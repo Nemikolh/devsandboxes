@@ -16,6 +16,9 @@ pub struct Instance {
     pub folder: PathBuf,
     /// Workspace folder inside the container.
     pub workspace: String,
+    /// devcontainer `remoteEnv`, applied to every exec in the container.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub remote_env: BTreeMap<String, String>,
     pub created_unix: u64,
 }
 
@@ -80,6 +83,7 @@ mod tests {
                 container: "devsandbox-repo-abc1".into(),
                 folder: "/home/u/repository-1".into(),
                 workspace: "/workspaces/repository-1".into(),
+                remote_env: BTreeMap::new(),
                 created_unix: Instance::now(),
             },
         );
