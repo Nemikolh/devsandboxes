@@ -39,9 +39,6 @@ pub struct SandboxProperties {
     // --- implemented devcontainer properties ---
     pub image: Option<String>,
     pub build: Option<Build>,
-    pub docker_compose_file: Option<StringOrList>,
-    pub service: Option<String>,
-    pub run_services: Option<Vec<String>>,
     pub workspace_folder: Option<String>,
     pub container_env: Option<BTreeMap<String, String>>,
     pub remote_env: Option<BTreeMap<String, String>>,
@@ -60,7 +57,7 @@ pub struct SandboxProperties {
     pub ports_attributes: Option<Value>,
     pub other_ports_attributes: Option<Value>,
     pub run_args: Option<Value>,
-    pub mounts: Option<Value>,
+    pub mounts: Option<Vec<Mount>>,
     pub workspace_mount: Option<Value>,
     pub features: Option<Value>,
     pub override_feature_install_order: Option<Value>,
@@ -97,7 +94,6 @@ impl SandboxProperties {
             ports_attributes => "portsAttributes",
             other_ports_attributes => "otherPortsAttributes",
             run_args => "runArgs",
-            mounts => "mounts",
             workspace_mount => "workspaceMount",
             features => "features",
             override_feature_install_order => "overrideFeatureInstallOrder",
@@ -141,6 +137,156 @@ impl SandboxProperties {
     }
 }
 
+/// A `mounts` entry: the docker `--mount` shorthand string
+/// (`source=…,target=…,type=bind`) or the devcontainer object form.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum Mount {
+    Shorthand(String),
+    Object(MountObject),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct MountObject {
+    #[serde(rename = "type")]
+    pub kind: Option<String>,
+    pub source: Option<String>,
+    pub target: String,
+    pub readonly: Option<bool>,
+}
+
+/// Values for the devcontainer `${…}` variables devsandbox substitutes in mount
+/// sources. `localEnv:*` is read from the process environment separately.
+pub struct MountContext<'a> {
+    /// Directory holding `config.toml` (`${configDir}`).
+    pub config_dir: &'a str,
+    /// Host path of the project checkout (`${localWorkspaceFolder}`).
+    pub workspace_folder: &'a str,
+    /// Its basename (`${localWorkspaceFolderBasename}`).
+    pub workspace_folder_basename: &'a str,
+}
+
+/// A mount with variables substituted and defaults applied, ready to hand to
+/// `docker run --mount`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedMount {
+    pub kind: String,
+    pub source: Option<String>,
+    pub target: String,
+    pub readonly: bool,
+}
+
+impl Mount {
+    /// Apply variable substitution and defaults. `bind` mounts require a source.
+    pub fn resolve(&self, ctx: &MountContext) -> Result<ResolvedMount> {
+        let (kind, source, target, readonly) = match self {
+            Mount::Shorthand(s) => parse_shorthand(s)?,
+            Mount::Object(o) => (
+                o.kind.clone(),
+                o.source.clone(),
+                o.target.clone(),
+                o.readonly.unwrap_or(false),
+            ),
+        };
+        let kind = kind.unwrap_or_else(|| "bind".to_string());
+        let source = source.map(|s| substitute(&s, ctx));
+        let target = substitute(&target, ctx);
+        if kind == "bind" && source.is_none() {
+            bail!("bind mount to `{target}` is missing a source");
+        }
+        Ok(ResolvedMount {
+            kind,
+            source,
+            target,
+            readonly,
+        })
+    }
+}
+
+impl ResolvedMount {
+    /// The value for a `docker run --mount <value>` flag.
+    pub fn to_arg(&self) -> String {
+        let mut arg = format!("type={}", self.kind);
+        if let Some(source) = &self.source {
+            arg.push_str(&format!(",source={source}"));
+        }
+        arg.push_str(&format!(",target={}", self.target));
+        if self.readonly {
+            arg.push_str(",readonly");
+        }
+        arg
+    }
+}
+
+type MountParts = (Option<String>, Option<String>, String, bool);
+
+/// Parse a docker `--mount` shorthand (`key=value,…`) into
+/// (type, source, target, readonly).
+fn parse_shorthand(spec: &str) -> Result<MountParts> {
+    let (mut kind, mut source, mut target, mut readonly) = (None, None, None, false);
+    for part in spec.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let (key, value) = match part.split_once('=') {
+            Some((k, v)) => (k.trim(), Some(v.trim().to_string())),
+            None => (part, None),
+        };
+        match key {
+            "type" => kind = value,
+            "source" | "src" => source = value,
+            "target" | "destination" | "dst" => target = value,
+            "readonly" | "ro" => readonly = value.as_deref() != Some("false"),
+            "consistency" | "bind-propagation" => {} // docker hints, no-op here
+            other => bail!("unknown mount field `{other}` in `{spec}`"),
+        }
+    }
+    let target = target.with_context(|| format!("mount `{spec}` is missing a target"))?;
+    Ok((kind, source, target, readonly))
+}
+
+/// Replace the devcontainer `${…}` variables devsandbox supports; unknown
+/// expressions are left verbatim.
+fn substitute(input: &str, ctx: &MountContext) -> String {
+    let mut out = String::new();
+    let mut rest = input;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        match after.find('}') {
+            Some(end) => {
+                let expr = &after[..end];
+                match resolve_var(expr, ctx) {
+                    Some(value) => out.push_str(&value),
+                    None => out.push_str(&rest[start..start + 2 + end + 1]),
+                }
+                rest = &after[end + 1..];
+            }
+            None => {
+                out.push_str(&rest[start..]);
+                return out;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn resolve_var(expr: &str, ctx: &MountContext) -> Option<String> {
+    if let Some(var) = expr.strip_prefix("localEnv:") {
+        // devcontainer semantics: an unset host variable expands to empty.
+        return Some(std::env::var(var).unwrap_or_default());
+    }
+    match expr {
+        "configDir" => Some(ctx.config_dir.to_string()),
+        "localWorkspaceFolder" => Some(ctx.workspace_folder.to_string()),
+        "localWorkspaceFolderBasename" => Some(ctx.workspace_folder_basename.to_string()),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Build {
@@ -176,13 +322,6 @@ pub enum StringOrList {
 }
 
 impl StringOrList {
-    pub fn first(&self) -> &str {
-        match self {
-            Self::One(s) => s,
-            Self::Many(v) => v.first().map(String::as_str).unwrap_or(""),
-        }
-    }
-
     pub fn to_vec(&self) -> Vec<&str> {
         match self {
             Self::One(s) => vec![s],
@@ -254,19 +393,31 @@ impl ResolvedSandbox {
         {
             return format!("dockerfile {dockerfile}");
         }
-        if let Some(compose) = &self.properties.docker_compose_file {
-            return format!("compose {}", compose.first());
-        }
         "?".into()
     }
 }
 
-/// A shared service definition (`[services.<name>]`). Free-form beyond the
-/// fields devsandbox acts on; unknown keys are rejected so typos surface.
+/// How a service is shared. `isolated` (the default) gives every sandbox
+/// instance its own container; `global` is a single container shared across the
+/// whole config root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServiceScope {
+    #[default]
+    Isolated,
+    Global,
+}
+
+/// A service definition (`[services.<name>]`). Backed by an `image` or a
+/// `build`. Free-form beyond the fields devsandbox acts on; unknown keys are
+/// rejected so typos surface.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Service {
-    pub image: String,
+    #[serde(default)]
+    pub scope: ServiceScope,
+    pub image: Option<String>,
+    pub build: Option<Build>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     #[serde(default)]
@@ -298,6 +449,11 @@ impl Config {
             .clone()
             .try_into()
             .map_err(|e| anyhow!("service `{name}`: {e}"))?;
+        match (&spec.image, &spec.build) {
+            (Some(_), Some(_)) => bail!("service `{name}`: set only one of `image` or `build`"),
+            (None, None) => bail!("service `{name}`: needs an `image` or a `build`"),
+            _ => {}
+        }
         Ok(ResolvedService {
             name: name.to_string(),
             spec,
@@ -371,14 +527,20 @@ fn config_hash(table: &Table) -> String {
     short_hash(&toml::to_string(table).unwrap_or_default())
 }
 
-/// Deep merge: `over` wins; nested tables merge recursively, everything else
-/// is replaced wholesale.
+/// Deep merge: nested tables merge recursively, arrays concatenate
+/// (base first, then `over`), scalars are replaced by `over`. Concatenating
+/// arrays lets a sandbox add to a template's `mounts`/`extensions` without
+/// restating them (devcontainer merge semantics).
 fn deep_merge(base: Table, over: Table) -> Table {
     let mut merged = base;
     for (key, value) in over {
         match (merged.remove(&key), value) {
             (Some(Value::Table(base_table)), Value::Table(over_table)) => {
                 merged.insert(key, Value::Table(deep_merge(base_table, over_table)));
+            }
+            (Some(Value::Array(mut base_arr)), Value::Array(over_arr)) => {
+                base_arr.extend(over_arr);
+                merged.insert(key, Value::Array(base_arr));
             }
             (_, value) => {
                 merged.insert(key, value);
@@ -560,19 +722,128 @@ onCreateCommand = { b = "make", a = ["cargo", "build"] }
         );
     }
 
+    fn ctx() -> MountContext<'static> {
+        MountContext {
+            config_dir: "/cfg",
+            workspace_folder: "/home/u/repo",
+            workspace_folder_basename: "repo",
+        }
+    }
+
     #[test]
-    fn compose_file_string_or_list() {
+    fn mount_shorthand_resolves_and_substitutes() {
         let config = Config::parse(
-            "[sandbox.a]\ndockerComposeFile = \"docker-compose.yml\"\nservice = \"app\"\n\
-             [sandbox.b]\ndockerComposeFile = [\"a.yml\", \"b.yml\"]\nservice = \"app\"",
+            r#"
+[sandbox.s]
+image = "alpine"
+mounts = ["source=${configDir}/shared-volumes/cargo,target=/root/.cargo,type=bind"]
+"#,
         )
         .unwrap();
-        let a = config.resolve_sandbox("a").unwrap();
-        assert_eq!(a.source(), "compose docker-compose.yml");
-        let b = config.resolve_sandbox("b").unwrap();
+        let props = config.resolve_sandbox("s").unwrap().properties;
+        assert!(props.ignored().is_empty());
+        let resolved = props.mounts.as_ref().unwrap()[0].resolve(&ctx()).unwrap();
+        assert_eq!(resolved.source.as_deref(), Some("/cfg/shared-volumes/cargo"));
+        assert_eq!(resolved.target, "/root/.cargo");
+        assert_eq!(resolved.kind, "bind");
         assert_eq!(
-            b.properties.docker_compose_file.unwrap().to_vec(),
-            vec!["a.yml", "b.yml"]
+            resolved.to_arg(),
+            "type=bind,source=/cfg/shared-volumes/cargo,target=/root/.cargo"
         );
+    }
+
+    #[test]
+    fn mount_object_form_with_readonly() {
+        let config = Config::parse(
+            r#"
+[sandbox.s]
+image = "alpine"
+mounts = [{ source = "${localWorkspaceFolder}/x", target = "/x", readonly = true }]
+"#,
+        )
+        .unwrap();
+        let props = config.resolve_sandbox("s").unwrap().properties;
+        let resolved = props.mounts.as_ref().unwrap()[0].resolve(&ctx()).unwrap();
+        assert_eq!(resolved.source.as_deref(), Some("/home/u/repo/x"));
+        assert!(resolved.readonly);
+        assert_eq!(resolved.to_arg(), "type=bind,source=/home/u/repo/x,target=/x,readonly");
+    }
+
+    #[test]
+    fn mount_localenv_expands_from_host() {
+        // PATH is reliably set; verify substitution reads the host env.
+        let expected = format!("type=bind,source={}/c,target=/c", std::env::var("PATH").unwrap());
+        let config = Config::parse(
+            "[sandbox.s]\nimage = \"alpine\"\nmounts = [\"source=${localEnv:PATH}/c,target=/c\"]",
+        )
+        .unwrap();
+        let props = config.resolve_sandbox("s").unwrap().properties;
+        let resolved = props.mounts.as_ref().unwrap()[0].resolve(&ctx()).unwrap();
+        assert_eq!(resolved.to_arg(), expected);
+    }
+
+    #[test]
+    fn mount_bind_without_source_errors() {
+        let config =
+            Config::parse("[sandbox.s]\nimage = \"alpine\"\nmounts = [\"target=/x,type=bind\"]")
+                .unwrap();
+        let props = config.resolve_sandbox("s").unwrap().properties;
+        assert!(props.mounts.as_ref().unwrap()[0].resolve(&ctx()).is_err());
+    }
+
+    #[test]
+    fn mount_unknown_variable_left_verbatim() {
+        assert_eq!(substitute("${nope}/x", &ctx()), "${nope}/x");
+        assert_eq!(substitute("a/${configDir}/b", &ctx()), "a//cfg/b");
+    }
+
+    #[test]
+    fn arrays_concatenate_on_merge() {
+        let config = Config::parse(
+            r#"
+[template.base]
+mounts = ["source=/a,target=/a,type=bind"]
+customizations.vscode.extensions = ["a.one"]
+
+[sandbox.s]
+extends = "base"
+image = "alpine"
+mounts = ["source=/b,target=/b,type=bind"]
+customizations.vscode.extensions = ["b.two"]
+"#,
+        )
+        .unwrap();
+        let props = config.resolve_sandbox("s").unwrap().properties;
+        assert_eq!(props.mounts.as_ref().unwrap().len(), 2);
+        assert_eq!(
+            props.vscode_extensions(),
+            Some(&["a.one".to_string(), "b.two".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn service_scope_defaults_to_isolated() {
+        let config = Config::parse("[services.db]\nimage = \"postgres:16\"").unwrap();
+        let svc = config.resolve_service("db").unwrap();
+        assert_eq!(svc.spec.scope, ServiceScope::Isolated);
+    }
+
+    #[test]
+    fn service_scope_global_parses() {
+        let config =
+            Config::parse("[services.db]\nimage = \"postgres:16\"\nscope = \"global\"").unwrap();
+        let svc = config.resolve_service("db").unwrap();
+        assert_eq!(svc.spec.scope, ServiceScope::Global);
+    }
+
+    #[test]
+    fn service_requires_image_xor_build() {
+        let neither = Config::parse("[services.db]\nenv = { X = \"1\" }").unwrap();
+        assert!(neither.resolve_service("db").unwrap_err().to_string().contains("image"));
+        let both = Config::parse(
+            "[services.db]\nimage = \"postgres:16\"\nbuild = { dockerfile = \"Dockerfile\" }",
+        )
+        .unwrap();
+        assert!(both.resolve_service("db").unwrap_err().to_string().contains("only one"));
     }
 }

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 
 use super::{pick, services};
-use crate::config::{Config, LifecycleCommand, ResolvedSandbox, StringOrList, CONFIG_FILE};
+use crate::config::{Config, LifecycleCommand, MountContext, ResolvedSandbox, CONFIG_FILE};
 use crate::docker::{self, NAME_PREFIX};
 use crate::state::{Instance, State};
 
@@ -31,12 +31,6 @@ pub fn run(dir: &Path, sandbox_name: Option<String>, instance_name: Option<Strin
     let ignored = props.ignored();
     if !ignored.is_empty() {
         eprintln!("warning: ignoring unsupported properties: {}", ignored.join(", "));
-    }
-
-    if props.docker_compose_file.is_some() && (props.image.is_some() || props.build.is_some()) {
-        bail!(
-            "sandbox `{sandbox_name}`: `dockerComposeFile` cannot be combined with `image` or `build`"
-        );
     }
 
     let folder = sandbox
@@ -90,55 +84,50 @@ pub fn run(dir: &Path, sandbox_name: Option<String>, instance_name: Option<Strin
         run_host_commands(dir, cmd).context("initializeCommand failed")?;
     }
 
-    // Bring up shared services + the project network; the instance container
-    // joins that network so it can reach services by name.
+    // Bring up the sandbox's services (global shared + this instance's isolated)
+    // and their networks; the instance container joins them to reach services by
+    // name.
     let project = services::project_id(dir)?;
     let service_names = props.services.clone().unwrap_or_default();
-    let network = services::ensure_services(&config, &project, &service_names)?;
+    let networks = services::ensure_services(&config, dir, &project, &instance, &service_names)?;
 
-    let (container, source, worktree) = match &props.docker_compose_file {
-        Some(files) => (
-            compose_up(dir, &sandbox, files, &container_name, network.as_deref())?,
-            folder.clone(),
-            None,
-        ),
-        None => {
-            // First instance for this base folder mounts it directly; a base
-            // folder already live in another instance gets a git worktree so
-            // the two containers never share a working tree.
-            let base_in_use = state
-                .instances
-                .values()
-                .filter(|i| i.base_folder == folder)
-                .any(|i| container_running(&i.container));
-            let (source, worktree, extra_mounts) = if base_in_use {
-                let wt = dir.join(".worktrees").join(&instance);
-                create_worktree(&folder, &wt, &instance)?;
-                // The worktree's `.git` file points at `<base>/.git/worktrees/..`
-                // by absolute host path; mount the base `.git` at the identical
-                // path so git works inside the container.
-                (wt.clone(), Some(wt), vec![git_companion_mount(&folder)])
-            } else {
-                (folder.clone(), None, Vec::new())
-            };
-            docker_run(
-                dir,
-                &sandbox,
-                &container_name,
-                &source,
-                &folder,
-                &workspace,
-                &extra_mounts,
-                network.as_deref(),
-            )?;
-            (container_name.clone(), source, worktree)
-        }
+    // First instance for this base folder mounts it directly; a base folder
+    // already live in another instance gets a git worktree so the two containers
+    // never share a working tree.
+    let base_in_use = state
+        .instances
+        .values()
+        .filter(|i| i.base_folder == folder)
+        .any(|i| container_running(&i.container));
+    let (source, worktree, extra_mounts) = if base_in_use {
+        let wt = dir.join(".worktrees").join(&instance);
+        create_worktree(&folder, &wt, &instance)?;
+        // The worktree's `.git` file points at `<base>/.git/worktrees/..`
+        // by absolute host path; mount the base `.git` at the identical
+        // path so git works inside the container.
+        (wt.clone(), Some(wt), vec![git_companion_mount(&folder)])
+    } else {
+        (folder.clone(), None, Vec::new())
     };
+    let mounts = resolve_mounts(dir, &folder, &basename, &sandbox)?;
+    docker_run(
+        dir,
+        &sandbox,
+        &container_name,
+        &source,
+        &folder,
+        &workspace,
+        &extra_mounts,
+        &mounts,
+        &networks,
+    )?;
+    let container = container_name.clone();
 
     state.instances.insert(
         instance.clone(),
         Instance {
             sandbox: sandbox_name,
+            project,
             container: container.clone(),
             folder: source,
             base_folder: folder,
@@ -257,7 +246,8 @@ fn docker_run(
     base_folder: &Path,
     workspace: &str,
     extra_mounts: &[String],
-    network: Option<&str>,
+    mounts: &[String],
+    networks: &[String],
 ) -> Result<()> {
     let image = image_for(dir, sandbox)?;
     let mount = format!("{}:{workspace}", source.display());
@@ -278,9 +268,14 @@ fn docker_run(
         args.push("-v".into());
         args.push(mount.clone());
     }
-    if let Some(network) = network {
+    for mount in mounts {
+        args.push("--mount".into());
+        args.push(mount.clone());
+    }
+    // A container can start on a single `--network`; join the rest afterwards.
+    if let Some(first) = networks.first() {
         args.push("--network".into());
-        args.push(network.to_string());
+        args.push(first.clone());
     }
     if let Some(env) = &sandbox.properties.container_env {
         for (key, value) in env {
@@ -293,7 +288,74 @@ fn docker_run(
     args.extend(["sleep".into(), "infinity".into()]);
 
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    docker::run_checked(&arg_refs)
+    docker::run_checked(&arg_refs)?;
+
+    for network in networks.iter().skip(1) {
+        docker::run_checked(&["network", "connect", network, container])?;
+    }
+    Ok(())
+}
+
+/// Resolve the sandbox's `mounts` into `docker run --mount` values, substituting
+/// `${…}` variables and creating any missing bind sources so a first run doesn't
+/// fail on a non-existent host path.
+fn resolve_mounts(
+    dir: &Path,
+    folder: &Path,
+    basename: &str,
+    sandbox: &ResolvedSandbox,
+) -> Result<Vec<String>> {
+    let Some(mounts) = &sandbox.properties.mounts else {
+        return Ok(Vec::new());
+    };
+    // `${configDir}` anchors host-backed volumes; make it absolute.
+    let config_dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let ctx = MountContext {
+        config_dir: &config_dir.to_string_lossy(),
+        workspace_folder: &folder.to_string_lossy(),
+        workspace_folder_basename: basename,
+    };
+    let mut args = Vec::with_capacity(mounts.len());
+    for mount in mounts {
+        let resolved = mount
+            .resolve(&ctx)
+            .with_context(|| format!("sandbox `{}`: invalid mount", sandbox.name))?;
+        if resolved.kind == "bind" {
+            if let Some(source) = &resolved.source {
+                ensure_bind_source(Path::new(source))?;
+            }
+        }
+        args.push(resolved.to_arg());
+    }
+    Ok(args)
+}
+
+/// Create a missing bind-mount source. A final path component containing a dot
+/// (other than a leading one) is treated as a file (touched); anything else as a
+/// directory — so `credentials.json` becomes a file and `pnpm-store` a dir.
+fn ensure_bind_source(path: &Path) -> Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    let is_file = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.trim_start_matches('.').contains('.'))
+        .unwrap_or(false);
+    if is_file {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("cannot create {}", parent.display()))?;
+        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .with_context(|| format!("cannot create {}", path.display()))?;
+    } else {
+        std::fs::create_dir_all(path).with_context(|| format!("cannot create {}", path.display()))?;
+    }
+    Ok(())
 }
 
 /// Image to run: the `image` property as-is, or a local build for
@@ -341,60 +403,6 @@ fn image_for(dir: &Path, sandbox: &ResolvedSandbox) -> Result<String> {
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     docker::run_checked(&arg_refs)?;
     Ok(tag)
-}
-
-/// `docker compose up` the sandbox's service (plus `runServices`), using the
-/// prefixed instance name as the compose project so `ps` filtering still
-/// works. Returns the service's container name.
-fn compose_up(
-    dir: &Path,
-    sandbox: &ResolvedSandbox,
-    files: &StringOrList,
-    project: &str,
-    network: Option<&str>,
-) -> Result<String> {
-    let props = &sandbox.properties;
-    let service = props.service.as_deref().with_context(|| {
-        format!("sandbox `{}`: `service` is required with `dockerComposeFile`", sandbox.name)
-    })?;
-
-    let mut args: Vec<String> = vec!["compose".into()];
-    for file in files.to_vec() {
-        args.push("-f".into());
-        args.push(dir.join(file).to_string_lossy().into_owned());
-    }
-    // Attach the compose service to the shared project network without editing
-    // the user's compose files.
-    if let Some(network) = network {
-        args.push("-f".into());
-        args.push(compose_network_override(service, network)?);
-    }
-    args.extend(["-p".into(), project.into(), "up".into(), "-d".into(), service.into()]);
-    if let Some(run_services) = &props.run_services {
-        args.extend(run_services.iter().cloned());
-    }
-    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    docker::run_checked(&arg_refs)?;
-
-    // Resolve the service's container name for exec / vscode attach.
-    let ids = docker::output(&["compose", "-p", project, "ps", "-q", service])?;
-    let id = ids
-        .lines()
-        .next()
-        .with_context(|| format!("no container found for compose service `{service}`"))?;
-    let name = docker::output(&["inspect", "-f", "{{.Name}}", id])?;
-    Ok(name.trim_start_matches('/').to_string())
-}
-
-/// Write a compose override attaching `service` to the external shared
-/// `network`, returning its path. Never touches the user's compose files.
-fn compose_network_override(service: &str, network: &str) -> Result<String> {
-    let yaml = format!(
-        "networks:\n  {network}:\n    external: true\nservices:\n  {service}:\n    networks:\n      - {network}\n"
-    );
-    let path = std::env::temp_dir().join(format!("devsandbox-{network}-{service}.yml"));
-    std::fs::write(&path, yaml).with_context(|| format!("cannot write {}", path.display()))?;
-    Ok(path.to_string_lossy().into_owned())
 }
 
 /// Run a lifecycle command's argv lists on the host (initializeCommand).
@@ -549,6 +557,7 @@ mod tests {
     fn instance(name: &str) -> Instance {
         Instance {
             sandbox: "repo".into(),
+            project: "proj1234".into(),
             container: format!("{NAME_PREFIX}{name}"),
             folder: "/tmp/repo".into(),
             base_folder: "/tmp/repo".into(),

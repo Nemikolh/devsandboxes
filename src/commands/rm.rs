@@ -40,9 +40,26 @@ pub fn rm(name: &str) -> Result<()> {
     let container = info.container.clone();
     let worktree = info.worktree.clone();
     let base_folder = info.base_folder.clone();
+    let project = info.project.clone();
 
     // Remove the container; ignore failure (it may already be gone).
     let _ = docker::run_inherit(&["rm", "-f", &container]);
+
+    // Reap this instance's isolated services and its per-instance network. Global
+    // services are shared and left to `gc`. Empty `project` = pre-upgrade state.
+    if !project.is_empty() {
+        let filter_project = format!("label=devsandbox.project={project}");
+        let filter_instance = format!("label=devsandbox.instance={key}");
+        if let Ok(listing) = docker::output(&[
+            "ps", "-aq", "--filter", &filter_project, "--filter", &filter_instance,
+        ]) {
+            for svc in listing.lines().filter(|l| !l.is_empty()) {
+                let _ = docker::run_inherit(&["rm", "-f", svc]);
+            }
+        }
+        let network = crate::commands::services::instance_network(&project, &key);
+        let _ = docker::run_inherit(&["network", "rm", &network]);
+    }
 
     if let Some(worktree) = worktree {
         remove_worktree(&base_folder, &worktree)?;

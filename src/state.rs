@@ -10,6 +10,10 @@ use serde::{Deserialize, Serialize};
 pub struct Instance {
     /// Sandbox config name from config.toml.
     pub sandbox: String,
+    /// Config-root id (see `services::project_id`); scopes this instance's
+    /// isolated services and networks so `rm` can find them without the dir.
+    #[serde(default)]
+    pub project: String,
     /// Docker container name (prefixed).
     pub container: String,
     /// Absolute path of the mounted project folder on the host (the worktree
@@ -89,6 +93,7 @@ mod tests {
             "repo-abc1".into(),
             Instance {
                 sandbox: "repository-1".into(),
+                project: "abc12345".into(),
                 container: "devsandbox-repo-abc1".into(),
                 folder: "/home/u/repository-1".into(),
                 base_folder: "/home/u/repository-1".into(),
