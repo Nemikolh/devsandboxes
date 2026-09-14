@@ -22,7 +22,7 @@ pub struct Config {
 
 /// The exact set of properties a sandbox accepts: the devcontainer.json
 /// schema plus the devsandbox extras (`extends`, `folder`, `services`,
-/// `cache-folder`). Unknown keys are a hard error (`deny_unknown_fields`);
+/// `caches`, `persist-shell-history`). Unknown keys are a hard error (`deny_unknown_fields`);
 /// valid-but-unimplemented ones are surfaced by [`Self::ignored`] so `run`
 /// can warn before creating the container.
 #[derive(Debug, Default, Deserialize)]
@@ -31,10 +31,10 @@ pub struct SandboxProperties {
     // --- devsandbox extras ---
     pub folder: Option<String>,
     pub services: Option<Vec<String>>,
-    // Consumed by the runtime layer in a later milestone.
-    #[allow(dead_code)]
-    #[serde(rename = "cache-folder")]
-    pub cache_folder: Option<String>,
+    /// Package-manager caches to persist and share across the config root (e.g.
+    /// `["pnpm", "cargo"]`). Each expands into a shared bind mount plus the env
+    /// vars that point the tool at it. See [`known_cache`].
+    pub caches: Option<Vec<String>>,
     /// When true, provision a per-instance `.zsh_history` on the host and
     /// bind-mount it, so shell history survives rebuilds without being shared
     /// between concurrent instances.
@@ -66,14 +66,14 @@ pub struct SandboxProperties {
     pub workspace_mount: Option<Value>,
     pub features: Option<Value>,
     pub override_feature_install_order: Option<Value>,
-    pub container_user: Option<Value>,
-    pub remote_user: Option<Value>,
+    pub container_user: Option<String>,
+    pub remote_user: Option<String>,
     #[serde(rename = "updateRemoteUserUID")]
     pub update_remote_user_uid: Option<Value>,
     pub user_env_probe: Option<Value>,
     pub override_command: Option<Value>,
     pub shutdown_action: Option<Value>,
-    pub init: Option<Value>,
+    pub init: Option<bool>,
     pub privileged: Option<Value>,
     pub cap_add: Option<Value>,
     pub security_opt: Option<Value>,
@@ -102,13 +102,10 @@ impl SandboxProperties {
             workspace_mount => "workspaceMount",
             features => "features",
             override_feature_install_order => "overrideFeatureInstallOrder",
-            container_user => "containerUser",
-            remote_user => "remoteUser",
             update_remote_user_uid => "updateRemoteUserUID",
             user_env_probe => "userEnvProbe",
             override_command => "overrideCommand",
             shutdown_action => "shutdownAction",
-            init => "init",
             privileged => "privileged",
             cap_add => "capAdd",
             security_opt => "securityOpt",
@@ -252,9 +249,31 @@ fn parse_shorthand(spec: &str) -> Result<MountParts> {
     Ok((kind, source, target, readonly))
 }
 
+/// Package-manager caches supported by the `caches` field, in a stable order.
+pub const SUPPORTED_CACHES: &[&str] = &["pnpm", "cargo", "npm", "yarn", "go", "pip"];
+
+/// Resolve a cache name to `(source subdirectory under shared-volumes, mount
+/// target in the container, env vars that must point at the target)`. Returns
+/// `None` for an unknown name.
+pub fn known_cache(name: &str) -> Option<(&'static str, &'static str, &'static [&'static str])> {
+    Some(match name {
+        "pnpm" => (
+            "pnpm-store",
+            "/root/.pnpm-store",
+            &["npm_config_store_dir", "pnpm_config_store_dir"],
+        ),
+        "cargo" => ("cargo", "/root/.cargo", &["CARGO_HOME"]),
+        "npm" => ("npm", "/root/.npm", &["npm_config_cache"]),
+        "yarn" => ("yarn", "/root/.yarn-cache", &["YARN_CACHE_FOLDER"]),
+        "go" => ("go-mod", "/root/go/pkg/mod", &["GOMODCACHE"]),
+        "pip" => ("pip", "/root/.cache/pip", &["PIP_CACHE_DIR"]),
+        _ => return None,
+    })
+}
+
 /// Replace the devcontainer `${…}` variables devsandbox supports; unknown
 /// expressions are left verbatim.
-fn substitute(input: &str, ctx: &MountContext) -> String {
+pub fn substitute(input: &str, ctx: &MountContext) -> String {
     let mut out = String::new();
     let mut rest = input;
     while let Some(start) = rest.find("${") {
@@ -479,21 +498,7 @@ impl Config {
             .get(name)
             .with_context(|| format!("unknown sandbox `{name}`"))?;
 
-        let mut properties = match sandbox.get("extends") {
-            None => sandbox.clone(),
-            Some(Value::String(template_name)) => {
-                let template = self.templates.get(template_name).with_context(|| {
-                    format!("sandbox `{name}` extends unknown template `{template_name}`")
-                })?;
-                deep_merge(template.clone(), sandbox.clone())
-            }
-            Some(other) => {
-                bail!(
-                    "sandbox `{name}`: `extends` must be a template name, got {}",
-                    other.type_str()
-                )
-            }
-        };
+        let mut properties = self.resolve_extends(sandbox, &mut Vec::new())?;
         properties.remove("extends");
 
         let config_hash = config_hash(&properties);
@@ -506,6 +511,48 @@ impl Config {
             properties,
             config_hash,
         })
+    }
+
+    /// Resolve a table's `extends` into a fully-merged table: referenced
+    /// templates first (left-to-right, each with its own `extends` resolved
+    /// recursively), then the table's own body on top. `stack` tracks the active
+    /// resolution path for cycle detection.
+    fn resolve_extends(&self, table: &Table, stack: &mut Vec<String>) -> Result<Table> {
+        let names = match table.get("extends") {
+            None => Vec::new(),
+            Some(Value::String(name)) => vec![name.clone()],
+            Some(Value::Array(items)) => items
+                .iter()
+                .map(|v| {
+                    v.as_str().map(str::to_string).ok_or_else(|| {
+                        anyhow!("`extends` array must contain template names (strings)")
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+            Some(other) => bail!(
+                "`extends` must be a template name or an array of names, got {}",
+                other.type_str()
+            ),
+        };
+
+        let mut merged = Table::new();
+        for name in names {
+            if stack.contains(&name) {
+                bail!("cyclic `extends`: {} -> {name}", stack.join(" -> "));
+            }
+            let template = self
+                .templates
+                .get(&name)
+                .with_context(|| format!("extends unknown template `{name}`"))?;
+            stack.push(name);
+            let resolved = self.resolve_extends(template, stack)?;
+            stack.pop();
+            merged = deep_merge(merged, resolved);
+        }
+
+        let mut body = table.clone();
+        body.remove("extends");
+        Ok(deep_merge(merged, body))
     }
 
     pub fn resolve_all(&self) -> Result<Vec<ResolvedSandbox>> {
@@ -564,7 +611,7 @@ mod tests {
 image = "postgres"
 
 [template.base-sandbox]
-cache-folder = ".pnpm-store"
+caches = ["pnpm"]
 build.args = { A = "1", B = "2" }
 
 [sandbox.repository-1]
@@ -594,7 +641,7 @@ build.args = { B = "3" }
         let sandbox = config.resolve_sandbox("repository-1").unwrap();
         assert_eq!(sandbox.folder(), Some("../repository-1"));
         assert_eq!(sandbox.source(), "image node-22");
-        assert_eq!(sandbox.properties.cache_folder.as_deref(), Some(".pnpm-store"));
+        assert_eq!(sandbox.properties.caches.as_deref(), Some(&["pnpm".to_string()][..]));
     }
 
     #[test]
@@ -662,7 +709,7 @@ build.args = { B = "3" }
 [sandbox.s]
 image = "alpine"
 forwardPorts = [3000]
-remoteUser = "vscode"
+runArgs = ["--gpus", "all"]
 customizations.vscode.settings = { "editor.formatOnSave" = true }
 customizations.jetbrains.plugins = ["x"]
 "#,
@@ -673,7 +720,7 @@ customizations.jetbrains.plugins = ["x"]
             sandbox.properties.ignored(),
             vec![
                 "forwardPorts",
-                "remoteUser",
+                "runArgs",
                 "customizations.vscode.settings",
                 "customizations.jetbrains",
             ]
@@ -842,6 +889,87 @@ image = "alpine"
         let props = config.resolve_sandbox("s").unwrap().properties;
         assert_eq!(props.persist_shell_history, Some(true));
         assert!(props.ignored().is_empty());
+    }
+
+    #[test]
+    fn extends_list_merges_left_to_right() {
+        let config = Config::parse(
+            r#"
+[template.node]
+image = "node"
+containerEnv = { A = "1" }
+customizations.vscode.extensions = ["node.ext"]
+
+[template.rust]
+containerEnv = { B = "2" }
+customizations.vscode.extensions = ["rust.ext"]
+
+[sandbox.s]
+extends = ["node", "rust"]
+folder = "."
+"#,
+        )
+        .unwrap();
+        let props = config.resolve_sandbox("s").unwrap().properties;
+        assert_eq!(props.image.as_deref(), Some("node"));
+        let env = props.container_env.as_ref().unwrap();
+        assert_eq!(env["A"], "1");
+        assert_eq!(env["B"], "2");
+        assert_eq!(
+            props.vscode_extensions(),
+            Some(&["node.ext".to_string(), "rust.ext".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn extends_resolves_recursively() {
+        let config = Config::parse(
+            r#"
+[template.base]
+image = "alpine"
+containerEnv = { BASE = "1" }
+
+[template.mid]
+extends = "base"
+containerEnv = { MID = "2" }
+
+[sandbox.s]
+extends = "mid"
+folder = "."
+"#,
+        )
+        .unwrap();
+        let props = config.resolve_sandbox("s").unwrap().properties;
+        assert_eq!(props.image.as_deref(), Some("alpine"));
+        let env = props.container_env.as_ref().unwrap();
+        assert_eq!(env["BASE"], "1");
+        assert_eq!(env["MID"], "2");
+    }
+
+    #[test]
+    fn extends_cycle_errors() {
+        let config = Config::parse(
+            r#"
+[template.a]
+extends = "b"
+[template.b]
+extends = "a"
+[sandbox.s]
+extends = "a"
+"#,
+        )
+        .unwrap();
+        let err = config.resolve_sandbox("s").unwrap_err().to_string();
+        assert!(err.contains("cyclic"), "{err}");
+    }
+
+    #[test]
+    fn caches_expand_to_known_specs() {
+        let (source, target, env) = known_cache("cargo").unwrap();
+        assert_eq!(source, "cargo");
+        assert_eq!(target, "/root/.cargo");
+        assert_eq!(env, &["CARGO_HOME"]);
+        assert!(known_cache("nope").is_none());
     }
 
     #[test]

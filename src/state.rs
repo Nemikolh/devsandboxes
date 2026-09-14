@@ -36,6 +36,9 @@ pub struct Instance {
     /// devcontainer `remoteEnv`, applied to every exec in the container.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub remote_env: BTreeMap<String, String>,
+    /// devcontainer `remoteUser`: the user every exec runs as, when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_user: Option<String>,
     pub created_unix: u64,
 }
 
@@ -105,6 +108,7 @@ mod tests {
                 shell_history: None,
                 workspace: "/workspaces/repository-1".into(),
                 remote_env: BTreeMap::new(),
+                remote_user: None,
                 created_unix: Instance::now(),
             },
         );

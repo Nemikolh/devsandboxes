@@ -5,7 +5,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 
 use super::{pick, services};
-use crate::config::{Config, LifecycleCommand, MountContext, ResolvedSandbox, CONFIG_FILE};
+use crate::config::{
+    substitute, Config, LifecycleCommand, MountContext, ResolvedSandbox, SandboxProperties,
+    CONFIG_FILE,
+};
 use crate::docker::{self, NAME_PREFIX};
 use crate::state::{Instance, State};
 
@@ -45,10 +48,23 @@ pub fn run(dir: &Path, sandbox_name: Option<String>, instance_name: Option<Strin
         .context("sandbox folder has no basename")?
         .to_string_lossy()
         .into_owned();
-    let workspace = props
-        .workspace_folder
-        .clone()
-        .unwrap_or_else(|| format!("/workspaces/{basename}"));
+    // `${configDir}` / `${localWorkspaceFolder(Basename)}` are usable in
+    // `workspaceFolder`, `mounts`, and cache sources; build the context once.
+    let config_dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let config_dir_str = config_dir.to_string_lossy().into_owned();
+    let folder_str = folder.to_string_lossy().into_owned();
+    let var_ctx = MountContext {
+        config_dir: &config_dir_str,
+        workspace_folder: &folder_str,
+        workspace_folder_basename: &basename,
+    };
+    let workspace = substitute(
+        &props
+            .workspace_folder
+            .clone()
+            .unwrap_or_else(|| format!("/workspaces/{basename}")),
+        &var_ctx,
+    );
 
     let mut state = State::load()?;
     // Deterministic name: explicit --name, or the sandbox name for the first
@@ -72,8 +88,14 @@ pub fn run(dir: &Path, sandbox_name: Option<String>, instance_name: Option<Strin
             write_vscode_name_config(&container_name, extensions)?;
         }
         if let Some(cmd) = &props.post_start_command {
-            exec_lifecycle(&container_name, &workspace, props.remote_env.as_ref(), cmd)
-                .context("postStartCommand failed")?;
+            exec_lifecycle(
+                &container_name,
+                &workspace,
+                props.remote_env.as_ref(),
+                props.remote_user.as_deref(),
+                cmd,
+            )
+            .context("postStartCommand failed")?;
         }
         println!("{instance}");
         return Ok(());
@@ -110,6 +132,9 @@ pub fn run(dir: &Path, sandbox_name: Option<String>, instance_name: Option<Strin
         (folder.clone(), None, Vec::new())
     };
     let mut mounts = resolve_mounts(dir, &folder, &basename, &sandbox)?;
+    // Package-manager caches: shared bind mounts + the env vars pointing at them.
+    let (cache_mounts, cache_env) = resolve_caches(&config_dir, props)?;
+    mounts.extend(cache_mounts);
     // Managed per-instance shell history: provision the host file and mount it.
     let shell_history = if props.persist_shell_history == Some(true) {
         let (path, mount) = provision_shell_history(dir, &instance)?;
@@ -127,6 +152,7 @@ pub fn run(dir: &Path, sandbox_name: Option<String>, instance_name: Option<Strin
         &workspace,
         &extra_mounts,
         &mounts,
+        &cache_env,
         &networks,
     )?;
     let container = container_name.clone();
@@ -143,6 +169,7 @@ pub fn run(dir: &Path, sandbox_name: Option<String>, instance_name: Option<Strin
             shell_history,
             workspace: workspace.clone(),
             remote_env: props.remote_env.clone().unwrap_or_default(),
+            remote_user: props.remote_user.clone(),
             created_unix: Instance::now(),
         },
     );
@@ -160,8 +187,14 @@ pub fn run(dir: &Path, sandbox_name: Option<String>, instance_name: Option<Strin
         ("postAttachCommand", &props.post_attach_command),
     ] {
         if let Some(cmd) = cmd {
-            exec_lifecycle(&container, &workspace, props.remote_env.as_ref(), cmd)
-                .with_context(|| format!("{name} failed (container `{container}` kept)"))?;
+            exec_lifecycle(
+                &container,
+                &workspace,
+                props.remote_env.as_ref(),
+                props.remote_user.as_deref(),
+                cmd,
+            )
+            .with_context(|| format!("{name} failed (container `{container}` kept)"))?;
         }
     }
 
@@ -256,8 +289,10 @@ fn docker_run(
     workspace: &str,
     extra_mounts: &[String],
     mounts: &[String],
+    extra_env: &[(String, String)],
     networks: &[String],
 ) -> Result<()> {
+    let props = &sandbox.properties;
     let image = image_for(dir, sandbox)?;
     let mount = format!("{}:{workspace}", source.display());
     let sandbox_label = format!("devsandbox.sandbox={}", sandbox.name);
@@ -273,6 +308,13 @@ fn docker_run(
     ]
     .map(str::to_string)
     .into();
+    if props.init == Some(true) {
+        args.push("--init".into());
+    }
+    if let Some(user) = &props.container_user {
+        args.push("--user".into());
+        args.push(user.clone());
+    }
     for mount in extra_mounts {
         args.push("-v".into());
         args.push(mount.clone());
@@ -286,11 +328,15 @@ fn docker_run(
         args.push("--network".into());
         args.push(first.clone());
     }
-    if let Some(env) = &sandbox.properties.container_env {
+    if let Some(env) = &props.container_env {
         for (key, value) in env {
             args.push("-e".into());
             args.push(format!("{key}={value}"));
         }
+    }
+    for (key, value) in extra_env {
+        args.push("-e".into());
+        args.push(format!("{key}={value}"));
     }
     args.push(image);
     // Same trick as devcontainers: keep the container alive, work happens via exec.
@@ -337,6 +383,33 @@ fn resolve_mounts(
         args.push(resolved.to_arg());
     }
     Ok(args)
+}
+
+/// Expand `caches` into (extra `--mount` args, extra `(key, value)` env vars).
+/// Each cache is a shared bind mount under `${configDir}/shared-volumes/<name>`
+/// (auto-created) plus the env vars that point the tool at its mount target.
+fn resolve_caches(
+    config_dir: &Path,
+    props: &SandboxProperties,
+) -> Result<(Vec<String>, Vec<(String, String)>)> {
+    let mut mounts = Vec::new();
+    let mut env = Vec::new();
+    for name in props.caches.iter().flatten() {
+        let (source_sub, target, vars) = crate::config::known_cache(name).with_context(|| {
+            format!(
+                "unknown cache `{name}`; supported: {}",
+                crate::config::SUPPORTED_CACHES.join(", ")
+            )
+        })?;
+        let source = config_dir.join("shared-volumes").join(source_sub);
+        std::fs::create_dir_all(&source)
+            .with_context(|| format!("cannot create {}", source.display()))?;
+        mounts.push(format!("type=bind,source={},target={target}", source.display()));
+        for var in vars {
+            env.push((var.to_string(), target.to_string()));
+        }
+    }
+    Ok((mounts, env))
 }
 
 /// Provision this instance's managed `.zsh_history` under
@@ -457,6 +530,7 @@ fn exec_lifecycle(
     container: &str,
     workspace: &str,
     remote_env: Option<&BTreeMap<String, String>>,
+    remote_user: Option<&str>,
     cmd: &LifecycleCommand,
 ) -> Result<()> {
     for argv in cmd.commands() {
@@ -464,6 +538,10 @@ fn exec_lifecycle(
             continue;
         }
         let mut args: Vec<String> = vec!["exec".into(), "-w".into(), workspace.into()];
+        if let Some(user) = remote_user {
+            args.push("-u".into());
+            args.push(user.to_string());
+        }
         for (key, value) in remote_env.into_iter().flatten() {
             args.push("-e".into());
             args.push(format!("{key}={value}"));
@@ -557,7 +635,7 @@ fn offer_example_config(dir: &Path) -> Result<()> {
 const EXAMPLE_CONFIG: &str = r#"# devsandbox example config
 
 [template.base]
-cache-folder = ".pnpm-store"
+caches = ["pnpm"]
 
 [sandbox.example]
 extends = "base"
@@ -596,6 +674,7 @@ mod tests {
             shell_history: None,
             workspace: "/workspaces/repo".into(),
             remote_env: Default::default(),
+            remote_user: None,
             created_unix: 0,
         }
     }

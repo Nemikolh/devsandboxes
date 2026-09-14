@@ -45,6 +45,10 @@ pub fn exec(name: &str, interactive: bool, tty: bool, command: &[String]) -> Res
         args.push("-t".into());
     }
     args.extend(["-w".into(), instance.workspace.clone()]);
+    if let Some(user) = &instance.remote_user {
+        args.push("-u".into());
+        args.push(user.clone());
+    }
     for (key, value) in &instance.remote_env {
         args.push("-e".into());
         args.push(format!("{key}={value}"));
