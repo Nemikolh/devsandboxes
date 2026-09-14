@@ -12,8 +12,6 @@ pub const CONFIG_FILE: &str = "config.toml";
 /// validated into [`SandboxProperties`] by `resolve_sandbox`.
 #[derive(Debug, Default, Deserialize)]
 pub struct Config {
-    // Consumed by the runtime layer in a later milestone.
-    #[allow(dead_code)]
     #[serde(default)]
     pub services: BTreeMap<String, Table>,
     #[serde(default, rename = "template")]
@@ -32,9 +30,8 @@ pub struct Config {
 pub struct SandboxProperties {
     // --- devsandbox extras ---
     pub folder: Option<String>,
-    // Consumed by the runtime layer in a later milestone.
-    #[allow(dead_code)]
     pub services: Option<Vec<String>>,
+    // Consumed by the runtime layer in a later milestone.
     #[allow(dead_code)]
     #[serde(rename = "cache-folder")]
     pub cache_folder: Option<String>,
@@ -264,9 +261,48 @@ impl ResolvedSandbox {
     }
 }
 
+/// A shared service definition (`[services.<name>]`). Free-form beyond the
+/// fields devsandbox acts on; unknown keys are rejected so typos surface.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Service {
+    pub image: String,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub ports: Vec<String>,
+    #[serde(default)]
+    pub command: Option<StringOrList>,
+}
+
+/// A validated service with a stable hash of its definition.
+#[derive(Debug)]
+pub struct ResolvedService {
+    pub name: String,
+    pub spec: Service,
+    pub config_hash: String,
+}
+
 impl Config {
     pub fn parse(contents: &str) -> Result<Self> {
         toml::from_str(contents).context("invalid config")
+    }
+
+    pub fn resolve_service(&self, name: &str) -> Result<ResolvedService> {
+        let table = self
+            .services
+            .get(name)
+            .with_context(|| format!("unknown service `{name}`"))?;
+        let config_hash = config_hash(table);
+        let spec: Service = table
+            .clone()
+            .try_into()
+            .map_err(|e| anyhow!("service `{name}`: {e}"))?;
+        Ok(ResolvedService {
+            name: name.to_string(),
+            spec,
+            config_hash,
+        })
     }
 
     pub fn load(dir: &Path) -> Result<Self> {
@@ -319,12 +355,8 @@ impl Config {
     }
 }
 
-/// Deep merge: `over` wins; nested tables merge recursively, everything else
-/// is replaced wholesale.
-/// Stable FNV-1a hash of a merged config table. `Table` is a `BTreeMap`, so its
-/// TOML serialization is key-sorted and deterministic across runs.
-fn config_hash(table: &Table) -> String {
-    let text = toml::to_string(table).unwrap_or_default();
+/// Stable FNV-1a hash of arbitrary text, rendered as 16 hex chars.
+pub fn short_hash(text: &str) -> String {
     let mut h: u64 = 0xcbf29ce484222325;
     for b in text.bytes() {
         h ^= b as u64;
@@ -333,6 +365,14 @@ fn config_hash(table: &Table) -> String {
     format!("{h:016x}")
 }
 
+/// Stable hash of a merged config table. `Table` is a `BTreeMap`, so its TOML
+/// serialization is key-sorted and deterministic across runs.
+fn config_hash(table: &Table) -> String {
+    short_hash(&toml::to_string(table).unwrap_or_default())
+}
+
+/// Deep merge: `over` wins; nested tables merge recursively, everything else
+/// is replaced wholesale.
 fn deep_merge(base: Table, over: Table) -> Table {
     let mut merged = base;
     for (key, value) in over {

@@ -3,6 +3,7 @@ pub mod ls;
 pub mod ps;
 pub mod rm;
 pub mod run;
+pub mod services;
 
 use std::io::Write;
 

@@ -42,6 +42,8 @@ enum Command {
         /// Instance name, sandbox config name, or repository folder name
         name: String,
     },
+    /// Remove shared services no live instance references
+    Gc,
     /// Run a command in a sandbox instance
     Exec {
         /// Keep stdin open
@@ -66,6 +68,7 @@ fn main() -> Result<()> {
         Command::Ps { all } => commands::ps::ps(all),
         Command::Run { sandbox, name } => commands::run::run(&cli.dir, sandbox, name),
         Command::Rm { name } => commands::rm::rm(&name),
+        Command::Gc => commands::services::gc(&cli.dir),
         Command::Exec { interactive, tty, name, command } => {
             commands::exec::exec(&name, interactive, tty, &command)
         }

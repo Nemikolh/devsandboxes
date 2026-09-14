@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
-use super::pick;
+use super::{pick, services};
 use crate::config::{Config, LifecycleCommand, ResolvedSandbox, StringOrList, CONFIG_FILE};
 use crate::docker::{self, NAME_PREFIX};
 use crate::state::{Instance, State};
@@ -90,8 +90,18 @@ pub fn run(dir: &Path, sandbox_name: Option<String>, instance_name: Option<Strin
         run_host_commands(dir, cmd).context("initializeCommand failed")?;
     }
 
+    // Bring up shared services + the project network; the instance container
+    // joins that network so it can reach services by name.
+    let project = services::project_id(dir)?;
+    let service_names = props.services.clone().unwrap_or_default();
+    let network = services::ensure_services(&config, &project, &service_names)?;
+
     let (container, source, worktree) = match &props.docker_compose_file {
-        Some(files) => (compose_up(dir, &sandbox, files, &container_name)?, folder.clone(), None),
+        Some(files) => (
+            compose_up(dir, &sandbox, files, &container_name, network.as_deref())?,
+            folder.clone(),
+            None,
+        ),
         None => {
             // First instance for this base folder mounts it directly; a base
             // folder already live in another instance gets a git worktree so
@@ -107,13 +117,20 @@ pub fn run(dir: &Path, sandbox_name: Option<String>, instance_name: Option<Strin
                 // The worktree's `.git` file points at `<base>/.git/worktrees/..`
                 // by absolute host path; mount the base `.git` at the identical
                 // path so git works inside the container.
-                let git = folder.join(".git");
-                let mount = format!("{}:{}", git.display(), git.display());
-                (wt.clone(), Some(wt), vec![mount])
+                (wt.clone(), Some(wt), vec![git_companion_mount(&folder)])
             } else {
                 (folder.clone(), None, Vec::new())
             };
-            docker_run(dir, &sandbox, &container_name, &source, &folder, &workspace, &extra_mounts)?;
+            docker_run(
+                dir,
+                &sandbox,
+                &container_name,
+                &source,
+                &folder,
+                &workspace,
+                &extra_mounts,
+                network.as_deref(),
+            )?;
             (container_name.clone(), source, worktree)
         }
     };
@@ -163,10 +180,22 @@ fn default_instance_name(state: &State, sandbox: &str) -> String {
     {
         return sandbox.to_string();
     }
+    first_free_ordinal(state, sandbox)
+}
+
+/// First free `<sandbox>-<n>` (n >= 2) not present in state.
+fn first_free_ordinal(state: &State, sandbox: &str) -> String {
     (2..)
         .map(|n| format!("{sandbox}-{n}"))
         .find(|name| !state.instances.contains_key(name))
         .expect("infinite range yields a free name")
+}
+
+/// Bind mount for the base repo's `.git` at the identical host path, so a
+/// worktree's absolute `gitdir` pointer resolves inside the container.
+fn git_companion_mount(base: &Path) -> String {
+    let git = base.join(".git");
+    format!("{}:{}", git.display(), git.display())
 }
 
 /// True when the named container exists and is running.
@@ -228,6 +257,7 @@ fn docker_run(
     base_folder: &Path,
     workspace: &str,
     extra_mounts: &[String],
+    network: Option<&str>,
 ) -> Result<()> {
     let image = image_for(dir, sandbox)?;
     let mount = format!("{}:{workspace}", source.display());
@@ -247,6 +277,10 @@ fn docker_run(
     for mount in extra_mounts {
         args.push("-v".into());
         args.push(mount.clone());
+    }
+    if let Some(network) = network {
+        args.push("--network".into());
+        args.push(network.to_string());
     }
     if let Some(env) = &sandbox.properties.container_env {
         for (key, value) in env {
@@ -317,6 +351,7 @@ fn compose_up(
     sandbox: &ResolvedSandbox,
     files: &StringOrList,
     project: &str,
+    network: Option<&str>,
 ) -> Result<String> {
     let props = &sandbox.properties;
     let service = props.service.as_deref().with_context(|| {
@@ -327,6 +362,12 @@ fn compose_up(
     for file in files.to_vec() {
         args.push("-f".into());
         args.push(dir.join(file).to_string_lossy().into_owned());
+    }
+    // Attach the compose service to the shared project network without editing
+    // the user's compose files.
+    if let Some(network) = network {
+        args.push("-f".into());
+        args.push(compose_network_override(service, network)?);
     }
     args.extend(["-p".into(), project.into(), "up".into(), "-d".into(), service.into()]);
     if let Some(run_services) = &props.run_services {
@@ -343,6 +384,17 @@ fn compose_up(
         .with_context(|| format!("no container found for compose service `{service}`"))?;
     let name = docker::output(&["inspect", "-f", "{{.Name}}", id])?;
     Ok(name.trim_start_matches('/').to_string())
+}
+
+/// Write a compose override attaching `service` to the external shared
+/// `network`, returning its path. Never touches the user's compose files.
+fn compose_network_override(service: &str, network: &str) -> Result<String> {
+    let yaml = format!(
+        "networks:\n  {network}:\n    external: true\nservices:\n  {service}:\n    networks:\n      - {network}\n"
+    );
+    let path = std::env::temp_dir().join(format!("devsandbox-{network}-{service}.yml"));
+    std::fs::write(&path, yaml).with_context(|| format!("cannot write {}", path.display()))?;
+    Ok(path.to_string_lossy().into_owned())
 }
 
 /// Run a lifecycle command's argv lists on the host (initializeCommand).
@@ -492,5 +544,40 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["extensions"], serde_json::json!(["new.ext"]));
         assert_eq!(parsed["settings"]["x"], 1);
+    }
+
+    fn instance(name: &str) -> Instance {
+        Instance {
+            sandbox: "repo".into(),
+            container: format!("{NAME_PREFIX}{name}"),
+            folder: "/tmp/repo".into(),
+            base_folder: "/tmp/repo".into(),
+            worktree: None,
+            workspace: "/workspaces/repo".into(),
+            remote_env: Default::default(),
+            created_unix: 0,
+        }
+    }
+
+    #[test]
+    fn ordinal_naming_skips_taken_names() {
+        let mut state = State::default();
+        state.instances.insert("repo".into(), instance("repo"));
+        state.instances.insert("repo-2".into(), instance("repo-2"));
+        assert_eq!(first_free_ordinal(&state, "repo"), "repo-3");
+        // Deterministic: no random component.
+        assert_eq!(first_free_ordinal(&state, "repo"), "repo-3");
+    }
+
+    #[test]
+    fn default_name_is_sandbox_when_absent() {
+        let state = State::default();
+        assert_eq!(default_instance_name(&state, "repo"), "repo");
+    }
+
+    #[test]
+    fn git_companion_mount_uses_identical_paths() {
+        let mount = git_companion_mount(Path::new("/home/u/repo"));
+        assert_eq!(mount, "/home/u/repo/.git:/home/u/repo/.git");
     }
 }
