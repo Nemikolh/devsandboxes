@@ -35,6 +35,11 @@ pub struct SandboxProperties {
     #[allow(dead_code)]
     #[serde(rename = "cache-folder")]
     pub cache_folder: Option<String>,
+    /// When true, provision a per-instance `.zsh_history` on the host and
+    /// bind-mount it, so shell history survives rebuilds without being shared
+    /// between concurrent instances.
+    #[serde(rename = "persist-shell-history")]
+    pub persist_shell_history: Option<bool>,
 
     // --- implemented devcontainer properties ---
     pub image: Option<String>,
@@ -819,6 +824,24 @@ customizations.vscode.extensions = ["b.two"]
             props.vscode_extensions(),
             Some(&["a.one".to_string(), "b.two".to_string()][..])
         );
+    }
+
+    #[test]
+    fn persist_shell_history_parses_and_merges() {
+        let config = Config::parse(
+            r#"
+[template.base]
+persist-shell-history = true
+
+[sandbox.s]
+extends = "base"
+image = "alpine"
+"#,
+        )
+        .unwrap();
+        let props = config.resolve_sandbox("s").unwrap().properties;
+        assert_eq!(props.persist_shell_history, Some(true));
+        assert!(props.ignored().is_empty());
     }
 
     #[test]

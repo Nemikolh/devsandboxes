@@ -27,6 +27,10 @@ pub struct Instance {
     /// the base folder directly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<PathBuf>,
+    /// Host path of this instance's managed `.zsh_history`, when
+    /// `persist-shell-history` is on. Removed with the instance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell_history: Option<PathBuf>,
     /// Workspace folder inside the container.
     pub workspace: String,
     /// devcontainer `remoteEnv`, applied to every exec in the container.
@@ -98,6 +102,7 @@ mod tests {
                 folder: "/home/u/repository-1".into(),
                 base_folder: "/home/u/repository-1".into(),
                 worktree: None,
+                shell_history: None,
                 workspace: "/workspaces/repository-1".into(),
                 remote_env: BTreeMap::new(),
                 created_unix: Instance::now(),

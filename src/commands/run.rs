@@ -109,7 +109,15 @@ pub fn run(dir: &Path, sandbox_name: Option<String>, instance_name: Option<Strin
     } else {
         (folder.clone(), None, Vec::new())
     };
-    let mounts = resolve_mounts(dir, &folder, &basename, &sandbox)?;
+    let mut mounts = resolve_mounts(dir, &folder, &basename, &sandbox)?;
+    // Managed per-instance shell history: provision the host file and mount it.
+    let shell_history = if props.persist_shell_history == Some(true) {
+        let (path, mount) = provision_shell_history(dir, &instance)?;
+        mounts.push(mount);
+        Some(path)
+    } else {
+        None
+    };
     docker_run(
         dir,
         &sandbox,
@@ -132,6 +140,7 @@ pub fn run(dir: &Path, sandbox_name: Option<String>, instance_name: Option<Strin
             folder: source,
             base_folder: folder,
             worktree,
+            shell_history,
             workspace: workspace.clone(),
             remote_env: props.remote_env.clone().unwrap_or_default(),
             created_unix: Instance::now(),
@@ -328,6 +337,28 @@ fn resolve_mounts(
         args.push(resolved.to_arg());
     }
     Ok(args)
+}
+
+/// Provision this instance's managed `.zsh_history` under
+/// `${configDir}/shared-volumes/history/<instance>.zsh_history` (touched so the
+/// bind mounts as a file, not a directory) and return (host path, `--mount` arg).
+fn provision_shell_history(dir: &Path, instance: &str) -> Result<(PathBuf, String)> {
+    let config_dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let path = config_dir
+        .join("shared-volumes")
+        .join("history")
+        .join(format!("{instance}.zsh_history"));
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("cannot create {}", parent.display()))?;
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("cannot create {}", path.display()))?;
+    let mount = format!("type=bind,source={},target=/root/.zsh_history", path.display());
+    Ok((path, mount))
 }
 
 /// Create a missing bind-mount source. A final path component containing a dot
@@ -562,6 +593,7 @@ mod tests {
             folder: "/tmp/repo".into(),
             base_folder: "/tmp/repo".into(),
             worktree: None,
+            shell_history: None,
             workspace: "/workspaces/repo".into(),
             remote_env: Default::default(),
             created_unix: 0,

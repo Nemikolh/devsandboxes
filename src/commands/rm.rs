@@ -41,9 +41,15 @@ pub fn rm(name: &str) -> Result<()> {
     let worktree = info.worktree.clone();
     let base_folder = info.base_folder.clone();
     let project = info.project.clone();
+    let shell_history = info.shell_history.clone();
 
     // Remove the container; ignore failure (it may already be gone).
     let _ = docker::run_inherit(&["rm", "-f", &container]);
+
+    // Drop this instance's managed shell-history file, if any.
+    if let Some(path) = shell_history {
+        let _ = std::fs::remove_file(path);
+    }
 
     // Reap this instance's isolated services and its per-instance network. Global
     // services are shared and left to `gc`. Empty `project` = pre-upgrade state.
