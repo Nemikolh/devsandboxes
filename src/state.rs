@@ -12,8 +12,17 @@ pub struct Instance {
     pub sandbox: String,
     /// Docker container name (prefixed).
     pub container: String,
-    /// Absolute path of the mounted project folder on the host.
+    /// Absolute path of the mounted project folder on the host (the worktree
+    /// path for worktree instances, otherwise the base folder).
     pub folder: PathBuf,
+    /// Absolute path of the base repo folder this instance derives from. Equals
+    /// `folder` for the first instance; differs when `worktree` is set.
+    #[serde(default)]
+    pub base_folder: PathBuf,
+    /// Git worktree path, when this instance runs against a worktree rather than
+    /// the base folder directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<PathBuf>,
     /// Workspace folder inside the container.
     pub workspace: String,
     /// devcontainer `remoteEnv`, applied to every exec in the container.
@@ -82,6 +91,8 @@ mod tests {
                 sandbox: "repository-1".into(),
                 container: "devsandbox-repo-abc1".into(),
                 folder: "/home/u/repository-1".into(),
+                base_folder: "/home/u/repository-1".into(),
+                worktree: None,
                 workspace: "/workspaces/repository-1".into(),
                 remote_env: BTreeMap::new(),
                 created_unix: Instance::now(),

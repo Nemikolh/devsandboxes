@@ -39,3 +39,16 @@ pub fn run_checked(args: &[&str]) -> Result<()> {
     }
     Ok(())
 }
+
+/// `docker inspect -f <format> <name>`, returning `None` when the object does
+/// not exist (any inspect failure is treated as "not found").
+pub fn inspect(name: &str, format: &str) -> Result<Option<String>> {
+    let out = Command::new("docker")
+        .args(["inspect", "-f", format, name])
+        .output()
+        .context("failed to run docker (is it installed?)")?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+    Ok(Some(String::from_utf8_lossy(&out.stdout).trim().to_string()))
+}

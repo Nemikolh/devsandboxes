@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 
@@ -58,27 +57,64 @@ pub fn run(dir: &Path, sandbox_name: Option<String>, instance_name: Option<Strin
         .unwrap_or_else(|| format!("/workspaces/{basename}"));
 
     let mut state = State::load()?;
+    // Deterministic name: explicit --name, or the sandbox name for the first
+    // instance. When the base instance is already live, default to the next
+    // free ordinal so a repeat `run` yields a worktree instance (see below).
     let instance = match instance_name {
-        Some(name) => {
-            if state.instances.contains_key(&name) {
-                bail!("instance `{name}` already exists");
-            }
-            name
-        }
-        None => format!("{sandbox_name}-{}", suffix()),
+        Some(name) => name,
+        None => default_instance_name(&state, &sandbox_name),
     };
     let container_name = format!("{NAME_PREFIX}{instance}");
+
+    // Reuse an existing instance whose container still exists: docker start it
+    // if stopped, refresh config, run postStartCommand, done.
+    let container_status = docker::inspect(&container_name, "{{.State.Running}}")?;
+    if let (true, Some(running)) = (state.instances.contains_key(&instance), &container_status) {
+        warn_on_drift(&container_name, &sandbox.config_hash)?;
+        if running != "true" {
+            docker::run_checked(&["start", &container_name])?;
+        }
+        if let Some(extensions) = props.vscode_extensions() {
+            write_vscode_name_config(&container_name, extensions)?;
+        }
+        if let Some(cmd) = &props.post_start_command {
+            exec_lifecycle(&container_name, &workspace, props.remote_env.as_ref(), cmd)
+                .context("postStartCommand failed")?;
+        }
+        println!("{instance}");
+        return Ok(());
+    }
 
     // initializeCommand runs on the host, before anything is created.
     if let Some(cmd) = &props.initialize_command {
         run_host_commands(dir, cmd).context("initializeCommand failed")?;
     }
 
-    let container = match &props.docker_compose_file {
-        Some(files) => compose_up(dir, &sandbox, files, &container_name)?,
+    let (container, source, worktree) = match &props.docker_compose_file {
+        Some(files) => (compose_up(dir, &sandbox, files, &container_name)?, folder.clone(), None),
         None => {
-            docker_run(dir, &sandbox, &container_name, &folder, &workspace)?;
-            container_name.clone()
+            // First instance for this base folder mounts it directly; a base
+            // folder already live in another instance gets a git worktree so
+            // the two containers never share a working tree.
+            let base_in_use = state
+                .instances
+                .values()
+                .filter(|i| i.base_folder == folder)
+                .any(|i| container_running(&i.container));
+            let (source, worktree, extra_mounts) = if base_in_use {
+                let wt = dir.join(".worktrees").join(&instance);
+                create_worktree(&folder, &wt, &instance)?;
+                // The worktree's `.git` file points at `<base>/.git/worktrees/..`
+                // by absolute host path; mount the base `.git` at the identical
+                // path so git works inside the container.
+                let git = folder.join(".git");
+                let mount = format!("{}:{}", git.display(), git.display());
+                (wt.clone(), Some(wt), vec![mount])
+            } else {
+                (folder.clone(), None, Vec::new())
+            };
+            docker_run(dir, &sandbox, &container_name, &source, &folder, &workspace, &extra_mounts)?;
+            (container_name.clone(), source, worktree)
         }
     };
 
@@ -87,7 +123,9 @@ pub fn run(dir: &Path, sandbox_name: Option<String>, instance_name: Option<Strin
         Instance {
             sandbox: sandbox_name,
             container: container.clone(),
-            folder,
+            folder: source,
+            base_folder: folder,
+            worktree,
             workspace: workspace.clone(),
             remote_env: props.remote_env.clone().unwrap_or_default(),
             created_unix: Instance::now(),
@@ -116,25 +154,100 @@ pub fn run(dir: &Path, sandbox_name: Option<String>, instance_name: Option<Strin
     Ok(())
 }
 
+/// Default instance name: the sandbox name for the first instance, or when that
+/// instance is already live, the first free `<sandbox>-<n>` ordinal (n >= 2).
+/// A stopped base instance is reused rather than duplicated.
+fn default_instance_name(state: &State, sandbox: &str) -> String {
+    if !state.instances.contains_key(sandbox)
+        || !container_running(&format!("{NAME_PREFIX}{sandbox}"))
+    {
+        return sandbox.to_string();
+    }
+    (2..)
+        .map(|n| format!("{sandbox}-{n}"))
+        .find(|name| !state.instances.contains_key(name))
+        .expect("infinite range yields a free name")
+}
+
+/// True when the named container exists and is running.
+fn container_running(container: &str) -> bool {
+    docker::inspect(container, "{{.State.Running}}")
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some("true")
+}
+
+/// Create a git worktree with a fresh `sandbox/<instance>` branch. Git refuses
+/// to check out a branch already checked out elsewhere, so the branch is unique
+/// per instance.
+fn create_worktree(base: &Path, worktree: &Path, instance: &str) -> Result<()> {
+    if let Some(parent) = worktree.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("cannot create {}", parent.display()))?;
+    }
+    let branch = format!("sandbox/{instance}");
+    let status = std::process::Command::new("git")
+        .args([
+            "-C",
+            &base.to_string_lossy(),
+            "worktree",
+            "add",
+            &worktree.to_string_lossy(),
+            "-b",
+            &branch,
+        ])
+        .status()
+        .context("failed to run git (is it installed?)")?;
+    if !status.success() {
+        bail!("git worktree add failed for `{}`", worktree.display());
+    }
+    Ok(())
+}
+
+/// Warn when the reused container's recorded config hash differs from the
+/// freshly resolved one. Compose containers carry no such label (None) — skip.
+fn warn_on_drift(container: &str, expected: &str) -> Result<()> {
+    let label = docker::inspect(container, "{{index .Config.Labels \"devsandbox.config_hash\"}}")?;
+    if let Some(hash) = label {
+        if !hash.is_empty() && hash != expected {
+            eprintln!(
+                "warning: config for `{container}` changed since it was created; \
+                 remove and re-run to apply changes"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn docker_run(
     dir: &Path,
     sandbox: &ResolvedSandbox,
     container: &str,
-    folder: &Path,
+    source: &Path,
+    base_folder: &Path,
     workspace: &str,
+    extra_mounts: &[String],
 ) -> Result<()> {
     let image = image_for(dir, sandbox)?;
-    let mount = format!("{}:{workspace}", folder.display());
+    let mount = format!("{}:{workspace}", source.display());
     let sandbox_label = format!("devsandbox.sandbox={}", sandbox.name);
     let instance = container.strip_prefix(NAME_PREFIX).unwrap_or(container);
     let instance_label = format!("devsandbox.instance={instance}");
+    let hash_label = format!("devsandbox.config_hash={}", sandbox.config_hash);
+    let base_label = format!("devsandbox.base_folder={}", base_folder.display());
     let mut args: Vec<String> = [
         "run", "-d", "--name", container,
         "--label", &sandbox_label, "--label", &instance_label,
+        "--label", &hash_label, "--label", &base_label,
         "-v", &mount, "-w", workspace,
     ]
     .map(str::to_string)
     .into();
+    for mount in extra_mounts {
+        args.push("-v".into());
+        args.push(mount.clone());
+    }
     if let Some(env) = &sandbox.properties.container_env {
         for (key, value) in env {
             args.push("-e".into());
@@ -275,21 +388,43 @@ fn exec_lifecycle(
 /// Register `customizations.vscode.extensions` with the Remote-Containers
 /// extension by writing its per-container-name config file.
 fn write_vscode_name_config(container: &str, extensions: &[String]) -> Result<()> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
+    let base = editor_config_base()?;
+    // Every installed VS Code-family product keys nameConfigs by container name.
+    for product in ["Code", "Cursor", "VSCodium"] {
+        let product_dir = base.join(product);
+        if !product_dir.is_dir() {
+            continue; // not installed
+        }
+        let dir =
+            product_dir.join("User/globalStorage/ms-vscode-remote.remote-containers/nameConfigs");
+        std::fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
+        let path = dir.join(format!("{container}.json"));
+        let existing = match std::fs::read_to_string(&path) {
+            Ok(contents) => Some(contents),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
+        };
+        let contents = merged_name_config(existing.as_deref(), extensions)
+            .with_context(|| format!("in {}", path.display()))?;
+        std::fs::write(&path, contents)
+            .with_context(|| format!("cannot write {}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// Per-OS base dir that holds each editor product's config directory:
+/// `~/Library/Application Support` on macOS, `$XDG_CONFIG_HOME`/`~/.config`
+/// elsewhere.
+fn editor_config_base() -> Result<PathBuf> {
+    if cfg!(target_os = "macos") {
+        return std::env::var_os("HOME")
+            .map(|h| PathBuf::from(h).join("Library/Application Support"))
+            .context("cannot determine config dir ($HOME)");
+    }
+    std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-        .context("cannot determine config dir ($XDG_CONFIG_HOME or $HOME)")?;
-    let dir = base.join("Code/User/globalStorage/ms-vscode-remote.remote-containers/nameConfigs");
-    std::fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
-    let path = dir.join(format!("{container}.json"));
-    let existing = match std::fs::read_to_string(&path) {
-        Ok(contents) => Some(contents),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
-    };
-    let contents = merged_name_config(existing.as_deref(), extensions)
-        .with_context(|| format!("in {}", path.display()))?;
-    std::fs::write(&path, contents).with_context(|| format!("cannot write {}", path.display()))
+        .context("cannot determine config dir ($XDG_CONFIG_HOME or $HOME)")
 }
 
 /// Existing name-config JSON (if any) with `extensions` replaced.
@@ -338,21 +473,6 @@ extends = "base"
 folder = "../example"
 image = "mcr.microsoft.com/devcontainers/base:ubuntu"
 "#;
-
-/// Short unique-enough suffix for generated instance names.
-fn suffix() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos() as u64 + d.as_secs() * 1_000_000_000)
-        .unwrap_or(0);
-    let mut n = nanos % 36u64.pow(4);
-    let mut out = String::new();
-    for _ in 0..4 {
-        out.push(char::from_digit((n % 36) as u32, 36).unwrap());
-        n /= 36;
-    }
-    out
-}
 
 #[cfg(test)]
 mod tests {

@@ -37,6 +37,11 @@ enum Command {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Remove a sandbox instance (container, worktree, state entry)
+    Rm {
+        /// Instance name, sandbox config name, or repository folder name
+        name: String,
+    },
     /// Run a command in a sandbox instance
     Exec {
         /// Keep stdin open
@@ -60,6 +65,7 @@ fn main() -> Result<()> {
         Command::Ls => commands::ls::ls(&cli.dir),
         Command::Ps { all } => commands::ps::ps(all),
         Command::Run { sandbox, name } => commands::run::run(&cli.dir, sandbox, name),
+        Command::Rm { name } => commands::rm::rm(&name),
         Command::Exec { interactive, tty, name, command } => {
             commands::exec::exec(&name, interactive, tty, &command)
         }

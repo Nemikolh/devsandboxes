@@ -235,6 +235,8 @@ impl LifecycleCommand {
 pub struct ResolvedSandbox {
     pub name: String,
     pub properties: SandboxProperties,
+    /// Stable hash of the merged config, used to detect drift on reuse.
+    pub config_hash: String,
 }
 
 impl ResolvedSandbox {
@@ -297,6 +299,7 @@ impl Config {
         };
         properties.remove("extends");
 
+        let config_hash = config_hash(&properties);
         let properties: SandboxProperties = properties
             .try_into()
             .map_err(|e| anyhow!("sandbox `{name}`: {e}"))?;
@@ -304,6 +307,7 @@ impl Config {
         Ok(ResolvedSandbox {
             name: name.to_string(),
             properties,
+            config_hash,
         })
     }
 
@@ -317,6 +321,18 @@ impl Config {
 
 /// Deep merge: `over` wins; nested tables merge recursively, everything else
 /// is replaced wholesale.
+/// Stable FNV-1a hash of a merged config table. `Table` is a `BTreeMap`, so its
+/// TOML serialization is key-sorted and deterministic across runs.
+fn config_hash(table: &Table) -> String {
+    let text = toml::to_string(table).unwrap_or_default();
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in text.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    format!("{h:016x}")
+}
+
 fn deep_merge(base: Table, over: Table) -> Table {
     let mut merged = base;
     for (key, value) in over {
@@ -383,6 +399,16 @@ build.args = { B = "3" }
         // A comes from the template, B is overridden by the sandbox.
         assert_eq!(args["A"], "1");
         assert_eq!(args["B"], "3");
+    }
+
+    #[test]
+    fn config_hash_is_stable_and_sensitive() {
+        let config = Config::parse(EXAMPLE).unwrap();
+        let a = config.resolve_sandbox("repository-1").unwrap().config_hash;
+        let b = config.resolve_sandbox("repository-1").unwrap().config_hash;
+        assert_eq!(a, b, "same config must hash identically");
+        let c = config.resolve_sandbox("repository-2").unwrap().config_hash;
+        assert_ne!(a, c, "different configs must hash differently");
     }
 
     #[test]

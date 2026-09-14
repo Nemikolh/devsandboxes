@@ -1,6 +1,7 @@
 pub mod exec;
 pub mod ls;
 pub mod ps;
+pub mod rm;
 pub mod run;
 
 use std::io::Write;
