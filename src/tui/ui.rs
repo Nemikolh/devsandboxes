@@ -8,8 +8,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Tabs};
 
-use super::app::{App, ConfigView, Modal, Side, Tab};
-use super::data::{humanize_secs, ContainerStatus, InstanceRow, ServiceRow};
+use super::app::{App, ConfigView, Modal, Side, Tab, TextModal};
+use super::data::{humanize_secs, totals_line, ContainerStatus, InstanceRow, ServiceRow};
 use super::prompt::Prompt;
 
 const HIGHLIGHT: Color = Color::Cyan;
@@ -32,20 +32,46 @@ pub fn draw(frame: &mut Frame, app: &App) {
         draw_help(frame, app, bottom_area);
     }
 
-    // The config modal draws over everything, using the full frame.
-    if let Modal::Config(view) = &app.modal {
-        draw_config_modal(frame, view);
+    // A modal draws over everything, using the full frame.
+    match &app.modal {
+        Modal::None => {}
+        Modal::Config(view) => draw_config_modal(frame, view),
+        Modal::Help(view) => draw_text_modal(frame, view),
+        Modal::Logs(view) => draw_text_modal(frame, view),
     }
 }
 
 fn draw_tabs(frame: &mut Frame, app: &App, area: Rect) {
+    // Right-aligned totals summary shares the tab-bar row; tabs take the rest.
+    let totals = app
+        .snapshot
+        .as_ref()
+        .map(|s| totals_line(s, s.collected_at.elapsed()));
+    let totals_w = totals.as_deref().map_or(0, |t| t.chars().count() as u16);
+    // Leave a gap before the totals; drop them entirely when the row is too narrow.
+    let reserve = if totals_w > 0 && area.width > totals_w + 4 {
+        totals_w + 2
+    } else {
+        0
+    };
+    let [tabs_area, totals_area] =
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(reserve)]).areas(area);
+
     let selected = Tab::ALL.iter().position(|t| *t == app.tab).unwrap_or(0);
     let tabs = Tabs::new(Tab::ALL.iter().map(|t| t.title()))
         .select(selected)
         .style(Style::default())
         .highlight_style(Style::default().fg(HIGHLIGHT).add_modifier(Modifier::BOLD))
         .divider(" ");
-    frame.render_widget(tabs, area);
+    frame.render_widget(tabs, tabs_area);
+
+    if reserve > 0 {
+        if let Some(totals) = totals {
+            let line = Line::from(Span::styled(totals, Style::default().add_modifier(Modifier::DIM)))
+                .alignment(Alignment::Right);
+            frame.render_widget(Paragraph::new(line), totals_area);
+        }
+    }
 }
 
 fn draw_content(frame: &mut Frame, app: &App, area: Rect) {
@@ -421,7 +447,9 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
     }
     let text = match app.modal {
         Modal::Config(_) => "tab original/resolved · ↑↓ scroll · pgup/pgdn · g/G · esc close",
-        Modal::None => "q quit · tab switch tab · ↑↓ select · enter/e config · : command",
+        Modal::Help(_) => "↑↓ scroll · pgup/pgdn · g/G · esc/? close",
+        Modal::Logs(_) => "↑↓ scroll · pgup/pgdn · g/G · esc close",
+        Modal::None => "q quit · tab switch · ↑↓ select · enter config · l logs · : cmd · ? help",
     };
     let help = Line::from(text).style(Style::default().add_modifier(Modifier::DIM));
     frame.render_widget(Paragraph::new(help), area);
@@ -504,6 +532,19 @@ fn draw_config_modal(frame: &mut Frame, view: &ConfigView) {
     let paragraph = Paragraph::new(lines).block(block).scroll((view.scroll, 0));
 
     // Clear whatever is underneath so the modal is opaque.
+    frame.render_widget(ratatui::widgets::Clear, area);
+    frame.render_widget(paragraph, area);
+}
+
+/// Render a plain scrollable text modal (help, logs) full-screen. No per-line
+/// highlighting — the body is shown verbatim.
+fn draw_text_modal(frame: &mut Frame, view: &TextModal) {
+    let area = frame.area();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(HIGHLIGHT))
+        .title(view.title.clone());
+    let paragraph = Paragraph::new(view.body.clone()).block(block).scroll((view.scroll, 0));
     frame.render_widget(ratatui::widgets::Clear, area);
     frame.render_widget(paragraph, area);
 }

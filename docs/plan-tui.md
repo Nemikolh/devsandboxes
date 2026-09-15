@@ -1,5 +1,7 @@
 # Plan: `ls` rendering + interactive dashboard
 
+**Status: implemented through step 7 (all steps done).**
+
 Repo: `devsandbox` (Rust, clap CLI managing devcontainer sandboxes).
 Key modules: `src/config.rs` (TOML config, templates/`extends`, `resolve_sandbox`),
 `src/state.rs` (instances in `~/.local/share/devsandbox/state.toml`),
@@ -11,7 +13,7 @@ Constraints for the implementing agent:
 - Run `cargo build` and `cargo test` before reporting a step done.
 - New deps only as listed per step (`ratatui`, `crossterm`); everything else stays std.
 
-## Step 1 — `ls`: empty-state message + colored invisible table
+## Step 1 — `ls`: empty-state message + colored invisible table  ✅ done
 
 `src/commands/ls.rs` currently prints raw `\t`-separated fields.
 
@@ -25,7 +27,7 @@ Constraints for the implementing agent:
 - Color only when stdout `IsTerminal()` and `NO_COLOR` is unset. Helpers live in a new
   `src/render.rs` (small: `style(s, code)`-style functions) so later steps can reuse them.
 
-## Step 2 — Dashboard scaffold (`devsandbox` with no args)
+## Step 2 — Dashboard scaffold (`devsandbox` with no args)  ✅ done
 
 - `main.rs`: `command: Option<Command>`; `None` + stdin/stdout are TTYs → launch dashboard;
   `None` without TTY → print clap help, exit 2.
@@ -37,7 +39,7 @@ Constraints for the implementing agent:
   - chrome: tab bar on top, bottom help bar (`q quit · tab switch · ↑↓ select …`).
 - Tabs render placeholder content this step; real data lands in steps 3–4.
 
-## Step 3 — Instances view
+## Step 3 — Instances view  ✅ done
 
 Data: `State::load()` joined with docker (`docker inspect` / one `docker ps --format json`
 call, plus `docker stats --no-stream` for cpu/mem). Collection runs on the tick in a
@@ -51,13 +53,13 @@ remoteUser, remoteEnv count, base folder vs worktree, config-drift warning (comp
 `ResolvedSandbox.config_hash` against the container's label — see `warn_on_drift` in
 `src/commands/run.rs`).
 
-## Step 4 — Services view
+## Step 4 — Services view  ✅ done
 
 From `Config::load(dir)` + docker: service name, scope (`global`/`isolated`),
 source (image or dockerfile), ports, container status per running instance,
 which live instances reference it. Same table/detail-panel pattern as step 3.
 
-## Step 5 — Config explorer modal
+## Step 5 — Config explorer modal  ✅ done
 
 - From either tab, `enter`/`e` on a sandbox (or the sandbox behind an instance) opens a
   full-screen modal showing its TOML.
@@ -68,7 +70,7 @@ which live instances reference it. Same table/detail-panel pattern as step 3.
   `esc`/`q` closes.
 - Light TOML highlighting (section headers, keys, strings) done manually over lines.
 
-## Step 6 — Command prompt: run / exec / code, history + completion
+## Step 6 — Command prompt: run / exec / code, history + completion  ✅ done
 
 - `:` opens a one-line prompt in the bottom bar. Commands:
   - `run <sandbox> [--name n]` — start instance,
@@ -88,7 +90,7 @@ which live instances reference it. Same table/detail-panel pattern as step 3.
 - History: `↑↓` in the prompt; persisted to `<data dir>/devsandbox/prompt_history`
   (same base-dir logic as `State::path`), capped at 200 entries, deduped consecutive.
 
-## Step 7 — Polish + extras
+## Step 7 — Polish + extras  ✅ done
 
 - `?` help overlay listing all keys.
 - Error toast (bottom-right, auto-dismiss on next key) instead of crashing on docker/config

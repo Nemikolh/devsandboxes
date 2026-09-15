@@ -7,9 +7,86 @@ use std::path::PathBuf;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::config::Config;
+use crate::docker;
 
 use super::data::Snapshot;
 use super::prompt::{Prompt, PromptAction, COMMANDS};
+
+/// Keybinding reference shown by the `?` overlay, grouped by context.
+const HELP_BODY: &str = "\
+Global
+  q, ctrl-c   quit
+  tab / S-tab switch tab      1/2  jump to tab
+  :           command prompt  ?    this help
+
+Tables (Instances / Services)
+  ↑/k ↓/j     move selection
+  enter, e    open config explorer
+  l           logs (Instances tab)
+
+Config modal
+  tab         toggle original / resolved
+  ↑/k ↓/j     scroll    pgup/pgdn  page
+  g / G       top / bottom
+  esc, q      close
+
+Logs modal
+  ↑/k ↓/j     scroll    pgup/pgdn  page
+  g / G       top / bottom
+  esc, q      close
+
+Command prompt (:)
+  run <sandbox> [--name n]    exec <instance> <cmd…>
+  code <instance>             rm <instance>
+  tab         complete / cycle
+  ↑ ↓         history
+  ctrl-u      clear line       ctrl-w  delete word
+  esc         cancel";
+
+/// A scrollable full-screen text overlay (help, logs). Body is captured once at
+/// open time; scrolling is the only interaction. Shared scroll math lives in
+/// [`clamp_scroll`]/[`line_count`] so the config modal and this stay in sync.
+pub struct TextModal {
+    /// Rendered in the modal border title.
+    pub title: String,
+    /// Full body text; rendered as-is (no per-line highlighting).
+    pub body: String,
+    pub scroll: u16,
+}
+
+impl TextModal {
+    pub fn new(title: String, body: String) -> Self {
+        Self { title, body, scroll: 0 }
+    }
+
+    /// Apply a scroll key. Returns `false` for keys that don't scroll (so the
+    /// caller can treat esc/q/? as close).
+    fn on_scroll_key(&mut self, key: KeyEvent) -> bool {
+        scroll_key(&mut self.scroll, line_count(&self.body), key)
+    }
+}
+
+/// Line count of `body`, clamped to `u16`, for scroll bounds.
+fn line_count(body: &str) -> u16 {
+    body.lines().count().min(u16::MAX as usize) as u16
+}
+
+/// Apply a scroll key to `scroll`, clamped to `[0, lines-1]`. Returns `true`
+/// when the key was a scroll key (consumed), `false` otherwise. Shared by the
+/// config modal and [`TextModal`].
+fn scroll_key(scroll: &mut u16, lines: u16, key: KeyEvent) -> bool {
+    let max = lines.saturating_sub(1);
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => *scroll = scroll.saturating_sub(1),
+        KeyCode::Down | KeyCode::Char('j') => *scroll = (*scroll).saturating_add(1).min(max),
+        KeyCode::PageUp => *scroll = scroll.saturating_sub(20),
+        KeyCode::PageDown => *scroll = (*scroll).saturating_add(20).min(max),
+        KeyCode::Char('g') => *scroll = 0,
+        KeyCode::Char('G') => *scroll = max,
+        _ => return false,
+    }
+    true
+}
 
 /// Which side of a [`ConfigView`] is currently shown.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -45,7 +122,7 @@ impl ConfigView {
 
     /// Line count of the current side, for scroll clamping.
     fn line_count(&self) -> u16 {
-        self.body().lines().count().min(u16::MAX as usize) as u16
+        line_count(self.body())
     }
 
     /// Clamp `scroll` into `[0, line_count)` (0 when empty).
@@ -57,10 +134,15 @@ impl ConfigView {
     }
 }
 
-/// Overlay state. `None` is the normal dashboard; `Config` is the explorer modal.
+/// Overlay state. `None` is the normal dashboard; the rest are full-screen
+/// modals that swallow every key until dismissed.
 pub enum Modal {
     None,
     Config(ConfigView),
+    /// Keybinding reference (`?`).
+    Help(TextModal),
+    /// Container log tail (`l` on the Instances tab).
+    Logs(TextModal),
 }
 
 /// The two top-level views. Real content lands in steps 3–4.
@@ -198,7 +280,7 @@ impl App {
         }
         // The modal swallows every key while it is up; the tab bar and tables
         // must not react underneath it.
-        if let Modal::Config(_) = self.modal {
+        if !matches!(self.modal, Modal::None) {
             self.on_key_modal(key);
             return;
         }
@@ -216,6 +298,8 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => self.select_up(),
             KeyCode::Down | KeyCode::Char('j') => self.select_down(),
             KeyCode::Enter | KeyCode::Char('e') => self.open_config(),
+            KeyCode::Char('l') => self.open_logs(),
+            KeyCode::Char('?') => self.open_help(),
             _ => {}
         }
     }
@@ -335,43 +419,71 @@ impl App {
         self.pending_action.take()
     }
 
-    /// Key handling while the config modal is open. Assumes `self.modal` is
-    /// `Config`; scroll clamps to content length.
+    /// Key handling while any modal is open. `esc`/`q` (and `?` for the help
+    /// overlay) close; the config modal additionally toggles sides on `tab`;
+    /// scroll keys are shared across all three. Assumes `self.modal` is not
+    /// `None`.
     fn on_key_modal(&mut self, key: KeyEvent) {
-        let Modal::Config(view) = &mut self.modal else {
+        match &mut self.modal {
+            Modal::None => {}
+            Modal::Config(view) => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => self.modal = Modal::None,
+                KeyCode::Tab => {
+                    view.showing = match view.showing {
+                        Side::Original => Side::Resolved,
+                        Side::Resolved => Side::Original,
+                    };
+                    view.clamp_scroll();
+                }
+                _ => {
+                    let lines = view.line_count();
+                    scroll_key(&mut view.scroll, lines, key);
+                }
+            },
+            Modal::Help(view) => {
+                if matches!(key.code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?')) {
+                    self.modal = Modal::None;
+                } else {
+                    view.on_scroll_key(key);
+                }
+            }
+            Modal::Logs(view) => {
+                if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+                    self.modal = Modal::None;
+                } else {
+                    view.on_scroll_key(key);
+                }
+            }
+        }
+    }
+
+    /// Open the help overlay listing all keybindings grouped by context.
+    fn open_help(&mut self) {
+        self.modal = Modal::Help(TextModal::new(" help — keys ".to_string(), HELP_BODY.to_string()));
+    }
+
+    /// Open a full-screen log tail for the selected instance's container.
+    /// Fetches `docker logs --tail 50` (stdout+stderr merged) at open time; a
+    /// missing container or docker error renders as the body. Instances tab only;
+    /// no-op with no selectable row.
+    fn open_logs(&mut self) {
+        if self.tab != Tab::Instances {
+            return;
+        }
+        let Some(snapshot) = &self.snapshot else {
             return;
         };
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => {
-                self.modal = Modal::None;
-            }
-            KeyCode::Tab => {
-                view.showing = match view.showing {
-                    Side::Original => Side::Resolved,
-                    Side::Resolved => Side::Original,
-                };
-                view.clamp_scroll();
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                view.scroll = view.scroll.saturating_sub(1);
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                view.scroll = view.scroll.saturating_add(1);
-                view.clamp_scroll();
-            }
-            KeyCode::PageUp => {
-                view.scroll = view.scroll.saturating_sub(20);
-            }
-            KeyCode::PageDown => {
-                view.scroll = view.scroll.saturating_add(20);
-                view.clamp_scroll();
-            }
-            KeyCode::Char('g') => view.scroll = 0,
-            KeyCode::Char('G') => {
-                view.scroll = view.line_count().saturating_sub(1);
-            }
-            _ => {}
-        }
+        let Some(row) = snapshot.instances.get(self.selected[Tab::Instances.index()]) else {
+            return;
+        };
+        let container = row.container.clone();
+        let body = match docker::output_merged(&["logs", "--tail", "50", &container]) {
+            Ok(out) if out.trim().is_empty() => "(no log output)".to_string(),
+            Ok(out) => out,
+            Err(e) => format!("{e:#}"),
+        };
+        let title = format!(" logs — {container} (last 50) ");
+        self.modal = Modal::Logs(TextModal::new(title, body));
     }
 
     /// Open the config explorer for the current selection. On the Instances tab
@@ -547,6 +659,8 @@ mod tests {
         Snapshot {
             instances,
             services: Vec::new(),
+            sandbox_count: 0,
+            docker_version: None,
             collected_at: std::time::Instant::now(),
             error: None,
         }
@@ -586,7 +700,7 @@ mod tests {
     fn view(app: &App) -> &ConfigView {
         match &app.modal {
             Modal::Config(v) => v,
-            Modal::None => panic!("modal not open"),
+            _ => panic!("config modal not open"),
         }
     }
 
@@ -644,6 +758,76 @@ mod tests {
         app.on_key(key(KeyCode::Char('2')));
         assert_eq!(app.tab, Tab::Instances);
         assert!(matches!(app.modal, Modal::Config(_)));
+    }
+
+    #[test]
+    fn help_overlay_opens_and_closes() {
+        let mut app = new_app();
+        app.on_key(key(KeyCode::Char('?')));
+        assert!(matches!(app.modal, Modal::Help(_)));
+
+        // The help modal swallows dashboard keys.
+        app.on_key(key(KeyCode::Char('2')));
+        assert_eq!(app.tab, Tab::Instances);
+        assert!(matches!(app.modal, Modal::Help(_)));
+
+        // `?` toggles it closed; so would esc/q.
+        app.on_key(key(KeyCode::Char('?')));
+        assert!(matches!(app.modal, Modal::None));
+
+        app.on_key(key(KeyCode::Char('?')));
+        app.on_key(key(KeyCode::Esc));
+        assert!(matches!(app.modal, Modal::None));
+
+        app.on_key(key(KeyCode::Char('?')));
+        app.on_key(key(KeyCode::Char('q')));
+        assert!(matches!(app.modal, Modal::None));
+    }
+
+    #[test]
+    fn text_modal_scroll_shares_config_logic() {
+        // A 10-line body scrolls and clamps identically to the config modal.
+        let mut m = TextModal::new("t".into(), (0..10).map(|i| format!("l{i}\n")).collect());
+        assert_eq!(m.scroll, 0);
+        assert!(m.on_scroll_key(key(KeyCode::Up))); // stays at 0
+        assert_eq!(m.scroll, 0);
+        assert!(m.on_scroll_key(key(KeyCode::Down)));
+        assert_eq!(m.scroll, 1);
+        assert!(m.on_scroll_key(key(KeyCode::Char('G'))));
+        assert_eq!(m.scroll, 9);
+        assert!(m.on_scroll_key(key(KeyCode::PageDown))); // clamps, no overflow
+        assert_eq!(m.scroll, 9);
+        assert!(m.on_scroll_key(key(KeyCode::Char('g'))));
+        assert_eq!(m.scroll, 0);
+        // A non-scroll key is not consumed.
+        assert!(!m.on_scroll_key(key(KeyCode::Char('x'))));
+    }
+
+    #[test]
+    fn logs_modal_opens_on_selected_instance() {
+        // Instances tab with a row and no docker: open_logs still opens the modal
+        // with the docker error as the body (never panics).
+        let mut app = new_app();
+        app.set_snapshot(snapshot_with(1));
+        app.on_key(key(KeyCode::Char('l')));
+        match &app.modal {
+            Modal::Logs(v) => {
+                assert!(v.title.contains("devsandbox-inst0"));
+                assert!(!v.body.is_empty());
+            }
+            _ => panic!("logs modal not open"),
+        }
+        app.on_key(key(KeyCode::Char('q')));
+        assert!(matches!(app.modal, Modal::None));
+    }
+
+    #[test]
+    fn logs_key_ignored_on_services_tab() {
+        let mut app = new_app();
+        app.set_snapshot(snapshot_with(1));
+        app.tab = Tab::Services;
+        app.on_key(key(KeyCode::Char('l')));
+        assert!(matches!(app.modal, Modal::None));
     }
 
     #[test]

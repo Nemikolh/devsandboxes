@@ -50,6 +50,37 @@ pub fn output_quiet(args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// Capture stdout and stderr merged into one string, for callers that own the
+/// screen (the TUI) and need both streams — `docker logs` writes container
+/// output to both. Non-zero exit is an error, with the first stderr line folded
+/// into the message. stdout is emitted first, then stderr, each trimmed.
+pub fn output_merged(args: &[&str]) -> Result<String> {
+    let out = Command::new("docker")
+        .args(args)
+        .output()
+        .context("failed to run docker (is it installed?)")?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        bail!(
+            "docker {}: {}",
+            args.first().unwrap_or(&""),
+            stderr.lines().next().unwrap_or("non-zero exit").trim()
+        );
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let mut merged = String::new();
+    merged.push_str(stdout.trim_end());
+    let stderr = stderr.trim_end();
+    if !stderr.is_empty() {
+        if !merged.is_empty() {
+            merged.push('\n');
+        }
+        merged.push_str(stderr);
+    }
+    Ok(merged.trim().to_string())
+}
+
 /// Like `run_inherit` but treats a non-zero exit as an error.
 pub fn run_checked(args: &[&str]) -> Result<()> {
     let code = run_inherit(args)?;

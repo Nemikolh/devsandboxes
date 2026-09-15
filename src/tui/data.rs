@@ -86,9 +86,13 @@ pub struct ServiceRow {
 pub struct Snapshot {
     pub instances: Vec<InstanceRow>,
     pub services: Vec<ServiceRow>,
-    /// When collection finished. Reserved for staleness display (later steps);
-    /// carried now so the collect/receive plumbing is stable.
-    #[allow(dead_code)]
+    /// Number of sandboxes defined in `config.toml` (0 when config is absent or
+    /// unreadable). Feeds the header totals line.
+    pub sandbox_count: usize,
+    /// Docker server version (e.g. `24.0.7`), or `None` when docker is down or
+    /// the version probe failed. Feeds the header totals line.
+    pub docker_version: Option<String>,
+    /// When collection finished. Drives the staleness indicator in the header.
     pub collected_at: Instant,
     pub error: Option<String>,
 }
@@ -284,6 +288,8 @@ pub fn collect(dir: &Path) -> Snapshot {
             return Snapshot {
                 instances: Vec::new(),
                 services: Vec::new(),
+                sandbox_count: 0,
+                docker_version: None,
                 collected_at,
                 error: Some(format!("state: {e:#}")),
             };
@@ -320,8 +326,16 @@ pub fn collect(dir: &Path) -> Snapshot {
         }
     };
 
+    // Docker server version for the header; best-effort (None when down). Kept
+    // off the UI thread like every other docker call here. Cheap enough to run
+    // each collection, so no caching is threaded through.
+    let docker_version = docker::output_quiet(&["version", "--format", "{{.Server.Version}}"])
+        .ok()
+        .filter(|v| !v.is_empty());
+
     // Load config once; resolve each distinct sandbox for services + drift hash.
     let config = Config::load(dir);
+    let sandbox_count = config.as_ref().map_or(0, |cfg| cfg.sandboxes.len());
     let mut resolved: BTreeMap<String, (Vec<String>, String)> = BTreeMap::new();
     match &config {
         Ok(cfg) => {
@@ -421,9 +435,55 @@ pub fn collect(dir: &Path) -> Snapshot {
     Snapshot {
         instances,
         services,
+        sandbox_count,
+        docker_version,
         collected_at,
         error: if errors.is_empty() { None } else { Some(errors.join("; ")) },
     }
+}
+
+/// How stale a snapshot may be before the header flags it, in seconds. Normal
+/// refresh cadence is 2s (see `mod::TICK_INTERVAL`); 10s means collection is
+/// slow or failing.
+pub const STALE_AFTER_SECS: u64 = 10;
+
+/// Right-aligned totals summary for the header, e.g.
+/// `3 sandboxes · 1 running / 2 stopped · 2 service containers · docker 24.0.7`.
+/// A trailing ` (stale Ns)` is appended when `collected_at` is older than
+/// [`STALE_AFTER_SECS`]. Pure over the snapshot so it is unit-testable; `age` is
+/// passed in rather than read from the clock.
+pub fn totals_line(snapshot: &Snapshot, age: std::time::Duration) -> String {
+    let running = snapshot
+        .instances
+        .iter()
+        .filter(|r| matches!(r.status, ContainerStatus::Running(_)))
+        .count();
+    let stopped = snapshot.instances.len() - running;
+    // Service containers that actually exist (any non-Missing backing container).
+    let service_containers: usize = snapshot
+        .services
+        .iter()
+        .flat_map(|s| &s.containers)
+        .filter(|(_, st)| !matches!(st, ContainerStatus::Missing))
+        .count();
+    let version = snapshot.docker_version.as_deref().unwrap_or("?");
+
+    let mut line = format!(
+        "{} {} · {running} running / {stopped} stopped · {service_containers} service {} · docker {version}",
+        snapshot.sandbox_count,
+        plural(snapshot.sandbox_count, "sandbox", "sandboxes"),
+        plural(service_containers, "container", "containers"),
+    );
+    if age.as_secs() >= STALE_AFTER_SECS {
+        line.push_str(&format!(" (stale {}s)", age.as_secs()));
+    }
+    line
+}
+
+/// `n singular` / `n plural` word choice (the count itself is rendered by the
+/// caller; this only returns the noun).
+fn plural<'a>(n: usize, singular: &'a str, plural: &'a str) -> &'a str {
+    if n == 1 { singular } else { plural }
 }
 
 /// True when the container's recorded config hash differs from the freshly
@@ -591,6 +651,100 @@ mod tests {
         assert!(row.config_hash.is_empty());
         assert_eq!(row.env_len, 0);
         assert!(row.command.is_none());
+    }
+
+    fn inst(name: &str, status: ContainerStatus) -> InstanceRow {
+        InstanceRow {
+            name: name.into(),
+            sandbox: "s".into(),
+            container: format!("devsandbox-{name}"),
+            status,
+            uptime_secs: 0,
+            cpu: None,
+            mem: None,
+            folder: "/f".into(),
+            worktree: false,
+            services: Vec::new(),
+            workspace: "/w".into(),
+            remote_user: None,
+            remote_env_len: 0,
+            base_folder: "/f".into(),
+            drift: false,
+        }
+    }
+
+    fn svc_row(containers: Vec<ContainerStatus>) -> ServiceRow {
+        ServiceRow {
+            name: "db".into(),
+            scope: "global",
+            source: "image x".into(),
+            ports: Vec::new(),
+            containers: containers
+                .into_iter()
+                .enumerate()
+                .map(|(i, s)| (format!("c{i}"), s))
+                .collect(),
+            used_by: Vec::new(),
+            env_len: 0,
+            command: None,
+            config_hash: String::new(),
+        }
+    }
+
+    fn snap(
+        instances: Vec<InstanceRow>,
+        services: Vec<ServiceRow>,
+        sandbox_count: usize,
+        docker_version: Option<&str>,
+    ) -> Snapshot {
+        Snapshot {
+            instances,
+            services,
+            sandbox_count,
+            docker_version: docker_version.map(str::to_string),
+            collected_at: Instant::now(),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn totals_line_counts_running_stopped_and_service_containers() {
+        let s = snap(
+            vec![
+                inst("a", ContainerStatus::Running("Up".into())),
+                inst("b", ContainerStatus::Exited("Exited".into())),
+                inst("c", ContainerStatus::Missing),
+            ],
+            vec![svc_row(vec![
+                ContainerStatus::Running("Up".into()),
+                ContainerStatus::Missing,
+            ])],
+            3,
+            Some("24.0.7"),
+        );
+        assert_eq!(
+            totals_line(&s, std::time::Duration::from_secs(0)),
+            "3 sandboxes · 1 running / 2 stopped · 1 service container · docker 24.0.7",
+        );
+    }
+
+    #[test]
+    fn totals_line_pluralizes_and_marks_missing_version() {
+        let s = snap(vec![inst("a", ContainerStatus::Running("Up".into()))], Vec::new(), 1, None);
+        assert_eq!(
+            totals_line(&s, std::time::Duration::from_secs(0)),
+            "1 sandbox · 1 running / 0 stopped · 0 service containers · docker ?",
+        );
+    }
+
+    #[test]
+    fn totals_line_flags_stale_data() {
+        let s = snap(Vec::new(), Vec::new(), 0, Some("24.0.7"));
+        let out = totals_line(&s, std::time::Duration::from_secs(STALE_AFTER_SECS + 2));
+        assert!(out.ends_with(" (stale 12s)"), "got: {out}");
+        // Fresh data has no staleness suffix.
+        let fresh = totals_line(&s, std::time::Duration::from_secs(1));
+        assert!(!fresh.contains("stale"), "got: {fresh}");
     }
 
     #[test]
