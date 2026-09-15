@@ -8,7 +8,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Tabs};
 
-use super::app::{App, Tab};
+use super::app::{App, ConfigView, Modal, Side, Tab};
 use super::data::{humanize_secs, ContainerStatus, InstanceRow, ServiceRow};
 
 const HIGHLIGHT: Color = Color::Cyan;
@@ -23,7 +23,12 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     draw_tabs(frame, app, tab_area);
     draw_content(frame, app, content_area);
-    draw_help(frame, help_area);
+    draw_help(frame, app, help_area);
+
+    // The config modal draws over everything, using the full frame.
+    if let Modal::Config(view) = &app.modal {
+        draw_config_modal(frame, view);
+    }
 }
 
 fn draw_tabs(frame: &mut Frame, app: &App, area: Rect) {
@@ -396,8 +401,104 @@ fn kv2<'a>(k1: &'a str, v1: &str, k2: &'a str, v2: &str) -> Line<'a> {
     ])
 }
 
-fn draw_help(frame: &mut Frame, area: Rect) {
-    let help = Line::from("q quit · tab switch tab · ↑↓ select")
-        .style(Style::default().add_modifier(Modifier::DIM));
+fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
+    let text = match app.modal {
+        Modal::Config(_) => "tab original/resolved · ↑↓ scroll · pgup/pgdn · g/G · esc close",
+        Modal::None => "q quit · tab switch tab · ↑↓ select · enter/e config",
+    };
+    let help = Line::from(text).style(Style::default().add_modifier(Modifier::DIM));
     frame.render_widget(Paragraph::new(help), area);
+}
+
+/// Render the config explorer full-screen over the dashboard.
+fn draw_config_modal(frame: &mut Frame, view: &ConfigView) {
+    let area = frame.area();
+
+    let (side, other) = match view.showing {
+        Side::Original => ("original", "resolved"),
+        Side::Resolved => ("resolved", "original"),
+    };
+    let hash = if view.hash.is_empty() {
+        String::new()
+    } else {
+        format!(" — {}", view.hash)
+    };
+    let title = format!(" {} — {side} (tab: {other}){hash} ", view.title);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(HIGHLIGHT))
+        .title(title);
+
+    let lines: Vec<Line> = view.body().lines().map(highlight_toml_line).collect();
+    let paragraph = Paragraph::new(lines).block(block).scroll((view.scroll, 0));
+
+    // Clear whatever is underneath so the modal is opaque.
+    frame.render_widget(ratatui::widgets::Clear, area);
+    frame.render_widget(paragraph, area);
+}
+
+/// Light per-line TOML highlighting: `[section]` headers cyan bold, comments
+/// dim, the `key =` part of an assignment green, and the rest default.
+fn highlight_toml_line(line: &str) -> Line<'static> {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with('#') {
+        return Line::from(Span::styled(
+            line.to_string(),
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+    }
+    if trimmed.starts_with('[') {
+        return Line::from(Span::styled(
+            line.to_string(),
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ));
+    }
+    // Split a `key = value` assignment at the first `=`, styling the key half
+    // (through the `=`) green and leaving the value default.
+    if let Some(eq) = line.find('=') {
+        let (key, value) = line.split_at(eq + 1);
+        return Line::from(vec![
+            Span::styled(key.to_string(), Style::default().fg(Color::Green)),
+            Span::raw(value.to_string()),
+        ]);
+    }
+    Line::from(Span::raw(line.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn highlight_toml_styles_by_kind() {
+        // Section header: cyan bold.
+        let header = highlight_toml_line("[sandbox.repo]");
+        assert_eq!(header.spans.len(), 1);
+        let s = header.spans[0].style;
+        assert_eq!(s.fg, Some(Color::Cyan));
+        assert!(s.add_modifier.contains(Modifier::BOLD));
+
+        // Comment: dim.
+        let comment = highlight_toml_line("  # a note");
+        assert!(comment.spans[0].style.add_modifier.contains(Modifier::DIM));
+
+        // Assignment: key half green, value split off.
+        let kv = highlight_toml_line("image = \"node:22\"");
+        assert_eq!(kv.spans.len(), 2);
+        assert_eq!(kv.spans[0].style.fg, Some(Color::Green));
+        assert_eq!(kv.spans[0].content, "image =");
+        assert_eq!(kv.spans[1].content, " \"node:22\"");
+
+        // Plain line: single default span, no panic.
+        let plain = highlight_toml_line("just text");
+        assert_eq!(plain.spans.len(), 1);
+    }
+
+    #[test]
+    fn highlight_splits_a_full_document() {
+        let doc = "[sandbox.s]\nimage = \"a\"\n# c\n\nx";
+        let lines: Vec<Line> = doc.lines().map(highlight_toml_line).collect();
+        assert_eq!(lines.len(), 5);
+    }
 }

@@ -513,6 +513,26 @@ impl Config {
         })
     }
 
+    /// The raw `[sandbox.<name>]` table exactly as written (including `extends`),
+    /// for the config explorer's "original" view.
+    pub fn sandbox_table(&self, name: &str) -> Result<&Table> {
+        self.sandboxes
+            .get(name)
+            .with_context(|| format!("unknown sandbox `{name}`"))
+    }
+
+    /// The merged-but-untyped sandbox table: `extends` resolved and dropped, so
+    /// it round-trips to TOML for the config explorer's "resolved" view. Unlike
+    /// [`Self::resolve_sandbox`] this skips typed validation. Returns the merged
+    /// table plus its config hash.
+    pub fn resolved_table(&self, name: &str) -> Result<(Table, String)> {
+        let sandbox = self.sandbox_table(name)?;
+        let mut properties = self.resolve_extends(sandbox, &mut Vec::new())?;
+        properties.remove("extends");
+        let hash = config_hash(&properties);
+        Ok((properties, hash))
+    }
+
     /// Resolve a table's `extends` into a fully-merged table: referenced
     /// templates first (left-to-right, each with its own `extends` resolved
     /// recursively), then the table's own body on top. `stack` tracks the active
@@ -663,6 +683,28 @@ build.args = { B = "3" }
         assert_eq!(a, b, "same config must hash identically");
         let c = config.resolve_sandbox("repository-2").unwrap().config_hash;
         assert_ne!(a, c, "different configs must hash differently");
+    }
+
+    #[test]
+    fn resolved_table_merges_and_drops_extends() {
+        let config = Config::parse(EXAMPLE).unwrap();
+        let (table, hash) = config.resolved_table("repository-2").unwrap();
+        // `extends` is gone but the merged body is present.
+        assert!(!table.contains_key("extends"));
+        assert_eq!(table["folder"].as_str(), Some("../repository-2"));
+        assert_eq!(table["caches"].as_array().unwrap().len(), 1); // from template
+        // Nested build.args deep-merged: A from template, B overridden.
+        let args = table["build"].as_table().unwrap()["args"].as_table().unwrap();
+        assert_eq!(args["A"].as_str(), Some("1"));
+        assert_eq!(args["B"].as_str(), Some("3"));
+        // Hash matches the typed resolver's for the same sandbox.
+        assert_eq!(hash, config.resolve_sandbox("repository-2").unwrap().config_hash);
+    }
+
+    #[test]
+    fn resolved_table_unknown_sandbox_errors() {
+        let config = Config::parse(EXAMPLE).unwrap();
+        assert!(config.resolved_table("nope").is_err());
     }
 
     #[test]
