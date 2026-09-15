@@ -3,38 +3,14 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 
-use super::pick;
+use super::resolve_instance;
 use crate::docker;
 use crate::state::State;
 
 pub fn rm(name: &str) -> Result<()> {
     let mut state = State::load()?;
 
-    // <name> may be an instance name, a sandbox config name, or a repository
-    // (folder basename); collect every instance it could refer to.
-    let mut matches: Vec<String> = state
-        .instances
-        .iter()
-        .filter(|(instance, info)| {
-            *instance == name
-                || info.sandbox == name
-                || info.folder.file_name().is_some_and(|f| f == name)
-        })
-        .map(|(instance, _)| instance.clone())
-        .collect();
-    matches.sort();
-
-    let key = match matches.len() {
-        0 => bail!("no sandbox instance matches `{name}` (see `devsandbox ps -a`)"),
-        1 => matches.remove(0),
-        _ => {
-            if !std::io::stdin().is_terminal() {
-                bail!("`{name}` is ambiguous: {}", matches.join(", "));
-            }
-            let refs: Vec<&str> = matches.iter().map(String::as_str).collect();
-            matches.remove(pick(&format!("`{name}` matches multiple instances"), &refs)?)
-        }
-    };
+    let key = resolve_instance(&state, name)?;
 
     let info = state.instances.get(&key).expect("key came from state");
     let container = info.container.clone();

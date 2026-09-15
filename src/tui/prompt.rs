@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 
 /// Command names offered for first-token completion, in display order.
-pub const COMMANDS: [&str; 4] = ["run", "exec", "code", "rm"];
+pub const COMMANDS: [&str; 5] = ["run", "exec", "code", "rm", "stop"];
 
 /// Max history entries kept on disk (oldest trimmed first).
 const HISTORY_CAP: usize = 200;
@@ -25,6 +25,7 @@ pub enum PromptAction {
     Exec { instance: String, argv: Vec<String> },
     Code { instance: String },
     Rm { instance: String },
+    Stop { instance: String },
 }
 
 /// In-flight tab-completion over a single token.
@@ -426,7 +427,13 @@ fn parse_line(line: &str) -> Result<PromptAction, String> {
             };
             Ok(PromptAction::Rm { instance: (*instance).to_string() })
         }
-        other => Err(format!("unknown command `{other}` (run, exec, code, rm)")),
+        "stop" => {
+            let [instance] = rest else {
+                return Err("usage: stop <instance>".into());
+            };
+            Ok(PromptAction::Stop { instance: (*instance).to_string() })
+        }
+        other => Err(format!("unknown command `{other}` (run, exec, code, rm, stop)")),
     }
 }
 
@@ -561,7 +568,7 @@ mod tests {
         }
         match first {
             "run" => vec!["alpha".into(), "beta".into(), "bacon".into()],
-            "exec" | "code" | "rm" => vec!["inst1".into(), "inst2".into()],
+            "exec" | "code" | "rm" | "stop" => vec!["inst1".into(), "inst2".into()],
             _ => Vec::new(),
         }
     }
@@ -633,6 +640,13 @@ mod tests {
         assert!(parse_line("code").is_err());
         assert!(parse_line("code a b").is_err());
         assert!(parse_line("rm").is_err());
+    }
+
+    #[test]
+    fn parse_stop() {
+        assert_eq!(parse_line("stop box"), Ok(PromptAction::Stop { instance: "box".into() }));
+        assert!(parse_line("stop").is_err());
+        assert!(parse_line("stop a b").is_err());
     }
 
     #[test]

@@ -25,7 +25,7 @@ Tables (Instances / Services)
   →/space     expand   ←  collapse / jump to parent
   enter, e    open config explorer
   r           run sandbox      o   open in VS Code (Instances)
-  l           logs (Instances tab)
+  s           stop instance    l   logs (Instances tab)
 
 Config modal
   tab         toggle original / resolved
@@ -40,7 +40,7 @@ Logs modal
 
 Command prompt (:)
   run <sandbox> [--name n]    exec <instance> <cmd…>
-  code <instance>             rm <instance>
+  code <instance>             rm <instance>   stop <instance>
   tab         complete / cycle
   ↑ ↓         history
   ctrl-u      clear line       ctrl-w  delete word
@@ -191,6 +191,12 @@ pub struct App {
     /// Action awaiting execution by the event loop (it owns the terminal
     /// suspend + command call, keeping [`App`] I/O-free).
     pub pending_action: Option<PromptAction>,
+    /// Instance name whose stop the event loop should spawn on a background
+    /// thread (the `s` shortcut; runs without suspending the TUI).
+    pub pending_stop: Option<String>,
+    /// Instances with a stop in flight, so repeated `s` presses don't spawn a
+    /// second stop for the same instance. Cleared by the loop on completion.
+    pub stopping: BTreeSet<String>,
     /// One-line status shown in the help-bar area (e.g. `code` launch outcome).
     pub status: Option<String>,
     pub should_quit: bool,
@@ -207,6 +213,8 @@ impl App {
             modal: Modal::None,
             prompt: None,
             pending_action: None,
+            pending_stop: None,
+            stopping: BTreeSet::new(),
             status: None,
             should_quit: false,
         }
@@ -394,6 +402,7 @@ impl App {
             KeyCode::Enter | KeyCode::Char('e') => self.open_config(),
             KeyCode::Char('r') if self.tab == Tab::Instances => self.open_run_prompt(),
             KeyCode::Char('o') if self.tab == Tab::Instances => self.attach_code(),
+            KeyCode::Char('s') if self.tab == Tab::Instances => self.stop_instance(),
             KeyCode::Char('l') => self.open_logs(),
             KeyCode::Char('?') => self.open_help(),
             _ => {}
@@ -443,6 +452,34 @@ impl App {
             return;
         };
         self.pending_action = Some(PromptAction::Code { instance: row.name.clone() });
+    }
+
+    /// `s` (Instances tab): stop the instance under the cursor on a background
+    /// thread (the event loop owns the docker work, keeping [`App`] I/O-free).
+    /// Works for orphan-group instance children too; a no-op on sandbox / empty
+    /// / orphan-group nodes and while a stop for the same instance is in flight.
+    fn stop_instance(&mut self) {
+        let Some(Node::Instance(i)) = self.selected_node() else {
+            return;
+        };
+        let Some(snapshot) = &self.snapshot else {
+            return;
+        };
+        let Some(row) = snapshot.instances.get(i) else {
+            return;
+        };
+        let name = row.name.clone();
+        if self.stopping.contains(&name) {
+            return;
+        }
+        self.status = Some(format!("stopping {name}…"));
+        self.stopping.insert(name.clone());
+        self.pending_stop = Some(name);
+    }
+
+    /// Take the pending background stop for the event loop to spawn, if any.
+    pub fn take_pending_stop(&mut self) -> Option<String> {
+        self.pending_stop.take()
     }
 
     /// Key handling while the prompt is open. `esc` cancels, `enter` parses
@@ -528,7 +565,7 @@ impl App {
         }
         match first {
             "run" => sandboxes.to_vec(),
-            "exec" | "code" | "rm" => instances.to_vec(),
+            "exec" | "code" | "rm" | "stop" => instances.to_vec(),
             _ => Vec::new(),
         }
     }
@@ -1190,6 +1227,58 @@ mod tests {
         assert!(app.prompt.is_none());
         app.on_key(key(KeyCode::Char('o')));
         assert_eq!(app.take_pending_action(), None);
+    }
+
+    #[test]
+    fn s_on_instance_sets_pending_stop() {
+        let mut app = new_app();
+        app.set_snapshot(snapshot_with(1)); // [Sandbox(0), inst0]
+        app.on_key(key(KeyCode::Down)); // onto inst0
+        app.on_key(key(KeyCode::Char('s')));
+        assert!(app.stopping.contains("inst0"));
+        assert_eq!(app.status.as_deref(), Some("stopping inst0…"));
+        assert_eq!(app.take_pending_stop(), Some("inst0".into()));
+    }
+
+    #[test]
+    fn s_on_orphan_instance_sets_pending_stop() {
+        let mut app = new_app();
+        app.set_snapshot(orphan_snapshot()); // [Orphans, orphan0]
+        app.on_key(key(KeyCode::Down)); // onto orphan0
+        assert_eq!(app.selected_node(), Some(Node::Instance(0)));
+        app.on_key(key(KeyCode::Char('s')));
+        assert_eq!(app.take_pending_stop(), Some("orphan0".into()));
+    }
+
+    #[test]
+    fn s_on_sandbox_is_noop() {
+        let mut app = new_app();
+        app.set_snapshot(snapshot_with(1)); // cursor on Sandbox(0)
+        app.on_key(key(KeyCode::Char('s')));
+        assert_eq!(app.take_pending_stop(), None);
+        assert!(app.stopping.is_empty());
+    }
+
+    #[test]
+    fn s_dedupes_while_stop_in_flight() {
+        let mut app = new_app();
+        app.set_snapshot(snapshot_with(1));
+        app.on_key(key(KeyCode::Down)); // onto inst0
+        app.on_key(key(KeyCode::Char('s')));
+        assert_eq!(app.take_pending_stop(), Some("inst0".into()));
+        // Still in flight (loop hasn't cleared `stopping`): a second `s` is a no-op.
+        app.on_key(key(KeyCode::Down)); // keep cursor on inst0
+        app.on_key(key(KeyCode::Char('s')));
+        assert_eq!(app.take_pending_stop(), None);
+    }
+
+    #[test]
+    fn s_ignored_on_services_tab() {
+        let mut app = new_app();
+        app.set_snapshot(snapshot_with(1));
+        app.tab = Tab::Services;
+        app.on_key(key(KeyCode::Char('s')));
+        assert_eq!(app.take_pending_stop(), None);
     }
 
     #[test]

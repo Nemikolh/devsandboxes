@@ -598,7 +598,7 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
         Modal::Help(_) => "↑↓ scroll · pgup/pgdn · g/G · esc/? close",
         Modal::Logs(_) => "↑↓ scroll · pgup/pgdn · g/G · esc close",
         Modal::None => match app.tab {
-            Tab::Instances => "q quit · tab switch · ↑↓ select · ←→ fold · enter config · r run · o vscode · l logs · : cmd · ? help",
+            Tab::Instances => "q quit · tab switch · ↑↓ select · ←→ fold · enter config · r run · o vscode · s stop · l logs · : cmd · ? help",
             Tab::Services => "q quit · tab switch · ↑↓ select · enter config · : cmd · ? help",
         },
     };

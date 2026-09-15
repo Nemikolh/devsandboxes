@@ -80,6 +80,9 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
     let dir = app.dir.clone();
     // At most one collection thread in flight; `Some` while one is running.
     let mut pending: Option<Receiver<Snapshot>> = Some(spawn_collect(&dir));
+    // Background `s` stops, each reporting completion over its own channel;
+    // paired with the instance name so the guard clears even if the thread dies.
+    let mut stops: Vec<(String, Receiver<StopDone>)> = Vec::new();
     let mut last_tick = Instant::now();
 
     while !app.should_quit {
@@ -110,6 +113,32 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
                 }
             }
         }
+
+        // A background stop was requested by `s`: spawn it without suspending.
+        if let Some(instance) = app.take_pending_stop() {
+            stops.push((instance.clone(), spawn_stop(&instance)));
+        }
+
+        // Drain any finished background stops: update the status line, clear the
+        // in-flight guard, and force an immediate snapshot refresh so the row's
+        // new (stopped) status shows without waiting for the next tick.
+        stops.retain_mut(|(instance, rx)| match rx.try_recv() {
+            Ok(done) => {
+                app.stopping.remove(instance);
+                app.status = Some(done.status);
+                last_tick = Instant::now();
+                if pending.is_none() {
+                    pending = Some(spawn_collect(&dir));
+                }
+                false
+            }
+            Err(TryRecvError::Empty) => true,
+            // Thread died without sending; clear the guard so `s` works again.
+            Err(TryRecvError::Disconnected) => {
+                app.stopping.remove(instance);
+                false
+            }
+        });
 
         // Drain a finished collection into the app, freeing the in-flight slot.
         if let Some(rx) = &pending {
@@ -149,6 +178,7 @@ fn run_suspended(terminal: &mut Term, dir: &Path, action: PromptAction) -> Resul
             commands::exec::exec_status(instance, true, true, argv).map(|_| ())
         }
         PromptAction::Rm { instance } => commands::rm::rm(instance),
+        PromptAction::Stop { instance } => commands::stop::stop(instance),
         // `code` never suspends; handled by the caller.
         PromptAction::Code { .. } => Ok(()),
     };
@@ -233,6 +263,37 @@ fn hex_encode(s: &str) -> String {
         out.push(char::from_digit((b & 0xf) as u32, 16).unwrap());
     }
     out
+}
+
+/// Result of a background `s` stop, drained by the event loop.
+struct StopDone {
+    /// One-line outcome for the help-bar status.
+    status: String,
+}
+
+/// Spawn a detached thread that stops `instance` (docker stop can block ~10s on
+/// the SIGTERM timeout) and reports a one-line status back. Docker calls go
+/// through the screen-safe quiet path so stderr can't corrupt the TUI. `instance`
+/// is a snapshot row name, which equals the state instance key.
+fn spawn_stop(instance: &str) -> Receiver<StopDone> {
+    let (tx, rx) = mpsc::channel();
+    let instance = instance.to_string();
+    std::thread::spawn(move || {
+        let status = match crate::state::State::load() {
+            Ok(state) => match state.instances.get(&instance) {
+                Some(info) => {
+                    let services =
+                        commands::stop::service_containers(&info.project, &instance, true);
+                    commands::stop::stop_containers(&info.container, &services, true);
+                    format!("stopped {instance}")
+                }
+                None => format!("stop: unknown instance `{instance}`"),
+            },
+            Err(e) => format!("stop: {e:#}"),
+        };
+        let _ = tx.send(StopDone { status });
+    });
+    rx
 }
 
 /// Spawn a detached thread that collects one [`Snapshot`] and sends it back.

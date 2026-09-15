@@ -45,6 +45,11 @@ enum Command {
         /// Instance name, sandbox config name, or repository folder name
         name: String,
     },
+    /// Stop a sandbox instance (docker stop; `run` restarts it)
+    Stop {
+        /// Instance name, sandbox config name, or repository folder name
+        name: String,
+    },
     /// Remove shared services no live instance references
     Gc,
     /// Run a command in a sandbox instance
@@ -79,6 +84,7 @@ fn main() -> Result<()> {
         Command::Ps { all } => commands::ps::ps(all),
         Command::Run { sandbox, name } => commands::run::run(&cli.dir, sandbox, name),
         Command::Rm { name } => commands::rm::rm(&name),
+        Command::Stop { name } => commands::stop::stop(&name),
         Command::Gc => commands::services::gc(&cli.dir),
         Command::Exec { interactive, tty, name, command } => {
             commands::exec::exec(&name, interactive, tty, &command)
