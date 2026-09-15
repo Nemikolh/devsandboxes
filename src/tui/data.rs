@@ -9,6 +9,7 @@ use std::time::Instant;
 
 use serde::Deserialize;
 
+use super::procs::{ProcState, MESSAGE_ROW};
 use crate::commands::services::{isolated_service_container, project_id, service_container};
 use crate::config::{Config, ServiceScope};
 use crate::docker::{self, NAME_PREFIX};
@@ -137,6 +138,11 @@ pub enum Node {
     /// The synthetic `(not in config)` group header, holding orphan instances.
     /// Only emitted when such instances exist.
     Orphans,
+    /// A process row under an expanded instance. `instance` indexes into
+    /// `instances`; `row` indexes into that instance's [`ProcState::Rows`], or is
+    /// [`MESSAGE_ROW`](super::procs::MESSAGE_ROW) for the single placeholder row
+    /// of a [`ProcState::Message`] (not fetched / not running / error).
+    Proc { instance: usize, row: usize },
 }
 
 /// Flatten the tree into the visible node list, in render/selection order.
@@ -151,6 +157,8 @@ pub fn visible_nodes(
     sandboxes: &[SandboxRow],
     instances: &[InstanceRow],
     collapsed: &BTreeSet<String>,
+    expanded_procs: &BTreeSet<String>,
+    procs: &BTreeMap<String, ProcState>,
 ) -> Vec<Node> {
     let mut nodes = Vec::new();
     let configured: BTreeSet<&str> = sandboxes.iter().map(|s| s.name.as_str()).collect();
@@ -164,6 +172,7 @@ pub fn visible_nodes(
         for (ii, inst) in instances.iter().enumerate() {
             if inst.sandbox == sb.name {
                 nodes.push(Node::Instance(ii));
+                push_proc_nodes(&mut nodes, ii, inst, expanded_procs, procs);
                 any = true;
             }
         }
@@ -184,11 +193,37 @@ pub fn visible_nodes(
         if !collapsed.contains(ORPHANS_NAME) {
             for ii in orphans {
                 nodes.push(Node::Instance(ii));
+                push_proc_nodes(&mut nodes, ii, &instances[ii], expanded_procs, procs);
             }
         }
     }
 
     nodes
+}
+
+/// Emit the process child nodes for one visible instance, if its procs are
+/// expanded. A running container with a fetched forest emits one
+/// [`Node::Proc`] per [`ProcRow`]; every other case (not fetched yet, container
+/// not running, fetch error) emits the single [`MESSAGE_ROW`] placeholder.
+fn push_proc_nodes(
+    nodes: &mut Vec<Node>,
+    instance: usize,
+    inst: &InstanceRow,
+    expanded_procs: &BTreeSet<String>,
+    procs: &BTreeMap<String, ProcState>,
+) {
+    if !expanded_procs.contains(&inst.name) {
+        return;
+    }
+    match procs.get(&inst.name) {
+        Some(ProcState::Rows(rows)) => {
+            for row in 0..rows.len() {
+                nodes.push(Node::Proc { instance, row });
+            }
+        }
+        // Message state, or not fetched yet: one placeholder row.
+        _ => nodes.push(Node::Proc { instance, row: MESSAGE_ROW }),
+    }
 }
 
 /// The `N/M running` stats string for a sandbox row: `M` instances, `N` running.
@@ -920,6 +955,12 @@ mod tests {
         names.iter().map(|s| s.to_string()).collect()
     }
 
+    /// The no-processes-expanded argument pair for `visible_nodes` callers that
+    /// only exercise the sandbox/instance levels.
+    fn no_procs() -> (BTreeSet<String>, BTreeMap<String, ProcState>) {
+        (BTreeSet::new(), BTreeMap::new())
+    }
+
     #[test]
     fn visible_nodes_expands_sandboxes_with_instances() {
         let sandboxes = vec![sb("a"), sb("b")];
@@ -928,7 +969,8 @@ mod tests {
             inst_in("b1", "b"),
             inst_in("a2", "a"),
         ];
-        let nodes = visible_nodes(&sandboxes, &instances, &BTreeSet::new());
+        let (ep, pm) = no_procs();
+        let nodes = visible_nodes(&sandboxes, &instances, &BTreeSet::new(), &ep, &pm);
         assert_eq!(
             nodes,
             vec![
@@ -944,7 +986,8 @@ mod tests {
     #[test]
     fn visible_nodes_empty_sandbox_gets_marker() {
         let sandboxes = vec![sb("a")];
-        let nodes = visible_nodes(&sandboxes, &[], &BTreeSet::new());
+        let (ep, pm) = no_procs();
+        let nodes = visible_nodes(&sandboxes, &[], &BTreeSet::new(), &ep, &pm);
         assert_eq!(nodes, vec![Node::Sandbox(0), Node::Empty(0)]);
     }
 
@@ -952,7 +995,8 @@ mod tests {
     fn visible_nodes_collapsed_sandbox_hides_children() {
         let sandboxes = vec![sb("a"), sb("b")];
         let instances = vec![inst_in("a1", "a"), inst_in("b1", "b")];
-        let nodes = visible_nodes(&sandboxes, &instances, &collapsed(&["a"]));
+        let (ep, pm) = no_procs();
+        let nodes = visible_nodes(&sandboxes, &instances, &collapsed(&["a"]), &ep, &pm);
         // a is collapsed (no children, not even a marker); b stays expanded.
         assert_eq!(
             nodes,
@@ -964,7 +1008,8 @@ mod tests {
     fn visible_nodes_orphans_group_at_bottom() {
         let sandboxes = vec![sb("a")];
         let instances = vec![inst_in("a1", "a"), inst_in("x1", "gone")];
-        let nodes = visible_nodes(&sandboxes, &instances, &BTreeSet::new());
+        let (ep, pm) = no_procs();
+        let nodes = visible_nodes(&sandboxes, &instances, &BTreeSet::new(), &ep, &pm);
         assert_eq!(
             nodes,
             vec![
@@ -976,7 +1021,7 @@ mod tests {
         );
 
         // Collapsing the orphan group hides its children but keeps the header.
-        let nodes = visible_nodes(&sandboxes, &instances, &collapsed(&[ORPHANS_NAME]));
+        let nodes = visible_nodes(&sandboxes, &instances, &collapsed(&[ORPHANS_NAME]), &ep, &pm);
         assert_eq!(
             nodes,
             vec![Node::Sandbox(0), Node::Instance(0), Node::Orphans],
@@ -987,8 +1032,72 @@ mod tests {
     fn visible_nodes_no_orphan_group_when_all_configured() {
         let sandboxes = vec![sb("a")];
         let instances = vec![inst_in("a1", "a")];
-        let nodes = visible_nodes(&sandboxes, &instances, &BTreeSet::new());
+        let (ep, pm) = no_procs();
+        let nodes = visible_nodes(&sandboxes, &instances, &BTreeSet::new(), &ep, &pm);
         assert!(!nodes.contains(&Node::Orphans));
+    }
+
+    fn proc_row(pid: &str) -> super::super::procs::ProcRow {
+        super::super::procs::ProcRow { pid: pid.into(), depth: 0, args: "x".into() }
+    }
+
+    #[test]
+    fn visible_nodes_emits_proc_rows_under_expanded_instance() {
+        let sandboxes = vec![sb("a")];
+        let instances = vec![inst_in("a1", "a")];
+        let expanded: BTreeSet<String> = ["a1".to_string()].into_iter().collect();
+        let mut procs = BTreeMap::new();
+        procs.insert(
+            "a1".to_string(),
+            ProcState::Rows(vec![proc_row("1"), proc_row("2")]),
+        );
+        let nodes = visible_nodes(&sandboxes, &instances, &BTreeSet::new(), &expanded, &procs);
+        assert_eq!(
+            nodes,
+            vec![
+                Node::Sandbox(0),
+                Node::Instance(0),
+                Node::Proc { instance: 0, row: 0 },
+                Node::Proc { instance: 0, row: 1 },
+            ],
+        );
+    }
+
+    #[test]
+    fn visible_nodes_message_row_when_not_fetched_or_error() {
+        let sandboxes = vec![sb("a")];
+        let instances = vec![inst_in("a1", "a")];
+        let expanded: BTreeSet<String> = ["a1".to_string()].into_iter().collect();
+
+        // Not fetched yet: one placeholder row.
+        let nodes =
+            visible_nodes(&sandboxes, &instances, &BTreeSet::new(), &expanded, &BTreeMap::new());
+        assert_eq!(nodes.last(), Some(&Node::Proc { instance: 0, row: MESSAGE_ROW }));
+
+        // Message state (e.g. not running / error): still one placeholder row.
+        let mut procs = BTreeMap::new();
+        procs.insert("a1".to_string(), ProcState::Message("(not running)".into()));
+        let nodes = visible_nodes(&sandboxes, &instances, &BTreeSet::new(), &expanded, &procs);
+        assert_eq!(
+            nodes,
+            vec![
+                Node::Sandbox(0),
+                Node::Instance(0),
+                Node::Proc { instance: 0, row: MESSAGE_ROW },
+            ],
+        );
+    }
+
+    #[test]
+    fn visible_nodes_collapsed_sandbox_hides_expanded_procs() {
+        let sandboxes = vec![sb("a")];
+        let instances = vec![inst_in("a1", "a")];
+        let expanded: BTreeSet<String> = ["a1".to_string()].into_iter().collect();
+        let mut procs = BTreeMap::new();
+        procs.insert("a1".to_string(), ProcState::Rows(vec![proc_row("1")]));
+        // Sandbox collapsed → its instance and procs are hidden entirely.
+        let nodes = visible_nodes(&sandboxes, &instances, &collapsed(&["a"]), &expanded, &procs);
+        assert_eq!(nodes, vec![Node::Sandbox(0)]);
     }
 
     #[test]

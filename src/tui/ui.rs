@@ -13,6 +13,7 @@ use super::data::{
     humanize_secs, sandbox_stats, totals_line, ContainerStatus, InstanceRow, Node, SandboxRow,
     ServiceRow, Snapshot,
 };
+use super::procs::{ProcState, MESSAGE_ROW};
 use super::prompt::Prompt;
 
 const HIGHLIGHT: Color = Color::Cyan;
@@ -375,6 +376,7 @@ fn tree_row<'a>(app: &App, snapshot: &'a Snapshot, node: Node) -> Row<'a> {
                 Style::default().add_modifier(Modifier::DIM),
             ))])
         }
+        Node::Proc { instance, row } => proc_tree_row(app, snapshot, instance, row),
         Node::Orphans => {
             let count = snapshot
                 .instances
@@ -472,6 +474,44 @@ fn instance_tree_row(r: &InstanceRow) -> Row<'_> {
     ])
 }
 
+/// Render a process row (or its placeholder) for the instance at `instance`.
+/// Dim throughout. Process rows put the PID in the TREE gutter (indented deeper
+/// than the instance row) and the `\_`-indented args in the FOLDER column; the
+/// status/uptime/cpu/mem columns stay empty. A [`ProcState::Message`] (and the
+/// `MESSAGE_ROW` placeholder) renders as one dim message in the TREE column.
+fn proc_tree_row<'a>(app: &App, snapshot: &'a Snapshot, instance: usize, row: usize) -> Row<'a> {
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let name = snapshot.instances.get(instance).map(|r| r.name.as_str());
+    let state = name.and_then(|n| app.procs.get(n));
+
+    // A real process row: only when we have a Rows state and a valid index.
+    if row != MESSAGE_ROW {
+        if let Some(ProcState::Rows(rows)) = state {
+            if let Some(p) = rows.get(row) {
+                let pid = Cell::from(Span::styled(format!("      {}", p.pid), dim));
+                let indent = "\\_ ".repeat(p.depth);
+                let args = Cell::from(Span::styled(format!("{indent}{}", p.args), dim));
+                return Row::new(vec![
+                    pid,
+                    Cell::from(""),
+                    Cell::from(""),
+                    Cell::from(""),
+                    Cell::from(""),
+                    args,
+                    Cell::from(""),
+                ]);
+            }
+        }
+    }
+
+    // Placeholder / message row.
+    let msg = match state {
+        Some(ProcState::Message(m)) => m.clone(),
+        _ => "(loading…)".to_string(),
+    };
+    Row::new(vec![Cell::from(Span::styled(format!("      {msg}"), dim))])
+}
+
 fn status_style(status: &ContainerStatus) -> Style {
     match status {
         ContainerStatus::Running(_) => Style::default().fg(Color::Green),
@@ -496,7 +536,8 @@ fn draw_detail(frame: &mut Frame, snapshot: Option<&Snapshot>, node: Option<Node
                 None => Vec::new(),
             }
         }
-        (Some(s), Some(Node::Instance(i))) => match s.instances.get(i) {
+        (Some(s), Some(Node::Instance(i)))
+        | (Some(s), Some(Node::Proc { instance: i, .. })) => match s.instances.get(i) {
             Some(r) => instance_detail(r),
             None => Vec::new(),
         },

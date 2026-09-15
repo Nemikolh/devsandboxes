@@ -2,7 +2,7 @@
 //! and selection logic stay unit-testable; `mod.rs` owns the crossterm/ratatui
 //! side and feeds decoded key events in here.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -10,7 +10,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::config::Config;
 use crate::docker;
 
-use super::data::{visible_nodes, Node, Snapshot, ORPHANS_NAME};
+use super::data::{visible_nodes, ContainerStatus, Node, Snapshot, ORPHANS_NAME};
+use super::procs::ProcState;
 use super::prompt::{Prompt, PromptAction, COMMANDS};
 
 /// Keybinding reference shown by the `?` overlay, grouped by context.
@@ -22,10 +23,12 @@ Global
 
 Tables (Instances / Services)
   ↑/k ↓/j     move selection
-  →/space     expand   ←  collapse / jump to parent
+  →/space     expand (sandbox instances, instance processes)
+  ←           collapse / jump to parent
   enter, e    open config explorer
   r           run sandbox      o   open in VS Code (Instances)
   s           stop instance    l   logs (Instances tab)
+  (process rows act on their parent instance)
 
 Config modal
   tab         toggle original / resolved
@@ -182,6 +185,17 @@ pub struct App {
     /// [`ORPHANS_NAME`] for the orphan group). Empty means all expanded; survives
     /// snapshot refreshes.
     collapsed: BTreeSet<String>,
+    /// Instances (by name) whose process layer is expanded on the Instances tab.
+    /// Default empty (all collapsed); survives snapshot refreshes.
+    expanded_procs: BTreeSet<String>,
+    /// Cached process state per instance name. Kept across collapse (stale is
+    /// fine); a fetch overwrites only the keys it fetched. Absent = not yet
+    /// fetched, which renders as a placeholder row.
+    pub procs: BTreeMap<String, ProcState>,
+    /// Set when an instance's procs are freshly expanded so the event loop
+    /// fetches immediately instead of waiting for the next proc tick; the loop
+    /// clears it.
+    pub needs_proc_fetch: bool,
     /// Latest data collected off-thread; `None` until the first snapshot lands.
     pub snapshot: Option<Snapshot>,
     /// Active overlay, if any.
@@ -209,6 +223,9 @@ impl App {
             tab: Tab::Instances,
             selected: [0, 0],
             collapsed: BTreeSet::new(),
+            expanded_procs: BTreeSet::new(),
+            procs: BTreeMap::new(),
+            needs_proc_fetch: false,
             snapshot: None,
             modal: Modal::None,
             prompt: None,
@@ -261,7 +278,13 @@ impl App {
     /// Empty until a snapshot lands. Cheap; recomputed on demand.
     pub fn visible_nodes(&self) -> Vec<Node> {
         match &self.snapshot {
-            Some(s) => visible_nodes(&s.sandboxes, &s.instances, &self.collapsed),
+            Some(s) => visible_nodes(
+                &s.sandboxes,
+                &s.instances,
+                &self.collapsed,
+                &self.expanded_procs,
+                &self.procs,
+            ),
             None => Vec::new(),
         }
     }
@@ -312,34 +335,64 @@ impl App {
         match node {
             Node::Sandbox(i) => snapshot.sandboxes.get(i).map(|s| s.name.clone()),
             Node::Orphans => Some(ORPHANS_NAME.to_string()),
-            Node::Instance(_) | Node::Empty(_) => None,
+            Node::Instance(_) | Node::Empty(_) | Node::Proc { .. } => None,
         }
     }
 
-    /// Expand the node under the cursor (sandbox / orphan group). No-op on leaves.
+    /// `→`: expand the node under the cursor. On a sandbox / orphan group this
+    /// unfolds its children; on an instance it expands the process layer (and
+    /// signals the event loop to fetch now). No-op on other leaves.
     fn tree_expand(&mut self) {
-        if let Some(node) = self.selected_node() {
-            if let Some(key) = self.collapse_key(node) {
-                self.collapsed.remove(&key);
-                self.clamp_selection();
-            }
-        }
-    }
-
-    /// Toggle the collapsible node under the cursor (space). No-op on leaves.
-    fn tree_toggle(&mut self) {
-        if let Some(node) = self.selected_node() {
-            if let Some(key) = self.collapse_key(node) {
-                if !self.collapsed.remove(&key) {
-                    self.collapsed.insert(key);
+        match self.selected_node() {
+            Some(Node::Instance(_)) => self.expand_procs(),
+            Some(node) => {
+                if let Some(key) = self.collapse_key(node) {
+                    self.collapsed.remove(&key);
+                    self.clamp_selection();
                 }
-                self.clamp_selection();
             }
+            None => {}
         }
     }
 
-    /// `←`: on a collapsible node collapse it; on an instance/empty child jump
-    /// selection to the parent sandbox (or orphan group) node.
+    /// `space`: toggle the node under the cursor. Collapsible groups fold/unfold;
+    /// an instance toggles its process layer.
+    fn tree_toggle(&mut self) {
+        match self.selected_node() {
+            Some(Node::Instance(_)) => {
+                if let Some(name) = self.selected_instance_name() {
+                    if !self.expanded_procs.remove(&name) {
+                        self.expanded_procs.insert(name);
+                        self.needs_proc_fetch = true;
+                    }
+                    self.clamp_selection();
+                }
+            }
+            Some(node) => {
+                if let Some(key) = self.collapse_key(node) {
+                    if !self.collapsed.remove(&key) {
+                        self.collapsed.insert(key);
+                    }
+                    self.clamp_selection();
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// Mark the selected instance's process layer expanded and request a fetch.
+    fn expand_procs(&mut self) {
+        if let Some(name) = self.selected_instance_name() {
+            if self.expanded_procs.insert(name) {
+                self.needs_proc_fetch = true;
+            }
+            self.clamp_selection();
+        }
+    }
+
+    /// `←`: fold one level. On a collapsible node collapse it. On a process row
+    /// jump to its instance. On an instance with procs expanded collapse the
+    /// procs (staying on the instance); otherwise jump to the parent sandbox.
     fn tree_collapse(&mut self) {
         let Some(node) = self.selected_node() else {
             return;
@@ -351,12 +404,56 @@ impl App {
                     self.clamp_selection();
                 }
             }
-            Node::Instance(_) | Node::Empty(_) => {
+            Node::Proc { instance, .. } => {
+                if let Some(pos) = self.instance_node_position(instance) {
+                    self.selected[Tab::Instances.index()] = pos;
+                }
+            }
+            Node::Instance(_) => {
+                // First press collapses an expanded process layer (staying put);
+                // otherwise fall through to the parent-sandbox jump.
+                if let Some(name) = self.selected_instance_name() {
+                    if self.expanded_procs.remove(&name) {
+                        self.clamp_selection();
+                        return;
+                    }
+                }
+                if let Some(parent) = self.parent_index(self.selected[Tab::Instances.index()]) {
+                    self.selected[Tab::Instances.index()] = parent;
+                }
+            }
+            Node::Empty(_) => {
                 if let Some(parent) = self.parent_index(self.selected[Tab::Instances.index()]) {
                     self.selected[Tab::Instances.index()] = parent;
                 }
             }
         }
+    }
+
+    /// Instance index under the cursor: the instance row itself or the parent of
+    /// a selected process row. `None` on sandbox / empty / orphan-group nodes.
+    fn selected_instance_index(&self) -> Option<usize> {
+        match self.selected_node()? {
+            Node::Instance(i) => Some(i),
+            Node::Proc { instance, .. } => Some(instance),
+            _ => None,
+        }
+    }
+
+    /// Name of the instance under the cursor, whether the selected node is the
+    /// instance row itself or one of its process rows. `None` otherwise.
+    fn selected_instance_name(&self) -> Option<String> {
+        let snapshot = self.snapshot.as_ref()?;
+        let idx = self.selected_instance_index()?;
+        snapshot.instances.get(idx).map(|r| r.name.clone())
+    }
+
+    /// Visible-node position of `Node::Instance(instance)`, for jumping a process
+    /// row's selection back onto its instance row.
+    fn instance_node_position(&self, instance: usize) -> Option<usize> {
+        self.visible_nodes()
+            .iter()
+            .position(|n| matches!(n, Node::Instance(i) if *i == instance))
     }
 
     /// Index of the enclosing group node (sandbox / orphan header) for the child
@@ -427,6 +524,9 @@ impl App {
                     snapshot.sandboxes.get(i).map(|s| s.name.clone())
                 }
                 Some(Node::Instance(i)) => snapshot.instances.get(i).map(|r| r.sandbox.clone()),
+                Some(Node::Proc { instance, .. }) => {
+                    snapshot.instances.get(instance).map(|r| r.sandbox.clone())
+                }
                 Some(Node::Orphans) | None => None,
             }
         });
@@ -439,10 +539,10 @@ impl App {
 
     /// `o` (Instances tab): VS Code attach for the instance under the cursor,
     /// routed through the same [`PromptAction::Code`] path the `code` command
-    /// uses. Works for orphan-group instance children too; a no-op on
-    /// sandbox / empty / orphan-group nodes.
+    /// uses. Works for orphan-group instance children and process rows (routing
+    /// to the parent instance); a no-op on sandbox / empty / orphan-group nodes.
     fn attach_code(&mut self) {
-        let Some(Node::Instance(i)) = self.selected_node() else {
+        let Some(i) = self.selected_instance_index() else {
             return;
         };
         let Some(snapshot) = &self.snapshot else {
@@ -456,10 +556,11 @@ impl App {
 
     /// `s` (Instances tab): stop the instance under the cursor on a background
     /// thread (the event loop owns the docker work, keeping [`App`] I/O-free).
-    /// Works for orphan-group instance children too; a no-op on sandbox / empty
-    /// / orphan-group nodes and while a stop for the same instance is in flight.
+    /// Works for orphan-group instance children and process rows (routing to the
+    /// parent instance); a no-op on sandbox / empty / orphan-group nodes and
+    /// while a stop for the same instance is in flight.
     fn stop_instance(&mut self) {
-        let Some(Node::Instance(i)) = self.selected_node() else {
+        let Some(i) = self.selected_instance_index() else {
             return;
         };
         let Some(snapshot) = &self.snapshot else {
@@ -480,6 +581,49 @@ impl App {
     /// Take the pending background stop for the event loop to spawn, if any.
     pub fn take_pending_stop(&mut self) -> Option<String> {
         self.pending_stop.take()
+    }
+
+    /// True when procs are expanded for at least one instance (so the event loop
+    /// should tick a fetch); false means no proc fetches at all.
+    pub fn has_expanded_procs(&self) -> bool {
+        !self.expanded_procs.is_empty()
+    }
+
+    /// Consume the "fetch now" signal set on expand.
+    pub fn take_needs_proc_fetch(&mut self) -> bool {
+        std::mem::take(&mut self.needs_proc_fetch)
+    }
+
+    /// The `docker top` fetch targets: `(instance name, container)` for every
+    /// expanded instance whose container is running. Expanded instances that are
+    /// not running (or absent from the snapshot) get a `(not running)` message
+    /// row stored directly here — no fetch — and are omitted from the returned
+    /// list. Instances no longer in the snapshot are dropped from the cache.
+    pub fn proc_fetch_targets(&mut self) -> Vec<(String, String)> {
+        let Some(snapshot) = &self.snapshot else {
+            return Vec::new();
+        };
+        let mut targets = Vec::new();
+        let mut not_running: Vec<String> = Vec::new();
+        for name in &self.expanded_procs {
+            match snapshot.instances.iter().find(|r| &r.name == name) {
+                Some(row) if matches!(row.status, ContainerStatus::Running(_)) => {
+                    targets.push((row.name.clone(), row.container.clone()));
+                }
+                _ => not_running.push(name.clone()),
+            }
+        }
+        for name in not_running {
+            self.procs
+                .insert(name, ProcState::Message("(not running)".to_string()));
+        }
+        targets
+    }
+
+    /// Merge a completed proc fetch into the cache, overwriting only fetched
+    /// keys (other instances' cached rows are left untouched).
+    pub fn apply_proc_fetch(&mut self, fetched: BTreeMap<String, ProcState>) {
+        self.procs.extend(fetched);
     }
 
     /// Key handling while the prompt is open. `esc` cancels, `enter` parses
@@ -642,8 +786,9 @@ impl App {
         if self.tab != Tab::Instances {
             return;
         }
-        // Logs are instance-only; a no-op on sandbox / empty / orphan-group nodes.
-        let Some(Node::Instance(i)) = self.selected_node() else {
+        // Logs route to an instance; a process row uses its parent instance. A
+        // no-op on sandbox / empty / orphan-group nodes.
+        let Some(i) = self.selected_instance_index() else {
             return;
         };
         let Some(snapshot) = &self.snapshot else {
@@ -679,6 +824,9 @@ impl App {
                     }
                     Some(Node::Instance(i)) => {
                         snapshot.instances.get(i).map(|r| r.sandbox.clone())
+                    }
+                    Some(Node::Proc { instance, .. }) => {
+                        snapshot.instances.get(instance).map(|r| r.sandbox.clone())
                     }
                     Some(Node::Orphans) | None => None,
                 };
@@ -1279,6 +1427,148 @@ mod tests {
         app.tab = Tab::Services;
         app.on_key(key(KeyCode::Char('s')));
         assert_eq!(app.take_pending_stop(), None);
+    }
+
+    /// Seed the proc cache + expansion for an instance so proc rows are visible
+    /// without a fetch.
+    fn expand_with_rows(app: &mut App, instance: &str, pids: &[&str]) {
+        use super::super::procs::{ProcRow, ProcState};
+        let rows = pids
+            .iter()
+            .map(|p| ProcRow { pid: p.to_string(), depth: 0, args: "x".into() })
+            .collect();
+        app.expanded_procs.insert(instance.to_string());
+        app.procs.insert(instance.to_string(), ProcState::Rows(rows));
+    }
+
+    #[test]
+    fn right_on_instance_expands_procs_and_signals_fetch() {
+        let mut app = new_app();
+        app.set_snapshot(snapshot_with(1)); // [Sandbox(0), inst0]
+        app.on_key(key(KeyCode::Down)); // onto inst0
+        app.on_key(key(KeyCode::Right));
+        assert!(app.expanded_procs.contains("inst0"));
+        assert!(app.take_needs_proc_fetch());
+        // Consumed once.
+        assert!(!app.take_needs_proc_fetch());
+    }
+
+    #[test]
+    fn space_toggles_procs_on_instance() {
+        let mut app = new_app();
+        app.set_snapshot(snapshot_with(1));
+        app.on_key(key(KeyCode::Down)); // onto inst0
+        app.on_key(key(KeyCode::Char(' ')));
+        assert!(app.expanded_procs.contains("inst0"));
+        app.on_key(key(KeyCode::Char(' ')));
+        assert!(!app.expanded_procs.contains("inst0"));
+    }
+
+    #[test]
+    fn left_ladder_proc_to_instance_to_sandbox() {
+        let mut app = new_app();
+        app.set_snapshot(snapshot_with(1)); // [Sandbox(0), inst0]
+        expand_with_rows(&mut app, "inst0", &["10", "20"]);
+        // Tree: [Sandbox(0), Instance(0), Proc r0, Proc r1].
+        app.on_key(key(KeyCode::Down)); // inst0 (pos 1)
+        app.on_key(key(KeyCode::Down)); // proc r0 (pos 2)
+        app.on_key(key(KeyCode::Down)); // proc r1 (pos 3)
+        assert_eq!(app.selected_node(), Some(Node::Proc { instance: 0, row: 1 }));
+
+        // First Left: proc → its instance row.
+        app.on_key(key(KeyCode::Left));
+        assert_eq!(app.selected_node(), Some(Node::Instance(0)));
+        // Procs still expanded (jump didn't collapse them).
+        assert!(app.expanded_procs.contains("inst0"));
+
+        // Second Left: instance with procs expanded → collapse procs, stay put.
+        app.on_key(key(KeyCode::Left));
+        assert_eq!(app.selected_node(), Some(Node::Instance(0)));
+        assert!(!app.expanded_procs.contains("inst0"));
+
+        // Third Left: instance → parent sandbox.
+        app.on_key(key(KeyCode::Left));
+        assert_eq!(app.selected_node(), Some(Node::Sandbox(0)));
+    }
+
+    #[test]
+    fn s_on_proc_row_stops_parent_instance() {
+        let mut app = new_app();
+        app.set_snapshot(snapshot_with(1));
+        expand_with_rows(&mut app, "inst0", &["10"]);
+        app.on_key(key(KeyCode::Down)); // inst0
+        app.on_key(key(KeyCode::Down)); // proc row
+        assert_eq!(app.selected_node(), Some(Node::Proc { instance: 0, row: 0 }));
+        app.on_key(key(KeyCode::Char('s')));
+        assert!(app.stopping.contains("inst0"));
+        assert_eq!(app.take_pending_stop(), Some("inst0".into()));
+    }
+
+    #[test]
+    fn o_on_proc_row_codes_parent_instance() {
+        let mut app = new_app();
+        app.set_snapshot(snapshot_with(1));
+        expand_with_rows(&mut app, "inst0", &["10"]);
+        app.on_key(key(KeyCode::Down)); // inst0
+        app.on_key(key(KeyCode::Down)); // proc row
+        app.on_key(key(KeyCode::Char('o')));
+        assert_eq!(
+            app.take_pending_action(),
+            Some(PromptAction::Code { instance: "inst0".into() }),
+        );
+    }
+
+    #[test]
+    fn proc_fetch_targets_running_and_not_running() {
+        use super::super::data::{ContainerStatus, InstanceRow, SandboxRow};
+        let mut app = new_app();
+        let mk = |name: &str, status: ContainerStatus| InstanceRow {
+            name: name.into(),
+            sandbox: "s".into(),
+            container: format!("devsandbox-{name}"),
+            status,
+            uptime_secs: 0,
+            cpu: None,
+            mem: None,
+            folder: "/f".into(),
+            worktree: false,
+            services: Vec::new(),
+            workspace: "/w".into(),
+            remote_user: None,
+            remote_env_len: 0,
+            base_folder: "/f".into(),
+            drift: false,
+        };
+        let snap = Snapshot {
+            instances: vec![
+                mk("up", ContainerStatus::Running("Up".into())),
+                mk("down", ContainerStatus::Exited("Exited".into())),
+            ],
+            sandboxes: vec![SandboxRow {
+                name: "s".into(),
+                source: "image x".into(),
+                folder: None,
+                services: Vec::new(),
+                extends: Vec::new(),
+                config_hash: "h".into(),
+            }],
+            services: Vec::new(),
+            sandbox_count: 1,
+            docker_version: None,
+            collected_at: std::time::Instant::now(),
+            error: None,
+        };
+        app.set_snapshot(snap);
+        app.expanded_procs.insert("up".into());
+        app.expanded_procs.insert("down".into());
+
+        let targets = app.proc_fetch_targets();
+        assert_eq!(targets, vec![("up".to_string(), "devsandbox-up".to_string())]);
+        // Non-running instance got a (not running) message row, no fetch.
+        assert_eq!(
+            app.procs.get("down"),
+            Some(&super::super::procs::ProcState::Message("(not running)".into())),
+        );
     }
 
     #[test]

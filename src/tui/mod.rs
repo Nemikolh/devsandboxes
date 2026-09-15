@@ -6,9 +6,11 @@
 
 mod app;
 mod data;
+mod procs;
 mod prompt;
 mod ui;
 
+use std::collections::BTreeMap;
 use std::io::{self, Stdout, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -28,12 +30,15 @@ use crate::config::Config;
 
 use app::App;
 use data::Snapshot;
+use procs::{parse_top, build_forest, ProcState};
 use prompt::PromptAction;
 
 /// How long each `event::poll` blocks before we redraw.
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// Data-refresh cadence: how often a background collection is kicked off.
 const TICK_INTERVAL: Duration = Duration::from_secs(2);
+/// Process-refresh cadence for expanded instances (separate from the snapshot).
+const PROC_TICK: Duration = Duration::from_secs(5);
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
@@ -84,6 +89,9 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
     // paired with the instance name so the guard clears even if the thread dies.
     let mut stops: Vec<(String, Receiver<StopDone>)> = Vec::new();
     let mut last_tick = Instant::now();
+    // At most one process fetch in flight; `Some` while one is running.
+    let mut proc_pending: Option<Receiver<BTreeMap<String, ProcState>>> = None;
+    let mut last_proc_tick = Instant::now();
 
     while !app.should_quit {
         terminal.draw(|frame| ui::draw(frame, &app))?;
@@ -158,6 +166,32 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
             // Skip if a collection is still running so docker calls can't pile up.
             if pending.is_none() {
                 pending = Some(spawn_collect(&dir));
+            }
+        }
+
+        // Drain a finished process fetch into the app, freeing the in-flight slot.
+        if let Some(rx) = &proc_pending {
+            match rx.try_recv() {
+                Ok(procs) => {
+                    app.apply_proc_fetch(procs);
+                    proc_pending = None;
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => proc_pending = None,
+            }
+        }
+
+        // Process refresh: fetch now on expand, else every PROC_TICK, but only
+        // while something is expanded and no fetch is already running.
+        let want_now = app.take_needs_proc_fetch();
+        let tick_due = last_proc_tick.elapsed() >= PROC_TICK;
+        if (want_now || tick_due) && app.has_expanded_procs() && proc_pending.is_none() {
+            last_proc_tick = Instant::now();
+            // Non-running expanded instances get their `(not running)` row here;
+            // running ones come back as fetch targets.
+            let targets = app.proc_fetch_targets();
+            if !targets.is_empty() {
+                proc_pending = Some(spawn_proc_fetch(targets));
             }
         }
     }
@@ -292,6 +326,32 @@ fn spawn_stop(instance: &str) -> Receiver<StopDone> {
             Err(e) => format!("stop: {e:#}"),
         };
         let _ = tx.send(StopDone { status });
+    });
+    rx
+}
+
+/// Spawn one detached thread that runs `docker top` for each target
+/// `(instance name, container)` and sends back a name→[`ProcState`] map. Docker
+/// calls go through the screen-safe quiet path; a per-container error becomes a
+/// `(processes unavailable: …)` message row rather than failing the batch.
+fn spawn_proc_fetch(targets: Vec<(String, String)>) -> Receiver<BTreeMap<String, ProcState>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut out: BTreeMap<String, ProcState> = BTreeMap::new();
+        for (instance, container) in targets {
+            let state = match crate::docker::output_quiet(&[
+                "top",
+                &container,
+                "-eo",
+                "pid,ppid,args",
+            ]) {
+                Ok(text) => ProcState::Rows(build_forest(parse_top(&text))),
+                Err(e) => ProcState::Message(format!("(processes unavailable: {e:#})")),
+            };
+            out.insert(instance, state);
+        }
+        // Receiver may be gone if the UI quit mid-fetch; ignore send errors.
+        let _ = tx.send(out);
     });
     rx
 }
