@@ -49,15 +49,31 @@ pub fn run(dir: &Path, sandbox_name: Option<String>, instance_name: Option<Strin
         .context("sandbox folder has no basename")?
         .to_string_lossy()
         .into_owned();
-    // `${configDir}` / `${localWorkspaceFolder(Basename)}` are usable in
-    // `workspaceFolder`, `mounts`, and cache sources; build the context once.
+    // `${configDir}` / `${localWorkspaceFolder(Basename)}` / `${sharedVolumes}`
+    // / `${instance}` are usable in `workspaceFolder`, `mounts`, and cache
+    // sources; build the context once. Instance naming comes first so
+    // `${instance}` can anchor per-instance state in mount sources.
     let config_dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
     let config_dir_str = config_dir.to_string_lossy().into_owned();
     let folder_str = folder.to_string_lossy().into_owned();
+    let shared_volumes = config_dir.join("shared-volumes").to_string_lossy().into_owned();
+
+    let mut state = State::load()?;
+    // Deterministic name: explicit --name, or the sandbox name for the first
+    // instance. When the base instance is already live, default to the next
+    // free ordinal so a repeat `run` yields a worktree instance (see below).
+    let instance = match instance_name {
+        Some(name) => name,
+        None => default_instance_name(&state, &sandbox_name),
+    };
+    let container_name = format!("{NAME_PREFIX}{instance}");
+
     let var_ctx = MountContext {
         config_dir: &config_dir_str,
         workspace_folder: &folder_str,
         workspace_folder_basename: &basename,
+        shared_volumes: &shared_volumes,
+        instance: &instance,
     };
     let workspace = substitute(
         &props
@@ -69,16 +85,6 @@ pub fn run(dir: &Path, sandbox_name: Option<String>, instance_name: Option<Strin
     // Extra workspace roots (`folders`): bind-mounted at their container path
     // and listed in the generated `.code-workspace` after the primary folder.
     let extra_folders = resolve_folders(dir, &var_ctx, &workspace, props)?;
-
-    let mut state = State::load()?;
-    // Deterministic name: explicit --name, or the sandbox name for the first
-    // instance. When the base instance is already live, default to the next
-    // free ordinal so a repeat `run` yields a worktree instance (see below).
-    let instance = match instance_name {
-        Some(name) => name,
-        None => default_instance_name(&state, &sandbox_name),
-    };
-    let container_name = format!("{NAME_PREFIX}{instance}");
 
     // Reuse an existing instance whose container still exists: start it if
     // stopped, refresh config, run postStartCommand, done.
@@ -154,7 +160,7 @@ pub fn run(dir: &Path, sandbox_name: Option<String>, instance_name: Option<Strin
     } else {
         (folder.clone(), None, Vec::new())
     };
-    let mut mounts = resolve_mounts(dir, &folder, &basename, &sandbox)?;
+    let mut mounts = resolve_mounts(dir, &folder, &basename, &instance, &sandbox)?;
     for (target, host) in &extra_folders {
         mounts.push(format!("type=bind,source={},target={target}", host.display()));
     }
@@ -381,6 +387,7 @@ fn resolve_mounts(
     dir: &Path,
     folder: &Path,
     basename: &str,
+    instance: &str,
     sandbox: &ResolvedSandbox,
 ) -> Result<Vec<String>> {
     let Some(mounts) = &sandbox.properties.mounts else {
@@ -388,10 +395,13 @@ fn resolve_mounts(
     };
     // `${configDir}` anchors host-backed volumes; make it absolute.
     let config_dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let shared_volumes = config_dir.join("shared-volumes");
     let ctx = MountContext {
         config_dir: &config_dir.to_string_lossy(),
         workspace_folder: &folder.to_string_lossy(),
         workspace_folder_basename: basename,
+        shared_volumes: &shared_volumes.to_string_lossy(),
+        instance,
     };
     let mut args = Vec::with_capacity(mounts.len());
     for mount in mounts {
@@ -1137,6 +1147,8 @@ mod tests {
             config_dir: "/cfg",
             workspace_folder: "/host/app",
             workspace_folder_basename: "app",
+            shared_volumes: "/cfg/shared-volumes",
+            instance: "app",
         }
     }
 

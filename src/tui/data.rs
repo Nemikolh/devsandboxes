@@ -433,10 +433,15 @@ fn validate_sandbox(dir: &Path, sb: &ResolvedSandbox) -> Vec<String> {
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
+        let shared_volumes = config_dir.join("shared-volumes");
         let ctx = MountContext {
             config_dir: &config_dir.to_string_lossy(),
             workspace_folder: &folder_str,
             workspace_folder_basename: &basename,
+            shared_volumes: &shared_volumes.to_string_lossy(),
+            // The sandbox name doubles as the default first-instance name; a
+            // real instance name only exists at run time.
+            instance: &sb.name,
         };
         for mount in mounts {
             match mount.resolve(&ctx) {

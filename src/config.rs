@@ -183,6 +183,12 @@ pub struct MountContext<'a> {
     pub workspace_folder: &'a str,
     /// Its basename (`${localWorkspaceFolderBasename}`).
     pub workspace_folder_basename: &'a str,
+    /// `<configDir>/shared-volumes` (`${sharedVolumes}`), the host-backed
+    /// persistent-state root.
+    pub shared_volumes: &'a str,
+    /// Name of the instance being run (`${instance}`), e.g. `web` / `web-2` —
+    /// anchors per-instance state under `${sharedVolumes}`.
+    pub instance: &'a str,
 }
 
 /// A mount with variables substituted and defaults applied, ready to hand to
@@ -323,6 +329,8 @@ fn resolve_var(expr: &str, ctx: &MountContext) -> Option<String> {
         "configDir" => Some(ctx.config_dir.to_string()),
         "localWorkspaceFolder" => Some(ctx.workspace_folder.to_string()),
         "localWorkspaceFolderBasename" => Some(ctx.workspace_folder_basename.to_string()),
+        "sharedVolumes" => Some(ctx.shared_volumes.to_string()),
+        "instance" => Some(ctx.instance.to_string()),
         _ => None,
     }
 }
@@ -940,7 +948,19 @@ onCreateCommand = { b = "make", a = ["cargo", "build"] }
             config_dir: "/cfg",
             workspace_folder: "/home/u/repo",
             workspace_folder_basename: "repo",
+            shared_volumes: "/cfg/shared-volumes",
+            instance: "repo-2",
         }
+    }
+
+    #[test]
+    fn substitutes_shared_volumes_and_instance() {
+        let m = Mount::Shorthand(
+            "source=${sharedVolumes}/zidane/${instance},target=/root/.zidane,type=bind".into(),
+        );
+        let resolved = m.resolve(&ctx()).unwrap();
+        assert_eq!(resolved.source.as_deref(), Some("/cfg/shared-volumes/zidane/repo-2"));
+        assert_eq!(resolved.target, "/root/.zidane");
     }
 
     #[test]
