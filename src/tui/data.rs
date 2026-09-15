@@ -386,6 +386,8 @@ pub fn humanize_secs(secs: u64) -> String {
 /// Validate a resolved sandbox's host-facing paths, mirroring what
 /// `commands::run` does at run time but reporting instead of acting:
 ///
+/// - **source**: must have an `image` or a `build.dockerfile` (i.e. the same
+///   condition that makes [`ResolvedSandbox::source`] return `?`).
 /// - **folder**: must be set and resolve relative to the config dir
 ///   (`dir.join(folder).canonicalize()`).
 /// - **mounts**: each must resolve (`${…}` substitution + a source for binds);
@@ -395,6 +397,13 @@ pub fn humanize_secs(secs: u64) -> String {
 /// Returns one message per problem, in check order; empty means it validates.
 fn validate_sandbox(dir: &Path, sb: &ResolvedSandbox) -> Vec<String> {
     let mut issues = Vec::new();
+
+    // Source: neither `image` nor a `build.dockerfile` — the same condition that
+    // renders `?` in the source column. Tie the red line to that marker so the
+    // user sees what is missing rather than just the `?`.
+    if sb.source() == "?" {
+        issues.push("no `image` or `build.dockerfile` set".to_string());
+    }
 
     // Folder: presence + resolution relative to the config dir. On success the
     // canonical path + basename anchor the mount context below.
@@ -1113,15 +1122,28 @@ mod tests {
         std::fs::create_dir_all(root.join("repo")).unwrap();
         std::fs::create_dir_all(root.join("data")).unwrap();
 
+        // `mk` gives a valid source (image) so cases isolate folder/mount checks.
         let mk = |folder: Option<&str>, mounts: Option<Vec<Mount>>| ResolvedSandbox {
             name: "s".into(),
             properties: SandboxProperties {
+                image: Some("node:22".into()),
                 folder: folder.map(str::to_string),
                 mounts,
                 ..Default::default()
             },
             config_hash: "h".into(),
         };
+
+        // No image and no build ⇒ the source issue (matches the `?` column).
+        let no_source = ResolvedSandbox {
+            name: "s".into(),
+            properties: SandboxProperties { folder: Some("repo".into()), ..Default::default() },
+            config_hash: "h".into(),
+        };
+        assert_eq!(
+            validate_sandbox(&root, &no_source),
+            vec!["no `image` or `build.dockerfile` set".to_string()],
+        );
 
         // Resolvable folder + an existing bind source ⇒ no issues.
         let ok = mk(
