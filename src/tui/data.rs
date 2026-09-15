@@ -3,7 +3,7 @@
 //! [`Snapshot`] that the state machine consumes verbatim. Parsing lives in
 //! free functions to stay unit-testable without docker.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Instant;
 
@@ -57,6 +57,23 @@ pub struct InstanceRow {
     pub drift: bool,
 }
 
+/// One sandbox row from `config.toml`, everything the Instances tree needs to
+/// render a sandbox node. Every configured sandbox gets one, even with zero
+/// instances; a sandbox that fails to resolve still gets a row with source `?`.
+#[derive(Clone, Debug)]
+pub struct SandboxRow {
+    pub name: String,
+    /// Like `ResolvedSandbox::source`: `image X` / `dockerfile Y`, or `?` when
+    /// the sandbox failed to resolve.
+    pub source: String,
+    pub folder: Option<String>,
+    pub services: Vec<String>,
+    /// `extends` template chain from the raw table (`-` list empty when none).
+    pub extends: Vec<String>,
+    /// Short config hash of the resolved table, empty when unresolved.
+    pub config_hash: String,
+}
+
 /// One service row, everything the Services view needs pre-joined.
 #[derive(Clone, Debug)]
 pub struct ServiceRow {
@@ -85,6 +102,9 @@ pub struct ServiceRow {
 #[derive(Clone, Debug)]
 pub struct Snapshot {
     pub instances: Vec<InstanceRow>,
+    /// Sandboxes from `config.toml`, in config order. Empty when config is
+    /// absent or unreadable. Roots of the Instances tree.
+    pub sandboxes: Vec<SandboxRow>,
     pub services: Vec<ServiceRow>,
     /// Number of sandboxes defined in `config.toml` (0 when config is absent or
     /// unreadable). Feeds the header totals line.
@@ -95,6 +115,86 @@ pub struct Snapshot {
     /// When collection finished. Drives the staleness indicator in the header.
     pub collected_at: Instant,
     pub error: Option<String>,
+}
+
+/// The literal sandbox name of the synthetic group holding instances whose
+/// sandbox is not in config. Keyed by this string in the collapsed set.
+pub const ORPHANS_NAME: &str = "(not in config)";
+
+/// One visible row of the Instances tree, flattened from
+/// (sandboxes, instances, collapsed) by [`visible_nodes`]. Payloads are indices
+/// into `Snapshot::sandboxes` / `Snapshot::instances`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Node {
+    /// A configured sandbox root (index into `sandboxes`).
+    Sandbox(usize),
+    /// An instance row (index into `instances`), a child of the sandbox or the
+    /// orphan group above it.
+    Instance(usize),
+    /// The dim "no instances" child under an expanded, empty sandbox (index into
+    /// `sandboxes`).
+    Empty(usize),
+    /// The synthetic `(not in config)` group header, holding orphan instances.
+    /// Only emitted when such instances exist.
+    Orphans,
+}
+
+/// Flatten the tree into the visible node list, in render/selection order.
+///
+/// Sandboxes appear in config order; an expanded sandbox lists its instances (in
+/// `instances` order) as children, or one [`Node::Empty`] child when it has
+/// none. Instances whose `sandbox` matches no [`SandboxRow`] group under a
+/// trailing [`Node::Orphans`] header (keyed by [`ORPHANS_NAME`] in `collapsed`),
+/// which only appears when such instances exist. A name in `collapsed` hides a
+/// node's children.
+pub fn visible_nodes(
+    sandboxes: &[SandboxRow],
+    instances: &[InstanceRow],
+    collapsed: &BTreeSet<String>,
+) -> Vec<Node> {
+    let mut nodes = Vec::new();
+    let configured: BTreeSet<&str> = sandboxes.iter().map(|s| s.name.as_str()).collect();
+
+    for (si, sb) in sandboxes.iter().enumerate() {
+        nodes.push(Node::Sandbox(si));
+        if collapsed.contains(&sb.name) {
+            continue;
+        }
+        let mut any = false;
+        for (ii, inst) in instances.iter().enumerate() {
+            if inst.sandbox == sb.name {
+                nodes.push(Node::Instance(ii));
+                any = true;
+            }
+        }
+        if !any {
+            nodes.push(Node::Empty(si));
+        }
+    }
+
+    // Orphans: instances whose sandbox is not configured, grouped at the bottom.
+    let orphans: Vec<usize> = instances
+        .iter()
+        .enumerate()
+        .filter(|(_, inst)| !configured.contains(inst.sandbox.as_str()))
+        .map(|(ii, _)| ii)
+        .collect();
+    if !orphans.is_empty() {
+        nodes.push(Node::Orphans);
+        if !collapsed.contains(ORPHANS_NAME) {
+            for ii in orphans {
+                nodes.push(Node::Instance(ii));
+            }
+        }
+    }
+
+    nodes
+}
+
+/// The `N/M running` stats string for a sandbox row: `M` instances, `N` running.
+/// Pure so the rendering layer and tests share one format.
+pub fn sandbox_stats(instances: usize, running: usize) -> String {
+    format!("{running}/{instances} running")
 }
 
 /// Parsed line of `docker ps --format {{json .}}`.
@@ -137,6 +237,20 @@ struct ResolvedServiceInput {
     env_len: usize,
     command: Option<String>,
     config_hash: String,
+}
+
+/// The `extends` template chain from a raw sandbox table value, as a name list
+/// (same shape as `commands::ls::extends_names`, but returning a `Vec`). A bare
+/// string is a single-element chain; anything else yields an empty chain.
+fn extends_names(value: &toml::Value) -> Vec<String> {
+    match value {
+        toml::Value::String(s) => vec![s.clone()],
+        toml::Value::Array(items) => items
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// Source description for a service, mirroring `ResolvedSandbox::source`.
@@ -287,6 +401,7 @@ pub fn collect(dir: &Path) -> Snapshot {
         Err(e) => {
             return Snapshot {
                 instances: Vec::new(),
+                sandboxes: Vec::new(),
                 services: Vec::new(),
                 sandbox_count: 0,
                 docker_version: None,
@@ -333,28 +448,50 @@ pub fn collect(dir: &Path) -> Snapshot {
         .ok()
         .filter(|v| !v.is_empty());
 
-    // Load config once; resolve each distinct sandbox for services + drift hash.
+    // Load config once; resolve every sandbox for the tree, services + drift
+    // hash. `resolved` maps sandbox name → (services, hash) for the instance join.
     let config = Config::load(dir);
-    let sandbox_count = config.as_ref().map_or(0, |cfg| cfg.sandboxes.len());
     let mut resolved: BTreeMap<String, (Vec<String>, String)> = BTreeMap::new();
+    let mut sandboxes: Vec<SandboxRow> = Vec::new();
     match &config {
         Ok(cfg) => {
-            for inst in state.instances.values() {
-                if resolved.contains_key(&inst.sandbox) {
-                    continue;
-                }
-                match cfg.resolve_sandbox(&inst.sandbox) {
+            for name in cfg.sandboxes.keys() {
+                let extends = cfg
+                    .sandboxes
+                    .get(name)
+                    .and_then(|t| t.get("extends"))
+                    .map(extends_names)
+                    .unwrap_or_default();
+                match cfg.resolve_sandbox(name) {
                     Ok(rs) => {
-                        let services =
-                            rs.properties.services.clone().unwrap_or_default();
-                        resolved.insert(inst.sandbox.clone(), (services, rs.config_hash));
+                        let services = rs.properties.services.clone().unwrap_or_default();
+                        sandboxes.push(SandboxRow {
+                            name: name.clone(),
+                            source: rs.source(),
+                            folder: rs.folder().map(str::to_string),
+                            services: services.clone(),
+                            extends,
+                            config_hash: rs.config_hash.clone(),
+                        });
+                        resolved.insert(name.clone(), (services, rs.config_hash));
                     }
-                    Err(e) => errors.push(format!("sandbox `{}`: {e:#}", inst.sandbox)),
+                    Err(e) => {
+                        errors.push(format!("sandbox `{name}`: {e:#}"));
+                        sandboxes.push(SandboxRow {
+                            name: name.clone(),
+                            source: "?".into(),
+                            folder: None,
+                            services: Vec::new(),
+                            extends,
+                            config_hash: String::new(),
+                        });
+                    }
                 }
             }
         }
         Err(e) => errors.push(format!("config: {e:#}")),
     }
+    let sandbox_count = sandboxes.len();
 
     let mut instances = Vec::with_capacity(state.instances.len());
     for (name, inst) in &state.instances {
@@ -434,6 +571,7 @@ pub fn collect(dir: &Path) -> Snapshot {
 
     Snapshot {
         instances,
+        sandboxes,
         services,
         sandbox_count,
         docker_version,
@@ -699,6 +837,7 @@ mod tests {
     ) -> Snapshot {
         Snapshot {
             instances,
+            sandboxes: Vec::new(),
             services,
             sandbox_count,
             docker_version: docker_version.map(str::to_string),
@@ -756,5 +895,105 @@ mod tests {
         let rows = build_service_rows("proj", &inputs, &[], &[]);
         assert!(rows[0].used_by.is_empty());
         assert!(rows[0].containers.is_empty());
+    }
+
+    fn sb(name: &str) -> SandboxRow {
+        SandboxRow {
+            name: name.into(),
+            source: "image x".into(),
+            folder: None,
+            services: Vec::new(),
+            extends: Vec::new(),
+            config_hash: "hash".into(),
+        }
+    }
+
+    /// An instance in a given sandbox (extends the `inst` helper, which pins
+    /// sandbox to "s").
+    fn inst_in(name: &str, sandbox: &str) -> InstanceRow {
+        let mut row = inst(name, ContainerStatus::Missing);
+        row.sandbox = sandbox.into();
+        row
+    }
+
+    fn collapsed(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn visible_nodes_expands_sandboxes_with_instances() {
+        let sandboxes = vec![sb("a"), sb("b")];
+        let instances = vec![
+            inst_in("a1", "a"),
+            inst_in("b1", "b"),
+            inst_in("a2", "a"),
+        ];
+        let nodes = visible_nodes(&sandboxes, &instances, &BTreeSet::new());
+        assert_eq!(
+            nodes,
+            vec![
+                Node::Sandbox(0),
+                Node::Instance(0), // a1
+                Node::Instance(2), // a2 (instances order preserved)
+                Node::Sandbox(1),
+                Node::Instance(1), // b1
+            ],
+        );
+    }
+
+    #[test]
+    fn visible_nodes_empty_sandbox_gets_marker() {
+        let sandboxes = vec![sb("a")];
+        let nodes = visible_nodes(&sandboxes, &[], &BTreeSet::new());
+        assert_eq!(nodes, vec![Node::Sandbox(0), Node::Empty(0)]);
+    }
+
+    #[test]
+    fn visible_nodes_collapsed_sandbox_hides_children() {
+        let sandboxes = vec![sb("a"), sb("b")];
+        let instances = vec![inst_in("a1", "a"), inst_in("b1", "b")];
+        let nodes = visible_nodes(&sandboxes, &instances, &collapsed(&["a"]));
+        // a is collapsed (no children, not even a marker); b stays expanded.
+        assert_eq!(
+            nodes,
+            vec![Node::Sandbox(0), Node::Sandbox(1), Node::Instance(1)],
+        );
+    }
+
+    #[test]
+    fn visible_nodes_orphans_group_at_bottom() {
+        let sandboxes = vec![sb("a")];
+        let instances = vec![inst_in("a1", "a"), inst_in("x1", "gone")];
+        let nodes = visible_nodes(&sandboxes, &instances, &BTreeSet::new());
+        assert_eq!(
+            nodes,
+            vec![
+                Node::Sandbox(0),
+                Node::Instance(0),
+                Node::Orphans,
+                Node::Instance(1),
+            ],
+        );
+
+        // Collapsing the orphan group hides its children but keeps the header.
+        let nodes = visible_nodes(&sandboxes, &instances, &collapsed(&[ORPHANS_NAME]));
+        assert_eq!(
+            nodes,
+            vec![Node::Sandbox(0), Node::Instance(0), Node::Orphans],
+        );
+    }
+
+    #[test]
+    fn visible_nodes_no_orphan_group_when_all_configured() {
+        let sandboxes = vec![sb("a")];
+        let instances = vec![inst_in("a1", "a")];
+        let nodes = visible_nodes(&sandboxes, &instances, &BTreeSet::new());
+        assert!(!nodes.contains(&Node::Orphans));
+    }
+
+    #[test]
+    fn sandbox_stats_formats_running_over_total() {
+        assert_eq!(sandbox_stats(0, 0), "0/0 running");
+        assert_eq!(sandbox_stats(3, 1), "1/3 running");
     }
 }

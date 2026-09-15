@@ -2,6 +2,7 @@
 //! and selection logic stay unit-testable; `mod.rs` owns the crossterm/ratatui
 //! side and feeds decoded key events in here.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -9,7 +10,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::config::Config;
 use crate::docker;
 
-use super::data::Snapshot;
+use super::data::{visible_nodes, Node, Snapshot, ORPHANS_NAME};
 use super::prompt::{Prompt, PromptAction, COMMANDS};
 
 /// Keybinding reference shown by the `?` overlay, grouped by context.
@@ -21,6 +22,7 @@ Global
 
 Tables (Instances / Services)
   ↑/k ↓/j     move selection
+  →/space     expand   ←  collapse / jump to parent
   enter, e    open config explorer
   l           logs (Instances tab)
 
@@ -175,6 +177,10 @@ pub struct App {
     pub tab: Tab,
     /// Selected row per tab, indexed by `Tab::index`.
     selected: [usize; 2],
+    /// Collapsed tree groups on the Instances tab, keyed by sandbox name (and
+    /// [`ORPHANS_NAME`] for the orphan group). Empty means all expanded; survives
+    /// snapshot refreshes.
+    collapsed: BTreeSet<String>,
     /// Latest data collected off-thread; `None` until the first snapshot lands.
     pub snapshot: Option<Snapshot>,
     /// Active overlay, if any.
@@ -195,6 +201,7 @@ impl App {
             dir,
             tab: Tab::Instances,
             selected: [0, 0],
+            collapsed: BTreeSet::new(),
             snapshot: None,
             modal: Modal::None,
             prompt: None,
@@ -236,11 +243,31 @@ impl App {
 
     fn row_count_for(&self, tab: Tab) -> usize {
         match tab {
-            Tab::Instances => {
-                self.snapshot.as_ref().map_or(0, |s| s.instances.len())
-            }
+            Tab::Instances => self.visible_nodes().len(),
             Tab::Services => self.snapshot.as_ref().map_or(0, |s| s.services.len()),
         }
+    }
+
+    /// Flattened Instances-tree nodes for the current snapshot + collapse state.
+    /// Empty until a snapshot lands. Cheap; recomputed on demand.
+    pub fn visible_nodes(&self) -> Vec<Node> {
+        match &self.snapshot {
+            Some(s) => visible_nodes(&s.sandboxes, &s.instances, &self.collapsed),
+            None => Vec::new(),
+        }
+    }
+
+    /// Whether a tree group (sandbox name / [`ORPHANS_NAME`]) is collapsed. Used
+    /// by the renderer to pick the ▸/▾ marker.
+    pub fn is_collapsed_group(&self, key: &str) -> bool {
+        self.collapsed.contains(key)
+    }
+
+    /// The tree node under the Instances-tab cursor, if any.
+    fn selected_node(&self) -> Option<Node> {
+        self.visible_nodes()
+            .get(self.selected[Tab::Instances.index()])
+            .copied()
     }
 
     pub fn next_tab(&mut self) {
@@ -267,6 +294,69 @@ impl App {
         }
         let slot = self.tab.index();
         self.selected[slot] = (self.selected[slot] + 1).min(rows - 1);
+    }
+
+    /// The collapse-set key for a collapsible node (sandbox name / orphan group),
+    /// or `None` for leaf nodes (instances, empty markers).
+    fn collapse_key(&self, node: Node) -> Option<String> {
+        let snapshot = self.snapshot.as_ref()?;
+        match node {
+            Node::Sandbox(i) => snapshot.sandboxes.get(i).map(|s| s.name.clone()),
+            Node::Orphans => Some(ORPHANS_NAME.to_string()),
+            Node::Instance(_) | Node::Empty(_) => None,
+        }
+    }
+
+    /// Expand the node under the cursor (sandbox / orphan group). No-op on leaves.
+    fn tree_expand(&mut self) {
+        if let Some(node) = self.selected_node() {
+            if let Some(key) = self.collapse_key(node) {
+                self.collapsed.remove(&key);
+                self.clamp_selection();
+            }
+        }
+    }
+
+    /// Toggle the collapsible node under the cursor (space). No-op on leaves.
+    fn tree_toggle(&mut self) {
+        if let Some(node) = self.selected_node() {
+            if let Some(key) = self.collapse_key(node) {
+                if !self.collapsed.remove(&key) {
+                    self.collapsed.insert(key);
+                }
+                self.clamp_selection();
+            }
+        }
+    }
+
+    /// `←`: on a collapsible node collapse it; on an instance/empty child jump
+    /// selection to the parent sandbox (or orphan group) node.
+    fn tree_collapse(&mut self) {
+        let Some(node) = self.selected_node() else {
+            return;
+        };
+        match node {
+            Node::Sandbox(_) | Node::Orphans => {
+                if let Some(key) = self.collapse_key(node) {
+                    self.collapsed.insert(key);
+                    self.clamp_selection();
+                }
+            }
+            Node::Instance(_) | Node::Empty(_) => {
+                if let Some(parent) = self.parent_index(self.selected[Tab::Instances.index()]) {
+                    self.selected[Tab::Instances.index()] = parent;
+                }
+            }
+        }
+    }
+
+    /// Index of the enclosing group node (sandbox / orphan header) for the child
+    /// at visible-node position `pos`: the nearest preceding `Sandbox`/`Orphans`.
+    fn parent_index(&self, pos: usize) -> Option<usize> {
+        let nodes = self.visible_nodes();
+        nodes[..pos.min(nodes.len())]
+            .iter()
+            .rposition(|n| matches!(n, Node::Sandbox(_) | Node::Orphans))
     }
 
     /// Apply a key event to the state. No terminal I/O here (the modal open path
@@ -297,6 +387,9 @@ impl App {
             KeyCode::Char('2') => self.tab = Tab::Services,
             KeyCode::Up | KeyCode::Char('k') => self.select_up(),
             KeyCode::Down | KeyCode::Char('j') => self.select_down(),
+            KeyCode::Right if self.tab == Tab::Instances => self.tree_expand(),
+            KeyCode::Char(' ') if self.tab == Tab::Instances => self.tree_toggle(),
+            KeyCode::Left if self.tab == Tab::Instances => self.tree_collapse(),
             KeyCode::Enter | KeyCode::Char('e') => self.open_config(),
             KeyCode::Char('l') => self.open_logs(),
             KeyCode::Char('?') => self.open_help(),
@@ -470,10 +563,14 @@ impl App {
         if self.tab != Tab::Instances {
             return;
         }
+        // Logs are instance-only; a no-op on sandbox / empty / orphan-group nodes.
+        let Some(Node::Instance(i)) = self.selected_node() else {
+            return;
+        };
         let Some(snapshot) = &self.snapshot else {
             return;
         };
-        let Some(row) = snapshot.instances.get(self.selected[Tab::Instances.index()]) else {
+        let Some(row) = snapshot.instances.get(i) else {
             return;
         };
         let container = row.container.clone();
@@ -487,23 +584,32 @@ impl App {
     }
 
     /// Open the config explorer for the current selection. On the Instances tab
-    /// the target is the sandbox behind the selected instance; on the Services
-    /// tab it is the selected service (original == resolved). No-op when there is
-    /// no row to key off.
+    /// the target is the sandbox under the cursor (a sandbox node, or the sandbox
+    /// behind an instance / empty node); the orphan group and its children have no
+    /// config. On the Services tab it is the selected service (original ==
+    /// resolved). No-op when there is no row to key off.
     fn open_config(&mut self) {
         let Some(snapshot) = &self.snapshot else {
             return;
         };
-        let sel = self.selected[self.tab.index()];
         let view = match self.tab {
             Tab::Instances => {
-                let Some(row) = snapshot.instances.get(sel) else {
+                let name = match self.selected_node() {
+                    Some(Node::Sandbox(i)) | Some(Node::Empty(i)) => {
+                        snapshot.sandboxes.get(i).map(|s| s.name.clone())
+                    }
+                    Some(Node::Instance(i)) => {
+                        snapshot.instances.get(i).map(|r| r.sandbox.clone())
+                    }
+                    Some(Node::Orphans) | None => None,
+                };
+                let Some(name) = name else {
                     return;
                 };
-                Self::build_sandbox_view(&self.dir, &row.sandbox)
+                Self::build_sandbox_view(&self.dir, &name)
             }
             Tab::Services => {
-                let Some(row) = snapshot.services.get(sel) else {
+                let Some(row) = snapshot.services.get(self.selected()) else {
                     return;
                 };
                 Self::build_service_view(&self.dir, &row.name)
@@ -635,8 +741,11 @@ mod tests {
         assert_eq!(app.selected(), 0);
     }
 
+    /// A snapshot with one sandbox `s` holding `n` instances. Its Instances tree
+    /// is `[Sandbox(0), Instance(0)..Instance(n-1)]` when expanded, i.e. node
+    /// position of instance `i` is `i + 1`.
     fn snapshot_with(n: usize) -> Snapshot {
-        use super::super::data::{ContainerStatus, InstanceRow};
+        use super::super::data::{ContainerStatus, InstanceRow, SandboxRow};
         let instances = (0..n)
             .map(|i| InstanceRow {
                 name: format!("inst{i}"),
@@ -656,10 +765,19 @@ mod tests {
                 drift: false,
             })
             .collect();
+        let sandboxes = vec![SandboxRow {
+            name: "s".into(),
+            source: "image x".into(),
+            folder: None,
+            services: Vec::new(),
+            extends: Vec::new(),
+            config_hash: "hash".into(),
+        }];
         Snapshot {
             instances,
+            sandboxes,
             services: Vec::new(),
-            sandbox_count: 0,
+            sandbox_count: 1,
             docker_version: None,
             collected_at: std::time::Instant::now(),
             error: None,
@@ -669,18 +787,77 @@ mod tests {
     #[test]
     fn selection_clamps_when_snapshot_shrinks() {
         let mut app = new_app();
+        // Tree: [Sandbox(0), inst0, inst1, inst2] → 4 nodes.
         app.set_snapshot(snapshot_with(3));
         // Move down to the last row.
         app.on_key(key(KeyCode::Down));
         app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(app.selected(), 3);
+
+        // Shrinking to one instance → [Sandbox(0), inst0] re-clamps to last row.
+        app.set_snapshot(snapshot_with(1));
+        assert_eq!(app.selected(), 1);
+
+        // Empty sandbox → [Sandbox(0), Empty(0)] still has 2 rows; clamp to 1.
+        app.set_snapshot(snapshot_with(0));
+        assert_eq!(app.selected(), 1);
+    }
+
+    #[test]
+    fn left_on_instance_jumps_to_parent_sandbox() {
+        let mut app = new_app();
+        app.set_snapshot(snapshot_with(2)); // [Sandbox(0), inst0, inst1]
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Down)); // on inst1
+        assert_eq!(app.selected(), 2);
+        assert_eq!(app.selected_node(), Some(Node::Instance(1)));
+
+        app.on_key(key(KeyCode::Left)); // jumps to the sandbox node
+        assert_eq!(app.selected(), 0);
+        assert_eq!(app.selected_node(), Some(Node::Sandbox(0)));
+    }
+
+    #[test]
+    fn collapse_hides_children_and_reclamps_selection() {
+        let mut app = new_app();
+        app.set_snapshot(snapshot_with(2)); // [Sandbox(0), inst0, inst1]
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Down)); // on inst1 (pos 2)
         assert_eq!(app.selected(), 2);
 
-        // Shrinking the snapshot re-clamps selection to the new last row.
-        app.set_snapshot(snapshot_with(1));
+        // Collapse the sandbox from the child: jumps to the parent first.
+        app.on_key(key(KeyCode::Left));
+        assert_eq!(app.selected(), 0);
+        // Now on the sandbox node: Left collapses it, hiding both instances.
+        app.on_key(key(KeyCode::Left));
+        assert_eq!(app.visible_nodes(), vec![Node::Sandbox(0)]);
         assert_eq!(app.selected(), 0);
 
-        // Empty snapshot clamps to 0.
-        app.set_snapshot(snapshot_with(0));
+        // Space toggles it back open.
+        app.on_key(key(KeyCode::Char(' ')));
+        assert_eq!(
+            app.visible_nodes(),
+            vec![Node::Sandbox(0), Node::Instance(0), Node::Instance(1)],
+        );
+    }
+
+    #[test]
+    fn collapse_survives_snapshot_refresh_and_clamps() {
+        let mut app = new_app();
+        app.set_snapshot(snapshot_with(3)); // 4 nodes
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Down)); // last instance, pos 3
+        assert_eq!(app.selected(), 3);
+        // Collapse via parent jump then Left.
+        app.on_key(key(KeyCode::Left)); // to sandbox, pos 0
+        app.on_key(key(KeyCode::Left)); // collapse
+        assert_eq!(app.visible_nodes().len(), 1);
+
+        // A refresh keeps the collapse and re-clamps (still 1 node).
+        app.set_snapshot(snapshot_with(3));
+        assert_eq!(app.visible_nodes().len(), 1);
         assert_eq!(app.selected(), 0);
     }
 
@@ -809,6 +986,8 @@ mod tests {
         // with the docker error as the body (never panics).
         let mut app = new_app();
         app.set_snapshot(snapshot_with(1));
+        // Cursor starts on the sandbox node; move down to the instance.
+        app.on_key(key(KeyCode::Down));
         app.on_key(key(KeyCode::Char('l')));
         match &app.modal {
             Modal::Logs(v) => {

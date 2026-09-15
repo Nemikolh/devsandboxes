@@ -9,7 +9,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Tabs};
 
 use super::app::{App, ConfigView, Modal, Side, Tab, TextModal};
-use super::data::{humanize_secs, totals_line, ContainerStatus, InstanceRow, ServiceRow};
+use super::data::{
+    humanize_secs, sandbox_stats, totals_line, ContainerStatus, InstanceRow, Node, SandboxRow,
+    ServiceRow, Snapshot,
+};
 use super::prompt::Prompt;
 
 const HIGHLIGHT: Color = Color::Cyan;
@@ -267,7 +270,7 @@ fn draw_service_detail(frame: &mut Frame, row: Option<&ServiceRow>, area: Rect) 
 
 fn draw_instances(frame: &mut Frame, app: &App, area: Rect) {
     let snapshot = app.snapshot.as_ref();
-    let rows: &[InstanceRow] = snapshot.map_or(&[], |s| s.instances.as_slice());
+    let nodes = app.visible_nodes();
 
     // Optional error line reserved above the table; detail panel below it.
     let error = snapshot.and_then(|s| s.error.as_deref());
@@ -286,14 +289,16 @@ fn draw_instances(frame: &mut Frame, app: &App, area: Rect) {
         frame.render_widget(Paragraph::new(line), err_area);
     }
 
-    if rows.is_empty() {
+    if nodes.is_empty() {
         draw_empty(frame, table_area);
-        draw_detail(frame, None, detail_area);
+        draw_detail(frame, snapshot, None, detail_area);
         return;
     }
 
-    draw_table(frame, app, rows, table_area);
-    draw_detail(frame, rows.get(app.selected()), detail_area);
+    let snapshot = snapshot.expect("non-empty nodes imply a snapshot");
+    draw_tree(frame, app, snapshot, &nodes, table_area);
+    let selected = nodes.get(app.selected()).copied();
+    draw_detail(frame, Some(snapshot), selected, detail_area);
 }
 
 fn draw_empty(frame: &mut Frame, area: Rect) {
@@ -302,7 +307,7 @@ fn draw_empty(frame: &mut Frame, area: Rect) {
         .border_style(Style::default().fg(HIGHLIGHT))
         .title(Tab::Instances.title());
     let text = Line::from(Span::styled(
-        "no instances — press : to run one",
+        "no sandboxes defined — check config.toml",
         Style::default().add_modifier(Modifier::DIM),
     ))
     .alignment(Alignment::Center);
@@ -310,19 +315,21 @@ fn draw_empty(frame: &mut Frame, area: Rect) {
     frame.render_widget(paragraph, area);
 }
 
-fn draw_table(frame: &mut Frame, app: &App, rows: &[InstanceRow], area: Rect) {
+fn draw_tree(frame: &mut Frame, app: &App, snapshot: &Snapshot, nodes: &[Node], area: Rect) {
     let header = Row::new(
-        ["NAME", "SANDBOX", "STATUS", "UPTIME", "CPU", "MEM", "FOLDER", "SERVICES"]
+        ["TREE", "STATUS", "UPTIME", "CPU", "MEM", "FOLDER", "SERVICES"]
             .into_iter()
             .map(Cell::from),
     )
     .style(Style::default().add_modifier(Modifier::DIM));
 
-    let table_rows: Vec<Row> = rows.iter().map(instance_row).collect();
+    let table_rows: Vec<Row> = nodes
+        .iter()
+        .map(|node| tree_row(app, snapshot, *node))
+        .collect();
 
     let widths = [
-        Constraint::Length(14),
-        Constraint::Length(14),
+        Constraint::Min(20),
         Constraint::Length(9),
         Constraint::Length(7),
         Constraint::Length(7),
@@ -348,7 +355,98 @@ fn draw_table(frame: &mut Frame, app: &App, rows: &[InstanceRow], area: Rect) {
     frame.render_stateful_widget(table, area, &mut state);
 }
 
-fn instance_row(r: &InstanceRow) -> Row<'_> {
+/// Render one tree node into a table row. Sandbox / orphan-group rows carry their
+/// stats in the STATUS column and leave the instance columns blank; instance
+/// rows fill the columns and indent the TREE cell.
+fn tree_row<'a>(app: &App, snapshot: &'a Snapshot, node: Node) -> Row<'a> {
+    match node {
+        Node::Sandbox(i) => match snapshot.sandboxes.get(i) {
+            Some(sb) => sandbox_tree_row(app, snapshot, sb),
+            None => Row::new(vec![Cell::from("")]),
+        },
+        Node::Instance(i) => match snapshot.instances.get(i) {
+            Some(inst) => instance_tree_row(inst),
+            None => Row::new(vec![Cell::from("")]),
+        },
+        Node::Empty(i) => {
+            let name = snapshot.sandboxes.get(i).map_or("", |s| s.name.as_str());
+            Row::new(vec![Cell::from(Span::styled(
+                format!("    no instances — : run {name}"),
+                Style::default().add_modifier(Modifier::DIM),
+            ))])
+        }
+        Node::Orphans => {
+            let count = snapshot
+                .instances
+                .iter()
+                .filter(|inst| !snapshot.sandboxes.iter().any(|s| s.name == inst.sandbox))
+                .count();
+            let marker = if app.is_collapsed_group(super::data::ORPHANS_NAME) {
+                '▸'
+            } else {
+                '▾'
+            };
+            Row::new(vec![
+                Cell::from(Span::styled(
+                    format!("{marker} (not in config)"),
+                    Style::default().add_modifier(Modifier::DIM),
+                )),
+                Cell::from(Span::styled(
+                    format!("{count} orphan"),
+                    Style::default().add_modifier(Modifier::DIM),
+                )),
+            ])
+        }
+    }
+}
+
+fn sandbox_tree_row<'a>(app: &App, snapshot: &Snapshot, sb: &'a SandboxRow) -> Row<'a> {
+    let collapsed = app.is_collapsed_group(&sb.name);
+    let marker = if collapsed { '▸' } else { '▾' };
+    let total = snapshot.instances.iter().filter(|r| r.sandbox == sb.name).count();
+    let running = snapshot
+        .instances
+        .iter()
+        .filter(|r| r.sandbox == sb.name && matches!(r.status, ContainerStatus::Running(_)))
+        .count();
+    let stats = sandbox_stats(total, running);
+    // Green when any running, dim when the sandbox has no instances at all.
+    let stats_style = if running > 0 {
+        Style::default().fg(Color::Green)
+    } else if total == 0 {
+        Style::default().add_modifier(Modifier::DIM)
+    } else {
+        Style::default()
+    };
+    Row::new(vec![
+        Cell::from(Span::styled(
+            format!("{marker} {}", sb.name),
+            Style::default().fg(HIGHLIGHT).add_modifier(Modifier::BOLD),
+        )),
+        Cell::from(Span::styled(stats, stats_style)),
+        Cell::from(""),
+        Cell::from(""),
+        Cell::from(""),
+        Cell::from(source_folder_cell(sb)),
+        Cell::from(""),
+    ])
+}
+
+/// Combined source + folder for the sandbox row's FOLDER column: source colored
+/// like `ls`, then a dim folder when set.
+fn source_folder_cell(sb: &SandboxRow) -> Line<'static> {
+    let mut spans = vec![Span::styled(sb.source.clone(), source_style(&sb.source))];
+    if let Some(folder) = &sb.folder {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            folder.clone(),
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+    }
+    Line::from(spans)
+}
+
+fn instance_tree_row(r: &InstanceRow) -> Row<'_> {
     let status = Cell::from(Span::styled(
         r.status.label().to_string(),
         status_style(&r.status),
@@ -364,8 +462,7 @@ fn instance_row(r: &InstanceRow) -> Row<'_> {
         r.services.join(",")
     };
     Row::new(vec![
-        Cell::from(r.name.clone()),
-        Cell::from(r.sandbox.clone()),
+        Cell::from(format!("  {}", r.name)),
         status,
         Cell::from(humanize_secs(r.uptime_secs)),
         Cell::from(r.cpu.clone().unwrap_or_else(|| "-".to_string())),
@@ -383,17 +480,69 @@ fn status_style(status: &ContainerStatus) -> Style {
     }
 }
 
-fn draw_detail(frame: &mut Frame, row: Option<&InstanceRow>, area: Rect) {
+/// Detail panel for the selected tree node: sandbox summary for sandbox / empty
+/// nodes, the existing instance detail for instances, and a hint for the orphan
+/// group. Empty when nothing is selected.
+fn draw_detail(frame: &mut Frame, snapshot: Option<&Snapshot>, node: Option<Node>, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(HIGHLIGHT))
         .title("Detail");
 
-    let Some(r) = row else {
-        frame.render_widget(Paragraph::new("").block(block), area);
-        return;
+    let lines: Vec<Line> = match (snapshot, node) {
+        (Some(s), Some(Node::Sandbox(i))) | (Some(s), Some(Node::Empty(i))) => {
+            match s.sandboxes.get(i) {
+                Some(sb) => sandbox_detail(s, sb),
+                None => Vec::new(),
+            }
+        }
+        (Some(s), Some(Node::Instance(i))) => match s.instances.get(i) {
+            Some(r) => instance_detail(r),
+            None => Vec::new(),
+        },
+        (_, Some(Node::Orphans)) => vec![Line::from(Span::styled(
+            "instances whose sandbox is no longer in config.toml",
+            Style::default().add_modifier(Modifier::DIM),
+        ))],
+        _ => Vec::new(),
     };
 
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// Sandbox summary: source, folder, services, extends chain, config hash, and
+/// instance counts.
+fn sandbox_detail<'a>(snapshot: &Snapshot, sb: &'a SandboxRow) -> Vec<Line<'a>> {
+    let total = snapshot.instances.iter().filter(|r| r.sandbox == sb.name).count();
+    let running = snapshot
+        .instances
+        .iter()
+        .filter(|r| r.sandbox == sb.name && matches!(r.status, ContainerStatus::Running(_)))
+        .count();
+    let services = if sb.services.is_empty() {
+        "-".to_string()
+    } else {
+        sb.services.join(", ")
+    };
+    let extends = if sb.extends.is_empty() {
+        "-".to_string()
+    } else {
+        sb.extends.join(" → ")
+    };
+    let mut lines = vec![
+        kv("source", &sb.source),
+        kv("folder", sb.folder.as_deref().unwrap_or("-")),
+        kv("services", &services),
+        kv("extends", &extends),
+    ];
+    if !sb.config_hash.is_empty() {
+        lines.push(kv("config hash", &sb.config_hash));
+    }
+    lines.push(kv("instances", &format!("{total} ({running} running)")));
+    lines
+}
+
+fn instance_detail(r: &InstanceRow) -> Vec<Line<'_>> {
     let mut lines: Vec<Line> = vec![
         kv("container", &r.container),
         kv("workspace", &r.workspace),
@@ -411,8 +560,7 @@ fn draw_detail(frame: &mut Frame, row: Option<&InstanceRow>, area: Rect) {
             Style::default().fg(Color::Yellow),
         )));
     }
-
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    lines
 }
 
 /// `key: value` with a dim key.
@@ -449,7 +597,7 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
         Modal::Config(_) => "tab original/resolved · ↑↓ scroll · pgup/pgdn · g/G · esc close",
         Modal::Help(_) => "↑↓ scroll · pgup/pgdn · g/G · esc/? close",
         Modal::Logs(_) => "↑↓ scroll · pgup/pgdn · g/G · esc close",
-        Modal::None => "q quit · tab switch · ↑↓ select · enter config · l logs · : cmd · ? help",
+        Modal::None => "q quit · tab switch · ↑↓ select · ←→ collapse/expand · space toggle · enter config · l logs · : cmd · ? help",
     };
     let help = Line::from(text).style(Style::default().add_modifier(Modifier::DIM));
     frame.render_widget(Paragraph::new(help), area);

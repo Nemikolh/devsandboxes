@@ -99,6 +99,47 @@ which live instances reference it. Same table/detail-panel pattern as step 3.
 - Header line with totals: N sandboxes, N running / N stopped instances, N service
   containers, docker version (cached).
 
+## Phase 2 — Instances tab becomes a sandbox tree
+
+### Step 8 — Tree data model + rendering
+
+The Instances tab currently lists instances flat. It becomes a tree keyed on
+sandboxes from config, instances nested below:
+
+- `Snapshot` gains `sandboxes: Vec<SandboxRow { name, source, folder, services,
+  extends, config_hash }>` filled from `Config::load` + `resolve_all` (every
+  configured sandbox appears, even with zero instances). Config load failure →
+  existing error path, empty sandbox list, instances still shown (see orphans).
+- App holds `collapsed: BTreeSet<String>` (sandbox names; default expanded),
+  preserved across snapshot refreshes. A pure function flattens
+  (sandboxes, instances, collapsed) into visible nodes:
+  `Node::Sandbox(i) | Node::Instance(i) | Node::EmptyMarker(sandbox)`.
+  Instances whose sandbox is not in config group under a synthetic dim
+  `(not in config)` sandbox node at the bottom.
+- Selection indexes the visible-node list; clamps on refresh AND on
+  collapse/expand. Row count for the Instances tab = visible nodes.
+- Keys: `→`/`space` expand, `←` collapse (on an instance: jump to its sandbox),
+  `space` toggles.
+- Sandbox line: `▸/▾ <name>` + stats: `N/M running`, source (colored like ls),
+  folder. Expanded sandbox with zero instances shows one dim child line
+  `no instances — : run <name>`.
+- Instance line, indented: existing columns (status, uptime, cpu/mem, folder,
+  worktree marker).
+- Detail panel: sandbox selected → sandbox summary (source, folder, services,
+  extends, config hash, instance count); instance selected → existing detail.
+
+### Step 9 — Tree interactions
+
+- `enter`/`e` on a sandbox node → config modal for that sandbox (existing
+  original/resolved split, `build_sandbox_view` already takes a name).
+  On an instance node → sandbox config as before. On the `(not in config)`
+  group or its children → no config; instance nodes there still get `l` logs.
+- `r` on a sandbox node opens the prompt prefilled `run <name> ` (cursor at
+  end); `r` on an instance prefills `run <its sandbox> `.
+- `o` on an instance node = VS Code attach (same path as the `code` prompt
+  command). `l` logs stays instance-only.
+- Help overlay + help bar updated for the tree keys.
+
 ## Step ordering / commits
 
 Each step = one review + one commit by the orchestrator. Steps 3 and 4 may share
