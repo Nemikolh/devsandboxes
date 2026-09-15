@@ -1,5 +1,6 @@
 mod commands;
 mod config;
+mod features;
 mod render;
 mod runtime;
 mod state;
