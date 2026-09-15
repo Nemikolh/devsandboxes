@@ -54,6 +54,9 @@ pub struct SandboxProperties {
     pub post_start_command: Option<LifecycleCommand>,
     pub post_attach_command: Option<LifecycleCommand>,
     pub customizations: Option<Customizations>,
+    /// devcontainer `features`: a map of feature ref (e.g.
+    /// `"ghcr.io/devcontainers/features/node:1"`) to its options.
+    pub features: Option<BTreeMap<String, FeatureOptions>>,
 
     // --- valid devcontainer properties, not implemented yet ---
     pub name: Option<Value>,
@@ -64,7 +67,6 @@ pub struct SandboxProperties {
     pub run_args: Option<Value>,
     pub mounts: Option<Vec<Mount>>,
     pub workspace_mount: Option<Value>,
-    pub features: Option<Value>,
     pub override_feature_install_order: Option<Value>,
     pub container_user: Option<String>,
     pub remote_user: Option<String>,
@@ -100,7 +102,6 @@ impl SandboxProperties {
             other_ports_attributes => "otherPortsAttributes",
             run_args => "runArgs",
             workspace_mount => "workspaceMount",
-            features => "features",
             override_feature_install_order => "overrideFeatureInstallOrder",
             update_remote_user_uid => "updateRemoteUserUID",
             user_env_probe => "userEnvProbe",
@@ -137,6 +138,17 @@ impl SandboxProperties {
             .extensions
             .as_deref()
     }
+}
+
+/// Options for a single `features` entry: an options table, a bare string
+/// (devcontainer shorthand for the `version` option), or a bool (`true` = no
+/// options).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum FeatureOptions {
+    Options(BTreeMap<String, Value>),
+    Version(String),
+    Enabled(bool),
 }
 
 /// A `mounts` entry: the docker `--mount` shorthand string
@@ -787,6 +799,88 @@ customizations.vscode.extensions = ["rust-lang.rust-analyzer"]
             sandbox.properties.vscode_extensions(),
             Some(&["rust-lang.rust-analyzer".to_string()][..])
         );
+    }
+
+    #[test]
+    fn feature_option_forms_parse() {
+        let config = Config::parse(
+            r#"
+[sandbox.s]
+image = "alpine"
+
+[sandbox.s.features]
+"ghcr.io/devcontainers/features/node:1" = { version = "lts" }
+"ghcr.io/devcontainers/features/go:1" = "1.22"
+"ghcr.io/devcontainers/features/git:1" = true
+"#,
+        )
+        .unwrap();
+        let features = config.resolve_sandbox("s").unwrap().properties.features.unwrap();
+        match &features["ghcr.io/devcontainers/features/node:1"] {
+            FeatureOptions::Options(opts) => {
+                assert_eq!(opts["version"].as_str(), Some("lts"));
+            }
+            other => panic!("expected options table, got {other:?}"),
+        }
+        match &features["ghcr.io/devcontainers/features/go:1"] {
+            FeatureOptions::Version(v) => assert_eq!(v, "1.22"),
+            other => panic!("expected version string, got {other:?}"),
+        }
+        match &features["ghcr.io/devcontainers/features/git:1"] {
+            FeatureOptions::Enabled(b) => assert!(b),
+            other => panic!("expected bool, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn features_are_not_ignored() {
+        let config = Config::parse(
+            r#"
+[sandbox.s]
+image = "alpine"
+features = { "ghcr.io/x/y:1" = true }
+"#,
+        )
+        .unwrap();
+        let sandbox = config.resolve_sandbox("s").unwrap();
+        assert!(sandbox.properties.ignored().is_empty());
+        assert!(!SandboxProperties::default().ignored().contains(&"features".to_string()));
+    }
+
+    #[test]
+    fn features_deep_merge_across_template() {
+        let config = Config::parse(
+            r#"
+[template.feat-base]
+[template.feat-base.features]
+"ghcr.io/devcontainers/features/common-utils:2" = true
+"ghcr.io/devcontainers/features/node:1" = { version = "18" }
+
+[sandbox.s]
+extends = "feat-base"
+image = "alpine"
+[sandbox.s.features]
+"ghcr.io/devcontainers/features/go:1" = "1.22"
+"ghcr.io/devcontainers/features/node:1" = { version = "lts" }
+"#,
+        )
+        .unwrap();
+        let features = config.resolve_sandbox("s").unwrap().properties.features.unwrap();
+        // common-utils comes from the template.
+        assert!(matches!(
+            features["ghcr.io/devcontainers/features/common-utils:2"],
+            FeatureOptions::Enabled(true)
+        ));
+        // go is added by the sandbox.
+        assert!(matches!(
+            &features["ghcr.io/devcontainers/features/go:1"],
+            FeatureOptions::Version(v) if v == "1.22"
+        ));
+        // node is overridden by the sandbox.
+        match &features["ghcr.io/devcontainers/features/node:1"] {
+            FeatureOptions::Options(opts) => assert_eq!(opts["version"].as_str(), Some("lts")),
+            other => panic!("expected options table, got {other:?}"),
+        }
     }
 
     #[test]
