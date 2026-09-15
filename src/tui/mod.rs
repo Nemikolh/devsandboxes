@@ -191,14 +191,25 @@ fn launch_code(dir: &Path, app: &App, instance: &str) -> String {
         return format!("code: unknown instance `{instance}`");
     };
 
-    // Extensions come from the resolved sandbox; failure to resolve is
-    // non-fatal — attach still works, just without registering extensions.
-    let extensions: Vec<String> = Config::load(dir)
+    // Extensions and remoteUser come from the resolved sandbox; failure to
+    // resolve is non-fatal — fall back to the remote user recorded in state at
+    // run time so the attach still opens with write access.
+    let resolved = Config::load(dir)
         .ok()
-        .and_then(|cfg| cfg.resolve_sandbox(&row.sandbox).ok())
+        .and_then(|cfg| cfg.resolve_sandbox(&row.sandbox).ok());
+    let extensions: Vec<String> = resolved
+        .as_ref()
         .and_then(|sb| sb.properties.vscode_extensions().map(<[String]>::to_vec))
         .unwrap_or_default();
-    let _ = commands::run::write_vscode_name_config(&row.container, &extensions);
+    let remote_user = resolved
+        .as_ref()
+        .and_then(|sb| sb.properties.remote_user.clone())
+        .or_else(|| row.remote_user.clone());
+    let _ = commands::run::write_vscode_name_config(
+        &row.container,
+        &extensions,
+        remote_user.as_deref(),
+    );
 
     let uri = format!(
         "vscode-remote://attached-container+{}/{}",

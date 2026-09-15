@@ -84,8 +84,9 @@ pub fn run(dir: &Path, sandbox_name: Option<String>, instance_name: Option<Strin
         if running != "true" {
             docker::run_checked(&["start", &container_name])?;
         }
-        if let Some(extensions) = props.vscode_extensions() {
-            write_vscode_name_config(&container_name, extensions)?;
+        let extensions = props.vscode_extensions().unwrap_or(&[]);
+        if !extensions.is_empty() || props.remote_user.is_some() {
+            write_vscode_name_config(&container_name, extensions, props.remote_user.as_deref())?;
         }
         if let Some(cmd) = &props.post_start_command {
             exec_lifecycle(
@@ -175,8 +176,9 @@ pub fn run(dir: &Path, sandbox_name: Option<String>, instance_name: Option<Strin
     );
     state.save()?;
 
-    if let Some(extensions) = props.vscode_extensions() {
-        write_vscode_name_config(&container, extensions)?;
+    let extensions = props.vscode_extensions().unwrap_or(&[]);
+    if !extensions.is_empty() || props.remote_user.is_some() {
+        write_vscode_name_config(&container, extensions, props.remote_user.as_deref())?;
     }
 
     for (name, cmd) in [
@@ -554,9 +556,15 @@ fn exec_lifecycle(
     Ok(())
 }
 
-/// Register `customizations.vscode.extensions` with the Remote-Containers
-/// extension by writing its per-container-name config file.
-pub(crate) fn write_vscode_name_config(container: &str, extensions: &[String]) -> Result<()> {
+/// Register `customizations.vscode.extensions` and `remoteUser` with the
+/// Remote-Containers extension by writing its per-container-name config file.
+/// Without `remoteUser`, VS Code attaches as the editor's default user and
+/// hits EACCES on root-owned files (e.g. rootless docker).
+pub(crate) fn write_vscode_name_config(
+    container: &str,
+    extensions: &[String],
+    remote_user: Option<&str>,
+) -> Result<()> {
     let base = editor_config_base()?;
     // Every installed VS Code-family product keys nameConfigs by container name.
     for product in ["Code", "Cursor", "VSCodium"] {
@@ -573,7 +581,7 @@ pub(crate) fn write_vscode_name_config(container: &str, extensions: &[String]) -
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
         };
-        let contents = merged_name_config(existing.as_deref(), extensions)
+        let contents = merged_name_config(existing.as_deref(), extensions, remote_user)
             .with_context(|| format!("in {}", path.display()))?;
         std::fs::write(&path, contents)
             .with_context(|| format!("cannot write {}", path.display()))?;
@@ -596,17 +604,31 @@ fn editor_config_base() -> Result<PathBuf> {
         .context("cannot determine config dir ($XDG_CONFIG_HOME or $HOME)")
 }
 
-/// Existing name-config JSON (if any) with `extensions` replaced.
-fn merged_name_config(existing: Option<&str>, extensions: &[String]) -> Result<String> {
+/// Existing name-config JSON (if any) with `extensions` and `remoteUser`
+/// replaced. `remoteUser: None` removes the key so the file tracks the config.
+fn merged_name_config(
+    existing: Option<&str>,
+    extensions: &[String],
+    remote_user: Option<&str>,
+) -> Result<String> {
     let mut root = match existing {
         Some(contents) => {
             serde_json::from_str::<serde_json::Value>(contents).context("invalid JSON")?
         }
         None => serde_json::json!({}),
     };
-    root.as_object_mut()
-        .context("existing config is not a JSON object")?
-        .insert("extensions".into(), serde_json::json!(extensions));
+    let obj = root
+        .as_object_mut()
+        .context("existing config is not a JSON object")?;
+    obj.insert("extensions".into(), serde_json::json!(extensions));
+    match remote_user {
+        Some(user) => {
+            obj.insert("remoteUser".into(), serde_json::json!(user));
+        }
+        None => {
+            obj.remove("remoteUser");
+        }
+    }
     Ok(serde_json::to_string_pretty(&root)?)
 }
 
@@ -649,18 +671,31 @@ mod tests {
 
     #[test]
     fn name_config_from_scratch() {
-        let json = merged_name_config(None, &["a.b".into(), "c.d".into()]).unwrap();
+        let json = merged_name_config(None, &["a.b".into(), "c.d".into()], None).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["extensions"], serde_json::json!(["a.b", "c.d"]));
+        assert!(parsed.get("remoteUser").is_none());
     }
 
     #[test]
     fn name_config_preserves_other_keys() {
         let existing = r#"{"settings": {"x": 1}, "extensions": ["old.ext"]}"#;
-        let json = merged_name_config(Some(existing), &["new.ext".into()]).unwrap();
+        let json = merged_name_config(Some(existing), &["new.ext".into()], None).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["extensions"], serde_json::json!(["new.ext"]));
         assert_eq!(parsed["settings"]["x"], 1);
+    }
+
+    #[test]
+    fn name_config_sets_and_clears_remote_user() {
+        let json = merged_name_config(None, &[], Some("root")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["remoteUser"], "root");
+
+        // remote_user gone from config → key removed from an existing file.
+        let json = merged_name_config(Some(&json), &[], None).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(parsed.get("remoteUser").is_none());
     }
 
     fn instance(name: &str) -> Instance {
