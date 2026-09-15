@@ -5,12 +5,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 
 use crate::config::Config;
 use crate::docker;
 
-use super::data::{visible_nodes, ContainerStatus, Node, Snapshot, ORPHANS_NAME};
+use super::data::{visible_nodes, ContainerStatus, InstanceRow, Node, Snapshot, ORPHANS_NAME};
 use super::procs::ProcState;
 use super::prompt::{Prompt, PromptAction, COMMANDS};
 
@@ -31,8 +33,10 @@ Tables (Instances / Services)
   (process rows act on their parent instance)
 
 Config modal
-  tab         toggle original / resolved
-  ↑/k ↓/j     scroll    pgup/pgdn  page
+  t           toggle original / resolved
+  tab         switch pane (config ⇄ inspect)
+  < / >       resize the divider (drag it too)
+  ↑/k ↓/j     scroll focused pane   pgup/pgdn  page
   g / G       top / bottom
   esc, q      close
 
@@ -94,16 +98,27 @@ fn scroll_key(scroll: &mut u16, lines: u16, key: KeyEvent) -> bool {
     true
 }
 
-/// Which side of a [`ConfigView`] is currently shown.
+/// Which side of a [`ConfigView`]'s config pane is currently shown.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Side {
     Original,
     Resolved,
 }
 
-/// Full-screen config explorer state. Built once at open time (fs + config are
-/// read then, not during rendering); on error `original`/`resolved` carry the
-/// error text so the modal still renders.
+/// Which pane of the split config modal has focus (receives scroll keys).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Pane {
+    Config,
+    Inspect,
+}
+
+/// Lower/upper bounds for the split percentage, inclusive.
+const SPLIT_MIN: u16 = 20;
+const SPLIT_MAX: u16 = 80;
+
+/// Full-screen config explorer state. Built once at open time (fs + config +
+/// `docker inspect` are read then, not during rendering); on error the bodies
+/// carry the error text so the modal still renders.
 pub struct ConfigView {
     /// Sandbox (or service) name, shown in the title.
     pub title: String,
@@ -115,6 +130,17 @@ pub struct ConfigView {
     pub scroll: u16,
     /// Short config hash of the resolved table, empty when unavailable.
     pub hash: String,
+    /// Pretty-printed `docker inspect` (or explanatory text) for the target
+    /// container, fetched at open time.
+    pub inspect: String,
+    pub inspect_scroll: u16,
+    /// Container the inspect pane is showing, for the pane title. Empty when
+    /// there is no target container (the body is then explanatory text).
+    pub inspect_container: String,
+    /// Which pane has focus for scroll keys.
+    pub focus: Pane,
+    /// Left (config) pane width as a percentage, clamped to [SPLIT_MIN, SPLIT_MAX].
+    pub split_pct: u16,
 }
 
 impl ConfigView {
@@ -138,6 +164,51 @@ impl ConfigView {
             self.scroll = max;
         }
     }
+
+    /// Route a scroll key to the focused pane, clamped to that pane's line count.
+    fn scroll_focused(&mut self, key: KeyEvent) {
+        match self.focus {
+            Pane::Config => {
+                let lines = self.line_count();
+                scroll_key(&mut self.scroll, lines, key);
+            }
+            Pane::Inspect => {
+                let lines = line_count(&self.inspect);
+                scroll_key(&mut self.inspect_scroll, lines, key);
+            }
+        }
+    }
+
+    /// Move the divider by `delta` percent, clamped to [SPLIT_MIN, SPLIT_MAX].
+    fn resize(&mut self, delta: i16) {
+        self.split_pct = clamp_split(self.split_pct as i16 + delta);
+    }
+}
+
+/// Clamp a split percentage into the allowed range.
+fn clamp_split(pct: i16) -> u16 {
+    pct.clamp(SPLIT_MIN as i16, SPLIT_MAX as i16) as u16
+}
+
+/// Divider percentage for a mouse at column `col` over a modal `width` cells
+/// wide, clamped to [SPLIT_MIN, SPLIT_MAX]. Pure so the drag math is testable.
+pub fn divider_pct(col: u16, width: u16) -> u16 {
+    if width == 0 {
+        return SPLIT_MIN;
+    }
+    let pct = (col as u32 * 100 / width as u32) as i16;
+    clamp_split(pct)
+}
+
+/// Whether `col` is on or within one cell of the divider column.
+fn col_near(col: u16, divider: u16) -> bool {
+    col.abs_diff(divider) <= 1
+}
+
+/// Add `delta` (may be negative) to `scroll`, clamped to `[0, max]`.
+fn apply_delta(scroll: u16, delta: i16, max: u16) -> u16 {
+    let next = scroll as i32 + delta as i32;
+    next.clamp(0, max as i32) as u16
 }
 
 /// Overlay state. `None` is the normal dashboard; the rest are full-screen
@@ -213,6 +284,8 @@ pub struct App {
     pub stopping: BTreeSet<String>,
     /// One-line status shown in the help-bar area (e.g. `code` launch outcome).
     pub status: Option<String>,
+    /// True while the config-modal divider is being dragged with the mouse.
+    dragging_divider: bool,
     pub should_quit: bool,
 }
 
@@ -233,6 +306,7 @@ impl App {
             pending_stop: None,
             stopping: BTreeSet::new(),
             status: None,
+            dragging_divider: false,
             should_quit: false,
         }
     }
@@ -506,6 +580,55 @@ impl App {
         }
     }
 
+    /// Apply a mouse event. Only meaningful while the config modal is open (the
+    /// modal is full-screen, so `area_width` is the terminal width). A press/drag
+    /// on or near the divider column resizes the split; the scroll wheel scrolls
+    /// the pane under the cursor. Everything else is ignored. I/O-free.
+    pub fn on_mouse(&mut self, ev: &MouseEvent, area_width: u16) {
+        let Modal::Config(view) = &mut self.modal else {
+            self.dragging_divider = false;
+            return;
+        };
+        // Divider column: the boundary between the left (config) pane and the
+        // right (inspect) pane, i.e. split_pct of the modal width.
+        let divider = (area_width as u32 * view.split_pct as u32 / 100) as u16;
+        match ev.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if col_near(ev.column, divider) {
+                    self.dragging_divider = true;
+                    view.split_pct = divider_pct(ev.column, area_width);
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if self.dragging_divider {
+                    view.split_pct = divider_pct(ev.column, area_width);
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.dragging_divider = false;
+            }
+            MouseEventKind::ScrollDown => {
+                Self::wheel_scroll(view, ev.column, divider, 3);
+            }
+            MouseEventKind::ScrollUp => {
+                Self::wheel_scroll(view, ev.column, divider, -3);
+            }
+            _ => {}
+        }
+    }
+
+    /// Scroll the pane under `col` (left of `divider` = config, else inspect) by
+    /// `delta` lines, clamped to that pane's line count.
+    fn wheel_scroll(view: &mut ConfigView, col: u16, divider: u16, delta: i16) {
+        if col < divider {
+            let max = view.line_count().saturating_sub(1);
+            view.scroll = apply_delta(view.scroll, delta, max);
+        } else {
+            let max = line_count(&view.inspect).saturating_sub(1);
+            view.inspect_scroll = apply_delta(view.inspect_scroll, delta, max);
+        }
+    }
+
     /// Open the command prompt, loading persisted history. Clears any status.
     fn open_prompt(&mut self) {
         self.status = None;
@@ -744,17 +867,22 @@ impl App {
             Modal::None => {}
             Modal::Config(view) => match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => self.modal = Modal::None,
-                KeyCode::Tab => {
+                KeyCode::Char('t') => {
                     view.showing = match view.showing {
                         Side::Original => Side::Resolved,
                         Side::Resolved => Side::Original,
                     };
                     view.clamp_scroll();
                 }
-                _ => {
-                    let lines = view.line_count();
-                    scroll_key(&mut view.scroll, lines, key);
+                KeyCode::Tab => {
+                    view.focus = match view.focus {
+                        Pane::Config => Pane::Inspect,
+                        Pane::Inspect => Pane::Config,
+                    };
                 }
+                KeyCode::Char('<') => view.resize(-5),
+                KeyCode::Char('>') => view.resize(5),
+                _ => view.scroll_focused(key),
             },
             Modal::Help(view) => {
                 if matches!(key.code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?')) {
@@ -816,32 +944,47 @@ impl App {
         let Some(snapshot) = &self.snapshot else {
             return;
         };
-        let view = match self.tab {
+        let (mut view, target) = match self.tab {
             Tab::Instances => {
-                let name = match self.selected_node() {
+                let (name, target) = match self.selected_node() {
                     Some(Node::Sandbox(i)) | Some(Node::Empty(i)) => {
-                        snapshot.sandboxes.get(i).map(|s| s.name.clone())
+                        let name = snapshot.sandboxes.get(i).map(|s| s.name.clone());
+                        let target = name
+                            .as_deref()
+                            .and_then(|n| inspect_target(&snapshot.instances, Target::Sandbox(n)));
+                        (name, target)
                     }
                     Some(Node::Instance(i)) => {
-                        snapshot.instances.get(i).map(|r| r.sandbox.clone())
+                        let name = snapshot.instances.get(i).map(|r| r.sandbox.clone());
+                        let target = inspect_target(&snapshot.instances, Target::Instance(i));
+                        (name, target)
                     }
                     Some(Node::Proc { instance, .. }) => {
-                        snapshot.instances.get(instance).map(|r| r.sandbox.clone())
+                        let name = snapshot.instances.get(instance).map(|r| r.sandbox.clone());
+                        let target =
+                            inspect_target(&snapshot.instances, Target::Instance(instance));
+                        (name, target)
                     }
-                    Some(Node::Orphans) | None => None,
+                    Some(Node::Orphans) | None => (None, None),
                 };
                 let Some(name) = name else {
                     return;
                 };
-                Self::build_sandbox_view(&self.dir, &name)
+                (Self::build_sandbox_view(&self.dir, &name), target)
             }
             Tab::Services => {
                 let Some(row) = snapshot.services.get(self.selected()) else {
                     return;
                 };
-                Self::build_service_view(&self.dir, &row.name)
+                let target = service_inspect_target(&row.containers);
+                (Self::build_service_view(&self.dir, &row.name), target)
             }
         };
+        let placeholder = match self.tab {
+            Tab::Instances => "(no running instance)",
+            Tab::Services => "(no containers)",
+        };
+        set_inspect(&mut view, target, placeholder);
         self.modal = Modal::Config(view);
     }
 
@@ -855,6 +998,11 @@ impl App {
             showing: Side::Original,
             scroll: 0,
             hash: String::new(),
+            inspect: String::new(),
+            inspect_scroll: 0,
+            inspect_container: String::new(),
+            focus: Pane::Config,
+            split_pct: 50,
         };
         match Config::load(dir) {
             Ok(cfg) => {
@@ -896,8 +1044,66 @@ impl App {
             showing: Side::Original,
             scroll: 0,
             hash: String::new(),
+            inspect: String::new(),
+            inspect_scroll: 0,
+            inspect_container: String::new(),
+            focus: Pane::Config,
+            split_pct: 50,
         }
     }
+}
+
+/// What the inspect pane targets, keyed off the selected Instances-tab node.
+enum Target<'a> {
+    /// An instance row by index: inspect its own container.
+    Instance(usize),
+    /// A sandbox by name: inspect its first running instance's container.
+    Sandbox(&'a str),
+}
+
+/// Container to `docker inspect` for an Instances-tab target, or `None` when
+/// there is none (an unknown index, or a sandbox with no running instance).
+/// Pure over the instance rows so the per-node-kind pick is testable.
+fn inspect_target(instances: &[InstanceRow], target: Target) -> Option<String> {
+    match target {
+        Target::Instance(i) => instances.get(i).map(|r| r.container.clone()),
+        Target::Sandbox(name) => instances
+            .iter()
+            .find(|r| r.sandbox == name && matches!(r.status, ContainerStatus::Running(_)))
+            .map(|r| r.container.clone()),
+    }
+}
+
+/// Container to `docker inspect` for a Services-tab row: the first running
+/// backing container, else the first container, else `None`.
+fn service_inspect_target(containers: &[(String, ContainerStatus)]) -> Option<String> {
+    containers
+        .iter()
+        .find(|(_, s)| matches!(s, ContainerStatus::Running(_)))
+        .or_else(|| containers.first())
+        .map(|(name, _)| name.clone())
+}
+
+/// Fill `view`'s inspect pane: fetch + pretty-print `docker inspect <container>`
+/// when there is a target, else store the given placeholder text. On docker
+/// error the error text is the body; on JSON parse failure the raw output is
+/// kept with the parse error as the first line.
+fn set_inspect(view: &mut ConfigView, target: Option<String>, placeholder: &str) {
+    let Some(container) = target else {
+        view.inspect = placeholder.to_string();
+        return;
+    };
+    view.inspect_container = container.clone();
+    view.inspect = match docker::output_quiet(&["inspect", &container]) {
+        Ok(out) => match serde_json::from_str::<serde_json::Value>(&out) {
+            Ok(v) => match serde_json::to_string_pretty(&v) {
+                Ok(pretty) => pretty,
+                Err(e) => format!("cannot format inspect JSON: {e}\n{out}"),
+            },
+            Err(e) => format!("could not parse inspect JSON: {e}\n{out}"),
+        },
+        Err(e) => format!("{e:#}"),
+    };
 }
 
 /// Serialize a table for display, preferring the pretty formatter and falling
@@ -1098,6 +1304,12 @@ mod tests {
             showing: Side::Original,
             scroll: 0,
             hash: "deadbeef".into(),
+            // Twenty inspect lines so the inspect pane scrolls independently.
+            inspect: (0..20).map(|i| format!("insp{i}\n")).collect(),
+            inspect_scroll: 0,
+            inspect_container: "devsandbox-s".into(),
+            focus: Pane::Config,
+            split_pct: 50,
         });
     }
 
@@ -1114,8 +1326,11 @@ mod tests {
         open_modal(&mut app);
         assert_eq!(view(&app).showing, Side::Original);
 
-        app.on_key(key(KeyCode::Tab));
+        // `t` toggles the config side; `tab` no longer touches it.
+        app.on_key(key(KeyCode::Char('t')));
         assert_eq!(view(&app).showing, Side::Resolved);
+        app.on_key(key(KeyCode::Char('t')));
+        assert_eq!(view(&app).showing, Side::Original);
         app.on_key(key(KeyCode::Tab));
         assert_eq!(view(&app).showing, Side::Original);
 
@@ -1133,7 +1348,7 @@ mod tests {
         let mut app = new_app();
         open_modal(&mut app);
         // Switch to the 10-line resolved body.
-        app.on_key(key(KeyCode::Tab));
+        app.on_key(key(KeyCode::Char('t')));
 
         // Up at the top stays at 0.
         app.on_key(key(KeyCode::Up));
@@ -1576,13 +1791,194 @@ mod tests {
         let mut app = new_app();
         open_modal(&mut app);
         // Scroll to bottom of the 10-line resolved side.
-        app.on_key(key(KeyCode::Tab));
+        app.on_key(key(KeyCode::Char('t')));
         app.on_key(key(KeyCode::Char('G')));
         assert_eq!(view(&app).scroll, 9);
 
         // Toggling back to the 2-line original re-clamps the offset.
-        app.on_key(key(KeyCode::Tab));
+        app.on_key(key(KeyCode::Char('t')));
         assert_eq!(view(&app).showing, Side::Original);
         assert_eq!(view(&app).scroll, 1);
+    }
+
+    fn mouse(kind: MouseEventKind, column: u16) -> MouseEvent {
+        MouseEvent { kind, column, row: 0, modifiers: KeyModifiers::NONE }
+    }
+
+    #[test]
+    fn tab_switches_focus_between_panes() {
+        let mut app = new_app();
+        open_modal(&mut app);
+        assert_eq!(view(&app).focus, Pane::Config);
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(view(&app).focus, Pane::Inspect);
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(view(&app).focus, Pane::Config);
+        // `t` still toggles the side, never the focus.
+        app.on_key(key(KeyCode::Char('t')));
+        assert_eq!(view(&app).focus, Pane::Config);
+    }
+
+    #[test]
+    fn scroll_routes_to_focused_pane() {
+        let mut app = new_app();
+        open_modal(&mut app);
+        // Config focus, resolved side (10 lines): Down moves config scroll only.
+        app.on_key(key(KeyCode::Char('t')));
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(view(&app).scroll, 1);
+        assert_eq!(view(&app).inspect_scroll, 0);
+
+        // Focus the inspect pane (20 lines): Down moves inspect scroll only.
+        app.on_key(key(KeyCode::Tab));
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(view(&app).scroll, 1);
+        assert_eq!(view(&app).inspect_scroll, 1);
+
+        // G on the inspect pane jumps to its last line (20 → max 19).
+        app.on_key(key(KeyCode::Char('G')));
+        assert_eq!(view(&app).inspect_scroll, 19);
+    }
+
+    #[test]
+    fn split_pct_clamps_via_resize_keys() {
+        let mut app = new_app();
+        open_modal(&mut app);
+        assert_eq!(view(&app).split_pct, 50);
+        // `<` shrinks by 5, `>` grows by 5.
+        app.on_key(key(KeyCode::Char('<')));
+        assert_eq!(view(&app).split_pct, 45);
+        app.on_key(key(KeyCode::Char('>')));
+        app.on_key(key(KeyCode::Char('>')));
+        assert_eq!(view(&app).split_pct, 55);
+
+        // Clamp at the lower bound.
+        for _ in 0..20 {
+            app.on_key(key(KeyCode::Char('<')));
+        }
+        assert_eq!(view(&app).split_pct, SPLIT_MIN);
+        // Clamp at the upper bound.
+        for _ in 0..40 {
+            app.on_key(key(KeyCode::Char('>')));
+        }
+        assert_eq!(view(&app).split_pct, SPLIT_MAX);
+    }
+
+    #[test]
+    fn divider_pct_maps_column_to_clamped_percentage() {
+        // Mid-column of a 100-wide modal → 50%.
+        assert_eq!(divider_pct(50, 100), 50);
+        // Extremes clamp into [SPLIT_MIN, SPLIT_MAX].
+        assert_eq!(divider_pct(0, 100), SPLIT_MIN);
+        assert_eq!(divider_pct(100, 100), SPLIT_MAX);
+        assert_eq!(divider_pct(5, 100), SPLIT_MIN);
+        assert_eq!(divider_pct(95, 100), SPLIT_MAX);
+        // Zero width never panics.
+        assert_eq!(divider_pct(10, 0), SPLIT_MIN);
+    }
+
+    #[test]
+    fn mouse_drag_resizes_divider() {
+        let mut app = new_app();
+        open_modal(&mut app);
+        // Width 100, split 50 → divider at column 50. Press on it starts a drag.
+        app.on_mouse(&mouse(MouseEventKind::Down(MouseButton::Left), 50), 100);
+        // Drag to column 30 → 30%.
+        app.on_mouse(&mouse(MouseEventKind::Drag(MouseButton::Left), 30), 100);
+        assert_eq!(view(&app).split_pct, 30);
+        // Release; a later drag with no press does nothing.
+        app.on_mouse(&mouse(MouseEventKind::Up(MouseButton::Left), 30), 100);
+        app.on_mouse(&mouse(MouseEventKind::Drag(MouseButton::Left), 70), 100);
+        assert_eq!(view(&app).split_pct, 30);
+    }
+
+    #[test]
+    fn mouse_press_far_from_divider_ignored() {
+        let mut app = new_app();
+        open_modal(&mut app);
+        // Divider at 50; press at 10 is far away → no drag started.
+        app.on_mouse(&mouse(MouseEventKind::Down(MouseButton::Left), 10), 100);
+        app.on_mouse(&mouse(MouseEventKind::Drag(MouseButton::Left), 70), 100);
+        assert_eq!(view(&app).split_pct, 50);
+    }
+
+    #[test]
+    fn wheel_scrolls_pane_under_cursor() {
+        let mut app = new_app();
+        open_modal(&mut app);
+        app.on_key(key(KeyCode::Char('t'))); // resolved side, 10 lines
+        // Divider at column 50. Wheel down left of it scrolls config by 3.
+        app.on_mouse(&mouse(MouseEventKind::ScrollDown, 10), 100);
+        assert_eq!(view(&app).scroll, 3);
+        assert_eq!(view(&app).inspect_scroll, 0);
+        // Wheel down right of it scrolls inspect by 3.
+        app.on_mouse(&mouse(MouseEventKind::ScrollDown, 90), 100);
+        assert_eq!(view(&app).inspect_scroll, 3);
+        // Wheel up clamps at 0.
+        app.on_mouse(&mouse(MouseEventKind::ScrollUp, 10), 100);
+        app.on_mouse(&mouse(MouseEventKind::ScrollUp, 10), 100);
+        assert_eq!(view(&app).scroll, 0);
+    }
+
+    #[test]
+    fn inspect_target_picks_per_node_kind() {
+        use super::super::data::{ContainerStatus, InstanceRow};
+        let mk = |name: &str, sandbox: &str, status: ContainerStatus| InstanceRow {
+            name: name.into(),
+            sandbox: sandbox.into(),
+            container: format!("devsandbox-{name}"),
+            status,
+            uptime_secs: 0,
+            cpu: None,
+            mem: None,
+            folder: "/f".into(),
+            worktree: false,
+            services: Vec::new(),
+            workspace: "/w".into(),
+            remote_user: None,
+            remote_env_len: 0,
+            base_folder: "/f".into(),
+            drift: false,
+        };
+        let rows = vec![
+            mk("a", "s", ContainerStatus::Exited("x".into())),
+            mk("b", "s", ContainerStatus::Running("Up".into())),
+            mk("c", "t", ContainerStatus::Missing),
+        ];
+
+        // Instance node → that instance's own container, regardless of status.
+        assert_eq!(
+            inspect_target(&rows, Target::Instance(0)),
+            Some("devsandbox-a".into()),
+        );
+        // Sandbox with a running instance → its first running container.
+        assert_eq!(
+            inspect_target(&rows, Target::Sandbox("s")),
+            Some("devsandbox-b".into()),
+        );
+        // Sandbox with no running instance → None.
+        assert_eq!(inspect_target(&rows, Target::Sandbox("t")), None);
+        // Unknown instance index → None.
+        assert_eq!(inspect_target(&rows, Target::Instance(9)), None);
+    }
+
+    #[test]
+    fn service_inspect_target_prefers_running() {
+        use super::super::data::ContainerStatus;
+        let running = vec![
+            ("svc-1".to_string(), ContainerStatus::Exited("x".into())),
+            ("svc-2".to_string(), ContainerStatus::Running("Up".into())),
+        ];
+        assert_eq!(service_inspect_target(&running), Some("svc-2".into()));
+
+        // No running → first container.
+        let none_running = vec![
+            ("svc-1".to_string(), ContainerStatus::Exited("x".into())),
+            ("svc-2".to_string(), ContainerStatus::Missing),
+        ];
+        assert_eq!(service_inspect_target(&none_running), Some("svc-1".into()));
+
+        // Empty → None.
+        assert_eq!(service_inspect_target(&[]), None);
     }
 }

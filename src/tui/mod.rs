@@ -17,7 +17,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event};
+use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
@@ -59,7 +59,7 @@ pub fn dashboard(dir: &Path) -> Result<()> {
 fn setup() -> Result<Term> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
     Ok(terminal)
 }
@@ -67,7 +67,7 @@ fn setup() -> Result<Term> {
 /// Best-effort teardown: leave the alternate screen and disable raw mode.
 /// Errors are ignored — there is nothing useful to do while cleaning up.
 fn restore() {
-    let _ = execute!(io::stdout(), LeaveAlternateScreen);
+    let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
     let _ = disable_raw_mode();
 }
 
@@ -97,10 +97,12 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
         terminal.draw(|frame| ui::draw(frame, &app))?;
 
         if event::poll(POLL_INTERVAL)? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == event::KeyEventKind::Press {
-                    app.on_key(key);
-                }
+            match event::read()? {
+                Event::Key(key) if key.kind == event::KeyEventKind::Press => app.on_key(key),
+                // The modal is full-screen, so the frame width equals the
+                // terminal width; feed it in so the divider math stays I/O-free.
+                Event::Mouse(ev) => app.on_mouse(&ev, terminal.size()?.width),
+                _ => {}
             }
         }
 
@@ -227,8 +229,8 @@ fn run_suspended(terminal: &mut Term, dir: &Path, action: PromptAction) -> Resul
     enable_raw_mode()?;
     wait_for_key();
 
-    // Re-enter: the outer setup already ran once; re-arm the alt screen.
-    execute!(io::stdout(), EnterAlternateScreen)?;
+    // Re-enter: the outer setup already ran once; re-arm the alt screen + mouse.
+    execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
     terminal.hide_cursor()?;
     Ok(())
 }

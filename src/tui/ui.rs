@@ -8,7 +8,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Tabs};
 
-use super::app::{App, ConfigView, Modal, Side, Tab, TextModal};
+use super::app::{App, ConfigView, Modal, Pane, Side, Tab, TextModal};
 use super::data::{
     humanize_secs, sandbox_stats, totals_line, ContainerStatus, InstanceRow, Node, SandboxRow,
     ServiceRow, Snapshot,
@@ -635,7 +635,7 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
     let text = match app.modal {
-        Modal::Config(_) => "tab original/resolved · ↑↓ scroll · pgup/pgdn · g/G · esc close",
+        Modal::Config(_) => "t toggle · tab pane · <> resize · ↑↓ scroll · esc close",
         Modal::Help(_) => "↑↓ scroll · pgup/pgdn · g/G · esc/? close",
         Modal::Logs(_) => "↑↓ scroll · pgup/pgdn · g/G · esc close",
         Modal::None => match app.tab {
@@ -700,9 +700,20 @@ fn prompt_candidates_line(prompt: &Prompt) -> Line<'static> {
     Line::from(spans)
 }
 
-/// Render the config explorer full-screen over the dashboard.
+/// Render the config explorer full-screen over the dashboard: config (TOML) on
+/// the left, `docker inspect` (JSON) on the right, split at `split_pct` with the
+/// two panes' shared border acting as the divider. The focused pane is marked in
+/// its title.
 fn draw_config_modal(frame: &mut Frame, view: &ConfigView) {
     let area = frame.area();
+
+    // Clear whatever is underneath so the modal is opaque, then split.
+    frame.render_widget(ratatui::widgets::Clear, area);
+    let [left_area, right_area] = Layout::horizontal([
+        Constraint::Percentage(view.split_pct),
+        Constraint::Min(0),
+    ])
+    .areas(area);
 
     let (side, other) = match view.showing {
         Side::Original => ("original", "resolved"),
@@ -713,19 +724,47 @@ fn draw_config_modal(frame: &mut Frame, view: &ConfigView) {
     } else {
         format!(" — {}", view.hash)
     };
-    let title = format!(" {} — {side} (tab: {other}){hash} ", view.title);
+    let config_focused = matches!(view.focus, Pane::Config);
+    let config_mark = if config_focused { "▶ " } else { "" };
+    let config_title = format!(
+        " {config_mark}config: {} — {side} (t: {other}){hash} ",
+        view.title
+    );
+    let config_lines: Vec<Line> = view.body().lines().map(highlight_toml_line).collect();
+    frame.render_widget(
+        Paragraph::new(config_lines)
+            .block(pane_block(config_title, config_focused))
+            .scroll((view.scroll, 0)),
+        left_area,
+    );
 
-    let block = Block::default()
+    let inspect_mark = if config_focused { "" } else { "▶ " };
+    let inspect_title = if view.inspect_container.is_empty() {
+        format!(" {inspect_mark}inspect ")
+    } else {
+        format!(" {inspect_mark}inspect — {} ", view.inspect_container)
+    };
+    let inspect_lines: Vec<Line> = view.inspect.lines().map(highlight_json_line).collect();
+    frame.render_widget(
+        Paragraph::new(inspect_lines)
+            .block(pane_block(inspect_title, !config_focused))
+            .scroll((view.inspect_scroll, 0)),
+        right_area,
+    );
+}
+
+/// A config-modal pane block. The focused pane's border is accented + bold; the
+/// unfocused one is dim so the shared column reads as the divider.
+fn pane_block(title: String, focused: bool) -> Block<'static> {
+    let border_style = if focused {
+        Style::default().fg(HIGHLIGHT).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().add_modifier(Modifier::DIM)
+    };
+    Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(HIGHLIGHT))
-        .title(title);
-
-    let lines: Vec<Line> = view.body().lines().map(highlight_toml_line).collect();
-    let paragraph = Paragraph::new(lines).block(block).scroll((view.scroll, 0));
-
-    // Clear whatever is underneath so the modal is opaque.
-    frame.render_widget(ratatui::widgets::Clear, area);
-    frame.render_widget(paragraph, area);
+        .border_style(border_style)
+        .title(title)
 }
 
 /// Render a plain scrollable text modal (help, logs) full-screen. No per-line
@@ -769,6 +808,33 @@ fn highlight_toml_line(line: &str) -> Line<'static> {
     Line::from(Span::raw(line.to_string()))
 }
 
+/// Light per-line JSON highlighting mirroring [`highlight_toml_line`]: a
+/// `"key":` prefix (through the colon) is green, structural punctuation-only
+/// lines (`{`, `}`, `[`, `],`) are dim, and everything else is default. Values
+/// stay plain — enough to make keys scannable without a real parser.
+fn highlight_json_line(line: &str) -> Line<'static> {
+    let trimmed = line.trim();
+    // Punctuation-only structural lines: dim the whole line.
+    if !trimmed.is_empty() && trimmed.chars().all(|c| matches!(c, '{' | '}' | '[' | ']' | ',')) {
+        return Line::from(Span::styled(
+            line.to_string(),
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+    }
+    // `"key": value` → green key half through the colon, plain value.
+    let after_indent = line.trim_start();
+    if after_indent.starts_with('"') {
+        if let Some(colon) = line.find(':') {
+            let (key, value) = line.split_at(colon + 1);
+            return Line::from(vec![
+                Span::styled(key.to_string(), Style::default().fg(Color::Green)),
+                Span::raw(value.to_string()),
+            ]);
+        }
+    }
+    Line::from(Span::raw(line.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -803,5 +869,25 @@ mod tests {
         let doc = "[sandbox.s]\nimage = \"a\"\n# c\n\nx";
         let lines: Vec<Line> = doc.lines().map(highlight_toml_line).collect();
         assert_eq!(lines.len(), 5);
+    }
+
+    #[test]
+    fn highlight_json_styles_by_kind() {
+        // Key/value: green key half through the colon, plain value.
+        let kv = highlight_json_line("    \"Id\": \"abc\",");
+        assert_eq!(kv.spans.len(), 2);
+        assert_eq!(kv.spans[0].style.fg, Some(Color::Green));
+        assert_eq!(kv.spans[0].content, "    \"Id\":");
+        assert_eq!(kv.spans[1].content, " \"abc\",");
+
+        // Structural punctuation line: dim.
+        let brace = highlight_json_line("  {");
+        assert_eq!(brace.spans.len(), 1);
+        assert!(brace.spans[0].style.add_modifier.contains(Modifier::DIM));
+
+        // Plain value line: single default span, no panic.
+        let plain = highlight_json_line("    \"abc\"");
+        assert_eq!(plain.spans.len(), 1);
+        assert_eq!(plain.spans[0].style.fg, None);
     }
 }
