@@ -5,10 +5,12 @@
 //! machine ([`app::App`]) and rendering ([`ui::draw`]) stay I/O-free.
 
 mod app;
+mod data;
 mod ui;
 
 use std::io::{self, Stdout};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -21,11 +23,12 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 use app::App;
+use data::Snapshot;
 
 /// How long each `event::poll` blocks before we redraw. A future step adds a
 /// 2s data-refresh tick; the loop is structured so that branch drops in easily.
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
-/// Data-refresh cadence. Nothing hangs off it yet (step 3 wires in docker).
+/// Data-refresh cadence: how often a background collection is kicked off.
 const TICK_INTERVAL: Duration = Duration::from_secs(2);
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
@@ -70,7 +73,11 @@ fn install_panic_hook() {
 }
 
 fn run(terminal: &mut Term, mut app: App) -> Result<()> {
+    let dir = app.dir.clone();
+    // At most one collection thread in flight; `Some` while one is running.
+    let mut pending: Option<Receiver<Snapshot>> = Some(spawn_collect(&dir));
     let mut last_tick = Instant::now();
+
     while !app.should_quit {
         terminal.draw(|frame| ui::draw(frame, &app))?;
 
@@ -82,10 +89,38 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
             }
         }
 
+        // Drain a finished collection into the app, freeing the in-flight slot.
+        if let Some(rx) = &pending {
+            match rx.try_recv() {
+                Ok(snapshot) => {
+                    app.set_snapshot(snapshot);
+                    pending = None;
+                }
+                Err(TryRecvError::Empty) => {}
+                // Thread died without sending; drop the slot so the next tick retries.
+                Err(TryRecvError::Disconnected) => pending = None,
+            }
+        }
+
         if last_tick.elapsed() >= TICK_INTERVAL {
-            // Data refresh lands in step 3; nothing to do on the tick yet.
             last_tick = Instant::now();
+            // Skip if a collection is still running so docker calls can't pile up.
+            if pending.is_none() {
+                pending = Some(spawn_collect(&dir));
+            }
         }
     }
     Ok(())
+}
+
+/// Spawn a detached thread that collects one [`Snapshot`] and sends it back.
+/// The receiver is polled from the event loop, keeping [`App`] I/O-free.
+fn spawn_collect(dir: &Path) -> Receiver<Snapshot> {
+    let (tx, rx) = mpsc::channel();
+    let dir: PathBuf = dir.to_path_buf();
+    std::thread::spawn(move || {
+        // Receiver may be gone if the UI quit mid-collection; ignore send errors.
+        let _ = tx.send(data::collect(&dir));
+    });
+    rx
 }

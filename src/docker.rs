@@ -31,6 +31,25 @@ pub fn output(args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// Like `output` but with stderr captured instead of inherited, for callers
+/// that own the screen (the TUI): stray stderr would corrupt the alternate
+/// screen. The first stderr line is folded into the error message.
+pub fn output_quiet(args: &[&str]) -> Result<String> {
+    let out = Command::new("docker")
+        .args(args)
+        .output()
+        .context("failed to run docker (is it installed?)")?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        bail!(
+            "docker {}: {}",
+            args.first().unwrap_or(&""),
+            stderr.lines().next().unwrap_or("non-zero exit").trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
 /// Like `run_inherit` but treats a non-zero exit as an error.
 pub fn run_checked(args: &[&str]) -> Result<()> {
     let code = run_inherit(args)?;
