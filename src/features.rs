@@ -128,6 +128,19 @@ fn cache_root() -> Result<PathBuf> {
     Ok(base.join("devsandbox/features"))
 }
 
+/// A fresh build-context dir for a sandbox's derived image build, under the
+/// features cache root: `<cache_root>/build-<sandbox>`. Recreated each call
+/// (any prior contents are removed) so a rebuild starts clean.
+pub fn build_context_dir(sandbox: &str) -> Result<PathBuf> {
+    let dir = cache_root()?.join(format!("build-{sandbox}"));
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir)
+            .with_context(|| format!("cannot clear {}", dir.display()))?;
+    }
+    std::fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    Ok(dir)
+}
+
 /// A feature's `devcontainer-feature.json`. Tolerant of unknown fields and
 /// missing values so new schema keys don't break parsing.
 #[derive(Debug, Clone, Default, Deserialize)]
