@@ -66,6 +66,9 @@ pub fn run(dir: &Path, sandbox_name: Option<String>, instance_name: Option<Strin
             .unwrap_or_else(|| format!("/workspaces/{basename}")),
         &var_ctx,
     );
+    // Extra workspace roots (`folders`): bind-mounted at their container path
+    // and listed in the generated `.code-workspace` after the primary folder.
+    let extra_folders = resolve_folders(dir, &var_ctx, &workspace, props)?;
 
     let mut state = State::load()?;
     // Deterministic name: explicit --name, or the sandbox name for the first
@@ -95,6 +98,16 @@ pub fn run(dir: &Path, sandbox_name: Option<String>, instance_name: Option<Strin
         let extensions = props.vscode_extensions().unwrap_or(&[]);
         if !extensions.is_empty() || props.remote_user.is_some() {
             write_vscode_name_config(&container_name, extensions, props.remote_user.as_deref())?;
+        }
+        // Refresh the generated workspace file (and record it for instances
+        // created before it existed).
+        let workspace_file =
+            write_workspace_file(&container_name, &instance, &workspace, &extra_folders);
+        if let Some(inst) = state.instances.get_mut(&instance)
+            && inst.workspace_file != workspace_file
+        {
+            inst.workspace_file = workspace_file;
+            state.save()?;
         }
         if let Some(cmd) = &props.post_start_command {
             exec_lifecycle(
@@ -142,6 +155,9 @@ pub fn run(dir: &Path, sandbox_name: Option<String>, instance_name: Option<Strin
         (folder.clone(), None, Vec::new())
     };
     let mut mounts = resolve_mounts(dir, &folder, &basename, &sandbox)?;
+    for (target, host) in &extra_folders {
+        mounts.push(format!("type=bind,source={},target={target}", host.display()));
+    }
     // Package-manager caches: shared bind mounts + the env vars pointing at them.
     let (cache_mounts, cache_env) = resolve_caches(&config_dir, props)?;
     mounts.extend(cache_mounts);
@@ -167,6 +183,7 @@ pub fn run(dir: &Path, sandbox_name: Option<String>, instance_name: Option<Strin
         &endpoints,
     )?;
     let container = container_name.clone();
+    let workspace_file = write_workspace_file(&container, &instance, &workspace, &extra_folders);
 
     state.instances.insert(
         instance.clone(),
@@ -179,6 +196,7 @@ pub fn run(dir: &Path, sandbox_name: Option<String>, instance_name: Option<Strin
             worktree,
             shell_history,
             workspace: workspace.clone(),
+            workspace_file,
             remote_env: props.remote_env.clone().unwrap_or_default(),
             remote_user: props.remote_user.clone(),
             created_unix: Instance::now(),
@@ -388,6 +406,75 @@ fn resolve_mounts(
         args.push(resolved.to_arg());
     }
     Ok(args)
+}
+
+/// Resolve `folders` (container path -> host folder) into
+/// `(container path, host path)` pairs. Host paths behave like `folder`:
+/// relative to the config dir, must exist. Container paths must be absolute
+/// and distinct from `workspaceFolder`, which is always the first root.
+fn resolve_folders(
+    dir: &Path,
+    ctx: &MountContext,
+    workspace: &str,
+    props: &SandboxProperties,
+) -> Result<Vec<(String, PathBuf)>> {
+    let Some(folders) = &props.folders else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::with_capacity(folders.len());
+    for (target, source) in folders {
+        let target = substitute(target, ctx);
+        if !target.starts_with('/') {
+            bail!("`folders` key `{target}` must be an absolute container path");
+        }
+        if target == workspace {
+            bail!(
+                "`folders` key `{target}` duplicates `workspaceFolder`; \
+                 the primary folder is added automatically"
+            );
+        }
+        let source = substitute(source, ctx);
+        let host = dir
+            .join(&source)
+            .canonicalize()
+            .with_context(|| format!("`folders` entry `{source}` does not exist"))?;
+        out.push((target, host));
+    }
+    Ok(out)
+}
+
+/// JSON body of the generated `.code-workspace`: the primary workspace folder
+/// first, then the extra `folders` roots.
+fn workspace_file_json(workspace: &str, extra_folders: &[(String, PathBuf)]) -> String {
+    let folders: Vec<serde_json::Value> = std::iter::once(workspace)
+        .chain(extra_folders.iter().map(|(target, _)| target.as_str()))
+        .map(|path| serde_json::json!({ "path": path }))
+        .collect();
+    serde_json::to_string_pretty(&serde_json::json!({ "folders": folders }))
+        .expect("workspace json serializes")
+}
+
+/// Write `/workspaces/<instance>.code-workspace` inside the container so VS
+/// Code opens the instance as a workspace named after it (the window title is
+/// the file name; there is no separate name property). Best-effort: a container
+/// without `sh` still runs, and `code` falls back to a folder open when no file
+/// was recorded. Returns the container path on success.
+fn write_workspace_file(
+    container: &str,
+    instance: &str,
+    workspace: &str,
+    extra_folders: &[(String, PathBuf)],
+) -> Option<String> {
+    let path = format!("/workspaces/{instance}.code-workspace");
+    let json = workspace_file_json(workspace, extra_folders);
+    let script = r#"mkdir -p "${2%/*}" && printf '%s\n' "$1" > "$2""#;
+    match backend().run_checked(&["exec", container, "sh", "-c", script, "sh", &json, &path]) {
+        Ok(()) => Some(path),
+        Err(e) => {
+            eprintln!("warning: cannot write {path} in `{container}`: {e:#}");
+            None
+        }
+    }
 }
 
 /// Expand `caches` into (extra `--mount` args, extra `(key, value)` env vars).
@@ -1020,6 +1107,7 @@ mod tests {
             worktree: None,
             shell_history: None,
             workspace: "/workspaces/repo".into(),
+            workspace_file: None,
             remote_env: Default::default(),
             remote_user: None,
             created_unix: 0,
@@ -1040,6 +1128,79 @@ mod tests {
     fn default_name_is_sandbox_when_absent() {
         let state = State::default();
         assert_eq!(default_instance_name(&state, "repo"), "repo");
+    }
+
+    // --- folders / generated workspace file ---
+
+    fn ctx() -> MountContext<'static> {
+        MountContext {
+            config_dir: "/cfg",
+            workspace_folder: "/host/app",
+            workspace_folder_basename: "app",
+        }
+    }
+
+    fn props_with_folders(entries: &[(&str, &str)]) -> SandboxProperties {
+        SandboxProperties {
+            folders: Some(
+                entries
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn folders_resolve_relative_to_config_dir() {
+        let dir = std::env::temp_dir();
+        let props = props_with_folders(&[("/workspaces/.shared", ".")]);
+        let resolved = resolve_folders(&dir, &ctx(), "/workspaces/app", &props).unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].0, "/workspaces/.shared");
+        assert_eq!(resolved[0].1, dir.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn folders_reject_relative_container_path() {
+        let props = props_with_folders(&[("workspaces/x", ".")]);
+        let err = resolve_folders(Path::new("/tmp"), &ctx(), "/workspaces/app", &props)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("absolute container path"), "{err}");
+    }
+
+    #[test]
+    fn folders_reject_workspace_folder_duplicate() {
+        let props = props_with_folders(&[("/workspaces/app", ".")]);
+        let err = resolve_folders(Path::new("/tmp"), &ctx(), "/workspaces/app", &props)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("duplicates `workspaceFolder`"), "{err}");
+    }
+
+    #[test]
+    fn folders_reject_missing_host_folder() {
+        let props = props_with_folders(&[("/workspaces/x", "does-not-exist-9f3a")]);
+        let err = resolve_folders(Path::new("/tmp"), &ctx(), "/workspaces/app", &props)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not exist"), "{err}");
+    }
+
+    #[test]
+    fn workspace_json_lists_primary_first() {
+        let extras = vec![("/workspaces/.shared".to_string(), PathBuf::from("/x"))];
+        let json = workspace_file_json("/workspaces/app", &extras);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed["folders"],
+            serde_json::json!([
+                { "path": "/workspaces/app" },
+                { "path": "/workspaces/.shared" }
+            ])
+        );
     }
 
     #[test]

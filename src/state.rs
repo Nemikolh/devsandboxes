@@ -33,6 +33,10 @@ pub struct Instance {
     pub shell_history: Option<PathBuf>,
     /// Workspace folder inside the container.
     pub workspace: String,
+    /// Container path of the generated `.code-workspace` file, when one was
+    /// written for this instance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_file: Option<String>,
     /// devcontainer `remoteEnv`, applied to every exec in the container.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub remote_env: BTreeMap<String, String>,
@@ -107,6 +111,7 @@ mod tests {
                 worktree: None,
                 shell_history: None,
                 workspace: "/workspaces/repository-1".into(),
+                workspace_file: None,
                 remote_env: BTreeMap::new(),
                 remote_user: None,
                 created_unix: Instance::now(),

@@ -40,6 +40,10 @@ pub struct SandboxProperties {
     /// between concurrent instances.
     #[serde(rename = "persist-shell-history")]
     pub persist_shell_history: Option<bool>,
+    /// Extra VS Code workspace roots: container path -> host folder (relative
+    /// to the config dir). Each entry is bind-mounted at its key and listed in
+    /// the generated `.code-workspace` file after `workspaceFolder`.
+    pub folders: Option<BTreeMap<String, String>>,
 
     // --- implemented devcontainer properties ---
     pub image: Option<String>,
@@ -685,6 +689,27 @@ build.args = { B = "3" }
         // A comes from the template, B is overridden by the sandbox.
         assert_eq!(args["A"], "1");
         assert_eq!(args["B"], "3");
+    }
+
+    #[test]
+    fn folders_parses_and_merges_through_extends() {
+        let config = Config::parse(
+            r#"
+[template.base]
+folders = { "/workspaces/.shared" = "../.shared" }
+
+[sandbox.app]
+extends = "base"
+folder = "../app"
+image = "img"
+folders = { "/workspaces/docs" = "../docs" }
+"#,
+        )
+        .unwrap();
+        let sandbox = config.resolve_sandbox("app").unwrap();
+        let folders = sandbox.properties.folders.as_ref().unwrap();
+        assert_eq!(folders["/workspaces/.shared"], "../.shared");
+        assert_eq!(folders["/workspaces/docs"], "../docs");
     }
 
     #[test]

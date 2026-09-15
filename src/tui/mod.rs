@@ -299,15 +299,22 @@ fn launch_code(dir: &Path, app: &App, instance: &str) -> String {
         remote_user.as_deref(),
     );
 
+    // Prefer the generated `.code-workspace` (window named after the instance,
+    // carries the extra `folders` roots); instances created before it existed
+    // fall back to a plain folder open. Row names equal state instance keys.
+    let workspace_file = crate::state::State::load()
+        .ok()
+        .and_then(|s| s.instances.get(instance).and_then(|i| i.workspace_file.clone()));
+    let (flag, path) = match &workspace_file {
+        Some(file) => ("--file-uri", file.as_str()),
+        None => ("--folder-uri", row.workspace.as_str()),
+    };
     let uri = format!(
         "vscode-remote://attached-container+{}/{}",
         hex_encode(&row.container),
-        row.workspace
+        path
     );
-    match std::process::Command::new("code")
-        .args(["--folder-uri", &uri])
-        .spawn()
-    {
+    match std::process::Command::new("code").args([flag, &uri]).spawn() {
         Ok(_) => format!("opening VS Code → {instance}"),
         Err(e) => format!("code: failed to launch (`code` on PATH?): {e}"),
     }
