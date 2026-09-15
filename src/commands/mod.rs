@@ -18,6 +18,10 @@ use crate::state::State;
 /// non-TTY) an ambiguous match bail; a TTY prompts interactively. Shared by
 /// `rm` and `stop`.
 pub(crate) fn resolve_instance(state: &State, name: &str) -> Result<String> {
+    resolve_instance_with(state, name, std::io::stdin().is_terminal())
+}
+
+fn resolve_instance_with(state: &State, name: &str, interactive: bool) -> Result<String> {
     let mut matches: Vec<String> = state
         .instances
         .iter()
@@ -34,7 +38,7 @@ pub(crate) fn resolve_instance(state: &State, name: &str) -> Result<String> {
         0 => bail!("no sandbox instance matches `{name}` (see `devsandbox ps -a`)"),
         1 => Ok(matches.remove(0)),
         _ => {
-            if !std::io::stdin().is_terminal() {
+            if !interactive {
                 bail!("`{name}` is ambiguous: {}", matches.join(", "));
             }
             let refs: Vec<&str> = matches.iter().map(String::as_str).collect();
@@ -66,7 +70,7 @@ mod tests {
 
     use crate::state::{Instance, State};
 
-    use super::resolve_instance;
+    use super::{resolve_instance, resolve_instance_with};
 
     /// State with two instances of the same sandbox, in two folders.
     fn state() -> State {
@@ -134,10 +138,11 @@ mod tests {
 
     #[test]
     fn ambiguous_sandbox_name_errors_without_tty() {
-        // Two instances share sandbox `web`; the test process has no stdin TTY,
-        // so the ambiguous match bails rather than prompting.
+        // Two instances share sandbox `web`; non-interactive resolution must
+        // bail rather than prompt (interactivity is injected so the test does
+        // not depend on whether cargo test itself has a TTY).
         let s = state();
-        let err = resolve_instance(&s, "web").unwrap_err().to_string();
+        let err = resolve_instance_with(&s, "web", false).unwrap_err().to_string();
         assert!(err.contains("is ambiguous"), "{err}");
         assert!(err.contains("web-aaaa"), "{err}");
         assert!(err.contains("web-bbbb"), "{err}");
