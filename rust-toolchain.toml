@@ -1,3 +1,5 @@
 [toolchain]
-# ratatui 0.30 / time 0.3.55 require rustc >= 1.88.
-channel = "1.91.1"
+# ratatui 0.30 / time 0.3.55 require rustc >= 1.88. Pinned to the version
+# shipped in this container's image so no extra toolchain download is needed.
+channel = "1.98.0"
+components = ["rust-analyzer"]
