@@ -1,6 +1,7 @@
 mod commands;
 mod config;
 mod docker;
+mod render;
 mod state;
 
 use std::path::PathBuf;
