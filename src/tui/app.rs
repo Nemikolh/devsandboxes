@@ -145,7 +145,7 @@ pub enum Modal {
     Logs(TextModal),
 }
 
-/// The two top-level views. Real content lands in steps 3–4.
+/// The two top-level views.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tab {
     Instances,

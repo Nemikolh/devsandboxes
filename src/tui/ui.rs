@@ -1,6 +1,6 @@
 //! Immediate-mode rendering for the dashboard. Layout: tab bar on top, content
 //! area in the middle, help bar at the bottom. The Instances tab renders real
-//! data from the latest snapshot; the Services tab is placeholder (step 4).
+//! data from the latest snapshot.
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -302,7 +302,7 @@ fn draw_empty(frame: &mut Frame, area: Rect) {
         .border_style(Style::default().fg(HIGHLIGHT))
         .title(Tab::Instances.title());
     let text = Line::from(Span::styled(
-        "no instances — press : to run one (step 6)",
+        "no instances — press : to run one",
         Style::default().add_modifier(Modifier::DIM),
     ))
     .alignment(Alignment::Center);

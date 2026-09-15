@@ -30,8 +30,7 @@ use app::App;
 use data::Snapshot;
 use prompt::PromptAction;
 
-/// How long each `event::poll` blocks before we redraw. A future step adds a
-/// 2s data-refresh tick; the loop is structured so that branch drops in easily.
+/// How long each `event::poll` blocks before we redraw.
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// Data-refresh cadence: how often a background collection is kicked off.
 const TICK_INTERVAL: Duration = Duration::from_secs(2);
