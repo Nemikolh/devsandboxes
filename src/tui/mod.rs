@@ -319,7 +319,7 @@ fn spawn_stop(instance: &str) -> Receiver<StopDone> {
             Ok(state) => match state.instances.get(&instance) {
                 Some(info) => {
                     let services =
-                        commands::stop::service_containers(&info.project, &instance, true);
+                        commands::stop::service_containers(&info.project, &instance);
                     commands::stop::stop_containers(&info.container, &services, true);
                     format!("stopped {instance}")
                 }
@@ -341,12 +341,7 @@ fn spawn_proc_fetch(targets: Vec<(String, String)>) -> Receiver<BTreeMap<String,
     std::thread::spawn(move || {
         let mut out: BTreeMap<String, ProcState> = BTreeMap::new();
         for (instance, container) in targets {
-            let state = match crate::docker::output_quiet(&[
-                "top",
-                &container,
-                "-eo",
-                "pid,ppid,args",
-            ]) {
+            let state = match crate::runtime::backend().proc_list(&container) {
                 Ok(text) => ProcState::Rows(build_forest(parse_top(&text))),
                 Err(e) => ProcState::Message(format!("(processes unavailable: {e:#})")),
             };

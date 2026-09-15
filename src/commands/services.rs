@@ -3,8 +3,8 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 
-use crate::config::{short_hash, Config, ResolvedService, ServiceScope};
-use crate::docker::{self, NAME_PREFIX};
+use crate::config::{short_hash, Build, Config, ResolvedService, ServiceScope};
+use crate::runtime::{backend, Backend, ServiceEndpoint, NAME_PREFIX};
 use crate::state::State;
 
 /// Short, stable id for a config root, scoping its networks and services so two
@@ -38,24 +38,28 @@ pub fn isolated_service_container(project: &str, instance: &str, name: &str) -> 
 
 /// Create the given network if it does not already exist.
 pub fn ensure_network(network: &str) -> Result<()> {
-    if docker::inspect(network, "{{.Id}}")?.is_some() {
+    if backend().network_exists(network)? {
         return Ok(());
     }
-    docker::run_checked(&["network", "create", network])
+    backend()
+        .run_checked(&["network", "create", network])
+        .with_context(|| format!("cannot create network `{network}` (services need runtime network support)"))
 }
 
 /// Ensure the networks exist and every service the sandbox declares is up:
 /// `global` services on the shared network, `isolated` ones on a per-instance
-/// network. Returns the networks the instance container must join.
+/// network. Returns the networks the instance container must join and the
+/// endpoints it must be able to resolve by service name.
 pub fn ensure_services(
     config: &Config,
     dir: &Path,
     project: &str,
     instance: &str,
     service_names: &[String],
-) -> Result<Vec<String>> {
+) -> Result<(Vec<String>, Vec<ServiceEndpoint>)> {
+    let mut endpoints = Vec::with_capacity(service_names.len());
     if service_names.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), endpoints));
     }
     let global_net = network_name(project);
     let instance_net = instance_network(project, instance);
@@ -77,6 +81,7 @@ pub fn ensure_services(
                     format!("devsandbox.config_hash={}", service.config_hash),
                 ];
                 ensure_service(dir, &container, &global_net, &service, &labels)?;
+                endpoints.push(ServiceEndpoint { alias: name.clone(), container });
             }
             ServiceScope::Isolated => {
                 if !used_isolated {
@@ -92,6 +97,7 @@ pub fn ensure_services(
                     format!("devsandbox.config_hash={}", service.config_hash),
                 ];
                 ensure_service(dir, &container, &instance_net, &service, &labels)?;
+                endpoints.push(ServiceEndpoint { alias: name.clone(), container });
             }
         }
     }
@@ -103,7 +109,7 @@ pub fn ensure_services(
     if used_isolated {
         networks.push(instance_net);
     }
-    Ok(networks)
+    Ok((networks, endpoints))
 }
 
 /// Idempotently bring a service container up: create it if absent, start it if
@@ -115,12 +121,9 @@ fn ensure_service(
     service: &ResolvedService,
     labels: &[String],
 ) -> Result<()> {
-    match docker::inspect(container, "{{.State.Running}}")? {
+    match backend().is_running(container)? {
         Some(running) => {
-            let label = docker::inspect(
-                container,
-                "{{index .Config.Labels \"devsandbox.config_hash\"}}",
-            )?;
+            let label = backend().label(container, "devsandbox.config_hash")?;
             if label.as_deref().unwrap_or_default() != service.config_hash {
                 eprintln!(
                     "warning: service `{}` ({container}) config changed since it started; \
@@ -128,16 +131,16 @@ fn ensure_service(
                     service.name
                 );
             }
-            if running != "true" {
-                docker::run_checked(&["start", container])?;
+            if !running {
+                backend().run_checked(&["start", container])?;
             }
         }
         None => {
             check_port_conflicts(container, &service.spec.ports)?;
             let image = service_image(dir, service)?;
-            let args = service_run_args(container, network, &image, service, labels);
+            let args = service_run_args(backend(), container, network, &image, service, labels);
             let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-            docker::run_checked(&refs)?;
+            backend().run_checked(&refs)?;
         }
     }
     Ok(())
@@ -158,13 +161,31 @@ fn service_image(dir: &Path, service: &ResolvedService) -> Result<String> {
         .dockerfile
         .as_deref()
         .with_context(|| format!("service `{}`: `build.dockerfile` is required", service.name))?;
-    let context = build.context.as_deref().unwrap_or(".");
     let tag = format!("{NAME_PREFIX}img-svc-{}", service.name);
 
+    let args = build_args(backend(), dir, &tag, dockerfile, build, &format!("service `{}`", service.name));
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    backend().run_checked(&refs)?;
+    Ok(tag)
+}
+
+/// `build` argv for a `build` block: `-t tag -f dockerfile [--build-arg …]
+/// [--target …] [--cache-from …] [options…] context`. `--cache-from` is dropped
+/// with a warning on runtimes without it (`what` names the owner in the
+/// message). Shared with sandbox image builds.
+pub fn build_args(
+    rt: &dyn Backend,
+    dir: &Path,
+    tag: &str,
+    dockerfile: &str,
+    build: &Build,
+    what: &str,
+) -> Vec<String> {
+    let context = build.context.as_deref().unwrap_or(".");
     let mut args: Vec<String> = vec![
         "build".into(),
         "-t".into(),
-        tag.clone(),
+        tag.to_string(),
         "-f".into(),
         dir.join(dockerfile).to_string_lossy().into_owned(),
     ];
@@ -178,23 +199,28 @@ fn service_image(dir: &Path, service: &ResolvedService) -> Result<String> {
         args.extend(["--target".into(), target.clone()]);
     }
     if let Some(cache_from) = &build.cache_from {
-        for image in cache_from.to_vec() {
-            args.extend(["--cache-from".into(), image.to_string()]);
+        if rt.supports_cache_from() {
+            for image in cache_from.to_vec() {
+                args.extend(["--cache-from".into(), image.to_string()]);
+            }
+        } else {
+            eprintln!(
+                "warning: {what}: `build.cacheFrom` is not supported by {}; ignoring",
+                rt.name()
+            );
         }
     }
     if let Some(options) = &build.options {
         args.extend(options.iter().cloned());
     }
     args.push(dir.join(context).to_string_lossy().into_owned());
-
-    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    docker::run_checked(&refs)?;
-    Ok(tag)
+    args
 }
 
-/// Build the `docker run` argv for a service container. Pure, so it can be
-/// tested without invoking docker.
+/// Build the `run` argv for a service container. Pure apart from the
+/// backend's alias flag, so it can be tested without a runtime.
 pub fn service_run_args(
+    rt: &dyn Backend,
     container: &str,
     network: &str,
     image: &str,
@@ -208,9 +234,9 @@ pub fn service_run_args(
     }
     args.push("--network".into());
     args.push(network.to_string());
-    // Alias = service name, so sandboxes reach it as `<name>:<port>`.
-    args.push("--network-alias".into());
-    args.push(service.name.clone());
+    // Alias = service name, so sandboxes reach it as `<name>:<port>`. Runtimes
+    // without aliases wire it into the sandbox's /etc/hosts instead.
+    args.extend(rt.service_alias_args(&service.name));
     for (key, value) in &service.spec.env {
         args.push("-e".into());
         args.push(format!("{key}={value}"));
@@ -236,14 +262,19 @@ fn host_port(spec: &str) -> Option<&str> {
 }
 
 /// Fail before creating a service if another running container already
-/// publishes one of its host ports (best-effort; docker is the final arbiter).
+/// publishes one of its host ports (best-effort; the runtime is the final
+/// arbiter).
 fn check_port_conflicts(container: &str, ports: &[String]) -> Result<()> {
-    for spec in ports {
-        let Some(port) = host_port(spec) else { continue };
-        let filter = format!("publish={port}");
-        let holder = docker::output(&["ps", "--filter", &filter, "--format", "{{.Names}}"])?;
-        let other = holder.lines().find(|name| !name.is_empty() && *name != container);
-        if let Some(other) = other {
+    let wanted: Vec<&str> = ports.iter().filter_map(|p| host_port(p)).collect();
+    if wanted.is_empty() {
+        return Ok(());
+    }
+    let running = backend().list(false, "")?;
+    for port in wanted {
+        let other = running
+            .iter()
+            .find(|r| r.name != container && r.host_ports.iter().any(|p| p == port));
+        if let Some(other) = other.map(|r| &r.name) {
             bail!(
                 "host port {port} (service `{container}`) is already published by `{other}`; \
                  change the service `ports` or stop the other container"
@@ -255,7 +286,7 @@ fn check_port_conflicts(container: &str, ports: &[String]) -> Result<()> {
 
 /// Stop and remove service containers of this project that no live sandbox
 /// instance references, and networks nothing needs. Refcounting is derived from
-/// state + docker, never stored.
+/// state + the runtime, never stored.
 pub fn gc(dir: &Path) -> Result<()> {
     let project = project_id(dir)?;
     let config = Config::load(dir).unwrap_or_default();
@@ -293,24 +324,27 @@ pub fn gc(dir: &Path) -> Result<()> {
         }
     }
 
-    let filter = format!("label=devsandbox.project={project}");
-    let listing = docker::output(&["ps", "-a", "--filter", &filter, "--format", "{{.Names}}"])?;
     let mut removed = 0;
-    for container in listing.lines().filter(|l| !l.is_empty()) {
-        let scope = label(container, "devsandbox.scope")?;
-        let service = label(container, "devsandbox.service")?;
-        let keep = match scope.as_str() {
-            "global" => global_refs.contains(&service),
-            "isolated" => {
-                let instance = label(container, "devsandbox.instance")?;
-                isolated_refs.get(&instance).is_some_and(|s| s.contains(&service))
+    for row in backend().list(true, NAME_PREFIX)? {
+        if row.label("devsandbox.project") != Some(project.as_str()) {
+            continue;
+        }
+        let service = row.label("devsandbox.service").unwrap_or_default();
+        let keep = match row.label("devsandbox.scope") {
+            Some("global") => global_refs.contains(service),
+            Some("isolated") => {
+                let instance = row.label("devsandbox.instance").unwrap_or_default();
+                isolated_refs.get(instance).is_some_and(|s| s.contains(service))
             }
             _ => false,
         };
         if keep {
             continue;
         }
-        docker::run_checked(&["rm", "-f", container])?;
+        let container = &row.name;
+        if backend().remove_force(container)? != 0 {
+            bail!("{} rm {container} failed", backend().name());
+        }
         println!("removed service {container}");
         removed += 1;
     }
@@ -318,8 +352,8 @@ pub fn gc(dir: &Path) -> Result<()> {
     // Drop networks nothing needs: the shared net once no live instance uses a
     // global service, and each instance net whose instance is gone.
     let global_net = network_name(&project);
-    let nets = docker::output(&["network", "ls", "--filter", &format!("name={global_net}"), "--format", "{{.Name}}"])?;
-    for net in nets.lines().filter(|l| !l.is_empty()) {
+    let nets = backend().output(&["network", "ls", "-q"])?;
+    for net in nets.lines().map(str::trim).filter(|l| l.starts_with(global_net.as_str())) {
         let drop = if net == global_net {
             global_refs.is_empty()
         } else if let Some(instance) = net.strip_prefix(&format!("{global_net}-")) {
@@ -328,7 +362,7 @@ pub fn gc(dir: &Path) -> Result<()> {
             false
         };
         if drop {
-            let _ = docker::run_inherit(&["network", "rm", net]);
+            let _ = backend().run_inherit(&["network", "rm", net]);
         }
     }
 
@@ -338,17 +372,8 @@ pub fn gc(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn label(container: &str, key: &str) -> Result<String> {
-    Ok(docker::inspect(container, &format!("{{{{index .Config.Labels \"{key}\"}}}}"))?
-        .unwrap_or_default())
-}
-
 fn container_running(container: &str) -> bool {
-    docker::inspect(container, "{{.State.Running}}")
-        .ok()
-        .flatten()
-        .as_deref()
-        == Some("true")
+    backend().is_running(container).ok().flatten() == Some(true)
 }
 
 #[cfg(test)]
@@ -383,6 +408,7 @@ ports = ["5432:5432"]
         );
         let labels = ["devsandbox.service=db".to_string(), "devsandbox.scope=isolated".to_string()];
         let args = service_run_args(
+            &crate::runtime::Dockerlike::DOCKER,
             "devsandbox-svc-proj-repo-db",
             "devsandbox-net-proj-repo",
             "postgres:16",
@@ -399,6 +425,40 @@ ports = ["5432:5432"]
         assert!(joined.contains("--label devsandbox.scope=isolated"));
         // Image is the final positional argument.
         assert_eq!(args.last().unwrap(), "postgres:16");
+    }
+
+    #[test]
+    fn service_run_args_apple_has_no_alias() {
+        let svc = service("[services.db]\nimage = \"postgres:16\"");
+        let args = service_run_args(
+            &crate::runtime::AppleContainer,
+            "devsandbox-svc-proj-repo-db",
+            "devsandbox-net-proj-repo",
+            "postgres:16",
+            &svc,
+            &[],
+        );
+        let joined = args.join(" ");
+        assert!(joined.contains("--network devsandbox-net-proj-repo"));
+        assert!(!joined.contains("--network-alias"));
+    }
+
+    #[test]
+    fn build_args_drop_cache_from_where_unsupported() {
+        let cfg = Config::parse(
+            "[services.db]\nbuild = { dockerfile = \"Dockerfile\", cacheFrom = \"reg/db:cache\", target = \"dev\" }",
+        )
+        .unwrap();
+        let svc = cfg.resolve_service("db").unwrap();
+        let build = svc.spec.build.as_ref().unwrap();
+        let dir = Path::new("/cfg");
+        let docker = build_args(&crate::runtime::Dockerlike::DOCKER, dir, "t", "Dockerfile", build, "x");
+        assert!(docker.join(" ").contains("--cache-from reg/db:cache"));
+        assert!(docker.join(" ").contains("--target dev"));
+        assert_eq!(docker.last().unwrap(), "/cfg/.");
+        let apple = build_args(&crate::runtime::AppleContainer, dir, "t", "Dockerfile", build, "x");
+        assert!(!apple.join(" ").contains("--cache-from"));
+        assert!(apple.join(" ").contains("--target dev"));
     }
 
     #[test]

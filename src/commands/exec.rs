@@ -3,7 +3,7 @@ use std::io::IsTerminal;
 use anyhow::{bail, Result};
 
 use super::pick;
-use crate::docker;
+use crate::runtime::backend;
 use crate::state::{Instance, State};
 
 /// CLI entry point: run the command, then exit the process with its status.
@@ -64,5 +64,5 @@ pub fn exec_status(name: &str, interactive: bool, tty: bool, command: &[String])
     args.push(instance.container.clone());
     args.extend(command.iter().cloned());
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    docker::run_inherit(&arg_refs)
+    backend().run_inherit(&arg_refs)
 }

@@ -10,7 +10,7 @@ use crossterm::event::{
 };
 
 use crate::config::Config;
-use crate::docker;
+use crate::runtime::backend;
 
 use super::data::{visible_nodes, ContainerStatus, InstanceRow, Node, Snapshot, ORPHANS_NAME};
 use super::procs::ProcState;
@@ -907,8 +907,8 @@ impl App {
     }
 
     /// Open a full-screen log tail for the selected instance's container.
-    /// Fetches `docker logs --tail 50` (stdout+stderr merged) at open time; a
-    /// missing container or docker error renders as the body. Instances tab only;
+    /// Fetches the last 50 log lines (stdout+stderr merged) at open time; a
+    /// missing container or runtime error renders as the body. Instances tab only;
     /// no-op with no selectable row.
     fn open_logs(&mut self) {
         if self.tab != Tab::Instances {
@@ -926,7 +926,7 @@ impl App {
             return;
         };
         let container = row.container.clone();
-        let body = match docker::output_merged(&["logs", "--tail", "50", &container]) {
+        let body = match backend().logs_tail(&container, 50) {
             Ok(out) if out.trim().is_empty() => "(no log output)".to_string(),
             Ok(out) => out,
             Err(e) => format!("{e:#}"),
@@ -1094,7 +1094,7 @@ fn set_inspect(view: &mut ConfigView, target: Option<String>, placeholder: &str)
         return;
     };
     view.inspect_container = container.clone();
-    view.inspect = match docker::output_quiet(&["inspect", &container]) {
+    view.inspect = match backend().inspect_json(&container) {
         Ok(out) => match serde_json::from_str::<serde_json::Value>(&out) {
             Ok(v) => match serde_json::to_string_pretty(&v) {
                 Ok(pretty) => pretty,
@@ -1211,7 +1211,8 @@ mod tests {
             sandboxes,
             services: Vec::new(),
             sandbox_count: 1,
-            docker_version: None,
+            runtime_name: "docker",
+            runtime_version: None,
             collected_at: std::time::Instant::now(),
             error: None,
         }
@@ -1478,7 +1479,8 @@ mod tests {
             sandboxes: Vec::new(),
             services: Vec::new(),
             sandbox_count: 0,
-            docker_version: None,
+            runtime_name: "docker",
+            runtime_version: None,
             collected_at: std::time::Instant::now(),
             error: None,
         }
@@ -1769,7 +1771,8 @@ mod tests {
             }],
             services: Vec::new(),
             sandbox_count: 1,
-            docker_version: None,
+            runtime_name: "docker",
+            runtime_version: None,
             collected_at: std::time::Instant::now(),
             error: None,
         };

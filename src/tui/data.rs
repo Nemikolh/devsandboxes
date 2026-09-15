@@ -7,12 +7,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Instant;
 
-use serde::Deserialize;
-
 use super::procs::{ProcState, MESSAGE_ROW};
 use crate::commands::services::{isolated_service_container, project_id, service_container};
 use crate::config::{Config, ServiceScope};
-use crate::docker::{self, NAME_PREFIX};
+use crate::runtime::{backend, ContainerRow, NAME_PREFIX};
 use crate::state::{Instance, State};
 
 /// Container liveness, joined from `docker ps` against the state's instance list.
@@ -110,9 +108,11 @@ pub struct Snapshot {
     /// Number of sandboxes defined in `config.toml` (0 when config is absent or
     /// unreadable). Feeds the header totals line.
     pub sandbox_count: usize,
-    /// Docker server version (e.g. `24.0.7`), or `None` when docker is down or
+    /// Runtime name for the header (`docker`, `podman`, `container`).
+    pub runtime_name: &'static str,
+    /// Runtime server version (e.g. `24.0.7`), or `None` when it is down or
     /// the version probe failed. Feeds the header totals line.
-    pub docker_version: Option<String>,
+    pub runtime_version: Option<String>,
     /// When collection finished. Drives the staleness indicator in the header.
     pub collected_at: Instant,
     pub error: Option<String>,
@@ -232,28 +232,6 @@ pub fn sandbox_stats(instances: usize, running: usize) -> String {
     format!("{running}/{instances} running")
 }
 
-/// Parsed line of `docker ps --format {{json .}}`.
-#[derive(Debug, Deserialize)]
-struct PsLine {
-    #[serde(rename = "Names")]
-    names: String,
-    #[serde(rename = "Status")]
-    status: String,
-    #[serde(rename = "State")]
-    state: String,
-}
-
-/// Parsed line of `docker stats --no-stream --format {{json .}}`.
-#[derive(Debug, Deserialize)]
-struct StatsLine {
-    #[serde(rename = "Name")]
-    name: String,
-    #[serde(rename = "CPUPerc")]
-    cpu: String,
-    #[serde(rename = "MemUsage")]
-    mem: String,
-}
-
 /// Pre-extracted service definition fed into [`build_service_rows`]. Keeping the
 /// join pure (no docker, no `ResolvedService`) makes it unit-testable: `collect`
 /// fills these from `Config::resolve_service`, tests construct them directly.
@@ -307,7 +285,7 @@ fn build_service_rows(
     project: &str,
     services: &[ServiceInput],
     instance_services: &[(String, Vec<String>)],
-    ps: &[PsLine],
+    ps: &[ContainerRow],
 ) -> Vec<ServiceRow> {
     services
         .iter()
@@ -371,39 +349,18 @@ fn build_service_rows(
         .collect()
 }
 
-/// Classify a container by name against parsed `docker ps` lines. `docker ps`
-/// may list several comma-separated names per container; match any of them.
-fn classify(container: &str, ps: &[PsLine]) -> ContainerStatus {
-    for line in ps {
-        if line.names.split(',').any(|n| n.trim() == container) {
-            // docker's State is one of created/restarting/running/removing/
-            // paused/exited/dead. Treat "running" as up, everything else stopped.
-            if line.state == "running" {
-                return ContainerStatus::Running(line.status.clone());
+/// Classify a container by name against the runtime's listing. Treat
+/// `running` as up, every other state (created/exited/stopped/…) as stopped.
+fn classify(container: &str, ps: &[ContainerRow]) -> ContainerStatus {
+    for row in ps {
+        if row.name == container {
+            if row.is_running() {
+                return ContainerStatus::Running(row.status.clone());
             }
-            return ContainerStatus::Exited(line.status.clone());
+            return ContainerStatus::Exited(row.status.clone());
         }
     }
     ContainerStatus::Missing
-}
-
-/// Parse `docker ps --format {{json .}}` output (one JSON object per line).
-/// Unparseable lines are skipped rather than failing the whole collection.
-fn parse_ps(out: &str) -> Vec<PsLine> {
-    out.lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str::<PsLine>(l).ok())
-        .collect()
-}
-
-/// Parse `docker stats --no-stream --format {{json .}}` output into a
-/// name→(cpu, mem) map. Unparseable lines are skipped.
-fn parse_stats(out: &str) -> BTreeMap<String, (String, String)> {
-    out.lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str::<StatsLine>(l).ok())
-        .map(|s| (s.name, (s.cpu, s.mem)))
-        .collect()
 }
 
 /// Humanize an elapsed-seconds duration: `3d4h`, `2h05m`, `12m`, `40s`.
@@ -424,8 +381,8 @@ pub fn humanize_secs(secs: u64) -> String {
 
 /// Collect a fresh [`Snapshot`]. Blocking; run off the UI thread.
 ///
-/// State is the source of truth for which rows exist; docker enriches them with
-/// liveness and resource usage. When docker or config is unavailable the rows
+/// State is the source of truth for which rows exist; the runtime enriches them
+/// with liveness and resource usage. When it or config is unavailable the rows
 /// still render (status `Missing`, no cpu/mem) and `error` is set.
 pub fn collect(dir: &Path) -> Snapshot {
     let collected_at = Instant::now();
@@ -439,7 +396,8 @@ pub fn collect(dir: &Path) -> Snapshot {
                 sandboxes: Vec::new(),
                 services: Vec::new(),
                 sandbox_count: 0,
-                docker_version: None,
+                runtime_name: backend().name(),
+                runtime_version: None,
                 collected_at,
                 error: Some(format!("state: {e:#}")),
             };
@@ -448,40 +406,32 @@ pub fn collect(dir: &Path) -> Snapshot {
 
     let mut errors: Vec<String> = Vec::new();
 
-    // One `docker ps` and one `docker stats` call for the whole snapshot.
-    let ps = match docker::output_quiet(&[
-        "ps",
-        "--all",
-        "--filter",
-        &format!("name=^/{NAME_PREFIX}"),
-        "--format",
-        "{{json .}}",
-    ]) {
-        Ok(out) => parse_ps(&out),
+    // One listing and one stats call for the whole snapshot.
+    let rt = backend();
+    let ps = match rt.list(true, NAME_PREFIX) {
+        Ok(rows) => rows,
         Err(e) => {
-            errors.push(format!("docker unavailable: {e:#}"));
+            errors.push(format!("{} unavailable: {e:#}", rt.name()));
             Vec::new()
         }
     };
 
-    let stats = match docker::output_quiet(&["stats", "--no-stream", "--format", "{{json .}}"]) {
-        Ok(out) => parse_stats(&out),
-        // Only report a stats error if ps succeeded; otherwise the ps error
-        // already covers "docker is down".
+    let stats: BTreeMap<String, (String, String)> = match rt.stats() {
+        Ok(rows) => rows.into_iter().map(|s| (s.name, (s.cpu, s.mem))).collect(),
+        // Only report a stats error if the listing succeeded; otherwise that
+        // error already covers "runtime is down".
         Err(e) => {
             if errors.is_empty() {
-                errors.push(format!("docker stats: {e:#}"));
+                errors.push(format!("{} stats: {e:#}", rt.name()));
             }
             BTreeMap::new()
         }
     };
 
-    // Docker server version for the header; best-effort (None when down). Kept
-    // off the UI thread like every other docker call here. Cheap enough to run
+    // Runtime version for the header; best-effort (None when down). Kept off
+    // the UI thread like every other runtime call here. Cheap enough to run
     // each collection, so no caching is threaded through.
-    let docker_version = docker::output_quiet(&["version", "--format", "{{.Server.Version}}"])
-        .ok()
-        .filter(|v| !v.is_empty());
+    let runtime_version = rt.server_version().ok().filter(|v| !v.is_empty());
 
     // Load config once; resolve every sandbox for the tree, services + drift
     // hash. `resolved` maps sandbox name → (services, hash) for the instance join.
@@ -609,7 +559,8 @@ pub fn collect(dir: &Path) -> Snapshot {
         sandboxes,
         services,
         sandbox_count,
-        docker_version,
+        runtime_name: rt.name(),
+        runtime_version,
         collected_at,
         error: if errors.is_empty() { None } else { Some(errors.join("; ")) },
     }
@@ -639,13 +590,14 @@ pub fn totals_line(snapshot: &Snapshot, age: std::time::Duration) -> String {
         .flat_map(|s| &s.containers)
         .filter(|(_, st)| !matches!(st, ContainerStatus::Missing))
         .count();
-    let version = snapshot.docker_version.as_deref().unwrap_or("?");
+    let version = snapshot.runtime_version.as_deref().unwrap_or("?");
 
     let mut line = format!(
-        "{} {} · {running} running / {stopped} stopped · {service_containers} service {} · docker {version}",
+        "{} {} · {running} running / {stopped} stopped · {service_containers} service {} · {} {version}",
         snapshot.sandbox_count,
         plural(snapshot.sandbox_count, "sandbox", "sandboxes"),
         plural(service_containers, "container", "containers"),
+        snapshot.runtime_name,
     );
     if age.as_secs() >= STALE_AFTER_SECS {
         line.push_str(&format!(" (stale {}s)", age.as_secs()));
@@ -663,8 +615,8 @@ fn plural<'a>(n: usize, singular: &'a str, plural: &'a str) -> &'a str {
 /// resolved one (same rule as `commands::run::warn_on_drift`). A missing label
 /// or a failed inspect is treated as "no drift".
 fn drifted(container: &str, expected: &str) -> bool {
-    match docker::inspect(container, "{{index .Config.Labels \"devsandbox.config_hash\"}}") {
-        Ok(Some(hash)) => !hash.is_empty() && hash != expected,
+    match backend().label(container, "devsandbox.config_hash") {
+        Ok(Some(hash)) => hash != expected,
         _ => false,
     }
 }
@@ -684,16 +636,11 @@ mod tests {
     }
 
     #[test]
-    fn classify_from_ps_lines() {
-        let out = concat!(
-            r#"{"Names":"devsandbox-repo-abc1","Status":"Up 3 minutes","State":"running"}"#,
-            "\n",
-            r#"{"Names":"devsandbox-repo-xyz2","Status":"Exited (0) 1 hour ago","State":"exited"}"#,
-            "\n",
-            "not json\n",
-        );
-        let ps = parse_ps(out);
-        assert_eq!(ps.len(), 2); // bad line skipped
+    fn classify_from_rows() {
+        let ps = vec![
+            ps_line("devsandbox-repo-abc1", "Up 3 minutes", "running"),
+            ps_line("devsandbox-repo-xyz2", "Exited (0) 1 hour ago", "exited"),
+        ];
 
         assert_eq!(
             classify("devsandbox-repo-abc1", &ps),
@@ -706,37 +653,12 @@ mod tests {
         assert_eq!(classify("devsandbox-nope", &ps), ContainerStatus::Missing);
     }
 
-    #[test]
-    fn classify_matches_multiname() {
-        let out =
-            r#"{"Names":"other-name,devsandbox-repo-abc1","Status":"Up 1s","State":"running"}"#;
-        let ps = parse_ps(out);
-        assert_eq!(
-            classify("devsandbox-repo-abc1", &ps),
-            ContainerStatus::Running("Up 1s".into()),
-        );
-    }
-
-    #[test]
-    fn stats_parse_maps_by_name() {
-        let out = concat!(
-            r#"{"Name":"devsandbox-repo-abc1","CPUPerc":"1.20%","MemUsage":"50MiB / 2GiB"}"#,
-            "\n",
-            "garbage\n",
-        );
-        let stats = parse_stats(out);
-        assert_eq!(
-            stats.get("devsandbox-repo-abc1"),
-            Some(&("1.20%".to_string(), "50MiB / 2GiB".to_string())),
-        );
-        assert_eq!(stats.len(), 1);
-    }
-
-    fn ps_line(names: &str, status: &str, state: &str) -> PsLine {
-        PsLine {
-            names: names.to_string(),
+    fn ps_line(name: &str, status: &str, state: &str) -> ContainerRow {
+        ContainerRow {
+            name: name.to_string(),
             status: status.to_string(),
             state: state.to_string(),
+            ..Default::default()
         }
     }
 
@@ -868,14 +790,15 @@ mod tests {
         instances: Vec<InstanceRow>,
         services: Vec<ServiceRow>,
         sandbox_count: usize,
-        docker_version: Option<&str>,
+        runtime_version: Option<&str>,
     ) -> Snapshot {
         Snapshot {
             instances,
             sandboxes: Vec::new(),
             services,
             sandbox_count,
-            docker_version: docker_version.map(str::to_string),
+            runtime_name: "docker",
+            runtime_version: runtime_version.map(str::to_string),
             collected_at: Instant::now(),
             error: None,
         }

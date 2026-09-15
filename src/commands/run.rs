@@ -9,7 +9,7 @@ use crate::config::{
     substitute, Config, LifecycleCommand, MountContext, ResolvedSandbox, SandboxProperties,
     CONFIG_FILE,
 };
-use crate::docker::{self, NAME_PREFIX};
+use crate::runtime::{backend, ServiceEndpoint, NAME_PREFIX};
 use crate::state::{Instance, State};
 
 pub fn run(dir: &Path, sandbox_name: Option<String>, instance_name: Option<String>) -> Result<()> {
@@ -76,14 +76,21 @@ pub fn run(dir: &Path, sandbox_name: Option<String>, instance_name: Option<Strin
     };
     let container_name = format!("{NAME_PREFIX}{instance}");
 
-    // Reuse an existing instance whose container still exists: docker start it
-    // if stopped, refresh config, run postStartCommand, done.
-    let container_status = docker::inspect(&container_name, "{{.State.Running}}")?;
-    if let (true, Some(running)) = (state.instances.contains_key(&instance), &container_status) {
+    // Reuse an existing instance whose container still exists: start it if
+    // stopped, refresh config, run postStartCommand, done.
+    let container_status = backend().is_running(&container_name)?;
+    if let (true, Some(running)) = (state.instances.contains_key(&instance), container_status) {
         warn_on_drift(&container_name, &sandbox.config_hash)?;
-        if running != "true" {
-            docker::run_checked(&["start", &container_name])?;
+        if !running {
+            backend().run_checked(&["start", &container_name])?;
         }
+        // Services may have been recreated with new addresses since the
+        // sandbox was created; refresh how it resolves them.
+        let project = services::project_id(dir)?;
+        let service_names = props.services.clone().unwrap_or_default();
+        let (_, endpoints) =
+            services::ensure_services(&config, dir, &project, &instance, &service_names)?;
+        backend().wire_service_dns(&container_name, &endpoints)?;
         let extensions = props.vscode_extensions().unwrap_or(&[]);
         if !extensions.is_empty() || props.remote_user.is_some() {
             write_vscode_name_config(&container_name, extensions, props.remote_user.as_deref())?;
@@ -112,7 +119,8 @@ pub fn run(dir: &Path, sandbox_name: Option<String>, instance_name: Option<Strin
     // name.
     let project = services::project_id(dir)?;
     let service_names = props.services.clone().unwrap_or_default();
-    let networks = services::ensure_services(&config, dir, &project, &instance, &service_names)?;
+    let (networks, endpoints) =
+        services::ensure_services(&config, dir, &project, &instance, &service_names)?;
 
     // First instance for this base folder mounts it directly; a base folder
     // already live in another instance gets a git worktree so the two containers
@@ -144,7 +152,7 @@ pub fn run(dir: &Path, sandbox_name: Option<String>, instance_name: Option<Strin
     } else {
         None
     };
-    docker_run(
+    run_container(
         dir,
         &sandbox,
         &container_name,
@@ -155,6 +163,7 @@ pub fn run(dir: &Path, sandbox_name: Option<String>, instance_name: Option<Strin
         &mounts,
         &cache_env,
         &networks,
+        &endpoints,
     )?;
     let container = container_name.clone();
 
@@ -233,11 +242,7 @@ fn git_companion_mount(base: &Path) -> String {
 
 /// True when the named container exists and is running.
 fn container_running(container: &str) -> bool {
-    docker::inspect(container, "{{.State.Running}}")
-        .ok()
-        .flatten()
-        .as_deref()
-        == Some("true")
+    backend().is_running(container).ok().flatten() == Some(true)
 }
 
 /// Create a git worktree with a fresh `sandbox/<instance>` branch. Git refuses
@@ -270,19 +275,18 @@ fn create_worktree(base: &Path, worktree: &Path, instance: &str) -> Result<()> {
 /// Warn when the reused container's recorded config hash differs from the
 /// freshly resolved one. Compose containers carry no such label (None) — skip.
 fn warn_on_drift(container: &str, expected: &str) -> Result<()> {
-    let label = docker::inspect(container, "{{index .Config.Labels \"devsandbox.config_hash\"}}")?;
-    if let Some(hash) = label {
-        if !hash.is_empty() && hash != expected {
-            eprintln!(
-                "warning: config for `{container}` changed since it was created; \
-                 remove and re-run to apply changes"
-            );
-        }
+    if let Some(hash) = backend().label(container, "devsandbox.config_hash")?
+        && hash != expected
+    {
+        eprintln!(
+            "warning: config for `{container}` changed since it was created; \
+             remove and re-run to apply changes"
+        );
     }
     Ok(())
 }
 
-fn docker_run(
+fn run_container(
     dir: &Path,
     sandbox: &ResolvedSandbox,
     container: &str,
@@ -293,6 +297,7 @@ fn docker_run(
     mounts: &[String],
     extra_env: &[(String, String)],
     networks: &[String],
+    endpoints: &[ServiceEndpoint],
 ) -> Result<()> {
     let props = &sandbox.properties;
     let image = image_for(dir, sandbox)?;
@@ -325,11 +330,9 @@ fn docker_run(
         args.push("--mount".into());
         args.push(mount.clone());
     }
-    // A container can start on a single `--network`; join the rest afterwards.
-    if let Some(first) = networks.first() {
-        args.push("--network".into());
-        args.push(first.clone());
-    }
+    // Runtimes differ in how many networks a container can start on; the
+    // backend attaches the rest after creation.
+    args.extend(backend().network_run_args(networks));
     if let Some(env) = &props.container_env {
         for (key, value) in env {
             args.push("-e".into());
@@ -345,11 +348,10 @@ fn docker_run(
     args.extend(["sleep".into(), "infinity".into()]);
 
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    docker::run_checked(&arg_refs)?;
+    backend().run_checked(&arg_refs)?;
 
-    for network in networks.iter().skip(1) {
-        docker::run_checked(&["network", "connect", network, container])?;
-    }
+    backend().connect_networks(container, networks)?;
+    backend().wire_service_dns(container, endpoints)?;
     Ok(())
 }
 
@@ -479,35 +481,17 @@ fn image_for(dir: &Path, sandbox: &ResolvedSandbox) -> Result<String> {
         .dockerfile
         .as_deref()
         .with_context(|| format!("sandbox `{}`: `build.dockerfile` is required", sandbox.name))?;
-    let context = build.context.as_deref().unwrap_or(".");
     let tag = format!("{NAME_PREFIX}img-{}", sandbox.name);
-
-    let mut args: Vec<String> = vec![
-        "build".into(),
-        "-t".into(), tag.clone(),
-        "-f".into(), dir.join(dockerfile).to_string_lossy().into_owned(),
-    ];
-    if let Some(build_args) = &build.args {
-        for (key, value) in build_args {
-            args.push("--build-arg".into());
-            args.push(format!("{key}={value}"));
-        }
-    }
-    if let Some(target) = &build.target {
-        args.extend(["--target".into(), target.clone()]);
-    }
-    if let Some(cache_from) = &build.cache_from {
-        for image in cache_from.to_vec() {
-            args.extend(["--cache-from".into(), image.to_string()]);
-        }
-    }
-    if let Some(options) = &build.options {
-        args.extend(options.iter().cloned());
-    }
-    args.push(dir.join(context).to_string_lossy().into_owned());
-
+    let args = services::build_args(
+        backend(),
+        dir,
+        &tag,
+        dockerfile,
+        build,
+        &format!("sandbox `{}`", sandbox.name),
+    );
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    docker::run_checked(&arg_refs)?;
+    backend().run_checked(&arg_refs)?;
     Ok(tag)
 }
 
@@ -527,7 +511,7 @@ fn run_host_commands(dir: &Path, cmd: &LifecycleCommand) -> Result<()> {
     Ok(())
 }
 
-/// Run a lifecycle command inside the container via docker exec.
+/// Run a lifecycle command inside the container via `exec`.
 fn exec_lifecycle(
     container: &str,
     workspace: &str,
@@ -551,7 +535,7 @@ fn exec_lifecycle(
         args.push(container.into());
         args.extend(argv);
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        docker::run_checked(&arg_refs)?;
+        backend().run_checked(&arg_refs)?;
     }
     Ok(())
 }

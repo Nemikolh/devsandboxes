@@ -4,7 +4,7 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 
 use super::resolve_instance;
-use crate::docker;
+use crate::runtime::backend;
 use crate::state::State;
 
 pub fn rm(name: &str) -> Result<()> {
@@ -20,7 +20,7 @@ pub fn rm(name: &str) -> Result<()> {
     let shell_history = info.shell_history.clone();
 
     // Remove the container; ignore failure (it may already be gone).
-    let _ = docker::run_inherit(&["rm", "-f", &container]);
+    let _ = backend().remove_force(&container);
 
     // Drop this instance's managed shell-history file, if any.
     if let Some(path) = shell_history {
@@ -30,17 +30,11 @@ pub fn rm(name: &str) -> Result<()> {
     // Reap this instance's isolated services and its per-instance network. Global
     // services are shared and left to `gc`. Empty `project` = pre-upgrade state.
     if !project.is_empty() {
-        let filter_project = format!("label=devsandbox.project={project}");
-        let filter_instance = format!("label=devsandbox.instance={key}");
-        if let Ok(listing) = docker::output(&[
-            "ps", "-aq", "--filter", &filter_project, "--filter", &filter_instance,
-        ]) {
-            for svc in listing.lines().filter(|l| !l.is_empty()) {
-                let _ = docker::run_inherit(&["rm", "-f", svc]);
-            }
+        for svc in super::stop::service_containers(&project, &key) {
+            let _ = backend().remove_force(&svc);
         }
         let network = crate::commands::services::instance_network(&project, &key);
-        let _ = docker::run_inherit(&["network", "rm", &network]);
+        let _ = backend().run_inherit(&["network", "rm", &network]);
     }
 
     if let Some(worktree) = worktree {
