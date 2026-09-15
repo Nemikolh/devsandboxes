@@ -3,11 +3,13 @@ mod config;
 mod docker;
 mod render;
 mod state;
+mod tui;
 
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(name = "devsandbox", about = "Manage devcontainer-based sandboxes")]
@@ -17,7 +19,7 @@ struct Cli {
     dir: PathBuf,
 
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -64,7 +66,15 @@ enum Command {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    match cli.command {
+    let Some(command) = cli.command else {
+        if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+            return tui::dashboard(&cli.dir);
+        }
+        Cli::command().print_help()?;
+        std::process::exit(2);
+    };
+
+    match command {
         Command::Ls => commands::ls::ls(&cli.dir),
         Command::Ps { all } => commands::ps::ps(all),
         Command::Run { sandbox, name } => commands::run::run(&cli.dir, sandbox, name),
