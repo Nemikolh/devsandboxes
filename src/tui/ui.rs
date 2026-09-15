@@ -16,7 +16,8 @@ use super::data::{
 use super::procs::{ProcState, MESSAGE_ROW};
 use super::prompt::Prompt;
 
-const HIGHLIGHT: Color = Color::Cyan;
+const ACCENT: Color = Color::Rgb(175, 135, 255);
+const SELECTION: Color = Color::Rgb(0, 215, 135);
 
 pub fn draw(frame: &mut Frame, app: &App) {
     // The prompt needs a second bottom line for its candidates/error hint.
@@ -65,7 +66,7 @@ fn draw_tabs(frame: &mut Frame, app: &App, area: Rect) {
     let tabs = Tabs::new(Tab::ALL.iter().map(|t| t.title()))
         .select(selected)
         .style(Style::default())
-        .highlight_style(Style::default().fg(HIGHLIGHT).add_modifier(Modifier::BOLD))
+        .highlight_style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
         .divider(" ");
     frame.render_widget(tabs, tabs_area);
 
@@ -115,7 +116,7 @@ fn draw_services(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_services_empty(frame: &mut Frame, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(HIGHLIGHT))
+        .border_style(Style::default().fg(ACCENT))
         .title(Tab::Services.title());
     let text = Line::from(Span::styled(
         "no services defined in config.toml",
@@ -146,14 +147,14 @@ fn draw_services_table(frame: &mut Frame, app: &App, rows: &[ServiceRow], area: 
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(HIGHLIGHT))
+        .border_style(Style::default().fg(ACCENT))
         .title(Tab::Services.title());
 
     let table = Table::new(table_rows, widths)
         .header(header)
         .block(block)
         .column_spacing(1)
-        .row_highlight_style(Style::default().fg(HIGHLIGHT).add_modifier(Modifier::BOLD));
+        .row_highlight_style(Style::default().fg(SELECTION).add_modifier(Modifier::BOLD));
 
     let mut state = TableState::default().with_selected(Some(app.selected()));
     frame.render_stateful_widget(table, area, &mut state);
@@ -229,7 +230,7 @@ fn service_status_cell(r: &ServiceRow) -> Cell<'static> {
 fn draw_service_detail(frame: &mut Frame, row: Option<&ServiceRow>, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(HIGHLIGHT))
+        .border_style(Style::default().fg(ACCENT))
         .title("Detail");
 
     let Some(r) = row else {
@@ -305,7 +306,7 @@ fn draw_instances(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_empty(frame: &mut Frame, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(HIGHLIGHT))
+        .border_style(Style::default().fg(ACCENT))
         .title(Tab::Instances.title());
     let text = Line::from(Span::styled(
         "no sandboxes defined — check config.toml",
@@ -341,7 +342,7 @@ fn draw_tree(frame: &mut Frame, app: &App, snapshot: &Snapshot, nodes: &[Node], 
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(HIGHLIGHT))
+        .border_style(Style::default().fg(ACCENT))
         .title(Tab::Instances.title());
 
     let table = Table::new(table_rows, widths)
@@ -349,7 +350,7 @@ fn draw_tree(frame: &mut Frame, app: &App, snapshot: &Snapshot, nodes: &[Node], 
         .block(block)
         .column_spacing(1)
         .row_highlight_style(
-            Style::default().fg(HIGHLIGHT).add_modifier(Modifier::BOLD),
+            Style::default().fg(SELECTION).add_modifier(Modifier::BOLD),
         );
 
     let mut state = TableState::default().with_selected(Some(app.selected()));
@@ -423,7 +424,7 @@ fn sandbox_tree_row<'a>(app: &App, snapshot: &Snapshot, sb: &'a SandboxRow) -> R
     Row::new(vec![
         Cell::from(Span::styled(
             format!("{marker} {}", sb.name),
-            Style::default().fg(HIGHLIGHT).add_modifier(Modifier::BOLD),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         )),
         Cell::from(Span::styled(stats, stats_style)),
         Cell::from(""),
@@ -526,7 +527,7 @@ fn status_style(status: &ContainerStatus) -> Style {
 fn draw_detail(frame: &mut Frame, snapshot: Option<&Snapshot>, node: Option<Node>, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(HIGHLIGHT))
+        .border_style(Style::default().fg(ACCENT))
         .title("Detail");
 
     let lines: Vec<Line> = match (snapshot, node) {
@@ -659,7 +660,7 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt, area: Rect) {
 
     let prefix = ": ";
     let line = Line::from(vec![
-        Span::styled(prefix, Style::default().fg(HIGHLIGHT)),
+        Span::styled(prefix, Style::default().fg(ACCENT)),
         Span::raw(prompt.input().to_string()),
     ]);
     frame.render_widget(Paragraph::new(line), input_area);
@@ -691,7 +692,7 @@ fn prompt_candidates_line(prompt: &Prompt) -> Line<'static> {
             spans.push(Span::raw(" "));
         }
         let style = if i == active {
-            Style::default().fg(HIGHLIGHT).add_modifier(Modifier::BOLD)
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
         } else {
             Style::default().add_modifier(Modifier::DIM)
         };
@@ -757,7 +758,7 @@ fn draw_config_modal(frame: &mut Frame, view: &ConfigView) {
 /// unfocused one is dim so the shared column reads as the divider.
 fn pane_block(title: String, focused: bool) -> Block<'static> {
     let border_style = if focused {
-        Style::default().fg(HIGHLIGHT).add_modifier(Modifier::BOLD)
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
     } else {
         Style::default().add_modifier(Modifier::DIM)
     };
@@ -773,7 +774,7 @@ fn draw_text_modal(frame: &mut Frame, view: &TextModal) {
     let area = frame.area();
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(HIGHLIGHT))
+        .border_style(Style::default().fg(ACCENT))
         .title(view.title.clone());
     let paragraph = Paragraph::new(view.body.clone()).block(block).scroll((view.scroll, 0));
     frame.render_widget(ratatui::widgets::Clear, area);
@@ -793,7 +794,7 @@ fn highlight_toml_line(line: &str) -> Line<'static> {
     if trimmed.starts_with('[') {
         return Line::from(Span::styled(
             line.to_string(),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ));
     }
     // Split a `key = value` assignment at the first `=`, styling the key half
@@ -845,7 +846,7 @@ mod tests {
         let header = highlight_toml_line("[sandbox.repo]");
         assert_eq!(header.spans.len(), 1);
         let s = header.spans[0].style;
-        assert_eq!(s.fg, Some(Color::Cyan));
+        assert_eq!(s.fg, Some(ACCENT));
         assert!(s.add_modifier.contains(Modifier::BOLD));
 
         // Comment: dim.
