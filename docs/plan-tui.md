@@ -76,6 +76,9 @@ which live instances reference it. Same table/detail-panel pattern as step 3.
   - `code <instance>` — open VS Code attached to the container:
     reuse `write_vscode_name_config` (run.rs) then
     `code --folder-uri vscode-remote://attached-container+<hex(container)>/<workspace>`,
+    where `hex(container)` is the lowercase hex of the container name's UTF-8
+    bytes (see `hex_encode` in `src/tui/mod.rs`). `code` is spawned detached (no
+    TUI suspend); its outcome shows as a one-line status in the help bar.
   - `rm <instance>`.
 - Execution suspends the TUI (leave alt screen + raw mode), runs the existing command fns
   (`commands::run::run`, `commands::exec::exec`, …) with inherited stdio, waits for a

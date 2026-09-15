@@ -9,6 +9,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::config::Config;
 
 use super::data::Snapshot;
+use super::prompt::{Prompt, PromptAction, COMMANDS};
 
 /// Which side of a [`ConfigView`] is currently shown.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -96,6 +97,13 @@ pub struct App {
     pub snapshot: Option<Snapshot>,
     /// Active overlay, if any.
     pub modal: Modal,
+    /// Command prompt, when open (`:`). Occupies the bottom bar and swallows keys.
+    pub prompt: Option<Prompt>,
+    /// Action awaiting execution by the event loop (it owns the terminal
+    /// suspend + command call, keeping [`App`] I/O-free).
+    pub pending_action: Option<PromptAction>,
+    /// One-line status shown in the help-bar area (e.g. `code` launch outcome).
+    pub status: Option<String>,
     pub should_quit: bool,
 }
 
@@ -107,6 +115,9 @@ impl App {
             selected: [0, 0],
             snapshot: None,
             modal: Modal::None,
+            prompt: None,
+            pending_action: None,
+            status: None,
             should_quit: false,
         }
     }
@@ -179,16 +190,25 @@ impl App {
     /// Apply a key event to the state. No terminal I/O here (the modal open path
     /// reads config/fs, which is local and user-triggered — see [`Self::open_config`]).
     pub fn on_key(&mut self, key: KeyEvent) {
+        // The prompt swallows every key while open, ahead of the modal and the
+        // dashboard bindings.
+        if self.prompt.is_some() {
+            self.on_key_prompt(key);
+            return;
+        }
         // The modal swallows every key while it is up; the tab bar and tables
         // must not react underneath it.
         if let Modal::Config(_) = self.modal {
             self.on_key_modal(key);
             return;
         }
+        // Any dashboard key dismisses a lingering status line.
+        self.status = None;
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('c') if ctrl => self.should_quit = true,
+            KeyCode::Char(':') => self.open_prompt(),
             KeyCode::Tab => self.next_tab(),
             KeyCode::BackTab => self.prev_tab(),
             KeyCode::Char('1') => self.tab = Tab::Instances,
@@ -198,6 +218,121 @@ impl App {
             KeyCode::Enter | KeyCode::Char('e') => self.open_config(),
             _ => {}
         }
+    }
+
+    /// Open the command prompt, loading persisted history. Clears any status.
+    fn open_prompt(&mut self) {
+        self.status = None;
+        self.prompt = Some(Prompt::new(super::prompt::load_history()));
+    }
+
+    /// Key handling while the prompt is open. `esc` cancels, `enter` parses
+    /// (a parse error stays inline and keeps the prompt open), `tab` completes,
+    /// everything else edits the line. Assumes `self.prompt` is `Some`.
+    fn on_key_prompt(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // Candidate lists are read here (config/snapshot) so the prompt stays
+        // data-agnostic; computed only on tab.
+        match key.code {
+            KeyCode::Esc => {
+                self.prompt = None;
+            }
+            KeyCode::Char('c') if ctrl => {
+                self.prompt = None;
+            }
+            KeyCode::Enter => {
+                let Some(prompt) = &mut self.prompt else {
+                    return;
+                };
+                if let Some(action) = prompt.parse() {
+                    let line = prompt.input().to_string();
+                    super::prompt::append_history(&line);
+                    self.pending_action = Some(action);
+                    self.prompt = None;
+                }
+            }
+            KeyCode::Tab => {
+                let instances = self.instance_names();
+                let sandboxes = self.sandbox_names();
+                if let Some(prompt) = &mut self.prompt {
+                    prompt.complete(|idx, first| {
+                        Self::candidates_for(idx, first, &sandboxes, &instances)
+                    });
+                }
+            }
+            KeyCode::Up => {
+                if let Some(prompt) = &mut self.prompt {
+                    prompt.history_prev();
+                }
+            }
+            KeyCode::Down => {
+                if let Some(prompt) = &mut self.prompt {
+                    prompt.history_next();
+                }
+            }
+            KeyCode::Left => self.with_prompt(Prompt::left),
+            KeyCode::Right => self.with_prompt(Prompt::right),
+            KeyCode::Home => self.with_prompt(Prompt::home),
+            KeyCode::End => self.with_prompt(Prompt::end),
+            KeyCode::Backspace => self.with_prompt(Prompt::backspace),
+            KeyCode::Delete => self.with_prompt(Prompt::delete),
+            KeyCode::Char('u') if ctrl => self.with_prompt(Prompt::clear),
+            KeyCode::Char('w') if ctrl => self.with_prompt(Prompt::delete_word),
+            KeyCode::Char(c) if !ctrl => {
+                if let Some(prompt) = &mut self.prompt {
+                    prompt.insert_char(c);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn with_prompt(&mut self, f: impl FnOnce(&mut Prompt)) {
+        if let Some(prompt) = &mut self.prompt {
+            f(prompt);
+        }
+    }
+
+    /// Candidate list for the token at `idx`: command names for the first
+    /// token, then sandbox names for `run` and instance names for the rest.
+    fn candidates_for(
+        idx: usize,
+        first: &str,
+        sandboxes: &[String],
+        instances: &[String],
+    ) -> Vec<String> {
+        if idx == 0 {
+            return COMMANDS.iter().map(|s| s.to_string()).collect();
+        }
+        if idx != 1 {
+            return Vec::new();
+        }
+        match first {
+            "run" => sandboxes.to_vec(),
+            "exec" | "code" | "rm" => instances.to_vec(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Instance names from the latest snapshot (empty until one lands).
+    fn instance_names(&self) -> Vec<String> {
+        self.snapshot
+            .as_ref()
+            .map(|s| s.instances.iter().map(|r| r.name.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Sandbox names from the on-disk config; best-effort (empty on error).
+    fn sandbox_names(&self) -> Vec<String> {
+        match Config::load(&self.dir) {
+            Ok(cfg) => cfg.sandboxes.keys().cloned().collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Take the pending action for the event loop to execute, if any.
+    pub fn take_pending_action(&mut self) -> Option<PromptAction> {
+        self.pending_action.take()
     }
 
     /// Key handling while the config modal is open. Assumes `self.modal` is

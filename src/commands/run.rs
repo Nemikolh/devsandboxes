@@ -556,7 +556,7 @@ fn exec_lifecycle(
 
 /// Register `customizations.vscode.extensions` with the Remote-Containers
 /// extension by writing its per-container-name config file.
-fn write_vscode_name_config(container: &str, extensions: &[String]) -> Result<()> {
+pub(crate) fn write_vscode_name_config(container: &str, extensions: &[String]) -> Result<()> {
     let base = editor_config_base()?;
     // Every installed VS Code-family product keys nameConfigs by container name.
     for product in ["Code", "Cursor", "VSCodium"] {

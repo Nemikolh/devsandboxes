@@ -6,7 +6,15 @@ use super::pick;
 use crate::docker;
 use crate::state::{Instance, State};
 
+/// CLI entry point: run the command, then exit the process with its status.
 pub fn exec(name: &str, interactive: bool, tty: bool, command: &[String]) -> Result<()> {
+    std::process::exit(exec_status(name, interactive, tty, command)?);
+}
+
+/// Run the command inside the matching instance and return its exit code.
+/// Split out of [`exec`] so callers that must not terminate the process (the
+/// dashboard prompt) can reuse it.
+pub fn exec_status(name: &str, interactive: bool, tty: bool, command: &[String]) -> Result<i32> {
     let state = State::load()?;
 
     // <name> may be an instance name, a sandbox config name, or a repository
@@ -56,5 +64,5 @@ pub fn exec(name: &str, interactive: bool, tty: bool, command: &[String]) -> Res
     args.push(instance.container.clone());
     args.extend(command.iter().cloned());
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    std::process::exit(docker::run_inherit(&arg_refs)?);
+    docker::run_inherit(&arg_refs)
 }

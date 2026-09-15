@@ -10,20 +10,27 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, 
 
 use super::app::{App, ConfigView, Modal, Side, Tab};
 use super::data::{humanize_secs, ContainerStatus, InstanceRow, ServiceRow};
+use super::prompt::Prompt;
 
 const HIGHLIGHT: Color = Color::Cyan;
 
 pub fn draw(frame: &mut Frame, app: &App) {
-    let [tab_area, content_area, help_area] = Layout::vertical([
+    // The prompt needs a second bottom line for its candidates/error hint.
+    let bottom = if app.prompt.is_some() { 2 } else { 1 };
+    let [tab_area, content_area, bottom_area] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(0),
-        Constraint::Length(1),
+        Constraint::Length(bottom),
     ])
     .areas(frame.area());
 
     draw_tabs(frame, app, tab_area);
     draw_content(frame, app, content_area);
-    draw_help(frame, app, help_area);
+    if let Some(prompt) = &app.prompt {
+        draw_prompt(frame, prompt, bottom_area);
+    } else {
+        draw_help(frame, app, bottom_area);
+    }
 
     // The config modal draws over everything, using the full frame.
     if let Modal::Config(view) = &app.modal {
@@ -402,12 +409,75 @@ fn kv2<'a>(k1: &'a str, v1: &str, k2: &'a str, v2: &str) -> Line<'a> {
 }
 
 fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
+    // A status line (e.g. `code` outcome) preempts the help hint until the
+    // next key clears it.
+    if let Some(status) = &app.status {
+        let line = Line::from(Span::styled(
+            status.clone(),
+            Style::default().fg(Color::Yellow),
+        ));
+        frame.render_widget(Paragraph::new(line), area);
+        return;
+    }
     let text = match app.modal {
         Modal::Config(_) => "tab original/resolved · ↑↓ scroll · pgup/pgdn · g/G · esc close",
-        Modal::None => "q quit · tab switch tab · ↑↓ select · enter/e config",
+        Modal::None => "q quit · tab switch tab · ↑↓ select · enter/e config · : command",
     };
     let help = Line::from(text).style(Style::default().add_modifier(Modifier::DIM));
     frame.render_widget(Paragraph::new(help), area);
+}
+
+/// Render the command prompt in the bottom bar: `: <input>` on the first line
+/// with the caret placed via `set_cursor_position`, and a second hint line for
+/// completion candidates or a red parse error.
+fn draw_prompt(frame: &mut Frame, prompt: &Prompt, area: Rect) {
+    let [input_area, hint_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(area);
+
+    let prefix = ": ";
+    let line = Line::from(vec![
+        Span::styled(prefix, Style::default().fg(HIGHLIGHT)),
+        Span::raw(prompt.input().to_string()),
+    ]);
+    frame.render_widget(Paragraph::new(line), input_area);
+
+    // Caret: prefix width + cursor char offset, clamped to the area.
+    let col = input_area.x + prefix.len() as u16 + prompt.cursor() as u16;
+    frame.set_cursor_position((col.min(input_area.right().saturating_sub(1)), input_area.y));
+
+    // Hint line: parse error (red) takes precedence over completion candidates.
+    let hint = if let Some(err) = &prompt.error {
+        Line::from(Span::styled(err.clone(), Style::default().fg(Color::Red)))
+    } else {
+        prompt_candidates_line(prompt)
+    };
+    frame.render_widget(Paragraph::new(hint), hint_area);
+}
+
+/// Completion-candidate hint: candidates space-joined, the active one bold cyan.
+/// Empty line when no cycle is in flight.
+fn prompt_candidates_line(prompt: &Prompt) -> Line<'static> {
+    let candidates = prompt.candidates();
+    if candidates.is_empty() {
+        return Line::from(String::new());
+    }
+    let active = prompt.cycle_index();
+    let mut spans: Vec<Span> = Vec::new();
+    for (i, cand) in candidates.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw(" "));
+        }
+        let style = if i == active {
+            Style::default().fg(HIGHLIGHT).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().add_modifier(Modifier::DIM)
+        };
+        spans.push(Span::styled(cand.clone(), style));
+    }
+    Line::from(spans)
 }
 
 /// Render the config explorer full-screen over the dashboard.

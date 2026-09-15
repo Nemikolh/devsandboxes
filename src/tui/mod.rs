@@ -6,9 +6,10 @@
 
 mod app;
 mod data;
+mod prompt;
 mod ui;
 
-use std::io::{self, Stdout};
+use std::io::{self, Stdout, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
@@ -22,8 +23,12 @@ use crossterm::execute;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
+use crate::commands;
+use crate::config::Config;
+
 use app::App;
 use data::Snapshot;
+use prompt::PromptAction;
 
 /// How long each `event::poll` blocks before we redraw. A future step adds a
 /// 2s data-refresh tick; the loop is structured so that branch drops in easily.
@@ -89,6 +94,24 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
             }
         }
 
+        // A prompt command is ready: suspend the TUI (or, for `code`, just
+        // launch it), then force a redraw + immediate refresh on return.
+        if let Some(action) = app.take_pending_action() {
+            match action {
+                PromptAction::Code { instance } => {
+                    app.status = Some(launch_code(&dir, &app, &instance));
+                }
+                other => {
+                    run_suspended(terminal, &dir, other)?;
+                    // Redraw from scratch: the child scribbled over the screen.
+                    terminal.clear()?;
+                    // Refresh data now rather than waiting for the next tick.
+                    last_tick = Instant::now();
+                    pending = Some(spawn_collect(&dir));
+                }
+            }
+        }
+
         // Drain a finished collection into the app, freeing the in-flight slot.
         if let Some(rx) = &pending {
             match rx.try_recv() {
@@ -113,6 +136,95 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
     Ok(())
 }
 
+/// Leave the TUI, run a prompt command with inherited stdio, wait for one
+/// keypress, then re-enter the TUI. Command errors are printed (not propagated)
+/// so a failed `run`/`exec`/`rm` returns the user to the dashboard.
+fn run_suspended(terminal: &mut Term, dir: &Path, action: PromptAction) -> Result<()> {
+    restore();
+
+    let result = match &action {
+        PromptAction::Run { sandbox, name } => {
+            commands::run::run(dir, Some(sandbox.clone()), name.clone())
+        }
+        PromptAction::Exec { instance, argv } => {
+            commands::exec::exec_status(instance, true, true, argv).map(|_| ())
+        }
+        PromptAction::Rm { instance } => commands::rm::rm(instance),
+        // `code` never suspends; handled by the caller.
+        PromptAction::Code { .. } => Ok(()),
+    };
+    if let Err(e) = result {
+        eprintln!("error: {e:#}");
+    }
+
+    print!("\r\n\x1b[2mpress any key to return\x1b[0m");
+    let _ = io::stdout().flush();
+    // Raw mode first: cooked mode is line-buffered, so "any key" would
+    // otherwise need an Enter before the event arrives.
+    enable_raw_mode()?;
+    wait_for_key();
+
+    // Re-enter: the outer setup already ran once; re-arm the alt screen.
+    execute!(io::stdout(), EnterAlternateScreen)?;
+    terminal.hide_cursor()?;
+    Ok(())
+}
+
+/// Block until the next key press (consuming it), ignoring release/repeat.
+fn wait_for_key() {
+    loop {
+        match event::read() {
+            Ok(Event::Key(key)) if key.kind == event::KeyEventKind::Press => break,
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+}
+
+/// Launch VS Code attached to the selected instance's container, detached.
+/// Best-effort: writes the extensions name-config, then spawns `code`. Returns
+/// a one-line status (error text on failure) for the help-bar.
+fn launch_code(dir: &Path, app: &App, instance: &str) -> String {
+    let Some(snapshot) = &app.snapshot else {
+        return format!("code: no data yet for `{instance}`");
+    };
+    let Some(row) = snapshot.instances.iter().find(|r| r.name == instance) else {
+        return format!("code: unknown instance `{instance}`");
+    };
+
+    // Extensions come from the resolved sandbox; failure to resolve is
+    // non-fatal — attach still works, just without registering extensions.
+    let extensions: Vec<String> = Config::load(dir)
+        .ok()
+        .and_then(|cfg| cfg.resolve_sandbox(&row.sandbox).ok())
+        .and_then(|sb| sb.properties.vscode_extensions().map(<[String]>::to_vec))
+        .unwrap_or_default();
+    let _ = commands::run::write_vscode_name_config(&row.container, &extensions);
+
+    let uri = format!(
+        "vscode-remote://attached-container+{}/{}",
+        hex_encode(&row.container),
+        row.workspace
+    );
+    match std::process::Command::new("code")
+        .args(["--folder-uri", &uri])
+        .spawn()
+    {
+        Ok(_) => format!("opening VS Code → {instance}"),
+        Err(e) => format!("code: failed to launch (`code` on PATH?): {e}"),
+    }
+}
+
+/// Lowercase hex of a string's UTF-8 bytes, as the Remote-Containers URI wants.
+fn hex_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 2);
+    for b in s.bytes() {
+        out.push(char::from_digit((b >> 4) as u32, 16).unwrap());
+        out.push(char::from_digit((b & 0xf) as u32, 16).unwrap());
+    }
+    out
+}
+
 /// Spawn a detached thread that collects one [`Snapshot`] and sends it back.
 /// The receiver is polled from the event loop, keeping [`App`] I/O-free.
 fn spawn_collect(dir: &Path) -> Receiver<Snapshot> {
@@ -123,4 +235,17 @@ fn spawn_collect(dir: &Path) -> Receiver<Snapshot> {
         let _ = tx.send(data::collect(&dir));
     });
     rx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::hex_encode;
+
+    #[test]
+    fn hex_encodes_container_name() {
+        // Lowercase hex of the UTF-8 bytes, matching the attach URI format.
+        assert_eq!(hex_encode("devsandbox-web"), "64657673616e64626f782d776562");
+        assert_eq!(hex_encode(""), "");
+        assert_eq!(hex_encode("A/z"), "412f7a");
+    }
 }
