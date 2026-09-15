@@ -47,6 +47,18 @@ fn resolve_instance_with(state: &State, name: &str, interactive: bool) -> Result
     }
 }
 
+/// Yes/no prompt on stderr; `false` on a non-TTY. Shared by `rm` and `gc`.
+pub(crate) fn confirm(prompt: &str) -> Result<bool> {
+    if !std::io::stdin().is_terminal() {
+        return Ok(false);
+    }
+    eprint!("{prompt} [y/N] ");
+    std::io::stderr().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    Ok(matches!(answer.trim(), "y" | "Y" | "yes"))
+}
+
 /// Numbered menu on stderr; returns the selected index.
 pub(crate) fn pick(prompt: &str, options: &[&str]) -> Result<usize> {
     eprintln!("{prompt}:");

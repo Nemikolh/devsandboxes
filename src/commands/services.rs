@@ -286,8 +286,9 @@ fn check_port_conflicts(container: &str, ports: &[String]) -> Result<()> {
 
 /// Stop and remove service containers of this project that no live sandbox
 /// instance references, and networks nothing needs. Refcounting is derived from
-/// state + the runtime, never stored.
-pub fn gc(dir: &Path) -> Result<()> {
+/// state + the runtime, never stored. Also reaps orphaned managed shell-history
+/// files (confirmed per file unless `force`).
+pub fn gc(dir: &Path, force: bool) -> Result<()> {
     let project = project_id(dir)?;
     let config = Config::load(dir).unwrap_or_default();
     let state = State::load()?;
@@ -368,6 +369,40 @@ pub fn gc(dir: &Path) -> Result<()> {
 
     if removed == 0 {
         println!("no unused services to remove");
+    }
+
+    gc_shell_history(dir, &state, force)?;
+    Ok(())
+}
+
+/// Delete `shared-volumes/history/<instance>.zsh_history` files whose instance
+/// is gone from state (any config root: instance names are global, so a match
+/// anywhere means the file is still owned). Kept on `rm` so history survives
+/// rebuilds; this is the explicit reaping path. Confirmed per file unless
+/// `force`.
+fn gc_shell_history(dir: &Path, state: &State, force: bool) -> Result<()> {
+    let history_dir = dir.join("shared-volumes").join("history");
+    let Ok(entries) = std::fs::read_dir(&history_dir) else {
+        return Ok(()); // never provisioned
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(instance) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_suffix(".zsh_history"))
+        else {
+            continue;
+        };
+        if state.instances.contains_key(instance) {
+            continue;
+        }
+        if !force && !super::confirm(&format!("delete shell history `{}`?", path.display()))? {
+            continue;
+        }
+        std::fs::remove_file(&path)
+            .with_context(|| format!("cannot remove {}", path.display()))?;
+        println!("removed history {}", path.display());
     }
     Ok(())
 }

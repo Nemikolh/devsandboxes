@@ -1,9 +1,8 @@
-use std::io::{IsTerminal, Write};
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 
-use super::resolve_instance;
+use super::{confirm, resolve_instance};
 use crate::runtime::backend;
 use crate::state::State;
 
@@ -71,13 +70,3 @@ fn remove_worktree(base: &Path, worktree: &Path) -> Result<()> {
     Ok(())
 }
 
-fn confirm(prompt: &str) -> Result<bool> {
-    if !std::io::stdin().is_terminal() {
-        return Ok(false);
-    }
-    eprint!("{prompt} [y/N] ");
-    std::io::stderr().flush()?;
-    let mut answer = String::new();
-    std::io::stdin().read_line(&mut answer)?;
-    Ok(matches!(answer.trim(), "y" | "Y" | "yes"))
-}

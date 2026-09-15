@@ -51,8 +51,13 @@ enum Command {
         /// Instance name, sandbox config name, or repository folder name
         name: String,
     },
-    /// Remove shared services no live instance references
-    Gc,
+    /// Remove shared services no live instance references and orphaned
+    /// shell-history files
+    Gc {
+        /// Delete orphaned shell-history files without asking
+        #[arg(long)]
+        force: bool,
+    },
     /// Run a command in a sandbox instance
     Exec {
         /// Keep stdin open
@@ -86,7 +91,7 @@ fn main() -> Result<()> {
         Command::Run { sandbox, name } => commands::run::run(&cli.dir, sandbox, name),
         Command::Rm { name } => commands::rm::rm(&name),
         Command::Stop { name } => commands::stop::stop(&name),
-        Command::Gc => commands::services::gc(&cli.dir),
+        Command::Gc { force } => commands::services::gc(&cli.dir, force),
         Command::Exec { interactive, tty, name, command } => {
             commands::exec::exec(&name, interactive, tty, &command)
         }

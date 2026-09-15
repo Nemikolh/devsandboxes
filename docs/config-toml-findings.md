@@ -36,7 +36,8 @@ shared pnpm/cargo caches. Minimum viable support:
 Implemented via a `persist-shell-history` knob: a per-instance file under
 `${configDir}/shared-volumes/history/` is provisioned, bind-mounted to
 `/root/.zsh_history`, recorded in state, and kept on `rm` so a rebuilt
-same-name instance inherits its history. Original notes below.
+same-name instance inherits its history. Orphaned files are reaped by `gc`
+(confirmed per file, or unconditionally with `--force`). Original notes below.
 
 The user wants `.zsh_history` persisted but unique per sandbox. Since instances
 already have deterministic names, devsandbox can own this end to end:
