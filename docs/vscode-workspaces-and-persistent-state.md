@@ -48,7 +48,7 @@ mounts = [
 ```
 
 - Missing bind sources are auto-created on first run (dot-less basename → dir).
-- Unlike `persist-shell-history`, `rm` does **not** delete these dirs: sessions
-  survive removal and revive when a same-name instance is re-created.
+- Like `persist-shell-history` files, `rm` does **not** delete these dirs:
+  sessions survive removal and revive when a same-name instance is re-created.
 - Existing containers pick mount changes up only on recreate; copy
   `/root/.zidane` out of a live container first if its sessions matter.

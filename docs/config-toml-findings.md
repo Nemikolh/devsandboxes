@@ -35,7 +35,8 @@ shared pnpm/cargo caches. Minimum viable support:
 ## 2. Managed per-instance shell history (feature) — DONE
 Implemented via a `persist-shell-history` knob: a per-instance file under
 `${configDir}/shared-volumes/history/` is provisioned, bind-mounted to
-`/root/.zsh_history`, recorded in state, and deleted on `rm`. Original notes below.
+`/root/.zsh_history`, recorded in state, and kept on `rm` so a rebuilt
+same-name instance inherits its history. Original notes below.
 
 The user wants `.zsh_history` persisted but unique per sandbox. Since instances
 already have deterministic names, devsandbox can own this end to end:
@@ -45,7 +46,8 @@ already have deterministic names, devsandbox can own this end to end:
 - Gate with a `persist-shell-history` knob on the sandbox/template (a real,
   known field — `deny_unknown_fields` rejects unknown keys today, so this must
   be added to `SandboxProperties`).
-- `rm` should delete the instance's history file.
+- `rm` should delete the instance's history file. (Revised: it is kept, so
+  history survives rm + run rebuilds.)
 
 ## 3. `mounts`/env for compose sandboxes — OBSOLETE
 Resolved by removal: `dockerComposeFile`/`service`/`runServices` and the compose

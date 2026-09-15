@@ -517,6 +517,7 @@ fn resolve_caches(
 /// Provision this instance's managed `.zsh_history` under
 /// `${configDir}/shared-volumes/history/<instance>.zsh_history` (touched so the
 /// bind mounts as a file, not a directory) and return (host path, `--mount` arg).
+/// An existing file is reused untouched, so history survives rm + run rebuilds.
 fn provision_shell_history(dir: &Path, instance: &str) -> Result<(PathBuf, String)> {
     let config_dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
     let path = config_dir

@@ -28,7 +28,8 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<PathBuf>,
     /// Host path of this instance's managed `.zsh_history`, when
-    /// `persist-shell-history` is on. Removed with the instance.
+    /// `persist-shell-history` is on. Kept on `rm` so a rebuilt instance with
+    /// the same name inherits its history.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shell_history: Option<PathBuf>,
     /// Workspace folder inside the container.

@@ -17,15 +17,12 @@ pub fn rm(name: &str) -> Result<()> {
     let worktree = info.worktree.clone();
     let base_folder = info.base_folder.clone();
     let project = info.project.clone();
-    let shell_history = info.shell_history.clone();
 
     // Remove the container; ignore failure (it may already be gone).
     let _ = backend().remove_force(&container);
 
-    // Drop this instance's managed shell-history file, if any.
-    if let Some(path) = shell_history {
-        let _ = std::fs::remove_file(path);
-    }
+    // The managed shell-history file is deliberately kept: `run` re-provisions
+    // the same per-instance path, so history survives an rm + run rebuild.
 
     // Reap this instance's isolated services and its per-instance network. Global
     // services are shared and left to `gc`. Empty `project` = pre-upgrade state.
