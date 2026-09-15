@@ -24,6 +24,7 @@ Tables (Instances / Services)
   ↑/k ↓/j     move selection
   →/space     expand   ←  collapse / jump to parent
   enter, e    open config explorer
+  r           run sandbox      o   open in VS Code (Instances)
   l           logs (Instances tab)
 
 Config modal
@@ -391,6 +392,8 @@ impl App {
             KeyCode::Char(' ') if self.tab == Tab::Instances => self.tree_toggle(),
             KeyCode::Left if self.tab == Tab::Instances => self.tree_collapse(),
             KeyCode::Enter | KeyCode::Char('e') => self.open_config(),
+            KeyCode::Char('r') if self.tab == Tab::Instances => self.open_run_prompt(),
+            KeyCode::Char('o') if self.tab == Tab::Instances => self.attach_code(),
             KeyCode::Char('l') => self.open_logs(),
             KeyCode::Char('?') => self.open_help(),
             _ => {}
@@ -401,6 +404,45 @@ impl App {
     fn open_prompt(&mut self) {
         self.status = None;
         self.prompt = Some(Prompt::new(super::prompt::load_history()));
+    }
+
+    /// `r` (Instances tab): open the prompt pre-filled `run <sandbox> ` for the
+    /// sandbox under the cursor (a sandbox / empty node's sandbox, or the sandbox
+    /// behind an instance). The orphan group, its children, and no selection fall
+    /// back to a plain empty prompt (identical to `:`).
+    fn open_run_prompt(&mut self) {
+        self.status = None;
+        let sandbox = self.snapshot.as_ref().and_then(|snapshot| {
+            match self.selected_node() {
+                Some(Node::Sandbox(i)) | Some(Node::Empty(i)) => {
+                    snapshot.sandboxes.get(i).map(|s| s.name.clone())
+                }
+                Some(Node::Instance(i)) => snapshot.instances.get(i).map(|r| r.sandbox.clone()),
+                Some(Node::Orphans) | None => None,
+            }
+        });
+        let history = super::prompt::load_history();
+        self.prompt = Some(match sandbox {
+            Some(name) => Prompt::with_input(history, format!("run {name} ")),
+            None => Prompt::new(history),
+        });
+    }
+
+    /// `o` (Instances tab): VS Code attach for the instance under the cursor,
+    /// routed through the same [`PromptAction::Code`] path the `code` command
+    /// uses. Works for orphan-group instance children too; a no-op on
+    /// sandbox / empty / orphan-group nodes.
+    fn attach_code(&mut self) {
+        let Some(Node::Instance(i)) = self.selected_node() else {
+            return;
+        };
+        let Some(snapshot) = &self.snapshot else {
+            return;
+        };
+        let Some(row) = snapshot.instances.get(i) else {
+            return;
+        };
+        self.pending_action = Some(PromptAction::Code { instance: row.name.clone() });
     }
 
     /// Key handling while the prompt is open. `esc` cancels, `enter` parses
@@ -1007,6 +1049,147 @@ mod tests {
         app.tab = Tab::Services;
         app.on_key(key(KeyCode::Char('l')));
         assert!(matches!(app.modal, Modal::None));
+    }
+
+    /// A snapshot with no configured sandboxes and one instance whose sandbox is
+    /// not in config, so it groups under the orphan node:
+    /// tree = [Orphans, Instance(0)].
+    fn orphan_snapshot() -> Snapshot {
+        use super::super::data::{ContainerStatus, InstanceRow};
+        let instances = vec![InstanceRow {
+            name: "orphan0".into(),
+            sandbox: "gone".into(),
+            container: "devsandbox-orphan0".into(),
+            status: ContainerStatus::Missing,
+            uptime_secs: 0,
+            cpu: None,
+            mem: None,
+            folder: "/f".into(),
+            worktree: false,
+            services: Vec::new(),
+            workspace: "/w".into(),
+            remote_user: None,
+            remote_env_len: 0,
+            base_folder: "/f".into(),
+            drift: false,
+        }];
+        Snapshot {
+            instances,
+            sandboxes: Vec::new(),
+            services: Vec::new(),
+            sandbox_count: 0,
+            docker_version: None,
+            collected_at: std::time::Instant::now(),
+            error: None,
+        }
+    }
+
+    fn prompt(app: &App) -> &Prompt {
+        app.prompt.as_ref().expect("prompt open")
+    }
+
+    #[test]
+    fn r_on_sandbox_prefills_run() {
+        let mut app = new_app();
+        app.set_snapshot(snapshot_with(1)); // [Sandbox(0), inst0], cursor on sandbox
+        app.on_key(key(KeyCode::Char('r')));
+        let p = prompt(&app);
+        assert_eq!(p.input(), "run s ");
+        // Cursor at the end (6 chars).
+        assert_eq!(p.cursor(), "run s ".chars().count());
+    }
+
+    #[test]
+    fn r_on_empty_marker_prefills_run() {
+        let mut app = new_app();
+        app.set_snapshot(snapshot_with(0)); // [Sandbox(0), Empty(0)]
+        app.on_key(key(KeyCode::Down)); // onto Empty(0)
+        assert_eq!(app.selected_node(), Some(Node::Empty(0)));
+        app.on_key(key(KeyCode::Char('r')));
+        assert_eq!(prompt(&app).input(), "run s ");
+    }
+
+    #[test]
+    fn r_on_instance_prefills_parent_sandbox() {
+        let mut app = new_app();
+        app.set_snapshot(snapshot_with(2)); // [Sandbox(0), inst0, inst1]
+        app.on_key(key(KeyCode::Down)); // onto inst0
+        assert_eq!(app.selected_node(), Some(Node::Instance(0)));
+        app.on_key(key(KeyCode::Char('r')));
+        assert_eq!(prompt(&app).input(), "run s ");
+    }
+
+    #[test]
+    fn r_on_orphans_gives_empty_prompt() {
+        let mut app = new_app();
+        app.set_snapshot(orphan_snapshot()); // [Orphans, inst0], cursor on Orphans
+        assert_eq!(app.selected_node(), Some(Node::Orphans));
+        app.on_key(key(KeyCode::Char('r')));
+        assert_eq!(prompt(&app).input(), "");
+    }
+
+    #[test]
+    fn r_with_no_snapshot_gives_empty_prompt() {
+        let mut app = new_app();
+        app.on_key(key(KeyCode::Char('r')));
+        assert_eq!(prompt(&app).input(), "");
+    }
+
+    #[test]
+    fn prefilled_prompt_history_up_stashes_prefill() {
+        // Seed one history entry, prefill, then Up shows history and Down restores
+        // the prefill as the stashed live line.
+        let mut app = new_app();
+        app.set_snapshot(snapshot_with(1));
+        app.prompt = Some(Prompt::with_input(vec!["run other".into()], "run s ".into()));
+        app.on_key(key(KeyCode::Up));
+        assert_eq!(prompt(&app).input(), "run other");
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(prompt(&app).input(), "run s ");
+    }
+
+    #[test]
+    fn o_on_instance_sets_pending_code() {
+        let mut app = new_app();
+        app.set_snapshot(snapshot_with(1)); // [Sandbox(0), inst0]
+        app.on_key(key(KeyCode::Down)); // onto inst0
+        app.on_key(key(KeyCode::Char('o')));
+        assert_eq!(
+            app.take_pending_action(),
+            Some(PromptAction::Code { instance: "inst0".into() }),
+        );
+    }
+
+    #[test]
+    fn o_on_orphan_instance_sets_pending_code() {
+        let mut app = new_app();
+        app.set_snapshot(orphan_snapshot()); // [Orphans, orphan0]
+        app.on_key(key(KeyCode::Down)); // onto orphan0
+        assert_eq!(app.selected_node(), Some(Node::Instance(0)));
+        app.on_key(key(KeyCode::Char('o')));
+        assert_eq!(
+            app.take_pending_action(),
+            Some(PromptAction::Code { instance: "orphan0".into() }),
+        );
+    }
+
+    #[test]
+    fn o_on_sandbox_is_noop() {
+        let mut app = new_app();
+        app.set_snapshot(snapshot_with(1)); // cursor on Sandbox(0)
+        app.on_key(key(KeyCode::Char('o')));
+        assert_eq!(app.take_pending_action(), None);
+    }
+
+    #[test]
+    fn r_and_o_ignored_on_services_tab() {
+        let mut app = new_app();
+        app.set_snapshot(snapshot_with(1));
+        app.tab = Tab::Services;
+        app.on_key(key(KeyCode::Char('r')));
+        assert!(app.prompt.is_none());
+        app.on_key(key(KeyCode::Char('o')));
+        assert_eq!(app.take_pending_action(), None);
     }
 
     #[test]

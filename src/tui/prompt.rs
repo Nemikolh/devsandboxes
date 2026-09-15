@@ -70,6 +70,22 @@ impl Prompt {
         }
     }
 
+    /// Construct a prompt pre-filled with `text`, cursor at the end. The prefill
+    /// is treated as the live in-progress line, so history navigation stashes and
+    /// restores it like anything typed by hand.
+    pub fn with_input(history: Vec<String>, text: String) -> Self {
+        let cursor = text.chars().count();
+        Self {
+            input: text,
+            cursor,
+            history,
+            hist_idx: None,
+            stash: String::new(),
+            completion: None,
+            error: None,
+        }
+    }
+
     pub fn input(&self) -> &str {
         &self.input
     }

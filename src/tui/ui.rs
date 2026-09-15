@@ -597,7 +597,10 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
         Modal::Config(_) => "tab original/resolved · ↑↓ scroll · pgup/pgdn · g/G · esc close",
         Modal::Help(_) => "↑↓ scroll · pgup/pgdn · g/G · esc/? close",
         Modal::Logs(_) => "↑↓ scroll · pgup/pgdn · g/G · esc close",
-        Modal::None => "q quit · tab switch · ↑↓ select · ←→ collapse/expand · space toggle · enter config · l logs · : cmd · ? help",
+        Modal::None => match app.tab {
+            Tab::Instances => "q quit · tab switch · ↑↓ select · ←→ fold · enter config · r run · o vscode · l logs · : cmd · ? help",
+            Tab::Services => "q quit · tab switch · ↑↓ select · enter config · : cmd · ? help",
+        },
     };
     let help = Line::from(text).style(Style::default().add_modifier(Modifier::DIM));
     frame.render_widget(Paragraph::new(help), area);
