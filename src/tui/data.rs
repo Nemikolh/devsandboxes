@@ -9,7 +9,8 @@ use std::time::Instant;
 
 use serde::Deserialize;
 
-use crate::config::Config;
+use crate::commands::services::{isolated_service_container, project_id, service_container};
+use crate::config::{Config, ServiceScope};
 use crate::docker::{self, NAME_PREFIX};
 use crate::state::{Instance, State};
 
@@ -56,11 +57,35 @@ pub struct InstanceRow {
     pub drift: bool,
 }
 
+/// One service row, everything the Services view needs pre-joined.
+#[derive(Clone, Debug)]
+pub struct ServiceRow {
+    pub name: String,
+    /// `"global"` or `"isolated"`.
+    pub scope: &'static str,
+    /// Like `ResolvedSandbox::source`: `image X` / `dockerfile Y`, or `?` when
+    /// the service failed to resolve.
+    pub source: String,
+    pub ports: Vec<String>,
+    /// Backing containers (one for global, one per referencing instance for
+    /// isolated) with their liveness.
+    pub containers: Vec<(String, ContainerStatus)>,
+    /// Instance names whose resolved sandbox lists this service.
+    pub used_by: Vec<String>,
+    /// Number of `env` entries in the service spec (`0` when unresolved).
+    pub env_len: usize,
+    /// Service command, if set.
+    pub command: Option<String>,
+    /// Short config hash, empty when unresolved.
+    pub config_hash: String,
+}
+
 /// A point-in-time view of instances plus any collection error (docker/config
 /// unavailable). Rows are always present from state even when docker is down.
 #[derive(Clone, Debug)]
 pub struct Snapshot {
     pub instances: Vec<InstanceRow>,
+    pub services: Vec<ServiceRow>,
     /// When collection finished. Reserved for staleness display (later steps);
     /// carried now so the collect/receive plumbing is stable.
     #[allow(dead_code)]
@@ -88,6 +113,109 @@ struct StatsLine {
     cpu: String,
     #[serde(rename = "MemUsage")]
     mem: String,
+}
+
+/// Pre-extracted service definition fed into [`build_service_rows`]. Keeping the
+/// join pure (no docker, no `ResolvedService`) makes it unit-testable: `collect`
+/// fills these from `Config::resolve_service`, tests construct them directly.
+struct ServiceInput {
+    name: String,
+    /// `Some` when the service resolved; `None` when it failed (row renders with
+    /// source `?`, scope defaulting to isolated).
+    resolved: Option<ResolvedServiceInput>,
+}
+
+/// The resolved half of a [`ServiceInput`].
+struct ResolvedServiceInput {
+    scope: ServiceScope,
+    source: String,
+    ports: Vec<String>,
+    env_len: usize,
+    command: Option<String>,
+    config_hash: String,
+}
+
+/// Source description for a service, mirroring `ResolvedSandbox::source`.
+fn service_source(spec: &crate::config::Service) -> String {
+    if let Some(image) = &spec.image {
+        return format!("image {image}");
+    }
+    if let Some(dockerfile) = spec.build.as_ref().and_then(|b| b.dockerfile.as_deref()) {
+        return format!("dockerfile {dockerfile}");
+    }
+    "?".into()
+}
+
+/// Join config services against docker state. Pure: all docker/config I/O is
+/// done by the caller and passed in. `project` scopes container names;
+/// `instance_services` pairs every live instance name with the service list of
+/// its resolved sandbox.
+fn build_service_rows(
+    project: &str,
+    services: &[ServiceInput],
+    instance_services: &[(String, Vec<String>)],
+    ps: &[PsLine],
+) -> Vec<ServiceRow> {
+    services
+        .iter()
+        .map(|svc| {
+            let used_by: Vec<String> = instance_services
+                .iter()
+                .filter(|(_, list)| list.iter().any(|s| s == &svc.name))
+                .map(|(inst, _)| inst.clone())
+                .collect();
+
+            let (scope, source, ports, env_len, command, config_hash) = match &svc.resolved {
+                Some(r) => (
+                    r.scope,
+                    r.source.clone(),
+                    r.ports.clone(),
+                    r.env_len,
+                    r.command.clone(),
+                    r.config_hash.clone(),
+                ),
+                None => (
+                    ServiceScope::Isolated,
+                    "?".to_string(),
+                    Vec::new(),
+                    0,
+                    None,
+                    String::new(),
+                ),
+            };
+
+            let containers: Vec<(String, ContainerStatus)> = match scope {
+                ServiceScope::Global => {
+                    let c = service_container(project, &svc.name);
+                    let status = classify(&c, ps);
+                    vec![(c, status)]
+                }
+                ServiceScope::Isolated => used_by
+                    .iter()
+                    .map(|inst| {
+                        let c = isolated_service_container(project, inst, &svc.name);
+                        let status = classify(&c, ps);
+                        (c, status)
+                    })
+                    .collect(),
+            };
+
+            ServiceRow {
+                name: svc.name.clone(),
+                scope: match scope {
+                    ServiceScope::Global => "global",
+                    ServiceScope::Isolated => "isolated",
+                },
+                source,
+                ports,
+                containers,
+                used_by,
+                env_len,
+                command,
+                config_hash,
+            }
+        })
+        .collect()
 }
 
 /// Classify a container by name against parsed `docker ps` lines. `docker ps`
@@ -155,6 +283,7 @@ pub fn collect(dir: &Path) -> Snapshot {
         Err(e) => {
             return Snapshot {
                 instances: Vec::new(),
+                services: Vec::new(),
                 collected_at,
                 error: Some(format!("state: {e:#}")),
             };
@@ -244,8 +373,54 @@ pub fn collect(dir: &Path) -> Snapshot {
         });
     }
 
+    // Services view: (instance name → the service list of its resolved sandbox),
+    // then the config services resolved into pure inputs for the join.
+    let instance_services: Vec<(String, Vec<String>)> = instances
+        .iter()
+        .map(|r| (r.name.clone(), r.services.clone()))
+        .collect();
+
+    let services = match (&config, project_id(dir)) {
+        (Ok(cfg), Ok(project)) => {
+            let inputs: Vec<ServiceInput> = cfg
+                .services
+                .keys()
+                .map(|name| match cfg.resolve_service(name) {
+                    Ok(rs) => ServiceInput {
+                        name: name.clone(),
+                        resolved: Some(ResolvedServiceInput {
+                            scope: rs.spec.scope,
+                            source: service_source(&rs.spec),
+                            ports: rs.spec.ports.clone(),
+                            env_len: rs.spec.env.len(),
+                            command: rs
+                                .spec
+                                .command
+                                .as_ref()
+                                .map(|c| c.to_vec().join(" ")),
+                            config_hash: rs.config_hash,
+                        }),
+                    },
+                    Err(e) => {
+                        errors.push(format!("service `{name}`: {e:#}"));
+                        ServiceInput { name: name.clone(), resolved: None }
+                    }
+                })
+                .collect();
+            build_service_rows(&project, &inputs, &instance_services, &ps)
+        }
+        // No config already reported above; a project_id failure (e.g. dir does
+        // not resolve) means no services either. Report it once.
+        (Ok(_), Err(e)) => {
+            errors.push(format!("project id: {e:#}"));
+            Vec::new()
+        }
+        _ => Vec::new(),
+    };
+
     Snapshot {
         instances,
+        services,
         collected_at,
         error: if errors.is_empty() { None } else { Some(errors.join("; ")) },
     }
@@ -322,5 +497,110 @@ mod tests {
             Some(&("1.20%".to_string(), "50MiB / 2GiB".to_string())),
         );
         assert_eq!(stats.len(), 1);
+    }
+
+    fn ps_line(names: &str, status: &str, state: &str) -> PsLine {
+        PsLine {
+            names: names.to_string(),
+            status: status.to_string(),
+            state: state.to_string(),
+        }
+    }
+
+    fn resolved(scope: ServiceScope, source: &str, ports: &[&str]) -> ResolvedServiceInput {
+        ResolvedServiceInput {
+            scope,
+            source: source.to_string(),
+            ports: ports.iter().map(|p| p.to_string()).collect(),
+            env_len: 2,
+            command: Some("redis-server".to_string()),
+            config_hash: "deadbeef".to_string(),
+        }
+    }
+
+    #[test]
+    fn global_service_joins_single_container() {
+        let inputs = vec![ServiceInput {
+            name: "db".into(),
+            resolved: Some(resolved(ServiceScope::Global, "image postgres:16", &["5432"])),
+        }];
+        let instance_services = vec![
+            ("repo".to_string(), vec!["db".to_string()]),
+            ("other".to_string(), vec![]),
+        ];
+        // Global container name is devsandbox-svc-<project>-<name>.
+        let ps = vec![ps_line("devsandbox-svc-proj-db", "Up 2 minutes", "running")];
+
+        let rows = build_service_rows("proj", &inputs, &instance_services, &ps);
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.scope, "global");
+        assert_eq!(row.source, "image postgres:16");
+        assert_eq!(row.used_by, vec!["repo".to_string()]);
+        assert_eq!(row.containers.len(), 1);
+        assert_eq!(row.containers[0].0, "devsandbox-svc-proj-db");
+        assert_eq!(
+            row.containers[0].1,
+            ContainerStatus::Running("Up 2 minutes".into())
+        );
+    }
+
+    #[test]
+    fn isolated_service_has_one_container_per_user() {
+        let inputs = vec![ServiceInput {
+            name: "cache".into(),
+            resolved: Some(resolved(ServiceScope::Isolated, "image redis:7", &["6379"])),
+        }];
+        let instance_services = vec![
+            ("repo".to_string(), vec!["cache".to_string()]),
+            ("repo-2".to_string(), vec!["cache".to_string()]),
+            ("nope".to_string(), vec![]),
+        ];
+        // repo's container is running, repo-2's is exited, none for `nope`.
+        let ps = vec![
+            ps_line("devsandbox-svc-proj-repo-cache", "Up 1s", "running"),
+            ps_line(
+                "devsandbox-svc-proj-repo-2-cache",
+                "Exited (0) 5s ago",
+                "exited",
+            ),
+        ];
+
+        let rows = build_service_rows("proj", &inputs, &instance_services, &ps);
+        let row = &rows[0];
+        assert_eq!(row.scope, "isolated");
+        assert_eq!(row.used_by, vec!["repo".to_string(), "repo-2".to_string()]);
+        assert_eq!(row.containers.len(), 2);
+        assert_eq!(row.containers[0].0, "devsandbox-svc-proj-repo-cache");
+        assert_eq!(row.containers[0].1, ContainerStatus::Running("Up 1s".into()));
+        assert_eq!(row.containers[1].0, "devsandbox-svc-proj-repo-2-cache");
+        assert_eq!(
+            row.containers[1].1,
+            ContainerStatus::Exited("Exited (0) 5s ago".into())
+        );
+    }
+
+    #[test]
+    fn unresolved_service_renders_placeholder_row() {
+        let inputs = vec![ServiceInput { name: "broken".into(), resolved: None }];
+        let rows = build_service_rows("proj", &inputs, &[], &[]);
+        let row = &rows[0];
+        assert_eq!(row.source, "?");
+        assert_eq!(row.scope, "isolated"); // default when unresolved
+        assert!(row.containers.is_empty());
+        assert!(row.config_hash.is_empty());
+        assert_eq!(row.env_len, 0);
+        assert!(row.command.is_none());
+    }
+
+    #[test]
+    fn isolated_service_with_no_users_has_no_containers() {
+        let inputs = vec![ServiceInput {
+            name: "cache".into(),
+            resolved: Some(resolved(ServiceScope::Isolated, "image redis:7", &["6379"])),
+        }];
+        let rows = build_service_rows("proj", &inputs, &[], &[]);
+        assert!(rows[0].used_by.is_empty());
+        assert!(rows[0].containers.is_empty());
     }
 }

@@ -89,8 +89,7 @@ impl App {
             Tab::Instances => {
                 self.snapshot.as_ref().map_or(0, |s| s.instances.len())
             }
-            // Real data lands in step 4.
-            Tab::Services => 0,
+            Tab::Services => self.snapshot.as_ref().map_or(0, |s| s.services.len()),
         }
     }
 
@@ -217,7 +216,12 @@ mod tests {
                 drift: false,
             })
             .collect();
-        Snapshot { instances, collected_at: std::time::Instant::now(), error: None }
+        Snapshot {
+            instances,
+            services: Vec::new(),
+            collected_at: std::time::Instant::now(),
+            error: None,
+        }
     }
 
     #[test]
