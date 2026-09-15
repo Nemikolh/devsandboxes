@@ -2,7 +2,7 @@ name: Release
 
 on:
   push:
-    branches: [main]
+    tags: ["v*"]
 
 permissions:
   contents: write
@@ -12,22 +12,19 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.check.outputs.version }}
-      bumped: ${{ steps.check.outputs.bumped }}
     steps:
       - uses: actions/checkout@v4
       - id: check
         run: |
           version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          if git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null; then
-            echo "bumped=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "bumped=true" >> "$GITHUB_OUTPUT"
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match Cargo.toml version $version" >&2
+            exit 1
           fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
   build:
     needs: version
-    if: needs.version.outputs.bumped == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -36,8 +33,6 @@ jobs:
             os: ubuntu-latest
           - target: aarch64-unknown-linux-musl
             os: ubuntu-24.04-arm
-          - target: x86_64-apple-darwin
-            os: macos-13
           - target: aarch64-apple-darwin
             os: macos-latest
           - target: x86_64-pc-windows-msvc
@@ -81,5 +76,4 @@ jobs:
           merge-multiple: true
       - uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ needs.version.outputs.version }}
           files: dist/*
