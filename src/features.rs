@@ -19,6 +19,12 @@ use serde::Deserialize;
 const FEATURE_LAYER_MEDIA_TYPE: &str = "application/vnd.devcontainers.layer.v1+tar";
 /// The manifest mediaType we request.
 const MANIFEST_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
+/// Cap the TCP/TLS handshake so an unreachable host fails fast instead of
+/// blocking a fetch indefinitely.
+const CONNECT_TIMEOUT_SECS: &str = "10";
+/// Cap a whole small request (headers, manifest, token). Blobs use a stall
+/// guard instead so large layers aren't cut off mid-download.
+const REQUEST_MAX_TIME_SECS: &str = "60";
 
 /// A parsed OCI feature reference.
 ///
@@ -350,6 +356,10 @@ fn download_blob(
     );
     let mut cmd = Command::new("curl");
     cmd.arg("-fsSL"); // -L: blob GETs redirect to storage.
+    // Fail fast on a dead connect; abort if the transfer stalls (<1 B/s for
+    // 30s) rather than a hard cap, so large layers can still complete.
+    cmd.arg("--connect-timeout").arg(CONNECT_TIMEOUT_SECS);
+    cmd.arg("--speed-limit").arg("1").arg("--speed-time").arg("30");
     if let Some(token) = token {
         cmd.arg("-H").arg(format!("Authorization: Bearer {token}"));
     }
@@ -455,6 +465,8 @@ fn urlencode(s: &str) -> String {
 fn curl_headers(args: &[&str]) -> Result<String> {
     let mut cmd = Command::new("curl");
     cmd.arg("-sS").arg("-D").arg("-").arg("-o").arg("/dev/null");
+    cmd.arg("--connect-timeout").arg(CONNECT_TIMEOUT_SECS);
+    cmd.arg("--max-time").arg(REQUEST_MAX_TIME_SECS);
     cmd.args(args);
     capture_stdout(&mut cmd, "curl")
 }
@@ -463,6 +475,8 @@ fn curl_headers(args: &[&str]) -> Result<String> {
 fn curl_body(args: &[&str]) -> Result<String> {
     let mut cmd = Command::new("curl");
     cmd.arg("-fsSL");
+    cmd.arg("--connect-timeout").arg(CONNECT_TIMEOUT_SECS);
+    cmd.arg("--max-time").arg(REQUEST_MAX_TIME_SECS);
     cmd.args(args);
     capture_stdout(&mut cmd, "curl")
 }
@@ -846,8 +860,11 @@ mod tests {
     #[test]
     fn fetches_common_utils_from_ghcr() {
         // Probe reachability: a 401 counts as reachable (registry is up).
+        // No `-S`: ghcr's /v2/ answers 401, and we don't want curl printing that
+        // (harmless) error to the test's stderr — reachability is read from the
+        // exit code below, not the message.
         let probe = Command::new("curl")
-            .args(["-fsS", "-o", "/dev/null", "--max-time", "10", "https://ghcr.io/v2/"])
+            .args(["-fs", "-o", "/dev/null", "--max-time", "10", "https://ghcr.io/v2/"])
             .status();
         let reachable = match probe {
             // -f makes a 401 exit non-zero (22); treat exit 22 as reachable too.
