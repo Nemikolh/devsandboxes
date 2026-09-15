@@ -219,7 +219,10 @@ fn run_suspended(terminal: &mut Term, dir: &Path, action: PromptAction) -> Resul
         PromptAction::Code { .. } => Ok(()),
     };
     if let Err(e) = result {
-        eprintln!("error: {e:#}");
+        match log_error(&action, &e) {
+            Some(path) => eprintln!("error: {e:#}\nlogged to {}", path.display()),
+            None => eprintln!("error: {e:#}"),
+        }
     }
 
     print!("\r\n\x1b[2mpress any key to return\x1b[0m");
@@ -233,6 +236,25 @@ fn run_suspended(terminal: &mut Term, dir: &Path, action: PromptAction) -> Resul
     execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
     terminal.hide_cursor()?;
     Ok(())
+}
+
+/// Write a failed suspended command's error to a timestamped log file under the
+/// data dir (`<data>/devsandbox/logs/<verb>-<unix>.log`, alongside `state.toml`)
+/// and return its path so the caller can point the user at it. Best-effort:
+/// `None` on any I/O failure, so the caller falls back to a plain stderr print.
+fn log_error(action: &PromptAction, err: &anyhow::Error) -> Option<PathBuf> {
+    let verb = match action {
+        PromptAction::Run { .. } => "run",
+        PromptAction::Exec { .. } => "exec",
+        PromptAction::Rm { .. } => "rm",
+        PromptAction::Stop { .. } => "stop",
+        PromptAction::Code { .. } => "code",
+    };
+    let dir = crate::state::State::path().ok()?.parent()?.join("logs");
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join(format!("{verb}-{}.log", crate::state::Instance::now()));
+    std::fs::write(&path, format!("{verb} failed: {err:#}\n")).ok()?;
+    Some(path)
 }
 
 /// Block until the next key press (consuming it), ignoring release/repeat.

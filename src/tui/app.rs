@@ -1205,6 +1205,7 @@ mod tests {
             services: Vec::new(),
             extends: Vec::new(),
             config_hash: "hash".into(),
+            issues: Vec::new(),
         }];
         Snapshot {
             instances,
@@ -1768,6 +1769,7 @@ mod tests {
                 services: Vec::new(),
                 extends: Vec::new(),
                 config_hash: "h".into(),
+                issues: Vec::new(),
             }],
             services: Vec::new(),
             sandbox_count: 1,

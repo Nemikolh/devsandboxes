@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use super::procs::{ProcState, MESSAGE_ROW};
 use crate::commands::services::{isolated_service_container, project_id, service_container};
-use crate::config::{Config, ServiceScope};
+use crate::config::{Config, MountContext, ResolvedSandbox, ServiceScope};
 use crate::runtime::{backend, ContainerRow, NAME_PREFIX};
 use crate::state::{Instance, State};
 
@@ -71,6 +71,10 @@ pub struct SandboxRow {
     pub extends: Vec<String>,
     /// Short config hash of the resolved table, empty when unresolved.
     pub config_hash: String,
+    /// Config-validation problems for this sandbox (folder / mount resolution),
+    /// shown in the Detail panel. Empty when the sandbox validates or failed to
+    /// resolve at all (the resolve error is reported separately).
+    pub issues: Vec<String>,
 }
 
 /// One service row, everything the Services view needs pre-joined.
@@ -379,6 +383,72 @@ pub fn humanize_secs(secs: u64) -> String {
     }
 }
 
+/// Validate a resolved sandbox's host-facing paths, mirroring what
+/// `commands::run` does at run time but reporting instead of acting:
+///
+/// - **folder**: must be set and resolve relative to the config dir
+///   (`dir.join(folder).canonicalize()`).
+/// - **mounts**: each must resolve (`${…}` substitution + a source for binds);
+///   a bind source that does not exist on the host is flagged as a warning
+///   (`run` would create it — see `ensure_bind_source`).
+///
+/// Returns one message per problem, in check order; empty means it validates.
+fn validate_sandbox(dir: &Path, sb: &ResolvedSandbox) -> Vec<String> {
+    let mut issues = Vec::new();
+
+    // Folder: presence + resolution relative to the config dir. On success the
+    // canonical path + basename anchor the mount context below.
+    let folder = match sb.folder() {
+        None => {
+            issues.push("folder: not set".to_string());
+            None
+        }
+        Some(f) => match dir.join(f).canonicalize() {
+            Ok(path) => Some(path),
+            Err(_) => {
+                issues.push(format!("folder `{f}` does not resolve relative to config"));
+                None
+            }
+        },
+    };
+
+    // Mounts: only when the sandbox declares any. `${configDir}` /
+    // `${localWorkspaceFolder}` mirror the run-time context; a folder that did
+    // not resolve leaves the workspace vars empty, so those mounts still surface
+    // as unresolved rather than silently passing.
+    if let Some(mounts) = &sb.properties.mounts {
+        let config_dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        let folder_str = folder.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+        let basename = folder
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let ctx = MountContext {
+            config_dir: &config_dir.to_string_lossy(),
+            workspace_folder: &folder_str,
+            workspace_folder_basename: &basename,
+        };
+        for mount in mounts {
+            match mount.resolve(&ctx) {
+                Ok(rm) if rm.kind == "bind" => {
+                    if let Some(source) = &rm.source
+                        && !Path::new(source).exists()
+                    {
+                        issues.push(format!(
+                            "mount source `{source}` not found on host (run creates it)"
+                        ));
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => issues.push(format!("mount: {e}")),
+            }
+        }
+    }
+
+    issues
+}
+
 /// Collect a fresh [`Snapshot`]. Blocking; run off the UI thread.
 ///
 /// State is the source of truth for which rows exist; the runtime enriches them
@@ -450,6 +520,7 @@ pub fn collect(dir: &Path) -> Snapshot {
                 match cfg.resolve_sandbox(name) {
                     Ok(rs) => {
                         let services = rs.properties.services.clone().unwrap_or_default();
+                        let issues = validate_sandbox(dir, &rs);
                         sandboxes.push(SandboxRow {
                             name: name.clone(),
                             source: rs.source(),
@@ -457,6 +528,7 @@ pub fn collect(dir: &Path) -> Snapshot {
                             services: services.clone(),
                             extends,
                             config_hash: rs.config_hash.clone(),
+                            issues,
                         });
                         resolved.insert(name.clone(), (services, rs.config_hash));
                     }
@@ -469,6 +541,7 @@ pub fn collect(dir: &Path) -> Snapshot {
                             services: Vec::new(),
                             extends,
                             config_hash: String::new(),
+                            issues: Vec::new(),
                         });
                     }
                 }
@@ -863,6 +936,7 @@ mod tests {
             services: Vec::new(),
             extends: Vec::new(),
             config_hash: "hash".into(),
+            issues: Vec::new(),
         }
     }
 
@@ -1027,5 +1101,54 @@ mod tests {
     fn sandbox_stats_formats_running_over_total() {
         assert_eq!(sandbox_stats(0, 0), "0/0 running");
         assert_eq!(sandbox_stats(3, 1), "1/3 running");
+    }
+
+    #[test]
+    fn validate_sandbox_flags_folder_and_mount_problems() {
+        use crate::config::{Mount, ResolvedSandbox, SandboxProperties};
+
+        // Unique temp config dir with real `repo` and `data` folders inside it.
+        let root = std::env::temp_dir().join(format!("devsandbox-validate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("repo")).unwrap();
+        std::fs::create_dir_all(root.join("data")).unwrap();
+
+        let mk = |folder: Option<&str>, mounts: Option<Vec<Mount>>| ResolvedSandbox {
+            name: "s".into(),
+            properties: SandboxProperties {
+                folder: folder.map(str::to_string),
+                mounts,
+                ..Default::default()
+            },
+            config_hash: "h".into(),
+        };
+
+        // Resolvable folder + an existing bind source ⇒ no issues.
+        let ok = mk(
+            Some("repo"),
+            Some(vec![Mount::Shorthand(format!(
+                "source={},target=/data",
+                root.join("data").display()
+            ))]),
+        );
+        assert!(validate_sandbox(&root, &ok).is_empty());
+
+        // Missing folder value ⇒ a single folder issue.
+        assert_eq!(
+            validate_sandbox(&root, &mk(None, None)),
+            vec!["folder: not set".to_string()],
+        );
+
+        // Bogus folder + missing bind source ⇒ both messages, in check order.
+        let bad = mk(
+            Some("nope"),
+            Some(vec![Mount::Shorthand("source=/no/such/path,target=/x".into())]),
+        );
+        let issues = validate_sandbox(&root, &bad);
+        assert_eq!(issues.len(), 2, "got: {issues:?}");
+        assert!(issues[0].contains("folder `nope` does not resolve"), "got: {issues:?}");
+        assert!(issues[1].contains("not found on host"), "got: {issues:?}");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -581,6 +581,12 @@ fn sandbox_detail<'a>(snapshot: &Snapshot, sb: &'a SandboxRow) -> Vec<Line<'a>> 
         lines.push(kv("config hash", &sb.config_hash));
     }
     lines.push(kv("instances", &format!("{total} ({running} running)")));
+    for issue in &sb.issues {
+        lines.push(Line::from(Span::styled(
+            format!("⚠ {issue}"),
+            Style::default().fg(Color::Red),
+        )));
+    }
     lines
 }
 
