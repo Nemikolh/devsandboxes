@@ -13,7 +13,7 @@ use super::data::{
     humanize_secs, sandbox_stats, totals_line, ContainerStatus, InstanceRow, Node, SandboxRow,
     ServiceRow, Snapshot,
 };
-use super::procs::{ProcState, MESSAGE_ROW};
+use super::procs::{is_agent, ProcState, MESSAGE_ROW};
 use super::prompt::Prompt;
 
 const ACCENT: Color = Color::Rgb(175, 135, 255);
@@ -491,7 +491,19 @@ fn proc_tree_row<'a>(app: &App, snapshot: &'a Snapshot, instance: usize, row: us
             if let Some(p) = rows.get(row) {
                 let pid = Cell::from(Span::styled(format!("      {}", p.pid), dim));
                 let indent = "\\_ ".repeat(p.depth);
-                let args = Cell::from(Span::styled(format!("{indent}{}", p.args), dim));
+                // Coding-agent processes are highlighted blue+bold; the tree
+                // connectors stay dim so the agent name itself is what pops.
+                let args = if is_agent(&p.args) {
+                    Cell::from(Line::from(vec![
+                        Span::styled(indent, dim),
+                        Span::styled(
+                            p.args.clone(),
+                            Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
+                        ),
+                    ]))
+                } else {
+                    Cell::from(Span::styled(format!("{indent}{}", p.args), dim))
+                };
                 return Row::new(vec![
                     pid,
                     Cell::from(""),

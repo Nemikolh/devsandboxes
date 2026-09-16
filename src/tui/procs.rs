@@ -25,6 +25,42 @@ pub enum ProcState {
 /// a [`ProcState::Message`] placeholder rather than an index into a `Rows` vec.
 pub const MESSAGE_ROW: usize = usize::MAX;
 
+/// Known coding-agent command names. Matched against the basename of each
+/// whitespace-separated token in a process's args, so a bare `zidane`, a
+/// `/usr/local/bin/zidane`, and a `node …/claude` wrapper all count. Entries are
+/// basenames only (no paths, no extensions); keep them distinctive to avoid
+/// matching ordinary argument values.
+pub const AGENT_NAMES: &[&str] = &[
+    "zidane",
+    "claude",
+    "claude-code",
+    "codex",
+    "crush",
+    "aider",
+    "goose",
+    "gemini",
+    "opencode",
+    "cline",
+    "qwen",
+    "cursor-agent",
+    "amp",
+    "plandex",
+    "copilot",
+];
+
+/// True when a process's args name a known coding agent. Each whitespace token is
+/// reduced to its path basename (`/usr/local/bin/zidane` → `zidane`) and compared
+/// case-insensitively against [`AGENT_NAMES`]. Flag tokens (`-…`) are skipped so a
+/// value that happens to match can't false-positive off a flag.
+pub fn is_agent(args: &str) -> bool {
+    args.split_whitespace()
+        .filter(|tok| !tok.starts_with('-'))
+        .any(|tok| {
+            let base = tok.rsplit(['/', '\\']).next().unwrap_or(tok);
+            AGENT_NAMES.iter().any(|name| base.eq_ignore_ascii_case(name))
+        })
+}
+
 /// Parse `docker top <container> -eo pid,ppid,args` output into
 /// `(pid, ppid, args)` triples. The first line is a header and is skipped; each
 /// remaining line splits into pid, ppid, and the remainder as args. Lines with
@@ -206,5 +242,27 @@ mod tests {
     #[test]
     fn build_forest_empty_is_empty() {
         assert!(build_forest(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn is_agent_matches_bare_name_and_path_and_wrapper() {
+        assert!(is_agent("zidane"));
+        assert!(is_agent("/usr/local/bin/zidane --resume"));
+        // node/python wrappers: the script token is what matches.
+        assert!(is_agent("node /opt/claude-code/dist/claude"));
+        assert!(is_agent("CLAUDE")); // case-insensitive
+        assert!(is_agent("codex exec"));
+    }
+
+    #[test]
+    fn is_agent_rejects_non_agents_and_partial_matches() {
+        assert!(!is_agent(""));
+        assert!(!is_agent("/sbin/init"));
+        assert!(!is_agent("node server.js"));
+        // A basename must equal an agent name, not merely contain it.
+        assert!(!is_agent("claudette"));
+        assert!(!is_agent("/opt/gemini-tools/run"));
+        // A flag token that spells an agent name is not the process.
+        assert!(!is_agent("mytool --amp"));
     }
 }
