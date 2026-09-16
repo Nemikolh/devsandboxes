@@ -151,7 +151,10 @@ pub fn run(dir: &Path, sandbox_name: Option<String>, instance_name: Option<Strin
         .filter(|i| i.base_folder == folder)
         .any(|i| container_running(&i.container));
     let (source, worktree, extra_mounts) = if base_in_use {
-        let wt = dir.join(".worktrees").join(&instance);
+        // Must be absolute: `create_worktree` runs `git -C <base>`, so a
+        // `dir`-relative path would resolve under the base repo instead of here,
+        // and the mount/state would point at a different (empty) directory.
+        let wt = config_dir.join(".worktrees").join(&instance);
         create_worktree(&folder, &wt, &instance)?;
         // The worktree's `.git` file points at `<base>/.git/worktrees/..`
         // by absolute host path; mount the base `.git` at the identical
@@ -278,6 +281,19 @@ fn create_worktree(base: &Path, worktree: &Path, instance: &str) -> Result<()> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("cannot create {}", parent.display()))?;
     }
+    // With an unborn HEAD, `git worktree add -b` infers `--orphan`, exits 0, and
+    // lays down a worktree with no files; guard against handing that empty path
+    // to the container as a bind mount.
+    let head = std::process::Command::new("git")
+        .args(["-C", &base.to_string_lossy(), "rev-parse", "--verify", "HEAD"])
+        .output()
+        .context("failed to run git (is it installed?)")?;
+    if !head.status.success() {
+        bail!(
+            "base repo `{}` has no commits; cannot create a worktree",
+            base.display()
+        );
+    }
     let branch = format!("sandbox/{instance}");
     let status = std::process::Command::new("git")
         .args([
@@ -293,6 +309,14 @@ fn create_worktree(base: &Path, worktree: &Path, instance: &str) -> Result<()> {
         .context("failed to run git (is it installed?)")?;
     if !status.success() {
         bail!("git worktree add failed for `{}`", worktree.display());
+    }
+    // A real worktree always has a `.git` entry pointing back at the base repo;
+    // its absence means git exited 0 without checking anything out.
+    if !worktree.join(".git").exists() {
+        bail!(
+            "git worktree add produced an empty worktree at `{}`",
+            worktree.display()
+        );
     }
     Ok(())
 }
