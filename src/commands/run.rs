@@ -307,6 +307,26 @@ fn create_worktree(base: &Path, worktree: &Path, branch: &str) -> Result<()> {
             base.display()
         );
     }
+    // A worktree branch must be unique: `git worktree add -b` refuses a branch
+    // that already exists. Catch it here with a message that points at the
+    // likely cause (a constant `worktree-branch`/`--branch` with no `${instance}`).
+    let exists = std::process::Command::new("git")
+        .args([
+            "-C",
+            &base.to_string_lossy(),
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ])
+        .status()
+        .context("failed to run git (is it installed?)")?;
+    if exists.success() {
+        bail!(
+            "branch `{branch}` already exists; a worktree needs a unique branch \
+             (include `${{instance}}` in `worktree-branch` or pass a distinct `--branch`)"
+        );
+    }
     let status = std::process::Command::new("git")
         .args([
             "-C",
