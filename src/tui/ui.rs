@@ -15,6 +15,7 @@ use super::data::{
 };
 use super::procs::{is_agent, ProcState, MESSAGE_ROW};
 use super::prompt::Prompt;
+use crate::render::JsonLine;
 
 const ACCENT: Color = Color::Rgb(175, 135, 255);
 const SELECTION: Color = Color::Rgb(0, 215, 135);
@@ -867,29 +868,24 @@ fn highlight_toml_line(line: &str) -> Line<'static> {
 
 /// Light per-line JSON highlighting mirroring [`highlight_toml_line`]: a
 /// `"key":` prefix (through the colon) is green, structural punctuation-only
-/// lines (`{`, `}`, `[`, `],`) are dim, and everything else is default. Values
-/// stay plain — enough to make keys scannable without a real parser.
+/// lines (`{`, `}`, `[`, `],`) are dim, and everything else is default. The
+/// classification is shared with the CLI `inspect` command
+/// ([`crate::render::classify_json_line`]) so both highlight identically.
 fn highlight_json_line(line: &str) -> Line<'static> {
-    let trimmed = line.trim();
-    // Punctuation-only structural lines: dim the whole line.
-    if !trimmed.is_empty() && trimmed.chars().all(|c| matches!(c, '{' | '}' | '[' | ']' | ',')) {
-        return Line::from(Span::styled(
+    match crate::render::classify_json_line(line) {
+        JsonLine::Structural => Line::from(Span::styled(
             line.to_string(),
             Style::default().add_modifier(Modifier::DIM),
-        ));
-    }
-    // `"key": value` → green key half through the colon, plain value.
-    let after_indent = line.trim_start();
-    if after_indent.starts_with('"') {
-        if let Some(colon) = line.find(':') {
-            let (key, value) = line.split_at(colon + 1);
-            return Line::from(vec![
+        )),
+        JsonLine::KeyValue(split) => {
+            let (key, value) = line.split_at(split);
+            Line::from(vec![
                 Span::styled(key.to_string(), Style::default().fg(Color::Green)),
                 Span::raw(value.to_string()),
-            ]);
+            ])
         }
+        JsonLine::Plain => Line::from(Span::raw(line.to_string())),
     }
-    Line::from(Span::raw(line.to_string()))
 }
 
 #[cfg(test)]

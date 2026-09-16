@@ -1128,13 +1128,7 @@ fn set_inspect(view: &mut ConfigView, target: Option<String>, placeholder: &str)
     };
     view.inspect_container = container.clone();
     view.inspect = match backend().inspect_json(&container) {
-        Ok(out) => match serde_json::from_str::<serde_json::Value>(&out) {
-            Ok(v) => match serde_json::to_string_pretty(&v) {
-                Ok(pretty) => pretty,
-                Err(e) => format!("cannot format inspect JSON: {e}\n{out}"),
-            },
-            Err(e) => format!("could not parse inspect JSON: {e}\n{out}"),
-        },
+        Ok(out) => crate::commands::inspect::pretty_inspect(&out),
         Err(e) => format!("{e:#}"),
     };
 }

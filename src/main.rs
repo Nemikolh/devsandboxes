@@ -58,6 +58,23 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Show the last lines of a container's logs
+    Logs {
+        /// Instance name, sandbox config name, repository folder name, or
+        /// devsandbox container name (service containers included)
+        name: String,
+        /// Number of log lines to show
+        #[arg(short = 'n', long, default_value_t = 50)]
+        lines: usize,
+    },
+    /// Pretty-print the runtime's inspect JSON for a container
+    Inspect {
+        /// Instance name, sandbox config name, repository folder name, or
+        /// devsandbox container name (service containers included)
+        name: String,
+    },
+    /// Show CPU/memory usage of running devsandbox containers
+    Stats,
     /// Run a command in a sandbox instance
     Exec {
         /// Keep stdin open
@@ -92,6 +109,9 @@ fn main() -> Result<()> {
         Command::Rm { name } => commands::rm::rm(&name),
         Command::Stop { name } => commands::stop::stop(&name),
         Command::Gc { force } => commands::services::gc(&cli.dir, force),
+        Command::Logs { name, lines } => commands::logs::logs(&name, lines),
+        Command::Inspect { name } => commands::inspect::inspect(&name),
+        Command::Stats => commands::stats::stats(),
         Command::Exec { interactive, tty, name, command } => {
             commands::exec::exec(&name, interactive, tty, &command)
         }

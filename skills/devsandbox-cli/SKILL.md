@@ -150,29 +150,46 @@ listed when stdin is not a TTY.
    - A failed lifecycle command aborts `run` but **keeps the container** so you can
      `exec` in to debug.
 
-3. **`ps [-a]`** — list instances (joined from state + runtime). `-a` includes
+3. **`logs <name> [-n N]`** — last N lines (default 50) of the container's
+   stdout+stderr, verbatim; prints `(no log output)` when empty. `<name>` also
+   accepts a raw devsandbox container name (with or without the `devsandbox-`
+   prefix), so service containers work: `devsandbox logs devsandbox-svc-<proj>-database`.
+   First stop when a lifecycle command or service misbehaves.
+
+4. **`inspect <name>`** — pretty-printed runtime `inspect` JSON (config, mounts,
+   networks, env, exit code). Same name resolution as `logs`, service containers
+   included. Keys are colour-highlighted on a TTY only; piped output is plain
+   JSON, safe to parse.
+
+5. **`ps [-a]`** — list instances (joined from state + runtime). `-a` includes
    stopped ones. Columns: NAME, IMAGE, STATUS.
 
-4. **`ls`** — list sandbox _configs_ from `config.toml` (NAME, SOURCE, FOLDER,
+6. **`stats`** — one-shot CPU/memory usage of every running `devsandbox-*`
+   container (instances and services). Columns: NAME, CPU, MEM.
+
+7. **`ls`** — list sandbox _configs_ from `config.toml` (NAME, SOURCE, FOLDER,
    SERVICES, EXTENDS). Use to discover what can be `run` and to catch config
    parse/validation errors.
 
-5. **`stop <name>`** — stop the instance container + its isolated service
+8. **`stop <name>`** — stop the instance container + its isolated service
    containers. Idempotent (already-stopped/missing is fine). State survives; a
    later `run` restarts it.
 
-6. **`rm <name>`** — remove container, its worktree (prompts to delete the
+9. **`rm <name>`** — remove container, its worktree (prompts to delete the
    `sandbox/<instance>` branch on a TTY), isolated services, per-instance network,
    and the state entry. Managed shell history is **kept** so a rebuilt instance
    inherits it. Global services are left for `gc`.
 
-7. **`gc [--force]`** — reap shared services no live instance references, orphaned
+10. **`gc [--force]`** — reap shared services no live instance references, orphaned
    networks, and orphaned shell-history files (`--force` skips the per-file
    confirm). Housekeeping, not part of a normal task loop.
 
-8. **`devsandbox`** (no subcommand) — opens the interactive **TUI dashboard** on a
-   TTY; prints help and exits `2` otherwise. **Not for agents** — it takes over the
-   terminal.
+11. **`devsandbox`** (no subcommand) — opens the interactive **TUI dashboard** on a
+    TTY; prints help and exits `2` otherwise. **Not for agents** — it takes over
+    the terminal.
+
+All commands colour output only when stdout is a TTY and `NO_COLOR` is unset;
+piped/captured output is always plain text.
 
 ## State
 
@@ -182,27 +199,21 @@ listed when stdin is not a TTY.
 - Networks/containers are namespaced by a short hash of the config-root path, so
   two projects never collide.
 
-## Debugging a sandbox — and a CLI gap
+## Debugging a sandbox
 
 Container name for an instance is `devsandbox-<instance>`; service containers are
-`devsandbox-svc-<project>-…`. `devsandbox ps -a` shows the names.
-
-**Gap:** the CLI has **no `logs`, `inspect`, `stats`, or process-list
-subcommand.** Those capabilities exist in the backend and the TUI dashboard
-(`logs_tail`, `inspect_json`, `stats`, `proc_list`) but aren't wired to any
-command. So when debugging a container that won't start, a lifecycle command that
-failed after `run` returned, or a crash-looping service, an agent driving the CLI
-has to fall back to the runtime directly:
+`devsandbox-svc-<project>-…`. `devsandbox ps -a` shows the names. Typical loop:
 
 ```bash
-docker logs devsandbox-web             # container / lifecycle stdout+stderr
-docker inspect devsandbox-web          # config, mounts, network, exit code
-docker ps -a --filter name=devsandbox- # everything devsandbox created
-devsandbox exec web sh -c 'env; ls -la'  # poke around inside a running instance
+devsandbox ps -a                  # what exists, what's stopped
+devsandbox logs web               # lifecycle / container output (-n 200 for more)
+devsandbox logs devsandbox-svc-<proj>-database   # a service's output
+devsandbox inspect web            # mounts, networks, env, exit code
+devsandbox stats                  # anything pegging CPU or leaking memory?
+devsandbox exec web sh -c 'env; ls -la'          # poke around inside
 ```
 
-Worth proposing to the maintainer: surface the already-implemented backend methods
-as `devsandbox logs <name> [-n N]`, `devsandbox inspect <name>`, and a
-`ps`-adjacent stats/top view, so agents don't have to reach past the CLI (and so it
-stays runtime-agnostic — the fallbacks above are docker-specific and break under
-podman/Apple `container`).
+All of these go through the runtime backend, so they work unchanged on docker,
+podman, and Apple `container` — no need to call `docker` directly. Remember a
+failed lifecycle command keeps the container around precisely so `logs` + `exec`
+can diagnose it.

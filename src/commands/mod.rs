@@ -1,15 +1,19 @@
 pub mod exec;
+pub mod inspect;
+pub mod logs;
 pub mod ls;
 pub mod ps;
 pub mod rm;
 pub mod run;
 pub mod services;
+pub mod stats;
 pub mod stop;
 
 use std::io::{IsTerminal, Write};
 
 use anyhow::{bail, Context, Result};
 
+use crate::runtime::{backend, NAME_PREFIX};
 use crate::state::State;
 
 /// Resolve a user-supplied `name` to a single instance key. `name` may be an
@@ -45,6 +49,28 @@ fn resolve_instance_with(state: &State, name: &str, interactive: bool) -> Result
             Ok(matches.remove(pick(&format!("`{name}` matches multiple instances"), &refs)?))
         }
     }
+}
+
+/// Resolve `name` to a container: an instance (same rules as
+/// [`resolve_instance`]) or, when no instance matches, an exact devsandbox
+/// container name with or without the `devsandbox-` prefix — so service
+/// containers are reachable too. Shared by `logs` and `inspect`.
+pub(crate) fn resolve_container(state: &State, name: &str) -> Result<String> {
+    let instance_err = match resolve_instance(state, name) {
+        Ok(key) => {
+            let info = state.instances.get(&key).expect("key came from state");
+            return Ok(info.container.clone());
+        }
+        Err(e) => e,
+    };
+    let prefixed = format!("{NAME_PREFIX}{name}");
+    backend()
+        .list(true, NAME_PREFIX)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|row| row.name)
+        .find(|n| n == name || n == &prefixed)
+        .ok_or(instance_err)
 }
 
 /// Yes/no prompt on stderr; `false` on a non-TTY. Shared by `rm` and `gc`.
