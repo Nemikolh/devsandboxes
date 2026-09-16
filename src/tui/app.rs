@@ -391,6 +391,9 @@ impl App {
     fn select_up(&mut self) {
         let slot = self.tab.index();
         self.selected[slot] = self.selected[slot].saturating_sub(1);
+        // Moving the cursor may land on a new instance; fetch its procs now so
+        // the Detail agent count appears without waiting for the next proc tick.
+        self.needs_proc_fetch = true;
     }
 
     fn select_down(&mut self) {
@@ -400,6 +403,7 @@ impl App {
         }
         let slot = self.tab.index();
         self.selected[slot] = (self.selected[slot] + 1).min(rows - 1);
+        self.needs_proc_fetch = true;
     }
 
     /// The collapse-set key for a collapsible node (sandbox name / orphan group),
@@ -706,10 +710,29 @@ impl App {
         self.pending_stop.take()
     }
 
-    /// True when procs are expanded for at least one instance (so the event loop
-    /// should tick a fetch); false means no proc fetches at all.
-    pub fn has_expanded_procs(&self) -> bool {
-        !self.expanded_procs.is_empty()
+    /// Agent-process count for a cached instance: the number of forest rows whose
+    /// args name a known coding agent (see [`super::procs::is_agent`]). `None`
+    /// when the instance has no fetched forest yet (not running, error, or the
+    /// fetch is still in flight), which the Detail panel renders as `…`/`-`.
+    pub fn agent_count(&self, instance: &str) -> Option<usize> {
+        match self.procs.get(instance) {
+            Some(ProcState::Rows(rows)) => {
+                Some(rows.iter().filter(|r| super::procs::is_agent(&r.args)).count())
+            }
+            _ => None,
+        }
+    }
+
+    /// The selected instance as a `(name, container)` fetch target, but only when
+    /// its container is running. Drives the on-demand proc fetch that backs the
+    /// Detail agent count for instances that aren't expanded. `None` on non-
+    /// instance nodes or a non-running selection.
+    fn selected_running_instance(&self) -> Option<(String, String)> {
+        let snapshot = self.snapshot.as_ref()?;
+        let idx = self.selected_instance_index()?;
+        let row = snapshot.instances.get(idx)?;
+        matches!(row.status, ContainerStatus::Running(_))
+            .then(|| (row.name.clone(), row.container.clone()))
     }
 
     /// Consume the "fetch now" signal set on expand.
@@ -721,7 +744,9 @@ impl App {
     /// expanded instance whose container is running. Expanded instances that are
     /// not running (or absent from the snapshot) get a `(not running)` message
     /// row stored directly here — no fetch — and are omitted from the returned
-    /// list. Instances no longer in the snapshot are dropped from the cache.
+    /// list. Instances no longer in the snapshot are dropped from the cache. The
+    /// selected running instance is appended (deduped) so the Detail agent count
+    /// has a fresh forest even when its process layer isn't expanded.
     pub fn proc_fetch_targets(&mut self) -> Vec<(String, String)> {
         let Some(snapshot) = &self.snapshot else {
             return Vec::new();
@@ -739,6 +764,14 @@ impl App {
         for name in not_running {
             self.procs
                 .insert(name, ProcState::Message("(not running)".to_string()));
+        }
+        // The selected running instance is fetched too (for the Detail agent
+        // count), even when its process layer isn't expanded. Deduped against the
+        // expanded targets so it's never fetched twice in one batch.
+        if let Some((name, container)) = self.selected_running_instance() {
+            if !targets.iter().any(|(n, _)| n == &name) {
+                targets.push((name, container));
+            }
         }
         targets
     }
@@ -1789,6 +1822,79 @@ mod tests {
             app.procs.get("down"),
             Some(&super::super::procs::ProcState::Message("(not running)".into())),
         );
+    }
+
+    #[test]
+    fn agent_count_counts_agent_rows_in_cache() {
+        use super::super::procs::{ProcRow, ProcState};
+        let mut app = new_app();
+        // Nothing cached → unknown.
+        assert_eq!(app.agent_count("x"), None);
+
+        let rows = vec![
+            ProcRow { pid: "1".into(), depth: 0, args: "/sbin/init".into() },
+            ProcRow { pid: "2".into(), depth: 1, args: "node /usr/local/bin/claude".into() },
+            ProcRow { pid: "3".into(), depth: 1, args: "zidane --resume".into() },
+        ];
+        app.procs.insert("x".into(), ProcState::Rows(rows));
+        assert_eq!(app.agent_count("x"), Some(2));
+
+        // A message state (not running / error) has no countable forest.
+        app.procs.insert("y".into(), ProcState::Message("(not running)".into()));
+        assert_eq!(app.agent_count("y"), None);
+    }
+
+    #[test]
+    fn proc_fetch_targets_includes_selected_running_instance() {
+        use super::super::data::{ContainerStatus, InstanceRow, SandboxRow};
+        let mut app = new_app();
+        let row = InstanceRow {
+            name: "up".into(),
+            sandbox: "s".into(),
+            container: "devsandbox-up".into(),
+            status: ContainerStatus::Running("Up".into()),
+            uptime_secs: 0,
+            cpu: None,
+            mem: None,
+            folder: "/f".into(),
+            worktree: false,
+            services: Vec::new(),
+            workspace: "/w".into(),
+            remote_user: None,
+            remote_env_len: 0,
+            base_folder: "/f".into(),
+            drift: false,
+        };
+        app.set_snapshot(Snapshot {
+            instances: vec![row],
+            sandboxes: vec![SandboxRow {
+                name: "s".into(),
+                source: "image x".into(),
+                folder: None,
+                services: Vec::new(),
+                extends: Vec::new(),
+                config_hash: "h".into(),
+                issues: Vec::new(),
+            }],
+            services: Vec::new(),
+            sandbox_count: 1,
+            runtime_name: "docker",
+            runtime_version: None,
+            collected_at: std::time::Instant::now(),
+            error: None,
+        });
+
+        // Cursor on the sandbox node: no instance selected, nothing expanded.
+        assert!(app.proc_fetch_targets().is_empty());
+
+        // Move onto the running instance: it becomes a fetch target for the
+        // Detail agent count, without being expanded.
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(
+            app.proc_fetch_targets(),
+            vec![("up".to_string(), "devsandbox-up".to_string())],
+        );
+        assert!(app.expanded_procs.is_empty());
     }
 
     #[test]

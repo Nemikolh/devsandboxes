@@ -183,14 +183,16 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
             }
         }
 
-        // Process refresh: fetch now on expand, else every PROC_TICK, but only
-        // while something is expanded and no fetch is already running.
+        // Process refresh: fetch now on expand / cursor move, else every
+        // PROC_TICK, whenever no fetch is already running. Targets are the
+        // expanded instances plus the selected running one (for the Detail agent
+        // count); an empty set means there is nothing to fetch.
         let want_now = app.take_needs_proc_fetch();
         let tick_due = last_proc_tick.elapsed() >= PROC_TICK;
-        if (want_now || tick_due) && app.has_expanded_procs() && proc_pending.is_none() {
+        if (want_now || tick_due) && proc_pending.is_none() {
             last_proc_tick = Instant::now();
             // Non-running expanded instances get their `(not running)` row here;
-            // running ones come back as fetch targets.
+            // running ones (and the selection) come back as fetch targets.
             let targets = app.proc_fetch_targets();
             if !targets.is_empty() {
                 proc_pending = Some(spawn_proc_fetch(targets));

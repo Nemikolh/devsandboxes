@@ -293,14 +293,22 @@ fn draw_instances(frame: &mut Frame, app: &App, area: Rect) {
 
     if nodes.is_empty() {
         draw_empty(frame, table_area);
-        draw_detail(frame, snapshot, None, detail_area);
+        draw_detail(frame, snapshot, None, None, detail_area);
         return;
     }
 
     let snapshot = snapshot.expect("non-empty nodes imply a snapshot");
     draw_tree(frame, app, snapshot, &nodes, table_area);
     let selected = nodes.get(app.selected()).copied();
-    draw_detail(frame, Some(snapshot), selected, detail_area);
+    // Agent count for the selected instance (or a proc row's parent), read from
+    // the proc cache; `None` until its forest is fetched.
+    let agent_count = match selected {
+        Some(Node::Instance(i)) | Some(Node::Proc { instance: i, .. }) => {
+            snapshot.instances.get(i).and_then(|r| app.agent_count(&r.name))
+        }
+        _ => None,
+    };
+    draw_detail(frame, Some(snapshot), selected, agent_count, detail_area);
 }
 
 fn draw_empty(frame: &mut Frame, area: Rect) {
@@ -536,7 +544,13 @@ fn status_style(status: &ContainerStatus) -> Style {
 /// Detail panel for the selected tree node: sandbox summary for sandbox / empty
 /// nodes, the existing instance detail for instances, and a hint for the orphan
 /// group. Empty when nothing is selected.
-fn draw_detail(frame: &mut Frame, snapshot: Option<&Snapshot>, node: Option<Node>, area: Rect) {
+fn draw_detail(
+    frame: &mut Frame,
+    snapshot: Option<&Snapshot>,
+    node: Option<Node>,
+    agent_count: Option<usize>,
+    area: Rect,
+) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(ACCENT))
@@ -551,7 +565,7 @@ fn draw_detail(frame: &mut Frame, snapshot: Option<&Snapshot>, node: Option<Node
         }
         (Some(s), Some(Node::Instance(i)))
         | (Some(s), Some(Node::Proc { instance: i, .. })) => match s.instances.get(i) {
-            Some(r) => instance_detail(r),
+            Some(r) => instance_detail(r, agent_count),
             None => Vec::new(),
         },
         (_, Some(Node::Orphans)) => vec![Line::from(Span::styled(
@@ -602,12 +616,13 @@ fn sandbox_detail<'a>(snapshot: &Snapshot, sb: &'a SandboxRow) -> Vec<Line<'a>> 
     lines
 }
 
-fn instance_detail(r: &InstanceRow) -> Vec<Line<'_>> {
+fn instance_detail(r: &InstanceRow, agent_count: Option<usize>) -> Vec<Line<'_>> {
     let mut lines: Vec<Line> = vec![
         kv("container", &r.container),
         kv("workspace", &r.workspace),
         kv("remoteUser", r.remote_user.as_deref().unwrap_or("-")),
         kv("remoteEnv", &r.remote_env_len.to_string()),
+        agents_line(r, agent_count),
     ];
     if r.worktree {
         lines.push(kv2("base", &r.base_folder, "worktree", &r.folder));
@@ -621,6 +636,29 @@ fn instance_detail(r: &InstanceRow) -> Vec<Line<'_>> {
         )));
     }
     lines
+}
+
+/// The `agents:` Detail line for an instance. A stopped/missing container shows
+/// a dim `-` (nothing to count); a running one shows the count — blue+bold when
+/// any agents are present, dim `0`, or a dim `…` while its forest is still being
+/// fetched.
+fn agents_line(r: &InstanceRow, agent_count: Option<usize>) -> Line<'static> {
+    let (text, style) = if !matches!(r.status, ContainerStatus::Running(_)) {
+        ("-".to_string(), Style::default().add_modifier(Modifier::DIM))
+    } else {
+        match agent_count {
+            Some(0) => ("0".to_string(), Style::default().add_modifier(Modifier::DIM)),
+            Some(n) => (
+                n.to_string(),
+                Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
+            ),
+            None => ("…".to_string(), Style::default().add_modifier(Modifier::DIM)),
+        }
+    };
+    Line::from(vec![
+        Span::styled("agents: ", Style::default().add_modifier(Modifier::DIM)),
+        Span::styled(text, style),
+    ])
 }
 
 /// `key: value` with a dim key.
