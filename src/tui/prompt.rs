@@ -21,7 +21,7 @@ const HISTORY_CAP: usize = 200;
 /// in [`Prompt::parse`]; the loop owns the terminal suspend + command call.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PromptAction {
-    Run { sandbox: String, name: Option<String> },
+    Run { sandbox: String, name: Option<String>, branch: Option<String> },
     Exec { instance: String, argv: Vec<String> },
     Code { instance: String },
     Rm { instance: String },
@@ -377,15 +377,21 @@ fn parse_line(line: &str) -> Result<PromptAction, String> {
     };
     match cmd {
         "run" => {
-            // `run <sandbox> [--name n]`.
+            // `run <sandbox> [--name n] [--branch b]`.
             let mut sandbox: Option<String> = None;
             let mut name: Option<String> = None;
+            let mut branch: Option<String> = None;
             let mut i = 0;
             while i < rest.len() {
                 match rest[i] {
                     "--name" => {
                         let val = rest.get(i + 1).ok_or("`--name` needs a value")?;
                         name = Some((*val).to_string());
+                        i += 2;
+                    }
+                    "--branch" => {
+                        let val = rest.get(i + 1).ok_or("`--branch` needs a value")?;
+                        branch = Some((*val).to_string());
                         i += 2;
                     }
                     other if other.starts_with("--") => {
@@ -400,8 +406,8 @@ fn parse_line(line: &str) -> Result<PromptAction, String> {
                     }
                 }
             }
-            let sandbox = sandbox.ok_or("usage: run <sandbox> [--name n]")?;
-            Ok(PromptAction::Run { sandbox, name })
+            let sandbox = sandbox.ok_or("usage: run <sandbox> [--name n] [--branch b]")?;
+            Ok(PromptAction::Run { sandbox, name, branch })
         }
         "exec" => {
             let (instance, argv) = rest
@@ -608,14 +614,23 @@ mod tests {
     fn parse_run_variants() {
         assert_eq!(
             parse_line("run web"),
-            Ok(PromptAction::Run { sandbox: "web".into(), name: None })
+            Ok(PromptAction::Run { sandbox: "web".into(), name: None, branch: None })
         );
         assert_eq!(
             parse_line("run web --name api"),
-            Ok(PromptAction::Run { sandbox: "web".into(), name: Some("api".into()) })
+            Ok(PromptAction::Run { sandbox: "web".into(), name: Some("api".into()), branch: None })
+        );
+        assert_eq!(
+            parse_line("run web --branch feat/x"),
+            Ok(PromptAction::Run {
+                sandbox: "web".into(),
+                name: None,
+                branch: Some("feat/x".into()),
+            })
         );
         assert!(parse_line("run").is_err());
         assert!(parse_line("run web --name").is_err());
+        assert!(parse_line("run web --branch").is_err());
         assert!(parse_line("run web --bogus").is_err());
         assert!(parse_line("run a b").is_err());
     }

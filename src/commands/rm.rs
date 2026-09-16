@@ -14,6 +14,7 @@ pub fn rm(name: &str) -> Result<()> {
     let info = state.instances.get(&key).expect("key came from state");
     let container = info.container.clone();
     let worktree = info.worktree.clone();
+    let branch = info.branch.clone();
     let base_folder = info.base_folder.clone();
     let project = info.project.clone();
 
@@ -35,7 +36,9 @@ pub fn rm(name: &str) -> Result<()> {
 
     if let Some(worktree) = worktree {
         remove_worktree(&base_folder, &worktree)?;
-        let branch = format!("sandbox/{key}");
+        // Recorded branch for instances created since it was tracked; older state
+        // entries fall back to the legacy default.
+        let branch = branch.unwrap_or_else(|| format!("sandbox/{key}"));
         if confirm(&format!("delete branch `{branch}`?"))? {
             let _ = std::process::Command::new("git")
                 .args(["-C", &base_folder.to_string_lossy(), "branch", "-D", &branch])

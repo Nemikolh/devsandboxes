@@ -7,7 +7,7 @@ Built for running multiple coding-agent sandboxes against the same repositories:
 ## Why
 
 - **devcontainer.json semantics, better config.** Sandboxes accept devcontainer properties (`image`, `build`, `features`, lifecycle commands, `containerEnv`, `mounts`, `customizations.vscode.extensions`, …) in TOML, plus an `extends` deep-merge over reusable templates.
-- **Concurrent instances of one repo.** A second `run` against a folder already in use gets its own git worktree (under `.worktrees/`, on a fresh `sandbox/<instance>` branch), so two containers never share a checkout.
+- **Concurrent instances of one repo.** A second `run` against a folder already in use gets its own git worktree (under `.worktrees/`, on a fresh `sandbox/<instance>` branch by default — customizable via `worktree-branch` or `run --branch`), so two containers never share a checkout.
 - **Shared caches.** `caches = ["pnpm", "cargo", …]` bind-mounts per-config-root package-manager caches into every sandbox and sets the env vars to match (supported: pnpm, cargo, npm, yarn, go, pip).
 - **Shared services.** `[services.*]` containers (e.g. postgres) run alongside sandboxes on a per-project network — `isolated` (one per instance, default) or `global` (one per config root).
 - **No daemon.** Docker is the source of truth for liveness; host-side state is a single TOML file in the user data dir. Everything devsandbox creates is prefixed `devsandbox-` so it is discoverable with plain `docker ps`.
@@ -62,7 +62,7 @@ devsandbox                  # no args on a TTY: interactive dashboard
 | `devsandbox`                   | TUI dashboard (bare invocation on a TTY); help otherwise                                                                                 |
 | `ls`                           | Sandbox configs defined in `config.toml`                                                                                                 |
 | `ps [-a]`                      | Sandbox instances, joined from state + runtime                                                                                           |
-| `run [sandbox] [--name n]`     | Start an instance in the background; interactive picker without args; reuses existing containers, detects config drift via a config hash |
+| `run [sandbox] [--name n] [--branch b]` | Start an instance in the background; interactive picker without args; reuses existing containers, detects config drift via a config hash. `--branch` sets the worktree branch, overriding the sandbox's `worktree-branch` |
 | `stop <name>`                  | `docker stop`; a later `run` restarts it                                                                                                 |
 | `rm <name>`                    | Remove container, worktree, and state entry (managed shell history is kept so a rebuilt instance inherits it)                            |
 | `exec [-i] [-t] <name> <cmd…>` | Exec in an instance, honoring `remoteEnv` / `remoteUser`                                                                                 |
@@ -92,6 +92,7 @@ devsandbox extras on a sandbox:
 | `services`              | Service names to start and network alongside the instance                                             |
 | `caches`                | Package-manager caches to persist and share across the config root                                    |
 | `persist-shell-history` | Per-instance `.zsh_history` on the host; survives rebuilds, never shared between concurrent instances |
+| `worktree-branch`       | Branch created for a worktree instance (supports `${instance}`); defaults to `sandbox/${instance}`; `run --branch` overrides it |
 
 Mount sources support devcontainer-style variables: `${configDir}`, `${localWorkspaceFolder}`, `${localWorkspaceFolderBasename}`, `${localEnv:VAR}`, plus devsandbox's `${sharedVolumes}` (the config root's persistent-state dir) and `${instance}` (the running instance name).
 

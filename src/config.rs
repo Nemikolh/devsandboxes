@@ -40,6 +40,11 @@ pub struct SandboxProperties {
     /// between concurrent instances.
     #[serde(rename = "persist-shell-history")]
     pub persist_shell_history: Option<bool>,
+    /// Branch created for a worktree instance. A pattern supporting the same
+    /// `${…}` variables as `mounts` (notably `${instance}`); defaults to
+    /// `sandbox/${instance}` when unset. A `run --branch` overrides it.
+    #[serde(rename = "worktree-branch")]
+    pub worktree_branch: Option<String>,
     /// Extra VS Code workspace roots: container path -> host folder (relative
     /// to the config dir). Each entry is bind-mounted at its key and listed in
     /// the generated `.code-workspace` file after `workspaceFolder`.
@@ -1070,6 +1075,38 @@ image = "alpine"
         let props = config.resolve_sandbox("s").unwrap().properties;
         assert_eq!(props.persist_shell_history, Some(true));
         assert!(props.ignored().is_empty());
+    }
+
+    #[test]
+    fn worktree_branch_parses_and_is_not_ignored() {
+        let config = Config::parse(
+            r#"
+[sandbox.s]
+image = "alpine"
+worktree-branch = "feat/${instance}"
+"#,
+        )
+        .unwrap();
+        let props = config.resolve_sandbox("s").unwrap().properties;
+        assert_eq!(props.worktree_branch.as_deref(), Some("feat/${instance}"));
+        assert!(props.ignored().is_empty());
+    }
+
+    #[test]
+    fn worktree_branch_merges_through_template() {
+        let config = Config::parse(
+            r#"
+[template.base]
+worktree-branch = "team/${instance}"
+
+[sandbox.s]
+extends = "base"
+image = "alpine"
+"#,
+        )
+        .unwrap();
+        let props = config.resolve_sandbox("s").unwrap().properties;
+        assert_eq!(props.worktree_branch.as_deref(), Some("team/${instance}"));
     }
 
     #[test]

@@ -46,7 +46,7 @@ Logs modal
   esc, q      close
 
 Command prompt (:)
-  run <sandbox> [--name n]    exec <instance> <cmd…>
+  run <sandbox> [--name n] [--branch b]   exec <instance> <cmd…>
   code <instance>             rm <instance>   stop <instance>
   tab         complete / cycle
   ↑ ↓         history

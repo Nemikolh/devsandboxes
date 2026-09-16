@@ -27,6 +27,11 @@ pub struct Instance {
     /// the base folder directly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<PathBuf>,
+    /// Git branch created for this instance's worktree, recorded so `rm` deletes
+    /// exactly the branch `run` created even if the config changed since. Only
+    /// set for worktree instances.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
     /// Host path of this instance's managed `.zsh_history`, when
     /// `persist-shell-history` is on. Kept on `rm` so a rebuilt instance with
     /// the same name inherits its history.
@@ -110,6 +115,7 @@ mod tests {
                 folder: "/home/u/repository-1".into(),
                 base_folder: "/home/u/repository-1".into(),
                 worktree: None,
+                branch: None,
                 shell_history: None,
                 workspace: "/workspaces/repository-1".into(),
                 workspace_file: None,

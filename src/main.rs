@@ -40,6 +40,10 @@ enum Command {
         /// Instance name; generated (and printed) when omitted
         #[arg(long)]
         name: Option<String>,
+        /// Branch for a worktree instance; overrides the sandbox's
+        /// `worktree-branch` (supports `${instance}`)
+        #[arg(long)]
+        branch: Option<String>,
     },
     /// Remove a sandbox instance (container, worktree, state entry)
     Rm {
@@ -105,7 +109,9 @@ fn main() -> Result<()> {
     match command {
         Command::Ls => commands::ls::ls(&cli.dir),
         Command::Ps { all } => commands::ps::ps(all),
-        Command::Run { sandbox, name } => commands::run::run(&cli.dir, sandbox, name),
+        Command::Run { sandbox, name, branch } => {
+            commands::run::run(&cli.dir, sandbox, name, branch)
+        }
         Command::Rm { name } => commands::rm::rm(&name),
         Command::Stop { name } => commands::stop::stop(&name),
         Command::Gc { force } => commands::services::gc(&cli.dir, force),

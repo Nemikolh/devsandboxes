@@ -13,7 +13,12 @@ use crate::features::{self, FeatureMetadata};
 use crate::runtime::{backend, ServiceEndpoint, NAME_PREFIX};
 use crate::state::{Instance, State};
 
-pub fn run(dir: &Path, sandbox_name: Option<String>, instance_name: Option<String>) -> Result<()> {
+pub fn run(
+    dir: &Path,
+    sandbox_name: Option<String>,
+    instance_name: Option<String>,
+    branch_override: Option<String>,
+) -> Result<()> {
     let config = match Config::load(dir) {
         Ok(config) if !config.sandboxes.is_empty() => config,
         _ => return offer_example_config(dir),
@@ -150,18 +155,25 @@ pub fn run(dir: &Path, sandbox_name: Option<String>, instance_name: Option<Strin
         .values()
         .filter(|i| i.base_folder == folder)
         .any(|i| container_running(&i.container));
-    let (source, worktree, extra_mounts) = if base_in_use {
+    let (source, worktree, branch, extra_mounts) = if base_in_use {
+        // Branch for the worktree: `--branch` override, else the sandbox's
+        // `worktree-branch`, else the default. `${instance}` (and the other mount
+        // variables) are substituted so each instance gets a unique branch.
+        let pattern = branch_override
+            .or_else(|| props.worktree_branch.clone())
+            .unwrap_or_else(|| "sandbox/${instance}".to_string());
+        let branch = substitute(&pattern, &var_ctx);
         // Must be absolute: `create_worktree` runs `git -C <base>`, so a
         // `dir`-relative path would resolve under the base repo instead of here,
         // and the mount/state would point at a different (empty) directory.
         let wt = config_dir.join(".worktrees").join(&instance);
-        create_worktree(&folder, &wt, &instance)?;
+        create_worktree(&folder, &wt, &branch)?;
         // The worktree's `.git` file points at `<base>/.git/worktrees/..`
         // by absolute host path; mount the base `.git` at the identical
         // path so git works inside the container.
-        (wt.clone(), Some(wt), vec![git_companion_mount(&folder)])
+        (wt.clone(), Some(wt), Some(branch), vec![git_companion_mount(&folder)])
     } else {
-        (folder.clone(), None, Vec::new())
+        (folder.clone(), None, None, Vec::new())
     };
     let mut mounts = resolve_mounts(dir, &folder, &basename, &instance, &sandbox)?;
     for (target, host) in &extra_folders {
@@ -203,6 +215,7 @@ pub fn run(dir: &Path, sandbox_name: Option<String>, instance_name: Option<Strin
             folder: source,
             base_folder: folder,
             worktree,
+            branch,
             shell_history,
             workspace: workspace.clone(),
             workspace_file,
@@ -273,10 +286,10 @@ fn container_running(container: &str) -> bool {
     backend().is_running(container).ok().flatten() == Some(true)
 }
 
-/// Create a git worktree with a fresh `sandbox/<instance>` branch. Git refuses
-/// to check out a branch already checked out elsewhere, so the branch is unique
-/// per instance.
-fn create_worktree(base: &Path, worktree: &Path, instance: &str) -> Result<()> {
+/// Create a git worktree on a fresh `branch`. Git refuses to check out a branch
+/// already checked out elsewhere, so the branch must be unique per instance
+/// (the default `sandbox/${instance}` pattern guarantees this).
+fn create_worktree(base: &Path, worktree: &Path, branch: &str) -> Result<()> {
     if let Some(parent) = worktree.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("cannot create {}", parent.display()))?;
@@ -294,7 +307,6 @@ fn create_worktree(base: &Path, worktree: &Path, instance: &str) -> Result<()> {
             base.display()
         );
     }
-    let branch = format!("sandbox/{instance}");
     let status = std::process::Command::new("git")
         .args([
             "-C",
@@ -303,7 +315,7 @@ fn create_worktree(base: &Path, worktree: &Path, instance: &str) -> Result<()> {
             "add",
             &worktree.to_string_lossy(),
             "-b",
-            &branch,
+            branch,
         ])
         .status()
         .context("failed to run git (is it installed?)")?;
@@ -1140,6 +1152,7 @@ mod tests {
             folder: "/tmp/repo".into(),
             base_folder: "/tmp/repo".into(),
             worktree: None,
+            branch: None,
             shell_history: None,
             workspace: "/workspaces/repo".into(),
             workspace_file: None,
