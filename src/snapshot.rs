@@ -340,6 +340,54 @@ fn validate_sandbox(dir: &Path, sb: &ResolvedSandbox) -> Vec<String> {
     issues
 }
 
+/// Build one [`SandboxRow`] per configured sandbox, in config order. A sandbox
+/// that resolves gets its real source/folder/services/hash plus any
+/// [`validate_sandbox`] issues; one that fails to resolve gets a placeholder row
+/// (source `?`, empty everything) and its resolve error is returned alongside so
+/// the caller can surface it (`collect` folds these into `Snapshot.error`; `ls
+/// --json` ignores them, the `?` row is the signal). Pure config work — no
+/// docker — shared verbatim by [`collect`] and `commands::ls`.
+pub fn sandbox_rows(dir: &Path, config: &Config) -> (Vec<SandboxRow>, Vec<String>) {
+    let mut rows = Vec::with_capacity(config.sandboxes.len());
+    let mut errors = Vec::new();
+    for name in config.sandboxes.keys() {
+        let extends = config
+            .sandboxes
+            .get(name)
+            .and_then(|t| t.get("extends"))
+            .map(extends_names)
+            .unwrap_or_default();
+        match config.resolve_sandbox(name) {
+            Ok(rs) => {
+                let services = rs.properties.services.clone().unwrap_or_default();
+                let issues = validate_sandbox(dir, &rs);
+                rows.push(SandboxRow {
+                    name: name.clone(),
+                    source: rs.source(),
+                    folder: rs.folder().map(str::to_string),
+                    services,
+                    extends,
+                    config_hash: rs.config_hash,
+                    issues,
+                });
+            }
+            Err(e) => {
+                errors.push(format!("sandbox `{name}`: {e:#}"));
+                rows.push(SandboxRow {
+                    name: name.clone(),
+                    source: "?".into(),
+                    folder: None,
+                    services: Vec::new(),
+                    extends,
+                    config_hash: String::new(),
+                    issues: Vec::new(),
+                });
+            }
+        }
+    }
+    (rows, errors)
+}
+
 /// Collect a fresh [`Snapshot`]. Blocking; run off the UI thread.
 ///
 /// State is the source of truth for which rows exist; the runtime enriches them
@@ -401,42 +449,16 @@ pub fn collect(dir: &Path) -> Snapshot {
     let mut sandboxes: Vec<SandboxRow> = Vec::new();
     match &config {
         Ok(cfg) => {
-            for name in cfg.sandboxes.keys() {
-                let extends = cfg
-                    .sandboxes
-                    .get(name)
-                    .and_then(|t| t.get("extends"))
-                    .map(extends_names)
-                    .unwrap_or_default();
-                match cfg.resolve_sandbox(name) {
-                    Ok(rs) => {
-                        let services = rs.properties.services.clone().unwrap_or_default();
-                        let issues = validate_sandbox(dir, &rs);
-                        sandboxes.push(SandboxRow {
-                            name: name.clone(),
-                            source: rs.source(),
-                            folder: rs.folder().map(str::to_string),
-                            services: services.clone(),
-                            extends,
-                            config_hash: rs.config_hash.clone(),
-                            issues,
-                        });
-                        resolved.insert(name.clone(), (services, rs.config_hash));
-                    }
-                    Err(e) => {
-                        errors.push(format!("sandbox `{name}`: {e:#}"));
-                        sandboxes.push(SandboxRow {
-                            name: name.clone(),
-                            source: "?".into(),
-                            folder: None,
-                            services: Vec::new(),
-                            extends,
-                            config_hash: String::new(),
-                            issues: Vec::new(),
-                        });
-                    }
-                }
+            let (rows, mut resolve_errors) = sandbox_rows(dir, cfg);
+            errors.append(&mut resolve_errors);
+            // The instance join needs each sandbox's services + hash; take them
+            // from the rows so nothing is resolved twice. Placeholder rows (empty
+            // hash) are skipped to match the old resolved-only map: comparing a
+            // container's hash label against "" would flag phantom drift.
+            for row in rows.iter().filter(|r| !r.config_hash.is_empty()) {
+                resolved.insert(row.name.clone(), (row.services.clone(), row.config_hash.clone()));
             }
+            sandboxes = rows;
         }
         Err(e) => errors.push(format!("config: {e:#}")),
     }
@@ -543,6 +565,45 @@ fn drifted(container: &str, expected: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sandbox_rows_empty_config_is_empty() {
+        let cfg = Config::parse("").unwrap();
+        let (rows, errors) = sandbox_rows(std::env::temp_dir().as_path(), &cfg);
+        assert!(rows.is_empty());
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn sandbox_rows_resolved_and_placeholder() {
+        // One sandbox with an image (resolves) and one that references a missing
+        // template (fails to resolve ⇒ `?` placeholder row + one error).
+        let cfg = Config::parse(
+            r#"
+[sandbox.web]
+image = "node:22"
+
+[sandbox.broken]
+extends = "does-not-exist"
+"#,
+        )
+        .unwrap();
+        let (rows, errors) = sandbox_rows(std::env::temp_dir().as_path(), &cfg);
+
+        assert_eq!(rows.len(), 2);
+        let web = rows.iter().find(|r| r.name == "web").unwrap();
+        assert_eq!(web.source, "image node:22");
+        assert!(!web.config_hash.is_empty());
+
+        let broken = rows.iter().find(|r| r.name == "broken").unwrap();
+        assert_eq!(broken.source, "?");
+        assert!(broken.config_hash.is_empty());
+        assert_eq!(broken.extends, vec!["does-not-exist".to_string()]);
+        assert!(broken.issues.is_empty());
+
+        assert_eq!(errors.len(), 1, "got: {errors:?}");
+        assert!(errors[0].contains("sandbox `broken`"), "got: {errors:?}");
+    }
 
     #[test]
     fn classify_from_rows() {

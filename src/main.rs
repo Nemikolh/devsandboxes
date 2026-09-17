@@ -27,12 +27,19 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// List the sandbox configs defined in config.toml
-    Ls,
+    Ls {
+        /// Output JSON instead of a table
+        #[arg(long)]
+        json: bool,
+    },
     /// List running sandbox instances
     Ps {
         /// Also show stopped instances
         #[arg(short, long)]
         all: bool,
+        /// Output JSON instead of a table
+        #[arg(long)]
+        json: bool,
     },
     /// Start a new sandbox instance (in the background)
     Run {
@@ -101,9 +108,16 @@ enum Command {
         /// Instance name, sandbox config name, repository folder name, or
         /// devsandbox container name (service containers included)
         name: String,
+        /// Output JSON instead of a table
+        #[arg(long)]
+        json: bool,
     },
     /// Show CPU/memory usage of running devsandbox containers
-    Stats,
+    Stats {
+        /// Output JSON instead of a table
+        #[arg(long)]
+        json: bool,
+    },
     /// Machine-readable snapshot of sandboxes, instances, and services
     Status {
         /// Emit JSON; mandatory for now (plain `status` is reserved for a
@@ -139,8 +153,8 @@ fn main() -> Result<()> {
     };
 
     match command {
-        Command::Ls => commands::ls::ls(&cli.dir),
-        Command::Ps { all } => commands::ps::ps(all),
+        Command::Ls { json } => commands::ls::ls(&cli.dir, json),
+        Command::Ps { all, json } => commands::ps::ps(all, json),
         Command::Run { sandbox, name, branch } => {
             commands::run::run(&cli.dir, sandbox, name, branch)
         }
@@ -150,8 +164,8 @@ fn main() -> Result<()> {
         Command::Start { name, all } => commands::start::start(&cli.dir, name, all),
         Command::Gc { force } => commands::services::gc(&cli.dir, force),
         Command::Logs { name, lines } => commands::logs::logs(&name, lines),
-        Command::Inspect { name } => commands::inspect::inspect(&name),
-        Command::Stats => commands::stats::stats(),
+        Command::Inspect { name, json } => commands::inspect::inspect(&name, json),
+        Command::Stats { json } => commands::stats::stats(json),
         Command::Status { json: _ } => commands::status::status(&cli.dir),
         Command::Exec { interactive, tty, name, command } => {
             commands::exec::exec(&name, interactive, tty, &command)

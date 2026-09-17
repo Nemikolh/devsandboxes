@@ -28,7 +28,7 @@ pub const NAME_PREFIX: &str = "devsandbox-";
 pub const RUNTIME_ENV: &str = "DEVSANDBOX_RUNTIME";
 
 /// One container as reported by the runtime's listing.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize)]
 pub struct ContainerRow {
     pub name: String,
     pub image: String,
@@ -53,7 +53,7 @@ impl ContainerRow {
 }
 
 /// Resource usage of one running container, pre-rendered for display.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct StatsRow {
     pub name: String,
     pub cpu: String,

@@ -1,15 +1,29 @@
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use toml::Value;
 
+use crate::commands::status::Envelope;
 use crate::config::Config;
 use crate::render::{bold_cyan, dim, green, magenta, yellow};
 
 const HEADERS: [&str; 5] = ["NAME", "SOURCE", "FOLDER", "SERVICES", "EXTENDS"];
 
-pub fn ls(dir: &Path) -> Result<()> {
+pub fn ls(dir: &Path, json: bool) -> Result<()> {
     let config = Config::load(dir)?;
+
+    // JSON path shares the snapshot's `SandboxRow` (structured services/extends,
+    // config_hash, issues) so a UI gets the same data the TUI does. No docker,
+    // like the table path; resolve failures become `?` rows rather than an error,
+    // and an empty config emits `data: []`, not the human "no sandboxes" prose.
+    if json {
+        let (rows, _errors) = crate::snapshot::sandbox_rows(dir, &config);
+        let out = serde_json::to_string_pretty(&Envelope::new(rows))
+            .context("serialize sandboxes")?;
+        println!("{out}");
+        return Ok(());
+    }
+
     let sandboxes = config.resolve_all()?;
     if sandboxes.is_empty() {
         println!(

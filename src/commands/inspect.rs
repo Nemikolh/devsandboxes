@@ -8,10 +8,16 @@ use crate::state::State;
 /// Pretty-print the runtime's `inspect` JSON for an instance or service
 /// container, with the same light key highlighting as the TUI inspect pane
 /// (color only on a TTY; see `render::paint`).
-pub fn inspect(name: &str) -> Result<()> {
+pub fn inspect(name: &str, json: bool) -> Result<()> {
     let state = State::load()?;
     let container = resolve_container(&state, name)?;
     let raw = backend().inspect_json(&container)?;
+    // JSON mode prints the runtime's own inspect document verbatim (no color, no
+    // envelope): the payload is the backend's schema, not ours.
+    if json {
+        println!("{}", pretty_inspect(&raw));
+        return Ok(());
+    }
     for line in pretty_inspect(&raw).lines() {
         println!("{}", paint_json_line(line));
     }
