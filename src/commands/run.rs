@@ -119,12 +119,7 @@ pub fn run(
     let (networks, endpoints) =
         services::ensure_services(&config, dir, &project, &instance, &service_names)?;
 
-    // First instance for this base folder mounts it directly; a base folder
-    // already owned by another instance (running or stopped — a stopped one can
-    // be started anytime) gets a git worktree so two containers never share a
-    // working tree.
-    let base_in_use = state.instances.values().any(|i| i.base_folder == folder);
-    let (source, worktree, branch, extra_mounts) = if base_in_use {
+    let (source, worktree, branch, extra_mounts) = if base_in_use(&state, &folder) {
         // Branch for the worktree: `--branch` override, else the sandbox's
         // `worktree-branch`, else the default. `${instance}` (and the other mount
         // variables) are substituted so each instance gets a unique branch.
@@ -221,6 +216,16 @@ pub fn run(
 
     println!("{instance}");
     Ok(())
+}
+
+/// Whether some instance (running or stopped — a stopped one can be started
+/// anytime) already mounts `folder` as its working tree; the new instance then
+/// gets a git worktree so two containers never share a working tree. Matched on
+/// `folder` (the mounted source), not `base_folder`: worktree instances carry
+/// the base's `base_folder` but have their own working tree, so they must not
+/// keep the base checkout reserved after its direct-mount instance is removed.
+fn base_in_use(state: &State, folder: &Path) -> bool {
+    state.instances.values().any(|i| i.folder == folder)
 }
 
 /// Default instance name: the sandbox name when it is free in state, else the
@@ -1158,6 +1163,23 @@ mod tests {
     fn default_name_is_sandbox_when_absent() {
         let state = State::default();
         assert_eq!(default_instance_name(&state, "repo"), "repo");
+    }
+
+    #[test]
+    fn base_in_use_ignores_worktree_instances() {
+        let base = Path::new("/tmp/repo");
+        let mut state = State::default();
+        // A worktree instance references the base via `base_folder` but mounts
+        // its own tree: the base stays reclaimable for a direct mount.
+        let mut wt = instance("repo-2");
+        wt.folder = "/cfg/.worktrees/repo-2".into();
+        wt.worktree = Some("/cfg/.worktrees/repo-2".into());
+        state.instances.insert("repo-2".into(), wt);
+        assert!(!base_in_use(&state, base));
+
+        // A direct-mount instance (even stopped) reserves it.
+        state.instances.insert("repo".into(), instance("repo"));
+        assert!(base_in_use(&state, base));
     }
 
     #[test]
