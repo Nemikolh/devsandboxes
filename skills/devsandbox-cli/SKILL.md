@@ -176,11 +176,12 @@ listed when stdin is not a TTY.
    containers. Idempotent (already-stopped/missing is fine). State survives; a
    later `run` restarts it.
 
-9. **`rebuild <name>`** (alias `recreate`) — recreate the instance's container
-   from the current config when it has drifted; the worktree, branch, instance
-   name, and per-instance state (shell history, `${instance}` mounts) are kept
-   and the lifecycle commands re-run. No drift → no-op (safe to run
-   speculatively). The fix for the config-drift warning.
+9. **`rebuild <name>`** / **`rebuild --all`** (alias `recreate`) — recreate the
+   instance's container from the current config when it has drifted; the
+   worktree, branch, instance name, and per-instance state (shell history,
+   `${instance}` mounts) are kept and the lifecycle commands re-run. No drift →
+   no-op (safe to run speculatively). `--all` rebuilds every drifted instance,
+   skipping ones from other config roots. The fix for the config-drift warning.
 
 10. **`rm <name>`** — remove container, its worktree (prompts to delete the
    `sandbox/<instance>` branch on a TTY), isolated services, per-instance network,

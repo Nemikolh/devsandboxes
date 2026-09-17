@@ -66,7 +66,7 @@ devsandbox                  # no args on a TTY: interactive dashboard
 | `run [sandbox] [--name n] [--branch b]` | Create a fresh instance in the background; interactive picker without args. Never restarts a stopped instance (that is `start`). `--branch` sets the worktree branch, overriding the sandbox's `worktree-branch` |
 | `start <name>` / `start --all` | Restart a stopped instance, full path: config-drift warning, services recreated/started, service DNS rewired, `postStartCommand`         |
 | `stop <name>` / `stop --all`   | `docker stop` of the instance and its isolated services; `start` restarts it                                                             |
-| `rebuild <name>` (alias `recreate`) | Recreate the container from the current config when it has drifted; worktree, branch, and per-instance state are kept. No drift → no-op |
+| `rebuild <name>` / `rebuild --all` (alias `recreate`) | Recreate the container from the current config when it has drifted; worktree, branch, and per-instance state are kept. No drift → no-op; `--all` rebuilds every drifted instance |
 | `rm <name>`                    | Remove container, worktree, and state entry (managed shell history is kept so a rebuilt instance inherits it)                            |
 | `exec [-i] [-t] <name> <cmd…>` | Exec in an instance, honoring `remoteEnv` / `remoteUser`                                                                                 |
 | `gc [--force]`                 | Remove services no live instance references, orphaned shell-history files                                                                |

@@ -10,36 +10,78 @@ use crate::state::{Instance, State};
 /// Recreate an instance's container from the *current* config, preserving the
 /// worktree, branch, instance name, and per-instance state (shell history,
 /// `${instance}`-anchored mounts). No config drift is a no-op with a message.
+/// `--all` rebuilds every drifted instance, skipping (with a note) ones that
+/// don't resolve here instead of aborting the batch.
 ///
 /// Unlike `start`, which falls back to a bare container start when the config
 /// no longer resolves, `rebuild` bails: re-materializing against a config that
 /// doesn't match the instance would silently rebuild it wrong.
-pub fn rebuild(dir: &Path, name: &str) -> Result<()> {
+pub fn rebuild(dir: &Path, name: Option<String>, all: bool) -> Result<()> {
     let mut state = State::load()?;
-    let key = resolve_instance(&state, name)?;
-    let info = state.instances.get(&key).expect("key came from state");
-
-    let config = Config::load(dir)
-        .with_context(|| format!("cannot load config to rebuild `{key}`"))?;
+    let config = Config::load(dir).context("cannot load config to rebuild against")?;
     let project = services::project_id(dir)?;
-    let sandbox = resolve(&config, info, &project, &key)?;
 
-    // Drift check against the container's recorded hash.
-    // - `Some(hash)` equal   → nothing to do.
-    // - `Some(hash)` differ  → rebuild.
-    // - `None` (container or label gone, e.g. removed manually) → rebuild anyway.
-    //   It is the only worktree-preserving way back to a live instance: `run`
-    //   refuses the taken name and `rm` destroys the worktree.
-    if let Some(hash) = backend().label(&info.container, "devsandbox.config_hash")?
-        && hash == sandbox.config_hash
-    {
-        println!("no config drift for `{key}`; nothing to do");
+    if all {
+        let mut rebuilt = 0;
+        // Keys first: `rebuild_instance` needs `&mut state` (materialize
+        // replaces the entry), so we can't hold an iterator over it.
+        for key in state.instances.keys().cloned().collect::<Vec<_>>() {
+            let info = state.instances.get(&key).expect("key came from state");
+            // A batch shouldn't die on the first foreign instance; note and go on.
+            let sandbox = match resolve(&config, info, &project, &key) {
+                Ok(sandbox) => sandbox,
+                Err(e) => {
+                    eprintln!("skipping `{key}`: {e:#}");
+                    continue;
+                }
+            };
+            if !needs_rebuild(&info.container, &sandbox.config_hash)? {
+                continue;
+            }
+            rebuild_instance(dir, &config, &sandbox, &key, &mut state)?;
+            rebuilt += 1;
+        }
+        if rebuilt == 0 {
+            println!("nothing to rebuild");
+        }
         return Ok(());
     }
 
-    // Clone everything materialize needs out of `info` before borrowing state
-    // mutably; `folder` is the mounted working tree (worktree or base folder),
-    // `base_folder` the canonicalized base.
+    let name = name.expect("clap requires a name without --all");
+    let key = resolve_instance(&state, &name)?;
+    let info = state.instances.get(&key).expect("key came from state");
+    let sandbox = resolve(&config, info, &project, &key)?;
+
+    if !needs_rebuild(&info.container, &sandbox.config_hash)? {
+        println!("no config drift for `{key}`; nothing to do");
+        return Ok(());
+    }
+    rebuild_instance(dir, &config, &sandbox, &key, &mut state)
+}
+
+/// Drift check against the container's recorded hash.
+/// - `Some(hash)` equal   → nothing to do.
+/// - `Some(hash)` differ  → rebuild.
+/// - `None` (container or label gone, e.g. removed manually) → rebuild anyway.
+///   It is the only worktree-preserving way back to a live instance: `run`
+///   refuses the taken name and `rm` destroys the worktree.
+fn needs_rebuild(container: &str, expected: &str) -> Result<bool> {
+    Ok(backend().label(container, "devsandbox.config_hash")? != Some(expected.to_string()))
+}
+
+/// Remove `key`'s container and re-materialize it from `config`, reusing the
+/// stored source/worktree/branch so the working tree survives.
+fn rebuild_instance(
+    dir: &Path,
+    config: &Config,
+    sandbox: &ResolvedSandbox,
+    key: &str,
+    state: &mut State,
+) -> Result<()> {
+    // Clone everything materialize needs out of the entry before borrowing
+    // state mutably; `folder` is the mounted working tree (worktree or base
+    // folder), `base_folder` the canonicalized base.
+    let info = state.instances.get(key).expect("key came from state");
     let sandbox_name = info.sandbox.clone();
     let container = info.container.clone();
     let source = info.folder.clone();
@@ -55,15 +97,15 @@ pub fn rebuild(dir: &Path, name: &str) -> Result<()> {
     // — intended: the point of rebuild is to re-apply the current config.
     run::materialize(
         dir,
-        &config,
+        config,
         &sandbox_name,
-        &sandbox,
-        &key,
+        sandbox,
+        key,
         &source,
         &base_folder,
         worktree,
         branch,
-        &mut state,
+        state,
     )?;
 
     println!("rebuilt {key}");

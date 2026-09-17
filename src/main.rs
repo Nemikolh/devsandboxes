@@ -50,7 +50,11 @@ enum Command {
     #[command(visible_alias = "recreate")]
     Rebuild {
         /// Instance name, sandbox config name, or repository folder name
-        name: String,
+        #[arg(required_unless_present = "all")]
+        name: Option<String>,
+        /// Rebuild every instance whose config has drifted
+        #[arg(long, conflicts_with = "name")]
+        all: bool,
     },
     /// Remove a sandbox instance (container, worktree, state entry)
     Rm {
@@ -132,7 +136,7 @@ fn main() -> Result<()> {
         Command::Run { sandbox, name, branch } => {
             commands::run::run(&cli.dir, sandbox, name, branch)
         }
-        Command::Rebuild { name } => commands::rebuild::rebuild(&cli.dir, &name),
+        Command::Rebuild { name, all } => commands::rebuild::rebuild(&cli.dir, name, all),
         Command::Rm { name } => commands::rm::rm(&name),
         Command::Stop { name, all } => commands::stop::stop(name, all),
         Command::Start { name, all } => commands::start::start(&cli.dir, name, all),
