@@ -104,6 +104,13 @@ enum Command {
     },
     /// Show CPU/memory usage of running devsandbox containers
     Stats,
+    /// Machine-readable snapshot of sandboxes, instances, and services
+    Status {
+        /// Emit JSON; mandatory for now (plain `status` is reserved for a
+        /// future human summary)
+        #[arg(long, required = true)]
+        json: bool,
+    },
     /// Run a command in a sandbox instance
     Exec {
         /// Keep stdin open
@@ -145,6 +152,7 @@ fn main() -> Result<()> {
         Command::Logs { name, lines } => commands::logs::logs(&name, lines),
         Command::Inspect { name } => commands::inspect::inspect(&name),
         Command::Stats => commands::stats::stats(),
+        Command::Status { json: _ } => commands::status::status(&cli.dir),
         Command::Exec { interactive, tty, name, command } => {
             commands::exec::exec(&name, interactive, tty, &command)
         }

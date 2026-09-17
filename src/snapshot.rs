@@ -7,13 +7,18 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Instant;
 
+use serde::Serialize;
+
 use crate::commands::services::{isolated_service_container, project_id, service_container};
 use crate::config::{Config, MountContext, ResolvedSandbox, ServiceScope};
 use crate::runtime::{backend, ContainerRow, NAME_PREFIX};
 use crate::state::{Instance, State};
 
 /// Container liveness, joined from `docker ps` against the state's instance list.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Serializes as an internally-tagged object so JSON consumers switch on
+/// `state` and read the runtime text from `text` (absent for `missing`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", content = "text", rename_all = "lowercase")]
 pub enum ContainerStatus {
     /// Container exists and is up. Carries docker's raw `Status` text (e.g.
     /// "Up 3 minutes").
@@ -36,7 +41,7 @@ impl ContainerStatus {
 }
 
 /// One instance row, everything the Instances view needs pre-joined.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct InstanceRow {
     pub name: String,
     pub sandbox: String,
@@ -58,7 +63,7 @@ pub struct InstanceRow {
 /// One sandbox row from `config.toml`, everything the Instances tree needs to
 /// render a sandbox node. Every configured sandbox gets one, even with zero
 /// instances; a sandbox that fails to resolve still gets a row with source `?`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct SandboxRow {
     pub name: String,
     /// Like `ResolvedSandbox::source`: `image X` / `dockerfile Y`, or `?` when
@@ -77,7 +82,7 @@ pub struct SandboxRow {
 }
 
 /// One service row, everything the Services view needs pre-joined.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct ServiceRow {
     pub name: String,
     /// `"global"` or `"isolated"`.
@@ -101,7 +106,7 @@ pub struct ServiceRow {
 
 /// A point-in-time view of instances plus any collection error (docker/config
 /// unavailable). Rows are always present from state even when docker is down.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct Snapshot {
     pub instances: Vec<InstanceRow>,
     /// Sandboxes from `config.toml`, in config order. Empty when config is
@@ -117,6 +122,9 @@ pub struct Snapshot {
     /// the version probe failed. Feeds the header totals line.
     pub runtime_version: Option<String>,
     /// When collection finished. Drives the staleness indicator in the header.
+    /// Skipped in JSON: it is a monotonic `Instant` with no wall-clock meaning
+    /// off-process; a JSON consumer prints at collection time itself.
+    #[serde(skip)]
     pub collected_at: Instant,
     pub error: Option<String>,
 }

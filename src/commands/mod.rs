@@ -9,6 +9,7 @@ pub mod run;
 pub mod services;
 pub mod start;
 pub mod stats;
+pub mod status;
 pub mod stop;
 
 use std::io::{IsTerminal, Write};
