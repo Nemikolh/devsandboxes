@@ -3,6 +3,7 @@ mod config;
 mod features;
 mod render;
 mod runtime;
+mod snapshot;
 mod state;
 mod tui;
 
