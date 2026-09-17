@@ -369,15 +369,42 @@ fn launch_code(dir: &Path, app: &App, instance: &str) -> String {
         Some(file) => ("--file-uri", file.as_str()),
         None => ("--folder-uri", row.workspace.as_str()),
     };
-    let uri = format!(
-        "vscode-remote://attached-container+{}/{}",
-        hex_encode(&row.container),
-        path
-    );
+    // The Remote-Containers extension resolves a different authority per runtime.
+    // Docker/podman use `attached-container` (hex of the bare container name).
+    // Apple `container` uses `apple-container` (hex of a JSON `{id, image}`
+    // payload) and requires the user's opt-in
+    // `dev.containers.experimentalAppleContainerSupport` setting.
+    let backend = crate::runtime::backend();
+    let (authority, hint) = if backend.name() == "container" {
+        let image = apple_image_reference(&row.container).unwrap_or_default();
+        let payload = serde_json::json!({ "id": row.container, "image": image }).to_string();
+        (
+            format!("apple-container+{}", hex_encode(&payload)),
+            " (needs dev.containers.experimentalAppleContainerSupport=true)",
+        )
+    } else {
+        (format!("attached-container+{}", hex_encode(&row.container)), "")
+    };
+    let uri = format!("vscode-remote://{authority}/{path}");
     match std::process::Command::new("code").args([flag, &uri]).spawn() {
-        Ok(_) => format!("opening VS Code → {instance}"),
+        Ok(_) => format!("opening VS Code → {instance}{hint}"),
         Err(e) => format!("code: failed to launch (`code` on PATH?): {e}"),
     }
+}
+
+/// Apple `container` image reference (`configuration.image.reference`) for
+/// `container`, needed in the `apple-container` attach URI payload. Best-effort:
+/// `None` when inspect fails or the field is absent, in which case the caller
+/// sends an empty image (the resolver only requires `id`).
+fn apple_image_reference(container: &str) -> Option<String> {
+    let json = crate::runtime::backend().inspect_json(container).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&json).ok()?;
+    let obj = v.get(0).unwrap_or(&v);
+    obj.get("configuration")?
+        .get("image")?
+        .get("reference")?
+        .as_str()
+        .map(str::to_string)
 }
 
 /// Lowercase hex of a string's UTF-8 bytes, as the Remote-Containers URI wants.
@@ -491,5 +518,22 @@ mod tests {
         assert_eq!(hex_encode("devsandbox-web"), "64657673616e64626f782d776562");
         assert_eq!(hex_encode(""), "");
         assert_eq!(hex_encode("A/z"), "412f7a");
+    }
+
+    #[test]
+    fn apple_authority_payload_roundtrips() {
+        // The `apple-container` authority carries hex of a JSON `{id, image}`
+        // payload; VS Code hex-decodes and `JSON.parse`s it. Verify the encoding
+        // devsandbox emits decodes back to that object.
+        let payload = serde_json::json!({ "id": "devsandbox-web", "image": "img:latest" })
+            .to_string();
+        let hex = hex_encode(&payload);
+        let bytes: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect();
+        let decoded: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(decoded["id"], "devsandbox-web");
+        assert_eq!(decoded["image"], "img:latest");
     }
 }

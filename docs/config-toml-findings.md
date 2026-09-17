@@ -33,11 +33,14 @@ shared pnpm/cargo caches. Minimum viable support:
   concatenate with the sandbox's, not be overwritten (see #4).
 
 ## 2. Managed per-instance shell history (feature) — DONE
-Implemented via a `persist-shell-history` knob: a per-instance file under
-`${configDir}/shared-volumes/history/` is provisioned, bind-mounted to
-`/root/.zsh_history`, recorded in state, and kept on `rm` so a rebuilt
-same-name instance inherits its history. Orphaned files are reaped by `gc`
-(confirmed per file, or unconditionally with `--force`). Original notes below.
+Implemented via a `persist-shell-history` knob: a per-instance directory
+`${configDir}/shared-volumes/history/<instance>/` is provisioned, bind-mounted
+to `/commandhistory`, and `HISTFILE=/commandhistory/.zsh_history` is set on the
+container. A directory (not a file) is mounted because Apple's `container`
+cannot bind-mount a single file. The file path is recorded in state and kept on
+`rm` so a rebuilt same-name instance inherits its history. Orphaned dirs are
+reaped by `gc` (confirmed per entry, or unconditionally with `--force`).
+Original notes below.
 
 The user wants `.zsh_history` persisted but unique per sandbox. Since instances
 already have deterministic names, devsandbox can own this end to end:

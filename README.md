@@ -96,7 +96,7 @@ devsandbox extras on a sandbox:
 | `folders`               | Extra VS Code workspace roots: container path → host folder; generates a `.code-workspace`            |
 | `services`              | Service names to start and network alongside the instance                                             |
 | `caches`                | Package-manager caches to persist and share across the config root                                    |
-| `persist-shell-history` | Per-instance `.zsh_history` on the host; survives rebuilds, never shared between concurrent instances |
+| `persist-shell-history` | Per-instance history dir on the host, mounted at `/commandhistory` with `HISTFILE` set; survives rebuilds, never shared between concurrent instances |
 | `worktree-branch`       | Branch created for a worktree instance (supports `${instance}`); defaults to `sandbox/${instance}`; `run --branch` overrides it |
 
 Mount sources support devcontainer-style variables: `${configDir}`, `${localWorkspaceFolder}`, `${localWorkspaceFolderBasename}`, `${localEnv:VAR}`, plus devsandbox's `${sharedVolumes}` (the config root's persistent-state dir) and `${instance}` (the running instance name).
@@ -105,7 +105,14 @@ Mount sources support devcontainer-style variables: `${configDir}`, `${localWork
 
 ## Container runtimes
 
-All runtime calls go through a `Backend` trait (`src/runtime/`): `docker` and `podman` share the docker-CLI shape; Apple's `container` (macOS 26+) has its own backend working around missing `--filter`, Go templates, `network connect`, and `top`. Selection: `DEVSANDBOX_RUNTIME=docker|podman|container`, else `container` on macOS, `docker` elsewhere. Details in `docs/runtimes.md`.
+All runtime calls go through a `Backend` trait (`src/runtime/`): `docker` and `podman` share the docker-CLI shape; Apple's `container` (macOS 26+) has its own backend working around missing `--filter`, Go templates, `network connect`, and `top`. Selection: `DEVSANDBOX_RUNTIME=docker|podman|container`, else on macOS `docker` when the `docker` client is on `PATH` (e.g. OrbStack — which ships it and auto-selects its own context — or Docker Desktop) and Apple `container` otherwise, `docker` elsewhere. Details in `docs/runtimes.md`.
+
+### VS Code attach on Apple `container` (fallback runtime)
+
+VS Code attach (`o` in the dashboard) uses the Remote-Containers extension. On Apple `container` this needs the extension's experimental support: set `"dev.containers.experimentalAppleContainerSupport": true` in your VS Code settings (the `o` status bar reminds you). Two limitations come from the extension, not devsandbox:
+
+- Per-container extension auto-install (`nameConfigs`) is Docker-only, so on Apple `container` the configured `customizations.vscode.extensions` are written as **recommendations** in the generated `.code-workspace` (VS Code offers to install them on open) instead of installing silently.
+- The flag exists in VS Code proper; forks (e.g. Cursor) may not expose it yet.
 
 ## State
 

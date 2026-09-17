@@ -32,7 +32,8 @@ pub struct Instance {
     /// set for worktree instances.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
-    /// Host path of this instance's managed `.zsh_history`, when
+    /// Host path of this instance's managed `.zsh_history` (inside the
+    /// per-instance history dir bind-mounted at `/commandhistory`), when
     /// `persist-shell-history` is on. Kept on `rm` so a rebuilt instance with
     /// the same name inherits its history.
     #[serde(default, skip_serializing_if = "Option::is_none")]

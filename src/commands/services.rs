@@ -375,10 +375,11 @@ pub fn gc(dir: &Path, force: bool) -> Result<()> {
     Ok(())
 }
 
-/// Delete `shared-volumes/history/<instance>.zsh_history` files whose instance
+/// Delete `shared-volumes/history/<instance>/` dirs (and legacy flat
+/// `<instance>.zsh_history` files from the pre-directory layout) whose instance
 /// is gone from state (any config root: instance names are global, so a match
-/// anywhere means the file is still owned). Kept on `rm` so history survives
-/// rebuilds; this is the explicit reaping path. Confirmed per file unless
+/// anywhere means the entry is still owned). Kept on `rm` so history survives
+/// rebuilds; this is the explicit reaping path. Confirmed per entry unless
 /// `force`.
 fn gc_shell_history(dir: &Path, state: &State, force: bool) -> Result<()> {
     let history_dir = dir.join("shared-volumes").join("history");
@@ -387,12 +388,17 @@ fn gc_shell_history(dir: &Path, state: &State, force: bool) -> Result<()> {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        let Some(instance) = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .and_then(|n| n.strip_suffix(".zsh_history"))
-        else {
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
+        };
+        let is_dir = path.is_dir();
+        let instance = if is_dir {
+            name
+        } else {
+            match name.strip_suffix(".zsh_history") {
+                Some(instance) => instance,
+                None => continue,
+            }
         };
         if state.instances.contains_key(instance) {
             continue;
@@ -400,8 +406,12 @@ fn gc_shell_history(dir: &Path, state: &State, force: bool) -> Result<()> {
         if !force && !super::confirm(&format!("delete shell history `{}`?", path.display()))? {
             continue;
         }
-        std::fs::remove_file(&path)
-            .with_context(|| format!("cannot remove {}", path.display()))?;
+        if is_dir {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        }
+        .with_context(|| format!("cannot remove {}", path.display()))?;
         println!("removed history {}", path.display());
     }
     Ok(())

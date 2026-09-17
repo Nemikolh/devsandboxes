@@ -226,15 +226,35 @@ pub fn backend_named(name: &str) -> Option<Box<dyn Backend>> {
     })
 }
 
-/// Backend name devsandbox uses on this host: [`RUNTIME_ENV`] when set, else
-/// Apple's `container` on macOS (Docker Desktop's file sharing is not native
-/// there) and `docker` everywhere else.
-pub fn default_backend_name(env: Option<&str>, macos: bool) -> &'static str {
+/// Whether the `docker` client resolves on `PATH`. Client-only (`--version`
+/// prints the CLI version without contacting a daemon), so it stays fast and
+/// does not hang when no engine is running.
+fn docker_on_path() -> bool {
+    Command::new("docker")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Backend name devsandbox uses on this host: [`RUNTIME_ENV`] when set, else on
+/// macOS `docker` when the `docker` client is on `PATH` (e.g. OrbStack, which
+/// ships it and auto-selects its own context, or Docker Desktop) and Apple's
+/// `container` otherwise; `docker` everywhere else.
+pub fn default_backend_name(env: Option<&str>, macos: bool, docker_on_path: bool) -> &'static str {
     match env {
         Some("docker") => "docker",
         Some("podman") => "podman",
         Some("container") | Some("apple") => "container",
-        Some(_) | None if macos => "container",
+        Some(_) | None if macos => {
+            if docker_on_path {
+                "docker"
+            } else {
+                "container"
+            }
+        }
         _ => "docker",
     }
 }
@@ -252,7 +272,12 @@ pub fn backend() -> &'static dyn Backend {
                     "warning: unknown {RUNTIME_ENV}=`{value}` (expected docker, podman or container); using the default"
                 );
             }
-            let name = default_backend_name(env.as_deref(), cfg!(target_os = "macos"));
+            let macos = cfg!(target_os = "macos");
+            // The PATH probe only affects the macOS default arm (no explicit
+            // backend selected); skip it whenever it can't change the outcome.
+            let explicit = matches!(env.as_deref(), Some("docker" | "podman" | "container" | "apple"));
+            let docker = macos && !explicit && docker_on_path();
+            let name = default_backend_name(env.as_deref(), macos, docker);
             backend_named(name).expect("default backend name is valid")
         })
         .as_ref()
@@ -290,15 +315,20 @@ mod tests {
 
     #[test]
     fn default_backend_prefers_env_then_os() {
-        assert_eq!(default_backend_name(None, true), "container");
-        assert_eq!(default_backend_name(None, false), "docker");
-        assert_eq!(default_backend_name(Some("docker"), true), "docker");
-        assert_eq!(default_backend_name(Some("podman"), true), "podman");
-        assert_eq!(default_backend_name(Some("podman"), false), "podman");
-        assert_eq!(default_backend_name(Some("container"), false), "container");
-        // Unknown values fall back to the OS default.
-        assert_eq!(default_backend_name(Some("nope"), true), "container");
-        assert_eq!(default_backend_name(Some("nope"), false), "docker");
+        // macOS default: docker when the client is on PATH, else Apple container.
+        assert_eq!(default_backend_name(None, true, true), "docker");
+        assert_eq!(default_backend_name(None, true, false), "container");
+        // Non-macOS is always docker; the PATH flag is irrelevant.
+        assert_eq!(default_backend_name(None, false, false), "docker");
+        // Explicit env wins regardless of OS or PATH.
+        assert_eq!(default_backend_name(Some("docker"), true, false), "docker");
+        assert_eq!(default_backend_name(Some("podman"), true, true), "podman");
+        assert_eq!(default_backend_name(Some("podman"), false, false), "podman");
+        assert_eq!(default_backend_name(Some("container"), false, true), "container");
+        // Unknown values fall back to the OS default arm.
+        assert_eq!(default_backend_name(Some("nope"), true, true), "docker");
+        assert_eq!(default_backend_name(Some("nope"), true, false), "container");
+        assert_eq!(default_backend_name(Some("nope"), false, false), "docker");
     }
 
     #[test]

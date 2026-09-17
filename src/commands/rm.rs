@@ -21,7 +21,7 @@ pub fn rm(name: &str) -> Result<()> {
     // Remove the container; ignore failure (it may already be gone).
     let _ = backend().remove_force(&container);
 
-    // The managed shell-history file is deliberately kept: `run` re-provisions
+    // The managed shell-history dir is deliberately kept: `run` re-provisions
     // the same per-instance path, so history survives an rm + run rebuild.
 
     // Reap this instance's isolated services and its per-instance network. Global
@@ -31,7 +31,9 @@ pub fn rm(name: &str) -> Result<()> {
             let _ = backend().remove_force(&svc);
         }
         let network = crate::commands::services::instance_network(&project, &key);
-        let _ = backend().run_inherit(&["network", "rm", &network]);
+        if backend().network_exists(&network).unwrap_or(false) {
+            let _ = backend().run_inherit(&["network", "rm", &network]);
+        }
     }
 
     if let Some(worktree) = worktree {

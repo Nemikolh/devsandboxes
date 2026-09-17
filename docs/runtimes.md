@@ -11,10 +11,16 @@ implementations exist:
 ## Selection
 
 1. `DEVSANDBOX_RUNTIME=docker|podman|container` when set.
-2. Otherwise `container` on macOS (Docker Desktop's file sharing is not native
-   there), `docker` everywhere else.
+2. Otherwise, on macOS, `docker` when the `docker` client is on `PATH`, else
+   Apple `container`; `docker` everywhere else.
 
 An unknown value warns and falls back to rule 2.
+
+OrbStack needs no special handling: it *is* the `docker` backend. It ships the
+standard `docker` CLI and auto-selects its own `docker context`, so once it's
+installed the PATH probe picks `docker` and every call goes through
+`Dockerlike`. (Same for Docker Desktop or any other engine that puts `docker`
+on `PATH`.)
 
 ## Apple `container` caveats
 

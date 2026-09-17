@@ -216,10 +216,12 @@ pub(crate) fn materialize(
     // Package-manager caches: shared bind mounts + the env vars pointing at them.
     let (cache_mounts, cache_env) = resolve_caches(&config_dir, props)?;
     mounts.extend(cache_mounts);
-    // Managed per-instance shell history: provision the host file and mount it.
+    // Managed per-instance shell history: mount the host dir, point zsh at it.
+    let mut extra_env = cache_env;
     let shell_history = if props.persist_shell_history == Some(true) {
-        let (path, mount) = provision_shell_history(dir, instance)?;
+        let (path, mount, env) = provision_shell_history(dir, instance)?;
         mounts.push(mount);
+        extra_env.push(env);
         Some(path)
     } else {
         None
@@ -233,12 +235,18 @@ pub(crate) fn materialize(
         &workspace,
         &extra_mounts,
         &mounts,
-        &cache_env,
+        &extra_env,
         &networks,
         &endpoints,
     )?;
     let container = container_name.clone();
-    let workspace_file = write_workspace_file(&container, instance, &workspace, &extra_folders);
+    let workspace_file = write_workspace_file(
+        &container,
+        instance,
+        &workspace,
+        &extra_folders,
+        props.vscode_extensions().unwrap_or(&[]),
+    );
 
     state.instances.insert(
         instance.to_string(),
@@ -549,14 +557,24 @@ fn resolve_folders(
 }
 
 /// JSON body of the generated `.code-workspace`: the primary workspace folder
-/// first, then the extra `folders` roots.
-fn workspace_file_json(workspace: &str, extra_folders: &[(String, PathBuf)]) -> String {
+/// first, then the extra `folders` roots. `recommendations`, when non-empty, is
+/// written as `extensions.recommendations` so VS Code offers to install them —
+/// the fallback for backends where auto-install via `nameConfigs` is unavailable
+/// (see [`write_workspace_file`]).
+fn workspace_file_json(
+    workspace: &str,
+    extra_folders: &[(String, PathBuf)],
+    recommendations: &[String],
+) -> String {
     let folders: Vec<serde_json::Value> = std::iter::once(workspace)
         .chain(extra_folders.iter().map(|(target, _)| target.as_str()))
         .map(|path| serde_json::json!({ "path": path }))
         .collect();
-    serde_json::to_string_pretty(&serde_json::json!({ "folders": folders }))
-        .expect("workspace json serializes")
+    let mut root = serde_json::json!({ "folders": folders });
+    if !recommendations.is_empty() {
+        root["extensions"] = serde_json::json!({ "recommendations": recommendations });
+    }
+    serde_json::to_string_pretty(&root).expect("workspace json serializes")
 }
 
 /// Write `/workspaces/<instance>.code-workspace` inside the container so VS
@@ -569,9 +587,18 @@ fn write_workspace_file(
     instance: &str,
     workspace: &str,
     extra_folders: &[(String, PathBuf)],
+    extensions: &[String],
 ) -> Option<String> {
     let path = format!("/workspaces/{instance}.code-workspace");
-    let json = workspace_file_json(workspace, extra_folders);
+    // The Remote-Containers `nameConfigs` file (see `write_vscode_name_config`)
+    // installs extensions automatically only for Docker containers; on Apple
+    // `container` it is ignored, so fall back to workspace recommendations.
+    let recommendations: &[String] = if backend().name() == "container" {
+        extensions
+    } else {
+        &[]
+    };
+    let json = workspace_file_json(workspace, extra_folders, recommendations);
     let script = r#"mkdir -p "${2%/*}" && printf '%s\n' "$1" > "$2""#;
     match backend().run_checked(&["exec", container, "sh", "-c", script, "sh", &json, &path]) {
         Ok(()) => Some(path),
@@ -609,27 +636,32 @@ fn resolve_caches(
     Ok((mounts, env))
 }
 
-/// Provision this instance's managed `.zsh_history` under
-/// `${configDir}/shared-volumes/history/<instance>.zsh_history` (touched so the
-/// bind mounts as a file, not a directory) and return (host path, `--mount` arg).
-/// An existing file is reused untouched, so history survives rm + run rebuilds.
-fn provision_shell_history(dir: &Path, instance: &str) -> Result<(PathBuf, String)> {
+/// Container mount point of the managed shell-history directory.
+const HISTORY_TARGET: &str = "/commandhistory";
+
+/// Provision this instance's managed shell history under
+/// `${configDir}/shared-volumes/history/<instance>/.zsh_history` and return
+/// (host file path, `--mount` arg, `HISTFILE` env pair). The *directory* is
+/// bind-mounted (Apple's `container` cannot bind a single file) and zsh is
+/// pointed at the file inside it via `HISTFILE`. An existing file is reused
+/// untouched, so history survives rm + run rebuilds.
+fn provision_shell_history(
+    dir: &Path,
+    instance: &str,
+) -> Result<(PathBuf, String, (String, String))> {
     let config_dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
-    let path = config_dir
-        .join("shared-volumes")
-        .join("history")
-        .join(format!("{instance}.zsh_history"));
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("cannot create {}", parent.display()))?;
-    }
+    let history_dir = config_dir.join("shared-volumes").join("history").join(instance);
+    std::fs::create_dir_all(&history_dir)
+        .with_context(|| format!("cannot create {}", history_dir.display()))?;
+    let path = history_dir.join(".zsh_history");
     std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)
         .with_context(|| format!("cannot create {}", path.display()))?;
-    let mount = format!("type=bind,source={},target=/root/.zsh_history", path.display());
-    Ok((path, mount))
+    let mount = format!("type=bind,source={},target={HISTORY_TARGET}", history_dir.display());
+    let env = ("HISTFILE".to_string(), format!("{HISTORY_TARGET}/.zsh_history"));
+    Ok((path, mount, env))
 }
 
 /// Create a missing bind-mount source. A final path component containing a dot
@@ -1327,7 +1359,7 @@ mod tests {
     #[test]
     fn workspace_json_lists_primary_first() {
         let extras = vec![("/workspaces/.shared".to_string(), PathBuf::from("/x"))];
-        let json = workspace_file_json("/workspaces/app", &extras);
+        let json = workspace_file_json("/workspaces/app", &extras, &[]);
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(
             parsed["folders"],
@@ -1335,6 +1367,19 @@ mod tests {
                 { "path": "/workspaces/app" },
                 { "path": "/workspaces/.shared" }
             ])
+        );
+        // No recommendations passed → no `extensions` key at all.
+        assert!(parsed.get("extensions").is_none());
+    }
+
+    #[test]
+    fn workspace_json_includes_extension_recommendations() {
+        let recs = vec!["dbaeumer.vscode-eslint".to_string()];
+        let json = workspace_file_json("/workspaces/app", &[], &recs);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed["extensions"]["recommendations"],
+            serde_json::json!(["dbaeumer.vscode-eslint"])
         );
     }
 
