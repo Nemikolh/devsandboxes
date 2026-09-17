@@ -31,3 +31,7 @@ git worktrees so working trees are never shared.
   testable without a container runtime.
 - Checks: `cargo test` (clippy/rustfmt are not installed in the default
   toolchain here).
+- Commits follow Conventional Commits, all lowercase:
+  `<type>(<what>): <description>` where `<type>` is `feat`, `fix`, `chore`,
+  `docs`, `test`, `refactor`, … and `<what>` is the module or concept touched
+  (`tui`, `rm` or any other command, `docker`, `apple`, `config`, …).
