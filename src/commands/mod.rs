@@ -3,6 +3,7 @@ pub mod inspect;
 pub mod logs;
 pub mod ls;
 pub mod ps;
+pub mod rebuild;
 pub mod rm;
 pub mod run;
 pub mod services;

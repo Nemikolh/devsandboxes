@@ -390,9 +390,12 @@ pub(crate) fn warn_on_drift(container: &str, expected: &str) -> Result<()> {
     if let Some(hash) = backend().label(container, "devsandbox.config_hash")?
         && hash != expected
     {
+        // Suggest a copy-pasteable command: strip the container prefix to the
+        // instance name, falling back to the container name if it is unprefixed.
+        let instance = container.strip_prefix(NAME_PREFIX).unwrap_or(container);
         eprintln!(
             "warning: config for `{container}` changed since it was created; \
-             remove and re-run to apply changes"
+             run `devsandbox rebuild {instance}` to apply changes"
         );
     }
     Ok(())

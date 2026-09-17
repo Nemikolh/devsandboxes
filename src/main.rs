@@ -45,6 +45,13 @@ enum Command {
         #[arg(long)]
         branch: Option<String>,
     },
+    /// Recreate an instance's container from the current config (keeps the
+    /// worktree, branch, and per-instance state); no-op when there is no drift
+    #[command(visible_alias = "recreate")]
+    Rebuild {
+        /// Instance name, sandbox config name, or repository folder name
+        name: String,
+    },
     /// Remove a sandbox instance (container, worktree, state entry)
     Rm {
         /// Instance name, sandbox config name, or repository folder name
@@ -125,6 +132,7 @@ fn main() -> Result<()> {
         Command::Run { sandbox, name, branch } => {
             commands::run::run(&cli.dir, sandbox, name, branch)
         }
+        Command::Rebuild { name } => commands::rebuild::rebuild(&cli.dir, &name),
         Command::Rm { name } => commands::rm::rm(&name),
         Command::Stop { name, all } => commands::stop::stop(name, all),
         Command::Start { name, all } => commands::start::start(&cli.dir, name, all),
