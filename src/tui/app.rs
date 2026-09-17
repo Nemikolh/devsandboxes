@@ -16,6 +16,8 @@ use crate::runtime::backend;
 use super::data::{visible_nodes, ContainerStatus, InstanceRow, Node, Snapshot, ORPHANS_NAME};
 use super::procs::ProcState;
 use super::prompt::{Prompt, PromptAction, COMMANDS};
+use super::term::{encode_key, TermSession, TermTabs, SHELL_FALLBACK_CMD};
+use crate::runtime::NAME_PREFIX;
 
 /// Keybinding reference shown by the `?` overlay, grouped by context.
 const HELP_BODY: &str = "\
@@ -35,6 +37,14 @@ Tables (Instances / Services)
                :start runs services + postStartCommand too; a drifted
                exited instance is rebuilt instead)
   (process rows act on their parent instance)
+
+Terminals
+  t           open terminal (instance / service)
+  T           force a new terminal for the same target
+  [ / ]       previous / next terminal tab
+  x           close the active terminal
+  ctrl-] / F12  focus terminal ⇄ back to dashboard
+  (while focused, all other keys go to the shell)
 
 Config modal
   t           toggle original / resolved
@@ -251,6 +261,14 @@ impl Tab {
     }
 }
 
+/// Where keystrokes go. `Dashboard` is the classic table/tree navigation;
+/// `Terminal` forwards nearly every key to the active integrated terminal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Focus {
+    Dashboard,
+    Terminal,
+}
+
 pub struct App {
     pub dir: PathBuf,
     pub tab: Tab,
@@ -296,6 +314,11 @@ pub struct App {
     pub status: Option<String>,
     /// True while the config-modal divider is being dragged with the mouse.
     dragging_divider: bool,
+    /// Whether keys drive the dashboard or the active terminal.
+    pub focus: Focus,
+    /// Open integrated-terminal tabs, shared across both top-level tabs. Empty
+    /// until the user opens one with `t`.
+    pub terms: TermTabs,
     pub should_quit: bool,
 }
 
@@ -319,6 +342,8 @@ impl App {
             starting: BTreeSet::new(),
             status: None,
             dragging_divider: false,
+            focus: Focus::Dashboard,
+            terms: TermTabs::default(),
             should_quit: false,
         }
     }
@@ -570,6 +595,12 @@ impl App {
             self.on_key_modal(key);
             return;
         }
+        // A focused terminal is next in line, ahead of the dashboard bindings:
+        // nearly every key belongs to the shell, not the tables.
+        if self.focus == Focus::Terminal {
+            self.on_key_terminal(key);
+            return;
+        }
         // Any dashboard key dismisses a lingering status line.
         self.status = None;
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -581,6 +612,15 @@ impl App {
             KeyCode::BackTab => self.prev_tab(),
             KeyCode::Char('1') => self.tab = Tab::Instances,
             KeyCode::Char('2') => self.tab = Tab::Services,
+            // Enter a terminal: ctrl-] or F12. No-op with a status hint when none
+            // are open.
+            KeyCode::Char(']') if ctrl => self.enter_terminal(),
+            KeyCode::F(12) => self.enter_terminal(),
+            KeyCode::Char('t') => self.open_terminal(false),
+            KeyCode::Char('T') => self.open_terminal(true),
+            KeyCode::Char(']') => self.terms.next(),
+            KeyCode::Char('[') => self.terms.prev(),
+            KeyCode::Char('x') => self.terms.close_active(),
             KeyCode::Up | KeyCode::Char('k') => self.select_up(),
             KeyCode::Down | KeyCode::Char('j') => self.select_down(),
             KeyCode::Right if self.tab == Tab::Instances => self.tree_expand(),
@@ -593,6 +633,48 @@ impl App {
             KeyCode::Char('l') => self.open_logs(),
             KeyCode::Char('?') => self.open_help(),
             _ => {}
+        }
+    }
+
+    /// Route a key to the active terminal. Only reached with `focus ==
+    /// Terminal`. `ctrl-]` / `F12` leave; on an exited session every other key
+    /// is swallowed; otherwise the key is encoded (honoring the shell's
+    /// application-cursor mode) and written to the PTY.
+    fn on_key_terminal(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // Leave keys: back to the dashboard.
+        if matches!(key.code, KeyCode::Char(']') if ctrl) || key.code == KeyCode::F(12) {
+            self.focus = Focus::Dashboard;
+            return;
+        }
+        // The session can vanish (closed elsewhere); fall back to the dashboard
+        // rather than forward into nothing.
+        let Some(session) = self.terms.active_session_mut() else {
+            self.focus = Focus::Dashboard;
+            return;
+        };
+        // An exited shell has nothing to receive keys; swallow them (leave keys
+        // above still work).
+        if session.exited() {
+            return;
+        }
+        // DECCKM: the parser tracks whether the shell wants SS3 cursor keys.
+        let application_cursor = session
+            .parser()
+            .lock()
+            .map(|p| p.screen().application_cursor())
+            .unwrap_or(false);
+        if let Some(bytes) = encode_key(key, application_cursor) {
+            session.write_key_bytes(&bytes);
+        }
+    }
+
+    /// Focus the active terminal, or leave a status hint when none are open.
+    fn enter_terminal(&mut self) {
+        if self.terms.is_empty() {
+            self.status = Some("no terminal open — press t".into());
+        } else {
+            self.focus = Focus::Terminal;
         }
     }
 
@@ -1028,6 +1110,125 @@ impl App {
     /// Open the help overlay listing all keybindings grouped by context.
     fn open_help(&mut self) {
         self.modal = Modal::Help(TextModal::new(" help — keys ".to_string(), HELP_BODY.to_string()));
+    }
+
+    /// Resolve the current selection to a terminal target: `(title, container,
+    /// is_instance)`, or an `Err(status message)` explaining why one can't open.
+    /// Pure over the snapshot so it is unit-testable; [`Self::open_terminal`]
+    /// does the state load + PTY spawn around it.
+    ///
+    /// Instances tab: the instance under the cursor (or a process row's parent),
+    /// which must be running. Services tab: the selected service's first running
+    /// container.
+    fn term_target(&self) -> Result<(String, String, bool), String> {
+        let snapshot = self
+            .snapshot
+            .as_ref()
+            .ok_or_else(|| "terminal: no data yet".to_string())?;
+        match self.tab {
+            Tab::Instances => {
+                let idx = self
+                    .selected_instance_index()
+                    .ok_or_else(|| "terminal: select an instance".to_string())?;
+                let row = snapshot
+                    .instances
+                    .get(idx)
+                    .ok_or_else(|| "terminal: select an instance".to_string())?;
+                if !matches!(row.status, ContainerStatus::Running(_)) {
+                    return Err(format!("terminal: `{}` is not running", row.name));
+                }
+                Ok((row.name.clone(), row.container.clone(), true))
+            }
+            Tab::Services => {
+                let row = snapshot
+                    .services
+                    .get(self.selected())
+                    .ok_or_else(|| "terminal: select a service".to_string())?;
+                let container = row
+                    .containers
+                    .iter()
+                    .find(|(_, status)| matches!(status, ContainerStatus::Running(_)))
+                    .map(|(name, _)| name.clone())
+                    .ok_or_else(|| {
+                        format!("terminal: no running container for `{}`", row.name)
+                    })?;
+                let title = container
+                    .strip_prefix(NAME_PREFIX)
+                    .unwrap_or(&container)
+                    .to_string();
+                Ok((title, container, false))
+            }
+        }
+    }
+
+    /// Open (or focus) an integrated terminal for the current selection. `t`
+    /// dedups against a live terminal for the same container; `T`
+    /// (`force_new`) always spawns a fresh one.
+    ///
+    /// This does I/O inline — a state load plus a PTY spawn — same precedent as
+    /// [`Self::open_logs`] / [`Self::open_config`] doing user-triggered work
+    /// without going through the event loop. Failures land in `self.status`.
+    fn open_terminal(&mut self, force_new: bool) {
+        let (title, container, is_instance) = match self.term_target() {
+            Ok(t) => t,
+            Err(msg) => {
+                self.status = Some(msg);
+                return;
+            }
+        };
+
+        // Dedup: an already-open live terminal for this container just gets focus.
+        if !force_new {
+            if let Some(idx) = self.terms.find(&container) {
+                self.terms.set_active(idx);
+                self.focus = Focus::Terminal;
+                self.status = None;
+                return;
+            }
+        }
+
+        // Build the runtime argv. Instances reuse the exact `exec` flags the CLI
+        // emits (workspace, remoteUser, remoteEnv) so the two can't drift;
+        // services get a plain interactive `exec`.
+        let shell: Vec<String> = SHELL_FALLBACK_CMD.iter().map(|s| s.to_string()).collect();
+        let mut argv = if is_instance {
+            let state = match crate::state::State::load() {
+                Ok(s) => s,
+                Err(e) => {
+                    self.status = Some(format!("terminal: {e:#}"));
+                    return;
+                }
+            };
+            let Some(instance) = state.instances.get(&title) else {
+                self.status = Some(format!("terminal: `{title}` not in state"));
+                return;
+            };
+            crate::commands::exec::exec_argv(instance, true, true, &shell)
+        } else {
+            let mut a = vec!["exec".to_string(), "-i".to_string(), "-t".to_string()];
+            a.push(container.clone());
+            a.extend(shell);
+            a
+        };
+        // Prepend the runtime binary: `exec_argv` and the service path both omit it.
+        argv.insert(0, backend().bin().to_string());
+
+        // Size doesn't matter yet: the event loop's pre-draw resize corrects the
+        // first frame. Reuse the active session's size when there is one, else a
+        // sane 24x80 default.
+        let (rows, cols) = self
+            .terms
+            .active_session()
+            .map(|s| s.size())
+            .unwrap_or((24, 80));
+        match TermSession::spawn(title, container, argv, rows, cols) {
+            Ok(session) => {
+                self.terms.open(session);
+                self.focus = Focus::Terminal;
+                self.status = None;
+            }
+            Err(e) => self.status = Some(format!("terminal: {e:#}")),
+        }
     }
 
     /// Open a full-screen log tail for the selected instance's container.
@@ -2356,4 +2557,177 @@ mod tests {
         );
     }
 
+    // --- integrated-terminal state (step 2) -----------------------------------
+
+    use super::super::data::ServiceRow;
+
+    /// A snapshot whose single service `svc` has `containers`.
+    fn service_snapshot(containers: Vec<(String, ContainerStatus)>) -> Snapshot {
+        Snapshot {
+            instances: Vec::new(),
+            sandboxes: Vec::new(),
+            services: vec![ServiceRow {
+                name: "svc".into(),
+                scope: "isolated",
+                source: "image x".into(),
+                ports: Vec::new(),
+                containers,
+                used_by: Vec::new(),
+                env_len: 0,
+                command: None,
+                config_hash: "hash".into(),
+            }],
+            sandbox_count: 0,
+            runtime_name: "docker",
+            runtime_version: None,
+            collected_at: std::time::Instant::now(),
+            error: None,
+        }
+    }
+
+    /// Open a test terminal directly (no PTY) and focus it, bypassing the
+    /// I/O-bound `open_terminal`.
+    fn open_test_term(app: &mut App, title: &str, container: &str) {
+        app.terms
+            .open(TermSession::test_session(title, container, 24, 80));
+        app.focus = Focus::Terminal;
+    }
+
+    #[test]
+    fn terminal_focus_swallows_dashboard_keys() {
+        let mut app = new_app();
+        open_test_term(&mut app, "web-1", "devsandbox-web-1");
+        let before = app.tab;
+        // Tab must not switch the top-level tab while a terminal is focused.
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.tab, before);
+        // `q` forwards to the shell rather than quitting.
+        app.on_key(key(KeyCode::Char('q')));
+        assert!(!app.should_quit);
+        assert_eq!(app.focus, Focus::Terminal);
+    }
+
+    #[test]
+    fn ctrl_bracket_and_f12_leave_terminal() {
+        let mut app = new_app();
+        open_test_term(&mut app, "web-1", "devsandbox-web-1");
+        app.on_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::CONTROL));
+        assert_eq!(app.focus, Focus::Dashboard);
+
+        open_test_term(&mut app, "web-1", "devsandbox-web-1");
+        app.on_key(key(KeyCode::F(12)));
+        assert_eq!(app.focus, Focus::Dashboard);
+    }
+
+    #[test]
+    fn enter_terminal_needs_a_terminal() {
+        let mut app = new_app();
+        // No terminals: ctrl-] and F12 stay on the dashboard with a hint.
+        app.on_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::CONTROL));
+        assert_eq!(app.focus, Focus::Dashboard);
+        assert_eq!(app.status.as_deref(), Some("no terminal open — press t"));
+        app.on_key(key(KeyCode::F(12)));
+        assert_eq!(app.focus, Focus::Dashboard);
+        assert_eq!(app.status.as_deref(), Some("no terminal open — press t"));
+
+        // With one open (but unfocused), ctrl-] focuses it.
+        app.terms
+            .open(TermSession::test_session("web-1", "devsandbox-web-1", 24, 80));
+        app.on_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::CONTROL));
+        assert_eq!(app.focus, Focus::Terminal);
+    }
+
+    #[test]
+    fn dashboard_brackets_cycle_and_x_closes() {
+        let mut app = new_app();
+        app.terms
+            .open(TermSession::test_session("a", "devsandbox-a", 24, 80));
+        app.terms
+            .open(TermSession::test_session("b", "devsandbox-b", 24, 80)); // active = 1
+        // `]` wraps to 0, `[` wraps back to 1.
+        app.on_key(key(KeyCode::Char(']')));
+        assert_eq!(app.terms.active(), 0);
+        app.on_key(key(KeyCode::Char('[')));
+        assert_eq!(app.terms.active(), 1);
+        // `x` closes the active one.
+        app.on_key(key(KeyCode::Char('x')));
+        assert_eq!(app.terms.len(), 1);
+        assert_eq!(app.terms.active_session().unwrap().title, "a");
+    }
+
+    #[test]
+    fn exited_terminal_swallows_keys_but_leaves() {
+        let mut app = new_app();
+        app.terms
+            .open(TermSession::test_session("web-1", "devsandbox-web-1", 24, 80));
+        app.terms.active_session().unwrap().set_exited();
+        app.focus = Focus::Terminal;
+        // Ordinary keys are swallowed without panicking; focus is unchanged.
+        app.on_key(key(KeyCode::Char('a')));
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.focus, Focus::Terminal);
+        // Leave keys still work on an exited session.
+        app.on_key(key(KeyCode::F(12)));
+        assert_eq!(app.focus, Focus::Dashboard);
+    }
+
+    #[test]
+    fn term_target_instance_requires_running() {
+        let mut app = new_app();
+        // Not running → Err with the instance name.
+        app.set_snapshot(snapshot_with_status(1, ContainerStatus::Missing));
+        app.on_key(key(KeyCode::Down)); // onto inst0
+        assert_eq!(
+            app.term_target(),
+            Err("terminal: `inst0` is not running".into())
+        );
+        // Running → the instance target.
+        app.set_snapshot(snapshot_with_status(1, running()));
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(
+            app.term_target(),
+            Ok(("inst0".into(), "devsandbox-inst0".into(), true))
+        );
+    }
+
+    #[test]
+    fn term_target_service_picks_first_running() {
+        let mut app = new_app();
+        app.tab = Tab::Services;
+        // No running container → Err.
+        app.set_snapshot(service_snapshot(vec![(
+            "devsandbox-svc-web-1".into(),
+            ContainerStatus::Exited("Exited (0)".into()),
+        )]));
+        assert_eq!(
+            app.term_target(),
+            Err("terminal: no running container for `svc`".into())
+        );
+        // First running container wins; title strips the prefix.
+        app.set_snapshot(service_snapshot(vec![
+            (
+                "devsandbox-svc-web-1".into(),
+                ContainerStatus::Exited("Exited (0)".into()),
+            ),
+            ("devsandbox-svc-api-2".into(), running()),
+        ]));
+        assert_eq!(
+            app.term_target(),
+            Ok(("svc-api-2".into(), "devsandbox-svc-api-2".into(), false))
+        );
+    }
+
+    #[test]
+    fn find_dedup_vs_force_new() {
+        // TermTabs dedup: an exited tab for a container is not a target, a live
+        // one is (mirrors `t` vs `T` at the app layer).
+        let mut app = new_app();
+        let dead = TermSession::test_session("web-1", "devsandbox-web-1", 24, 80);
+        dead.set_exited();
+        app.terms.open(dead);
+        assert_eq!(app.terms.find("devsandbox-web-1"), None);
+        app.terms
+            .open(TermSession::test_session("web-1", "devsandbox-web-1", 24, 80));
+        assert_eq!(app.terms.find("devsandbox-web-1"), Some(1));
+    }
 }

@@ -6,10 +6,8 @@
 //! forward key bytes. Everything here is deliberately self-contained so the
 //! app state machine ([`super::app`]) can stay I/O-free and unit-testable.
 //!
-//! TODO(step 2): the tab state (`TermTabs`) and the app wiring land in step 2;
-//! until then the spawn/reader/encode machinery below has no in-crate caller
-//! outside the tests, so the module opts out of dead-code warnings.
-#![allow(dead_code)]
+//! [`TermTabs`] holds the open sessions as a pure tab strip (active index,
+//! open/dedup/next/prev/close); [`super::app`] drives it and forwards keys.
 
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -39,7 +37,8 @@ pub const SHELL_FALLBACK_CMD: [&str; 3] = [
 /// UI thread writes keys and resizes.
 pub struct TermSession {
     /// Tab label: instance name, or a service container name minus the
-    /// `devsandbox-` prefix.
+    /// `devsandbox-` prefix. Read by the renderer's tab strip (step 3).
+    #[allow(dead_code)] // rendered by the tab strip in step 3
     pub title: String,
     /// Container this shell runs in (the resolved `devsandbox-*` name), kept so
     /// the app can dedup `t` against an already-open terminal for the target.
@@ -132,6 +131,7 @@ impl TermSession {
 
     /// Propagate a new pane size to the kernel winsize and the parser. No-op
     /// when unchanged so we don't churn on every redraw.
+    #[allow(dead_code)] // called by the event loop's pre-draw resize in step 4
     pub fn resize(&mut self, rows: u16, cols: u16) {
         if self.size == (rows, cols) {
             return;
@@ -169,14 +169,16 @@ impl TermSession {
 
     /// Consume the dirty flag: returns whether anything changed since the last
     /// call and resets it, so the event loop can redraw only when needed.
+    #[allow(dead_code)] // polled by the event loop in step 4
     pub fn take_dirty(&self) -> bool {
         self.dirty.swap(false, Ordering::Relaxed)
     }
 
     /// Test constructor: an in-memory writer, no PTY, no child. Lets tab and
-    /// key-forwarding logic be exercised without a container runtime.
+    /// key-forwarding logic be exercised without a container runtime. Shared with
+    /// [`super::app`]'s tests via `pub(crate)`.
     #[cfg(test)]
-    fn test_session(title: &str, container: &str, rows: u16, cols: u16) -> TermSession {
+    pub(crate) fn test_session(title: &str, container: &str, rows: u16, cols: u16) -> TermSession {
         TermSession {
             title: title.into(),
             container: container.into(),
@@ -189,6 +191,13 @@ impl TermSession {
             size: (rows, cols),
         }
     }
+
+    /// Test helper: flip the exited flag, standing in for the reader thread's
+    /// EOF handling so key-swallowing and dedup can be exercised deterministically.
+    #[cfg(test)]
+    pub(crate) fn set_exited(&self) {
+        self.exited.store(true, Ordering::Relaxed);
+    }
 }
 
 impl Drop for TermSession {
@@ -198,6 +207,101 @@ impl Drop for TermSession {
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
             let _ = child.wait();
+        }
+    }
+}
+
+/// The dashboard's open terminals as a pure tab strip: a `Vec<TermSession>`
+/// plus the active index. Mechanical only — the app owns the focus/open policy
+/// (dedup vs. force-new, spawning); this type just tracks and cycles tabs.
+#[derive(Default)]
+pub struct TermTabs {
+    sessions: Vec<TermSession>,
+    /// Index into `sessions` of the shown tab. Meaningless when empty; kept
+    /// clamped to `[0, len)` by every mutator.
+    active: usize,
+}
+
+impl TermTabs {
+    /// The open sessions, for rendering the tab strip and active screen.
+    #[allow(dead_code)] // read by the renderer in step 3
+    pub fn sessions(&self) -> &[TermSession] {
+        &self.sessions
+    }
+
+    /// Active tab index. Only meaningful when `!is_empty()`.
+    #[allow(dead_code)] // read by the renderer in step 3
+    pub fn active(&self) -> usize {
+        self.active
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.sessions.is_empty()
+    }
+
+    #[allow(dead_code)] // read by the renderer in step 3
+    pub fn len(&self) -> usize {
+        self.sessions.len()
+    }
+
+    /// The active session, or `None` when no terminals are open.
+    pub fn active_session(&self) -> Option<&TermSession> {
+        self.sessions.get(self.active)
+    }
+
+    /// The active session mutably (for resize / key forwarding).
+    pub fn active_session_mut(&mut self) -> Option<&mut TermSession> {
+        self.sessions.get_mut(self.active)
+    }
+
+    /// Append `session` and make it active.
+    pub fn open(&mut self, session: TermSession) {
+        self.sessions.push(session);
+        self.active = self.sessions.len() - 1;
+    }
+
+    /// Index of the first *live* (non-exited) session for `container`. Exited
+    /// tabs are skipped so `t`'s dedup opens a fresh terminal alongside a dead
+    /// one for the same target instead of re-focusing the corpse.
+    pub fn find(&self, container: &str) -> Option<usize> {
+        self.sessions
+            .iter()
+            .position(|s| s.container == container && !s.exited())
+    }
+
+    /// Focus tab `idx`, clamped into range. No-op when empty.
+    pub fn set_active(&mut self, idx: usize) {
+        if self.sessions.is_empty() {
+            return;
+        }
+        self.active = idx.min(self.sessions.len() - 1);
+    }
+
+    /// Focus the next tab, wrapping. No-op when empty.
+    pub fn next(&mut self) {
+        if self.sessions.is_empty() {
+            return;
+        }
+        self.active = (self.active + 1) % self.sessions.len();
+    }
+
+    /// Focus the previous tab, wrapping. No-op when empty.
+    pub fn prev(&mut self) {
+        if self.sessions.is_empty() {
+            return;
+        }
+        self.active = (self.active + self.sessions.len() - 1) % self.sessions.len();
+    }
+
+    /// Drop the active session (its `Drop` kills the child) and clamp `active`
+    /// onto the tab that shifts into its place. No-op when empty.
+    pub fn close_active(&mut self) {
+        if self.sessions.is_empty() {
+            return;
+        }
+        self.sessions.remove(self.active);
+        if self.active >= self.sessions.len() {
+            self.active = self.sessions.len().saturating_sub(1);
         }
     }
 }
@@ -514,6 +618,76 @@ mod tests {
         // no-op path: unchanged size stays put
         s.resize(30, 100);
         assert_eq!(s.size(), (30, 100));
+    }
+
+    fn sess(title: &str, container: &str) -> TermSession {
+        TermSession::test_session(title, container, 24, 80)
+    }
+
+    #[test]
+    fn tabs_open_sets_active_last() {
+        let mut tabs = TermTabs::default();
+        assert!(tabs.is_empty());
+        tabs.open(sess("a", "devsandbox-a"));
+        tabs.open(sess("b", "devsandbox-b"));
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(tabs.active(), 1);
+        assert_eq!(tabs.active_session().unwrap().title, "b");
+    }
+
+    #[test]
+    fn tabs_next_prev_wrap() {
+        let mut tabs = TermTabs::default();
+        tabs.open(sess("a", "devsandbox-a"));
+        tabs.open(sess("b", "devsandbox-b"));
+        tabs.open(sess("c", "devsandbox-c")); // active = 2
+        tabs.next();
+        assert_eq!(tabs.active(), 0); // wrapped
+        tabs.prev();
+        assert_eq!(tabs.active(), 2); // wrapped back
+    }
+
+    #[test]
+    fn tabs_set_active_clamps() {
+        let mut tabs = TermTabs::default();
+        tabs.open(sess("a", "devsandbox-a"));
+        tabs.open(sess("b", "devsandbox-b"));
+        tabs.set_active(99);
+        assert_eq!(tabs.active(), 1);
+    }
+
+    #[test]
+    fn tabs_close_active_clamps() {
+        let mut tabs = TermTabs::default();
+        tabs.open(sess("a", "devsandbox-a"));
+        tabs.open(sess("b", "devsandbox-b"));
+        tabs.open(sess("c", "devsandbox-c")); // active = 2 (last)
+        tabs.close_active();
+        // last removed → active clamps to new last
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(tabs.active(), 1);
+        assert_eq!(tabs.active_session().unwrap().title, "b");
+        tabs.set_active(0);
+        tabs.close_active(); // remove "a", "b" shifts to index 0
+        assert_eq!(tabs.active(), 0);
+        assert_eq!(tabs.active_session().unwrap().title, "b");
+        tabs.close_active();
+        assert!(tabs.is_empty());
+        tabs.close_active(); // no-op on empty
+        assert!(tabs.is_empty());
+    }
+
+    #[test]
+    fn find_dedup_skips_exited() {
+        let mut tabs = TermTabs::default();
+        let dead = sess("a", "devsandbox-a");
+        dead.set_exited();
+        tabs.open(dead);
+        // exited tab for the container is not a dedup target
+        assert_eq!(tabs.find("devsandbox-a"), None);
+        tabs.open(sess("a2", "devsandbox-a")); // a live one alongside
+        assert_eq!(tabs.find("devsandbox-a"), Some(1));
+        assert_eq!(tabs.find("devsandbox-missing"), None);
     }
 
     #[test]
