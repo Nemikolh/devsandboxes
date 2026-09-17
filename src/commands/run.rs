@@ -54,10 +54,9 @@ pub fn run(
         .context("sandbox folder has no basename")?
         .to_string_lossy()
         .into_owned();
-    // `${configDir}` / `${localWorkspaceFolder(Basename)}` / `${sharedVolumes}`
-    // / `${instance}` are usable in `workspaceFolder`, `mounts`, and cache
-    // sources; build the context once. Instance naming comes first so
-    // `${instance}` can anchor per-instance state in mount sources.
+    // The mount context is rebuilt inside `materialize` for the actual mounts;
+    // here it only substitutes `${instance}` into the worktree branch pattern,
+    // which is why instance naming comes first.
     let config_dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
     let config_dir_str = config_dir.to_string_lossy().into_owned();
     let folder_str = folder.to_string_lossy().into_owned();
@@ -80,16 +79,6 @@ pub fn run(
         shared_volumes: &shared_volumes,
         instance: &instance,
     };
-    let workspace = substitute(
-        &props
-            .workspace_folder
-            .clone()
-            .unwrap_or_else(|| format!("/workspaces/{basename}")),
-        &var_ctx,
-    );
-    // Extra workspace roots (`folders`): bind-mounted at their container path
-    // and listed in the generated `.code-workspace` after the primary folder.
-    let extra_folders = resolve_folders(dir, &var_ctx, &workspace, props)?;
 
     // `run` always creates a fresh instance; it never restarts a stopped one
     // (that is `devsandbox start`).
@@ -106,20 +95,7 @@ pub fn run(
         );
     }
 
-    // initializeCommand runs on the host, before anything is created.
-    if let Some(cmd) = &props.initialize_command {
-        run_host_commands(dir, cmd).context("initializeCommand failed")?;
-    }
-
-    // Bring up the sandbox's services (global shared + this instance's isolated)
-    // and their networks; the instance container joins them to reach services by
-    // name.
-    let project = services::project_id(dir)?;
-    let service_names = props.services.clone().unwrap_or_default();
-    let (networks, endpoints) =
-        services::ensure_services(&config, dir, &project, &instance, &service_names)?;
-
-    let (source, worktree, branch, extra_mounts) = if base_in_use(&state, &folder) {
+    let (source, worktree, branch) = if base_in_use(&state, &folder) {
         // Branch for the worktree: `--branch` override, else the sandbox's
         // `worktree-branch`, else the default. `${instance}` (and the other mount
         // variables) are substituted so each instance gets a unique branch.
@@ -132,14 +108,103 @@ pub fn run(
         // and the mount/state would point at a different (empty) directory.
         let wt = config_dir.join(".worktrees").join(&instance);
         create_worktree(&folder, &wt, &branch)?;
-        // The worktree's `.git` file points at `<base>/.git/worktrees/..`
-        // by absolute host path; mount the base `.git` at the identical
-        // path so git works inside the container.
-        (wt.clone(), Some(wt), Some(branch), vec![git_companion_mount(&folder)])
+        (wt.clone(), Some(wt), Some(branch))
     } else {
-        (folder.clone(), None, None, Vec::new())
+        (folder.clone(), None, None)
     };
-    let mut mounts = resolve_mounts(dir, &folder, &basename, &instance, &sandbox)?;
+
+    materialize(
+        dir,
+        &config,
+        &sandbox_name,
+        &sandbox,
+        &instance,
+        &source,
+        &folder,
+        worktree,
+        branch,
+        &mut state,
+    )?;
+
+    println!("{instance}");
+    Ok(())
+}
+
+/// Create (and start) the instance container and record it: run
+/// `initializeCommand`, bring up services, build the mount set (rebuilding the
+/// `${instance}` context from `instance` so per-instance mounts/history resolve
+/// to the same host paths), start the container, upsert state (saved before the
+/// lifecycle chain so a crash mid-lifecycle leaves the container tracked), then
+/// run the lifecycle commands. `source` is what gets mounted as the working tree
+/// (a worktree when `worktree.is_some()`, else `folder`); `folder` is the
+/// canonicalized base folder, used for `base_folder` and the git companion mount.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn materialize(
+    dir: &Path,
+    config: &Config,
+    sandbox_name: &str,
+    sandbox: &ResolvedSandbox,
+    instance: &str,
+    source: &Path,
+    folder: &Path,
+    worktree: Option<PathBuf>,
+    branch: Option<String>,
+    state: &mut State,
+) -> Result<()> {
+    let props = &sandbox.properties;
+    let container_name = format!("{NAME_PREFIX}{instance}");
+    let basename = folder
+        .file_name()
+        .context("sandbox folder has no basename")?
+        .to_string_lossy()
+        .into_owned();
+    // `${configDir}` / `${localWorkspaceFolder(Basename)}` / `${sharedVolumes}`
+    // / `${instance}` are usable in `workspaceFolder`, `mounts`, and cache
+    // sources; rebuild the context from the passed instance name so
+    // `${instance}`-anchored mounts/history resolve to the same host paths.
+    let config_dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let config_dir_str = config_dir.to_string_lossy().into_owned();
+    let folder_str = folder.to_string_lossy().into_owned();
+    let shared_volumes = config_dir.join("shared-volumes").to_string_lossy().into_owned();
+    let var_ctx = MountContext {
+        config_dir: &config_dir_str,
+        workspace_folder: &folder_str,
+        workspace_folder_basename: &basename,
+        shared_volumes: &shared_volumes,
+        instance,
+    };
+    let workspace = substitute(
+        &props
+            .workspace_folder
+            .clone()
+            .unwrap_or_else(|| format!("/workspaces/{basename}")),
+        &var_ctx,
+    );
+    // Extra workspace roots (`folders`): bind-mounted at their container path
+    // and listed in the generated `.code-workspace` after the primary folder.
+    let extra_folders = resolve_folders(dir, &var_ctx, &workspace, props)?;
+
+    // initializeCommand runs on the host, before anything is created.
+    if let Some(cmd) = &props.initialize_command {
+        run_host_commands(dir, cmd).context("initializeCommand failed")?;
+    }
+
+    // Bring up the sandbox's services (global shared + this instance's isolated)
+    // and their networks; the instance container joins them to reach services by
+    // name.
+    let project = services::project_id(dir)?;
+    let service_names = props.services.clone().unwrap_or_default();
+    let (networks, endpoints) =
+        services::ensure_services(config, dir, &project, instance, &service_names)?;
+
+    // The worktree's `.git` file points at `<base>/.git/worktrees/..` by absolute
+    // host path; mount the base `.git` at the identical path so git works inside
+    // the container.
+    let extra_mounts = match &worktree {
+        Some(_) => vec![git_companion_mount(folder)],
+        None => Vec::new(),
+    };
+    let mut mounts = resolve_mounts(dir, folder, &basename, instance, sandbox)?;
     for (target, host) in &extra_folders {
         mounts.push(format!("type=bind,source={},target={target}", host.display()));
     }
@@ -148,7 +213,7 @@ pub fn run(
     mounts.extend(cache_mounts);
     // Managed per-instance shell history: provision the host file and mount it.
     let shell_history = if props.persist_shell_history == Some(true) {
-        let (path, mount) = provision_shell_history(dir, &instance)?;
+        let (path, mount) = provision_shell_history(dir, instance)?;
         mounts.push(mount);
         Some(path)
     } else {
@@ -156,10 +221,10 @@ pub fn run(
     };
     run_container(
         dir,
-        &sandbox,
+        sandbox,
         &container_name,
-        &source,
-        &folder,
+        source,
+        folder,
         &workspace,
         &extra_mounts,
         &mounts,
@@ -168,16 +233,16 @@ pub fn run(
         &endpoints,
     )?;
     let container = container_name.clone();
-    let workspace_file = write_workspace_file(&container, &instance, &workspace, &extra_folders);
+    let workspace_file = write_workspace_file(&container, instance, &workspace, &extra_folders);
 
     state.instances.insert(
-        instance.clone(),
+        instance.to_string(),
         Instance {
-            sandbox: sandbox_name,
+            sandbox: sandbox_name.to_string(),
             project,
             container: container.clone(),
-            folder: source,
-            base_folder: folder,
+            folder: source.to_path_buf(),
+            base_folder: folder.to_path_buf(),
             worktree,
             branch,
             shell_history,
@@ -214,7 +279,6 @@ pub fn run(
         }
     }
 
-    println!("{instance}");
     Ok(())
 }
 
