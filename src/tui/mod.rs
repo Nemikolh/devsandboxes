@@ -8,6 +8,7 @@ mod app;
 mod data;
 mod procs;
 mod prompt;
+mod term;
 mod ui;
 
 use std::collections::BTreeMap;

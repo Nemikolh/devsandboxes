@@ -45,6 +45,21 @@ pub fn exec_status(name: &str, interactive: bool, tty: bool, command: &[String])
         }
     };
 
+    let args = exec_argv(instance, interactive, tty, command);
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    backend().run_inherit(&arg_refs)
+}
+
+/// Build the runtime `exec` argv for `instance`: the flags, workspace,
+/// remoteUser, remoteEnv, container, and command, in the order the CLI has
+/// always emitted them. Factored out so the dashboard's integrated terminal
+/// spawns the exact same command the CLI does and the two can't drift.
+pub fn exec_argv(
+    instance: &Instance,
+    interactive: bool,
+    tty: bool,
+    command: &[String],
+) -> Vec<String> {
     let mut args: Vec<String> = vec!["exec".into()];
     if interactive {
         args.push("-i".into());
@@ -63,6 +78,73 @@ pub fn exec_status(name: &str, interactive: bool, tty: bool, command: &[String])
     }
     args.push(instance.container.clone());
     args.extend(command.iter().cloned());
-    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    backend().run_inherit(&arg_refs)
+    args
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    fn instance() -> Instance {
+        Instance {
+            sandbox: "repository-1".into(),
+            project: "abc12345".into(),
+            container: "devsandbox-repo-abc1".into(),
+            folder: PathBuf::from("/home/u/repository-1"),
+            base_folder: PathBuf::from("/home/u/repository-1"),
+            worktree: None,
+            branch: None,
+            shell_history: None,
+            workspace: "/workspaces/repository-1".into(),
+            workspace_file: None,
+            remote_env: BTreeMap::new(),
+            remote_user: None,
+            created_unix: 0,
+        }
+    }
+
+    #[test]
+    fn argv_minimal() {
+        let inst = instance();
+        assert_eq!(
+            exec_argv(&inst, false, false, &["ls".into()]),
+            vec![
+                "exec",
+                "-w",
+                "/workspaces/repository-1",
+                "devsandbox-repo-abc1",
+                "ls",
+            ]
+        );
+    }
+
+    #[test]
+    fn argv_flag_ordering() {
+        let mut inst = instance();
+        inst.remote_user = Some("vscode".into());
+        inst.remote_env.insert("FOO".into(), "bar".into());
+        inst.remote_env.insert("BAZ".into(), "qux".into());
+        assert_eq!(
+            exec_argv(&inst, true, true, &["bash".into(), "-l".into()]),
+            vec![
+                "exec",
+                "-i",
+                "-t",
+                "-w",
+                "/workspaces/repository-1",
+                "-u",
+                "vscode",
+                // BTreeMap iterates sorted: BAZ before FOO
+                "-e",
+                "BAZ=qux",
+                "-e",
+                "FOO=bar",
+                "devsandbox-repo-abc1",
+                "bash",
+                "-l",
+            ]
+        );
+    }
 }
