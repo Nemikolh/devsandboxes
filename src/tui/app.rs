@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
+use ratatui::layout::Rect;
 
 use crate::commands::run::DEFAULT_WORKTREE_BRANCH;
 use crate::config::Config;
@@ -217,6 +218,15 @@ pub fn divider_pct(col: u16, width: u16) -> u16 {
 /// Whether `col` is on or within one cell of the divider column.
 fn col_near(col: u16, divider: u16) -> bool {
     col.abs_diff(divider) <= 1
+}
+
+/// Whether `(col, row)` falls inside `rect` (border included). Pure so the
+/// terminal-panel hit-testing stays unit-testable.
+fn point_in(rect: Rect, col: u16, row: u16) -> bool {
+    col >= rect.x
+        && col < rect.x + rect.width
+        && row >= rect.y
+        && row < rect.y + rect.height
 }
 
 /// Add `delta` (may be negative) to `scroll`, clamped to `[0, max]`.
@@ -678,28 +688,30 @@ impl App {
         }
     }
 
-    /// Apply a mouse event. Only meaningful while the config modal is open (the
-    /// modal is full-screen, so `area_width` is the terminal width). A press/drag
-    /// on or near the divider column resizes the split; the scroll wheel scrolls
-    /// the pane under the cursor. Everything else is ignored. I/O-free.
-    pub fn on_mouse(&mut self, ev: &MouseEvent, area_width: u16) {
+    /// Apply a mouse event over the full frame `area`. The config modal (when
+    /// open) owns the mouse: a press/drag on or near the divider column resizes
+    /// the split; the scroll wheel scrolls the pane under the cursor. Otherwise,
+    /// with terminals open, clicks and the wheel drive the terminal panel
+    /// ([`Self::terminal_mouse`]). I/O-free.
+    pub fn on_mouse(&mut self, ev: &MouseEvent, area: Rect) {
         let Modal::Config(view) = &mut self.modal else {
             self.dragging_divider = false;
+            self.terminal_mouse(ev, area);
             return;
         };
         // Divider column: the boundary between the left (config) pane and the
         // right (inspect) pane, i.e. split_pct of the modal width.
-        let divider = (area_width as u32 * view.split_pct as u32 / 100) as u16;
+        let divider = (area.width as u32 * view.split_pct as u32 / 100) as u16;
         match ev.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 if col_near(ev.column, divider) {
                     self.dragging_divider = true;
-                    view.split_pct = divider_pct(ev.column, area_width);
+                    view.split_pct = divider_pct(ev.column, area.width);
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 if self.dragging_divider {
-                    view.split_pct = divider_pct(ev.column, area_width);
+                    view.split_pct = divider_pct(ev.column, area.width);
                 }
             }
             MouseEventKind::Up(MouseButton::Left) => {
@@ -713,6 +725,59 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Mouse routing for the integrated-terminal panel, active only when no
+    /// config modal is open and at least one terminal exists. Left-click inside
+    /// the panel focuses the terminal; a click on the title row's tab labels
+    /// activates that tab; a left-click outside the panel while the terminal is
+    /// focused returns focus to the dashboard. The wheel scrolls the active
+    /// session's vt100 scrollback. All layout math is borrowed from `ui` so it
+    /// tracks exactly what the draw path lays out. I/O-free.
+    fn terminal_mouse(&mut self, ev: &MouseEvent, area: Rect) {
+        if self.terms.is_empty() {
+            return;
+        }
+        let prompt_open = self.prompt.is_some();
+        let panel = super::ui::terminal_panel_rect(area, prompt_open);
+        let inside = point_in(panel, ev.column, ev.row);
+        match ev.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if inside {
+                    let focused = self.focus == Focus::Terminal;
+                    // Title row: hit-test the tab labels; a hit activates that tab.
+                    if let Some(i) =
+                        super::ui::terminal_tab_hit(self, panel, focused, ev.column, ev.row)
+                    {
+                        self.terms.set_active(i);
+                    }
+                    self.focus = Focus::Terminal;
+                } else if self.focus == Focus::Terminal {
+                    // Click-away unfocuses; dashboard click handling is out of scope.
+                    self.focus = Focus::Dashboard;
+                }
+            }
+            MouseEventKind::ScrollUp if inside => self.scroll_active_terminal(3),
+            MouseEventKind::ScrollDown if inside => self.scroll_active_terminal(-3),
+            _ => {}
+        }
+    }
+
+    /// Scroll the active session's vt100 scrollback by `delta` lines: positive
+    /// scrolls up (older output, larger offset), negative scrolls down toward the
+    /// live screen (offset 0). vt100 clamps the offset to the actual scrollback,
+    /// so overshoot is harmless. New output while scrolled back keeps the offset
+    /// (vt100's behavior); it snaps back when the user scrolls down to 0.
+    fn scroll_active_terminal(&mut self, delta: i16) {
+        let Some(session) = self.terms.active_session() else {
+            return;
+        };
+        let Ok(mut parser) = session.parser().lock() else {
+            return;
+        };
+        let current = parser.screen().scrollback() as i32;
+        let next = (current + delta as i32).max(0) as usize;
+        parser.screen_mut().set_scrollback(next);
     }
 
     /// Scroll the pane under `col` (left of `divider` = config, else inspect) by
@@ -2303,6 +2368,149 @@ mod tests {
         MouseEvent { kind, column, row: 0, modifiers: KeyModifiers::NONE }
     }
 
+    fn mouse_at(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE }
+    }
+
+    fn term_sess(title: &str, container: &str) -> TermSession {
+        TermSession::test_session(title, container, 24, 80)
+    }
+
+    // A frame large enough that the terminal panel is laid out; the panel Rect
+    // is derived from the same helper the real code uses so tests can't drift.
+    const FRAME: Rect = Rect { x: 0, y: 0, width: 100, height: 40 };
+
+    // The config modal is full-screen, so its divider math only reads the width;
+    // a 100-wide area keeps the pre-Rect tests' column→percent mapping intact.
+    const MODAL_AREA: Rect = Rect { x: 0, y: 0, width: 100, height: 40 };
+
+    #[test]
+    fn mouse_click_in_panel_focuses_terminal() {
+        let mut app = new_app();
+        app.terms.open(term_sess("web-1", "devsandbox-web-1"));
+        assert_eq!(app.focus, Focus::Dashboard);
+        let panel = super::super::ui::terminal_panel_rect(FRAME, false);
+        // A click in the panel body (below the title row) focuses the terminal.
+        let click = mouse_at(
+            MouseEventKind::Down(MouseButton::Left),
+            panel.x + 2,
+            panel.y + 2,
+        );
+        app.on_mouse(&click, FRAME);
+        assert_eq!(app.focus, Focus::Terminal);
+    }
+
+    #[test]
+    fn mouse_click_outside_panel_unfocuses() {
+        let mut app = new_app();
+        app.terms.open(term_sess("web-1", "devsandbox-web-1"));
+        app.focus = Focus::Terminal;
+        // Top-left corner is outside the bottom-right panel → back to dashboard.
+        let click = mouse_at(MouseEventKind::Down(MouseButton::Left), 0, 0);
+        app.on_mouse(&click, FRAME);
+        assert_eq!(app.focus, Focus::Dashboard);
+    }
+
+    #[test]
+    fn mouse_click_on_tab_label_activates_it() {
+        let mut app = new_app();
+        app.terms.open(term_sess("web-1", "devsandbox-web-1"));
+        app.terms.open(term_sess("api-2", "devsandbox-api-2"));
+        // Two tabs open; the second is active. Click the FIRST tab's label.
+        assert_eq!(app.terms.active(), 1);
+        let panel = super::super::ui::terminal_panel_rect(FRAME, false);
+        // Labels (not focused): "1:web-1" at panel.x+1, "2:api-2" after +2 sep.
+        // Land on the first character of the first label.
+        let click = mouse_at(
+            MouseEventKind::Down(MouseButton::Left),
+            panel.x + 1,
+            panel.y,
+        );
+        app.on_mouse(&click, FRAME);
+        assert_eq!(app.terms.active(), 0);
+        assert_eq!(app.focus, Focus::Terminal);
+        // Now focused, so the `▶ ` mark (2 cols) shifts labels right by 2.
+        // Tab 2 "2:api-2" starts at x+1 + 2(mark) + 7("1:web-1") + 2(sep) = x+12.
+        let click2 = mouse_at(
+            MouseEventKind::Down(MouseButton::Left),
+            panel.x + 1 + 2 + 7 + 2,
+            panel.y,
+        );
+        app.on_mouse(&click2, FRAME);
+        assert_eq!(app.terms.active(), 1);
+    }
+
+    #[test]
+    fn mouse_click_in_gap_between_tabs_keeps_active() {
+        let mut app = new_app();
+        app.terms.open(term_sess("web-1", "devsandbox-web-1"));
+        app.terms.open(term_sess("api-2", "devsandbox-api-2"));
+        app.terms.set_active(0);
+        let panel = super::super::ui::terminal_panel_rect(FRAME, false);
+        // The two-space gap after "1:web-1" (cols x+1+7, x+1+8) hits no label,
+        // so the active tab is unchanged — but the click still focuses.
+        let click = mouse_at(
+            MouseEventKind::Down(MouseButton::Left),
+            panel.x + 1 + 7,
+            panel.y,
+        );
+        app.on_mouse(&click, FRAME);
+        assert_eq!(app.terms.active(), 0);
+        assert_eq!(app.focus, Focus::Terminal);
+    }
+
+    #[test]
+    fn mouse_in_panel_ignored_when_no_terminal() {
+        let mut app = new_app();
+        // No terminals: a click never changes focus.
+        let click = mouse_at(MouseEventKind::Down(MouseButton::Left), 50, 30);
+        app.on_mouse(&click, FRAME);
+        assert_eq!(app.focus, Focus::Dashboard);
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_active_terminal_scrollback() {
+        let mut app = new_app();
+        app.terms.open(term_sess("web-1", "devsandbox-web-1"));
+        // Build real scrollback: push 60 lines through a 24-row screen so lines
+        // scroll off the top and vt100 has somewhere to scroll back to.
+        {
+            let session = app.terms.active_session().unwrap();
+            let mut parser = session.parser().lock().unwrap();
+            for i in 0..60 {
+                parser.process(format!("line {i}\r\n").as_bytes());
+            }
+        }
+        let panel = super::super::ui::terminal_panel_rect(FRAME, false);
+        let body = (panel.x + 2, panel.y + 2);
+        fn offset(app: &App) -> usize {
+            app.terms
+                .active_session()
+                .unwrap()
+                .parser()
+                .lock()
+                .unwrap()
+                .screen()
+                .scrollback()
+        }
+        assert_eq!(offset(&app), 0);
+        // Wheel up over the body scrolls back by 3 lines.
+        app.on_mouse(&mouse_at(MouseEventKind::ScrollUp, body.0, body.1), FRAME);
+        assert_eq!(offset(&app), 3);
+        app.on_mouse(&mouse_at(MouseEventKind::ScrollUp, body.0, body.1), FRAME);
+        assert_eq!(offset(&app), 6);
+        // Wheel down walks it back toward the live screen, saturating at 0.
+        app.on_mouse(&mouse_at(MouseEventKind::ScrollDown, body.0, body.1), FRAME);
+        assert_eq!(offset(&app), 3);
+        for _ in 0..5 {
+            app.on_mouse(&mouse_at(MouseEventKind::ScrollDown, body.0, body.1), FRAME);
+        }
+        assert_eq!(offset(&app), 0);
+        // The wheel outside the panel body is ignored (offset stays 0).
+        app.on_mouse(&mouse_at(MouseEventKind::ScrollUp, 0, 0), FRAME);
+        assert_eq!(offset(&app), 0);
+    }
+
     #[test]
     fn tab_switches_focus_between_panes() {
         let mut app = new_app();
@@ -2380,13 +2588,13 @@ mod tests {
         let mut app = new_app();
         open_modal(&mut app);
         // Width 100, split 50 → divider at column 50. Press on it starts a drag.
-        app.on_mouse(&mouse(MouseEventKind::Down(MouseButton::Left), 50), 100);
+        app.on_mouse(&mouse(MouseEventKind::Down(MouseButton::Left), 50), MODAL_AREA);
         // Drag to column 30 → 30%.
-        app.on_mouse(&mouse(MouseEventKind::Drag(MouseButton::Left), 30), 100);
+        app.on_mouse(&mouse(MouseEventKind::Drag(MouseButton::Left), 30), MODAL_AREA);
         assert_eq!(view(&app).split_pct, 30);
         // Release; a later drag with no press does nothing.
-        app.on_mouse(&mouse(MouseEventKind::Up(MouseButton::Left), 30), 100);
-        app.on_mouse(&mouse(MouseEventKind::Drag(MouseButton::Left), 70), 100);
+        app.on_mouse(&mouse(MouseEventKind::Up(MouseButton::Left), 30), MODAL_AREA);
+        app.on_mouse(&mouse(MouseEventKind::Drag(MouseButton::Left), 70), MODAL_AREA);
         assert_eq!(view(&app).split_pct, 30);
     }
 
@@ -2395,8 +2603,8 @@ mod tests {
         let mut app = new_app();
         open_modal(&mut app);
         // Divider at 50; press at 10 is far away → no drag started.
-        app.on_mouse(&mouse(MouseEventKind::Down(MouseButton::Left), 10), 100);
-        app.on_mouse(&mouse(MouseEventKind::Drag(MouseButton::Left), 70), 100);
+        app.on_mouse(&mouse(MouseEventKind::Down(MouseButton::Left), 10), MODAL_AREA);
+        app.on_mouse(&mouse(MouseEventKind::Drag(MouseButton::Left), 70), MODAL_AREA);
         assert_eq!(view(&app).split_pct, 50);
     }
 
@@ -2406,15 +2614,15 @@ mod tests {
         open_modal(&mut app);
         app.on_key(key(KeyCode::Char('t'))); // resolved side, 10 lines
         // Divider at column 50. Wheel down left of it scrolls config by 3.
-        app.on_mouse(&mouse(MouseEventKind::ScrollDown, 10), 100);
+        app.on_mouse(&mouse(MouseEventKind::ScrollDown, 10), MODAL_AREA);
         assert_eq!(view(&app).scroll, 3);
         assert_eq!(view(&app).inspect_scroll, 0);
         // Wheel down right of it scrolls inspect by 3.
-        app.on_mouse(&mouse(MouseEventKind::ScrollDown, 90), 100);
+        app.on_mouse(&mouse(MouseEventKind::ScrollDown, 90), MODAL_AREA);
         assert_eq!(view(&app).inspect_scroll, 3);
         // Wheel up clamps at 0.
-        app.on_mouse(&mouse(MouseEventKind::ScrollUp, 10), 100);
-        app.on_mouse(&mouse(MouseEventKind::ScrollUp, 10), 100);
+        app.on_mouse(&mouse(MouseEventKind::ScrollUp, 10), MODAL_AREA);
+        app.on_mouse(&mouse(MouseEventKind::ScrollUp, 10), MODAL_AREA);
         assert_eq!(view(&app).scroll, 0);
     }
 
@@ -2651,7 +2859,7 @@ mod tests {
         assert_eq!(app.terms.active(), 1);
         // `x` closes the active one.
         app.on_key(key(KeyCode::Char('x')));
-        assert_eq!(app.terms.len(), 1);
+        assert_eq!(app.terms.sessions().len(), 1);
         assert_eq!(app.terms.active_session().unwrap().title, "a");
     }
 

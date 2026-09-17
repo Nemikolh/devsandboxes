@@ -129,21 +129,8 @@ fn open_bottom_split(area: Rect) -> (Rect, Rect, Rect) {
 /// layout functions the draw path uses ([`draw`] for the bottom-bar height,
 /// [`content_areas`] for the panel), so step 4 can size the PTY to exactly what
 /// gets rendered. Returns `None` when no terminal panel is laid out.
-#[allow(dead_code)] // called by the event loop's pre-draw PTY resize in step 4
 pub fn term_pane_size(frame: Rect, prompt_open: bool) -> Option<(u16, u16)> {
-    // Mirror draw()'s vertical split: tab bar (1), content (Min 0), bottom bar.
-    let bottom = if prompt_open { 2 } else { 1 };
-    let [_tab_area, content_area, _bottom_area] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(0),
-        Constraint::Length(bottom),
-    ])
-    .areas(frame);
-
-    // The terminal panel only exists when terminals are open; reuse the exact
-    // split the draw path lays out.
-    let (_top, _detail, panel) = open_bottom_split(content_area);
-
+    let panel = terminal_panel_rect(frame, prompt_open);
     // Inner screen = panel minus the block border (1 cell each side).
     let rows = panel.height.saturating_sub(2);
     let cols = panel.width.saturating_sub(2);
@@ -153,6 +140,65 @@ pub fn term_pane_size(frame: Rect, prompt_open: bool) -> Option<(u16, u16)> {
         Some((rows, cols))
     }
 }
+
+/// The full terminal-panel Rect (border included) for a frame of size `frame`,
+/// mirroring `draw()`'s vertical split and the `open_bottom_split` bottom split.
+/// Independent of whether terminals are actually open — callers gate on
+/// `!app.terms.is_empty()` — so the mouse hit-test and the PTY-size math share
+/// exactly one layout definition. `pub(crate)` for the event loop's mouse routing.
+pub(crate) fn terminal_panel_rect(frame: Rect, prompt_open: bool) -> Rect {
+    // Mirror draw()'s vertical split: tab bar (1), content (Min 0), bottom bar.
+    let bottom = if prompt_open { 2 } else { 1 };
+    let [_tab_area, content_area, _bottom_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(bottom),
+    ])
+    .areas(frame);
+    let (_top, _detail, panel) = open_bottom_split(content_area);
+    panel
+}
+
+/// Mouse hit-test for the terminal panel's tab strip. Given the panel Rect, the
+/// focus flag (a focused panel prepends the `▶ ` mark, shifting labels right),
+/// and a click `(col, row)`, return the index of the tab whose label span the
+/// click lands on — or `None` when the click is not on the title row or misses
+/// every label. The label spans are derived from the SAME strings the strip
+/// renders ([`terminal_tab_labels`]), so a hit can only land where a tab is drawn.
+pub(crate) fn terminal_tab_hit(
+    app: &App,
+    panel: Rect,
+    focused: bool,
+    col: u16,
+    row: u16,
+) -> Option<usize> {
+    // The tab strip lives in the block's top border row.
+    if row != panel.y {
+        return None;
+    }
+    // Title starts one cell in from the left border corner, then the focus mark.
+    let mut x = panel.x + 1;
+    if focused {
+        x += FOCUS_MARK_WIDTH;
+    }
+    for (i, label) in terminal_tab_labels(app).into_iter().enumerate() {
+        if i > 0 {
+            x += TAB_SEP_WIDTH; // the two-space separator between tabs
+        }
+        let width = label.chars().count() as u16;
+        if col >= x && col < x + width {
+            return Some(i);
+        }
+        x += width;
+    }
+    None
+}
+
+/// Display width of the `▶ ` focus mark prepended to the tab strip when the
+/// terminal is focused (`▶` is one column plus a trailing space).
+const FOCUS_MARK_WIDTH: u16 = 2;
+/// Width of the two-space separator between tab labels.
+const TAB_SEP_WIDTH: u16 = 2;
 
 fn draw_services(frame: &mut Frame, app: &App, area: Rect) {
     let snapshot = app.snapshot.as_ref();
@@ -356,25 +402,36 @@ fn draw_service_detail(
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-/// Pure tab-strip model for the terminal panel: one entry per open session as
-/// `(label, active, exited)`. Labels are `{i+1}:{title}` with a ` (exited)`
-/// suffix on dead tabs. Kept free of styling so it's unit-testable; the styling
-/// lives in [`terminal_tab_line`].
-fn terminal_tab_specs(app: &App) -> Vec<(String, bool, bool)> {
-    let active = app.terms.active();
+/// Pure tab labels for the terminal panel, one per open session: `{i+1}:{title}`
+/// with a ` (exited)` suffix on dead tabs. The single source of truth for both
+/// the rendered strip ([`terminal_tab_specs`]) and the mouse hit-test
+/// ([`terminal_tab_hit`]), so a click can't land on a column the strip doesn't
+/// actually draw.
+pub(crate) fn terminal_tab_labels(app: &App) -> Vec<String> {
     app.terms
         .sessions()
         .iter()
         .enumerate()
         .map(|(i, s)| {
-            let exited = s.exited();
-            let label = if exited {
+            if s.exited() {
                 format!("{}:{} (exited)", i + 1, s.title)
             } else {
                 format!("{}:{}", i + 1, s.title)
-            };
-            (label, i == active, exited)
+            }
         })
+        .collect()
+}
+
+/// Pure tab-strip model for the terminal panel: one entry per open session as
+/// `(label, active, exited)`. Kept free of styling so it's unit-testable; the
+/// styling lives in [`terminal_tab_line`].
+fn terminal_tab_specs(app: &App) -> Vec<(String, bool, bool)> {
+    let active = app.terms.active();
+    terminal_tab_labels(app)
+        .into_iter()
+        .zip(app.terms.sessions())
+        .enumerate()
+        .map(|(i, (label, s))| (label, i == active, s.exited()))
         .collect()
 }
 
@@ -385,6 +442,7 @@ fn terminal_tab_specs(app: &App) -> Vec<(String, bool, bool)> {
 fn terminal_tab_line(app: &App) -> Line<'static> {
     let mut spans: Vec<Span> = Vec::new();
     if app.focus == Focus::Terminal {
+        // `▶ ` is FOCUS_MARK_WIDTH columns; keep the string and constant in sync.
         spans.push(Span::styled(
             "▶ ",
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),

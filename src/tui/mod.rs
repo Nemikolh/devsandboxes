@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event};
+use ratatui::layout::Rect;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
@@ -34,8 +35,13 @@ use data::Snapshot;
 use procs::{parse_top, build_forest, ProcState};
 use prompt::PromptAction;
 
-/// How long each `event::poll` blocks before we redraw.
+/// How long each `event::poll` blocks before we redraw when no terminal is open.
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// Shorter poll used while any integrated terminal is open. Key events already
+/// wake `event::poll`, but child *output* arrives on the reader threads and only
+/// becomes visible on the next draw — a 250ms cadence makes shell echo feel
+/// laggy, so we redraw ~33×/s to keep echo snappy while terminals exist.
+const TERM_POLL_INTERVAL: Duration = Duration::from_millis(30);
 /// Data-refresh cadence: how often a background collection is kicked off.
 const TICK_INTERVAL: Duration = Duration::from_secs(2);
 /// Process-refresh cadence for expanded instances (separate from the snapshot).
@@ -97,14 +103,34 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
     let mut last_proc_tick = Instant::now();
 
     while !app.should_quit {
+        // Full-frame area, shared by the pre-draw PTY resize and mouse routing.
+        let size = terminal.size()?;
+        let area = Rect::new(0, 0, size.width, size.height);
+
+        // Pre-draw: size every PTY to the panel the draw path is about to lay
+        // out, so the shell's winsize matches what gets rendered. Resize is a
+        // cheap no-op when unchanged; every tab (not just the active one) is
+        // sized so a background tab is already correct when switched to.
+        if !app.terms.is_empty() {
+            if let Some((rows, cols)) = ui::term_pane_size(area, app.prompt.is_some()) {
+                app.terms.resize_all(rows, cols);
+            }
+        }
+
         terminal.draw(|frame| ui::draw(frame, &app))?;
 
-        if event::poll(POLL_INTERVAL)? {
+        // Shorter cadence while terminals are open so shell echo stays snappy.
+        let poll = if app.terms.is_empty() {
+            POLL_INTERVAL
+        } else {
+            TERM_POLL_INTERVAL
+        };
+        if event::poll(poll)? {
             match event::read()? {
                 Event::Key(key) if key.kind == event::KeyEventKind::Press => app.on_key(key),
-                // The modal is full-screen, so the frame width equals the
-                // terminal width; feed it in so the divider math stays I/O-free.
-                Event::Mouse(ev) => app.on_mouse(&ev, terminal.size()?.width),
+                // Feed the full frame area so the modal divider math and the
+                // terminal-panel hit-testing stay I/O-free.
+                Event::Mouse(ev) => app.on_mouse(&ev, area),
                 _ => {}
             }
         }

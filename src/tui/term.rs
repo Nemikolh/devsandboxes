@@ -53,9 +53,6 @@ pub struct TermSession {
     writer: Box<dyn Write + Send>,
     /// Child handle, kept so [`Drop`] can kill+wait it. `None` in tests.
     child: Option<Box<dyn Child + Send + Sync>>,
-    /// Set by the reader thread whenever new bytes were parsed; the event loop
-    /// swaps it to `false` after a redraw so idle terminals cost nothing.
-    dirty: Arc<AtomicBool>,
     /// Set by the reader thread once the PTY hits EOF (shell exited / container
     /// stopped). The tab then renders as `(exited)` and swallows keys.
     exited: Arc<AtomicBool>,
@@ -105,10 +102,9 @@ impl TermSession {
             .context("failed to take pty writer")?;
 
         let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, SCROLLBACK)));
-        let dirty = Arc::new(AtomicBool::new(true));
         let exited = Arc::new(AtomicBool::new(false));
 
-        spawn_reader(reader, parser.clone(), dirty.clone(), exited.clone());
+        spawn_reader(reader, parser.clone(), exited.clone());
 
         Ok(TermSession {
             title,
@@ -117,7 +113,6 @@ impl TermSession {
             master: Some(pair.master),
             writer,
             child: Some(child),
-            dirty,
             exited,
             size: (rows, cols),
         })
@@ -130,7 +125,6 @@ impl TermSession {
 
     /// Propagate a new pane size to the kernel winsize and the parser. No-op
     /// when unchanged so we don't churn on every redraw.
-    #[allow(dead_code)] // called by the event loop's pre-draw resize in step 4
     pub fn resize(&mut self, rows: u16, cols: u16) {
         if self.size == (rows, cols) {
             return;
@@ -166,13 +160,6 @@ impl TermSession {
         self.size
     }
 
-    /// Consume the dirty flag: returns whether anything changed since the last
-    /// call and resets it, so the event loop can redraw only when needed.
-    #[allow(dead_code)] // polled by the event loop in step 4
-    pub fn take_dirty(&self) -> bool {
-        self.dirty.swap(false, Ordering::Relaxed)
-    }
-
     /// Test constructor: an in-memory writer, no PTY, no child. Lets tab and
     /// key-forwarding logic be exercised without a container runtime. Shared with
     /// [`super::app`]'s tests via `pub(crate)`.
@@ -185,7 +172,6 @@ impl TermSession {
             master: None,
             writer: Box::new(Vec::<u8>::new()),
             child: None,
-            dirty: Arc::new(AtomicBool::new(false)),
             exited: Arc::new(AtomicBool::new(false)),
             size: (rows, cols),
         }
@@ -236,9 +222,13 @@ impl TermTabs {
         self.sessions.is_empty()
     }
 
-    #[allow(dead_code)] // used by the event loop's mouse/tab routing in step 4
-    pub fn len(&self) -> usize {
-        self.sessions.len()
+    /// Resize every open session to `rows`×`cols`. The event loop calls this
+    /// before each draw so background tabs are already right-sized when switched
+    /// to; `TermSession::resize` no-ops when a session's size is unchanged.
+    pub fn resize_all(&mut self, rows: u16, cols: u16) {
+        for session in &mut self.sessions {
+            session.resize(rows, cols);
+        }
     }
 
     /// The active session, or `None` when no terminals are open.
@@ -303,12 +293,13 @@ impl TermTabs {
     }
 }
 
-/// Pump PTY output into the parser until EOF, flagging `dirty` after each
-/// chunk and `exited` when the stream closes.
+/// Pump PTY output into the parser until EOF, flagging `exited` when the stream
+/// closes. The event loop redraws on a fixed cadence while any terminal exists
+/// (see `mod.rs`), so the reader doesn't need to signal "dirty" — ratatui's
+/// buffer diff collapses redraws that changed nothing.
 fn spawn_reader(
     mut reader: Box<dyn Read + Send>,
     parser: Arc<Mutex<vt100::Parser>>,
-    dirty: Arc<AtomicBool>,
     exited: Arc<AtomicBool>,
 ) {
     thread::spawn(move || {
@@ -320,13 +311,11 @@ fn spawn_reader(
                     if let Ok(mut parser) = parser.lock() {
                         parser.process(&buf[..n]);
                     }
-                    dirty.store(true, Ordering::Relaxed);
                 }
                 Err(_) => break,
             }
         }
         exited.store(true, Ordering::Relaxed);
-        dirty.store(true, Ordering::Relaxed);
     });
 }
 
@@ -604,7 +593,6 @@ mod tests {
         assert_eq!(s.container, "devsandbox-web-1");
         assert_eq!(s.size(), (24, 80));
         assert!(!s.exited());
-        assert!(!s.take_dirty());
     }
 
     #[test]
@@ -622,12 +610,23 @@ mod tests {
     }
 
     #[test]
+    fn tabs_resize_all_sizes_every_session() {
+        let mut tabs = TermTabs::default();
+        tabs.open(sess("a", "devsandbox-a"));
+        tabs.open(sess("b", "devsandbox-b"));
+        tabs.resize_all(40, 120);
+        for s in tabs.sessions() {
+            assert_eq!(s.size(), (40, 120));
+        }
+    }
+
+    #[test]
     fn tabs_open_sets_active_last() {
         let mut tabs = TermTabs::default();
         assert!(tabs.is_empty());
         tabs.open(sess("a", "devsandbox-a"));
         tabs.open(sess("b", "devsandbox-b"));
-        assert_eq!(tabs.len(), 2);
+        assert_eq!(tabs.sessions().len(), 2);
         assert_eq!(tabs.active(), 1);
         assert_eq!(tabs.active_session().unwrap().title, "b");
     }
@@ -661,7 +660,7 @@ mod tests {
         tabs.open(sess("c", "devsandbox-c")); // active = 2 (last)
         tabs.close_active();
         // last removed → active clamps to new last
-        assert_eq!(tabs.len(), 2);
+        assert_eq!(tabs.sessions().len(), 2);
         assert_eq!(tabs.active(), 1);
         assert_eq!(tabs.active_session().unwrap().title, "b");
         tabs.set_active(0);

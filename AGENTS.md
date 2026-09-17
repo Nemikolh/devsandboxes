@@ -22,7 +22,9 @@ git worktrees so working trees are never shared.
 - `src/runtime/` — backend abstraction over docker/podman/Apple container.
 - `src/tui/` — ratatui dashboard. `app.rs` is a deliberately I/O-free state
   machine (unit-tested); `mod.rs` owns the terminal + event loop and runs
-  docker work on background threads; `prompt.rs` is the `:` command line.
+  docker work on background threads; `prompt.rs` is the `:` command line;
+  `term.rs` holds the integrated terminal's PTY sessions + tab strip
+  (`TermSession`/`TermTabs`, `docker exec -it` shell rendered via vt100).
 
 ## Conventions & checks
 
