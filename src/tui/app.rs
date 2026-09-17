@@ -9,6 +9,7 @@ use crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 
+use crate::commands::run::DEFAULT_WORKTREE_BRANCH;
 use crate::config::Config;
 use crate::runtime::backend;
 
@@ -850,10 +851,16 @@ impl App {
             }
             KeyCode::Tab => {
                 let instances = self.instance_names();
-                let sandboxes = self.sandbox_names();
+                // One config load per tab: sandbox names for the positional
+                // argument plus `worktree-branch` lookups for `--branch` values.
+                let config = Config::load(&self.dir).ok();
+                let sandboxes: Vec<String> = config
+                    .as_ref()
+                    .map(|c| c.sandboxes.keys().cloned().collect())
+                    .unwrap_or_default();
                 if let Some(prompt) = &mut self.prompt {
-                    prompt.complete(|idx, first| {
-                        Self::candidates_for(idx, first, &sandboxes, &instances)
+                    prompt.complete(|idx, tokens| {
+                        Self::candidates_for(idx, tokens, &sandboxes, &instances, config.as_ref())
                     });
                 }
             }
@@ -890,25 +897,76 @@ impl App {
         }
     }
 
-    /// Candidate list for the token at `idx`: command names for the first
-    /// token, then sandbox names for `run` and instance names for the rest.
+    /// Candidate list for the token at `idx` of the whitespace-split `tokens`
+    /// (the token being completed is absent when empty): command names for the
+    /// first token, sandbox names / flags for `run`, instance names for the rest.
     fn candidates_for(
         idx: usize,
-        first: &str,
+        tokens: &[String],
         sandboxes: &[String],
         instances: &[String],
+        config: Option<&Config>,
     ) -> Vec<String> {
         if idx == 0 {
             return COMMANDS.iter().map(|s| s.to_string()).collect();
         }
-        if idx != 1 {
-            return Vec::new();
-        }
-        match first {
-            "run" => sandboxes.to_vec(),
-            "exec" | "code" | "rm" | "stop" | "start" => instances.to_vec(),
+        match tokens.first().map(String::as_str) {
+            Some("run") => Self::run_candidates(idx, tokens, sandboxes, config),
+            Some("exec" | "code" | "rm" | "stop" | "start" | "rebuild" | "recreate")
+                if idx == 1 =>
+            {
+                instances.to_vec()
+            }
             _ => Vec::new(),
         }
+    }
+
+    /// Candidates for `run` arguments past the command. Positional: sandbox
+    /// names while none is on the line. Otherwise the flags not already used.
+    /// After `--branch`, the branch the run would use anyway (the sandbox's
+    /// `worktree-branch`, else the default pattern) so the user edits a base
+    /// instead of typing from scratch; `${…}` variables stay unsubstituted,
+    /// exactly as `run` would receive them.
+    fn run_candidates(
+        idx: usize,
+        tokens: &[String],
+        sandboxes: &[String],
+        config: Option<&Config>,
+    ) -> Vec<String> {
+        match tokens.get(idx - 1).map(String::as_str) {
+            Some("--branch") => {
+                let branch = Self::run_sandbox_token(tokens, idx)
+                    .and_then(|s| config?.resolve_sandbox(s).ok()?.properties.worktree_branch)
+                    .unwrap_or_else(|| DEFAULT_WORKTREE_BRANCH.to_string());
+                return vec![branch];
+            }
+            Some("--name") => return Vec::new(), // free-form value
+            _ => {}
+        }
+        let stem = tokens.get(idx).map(String::as_str).unwrap_or("");
+        if !stem.starts_with('-') && Self::run_sandbox_token(tokens, idx).is_none() {
+            return sandboxes.to_vec();
+        }
+        ["--name", "--branch"]
+            .into_iter()
+            .filter(|flag| !tokens.iter().enumerate().any(|(i, t)| i != idx && t == flag))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The positional (sandbox) token of a `run` line, if any: the first token
+    /// after the command that is neither a flag, a flag's value, nor the token
+    /// currently being completed (at index `skip`).
+    fn run_sandbox_token(tokens: &[String], skip: usize) -> Option<&str> {
+        let mut i = 1;
+        while i < tokens.len() {
+            match tokens[i].as_str() {
+                "--name" | "--branch" => i += 2,
+                _ if i == skip => i += 1,
+                other => return Some(other),
+            }
+        }
+        None
     }
 
     /// Instance names from the latest snapshot (empty until one lands).
@@ -917,14 +975,6 @@ impl App {
             .as_ref()
             .map(|s| s.instances.iter().map(|r| r.name.clone()).collect())
             .unwrap_or_default()
-    }
-
-    /// Sandbox names from the on-disk config; best-effort (empty on error).
-    fn sandbox_names(&self) -> Vec<String> {
-        match Config::load(&self.dir) {
-            Ok(cfg) => cfg.sandboxes.keys().cloned().collect(),
-            Err(_) => Vec::new(),
-        }
     }
 
     /// Take the pending action for the event loop to execute, if any.
@@ -2228,4 +2278,82 @@ mod tests {
         // Empty → None.
         assert_eq!(service_inspect_target(&[]), None);
     }
+
+    fn toks(line: &str) -> Vec<String> {
+        line.split_whitespace().map(str::to_string).collect()
+    }
+
+    fn cfg() -> Config {
+        Config::parse(
+            "[sandbox.web]\nfolder = \"code\"\nworktree-branch = \"wt/${instance}\"\n\n[sandbox.api]\nfolder = \"code\"\n",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn run_candidates_sandbox_position() {
+        let sandboxes = vec!["api".to_string(), "web".to_string()];
+        assert_eq!(
+            App::candidates_for(1, &toks("run"), &sandboxes, &[], None),
+            sandboxes
+        );
+        // Sandbox not on the line yet (only a flag pair) → still sandbox names.
+        assert_eq!(
+            App::candidates_for(3, &toks("run --name x"), &sandboxes, &[], None),
+            sandboxes
+        );
+    }
+
+    #[test]
+    fn run_candidates_flags_after_sandbox() {
+        let sandboxes = vec!["web".to_string()];
+        // Empty token after the sandbox → the flags.
+        assert_eq!(
+            App::candidates_for(2, &toks("run web"), &sandboxes, &[], None),
+            vec!["--name".to_string(), "--branch".to_string()]
+        );
+        // A `--` stem too (the prompt then filters by the stem).
+        assert_eq!(
+            App::candidates_for(2, &toks("run web --"), &sandboxes, &[], None),
+            vec!["--name".to_string(), "--branch".to_string()]
+        );
+        // A flag already used is not offered again.
+        assert_eq!(
+            App::candidates_for(4, &toks("run web --name x"), &sandboxes, &[], None),
+            vec!["--branch".to_string()]
+        );
+    }
+
+    #[test]
+    fn run_candidates_branch_value_offers_default() {
+        let config = cfg();
+        let sandboxes: Vec<String> = config.sandboxes.keys().cloned().collect();
+        // Sandbox with `worktree-branch` → its pattern as the editable base.
+        assert_eq!(
+            App::candidates_for(3, &toks("run web --branch"), &sandboxes, &[], Some(&config)),
+            vec!["wt/${instance}".to_string()]
+        );
+        // Without one → the built-in default pattern.
+        assert_eq!(
+            App::candidates_for(3, &toks("run api --branch"), &sandboxes, &[], Some(&config)),
+            vec![DEFAULT_WORKTREE_BRANCH.to_string()]
+        );
+        // `--name` values are free-form: no candidates.
+        assert!(App::candidates_for(3, &toks("run web --name"), &sandboxes, &[], Some(&config))
+            .is_empty());
+    }
+
+    #[test]
+    fn rebuild_completes_instance_names() {
+        let instances = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(
+            App::candidates_for(1, &toks("rebuild"), &[], &instances, None),
+            instances
+        );
+        assert_eq!(
+            App::candidates_for(1, &toks("recreate"), &[], &instances, None),
+            instances
+        );
+    }
+
 }

@@ -251,12 +251,14 @@ impl Prompt {
     }
 
     /// Tab: complete the token under the cursor. `candidates(token_index,
-    /// first_token)` supplies the raw candidate list for that position; the
-    /// prompt filters by the token's stem, applies the first match, and cycles
-    /// on repeated calls. Any non-tab edit clears the cycle (via [`Self::edited`]).
+    /// tokens)` supplies the raw candidate list for that position given the
+    /// line's whitespace-split tokens (so callers can key on the command and
+    /// on preceding flags); the prompt filters by the token's stem, applies
+    /// the first match, and cycles on repeated calls. Any non-tab edit clears
+    /// the cycle (via [`Self::edited`]).
     pub fn complete<F>(&mut self, candidates: F)
     where
-        F: Fn(usize, &str) -> Vec<String>,
+        F: Fn(usize, &[String]) -> Vec<String>,
     {
         // Repeated tab: advance within the existing cycle.
         if let Some(comp) = &mut self.completion {
@@ -271,11 +273,8 @@ impl Prompt {
 
         let (idx, start, end) = self.token_at_cursor();
         let stem: String = self.input.chars().take(end).skip(start).collect();
-        let first: String = {
-            let (_, fs, fe) = self.nth_token(0);
-            self.input.chars().take(fe).skip(fs).collect()
-        };
-        let mut cands: Vec<String> = candidates(idx, &first)
+        let tokens: Vec<String> = self.input.split_whitespace().map(str::to_string).collect();
+        let mut cands: Vec<String> = candidates(idx, &tokens)
             .into_iter()
             .filter(|c| c.starts_with(&stem))
             .collect();
@@ -331,28 +330,6 @@ impl Prompt {
         }
         // Cursor past the last token (on trailing space) → new empty token.
         (idx, self.cursor, self.cursor)
-    }
-
-    /// Char span and index of the nth whitespace-delimited token; an empty span
-    /// at end-of-line when there are fewer than `n + 1` tokens.
-    fn nth_token(&self, n: usize) -> (usize, usize, usize) {
-        let chars: Vec<char> = self.input.chars().collect();
-        let mut idx = 0;
-        let mut i = 0;
-        while i < chars.len() {
-            while i < chars.len() && chars[i].is_whitespace() {
-                i += 1;
-            }
-            let start = i;
-            while i < chars.len() && !chars[i].is_whitespace() {
-                i += 1;
-            }
-            if idx == n {
-                return (idx, start, i);
-            }
-            idx += 1;
-        }
-        (n, chars.len(), chars.len())
     }
 
     /// Parse the current line into a [`PromptAction`]. On error, stash the
@@ -585,13 +562,13 @@ mod tests {
     }
 
     /// Candidate source used by completion tests.
-    fn cands(idx: usize, first: &str) -> Vec<String> {
+    fn cands(idx: usize, tokens: &[String]) -> Vec<String> {
         if idx == 0 {
             return COMMANDS.iter().map(|s| s.to_string()).collect();
         }
-        match first {
-            "run" => vec!["alpha".into(), "beta".into(), "bacon".into()],
-            "exec" | "code" | "rm" | "stop" => vec!["inst1".into(), "inst2".into()],
+        match tokens.first().map(String::as_str) {
+            Some("run") => vec!["alpha".into(), "beta".into(), "bacon".into()],
+            Some("exec" | "code" | "rm" | "stop") => vec!["inst1".into(), "inst2".into()],
             _ => Vec::new(),
         }
     }

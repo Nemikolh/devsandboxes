@@ -13,6 +13,11 @@ use crate::features::{self, FeatureMetadata};
 use crate::runtime::{backend, ServiceEndpoint, NAME_PREFIX};
 use crate::state::{Instance, State};
 
+/// Branch pattern for worktree instances when neither `--branch` nor the
+/// sandbox's `worktree-branch` is set. Also the TUI prompt's completion base
+/// after `--branch`.
+pub const DEFAULT_WORKTREE_BRANCH: &str = "sandbox/${instance}";
+
 pub fn run(
     dir: &Path,
     sandbox_name: Option<String>,
@@ -101,7 +106,7 @@ pub fn run(
         // variables) are substituted so each instance gets a unique branch.
         let pattern = branch_override
             .or_else(|| props.worktree_branch.clone())
-            .unwrap_or_else(|| "sandbox/${instance}".to_string());
+            .unwrap_or_else(|| DEFAULT_WORKTREE_BRANCH.to_string());
         let branch = substitute(&pattern, &var_ctx);
         // Must be absolute: `create_worktree` runs `git -C <base>`, so a
         // `dir`-relative path would resolve under the base repo instead of here,
