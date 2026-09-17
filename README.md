@@ -73,6 +73,48 @@ devsandbox                  # no args on a TTY: interactive dashboard
 
 `<name>` may be an instance name, a sandbox config name, or a repository folder basename; ambiguity prompts on a TTY and errors otherwise.
 
+## JSON output
+
+For scripts and external UIs that drive devsandbox through the CLI, the read verbs emit machine-readable JSON:
+
+- `status --json` — the full dashboard snapshot in one call: `instances`, `sandboxes`, `services`, plus the runtime `name`/`version`. `--json` is mandatory (plain `status` is reserved for a future human summary). The runtime or config being unavailable is data, not failure: the rows still come from state, an `error` field carries the reason, and the exit code stays `0`.
+- `ps --json`, `ls --json`, `stats --json` — the same rows as the table, as JSON.
+- `inspect --json` — the runtime's own inspect document, pretty-printed.
+
+Every payload except `inspect` is wrapped in an envelope so consumers can gate on the version before reading `data`:
+
+```json
+{ "schema": 1, "data": … }
+```
+
+`schema` is bumped on any breaking payload change (`SCHEMA` in `src/commands/status.rs`). `inspect --json` carries no envelope — the payload is the backend's schema, not ours. The field-level contract is the serialized Rust types in `src/snapshot.rs`; this README states the surface and the stability promise, not every field.
+
+Container liveness is a tagged object: `{"state":"running","text":"Up 3 minutes"}`, `{"state":"exited","text":…}`, or `{"state":"missing"}` (no `text`).
+
+```console
+$ devsandbox -C ../.devsandboxes ls --json
+{
+  "schema": 1,
+  "data": [
+    {
+      "name": "devsandboxes",
+      "source": "image rust:1.98-trixie",
+      "folder": "../devsandboxes",
+      "services": [
+        "tools"
+      ],
+      "extends": [
+        "base"
+      ],
+      "config_hash": "6287325c422daa3a",
+      "issues": []
+    }
+  ]
+}
+```
+
+Non-goals: there is no JSON for the interactive terminal — a UI owns its own PTY and runs `devsandbox exec` under it. `cpu`/`mem` are the runtime's pre-formatted strings (what the TUI shows); raw numeric metrics would be a future schema bump.
+
 ## The dashboard
 
 Running `devsandbox` with no subcommand opens a ratatui dashboard: an instance tree grouped by sandbox with live status/CPU/mem, an expandable process forest per instance, a services view, a config explorer (original vs. `extends`-resolved TOML, side-by-side with `docker inspect`), instance logs, a command prompt with history and tab completion, one-key run and VS Code attach, and a help overlay. Config entries are validated in place; broken sandboxes are flagged.
