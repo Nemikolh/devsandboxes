@@ -956,19 +956,26 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     let base = match app.modal {
-        Modal::Config(_) => "t toggle · tab pane · <> resize · ↑↓ scroll · esc close",
-        Modal::Help(_) => "↑↓ scroll · pgup/pgdn · g/G · esc/? close",
-        Modal::Logs(_) => "↑↓ scroll · pgup/pgdn · g/G · esc close",
+        Modal::Config(_) => "t toggle · tab pane · <> resize · ↑↓ scroll · esc close".to_string(),
+        Modal::Help(_) => "↑↓ scroll · pgup/pgdn · g/G · esc/? close".to_string(),
+        Modal::Logs(_) => "↑↓ scroll · pgup/pgdn · g/G · esc close".to_string(),
         Modal::None => match app.tab {
-            Tab::Instances => "q quit · tab switch · ↑↓ select · ←→ fold · enter config · r run · o vscode · s stop · l logs · : cmd · ? help",
-            Tab::Services => "q quit · tab switch · ↑↓ select · enter config · : cmd · ? help",
+            // `s` mirrors what the key would do to the selection: stop vs start.
+            Tab::Instances => format!(
+                "q quit · tab switch · ↑↓ select · ←→ fold · enter config · r run · o vscode · s {} · l logs · t term · : cmd · ? help",
+                app.stop_start_hint()
+            ),
+            Tab::Services => {
+                "q quit · tab switch · ↑↓ select · enter config · t term · : cmd · ? help"
+                    .to_string()
+            }
         },
     };
     // On the dashboard with terminals open, append the terminal-cycle hints.
     let text = if matches!(app.modal, Modal::None) && !app.terms.is_empty() {
         format!("{base} · [/] terms · ctrl-] focus term")
     } else {
-        base.to_string()
+        base
     };
     let help = Line::from(text).style(Style::default().add_modifier(Modifier::DIM));
     frame.render_widget(Paragraph::new(help), area);

@@ -889,6 +889,18 @@ impl App {
         }
     }
 
+    /// Help-bar verb for the `s` key, matching what
+    /// [`Self::stop_or_start_instance`] would actually do to the instance under
+    /// the cursor: `start` when it is exited (a drifted one rebuilds, which is
+    /// still a start from the user's seat), `stop` otherwise.
+    pub fn stop_start_hint(&self) -> &'static str {
+        let exited = self
+            .selected_instance_index()
+            .and_then(|i| self.snapshot.as_ref()?.instances.get(i))
+            .is_some_and(|row| matches!(row.status, ContainerStatus::Exited(_)));
+        if exited { "start" } else { "stop" }
+    }
+
     /// Take the pending background stop for the event loop to spawn, if any.
     pub fn take_pending_stop(&mut self) -> Option<String> {
         self.pending_stop.take()
@@ -2877,6 +2889,25 @@ mod tests {
         // Leave keys still work on an exited session.
         app.on_key(key(KeyCode::F(12)));
         assert_eq!(app.focus, Focus::Dashboard);
+    }
+
+    #[test]
+    fn stop_start_hint_tracks_selection_status() {
+        let mut app = new_app();
+        // No snapshot / nothing selected → the default verb.
+        assert_eq!(app.stop_start_hint(), "stop");
+        // Exited instance under the cursor → `start`.
+        app.set_snapshot(snapshot_with_status(
+            1,
+            ContainerStatus::Exited("Exited (0)".into()),
+        ));
+        app.on_key(key(KeyCode::Down)); // onto inst0
+        assert_eq!(app.stop_start_hint(), "start");
+        // Running → `stop`; Missing (s is a no-op) → the default `stop`.
+        app.set_snapshot(snapshot_with_status(1, running()));
+        assert_eq!(app.stop_start_hint(), "stop");
+        app.set_snapshot(snapshot_with_status(1, ContainerStatus::Missing));
+        assert_eq!(app.stop_start_hint(), "stop");
     }
 
     #[test]
