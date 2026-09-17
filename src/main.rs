@@ -50,10 +50,23 @@ enum Command {
         /// Instance name, sandbox config name, or repository folder name
         name: String,
     },
-    /// Stop a sandbox instance (docker stop; `run` restarts it)
+    /// Stop a sandbox instance (docker stop; `start` restarts it)
     Stop {
         /// Instance name, sandbox config name, or repository folder name
-        name: String,
+        #[arg(required_unless_present = "all")]
+        name: Option<String>,
+        /// Stop every running instance
+        #[arg(long, conflicts_with = "name")]
+        all: bool,
+    },
+    /// Start a stopped sandbox instance (services included)
+    Start {
+        /// Instance name, sandbox config name, or repository folder name
+        #[arg(required_unless_present = "all")]
+        name: Option<String>,
+        /// Start every stopped instance
+        #[arg(long, conflicts_with = "name")]
+        all: bool,
     },
     /// Remove shared services no live instance references and orphaned
     /// shell-history files
@@ -113,7 +126,8 @@ fn main() -> Result<()> {
             commands::run::run(&cli.dir, sandbox, name, branch)
         }
         Command::Rm { name } => commands::rm::rm(&name),
-        Command::Stop { name } => commands::stop::stop(&name),
+        Command::Stop { name, all } => commands::stop::stop(name, all),
+        Command::Start { name, all } => commands::start::start(&cli.dir, name, all),
         Command::Gc { force } => commands::services::gc(&cli.dir, force),
         Command::Logs { name, lines } => commands::logs::logs(&name, lines),
         Command::Inspect { name } => commands::inspect::inspect(&name),

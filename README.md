@@ -47,7 +47,8 @@ Then:
 devsandbox run web          # start an instance in the background (name printed)
 devsandbox ps               # list running instances (-a includes stopped)
 devsandbox exec -it web zsh # exec into it (name = instance, sandbox, or folder)
-devsandbox stop web
+devsandbox stop web         # stop it (--all: everything running)
+devsandbox start web        # restart it (--all: everything stopped)
 devsandbox rm web           # container + worktree + state entry
 devsandbox gc               # reap unreferenced services and orphaned history files
 devsandbox                  # no args on a TTY: interactive dashboard
@@ -62,8 +63,9 @@ devsandbox                  # no args on a TTY: interactive dashboard
 | `devsandbox`                   | TUI dashboard (bare invocation on a TTY); help otherwise                                                                                 |
 | `ls`                           | Sandbox configs defined in `config.toml`                                                                                                 |
 | `ps [-a]`                      | Sandbox instances, joined from state + runtime                                                                                           |
-| `run [sandbox] [--name n] [--branch b]` | Start an instance in the background; interactive picker without args; reuses existing containers, detects config drift via a config hash. `--branch` sets the worktree branch, overriding the sandbox's `worktree-branch` |
-| `stop <name>`                  | `docker stop`; a later `run` restarts it                                                                                                 |
+| `run [sandbox] [--name n] [--branch b]` | Create a fresh instance in the background; interactive picker without args. Never restarts a stopped instance (that is `start`). `--branch` sets the worktree branch, overriding the sandbox's `worktree-branch` |
+| `start <name>` / `start --all` | Restart a stopped instance, full path: config-drift warning, services recreated/started, service DNS rewired, `postStartCommand`         |
+| `stop <name>` / `stop --all`   | `docker stop` of the instance and its isolated services; `start` restarts it                                                             |
 | `rm <name>`                    | Remove container, worktree, and state entry (managed shell history is kept so a rebuilt instance inherits it)                            |
 | `exec [-i] [-t] <name> <cmd…>` | Exec in an instance, honoring `remoteEnv` / `remoteUser`                                                                                 |
 | `gc [--force]`                 | Remove services no live instance references, orphaned shell-history files                                                                |
@@ -73,6 +75,8 @@ devsandbox                  # no args on a TTY: interactive dashboard
 ## The dashboard
 
 Running `devsandbox` with no subcommand opens a ratatui dashboard: an instance tree grouped by sandbox with live status/CPU/mem, an expandable process forest per instance, a services view, a config explorer (original vs. `extends`-resolved TOML, side-by-side with `docker inspect`), instance logs, a command prompt with history and tab completion, one-key run and VS Code attach, and a help overlay. Config entries are validated in place; broken sandboxes are flagged.
+
+One deliberate asymmetry: the `s` key stops a running instance and starts an exited one **on a background thread without leaving the dashboard**, so it uses a quiet bare start (`docker start` of the instance + its isolated services). It skips service recreation, DNS rewiring, and `postStartCommand` — their output (image builds, lifecycle commands with inherited stdio) would corrupt the alternate screen. For the full path, use `:start <instance>` (or CLI `devsandbox start`), which suspends the TUI and hands over the terminal — the same split as `s`-stop vs `:stop`.
 
 ## config.toml reference
 
@@ -116,7 +120,7 @@ src/
   config.rs           config.toml model, extends deep-merge, mounts, validation
   features.rs         devcontainer features: OCI fetch, metadata, install order
   state.rs            host-side instance store (no daemon)
-  commands/           ls, ps, run, rm, stop, exec, services (+gc)
+  commands/           ls, ps, run, start, rm, stop, exec, services (+gc)
   runtime/            Backend trait; dockerlike (docker/podman) and Apple container
   tui/                ratatui dashboard: app state, data collection, procs, prompt, ui
 docs/                 design plans and findings that drove each milestone

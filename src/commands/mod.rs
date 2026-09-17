@@ -6,6 +6,7 @@ pub mod ps;
 pub mod rm;
 pub mod run;
 pub mod services;
+pub mod start;
 pub mod stats;
 pub mod stop;
 

@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 
 /// Command names offered for first-token completion, in display order.
-pub const COMMANDS: [&str; 5] = ["run", "exec", "code", "rm", "stop"];
+pub const COMMANDS: [&str; 6] = ["run", "exec", "code", "rm", "stop", "start"];
 
 /// Max history entries kept on disk (oldest trimmed first).
 const HISTORY_CAP: usize = 200;
@@ -26,6 +26,7 @@ pub enum PromptAction {
     Code { instance: String },
     Rm { instance: String },
     Stop { instance: String },
+    Start { instance: String },
 }
 
 /// In-flight tab-completion over a single token.
@@ -439,7 +440,13 @@ fn parse_line(line: &str) -> Result<PromptAction, String> {
             };
             Ok(PromptAction::Stop { instance: (*instance).to_string() })
         }
-        other => Err(format!("unknown command `{other}` (run, exec, code, rm, stop)")),
+        "start" => {
+            let [instance] = rest else {
+                return Err("usage: start <instance>".into());
+            };
+            Ok(PromptAction::Start { instance: (*instance).to_string() })
+        }
+        other => Err(format!("unknown command `{other}` (run, exec, code, rm, stop, start)")),
     }
 }
 
@@ -662,6 +669,13 @@ mod tests {
         assert_eq!(parse_line("stop box"), Ok(PromptAction::Stop { instance: "box".into() }));
         assert!(parse_line("stop").is_err());
         assert!(parse_line("stop a b").is_err());
+    }
+
+    #[test]
+    fn parse_start() {
+        assert_eq!(parse_line("start box"), Ok(PromptAction::Start { instance: "box".into() }));
+        assert!(parse_line("start").is_err());
+        assert!(parse_line("start a b").is_err());
     }
 
     #[test]

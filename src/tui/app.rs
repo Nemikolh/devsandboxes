@@ -29,7 +29,9 @@ Tables (Instances / Services)
   ←           collapse / jump to parent
   enter, e    open config explorer
   r           run sandbox      o   open in VS Code (Instances)
-  s           stop instance    l   logs (Instances tab)
+  s           stop / start     l   logs (Instances tab)
+              (stops running / starts exited; s-start is a bare start —
+               :start runs services + postStartCommand too)
   (process rows act on their parent instance)
 
 Config modal
@@ -47,7 +49,7 @@ Logs modal
 
 Command prompt (:)
   run <sandbox> [--name n] [--branch b]   exec <instance> <cmd…>
-  code <instance>             rm <instance>   stop <instance>
+  code <instance>   rm <instance>   stop <instance>   start <instance>
   tab         complete / cycle
   ↑ ↓         history
   ctrl-u      clear line       ctrl-w  delete word
@@ -277,11 +279,17 @@ pub struct App {
     /// suspend + command call, keeping [`App`] I/O-free).
     pub pending_action: Option<PromptAction>,
     /// Instance name whose stop the event loop should spawn on a background
-    /// thread (the `s` shortcut; runs without suspending the TUI).
+    /// thread (the `s` shortcut on a running instance; runs without suspending
+    /// the TUI).
     pub pending_stop: Option<String>,
     /// Instances with a stop in flight, so repeated `s` presses don't spawn a
     /// second stop for the same instance. Cleared by the loop on completion.
     pub stopping: BTreeSet<String>,
+    /// Instance name whose start the event loop should spawn on a background
+    /// thread (the `s` shortcut on an exited instance).
+    pub pending_start: Option<String>,
+    /// Instances with a start in flight (same dedup rule as `stopping`).
+    pub starting: BTreeSet<String>,
     /// One-line status shown in the help-bar area (e.g. `code` launch outcome).
     pub status: Option<String>,
     /// True while the config-modal divider is being dragged with the mouse.
@@ -305,6 +313,8 @@ impl App {
             pending_action: None,
             pending_stop: None,
             stopping: BTreeSet::new(),
+            pending_start: None,
+            starting: BTreeSet::new(),
             status: None,
             dragging_divider: false,
             should_quit: false,
@@ -577,7 +587,7 @@ impl App {
             KeyCode::Enter | KeyCode::Char('e') => self.open_config(),
             KeyCode::Char('r') if self.tab == Tab::Instances => self.open_run_prompt(),
             KeyCode::Char('o') if self.tab == Tab::Instances => self.attach_code(),
-            KeyCode::Char('s') if self.tab == Tab::Instances => self.stop_instance(),
+            KeyCode::Char('s') if self.tab == Tab::Instances => self.stop_or_start_instance(),
             KeyCode::Char('l') => self.open_logs(),
             KeyCode::Char('?') => self.open_help(),
             _ => {}
@@ -681,12 +691,14 @@ impl App {
         self.pending_action = Some(PromptAction::Code { instance: row.name.clone() });
     }
 
-    /// `s` (Instances tab): stop the instance under the cursor on a background
-    /// thread (the event loop owns the docker work, keeping [`App`] I/O-free).
-    /// Works for orphan-group instance children and process rows (routing to the
-    /// parent instance); a no-op on sandbox / empty / orphan-group nodes and
-    /// while a stop for the same instance is in flight.
-    fn stop_instance(&mut self) {
+    /// `s` (Instances tab): stop the running instance under the cursor, or
+    /// start it when its container is exited, on a background thread (the event
+    /// loop owns the docker work, keeping [`App`] I/O-free). Works for
+    /// orphan-group instance children and process rows (routing to the parent
+    /// instance); a no-op on sandbox / empty / orphan-group nodes, on a missing
+    /// container (`run` recreates those), and while a stop/start for the same
+    /// instance is in flight.
+    fn stop_or_start_instance(&mut self) {
         let Some(i) = self.selected_instance_index() else {
             return;
         };
@@ -697,17 +709,32 @@ impl App {
             return;
         };
         let name = row.name.clone();
-        if self.stopping.contains(&name) {
+        if self.stopping.contains(&name) || self.starting.contains(&name) {
             return;
         }
-        self.status = Some(format!("stopping {name}…"));
-        self.stopping.insert(name.clone());
-        self.pending_stop = Some(name);
+        match row.status {
+            ContainerStatus::Running(_) => {
+                self.status = Some(format!("stopping {name}…"));
+                self.stopping.insert(name.clone());
+                self.pending_stop = Some(name);
+            }
+            ContainerStatus::Exited(_) => {
+                self.status = Some(format!("starting {name}…"));
+                self.starting.insert(name.clone());
+                self.pending_start = Some(name);
+            }
+            ContainerStatus::Missing => {}
+        }
     }
 
     /// Take the pending background stop for the event loop to spawn, if any.
     pub fn take_pending_stop(&mut self) -> Option<String> {
         self.pending_stop.take()
+    }
+
+    /// Take the pending background start for the event loop to spawn, if any.
+    pub fn take_pending_start(&mut self) -> Option<String> {
+        self.pending_start.take()
     }
 
     /// Agent-process count for a cached instance: the number of forest rows whose
@@ -865,7 +892,7 @@ impl App {
         }
         match first {
             "run" => sandboxes.to_vec(),
-            "exec" | "code" | "rm" | "stop" => instances.to_vec(),
+            "exec" | "code" | "rm" | "stop" | "start" => instances.to_vec(),
             _ => Vec::new(),
         }
     }
@@ -1622,21 +1649,62 @@ mod tests {
         assert_eq!(app.take_pending_action(), None);
     }
 
+    /// `snapshot_with(n)` with every instance's container reporting `status`.
+    fn snapshot_with_status(n: usize, status: ContainerStatus) -> Snapshot {
+        let mut snap = snapshot_with(n);
+        for row in &mut snap.instances {
+            row.status = status.clone();
+        }
+        snap
+    }
+
+    fn running() -> ContainerStatus {
+        ContainerStatus::Running("Up".into())
+    }
+
     #[test]
-    fn s_on_instance_sets_pending_stop() {
+    fn s_on_running_instance_sets_pending_stop() {
         let mut app = new_app();
-        app.set_snapshot(snapshot_with(1)); // [Sandbox(0), inst0]
+        app.set_snapshot(snapshot_with_status(1, running())); // [Sandbox(0), inst0]
         app.on_key(key(KeyCode::Down)); // onto inst0
         app.on_key(key(KeyCode::Char('s')));
         assert!(app.stopping.contains("inst0"));
         assert_eq!(app.status.as_deref(), Some("stopping inst0…"));
         assert_eq!(app.take_pending_stop(), Some("inst0".into()));
+        assert_eq!(app.take_pending_start(), None);
+    }
+
+    #[test]
+    fn s_on_exited_instance_sets_pending_start() {
+        let mut app = new_app();
+        let status = ContainerStatus::Exited("Exited (0)".into());
+        app.set_snapshot(snapshot_with_status(1, status));
+        app.on_key(key(KeyCode::Down)); // onto inst0
+        app.on_key(key(KeyCode::Char('s')));
+        assert!(app.starting.contains("inst0"));
+        assert_eq!(app.status.as_deref(), Some("starting inst0…"));
+        assert_eq!(app.take_pending_start(), Some("inst0".into()));
+        assert_eq!(app.take_pending_stop(), None);
+    }
+
+    #[test]
+    fn s_on_missing_container_is_noop() {
+        let mut app = new_app();
+        app.set_snapshot(snapshot_with(1)); // status Missing
+        app.on_key(key(KeyCode::Down)); // onto inst0
+        app.on_key(key(KeyCode::Char('s')));
+        assert_eq!(app.take_pending_stop(), None);
+        assert_eq!(app.take_pending_start(), None);
+        assert!(app.stopping.is_empty());
+        assert!(app.starting.is_empty());
     }
 
     #[test]
     fn s_on_orphan_instance_sets_pending_stop() {
         let mut app = new_app();
-        app.set_snapshot(orphan_snapshot()); // [Orphans, orphan0]
+        let mut snap = orphan_snapshot(); // [Orphans, orphan0]
+        snap.instances[0].status = running();
+        app.set_snapshot(snap);
         app.on_key(key(KeyCode::Down)); // onto orphan0
         assert_eq!(app.selected_node(), Some(Node::Instance(0)));
         app.on_key(key(KeyCode::Char('s')));
@@ -1655,7 +1723,7 @@ mod tests {
     #[test]
     fn s_dedupes_while_stop_in_flight() {
         let mut app = new_app();
-        app.set_snapshot(snapshot_with(1));
+        app.set_snapshot(snapshot_with_status(1, running()));
         app.on_key(key(KeyCode::Down)); // onto inst0
         app.on_key(key(KeyCode::Char('s')));
         assert_eq!(app.take_pending_stop(), Some("inst0".into()));
@@ -1663,6 +1731,20 @@ mod tests {
         app.on_key(key(KeyCode::Down)); // keep cursor on inst0
         app.on_key(key(KeyCode::Char('s')));
         assert_eq!(app.take_pending_stop(), None);
+    }
+
+    #[test]
+    fn s_dedupes_while_start_in_flight() {
+        let mut app = new_app();
+        let status = ContainerStatus::Exited("Exited (0)".into());
+        app.set_snapshot(snapshot_with_status(1, status));
+        app.on_key(key(KeyCode::Down)); // onto inst0
+        app.on_key(key(KeyCode::Char('s')));
+        assert_eq!(app.take_pending_start(), Some("inst0".into()));
+        // Still in flight (loop hasn't cleared `starting`): a second `s` is a no-op.
+        app.on_key(key(KeyCode::Down)); // keep cursor on inst0
+        app.on_key(key(KeyCode::Char('s')));
+        assert_eq!(app.take_pending_start(), None);
     }
 
     #[test]
@@ -1739,7 +1821,7 @@ mod tests {
     #[test]
     fn s_on_proc_row_stops_parent_instance() {
         let mut app = new_app();
-        app.set_snapshot(snapshot_with(1));
+        app.set_snapshot(snapshot_with_status(1, running()));
         expand_with_rows(&mut app, "inst0", &["10"]);
         app.on_key(key(KeyCode::Down)); // inst0
         app.on_key(key(KeyCode::Down)); // proc row

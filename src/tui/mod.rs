@@ -85,9 +85,11 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
     let dir = app.dir.clone();
     // At most one collection thread in flight; `Some` while one is running.
     let mut pending: Option<Receiver<Snapshot>> = Some(spawn_collect(&dir));
-    // Background `s` stops, each reporting completion over its own channel;
-    // paired with the instance name so the guard clears even if the thread dies.
-    let mut stops: Vec<(String, Receiver<StopDone>)> = Vec::new();
+    // Background `s` stops/starts, each reporting completion over its own
+    // channel; paired with the instance name so the guard clears even if the
+    // thread dies.
+    let mut stops: Vec<(String, Receiver<OpDone>)> = Vec::new();
+    let mut starts: Vec<(String, Receiver<OpDone>)> = Vec::new();
     let mut last_tick = Instant::now();
     // At most one process fetch in flight; `Some` while one is running.
     let mut proc_pending: Option<Receiver<BTreeMap<String, ProcState>>> = None;
@@ -124,14 +126,18 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
             }
         }
 
-        // A background stop was requested by `s`: spawn it without suspending.
+        // A background stop/start was requested by `s`: spawn it without
+        // suspending.
         if let Some(instance) = app.take_pending_stop() {
             stops.push((instance.clone(), spawn_stop(&instance)));
         }
+        if let Some(instance) = app.take_pending_start() {
+            starts.push((instance.clone(), spawn_start(&instance)));
+        }
 
-        // Drain any finished background stops: update the status line, clear the
-        // in-flight guard, and force an immediate snapshot refresh so the row's
-        // new (stopped) status shows without waiting for the next tick.
+        // Drain any finished background stops/starts: update the status line,
+        // clear the in-flight guard, and force an immediate snapshot refresh so
+        // the row's new status shows without waiting for the next tick.
         stops.retain_mut(|(instance, rx)| match rx.try_recv() {
             Ok(done) => {
                 app.stopping.remove(instance);
@@ -146,6 +152,23 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
             // Thread died without sending; clear the guard so `s` works again.
             Err(TryRecvError::Disconnected) => {
                 app.stopping.remove(instance);
+                false
+            }
+        });
+        starts.retain_mut(|(instance, rx)| match rx.try_recv() {
+            Ok(done) => {
+                app.starting.remove(instance);
+                app.status = Some(done.status);
+                last_tick = Instant::now();
+                if pending.is_none() {
+                    pending = Some(spawn_collect(&dir));
+                }
+                false
+            }
+            Err(TryRecvError::Empty) => true,
+            // Thread died without sending; clear the guard so `s` works again.
+            Err(TryRecvError::Disconnected) => {
+                app.starting.remove(instance);
                 false
             }
         });
@@ -216,7 +239,10 @@ fn run_suspended(terminal: &mut Term, dir: &Path, action: PromptAction) -> Resul
             commands::exec::exec_status(instance, true, true, argv).map(|_| ())
         }
         PromptAction::Rm { instance } => commands::rm::rm(instance),
-        PromptAction::Stop { instance } => commands::stop::stop(instance),
+        PromptAction::Stop { instance } => commands::stop::stop(Some(instance.clone()), false),
+        PromptAction::Start { instance } => {
+            commands::start::start(dir, Some(instance.clone()), false)
+        }
         // `code` never suspends; handled by the caller.
         PromptAction::Code { .. } => Ok(()),
     };
@@ -250,6 +276,7 @@ fn log_error(action: &PromptAction, err: &anyhow::Error) -> Option<PathBuf> {
         PromptAction::Exec { .. } => "exec",
         PromptAction::Rm { .. } => "rm",
         PromptAction::Stop { .. } => "stop",
+        PromptAction::Start { .. } => "start",
         PromptAction::Code { .. } => "code",
     };
     let dir = crate::state::State::path().ok()?.parent()?.join("logs");
@@ -332,8 +359,8 @@ fn hex_encode(s: &str) -> String {
     out
 }
 
-/// Result of a background `s` stop, drained by the event loop.
-struct StopDone {
+/// Result of a background `s` stop/start, drained by the event loop.
+struct OpDone {
     /// One-line outcome for the help-bar status.
     status: String,
 }
@@ -342,7 +369,7 @@ struct StopDone {
 /// the SIGTERM timeout) and reports a one-line status back. Docker calls go
 /// through the screen-safe quiet path so stderr can't corrupt the TUI. `instance`
 /// is a snapshot row name, which equals the state instance key.
-fn spawn_stop(instance: &str) -> Receiver<StopDone> {
+fn spawn_stop(instance: &str) -> Receiver<OpDone> {
     let (tx, rx) = mpsc::channel();
     let instance = instance.to_string();
     std::thread::spawn(move || {
@@ -358,7 +385,34 @@ fn spawn_stop(instance: &str) -> Receiver<StopDone> {
             },
             Err(e) => format!("stop: {e:#}"),
         };
-        let _ = tx.send(StopDone { status });
+        let _ = tx.send(OpDone { status });
+    });
+    rx
+}
+
+/// Spawn a detached thread that starts `instance`'s containers (isolated
+/// services first, then the instance) and reports a one-line status back. The
+/// bare-start path is used — no service recreation or lifecycle commands — so
+/// nothing can write to the alternate screen; docker calls go through the
+/// screen-safe quiet path. `instance` is a snapshot row name, which equals the
+/// state instance key.
+fn spawn_start(instance: &str) -> Receiver<OpDone> {
+    let (tx, rx) = mpsc::channel();
+    let instance = instance.to_string();
+    std::thread::spawn(move || {
+        let status = match crate::state::State::load() {
+            Ok(state) => match state.instances.get(&instance) {
+                Some(info) => {
+                    let services =
+                        commands::stop::service_containers(&info.project, &instance);
+                    commands::start::start_containers(&info.container, &services, true);
+                    format!("started {instance}")
+                }
+                None => format!("start: unknown instance `{instance}`"),
+            },
+            Err(e) => format!("start: {e:#}"),
+        };
+        let _ = tx.send(OpDone { status });
     });
     rx
 }

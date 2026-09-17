@@ -5,19 +5,35 @@ use crate::runtime::{backend, NAME_PREFIX};
 use crate::state::State;
 
 /// Stop a sandbox instance: stop the container plus its isolated
-/// service containers. The container and its state entry survive (`run`
-/// restarts a stopped container); networks and global services are left alone.
-/// Forgiving by design (idempotent): an already-stopped or missing container is
-/// not an error.
-pub fn stop(name: &str) -> Result<()> {
+/// service containers. The container and its state entry survive (`start`
+/// restarts a stopped instance); networks and global services are left alone.
+/// `--all` stops every running instance in state. Forgiving by design
+/// (idempotent): an already-stopped or missing container is not an error.
+pub fn stop(name: Option<String>, all: bool) -> Result<()> {
     let state = State::load()?;
-    let key = resolve_instance(&state, name)?;
-    let info = state.instances.get(&key).expect("key came from state");
-    let container = info.container.clone();
-    let project = info.project.clone();
+    if all {
+        let mut stopped = 0;
+        for (key, info) in &state.instances {
+            if backend().is_running(&info.container)? != Some(true) {
+                continue;
+            }
+            let services = service_containers(&info.project, key);
+            stop_containers(&info.container, &services, false);
+            println!("stopped {key}");
+            stopped += 1;
+        }
+        if stopped == 0 {
+            println!("nothing to stop");
+        }
+        return Ok(());
+    }
 
-    let services = service_containers(&project, &key);
-    stop_containers(&container, &services, false);
+    let name = name.expect("clap requires a name without --all");
+    let key = resolve_instance(&state, &name)?;
+    let info = state.instances.get(&key).expect("key came from state");
+
+    let services = service_containers(&info.project, &key);
+    stop_containers(&info.container, &services, false);
 
     println!("stopped {key}");
     Ok(())

@@ -64,9 +64,9 @@ pub fn run(
     let shared_volumes = config_dir.join("shared-volumes").to_string_lossy().into_owned();
 
     let mut state = State::load()?;
-    // Deterministic name: explicit --name, or the sandbox name for the first
-    // instance. When the base instance is already live, default to the next
-    // free ordinal so a repeat `run` yields a worktree instance (see below).
+    // Deterministic name: explicit --name, or the sandbox name when free, else
+    // the first free ordinal. `run` always creates a fresh instance; `start`
+    // restarts a stopped one.
     let instance = match instance_name {
         Some(name) => name,
         None => default_instance_name(&state, &sandbox_name),
@@ -91,47 +91,19 @@ pub fn run(
     // and listed in the generated `.code-workspace` after the primary folder.
     let extra_folders = resolve_folders(dir, &var_ctx, &workspace, props)?;
 
-    // Reuse an existing instance whose container still exists: start it if
-    // stopped, refresh config, run postStartCommand, done.
-    let container_status = backend().is_running(&container_name)?;
-    if let (true, Some(running)) = (state.instances.contains_key(&instance), container_status) {
-        warn_on_drift(&container_name, &sandbox.config_hash)?;
-        if !running {
-            backend().run_checked(&["start", &container_name])?;
-        }
-        // Services may have been recreated with new addresses since the
-        // sandbox was created; refresh how it resolves them.
-        let project = services::project_id(dir)?;
-        let service_names = props.services.clone().unwrap_or_default();
-        let (_, endpoints) =
-            services::ensure_services(&config, dir, &project, &instance, &service_names)?;
-        backend().wire_service_dns(&container_name, &endpoints)?;
-        let extensions = props.vscode_extensions().unwrap_or(&[]);
-        if !extensions.is_empty() || props.remote_user.is_some() {
-            write_vscode_name_config(&container_name, extensions, props.remote_user.as_deref())?;
-        }
-        // Refresh the generated workspace file (and record it for instances
-        // created before it existed).
-        let workspace_file =
-            write_workspace_file(&container_name, &instance, &workspace, &extra_folders);
-        if let Some(inst) = state.instances.get_mut(&instance)
-            && inst.workspace_file != workspace_file
-        {
-            inst.workspace_file = workspace_file;
-            state.save()?;
-        }
-        if let Some(cmd) = &props.post_start_command {
-            exec_lifecycle(
-                &container_name,
-                &workspace,
-                props.remote_env.as_ref(),
-                props.remote_user.as_deref(),
-                cmd,
-            )
-            .context("postStartCommand failed")?;
-        }
-        println!("{instance}");
-        return Ok(());
+    // `run` always creates a fresh instance; it never restarts a stopped one
+    // (that is `devsandbox start`).
+    if state.instances.contains_key(&instance) {
+        bail!(
+            "instance `{instance}` already exists; `devsandbox start {instance}` restarts it, \
+             `devsandbox rm {instance}` frees the name"
+        );
+    }
+    if backend().is_running(&container_name)?.is_some() {
+        bail!(
+            "container `{container_name}` already exists but is not in state; \
+             remove it or pick another --name"
+        );
     }
 
     // initializeCommand runs on the host, before anything is created.
@@ -148,13 +120,10 @@ pub fn run(
         services::ensure_services(&config, dir, &project, &instance, &service_names)?;
 
     // First instance for this base folder mounts it directly; a base folder
-    // already live in another instance gets a git worktree so the two containers
-    // never share a working tree.
-    let base_in_use = state
-        .instances
-        .values()
-        .filter(|i| i.base_folder == folder)
-        .any(|i| container_running(&i.container));
+    // already owned by another instance (running or stopped — a stopped one can
+    // be started anytime) gets a git worktree so two containers never share a
+    // working tree.
+    let base_in_use = state.instances.values().any(|i| i.base_folder == folder);
     let (source, worktree, branch, extra_mounts) = if base_in_use {
         // Branch for the worktree: `--branch` override, else the sandbox's
         // `worktree-branch`, else the default. `${instance}` (and the other mount
@@ -254,13 +223,11 @@ pub fn run(
     Ok(())
 }
 
-/// Default instance name: the sandbox name for the first instance, or when that
-/// instance is already live, the first free `<sandbox>-<n>` ordinal (n >= 2).
-/// A stopped base instance is reused rather than duplicated.
+/// Default instance name: the sandbox name when it is free in state, else the
+/// first free `<sandbox>-<n>` ordinal (n >= 2). Stopped instances keep their
+/// name (`start` restarts them), so a taken name always means a new ordinal.
 fn default_instance_name(state: &State, sandbox: &str) -> String {
-    if !state.instances.contains_key(sandbox)
-        || !container_running(&format!("{NAME_PREFIX}{sandbox}"))
-    {
+    if !state.instances.contains_key(sandbox) {
         return sandbox.to_string();
     }
     first_free_ordinal(state, sandbox)
@@ -279,11 +246,6 @@ fn first_free_ordinal(state: &State, sandbox: &str) -> String {
 fn git_companion_mount(base: &Path) -> String {
     let git = base.join(".git");
     format!("{}:{}", git.display(), git.display())
-}
-
-/// True when the named container exists and is running.
-fn container_running(container: &str) -> bool {
-    backend().is_running(container).ok().flatten() == Some(true)
 }
 
 /// Create a git worktree on a fresh `branch`. Git refuses to check out a branch
@@ -355,7 +317,7 @@ fn create_worktree(base: &Path, worktree: &Path, branch: &str) -> Result<()> {
 
 /// Warn when the reused container's recorded config hash differs from the
 /// freshly resolved one. Compose containers carry no such label (None) — skip.
-fn warn_on_drift(container: &str, expected: &str) -> Result<()> {
+pub(crate) fn warn_on_drift(container: &str, expected: &str) -> Result<()> {
     if let Some(hash) = backend().label(container, "devsandbox.config_hash")?
         && hash != expected
     {
@@ -994,7 +956,7 @@ fn run_host_commands(dir: &Path, cmd: &LifecycleCommand) -> Result<()> {
 }
 
 /// Run a lifecycle command inside the container via `exec`.
-fn exec_lifecycle(
+pub(crate) fn exec_lifecycle(
     container: &str,
     workspace: &str,
     remote_env: Option<&BTreeMap<String, String>>,
@@ -1196,6 +1158,15 @@ mod tests {
     fn default_name_is_sandbox_when_absent() {
         let state = State::default();
         assert_eq!(default_instance_name(&state, "repo"), "repo");
+    }
+
+    #[test]
+    fn default_name_ordinal_when_taken_even_if_stopped() {
+        // A stopped instance keeps its name (`start` restarts it); `run` must
+        // pick the next ordinal, never reuse it.
+        let mut state = State::default();
+        state.instances.insert("repo".into(), instance("repo"));
+        assert_eq!(default_instance_name(&state, "repo"), "repo-2");
     }
 
     // --- folders / generated workspace file ---
