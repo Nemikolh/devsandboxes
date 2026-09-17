@@ -145,7 +145,8 @@ listed when stdin is not a TTY.
      `<sandbox>-<n>` instance name — the two containers never share a checkout.
 
    - **Config drift**: reusing a container whose recorded config hash differs from
-     the current config only _warns_; you must `rm` then `run` to apply changes.
+     the current config only _warns_; `rebuild <name>` applies the changes without
+     losing the worktree.
 
    - A failed lifecycle command aborts `run` but **keeps the container** so you can
      `exec` in to debug.
@@ -175,16 +176,22 @@ listed when stdin is not a TTY.
    containers. Idempotent (already-stopped/missing is fine). State survives; a
    later `run` restarts it.
 
-9. **`rm <name>`** — remove container, its worktree (prompts to delete the
+9. **`rebuild <name>`** (alias `recreate`) — recreate the instance's container
+   from the current config when it has drifted; the worktree, branch, instance
+   name, and per-instance state (shell history, `${instance}` mounts) are kept
+   and the lifecycle commands re-run. No drift → no-op (safe to run
+   speculatively). The fix for the config-drift warning.
+
+10. **`rm <name>`** — remove container, its worktree (prompts to delete the
    `sandbox/<instance>` branch on a TTY), isolated services, per-instance network,
    and the state entry. Managed shell history is **kept** so a rebuilt instance
    inherits it. Global services are left for `gc`.
 
-10. **`gc [--force]`** — reap shared services no live instance references, orphaned
+11. **`gc [--force]`** — reap shared services no live instance references, orphaned
    networks, and orphaned shell-history files (`--force` skips the per-file
    confirm). Housekeeping, not part of a normal task loop.
 
-11. **`devsandbox`** (no subcommand) — opens the interactive **TUI dashboard** on a
+12. **`devsandbox`** (no subcommand) — opens the interactive **TUI dashboard** on a
     TTY; prints help and exits `2` otherwise. **Not for agents** — it takes over
     the terminal.
 

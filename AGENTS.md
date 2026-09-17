@@ -8,8 +8,8 @@ git worktrees so working trees are never shared.
 ## Module map
 
 - `src/main.rs` — clap CLI; no subcommand on a TTY opens the TUI dashboard.
-- `src/commands/*.rs` — one file per verb (`run`, `start`, `stop`, `rm`, `ps`,
-  `ls`, `exec`, `logs`, `inspect`, `stats`, `services::gc`). Shared name
+- `src/commands/*.rs` — one file per verb (`run`, `start`, `stop`, `rebuild`,
+  `rm`, `ps`, `ls`, `exec`, `logs`, `inspect`, `stats`, `services::gc`). Shared name
   resolution in `commands/mod.rs` (`resolve_instance`: instance | sandbox |
   folder basename).
 - `src/config.rs` — TOML schema: `[template.*]`, `[sandbox.*]`, `[services.*]`.
