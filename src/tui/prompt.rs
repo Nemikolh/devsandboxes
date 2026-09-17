@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 
 /// Command names offered for first-token completion, in display order.
-pub const COMMANDS: [&str; 6] = ["run", "exec", "code", "rm", "stop", "start"];
+pub const COMMANDS: [&str; 7] = ["run", "exec", "code", "rm", "stop", "start", "rebuild"];
 
 /// Max history entries kept on disk (oldest trimmed first).
 const HISTORY_CAP: usize = 200;
@@ -27,6 +27,7 @@ pub enum PromptAction {
     Rm { instance: String },
     Stop { instance: String },
     Start { instance: String },
+    Rebuild { instance: String },
 }
 
 /// In-flight tab-completion over a single token.
@@ -446,7 +447,16 @@ fn parse_line(line: &str) -> Result<PromptAction, String> {
             };
             Ok(PromptAction::Start { instance: (*instance).to_string() })
         }
-        other => Err(format!("unknown command `{other}` (run, exec, code, rm, stop, start)")),
+        // `recreate` is an alias, mirroring the CLI's `rebuild`/`recreate`.
+        "rebuild" | "recreate" => {
+            let [instance] = rest else {
+                return Err("usage: rebuild <instance>".into());
+            };
+            Ok(PromptAction::Rebuild { instance: (*instance).to_string() })
+        }
+        other => {
+            Err(format!("unknown command `{other}` (run, exec, code, rm, stop, start, rebuild)"))
+        }
     }
 }
 
@@ -589,12 +599,14 @@ mod tests {
     #[test]
     fn first_token_completion_cycles() {
         let mut pr = p("r");
-        pr.complete(cands); // "r" matches run, rm → first applied ("rm" < "run" sorted)
-        assert_eq!(pr.input(), "rm");
+        pr.complete(cands); // "r" matches rebuild, rm, run → first sorted ("rebuild")
+        assert_eq!(pr.input(), "rebuild");
         pr.complete(cands); // cycle to next
+        assert_eq!(pr.input(), "rm");
+        pr.complete(cands); // then run
         assert_eq!(pr.input(), "run");
         pr.complete(cands); // wraps back
-        assert_eq!(pr.input(), "rm");
+        assert_eq!(pr.input(), "rebuild");
     }
 
     #[test]
@@ -676,6 +688,21 @@ mod tests {
         assert_eq!(parse_line("start box"), Ok(PromptAction::Start { instance: "box".into() }));
         assert!(parse_line("start").is_err());
         assert!(parse_line("start a b").is_err());
+    }
+
+    #[test]
+    fn parse_rebuild_and_recreate_alias() {
+        assert_eq!(
+            parse_line("rebuild box"),
+            Ok(PromptAction::Rebuild { instance: "box".into() })
+        );
+        assert_eq!(
+            parse_line("recreate box"),
+            Ok(PromptAction::Rebuild { instance: "box".into() })
+        );
+        assert!(parse_line("rebuild").is_err());
+        assert!(parse_line("rebuild a b").is_err());
+        assert!(parse_line("recreate").is_err());
     }
 
     #[test]

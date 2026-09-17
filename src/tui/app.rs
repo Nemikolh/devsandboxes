@@ -31,7 +31,8 @@ Tables (Instances / Services)
   r           run sandbox      o   open in VS Code (Instances)
   s           stop / start     l   logs (Instances tab)
               (stops running / starts exited; s-start is a bare start —
-               :start runs services + postStartCommand too)
+               :start runs services + postStartCommand too; a drifted
+               exited instance is rebuilt instead)
   (process rows act on their parent instance)
 
 Config modal
@@ -698,6 +699,13 @@ impl App {
     /// instance); a no-op on sandbox / empty / orphan-group nodes, on a missing
     /// container (`run` recreates those), and while a stop/start for the same
     /// instance is in flight.
+    ///
+    /// One exception: an exited instance whose container has drifted from the
+    /// current config is *rebuilt* rather than bare-started, by queuing a
+    /// [`PromptAction::Rebuild`] through the same suspend path the `:` prompt
+    /// uses (the loop restores the terminal, runs `rebuild` with inherited
+    /// stdio, then re-enters). Rebuild is modal, so it needs no `starting`
+    /// in-flight guard — the guard is only for the background stop/start ops.
     fn stop_or_start_instance(&mut self) {
         let Some(i) = self.selected_instance_index() else {
             return;
@@ -717,6 +725,12 @@ impl App {
                 self.status = Some(format!("stopping {name}…"));
                 self.stopping.insert(name.clone());
                 self.pending_stop = Some(name);
+            }
+            ContainerStatus::Exited(_) if row.drift => {
+                // Config drifted: recreate the container (worktree preserved) via
+                // the modal suspend path instead of a bare start. No `starting`
+                // guard — that's for background ops; the suspend is modal.
+                self.pending_action = Some(PromptAction::Rebuild { instance: name });
             }
             ContainerStatus::Exited(_) => {
                 self.status = Some(format!("starting {name}…"));
@@ -1685,6 +1699,52 @@ mod tests {
         assert_eq!(app.status.as_deref(), Some("starting inst0…"));
         assert_eq!(app.take_pending_start(), Some("inst0".into()));
         assert_eq!(app.take_pending_stop(), None);
+    }
+
+    #[test]
+    fn s_on_exited_drifted_instance_queues_rebuild() {
+        let mut app = new_app();
+        let status = ContainerStatus::Exited("Exited (0)".into());
+        let mut snap = snapshot_with_status(1, status);
+        snap.instances[0].drift = true;
+        app.set_snapshot(snap);
+        app.on_key(key(KeyCode::Down)); // onto inst0
+        app.on_key(key(KeyCode::Char('s')));
+        assert_eq!(
+            app.take_pending_action(),
+            Some(PromptAction::Rebuild { instance: "inst0".into() })
+        );
+        // Drift takes the suspend path, not the background start guard.
+        assert_eq!(app.take_pending_start(), None);
+        assert!(app.starting.is_empty());
+        assert_eq!(app.take_pending_stop(), None);
+    }
+
+    #[test]
+    fn s_on_exited_undrifted_instance_still_bare_starts() {
+        let mut app = new_app();
+        let status = ContainerStatus::Exited("Exited (0)".into());
+        let snap = snapshot_with_status(1, status); // drift: false
+        app.set_snapshot(snap);
+        app.on_key(key(KeyCode::Down)); // onto inst0
+        app.on_key(key(KeyCode::Char('s')));
+        assert!(app.starting.contains("inst0"));
+        assert_eq!(app.take_pending_start(), Some("inst0".into()));
+        assert_eq!(app.take_pending_action(), None);
+    }
+
+    #[test]
+    fn s_on_running_drifted_instance_still_stops() {
+        let mut app = new_app();
+        let mut snap = snapshot_with_status(1, running());
+        snap.instances[0].drift = true;
+        app.set_snapshot(snap);
+        app.on_key(key(KeyCode::Down)); // onto inst0
+        app.on_key(key(KeyCode::Char('s')));
+        assert!(app.stopping.contains("inst0"));
+        assert_eq!(app.take_pending_stop(), Some("inst0".into()));
+        assert_eq!(app.take_pending_action(), None);
+        assert_eq!(app.take_pending_start(), None);
     }
 
     #[test]

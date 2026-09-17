@@ -243,6 +243,7 @@ fn run_suspended(terminal: &mut Term, dir: &Path, action: PromptAction) -> Resul
         PromptAction::Start { instance } => {
             commands::start::start(dir, Some(instance.clone()), false)
         }
+        PromptAction::Rebuild { instance } => commands::rebuild::rebuild(dir, instance),
         // `code` never suspends; handled by the caller.
         PromptAction::Code { .. } => Ok(()),
     };
@@ -277,6 +278,7 @@ fn log_error(action: &PromptAction, err: &anyhow::Error) -> Option<PathBuf> {
         PromptAction::Rm { .. } => "rm",
         PromptAction::Stop { .. } => "stop",
         PromptAction::Start { .. } => "start",
+        PromptAction::Rebuild { .. } => "rebuild",
         PromptAction::Code { .. } => "code",
     };
     let dir = crate::state::State::path().ok()?.parent()?.join("logs");
