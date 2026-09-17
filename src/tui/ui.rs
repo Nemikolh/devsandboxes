@@ -7,8 +7,9 @@ use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Tabs};
+use tui_term::widget::{Cursor, PseudoTerminal};
 
-use super::app::{App, ConfigView, Modal, Pane, Side, Tab, TextModal};
+use super::app::{App, ConfigView, Focus, Modal, Pane, Side, Tab, TextModal};
 use super::data::{
     humanize_secs, sandbox_stats, totals_line, ContainerStatus, InstanceRow, Node, SandboxRow,
     ServiceRow, Snapshot,
@@ -87,37 +88,110 @@ fn draw_content(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+/// Split a tab's content `area` into the top part (error line + table) and the
+/// bottom section (Detail, plus the terminal panel when terminals are open).
+///
+/// The split is deliberately independent of snapshot state: the error line is
+/// carved *inside* `top` by the caller, never here. That keeps the bottom
+/// geometry — and therefore [`term_pane_size`] — a pure function of the frame
+/// size and whether any terminal exists, so the event loop's PTY-resize math
+/// (step 4) can't drift from what the draw path actually laid out.
+///
+/// Returns `(top, detail, Some(terms))` when `!app.terms.is_empty()`: the bottom
+/// section is 50% of the content area, split `[Detail 30%, terminal Min(0)]`.
+/// Returns `(top, detail, None)` otherwise: today's `Length(9)` full-width
+/// Detail, no terminal panel.
+fn content_areas(app: &App, area: Rect) -> (Rect, Rect, Option<Rect>) {
+    if app.terms.is_empty() {
+        let [top, detail] =
+            Layout::vertical([Constraint::Min(0), Constraint::Length(9)]).areas(area);
+        (top, detail, None)
+    } else {
+        let (top, detail, terms) = open_bottom_split(area);
+        (top, detail, Some(terms))
+    }
+}
+
+/// The terminals-open split of a content area: `(top, detail, terminal panel)`.
+/// The single home for the 50% bottom / 30-70 horizontal constants, shared by
+/// the draw path ([`content_areas`]) and the PTY-sizing math ([`term_pane_size`])
+/// so the two cannot drift.
+fn open_bottom_split(area: Rect) -> (Rect, Rect, Rect) {
+    let [top, bottom] =
+        Layout::vertical([Constraint::Min(0), Constraint::Percentage(50)]).areas(area);
+    let [detail, terms] =
+        Layout::horizontal([Constraint::Percentage(30), Constraint::Min(0)]).areas(bottom);
+    (top, detail, terms)
+}
+
+/// `(rows, cols)` of the active terminal's *inner* screen — the terminal panel
+/// Rect minus its one-cell block border on each side. Derived from the same
+/// layout functions the draw path uses ([`draw`] for the bottom-bar height,
+/// [`content_areas`] for the panel), so step 4 can size the PTY to exactly what
+/// gets rendered. Returns `None` when no terminal panel is laid out.
+#[allow(dead_code)] // called by the event loop's pre-draw PTY resize in step 4
+pub fn term_pane_size(frame: Rect, prompt_open: bool) -> Option<(u16, u16)> {
+    // Mirror draw()'s vertical split: tab bar (1), content (Min 0), bottom bar.
+    let bottom = if prompt_open { 2 } else { 1 };
+    let [_tab_area, content_area, _bottom_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(bottom),
+    ])
+    .areas(frame);
+
+    // The terminal panel only exists when terminals are open; reuse the exact
+    // split the draw path lays out.
+    let (_top, _detail, panel) = open_bottom_split(content_area);
+
+    // Inner screen = panel minus the block border (1 cell each side).
+    let rows = panel.height.saturating_sub(2);
+    let cols = panel.width.saturating_sub(2);
+    if rows == 0 || cols == 0 {
+        None
+    } else {
+        Some((rows, cols))
+    }
+}
+
 fn draw_services(frame: &mut Frame, app: &App, area: Rect) {
     let snapshot = app.snapshot.as_ref();
     let rows: &[ServiceRow] = snapshot.map_or(&[], |s| s.services.as_slice());
 
+    let (top, detail_area, terms_area) = content_areas(app, area);
+    // Carve the error line out of the top part (never the bottom), so the
+    // terminal panel's geometry stays independent of snapshot state.
     let error = snapshot.and_then(|s| s.error.as_deref());
-    let [err_area, table_area, detail_area] = Layout::vertical([
+    let [err_area, table_area] = Layout::vertical([
         Constraint::Length(if error.is_some() { 1 } else { 0 }),
         Constraint::Min(0),
-        Constraint::Length(9),
     ])
-    .areas(area);
+    .areas(top);
 
     if let Some(err) = error {
         let line = Line::from(Span::styled(err.to_string(), Style::default().fg(Color::Red)));
         frame.render_widget(Paragraph::new(line), err_area);
     }
 
-    if rows.is_empty() {
-        draw_services_empty(frame, table_area);
-        draw_service_detail(frame, None, detail_area);
-        return;
-    }
+    // Terminal focused ⇒ the terminal panel is the accented one; dim the rest.
+    let panel_focused = app.focus == Focus::Terminal;
 
-    draw_services_table(frame, app, rows, table_area);
-    draw_service_detail(frame, rows.get(app.selected()), detail_area);
+    if rows.is_empty() {
+        draw_services_empty(frame, table_area, panel_focused);
+        draw_service_detail(frame, None, detail_area, panel_focused);
+    } else {
+        draw_services_table(frame, app, rows, table_area, panel_focused);
+        draw_service_detail(frame, rows.get(app.selected()), detail_area, panel_focused);
+    }
+    if let Some(terms_area) = terms_area {
+        draw_terminal_panel(frame, app, terms_area);
+    }
 }
 
-fn draw_services_empty(frame: &mut Frame, area: Rect) {
+fn draw_services_empty(frame: &mut Frame, area: Rect, term_focused: bool) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(ACCENT))
+        .border_style(dash_border_style(term_focused))
         .title(Tab::Services.title());
     let text = Line::from(Span::styled(
         "no services defined in config.toml",
@@ -127,7 +201,13 @@ fn draw_services_empty(frame: &mut Frame, area: Rect) {
     frame.render_widget(Paragraph::new(text).block(block), area);
 }
 
-fn draw_services_table(frame: &mut Frame, app: &App, rows: &[ServiceRow], area: Rect) {
+fn draw_services_table(
+    frame: &mut Frame,
+    app: &App,
+    rows: &[ServiceRow],
+    area: Rect,
+    term_focused: bool,
+) {
     let header = Row::new(
         ["NAME", "SCOPE", "SOURCE", "PORTS", "STATUS", "USED BY"]
             .into_iter()
@@ -148,7 +228,7 @@ fn draw_services_table(frame: &mut Frame, app: &App, rows: &[ServiceRow], area: 
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(ACCENT))
+        .border_style(dash_border_style(term_focused))
         .title(Tab::Services.title());
 
     let table = Table::new(table_rows, widths)
@@ -228,10 +308,15 @@ fn service_status_cell(r: &ServiceRow) -> Cell<'static> {
     }
 }
 
-fn draw_service_detail(frame: &mut Frame, row: Option<&ServiceRow>, area: Rect) {
+fn draw_service_detail(
+    frame: &mut Frame,
+    row: Option<&ServiceRow>,
+    area: Rect,
+    term_focused: bool,
+) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(ACCENT))
+        .border_style(dash_border_style(term_focused))
         .title("Detail");
 
     let Some(r) = row else {
@@ -271,18 +356,105 @@ fn draw_service_detail(frame: &mut Frame, row: Option<&ServiceRow>, area: Rect) 
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+/// Pure tab-strip model for the terminal panel: one entry per open session as
+/// `(label, active, exited)`. Labels are `{i+1}:{title}` with a ` (exited)`
+/// suffix on dead tabs. Kept free of styling so it's unit-testable; the styling
+/// lives in [`terminal_tab_line`].
+fn terminal_tab_specs(app: &App) -> Vec<(String, bool, bool)> {
+    let active = app.terms.active();
+    app.terms
+        .sessions()
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let exited = s.exited();
+            let label = if exited {
+                format!("{}:{} (exited)", i + 1, s.title)
+            } else {
+                format!("{}:{}", i + 1, s.title)
+            };
+            (label, i == active, exited)
+        })
+        .collect()
+}
+
+/// Build the terminal panel's block title as a styled tab strip. The active
+/// (live) tab is ACCENT+BOLD, inactive live tabs DIM, exited tabs always DIM.
+/// When the terminal holds focus, `▶ ` is prepended to match `pane_block`'s
+/// focus mark. Tabs are separated by two spaces, matching the plan's example.
+fn terminal_tab_line(app: &App) -> Line<'static> {
+    let mut spans: Vec<Span> = Vec::new();
+    if app.focus == Focus::Terminal {
+        spans.push(Span::styled(
+            "▶ ",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ));
+    }
+    for (i, (label, active, exited)) in terminal_tab_specs(app).into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+        }
+        let style = if active && !exited {
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().add_modifier(Modifier::DIM)
+        };
+        spans.push(Span::styled(label, style));
+    }
+    Line::from(spans)
+}
+
+/// The integrated-terminal panel: a bordered block whose title is the tab strip,
+/// showing the active session's vt100 screen. Border is ACCENT+BOLD when focused,
+/// DIM otherwise. Assumes at least one terminal is open (only called then).
+fn draw_terminal_panel(frame: &mut Frame, app: &App, area: Rect) {
+    let focused = app.focus == Focus::Terminal;
+    let border_style = if focused {
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().add_modifier(Modifier::DIM)
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .title(terminal_tab_line(app));
+
+    let Some(session) = app.terms.active_session() else {
+        frame.render_widget(block, area);
+        return;
+    };
+
+    // Lock the active screen to render it. A poisoned lock (a reader thread
+    // panicked) is unrecoverable here — skip the body but still show the block.
+    let Ok(parser) = session.parser().lock() else {
+        frame.render_widget(block, area);
+        return;
+    };
+    let screen = parser.screen();
+
+    // Show the cursor only when the terminal is focused; hide it otherwise so a
+    // background terminal doesn't compete with the dashboard's own cursor.
+    let mut cursor = Cursor::default();
+    if !focused {
+        cursor.hide();
+    }
+    let widget = PseudoTerminal::new(screen).block(block).cursor(cursor);
+    frame.render_widget(&widget, area);
+}
+
 fn draw_instances(frame: &mut Frame, app: &App, area: Rect) {
     let snapshot = app.snapshot.as_ref();
     let nodes = app.visible_nodes();
 
-    // Optional error line reserved above the table; detail panel below it.
+    let (top, detail_area, terms_area) = content_areas(app, area);
+    // Optional error line reserved above the table, carved out of the top part
+    // (never the bottom) so the terminal panel geometry is snapshot-independent.
     let error = snapshot.and_then(|s| s.error.as_deref());
-    let [err_area, table_area, detail_area] = Layout::vertical([
+    let [err_area, table_area] = Layout::vertical([
         Constraint::Length(if error.is_some() { 1 } else { 0 }),
         Constraint::Min(0),
-        Constraint::Length(9),
     ])
-    .areas(area);
+    .areas(top);
 
     if let Some(err) = error {
         let line = Line::from(Span::styled(
@@ -292,30 +464,42 @@ fn draw_instances(frame: &mut Frame, app: &App, area: Rect) {
         frame.render_widget(Paragraph::new(line), err_area);
     }
 
-    if nodes.is_empty() {
-        draw_empty(frame, table_area);
-        draw_detail(frame, snapshot, None, None, detail_area);
-        return;
-    }
+    // Terminal focused ⇒ the terminal panel is the accented one; dim the rest.
+    let panel_focused = app.focus == Focus::Terminal;
 
-    let snapshot = snapshot.expect("non-empty nodes imply a snapshot");
-    draw_tree(frame, app, snapshot, &nodes, table_area);
-    let selected = nodes.get(app.selected()).copied();
-    // Agent count for the selected instance (or a proc row's parent), read from
-    // the proc cache; `None` until its forest is fetched.
-    let agent_count = match selected {
-        Some(Node::Instance(i)) | Some(Node::Proc { instance: i, .. }) => {
-            snapshot.instances.get(i).and_then(|r| app.agent_count(&r.name))
-        }
-        _ => None,
-    };
-    draw_detail(frame, Some(snapshot), selected, agent_count, detail_area);
+    if nodes.is_empty() {
+        draw_empty(frame, table_area, panel_focused);
+        draw_detail(frame, snapshot, None, None, detail_area, panel_focused);
+    } else {
+        let snapshot = snapshot.expect("non-empty nodes imply a snapshot");
+        draw_tree(frame, app, snapshot, &nodes, table_area, panel_focused);
+        let selected = nodes.get(app.selected()).copied();
+        // Agent count for the selected instance (or a proc row's parent), read
+        // from the proc cache; `None` until its forest is fetched.
+        let agent_count = match selected {
+            Some(Node::Instance(i)) | Some(Node::Proc { instance: i, .. }) => {
+                snapshot.instances.get(i).and_then(|r| app.agent_count(&r.name))
+            }
+            _ => None,
+        };
+        draw_detail(
+            frame,
+            Some(snapshot),
+            selected,
+            agent_count,
+            detail_area,
+            panel_focused,
+        );
+    }
+    if let Some(terms_area) = terms_area {
+        draw_terminal_panel(frame, app, terms_area);
+    }
 }
 
-fn draw_empty(frame: &mut Frame, area: Rect) {
+fn draw_empty(frame: &mut Frame, area: Rect, term_focused: bool) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(ACCENT))
+        .border_style(dash_border_style(term_focused))
         .title(Tab::Instances.title());
     let text = Line::from(Span::styled(
         "no sandboxes defined — check config.toml",
@@ -326,7 +510,14 @@ fn draw_empty(frame: &mut Frame, area: Rect) {
     frame.render_widget(paragraph, area);
 }
 
-fn draw_tree(frame: &mut Frame, app: &App, snapshot: &Snapshot, nodes: &[Node], area: Rect) {
+fn draw_tree(
+    frame: &mut Frame,
+    app: &App,
+    snapshot: &Snapshot,
+    nodes: &[Node],
+    area: Rect,
+    term_focused: bool,
+) {
     let header = Row::new(
         ["TREE", "STATUS", "UPTIME", "CPU", "MEM", "FOLDER", "SERVICES"]
             .into_iter()
@@ -351,7 +542,7 @@ fn draw_tree(frame: &mut Frame, app: &App, snapshot: &Snapshot, nodes: &[Node], 
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(ACCENT))
+        .border_style(dash_border_style(term_focused))
         .title(Tab::Instances.title());
 
     let table = Table::new(table_rows, widths)
@@ -551,10 +742,11 @@ fn draw_detail(
     node: Option<Node>,
     agent_count: Option<usize>,
     area: Rect,
+    term_focused: bool,
 ) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(ACCENT))
+        .border_style(dash_border_style(term_focused))
         .title("Detail");
 
     let lines: Vec<Line> = match (snapshot, node) {
@@ -692,7 +884,20 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
         frame.render_widget(Paragraph::new(line), area);
         return;
     }
-    let text = match app.modal {
+    // Terminal focus (no modal) has its own hints, independent of the tab.
+    if app.focus == Focus::Terminal && matches!(app.modal, Modal::None) {
+        let exited = app.terms.active_session().is_some_and(|s| s.exited());
+        let text = if exited {
+            "terminal exited — ctrl-]/F12 back · x closes (from dashboard)"
+        } else {
+            "ctrl-] / F12 back to dashboard · all other keys go to the shell"
+        };
+        let help = Line::from(text).style(Style::default().add_modifier(Modifier::DIM));
+        frame.render_widget(Paragraph::new(help), area);
+        return;
+    }
+
+    let base = match app.modal {
         Modal::Config(_) => "t toggle · tab pane · <> resize · ↑↓ scroll · esc close",
         Modal::Help(_) => "↑↓ scroll · pgup/pgdn · g/G · esc/? close",
         Modal::Logs(_) => "↑↓ scroll · pgup/pgdn · g/G · esc close",
@@ -700,6 +905,12 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
             Tab::Instances => "q quit · tab switch · ↑↓ select · ←→ fold · enter config · r run · o vscode · s stop · l logs · : cmd · ? help",
             Tab::Services => "q quit · tab switch · ↑↓ select · enter config · : cmd · ? help",
         },
+    };
+    // On the dashboard with terminals open, append the terminal-cycle hints.
+    let text = if matches!(app.modal, Modal::None) && !app.terms.is_empty() {
+        format!("{base} · [/] terms · ctrl-] focus term")
+    } else {
+        base.to_string()
     };
     let help = Line::from(text).style(Style::default().add_modifier(Modifier::DIM));
     frame.render_widget(Paragraph::new(help), area);
@@ -811,6 +1022,17 @@ fn draw_config_modal(frame: &mut Frame, view: &ConfigView) {
     );
 }
 
+/// Border style for the dashboard's table / Detail blocks: normally ACCENT, but
+/// DIM when the integrated terminal holds focus (the terminal panel becomes the
+/// accented one). Titles stay unchanged — only the border color shifts.
+fn dash_border_style(term_focused: bool) -> Style {
+    if term_focused {
+        Style::default().add_modifier(Modifier::DIM)
+    } else {
+        Style::default().fg(ACCENT)
+    }
+}
+
 /// A config-modal pane block. The focused pane's border is accented + bold; the
 /// unfocused one is dim so the shared column reads as the divider.
 fn pane_block(title: String, focused: bool) -> Block<'static> {
@@ -891,6 +1113,66 @@ fn highlight_json_line(line: &str) -> Line<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::app::App;
+    use crate::tui::term::TermSession;
+    use std::path::PathBuf;
+
+    /// An `App` with the given terminal sessions opened, for layout/tab tests.
+    fn app_with_terms(sessions: Vec<TermSession>) -> App {
+        let mut app = App::new(PathBuf::from("/tmp"));
+        for s in sessions {
+            app.terms.open(s);
+        }
+        app
+    }
+
+    #[test]
+    fn term_pane_size_none_matches_inner_geometry() {
+        // 80x40 frame, prompt closed. draw() reserves 1 (tabs) + 1 (bottom) → 38
+        // content rows. Bottom section = 50% of 38 = 19 rows; panel width = 70%
+        // of 80 = 56 cols. Inner screen = minus 1-cell border each side.
+        let frame = Rect::new(0, 0, 80, 40);
+        assert_eq!(term_pane_size(frame, false), Some((19 - 2, 56 - 2)));
+    }
+
+    #[test]
+    fn term_pane_size_prompt_open_shrinks_height() {
+        // Prompt open reserves a 2-line bottom bar → 37 content rows; 50% = 18.
+        let frame = Rect::new(0, 0, 80, 40);
+        assert_eq!(term_pane_size(frame, true), Some((18 - 2, 56 - 2)));
+    }
+
+    #[test]
+    fn term_pane_size_tiny_frame_is_none() {
+        // Too small to carve a usable inner screen.
+        assert_eq!(term_pane_size(Rect::new(0, 0, 4, 4), false), None);
+    }
+
+    #[test]
+    fn tab_specs_number_and_flag_active() {
+        let app = app_with_terms(vec![
+            TermSession::test_session("web-1", "devsandbox-web-1", 24, 80),
+            TermSession::test_session("api-2", "devsandbox-api-2", 24, 80),
+        ]);
+        // `open` makes the last session active.
+        let specs = terminal_tab_specs(&app);
+        assert_eq!(
+            specs,
+            vec![
+                ("1:web-1".to_string(), false, false),
+                ("2:api-2".to_string(), true, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn tab_specs_exited_gets_suffix() {
+        let dead = TermSession::test_session("web-1", "devsandbox-web-1", 24, 80);
+        dead.set_exited();
+        let app = app_with_terms(vec![dead]);
+        let specs = terminal_tab_specs(&app);
+        assert_eq!(specs, vec![("1:web-1 (exited)".to_string(), true, true)]);
+    }
 
     #[test]
     fn highlight_toml_styles_by_kind() {

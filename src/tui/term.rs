@@ -37,8 +37,7 @@ pub const SHELL_FALLBACK_CMD: [&str; 3] = [
 /// UI thread writes keys and resizes.
 pub struct TermSession {
     /// Tab label: instance name, or a service container name minus the
-    /// `devsandbox-` prefix. Read by the renderer's tab strip (step 3).
-    #[allow(dead_code)] // rendered by the tab strip in step 3
+    /// `devsandbox-` prefix. Read by the renderer's tab strip.
     pub title: String,
     /// Container this shell runs in (the resolved `devsandbox-*` name), kept so
     /// the app can dedup `t` against an already-open terminal for the target.
@@ -224,13 +223,11 @@ pub struct TermTabs {
 
 impl TermTabs {
     /// The open sessions, for rendering the tab strip and active screen.
-    #[allow(dead_code)] // read by the renderer in step 3
     pub fn sessions(&self) -> &[TermSession] {
         &self.sessions
     }
 
     /// Active tab index. Only meaningful when `!is_empty()`.
-    #[allow(dead_code)] // read by the renderer in step 3
     pub fn active(&self) -> usize {
         self.active
     }
@@ -239,7 +236,7 @@ impl TermTabs {
         self.sessions.is_empty()
     }
 
-    #[allow(dead_code)] // read by the renderer in step 3
+    #[allow(dead_code)] // used by the event loop's mouse/tab routing in step 4
     pub fn len(&self) -> usize {
         self.sessions.len()
     }
