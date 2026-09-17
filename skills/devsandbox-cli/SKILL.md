@@ -137,8 +137,8 @@ listed when stdin is not a TTY.
    On a non-TTY the sandbox arg is **required** (it lists available names on
    error). Behavior worth knowing:
 
-   - Reuses an existing instance's container: starts it if stopped, refreshes
-     service DNS + VS Code wiring, re-runs `postStartCommand`.
+   - Never reuses an instance: a taken name is an error (`start <name>` restarts
+     a stopped instance, `rebuild <name>` recreates a drifted one).
 
    - A **second `run` against a folder already live** creates a git **worktree**
      under `.worktrees/<instance>` on a fresh `sandbox/<instance>` branch, and a
