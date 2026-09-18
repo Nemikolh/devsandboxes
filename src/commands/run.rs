@@ -561,16 +561,31 @@ fn resolve_folders(
 /// written as `extensions.recommendations` so VS Code offers to install them —
 /// the fallback for backends where auto-install via `nameConfigs` is unavailable
 /// (see [`write_workspace_file`]).
+///
+/// The primary folder is named after the instance and `terminal.integrated.cwd`
+/// is pinned to it via `${workspaceFolder:<name>}`: in a multi-root workspace
+/// VS Code otherwise picks the terminal cwd from whichever root holds the
+/// active editor, which lands new terminals in the extra roots.
 fn workspace_file_json(
+    instance: &str,
     workspace: &str,
     extra_folders: &[(String, PathBuf)],
     recommendations: &[String],
 ) -> String {
-    let folders: Vec<serde_json::Value> = std::iter::once(workspace)
-        .chain(extra_folders.iter().map(|(target, _)| target.as_str()))
-        .map(|path| serde_json::json!({ "path": path }))
-        .collect();
-    let mut root = serde_json::json!({ "folders": folders });
+    let folders: Vec<serde_json::Value> =
+        std::iter::once(serde_json::json!({ "name": instance, "path": workspace }))
+            .chain(
+                extra_folders
+                    .iter()
+                    .map(|(target, _)| serde_json::json!({ "path": target })),
+            )
+            .collect();
+    let mut root = serde_json::json!({
+        "folders": folders,
+        "settings": {
+            "terminal.integrated.cwd": format!("${{workspaceFolder:{instance}}}"),
+        },
+    });
     if !recommendations.is_empty() {
         root["extensions"] = serde_json::json!({ "recommendations": recommendations });
     }
@@ -598,7 +613,7 @@ fn write_workspace_file(
     } else {
         &[]
     };
-    let json = workspace_file_json(workspace, extra_folders, recommendations);
+    let json = workspace_file_json(instance, workspace, extra_folders, recommendations);
     let script = r#"mkdir -p "${2%/*}" && printf '%s\n' "$1" > "$2""#;
     match backend().run_checked(&["exec", container, "sh", "-c", script, "sh", &json, &path]) {
         Ok(()) => Some(path),
@@ -1359,14 +1374,18 @@ mod tests {
     #[test]
     fn workspace_json_lists_primary_first() {
         let extras = vec![("/workspaces/.shared".to_string(), PathBuf::from("/x"))];
-        let json = workspace_file_json("/workspaces/app", &extras, &[]);
+        let json = workspace_file_json("app-2", "/workspaces/app", &extras, &[]);
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(
             parsed["folders"],
             serde_json::json!([
-                { "path": "/workspaces/app" },
+                { "name": "app-2", "path": "/workspaces/app" },
                 { "path": "/workspaces/.shared" }
             ])
+        );
+        assert_eq!(
+            parsed["settings"]["terminal.integrated.cwd"],
+            "${workspaceFolder:app-2}"
         );
         // No recommendations passed → no `extensions` key at all.
         assert!(parsed.get("extensions").is_none());
@@ -1375,7 +1394,7 @@ mod tests {
     #[test]
     fn workspace_json_includes_extension_recommendations() {
         let recs = vec!["dbaeumer.vscode-eslint".to_string()];
-        let json = workspace_file_json("/workspaces/app", &[], &recs);
+        let json = workspace_file_json("app", "/workspaces/app", &[], &recs);
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(
             parsed["extensions"]["recommendations"],
