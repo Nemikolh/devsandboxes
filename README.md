@@ -139,6 +139,7 @@ devsandbox extras on a sandbox:
 | `services`              | Service names to start and network alongside the instance                                             |
 | `caches`                | Package-manager caches to persist and share across the config root                                    |
 | `persist-shell-history` | Per-instance history dir on the host, mounted at `/commandhistory` with `HISTFILE` set; survives rebuilds, never shared between concurrent instances |
+| `shell-rc`              | Host shell snippets (e.g. `["${configDir}/shell/aliases.sh"]`) mounted read-only and sourced by `~/.zshrc` and `~/.bashrc` in the container; concatenates under `extends` |
 | `worktree-branch`       | Branch created for a worktree instance (supports `${instance}`); defaults to `sandbox/${instance}`; `run --branch` overrides it |
 
 Mount sources support devcontainer-style variables: `${configDir}`, `${localWorkspaceFolder}`, `${localWorkspaceFolderBasename}`, `${localEnv:VAR}`, plus devsandbox's `${sharedVolumes}` (the config root's persistent-state dir) and `${instance}` (the running instance name).

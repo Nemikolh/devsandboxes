@@ -45,6 +45,14 @@ pub struct SandboxProperties {
     /// `sandbox/${instance}` when unset. A `run --branch` overrides it.
     #[serde(rename = "worktree-branch")]
     pub worktree_branch: Option<String>,
+    /// Host shell snippets (relative to the config dir, `${…}` variables as in
+    /// `mounts`) sourced by the container's interactive `~/.zshrc` and
+    /// `~/.bashrc`. Each file is bind-mounted read-only via its parent dir and
+    /// a guarded `. <file>` line is appended to both rc files once at create.
+    /// Arrays concatenate under `extends`, so a template's aliases and a
+    /// sandbox's additions are all sourced.
+    #[serde(rename = "shell-rc")]
+    pub shell_rc: Option<Vec<String>>,
     /// Extra VS Code workspace roots: container path -> host folder (relative
     /// to the config dir). Each entry is bind-mounted at its key and listed in
     /// the generated `.code-workspace` file after `workspaceFolder`.
@@ -1107,6 +1115,28 @@ image = "alpine"
         .unwrap();
         let props = config.resolve_sandbox("s").unwrap().properties;
         assert_eq!(props.worktree_branch.as_deref(), Some("team/${instance}"));
+    }
+
+    #[test]
+    fn shell_rc_concatenates_through_template() {
+        let config = Config::parse(
+            r#"
+[template.base]
+shell-rc = ["${configDir}/shell/aliases.sh"]
+
+[sandbox.s]
+extends = "base"
+image = "alpine"
+shell-rc = ["./env.sh"]
+"#,
+        )
+        .unwrap();
+        let props = config.resolve_sandbox("s").unwrap().properties;
+        assert_eq!(
+            props.shell_rc.as_deref(),
+            Some(&["${configDir}/shell/aliases.sh".to_string(), "./env.sh".to_string()][..])
+        );
+        assert!(props.ignored().is_empty());
     }
 
     #[test]

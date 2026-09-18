@@ -7,7 +7,7 @@ use anyhow::{bail, Context, Result};
 use super::{pick, services};
 use crate::config::{
     substitute, Config, FeatureOptions, LifecycleCommand, MountContext, ResolvedSandbox,
-    SandboxProperties, CONFIG_FILE,
+    SandboxProperties, SimpleCommand, CONFIG_FILE,
 };
 use crate::features::{self, FeatureMetadata};
 use crate::runtime::{backend, ServiceEndpoint, NAME_PREFIX};
@@ -226,6 +226,9 @@ pub(crate) fn materialize(
     } else {
         None
     };
+    // `shell-rc`: host snippets mounted read-only, sourced by the rc files.
+    let shell_rc = resolve_shell_rc(dir, &var_ctx, props)?;
+    mounts.extend(shell_rc.iter().map(|(mount, _)| mount.clone()));
     run_container(
         dir,
         sandbox,
@@ -271,6 +274,18 @@ pub(crate) fn materialize(
     let extensions = props.vscode_extensions().unwrap_or(&[]);
     if !extensions.is_empty() || props.remote_user.is_some() {
         write_vscode_name_config(&container, extensions, props.remote_user.as_deref())?;
+    }
+
+    if !shell_rc.is_empty() {
+        let paths: Vec<&str> = shell_rc.iter().map(|(_, path)| path.as_str()).collect();
+        exec_lifecycle(
+            &container,
+            &workspace,
+            props.remote_env.as_ref(),
+            props.remote_user.as_deref(),
+            &shell_rc_wiring(&paths),
+        )
+        .with_context(|| format!("shell-rc wiring failed (container `{container}` kept)"))?;
     }
 
     for (name, cmd) in [
@@ -677,6 +692,61 @@ fn provision_shell_history(
     let mount = format!("type=bind,source={},target={HISTORY_TARGET}", history_dir.display());
     let env = ("HISTFILE".to_string(), format!("{HISTORY_TARGET}/.zsh_history"));
     Ok((path, mount, env))
+}
+
+const SHELL_RC_TARGET: &str = "/devsandbox/rc";
+
+/// Resolve `shell-rc` entries into `(--mount arg, container file path)` pairs.
+/// Entry `i`'s *parent directory* is bind-mounted read-only at
+/// `/devsandbox/rc/<i>` (Apple's `container` cannot bind a single file) and the
+/// file is addressed by basename inside it. A missing host file is an error:
+/// unlike `mounts`, auto-creating an empty snippet would only hide a typo.
+fn resolve_shell_rc(
+    dir: &Path,
+    ctx: &MountContext,
+    props: &SandboxProperties,
+) -> Result<Vec<(String, String)>> {
+    let Some(entries) = &props.shell_rc else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::with_capacity(entries.len());
+    for (i, entry) in entries.iter().enumerate() {
+        let source = substitute(entry, ctx);
+        let host = dir
+            .join(&source)
+            .canonicalize()
+            .with_context(|| format!("`shell-rc` entry `{source}` does not exist"))?;
+        if !host.is_file() {
+            bail!("`shell-rc` entry `{source}` is not a file");
+        }
+        let parent = host.parent().context("shell-rc entry has no parent dir")?;
+        let name = host
+            .file_name()
+            .context("shell-rc entry has no file name")?
+            .to_string_lossy();
+        let target = format!("{SHELL_RC_TARGET}/{i}");
+        out.push((
+            format!("type=bind,source={},target={target},readonly", parent.display()),
+            format!("{target}/{name}"),
+        ));
+    }
+    Ok(out)
+}
+
+/// Shell snippet that makes the remote user's interactive rc files source each
+/// `shell-rc` path. Runs as `remoteUser`, so `$HOME` is theirs rather than a
+/// hard-coded `/root`. Idempotent: each line is appended only when the rc file
+/// doesn't mention the path yet, and a missing rc file is created. The source
+/// line is guarded with `[ -r … ]` so a shell still starts if the mount is gone.
+fn shell_rc_wiring(paths: &[&str]) -> LifecycleCommand {
+    let mut script = String::from("set -eu\nfor rc in \"$HOME/.zshrc\" \"$HOME/.bashrc\"; do\n");
+    for path in paths {
+        script.push_str(&format!(
+            "  grep -qsF '{path}' \"$rc\" || printf '\\n[ -r {path} ] && . {path}\\n' >> \"$rc\"\n"
+        ));
+    }
+    script.push_str("done\n");
+    LifecycleCommand::Simple(SimpleCommand::Shell(script))
 }
 
 /// Create a missing bind-mount source. A final path component containing a dot
@@ -1342,6 +1412,62 @@ mod tests {
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].0, "/workspaces/.shared");
         assert_eq!(resolved[0].1, dir.canonicalize().unwrap());
+    }
+
+    // --- shell-rc ---
+
+    #[test]
+    fn shell_rc_mounts_parent_dir_readonly_and_addresses_file() {
+        let dir = std::env::temp_dir().join(format!("devsandbox-rc-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("shell")).unwrap();
+        std::fs::write(dir.join("shell/aliases.sh"), "alias ll='ls -l'\n").unwrap();
+        let props = SandboxProperties {
+            shell_rc: Some(vec!["./shell/aliases.sh".into()]),
+            ..Default::default()
+        };
+        let resolved = resolve_shell_rc(&dir, &ctx(), &props).unwrap();
+        let parent = dir.join("shell").canonicalize().unwrap();
+        assert_eq!(
+            resolved,
+            vec![(
+                format!("type=bind,source={},target=/devsandbox/rc/0,readonly", parent.display()),
+                "/devsandbox/rc/0/aliases.sh".to_string(),
+            )]
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn shell_rc_missing_file_is_an_error() {
+        let props = SandboxProperties {
+            shell_rc: Some(vec!["./nope.sh".into()]),
+            ..Default::default()
+        };
+        let err = resolve_shell_rc(&std::env::temp_dir(), &ctx(), &props).unwrap_err();
+        assert!(err.to_string().contains("`shell-rc` entry `./nope.sh` does not exist"));
+    }
+
+    #[test]
+    fn shell_rc_directory_is_rejected() {
+        let props = SandboxProperties {
+            shell_rc: Some(vec![".".into()]),
+            ..Default::default()
+        };
+        let err = resolve_shell_rc(&std::env::temp_dir(), &ctx(), &props).unwrap_err();
+        assert!(err.to_string().contains("is not a file"));
+    }
+
+    #[test]
+    fn shell_rc_wiring_is_guarded_and_idempotent_per_path() {
+        let cmd = shell_rc_wiring(&["/devsandbox/rc/0/a.sh", "/devsandbox/rc/1/b.sh"]);
+        let argv = &cmd.commands()[0];
+        assert_eq!(&argv[..2], &["sh".to_string(), "-c".to_string()]);
+        let script = &argv[2];
+        assert!(script.contains(r#"for rc in "$HOME/.zshrc" "$HOME/.bashrc""#));
+        assert!(script.contains(
+            r#"grep -qsF '/devsandbox/rc/0/a.sh' "$rc" || printf '\n[ -r /devsandbox/rc/0/a.sh ] && . /devsandbox/rc/0/a.sh\n' >> "$rc""#
+        ));
+        assert!(script.contains("grep -qsF '/devsandbox/rc/1/b.sh'"));
     }
 
     #[test]
