@@ -978,9 +978,11 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
         Modal::Help(_) => "↑↓ scroll · pgup/pgdn · g/G · esc/? close".to_string(),
         Modal::Logs(_) => "↑↓ scroll · pgup/pgdn · g/G · esc close".to_string(),
         Modal::None => match app.tab {
-            // `s` mirrors what the key would do to the selection: stop vs start.
+            // `r` and `s` mirror what the key would do to the selection:
+            // run vs rename, stop vs start.
             Tab::Instances => format!(
-                "q quit · tab switch · ↑↓ select · ←→ fold · enter config · r run · o vscode · s {} · l logs · t term · : cmd · ? help",
+                "q quit · tab switch · ↑↓ select · ←→ fold · enter config · r {} · o vscode · s {} · l logs · t term · : cmd · ? help",
+                app.run_rename_hint(),
                 app.stop_start_hint()
             ),
             Tab::Services => {

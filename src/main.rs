@@ -66,7 +66,7 @@ enum Command {
     },
     /// Rename an instance (state only; the container keeps its old name)
     Rename {
-        /// Instance name, sandbox config name, or repository folder name
+        /// Exact instance name (no sandbox/folder resolution)
         name: String,
         /// New instance name
         new_name: String,

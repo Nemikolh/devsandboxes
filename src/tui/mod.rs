@@ -142,11 +142,13 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
                 PromptAction::Code { instance } => {
                     app.status = Some(launch_code(&dir, &app, &instance));
                 }
-                // Rename is pure state I/O: run it in place (no suspend) and
-                // force an immediate resnapshot so the renamed row shows now.
+                // Rename is pure state I/O (`rename_exact`: no stdout, no
+                // prompts — plain `rename` would scribble on the alternate
+                // screen): run it in place (no suspend) and force an immediate
+                // resnapshot so the renamed row shows now.
                 PromptAction::Rename { instance, new_name } => {
-                    app.status = Some(match commands::rename::rename(&instance, &new_name) {
-                        Ok(()) => format!("renamed {instance} -> {new_name}"),
+                    app.status = Some(match commands::rename::rename_exact(&instance, &new_name) {
+                        Ok(new_name) => format!("renamed {instance} -> {new_name}"),
                         Err(e) => format!("rename failed: {e:#}"),
                     });
                     last_tick = Instant::now();

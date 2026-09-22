@@ -1,21 +1,31 @@
 use anyhow::{bail, Result};
 
-use super::resolve_instance;
 use crate::state::State;
 
-/// Rename an instance: move its state entry to a new key and persist. `name`
-/// resolves like every other verb (instance / sandbox / folder). The container
-/// keeps its old `devsandbox-<old>` name — nothing is renamed in the runtime;
-/// all ops go through the stored `container` field, and a later `rebuild`
-/// re-derives the container from the (new) key. Pure state I/O, so the TUI runs
-/// it without suspending.
+/// Rename an instance: move its state entry to a new key and persist. Unlike
+/// other verbs, `name` must be the exact instance key — a rename changes
+/// identity, so fuzzy sandbox/folder resolution (and its interactive ambiguity
+/// prompt) is deliberately not used here.
 pub fn rename(name: &str, new_name: &str) -> Result<()> {
-    let mut state = State::load()?;
-    let key = resolve_instance(&state, name)?;
-    let new_name = rename_in_state(&mut state, &key, new_name)?;
-    state.save()?;
-    println!("renamed {key} -> {new_name}");
+    let new_name = rename_exact(name, new_name)?;
+    println!("renamed {name} -> {new_name}");
     Ok(())
+}
+
+/// Silent core shared with the TUI, which runs it in place on the alternate
+/// screen — so it must never touch stdout/stderr or prompt on stdin. The
+/// container keeps its old `devsandbox-<old>` name — nothing is renamed in the
+/// runtime; all ops go through the stored `container` field, and a later
+/// `rebuild` re-derives the container from the (new) key. Returns the trimmed
+/// new name.
+pub fn rename_exact(name: &str, new_name: &str) -> Result<String> {
+    let mut state = State::load()?;
+    if !state.instances.contains_key(name) {
+        bail!("no instance named `{name}` (see `devsandbox ps -a`)");
+    }
+    let new_name = rename_in_state(&mut state, name, new_name)?;
+    state.save()?;
+    Ok(new_name)
 }
 
 /// Move `key`'s entry to `new_name` in `state`, returning the trimmed name.

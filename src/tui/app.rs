@@ -905,6 +905,17 @@ impl App {
         }
     }
 
+    /// Help-bar verb for the `r` key: `rename` when the cursor is on an
+    /// instance (or one of its process rows), `run` otherwise — mirrors what
+    /// [`Self::open_rename_or_run_prompt`] would do.
+    pub fn run_rename_hint(&self) -> &'static str {
+        if self.selected_instance_index().is_some() {
+            "rename"
+        } else {
+            "run"
+        }
+    }
+
     /// Help-bar verb for the `s` key, matching what
     /// [`Self::stop_or_start_instance`] would actually do to the instance under
     /// the cursor: `start` when it is exited (a drifted one rebuilds, which is
@@ -3025,6 +3036,18 @@ mod tests {
         assert_eq!(app.stop_start_hint(), "stop");
         app.set_snapshot(snapshot_with_status(1, ContainerStatus::Missing));
         assert_eq!(app.stop_start_hint(), "stop");
+    }
+
+    #[test]
+    fn run_rename_hint_tracks_selection() {
+        let mut app = new_app();
+        // No snapshot / sandbox row selected → `run`.
+        assert_eq!(app.run_rename_hint(), "run");
+        app.set_snapshot(snapshot_with(2)); // [Sandbox(0), inst0, inst1]
+        assert_eq!(app.run_rename_hint(), "run");
+        // Instance row under the cursor → `rename`.
+        app.on_key(key(KeyCode::Down)); // onto inst0
+        assert_eq!(app.run_rename_hint(), "rename");
     }
 
     #[test]
