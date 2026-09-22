@@ -12,14 +12,15 @@ You orchestrate; subagents implement. You never let a subagent touch git.
 1. **Recon first.** Read the relevant code (grep/glob, then targeted reads)
    until you can name exact files, functions, and line numbers. Never plan
    from memory.
-2. **Write the plan as a markdown file** in `docs/` (e.g. `docs/plan-<topic>.md`):
+2. **Write the plan as a markdown file** in `docs/` (e.g. `docs/<topic>.md`):
    one `## Step N` section per commit-sized step, with constraints the
    implementer must obey and code landmarks (file:line). Both the user and
    the subagents read this file.
 3. **Present the plan** to the user for approval before touching anything.
    On revision requests, update the plan file and re-present.
-4. **Per step, spawn one implementer subagent** (`claude-opus-4-8`):
-   - brief = `/implementer` skill + the plan file path + step number
+4. **Per step, spawn one implementer subagent**:
+   - IMPORTANT: set "model" to `claude-opus-4-8`
+   - "task" = `/implementer` skill + the plan file path + step number
      + code landmarks + anything learned from prior steps' reviews;
    - subagents have no conversation context — brief like a colleague who
      just walked in.
