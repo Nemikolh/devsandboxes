@@ -11,9 +11,14 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
+use super::spec;
+
 /// Command names offered for first-token completion, in display order.
-pub const COMMANDS: [&str; 8] =
-    ["run", "exec", "code", "rm", "rename", "stop", "start", "rebuild"];
+/// Derived from [`spec::SPECS`] (primary names only; aliases parse but
+/// don't complete, mirroring the CLI).
+pub fn commands() -> impl Iterator<Item = &'static str> {
+    spec::SPECS.iter().map(|s| s.name)
+}
 
 /// Max history entries kept on disk (oldest trimmed first).
 const HISTORY_CAP: usize = 200;
@@ -354,116 +359,47 @@ impl Prompt {
     }
 }
 
-/// Pure line parser, split from [`Prompt`] so it is trivially testable.
+/// Pure line parser, split from [`Prompt`] so it is trivially testable. The
+/// grammar (flags, positionals, usage strings) lives in [`spec::SPECS`]; this
+/// only maps the generic [`spec::ParsedArgs`] onto [`PromptAction`] variants,
+/// so adding an option is a spec-table change, not a parser change.
 fn parse_line(line: &str) -> Result<PromptAction, String> {
     let tokens: Vec<&str> = line.split_whitespace().collect();
     let Some((&cmd, rest)) = tokens.split_first() else {
         return Err("empty command".into());
     };
-    match cmd {
-        "run" => {
-            // `run <sandbox> [--name n] [--branch b]`.
-            let mut sandbox: Option<String> = None;
-            let mut name: Option<String> = None;
-            let mut branch: Option<String> = None;
-            let mut i = 0;
-            while i < rest.len() {
-                match rest[i] {
-                    "--name" => {
-                        let val = rest.get(i + 1).ok_or("`--name` needs a value")?;
-                        name = Some((*val).to_string());
-                        i += 2;
-                    }
-                    "--branch" => {
-                        let val = rest.get(i + 1).ok_or("`--branch` needs a value")?;
-                        branch = Some((*val).to_string());
-                        i += 2;
-                    }
-                    other if other.starts_with("--") => {
-                        return Err(format!("unknown flag `{other}`"));
-                    }
-                    other => {
-                        if sandbox.is_some() {
-                            return Err(format!("unexpected argument `{other}`"));
-                        }
-                        sandbox = Some(other.to_string());
-                        i += 1;
-                    }
-                }
-            }
-            let sandbox = sandbox.ok_or("usage: run <sandbox> [--name n] [--branch b]")?;
-            Ok(PromptAction::Run { sandbox, name, branch })
-        }
+    let Some(cmd_spec) = spec::find(cmd) else {
+        let names: Vec<&str> = spec::SPECS.iter().map(|s| s.name).collect();
+        return Err(format!("unknown command `{cmd}` ({})", names.join(", ")));
+    };
+    let mut args = spec::parse_args(cmd_spec, rest)?;
+    // Aliases resolve to the primary name (`recreate` → `rebuild`), so matching
+    // on `cmd_spec.name` covers them.
+    match cmd_spec.name {
+        "run" => Ok(PromptAction::Run {
+            sandbox: args.positionals.remove(0),
+            name: args.value("--name").map(str::to_string),
+            branch: args.value("--branch").map(str::to_string),
+        }),
         "exec" => {
-            let (instance, argv) = rest
-                .split_first()
-                .ok_or("usage: exec <instance> <cmd…>")?;
-            if argv.is_empty() {
-                return Err("usage: exec <instance> <cmd…>".into());
-            }
-            Ok(PromptAction::Exec {
-                instance: (*instance).to_string(),
-                argv: argv.iter().map(|s| (*s).to_string()).collect(),
-            })
+            Ok(PromptAction::Exec { instance: args.positionals.remove(0), argv: args.trailing })
         }
-        "code" => {
-            let [instance] = rest else {
-                return Err("usage: code <instance>".into());
-            };
-            Ok(PromptAction::Code { instance: (*instance).to_string() })
-        }
-        "rm" => {
-            let [instance] = rest else {
-                return Err("usage: rm <instance>".into());
-            };
-            Ok(PromptAction::Rm { instance: (*instance).to_string() })
-        }
+        "code" => Ok(PromptAction::Code { instance: args.positionals.remove(0) }),
+        "rm" => Ok(PromptAction::Rm { instance: args.positionals.remove(0) }),
         "rename" => {
-            let [instance, new_name] = rest else {
-                return Err("usage: rename <instance> <new-name>".into());
-            };
+            let mut pos = args.positionals.into_iter();
             Ok(PromptAction::Rename {
-                instance: (*instance).to_string(),
-                new_name: (*new_name).to_string(),
+                instance: pos.next().expect("spec guarantees two positionals"),
+                new_name: pos.next().expect("spec guarantees two positionals"),
             })
         }
-        "stop" => {
-            let [instance] = rest else {
-                return Err("usage: stop <instance>".into());
-            };
-            Ok(PromptAction::Stop { instance: (*instance).to_string() })
-        }
-        "start" => {
-            let [instance] = rest else {
-                return Err("usage: start <instance>".into());
-            };
-            Ok(PromptAction::Start { instance: (*instance).to_string() })
-        }
-        // `recreate` is an alias, mirroring the CLI's `rebuild`/`recreate`.
-        // `--force` skips the drift check, like the CLI flag.
-        "rebuild" | "recreate" => {
-            let mut force = false;
-            let mut instance: Option<String> = None;
-            for tok in rest {
-                match *tok {
-                    "--force" => force = true,
-                    other if other.starts_with("--") => {
-                        return Err(format!("unknown flag `{other}`"));
-                    }
-                    other => {
-                        if instance.is_some() {
-                            return Err("usage: rebuild [--force] <instance>".into());
-                        }
-                        instance = Some(other.to_string());
-                    }
-                }
-            }
-            let instance = instance.ok_or("usage: rebuild [--force] <instance>")?;
-            Ok(PromptAction::Rebuild { instance, force })
-        }
-        other => Err(format!(
-            "unknown command `{other}` (run, exec, code, rm, rename, stop, start, rebuild)"
-        )),
+        "stop" => Ok(PromptAction::Stop { instance: args.positionals.remove(0) }),
+        "start" => Ok(PromptAction::Start { instance: args.positionals.remove(0) }),
+        "rebuild" => Ok(PromptAction::Rebuild {
+            instance: args.positionals.remove(0),
+            force: args.flag("--force"),
+        }),
+        other => unreachable!("spec `{other}` has no PromptAction mapping"),
     }
 }
 
@@ -594,7 +530,7 @@ mod tests {
     /// Candidate source used by completion tests.
     fn cands(idx: usize, tokens: &[String]) -> Vec<String> {
         if idx == 0 {
-            return COMMANDS.iter().map(|s| s.to_string()).collect();
+            return commands().map(str::to_string).collect();
         }
         match tokens.first().map(String::as_str) {
             Some("run") => vec!["alpha".into(), "beta".into(), "bacon".into()],

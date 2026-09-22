@@ -16,7 +16,7 @@ use crate::runtime::backend;
 
 use super::data::{visible_nodes, ContainerStatus, InstanceRow, Node, Snapshot, ORPHANS_NAME};
 use super::procs::ProcState;
-use super::prompt::{Prompt, PromptAction, COMMANDS};
+use super::prompt::{commands, Prompt, PromptAction};
 use super::term::{encode_key, TermSession, TermTabs, SHELL_FALLBACK_CMD};
 use crate::runtime::NAME_PREFIX;
 
@@ -1133,7 +1133,7 @@ impl App {
         config: Option<&Config>,
     ) -> Vec<String> {
         if idx == 0 {
-            return COMMANDS.iter().map(|s| s.to_string()).collect();
+            return commands().map(str::to_string).collect();
         }
         match tokens.first().map(String::as_str) {
             Some("run") => Self::run_candidates(idx, tokens, sandboxes, config),
