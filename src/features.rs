@@ -115,13 +115,6 @@ impl FeatureRef {
     pub fn full(&self) -> String {
         format!("{}/{}:{}", self.registry, self.path, self.tag)
     }
-
-    /// Cache directory for this ref:
-    /// `$XDG_CACHE_HOME/devsandbox/features/<registry>/<path>/<tag>/`,
-    /// falling back to `$HOME/.cache/...`. Mirrors `State::path`.
-    pub fn cache_dir(&self) -> Result<PathBuf> {
-        Ok(cache_root()?.join(&self.registry).join(&self.path).join(&self.tag))
-    }
 }
 
 /// Base cache dir (`$XDG_CACHE_HOME/devsandbox/features`, falling back to
