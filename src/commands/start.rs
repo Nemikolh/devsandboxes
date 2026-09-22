@@ -42,7 +42,7 @@ pub fn start(dir: &Path, name: Option<String>, all: bool) -> Result<()> {
 fn start_instance(dir: &Path, key: &str, info: &Instance) -> Result<()> {
     match resolved_sandbox(dir, info) {
         Some((config, sandbox)) => {
-            run::warn_on_drift(&info.container, &sandbox.config_hash)?;
+            run::warn_on_drift(dir, &info.container, &sandbox)?;
             backend().run_checked(&["start", &info.container])?;
             // Services may have been recreated with new addresses (or gc'd)
             // since the instance last ran; bring them up and refresh resolution.

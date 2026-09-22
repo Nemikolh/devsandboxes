@@ -4,10 +4,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
-use super::{pick, services};
+use super::{container_drifted, pick, services};
 use crate::config::{
-    substitute, Config, FeatureOptions, LifecycleCommand, MountContext, ResolvedSandbox,
-    SandboxProperties, SimpleCommand, CONFIG_FILE,
+    build_hash, substitute, Config, FeatureOptions, LifecycleCommand, MountContext,
+    ResolvedSandbox, SandboxProperties, SimpleCommand, CONFIG_FILE,
 };
 use crate::features::{self, FeatureMetadata};
 use crate::runtime::{backend, ServiceEndpoint, NAME_PREFIX};
@@ -412,12 +412,12 @@ fn create_worktree(base: &Path, worktree: &Path, branch: &str) -> Result<()> {
     Ok(())
 }
 
-/// Warn when the reused container's recorded config hash differs from the
-/// freshly resolved one. Compose containers carry no such label (None) — skip.
-pub(crate) fn warn_on_drift(container: &str, expected: &str) -> Result<()> {
-    if let Some(hash) = backend().label(container, "devsandbox.config_hash")?
-        && hash != expected
-    {
+/// Warn when the reused container's recorded config or build hash differs from
+/// the freshly resolved one (the shared [`container_drifted`] rule, so a
+/// dockerfile edit warns too). Containers without the labels (None) — skip.
+pub(crate) fn warn_on_drift(dir: &Path, container: &str, sandbox: &ResolvedSandbox) -> Result<()> {
+    let build = build_hash(dir, sandbox.properties.build.as_ref());
+    if container_drifted(container, &sandbox.config_hash, &build)? {
         // Suggest a copy-pasteable command: strip the container prefix to the
         // instance name, falling back to the container name if it is unprefixed.
         let instance = container.strip_prefix(NAME_PREFIX).unwrap_or(container);
@@ -449,11 +449,15 @@ fn run_container(
     let instance = container.strip_prefix(NAME_PREFIX).unwrap_or(container);
     let instance_label = format!("devsandbox.instance={instance}");
     let hash_label = format!("devsandbox.config_hash={}", sandbox.config_hash);
+    let build_hash_label = format!(
+        "devsandbox.build_hash={}",
+        build_hash(dir, sandbox.properties.build.as_ref())
+    );
     let base_label = format!("devsandbox.base_folder={}", base_folder.display());
     let mut args: Vec<String> = [
         "run", "-d", "--name", container,
         "--label", &sandbox_label, "--label", &instance_label,
-        "--label", &hash_label, "--label", &base_label,
+        "--label", &hash_label, "--label", &build_hash_label, "--label", &base_label,
         "-v", &mount, "-w", workspace,
     ]
     .map(str::to_string)

@@ -1617,6 +1617,7 @@ mod tests {
             services: Vec::new(),
             extends: Vec::new(),
             config_hash: "hash".into(),
+            build_hash: String::new(),
             issues: Vec::new(),
         }];
         Snapshot {
@@ -2282,6 +2283,7 @@ mod tests {
                 services: Vec::new(),
                 extends: Vec::new(),
                 config_hash: "h".into(),
+                build_hash: String::new(),
                 issues: Vec::new(),
             }],
             services: Vec::new(),
@@ -2354,6 +2356,7 @@ mod tests {
                 services: Vec::new(),
                 extends: Vec::new(),
                 config_hash: "h".into(),
+                build_hash: String::new(),
                 issues: Vec::new(),
             }],
             services: Vec::new(),

@@ -630,6 +630,24 @@ pub fn short_hash(text: &str) -> String {
     format!("{h:016x}")
 }
 
+/// Short hash of a `build`'s dockerfile *contents*, or `""` when there is no
+/// build, no `dockerfile` key, or the file can't be read.
+///
+/// Hashing the bytes (not the path in the merged config, which `config_hash`
+/// already covers) is what lets a dockerfile edit register as drift: the path
+/// is unchanged, only the contents moved. Limitation: only the dockerfile file
+/// itself is hashed — the build context and devcontainer features are not, so
+/// edits to those go undetected.
+pub fn build_hash(dir: &Path, build: Option<&Build>) -> String {
+    let Some(dockerfile) = build.and_then(|b| b.dockerfile.as_deref()) else {
+        return String::new();
+    };
+    match std::fs::read(dir.join(dockerfile)) {
+        Ok(bytes) => short_hash(&String::from_utf8_lossy(&bytes)),
+        Err(_) => String::new(),
+    }
+}
+
 /// Stable hash of a merged config table. `Table` is a `BTreeMap`, so its TOML
 /// serialization is key-sorted and deterministic across runs.
 fn config_hash(table: &Table) -> String {
@@ -741,6 +759,44 @@ folders = { "/workspaces/docs" = "../docs" }
         assert_eq!(a, b, "same config must hash identically");
         let c = config.resolve_sandbox("repository-2").unwrap().config_hash;
         assert_ne!(a, c, "different configs must hash differently");
+    }
+
+    #[test]
+    fn build_hash_none_and_missing_are_empty() {
+        let dir = std::env::temp_dir();
+        // No build block at all.
+        assert_eq!(build_hash(&dir, None), "");
+        // Build with no dockerfile key.
+        let no_dockerfile = Build::default();
+        assert_eq!(build_hash(&dir, Some(&no_dockerfile)), "");
+        // Dockerfile key pointing at a nonexistent file.
+        let missing = Build {
+            dockerfile: Some("does-not-exist-xyz.Dockerfile".into()),
+            ..Build::default()
+        };
+        assert_eq!(build_hash(&dir, Some(&missing)), "");
+    }
+
+    #[test]
+    fn build_hash_tracks_dockerfile_contents() {
+        let dir = std::env::temp_dir().join(format!("devsandbox-bh-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Dockerfile");
+        let build = Build {
+            dockerfile: Some("Dockerfile".into()),
+            ..Build::default()
+        };
+
+        std::fs::write(&path, "FROM alpine\n").unwrap();
+        let first = build_hash(&dir, Some(&build));
+        assert!(!first.is_empty());
+        // Identical contents hash identically.
+        assert_eq!(first, build_hash(&dir, Some(&build)));
+        // A content change moves the hash even though the path is unchanged.
+        std::fs::write(&path, "FROM alpine\nRUN echo hi\n").unwrap();
+        assert_ne!(first, build_hash(&dir, Some(&build)));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -3,7 +3,8 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 
-use crate::config::{short_hash, Build, Config, ResolvedService, ServiceScope};
+use super::container_drifted;
+use crate::config::{build_hash, short_hash, Build, Config, ResolvedService, ServiceScope};
 use crate::runtime::{backend, Backend, ServiceEndpoint, NAME_PREFIX};
 use crate::state::State;
 
@@ -79,6 +80,10 @@ pub fn ensure_services(
                     format!("devsandbox.project={project}"),
                     "devsandbox.scope=global".to_string(),
                     format!("devsandbox.config_hash={}", service.config_hash),
+                    format!(
+                        "devsandbox.build_hash={}",
+                        build_hash(dir, service.spec.build.as_ref())
+                    ),
                 ];
                 ensure_service(dir, &container, &global_net, &service, &labels)?;
                 endpoints.push(ServiceEndpoint { alias: name.clone(), container });
@@ -95,6 +100,10 @@ pub fn ensure_services(
                     format!("devsandbox.instance={instance}"),
                     "devsandbox.scope=isolated".to_string(),
                     format!("devsandbox.config_hash={}", service.config_hash),
+                    format!(
+                        "devsandbox.build_hash={}",
+                        build_hash(dir, service.spec.build.as_ref())
+                    ),
                 ];
                 ensure_service(dir, &container, &instance_net, &service, &labels)?;
                 endpoints.push(ServiceEndpoint { alias: name.clone(), container });
@@ -123,8 +132,8 @@ fn ensure_service(
 ) -> Result<()> {
     match backend().is_running(container)? {
         Some(running) => {
-            let label = backend().label(container, "devsandbox.config_hash")?;
-            if label.as_deref().unwrap_or_default() != service.config_hash {
+            let build = build_hash(dir, service.spec.build.as_ref());
+            if container_drifted(container, &service.config_hash, &build)? {
                 eprintln!(
                     "warning: service `{}` ({container}) config changed since it started; \
                      `devsandbox gc` (or remove the instance) then re-run to recreate",

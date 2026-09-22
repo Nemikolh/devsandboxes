@@ -2,8 +2,8 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 
-use super::{resolve_instance, run, services};
-use crate::config::{Config, ResolvedSandbox};
+use super::{container_drifted, resolve_instance, run, services};
+use crate::config::{build_hash, Config, ResolvedSandbox};
 use crate::runtime::backend;
 use crate::state::{Instance, State};
 
@@ -35,7 +35,7 @@ pub fn rebuild(dir: &Path, name: Option<String>, all: bool) -> Result<()> {
                     continue;
                 }
             };
-            if !needs_rebuild(&info.container, &sandbox.config_hash)? {
+            if !needs_rebuild(dir, &info.container, &sandbox)? {
                 continue;
             }
             rebuild_instance(dir, &config, &sandbox, &key, &mut state)?;
@@ -52,21 +52,27 @@ pub fn rebuild(dir: &Path, name: Option<String>, all: bool) -> Result<()> {
     let info = state.instances.get(&key).expect("key came from state");
     let sandbox = resolve(&config, info, &project, &key)?;
 
-    if !needs_rebuild(&info.container, &sandbox.config_hash)? {
+    if !needs_rebuild(dir, &info.container, &sandbox)? {
         println!("no config drift for `{key}`; nothing to do");
         return Ok(());
     }
     rebuild_instance(dir, &config, &sandbox, &key, &mut state)
 }
 
-/// Drift check against the container's recorded hash.
-/// - `Some(hash)` equal   → nothing to do.
-/// - `Some(hash)` differ  → rebuild.
-/// - `None` (container or label gone, e.g. removed manually) → rebuild anyway.
-///   It is the only worktree-preserving way back to a live instance: `run`
-///   refuses the taken name and `rm` destroys the worktree.
-fn needs_rebuild(container: &str, expected: &str) -> Result<bool> {
-    Ok(backend().label(container, "devsandbox.config_hash")? != Some(expected.to_string()))
+/// Drift check against the container's recorded config *and* build hashes.
+/// - config or build hash differs → rebuild (the shared [`container_drifted`]
+///   rule; a dockerfile edit shows up as build-hash drift).
+/// - config label `None` (container or label gone, e.g. removed manually) →
+///   rebuild anyway. It is the only worktree-preserving way back to a live
+///   instance: `run` refuses the taken name and `rm` destroys the worktree.
+///   This recovery case is unique to `rebuild`, so it lives here rather than in
+///   the shared rule.
+fn needs_rebuild(dir: &Path, container: &str, sandbox: &ResolvedSandbox) -> Result<bool> {
+    if backend().label(container, "devsandbox.config_hash")?.is_none() {
+        return Ok(true);
+    }
+    let build = build_hash(dir, sandbox.properties.build.as_ref());
+    container_drifted(container, &sandbox.config_hash, &build)
 }
 
 /// Remove `key`'s container and re-materialize it from `config`, reusing the

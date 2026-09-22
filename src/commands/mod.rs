@@ -77,6 +77,50 @@ pub(crate) fn resolve_container(state: &State, name: &str) -> Result<String> {
         .ok_or(instance_err)
 }
 
+/// The single drift rule shared by every comparison site (`rebuild`, `run`
+/// reuse, `services`, and the TUI snapshot) so they can't diverge. A container
+/// has drifted when either recorded label is present *and* differs from what
+/// the current config produces:
+///
+/// - config: label `Some(h)` and `h != expected_config`.
+/// - build:  label `Some(h)` and `expected_build` non-empty and `h != expected_build`.
+///
+/// A missing label (pre-upgrade container, or an image-based sandbox that
+/// carries an empty build hash) or an empty expected build hash contributes no
+/// drift — the lenient rule that keeps old containers from flapping.
+///
+/// `rebuild`'s "config label gone → rebuild anyway" recovery is *not* folded in
+/// here; it stays local to `needs_rebuild`.
+pub(crate) fn container_drifted(
+    container: &str,
+    expected_config: &str,
+    expected_build: &str,
+) -> Result<bool> {
+    let rt = backend();
+    let config_label = rt.label(container, "devsandbox.config_hash")?;
+    let build_label = rt.label(container, "devsandbox.build_hash")?;
+    Ok(drift_decision(
+        config_label.as_deref(),
+        expected_config,
+        build_label.as_deref(),
+        expected_build,
+    ))
+}
+
+/// The pure drift decision behind [`container_drifted`], split out so it can be
+/// table-tested without a runtime. See [`container_drifted`] for the rule.
+fn drift_decision(
+    config_label: Option<&str>,
+    expected_config: &str,
+    build_label: Option<&str>,
+    expected_build: &str,
+) -> bool {
+    let config_drift = config_label.is_some_and(|h| h != expected_config);
+    let build_drift =
+        !expected_build.is_empty() && build_label.is_some_and(|h| h != expected_build);
+    config_drift || build_drift
+}
+
 /// Yes/no prompt on stderr; `false` on a non-TTY. Shared by `rm` and `gc`.
 pub(crate) fn confirm(prompt: &str) -> Result<bool> {
     if !std::io::stdin().is_terminal() {
@@ -112,7 +156,37 @@ mod tests {
 
     use crate::state::{Instance, State};
 
-    use super::{resolve_instance, resolve_instance_with};
+    use super::{drift_decision, resolve_instance, resolve_instance_with};
+
+    #[test]
+    fn drift_rule_covers_label_presence_and_expected_emptiness() {
+        // (config_label, expected_config, build_label, expected_build) → drift.
+        // "cfg" matches expected config; "b" matches expected build.
+        let cases: &[(Option<&str>, &str, Option<&str>, &str, bool)] = &[
+            // No labels at all → no drift regardless of expected.
+            (None, "cfg", None, "b", false),
+            (None, "cfg", None, "", false),
+            // Config label present and matching, build absent → no drift.
+            (Some("cfg"), "cfg", None, "b", false),
+            // Config label present and differing → drift (even with empty build).
+            (Some("old"), "cfg", None, "", true),
+            // Build label present, non-empty expected, differing → drift.
+            (Some("cfg"), "cfg", Some("old"), "b", true),
+            // Build label present but expected build empty → build contributes nothing.
+            (Some("cfg"), "cfg", Some("anything"), "", false),
+            // Build label present and matching → no drift.
+            (Some("cfg"), "cfg", Some("b"), "b", false),
+            // Build label absent, non-empty expected → no drift (missing label lenient).
+            (Some("cfg"), "cfg", None, "b", false),
+        ];
+        for &(cfg_label, exp_cfg, build_label, exp_build, want) in cases {
+            assert_eq!(
+                drift_decision(cfg_label, exp_cfg, build_label, exp_build),
+                want,
+                "cfg_label={cfg_label:?} exp_cfg={exp_cfg} build_label={build_label:?} exp_build={exp_build}"
+            );
+        }
+    }
 
     /// State with two instances of the same sandbox, in two folders.
     fn state() -> State {

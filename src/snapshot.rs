@@ -9,8 +9,9 @@ use std::time::Instant;
 
 use serde::Serialize;
 
+use crate::commands::container_drifted;
 use crate::commands::services::{isolated_service_container, project_id, service_container};
-use crate::config::{Config, MountContext, ResolvedSandbox, ServiceScope};
+use crate::config::{build_hash, Config, MountContext, ResolvedSandbox, ServiceScope};
 use crate::runtime::{backend, ContainerRow, NAME_PREFIX};
 use crate::state::{Instance, State};
 
@@ -75,6 +76,10 @@ pub struct SandboxRow {
     pub extends: Vec<String>,
     /// Short config hash of the resolved table, empty when unresolved.
     pub config_hash: String,
+    /// Short hash of the build dockerfile's contents, empty when the sandbox is
+    /// image-based, has no dockerfile, or failed to resolve. Drift-only; carried
+    /// here so the instance join computes it once per sandbox, not per instance.
+    pub build_hash: String,
     /// Config-validation problems for this sandbox (folder / mount resolution),
     /// shown in the Detail panel. Empty when the sandbox validates or failed to
     /// resolve at all (the resolve error is reported separately).
@@ -361,6 +366,7 @@ pub fn sandbox_rows(dir: &Path, config: &Config) -> (Vec<SandboxRow>, Vec<String
             Ok(rs) => {
                 let services = rs.properties.services.clone().unwrap_or_default();
                 let issues = validate_sandbox(dir, &rs);
+                let build_hash = build_hash(dir, rs.properties.build.as_ref());
                 rows.push(SandboxRow {
                     name: name.clone(),
                     source: rs.source(),
@@ -368,6 +374,7 @@ pub fn sandbox_rows(dir: &Path, config: &Config) -> (Vec<SandboxRow>, Vec<String
                     services,
                     extends,
                     config_hash: rs.config_hash,
+                    build_hash,
                     issues,
                 });
             }
@@ -380,6 +387,7 @@ pub fn sandbox_rows(dir: &Path, config: &Config) -> (Vec<SandboxRow>, Vec<String
                     services: Vec::new(),
                     extends,
                     config_hash: String::new(),
+                    build_hash: String::new(),
                     issues: Vec::new(),
                 });
             }
@@ -445,7 +453,7 @@ pub fn collect(dir: &Path) -> Snapshot {
     // Load config once; resolve every sandbox for the tree, services + drift
     // hash. `resolved` maps sandbox name → (services, hash) for the instance join.
     let config = Config::load(dir);
-    let mut resolved: BTreeMap<String, (Vec<String>, String)> = BTreeMap::new();
+    let mut resolved: BTreeMap<String, (Vec<String>, String, String)> = BTreeMap::new();
     let mut sandboxes: Vec<SandboxRow> = Vec::new();
     match &config {
         Ok(cfg) => {
@@ -456,7 +464,10 @@ pub fn collect(dir: &Path) -> Snapshot {
             // hash) are skipped to match the old resolved-only map: comparing a
             // container's hash label against "" would flag phantom drift.
             for row in rows.iter().filter(|r| !r.config_hash.is_empty()) {
-                resolved.insert(row.name.clone(), (row.services.clone(), row.config_hash.clone()));
+                resolved.insert(
+                    row.name.clone(),
+                    (row.services.clone(), row.config_hash.clone(), row.build_hash.clone()),
+                );
             }
             sandboxes = rows;
         }
@@ -472,7 +483,9 @@ pub fn collect(dir: &Path) -> Snapshot {
             None => (None, None),
         };
         let (services, drift) = match resolved.get(&inst.sandbox) {
-            Some((svcs, hash)) => (svcs.clone(), drifted(&inst.container, hash)),
+            Some((svcs, hash, build)) => {
+                (svcs.clone(), drifted(&inst.container, hash, build))
+            }
             None => (Vec::new(), false),
         };
 
@@ -552,14 +565,13 @@ pub fn collect(dir: &Path) -> Snapshot {
     }
 }
 
-/// True when the container's recorded config hash differs from the freshly
-/// resolved one (same rule as `commands::run::warn_on_drift`). A missing label
-/// or a failed inspect is treated as "no drift".
-fn drifted(container: &str, expected: &str) -> bool {
-    match backend().label(container, "devsandbox.config_hash") {
-        Ok(Some(hash)) => hash != expected,
-        _ => false,
-    }
+/// True when the container's recorded config *or* build hash differs from the
+/// freshly resolved one (the shared [`container_drifted`] rule, so dockerfile
+/// edits flag too). A missing label or a failed inspect is treated as "no
+/// drift" — the TUI stays lenient rather than surfacing an inspect error as
+/// phantom drift.
+fn drifted(container: &str, expected_config: &str, expected_build: &str) -> bool {
+    container_drifted(container, expected_config, expected_build).unwrap_or(false)
 }
 
 #[cfg(test)]
