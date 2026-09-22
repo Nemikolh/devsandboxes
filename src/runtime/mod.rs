@@ -214,6 +214,11 @@ pub trait Backend: Send + Sync {
 
     /// Whether `build --cache-from` is supported.
     fn supports_cache_from(&self) -> bool;
+
+    /// Whether a single host *file* (or socket) can be bind-mounted. Apple's
+    /// `container` only binds directories; callers that would mount a file must
+    /// mount its parent directory instead, or skip the mount.
+    fn supports_file_binds(&self) -> bool;
 }
 
 /// Pick a backend by name: `docker`, `podman` or `container`.

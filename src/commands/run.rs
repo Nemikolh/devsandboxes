@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
@@ -6,8 +6,8 @@ use anyhow::{bail, Context, Result};
 
 use super::{container_drifted, pick, services};
 use crate::config::{
-    build_hash, substitute, Config, FeatureOptions, LifecycleCommand, MountContext,
-    ResolvedSandbox, SandboxProperties, SimpleCommand, CONFIG_FILE,
+    build_hash, parse_shorthand, substitute, Config, FeatureOptions, LifecycleCommand,
+    MountContext, ResolvedMount, ResolvedSandbox, SandboxProperties, SimpleCommand, CONFIG_FILE,
 };
 use crate::features::{self, FeatureMetadata};
 use crate::runtime::{backend, ServiceEndpoint, NAME_PREFIX};
@@ -231,6 +231,10 @@ pub(crate) fn materialize(
     // `shell-rc`: host snippets mounted read-only, sourced by the rc files.
     let shell_rc = resolve_shell_rc(dir, &var_ctx, props)?;
     mounts.extend(shell_rc.iter().map(|(mount, _)| mount.clone()));
+    // Feature-declared mounts come last: any target claimed above (or the
+    // workspace itself) wins, so the config can override a feature's mount.
+    let feature = feature_mounts(props, &var_ctx, &mounts, &workspace)?;
+    mounts.extend(feature);
     run_container(
         dir,
         sandbox,
@@ -765,6 +769,103 @@ fn shell_rc_wiring(paths: &[&str], persist_history: bool) -> LifecycleCommand {
     }
     script.push_str("done\n");
     LifecycleCommand::Simple(SimpleCommand::Shell(script))
+}
+
+/// Resolve the mounts declared by the sandbox's enabled features (fetches hit
+/// the per-user cache also used by the image build) into `--mount` args. The
+/// sandbox always wins: a feature mount whose target is already claimed is
+/// dropped, so the config can replace e.g. docker-outside-of-docker's hardcoded
+/// `/var/run/docker.sock` source with a rootless socket path. Mounts the
+/// backend cannot apply, or whose bind source is missing on the host, are
+/// skipped with a warning — auto-creating the source (the config-mount
+/// behavior) would hand the container an empty stub instead of a clear signal.
+fn feature_mounts(
+    props: &SandboxProperties,
+    ctx: &MountContext,
+    existing: &[String],
+    workspace: &str,
+) -> Result<Vec<String>> {
+    let Some(features) = &props.features else {
+        return Ok(Vec::new());
+    };
+    let mut taken: BTreeSet<String> = existing
+        .iter()
+        .filter_map(|arg| parse_shorthand(arg).ok().map(|(_, _, target, _)| target))
+        .collect();
+    taken.insert(workspace.to_string());
+    let mut out = Vec::new();
+    for (reference, opts) in features {
+        if feature_option_values(opts)
+            .with_context(|| format!("feature `{reference}`: invalid options"))?
+            .is_none()
+        {
+            continue; // `= false`: disabled.
+        }
+        let parsed = features::FeatureRef::parse(reference)?;
+        let feature =
+            features::fetch(&parsed).with_context(|| format!("fetching feature `{reference}`"))?;
+        for mount in &feature.metadata.mounts {
+            let resolved = mount.resolve(ctx)?;
+            let probe = |source: &str| std::fs::metadata(source).ok().map(|m| !m.is_dir());
+            match feature_mount_decision(
+                &resolved,
+                &taken,
+                backend().supports_file_binds(),
+                probe,
+            ) {
+                MountDecision::Apply => {
+                    taken.insert(resolved.target.clone());
+                    out.push(resolved.to_arg());
+                }
+                MountDecision::Overridden => {}
+                MountDecision::Skip(reason) => {
+                    eprintln!("warning: feature `{reference}`: {reason}");
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Outcome for one feature-declared mount.
+#[derive(Debug, PartialEq)]
+enum MountDecision {
+    Apply,
+    /// Target already claimed by the sandbox (config wins, silently).
+    Overridden,
+    /// Not applicable here; skipped with a printed warning.
+    Skip(String),
+}
+
+/// Pure applicability check for a feature mount: `taken` holds the targets
+/// already mounted, `file_binds` whether the backend can bind single files, and
+/// `source_probe` reports a bind source as `Some(is_file_like)` (`!is_dir`, so
+/// sockets count as files) or `None` when it does not exist on the host.
+fn feature_mount_decision(
+    mount: &ResolvedMount,
+    taken: &BTreeSet<String>,
+    file_binds: bool,
+    source_probe: impl Fn(&str) -> Option<bool>,
+) -> MountDecision {
+    if taken.contains(&mount.target) {
+        return MountDecision::Overridden;
+    }
+    if mount.kind != "bind" {
+        return MountDecision::Apply;
+    }
+    // `Mount::resolve` already rejects sourceless bind mounts.
+    let Some(source) = &mount.source else {
+        return MountDecision::Skip(format!("bind mount to `{}` has no source", mount.target));
+    };
+    match source_probe(source) {
+        None => MountDecision::Skip(format!(
+            "mount source `{source}` does not exist on the host; skipping"
+        )),
+        Some(true) if !file_binds => MountDecision::Skip(format!(
+            "cannot bind file `{source}` on this runtime; skipping"
+        )),
+        _ => MountDecision::Apply,
+    }
 }
 
 /// Create a missing bind-mount source. A final path component containing a dot
@@ -1487,6 +1588,59 @@ mod tests {
         ));
         assert!(script.contains("grep -qsF '/devsandbox/rc/1/b.sh'"));
         assert!(!script.contains("HISTFILE"));
+    }
+
+    fn feature_mount(kind: &str, source: Option<&str>, target: &str) -> ResolvedMount {
+        ResolvedMount {
+            kind: kind.into(),
+            source: source.map(Into::into),
+            target: target.into(),
+            readonly: false,
+        }
+    }
+
+    #[test]
+    fn feature_mount_decision_config_target_wins_silently() {
+        let taken = BTreeSet::from(["/var/run/docker-host.sock".to_string()]);
+        let m = feature_mount("bind", Some("/var/run/docker.sock"), "/var/run/docker-host.sock");
+        assert_eq!(
+            feature_mount_decision(&m, &taken, true, |_| Some(true)),
+            MountDecision::Overridden
+        );
+    }
+
+    #[test]
+    fn feature_mount_decision_missing_source_warns() {
+        let m = feature_mount("bind", Some("/var/run/docker.sock"), "/var/run/docker-host.sock");
+        match feature_mount_decision(&m, &BTreeSet::new(), true, |_| None) {
+            MountDecision::Skip(reason) => assert!(reason.contains("does not exist"), "{reason}"),
+            other => panic!("expected Skip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn feature_mount_decision_file_bind_unsupported_warns() {
+        // Apple `container` cannot bind single files (sockets included).
+        let m = feature_mount("bind", Some("/var/run/docker.sock"), "/var/run/docker-host.sock");
+        match feature_mount_decision(&m, &BTreeSet::new(), false, |_| Some(true)) {
+            MountDecision::Skip(reason) => assert!(reason.contains("cannot bind file"), "{reason}"),
+            other => panic!("expected Skip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn feature_mount_decision_applies_dirs_and_volumes() {
+        let dir = feature_mount("bind", Some("/opt/data"), "/data");
+        assert_eq!(
+            feature_mount_decision(&dir, &BTreeSet::new(), false, |_| Some(false)),
+            MountDecision::Apply
+        );
+        // Non-bind mounts have no host source to probe.
+        let vol = feature_mount("volume", Some("dind-var-lib-docker"), "/var/lib/docker");
+        assert_eq!(
+            feature_mount_decision(&vol, &BTreeSet::new(), false, |_| None),
+            MountDecision::Apply
+        );
     }
 
     #[test]

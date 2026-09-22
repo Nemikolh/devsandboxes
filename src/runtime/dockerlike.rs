@@ -129,6 +129,10 @@ impl Backend for Dockerlike {
     fn supports_cache_from(&self) -> bool {
         true
     }
+
+    fn supports_file_binds(&self) -> bool {
+        true
+    }
 }
 
 /// A string, or a list of strings (podman emits `Names` as an array).

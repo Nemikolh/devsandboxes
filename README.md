@@ -148,7 +148,7 @@ devsandbox extras on a sandbox:
 
 Mount sources support devcontainer-style variables: `${configDir}`, `${localWorkspaceFolder}`, `${localWorkspaceFolderBasename}`, `${localEnv:VAR}`, plus devsandbox's `${sharedVolumes}` (the config root's persistent-state dir) and `${instance}` (the running instance name).
 
-`features` are fetched natively as OCI artifacts (via `curl`, no registry crates), cached per user, ordered by `installsAfter`, and baked into a derived image at `run`.
+`features` are fetched natively as OCI artifacts (via `curl`, no registry crates), cached per user, ordered by `installsAfter`, and baked into a derived image at `run`. Feature-declared `mounts` are applied too; a sandbox mount with the same target overrides the feature's, and a mount the host or runtime can't satisfy (missing bind source, file bind on Apple `container`) is skipped with a warning.
 
 ## Container runtimes
 

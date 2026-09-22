@@ -256,11 +256,11 @@ impl ResolvedMount {
     }
 }
 
-type MountParts = (Option<String>, Option<String>, String, bool);
+pub(crate) type MountParts = (Option<String>, Option<String>, String, bool);
 
 /// Parse a docker `--mount` shorthand (`key=value,…`) into
 /// (type, source, target, readonly).
-fn parse_shorthand(spec: &str) -> Result<MountParts> {
+pub(crate) fn parse_shorthand(spec: &str) -> Result<MountParts> {
     let (mut kind, mut source, mut target, mut readonly) = (None, None, None, false);
     for part in spec.split(',') {
         let part = part.trim();

@@ -269,6 +269,10 @@ impl Backend for AppleContainer {
     fn supports_cache_from(&self) -> bool {
         false
     }
+
+    fn supports_file_binds(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

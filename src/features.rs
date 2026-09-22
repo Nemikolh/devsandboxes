@@ -15,6 +15,8 @@ use std::process::Command;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 
+use crate::config::Mount;
+
 /// The layer mediaType carrying a feature's tarball.
 const FEATURE_LAYER_MEDIA_TYPE: &str = "application/vnd.devcontainers.layer.v1+tar";
 /// The manifest mediaType we request.
@@ -159,6 +161,11 @@ pub struct FeatureMetadata {
     pub installs_after: Vec<String>,
     #[serde(default)]
     pub entrypoint: Option<String>,
+    /// Mounts the feature asks the container to carry (e.g.
+    /// docker-outside-of-docker's host socket bind). Applied at `run`, where a
+    /// sandbox mount with the same target takes precedence.
+    #[serde(default)]
+    pub mounts: Vec<Mount>,
     #[serde(default, rename = "documentationURL")]
     pub documentation_url: Option<String>,
 }
@@ -807,6 +814,30 @@ mod tests {
             vec!["ghcr.io/devcontainers/features/common-utils".to_string()]
         );
         assert_eq!(md.entrypoint.as_deref(), Some("/usr/local/share/go-init.sh"));
+    }
+
+    #[test]
+    fn metadata_parses_mounts() {
+        // Object form as shipped by docker-outside-of-docker.
+        let json = r#"{
+            "id": "docker-outside-of-docker",
+            "mounts": [
+                {"source": "/var/run/docker.sock", "target": "/var/run/docker-host.sock", "type": "bind"}
+            ]
+        }"#;
+        let md = FeatureMetadata::parse(json).unwrap();
+        assert_eq!(md.mounts.len(), 1);
+        let ctx = crate::config::MountContext {
+            config_dir: "/cfg",
+            workspace_folder: "/w",
+            workspace_folder_basename: "w",
+            shared_volumes: "/cfg/shared-volumes",
+            instance: "i",
+        };
+        let resolved = md.mounts[0].resolve(&ctx).unwrap();
+        assert_eq!(resolved.kind, "bind");
+        assert_eq!(resolved.source.as_deref(), Some("/var/run/docker.sock"));
+        assert_eq!(resolved.target, "/var/run/docker-host.sock");
     }
 
     #[test]
