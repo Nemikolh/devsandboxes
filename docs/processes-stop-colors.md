@@ -1,6 +1,6 @@
 # Plan: process layer, stop command, color refresh
 
-Repo: `devsandbox`. Builds on the dashboard in `src/tui/` (see docs/plan-tui.md:
+Repo: `devsandbox`. Builds on the dashboard in `src/tui/` (see docs/tui.md:
 sandbox tree on the Instances tab, background `Snapshot` collection every 2s,
 `:` prompt with `run/exec/code/rm`, config/logs/help modals).
 

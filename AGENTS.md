@@ -32,6 +32,8 @@ git worktrees so working trees are never shared.
 
 ## Conventions & checks
 
+- Docs in `docs/` are named after their topic, no `plan-` prefix or `-plan`
+  suffix (e.g. `docs/rebuild.md`, not `docs/plan-rebuild.md`).
 - Doc comments explain *why*; keep them current when moving logic.
 - Tests live in `#[cfg(test)]` modules per file; most logic is factored to be
   testable without a container runtime.
