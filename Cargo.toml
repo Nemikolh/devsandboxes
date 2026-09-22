@@ -2,6 +2,9 @@
 name = "devsandbox"
 version = "0.2.0"
 edition = "2024"
+description = "Manage devcontainer-style sandboxes on docker, podman, or Apple container — many throwaway instances per repo from one TOML config."
+license = "MIT"
+exclude = ["docs/"]
 
 [dependencies]
 anyhow = "1.0.104"
