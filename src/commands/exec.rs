@@ -90,6 +90,7 @@ mod tests {
     fn instance() -> Instance {
         Instance {
             sandbox: "repository-1".into(),
+            instance_id: "repo-abc1".into(),
             project: "abc12345".into(),
             container: "devsandbox-repo-abc1".into(),
             folder: PathBuf::from("/home/u/repository-1"),

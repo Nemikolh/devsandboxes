@@ -21,8 +21,9 @@ use crate::runtime::{backend, NAME_PREFIX};
 use crate::state::State;
 
 /// Resolve a user-supplied `name` to a single instance key. `name` may be an
-/// instance name, a sandbox config name, or a repository (folder basename);
-/// every instance it could refer to is collected. Zero matches or (on a
+/// instance name, its persistent id (they diverge after a rename — the id is
+/// what container/mount names show), a sandbox config name, or a repository
+/// (folder basename); every instance it could refer to is collected. Zero matches or (on a
 /// non-TTY) an ambiguous match bail; a TTY prompts interactively. Shared by
 /// `rm` and `stop`.
 pub(crate) fn resolve_instance(state: &State, name: &str) -> Result<String> {
@@ -35,6 +36,7 @@ fn resolve_instance_with(state: &State, name: &str, interactive: bool) -> Result
         .iter()
         .filter(|(instance, info)| {
             *instance == name
+                || info.instance_id == name
                 || info.sandbox == name
                 || info.folder.file_name().is_some_and(|f| f == name)
         })
@@ -197,6 +199,7 @@ mod tests {
         let mut state = State::default();
         let mk = |sandbox: &str, folder: &str| Instance {
             sandbox: sandbox.to_string(),
+            instance_id: String::new(),
             project: "proj".into(),
             container: "devsandbox-x".into(),
             folder: folder.into(),
@@ -229,6 +232,7 @@ mod tests {
             "api-cccc".into(),
             Instance {
                 sandbox: "api".into(),
+                instance_id: "api-cccc".into(),
                 project: "proj".into(),
                 container: "devsandbox-x".into(),
                 folder: "/home/u/api".into(),
@@ -251,6 +255,17 @@ mod tests {
         // Unique folder basename resolves to the single owning instance.
         let s = state();
         assert_eq!(resolve_instance(&s, "site").unwrap(), "web-aaaa");
+    }
+
+    #[test]
+    fn matches_persistent_id_after_rename() {
+        // Renamed instance: key `new-name`, id `web-aaaa` — the id (what the
+        // container name shows) still resolves to the entry.
+        let mut s = State::default();
+        let mut info = state().instances.remove("web-aaaa").unwrap();
+        info.instance_id = "web-aaaa".into();
+        s.instances.insert("new-name".into(), info);
+        assert_eq!(resolve_instance(&s, "web-aaaa").unwrap(), "new-name");
     }
 
     #[test]

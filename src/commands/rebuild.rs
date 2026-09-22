@@ -8,8 +8,9 @@ use crate::runtime::backend;
 use crate::state::{Instance, State};
 
 /// Recreate an instance's container from the *current* config, preserving the
-/// worktree, branch, instance name, and per-instance state (shell history,
-/// `${instance}`-anchored mounts). No config drift is a no-op with a message.
+/// worktree, branch, instance identity (name *and* persistent id, so shell
+/// history and `${instance}`-anchored mounts stay put even after a rename).
+/// No config drift is a no-op with a message.
 /// `--all` rebuilds every drifted instance, skipping (with a note) ones that
 /// don't resolve here instead of aborting the batch.
 ///
@@ -89,6 +90,7 @@ fn rebuild_instance(
     // folder), `base_folder` the canonicalized base.
     let info = state.instances.get(key).expect("key came from state");
     let sandbox_name = info.sandbox.clone();
+    let instance_id = info.instance_id.clone();
     let container = info.container.clone();
     let source = info.folder.clone();
     let base_folder = info.base_folder.clone();
@@ -107,6 +109,7 @@ fn rebuild_instance(
         &sandbox_name,
         sandbox,
         key,
+        &instance_id,
         &source,
         &base_folder,
         worktree,
@@ -150,6 +153,7 @@ mod tests {
     fn instance(project: &str) -> Instance {
         Instance {
             sandbox: "web".into(),
+            instance_id: "web".into(),
             project: project.into(),
             container: "devsandbox-web".into(),
             folder: "/home/u/site".into(),

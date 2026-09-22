@@ -32,7 +32,9 @@ folders = { "/workspaces/.devsandboxes" = "../.devsandboxes" }
 Substituted in `mounts`, cache sources, and `workspaceFolder`:
 
 - `${sharedVolumes}` → `<configDir>/shared-volumes`
-- `${instance}` → the instance name being run (`web`, `web-2`, …)
+- `${instance}` → the instance's persistent id (`web`, `web-2`, …): its name at
+  creation, kept unique across renames (a new instance reusing a freed name gets
+  `name-1`), so these paths never move once created
 
 Used to persist zidane sessions per instance, with the host-shared binary and
 credentials layered on top (docker/podman sort mounts by target, so nested

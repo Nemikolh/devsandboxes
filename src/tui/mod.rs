@@ -450,7 +450,7 @@ fn spawn_stop(instance: &str) -> Receiver<OpDone> {
             Ok(state) => match state.instances.get(&instance) {
                 Some(info) => {
                     let services =
-                        commands::stop::service_containers(&info.project, &instance);
+                        commands::stop::service_containers(&info.project, &info.instance_id);
                     commands::stop::stop_containers(&info.container, &services, true);
                     format!("stopped {instance}")
                 }
@@ -477,7 +477,7 @@ fn spawn_start(instance: &str) -> Receiver<OpDone> {
             Ok(state) => match state.instances.get(&instance) {
                 Some(info) => {
                     let services =
-                        commands::stop::service_containers(&info.project, &instance);
+                        commands::stop::service_containers(&info.project, &info.instance_id);
                     commands::start::start_containers(&info.container, &services, true);
                     format!("started {instance}")
                 }

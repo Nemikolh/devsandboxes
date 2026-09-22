@@ -51,13 +51,15 @@ pub fn ensure_network(network: &str) -> Result<()> {
 
 /// Ensure the networks exist and every service the sandbox declares is up:
 /// `global` services on the shared network, `isolated` ones on a per-instance
-/// network. Returns the networks the instance container must join and the
-/// endpoints it must be able to resolve by service name.
+/// network. `instance_id` (the persistent id, not the display name) names and
+/// labels the isolated containers/network so they survive renames. Returns the
+/// networks the instance container must join and the endpoints it must be able
+/// to resolve by service name.
 pub fn ensure_services(
     config: &Config,
     dir: &Path,
     project: &str,
-    instance: &str,
+    instance_id: &str,
     service_names: &[String],
 ) -> Result<(Vec<String>, Vec<ServiceEndpoint>)> {
     let mut endpoints = Vec::with_capacity(service_names.len());
@@ -65,7 +67,7 @@ pub fn ensure_services(
         return Ok((Vec::new(), endpoints));
     }
     let global_net = network_name(project);
-    let instance_net = instance_network(project, instance);
+    let instance_net = instance_network(project, instance_id);
     let (mut used_global, mut used_isolated) = (false, false);
 
     for name in service_names {
@@ -95,11 +97,11 @@ pub fn ensure_services(
                     ensure_network(&instance_net)?;
                     used_isolated = true;
                 }
-                let container = isolated_service_container(project, instance, name);
+                let container = isolated_service_container(project, instance_id, name);
                 let labels = [
                     format!("devsandbox.service={name}"),
                     format!("devsandbox.project={project}"),
-                    format!("devsandbox.instance={instance}"),
+                    format!("devsandbox.instance={instance_id}"),
                     "devsandbox.scope=isolated".to_string(),
                     format!("devsandbox.config_hash={}", service.config_hash),
                     format!(
@@ -301,10 +303,14 @@ fn check_port_conflicts(container: &str, ports: &[String]) -> Result<()> {
 /// `rebuild` derive references the same way and it stays unit-testable without a
 /// runtime. `running` is the set of instance keys whose container is up.
 ///
+/// Isolated refs and live instances are keyed by the *persistent id*, not the
+/// state key: service containers, labels, and networks all carry the id, so a
+/// renamed instance still owns its services.
+///
 /// - `global_refs`: global service names any running instance references (one
 ///   shared container regardless of how many reference it).
-/// - `isolated_refs`: per-instance isolated service names.
-/// - `live_instances`: running instance keys belonging to this config root.
+/// - `isolated_refs`: isolated service names per running instance id.
+/// - `live_instances`: ids of running instances belonging to this config root.
 fn service_refs(config: &Config, state: &State, running: &BTreeSet<String>) -> ServiceRefs {
     let mut refs = ServiceRefs::default();
     for (name, instance) in &state.instances {
@@ -314,7 +320,7 @@ fn service_refs(config: &Config, state: &State, running: &BTreeSet<String>) -> S
         if !running.contains(name) {
             continue;
         }
-        refs.live_instances.insert(name.clone());
+        refs.live_instances.insert(instance.instance_id.clone());
         let Ok(sandbox) = config.resolve_sandbox(&instance.sandbox) else {
             continue;
         };
@@ -327,7 +333,10 @@ fn service_refs(config: &Config, state: &State, running: &BTreeSet<String>) -> S
                     refs.global.insert(service.clone());
                 }
                 Ok(ServiceScope::Isolated) => {
-                    refs.isolated.entry(name.clone()).or_default().insert(service.clone());
+                    refs.isolated
+                        .entry(instance.instance_id.clone())
+                        .or_default()
+                        .insert(service.clone());
                 }
                 Err(_) => {}
             }
@@ -341,9 +350,9 @@ fn service_refs(config: &Config, state: &State, running: &BTreeSet<String>) -> S
 struct ServiceRefs {
     /// Global service names referenced by any running instance.
     global: BTreeSet<String>,
-    /// Isolated service names per running instance key.
+    /// Isolated service names per running instance id.
     isolated: BTreeMap<String, BTreeSet<String>>,
-    /// Running instance keys belonging to this config root.
+    /// Persistent ids of running instances belonging to this config root.
     live_instances: BTreeSet<String>,
 }
 
@@ -464,22 +473,27 @@ pub fn rebuild(dir: &Path, name: &str) -> Result<()> {
     let names = [name.to_string()];
     let mut recreated = 0;
 
-    for instance in &refs.live_instances {
+    // Iterate state (not `live_instances`) so both the display key (messages)
+    // and the persistent id (service names/labels) are at hand.
+    for (key, inst) in &state.instances {
+        if !refs.live_instances.contains(&inst.instance_id) {
+            continue;
+        }
         let referenced = match service.spec.scope {
             ServiceScope::Global => refs.global.contains(name),
             ServiceScope::Isolated => {
-                refs.isolated.get(instance).is_some_and(|s| s.contains(name))
+                refs.isolated.get(&inst.instance_id).is_some_and(|s| s.contains(name))
             }
         };
         if !referenced {
             continue;
         }
-        let container = &state.instances[instance].container;
-        let (_, endpoints) = ensure_services(&config, dir, &project, instance, &names)?;
+        let container = &inst.container;
+        let (_, endpoints) = ensure_services(&config, dir, &project, &inst.instance_id, &names)?;
         backend()
             .wire_service_dns(container, &endpoints)
-            .with_context(|| format!("rewiring service `{name}` into `{instance}` failed"))?;
-        println!("recreated {container} (wired into {instance})");
+            .with_context(|| format!("rewiring service `{name}` into `{key}` failed"))?;
+        println!("recreated {container} (wired into {key})");
         recreated += 1;
     }
 
@@ -535,7 +549,7 @@ pub fn ls(dir: &Path, json: bool) -> Result<()> {
     // sandbox resolves in this config, paired with that sandbox's service list.
     // Same config-root filter as `service_refs`.
     let state = State::load()?;
-    let instance_services: Vec<(String, Vec<String>)> = state
+    let instance_services: Vec<(String, String, Vec<String>)> = state
         .instances
         .iter()
         .filter(|(_, inst)| config.sandboxes.contains_key(&inst.sandbox))
@@ -545,7 +559,7 @@ pub fn ls(dir: &Path, json: bool) -> Result<()> {
                 .ok()
                 .and_then(|sb| sb.properties.services.clone())
                 .unwrap_or_default();
-            (name.clone(), services)
+            (name.clone(), inst.instance_id.clone(), services)
         })
         .collect();
 
@@ -691,12 +705,13 @@ fn ls_format_row(colored: &[String; 6], plain: &[String; 6], widths: &[usize; 6]
     out
 }
 
-/// Delete `shared-volumes/history/<instance>/` dirs (and legacy flat
-/// `<instance>.zsh_history` files from the pre-directory layout) whose instance
-/// is gone from state (any config root: instance names are global, so a match
-/// anywhere means the entry is still owned). Kept on `rm` so history survives
-/// rebuilds; this is the explicit reaping path. Confirmed per entry unless
-/// `force`.
+/// Delete `shared-volumes/history/<instance_id>/` dirs (and legacy flat
+/// `<instance_id>.zsh_history` files from the pre-directory layout) whose id no
+/// instance in state holds (any config root: ids are global, so a match
+/// anywhere means the entry is still owned). Matched on the persistent id, not
+/// the key, so a renamed instance keeps its history. Kept on `rm` so history
+/// survives rebuilds; this is the explicit reaping path. Confirmed per entry
+/// unless `force`.
 fn gc_shell_history(dir: &Path, state: &State, force: bool) -> Result<()> {
     let history_dir = dir.join("shared-volumes").join("history");
     let Ok(entries) = std::fs::read_dir(&history_dir) else {
@@ -716,7 +731,7 @@ fn gc_shell_history(dir: &Path, state: &State, force: bool) -> Result<()> {
                 None => continue,
             }
         };
-        if state.instances.contains_key(instance) {
+        if state.instances.values().any(|i| i.instance_id == instance) {
             continue;
         }
         if !force && !super::confirm(&format!("delete shell history `{}`?", path.display()))? {
@@ -846,11 +861,12 @@ ports = ["5432:5432"]
         assert_eq!(host_port("80"), None);
     }
 
-    fn instance(sandbox: &str) -> crate::state::Instance {
+    fn instance(sandbox: &str, id: &str) -> crate::state::Instance {
         crate::state::Instance {
             sandbox: sandbox.into(),
+            instance_id: id.into(),
             project: String::new(),
-            container: format!("devsandbox-{sandbox}"),
+            container: format!("devsandbox-{id}"),
             folder: Default::default(),
             base_folder: Default::default(),
             worktree: None,
@@ -885,10 +901,10 @@ image = "node"
 
     fn refs_state() -> State {
         let mut state = State::default();
-        state.instances.insert("app-1".into(), instance("app"));
-        state.instances.insert("app-2".into(), instance("app"));
-        state.instances.insert("plain-1".into(), instance("plain"));
-        state.instances.insert("foreign".into(), instance("elsewhere"));
+        state.instances.insert("app-1".into(), instance("app", "app-1"));
+        state.instances.insert("app-2".into(), instance("app", "app-2"));
+        state.instances.insert("plain-1".into(), instance("plain", "plain-1"));
+        state.instances.insert("foreign".into(), instance("elsewhere", "foreign"));
         state
     }
 
@@ -936,5 +952,22 @@ image = "node"
         assert!(refs.isolated.is_empty());
         // plain-1 is live (this config root); foreign is not counted at all.
         assert_eq!(refs.live_instances, BTreeSet::from(["plain-1".to_string()]));
+    }
+
+    #[test]
+    fn service_refs_key_by_persistent_id_not_state_key() {
+        // A renamed instance: state key `app-renamed`, id still `app-1`. Refs
+        // must carry the id — service containers/labels/networks are named by
+        // it — so gc keeps the right containers and reaps the right network.
+        let config = Config::parse(REFS_CONFIG).unwrap();
+        let mut state = State::default();
+        state.instances.insert("app-renamed".into(), instance("app", "app-1"));
+        let running: BTreeSet<String> = ["app-renamed"].iter().map(|s| s.to_string()).collect();
+
+        let refs = service_refs(&config, &state, &running);
+
+        assert_eq!(refs.isolated["app-1"], BTreeSet::from(["db".to_string()]));
+        assert!(!refs.isolated.contains_key("app-renamed"));
+        assert_eq!(refs.live_instances, BTreeSet::from(["app-1".to_string()]));
     }
 }

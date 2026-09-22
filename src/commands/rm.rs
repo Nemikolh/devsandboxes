@@ -12,6 +12,7 @@ pub fn rm(name: &str) -> Result<()> {
     let key = resolve_instance(&state, name)?;
 
     let info = state.instances.get(&key).expect("key came from state");
+    let instance_id = info.instance_id.clone();
     let container = info.container.clone();
     let worktree = info.worktree.clone();
     let branch = info.branch.clone();
@@ -24,13 +25,15 @@ pub fn rm(name: &str) -> Result<()> {
     // The managed shell-history dir is deliberately kept: `run` re-provisions
     // the same per-instance path, so history survives an rm + run rebuild.
 
-    // Reap this instance's isolated services and its per-instance network. Global
-    // services are shared and left to `gc`. Empty `project` = pre-upgrade state.
+    // Reap this instance's isolated services and its per-instance network,
+    // addressed by the persistent id (their names/labels carry the id, not the
+    // possibly-renamed key). Global services are shared and left to `gc`.
+    // Empty `project` = pre-upgrade state.
     if !project.is_empty() {
-        for svc in super::stop::service_containers(&project, &key) {
+        for svc in super::stop::service_containers(&project, &instance_id) {
             let _ = backend().remove_force(&svc);
         }
-        let network = crate::commands::services::instance_network(&project, &key);
+        let network = crate::commands::services::instance_network(&project, &instance_id);
         if backend().network_exists(&network).unwrap_or(false) {
             let _ = backend().run_inherit(&["network", "rm", &network]);
         }

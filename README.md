@@ -146,7 +146,7 @@ devsandbox extras on a sandbox:
 | `shell-rc`              | Host shell snippets (e.g. `["${configDir}/shell/aliases.sh"]`) mounted read-only and sourced by `~/.zshrc` and `~/.bashrc` in the container; concatenates under `extends` |
 | `worktree-branch`       | Branch created for a worktree instance (supports `${instance}`); defaults to `sandbox/${instance}`; `run --branch` overrides it |
 
-Mount sources support devcontainer-style variables: `${configDir}`, `${localWorkspaceFolder}`, `${localWorkspaceFolderBasename}`, `${localEnv:VAR}`, plus devsandbox's `${sharedVolumes}` (the config root's persistent-state dir) and `${instance}` (the running instance name).
+Mount sources support devcontainer-style variables: `${configDir}`, `${localWorkspaceFolder}`, `${localWorkspaceFolderBasename}`, `${localEnv:VAR}`, plus devsandbox's `${sharedVolumes}` (the config root's persistent-state dir) and `${instance}` (the instance's persistent id: its name at creation, kept unique and unchanged by `rename`, so `${instance}`-anchored host paths never move).
 
 `features` are fetched natively as OCI artifacts (via `curl`, no registry crates), cached per user, ordered by `installsAfter`, and baked into a derived image at `run`. Feature-declared `mounts` are applied too; a sandbox mount with the same target overrides the feature's, and a mount the host or runtime can't satisfy (missing bind source, file bind on Apple `container`) is skipped with a warning.
 

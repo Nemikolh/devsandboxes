@@ -13,11 +13,12 @@ pub fn rename(name: &str, new_name: &str) -> Result<()> {
 }
 
 /// Silent core shared with the TUI, which runs it in place on the alternate
-/// screen — so it must never touch stdout/stderr or prompt on stdin. The
-/// container keeps its old `devsandbox-<old>` name — nothing is renamed in the
-/// runtime; all ops go through the stored `container` field, and a later
-/// `rebuild` re-derives the container from the (new) key. Returns the trimmed
-/// new name.
+/// screen — so it must never touch stdout/stderr or prompt on stdin. Purely
+/// cosmetic: only the state key moves. `instance_id` — and with it the
+/// container name, `${instance}`-anchored mounts, worktree, shell history, and
+/// isolated services, on this run *and* every later `rebuild` — stays what it
+/// was at creation; all ops go through the stored `container` field. Returns
+/// the trimmed new name.
 pub fn rename_exact(name: &str, new_name: &str) -> Result<String> {
     let mut state = State::load()?;
     if !state.instances.contains_key(name) {
@@ -60,6 +61,7 @@ mod tests {
             name.into(),
             Instance {
                 sandbox: "web".into(),
+                instance_id: name.into(),
                 project: "abc12345".into(),
                 container: format!("devsandbox-{name}"),
                 folder: "/home/u/web".into(),
@@ -82,8 +84,10 @@ mod tests {
         insert(&mut state, "old");
         assert_eq!(rename_in_state(&mut state, "old", " new ").unwrap(), "new");
         assert!(!state.instances.contains_key("old"));
-        // Container name is deliberately preserved.
+        // Container name and persistent id are deliberately preserved: every
+        // runtime/host name derives from the id, so a rename moves nothing.
         assert_eq!(state.instances["new"].container, "devsandbox-old");
+        assert_eq!(state.instances["new"].instance_id, "old");
     }
 
     #[test]

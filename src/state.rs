@@ -10,6 +10,14 @@ use serde::{Deserialize, Serialize};
 pub struct Instance {
     /// Sandbox config name from config.toml.
     pub sandbox: String,
+    /// Persistent identity: the instance's name at creation, unique across all
+    /// instances and never changed by `rename` (which only moves the state
+    /// key). Everything host- or runtime-addressed keys off this — `${instance}`
+    /// in mounts/branches, the container name, isolated services/networks,
+    /// managed shell history — so a rename never moves per-instance state.
+    /// Backfilled to the state key by [`State::load`] for pre-upgrade entries.
+    #[serde(default)]
+    pub instance_id: String,
     /// Config-root id (see `services::project_id`); scopes this instance's
     /// isolated services and networks so `rm` can find them without the dir.
     #[serde(default)]
@@ -82,8 +90,19 @@ impl State {
     pub fn load() -> Result<Self> {
         let path = Self::path()?;
         match std::fs::read_to_string(&path) {
-            Ok(contents) => toml::from_str(&contents)
-                .with_context(|| format!("invalid state file {}", path.display())),
+            Ok(contents) => {
+                let mut state: Self = toml::from_str(&contents)
+                    .with_context(|| format!("invalid state file {}", path.display()))?;
+                // Pre-upgrade entries carry no id; the key is the best available
+                // identity (equal to the creation name unless the instance was
+                // renamed before ids existed).
+                for (key, instance) in &mut state.instances {
+                    if instance.instance_id.is_empty() {
+                        instance.instance_id = key.clone();
+                    }
+                }
+                Ok(state)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e).with_context(|| format!("cannot read {}", path.display())),
         }
@@ -111,6 +130,7 @@ mod tests {
             "repo-abc1".into(),
             Instance {
                 sandbox: "repository-1".into(),
+                instance_id: "repo-abc1".into(),
                 project: "abc12345".into(),
                 container: "devsandbox-repo-abc1".into(),
                 folder: "/home/u/repository-1".into(),
@@ -128,5 +148,25 @@ mod tests {
         let text = toml::to_string_pretty(&state).unwrap();
         let back: State = toml::from_str(&text).unwrap();
         assert_eq!(back.instances["repo-abc1"].sandbox, "repository-1");
+        assert_eq!(back.instances["repo-abc1"].instance_id, "repo-abc1");
+    }
+
+    #[test]
+    fn missing_instance_id_deserializes_empty() {
+        // Pre-upgrade state files have no `instance_id`; serde defaults it to
+        // empty and `load()` backfills it from the key (exercised there, not
+        // here, since `load()` reads the real state path).
+        let state: State = toml::from_str(
+            r#"
+            [instance.repo]
+            sandbox = "web"
+            container = "devsandbox-repo"
+            folder = "/home/u/web"
+            workspace = "/workspaces/web"
+            created_unix = 0
+            "#,
+        )
+        .unwrap();
+        assert_eq!(state.instances["repo"].instance_id, "");
     }
 }

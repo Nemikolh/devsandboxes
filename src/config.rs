@@ -199,8 +199,10 @@ pub struct MountContext<'a> {
     /// `<configDir>/shared-volumes` (`${sharedVolumes}`), the host-backed
     /// persistent-state root.
     pub shared_volumes: &'a str,
-    /// Name of the instance being run (`${instance}`), e.g. `web` / `web-2` —
-    /// anchors per-instance state under `${sharedVolumes}`.
+    /// Persistent id of the instance being run (`${instance}`), e.g. `web` /
+    /// `web-2` — anchors per-instance state under `${sharedVolumes}`. This is
+    /// `Instance::instance_id` (the name at creation, unique forever), not the
+    /// current display name, so renames never move `${instance}`-anchored paths.
     pub instance: &'a str,
 }
 

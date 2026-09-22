@@ -195,13 +195,14 @@ fn service_source(spec: &crate::config::Service) -> String {
 /// `instance_services` pairing are passed in so `collect` and `commands::services::ls`
 /// build the Services view identically and cannot drift. `dir` is the config
 /// root, used to hash each service's dockerfile for drift. `project` scopes
-/// container names; `instance_services` pairs every relevant instance name with
-/// the service list of its resolved sandbox.
+/// container names; `instance_services` is `(display name, persistent id,
+/// services of the resolved sandbox)` per relevant instance — container names
+/// join on the id, `used_by` shows the name.
 pub fn service_rows(
     dir: &Path,
     project: &str,
     config: &Config,
-    instance_services: &[(String, Vec<String>)],
+    instance_services: &[(String, String, Vec<String>)],
     ps: &[ContainerRow],
 ) -> (Vec<ServiceRow>, Vec<String>) {
     let mut errors = Vec::new();
@@ -232,22 +233,24 @@ pub fn service_rows(
 
 /// Join config services against docker state. Pure: all docker/config I/O is
 /// done by the caller and passed in. `project` scopes container names;
-/// `instance_services` pairs every live instance name with the service list of
-/// its resolved sandbox.
+/// `instance_services` is `(display name, persistent id, services)` per live
+/// instance — isolated container names derive from the id (they survive
+/// renames), while `used_by` reports the display name.
 fn build_service_rows(
     project: &str,
     services: &[ServiceInput],
-    instance_services: &[(String, Vec<String>)],
+    instance_services: &[(String, String, Vec<String>)],
     ps: &[ContainerRow],
 ) -> Vec<ServiceRow> {
     services
         .iter()
         .map(|svc| {
-            let used_by: Vec<String> = instance_services
+            let users: Vec<(&str, &str)> = instance_services
                 .iter()
-                .filter(|(_, list)| list.iter().any(|s| s == &svc.name))
-                .map(|(inst, _)| inst.clone())
+                .filter(|(_, _, list)| list.iter().any(|s| s == &svc.name))
+                .map(|(name, id, _)| (name.as_str(), id.as_str()))
                 .collect();
+            let used_by: Vec<String> = users.iter().map(|(name, _)| name.to_string()).collect();
 
             let (scope, source, ports, env_len, command, config_hash, build_hash) =
                 match &svc.resolved {
@@ -277,10 +280,10 @@ fn build_service_rows(
                     let status = classify(&c, ps);
                     vec![(c, status)]
                 }
-                ServiceScope::Isolated => used_by
+                ServiceScope::Isolated => users
                     .iter()
-                    .map(|inst| {
-                        let c = isolated_service_container(project, inst, &svc.name);
+                    .map(|(_, id)| {
+                        let c = isolated_service_container(project, id, &svc.name);
                         let status = classify(&c, ps);
                         (c, status)
                     })
@@ -594,11 +597,20 @@ pub fn collect(dir: &Path) -> Snapshot {
         });
     }
 
-    // Services view: (instance name → the service list of its resolved sandbox),
-    // then the config services resolved into pure inputs for the join.
-    let instance_services: Vec<(String, Vec<String>)> = instances
+    // Services view: (instance name, persistent id, service list of its
+    // resolved sandbox), then the config services resolved into pure inputs for
+    // the join. Built from state so the id — which container names derive from
+    // — rides along with the display name.
+    let instance_services: Vec<(String, String, Vec<String>)> = state
+        .instances
         .iter()
-        .map(|r| (r.name.clone(), r.services.clone()))
+        .map(|(name, inst)| {
+            let services = resolved
+                .get(&inst.sandbox)
+                .map(|(svcs, _, _)| svcs.clone())
+                .unwrap_or_default();
+            (name.clone(), inst.instance_id.clone(), services)
+        })
         .collect();
 
     let services = match (&config, project_id(dir)) {
@@ -737,8 +749,8 @@ extends = "does-not-exist"
             resolved: Some(resolved(ServiceScope::Global, "image postgres:16", &["5432"])),
         }];
         let instance_services = vec![
-            ("repo".to_string(), vec!["db".to_string()]),
-            ("other".to_string(), vec![]),
+            ("repo".to_string(), "repo".to_string(), vec!["db".to_string()]),
+            ("other".to_string(), "other".to_string(), vec![]),
         ];
         // Global container name is devsandbox-svc-<project>-<name>.
         let ps = vec![ps_line("devsandbox-svc-proj-db", "Up 2 minutes", "running")];
@@ -763,10 +775,12 @@ extends = "does-not-exist"
             name: "cache".into(),
             resolved: Some(resolved(ServiceScope::Isolated, "image redis:7", &["6379"])),
         }];
+        // `renamed` was created as `repo-2` then renamed: containers keep the
+        // id-derived name while `used_by` shows the display name.
         let instance_services = vec![
-            ("repo".to_string(), vec!["cache".to_string()]),
-            ("repo-2".to_string(), vec!["cache".to_string()]),
-            ("nope".to_string(), vec![]),
+            ("repo".to_string(), "repo".to_string(), vec!["cache".to_string()]),
+            ("renamed".to_string(), "repo-2".to_string(), vec!["cache".to_string()]),
+            ("nope".to_string(), "nope".to_string(), vec![]),
         ];
         // repo's container is running, repo-2's is exited, none for `nope`.
         let ps = vec![
@@ -781,7 +795,7 @@ extends = "does-not-exist"
         let rows = build_service_rows("proj", &inputs, &instance_services, &ps);
         let row = &rows[0];
         assert_eq!(row.scope, "isolated");
-        assert_eq!(row.used_by, vec!["repo".to_string(), "repo-2".to_string()]);
+        assert_eq!(row.used_by, vec!["repo".to_string(), "renamed".to_string()]);
         assert_eq!(row.containers.len(), 2);
         assert_eq!(row.containers[0].0, "devsandbox-svc-proj-repo-cache");
         assert_eq!(row.containers[0].1, ContainerStatus::Running("Up 1s".into()));
@@ -826,7 +840,8 @@ extends = "does-not-exist"
         input.config_hash = "cfg".into();
         input.build_hash = "bld".into();
         let inputs = vec![ServiceInput { name: "db".into(), resolved: Some(input) }];
-        let instance_services = vec![("repo".to_string(), vec!["db".to_string()])];
+        let instance_services =
+            vec![("repo".to_string(), "repo".to_string(), vec!["db".to_string()])];
         let name = "devsandbox-svc-proj-db";
 
         // Both labels match → no drift.
@@ -858,8 +873,8 @@ extends = "does-not-exist"
         input.build_hash = String::new();
         let inputs = vec![ServiceInput { name: "cache".into(), resolved: Some(input) }];
         let instance_services = vec![
-            ("repo".to_string(), vec!["cache".to_string()]),
-            ("repo-2".to_string(), vec!["cache".to_string()]),
+            ("repo".to_string(), "repo".to_string(), vec!["cache".to_string()]),
+            ("repo-2".to_string(), "repo-2".to_string(), vec!["cache".to_string()]),
         ];
         // repo current, repo-2 stale on config.
         let ps = vec![

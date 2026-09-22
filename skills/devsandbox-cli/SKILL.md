@@ -89,8 +89,9 @@ devcontainer forms: `= true`, a bare version string, or an options table; `= fal
 Usable in `workspaceFolder`, `mounts` sources, and `folders`:
 
   `${configDir}`, `${localWorkspaceFolder}`, `${localWorkspaceFolderBasename}`, `${localEnv:VAR}` (unset → empty),
-  plus devsandbox's `${sharedVolumes}` (the config root's `shared-volumes/` dir) and `${instance}` (the running instance
-  name — use it to anchor per-instance state in a mount source). Unknown `${…}` is left verbatim. Missing bind sources
+  plus devsandbox's `${sharedVolumes}` (the config root's `shared-volumes/` dir) and `${instance}` (the instance's
+  persistent id: its creation name, unique and unaffected by `rename` — use it to anchor per-instance state in a mount
+  source). Unknown `${…}` is left verbatim. Missing bind sources
   are auto-created (a final component with a dot → file, else directory).
 
 ### Minimal example

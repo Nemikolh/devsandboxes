@@ -49,7 +49,7 @@ fn start_instance(dir: &Path, key: &str, info: &Instance) -> Result<()> {
             let project = services::project_id(dir)?;
             let service_names = sandbox.properties.services.clone().unwrap_or_default();
             let (_, endpoints) =
-                services::ensure_services(&config, dir, &project, key, &service_names)?;
+                services::ensure_services(&config, dir, &project, &info.instance_id, &service_names)?;
             backend().wire_service_dns(&info.container, &endpoints)?;
             if let Some(cmd) = &sandbox.properties.post_start_command {
                 run::exec_lifecycle(
@@ -63,7 +63,7 @@ fn start_instance(dir: &Path, key: &str, info: &Instance) -> Result<()> {
             }
         }
         None => {
-            let services = stop::service_containers(&info.project, key);
+            let services = stop::service_containers(&info.project, &info.instance_id);
             start_containers(&info.container, &services, false);
         }
     }

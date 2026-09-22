@@ -17,7 +17,7 @@ pub fn stop(name: Option<String>, all: bool) -> Result<()> {
             if backend().is_running(&info.container)? != Some(true) {
                 continue;
             }
-            let services = service_containers(&info.project, key);
+            let services = service_containers(&info.project, &info.instance_id);
             stop_containers(&info.container, &services, false);
             println!("stopped {key}");
             stopped += 1;
@@ -32,7 +32,7 @@ pub fn stop(name: Option<String>, all: bool) -> Result<()> {
     let key = resolve_instance(&state, &name)?;
     let info = state.instances.get(&key).expect("key came from state");
 
-    let services = service_containers(&info.project, &key);
+    let services = service_containers(&info.project, &info.instance_id);
     stop_containers(&info.container, &services, false);
 
     println!("stopped {key}");
@@ -40,10 +40,11 @@ pub fn stop(name: Option<String>, all: bool) -> Result<()> {
 }
 
 /// Container names of this instance's isolated services, matched on the
-/// project+instance labels (same rule as `rm`). Empty when `project` is empty
+/// project+instance labels (same rule as `rm`); `instance_id` is the persistent
+/// id the labels carry, not the display name. Empty when `project` is empty
 /// (pre-upgrade state) or on any runtime error. Listing always captures
 /// stderr, so this is safe from callers that own the screen (the TUI).
-pub(crate) fn service_containers(project: &str, instance: &str) -> Vec<String> {
+pub(crate) fn service_containers(project: &str, instance_id: &str) -> Vec<String> {
     if project.is_empty() {
         return Vec::new();
     }
@@ -52,7 +53,7 @@ pub(crate) fn service_containers(project: &str, instance: &str) -> Vec<String> {
             .into_iter()
             .filter(|r| {
                 r.label("devsandbox.project") == Some(project)
-                    && r.label("devsandbox.instance") == Some(instance)
+                    && r.label("devsandbox.instance") == Some(instance_id)
             })
             .map(|r| r.name)
             .collect(),

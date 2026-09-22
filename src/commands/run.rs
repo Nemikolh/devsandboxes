@@ -61,7 +61,7 @@ pub fn run(
         .into_owned();
     // The mount context is rebuilt inside `materialize` for the actual mounts;
     // here it only substitutes `${instance}` into the worktree branch pattern,
-    // which is why instance naming comes first.
+    // which is why instance naming (and id allocation) comes first.
     let config_dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
     let config_dir_str = config_dir.to_string_lossy().into_owned();
     let folder_str = folder.to_string_lossy().into_owned();
@@ -75,15 +75,6 @@ pub fn run(
         Some(name) => name,
         None => default_instance_name(&state, &sandbox_name),
     };
-    let container_name = format!("{NAME_PREFIX}{instance}");
-
-    let var_ctx = MountContext {
-        config_dir: &config_dir_str,
-        workspace_folder: &folder_str,
-        workspace_folder_basename: &basename,
-        shared_volumes: &shared_volumes,
-        instance: &instance,
-    };
 
     // `run` always creates a fresh instance; it never restarts a stopped one
     // (that is `devsandbox start`).
@@ -93,12 +84,26 @@ pub fn run(
              `devsandbox rm {instance}` frees the name"
         );
     }
+    // Persistent id (see `Instance::instance_id`): the name, unless a rename
+    // left that id taken. Everything host/runtime-addressed — container name,
+    // `${instance}` substitutions, worktree, services — keys off the id so a
+    // later rename moves nothing.
+    let instance_id = unique_instance_id(&state, &instance);
+    let container_name = format!("{NAME_PREFIX}{instance_id}");
     if backend().is_running(&container_name)?.is_some() {
         bail!(
             "container `{container_name}` already exists but is not in state; \
              remove it or pick another --name"
         );
     }
+
+    let var_ctx = MountContext {
+        config_dir: &config_dir_str,
+        workspace_folder: &folder_str,
+        workspace_folder_basename: &basename,
+        shared_volumes: &shared_volumes,
+        instance: &instance_id,
+    };
 
     let (source, worktree, branch) = if base_in_use(&state, &folder) {
         // Branch for the worktree: `--branch` override, else the sandbox's
@@ -111,7 +116,9 @@ pub fn run(
         // Must be absolute: `create_worktree` runs `git -C <base>`, so a
         // `dir`-relative path would resolve under the base repo instead of here,
         // and the mount/state would point at a different (empty) directory.
-        let wt = config_dir.join(".worktrees").join(&instance);
+        // Keyed by id: a renamed instance keeps its worktree dir, so a new
+        // instance reusing the freed name must not collide with it.
+        let wt = config_dir.join(".worktrees").join(&instance_id);
         create_worktree(&folder, &wt, &branch)?;
         (wt.clone(), Some(wt), Some(branch))
     } else {
@@ -124,6 +131,7 @@ pub fn run(
         &sandbox_name,
         &sandbox,
         &instance,
+        &instance_id,
         &source,
         &folder,
         worktree,
@@ -137,12 +145,15 @@ pub fn run(
 
 /// Create (and start) the instance container and record it: run
 /// `initializeCommand`, bring up services, build the mount set (rebuilding the
-/// `${instance}` context from `instance` so per-instance mounts/history resolve
-/// to the same host paths), start the container, upsert state (saved before the
-/// lifecycle chain so a crash mid-lifecycle leaves the container tracked), then
-/// run the lifecycle commands. `source` is what gets mounted as the working tree
-/// (a worktree when `worktree.is_some()`, else `folder`); `folder` is the
-/// canonicalized base folder, used for `base_folder` and the git companion mount.
+/// `${instance}` context from `instance_id` so per-instance mounts/history
+/// resolve to the same host paths across renames), start the container, upsert
+/// state (saved before the lifecycle chain so a crash mid-lifecycle leaves the
+/// container tracked), then run the lifecycle commands. `instance` is the
+/// display name (state key); `instance_id` the persistent identity every
+/// container/service/mount name derives from. `source` is what gets mounted as
+/// the working tree (a worktree when `worktree.is_some()`, else `folder`);
+/// `folder` is the canonicalized base folder, used for `base_folder` and the
+/// git companion mount.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn materialize(
     dir: &Path,
@@ -150,6 +161,7 @@ pub(crate) fn materialize(
     sandbox_name: &str,
     sandbox: &ResolvedSandbox,
     instance: &str,
+    instance_id: &str,
     source: &Path,
     folder: &Path,
     worktree: Option<PathBuf>,
@@ -157,7 +169,7 @@ pub(crate) fn materialize(
     state: &mut State,
 ) -> Result<()> {
     let props = &sandbox.properties;
-    let container_name = format!("{NAME_PREFIX}{instance}");
+    let container_name = format!("{NAME_PREFIX}{instance_id}");
     let basename = folder
         .file_name()
         .context("sandbox folder has no basename")?
@@ -165,8 +177,9 @@ pub(crate) fn materialize(
         .into_owned();
     // `${configDir}` / `${localWorkspaceFolder(Basename)}` / `${sharedVolumes}`
     // / `${instance}` are usable in `workspaceFolder`, `mounts`, and cache
-    // sources; rebuild the context from the passed instance name so
-    // `${instance}`-anchored mounts/history resolve to the same host paths.
+    // sources; rebuild the context from the persistent id so
+    // `${instance}`-anchored mounts/history resolve to the same host paths
+    // across rebuilds *and* renames.
     let config_dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
     let config_dir_str = config_dir.to_string_lossy().into_owned();
     let folder_str = folder.to_string_lossy().into_owned();
@@ -176,7 +189,7 @@ pub(crate) fn materialize(
         workspace_folder: &folder_str,
         workspace_folder_basename: &basename,
         shared_volumes: &shared_volumes,
-        instance,
+        instance: instance_id,
     };
     let workspace = substitute(
         &props
@@ -200,7 +213,7 @@ pub(crate) fn materialize(
     let project = services::project_id(dir)?;
     let service_names = props.services.clone().unwrap_or_default();
     let (networks, endpoints) =
-        services::ensure_services(config, dir, &project, instance, &service_names)?;
+        services::ensure_services(config, dir, &project, instance_id, &service_names)?;
 
     // The worktree's `.git` file points at `<base>/.git/worktrees/..` by absolute
     // host path; mount the base `.git` at the identical path so git works inside
@@ -209,7 +222,7 @@ pub(crate) fn materialize(
         Some(_) => vec![git_companion_mount(folder)],
         None => Vec::new(),
     };
-    let mut mounts = resolve_mounts(dir, folder, &basename, instance, sandbox)?;
+    let mut mounts = resolve_mounts(dir, folder, &basename, instance_id, sandbox)?;
     for (target, host) in &extra_folders {
         mounts.push(format!("type=bind,source={},target={target}", host.display()));
     }
@@ -221,7 +234,7 @@ pub(crate) fn materialize(
     // clobbers the env, e.g. VS Code's injected shell integration).
     let mut extra_env = cache_env;
     let shell_history = if props.persist_shell_history == Some(true) {
-        let (path, mount, env) = provision_shell_history(dir, instance)?;
+        let (path, mount, env) = provision_shell_history(dir, instance_id)?;
         mounts.push(mount);
         extra_env.push(env);
         Some(path)
@@ -262,6 +275,7 @@ pub(crate) fn materialize(
         instance.to_string(),
         Instance {
             sandbox: sandbox_name.to_string(),
+            instance_id: instance_id.to_string(),
             project,
             container: container.clone(),
             folder: source.to_path_buf(),
@@ -343,6 +357,22 @@ fn first_free_ordinal(state: &State, sandbox: &str) -> String {
         .map(|n| format!("{sandbox}-{n}"))
         .find(|name| !state.instances.contains_key(name))
         .expect("infinite range yields a free name")
+}
+
+/// Persistent id for a new instance named `name`: `name` itself when no
+/// existing instance holds that id, else `name-<i>` (first free i >= 1). Ids
+/// survive renames, so a rename can free a *name* whose id is still taken —
+/// the suffix keeps ids (and everything derived from them: container, mounts,
+/// worktree, services) unique while the instance still displays as `name`.
+fn unique_instance_id(state: &State, name: &str) -> String {
+    let taken = |id: &str| state.instances.values().any(|i| i.instance_id == id);
+    if !taken(name) {
+        return name.to_string();
+    }
+    (1..)
+        .map(|i| format!("{name}-{i}"))
+        .find(|id| !taken(id))
+        .expect("infinite range yields a free id")
 }
 
 /// Bind mount for the base repo's `.git` at the identical host path, so a
@@ -516,7 +546,7 @@ fn resolve_mounts(
     dir: &Path,
     folder: &Path,
     basename: &str,
-    instance: &str,
+    instance_id: &str,
     sandbox: &ResolvedSandbox,
 ) -> Result<Vec<String>> {
     let Some(mounts) = &sandbox.properties.mounts else {
@@ -530,7 +560,7 @@ fn resolve_mounts(
         workspace_folder: &folder.to_string_lossy(),
         workspace_folder_basename: basename,
         shared_volumes: &shared_volumes.to_string_lossy(),
-        instance,
+        instance: instance_id,
     };
     let mut args = Vec::with_capacity(mounts.len());
     for mount in mounts {
@@ -681,17 +711,18 @@ fn resolve_caches(
 const HISTORY_TARGET: &str = "/commandhistory";
 
 /// Provision this instance's managed shell history under
-/// `${configDir}/shared-volumes/history/<instance>/.zsh_history` and return
+/// `${configDir}/shared-volumes/history/<instance_id>/.zsh_history` and return
 /// (host file path, `--mount` arg, `HISTFILE` env pair). The *directory* is
 /// bind-mounted (Apple's `container` cannot bind a single file) and zsh is
 /// pointed at the file inside it via `HISTFILE`. An existing file is reused
-/// untouched, so history survives rm + run rebuilds.
+/// untouched, so history survives rm + run rebuilds; keying by the persistent
+/// id keeps it attached across renames too.
 fn provision_shell_history(
     dir: &Path,
-    instance: &str,
+    instance_id: &str,
 ) -> Result<(PathBuf, String, (String, String))> {
     let config_dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
-    let history_dir = config_dir.join("shared-volumes").join("history").join(instance);
+    let history_dir = config_dir.join("shared-volumes").join("history").join(instance_id);
     std::fs::create_dir_all(&history_dir)
         .with_context(|| format!("cannot create {}", history_dir.display()))?;
     let path = history_dir.join(".zsh_history");
@@ -1442,6 +1473,7 @@ mod tests {
     fn instance(name: &str) -> Instance {
         Instance {
             sandbox: "repo".into(),
+            instance_id: name.into(),
             project: "proj1234".into(),
             container: format!("{NAME_PREFIX}{name}"),
             folder: "/tmp/repo".into(),
@@ -1497,6 +1529,25 @@ mod tests {
         let mut state = State::default();
         state.instances.insert("repo".into(), instance("repo"));
         assert_eq!(default_instance_name(&state, "repo"), "repo-2");
+    }
+
+    #[test]
+    fn instance_id_is_name_when_free() {
+        let state = State::default();
+        assert_eq!(unique_instance_id(&state, "repo"), "repo");
+    }
+
+    #[test]
+    fn instance_id_suffixes_when_rename_kept_the_id() {
+        // `repo` was created (id `repo`) then renamed to `other`: the *name*
+        // is free again but the id is not — a new `repo` gets `repo-1`.
+        let mut state = State::default();
+        state.instances.insert("other".into(), instance("repo"));
+        assert_eq!(unique_instance_id(&state, "repo"), "repo-1");
+
+        // A second collision (id `repo-1` also taken) moves to `repo-2`.
+        state.instances.insert("other-2".into(), instance("repo-1"));
+        assert_eq!(unique_instance_id(&state, "repo"), "repo-2");
     }
 
     // --- folders / generated workspace file ---
