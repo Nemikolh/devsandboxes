@@ -293,28 +293,26 @@ fn check_port_conflicts(container: &str, ports: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Stop and remove service containers of this project that no live sandbox
-/// instance references, and networks nothing needs. Refcounting is derived from
-/// state + the runtime, never stored. Also reaps orphaned managed shell-history
-/// files (confirmed per file unless `force`).
-pub fn gc(dir: &Path, force: bool) -> Result<()> {
-    let project = project_id(dir)?;
-    let config = Config::load(dir).unwrap_or_default();
-    let state = State::load()?;
-
-    // What live instances of this config root still reference: global service
-    // names, and per-instance isolated service names.
-    let mut global_refs: BTreeSet<String> = BTreeSet::new();
-    let mut isolated_refs: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    let mut live_instances: BTreeSet<String> = BTreeSet::new();
+/// Which services of this config root the given running instances reference,
+/// split by scope. Pure over `(config, state, running)` — the impure
+/// `container_running` liveness check lives at the call sites — so `gc` and
+/// `rebuild` derive references the same way and it stays unit-testable without a
+/// runtime. `running` is the set of instance keys whose container is up.
+///
+/// - `global_refs`: global service names any running instance references (one
+///   shared container regardless of how many reference it).
+/// - `isolated_refs`: per-instance isolated service names.
+/// - `live_instances`: running instance keys belonging to this config root.
+fn service_refs(config: &Config, state: &State, running: &BTreeSet<String>) -> ServiceRefs {
+    let mut refs = ServiceRefs::default();
     for (name, instance) in &state.instances {
         if !config.sandboxes.contains_key(&instance.sandbox) {
             continue; // belongs to a different config root
         }
-        if !container_running(&instance.container) {
+        if !running.contains(name) {
             continue;
         }
-        live_instances.insert(name.clone());
+        refs.live_instances.insert(name.clone());
         let Ok(sandbox) = config.resolve_sandbox(&instance.sandbox) else {
             continue;
         };
@@ -324,15 +322,47 @@ pub fn gc(dir: &Path, force: bool) -> Result<()> {
         for service in services {
             match config.resolve_service(service).map(|s| s.spec.scope) {
                 Ok(ServiceScope::Global) => {
-                    global_refs.insert(service.clone());
+                    refs.global.insert(service.clone());
                 }
                 Ok(ServiceScope::Isolated) => {
-                    isolated_refs.entry(name.clone()).or_default().insert(service.clone());
+                    refs.isolated.entry(name.clone()).or_default().insert(service.clone());
                 }
                 Err(_) => {}
             }
         }
     }
+    refs
+}
+
+/// The service references a set of running instances hold, keyed by scope.
+#[derive(Default)]
+struct ServiceRefs {
+    /// Global service names referenced by any running instance.
+    global: BTreeSet<String>,
+    /// Isolated service names per running instance key.
+    isolated: BTreeMap<String, BTreeSet<String>>,
+    /// Running instance keys belonging to this config root.
+    live_instances: BTreeSet<String>,
+}
+
+/// Stop and remove service containers of this project that no live sandbox
+/// instance references, and networks nothing needs. Refcounting is derived from
+/// state + the runtime, never stored. Also reaps orphaned managed shell-history
+/// files (confirmed per file unless `force`).
+pub fn gc(dir: &Path, force: bool) -> Result<()> {
+    let project = project_id(dir)?;
+    let config = Config::load(dir).unwrap_or_default();
+    let state = State::load()?;
+
+    // What live instances of this config root still reference, split by scope.
+    let running: BTreeSet<String> = state
+        .instances
+        .iter()
+        .filter(|(_, i)| container_running(&i.container))
+        .map(|(name, _)| name.clone())
+        .collect();
+    let ServiceRefs { global: global_refs, isolated: isolated_refs, live_instances } =
+        service_refs(&config, &state, &running);
 
     let mut removed = 0;
     for row in backend().list(true, NAME_PREFIX)? {
@@ -381,6 +411,100 @@ pub fn gc(dir: &Path, force: bool) -> Result<()> {
     }
 
     gc_shell_history(dir, &state, force)?;
+    Ok(())
+}
+
+/// Recreate a service's container(s) from the current config and rewire every
+/// running sandbox that references it — no sandbox restart on any runtime.
+///
+/// Recreating (rather than restarting) is what applies dockerfile edits: the
+/// create path in `ensure_services` re-runs `docker build`, whose cache picks up
+/// the changed dockerfile, and stamps fresh labels. A recreated container gets a
+/// new address, so referencing sandboxes must be re-pointed at it. On
+/// docker/podman that is free — the service keeps its network alias, so DNS
+/// resolves the new container with no action (`wire_service_dns` is a no-op
+/// there). On Apple, aliases don't exist and the sandbox's `/etc/hosts` holds a
+/// baked address, so `wire_service_dns` rewrites that file in place on the live
+/// container. Either way the sandbox never restarts. Stopped sandboxes are
+/// rewired by their next `start`.
+pub fn rebuild(dir: &Path, name: &str) -> Result<()> {
+    let project = project_id(dir)?;
+    let config = Config::load(dir)?;
+    let service = config.resolve_service(name)?; // unknown service bails here
+    let state = State::load()?;
+
+    // Remove every backing container of this project+service; the referencing
+    // instances (or the global arm below) recreate them fresh.
+    let mut removed = 0;
+    for row in backend().list(true, NAME_PREFIX)? {
+        if row.label("devsandbox.project") != Some(project.as_str())
+            || row.label("devsandbox.service") != Some(name)
+        {
+            continue;
+        }
+        let container = &row.name;
+        if backend().remove_force(container)? != 0 {
+            bail!("{} rm {container} failed", backend().name());
+        }
+        println!("removed {container}");
+        removed += 1;
+    }
+
+    // Recreate on each running instance that references the service, then rewire
+    // that live container to the new backing container.
+    let running: BTreeSet<String> = state
+        .instances
+        .iter()
+        .filter(|(_, i)| container_running(&i.container))
+        .map(|(name, _)| name.clone())
+        .collect();
+    let refs = service_refs(&config, &state, &running);
+    let names = [name.to_string()];
+    let mut recreated = 0;
+
+    for instance in &refs.live_instances {
+        let referenced = match service.spec.scope {
+            ServiceScope::Global => refs.global.contains(name),
+            ServiceScope::Isolated => {
+                refs.isolated.get(instance).is_some_and(|s| s.contains(name))
+            }
+        };
+        if !referenced {
+            continue;
+        }
+        let container = &state.instances[instance].container;
+        let (_, endpoints) = ensure_services(&config, dir, &project, instance, &names)?;
+        backend()
+            .wire_service_dns(container, &endpoints)
+            .with_context(|| format!("rewiring service `{name}` into `{instance}` failed"))?;
+        println!("recreated {container} (wired into {instance})");
+        recreated += 1;
+    }
+
+    // A global service with no running referencer still has one shared container;
+    // recreate it once on the global network (mirrors the `Global` arm of
+    // `ensure_services`) so `rebuild` applies drift even with nothing to wire.
+    if service.spec.scope == ServiceScope::Global && !refs.global.contains(name) {
+        let global_net = network_name(&project);
+        ensure_network(&global_net)?;
+        let container = service_container(&project, name);
+        let labels = [
+            format!("devsandbox.service={name}"),
+            format!("devsandbox.project={project}"),
+            "devsandbox.scope=global".to_string(),
+            format!("devsandbox.config_hash={}", service.config_hash),
+            format!("devsandbox.build_hash={}", build_hash(dir, service.spec.build.as_ref())),
+        ];
+        ensure_service(dir, &container, &global_net, &service, &labels)?;
+        println!("recreated {container}");
+        recreated += 1;
+    }
+
+    if removed == 0 && recreated == 0 {
+        // Isolated service with no running instances: containers exist only
+        // per instance, so there was nothing to remove or recreate.
+        println!("no containers for service `{name}`");
+    }
     Ok(())
 }
 
@@ -520,5 +644,97 @@ ports = ["5432:5432"]
         assert_eq!(host_port("8080:80"), Some("8080"));
         assert_eq!(host_port("127.0.0.1:8080:80"), Some("8080"));
         assert_eq!(host_port("80"), None);
+    }
+
+    fn instance(sandbox: &str) -> crate::state::Instance {
+        crate::state::Instance {
+            sandbox: sandbox.into(),
+            project: String::new(),
+            container: format!("devsandbox-{sandbox}"),
+            folder: Default::default(),
+            base_folder: Default::default(),
+            worktree: None,
+            branch: None,
+            shell_history: None,
+            workspace: String::new(),
+            workspace_file: None,
+            remote_env: Default::default(),
+            remote_user: None,
+            created_unix: 0,
+        }
+    }
+
+    const REFS_CONFIG: &str = r#"
+[services.db]
+image = "postgres"
+scope = "isolated"
+
+[services.cache]
+image = "redis"
+scope = "global"
+
+[sandbox.app]
+folder = "../app"
+image = "node"
+services = ["db", "cache"]
+
+[sandbox.plain]
+folder = "../plain"
+image = "node"
+"#;
+
+    fn refs_state() -> State {
+        let mut state = State::default();
+        state.instances.insert("app-1".into(), instance("app"));
+        state.instances.insert("app-2".into(), instance("app"));
+        state.instances.insert("plain-1".into(), instance("plain"));
+        state.instances.insert("foreign".into(), instance("elsewhere"));
+        state
+    }
+
+    #[test]
+    fn service_refs_splits_isolated_and_global_by_running_instance() {
+        let config = Config::parse(REFS_CONFIG).unwrap();
+        let state = refs_state();
+        let running: BTreeSet<String> = ["app-1", "app-2"].iter().map(|s| s.to_string()).collect();
+
+        let refs = service_refs(&config, &state, &running);
+
+        // Global service: one entry regardless of how many instances reference it.
+        assert_eq!(refs.global, BTreeSet::from(["cache".to_string()]));
+        // Isolated service: recorded per running instance.
+        assert_eq!(refs.isolated["app-1"], BTreeSet::from(["db".to_string()]));
+        assert_eq!(refs.isolated["app-2"], BTreeSet::from(["db".to_string()]));
+        assert_eq!(refs.live_instances, BTreeSet::from(["app-1".to_string(), "app-2".to_string()]));
+    }
+
+    #[test]
+    fn service_refs_skips_non_running_instances() {
+        let config = Config::parse(REFS_CONFIG).unwrap();
+        let state = refs_state();
+        // Only app-1 is running; app-2 is stopped, so its isolated ref is absent.
+        let running: BTreeSet<String> = ["app-1"].iter().map(|s| s.to_string()).collect();
+
+        let refs = service_refs(&config, &state, &running);
+
+        assert!(refs.isolated.contains_key("app-1"));
+        assert!(!refs.isolated.contains_key("app-2"));
+        assert_eq!(refs.live_instances, BTreeSet::from(["app-1".to_string()]));
+    }
+
+    #[test]
+    fn service_refs_skips_non_referencing_and_foreign_instances() {
+        let config = Config::parse(REFS_CONFIG).unwrap();
+        let state = refs_state();
+        // plain-1 references no service; foreign belongs to another config root.
+        let running: BTreeSet<String> =
+            ["plain-1", "foreign"].iter().map(|s| s.to_string()).collect();
+
+        let refs = service_refs(&config, &state, &running);
+
+        assert!(refs.global.is_empty());
+        assert!(refs.isolated.is_empty());
+        // plain-1 is live (this config root); foreign is not counted at all.
+        assert_eq!(refs.live_instances, BTreeSet::from(["plain-1".to_string()]));
     }
 }

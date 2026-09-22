@@ -101,6 +101,11 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Manage services
+    Service {
+        #[command(subcommand)]
+        cmd: ServiceCommand,
+    },
     /// Show the last lines of a container's logs
     Logs {
         /// Instance name, sandbox config name, repository folder name, or
@@ -148,6 +153,16 @@ enum Command {
     },
 }
 
+#[derive(Subcommand)]
+enum ServiceCommand {
+    /// Recreate a service's container(s) from the current config and rewire
+    /// every running sandbox that references it (no sandbox restart)
+    Rebuild {
+        /// Service name from config.toml
+        name: String,
+    },
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -171,6 +186,9 @@ fn main() -> Result<()> {
         Command::Stop { name, all } => commands::stop::stop(name, all),
         Command::Start { name, all } => commands::start::start(&cli.dir, name, all),
         Command::Gc { force } => commands::services::gc(&cli.dir, force),
+        Command::Service { cmd } => match cmd {
+            ServiceCommand::Rebuild { name } => commands::services::rebuild(&cli.dir, &name),
+        },
         Command::Logs { name, lines } => commands::logs::logs(&name, lines),
         Command::Inspect { name, json } => commands::inspect::inspect(&name, json),
         Command::Stats { json } => commands::stats::stats(json),
