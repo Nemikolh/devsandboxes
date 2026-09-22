@@ -17,6 +17,7 @@ use crate::runtime::backend;
 use super::data::{visible_nodes, ContainerStatus, InstanceRow, Node, Snapshot, ORPHANS_NAME};
 use super::procs::ProcState;
 use super::prompt::{commands, Prompt, PromptAction};
+use super::spec;
 use super::term::{encode_key, TermSession, TermTabs, SHELL_FALLBACK_CMD};
 use crate::runtime::NAME_PREFIX;
 
@@ -1119,10 +1120,16 @@ impl App {
     }
 
     /// Candidate list for the token at `idx` of the whitespace-split `tokens`
-    /// (the token being completed is absent when empty): command names for the
-    /// first token, sandbox names / flags for `run`, instance names for the rest.
-    /// `rebuild`/`recreate` complete against service names on the Services tab
-    /// (where they rebuild a service) and instance names elsewhere.
+    /// (the token being completed is absent when empty). Command names for the
+    /// first token; everything past it walks the command's [`spec::CommandSpec`]:
+    /// the value of the preceding flag, the spec's unused flags on a `-` stem,
+    /// the next unconsumed positional, and — once the positionals are filled —
+    /// the unused flags again. Trailing argv (`exec`) gets no candidates.
+    ///
+    /// [`spec::ArgValue::Branch`] offers the branch the run would use anyway
+    /// (the sandbox's `worktree-branch`, else the default pattern) so the user
+    /// edits a base instead of typing from scratch; `${…}` variables stay
+    /// unsubstituted, exactly as `run` would receive them.
     fn candidates_for(
         tab: Tab,
         idx: usize,
@@ -1135,64 +1142,92 @@ impl App {
         if idx == 0 {
             return commands().map(str::to_string).collect();
         }
-        match tokens.first().map(String::as_str) {
-            Some("run") => Self::run_candidates(idx, tokens, sandboxes, config),
-            Some("rebuild" | "recreate") if idx == 1 && tab == Tab::Services => services.to_vec(),
-            Some("exec" | "code" | "rm" | "rename" | "stop" | "start" | "rebuild" | "recreate")
-                if idx == 1 =>
-            {
-                instances.to_vec()
+        let Some(cmd_spec) = tokens.first().and_then(|t| spec::find(t)) else {
+            return Vec::new();
+        };
+        let value_candidates = |value: spec::ArgValue| -> Vec<String> {
+            match value {
+                spec::ArgValue::Instance => instances.to_vec(),
+                spec::ArgValue::InstanceOrService if tab == Tab::Services => services.to_vec(),
+                spec::ArgValue::InstanceOrService => instances.to_vec(),
+                spec::ArgValue::Sandbox => sandboxes.to_vec(),
+                spec::ArgValue::Branch => {
+                    let sandbox = cmd_spec
+                        .positionals
+                        .iter()
+                        .zip(Self::consumed_positionals(cmd_spec, tokens, idx))
+                        .find(|(v, _)| **v == spec::ArgValue::Sandbox)
+                        .map(|(_, t)| t);
+                    let branch = sandbox
+                        .and_then(|s| {
+                            config?.resolve_sandbox(s).ok()?.properties.worktree_branch
+                        })
+                        .unwrap_or_else(|| DEFAULT_WORKTREE_BRANCH.to_string());
+                    vec![branch]
+                }
+                spec::ArgValue::Free => Vec::new(),
             }
-            _ => Vec::new(),
+        };
+        // Value position: the previous token is a value-taking flag.
+        if let Some(value) = tokens
+            .get(idx - 1)
+            .and_then(|p| cmd_spec.flags.iter().find(|f| f.name == p.as_str()))
+            .and_then(|f| f.value)
+        {
+            return value_candidates(value);
         }
-    }
-
-    /// Candidates for `run` arguments past the command. Positional: sandbox
-    /// names while none is on the line. Otherwise the flags not already used.
-    /// After `--branch`, the branch the run would use anyway (the sandbox's
-    /// `worktree-branch`, else the default pattern) so the user edits a base
-    /// instead of typing from scratch; `${…}` variables stay unsubstituted,
-    /// exactly as `run` would receive them.
-    fn run_candidates(
-        idx: usize,
-        tokens: &[String],
-        sandboxes: &[String],
-        config: Option<&Config>,
-    ) -> Vec<String> {
-        match tokens.get(idx - 1).map(String::as_str) {
-            Some("--branch") => {
-                let branch = Self::run_sandbox_token(tokens, idx)
-                    .and_then(|s| config?.resolve_sandbox(s).ok()?.properties.worktree_branch)
-                    .unwrap_or_else(|| DEFAULT_WORKTREE_BRANCH.to_string());
-                return vec![branch];
-            }
-            Some("--name") => return Vec::new(), // free-form value
-            _ => {}
-        }
+        // Flags in spec order (the prompt sorts later); one already on the
+        // line — anywhere but at `idx` itself — is not re-offered.
+        let unused_flags = || -> Vec<String> {
+            cmd_spec
+                .flags
+                .iter()
+                .filter(|f| {
+                    !tokens.iter().enumerate().any(|(i, t)| i != idx && t == f.name)
+                })
+                .map(|f| f.name.to_string())
+                .collect()
+        };
         let stem = tokens.get(idx).map(String::as_str).unwrap_or("");
-        if !stem.starts_with('-') && Self::run_sandbox_token(tokens, idx).is_none() {
-            return sandboxes.to_vec();
+        if stem.starts_with('-') {
+            return unused_flags();
         }
-        ["--name", "--branch"]
-            .into_iter()
-            .filter(|flag| !tokens.iter().enumerate().any(|(i, t)| i != idx && t == flag))
-            .map(str::to_string)
-            .collect()
+        let consumed = Self::consumed_positionals(cmd_spec, tokens, idx);
+        if let Some(&value) = cmd_spec.positionals.get(consumed.len()) {
+            return value_candidates(value);
+        }
+        if cmd_spec.trailing {
+            return Vec::new(); // verbatim argv: no candidates
+        }
+        unused_flags()
     }
 
-    /// The positional (sandbox) token of a `run` line, if any: the first token
-    /// after the command that is neither a flag, a flag's value, nor the token
-    /// currently being completed (at index `skip`).
-    fn run_sandbox_token(tokens: &[String], skip: usize) -> Option<&str> {
+    /// Positional tokens already on the line: tokens after the command that
+    /// are neither a known flag, a value-taking flag's value, nor the token
+    /// currently being completed (at index `skip`). For `trailing` specs the
+    /// argv after the positionals is not scanned.
+    fn consumed_positionals<'a>(
+        cmd_spec: &spec::CommandSpec,
+        tokens: &'a [String],
+        skip: usize,
+    ) -> Vec<&'a str> {
+        let mut out = Vec::new();
         let mut i = 1;
         while i < tokens.len() {
-            match tokens[i].as_str() {
-                "--name" | "--branch" => i += 2,
-                _ if i == skip => i += 1,
-                other => return Some(other),
+            if cmd_spec.trailing && out.len() == cmd_spec.positionals.len() {
+                break;
             }
+            let tok = tokens[i].as_str();
+            if let Some(flag) = cmd_spec.flags.iter().find(|f| f.name == tok) {
+                i += if flag.value.is_some() { 2 } else { 1 };
+                continue;
+            }
+            if i != skip {
+                out.push(tok);
+            }
+            i += 1;
         }
-        None
+        out
     }
 
     /// Instance names from the latest snapshot (empty until one lands).
@@ -2922,6 +2957,82 @@ mod tests {
                 None,
             ),
             services
+        );
+    }
+
+    #[test]
+    fn rebuild_offers_force_flag() {
+        // `--` stem before or after the positional → the spec's flags.
+        assert_eq!(
+            App::candidates_for(Tab::Instances, 1, &toks("rebuild --"), &[], &[], &[], None),
+            vec!["--force".to_string()]
+        );
+        assert_eq!(
+            App::candidates_for(Tab::Instances, 2, &toks("rebuild box --"), &[], &[], &[], None),
+            vec!["--force".to_string()]
+        );
+        // Positional filled, empty stem → unused flags too.
+        assert_eq!(
+            App::candidates_for(Tab::Instances, 2, &toks("rebuild box"), &[], &[], &[], None),
+            vec!["--force".to_string()]
+        );
+    }
+
+    #[test]
+    fn rebuild_force_not_reoffered() {
+        assert!(App::candidates_for(
+            Tab::Instances,
+            2,
+            &toks("rebuild --force --"),
+            &[],
+            &[],
+            &[],
+            None,
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn rebuild_completes_instances_after_force() {
+        let instances = vec!["a".to_string(), "b".to_string()];
+        let services = vec!["cache".to_string()];
+        // Boolean flag before the positional: still the positional's names.
+        assert_eq!(
+            App::candidates_for(
+                Tab::Instances,
+                2,
+                &toks("rebuild --force"),
+                &[],
+                &instances,
+                &services,
+                None,
+            ),
+            instances
+        );
+        // Services tab: same walk, service names.
+        assert_eq!(
+            App::candidates_for(
+                Tab::Services,
+                2,
+                &toks("rebuild --force"),
+                &[],
+                &instances,
+                &services,
+                None,
+            ),
+            services
+        );
+    }
+
+    #[test]
+    fn exec_argv_offers_nothing() {
+        let instances = vec!["box".to_string()];
+        // Positional consumed → the rest of the line is verbatim argv.
+        assert!(App::candidates_for(Tab::Instances, 2, &toks("exec box"), &[], &instances, &[], None)
+            .is_empty());
+        assert!(
+            App::candidates_for(Tab::Instances, 3, &toks("exec box ls"), &[], &instances, &[], None)
+                .is_empty()
         );
     }
 
