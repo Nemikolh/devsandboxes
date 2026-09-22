@@ -23,13 +23,14 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 const SCROLLBACK: usize = 5000;
 
 /// In-container shell command, expressed as argv pieces. Service images are
-/// often minimal (no bash, no login profile wired up), so we probe for bash
-/// and fall back to POSIX `sh`, both as login shells. The caller wraps this in
-/// the runtime `exec` argv (`docker exec -it <container> <SHELL_FALLBACK_CMD>`).
+/// often minimal (no bash, no login profile wired up), so we probe for zsh
+/// first (most devsandboxes ship it), then bash, and fall back to POSIX `sh`,
+/// all as login shells. The caller wraps this in the runtime `exec` argv
+/// (`docker exec -it <container> <SHELL_FALLBACK_CMD>`).
 pub const SHELL_FALLBACK_CMD: [&str; 3] = [
     "sh",
     "-lc",
-    "command -v bash >/dev/null 2>&1 && exec bash -l; exec sh -l",
+    "command -v zsh >/dev/null 2>&1 && exec zsh -l; command -v bash >/dev/null 2>&1 && exec bash -l; exec sh -l",
 ];
 
 /// One integrated-terminal tab: a child shell on a PTY, its parsed screen, and
@@ -690,7 +691,13 @@ mod tests {
     fn shell_fallback_cmd_probes_bash() {
         assert_eq!(SHELL_FALLBACK_CMD[0], "sh");
         assert_eq!(SHELL_FALLBACK_CMD[1], "-lc");
+        assert!(SHELL_FALLBACK_CMD[2].contains("exec zsh -l"));
         assert!(SHELL_FALLBACK_CMD[2].contains("exec bash -l"));
         assert!(SHELL_FALLBACK_CMD[2].contains("exec sh -l"));
+        // zsh probed before bash before sh.
+        let zsh = SHELL_FALLBACK_CMD[2].find("exec zsh -l").unwrap();
+        let bash = SHELL_FALLBACK_CMD[2].find("exec bash -l").unwrap();
+        let sh = SHELL_FALLBACK_CMD[2].find("exec sh -l").unwrap();
+        assert!(zsh < bash && bash < sh);
     }
 }
