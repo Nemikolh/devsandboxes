@@ -8,6 +8,10 @@ mod app;
 mod data;
 mod procs;
 mod prompt;
+// Not yet consumed: step 2 rewires `prompt::parse_line` onto it, step 3 the
+// completer. The allow goes away with the first caller.
+#[allow(dead_code)]
+mod spec;
 mod term;
 mod ui;
 
