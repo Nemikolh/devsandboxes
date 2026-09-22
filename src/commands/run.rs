@@ -216,7 +216,9 @@ pub(crate) fn materialize(
     // Package-manager caches: shared bind mounts + the env vars pointing at them.
     let (cache_mounts, cache_env) = resolve_caches(&config_dir, props)?;
     mounts.extend(cache_mounts);
-    // Managed per-instance shell history: mount the host dir, point zsh at it.
+    // Managed per-instance shell history: mount the host dir, point zsh at it
+    // (env var for rc-less shells, rc export below for shells whose rc chain
+    // clobbers the env, e.g. VS Code's injected shell integration).
     let mut extra_env = cache_env;
     let shell_history = if props.persist_shell_history == Some(true) {
         let (path, mount, env) = provision_shell_history(dir, instance)?;
@@ -251,6 +253,7 @@ pub(crate) fn materialize(
         props.vscode_extensions().unwrap_or(&[]),
     );
 
+    let persist_history = shell_history.is_some();
     state.instances.insert(
         instance.to_string(),
         Instance {
@@ -276,14 +279,14 @@ pub(crate) fn materialize(
         write_vscode_name_config(&container, extensions, props.remote_user.as_deref())?;
     }
 
-    if !shell_rc.is_empty() {
+    if !shell_rc.is_empty() || persist_history {
         let paths: Vec<&str> = shell_rc.iter().map(|(_, path)| path.as_str()).collect();
         exec_lifecycle(
             &container,
             &workspace,
             props.remote_env.as_ref(),
             props.remote_user.as_deref(),
-            &shell_rc_wiring(&paths),
+            &shell_rc_wiring(&paths, persist_history),
         )
         .with_context(|| format!("shell-rc wiring failed (container `{container}` kept)"))?;
     }
@@ -738,12 +741,23 @@ fn resolve_shell_rc(
 }
 
 /// Shell snippet that makes the remote user's interactive rc files source each
-/// `shell-rc` path. Runs as `remoteUser`, so `$HOME` is theirs rather than a
-/// hard-coded `/root`. Idempotent: each line is appended only when the rc file
-/// doesn't mention the path yet, and a missing rc file is created. The source
-/// line is guarded with `[ -r … ]` so a shell still starts if the mount is gone.
-fn shell_rc_wiring(paths: &[&str]) -> LifecycleCommand {
+/// `shell-rc` path and, with `persist_history`, pin `HISTFILE` to the managed
+/// location. The rc-level export exists because the container-env `HISTFILE`
+/// alone is not enough: VS Code's injected shell integration resets `HISTFILE`
+/// to `$HOME/.zsh_history` before sourcing `~/.zshrc`, so only a line inside
+/// the rc file survives every shell startup path. Runs as `remoteUser`, so
+/// `$HOME` is theirs rather than a hard-coded `/root`. Idempotent: each line is
+/// appended only when the rc file doesn't mention it yet, and a missing rc file
+/// is created. The source line is guarded with `[ -r … ]` so a shell still
+/// starts if the mount is gone.
+fn shell_rc_wiring(paths: &[&str], persist_history: bool) -> LifecycleCommand {
     let mut script = String::from("set -eu\nfor rc in \"$HOME/.zshrc\" \"$HOME/.bashrc\"; do\n");
+    if persist_history {
+        let histfile = format!("{HISTORY_TARGET}/.zsh_history");
+        script.push_str(&format!(
+            "  grep -qsF 'HISTFILE={histfile}' \"$rc\" || printf '\\nexport HISTFILE={histfile}\\n' >> \"$rc\"\n"
+        ));
+    }
     for path in paths {
         script.push_str(&format!(
             "  grep -qsF '{path}' \"$rc\" || printf '\\n[ -r {path} ] && . {path}\\n' >> \"$rc\"\n"
@@ -1463,7 +1477,7 @@ mod tests {
 
     #[test]
     fn shell_rc_wiring_is_guarded_and_idempotent_per_path() {
-        let cmd = shell_rc_wiring(&["/devsandbox/rc/0/a.sh", "/devsandbox/rc/1/b.sh"]);
+        let cmd = shell_rc_wiring(&["/devsandbox/rc/0/a.sh", "/devsandbox/rc/1/b.sh"], false);
         let argv = &cmd.commands()[0];
         assert_eq!(&argv[..2], &["sh".to_string(), "-c".to_string()]);
         let script = &argv[2];
@@ -1472,6 +1486,16 @@ mod tests {
             r#"grep -qsF '/devsandbox/rc/0/a.sh' "$rc" || printf '\n[ -r /devsandbox/rc/0/a.sh ] && . /devsandbox/rc/0/a.sh\n' >> "$rc""#
         ));
         assert!(script.contains("grep -qsF '/devsandbox/rc/1/b.sh'"));
+        assert!(!script.contains("HISTFILE"));
+    }
+
+    #[test]
+    fn shell_rc_wiring_pins_histfile_when_history_persisted() {
+        let cmd = shell_rc_wiring(&[], true);
+        let script = &cmd.commands()[0][2];
+        assert!(script.contains(
+            r#"grep -qsF 'HISTFILE=/commandhistory/.zsh_history' "$rc" || printf '\nexport HISTFILE=/commandhistory/.zsh_history\n' >> "$rc""#
+        ), "{script}");
     }
 
     #[test]

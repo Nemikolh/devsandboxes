@@ -142,7 +142,7 @@ devsandbox extras on a sandbox:
 | `folders`               | Extra VS Code workspace roots: container path → host folder; generates a `.code-workspace`            |
 | `services`              | Service names to start and network alongside the instance                                             |
 | `caches`                | Package-manager caches to persist and share across the config root                                    |
-| `persist-shell-history` | Per-instance history dir on the host, mounted at `/commandhistory` with `HISTFILE` set; survives rebuilds, never shared between concurrent instances |
+| `persist-shell-history` | Per-instance history dir on the host, mounted at `/commandhistory` with `HISTFILE` set via container env and pinned in the rc files (VS Code's shell integration resets the env value); survives rebuilds, never shared between concurrent instances |
 | `shell-rc`              | Host shell snippets (e.g. `["${configDir}/shell/aliases.sh"]`) mounted read-only and sourced by `~/.zshrc` and `~/.bashrc` in the container; concatenates under `extends` |
 | `worktree-branch`       | Branch created for a worktree instance (supports `${instance}`); defaults to `sandbox/${instance}`; `run --branch` overrides it |
 
