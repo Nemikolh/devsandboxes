@@ -9,16 +9,20 @@ git worktrees so working trees are never shared.
 
 - `src/main.rs` — clap CLI; no subcommand on a TTY opens the TUI dashboard.
 - `src/commands/*.rs` — one file per verb (`run`, `start`, `stop`, `rebuild`,
-  `rm`, `ps`, `ls`, `exec`, `logs`, `inspect`, `stats`, `services::gc`). Shared name
+  `rm`, `ps`, `ls`, `exec`, `logs`, `inspect`, `stats`, `services::{gc,ls,rebuild}`). Shared name
   resolution in `commands/mod.rs` (`resolve_instance`: instance | sandbox |
   folder basename).
 - `src/config.rs` — TOML schema: `[template.*]`, `[sandbox.*]`, `[services.*]`.
   `extends` deep-merges (tables recurse, **arrays concatenate** — that's how
   `template.base` services reach every sandbox). Config drift is detected by
-  hashing the merged table (`config_hash` label on containers).
+  hashing the merged table (`config_hash` label on containers) plus the build
+  dockerfile's contents (`build_hash` label); the shared rule is
+  `commands::drift_decision`.
 - `src/commands/services.rs` — service/network lifecycle. `scope = "isolated"`
   (default): one container per instance on a per-instance network. `scope =
-  "global"`: one shared container per config root. `gc` reaps unreferenced ones.
+  "global"`: one shared container per config root. `gc` reaps unreferenced ones;
+  `rebuild` recreates a service's containers and rewires running sandboxes in
+  place (no restart, on any runtime).
 - `src/runtime/` — backend abstraction over docker/podman/Apple container.
 - `src/tui/` — ratatui dashboard. `app.rs` is a deliberately I/O-free state
   machine (unit-tested); `mod.rs` owns the terminal + event loop and runs

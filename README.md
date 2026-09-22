@@ -67,18 +67,22 @@ devsandbox                  # no args on a TTY: interactive dashboard
 | `start <name>` / `start --all` | Restart a stopped instance, full path: config-drift warning, services recreated/started, service DNS rewired, `postStartCommand`         |
 | `stop <name>` / `stop --all`   | `docker stop` of the instance and its isolated services; `start` restarts it                                                             |
 | `rebuild <name>` / `rebuild --all` (alias `recreate`) | Recreate the container from the current config when it has drifted; worktree, branch, and per-instance state are kept. No drift → no-op; `--all` rebuilds every drifted instance |
+| `service ls`                   | Services defined in `config.toml`, joined with their backing containers (scope, used-by, status)                                          |
+| `service rebuild <name>`       | Remove and recreate a service's container(s) from the current config, then rewire every running sandbox that references it — sandboxes are never restarted (docker/podman resolve the new container via its network alias; Apple gets its `/etc/hosts` rewritten in place). Stopped sandboxes are rewired by their next `start` |
 | `rm <name>`                    | Remove container, worktree, and state entry (managed shell history is kept so a rebuilt instance inherits it)                            |
 | `exec [-i] [-t] <name> <cmd…>` | Exec in an instance, honoring `remoteEnv` / `remoteUser`                                                                                 |
 | `gc [--force]`                 | Remove services no live instance references, orphaned shell-history files                                                                |
 
 `<name>` may be an instance name, a sandbox config name, or a repository folder basename; ambiguity prompts on a TTY and errors otherwise.
 
+**Drift** covers both the merged config (hash of the resolved TOML table) and the build dockerfile's *contents*, each recorded as a container label at creation — so editing a `build.dockerfile` flags the affected instances and services for rebuild in the CLI warnings and the TUI. The build context and devcontainer features are not hashed; edits to those go undetected.
+
 ## JSON output
 
 For scripts and external UIs that drive devsandbox through the CLI, the read verbs emit machine-readable JSON:
 
 - `status --json` — the full dashboard snapshot in one call: `instances`, `sandboxes`, `services`, plus the runtime `name`/`version`. `--json` is mandatory (plain `status` is reserved for a future human summary). The runtime or config being unavailable is data, not failure: the rows still come from state, an `error` field carries the reason, and the exit code stays `0`.
-- `ps --json`, `ls --json`, `stats --json` — the same rows as the table, as JSON.
+- `ps --json`, `ls --json`, `service ls --json`, `stats --json` — the same rows as the table, as JSON.
 - `inspect --json` — the runtime's own inspect document, pretty-printed.
 
 Every payload except `inspect` is wrapped in an envelope so consumers can gate on the version before reading `data`:
