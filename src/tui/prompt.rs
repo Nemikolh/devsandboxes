@@ -12,7 +12,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 
 /// Command names offered for first-token completion, in display order.
-pub const COMMANDS: [&str; 7] = ["run", "exec", "code", "rm", "stop", "start", "rebuild"];
+pub const COMMANDS: [&str; 8] =
+    ["run", "exec", "code", "rm", "rename", "stop", "start", "rebuild"];
 
 /// Max history entries kept on disk (oldest trimmed first).
 const HISTORY_CAP: usize = 200;
@@ -24,6 +25,7 @@ pub enum PromptAction {
     Run { sandbox: String, name: Option<String>, branch: Option<String> },
     Exec { instance: String, argv: Vec<String> },
     Code { instance: String },
+    Rename { instance: String, new_name: String },
     Rm { instance: String },
     Stop { instance: String },
     Start { instance: String },
@@ -412,6 +414,15 @@ fn parse_line(line: &str) -> Result<PromptAction, String> {
             };
             Ok(PromptAction::Rm { instance: (*instance).to_string() })
         }
+        "rename" => {
+            let [instance, new_name] = rest else {
+                return Err("usage: rename <instance> <new-name>".into());
+            };
+            Ok(PromptAction::Rename {
+                instance: (*instance).to_string(),
+                new_name: (*new_name).to_string(),
+            })
+        }
         "stop" => {
             let [instance] = rest else {
                 return Err("usage: stop <instance>".into());
@@ -431,9 +442,9 @@ fn parse_line(line: &str) -> Result<PromptAction, String> {
             };
             Ok(PromptAction::Rebuild { instance: (*instance).to_string() })
         }
-        other => {
-            Err(format!("unknown command `{other}` (run, exec, code, rm, stop, start, rebuild)"))
-        }
+        other => Err(format!(
+            "unknown command `{other}` (run, exec, code, rm, rename, stop, start, rebuild)"
+        )),
     }
 }
 
@@ -576,9 +587,11 @@ mod tests {
     #[test]
     fn first_token_completion_cycles() {
         let mut pr = p("r");
-        pr.complete(cands); // "r" matches rebuild, rm, run → first sorted ("rebuild")
+        pr.complete(cands); // "r" matches rebuild, rename, rm, run → first sorted ("rebuild")
         assert_eq!(pr.input(), "rebuild");
         pr.complete(cands); // cycle to next
+        assert_eq!(pr.input(), "rename");
+        pr.complete(cands); // then rm
         assert_eq!(pr.input(), "rm");
         pr.complete(cands); // then run
         assert_eq!(pr.input(), "run");
@@ -651,6 +664,17 @@ mod tests {
         assert!(parse_line("code").is_err());
         assert!(parse_line("code a b").is_err());
         assert!(parse_line("rm").is_err());
+    }
+
+    #[test]
+    fn parse_rename() {
+        assert_eq!(
+            parse_line("rename old new"),
+            Ok(PromptAction::Rename { instance: "old".into(), new_name: "new".into() })
+        );
+        assert!(parse_line("rename").is_err());
+        assert!(parse_line("rename old").is_err());
+        assert!(parse_line("rename old new extra").is_err());
     }
 
     #[test]

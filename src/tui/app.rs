@@ -32,7 +32,8 @@ Tables (Instances / Services)
   →/space     expand (sandbox instances, instance processes)
   ←           collapse / jump to parent
   enter, e    open config explorer
-  r           run sandbox      o   open in VS Code (Instances)
+  r           run (sandbox) /   o   open in VS Code (Instances)
+              rename (instance)
   s           stop / start     l   logs (Instances tab)
               (stops running / starts exited; s-start is a bare start —
                :start runs services + postStartCommand too; a drifted
@@ -62,7 +63,8 @@ Logs modal
 
 Command prompt (:)
   run <sandbox> [--name n] [--branch b]   exec <instance> <cmd…>
-  code <instance>   rm <instance>   stop <instance>   start <instance>
+  code <instance>   rm <instance>   rename <instance> <new-name>
+  stop <instance>   start <instance>
   tab         complete / cycle
   ↑ ↓         history
   ctrl-u      clear line       ctrl-w  delete word
@@ -637,7 +639,7 @@ impl App {
             KeyCode::Char(' ') if self.tab == Tab::Instances => self.tree_toggle(),
             KeyCode::Left if self.tab == Tab::Instances => self.tree_collapse(),
             KeyCode::Enter | KeyCode::Char('e') => self.open_config(),
-            KeyCode::Char('r') if self.tab == Tab::Instances => self.open_run_prompt(),
+            KeyCode::Char('r') if self.tab == Tab::Instances => self.open_rename_or_run_prompt(),
             KeyCode::Char('o') if self.tab == Tab::Instances => self.attach_code(),
             KeyCode::Char('s') if self.tab == Tab::Instances => self.stop_or_start_instance(),
             KeyCode::Char('l') => self.open_logs(),
@@ -821,6 +823,20 @@ impl App {
             Some(name) => Prompt::with_input(history, format!("run {name} ")),
             None => Prompt::new(history),
         });
+    }
+
+    /// `r` (Instances tab): rename the instance under the cursor (or its process
+    /// row's parent) via the command prompt pre-filled `rename <instance> `.
+    /// Sandbox / empty / orphan-group selections have no instance, so they fall
+    /// back to [`Self::open_run_prompt`] — `r` keeps its run behavior there.
+    fn open_rename_or_run_prompt(&mut self) {
+        let Some(name) = self.selected_instance_name() else {
+            self.open_run_prompt();
+            return;
+        };
+        self.status = None;
+        let history = super::prompt::load_history();
+        self.prompt = Some(Prompt::with_input(history, format!("rename {name} ")));
     }
 
     /// `o` (Instances tab): VS Code attach for the instance under the cursor,
@@ -1071,7 +1087,7 @@ impl App {
         }
         match tokens.first().map(String::as_str) {
             Some("run") => Self::run_candidates(idx, tokens, sandboxes, config),
-            Some("exec" | "code" | "rm" | "stop" | "start" | "rebuild" | "recreate")
+            Some("exec" | "code" | "rm" | "rename" | "stop" | "start" | "rebuild" | "recreate")
                 if idx == 1 =>
             {
                 instances.to_vec()
@@ -1909,13 +1925,13 @@ mod tests {
     }
 
     #[test]
-    fn r_on_instance_prefills_parent_sandbox() {
+    fn r_on_instance_prefills_rename() {
         let mut app = new_app();
         app.set_snapshot(snapshot_with(2)); // [Sandbox(0), inst0, inst1]
         app.on_key(key(KeyCode::Down)); // onto inst0
         assert_eq!(app.selected_node(), Some(Node::Instance(0)));
         app.on_key(key(KeyCode::Char('r')));
-        assert_eq!(prompt(&app).input(), "run s ");
+        assert_eq!(prompt(&app).input(), "rename inst0 ");
     }
 
     #[test]

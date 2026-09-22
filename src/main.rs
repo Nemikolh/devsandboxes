@@ -64,6 +64,13 @@ enum Command {
         #[arg(long, conflicts_with = "name")]
         all: bool,
     },
+    /// Rename an instance (state only; the container keeps its old name)
+    Rename {
+        /// Instance name, sandbox config name, or repository folder name
+        name: String,
+        /// New instance name
+        new_name: String,
+    },
     /// Remove a sandbox instance (container, worktree, state entry)
     Rm {
         /// Instance name, sandbox config name, or repository folder name
@@ -159,6 +166,7 @@ fn main() -> Result<()> {
             commands::run::run(&cli.dir, sandbox, name, branch)
         }
         Command::Rebuild { name, all } => commands::rebuild::rebuild(&cli.dir, name, all),
+        Command::Rename { name, new_name } => commands::rename::rename(&name, &new_name),
         Command::Rm { name } => commands::rm::rm(&name),
         Command::Stop { name, all } => commands::stop::stop(name, all),
         Command::Start { name, all } => commands::start::start(&cli.dir, name, all),

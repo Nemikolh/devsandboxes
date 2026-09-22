@@ -142,6 +142,16 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
                 PromptAction::Code { instance } => {
                     app.status = Some(launch_code(&dir, &app, &instance));
                 }
+                // Rename is pure state I/O: run it in place (no suspend) and
+                // force an immediate resnapshot so the renamed row shows now.
+                PromptAction::Rename { instance, new_name } => {
+                    app.status = Some(match commands::rename::rename(&instance, &new_name) {
+                        Ok(()) => format!("renamed {instance} -> {new_name}"),
+                        Err(e) => format!("rename failed: {e:#}"),
+                    });
+                    last_tick = Instant::now();
+                    pending = Some(spawn_collect(&dir));
+                }
                 other => {
                     run_suspended(terminal, &dir, other)?;
                     // Redraw from scratch: the child scribbled over the screen.
@@ -273,8 +283,8 @@ fn run_suspended(terminal: &mut Term, dir: &Path, action: PromptAction) -> Resul
         PromptAction::Rebuild { instance } => {
             commands::rebuild::rebuild(dir, Some(instance.clone()), false)
         }
-        // `code` never suspends; handled by the caller.
-        PromptAction::Code { .. } => Ok(()),
+        // `code` and `rename` never suspend; handled by the caller.
+        PromptAction::Code { .. } | PromptAction::Rename { .. } => Ok(()),
     };
     if let Err(e) = result {
         match log_error(&action, &e) {
@@ -309,6 +319,7 @@ fn log_error(action: &PromptAction, err: &anyhow::Error) -> Option<PathBuf> {
         PromptAction::Start { .. } => "start",
         PromptAction::Rebuild { .. } => "rebuild",
         PromptAction::Code { .. } => "code",
+        PromptAction::Rename { .. } => "rename",
     };
     let dir = crate::state::State::path().ok()?.parent()?.join("logs");
     std::fs::create_dir_all(&dir).ok()?;
