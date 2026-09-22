@@ -549,7 +549,8 @@ pub fn ls(dir: &Path, json: bool) -> Result<()> {
         })
         .collect();
 
-    let (rows, errors) = crate::snapshot::service_rows(&project, &config, &instance_services, &ps);
+    let (rows, errors) =
+        crate::snapshot::service_rows(dir, &project, &config, &instance_services, &ps);
 
     // JSON path mirrors `ls --json`: emit the same `ServiceRow`s the TUI has, an
     // empty config yields `data: []`, and resolve failures are ignored (the `?`

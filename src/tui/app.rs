@@ -1020,12 +1020,24 @@ impl App {
                 if let Some(action) = prompt.parse() {
                     let line = prompt.input().to_string();
                     super::prompt::append_history(&line);
+                    // `rebuild`/`recreate` parses tab-agnostically as an instance
+                    // action; on the Services tab it targets the named service
+                    // instead. Rewrite here where the tab is known, keeping the
+                    // parser pure.
+                    let action = match action {
+                        PromptAction::Rebuild { instance } if self.tab == Tab::Services => {
+                            PromptAction::ServiceRebuild { name: instance }
+                        }
+                        other => other,
+                    };
                     self.pending_action = Some(action);
                     self.prompt = None;
                 }
             }
             KeyCode::Tab => {
                 let instances = self.instance_names();
+                let services = self.service_names();
+                let tab = self.tab;
                 // One config load per tab: sandbox names for the positional
                 // argument plus `worktree-branch` lookups for `--branch` values.
                 let config = Config::load(&self.dir).ok();
@@ -1035,7 +1047,15 @@ impl App {
                     .unwrap_or_default();
                 if let Some(prompt) = &mut self.prompt {
                     prompt.complete(|idx, tokens| {
-                        Self::candidates_for(idx, tokens, &sandboxes, &instances, config.as_ref())
+                        Self::candidates_for(
+                            tab,
+                            idx,
+                            tokens,
+                            &sandboxes,
+                            &instances,
+                            &services,
+                            config.as_ref(),
+                        )
                     });
                 }
             }
@@ -1075,11 +1095,15 @@ impl App {
     /// Candidate list for the token at `idx` of the whitespace-split `tokens`
     /// (the token being completed is absent when empty): command names for the
     /// first token, sandbox names / flags for `run`, instance names for the rest.
+    /// `rebuild`/`recreate` complete against service names on the Services tab
+    /// (where they rebuild a service) and instance names elsewhere.
     fn candidates_for(
+        tab: Tab,
         idx: usize,
         tokens: &[String],
         sandboxes: &[String],
         instances: &[String],
+        services: &[String],
         config: Option<&Config>,
     ) -> Vec<String> {
         if idx == 0 {
@@ -1087,6 +1111,7 @@ impl App {
         }
         match tokens.first().map(String::as_str) {
             Some("run") => Self::run_candidates(idx, tokens, sandboxes, config),
+            Some("rebuild" | "recreate") if idx == 1 && tab == Tab::Services => services.to_vec(),
             Some("exec" | "code" | "rm" | "rename" | "stop" | "start" | "rebuild" | "recreate")
                 if idx == 1 =>
             {
@@ -1149,6 +1174,13 @@ impl App {
         self.snapshot
             .as_ref()
             .map(|s| s.instances.iter().map(|r| r.name.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    fn service_names(&self) -> Vec<String> {
+        self.snapshot
+            .as_ref()
+            .map(|s| s.services.iter().map(|r| r.name.clone()).collect())
             .unwrap_or_default()
     }
 
@@ -1998,6 +2030,40 @@ mod tests {
     }
 
     #[test]
+    fn prompt_rebuild_on_services_tab_queues_service_rebuild() {
+        let mut app = new_app();
+        app.set_snapshot(snapshot_with(1));
+        app.tab = Tab::Services;
+        app.on_key(key(KeyCode::Char(':')));
+        for c in "rebuild db".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        app.on_key(key(KeyCode::Enter));
+        // On the Services tab, `rebuild <name>` targets the service, not an
+        // instance.
+        assert_eq!(
+            app.take_pending_action(),
+            Some(PromptAction::ServiceRebuild { name: "db".into() }),
+        );
+    }
+
+    #[test]
+    fn prompt_rebuild_on_instances_tab_stays_instance_rebuild() {
+        let mut app = new_app();
+        app.set_snapshot(snapshot_with(1));
+        app.tab = Tab::Instances;
+        app.on_key(key(KeyCode::Char(':')));
+        for c in "rebuild inst0".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(
+            app.take_pending_action(),
+            Some(PromptAction::Rebuild { instance: "inst0".into() }),
+        );
+    }
+
+    #[test]
     fn r_and_o_ignored_on_services_tab() {
         let mut app = new_app();
         app.set_snapshot(snapshot_with(1));
@@ -2734,12 +2800,12 @@ mod tests {
     fn run_candidates_sandbox_position() {
         let sandboxes = vec!["api".to_string(), "web".to_string()];
         assert_eq!(
-            App::candidates_for(1, &toks("run"), &sandboxes, &[], None),
+            App::candidates_for(Tab::Instances, 1, &toks("run"), &sandboxes, &[], &[], None),
             sandboxes
         );
         // Sandbox not on the line yet (only a flag pair) → still sandbox names.
         assert_eq!(
-            App::candidates_for(3, &toks("run --name x"), &sandboxes, &[], None),
+            App::candidates_for(Tab::Instances, 3, &toks("run --name x"), &sandboxes, &[], &[], None),
             sandboxes
         );
     }
@@ -2749,17 +2815,17 @@ mod tests {
         let sandboxes = vec!["web".to_string()];
         // Empty token after the sandbox → the flags.
         assert_eq!(
-            App::candidates_for(2, &toks("run web"), &sandboxes, &[], None),
+            App::candidates_for(Tab::Instances, 2, &toks("run web"), &sandboxes, &[], &[], None),
             vec!["--name".to_string(), "--branch".to_string()]
         );
         // A `--` stem too (the prompt then filters by the stem).
         assert_eq!(
-            App::candidates_for(2, &toks("run web --"), &sandboxes, &[], None),
+            App::candidates_for(Tab::Instances, 2, &toks("run web --"), &sandboxes, &[], &[], None),
             vec!["--name".to_string(), "--branch".to_string()]
         );
         // A flag already used is not offered again.
         assert_eq!(
-            App::candidates_for(4, &toks("run web --name x"), &sandboxes, &[], None),
+            App::candidates_for(Tab::Instances, 4, &toks("run web --name x"), &sandboxes, &[], &[], None),
             vec!["--branch".to_string()]
         );
     }
@@ -2770,16 +2836,16 @@ mod tests {
         let sandboxes: Vec<String> = config.sandboxes.keys().cloned().collect();
         // Sandbox with `worktree-branch` → its pattern as the editable base.
         assert_eq!(
-            App::candidates_for(3, &toks("run web --branch"), &sandboxes, &[], Some(&config)),
+            App::candidates_for(Tab::Instances, 3, &toks("run web --branch"), &sandboxes, &[], &[], Some(&config)),
             vec!["wt/${instance}".to_string()]
         );
         // Without one → the built-in default pattern.
         assert_eq!(
-            App::candidates_for(3, &toks("run api --branch"), &sandboxes, &[], Some(&config)),
+            App::candidates_for(Tab::Instances, 3, &toks("run api --branch"), &sandboxes, &[], &[], Some(&config)),
             vec![DEFAULT_WORKTREE_BRANCH.to_string()]
         );
         // `--name` values are free-form: no candidates.
-        assert!(App::candidates_for(3, &toks("run web --name"), &sandboxes, &[], Some(&config))
+        assert!(App::candidates_for(Tab::Instances, 3, &toks("run web --name"), &sandboxes, &[], &[], Some(&config))
             .is_empty());
     }
 
@@ -2787,12 +2853,43 @@ mod tests {
     fn rebuild_completes_instance_names() {
         let instances = vec!["a".to_string(), "b".to_string()];
         assert_eq!(
-            App::candidates_for(1, &toks("rebuild"), &[], &instances, None),
+            App::candidates_for(Tab::Instances, 1, &toks("rebuild"), &[], &instances, &[], None),
             instances
         );
         assert_eq!(
-            App::candidates_for(1, &toks("recreate"), &[], &instances, None),
+            App::candidates_for(Tab::Instances, 1, &toks("recreate"), &[], &instances, &[], None),
             instances
+        );
+    }
+
+    #[test]
+    fn rebuild_completes_service_names_on_services_tab() {
+        let instances = vec!["a".to_string(), "b".to_string()];
+        let services = vec!["cache".to_string(), "db".to_string()];
+        // Services tab: `rebuild`/`recreate` offer service names, not instances.
+        assert_eq!(
+            App::candidates_for(
+                Tab::Services,
+                1,
+                &toks("rebuild"),
+                &[],
+                &instances,
+                &services,
+                None,
+            ),
+            services
+        );
+        assert_eq!(
+            App::candidates_for(
+                Tab::Services,
+                1,
+                &toks("recreate"),
+                &[],
+                &instances,
+                &services,
+                None,
+            ),
+            services
         );
     }
 
@@ -2815,6 +2912,7 @@ mod tests {
                 env_len: 0,
                 command: None,
                 config_hash: "hash".into(),
+                drift: false,
             }],
             sandbox_count: 0,
             runtime_name: "docker",

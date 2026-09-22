@@ -298,8 +298,20 @@ fn service_row(r: &ServiceRow) -> Row<'_> {
     } else {
         r.used_by.join(",")
     };
+    // Drifted services get a subtle yellow `!` suffix on the NAME cell (the
+    // Instances tab only shows drift in the Detail panel; the Services table is
+    // flatter, so a name marker is the least-noisy live signal). The Detail
+    // panel spells the drift out.
+    let name = if r.drift {
+        Cell::from(Line::from(vec![
+            Span::raw(r.name.clone()),
+            Span::styled(" !", Style::default().fg(Color::Yellow)),
+        ]))
+    } else {
+        Cell::from(r.name.clone())
+    };
     Row::new(vec![
-        Cell::from(r.name.clone()),
+        name,
         Cell::from(Span::styled(r.scope.to_string(), scope_style(r.scope))),
         Cell::from(Span::styled(r.source.clone(), source_style(&r.source))),
         Cell::from(ports),
@@ -397,6 +409,12 @@ fn draw_service_detail(
     }
     if !r.config_hash.is_empty() {
         lines.push(kv("config hash", &r.config_hash));
+    }
+    if r.drift {
+        lines.push(Line::from(Span::styled(
+            "drift: config or dockerfile changed since the container was created (:rebuild)",
+            Style::default().fg(Color::Yellow),
+        )));
     }
 
     frame.render_widget(Paragraph::new(lines).block(block), area);
@@ -882,7 +900,7 @@ fn instance_detail(r: &InstanceRow, agent_count: Option<usize>) -> Vec<Line<'_>>
     }
     if r.drift {
         lines.push(Line::from(Span::styled(
-            "config drift: container was created from an older config",
+            "drift: config or dockerfile changed since the container was created",
             Style::default().fg(Color::Yellow),
         )));
     }

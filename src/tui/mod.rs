@@ -283,6 +283,7 @@ fn run_suspended(terminal: &mut Term, dir: &Path, action: PromptAction) -> Resul
         PromptAction::Rebuild { instance } => {
             commands::rebuild::rebuild(dir, Some(instance.clone()), false)
         }
+        PromptAction::ServiceRebuild { name } => commands::services::rebuild(dir, name),
         // `code` and `rename` never suspend; handled by the caller.
         PromptAction::Code { .. } | PromptAction::Rename { .. } => Ok(()),
     };
@@ -318,6 +319,7 @@ fn log_error(action: &PromptAction, err: &anyhow::Error) -> Option<PathBuf> {
         PromptAction::Stop { .. } => "stop",
         PromptAction::Start { .. } => "start",
         PromptAction::Rebuild { .. } => "rebuild",
+        PromptAction::ServiceRebuild { .. } => "service rebuild",
         PromptAction::Code { .. } => "code",
         PromptAction::Rename { .. } => "rename",
     };

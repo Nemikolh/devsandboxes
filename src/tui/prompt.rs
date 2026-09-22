@@ -30,6 +30,10 @@ pub enum PromptAction {
     Stop { instance: String },
     Start { instance: String },
     Rebuild { instance: String },
+    /// `rebuild`/`recreate` on the Services tab: recreate the named service's
+    /// backing containers. The parser emits [`PromptAction::Rebuild`]
+    /// tab-agnostically; `App` rewrites it to this on the Services tab.
+    ServiceRebuild { name: String },
 }
 
 /// In-flight tab-completion over a single token.

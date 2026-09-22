@@ -235,6 +235,7 @@ mod tests {
             env_len: 0,
             command: None,
             config_hash: String::new(),
+            drift: false,
         }
     }
 

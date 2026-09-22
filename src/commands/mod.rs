@@ -109,7 +109,11 @@ pub(crate) fn container_drifted(
 
 /// The pure drift decision behind [`container_drifted`], split out so it can be
 /// table-tested without a runtime. See [`container_drifted`] for the rule.
-fn drift_decision(
+///
+/// Shared with the snapshot's service join (`snapshot::build_service_rows`),
+/// which applies the same rule against the labels already carried by the `ps`
+/// listing rather than paying a per-container `inspect`.
+pub(crate) fn drift_decision(
     config_label: Option<&str>,
     expected_config: &str,
     build_label: Option<&str>,

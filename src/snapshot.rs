@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use serde::Serialize;
 
-use crate::commands::container_drifted;
+use crate::commands::{container_drifted, drift_decision};
 use crate::commands::services::{isolated_service_container, project_id, service_container};
 use crate::config::{build_hash, Config, MountContext, ResolvedSandbox, ServiceScope};
 use crate::runtime::{backend, ContainerRow, NAME_PREFIX};
@@ -107,6 +107,11 @@ pub struct ServiceRow {
     pub command: Option<String>,
     /// Short config hash, empty when unresolved.
     pub config_hash: String,
+    /// True when any backing container drifted from the current config or
+    /// dockerfile (OR over `containers`). Computed in the pure join from the
+    /// labels the `ps` listing already carries, so it costs zero extra docker
+    /// calls. `service ls --json` serializes it for free.
+    pub drift: bool,
 }
 
 /// A point-in-time view of instances plus any collection error (docker/config
@@ -152,6 +157,10 @@ struct ResolvedServiceInput {
     env_len: usize,
     command: Option<String>,
     config_hash: String,
+    /// Short hash of the service's dockerfile contents, empty when image-based or
+    /// no dockerfile. Drift-only; resolved once per service by `service_rows` (it
+    /// has the `dir`) so the pure join can apply the shared drift rule.
+    build_hash: String,
 }
 
 /// The `extends` template chain from a raw sandbox table value, as a name list
@@ -184,10 +193,12 @@ fn service_source(spec: &crate::config::Service) -> String {
 /// resolve (`?` placeholder rows still render). The config resolution is the only
 /// impure-ish part (pure config work, no docker); the docker listing `ps` and the
 /// `instance_services` pairing are passed in so `collect` and `commands::services::ls`
-/// build the Services view identically and cannot drift. `project` scopes
+/// build the Services view identically and cannot drift. `dir` is the config
+/// root, used to hash each service's dockerfile for drift. `project` scopes
 /// container names; `instance_services` pairs every relevant instance name with
 /// the service list of its resolved sandbox.
 pub fn service_rows(
+    dir: &Path,
     project: &str,
     config: &Config,
     instance_services: &[(String, Vec<String>)],
@@ -207,6 +218,7 @@ pub fn service_rows(
                     env_len: rs.spec.env.len(),
                     command: rs.spec.command.as_ref().map(|c| c.to_vec().join(" ")),
                     config_hash: rs.config_hash,
+                    build_hash: build_hash(dir, rs.spec.build.as_ref()),
                 }),
             },
             Err(e) => {
@@ -237,24 +249,27 @@ fn build_service_rows(
                 .map(|(inst, _)| inst.clone())
                 .collect();
 
-            let (scope, source, ports, env_len, command, config_hash) = match &svc.resolved {
-                Some(r) => (
-                    r.scope,
-                    r.source.clone(),
-                    r.ports.clone(),
-                    r.env_len,
-                    r.command.clone(),
-                    r.config_hash.clone(),
-                ),
-                None => (
-                    ServiceScope::Isolated,
-                    "?".to_string(),
-                    Vec::new(),
-                    0,
-                    None,
-                    String::new(),
-                ),
-            };
+            let (scope, source, ports, env_len, command, config_hash, build_hash) =
+                match &svc.resolved {
+                    Some(r) => (
+                        r.scope,
+                        r.source.clone(),
+                        r.ports.clone(),
+                        r.env_len,
+                        r.command.clone(),
+                        r.config_hash.clone(),
+                        r.build_hash.clone(),
+                    ),
+                    None => (
+                        ServiceScope::Isolated,
+                        "?".to_string(),
+                        Vec::new(),
+                        0,
+                        None,
+                        String::new(),
+                        String::new(),
+                    ),
+                };
 
             let containers: Vec<(String, ContainerStatus)> = match scope {
                 ServiceScope::Global => {
@@ -272,6 +287,15 @@ fn build_service_rows(
                     .collect(),
             };
 
+            // Drift: OR the shared drift rule over every backing container found
+            // in the `ps` listing. The labels are already on the row (`gc` reads
+            // them the same way), so this join adds no docker calls. A missing
+            // container or missing label contributes nothing — the lenient rule
+            // shared with the instance drift path.
+            let drift = containers.iter().any(|(name, _)| {
+                service_container_drifted(name, &config_hash, &build_hash, ps)
+            });
+
             ServiceRow {
                 name: svc.name.clone(),
                 scope: match scope {
@@ -285,9 +309,32 @@ fn build_service_rows(
                 env_len,
                 command,
                 config_hash,
+                drift,
             }
         })
         .collect()
+}
+
+/// Whether one backing service container drifted, applying the shared
+/// [`drift_decision`] rule against the labels the `ps` listing already carries.
+/// A container absent from `ps` (never created, or removed) is not drift — you
+/// can't be stale against a config you were never built from. Zero docker calls:
+/// the labels ride along on the listing rows.
+fn service_container_drifted(
+    container: &str,
+    expected_config: &str,
+    expected_build: &str,
+    ps: &[ContainerRow],
+) -> bool {
+    match ps.iter().find(|row| row.name == container) {
+        Some(row) => drift_decision(
+            row.label("devsandbox.config_hash"),
+            expected_config,
+            row.label("devsandbox.build_hash"),
+            expected_build,
+        ),
+        None => false,
+    }
 }
 
 /// Classify a container by name against the runtime's listing. Treat
@@ -556,7 +603,7 @@ pub fn collect(dir: &Path) -> Snapshot {
 
     let services = match (&config, project_id(dir)) {
         (Ok(cfg), Ok(project)) => {
-            let (rows, mut svc_errors) = service_rows(&project, cfg, &instance_services, &ps);
+            let (rows, mut svc_errors) = service_rows(dir, &project, cfg, &instance_services, &ps);
             errors.append(&mut svc_errors);
             rows
         }
@@ -668,7 +715,19 @@ extends = "does-not-exist"
             env_len: 2,
             command: Some("redis-server".to_string()),
             config_hash: "deadbeef".to_string(),
+            build_hash: String::new(),
         }
+    }
+
+    /// A `ps` row carrying the two drift labels, mirroring what the runtime
+    /// listing attaches at container-create time.
+    fn ps_labeled(name: &str, config_hash: &str, build_hash: &str) -> ContainerRow {
+        let mut row = ps_line(name, "Up 1s", "running");
+        row.labels
+            .insert("devsandbox.config_hash".into(), config_hash.into());
+        row.labels
+            .insert("devsandbox.build_hash".into(), build_hash.into());
+        row
     }
 
     #[test]
@@ -755,6 +814,59 @@ extends = "does-not-exist"
         let rows = build_service_rows("proj", &inputs, &[], &[]);
         assert!(rows[0].used_by.is_empty());
         assert!(rows[0].containers.is_empty());
+    }
+
+    /// Drift builder: a global service whose container's `config_hash` label
+    /// differs from the resolved hash flags drift; matching labels do not; a
+    /// missing label (pre-upgrade container) stays lenient; and a differing
+    /// build hash flags even when the config hash matches.
+    #[test]
+    fn service_drift_follows_container_labels() {
+        let mut input = resolved(ServiceScope::Global, "dockerfile Dockerfile", &["5432"]);
+        input.config_hash = "cfg".into();
+        input.build_hash = "bld".into();
+        let inputs = vec![ServiceInput { name: "db".into(), resolved: Some(input) }];
+        let instance_services = vec![("repo".to_string(), vec!["db".to_string()])];
+        let name = "devsandbox-svc-proj-db";
+
+        // Both labels match → no drift.
+        let ps = vec![ps_labeled(name, "cfg", "bld")];
+        assert!(!build_service_rows("proj", &inputs, &instance_services, &ps)[0].drift);
+
+        // Config label differs → drift.
+        let ps = vec![ps_labeled(name, "old", "bld")];
+        assert!(build_service_rows("proj", &inputs, &instance_services, &ps)[0].drift);
+
+        // Build label differs (config matches) → drift.
+        let ps = vec![ps_labeled(name, "cfg", "old")];
+        assert!(build_service_rows("proj", &inputs, &instance_services, &ps)[0].drift);
+
+        // No labels at all (pre-upgrade container) → lenient, no drift.
+        let ps = vec![ps_line(name, "Up 1s", "running")];
+        assert!(!build_service_rows("proj", &inputs, &instance_services, &ps)[0].drift);
+
+        // Container absent from ps → no drift (nothing to be stale against).
+        assert!(!build_service_rows("proj", &inputs, &instance_services, &[])[0].drift);
+    }
+
+    /// Isolated drift ORs over every backing container: one stale instance
+    /// container flags the whole row.
+    #[test]
+    fn isolated_service_drift_ors_over_containers() {
+        let mut input = resolved(ServiceScope::Isolated, "dockerfile Dockerfile", &["6379"]);
+        input.config_hash = "cfg".into();
+        input.build_hash = String::new();
+        let inputs = vec![ServiceInput { name: "cache".into(), resolved: Some(input) }];
+        let instance_services = vec![
+            ("repo".to_string(), vec!["cache".to_string()]),
+            ("repo-2".to_string(), vec!["cache".to_string()]),
+        ];
+        // repo current, repo-2 stale on config.
+        let ps = vec![
+            ps_labeled("devsandbox-svc-proj-repo-cache", "cfg", ""),
+            ps_labeled("devsandbox-svc-proj-repo-2-cache", "old", ""),
+        ];
+        assert!(build_service_rows("proj", &inputs, &instance_services, &ps)[0].drift);
     }
 
     #[test]
