@@ -896,7 +896,8 @@ impl App {
                 // Config drifted: recreate the container (worktree preserved) via
                 // the modal suspend path instead of a bare start. No `starting`
                 // guard — that's for background ops; the suspend is modal.
-                self.pending_action = Some(PromptAction::Rebuild { instance: name });
+                self.pending_action =
+                    Some(PromptAction::Rebuild { instance: name, force: false });
             }
             ContainerStatus::Exited(_) => {
                 self.status = Some(format!("starting {name}…"));
@@ -907,7 +908,8 @@ impl App {
                 // No container to start: recreate it via the CLI rebuild on the
                 // suspend path (its "config label gone → rebuild anyway" rule
                 // covers exactly this).
-                self.pending_action = Some(PromptAction::Rebuild { instance: name });
+                self.pending_action =
+                    Some(PromptAction::Rebuild { instance: name, force: false });
             }
         }
     }
@@ -1048,7 +1050,8 @@ impl App {
                     // instead. Rewrite here where the tab is known, keeping the
                     // parser pure.
                     let action = match action {
-                        PromptAction::Rebuild { instance } if self.tab == Tab::Services => {
+                        // `force` is dropped: service rebuild always recreates.
+                        PromptAction::Rebuild { instance, .. } if self.tab == Tab::Services => {
                             PromptAction::ServiceRebuild { name: instance }
                         }
                         other => other,
@@ -2082,7 +2085,7 @@ mod tests {
         app.on_key(key(KeyCode::Enter));
         assert_eq!(
             app.take_pending_action(),
-            Some(PromptAction::Rebuild { instance: "inst0".into() }),
+            Some(PromptAction::Rebuild { instance: "inst0".into(), force: false }),
         );
     }
 
@@ -2146,7 +2149,7 @@ mod tests {
         app.on_key(key(KeyCode::Char('s')));
         assert_eq!(
             app.take_pending_action(),
-            Some(PromptAction::Rebuild { instance: "inst0".into() })
+            Some(PromptAction::Rebuild { instance: "inst0".into(), force: false })
         );
         // Drift takes the suspend path, not the background start guard.
         assert_eq!(app.take_pending_start(), None);
@@ -2191,7 +2194,7 @@ mod tests {
         app.on_key(key(KeyCode::Char('s')));
         assert_eq!(
             app.take_pending_action(),
-            Some(PromptAction::Rebuild { instance: "inst0".into() })
+            Some(PromptAction::Rebuild { instance: "inst0".into(), force: false })
         );
         assert_eq!(app.take_pending_stop(), None);
         assert_eq!(app.take_pending_start(), None);

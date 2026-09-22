@@ -282,8 +282,8 @@ fn run_suspended(terminal: &mut Term, dir: &Path, action: PromptAction) -> Resul
         PromptAction::Start { instance } => {
             commands::start::start(dir, Some(instance.clone()), false)
         }
-        PromptAction::Rebuild { instance } => {
-            commands::rebuild::rebuild(dir, Some(instance.clone()), false)
+        PromptAction::Rebuild { instance, force } => {
+            commands::rebuild::rebuild(dir, Some(instance.clone()), false, *force)
         }
         PromptAction::ServiceRebuild { name } => commands::services::rebuild(dir, name),
         // `code` and `rename` never suspend; handled by the caller.

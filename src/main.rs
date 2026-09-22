@@ -63,6 +63,10 @@ enum Command {
         /// Rebuild every instance whose config has drifted
         #[arg(long, conflicts_with = "name")]
         all: bool,
+        /// Recreate even without config drift (picks up devsandbox-side
+        /// behavior changes the drift hashes cannot see)
+        #[arg(long)]
+        force: bool,
     },
     /// Rename an instance (state only; the container keeps its old name)
     Rename {
@@ -186,7 +190,9 @@ fn main() -> Result<()> {
         Command::Run { sandbox, name, branch } => {
             commands::run::run(&cli.dir, sandbox, name, branch)
         }
-        Command::Rebuild { name, all } => commands::rebuild::rebuild(&cli.dir, name, all),
+        Command::Rebuild { name, all, force } => {
+            commands::rebuild::rebuild(&cli.dir, name, all, force)
+        }
         Command::Rename { name, new_name } => commands::rename::rename(&name, &new_name),
         Command::Rm { name } => commands::rm::rm(&name),
         Command::Stop { name, all } => commands::stop::stop(name, all),

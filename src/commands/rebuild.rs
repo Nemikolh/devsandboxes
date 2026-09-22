@@ -10,14 +10,17 @@ use crate::state::{Instance, State};
 /// Recreate an instance's container from the *current* config, preserving the
 /// worktree, branch, instance identity (name *and* persistent id, so shell
 /// history and `${instance}`-anchored mounts stay put even after a rename).
-/// No config drift is a no-op with a message.
-/// `--all` rebuilds every drifted instance, skipping (with a note) ones that
-/// don't resolve here instead of aborting the batch.
+/// No config drift is a no-op with a message, unless `force` — the escape
+/// hatch for devsandbox-side behavior changes (rc wiring, mount layout, …)
+/// that the drift hashes cannot see.
+/// `--all` rebuilds every drifted instance (every instance with `force`),
+/// skipping (with a note) ones that don't resolve here instead of aborting the
+/// batch.
 ///
 /// Unlike `start`, which falls back to a bare container start when the config
 /// no longer resolves, `rebuild` bails: re-materializing against a config that
 /// doesn't match the instance would silently rebuild it wrong.
-pub fn rebuild(dir: &Path, name: Option<String>, all: bool) -> Result<()> {
+pub fn rebuild(dir: &Path, name: Option<String>, all: bool, force: bool) -> Result<()> {
     let mut state = State::load()?;
     let config = Config::load(dir).context("cannot load config to rebuild against")?;
     let project = services::project_id(dir)?;
@@ -36,7 +39,7 @@ pub fn rebuild(dir: &Path, name: Option<String>, all: bool) -> Result<()> {
                     continue;
                 }
             };
-            if !needs_rebuild(dir, &info.container, &sandbox)? {
+            if !force && !needs_rebuild(dir, &info.container, &sandbox)? {
                 continue;
             }
             rebuild_instance(dir, &config, &sandbox, &key, &mut state)?;
@@ -53,8 +56,8 @@ pub fn rebuild(dir: &Path, name: Option<String>, all: bool) -> Result<()> {
     let info = state.instances.get(&key).expect("key came from state");
     let sandbox = resolve(&config, info, &project, &key)?;
 
-    if !needs_rebuild(dir, &info.container, &sandbox)? {
-        println!("no config drift for `{key}`; nothing to do");
+    if !force && !needs_rebuild(dir, &info.container, &sandbox)? {
+        println!("no config drift for `{key}`; nothing to do (--force overrides)");
         return Ok(());
     }
     rebuild_instance(dir, &config, &sandbox, &key, &mut state)

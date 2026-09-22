@@ -182,8 +182,10 @@ listed when stdin is not a TTY.
    instance's container from the current config when it has drifted; the
    worktree, branch, instance name, and per-instance state (shell history,
    `${instance}` mounts) are kept and the lifecycle commands re-run. No drift →
-   no-op (safe to run speculatively). `--all` rebuilds every drifted instance,
-   skipping ones from other config roots. The fix for the config-drift warning.
+   no-op (safe to run speculatively); `--force` recreates anyway (picks up
+   devsandbox-side behavior changes the drift hashes cannot see). `--all`
+   rebuilds every drifted instance (every instance with `--force`), skipping
+   ones from other config roots. The fix for the config-drift warning.
 
 10. **`rm <name>`** — remove container, its worktree (prompts to delete the
    `sandbox/<instance>` branch on a TTY), isolated services, per-instance network,

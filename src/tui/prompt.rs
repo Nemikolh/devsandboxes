@@ -29,7 +29,7 @@ pub enum PromptAction {
     Rm { instance: String },
     Stop { instance: String },
     Start { instance: String },
-    Rebuild { instance: String },
+    Rebuild { instance: String, force: bool },
     /// `rebuild`/`recreate` on the Services tab: recreate the named service's
     /// backing containers. The parser emits [`PromptAction::Rebuild`]
     /// tab-agnostically; `App` rewrites it to this on the Services tab.
@@ -440,11 +440,26 @@ fn parse_line(line: &str) -> Result<PromptAction, String> {
             Ok(PromptAction::Start { instance: (*instance).to_string() })
         }
         // `recreate` is an alias, mirroring the CLI's `rebuild`/`recreate`.
+        // `--force` skips the drift check, like the CLI flag.
         "rebuild" | "recreate" => {
-            let [instance] = rest else {
-                return Err("usage: rebuild <instance>".into());
-            };
-            Ok(PromptAction::Rebuild { instance: (*instance).to_string() })
+            let mut force = false;
+            let mut instance: Option<String> = None;
+            for tok in rest {
+                match *tok {
+                    "--force" => force = true,
+                    other if other.starts_with("--") => {
+                        return Err(format!("unknown flag `{other}`"));
+                    }
+                    other => {
+                        if instance.is_some() {
+                            return Err("usage: rebuild [--force] <instance>".into());
+                        }
+                        instance = Some(other.to_string());
+                    }
+                }
+            }
+            let instance = instance.ok_or("usage: rebuild [--force] <instance>")?;
+            Ok(PromptAction::Rebuild { instance, force })
         }
         other => Err(format!(
             "unknown command `{other}` (run, exec, code, rm, rename, stop, start, rebuild)"
@@ -699,13 +714,24 @@ mod tests {
     fn parse_rebuild_and_recreate_alias() {
         assert_eq!(
             parse_line("rebuild box"),
-            Ok(PromptAction::Rebuild { instance: "box".into() })
+            Ok(PromptAction::Rebuild { instance: "box".into(), force: false })
         );
         assert_eq!(
             parse_line("recreate box"),
-            Ok(PromptAction::Rebuild { instance: "box".into() })
+            Ok(PromptAction::Rebuild { instance: "box".into(), force: false })
+        );
+        // `--force` skips the drift check; position-independent like the CLI.
+        assert_eq!(
+            parse_line("rebuild --force box"),
+            Ok(PromptAction::Rebuild { instance: "box".into(), force: true })
+        );
+        assert_eq!(
+            parse_line("rebuild box --force"),
+            Ok(PromptAction::Rebuild { instance: "box".into(), force: true })
         );
         assert!(parse_line("rebuild").is_err());
+        assert!(parse_line("rebuild --force").is_err());
+        assert!(parse_line("rebuild --bogus box").is_err());
         assert!(parse_line("rebuild a b").is_err());
         assert!(parse_line("recreate").is_err());
     }
