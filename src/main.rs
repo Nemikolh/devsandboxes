@@ -161,6 +161,12 @@ enum ServiceCommand {
         /// Service name from config.toml
         name: String,
     },
+    /// List the services defined in config.toml
+    Ls {
+        /// Output JSON instead of a table
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -188,6 +194,7 @@ fn main() -> Result<()> {
         Command::Gc { force } => commands::services::gc(&cli.dir, force),
         Command::Service { cmd } => match cmd {
             ServiceCommand::Rebuild { name } => commands::services::rebuild(&cli.dir, &name),
+            ServiceCommand::Ls { json } => commands::services::ls(&cli.dir, json),
         },
         Command::Logs { name, lines } => commands::logs::logs(&name, lines),
         Command::Inspect { name, json } => commands::inspect::inspect(&name, json),

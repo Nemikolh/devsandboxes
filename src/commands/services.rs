@@ -4,7 +4,9 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 
 use super::container_drifted;
+use crate::commands::status::Envelope;
 use crate::config::{build_hash, short_hash, Build, Config, ResolvedService, ServiceScope};
+use crate::render::{bold_cyan, dim, green, magenta, yellow};
 use crate::runtime::{backend, Backend, ServiceEndpoint, NAME_PREFIX};
 use crate::state::State;
 
@@ -508,6 +510,186 @@ pub fn rebuild(dir: &Path, name: &str) -> Result<()> {
     Ok(())
 }
 
+const LS_HEADERS: [&str; 6] = ["NAME", "SCOPE", "SOURCE", "PORTS", "USED BY", "STATUS"];
+
+/// List the services defined in this config root, mirroring `commands::ls` for
+/// sandboxes. Shares `snapshot::service_rows` with the TUI so the two views
+/// cannot drift. Docker being down is data, not failure: the runtime error goes
+/// to stderr and rows still render (statuses `missing`), matching the snapshot.
+pub fn ls(dir: &Path, json: bool) -> Result<()> {
+    let config = Config::load(dir)?;
+    let project = project_id(dir)?;
+
+    // Container statuses come from one listing; a runtime that is down leaves an
+    // empty ps so every status renders `missing` rather than aborting the command.
+    let ps = match backend().list(true, NAME_PREFIX) {
+        Ok(rows) => rows,
+        Err(e) => {
+            eprintln!("{} unavailable: {e:#}", backend().name());
+            Vec::new()
+        }
+    };
+
+    // Which services each instance of this config root references, derived from
+    // state+config directly (no full snapshot): every state instance whose
+    // sandbox resolves in this config, paired with that sandbox's service list.
+    // Same config-root filter as `service_refs`.
+    let state = State::load()?;
+    let instance_services: Vec<(String, Vec<String>)> = state
+        .instances
+        .iter()
+        .filter(|(_, inst)| config.sandboxes.contains_key(&inst.sandbox))
+        .map(|(name, inst)| {
+            let services = config
+                .resolve_sandbox(&inst.sandbox)
+                .ok()
+                .and_then(|sb| sb.properties.services.clone())
+                .unwrap_or_default();
+            (name.clone(), services)
+        })
+        .collect();
+
+    let (rows, errors) = crate::snapshot::service_rows(&project, &config, &instance_services, &ps);
+
+    // JSON path mirrors `ls --json`: emit the same `ServiceRow`s the TUI has, an
+    // empty config yields `data: []`, and resolve failures are ignored (the `?`
+    // source row is the signal), not surfaced as errors.
+    if json {
+        let out = serde_json::to_string_pretty(&Envelope::new(rows))
+            .context("serialize services")?;
+        println!("{out}");
+        return Ok(());
+    }
+
+    // Table path surfaces resolve failures on stderr (like the snapshot folds
+    // them into `error`), but still prints the rows.
+    for err in &errors {
+        eprintln!("{err}");
+    }
+
+    if rows.is_empty() {
+        println!("no services defined in {}/config.toml", dir.display());
+        return Ok(());
+    }
+
+    // Plain cells (width math) and colored cells (display) kept in lockstep so
+    // widths derive from visible text, not escapes — same shape as `commands::ls`.
+    let mut plain: Vec<[String; 6]> = Vec::with_capacity(rows.len());
+    let mut colored: Vec<[String; 6]> = Vec::with_capacity(rows.len());
+
+    for row in &rows {
+        let ports = if row.ports.is_empty() { None } else { Some(row.ports.join(", ")) };
+        let used_by = if row.used_by.is_empty() { None } else { Some(row.used_by.join(", ")) };
+        let status = ls_status_cell(&row.containers);
+
+        plain.push([
+            row.name.clone(),
+            row.scope.to_string(),
+            row.source.clone(),
+            ports.clone().unwrap_or_else(|| "-".to_string()),
+            used_by.clone().unwrap_or_else(|| "-".to_string()),
+            status.clone(),
+        ]);
+        colored.push([
+            bold_cyan(&row.name),
+            row.scope.to_string(),
+            ls_color_source(&row.source),
+            match ports {
+                Some(p) => magenta(&p),
+                None => dim("-"),
+            },
+            match used_by {
+                Some(u) => u,
+                None => dim("-"),
+            },
+            ls_color_status(&status),
+        ]);
+    }
+
+    let widths = ls_column_widths(&LS_HEADERS, &plain);
+    print!("{}", ls_format_row(&LS_HEADERS.map(|h| dim(h)), &LS_HEADERS.map(str::to_string), &widths));
+    for (colored_row, plain_row) in colored.iter().zip(&plain) {
+        print!("{}", ls_format_row(colored_row, plain_row, &widths));
+    }
+    Ok(())
+}
+
+/// STATUS cell from a service's backing containers: `-` when it has none,
+/// `missing` when none of them exist (never created, removed, or the runtime
+/// is down — calling that `stopped` would overstate), `running`/`stopped` when
+/// all existing ones share one state, else `<up>/<total> running`.
+fn ls_status_cell(containers: &[(String, crate::snapshot::ContainerStatus)]) -> String {
+    use crate::snapshot::ContainerStatus;
+    if containers.is_empty() {
+        return "-".to_string();
+    }
+    if containers.iter().all(|(_, s)| matches!(s, ContainerStatus::Missing)) {
+        return "missing".to_string();
+    }
+    let running = containers
+        .iter()
+        .filter(|(_, s)| matches!(s, ContainerStatus::Running(_)))
+        .count();
+    let total = containers.len();
+    if running == total {
+        "running".to_string()
+    } else if running == 0 {
+        "stopped".to_string()
+    } else {
+        format!("{running}/{total} running")
+    }
+}
+
+/// Color the SOURCE cell like `commands::ls::color_source`.
+fn ls_color_source(source: &str) -> String {
+    if source.starts_with("image ") {
+        green(source)
+    } else if source.starts_with("dockerfile ") {
+        yellow(source)
+    } else {
+        source.to_string()
+    }
+}
+
+/// Color the STATUS cell: green when fully running, dim when absent or never
+/// created, else yellow.
+fn ls_color_status(status: &str) -> String {
+    match status {
+        "running" => green(status),
+        "-" | "missing" => dim(status),
+        _ => yellow(status),
+    }
+}
+
+/// Widest plain cell per column, header included (mirrors `commands::ls`).
+fn ls_column_widths(headers: &[&str; 6], rows: &[[String; 6]]) -> [usize; 6] {
+    let mut widths = headers.map(str::len);
+    for row in rows {
+        for (i, cell) in row.iter().enumerate() {
+            widths[i] = widths[i].max(cell.len());
+        }
+    }
+    widths
+}
+
+/// Render one row with a two-space gutter, padding colored cells to plain widths,
+/// no trailing pad on the last column (mirrors `commands::ls`).
+fn ls_format_row(colored: &[String; 6], plain: &[String; 6], widths: &[usize; 6]) -> String {
+    let mut out = String::new();
+    for i in 0..6 {
+        if i > 0 {
+            out.push_str("  ");
+        }
+        out.push_str(&colored[i]);
+        if i < 5 {
+            let pad = widths[i] - plain[i].len();
+            out.extend(std::iter::repeat(' ').take(pad));
+        }
+    }
+    out.push('\n');
+    out
+}
+
 /// Delete `shared-volumes/history/<instance>/` dirs (and legacy flat
 /// `<instance>.zsh_history` files from the pre-directory layout) whose instance
 /// is gone from state (any config root: instance names are global, so a match
@@ -561,6 +743,23 @@ mod tests {
 
     fn service(toml: &str) -> ResolvedService {
         Config::parse(toml).unwrap().resolve_service("db").unwrap()
+    }
+
+    #[test]
+    fn ls_status_cell_summarizes_containers() {
+        use crate::snapshot::ContainerStatus::{Exited, Missing, Running};
+        let up = |n: &str| (n.to_string(), Running("Up".into()));
+        let down = |n: &str| (n.to_string(), Exited("Exited".into()));
+        let gone = |n: &str| (n.to_string(), Missing);
+
+        assert_eq!(ls_status_cell(&[]), "-");
+        assert_eq!(ls_status_cell(&[up("a")]), "running");
+        assert_eq!(ls_status_cell(&[down("a")]), "stopped");
+        assert_eq!(ls_status_cell(&[gone("a")]), "missing");
+        assert_eq!(ls_status_cell(&[gone("a"), gone("b")]), "missing");
+        assert_eq!(ls_status_cell(&[up("a"), up("b")]), "running");
+        assert_eq!(ls_status_cell(&[up("a"), down("b")]), "1/2 running");
+        assert_eq!(ls_status_cell(&[up("a"), gone("b"), down("c")]), "1/3 running");
     }
 
     #[test]

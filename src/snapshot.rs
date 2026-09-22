@@ -179,6 +179,45 @@ fn service_source(spec: &crate::config::Service) -> String {
     "?".into()
 }
 
+/// Resolve every configured service into [`ServiceInput`]s and join them against
+/// docker state, returning the rows plus one message per service that failed to
+/// resolve (`?` placeholder rows still render). The config resolution is the only
+/// impure-ish part (pure config work, no docker); the docker listing `ps` and the
+/// `instance_services` pairing are passed in so `collect` and `commands::services::ls`
+/// build the Services view identically and cannot drift. `project` scopes
+/// container names; `instance_services` pairs every relevant instance name with
+/// the service list of its resolved sandbox.
+pub fn service_rows(
+    project: &str,
+    config: &Config,
+    instance_services: &[(String, Vec<String>)],
+    ps: &[ContainerRow],
+) -> (Vec<ServiceRow>, Vec<String>) {
+    let mut errors = Vec::new();
+    let inputs: Vec<ServiceInput> = config
+        .services
+        .keys()
+        .map(|name| match config.resolve_service(name) {
+            Ok(rs) => ServiceInput {
+                name: name.clone(),
+                resolved: Some(ResolvedServiceInput {
+                    scope: rs.spec.scope,
+                    source: service_source(&rs.spec),
+                    ports: rs.spec.ports.clone(),
+                    env_len: rs.spec.env.len(),
+                    command: rs.spec.command.as_ref().map(|c| c.to_vec().join(" ")),
+                    config_hash: rs.config_hash,
+                }),
+            },
+            Err(e) => {
+                errors.push(format!("service `{name}`: {e:#}"));
+                ServiceInput { name: name.clone(), resolved: None }
+            }
+        })
+        .collect();
+    (build_service_rows(project, &inputs, instance_services, ps), errors)
+}
+
 /// Join config services against docker state. Pure: all docker/config I/O is
 /// done by the caller and passed in. `project` scopes container names;
 /// `instance_services` pairs every live instance name with the service list of
@@ -517,32 +556,9 @@ pub fn collect(dir: &Path) -> Snapshot {
 
     let services = match (&config, project_id(dir)) {
         (Ok(cfg), Ok(project)) => {
-            let inputs: Vec<ServiceInput> = cfg
-                .services
-                .keys()
-                .map(|name| match cfg.resolve_service(name) {
-                    Ok(rs) => ServiceInput {
-                        name: name.clone(),
-                        resolved: Some(ResolvedServiceInput {
-                            scope: rs.spec.scope,
-                            source: service_source(&rs.spec),
-                            ports: rs.spec.ports.clone(),
-                            env_len: rs.spec.env.len(),
-                            command: rs
-                                .spec
-                                .command
-                                .as_ref()
-                                .map(|c| c.to_vec().join(" ")),
-                            config_hash: rs.config_hash,
-                        }),
-                    },
-                    Err(e) => {
-                        errors.push(format!("service `{name}`: {e:#}"));
-                        ServiceInput { name: name.clone(), resolved: None }
-                    }
-                })
-                .collect();
-            build_service_rows(&project, &inputs, &instance_services, &ps)
+            let (rows, mut svc_errors) = service_rows(&project, cfg, &instance_services, &ps);
+            errors.append(&mut svc_errors);
+            rows
         }
         // No config already reported above; a project_id failure (e.g. dir does
         // not resolve) means no services either. Report it once.
