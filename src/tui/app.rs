@@ -860,16 +860,18 @@ impl App {
     /// start it when its container is exited, on a background thread (the event
     /// loop owns the docker work, keeping [`App`] I/O-free). Works for
     /// orphan-group instance children and process rows (routing to the parent
-    /// instance); a no-op on sandbox / empty / orphan-group nodes, on a missing
-    /// container (`run` recreates those), and while a stop/start for the same
-    /// instance is in flight.
+    /// instance); a no-op on sandbox / empty / orphan-group nodes and while a
+    /// stop/start for the same instance is in flight.
     ///
-    /// One exception: an exited instance whose container has drifted from the
-    /// current config is *rebuilt* rather than bare-started, by queuing a
-    /// [`PromptAction::Rebuild`] through the same suspend path the `:` prompt
-    /// uses (the loop restores the terminal, runs `rebuild` with inherited
-    /// stdio, then re-enters). Rebuild is modal, so it needs no `starting`
-    /// in-flight guard — the guard is only for the background stop/start ops.
+    /// Two cases can't be served by a bare `docker start` and are *rebuilt*
+    /// instead, by queuing a [`PromptAction::Rebuild`] through the same suspend
+    /// path the `:` prompt uses (the loop restores the terminal, runs `rebuild`
+    /// with inherited stdio, then re-enters): an exited instance whose
+    /// container drifted from the current config, and a missing container —
+    /// `rebuild` is the worktree-preserving way to recreate it (`run` refuses
+    /// the taken name, `rm` destroys the worktree). Rebuild is modal, so it
+    /// needs no `starting` in-flight guard — the guard is only for the
+    /// background stop/start ops.
     fn stop_or_start_instance(&mut self) {
         let Some(i) = self.selected_instance_index() else {
             return;
@@ -901,7 +903,12 @@ impl App {
                 self.starting.insert(name.clone());
                 self.pending_start = Some(name);
             }
-            ContainerStatus::Missing => {}
+            ContainerStatus::Missing => {
+                // No container to start: recreate it via the CLI rebuild on the
+                // suspend path (its "config label gone → rebuild anyway" rule
+                // covers exactly this).
+                self.pending_action = Some(PromptAction::Rebuild { instance: name });
+            }
         }
     }
 
@@ -918,14 +925,19 @@ impl App {
 
     /// Help-bar verb for the `s` key, matching what
     /// [`Self::stop_or_start_instance`] would actually do to the instance under
-    /// the cursor: `start` when it is exited (a drifted one rebuilds, which is
-    /// still a start from the user's seat), `stop` otherwise.
+    /// the cursor: `start` when it is exited or missing (drifted/missing ones
+    /// rebuild, which is still a start from the user's seat), `stop` otherwise.
     pub fn stop_start_hint(&self) -> &'static str {
-        let exited = self
+        let startable = self
             .selected_instance_index()
             .and_then(|i| self.snapshot.as_ref()?.instances.get(i))
-            .is_some_and(|row| matches!(row.status, ContainerStatus::Exited(_)));
-        if exited { "start" } else { "stop" }
+            .is_some_and(|row| {
+                matches!(
+                    row.status,
+                    ContainerStatus::Exited(_) | ContainerStatus::Missing
+                )
+            });
+        if startable { "start" } else { "stop" }
     }
 
     /// Take the pending background stop for the event loop to spawn, if any.
@@ -2170,11 +2182,17 @@ mod tests {
     }
 
     #[test]
-    fn s_on_missing_container_is_noop() {
+    fn s_on_missing_container_queues_rebuild() {
+        // A missing container can't be bare-started; `s` recreates it via the
+        // modal CLI rebuild (worktree preserved), like the drifted-exited case.
         let mut app = new_app();
         app.set_snapshot(snapshot_with(1)); // status Missing
         app.on_key(key(KeyCode::Down)); // onto inst0
         app.on_key(key(KeyCode::Char('s')));
+        assert_eq!(
+            app.take_pending_action(),
+            Some(PromptAction::Rebuild { instance: "inst0".into() })
+        );
         assert_eq!(app.take_pending_stop(), None);
         assert_eq!(app.take_pending_start(), None);
         assert!(app.stopping.is_empty());
@@ -3031,11 +3049,12 @@ mod tests {
         ));
         app.on_key(key(KeyCode::Down)); // onto inst0
         assert_eq!(app.stop_start_hint(), "start");
-        // Running → `stop`; Missing (s is a no-op) → the default `stop`.
+        // Running → `stop`; Missing (s rebuilds — a start from the user's
+        // seat) → `start`.
         app.set_snapshot(snapshot_with_status(1, running()));
         assert_eq!(app.stop_start_hint(), "stop");
         app.set_snapshot(snapshot_with_status(1, ContainerStatus::Missing));
-        assert_eq!(app.stop_start_hint(), "stop");
+        assert_eq!(app.stop_start_hint(), "start");
     }
 
     #[test]
