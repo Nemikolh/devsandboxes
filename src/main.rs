@@ -52,6 +52,10 @@ enum Command {
         /// `worktree-branch` (supports `${instance}`)
         #[arg(long)]
         branch: Option<String>,
+        /// Start point for a worktree instance's branch (e.g. `origin/develop`);
+        /// overrides the sandbox's `worktree-base` and default-branch detection
+        #[arg(long)]
+        base: Option<String>,
     },
     /// Recreate an instance's container from the current config (keeps the
     /// worktree, branch, and per-instance state); no-op when there is no drift
@@ -187,8 +191,8 @@ fn main() -> Result<()> {
     match command {
         Command::Ls { json } => commands::ls::ls(&cli.dir, json),
         Command::Ps { all, json } => commands::ps::ps(all, json),
-        Command::Run { sandbox, name, branch } => {
-            commands::run::run(&cli.dir, sandbox, name, branch)
+        Command::Run { sandbox, name, branch, base } => {
+            commands::run::run(&cli.dir, sandbox, name, branch, base)
         }
         Command::Rebuild { name, all, force } => {
             commands::rebuild::rebuild(&cli.dir, name, all, force)

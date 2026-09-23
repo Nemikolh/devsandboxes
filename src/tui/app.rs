@@ -68,7 +68,8 @@ Logs modal
   esc, q      close
 
 Command prompt (:)
-  run <sandbox> [--name n] [--branch b]   exec <instance> <cmd…>
+  run <sandbox> [--name n] [--branch b] [--base ref]
+  exec <instance> <cmd…>
   code <instance>   rm <instance>   rename <instance> <new-name>
   stop <instance>   start <instance>
   tab         complete / cycle
@@ -3091,17 +3092,17 @@ mod tests {
         // Empty token after the sandbox → the flags.
         assert_eq!(
             App::candidates_for(Tab::Instances, 2, &toks("run web"), &sandboxes, &[], &[], None),
-            vec!["--name".to_string(), "--branch".to_string()]
+            vec!["--name".to_string(), "--branch".to_string(), "--base".to_string()]
         );
         // A `--` stem too (the prompt then filters by the stem).
         assert_eq!(
             App::candidates_for(Tab::Instances, 2, &toks("run web --"), &sandboxes, &[], &[], None),
-            vec!["--name".to_string(), "--branch".to_string()]
+            vec!["--name".to_string(), "--branch".to_string(), "--base".to_string()]
         );
         // A flag already used is not offered again.
         assert_eq!(
             App::candidates_for(Tab::Instances, 4, &toks("run web --name x"), &sandboxes, &[], &[], None),
-            vec!["--branch".to_string()]
+            vec!["--branch".to_string(), "--base".to_string()]
         );
     }
 

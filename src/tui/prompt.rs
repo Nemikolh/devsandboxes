@@ -27,7 +27,7 @@ const HISTORY_CAP: usize = 200;
 /// in [`Prompt::parse`]; the loop owns the terminal suspend + command call.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PromptAction {
-    Run { sandbox: String, name: Option<String>, branch: Option<String> },
+    Run { sandbox: String, name: Option<String>, branch: Option<String>, base: Option<String> },
     Exec { instance: String, argv: Vec<String> },
     Code { instance: String },
     Rename { instance: String, new_name: String },
@@ -380,6 +380,7 @@ fn parse_line(line: &str) -> Result<PromptAction, String> {
             sandbox: args.positionals.remove(0),
             name: args.value("--name").map(str::to_string),
             branch: args.value("--branch").map(str::to_string),
+            base: args.value("--base").map(str::to_string),
         }),
         "exec" => {
             Ok(PromptAction::Exec { instance: args.positionals.remove(0), argv: args.trailing })
@@ -578,11 +579,16 @@ mod tests {
     fn parse_run_variants() {
         assert_eq!(
             parse_line("run web"),
-            Ok(PromptAction::Run { sandbox: "web".into(), name: None, branch: None })
+            Ok(PromptAction::Run { sandbox: "web".into(), name: None, branch: None, base: None })
         );
         assert_eq!(
             parse_line("run web --name api"),
-            Ok(PromptAction::Run { sandbox: "web".into(), name: Some("api".into()), branch: None })
+            Ok(PromptAction::Run {
+                sandbox: "web".into(),
+                name: Some("api".into()),
+                branch: None,
+                base: None,
+            })
         );
         assert_eq!(
             parse_line("run web --branch feat/x"),
@@ -590,8 +596,19 @@ mod tests {
                 sandbox: "web".into(),
                 name: None,
                 branch: Some("feat/x".into()),
+                base: None,
             })
         );
+        assert_eq!(
+            parse_line("run web --base origin/develop"),
+            Ok(PromptAction::Run {
+                sandbox: "web".into(),
+                name: None,
+                branch: None,
+                base: Some("origin/develop".into()),
+            })
+        );
+        assert!(parse_line("run web --base").is_err());
         assert!(parse_line("run").is_err());
         assert!(parse_line("run web --name").is_err());
         assert!(parse_line("run web --branch").is_err());

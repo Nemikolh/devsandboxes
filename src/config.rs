@@ -45,6 +45,11 @@ pub struct SandboxProperties {
     /// `sandbox/${instance}` when unset. A `run --branch` overrides it.
     #[serde(rename = "worktree-branch")]
     pub worktree_branch: Option<String>,
+    /// Start point for a worktree instance's branch (any commit-ish, e.g.
+    /// `origin/develop`). Unset: the remote's default branch is detected
+    /// after a fetch. A `run --base` overrides it.
+    #[serde(rename = "worktree-base")]
+    pub worktree_base: Option<String>,
     /// Host shell snippets (relative to the config dir, `${…}` variables as in
     /// `mounts`) sourced by the container's interactive `~/.zshrc` and
     /// `~/.bashrc`. Each file is bind-mounted read-only via its parent dir and
@@ -1173,6 +1178,21 @@ image = "alpine"
         .unwrap();
         let props = config.resolve_sandbox("s").unwrap().properties;
         assert_eq!(props.worktree_branch.as_deref(), Some("team/${instance}"));
+    }
+
+    #[test]
+    fn worktree_base_parses_and_is_not_ignored() {
+        let config = Config::parse(
+            r#"
+[sandbox.s]
+image = "alpine"
+worktree-base = "origin/develop"
+"#,
+        )
+        .unwrap();
+        let props = config.resolve_sandbox("s").unwrap().properties;
+        assert_eq!(props.worktree_base.as_deref(), Some("origin/develop"));
+        assert!(props.ignored().is_empty());
     }
 
     #[test]
