@@ -978,6 +978,12 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
         Modal::Help(_) => "↑↓ scroll · pgup/pgdn · g/G · esc/? close".to_string(),
         Modal::Logs(_) => "↑↓ scroll · pgup/pgdn · g/G · esc close".to_string(),
         Modal::None => match app.tab {
+            // A process row acts only on itself: signals, nothing forwarded to
+            // the parent instance.
+            Tab::Instances if app.on_proc_row() => {
+                "q quit · tab switch · ↑↓ select · ← parent · t SIGTERM · K SIGKILL · : cmd · ? help"
+                    .to_string()
+            }
             // `r` and `s` mirror what the key would do to the selection:
             // run vs rename, stop vs start.
             Tab::Instances => format!(

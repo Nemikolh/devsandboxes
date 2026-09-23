@@ -31,7 +31,7 @@ use ratatui::backend::CrosstermBackend;
 use crate::commands;
 use crate::config::Config;
 
-use app::App;
+use app::{App, PendingSignal};
 use data::Snapshot;
 use procs::{parse_top, build_forest, ProcState};
 use prompt::PromptAction;
@@ -98,6 +98,9 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
     // thread dies.
     let mut stops: Vec<(String, Receiver<OpDone>)> = Vec::new();
     let mut starts: Vec<(String, Receiver<OpDone>)> = Vec::new();
+    // Background process signals (SIGTERM/SIGKILL from a process row); no guard
+    // needed since each keypress targets a concrete pid.
+    let mut signals: Vec<Receiver<OpDone>> = Vec::new();
     let mut last_tick = Instant::now();
     // At most one process fetch in flight; `Some` while one is running.
     let mut proc_pending: Option<Receiver<BTreeMap<String, ProcState>>> = None;
@@ -174,6 +177,10 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
         if let Some(instance) = app.take_pending_start() {
             starts.push((instance.clone(), spawn_start(&instance)));
         }
+        // A process-row SIGTERM/SIGKILL was requested: send it off-thread.
+        if let Some(sig) = app.take_pending_signal() {
+            signals.push(spawn_signal(sig));
+        }
 
         // Drain any finished background stops/starts: update the status line,
         // clear the in-flight guard, and force an immediate snapshot refresh so
@@ -211,6 +218,17 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
                 app.starting.remove(instance);
                 false
             }
+        });
+        // Drain finished signals: show the outcome and force a proc refresh so a
+        // killed process drops off the forest without waiting for the next tick.
+        signals.retain_mut(|rx| match rx.try_recv() {
+            Ok(done) => {
+                app.status = Some(done.status);
+                app.needs_proc_fetch = true;
+                false
+            }
+            Err(TryRecvError::Empty) => true,
+            Err(TryRecvError::Disconnected) => false,
         });
 
         // Drain a finished collection into the app, freeing the in-flight slot.
@@ -489,6 +507,25 @@ fn spawn_start(instance: &str) -> Receiver<OpDone> {
                 None => format!("start: unknown instance `{instance}`"),
             },
             Err(e) => format!("start: {e:#}"),
+        };
+        let _ = tx.send(OpDone { status });
+    });
+    rx
+}
+
+/// Spawn a detached thread that sends `sig.signal` to a pid inside a container
+/// (`kill -<n>` via the runtime's screen-safe exec) and reports a one-line
+/// status back.
+fn spawn_signal(sig: PendingSignal) -> Receiver<OpDone> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let status = match crate::runtime::backend().signal_proc(
+            &sig.container,
+            &sig.pid,
+            sig.signal.num(),
+        ) {
+            Ok(()) => format!("sent {} to pid {}", sig.signal.name(), sig.pid),
+            Err(e) => format!("{}: {e:#}", sig.signal.name()),
         };
         let _ = tx.send(OpDone { status });
     });

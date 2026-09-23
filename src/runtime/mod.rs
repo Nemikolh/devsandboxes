@@ -191,6 +191,15 @@ pub trait Backend: Send + Sync {
     /// `pid,ppid,args` process listing of a container, `ps -eo` style text.
     fn proc_list(&self, container: &str) -> Result<String>;
 
+    /// Send signal `sig` (a number, e.g. `15` for TERM, `9` for KILL) to `pid`
+    /// inside `container`. Runs `kill -<sig> <pid>` via `exec`, which every
+    /// backend supports; the numeric form is portable across busybox and
+    /// coreutils `kill`. stderr is captured (screen-safe for the TUI).
+    fn signal_proc(&self, container: &str, pid: &str, sig: i32) -> Result<()> {
+        self.output_quiet(&["exec", container, "kill", &format!("-{sig}"), pid])?;
+        Ok(())
+    }
+
     // --- mutations that differ in shape ---
 
     /// Force-remove a container.

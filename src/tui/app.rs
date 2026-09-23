@@ -39,7 +39,11 @@ Tables (Instances / Services)
               (stops running / starts exited; s-start is a bare start —
                :start runs services + postStartCommand too; a drifted
                exited instance is rebuilt instead)
-  (process rows act on their parent instance)
+
+Process rows (expanded instance)
+  ←           jump to the parent instance
+  t           SIGTERM          K   SIGKILL
+  (the instance shortcuts above are disabled on a process row)
 
 Terminals
   t           open terminal (instance / service)
@@ -282,6 +286,42 @@ pub enum Focus {
     Terminal,
 }
 
+/// A POSIX signal the process-row shortcuts can send. Kept small and typed so
+/// the key handler, status text, and the event loop share one source of truth.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Signal {
+    Term,
+    Kill,
+}
+
+impl Signal {
+    /// The numeric signal passed to `kill -<n>` (portable across busybox and
+    /// coreutils, unlike some name spellings).
+    pub fn num(self) -> i32 {
+        match self {
+            Signal::Term => 15,
+            Signal::Kill => 9,
+        }
+    }
+
+    /// Display name for status messages.
+    pub fn name(self) -> &'static str {
+        match self {
+            Signal::Term => "SIGTERM",
+            Signal::Kill => "SIGKILL",
+        }
+    }
+}
+
+/// A pending `kill` the event loop should run on a background thread: signal
+/// `pid` inside `container`. Set by the SIGTERM/SIGKILL process-row shortcuts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingSignal {
+    pub container: String,
+    pub pid: String,
+    pub signal: Signal,
+}
+
 pub struct App {
     pub dir: PathBuf,
     pub tab: Tab,
@@ -323,6 +363,9 @@ pub struct App {
     pub pending_start: Option<String>,
     /// Instances with a start in flight (same dedup rule as `stopping`).
     pub starting: BTreeSet<String>,
+    /// A `kill` the event loop should spawn on a background thread (the
+    /// SIGTERM/SIGKILL shortcuts on a process row). Runs without suspending.
+    pub pending_signal: Option<PendingSignal>,
     /// One-line status shown in the help-bar area (e.g. `code` launch outcome).
     pub status: Option<String>,
     /// True while the config-modal divider is being dragged with the mouse.
@@ -353,6 +396,7 @@ impl App {
             stopping: BTreeSet::new(),
             pending_start: None,
             starting: BTreeSet::new(),
+            pending_signal: None,
             status: None,
             dragging_divider: false,
             focus: Focus::Dashboard,
@@ -617,6 +661,11 @@ impl App {
         // Any dashboard key dismisses a lingering status line.
         self.status = None;
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // A selected process row has its own action set: signals only. The
+        // instance-forwarding shortcuts (rename/vscode/stop/logs/config/terminal)
+        // are disabled here, leaving navigation and the SIGTERM/SIGKILL keys.
+        let on_proc = self.tab == Tab::Instances
+            && matches!(self.selected_node(), Some(Node::Proc { .. }));
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('c') if ctrl => self.should_quit = true,
@@ -629,8 +678,12 @@ impl App {
             // are open.
             KeyCode::Char(']') if ctrl => self.enter_terminal(),
             KeyCode::F(12) => self.enter_terminal(),
+            // Process-row signals; `t` doubles as SIGTERM there, otherwise it
+            // opens a terminal.
+            KeyCode::Char('t') if on_proc => self.signal_selected_proc(Signal::Term),
+            KeyCode::Char('K') if on_proc => self.signal_selected_proc(Signal::Kill),
             KeyCode::Char('t') => self.open_terminal(false),
-            KeyCode::Char('T') => self.open_terminal(true),
+            KeyCode::Char('T') if !on_proc => self.open_terminal(true),
             KeyCode::Char(']') => self.terms.next(),
             KeyCode::Char('[') => self.terms.prev(),
             KeyCode::Char('x') => self.terms.close_active(),
@@ -639,11 +692,15 @@ impl App {
             KeyCode::Right if self.tab == Tab::Instances => self.tree_expand(),
             KeyCode::Char(' ') if self.tab == Tab::Instances => self.tree_toggle(),
             KeyCode::Left if self.tab == Tab::Instances => self.tree_collapse(),
-            KeyCode::Enter | KeyCode::Char('e') => self.open_config(),
-            KeyCode::Char('r') if self.tab == Tab::Instances => self.open_rename_or_run_prompt(),
-            KeyCode::Char('o') if self.tab == Tab::Instances => self.attach_code(),
-            KeyCode::Char('s') if self.tab == Tab::Instances => self.stop_or_start_instance(),
-            KeyCode::Char('l') => self.open_logs(),
+            KeyCode::Enter | KeyCode::Char('e') if !on_proc => self.open_config(),
+            KeyCode::Char('r') if self.tab == Tab::Instances && !on_proc => {
+                self.open_rename_or_run_prompt()
+            }
+            KeyCode::Char('o') if self.tab == Tab::Instances && !on_proc => self.attach_code(),
+            KeyCode::Char('s') if self.tab == Tab::Instances && !on_proc => {
+                self.stop_or_start_instance()
+            }
+            KeyCode::Char('l') if !on_proc => self.open_logs(),
             KeyCode::Char('?') => self.open_help(),
             _ => {}
         }
@@ -958,6 +1015,53 @@ impl App {
     /// Take the pending background start for the event loop to spawn, if any.
     pub fn take_pending_start(&mut self) -> Option<String> {
         self.pending_start.take()
+    }
+
+    /// The selected process row as `(container, pid)`, when the cursor is on a
+    /// real process (not a `(message)` placeholder) with a numeric pid. Backs the
+    /// SIGTERM/SIGKILL shortcuts; `None` on every other selection.
+    fn selected_proc(&self) -> Option<(String, String)> {
+        let snapshot = self.snapshot.as_ref()?;
+        let Node::Proc { instance, row } = self.selected_node()? else {
+            return None;
+        };
+        if row == super::procs::MESSAGE_ROW {
+            return None;
+        }
+        let inst = snapshot.instances.get(instance)?;
+        let ProcState::Rows(rows) = self.procs.get(&inst.name)? else {
+            return None;
+        };
+        let proc = rows.get(row)?;
+        // Defensive: `parse_top` only yields numeric pids, but never hand a
+        // non-numeric token to `kill`.
+        proc.pid.parse::<u32>().ok()?;
+        Some((inst.container.clone(), proc.pid.clone()))
+    }
+
+    /// Queue `signal` for the selected process, for the event loop to send on a
+    /// background thread. No-op when the cursor is not on a signalable process.
+    fn signal_selected_proc(&mut self, signal: Signal) {
+        let Some((container, pid)) = self.selected_proc() else {
+            return;
+        };
+        self.status = Some(format!("sending {} to pid {pid}…", signal.name()));
+        self.pending_signal = Some(PendingSignal {
+            container,
+            pid,
+            signal,
+        });
+    }
+
+    /// Take the pending process signal for the event loop to spawn, if any.
+    pub fn take_pending_signal(&mut self) -> Option<PendingSignal> {
+        self.pending_signal.take()
+    }
+
+    /// Whether the cursor is on a process row (Instances tab). Drives the help
+    /// bar's process-specific legend.
+    pub fn on_proc_row(&self) -> bool {
+        self.tab == Tab::Instances && matches!(self.selected_node(), Some(Node::Proc { .. }))
     }
 
     /// Agent-process count for a cached instance: the number of forest rows whose
@@ -2363,31 +2467,88 @@ mod tests {
         assert_eq!(app.selected_node(), Some(Node::Sandbox(0)));
     }
 
-    #[test]
-    fn s_on_proc_row_stops_parent_instance() {
+    /// Select the single process row of `inst0`, returning the app ready to act.
+    fn app_on_proc_row(pids: &[&str]) -> App {
         let mut app = new_app();
         app.set_snapshot(snapshot_with_status(1, running()));
-        expand_with_rows(&mut app, "inst0", &["10"]);
+        expand_with_rows(&mut app, "inst0", pids);
         app.on_key(key(KeyCode::Down)); // inst0
         app.on_key(key(KeyCode::Down)); // proc row
         assert_eq!(app.selected_node(), Some(Node::Proc { instance: 0, row: 0 }));
-        app.on_key(key(KeyCode::Char('s')));
-        assert!(app.stopping.contains("inst0"));
-        assert_eq!(app.take_pending_stop(), Some("inst0".into()));
+        app
     }
 
     #[test]
-    fn o_on_proc_row_codes_parent_instance() {
-        let mut app = new_app();
-        app.set_snapshot(snapshot_with(1));
-        expand_with_rows(&mut app, "inst0", &["10"]);
-        app.on_key(key(KeyCode::Down)); // inst0
-        app.on_key(key(KeyCode::Down)); // proc row
-        app.on_key(key(KeyCode::Char('o')));
+    fn instance_shortcuts_disabled_on_proc_row() {
+        let mut app = app_on_proc_row(&["10"]);
+        // None of the instance-forwarding shortcuts fire on a process row.
+        for code in [
+            KeyCode::Char('s'),
+            KeyCode::Char('o'),
+            KeyCode::Char('r'),
+            KeyCode::Char('l'),
+            KeyCode::Char('e'),
+            KeyCode::Enter,
+            KeyCode::Char('T'),
+        ] {
+            app.on_key(key(code));
+        }
+        assert!(app.stopping.is_empty());
+        assert!(app.take_pending_stop().is_none());
+        assert!(app.take_pending_action().is_none());
+        assert!(app.take_pending_signal().is_none());
+        assert!(matches!(app.modal, Modal::None));
+        assert!(app.prompt.is_none());
+        assert!(app.terms.is_empty());
+    }
+
+    #[test]
+    fn t_and_shift_k_signal_the_selected_proc() {
+        let mut app = app_on_proc_row(&["10"]);
+        app.on_key(key(KeyCode::Char('t')));
         assert_eq!(
-            app.take_pending_action(),
-            Some(PromptAction::Code { instance: "inst0".into() }),
+            app.take_pending_signal(),
+            Some(PendingSignal {
+                container: "devsandbox-inst0".into(),
+                pid: "10".into(),
+                signal: Signal::Term,
+            }),
         );
+        app.on_key(key(KeyCode::Char('K')));
+        assert_eq!(
+            app.take_pending_signal(),
+            Some(PendingSignal {
+                container: "devsandbox-inst0".into(),
+                pid: "10".into(),
+                signal: Signal::Kill,
+            }),
+        );
+    }
+
+    #[test]
+    fn signal_noop_on_message_placeholder_row() {
+        use super::super::procs::ProcState;
+        let mut app = new_app();
+        app.set_snapshot(snapshot_with_status(1, running()));
+        app.expanded_procs.insert("inst0".into());
+        app.procs
+            .insert("inst0".into(), ProcState::Message("(not running)".into()));
+        app.on_key(key(KeyCode::Down)); // inst0
+        app.on_key(key(KeyCode::Down)); // message row
+        assert!(matches!(app.selected_node(), Some(Node::Proc { .. })));
+        app.on_key(key(KeyCode::Char('t')));
+        assert!(app.take_pending_signal().is_none());
+    }
+
+    #[test]
+    fn help_bar_switches_to_signal_legend_on_proc_row() {
+        let app = app_on_proc_row(&["10"]);
+        assert!(app.on_proc_row());
+        // Instance row: not a proc.
+        let mut app2 = new_app();
+        app2.set_snapshot(snapshot_with_status(1, running()));
+        app2.on_key(key(KeyCode::Down)); // inst0
+        assert!(!app2.on_proc_row());
     }
 
     #[test]
