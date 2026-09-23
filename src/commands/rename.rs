@@ -73,6 +73,7 @@ mod tests {
                 workspace_file: None,
                 remote_env: Default::default(),
                 remote_user: None,
+                ssh_auth_sock: None,
                 created_unix: 0,
             },
         );

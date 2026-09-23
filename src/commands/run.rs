@@ -18,6 +18,11 @@ use crate::state::{Instance, State};
 /// after `--branch`.
 pub const DEFAULT_WORKTREE_BRANCH: &str = "sandbox/${instance}";
 
+/// Fixed container path the forwarded ssh-agent socket is mounted at, so Linux
+/// and macOS converge on one target regardless of the host source (see
+/// docs/ssh-agent.md).
+pub(crate) const SSH_AGENT_TARGET: &str = "/run/devsandbox/ssh-agent.sock";
+
 pub fn run(
     dir: &Path,
     sandbox_name: Option<String>,
@@ -218,9 +223,18 @@ pub(crate) fn materialize(
     // The worktree's `.git` file points at `<base>/.git/worktrees/..` by absolute
     // host path; mount the base `.git` at the identical path so git works inside
     // the container.
-    let extra_mounts = match &worktree {
+    let mut extra_mounts = match &worktree {
         Some(_) => vec![git_companion_mount(folder)],
         None => Vec::new(),
+    };
+    // Forward the host ssh-agent (a filesystem fact, mounted here; the
+    // activating `SSH_AUTH_SOCK` is injected per exec — see docs/ssh-agent.md).
+    let ssh_auth_sock = match ssh_agent_forward(instance_id)? {
+        Some((mount, target)) => {
+            extra_mounts.push(mount);
+            Some(target)
+        }
+        None => None,
     };
     let mut mounts = resolve_mounts(dir, folder, &basename, instance_id, sandbox)?;
     for (target, host) in &extra_folders {
@@ -287,6 +301,7 @@ pub(crate) fn materialize(
             workspace_file,
             remote_env: props.remote_env.clone().unwrap_or_default(),
             remote_user: props.remote_user.clone(),
+            ssh_auth_sock,
             created_unix: Instance::now(),
         },
     );
@@ -380,6 +395,57 @@ fn unique_instance_id(state: &State, name: &str) -> String {
 fn git_companion_mount(base: &Path) -> String {
     let git = base.join(".git");
     format!("{}:{}", git.display(), git.display())
+}
+
+/// Create or re-point `agent_dir/<instance_id>.sock` at the host agent
+/// socket. A symlink (not the raw path) because bind sources are
+/// re-resolved at every container start, so `start` can re-point it after
+/// the host agent rotates (docs/ssh-agent.md).
+pub(crate) fn ssh_agent_link(agent_dir: &Path, instance_id: &str, sock: &Path) -> Result<PathBuf> {
+    std::fs::create_dir_all(agent_dir)
+        .with_context(|| format!("cannot create {}", agent_dir.display()))?;
+    let link = agent_dir.join(format!("{instance_id}.sock"));
+    match std::fs::remove_file(&link) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("cannot replace {}", link.display())),
+    }
+    std::os::unix::fs::symlink(sock, &link)
+        .with_context(|| format!("cannot link {} -> {}", link.display(), sock.display()))?;
+    Ok(link)
+}
+
+/// Decide ssh-agent forwarding for a new instance. Returns the `-v
+/// <link>:<target>` mount to push and the container target to persist, or
+/// `None` when forwarding is off. Gate (all silent on miss — an absent agent
+/// is the common case): the runtime binds files, `$SSH_AUTH_SOCK` is set, and
+/// its socket exists on the host. On a link error, warn and skip: forwarding
+/// is best-effort and must not fail container creation (docs/ssh-agent.md).
+fn ssh_agent_forward(instance_id: &str) -> Result<Option<(String, String)>> {
+    if !backend().supports_file_binds() {
+        return Ok(None);
+    }
+    let Some(sock) = std::env::var_os("SSH_AUTH_SOCK") else {
+        return Ok(None);
+    };
+    let sock = PathBuf::from(sock);
+    if std::fs::metadata(&sock).is_err() {
+        return Ok(None);
+    }
+    let agent_dir = State::path()?
+        .parent()
+        .context("state path has no parent")?
+        .join("agent");
+    match ssh_agent_link(&agent_dir, instance_id, &sock) {
+        Ok(link) => Ok(Some((
+            format!("{}:{SSH_AGENT_TARGET}", link.display()),
+            SSH_AGENT_TARGET.to_string(),
+        ))),
+        Err(e) => {
+            eprintln!("warning: ssh-agent forwarding disabled: {e:#}");
+            Ok(None)
+        }
+    }
 }
 
 /// Create a git worktree on a fresh `branch`. Git refuses to check out a branch
@@ -1485,6 +1551,7 @@ mod tests {
             workspace_file: None,
             remote_env: Default::default(),
             remote_user: None,
+            ssh_auth_sock: None,
             created_unix: 0,
         }
     }
@@ -1765,6 +1832,24 @@ mod tests {
     fn git_companion_mount_uses_identical_paths() {
         let mount = git_companion_mount(Path::new("/home/u/repo"));
         assert_eq!(mount, "/home/u/repo/.git:/home/u/repo/.git");
+    }
+
+    #[test]
+    fn ssh_agent_link_creates_and_repoints() {
+        let dir = std::env::temp_dir().join(format!("devsandbox-agent-{}", std::process::id()));
+        let first = dir.join("agent-a.sock");
+        let second = dir.join("agent-b.sock");
+
+        let link = ssh_agent_link(&dir, "repo-abc1", &first).unwrap();
+        assert_eq!(link, dir.join("repo-abc1.sock"));
+        assert_eq!(std::fs::read_link(&link).unwrap(), first);
+
+        // A second call re-points the same link at the new target.
+        let link2 = ssh_agent_link(&dir, "repo-abc1", &second).unwrap();
+        assert_eq!(link2, link);
+        assert_eq!(std::fs::read_link(&link).unwrap(), second);
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     // --- features: pure generators ---

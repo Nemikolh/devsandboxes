@@ -58,6 +58,11 @@ pub struct Instance {
     /// devcontainer `remoteUser`: the user every exec runs as, when set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_user: Option<String>,
+    /// Container path of the forwarded ssh-agent socket, set when `run`
+    /// mounted the host agent (see docs/ssh-agent.md); `exec_argv` uses it
+    /// to inject `SSH_AUTH_SOCK` per exec (a later step).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_auth_sock: Option<String>,
     pub created_unix: u64,
 }
 
@@ -142,6 +147,7 @@ mod tests {
                 workspace_file: None,
                 remote_env: BTreeMap::new(),
                 remote_user: None,
+                ssh_auth_sock: None,
                 created_unix: Instance::now(),
             },
         );

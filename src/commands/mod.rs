@@ -211,6 +211,7 @@ mod tests {
             workspace_file: None,
             remote_env: BTreeMap::new(),
             remote_user: None,
+            ssh_auth_sock: None,
             created_unix: 0,
         };
         state.instances.insert("web-aaaa".into(), mk("web", "/home/u/site"));
@@ -244,6 +245,7 @@ mod tests {
                 workspace_file: None,
                 remote_env: BTreeMap::new(),
                 remote_user: None,
+                ssh_auth_sock: None,
                 created_unix: 0,
             },
         );
