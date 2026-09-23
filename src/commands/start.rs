@@ -40,6 +40,9 @@ pub fn start(dir: &Path, name: Option<String>, all: bool) -> Result<()> {
 }
 
 fn start_instance(dir: &Path, key: &str, info: &Instance) -> Result<()> {
+    // Re-point the agent symlink before either start path so a restart after
+    // host agent rotation re-captures the live socket (docs/ssh-agent.md).
+    run::ssh_agent_refresh(info);
     match resolved_sandbox(dir, info) {
         Some((config, sandbox)) => {
             run::warn_on_drift(dir, &info.container, &sandbox)?;

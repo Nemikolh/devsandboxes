@@ -448,6 +448,36 @@ fn ssh_agent_forward(instance_id: &str) -> Result<Option<(String, String)>> {
     }
 }
 
+/// Re-point `info`'s agent symlink at the current host agent before its
+/// container starts, so a restart after agent rotation (reboot, re-login)
+/// re-captures the live socket — bind sources re-resolve at every container
+/// start (docs/ssh-agent.md). Gate mirrors `ssh_agent_forward`: forwarding was
+/// on for this instance, `$SSH_AUTH_SOCK` is set, and its socket exists.
+/// Fully silent — every gate miss and error is a no-op (the link stays as-is
+/// and forwarding is degraded for this run only): callers include the TUI
+/// background thread that owns the alternate screen, where a stray warning
+/// would corrupt the display, so screen safety wins over a lost warning.
+pub(crate) fn ssh_agent_refresh(info: &Instance) {
+    if info.ssh_auth_sock.is_none() {
+        return;
+    }
+    let Some(sock) = std::env::var_os("SSH_AUTH_SOCK") else {
+        return;
+    };
+    let sock = PathBuf::from(sock);
+    if std::fs::metadata(&sock).is_err() {
+        return;
+    }
+    let Ok(state_path) = State::path() else {
+        return;
+    };
+    let Some(parent) = state_path.parent() else {
+        return;
+    };
+    let agent_dir = parent.join("agent");
+    let _ = ssh_agent_link(&agent_dir, &info.instance_id, &sock);
+}
+
 /// Create a git worktree on a fresh `branch`. Git refuses to check out a branch
 /// already checked out elsewhere, so the branch must be unique per instance
 /// (the default `sandbox/${instance}` pattern guarantees this).
@@ -1850,6 +1880,25 @@ mod tests {
         assert_eq!(std::fs::read_link(&link).unwrap(), second);
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn ssh_agent_refresh_noop_without_forwarding() {
+        // `ssh_auth_sock: None` means forwarding was never on for this instance;
+        // the gate returns before any env/fs access, so no link is created even
+        // if the data dir and a live agent are present. Uses a unique id so the
+        // agent dir (if it exists at all) can't already hold a matching link.
+        let id = format!("refresh-gate-{}", std::process::id());
+        let mut info = instance("repo");
+        info.instance_id = id.clone();
+        assert!(info.ssh_auth_sock.is_none());
+        ssh_agent_refresh(&info);
+        if let Ok(path) = State::path() {
+            if let Some(parent) = path.parent() {
+                let link = parent.join("agent").join(format!("{id}.sock"));
+                assert!(!link.exists(), "gate should not create {}", link.display());
+            }
+        }
     }
 
     // --- features: pure generators ---

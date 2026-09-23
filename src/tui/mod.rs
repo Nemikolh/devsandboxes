@@ -477,6 +477,10 @@ fn spawn_start(instance: &str) -> Receiver<OpDone> {
         let status = match crate::state::State::load() {
             Ok(state) => match state.instances.get(&instance) {
                 Some(info) => {
+                    // Bare start bypasses `start_instance`, so re-point the agent
+                    // symlink here too, so a restart after host agent rotation
+                    // re-captures the live socket (docs/ssh-agent.md).
+                    commands::run::ssh_agent_refresh(info);
                     let services =
                         commands::stop::service_containers(&info.project, &info.instance_id);
                     commands::start::start_containers(&info.container, &services, true);
