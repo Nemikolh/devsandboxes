@@ -763,7 +763,7 @@ fn proc_tree_row<'a>(app: &App, snapshot: &'a Snapshot, instance: usize, row: us
 
     // A real process row: only when we have a Rows state and a valid index.
     if row != MESSAGE_ROW {
-        if let Some(ProcState::Rows(rows)) = state {
+        if let Some(ProcState::Rows { rows, .. }) = state {
             if let Some(p) = rows.get(row) {
                 let pid = Cell::from(Span::styled(format!("      {}", p.pid), dim));
                 let indent = "\\_ ".repeat(p.depth);
@@ -979,10 +979,15 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
         Modal::Logs(_) => "↑↓ scroll · pgup/pgdn · g/G · esc close".to_string(),
         Modal::None => match app.tab {
             // A process row acts only on itself: signals, nothing forwarded to
-            // the parent instance.
+            // the parent instance. Signals need container-namespace pids, so a
+            // `top` fallback listing (or a placeholder row) drops them.
             Tab::Instances if app.on_proc_row() => {
-                "q quit · tab switch · ↑↓ select · ← parent · t SIGTERM · K SIGKILL · : cmd · ? help"
-                    .to_string()
+                if app.proc_row_signalable() {
+                    "q quit · tab switch · ↑↓ select · ← parent · t SIGTERM · K SIGKILL · : cmd · ? help"
+                        .to_string()
+                } else {
+                    "q quit · tab switch · ↑↓ select · ← parent · : cmd · ? help".to_string()
+                }
             }
             // `r` and `s` mirror what the key would do to the selection:
             // run vs rename, stop vs start.

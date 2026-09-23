@@ -108,7 +108,7 @@ fn push_proc_nodes(
         return;
     }
     match procs.get(&inst.name) {
-        Some(ProcState::Rows(rows)) => {
+        Some(ProcState::Rows { rows, .. }) => {
             for row in 0..rows.len() {
                 nodes.push(Node::Proc { instance, row });
             }
@@ -416,7 +416,7 @@ mod tests {
         let mut procs = BTreeMap::new();
         procs.insert(
             "a1".to_string(),
-            ProcState::Rows(vec![proc_row("1"), proc_row("2")]),
+            ProcState::Rows { rows: vec![proc_row("1"), proc_row("2")], signalable: true },
         );
         let nodes = visible_nodes(&sandboxes, &instances, &BTreeSet::new(), &expanded, &procs);
         assert_eq!(
@@ -461,7 +461,10 @@ mod tests {
         let instances = vec![inst_in("a1", "a")];
         let expanded: BTreeSet<String> = ["a1".to_string()].into_iter().collect();
         let mut procs = BTreeMap::new();
-        procs.insert("a1".to_string(), ProcState::Rows(vec![proc_row("1")]));
+        procs.insert(
+            "a1".to_string(),
+            ProcState::Rows { rows: vec![proc_row("1")], signalable: true },
+        );
         // Sandbox collapsed → its instance and procs are hidden entirely.
         let nodes = visible_nodes(&sandboxes, &instances, &collapsed(&["a"]), &expanded, &procs);
         assert_eq!(nodes, vec![Node::Sandbox(0)]);

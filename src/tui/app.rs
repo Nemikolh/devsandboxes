@@ -43,7 +43,8 @@ Tables (Instances / Services)
 Process rows (expanded instance)
   ←           jump to the parent instance
   t           SIGTERM          K   SIGKILL
-  (the instance shortcuts above are disabled on a process row)
+  (the instance shortcuts above are disabled on a process row;
+   signals need `ps` in the image — a `top` fallback listing hides them)
 
 Terminals
   t           open terminal (instance / service)
@@ -1029,9 +1030,14 @@ impl App {
             return None;
         }
         let inst = snapshot.instances.get(instance)?;
-        let ProcState::Rows(rows) = self.procs.get(&inst.name)? else {
+        let ProcState::Rows { rows, signalable } = self.procs.get(&inst.name)? else {
             return None;
         };
+        // A `top` fallback listing has host-namespace pids that `exec kill` can't
+        // reach; don't offer signals for it.
+        if !signalable {
+            return None;
+        }
         let proc = rows.get(row)?;
         // Defensive: `parse_top` only yields numeric pids, but never hand a
         // non-numeric token to `kill`.
@@ -1064,13 +1070,20 @@ impl App {
         self.tab == Tab::Instances && matches!(self.selected_node(), Some(Node::Proc { .. }))
     }
 
+    /// Whether the selected process row can be signalled (its pids are
+    /// container-namespace). False for a `(message)` row or a `top` fallback
+    /// listing; drives whether the help bar advertises SIGTERM/SIGKILL.
+    pub fn proc_row_signalable(&self) -> bool {
+        self.selected_proc().is_some()
+    }
+
     /// Agent-process count for a cached instance: the number of forest rows whose
     /// args name a known coding agent (see [`super::procs::is_agent`]). `None`
     /// when the instance has no fetched forest yet (not running, error, or the
     /// fetch is still in flight), which the Detail panel renders as `…`/`-`.
     pub fn agent_count(&self, instance: &str) -> Option<usize> {
         match self.procs.get(instance) {
-            Some(ProcState::Rows(rows)) => {
+            Some(ProcState::Rows { rows, .. }) => {
                 Some(rows.iter().filter(|r| super::procs::is_agent(&r.args)).count())
             }
             _ => None,
@@ -2414,7 +2427,8 @@ mod tests {
             .map(|p| ProcRow { pid: p.to_string(), depth: 0, args: "x".into() })
             .collect();
         app.expanded_procs.insert(instance.to_string());
-        app.procs.insert(instance.to_string(), ProcState::Rows(rows));
+        app.procs
+            .insert(instance.to_string(), ProcState::Rows { rows, signalable: true });
     }
 
     #[test]
@@ -2544,11 +2558,37 @@ mod tests {
     fn help_bar_switches_to_signal_legend_on_proc_row() {
         let app = app_on_proc_row(&["10"]);
         assert!(app.on_proc_row());
+        assert!(app.proc_row_signalable());
         // Instance row: not a proc.
         let mut app2 = new_app();
         app2.set_snapshot(snapshot_with_status(1, running()));
         app2.on_key(key(KeyCode::Down)); // inst0
         assert!(!app2.on_proc_row());
+    }
+
+    #[test]
+    fn top_fallback_listing_is_not_signalable() {
+        use super::super::procs::{ProcRow, ProcState};
+        let mut app = new_app();
+        app.set_snapshot(snapshot_with_status(1, running()));
+        // Non-signalable rows: a host-side `top` fallback (pids aren't reachable
+        // by `exec kill`).
+        app.expanded_procs.insert("inst0".into());
+        app.procs.insert(
+            "inst0".into(),
+            ProcState::Rows {
+                rows: vec![ProcRow { pid: "660011".into(), depth: 0, args: "x".into() }],
+                signalable: false,
+            },
+        );
+        app.on_key(key(KeyCode::Down)); // inst0
+        app.on_key(key(KeyCode::Down)); // proc row
+        assert!(app.on_proc_row());
+        // Help bar drops the signal keys, and the keys are inert.
+        assert!(!app.proc_row_signalable());
+        app.on_key(key(KeyCode::Char('t')));
+        app.on_key(key(KeyCode::Char('K')));
+        assert!(app.take_pending_signal().is_none());
     }
 
     #[test]
@@ -2619,7 +2659,7 @@ mod tests {
             ProcRow { pid: "2".into(), depth: 1, args: "node /usr/local/bin/claude".into() },
             ProcRow { pid: "3".into(), depth: 1, args: "zidane --resume".into() },
         ];
-        app.procs.insert("x".into(), ProcState::Rows(rows));
+        app.procs.insert("x".into(), ProcState::Rows { rows, signalable: true });
         assert_eq!(app.agent_count("x"), Some(2));
 
         // A message state (not running / error) has no countable forest.

@@ -66,6 +66,16 @@ pub struct ServiceEndpoint {
     pub container: String,
 }
 
+/// A container's process listing plus whether its pids are usable by
+/// [`Backend::signal_proc`]. `container_pids` is true when the listing came from
+/// inside the container (`exec ps`), so its pids are container-namespace and a
+/// signal can target them; false for a host-side `top` fallback, whose pids are
+/// host-namespace and can't be signalled through `exec`.
+pub struct ProcList {
+    pub text: String,
+    pub container_pids: bool,
+}
+
 pub trait Backend: Send + Sync {
     /// Short runtime name for messages and the dashboard header.
     fn name(&self) -> &'static str;
@@ -188,8 +198,9 @@ pub trait Backend: Send + Sync {
     /// Last `n` lines of a container's stdout+stderr.
     fn logs_tail(&self, container: &str, n: usize) -> Result<String>;
 
-    /// `pid,ppid,args` process listing of a container, `ps -eo` style text.
-    fn proc_list(&self, container: &str) -> Result<String>;
+    /// `pid,ppid,args` process listing of a container, `ps -eo` style text,
+    /// tagged with whether its pids are container-namespace (see [`ProcList`]).
+    fn proc_list(&self, container: &str) -> Result<ProcList>;
 
     /// Send signal `sig` (a number, e.g. `15` for TERM, `9` for KILL) to `pid`
     /// inside `container`. Runs `kill -<sig> <pid>` via `exec`, which every

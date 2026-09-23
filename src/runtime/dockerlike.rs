@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use anyhow::Result;
 use serde::Deserialize;
 
-use super::{split_kv, Backend, ContainerRow, ServiceEndpoint, StatsRow};
+use super::{split_kv, Backend, ContainerRow, ProcList, ServiceEndpoint, StatsRow};
 
 pub struct Dockerlike {
     name: &'static str,
@@ -96,11 +96,18 @@ impl Backend for Dockerlike {
         self.output_merged(&["logs", "--tail", &n.to_string(), container])
     }
 
-    fn proc_list(&self, container: &str) -> Result<String> {
-        // `top` reports *host*-namespace pids, which don't match what `kill`
-        // sees inside the container (see `signal_proc`). Run `ps` inside the
-        // container instead so listed pids are the ones signals target.
-        self.output_quiet(&["exec", container, "ps", "-eo", "pid,ppid,args"])
+    fn proc_list(&self, container: &str) -> Result<ProcList> {
+        // Prefer container-namespace pids via `exec ps` so process-row signals
+        // can target the shown pid (`top` reports host-namespace pids, which
+        // `exec kill` inside the container can't reach). Fall back to `top` for
+        // images without `ps`: those still list, but as non-signalable host pids.
+        match self.output_quiet(&["exec", container, "ps", "-eo", "pid,ppid,args"]) {
+            Ok(text) => Ok(ProcList { text, container_pids: true }),
+            Err(_) => {
+                let text = self.output_quiet(&["top", container, "-eo", "pid,ppid,args"])?;
+                Ok(ProcList { text, container_pids: false })
+            }
+        }
     }
 
     fn remove_force(&self, container: &str) -> Result<i32> {

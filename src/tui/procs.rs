@@ -14,10 +14,13 @@ pub struct ProcRow {
 
 /// Per-instance process state stored on [`App`](super::app::App). `Rows` is the
 /// forest for a running container; `Message` is a single dim placeholder row
-/// (not fetched yet, container not running, or a fetch error).
+/// (not fetched yet, container not running, or a fetch error). `signalable` is
+/// true when the rows' pids are container-namespace (from `exec ps`), so the
+/// SIGTERM/SIGKILL shortcuts can target them; false for a host-side `top`
+/// fallback (see [`ProcList`](super::super::runtime::ProcList)).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProcState {
-    Rows(Vec<ProcRow>),
+    Rows { rows: Vec<ProcRow>, signalable: bool },
     Message(String),
 }
 

@@ -542,7 +542,10 @@ fn spawn_proc_fetch(targets: Vec<(String, String)>) -> Receiver<BTreeMap<String,
         let mut out: BTreeMap<String, ProcState> = BTreeMap::new();
         for (instance, container) in targets {
             let state = match crate::runtime::backend().proc_list(&container) {
-                Ok(text) => ProcState::Rows(build_forest(parse_top(&text))),
+                Ok(list) => ProcState::Rows {
+                    rows: build_forest(parse_top(&list.text)),
+                    signalable: list.container_pids,
+                },
                 Err(e) => ProcState::Message(format!("(processes unavailable: {e:#})")),
             };
             out.insert(instance, state);
