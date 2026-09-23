@@ -964,7 +964,7 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
     if app.focus == Focus::Terminal && matches!(app.modal, Modal::None) {
         let exited = app.terms.active_session().is_some_and(|s| s.exited());
         let text = if exited {
-            "terminal exited — ctrl-]/F12 back · x closes (from dashboard)"
+            "terminal exited — ctrl-]/F12 back · x closes"
         } else {
             "ctrl-] / F12 back to dashboard · all other keys go to the shell"
         };
@@ -993,7 +993,7 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
     };
     // On the dashboard with terminals open, append the terminal-cycle hints.
     let text = if matches!(app.modal, Modal::None) && !app.terms.is_empty() {
-        format!("{base} · [/] terms · ctrl-] focus term")
+        format!("{base} · [/] terms · ctrl-] focus term · x close term")
     } else {
         base
     };

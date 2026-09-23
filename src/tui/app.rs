@@ -667,8 +667,15 @@ impl App {
             return;
         };
         // An exited shell has nothing to receive keys; swallow them (leave keys
-        // above still work).
+        // above still work). `x` closes it in place, mirroring the dashboard
+        // binding; fall back to the dashboard once no sessions remain.
         if session.exited() {
+            if key.code == KeyCode::Char('x') {
+                self.terms.close_active();
+                if self.terms.is_empty() {
+                    self.focus = Focus::Dashboard;
+                }
+            }
             return;
         }
         // DECCKM: the parser tracks whether the shell wants SS3 cursor keys.
@@ -3149,6 +3156,35 @@ mod tests {
         // Leave keys still work on an exited session.
         app.on_key(key(KeyCode::F(12)));
         assert_eq!(app.focus, Focus::Dashboard);
+    }
+
+    #[test]
+    fn x_closes_exited_terminal_and_returns_to_dashboard() {
+        let mut app = new_app();
+        app.terms
+            .open(TermSession::test_session("web-1", "devsandbox-web-1", 24, 80));
+        app.terms.active_session().unwrap().set_exited();
+        app.focus = Focus::Terminal;
+        // `x` closes the exited session in place; with none left, focus drops
+        // back to the dashboard.
+        app.on_key(key(KeyCode::Char('x')));
+        assert!(app.terms.is_empty());
+        assert_eq!(app.focus, Focus::Dashboard);
+    }
+
+    #[test]
+    fn x_closes_exited_terminal_but_stays_focused_with_others() {
+        let mut app = new_app();
+        app.terms
+            .open(TermSession::test_session("web-1", "devsandbox-web-1", 24, 80));
+        app.terms
+            .open(TermSession::test_session("web-2", "devsandbox-web-2", 24, 80));
+        app.terms.active_session().unwrap().set_exited();
+        app.focus = Focus::Terminal;
+        app.on_key(key(KeyCode::Char('x')));
+        // One session remains, so the terminal stays focused.
+        assert_eq!(app.terms.sessions().len(), 1);
+        assert_eq!(app.focus, Focus::Terminal);
     }
 
     #[test]
