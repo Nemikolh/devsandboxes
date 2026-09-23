@@ -397,6 +397,20 @@ fn git_companion_mount(base: &Path) -> String {
     format!("{}:{}", git.display(), git.display())
 }
 
+/// `<data-dir>/agent`, the dir holding per-instance agent symlinks. `None` when
+/// the state path can't be resolved. One recipe so `run`, `rm`, and `gc` don't
+/// each re-derive it (docs/ssh-agent.md).
+pub(crate) fn ssh_agent_dir() -> Option<PathBuf> {
+    Some(State::path().ok()?.parent()?.join("agent"))
+}
+
+/// The agent symlink path for one instance, `<data-dir>/agent/<id>.sock`. `None`
+/// when the state path can't be resolved. Callers that clean up (`rm`, `gc`)
+/// share this rather than duplicating the join.
+pub(crate) fn ssh_agent_link_path(instance_id: &str) -> Option<PathBuf> {
+    Some(ssh_agent_dir()?.join(format!("{instance_id}.sock")))
+}
+
 /// Create or re-point `agent_dir/<instance_id>.sock` at the host agent
 /// socket. A symlink (not the raw path) because bind sources are
 /// re-resolved at every container start, so `start` can re-point it after
@@ -432,10 +446,7 @@ fn ssh_agent_forward(instance_id: &str) -> Result<Option<(String, String)>> {
     if std::fs::metadata(&sock).is_err() {
         return Ok(None);
     }
-    let agent_dir = State::path()?
-        .parent()
-        .context("state path has no parent")?
-        .join("agent");
+    let agent_dir = ssh_agent_dir().context("state path has no parent")?;
     match ssh_agent_link(&agent_dir, instance_id, &sock) {
         Ok(link) => Ok(Some((
             format!("{}:{SSH_AGENT_TARGET}", link.display()),
@@ -468,13 +479,9 @@ pub(crate) fn ssh_agent_refresh(info: &Instance) {
     if std::fs::metadata(&sock).is_err() {
         return;
     }
-    let Ok(state_path) = State::path() else {
+    let Some(agent_dir) = ssh_agent_dir() else {
         return;
     };
-    let Some(parent) = state_path.parent() else {
-        return;
-    };
-    let agent_dir = parent.join("agent");
     let _ = ssh_agent_link(&agent_dir, &info.instance_id, &sock);
 }
 

@@ -39,6 +39,13 @@ pub fn rm(name: &str) -> Result<()> {
         }
     }
 
+    // Drop this instance's ssh-agent link: it is worthless without its
+    // instance, and `run` recreates it. Best-effort — a missing link is a
+    // harmless no-op; `gc` sweeps any that outlive a crashed rm.
+    if let Some(link) = crate::commands::run::ssh_agent_link_path(&instance_id) {
+        let _ = std::fs::remove_file(link);
+    }
+
     if let Some(worktree) = worktree {
         remove_worktree(&base_folder, &worktree)?;
         // Recorded branch for instances created since it was tracked; older state

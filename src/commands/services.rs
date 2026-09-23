@@ -422,6 +422,7 @@ pub fn gc(dir: &Path, force: bool) -> Result<()> {
     }
 
     gc_shell_history(dir, &state, force)?;
+    gc_agent_links(&state)?;
     Ok(())
 }
 
@@ -748,6 +749,37 @@ fn gc_shell_history(dir: &Path, state: &State, force: bool) -> Result<()> {
     Ok(())
 }
 
+/// Delete `<data-dir>/agent/<instance_id>.sock` symlinks whose id no instance in
+/// state holds. Links leak when an `rm` crashed mid-way or predate this feature;
+/// matched on the persistent id (like `gc_shell_history`, since ids are global
+/// across config roots). No confirm prompt: unlike history, a dangling symlink
+/// carries no data (docs/ssh-agent.md).
+fn gc_agent_links(state: &State) -> Result<()> {
+    let Some(agent_dir) = crate::commands::run::ssh_agent_dir() else {
+        return Ok(()); // no data dir → nothing to sweep
+    };
+    gc_agent_links_in(&agent_dir, state)
+}
+
+fn gc_agent_links_in(agent_dir: &Path, state: &State) -> Result<()> {
+    let Ok(entries) = std::fs::read_dir(agent_dir) else {
+        return Ok(()); // never provisioned
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(id) = path.file_name().and_then(|n| n.to_str()).and_then(|n| n.strip_suffix(".sock"))
+        else {
+            continue;
+        };
+        if state.instances.values().any(|i| i.instance_id == id) {
+            continue;
+        }
+        std::fs::remove_file(&path).with_context(|| format!("cannot remove {}", path.display()))?;
+        println!("removed agent link {}", path.display());
+    }
+    Ok(())
+}
+
 fn container_running(container: &str) -> bool {
     backend().is_running(container).ok().flatten() == Some(true)
 }
@@ -859,6 +891,31 @@ ports = ["5432:5432"]
         assert_eq!(host_port("8080:80"), Some("8080"));
         assert_eq!(host_port("127.0.0.1:8080:80"), Some("8080"));
         assert_eq!(host_port("80"), None);
+    }
+
+    #[test]
+    fn gc_agent_links_sweeps_orphans_keeps_owned() {
+        let agent_dir =
+            std::env::temp_dir().join(format!("devsandbox-gc-agent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&agent_dir);
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let owned = agent_dir.join("owned-1.sock");
+        let orphan = agent_dir.join("orphan-1.sock");
+        // Targets need not exist — a dangling symlink is enough for the sweep.
+        std::os::unix::fs::symlink("/nonexistent/agent-a.sock", &owned).unwrap();
+        std::os::unix::fs::symlink("/nonexistent/agent-b.sock", &orphan).unwrap();
+
+        let mut state = State::default();
+        state.instances.insert("owned-1".into(), instance("owned", "owned-1"));
+
+        gc_agent_links_in(&agent_dir, &state).unwrap();
+
+        // `exists()` follows the (dangling) link and reports false; probe the
+        // link itself with `symlink_metadata`.
+        assert!(std::fs::symlink_metadata(&owned).is_ok(), "owned link removed");
+        assert!(std::fs::symlink_metadata(&orphan).is_err(), "orphan link kept");
+
+        std::fs::remove_dir_all(&agent_dir).unwrap();
     }
 
     fn instance(sandbox: &str, id: &str) -> crate::state::Instance {
