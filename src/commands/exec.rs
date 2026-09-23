@@ -76,6 +76,12 @@ pub fn exec_argv(
         args.push("-e".into());
         args.push(format!("{key}={value}"));
     }
+    // agent forwarding: the socket is a mount, the activating env var rides
+    // every exec, same as remote_env (docs/ssh-agent.md).
+    if let Some(sock) = &instance.ssh_auth_sock {
+        args.push("-e".into());
+        args.push(format!("SSH_AUTH_SOCK={sock}"));
+    }
     args.push(instance.container.clone());
     args.extend(command.iter().cloned());
     args
@@ -146,6 +152,29 @@ mod tests {
                 "devsandbox-repo-abc1",
                 "bash",
                 "-l",
+            ]
+        );
+    }
+
+    #[test]
+    fn argv_ssh_auth_sock() {
+        let mut inst = instance();
+        inst.remote_env.insert("FOO".into(), "bar".into());
+        inst.ssh_auth_sock = Some("/run/devsandbox/ssh-agent.sock".into());
+        assert_eq!(
+            exec_argv(&inst, false, false, &["ls".into()]),
+            vec![
+                "exec",
+                "-w",
+                "/workspaces/repository-1",
+                // remote_env -e pairs come first,
+                "-e",
+                "FOO=bar",
+                // then SSH_AUTH_SOCK, before the container name.
+                "-e",
+                "SSH_AUTH_SOCK=/run/devsandbox/ssh-agent.sock",
+                "devsandbox-repo-abc1",
+                "ls",
             ]
         );
     }
