@@ -12,6 +12,8 @@ Rollout is staged by runtime, easiest first:
 
 3. **macOS + Apple `container`** — blocked today; see _Future: Apple container_.
 
+4. **Windows (native)** — disabled; use WSL2. See _Windows (native)_.
+
 ## How it splits: mount at `run`, env at `exec`
 
 Two independent pieces:
@@ -170,6 +172,48 @@ Blocked today, two independent reasons:
    magic-socket equivalent.
 
 A future path would need an in-container relay (e.g. `socat` bridging a TCP forward to a unix socket), which is a materially different mechanism — out of scope until Apple `container` gains socket binds or a host-services socket. If that relay is ever built, note it also eliminates the remaining rotation-while-running staleness on every runtime (see the stale-socket caveat) and could replace the mount path entirely.
+
+## Windows (native): disabled, relay deferred
+
+**Status:** forwarding is compiled out on non-unix hosts. `ssh_agent_link` builds its symlink via a `#[cfg(unix)]` helper; `ssh_agent_forward` and
+`ssh_agent_refresh` return early under `!cfg!(unix)`, so no mount, no `Instance.ssh_auth_sock`, and no warning. The two symlink tests are
+`#[cfg(unix)]`. (Before this, `std::os::unix::fs::symlink` broke the Windows release build.)
+
+**Why not just a Windows symlink** (`std::os::windows::fs::symlink_file`): it would compile, but nothing useful would be on the other end.
+
+- Windows' own OpenSSH agent listens on a **named pipe**
+  (`\\.\pipe\openssh-ssh-agent`), not a unix socket, and normally leaves
+  `SSH_AUTH_SOCK` unset. So the Step 1 gate would already skip it.
+
+- A pipe (or a Git-Bash/MSYS agent socket) can't be bind-mounted into a
+  Linux container as a working unix socket.
+
+- Docker Desktop's magic `/run/host-services/ssh-auth.sock` (see _macOS +
+  docker_) doesn't forward on the Windows/WSL2 backend: `ssh-add -l` in the
+  container comes back empty (still open as of 2026-09).
+  1Password adds a hop (1Password → Windows pipe → WSL2 → container) that
+  doesn't resolve out of the box either.
+
+- Windows symlinks also need Developer Mode or admin.
+
+**Supported workaround today:** run devsandbox **inside WSL2** (the Linux build). Bridge the Windows agent into WSL with `socat` + `npiperelay.exe`
+(`socat UNIX-LISTEN:$SSH_AUTH_SOCK,fork EXEC:"npiperelay.exe -ei -s //./pipe/openssh-ssh-agent"`). From devsandbox's point of view that's the plain Linux case: Steps 1–4 apply unchanged.
+
+**Future native path (not started):** an agent relay owned by devsandbox:
+
+1. Host side: open the named pipe. That needs a Windows pipe client
+   (`tokio::net::windows::named_pipe` or a small winapi crate), and neither
+   is a dependency today.
+
+2. Transport: move agent-protocol bytes over a `docker exec -i` stdio stream
+   into the container.
+
+3. Container side: a tiny listener (`socat` or an injected helper) serves a
+   unix socket at `SSH_AGENT_TARGET`. Step 3's `exec -e` injection stays the
+   same.
+
+This needs a long-lived host process per instance (or per exec session, VS Code-style), which doesn't fit the current mount-and-forget design, `start`
+(Step 4), or rm/gc link cleanup. It's the same exec-stdio relay already noted under the stale-socket caveat and _Future: Apple container_. Building it once would cover Windows, Apple `container`, and live agent rotation, so do all three together if we ever do it.
 
 ## Appendix — how git chooses `SSH_AUTH_SOCK` vs `GIT_ASKPASS`
 
