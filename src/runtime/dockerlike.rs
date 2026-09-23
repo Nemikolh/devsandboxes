@@ -9,7 +9,10 @@ use std::collections::BTreeMap;
 use anyhow::Result;
 use serde::Deserialize;
 
-use super::{split_kv, Backend, ContainerRow, ProcList, ServiceEndpoint, StatsRow};
+use super::{
+    split_kv, without_self_ps, Backend, ContainerRow, ProcList, ServiceEndpoint, StatsRow,
+    PROC_PS_ARGS,
+};
 
 pub struct Dockerlike {
     name: &'static str,
@@ -101,8 +104,10 @@ impl Backend for Dockerlike {
         // can target the shown pid (`top` reports host-namespace pids, which
         // `exec kill` inside the container can't reach). Fall back to `top` for
         // images without `ps`: those still list, but as non-signalable host pids.
-        match self.output_quiet(&["exec", container, "ps", "-eo", "pid,ppid,args"]) {
-            Ok(text) => Ok(ProcList { text, container_pids: true }),
+        let mut exec = vec!["exec", container];
+        exec.extend_from_slice(&PROC_PS_ARGS);
+        match self.output_quiet(&exec) {
+            Ok(text) => Ok(ProcList { text: without_self_ps(&text), container_pids: true }),
             Err(_) => {
                 let text = self.output_quiet(&["top", container, "-eo", "pid,ppid,args"])?;
                 Ok(ProcList { text, container_pids: false })

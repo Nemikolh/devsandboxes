@@ -9,7 +9,10 @@ use std::collections::BTreeMap;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
-use super::{human_bytes, Backend, ContainerRow, ProcList, ServiceEndpoint, StatsRow};
+use super::{
+    human_bytes, without_self_ps, Backend, ContainerRow, ProcList, ServiceEndpoint, StatsRow,
+    PROC_PS_ARGS,
+};
 
 pub struct AppleContainer;
 
@@ -223,8 +226,10 @@ impl Backend for AppleContainer {
     fn proc_list(&self, container: &str) -> Result<ProcList> {
         // No `top` subcommand; ask procps inside the container instead, so pids
         // are container-namespace and signalable.
-        let text = self.output_quiet(&["exec", container, "ps", "-eo", "pid,ppid,args"])?;
-        Ok(ProcList { text, container_pids: true })
+        let mut exec = vec!["exec", container];
+        exec.extend_from_slice(&PROC_PS_ARGS);
+        let text = self.output_quiet(&exec)?;
+        Ok(ProcList { text: without_self_ps(&text), container_pids: true })
     }
 
     fn remove_force(&self, container: &str) -> Result<i32> {

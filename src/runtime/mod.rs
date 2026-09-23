@@ -308,6 +308,26 @@ pub fn backend() -> &'static dyn Backend {
         .as_ref()
 }
 
+/// The `ps` invocation `proc_list` runs inside a container. Shared so the call
+/// site and [`without_self_ps`] can't drift.
+pub(crate) const PROC_PS_ARGS: [&str; 3] = ["ps", "-eo", "pid,ppid,args"];
+
+/// Drop the `ps` process we spawned from a container process listing: run via
+/// `exec`, `ps` appears in its own output. Removes the row whose command column
+/// (everything after pid and ppid) equals the [`PROC_PS_ARGS`] invocation;
+/// every other line, including the header, is kept. Whitespace is normalized
+/// before comparing so the parser's column padding doesn't matter.
+pub(crate) fn without_self_ps(text: &str) -> String {
+    let ps_cmd = PROC_PS_ARGS.join(" ");
+    text.lines()
+        .filter(|line| {
+            let cmd = line.split_whitespace().skip(2).collect::<Vec<_>>().join(" ");
+            cmd != ps_cmd
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Split `k=v` into `(k, v)`; a bare key maps to an empty value.
 pub(crate) fn split_kv(pair: &str) -> (String, String) {
     match pair.split_once('=') {
@@ -370,5 +390,31 @@ mod tests {
         assert_eq!(human_bytes(50 * 1024 * 1024), "50.0MiB");
         assert_eq!(human_bytes(2 * 1024 * 1024 * 1024), "2.0GiB");
         assert_eq!(human_bytes(150 * 1024 * 1024), "150MiB");
+    }
+
+    #[test]
+    fn without_self_ps_drops_only_the_ps_row() {
+        // Header kept, the `ps -eo pid,ppid,args` row (any column padding) removed,
+        // real processes untouched.
+        let input = "\
+    PID    PPID COMMAND
+      1       0 /sbin/init
+   1409       1 zidane --resume
+   1500    1409 ps -eo pid,ppid,args";
+        let out = without_self_ps(input);
+        assert_eq!(
+            out,
+            "\
+    PID    PPID COMMAND
+      1       0 /sbin/init
+   1409       1 zidane --resume"
+        );
+    }
+
+    #[test]
+    fn without_self_ps_keeps_unrelated_lines() {
+        // A `top` listing has no self `ps` row; nothing is dropped.
+        let input = "PID PPID COMMAND\n1 0 bash\n2 1 node server.js";
+        assert_eq!(without_self_ps(input), input);
     }
 }
