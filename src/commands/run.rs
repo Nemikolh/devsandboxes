@@ -428,9 +428,25 @@ pub(crate) fn ssh_agent_link(agent_dir: &Path, instance_id: &str, sock: &Path) -
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e).with_context(|| format!("cannot replace {}", link.display())),
     }
-    std::os::unix::fs::symlink(sock, &link)
+    symlink(sock, &link)
         .with_context(|| format!("cannot link {} -> {}", link.display(), sock.display()))?;
     Ok(link)
+}
+
+#[cfg(unix)]
+fn symlink(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(src, dst)
+}
+
+/// Never reached: `ssh_agent_forward`/`ssh_agent_refresh` bail out first on
+/// non-unix hosts, whose agent is a named pipe no runtime can bind
+/// (docs/ssh-agent.md, _Windows_). Exists only so the crate compiles.
+#[cfg(not(unix))]
+fn symlink(_src: &Path, _dst: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "ssh-agent forwarding is unix-only",
+    ))
 }
 
 /// Decide ssh-agent forwarding for a new instance. Returns the `-v
@@ -440,7 +456,7 @@ pub(crate) fn ssh_agent_link(agent_dir: &Path, instance_id: &str, sock: &Path) -
 /// its socket exists on the host. On a link error, warn and skip: forwarding
 /// is best-effort and must not fail container creation (docs/ssh-agent.md).
 fn ssh_agent_forward(instance_id: &str) -> Result<Option<(String, String)>> {
-    if !backend().supports_file_binds() {
+    if !cfg!(unix) || !backend().supports_file_binds() {
         return Ok(None);
     }
     let Some(sock) = std::env::var_os("SSH_AUTH_SOCK") else {
@@ -473,7 +489,7 @@ fn ssh_agent_forward(instance_id: &str) -> Result<Option<(String, String)>> {
 /// background thread that owns the alternate screen, where a stray warning
 /// would corrupt the display, so screen safety wins over a lost warning.
 pub(crate) fn ssh_agent_refresh(info: &Instance) {
-    if info.ssh_auth_sock.is_none() {
+    if !cfg!(unix) || info.ssh_auth_sock.is_none() {
         return;
     }
     let Some(sock) = std::env::var_os("SSH_AUTH_SOCK") else {
@@ -2051,6 +2067,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn ssh_agent_link_creates_and_repoints() {
         let dir = std::env::temp_dir().join(format!("devsandbox-agent-{}", std::process::id()));
         let first = dir.join("agent-a.sock");

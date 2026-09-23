@@ -894,6 +894,7 @@ ports = ["5432:5432"]
     }
 
     #[test]
+    #[cfg(unix)]
     fn gc_agent_links_sweeps_orphans_keeps_owned() {
         let agent_dir =
             std::env::temp_dir().join(format!("devsandbox-gc-agent-{}", std::process::id()));
