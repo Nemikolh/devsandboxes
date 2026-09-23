@@ -1094,7 +1094,7 @@ impl App {
         std::mem::take(&mut self.needs_proc_fetch)
     }
 
-    /// The `docker top` fetch targets: `(instance name, container)` for every
+    /// The process-list fetch targets: `(instance name, container)` for every
     /// expanded instance whose container is running. Expanded instances that are
     /// not running (or absent from the snapshot) get a `(not running)` message
     /// row stored directly here — no fetch — and are omitted from the returned

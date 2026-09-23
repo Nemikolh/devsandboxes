@@ -97,7 +97,10 @@ impl Backend for Dockerlike {
     }
 
     fn proc_list(&self, container: &str) -> Result<String> {
-        self.output_quiet(&["top", container, "-eo", "pid,ppid,args"])
+        // `top` reports *host*-namespace pids, which don't match what `kill`
+        // sees inside the container (see `signal_proc`). Run `ps` inside the
+        // container instead so listed pids are the ones signals target.
+        self.output_quiet(&["exec", container, "ps", "-eo", "pid,ppid,args"])
     }
 
     fn remove_force(&self, container: &str) -> Result<i32> {

@@ -532,7 +532,7 @@ fn spawn_signal(sig: PendingSignal) -> Receiver<OpDone> {
     rx
 }
 
-/// Spawn one detached thread that runs `docker top` for each target
+/// Spawn one detached thread that runs the runtime's `proc_list` for each target
 /// `(instance name, container)` and sends back a name→[`ProcState`] map. Docker
 /// calls go through the screen-safe quiet path; a per-container error becomes a
 /// `(processes unavailable: …)` message row rather than failing the batch.

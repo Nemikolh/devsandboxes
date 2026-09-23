@@ -1,7 +1,7 @@
 //! Process layer for the Instances tree: the third level, showing an instance's
 //! running processes as a `ps -ef --forest`-style tree. Parsing and forest
 //! building live here as pure functions so they unit-test without docker; the
-//! fetch itself (`docker top`) is driven by the event loop.
+//! fetch itself (the runtime's `proc_list`) is driven by the event loop.
 
 /// One rendered process row, forest-ordered. `depth` drives the `\_ ` indent at
 /// render time; `pid` sits in the TREE gutter and `args` spans the rest.
@@ -61,7 +61,7 @@ pub fn is_agent(args: &str) -> bool {
         })
 }
 
-/// Parse `docker top <container> -eo pid,ppid,args` output into
+/// Parse `ps -eo pid,ppid,args` output into
 /// `(pid, ppid, args)` triples. The first line is a header and is skipped; each
 /// remaining line splits into pid, ppid, and the remainder as args. Lines with
 /// fewer than three whitespace-separated fields are skipped.
