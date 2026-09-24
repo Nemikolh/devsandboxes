@@ -163,24 +163,79 @@ ssh (in container) ──unix──▶ devsbd daemon ◀──frames over exec s
                     /run/devsandbox/ssh-agent.sock      `exec -i <c> devsbd bridge`
 ```
 
-- **Daemon:** started with `exec -d <c> devsbd daemon` after install.
-  Pidfile/lock at `/run/devsandbox/devsbd.pid`; a second `daemon` exits 0 if
-  one is alive. Listens on `/run/devsandbox/ssh-agent.sock` (mode 0666 or
-  chowned to `remoteUser` — fixes the uid-mismatch caveat of the bind mount)
-  and on a control socket `/run/devsandbox/devsbd.ctl` for bridges.
+- **Daemon:** started with `exec -d -u root <c> devsbd daemon` after every
+  successful install (`devsbd::ensure`). Pidfile at `/run/devsandbox/devsbd.pid`
+  (`<pid> <build hash>`) held with an exclusive `File::try_lock` for the
+  daemon's lifetime. The kernel drops the lock with the process, so a stale
+  pidfile never blocks. Listens on `/run/devsandbox/ssh-agent.sock` (mode
+  0666, daemon runs as root — fixes the uid-mismatch caveat of the bind mount)
+  and on a control socket `/run/devsandbox/devsbd.ctl` (0600) for bridges. If
+  the agent path is taken (the bind mount), it logs and serves only the
+  control socket.
 
-- **Bridge:** host runs `exec -i <c> devsbd bridge`; the bridge
-  connects to the control socket and relays frames between it and its stdio.
+- **Version mismatch / takeover.** A CLI upgrade while a container runs
+  leaves the old binary and old daemon in it. Outcomes:
+  - `exec`/TUI before any reinstall: the host runs the *old* `bridge`. A
+    differing build hash is fine (bridge and daemon are the same old build;
+    only `VERSION` must match). A differing `VERSION` fails the host
+    handshake: `exec` prints `note: ssh-agent relay unavailable in <c>:
+    protocol version N, expected M: helper out of date, restart the instance`
+    after the command; the TUI stays silent.
+  - `stop` + `start` / `rebuild`: clean, no process survives.
+  - `start` on a still-running container (`start.rs` accepts it): `ensure`
+    rewrites the binary (hash differs) and starts a new daemon. The lock is
+    held by a daemon whose pidfile hash differs, so the new one sends `Quit`
+    as the first frame on the control socket. The old one exits (its bridges
+    and streams end), and the new one takes the lock (waits up to 3s) and
+    rebinds the sockets. Same hash → exits 0. No hash in the pidfile yet (its
+    owner is mid-startup) → treated as same build, so two concurrent starts
+    never evict each other.
+  - The bridge also exchanges `Hello` with the daemon, so a bridge/daemon
+    mismatch fails the handshake rather than passing frames the daemon
+    can't parse.
+
+- **Bridge:** host runs `exec -i -u root <c> devsbd bridge`. The bridge
+  connects to the control socket first (retrying for 2s: `exec -d` returns
+  before the daemon listens) and exchanges `Hello` with the daemon, so a
+  missing or mismatched daemon shows up as a failed handshake; the host then
+  reports the bridge's stderr (e.g. `daemon not running`). Then it does
+  `Hello` with the host and copies bytes verbatim between stdio and the
+  control socket; only the daemon parses frames.
   Each agent client connection accepted by the daemon becomes a stream routed
-  to *one* live bridge (most recent); no live bridge → accept and close
-  immediately (ssh reports "agent refused", same as no agent).
+  to *one* live bridge (most recent). No live bridge → the client is held up
+  to 1s for one to attach, then closed (ssh reports "agent refused", same as
+  no agent). The hold is what makes the optimistic `exec` below safe; its cost
+  is a 1s delay before "refused" when no devsandbox process is alive. The daemon
+  keeps every connected bridge, so when the newest ends (a CLI `exec`),
+  routing falls back to the next newest (the TUI's) instead of to nothing.
+
+- **Stream routing** (`src/devsbd/mux.rs`, shared via `#[path]` like the
+  protocol): the same `Mux` runs in the daemon and on the host. Whoever sees
+  a local stream end first sends `Close`; receiving `Close` shuts the local
+  socket without echoing. A refused `Open` (unknown channel, no host agent)
+  is answered with `Close`. Losing the frame connection shuts every stream.
+  No half-close: a client's EOF closes the stream both ways (ssh clients
+  don't half-close agent connections). Unix-only for now (unix sockets on
+  both ends).
 
 - **Host side:** for each `Open` the host connects to the *current*
   `$SSH_AUTH_SOCK` (so rotation is a non-issue) — or, later, the Windows
   named pipe. Owner of the host side:
-  - TUI: one bridge per running instance while the dashboard is open
-    (background thread in `src/tui/mod.rs`).
-  - CLI `exec`: spawn a bridge thread for the lifetime of the exec.
+  - Each host process owns its bridges; they're never shared across processes.
+    Several bridges per container are normal (the daemon routes to the newest
+    live one, see _Bridge_).
+  - TUI: one bridge per running instance while the dashboard is open, used by
+    every integrated terminal tab on that instance
+    (`devsbd::bridge::Bridges`, reconciled on each snapshot in
+    `src/tui/mod.rs`; a dead bridge is retried at most every 10s).
+  - CLI `exec` (including the TUI's suspended `:exec`, which goes through
+    `exec_status`): its own bridge for the lifetime of the exec, started
+    optimistically alongside the command, with no handshake wait and so no added
+    latency. The daemon's hold covers a command that reaches the agent
+    first (a `docker exec` startup is ~60–100 ms). A failed handshake is
+    reported after the command exits, so it can't interleave with its output.
+  - Until step 6, bridges only run for instances with the helper and *no*
+    bind mount (`bridge::wanted`): the mount occupies the daemon's socket path.
   - Everything else (VS Code terminals, plain `docker exec`): covered whenever
     a devsandbox TUI/exec is alive; otherwise not. VS Code keeps its own
     forwarding. Document the gap; a `devsandbox agent <instance>` foreground
@@ -201,10 +256,16 @@ Length-prefixed, little-endian, one byte stream in each direction:
 
 ```
 u32 stream_id | u8 kind | u32 len | payload[len]
-kind: 0 Hello(u32 version, hash utf-8)  1 Open(channel: u8)  2 Data  3 Close  4 Ping  5 Pong
+kind: 0 Hello(u32 version, hash utf-8)  1 Open(channel: u8)  2 Data  3 Close  4 Ping  5 Pong  6 Quit
 ```
 
-- Control frames (`Hello`, `Ping`, `Pong`) use stream 0; the daemon allocates
+- **Frozen forever:** the header layout, `Hello` and `Quit` (pinned by a
+  byte-level test). An outdated daemon must still understand the `Quit` that
+  replaces it, and either side's `Hello` must decode far enough to report a
+  version mismatch. The daemon answers a bridge's `Hello` with its own even
+  on mismatch, for the same reason.
+
+- Control frames (`Hello`, `Ping`, `Pong`, `Quit`) use stream 0; the daemon allocates
   stream ids from 1 for the connections it accepts. `Pong` echoes the `Ping`
   payload (separate kinds so a reply can't be mistaken for a new ping).
 - Payload capped at 1 MiB (`MAX_PAYLOAD`): stray bytes on the stream (a shell
@@ -215,8 +276,9 @@ kind: 0 Hello(u32 version, hash utf-8)  1 Open(channel: u8)  2 Data  3 Close  4 
   `write_all` + flush, so writers sharing a stream behind a mutex never
   interleave frames.
 
-- `Hello` both ways first; mismatched version → bridge exits non-zero with a
-  message the host surfaces ("helper out of date, restart instance").
+- `Hello` both ways first; mismatched version → the host's handshake fails
+  with "helper out of date, restart the instance", which CLI `exec` prints
+  (see _Version mismatch / takeover_).
 - `channel` byte reserves room for API proxy streams (`1 = ssh-agent`,
   `2 = http-proxy`, …) so the protocol doesn't change later.
 - `Hello`'s hash is informational (the sender's build hash); only `version`
@@ -238,7 +300,7 @@ kind: 0 Hello(u32 version, hash utf-8)  1 Open(channel: u8)  2 Data  3 Close  4 
 3. [x] Install into container (host arch → other-arch retry, stream write, hash check) in `run` +
    `start`; `Instance.devsbd_arch`.
 4. [x] Shared frame protocol + tests.
-5. Helper `daemon` + `bridge`; host-side bridge driver (`src/commands/agent.rs`
+5. [x] Helper `daemon` + `bridge`; host-side bridge driver (`src/commands/agent.rs`
    or similar), wired into CLI `exec` and the TUI.
 6. Switch ssh-agent to relay when available; update `docs/ssh-agent.md`
    (stale-socket, Apple, Windows sections point here).

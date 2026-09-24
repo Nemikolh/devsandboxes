@@ -7,7 +7,11 @@
 //! `exec -i` stdin, which works on every runtime (no `docker cp`, no file
 //! binds on Apple `container`).
 
-// Consumed by the host-side bridge driver (step 5 of docs/sandbox-helper.md).
+#[cfg(unix)]
+pub mod bridge;
+#[cfg(unix)]
+mod mux;
+// Partly helper-only (e.g. `Frame::encode` callers on the daemon side).
 #[allow(dead_code)]
 pub mod proto;
 
@@ -148,11 +152,21 @@ pub fn install(container: &str, recorded: Option<Arch>) -> Result<Arch, String> 
     Err(format!("devsbd couldn't run in `{container}`"))
 }
 
-/// `install`, printing the note on failure unless `quiet` (the TUI owns the
-/// screen). Never fails the caller: the helper is optional.
+/// Start `devsbd daemon` detached. Idempotent: a second daemon sees the
+/// pidfile lock and exits 0. Failures are silent; bridges then fail their
+/// handshake and the relay is simply off.
+fn start_daemon(container: &str) {
+    let _ = backend().output_quiet(&["exec", "-d", "-u", "root", container, BIN, "daemon"]);
+}
+
+/// `install` + `start_daemon`, printing the note on failure unless `quiet`
+/// (the TUI owns the screen). Never fails the caller: the helper is optional.
 pub fn ensure(container: &str, recorded: Option<Arch>, quiet: bool) -> Option<Arch> {
     match install(container, recorded) {
-        Ok(arch) => Some(arch),
+        Ok(arch) => {
+            start_daemon(container);
+            Some(arch)
+        }
         Err(note) => {
             if !quiet {
                 eprintln!("note: {note}");

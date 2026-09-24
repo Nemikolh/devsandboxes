@@ -1,10 +1,15 @@
 //! devsbd: container-side half of devsandbox's host<->container relays.
 //! argv is hand-parsed (no clap) to keep the static binary small.
 
-// Shared with the host so the two sides can't drift; lives in the root crate
-// because devsbd/ isn't packaged (see the module doc).
+mod bridge;
+mod daemon;
+
+// Shared with the host so the two sides can't drift; they live in the root
+// crate because devsbd/ isn't packaged (see proto.rs's module doc).
+#[path = "../../src/devsbd/mux.rs"]
+mod mux;
 #[path = "../../src/devsbd/proto.rs"]
-#[allow(dead_code)] // daemon/bridge land in step 5
+#[allow(dead_code)] // host-only helpers (e.g. Frame::Ping senders)
 mod proto;
 
 /// Build hash slot. The helper can't know its own sha256 at compile time, so
@@ -25,9 +30,18 @@ fn main() {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("version") => println!("devsbd {} {}", proto::VERSION, build_hash()),
+        Some("daemon") => exit_on_err(daemon::run(&build_hash())),
+        Some("bridge") => exit_on_err(bridge::run(&build_hash())),
         _ => {
-            eprintln!("usage: devsbd version");
+            eprintln!("usage: devsbd version|daemon|bridge");
             std::process::exit(2);
         }
+    }
+}
+
+fn exit_on_err(result: std::io::Result<()>) {
+    if let Err(e) = result {
+        eprintln!("devsbd: {e}");
+        std::process::exit(1);
     }
 }

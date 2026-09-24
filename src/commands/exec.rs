@@ -45,9 +45,22 @@ pub fn exec_status(name: &str, interactive: bool, tty: bool, command: &[String])
         }
     };
 
+    // ssh-agent relay for the command's lifetime, started optimistically
+    // alongside it: no handshake wait, the daemon holds an agent client that
+    // beats the bridge (docs/sandbox-helper.md).
+    #[cfg(unix)]
+    let bridge = crate::devsbd::bridge::wanted(instance)
+        .then(|| crate::devsbd::bridge::spawn(instance))
+        .flatten();
     let args = exec_argv(instance, interactive, tty, command);
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    backend().run_inherit(&arg_refs)
+    let code = backend().run_inherit(&arg_refs)?;
+    // Reported after the command so it can't interleave with its output.
+    #[cfg(unix)]
+    if let Some(Err(e)) = bridge.as_ref().and_then(|b| b.outcome(std::time::Duration::ZERO)) {
+        eprintln!("note: ssh-agent relay unavailable in `{}`: {e}", instance.container);
+    }
+    Ok(code)
 }
 
 /// Build the runtime `exec` argv for `instance`: the flags, workspace,

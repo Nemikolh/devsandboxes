@@ -7,6 +7,11 @@
 //! `u32 stream | u8 kind | u32 len | payload[len]`. Control frames (`Hello`,
 //! `Ping`, `Pong`) use stream 0; the daemon allocates stream ids from 1 for
 //! the connections it accepts.
+//!
+//! **Frozen across versions:** the header layout, `Hello` and `Quit`. An
+//! outdated daemon must still understand the `Quit` a newer one sends to
+//! replace it, and a `Hello` from either side must still decode far enough to
+//! report the version mismatch.
 
 use std::io::{self, Read, Write};
 
@@ -33,6 +38,7 @@ const KIND_DATA: u8 = 2;
 const KIND_CLOSE: u8 = 3;
 const KIND_PING: u8 = 4;
 const KIND_PONG: u8 = 5;
+const KIND_QUIT: u8 = 6;
 
 const HEADER_LEN: usize = 9;
 
@@ -49,6 +55,10 @@ pub enum Frame {
     /// Liveness check; the peer answers `Pong` with the same payload.
     Ping(Vec<u8>),
     Pong(Vec<u8>),
+    /// Sent as the first frame on the daemon's control socket by a daemon of a
+    /// different build taking over: the running daemon exits. Frozen (see the
+    /// module doc).
+    Quit,
 }
 
 impl Frame {
@@ -66,6 +76,7 @@ impl Frame {
             Frame::Close { stream } => (*stream, KIND_CLOSE, Vec::new()),
             Frame::Ping(p) => (0, KIND_PING, p.clone()),
             Frame::Pong(p) => (0, KIND_PONG, p.clone()),
+            Frame::Quit => (0, KIND_QUIT, Vec::new()),
         };
         let mut out = Vec::with_capacity(HEADER_LEN + payload.len());
         out.extend_from_slice(&stream.to_le_bytes());
@@ -94,6 +105,7 @@ impl Frame {
             KIND_CLOSE => Frame::Close { stream },
             KIND_PING => Frame::Ping(payload),
             KIND_PONG => Frame::Pong(payload),
+            KIND_QUIT => Frame::Quit,
             other => return Err(invalid(&format!("unknown frame kind {other}"))),
         })
     }
@@ -162,6 +174,7 @@ mod tests {
             Frame::Close { stream: 7 },
             Frame::Ping(b"t".to_vec()),
             Frame::Pong(Vec::new()),
+            Frame::Quit,
         ]
     }
 
@@ -182,6 +195,17 @@ mod tests {
     fn header_layout_is_little_endian() {
         let wire = Frame::Data { stream: 0x0102_0304, bytes: b"hi".to_vec() }.encode();
         assert_eq!(wire, [4, 3, 2, 1, KIND_DATA, 2, 0, 0, 0, b'h', b'i']);
+    }
+
+    /// `Hello` and `Quit` are frozen across versions: these bytes must never
+    /// change, or daemon takeover and mismatch reporting break for old helpers.
+    #[test]
+    fn frozen_frames_keep_their_bytes() {
+        assert_eq!(Frame::Quit.encode(), [0, 0, 0, 0, 6, 0, 0, 0, 0]);
+        assert_eq!(
+            Frame::Hello { version: 1, hash: "h".into() }.encode(),
+            [0, 0, 0, 0, 0, 5, 0, 0, 0, 1, 0, 0, 0, b'h']
+        );
     }
 
     /// Reader yielding one byte per `read`, like a pipe under pressure.

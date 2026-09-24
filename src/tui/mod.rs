@@ -104,6 +104,10 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
     // At most one process fetch in flight; `Some` while one is running.
     let mut proc_pending: Option<Receiver<BTreeMap<String, ProcState>>> = None;
     let mut last_proc_tick = Instant::now();
+    // ssh-agent relays, one per running instance while the dashboard is open
+    // (docs/sandbox-helper.md); dropped (killed) on exit.
+    #[cfg(unix)]
+    let mut bridges = crate::devsbd::bridge::Bridges::default();
 
     while !app.should_quit {
         // Full-frame area, shared by the pre-draw PTY resize and mouse routing.
@@ -234,6 +238,16 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
         if let Some(rx) = &pending {
             match rx.try_recv() {
                 Ok(snapshot) => {
+                    #[cfg(unix)]
+                    {
+                        let running: Vec<&str> = snapshot
+                            .instances
+                            .iter()
+                            .filter(|r| matches!(r.status, data::ContainerStatus::Running(_)))
+                            .map(|r| r.container.as_str())
+                            .collect();
+                        bridges.reconcile(&running);
+                    }
                     app.set_snapshot(snapshot);
                     pending = None;
                 }
