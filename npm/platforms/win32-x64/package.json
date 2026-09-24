@@ -1,6 +1,6 @@
 {
   "name": "@devsandboxes/win32-x64",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "devsandbox native binary for win32 x64. Install `devsandboxes` instead.",
   "license": "MIT",
   "repository": {
