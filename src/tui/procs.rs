@@ -29,8 +29,8 @@ pub enum ProcState {
 pub const MESSAGE_ROW: usize = usize::MAX;
 
 /// Known coding-agent command names. Matched against the basename of each
-/// whitespace-separated token in a process's args, so a bare `zidane`, a
-/// `/usr/local/bin/zidane`, and a `node …/claude` wrapper all count. Entries are
+/// whitespace-separated token in a process's args, so a bare `codex`, a
+/// `/usr/local/bin/codex`, and a `node …/claude` wrapper all count. Entries are
 /// basenames only (no paths, no extensions); keep them distinctive to avoid
 /// matching ordinary argument values.
 pub const AGENT_NAMES: &[&str] = &[
@@ -52,7 +52,7 @@ pub const AGENT_NAMES: &[&str] = &[
 ];
 
 /// True when a process's args name a known coding agent. Each whitespace token is
-/// reduced to its path basename (`/usr/local/bin/zidane` → `zidane`) and compared
+/// reduced to its path basename (`/usr/local/bin/codex` → `codex`) and compared
 /// case-insensitively against [`AGENT_NAMES`]. Flag tokens (`-…`) are skipped so a
 /// value that happens to match can't false-positive off a flag.
 pub fn is_agent(args: &str) -> bool {
@@ -249,8 +249,8 @@ mod tests {
 
     #[test]
     fn is_agent_matches_bare_name_and_path_and_wrapper() {
-        assert!(is_agent("zidane"));
-        assert!(is_agent("/usr/local/bin/zidane --resume"));
+        assert!(is_agent("codex"));
+        assert!(is_agent("/usr/local/bin/codex --resume"));
         // node/python wrappers: the script token is what matches.
         assert!(is_agent("node /opt/claude-code/dist/claude"));
         assert!(is_agent("CLAUDE")); // case-insensitive

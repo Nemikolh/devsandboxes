@@ -430,7 +430,7 @@ mod tests {
         let input = "\
     PID    PPID COMMAND
       1       0 /sbin/init
-   1409       1 zidane --resume
+   1409       1 claude --resume
    1500    1409 ps -eo pid,ppid,args";
         let out = without_self_ps(input);
         assert_eq!(
@@ -438,7 +438,7 @@ mod tests {
             "\
     PID    PPID COMMAND
       1       0 /sbin/init
-   1409       1 zidane --resume"
+   1409       1 claude --resume"
         );
     }
 

@@ -1032,11 +1032,11 @@ onCreateCommand = { b = "make", a = ["cargo", "build"] }
     #[test]
     fn substitutes_shared_volumes_and_instance() {
         let m = Mount::Shorthand(
-            "source=${sharedVolumes}/zidane/${instance},target=/root/.zidane,type=bind".into(),
+            "source=${sharedVolumes}/agent/${instance},target=/root/.agent,type=bind".into(),
         );
         let resolved = m.resolve(&ctx()).unwrap();
-        assert_eq!(resolved.source.as_deref(), Some("/cfg/shared-volumes/zidane/repo-2"));
-        assert_eq!(resolved.target, "/root/.zidane");
+        assert_eq!(resolved.source.as_deref(), Some("/cfg/shared-volumes/agent/repo-2"));
+        assert_eq!(resolved.target, "/root/.agent");
     }
 
     #[test]

@@ -2994,7 +2994,7 @@ mod tests {
         let rows = vec![
             ProcRow { pid: "1".into(), depth: 0, args: "/sbin/init".into() },
             ProcRow { pid: "2".into(), depth: 1, args: "node /usr/local/bin/claude".into() },
-            ProcRow { pid: "3".into(), depth: 1, args: "zidane --resume".into() },
+            ProcRow { pid: "3".into(), depth: 1, args: "claude --resume".into() },
         ];
         app.procs.insert("x".into(), ProcState::Rows { rows, signalable: true });
         assert_eq!(app.agent_count("x"), Some(2));

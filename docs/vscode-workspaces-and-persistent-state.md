@@ -36,16 +36,16 @@ Substituted in `mounts`, cache sources, and `workspaceFolder`:
   creation, kept unique across renames (a new instance reusing a freed name gets
   `name-1`), so these paths never move once created
 
-Used to persist zidane sessions per instance, with the host-shared binary and
+Used to persist agent sessions per instance, with the host-shared binary and
 credentials layered on top (docker/podman sort mounts by target, so nested
 binds are safe; Apple `container` untested):
 
 ```toml
 [template.base]
 mounts = [
-  "source=${sharedVolumes}/zidane/${instance},target=/root/.zidane,type=bind",
-  "source=${localEnv:HOME}/.zidane/zidane,target=/root/.zidane/zidane,type=bind",
-  "source=${localEnv:HOME}/.zidane/credentials.json,target=/root/.zidane/credentials.json,type=bind",
+  "source=${sharedVolumes}/agent/${instance},target=/root/.agent,type=bind",
+  "source=${localEnv:HOME}/.agent/agent,target=/root/.agent/agent,type=bind",
+  "source=${localEnv:HOME}/.agent/credentials.json,target=/root/.agent/credentials.json,type=bind",
 ]
 ```
 
@@ -53,4 +53,4 @@ mounts = [
 - Like `persist-shell-history` files, `rm` does **not** delete these dirs:
   sessions survive removal and revive when a same-name instance is re-created.
 - Existing containers pick mount changes up only on recreate; copy
-  `/root/.zidane` out of a live container first if its sessions matter.
+  `/root/.agent` out of a live container first if its sessions matter.

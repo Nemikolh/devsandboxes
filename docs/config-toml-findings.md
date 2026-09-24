@@ -2,7 +2,7 @@
 
 Modeling the six real devcontainer projects under `data/` against one shared
 template exposed the gaps below. Ordered by how much they block the goal
-(one common template that sets up zidane + persistent caches + shell history).
+(one common template that sets up the agent + persistent caches + shell history).
 
 ## Status
 
@@ -19,7 +19,7 @@ bind sources (file vs dir heuristic), wired to `docker run --mount`. Original
 notes below.
 
 `mounts` is parsed but ignored (listed under "valid, not implemented"). It is
-the mechanism the whole template relies on: the zidane binary + credentials, the
+the mechanism the whole template relies on: the agent binary + credentials, the
 shared pnpm/cargo caches. Minimum viable support:
 - `type=bind` with `source=`/`target=` (and optional `readonly`).
 - Variable substitution in `source`:
@@ -55,11 +55,11 @@ already have deterministic names, devsandbox can own this end to end:
 
 ## 3. `mounts`/env for compose sandboxes — OBSOLETE
 Resolved by removal: `dockerComposeFile`/`service`/`runServices` and the compose
-code path are gone. `bolt-restate`/`rails` are modeled with `image`/`build` +
+code path are gone. The compose projects are modeled with `image`/`build` +
 shared `services`, so there is no compose service for the template to reach.
 Original notes below.
 
-`bolt-restate` and `rails` were compose devcontainers whose zidane mounts lived
+Two projects were compose devcontainers whose agent mounts lived
 in `docker-compose.yml`. The template's `mounts`/`containerEnv` never reach a
 compose service today. Either:
 - inject them via the generated compose override (we already write one for the
@@ -75,7 +75,7 @@ restating the template. Caveat: a diamond (two bases sharing an ancestor)
 duplicates concatenated array entries; not deduped. Original notes below.
 
 Single-level, single-`extends` forces one fat `base` template. Real projects are
-node **and** rust (bolt, webcontainer) or go **and** rust (goj). Two options:
+node **and** rust (webcontainer) or go **and** rust (goj). Two options:
 - allow `extends = ["node", "rust"]` (list), merged left-to-right; and/or
 - allow templates to `extends` other templates (recursive resolve).
 Also make table/array merges additive for `mounts`, `containerEnv`, `extensions`
@@ -111,7 +111,7 @@ v1 limitations:
 
 Original notes below.
 
-`goj`, `rails`, `wasm-typescript`, `zidane` use devcontainer features
+`goj`, `wasm-typescript` and others use devcontainer features
 (go, rust, node, common-utils/zsh). Unsupported, so today they must be baked
 into images or `postCreateCommand`. Full feature support is a large, separate
 effort — worth a decision: support the common ones, or declare features

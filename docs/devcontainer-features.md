@@ -1,7 +1,7 @@
 # Plan: devcontainer `features` support
 
 Addresses finding #6 in `docs/config-toml-findings.md` (lines 88–94): `goj`,
-`rails`, `wasm-typescript`, `zidane` originally used devcontainer features
+`wasm-typescript` and others originally used devcontainer features
 (go, rust, node, common-utils/zsh, git); today those must be baked into images
 or `postCreateCommand`.
 
@@ -31,7 +31,7 @@ containing `devcontainer-feature.json` + `install.sh`. Support pipeline:
    its `containerEnv` (escape `"` and `\` only — `# Plan: devcontainer `features` support
 
 Addresses finding #6 in `docs/config-toml-findings.md` (lines 88–94): `goj`,
-`rails`, `wasm-typescript`, `zidane` originally used devcontainer features
+`wasm-typescript` and others originally used devcontainer features
 (go, rust, node, common-utils/zsh, git); today those must be baked into images
 or `postCreateCommand`.
 
@@ -147,11 +147,9 @@ build on CI.
 
 ## Step 4 — example config + findings doc
 
-- `data/config.toml`: `rails` gains `common-utils` + `node` features
-  (drop the `[PROPOSED]` comment at lines 96–97); `wasm-typescript` gains the
+- `data/config.toml`: `wasm-typescript` gains the
   `go` feature (comment at line 135; goreleaser/tinygo stay in
-  `postCreateCommand` — no official feature exists); `zidane` gains
-  `common-utils`, `node`, `git` (comment at line 163). `goj` keeps its prebuilt
+  `postCreateCommand` — no official feature exists). `goj` keeps its prebuilt
   image (its comment carries no `[PROPOSED]`).
 - `docs/config-toml-findings.md`: #6 → DONE with an implementation summary +
   limitations; update the Status list (lines 9–13).

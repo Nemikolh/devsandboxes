@@ -18,9 +18,9 @@ Best-effort by design:
 - Remote CLI file access only works for paths inside workspaces (mounted into
   `tools` at identical paths). Anything else (`/tmp/foo.patch`) fails with a
   clear "path not shared with tools" error. Accepted limitation.
-- zidane is explicitly out of scope: its CLI must keep running *inside* the
-  sandbox, so its credential isolation needs a different mechanism (separate
-  plan).
+- In-sandbox coding agents are explicitly out of scope: their CLIs must keep
+  running *inside* the sandbox, so their credential isolation needs a different
+  mechanism (separate plan).
 
 Interim state (already live): `template.base` in the real config mounts shared
 auth rw into every sandbox (`${sharedVolumes}/gh` → `/root/.config/gh`,
