@@ -411,7 +411,42 @@ kind: 0 Hello(u32 version, u8 hash_len, hash utf-8, u32 caps)  1 Open(channel: u
 9. [x] Daemon self-heal (details below).
 10. [x] TUI bridge ownership off the UI thread (details below).
 11. [x] Build hygiene (details below).
-12. `release.yml` helper job (after confirmation).
+12. `release.yml` helper job (confirmed 2026-09-24; details below).
+13. ssh-agent for lifecycle commands (details below).
+
+### Step 12 — release.yml helper job
+
+- New `devsbd` job in `.github/workflows/release.yml` (after `version`):
+  matrix x86_64 on `ubuntu-latest`, aarch64 on `ubuntu-24.04-arm`;
+  `rustup target add <arch>-unknown-linux-musl`, `cargo build -p devsbd
+  --profile devsbd --target …` (linker is `rust-lld` via `.cargo/config.toml`,
+  so no musl-tools needed for devsbd), upload `target/<t>/devsbd/devsbd` as
+  artifact `devsbd-<arch>`.
+- `build` job `needs: [version, devsbd]`, downloads both into
+  `$RUNNER_TEMP/devsbd/<arch>/devsbd` and sets `DEVSANDBOX_DEVSBD_DIR` to it
+  plus `DEVSANDBOX_DEVSBD_REQUIRED=1` for `cargo build --release` (every
+  target, Windows included: env must survive the existing `RUSTFLAGS` env).
+- `cargo publish` in `release` stays helper-less (crates.io users get the
+  mount path); verify locally the packaged crate still builds
+  (`cargo package`), given `[workspace] members` lists the excluded `devsbd/`.
+- Verify locally what CI will run: both `cargo build -p devsbd --profile
+  devsbd --target …` and `cargo build --release --target
+  x86_64-unknown-linux-musl` with the env vars set. `ci.yml` is out of scope.
+
+### Step 13 — ssh-agent for lifecycle commands
+
+- `exec_lifecycle` (`src/commands/run.rs` ~l.1560) never injected
+  `SSH_AUTH_SOCK`, contrary to `docs/ssh-agent.md`. Callers: `materialize`
+  (shell-rc wiring + `onCreate…postAttach`, run.rs ~l.344/362, state already
+  saved with the new `Instance`) and `start_instance` (`postStartCommand`,
+  `src/commands/start.rs:59`).
+- Inject the same env `exec_argv` does (mount → always; relay → when the host
+  has an agent), sharing one helper so the rules can't drift.
+- Relay mode: hold one bridge (`devsbd::bridge::spawn`) for the whole
+  lifecycle chain of a `run`/`start`, dropped after; its handshake failure is
+  reported once after the chain (like `exec_status`). `start_instance` must
+  use the `devsbd_arch` that `ensure_recorded` just established (have it
+  return the arch), not the stale `info`.
 
 Decisions taken for 6–11 (user, 2026-09-24): **relay-first** (never mount when
 a helper is embedded), **last start wins** on takeover (hash differs → take
