@@ -100,8 +100,10 @@ fn decompress(zst: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Install path inside the container. `/run` is often tmpfs, hence the
-/// reinstall on every `start`.
+/// Install path inside the container. On docker `/run` is in the writable
+/// layer, so the binary survives a restart (the daemon doesn't — the bridge
+/// self-heals that); the reinstall on every `start` is for CLI upgrades and
+/// images that mount a tmpfs at `/run`.
 pub const BIN: &str = "/run/devsandbox/bin/devsbd";
 
 /// Write stdin to a temp file and rename, so a concurrent `devsbd version`

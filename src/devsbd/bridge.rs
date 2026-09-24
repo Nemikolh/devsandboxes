@@ -297,13 +297,20 @@ mod tests {
                 String::from_utf8_lossy(&out.stdout).trim().to_string()
             };
 
-            // No daemon: the handshake fails with the bridge's own reason.
-            let orphan = bridge().outcome(Duration::from_secs(10)).expect("handshake finished");
-            assert!(orphan.unwrap_err().contains("daemon not running"));
+            // No daemon yet: the bridge self-heals by starting one, so the
+            // handshake succeeds and the key lists — no `start_daemon` first.
+            let boot = bridge();
+            assert_eq!(boot.outcome(Duration::from_secs(10)), Some(Ok(())), "self-started daemon");
+            assert!(list().contains("devsbd-relay-test"), "via self-started daemon");
+            drop(boot);
+            // The daemon outlives the bridge that started it (own process
+            // group), so it's still routing once `boot` is gone.
 
+            // start_daemon on the running daemon is a no-op takeover (same
+            // build → pidfile lock held → the new process exits).
             start_daemon(&name);
-            // Optimistic start: the client connects before any bridge exists
-            // and is held until one attaches.
+            // Optimistic start: the client connects before any bridge is
+            // attached and is held until one attaches.
             let early = ssh_add();
             std::thread::sleep(Duration::from_millis(300));
             let long = bridge();
@@ -360,6 +367,15 @@ mod tests {
             start_daemon(&name);
             std::thread::sleep(Duration::from_millis(300));
             assert_eq!(pidfile(), before);
+
+            // Kill the daemon (as a container restart would) with no
+            // start_daemon: the next bridge revives it and the key lists.
+            drop(fresh);
+            let killed = "kill $(cut -d' ' -f1 /run/devsandbox/devsbd.pid)";
+            assert!(ok(Command::new("docker").args(["exec", &name, "sh", "-c", killed])));
+            let revived = bridge();
+            assert_eq!(revived.outcome(Duration::from_secs(10)), Some(Ok(())), "revived daemon");
+            assert!(list().contains("devsbd-relay-test"), "via revived daemon");
             Ok(())
         }));
         cleanup(&mut agent);

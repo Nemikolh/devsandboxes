@@ -4,6 +4,8 @@
 
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
+use std::process::{Command, Stdio};
 
 use crate::daemon::CTL;
 use crate::proto;
@@ -66,16 +68,48 @@ fn daemon_mismatch(vm: &proto::VersionMismatch) -> String {
 
 /// Connect to the daemon, retrying briefly: the host starts it with `exec -d`,
 /// which returns before the daemon is listening.
+///
+/// Self-heal: if the very first connect fails because nothing is listening
+/// (`NotFound` = socket gone, `ConnectionRefused` = stale socket, no daemon),
+/// start one ourselves and keep retrying. This covers containers restarted
+/// outside devsandbox (restart policy, `docker restart`, VM restart), where
+/// the binary survives but the daemon does not. Racing self-starts are safe:
+/// the daemon's pidfile flock (`daemon::take_over`) lets only one of this
+/// build win; the losers exit `Ok`.
 fn connect_ctl() -> io::Result<UnixStream> {
     let mut tries = 40; // 40 x 50ms = 2s
+    let mut spawned = false;
     loop {
         match UnixStream::connect(CTL) {
             Ok(s) => return Ok(s),
             Err(e) if tries == 0 => return Err(e),
-            Err(_) => {
+            Err(e) => {
+                if !spawned && matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused) {
+                    // At most once per bridge; on spawn failure fall through to
+                    // the normal retry/error path ("daemon not running").
+                    spawned = true;
+                    let _ = spawn_daemon();
+                }
                 tries -= 1;
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
         }
     }
+}
+
+/// Start a detached daemon: our own binary, `daemon` subcommand, its own
+/// process group so it outlives this bridge, all stdio null. stdout MUST be
+/// null — the bridge's own stdout is the frame stream to the host. Not waited:
+/// the daemon is our child until we exit, then reparented. A daemon that lost
+/// the pidfile race exits at once and stays a zombie until this bridge exits,
+/// which is harmless.
+fn spawn_daemon() -> io::Result<()> {
+    Command::new(std::env::current_exe()?)
+        .arg("daemon")
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    Ok(())
 }

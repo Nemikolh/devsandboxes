@@ -439,7 +439,8 @@ fn spawn_start(instance: &str) -> Receiver<OpDone> {
                     let services =
                         commands::stop::service_containers(&info.project, &info.instance_id);
                     commands::start::start_containers(&info.container, &services, true);
-                    // `/run` may be tmpfs: reinstall the helper (no-op when current).
+                    // Reinstall the helper (no-op when current): covers CLI
+                    // upgrades and images that mount a tmpfs at `/run`.
                     crate::devsbd::ensure_recorded(&instance, info, true);
                     format!("started {instance}")
                 }

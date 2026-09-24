@@ -145,9 +145,11 @@ The main crate must build for every release target (incl. macOS, Windows) while 
 - **When:** in `run` after create (next to lifecycle commands) and in
   `start_instance` (`src/commands/start.rs:42`, both the resolved and bare
   branches) after the container starts, plus the TUI's bare `s` start
-  (`spawn_start`, silently) — `/run` is often tmpfs, so the binary may not
-  survive a restart; reinstall is cheap and the hash check makes it a no-op
-  otherwise. `devsbd::ensure_recorded` persists a changed `devsbd_arch`,
+  (`spawn_start`, silently). On docker `/run` is in the container's writable
+  layer, so the binary survives a restart (only the daemon doesn't — the bridge
+  self-heals that); reinstall on start stays for CLI upgrades and images that
+  do mount a tmpfs at `/run`. Reinstall is cheap and the hash check makes it a
+  no-op otherwise. `devsbd::ensure_recorded` persists a changed `devsbd_arch`,
   reloading state before saving.
 
 - Failure never fails the command: a one-line `note:` on stderr (suppressed in
@@ -203,8 +205,16 @@ ssh (in container) ──unix──▶ devsbd daemon ◀──frames over exec s
 - **Bridge:** host runs `exec -i -u root <c> devsbd bridge`. The bridge
   connects to the control socket first (retrying for 2s: `exec -d` returns
   before the daemon listens) and exchanges `Hello` with the daemon, so a
-  missing or mismatched daemon shows up as a failed handshake; the host then
-  reports the bridge's stderr (e.g. `daemon not running`). Then it does
+  mismatched daemon shows up as a failed handshake; the host then reports the
+  bridge's stderr (e.g. `daemon not running`). **Self-heal:** if that first
+  connect finds nothing listening (`NotFound`/`ConnectionRefused`), the bridge
+  starts a daemon itself — its own binary, `daemon` subcommand, detached (own
+  process group, all stdio null; stdout *must* be null, it's the frame stream
+  to the host) — at most once, then keeps retrying for the 2s. This revives a
+  container restarted outside devsandbox (restart policy, `docker restart`, VM
+  restart): the binary survives in the writable layer but the daemon process
+  does not. Concurrent bridges self-starting is safe — the daemon's pidfile
+  flock (`take_over`) lets one of this build win and the losers exit. Then it does
   `Hello` with the host and copies bytes verbatim between stdio and the
   control socket; only the daemon parses frames — so `Ping`/`Pong` traverse
   the in-container bridge end to end with no keepalive logic there. The host
@@ -450,7 +460,7 @@ over; document it), agent socket stays **0666** (document the consequence).
 - Pure logic (timeout decision) unit-tested with injected clock/durations;
   intervals are consts.
 
-### Step 9 — daemon self-heal
+### Step 9 — daemon self-heal [x]
 
 - `devsbd bridge`: when the first control-socket connect fails with
   `NotFound`/`ConnectionRefused`, spawn `current_exe() daemon` detached
