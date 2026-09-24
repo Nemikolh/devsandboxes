@@ -339,6 +339,19 @@ pub(crate) fn materialize(
         write_vscode_name_config(&container, extensions, props.remote_user.as_deref())?;
     }
 
+    // ssh-agent for the lifecycle chain. The instance was just saved, so read
+    // the agent rule off it (mount → always; relay → only with a host agent).
+    // In relay mode one bridge (RAII-dropped before this fn returns, `?` paths
+    // included) spans shell-rc wiring + all five commands so each exec reaches
+    // the host agent; its handshake failure is reported once, after the chain.
+    let inst = state.instances.get(instance).expect("instance just inserted");
+    let host_agent = crate::commands::exec::has_host_agent();
+    let ssh_auth_sock = crate::commands::exec::ssh_auth_sock_env(inst, host_agent);
+    #[cfg(unix)]
+    let bridge = (crate::devsbd::relay_mode(inst) && host_agent)
+        .then(|| crate::devsbd::bridge::spawn(inst))
+        .flatten();
+
     if !shell_rc.is_empty() || persist_history {
         let paths: Vec<&str> = shell_rc.iter().map(|(_, path)| path.as_str()).collect();
         exec_lifecycle(
@@ -346,6 +359,7 @@ pub(crate) fn materialize(
             &workspace,
             props.remote_env.as_ref(),
             props.remote_user.as_deref(),
+            ssh_auth_sock,
             &shell_rc_wiring(&paths, persist_history),
         )
         .with_context(|| format!("shell-rc wiring failed (container `{container}` kept)"))?;
@@ -364,10 +378,18 @@ pub(crate) fn materialize(
                 &workspace,
                 props.remote_env.as_ref(),
                 props.remote_user.as_deref(),
+                ssh_auth_sock,
                 cmd,
             )
             .with_context(|| format!("{name} failed (container `{container}` kept)"))?;
         }
+    }
+
+    // Chain succeeded: surface a relay handshake failure once (as `exec_status`
+    // does). On the error paths above the error is what matters, not this note.
+    #[cfg(unix)]
+    if let Some(Err(e)) = bridge.as_ref().and_then(|b| b.outcome(std::time::Duration::ZERO)) {
+        eprintln!("note: ssh-agent relay unavailable in `{container}`: {e}");
     }
 
     Ok(())
@@ -1562,27 +1584,48 @@ pub(crate) fn exec_lifecycle(
     workspace: &str,
     remote_env: Option<&BTreeMap<String, String>>,
     remote_user: Option<&str>,
+    ssh_auth_sock: Option<&str>,
     cmd: &LifecycleCommand,
 ) -> Result<()> {
     for argv in cmd.commands() {
         if argv.is_empty() {
             continue;
         }
-        let mut args: Vec<String> = vec!["exec".into(), "-w".into(), workspace.into()];
-        if let Some(user) = remote_user {
-            args.push("-u".into());
-            args.push(user.to_string());
-        }
-        for (key, value) in remote_env.into_iter().flatten() {
-            args.push("-e".into());
-            args.push(format!("{key}={value}"));
-        }
-        args.push(container.into());
-        args.extend(argv);
+        let args = lifecycle_argv(container, workspace, remote_env, remote_user, ssh_auth_sock, argv);
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         backend().run_checked(&arg_refs)?;
     }
     Ok(())
+}
+
+/// Pure argv builder for one lifecycle exec, mirroring [`exec_argv_with`]'s
+/// flag order (`-w`, `-u`, remote_env, `SSH_AUTH_SOCK`, container, command) so
+/// lifecycle execs carry the same agent env the CLI/TUI do. `ssh_auth_sock` is
+/// the shared rule's result (`commands::exec::ssh_auth_sock_env`).
+fn lifecycle_argv(
+    container: &str,
+    workspace: &str,
+    remote_env: Option<&BTreeMap<String, String>>,
+    remote_user: Option<&str>,
+    ssh_auth_sock: Option<&str>,
+    argv: Vec<String>,
+) -> Vec<String> {
+    let mut args: Vec<String> = vec!["exec".into(), "-w".into(), workspace.into()];
+    if let Some(user) = remote_user {
+        args.push("-u".into());
+        args.push(user.to_string());
+    }
+    for (key, value) in remote_env.into_iter().flatten() {
+        args.push("-e".into());
+        args.push(format!("{key}={value}"));
+    }
+    if let Some(sock) = ssh_auth_sock {
+        args.push("-e".into());
+        args.push(format!("SSH_AUTH_SOCK={sock}"));
+    }
+    args.push(container.into());
+    args.extend(argv);
+    args
 }
 
 /// Register `customizations.vscode.extensions` and `remoteUser` with the
@@ -1898,6 +1941,59 @@ mod tests {
         ));
         assert!(script.contains("grep -qsF '/devsandbox/rc/1/b.sh'"));
         assert!(!script.contains("HISTFILE"));
+    }
+
+    #[test]
+    fn lifecycle_argv_flag_order_and_env() {
+        let mut env = BTreeMap::new();
+        env.insert("FOO".to_string(), "bar".to_string());
+        env.insert("BAZ".to_string(), "qux".to_string());
+        let argv = lifecycle_argv(
+            "devsandbox-repo-abc1",
+            "/workspaces/repository-1",
+            Some(&env),
+            Some("vscode"),
+            Some("/run/devsandbox/ssh-agent.sock"),
+            vec!["sh".into(), "-c".into(), "echo hi".into()],
+        );
+        assert_eq!(
+            argv,
+            vec![
+                "exec",
+                "-w",
+                "/workspaces/repository-1",
+                "-u",
+                "vscode",
+                // BTreeMap iterates sorted: BAZ before FOO,
+                "-e",
+                "BAZ=qux",
+                "-e",
+                "FOO=bar",
+                // then SSH_AUTH_SOCK, before the container name.
+                "-e",
+                "SSH_AUTH_SOCK=/run/devsandbox/ssh-agent.sock",
+                "devsandbox-repo-abc1",
+                "sh",
+                "-c",
+                "echo hi",
+            ]
+        );
+    }
+
+    #[test]
+    fn lifecycle_argv_omits_sock_when_none() {
+        let argv = lifecycle_argv(
+            "devsandbox-repo-abc1",
+            "/workspaces/repository-1",
+            None,
+            None,
+            None,
+            vec!["true".into()],
+        );
+        assert_eq!(
+            argv,
+            vec!["exec", "-w", "/workspaces/repository-1", "devsandbox-repo-abc1", "true"]
+        );
     }
 
     fn feature_mount(kind: &str, source: Option<&str>, target: &str) -> ResolvedMount {

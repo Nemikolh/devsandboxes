@@ -86,12 +86,31 @@ pub fn exec_argv(
 /// Whether the host currently has a usable ssh-agent, for relay-mode
 /// `SSH_AUTH_SOCK` injection. Unix-only (the relay is); `false` elsewhere.
 #[cfg(unix)]
-fn has_host_agent() -> bool {
+pub(crate) fn has_host_agent() -> bool {
     crate::devsbd::bridge::has_host_agent()
 }
 #[cfg(not(unix))]
-fn has_host_agent() -> bool {
+pub(crate) fn has_host_agent() -> bool {
     false
+}
+
+/// The container-side `SSH_AUTH_SOCK` value to inject on an exec into
+/// `instance`, or `None` when no agent forwarding applies. The single source
+/// of truth shared by the CLI/TUI builder ([`exec_argv_with`]) and lifecycle
+/// execs (`run::exec_lifecycle`), so the two can't drift. Mount mode carries
+/// the target on `ssh_auth_sock` and always injects (the bind decision was
+/// made at `run`); relay mode uses the fixed target but only when a host agent
+/// is actually present, so an agent-less exec doesn't point ssh at a dead
+/// socket. `host_agent` is the probe result ([`has_host_agent`]), passed in so
+/// the rule stays a pure function tests can drive without env mutation.
+pub(crate) fn ssh_auth_sock_env(instance: &Instance, host_agent: bool) -> Option<&str> {
+    match &instance.ssh_auth_sock {
+        Some(sock) => Some(sock.as_str()),
+        None if crate::devsbd::relay_mode(instance) && host_agent => {
+            Some(crate::commands::run::SSH_AGENT_TARGET)
+        }
+        None => None,
+    }
 }
 
 /// Pure argv builder. `host_agent` says the host has a live agent (relay mode
@@ -120,17 +139,8 @@ fn exec_argv_with(
         args.push(format!("{key}={value}"));
     }
     // agent forwarding: the activating env var rides every exec, same as
-    // remote_env. Mount mode carries the target on `ssh_auth_sock`; relay mode
-    // (helper installed, no mount) uses the fixed target, but only when a host
-    // agent is actually present (docs/sandbox-helper.md).
-    let sock = match &instance.ssh_auth_sock {
-        Some(sock) => Some(sock.as_str()),
-        None if crate::devsbd::relay_mode(instance) && host_agent => {
-            Some(crate::commands::run::SSH_AGENT_TARGET)
-        }
-        None => None,
-    };
-    if let Some(sock) = sock {
+    // remote_env, via the shared rule (docs/sandbox-helper.md).
+    if let Some(sock) = ssh_auth_sock_env(instance, host_agent) {
         args.push("-e".into());
         args.push(format!("SSH_AUTH_SOCK={sock}"));
     }
@@ -258,5 +268,37 @@ mod tests {
             exec_argv_with(&inst, false, false, &["ls".into()], false),
             vec!["exec", "-w", "/workspaces/repository-1", "devsandbox-repo-abc1", "ls"]
         );
+    }
+
+    /// The shared rule the CLI/TUI builder and lifecycle execs both consult.
+    #[test]
+    fn ssh_auth_sock_env_rule() {
+        // Mount mode: the recorded target, regardless of the host-agent flag.
+        let mut mount = instance();
+        mount.ssh_auth_sock = Some("/run/devsandbox/ssh-agent.sock".into());
+        assert_eq!(ssh_auth_sock_env(&mount, false), Some("/run/devsandbox/ssh-agent.sock"));
+        assert_eq!(ssh_auth_sock_env(&mount, true), Some("/run/devsandbox/ssh-agent.sock"));
+
+        // Relay mode (`devsbd_arch` set, no mount): the fixed target only when a
+        // host agent is present. Unix-only — `relay_mode` is `false` off unix.
+        let mut relay = instance();
+        relay.devsbd_arch = Some(crate::devsbd::Arch::X86_64);
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                ssh_auth_sock_env(&relay, true),
+                Some(crate::commands::run::SSH_AGENT_TARGET)
+            );
+            assert_eq!(ssh_auth_sock_env(&relay, false), None);
+        }
+        #[cfg(not(unix))]
+        {
+            assert_eq!(ssh_auth_sock_env(&relay, true), None);
+        }
+
+        // Neither mount nor relay: never injected.
+        let bare = instance();
+        assert_eq!(ssh_auth_sock_env(&bare, true), None);
+        assert_eq!(ssh_auth_sock_env(&bare, false), None);
     }
 }

@@ -417,7 +417,7 @@ kind: 0 Hello(u32 version, u8 hash_len, hash utf-8, u32 caps)  1 Open(channel: u
 10. [x] TUI bridge ownership off the UI thread (details below).
 11. [x] Build hygiene (details below).
 12. [x] `release.yml` helper job (confirmed 2026-09-24; details below).
-13. ssh-agent for lifecycle commands (details below).
+13. [x] ssh-agent for lifecycle commands (details below).
 
 ### Step 12 — release.yml helper job [x]
 
@@ -452,6 +452,17 @@ kind: 0 Hello(u32 version, u8 hash_len, hash utf-8, u32 caps)  1 Open(channel: u
   reported once after the chain (like `exec_status`). `start_instance` must
   use the `devsbd_arch` that `ensure_recorded` just established (have it
   return the arch), not the stale `info`.
+
+Done. The mount-vs-relay `SSH_AUTH_SOCK` rule is factored into one shared
+`exec::ssh_auth_sock_env(instance, host_agent)` (with `exec::has_host_agent()`
+the probe), consulted by both `exec_argv_with` and `exec_lifecycle` (which now
+takes an `ssh_auth_sock: Option<&str>` and builds argv via the pure
+`run::lifecycle_argv`). `materialize` reads the rule off the just-saved
+instance (`state.instances[instance]`) and holds one RAII-dropped bridge across
+shell-rc wiring + all five commands; `start_instance` clones `info` with the
+arch `ensure_recorded` now returns and bridges the `postStartCommand`. Both
+report the handshake note once, after a successful chain. `Instance` gained
+`Clone`. `SSH_AUTH_SOCK` stays out of `config_hash` (per-exec, unchanged).
 
 Decisions taken for 6–11 (user, 2026-09-24): **relay-first** (never mount when
 a helper is embedded), **last start wins** on takeover (hash differs → take

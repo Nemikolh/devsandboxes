@@ -37,7 +37,10 @@ This mirrors the existing `remote_env` handling: `exec_argv:75-78` already appen
 `docker exec` inherits container-config env (image `ENV` + `run -e`) by default; each caller then adds its own `-e`. Because we inject via `exec -e` and **not** `run -e`:
 
 - ✅ devsandbox's TUI integrated terminal — we build its argv via `exec_argv`.
-- ✅ CLI `devsandbox exec …` and lifecycle execs — same builder.
+- ✅ CLI `devsandbox exec …` and lifecycle execs (`onCreate…postAttach`,
+  `postStart`, shell-rc wiring) — the CLI/TUI argv builder and the lifecycle
+  argv builder consult one shared rule (`exec::ssh_auth_sock_env`), so they
+  inject the same `SSH_AUTH_SOCK` and can't drift.
 - ➖ **VS Code's integrated terminal** — not ours to serve, and it doesn't need us: VS Code already forwards the agent itself, at the application layer, with no docker involvement (see below).
 
 This feature and VS Code's forwarding are **orthogonal**: two independent relays, each serving only the terminals it spawns. There is no conflict and no trade — VS Code covers its own terminals, devsandbox covers the TUI + CLI terminals VS Code never touches.

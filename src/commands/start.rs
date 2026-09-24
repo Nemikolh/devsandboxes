@@ -47,7 +47,10 @@ fn start_instance(dir: &Path, key: &str, info: &Instance) -> Result<()> {
         Some((config, sandbox)) => {
             run::warn_on_drift(dir, &info.container, &sandbox)?;
             backend().run_checked(&["start", &info.container])?;
-            crate::devsbd::ensure_recorded(key, info, false);
+            // `ensure_recorded` may install a different-arch helper than the
+            // pre-start `info` snapshot recorded; use the arch it establishes
+            // for the relay decision below, not the possibly-stale `info`.
+            let arch = crate::devsbd::ensure_recorded(key, info, false);
             // Services may have been recreated with new addresses (or gc'd)
             // since the instance last ran; bring them up and refresh resolution.
             let project = services::project_id(dir)?;
@@ -56,14 +59,32 @@ fn start_instance(dir: &Path, key: &str, info: &Instance) -> Result<()> {
                 services::ensure_services(&config, dir, &project, &info.instance_id, &service_names)?;
             backend().wire_service_dns(&info.container, &endpoints)?;
             if let Some(cmd) = &sandbox.properties.post_start_command {
+                // Same ssh-agent path as `run`'s lifecycle chain: read the rule
+                // off an instance carrying the just-established arch, hold one
+                // bridge (relay mode) for the command, report its failure after.
+                let mut fresh = info.clone();
+                fresh.devsbd_arch = arch;
+                let host_agent = crate::commands::exec::has_host_agent();
+                let ssh_auth_sock = crate::commands::exec::ssh_auth_sock_env(&fresh, host_agent);
+                #[cfg(unix)]
+                let bridge = (crate::devsbd::relay_mode(&fresh) && host_agent)
+                    .then(|| crate::devsbd::bridge::spawn(&fresh))
+                    .flatten();
                 run::exec_lifecycle(
                     &info.container,
                     &info.workspace,
                     Some(&info.remote_env),
                     info.remote_user.as_deref(),
+                    ssh_auth_sock,
                     cmd,
                 )
                 .context("postStartCommand failed")?;
+                #[cfg(unix)]
+                if let Some(Err(e)) =
+                    bridge.as_ref().and_then(|b| b.outcome(std::time::Duration::ZERO))
+                {
+                    eprintln!("note: ssh-agent relay unavailable in `{}`: {e}", info.container);
+                }
             }
         }
         None => {

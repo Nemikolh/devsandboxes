@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 /// A running (or previously started) sandbox instance.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Instance {
     /// Sandbox config name from config.toml.
     pub sandbox: String,
