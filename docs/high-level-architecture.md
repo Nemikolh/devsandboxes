@@ -99,7 +99,11 @@ VS Code attach (`o` in the dashboard) uses the Remote-Containers extension. On A
 
 ### ssh-agent forwarding
 
-The host `$SSH_AUTH_SOCK` is bind-mounted through a per-instance symlink, and `SSH_AUTH_SOCK` is injected on every exec. That only works on runtimes with file binds and on unix hosts. On native Windows it's compiled out; run devsandbox inside WSL2 instead. Full status and the deferred relay design are in `docs/ssh-agent.md`.
+Relay-first. When the build embeds the `devsbd` helper (npm package, local builds after `scripts/build-devsbd.sh`), nothing is mounted: the in-container `devsbd` daemon listens on `/run/devsandbox/ssh-agent.sock`, and the host runs `exec -i <c> devsbd bridge` to carry each agent connection over exec stdio to the host `$SSH_AUTH_SOCK` (re-read per connection, so agent rotation needs no restart). The bridge lives for a CLI `exec`, for lifecycle hooks during `run`/`start`, and per running instance while the TUI is open. Needing only `exec`, it works on every runtime, including Apple `container`.
+
+Builds without the helper (`cargo install`) fall back to bind-mounting the host `$SSH_AUTH_SOCK` through a per-instance symlink, which needs file binds (docker/podman). An instance keeps the mode it was created with until it's recreated (`devsbd::relay_mode`).
+
+Either way, `SSH_AUTH_SOCK` is injected per exec, never baked into the container (`exec::ssh_auth_sock_env`); relay mode injects it only when the host has a live agent. On native Windows forwarding is compiled out; run devsandbox inside WSL2 instead. Details: `docs/sandbox-helper.md` (relay), `docs/ssh-agent.md` (mount path, Windows).
 
 ## The dashboard
 
@@ -140,7 +144,7 @@ Everything except `inspect` is wrapped as `{ "schema": 1, "data": … }`, and `s
   remote env/user, and ssh-agent target. It's global across config roots
   (`src/state.rs`).
 
-- **ssh-agent links:** `<data-dir>/devsandbox/agent/<instance>.sock`.
+- **ssh-agent links** (bind-mount fallback only): `<data-dir>/devsandbox/agent/<instance>.sock`.
 
 - **Per-config-root data** (caches, shell history, `${sharedVolumes}`): `<config dir>/shared-volumes/`.
 

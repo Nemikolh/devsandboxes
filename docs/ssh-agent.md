@@ -10,7 +10,9 @@ Rollout is staged by runtime, easiest first:
 
 2. **macOS + docker** (OrbStack / Docker Desktop) — same shape, different mount source (a synthesized "magic" socket). See _macOS + docker_.
 
-3. **macOS + Apple `container`** — blocked today; see _Future: Apple container_.
+3. **macOS + Apple `container`** — covered by the `devsbd` relay, untested on a Mac; see _Future: Apple container_.
+
+**Current state:** the bind mount described here is now the *fallback*. Builds that embed the `devsbd` helper (the npm package) use the exec-stdio relay instead (`docs/sandbox-helper.md`); only helper-less builds (`cargo install`) and instances created by one take the mount path below.
 
 4. **Windows (native)** — disabled; use WSL2. See _Windows (native)_.
 

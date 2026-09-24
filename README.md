@@ -11,11 +11,45 @@ Built for running multiple coding-agent sandboxes against the same repositories:
 
 How it works (config reference, state, runtimes, layout): [`docs/high-level-architecture.md`](docs/high-level-architecture.md).
 
-## Quick start
+## Installation
 
-```bash
-cargo install devsandbox
+The binary name is `devsandbox`.
+
+If you're on **Node**, install from npm:
+
 ```
+$ npm i -g devsandboxes
+$ npx devsandboxes --help
+```
+
+Grab a precompiled binary from the [latest release](https://github.com/Nemikolh/devsandboxes/releases) and put it on your `PATH`.
+
+**Linux** (x86_64 / aarch64, static):
+
+```
+$ curl -L https://github.com/Nemikolh/devsandboxes/releases/download/v0.3.3/devsandbox-0.3.3-$(uname -m)-unknown-linux-musl.tar.gz | tar xz
+```
+
+**macOS** (Apple silicon):
+
+```
+$ curl -L https://github.com/Nemikolh/devsandboxes/releases/download/v0.3.3/devsandbox-0.3.3-aarch64-apple-darwin.tar.gz | tar xz
+```
+
+**Windows** (x86_64, PowerShell):
+
+```
+> Invoke-WebRequest https://github.com/Nemikolh/devsandboxes/releases/download/v0.3.3/devsandbox-0.3.3-x86_64-pc-windows-msvc.zip -OutFile devsandbox.zip
+> Expand-Archive devsandbox.zip .
+```
+
+If you're a **Rust** user, you can install from crates.io. That build lacks the in-container helper, which limits ssh-agent forwarding (see [Platform support](#platform-support)):
+
+```
+$ cargo install devsandbox
+```
+
+## Quick start
 
 Create a `config.toml` (or just run `devsandbox run` — on a TTY it offers to generate an example):
 
@@ -68,9 +102,9 @@ devsandbox                  # no args on a TTY: interactive dashboard
 | Instances, worktrees, services, caches | ✅         | ✅                                        | ✅                        | ⚠️ untested      |
 | File bind mounts (`shell-rc`, feature mounts) | ✅  | ✅                                        | ❌ dirs only              | ⚠️ untested      |
 | VS Code attach              | ✅                    | ✅                                        | ⚠️ experimental flag      | ⚠️ untested      |
-| ssh-agent forwarding        | ✅                    | ⚠️ relay only, untested on Mac            | ⚠️ relay only, untested on Mac | ❌ use WSL2 |
+| ssh-agent forwarding        | ✅                    | ✅ (relay only)                           | ⚠️ relay only, untested on Mac | ❌ use WSL2 |
 | TUI dashboard + terminal    | ✅                    | ✅                                        | ✅                        | ⚠️ untested      |
 
 Windows builds ship from the release workflow, but only the Linux build (e.g. inside WSL2) is exercised. Details: [`docs/runtimes.md`](docs/runtimes.md), [`docs/ssh-agent.md`](docs/ssh-agent.md).
 
-ssh-agent forwarding uses an embedded in-container helper (`devsbd`) that relays the agent over `exec` stdio, so it needs no socket bind mount and works on every runtime, including Apple `container`. Release binaries embed it; **`cargo install` builds don't** (local builds do after `scripts/build-devsbd.sh`) and fall back to the bind mount (docker/podman on Linux only). See [`docs/sandbox-helper.md`](docs/sandbox-helper.md).
+ssh-agent forwarding uses an embedded in-container helper (`devsbd`) that relays the agent over `exec` stdio, so it needs no socket bind mount and works on every runtime, including Apple `container`. Release archives and the npm package embed it; **`cargo install` builds don't** (local builds do after `scripts/build-devsbd.sh`) and fall back to the bind mount (docker/podman on Linux only). See [`docs/sandbox-helper.md`](docs/sandbox-helper.md).
