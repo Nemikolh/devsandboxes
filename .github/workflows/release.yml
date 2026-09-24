@@ -23,8 +23,31 @@ jobs:
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
-  build:
+  devsbd:
     needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            os: ubuntu-latest
+          - arch: aarch64
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      # rust-lld (via .cargo/config.toml) cross-links musl from any host, so no
+      # musl-tools needed for the helper.
+      - run: rustup target add ${{ matrix.arch }}-unknown-linux-musl
+      - run: cargo build -p devsbd --profile devsbd --target ${{ matrix.arch }}-unknown-linux-musl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: devsbd-${{ matrix.arch }}
+          path: target/${{ matrix.arch }}-unknown-linux-musl/devsbd/devsbd
+          if-no-files-found: error
+
+  build:
+    needs: [version, devsbd]
     strategy:
       fail-fast: false
       matrix:
@@ -43,10 +66,23 @@ jobs:
       - run: rustup target add ${{ matrix.target }}
       - if: contains(matrix.target, 'musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
+      # Both helpers get embedded into every release binary (build.rs reads
+      # $DEVSANDBOX_DEVSBD_DIR/<arch>/devsbd); DEVSANDBOX_DEVSBD_REQUIRED=1 makes
+      # a missing helper a build error so a release never ships without it.
+      - uses: actions/download-artifact@v4
+        with:
+          name: devsbd-x86_64
+          path: ${{ runner.temp }}/devsbd/x86_64
+      - uses: actions/download-artifact@v4
+        with:
+          name: devsbd-aarch64
+          path: ${{ runner.temp }}/devsbd/aarch64
       - run: cargo build --release --target ${{ matrix.target }}
         env:
           # Static CRT on Windows so the binary doesn't need the VC++ redistributable
           RUSTFLAGS: ${{ contains(matrix.target, 'windows') && '-C target-feature=+crt-static' || '' }}
+          DEVSANDBOX_DEVSBD_DIR: ${{ runner.temp }}/devsbd
+          DEVSANDBOX_DEVSBD_REQUIRED: "1"
       - name: Package
         shell: bash
         run: |
@@ -73,6 +109,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: dist
+          pattern: devsandbox-*
           merge-multiple: true
       - uses: softprops/action-gh-release@v2
         with:

@@ -104,10 +104,15 @@ The main crate must build for every release target (incl. macOS, Windows) while 
   of the patched bytes.
 
 - `release.yml`: new `devsbd` job matrix (x86_64 on `ubuntu-latest`, aarch64 on
-  `ubuntu-24.04-arm`, both with `musl-tools`) runs
-  `cargo build -p devsbd --profile devsbd --target …`, uploads
-  artifacts; the `build` job downloads both into a dir and sets
-  `DEVSANDBOX_DEVSBD_DIR`, overriding the local default below.
+  `ubuntu-24.04-arm`) runs `cargo build -p devsbd --profile devsbd --target
+  <arch>-unknown-linux-musl` (rust-lld cross-links musl, so no `musl-tools`) and
+  uploads each `target/<t>/devsbd/devsbd` as artifact `devsbd-<arch>`; the
+  `build` job (`needs: [version, devsbd]`) downloads both into
+  `${{ runner.temp }}/devsbd/<arch>/` and sets `DEVSANDBOX_DEVSBD_DIR` +
+  `DEVSANDBOX_DEVSBD_REQUIRED=1` on the release `cargo build` step (a real env
+  var overrides the un-`force`d local default below). The `release` job's
+  `download-artifact` uses `pattern: devsandbox-*` so the helper artifacts
+  aren't published as release assets.
 
 - **Local default:** `.cargo/config.toml` sets
   `[env] DEVSANDBOX_DEVSBD_DIR = { value = "target/devsbd", relative = true }`, and
@@ -411,10 +416,10 @@ kind: 0 Hello(u32 version, u8 hash_len, hash utf-8, u32 caps)  1 Open(channel: u
 9. [x] Daemon self-heal (details below).
 10. [x] TUI bridge ownership off the UI thread (details below).
 11. [x] Build hygiene (details below).
-12. `release.yml` helper job (confirmed 2026-09-24; details below).
+12. [x] `release.yml` helper job (confirmed 2026-09-24; details below).
 13. ssh-agent for lifecycle commands (details below).
 
-### Step 12 — release.yml helper job
+### Step 12 — release.yml helper job [x]
 
 - New `devsbd` job in `.github/workflows/release.yml` (after `version`):
   matrix x86_64 on `ubuntu-latest`, aarch64 on `ubuntu-24.04-arm`;
