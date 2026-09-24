@@ -331,4 +331,41 @@ mod tests {
         assert_eq!(Arch::host().other().other(), Arch::host());
         assert_ne!(Arch::host().other(), Arch::host());
     }
+
+    /// Runs the embedded host-arch helper directly and checks `version` reports
+    /// `devsbd <proto::VERSION> <hash(host)>`. Catches a stale `target/devsbd`
+    /// after a protocol change (the blob's built-in `VERSION` wouldn't match
+    /// this crate's). Skipped when no helper is embedded (`cargo install`).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn embedded_host_helper_reports_version() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let Some(want_hash) = hash(Arch::host()) else {
+            eprintln!("skipping embedded_host_helper_reports_version: no helper embedded");
+            return;
+        };
+        let bytes = blob(Arch::host()).expect("blob present when hash is");
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("devsandbox-devsbd-test-{stamp}"));
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&bytes).unwrap();
+        f.flush().unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        drop(f);
+
+        let out = Command::new(&path).arg("version").output().unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            format!("devsbd {} {want_hash}", proto::VERSION),
+            "stale target/devsbd? rerun scripts/build-devsbd.sh",
+        );
+    }
 }

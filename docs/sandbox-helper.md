@@ -73,6 +73,19 @@ The main crate must build for every release target (incl. macOS, Windows) while 
   "helper unavailable": SSH forwarding falls back to the existing bind-mount path (`docs/ssh-agent.md`) and a
   one-line note is logged. `cargo install` users therefore get today's behavior, not a broken one — call that out in the README.
 
+- **`DEVSANDBOX_DEVSBD_REQUIRED=1` → missing helper is a build error.** The release build
+  (`release.yml`, step 12) sets it so a broken artifact upload can't silently ship empty blobs; the
+  panic names the missing `<arch>/devsbd` path and points at `scripts/build-devsbd.sh`. Unset (the
+  default) keeps the empty-blob fallback.
+
+- **No-change builds are a no-op.** A `rerun-if-changed` on a *missing* path is always stale, so
+  before the fix cargo reran `build.rs` and recompiled the crate on every build once the helper was
+  absent. When the helper file exists `build.rs` tracks it directly; when it's missing it creates the
+  empty `<dir>/<arch>/` and tracks that directory, which cargo rescans and so sees the helper appear
+  (not an ancestor like `target/`: cargo scans directories recursively and every build modifies
+  `target/`). `OUT_DIR` files are rewritten only when their bytes
+  change, so a settled tree — helper present or absent — rebuilds without recompiling `devsandbox`.
+
 - Compression: `zstd` crate as a **build-dependency** (level 19, C is fine at build time); decompression at
   runtime with `ruzstd` (pure Rust, no C on the Windows/macOS host builds). Confirm neither is in the tree
   yet — both are new deps.
@@ -397,7 +410,7 @@ kind: 0 Hello(u32 version, u8 hash_len, hash utf-8, u32 caps)  1 Open(channel: u
 8. [x] Keepalive + timeouts (details below).
 9. [x] Daemon self-heal (details below).
 10. [x] TUI bridge ownership off the UI thread (details below).
-11. Build hygiene (details below).
+11. [x] Build hygiene (details below).
 12. `release.yml` helper job (after confirmation).
 
 Decisions taken for 6–11 (user, 2026-09-24): **relay-first** (never mount when
@@ -496,7 +509,7 @@ over; document it), agent socket stays **0666** (document the consequence).
   change: "until the container leaves the running set" would never retry after
   a `start` on a running container, which is what fixes it).
 
-### Step 11 — build hygiene
+### Step 11 — build hygiene [x]
 
 - `build.rs`: `DEVSANDBOX_DEVSBD_REQUIRED=1` turns a missing/empty helper
   into a build error (for CI, step 12).
