@@ -18,9 +18,21 @@ use super::proto::{self, Frame};
 /// Read chunk for local stream -> `Data` frames; far below `MAX_PAYLOAD`.
 const CHUNK: usize = 16 * 1024;
 
+/// Cap on concurrently live streams per bridge. An `Open` past this is refused
+/// (`Close`); ssh-agent volumes never approach it, so it's purely a bound on a
+/// misbehaving or hostile peer.
+const MAX_STREAMS: usize = 64;
+
+/// Stream-id spaces: the daemon allocates ids with the high bit clear
+/// (1..2^31), the host with it set (none yet). The host refuses a peer `Open`
+/// whose id has this bit set (docs/sandbox-helper.md, _Frame protocol_).
+const HOST_ID_BIT: u32 = 1 << 31;
+
 pub struct Mux {
     out: Mutex<Box<dyn Write + Send>>,
-    streams: Mutex<HashMap<u32, UnixStream>>,
+    // `Arc` so the `Data` arm can clone a handle and write after dropping the
+    // `streams` guard, instead of holding the lock across a blocking write.
+    streams: Mutex<HashMap<u32, Arc<UnixStream>>>,
 }
 
 impl Mux {
@@ -38,7 +50,7 @@ impl Mux {
     /// any data can flow.
     pub fn attach(self: &Arc<Self>, stream: u32, conn: UnixStream, open: Option<u8>) -> io::Result<()> {
         let reader = conn.try_clone()?;
-        self.streams.lock().unwrap().insert(stream, conn);
+        self.streams.lock().unwrap().insert(stream, Arc::new(conn));
         if let Some(channel) = open {
             if let Err(e) = self.send(&Frame::Open { stream, channel }) {
                 self.streams.lock().unwrap().remove(&stream);
@@ -91,8 +103,12 @@ impl Mux {
         while let Ok(Some(frame)) = proto::read_frame(&mut reader) {
             match frame {
                 Frame::Data { stream, bytes } => {
-                    let failed = match self.streams.lock().unwrap().get(&stream) {
-                        Some(mut conn) => conn.write_all(&bytes).is_err(),
+                    // Clone the handle and drop the guard before the blocking
+                    // write, so a slow local socket can't stall other streams'
+                    // routing (`&UnixStream: Write`).
+                    let conn = self.streams.lock().unwrap().get(&stream).cloned();
+                    let failed = match conn {
+                        Some(conn) => (&*conn).write_all(&bytes).is_err(),
                         // Raced a local close; its `Close` is already on the way.
                         None => false,
                     };
@@ -107,9 +123,25 @@ impl Mux {
                     let _ = self.send(&Frame::Pong(payload));
                 }
                 Frame::Open { stream, channel } => {
-                    let attached = match on_open(stream, channel) {
-                        Some(conn) => self.attach(stream, conn, None).is_ok(),
-                        None => false,
+                    // Host-side policy for peer-allocated stream ids. The
+                    // high bit is reserved for host-allocated ids (none yet),
+                    // so a peer `Open` must have it clear; refuse a duplicate
+                    // id or one past the stream cap. Sending `Close` for a
+                    // duplicate makes a misbehaving peer drop its *existing*
+                    // stream with that id — acceptable, since only a broken or
+                    // hostile peer reuses a live id. The daemon side passes
+                    // `on_open = |_,_| None` and never reaches the accept path.
+                    let attached = {
+                        let live = self.streams.lock().unwrap();
+                        let allowed = stream & HOST_ID_BIT == 0
+                            && !live.contains_key(&stream)
+                            && live.len() < MAX_STREAMS;
+                        drop(live);
+                        allowed
+                            && match on_open(stream, channel) {
+                                Some(conn) => self.attach(stream, conn, None).is_ok(),
+                                None => false,
+                            }
                     };
                     if !attached {
                         let _ = self.send(&Frame::Close { stream });
@@ -228,5 +260,66 @@ mod tests {
         daemon.serve(d_r, |_, _| None);
         let mut buf = String::new();
         assert_eq!(c.read_line(&mut buf).unwrap(), 0);
+    }
+
+    /// A `Write` that appends to a shared buffer, so a test can read back the
+    /// frames a `Mux` emitted on its `out` side.
+    #[derive(Clone)]
+    struct Sink(Arc<Mutex<Vec<u8>>>);
+    impl Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Drive a host-side `Mux::serve` with `opens`, always granting a live
+    /// socket, and return the stream ids it refused with `Close`.
+    fn refused_opens(opens: &[u32]) -> Vec<u32> {
+        let mut wire = Vec::new();
+        for &stream in opens {
+            proto::write_frame(&mut wire, &Frame::Open { stream, channel: channel::SSH_AGENT }).unwrap();
+        }
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let mux = Mux::new(Sink(Arc::clone(&out)));
+        // Grant every Open a fresh socket; the policy inside `serve` decides.
+        // Retain each peer end so an accepted stream's pump never sees EOF and
+        // emits its own `Close` — only the policy's refusals reach `out`.
+        let peers = Mutex::new(Vec::new());
+        mux.serve(io::Cursor::new(wire), |_, _| {
+            let (ours, theirs) = UnixStream::pair().unwrap();
+            peers.lock().unwrap().push(theirs);
+            Some(ours)
+        });
+        let mut r = io::Cursor::new(std::mem::take(&mut *out.lock().unwrap()));
+        let mut closed = Vec::new();
+        while let Ok(Some(frame)) = proto::read_frame(&mut r) {
+            if let Frame::Close { stream } = frame {
+                closed.push(stream);
+            }
+        }
+        closed
+    }
+
+    #[test]
+    fn open_with_high_bit_is_refused() {
+        assert_eq!(refused_opens(&[HOST_ID_BIT, HOST_ID_BIT | 5]), vec![HOST_ID_BIT, HOST_ID_BIT | 5]);
+    }
+
+    #[test]
+    fn duplicate_open_id_is_refused() {
+        // First Open for id 1 is accepted (no Close), the second refused.
+        assert_eq!(refused_opens(&[1, 1]), vec![1]);
+    }
+
+    #[test]
+    fn opens_past_the_stream_cap_are_refused() {
+        // 1..=MAX_STREAMS accepted, then two more refused.
+        let opens: Vec<u32> = (1..=(MAX_STREAMS as u32 + 2)).collect();
+        let over = vec![MAX_STREAMS as u32 + 1, MAX_STREAMS as u32 + 2];
+        assert_eq!(refused_opens(&opens), over);
     }
 }

@@ -149,7 +149,7 @@ fn serve_bridge(mut conn: UnixStream, bridges: &Bridges, hash: &str) {
     match proto::read_frame(&mut conn) {
         Ok(Some(Frame::Quit)) => std::process::exit(0),
         Ok(Some(Frame::Hello { version, .. })) => {
-            let ours = Frame::Hello { version: proto::VERSION, hash: hash.to_string() };
+            let ours = Frame::Hello { version: proto::VERSION, hash: hash.to_string(), caps: 0 };
             if proto::write_frame(&mut conn, &ours).is_err() || version != proto::VERSION {
                 return;
             }
@@ -166,7 +166,9 @@ fn serve_bridge(mut conn: UnixStream, bridges: &Bridges, hash: &str) {
 }
 
 fn accept_agent_clients(agent: UnixListener, bridges: Arc<Bridges>) {
-    // Daemon-allocated ids start at 1; 0 is reserved for control frames.
+    // Daemon-allocated ids start at 1; 0 is reserved for control frames and the
+    // high bit for host-allocated ids, so ids wrap within 1..2^31 (never 0,
+    // high bit never set — see the host's `Open` policy in mux.rs).
     let next = Arc::new(AtomicU32::new(1));
     for conn in agent.incoming() {
         let Ok(conn) = conn else { continue };
@@ -177,8 +179,39 @@ fn accept_agent_clients(agent: UnixListener, bridges: Arc<Bridges>) {
             // No bridge even after HOLD: dropping `conn` closes it, and ssh
             // sees a refusing agent.
             let Some(mux) = bridges.route() else { return };
-            let stream = next.fetch_add(1, Ordering::Relaxed);
+            let stream = next_stream_id(&next);
             let _ = mux.attach(stream, conn, Some(channel::SSH_AGENT));
         });
+    }
+}
+
+/// Next daemon-allocated stream id in 1..2^31, wrapping back to 1. A CAS loop
+/// keeps two concurrent accepts from landing on the same id.
+fn next_stream_id(next: &AtomicU32) -> u32 {
+    let mut cur = next.load(Ordering::Relaxed);
+    loop {
+        let step = if cur >= (1 << 31) - 1 { 1 } else { cur + 1 };
+        match next.compare_exchange_weak(cur, step, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return cur,
+            Err(actual) => cur = actual,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_ids_stay_in_lower_half_and_wrap() {
+        let next = AtomicU32::new(1);
+        assert_eq!(next_stream_id(&next), 1);
+        assert_eq!(next_stream_id(&next), 2);
+        // At the top of the space it wraps back to 1, never hitting 0 or the
+        // host's high-bit space.
+        let top = AtomicU32::new((1 << 31) - 1);
+        assert_eq!(next_stream_id(&top), (1 << 31) - 1);
+        assert_eq!(next_stream_id(&top), 1);
+        assert_eq!(top.load(Ordering::Relaxed), 2);
     }
 }

@@ -13,7 +13,16 @@ pub fn run(hash: &str) -> io::Result<()> {
     // a failed handshake rather than a bridge that silently routes nowhere.
     let ctl = connect_ctl()
         .map_err(|e| io::Error::new(e.kind(), format!("daemon not running ({CTL}: {e})")))?;
-    proto::handshake(&mut ctl.try_clone()?, &mut ctl.try_clone()?, hash)?;
+    // On a daemon/helper mismatch, print the direction from the helper's own
+    // point of view; the host then surfaces this stderr (it prefers the
+    // bridge's stderr when its handshake with us hits EOF, which is what a
+    // dying bridge here produces).
+    proto::handshake(&mut ctl.try_clone()?, &mut ctl.try_clone()?, hash).map_err(|e| {
+        match proto::version_mismatch(&e) {
+            Some(vm) => io::Error::new(e.kind(), daemon_mismatch(vm)),
+            None => e,
+        }
+    })?;
     let mut stdin = io::stdin().lock();
     let mut stdout = io::stdout().lock();
     proto::handshake(&mut stdin, &mut stdout, hash)?;
@@ -43,6 +52,16 @@ pub fn run(hash: &str) -> io::Result<()> {
     let mut to_daemon = ctl;
     io::copy(&mut stdin, &mut to_daemon)?;
     Ok(())
+}
+
+/// Daemon/helper protocol mismatch, phrased from the helper's side (`peer` is
+/// the daemon, `ours` this bridge). The host surfaces this verbatim.
+fn daemon_mismatch(vm: &proto::VersionMismatch) -> String {
+    let dir = if vm.peer < vm.ours { "older" } else { "newer" };
+    format!(
+        "daemon in container is {dir} (protocol {}) than this helper ({})",
+        vm.peer, vm.ours
+    )
 }
 
 /// Connect to the daemon, retrying briefly: the host starts it with `exec -d`,

@@ -83,12 +83,18 @@ fn spawn_with(
     let done = Arc::new(AtomicBool::new(false));
     let (tx, handshake) = mpsc::channel();
     let hash = hash.to_string();
+    let container = container.to_string();
     let finished = Arc::clone(&done);
     std::thread::spawn(move || {
         let result = proto::handshake(&mut stdout, &mut stdin, &hash).map(|_| ()).map_err(|e| {
-            // The bridge died before `Hello` (no daemon, no binary): its stderr
-            // says why. Otherwise (version mismatch) our own error is the
-            // right-way-round one.
+            // A version mismatch is a typed error carrying both versions, so we
+            // phrase it with the right direction and container. Otherwise the
+            // bridge died before `Hello` (no daemon, no binary) and its stderr
+            // says why — but when the *daemon* is the mismatch, the bridge
+            // already printed its own direction-aware line, so prefer stderr.
+            if let Some(vm) = proto::version_mismatch(&e) {
+                return mismatch_message(&container, vm);
+            }
             let mut msg = String::new();
             if e.kind() == std::io::ErrorKind::UnexpectedEof {
                 let _ = std::io::Read::read_to_string(&mut stderr, &mut msg);
@@ -112,6 +118,25 @@ fn spawn_with(
         finished.store(true, Ordering::Relaxed);
     });
     Some(Bridge { child, done, handshake })
+}
+
+/// A host-side, direction-aware message for a helper/host protocol mismatch.
+/// Peer (the helper) older → tell the user to restart the instance so the
+/// binary is rewritten; peer newer → this `devsandbox` is the stale side.
+/// The instance key isn't on hand here (only the container), so the fix hint
+/// stays generic ("restart the instance").
+fn mismatch_message(container: &str, vm: &proto::VersionMismatch) -> String {
+    if vm.peer < vm.ours {
+        format!(
+            "helper in {container} is outdated (protocol {}, need {}): restart the instance",
+            vm.peer, vm.ours
+        )
+    } else {
+        format!(
+            "this devsandbox is older than the helper in {container} (protocol {}, need {})",
+            vm.peer, vm.ours
+        )
+    }
 }
 
 /// Minimum gap between bridge attempts for one container, so a container

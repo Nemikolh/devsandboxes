@@ -177,10 +177,12 @@ ssh (in container) ──unix──▶ devsbd daemon ◀──frames over exec s
   leaves the old binary and old daemon in it. Outcomes:
   - `exec`/TUI before any reinstall: the host runs the *old* `bridge`. A
     differing build hash is fine (bridge and daemon are the same old build;
-    only `VERSION` must match). A differing `VERSION` fails the host
-    handshake: `exec` prints `note: ssh-agent relay unavailable in <c>:
-    protocol version N, expected M: helper out of date, restart the instance`
-    after the command; the TUI stays silent.
+    only `VERSION` must match). A differing `VERSION` fails the host handshake
+    with a typed error carrying both versions, phrased with direction: the
+    helper older → `helper in <c> is outdated (protocol N, need M): restart
+    the instance`, the helper newer → `this devsandbox is older than the
+    helper in <c> (protocol N, need M)`. `exec` prints it as a `note:` after
+    the command; the TUI stays silent.
   - `stop` + `start` / `rebuild`: clean, no process survives.
   - `start` on a still-running container (`start.rs` accepts it): `ensure`
     rewrites the binary (hash differs) and starts a new daemon. The lock is
@@ -192,7 +194,11 @@ ssh (in container) ──unix──▶ devsbd daemon ◀──frames over exec s
     never evict each other.
   - The bridge also exchanges `Hello` with the daemon, so a bridge/daemon
     mismatch fails the handshake rather than passing frames the daemon
-    can't parse.
+    can't parse. The bridge prints its own direction-aware line for that case
+    (`daemon in container is older/newer (protocol N) than this helper (M)`),
+    which the host surfaces (it prefers the bridge's stderr when its own
+    handshake with the bridge hit `UnexpectedEof`, i.e. the bridge died
+    before `Hello`).
 
 - **Bridge:** host runs `exec -i -u root <c> devsbd bridge`. The bridge
   connects to the control socket first (retrying for 2s: `exec -d` returns
@@ -282,29 +288,42 @@ Length-prefixed, little-endian, one byte stream in each direction:
 
 ```
 u32 stream_id | u8 kind | u32 len | payload[len]
-kind: 0 Hello(u32 version, hash utf-8)  1 Open(channel: u8)  2 Data  3 Close  4 Ping  5 Pong  6 Quit
+kind: 0 Hello(u32 version, u8 hash_len, hash utf-8, u32 caps)  1 Open(channel: u8)  2 Data  3 Close  4 Ping  5 Pong  6 Quit
 ```
 
-- **Frozen forever:** the header layout, `Hello` and `Quit` (pinned by a
-  byte-level test). An outdated daemon must still understand the `Quit` that
-  replaces it, and either side's `Hello` must decode far enough to report a
-  version mismatch. The daemon answers a bridge's `Hello` with its own even
-  on mismatch, for the same reason.
+- **Frozen forever:** the header layout, `Hello`'s leading `u32 version`, and
+  `Quit` (pinned by a byte-level test). An outdated daemon must still
+  understand the `Quit` that replaces it, and either side's `Hello` must
+  decode its `version` far enough to report a mismatch — even when the rest of
+  the payload is a future layout it can't parse (so on version mismatch,
+  decoding keeps only `version` and doesn't fail on the rest). The daemon
+  answers a bridge's `Hello` with its own even on mismatch, for the same
+  reason. `Hello`'s trailing `caps: u32` is a capability bitset (0 today,
+  unknown bits ignored) and bytes after it are ignored, leaving room for
+  later fields without a `VERSION` bump.
 
-- Control frames (`Hello`, `Ping`, `Pong`, `Quit`) use stream 0; the daemon allocates
-  stream ids from 1 for the connections it accepts. `Pong` echoes the `Ping`
-  payload (separate kinds so a reply can't be mistaken for a new ping).
+- Control frames (`Hello`, `Ping`, `Pong`, `Quit`) use stream 0. **Stream-id
+  spaces:** the daemon (container side) allocates ids with the high bit clear
+  (1..2^31, wrapping back to 1, never 0); the host allocates them with the
+  high bit set (none yet). The host refuses (`Close`) an `Open` whose id has
+  the high bit set, whose id is already live, or once 64 streams are live
+  (`MAX_STREAMS`). `Pong` echoes the `Ping` payload (separate kinds so a reply
+  can't be mistaken for a new ping).
 - Payload capped at 1 MiB (`MAX_PAYLOAD`): stray bytes on the stream (a shell
   banner on stdout) become an `InvalidData` error, not a huge allocation.
-  Unknown kinds and malformed `Hello`/`Open` payloads are errors too; EOF at a
-  frame boundary is a clean end, inside a frame `UnexpectedEof`.
+  Malformed `Hello`/`Open` payloads are errors too. **Unknown kinds are
+  skipped** (their payload consumed), not errors, so additive frames don't
+  need a `VERSION` bump. EOF at a frame boundary is a clean end, inside a
+  frame `UnexpectedEof`.
 - Each frame is encoded into one buffer and written with a single
   `write_all` + flush, so writers sharing a stream behind a mutex never
   interleave frames.
 
-- `Hello` both ways first; mismatched version → the host's handshake fails
-  with "helper out of date, restart the instance", which CLI `exec` prints
-  (see _Version mismatch / takeover_).
+- `Hello` both ways first; a mismatched version makes `proto::handshake`
+  return a typed `VersionMismatch { peer, ours }` (wrapped in an `InvalidData`
+  `io::Error`, recovered with `proto::version_mismatch`). Each side phrases
+  its own direction-aware message, which CLI `exec` prints (see _Version
+  mismatch / takeover_).
 - `channel` byte reserves room for API proxy streams (`1 = ssh-agent`,
   `2 = http-proxy`, …) so the protocol doesn't change later.
 - `Hello`'s hash is informational (the sender's build hash); only `version`
@@ -329,7 +348,7 @@ kind: 0 Hello(u32 version, hash utf-8)  1 Open(channel: u8)  2 Data  3 Close  4 
 5. [x] Helper `daemon` + `bridge`; host-side bridge driver (`src/devsbd/bridge.rs`),
    wired into CLI `exec` and the TUI.
 6. [x] Switch ssh-agent to relay when available (details below).
-7. Protocol revision before first release (details below).
+7. [x] Protocol revision before first release (details below).
 8. Keepalive + timeouts (details below).
 9. Daemon self-heal (details below).
 10. TUI bridge ownership off the UI thread (details below).
@@ -446,7 +465,10 @@ over; document it), agent socket stays **0666** (document the consequence).
 - Helper grows a `http-proxy` channel: listens on `127.0.0.1:<port>`, sandbox
   gets `HTTPS_PROXY`/`HTTP_PROXY` via `exec_argv`; streams go to the global
   credentials service container (network alias, cf. `docs/cli-proxy.md`)
-  rather than to the host.
+  rather than to the host. Unlike ssh-agent's small messages, bulk HTTP needs
+  flow control, so this adds credit/window frames — a new frame kind gated on a
+  `Hello` `caps` bit (a peer that skips the frames must not be sent them), so
+  it needs no `VERSION` bump.
 
 - TLS interception: devsandbox generates a CA per config root, installs the
   cert in the container (`update-ca-certificates` when present, plus
