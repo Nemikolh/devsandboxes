@@ -201,16 +201,33 @@ Length-prefixed, little-endian, one byte stream in each direction:
 
 ```
 u32 stream_id | u8 kind | u32 len | payload[len]
-kind: 0 Hello(version, hash)  1 Open(channel: u8)  2 Data  3 Close  4 Ping/Pong
+kind: 0 Hello(u32 version, hash utf-8)  1 Open(channel: u8)  2 Data  3 Close  4 Ping  5 Pong
 ```
+
+- Control frames (`Hello`, `Ping`, `Pong`) use stream 0; the daemon allocates
+  stream ids from 1 for the connections it accepts. `Pong` echoes the `Ping`
+  payload (separate kinds so a reply can't be mistaken for a new ping).
+- Payload capped at 1 MiB (`MAX_PAYLOAD`): stray bytes on the stream (a shell
+  banner on stdout) become an `InvalidData` error, not a huge allocation.
+  Unknown kinds and malformed `Hello`/`Open` payloads are errors too; EOF at a
+  frame boundary is a clean end, inside a frame `UnexpectedEof`.
+- Each frame is encoded into one buffer and written with a single
+  `write_all` + flush, so writers sharing a stream behind a mutex never
+  interleave frames.
 
 - `Hello` both ways first; mismatched version → bridge exits non-zero with a
   message the host surfaces ("helper out of date, restart instance").
 - `channel` byte reserves room for API proxy streams (`1 = ssh-agent`,
   `2 = http-proxy`, …) so the protocol doesn't change later.
-- Protocol code lives in a small `helper-proto` module shared by both crates
-  (a third workspace member, or `#[path]` include) so host and helper can't
-  drift; unit-tested with in-memory pipes.
+- `Hello`'s hash is informational (the sender's build hash); only `version`
+  must match (`proto::handshake`). `proto::VERSION` is also what
+  `devsbd version` prints.
+- Protocol code lives in `src/devsbd/proto.rs` (std-only), included by devsbd
+  via `#[path]` so host and helper can't drift. Not a third workspace crate: it
+  would have to be published for `cargo install devsandbox` to build, and
+  `devsbd/` is excluded from the package, hence the file sits in the root
+  crate. Unit-tested with in-memory readers and real OS pipes; runs under both
+  `cargo test` and `cargo test -p devsbd`.
 
 ## Steps
 
@@ -220,7 +237,7 @@ kind: 0 Hello(version, hash)  1 Open(channel: u8)  2 Data  3 Close  4 Ping/Pong
    blob/hash plumbing (`cargo test` must pass with no helper built).
 3. [x] Install into container (host arch → other-arch retry, stream write, hash check) in `run` +
    `start`; `Instance.devsbd_arch`.
-4. Shared frame protocol + tests.
+4. [x] Shared frame protocol + tests.
 5. Helper `daemon` + `bridge`; host-side bridge driver (`src/commands/agent.rs`
    or similar), wired into CLI `exec` and the TUI.
 6. Switch ssh-agent to relay when available; update `docs/ssh-agent.md`

@@ -7,6 +7,10 @@
 //! `exec -i` stdin, which works on every runtime (no `docker cp`, no file
 //! binds on Apple `container`).
 
+// Consumed by the host-side bridge driver (step 5 of docs/sandbox-helper.md).
+#[allow(dead_code)]
+pub mod proto;
+
 use std::borrow::Cow;
 use std::io::Read;
 
