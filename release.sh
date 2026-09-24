@@ -44,7 +44,19 @@ if grep -nE "\"(version|@devsandboxes/[^\"]+)\": \"" "${npm_manifests[@]}" | gre
   exit 1
 fi
 
-git add Cargo.toml Cargo.lock "${npm_manifests[@]}"
+# README's curl install example pins a release archive URL.
+current_re=${current//./\\.}
+sed -i -E \
+  -e "s#/download/v$current_re/#/download/v$new/#g" \
+  -e "s#devsandbox-$current_re-#devsandbox-$new-#g" \
+  README.md
+if grep -noE "(/download/v|devsandbox-)[0-9]+\.[0-9]+\.[0-9]+" README.md \
+  | grep -vE "(v|-)${new//./\\.}$"; then
+  echo "error: README download links above were not bumped to $new" >&2
+  exit 1
+fi
+
+git add Cargo.toml Cargo.lock README.md "${npm_manifests[@]}"
 git commit -m "release v$new"
 git tag "v$new"
 git push origin main "v$new"
