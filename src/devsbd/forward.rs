@@ -589,13 +589,21 @@ mod tests {
 
     #[test]
     fn prefer_uses_the_requested_port_when_free() {
-        // Reserve then release a port so it's (almost certainly) free.
-        let port = {
-            let l = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-            l.local_addr().unwrap().port()
-        };
-        let listener = bind_listener(LOOPBACK, HostPort::Prefer(port)).unwrap();
-        assert_eq!(listener.local_addr().unwrap().port(), port);
+        // Reserve then release a port so it's free. Parallel tests bind
+        // ephemeral loopback ports too, so one can grab it before we rebind and
+        // Prefer (correctly) falls back; retry with a fresh port. A Prefer that
+        // ignored a free port would miss on every attempt, so this still fails.
+        for _ in 0..20 {
+            let port = {
+                let l = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+                l.local_addr().unwrap().port()
+            };
+            let listener = bind_listener(LOOPBACK, HostPort::Prefer(port)).unwrap();
+            if listener.local_addr().unwrap().port() == port {
+                return;
+            }
+        }
+        panic!("Prefer never bound the requested port in 20 attempts");
     }
 
     #[test]
