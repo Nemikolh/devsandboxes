@@ -378,7 +378,7 @@ I/O-free.
 - Tests: tab cycling over three tabs, selection clamp, prompt parse and
   completion for `port`, key → pending request mapping.
 
-### Step 10 — TUI Ports tab: event-loop wiring [ ]
+### Step 10 — TUI Ports tab: event-loop wiring [x]
 
 `src/tui/mod.rs`.
 

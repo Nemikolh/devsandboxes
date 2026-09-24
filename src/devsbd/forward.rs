@@ -103,9 +103,8 @@ pub struct ForwardStatus {
     pub local_addr: SocketAddr,
     pub route_label: String,
     pub state: ForwardState,
-    // Read by the TUI Ports tab (docs/port-forwarding.md, steps 9-10); the CLI
-    // doesn't surface it.
-    #[allow(dead_code)]
+    // Read by the TUI Ports tab worker (docs/port-forwarding.md, step 10); the
+    // CLI doesn't surface it.
     pub open_conns: usize,
     /// The process listening on the forwarded port, e.g. `node (pid 412)`, or
     /// `None` when unknown (no `lsof`, no match, or not yet probed). Refreshed
@@ -360,7 +359,7 @@ fn handle_conn(sock: TcpStream, shared: &Arc<Shared>, stop: &Arc<AtomicBool>) {
 /// (so route changes heal), and spawn again. Never re-exec per connection.
 fn supervise(resolve: Box<dyn Fn() -> Result<Route, String> + Send + Sync>, shared: Arc<Shared>, stop: Arc<AtomicBool>) {
     while !stop.load(Ordering::Relaxed) {
-        let gap = match try_spawn(&resolve, &shared) {
+        let gap = match try_spawn(&resolve, &shared, &stop) {
             SpawnOutcome::Serving(bridge) => {
                 // Just became Active: probe the listening process once now, then
                 // periodically inside `wait_until_dead` (docs, _Listening
@@ -405,7 +404,7 @@ fn retry_gap(mismatch: bool) -> Duration {
 /// Resolve the route and spawn one bridge, waiting for its handshake. Publishes
 /// the result into `shared` (state + label + bridge). On any failure records a
 /// note and leaves the forward in `Error`.
-fn try_spawn(resolve: &(dyn Fn() -> Result<Route, String> + Send + Sync), shared: &Arc<Shared>) -> SpawnOutcome {
+fn try_spawn(resolve: &(dyn Fn() -> Result<Route, String> + Send + Sync), shared: &Arc<Shared>, stop: &Arc<AtomicBool>) -> SpawnOutcome {
     let route = match resolve() {
         Ok(route) => route,
         Err(reason) => {
@@ -423,9 +422,11 @@ fn try_spawn(resolve: &(dyn Fn() -> Result<Route, String> + Send + Sync), shared
         return SpawnOutcome::Failed { mismatch: false };
     };
     // The handshake channel is consumed here (still sole owner), before the
-    // bridge is wrapped for sharing across accept threads.
-    match bridge.outcome(HANDSHAKE_WAIT) {
-        Some(Ok(())) => {
+    // bridge is wrapped for sharing across accept threads. Wait in short slices
+    // so a `Drop` mid-handshake bails within a slice instead of blocking up to
+    // HANDSHAKE_WAIT (~10s): dropping `bridge` here kills its `exec`.
+    match wait_handshake(&bridge, stop) {
+        Handshake::Ok => {
             let bridge = Arc::new(Mutex::new(bridge));
             {
                 let mut inner = shared.inner.lock().unwrap();
@@ -434,15 +435,59 @@ fn try_spawn(resolve: &(dyn Fn() -> Result<Route, String> + Send + Sync), shared
             }
             SpawnOutcome::Serving(bridge)
         }
-        Some(Err(reason)) => {
+        Handshake::Err(reason) => {
             let mismatch = bridge.is_mismatch();
             set_error(shared, reason);
             SpawnOutcome::Failed { mismatch }
         }
-        None => {
+        Handshake::TimedOut => {
             let mismatch = bridge.is_mismatch();
             set_error(shared, "helper handshake timed out".into());
             SpawnOutcome::Failed { mismatch }
+        }
+        // `Drop` set `stop` mid-handshake: bail silently (no note). Dropping
+        // `bridge` here kills its `exec`, so the supervisor exits at once.
+        Handshake::Stopped => SpawnOutcome::Failed { mismatch: false },
+    }
+}
+
+/// Slice of the handshake wait, so a `stop` set by `Drop` is noticed within one
+/// slice instead of blocking the whole `HANDSHAKE_WAIT`.
+const HANDSHAKE_SLICE: Duration = Duration::from_millis(100);
+
+/// Outcome of waiting for a fresh bridge's handshake.
+enum Handshake {
+    /// The handshake succeeded.
+    Ok,
+    /// The handshake failed with this reason.
+    Err(String),
+    /// No result within `HANDSHAKE_WAIT` (the bridge's own watchdog has already
+    /// killed the `exec`).
+    TimedOut,
+    /// `stop` was set (a `Drop`) before the handshake resolved.
+    Stopped,
+}
+
+/// Wait for `bridge`'s handshake in `HANDSHAKE_SLICE` slices up to
+/// `HANDSHAKE_WAIT`, checking `stop` between slices so a `Drop` mid-handshake
+/// returns promptly (the caller then drops the bridge, killing its `exec`)
+/// rather than hanging for seconds. `outcome` yields its result at most once, so
+/// a slice that returns `Some(..)` is the final answer.
+fn wait_handshake(bridge: &Bridge, stop: &Arc<AtomicBool>) -> Handshake {
+    let deadline = Instant::now() + HANDSHAKE_WAIT;
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return Handshake::Stopped;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Handshake::TimedOut;
+        }
+        match bridge.outcome(HANDSHAKE_SLICE.min(remaining)) {
+            Some(Ok(())) => return Handshake::Ok,
+            Some(Err(reason)) => return Handshake::Err(reason),
+            // Slice elapsed with no result yet: loop to re-check `stop`.
+            None => {}
         }
     }
 }

@@ -175,7 +175,7 @@ fn format_procs(procs: &[(u32, String)]) -> Option<String> {
 /// needed). `-F` output is machine-parseable; any failure at all — `lsof`
 /// missing (exit 127), no match (exit 1), or the container gone — yields
 /// `None`, never an error (docs/port-forwarding.md, _Listening process_).
-fn listening_procs(container: &str, port: u16) -> Option<String> {
+pub(crate) fn listening_procs(container: &str, port: u16) -> Option<String> {
     let out = crate::runtime::backend()
         .output_quiet(&[
             "exec",

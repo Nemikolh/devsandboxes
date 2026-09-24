@@ -32,6 +32,16 @@ pub(crate) fn resolve_instance(state: &State, name: &str) -> Result<String> {
     resolve_instance_with(state, name, std::io::stdin().is_terminal())
 }
 
+/// Non-interactive [`resolve_instance`]: an ambiguous `name` bails instead of
+/// prompting. For callers where prompting is impossible or wrong even though
+/// stdin is a TTY — the TUI worker thread owns no console (the dashboard does),
+/// so a `pick` there would fight the alternate screen.
+// Only the unix-only TUI forwarder worker calls this.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn resolve_instance_noninteractive(state: &State, name: &str) -> Result<String> {
+    resolve_instance_with(state, name, false)
+}
+
 fn resolve_instance_with(state: &State, name: &str, interactive: bool) -> Result<String> {
     let mut matches: Vec<String> = state
         .instances

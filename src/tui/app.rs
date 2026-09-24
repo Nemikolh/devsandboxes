@@ -470,6 +470,7 @@ impl App {
 
     /// Install the forwarder's latest rows and re-clamp the Ports selection in
     /// case it shrank. I/O-free: the event loop (step 10) does the collecting.
+    #[cfg_attr(not(unix), allow(dead_code))] // fed by the unix-only forward worker
     pub fn set_ports(&mut self, ports: Vec<PortRow>) {
         self.ports = ports;
         self.clamp_selection();

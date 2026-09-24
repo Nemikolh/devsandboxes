@@ -6,6 +6,8 @@
 
 mod app;
 mod data;
+#[cfg(unix)]
+mod forwards;
 mod procs;
 mod prompt;
 mod spec;
@@ -112,6 +114,15 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
     // before the terminal is restored.
     #[cfg(unix)]
     let bridges = crate::devsbd::bridge::Bridges::spawn_worker();
+    // Ports-tab forwards (docs/port-forwarding.md, step 10). Same ownership as
+    // `bridges`: a worker thread owns every `Forward`, doing all config/state/
+    // docker work (route resolution, `ensure`, the `lsof` probe) off the UI
+    // thread; its `Drop` (any exit path, including `?`) closes the channel and
+    // joins, dropping every forward — killing its bridge/`exec` — before the
+    // terminal is restored. Declared after `bridges` so it drops first (LIFO),
+    // though the two are independent.
+    #[cfg(unix)]
+    let forwards = forwards::ForwardWorker::spawn(dir.clone());
 
     while !app.should_quit {
         // Full-frame area, shared by the pre-draw PTY resize and mouse routing.
@@ -187,6 +198,33 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
         // A process-row SIGTERM/SIGKILL was requested: send it off-thread.
         if let Some(sig) = app.take_pending_signal() {
             signals.push(spawn_signal(sig));
+        }
+
+        // Ports tab: hand add/remove requests to the forwarder worker and drain
+        // its updates into the app. All docker/config work happens on the worker,
+        // never here. Off unix the mux (and thus forwarding) doesn't exist.
+        #[cfg(unix)]
+        {
+            if let Some(req) = app.take_pending_port() {
+                forwards.add(req);
+            }
+            if let Some(id) = app.take_pending_unport() {
+                forwards.remove(id);
+            }
+            while let Some(update) = forwards.try_recv() {
+                match update {
+                    forwards::ForwardUpdate::Rows(rows) => app.set_ports(rows),
+                    forwards::ForwardUpdate::Status(status) => app.status = Some(status),
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            if app.take_pending_port().is_some() {
+                app.status = Some("port forwarding is unix-only for now".into());
+            }
+            // No forwards exist off unix, so a stale unport is just dropped.
+            let _ = app.take_pending_unport();
         }
 
         // Drain any finished background stops/starts: update the status line,
