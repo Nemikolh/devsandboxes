@@ -24,6 +24,10 @@ git worktrees so working trees are never shared.
   `rebuild` recreates a service's containers and rewires running sandboxes in
   place (no restart, on any runtime).
 - `src/runtime/` — backend abstraction over docker/podman/Apple container.
+- `devsbd/` — static in-container helper (workspace member), built by
+  `scripts/build-devsbd.sh` and embedded by `build.rs`; `src/devsbd.rs` holds
+  the embedded blobs + install, `src/devsbd/proto.rs` the frame protocol
+  shared with the helper via `#[path]`. See `docs/sandbox-helper.md`.
 - `src/tui/` — ratatui dashboard. `app.rs` is a deliberately I/O-free state
   machine (unit-tested); `mod.rs` owns the terminal + event loop and runs
   docker work on background threads; `prompt.rs` is the `:` command line
@@ -39,8 +43,9 @@ git worktrees so working trees are never shared.
 - Doc comments explain *why*; keep them current when moving logic.
 - Tests live in `#[cfg(test)]` modules per file; most logic is factored to be
   testable without a container runtime.
-- Checks: `cargo test` (clippy/rustfmt are not installed in the default
-  toolchain here).
+- Checks: `cargo test --workspace` (covers the `devsbd/` helper crate too;
+  plain `cargo test` only runs the root package). clippy/rustfmt are not
+  installed in the default toolchain here.
 - Commits follow Conventional Commits, all lowercase:
   `<type>(<what>): <description>` where `<type>` is `feat`, `fix`, `chore`,
   `docs`, `test`, `refactor`, … and `<what>` is the module or concept touched
