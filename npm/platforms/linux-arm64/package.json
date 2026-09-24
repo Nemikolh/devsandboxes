@@ -1,6 +1,6 @@
 {
   "name": "@devsandboxes/linux-arm64",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "devsandbox native binary for linux arm64. Install `devsandbox` instead.",
   "license": "MIT",
   "repository": {
