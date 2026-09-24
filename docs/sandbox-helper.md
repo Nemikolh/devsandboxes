@@ -82,6 +82,14 @@ The main crate must build for every release target (incl. macOS, Windows) while 
   the non-host one is the fallback for emulated images (see _Installing_) and later serves remote
   containers.
 
+- **Build hash patched into the binary.** The helper can't know its own sha256 at compile time, so
+  devsbd holds a fixed-length slot (`BUILD_HASH`: marker `DEVSBD_BUILD_HASH:` + a 64-byte
+  placeholder). `build.rs` hashes the unpatched binary, finds the slot (exactly one occurrence, else
+  the build fails), overwrites the placeholder with the hex hash, then compresses. `devsbd version`
+  reads the slot with a volatile read and prints `devsbd <protocol> <hash>`, which is what the install
+  check compares against `devsbd::hash(arch)`. So `hash` identifies the build; it's not the sha256
+  of the patched bytes.
+
 - `release.yml`: new `devsbd` job matrix (x86_64 on `ubuntu-latest`, aarch64 on
   `ubuntu-24.04-arm`, both with `musl-tools`) runs
   `cargo build -p devsbd --profile devsbd --target …`, uploads
@@ -197,9 +205,9 @@ kind: 0 Hello(version, hash)  1 Open(channel: u8)  2 Data  3 Close  4 Ping/Pong
 
 ## Steps
 
-1. Workspace + `devsbd/` crate skeleton (`version`), `[profile.devsbd]`,
+1. [x] Workspace + `devsbd/` crate skeleton (`version`), `[profile.devsbd]`,
    `scripts/build-devsbd.sh`; check size.
-2. `build.rs` + `src/devsbd.rs` embedding with empty-blob fallback; tests for
+2. [x] `build.rs` + `src/devsbd.rs` embedding with empty-blob fallback; tests for
    blob/hash plumbing (`cargo test` must pass with no helper built).
 3. Install into container (host arch → other-arch retry, stream write, hash check) in `run` +
    `start`; `Instance.devsbd_arch`.

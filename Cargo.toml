@@ -4,7 +4,7 @@ version = "0.2.4"
 edition = "2024"
 description = "Manage devcontainer-style sandboxes on docker, podman, or Apple container — many throwaway instances per repo from one TOML config."
 license = "MIT"
-exclude = ["docs/", "release.sh", ".agents/", ".github/"]
+exclude = ["docs/", "release.sh", ".agents/", ".github/", "devsbd/", "scripts/"]
 
 [dependencies]
 anyhow = "1.0.104"
@@ -17,3 +17,24 @@ serde_json = "1.0"
 toml = "1.1.5"
 tui-term = "0.3.4"
 vt100 = "0.16"
+ruzstd = "0.8"
+
+[build-dependencies]
+sha2 = "0.10"
+zstd = "0.13"
+
+[dev-dependencies]
+# Tests roundtrip through the same encoder build.rs uses.
+zstd = "0.13"
+
+[workspace]
+members = [".", "devsbd"]
+
+# Only the helper build uses this; lto/strip/panic can't be set per package.
+[profile.devsbd]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

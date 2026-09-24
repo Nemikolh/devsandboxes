@@ -1,0 +1,11 @@
+[package]
+name = "devsbd"
+version = "0.1.0"
+edition = "2024"
+description = "In-container helper for devsandbox (embedded in the devsandbox binary)."
+license = "MIT"
+publish = false
+
+# No dependencies: size is the product, and no C deps keeps the rust-lld
+# cross-build working (see docs/sandbox-helper.md).
+[dependencies]
