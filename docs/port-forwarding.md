@@ -338,7 +338,7 @@ New `src/commands/port.rs` (resolution only, no CLI yet).
   stderr, deduplicated so a retry loop doesn't spam.
 - Not on Windows yet: bail `port forwarding is unix-only for now`.
 
-### Step 8 — listening process lookup [ ]
+### Step 8 — listening process lookup [x]
 
 `src/commands/port.rs` (or a small `src/devsbd/forward.rs` hook; implementer's
 call, justify it), see _Listening process_.

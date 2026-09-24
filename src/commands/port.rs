@@ -39,8 +39,11 @@ pub enum Planned {
     Instance { key: String, container: String },
     /// Service via a running instance: tunnel into that instance's `container`,
     /// daemon dials `<alias>:<port>` over the shared network. `alias` is the
-    /// service name (its network alias / `/etc/hosts` entry).
-    ViaInstance { key: String, container: String, alias: String },
+    /// service name (its network alias / `/etc/hosts` entry). `service_container`
+    /// is where the port actually lives — the *service* container, not the
+    /// instance — for the listening-process lookup (the instance can't see the
+    /// service's processes).
+    ViaInstance { key: String, container: String, alias: String, service_container: String },
     /// Injection fallback: tunnel into the service's own container and dial
     /// `127.0.0.1:<port>` there. No instance available (or its helper is unusable).
     Inject { service_container: String },
@@ -103,7 +106,7 @@ pub fn plan(
                             return Err(format!("instance `{key}` doesn't use service `{service}`"));
                         }
                     }
-                    if let Some(via) = via_instance(config, state, running, key, service) {
+                    if let Some(via) = via_instance(config, state, running, scope, project, key, service) {
                         plans.push(via);
                     }
                     let id = instance_id(state, key);
@@ -113,8 +116,8 @@ pub fn plan(
                 }
                 ServiceScope::Global => {
                     let via = instance_key
-                        .and_then(|key| via_instance(config, state, running, key, service))
-                        .or_else(|| first_referencing(config, state, running, service));
+                        .and_then(|key| via_instance(config, state, running, scope, project, key, service))
+                        .or_else(|| first_referencing(config, state, running, scope, project, service));
                     if let Some(via) = via {
                         plans.push(via);
                     }
@@ -128,10 +131,90 @@ pub fn plan(
     }
 }
 
+/// Parse `lsof -F` (field) output into the listening `(pid, command)` pairs
+/// (docs/port-forwarding.md, _Listening process_). `-F` emits one field per
+/// line: a `p<pid>` line opens a process set, a `c<command>` line names its
+/// command; other field lines (file descriptors, addresses) are ignored. A
+/// `c` line with no preceding `p` is dropped. Duplicates — the same process
+/// listening on both v4 and v6, or under `SO_REUSEPORT` — are deduped, order
+/// preserved.
+fn parse_lsof_f(out: &str) -> Vec<(u32, String)> {
+    let mut procs = Vec::new();
+    let mut pid: Option<u32> = None;
+    for line in out.lines() {
+        let Some((tag, rest)) = line.split_at_checked(1) else {
+            continue;
+        };
+        match tag {
+            "p" => pid = rest.parse::<u32>().ok(),
+            "c" => {
+                if let Some(pid) = pid {
+                    let pair = (pid, rest.to_string());
+                    if !procs.contains(&pair) {
+                        procs.push(pair);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    procs
+}
+
+/// Render listening processes for the UI: `node (pid 412)`, several joined with
+/// `, `. Empty → `None` (nothing to show).
+fn format_procs(procs: &[(u32, String)]) -> Option<String> {
+    if procs.is_empty() {
+        return None;
+    }
+    Some(procs.iter().map(|(pid, cmd)| format!("{cmd} (pid {pid})")).collect::<Vec<_>>().join(", "))
+}
+
+/// Look up the process listening on `port` inside `container`, quietly (never
+/// stderr — the TUI owns the screen), via a plain root `exec` (no devsbd
+/// needed). `-F` output is machine-parseable; any failure at all — `lsof`
+/// missing (exit 127), no match (exit 1), or the container gone — yields
+/// `None`, never an error (docs/port-forwarding.md, _Listening process_).
+fn listening_procs(container: &str, port: u16) -> Option<String> {
+    let out = crate::runtime::backend()
+        .output_quiet(&[
+            "exec",
+            "-u",
+            "root",
+            container,
+            "lsof",
+            "-nP",
+            &format!("-iTCP:{port}"),
+            "-sTCP:LISTEN",
+            "-Fpc",
+        ])
+        .ok()?;
+    format_procs(&parse_lsof_f(&out))
+}
+
 /// The persistent id for a state key (falls back to the key when the instance
 /// is absent, which only happens for a stale user-supplied key).
 fn instance_id<'a>(state: &'a State, key: &'a str) -> &'a str {
     state.instances.get(key).map(|i| i.instance_id.as_str()).unwrap_or(key)
+}
+
+/// The service container backing a via-instance candidate — where the port
+/// actually lives, for the listening-process lookup. Uses the same helpers as
+/// the injection fallback: an isolated service is per-instance (named by the
+/// instance's persistent id), a global one is project-level.
+fn via_service_container(
+    scope: ServiceScope,
+    state: &State,
+    project: &str,
+    key: &str,
+    service: &str,
+) -> String {
+    match scope {
+        ServiceScope::Isolated => {
+            services::isolated_service_container(project, instance_id(state, key), service)
+        }
+        ServiceScope::Global => services::service_container(project, service),
+    }
 }
 
 /// A `ViaInstance` candidate for `key` iff that instance exists, is running,
@@ -140,6 +223,8 @@ fn via_instance(
     config: &Config,
     state: &State,
     running: &BTreeSet<String>,
+    scope: ServiceScope,
+    project: &str,
     key: &str,
     service: &str,
 ) -> Option<Planned> {
@@ -151,6 +236,7 @@ fn via_instance(
         key: key.to_string(),
         container: info.container.clone(),
         alias: service.to_string(),
+        service_container: via_service_container(scope, state, project, key, service),
     })
 }
 
@@ -161,6 +247,8 @@ fn first_referencing(
     config: &Config,
     state: &State,
     running: &BTreeSet<String>,
+    scope: ServiceScope,
+    project: &str,
     service: &str,
 ) -> Option<Planned> {
     state.instances.iter().find_map(|(key, info)| {
@@ -169,6 +257,7 @@ fn first_referencing(
                 key: key.clone(),
                 container: info.container.clone(),
                 alias: service.to_string(),
+                service_container: via_service_container(scope, state, project, key, service),
             }
         })
     })
@@ -242,6 +331,7 @@ pub fn resolver(
                     match crate::devsbd::ensure_recorded(&key, info, true) {
                         Some(arch) => {
                             return Ok(crate::devsbd::forward::Route {
+                                process_container: container.clone(),
                                 container,
                                 arch: Some(arch),
                                 host: "127.0.0.1".into(),
@@ -252,7 +342,7 @@ pub fn resolver(
                         None => return Err(format!("devsbd couldn't run in `{container}`")),
                     }
                 }
-                Planned::ViaInstance { key, container, alias } => {
+                Planned::ViaInstance { key, container, alias, service_container } => {
                     let info = state.instances.get(&key).ok_or_else(|| format!("no sandbox instance `{key}`"))?;
                     match crate::devsbd::ensure_recorded(&key, info, true) {
                         Some(arch) => {
@@ -262,6 +352,9 @@ pub fn resolver(
                                 host: alias.clone(),
                                 port,
                                 label: format!("{alias}:{port} (via instance {key})"),
+                                // The port lives in the service container, not
+                                // the instance, so probe there.
+                                process_container: service_container,
                             });
                         }
                         // Helper unavailable in this instance: fall through to
@@ -280,6 +373,7 @@ pub fn resolver(
                             *inject_arch.lock().unwrap() = Some(arch);
                             let alias = service.as_deref().unwrap_or_default();
                             return Ok(crate::devsbd::forward::Route {
+                                process_container: service_container.clone(),
                                 container: service_container,
                                 arch: Some(arch),
                                 host: "127.0.0.1".into(),
@@ -416,7 +510,8 @@ pub fn port(
     let mut forwards: Vec<Forward> = Vec::with_capacity(specs.len());
     for (host_port, container_port) in &specs {
         let resolve = resolver(dir.clone(), instance_key.clone(), service.clone(), *container_port);
-        let forward = Forward::start(ForwardSpec { bind: address, host_port: *host_port, resolve })
+        let probe = Box::new(listening_procs);
+        let forward = Forward::start(ForwardSpec { bind: address, host_port: *host_port, resolve, probe })
             .with_context(|| match host_port {
                 HostPort::Fixed(p) => format!("host port {p} is in use"),
                 HostPort::Prefer(p) => format!("binding host port {p}"),
@@ -447,12 +542,16 @@ pub fn port(
         }
     }
 
-    // All active: print the mappings, then announce we're blocking.
+    // All active: print the mappings, then announce we're blocking. The
+    // listening process usually isn't known yet at this point (the first probe
+    // lands ~100ms later), so the suffix is re-printed by the loop below.
     let mut prev_states: Vec<ForwardState> = Vec::with_capacity(forwards.len());
+    let mut prev_procs: Vec<Option<String>> = Vec::with_capacity(forwards.len());
     for (forward, (host_port, _)) in forwards.iter().zip(&specs) {
         let status = forward.status();
         println!("{}", mapping_line(&status, *host_port));
         prev_states.push(status.state.clone());
+        prev_procs.push(status.process.clone());
     }
     eprintln!("forwarding; press Ctrl-C to stop");
 
@@ -461,13 +560,23 @@ pub fn port(
     // and per-connection notes, deduplicated.
     loop {
         std::thread::sleep(Duration::from_millis(250));
-        for (forward, prev) in forwards.iter().zip(&mut prev_states) {
+        for ((forward, (host_port, _)), (prev, prev_proc)) in forwards
+            .iter()
+            .zip(&specs)
+            .zip(prev_states.iter_mut().zip(prev_procs.iter_mut()))
+        {
             let status = forward.status();
             let local_port = status.local_addr.port();
             if let Some(line) = state_change_line(prev, &status.state, local_port) {
                 eprintln!("{line}");
             }
             *prev = status.state.clone();
+            // Re-print the mapping (on stdout) when the listening process is
+            // first discovered or changes to a new pid.
+            if let Some(line) = process_reprint_line(prev_proc, &status, *host_port) {
+                println!("{line}");
+            }
+            *prev_proc = status.process.clone();
             for note in forward.drain_notes() {
                 eprintln!("note: {local_port}: {note}");
             }
@@ -487,18 +596,40 @@ fn first_outcome_label(status: &crate::devsbd::forward::ForwardStatus) -> String
     }
 }
 
-/// The stdout mapping line for an active forward: `127.0.0.1:3000 -> api:3000`.
+/// The stdout mapping line for an active forward: `127.0.0.1:3000 -> api:3000`,
+/// suffixed with ` [node (pid 412)]` once the listening process is known.
 /// Uses the real bound port (a `Prefer` fallback shows the OS-assigned port);
 /// when it differs from the requested port, say why.
 #[cfg(unix)]
 fn mapping_line(status: &crate::devsbd::forward::ForwardStatus, host_port: HostPort) -> String {
     let local = status.local_addr;
     let base = format!("{local} -> {}", status.route_label);
-    match host_port {
+    let base = match host_port {
         HostPort::Prefer(requested) if local.port() != requested => {
             format!("{base} ({requested} was in use)")
         }
         _ => base,
+    };
+    match &status.process {
+        Some(process) => format!("{base} [{process}]"),
+        None => base,
+    }
+}
+
+/// Whether to re-print the mapping line because the listening process changed.
+/// The lookup usually lands after the first mapping print (and a dev server can
+/// restart under a new pid), so re-emit the line whenever `process` becomes a
+/// *new* `Some` value; going back to `None` (or unchanged) prints nothing. Pure
+/// over `(prev, new)` so the poll loop dedupes.
+#[cfg(unix)]
+fn process_reprint_line(
+    prev: &Option<String>,
+    status: &crate::devsbd::forward::ForwardStatus,
+    host_port: HostPort,
+) -> Option<String> {
+    match &status.process {
+        Some(new) if prev.as_deref() != Some(new.as_str()) => Some(mapping_line(status, host_port)),
+        _ => None,
     }
 }
 
@@ -506,6 +637,7 @@ fn mapping_line(status: &crate::devsbd::forward::ForwardStatus, host_port: HostP
 mod tests {
     use super::*;
     use crate::state::Instance;
+    use std::time::Duration;
 
     const CONFIG: &str = r#"
 [services.db]
@@ -630,6 +762,7 @@ image = "node"
                     key: "app-1".into(),
                     container: "devsandbox-app-1".into(),
                     alias: "db".into(),
+                    service_container: services::isolated_service_container(PROJECT, "app-1", "db"),
                 },
                 Planned::Inject {
                     service_container: services::isolated_service_container(PROJECT, "app-1", "db"),
@@ -698,6 +831,7 @@ image = "node"
                     key: "app-2".into(),
                     container: "devsandbox-app-2".into(),
                     alias: "cache".into(),
+                    service_container: services::service_container(PROJECT, "cache"),
                 },
                 Planned::Inject { service_container: services::service_container(PROJECT, "cache") },
             ]
@@ -717,6 +851,7 @@ image = "node"
                 key: "app-1".into(),
                 container: "devsandbox-app-1".into(),
                 alias: "cache".into(),
+                service_container: services::service_container(PROJECT, "cache"),
             }
         );
     }
@@ -733,6 +868,7 @@ image = "node"
                 key: "app-1".into(),
                 container: "devsandbox-app-1".into(),
                 alias: "cache".into(),
+                service_container: services::service_container(PROJECT, "cache"),
             }
         );
     }
@@ -765,6 +901,7 @@ image = "node"
                 key: "app-1".into(),
                 container: "devsandbox-app-1".into(),
                 alias: "cache".into(),
+                service_container: services::service_container(PROJECT, "cache"),
             }
         );
     }
@@ -838,5 +975,153 @@ image = "node"
             state_change_line(&Active, &Error("dead".into()), 5432),
             Some("note: 5432: dead".to_string())
         );
+    }
+
+    // ---- parse_lsof_f / format_procs ----
+
+    #[test]
+    fn parse_lsof_f_table() {
+        // Empty output → no processes.
+        assert_eq!(parse_lsof_f(""), Vec::<(u32, String)>::new());
+
+        // One process, with an interleaved (ignored) fd/address field line.
+        assert_eq!(
+            parse_lsof_f("p412\ncnode\nf5\nn127.0.0.1:3000\n"),
+            vec![(412, "node".to_string())]
+        );
+
+        // Multiple distinct processes.
+        assert_eq!(
+            parse_lsof_f("p1\ncnginx\np2\ncredis\n"),
+            vec![(1, "nginx".to_string()), (2, "redis".to_string())]
+        );
+
+        // v4 + v6 listing of the *same* pid/command is deduped, order kept.
+        assert_eq!(
+            parse_lsof_f("p412\ncnode\nfIPv4\np412\ncnode\nfIPv6\n"),
+            vec![(412, "node".to_string())]
+        );
+
+        // A stray `c` line with no preceding `p` is dropped.
+        assert_eq!(parse_lsof_f("cghost\np7\ncsh\n"), vec![(7, "sh".to_string())]);
+    }
+
+    #[test]
+    fn format_procs_table() {
+        assert_eq!(format_procs(&[]), None);
+        assert_eq!(format_procs(&[(412, "node".into())]), Some("node (pid 412)".to_string()));
+        assert_eq!(
+            format_procs(&[(1, "nginx".into()), (2, "redis".into())]),
+            Some("nginx (pid 1), redis (pid 2)".to_string())
+        );
+    }
+
+    // ---- process_reprint_line ----
+
+    #[cfg(unix)]
+    #[test]
+    fn process_reprint_line_only_on_new_some() {
+        use crate::devsbd::forward::{ForwardState, ForwardStatus};
+        use std::net::{Ipv4Addr, SocketAddr};
+
+        let status = |process: Option<&str>| ForwardStatus {
+            local_addr: SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 3000),
+            route_label: "api:3000".into(),
+            state: ForwardState::Active,
+            open_conns: 0,
+            process: process.map(str::to_string),
+        };
+        let hp = HostPort::Prefer(3000);
+
+        // First discovery (None → Some) re-prints the mapping with the suffix.
+        assert_eq!(
+            process_reprint_line(&None, &status(Some("node (pid 412)")), hp),
+            Some("127.0.0.1:3000 -> api:3000 [node (pid 412)]".to_string())
+        );
+        // Unchanged Some → nothing.
+        assert_eq!(
+            process_reprint_line(&Some("node (pid 412)".into()), &status(Some("node (pid 412)")), hp),
+            None
+        );
+        // New pid → re-print.
+        assert_eq!(
+            process_reprint_line(&Some("node (pid 412)".into()), &status(Some("node (pid 999)")), hp),
+            Some("127.0.0.1:3000 -> api:3000 [node (pid 999)]".to_string())
+        );
+        // Back to None → nothing (don't print when it disappears).
+        assert_eq!(process_reprint_line(&Some("node (pid 412)".into()), &status(None), hp), None);
+    }
+
+    // ---- docker-gated: listening_procs ----
+
+    use std::process::Command;
+
+    fn docker_ok() -> bool {
+        matches!(Command::new("docker").arg("info").output(), Ok(o) if o.status.success())
+    }
+
+    /// Docker-gated: a container with `lsof` running a loopback listener yields
+    /// the listening process; a container without `lsof` yields `None`. Skips
+    /// cleanly without docker, without network (apk fails), or on any hiccup.
+    #[test]
+    fn listening_procs_with_docker() {
+        let name_test = "listening_procs_with_docker";
+        let skip = |why: &str| eprintln!("skipping {name_test}: {why}");
+        if !docker_ok() {
+            return skip("docker unavailable");
+        }
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        // (1) lsof present, a loopback TCP listener on 8080.
+        let with = format!("devsandbox-lsof-yes-{stamp}");
+        // (2) no lsof: plain alpine sleeping.
+        let without = format!("devsandbox-lsof-no-{stamp}");
+        let cleanup = || {
+            for n in [&with, &without] {
+                let _ = Command::new("docker").args(["rm", "-f", n]).output();
+            }
+        };
+        let run_ok = |args: &[&str]| matches!(Command::new("docker").args(args).output(), Ok(o) if o.status.success());
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // Listener: keep the container up on a trivial command, then add
+            // lsof + a *real* nc (netcat-openbsd, so lsof reports the command
+            // as `nc`, not `busybox`) and start the listener as a distinct pid.
+            assert!(run_ok(&["run", "-d", "--name", &with, "alpine:3.20", "sleep", "300"]));
+            // Add lsof + nc; if apk can't reach the network, skip cleanly.
+            if !run_ok(&["exec", "-u", "root", &with, "apk", "add", "--no-cache", "lsof", "netcat-openbsd"]) {
+                return Err("apk add failed (no network?)");
+            }
+            // netcat-openbsd's nc holds 127.0.0.1:8080 LISTENing in the background.
+            if !run_ok(&["exec", "-d", "-u", "root", &with, "nc", "-lk", "-s", "127.0.0.1", "-p", "8080"]) {
+                return Err("could not start nc listener");
+            }
+            // nc may take a moment to bind; retry the lookup.
+            let mut found = None;
+            for _ in 0..50 {
+                if let Some(p) = listening_procs(&with, 8080) {
+                    found = Some(p);
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            let found = found.ok_or("listening process never found")?;
+            assert!(found.contains("nc"), "expected nc, got `{found}`");
+            assert!(found.contains("pid "), "expected a pid, got `{found}`");
+
+            // No lsof in this container → None, never an error.
+            assert!(run_ok(&["run", "-d", "--name", &without, "alpine:3.20", "sleep", "300"]));
+            assert_eq!(listening_procs(&without, 8080), None, "no lsof → None");
+            Ok::<(), &str>(())
+        }));
+        cleanup();
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(why)) => skip(why),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
     }
 }
