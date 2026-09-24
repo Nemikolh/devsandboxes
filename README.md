@@ -73,4 +73,4 @@ devsandbox                  # no args on a TTY: interactive dashboard
 
 Windows builds ship from the release workflow, but only the Linux build (e.g. inside WSL2) is exercised. Details: [`docs/runtimes.md`](docs/runtimes.md), [`docs/ssh-agent.md`](docs/ssh-agent.md).
 
-ssh-agent forwarding uses an embedded in-container helper (`devsbd`) that relays the agent over `exec` stdio when the build embeds it (`scripts/build-devsbd.sh`), so it needs no socket bind mount and works on every runtime, including Apple `container`. Release binaries don't embed it yet, and **`cargo install` builds never do**: those fall back to the bind mount (docker/podman on Linux only). See [`docs/sandbox-helper.md`](docs/sandbox-helper.md).
+ssh-agent forwarding uses an embedded in-container helper (`devsbd`) that relays the agent over `exec` stdio, so it needs no socket bind mount and works on every runtime, including Apple `container`. Release binaries embed it; **`cargo install` builds don't** (local builds do after `scripts/build-devsbd.sh`) and fall back to the bind mount (docker/podman on Linux only). See [`docs/sandbox-helper.md`](docs/sandbox-helper.md).
