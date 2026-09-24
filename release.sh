@@ -32,7 +32,19 @@ sed -i "0,/^version = \"$current\"/s//version = \"$new\"/" Cargo.toml
 # refresh Cargo.lock with the new version
 cargo check --quiet
 
-git add Cargo.toml Cargo.lock
+# npm packages ship the same binary, so they share the crate version: each
+# manifest's own version plus the root's exact pins on the platform packages.
+npm_manifests=(npm/devsandbox/package.json npm/platforms/*/package.json)
+sed -i -E \
+  -e "s/^(  \"version\": )\"$current\"/\1\"$new\"/" \
+  -e "s/^(    \"@devsandboxes\/[^\"]+\": )\"$current\"/\1\"$new\"/" \
+  "${npm_manifests[@]}"
+if grep -nE "\"(version|@devsandboxes/[^\"]+)\": \"" "${npm_manifests[@]}" | grep -v "\"$new\""; then
+  echo "error: npm manifests above were not bumped to $new" >&2
+  exit 1
+fi
+
+git add Cargo.toml Cargo.lock "${npm_manifests[@]}"
 git commit -m "release v$new"
 git tag "v$new"
 git push origin main "v$new"

@@ -21,6 +21,16 @@ jobs:
             echo "Tag $GITHUB_REF_NAME does not match Cargo.toml version $version" >&2
             exit 1
           fi
+          # release.sh bumps the npm packages in tandem; catch a hand-edited drift
+          # before building anything.
+          for pkg in npm/devsandbox npm/platforms/*; do
+            node -e '
+              const p = require(`./${process.argv[1]}/package.json`);
+              const bad = [["version", p.version], ...Object.entries(p.optionalDependencies ?? {})]
+                .filter(([, v]) => v !== process.argv[2]);
+              if (bad.length) { console.error(`${p.name}: ${bad.map(([k, v]) => `${k}=${v}`).join(", ")} != ${process.argv[2]}`); process.exit(1); }
+            ' "$pkg" "$version"
+          done
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
   devsbd:
@@ -119,3 +129,51 @@ jobs:
         run: cargo publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  npm:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: devsandbox-*
+          merge-multiple: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - name: Stage binaries into the platform packages
+        run: |
+          v=${{ needs.version.outputs.version }}
+          stage() { # <rust target> <npm platform dir> <archive ext>
+            bin=npm/platforms/$2/bin
+            mkdir -p "$bin"
+            case "$3" in
+              zip) unzip -j "dist/devsandbox-$v-$1.zip" -d "$bin" ;;
+              *) tar xzf "dist/devsandbox-$v-$1.tar.gz" -C "$bin" && chmod +x "$bin/devsandbox" ;;
+            esac
+          }
+          stage x86_64-unknown-linux-musl linux-x64 tar.gz
+          stage aarch64-unknown-linux-musl linux-arm64 tar.gz
+          stage aarch64-apple-darwin darwin-arm64 tar.gz
+          stage x86_64-pc-windows-msvc win32-x64 zip
+      # Platform packages first: the root package's optionalDependencies pin
+      # them exactly, so it must never be visible before they are. Already
+      # published versions are skipped so a failed run can be re-run.
+      - name: Publish to npm
+        run: |
+          v=${{ needs.version.outputs.version }}
+          for dir in npm/platforms/* npm/devsandbox; do
+            name=$(node -p "require('./$dir/package.json').name")
+            if npm view "$name@$v" version >/dev/null 2>&1; then
+              echo "$name@$v already published, skipping"
+            else
+              npm publish "./$dir" --access public
+            fi
+          done
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

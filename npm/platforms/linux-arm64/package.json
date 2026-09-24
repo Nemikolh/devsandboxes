@@ -1,0 +1,14 @@
+{
+  "name": "@devsandboxes/linux-arm64",
+  "version": "0.3.0",
+  "description": "devsandbox native binary for linux arm64. Install `devsandbox` instead.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Nemikolh/devsandboxes.git",
+    "directory": "npm/platforms/linux-arm64"
+  },
+  "os": ["linux"],
+  "cpu": ["arm64"],
+  "files": ["bin/"]
+}

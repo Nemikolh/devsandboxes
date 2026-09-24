@@ -1,0 +1,14 @@
+{
+  "name": "@devsandboxes/win32-x64",
+  "version": "0.3.0",
+  "description": "devsandbox native binary for win32 x64. Install `devsandbox` instead.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Nemikolh/devsandboxes.git",
+    "directory": "npm/platforms/win32-x64"
+  },
+  "os": ["win32"],
+  "cpu": ["x64"],
+  "files": ["bin/"]
+}

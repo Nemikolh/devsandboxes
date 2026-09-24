@@ -1,0 +1,27 @@
+{
+  "name": "devsandbox",
+  "version": "0.3.0",
+  "description": "Manage devcontainer-style sandboxes on docker, podman, or Apple container, from the CLI or a typed Node API.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Nemikolh/devsandboxes.git",
+    "directory": "npm/devsandbox"
+  },
+  "keywords": ["devcontainer", "sandbox", "docker", "podman", "cli"],
+  "main": "index.js",
+  "types": "index.d.ts",
+  "bin": {
+    "devsandbox": "bin/devsandbox.js"
+  },
+  "files": ["index.js", "index.d.ts", "bin/"],
+  "engines": {
+    "node": ">=18"
+  },
+  "optionalDependencies": {
+    "@devsandboxes/darwin-arm64": "0.3.0",
+    "@devsandboxes/linux-arm64": "0.3.0",
+    "@devsandboxes/linux-x64": "0.3.0",
+    "@devsandboxes/win32-x64": "0.3.0"
+  }
+}
