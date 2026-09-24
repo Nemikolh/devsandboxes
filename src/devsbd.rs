@@ -366,7 +366,20 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         drop(f);
 
-        let out = Command::new(&path).arg("version").output().unwrap();
+        // Exec of a just-written file races other test threads' `fork()`: a
+        // child forked while our write fd was open inherits it until its own
+        // exec closes it (O_CLOEXEC), and meanwhile our exec fails ETXTBSY.
+        // That window is brief, so a bounded retry is the standard fix.
+        let mut tries = 0;
+        let out = loop {
+            match Command::new(&path).arg("version").output() {
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && tries < 100 => {
+                    tries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                r => break r.unwrap(),
+            }
+        };
         let _ = std::fs::remove_file(&path);
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         assert_eq!(
