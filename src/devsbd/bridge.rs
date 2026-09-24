@@ -7,9 +7,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use super::mux::{self, Mux};
 use super::{proto, relay_mode, BIN};
 use crate::runtime::backend;
 use crate::state::{Instance, State};
@@ -17,7 +18,9 @@ use crate::state::{Instance, State};
 /// A running bridge; dropping it kills the `exec` (the in-container bridge
 /// then sees stdin EOF and exits).
 pub struct Bridge {
-    child: Child,
+    // Shared so the keepalive/handshake-timeout threads can kill the child too;
+    // `Drop` and those threads race on `kill()`, which is idempotent.
+    child: Arc<Mutex<Child>>,
     done: Arc<AtomicBool>,
     handshake: mpsc::Receiver<Result<(), String>>,
 }
@@ -37,8 +40,9 @@ impl Bridge {
 
 impl Drop for Bridge {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let mut child = self.child.lock().unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 
@@ -80,13 +84,38 @@ fn spawn_with(
     let mut stdin = child.stdin.take()?;
     let mut stdout = child.stdout.take()?;
     let mut stderr = child.stderr.take()?;
+    let child = Arc::new(Mutex::new(child));
     let done = Arc::new(AtomicBool::new(false));
     let (tx, handshake) = mpsc::channel();
     let hash = hash.to_string();
     let container = container.to_string();
     let finished = Arc::clone(&done);
+    // Watchdog: if the handshake hasn't produced a result within the timeout,
+    // kill the child, which unblocks the blocking `handshake` read below. The
+    // handshake thread then sees the read fail and, because `timed_out` is set,
+    // reports the timeout instead of the resulting EOF.
+    let timed_out = Arc::new(AtomicBool::new(false));
+    let bridged = Arc::new(AtomicBool::new(false));
+    {
+        let child = Arc::clone(&child);
+        let timed_out = Arc::clone(&timed_out);
+        let bridged = Arc::clone(&bridged);
+        std::thread::spawn(move || {
+            std::thread::sleep(HANDSHAKE_TIMEOUT);
+            // `bridged` flips once the handshake succeeds and routing starts;
+            // past that there's no handshake to time out.
+            if !bridged.load(Ordering::Relaxed) {
+                timed_out.store(true, Ordering::Relaxed);
+                let _ = child.lock().unwrap().kill();
+            }
+        });
+    }
+    let hs_child = Arc::clone(&child);
     std::thread::spawn(move || {
         let result = proto::handshake(&mut stdout, &mut stdin, &hash).map(|_| ()).map_err(|e| {
+            if timed_out.load(Ordering::Relaxed) {
+                return "helper handshake timed out".to_string();
+            }
             // A version mismatch is a typed error carrying both versions, so we
             // phrase it with the right direction and container. Otherwise the
             // bridge died before `Hello` (no daemon, no binary) and its stderr
@@ -105,9 +134,18 @@ fn spawn_with(
             }
         });
         let ok = result.is_ok();
+        // Stop the watchdog from racing a kill against a healthy bridge.
+        bridged.store(ok, Ordering::Relaxed);
         let _ = tx.send(result);
         if ok {
-            let mux = super::mux::Mux::new(stdin);
+            let mux = Mux::new(stdin);
+            // Keepalive: a wedged daemon (stopped reading) is caught by inbound
+            // silence; `on_dead` kills the child, ending the `serve` read below
+            // so `done` flips and `Bridges::reconcile` retries.
+            let dead_child = Arc::clone(&hs_child);
+            mux.keepalive(mux::KEEPALIVE_INTERVAL, mux::KEEPALIVE_TIMEOUT, move || {
+                let _ = dead_child.lock().unwrap().kill();
+            });
             mux.serve(stdout, |_, channel| {
                 if channel != proto::channel::SSH_AGENT {
                     return None;
@@ -119,6 +157,12 @@ fn spawn_with(
     });
     Some(Bridge { child, done, handshake })
 }
+
+/// How long the host waits for the daemon handshake before killing the child
+/// and reporting a timeout, so a container that accepts the `exec` but never
+/// completes `Hello` (wedged daemon, stuck runtime) can't block a bridge owner
+/// forever.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A host-side, direction-aware message for a helper/host protocol mismatch.
 /// Peer (the helper) older → tell the user to restart the instance so the

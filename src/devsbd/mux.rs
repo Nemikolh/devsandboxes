@@ -11,12 +11,26 @@ use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use super::proto::{self, Frame};
 
 /// Read chunk for local stream -> `Data` frames; far below `MAX_PAYLOAD`.
 const CHUNK: usize = 16 * 1024;
+
+/// Keepalive `Ping` cadence and the inbound-silence window after which the
+/// peer is declared dead (`on_dead`). A wedged peer that stops reading (so our
+/// `Ping`s pile up unanswered) is caught within `KEEPALIVE_TIMEOUT`.
+pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+pub const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// Pure liveness rule, split out so the timeout logic is testable with
+/// injected durations: dead once no inbound frame has arrived for `timeout`.
+fn is_dead(since_last_inbound: Duration, timeout: Duration) -> bool {
+    since_last_inbound >= timeout
+}
 
 /// Cap on concurrently live streams per bridge. An `Open` past this is refused
 /// (`Close`); ssh-agent volumes never approach it, so it's purely a bound on a
@@ -33,11 +47,59 @@ pub struct Mux {
     // `Arc` so the `Data` arm can clone a handle and write after dropping the
     // `streams` guard, instead of holding the lock across a blocking write.
     streams: Mutex<HashMap<u32, Arc<UnixStream>>>,
+    /// When `serve` last saw any inbound frame; the keepalive thread reads it
+    /// to decide liveness. Initialised at construction so a peer that never
+    /// sends a frame is still declared dead after `KEEPALIVE_TIMEOUT`.
+    last_inbound: Mutex<Instant>,
+    /// Set when `serve` returns, so the keepalive thread stops instead of
+    /// leaking (and pinging a dead connection) once the bridge is gone.
+    ended: AtomicBool,
 }
 
 impl Mux {
     pub fn new(out: impl Write + Send + 'static) -> Arc<Mux> {
-        Arc::new(Mux { out: Mutex::new(Box::new(out)), streams: Mutex::new(HashMap::new()) })
+        Arc::new(Mux {
+            out: Mutex::new(Box::new(out)),
+            streams: Mutex::new(HashMap::new()),
+            last_inbound: Mutex::new(Instant::now()),
+            ended: AtomicBool::new(false),
+        })
+    }
+
+    /// Spawn the keepalive thread: send `Ping` every `interval` and, once
+    /// `timeout` passes with no inbound frame, call `on_dead` once and stop.
+    /// Also stops (without calling `on_dead`) once `serve` has returned, so a
+    /// thread never outlives its bridge. `on_dead` typically tears the
+    /// connection down (shutdown/kill), which unblocks the `serve` read.
+    pub fn keepalive(
+        self: &Arc<Self>,
+        interval: Duration,
+        timeout: Duration,
+        on_dead: impl FnOnce() + Send + 'static,
+    ) {
+        let mux = Arc::clone(self);
+        std::thread::spawn(move || {
+            let mut on_dead = Some(on_dead);
+            while !mux.ended.load(Ordering::Relaxed) {
+                std::thread::sleep(interval);
+                if mux.ended.load(Ordering::Relaxed) {
+                    return;
+                }
+                let idle = mux.last_inbound.lock().unwrap().elapsed();
+                if is_dead(idle, timeout) {
+                    if let Some(f) = on_dead.take() {
+                        f();
+                    }
+                    return;
+                }
+                // `try_lock`: a writer stuck on a wedged peer holds `out`;
+                // queuing behind it would park this thread and the silence
+                // check above would never fire. Skip this tick's ping instead.
+                if let Ok(mut out) = mux.out.try_lock() {
+                    let _ = proto::write_frame(&mut *out, &Frame::Ping(Vec::new()));
+                }
+            }
+        });
     }
 
     pub fn send(&self, frame: &Frame) -> io::Result<()> {
@@ -101,6 +163,7 @@ impl Mux {
         on_open: impl Fn(u32, u8) -> Option<UnixStream>,
     ) {
         while let Ok(Some(frame)) = proto::read_frame(&mut reader) {
+            *self.last_inbound.lock().unwrap() = Instant::now();
             match frame {
                 Frame::Data { stream, bytes } => {
                     // Clone the handle and drop the guard before the blocking
@@ -152,6 +215,7 @@ impl Mux {
                 Frame::Hello { .. } | Frame::Pong(_) | Frame::Quit => {}
             }
         }
+        self.ended.store(true, Ordering::Relaxed);
         self.close_all();
     }
 
@@ -302,6 +366,62 @@ mod tests {
             }
         }
         closed
+    }
+
+    #[test]
+    fn is_dead_fires_only_after_the_timeout() {
+        let timeout = Duration::from_secs(45);
+        assert!(!is_dead(Duration::from_secs(0), timeout));
+        assert!(!is_dead(Duration::from_secs(44), timeout));
+        // The window is inclusive at the boundary.
+        assert!(is_dead(Duration::from_secs(45), timeout));
+        assert!(is_dead(Duration::from_secs(90), timeout));
+    }
+
+    #[test]
+    fn keepalive_calls_on_dead_when_peer_stops_answering() {
+        // A live peer that reads our frames but never replies: inbound stays
+        // silent, so `on_dead` fires once the tiny timeout elapses.
+        let (mux_r, peer_w) = std::io::pipe().unwrap();
+        let (peer_r, mux_w) = std::io::pipe().unwrap();
+        let mux = Mux::new(mux_w);
+        // Drain the peer's read end so our `Ping`s never block on a full pipe.
+        std::thread::spawn(move || {
+            let mut sink = peer_r;
+            let mut buf = [0u8; 256];
+            while let Ok(n) = sink.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+            }
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        mux.keepalive(Duration::from_millis(5), Duration::from_millis(30), move || {
+            let _ = tx.send(());
+        });
+        let m = Arc::clone(&mux);
+        std::thread::spawn(move || m.serve(mux_r, |_, _| None));
+        rx.recv_timeout(Duration::from_secs(2)).expect("on_dead fired");
+        // Keep the peer's write end alive until on_dead so `serve` doesn't end
+        // (and set `ended`) before liveness is judged.
+        drop(peer_w);
+    }
+
+    #[test]
+    fn keepalive_stops_once_serve_returns_without_calling_on_dead() {
+        let (mux_r, peer_w) = std::io::pipe().unwrap();
+        let (_peer_r, mux_w) = std::io::pipe().unwrap();
+        let mux = Mux::new(mux_w);
+        let fired = Arc::new(AtomicBool::new(false));
+        let f = Arc::clone(&fired);
+        mux.keepalive(Duration::from_millis(5), Duration::from_secs(30), move || {
+            f.store(true, Ordering::Relaxed);
+        });
+        // Peer vanishes: `serve` returns and flips `ended`.
+        drop(peer_w);
+        mux.serve(mux_r, |_, _| None);
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(!fired.load(Ordering::Relaxed), "on_dead must not fire after serve ended");
     }
 
     #[test]

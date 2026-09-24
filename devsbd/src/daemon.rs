@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-use crate::mux::Mux;
+use crate::mux::{self, Mux};
 use crate::proto::{self, channel, Frame};
 
 pub const DIR: &str = "/run/devsandbox";
@@ -160,6 +160,16 @@ fn serve_bridge(mut conn: UnixStream, bridges: &Bridges, hash: &str) {
     let mux = Mux::new(out);
     bridges.list.lock().unwrap().push(Arc::clone(&mux));
     bridges.arrived.notify_all();
+    // Keepalive: a wedged bridge (stopped reading, so it also stops sending)
+    // is caught by inbound silence; `on_dead` shuts the control connection,
+    // which unblocks the `serve` read below so it returns and the bridge
+    // leaves the routing list. Without this a wedged newest bridge would stall
+    // every agent request routed to it.
+    if let Ok(dead) = conn.try_clone() {
+        mux.keepalive(mux::KEEPALIVE_INTERVAL, mux::KEEPALIVE_TIMEOUT, move || {
+            let _ = dead.shutdown(std::net::Shutdown::Both);
+        });
+    }
     // The host never opens streams toward the container (yet).
     mux.serve(conn, |_, _| None);
     bridges.list.lock().unwrap().retain(|m| !Arc::ptr_eq(m, &mux));

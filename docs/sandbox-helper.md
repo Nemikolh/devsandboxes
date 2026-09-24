@@ -206,7 +206,11 @@ ssh (in container) ──unix──▶ devsbd daemon ◀──frames over exec s
   missing or mismatched daemon shows up as a failed handshake; the host then
   reports the bridge's stderr (e.g. `daemon not running`). Then it does
   `Hello` with the host and copies bytes verbatim between stdio and the
-  control socket; only the daemon parses frames.
+  control socket; only the daemon parses frames — so `Ping`/`Pong` traverse
+  the in-container bridge end to end with no keepalive logic there. The host
+  handshake has a 10s timeout (`spawn_with`): a container that accepts the
+  `exec` but never completes `Hello` is killed and reported as `helper
+  handshake timed out`, so a bridge owner is never blocked forever.
   Each agent client connection accepted by the daemon becomes a stream routed
   to *one* live bridge (most recent). No live bridge → the client is held up
   to 1s for one to attach, then closed (ssh reports "agent refused", same as
@@ -223,6 +227,23 @@ ssh (in container) ──unix──▶ devsbd daemon ◀──frames over exec s
   No half-close: a client's EOF closes the stream both ways (ssh clients
   don't half-close agent connections). Unix-only for now (unix sockets on
   both ends).
+  - **Keepalive.** `Mux` records the `Instant` of the last inbound frame (any
+    kind) and runs a keepalive thread (`Mux::keepalive`): `Ping` every 15s,
+    and after 45s of inbound silence it calls a caller-supplied `on_dead`
+    once and stops. It also stops (without firing `on_dead`) once `serve`
+    returns, so no thread outlives its bridge. Daemon side: `on_dead` shuts
+    the control connection down, so `serve` returns and the wedged bridge
+    leaves the routing list (a wedged newest bridge no longer stalls every
+    agent request). Host side: `on_dead` kills the child, so `serve` ends,
+    `is_done` flips, and `Bridges::reconcile` retries. The dead/alive rule is
+    a pure fn tested with injected durations; a real-pipe test drives the
+    thread with tiny durations.
+    - _Caveat (head-of-line):_ liveness is judged from *inbound* frames, but a
+      `serve` blocked writing `Data` to a slow local socket also stops reading,
+      so it stops updating the last-inbound timestamp — a slow local peer can
+      look dead. Acceptable for agent traffic (small messages); bulk
+      http-proxy will need per-stream flow control (see _Later_) so one slow
+      stream can't stall the frame reader.
 
 - **Host side:** for each `Open` the host connects to the *current*
   `$SSH_AUTH_SOCK` (so rotation is a non-issue) — or, later, the Windows
@@ -349,7 +370,7 @@ kind: 0 Hello(u32 version, u8 hash_len, hash utf-8, u32 caps)  1 Open(channel: u
    wired into CLI `exec` and the TUI.
 6. [x] Switch ssh-agent to relay when available (details below).
 7. [x] Protocol revision before first release (details below).
-8. Keepalive + timeouts (details below).
+8. [x] Keepalive + timeouts (details below).
 9. Daemon self-heal (details below).
 10. TUI bridge ownership off the UI thread (details below).
 11. Build hygiene (details below).
