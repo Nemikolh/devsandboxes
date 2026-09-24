@@ -135,6 +135,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      # npm trusted publishing: the registry trades this job's OIDC token for a
+      # short-lived publish token, so no NPM_TOKEN secret is involved.
+      id-token: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -142,10 +145,12 @@ jobs:
           path: dist
           pattern: devsandbox-*
           merge-multiple: true
+      # No registry-url: its generated .npmrc expects a token.
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
-          registry-url: https://registry.npmjs.org
+          node-version: 24
+      # Trusted publishing needs npm >= 11.5.1.
+      - run: npm install -g npm@latest
       - name: Stage binaries into the platform packages
         run: |
           v=${{ needs.version.outputs.version }}
@@ -175,5 +180,3 @@ jobs:
               npm publish "./$dir" --access public
             fi
           done
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
