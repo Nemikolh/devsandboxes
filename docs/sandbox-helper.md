@@ -300,11 +300,120 @@ kind: 0 Hello(u32 version, hash utf-8)  1 Open(channel: u8)  2 Data  3 Close  4 
 3. [x] Install into container (host arch → other-arch retry, stream write, hash check) in `run` +
    `start`; `Instance.devsbd_arch`.
 4. [x] Shared frame protocol + tests.
-5. [x] Helper `daemon` + `bridge`; host-side bridge driver (`src/commands/agent.rs`
-   or similar), wired into CLI `exec` and the TUI.
-6. Switch ssh-agent to relay when available; update `docs/ssh-agent.md`
-   (stale-socket, Apple, Windows sections point here).
-7. `release.yml` helper job (after confirmation).
+5. [x] Helper `daemon` + `bridge`; host-side bridge driver (`src/devsbd/bridge.rs`),
+   wired into CLI `exec` and the TUI.
+6. Switch ssh-agent to relay when available (details below).
+7. Protocol revision before first release (details below).
+8. Keepalive + timeouts (details below).
+9. Daemon self-heal (details below).
+10. TUI bridge ownership off the UI thread (details below).
+11. Build hygiene (details below).
+12. `release.yml` helper job (after confirmation).
+
+Decisions taken for 6–11 (user, 2026-09-24): **relay-first** (never mount when
+a helper is embedded), **last start wins** on takeover (hash differs → take
+over; document it), agent socket stays **0666** (document the consequence).
+
+### Step 6 — relay-first ssh-agent
+
+- `run` (`src/commands/run.rs` `materialize`, ~l.252): on unix, when
+  `devsbd::embedded()` (new: any arch has a hash), skip `ssh_agent_forward`
+  entirely — no mount, no symlink, `ssh_auth_sock = None`. If `ensure` then
+  fails, the instance has no forwarding (distroless / read-only `/run`); the
+  note says so: `note: ssh-agent forwarding off in <c>: <reason>`.
+  Non-unix hosts and builds without helpers keep today's path unchanged.
+- Mode is inferred, no new field: relay = `devsbd_arch.is_some() &&
+  ssh_auth_sock.is_none()` (`bridge::wanted`, now cfg-independent so
+  `exec_argv` can call it; `false` on non-unix). Instances created with a
+  mount keep mount mode until recreated.
+- `exec_argv` (`src/commands/exec.rs:94`): mount mode unchanged; relay mode
+  injects `-e SSH_AUTH_SOCK=<SSH_AGENT_TARGET>` **only when the host has a
+  usable agent** (`$SSH_AUTH_SOCK` set and the path exists). Keep the builder
+  testable: the env probe is one small fn, the argv logic takes its result
+  (e.g. an inner `exec_argv_with(.., host_agent: bool)`); no env mutation in
+  tests.
+- Same probe gates bridge spawning: `exec_status` and `Bridges::reconcile`
+  spawn nothing when the host has no agent (removes the extra `exec` per
+  command where it can't help). `host_agent()` (bridge.rs:55) also checks the
+  path exists.
+- Docs: `docs/ssh-agent.md` stale-socket caveat, _Future: Apple container_ and
+  _Windows_ sections point here; README feature table: Apple `container` via
+  relay (note: not yet exercised on a Mac), Linux/macOS-docker relay when
+  helper embedded; README note that `cargo install` builds have no helper and
+  use the mount path. Document in this file: last-start-wins takeover
+  (two CLI builds on one machine evict each other's daemon on `start`), and
+  that 0666 means any uid in the container can use the agent (same as the
+  bind mount when running as the socket owner).
+
+### Step 7 — protocol revision (unreleased, `VERSION` stays 1)
+
+- `Hello` payload becomes `u32 version | u8 hash_len | hash | u32 caps`;
+  `caps` = 0 for now, unknown bits ignored, bytes after `caps` ignored (room
+  for later fields). Only `u32 version` at offset 0 is frozen for mismatch
+  reporting; update the frozen-bytes test and _Frame protocol_ above.
+- Unknown frame kinds are skipped (payload consumed), not errors, so
+  additive frames don't need a `VERSION` bump.
+- Stream id spaces: container-allocated ids have the high bit clear
+  (daemon allocates 1..2^31, wrapping back to 1, never 0), host-allocated
+  ids have it set (none yet). The host refuses (`Close`) an `Open` with the
+  high bit set or an id already live.
+- Host caps concurrent streams per bridge (64); further `Open`s are refused.
+- `Mux::serve` (`src/devsbd/mux.rs` `Data` arm) must not hold the `streams`
+  mutex across the blocking `write_all`: keep a cloned handle (e.g.
+  `Arc<UnixStream>`), drop the guard, then write.
+- Mismatch direction: `proto::handshake` returns a typed error carrying
+  `peer`/`ours` versions (downcastable from `io::Error`). Host message:
+  peer older → `helper in <c> is outdated (protocol N, need M): run
+  devsandbox start <instance>`; peer newer → `this devsandbox is older than
+  the helper in <c> (protocol N, need M)`. The bridge reports daemon mismatch
+  the same way, from its own side.
+- Flow control stays out (agent volumes); record in _Later_ that
+  http-proxy needs credit/window frames (a new kind, now additive).
+
+### Step 8 — keepalive + timeouts
+
+- `Mux` gains liveness: record `Instant` of the last inbound frame in
+  `serve`; a keepalive thread sends `Ping` every 15s and, after 45s with no
+  inbound frame, calls a caller-supplied `on_dead` and stops.
+- Daemon: per bridge, `on_dead` shuts down the control connection, so
+  `serve` returns and the bridge leaves the routing list (a wedged newest
+  bridge no longer stalls every agent request).
+- Host: per bridge, `on_dead` kills the child (`is_done` flips, TUI retries).
+- Host handshake timeout: 10s, then kill the child and report
+  `Err("helper handshake timed out")`.
+- Pure logic (timeout decision) unit-tested with injected clock/durations;
+  intervals are consts.
+
+### Step 9 — daemon self-heal
+
+- `devsbd bridge`: when the first control-socket connect fails with
+  `NotFound`/`ConnectionRefused`, spawn `current_exe() daemon` detached
+  (`process_group(0)`, stdio null, not waited), then retry the connect for
+  the existing 2s. The daemon's pidfile lock already makes racing starts
+  safe. Covers containers restarted outside devsandbox (restart policy,
+  `docker restart`, VM restart).
+- Fix the doc claim "`/run` is often tmpfs": on docker it's in the writable
+  layer, so the binary survives a restart but the daemon doesn't.
+
+### Step 10 — TUI bridges off the UI thread
+
+- `Bridges` (`src/devsbd/bridge.rs`) moves to a worker thread fed by an mpsc
+  of running-container lists (sent from the snapshot arm, `src/tui/mod.rs`
+  ~l.240). `State::load` and spawns happen there. On TUI exit the sender is
+  dropped and the thread joined, so bridges are killed before returning.
+- Version mismatch (typed error from step 7) is not retried until the
+  container leaves the running set.
+
+### Step 11 — build hygiene
+
+- `build.rs`: `DEVSANDBOX_DEVSBD_REQUIRED=1` turns a missing/empty helper
+  into a build error (for CI, step 12).
+- Check whether a `rerun-if-changed` on a missing path reruns `build.rs` (and
+  recompiles the crate via rewritten `OUT_DIR` files) on every build; if so,
+  fix (e.g. only write `OUT_DIR` files when content changed).
+- Test (linux, host arch embedded): write the host-arch blob to a temp file,
+  run `version`, assert it reports `proto::VERSION` and `hash(host)` — catches
+  a stale `target/devsbd` after a protocol change.
 
 ## Later: API proxying (separate plan)
 
