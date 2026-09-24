@@ -355,7 +355,7 @@ call, justify it), see _Listening process_.
 - CLI line gets the `[…]` suffix; it re-prints the line when the process
   changes (e.g. dev server restarted under a new pid).
 
-### Step 9 — TUI Ports tab: state, prompt, rendering [ ]
+### Step 9 — TUI Ports tab: state, prompt, rendering [x]
 
 `src/tui/app.rs`, `src/tui/spec.rs`, `src/tui/prompt.rs`, `src/tui/ui.rs`.
 I/O-free.

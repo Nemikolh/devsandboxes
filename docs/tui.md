@@ -140,6 +140,30 @@ sandboxes from config, instances nested below:
   command). `l` logs stays instance-only.
 - Help overlay + help bar updated for the tree keys.
 
+## Phase 3 — Ports tab (on-demand port forwarding)
+
+See `docs/port-forwarding.md` for the engine. The dashboard gains a third tab.
+
+- `Tab::Ports` sits next to Instances and Services: `1/2/3` jump to a tab and
+  `tab`/`S-tab` cycle over all three (no longer a two-tab toggle).
+- Table columns: `LOCAL` (`127.0.0.1:3000`), `TARGET` (route label, already
+  carrying any `(via instance …)` suffix — no separate VIA column), `PROCESS`
+  (`node (pid 412)`, `-` when unknown), `STATE` (active green / connecting
+  yellow / error red), `CONNS`. Empty state points at `p` / `:port`.
+- Keys:
+  - `p` on an Instances row (not a process row) opens the prompt prefilled
+    `port <instance> `; `p` on a Services row prefills
+    `port <first used_by instance> --service <svc> ` (blank instance slot when
+    the service has no user).
+  - `d` on the Ports tab stops the selected forward.
+- Prompt command
+  `port <instance> [--service s] [--address a] <[host:]port>`: an instance is
+  required (a global service is reached by naming any instance that references
+  it); `--service` completes service names. The port spec is validated on submit
+  (`p` or `h:p`, non-zero u16s) via `commands::port::validate_port_spec`; a bad
+  spec is an inline prompt error. Submitting switches to the Ports tab and hands
+  the request to the forwarder worker (it never suspends the TUI).
+
 ## Step ordering / commits
 
 Each step = one review + one commit by the orchestrator. Steps 3 and 4 may share

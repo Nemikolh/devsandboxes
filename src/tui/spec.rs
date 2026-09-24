@@ -10,6 +10,8 @@ pub enum ArgValue {
     Instance,
     /// Instance names; service names on the Services tab.
     InstanceOrService,
+    /// Service names from the snapshot (tab-independent).
+    Service,
     /// Sandbox config names.
     Sandbox,
     /// The branch `run` would use (worktree-branch/default).
@@ -110,6 +112,17 @@ pub const SPECS: &[CommandSpec] = &[
         usage: "rebuild [--force] <instance>",
         flags: &[FlagSpec { name: "--force", value: None }],
         positionals: &[ArgValue::InstanceOrService],
+        trailing: false,
+    },
+    CommandSpec {
+        name: "port",
+        aliases: &[],
+        usage: "port <instance> [--service s] [--address a] <[host:]port>",
+        flags: &[
+            FlagSpec { name: "--service", value: Some(ArgValue::Service) },
+            FlagSpec { name: "--address", value: Some(ArgValue::Free) },
+        ],
+        positionals: &[ArgValue::Instance, ArgValue::Free],
         trailing: false,
     },
 ];
@@ -324,6 +337,6 @@ mod tests {
     #[test]
     fn specs_cover_all_commands_in_display_order() {
         let names: Vec<&str> = SPECS.iter().map(|s| s.name).collect();
-        assert_eq!(names, ["run", "exec", "code", "rm", "rename", "stop", "start", "rebuild"]);
+        assert_eq!(names, ["run", "exec", "code", "rm", "rename", "stop", "start", "rebuild", "port"]);
     }
 }

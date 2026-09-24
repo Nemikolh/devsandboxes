@@ -323,8 +323,12 @@ fn run_suspended(terminal: &mut Term, dir: &Path, action: PromptAction) -> Resul
             commands::rebuild::rebuild(dir, Some(instance.clone()), false, *force)
         }
         PromptAction::ServiceRebuild { name } => commands::services::rebuild(dir, name),
-        // `code` and `rename` never suspend; handled by the caller.
-        PromptAction::Code { .. } | PromptAction::Rename { .. } => Ok(()),
+        // `code`/`rename` never suspend (handled by the caller); `port` never
+        // reaches here — `App` routes it to `pending_port` (step 10), not
+        // `pending_action`.
+        PromptAction::Code { .. } | PromptAction::Rename { .. } | PromptAction::Port { .. } => {
+            Ok(())
+        }
     };
     if let Err(e) = result {
         match log_error(&action, &e) {
@@ -361,6 +365,7 @@ fn log_error(action: &PromptAction, err: &anyhow::Error) -> Option<PathBuf> {
         PromptAction::ServiceRebuild { .. } => "service rebuild",
         PromptAction::Code { .. } => "code",
         PromptAction::Rename { .. } => "rename",
+        PromptAction::Port { .. } => "port",
     };
     let dir = crate::state::State::path().ok()?.parent()?.join("logs");
     std::fs::create_dir_all(&dir).ok()?;

@@ -9,7 +9,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Tabs};
 use tui_term::widget::{Cursor, PseudoTerminal};
 
-use super::app::{App, ConfigView, Focus, Modal, Pane, Side, Tab, TextModal};
+use super::app::{App, ConfigView, Focus, Modal, Pane, PortRow, Side, Tab, TextModal};
 use super::data::{
     humanize_secs, sandbox_stats, totals_line, ContainerStatus, InstanceRow, Node, SandboxRow,
     ServiceRow, Snapshot,
@@ -85,6 +85,7 @@ fn draw_content(frame: &mut Frame, app: &App, area: Rect) {
     match app.tab {
         Tab::Instances => draw_instances(frame, app, area),
         Tab::Services => draw_services(frame, app, area),
+        Tab::Ports => draw_ports(frame, app, area),
     }
 }
 
@@ -418,6 +419,107 @@ fn draw_service_detail(
     }
 
     frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn draw_ports(frame: &mut Frame, app: &App, area: Rect) {
+    let rows: &[PortRow] = &app.ports;
+
+    let (top, detail_area, terms_area) = content_areas(app, area);
+    // The Ports tab has no snapshot error line; keep the top part whole.
+    let panel_focused = app.focus == Focus::Terminal;
+
+    if rows.is_empty() {
+        draw_ports_empty(frame, top, panel_focused);
+    } else {
+        draw_ports_table(frame, app, rows, top, panel_focused);
+    }
+    // No per-row detail for forwards; a plain block keeps the layout aligned with
+    // the other tabs (and reserves the terminal-panel geometry).
+    let detail = Block::default()
+        .borders(Borders::ALL)
+        .border_style(dash_border_style(panel_focused))
+        .title("Detail");
+    frame.render_widget(Paragraph::new("").block(detail), detail_area);
+    if let Some(terms_area) = terms_area {
+        draw_terminal_panel(frame, app, terms_area);
+    }
+}
+
+fn draw_ports_empty(frame: &mut Frame, area: Rect, term_focused: bool) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(dash_border_style(term_focused))
+        .title(Tab::Ports.title());
+    let text = Line::from(Span::styled(
+        "no forwards — press p on an instance or service, or :port <instance> <port>",
+        Style::default().add_modifier(Modifier::DIM),
+    ))
+    .alignment(Alignment::Center);
+    frame.render_widget(Paragraph::new(text).block(block), area);
+}
+
+fn draw_ports_table(
+    frame: &mut Frame,
+    app: &App,
+    rows: &[PortRow],
+    area: Rect,
+    term_focused: bool,
+) {
+    let header = Row::new(
+        ["LOCAL", "TARGET", "PROCESS", "STATE", "CONNS"]
+            .into_iter()
+            .map(Cell::from),
+    )
+    .style(Style::default().add_modifier(Modifier::DIM));
+
+    let table_rows: Vec<Row> = rows.iter().map(port_row).collect();
+
+    let widths = [
+        Constraint::Length(20),
+        Constraint::Min(24),
+        Constraint::Length(18),
+        Constraint::Length(14),
+        Constraint::Length(6),
+    ];
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(dash_border_style(term_focused))
+        .title(Tab::Ports.title());
+
+    let table = Table::new(table_rows, widths)
+        .header(header)
+        .block(block)
+        .column_spacing(1)
+        .row_highlight_style(Style::default().fg(SELECTION).add_modifier(Modifier::BOLD));
+
+    let mut state = TableState::default().with_selected(Some(app.selected()));
+    frame.render_stateful_widget(table, area, &mut state);
+}
+
+fn port_row(r: &PortRow) -> Row<'_> {
+    let process = r.process.clone().unwrap_or_else(|| "-".to_string());
+    Row::new(vec![
+        Cell::from(r.local.clone()),
+        Cell::from(r.target.clone()),
+        Cell::from(process),
+        Cell::from(Span::styled(r.state.clone(), port_state_style(&r.state))),
+        Cell::from(r.conns.to_string()),
+    ])
+}
+
+/// Color the STATE column like the siblings: active green, connecting yellow,
+/// error red; anything else uncolored.
+fn port_state_style(state: &str) -> Style {
+    if state == "active" {
+        Style::default().fg(Color::Green)
+    } else if state == "connecting" {
+        Style::default().fg(Color::Yellow)
+    } else if state.starts_with("error") {
+        Style::default().fg(Color::Red)
+    } else {
+        Style::default()
+    }
 }
 
 /// Pure tab labels for the terminal panel, one per open session: `{i+1}:{title}`
@@ -992,13 +1094,16 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
             // `r` and `s` mirror what the key would do to the selection:
             // run vs rename, stop vs start.
             Tab::Instances => format!(
-                "q quit · tab switch · ↑↓ select · ←→ fold · enter config · r {} · o vscode · s {} · l logs · t term · : cmd · ? help",
+                "q quit · tab switch · ↑↓ select · ←→ fold · enter config · r {} · o vscode · s {} · l logs · p forward · t term · : cmd · ? help",
                 app.run_rename_hint(),
                 app.stop_start_hint()
             ),
             Tab::Services => {
-                "q quit · tab switch · ↑↓ select · enter config · t term · : cmd · ? help"
+                "q quit · tab switch · ↑↓ select · enter config · t term · p forward · : cmd · ? help"
                     .to_string()
+            }
+            Tab::Ports => {
+                "q quit · tab switch · ↑↓ select · d stop forward · : port … · ? help".to_string()
             }
         },
     };

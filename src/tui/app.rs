@@ -25,7 +25,7 @@ use crate::runtime::NAME_PREFIX;
 const HELP_BODY: &str = "\
 Global
   q, ctrl-c   quit
-  tab / S-tab switch tab      1/2  jump to tab
+  tab / S-tab switch tab      1/2/3  jump to tab
   :           command prompt  ?    this help
 
 Tables (Instances / Services)
@@ -39,6 +39,11 @@ Tables (Instances / Services)
               (stops running / starts exited; s-start is a bare start —
                :start runs services + postStartCommand too; a drifted
                exited instance is rebuilt instead)
+  p           forward a port (instance / service selection prefills the prompt)
+
+Ports tab
+  ↑/k ↓/j     move selection
+  d           stop the selected forward
 
 Process rows (expanded instance)
   ←           jump to the parent instance
@@ -72,6 +77,9 @@ Command prompt (:)
   exec <instance> <cmd…>
   code <instance>   rm <instance>   rename <instance> <new-name>
   stop <instance>   start <instance>
+  port <instance> [--service s] [--address a] <[host:]port>
+              (an instance is required; a global service is reached by
+               naming any instance that references it)
   tab         complete / cycle
   ↑ ↓         history
   ctrl-u      clear line       ctrl-w  delete word
@@ -255,20 +263,22 @@ pub enum Modal {
     Logs(TextModal),
 }
 
-/// The two top-level views.
+/// The three top-level views.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tab {
     Instances,
     Services,
+    Ports,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 2] = [Tab::Instances, Tab::Services];
+    pub const ALL: [Tab; 3] = [Tab::Instances, Tab::Services, Tab::Ports];
 
     pub fn title(self) -> &'static str {
         match self {
             Tab::Instances => "Instances",
             Tab::Services => "Services",
+            Tab::Ports => "Ports",
         }
     }
 
@@ -276,6 +286,7 @@ impl Tab {
         match self {
             Tab::Instances => 0,
             Tab::Services => 1,
+            Tab::Ports => 2,
         }
     }
 }
@@ -324,11 +335,42 @@ pub struct PendingSignal {
     pub signal: Signal,
 }
 
+/// One row of the Ports tab: a live forward, projected from the forwarder's
+/// `ForwardStatus` by the event loop (step 10). Plain data with no dependency on
+/// the unix-only forward module, so [`App`] compiles on every platform.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PortRow {
+    /// Stable forward id, used to target a `d` (stop) at the right forward.
+    pub id: u64,
+    /// Host side, e.g. `"127.0.0.1:3000"`.
+    pub local: String,
+    /// Route label, e.g. `"api:3000"` or `"postgres:5432 (via instance api)"`.
+    /// Already carries the `(via …)` suffix, so the table needs no VIA column.
+    pub target: String,
+    /// Listening process (`node (pid 412)`), when known.
+    pub process: Option<String>,
+    /// Coarse state: `"active"`, `"connecting"`, or `"error: …"`.
+    pub state: String,
+    /// Open connection count.
+    pub conns: usize,
+}
+
+/// A forward the user asked for, for the event loop (step 10) to start on its
+/// worker thread. Mirrors the CLI's `(instance, service, address, spec)` inputs;
+/// `spec` is a validated `[host:]port` string.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PortRequest {
+    pub instance: String,
+    pub service: Option<String>,
+    pub address: Option<String>,
+    pub spec: String,
+}
+
 pub struct App {
     pub dir: PathBuf,
     pub tab: Tab,
     /// Selected row per tab, indexed by `Tab::index`.
-    selected: [usize; 2],
+    selected: [usize; 3],
     /// Collapsed tree groups on the Instances tab, keyed by sandbox name (and
     /// [`ORPHANS_NAME`] for the orphan group). Empty means all expanded; survives
     /// snapshot refreshes.
@@ -368,6 +410,15 @@ pub struct App {
     /// A `kill` the event loop should spawn on a background thread (the
     /// SIGTERM/SIGKILL shortcuts on a process row). Runs without suspending.
     pub pending_signal: Option<PendingSignal>,
+    /// Live forwards shown on the Ports tab, fed by the forwarder worker (step
+    /// 10). Empty until the worker reports; set via [`Self::set_ports`].
+    pub ports: Vec<PortRow>,
+    /// A forward the event loop should start on its worker thread (the `p`
+    /// shortcut / `port` prompt). Consumed by step 10; sits here until then.
+    pub pending_port: Option<PortRequest>,
+    /// Id of a forward the event loop should stop (the `d` shortcut on the Ports
+    /// tab). Consumed by step 10.
+    pub pending_unport: Option<u64>,
     /// One-line status shown in the help-bar area (e.g. `code` launch outcome).
     pub status: Option<String>,
     /// True while the config-modal divider is being dragged with the mouse.
@@ -385,7 +436,7 @@ impl App {
         Self {
             dir,
             tab: Tab::Instances,
-            selected: [0, 0],
+            selected: [0, 0, 0],
             collapsed: BTreeSet::new(),
             expanded_procs: BTreeSet::new(),
             procs: BTreeMap::new(),
@@ -399,6 +450,9 @@ impl App {
             pending_start: None,
             starting: BTreeSet::new(),
             pending_signal: None,
+            ports: Vec::new(),
+            pending_port: None,
+            pending_unport: None,
             status: None,
             dragging_divider: false,
             focus: Focus::Dashboard,
@@ -411,6 +465,13 @@ impl App {
     /// in case rows shrank. I/O-free: the caller does the collecting.
     pub fn set_snapshot(&mut self, snapshot: Snapshot) {
         self.snapshot = Some(snapshot);
+        self.clamp_selection();
+    }
+
+    /// Install the forwarder's latest rows and re-clamp the Ports selection in
+    /// case it shrank. I/O-free: the event loop (step 10) does the collecting.
+    pub fn set_ports(&mut self, ports: Vec<PortRow>) {
+        self.ports = ports;
         self.clamp_selection();
     }
 
@@ -441,6 +502,7 @@ impl App {
         match tab {
             Tab::Instances => self.visible_nodes().len(),
             Tab::Services => self.snapshot.as_ref().map_or(0, |s| s.services.len()),
+            Tab::Ports => self.ports.len(),
         }
     }
 
@@ -475,13 +537,17 @@ impl App {
     pub fn next_tab(&mut self) {
         self.tab = match self.tab {
             Tab::Instances => Tab::Services,
-            Tab::Services => Tab::Instances,
+            Tab::Services => Tab::Ports,
+            Tab::Ports => Tab::Instances,
         };
     }
 
     pub fn prev_tab(&mut self) {
-        // Only two tabs, so previous is the same toggle as next.
-        self.next_tab();
+        self.tab = match self.tab {
+            Tab::Instances => Tab::Ports,
+            Tab::Services => Tab::Instances,
+            Tab::Ports => Tab::Services,
+        };
     }
 
     fn select_up(&mut self) {
@@ -676,6 +742,7 @@ impl App {
             KeyCode::BackTab => self.prev_tab(),
             KeyCode::Char('1') => self.tab = Tab::Instances,
             KeyCode::Char('2') => self.tab = Tab::Services,
+            KeyCode::Char('3') => self.tab = Tab::Ports,
             // Enter a terminal: ctrl-] or F12. No-op with a status hint when none
             // are open.
             KeyCode::Char(']') if ctrl => self.enter_terminal(),
@@ -703,6 +770,14 @@ impl App {
                 self.stop_or_start_instance()
             }
             KeyCode::Char('l') if !on_proc => self.open_logs(),
+            // Forwarding: `p` opens the `port` prompt prefilled from the selected
+            // instance (Instances, not a process row) or service (Services); `d`
+            // stops the selected forward on the Ports tab.
+            KeyCode::Char('p') if self.tab == Tab::Instances && !on_proc => {
+                self.open_port_prompt_instance()
+            }
+            KeyCode::Char('p') if self.tab == Tab::Services => self.open_port_prompt_service(),
+            KeyCode::Char('d') if self.tab == Tab::Ports => self.stop_selected_forward(),
             KeyCode::Char('?') => self.open_help(),
             _ => {}
         }
@@ -904,6 +979,60 @@ impl App {
         self.status = None;
         let history = super::prompt::load_history();
         self.prompt = Some(Prompt::with_input(history, format!("rename {name} ")));
+    }
+
+    /// `p` (Instances tab): open the prompt prefilled `port <instance> ` for the
+    /// instance under the cursor (or a process row's parent), cursor at the end.
+    /// Sandbox / empty / orphan-group selections have no instance, so `p` is a
+    /// no-op there (nothing to forward from).
+    fn open_port_prompt_instance(&mut self) {
+        let Some(name) = self.selected_instance_name() else {
+            return;
+        };
+        self.status = None;
+        let history = super::prompt::load_history();
+        self.prompt = Some(Prompt::with_input(history, format!("port {name} ")));
+    }
+
+    /// `p` (Services tab): open the prompt prefilled `port <instance> --service
+    /// <svc> ` for the selected service, using its first `used_by` instance as the
+    /// instance slot (a global service reached via a named instance works because
+    /// the resolver falls back to another referencing instance). With no user, the
+    /// instance slot is left blank for the user to fill.
+    fn open_port_prompt_service(&mut self) {
+        let Some(row) = self
+            .snapshot
+            .as_ref()
+            .and_then(|s| s.services.get(self.selected()))
+        else {
+            return;
+        };
+        let instance = row.used_by.first().map(String::as_str).unwrap_or("");
+        let svc = row.name.clone();
+        self.status = None;
+        let history = super::prompt::load_history();
+        self.prompt =
+            Some(Prompt::with_input(history, format!("port {instance} --service {svc} ")));
+    }
+
+    /// `d` (Ports tab): stop the selected forward, queuing its id for the event
+    /// loop (step 10) to remove on its worker thread. No-op with no row selected.
+    fn stop_selected_forward(&mut self) {
+        let Some(row) = self.ports.get(self.selected()) else {
+            return;
+        };
+        self.status = Some(format!("stopping {}", row.local));
+        self.pending_unport = Some(row.id);
+    }
+
+    /// Take the pending forward request for the event loop to start, if any.
+    pub fn take_pending_port(&mut self) -> Option<PortRequest> {
+        self.pending_port.take()
+    }
+
+    /// Take the pending forward-stop id for the event loop to remove, if any.
+    pub fn take_pending_unport(&mut self) -> Option<u64> {
+        self.pending_unport.take()
     }
 
     /// `o` (Instances tab): VS Code attach for the instance under the cursor,
@@ -1171,6 +1300,17 @@ impl App {
                 if let Some(action) = prompt.parse() {
                     let line = prompt.input().to_string();
                     super::prompt::append_history(&line);
+                    // `port` is not a suspending action: it goes to the forwarder
+                    // worker (step 10) via `pending_port`, and the TUI stays up on
+                    // the Ports tab. Handled before the generic `pending_action`
+                    // path so the loop never suspends the screen for it.
+                    if let PromptAction::Port { instance, service, address, spec } = action {
+                        self.status = Some(format!("forwarding {spec} …"));
+                        self.pending_port = Some(PortRequest { instance, service, address, spec });
+                        self.tab = Tab::Ports;
+                        self.prompt = None;
+                        return;
+                    }
                     // `rebuild`/`recreate` parses tab-agnostically as an instance
                     // action; on the Services tab it targets the named service
                     // instead. Rewrite here where the tab is known, keeping the
@@ -1275,6 +1415,7 @@ impl App {
                 spec::ArgValue::Instance => instances.to_vec(),
                 spec::ArgValue::InstanceOrService if tab == Tab::Services => services.to_vec(),
                 spec::ArgValue::InstanceOrService => instances.to_vec(),
+                spec::ArgValue::Service => services.to_vec(),
                 spec::ArgValue::Sandbox => sandboxes.to_vec(),
                 spec::ArgValue::Branch => {
                     let sandbox = cmd_spec
@@ -1469,6 +1610,8 @@ impl App {
                     .to_string();
                 Ok((title, container, false))
             }
+            // The Ports tab has no terminal target: forwards aren't containers.
+            Tab::Ports => Err("terminal: not available on the Ports tab".to_string()),
         }
     }
 
@@ -1615,10 +1758,13 @@ impl App {
                 let target = service_inspect_target(&row.containers);
                 (Self::build_service_view(&self.dir, &row.name), target)
             }
+            // The Ports tab has no config to explore; `enter`/`e` is a no-op.
+            Tab::Ports => return,
         };
         let placeholder = match self.tab {
             Tab::Instances => "(no running instance)",
             Tab::Services => "(no containers)",
+            Tab::Ports => "",
         };
         set_inspect(&mut view, target, placeholder);
         self.modal = Modal::Config(view);
@@ -1762,17 +1908,206 @@ mod tests {
         let mut app = new_app();
         assert_eq!(app.tab, Tab::Instances);
 
+        // `tab` cycles forward over all three tabs and wraps.
         app.on_key(key(KeyCode::Tab));
         assert_eq!(app.tab, Tab::Services);
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.tab, Tab::Ports);
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.tab, Tab::Instances);
 
+        // `S-tab` cycles backward and wraps (no longer a toggle).
+        app.on_key(key(KeyCode::BackTab));
+        assert_eq!(app.tab, Tab::Ports);
+        app.on_key(key(KeyCode::BackTab));
+        assert_eq!(app.tab, Tab::Services);
         app.on_key(key(KeyCode::BackTab));
         assert_eq!(app.tab, Tab::Instances);
 
+        // Number keys jump directly.
         app.on_key(key(KeyCode::Char('2')));
         assert_eq!(app.tab, Tab::Services);
-
+        app.on_key(key(KeyCode::Char('3')));
+        assert_eq!(app.tab, Tab::Ports);
         app.on_key(key(KeyCode::Char('1')));
         assert_eq!(app.tab, Tab::Instances);
+    }
+
+    /// `n` synthetic forward rows with ids `0..n`.
+    fn port_rows(n: usize) -> Vec<PortRow> {
+        (0..n)
+            .map(|i| PortRow {
+                id: i as u64,
+                local: format!("127.0.0.1:{}", 3000 + i),
+                target: format!("api:{}", 3000 + i),
+                process: None,
+                state: "active".into(),
+                conns: 0,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn set_ports_reclamps_selection() {
+        let mut app = new_app();
+        app.tab = Tab::Ports;
+        app.set_ports(port_rows(3));
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Down)); // last row (idx 2)
+        assert_eq!(app.selected(), 2);
+
+        // Shrinking to one row re-clamps to the last valid index.
+        app.set_ports(port_rows(1));
+        assert_eq!(app.selected(), 0);
+
+        // Emptying re-clamps to 0.
+        app.set_ports(port_rows(0));
+        assert_eq!(app.selected(), 0);
+    }
+
+    #[test]
+    fn port_prompt_sets_pending_port_not_action() {
+        let mut app = new_app();
+        app.set_snapshot(snapshot_with(1));
+        app.on_key(key(KeyCode::Char(':')));
+        for c in "port api 3000".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        app.on_key(key(KeyCode::Enter));
+        // Routed to pending_port (worker), never pending_action (suspend path).
+        assert_eq!(app.take_pending_action(), None);
+        assert_eq!(
+            app.take_pending_port(),
+            Some(PortRequest {
+                instance: "api".into(),
+                service: None,
+                address: None,
+                spec: "3000".into(),
+            })
+        );
+        // Submitting a forward switches to the Ports tab with a status line.
+        assert_eq!(app.tab, Tab::Ports);
+        assert_eq!(app.status.as_deref(), Some("forwarding 3000 …"));
+    }
+
+    #[test]
+    fn port_prompt_carries_flags() {
+        let mut app = new_app();
+        app.set_snapshot(snapshot_with(1));
+        app.on_key(key(KeyCode::Char(':')));
+        for c in "port api --service pg --address 0.0.0.0 8080:5432".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(
+            app.take_pending_port(),
+            Some(PortRequest {
+                instance: "api".into(),
+                service: Some("pg".into()),
+                address: Some("0.0.0.0".into()),
+                spec: "8080:5432".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn port_prompt_bad_spec_errors_without_request() {
+        let mut app = new_app();
+        app.set_snapshot(snapshot_with(1));
+        app.on_key(key(KeyCode::Char(':')));
+        for c in "port api 0".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        app.on_key(key(KeyCode::Enter));
+        // Parse error keeps the prompt open, sets no request, and stays put.
+        assert!(app.prompt.is_some());
+        assert!(prompt(&app).error.is_some());
+        assert_eq!(app.take_pending_port(), None);
+        assert_eq!(app.tab, Tab::Instances);
+    }
+
+    #[test]
+    fn port_completion_service_and_instance() {
+        let instances = vec!["api".to_string()];
+        let services = vec!["pg".to_string(), "redis".to_string()];
+        // First positional completes instances.
+        assert_eq!(
+            App::candidates_for(Tab::Instances, 1, &toks("port"), &[], &instances, &services, None),
+            instances
+        );
+        // `--service` value completes service names, on any tab.
+        assert_eq!(
+            App::candidates_for(
+                Tab::Instances,
+                3,
+                &toks("port api --service"),
+                &[],
+                &instances,
+                &services,
+                None,
+            ),
+            services
+        );
+    }
+
+    #[test]
+    fn p_on_instance_prefills_port_prompt() {
+        let mut app = new_app();
+        app.set_snapshot(snapshot_with(1)); // [Sandbox(0), inst0]
+        app.on_key(key(KeyCode::Down)); // onto inst0
+        app.on_key(key(KeyCode::Char('p')));
+        let p = prompt(&app);
+        assert_eq!(p.input(), "port inst0 ");
+        assert_eq!(p.cursor(), "port inst0 ".chars().count());
+    }
+
+    #[test]
+    fn p_on_sandbox_is_noop() {
+        let mut app = new_app();
+        app.set_snapshot(snapshot_with(1)); // cursor on Sandbox(0)
+        app.on_key(key(KeyCode::Char('p')));
+        assert!(app.prompt.is_none());
+    }
+
+    #[test]
+    fn p_on_service_prefills_with_used_by_instance() {
+        let mut app = new_app();
+        let mut snap = service_snapshot(Vec::new());
+        snap.services[0].used_by = vec!["api".into(), "web".into()];
+        app.set_snapshot(snap);
+        app.tab = Tab::Services;
+        app.on_key(key(KeyCode::Char('p')));
+        // First used_by instance fills the instance slot; service via --service.
+        assert_eq!(prompt(&app).input(), "port api --service svc ");
+    }
+
+    #[test]
+    fn p_on_service_without_used_by_leaves_instance_blank() {
+        let mut app = new_app();
+        app.set_snapshot(service_snapshot(Vec::new())); // used_by empty
+        app.tab = Tab::Services;
+        app.on_key(key(KeyCode::Char('p')));
+        assert_eq!(prompt(&app).input(), "port  --service svc ");
+    }
+
+    #[test]
+    fn d_on_ports_sets_pending_unport() {
+        let mut app = new_app();
+        app.tab = Tab::Ports;
+        app.set_ports(port_rows(3));
+        app.on_key(key(KeyCode::Down)); // onto id 1
+        app.on_key(key(KeyCode::Char('d')));
+        assert_eq!(app.take_pending_unport(), Some(1));
+        assert_eq!(app.status.as_deref(), Some("stopping 127.0.0.1:3001"));
+    }
+
+    #[test]
+    fn d_elsewhere_does_nothing_new() {
+        let mut app = new_app();
+        app.set_snapshot(snapshot_with(1)); // Instances tab
+        app.on_key(key(KeyCode::Down)); // onto inst0
+        app.on_key(key(KeyCode::Char('d')));
+        assert_eq!(app.take_pending_unport(), None);
     }
 
     #[test]

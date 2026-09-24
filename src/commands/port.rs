@@ -394,16 +394,15 @@ pub fn resolver(
     })
 }
 
-/// Parse a CLI port spec into `(host binding, container port)`.
-///
-/// - `<port>` → `(Prefer(port), port)`: same host port, OS-assigned fallback if
-///   taken (docs/port-forwarding.md, _Binding_).
-/// - `<host>:<port>` → `(Fixed(host), port)`: explicit host port, fail if taken.
-///
-/// Both ports must be non-zero decimals. Extra colons, empty parts, or garbage
+/// Validate a port spec's shape, returning `(host_port?, container_port)` on
+/// success. `<port>` → `(None, port)`; `<host>:<port>` → `(Some(host), port)`.
+/// Both ports must be non-zero decimals; extra colons, empty parts, or garbage
 /// are rejected with a message that names the offending spec's shape.
-#[cfg(unix)]
-pub fn parse_port_spec(spec: &str) -> Result<(HostPort, u16), String> {
+///
+/// Platform-independent (no `HostPort`), so the TUI can validate the same way
+/// the CLI does without pulling in the unix-only forwarder types. [`parse_port_spec`]
+/// wraps it into `HostPort` on unix.
+pub fn validate_port_spec(spec: &str) -> Result<(Option<u16>, u16), String> {
     let parse = |s: &str, what: &str| -> Result<u16, String> {
         if s.is_empty() {
             return Err(format!("port spec `{spec}`: {what} is empty"));
@@ -415,16 +414,24 @@ pub fn parse_port_spec(spec: &str) -> Result<(HostPort, u16), String> {
         }
     };
     match spec.split(':').collect::<Vec<_>>().as_slice() {
-        [port] => {
-            let p = parse(port, "port")?;
-            Ok((HostPort::Prefer(p), p))
-        }
-        [host, container] => {
-            let h = parse(host, "host port")?;
-            let c = parse(container, "container port")?;
-            Ok((HostPort::Fixed(h), c))
-        }
+        [port] => Ok((None, parse(port, "port")?)),
+        [host, container] => Ok((Some(parse(host, "host port")?), parse(container, "container port")?)),
         _ => Err(format!("port spec `{spec}`: expected `<port>` or `<host>:<port>`")),
+    }
+}
+
+/// Parse a CLI port spec into `(host binding, container port)`.
+///
+/// - `<port>` → `(Prefer(port), port)`: same host port, OS-assigned fallback if
+///   taken (docs/port-forwarding.md, _Binding_).
+/// - `<host>:<port>` → `(Fixed(host), port)`: explicit host port, fail if taken.
+///
+/// Shape validation is shared with the TUI via [`validate_port_spec`].
+#[cfg(unix)]
+pub fn parse_port_spec(spec: &str) -> Result<(HostPort, u16), String> {
+    match validate_port_spec(spec)? {
+        (None, p) => Ok((HostPort::Prefer(p), p)),
+        (Some(h), c) => Ok((HostPort::Fixed(h), c)),
     }
 }
 

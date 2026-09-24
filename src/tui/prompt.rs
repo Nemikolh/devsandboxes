@@ -39,6 +39,10 @@ pub enum PromptAction {
     /// backing containers. The parser emits [`PromptAction::Rebuild`]
     /// tab-agnostically; `App` rewrites it to this on the Services tab.
     ServiceRebuild { name: String },
+    /// `port <instance> [--service s] [--address a] <[host:]port>`: add a forward.
+    /// `App` turns this into a `pending_port` request (not a suspending
+    /// `pending_action`) so the event loop never suspends the TUI for it.
+    Port { instance: String, service: Option<String>, address: Option<String>, spec: String },
 }
 
 /// In-flight tab-completion over a single token.
@@ -400,6 +404,20 @@ fn parse_line(line: &str) -> Result<PromptAction, String> {
             instance: args.positionals.remove(0),
             force: args.flag("--force"),
         }),
+        "port" => {
+            let instance = args.positionals.remove(0);
+            // The second positional is the `[host:]port` spec. Validate its shape
+            // here (same rules as the CLI) so a bad spec is an inline prompt error,
+            // not a request the loop has to reject later.
+            let spec = args.positionals.remove(0);
+            crate::commands::port::validate_port_spec(&spec)?;
+            Ok(PromptAction::Port {
+                instance,
+                service: args.value("--service").map(str::to_string),
+                address: args.value("--address").map(str::to_string),
+                spec,
+            })
+        }
         other => unreachable!("spec `{other}` has no PromptAction mapping"),
     }
 }
@@ -687,6 +705,45 @@ mod tests {
         assert!(parse_line("rebuild --bogus box").is_err());
         assert!(parse_line("rebuild a b").is_err());
         assert!(parse_line("recreate").is_err());
+    }
+
+    #[test]
+    fn parse_port_variants() {
+        assert_eq!(
+            parse_line("port api 3000"),
+            Ok(PromptAction::Port {
+                instance: "api".into(),
+                service: None,
+                address: None,
+                spec: "3000".into(),
+            })
+        );
+        assert_eq!(
+            parse_line("port api --service postgres 5432"),
+            Ok(PromptAction::Port {
+                instance: "api".into(),
+                service: Some("postgres".into()),
+                address: None,
+                spec: "5432".into(),
+            })
+        );
+        assert_eq!(
+            parse_line("port api --address 0.0.0.0 8080:3000"),
+            Ok(PromptAction::Port {
+                instance: "api".into(),
+                service: None,
+                address: Some("0.0.0.0".into()),
+                spec: "8080:3000".into(),
+            })
+        );
+        // An instance is required; the port spec is required.
+        assert!(parse_line("port").is_err());
+        assert!(parse_line("port api").is_err());
+        assert!(parse_line("port api --service").is_err());
+        // Bad spec shape is a parse error, surfaced inline.
+        assert!(parse_line("port api 0").is_err());
+        assert!(parse_line("port api abc").is_err());
+        assert!(parse_line("port api 8080:0").is_err());
     }
 
     #[test]
