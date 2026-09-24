@@ -9,10 +9,9 @@
 
 #[cfg(unix)]
 pub mod bridge;
-// The forwarder engine (step 5); its public surface is exercised by the CLI
-// and TUI in later steps (docs/port-forwarding.md, steps 7/9-10).
+// The forwarder engine (step 5); the CLI (`devsandbox port`) drives its full
+// public surface, the TUI Ports tab reuses it (docs/port-forwarding.md).
 #[cfg(unix)]
-#[allow(dead_code)]
 pub mod forward;
 #[cfg(unix)]
 mod mux;

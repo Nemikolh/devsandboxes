@@ -165,6 +165,29 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,
     },
+    /// Forward a container port to the host until Ctrl-C
+    ///
+    /// Each `<port>` binds the same port on the host (falling back to a free
+    /// port if it's taken); `<host>:<port>` binds an explicit host port and
+    /// fails if it's in use. Several specs forward in parallel.
+    ///
+    ///     devsandbox port api 3000
+    ///     devsandbox port api --service postgres 5432
+    ///     devsandbox port --service redis 6379
+    Port {
+        /// Instance name, sandbox config name, or repository folder name;
+        /// omit only with `--service <global-svc>`
+        name: Option<String>,
+        /// Forward a service's port instead of the instance's own; a global
+        /// service needs no instance name, an isolated one does
+        #[arg(long)]
+        service: Option<String>,
+        /// Host address to bind (use `0.0.0.0` to expose beyond loopback)
+        #[arg(long, default_value = "127.0.0.1")]
+        address: std::net::IpAddr,
+        /// Ports to forward, each `<port>` or `<host>:<port>` (at least one)
+        ports: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -219,6 +242,17 @@ fn main() -> Result<()> {
         Command::Status { json: _ } => commands::status::status(&cli.dir),
         Command::Exec { interactive, tty, name, command } => {
             commands::exec::exec(&name, interactive, tty, &command)
+        }
+        Command::Port { name, service, address, ports } => {
+            #[cfg(unix)]
+            {
+                commands::port::port(cli.dir, name, service, address, ports)
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = (name, service, address, ports);
+                anyhow::bail!("port forwarding is unix-only for now")
+            }
         }
     }
 }

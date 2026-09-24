@@ -15,9 +15,17 @@
 //!   the chosen container. Reloading each call is what lets a `service rebuild`
 //!   or an instance restart heal without restarting the forward.
 
+// Forwarding itself is unix-only (the mux is), so off unix only the planner
+// compiles and nothing calls it.
+#![cfg_attr(not(unix), allow(dead_code))]
+
 use std::collections::BTreeSet;
 
+use anyhow::Result;
+
 use crate::config::{Config, ServiceScope};
+#[cfg(unix)]
+use crate::devsbd::forward::HostPort;
 use crate::state::State;
 
 use super::services;
@@ -292,6 +300,208 @@ pub fn resolver(
     })
 }
 
+/// Parse a CLI port spec into `(host binding, container port)`.
+///
+/// - `<port>` → `(Prefer(port), port)`: same host port, OS-assigned fallback if
+///   taken (docs/port-forwarding.md, _Binding_).
+/// - `<host>:<port>` → `(Fixed(host), port)`: explicit host port, fail if taken.
+///
+/// Both ports must be non-zero decimals. Extra colons, empty parts, or garbage
+/// are rejected with a message that names the offending spec's shape.
+#[cfg(unix)]
+pub fn parse_port_spec(spec: &str) -> Result<(HostPort, u16), String> {
+    let parse = |s: &str, what: &str| -> Result<u16, String> {
+        if s.is_empty() {
+            return Err(format!("port spec `{spec}`: {what} is empty"));
+        }
+        match s.parse::<u16>() {
+            Ok(0) => Err(format!("port spec `{spec}`: {what} must not be 0")),
+            Ok(p) => Ok(p),
+            Err(_) => Err(format!("port spec `{spec}`: {what} `{s}` is not a port number")),
+        }
+    };
+    match spec.split(':').collect::<Vec<_>>().as_slice() {
+        [port] => {
+            let p = parse(port, "port")?;
+            Ok((HostPort::Prefer(p), p))
+        }
+        [host, container] => {
+            let h = parse(host, "host port")?;
+            let c = parse(container, "container port")?;
+            Ok((HostPort::Fixed(h), c))
+        }
+        _ => Err(format!("port spec `{spec}`: expected `<port>` or `<host>:<port>`")),
+    }
+}
+
+/// A stderr status line for a forward whose coarse state changed, or `None` when
+/// there's nothing worth printing. Pure over `(previous, new, local_port)` so
+/// the poll loop can dedupe without re-printing an unchanged state. `Active` is
+/// silent — the initial `->` line already announced it; only `Connecting`
+/// (a retry in flight) and `Error` (with the reason) are surfaced.
+#[cfg(unix)]
+fn state_change_line(
+    prev: &crate::devsbd::forward::ForwardState,
+    new: &crate::devsbd::forward::ForwardState,
+    local_port: u16,
+) -> Option<String> {
+    use crate::devsbd::forward::ForwardState::*;
+    if prev == new {
+        return None;
+    }
+    match new {
+        Active => Some(format!("note: {local_port}: reconnected")),
+        Connecting => Some(format!("note: {local_port}: reconnecting")),
+        Error(reason) => Some(format!("note: {local_port}: {reason}")),
+    }
+}
+
+/// clap fills the optional leading `name` positional first, so
+/// `port --service redis 6379` arrives as `name = "6379"`. With `--service`, a
+/// leading positional that parses as a port spec is a port, not an instance
+/// (instance names that are bare port numbers aren't worth the ambiguity).
+#[cfg(unix)]
+fn split_target(name: Option<String>, has_service: bool, mut ports: Vec<String>) -> (Option<String>, Vec<String>) {
+    match name {
+        Some(n) if has_service && parse_port_spec(&n).is_ok() => {
+            ports.insert(0, n);
+            (None, ports)
+        }
+        other => (other, ports),
+    }
+}
+
+/// CLI entry point for `devsandbox port`. Starts one forward per spec, waits for
+/// each to reach its first outcome, prints the mapping, then blocks until SIGINT
+/// (unix-only). See docs/port-forwarding.md, step 7.
+#[cfg(unix)]
+pub fn port(
+    dir: std::path::PathBuf,
+    name: Option<String>,
+    service: Option<String>,
+    address: std::net::IpAddr,
+    ports: Vec<String>,
+) -> Result<()> {
+    use std::time::{Duration, Instant};
+
+    use anyhow::{bail, Context};
+
+    use crate::devsbd::forward::{Forward, ForwardSpec, ForwardState};
+
+    let (name, ports) = split_target(name, service.is_some(), ports);
+    if name.is_none() && service.is_none() {
+        bail!("name an instance or a service: `devsandbox port <instance> <port>` or `devsandbox port --service <svc> <port>`");
+    }
+    if ports.is_empty() {
+        bail!("give at least one port to forward, e.g. `devsandbox port <instance> 3000`");
+    }
+
+    // Parse every spec up front so a typo fails before we bind or touch docker.
+    let specs: Vec<(HostPort, u16)> = ports
+        .iter()
+        .map(|s| parse_port_spec(s))
+        .collect::<Result<_, _>>()
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+    // Resolve the user-supplied name once, on this (TTY) thread — the resolver
+    // closure runs on the forwarder's worker thread and must never prompt.
+    let instance_key = match &name {
+        Some(name) => {
+            let state = State::load()?;
+            Some(super::resolve_instance(&state, name)?)
+        }
+        None => None,
+    };
+
+    let mut forwards: Vec<Forward> = Vec::with_capacity(specs.len());
+    for (host_port, container_port) in &specs {
+        let resolve = resolver(dir.clone(), instance_key.clone(), service.clone(), *container_port);
+        let forward = Forward::start(ForwardSpec { bind: address, host_port: *host_port, resolve })
+            .with_context(|| match host_port {
+                HostPort::Fixed(p) => format!("host port {p} is in use"),
+                HostPort::Prefer(p) => format!("binding host port {p}"),
+            })?;
+        forwards.push(forward);
+    }
+
+    // Wait for each forward's first outcome (Active or Error), with a bound, so
+    // a bad route fails fast instead of hanging. Any Error aborts (drops all).
+    let deadline = Instant::now() + Duration::from_secs(20);
+    for forward in &forwards {
+        loop {
+            let status = forward.status();
+            match &status.state {
+                ForwardState::Active => break,
+                ForwardState::Error(reason) => {
+                    let label = first_outcome_label(&status);
+                    bail!("{label}: {reason}");
+                }
+                ForwardState::Connecting => {
+                    if Instant::now() >= deadline {
+                        let label = first_outcome_label(&status);
+                        bail!("{label}: timed out waiting to connect");
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+        }
+    }
+
+    // All active: print the mappings, then announce we're blocking.
+    let mut prev_states: Vec<ForwardState> = Vec::with_capacity(forwards.len());
+    for (forward, (host_port, _)) in forwards.iter().zip(&specs) {
+        let status = forward.status();
+        println!("{}", mapping_line(&status, *host_port));
+        prev_states.push(status.state.clone());
+    }
+    eprintln!("forwarding; press Ctrl-C to stop");
+
+    // Block until SIGINT (kills this process group, so the exec children die
+    // with us — a plain poll loop needs no signal crate). Surface state changes
+    // and per-connection notes, deduplicated.
+    loop {
+        std::thread::sleep(Duration::from_millis(250));
+        for (forward, prev) in forwards.iter().zip(&mut prev_states) {
+            let status = forward.status();
+            let local_port = status.local_addr.port();
+            if let Some(line) = state_change_line(prev, &status.state, local_port) {
+                eprintln!("{line}");
+            }
+            *prev = status.state.clone();
+            for note in forward.drain_notes() {
+                eprintln!("note: {local_port}: {note}");
+            }
+        }
+    }
+}
+
+/// Best label for a forward that failed its first outcome: the resolved route
+/// label once known, else the bound local address (the route may never have
+/// resolved, so `route_label` can be empty).
+#[cfg(unix)]
+fn first_outcome_label(status: &crate::devsbd::forward::ForwardStatus) -> String {
+    if status.route_label.is_empty() {
+        status.local_addr.to_string()
+    } else {
+        status.route_label.clone()
+    }
+}
+
+/// The stdout mapping line for an active forward: `127.0.0.1:3000 -> api:3000`.
+/// Uses the real bound port (a `Prefer` fallback shows the OS-assigned port);
+/// when it differs from the requested port, say why.
+#[cfg(unix)]
+fn mapping_line(status: &crate::devsbd::forward::ForwardStatus, host_port: HostPort) -> String {
+    let local = status.local_addr;
+    let base = format!("{local} -> {}", status.route_label);
+    match host_port {
+        HostPort::Prefer(requested) if local.port() != requested => {
+            format!("{base} ({requested} was in use)")
+        }
+        _ => base,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -556,6 +766,77 @@ image = "node"
                 container: "devsandbox-app-1".into(),
                 alias: "cache".into(),
             }
+        );
+    }
+
+    // ---- split_target ----
+
+    #[test]
+    fn split_target_moves_a_leading_port_to_ports_only_with_service() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        // `port --service redis 6379`: clap put the port in `name`.
+        assert_eq!(split_target(Some("6379".into()), true, vec![]), (None, s(&["6379"])));
+        assert_eq!(split_target(Some("1:2".into()), true, s(&["3"])), (None, s(&["1:2", "3"])));
+        // A real instance name stays a name.
+        assert_eq!(split_target(Some("api".into()), true, s(&["5432"])), (Some("api".into()), s(&["5432"])));
+        // Without --service a numeric name is left alone (the port guard reports it).
+        assert_eq!(split_target(Some("3000".into()), false, vec![]), (Some("3000".into()), vec![]));
+    }
+
+    // ---- parse_port_spec ----
+
+    #[test]
+    fn parse_port_spec_table() {
+        use HostPort::{Fixed, Prefer};
+
+        let ok: &[(&str, (HostPort, u16))] = &[
+            ("3000", (Prefer(3000), 3000)),
+            ("8080:3000", (Fixed(8080), 3000)),
+            ("1:65535", (Fixed(1), 65535)),
+        ];
+        for (spec, want) in ok {
+            assert_eq!(parse_port_spec(spec), Ok(*want), "spec `{spec}`");
+        }
+
+        let err: &[&str] = &[
+            "",           // empty
+            "0",          // zero container/host port
+            "8080:0",     // zero container port
+            "0:3000",     // zero host port
+            "abc",        // non-numeric
+            "8080:abc",   // non-numeric container
+            "8080:3000:1", // extra colon
+            ":3000",      // empty host part
+            "8080:",      // empty container part
+            "70000",      // out of u16 range
+        ];
+        for spec in err {
+            assert!(parse_port_spec(spec).is_err(), "spec `{spec}` should be rejected");
+        }
+    }
+
+    // ---- state_change_line ----
+
+    #[test]
+    fn state_change_line_transitions() {
+        use crate::devsbd::forward::ForwardState::*;
+
+        // No change → nothing.
+        assert_eq!(state_change_line(&Active, &Active, 3000), None);
+        assert_eq!(state_change_line(&Connecting, &Connecting, 3000), None);
+
+        // Transitions carry the local port and (for Error) the reason.
+        assert_eq!(
+            state_change_line(&Active, &Connecting, 3000),
+            Some("note: 3000: reconnecting".to_string())
+        );
+        assert_eq!(
+            state_change_line(&Connecting, &Active, 3000),
+            Some("note: 3000: reconnected".to_string())
+        );
+        assert_eq!(
+            state_change_line(&Active, &Error("dead".into()), 5432),
+            Some("note: 5432: dead".to_string())
         );
     }
 }

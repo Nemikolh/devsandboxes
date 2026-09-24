@@ -86,6 +86,9 @@ pub struct ForwardStatus {
     pub local_addr: SocketAddr,
     pub route_label: String,
     pub state: ForwardState,
+    // Read by the TUI Ports tab (docs/port-forwarding.md, steps 9-10); the CLI
+    // doesn't surface it.
+    #[allow(dead_code)]
     pub open_conns: usize,
 }
 

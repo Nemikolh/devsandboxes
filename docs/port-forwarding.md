@@ -326,7 +326,7 @@ New `src/commands/port.rs` (resolution only, no CLI yet).
 - Tests: table tests over the pure resolver (isolated/global × instance
   given or not × running or not × helper present or not).
 
-### Step 7 — CLI `devsandbox port` [ ]
+### Step 7 — CLI `devsandbox port` [x]
 
 `src/main.rs`, `src/commands/port.rs`, `src/commands/mod.rs`.
 

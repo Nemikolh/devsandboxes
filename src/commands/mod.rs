@@ -2,9 +2,6 @@ pub mod exec;
 pub mod inspect;
 pub mod logs;
 pub mod ls;
-// Route resolution only (docs/port-forwarding.md, step 6); the CLI wires it in
-// step 7, so its public surface is unused for now.
-#[allow(dead_code)]
 pub mod port;
 pub mod ps;
 pub mod rebuild;
