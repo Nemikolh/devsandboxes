@@ -1063,20 +1063,12 @@ image = "node"
 
     use std::process::Command;
 
-    fn docker_ok() -> bool {
-        matches!(Command::new("docker").arg("info").output(), Ok(o) if o.status.success())
-    }
-
     /// Docker-gated: a container with `lsof` running a loopback listener yields
     /// the listening process; a container without `lsof` yields `None`. Skips
-    /// cleanly without docker, without network (apk fails), or on any hiccup.
-    #[test]
-    fn listening_procs_with_docker() {
-        let name_test = "listening_procs_with_docker";
-        let skip = |why: &str| eprintln!("skipping {name_test}: {why}");
-        if !docker_ok() {
-            return skip("docker unavailable");
-        }
+    /// (fails on CI) without docker, without network (apk fails), or on any
+    /// hiccup.
+    #[test_utils::docker_test]
+    fn listening_procs_with_docker() -> Result<(), &'static str> {
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -1093,7 +1085,7 @@ image = "node"
         };
         let run_ok = |args: &[&str]| matches!(Command::new("docker").args(args).output(), Ok(o) if o.status.success());
 
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::test_support::with_cleanup(cleanup, || {
             // Listener: keep the container up on a trivial command, then add
             // lsof + a *real* nc (netcat-openbsd, so lsof reports the command
             // as `nc`, not `busybox`) and start the listener as a distinct pid.
@@ -1122,13 +1114,7 @@ image = "node"
             // No lsof in this container → None, never an error.
             assert!(run_ok(&["run", "-d", "--name", &without, "alpine:3.20", "sleep", "300"]));
             assert_eq!(listening_procs(&without, 8080), None, "no lsof → None");
-            Ok::<(), &str>(())
-        }));
-        cleanup();
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(why)) => skip(why),
-            Err(panic) => std::panic::resume_unwind(panic),
-        }
+            Ok(())
+        })
     }
 }

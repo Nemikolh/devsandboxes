@@ -414,6 +414,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "test-utils",
  "toml",
  "tui-term",
  "vt100",
@@ -1641,6 +1642,15 @@ dependencies = [
  "wezterm-dynamic",
  "wezterm-input-types",
  "winapi",
+]
+
+[[package]]
+name = "test-utils"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]

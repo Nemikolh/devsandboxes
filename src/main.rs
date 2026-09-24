@@ -6,6 +6,8 @@ mod render;
 mod runtime;
 mod snapshot;
 mod state;
+#[cfg(test)]
+mod test_support;
 mod tui;
 
 use std::io::IsTerminal;

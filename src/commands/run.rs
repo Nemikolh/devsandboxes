@@ -2404,17 +2404,10 @@ chmod +x ./devcontainer-features-install.sh && \
     /// (no network) using the pure generators, then runs it and checks the option
     /// value and remote user landed. Skips (with a message) when `docker info`
     /// fails — so it's a no-op in a sandbox without docker, but exercises the real
-    /// build on CI.
-    #[test]
-    fn derived_image_builds_with_docker() {
+    /// build on CI (where it fails instead of skipping).
+    #[test_utils::docker_test]
+    fn derived_image_builds_with_docker() -> Result<(), &'static str> {
         use std::process::Command;
-
-        let probe = Command::new("docker").arg("info").output();
-        let docker_ok = matches!(probe, Ok(o) if o.status.success());
-        if !docker_ok {
-            eprintln!("skipping derived_image_builds_with_docker: docker unavailable");
-            return;
-        }
 
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2494,5 +2487,6 @@ chmod +x ./devcontainer-features-install.sh && \
         cleanup(&ctx, &tag);
         assert!(ok, "docker run failed: {}", String::from_utf8_lossy(&run.stderr));
         assert_eq!(stdout.trim(), "myopt=chosen remote=root env=from-env", "marker: {stdout}");
+        Ok(())
     }
 }

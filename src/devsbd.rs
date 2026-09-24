@@ -293,14 +293,9 @@ mod tests {
     /// Docker-gated, and skipped when no helper is embedded: installs into a
     /// throwaway alpine container, checks the hash-matching no-op, then the
     /// wrong-arch-first retry.
-    #[test]
-    fn installs_into_container_with_docker() {
+    #[test_utils::docker_test(helper)]
+    fn installs_into_container_with_docker() -> Result<(), &'static str> {
         use std::process::Command;
-        let docker_ok = matches!(Command::new("docker").arg("info").output(), Ok(o) if o.status.success());
-        if !docker_ok || hash(Arch::host()).is_none() {
-            eprintln!("skipping installs_into_container_with_docker: docker or embedded helper unavailable");
-            return;
-        }
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -316,7 +311,10 @@ mod tests {
             String::from_utf8_lossy(&out.stdout).trim().to_string()
         };
 
-        let result = std::panic::catch_unwind(|| {
+        let cleanup = || {
+            let _ = Command::new("docker").args(["rm", "-f", &name]).output();
+        };
+        crate::test_support::with_cleanup(cleanup, || {
             let arch = install(&name, None).unwrap();
             assert_eq!(installed_hash(&name).as_deref(), hash(arch));
             // Current helper: no rewrite (mv would change the inode).
@@ -329,8 +327,7 @@ mod tests {
             let retried = install(&name, Some(Arch::host().other())).unwrap();
             assert_eq!(installed_hash(&name).as_deref(), hash(retried));
         });
-        let _ = Command::new("docker").args(["rm", "-f", &name]).output();
-        result.unwrap();
+        Ok(())
     }
 
     #[test]
@@ -344,16 +341,13 @@ mod tests {
     /// after a protocol change (the blob's built-in `VERSION` wouldn't match
     /// this crate's). Skipped when no helper is embedded (`cargo install`).
     #[cfg(target_os = "linux")]
-    #[test]
-    fn embedded_host_helper_reports_version() {
+    #[test_utils::helper_test]
+    fn embedded_host_helper_reports_version() -> Result<(), &'static str> {
         use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
         use std::process::Command;
 
-        let Some(want_hash) = hash(Arch::host()) else {
-            eprintln!("skipping embedded_host_helper_reports_version: no helper embedded");
-            return;
-        };
+        let want_hash = hash(Arch::host()).expect("gated on Need::Helper");
         let bytes = blob(Arch::host()).expect("blob present when hash is");
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -387,5 +381,6 @@ mod tests {
             format!("devsbd {} {want_hash}", proto::VERSION),
             "stale target/devsbd? rerun scripts/build-devsbd.sh",
         );
+        Ok(())
     }
 }

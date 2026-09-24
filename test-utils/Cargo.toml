@@ -1,0 +1,15 @@
+[package]
+name = "test-utils"
+version = "0.1.0"
+edition = "2024"
+description = "Test-only proc macros for devsandbox (path dev-dependency, never published)."
+license = "MIT"
+publish = false
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full"] }

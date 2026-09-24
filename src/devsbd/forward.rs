@@ -663,7 +663,7 @@ mod tests {
 
     // ---- docker-gated end-to-end ----
 
-    use crate::devsbd::{hash as blob_hash, install, Arch};
+    use crate::devsbd::{install, Arch};
     use std::process::Command;
 
     fn ok(cmd: &mut Command) -> bool {
@@ -705,15 +705,9 @@ mod tests {
     /// container. Round-trips a small message, then 20 MiB (written and read
     /// concurrently so the echo drains both ways), then several concurrent
     /// clients. The server (`nc -lk … -e cat`) is the container's main command
-    /// so a later `docker restart` brings it back. Skips cleanly without
-    /// docker or an embedded helper.
-    #[test]
-    fn forwards_to_a_loopback_echo_server_with_docker() {
-        let name_test = "forwards_to_a_loopback_echo_server_with_docker";
-        let skip = |why: &str| eprintln!("skipping {name_test}: {why}");
-        if !ok(Command::new("docker").arg("info")) || blob_hash(Arch::host()).is_none() {
-            return skip("docker or embedded helper unavailable");
-        }
+    /// so a later `docker restart` brings it back.
+    #[test_utils::docker_test(helper)]
+    fn forwards_to_a_loopback_echo_server_with_docker() -> Result<(), &'static str> {
         let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let name = format!("devsandbox-fwd-echo-{stamp}");
         // Loopback-only echo, reachable only from inside the netns (where the
@@ -722,7 +716,7 @@ mod tests {
         let cleanup = || {
             let _ = Command::new("docker").args(["rm", "-f", &name]).output();
         };
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::test_support::with_cleanup(cleanup, || {
             assert!(ok(Command::new("docker").args(["run", "-d", "--name", &name, "alpine:3.20", "sh", "-c", serve])));
             let arch = install(&name, None).unwrap();
 
@@ -807,31 +801,20 @@ mod tests {
                 h.join().unwrap();
             }
             drop(forward);
-            Ok::<(), &str>(())
-        }));
-        cleanup();
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(why)) => skip(why),
-            Err(panic) => std::panic::resume_unwind(panic),
-        }
+            Ok(())
+        })
     }
 
     /// Docker-gated: a forward to a *closed* container port. The client
     /// connection closes and a note mentions "refused".
-    #[test]
-    fn forward_to_a_closed_port_notes_refused_with_docker() {
-        let name_test = "forward_to_a_closed_port_notes_refused_with_docker";
-        let skip = |why: &str| eprintln!("skipping {name_test}: {why}");
-        if !ok(Command::new("docker").arg("info")) || blob_hash(Arch::host()).is_none() {
-            return skip("docker or embedded helper unavailable");
-        }
+    #[test_utils::docker_test(helper)]
+    fn forward_to_a_closed_port_notes_refused_with_docker() -> Result<(), &'static str> {
         let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let name = format!("devsandbox-fwd-closed-{stamp}");
         let cleanup = || {
             let _ = Command::new("docker").args(["rm", "-f", &name]).output();
         };
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::test_support::with_cleanup(cleanup, || {
             assert!(ok(Command::new("docker").args(["run", "-d", "--name", &name, "alpine:3.20", "sleep", "300"])));
             let arch = install(&name, None).unwrap();
             // Port 9: nothing listening → the daemon's dial is refused.
@@ -860,14 +843,8 @@ mod tests {
             }
             assert!(refused, "no note mentioning refused");
             drop(forward);
-            Ok::<(), &str>(())
-        }));
-        cleanup();
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(why)) => skip(why),
-            Err(panic) => std::panic::resume_unwind(panic),
-        }
+            Ok(())
+        })
     }
 
     /// Docker-gated heal: `docker restart` the container (its main command is
@@ -875,13 +852,8 @@ mod tests {
     /// re-resolves, respawns a bridge (the helper binary survives in the
     /// writable layer; the bridge self-starts the daemon), and a new client
     /// works again.
-    #[test]
-    fn forward_heals_after_a_container_restart_with_docker() {
-        let name_test = "forward_heals_after_a_container_restart_with_docker";
-        let skip = |why: &str| eprintln!("skipping {name_test}: {why}");
-        if !ok(Command::new("docker").arg("info")) || blob_hash(Arch::host()).is_none() {
-            return skip("docker or embedded helper unavailable");
-        }
+    #[test_utils::docker_test(helper)]
+    fn forward_heals_after_a_container_restart_with_docker() -> Result<(), &'static str> {
         let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let name = format!("devsandbox-fwd-heal-{stamp}");
         let serve = "busybox nc -lk -s 127.0.0.1 -p 8080 -e cat";
@@ -903,7 +875,7 @@ mod tests {
             }
             false
         };
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::test_support::with_cleanup(cleanup, || {
             assert!(ok(Command::new("docker").args(["run", "-d", "--name", &name, "alpine:3.20", "sh", "-c", serve])));
             let arch = install(&name, None).unwrap();
             let forward = Forward::start(ForwardSpec {
@@ -924,13 +896,7 @@ mod tests {
             assert!(echo_ok(addr), "echo after restart (healed)");
             assert_eq!(forward.status().state, ForwardState::Active, "back to Active");
             drop(forward);
-            Ok::<(), &str>(())
-        }));
-        cleanup();
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(why)) => skip(why),
-            Err(panic) => std::panic::resume_unwind(panic),
-        }
+            Ok(())
+        })
     }
 }

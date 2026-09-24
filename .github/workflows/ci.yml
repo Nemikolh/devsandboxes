@@ -10,5 +10,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Build the devsbd helpers into target/devsbd (where .cargo/config.toml
+      # points build.rs) so the docker-gated bridge/forward tests have a helper
+      # to install. Those tests fail rather than skip on CI (src/test_support.rs).
+      - run: rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+      - run: scripts/build-devsbd.sh
       - run: cargo check
-      - run: cargo test
+      - run: cargo test --workspace
+        env:
+          DEVSANDBOX_DEVSBD_REQUIRED: "1"

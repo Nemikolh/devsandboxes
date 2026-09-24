@@ -4,7 +4,7 @@ version = "0.3.3"
 edition = "2024"
 description = "Manage devcontainer-style sandboxes on docker, podman, or Apple container — many throwaway instances per repo from one TOML config."
 license = "MIT"
-exclude = ["docs/", "release.sh", ".agents/", ".github/", "/devsbd/", "/scripts/", "/npm/"]
+exclude = ["docs/", "release.sh", ".agents/", ".github/", "/devsbd/", "/test-utils/", "/scripts/", "/npm/"]
 
 [dependencies]
 anyhow = "1.0.104"
@@ -26,9 +26,11 @@ zstd = "0.13"
 [dev-dependencies]
 # Tests roundtrip through the same encoder build.rs uses.
 zstd = "0.13"
+# Path-only, so `cargo publish` strips it: test-utils is never published.
+test-utils = { path = "test-utils" }
 
 [workspace]
-members = [".", "devsbd"]
+members = [".", "devsbd", "test-utils"]
 
 # Only the helper build uses this; lto/strip/panic can't be set per package.
 [profile.devsbd]

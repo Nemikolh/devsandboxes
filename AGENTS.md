@@ -49,6 +49,12 @@ git worktrees so working trees are never shared.
 - Doc comments explain *why*; keep them current when moving logic.
 - Tests live in `#[cfg(test)]` modules per file; most logic is factored to be
   testable without a container runtime.
+- Tests that need docker or the embedded helper use
+  `#[test_utils::docker_test]` / `#[test_utils::docker_test(helper)]` /
+  `#[test_utils::helper_test]` (proc macros in `test-utils/`, a path-only,
+  never-published dev-dependency) and return `Result<(), E>`. A missing
+  requirement or `Err(why)` skips locally but **fails on CI** (`CI` env var);
+  runtime side in `src/test_support.rs` (`gated`, `with_cleanup`).
 - Checks: `cargo test --workspace` (covers the `devsbd/` helper crate too;
   plain `cargo test` only runs the root package). clippy/rustfmt are not
   installed in the default toolchain here.

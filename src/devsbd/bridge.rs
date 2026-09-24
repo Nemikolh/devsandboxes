@@ -439,7 +439,7 @@ impl Drop for BridgeWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::devsbd::{hash, install, start_daemon, Arch};
+    use crate::devsbd::{hash, install, start_daemon};
     use std::process::Command;
 
     fn ok(cmd: &mut Command) -> bool {
@@ -478,16 +478,12 @@ mod tests {
     /// Docker-gated end to end: a real `ssh-add -l` in an alpine container
     /// lists a key held by a host `ssh-agent`, through daemon + bridge.
     /// Also checks the daemon falls back to the older bridge when the newest
-    /// one ends. Skips without docker, an embedded helper, host
+    /// one ends. Skips (fails on CI) without docker, an embedded helper, host
     /// ssh-agent/ssh-keygen, or network for `apk add`.
-    #[test]
-    fn relays_host_agent_into_container_with_docker() {
-        let skip = |why: &str| eprintln!("skipping relays_host_agent_into_container_with_docker: {why}");
-        if !ok(Command::new("docker").arg("info")) || hash(Arch::host()).is_none() {
-            return skip("docker or embedded helper unavailable");
-        }
+    #[test_utils::docker_test(helper)]
+    fn relays_host_agent_into_container_with_docker() -> Result<(), &'static str> {
         if !ok(Command::new("ssh-agent").arg("-h")) && !ok(Command::new("which").arg("ssh-agent")) {
-            return skip("no host ssh-agent");
+            return Err("no host ssh-agent");
         }
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -500,12 +496,12 @@ mod tests {
         let name = format!("devsandbox-relay-test-{stamp}");
 
         let mut agent = Command::new("ssh-agent").arg("-D").arg("-a").arg(&sock).stdout(Stdio::null()).spawn().unwrap();
-        let cleanup = |agent: &mut Child| {
+        let cleanup = || {
             let _ = agent.kill();
             let _ = Command::new("docker").args(["rm", "-f", &name]).output();
             let _ = std::fs::remove_dir_all(&tmp);
         };
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::test_support::with_cleanup(cleanup, || {
             for _ in 0..100 {
                 if sock.exists() {
                     break;
@@ -619,13 +615,7 @@ mod tests {
             assert_eq!(revived.outcome(Duration::from_secs(10)), Some(Ok(())), "revived daemon");
             assert!(list().contains("devsbd-relay-test"), "via revived daemon");
             Ok(())
-        }));
-        cleanup(&mut agent);
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(why)) => skip(why),
-            Err(panic) => std::panic::resume_unwind(panic),
-        }
+        })
     }
 
     /// Docker-gated: an agent-less bridge (a `devsandbox port` forward) spawned
@@ -633,15 +623,10 @@ mod tests {
     /// lists the key via the older agent bridge. Regression for the routing fix
     /// in docs/port-forwarding.md (a shell with no agent starting a forward
     /// would otherwise become the newest bridge and break ssh in the container).
-    #[test]
-    fn agent_less_bridge_does_not_steal_agent_routing_with_docker() {
-        let name_test = "agent_less_bridge_does_not_steal_agent_routing_with_docker";
-        let skip = |why: &str| eprintln!("skipping {name_test}: {why}");
-        if !ok(Command::new("docker").arg("info")) || hash(Arch::host()).is_none() {
-            return skip("docker or embedded helper unavailable");
-        }
+    #[test_utils::docker_test(helper)]
+    fn agent_less_bridge_does_not_steal_agent_routing_with_docker() -> Result<(), &'static str> {
         if !ok(Command::new("ssh-agent").arg("-h")) && !ok(Command::new("which").arg("ssh-agent")) {
-            return skip("no host ssh-agent");
+            return Err("no host ssh-agent");
         }
         let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let tmp = std::env::temp_dir().join(format!("devsbd-agentroute-{stamp}"));
@@ -650,12 +635,12 @@ mod tests {
         let key = tmp.join("id");
         let name = format!("devsandbox-agentroute-test-{stamp}");
         let mut agent = Command::new("ssh-agent").arg("-D").arg("-a").arg(&sock).stdout(Stdio::null()).spawn().unwrap();
-        let cleanup = |agent: &mut Child| {
+        let cleanup = || {
             let _ = agent.kill();
             let _ = Command::new("docker").args(["rm", "-f", &name]).output();
             let _ = std::fs::remove_dir_all(&tmp);
         };
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::test_support::with_cleanup(cleanup, || {
             for _ in 0..100 {
                 if sock.exists() {
                     break;
@@ -718,13 +703,7 @@ mod tests {
             // Settled (every `Caps(0)` in): still routed to the agent bridge.
             assert!(list().contains("devsbd-agentroute"), "agent-less bridge stole routing");
             Ok(())
-        }));
-        cleanup(&mut agent);
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(why)) => skip(why),
-            Err(panic) => std::panic::resume_unwind(panic),
-        }
+        })
     }
 
     /// Docker-gated: a `Connect` over a host `Bridge` reaches a server bound to
@@ -732,17 +711,12 @@ mod tests {
     /// namespace) and round-trips data; a `Connect` to a closed port yields an
     /// `on_close` reason mentioning "refused". No ssh-agent needed — the bridge
     /// is agent-less, exercising the forwarding path on its own.
-    #[test]
-    fn forwards_a_connect_to_a_loopback_server_with_docker() {
+    #[test_utils::docker_test(helper)]
+    fn forwards_a_connect_to_a_loopback_server_with_docker() -> Result<(), &'static str> {
         use std::io::{Read, Write};
         use std::os::unix::net::UnixStream;
         use std::sync::mpsc;
 
-        let name_test = "forwards_a_connect_to_a_loopback_server_with_docker";
-        let skip = |why: &str| eprintln!("skipping {name_test}: {why}");
-        if !ok(Command::new("docker").arg("info")) || hash(Arch::host()).is_none() {
-            return skip("docker or embedded helper unavailable");
-        }
         let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let name = format!("devsandbox-forward-test-{stamp}");
         // busybox nc echoes stdin back to the client (-e cat) on loopback only,
@@ -752,7 +726,7 @@ mod tests {
         let cleanup = || {
             let _ = Command::new("docker").args(["rm", "-f", &name]).output();
         };
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::test_support::with_cleanup(cleanup, || {
             assert!(ok(Command::new("docker").args(["run", "-d", "--name", &name, "alpine:3.20", "sh", "-c", serve])));
             let arch = install(&name, None).unwrap();
             start_daemon(&name);
@@ -800,13 +774,7 @@ mod tests {
             .unwrap();
             let reason = closed.recv_timeout(Duration::from_secs(10)).unwrap();
             assert!(reason.contains("refused"), "closed port reason: {reason:?}");
-            Ok::<(), &str>(())
-        }));
-        cleanup();
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(why)) => skip(why),
-            Err(panic) => std::panic::resume_unwind(panic),
-        }
+            Ok(())
+        })
     }
 }
