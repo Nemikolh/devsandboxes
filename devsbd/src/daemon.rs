@@ -170,8 +170,11 @@ fn serve_bridge(mut conn: UnixStream, bridges: &Bridges, hash: &str) {
             let _ = dead.shutdown(std::net::Shutdown::Both);
         });
     }
-    // The host never opens streams toward the container (yet).
-    mux.serve(conn, |_, _| None);
+    // The daemon never accepts `Open`. `Connect` is refused until the daemon
+    // learns to dial (docs/port-forwarding.md, step 4).
+    mux.serve_with(conn, |_, _| None, |_, _, _, reply: mux::ConnectReply| {
+        reply.finish(Err("port forwarding not enabled".into()))
+    });
     bridges.list.lock().unwrap().retain(|m| !Arc::ptr_eq(m, &mux));
 }
 

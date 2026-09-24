@@ -221,7 +221,7 @@ embedded blob, so a stale blob fails them.
   return `Conn`.
 - Every existing mux test passes unchanged, apart from constructor adaptations.
 
-### Step 3 — flow control + half-close + host-initiated streams [ ]
+### Step 3 — flow control + half-close + host-initiated streams [x]
 
 `src/devsbd/mux.rs`. This is the heart of the plan; see _Flow control_ above.
 
