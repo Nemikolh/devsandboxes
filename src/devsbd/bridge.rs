@@ -22,6 +22,12 @@ pub struct Bridge {
     // `Drop` and those threads race on `kill()`, which is idempotent.
     child: Arc<Mutex<Child>>,
     done: Arc<AtomicBool>,
+    // Set by the handshake thread when the failure is a protocol version
+    // mismatch — either detected host-side (`proto::version_mismatch`) or by the
+    // bridge exiting `proto::MISMATCH_EXIT` (daemon mismatch). A mismatched
+    // bridge is not retried while its container stays running: only a restart,
+    // which rewrites the helper, can fix it.
+    mismatch: Arc<AtomicBool>,
     handshake: mpsc::Receiver<Result<(), String>>,
 }
 
@@ -35,6 +41,11 @@ impl Bridge {
     /// The relay ended (container stopped, daemon gone, handshake failed).
     pub fn is_done(&self) -> bool {
         self.done.load(Ordering::Relaxed)
+    }
+
+    /// The relay failed on a protocol version mismatch (host or daemon side).
+    pub fn is_mismatch(&self) -> bool {
+        self.mismatch.load(Ordering::Relaxed)
     }
 }
 
@@ -86,10 +97,12 @@ fn spawn_with(
     let mut stderr = child.stderr.take()?;
     let child = Arc::new(Mutex::new(child));
     let done = Arc::new(AtomicBool::new(false));
+    let mismatch = Arc::new(AtomicBool::new(false));
     let (tx, handshake) = mpsc::channel();
     let hash = hash.to_string();
     let container = container.to_string();
     let finished = Arc::clone(&done);
+    let hs_mismatch = Arc::clone(&mismatch);
     // Watchdog: if the handshake hasn't produced a result within the timeout,
     // kill the child, which unblocks the blocking `handshake` read below. The
     // handshake thread then sees the read fail and, because `timed_out` is set,
@@ -122,11 +135,21 @@ fn spawn_with(
             // says why — but when the *daemon* is the mismatch, the bridge
             // already printed its own direction-aware line, so prefer stderr.
             if let Some(vm) = proto::version_mismatch(&e) {
+                hs_mismatch.store(true, Ordering::Relaxed);
                 return mismatch_message(&container, vm);
             }
             let mut msg = String::new();
             if e.kind() == std::io::ErrorKind::UnexpectedEof {
                 let _ = std::io::Read::read_to_string(&mut stderr, &mut msg);
+                // The bridge exits `MISMATCH_EXIT` when *its* handshake with the
+                // daemon failed on a version mismatch (it printed the line we
+                // just read). Classify that from the exit code, not the text, so
+                // reconcile can stop retrying. `wait()` after EOF is prompt.
+                if let Ok(status) = hs_child.lock().unwrap().wait() {
+                    if status.code() == Some(proto::MISMATCH_EXIT) {
+                        hs_mismatch.store(true, Ordering::Relaxed);
+                    }
+                }
             }
             match msg.trim() {
                 "" => e.to_string(),
@@ -155,7 +178,7 @@ fn spawn_with(
         }
         finished.store(true, Ordering::Relaxed);
     });
-    Some(Bridge { child, done, handshake })
+    Some(Bridge { child, done, mismatch, handshake })
 }
 
 /// How long the host waits for the daemon handshake before killing the child
@@ -187,8 +210,42 @@ fn mismatch_message(container: &str, vm: &proto::VersionMismatch) -> String {
 /// whose bridge keeps failing (daemon down) isn't re-exec'd every tick.
 const RETRY: Duration = Duration::from_secs(10);
 
+/// Gap after a version mismatch. Long, since only a helper rewrite fixes it,
+/// but not infinite: `devsandbox start` on a still-running container rewrites
+/// the helper without the container ever leaving the running set.
+const MISMATCH_RETRY: Duration = Duration::from_secs(300);
+
+/// What `reconcile` should do with the current bridge for one container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Retry {
+    /// No live bridge for this container yet: start one.
+    Spawn,
+    /// Keep the existing entry untouched (healthy, or dead but still within
+    /// its retry gap).
+    Keep,
+    /// The bridge is dead and past its retry gap: replace it.
+    Respawn,
+}
+
+/// The retry policy for one container's bridge, factored out so it's testable
+/// without a container runtime. `entry` is the current live bridge's state, or
+/// `None` when there is none: `(done, mismatch, since_spawn)`. A dead bridge
+/// is retried after `RETRY`, or `MISMATCH_RETRY` when it died on a version
+/// mismatch (a restart, which drops the entry, retries at once).
+fn retry_decision(entry: Option<(bool, bool, Duration)>) -> Retry {
+    match entry {
+        None => Retry::Spawn,
+        Some((true, mismatch, since)) => {
+            let gap = if mismatch { MISMATCH_RETRY } else { RETRY };
+            if since >= gap { Retry::Respawn } else { Retry::Keep }
+        }
+        Some((false, ..)) => Retry::Keep,
+    }
+}
+
 /// The TUI's set of bridges, reconciled against the running instances on each
-/// snapshot.
+/// snapshot. Owned by a worker thread (`spawn_worker`), never touched on the UI
+/// thread.
 #[derive(Default)]
 pub struct Bridges {
     live: HashMap<String, (Bridge, Instant)>,
@@ -196,7 +253,7 @@ pub struct Bridges {
 
 impl Bridges {
     /// Keep one bridge per running container in `running` whose instance
-    /// wants one; drop the rest. Dead bridges are retried after `RETRY`.
+    /// wants one; drop the rest. Dead bridges are retried per `retry_decision`.
     pub fn reconcile(&mut self, running: &[&str]) {
         self.live.retain(|c, _| running.contains(&c.as_str()));
         // No host agent → nothing to relay; skip the per-instance `exec`.
@@ -209,16 +266,70 @@ impl Bridges {
             if !running.contains(&info.container.as_str()) || !relay_mode(info) {
                 continue;
             }
-            let retry_due = match self.live.get(&info.container) {
-                None => true,
-                Some((b, at)) => b.is_done() && at.elapsed() >= RETRY,
-            };
-            if retry_due {
+            let entry = self
+                .live
+                .get(&info.container)
+                .map(|(b, at)| (b.is_done(), b.is_mismatch(), at.elapsed()));
+            if retry_decision(entry) != Retry::Keep {
                 self.live.remove(&info.container);
                 if let Some(b) = spawn(info) {
                     self.live.insert(info.container.clone(), (b, Instant::now()));
                 }
             }
+        }
+    }
+
+    /// Move a `Bridges` onto its own thread, fed running-container lists over an
+    /// mpsc. Reconcile (which does `State::load` and `exec` spawns) never runs
+    /// on the UI thread; the snapshot arm just `send`s the owned list. Dropping
+    /// the returned [`BridgeWorker`] closes the channel and joins the thread,
+    /// which drops every live `Bridge` (killing its `exec`) before returning.
+    pub fn spawn_worker() -> BridgeWorker {
+        let (tx, rx) = mpsc::channel::<Vec<String>>();
+        let handle = std::thread::spawn(move || {
+            let mut bridges = Bridges::default();
+            // Block for the next list, then coalesce: drain everything already
+            // queued and reconcile only against the newest, so a burst of
+            // snapshots costs one reconcile.
+            while let Ok(mut running) = rx.recv() {
+                while let Ok(next) = rx.try_recv() {
+                    running = next;
+                }
+                let refs: Vec<&str> = running.iter().map(String::as_str).collect();
+                bridges.reconcile(&refs);
+            }
+            // Sender dropped: `bridges` drops here, killing every live bridge.
+        });
+        BridgeWorker { tx: Some(tx), handle: Some(handle) }
+    }
+}
+
+/// Handle to the bridge worker thread. Send running-container lists with
+/// [`send`](Self::send); on drop the channel closes and the thread is joined,
+/// so all bridges are killed before the caller (the TUI) restores the terminal.
+pub struct BridgeWorker {
+    tx: Option<mpsc::Sender<Vec<String>>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl BridgeWorker {
+    /// Hand the worker the current running-container set. Never blocks the UI
+    /// thread; a dead worker (thread gone) is silently ignored.
+    pub fn send(&self, running: Vec<String>) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(running);
+        }
+    }
+}
+
+impl Drop for BridgeWorker {
+    fn drop(&mut self) {
+        // Close the channel first so the worker's `recv` returns and it drops
+        // `Bridges` (killing every bridge), then join so that teardown finishes
+        // before the terminal is restored.
+        self.tx.take();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
         }
     }
 }
@@ -231,6 +342,35 @@ mod tests {
 
     fn ok(cmd: &mut Command) -> bool {
         matches!(cmd.output(), Ok(o) if o.status.success())
+    }
+
+    #[test]
+    fn retry_policy() {
+        // No entry: always start one.
+        assert_eq!(retry_decision(None), Retry::Spawn);
+        // Alive (not done): keep, regardless of elapsed time.
+        let (zero, day) = (Duration::ZERO, Duration::from_secs(86_400));
+        assert_eq!(retry_decision(Some((false, false, zero))), Retry::Keep);
+        assert_eq!(retry_decision(Some((false, false, day))), Retry::Keep);
+        // Dead, not a mismatch: retried after RETRY.
+        assert_eq!(retry_decision(Some((true, false, zero))), Retry::Keep);
+        assert_eq!(retry_decision(Some((true, false, RETRY))), Retry::Respawn);
+        // Dead on a mismatch: only after the long MISMATCH_RETRY.
+        assert_eq!(retry_decision(Some((true, true, RETRY))), Retry::Keep);
+        assert_eq!(retry_decision(Some((true, true, MISMATCH_RETRY))), Retry::Respawn);
+    }
+
+    /// The worker reconciles against only the newest queued list. With no host
+    /// agent every reconcile is a cheap no-op (no `exec`), so this exercises the
+    /// send/coalesce/join path without docker.
+    #[test]
+    fn worker_coalesces_and_joins() {
+        let worker = Bridges::spawn_worker();
+        for i in 0..100 {
+            worker.send(vec![format!("devsandbox-c{i}")]);
+        }
+        // Dropping joins the thread; it must have drained without deadlock.
+        drop(worker);
     }
 
     /// Docker-gated end to end: a real `ssh-add -l` in an alpine container

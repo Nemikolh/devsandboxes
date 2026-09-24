@@ -105,9 +105,13 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
     let mut proc_pending: Option<Receiver<BTreeMap<String, ProcState>>> = None;
     let mut last_proc_tick = Instant::now();
     // ssh-agent relays, one per running instance while the dashboard is open
-    // (docs/sandbox-helper.md); dropped (killed) on exit.
+    // (docs/sandbox-helper.md). Owned by a worker thread so `State::load` and
+    // the per-instance `exec` spawns never block the UI; the snapshot arm just
+    // sends it the running set. Its `Drop` (any exit path, including `?` early
+    // returns) closes the channel and joins the thread, killing every bridge
+    // before the terminal is restored.
     #[cfg(unix)]
-    let mut bridges = crate::devsbd::bridge::Bridges::default();
+    let bridges = crate::devsbd::bridge::Bridges::spawn_worker();
 
     while !app.should_quit {
         // Full-frame area, shared by the pre-draw PTY resize and mouse routing.
@@ -240,13 +244,14 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
                 Ok(snapshot) => {
                     #[cfg(unix)]
                     {
-                        let running: Vec<&str> = snapshot
+                        // Owned list handed to the worker; never blocks the UI.
+                        let running: Vec<String> = snapshot
                             .instances
                             .iter()
                             .filter(|r| matches!(r.status, data::ContainerStatus::Running(_)))
-                            .map(|r| r.container.as_str())
+                            .map(|r| r.container.clone())
                             .collect();
-                        bridges.reconcile(&running);
+                        bridges.send(running);
                     }
                     app.set_snapshot(snapshot);
                     pending = None;

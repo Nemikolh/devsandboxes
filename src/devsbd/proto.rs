@@ -23,6 +23,14 @@ use std::io::{self, Read, Write};
 /// a mismatch means a stale helper left in a still-running container.
 pub const VERSION: u32 = 1;
 
+/// Process exit code `devsbd bridge` uses when its handshake with the daemon
+/// fails on a protocol version mismatch (as opposed to any other error, which
+/// exits 1). The host reads this after the bridge's stdout hits EOF to classify
+/// the failure as a mismatch without string-matching stderr, so it can stop
+/// retrying that container until it leaves the running set (a restart rewrites
+/// the helper). Distinct from the argv-usage code (2).
+pub const MISMATCH_EXIT: i32 = 3;
+
 /// Upper bound on one frame's payload. Agent messages are small; the cap
 /// turns stray bytes on the stream (e.g. a shell banner on stdout) into an
 /// error rather than a multi-GiB allocation.

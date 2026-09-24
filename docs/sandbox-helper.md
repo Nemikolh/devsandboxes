@@ -200,7 +200,12 @@ ssh (in container) ──unix──▶ devsbd daemon ◀──frames over exec s
     (`daemon in container is older/newer (protocol N) than this helper (M)`),
     which the host surfaces (it prefers the bridge's stderr when its own
     handshake with the bridge hit `UnexpectedEof`, i.e. the bridge died
-    before `Hello`).
+    before `Hello`). **Exit-code contract:** on a daemon mismatch the bridge
+    exits `proto::MISMATCH_EXIT` (3), distinct from any other failure (1) and
+    the argv-usage error (2). The host `wait()`s the child after that EOF and,
+    seeing code 3 (or a host-side `version_mismatch` on its own `Hello`), flags
+    the bridge as a mismatch — so `reconcile` classifies mismatches from the
+    exit code, never by string-matching stderr.
 
 - **Bridge:** host runs `exec -i -u root <c> devsbd bridge`. The bridge
   connects to the control socket first (retrying for 2s: `exec -d` returns
@@ -262,9 +267,18 @@ ssh (in container) ──unix──▶ devsbd daemon ◀──frames over exec s
     Several bridges per container are normal (the daemon routes to the newest
     live one, see _Bridge_).
   - TUI: one bridge per running instance while the dashboard is open, used by
-    every integrated terminal tab on that instance
-    (`devsbd::bridge::Bridges`, reconciled on each snapshot in
-    `src/tui/mod.rs`; a dead bridge is retried at most every 10s).
+    every integrated terminal tab on that instance (`devsbd::bridge::Bridges`).
+    Owned by a worker thread (`Bridges::spawn_worker` → `BridgeWorker`), not the
+    UI thread: the snapshot arm in `src/tui/mod.rs` just `send`s the worker the
+    owned list of running containers, and the worker does `State::load` + the
+    per-instance `exec` off-thread, coalescing a burst of snapshots to the
+    newest list before reconciling. A dead bridge is retried at most every 10s —
+    except a protocol **version mismatch** (host- or daemon-side, see _Bridge_),
+    which is retried only every 5 min, since only a helper rewrite fixes it
+    (`start`, which may not take the container out of the running set; a real
+    restart drops the entry and retries at once). On TUI exit `BridgeWorker`'s `Drop` closes the channel and joins the
+    worker (any exit path, including `?` early returns), so every bridge is
+    killed before the terminal is restored.
   - CLI `exec` (including the TUI's suspended `:exec`, which goes through
     `exec_status`): its own bridge for the lifetime of the exec, started
     optimistically alongside the command, with no handshake wait and so no added
@@ -381,8 +395,8 @@ kind: 0 Hello(u32 version, u8 hash_len, hash utf-8, u32 caps)  1 Open(channel: u
 6. [x] Switch ssh-agent to relay when available (details below).
 7. [x] Protocol revision before first release (details below).
 8. [x] Keepalive + timeouts (details below).
-9. Daemon self-heal (details below).
-10. TUI bridge ownership off the UI thread (details below).
+9. [x] Daemon self-heal (details below).
+10. [x] TUI bridge ownership off the UI thread (details below).
 11. Build hygiene (details below).
 12. `release.yml` helper job (after confirmation).
 
@@ -471,14 +485,16 @@ over; document it), agent socket stays **0666** (document the consequence).
 - Fix the doc claim "`/run` is often tmpfs": on docker it's in the writable
   layer, so the binary survives a restart but the daemon doesn't.
 
-### Step 10 — TUI bridges off the UI thread
+### Step 10 — TUI bridges off the UI thread [x]
 
 - `Bridges` (`src/devsbd/bridge.rs`) moves to a worker thread fed by an mpsc
   of running-container lists (sent from the snapshot arm, `src/tui/mod.rs`
   ~l.240). `State::load` and spawns happen there. On TUI exit the sender is
   dropped and the thread joined, so bridges are killed before returning.
-- Version mismatch (typed error from step 7) is not retried until the
-  container leaves the running set.
+- Version mismatch (typed error from step 7, or `devsbd bridge` exiting
+  `proto::MISMATCH_EXIT`) is retried on a 5 min gap instead of 10s (review
+  change: "until the container leaves the running set" would never retry after
+  a `start` on a running container, which is what fixes it).
 
 ### Step 11 — build hygiene
 

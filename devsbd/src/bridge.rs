@@ -16,15 +16,18 @@ pub fn run(hash: &str) -> io::Result<()> {
     let ctl = connect_ctl()
         .map_err(|e| io::Error::new(e.kind(), format!("daemon not running ({CTL}: {e})")))?;
     // On a daemon/helper mismatch, print the direction from the helper's own
-    // point of view; the host then surfaces this stderr (it prefers the
-    // bridge's stderr when its handshake with us hits EOF, which is what a
-    // dying bridge here produces).
-    proto::handshake(&mut ctl.try_clone()?, &mut ctl.try_clone()?, hash).map_err(|e| {
-        match proto::version_mismatch(&e) {
-            Some(vm) => io::Error::new(e.kind(), daemon_mismatch(vm)),
-            None => e,
+    // point of view (the host surfaces this stderr, preferring it when its own
+    // handshake with us hits EOF — what a dying bridge here produces) and exit
+    // with `proto::MISMATCH_EXIT` so the host can classify the failure as a
+    // mismatch from the exit code alone, without string-matching, and stop
+    // retrying until a restart rewrites the helper.
+    if let Err(e) = proto::handshake(&mut ctl.try_clone()?, &mut ctl.try_clone()?, hash) {
+        if let Some(vm) = proto::version_mismatch(&e) {
+            eprintln!("devsbd: {}", daemon_mismatch(vm));
+            std::process::exit(proto::MISMATCH_EXIT);
         }
-    })?;
+        return Err(e);
+    }
     let mut stdin = io::stdin().lock();
     let mut stdout = io::stdout().lock();
     proto::handshake(&mut stdin, &mut stdout, hash)?;
