@@ -4,12 +4,13 @@
 //! drift: whoever sees a local stream end first sends `Close`; receiving
 //! `Close` shuts the local socket down without echoing one back.
 //!
-//! Unix-only (streams are unix sockets on both ends today); the Windows host
-//! will need a named-pipe stream here (docs/sandbox-helper.md).
+//! Local ends are a [`Conn`]: a unix socket (ssh-agent streams) or a TCP
+//! socket (forwarded ports, docs/port-forwarding.md). Unix-only: the Windows
+//! host will need a named-pipe stream here (docs/sandbox-helper.md).
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::net::Shutdown;
+use std::net::{Shutdown, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -42,11 +43,89 @@ const MAX_STREAMS: usize = 64;
 /// whose id has this bit set (docs/sandbox-helper.md, _Frame protocol_).
 const HOST_ID_BIT: u32 = 1 << 31;
 
+/// A stream's local socket. An enum rather than a trait object keeps the mux
+/// std-only and monomorphic; both variants share the same read/write/shutdown
+/// surface, so routing doesn't care which one it holds.
+#[derive(Debug)]
+pub enum Conn {
+    Unix(UnixStream),
+    Tcp(TcpStream),
+}
+
+impl Conn {
+    pub fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+        match self {
+            Conn::Unix(s) => s.shutdown(how),
+            Conn::Tcp(s) => s.shutdown(how),
+        }
+    }
+
+    pub fn try_clone(&self) -> io::Result<Conn> {
+        Ok(match self {
+            Conn::Unix(s) => Conn::Unix(s.try_clone()?),
+            Conn::Tcp(s) => Conn::Tcp(s.try_clone()?),
+        })
+    }
+}
+
+impl From<UnixStream> for Conn {
+    fn from(s: UnixStream) -> Conn {
+        Conn::Unix(s)
+    }
+}
+
+impl From<TcpStream> for Conn {
+    fn from(s: TcpStream) -> Conn {
+        Conn::Tcp(s)
+    }
+}
+
+/// `&Conn` like `&UnixStream`/`&TcpStream`: lets the `Data` arm write through
+/// a shared `Arc<Conn>` without a lock.
+impl Read for &Conn {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match *self {
+            Conn::Unix(s) => (&*s).read(buf),
+            Conn::Tcp(s) => (&*s).read(buf),
+        }
+    }
+}
+
+impl Write for &Conn {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match *self {
+            Conn::Unix(s) => (&*s).write(buf),
+            Conn::Tcp(s) => (&*s).write(buf),
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        match *self {
+            Conn::Unix(s) => (&*s).flush(),
+            Conn::Tcp(s) => (&*s).flush(),
+        }
+    }
+}
+
+impl Read for Conn {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        (&*self).read(buf)
+    }
+}
+
+impl Write for Conn {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        (&*self).write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        (&*self).flush()
+    }
+}
+
 pub struct Mux {
     out: Mutex<Box<dyn Write + Send>>,
     // `Arc` so the `Data` arm can clone a handle and write after dropping the
     // `streams` guard, instead of holding the lock across a blocking write.
-    streams: Mutex<HashMap<u32, Arc<UnixStream>>>,
+    streams: Mutex<HashMap<u32, Arc<Conn>>>,
     /// When `serve` last saw any inbound frame; the keepalive thread reads it
     /// to decide liveness. Initialised at construction so a peer that never
     /// sends a frame is still declared dead after `KEEPALIVE_TIMEOUT`.
@@ -110,7 +189,8 @@ impl Mux {
     /// new thread, sending `Close` when it ends (unless the peer closed it
     /// first). With `open`, announces the stream with `Open { channel }` before
     /// any data can flow.
-    pub fn attach(self: &Arc<Self>, stream: u32, conn: UnixStream, open: Option<u8>) -> io::Result<()> {
+    pub fn attach(self: &Arc<Self>, stream: u32, conn: impl Into<Conn>, open: Option<u8>) -> io::Result<()> {
+        let conn = conn.into();
         let reader = conn.try_clone()?;
         self.streams.lock().unwrap().insert(stream, Arc::new(conn));
         if let Some(channel) = open {
@@ -124,7 +204,7 @@ impl Mux {
         Ok(())
     }
 
-    fn pump(&self, stream: u32, mut conn: UnixStream) {
+    fn pump(&self, stream: u32, mut conn: Conn) {
         let mut buf = vec![0u8; CHUNK];
         loop {
             match conn.read(&mut buf) {
@@ -160,7 +240,7 @@ impl Mux {
     pub fn serve(
         self: &Arc<Self>,
         mut reader: impl Read,
-        on_open: impl Fn(u32, u8) -> Option<UnixStream>,
+        on_open: impl Fn(u32, u8) -> Option<Conn>,
     ) {
         while let Ok(Some(frame)) = proto::read_frame(&mut reader) {
             *self.last_inbound.lock().unwrap() = Instant::now();
@@ -168,7 +248,7 @@ impl Mux {
                 Frame::Data { stream, bytes } => {
                     // Clone the handle and drop the guard before the blocking
                     // write, so a slow local socket can't stall other streams'
-                    // routing (`&UnixStream: Write`).
+                    // routing (`&Conn: Write`).
                     let conn = self.streams.lock().unwrap().get(&stream).cloned();
                     let failed = match conn {
                         Some(conn) => (&*conn).write_all(&bytes).is_err(),
@@ -269,7 +349,7 @@ mod tests {
                 (ch == channel::SSH_AGENT).then(|| {
                     let (ours, agent) = UnixStream::pair().unwrap();
                     echo_agent(agent);
-                    ours
+                    ours.into()
                 })
             })
         });
@@ -297,6 +377,51 @@ mod tests {
         roundtrip(&mut a, "one");
         roundtrip(&mut b, "two");
         roundtrip(&mut a, "three");
+    }
+
+    /// Same relay as `streams_relay_independently`, but with TCP on both local
+    /// ends: the daemon attaches a loopback client, the host's `on_open` dials a
+    /// loopback echo server. Exercises every `Conn::Tcp` arm.
+    #[test]
+    fn tcp_conns_relay_through_the_mux() {
+        use std::net::{TcpListener, TcpStream};
+        let echo = TcpListener::bind("127.0.0.1:0").unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for conn in echo.incoming() {
+                let conn = conn.unwrap();
+                std::thread::spawn(move || {
+                    let mut w = conn.try_clone().unwrap();
+                    for line in BufReader::new(conn).lines() {
+                        let Ok(line) = line else { break };
+                        if writeln!(w, "re:{line}").is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        let (d_r, h_w) = std::io::pipe().unwrap();
+        let (h_r, d_w) = std::io::pipe().unwrap();
+        let daemon = Mux::new(d_w);
+        let host = Mux::new(h_w);
+        let d = Arc::clone(&daemon);
+        std::thread::spawn(move || d.serve(d_r, |_, _| None));
+        std::thread::spawn(move || host.serve(h_r, |_, _| TcpStream::connect(echo_addr).ok().map(Into::into)));
+
+        let front = TcpListener::bind("127.0.0.1:0").unwrap();
+        let ours = TcpStream::connect(front.local_addr().unwrap()).unwrap();
+        let (theirs, _) = front.accept().unwrap();
+        daemon.attach(1, theirs, Some(channel::SSH_AGENT)).unwrap();
+        ours.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut c = BufReader::new(ours);
+        for msg in ["one", "two"] {
+            writeln!(c.get_mut(), "{msg}").unwrap();
+            let mut line = String::new();
+            c.read_line(&mut line).unwrap();
+            assert_eq!(line, format!("re:{msg}\n"));
+        }
     }
 
     #[test]
@@ -365,7 +490,7 @@ mod tests {
         mux.serve(io::Cursor::new(wire), |_, _| {
             let (ours, theirs) = UnixStream::pair().unwrap();
             peers.lock().unwrap().push(theirs);
-            Some(ours)
+            Some(ours.into())
         });
         let mut r = io::Cursor::new(std::mem::take(&mut *out.lock().unwrap()));
         let mut closed = Vec::new();

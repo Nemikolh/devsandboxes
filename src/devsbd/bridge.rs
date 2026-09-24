@@ -173,7 +173,7 @@ fn spawn_with(
                 if channel != proto::channel::SSH_AGENT {
                     return None;
                 }
-                std::os::unix::net::UnixStream::connect(agent()?).ok()
+                std::os::unix::net::UnixStream::connect(agent()?).ok().map(Into::into)
             });
         }
         finished.store(true, Ordering::Relaxed);

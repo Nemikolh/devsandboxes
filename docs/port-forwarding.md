@@ -210,7 +210,7 @@ embedded blob, so a stale blob fails them.
   a `Close` with a reason decodes, and an *old-style* empty-payload `Close`
   still decodes; the frozen-bytes test is unchanged.
 
-### Step 2 — `Conn` abstraction in the mux [ ]
+### Step 2 — `Conn` abstraction in the mux [x]
 
 `src/devsbd/mux.rs` (+ call sites in `src/devsbd/bridge.rs`,
 `devsbd/src/daemon.rs`). Pure refactor, no behavior change.
