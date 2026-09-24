@@ -170,6 +170,37 @@ pub trait Backend: Send + Sync {
         Ok(())
     }
 
+    /// Run with `input` piped to stdin (e.g. `exec -i … sh -c 'cat > f'`).
+    /// stdout is discarded and stderr captured, so it is screen-safe; a
+    /// non-zero exit is an error with the first stderr line folded in.
+    fn run_with_stdin(&self, args: &[&str], input: &[u8]) -> Result<()> {
+        use std::io::Write;
+        use std::process::Stdio;
+        let mut child = Command::new(self.bin())
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("failed to run {} (is it installed?)", self.bin()))?;
+        let mut stdin = child.stdin.take().expect("stdin was piped");
+        // A write error (EPIPE when the child exits early) is reported below
+        // through the exit status, which carries the more useful message.
+        let written = stdin.write_all(input);
+        drop(stdin);
+        let out = child.wait_with_output()?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            bail!(
+                "{} {}: {}",
+                self.bin(),
+                args.first().unwrap_or(&""),
+                stderr.lines().next().unwrap_or("non-zero exit").trim()
+            );
+        }
+        written.with_context(|| format!("writing stdin of {} {}", self.bin(), args.first().unwrap_or(&"")))
+    }
+
     // --- queries (diverge per runtime) ---
 
     /// `Some(true|false)` for an existing container, `None` when it does not

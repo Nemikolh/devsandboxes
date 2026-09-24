@@ -280,6 +280,8 @@ pub(crate) fn materialize(
         &endpoints,
     )?;
     let container = container_name.clone();
+    // Before lifecycle commands, so they could already rely on the helper.
+    let devsbd_arch = crate::devsbd::ensure(&container, None, false);
     let workspace_file = write_workspace_file(
         &container,
         instance,
@@ -306,6 +308,7 @@ pub(crate) fn materialize(
             remote_env: props.remote_env.clone().unwrap_or_default(),
             remote_user: props.remote_user.clone(),
             ssh_auth_sock,
+            devsbd_arch,
             created_unix: Instance::now(),
         },
     );
@@ -1720,6 +1723,7 @@ mod tests {
             remote_env: Default::default(),
             remote_user: None,
             ssh_auth_sock: None,
+            devsbd_arch: None,
             created_unix: 0,
         }
     }

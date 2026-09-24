@@ -63,6 +63,11 @@ pub struct Instance {
     /// to inject `SSH_AUTH_SOCK` per exec.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh_auth_sock: Option<String>,
+    /// Arch of the devsbd helper that ran in this container (see
+    /// docs/sandbox-helper.md); `None` = helper unavailable. Tried first on
+    /// the next install so emulated images skip the host-arch attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub devsbd_arch: Option<crate::devsbd::Arch>,
     pub created_unix: u64,
 }
 
@@ -148,6 +153,7 @@ mod tests {
                 remote_env: BTreeMap::new(),
                 remote_user: None,
                 ssh_auth_sock: None,
+                devsbd_arch: None,
                 created_unix: Instance::now(),
             },
         );

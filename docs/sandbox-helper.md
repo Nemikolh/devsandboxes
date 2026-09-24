@@ -120,7 +120,7 @@ The main crate must build for every release target (incl. macOS, Windows) while 
   aarch64). Except emulated images — Docker Desktop/OrbStack/podman silently run amd64-only images
   under Rosetta/qemu on arm64 hosts (and qemu binfmt on arm64 Linux), where the host-arch binary fails
   with `exec format error`. So:
-  1. Write the host-arch blob, run `devsbd version`.
+  1. Write the recorded arch's blob (else the host's), run `devsbd version`.
   2. Any failure → write the other arch's blob to the same path, run `version` again. Don't match on
      `exec format error` — exit code/message differ per runtime (126, 255, OCI error text); one blind
      retry is simpler and only costs anything in the rare case.
@@ -132,18 +132,27 @@ The main crate must build for every release target (incl. macOS, Windows) while 
   remote-container support; leave a code comment saying so.
 
 - **Transport:** stream the decompressed bytes into
-  `exec -i -u 0 <c> sh -c 'mkdir -p /run/devsandbox/bin && cat > …tmp && chmod 755 …tmp && mv …tmp /run/devsandbox/bin/devsbd'`.
-  Works on docker, podman and Apple `container` alike (no `docker cp`, no file binds). Requires `/bin/sh` in the image — distroless images
-  get the fallback.
+  `exec -i -u root <c> sh -c 'mkdir -p /run/devsandbox/bin && cat > …tmp && chmod 755 …tmp && mv …tmp /run/devsandbox/bin/devsbd'`
+  (`Backend::run_with_stdin`: stdout discarded, stderr captured, so it's TUI-safe). `-u root`
+  rather than `-u 0`, matching the existing Apple backend exec (`src/runtime/apple.rs`). Works on
+  docker, podman and Apple `container` alike (no `docker cp`, no file binds). Requires `/bin/sh` in
+  the image — distroless images get the fallback.
 
 - **Idempotence:** first run `devsbd version`; skip the write when
-  it reports `devsbd::hash(devsbd_arch)`. A CLI upgrade therefore rewrites the binary
-  on next `run`/`start`.
+  it reports either embedded arch's hash (the reporting one is the arch that works). A CLI upgrade
+  therefore rewrites the binary on next `run`/`start`.
 
 - **When:** in `run` after create (next to lifecycle commands) and in
-  `start_instance` (`src/commands/start.rs:42`) after the container starts —
-  `/run` is often tmpfs, so the binary may not survive a restart; reinstall is
-  cheap and the hash check makes it a no-op otherwise.
+  `start_instance` (`src/commands/start.rs:42`, both the resolved and bare
+  branches) after the container starts, plus the TUI's bare `s` start
+  (`spawn_start`, silently) — `/run` is often tmpfs, so the binary may not
+  survive a restart; reinstall is cheap and the hash check makes it a no-op
+  otherwise. `devsbd::ensure_recorded` persists a changed `devsbd_arch`,
+  reloading state before saving.
+
+- Failure never fails the command: a one-line `note:` on stderr (suppressed in
+  the TUI). Builds without embedded helpers (`cargo install`) print
+  `devsbd not embedded in this build` on each `run`/`start`.
 
 - Not part of `config_hash`/`build_hash` (runtime fact, same rule as ssh-agent).
 
@@ -209,7 +218,7 @@ kind: 0 Hello(version, hash)  1 Open(channel: u8)  2 Data  3 Close  4 Ping/Pong
    `scripts/build-devsbd.sh`; check size.
 2. [x] `build.rs` + `src/devsbd.rs` embedding with empty-blob fallback; tests for
    blob/hash plumbing (`cargo test` must pass with no helper built).
-3. Install into container (host arch → other-arch retry, stream write, hash check) in `run` +
+3. [x] Install into container (host arch → other-arch retry, stream write, hash check) in `run` +
    `start`; `Instance.devsbd_arch`.
 4. Shared frame protocol + tests.
 5. Helper `daemon` + `bridge`; host-side bridge driver (`src/commands/agent.rs`
@@ -244,7 +253,7 @@ kind: 0 Hello(version, hash)  1 Open(channel: u8)  2 Data  3 Close  4 Ping/Pong
   them). Leaning: service terminates, helper stays a dumb tunnel; rustls only
   if helper↔service traffic must be encrypted on the shared network.
 
-- Should the daemon run as root (`-u 0`) and chown the socket to `remoteUser`,
+- Should the daemon run as root (`-u root`) and chown the socket to `remoteUser`,
   or run as `remoteUser` directly? Root is simpler and fixes the uid caveat.
 
 - Images without `/bin/sh` or with read-only `/run`: fall back silently, or

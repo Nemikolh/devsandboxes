@@ -1,6 +1,5 @@
 mod commands;
 mod config;
-#[allow(dead_code)] // consumed from step 3 (install into container)
 mod devsbd;
 mod features;
 mod render;

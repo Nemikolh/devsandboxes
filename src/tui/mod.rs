@@ -425,6 +425,8 @@ fn spawn_start(instance: &str) -> Receiver<OpDone> {
                     let services =
                         commands::stop::service_containers(&info.project, &info.instance_id);
                     commands::start::start_containers(&info.container, &services, true);
+                    // `/run` may be tmpfs: reinstall the helper (no-op when current).
+                    crate::devsbd::ensure_recorded(&instance, info, true);
                     format!("started {instance}")
                 }
                 None => format!("start: unknown instance `{instance}`"),

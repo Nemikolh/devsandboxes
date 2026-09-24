@@ -47,6 +47,7 @@ fn start_instance(dir: &Path, key: &str, info: &Instance) -> Result<()> {
         Some((config, sandbox)) => {
             run::warn_on_drift(dir, &info.container, &sandbox)?;
             backend().run_checked(&["start", &info.container])?;
+            crate::devsbd::ensure_recorded(key, info, false);
             // Services may have been recreated with new addresses (or gc'd)
             // since the instance last ran; bring them up and refresh resolution.
             let project = services::project_id(dir)?;
@@ -68,6 +69,7 @@ fn start_instance(dir: &Path, key: &str, info: &Instance) -> Result<()> {
         None => {
             let services = stop::service_containers(&info.project, &info.instance_id);
             start_containers(&info.container, &services, false);
+            crate::devsbd::ensure_recorded(key, info, false);
         }
     }
     println!("started {key}");

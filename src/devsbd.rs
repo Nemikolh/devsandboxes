@@ -2,11 +2,22 @@
 //! Both Linux arches are always embedded: the non-host one is the fallback
 //! for emulated images. An empty blob means the helper wasn't built, and
 //! callers fall back to the bind-mount path.
+//!
+//! Also installs the helper into containers (`ensure`): written through
+//! `exec -i` stdin, which works on every runtime (no `docker cp`, no file
+//! binds on Apple `container`).
 
 use std::borrow::Cow;
 use std::io::Read;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+use serde::{Deserialize, Serialize};
+
+use crate::runtime::backend;
+use crate::state::{Instance, State};
+
+/// Serialized as `x86_64` / `aarch64` in state.toml.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Arch {
     X86_64,
     Aarch64,
@@ -65,6 +76,108 @@ fn decompress(zst: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Install path inside the container. `/run` is often tmpfs, hence the
+/// reinstall on every `start`.
+pub const BIN: &str = "/run/devsandbox/bin/devsbd";
+
+/// Write stdin to a temp file and rename, so a concurrent `devsbd version`
+/// never sees a half-written binary.
+const INSTALL_SCRIPT: &str = "mkdir -p /run/devsandbox/bin \
+    && cat > /run/devsandbox/bin/devsbd.tmp \
+    && chmod 755 /run/devsandbox/bin/devsbd.tmp \
+    && mv /run/devsandbox/bin/devsbd.tmp /run/devsandbox/bin/devsbd";
+
+/// Build hash from `devsbd version` output (`devsbd <protocol> <hash>`). The
+/// hash pins the exact build, protocol version included.
+fn parse_version(out: &str) -> Option<&str> {
+    let mut words = out.split_whitespace();
+    match (words.next(), words.next(), words.next(), words.next()) {
+        (Some("devsbd"), Some(_), Some(hash), None) => Some(hash),
+        _ => None,
+    }
+}
+
+/// Arch try order: the one recorded as working (so emulated images go
+/// straight to the right blob), else the host's, then the other. No
+/// `uname`/inspect probe: local runtimes run host-arch containers except
+/// emulated images, which the blind second try covers. Real probing is
+/// deferred to remote-container support (docs/sandbox-helper.md).
+fn candidates(recorded: Option<Arch>) -> [Arch; 2] {
+    let first = recorded.unwrap_or_else(Arch::host);
+    [first, first.other()]
+}
+
+/// Hash reported by the helper installed in `container`; `None` when it is
+/// missing or can't run (wrong arch, no binary, container down).
+fn installed_hash(container: &str) -> Option<String> {
+    let out = backend().output_quiet(&["exec", "-u", "root", container, BIN, "version"]).ok()?;
+    parse_version(&out).map(str::to_string)
+}
+
+/// Make sure `container` runs this build's helper; returns the arch that works.
+/// Skips the write when the installed helper already reports an embedded hash
+/// (so a CLI upgrade rewrites it). Otherwise writes each candidate arch and
+/// keeps the first whose `version` reports its hash — one blind retry rather
+/// than matching `exec format error`, whose code/text differ per runtime. `Err`
+/// is a one-line note: the helper is unavailable for this container.
+pub fn install(container: &str, recorded: Option<Arch>) -> Result<Arch, String> {
+    let order = candidates(recorded);
+    if order.iter().all(|a| hash(*a).is_none()) {
+        return Err("devsbd not embedded in this build (see scripts/build-devsbd.sh)".into());
+    }
+    if let Some(current) = installed_hash(container) {
+        if let Some(arch) = order.into_iter().find(|a| hash(*a) == Some(current.as_str())) {
+            return Ok(arch);
+        }
+    }
+    for arch in order {
+        let (Some(want), Some(bytes)) = (hash(arch), blob(arch)) else {
+            continue;
+        };
+        let args = ["exec", "-i", "-u", "root", container, "sh", "-c", INSTALL_SCRIPT];
+        if backend().run_with_stdin(&args, &bytes).is_ok()
+            && installed_hash(container).as_deref() == Some(want)
+        {
+            return Ok(arch);
+        }
+    }
+    Err(format!("devsbd couldn't run in `{container}`"))
+}
+
+/// `install`, printing the note on failure unless `quiet` (the TUI owns the
+/// screen). Never fails the caller: the helper is optional.
+pub fn ensure(container: &str, recorded: Option<Arch>, quiet: bool) -> Option<Arch> {
+    match install(container, recorded) {
+        Ok(arch) => Some(arch),
+        Err(note) => {
+            if !quiet {
+                eprintln!("note: {note}");
+            }
+            None
+        }
+    }
+}
+
+/// `ensure` for an existing instance, persisting `devsbd_arch` under `key`
+/// when it changed. State is reloaded so the save can't clobber writes made
+/// since the caller loaded it.
+pub fn ensure_recorded(key: &str, info: &Instance, quiet: bool) {
+    let arch = ensure(&info.container, info.devsbd_arch, quiet);
+    if arch == info.devsbd_arch {
+        return;
+    }
+    let saved = State::load().and_then(|mut state| match state.instances.get_mut(key) {
+        Some(entry) => {
+            entry.devsbd_arch = arch;
+            state.save()
+        }
+        None => Ok(()),
+    });
+    if let (Err(e), false) = (saved, quiet) {
+        eprintln!("note: couldn't record devsbd arch: {e:#}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,6 +211,76 @@ mod tests {
             let slot = [&b"DEVSBD_BUILD_HASH:"[..], h.as_bytes()].concat();
             assert!(b.windows(slot.len()).any(|w| w == slot), "{arch:?}");
         }
+    }
+
+    #[test]
+    fn parse_version_takes_the_hash() {
+        assert_eq!(parse_version("devsbd 1 abc123\n"), Some("abc123"));
+        assert_eq!(parse_version("devsbd 1"), None);
+        assert_eq!(parse_version("devsbd 1 abc extra"), None);
+        assert_eq!(parse_version("sh: devsbd: not found"), None);
+        assert_eq!(parse_version(""), None);
+    }
+
+    #[test]
+    fn candidates_prefer_recorded_then_host() {
+        assert_eq!(candidates(None), [Arch::host(), Arch::host().other()]);
+        assert_eq!(candidates(Some(Arch::Aarch64)), [Arch::Aarch64, Arch::X86_64]);
+        assert_eq!(candidates(Some(Arch::X86_64)), [Arch::X86_64, Arch::Aarch64]);
+    }
+
+    #[test]
+    fn arch_serializes_lowercase() {
+        #[derive(Serialize, Deserialize)]
+        struct W {
+            a: Arch,
+        }
+        assert_eq!(toml::to_string(&W { a: Arch::X86_64 }).unwrap().trim(), "a = \"x86_64\"");
+        let w: W = toml::from_str("a = \"aarch64\"").unwrap();
+        assert_eq!(w.a, Arch::Aarch64);
+    }
+
+    /// Docker-gated, and skipped when no helper is embedded: installs into a
+    /// throwaway alpine container, checks the hash-matching no-op, then the
+    /// wrong-arch-first retry.
+    #[test]
+    fn installs_into_container_with_docker() {
+        use std::process::Command;
+        let docker_ok = matches!(Command::new("docker").arg("info").output(), Ok(o) if o.status.success());
+        if !docker_ok || hash(Arch::host()).is_none() {
+            eprintln!("skipping installs_into_container_with_docker: docker or embedded helper unavailable");
+            return;
+        }
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let name = format!("devsandbox-devsbd-test-{stamp}");
+        let up = Command::new("docker")
+            .args(["run", "-d", "--rm", "--name", &name, "alpine:3.20", "sleep", "300"])
+            .output()
+            .unwrap();
+        assert!(up.status.success(), "{}", String::from_utf8_lossy(&up.stderr));
+        let inode = || {
+            let out = Command::new("docker").args(["exec", &name, "stat", "-c", "%i", BIN]).output().unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        let result = std::panic::catch_unwind(|| {
+            let arch = install(&name, None).unwrap();
+            assert_eq!(installed_hash(&name).as_deref(), hash(arch));
+            // Current helper: no rewrite (mv would change the inode).
+            let before = inode();
+            assert_eq!(install(&name, Some(arch.other())), Ok(arch));
+            assert_eq!(inode(), before);
+            // Missing helper, wrong arch recorded: blind retry lands on one that
+            // runs (the other arch too, where qemu binfmt is registered).
+            Command::new("docker").args(["exec", &name, "rm", BIN]).output().unwrap();
+            let retried = install(&name, Some(Arch::host().other())).unwrap();
+            assert_eq!(installed_hash(&name).as_deref(), hash(retried));
+        });
+        let _ = Command::new("docker").args(["rm", "-f", &name]).output();
+        result.unwrap();
     }
 
     #[test]

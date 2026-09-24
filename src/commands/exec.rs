@@ -109,6 +109,7 @@ mod tests {
             remote_env: BTreeMap::new(),
             remote_user: None,
             ssh_auth_sock: None,
+            devsbd_arch: None,
             created_unix: 0,
         }
     }

@@ -935,6 +935,7 @@ ports = ["5432:5432"]
             remote_env: Default::default(),
             remote_user: None,
             ssh_auth_sock: None,
+            devsbd_arch: None,
             created_unix: 0,
         }
     }
