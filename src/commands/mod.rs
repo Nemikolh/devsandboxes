@@ -12,6 +12,7 @@ pub mod start;
 pub mod stats;
 pub mod status;
 pub mod stop;
+pub mod vscode;
 
 use std::io::{IsTerminal, Write};
 

@@ -29,7 +29,6 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 use crate::commands;
-use crate::config::Config;
 
 use app::{App, PendingSignal};
 use data::Snapshot;
@@ -144,7 +143,7 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
         if let Some(action) = app.take_pending_action() {
             match action {
                 PromptAction::Code { instance } => {
-                    app.status = Some(launch_code(&dir, &app, &instance));
+                    app.status = Some(launch_code(&dir, &instance));
                 }
                 // Rename is pure state I/O (`rename_exact`: no stdout, no
                 // prompts — plain `rename` would scribble on the alternate
@@ -362,93 +361,17 @@ fn wait_for_key() {
     }
 }
 
-/// Launch VS Code attached to the selected instance's container, detached.
-/// Best-effort: writes the extensions name-config, then spawns `code`. Returns
-/// a one-line status (error text on failure) for the help-bar.
-fn launch_code(dir: &Path, app: &App, instance: &str) -> String {
-    let Some(snapshot) = &app.snapshot else {
-        return format!("code: no data yet for `{instance}`");
+/// Launch VS Code attached to `instance` (a snapshot row name, which equals
+/// the state instance key). Returns a one-line status for the help-bar.
+fn launch_code(dir: &Path, instance: &str) -> String {
+    let state = match crate::state::State::load() {
+        Ok(s) => s,
+        Err(e) => return format!("code: {e:#}"),
     };
-    let Some(row) = snapshot.instances.iter().find(|r| r.name == instance) else {
+    let Some(info) = state.instances.get(instance) else {
         return format!("code: unknown instance `{instance}`");
     };
-
-    // Extensions and remoteUser come from the resolved sandbox; failure to
-    // resolve is non-fatal — fall back to the remote user recorded in state at
-    // run time so the attach still opens with write access.
-    let resolved = Config::load(dir)
-        .ok()
-        .and_then(|cfg| cfg.resolve_sandbox(&row.sandbox).ok());
-    let extensions: Vec<String> = resolved
-        .as_ref()
-        .and_then(|sb| sb.properties.vscode_extensions().map(<[String]>::to_vec))
-        .unwrap_or_default();
-    let remote_user = resolved
-        .as_ref()
-        .and_then(|sb| sb.properties.remote_user.clone())
-        .or_else(|| row.remote_user.clone());
-    let _ = commands::run::write_vscode_name_config(
-        &row.container,
-        &extensions,
-        remote_user.as_deref(),
-    );
-
-    // Prefer the generated `.code-workspace` (window named after the instance,
-    // carries the extra `folders` roots); instances created before it existed
-    // fall back to a plain folder open. Row names equal state instance keys.
-    let workspace_file = crate::state::State::load()
-        .ok()
-        .and_then(|s| s.instances.get(instance).and_then(|i| i.workspace_file.clone()));
-    let (flag, path) = match &workspace_file {
-        Some(file) => ("--file-uri", file.as_str()),
-        None => ("--folder-uri", row.workspace.as_str()),
-    };
-    // The Remote-Containers extension resolves a different authority per runtime.
-    // Docker/podman use `attached-container` (hex of the bare container name).
-    // Apple `container` uses `apple-container` (hex of a JSON `{id, image}`
-    // payload) and requires the user's opt-in
-    // `dev.containers.experimentalAppleContainerSupport` setting.
-    let backend = crate::runtime::backend();
-    let (authority, hint) = if backend.name() == "container" {
-        let image = apple_image_reference(&row.container).unwrap_or_default();
-        let payload = serde_json::json!({ "id": row.container, "image": image }).to_string();
-        (
-            format!("apple-container+{}", hex_encode(&payload)),
-            " (needs dev.containers.experimentalAppleContainerSupport=true)",
-        )
-    } else {
-        (format!("attached-container+{}", hex_encode(&row.container)), "")
-    };
-    let uri = format!("vscode-remote://{authority}/{path}");
-    match std::process::Command::new("code").args([flag, &uri]).spawn() {
-        Ok(_) => format!("opening VS Code → {instance}{hint}"),
-        Err(e) => format!("code: failed to launch (`code` on PATH?): {e}"),
-    }
-}
-
-/// Apple `container` image reference (`configuration.image.reference`) for
-/// `container`, needed in the `apple-container` attach URI payload. Best-effort:
-/// `None` when inspect fails or the field is absent, in which case the caller
-/// sends an empty image (the resolver only requires `id`).
-fn apple_image_reference(container: &str) -> Option<String> {
-    let json = crate::runtime::backend().inspect_json(container).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&json).ok()?;
-    let obj = v.get(0).unwrap_or(&v);
-    obj.get("configuration")?
-        .get("image")?
-        .get("reference")?
-        .as_str()
-        .map(str::to_string)
-}
-
-/// Lowercase hex of a string's UTF-8 bytes, as the Remote-Containers URI wants.
-fn hex_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() * 2);
-    for b in s.bytes() {
-        out.push(char::from_digit((b >> 4) as u32, 16).unwrap());
-        out.push(char::from_digit((b & 0xf) as u32, 16).unwrap());
-    }
-    out
+    commands::vscode::launch(dir, instance, info).unwrap_or_else(|e| format!("{e:#}"))
 }
 
 /// Result of a background `s` stop/start, drained by the event loop.
@@ -566,34 +489,4 @@ fn spawn_collect(dir: &Path) -> Receiver<Snapshot> {
         let _ = tx.send(data::collect(&dir));
     });
     rx
-}
-
-#[cfg(test)]
-mod tests {
-    use super::hex_encode;
-
-    #[test]
-    fn hex_encodes_container_name() {
-        // Lowercase hex of the UTF-8 bytes, matching the attach URI format.
-        assert_eq!(hex_encode("devsandbox-web"), "64657673616e64626f782d776562");
-        assert_eq!(hex_encode(""), "");
-        assert_eq!(hex_encode("A/z"), "412f7a");
-    }
-
-    #[test]
-    fn apple_authority_payload_roundtrips() {
-        // The `apple-container` authority carries hex of a JSON `{id, image}`
-        // payload; VS Code hex-decodes and `JSON.parse`s it. Verify the encoding
-        // devsandbox emits decodes back to that object.
-        let payload = serde_json::json!({ "id": "devsandbox-web", "image": "img:latest" })
-            .to_string();
-        let hex = hex_encode(&payload);
-        let bytes: Vec<u8> = (0..hex.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
-            .collect();
-        let decoded: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(decoded["id"], "devsandbox-web");
-        assert_eq!(decoded["image"], "img:latest");
-    }
 }

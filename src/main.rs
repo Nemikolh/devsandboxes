@@ -132,6 +132,11 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Open VS Code attached to a sandbox instance (same as `o` in the TUI)
+    Vscode {
+        /// Instance name, sandbox config name, or repository folder name
+        name: String,
+    },
     /// Show CPU/memory usage of running devsandbox containers
     Stats {
         /// Output JSON instead of a table
@@ -208,6 +213,7 @@ fn main() -> Result<()> {
         },
         Command::Logs { name, lines } => commands::logs::logs(&name, lines),
         Command::Inspect { name, json } => commands::inspect::inspect(&name, json),
+        Command::Vscode { name } => commands::vscode::vscode(&cli.dir, &name),
         Command::Stats { json } => commands::stats::stats(json),
         Command::Status { json: _ } => commands::status::status(&cli.dir),
         Command::Exec { interactive, tty, name, command } => {
