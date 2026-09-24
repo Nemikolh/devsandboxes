@@ -5,8 +5,13 @@
 //!
 //! Wire format, little-endian, one byte stream per direction:
 //! `u32 stream | u8 kind | u32 len | payload[len]`. Control frames (`Hello`,
-//! `Ping`, `Pong`) use stream 0; the daemon allocates stream ids from 1 for
-//! the connections it accepts.
+//! `Ping`, `Pong`, `Caps`) use stream 0; the daemon allocates stream ids from 1
+//! for the connections it accepts.
+//!
+//! Kinds: 0 `Hello` · 1 `Open` · 2 `Data` · 3 `Close` · 4 `Ping` · 5 `Pong` ·
+//! 6 `Quit` · 7 `Connect` · 8 `Window` · 9 `Eof` · 10 `Caps`. 7–10 are the
+//! additive port-forwarding frames (see docs/port-forwarding.md); older peers
+//! skip them as unknown kinds.
 //!
 //! **Frozen across versions:** the header layout, `Hello`'s leading `u32`
 //! version, and `Quit`. An outdated daemon must still understand the `Quit` a
@@ -51,8 +56,27 @@ const KIND_CLOSE: u8 = 3;
 const KIND_PING: u8 = 4;
 const KIND_PONG: u8 = 5;
 const KIND_QUIT: u8 = 6;
+const KIND_CONNECT: u8 = 7;
+const KIND_WINDOW: u8 = 8;
+const KIND_EOF: u8 = 9;
+const KIND_CAPS: u8 = 10;
 
 const HEADER_LEN: usize = 9;
+
+/// Optional capability bits carried in `Caps` (and, later, `Hello`). A missing
+/// bit means the peer won't handle the matching frames; unknown bits are
+/// ignored, so the set can grow without a `VERSION` bump.
+pub mod caps {
+    /// Daemon serves `Connect` streams with flow control + half-close.
+    pub const TCP_FORWARD: u32 = 1 << 0;
+    /// Host serves ssh-agent streams for this bridge.
+    pub const SSH_AGENT: u32 = 1 << 1;
+}
+
+/// Starting per-direction credit for a flow-controlled stream: a sender may
+/// have this many bytes outstanding before a `Window` grants more. Sized so a
+/// single stalled reader can't starve the mux yet bulk transfers stay full.
+pub const INITIAL_WINDOW: u32 = 256 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
@@ -65,8 +89,25 @@ pub enum Frame {
     /// A new stream on `channel`, e.g. an ssh client connected to the agent socket.
     Open { stream: u32, channel: u8 },
     Data { stream: u32, bytes: Vec<u8> },
-    /// Either side is done with `stream`; the peer drops its end.
-    Close { stream: u32 },
+    /// Either side is done with `stream`; the peer drops its end. `reason` is an
+    /// optional UTF-8 diagnostic (empty = none) the host surfaces, e.g.
+    /// `connection refused`; an empty reason encodes to no payload, so it stays
+    /// byte-identical to the original `Close` and old peers are unaffected.
+    Close { stream: u32, reason: String },
+    /// Host asks the daemon to open a TCP stream to `host:port` from inside the
+    /// container. `stream` carries the host id (high bit set). Flow-controlled
+    /// end to end; see docs/port-forwarding.md.
+    Connect { stream: u32, host: String, port: u16 },
+    /// Flow control: the receiver grants `credit` more bytes it's ready to
+    /// accept on `stream`. Batched (one per half-window), not one per chunk.
+    Window { stream: u32, credit: u32 },
+    /// Half-close: the sender's local side hit EOF on `stream`; the peer
+    /// `shutdown(Write)`s its local socket but keeps the other direction open.
+    Eof { stream: u32 },
+    /// Host capabilities, sent once on stream 0 right after the handshake. Lets
+    /// the daemon route by what this host supports; passes through the bridge
+    /// verbatim. An old daemon skips this unknown kind.
+    Caps(u32),
     /// Liveness check; the peer answers `Pong` with the same payload.
     Ping(Vec<u8>),
     Pong(Vec<u8>),
@@ -90,7 +131,16 @@ impl Frame {
             }
             Frame::Open { stream, channel } => (*stream, KIND_OPEN, vec![*channel]),
             Frame::Data { stream, bytes } => (*stream, KIND_DATA, bytes.clone()),
-            Frame::Close { stream } => (*stream, KIND_CLOSE, Vec::new()),
+            Frame::Close { stream, reason } => (*stream, KIND_CLOSE, reason.clone().into_bytes()),
+            Frame::Connect { stream, host, port } => {
+                let mut p = port.to_le_bytes().to_vec();
+                p.push(host.len() as u8);
+                p.extend_from_slice(host.as_bytes());
+                (*stream, KIND_CONNECT, p)
+            }
+            Frame::Window { stream, credit } => (*stream, KIND_WINDOW, credit.to_le_bytes().to_vec()),
+            Frame::Eof { stream } => (*stream, KIND_EOF, Vec::new()),
+            Frame::Caps(c) => (0, KIND_CAPS, c.to_le_bytes().to_vec()),
             Frame::Ping(p) => (0, KIND_PING, p.clone()),
             Frame::Pong(p) => (0, KIND_PONG, p.clone()),
             Frame::Quit => (0, KIND_QUIT, Vec::new()),
@@ -137,7 +187,41 @@ impl Frame {
                 _ => return Err(invalid("Open payload must be one channel byte")),
             },
             KIND_DATA => Frame::Data { stream, bytes: payload },
-            KIND_CLOSE => Frame::Close { stream },
+            // An empty payload is a plain close; a reason is decoded lossily so a
+            // garbled diagnostic never turns a close into a hard error.
+            KIND_CLOSE => Frame::Close {
+                stream,
+                reason: String::from_utf8_lossy(&payload).into_owned(),
+            },
+            KIND_CONNECT => {
+                // u16 port LE | u8 host_len | host utf-8.
+                if payload.len() < 3 {
+                    return Err(invalid("short Connect"));
+                }
+                let port = u16::from_le_bytes(payload[..2].try_into().unwrap());
+                let host_len = payload[2] as usize;
+                if payload.len() != 3 + host_len {
+                    return Err(invalid("Connect host length mismatch"));
+                }
+                let host = String::from_utf8(payload[3..].to_vec())
+                    .map_err(|_| invalid("Connect host is not utf-8"))?;
+                if host.is_empty() {
+                    return Err(invalid("Connect host is empty"));
+                }
+                if port == 0 {
+                    return Err(invalid("Connect port is 0"));
+                }
+                Frame::Connect { stream, host, port }
+            }
+            KIND_WINDOW => match payload[..].try_into() {
+                Ok(b) => Frame::Window { stream, credit: u32::from_le_bytes(b) },
+                Err(_) => return Err(invalid("Window payload must be four bytes")),
+            },
+            KIND_EOF => Frame::Eof { stream },
+            KIND_CAPS => match payload[..].try_into() {
+                Ok(b) => Frame::Caps(u32::from_le_bytes(b)),
+                Err(_) => return Err(invalid("Caps payload must be four bytes")),
+            },
             KIND_PING => Frame::Ping(payload),
             KIND_PONG => Frame::Pong(payload),
             KIND_QUIT => Frame::Quit,
@@ -210,12 +294,21 @@ pub fn read_frame(r: &mut impl Read) -> io::Result<Option<Frame>> {
     }
 }
 
-/// Exchange `Hello`s: send ours, then require the peer's first frame to be a
-/// `Hello` with our `VERSION`. Returns the peer's build hash.
-pub fn handshake(r: &mut impl Read, w: &mut impl Write, hash: &str) -> io::Result<String> {
-    write_frame(w, &Frame::Hello { version: VERSION, hash: hash.to_string(), caps: 0 })?;
+/// What the peer told us in its `Hello`: its build hash (informational) and its
+/// capability bitset (0 from a peer that doesn't advertise any).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Peer {
+    pub hash: String,
+    pub caps: u32,
+}
+
+/// Exchange `Hello`s: send ours (advertising `caps`), then require the peer's
+/// first frame to be a `Hello` with our `VERSION`. Returns the peer's hash and
+/// advertised caps.
+pub fn handshake(r: &mut impl Read, w: &mut impl Write, hash: &str, caps: u32) -> io::Result<Peer> {
+    write_frame(w, &Frame::Hello { version: VERSION, hash: hash.to_string(), caps })?;
     match read_frame(r)? {
-        Some(Frame::Hello { version: VERSION, hash, .. }) => Ok(hash),
+        Some(Frame::Hello { version: VERSION, hash, caps }) => Ok(Peer { hash, caps }),
         Some(Frame::Hello { version, .. }) => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             VersionMismatch { peer: version, ours: VERSION },
@@ -236,7 +329,12 @@ mod tests {
             Frame::Open { stream: 7, channel: channel::SSH_AGENT },
             Frame::Data { stream: 7, bytes: b"\x00\x00\x00\x01\x0b".to_vec() },
             Frame::Data { stream: u32::MAX, bytes: Vec::new() },
-            Frame::Close { stream: 7 },
+            Frame::Close { stream: 7, reason: String::new() },
+            Frame::Close { stream: 8, reason: "connection refused".into() },
+            Frame::Connect { stream: 0x8000_0001, host: "postgres".into(), port: 5432 },
+            Frame::Window { stream: 7, credit: INITIAL_WINDOW },
+            Frame::Eof { stream: 7 },
+            Frame::Caps(caps::TCP_FORWARD | caps::SSH_AGENT),
             Frame::Ping(b"t".to_vec()),
             Frame::Pong(Vec::new()),
             Frame::Quit,
@@ -274,6 +372,105 @@ mod tests {
         assert_eq!(hello[..HEADER_LEN + 4], [0, 0, 0, 0, 0, 10, 0, 0, 0, 1, 0, 0, 0]);
         // Full current layout, for change awareness.
         assert_eq!(hello[HEADER_LEN + 4..], [1, b'h', 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn connect_byte_layout() {
+        // u16 port LE | u8 host_len | host utf-8, after the header.
+        let wire = Frame::Connect { stream: 0x8000_0002, host: "db".into(), port: 5432 }.encode();
+        assert_eq!(
+            wire,
+            [
+                0x02, 0x00, 0x00, 0x80, // stream, high bit set
+                KIND_CONNECT,
+                5, 0, 0, 0, // payload len
+                0x38, 0x15, // port 5432 LE
+                2,          // host_len
+                b'd', b'b',
+            ]
+        );
+    }
+
+    #[test]
+    fn window_byte_layout() {
+        let wire = Frame::Window { stream: 7, credit: INITIAL_WINDOW }.encode();
+        #[rustfmt::skip]
+        let want = [
+            7, 0, 0, 0,        // stream
+            KIND_WINDOW,
+            4, 0, 0, 0,        // payload len
+            0x00, 0x00, 0x04, 0x00, // 262144 LE
+        ];
+        assert_eq!(wire, want);
+    }
+
+    /// An empty-reason `Close` carries no payload, so it encodes byte-identically
+    /// to the pre-`reason` `Close` (stream | KIND_CLOSE | len 0) and old peers see
+    /// no change. A reason rides along and decodes back.
+    #[test]
+    fn close_reason_is_backward_compatible() {
+        let bare = Frame::Close { stream: 4, reason: String::new() }.encode();
+        assert_eq!(bare, [4, 0, 0, 0, KIND_CLOSE, 0, 0, 0, 0]);
+
+        let with_reason = Frame::Close { stream: 4, reason: "refused".into() }.encode();
+        assert_eq!(
+            read_frame(&mut Cursor::new(with_reason)).unwrap(),
+            Some(Frame::Close { stream: 4, reason: "refused".into() })
+        );
+
+        // An old-style empty-payload Close on the wire decodes to an empty reason.
+        assert_eq!(
+            read_frame(&mut Cursor::new(bare)).unwrap(),
+            Some(Frame::Close { stream: 4, reason: String::new() })
+        );
+    }
+
+    /// A `Close` reason that isn't valid UTF-8 decodes lossily rather than
+    /// failing: a garbled diagnostic must never break tearing a stream down.
+    #[test]
+    fn close_reason_non_utf8_decodes_lossily() {
+        let mut wire = vec![4, 0, 0, 0, KIND_CLOSE, 2, 0, 0, 0];
+        wire.extend_from_slice(&[0xff, 0xfe]);
+        assert_eq!(
+            read_frame(&mut Cursor::new(wire)).unwrap(),
+            Some(Frame::Close { stream: 4, reason: "\u{fffd}\u{fffd}".into() })
+        );
+    }
+
+    #[test]
+    fn malformed_connect_and_window_rejected() {
+        let base = Frame::Connect { stream: 0x8000_0001, host: "db".into(), port: 80 }.encode();
+        // Short (only 2 payload bytes, missing host_len).
+        let mut short = base.clone();
+        short[5..9].copy_from_slice(&2u32.to_le_bytes());
+        short.truncate(HEADER_LEN + 2);
+        // Empty host: port 80 | host_len 0 | (no host bytes).
+        let empty_host = {
+            let mut w = vec![0x01, 0x00, 0x00, 0x80, KIND_CONNECT, 3, 0, 0, 0];
+            w.extend_from_slice(&80u16.to_le_bytes());
+            w.push(0);
+            w
+        };
+        // Non-utf8 host.
+        let bad_utf8 = {
+            let mut w = vec![0x01, 0x00, 0x00, 0x80, KIND_CONNECT, 4, 0, 0, 0];
+            w.extend_from_slice(&80u16.to_le_bytes());
+            w.push(1);
+            w.push(0xff);
+            w
+        };
+        // Port 0.
+        let mut port_zero = base.clone();
+        port_zero[HEADER_LEN..HEADER_LEN + 2].copy_from_slice(&0u16.to_le_bytes());
+        // Window with a payload that isn't four bytes.
+        let mut bad_window = Frame::Window { stream: 1, credit: 1 }.encode();
+        bad_window[5..9].copy_from_slice(&3u32.to_le_bytes());
+        bad_window.truncate(HEADER_LEN + 3);
+
+        for wire in [short, empty_host, bad_utf8, port_zero, bad_window] {
+            let err = read_frame(&mut Cursor::new(wire)).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        }
     }
 
     /// Reader yielding one byte per `read`, like a pipe under pressure.
@@ -374,7 +571,7 @@ mod tests {
     fn version_mismatch_is_a_downcastable_typed_error() {
         let mut stale = Vec::new();
         write_frame(&mut stale, &Frame::Hello { version: VERSION + 1, hash: String::new(), caps: 0 }).unwrap();
-        let err = handshake(&mut Cursor::new(stale), &mut Vec::new(), "").unwrap_err();
+        let err = handshake(&mut Cursor::new(stale), &mut Vec::new(), "", 0).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         let vm = version_mismatch(&err).expect("typed VersionMismatch");
         assert_eq!(*vm, VersionMismatch { peer: VERSION + 1, ours: VERSION });
@@ -383,15 +580,20 @@ mod tests {
     }
 
     #[test]
-    fn handshake_returns_peer_hash() {
+    fn handshake_returns_peer_hash_and_caps() {
         let mut peer = Vec::new();
-        write_frame(&mut peer, &Frame::Hello { version: VERSION, hash: "peer".into(), caps: 0 }).unwrap();
+        write_frame(
+            &mut peer,
+            &Frame::Hello { version: VERSION, hash: "peer".into(), caps: caps::TCP_FORWARD },
+        )
+        .unwrap();
         let mut sent = Vec::new();
-        let got = handshake(&mut Cursor::new(peer), &mut sent, "mine").unwrap();
-        assert_eq!(got, "peer");
+        let got = handshake(&mut Cursor::new(peer), &mut sent, "mine", caps::SSH_AGENT).unwrap();
+        assert_eq!(got, Peer { hash: "peer".into(), caps: caps::TCP_FORWARD });
+        // We advertised our own caps in the Hello we sent.
         assert_eq!(
             read_frame(&mut Cursor::new(sent)).unwrap(),
-            Some(Frame::Hello { version: VERSION, hash: "mine".into(), caps: 0 })
+            Some(Frame::Hello { version: VERSION, hash: "mine".into(), caps: caps::SSH_AGENT })
         );
     }
 
@@ -399,14 +601,14 @@ mod tests {
     fn handshake_rejects_version_mismatch_and_non_hello() {
         let mut stale = Vec::new();
         write_frame(&mut stale, &Frame::Hello { version: VERSION + 1, hash: String::new(), caps: 0 }).unwrap();
-        let err = handshake(&mut Cursor::new(stale), &mut Vec::new(), "").unwrap_err();
+        let err = handshake(&mut Cursor::new(stale), &mut Vec::new(), "", 0).unwrap_err();
         assert!(version_mismatch(&err).is_some(), "{err}");
 
         let mut ping = Vec::new();
         write_frame(&mut ping, &Frame::Ping(Vec::new())).unwrap();
-        assert!(handshake(&mut Cursor::new(ping), &mut Vec::new(), "").is_err());
+        assert!(handshake(&mut Cursor::new(ping), &mut Vec::new(), "", 0).is_err());
 
-        let err = handshake(&mut Cursor::new(Vec::new()), &mut Vec::new(), "").unwrap_err();
+        let err = handshake(&mut Cursor::new(Vec::new()), &mut Vec::new(), "", 0).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
     }
 
@@ -418,19 +620,19 @@ mod tests {
         let (mut a_r, mut b_w) = std::io::pipe().unwrap();
         let (mut b_r, mut a_w) = std::io::pipe().unwrap();
         let helper = std::thread::spawn(move || {
-            handshake(&mut b_r, &mut b_w, "helper").unwrap();
+            handshake(&mut b_r, &mut b_w, "helper", 0).unwrap();
             let Some(Frame::Ping(p)) = read_frame(&mut b_r).unwrap() else { panic!("want Ping") };
             write_frame(&mut b_w, &Frame::Pong(p)).unwrap();
             write_frame(&mut b_w, &Frame::Open { stream: 1, channel: channel::SSH_AGENT }).unwrap();
             write_frame(&mut b_w, &Frame::Data { stream: 1, bytes: b"req".to_vec() }).unwrap();
-            write_frame(&mut b_w, &Frame::Close { stream: 1 }).unwrap();
+            write_frame(&mut b_w, &Frame::Close { stream: 1, reason: String::new() }).unwrap();
         });
-        assert_eq!(handshake(&mut a_r, &mut a_w, "host").unwrap(), "helper");
+        assert_eq!(handshake(&mut a_r, &mut a_w, "host", 0).unwrap().hash, "helper");
         write_frame(&mut a_w, &Frame::Ping(b"1".to_vec())).unwrap();
         assert_eq!(read_frame(&mut a_r).unwrap(), Some(Frame::Pong(b"1".to_vec())));
         assert_eq!(read_frame(&mut a_r).unwrap(), Some(Frame::Open { stream: 1, channel: 1 }));
         assert_eq!(read_frame(&mut a_r).unwrap(), Some(Frame::Data { stream: 1, bytes: b"req".to_vec() }));
-        assert_eq!(read_frame(&mut a_r).unwrap(), Some(Frame::Close { stream: 1 }));
+        assert_eq!(read_frame(&mut a_r).unwrap(), Some(Frame::Close { stream: 1, reason: String::new() }));
         helper.join().unwrap();
         assert_eq!(read_frame(&mut a_r).unwrap(), None);
     }

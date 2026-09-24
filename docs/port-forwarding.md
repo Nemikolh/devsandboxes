@@ -192,7 +192,7 @@ helper with `scripts/build-devsbd.sh` before `cargo test --workspace`.
 `embedded_host_helper_reports_version` and the docker-gated tests run the
 embedded blob, so a stale blob fails them.
 
-### Step 1 — protocol frames [ ]
+### Step 1 — protocol frames [x]
 
 `src/devsbd/proto.rs` only. Pure, no behavior change anywhere else.
 

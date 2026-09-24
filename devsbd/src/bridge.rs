@@ -21,7 +21,7 @@ pub fn run(hash: &str) -> io::Result<()> {
     // with `proto::MISMATCH_EXIT` so the host can classify the failure as a
     // mismatch from the exit code alone, without string-matching, and stop
     // retrying until a restart rewrites the helper.
-    if let Err(e) = proto::handshake(&mut ctl.try_clone()?, &mut ctl.try_clone()?, hash) {
+    if let Err(e) = proto::handshake(&mut ctl.try_clone()?, &mut ctl.try_clone()?, hash, 0) {
         if let Some(vm) = proto::version_mismatch(&e) {
             eprintln!("devsbd: {}", daemon_mismatch(vm));
             std::process::exit(proto::MISMATCH_EXIT);
@@ -30,7 +30,7 @@ pub fn run(hash: &str) -> io::Result<()> {
     }
     let mut stdin = io::stdin().lock();
     let mut stdout = io::stdout().lock();
-    proto::handshake(&mut stdin, &mut stdout, hash)?;
+    proto::handshake(&mut stdin, &mut stdout, hash, 0)?;
     drop(stdout);
 
     let mut from_daemon = ctl.try_clone()?;

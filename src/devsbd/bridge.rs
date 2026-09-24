@@ -125,7 +125,7 @@ fn spawn_with(
     }
     let hs_child = Arc::clone(&child);
     std::thread::spawn(move || {
-        let result = proto::handshake(&mut stdout, &mut stdin, &hash).map(|_| ()).map_err(|e| {
+        let result = proto::handshake(&mut stdout, &mut stdin, &hash, 0).map(|_| ()).map_err(|e| {
             if timed_out.load(Ordering::Relaxed) {
                 return "helper handshake timed out".to_string();
             }

@@ -138,7 +138,7 @@ impl Mux {
         }
         // Still registered = we ended first, so the peer needs to hear it.
         if self.drop_stream(stream) {
-            let _ = self.send(&Frame::Close { stream });
+            let _ = self.send(&Frame::Close { stream, reason: String::new() });
         }
     }
 
@@ -176,10 +176,10 @@ impl Mux {
                         None => false,
                     };
                     if failed && self.drop_stream(stream) {
-                        let _ = self.send(&Frame::Close { stream });
+                        let _ = self.send(&Frame::Close { stream, reason: String::new() });
                     }
                 }
-                Frame::Close { stream } => {
+                Frame::Close { stream, .. } => {
                     self.drop_stream(stream);
                 }
                 Frame::Ping(payload) => {
@@ -207,12 +207,21 @@ impl Mux {
                             }
                     };
                     if !attached {
-                        let _ = self.send(&Frame::Close { stream });
+                        let _ = self.send(&Frame::Close { stream, reason: String::new() });
                     }
                 }
                 // `Quit` only means something as a control socket's first
                 // frame, which the daemon reads before handing over to `serve`.
-                Frame::Hello { .. } | Frame::Pong(_) | Frame::Quit => {}
+                // The port-forwarding frames (`Connect`/`Window`/`Eof`/`Caps`)
+                // are handled in step 3; ignored here so this build is inert to
+                // them, exactly as an old peer would be.
+                Frame::Hello { .. }
+                | Frame::Pong(_)
+                | Frame::Quit
+                | Frame::Connect { .. }
+                | Frame::Window { .. }
+                | Frame::Eof { .. }
+                | Frame::Caps(_) => {}
             }
         }
         self.ended.store(true, Ordering::Relaxed);
@@ -361,7 +370,7 @@ mod tests {
         let mut r = io::Cursor::new(std::mem::take(&mut *out.lock().unwrap()));
         let mut closed = Vec::new();
         while let Ok(Some(frame)) = proto::read_frame(&mut r) {
-            if let Frame::Close { stream } = frame {
+            if let Frame::Close { stream, .. } = frame {
                 closed.push(stream);
             }
         }
