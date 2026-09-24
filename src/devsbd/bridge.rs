@@ -10,17 +10,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
-use super::{proto, BIN};
+use super::{proto, relay_mode, BIN};
 use crate::runtime::backend;
 use crate::state::{Instance, State};
-
-/// Whether `info` should get a bridge: the helper runs in its container and
-/// the ssh-agent bind mount isn't in place (it occupies the socket path the
-/// daemon listens on). Step 6 of docs/sandbox-helper.md replaces this with an
-/// explicit ssh mode.
-pub fn wanted(info: &Instance) -> bool {
-    info.devsbd_arch.is_some() && info.ssh_auth_sock.is_none()
-}
 
 /// A running bridge; dropping it kills the `exec` (the in-container bridge
 /// then sees stdin EOF and exits).
@@ -51,8 +43,18 @@ impl Drop for Bridge {
 }
 
 /// The host agent socket, read per stream so agent rotation needs no restart.
+/// `$SSH_AUTH_SOCK` set and its path present on the host; the existence check
+/// also gates whether a bridge is worth spawning (`has_host_agent`).
 fn host_agent() -> Option<PathBuf> {
-    std::env::var_os("SSH_AUTH_SOCK").map(PathBuf::from)
+    let sock = PathBuf::from(std::env::var_os("SSH_AUTH_SOCK")?);
+    std::fs::metadata(&sock).is_ok().then_some(sock)
+}
+
+/// Whether the host has a usable ssh-agent right now. Gates bridge spawning
+/// (`exec_status`, `Bridges::reconcile`) and `SSH_AUTH_SOCK` injection: with no
+/// agent a bridge and the env var only cost an extra `exec` that can't help.
+pub fn has_host_agent() -> bool {
+    host_agent().is_some()
 }
 
 /// Start a bridge for `info` without waiting for its handshake (see
@@ -128,9 +130,14 @@ impl Bridges {
     /// wants one; drop the rest. Dead bridges are retried after `RETRY`.
     pub fn reconcile(&mut self, running: &[&str]) {
         self.live.retain(|c, _| running.contains(&c.as_str()));
+        // No host agent → nothing to relay; skip the per-instance `exec`.
+        if !has_host_agent() {
+            self.live.clear();
+            return;
+        }
         let Ok(state) = State::load() else { return };
         for info in state.instances.values() {
-            if !running.contains(&info.container.as_str()) || !wanted(info) {
+            if !running.contains(&info.container.as_str()) || !relay_mode(info) {
                 continue;
             }
             let retry_due = match self.live.get(&info.container) {

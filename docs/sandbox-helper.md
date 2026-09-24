@@ -234,21 +234,47 @@ ssh (in container) ──unix──▶ devsbd daemon ◀──frames over exec s
     latency. The daemon's hold covers a command that reaches the agent
     first (a `docker exec` startup is ~60–100 ms). A failed handshake is
     reported after the command exits, so it can't interleave with its output.
-  - Until step 6, bridges only run for instances with the helper and *no*
-    bind mount (`bridge::wanted`): the mount occupies the daemon's socket path.
+  - Bridges run for instances in relay mode (`devsbd::relay_mode`: helper
+    installed, no bind mount) when the host has a live agent. A mounted
+    instance stays on the mount (the mount occupies the daemon's socket path).
   - Everything else (VS Code terminals, plain `docker exec`): covered whenever
     a devsandbox TUI/exec is alive; otherwise not. VS Code keeps its own
     forwarding. Document the gap; a `devsandbox agent <instance>` foreground
     command is a cheap follow-up if needed.
 
-- **Env:** `exec_argv` keeps injecting `SSH_AUTH_SOCK` (`src/commands/exec.rs:81`)
-  — the target path is identical to the bind-mount design, so the two modes
-  are interchangeable per instance. `Instance.ssh_auth_sock` stays the switch;
-  add `ssh_mode: Mount | Relay` (or infer from `devsbd_arch.is_some()`).
+- **Env:** `exec_argv` (`src/commands/exec.rs`) injects `SSH_AUTH_SOCK` in both
+  modes at the same target. Mount mode carries the target on
+  `Instance.ssh_auth_sock` and always injects. Relay mode is inferred
+  (`devsbd::relay_mode` = `devsbd_arch.is_some() && ssh_auth_sock.is_none()`,
+  `false` off unix) and injects the fixed `SSH_AGENT_TARGET` **only when the
+  host has a live agent** (`$SSH_AUTH_SOCK` set and the path exists), so an
+  agent-less exec doesn't point ssh at a dead socket. Same probe gates bridge
+  spawning (`bridge::has_host_agent`, from `exec_status` and
+  `Bridges::reconcile`): no host agent → no extra `exec` that can't help. No
+  `ssh_mode` field: the two `Option`s already encode it.
 
-- **Precedence:** helper available → relay (every runtime, including Apple
-  `container` and Windows once the pipe client exists); else → existing bind
-  mount on docker/podman Linux.
+- **Precedence:** relay-first. On unix, whenever a helper is embedded
+  (`devsbd::embedded()`), `run` never mounts the socket — the daemon serves it
+  on every runtime (docker/podman now; Apple `container` and Windows once the
+  pipe client exists). Only builds with no embedded helper (`cargo install`)
+  and non-unix hosts fall back to the bind mount. An instance created under one
+  path keeps it until recreated (`rm` + `run` / `rebuild`); the two `Option`s
+  on `Instance` record which.
+
+- **Last start wins (takeover).** Takeover keys on build-hash inequality,
+  not on which build is newer: any `start` by a CLI of another build
+  (upgrade, downgrade, or a second install) rewrites the binary and evicts
+  the running daemon, ending its bridges and in-flight agent streams. Two
+  CLI builds used against the same containers therefore evict each other on
+  every `start`. Same build is a no-op. Chosen over a version gate so the
+  binary on disk always matches the running daemon.
+
+- **0666 agent socket.** The daemon runs as root and chmods
+  `/run/devsandbox/ssh-agent.sock` to 0666, so **any uid inside the container**
+  can reach the host agent (same effective exposure as the bind mount when the
+  container process runs as the socket owner — it fixes that path's
+  uid-mismatch failure). The blast radius is one container's processes; the
+  private key never enters the sandbox regardless.
 
 ### Frame protocol
 
@@ -302,7 +328,7 @@ kind: 0 Hello(u32 version, hash utf-8)  1 Open(channel: u8)  2 Data  3 Close  4 
 4. [x] Shared frame protocol + tests.
 5. [x] Helper `daemon` + `bridge`; host-side bridge driver (`src/devsbd/bridge.rs`),
    wired into CLI `exec` and the TUI.
-6. Switch ssh-agent to relay when available (details below).
+6. [x] Switch ssh-agent to relay when available (details below).
 7. Protocol revision before first release (details below).
 8. Keepalive + timeouts (details below).
 9. Daemon self-heal (details below).

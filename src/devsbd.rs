@@ -72,6 +72,22 @@ pub fn hash(arch: Arch) -> Option<&'static str> {
     (!h.is_empty()).then_some(h)
 }
 
+/// Whether this build ships a helper for any arch. False for `cargo install`
+/// builds (no `DEVSANDBOX_DEVSBD_DIR`): they keep the ssh-agent bind mount.
+pub fn embedded() -> bool {
+    hash(Arch::X86_64).is_some() || hash(Arch::Aarch64).is_some()
+}
+
+/// Whether `info`'s ssh-agent uses the relay (not the bind mount): the helper
+/// runs in its container and no mount occupies the daemon's socket path. Not
+/// cfg-gated so `exec_argv` can call it on every platform; the relay is
+/// unix-only, so `false` off unix (`bridge` compiles only there). An instance
+/// created with a mount keeps mount mode until recreated (`ssh_auth_sock` is
+/// `Some`).
+pub fn relay_mode(info: &Instance) -> bool {
+    cfg!(unix) && info.devsbd_arch.is_some() && info.ssh_auth_sock.is_none()
+}
+
 fn decompress(zst: &[u8]) -> Option<Vec<u8>> {
     if zst.is_empty() {
         return None;
@@ -159,14 +175,21 @@ fn start_daemon(container: &str) {
     let _ = backend().output_quiet(&["exec", "-d", "-u", "root", container, BIN, "daemon"]);
 }
 
-/// `install` + `start_daemon`, printing the note on failure unless `quiet`
-/// (the TUI owns the screen). Never fails the caller: the helper is optional.
+/// `install` + `start_daemon`; `Err` carries the reason so the caller can word
+/// its own note (relay-first `run` says "ssh-agent forwarding off"). Never
+/// fails the command: the helper is optional.
+pub fn ensure_or_reason(container: &str, recorded: Option<Arch>) -> Result<Arch, String> {
+    let arch = install(container, recorded)?;
+    start_daemon(container);
+    Ok(arch)
+}
+
+/// `ensure_or_reason`, printing the plain note on failure unless `quiet` (the
+/// TUI owns the screen). The common path; relay-first `run` calls
+/// `ensure_or_reason` directly to reword the note.
 pub fn ensure(container: &str, recorded: Option<Arch>, quiet: bool) -> Option<Arch> {
-    match install(container, recorded) {
-        Ok(arch) => {
-            start_daemon(container);
-            Some(arch)
-        }
+    match ensure_or_reason(container, recorded) {
+        Ok(arch) => Some(arch),
         Err(note) => {
             if !quiet {
                 eprintln!("note: {note}");

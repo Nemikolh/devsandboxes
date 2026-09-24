@@ -135,9 +135,11 @@ Only `start` needs this; `run` creates the link fresh (Step 1) and `rebuild` goe
 
   - **exec-stdio relay** (VS Code-style) — bridge the agent protocol over each
     exec session's stdio to a per-session in-container socket. Zero staleness
-    by construction and needs no file binds, which makes it the Apple
-    `container` path (see _Future_); building it just for Linux staleness is
-    overkill.
+    by construction and needs no file binds. **This is now built and default**
+    on unix whenever the embedded `devsbd` helper is present: the host side
+    connects to its *current* `$SSH_AUTH_SOCK` per stream, so
+    rotation-while-running no longer bites (`docs/sandbox-helper.md`). The mount path below is the
+    fallback for `cargo install` builds (no helper) and non-unix hosts.
 
 - **Not part of `config_hash`.** Forwarding is a runtime/environment fact, not
   config; it must not enter the drift hash or every login would look like
@@ -171,7 +173,7 @@ Blocked today, two independent reasons:
 2. Same VM-boundary problem as Docker Desktop, with **no** documented
    magic-socket equivalent.
 
-A future path would need an in-container relay (e.g. `socat` bridging a TCP forward to a unix socket), which is a materially different mechanism — out of scope until Apple `container` gains socket binds or a host-services socket. If that relay is ever built, note it also eliminates the remaining rotation-while-running staleness on every runtime (see the stale-socket caveat) and could replace the mount path entirely.
+That in-container relay is now built: the embedded `devsbd` helper serves the agent over exec stdio, which needs no file binds and so covers Apple `container` too (`docs/sandbox-helper.md`). Not yet exercised on a Mac; the mechanism is runtime-agnostic (`exec -i`/`exec -d`), so it should work once tested. It also eliminates the rotation-while-running staleness on every runtime and replaces the mount path wherever the helper is embedded.
 
 ## Windows (native): disabled, relay deferred
 
@@ -212,8 +214,7 @@ A future path would need an in-container relay (e.g. `socat` bridging a TCP forw
    unix socket at `SSH_AGENT_TARGET`. Step 3's `exec -e` injection stays the
    same.
 
-This needs a long-lived host process per instance (or per exec session, VS Code-style), which doesn't fit the current mount-and-forget design, `start`
-(Step 4), or rm/gc link cleanup. It's the same exec-stdio relay already noted under the stale-socket caveat and _Future: Apple container_. Building it once would cover Windows, Apple `container`, and live agent rotation, so do all three together if we ever do it.
+The container side (2–3) is the built `devsbd` relay (`docs/sandbox-helper.md`); Windows only lacks the **host side** — a named-pipe client feeding the bridge's stdio, since `host_agent()` reads a unix `$SSH_AUTH_SOCK` today. Add that pipe client and relay mode lights up natively (no mount, no `start` re-point, no link cleanup). Until then, the WSL2 workaround above is the supported path.
 
 ## Appendix — how git chooses `SSH_AUTH_SOCK` vs `GIT_ASKPASS`
 

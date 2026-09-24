@@ -231,14 +231,22 @@ pub(crate) fn materialize(
         Some(_) => vec![git_companion_mount(folder)],
         None => Vec::new(),
     };
-    // Forward the host ssh-agent (a filesystem fact, mounted here; the
-    // activating `SSH_AUTH_SOCK` is injected per exec — see docs/ssh-agent.md).
-    let ssh_auth_sock = match ssh_agent_forward(instance_id)? {
-        Some((mount, target)) => {
-            extra_mounts.push(mount);
-            Some(target)
+    // ssh-agent: relay-first. On unix with an embedded helper we never mount
+    // the socket — the in-container `devsbd` daemon serves it over exec stdio
+    // (docs/sandbox-helper.md), which also fixes rotation-while-running and
+    // works on runtimes that can't bind files. Only builds without a helper
+    // (`cargo install`) and non-unix hosts fall back to the bind mount.
+    let relay_first = cfg!(unix) && crate::devsbd::embedded();
+    let ssh_auth_sock = if relay_first {
+        None
+    } else {
+        match ssh_agent_forward(instance_id)? {
+            Some((mount, target)) => {
+                extra_mounts.push(mount);
+                Some(target)
+            }
+            None => None,
         }
-        None => None,
     };
     let mut mounts = resolve_mounts(dir, folder, &basename, instance_id, sandbox)?;
     for (target, host) in &extra_folders {
@@ -280,8 +288,20 @@ pub(crate) fn materialize(
         &endpoints,
     )?;
     let container = container_name.clone();
-    // Before lifecycle commands, so they could already rely on the helper.
-    let devsbd_arch = crate::devsbd::ensure(&container, None, false);
+    // Before lifecycle commands, so they could already rely on the helper. In
+    // relay-first mode a failure means no ssh-agent forwarding at all (no mount
+    // fallback), so word the note that way; otherwise the plain install note.
+    let devsbd_arch = match crate::devsbd::ensure_or_reason(&container, None) {
+        Ok(arch) => Some(arch),
+        Err(reason) => {
+            if relay_first {
+                eprintln!("note: ssh-agent forwarding off in `{container}`: {reason}");
+            } else {
+                eprintln!("note: {reason}");
+            }
+            None
+        }
+    };
     let workspace_file = write_workspace_file(
         &container,
         instance,

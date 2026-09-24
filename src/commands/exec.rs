@@ -47,11 +47,13 @@ pub fn exec_status(name: &str, interactive: bool, tty: bool, command: &[String])
 
     // ssh-agent relay for the command's lifetime, started optimistically
     // alongside it: no handshake wait, the daemon holds an agent client that
-    // beats the bridge (docs/sandbox-helper.md).
+    // beats the bridge (docs/sandbox-helper.md). Only when a host agent exists,
+    // same gate as the `SSH_AUTH_SOCK` injection below.
     #[cfg(unix)]
-    let bridge = crate::devsbd::bridge::wanted(instance)
-        .then(|| crate::devsbd::bridge::spawn(instance))
-        .flatten();
+    let bridge = (crate::devsbd::relay_mode(instance)
+        && crate::devsbd::bridge::has_host_agent())
+    .then(|| crate::devsbd::bridge::spawn(instance))
+    .flatten();
     let args = exec_argv(instance, interactive, tty, command);
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let code = backend().run_inherit(&arg_refs)?;
@@ -73,6 +75,34 @@ pub fn exec_argv(
     tty: bool,
     command: &[String],
 ) -> Vec<String> {
+    // Relay mode injects `SSH_AUTH_SOCK` only when the host has a live agent,
+    // so an agent-less exec doesn't point ssh at a dead socket; mount mode
+    // always injects (the bind decision was made at `run`). The probe lives
+    // outside the pure builder so tests need no env mutation.
+    let host_agent = crate::devsbd::relay_mode(instance) && has_host_agent();
+    exec_argv_with(instance, interactive, tty, command, host_agent)
+}
+
+/// Whether the host currently has a usable ssh-agent, for relay-mode
+/// `SSH_AUTH_SOCK` injection. Unix-only (the relay is); `false` elsewhere.
+#[cfg(unix)]
+fn has_host_agent() -> bool {
+    crate::devsbd::bridge::has_host_agent()
+}
+#[cfg(not(unix))]
+fn has_host_agent() -> bool {
+    false
+}
+
+/// Pure argv builder. `host_agent` says the host has a live agent (relay mode
+/// only); mount mode ignores it and injects unconditionally.
+fn exec_argv_with(
+    instance: &Instance,
+    interactive: bool,
+    tty: bool,
+    command: &[String],
+    host_agent: bool,
+) -> Vec<String> {
     let mut args: Vec<String> = vec!["exec".into()];
     if interactive {
         args.push("-i".into());
@@ -89,9 +119,18 @@ pub fn exec_argv(
         args.push("-e".into());
         args.push(format!("{key}={value}"));
     }
-    // agent forwarding: the socket is a mount, the activating env var rides
-    // every exec, same as remote_env (docs/ssh-agent.md).
-    if let Some(sock) = &instance.ssh_auth_sock {
+    // agent forwarding: the activating env var rides every exec, same as
+    // remote_env. Mount mode carries the target on `ssh_auth_sock`; relay mode
+    // (helper installed, no mount) uses the fixed target, but only when a host
+    // agent is actually present (docs/sandbox-helper.md).
+    let sock = match &instance.ssh_auth_sock {
+        Some(sock) => Some(sock.as_str()),
+        None if crate::devsbd::relay_mode(instance) && host_agent => {
+            Some(crate::commands::run::SSH_AGENT_TARGET)
+        }
+        None => None,
+    };
+    if let Some(sock) = sock {
         args.push("-e".into());
         args.push(format!("SSH_AUTH_SOCK={sock}"));
     }
@@ -131,7 +170,7 @@ mod tests {
     fn argv_minimal() {
         let inst = instance();
         assert_eq!(
-            exec_argv(&inst, false, false, &["ls".into()]),
+            exec_argv_with(&inst, false, false, &["ls".into()], false),
             vec![
                 "exec",
                 "-w",
@@ -149,7 +188,7 @@ mod tests {
         inst.remote_env.insert("FOO".into(), "bar".into());
         inst.remote_env.insert("BAZ".into(), "qux".into());
         assert_eq!(
-            exec_argv(&inst, true, true, &["bash".into(), "-l".into()]),
+            exec_argv_with(&inst, true, true, &["bash".into(), "-l".into()], false),
             vec![
                 "exec",
                 "-i",
@@ -175,8 +214,9 @@ mod tests {
         let mut inst = instance();
         inst.remote_env.insert("FOO".into(), "bar".into());
         inst.ssh_auth_sock = Some("/run/devsandbox/ssh-agent.sock".into());
+        // Mount mode injects regardless of the host-agent flag.
         assert_eq!(
-            exec_argv(&inst, false, false, &["ls".into()]),
+            exec_argv_with(&inst, false, false, &["ls".into()], false),
             vec![
                 "exec",
                 "-w",
@@ -190,6 +230,33 @@ mod tests {
                 "devsandbox-repo-abc1",
                 "ls",
             ]
+        );
+    }
+
+    /// Relay mode (`devsbd_arch` set, no mount): inject the fixed target only
+    /// when a host agent is present. Unix-only — `relay_mode` is `false` off
+    /// unix, so no injection there.
+    #[cfg(unix)]
+    #[test]
+    fn argv_relay_injects_only_with_host_agent() {
+        let mut inst = instance();
+        inst.devsbd_arch = Some(crate::devsbd::Arch::X86_64);
+        assert_eq!(
+            exec_argv_with(&inst, false, false, &["ls".into()], true),
+            vec![
+                "exec",
+                "-w",
+                "/workspaces/repository-1",
+                "-e",
+                "SSH_AUTH_SOCK=/run/devsandbox/ssh-agent.sock",
+                "devsandbox-repo-abc1",
+                "ls",
+            ]
+        );
+        // No host agent → no SSH_AUTH_SOCK, so ssh doesn't hit a dead socket.
+        assert_eq!(
+            exec_argv_with(&inst, false, false, &["ls".into()], false),
+            vec!["exec", "-w", "/workspaces/repository-1", "devsandbox-repo-abc1", "ls"]
         );
     }
 }
