@@ -9,9 +9,10 @@ git worktrees so working trees are never shared.
 
 - `src/main.rs` — clap CLI; no subcommand on a TTY opens the TUI dashboard.
 - `src/commands/*.rs` — one file per verb (`run`, `start`, `stop`, `rebuild`,
-  `rm`, `ps`, `ls`, `exec`, `logs`, `inspect`, `stats`, `services::{gc,ls,rebuild}`). Shared name
+  `rm`, `ps`, `ls`, `exec`, `logs`, `inspect`, `stats`, `port`, `services::{gc,ls,rebuild}`). Shared name
   resolution in `commands/mod.rs` (`resolve_instance`: instance | sandbox |
-  folder basename).
+  folder basename). `port.rs` resolves a forward route (instance | service via a
+  running instance | injection fallback) and hosts the foreground `port` CLI.
 - `src/config.rs` — TOML schema: `[template.*]`, `[sandbox.*]`, `[services.*]`.
   `extends` deep-merges (tables recurse, **arrays concatenate** — that's how
   `template.base` services reach every sandbox). Config drift is detected by
@@ -28,13 +29,18 @@ git worktrees so working trees are never shared.
   `scripts/build-devsbd.sh` and embedded by `build.rs`; `src/devsbd.rs` holds
   the embedded blobs + install, `src/devsbd/proto.rs` the frame protocol
   shared with the helper via `#[path]`. See `docs/sandbox-helper.md`.
+  `src/devsbd/forward.rs` is the host forwarder engine (unix-only): binds a
+  local listener and tunnels each connection through a self-healing bridge, over
+  the mux's flow-controlled `Connect` streams. See `docs/port-forwarding.md`.
 - `src/tui/` — ratatui dashboard. `app.rs` is a deliberately I/O-free state
   machine (unit-tested); `mod.rs` owns the terminal + event loop and runs
   docker work on background threads; `prompt.rs` is the `:` command line
   (`spec.rs` is its declarative grammar table — parsing *and* tab completion
   derive from `SPECS`, so a new flag is one table entry);
   `term.rs` holds the integrated terminal's PTY sessions + tab strip
-  (`TermSession`/`TermTabs`, `docker exec -it` shell rendered via vt100).
+  (`TermSession`/`TermTabs`, `docker exec -it` shell rendered via vt100);
+  `forwards.rs` is the Ports-tab worker thread that owns every live `Forward`
+  (route resolution + docker work off the UI thread), modelled on `BridgeWorker`.
 
 ## Conventions & checks
 

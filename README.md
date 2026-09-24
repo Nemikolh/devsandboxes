@@ -91,9 +91,22 @@ devsandbox                  # no args on a TTY: interactive dashboard
 | `rebuild <name>\|--all [--force]`   | Recreate from current config when drifted; worktree and state kept        |
 | `rm <name>`                         | Remove container, worktree, and state entry                               |
 | `exec [-i] [-t] <name> <cmd…>`      | Exec honoring `remoteEnv` / `remoteUser`                                  |
+| `port <name> [--service s] <port…>` | Forward a container/service port to the host until Ctrl-C (unix only)     |
 | `service ls` / `service rebuild`    | List services / recreate one and rewire running sandboxes in place        |
 | `gc [--force]`                      | Reap unreferenced services, orphaned history files and agent links        |
 | `status --json`                     | Full snapshot for scripts; `ps`/`ls`/`stats`/`inspect` also take `--json` |
+
+`devsandbox port` makes a port inside a running instance or service reachable on the host, on demand — no `-p` at create time, no restart. It runs in the foreground and stops on Ctrl-C.
+
+```bash
+devsandbox port api 3000                # localhost:3000 -> api's :3000
+devsandbox port api 8080:3000           # bind host :8080 instead
+devsandbox port api --service postgres 5432   # api's postgres, via the api container
+devsandbox port --service redis 6379    # a global service, no instance named
+devsandbox port api 3000 --address 0.0.0.0    # bind all interfaces (default 127.0.0.1)
+```
+
+An instance port tunnels straight into its container; a service port is reached through a running instance that references it, falling back to injecting the helper into the service container when none is available. Forwards are also available from the TUI's Ports tab — `p` to add, `d` to remove. Unix hosts only for now.
 
 ## Platform support
 

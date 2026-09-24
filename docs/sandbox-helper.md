@@ -245,9 +245,15 @@ ssh (in container) ──unix──▶ devsbd daemon ◀──frames over exec s
   `exec` but never completes `Hello` is killed and reported as `helper
   handshake timed out`, so a bridge owner is never blocked forever.
   Each agent client connection accepted by the daemon becomes a stream routed
-  to *one* live bridge (most recent). No live bridge → the client is held up
-  to 1s for one to attach, then closed (ssh reports "agent refused", same as
-  no agent). The hold is what makes the optimistic `exec` below safe; its cost
+  to the newest *agent-capable* bridge. Agent-capable means the host's `Caps`
+  advertised `SSH_AGENT`; a bridge that never sent `Caps` counts as capable only
+  when its own `Hello` caps were 0 (a pre-forwarding host, whose bridge never
+  sends `Caps`) — a current bridge whose `Caps` is still in flight is skipped
+  until it arrives (`agent_capable` / `agent_route` in `daemon.rs`), so a
+  `devsandbox port` started from an agent-less shell can't become the newest
+  bridge and break ssh inside the container. No agent-capable bridge → the
+  client is held up to 1s for one to attach, then closed (ssh reports "agent
+  refused", same as no agent). The hold is what makes the optimistic `exec` below safe; its cost
   is a 1s delay before "refused" when no devsandbox process is alive. The daemon
   keeps every connected bridge, so when the newest ends (a CLI `exec`),
   routing falls back to the next newest (the TUI's) instead of to nothing.
@@ -271,19 +277,28 @@ ssh (in container) ──unix──▶ devsbd daemon ◀──frames over exec s
     `is_done` flips, and `Bridges::reconcile` retries. The dead/alive rule is
     a pure fn tested with injected durations; a real-pipe test drives the
     thread with tiny durations.
-    - _Caveat (head-of-line):_ liveness is judged from *inbound* frames, but a
-      `serve` blocked writing `Data` to a slow local socket also stops reading,
-      so it stops updating the last-inbound timestamp — a slow local peer can
-      look dead. Acceptable for agent traffic (small messages); bulk
-      http-proxy will need per-stream flow control (see _Later_) so one slow
-      stream can't stall the frame reader.
+    - _Caveat (head-of-line), resolved for forwarded streams:_ liveness is
+      judged from *inbound* frames, so a `serve` blocked writing `Data` to a
+      slow local socket would stop reading and stop updating the last-inbound
+      timestamp — a slow local peer could look dead. Flow-controlled (`Connect`)
+      streams no longer have this problem: inbound `Data` goes into that
+      stream's own queue (bounded by its credit window) and a per-stream writer
+      thread drains it, so the frame reader never blocks on a local write.
+      The reader also never blocks on *outbound* writes: any frame it must send
+      (a `Close`, a `Window`, a `Pong`) goes through a control-frame queue
+      drained by a separate writer thread (`send_ctl` / `ctl_writer` in
+      `mux.rs`). This breaks a deadlock — the reader holding `out` while blocked
+      on a full pipe that only the peer's reader drains, with the peer's reader
+      stuck in the same spot, so neither pipe ever drains again. Legacy
+      ssh-agent streams keep the inline write on the reader thread (small
+      request/response messages), so their behavior is unchanged.
 
 - **Host side:** for each `Open` the host connects to the *current*
   `$SSH_AUTH_SOCK` (so rotation is a non-issue) — or, later, the Windows
   named pipe. Owner of the host side:
   - Each host process owns its bridges; they're never shared across processes.
-    Several bridges per container are normal (the daemon routes to the newest
-    live one, see _Bridge_).
+    Several bridges per container are normal (the daemon routes agent streams to
+    the newest agent-capable one, see _Bridge_).
   - TUI: one bridge per running instance while the dashboard is open, used by
     every integrated terminal tab on that instance (`devsbd::bridge::Bridges`).
     Owned by a worker thread (`Bridges::spawn_worker` → `BridgeWorker`), not the
@@ -351,7 +366,7 @@ Length-prefixed, little-endian, one byte stream in each direction:
 
 ```
 u32 stream_id | u8 kind | u32 len | payload[len]
-kind: 0 Hello(u32 version, u8 hash_len, hash utf-8, u32 caps)  1 Open(channel: u8)  2 Data  3 Close  4 Ping  5 Pong  6 Quit
+kind: 0 Hello(u32 version, u8 hash_len, hash utf-8, u32 caps)  1 Open(channel: u8)  2 Data  3 Close(reason utf-8, may be empty)  4 Ping  5 Pong  6 Quit  7 Connect(u16 port, u8 host_len, host utf-8)  8 Window(u32 credit)  9 Eof  10 Caps(u32)
 ```
 
 - **Frozen forever:** the header layout, `Hello`'s leading `u32 version`, and
@@ -365,13 +380,46 @@ kind: 0 Hello(u32 version, u8 hash_len, hash utf-8, u32 caps)  1 Open(channel: u
   unknown bits ignored) and bytes after it are ignored, leaving room for
   later fields without a `VERSION` bump.
 
-- Control frames (`Hello`, `Ping`, `Pong`, `Quit`) use stream 0. **Stream-id
-  spaces:** the daemon (container side) allocates ids with the high bit clear
-  (1..2^31, wrapping back to 1, never 0); the host allocates them with the
-  high bit set (none yet). The host refuses (`Close`) an `Open` whose id has
-  the high bit set, whose id is already live, or once 64 streams are live
-  (`MAX_STREAMS`). `Pong` echoes the `Ping` payload (separate kinds so a reply
-  can't be mistaken for a new ping).
+- Control frames (`Hello`, `Ping`, `Pong`, `Quit`, `Caps`) use stream 0.
+  **Stream-id spaces:** the daemon (container side) allocates ids with the high
+  bit clear (1..2^31, wrapping back to 1, never 0); the host allocates them with
+  the high bit set (`HOST_ID_BIT = 1 << 31`) — now used by `Connect` (port
+  forwarding, docs/port-forwarding.md), not just reserved. The host refuses
+  (`Close`) an `Open` whose id has the high bit set, whose id is already live,
+  or once 64 daemon streams are live (`MAX_STREAMS`, which now covers
+  daemon-allocated ids only). Host `Connect`s have their own, higher cap of 256
+  live streams (`MAX_HOST_STREAMS`, in `mux.rs`), enforced daemon-side: browsers
+  open many connections behind one forward. `Pong` echoes the `Ping` payload
+  (separate kinds so a reply can't be mistaken for a new ping).
+- **Additive kinds 7–10** land port forwarding with no `VERSION` bump (all
+  skipped by an old peer that doesn't know them):
+  - `Connect { stream, host, port }` (host → daemon): open a flow-controlled TCP
+    stream to `host:port` from inside the container. `stream` has `HOST_ID_BIT`
+    set. Payload `u16 port | u8 host_len | host` — a short, empty-host, port-0,
+    or non-utf-8 payload is `InvalidData`, like `Open`.
+  - `Window { stream, credit: u32 }` (both ways): the receiver grants `credit`
+    more bytes on `stream` (flow control, below).
+  - `Eof { stream }` (both ways): the sender's local side hit EOF (half-close);
+    the receiver `shutdown(Write)`s its local socket once its write queue drains.
+  - `Caps(u32)` (host → daemon): the host's capability bitset, sent once on
+    stream 0 right after the handshake (caps negotiation, below).
+  - `Close` gained an optional utf-8 `reason` payload (empty = none). An
+    empty-reason `Close` encodes byte-identically to the pre-`reason` `Close`,
+    so old peers are unaffected; the host surfaces the reason (`connection
+    refused`, `no such host postgres`).
+- **Capabilities.** `caps` bits (`proto::caps`): `TCP_FORWARD = 1 << 0` (daemon
+  serves `Connect` with flow control + half-close), `SSH_AGENT = 1 << 1` (host
+  serves ssh-agent streams). The bridge does two separate handshakes and copies
+  bytes, so caps don't flow end to end by themselves:
+  - The daemon's `Hello` advertises `TCP_FORWARD`.
+  - The bridge advertises `own & daemon` caps to the host (its `OWN_CAPS` ANDed
+    with the daemon caps it learned from its first handshake), so a forward is
+    attempted only when the *daemon* that will serve it supports it — otherwise
+    the host reports `helper in <c> is outdated (no port forwarding): restart
+    the instance`.
+  - The host sends `Caps` right after its handshake; it passes through the
+    bridge verbatim to the daemon (an old daemon skips the unknown kind). The
+    host advertises `SSH_AGENT` only when its bridge has a live agent provider.
 - Payload capped at 1 MiB (`MAX_PAYLOAD`): stray bytes on the stream (a shell
   banner on stdout) become an `InvalidData` error, not a huge allocation.
   Malformed `Hello`/`Open` payloads are errors too. **Unknown kinds are
@@ -577,9 +625,10 @@ over; document it), agent socket stays **0666** (document the consequence).
   gets `HTTPS_PROXY`/`HTTP_PROXY` via `exec_argv`; streams go to the global
   credentials service container (network alias, cf. `docs/cli-proxy.md`)
   rather than to the host. Unlike ssh-agent's small messages, bulk HTTP needs
-  flow control, so this adds credit/window frames — a new frame kind gated on a
-  `Hello` `caps` bit (a peer that skips the frames must not be sent them), so
-  it needs no `VERSION` bump.
+  flow control — the `Window` credit frames it needs already landed with port
+  forwarding (docs/port-forwarding.md), per stream on `Connect` streams and
+  gated on the `TCP_FORWARD` caps bit, so this reuses them and still needs no
+  `VERSION` bump.
 
 - TLS interception: devsandbox generates a CA per config root, installs the
   cert in the container (`update-ca-certificates` when present, plus

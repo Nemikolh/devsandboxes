@@ -97,7 +97,8 @@ All additive, per the rules in docs/sandbox-helper.md (_Frame protocol_):
   and then copies bytes, so caps don't flow end to end by themselves:
   - The bridge advertises to the host `own_caps & daemon_caps`: a forward is
     attempted only when the *daemon* that will serve it supports it. Otherwise
-    the host reports `helper in <c> is outdated: restart the instance`.
+    the host reports `helper in <c> is outdated (no port forwarding): restart
+    the instance`.
   - The daemon learns the host's caps from `Caps`, which passes through the
     bridge verbatim. An old daemon skips the unknown kind.
 - **Agent routing fix.** The daemon routes ssh-agent streams to the newest
@@ -124,7 +125,13 @@ dumps) makes this the common case, not an edge case.
   that stream's queue, and a per-stream writer thread drains it into the local
   socket. The queue is bounded by the window by construction. A peer that
   overruns its credit is a protocol violation: `Close` *that stream* (with a
-  reason), not the connection.
+  reason), not the connection. The reader also never blocks on *outbound*
+  writes: any frame it must send (`Close`, `Window`, `Pong`) goes through a
+  control-frame queue (`send_ctl` / `ctl_writer` in `mux.rs`) drained by a
+  separate writer thread, so the reader can't deadlock holding `out` while
+  blocked on a full pipe that only the peer's reader — itself stuck writing —
+  would drain. Identical queued `Pong`s coalesce, so a `Ping` flood can't grow
+  the queue.
 - **Half-close** on flow-controlled streams. Local EOF → send `Eof`, keep
   reading the other direction. The stream ends when both directions have seen
   EOF, or on `Close`, or on a local error. The mux must remember per direction
@@ -172,8 +179,14 @@ devsandbox port --service <global-svc> [--address <ip>] <[host:]port>...
 
 - `<instance>` resolves via `commands::resolve_instance` (instance | id |
   sandbox | folder basename).
-- `--service` without an instance is only valid for a `global` service.
+- `--service` without an instance is only valid for a `global` service. clap
+  fills the optional leading `name` positional first, so `port --service redis
+  6379` arrives with `name = "6379"`; with `--service` set, a leading positional
+  that parses as a port spec is treated as a port, not an instance (`split_target`).
 - Several port specs forward in parallel from one command.
+- The command waits for each forward's first outcome (bounded, 20s). If any is
+  an `Error`, it prints `<label>: <reason>` and exits non-zero (dropping the
+  rest); otherwise it prints the mappings and blocks until Ctrl-C.
 - Output, one line per forward:
   `127.0.0.1:3000 -> api:3000` and
   `127.0.0.1:5432 -> postgres:5432 (via instance api)`, suffixed with
@@ -233,8 +246,10 @@ embedded blob, so a stale blob fails them.
   allocates the next host id (`HOST_ID_BIT | n`, wrapping within the high
   half, never reusing a live id), registers a flow-controlled stream, and
   sends `Connect`.
-- `serve` gains an `on_connect(stream, host, port, reply)` callback, the
-  daemon's hook. It must return immediately; the callback dials on its own
+- A new `serve_with` takes an `on_connect(stream, host, port, reply)` callback,
+  the daemon's hook (`serve` becomes a thin wrapper that passes an `on_connect`
+  which refuses every `Connect` — the host side, which serves none). It must
+  return immediately; the callback dials on its own
   thread and then calls `reply(Ok(Conn))` to attach the flow-controlled stream
   or `reply(Err(reason))` to send `Close { reason }`. Id policy for `Connect`:
   high bit set, not live, under 256 live host streams; otherwise `Close`.
@@ -300,7 +315,12 @@ New `src/devsbd/forward.rs` (unix-only, like `bridge.rs`).
 - Observable state for the UI/CLI, pure and snapshot-able:
   `ForwardStatus { local_addr, route_label, state: Connecting | Active |
   Error(String), open_conns }`, and a stream of per-connection error notes.
-- `Drop` closes the listener, kills the bridge, and joins the accept thread.
+- `Drop` closes the listener, kills the bridge, and joins the accept and
+  per-connection handler threads. Teardown is prompt even mid-handshake: the
+  supervisor waits for a fresh bridge's handshake in short slices checking a
+  `stop` flag, so a `Drop` set during the ~10s handshake bails within a slice
+  (dropping the bridge kills its `exec`) instead of blocking on the full wait —
+  quitting the TUI never hangs on a connecting forward.
 - Tests: pure retry/state transitions; a docker-gated end-to-end test with an
   alpine container running `busybox httpd -f -p 127.0.0.1:8080`: the forward
   serves `GET /`, and a 20 MiB file downloads intact.
@@ -367,13 +387,18 @@ I/O-free.
   `pending_stop`.
 - Prompt: `SPECS` entry
   `port <instance> [--service s] [--address a] <[host:]port>`, with a new
-  `ArgValue::Service` completing service names. `PromptAction::Port`.
+  `ArgValue::Service` completing service names. `PromptAction::Port`. The
+  `<instance>` positional is required in the TUI (unlike the CLI's service-only
+  form): a global service is forwarded by naming any instance that references
+  it, and the planner falls back to another running referencing instance if that
+  one is stopped.
 - Keys: `p` on Instances/Services opens the prompt prefilled with the
   selection (instance, or instance + `--service`); on Ports, `d` stops the
   selected forward.
-- Rendering: a table with `LOCAL`, `TARGET`, `VIA`, `PROCESS`, `STATE`,
-  `CONNS` (`PROCESS` = `-` when unknown), plus an empty state that explains
-  `p`.
+- Rendering: a table with `LOCAL`, `TARGET`, `PROCESS`, `STATE`, `CONNS`
+  (`PROCESS` = `-` when unknown), plus an empty state that explains `p`. No
+  separate `VIA` column — the `TARGET` label carries `(via instance …)` for a
+  via-instance route.
 - Help modal + `docs/tui.md` keybindings.
 - Tests: tab cycling over three tabs, selection clamp, prompt parse and
   completion for `port`, key → pending request mapping.
@@ -391,13 +416,14 @@ I/O-free.
 - Errors land in `app.status`. Nothing reaches stderr (the TUI owns the
   screen).
 
-### Step 11 — docs sweep [ ]
+### Step 11 — docs sweep [x]
 
 - `docs/sandbox-helper.md`: the frame table, stream-id spaces (host ids are now
-  used), the head-of-line caveat (resolved for forwarded streams), and agent
-  routing by caps.
-- README: a short `devsandbox port` section.
-- Mark steps done here.
+  used by `Connect`), the head-of-line caveat (resolved for forwarded streams
+  plus the control-frame queue), and agent routing by caps.
+- README: a short `devsandbox port` section (CLI table row + examples).
+- `AGENTS.md`: `port` verb, `src/devsbd/forward.rs`, `src/tui/forwards.rs`.
+- Steps marked done here.
 
 ## Known limitations (v1)
 
@@ -408,6 +434,8 @@ I/O-free.
 - CLI forwards are invisible to the TUI and vice versa.
 - The injection route needs `/bin/sh` + root `exec` + writable `/run` in the
   service image.
+- The listening-process probe runs `lsof` (a plain `exec`) every 10s per active
+  forward while its process is shown.
 - UDP not supported.
 
 ## Future: static `forwardPorts`
