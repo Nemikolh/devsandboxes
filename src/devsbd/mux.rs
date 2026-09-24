@@ -355,6 +355,15 @@ pub struct Mux {
     /// Set when `serve` returns, so the keepalive thread stops instead of
     /// leaking (and pinging a dead connection) once the bridge is gone.
     ended: AtomicBool,
+    /// The peer's capabilities, learned from its `Caps` frame (docs/
+    /// port-forwarding.md). `None` until one arrives: an older peer never sends
+    /// it, so the daemon treats `None` as agent-capable. The host reads it to
+    /// know the daemon's caps before opening a forward stream.
+    peer_caps: Mutex<Option<u32>>,
+    /// Called once with the peer's caps when a `Caps` frame arrives, so the
+    /// daemon can wake agent clients held while no agent-capable bridge existed
+    /// (a bridge becomes capable only after it advertises `SSH_AGENT`).
+    on_caps: Mutex<Option<Box<dyn FnMut(u32) + Send>>>,
 }
 
 impl Mux {
@@ -367,7 +376,25 @@ impl Mux {
             next_host: AtomicU32::new(1),
             last_inbound: Mutex::new(Instant::now()),
             ended: AtomicBool::new(false),
+            peer_caps: Mutex::new(None),
+            on_caps: Mutex::new(None),
         })
+    }
+
+    /// The peer's advertised capabilities, or `None` if it never sent `Caps`
+    /// (an older peer). The host reads the daemon's caps here after the
+    /// handshake to decide whether a forward is possible.
+    #[allow(dead_code)] // daemon routing (devsbd); host reads via Bridge (step 5)
+    pub fn peer_caps(&self) -> Option<u32> {
+        *self.peer_caps.lock().unwrap()
+    }
+
+    /// Register a callback run once with the peer's caps when its `Caps` frame
+    /// arrives during `serve_with`. The daemon uses it to wake agent clients
+    /// held while no agent-capable bridge existed.
+    #[allow(dead_code)] // used by the daemon (devsbd crate) only
+    pub fn on_caps(&self, f: impl FnMut(u32) + Send + 'static) {
+        *self.on_caps.lock().unwrap() = Some(Box::new(f));
     }
 
     /// Spawn the keepalive thread: send `Ping` every `interval` and, once
@@ -840,10 +867,18 @@ impl Mux {
                         None => self.send_ctl(Frame::Close { stream, reason: "stream refused".into() }),
                     }
                 }
+                // The peer's capabilities (docs/port-forwarding.md): record them
+                // and wake anything waiting on them (the daemon's held agent
+                // clients). Arrives once on stream 0 right after the handshake.
+                Frame::Caps(c) => {
+                    *self.peer_caps.lock().unwrap() = Some(c);
+                    if let Some(f) = self.on_caps.lock().unwrap().as_mut() {
+                        f(c);
+                    }
+                }
                 // `Quit` only means something as a control socket's first
                 // frame, which the daemon reads before handing over to `serve`.
-                // `Caps` is recorded by the daemon in step 4 (docs/port-forwarding.md).
-                Frame::Hello { .. } | Frame::Pong(_) | Frame::Quit | Frame::Caps(_) => {}
+                Frame::Hello { .. } | Frame::Pong(_) | Frame::Quit => {}
             }
         }
         self.ended.store(true, Ordering::Relaxed);

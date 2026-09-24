@@ -8,7 +8,12 @@ use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 
 use crate::daemon::CTL;
-use crate::proto;
+use crate::proto::{self, caps};
+
+/// What this bridge itself can serve. The daemon dials `Connect` streams (the
+/// bridge just relays bytes), so the bridge advertises `TCP_FORWARD` to the
+/// host — gated below by what the daemon also supports.
+const OWN_CAPS: u32 = caps::TCP_FORWARD;
 
 pub fn run(hash: &str) -> io::Result<()> {
     // Daemon first, so a missing or mismatched daemon surfaces to the host as
@@ -21,16 +26,22 @@ pub fn run(hash: &str) -> io::Result<()> {
     // with `proto::MISMATCH_EXIT` so the host can classify the failure as a
     // mismatch from the exit code alone, without string-matching, and stop
     // retrying until a restart rewrites the helper.
-    if let Err(e) = proto::handshake(&mut ctl.try_clone()?, &mut ctl.try_clone()?, hash, 0) {
-        if let Some(vm) = proto::version_mismatch(&e) {
-            eprintln!("devsbd: {}", daemon_mismatch(vm));
-            std::process::exit(proto::MISMATCH_EXIT);
+    // Advertise our own caps to the daemon; learn the daemon's from its `Hello`.
+    let daemon = match proto::handshake(&mut ctl.try_clone()?, &mut ctl.try_clone()?, hash, OWN_CAPS) {
+        Ok(peer) => peer,
+        Err(e) => {
+            if let Some(vm) = proto::version_mismatch(&e) {
+                eprintln!("devsbd: {}", daemon_mismatch(vm));
+                std::process::exit(proto::MISMATCH_EXIT);
+            }
+            return Err(e);
         }
-        return Err(e);
-    }
+    };
     let mut stdin = io::stdin().lock();
     let mut stdout = io::stdout().lock();
-    proto::handshake(&mut stdin, &mut stdout, hash, 0)?;
+    // Tell the host only what the daemon that will serve it also supports, so a
+    // forward is attempted only when it can actually be served end to end.
+    proto::handshake(&mut stdin, &mut stdout, hash, OWN_CAPS & daemon.caps)?;
     drop(stdout);
 
     let mut from_daemon = ctl.try_clone()?;

@@ -259,7 +259,7 @@ embedded blob, so a stale blob fails them.
   - a legacy ssh-agent stream still behaves exactly as before (the existing
     tests).
 
-### Step 4 — daemon + bridge: serve `Connect`, negotiate caps, route the agent [ ]
+### Step 4 — daemon + bridge: serve `Connect`, negotiate caps, route the agent [x]
 
 `devsbd/src/daemon.rs`, `devsbd/src/bridge.rs`, `src/devsbd/bridge.rs`.
 

@@ -7,10 +7,11 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use super::mux::{self, Mux};
+use super::mux::{self, Conn, Mux};
+use super::proto::caps;
 use super::{proto, relay_mode, BIN};
 use crate::runtime::backend;
 use crate::state::{Instance, State};
@@ -29,6 +30,19 @@ pub struct Bridge {
     // which rewrites the helper, can fix it.
     mismatch: Arc<AtomicBool>,
     handshake: mpsc::Receiver<Result<(), String>>,
+    // Published by the handshake thread once `Hello` succeeds: the live mux (to
+    // open forward streams on) and the daemon's advertised caps. Absent while
+    // the handshake is pending or after it failed.
+    forward: Arc<OnceLock<Forward>>,
+    // The instance's container, for the "outdated helper" message.
+    container: String,
+}
+
+/// The forwarding side of a healthy bridge: the mux carrying its streams and
+/// the peer (daemon) caps negotiated in the handshake.
+struct Forward {
+    mux: Arc<Mux>,
+    peer_caps: u32,
 }
 
 impl Bridge {
@@ -46,6 +60,49 @@ impl Bridge {
     /// The relay failed on a protocol version mismatch (host or daemon side).
     pub fn is_mismatch(&self) -> bool {
         self.mismatch.load(Ordering::Relaxed)
+    }
+
+    /// The daemon's advertised capabilities, available once the handshake has
+    /// succeeded; `None` while it's pending or after it failed.
+    #[allow(dead_code)] // host forwarder engine (docs/port-forwarding.md, step 5)
+    pub fn peer_caps(&self) -> Option<u32> {
+        self.forward.get().map(|f| f.peer_caps)
+    }
+
+    /// Open a flow-controlled forward stream to `host:port`, dialed by the
+    /// daemon inside the container, relaying `conn` over it. `on_close` runs
+    /// once when the stream ends, with the reason (see [`mux::OnClose`]).
+    ///
+    /// Errors before the handshake is done, when the bridge is dead, or when the
+    /// daemon doesn't advertise `TCP_FORWARD` (an outdated helper) — the last as
+    /// `Unsupported`, so callers can phrase the restart hint.
+    #[allow(dead_code)] // host forwarder engine (docs/port-forwarding.md, step 5)
+    pub fn connect(
+        &self,
+        conn: impl Into<Conn>,
+        host: &str,
+        port: u16,
+        on_close: impl FnOnce(String) + Send + 'static,
+    ) -> std::io::Result<u32> {
+        let Some(forward) = self.forward.get() else {
+            let kind = if self.is_done() {
+                std::io::ErrorKind::BrokenPipe
+            } else {
+                std::io::ErrorKind::NotConnected
+            };
+            let msg = if self.is_done() { "bridge is not running" } else { "bridge handshake not done" };
+            return Err(std::io::Error::new(kind, msg));
+        };
+        if self.is_done() {
+            return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "bridge is not running"));
+        }
+        if forward.peer_caps & caps::TCP_FORWARD == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!("helper in {} is outdated (no port forwarding): restart the instance", self.container),
+            ));
+        }
+        forward.mux.connect(conn, host, port, on_close)
     }
 }
 
@@ -77,13 +134,17 @@ pub fn has_host_agent() -> bool {
 /// screen; `None` only when the `exec` can't even be spawned.
 pub fn spawn(info: &Instance) -> Option<Bridge> {
     let hash = info.devsbd_arch.and_then(super::hash).unwrap_or_default();
-    spawn_with(&info.container, hash, host_agent)
+    spawn_with(&info.container, hash, Some(host_agent))
 }
 
+/// Start a bridge. `agent` is the host ssh-agent socket provider, or `None` for
+/// an agent-less bridge (a `devsandbox port` forward): it advertises no
+/// `SSH_AGENT` cap and refuses agent `Open`s, so the daemon won't route agent
+/// clients to it and it can't steal ssh from an older agent bridge.
 fn spawn_with(
     container: &str,
     hash: &str,
-    agent: impl Fn() -> Option<PathBuf> + Send + 'static,
+    agent: Option<impl Fn() -> Option<PathBuf> + Send + 'static>,
 ) -> Option<Bridge> {
     let mut child = Command::new(backend().bin())
         .args(["exec", "-i", "-u", "root", container, BIN, "bridge"])
@@ -103,6 +164,11 @@ fn spawn_with(
     let container = container.to_string();
     let finished = Arc::clone(&done);
     let hs_mismatch = Arc::clone(&mismatch);
+    let forward = Arc::new(OnceLock::new());
+    let hs_forward = Arc::clone(&forward);
+    // The handshake thread moves `container` (for `mismatch_message`); keep a
+    // copy for the `Bridge`'s own `connect` error message.
+    let bridge_container = container.clone();
     // Watchdog: if the handshake hasn't produced a result within the timeout,
     // kill the child, which unblocks the blocking `handshake` read below. The
     // handshake thread then sees the read fail and, because `timed_out` is set,
@@ -125,7 +191,10 @@ fn spawn_with(
     }
     let hs_child = Arc::clone(&child);
     std::thread::spawn(move || {
-        let result = proto::handshake(&mut stdout, &mut stdin, &hash, 0).map(|_| ()).map_err(|e| {
+        // The bridge advertises to us `own & daemon` caps, so `daemon_caps` is
+        // what the whole path (daemon included) can serve.
+        let mut daemon_caps = 0;
+        let result = proto::handshake(&mut stdout, &mut stdin, &hash, 0).map(|peer| daemon_caps = peer.caps).map_err(|e| {
             if timed_out.load(Ordering::Relaxed) {
                 return "helper handshake timed out".to_string();
             }
@@ -159,9 +228,26 @@ fn spawn_with(
         let ok = result.is_ok();
         // Stop the watchdog from racing a kill against a healthy bridge.
         bridged.store(ok, Ordering::Relaxed);
-        let _ = tx.send(result);
-        if ok {
+        if !ok {
+            let _ = tx.send(result);
+            finished.store(true, Ordering::Relaxed);
+            return;
+        }
+        {
             let mux = Mux::new(stdin);
+            // Tell the daemon our caps right after the handshake, on stream 0:
+            // `SSH_AGENT` only when this bridge has an agent provider and it
+            // yields a socket now. An agent-less bridge (a `devsandbox port`
+            // forward) advertises 0, so the daemon won't route agent clients to
+            // it. Best effort — a send failure just means the connection died.
+            let has_agent = agent.as_ref().and_then(|a| a()).is_some();
+            let own = if has_agent { caps::SSH_AGENT } else { 0 };
+            let _ = mux.send(&proto::Frame::Caps(own));
+            // Publish the mux + daemon caps *before* reporting the handshake
+            // result, so a caller that sees `outcome() == Ok` can rely on
+            // `peer_caps()` / `connect()` being ready (no publish race).
+            let _ = hs_forward.set(Forward { mux: Arc::clone(&mux), peer_caps: daemon_caps });
+            let _ = tx.send(result);
             // Keepalive: a wedged daemon (stopped reading) is caught by inbound
             // silence; `on_dead` kills the child, ending the `serve` read below
             // so `done` flips and `Bridges::reconcile` retries.
@@ -169,16 +255,17 @@ fn spawn_with(
             mux.keepalive(mux::KEEPALIVE_INTERVAL, mux::KEEPALIVE_TIMEOUT, move || {
                 let _ = dead_child.lock().unwrap().kill();
             });
-            mux.serve(stdout, |_, channel| {
+            mux.serve(stdout, move |_, channel| {
                 if channel != proto::channel::SSH_AGENT {
                     return None;
                 }
+                let agent = agent.as_ref()?;
                 std::os::unix::net::UnixStream::connect(agent()?).ok().map(Into::into)
             });
         }
         finished.store(true, Ordering::Relaxed);
     });
-    Some(Bridge { child, done, mismatch, handshake })
+    Some(Bridge { child, done, mismatch, handshake, forward, container: bridge_container })
 }
 
 /// How long the host waits for the daemon handshake before killing the child
@@ -422,7 +509,7 @@ mod tests {
             let arch = install(&name, None).unwrap();
             let bridge = || {
                 let agent_path = sock.clone();
-                spawn_with(&name, hash(arch).unwrap(), move || Some(agent_path.clone())).unwrap()
+                spawn_with(&name, hash(arch).unwrap(), Some(move || Some(agent_path.clone()))).unwrap()
             };
             let ssh_add = || {
                 Command::new("docker")
@@ -519,6 +606,188 @@ mod tests {
             Ok(())
         }));
         cleanup(&mut agent);
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(why)) => skip(why),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+
+    /// Docker-gated: an agent-less bridge (a `devsandbox port` forward) spawned
+    /// *after* an agent bridge must not steal agent routing — `ssh-add -l` still
+    /// lists the key via the older agent bridge. Regression for the routing fix
+    /// in docs/port-forwarding.md (a shell with no agent starting a forward
+    /// would otherwise become the newest bridge and break ssh in the container).
+    #[test]
+    fn agent_less_bridge_does_not_steal_agent_routing_with_docker() {
+        let name_test = "agent_less_bridge_does_not_steal_agent_routing_with_docker";
+        let skip = |why: &str| eprintln!("skipping {name_test}: {why}");
+        if !ok(Command::new("docker").arg("info")) || hash(Arch::host()).is_none() {
+            return skip("docker or embedded helper unavailable");
+        }
+        if !ok(Command::new("ssh-agent").arg("-h")) && !ok(Command::new("which").arg("ssh-agent")) {
+            return skip("no host ssh-agent");
+        }
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let tmp = std::env::temp_dir().join(format!("devsbd-agentroute-{stamp}"));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let sock = tmp.join("agent.sock");
+        let key = tmp.join("id");
+        let name = format!("devsandbox-agentroute-test-{stamp}");
+        let mut agent = Command::new("ssh-agent").arg("-D").arg("-a").arg(&sock).stdout(Stdio::null()).spawn().unwrap();
+        let cleanup = |agent: &mut Child| {
+            let _ = agent.kill();
+            let _ = Command::new("docker").args(["rm", "-f", &name]).output();
+            let _ = std::fs::remove_dir_all(&tmp);
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            for _ in 0..100 {
+                if sock.exists() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(ok(Command::new("ssh-keygen")
+                .args(["-q", "-t", "ed25519", "-N", "", "-C", "devsbd-agentroute", "-f"])
+                .arg(&key)));
+            assert!(ok(Command::new("ssh-add").arg(&key).env("SSH_AUTH_SOCK", &sock)));
+            assert!(ok(Command::new("docker").args(["run", "-d", "--name", &name, "alpine:3.20", "sleep", "300"])));
+            if !ok(Command::new("docker").args(["exec", &name, "apk", "add", "--no-cache", "-q", "openssh-client-default"])) {
+                return Err("apk add failed (no network?)");
+            }
+            let arch = install(&name, None).unwrap();
+            start_daemon(&name);
+            let list = || {
+                let out = Command::new("docker")
+                    .args(["exec", "-e", "SSH_AUTH_SOCK=/run/devsandbox/ssh-agent.sock", &name, "ssh-add", "-l"])
+                    .output()
+                    .unwrap();
+                String::from_utf8_lossy(&out.stdout).into_owned()
+            };
+
+            // The agent bridge attaches first and lists the key.
+            let agent_path = sock.clone();
+            let agent_bridge = spawn_with(&name, hash(arch).unwrap(), Some(move || Some(agent_path.clone()))).unwrap();
+            assert_eq!(agent_bridge.outcome(Duration::from_secs(10)), Some(Ok(())), "agent bridge");
+            assert!(list().contains("devsbd-agentroute"), "via agent bridge");
+
+            // Newer agent-less bridges attach while `ssh-add -l` clients keep
+            // arriving. The dangerous window is between the bridge registering
+            // with the daemon and its host's `Caps(0)` landing (the bridge↔host
+            // handshake sits in between): the daemon must treat it as pending,
+            // not capable, or those clients hit a host that refuses them. Each
+            // round fires clients staggered across the spawn; every one must
+            // list the key via the older agent bridge.
+            let mut port_bridges = Vec::new();
+            for round in 0..6 {
+                let outputs = std::thread::scope(|s| {
+                    let clients: Vec<_> = (0..12)
+                        .map(|i| {
+                            let list = &list;
+                            s.spawn(move || {
+                                std::thread::sleep(Duration::from_millis(15 * i));
+                                list()
+                            })
+                        })
+                        .collect();
+                    let none: Option<fn() -> Option<PathBuf>> = None;
+                    let port_bridge = spawn_with(&name, hash(arch).unwrap(), none).unwrap();
+                    assert_eq!(port_bridge.outcome(Duration::from_secs(10)), Some(Ok(())), "agent-less bridge");
+                    port_bridges.push(port_bridge);
+                    clients.into_iter().map(|c| c.join().unwrap()).collect::<Vec<_>>()
+                });
+                for (i, out) in outputs.iter().enumerate() {
+                    assert!(out.contains("devsbd-agentroute"), "round {round} client {i}: agent-less bridge stole routing: {out:?}");
+                }
+            }
+            // Settled (every `Caps(0)` in): still routed to the agent bridge.
+            assert!(list().contains("devsbd-agentroute"), "agent-less bridge stole routing");
+            Ok(())
+        }));
+        cleanup(&mut agent);
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(why)) => skip(why),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+
+    /// Docker-gated: a `Connect` over a host `Bridge` reaches a server bound to
+    /// **127.0.0.1 inside the container** (only the daemon shares its network
+    /// namespace) and round-trips data; a `Connect` to a closed port yields an
+    /// `on_close` reason mentioning "refused". No ssh-agent needed — the bridge
+    /// is agent-less, exercising the forwarding path on its own.
+    #[test]
+    fn forwards_a_connect_to_a_loopback_server_with_docker() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+        use std::sync::mpsc;
+
+        let name_test = "forwards_a_connect_to_a_loopback_server_with_docker";
+        let skip = |why: &str| eprintln!("skipping {name_test}: {why}");
+        if !ok(Command::new("docker").arg("info")) || hash(Arch::host()).is_none() {
+            return skip("docker or embedded helper unavailable");
+        }
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let name = format!("devsandbox-forward-test-{stamp}");
+        // busybox nc echoes stdin back to the client (-e cat) on loopback only,
+        // so the port is reachable only from inside the netns — where the daemon
+        // dials. `-lk` keeps it serving across connects.
+        let serve = "busybox nc -lk -s 127.0.0.1 -p 8080 -e cat";
+        let cleanup = || {
+            let _ = Command::new("docker").args(["rm", "-f", &name]).output();
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert!(ok(Command::new("docker").args(["run", "-d", "--name", &name, "alpine:3.20", "sh", "-c", serve])));
+            let arch = install(&name, None).unwrap();
+            start_daemon(&name);
+            let none: Option<fn() -> Option<PathBuf>> = None;
+            let bridge = spawn_with(&name, hash(arch).unwrap(), none).unwrap();
+            assert_eq!(bridge.outcome(Duration::from_secs(10)), Some(Ok(())), "bridge handshake");
+            assert_eq!(bridge.peer_caps(), Some(caps::TCP_FORWARD), "daemon advertises TCP_FORWARD");
+
+            // Round-trip through the loopback echo server. Retry the connect a
+            // few times: `nc -lk` may not have bound its listener the instant
+            // the container starts.
+            let mut round_tripped = false;
+            for _ in 0..30 {
+                let (mut ours, theirs) = UnixStream::pair().unwrap();
+                ours.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let (tx, closed) = mpsc::channel();
+                let Ok(_id) = bridge.connect(theirs, "127.0.0.1", 8080, move |r| {
+                    let _ = tx.send(r);
+                }) else {
+                    std::thread::sleep(Duration::from_millis(200));
+                    continue;
+                };
+                ours.write_all(b"ping\n").unwrap();
+                let mut buf = [0u8; 5];
+                match ours.read_exact(&mut buf) {
+                    Ok(()) if &buf == b"ping\n" => {
+                        round_tripped = true;
+                        break;
+                    }
+                    _ => {
+                        // Server not up yet: this stream closed, try again.
+                        let _ = closed.recv_timeout(Duration::from_secs(1));
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
+                }
+            }
+            assert!(round_tripped, "loopback echo did not round-trip through the forward");
+
+            // A Connect to a closed port comes back refused.
+            let (_ours, theirs) = UnixStream::pair().unwrap();
+            let (tx, closed) = mpsc::channel();
+            bridge.connect(theirs, "127.0.0.1", 9, move |r| {
+                let _ = tx.send(r);
+            })
+            .unwrap();
+            let reason = closed.recv_timeout(Duration::from_secs(10)).unwrap();
+            assert!(reason.contains("refused"), "closed port reason: {reason:?}");
+            Ok::<(), &str>(())
+        }));
+        cleanup();
         match result {
             Ok(Ok(())) => {}
             Ok(Err(why)) => skip(why),
