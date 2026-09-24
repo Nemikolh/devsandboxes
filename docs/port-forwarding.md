@@ -283,7 +283,7 @@ embedded blob, so a stale blob fails them.
   `ssh-add -l`, and that a `Connect` to a `busybox nc -l -s 127.0.0.1` in the
   container round-trips.
 
-### Step 5 — host forwarder engine [ ]
+### Step 5 — host forwarder engine [x]
 
 New `src/devsbd/forward.rs` (unix-only, like `bridge.rs`).
 

@@ -9,6 +9,11 @@
 
 #[cfg(unix)]
 pub mod bridge;
+// The forwarder engine (step 5); its public surface is exercised by the CLI
+// and TUI in later steps (docs/port-forwarding.md, steps 7/9-10).
+#[cfg(unix)]
+#[allow(dead_code)]
+pub mod forward;
 #[cfg(unix)]
 mod mux;
 // Partly helper-only (e.g. `Frame::encode` callers on the daemon side).

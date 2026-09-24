@@ -137,6 +137,21 @@ pub fn spawn(info: &Instance) -> Option<Bridge> {
     spawn_with(&info.container, hash, Some(host_agent))
 }
 
+/// Start a bridge for `container` with helper `hash`, optionally serving the
+/// host ssh-agent. `with_agent` = true wires the real `host_agent` provider (a
+/// forward bridge serves ssh-agent when the host has one, advertising
+/// `SSH_AGENT` honestly); false makes an agent-less bridge that the daemon
+/// won't route agent clients to. The forwarder (docs/port-forwarding.md, step
+/// 5) uses this so `spawn_with`'s generic agent type stays private.
+pub fn spawn_for(container: &str, hash: &str, with_agent: bool) -> Option<Bridge> {
+    if with_agent {
+        spawn_with(container, hash, Some(host_agent))
+    } else {
+        let none: Option<fn() -> Option<PathBuf>> = None;
+        spawn_with(container, hash, none)
+    }
+}
+
 /// Start a bridge. `agent` is the host ssh-agent socket provider, or `None` for
 /// an agent-less bridge (a `devsandbox port` forward): it advertises no
 /// `SSH_AGENT` cap and refuses agent `Open`s, so the daemon won't route agent
