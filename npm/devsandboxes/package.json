@@ -1,12 +1,12 @@
 {
-  "name": "devsandbox",
+  "name": "devsandboxes",
   "version": "0.3.1",
   "description": "Manage devcontainer-style sandboxes on docker, podman, or Apple container, from the CLI or a typed Node API.",
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Nemikolh/devsandboxes.git",
-    "directory": "npm/devsandbox"
+    "directory": "npm/devsandboxes"
   },
   "keywords": ["devcontainer", "sandbox", "docker", "podman", "cli"],
   "main": "index.js",

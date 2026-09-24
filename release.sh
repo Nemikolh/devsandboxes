@@ -34,7 +34,7 @@ cargo check --quiet
 
 # npm packages ship the same binary, so they share the crate version: each
 # manifest's own version plus the root's exact pins on the platform packages.
-npm_manifests=(npm/devsandbox/package.json npm/platforms/*/package.json)
+npm_manifests=(npm/devsandboxes/package.json npm/platforms/*/package.json)
 sed -i -E \
   -e "s/^(  \"version\": )\"$current\"/\1\"$new\"/" \
   -e "s/^(    \"@devsandboxes\/[^\"]+\": )\"$current\"/\1\"$new\"/" \

@@ -1,21 +1,23 @@
-# devsandbox
+# devsandboxes
 
 Manage devcontainer-style sandboxes on docker, podman, or Apple `container`: many throwaway instances per repo from one `config.toml`. This package ships the native `devsandbox` binary (Linux x64/arm64, macOS arm64, Windows x64) plus a typed Node API.
+
+The package installs a `devsandbox` command (`npm i -g devsandboxes`); `npx devsandboxes` runs it without installing.
 
 Config reference and concepts: [github.com/Nemikolh/devsandboxes](https://github.com/Nemikolh/devsandboxes).
 
 ## CLI
 
 ```bash
-npx devsandbox            # dashboard (on a TTY)
-npx devsandbox run web    # start an instance of [sandbox.web]
-npx devsandbox exec -it web zsh
+npx devsandboxes            # dashboard (on a TTY)
+npx devsandboxes run web    # start an instance of [sandbox.web]
+npx devsandboxes exec -it web zsh
 ```
 
 ## Node API
 
 ```ts
-import * as devsandbox from 'devsandbox';
+import * as devsandbox from 'devsandboxes';
 
 const name = await devsandbox.run('web', { dir: './sandboxes', stderr: 'inherit' });
 const { instances } = await devsandbox.status({ dir: './sandboxes' });

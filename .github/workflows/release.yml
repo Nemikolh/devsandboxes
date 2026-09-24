@@ -23,7 +23,7 @@ jobs:
           fi
           # release.sh bumps the npm packages in tandem; catch a hand-edited drift
           # before building anything.
-          for pkg in npm/devsandbox npm/platforms/*; do
+          for pkg in npm/devsandboxes npm/platforms/*; do
             node -e '
               const p = require(`./${process.argv[1]}/package.json`);
               const bad = [["version", p.version], ...Object.entries(p.optionalDependencies ?? {})]
@@ -167,7 +167,7 @@ jobs:
       - name: Publish to npm
         run: |
           v=${{ needs.version.outputs.version }}
-          for dir in npm/platforms/* npm/devsandbox; do
+          for dir in npm/platforms/* npm/devsandboxes; do
             name=$(node -p "require('./$dir/package.json').name")
             if npm view "$name@$v" version >/dev/null 2>&1; then
               echo "$name@$v already published, skipping"
