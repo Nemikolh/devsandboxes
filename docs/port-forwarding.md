@@ -305,7 +305,7 @@ New `src/devsbd/forward.rs` (unix-only, like `bridge.rs`).
   alpine container running `busybox httpd -f -p 127.0.0.1:8080`: the forward
   serves `GET /`, and a 20 MiB file downloads intact.
 
-### Step 6 — route resolution (instance / service, both routes) [ ]
+### Step 6 — route resolution (instance / service, both routes) [x]
 
 New `src/commands/port.rs` (resolution only, no CLI yet).
 

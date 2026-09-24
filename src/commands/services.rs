@@ -780,7 +780,7 @@ fn gc_agent_links_in(agent_dir: &Path, state: &State) -> Result<()> {
     Ok(())
 }
 
-fn container_running(container: &str) -> bool {
+pub(crate) fn container_running(container: &str) -> bool {
     backend().is_running(container).ok().flatten() == Some(true)
 }
 
