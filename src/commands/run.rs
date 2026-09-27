@@ -820,7 +820,9 @@ fn run_container(
 
 /// Resolve the sandbox's `mounts` into `docker run --mount` values, substituting
 /// `${…}` variables and creating any missing bind sources so a first run doesn't
-/// fail on a non-existent host path.
+/// fail on a non-existent host path. Entries sharing a target collapse to the
+/// last one (see [`last_wins_by_target`]) before any source is created, so an
+/// overridden template mount leaves no stub behind.
 fn resolve_mounts(
     dir: &Path,
     folder: &Path,
@@ -841,11 +843,14 @@ fn resolve_mounts(
         shared_volumes: &shared_volumes.to_string_lossy(),
         instance: instance_id,
     };
-    let mut args = Vec::with_capacity(mounts.len());
-    for mount in mounts {
-        let resolved = mount
-            .resolve(&ctx)
-            .with_context(|| format!("sandbox `{}`: invalid mount", sandbox.name))?;
+    let resolved = mounts
+        .iter()
+        .map(|mount| mount.resolve(&ctx))
+        .collect::<Result<Vec<_>>>()
+        .with_context(|| format!("sandbox `{}`: invalid mount", sandbox.name))?;
+    let resolved = last_wins_by_target(resolved);
+    let mut args = Vec::with_capacity(resolved.len());
+    for resolved in resolved {
         if resolved.kind == "bind" {
             if let Some(source) = &resolved.source {
                 ensure_bind_source(Path::new(source))?;
@@ -854,6 +859,22 @@ fn resolve_mounts(
         args.push(resolved.to_arg());
     }
     Ok(args)
+}
+
+/// Drop every mount whose target a later entry claims again, keeping the order
+/// of the survivors. `extends` concatenates `mounts` base-first, so "later" is
+/// the more downstream table: a sandbox (or a template further down the chain)
+/// replaces an inherited mount by re-mounting its target, instead of the
+/// runtime rejecting the pair as a duplicate mount point.
+fn last_wins_by_target(mounts: Vec<ResolvedMount>) -> Vec<ResolvedMount> {
+    let mut seen = BTreeSet::new();
+    let mut kept: Vec<ResolvedMount> = mounts
+        .into_iter()
+        .rev()
+        .filter(|m| seen.insert(m.target.clone()))
+        .collect();
+    kept.reverse();
+    kept
 }
 
 /// Resolve `folders` (container path -> host folder) into
@@ -2003,6 +2024,33 @@ mod tests {
             target: target.into(),
             readonly: false,
         }
+    }
+
+    #[test]
+    fn last_wins_by_target_keeps_downstream_mount() {
+        let mounts = vec![
+            feature_mount("bind", Some("/tpl/gh"), "/root/.config/gh"),
+            feature_mount("bind", Some("/tpl/bin"), "/usr/local/bin/tool"),
+            feature_mount("bind", Some("/sandbox/gh"), "/root/.config/gh"),
+        ];
+        let kept = last_wins_by_target(mounts);
+        assert_eq!(
+            kept,
+            vec![
+                feature_mount("bind", Some("/tpl/bin"), "/usr/local/bin/tool"),
+                feature_mount("bind", Some("/sandbox/gh"), "/root/.config/gh"),
+            ]
+        );
+    }
+
+    #[test]
+    fn last_wins_by_target_keeps_nested_targets() {
+        // Layering inside an inherited mount is not an override.
+        let mounts = vec![
+            feature_mount("bind", Some("/s/zidane"), "/root/.zidane"),
+            feature_mount("bind", Some("/h/creds.json"), "/root/.zidane/credentials.json"),
+        ];
+        assert_eq!(last_wins_by_target(mounts.clone()), mounts);
     }
 
     #[test]

@@ -28,6 +28,8 @@ Three top-level tables:
   left-to-right, with cycles detected. The merge is deep: nested tables merge
   recursively, **arrays concatenate** (so a sandbox adds to a template's
   `mounts`/`extensions` without restating them), and scalars override.
+  Mounts are then collapsed to one per target, last entry wins, so a
+  downstream table overrides an inherited mount by re-mounting its target.
 
 - **`[sandbox.<name>]`**: a devcontainer definition plus devsandbox extras.
   Unknown keys are hard errors. Valid devcontainer properties that aren't

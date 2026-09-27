@@ -664,7 +664,9 @@ fn config_hash(table: &Table) -> String {
 /// Deep merge: nested tables merge recursively, arrays concatenate
 /// (base first, then `over`), scalars are replaced by `over`. Concatenating
 /// arrays lets a sandbox add to a template's `mounts`/`extensions` without
-/// restating them (devcontainer merge semantics).
+/// restating them (devcontainer merge semantics). Overriding an inherited
+/// mount happens later, at `run`: mounts collapse to the last entry per target
+/// (`commands::run::last_wins_by_target`).
 fn deep_merge(base: Table, over: Table) -> Table {
     let mut merged = base;
     for (key, value) in over {
