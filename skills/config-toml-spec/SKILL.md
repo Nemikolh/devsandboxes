@@ -38,7 +38,8 @@ Next to it devsandbox uses: `shared-volumes/` (`${sharedVolumes}`, persistent ho
       A downstream table overrides an inherited mount by mounting the same
       target again: the last entry for a target wins, the earlier ones are
       dropped. A more specific target *inside* an inherited mount is not an
-      override; both apply (runtimes sort mounts by target).
+      override; both apply, in any order in the config: devsandbox mounts
+      parents before the mounts nested inside them, on every runtime.
   - scalars: the later value wins.
 - Diamond inheritance duplicates concatenated array entries (not deduped).
 - After merging, the result must be a valid sandbox (below). Templates are

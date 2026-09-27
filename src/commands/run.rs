@@ -274,6 +274,7 @@ pub(crate) fn materialize(
     // workspace itself) wins, so the config can override a feature's mount.
     let feature = feature_mounts(props, &var_ctx, &mounts, &workspace)?;
     mounts.extend(feature);
+    sort_parents_first(&mut mounts);
     run_container(
         dir,
         sandbox,
@@ -875,6 +876,20 @@ fn last_wins_by_target(mounts: Vec<ResolvedMount>) -> Vec<ResolvedMount> {
         .collect();
     kept.reverse();
     kept
+}
+
+/// Order `--mount` args parent-first (by target depth, then path), so a mount
+/// nested inside another is applied after it and stays visible. docker sorts
+/// this way itself (moby `container.SortMounts`), but that is undocumented and
+/// not something to rely on for other runtimes (Apple `container`). Stable, so
+/// equal targets keep their order; unparsable args sort as depth 0.
+fn sort_parents_first(mounts: &mut [String]) {
+    let key = |arg: &String| {
+        let target = parse_shorthand(arg).map(|(_, _, t, _)| t).unwrap_or_default();
+        let depth = target.split('/').filter(|c| !c.is_empty()).count();
+        (depth, target)
+    };
+    mounts.sort_by_cached_key(key);
 }
 
 /// Resolve `folders` (container path -> host folder) into
@@ -2040,6 +2055,25 @@ mod tests {
                 feature_mount("bind", Some("/tpl/bin"), "/usr/local/bin/tool"),
                 feature_mount("bind", Some("/sandbox/gh"), "/root/.config/gh"),
             ]
+        );
+    }
+
+    #[test]
+    fn sort_parents_first_orders_by_depth_then_path() {
+        let mut mounts = vec![
+            "type=bind,source=/h/creds.json,target=/root/.zidane/credentials.json".to_string(),
+            "type=bind,source=/s/zidane,target=/root/.zidane".to_string(),
+            "type=bind,source=/s/b,target=/b".to_string(),
+            "type=bind,source=/s/a,target=/a/x".to_string(),
+        ];
+        sort_parents_first(&mut mounts);
+        let targets: Vec<_> = mounts
+            .iter()
+            .map(|m| parse_shorthand(m).unwrap().2)
+            .collect();
+        assert_eq!(
+            targets,
+            ["/b", "/a/x", "/root/.zidane", "/root/.zidane/credentials.json"]
         );
     }
 
