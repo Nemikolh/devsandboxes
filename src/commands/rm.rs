@@ -18,9 +18,22 @@ pub fn rm(name: &str) -> Result<()> {
     let branch = info.branch.clone();
     let base_folder = info.base_folder.clone();
     let project = info.project.clone();
+    let volumes = info.volumes.clone();
 
     // Remove the container; ignore failure (it may already be gone).
     let _ = backend().remove_force(&container);
+
+    // Per-instance volumes (e.g. docker-in-docker's /var/lib/docker) die with
+    // the instance; `rebuild` never comes through here, so they survive it.
+    // After the container: runtimes refuse to delete a volume in use. A
+    // failure warns and still removes the instance, like the container above.
+    for volume in &volumes {
+        match backend().remove_volume(volume) {
+            Ok(true) => println!("removed volume {volume}"),
+            Ok(false) => {}
+            Err(e) => eprintln!("warning: cannot remove volume `{volume}`: {e:#}"),
+        }
+    }
 
     // The managed shell-history dir is deliberately kept: `run` re-provisions
     // the same per-instance path, so history survives an rm + run rebuild.

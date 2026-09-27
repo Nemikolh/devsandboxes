@@ -688,6 +688,7 @@ image = "node"
             remote_user: None,
             ssh_auth_sock: None,
             devsbd_arch: None,
+            volumes: Vec::new(),
             created_unix: 0,
         }
     }

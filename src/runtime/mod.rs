@@ -279,6 +279,17 @@ pub trait Backend: Send + Sync {
     /// chain it behind feature entrypoints, since a Dockerfile cannot reference
     /// its parent's.
     fn image_entrypoint(&self, image: &str) -> Result<Vec<String>>;
+
+    /// Delete a named volume. `Ok(false)` when it doesn't exist (already
+    /// gone), an error when the runtime refuses (e.g. still in use).
+    fn remove_volume(&self, name: &str) -> Result<bool>;
+}
+
+/// Whether a runtime's error text means "no such volume" (docker/podman say
+/// `no such volume`, Apple `container` says `not found`).
+pub(crate) fn is_missing_volume(err: &str) -> bool {
+    let err = err.to_ascii_lowercase();
+    err.contains("no such volume") || err.contains("not found")
 }
 
 /// Pick a backend by name: `docker`, `podman` or `container`.

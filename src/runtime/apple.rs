@@ -289,6 +289,14 @@ impl Backend for AppleContainer {
         let out = self.output_quiet(&["image", "inspect", image])?;
         parse_image_entrypoint(&out, oci_arch(std::env::consts::ARCH))
     }
+
+    fn remove_volume(&self, name: &str) -> Result<bool> {
+        match self.output_quiet(&["volume", "delete", name]) {
+            Ok(_) => Ok(true),
+            Err(e) if super::is_missing_volume(&e.to_string()) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 /// Element of `container image inspect`: one OCI image config per platform

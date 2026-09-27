@@ -163,6 +163,14 @@ impl Backend for Dockerlike {
         ])?;
         parse_entrypoint(&out)
     }
+
+    fn remove_volume(&self, name: &str) -> Result<bool> {
+        match self.output_quiet(&["volume", "rm", name]) {
+            Ok(_) => Ok(true),
+            Err(e) if super::is_missing_volume(&e.to_string()) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 /// `{{json .Config.Entrypoint}}`: `null` (unset) or a string array.
@@ -351,6 +359,23 @@ mod tests {
             ["/usr/bin/tini", "--"]
         );
         assert!(parse_entrypoint("garbage").is_err());
+    }
+
+    /// Docker-gated: a removed volume reports `true`, a second removal hits the
+    /// real "no such volume" error and reports `false` instead of failing.
+    #[test_utils::docker_test]
+    fn remove_volume_reports_missing() -> Result<(), &'static str> {
+        let name = format!(
+            "devsandbox-vol-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        Dockerlike::DOCKER.run_checked(&["volume", "create", &name]).map_err(|_| "volume create failed")?;
+        assert!(Dockerlike::DOCKER.remove_volume(&name).unwrap());
+        assert!(!Dockerlike::DOCKER.remove_volume(&name).unwrap());
+        Ok(())
     }
 
     #[test]

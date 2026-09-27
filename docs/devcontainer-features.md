@@ -78,6 +78,11 @@ containing `devcontainer-feature.json` + `install.sh`. Support pipeline:
   skipped with a warning on Apple `container`, which has no such flag).
   Feature entrypoints are chained ahead of the image's own `ENTRYPOINT` in the
   derived image; see `docs/entrypoint.md`.
+- Feature mounts: `${devcontainerId}` resolves to the instance id (the CLI
+  uses a label hash; both are stable per container), so e.g.
+  docker-in-docker's `dind-var-lib-docker-${devcontainerId}` volume is
+  per-instance and `rm` deletes it. A mount still holding an unsupported
+  `${…}` variable is skipped with a warning instead of failing `docker run`.
 - No image-config introspection for the default user (the CLI inspects the
   image and uses its `User` — `containerFeatures.ts:385-390`): `_REMOTE_USER`
   falls back to `root` when `remoteUser`/`containerUser` are unset.

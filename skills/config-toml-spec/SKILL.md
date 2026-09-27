@@ -68,9 +68,9 @@ Keys are devcontainer camelCase, except devsandbox extras noted in kebab-case. *
 |---|---|
 | `image` | Base image. Exactly one of `image` / `build` is needed. |
 | `build` | `{ dockerfile (required), context = ".", args = {}, target, cacheFrom = str\|[str], options = [str] }`. Tag `devsandbox-img-<sandbox>`. `cacheFrom` ignored with a warning on runtimes without support. |
-| `features` | `{ "<oci-ref>" = { opts } \| "version" \| true \| false }` (`false` skips it, handy to disable an inherited feature). OCI refs only (no local paths/tarballs); ordered by `installsAfter`, baked into `devsandbox-img-<sandbox>-feat`. Feature-declared `mounts` are applied, but a sandbox `mounts` entry on the same target replaces them, and one the host or runtime can't satisfy (missing bind source, single-file bind on Apple `container`) is skipped with a warning. A feature declaring `privileged: true` runs the container `--privileged` (skipped with a warning on Apple `container`, which has no such flag). Feature `entrypoint`s run at every container start, in install order, before the image's own `ENTRYPOINT` (a failing one warns in the logs and the rest continue; see `docs/entrypoint.md`). Feature `capAdd` is ignored. |
+| `features` | `{ "<oci-ref>" = { opts } \| "version" \| true \| false }` (`false` skips it, handy to disable an inherited feature). OCI refs only (no local paths/tarballs); ordered by `installsAfter`, baked into `devsandbox-img-<sandbox>-feat`. Feature-declared `mounts` are applied, but a sandbox `mounts` entry on the same target replaces them, and one the host or runtime can't satisfy (missing bind source, single-file bind on Apple `container`) is skipped with a warning, as is one still holding an unsupported `${…}` variable. A feature declaring `privileged: true` runs the container `--privileged` (skipped with a warning on Apple `container`, which has no such flag). Feature `entrypoint`s run at every container start, in install order, before the image's own `ENTRYPOINT` (a failing one warns in the logs and the rest continue; see `docs/entrypoint.md`). Feature `capAdd` is ignored. |
 | `workspaceFolder` | Container path of the working tree. Default `/workspaces/<folder basename>`. `${…}` vars allowed. |
-| `mounts` | Docker shorthand `"source=…,target=…,type=bind[,readonly]"` or `{ type = "bind", source, target, readonly }`. Default type `bind` (needs `source`). One mount per target: the last entry wins (see merge rules). Missing bind sources are auto-created: a basename with a dot after any leading dots (`creds.json`) → file, otherwise → dir (`.zshrc` becomes a *dir*). |
+| `mounts` | Docker shorthand `"source=…,target=…,type=bind[,readonly]"` or `{ type = "bind", source, target, readonly }`. Default type `bind` (needs `source`). One mount per target: the last entry wins (see merge rules). Missing bind sources are auto-created: a basename with a dot after any leading dots (`creds.json`) → file, otherwise → dir (`.zshrc` becomes a *dir*). A `volume` whose source uses `${instance}` / `${devcontainerId}` is per-instance: `rm` deletes it (`rebuild` keeps it); other named volumes are shared and never deleted. |
 | `containerEnv` | `docker run -e`. Not `${…}`-substituted. |
 | `remoteEnv` | Applied on every `exec` and lifecycle command. |
 | `containerUser` | `docker run --user`. |
@@ -100,6 +100,7 @@ Substituted in `mounts` (source/target), `workspaceFolder`, `worktree-branch`, `
 | `${localWorkspaceFolder}` | absolute host `folder` (the base repo, even for worktree instances) |
 | `${localWorkspaceFolderBasename}` | its basename |
 | `${instance}` | persistent instance id (name at creation; stable across renames) |
+| `${devcontainerId}` | same as `${instance}` (devcontainer's stable per-container id; features name volumes with it) |
 | `${localEnv:VAR}` | host env var, empty if unset |
 
 ## Services (`[services.<name>]`)

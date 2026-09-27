@@ -248,7 +248,8 @@ pub(crate) fn materialize(
             None => None,
         }
     };
-    let mut mounts = resolve_mounts(dir, folder, &basename, instance_id, sandbox)?;
+    let ResolvedMounts { args: mut mounts, volumes: mut instance_volumes } =
+        resolve_mounts(dir, folder, &basename, instance_id, sandbox)?;
     for (target, host) in &extra_folders {
         mounts.push(format!("type=bind,source={},target={target}", host.display()));
     }
@@ -274,6 +275,7 @@ pub(crate) fn materialize(
     // workspace itself) wins, so the config can override a feature's mount.
     let feature = feature_container_opts(props, &var_ctx, &mounts, &workspace)?;
     mounts.extend(feature.mounts);
+    instance_volumes.extend(feature.volumes);
     sort_parents_first(&mut mounts);
     let (privileged, warnings) = privileged_decision(
         props.privileged == Some(true),
@@ -321,6 +323,12 @@ pub(crate) fn materialize(
     );
 
     let persist_history = shell_history.is_some();
+    // Keep volumes a previous run recorded: a rebuild keeps them on disk even
+    // when the config no longer mounts them, and `rm` must still find them.
+    let volumes = merge_volumes(
+        state.instances.get(instance).map(|i| i.volumes.as_slice()).unwrap_or_default(),
+        instance_volumes,
+    );
     state.instances.insert(
         instance.to_string(),
         Instance {
@@ -339,6 +347,7 @@ pub(crate) fn materialize(
             remote_user: props.remote_user.clone(),
             ssh_auth_sock,
             devsbd_arch,
+            volumes,
             created_unix: Instance::now(),
         },
     );
@@ -843,9 +852,9 @@ fn resolve_mounts(
     basename: &str,
     instance_id: &str,
     sandbox: &ResolvedSandbox,
-) -> Result<Vec<String>> {
+) -> Result<ResolvedMounts> {
     let Some(mounts) = &sandbox.properties.mounts else {
-        return Ok(Vec::new());
+        return Ok(ResolvedMounts::default());
     };
     // `${configDir}` anchors host-backed volumes; make it absolute.
     let config_dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
@@ -863,16 +872,27 @@ fn resolve_mounts(
         .collect::<Result<Vec<_>>>()
         .with_context(|| format!("sandbox `{}`: invalid mount", sandbox.name))?;
     let resolved = last_wins_by_target(resolved);
-    let mut args = Vec::with_capacity(resolved.len());
+    let mut out = ResolvedMounts::default();
     for resolved in resolved {
         if resolved.kind == "bind" {
             if let Some(source) = &resolved.source {
                 ensure_bind_source(Path::new(source))?;
             }
         }
-        args.push(resolved.to_arg());
+        if resolved.per_instance {
+            out.volumes.extend(resolved.source.clone());
+        }
+        out.args.push(resolved.to_arg());
     }
-    Ok(args)
+    Ok(out)
+}
+
+/// The sandbox's own `mounts` as `--mount` args, plus the per-instance volume
+/// names among them (for `rm`).
+#[derive(Default)]
+struct ResolvedMounts {
+    args: Vec<String>,
+    volumes: Vec<String>,
 }
 
 /// Drop every mount whose target a later entry claims again, keeping the order
@@ -1135,6 +1155,8 @@ fn shell_rc_wiring(paths: &[&str], persist_history: bool) -> LifecycleCommand {
 struct FeatureContainerOpts {
     /// `--mount` args.
     mounts: Vec<String>,
+    /// Per-instance volume names among `mounts` (for `rm`).
+    volumes: Vec<String>,
     /// Refs of the enabled features declaring `privileged: true`; the backend
     /// check happens in [`privileged_decision`].
     privileged_by: Vec<String>,
@@ -1176,6 +1198,7 @@ fn feature_container_opts(
 ) -> Result<FeatureContainerOpts> {
     let mut opts = FeatureContainerOpts {
         mounts: Vec::new(),
+        volumes: Vec::new(),
         privileged_by: Vec::new(),
     };
     let Some(features) = &props.features else {
@@ -1211,6 +1234,9 @@ fn feature_container_opts(
                 MountDecision::Apply => {
                     taken.insert(resolved.target.clone());
                     opts.mounts.push(resolved.to_arg());
+                    if resolved.per_instance {
+                        opts.volumes.extend(resolved.source.clone());
+                    }
                 }
                 MountDecision::Overridden => {}
                 MountDecision::Skip(reason) => {
@@ -1220,6 +1246,24 @@ fn feature_container_opts(
         }
     }
     Ok(opts)
+}
+
+/// The first `${…}` expression left in an already-substituted value.
+fn unresolved_variable(value: &str) -> Option<&str> {
+    let start = value.find("${")?;
+    let end = value[start..].find('}').map_or(value.len(), |e| start + e + 1);
+    Some(&value[start..end])
+}
+
+/// `previous` followed by the new names not already in it.
+fn merge_volumes(previous: &[String], current: Vec<String>) -> Vec<String> {
+    let mut out = previous.to_vec();
+    for volume in current {
+        if !out.contains(&volume) {
+            out.push(volume);
+        }
+    }
+    out
 }
 
 /// Outcome for one feature-declared mount.
@@ -1244,6 +1288,16 @@ fn feature_mount_decision(
 ) -> MountDecision {
     if taken.contains(&mount.target) {
         return MountDecision::Overridden;
+    }
+    // `substitute` leaves unknown `${…}` verbatim; passing one on only earns an
+    // opaque runtime error (e.g. an invalid volume name).
+    for value in mount.source.iter().chain([&mount.target]) {
+        if let Some(var) = unresolved_variable(value) {
+            return MountDecision::Skip(format!(
+                "mount to `{}` uses unsupported variable `{var}`; skipping",
+                mount.target
+            ));
+        }
     }
     if mount.kind != "bind" {
         return MountDecision::Apply;
@@ -1943,6 +1997,7 @@ mod tests {
             remote_user: None,
             ssh_auth_sock: None,
             devsbd_arch: None,
+            volumes: Vec::new(),
             created_unix: 0,
         }
     }
@@ -2158,7 +2213,42 @@ mod tests {
             source: source.map(Into::into),
             target: target.into(),
             readonly: false,
+            per_instance: false,
         }
+    }
+
+    #[test]
+    fn feature_mount_decision_skips_unresolved_variables() {
+        // An unsupported variable would otherwise reach the runtime verbatim.
+        let m = feature_mount("volume", Some("dind-${someFutureVar}"), "/var/lib/docker");
+        match feature_mount_decision(&m, &BTreeSet::new(), true, |_| None) {
+            MountDecision::Skip(reason) => {
+                assert!(reason.contains("unsupported variable `${someFutureVar}`"), "{reason}")
+            }
+            other => panic!("expected Skip, got {other:?}"),
+        }
+        let m = feature_mount("volume", Some("v"), "/x/${nope");
+        assert!(matches!(
+            feature_mount_decision(&m, &BTreeSet::new(), true, |_| None),
+            MountDecision::Skip(_)
+        ));
+        // Overridden by the sandbox wins before the check: silent, as before.
+        let taken = BTreeSet::from(["/var/lib/docker".to_string()]);
+        let m = feature_mount("volume", Some("dind-${someFutureVar}"), "/var/lib/docker");
+        assert_eq!(
+            feature_mount_decision(&m, &taken, true, |_| None),
+            MountDecision::Overridden
+        );
+    }
+
+    #[test]
+    fn merge_volumes_keeps_previous_and_dedupes() {
+        let previous = vec!["dind-web".to_string(), "old-web".to_string()];
+        assert_eq!(
+            merge_volumes(&previous, vec!["dind-web".into(), "new-web".into()]),
+            ["dind-web", "old-web", "new-web"]
+        );
+        assert!(merge_volumes(&[], vec![]).is_empty());
     }
 
     #[test]

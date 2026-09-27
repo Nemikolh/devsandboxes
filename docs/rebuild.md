@@ -5,7 +5,7 @@
 `devsandbox rebuild <name>` (alias: `recreate`) removes an instance's
 container and re-materializes it from the *current* config, preserving the
 worktree, branch, instance name, and per-instance state (shell history,
-`${instance}`-anchored mounts). No drift → no-op with a message. In the TUI,
+`${instance}`-anchored mounts, per-instance volumes, which only `rm` deletes). No drift → no-op with a message. In the TUI,
 `s` on a stopped instance with drift rebuilds (suspending the TUI) instead of
 bare-starting.
 

@@ -221,7 +221,15 @@ pub struct ResolvedMount {
     pub source: Option<String>,
     pub target: String,
     pub readonly: bool,
+    /// A `volume` whose source names it after the instance (`${instance}` /
+    /// `${devcontainerId}`), so it belongs to that instance alone and `rm`
+    /// deletes it. Shared named volumes are never touched.
+    pub per_instance: bool,
 }
+
+/// Variables that resolve to the instance id; a volume named with one is
+/// per-instance.
+const INSTANCE_VARS: [&str; 2] = ["${instance}", "${devcontainerId}"];
 
 impl Mount {
     /// Apply variable substitution and defaults. `bind` mounts require a source.
@@ -236,6 +244,10 @@ impl Mount {
             ),
         };
         let kind = kind.unwrap_or_else(|| "bind".to_string());
+        let per_instance = kind == "volume"
+            && source
+                .as_deref()
+                .is_some_and(|s| INSTANCE_VARS.iter().any(|v| s.contains(v)));
         let source = source.map(|s| substitute(&s, ctx));
         let target = substitute(&target, ctx);
         if kind == "bind" && source.is_none() {
@@ -246,6 +258,7 @@ impl Mount {
             source,
             target,
             readonly,
+            per_instance,
         })
     }
 }
@@ -352,7 +365,11 @@ fn resolve_var(expr: &str, ctx: &MountContext) -> Option<String> {
         "localWorkspaceFolder" => Some(ctx.workspace_folder.to_string()),
         "localWorkspaceFolderBasename" => Some(ctx.workspace_folder_basename.to_string()),
         "sharedVolumes" => Some(ctx.shared_volumes.to_string()),
-        "instance" => Some(ctx.instance.to_string()),
+        // devcontainer's stable per-container id (features use it to name
+        // their volumes, e.g. docker-in-docker's `/var/lib/docker`). The
+        // instance id has the same properties: unique, and stable across
+        // rebuilds and renames.
+        "instance" | "devcontainerId" => Some(ctx.instance.to_string()),
         _ => None,
     }
 }
@@ -1043,6 +1060,26 @@ onCreateCommand = { b = "make", a = ["cargo", "build"] }
         let resolved = m.resolve(&ctx()).unwrap();
         assert_eq!(resolved.source.as_deref(), Some("/cfg/shared-volumes/agent/repo-2"));
         assert_eq!(resolved.target, "/root/.agent");
+        assert!(!resolved.per_instance, "binds are never per-instance volumes");
+    }
+
+    #[test]
+    fn devcontainer_id_is_the_instance_and_marks_volume_per_instance() {
+        // docker-in-docker's feature mount, object form.
+        let m = Mount::Object(MountObject {
+            kind: Some("volume".into()),
+            source: Some("dind-var-lib-docker-${devcontainerId}".into()),
+            target: "/var/lib/docker".into(),
+            readonly: None,
+        });
+        let resolved = m.resolve(&ctx()).unwrap();
+        assert_eq!(resolved.source.as_deref(), Some("dind-var-lib-docker-repo-2"));
+        assert!(resolved.per_instance);
+        let m = Mount::Shorthand("type=volume,source=cache-${instance},target=/c".into());
+        assert!(m.resolve(&ctx()).unwrap().per_instance);
+        // A shared named volume is not the instance's to delete.
+        let m = Mount::Shorthand("type=volume,source=pnpm-store,target=/p".into());
+        assert!(!m.resolve(&ctx()).unwrap().per_instance);
     }
 
     #[test]

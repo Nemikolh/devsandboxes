@@ -68,6 +68,12 @@ pub struct Instance {
     /// the next install so emulated images skip the host-arch attempt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub devsbd_arch: Option<crate::devsbd::Arch>,
+    /// Per-instance named volumes (sources using `${instance}` /
+    /// `${devcontainerId}`, e.g. docker-in-docker's `/var/lib/docker`),
+    /// recorded so `rm` deletes exactly these even if the config changed since.
+    /// Accumulated across rebuilds, which keep them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volumes: Vec<String>,
     pub created_unix: u64,
 }
 
@@ -154,6 +160,7 @@ mod tests {
                 remote_user: None,
                 ssh_auth_sock: None,
                 devsbd_arch: None,
+                volumes: Vec::new(),
                 created_unix: Instance::now(),
             },
         );
