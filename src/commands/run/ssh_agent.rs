@@ -61,8 +61,8 @@ fn symlink(_src: &Path, _dst: &Path) -> std::io::Result<()> {
     ))
 }
 
-/// Decide ssh-agent forwarding for a new instance. Returns the `-v
-/// <link>:<target>` mount to push and the container target to persist, or
+/// Decide ssh-agent forwarding for a new instance. Returns the
+/// `-v <link>:<target>` mount to push and the container target to persist, or
 /// `None` when forwarding is off. Gate (all silent on miss — an absent agent
 /// is the common case): the runtime binds files, `$SSH_AUTH_SOCK` is set, and
 /// its socket exists on the host. On a link error, warn and skip: forwarding

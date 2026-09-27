@@ -45,10 +45,11 @@ pub(crate) fn exec_lifecycle(
     Ok(())
 }
 
-/// Pure argv builder for one lifecycle exec, mirroring [`exec_argv_with`]'s
-/// flag order (`-w`, `-u`, remote_env, `SSH_AUTH_SOCK`, container, command) so
-/// lifecycle execs carry the same agent env the CLI/TUI do. `ssh_auth_sock` is
-/// the shared rule's result (`commands::exec::ssh_auth_sock_env`).
+/// Pure argv builder for one lifecycle exec, mirroring
+/// `commands::exec::exec_argv_with`'s flag order (`-w`, `-u`, remote_env,
+/// `SSH_AUTH_SOCK`, container, command) so lifecycle execs carry the same agent
+/// env the CLI/TUI do. `ssh_auth_sock` is the shared rule's result
+/// (`commands::exec::ssh_auth_sock_env`).
 fn lifecycle_argv(
     container: &str,
     workspace: &str,

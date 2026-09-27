@@ -32,7 +32,7 @@ pub enum Node {
     Orphans,
     /// A process row under an expanded instance. `instance` indexes into
     /// `instances`; `row` indexes into that instance's [`ProcState::Rows`], or is
-    /// [`MESSAGE_ROW`](super::procs::MESSAGE_ROW) for the single placeholder row
+    /// [`MESSAGE_ROW`] for the single placeholder row
     /// of a [`ProcState::Message`] (not fetched / not running / error).
     Proc { instance: usize, row: usize },
 }
@@ -95,8 +95,9 @@ pub fn visible_nodes(
 
 /// Emit the process child nodes for one visible instance, if its procs are
 /// expanded. A running container with a fetched forest emits one
-/// [`Node::Proc`] per [`ProcRow`]; every other case (not fetched yet, container
-/// not running, fetch error) emits the single [`MESSAGE_ROW`] placeholder.
+/// [`Node::Proc`] per [`ProcRow`](super::procs::ProcRow); every other case
+/// (not fetched yet, container not running, fetch error) emits the single
+/// [`MESSAGE_ROW`] placeholder.
 fn push_proc_nodes(
     nodes: &mut Vec<Node>,
     instance: usize,

@@ -78,7 +78,7 @@ Command prompt (:)
 
 /// A scrollable full-screen text overlay (help, logs). Body is captured once at
 /// open time; scrolling is the only interaction. Shared scroll math lives in
-/// [`clamp_scroll`]/[`line_count`] so the config modal and this stay in sync.
+/// [`scroll_key`]/[`line_count`] so the config modal and this stay in sync.
 pub struct TextModal {
     /// Rendered in the modal border title.
     pub title: String,

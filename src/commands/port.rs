@@ -274,7 +274,8 @@ fn references(config: &Config, sandbox: &str, service: &str) -> bool {
 }
 
 /// The impure edge: build the `resolve` closure `Forward` calls on every
-/// (re)spawn of its bridge. Unix-only, since [`Route`] is.
+/// (re)spawn of its bridge. Unix-only, since
+/// [`Route`](crate::devsbd::forward::Route) is.
 ///
 /// `instance_key` must be an **exact state key** — the CLI resolves a
 /// user-supplied name via [`super::resolve_instance`] once, before building the

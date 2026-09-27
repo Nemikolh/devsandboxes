@@ -1,8 +1,8 @@
-//! `status --json`: dump the full [`Snapshot`] as machine-readable JSON for an
-//! external UI. The snapshot is the same struct the TUI renders, so JSON parity
-//! holds by construction. Docker being down is data, not a CLI failure: the rows
-//! still come from state and `Snapshot.error` carries the reason, so we print
-//! and exit 0.
+//! `status --json`: dump the full [`Snapshot`](crate::snapshot::Snapshot) as
+//! machine-readable JSON for an external UI. The snapshot is the same struct
+//! the TUI renders, so JSON parity holds by construction. Docker being down is
+//! data, not a CLI failure: the rows still come from state and `Snapshot.error`
+//! carries the reason, so we print and exit 0.
 
 use std::path::Path;
 
