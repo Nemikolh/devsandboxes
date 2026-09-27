@@ -13,6 +13,10 @@ git worktrees so working trees are never shared.
   resolution in `commands/mod.rs` (`resolve_instance`: instance | sandbox |
   folder basename). `port.rs` resolves a forward route (instance | service via a
   running instance | injection fallback) and hosts the foreground `port` CLI.
+  `run/` is split by concern: `mod.rs` (`run`/`materialize`, naming,
+  `run_container`), `worktree.rs`, `ssh_agent.rs`, `mounts.rs`, `image.rs`
+  (feature image + Dockerfile/entrypoint generation), `lifecycle.rs`,
+  `editor.rs` (VS Code name config); `mod.rs` re-exports what other commands use.
 - `src/config.rs` — TOML schema: `[template.*]`, `[sandbox.*]`, `[services.*]`.
   `extends` deep-merges (tables recurse, **arrays concatenate** — that's how
   `template.base` services reach every sandbox). Config drift is detected by
