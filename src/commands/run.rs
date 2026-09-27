@@ -275,6 +275,14 @@ pub(crate) fn materialize(
     let feature = feature_container_opts(props, &var_ctx, &mounts, &workspace)?;
     mounts.extend(feature.mounts);
     sort_parents_first(&mut mounts);
+    let (privileged, warnings) = privileged_decision(
+        props.privileged == Some(true),
+        &feature.privileged_by,
+        backend().supports_privileged(),
+    );
+    for warning in warnings {
+        eprintln!("warning: {warning}");
+    }
     run_container(
         dir,
         sandbox,
@@ -287,7 +295,7 @@ pub(crate) fn materialize(
         &extra_env,
         &networks,
         &endpoints,
-        feature.privileged,
+        privileged,
     )?;
     let container = container_name.clone();
     // Before lifecycle commands, so they could already rely on the helper. In
@@ -1127,16 +1135,31 @@ fn shell_rc_wiring(paths: &[&str], persist_history: bool) -> LifecycleCommand {
 struct FeatureContainerOpts {
     /// `--mount` args.
     mounts: Vec<String>,
-    /// Some feature declared `privileged: true` and the backend can honor it.
-    privileged: bool,
+    /// Refs of the enabled features declaring `privileged: true`; the backend
+    /// check happens in [`privileged_decision`].
+    privileged_by: Vec<String>,
+}
+
+/// Whether to pass `--privileged`, plus the warnings to print. Requested by the
+/// sandbox's `privileged = true` or any enabled feature's `privileged: true`;
+/// on a backend without the flag every request is skipped with a warning, like
+/// an unsatisfiable feature mount.
+fn privileged_decision(sandbox: bool, features: &[String], supported: bool) -> (bool, Vec<String>) {
+    let requested = sandbox || !features.is_empty();
+    if supported || !requested {
+        return (requested, Vec::new());
+    }
+    let skip = "this runtime cannot run privileged containers; skipping `privileged`";
+    let mut warnings: Vec<String> =
+        features.iter().map(|r| format!("feature `{r}`: {skip}")).collect();
+    if sandbox {
+        warnings.insert(0, skip.to_string());
+    }
+    (false, warnings)
 }
 
 /// Resolve the container-side settings declared by the sandbox's enabled
 /// features (fetches hit the per-user cache also used by the image build).
-///
-/// `privileged`: any requesting feature makes the container privileged; on a
-/// backend without `--privileged` it is skipped with a warning, like an
-/// unsatisfiable mount.
 ///
 /// Mounts are turned into `--mount` args. The
 /// sandbox always wins: a feature mount whose target is already claimed is
@@ -1153,7 +1176,7 @@ fn feature_container_opts(
 ) -> Result<FeatureContainerOpts> {
     let mut opts = FeatureContainerOpts {
         mounts: Vec::new(),
-        privileged: false,
+        privileged_by: Vec::new(),
     };
     let Some(features) = &props.features else {
         return Ok(opts);
@@ -1174,13 +1197,7 @@ fn feature_container_opts(
         let feature =
             features::fetch(&parsed).with_context(|| format!("fetching feature `{reference}`"))?;
         if feature.metadata.privileged == Some(true) {
-            if backend().supports_privileged() {
-                opts.privileged = true;
-            } else {
-                eprintln!(
-                    "warning: feature `{reference}`: this runtime cannot run privileged containers; skipping `privileged`"
-                );
-            }
+            opts.privileged_by.push(reference.clone());
         }
         for mount in &feature.metadata.mounts {
             let resolved = mount.resolve(ctx)?;
@@ -2117,6 +2134,27 @@ mod tests {
             feature_mount("bind", Some("/h/creds.json"), "/root/.zidane/credentials.json"),
         ];
         assert_eq!(last_wins_by_target(mounts.clone()), mounts);
+    }
+
+    #[test]
+    fn privileged_decision_ors_sandbox_and_features() {
+        let dind = ["ghcr.io/devcontainers/features/docker-in-docker:2".to_string()];
+        assert_eq!(privileged_decision(false, &[], true), (false, vec![]));
+        assert_eq!(privileged_decision(true, &[], true), (true, vec![]));
+        assert_eq!(privileged_decision(false, &dind, true), (true, vec![]));
+        assert_eq!(privileged_decision(true, &dind, true), (true, vec![]));
+    }
+
+    #[test]
+    fn privileged_decision_unsupported_warns_per_request() {
+        // Apple `container` has no `--privileged`.
+        let dind = ["ghcr.io/devcontainers/features/docker-in-docker:2".to_string()];
+        assert_eq!(privileged_decision(false, &[], false), (false, vec![]));
+        let (on, warnings) = privileged_decision(true, &dind, false);
+        assert!(!on);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].starts_with("this runtime cannot"), "{warnings:?}");
+        assert!(warnings[1].contains("docker-in-docker"), "{warnings:?}");
     }
 
     #[test]

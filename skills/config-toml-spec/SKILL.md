@@ -76,6 +76,7 @@ Keys are devcontainer camelCase, except devsandbox extras noted in kebab-case. *
 | `containerUser` | `docker run --user`. |
 | `remoteUser` | `exec -u` for `exec`, lifecycle commands, VS Code attach. |
 | `init` | `true` → `docker run --init`. |
+| `privileged` | bool; `true` → `docker run --privileged`. OR-ed with any enabled feature's `privileged`, so `false` can't veto a feature that needs it. Skipped with a warning on Apple `container` (no such flag). |
 | `initializeCommand` | Runs on the **host**, cwd = config dir, before anything is created. |
 | `onCreateCommand`, `updateContentCommand`, `postCreateCommand`, `postStartCommand`, `postAttachCommand` | Run in that order in the container after create (as `remoteUser`, in `workspaceFolder`, with `remoteEnv`). `start` re-runs only `postStartCommand`. |
 | `customizations.vscode.extensions` | [string]; installed via VS Code (workspace recommendations on Apple `container`). |
@@ -84,7 +85,7 @@ Lifecycle command forms: `"shell string"` (→ `sh -c`), `["argv", "..."]`, or a
 
 ### Accepted but ignored (warned at `run`)
 
-`name`, `forwardPorts`, `appPort`, `portsAttributes`, `otherPortsAttributes`, `runArgs`, `workspaceMount`, `overrideFeatureInstallOrder`, `updateRemoteUserUID`, `userEnvProbe`, `overrideCommand`, `shutdownAction`, `privileged`, `capAdd`, `securityOpt`, `hostRequirements`, `waitFor`, `secrets`, `customizations.vscode.settings`, any other `customizations.vscode.*` or `customizations.<tool>`.
+`name`, `forwardPorts`, `appPort`, `portsAttributes`, `otherPortsAttributes`, `runArgs`, `workspaceMount`, `overrideFeatureInstallOrder`, `updateRemoteUserUID`, `userEnvProbe`, `overrideCommand`, `shutdownAction`, `capAdd`, `securityOpt`, `hostRequirements`, `waitFor`, `secrets`, `customizations.vscode.settings`, any other `customizations.vscode.*` or `customizations.<tool>`.
 
 Not accepted at all (hard error): compose keys (`dockerComposeFile`, `service`, `runServices`) — compose support was removed.
 

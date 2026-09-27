@@ -79,6 +79,10 @@ pub struct SandboxProperties {
     /// devcontainer `features`: a map of feature ref (e.g.
     /// `"ghcr.io/devcontainers/features/node:1"`) to its options.
     pub features: Option<BTreeMap<String, FeatureOptions>>,
+    /// Run the container `--privileged`. OR-ed with any enabled feature's
+    /// `privileged` (as the official CLI does), so `false` cannot veto a
+    /// feature that needs it.
+    pub privileged: Option<bool>,
 
     // --- valid devcontainer properties, not implemented yet ---
     pub name: Option<Value>,
@@ -98,7 +102,6 @@ pub struct SandboxProperties {
     pub override_command: Option<Value>,
     pub shutdown_action: Option<Value>,
     pub init: Option<bool>,
-    pub privileged: Option<Value>,
     pub cap_add: Option<Value>,
     pub security_opt: Option<Value>,
     pub host_requirements: Option<Value>,
@@ -129,7 +132,6 @@ impl SandboxProperties {
             user_env_probe => "userEnvProbe",
             override_command => "overrideCommand",
             shutdown_action => "shutdownAction",
-            privileged => "privileged",
             cap_add => "capAdd",
             security_opt => "securityOpt",
             host_requirements => "hostRequirements",
@@ -901,11 +903,13 @@ image = "alpine"
 containerEnv = { FOO = "bar" }
 postCreateCommand = "npm install"
 customizations.vscode.extensions = ["rust-lang.rust-analyzer"]
+privileged = true
 "#,
         )
         .unwrap();
         let sandbox = config.resolve_sandbox("s").unwrap();
         assert!(sandbox.properties.ignored().is_empty());
+        assert_eq!(sandbox.properties.privileged, Some(true));
         assert_eq!(
             sandbox.properties.vscode_extensions(),
             Some(&["rust-lang.rust-analyzer".to_string()][..])
