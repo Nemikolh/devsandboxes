@@ -18,7 +18,9 @@ git worktrees so working trees are never shared.
   `template.base` services reach every sandbox). Config drift is detected by
   hashing the merged table (`config_hash` label on containers) plus the build
   dockerfile's contents (`build_hash` label); the shared rule is
-  `commands::drift_decision`.
+  `commands::drift_decision`. The full user-facing format reference is the
+  `skills/config-toml-spec/SKILL.md` skill: update it whenever a config field,
+  merge rule, or `${…}` variable changes.
 - `src/commands/services.rs` — service/network lifecycle. `scope = "isolated"`
   (default): one container per instance on a per-instance network. `scope =
   "global"`: one shared container per config root. `gc` reaps unreferenced ones;

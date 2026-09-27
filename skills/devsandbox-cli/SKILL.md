@@ -2,7 +2,7 @@
 name: devsandbox-cli
 description: |
   Use the devsandbox CLI to create, run, exec into, and tear down devcontainer-based sandboxes from a config.toml file.
-  Covers config.toml (devcontainer properties plus devsandbox extras) and every subcommand, ordered by how useful each is to an agent.
+  Covers every subcommand, ordered by how useful each is to an agent, plus a config.toml overview (full format: the `config-toml-spec` skill).
 ---
 
 # devsandbox CLI
@@ -44,55 +44,14 @@ TOML, not JSON. Three top-level table families:
 - `[sandbox.<name>]` — a devcontainer definition plus devsandbox extras.
 - `[services.<name>]` — sidecar containers (databases, etc.).
 
-Sandbox/template keys use devcontainer **camelCase** (`postCreateCommand`, `containerEnv`, …).
-Unknown keys are a **hard error**. Valid devcontainer properties that aren't implemented yet
-parse but emit a `warning: ignoring unsupported properties: …` at `run` (see [what's implemented](#devcontainer-properties)).
+Sandbox/template keys use devcontainer **camelCase** (`postCreateCommand`, `containerEnv`, …);
+devsandbox extras (`folder`, `services`, `caches`, `persist-shell-history`, `shell-rc`, …) are
+additions on top. Unknown keys are a **hard error**; valid devcontainer properties that aren't
+implemented parse but warn at `run`. `extends` deep-merges templates: tables recurse, **arrays
+concatenate**, scalars are replaced.
 
-### devsandbox extras (what differs from devcontainer.json)
-
-These keys do not exist in devcontainer.json — they are devsandbox additions:
-
-| Key                     | Where             | Meaning                                                                                                                                                                                                                                              |
-| ----------------------- | ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `extends`               | sandbox, template | Template name (`"base"`) or list (`["a","b"]`) to deep-merge **under** this table. Merged left-to-right; templates may extend templates; cycles are detected and error.                                                                              |
-| `folder`                | sandbox           | **Required to `run`.** Host project folder, relative to the config dir, mounted as the workspace. Must exist.                                                                                                                                        |
-| `folders`               | sandbox           | Extra VS Code roots: `{ "/abs/container/path" = "../host/folder" }`. Each is bind-mounted and listed in a generated `.code-workspace`. Container path must be absolute and differ from the primary workspace.                                        |
-| `services`              | sandbox           | List of `[services.<name>]` to start and network alongside the instance.                                                                                                                                                                             |
-| `caches`                | sandbox, template | Package-manager caches to persist + share across the config root. Supported: `pnpm`, `cargo`, `npm`, `yarn`, `go`, `pip`. Each becomes a shared bind mount under `shared-volumes/` plus the env var(s) pointing the tool at it. Unknown name errors. |
-| `persist-shell-history` | sandbox, template | `true` provisions a per-instance `.zsh_history` on the host, bind-mounted at `/root/.zsh_history`. Survives `rm` + `run`; never shared between concurrent instances. (Kebab-case, unlike the camelCase devcontainer keys.)                           |
-| `shell-rc`              | sandbox, template | List of host shell snippets (relative to the config dir; `${…}` variables as in `mounts`). Each file's parent dir is bind-mounted read-only at `/devsandbox/rc/<i>` and a guarded `. <file>` line is appended once to `$HOME/.zshrc` and `$HOME/.bashrc` (as `remoteUser`) before `onCreateCommand`. Arrays concatenate under `extends`. Missing file errors. |
-
-`[services.<name>]` fields (also devsandbox-specific): `image` **xor** `build`, plus `env` (map), `ports` (list, `"8080:80"`), `command` (string or list),
-and `scope = "isolated"` (default; one container per instance) or `"global"` (one per config root, shared). Reached from the sandbox by service name as
-the DNS alias.
-
-### Deep-merge semantics for `extends`
-
-Nested tables merge recursively; **arrays concatenate** (base first, then the overriding table) so a sandbox can add to a template's `mounts` / `extensions`
-without restating them; scalars are replaced.
-
-### devcontainer properties
-
-**Implemented** (behave as in devcontainer.json): `image`, `build` (`dockerfile`, `context`, `args`, `target`, `cacheFrom`, `options`), `workspaceFolder`,
-`containerEnv`, `remoteEnv`, `containerUser`, `remoteUser`, `init`, `mounts`, `features`, `customizations.vscode.extensions`, and the lifecycle commands
-`initializeCommand` (runs on the **host**), `onCreateCommand`, `updateContentCommand`, `postCreateCommand`, `postStartCommand`, `postAttachCommand`.
-
-**Parsed but ignored (warn at `run`)**: `name`, `forwardPorts`, `appPort`, `portsAttributes`, `otherPortsAttributes`, `runArgs`, `workspaceMount`,
-`overrideFeatureInstallOrder`, `updateRemoteUserUID`, `userEnvProbe`, `overrideCommand`, `shutdownAction`, `privileged`, `capAdd`, `securityOpt`,
-`hostRequirements`, `waitFor`, `secrets`, `customizations.vscode.settings`, and any non-vscode `customizations.<tool>`.
-
-`features` are fetched as OCI artifacts, cached per user, ordered by `installsAfter`, and baked into a derived image at `run`. Options accept the
-devcontainer forms: `= true`, a bare version string, or an options table; `= false` skips the feature.
-
-### Mount / cache variables
-
-Usable in `workspaceFolder`, `mounts` sources, and `folders`:
-
-  `${configDir}`, `${localWorkspaceFolder}`, `${localWorkspaceFolderBasename}`, `${localEnv:VAR}` (unset → empty),
-  plus devsandbox's `${sharedVolumes}` (the config root's `shared-volumes/` dir) and `${instance}` (the instance's
-  persistent id: its creation name, unique and unaffected by `rename` — use it to anchor per-instance state in a mount
-  source). Unknown `${…}` is left verbatim. Missing bind sources
-  are auto-created (a final component with a dot → file, else directory).
+**For the full format** — every key, merge rules, `${…}` variables, services, what's implemented —
+use the `config-toml-spec` skill.
 
 ### Minimal example
 
