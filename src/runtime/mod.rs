@@ -274,6 +274,11 @@ pub trait Backend: Send + Sync {
     /// Whether `run --privileged` is supported. Apple's `container` has no such
     /// flag (each container is its own VM).
     fn supports_privileged(&self) -> bool;
+
+    /// The local image's `ENTRYPOINT` (exec form; empty when unset). Needed to
+    /// chain it behind feature entrypoints, since a Dockerfile cannot reference
+    /// its parent's.
+    fn image_entrypoint(&self, image: &str) -> Result<Vec<String>>;
 }
 
 /// Pick a backend by name: `docker`, `podman` or `container`.

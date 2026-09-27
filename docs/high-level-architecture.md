@@ -53,7 +53,7 @@ devsandbox extras on a sandbox:
 
 Mount sources support devcontainer-style variables: `${configDir}`, `${localWorkspaceFolder}`, `${localWorkspaceFolderBasename}`, `${localEnv:VAR}`. devsandbox adds `${sharedVolumes}` (the config root's persistent-state dir) and `${instance}` (the instance's persistent id: its name at creation, kept unique and unchanged by `rename`, so host paths anchored on `${instance}` never move).
 
-`features` are fetched natively as OCI artifacts (via `curl`, no registry crates), cached per user, ordered by `installsAfter`, and baked into a derived image at `run`. Feature-declared `mounts` are applied too, and a feature declaring `privileged: true` runs the container `--privileged` (skipped with a warning on Apple `container`). A sandbox mount with the same target overrides the feature's. A mount the host or runtime can't satisfy (missing bind source, file bind on Apple `container`) is skipped with a warning. See `docs/devcontainer-features.md`.
+`features` are fetched natively as OCI artifacts (via `curl`, no registry crates), cached per user, ordered by `installsAfter`, and baked into a derived image at `run`. Feature-declared `mounts` are applied too, and a feature declaring `privileged: true` runs the container `--privileged` (skipped with a warning on Apple `container`). Feature `entrypoint`s run at every start, chained ahead of the image's own `ENTRYPOINT` (`docs/entrypoint.md`). A sandbox mount with the same target overrides the feature's. A mount the host or runtime can't satisfy (missing bind source, file bind on Apple `container`) is skipped with a warning. See `docs/devcontainer-features.md`.
 
 ## Drift
 

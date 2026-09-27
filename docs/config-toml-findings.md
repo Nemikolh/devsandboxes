@@ -102,8 +102,9 @@ Feature options are passed as env files and feature `containerEnv` becomes `ENV`
 
 v1 limitations:
 - OCI refs only — no local paths or tarballs.
-- Feature `capAdd` and `entrypoint` are ignored (`mounts` and `privileged` are
-  applied; `privileged` is skipped with a warning on Apple `container`).
+- Feature `capAdd` is ignored (`mounts`, `privileged` and `entrypoint` are
+  applied; `privileged` is skipped with a warning on Apple `container`;
+  entrypoints: `docs/entrypoint.md`).
 - `_REMOTE_USER` defaults to `root` unless `remoteUser`/`containerUser` is set.
 - Cached tags don't auto-refresh; clear `$XDG_CACHE_HOME/devsandbox/features`
   to force a re-fetch.

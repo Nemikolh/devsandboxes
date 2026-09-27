@@ -284,11 +284,96 @@ impl Backend for AppleContainer {
     fn supports_privileged(&self) -> bool {
         false
     }
+
+    fn image_entrypoint(&self, image: &str) -> Result<Vec<String>> {
+        let out = self.output_quiet(&["image", "inspect", image])?;
+        parse_image_entrypoint(&out, oci_arch(std::env::consts::ARCH))
+    }
+}
+
+/// Element of `container image inspect`: one OCI image config per platform
+/// variant (`variants[].config` is `ContainerizationOCI.Image`, whose keys
+/// follow the OCI image spec).
+#[derive(Debug, Deserialize)]
+struct ImageInspect {
+    #[serde(default)]
+    variants: Vec<ImageVariant>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ImageVariant {
+    config: OciImage,
+}
+
+#[derive(Debug, Deserialize)]
+struct OciImage {
+    #[serde(default)]
+    architecture: String,
+    #[serde(default)]
+    os: String,
+    #[serde(default)]
+    config: Option<OciImageConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OciImageConfig {
+    #[serde(rename = "Entrypoint", default)]
+    entrypoint: Option<Vec<String>>,
+}
+
+/// Rust's `std::env::consts::ARCH` in OCI platform terms.
+fn oci_arch(arch: &str) -> &str {
+    match arch {
+        "aarch64" => "arm64",
+        "x86_64" => "amd64",
+        other => other,
+    }
+}
+
+/// The entrypoint of the `linux/<arch>` variant (what `run` would start),
+/// falling back to the first variant.
+fn parse_image_entrypoint(json: &str, arch: &str) -> Result<Vec<String>> {
+    let images: Vec<ImageInspect> =
+        serde_json::from_str(json).context("unexpected `container image inspect` JSON")?;
+    let variants = images.into_iter().next().map(|i| i.variants).unwrap_or_default();
+    let pick = variants
+        .iter()
+        .position(|v| v.config.os == "linux" && v.config.architecture == arch)
+        .unwrap_or(0);
+    Ok(variants
+        .into_iter()
+        .nth(pick)
+        .and_then(|v| v.config.config)
+        .and_then(|c| c.entrypoint)
+        .unwrap_or_default())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_entrypoint_picks_host_variant() {
+        let json = r#"[{"id": "x", "configuration": {}, "variants": [
+          {"platform": {}, "digest": "d1", "size": 1,
+           "config": {"architecture": "amd64", "os": "linux", "config": {"Entrypoint": ["/amd"]}}},
+          {"platform": {}, "digest": "d2", "size": 1,
+           "config": {"architecture": "arm64", "os": "linux", "config": {"Entrypoint": ["/arm", "--"]}}}
+        ]}]"#;
+        assert_eq!(parse_image_entrypoint(json, "arm64").unwrap(), ["/arm", "--"]);
+        assert_eq!(parse_image_entrypoint(json, "amd64").unwrap(), ["/amd"]);
+        // No matching variant: first one.
+        assert_eq!(parse_image_entrypoint(json, "riscv64").unwrap(), ["/amd"]);
+    }
+
+    #[test]
+    fn image_entrypoint_unset_is_empty() {
+        let json = r#"[{"variants": [{"config": {"architecture": "arm64", "os": "linux", "config": {"Cmd": ["sh"]}}}]}]"#;
+        assert!(parse_image_entrypoint(json, "arm64").unwrap().is_empty());
+        let json = r#"[{"variants": [{"config": {"architecture": "arm64", "os": "linux"}}]}]"#;
+        assert!(parse_image_entrypoint(json, "arm64").unwrap().is_empty());
+        assert_eq!(oci_arch("aarch64"), "arm64");
+    }
 
     const INSPECT: &str = r#"[{
       "id": "devsandbox-repo",

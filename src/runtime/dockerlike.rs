@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Deserialize;
 
 use super::{
@@ -152,6 +152,24 @@ impl Backend for Dockerlike {
     fn supports_privileged(&self) -> bool {
         true
     }
+
+    fn image_entrypoint(&self, image: &str) -> Result<Vec<String>> {
+        let out = self.output_quiet(&[
+            "image",
+            "inspect",
+            "--format",
+            "{{json .Config.Entrypoint}}",
+            image,
+        ])?;
+        parse_entrypoint(&out)
+    }
+}
+
+/// `{{json .Config.Entrypoint}}`: `null` (unset) or a string array.
+fn parse_entrypoint(out: &str) -> Result<Vec<String>> {
+    let value: Option<Vec<String>> = serde_json::from_str(out.trim())
+        .with_context(|| format!("unexpected image entrypoint `{}`", out.trim()))?;
+    Ok(value.unwrap_or_default())
 }
 
 /// A string, or a list of strings (podman emits `Names` as an array).
@@ -322,6 +340,17 @@ mod tests {
                 mem: "50MiB / 2GiB".into(),
             }]
         );
+    }
+
+    #[test]
+    fn parse_entrypoint_null_or_array() {
+        assert!(parse_entrypoint("null\n").unwrap().is_empty());
+        assert!(parse_entrypoint("[]").unwrap().is_empty());
+        assert_eq!(
+            parse_entrypoint(r#"["/usr/bin/tini","--"]"#).unwrap(),
+            ["/usr/bin/tini", "--"]
+        );
+        assert!(parse_entrypoint("garbage").is_err());
     }
 
     #[test]

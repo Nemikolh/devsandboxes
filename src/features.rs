@@ -159,6 +159,9 @@ pub struct FeatureMetadata {
     pub container_env: BTreeMap<String, String>,
     #[serde(default)]
     pub installs_after: Vec<String>,
+    /// A command to run at every container start (e.g. docker-in-docker's
+    /// `dockerd` launcher). Chained ahead of the image's own ENTRYPOINT in the
+    /// derived image; see `docs/entrypoint.md`.
     #[serde(default)]
     pub entrypoint: Option<String>,
     /// Mounts the feature asks the container to carry (e.g.
