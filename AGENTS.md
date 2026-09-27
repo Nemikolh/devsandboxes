@@ -38,8 +38,12 @@ git worktrees so working trees are never shared.
   `src/devsbd/forward.rs` is the host forwarder engine (unix-only): binds a
   local listener and tunnels each connection through a self-healing bridge, over
   the mux's flow-controlled `Connect` streams. See `docs/port-forwarding.md`.
-- `src/tui/` — ratatui dashboard. `app.rs` is a deliberately I/O-free state
-  machine (unit-tested); `mod.rs` owns the terminal + event loop and runs
+- `src/tui/` — ratatui dashboard. `app/` is a deliberately I/O-free state
+  machine (unit-tested): `App` + key/mouse dispatch in `app/mod.rs`, with
+  `impl App` blocks split into `tree.rs` (selection/navigation), `view.rs`
+  (modals, config/inspect view), `command_line.rs` (`:` prompt handling and
+  completion), `terminal.rs`, `actions.rs` (one-key actions + pending queue),
+  `procs.rs`; shared test fixtures in `test_support.rs`. `tui/mod.rs` owns the terminal + event loop and runs
   docker work on background threads; `prompt.rs` is the `:` command line
   (`spec.rs` is its declarative grammar table — parsing *and* tab completion
   derive from `SPECS`, so a new flag is one table entry);
