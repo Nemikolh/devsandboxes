@@ -1,6 +1,6 @@
 {
   "name": "@devsandboxes/linux-x64",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "description": "devsandbox native binary for linux x64. Install `devsandboxes` instead.",
   "license": "MIT",
   "repository": {
