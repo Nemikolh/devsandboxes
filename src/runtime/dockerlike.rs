@@ -148,6 +148,10 @@ impl Backend for Dockerlike {
     fn supports_file_binds(&self) -> bool {
         true
     }
+
+    fn supports_privileged(&self) -> bool {
+        true
+    }
 }
 
 /// A string, or a list of strings (podman emits `Names` as an array).

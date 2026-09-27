@@ -280,6 +280,10 @@ impl Backend for AppleContainer {
     fn supports_file_binds(&self) -> bool {
         false
     }
+
+    fn supports_privileged(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

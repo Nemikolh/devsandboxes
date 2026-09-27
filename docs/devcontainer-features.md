@@ -71,9 +71,11 @@ containing `devcontainer-feature.json` + `install.sh`. Support pipeline:
 ### v1 scope cuts (documented, not silent)
 
 - OCI refs only; local-path / https-tarball features error clearly.
-- Feature metadata `mounts`, `capAdd`, `privileged`, `entrypoint`, `init`
-  ignored (the runner uses `sleep infinity`; the four target features need
-  none of these). `containerEnv` and options are honored.
+- Feature metadata `capAdd`, `entrypoint`, `init` ignored (the runner uses
+  `sleep infinity`; the four target features need none of these).
+  `containerEnv`, options, `mounts` and `privileged` are honored (`privileged:
+  true` on any enabled feature runs the container `--privileged`; skipped with
+  a warning on Apple `container`, which has no such flag).
 - No image-config introspection for the default user (the CLI inspects the
   image and uses its `User` — `containerFeatures.ts:385-390`): `_REMOTE_USER`
   falls back to `root` when `remoteUser`/`containerUser` are unset.

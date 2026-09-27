@@ -272,8 +272,8 @@ pub(crate) fn materialize(
     mounts.extend(shell_rc.iter().map(|(mount, _)| mount.clone()));
     // Feature-declared mounts come last: any target claimed above (or the
     // workspace itself) wins, so the config can override a feature's mount.
-    let feature = feature_mounts(props, &var_ctx, &mounts, &workspace)?;
-    mounts.extend(feature);
+    let feature = feature_container_opts(props, &var_ctx, &mounts, &workspace)?;
+    mounts.extend(feature.mounts);
     sort_parents_first(&mut mounts);
     run_container(
         dir,
@@ -287,6 +287,7 @@ pub(crate) fn materialize(
         &extra_env,
         &networks,
         &endpoints,
+        feature.privileged,
     )?;
     let container = container_name.clone();
     // Before lifecycle commands, so they could already rely on the helper. In
@@ -758,6 +759,7 @@ fn run_container(
     extra_env: &[(String, String)],
     networks: &[String],
     endpoints: &[ServiceEndpoint],
+    privileged: bool,
 ) -> Result<()> {
     let props = &sandbox.properties;
     let image = image_for(dir, sandbox)?;
@@ -781,6 +783,9 @@ fn run_container(
     .into();
     if props.init == Some(true) {
         args.push("--init".into());
+    }
+    if privileged {
+        args.push("--privileged".into());
     }
     if let Some(user) = &props.container_user {
         args.push("--user".into());
@@ -1117,31 +1122,49 @@ fn shell_rc_wiring(paths: &[&str], persist_history: bool) -> LifecycleCommand {
     LifecycleCommand::Simple(SimpleCommand::Shell(script))
 }
 
-/// Resolve the mounts declared by the sandbox's enabled features (fetches hit
-/// the per-user cache also used by the image build) into `--mount` args. The
+/// What the sandbox's enabled features ask of the container itself (the image
+/// side lives in [`build_features_image`]).
+struct FeatureContainerOpts {
+    /// `--mount` args.
+    mounts: Vec<String>,
+    /// Some feature declared `privileged: true` and the backend can honor it.
+    privileged: bool,
+}
+
+/// Resolve the container-side settings declared by the sandbox's enabled
+/// features (fetches hit the per-user cache also used by the image build).
+///
+/// `privileged`: any requesting feature makes the container privileged; on a
+/// backend without `--privileged` it is skipped with a warning, like an
+/// unsatisfiable mount.
+///
+/// Mounts are turned into `--mount` args. The
 /// sandbox always wins: a feature mount whose target is already claimed is
 /// dropped, so the config can replace e.g. docker-outside-of-docker's hardcoded
 /// `/var/run/docker.sock` source with a rootless socket path. Mounts the
 /// backend cannot apply, or whose bind source is missing on the host, are
 /// skipped with a warning — auto-creating the source (the config-mount
 /// behavior) would hand the container an empty stub instead of a clear signal.
-fn feature_mounts(
+fn feature_container_opts(
     props: &SandboxProperties,
     ctx: &MountContext,
     existing: &[String],
     workspace: &str,
-) -> Result<Vec<String>> {
+) -> Result<FeatureContainerOpts> {
+    let mut opts = FeatureContainerOpts {
+        mounts: Vec::new(),
+        privileged: false,
+    };
     let Some(features) = &props.features else {
-        return Ok(Vec::new());
+        return Ok(opts);
     };
     let mut taken: BTreeSet<String> = existing
         .iter()
         .filter_map(|arg| parse_shorthand(arg).ok().map(|(_, _, target, _)| target))
         .collect();
     taken.insert(workspace.to_string());
-    let mut out = Vec::new();
-    for (reference, opts) in features {
-        if feature_option_values(opts)
+    for (reference, options) in features {
+        if feature_option_values(options)
             .with_context(|| format!("feature `{reference}`: invalid options"))?
             .is_none()
         {
@@ -1150,6 +1173,15 @@ fn feature_mounts(
         let parsed = features::FeatureRef::parse(reference)?;
         let feature =
             features::fetch(&parsed).with_context(|| format!("fetching feature `{reference}`"))?;
+        if feature.metadata.privileged == Some(true) {
+            if backend().supports_privileged() {
+                opts.privileged = true;
+            } else {
+                eprintln!(
+                    "warning: feature `{reference}`: this runtime cannot run privileged containers; skipping `privileged`"
+                );
+            }
+        }
         for mount in &feature.metadata.mounts {
             let resolved = mount.resolve(ctx)?;
             let probe = |source: &str| std::fs::metadata(source).ok().map(|m| !m.is_dir());
@@ -1161,7 +1193,7 @@ fn feature_mounts(
             ) {
                 MountDecision::Apply => {
                     taken.insert(resolved.target.clone());
-                    out.push(resolved.to_arg());
+                    opts.mounts.push(resolved.to_arg());
                 }
                 MountDecision::Overridden => {}
                 MountDecision::Skip(reason) => {
@@ -1170,7 +1202,7 @@ fn feature_mounts(
             }
         }
     }
-    Ok(out)
+    Ok(opts)
 }
 
 /// Outcome for one feature-declared mount.

@@ -166,6 +166,11 @@ pub struct FeatureMetadata {
     /// sandbox mount with the same target takes precedence.
     #[serde(default)]
     pub mounts: Vec<Mount>,
+    /// Whether the feature needs a privileged container (e.g.
+    /// docker-in-docker). One requesting feature makes the whole container
+    /// privileged, as in the official CLI.
+    #[serde(default)]
+    pub privileged: Option<bool>,
     #[serde(default, rename = "documentationURL")]
     pub documentation_url: Option<String>,
 }
@@ -838,6 +843,14 @@ mod tests {
         assert_eq!(resolved.kind, "bind");
         assert_eq!(resolved.source.as_deref(), Some("/var/run/docker.sock"));
         assert_eq!(resolved.target, "/var/run/docker-host.sock");
+    }
+
+    #[test]
+    fn metadata_parses_privileged() {
+        let md = FeatureMetadata::parse(r#"{"id": "docker-in-docker", "privileged": true}"#).unwrap();
+        assert_eq!(md.privileged, Some(true));
+        let md = FeatureMetadata::parse(r#"{"id": "node"}"#).unwrap();
+        assert_eq!(md.privileged, None);
     }
 
     #[test]

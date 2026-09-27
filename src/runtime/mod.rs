@@ -270,6 +270,10 @@ pub trait Backend: Send + Sync {
     /// `container` only binds directories; callers that would mount a file must
     /// mount its parent directory instead, or skip the mount.
     fn supports_file_binds(&self) -> bool;
+
+    /// Whether `run --privileged` is supported. Apple's `container` has no such
+    /// flag (each container is its own VM).
+    fn supports_privileged(&self) -> bool;
 }
 
 /// Pick a backend by name: `docker`, `podman` or `container`.
