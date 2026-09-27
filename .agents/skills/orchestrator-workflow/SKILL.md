@@ -19,9 +19,8 @@ You orchestrate; subagents implement. You never let a subagent touch git.
 3. **Present the plan** to the user for approval before touching anything.
    On revision requests, update the plan file and re-present.
 4. **Per step, spawn one implementer subagent**:
-   - IMPORTANT: set "model" to `claude-opus-4-8`
    - "task" = `/implementer` skill + the plan file path + step number
-     + code landmarks + anything learned from prior steps' reviews;
+     - code landmarks + anything learned from prior steps' reviews;
    - subagents have no conversation context — brief like a colleague who
      just walked in.
 5. **Review every completed step yourself**: read the diff (`git diff --stat`,
@@ -29,7 +28,7 @@ You orchestrate; subagents implement. You never let a subagent touch git.
    defects the step brief couldn't foresee (resource leaks, stderr hitting
    owned terminals, cooked-vs-raw mode, blocking the UI thread). Small
    defects: fix directly. Large ones: resume the subagent with the finding.
-6. **Commit the step** with a message that says *why*, staging only the
+6. **Commit the step** with a message that says _why_, staging only the
    step's files (never `git add -A`; leave unrelated workspace diffs alone).
 7. Track steps with the todo list; mark off as you go. After the final step,
    summarize: what landed, review fixes you made on top, known limitations.
