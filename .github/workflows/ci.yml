@@ -9,7 +9,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # Build the devsbd helpers into target/devsbd (where .cargo/config.toml
       # points build.rs) so the docker-gated bridge/forward tests have a helper
       # to install. Those tests fail rather than skip on CI (src/test_support.rs).

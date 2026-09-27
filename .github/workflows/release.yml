@@ -13,7 +13,7 @@ jobs:
     outputs:
       version: ${{ steps.check.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - id: check
         run: |
           version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
@@ -45,12 +45,12 @@ jobs:
             os: ubuntu-24.04-arm
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # rust-lld (via .cargo/config.toml) cross-links musl from any host, so no
       # musl-tools needed for the helper.
       - run: rustup target add ${{ matrix.arch }}-unknown-linux-musl
       - run: cargo build -p devsbd --profile devsbd --target ${{ matrix.arch }}-unknown-linux-musl
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: devsbd-${{ matrix.arch }}
           path: target/${{ matrix.arch }}-unknown-linux-musl/devsbd/devsbd
@@ -72,18 +72,18 @@ jobs:
             os: windows-latest
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: rustup target add ${{ matrix.target }}
       - if: contains(matrix.target, 'musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       # Both helpers get embedded into every release binary (build.rs reads
       # $DEVSANDBOX_DEVSBD_DIR/<arch>/devsbd); DEVSANDBOX_DEVSBD_REQUIRED=1 makes
       # a missing helper a build error so a release never ships without it.
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           name: devsbd-x86_64
           path: ${{ runner.temp }}/devsbd/x86_64
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           name: devsbd-aarch64
           path: ${{ runner.temp }}/devsbd/aarch64
@@ -106,7 +106,7 @@ jobs:
               tar czf "dist/$name.tar.gz" -C "target/${{ matrix.target }}/release" devsandbox
               ;;
           esac
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: devsandbox-${{ matrix.target }}
           path: dist/*
@@ -116,15 +116,15 @@ jobs:
     needs: [version, build]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           path: dist
           pattern: devsandbox-*
           merge-multiple: true
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           files: dist/*
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Publish to crates.io
         run: cargo publish
         env:
@@ -139,14 +139,14 @@ jobs:
       # short-lived publish token, so no NPM_TOKEN secret is involved.
       id-token: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v7
         with:
           path: dist
           pattern: devsandbox-*
           merge-multiple: true
       # No registry-url: its generated .npmrc expects a token.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 24
       # Trusted publishing needs npm >= 11.5.1.
