@@ -82,10 +82,27 @@ worktree.
 
 ## Link: `worktree-link`
 
-Entries are **literal repo-relative paths**, not globs. A link can be set up
-before the file exists anywhere, and moving files into the store needs
-concrete names. A trailing `/` is accepted but isn't needed. Entries with `..`,
-`.`, `.git`, or an absolute path are a config error and fail `run`.
+Entries are **paths from the repo root**, and a bare `.env` means only
+`<root>/.env`, unlike gitignore where it matches at any depth. A leading `./`
+and a trailing `/` are dropped. Entries with `..`, `.git`, `**`, or an absolute
+path are a config error and fail `run`. Every entry is checked before anything
+on disk changes.
+
+**Globs are one segment at a time**: `*` (any run of characters) and `?` (one
+character) match within a single path segment, e.g. `packages/*/.env`. There is
+no `**` and no `[...]` (`[` is literal).
+
+- A glob is expanded by listing only the directories the pattern names, in both
+  the base repo and the store. A file already moved into the store still
+  matches even if its base copy was deleted. There's never a recursive walk,
+  because the step runs on every `run` and `rebuild`.
+- Wildcards match dotfiles, as in gitignore, but never `.git`. A wildcard
+  segment in the middle only matches directories (symlinked dirs count).
+- A glob matches only paths that already **exist** in the base repo or the
+  store. A new package's `.env` is picked up on the next `run` or `rebuild`. To
+  share a file before it exists anywhere, list its exact path: an exact entry
+  is linked as soon as the file shows up.
+- Every match goes through the same checks as an exact entry below.
 
 - **Store**: `<config>/shared-files/<sandbox>/<path>` holds the real file or
   directory. There's one store per sandbox, shared by the base instance and
@@ -148,7 +165,7 @@ from the TUI, and stdout carries the instance name for scripts.
 ## Out of scope (possible follow-ups)
 
 - `.worktreeinclude.local` (per-user additions and negations, read last).
-- Globs in `worktree-link`, read-only store mounts, a per-repo (rather than
+- `**` / `[...]` in `worktree-link`, read-only store mounts, a per-repo (rather than
   per-sandbox) store, and an `unlink`/restore command.
 - A command to re-seed copies into an existing instance.
 - Serving shared files through `devsbd` into a tmpfs, so secrets never sit in

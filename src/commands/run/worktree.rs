@@ -1,7 +1,7 @@
 //! Git worktrees for repeat instances of one repo, so working trees are never
 //! shared.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
@@ -214,12 +214,16 @@ fn copy_entry(src: &Path, dst: &Path) -> Result<()> {
 pub(super) fn link_shared_files(store: &Path, trees: &[&Path], entries: &[String]) -> Result<()> {
     let Some((base, _)) = trees.split_first() else { return Ok(()) };
     std::fs::create_dir_all(store).with_context(|| format!("cannot create {}", store.display()))?;
+    // Validate every entry before touching the disk: a config error must not
+    // leave half the entries adopted.
+    let rels = entries.iter().map(|e| link_entry_path(e)).collect::<Result<Vec<_>>>()?;
     let mut seen = std::collections::BTreeSet::new();
-    for entry in entries {
-        let rel = link_entry_path(entry)?;
+    let expanded = rels.iter().flat_map(|rel| expand_link_glob(rel, &[*base, store]));
+    for rel in expanded {
         if !seen.insert(rel.clone()) {
             continue;
         }
+        let entry = rel.display();
         // Replacing a tracked (or merely untracked) path with a symlink would
         // show up in `git status`; only gitignored, untracked paths qualify.
         if !git_ignores(base, &rel) {
@@ -253,17 +257,98 @@ pub(super) fn link_shared_files(store: &Path, trees: &[&Path], entries: &[String
     Ok(())
 }
 
-/// Normalize a `worktree-link` entry to a plain relative path (trailing `/`
-/// dropped). Anything that could escape the tree or the store is rejected.
-fn link_entry_path(entry: &str) -> Result<std::path::PathBuf> {
+/// Normalize a `worktree-link` entry to a plain relative path: leading `./`
+/// and trailing `/` dropped, interior `.` collapsed. Anything that could
+/// escape the tree or the store is rejected, as is `**` (globs are one
+/// segment only, see [`expand_link_glob`]).
+fn link_entry_path(entry: &str) -> Result<PathBuf> {
     use std::path::Component;
-    let rel = Path::new(entry.trim_end_matches('/'));
-    let ok = !entry.trim_end_matches('/').is_empty()
-        && rel.components().all(|c| matches!(c, Component::Normal(n) if n != ".git"));
-    if !ok {
-        bail!("invalid worktree-link `{entry}`: must be a relative path inside the repo (no `..`, `.`, `.git`)");
+    let mut trimmed = entry.trim_end_matches('/');
+    while let Some(rest) = trimmed.strip_prefix("./") {
+        trimmed = rest.trim_start_matches('/');
     }
-    Ok(rel.to_path_buf())
+    let mut rel = PathBuf::new();
+    for c in Path::new(trimmed).components() {
+        match c {
+            Component::Normal(n) if n != ".git" && n != "**" => rel.push(n),
+            Component::Normal(n) if n == "**" => {
+                bail!("invalid worktree-link `{entry}`: `**` is not supported, use `*` per path segment")
+            }
+            _ => bail!(
+                "invalid worktree-link `{entry}`: must be a relative path inside the repo (no `..`, `.git`, or absolute path)"
+            ),
+        }
+    }
+    if rel.as_os_str().is_empty() {
+        bail!("invalid worktree-link `{entry}`: empty path");
+    }
+    Ok(rel)
+}
+
+/// Expand `*` / `?` in `rel`, one path segment at a time, against what exists
+/// under any of `roots` (the base repo and the store, so a file already moved
+/// into the store still matches). Only the directories the pattern names are
+/// listed, never a recursive walk: this runs on every `run`. Wildcards match
+/// dotfiles (as in gitignore) but never `.git`. A literal entry passes through
+/// unchanged, existing or not; a glob yields only existing matches.
+fn expand_link_glob(rel: &Path, roots: &[&Path]) -> Vec<PathBuf> {
+    let mut frontier = vec![PathBuf::new()];
+    let segments: Vec<_> = rel.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
+    for (i, seg) in segments.iter().enumerate() {
+        if !seg.contains(['*', '?']) {
+            frontier.iter_mut().for_each(|p| p.push(seg));
+            continue;
+        }
+        let last = i + 1 == segments.len();
+        let mut next = std::collections::BTreeSet::new();
+        for prefix in &frontier {
+            for root in roots {
+                let Ok(dir) = std::fs::read_dir(root.join(prefix)) else { continue };
+                for entry in dir.flatten() {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    // Intermediate segments must lead somewhere (`metadata`
+                    // follows symlinks, so a linked dir still counts).
+                    let descends = last || entry.path().metadata().is_ok_and(|m| m.is_dir());
+                    if name != ".git" && descends && wildcard_match(seg, &name) {
+                        next.insert(prefix.join(&name));
+                    }
+                }
+            }
+        }
+        frontier = next.into_iter().collect();
+    }
+    frontier
+}
+
+/// Shell-style match of one path segment: `*` any run of chars, `?` one char,
+/// everything else literal.
+fn wildcard_match(pattern: &str, name: &str) -> bool {
+    let (p, n): (Vec<char>, Vec<char>) = (pattern.chars().collect(), name.chars().collect());
+    let (mut pi, mut ni) = (0, 0);
+    // Backtrack point: pattern index after the last `*`, and the name index it
+    // is currently assumed to have consumed up to.
+    let mut star: Option<(usize, usize)> = None;
+    while ni < n.len() {
+        match p.get(pi) {
+            Some('*') => {
+                star = Some((pi + 1, ni));
+                pi += 1;
+            }
+            Some(&c) if c == '?' || c == n[ni] => {
+                pi += 1;
+                ni += 1;
+            }
+            _ => match star {
+                Some((sp, sn)) => {
+                    pi = sp;
+                    ni = sn + 1;
+                    star = Some((sp, sn + 1));
+                }
+                None => return false,
+            },
+        }
+    }
+    p[pi..].iter().all(|&c| c == '*')
 }
 
 /// Whether git ignores `rel` in `tree` (false for tracked paths: `check-ignore`
@@ -565,10 +650,87 @@ mod tests {
         assert_eq!(git(&base, &["status", "--porcelain"]), "");
         assert_eq!(git(&wt, &["status", "--porcelain"]), "");
 
-        for bad in ["../x", "/abs", ".git/config", "./.env", ""] {
+        for bad in ["../x", "/abs", ".git/config", "a/../../x", "", "./", "**/.env", "a/**"] {
             let err = link_shared_files(&store, &[&base], &[bad.into()]).unwrap_err();
             assert!(err.to_string().contains("invalid worktree-link"), "{bad}: {err}");
         }
+        // A bad entry anywhere fails before any other entry is adopted.
+        std::fs::write(base.join(".env.late"), "x").unwrap();
+        assert!(link_shared_files(&store, &[&base], &[".env.late".into(), "../x".into()]).is_err());
+        assert!(!store.join(".env.late").exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn link_entry_path_normalizes() {
+        for (entry, want) in [
+            ("./packages/bolt/.env", "packages/bolt/.env"),
+            ("././.env", ".env"),
+            (".//x/", "x"),
+            ("a/./b", "a/b"),
+            ("packages/*/.env", "packages/*/.env"),
+        ] {
+            assert_eq!(link_entry_path(entry).unwrap(), Path::new(want), "{entry}");
+        }
+    }
+
+    #[test]
+    fn wildcard_matches_one_segment() {
+        for (p, n, ok) in [
+            ("*", "bolt", true),
+            ("*", ".hidden", true),
+            ("*", "", true),
+            (".env*", ".env.local", true),
+            (".env*", ".en", false),
+            ("a?c", "abc", true),
+            ("a?c", "ac", false),
+            ("*-proxy", "claude-code-proxy", true),
+            ("*a*b", "xaxxb", true),
+            ("*a*b", "xaxxbc", false),
+            ("lit", "lit", true),
+            ("lit", "lits", false),
+        ] {
+            assert_eq!(wildcard_match(p, n), ok, "{p} vs {n}");
+        }
+    }
+
+    #[test]
+    fn link_glob_expands_against_base_and_store() {
+        let root = std::env::temp_dir().join(format!("devsandbox-wtg-{}", std::process::id()));
+        let base = repo(&root, ".env\nnotadir\n");
+        let (wt, store) = (root.join("wt"), root.join("store"));
+        for pkg in ["bolt", "proxy", "empty"] {
+            std::fs::create_dir_all(base.join("packages").join(pkg)).unwrap();
+        }
+        std::fs::write(base.join("packages/bolt/.env"), "b").unwrap();
+        std::fs::write(base.join("packages/proxy/.env"), "p").unwrap();
+        // A plain file where a directory is expected is not descended into.
+        std::fs::write(base.join("packages/notadir"), "").unwrap();
+        // Only in the store (base copy gone): the glob must still find it.
+        std::fs::create_dir_all(store.join("packages/gone")).unwrap();
+        std::fs::write(store.join("packages/gone/.env"), "g").unwrap();
+        create_worktree(&base, &wt, "sandbox/g", None).unwrap();
+
+        let mut got = expand_link_glob(Path::new("packages/*/.env"), &[&base, &store]);
+        got.sort();
+        let want: Vec<PathBuf> = ["bolt", "empty", "gone", "proxy"]
+            .iter()
+            .map(|p| Path::new("packages").join(p).join(".env"))
+            .collect();
+        assert_eq!(got, want);
+
+        link_shared_files(&store, &[&base, &wt], &["./packages/*/.env".into()]).unwrap();
+
+        let link = |p: PathBuf| std::fs::read_link(p).ok();
+        for pkg in ["bolt", "proxy", "gone"] {
+            let rel = format!("packages/{pkg}/.env");
+            assert_eq!(link(wt.join(&rel)), Some(store.join(&rel)), "{rel}");
+        }
+        assert_eq!(std::fs::read_to_string(wt.join("packages/gone/.env")).unwrap(), "g");
+        // No file anywhere: nothing created, not even an empty store slot.
+        assert!(wt.join("packages/empty/.env").symlink_metadata().is_err());
+        assert!(!store.join("packages/empty").exists());
+        assert_eq!(git(&base, &["status", "--porcelain"]), "");
         std::fs::remove_dir_all(&root).unwrap();
     }
 
