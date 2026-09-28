@@ -27,19 +27,19 @@ Grab a precompiled binary from the [latest release](https://github.com/Nemikolh/
 **Linux** (x86_64 / aarch64, static):
 
 ```
-$ curl -L https://github.com/Nemikolh/devsandboxes/releases/download/v0.3.4/devsandbox-0.3.4-$(uname -m)-unknown-linux-musl.tar.gz | tar xz
+$ curl -L https://github.com/Nemikolh/devsandboxes/releases/download/v0.4.0/devsandbox-0.4.0-$(uname -m)-unknown-linux-musl.tar.gz | tar xz
 ```
 
 **macOS** (Apple silicon):
 
 ```
-$ curl -L https://github.com/Nemikolh/devsandboxes/releases/download/v0.3.4/devsandbox-0.3.4-aarch64-apple-darwin.tar.gz | tar xz
+$ curl -L https://github.com/Nemikolh/devsandboxes/releases/download/v0.4.0/devsandbox-0.4.0-aarch64-apple-darwin.tar.gz | tar xz
 ```
 
 **Windows** (x86_64, PowerShell):
 
 ```
-> Invoke-WebRequest https://github.com/Nemikolh/devsandboxes/releases/download/v0.3.4/devsandbox-0.3.4-x86_64-pc-windows-msvc.zip -OutFile devsandbox.zip
+> Invoke-WebRequest https://github.com/Nemikolh/devsandboxes/releases/download/v0.4.0/devsandbox-0.4.0-x86_64-pc-windows-msvc.zip -OutFile devsandbox.zip
 > Expand-Archive devsandbox.zip .
 ```
 

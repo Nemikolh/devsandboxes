@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.0
 
 Worktree instances can now bring along the gitignored files a repo needs to run, like `.env` files, instead of starting without them.
 
