@@ -50,6 +50,16 @@ pub struct SandboxProperties {
     /// after a fetch. A `run --base` overrides it.
     #[serde(rename = "worktree-base")]
     pub worktree_base: Option<String>,
+    /// Extra `.worktreeinclude` patterns (gitignore syntax): gitignored files
+    /// copied from the base repo into each new worktree. Applied after the
+    /// repo's own `.worktreeinclude`, so they can negate its patterns.
+    #[serde(rename = "worktree-include")]
+    pub worktree_include: Option<Vec<String>>,
+    /// Repo-relative gitignored paths shared live by every instance: kept in
+    /// `shared-files/<sandbox>/` and symlinked into each working tree, the
+    /// store mounted at its host path (docs/worktreeinclude.md).
+    #[serde(rename = "worktree-link")]
+    pub worktree_link: Option<Vec<String>>,
     /// Host shell snippets (relative to the config dir, `${…}` variables as in
     /// `mounts`) sourced by the container's interactive `~/.zshrc` and
     /// `~/.bashrc`. Each file is bind-mounted read-only via its parent dir and
@@ -1235,6 +1245,34 @@ worktree-base = "origin/develop"
         .unwrap();
         let props = config.resolve_sandbox("s").unwrap().properties;
         assert_eq!(props.worktree_base.as_deref(), Some("origin/develop"));
+        assert!(props.ignored().is_empty());
+    }
+
+    #[test]
+    fn worktree_include_and_link_concatenate_through_template() {
+        let config = Config::parse(
+            r#"
+[template.base]
+worktree-include = [".vscode/tasks.json"]
+worktree-link = [".env"]
+
+[sandbox.s]
+extends = "base"
+image = "alpine"
+worktree-include = ["!.vscode/tasks.json"]
+worktree-link = [".env.local"]
+"#,
+        )
+        .unwrap();
+        let props = config.resolve_sandbox("s").unwrap().properties;
+        assert_eq!(
+            props.worktree_include.as_deref(),
+            Some(&[".vscode/tasks.json".to_string(), "!.vscode/tasks.json".to_string()][..])
+        );
+        assert_eq!(
+            props.worktree_link.as_deref(),
+            Some(&[".env".to_string(), ".env.local".to_string()][..])
+        );
         assert!(props.ignored().is_empty());
     }
 

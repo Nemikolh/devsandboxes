@@ -117,6 +117,7 @@ fn rebuild_instance(
         &base_folder,
         worktree,
         branch,
+        false,
         state,
     )?;
 

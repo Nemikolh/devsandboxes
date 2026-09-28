@@ -103,6 +103,238 @@ pub(super) fn create_worktree(
     Ok(())
 }
 
+/// Seed a fresh worktree with the base repo's gitignored files listed in its
+/// `.worktreeinclude` (docs/worktreeinclude.md): a checkout has no untracked
+/// files, so `.env` and friends would otherwise be missing. Git does the
+/// matching (include patterns, then gitignore), so semantics equal the other
+/// tools reading the same file. `patterns` (the sandbox's `worktree-include`)
+/// apply after the file, so they can negate it. Best effort: problems warn,
+/// never fail `run`.
+pub(super) fn copy_worktree_includes(base: &Path, worktree: &Path, patterns: &[String]) {
+    let include = base.join(".worktreeinclude");
+    let include = include.is_file().then_some(include);
+    if include.is_none() && patterns.is_empty() {
+        return;
+    }
+    let paths = match worktree_include_paths(base, include.as_deref(), patterns) {
+        Ok(paths) => paths,
+        Err(e) => {
+            eprintln!("warning: cannot apply worktree includes: {e:#}");
+            return;
+        }
+    };
+    for rel in paths {
+        if let Err(e) = copy_entry(&base.join(&rel), &worktree.join(&rel)) {
+            eprintln!("warning: cannot copy `{rel}` into worktree: {e:#}");
+        }
+    }
+}
+
+/// Untracked paths (relative to `base`) matching the include patterns that git
+/// also ignores. `ls-files` given only these exclude sources ignores
+/// `.gitignore`, so negation behaves as written (command-line `--exclude`
+/// outranks `--exclude-from`); `check-ignore` then drops anything not
+/// gitignored, which also keeps files under an ignored directory.
+fn worktree_include_paths(
+    base: &Path,
+    include: Option<&Path>,
+    patterns: &[String],
+) -> Result<Vec<String>> {
+    let mut ls = std::process::Command::new("git");
+    ls.arg("-C").arg(base).args(["ls-files", "-z", "--others", "--ignored"]);
+    if let Some(include) = include {
+        ls.arg(format!("--exclude-from={}", include.display()));
+    }
+    for p in patterns {
+        ls.arg(format!("--exclude={p}"));
+    }
+    let listed = ls.output().context("failed to run git (is it installed?)")?;
+    if !listed.status.success() {
+        bail!("git ls-files failed: {}", String::from_utf8_lossy(&listed.stderr).trim());
+    }
+    if listed.stdout.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut child = std::process::Command::new("git")
+        .arg("-C")
+        .arg(base)
+        .args(["check-ignore", "-z", "--stdin"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("failed to run git (is it installed?)")?;
+    // Write on a thread: a large list could fill the stdout pipe while we
+    // are still feeding stdin.
+    let mut stdin = child.stdin.take().expect("stdin is piped");
+    let input = listed.stdout;
+    let writer = std::thread::spawn(move || std::io::Write::write_all(&mut stdin, &input));
+    let out = child.wait_with_output().context("git check-ignore failed")?;
+    writer.join().expect("writer thread panicked").context("git check-ignore failed")?;
+    // Exit 1 means "nothing ignored", not an error.
+    if !out.status.success() && out.status.code() != Some(1) {
+        bail!("git check-ignore failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(out
+        .stdout
+        .split(|b| *b == 0)
+        .filter(|p| !p.is_empty())
+        .map(|p| String::from_utf8_lossy(p).into_owned())
+        .collect())
+}
+
+/// Copy one file or symlink, never overwriting: an existing destination
+/// (dangling symlinks included) is left alone.
+fn copy_entry(src: &Path, dst: &Path) -> Result<()> {
+    if dst.symlink_metadata().is_ok() {
+        return Ok(());
+    }
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let meta = src.symlink_metadata()?;
+    #[cfg(unix)]
+    if meta.file_type().is_symlink() {
+        std::os::unix::fs::symlink(std::fs::read_link(src)?, dst)?;
+        return Ok(());
+    }
+    if meta.is_file() {
+        std::fs::copy(src, dst)?;
+    }
+    Ok(())
+}
+
+/// Share `entries` (repo-relative, gitignored paths) live across every
+/// instance of a sandbox (docs/worktreeinclude.md): the real file lives in
+/// `store`, each of `trees` (base repo first, then the worktree if any) gets
+/// an absolute symlink to it, and the caller mounts `store` at its host path
+/// so the links resolve in the container. Idempotent (runs on every `run` and
+/// `rebuild`). A bad entry is a config error; anything on disk that doesn't
+/// fit (tracked path, conflicting file) only warns and is left untouched.
+pub(super) fn link_shared_files(store: &Path, trees: &[&Path], entries: &[String]) -> Result<()> {
+    let Some((base, _)) = trees.split_first() else { return Ok(()) };
+    std::fs::create_dir_all(store).with_context(|| format!("cannot create {}", store.display()))?;
+    let mut seen = std::collections::BTreeSet::new();
+    for entry in entries {
+        let rel = link_entry_path(entry)?;
+        if !seen.insert(rel.clone()) {
+            continue;
+        }
+        // Replacing a tracked (or merely untracked) path with a symlink would
+        // show up in `git status`; only gitignored, untracked paths qualify.
+        if !git_ignores(base, &rel) {
+            eprintln!(
+                "warning: worktree-link `{entry}` skipped: not gitignored (or tracked) in `{}`",
+                base.display()
+            );
+            continue;
+        }
+        let shared = store.join(&rel);
+        if let Err(e) = adopt(&base.join(&rel), &shared) {
+            eprintln!("warning: worktree-link `{entry}`: {e:#}");
+            continue;
+        }
+        if shared.symlink_metadata().is_err() {
+            // Neither the store nor the base has it yet; a later run links it.
+            continue;
+        }
+        for tree in trees {
+            match link_into(&tree.join(&rel), &shared) {
+                Ok(true) if !git_ignores(tree, &rel) => eprintln!(
+                    "warning: worktree-link `{entry}` shows as untracked in `{}`: a `dir/` \
+                     gitignore pattern doesn't match a symlink, drop the trailing `/`",
+                    tree.display()
+                ),
+                Ok(_) => {}
+                Err(e) => eprintln!("warning: worktree-link `{entry}` in `{}`: {e:#}", tree.display()),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Normalize a `worktree-link` entry to a plain relative path (trailing `/`
+/// dropped). Anything that could escape the tree or the store is rejected.
+fn link_entry_path(entry: &str) -> Result<std::path::PathBuf> {
+    use std::path::Component;
+    let rel = Path::new(entry.trim_end_matches('/'));
+    let ok = !entry.trim_end_matches('/').is_empty()
+        && rel.components().all(|c| matches!(c, Component::Normal(n) if n != ".git"));
+    if !ok {
+        bail!("invalid worktree-link `{entry}`: must be a relative path inside the repo (no `..`, `.`, `.git`)");
+    }
+    Ok(rel.to_path_buf())
+}
+
+/// Whether git ignores `rel` in `tree` (false for tracked paths: `check-ignore`
+/// only reports untracked ones). A missing git counts as not ignored.
+fn git_ignores(tree: &Path, rel: &Path) -> bool {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(tree)
+        .args(["check-ignore", "-q", "--"])
+        .arg(rel)
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// First sighting: move the base repo's real file/dir into the empty store
+/// slot (its symlink is laid down by [`link_into`]). No-op once the store has
+/// it, or when the base has nothing (or already a symlink) there.
+fn adopt(base_path: &Path, shared: &Path) -> Result<()> {
+    if shared.symlink_metadata().is_ok() {
+        return Ok(());
+    }
+    let Ok(meta) = base_path.symlink_metadata() else { return Ok(()) };
+    if meta.file_type().is_symlink() {
+        return Ok(());
+    }
+    if let Some(parent) = shared.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if std::fs::rename(base_path, shared).is_ok() {
+        return Ok(());
+    }
+    // rename fails across filesystems (repo and config on different mounts);
+    // a file can be copied over, a dir is left for the user to move.
+    if !meta.is_file() {
+        bail!(
+            "cannot move `{}` into `{}`; move it there yourself",
+            base_path.display(),
+            shared.display()
+        );
+    }
+    std::fs::copy(base_path, shared)?;
+    std::fs::remove_file(base_path)?;
+    Ok(())
+}
+
+/// Point `path` at `shared` with an absolute symlink. `Ok(true)` when it
+/// created the link, `Ok(false)` when the right link already exists; anything
+/// else at `path` (a real file, a foreign symlink) is an error, left alone.
+fn link_into(path: &Path, shared: &Path) -> Result<bool> {
+    match path.symlink_metadata() {
+        Err(_) => {}
+        Ok(m) if m.file_type().is_symlink() && std::fs::read_link(path)? == shared => {
+            return Ok(false)
+        }
+        Ok(_) => bail!(
+            "`{}` already exists and is not a link to `{}`; merge it into the shared copy and delete it",
+            path.display(),
+            shared.display()
+        ),
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(shared, path)?;
+    #[cfg(not(unix))]
+    bail!("symlinks are only supported on unix hosts");
+    #[cfg(unix)]
+    Ok(true)
+}
+
 /// Git's output for `git -C base <args>` on success, trimmed; None on failure.
 fn git_query(base: &Path, args: &[&str]) -> Option<String> {
     let out = std::process::Command::new("git")
@@ -210,6 +442,145 @@ mod tests {
             .unwrap();
         assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
         String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn worktree_includes_copy_only_matching_ignored_files() {
+        let root = std::env::temp_dir().join(format!("devsandbox-wti-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (base, wt) = (root.join("base"), root.join("wt"));
+        std::fs::create_dir_all(&base).unwrap();
+        git(&base, &["init", "-q", "-b", "main"]);
+        let write = |rel: &str, body: &str| {
+            let p = base.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        };
+        write(".gitignore", ".env*\nsecrets/\n.vscode/\n");
+        write(".worktreeinclude", "# secrets\n.env*\n!.env.skip\nsecrets/\nnotes.txt\n.vscode/tasks.json\n");
+        // `-f`: a tracked file matching both lists must still not be copied.
+        write(".env.example", "tracked");
+        git(&base, &["add", ".gitignore", ".worktreeinclude"]);
+        git(&base, &["add", "-f", ".env.example"]);
+        git(&base, &["commit", "-q", "-m", "init"]);
+        write(".env", "base");
+        write(".env.local", "local");
+        write(".env.skip", "negated");
+        write("secrets/x/key", "k");
+        write("notes.txt", "untracked, not ignored");
+        write(".vscode/tasks.json", "{}");
+        write(".vscode/other.json", "{}");
+        create_worktree(&base, &wt, "sandbox/i", None).unwrap();
+        // Pre-existing destination is never overwritten.
+        std::fs::write(wt.join(".env.local"), "mine").unwrap();
+
+        copy_worktree_includes(&base, &wt, &[]);
+
+        let read = |rel: &str| std::fs::read_to_string(wt.join(rel)).ok();
+        assert_eq!(read(".env").as_deref(), Some("base"));
+        assert_eq!(read(".env.local").as_deref(), Some("mine"));
+        assert_eq!(read("secrets/x/key").as_deref(), Some("k"));
+        assert_eq!(read(".vscode/tasks.json").as_deref(), Some("{}"));
+        assert_eq!(read(".env.skip"), None);
+        assert_eq!(read("notes.txt"), None);
+        assert_eq!(read(".vscode/other.json"), None);
+        assert_eq!(git(&wt, &["status", "--porcelain"]), "");
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A committed repo at `root/base` with `.gitignore` = `ignore`.
+    fn repo(root: &Path, ignore: &str) -> std::path::PathBuf {
+        let _ = std::fs::remove_dir_all(root);
+        let base = root.join("base");
+        std::fs::create_dir_all(&base).unwrap();
+        git(&base, &["init", "-q", "-b", "main"]);
+        std::fs::write(base.join(".gitignore"), ignore).unwrap();
+        git(&base, &["add", ".gitignore"]);
+        git(&base, &["commit", "-q", "-m", "init"]);
+        base
+    }
+
+    #[test]
+    fn worktree_include_config_patterns_extend_and_negate_file() {
+        let root = std::env::temp_dir().join(format!("devsandbox-wtip-{}", std::process::id()));
+        let base = repo(&root, ".env*\n");
+        let wt = root.join("wt");
+        std::fs::write(base.join(".worktreeinclude"), ".env\n.env.local\n").unwrap();
+        for f in [".env", ".env.local", ".env.test"] {
+            std::fs::write(base.join(f), f).unwrap();
+        }
+        create_worktree(&base, &wt, "sandbox/p", None).unwrap();
+
+        copy_worktree_includes(&base, &wt, &["!.env.local".into(), ".env.test".into()]);
+
+        assert!(wt.join(".env").is_file());
+        assert!(!wt.join(".env.local").exists(), "config negation must win over the file");
+        assert!(wt.join(".env.test").is_file());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn link_shared_files_adopts_links_and_guards() {
+        let root = std::env::temp_dir().join(format!("devsandbox-wtl-{}", std::process::id()));
+        let base = repo(&root, ".env*\nsecrets\n");
+        let (wt, store) = (root.join("wt"), root.join("store"));
+        std::fs::write(base.join(".env"), "base").unwrap();
+        std::fs::create_dir_all(base.join("secrets")).unwrap();
+        std::fs::write(base.join("secrets/key"), "k").unwrap();
+        std::fs::write(base.join("tracked.txt"), "t").unwrap();
+        git(&base, &["add", "tracked.txt"]);
+        git(&base, &["commit", "-q", "-m", "t"]);
+        create_worktree(&base, &wt, "sandbox/l", None).unwrap();
+        // The worktree already holds its own `.env.local`: a conflict to keep.
+        std::fs::write(wt.join(".env.local"), "mine").unwrap();
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(store.join(".env.local"), "shared").unwrap();
+        let entries: Vec<String> =
+            [".env", "secrets/", ".env.local", "tracked.txt", ".env.missing", ".env"]
+                .map(String::from)
+                .into();
+
+        for _ in 0..2 {
+            // Twice: the second pass must be a no-op.
+            link_shared_files(&store, &[&base, &wt], &entries).unwrap();
+        }
+
+        let link = |p: &Path| std::fs::read_link(p).ok();
+        assert_eq!(std::fs::read_to_string(store.join(".env")).unwrap(), "base");
+        assert_eq!(link(&base.join(".env")), Some(store.join(".env")));
+        assert_eq!(link(&wt.join(".env")), Some(store.join(".env")));
+        assert_eq!(link(&wt.join("secrets")), Some(store.join("secrets")));
+        assert_eq!(std::fs::read_to_string(wt.join("secrets/key")).unwrap(), "k");
+        // Store copy linked into the base; the worktree's own file is kept.
+        assert_eq!(link(&base.join(".env.local")), Some(store.join(".env.local")));
+        assert_eq!(std::fs::read_to_string(wt.join(".env.local")).unwrap(), "mine");
+        // Tracked path untouched, missing everywhere skipped.
+        assert!(link(&base.join("tracked.txt")).is_none());
+        assert!(!store.join("tracked.txt").exists());
+        assert!(base.join(".env.missing").symlink_metadata().is_err());
+        // Live: an edit through one tree is seen by the other.
+        std::fs::write(wt.join(".env"), "rotated").unwrap();
+        assert_eq!(std::fs::read_to_string(base.join(".env")).unwrap(), "rotated");
+        assert_eq!(git(&base, &["status", "--porcelain"]), "");
+        assert_eq!(git(&wt, &["status", "--porcelain"]), "");
+
+        for bad in ["../x", "/abs", ".git/config", "./.env", ""] {
+            let err = link_shared_files(&store, &[&base], &[bad.into()]).unwrap_err();
+            assert!(err.to_string().contains("invalid worktree-link"), "{bad}: {err}");
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn worktree_includes_absent_file_is_noop() {
+        let root = std::env::temp_dir().join(format!("devsandbox-wti0-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let wt = root.join("wt");
+        std::fs::create_dir_all(&root).unwrap();
+        copy_worktree_includes(&root, &wt, &[]);
+        assert!(!wt.exists());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

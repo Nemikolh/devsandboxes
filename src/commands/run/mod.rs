@@ -28,7 +28,7 @@ use mounts::{
     resolve_shell_rc, shell_rc_wiring, sort_parents_first, write_workspace_file, ResolvedMounts,
 };
 use ssh_agent::ssh_agent_forward;
-use worktree::{create_worktree, git_companion_mount};
+use worktree::{copy_worktree_includes, create_worktree, git_companion_mount, link_shared_files};
 
 /// Branch pattern for worktree instances when neither `--branch` nor the
 /// sandbox's `worktree-branch` is set. Also the TUI prompt's completion base
@@ -157,6 +157,7 @@ pub fn run(
         &folder,
         worktree,
         branch,
+        true,
         &mut state,
     )?;
 
@@ -174,7 +175,8 @@ pub fn run(
 /// container/service/mount name derives from. `source` is what gets mounted as
 /// the working tree (a worktree when `worktree.is_some()`, else `folder`);
 /// `folder` is the canonicalized base folder, used for `base_folder` and the
-/// git companion mount.
+/// git companion mount. `fresh_worktree` seeds a just-created worktree with the
+/// `.worktreeinclude` copies (`rebuild` passes false: seeding is once only).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn materialize(
     dir: &Path,
@@ -187,6 +189,7 @@ pub(crate) fn materialize(
     folder: &Path,
     worktree: Option<PathBuf>,
     branch: Option<String>,
+    fresh_worktree: bool,
     state: &mut State,
 ) -> Result<()> {
     let props = &sandbox.properties;
@@ -228,6 +231,27 @@ pub(crate) fn materialize(
         run_host_commands(dir, cmd).context("initializeCommand failed")?;
     }
 
+    // Shared files (`worktree-link`), then per-worktree copies: after
+    // initializeCommand so files it generates get adopted, before the
+    // container so lifecycle commands see them. Links go first because the
+    // copy never overwrites, so a path in both lists ends up linked.
+    let links = props.worktree_link.clone().unwrap_or_default();
+    let link_store = if links.is_empty() {
+        None
+    } else {
+        let store = config_dir.join("shared-files").join(sandbox_name);
+        let mut trees = vec![folder];
+        if worktree.is_some() {
+            trees.push(source);
+        }
+        link_shared_files(&store, &trees, &links)?;
+        Some(store)
+    };
+    if fresh_worktree && worktree.is_some() {
+        let patterns = props.worktree_include.clone().unwrap_or_default();
+        copy_worktree_includes(folder, source, &patterns);
+    }
+
     // Bring up the sandbox's services (global shared + this instance's isolated)
     // and their networks; the instance container joins them to reach services by
     // name.
@@ -243,6 +267,12 @@ pub(crate) fn materialize(
         Some(_) => vec![git_companion_mount(folder)],
         None => Vec::new(),
     };
+    // The links are absolute symlinks into the store; mounting the store dir at
+    // the same path makes them resolve in the container. A dir mount, so it
+    // works on Apple `container` too.
+    if let Some(store) = &link_store {
+        extra_mounts.push(format!("{}:{}", store.display(), store.display()));
+    }
     // ssh-agent: relay-first. On unix with an embedded helper we never mount
     // the socket — the in-container `devsbd` daemon serves it over exec stdio
     // (docs/sandbox-helper.md), which also fixes rotation-while-running and

@@ -17,7 +17,7 @@ description: Reference for devsandbox's `config.toml` format — `[template.*]`,
 [services.<name>]   # sidecar containers a sandbox lists in `services`
 ```
 
-Next to it devsandbox uses: `shared-volumes/` (`${sharedVolumes}`, persistent host state), `.worktrees/<instance-id>/` (repeat-instance git worktrees). Relative paths (`folder`, `folders` values, `shell-rc`, `build.dockerfile`, `build.context`) resolve against the config dir.
+Next to it devsandbox uses: `shared-volumes/` (`${sharedVolumes}`, persistent host state), `.worktrees/<instance-id>/` (repeat-instance git worktrees), `shared-files/<sandbox>/` (`worktree-link` store). Relative paths (`folder`, `folders` values, `shell-rc`, `build.dockerfile`, `build.context`) resolve against the config dir.
 
 ## Templates and `extends`
 
@@ -59,6 +59,8 @@ Keys are devcontainer camelCase, except devsandbox extras noted in kebab-case. *
 | `persist-shell-history` | bool | Per-instance `shared-volumes/history/<id>/.zsh_history`, dir mounted at `/commandhistory`, `HISTFILE` set (env + rc line). Kept on `rm`. |
 | `worktree-branch` | string | Branch pattern for worktree instances, `${…}` vars allowed. Default `sandbox/${instance}`. `run --branch` overrides. |
 | `worktree-base` | string | Commit-ish start point (e.g. `origin/develop`). Default: remote's default branch. `run --base` overrides. |
+| `worktree-include` | [string] | Gitignore-syntax patterns: gitignored, untracked files copied from the base repo into each **new** worktree (never overwriting; `rebuild` doesn't re-copy). Added after the repo's own `.worktreeinclude` (always honored), so `!pat` can negate it. See `docs/worktreeinclude.md`. |
+| `worktree-link` | [string] | Literal repo-relative gitignored paths shared live by all instances: the base repo's file is moved to `shared-files/<sandbox>/<path>` and each tree gets an absolute symlink; that dir is mounted at its host path (works on Apple `container`). Tracked/non-ignored paths and existing conflicting files are skipped with a warning; `..`/absolute/`.git` entries error. Store kept on `rm`. |
 | `shell-rc` | [string] | Host shell snippets sourced by `~/.zshrc`/`~/.bashrc`. Must exist and be files (no auto-create). Parent dir mounted read-only at `/devsandbox/rc/<i>`. |
 | `folders` | {container path = host dir} | Extra VS Code workspace roots. Key must be absolute and differ from `workspaceFolder`; value must exist. |
 
