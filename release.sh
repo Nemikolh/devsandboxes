@@ -56,7 +56,29 @@ if grep -noE "(/download/v|devsandbox-)[0-9]+\.[0-9]+\.[0-9]+" README.md \
   exit 1
 fi
 
-git add Cargo.toml Cargo.lock README.md "${npm_manifests[@]}"
+# The new section is every commit since the last tag; it replaces any
+# hand-written Unreleased section so the changelog never needs manual upkeep.
+last_tag=$(git describe --tags --abbrev=0)
+entries=$(git log --format='- %h %s' "$last_tag..HEAD")
+if [ -z "$entries" ]; then
+  echo "error: no commits since $last_tag" >&2
+  exit 1
+fi
+# Entries go through ENVIRON: `-v` rejects multi-line values on BSD awk and
+# would unescape backslashes in commit subjects.
+heading="## $new" entries="$entries" awk '
+  !done && /^## / { print ENVIRON["heading"] "\n\n" ENVIRON["entries"] "\n"; done = 1 }
+  /^## Unreleased$/ { skip = 1; next }
+  skip && /^## / { skip = 0 }
+  !skip { print }
+' CHANGELOG.md >CHANGELOG.md.tmp
+mv CHANGELOG.md.tmp CHANGELOG.md
+if ! grep -qx "## $new" CHANGELOG.md; then
+  echo "error: CHANGELOG.md was not updated with $new" >&2
+  exit 1
+fi
+
+git add Cargo.toml Cargo.lock README.md CHANGELOG.md "${npm_manifests[@]}"
 git commit -m "release v$new"
 git tag "v$new"
 git push origin main "v$new"

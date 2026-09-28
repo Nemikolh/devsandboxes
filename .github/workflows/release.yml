@@ -116,15 +116,17 @@ jobs:
     needs: [version, build]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v5
       - uses: actions/download-artifact@v7
         with:
           path: dist
           pattern: devsandbox-*
           merge-multiple: true
+      - run: scripts/changelog-section.sh ${{ needs.version.outputs.version }} > "$RUNNER_TEMP/notes.md"
       - uses: softprops/action-gh-release@v3
         with:
           files: dist/*
-      - uses: actions/checkout@v5
+          body_path: ${{ runner.temp }}/notes.md
       - name: Publish to crates.io
         run: cargo publish
         env:
