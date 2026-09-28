@@ -58,7 +58,7 @@ devsandbox extras on a sandbox:
 | `caches`                | Package-manager caches to persist and share across the config root (pnpm, cargo, npm, yarn, go, pip)  |
 | `persist-shell-history` | Per-instance history dir on the host, mounted at `/commandhistory` with `HISTFILE` set via container env and pinned in the rc files (VS Code's shell integration resets the env value); survives rebuilds, never shared between concurrent instances |
 | `shell-rc`              | Host shell snippets (e.g. `["${configDir}/shell/aliases.sh"]`) mounted read-only and sourced by `~/.zshrc` and `~/.bashrc` in the container; concatenates under `extends` |
-| `worktree-branch`       | Branch created for a worktree instance (supports `${instance}`); defaults to `sandbox/${instance}`; `run --branch` overrides it |
+| `worktree-branch`       | Branch for a worktree instance (supports `${instance}`); defaults to `sandbox/${instance}`; `run --branch` overrides it. An existing branch (local, or `origin/<branch>` → tracking branch) is checked out rather than created |
 | `autostart`             | `true` / `"runtime"`: bring instances up once per boot (see _Automations_); not hashed               |
 | `dispatcher`            | `{ spawn, max-instances }`: instances may manage child instances over `devsbd` (see _Automations_); not hashed |
 

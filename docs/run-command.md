@@ -66,8 +66,11 @@ attach picks up user/workspace hints).
 When `run` targets a sandbox whose `folder` is already mounted by an existing instance:
 
 - **Delegate to git**: `git -C <folder> worktree add <sandbox-root>/.worktrees/<instance>
-  -b sandbox/<instance>` (new branch; git refuses to check out a branch that is already
-  checked out elsewhere, so a fresh branch per instance is mandatory).
+  -b sandbox/<instance>` (new branch by default). A `--branch` naming an existing
+  branch reuses it: a local one is checked out as is, one only on `origin` becomes a
+  local branch tracking `origin/<branch>`. Git refuses a branch already checked out
+  elsewhere; `run` reports where (and which instance), and `rm` only offers to delete
+  branches `run` created.
 - The new instance reuses the **same resolved sandbox config** as the original — only the
   mounted source differs. Same image, same services, same workspace path convention
   (`/workspaces/<basename>`).

@@ -68,6 +68,7 @@ mod tests {
                 base_folder: "/home/u/web".into(),
                 worktree: None,
                 branch: None,
+                branch_created: true,
                 shell_history: None,
                 workspace: "/workspaces/web".into(),
                 workspace_file: None,

@@ -40,9 +40,10 @@ pub struct SandboxProperties {
     /// between concurrent instances.
     #[serde(rename = "persist-shell-history")]
     pub persist_shell_history: Option<bool>,
-    /// Branch created for a worktree instance. A pattern supporting the same
-    /// `${…}` variables as `mounts` (notably `${instance}`); defaults to
-    /// `sandbox/${instance}` when unset. A `run --branch` overrides it.
+    /// Branch for a worktree instance (created unless it exists, see
+    /// `create_worktree`). A pattern supporting the same `${…}` variables as
+    /// `mounts` (notably `${instance}`); defaults to `sandbox/${instance}`
+    /// when unset. A `run --branch` overrides it.
     #[serde(rename = "worktree-branch")]
     pub worktree_branch: Option<String>,
     /// Start point for a worktree instance's branch (any commit-ish, e.g.

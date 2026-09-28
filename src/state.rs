@@ -40,6 +40,12 @@ pub struct Instance {
     /// set for worktree instances.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    /// Whether `run` created `branch` (false when the worktree reused an
+    /// existing local branch or one tracking `origin/<branch>`), so `rm` only
+    /// offers to delete branches devsandbox made. Defaults to true: entries
+    /// from before reuse existed always had a created branch.
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub branch_created: bool,
     /// Host path of this instance's managed `.zsh_history` (inside the
     /// per-instance history dir bind-mounted at `/commandhistory`), when
     /// `persist-shell-history` is on. Kept on `rm` so a rebuilt instance with
@@ -85,6 +91,14 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_dir: Option<PathBuf>,
     pub created_unix: u64,
+}
+
+fn yes() -> bool {
+    true
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
 }
 
 impl Instance {
@@ -167,6 +181,7 @@ mod tests {
                 base_folder: "/home/u/repository-1".into(),
                 worktree: None,
                 branch: None,
+                branch_created: true,
                 shell_history: None,
                 workspace: "/workspaces/repository-1".into(),
                 workspace_file: None,
@@ -220,7 +235,22 @@ mod tests {
         assert_eq!(state.instances["repo"].instance_id, "");
         assert_eq!(state.instances["repo"].dispatcher, None);
         assert_eq!(state.instances["repo"].config_dir, None);
+        // Pre-reuse entries always had a created branch: `rm` keeps offering it.
+        assert!(state.instances["repo"].branch_created);
         let text = toml::to_string_pretty(&state).unwrap();
         assert!(!text.contains("dispatcher") && !text.contains("config_dir"), "{text}");
+        assert!(!text.contains("branch_created"), "{text}");
+    }
+
+    #[test]
+    fn reused_branch_roundtrips() {
+        let mut state: State = toml::from_str(
+            "[instance.a]\nsandbox = \"web\"\ncontainer = \"c\"\nfolder = \"/f\"\nworkspace = \"/w\"\ncreated_unix = 0\n",
+        )
+        .unwrap();
+        state.instances.get_mut("a").unwrap().branch_created = false;
+        let text = toml::to_string_pretty(&state).unwrap();
+        let back: State = toml::from_str(&text).unwrap();
+        assert!(!back.instances["a"].branch_created, "{text}");
     }
 }

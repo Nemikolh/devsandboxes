@@ -99,6 +99,7 @@ fn rebuild_instance(
     let base_folder = info.base_folder.clone();
     let worktree = info.worktree.clone();
     let branch = info.branch.clone();
+    let branch_created = info.branch_created;
 
     // Remove the old container; ignore failure (it may already be gone).
     let _ = backend().remove_force(&container);
@@ -117,6 +118,7 @@ fn rebuild_instance(
         &base_folder,
         worktree,
         branch,
+        branch_created,
         false,
         // No extras: `materialize` keeps the recorded dispatcher; `--env`s
         // aren't recorded, so they are dropped.
@@ -167,6 +169,7 @@ mod tests {
             base_folder: "/home/u/site".into(),
             worktree: None,
             branch: None,
+            branch_created: true,
             shell_history: None,
             workspace: "/w".into(),
             workspace_file: None,

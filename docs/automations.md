@@ -419,7 +419,7 @@ _Automations_ section), plus the config spec, `docs/high-level-architecture.md`,
   `devsbd` commands, exit 75); `docs/high-level-architecture.md` and the
   `AGENTS.md` module map for the new modules.
 
-### Step 12 — worktrees on existing branches
+### Step 12 — worktrees on existing branches [x]
 
 Decision (user): creating an instance on an existing branch must work, for
 `run --branch` and therefore `devsbd ensure --branch`.

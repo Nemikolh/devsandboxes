@@ -16,7 +16,7 @@ pub fn rm(name: &str) -> Result<()> {
     let instance_id = info.instance_id.clone();
     let container = info.container.clone();
     let worktree = info.worktree.clone();
-    let branch = info.branch.clone();
+    let branch = branch_to_offer(info.branch.clone(), info.branch_created, &key);
     let base_folder = info.base_folder.clone();
     let project = info.project.clone();
     let volumes = info.volumes.clone();
@@ -68,15 +68,14 @@ pub fn rm(name: &str) -> Result<()> {
 
     if let Some(worktree) = worktree {
         remove_worktree(&base_folder, &worktree)?;
-        // Recorded branch for instances created since it was tracked; older state
-        // entries fall back to the legacy default.
-        let branch = branch.unwrap_or_else(|| format!("sandbox/{key}"));
-        if confirm(&format!("delete branch `{branch}`?"))? {
-            match host_git(&base_folder) {
-                Ok(mut git) => {
-                    let _ = git.args(["branch", "-D", &branch]).status();
+        if let Some(branch) = branch {
+            if confirm(&format!("delete branch `{branch}`?"))? {
+                match host_git(&base_folder) {
+                    Ok(mut git) => {
+                        let _ = git.args(["branch", "-D", &branch]).status();
+                    }
+                    Err(e) => eprintln!("warning: branch `{branch}` not deleted: {e:#}"),
                 }
-                Err(e) => eprintln!("warning: branch `{branch}` not deleted: {e:#}"),
             }
         }
     }
@@ -85,6 +84,13 @@ pub fn rm(name: &str) -> Result<()> {
     state.save()?;
     println!("removed {key}");
     Ok(())
+}
+
+/// The branch `rm` offers to delete: only one `run` created (a reused PR or
+/// feature branch is the user's). Entries from before branches were recorded
+/// fall back to the legacy default.
+fn branch_to_offer(branch: Option<String>, created: bool, key: &str) -> Option<String> {
+    created.then(|| branch.unwrap_or_else(|| format!("sandbox/{key}")))
 }
 
 fn remove_worktree(base: &Path, worktree: &Path) -> Result<()> {
@@ -110,6 +116,13 @@ fn remove_worktree(base: &Path, worktree: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_created_branches_are_offered_for_deletion() {
+        assert_eq!(branch_to_offer(Some("feat/x".into()), true, "k").as_deref(), Some("feat/x"));
+        assert_eq!(branch_to_offer(None, true, "k").as_deref(), Some("sandbox/k"));
+        assert_eq!(branch_to_offer(Some("pr/1".into()), false, "k"), None);
+    }
 
     /// A sandbox-planted `core.fsmonitor` must not run during `worktree remove`
     /// (the security review's PoC): the removal is refused instead.

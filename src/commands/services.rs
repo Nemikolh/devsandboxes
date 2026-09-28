@@ -929,6 +929,7 @@ ports = ["5432:5432"]
             base_folder: Default::default(),
             worktree: None,
             branch: None,
+            branch_created: true,
             shell_history: None,
             workspace: String::new(),
             workspace_file: None,

@@ -52,7 +52,8 @@ enum Command {
         #[arg(long)]
         name: Option<String>,
         /// Branch for a worktree instance; overrides the sandbox's
-        /// `worktree-branch` (supports `${instance}`)
+        /// `worktree-branch` (supports `${instance}`). An existing branch is
+        /// checked out (one only on `origin` gets a tracking branch)
         #[arg(long)]
         branch: Option<String>,
         /// Start point for a worktree instance's branch (e.g. `origin/develop`);

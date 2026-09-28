@@ -152,7 +152,10 @@ pub fn run(
 
     // A dispatcher's child always gets a worktree, even as the folder's first
     // instance: an unattended agent must never work in the user's checkout.
-    let (source, worktree, branch) = if base_in_use(&state, &folder) || extras.dispatcher.is_some() {
+    let (source, worktree, branch, branch_created) = if base_in_use(&state, &folder) || extras.dispatcher.is_some() {
+        // Only a named branch can already exist on the remote; generated
+        // pattern names are new by construction (see `create_worktree`).
+        let explicit_branch = branch_override.is_some();
         let branch = worktree_branch(
             branch_override,
             extras.dispatcher.is_some(),
@@ -168,10 +171,11 @@ pub fn run(
         // Start point: `--base`, else the sandbox's `worktree-base`, else
         // detected from the remote (see `worktree_start_point`).
         let base_ref = base_override.or_else(|| props.worktree_base.clone());
-        create_worktree(&folder, &wt, &branch, base_ref.as_deref())?;
-        (wt.clone(), Some(wt), Some(branch))
+        let created =
+            create_worktree(&folder, &wt, &branch, base_ref.as_deref(), explicit_branch, &state)?;
+        (wt.clone(), Some(wt), Some(branch), created)
     } else {
-        (folder.clone(), None, None)
+        (folder.clone(), None, None, true)
     };
 
     materialize(
@@ -185,6 +189,7 @@ pub fn run(
         &folder,
         worktree,
         branch,
+        branch_created,
         true,
         &extras,
         &mut state,
@@ -224,6 +229,7 @@ fn worktree_branch(
 /// `folder` is the canonicalized base folder, used for `base_folder` and the
 /// git companion mount. `fresh_worktree` seeds a just-created worktree with the
 /// `.worktreeinclude` copies (`rebuild` passes false: seeding is once only).
+/// `branch_created` is recorded for `rm` (see `Instance::branch_created`).
 /// `extras.dispatcher` falls back to the entry being replaced, as does the
 /// recorded `config_dir`, so a `rebuild` keeps both.
 #[allow(clippy::too_many_arguments)]
@@ -238,6 +244,7 @@ pub(crate) fn materialize(
     folder: &Path,
     worktree: Option<PathBuf>,
     branch: Option<String>,
+    branch_created: bool,
     fresh_worktree: bool,
     extras: &RunExtras,
     state: &mut State,
@@ -449,6 +456,7 @@ pub(crate) fn materialize(
             base_folder: folder.to_path_buf(),
             worktree,
             branch,
+            branch_created,
             shell_history,
             workspace: workspace.clone(),
             workspace_file,
@@ -775,6 +783,7 @@ mod tests {
             base_folder: "/tmp/repo".into(),
             worktree: None,
             branch: None,
+            branch_created: true,
             shell_history: None,
             workspace: "/workspaces/repo".into(),
             workspace_file: None,

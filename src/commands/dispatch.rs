@@ -669,6 +669,7 @@ folder = "."
             base_folder: "/w".into(),
             worktree: None,
             branch: owner.map(|_| format!("sandbox/{id}")),
+            branch_created: true,
             shell_history: None,
             workspace: "/workspaces/w".into(),
             workspace_file: None,

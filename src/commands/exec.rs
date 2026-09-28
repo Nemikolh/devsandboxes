@@ -165,6 +165,7 @@ mod tests {
             base_folder: PathBuf::from("/home/u/repository-1"),
             worktree: None,
             branch: None,
+            branch_created: true,
             shell_history: None,
             workspace: "/workspaces/repository-1".into(),
             workspace_file: None,

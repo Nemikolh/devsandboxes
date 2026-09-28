@@ -104,6 +104,9 @@ listed when stdin is not a TTY.
    - A **second `run` against a folder already live** creates a git **worktree**
      under `.worktrees/<instance>` on a fresh `sandbox/<instance>` branch, and a
      `<sandbox>-<n>` instance name — the two containers never share a checkout.
+     `--branch <name>` naming an existing branch checks it out instead (a local
+     one as is, a remote-only one as a local branch tracking `origin/<name>`);
+     a branch checked out elsewhere is an error naming where.
 
    - **Config drift**: reusing a container whose recorded config hash differs from
      the current config only _warns_; `rebuild <name>` applies the changes without
@@ -147,7 +150,7 @@ listed when stdin is not a TTY.
    ones from other config roots. The fix for the config-drift warning.
 
 10. **`rm <name>`** — remove container, its worktree (prompts to delete the
-   `sandbox/<instance>` branch on a TTY), isolated services, per-instance network,
+   branch on a TTY, only when `run` created it), isolated services, per-instance network,
    and the state entry. Managed shell history is **kept** so a rebuilt instance
    inherits it. Global services are left for `gc`.
 

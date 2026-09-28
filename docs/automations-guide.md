@@ -77,7 +77,7 @@ devsbd run logs <key> <id> [--sandbox S] [--follow]
 devsbd run wait <key> <id> [--sandbox S] [--timeout SECS]
 ```
 
-- `ensure` is idempotent: creates `<sandbox>-<key>` if missing, starts it if stopped, recreates it if its container is gone, and prints the instance name. `--branch` and `--env` apply only at creation (ignored for an existing child). `--branch` names the *new* branch of the child's worktree, created from the repo's default base; it doesn't check out an existing branch. The name is taken literally (no `${…}` substitution, unlike the sandbox's `worktree-branch` pattern) and must be 1–200 chars of `[A-Za-z0-9._/-]`, not start with `-`, `/` or `.`, not end with `/` or `.`, and contain no `..`, `//`, component starting with `.` or ending in `.lock`; anything else is a usage error (exit 2). Without `--branch` the child's branch comes from `worktree-branch` (default `sandbox/${instance}`). `--env` may not set variables that steer what runs (denied, exit 77): `PATH`, `HOME`, `SHELL`, `USER`, `ENV`, `BASH_ENV`, `IFS`, `CDPATH`, `PS4`, `PROMPT_COMMAND`, `SSH_AUTH_SOCK`, `TMPDIR`, `GCONV_PATH`, `NODE_OPTIONS`, `RUBYOPT`, and anything starting with `LD_`, `DYLD_`, `GIT_`, `PYTHON` or `PERL5` (matched case-insensitively).
+- `ensure` is idempotent: creates `<sandbox>-<key>` if missing, starts it if stopped, recreates it if its container is gone, and prints the instance name. `--branch` and `--env` apply only at creation (ignored for an existing child). `--branch` names the branch of the child's worktree: an existing local branch is checked out as is, one only on `origin` (e.g. a PR head) is fetched and checked out as a local branch tracking `origin/<branch>` (so a plain `git push` updates the PR), anything else is created from the repo's default base. A branch already checked out elsewhere (the base checkout, another instance) is an error naming where. `rm` only offers to delete a branch the child created. The name is taken literally (no `${…}` substitution, unlike the sandbox's `worktree-branch` pattern) and must be 1–200 chars of `[A-Za-z0-9._/-]`, not start with `-`, `/` or `.`, not end with `/` or `.`, and contain no `..`, `//`, component starting with `.` or ending in `.lock`; anything else is a usage error (exit 2). Without `--branch` the child's branch comes from `worktree-branch` (default `sandbox/${instance}`). `--env` may not set variables that steer what runs (denied, exit 77): `PATH`, `HOME`, `SHELL`, `USER`, `ENV`, `BASH_ENV`, `IFS`, `CDPATH`, `PS4`, `PROMPT_COMMAND`, `SSH_AUTH_SOCK`, `TMPDIR`, `GCONV_PATH`, `NODE_OPTIONS`, `RUBYOPT`, and anything starting with `LD_`, `DYLD_`, `GIT_`, `PYTHON` or `PERL5` (matched case-insensitively).
 - `ls` prints a JSON array of this dispatcher's children: `name`, `sandbox`, `key`, `state` (`running` | `stopped` | `missing`), `branch`.
 - `stop` / `rm` / `exec` / `run …` take the key; `--sandbox` disambiguates a key used under two sandboxes.
 - `exec` starts a tracked *run* in a running child (`ensure` it first), as the child's `remoteUser` in its workspace with its `remoteEnv`. With `--detach` it prints the run id and returns; without, it prints `devsbd: run <id>` to stderr, streams the output, and exits with the run's code (`killed N` → 128+N, `lost` → 1).
@@ -155,12 +155,12 @@ while :; do
       continue
     fi
     needs_attention "$num" || continue
-    ctl devsbd ensure web --key "$key" --env PR_NUMBER="$num" --env PR_BRANCH="$branch" >/dev/null || {
+    ctl devsbd ensure web --key "$key" --branch "$branch" --env PR_NUMBER="$num" >/dev/null || {
       devsbd notify --level error --key "$key" "PR $num: cannot start a child (exit $?)"
       continue
     }
     id=$(ctl devsbd exec "$key" --detach -- sh -c \
-      'gh pr checkout "$PR_NUMBER" && zidane -p "Rebase this PR on its base, fix conflicts and failing checks, push. If a human decision is needed, run: devsbd notify --level warn --key pr-$PR_NUMBER <why>"') || continue
+      'zidane -p "Rebase this PR on its base, fix conflicts and failing checks, push. If a human decision is needed, run: devsbd notify --level warn --key pr-$PR_NUMBER <why>"') || continue
     echo "$id" >"$STATE/$key"
   done <"$STATE/open"
 
@@ -176,7 +176,7 @@ while :; do
 done
 ```
 
-Notes: `--branch` isn't used because it would create a fresh branch from the base, not the PR's; the run checks the PR out itself. `--env` values reach only a newly created child (see _Known limitations_). `devsbd notify` is also available inside the children, so the agent can ask for help directly.
+Notes: `--branch "$branch"` puts the child's worktree on the PR head, tracking `origin/<branch>`, so the agent's `git push` updates the PR. That only works for PRs whose head is on `origin`: a fork's branch isn't, and would come out as a fresh branch of that name off the default base. `--env` values reach only a newly created child (see _Known limitations_). `devsbd notify` is also available inside the children, so the agent can ask for help directly.
 
 ## Known limitations
 

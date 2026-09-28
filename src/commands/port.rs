@@ -682,6 +682,7 @@ image = "node"
             base_folder: Default::default(),
             worktree: None,
             branch: None,
+            branch_created: true,
             shell_history: None,
             workspace: String::new(),
             workspace_file: None,
