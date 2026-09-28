@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
+use super::git::{check_repo, host_git};
+
 /// Bind mount for the base repo's `.git` at the identical host path, so a
 /// worktree's absolute `gitdir` pointer resolves inside the container.
 pub(super) fn git_companion_mount(base: &Path) -> String {
@@ -33,10 +35,8 @@ pub(super) fn create_worktree(
     // With an unborn HEAD, `git worktree add -b` infers `--orphan`, exits 0, and
     // lays down a worktree with no files; guard against handing that empty path
     // to the container as a bind mount.
-    let head = std::process::Command::new("git")
+    let head = host_git(base)?
         .args([
-            "-C",
-            &base.to_string_lossy(),
             "rev-parse",
             "--verify",
             &format!("{start}^{{commit}}"),
@@ -56,10 +56,8 @@ pub(super) fn create_worktree(
     // A worktree branch must be unique: `git worktree add -b` refuses a branch
     // that already exists. Catch it here with a message that points at the
     // likely cause (a constant `worktree-branch`/`--branch` with no `${instance}`).
-    let exists = std::process::Command::new("git")
+    let exists = host_git(base)?
         .args([
-            "-C",
-            &base.to_string_lossy(),
             "show-ref",
             "--verify",
             "--quiet",
@@ -73,10 +71,8 @@ pub(super) fn create_worktree(
              (include `${{instance}}` in `worktree-branch` or pass a distinct `--branch`)"
         );
     }
-    let status = std::process::Command::new("git")
+    let status = host_git(base)?
         .args([
-            "-C",
-            &base.to_string_lossy(),
             "worktree",
             "add",
             &worktree.to_string_lossy(),
@@ -140,8 +136,8 @@ fn worktree_include_paths(
     include: Option<&Path>,
     patterns: &[String],
 ) -> Result<Vec<String>> {
-    let mut ls = std::process::Command::new("git");
-    ls.arg("-C").arg(base).args(["ls-files", "-z", "--others", "--ignored"]);
+    let mut ls = host_git(base)?;
+    ls.args(["ls-files", "-z", "--others", "--ignored"]);
     if let Some(include) = include {
         ls.arg(format!("--exclude-from={}", include.display()));
     }
@@ -155,9 +151,7 @@ fn worktree_include_paths(
     if listed.stdout.is_empty() {
         return Ok(Vec::new());
     }
-    let mut child = std::process::Command::new("git")
-        .arg("-C")
-        .arg(base)
+    let mut child = host_git(base)?
         .args(["check-ignore", "-z", "--stdin"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -213,6 +207,11 @@ fn copy_entry(src: &Path, dst: &Path) -> Result<()> {
 /// fit (tracked path, conflicting file) only warns and is left untouched.
 pub(super) fn link_shared_files(store: &Path, trees: &[&Path], entries: &[String]) -> Result<()> {
     let Some((base, _)) = trees.split_first() else { return Ok(()) };
+    // Every check below would silently read as "not gitignored"; say why.
+    if let Err(e) = check_repo(base) {
+        eprintln!("warning: worktree-link skipped: {e:#}");
+        return Ok(());
+    }
     std::fs::create_dir_all(store).with_context(|| format!("cannot create {}", store.display()))?;
     // Validate every entry before touching the disk: a config error must not
     // leave half the entries adopted.
@@ -352,15 +351,15 @@ fn wildcard_match(pattern: &str, name: &str) -> bool {
 }
 
 /// Whether git ignores `rel` in `tree` (false for tracked paths: `check-ignore`
-/// only reports untracked ones). A missing git counts as not ignored.
+/// only reports untracked ones). A missing git, or a repo [`host_git`]
+/// refuses, counts as not ignored.
 fn git_ignores(tree: &Path, rel: &Path) -> bool {
-    std::process::Command::new("git")
-        .arg("-C")
-        .arg(tree)
-        .args(["check-ignore", "-q", "--"])
-        .arg(rel)
-        .status()
-        .is_ok_and(|s| s.success())
+    host_git(tree).is_ok_and(|mut git| {
+        git.args(["check-ignore", "-q", "--"])
+            .arg(rel)
+            .status()
+            .is_ok_and(|s| s.success())
+    })
 }
 
 /// First sighting: move the base repo's real file/dir into the empty store
@@ -422,9 +421,8 @@ fn link_into(path: &Path, shared: &Path) -> Result<bool> {
 
 /// Git's output for `git -C base <args>` on success, trimmed; None on failure.
 fn git_query(base: &Path, args: &[&str]) -> Option<String> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(base)
+    let out = host_git(base)
+        .ok()?
         .args(args)
         .output()
         .ok()?;
@@ -455,9 +453,7 @@ fn fetch_origin(base: &Path) -> Result<()> {
     if fresh {
         return Ok(());
     }
-    let fetch = std::process::Command::new("git")
-        .arg("-C")
-        .arg(base)
+    let fetch = host_git(base)?
         .args(["fetch", "--quiet", "origin"])
         .output()
         .context("failed to run git (is it installed?)")?;
@@ -731,6 +727,31 @@ mod tests {
         assert!(wt.join("packages/empty/.env").symlink_metadata().is_err());
         assert!(!store.join("packages/empty").exists());
         assert_eq!(git(&base, &["status", "--porcelain"]), "");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The security review's PoC: a sandbox plants a hook, or command-running
+    /// config, in the shared `.git`; host git must run neither.
+    #[cfg(unix)]
+    #[test]
+    fn create_worktree_runs_no_repo_controlled_code() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("devsandbox-wtsec-{}", std::process::id()));
+        let base = repo(&root, "");
+        let marker = root.join("pwned");
+        let hook = base.join(".git/hooks/post-checkout");
+        std::fs::write(&hook, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        create_worktree(&base, &root.join("wt"), "sandbox/h", None).unwrap();
+        assert!(!marker.exists(), "post-checkout hook ran on the host");
+
+        git(&base, &["config", "core.fsmonitor", &hook.to_string_lossy()]);
+        let err = create_worktree(&base, &root.join("wt2"), "sandbox/f", None).unwrap_err().to_string();
+        assert!(err.contains("refusing to run git on"), "{err}");
+        assert!(err.contains(".git/config sets core.fsmonitor"), "{err}");
+        assert!(!marker.exists(), "fsmonitor ran on the host");
+        assert!(!root.join("wt2").exists());
         std::fs::remove_dir_all(&root).unwrap();
     }
 

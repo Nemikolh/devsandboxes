@@ -19,6 +19,15 @@ Topic docs in `docs/` go deeper on single features.
   fresh `sandbox/<instance>` branch by default). Two containers never share a
   checkout.
 
+- **Host git never runs repo-controlled code.** Containers can write the
+  repo's `.git` (worktree instances bind-mount the base repo's), so every host
+  git call goes through one wrapper (`commands/run/git.rs`): hooks and
+  `core.fsmonitor` are disabled on the command line, and the repo's local
+  config files are parsed (never via `git config`, which follows includes)
+  and checked against an allowlist of keys that can't run commands. Anything
+  else, an `ext::` remote, or an `objects/info/alternates` file refuses the
+  operation with the file and key named; the user reviews and removes it.
+
 ## config.toml
 
 Three top-level tables:

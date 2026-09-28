@@ -3,6 +3,7 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 
 use super::{confirm, resolve_instance};
+use crate::commands::run::host_git;
 use crate::runtime::backend;
 use crate::state::State;
 
@@ -19,6 +20,12 @@ pub fn rm(name: &str) -> Result<()> {
     let base_folder = info.base_folder.clone();
     let project = info.project.clone();
     let volumes = info.volumes.clone();
+
+    // Refuse up front, before anything is torn down, when the worktree's base
+    // repo would be refused by `host_git` later (otherwise rm stops half-way).
+    if worktree.is_some() {
+        crate::commands::run::check_repo(&base_folder)?;
+    }
 
     // Remove the container; ignore failure (it may already be gone).
     let _ = backend().remove_force(&container);
@@ -65,9 +72,12 @@ pub fn rm(name: &str) -> Result<()> {
         // entries fall back to the legacy default.
         let branch = branch.unwrap_or_else(|| format!("sandbox/{key}"));
         if confirm(&format!("delete branch `{branch}`?"))? {
-            let _ = std::process::Command::new("git")
-                .args(["-C", &base_folder.to_string_lossy(), "branch", "-D", &branch])
-                .status();
+            match host_git(&base_folder) {
+                Ok(mut git) => {
+                    let _ = git.args(["branch", "-D", &branch]).status();
+                }
+                Err(e) => eprintln!("warning: branch `{branch}` not deleted: {e:#}"),
+            }
         }
     }
 
@@ -78,10 +88,8 @@ pub fn rm(name: &str) -> Result<()> {
 }
 
 fn remove_worktree(base: &Path, worktree: &Path) -> Result<()> {
-    let status = std::process::Command::new("git")
+    let status = host_git(base)?
         .args([
-            "-C",
-            &base.to_string_lossy(),
             "worktree",
             "remove",
             &worktree.to_string_lossy(),
@@ -98,3 +106,49 @@ fn remove_worktree(base: &Path, worktree: &Path) -> Result<()> {
     Ok(())
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A sandbox-planted `core.fsmonitor` must not run during `worktree remove`
+    /// (the security review's PoC): the removal is refused instead.
+    #[cfg(unix)]
+    #[test]
+    fn remove_worktree_refuses_planted_fsmonitor() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("devsandbox-rmsec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (base, wt) = (root.join("base"), root.join("wt"));
+        std::fs::create_dir_all(&base).unwrap();
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&base)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+                .args(args)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "init"]);
+        git(&["worktree", "add", "-q", &wt.to_string_lossy(), "-b", "sandbox/r"]);
+        let marker = root.join("pwned");
+        let monitor = root.join("monitor.sh");
+        std::fs::write(&monitor, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
+        std::fs::set_permissions(&monitor, std::fs::Permissions::from_mode(0o755)).unwrap();
+        git(&["config", "core.fsmonitor", &monitor.to_string_lossy()]);
+
+        let err = remove_worktree(&base, &wt).unwrap_err().to_string();
+        assert!(err.contains(".git/config sets core.fsmonitor"), "{err}");
+        assert!(!marker.exists(), "fsmonitor ran on the host");
+
+        // Once the key is removed, the removal goes through.
+        git(&["config", "--unset", "core.fsmonitor"]);
+        remove_worktree(&base, &wt).unwrap();
+        assert!(!wt.exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+}

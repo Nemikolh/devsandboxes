@@ -490,7 +490,7 @@ From a security review of the automations work. Threat model: a container
 (and any user in it) is untrusted relative to the host. Low findings are
 deferred.
 
-### Step 17 — host git never runs repo-controlled code (Critical)
+### Step 17 — host git never runs repo-controlled code (Critical) [x]
 
 Every worktree instance bind-mounts the base repo's `.git` read-write
 (`git_companion_mount`, `src/commands/run/worktree.rs:10`), and the host runs

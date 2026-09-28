@@ -14,7 +14,9 @@ git worktrees so working trees are never shared.
   folder basename). `port.rs` resolves a forward route (instance | service via a
   running instance | injection fallback) and hosts the foreground `port` CLI.
   `run/` is split by concern: `mod.rs` (`run`/`materialize`, naming,
-  `run_container`), `worktree.rs`, `ssh_agent.rs`, `mounts.rs`, `image.rs`
+  `run_container`), `worktree.rs`, `git.rs` (`host_git`: the only way the
+  host runs git — hooks/fsmonitor off, repo config allowlist-checked),
+  `ssh_agent.rs`, `mounts.rs`, `image.rs`
   (feature image + Dockerfile/entrypoint generation), `lifecycle.rs`,
   `editor.rs` (VS Code name config); `mod.rs` re-exports what other commands use.
 - `src/config.rs` — TOML schema: `[template.*]`, `[sandbox.*]`, `[services.*]`.

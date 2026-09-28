@@ -10,6 +10,7 @@ use crate::state::{Instance, State};
 use super::{container_drifted, pick, services};
 
 mod editor;
+mod git;
 mod image;
 mod lifecycle;
 mod mounts;
@@ -17,6 +18,7 @@ mod ssh_agent;
 mod worktree;
 
 pub(crate) use editor::write_vscode_name_config;
+pub(crate) use git::{check_repo, host_git};
 pub(crate) use lifecycle::exec_lifecycle;
 pub(crate) use ssh_agent::{
     ssh_agent_dir, ssh_agent_link_path, ssh_agent_refresh, SSH_AGENT_TARGET,
