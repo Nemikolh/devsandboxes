@@ -153,6 +153,19 @@ impl Backend for Dockerlike {
         true
     }
 
+    fn supports_restart_policy(&self) -> bool {
+        true
+    }
+
+    fn restart_policy(&self, container: &str) -> Result<Option<String>> {
+        self.inspect_template(container, "{{.HostConfig.RestartPolicy.Name}}")
+    }
+
+    fn set_restart_policy(&self, container: &str, policy: &str) -> Result<()> {
+        self.output_quiet(&["update", "--restart", policy, container])?;
+        Ok(())
+    }
+
     fn image_entrypoint(&self, image: &str) -> Result<Vec<String>> {
         let out = self.output_quiet(&[
             "image",

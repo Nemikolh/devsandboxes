@@ -327,6 +327,14 @@ pub(crate) fn materialize(
     for warning in warnings {
         eprintln!("warning: {warning}");
     }
+    let (restart, warnings) = crate::commands::autostart::restart_decision(
+        props.autostart,
+        backend().supports_restart_policy(),
+        backend().name(),
+    );
+    for warning in warnings {
+        eprintln!("warning: {warning}");
+    }
     run_container(
         dir,
         sandbox,
@@ -340,6 +348,7 @@ pub(crate) fn materialize(
         &networks,
         &endpoints,
         privileged,
+        restart,
     )?;
     let container = container_name.clone();
     // Before lifecycle commands, so they could already rely on the helper. In
@@ -530,6 +539,7 @@ fn run_container(
     networks: &[String],
     endpoints: &[ServiceEndpoint],
     privileged: bool,
+    restart: Option<&str>,
 ) -> Result<()> {
     let props = &sandbox.properties;
     let image = image_for(dir, sandbox)?;
@@ -556,6 +566,10 @@ fn run_container(
     }
     if privileged {
         args.push("--privileged".into());
+    }
+    if let Some(policy) = restart {
+        args.push("--restart".into());
+        args.push(policy.into());
     }
     if let Some(user) = &props.container_user {
         args.push("--user".into());

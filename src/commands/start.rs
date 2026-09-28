@@ -2,7 +2,7 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 
-use super::{resolve_instance, run, services, stop};
+use super::{autostart, resolve_instance, run, services, stop};
 use crate::config::{Config, ResolvedSandbox};
 use crate::runtime::backend;
 use crate::state::{Instance, State};
@@ -47,6 +47,7 @@ pub(crate) fn start_instance(dir: &Path, key: &str, info: &Instance) -> Result<(
         Some((config, sandbox)) => {
             run::warn_on_drift(dir, &info.container, &sandbox)?;
             backend().run_checked(&["start", &info.container])?;
+            autostart::apply_restart_policy(&info.container, key, sandbox.properties.autostart);
             // `ensure_recorded` may install a different-arch helper than the
             // pre-start `info` snapshot recorded; use the arch it establishes
             // for the relay decision below, not the possibly-stale `info`.

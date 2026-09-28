@@ -285,6 +285,18 @@ impl Backend for AppleContainer {
         false
     }
 
+    fn supports_restart_policy(&self) -> bool {
+        false
+    }
+
+    fn restart_policy(&self, _container: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    fn set_restart_policy(&self, _container: &str, _policy: &str) -> Result<()> {
+        Ok(())
+    }
+
     fn image_entrypoint(&self, image: &str) -> Result<Vec<String>> {
         let out = self.output_quiet(&["image", "inspect", image])?;
         parse_image_entrypoint(&out, oci_arch(std::env::consts::ARCH))

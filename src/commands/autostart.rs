@@ -152,6 +152,70 @@ fn actions(
     out
 }
 
+/// Restart policy an `autostart = "runtime"` container carries; `unless-stopped`
+/// so a container the user stopped stays stopped across a runtime restart.
+const RUNTIME_RESTART: &str = "unless-stopped";
+
+/// The `--restart` policy to create a container with (only on backends that
+/// support one) and the warnings to print at `run`. Podman only honors the
+/// policy at boot through `podman-restart.service`, which devsandbox never
+/// installs; Apple `container` has no restart policy, so the sandbox falls
+/// back to the devsandbox-driven pass (`autostart = true`).
+pub(crate) fn restart_decision(
+    mode: Option<Autostart>,
+    supported: bool,
+    backend: &str,
+) -> (Option<&'static str>, Vec<String>) {
+    if mode != Some(Autostart::Runtime) {
+        return (None, Vec::new());
+    }
+    if !supported {
+        let runtime = if backend == "container" { "Apple container" } else { backend };
+        return (
+            None,
+            vec![format!(
+                "autostart = \"runtime\" is unsupported on {runtime}; behaving as `true`"
+            )],
+        );
+    }
+    let mut warnings = Vec::new();
+    if backend == "podman" {
+        warnings.push(
+            "autostart = \"runtime\": podman restarts containers at boot only with \
+             `podman-restart.service` enabled (devsandbox never installs it)"
+                .to_string(),
+        );
+    }
+    (Some(RUNTIME_RESTART), warnings)
+}
+
+/// The policy to switch an existing container to so it matches `mode`, or
+/// `None` when `current` already does. `autostart` isn't hashed for drift, so
+/// a flip is applied in place on start instead of requiring a rebuild. An
+/// unset policy (empty) counts as `no`; an unknown current policy is updated.
+fn restart_update(mode: Option<Autostart>, current: Option<&str>) -> Option<&'static str> {
+    let desired = if mode == Some(Autostart::Runtime) { RUNTIME_RESTART } else { "no" };
+    let current = current.map(|c| if c.is_empty() { "no" } else { c });
+    (current != Some(desired)).then_some(desired)
+}
+
+/// Bring `container`'s restart policy in line with `mode` (no-op on backends
+/// without restart policies). Never fails the caller: an old podman without
+/// `update --restart` gets a warning pointing at a recreate.
+pub(crate) fn apply_restart_policy(container: &str, instance: &str, mode: Option<Autostart>) {
+    if !backend().supports_restart_policy() {
+        return;
+    }
+    let current = backend().restart_policy(container).ok().flatten();
+    let Some(policy) = restart_update(mode, current.as_deref()) else { return };
+    if let Err(e) = backend().set_restart_policy(container, policy) {
+        eprintln!(
+            "warning: cannot change restart policy of {container}: {e:#}; \
+             recreate with `devsandbox rebuild --force {instance}`"
+        );
+    }
+}
+
 /// The host's current boot id, or `None` when it can't be read (or the OS has
 /// no supported source).
 fn boot_id() -> Option<String> {
@@ -268,5 +332,56 @@ mod tests {
         );
         assert_eq!(parse_macos_boottime("garbage"), None);
         assert_eq!(parse_macos_boottime("{ sec = 1"), None);
+    }
+
+    #[test]
+    fn restart_flag_on_docker_for_runtime_only() {
+        assert_eq!(
+            restart_decision(Some(Autostart::Runtime), true, "docker"),
+            (Some("unless-stopped"), Vec::new())
+        );
+        for mode in [None, Some(Autostart::Off), Some(Autostart::Devsandbox)] {
+            for (supported, name) in [(true, "docker"), (true, "podman"), (false, "container")] {
+                assert_eq!(restart_decision(mode, supported, name), (None, Vec::new()));
+            }
+        }
+    }
+
+    #[test]
+    fn restart_flag_on_podman_warns_about_service() {
+        let (policy, warnings) = restart_decision(Some(Autostart::Runtime), true, "podman");
+        assert_eq!(policy, Some("unless-stopped"));
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("podman-restart.service"), "{warnings:?}");
+    }
+
+    #[test]
+    fn restart_unsupported_on_apple_falls_back() {
+        assert_eq!(
+            restart_decision(Some(Autostart::Runtime), false, "container"),
+            (
+                None,
+                vec![
+                    "autostart = \"runtime\" is unsupported on Apple container; behaving as `true`"
+                        .to_string()
+                ]
+            )
+        );
+    }
+
+    #[test]
+    fn restart_update_only_on_mismatch() {
+        let rt = Some(Autostart::Runtime);
+        assert_eq!(restart_update(rt, Some("unless-stopped")), None);
+        assert_eq!(restart_update(rt, Some("no")), Some("unless-stopped"));
+        assert_eq!(restart_update(rt, Some("")), Some("unless-stopped"));
+        assert_eq!(restart_update(rt, Some("always")), Some("unless-stopped"));
+        assert_eq!(restart_update(rt, None), Some("unless-stopped"));
+        for mode in [None, Some(Autostart::Off), Some(Autostart::Devsandbox)] {
+            assert_eq!(restart_update(mode, Some("no")), None);
+            assert_eq!(restart_update(mode, Some("")), None);
+            assert_eq!(restart_update(mode, Some("unless-stopped")), Some("no"));
+            assert_eq!(restart_update(mode, None), Some("no"));
+        }
     }
 }

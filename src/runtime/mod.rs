@@ -275,6 +275,20 @@ pub trait Backend: Send + Sync {
     /// flag (each container is its own VM).
     fn supports_privileged(&self) -> bool;
 
+    /// Whether containers can carry a restart policy (`run --restart`,
+    /// changeable in place with `update --restart`). Apple's `container` has
+    /// none, so `autostart = "runtime"` falls back to devsandbox-driven there.
+    fn supports_restart_policy(&self) -> bool;
+
+    /// A container's current restart policy name (`no`, `unless-stopped`, …;
+    /// empty when unset). `None` when the container doesn't exist or the
+    /// runtime has no restart policies. stderr is captured (screen-safe).
+    fn restart_policy(&self, container: &str) -> Result<Option<String>>;
+
+    /// Change a container's restart policy in place. stderr is captured
+    /// (screen-safe); no-op on runtimes without restart policies.
+    fn set_restart_policy(&self, container: &str, policy: &str) -> Result<()>;
+
     /// The local image's `ENTRYPOINT` (exec form; empty when unset). Needed to
     /// chain it behind feature entrypoints, since a Dockerfile cannot reference
     /// its parent's.

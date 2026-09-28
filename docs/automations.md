@@ -236,7 +236,7 @@ Decisions taken while planning (differ from or sharpen the design above):
 - Tests: config parse (bool, `"runtime"`, bad string), hash unaffected by
   `autostart`, state round-trip with the new map.
 
-### Step 2 — `autostart = "runtime"`: restart policy
+### Step 2 — `autostart = "runtime"`: restart policy [x]
 
 - `src/runtime/mod.rs` `Backend`: `fn supports_restart_policy(&self) -> bool`
   (docker/podman true, Apple `container` false — confirm in its backend file)

@@ -122,8 +122,9 @@ pub struct SandboxProperties {
     pub secrets: Option<Value>,
 }
 
-/// `autostart` mode: `false` / `true` / `"runtime"`. `Runtime` behaves like
-/// `Devsandbox` until the runtime restart policy lands.
+/// `autostart` mode: `false` / `true` / `"runtime"`. `Runtime` also gets the
+/// devsandbox-driven pass; on backends with restart policies its containers
+/// additionally carry `--restart unless-stopped` (`commands::autostart`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Autostart {
     #[default]
