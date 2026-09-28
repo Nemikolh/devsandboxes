@@ -109,7 +109,7 @@ devsbd ensure <sandbox> --key <key> [--branch B] [--env K=V]…
 devsbd ls                         # this dispatcher's children + status (JSON)
 devsbd stop <key>
 devsbd rm <key>
-devsbd exec <key> [--detach] -- <cmd>…   # a run; see _Runs_
+devsbd exec <key> [--sandbox S] [--detach] -- <cmd>…   # a run; see _Runs_
 ```
 
 - Children are named `<sandbox>-<key>` (e.g. `web-pr-123`): predictable, so a human can `devsandbox vscode web-pr-123`.
@@ -138,7 +138,16 @@ The TUI serves control requests for every running dispatcher. Two TUIs don't bot
 
 ## Runs
 
-`devsbd exec <key> --detach -- zidane -p "…"` starts a tracked process in a child: run id, start/end time, exit status, captured stdout/stderr (kept in the child, streamed on demand). `devsbd run ls|logs|wait <id>` for the dispatcher; the TUI shows a child's runs next to its processes. Without `--detach`, `exec` streams and returns the exit status.
+`devsbd exec <key> [--sandbox S] --detach -- zidane -p "…"` starts a tracked process in a child: run id, start/end time, exit status, captured stdout/stderr (kept in the child under `/var/lib/devsandbox/runs/<id>/`, streamed on demand). Runs live in the child, so the dispatcher names it:
+
+```
+devsbd run ls <key> [--sandbox S]                      # id, state, start (UTC), argv; one line per run
+devsbd run logs <key> <id> [--sandbox S] [--follow]    # output so far; --follow until the run ends
+devsbd run wait <key> <id> [--sandbox S] [--timeout S] # prints `exited N` | `killed N` | `lost`,
+                                                       # or `running` after --timeout; exit 0
+```
+
+States: `running`, `exited N`, `killed N` (signal), `lost` (its supervisor died without recording an end, e.g. the child restarted). Without `--detach`, `exec` prints the id to stderr (`devsbd: run <id>`), streams the output, and exits with the run's code (`killed N` → 128+N, `lost` → 1). The child must be a running, owned child (`ensure` it first). Inside the child the same store is `devsbd run start [--cwd D] -- cmd…` / `run ls` / `run logs <id> [--offset N]` / `run wait <id> [--timeout S]` — what the host execs there. The TUI shows a child's last runs (dim `run` rows) after its processes.
 
 ## Transport
 
@@ -355,7 +364,7 @@ Landed limitations: the hook runs as the container's user, so a non-root `contai
 - Tests: exit 75 with no bridge; `#[test_utils::docker_test(helper)]`
   dispatcher `ensure`s a child and `ls` lists it.
 
-### Step 9 — runs
+### Step 9 — runs [x]
 
 - `devsbd exec <key> [--detach] -- cmd…` via `CONTROL`: host execs in the
   child through the child's own helper (`devsbd run start` there), which

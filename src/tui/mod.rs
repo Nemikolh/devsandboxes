@@ -640,10 +640,16 @@ fn spawn_proc_fetch(targets: Vec<(String, String)>) -> Receiver<BTreeMap<String,
         let mut out: BTreeMap<String, ProcState> = BTreeMap::new();
         for (instance, container) in targets {
             let state = match crate::runtime::backend().proc_list(&container) {
-                Ok(list) => ProcState::Rows {
-                    rows: build_forest(parse_top(&list.text)),
-                    signalable: list.container_pids,
-                },
+                Ok(list) => {
+                    let mut rows = build_forest(parse_top(&list.text));
+                    // A child's runs next to its processes (docs/automations.md,
+                    // "Runs"). No helper, or one predating runs: no rows.
+                    let ls = ["exec", container.as_str(), crate::devsbd::BIN, "run", "ls"];
+                    if let Ok(text) = crate::runtime::backend().output_quiet(&ls) {
+                        rows.extend(procs::run_rows(&text));
+                    }
+                    ProcState::Rows { rows, signalable: list.container_pids }
+                }
                 Err(e) => ProcState::Message(format!("(processes unavailable: {e:#})")),
             };
             out.insert(instance, state);

@@ -413,8 +413,10 @@ kind: 0 Hello(u32 version, u8 hash_len, hash utf-8, u32 caps)  1 Open(channel: u
   streams: the daemon sends one outbox record as `Data` then `Eof`, the host
   replies `ok`; a legacy `Open` stream half-closes on a peer `Eof`, see
   `mux.rs`, docs/automations.md), `CONTROL = 1 << 3` (host serves
-  `channel::CONTROL` streams: a dispatcher's `devsbd ensure|ls|stop|rm`
-  request, sent the same way, answered with an encoded response and a close;
+  `channel::CONTROL` streams: a dispatcher's `devsbd ensure|ls|stop|rm|exec`
+  or `devsbd run ls|logs|wait <key> …` request, sent the same way (run ops
+  are then carried out by the host exec'ing `devsbd run …` in the child;
+  runs themselves never touch the frame channel), answered with an encoded response and a close;
   only sink-bearing TUI bridges advertise it, and the host's handler refuses
   non-dispatchers). The bridge does two separate handshakes and copies
   bytes, so caps don't flow end to end by themselves:

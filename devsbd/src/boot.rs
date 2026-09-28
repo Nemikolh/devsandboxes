@@ -163,7 +163,7 @@ fn utc_now() -> String {
     format_utc(secs)
 }
 
-fn format_utc(secs: u64) -> String {
+pub(crate) fn format_utc(secs: u64) -> String {
     let (days, rem) = (secs / 86400, secs % 86400);
     // Howard Hinnant's civil_from_days.
     let z = days as i64 + 719_468;

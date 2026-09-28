@@ -110,9 +110,12 @@ impl App {
     /// fetch is still in flight), which the Detail panel renders as `…`/`-`.
     pub fn agent_count(&self, instance: &str) -> Option<usize> {
         match self.procs.get(instance) {
-            Some(ProcState::Rows { rows, .. }) => {
-                Some(rows.iter().filter(|r| crate::tui::procs::is_agent(&r.args)).count())
-            }
+            // Run rows (`RUN_PID`) repeat a live agent's argv: count processes only.
+            Some(ProcState::Rows { rows, .. }) => Some(
+                rows.iter()
+                    .filter(|r| r.pid != crate::tui::procs::RUN_PID && crate::tui::procs::is_agent(&r.args))
+                    .count(),
+            ),
             _ => None,
         }
     }
@@ -341,6 +344,15 @@ mod tests {
     }
 
     #[test]
+    fn run_rows_are_not_signalable() {
+        let mut app = app_on_proc_row(&[crate::tui::procs::RUN_PID]);
+        assert!(app.on_proc_row());
+        assert!(!app.proc_row_signalable());
+        app.on_key(key(KeyCode::Char('t')));
+        assert!(app.take_pending_signal().is_none());
+    }
+
+    #[test]
     fn agent_count_counts_agent_rows_in_cache() {
         use crate::tui::procs::{ProcRow, ProcState};
         let mut app = new_app();
@@ -351,6 +363,12 @@ mod tests {
             ProcRow { pid: "1".into(), depth: 0, args: "/sbin/init".into() },
             ProcRow { pid: "2".into(), depth: 1, args: "node /usr/local/bin/claude".into() },
             ProcRow { pid: "3".into(), depth: 1, args: "claude --resume".into() },
+            // A run row repeating an agent's argv isn't another agent.
+            ProcRow {
+                pid: crate::tui::procs::RUN_PID.into(),
+                depth: 0,
+                args: "1790000000-a1b2 running claude -p x".into(),
+            },
         ];
         app.procs.insert("x".into(), ProcState::Rows { rows, signalable: true });
         assert_eq!(app.agent_count("x"), Some(2));

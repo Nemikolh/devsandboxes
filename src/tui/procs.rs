@@ -166,9 +166,61 @@ pub fn build_forest(rows: Vec<(String, String, String)>) -> Vec<ProcRow> {
     out
 }
 
+/// The gutter label of a run row (docs/automations.md, "Runs"): not a pid,
+/// so the signal shortcuts and the agent count skip it.
+pub const RUN_PID: &str = "run";
+
+/// Runs shown under an instance's processes, newest kept.
+pub const MAX_RUN_ROWS: usize = 5;
+
+/// Rows for the last [`MAX_RUN_ROWS`] runs in `devsbd run ls` output
+/// (`<id> <state> <started> <argv…>`, oldest first), after the process
+/// forest: `run` in the gutter, the line minus its start time as args.
+pub fn run_rows(ls: &str) -> Vec<ProcRow> {
+    let lines: Vec<&str> = ls.lines().filter(|l| !l.trim().is_empty()).collect();
+    lines[lines.len().saturating_sub(MAX_RUN_ROWS)..]
+        .iter()
+        .map(|line| {
+            let words: Vec<&str> = line.split(' ').collect();
+            // `exited N` / `killed N` are two words, `running` / `lost` one.
+            let state_len = match words.get(1) {
+                Some(&"exited" | &"killed") => 2,
+                _ => 1,
+            };
+            let head = words.iter().take(1 + state_len);
+            let argv = words.iter().skip(2 + state_len);
+            let args: Vec<&str> = head.chain(argv).copied().collect();
+            ProcRow { pid: RUN_PID.to_string(), depth: 0, args: args.join(" ") }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_rows_keep_the_newest_runs_without_start_times() {
+        let ls = "1790000000-a1b2 exited 4 2026-09-21T14:13:20Z sh -c echo hi\n\
+1790000001-0000 running 2026-09-21T14:13:21Z zidane -p fix it\n\
+1790000002-ffff lost 2026-09-21T14:13:22Z sleep 9\n";
+        let rows = run_rows(ls);
+        let args: Vec<&str> = rows.iter().map(|r| r.args.as_str()).collect();
+        assert_eq!(
+            args,
+            [
+                "1790000000-a1b2 exited 4 sh -c echo hi",
+                "1790000001-0000 running zidane -p fix it",
+                "1790000002-ffff lost sleep 9",
+            ]
+        );
+        assert!(rows.iter().all(|r| r.pid == RUN_PID && r.depth == 0));
+        let many: String = (0..8).map(|i| format!("17900000{i:02}-0000 lost x y\n")).collect();
+        let rows = run_rows(&many);
+        assert_eq!(rows.len(), MAX_RUN_ROWS);
+        assert!(rows[0].args.starts_with("1790000003-0000"), "{:?}", rows[0]);
+        assert!(run_rows("").is_empty());
+    }
 
     #[test]
     fn parse_top_skips_header_and_keeps_arg_spacing() {

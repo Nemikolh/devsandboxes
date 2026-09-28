@@ -6,6 +6,7 @@ mod bridge;
 mod ctl;
 mod daemon;
 mod outbox;
+mod runs;
 
 // Shared with the host so the two sides can't drift; they live in the root
 // crate because devsbd/ isn't packaged (see proto.rs's module doc).
@@ -47,11 +48,16 @@ fn main() {
         Some("bridge") => exit_on_err(bridge::run(&build_hash())),
         Some("boot") => exit_on_err(boot::run()),
         Some("notify") => exit_on_err(outbox::run(&args.collect::<Vec<_>>())),
-        Some(verb @ ("ensure" | "ls" | "stop" | "rm")) => {
+        Some(verb @ ("ensure" | "ls" | "stop" | "rm" | "exec")) => {
             std::process::exit(ctl::run(verb, &args.collect::<Vec<_>>()))
         }
+        Some("run") => {
+            let args = args.collect::<Vec<_>>();
+            let code = if runs::is_local(&args) { runs::run(&args) } else { ctl::run_remote(&args) };
+            std::process::exit(code)
+        }
         _ => {
-            eprintln!("usage: devsbd version|daemon|bridge|boot|notify|ensure|ls|stop|rm");
+            eprintln!("usage: devsbd version|daemon|bridge|boot|notify|ensure|ls|stop|rm|exec|run");
             std::process::exit(2);
         }
     }

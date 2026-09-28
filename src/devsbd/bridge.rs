@@ -181,12 +181,16 @@ const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// Each op is a `devsandbox` subprocess that loads and saves `state.toml`;
 /// two at once (two dispatchers, or one script firing in parallel) would race
 /// on it and lose a write. Poisoning is ignored: the guard protects no data.
-/// Read-only `ls` and requests from non-dispatchers (denied without running
-/// anything) skip the lock, so they never wait behind a long `ensure`.
+/// Ops that don't write state (`ls`, and every run op: they only exec in a
+/// child) and requests from non-dispatchers (denied without running
+/// anything) skip the lock, so they never wait behind a long `ensure` — a
+/// `run-wait` holds its handler for up to `dispatch::MAX_WAIT`.
 fn dispatch_control(key: &str, req: &Request) -> Response {
     use crate::commands::dispatch;
+    use crate::devsbd::control::Op;
     static LOCK: Mutex<()> = Mutex::new(());
-    if req.op == crate::devsbd::control::Op::Ls || !dispatch::declares_dispatcher(key) {
+    let writes_state = matches!(req.op, Op::Ensure | Op::Stop | Op::Rm);
+    if !writes_state || !dispatch::declares_dispatcher(key) {
         return dispatch::handle(key, req);
     }
     let _serial = LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -789,11 +793,9 @@ mod tests {
         });
         let (daemon, _notes) = service_pair(control);
         let req = Request {
-            op: control::Op::Ensure,
             sandbox: Some("web".into()),
             key: Some("pr-1".into()),
-            branch: None,
-            env: vec![],
+            ..Request::new(control::Op::Ensure)
         };
         let reply = send_on(&daemon, 1, proto::channel::CONTROL, control::encode_request(&req).as_bytes());
         assert_eq!(reply, b"status ok\nbody web-pr-1\n");

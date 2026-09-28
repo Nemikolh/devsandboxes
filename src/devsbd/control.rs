@@ -1,5 +1,5 @@
-//! Control requests and responses: what `devsbd ensure|ls|stop|rm` sends from
-//! a dispatcher's container to the host, and what comes back
+//! Control requests and responses: what `devsbd ensure|ls|stop|rm|exec|run`
+//! sends from a dispatcher's container to the host, and what comes back
 //! (docs/automations.md, "Dispatchers"). One file shared by both crates
 //! (devsbd includes it via `#[path]`) so both ends can't drift; std-only and
 //! hand-parsed, like `notify.rs`.
@@ -8,11 +8,15 @@
 //! escaped as in `escape.rs` (`\\`, `\n`, `\0`). Request:
 //!
 //! ```text
-//! op ensure             required, once: ensure|ls|stop|rm
+//! op ensure             required, once: ensure|ls|stop|rm|exec|run-ls|run-logs|run-wait
 //! sandbox web           optional, at most once
 //! key pr-123            optional, at most once
 //! branch feat/x         optional, at most once
 //! env FOO=bar           optional, repeatable, each `K=V` (see `parse_env`)
+//! arg zidane            optional, repeatable: `exec`'s command, one line per argv word
+//! id 1790000000-a1b2    optional, at most once: a run id (see `valid_run_id`)
+//! offset 1024           optional, at most once: decimal byte offset into a run's log
+//! timeout 5             optional, at most once: decimal seconds
 //! ```
 //!
 //! Which fields an op needs is the host handler's call (`commands::dispatch`),
@@ -21,6 +25,8 @@
 //! ```text
 //! status ok             required, once: ok|denied|failed|no-host|usage
 //! body web-pr-123       required, once: instance name (ensure), JSON (ls),
+//!                       run id (exec), `devsbd run ls|wait` output (run-ls,
+//!                       run-wait), `<next offset>\n<log text>` (run-logs),
 //!                       else a short message; may be empty
 //! ```
 //!
@@ -51,17 +57,22 @@ pub enum Op {
     Ls,
     Stop,
     Rm,
+    /// Start a run in a child (`devsbd run start` there); body = run id.
+    Exec,
+    /// A child's runs (`devsbd run ls` there).
+    RunLs,
+    /// A chunk of a run's output from `offset`.
+    RunLogs,
+    /// Wait up to `timeout` for a run to end; body = its state.
+    RunWait,
 }
 
 impl Op {
+    pub const ALL: [Op; 8] =
+        [Op::Ensure, Op::Ls, Op::Stop, Op::Rm, Op::Exec, Op::RunLs, Op::RunLogs, Op::RunWait];
+
     pub fn parse(s: &str) -> Option<Op> {
-        match s {
-            "ensure" => Some(Op::Ensure),
-            "ls" => Some(Op::Ls),
-            "stop" => Some(Op::Stop),
-            "rm" => Some(Op::Rm),
-            _ => None,
-        }
+        Op::ALL.into_iter().find(|op| op.as_str() == s)
     }
 
     pub fn as_str(self) -> &'static str {
@@ -70,8 +81,23 @@ impl Op {
             Op::Ls => "ls",
             Op::Stop => "stop",
             Op::Rm => "rm",
+            Op::Exec => "exec",
+            Op::RunLs => "run-ls",
+            Op::RunLogs => "run-logs",
+            Op::RunWait => "run-wait",
         }
     }
+}
+
+/// A run id as the helper mints them: `<unix secs:010>-<4 lowercase hex>`,
+/// so a name sort is start order. Checked on both ends: it becomes a path
+/// segment in the child.
+pub fn valid_run_id(id: &str) -> bool {
+    let b = id.as_bytes();
+    b.len() == 15
+        && b[..10].iter().all(u8::is_ascii_digit)
+        && b[10] == b'-'
+        && b[11..].iter().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(c))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,6 +107,27 @@ pub struct Request {
     pub key: Option<String>,
     pub branch: Option<String>,
     pub env: Vec<(String, String)>,
+    pub argv: Vec<String>,
+    pub id: Option<String>,
+    pub offset: Option<u64>,
+    pub timeout: Option<u64>,
+}
+
+impl Request {
+    /// `op` with every field empty.
+    pub fn new(op: Op) -> Request {
+        Request {
+            op,
+            sandbox: None,
+            key: None,
+            branch: None,
+            env: Vec::new(),
+            argv: Vec::new(),
+            id: None,
+            offset: None,
+            timeout: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,11 +222,20 @@ fn directives(text: &str) -> impl Iterator<Item = Result<(usize, &str, String), 
     })
 }
 
-fn set_once(slot: &mut Option<String>, value: String, n: usize, name: &str) -> Result<(), String> {
+fn set_once<T>(slot: &mut Option<T>, value: T, n: usize, name: &str) -> Result<(), String> {
     match slot.replace(value) {
         Some(_) => Err(format!("line {n}: repeated `{name}`")),
         None => Ok(()),
     }
+}
+
+/// Plain decimal digits only (no sign, no spaces): `u64::from_str` alone
+/// accepts a leading `+`.
+fn number(value: &str, n: usize, name: &str) -> Result<u64, String> {
+    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("line {n}: bad `{name}` `{value}`"));
+    }
+    value.parse().map_err(|_| format!("line {n}: `{name}` out of range"))
 }
 
 pub fn encode_request(r: &Request) -> String {
@@ -193,12 +249,24 @@ pub fn encode_request(r: &Request) -> String {
     for (k, v) in &r.env {
         line(&mut out, "env", &format!("{k}={v}"));
     }
+    for arg in &r.argv {
+        line(&mut out, "arg", arg);
+    }
+    if let Some(id) = &r.id {
+        line(&mut out, "id", id);
+    }
+    for (key, value) in [("offset", r.offset), ("timeout", r.timeout)] {
+        if let Some(value) = value {
+            line(&mut out, key, &value.to_string());
+        }
+    }
     out
 }
 
 pub fn decode_request(text: &str) -> Result<Request, String> {
     let (mut op, mut sandbox, mut key, mut branch) = (None, None, None, None);
     let mut env = Vec::new();
+    let (mut argv, mut id, mut offset, mut timeout) = (Vec::new(), None, None, None);
     for d in directives(text) {
         let (n, name, value) = d?;
         match name {
@@ -212,10 +280,61 @@ pub fn decode_request(text: &str) -> Result<Request, String> {
             "key" => set_once(&mut key, value, n, name)?,
             "branch" => set_once(&mut branch, value, n, name)?,
             "env" => env.push(parse_env(&value).map_err(|e| format!("line {n}: {e}"))?),
+            "arg" => argv.push(value),
+            "id" => set_once(&mut id, value, n, name)?,
+            "offset" => set_once(&mut offset, number(&value, n, name)?, n, name)?,
+            "timeout" => set_once(&mut timeout, number(&value, n, name)?, n, name)?,
             other => return Err(format!("line {n}: unknown key `{other}`")),
         }
     }
-    Ok(Request { op: op.ok_or("missing `op`")?, sandbox, key, branch, env })
+    Ok(Request {
+        op: op.ok_or("missing `op`")?,
+        sandbox,
+        key,
+        branch,
+        env,
+        argv,
+        id,
+        offset,
+        timeout,
+    })
+}
+
+/// The `run-logs` body for `chunk`, read from byte `offset` of a run's log:
+/// `<next offset>\n<text>`. Bodies are UTF-8, logs are bytes: invalid
+/// sequences become U+FFFD, and a multi-byte character cut off at the end of
+/// the chunk is left for the next read (`next` stops before it), so a
+/// character split across two reads isn't mangled. The explicit `next` is
+/// what keeps the caller's offset in bytes of the log, not of the text.
+pub fn logs_body(offset: u64, chunk: &[u8]) -> String {
+    let len = complete_len(chunk);
+    format!("{}\n{}", offset + len as u64, String::from_utf8_lossy(&chunk[..len]))
+}
+
+/// Split a [`logs_body`] into `(next offset, text)`.
+pub fn parse_logs_body(body: &str) -> Result<(u64, &str), String> {
+    let (next, text) = body.split_once('\n').unwrap_or((body, ""));
+    let next = number(next, 1, "offset")?;
+    Ok((next, text))
+}
+
+/// Length of `b` without a trailing incomplete UTF-8 sequence.
+fn complete_len(b: &[u8]) -> usize {
+    let n = b.len();
+    for back in 1..=n.min(4) {
+        let c = b[n - back];
+        if c & 0xC0 == 0x80 {
+            continue; // continuation byte: look further back for its lead
+        }
+        let need = match c {
+            0xC0..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xF7 => 4,
+            _ => 1,
+        };
+        return if need > back { n - back } else { n };
+    }
+    n
 }
 
 pub fn encode_response(r: &Response) -> String {
@@ -267,6 +386,29 @@ env B=x=y\\nz\n";
             key: Some("pr-123".into()),
             branch: Some("feat/x".into()),
             env: vec![("A".into(), "1".into()), ("B".into(), "x=y\nz".into())],
+            ..Request::new(Op::Ensure)
+        }
+    }
+
+    /// Every run field; `arg`s keep order, empty and multi-line words included.
+    const RUN_REQUEST: &str = "op exec\n\
+key pr-1\n\
+arg sh\n\
+arg -c\n\
+arg echo a\\nb \\\\\n\
+arg \n\
+id 1790000000-a1b2\n\
+offset 1024\n\
+timeout 5\n";
+
+    fn run_request() -> Request {
+        Request {
+            key: Some("pr-1".into()),
+            argv: vec!["sh".into(), "-c".into(), "echo a\nb \\".into(), String::new()],
+            id: Some("1790000000-a1b2".into()),
+            offset: Some(1024),
+            timeout: Some(5),
+            ..Request::new(Op::Exec)
         }
     }
 
@@ -274,12 +416,14 @@ env B=x=y\\nz\n";
     fn request_fixture_round_trips() {
         assert_eq!(encode_request(&request()), REQUEST);
         assert_eq!(decode_request(REQUEST), Ok(request()));
+        assert_eq!(encode_request(&run_request()), RUN_REQUEST);
+        assert_eq!(decode_request(RUN_REQUEST), Ok(run_request()));
     }
 
     #[test]
     fn minimal_request_and_every_op() {
-        for op in [Op::Ensure, Op::Ls, Op::Stop, Op::Rm] {
-            let r = Request { op, sandbox: None, key: None, branch: None, env: vec![] };
+        for op in Op::ALL {
+            let r = Request::new(op);
             let text = encode_request(&r);
             assert_eq!(text, format!("op {}\n", op.as_str()));
             assert_eq!(decode_request(&text), Ok(r));
@@ -323,6 +467,52 @@ env B=x=y\\nz\n";
         assert!(decode_request("op ls\nenv 1A=x\n").unwrap_err().contains("env var name"));
         assert!(decode_request("op ls\nkey a\\tb\n").unwrap_err().contains("bad escape"));
         assert!(decode_request("\u{1}\u{2}garbage").is_err());
+        assert!(decode_request("op run\n").unwrap_err().contains("bad op"));
+        assert!(decode_request("op run-ls\nid a\nid b\n").unwrap_err().contains("repeated `id`"));
+        assert!(decode_request("op run-logs\noffset 1\noffset 1\n").unwrap_err().contains("repeated"));
+        assert!(decode_request("op run-wait\ntimeout 1\ntimeout 2\n").is_err());
+        for bad in ["", "-1", "+1", " 1", "1s", "0x10", "99999999999999999999"] {
+            let text = format!("op run-logs\noffset {bad}\n");
+            assert!(decode_request(&text).is_err(), "offset {bad:?}");
+            let text = format!("op run-wait\ntimeout {bad}\n");
+            assert!(decode_request(&text).is_err(), "timeout {bad:?}");
+        }
+        assert!(decode_request("op exec\narg a\\x\n").unwrap_err().contains("bad escape"));
+    }
+
+    #[test]
+    fn run_ids() {
+        assert!(valid_run_id("1790000000-a1b2"));
+        assert!(valid_run_id("0000000000-0000"));
+        for bad in ["", "1790000000-A1B2", "1790000000-a1b", "179000000-a1b2c", "1790000000_a1b2",
+                    "../../../etc-x", "1790000000-g1b2", "1790000000-a1b2 "] {
+            assert!(!valid_run_id(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn logs_bodies_keep_offsets_in_log_bytes() {
+        assert_eq!(logs_body(0, b"out\n"), "4\nout\n");
+        assert_eq!(parse_logs_body("4\nout\n"), Ok((4, "out\n")));
+        assert_eq!(logs_body(7, b""), "7\n");
+        assert_eq!(parse_logs_body("7\n"), Ok((7, "")));
+        assert_eq!(parse_logs_body("7"), Ok((7, "")));
+        // A character cut at the chunk end waits for the next read ...
+        let e_acute = "é".as_bytes();
+        assert_eq!(logs_body(10, &[b'a', e_acute[0]]), "11\na");
+        assert_eq!(logs_body(0, &[0xE2, 0x82]), "0\n");
+        assert_eq!(logs_body(0, "a€".as_bytes()), "4\na€");
+        assert_eq!(logs_body(0, "😀".as_bytes()), "4\n😀");
+        assert_eq!(logs_body(0, &"😀".as_bytes()[..3]), "0\n");
+        // ... but invalid bytes are replaced and counted.
+        assert_eq!(logs_body(0, &[0xFF, b'x']), "2\n\u{FFFD}x");
+        assert_eq!(logs_body(0, &[0x80]), "1\n\u{FFFD}");
+        assert!(parse_logs_body("x\nout").is_err());
+        assert!(parse_logs_body("").is_err());
+        // Round trip through a response: newlines, NULs, backslashes survive.
+        let body = logs_body(0, b"a\n\0\\\n");
+        let resp = decode_response(&encode_response(&Response::new(Status::Ok, body.clone()))).unwrap();
+        assert_eq!(parse_logs_body(&resp.body), Ok((5, "a\n\0\\\n")));
     }
 
     #[test]

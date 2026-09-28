@@ -11,6 +11,12 @@
 //! new child respects `max-instances` (all owned children in state count,
 //! stopped ones included).
 //!
+//! Runs (`exec`, `run-ls|logs|wait`) live in the child: the host execs the
+//! child's own helper (`devsbd run start|ls|logs|wait`, `devsbd/src/runs.rs`)
+//! there, as the child's remote user in its workspace with its `remoteEnv`
+//! (the `devsandbox exec` argv), output captured, and answers with what it
+//! printed. Only owned, running children with a helper are reachable.
+//!
 //! Children are ordinary instances named `<sandbox>-<key>`. Operations run as
 //! `devsandbox -C <config root> run|start|rebuild|stop|rm …` subprocesses, not
 //! in-process: the handler runs on the TUI's bridge worker and those commands
@@ -25,12 +31,25 @@ use std::process::{Command, Stdio};
 use serde::Serialize;
 
 use crate::config::Config;
-use crate::devsbd::control::{Op, Request, Response, Status};
+use crate::devsbd::control::{self, Op, Request, Response, Status};
 use crate::runtime::backend;
 use crate::state::{Instance, State};
 
 /// Longest accepted child key (the charset is checked by [`valid_key`]).
 pub const MAX_KEY: usize = 40;
+
+/// Cap on a `run-wait` request's `timeout`, seconds: each wait holds a bridge
+/// handler thread and a `docker exec`; clients loop (`devsbd run wait`), and
+/// the daemon gives up on a reply after 30 minutes anyway.
+pub const MAX_WAIT: u64 = 300;
+
+/// What an in-container command left behind (see [`Executor::exec_in`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExecOutput {
+    pub code: i32,
+    pub stdout: Vec<u8>,
+    pub stderr: String,
+}
 
 /// Side effects of a request, injectable so the decisions are testable
 /// without a runtime.
@@ -40,6 +59,10 @@ pub trait Executor {
     /// Run `devsandbox -C <config_dir> <args…>`; `Err` is a short message
     /// for the response body.
     fn devsandbox(&mut self, config_dir: &Path, args: &[String]) -> Result<(), String>;
+    /// Run `command` in `child`'s container as `devsandbox exec` would (user,
+    /// workspace, remoteEnv), stdin null, output captured; `Err` only when it
+    /// couldn't run at all.
+    fn exec_in(&mut self, child: &Instance, command: &[String]) -> Result<ExecOutput, String>;
 }
 
 /// Load state and the dispatcher's config, then [`handle_with`] the real
@@ -171,17 +194,31 @@ pub(crate) fn handle_with(
                 Err(e) => failed(e),
             }
         }
+        Op::Exec | Op::RunLs | Op::RunLogs | Op::RunWait => {
+            let key = req.key.as_deref().expect("checked by check_fields");
+            let name = match find_child(state, owner_id, key, req.sandbox.as_deref()) {
+                Ok(name) => name,
+                Err(resp) => return resp,
+            };
+            run_op(&name, &state.instances[&name], req, exec)
+        }
     }
 }
 
 /// Which fields each op takes; the codec only checks syntax. Also validates
-/// the key's charset.
+/// the key's charset and the run id's shape.
 fn check_fields(req: &Request) -> Result<(), String> {
     let op = req.op.as_str();
-    let (sandbox, key, extras) = match req.op {
-        Op::Ls => (Some(false), Some(false), false),
-        Op::Ensure => (Some(true), Some(true), true),
-        Op::Stop | Op::Rm => (None, Some(true), false),
+    // Some(true) = required, Some(false) = forbidden, None = optional.
+    let (sandbox, key) = match req.op {
+        Op::Ls => (Some(false), Some(false)),
+        Op::Ensure => (Some(true), Some(true)),
+        _ => (None, Some(true)),
+    };
+    let only = |ops: &[Op], optional: bool| match (ops.contains(&req.op), optional) {
+        (true, true) => None,
+        (true, false) => Some(true),
+        (false, _) => Some(false),
     };
     let field = |name: &str, want: Option<bool>, has: bool| match want {
         Some(true) if !has => Err(format!("`{op}` needs `{name}`")),
@@ -190,9 +227,13 @@ fn check_fields(req: &Request) -> Result<(), String> {
     };
     field("sandbox", sandbox, req.sandbox.is_some())?;
     field("key", key, req.key.is_some())?;
-    if !extras && (req.branch.is_some() || !req.env.is_empty()) {
+    if req.op != Op::Ensure && (req.branch.is_some() || !req.env.is_empty()) {
         return Err(format!("`{op}` takes no `branch`/`env`"));
     }
+    field("arg", only(&[Op::Exec], false), !req.argv.is_empty())?;
+    field("id", only(&[Op::RunLogs, Op::RunWait], false), req.id.is_some())?;
+    field("offset", only(&[Op::RunLogs], true), req.offset.is_some())?;
+    field("timeout", only(&[Op::RunWait], true), req.timeout.is_some())?;
     if let Some(key) = &req.key {
         if !valid_key(key) {
             return Err(format!(
@@ -201,7 +242,66 @@ fn check_fields(req: &Request) -> Result<(), String> {
             ));
         }
     }
+    if let Some(id) = req.id.as_deref().filter(|id| !control::valid_run_id(id)) {
+        return Err(format!("bad run id `{id}`"));
+    }
     Ok(())
+}
+
+/// The child helper's argv for a run op (after the checks in
+/// [`check_fields`]).
+fn helper_argv(req: &Request) -> Vec<String> {
+    let s = |v: &str| v.to_string();
+    let mut argv = vec![s(crate::devsbd::BIN), s("run")];
+    let id = || req.id.clone().expect("checked by check_fields");
+    match req.op {
+        Op::Exec => {
+            argv.extend([s("start"), s("--")]);
+            argv.extend(req.argv.iter().cloned());
+        }
+        Op::RunLs => argv.push(s("ls")),
+        Op::RunLogs => {
+            argv.extend([s("logs"), id(), s("--offset"), req.offset.unwrap_or(0).to_string()]);
+        }
+        Op::RunWait => {
+            argv.extend([s("wait"), id()]);
+            if let Some(t) = req.timeout {
+                argv.extend([s("--timeout"), t.min(MAX_WAIT).to_string()]);
+            }
+        }
+        Op::Ensure | Op::Ls | Op::Stop | Op::Rm => unreachable!("not a run op"),
+    }
+    argv
+}
+
+/// Carry out a run op in child `name`: it must be running and have a helper.
+/// The body is the helper's output (`run-logs`: a [`control::logs_body`]).
+fn run_op(name: &str, child: &Instance, req: &Request, exec: &mut dyn Executor) -> Response {
+    match exec.is_running(&child.container) {
+        Ok(Some(true)) => {}
+        Ok(Some(false)) => return failed(format!("child {name} is stopped; ensure it first")),
+        Ok(None) => return failed(format!("child {name} has no container; ensure it first")),
+        Err(e) => return failed(e),
+    }
+    if child.devsbd_arch.is_none() {
+        return failed(format!("child {name} has no devsbd helper (installed on `start`)"));
+    }
+    let out = match exec.exec_in(child, &helper_argv(req)) {
+        Ok(out) => out,
+        Err(e) => return failed(e),
+    };
+    if out.code != 0 {
+        let why = out.stderr.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+        if out.code == control::EXIT_USAGE && why.starts_with("usage: devsbd version") {
+            return failed(format!("child {name}'s devsbd predates runs; restart the child"));
+        }
+        return failed(format!("in {name}: {}", if why.is_empty() { "devsbd run failed" } else { why }));
+    }
+    let body = match req.op {
+        Op::RunLogs => control::logs_body(req.offset.unwrap_or(0), &out.stdout),
+        _ => String::from_utf8_lossy(&out.stdout).trim_end().to_string(),
+    };
+    Response::new(Status::Ok, body)
 }
 
 /// `[a-z0-9][a-z0-9-]{0,39}`: always a valid tail for an instance name, a
@@ -424,6 +524,22 @@ impl Executor for Subprocess {
             tail(&text, TAIL_LINES)
         ))
     }
+
+    fn exec_in(&mut self, child: &Instance, command: &[String]) -> Result<ExecOutput, String> {
+        let args = crate::commands::exec::exec_argv(child, false, false, command);
+        let bin = backend().bin();
+        // Captured, never inherited: this runs on the TUI's bridge worker.
+        let out = Command::new(bin)
+            .args(&args)
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| format!("cannot run {bin}: {e}"))?;
+        Ok(ExecOutput {
+            code: out.status.code().unwrap_or(1),
+            stdout: out.stdout,
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        })
+    }
 }
 
 /// `<data>/devsandbox/logs/dispatch-<unix>-<op>.log` (next to `state.toml`,
@@ -509,11 +625,14 @@ folder = "."
     }
 
     /// Records calls; `running`: container -> liveness (absent = no container).
+    /// `exec_in` answers `helper` and records `(container, argv)` in `execs`.
     #[derive(Default)]
     struct Fake {
         running: BTreeMap<String, bool>,
         calls: Vec<Vec<String>>,
         fail: bool,
+        helper: ExecOutput,
+        execs: Vec<(String, Vec<String>)>,
     }
 
     impl Fake {
@@ -534,15 +653,17 @@ folder = "."
             self.calls.push(args.to_vec());
             if self.fail { Err("boom".into()) } else { Ok(()) }
         }
+        fn exec_in(&mut self, child: &Instance, command: &[String]) -> Result<ExecOutput, String> {
+            self.execs.push((child.container.clone(), command.to_vec()));
+            if self.fail { Err("no docker".into()) } else { Ok(self.helper.clone()) }
+        }
     }
 
     fn req(op: Op, sandbox: Option<&str>, key: Option<&str>) -> Request {
         Request {
-            op,
             sandbox: sandbox.map(str::to_string),
             key: key.map(str::to_string),
-            branch: None,
-            env: Vec::new(),
+            ..Request::new(op)
         }
     }
 
@@ -652,6 +773,193 @@ folder = "."
             env: vec![("X".into(), "y".into())],
             ..req(op, Some("web"), Some(key))
         }
+    }
+
+    const RUN_ID: &str = "1790000000-a1b2";
+
+    fn run_req(op: Op, key: &str) -> Request {
+        let mut r = req(op, None, Some(key));
+        match op {
+            Op::Exec => r.argv = argv(&["sh", "-c", "echo hi"]),
+            Op::RunLogs | Op::RunWait => r.id = Some(RUN_ID.into()),
+            _ => {}
+        }
+        r
+    }
+
+    /// `state()` with helpers recorded on the children.
+    fn helper_state() -> State {
+        let mut s = state();
+        for i in s.instances.values_mut() {
+            i.devsbd_arch = Some(crate::devsbd::Arch::X86_64);
+        }
+        s
+    }
+
+    fn helper(code: i32, stdout: &str, stderr: &str) -> ExecOutput {
+        ExecOutput { code, stdout: stdout.as_bytes().to_vec(), stderr: stderr.into() }
+    }
+
+    #[test]
+    fn run_ops_reach_only_owned_running_children_with_a_helper() {
+        let s = helper_state();
+        let run_ops = [Op::Exec, Op::RunLs, Op::RunLogs, Op::RunWait];
+        let cases: &[(&str, &str, Status, &str)] = &[
+            ("p", "one", Status::Denied, "does not declare `dispatcher`"),
+            ("d", "other", Status::Denied, "`web-other` is not this dispatcher's child"),
+            ("d", "mine", Status::Denied, "`web-mine` is not"),
+            ("a", "one", Status::Denied, "`web-one` is not"),
+            ("d", "zzz", Status::Failed, "no child with key `zzz`"),
+            ("d", "two", Status::Failed, "child web-two is stopped; ensure it first"),
+        ];
+        for op in run_ops {
+            for (who, key, status, needle) in cases {
+                let mut fake = Fake::new();
+                let resp = call(&s, who, &run_req(op, key), &mut fake);
+                assert_eq!(resp.status, *status, "{op:?} {who} {key}: {resp:?}");
+                assert!(resp.body.contains(needle), "{op:?} {who} {key}: {resp:?}");
+                assert!(fake.execs.is_empty() && fake.calls.is_empty());
+            }
+            // No container, or no helper recorded.
+            let mut fake = Fake::new();
+            fake.running.remove("devsandbox-web-one");
+            let resp = call(&s, "d", &run_req(op, "one"), &mut fake);
+            assert!(resp.body.contains("has no container"), "{resp:?}");
+            let resp = call(&state(), "d", &run_req(op, "one"), &mut Fake::new());
+            assert_eq!(resp.status, Status::Failed);
+            assert!(resp.body.contains("no devsbd helper"), "{resp:?}");
+        }
+    }
+
+    #[test]
+    fn run_ops_exec_the_childs_helper() {
+        let s = helper_state();
+        let bin = crate::devsbd::BIN;
+        let cases: Vec<(Request, Vec<&str>, &str, &str)> = vec![
+            (run_req(Op::Exec, "one"), vec![bin, "run", "start", "--", "sh", "-c", "echo hi"],
+             "1790000000-a1b2\n", "1790000000-a1b2"),
+            (run_req(Op::RunLs, "one"), vec![bin, "run", "ls"], "a\nb\n", "a\nb"),
+            (run_req(Op::RunLogs, "one"), vec![bin, "run", "logs", RUN_ID, "--offset", "0"],
+             "out\n", "4\nout\n"),
+            (Request { offset: Some(10), ..run_req(Op::RunLogs, "one") },
+             vec![bin, "run", "logs", RUN_ID, "--offset", "10"], "x", "11\nx"),
+            (run_req(Op::RunWait, "one"), vec![bin, "run", "wait", RUN_ID], "exited 4\n", "exited 4"),
+            (Request { timeout: Some(5), ..run_req(Op::RunWait, "one") },
+             vec![bin, "run", "wait", RUN_ID, "--timeout", "5"], "running\n", "running"),
+            // Capped.
+            (Request { timeout: Some(99_999), ..run_req(Op::RunWait, "one") },
+             vec![bin, "run", "wait", RUN_ID, "--timeout", "300"], "running\n", "running"),
+        ];
+        for (r, want, stdout, body) in cases {
+            let mut fake = Fake { helper: helper(0, stdout, ""), ..Fake::new() };
+            let resp = call(&s, "d", &r, &mut fake);
+            assert_eq!(resp, Response::new(Status::Ok, body), "{r:?}");
+            assert_eq!(fake.execs, vec![("devsandbox-web-one".to_string(), argv(&want))]);
+            assert!(fake.calls.is_empty(), "no devsandbox subprocess for runs");
+        }
+        // The sandbox filter narrows the child lookup like stop/rm.
+        let resp = call(&s, "d", &Request { sandbox: Some("api".into()), ..run_req(Op::RunLs, "one") }, &mut Fake::new());
+        assert_eq!(resp.status, Status::Failed);
+    }
+
+    #[test]
+    fn run_op_failures() {
+        let s = helper_state();
+        let r = run_req(Op::RunLogs, "one");
+        let mut fake = Fake { helper: helper(1, "", "\ndevsbd run: no run `1790000000-a1b2`\n"), ..Fake::new() };
+        let resp = call(&s, "d", &r, &mut fake);
+        assert_eq!(resp, Response::new(Status::Failed, "in web-one: devsbd run: no run `1790000000-a1b2`"));
+        let mut fake = Fake { helper: helper(2, "", "usage: devsbd version|daemon|bridge\n"), ..Fake::new() };
+        let resp = call(&s, "d", &r, &mut fake);
+        assert!(resp.body.contains("predates runs"), "{resp:?}");
+        let mut fake = Fake { helper: helper(3, "", ""), ..Fake::new() };
+        assert!(call(&s, "d", &r, &mut fake).body.contains("devsbd run failed"));
+        let mut fake = Fake { fail: true, ..Fake::new() };
+        assert_eq!(call(&s, "d", &r, &mut fake), Response::new(Status::Failed, "no docker"));
+    }
+
+    #[test]
+    fn run_op_fields() {
+        let s = helper_state();
+        let cases: &[(Request, &str)] = &[
+            (req(Op::Exec, None, Some("one")), "`exec` needs `arg`"),
+            (req(Op::RunLogs, None, Some("one")), "`run-logs` needs `id`"),
+            (req(Op::RunWait, None, None), "needs `key`"),
+            (Request { id: Some("../x".into()), ..run_req(Op::RunWait, "one") }, "bad run id `../x`"),
+            (Request { id: Some(RUN_ID.into()), ..run_req(Op::Exec, "one") }, "`exec` takes no `id`"),
+            (Request { offset: Some(1), ..run_req(Op::RunWait, "one") }, "takes no `offset`"),
+            (Request { timeout: Some(1), ..run_req(Op::RunLogs, "one") }, "takes no `timeout`"),
+            (Request { argv: argv(&["x"]), ..run_req(Op::RunLs, "one") }, "`run-ls` takes no `arg`"),
+            (Request { argv: argv(&["x"]), ..req(Op::Stop, None, Some("one")) }, "`stop` takes no `arg`"),
+            (Request { id: Some(RUN_ID.into()), ..req(Op::Ls, None, None) }, "`ls` takes no `id`"),
+            (r_with(Op::Exec, "one"), "takes no `branch`/`env`"),
+        ];
+        for (r, needle) in cases {
+            let mut fake = Fake::new();
+            let resp = call(&s, "d", r, &mut fake);
+            assert_eq!(resp.status, Status::Usage, "{r:?}: {resp:?}");
+            assert!(resp.body.contains(needle), "{r:?}: {resp:?}");
+            assert!(fake.execs.is_empty());
+        }
+    }
+
+    /// The real executor end to end: a throwaway container with the helper,
+    /// a fabricated child instance owning it, and every run op through
+    /// `handle_with` (argv from `exec_argv`, the helper's `run` commands).
+    #[test_utils::docker_test(helper)]
+    fn runs_in_a_child_container_with_docker() -> Result<(), &'static str> {
+        use std::process::Command;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let name = format!("devsandbox-dispatch-runs-test-{stamp}");
+        let up = Command::new("docker")
+            .args(["run", "-d", "--rm", "--name", &name, "alpine:3.20", "sleep", "300"])
+            .output()
+            .unwrap();
+        assert!(up.status.success(), "{}", String::from_utf8_lossy(&up.stderr));
+        let cleanup = || {
+            let _ = Command::new("docker").args(["rm", "-f", &name]).output();
+        };
+        crate::test_support::with_cleanup(cleanup, || {
+            let arch = crate::devsbd::install(&name, None).unwrap();
+            let mut s = state();
+            let child = s.instances.get_mut("web-one").unwrap();
+            child.container = name.clone();
+            child.workspace = "/tmp".into();
+            child.devsbd_arch = Some(arch);
+            let config = Config::parse(CONFIG).unwrap();
+            let call = |r: Request| handle_with(&s, &config, "d", &r, &mut Subprocess);
+
+            let exec = Request {
+                argv: argv(&["sh", "-c", "echo out; pwd; exit 4"]),
+                ..req(Op::Exec, None, Some("one"))
+            };
+            let resp = call(exec);
+            assert_eq!(resp.status, Status::Ok, "{resp:?}");
+            let id = resp.body;
+            assert!(control::valid_run_id(&id), "{id}");
+            let with_id = |op, timeout| Request {
+                id: Some(id.clone()),
+                timeout,
+                ..req(op, None, Some("one"))
+            };
+            let resp = call(with_id(Op::RunWait, Some(30)));
+            assert_eq!(resp, Response::new(Status::Ok, "exited 4"));
+            let resp = call(with_id(Op::RunLogs, None));
+            assert_eq!(resp, Response::new(Status::Ok, "9\nout\n/tmp\n"), "cwd is the workspace");
+            let resp = call(Request { offset: Some(4), ..with_id(Op::RunLogs, None) });
+            assert_eq!(resp, Response::new(Status::Ok, "9\n/tmp\n"));
+            let resp = call(req(Op::RunLs, None, Some("one")));
+            assert_eq!(resp.status, Status::Ok);
+            assert!(resp.body.starts_with(&format!("{id} exited 4 ")), "{resp:?}");
+            // An unknown run is a clean failure from the helper.
+            let resp = call(Request { id: Some("0000000000-0000".into()), ..with_id(Op::RunWait, None) });
+            assert_eq!(resp.status, Status::Failed);
+            assert!(resp.body.contains("no run `0000000000-0000`"), "{resp:?}");
+        });
+        Ok(())
     }
 
     #[test]
