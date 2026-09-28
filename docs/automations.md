@@ -278,10 +278,10 @@ Landed limitations: the hook runs as the container's user, so a non-root `contai
   shared fixture; `#[test_utils::docker_test(helper)]`: a runtime-mode
   container restarted with `docker restart` runs `postStartCommand` again.
 
-### Step 4 — `devsbd notify`: helper side
+### Step 4 — `devsbd notify`: helper side [x]
 
 - `devsbd notify [--level info|warn|error] [--link URL] [--key K] <msg>`:
-  writes one record to `/var/lib/devsandbox/outbox/<ts>-<rand>` (atomic
+  writes one record to `/var/lib/devsandbox/outbox/<secs>-<nanos>-<pid>` (atomic
   rename), then pokes the daemon over a new client socket
   (`/run/devsandbox/api.sock`, like `AGENT_SOCK`, `devsbd/src/daemon.rs:145`).
   Succeeds even with no daemon (the record is queued).

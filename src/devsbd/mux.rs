@@ -9,9 +9,12 @@
 //! host will need a named-pipe stream here (docs/sandbox-helper.md).
 //!
 //! Two kinds of stream share the connection:
-//! - **Legacy** (`Open`, ssh-agent): `Data` is written straight into the local
-//!   socket on the frame-reader thread, and local EOF sends `Close`. Small
-//!   request/response traffic, kept exactly as it was.
+//! - **Legacy** (`Open`, ssh-agent, notify): `Data` is written straight into the
+//!   local socket on the frame-reader thread, and local EOF sends `Close`. Small
+//!   request/response traffic, kept as it was, plus one addition: a peer `Eof`
+//!   `shutdown(Write)`s the local socket, so a sender that writes its request
+//!   with `Mux::send` and then `Eof` (the daemon's notify flush) still gets the
+//!   reply. Never sent on agent streams, so their behavior is unchanged.
 //! - **Flow-controlled** (`Connect`, forwarded TCP): per-direction credit
 //!   (`Window`), a per-stream write queue drained by its own thread so the
 //!   reader never blocks, and half-close (`Eof`). One slow local reader can't
@@ -808,9 +811,21 @@ impl Mux {
                     }
                 }
                 Frame::Eof { stream } => {
-                    if let Some(flow) = self.flow(stream) {
-                        flow.state.lock().unwrap().eof_received = true;
-                        flow.cv.notify_all();
+                    let entry = match self.streams.lock().unwrap().get(&stream) {
+                        Some(Entry::Legacy(conn)) => Ok(Arc::clone(conn)),
+                        Some(Entry::Flow(flow)) => Err(Arc::clone(flow)),
+                        None => continue,
+                    };
+                    match entry {
+                        // Legacy half-close: the request is complete, the
+                        // reply direction stays open (see the module doc).
+                        Ok(conn) => {
+                            let _ = conn.shutdown(Shutdown::Write);
+                        }
+                        Err(flow) => {
+                            flow.state.lock().unwrap().eof_received = true;
+                            flow.cv.notify_all();
+                        }
                     }
                 }
                 Frame::Close { stream, reason } => {
@@ -1052,6 +1067,38 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         panic!("stream still registered after client closed");
+    }
+
+    /// Legacy half-close: a request sent as `Data` + `Eof` reaches the host's
+    /// local end as bytes then EOF, and the reply still flows back — the notify
+    /// exchange (the local-EOF path would send `Close` and lose the reply).
+    #[test]
+    fn eof_half_closes_a_legacy_stream_and_the_reply_flows_back() {
+        let (d_r, h_w) = std::io::pipe().unwrap();
+        let (h_r, d_w) = std::io::pipe().unwrap();
+        let daemon = Mux::new(d_w);
+        let host = Mux::new(h_w);
+        let d = Arc::clone(&daemon);
+        std::thread::spawn(move || d.serve(d_r, |_, _| None));
+        std::thread::spawn(move || {
+            host.serve(h_r, |_, _| {
+                let (ours, mut handler) = UnixStream::pair().unwrap();
+                std::thread::spawn(move || {
+                    let mut req = Vec::new();
+                    handler.read_to_end(&mut req).unwrap();
+                    handler.write_all(format!("got {}", req.len()).as_bytes()).unwrap();
+                });
+                Some(ours.into())
+            })
+        });
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+        ours.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        daemon.attach(1, theirs, Some(channel::NOTIFY)).unwrap();
+        daemon.send(&Frame::Data { stream: 1, bytes: b"hello".to_vec() }).unwrap();
+        daemon.send(&Frame::Eof { stream: 1 }).unwrap();
+        let mut reply = String::new();
+        ours.read_to_string(&mut reply).unwrap();
+        assert_eq!(reply, "got 5");
     }
 
     #[test]

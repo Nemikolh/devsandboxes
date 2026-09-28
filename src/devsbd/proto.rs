@@ -47,6 +47,10 @@ pub mod channel {
     pub const SSH_AGENT: u8 = 1;
     #[allow(dead_code)] // reserved for API proxying (docs/sandbox-helper.md)
     pub const HTTP_PROXY: u8 = 2;
+    /// A notification record from the outbox (`notify.rs`): the daemon sends
+    /// the record then `Eof`; the host replies `notify::REPLY_OK`. Only opened
+    /// toward a host that advertised `caps::NOTIFY`.
+    pub const NOTIFY: u8 = 3;
 }
 
 const KIND_HELLO: u8 = 0;
@@ -71,6 +75,8 @@ pub mod caps {
     pub const TCP_FORWARD: u32 = 1 << 0;
     /// Host serves ssh-agent streams for this bridge.
     pub const SSH_AGENT: u32 = 1 << 1;
+    /// Host serves notify streams (`channel::NOTIFY`) for this bridge.
+    pub const NOTIFY: u32 = 1 << 2;
 }
 
 /// Starting per-direction credit for a flow-controlled stream: a sender may
@@ -327,6 +333,7 @@ mod tests {
         vec![
             Frame::Hello { version: VERSION, hash: "ab".repeat(32), caps: 0 },
             Frame::Open { stream: 7, channel: channel::SSH_AGENT },
+            Frame::Open { stream: 9, channel: channel::NOTIFY },
             Frame::Data { stream: 7, bytes: b"\x00\x00\x00\x01\x0b".to_vec() },
             Frame::Data { stream: u32::MAX, bytes: Vec::new() },
             Frame::Close { stream: 7, reason: String::new() },
@@ -334,7 +341,7 @@ mod tests {
             Frame::Connect { stream: 0x8000_0001, host: "postgres".into(), port: 5432 },
             Frame::Window { stream: 7, credit: INITIAL_WINDOW },
             Frame::Eof { stream: 7 },
-            Frame::Caps(caps::TCP_FORWARD | caps::SSH_AGENT),
+            Frame::Caps(caps::TCP_FORWARD | caps::SSH_AGENT | caps::NOTIFY),
             Frame::Ping(b"t".to_vec()),
             Frame::Pong(Vec::new()),
             Frame::Quit,

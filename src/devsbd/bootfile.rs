@@ -13,12 +13,15 @@
 //! cmd sh\0-c\0echo hi      one per command, run sequentially; argv split on NUL
 //! ```
 //!
-//! Values are escaped so they can hold anything: `\\` → `\`, `\n` → newline,
-//! `\0` → NUL (so a raw NUL is only ever `cmd`'s argv separator). Any other
-//! escape, an unknown key, or a repeated `user`/`cwd` is a parse error:
+//! Values are escaped (`escape.rs`) so they can hold anything: `\\` → `\`,
+//! `\n` → newline, `\0` → NUL (so a raw NUL is only ever `cmd`'s argv
+//! separator). Any other escape, an unknown key, or a repeated `user`/`cwd` is
+//! a parse error:
 //! host and helper ship together, so a mismatch is a bug, not a version skew
 //! to tolerate. Empty lines are ignored; a `cmd` with no value has no argv
 //! (and is skipped by the runner, like an empty lifecycle argv).
+
+use super::escape::{escape, unescape};
 
 /// Where the host writes the boot file.
 pub const PATH: &str = "/run/devsandbox/boot";
@@ -31,35 +34,6 @@ pub struct BootSpec {
     pub cwd: Option<String>,
     pub env: Vec<(String, String)>,
     pub cmds: Vec<Vec<String>>,
-}
-
-fn escape(value: &str, out: &mut String) {
-    for c in value.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\0' => out.push_str("\\0"),
-            c => out.push(c),
-        }
-    }
-}
-
-fn unescape(value: &str) -> Result<String, String> {
-    let mut out = String::with_capacity(value.len());
-    let mut chars = value.chars();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            out.push(c);
-            continue;
-        }
-        match chars.next() {
-            Some('\\') => out.push('\\'),
-            Some('n') => out.push('\n'),
-            Some('0') => out.push('\0'),
-            other => return Err(format!("bad escape `\\{}`", other.map(String::from).unwrap_or_default())),
-        }
-    }
-    Ok(out)
 }
 
 pub fn serialize(spec: &BootSpec) -> String {

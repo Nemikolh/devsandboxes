@@ -3,21 +3,29 @@
 //! recent live bridge (`devsbd bridge`, attached over the control socket),
 //! which relays it to the host.
 //!
+//! It also drains the notification outbox (`outbox.rs`): a flusher thread
+//! sends each queued record to the newest bridge whose host serves `NOTIFY`,
+//! woken by `devsbd notify`'s poke on the API socket, by bridges attaching or
+//! their host caps arriving, and by a periodic retry.
+//!
 //! One daemon per container, per build: the pidfile records the owner's build
 //! hash, and a daemon of a different build (the host rewrote the binary, e.g.
 //! `start` on a running container after a CLI upgrade) makes the running one
 //! exit and takes over.
 
 use std::fs::{self, File, OpenOptions, TryLockError};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::mux::{self, Conn, Mux};
+use crate::notify;
+use crate::outbox;
 use crate::proto::{self, caps, channel, Frame};
 
 pub const DIR: &str = "/run/devsandbox";
@@ -26,6 +34,23 @@ const PIDFILE: &str = "/run/devsandbox/devsbd.pid";
 /// Same path the bind-mount design uses, so `SSH_AUTH_SOCK` is identical in
 /// both modes (docs/sandbox-helper.md).
 const AGENT_SOCK: &str = "/run/devsandbox/ssh-agent.sock";
+/// Client socket for in-container tools (mode 0666, like the agent socket).
+/// Each connection's first byte selects the request: [`API_POKE`] today; the
+/// control API (docs/automations.md, step 8) will add verbs here.
+pub const API_SOCK: &str = "/run/devsandbox/api.sock";
+/// "The outbox has new records": wakes the flusher. No reply.
+pub const API_POKE: u8 = b'n';
+
+/// How long an API client may take to send its first byte.
+const API_READ_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Periodic outbox retry, for records a failed flush left behind (a host that
+/// never replied, a bridge that died mid-flush).
+const FLUSH_RETRY: Duration = Duration::from_secs(30);
+
+/// How long the flusher waits for the host's `ok` on one record before
+/// giving up on this flush.
+const NOTIFY_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long an agent client that arrives with no bridge attached waits for
 /// one. The host starts a CLI `exec`'s bridge concurrently with the command
@@ -40,51 +65,82 @@ const TAKEOVER: Duration = Duration::from_secs(3);
 /// (one per `Connect`) forever.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Whether a bridge may carry ssh-agent streams, from what it has told us so
-/// far. `bridge_caps` is the caps in the *bridge binary's* `Hello` to us;
-/// `host_caps` is its host's `Caps` frame, `None` until one arrives.
+/// The caps a bridge's host serves, as far as we know from what it has told
+/// us so far; `None` while that's still unknown. `bridge_caps` is the caps in
+/// the *bridge binary's* `Hello` to us; `host_caps` is its host's `Caps`
+/// frame, `None` until one arrives.
 ///
 /// The daemon registers a bridge right after the bridge↔daemon handshake, but
 /// the host's `Caps` only comes after the bridge↔host handshake (a `docker
 /// exec` round trip later). So "no `Caps` yet" is ambiguous, and the bridge's
 /// own `Hello` caps settle it:
 /// - `bridge_caps == 0`: a pre-forwarding bridge, whose host never sends `Caps`
-///   → capable (the old behavior).
+///   → `SSH_AGENT` only (the old behavior: agent-capable, nothing newer).
 /// - `bridge_caps != 0`, no `Caps` yet: a current host whose `Caps` is in
-///   flight → *not* capable yet. Counting it as capable would route agent
-///   clients to a just-spawned `devsandbox port` bridge that refuses them,
-///   breaking ssh in the container whenever a forward (re)connects.
-/// - `Caps` received → capable iff it has `SSH_AGENT`.
+///   flight → unknown, *not* capable of anything yet. Counting it as
+///   agent-capable would route agent clients to a just-spawned `devsandbox
+///   port` bridge that refuses them, breaking ssh in the container whenever a
+///   forward (re)connects.
+/// - `Caps` received → exactly those.
 ///
 /// Accepted gap: an older CLI exec'ing a newer helper sends no `Caps` behind a
 /// capable bridge, so that bridge is never used for agent routing (the daemon
 /// falls back to others). Mixed CLI builds already evict each other on
 /// takeover (docs/sandbox-helper.md), so it's rare.
-fn agent_capable(bridge_caps: u32, host_caps: Option<u32>) -> bool {
+fn known_host_caps(bridge_caps: u32, host_caps: Option<u32>) -> Option<u32> {
     match host_caps {
-        Some(c) => c & caps::SSH_AGENT != 0,
-        None => bridge_caps == 0,
+        Some(c) => Some(c),
+        None if bridge_caps == 0 => Some(caps::SSH_AGENT),
+        None => None,
     }
 }
 
-/// Index of the newest agent-capable bridge in a per-bridge list of
+/// Whether a bridge's host is known to serve `cap` streams (`known_host_caps`).
+fn capable(cap: u32, bridge_caps: u32, host_caps: Option<u32>) -> bool {
+    known_host_caps(bridge_caps, host_caps).is_some_and(|c| c & cap != 0)
+}
+
+/// Index of the newest bridge capable of `cap` in a per-bridge list of
 /// `(bridge_caps, host_caps)` (oldest first), or `None` when none qualify.
 /// Pure so the routing rule is testable without a daemon.
-fn agent_route(bridges: &[(u32, Option<u32>)]) -> Option<usize> {
-    bridges.iter().rposition(|&(b, h)| agent_capable(b, h))
+fn route_index(cap: u32, bridges: &[(u32, Option<u32>)]) -> Option<usize> {
+    bridges.iter().rposition(|&(b, h)| capable(cap, b, h))
+}
+
+/// A wake-up flag for the outbox flusher: `fire` any number of times, the
+/// next `wait` consumes them all. Firing while a flush runs makes the flusher
+/// go around once more, so no trigger is lost.
+#[derive(Default)]
+struct Trigger {
+    fired: Mutex<bool>,
+    cv: Condvar,
+}
+
+impl Trigger {
+    fn fire(&self) {
+        *self.fired.lock().unwrap() = true;
+        self.cv.notify_all();
+    }
+
+    /// Wait until fired or `timeout` passes; `true` when fired.
+    fn wait(&self, timeout: Duration) -> bool {
+        let fired = self.fired.lock().unwrap();
+        let (mut fired, _) = self.cv.wait_timeout_while(fired, timeout, |f| !*f).unwrap();
+        std::mem::replace(&mut *fired, false)
+    }
 }
 
 /// One attached bridge: its mux and the caps its binary sent in `Hello` (see
-/// `agent_capable`).
+/// `known_host_caps`).
 struct Attached {
     mux: Arc<Mux>,
     hello_caps: u32,
 }
 
-/// Connected bridges, oldest first. Agent routing goes to the newest
-/// agent-capable one; keeping the rest means a short-lived bridge (a CLI
-/// `exec`) ending falls back to a long-lived one (the TUI's) instead of leaving
-/// no route.
+/// Connected bridges, oldest first. A stream on a channel is routed to the
+/// newest bridge whose host serves it; keeping the rest means a short-lived
+/// bridge (a CLI `exec`) ending falls back to a long-lived one (the TUI's)
+/// instead of leaving no route.
 #[derive(Default)]
 struct Bridges {
     list: Mutex<Vec<Attached>>,
@@ -93,20 +149,23 @@ struct Bridges {
     /// `Caps` arrives, after it attaches). Notifiers take `list` first so a
     /// wake-up can't slip between `route`'s predicate check and its wait.
     arrived: Condvar,
+    /// Fired on the same events as `arrived` (and by pokes on `API_SOCK`): a
+    /// bridge that can take notifications may have appeared.
+    flush: Trigger,
 }
 
 impl Bridges {
-    /// The newest agent-capable bridge, waiting up to `HOLD` for one to appear.
-    /// Waits while no attached bridge is agent-capable, not merely while the
-    /// list is empty, so a lone non-agent (or pending) bridge doesn't cut the
+    /// The newest bridge capable of `cap`, waiting up to `hold` for one to
+    /// appear. Waits while no attached bridge is capable, not merely while the
+    /// list is empty, so a lone incapable (or pending) bridge doesn't cut the
     /// hold short.
-    fn route(&self) -> Option<Arc<Mux>> {
+    fn route(&self, cap: u32, hold: Duration) -> Option<Arc<Mux>> {
         let list = self.list.lock().unwrap();
         let (list, _) = self
             .arrived
-            .wait_timeout_while(list, HOLD, |l| agent_route(&caps_of(l)).is_none())
+            .wait_timeout_while(list, hold, |l| route_index(cap, &caps_of(l)).is_none())
             .unwrap();
-        agent_route(&caps_of(&list)).map(|i| Arc::clone(&list[i].mux))
+        route_index(cap, &caps_of(&list)).map(|i| Arc::clone(&list[i].mux))
     }
 
     /// Register a bridge that just finished its handshake with us. Call before
@@ -118,14 +177,17 @@ impl Bridges {
         mux.on_caps(move |_| b.wake());
         this.list.lock().unwrap().push(Attached { mux: Arc::clone(mux), hello_caps });
         this.arrived.notify_all();
+        this.flush.fire();
     }
 
-    /// Wake held agent clients. Takes `list` (briefly) before notifying: the
-    /// state change (a push, or the mux's recorded `Caps`) is already visible,
-    /// so a `route` either sees it in its predicate or is already waiting.
+    /// Wake held agent clients and the flusher. Takes `list` (briefly) before
+    /// notifying: the state change (a push, or the mux's recorded `Caps`) is
+    /// already visible, so a `route` either sees it in its predicate or is
+    /// already waiting.
     fn wake(&self) {
         drop(self.list.lock().unwrap());
         self.arrived.notify_all();
+        self.flush.fire();
     }
 }
 
@@ -150,12 +212,34 @@ pub fn run(hash: &str) -> io::Result<()> {
         }
     };
 
+    let api = match listen(API_SOCK, 0o666) {
+        Ok(l) => Some(l),
+        Err(e) => {
+            eprintln!("devsbd: api socket {API_SOCK}: {e}");
+            None
+        }
+    };
+    // Normally made by the installer; the daemon runs as root, so it can
+    // repair a missing one. Best-effort: `notify` reports its own failure.
+    let _ = outbox::ensure_dir(Path::new(notify::OUTBOX));
+
     let bridges = Arc::new(Bridges::default());
+    // Daemon-allocated ids start at 1; 0 is reserved for control frames and the
+    // high bit for host-allocated ids, so ids wrap within 1..2^31 (never 0,
+    // high bit never set — see the host's `Open` policy in mux.rs). Shared by
+    // agent streams and notify streams.
+    let ids = Arc::new(AtomicU32::new(1));
     let b = Arc::clone(&bridges);
     let hash = hash.to_string();
     std::thread::spawn(move || accept_bridges(ctl, b, &hash));
+    let (b, i) = (Arc::clone(&bridges), Arc::clone(&ids));
+    std::thread::spawn(move || flush_loop(Path::new(notify::OUTBOX), &b, &i));
+    if let Some(api) = api {
+        let b = Arc::clone(&bridges);
+        std::thread::spawn(move || accept_api_clients(api, b));
+    }
     match agent {
-        Some(agent) => accept_agent_clients(agent, bridges),
+        Some(agent) => accept_agent_clients(agent, bridges, ids),
         None => loop {
             std::thread::park();
         },
@@ -228,7 +312,8 @@ fn accept_bridges(ctl: UnixListener, bridges: Arc<Bridges>, hash: &str) {
 /// becomes the newest route until it disconnects.
 fn serve_bridge(mut conn: UnixStream, bridges: Arc<Bridges>, hash: &str) {
     // The bridge binary's own `Hello` caps: nonzero means its host will send
-    // `Caps`, so until then the bridge isn't agent-capable (`agent_capable`).
+    // `Caps`, so until then the bridge isn't capable of anything
+    // (`known_host_caps`).
     let hello_caps = match proto::read_frame(&mut conn) {
         Ok(Some(Frame::Quit)) => std::process::exit(0),
         Ok(Some(Frame::Hello { version, caps: bridge_caps, .. })) => {
@@ -302,11 +387,7 @@ fn dial_error(addr: &str, e: &io::Error) -> String {
     }
 }
 
-fn accept_agent_clients(agent: UnixListener, bridges: Arc<Bridges>) {
-    // Daemon-allocated ids start at 1; 0 is reserved for control frames and the
-    // high bit for host-allocated ids, so ids wrap within 1..2^31 (never 0,
-    // high bit never set — see the host's `Open` policy in mux.rs).
-    let next = Arc::new(AtomicU32::new(1));
+fn accept_agent_clients(agent: UnixListener, bridges: Arc<Bridges>, next: Arc<AtomicU32>) {
     for conn in agent.incoming() {
         let Ok(conn) = conn else { continue };
         let bridges = Arc::clone(&bridges);
@@ -315,10 +396,106 @@ fn accept_agent_clients(agent: UnixListener, bridges: Arc<Bridges>) {
         std::thread::spawn(move || {
             // No bridge even after HOLD: dropping `conn` closes it, and ssh
             // sees a refusing agent.
-            let Some(mux) = bridges.route() else { return };
+            let Some(mux) = bridges.route(caps::SSH_AGENT, HOLD) else { return };
             let stream = next_stream_id(&next);
             let _ = mux.attach(stream, conn, Some(channel::SSH_AGENT));
         });
+    }
+}
+
+/// Serve `API_SOCK`: read each client's first byte and dispatch on it. A
+/// thread per client so a silent one can't stall the others (`API_READ_TIMEOUT`
+/// bounds it anyway), and so a later control request can take its time.
+fn accept_api_clients(api: UnixListener, bridges: Arc<Bridges>) {
+    for conn in api.incoming() {
+        let Ok(mut conn) = conn else { continue };
+        let bridges = Arc::clone(&bridges);
+        std::thread::spawn(move || {
+            let _ = conn.set_read_timeout(Some(API_READ_TIMEOUT));
+            let mut verb = [0u8; 1];
+            if conn.read_exact(&mut verb).is_err() {
+                return;
+            }
+            match verb[0] {
+                API_POKE => bridges.flush.fire(),
+                // Reserved for the control API; dropping `conn` closes it.
+                _ => {}
+            }
+        });
+    }
+}
+
+/// The flusher thread: flush now (records queued while no daemon ran), then
+/// again on every trigger (`Bridges::flush`) or after `FLUSH_RETRY`.
+fn flush_loop(dir: &Path, bridges: &Bridges, ids: &AtomicU32) {
+    loop {
+        flush(dir, bridges, ids, NOTIFY_REPLY_TIMEOUT);
+        bridges.flush.wait(FLUSH_RETRY);
+    }
+}
+
+/// Send queued records oldest first, each on its own `Open(NOTIFY)` stream to
+/// the newest bridge whose host serves notify, deleting a file only once its
+/// host replied `ok`. Stops at the first failure (no capable bridge, no
+/// reply, I/O error), leaving the rest for the next trigger or retry, so order
+/// is kept. A file with bad content is moved aside instead, so it can't block
+/// the queue forever. Returns how many records were delivered.
+fn flush(dir: &Path, bridges: &Bridges, ids: &AtomicU32, timeout: Duration) -> usize {
+    let Ok(queue) = outbox::pending(dir) else { return 0 };
+    let mut sent = 0;
+    for path in queue {
+        // Routed per record: the bridge used for the last one may be gone.
+        let Some(mux) = bridges.route(caps::NOTIFY, Duration::ZERO) else { break };
+        let record = match outbox::load(&path) {
+            Ok(Ok(record)) => record,
+            Ok(Err(_)) => {
+                let _ = outbox::move_aside(&path);
+                continue;
+            }
+            Err(_) => break,
+        };
+        if send_record(&mux, next_stream_id(ids), &record, timeout).is_err() {
+            break;
+        }
+        // Delivered but undeletable would resend it forever; stop instead.
+        if fs::remove_file(&path).is_err() {
+            break;
+        }
+        sent += 1;
+    }
+    sent
+}
+
+/// One notify exchange on `stream`: `Open(NOTIFY)`, the record as one `Data`,
+/// `Eof`, then wait up to `timeout` for the host's `notify::REPLY_OK`. The
+/// reply comes back through a socket pair attached like an agent client's;
+/// the request goes out with `Mux::send` rather than through that pair, since
+/// a legacy stream turns local EOF into `Close` (which would drop the reply),
+/// while a peer `Eof` half-closes it (mux.rs module doc). Dropping our end on
+/// return closes the stream if the host hasn't already.
+fn send_record(mux: &Arc<Mux>, stream: u32, record: &[u8], timeout: Duration) -> io::Result<()> {
+    let (mut ours, theirs) = UnixStream::pair()?;
+    mux.attach(stream, theirs, Some(channel::NOTIFY))?;
+    mux.send(&Frame::Data { stream, bytes: record.to_vec() })?;
+    mux.send(&Frame::Eof { stream })?;
+    let deadline = Instant::now() + timeout;
+    let mut reply = Vec::new();
+    let mut buf = [0u8; 16];
+    while reply.len() < notify::REPLY_OK.len() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        ours.set_read_timeout(Some(left))?;
+        match ours.read(&mut buf)? {
+            0 => return Err(io::Error::other("notify stream closed without a reply")),
+            n => reply.extend_from_slice(&buf[..n]),
+        }
+    }
+    if reply.starts_with(notify::REPLY_OK) {
+        Ok(())
+    } else {
+        Err(io::Error::other("unexpected notify reply"))
     }
 }
 
@@ -357,17 +534,17 @@ mod tests {
         const TF: u32 = caps::TCP_FORWARD;
         // Pre-forwarding bridge (Hello caps 0), no `Caps`: its host never sends
         // one, so it's capable (the old behavior).
-        assert!(agent_capable(0, None));
+        assert!(capable(caps::SSH_AGENT, 0, None));
         // Current bridge (Hello caps != 0), `Caps` still in flight: pending,
         // not capable — the window where a new `devsandbox port` bridge would
         // otherwise steal agent streams.
-        assert!(!agent_capable(TF, None));
+        assert!(!capable(caps::SSH_AGENT, TF, None));
         // `Caps` received: capable iff SSH_AGENT, whatever the Hello said.
         for bridge in [0, TF] {
-            assert!(agent_capable(bridge, Some(caps::SSH_AGENT)));
-            assert!(agent_capable(bridge, Some(caps::SSH_AGENT | TF)));
-            assert!(!agent_capable(bridge, Some(0)));
-            assert!(!agent_capable(bridge, Some(TF)));
+            assert!(capable(caps::SSH_AGENT, bridge, Some(caps::SSH_AGENT)));
+            assert!(capable(caps::SSH_AGENT, bridge, Some(caps::SSH_AGENT | TF)));
+            assert!(!capable(caps::SSH_AGENT, bridge, Some(0)));
+            assert!(!capable(caps::SSH_AGENT, bridge, Some(TF)));
         }
     }
 
@@ -394,14 +571,14 @@ mod tests {
         Bridges::attach(&bridges, &old, 0);
         let (_pending, _w) = pending_bridge(&bridges);
         let t = std::time::Instant::now();
-        assert!(Arc::ptr_eq(&bridges.route().unwrap(), &old));
+        assert!(Arc::ptr_eq(&bridges.route(caps::SSH_AGENT, HOLD).unwrap(), &old));
         assert!(t.elapsed() < HOLD / 2, "no hold when a capable bridge exists");
 
         // Only a pending bridge: a held client is woken by its `Caps(SSH_AGENT)`.
         let bridges = Arc::new(Bridges::default());
         let (pending, mut w) = pending_bridge(&bridges);
         let b = Arc::clone(&bridges);
-        let held = std::thread::spawn(move || (b.route(), std::time::Instant::now()));
+        let held = std::thread::spawn(move || (b.route(caps::SSH_AGENT, HOLD), std::time::Instant::now()));
         std::thread::sleep(Duration::from_millis(100));
         let sent = std::time::Instant::now();
         proto::write_frame(&mut w, &Frame::Caps(caps::SSH_AGENT)).unwrap();
@@ -413,7 +590,7 @@ mod tests {
         let bridges = Arc::new(Bridges::default());
         let (_pending, mut w) = pending_bridge(&bridges);
         proto::write_frame(&mut w, &Frame::Caps(0)).unwrap();
-        assert!(bridges.route().is_none());
+        assert!(bridges.route(caps::SSH_AGENT, HOLD).is_none());
     }
 
     #[test]
@@ -437,19 +614,179 @@ mod tests {
         const TF: u32 = caps::TCP_FORWARD;
         const AG: Option<u32> = Some(caps::SSH_AGENT);
         // Empty list, or one made only of non-agent / pending bridges: no route.
-        assert_eq!(agent_route(&[]), None);
-        assert_eq!(agent_route(&[(TF, Some(TF)), (TF, Some(0)), (TF, None)]), None);
+        assert_eq!(route_index(caps::SSH_AGENT, &[]), None);
+        assert_eq!(route_index(caps::SSH_AGENT, &[(TF, Some(TF)), (TF, Some(0)), (TF, None)]), None);
         // Newest capable wins over an older capable one.
-        assert_eq!(agent_route(&[(0, None), (0, None)]), Some(1));
-        assert_eq!(agent_route(&[(TF, AG), (TF, AG)]), Some(1));
+        assert_eq!(route_index(caps::SSH_AGENT, &[(0, None), (0, None)]), Some(1));
+        assert_eq!(route_index(caps::SSH_AGENT, &[(TF, AG), (TF, AG)]), Some(1));
         // A newer non-agent bridge is skipped for the older agent bridge — the
         // fix for a `devsandbox port` stealing ssh routing.
-        assert_eq!(agent_route(&[(0, None), (TF, Some(0))]), Some(0));
-        assert_eq!(agent_route(&[(TF, AG), (TF, Some(0)), (TF, Some(TF))]), Some(0));
+        assert_eq!(route_index(caps::SSH_AGENT, &[(0, None), (TF, Some(0))]), Some(0));
+        assert_eq!(route_index(caps::SSH_AGENT, &[(TF, AG), (TF, Some(0)), (TF, Some(TF))]), Some(0));
         // A newer bridge whose `Caps` is still in flight is skipped too.
-        assert_eq!(agent_route(&[(TF, AG), (TF, None)]), Some(0));
-        assert_eq!(agent_route(&[(0, None), (TF, None)]), Some(0));
+        assert_eq!(route_index(caps::SSH_AGENT, &[(TF, AG), (TF, None)]), Some(0));
+        assert_eq!(route_index(caps::SSH_AGENT, &[(0, None), (TF, None)]), Some(0));
         // The newest capable among a mix.
-        assert_eq!(agent_route(&[(TF, AG), (TF, Some(0)), (0, None), (TF, None)]), Some(2));
+        assert_eq!(route_index(caps::SSH_AGENT, &[(TF, AG), (TF, Some(0)), (0, None), (TF, None)]), Some(2));
+    }
+
+    #[test]
+    fn notify_route_needs_the_hosts_notify_cap() {
+        const TF: u32 = caps::TCP_FORWARD;
+        const NO: u32 = caps::NOTIFY;
+        // A pre-forwarding host is agent-only: never a notify route.
+        assert!(!capable(NO, 0, None));
+        // Pending, or a current host without NOTIFY: not capable.
+        assert!(!capable(NO, TF, None));
+        assert!(!capable(NO, TF, Some(caps::SSH_AGENT)));
+        assert!(capable(NO, TF, Some(NO)));
+        assert!(capable(NO, 0, Some(NO | caps::SSH_AGENT)));
+        // Agent and notify route independently: the newest of each.
+        let list = [(TF, Some(NO)), (TF, Some(caps::SSH_AGENT)), (0, None)];
+        assert_eq!(route_index(NO, &list), Some(0));
+        assert_eq!(route_index(caps::SSH_AGENT, &list), Some(2));
+    }
+
+    #[test]
+    fn trigger_coalesces_and_is_consumed_by_wait() {
+        let t = Trigger::default();
+        assert!(!t.wait(Duration::ZERO));
+        t.fire();
+        t.fire();
+        assert!(t.wait(Duration::ZERO));
+        assert!(!t.wait(Duration::ZERO), "one wait consumes every firing");
+    }
+
+    /// A bridge attached to `bridges` whose far end is a real host-side mux:
+    /// it sends `Caps(host_caps)`, and each `Open(NOTIFY)` gets a handler
+    /// that reads the record to EOF, reports it on the returned channel, then
+    /// replies `ok` (or, with `reply: false`, holds the stream open silently).
+    /// Other channels are refused.
+    fn host_bridge(bridges: &Arc<Bridges>, host_caps: u32, reply: bool) -> std::sync::mpsc::Receiver<Vec<u8>> {
+        let (d_r, h_w) = std::io::pipe().unwrap();
+        let (h_r, d_w) = std::io::pipe().unwrap();
+        let daemon = Mux::new(d_w);
+        let host = Mux::new(h_w);
+        Bridges::attach(bridges, &daemon, caps::TCP_FORWARD);
+        std::thread::spawn(move || daemon.serve_with(d_r, |_, _| None, |_, _, _, _reply| {}));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let h = Arc::clone(&host);
+        std::thread::spawn(move || {
+            h.serve(h_r, move |_, ch| {
+                if ch != channel::NOTIFY {
+                    return None;
+                }
+                let (ours, mut handler) = UnixStream::pair().unwrap();
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    let mut record = Vec::new();
+                    handler.read_to_end(&mut record).unwrap();
+                    let _ = tx.send(record);
+                    if reply {
+                        let _ = handler.write_all(notify::REPLY_OK);
+                    } else {
+                        std::thread::sleep(Duration::from_secs(5));
+                    }
+                });
+                Some(ours.into())
+            })
+        });
+        host.send(&Frame::Caps(host_caps)).unwrap();
+        rx
+    }
+
+    fn record(at: u64, msg: &str) -> notify::Record {
+        notify::Record { level: notify::Level::Info, key: None, link: None, msg: msg.into(), at }
+    }
+
+    /// Wait (bounded) for the host's `Caps` to land, so `flush`'s zero-hold
+    /// route sees the bridge.
+    fn wait_routable(bridges: &Bridges, cap: u32) {
+        assert!(bridges.route(cap, Duration::from_secs(5)).is_some(), "bridge never became capable");
+    }
+
+    #[test]
+    fn flush_sends_oldest_first_and_deletes_on_ok() {
+        let dir = outbox::test_dir("flush-ok");
+        let b = outbox::enqueue(&dir, &record(20, "second"), 0).unwrap();
+        let a = outbox::enqueue(&dir, &record(10, "first"), 0).unwrap();
+        let bad = dir.join("0000000015-000000000-1");
+        fs::write(&bad, "garbage").unwrap();
+        let bridges = Arc::new(Bridges::default());
+        let got = host_bridge(&bridges, caps::NOTIFY, true);
+        wait_routable(&bridges, caps::NOTIFY);
+
+        let ids = AtomicU32::new(1);
+        assert_eq!(flush(&dir, &bridges, &ids, Duration::from_secs(5)), 2);
+        let first = got.recv_timeout(Duration::from_secs(5)).unwrap();
+        let second = got.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(notify::decode(std::str::from_utf8(&first).unwrap()), Ok(record(10, "first")));
+        assert_eq!(notify::decode(std::str::from_utf8(&second).unwrap()), Ok(record(20, "second")));
+        assert!(!a.exists() && !b.exists(), "delivered records are deleted");
+        // The unparseable one was moved aside, not sent, and didn't block the queue.
+        assert!(!bad.exists());
+        assert!(dir.join(format!("0000000015-000000000-1{}", outbox::BAD_SUFFIX)).is_file());
+        assert!(outbox::pending(&dir).unwrap().is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn flush_keeps_the_record_when_the_host_never_replies() {
+        let dir = outbox::test_dir("flush-silent");
+        let a = outbox::enqueue(&dir, &record(10, "first"), 0).unwrap();
+        let b = outbox::enqueue(&dir, &record(20, "second"), 0).unwrap();
+        let bridges = Arc::new(Bridges::default());
+        let got = host_bridge(&bridges, caps::NOTIFY, false);
+        wait_routable(&bridges, caps::NOTIFY);
+
+        let t = Instant::now();
+        assert_eq!(flush(&dir, &bridges, &AtomicU32::new(1), Duration::from_millis(300)), 0);
+        assert!(t.elapsed() < Duration::from_secs(3), "bounded by the reply timeout");
+        // The host got the first record, but without its `ok` nothing is
+        // deleted, and the flush stopped there (order is kept for the retry).
+        assert!(got.recv_timeout(Duration::from_secs(5)).is_ok());
+        assert!(got.recv_timeout(Duration::from_millis(200)).is_err(), "no second record sent");
+        assert!(a.exists() && b.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn flush_sends_nothing_without_a_notify_capable_host() {
+        let dir = outbox::test_dir("flush-nocap");
+        let a = outbox::enqueue(&dir, &record(10, "first"), 0).unwrap();
+        let bridges = Arc::new(Bridges::default());
+        let got = host_bridge(&bridges, caps::SSH_AGENT, true);
+        wait_routable(&bridges, caps::SSH_AGENT);
+
+        assert_eq!(flush(&dir, &bridges, &AtomicU32::new(1), Duration::from_secs(5)), 0);
+        assert!(got.recv_timeout(Duration::from_millis(200)).is_err(), "no stream opened");
+        assert!(a.exists());
+        // No bridge at all: same.
+        assert_eq!(flush(&dir, &Bridges::default(), &AtomicU32::new(1), Duration::from_secs(5)), 0);
+        assert!(a.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// End to end through the flusher thread: a record queued while no bridge
+    /// exists goes out as soon as a notify-capable bridge attaches and its
+    /// `Caps` arrives — well before the periodic retry.
+    #[test]
+    fn flusher_drains_on_bridge_attach() {
+        let dir = outbox::test_dir("flush-attach");
+        let a = outbox::enqueue(&dir, &record(10, "queued"), 0).unwrap();
+        let bridges = Arc::new(Bridges::default());
+        let (b, d) = (Arc::clone(&bridges), dir.clone());
+        std::thread::spawn(move || flush_loop(&d, &b, &AtomicU32::new(1)));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(a.exists(), "no bridge yet");
+
+        let got = host_bridge(&bridges, caps::NOTIFY, true);
+        assert!(got.recv_timeout(Duration::from_secs(5)).is_ok());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while a.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!a.exists(), "delivered after attach, not at the {FLUSH_RETRY:?} retry");
+        let _ = fs::remove_dir_all(&dir);
     }
 }

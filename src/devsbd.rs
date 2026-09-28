@@ -12,6 +12,10 @@ pub mod bridge;
 // Shared with the helper; the parser is helper-only (the host only writes).
 #[allow(dead_code)]
 pub mod bootfile;
+mod escape;
+// Shared with the helper, which writes records; the host reads them (step 5).
+#[allow(dead_code)]
+pub mod notify;
 // The forwarder engine (step 5); the CLI (`devsandbox port`) drives its full
 // public surface, the TUI Ports tab reuses it (docs/port-forwarding.md).
 #[cfg(unix)]
@@ -116,13 +120,16 @@ fn decompress(zst: &[u8]) -> Option<Vec<u8>> {
 pub const BIN: &str = "/run/devsandbox/bin/devsbd";
 
 /// Write stdin to a temp file and rename, so a concurrent `devsbd version`
-/// never sees a half-written binary. The `/usr/local/bin` symlink puts
-/// `devsbd` on `PATH` for scripts; best-effort (the dir may be missing or
-/// read-only), so it can't turn a good install into a failure.
+/// never sees a half-written binary. The notify outbox (`notify::OUTBOX`) is
+/// made world-writable + sticky because `devsbd notify` runs as the sandbox
+/// user; the `/usr/local/bin` symlink puts `devsbd` on `PATH` for scripts.
+/// Both best-effort (read-only or missing dirs), each wrapped in `{ …; }` so
+/// it can't turn a good install into a failure.
 const INSTALL_SCRIPT: &str = "mkdir -p /run/devsandbox/bin \
     && cat > /run/devsandbox/bin/devsbd.tmp \
     && chmod 755 /run/devsandbox/bin/devsbd.tmp \
     && mv /run/devsandbox/bin/devsbd.tmp /run/devsandbox/bin/devsbd \
+    && { { mkdir -p /var/lib/devsandbox/outbox && chmod 1777 /var/lib/devsandbox/outbox; } 2>/dev/null || true; } \
     && { ln -sf /run/devsandbox/bin/devsbd /usr/local/bin/devsbd 2>/dev/null || true; }";
 
 /// Boot file write, atomic for the same reason as `INSTALL_SCRIPT`: a hook
@@ -418,6 +425,14 @@ mod tests {
         assert_eq!((bare.user, bare.env), (None, vec![]));
         // What the host writes is what the helper reads.
         assert_eq!(bootfile::parse(&bootfile::serialize(&spec)), Ok(spec));
+    }
+
+    #[test]
+    fn install_makes_the_outbox_best_effort() {
+        let outbox = notify::OUTBOX;
+        assert!(INSTALL_SCRIPT.contains(&format!(
+            "&& {{ {{ mkdir -p {outbox} && chmod 1777 {outbox}; }} 2>/dev/null || true; }}"
+        )));
     }
 
     #[test]

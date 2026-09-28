@@ -409,7 +409,10 @@ kind: 0 Hello(u32 version, u8 hash_len, hash utf-8, u32 caps)  1 Open(channel: u
     refused`, `no such host postgres`).
 - **Capabilities.** `caps` bits (`proto::caps`): `TCP_FORWARD = 1 << 0` (daemon
   serves `Connect` with flow control + half-close), `SSH_AGENT = 1 << 1` (host
-  serves ssh-agent streams). The bridge does two separate handshakes and copies
+  serves ssh-agent streams), `NOTIFY = 1 << 2` (host serves `channel::NOTIFY`
+  streams: the daemon sends one outbox record as `Data` then `Eof`, the host
+  replies `ok`; a legacy `Open` stream half-closes on a peer `Eof`, see
+  `mux.rs`, docs/automations.md). The bridge does two separate handshakes and copies
   bytes, so caps don't flow end to end by themselves:
   - The daemon's `Hello` advertises `TCP_FORWARD`.
   - The bridge advertises `own & daemon` caps to the host (its `OWN_CAPS` ANDed
