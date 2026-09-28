@@ -148,7 +148,8 @@ pub struct Dispatcher {
     /// [`Dispatcher::ANY`] allows every one.
     #[serde(default)]
     pub spawn: Vec<String>,
-    /// Cap on the dispatcher's children (all recorded ones, stopped included).
+    /// Cap on the dispatcher's children (all recorded ones, stopped included);
+    /// unset = [`Dispatcher::DEFAULT_MAX_INSTANCES`] (see [`Dispatcher::cap`]).
     #[serde(rename = "max-instances")]
     pub max_instances: Option<u32>,
 }
@@ -156,6 +157,19 @@ pub struct Dispatcher {
 impl Dispatcher {
     pub const ANY: &'static str = "*";
 
+    /// `max-instances` when unset: a runaway (or hostile) dispatcher can't
+    /// fill the host with children by default.
+    pub const DEFAULT_MAX_INSTANCES: u32 = 10;
+
+    /// The effective cap on children.
+    pub fn cap(&self) -> u32 {
+        self.max_instances.unwrap_or(Self::DEFAULT_MAX_INSTANCES)
+    }
+
+    /// Whether `spawn` lists `sandbox` (or [`Dispatcher::ANY`]). `"*"` never
+    /// covers dispatcher sandboxes, this one included: children can't be
+    /// dispatchers, which `commands::dispatch` enforces on `ensure` whatever
+    /// `spawn` says.
     pub fn may_spawn(&self, sandbox: &str) -> bool {
         self.spawn.iter().any(|s| s == Self::ANY || s == sandbox)
     }
@@ -942,6 +956,8 @@ folders = { "/workspaces/docs" = "../docs" }
         let d = config.resolve_sandbox("d").unwrap().properties.dispatcher.unwrap();
         assert_eq!(d.spawn, vec!["web", "*"]);
         assert_eq!(d.max_instances, Some(3));
+        assert_eq!(d.cap(), 3);
+        assert_eq!(Dispatcher::default().cap(), Dispatcher::DEFAULT_MAX_INSTANCES);
         assert!(d.may_spawn("anything"));
         assert_eq!(config.resolve_sandbox("web").unwrap().properties.dispatcher, None);
 

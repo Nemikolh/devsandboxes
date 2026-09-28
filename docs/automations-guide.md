@@ -55,8 +55,8 @@ extends = "base"
 folder = "../web"
 ```
 
-- `spawn`: sandboxes of this config root the dispatcher may instantiate; `"*"` allows any. Omitted = nothing.
-- `max-instances` (optional): cap on the dispatcher's children, stopped ones included.
+- `spawn`: sandboxes of this config root the dispatcher may instantiate; `"*"` allows every non-dispatcher sandbox of the root, which hands the dispatcher their mounts, docker socket and other privileges: list names unless you mean that. Omitted = nothing. Children can't be dispatchers: a sandbox that declares `dispatcher` is never spawnable, even when named.
+- `max-instances` (optional, default 10): cap on the dispatcher's children, stopped ones included.
 - Both are re-read on every request, and neither marks instances drifted.
 
 **Background the loop.** Lifecycle commands block the `run`/`start` that runs them, so a long-running loop in `postStartCommand` must detach itself: `nohup ./loop.sh >loop.log 2>&1 &`. The output lands in the workspace (gitignore it).
@@ -76,7 +76,7 @@ devsbd run logs <key> <id> [--sandbox S] [--follow]
 devsbd run wait <key> <id> [--sandbox S] [--timeout SECS]
 ```
 
-- `ensure` is idempotent: creates `<sandbox>-<key>` if missing, starts it if stopped, recreates it if its container is gone, and prints the instance name. `--branch` and `--env` apply only at creation (ignored for an existing child). `--branch` names the *new* branch of the child's worktree, created from the repo's default base; it doesn't check out an existing branch. The name is taken literally (no `${…}` substitution, unlike the sandbox's `worktree-branch` pattern) and must be 1–200 chars of `[A-Za-z0-9._/-]`, not start with `-`, `/` or `.`, not end with `/` or `.`, and contain no `..`, `//`, component starting with `.` or ending in `.lock`; anything else is a usage error (exit 2). Without `--branch` the child's branch comes from `worktree-branch` (default `sandbox/${instance}`).
+- `ensure` is idempotent: creates `<sandbox>-<key>` if missing, starts it if stopped, recreates it if its container is gone, and prints the instance name. `--branch` and `--env` apply only at creation (ignored for an existing child). `--branch` names the *new* branch of the child's worktree, created from the repo's default base; it doesn't check out an existing branch. The name is taken literally (no `${…}` substitution, unlike the sandbox's `worktree-branch` pattern) and must be 1–200 chars of `[A-Za-z0-9._/-]`, not start with `-`, `/` or `.`, not end with `/` or `.`, and contain no `..`, `//`, component starting with `.` or ending in `.lock`; anything else is a usage error (exit 2). Without `--branch` the child's branch comes from `worktree-branch` (default `sandbox/${instance}`). `--env` may not set variables that steer what runs (denied, exit 77): `PATH`, `HOME`, `SHELL`, `USER`, `ENV`, `BASH_ENV`, `IFS`, `CDPATH`, `PS4`, `PROMPT_COMMAND`, `SSH_AUTH_SOCK`, `TMPDIR`, `GCONV_PATH`, `NODE_OPTIONS`, `RUBYOPT`, and anything starting with `LD_`, `DYLD_`, `GIT_`, `PYTHON` or `PERL5` (matched case-insensitively).
 - `ls` prints a JSON array of this dispatcher's children: `name`, `sandbox`, `key`, `state` (`running` | `stopped` | `missing`), `branch`.
 - `stop` / `rm` / `exec` / `run …` take the key; `--sandbox` disambiguates a key used under two sandboxes.
 - `exec` starts a tracked *run* in a running child (`ensure` it first), as the child's `remoteUser` in its workspace with its `remoteEnv`. With `--detach` it prints the run id and returns; without, it prints `devsbd: run <id>` to stderr, streams the output, and exits with the run's code (`killed N` → 128+N, `lost` → 1).
@@ -91,7 +91,7 @@ Exit codes:
 | 1 | failed (the message says why; host-side details in the log below) |
 | 2 | usage error, or an ambiguous key (pass `--sandbox`) |
 | 75 | no host connected: the dashboard isn't open (or the helper daemon isn't running). Retry later. |
-| 77 | denied: not a dispatcher, sandbox not in `spawn`, not this dispatcher's child, `max-instances` reached |
+| 77 | denied: not a dispatcher (or a dispatcher's child), sandbox not in `spawn` or itself a dispatcher, not this dispatcher's child, `max-instances` reached, a denied `--env` name |
 
 Control is served only while the devsandbox **dashboard** is open (two open dashboards are fine: each request goes to one of them). Nothing is queued: a script must retry on 75.
 

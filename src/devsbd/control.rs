@@ -229,6 +229,25 @@ pub fn parse_env(s: &str) -> Result<(String, String), String> {
     Ok((k.to_string(), v.to_string()))
 }
 
+/// Env names a dispatcher may not set on a child ([`denied_env`]).
+const DENIED_ENV: &[&str] = &[
+    "PATH", "HOME", "SHELL", "USER", "ENV", "BASH_ENV", "IFS", "CDPATH", "PS4",
+    "PROMPT_COMMAND", "SSH_AUTH_SOCK", "TMPDIR", "GCONV_PATH", "NODE_OPTIONS", "RUBYOPT",
+];
+/// Env name prefixes denied the same way.
+const DENIED_ENV_PREFIXES: &[&str] = &["LD_", "DYLD_", "GIT_", "PYTHON", "PERL5"];
+
+/// Whether a dispatcher's `--env` may not set `name`: variables that steer
+/// which binary or library a process loads, or what a shell runs on its own.
+/// A child's env reaches every exec in it, root ones included (the host's
+/// helper install/boot/daemon execs), so e.g. `PATH=/tmp/p` plus a planted
+/// binary would run as root on the next `start`. Matched case-insensitively:
+/// Linux names are case-sensitive, but no legitimate use needs `Path` either.
+pub fn denied_env(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    DENIED_ENV.contains(&upper.as_str()) || DENIED_ENV_PREFIXES.iter().any(|p| upper.starts_with(p))
+}
+
 fn line(out: &mut String, key: &str, value: &str) {
     out.push_str(key);
     out.push(' ');
@@ -563,6 +582,26 @@ timeout 5\n";
         assert!(decode_response("status ok\nbody\nbody\n").unwrap_err().contains("repeated"));
         assert!(decode_response("status ok\nstatus ok\nbody\n").is_err());
         assert!(decode_response("status ok\nbody\nextra 1\n").unwrap_err().contains("unknown"));
+    }
+
+    #[test]
+    fn denied_env_names() {
+        for bad in [
+            "PATH", "HOME", "SHELL", "USER", "ENV", "BASH_ENV", "IFS", "CDPATH", "PS4",
+            "PROMPT_COMMAND", "SSH_AUTH_SOCK", "TMPDIR", "GCONV_PATH", "NODE_OPTIONS", "RUBYOPT",
+            "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_", "DYLD_INSERT_LIBRARIES", "GIT_DIR",
+            "GIT_SSH_COMMAND", "PYTHONPATH", "PYTHONSTARTUP", "PERL5LIB", "PERL5OPT",
+            // Case-insensitive.
+            "path", "Path", "ld_preload", "Git_Dir", "pythonpath", "node_options",
+        ] {
+            assert!(denied_env(bad), "{bad:?}");
+        }
+        for good in [
+            "A", "FOO", "PR_URL", "GITHUB_TOKEN", "PATHS", "MYPATH", "XPATH", "HOMEDIR", "USERNAME",
+            "OLD_PATH", "LD", "GIT", "PERL", "NODE_ENV", "RUBY", "TERM", "LANG", "_",
+        ] {
+            assert!(!denied_env(good), "{good:?}");
+        }
     }
 
     #[test]

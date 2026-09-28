@@ -189,8 +189,11 @@ pub(super) fn write_workspace_file(
         &[]
     };
     let json = workspace_file_json(instance, workspace, extra_folders, recommendations);
-    let script = r#"mkdir -p "${2%/*}" && printf '%s\n' "$1" > "$2""#;
-    match backend().run_checked(&["exec", container, "sh", "-c", script, "sh", &json, &path]) {
+    // Runs as the container's default user, often root: shell and tools by
+    // fixed path, not the container's env (`runtime::fixed_path`).
+    let script = crate::runtime::fixed_path(r#"mkdir -p "${2%/*}" && printf '%s\n' "$1" > "$2""#);
+    let sh = crate::runtime::SH;
+    match backend().run_checked(&["exec", container, sh, "-c", &script, "sh", &json, &path]) {
         Ok(()) => Some(path),
         Err(e) => {
             eprintln!("warning: cannot write {path} in `{container}`: {e:#}");

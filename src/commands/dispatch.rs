@@ -9,7 +9,11 @@
 //! instance) must declare `dispatcher`, `ensure` needs the target in its
 //! `spawn` list, `stop`/`rm` only reach instances it owns, and `ensure` of a
 //! new child respects `max-instances` (all owned children in state count,
-//! stopped ones included).
+//! stopped ones included; unset = `Dispatcher::DEFAULT_MAX_INSTANCES`).
+//! Children can't be dispatchers: `ensure` of a sandbox declaring
+//! `dispatcher` is denied whatever `spawn` says, and a request from a child
+//! instance (old state) is denied, so dispatch can't recurse. `--env` names
+//! on the control::denied_env list are denied.
 //!
 //! Runs (`exec`, `run-ls|logs|wait`) live in the child: the host execs the
 //! child's own helper (`devsbd run start|ls|logs|wait`, `devsbd/src/runs.rs`)
@@ -93,11 +97,15 @@ pub fn handle(dispatcher_key: &str, req: &Request) -> Response {
 /// Whether `key` is an instance whose sandbox declares `dispatcher`. Lets the
 /// bridge skip its host-wide lock for requests `handle` will deny anyway, so a
 /// child's lifecycle command calling `devsbd` can't stall behind the parent
-/// op that is waiting for it.
+/// op that is waiting for it. A dispatcher's child is never one (see
+/// [`handle_with`]), even if its sandbox declares `dispatcher`.
 #[cfg_attr(not(unix), allow(dead_code))]
 pub fn declares_dispatcher(key: &str) -> bool {
     let Ok(state) = State::load() else { return false };
     let Some(info) = state.instances.get(key) else { return false };
+    if info.dispatcher.is_some() {
+        return false;
+    }
     let Some(dir) = info.config_dir.as_deref() else { return false };
     Config::load(dir)
         .and_then(|c| c.resolve_sandbox(&info.sandbox))
@@ -138,6 +146,10 @@ pub(crate) fn handle_with(
     let Some(config_dir) = owner.config_dir.as_deref() else {
         return no_config_dir(dispatcher_key);
     };
+    // Only state from before children of dispatcher sandboxes were refused.
+    if owner.dispatcher.is_some() {
+        return denied(format!("`{dispatcher_key}` is a dispatcher's child; children can't be dispatchers"));
+    }
     let decl = match config.resolve_sandbox(&owner.sandbox) {
         Ok(sandbox) => sandbox.properties.dispatcher,
         Err(e) => return denied(format!("{e:#}")),
@@ -147,6 +159,9 @@ pub(crate) fn handle_with(
     };
     if let Err(msg) = check_fields(req) {
         return usage(msg);
+    }
+    if let Some((k, _)) = req.env.iter().find(|(k, _)| control::denied_env(k)) {
+        return denied(format!("env `{k}` may not be set by a dispatcher"));
     }
     let owner_id = owner.instance_id.as_str();
 
@@ -164,10 +179,19 @@ pub(crate) fn handle_with(
             if !config.sandboxes.contains_key(sandbox) {
                 return denied(format!("unknown sandbox `{sandbox}`"));
             }
+            match config.resolve_sandbox(sandbox) {
+                Ok(target) if target.properties.dispatcher.is_some() => {
+                    return denied(format!(
+                        "sandbox `{sandbox}` declares `dispatcher`; children can't be dispatchers"
+                    ));
+                }
+                Ok(_) => {}
+                Err(e) => return denied(format!("{e:#}")),
+            }
             let name = child_name(sandbox, key);
             let child = state.instances.get(&name);
             let owned = children(state, owner_id).count();
-            let action = ensure_action(&name, child, owner_id, sandbox, owned, decl.max_instances, |c| {
+            let action = ensure_action(&name, child, owner_id, sandbox, owned, decl.cap(), |c| {
                 exec.is_running(c)
             });
             match action {
@@ -359,11 +383,11 @@ fn ensure_action(
     owner_id: &str,
     sandbox: &str,
     owned: usize,
-    max: Option<u32>,
+    max: u32,
     liveness: impl FnOnce(&str) -> Result<Option<bool>, String>,
 ) -> Result<Ensure, Response> {
     let Some(child) = child else {
-        if max.is_some_and(|max| owned >= max as usize) {
+        if owned >= max as usize {
             return Err(denied(format!(
                 "`max-instances` reached ({owned}); `rm` a child first"
             )));
@@ -572,7 +596,7 @@ mod tests {
     const CONFIG: &str = r#"
 [sandbox.disp]
 folder = "."
-dispatcher = { spawn = ["web"], max-instances = 2 }
+dispatcher = { spawn = ["web", "any"], max-instances = 2 }
 
 [sandbox.any]
 folder = "."
@@ -697,6 +721,11 @@ folder = "."
             // `*` allows any sandbox of the root, but only existing ones.
             ("a", ensure("api"), Status::Ok, "api-new"),
             ("a", ensure("nope"), Status::Denied, "unknown sandbox `nope`"),
+            // Children can't be dispatchers: not via `*` (itself or another), not
+            // when named explicitly.
+            ("a", ensure("any"), Status::Denied, "children can't be dispatchers"),
+            ("a", ensure("disp"), Status::Denied, "children can't be dispatchers"),
+            ("d", ensure("any"), Status::Denied, "children can't be dispatchers"),
             // Name taken by a foreign instance (user-made or another dispatcher's).
             ("d", req(Op::Ensure, Some("web"), Some("mine")), Status::Denied, "not this dispatcher's"),
             ("d", req(Op::Ensure, Some("web"), Some("other")), Status::Denied, "not this dispatcher's"),
@@ -714,6 +743,37 @@ folder = "."
             if *status != Status::Ok {
                 assert!(fake.calls.is_empty(), "denied requests run nothing: {r:?}");
             }
+        }
+    }
+
+    /// A child of a dispatcher sandbox (only possible in old state) can't
+    /// dispatch, whatever the op.
+    #[test]
+    fn requests_from_a_child_are_denied() {
+        let mut s = state();
+        s.instances.insert("any-kid".into(), inst("any", "any-kid", Some("a")));
+        for r in [req(Op::Ls, None, None), req(Op::Ensure, Some("web"), Some("x")), req(Op::Rm, None, Some("one"))] {
+            let mut fake = Fake::new();
+            let resp = call(&s, "any-kid", &r, &mut fake);
+            assert_eq!(resp.status, Status::Denied, "{r:?}: {resp:?}");
+            assert!(resp.body.contains("children can't be dispatchers"), "{resp:?}");
+            assert!(fake.calls.is_empty() && fake.execs.is_empty());
+        }
+    }
+
+    #[test]
+    fn denied_env_names_are_refused() {
+        // Room under `d`'s cap, so only the env can deny.
+        let mut s = state();
+        s.instances.remove("web-two");
+        for name in ["PATH", "LD_PRELOAD", "path", "GIT_DIR", "PYTHONPATH", "BASH_ENV"] {
+            let mut r = req(Op::Ensure, Some("web"), Some("new"));
+            r.env = vec![("OK".into(), "1".into()), (name.into(), "/tmp/p".into())];
+            let mut fake = Fake::new();
+            let resp = call(&s, "d", &r, &mut fake);
+            assert_eq!(resp.status, Status::Denied, "{name}: {resp:?}");
+            assert!(resp.body.contains(&format!("`{name}`")), "names the variable: {resp:?}");
+            assert!(fake.calls.is_empty());
         }
     }
 
@@ -981,9 +1041,18 @@ folder = "."
         // Existing children are still ensured at the cap.
         let resp = call(&s, "d", &req(Op::Ensure, Some("web"), Some("two")), &mut fake);
         assert_eq!(resp.status, Status::Ok);
-        // No cap: `a` (spawn "*") creates freely; others' children don't count.
+        // No `max-instances`: `a` gets the default cap; others' children don't count.
         let resp = call(&s, "a", &req(Op::Ensure, Some("web"), Some("three")), &mut fake);
         assert_eq!(resp, Response::new(Status::Ok, "web-three"));
+        let mut s = state();
+        let cap = crate::config::Dispatcher::DEFAULT_MAX_INSTANCES as usize;
+        for i in 1..cap {
+            let name = format!("api-{i}");
+            s.instances.insert(name.clone(), inst("api", &name, Some("a")));
+        }
+        let resp = call(&s, "a", &req(Op::Ensure, Some("web"), Some("three")), &mut fake);
+        assert_eq!(resp.status, Status::Denied, "{resp:?}");
+        assert!(resp.body.contains(&format!("`max-instances` reached ({cap})")), "{resp:?}");
     }
 
     #[test]

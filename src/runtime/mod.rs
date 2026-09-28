@@ -24,6 +24,21 @@ use anyhow::{bail, Context, Result};
 /// filter on it.
 pub const NAME_PREFIX: &str = "devsandbox-";
 
+/// Shell for the scripts devsandbox execs in containers, by absolute path:
+/// a container's env (and whatever it planted on its `PATH`) is untrusted,
+/// and these execs often run as root.
+pub const SH: &str = "/bin/sh";
+
+/// `PATH` those scripts run with (see [`fixed_path`]).
+pub const FIXED_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
+
+/// `script` with `PATH` pinned to [`FIXED_PATH`] first, so the tools it names
+/// (`mkdir`, `cat`, …) resolve the same whatever the container's env says.
+/// Run it with [`SH`] `-c`.
+pub fn fixed_path(script: &str) -> String {
+    format!("PATH={FIXED_PATH}; export PATH; {script}")
+}
+
 /// Env var that overrides runtime selection: `docker`, `podman` or `container`.
 pub const RUNTIME_ENV: &str = "DEVSANDBOX_RUNTIME";
 

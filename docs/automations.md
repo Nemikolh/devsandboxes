@@ -97,8 +97,8 @@ extends = "base"
 folder = "../web"
 ```
 
-- `spawn`: sandbox configs this dispatcher may instantiate (same config root). can use "*" to allow any config
-- `max-instances`: cap on live children, enforced by the host.
+- `spawn`: sandbox configs this dispatcher may instantiate (same config root); `"*"` = every non-dispatcher sandbox (children can never be dispatchers).
+- `max-instances`: cap on owned children (stopped ones count), default 10, enforced by the host.
 
 ### Control API
 
@@ -549,7 +549,7 @@ container trigger those host git calls itself (`ensure`, `rm`).
 - Tests: valid/invalid branch table; dispatcher branch with `${localEnv:X}` is
   rejected at the boundary, and never expanded in `run`.
 
-### Step 19 — dispatcher authorization hardening (Medium ×2)
+### Step 19 — dispatcher authorization hardening (Medium ×2) [x]
 
 - `--env` names: deny-list at the control boundary (`control::parse_env` or
   `check_fields`) and in `run --env`: `PATH`, `HOME`, `SHELL`, `USER`, `ENV`,

@@ -269,8 +269,8 @@ impl Backend for AppleContainer {
             }
             entries.push((ip.to_string(), endpoint.alias.clone()));
         }
-        let script = hosts_script(&entries);
-        self.run_checked(&["exec", "-u", "root", container, "sh", "-c", &script])
+        let script = super::fixed_path(&hosts_script(&entries));
+        self.run_checked(&["exec", "-u", "root", container, super::SH, "-c", &script])
     }
 
     fn supports_cache_from(&self) -> bool {

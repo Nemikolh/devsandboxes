@@ -148,6 +148,23 @@ const BOOT_WRITE_SCRIPT: &str = "mkdir -p /run/devsandbox \
     && cat > /run/devsandbox/boot.tmp \
     && mv /run/devsandbox/boot.tmp /run/devsandbox/boot";
 
+/// `exec [-i] -u root <container> /bin/sh -c <script>` with `PATH` pinned
+/// (`runtime::fixed_path`): these run as root, so neither the shell nor the
+/// tools the script names may resolve through the container's `PATH`.
+fn root_script_argv(stdin: bool, container: &str, script: &str) -> Vec<String> {
+    let mut args = vec!["exec".to_string()];
+    if stdin {
+        args.push("-i".into());
+    }
+    args.extend(["-u", "root", container, crate::runtime::SH, "-c"].map(String::from));
+    args.push(crate::runtime::fixed_path(script));
+    args
+}
+
+fn as_strs(args: &[String]) -> Vec<&str> {
+    args.iter().map(String::as_str).collect()
+}
+
 /// What `devsbd boot` should run on the container's next start: `cmd` (a
 /// `postStartCommand`) with the context the host's lifecycle exec gives it
 /// (`run::exec_lifecycle`: `-w workspace`, `-u remote_user`, `remote_env`,
@@ -182,15 +199,15 @@ pub fn boot_spec(
 pub fn sync_boot(container: &str, spec: Option<&bootfile::BootSpec>, quiet: bool) {
     match spec {
         Some(spec) => {
-            let args = ["exec", "-i", "-u", "root", container, "sh", "-c", BOOT_WRITE_SCRIPT];
+            let args = root_script_argv(true, container, BOOT_WRITE_SCRIPT);
             let text = bootfile::serialize(spec);
-            if let (Err(e), false) = (backend().run_with_stdin(&args, text.as_bytes()), quiet) {
+            if let (Err(e), false) = (backend().run_with_stdin(&as_strs(&args), text.as_bytes()), quiet) {
                 eprintln!("note: couldn't write the boot hook's postStartCommand in `{container}`: {e:#}");
             }
         }
         None => {
-            let _ = backend()
-                .output_quiet(&["exec", "-u", "root", container, "rm", "-f", bootfile::PATH]);
+            let args = root_script_argv(false, container, &format!("rm -f {}", bootfile::PATH));
+            let _ = backend().output_quiet(&as_strs(&args));
         }
     }
 }
@@ -242,8 +259,8 @@ pub fn install(container: &str, recorded: Option<Arch>) -> Result<Arch, String> 
         let (Some(want), Some(bytes)) = (hash(arch), blob(arch)) else {
             continue;
         };
-        let args = ["exec", "-i", "-u", "root", container, "sh", "-c", INSTALL_SCRIPT];
-        if backend().run_with_stdin(&args, &bytes).is_ok()
+        let args = root_script_argv(true, container, INSTALL_SCRIPT);
+        if backend().run_with_stdin(&as_strs(&args), &bytes).is_ok()
             && installed_hash(container).as_deref() == Some(want)
         {
             return Ok(arch);
@@ -408,6 +425,53 @@ mod tests {
         Ok(())
     }
 
+    /// The reviewer's PoC: a container whose env puts a planted dir first on
+    /// `PATH` (as a dispatcher's `--env PATH=…` could) gets none of its fakes
+    /// run by the host's root execs (install, boot file write and removal).
+    #[test_utils::docker_test(helper)]
+    fn root_execs_ignore_the_containers_path_with_docker() -> Result<(), &'static str> {
+        use std::process::Command;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let name = format!("devsandbox-devsbd-path-test-{stamp}");
+        let up = Command::new("docker")
+            .args(["run", "-d", "--rm", "--name", &name, "-e", "PATH=/tmp/p:/usr/sbin:/usr/bin:/sbin:/bin"])
+            .args(["alpine:3.20", "/bin/sleep", "300"])
+            .output()
+            .unwrap();
+        assert!(up.status.success(), "{}", String::from_utf8_lossy(&up.stderr));
+        let cleanup = || {
+            let _ = Command::new("docker").args(["rm", "-f", &name]).output();
+        };
+        crate::test_support::with_cleanup(cleanup, || {
+            let plant = "mkdir -p /tmp/p && for t in sh mkdir cat chmod mv ln rm; do \
+                printf '#!/bin/sh\\ntouch /tmp/pwned\\nexec /bin/%s \"$@\"\\n' $t > /tmp/p/$t; \
+                chmod 755 /tmp/p/$t; done";
+            let ok = Command::new("docker").args(["exec", &name, "/bin/sh", "-c", plant]).status().unwrap();
+            assert!(ok.success());
+            let pwned = || {
+                Command::new("docker")
+                    .args(["exec", &name, "/bin/ls", "/tmp/pwned"])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .unwrap()
+                    .success()
+            };
+            assert!(!pwned());
+            install(&name, None).unwrap();
+            let spec = bootfile::BootSpec { user: None, cwd: None, env: vec![], cmds: vec![vec!["true".into()]] };
+            sync_boot(&name, Some(&spec), false);
+            sync_boot(&name, None, false);
+            assert!(!pwned(), "a root exec ran a planted binary");
+            let ok = Command::new("docker").args(["exec", &name, "sh", "-c", "true"]).status().unwrap();
+            assert!(ok.success() && pwned(), "the fakes are live (sanity)");
+        });
+        Ok(())
+    }
+
     #[test]
     fn boot_spec_mirrors_the_lifecycle_exec() {
         #[derive(Deserialize)]
@@ -435,6 +499,20 @@ mod tests {
         assert_eq!((bare.user, bare.env), (None, vec![]));
         // What the host writes is what the helper reads.
         assert_eq!(bootfile::parse(&bootfile::serialize(&spec)), Ok(spec));
+    }
+
+    #[test]
+    fn root_scripts_use_an_absolute_shell_and_a_fixed_path() {
+        let pinned = "PATH=/usr/sbin:/usr/bin:/sbin:/bin; export PATH; ";
+        assert_eq!(
+            root_script_argv(true, "c", INSTALL_SCRIPT),
+            ["exec", "-i", "-u", "root", "c", "/bin/sh", "-c", &format!("{pinned}{INSTALL_SCRIPT}")]
+        );
+        assert_eq!(
+            root_script_argv(false, "c", "rm -f /run/devsandbox/boot"),
+            ["exec", "-u", "root", "c", "/bin/sh", "-c", &format!("{pinned}rm -f /run/devsandbox/boot")]
+        );
+        assert_eq!(bootfile::PATH, "/run/devsandbox/boot");
     }
 
     #[test]

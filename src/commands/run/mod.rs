@@ -64,6 +64,11 @@ pub fn run(
     {
         bail!("bad --branch for a dispatcher child: use {}", crate::devsbd::control::BRANCH_RULES);
     }
+    if extras.dispatcher.is_some() {
+        if let Some((k, _)) = extras.env.iter().find(|(k, _)| crate::devsbd::control::denied_env(k)) {
+            bail!("--env `{k}` may not be set by a dispatcher");
+        }
+    }
     let config = match Config::load(dir) {
         Ok(config) if !config.sandboxes.is_empty() => config,
         _ => return offer_example_config(dir),
@@ -816,6 +821,19 @@ mod tests {
                 .unwrap_err()
                 .to_string();
             assert!(err.starts_with("bad --branch for a dispatcher child"), "{bad:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn run_rejects_a_denied_dispatcher_env_before_any_work() {
+        let dir = Path::new("/nonexistent/devsandbox-test");
+        for name in ["PATH", "LD_PRELOAD", "Path", "GIT_SSH_COMMAND"] {
+            let extras = RunExtras {
+                env: vec![("OK".into(), "1".into()), (name.into(), "/tmp/p".into())],
+                dispatcher: Some("d".into()),
+            };
+            let err = run(dir, Some("web".into()), None, None, None, extras).unwrap_err().to_string();
+            assert_eq!(err, format!("--env `{name}` may not be set by a dispatcher"));
         }
     }
 
