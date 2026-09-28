@@ -24,6 +24,7 @@ worktree-link = [".env", "packages/*/.env"]    # one live copy shared by every i
 
 <details><summary>Commits</summary>
 
+- 52da316 docs(changelog): readable release notes with examples, written ahead of release via a release skill
 - 9dff820 docs(changelog): backfill changelog and generate it on release so github releases carry notes
 - c6925a0 feat(run): one-segment globs and leading ./ in worktree-link
 - ebd7200 feat(run): carry gitignored files into worktrees via copy or shared link
