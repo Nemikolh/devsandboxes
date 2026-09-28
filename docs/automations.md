@@ -419,6 +419,71 @@ _Automations_ section), plus the config spec, `docs/high-level-architecture.md`,
   `devsbd` commands, exit 75); `docs/high-level-architecture.md` and the
   `AGENTS.md` module map for the new modules.
 
+### Step 12 — worktrees on existing branches
+
+Decision (user): creating an instance on an existing branch must work, for
+`run --branch` and therefore `devsbd ensure --branch`.
+
+- `create_worktree` (`src/commands/run/worktree.rs:22`): today it bails when
+  `refs/heads/<branch>` exists (~:56-74). New rule: local branch exists →
+  `git worktree add <path> <branch>` (no `-b`, no start point, `--base`
+  ignored with a note); only `origin/<branch>` exists (a PR head fetched from
+  the remote; `git fetch origin <branch>` first, quietly, best-effort) →
+  `git worktree add --track -b <branch> <path> origin/<branch>` so a plain
+  `git push` updates the PR; neither → today's `-b … --no-track <start>`.
+  A branch already checked out in another worktree (or the base checkout) →
+  git refuses; surface a message naming where it's checked out.
+- `rm` must not delete a branch it didn't create: record in state whether
+  `run` created the branch (`Instance.branch` is only set for created ones —
+  keep that invariant, or add a flag) so `rm`'s delete-branch prompt only
+  covers branches devsandbox made.
+- Tests: the three branch cases against a temp git repo with a bare remote
+  (look for existing git fixtures in `worktree.rs` tests), plus the
+  checked-out-elsewhere message.
+
+### Step 13 — `--env` persisted
+
+Decision (user): `run --env` values live in `state.toml` and survive
+`rebuild` (including `ensure` recreating a containerless child).
+
+- `Instance.extra_env: BTreeMap<String, String>` (serde default, skip if
+  empty), written by `materialize`, reused by `rebuild` when `RunExtras.env`
+  is empty (same fallback shape as `dispatcher`/`config_dir`).
+- `ensure` on an existing child with different `--env`: still ignored
+  (documented), not merged.
+
+### Step 14 — autostart skips dispatcher-owned instances
+
+Decision (user): the once-per-boot pass never starts or creates children.
+
+- `commands/autostart.rs` `actions`: filter rows with `Instance.dispatcher`
+  set; a sandbox whose only instances are children still gets no `Run` (the
+  dispatcher owns that sandbox's fleet — decide: count children as "existing"
+  so no stray instance is created; test it).
+- `"runtime"` children still come back via the runtime's `unless-stopped`
+  when they were running — that's the runtime's rule, documented.
+
+### Step 15 — clearing runs
+
+Decision (user): dispatchers clear their runs through `devsbd`.
+
+- Helper (`devsbd/src/runs.rs`): `run rm <id>` (refuses a `running` run
+  unless `--force`, which kills its process group first) and `run prune
+  [--keep N]` (deletes finished/lost runs, newest N kept, default 0).
+- Control ops `RunRm` / `RunPrune` (`src/devsbd/control.rs`,
+  `src/commands/dispatch.rs`), CLI `devsbd run rm <key> <id> [--force]` and
+  `devsbd run prune <key> [--keep N]` (`devsbd/src/ctl.rs`). Read-only
+  ops skip the host lock; these don't touch `state.toml` either, so they skip
+  it too.
+- Docs: guide + known-limitations entry replaced.
+
+### Step 16 — no zombie from the boot hook (proposed by orchestrator, not decided)
+
+`devsbd boot` exits after `postStartCommand`, leaving a zombie under a
+`sleep` PID 1 when `init` is off. `boot` could instead `exec` into `devsbd
+daemon` once done (the daemon is long-lived anyway), removing that zombie.
+Run supervisors still need `init = true`. Skip unless approved.
+
 ## Open questions
 
 - Can the restart policy be changed in place on podman (`podman update --restart`, version-dependent), or does flipping `autostart` there require a recreate?

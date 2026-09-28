@@ -1,5 +1,72 @@
 # Changelog
 
+## Unreleased
+
+Sandboxes can now start themselves after a reboot and run unattended **dispatcher** scripts that create, drive and clean up their own child instances. Messages from inside containers show up in the dashboard and as desktop notifications. See `docs/automations-guide.md`.
+
+### Added
+
+- **`autostart`**: a sandbox's instances come up once per boot, when the dashboard opens or after your first `devsandbox run` / `start`. A sandbox with no instance yet gets one.
+- **`autostart = "runtime"`**: docker and podman restart the containers themselves at boot (`--restart unless-stopped`), with no devsandbox process needed. Podman also needs `podman-restart.service` enabled. On Apple `container` it behaves like `true`. Changing `autostart` never marks an instance as drifted; the next `start` applies it in place.
+
+```toml
+[sandbox.triage]
+folder = "../triage"
+autostart = "runtime"   # or true
+```
+
+- **Boot hook**: new containers run `devsbd boot` on every start, which brings back the helper daemon and, in runtime mode, `postStartCommand` (output in `/run/devsandbox/boot.log`). Containers created before this need `devsandbox rebuild --force` to get it.
+- **`devsbd notify`**: any sandbox can send the user a message. It is queued inside the container until a dashboard is open, then shown in the new **Inbox** tab (unread badges on instance rows, `enter` opens an `http(s)` link, `d`/`D` dismiss) and as a desktop notification (`notify-send` / `osascript`).
+
+```bash
+devsbd notify --level warn --key pr-123 --link https://github.com/o/r/pull/123 "PR 123 needs you"
+```
+
+- **Dispatchers**: a sandbox that declares `dispatcher` can manage child instances through `devsbd`, while the dashboard is open. Children are named `<sandbox>-<key>`, always get their own worktree, are marked `⇠ <dispatcher>` in the TUI, and outlive the dispatcher. Host-side operations log to `<data>/devsandbox/logs/dispatch-*.log`. Exit codes: 75 when no dashboard is connected, 77 when denied.
+
+```toml
+[sandbox.pr-dispatcher]
+folder = "../pr-dispatcher"
+autostart = "runtime"
+dispatcher = { spawn = ["web"], max-instances = 10 }   # "*" = any sandbox
+postStartCommand = "nohup ./loop.sh >loop.log 2>&1 &"
+```
+
+```bash
+devsbd ensure web --key pr-123 --branch feat/x   # create or start web-pr-123
+devsbd exec pr-123 --detach -- zidane -p "babysit PR 123"
+devsbd run logs pr-123 <id> --follow
+devsbd ls; devsbd stop pr-123; devsbd rm pr-123
+```
+
+- **Runs**: commands started with `devsbd exec` are tracked in the child (id, log, exit status). Follow them with `devsbd run ls|logs|wait`; the TUI shows a child's last runs under its processes.
+- `devsbd` is on `PATH` in containers (`/usr/local/bin/devsbd`).
+
+### Changed
+
+- New containers use `sh -c '… devsbd boot & exec sleep infinity'` as their command instead of `sleep infinity`, so images need `/bin/sh`.
+- `start` sets the container's restart policy from `autostart`, overwriting a policy set by hand.
+- While the dashboard is open it keeps a helper connection to every running instance that has the helper, not only when an ssh-agent is being relayed.
+- `devsandbox status --json` instance rows include `instance_id` and, for children, `dispatcher`.
+
+<details><summary>Commits</summary>
+
+- 5c2e49a docs(automations): user guide, architecture and module map for autostart, notify and dispatchers
+- b080bf1 fix(autostart): keep the boot's pass when the runtime is unreachable and pin dispatch subprocesses to the parent's backend, found auditing apple container
+- 7868cb5 feat(dispatch): tracked runs in child instances (devsbd exec, run ls/logs/wait), so dispatchers can start agents and follow their outcome
+- d499764 feat(dispatch): devsbd ensure/ls/stop/rm over a control channel served by the dashboard, failing fast with 75 when no host is attached
+- 32a030d feat(dispatch): dispatcher config and host-side control handler that runs ops as logged subprocesses, so a sandbox can safely own child instances
+- d5a1f6f feat(tui): inbox tab with per-instance unread badges, so notifications stay reviewable after the status line moves on
+- cec26b4 feat(tui): serve devsbd notify streams from dashboard bridges and raise desktop notifications, so container messages reach the user
+- 35f2e7c feat(devsbd): notify queues records in a durable outbox and the daemon flushes them to notify-capable hosts, so no message is lost while no host is attached
+- c3ae6ce feat(devsbd): boot hook in the container command so runtime restarts bring back the helper daemon and postStartCommand without a host
+- 75345d6 feat(autostart): runtime mode sets --restart unless-stopped so docker/podman bring sandboxes back on boot without devsandbox, flipped in place on start
+- 9075dec feat(autostart): bring autostart sandboxes up once per boot from the tui or the first run/start, so automations survive a reboot
+- 74ff407 docs(automations): step plan, with triggers, per-root boot ids and runtime-mode poststart settled
+- 6bb660e docs(automations): design for autostarted sandboxes, notify and dispatcher-driven child instances
+
+</details>
+
 ## 0.4.0
 
 Worktree instances can now bring along the gitignored files a repo needs to run, like `.env` files, instead of starting without them.
