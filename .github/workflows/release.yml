@@ -117,15 +117,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      # Outside the checkout: untracked archives would make `cargo publish`
+      # refuse to run on a dirty tree.
       - uses: actions/download-artifact@v7
         with:
-          path: dist
+          path: ${{ runner.temp }}/dist
           pattern: devsandbox-*
           merge-multiple: true
       - run: scripts/changelog-section.sh ${{ needs.version.outputs.version }} > "$RUNNER_TEMP/notes.md"
       - uses: softprops/action-gh-release@v3
         with:
-          files: dist/*
+          files: ${{ runner.temp }}/dist/*
           body_path: ${{ runner.temp }}/notes.md
       - name: Publish to crates.io
         run: cargo publish
