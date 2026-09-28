@@ -176,18 +176,13 @@ fn format_procs(procs: &[(u32, String)]) -> Option<String> {
 /// missing (exit 127), no match (exit 1), or the container gone — yields
 /// `None`, never an error (docs/port-forwarding.md, _Listening process_).
 pub(crate) fn listening_procs(container: &str, port: u16) -> Option<String> {
-    // Root exec: `lsof` resolves through a fixed PATH, not the container's.
-    let script = crate::runtime::fixed_path(r#"exec lsof "$@""#);
     let out = crate::runtime::backend()
         .output_quiet(&[
             "exec",
             "-u",
             "root",
             container,
-            crate::runtime::SH,
-            "-c",
-            &script,
-            "sh",
+            "lsof",
             "-nP",
             &format!("-iTCP:{port}"),
             "-sTCP:LISTEN",
