@@ -59,6 +59,14 @@ pub struct InstanceRow {
     pub remote_env_len: usize,
     pub base_folder: String,
     pub drift: bool,
+    /// Persistent id (`state::Instance::instance_id`), what `dispatcher`
+    /// refers to.
+    pub instance_id: String,
+    /// `instance_id` of the dispatcher that created this instance
+    /// (docs/automations.md), `None` for user-created ones. May name an
+    /// instance that no longer exists (an orphaned child).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dispatcher: Option<String>,
 }
 
 /// One sandbox row from `config.toml`, everything the Instances tree needs to
@@ -594,6 +602,8 @@ pub fn collect(dir: &Path) -> Snapshot {
             remote_env_len: inst.remote_env.len(),
             base_folder: inst.base_folder.display().to_string(),
             drift,
+            instance_id: inst.instance_id.clone(),
+            dispatcher: inst.dispatcher.clone(),
         });
     }
 

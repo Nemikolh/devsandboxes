@@ -302,6 +302,8 @@ mod tests {
             remote_env_len: 0,
             base_folder: "/f".into(),
             drift: false,
+            instance_id: String::new(),
+            dispatcher: None,
         };
         let snap = Snapshot {
             instances: vec![
@@ -378,6 +380,8 @@ mod tests {
             remote_env_len: 0,
             base_folder: "/f".into(),
             drift: false,
+            instance_id: String::new(),
+            dispatcher: None,
         };
         app.set_snapshot(Snapshot {
             instances: vec![row],

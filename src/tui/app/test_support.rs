@@ -50,6 +50,8 @@ pub(super) fn snapshot_with(n: usize) -> Snapshot {
             remote_env_len: 0,
             base_folder: "/f".into(),
             drift: false,
+            instance_id: String::new(),
+            dispatcher: None,
         })
         .collect();
     let sandboxes = vec![SandboxRow {
@@ -121,6 +123,8 @@ pub(super) fn orphan_snapshot() -> Snapshot {
         remote_env_len: 0,
         base_folder: "/f".into(),
         drift: false,
+        instance_id: String::new(),
+        dispatcher: None,
     }];
     Snapshot {
         instances,

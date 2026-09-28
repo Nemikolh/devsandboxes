@@ -38,6 +38,13 @@ pub const EXIT_NO_HOST: i32 = 75;
 /// The host refused the request (`EX_NOPERM`).
 pub const EXIT_DENIED: i32 = 77;
 
+/// Longest encoded request any end accepts: the daemon sends it as one `Data`
+/// frame (well under `proto::MAX_PAYLOAD`), and the cap bounds a misbehaving
+/// peer's buffer on the daemon and host alike.
+pub const MAX_REQUEST: usize = 64 * 1024;
+/// Longest encoded response the daemon and CLI accept (`ls` JSON is the big one).
+pub const MAX_RESPONSE: usize = 1024 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
     Ensure,

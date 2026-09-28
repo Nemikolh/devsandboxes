@@ -45,9 +45,9 @@ pub trait Executor {
 /// Load state and the dispatcher's config, then [`handle_with`] the real
 /// executor. `dispatcher_key` is the state key of the instance whose bridge
 /// the request arrived on. Blocking (it waits for the subprocess): run it off
-/// the UI thread.
-// The CONTROL channel that calls it lands in the next step.
-#[allow(dead_code)]
+/// the UI thread. Called by the TUI bridges' `CONTROL` handler
+/// (`devsbd::bridge`), which is unix-only.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub fn handle(dispatcher_key: &str, req: &Request) -> Response {
     let state = match State::load() {
         Ok(state) => state,
@@ -65,6 +65,20 @@ pub fn handle(dispatcher_key: &str, req: &Request) -> Response {
         Err(e) => return Response::new(Status::Failed, format!("{e:#}")),
     };
     handle_with(&state, &config, dispatcher_key, req, &mut Subprocess)
+}
+
+/// Whether `key` is an instance whose sandbox declares `dispatcher`. Lets the
+/// bridge skip its host-wide lock for requests `handle` will deny anyway, so a
+/// child's lifecycle command calling `devsbd` can't stall behind the parent
+/// op that is waiting for it.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub fn declares_dispatcher(key: &str) -> bool {
+    let Ok(state) = State::load() else { return false };
+    let Some(info) = state.instances.get(key) else { return false };
+    let Some(dir) = info.config_dir.as_deref() else { return false };
+    Config::load(dir)
+        .and_then(|c| c.resolve_sandbox(&info.sandbox))
+        .is_ok_and(|s| s.properties.dispatcher.is_some())
 }
 
 fn denied(msg: impl Into<String>) -> Response {

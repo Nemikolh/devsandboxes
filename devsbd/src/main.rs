@@ -3,6 +3,7 @@
 
 mod boot;
 mod bridge;
+mod ctl;
 mod daemon;
 mod outbox;
 
@@ -12,7 +13,7 @@ mod outbox;
 #[allow(dead_code)] // host-only serializer
 mod bootfile;
 #[path = "../../src/devsbd/control.rs"]
-#[allow(dead_code)] // the control CLI (`devsbd ensure|ls|stop|rm`) comes next
+#[allow(dead_code)] // host-only decoder (`decode_request`)
 mod control;
 #[path = "../../src/devsbd/escape.rs"]
 mod escape;
@@ -46,8 +47,11 @@ fn main() {
         Some("bridge") => exit_on_err(bridge::run(&build_hash())),
         Some("boot") => exit_on_err(boot::run()),
         Some("notify") => exit_on_err(outbox::run(&args.collect::<Vec<_>>())),
+        Some(verb @ ("ensure" | "ls" | "stop" | "rm")) => {
+            std::process::exit(ctl::run(verb, &args.collect::<Vec<_>>()))
+        }
         _ => {
-            eprintln!("usage: devsbd version|daemon|bridge|boot|notify");
+            eprintln!("usage: devsbd version|daemon|bridge|boot|notify|ensure|ls|stop|rm");
             std::process::exit(2);
         }
     }

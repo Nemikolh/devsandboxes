@@ -341,7 +341,7 @@ Landed limitations: the hook runs as the container's user, so a non-root `contai
 - Tests: codec round-trip, authorization matrix, naming, cap, `ls` filters to
   owned children, `ensure` decision per child state.
 
-### Step 8 — control channel end to end
+### Step 8 — control channel end to end [x]
 
 - Protocol: `channel::CONTROL = 4`, `caps::CONTROL = 1 << 3`. Helper:
   `devsbd ensure|ls|stop|rm` send a request over `api.sock`; the daemon opens
@@ -350,7 +350,8 @@ Landed limitations: the hook runs as the container's user, so a non-root `contai
 - Host: only bridges of instances whose sandbox declares `dispatcher`
   advertise `CONTROL`; the handler re-checks on every request (config may have
   changed). Runs on the bridge worker thread, quiet, never the UI thread.
-- TUI tree nests children under their dispatcher; orphans marked.
+- TUI tree marks children with a dim `⇠ <dispatcher>` suffix under their own
+  sandbox group (no re-nesting); orphans marked `⇠ <id> (orphan)`.
 - Tests: exit 75 with no bridge; `#[test_utils::docker_test(helper)]`
   dispatcher `ensure`s a child and `ls` lists it.
 

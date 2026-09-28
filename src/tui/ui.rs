@@ -862,7 +862,11 @@ fn tree_row<'a>(app: &App, snapshot: &'a Snapshot, node: Node) -> Row<'a> {
             None => Row::new(vec![Cell::from("")]),
         },
         Node::Instance(i) => match snapshot.instances.get(i) {
-            Some(inst) => instance_tree_row(inst, app.inbox.unread_for(&inst.name)),
+            Some(inst) => instance_tree_row(
+                inst,
+                app.inbox.unread_for(&inst.name),
+                super::data::dispatcher_label(inst, &snapshot.instances),
+            ),
             None => Row::new(vec![Cell::from("")]),
         },
         Node::Empty(i) => {
@@ -945,8 +949,9 @@ fn source_folder_cell(sb: &SandboxRow) -> Line<'static> {
 }
 
 /// `unread`: the instance's unread Inbox notifications, shown as a yellow
-/// `✉N` after the name.
-fn instance_tree_row(r: &InstanceRow, unread: usize) -> Row<'_> {
+/// `✉N` after the name. `owner`: a dispatcher child's dim
+/// `⇠ <dispatcher>` suffix (`data::dispatcher_label`).
+fn instance_tree_row(r: &InstanceRow, unread: usize, owner: Option<String>) -> Row<'_> {
     let status = Cell::from(Span::styled(
         r.status.label().to_string(),
         status_style(&r.status),
@@ -961,14 +966,14 @@ fn instance_tree_row(r: &InstanceRow, unread: usize) -> Row<'_> {
     } else {
         r.services.join(",")
     };
-    let name = if unread > 0 {
-        Cell::from(Line::from(vec![
-            Span::raw(format!("  {}", r.name)),
-            Span::styled(format!(" ✉{unread}"), Style::default().fg(Color::Yellow)),
-        ]))
-    } else {
-        Cell::from(format!("  {}", r.name))
-    };
+    let mut name = vec![Span::raw(format!("  {}", r.name))];
+    if unread > 0 {
+        name.push(Span::styled(format!(" ✉{unread}"), Style::default().fg(Color::Yellow)));
+    }
+    if let Some(owner) = owner {
+        name.push(Span::styled(format!(" {owner}"), Style::default().add_modifier(Modifier::DIM)));
+    }
+    let name = Cell::from(Line::from(name));
     Row::new(vec![
         name,
         status,

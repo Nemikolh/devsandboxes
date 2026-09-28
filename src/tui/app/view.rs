@@ -814,6 +814,8 @@ mod tests {
             remote_env_len: 0,
             base_folder: "/f".into(),
             drift: false,
+            instance_id: String::new(),
+            dispatcher: None,
         };
         let rows = vec![
             mk("a", "s", ContainerStatus::Exited("x".into())),

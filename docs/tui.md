@@ -116,6 +116,10 @@ sandboxes from config, instances nested below:
   `Node::Sandbox(i) | Node::Instance(i) | Node::EmptyMarker(sandbox)`.
   Instances whose sandbox is not in config group under a synthetic dim
   `(not in config)` sandbox node at the bottom.
+- Dispatcher children (docs/automations.md) stay under their own sandbox
+  group; the row gets a dim `⇠ <dispatcher instance>` suffix, or
+  `⇠ <id> (orphan)` once the owner id is gone from state
+  (`data::dispatcher_label`, fed by the snapshot's `instance_id`/`dispatcher`).
 - Selection indexes the visible-node list; clamps on refresh AND on
   collapse/expand. Row count for the Instances tab = visible nodes.
 - Keys: `→`/`space` expand, `←` collapse (on an instance: jump to its sandbox),

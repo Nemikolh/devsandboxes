@@ -51,6 +51,10 @@ pub mod channel {
     /// the record then `Eof`; the host replies `notify::REPLY_OK`. Only opened
     /// toward a host that advertised `caps::NOTIFY`.
     pub const NOTIFY: u8 = 3;
+    /// A dispatcher's control request (`control.rs`): the daemon sends the
+    /// encoded request then `Eof`; the host replies with the encoded response
+    /// and closes. Only opened toward a host that advertised `caps::CONTROL`.
+    pub const CONTROL: u8 = 4;
 }
 
 const KIND_HELLO: u8 = 0;
@@ -77,6 +81,8 @@ pub mod caps {
     pub const SSH_AGENT: u32 = 1 << 1;
     /// Host serves notify streams (`channel::NOTIFY`) for this bridge.
     pub const NOTIFY: u32 = 1 << 2;
+    /// Host serves control streams (`channel::CONTROL`) for this bridge.
+    pub const CONTROL: u32 = 1 << 3;
 }
 
 /// Starting per-direction credit for a flow-controlled stream: a sender may
@@ -334,6 +340,7 @@ mod tests {
             Frame::Hello { version: VERSION, hash: "ab".repeat(32), caps: 0 },
             Frame::Open { stream: 7, channel: channel::SSH_AGENT },
             Frame::Open { stream: 9, channel: channel::NOTIFY },
+            Frame::Open { stream: 11, channel: channel::CONTROL },
             Frame::Data { stream: 7, bytes: b"\x00\x00\x00\x01\x0b".to_vec() },
             Frame::Data { stream: u32::MAX, bytes: Vec::new() },
             Frame::Close { stream: 7, reason: String::new() },
@@ -341,7 +348,7 @@ mod tests {
             Frame::Connect { stream: 0x8000_0001, host: "postgres".into(), port: 5432 },
             Frame::Window { stream: 7, credit: INITIAL_WINDOW },
             Frame::Eof { stream: 7 },
-            Frame::Caps(caps::TCP_FORWARD | caps::SSH_AGENT | caps::NOTIFY),
+            Frame::Caps(caps::TCP_FORWARD | caps::SSH_AGENT | caps::NOTIFY | caps::CONTROL),
             Frame::Ping(b"t".to_vec()),
             Frame::Pong(Vec::new()),
             Frame::Quit,

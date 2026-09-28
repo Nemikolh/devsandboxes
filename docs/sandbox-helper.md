@@ -412,7 +412,11 @@ kind: 0 Hello(u32 version, u8 hash_len, hash utf-8, u32 caps)  1 Open(channel: u
   serves ssh-agent streams), `NOTIFY = 1 << 2` (host serves `channel::NOTIFY`
   streams: the daemon sends one outbox record as `Data` then `Eof`, the host
   replies `ok`; a legacy `Open` stream half-closes on a peer `Eof`, see
-  `mux.rs`, docs/automations.md). The bridge does two separate handshakes and copies
+  `mux.rs`, docs/automations.md), `CONTROL = 1 << 3` (host serves
+  `channel::CONTROL` streams: a dispatcher's `devsbd ensure|ls|stop|rm`
+  request, sent the same way, answered with an encoded response and a close;
+  only sink-bearing TUI bridges advertise it, and the host's handler refuses
+  non-dispatchers). The bridge does two separate handshakes and copies
   bytes, so caps don't flow end to end by themselves:
   - The daemon's `Hello` advertises `TCP_FORWARD`.
   - The bridge advertises `own & daemon` caps to the host (its `OWN_CAPS` ANDed
@@ -422,7 +426,8 @@ kind: 0 Hello(u32 version, u8 hash_len, hash utf-8, u32 caps)  1 Open(channel: u
     the instance`.
   - The host sends `Caps` right after its handshake; it passes through the
     bridge verbatim to the daemon (an old daemon skips the unknown kind). The
-    host advertises `SSH_AGENT` only when its bridge has a live agent provider.
+    host advertises `SSH_AGENT` only when its bridge has a live agent provider,
+    `NOTIFY` + `CONTROL` only when it has a notification sink (the TUI's).
 - Payload capped at 1 MiB (`MAX_PAYLOAD`): stray bytes on the stream (a shell
   banner on stdout) become an `InvalidData` error, not a huge allocation.
   Malformed `Hello`/`Open` payloads are errors too. **Unknown kinds are

@@ -8,6 +8,11 @@
 //! woken by `devsbd notify`'s poke on the API socket, by bridges attaching or
 //! their host caps arriving, and by a periodic retry.
 //!
+//! And it relays control requests (`devsbd ensure|ls|stop|rm`, `ctl.rs`)
+//! arriving on the API socket to the newest bridge whose host serves
+//! `CONTROL`, each on its own client thread, answering `NoHost` itself when
+//! there's none.
+//!
 //! One daemon per container, per build: the pidfile records the owner's build
 //! hash, and a daemon of a different build (the host rewrote the binary, e.g.
 //! `start` on a running container after a CLI upgrade) makes the running one
@@ -23,6 +28,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::control::{self, Response, Status};
 use crate::mux::{self, Conn, Mux};
 use crate::notify;
 use crate::outbox;
@@ -35,14 +41,25 @@ const PIDFILE: &str = "/run/devsandbox/devsbd.pid";
 /// both modes (docs/sandbox-helper.md).
 const AGENT_SOCK: &str = "/run/devsandbox/ssh-agent.sock";
 /// Client socket for in-container tools (mode 0666, like the agent socket).
-/// Each connection's first byte selects the request: [`API_POKE`] today; the
-/// control API (docs/automations.md, step 8) will add verbs here.
+/// Each connection's first byte selects the request: [`API_POKE`] or
+/// [`API_CONTROL`].
 pub const API_SOCK: &str = "/run/devsandbox/api.sock";
 /// "The outbox has new records": wakes the flusher. No reply.
 pub const API_POKE: u8 = b'n';
+/// A control request: the encoded `control::Request` follows, then the client
+/// shuts its write side; the daemon answers one encoded `control::Response`
+/// and closes.
+pub const API_CONTROL: u8 = b'c';
 
 /// How long an API client may take to send its first byte.
 const API_READ_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// How long a control client may take to send the rest of its request.
+const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a control request may wait for the host's reply. Generous: an
+/// `ensure` may build an image and create a worktree before it answers.
+const CONTROL_REPLY_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// Periodic outbox retry, for records a failed flush left behind (a host that
 /// never replied, a bridge that died mid-flush).
@@ -235,8 +252,8 @@ pub fn run(hash: &str) -> io::Result<()> {
     let (b, i) = (Arc::clone(&bridges), Arc::clone(&ids));
     std::thread::spawn(move || flush_loop(Path::new(notify::OUTBOX), &b, &i));
     if let Some(api) = api {
-        let b = Arc::clone(&bridges);
-        std::thread::spawn(move || accept_api_clients(api, b));
+        let (b, i) = (Arc::clone(&bridges), Arc::clone(&ids));
+        std::thread::spawn(move || accept_api_clients(api, b, i));
     }
     match agent {
         Some(agent) => accept_agent_clients(agent, bridges, ids),
@@ -405,11 +422,13 @@ fn accept_agent_clients(agent: UnixListener, bridges: Arc<Bridges>, next: Arc<At
 
 /// Serve `API_SOCK`: read each client's first byte and dispatch on it. A
 /// thread per client so a silent one can't stall the others (`API_READ_TIMEOUT`
-/// bounds it anyway), and so a later control request can take its time.
-fn accept_api_clients(api: UnixListener, bridges: Arc<Bridges>) {
+/// bounds it anyway), and so a control request can take its time without
+/// holding up pokes or the flusher.
+fn accept_api_clients(api: UnixListener, bridges: Arc<Bridges>, ids: Arc<AtomicU32>) {
     for conn in api.incoming() {
         let Ok(mut conn) = conn else { continue };
         let bridges = Arc::clone(&bridges);
+        let ids = Arc::clone(&ids);
         std::thread::spawn(move || {
             let _ = conn.set_read_timeout(Some(API_READ_TIMEOUT));
             let mut verb = [0u8; 1];
@@ -418,11 +437,78 @@ fn accept_api_clients(api: UnixListener, bridges: Arc<Bridges>) {
             }
             match verb[0] {
                 API_POKE => bridges.flush.fire(),
-                // Reserved for the control API; dropping `conn` closes it.
+                API_CONTROL => serve_control_client(conn, &bridges, &ids),
+                // Unknown verb: dropping `conn` closes it.
                 _ => {}
             }
         });
     }
+}
+
+/// One control client, after its verb byte: read the request to EOF, relay
+/// it (`control_exchange`), write the encoded response back.
+fn serve_control_client(mut conn: UnixStream, bridges: &Bridges, ids: &AtomicU32) {
+    let _ = conn.set_read_timeout(Some(CONTROL_REQUEST_TIMEOUT));
+    let mut request = Vec::new();
+    let reply = match (&conn).take(control::MAX_REQUEST as u64 + 1).read_to_end(&mut request) {
+        Err(e) => encoded(Status::Usage, format!("reading request: {e}")),
+        Ok(_) if request.len() > control::MAX_REQUEST => {
+            encoded(Status::Usage, format!("request longer than {} bytes", control::MAX_REQUEST))
+        }
+        Ok(_) => control_exchange(bridges, ids, &request, CONTROL_REPLY_TIMEOUT),
+    };
+    let _ = conn.write_all(&reply);
+}
+
+fn encoded(status: Status, body: impl Into<String>) -> Vec<u8> {
+    control::encode_response(&Response::new(status, body)).into_bytes()
+}
+
+/// Relay one encoded control request to the newest bridge whose host serves
+/// `CONTROL` and return the host's encoded response verbatim. The daemon
+/// answers itself when it can't: `NoHost` with no capable bridge (at once, no
+/// hold: the script retries), `Failed` when the host doesn't reply within
+/// `timeout` or its bridge dies (the mux closes every stream then, so the
+/// reply ends short). Same stream shape as `send_record`: `Open(CONTROL)`,
+/// the request as one `Data`, `Eof`, the reply read through a socket pair.
+fn control_exchange(bridges: &Bridges, ids: &AtomicU32, request: &[u8], timeout: Duration) -> Vec<u8> {
+    let Some(mux) = bridges.route(caps::CONTROL, Duration::ZERO) else {
+        return encoded(Status::NoHost, "no host connected; open the devsandbox dashboard");
+    };
+    let disconnected = || encoded(Status::Failed, "host disconnected");
+    let stream = next_stream_id(ids);
+    let Ok((mut ours, theirs)) = UnixStream::pair() else { return disconnected() };
+    let sent = mux.attach(stream, theirs, Some(channel::CONTROL)).and_then(|()| {
+        mux.send(&Frame::Data { stream, bytes: request.to_vec() })?;
+        mux.send(&Frame::Eof { stream })
+    });
+    if sent.is_err() {
+        return disconnected();
+    }
+    let deadline = Instant::now() + timeout;
+    let mut reply = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() || ours.set_read_timeout(Some(left)).is_err() {
+            return encoded(Status::Failed, "timed out");
+        }
+        match ours.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => reply.extend_from_slice(&buf[..n]),
+            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+                return encoded(Status::Failed, "timed out");
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return disconnected(),
+        }
+        if reply.len() > control::MAX_RESPONSE {
+            return encoded(Status::Failed, "host response too large");
+        }
+    }
+    // A reply cut short by a dying bridge doesn't decode; neither does none.
+    let complete = std::str::from_utf8(&reply).is_ok_and(|t| control::decode_response(t).is_ok());
+    if complete { reply } else { disconnected() }
 }
 
 /// The flusher thread: flush now (records queued while no daemon ran), then
@@ -765,6 +851,121 @@ mod tests {
         assert_eq!(flush(&dir, &Bridges::default(), &AtomicU32::new(1), Duration::from_secs(5)), 0);
         assert!(a.exists());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// What a test control host does with a request it read to EOF.
+    #[derive(Clone, Copy)]
+    enum Host {
+        /// Write these bytes, then close.
+        Reply(&'static [u8]),
+        /// Close without a reply.
+        Hangup,
+        /// Hold the stream open silently.
+        Silent,
+    }
+
+    /// A bridge attached to `bridges` whose far end is a host-side mux sending
+    /// `Caps(host_caps)` and serving `Open(CONTROL)` per `host`; each request
+    /// is reported on the returned channel. Returns the host mux too, so a
+    /// test can end the bridge (`close_all` stands in for its death).
+    fn control_host(bridges: &Arc<Bridges>, host_caps: u32, host: Host) -> (std::sync::mpsc::Receiver<Vec<u8>>, Arc<Mux>) {
+        let (d_r, h_w) = std::io::pipe().unwrap();
+        let (h_r, d_w) = std::io::pipe().unwrap();
+        let daemon = Mux::new(d_w);
+        let host_mux = Mux::new(h_w);
+        Bridges::attach(bridges, &daemon, caps::TCP_FORWARD);
+        std::thread::spawn(move || daemon.serve_with(d_r, |_, _| None, |_, _, _, _reply| {}));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let h = Arc::clone(&host_mux);
+        std::thread::spawn(move || {
+            h.serve(h_r, move |_, ch| {
+                if ch != channel::CONTROL {
+                    return None;
+                }
+                let (ours, mut handler) = UnixStream::pair().unwrap();
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    let mut request = Vec::new();
+                    handler.read_to_end(&mut request).unwrap();
+                    let _ = tx.send(request);
+                    match host {
+                        Host::Reply(bytes) => {
+                            let _ = handler.write_all(bytes);
+                        }
+                        Host::Hangup => {}
+                        Host::Silent => std::thread::sleep(Duration::from_secs(5)),
+                    }
+                });
+                Some(ours.into())
+            })
+        });
+        host_mux.send(&Frame::Caps(host_caps)).unwrap();
+        (rx, host_mux)
+    }
+
+    fn decoded(reply: &[u8]) -> Response {
+        control::decode_response(std::str::from_utf8(reply).unwrap()).unwrap()
+    }
+
+    const REQUEST: &[u8] = b"op ensure\nsandbox web\nkey pr-1\n";
+
+    #[test]
+    fn control_without_a_capable_bridge_is_no_host_at_once() {
+        let ids = AtomicU32::new(1);
+        let t = Instant::now();
+        let resp = decoded(&control_exchange(&Bridges::default(), &ids, REQUEST, Duration::from_secs(5)));
+        assert_eq!(resp.status, Status::NoHost);
+        assert!(resp.body.contains("no host connected"), "{}", resp.body);
+        // A notify-only host (a sink-less or older TUI) doesn't count.
+        let bridges = Arc::new(Bridges::default());
+        let (got, _host) = control_host(&bridges, caps::NOTIFY | caps::SSH_AGENT, Host::Reply(b"x"));
+        wait_routable(&bridges, caps::NOTIFY);
+        let resp = decoded(&control_exchange(&bridges, &ids, REQUEST, Duration::from_secs(5)));
+        assert_eq!(resp.status, Status::NoHost);
+        assert!(t.elapsed() < Duration::from_secs(3), "no hold");
+        assert!(got.recv_timeout(Duration::from_millis(200)).is_err(), "no stream opened");
+    }
+
+    #[test]
+    fn control_reply_is_relayed_verbatim() {
+        let bridges = Arc::new(Bridges::default());
+        let reply: &[u8] = b"status ok\nbody web-pr-1\n";
+        let (got, _host) = control_host(&bridges, caps::CONTROL, Host::Reply(reply));
+        wait_routable(&bridges, caps::CONTROL);
+        let out = control_exchange(&bridges, &AtomicU32::new(1), REQUEST, Duration::from_secs(5));
+        assert_eq!(out, reply);
+        assert_eq!(got.recv_timeout(Duration::from_secs(5)).unwrap(), REQUEST);
+    }
+
+    #[test]
+    fn control_fails_on_hangup_garbage_timeout_and_bridge_death() {
+        let ids = AtomicU32::new(1);
+        let check = |host: Host, timeout: Duration, want: &str| {
+            let bridges = Arc::new(Bridges::default());
+            let (_got, _host) = control_host(&bridges, caps::CONTROL, host);
+            wait_routable(&bridges, caps::CONTROL);
+            let resp = decoded(&control_exchange(&bridges, &ids, REQUEST, timeout));
+            assert_eq!((resp.status, resp.body.as_str()), (Status::Failed, want));
+        };
+        check(Host::Hangup, Duration::from_secs(5), "host disconnected");
+        check(Host::Reply(b"status o"), Duration::from_secs(5), "host disconnected");
+        let t = Instant::now();
+        check(Host::Silent, Duration::from_millis(300), "timed out");
+        assert!(t.elapsed() < Duration::from_secs(3));
+
+        // The bridge dies mid-request: the daemon's mux ends every stream.
+        let bridges = Arc::new(Bridges::default());
+        let (got, _host) = control_host(&bridges, caps::CONTROL, Host::Silent);
+        wait_routable(&bridges, caps::CONTROL);
+        let mux = bridges.route(caps::CONTROL, Duration::ZERO).unwrap();
+        let b = Arc::clone(&bridges);
+        let pending = std::thread::spawn(move || control_exchange(&b, &AtomicU32::new(1), REQUEST, Duration::from_secs(10)));
+        got.recv_timeout(Duration::from_secs(5)).unwrap();
+        let t = Instant::now();
+        mux.close_all();
+        let resp = decoded(&pending.join().unwrap());
+        assert_eq!((resp.status, resp.body.as_str()), (Status::Failed, "host disconnected"));
+        assert!(t.elapsed() < Duration::from_secs(3));
     }
 
     /// End to end through the flusher thread: a record queued while no bridge

@@ -2,7 +2,8 @@
 //! `exec -i <c> devsbd bridge` and serves the streams it carries, connecting
 //! each `Open` to the host agent. Owners: CLI `exec` (for the command's
 //! lifetime) and the TUI (one per running instance while open). TUI bridges
-//! also take the container's `devsbd notify` records (docs/automations.md).
+//! also take the container's `devsbd notify` records and serve its
+//! `devsbd ensure|ls|stop|rm` control requests (docs/automations.md).
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -15,6 +16,7 @@ use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::mux::{self, Conn, Mux};
+use super::control::{self, Request, Response, Status};
 use super::proto::caps;
 use super::{notify, proto, relay_mode, BIN};
 use crate::runtime::backend;
@@ -145,21 +147,50 @@ pub struct Notification {
 /// handler thread (never the UI thread), after the daemon got its `ok`.
 pub type Sink = Arc<dyn Fn(Notification) + Send + Sync>;
 
-/// A bridge's notify wiring: its sink plus the instance it serves.
+/// Serves one control request that arrived on instance `key`'s (state key)
+/// bridge. Blocking; called on the stream's handler thread.
+pub type ControlHandler = Arc<dyn Fn(&str, &Request) -> Response + Send + Sync>;
+
+/// What a long-lived (TUI) bridge serves beyond the agent: notify into its
+/// sink, control through its handler, both tagged with the instance it serves.
 #[derive(Clone)]
-struct NotifyTo {
+struct Services {
     instance: String,
     sink: Sink,
+    control: ControlHandler,
 }
 
 /// The caps a host bridge advertises in its `Caps` frame: `SSH_AGENT` only
-/// with an agent socket, `NOTIFY` only with a sink — so short-lived sink-less
-/// bridges (`exec`, lifecycle, forwards) never take notify streams, which
-/// would drop the records with them.
+/// with an agent socket, `NOTIFY` and `CONTROL` only with a sink (the TUI's
+/// bridges) — so short-lived sink-less bridges (`exec`, lifecycle, forwards)
+/// never take notify streams, which would drop the records with them, nor
+/// control requests, which must outlive a one-shot command. Every such bridge
+/// advertises `CONTROL`, dispatcher or not: `dispatch::handle` re-checks the
+/// config on each request and answers `Denied` for the rest.
 fn own_caps(has_agent: bool, has_sink: bool) -> u32 {
     let agent = if has_agent { caps::SSH_AGENT } else { 0 };
-    let sink = if has_sink { caps::NOTIFY } else { 0 };
+    let sink = if has_sink { caps::NOTIFY | caps::CONTROL } else { 0 };
     agent | sink
+}
+
+/// A control stream whose request doesn't end (no `Eof`) within this is
+/// dropped. The daemon sends the whole request at once.
+const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The production [`ControlHandler`]: `dispatch::handle`, serialized host-wide.
+/// Each op is a `devsandbox` subprocess that loads and saves `state.toml`;
+/// two at once (two dispatchers, or one script firing in parallel) would race
+/// on it and lose a write. Poisoning is ignored: the guard protects no data.
+/// Read-only `ls` and requests from non-dispatchers (denied without running
+/// anything) skip the lock, so they never wait behind a long `ensure`.
+fn dispatch_control(key: &str, req: &Request) -> Response {
+    use crate::commands::dispatch;
+    static LOCK: Mutex<()> = Mutex::new(());
+    if req.op == crate::devsbd::control::Op::Ls || !dispatch::declares_dispatcher(key) {
+        return dispatch::handle(key, req);
+    }
+    let _serial = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    dispatch::handle(key, req)
 }
 
 /// Room over `notify::MAX_RECORD` before a notify stream counts as oversized:
@@ -176,23 +207,45 @@ const NOTIFY_REPLY_BAD: &[u8] = b"bad record";
 
 /// The local end for an `Open` on `channel`, or `None` to refuse it: agent
 /// streams connect to the host agent (when this bridge has a provider), notify
-/// streams go to a handler thread (when it has a sink). Must return at once:
-/// it runs on the mux's `serve` thread.
+/// and control streams go to a handler thread (when it has `services`). Must
+/// return at once: it runs on the mux's `serve` thread.
 fn open_stream(
     channel: u8,
     agent: Option<&impl Fn() -> Option<PathBuf>>,
-    notify: Option<&NotifyTo>,
+    services: Option<&Services>,
 ) -> Option<Conn> {
-    match channel {
-        proto::channel::SSH_AGENT => UnixStream::connect(agent?()?).ok().map(Into::into),
-        proto::channel::NOTIFY => {
-            let to = notify?.clone();
-            let (ours, theirs) = UnixStream::pair().ok()?;
-            std::thread::spawn(move || handle_notify(ours, &to));
-            Some(theirs.into())
-        }
-        _ => None,
+    let handler: fn(UnixStream, &Services) = match channel {
+        proto::channel::SSH_AGENT => return UnixStream::connect(agent?()?).ok().map(Into::into),
+        proto::channel::NOTIFY => handle_notify,
+        proto::channel::CONTROL => handle_control,
+        _ => return None,
+    };
+    let to = services?.clone();
+    let (ours, theirs) = UnixStream::pair().ok()?;
+    std::thread::spawn(move || handler(ours, &to));
+    Some(theirs.into())
+}
+
+/// One control stream: read the request to EOF (the daemon's `Eof`
+/// half-closes our side), decode, run it through the handler, write the
+/// encoded response, close. Oversized or undecodable → a `Usage` response;
+/// timed out → close with no reply (the daemon reports the host
+/// disconnected). Silent: the TUI owns the terminal.
+fn handle_control(mut conn: UnixStream, to: &Services) {
+    let _ = conn.set_read_timeout(Some(CONTROL_READ_TIMEOUT));
+    let mut buf = Vec::new();
+    if (&conn).take(control::MAX_REQUEST as u64 + 1).read_to_end(&mut buf).is_err() {
+        return;
     }
+    let resp = if buf.len() > control::MAX_REQUEST {
+        Response::new(Status::Usage, format!("request longer than {} bytes", control::MAX_REQUEST))
+    } else {
+        match std::str::from_utf8(&buf).map_err(|e| e.to_string()).and_then(control::decode_request) {
+            Ok(req) => (to.control)(&to.instance, &req),
+            Err(e) => Response::new(Status::Usage, format!("bad request: {e}")),
+        }
+    };
+    let _ = conn.write_all(control::encode_response(&resp).as_bytes());
 }
 
 /// One notify stream: read the record to EOF (the daemon's `Eof` half-closes
@@ -201,7 +254,7 @@ fn open_stream(
 /// skips delivery, since the daemon will resend. Oversized or timed-out →
 /// close with no reply; undecodable → `NOTIFY_REPLY_BAD`. Silent throughout:
 /// the TUI owns the terminal.
-fn handle_notify(mut conn: UnixStream, to: &NotifyTo) {
+fn handle_notify(mut conn: UnixStream, to: &Services) {
     let _ = conn.set_read_timeout(Some(NOTIFY_READ_TIMEOUT));
     let limit = notify::MAX_RECORD + NOTIFY_SLACK;
     let mut buf = Vec::new();
@@ -229,10 +282,14 @@ pub fn spawn(info: &Instance) -> Option<Bridge> {
 }
 
 /// A `Bridges` bridge for instance `key`: the host agent only when
-/// `with_agent`, notify only when `sink` is set.
+/// `with_agent`, notify + control only when `sink` is set.
 fn spawn_managed(key: &str, info: &Instance, with_agent: bool, sink: Option<&Sink>) -> Option<Bridge> {
     let hash = info.devsbd_arch.and_then(super::hash).unwrap_or_default();
-    let notify = sink.map(|s| NotifyTo { instance: key.to_string(), sink: Arc::clone(s) });
+    let notify = sink.map(|s| Services {
+        instance: key.to_string(),
+        sink: Arc::clone(s),
+        control: Arc::new(dispatch_control),
+    });
     if with_agent {
         spawn_with(&info.container, hash, Some(host_agent), notify)
     } else {
@@ -260,12 +317,13 @@ pub fn spawn_for(container: &str, hash: &str, with_agent: bool) -> Option<Bridge
 /// an agent-less bridge (a `devsandbox port` forward): it advertises no
 /// `SSH_AGENT` cap and refuses agent `Open`s, so the daemon won't route agent
 /// clients to it and it can't steal ssh from an older agent bridge. `notify`
-/// set → the bridge advertises `NOTIFY` and takes the daemon's notify streams.
+/// set → the bridge advertises `NOTIFY` + `CONTROL` and takes the daemon's
+/// notify and control streams.
 fn spawn_with(
     container: &str,
     hash: &str,
     agent: Option<impl Fn() -> Option<PathBuf> + Send + 'static>,
-    notify: Option<NotifyTo>,
+    notify: Option<Services>,
 ) -> Option<Bridge> {
     let mut child = Command::new(backend().bin())
         .args(["exec", "-i", "-u", "root", container, BIN, "bridge"])
@@ -358,7 +416,7 @@ fn spawn_with(
             let mux = Mux::new(stdin);
             // Tell the daemon our caps right after the handshake, on stream 0:
             // `SSH_AGENT` only when this bridge has an agent provider and it
-            // yields a socket now; `NOTIFY` only with a sink (`own_caps`). An
+            // yields a socket now; `NOTIFY`/`CONTROL` only with a sink (`own_caps`). An
             // agent-less bridge (a `devsandbox port` forward) advertises no
             // `SSH_AGENT`, so the daemon won't route agent clients to it. Best
             // effort — a send failure just means the connection died.
@@ -596,11 +654,32 @@ mod tests {
     }
 
     #[test]
-    fn caps_advertise_notify_only_with_a_sink() {
+    fn caps_advertise_notify_and_control_only_with_a_sink() {
+        const SERVED: u32 = caps::NOTIFY | caps::CONTROL;
         assert_eq!(own_caps(false, false), 0);
         assert_eq!(own_caps(true, false), caps::SSH_AGENT);
-        assert_eq!(own_caps(false, true), caps::NOTIFY);
-        assert_eq!(own_caps(true, true), caps::SSH_AGENT | caps::NOTIFY);
+        assert_eq!(own_caps(false, true), SERVED);
+        assert_eq!(own_caps(true, true), caps::SSH_AGENT | SERVED);
+    }
+
+    /// `Services` for instance `instance` whose notifications go to the
+    /// returned channel and whose control handler is `control`.
+    fn services(instance: &str, control: ControlHandler) -> (Services, mpsc::Receiver<Notification>) {
+        let (tx, rx) = mpsc::channel();
+        let tx = Mutex::new(tx);
+        let to = Services {
+            instance: instance.into(),
+            sink: Arc::new(move |n| {
+                let _ = tx.lock().unwrap().send(n);
+            }),
+            control,
+        };
+        (to, rx)
+    }
+
+    /// A control handler that must not be called.
+    fn no_control() -> ControlHandler {
+        Arc::new(|_: &str, _: &Request| panic!("control handler called"))
     }
 
     #[test]
@@ -623,18 +702,16 @@ mod tests {
     /// A daemon-side mux and a host bridge's `open_stream` joined by pipes;
     /// the host has a notify sink for instance `web-1` and no agent.
     fn notify_pair() -> (Arc<Mux>, mpsc::Receiver<Notification>) {
+        service_pair(no_control())
+    }
+
+    /// `notify_pair` with control requests going to `control`.
+    fn service_pair(control: ControlHandler) -> (Arc<Mux>, mpsc::Receiver<Notification>) {
         let (d_r, h_w) = std::io::pipe().unwrap();
         let (h_r, d_w) = std::io::pipe().unwrap();
         let daemon = Mux::new(d_w);
         let host = Mux::new(h_w);
-        let (tx, rx) = mpsc::channel();
-        let tx = Mutex::new(tx);
-        let to = NotifyTo {
-            instance: "web-1".into(),
-            sink: Arc::new(move |n| {
-                let _ = tx.lock().unwrap().send(n);
-            }),
-        };
+        let (to, rx) = services("web-1", control);
         let d = Arc::clone(&daemon);
         std::thread::spawn(move || d.serve(d_r, |_, _| None));
         std::thread::spawn(move || {
@@ -647,9 +724,14 @@ mod tests {
     /// What the daemon's `send_record` does: `Open(NOTIFY)`, the bytes as one
     /// `Data`, `Eof`; returns everything the host wrote back before closing.
     fn send_notify(daemon: &Arc<Mux>, stream: u32, bytes: &[u8]) -> Vec<u8> {
+        send_on(daemon, stream, proto::channel::NOTIFY, bytes)
+    }
+
+    /// `send_notify` on any channel.
+    fn send_on(daemon: &Arc<Mux>, stream: u32, channel: u8, bytes: &[u8]) -> Vec<u8> {
         let (mut ours, theirs) = UnixStream::pair().unwrap();
         ours.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        daemon.attach(stream, theirs, Some(proto::channel::NOTIFY)).unwrap();
+        daemon.attach(stream, theirs, Some(channel)).unwrap();
         daemon.send(&proto::Frame::Data { stream, bytes: bytes.to_vec() }).unwrap();
         daemon.send(&proto::Frame::Eof { stream }).unwrap();
         let mut reply = Vec::new();
@@ -684,13 +766,47 @@ mod tests {
         assert!(rx.recv_timeout(Duration::from_millis(200)).is_err(), "nothing delivered");
     }
 
-    /// A sink-less bridge refuses notify streams (it never advertises NOTIFY,
-    /// but an old/confused daemon must still get no `ok`).
+    /// A sink-less bridge refuses notify and control streams (it never
+    /// advertises either, but an old/confused daemon must still get no reply).
     #[test]
-    fn sink_less_refuses_notify() {
+    fn sink_less_refuses_notify_and_control() {
         let none: Option<fn() -> Option<PathBuf>> = None;
         assert!(open_stream(proto::channel::NOTIFY, none.as_ref(), None).is_none());
+        assert!(open_stream(proto::channel::CONTROL, none.as_ref(), None).is_none());
         assert!(open_stream(proto::channel::SSH_AGENT, none.as_ref(), None).is_none());
+    }
+
+    /// A control stream reaches the handler with this bridge's instance key
+    /// and the decoded request; its response comes back encoded. A bad
+    /// request never reaches the handler and gets `Usage`.
+    #[test]
+    fn control_stream_runs_the_handler_and_replies() {
+        let (tx, calls) = mpsc::channel();
+        let tx = Mutex::new(tx);
+        let control: ControlHandler = Arc::new(move |key: &str, req: &Request| {
+            let _ = tx.lock().unwrap().send((key.to_string(), req.clone()));
+            Response::new(Status::Ok, "web-pr-1")
+        });
+        let (daemon, _notes) = service_pair(control);
+        let req = Request {
+            op: control::Op::Ensure,
+            sandbox: Some("web".into()),
+            key: Some("pr-1".into()),
+            branch: None,
+            env: vec![],
+        };
+        let reply = send_on(&daemon, 1, proto::channel::CONTROL, control::encode_request(&req).as_bytes());
+        assert_eq!(reply, b"status ok\nbody web-pr-1\n");
+        assert_eq!(calls.recv_timeout(Duration::from_secs(5)).unwrap(), ("web-1".to_string(), req));
+
+        let reply = send_on(&daemon, 3, proto::channel::CONTROL, b"op boot\n");
+        let resp = control::decode_response(std::str::from_utf8(&reply).unwrap()).unwrap();
+        assert_eq!(resp.status, Status::Usage);
+        assert!(resp.body.contains("bad op"), "{}", resp.body);
+        let big = vec![b'x'; control::MAX_REQUEST + 1];
+        let reply = send_on(&daemon, 5, proto::channel::CONTROL, &big);
+        assert!(std::str::from_utf8(&reply).unwrap().starts_with("status usage\n"));
+        assert!(calls.recv_timeout(Duration::from_millis(200)).is_err(), "handler not called");
     }
 
     /// The worker reconciles against only the newest queued list. With no host
@@ -951,14 +1067,7 @@ mod tests {
             assert!(ok(Command::new("docker").args(["run", "-d", "--name", &name, "alpine:3.20", "sleep", "300"])));
             let arch = install(&name, None).unwrap();
             start_daemon(&name);
-            let (tx, rx) = mpsc::channel();
-            let tx = Mutex::new(tx);
-            let to = NotifyTo {
-                instance: "notify-test".into(),
-                sink: Arc::new(move |n| {
-                    let _ = tx.lock().unwrap().send(n);
-                }),
-            };
+            let (to, rx) = services("notify-test", no_control());
             let none: Option<fn() -> Option<PathBuf>> = None;
             let bridge = spawn_with(&name, hash(arch).unwrap(), none, Some(to)).unwrap();
             assert_eq!(bridge.outcome(Duration::from_secs(10)), Some(Ok(())), "bridge handshake");
@@ -981,6 +1090,72 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(100));
             }
             assert!(empty, "outbox drained");
+            Ok(())
+        })
+    }
+
+    /// Docker-gated end to end: `devsbd ensure` in a container reaches a
+    /// sink-bearing bridge's control handler (a stub, so no real state is
+    /// touched) and prints its answer; with no bridge it exits 75.
+    #[test_utils::docker_test(helper)]
+    fn serves_container_control_requests_with_docker() -> Result<(), &'static str> {
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let name = format!("devsandbox-control-test-{stamp}");
+        let cleanup = || {
+            let _ = Command::new("docker").args(["rm", "-f", &name]).output();
+        };
+        crate::test_support::with_cleanup(cleanup, || {
+            assert!(ok(Command::new("docker").args(["run", "-d", "--name", &name, "alpine:3.20", "sleep", "300"])));
+            let arch = install(&name, None).unwrap();
+            start_daemon(&name);
+            let ensure = || Command::new("docker").args(["exec", &name, BIN, "ensure", "web", "--key", "pr-1"]).output().unwrap();
+
+            // Daemon up, no bridge: fail fast with the no-host code.
+            let out = ensure();
+            assert_eq!(out.status.code(), Some(control::EXIT_NO_HOST), "{out:?}");
+            assert!(String::from_utf8_lossy(&out.stderr).contains("no host connected"), "{out:?}");
+
+            let (tx, calls) = mpsc::channel();
+            let tx = Mutex::new(tx);
+            let control: ControlHandler = Arc::new(move |key: &str, req: &Request| {
+                let _ = tx.lock().unwrap().send((key.to_string(), req.clone()));
+                Response::new(Status::Ok, "web-pr-1")
+            });
+            let (to, _notes) = services("control-test", control);
+            let none: Option<fn() -> Option<PathBuf>> = None;
+            let bridge = spawn_with(&name, hash(arch).unwrap(), none, Some(to)).unwrap();
+            assert_eq!(bridge.outcome(Duration::from_secs(10)), Some(Ok(())), "bridge handshake");
+            // The host's `Caps` lands just after the handshake: retry briefly.
+            let mut out = ensure();
+            for _ in 0..50 {
+                if out.status.code() != Some(control::EXIT_NO_HOST) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+                out = ensure();
+            }
+            assert_eq!(out.status.code(), Some(0), "{out:?}");
+            assert_eq!(String::from_utf8_lossy(&out.stdout), "web-pr-1\n");
+            let (key, req) = calls.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(key, "control-test");
+            assert_eq!((req.op, req.sandbox.as_deref(), req.key.as_deref()), (control::Op::Ensure, Some("web"), Some("pr-1")));
+
+            // A usage error never reaches the host.
+            let out = Command::new("docker").args(["exec", &name, BIN, "ensure", "web"]).output().unwrap();
+            assert_eq!(out.status.code(), Some(control::EXIT_USAGE), "{out:?}");
+            assert!(calls.recv_timeout(Duration::from_millis(200)).is_err());
+
+            // Bridge gone: back to 75 once the daemon notices.
+            drop(bridge);
+            let mut code = None;
+            for _ in 0..50 {
+                code = ensure().status.code();
+                if code == Some(control::EXIT_NO_HOST) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            assert_eq!(code, Some(control::EXIT_NO_HOST), "after the bridge ended");
             Ok(())
         })
     }

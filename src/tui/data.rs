@@ -119,6 +119,19 @@ fn push_proc_nodes(
     }
 }
 
+/// The dim suffix marking a dispatcher's child in the Instances tree
+/// (docs/automations.md): `⇠ <dispatcher instance name>`, or `⇠ <id> (orphan)`
+/// when no instance in `instances` has the recorded owner id any more. `None`
+/// for user-created instances. Children stay under their own sandbox group
+/// (the tree groups by sandbox) rather than being nested under the dispatcher.
+pub fn dispatcher_label(row: &InstanceRow, instances: &[InstanceRow]) -> Option<String> {
+    let id = row.dispatcher.as_deref()?;
+    Some(match instances.iter().find(|i| i.instance_id == id) {
+        Some(owner) => format!("⇠ {}", owner.name),
+        None => format!("⇠ {id} (orphan)"),
+    })
+}
+
 /// The `N/M running` stats string for a sandbox row: `M` instances, `N` running.
 /// Pure so the rendering layer and tests share one format.
 pub fn sandbox_stats(instances: usize, running: usize) -> String {
@@ -218,6 +231,8 @@ mod tests {
             remote_env_len: 0,
             base_folder: "/f".into(),
             drift: false,
+            instance_id: String::new(),
+            dispatcher: None,
         }
     }
 
@@ -309,6 +324,23 @@ mod tests {
             build_hash: String::new(),
             issues: Vec::new(),
         }
+    }
+
+    #[test]
+    fn dispatcher_label_names_the_owner_or_marks_an_orphan() {
+        let mut owner = inst("pr-dispatcher", ContainerStatus::Missing);
+        owner.instance_id = "d-1".into();
+        let mut child = inst("web-pr-1", ContainerStatus::Missing);
+        child.instance_id = "c-1".into();
+        child.dispatcher = Some("d-1".into());
+        let mut orphan = inst("web-pr-2", ContainerStatus::Missing);
+        orphan.dispatcher = Some("gone-7".into());
+        let rows = vec![owner.clone(), child.clone(), orphan.clone()];
+        assert_eq!(dispatcher_label(&owner, &rows), None, "user-created");
+        assert_eq!(dispatcher_label(&child, &rows).as_deref(), Some("⇠ pr-dispatcher"));
+        assert_eq!(dispatcher_label(&orphan, &rows).as_deref(), Some("⇠ gone-7 (orphan)"));
+        // The dispatcher itself removed: its children turn orphan.
+        assert_eq!(dispatcher_label(&child, &rows[1..]).as_deref(), Some("⇠ d-1 (orphan)"));
     }
 
     /// An instance in a given sandbox (extends the `inst` helper, which pins
