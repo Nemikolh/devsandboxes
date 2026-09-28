@@ -172,12 +172,194 @@ devsandbox takes no stand; both are supported and documented:
 
 ## Steps
 
-1. `autostart = true`: boot id in `state.toml`, trigger on TUI load and first CLI command.
-2. `autostart = "runtime"`: restart policy per backend, entrypoint starts `devsbd daemon`, daemon runs `postStartCommand`; excluded from `config_hash`.
-3. `devsbd notify`: outbox, `NOTIFY` channel, TUI inbox + badge, desktop notifier.
-4. `dispatcher` config + `CONTROL` channel: `ensure`/`ls`/`stop`/`rm`, ownership label, `max-instances`, lease, fail-fast exit code.
-5. Runs: `exec --detach`, `run ls|logs|wait`, TUI view.
-6. User docs: patterns above, sample dispatcher; update `skills/config-toml-spec/SKILL.md` for `autostart` and `dispatcher`.
+One step = one commit. Each implementer re-reads the landmarks it's given before editing (line numbers drift as steps land). After any change under `devsbd/` or to `src/devsbd/{proto,mux}.rs`, rebuild the helper with `scripts/build-devsbd.sh` before `cargo test --workspace` (a stale embedded blob fails the helper tests).
+
+Decisions taken while planning (differ from or sharpen the design above):
+
+- **Triggers**: autostart fires on TUI load (before the alternate screen, so
+  `run` output is readable) and after the user's own `devsandbox run` /
+  `devsandbox start` — not on every CLI command (`ps`, `status --json`,
+  `stop --all` shouldn't start things). After, not before, so `run web` for an
+  autostart `web` doesn't create two instances.
+
+- **Boot id is per config root**: `state.toml` is global but autostart is a
+  config property, so the record is keyed by project id
+  (`services::project_id`), not a single `last_autostart_boot`.
+
+- **No lease**: the daemon already routes each client stream to exactly one
+  bridge, the newest capable one (`devsbd/src/daemon.rs:73`, `agent_route`), so
+  two TUIs never both serve a request. The lock-file lease is dropped.
+
+- **Runtime-mode `postStartCommand`** (open question above): run only by the
+  in-container boot hook on every container start, never by the host `start`;
+  `run` (create) still runs it from the host after `postCreateCommand` because
+  the hook can't (helper not installed yet at create).
+
+- **Long-running loops**: lifecycle commands block the host
+  (`src/commands/run/lifecycle.rs:29`), so a dispatcher loop in
+  `postStartCommand` must background itself (`nohup ./loop.sh >loop.log 2>&1 &`).
+  Documented in step 11; a detached lifecycle form is a possible later step.
+
+- **`devsbd` on `PATH`**: the helper lives at `/run/devsandbox/bin/devsbd`
+  (`src/devsbd.rs:111`); install also symlinks `/usr/local/bin/devsbd`
+  (best-effort) so scripts call `devsbd notify`.
+
+### Step 1 — `autostart = true`
+
+- `src/config.rs:30` `SandboxProperties`: `autostart: Option<Autostart>`,
+  `enum Autostart { Off, Devsandbox, Runtime }` deserialized from `true` /
+  `false` / `"runtime"` (anything else errors, naming the accepted values).
+  `"runtime"` behaves like `true` in this step. Excluded from `config_hash`
+  (`src/config.rs:689`): strip the `autostart` key before hashing, in
+  `resolve_sandbox` and `resolved_table` alike.
+- `src/state.rs:92` `State`: `autostart_boot: BTreeMap<String, String>`
+  (project id → boot id), `#[serde(default, skip_serializing_if = "BTreeMap::is_empty")]`.
+- New `src/commands/autostart.rs`: `pub fn autostart(dir: &Path)` — never
+  fails the caller (warnings to stderr). No config / no boot id → no-op.
+  Same boot id recorded for this project → no-op. Otherwise **record first,
+  save**, then act, so a failing start can't retrigger on every invocation.
+  Per `autostart` sandbox: its instances in state with matching
+  `sandbox` + `project`: start the stopped ones through the full
+  `start_instance` path (`src/commands/start.rs:43`, make it `pub(crate)`),
+  skip running ones, skip containerless ones with a note; none at all →
+  `run::run(dir, Some(name), None, None, None)`.
+- Boot id: Linux `/proc/sys/kernel/random/boot_id` (trimmed); macOS
+  `sysctl -n kern.boottime` → the `{ sec = …, usec = … }` part. Parsing is a
+  pure fn with tests.
+- The decision is a pure fn (recorded boot, current boot, autostart sandboxes,
+  instance rows with running state) → `Vec<Action>` (`Start(key)` /
+  `Run(sandbox)`), unit-tested: already-booted no-op, stopped started, running
+  skipped, missing → run, other project's instances ignored.
+- Wiring: `src/main.rs:225`/`:234` call it after `Run`/`Start` (whatever their
+  result, then return that result); `src/tui/mod.rs:88` `dashboard` calls it
+  before `setup()`.
+- Tests: config parse (bool, `"runtime"`, bad string), hash unaffected by
+  `autostart`, state round-trip with the new map.
+
+### Step 2 — `autostart = "runtime"`: restart policy
+
+- `src/runtime/mod.rs` `Backend`: `fn supports_restart_policy(&self) -> bool`
+  (docker/podman true, Apple `container` false — confirm in its backend file)
+  and `fn set_restart_policy(&self, container, policy: &str) -> Result<()>`
+  (`update --restart <policy>`; Apple: no-op).
+- `run_container` (`src/commands/run/mod.rs:520`): `--restart unless-stopped`
+  when `Runtime` and supported; Apple → warning, behaves as `true`. Podman:
+  warn at `run` that boot restarts need `podman-restart.service` enabled.
+- Because `autostart` isn't hashed, apply flips in place: `start_instance`
+  and `autostart` set the policy (`unless-stopped` / `no`) when the sandbox
+  resolves; on failure (old podman without `update --restart`) warn "recreate
+  with `devsandbox rebuild --force`".
+- Tests: run-args builder includes/omits `--restart` per mode + backend.
+
+### Step 3 — in-container boot hook
+
+- Container command becomes a hook + keep-alive for **new** containers:
+  `sh -c '[ -x /run/devsandbox/bin/devsbd ] && /run/devsandbox/bin/devsbd boot & exec sleep infinity'`
+  (replaces `sleep infinity` at `src/commands/run/mod.rs:585`). No binary →
+  no-op, so first create is unaffected. Existing containers keep `sleep
+  infinity`; `start` of a runtime-mode instance without the hook warns to
+  `rebuild --force`.
+- `devsbd boot` (`devsbd/src/main.rs:31`): start the daemon detached
+  (idempotent, same as `start_daemon`, `src/devsbd.rs:180`), then, if
+  `/run/devsandbox/boot` exists, run its `postStartCommand` as the recorded
+  user/cwd/env, output appended to `/run/devsandbox/boot.log`. File format is
+  line-based and hand-parsed (no serde in the helper; size budget): `user`,
+  `cwd`, `env K=V`, one `cmd` per sequential command with NUL-separated argv.
+  User switch via `CommandExt::uid/gid` after an `/etc/passwd` lookup.
+- Host writes/removes `/run/devsandbox/boot` (via `exec -u root … sh -c 'cat >'`,
+  like `INSTALL_SCRIPT`, `src/devsbd.rs:115`) on `run`, `start`, `rebuild` for
+  runtime-mode instances with a `postStartCommand`; removes it otherwise.
+  Host `start` skips `postStartCommand` for runtime-mode instances (decision
+  above).
+- Also here: the best-effort `/usr/local/bin/devsbd` symlink in the install.
+- Tests: boot-file serializer (host) and parser (helper) round-trip on a
+  shared fixture; `#[test_utils::docker_test(helper)]`: a runtime-mode
+  container restarted with `docker restart` runs `postStartCommand` again.
+
+### Step 4 — `devsbd notify`: helper side
+
+- `devsbd notify [--level info|warn|error] [--link URL] [--key K] <msg>`:
+  writes one record to `/var/lib/devsandbox/outbox/<ts>-<rand>` (atomic
+  rename), then pokes the daemon over a new client socket
+  (`/run/devsandbox/api.sock`, like `AGENT_SOCK`, `devsbd/src/daemon.rs:145`).
+  Succeeds even with no daemon (the record is queued).
+- Protocol (`src/devsbd/proto.rs`): `channel::NOTIFY = 3`,
+  `caps::NOTIFY = 1 << 2` (host serves notify). Daemon: on poke and on each
+  bridge attach whose host advertises `NOTIFY`, flush the outbox oldest first:
+  one `Open(NOTIFY)` stream per record, record bytes, `Eof`; delete the file
+  only after the host's `ok` reply.
+- Tests: record encode/decode, outbox ordering, flush-on-attach with an
+  in-process mux pair (see existing daemon tests).
+
+### Step 5 — notify: host side
+
+- `src/devsbd/bridge.rs`: bridges advertise `caps::NOTIFY` when given a
+  notification sink; `on_open(NOTIFY)` reads the record, replies `ok`, hands a
+  `Notification { instance, level, key, link, msg, at }` to the sink (a
+  `UnixStream::pair` + thread, since the mux speaks `Conn`).
+- `Bridges::reconcile` (`src/devsbd/bridge.rs:359`): keep a bridge per running
+  helper-capable instance even without a host agent (today it clears
+  everything when there's no agent at `:362`); agent routing unchanged.
+- Desktop notifier: `notify-send` / `osascript`, spawned quietly, missing
+  binary ignored; the argv builder is pure and tested.
+
+### Step 6 — notify: TUI inbox
+
+- `src/tui/app/`: notifications list in `App` (dedupe by `key`, capped at 200,
+  in memory), unread badge on the instance row, an inbox view listing
+  instance, time, level, message, link; key/command to open and to clear.
+  I/O-free, unit-tested with `test_support.rs` fixtures.
+- `src/tui/mod.rs`: drain the sink each loop turn into `App`; fire the desktop
+  notifier from the worker, not the UI thread.
+
+### Step 7 — `dispatcher` config + control handler (host, pure)
+
+- `src/config.rs`: `dispatcher: Option<Dispatcher { spawn: Vec<String>,
+  max_instances: Option<u32> }>` (`"*"` = any sandbox of this root), validated
+  at `ls` (unknown sandbox names error, except `"*"`).
+- `src/state.rs` `Instance`: `dispatcher: Option<String>` (owner
+  `instance_id`); `run_container` adds label `devsandbox.dispatcher=<id>`.
+- New `src/commands/dispatch.rs`: request/response types (JSON) for `ensure`,
+  `ls`, `stop`, `rm`; pure authorization (`spawn` list, ownership, cap) and
+  naming (`<sandbox>-<key>`, key charset validated); execution reusing
+  `run::materialize` / `start_instance` / `stop` / `rm` in quiet mode.
+  `ensure` = create with `--branch`/`--env` if missing, start if stopped,
+  return the name.
+- Tests: authorization matrix, naming, cap, `ls` filters to owned children.
+
+### Step 8 — control channel end to end
+
+- Protocol: `channel::CONTROL = 4`, `caps::CONTROL = 1 << 3`. Helper:
+  `devsbd ensure|ls|stop|rm` send a request over `api.sock`; the daemon opens
+  a `CONTROL` stream to the newest bridge whose host advertises `CONTROL`, or
+  answers "no host connected" → the CLI exits 75.
+- Host: only bridges of instances whose sandbox declares `dispatcher`
+  advertise `CONTROL`; the handler re-checks on every request (config may have
+  changed). Runs on the bridge worker thread, quiet, never the UI thread.
+- TUI tree nests children under their dispatcher; orphans marked.
+- Tests: exit 75 with no bridge; `#[test_utils::docker_test(helper)]`
+  dispatcher `ensure`s a child and `ls` lists it.
+
+### Step 9 — runs
+
+- `devsbd exec <key> [--detach] -- cmd…` via `CONTROL`: host execs in the
+  child through the child's own helper (`devsbd run start` there), which
+  records run id, times, exit status, and stdout/stderr under
+  `/var/lib/devsandbox/runs/<id>/`. `devsbd run ls|logs|wait <id>` for the
+  dispatcher.
+- TUI: a child's runs next to its processes.
+
+### Step 10 — Apple `container` pass
+
+- Re-check every step on Apple `container`: runtime mode falls back with a
+  warning, notify + control work over the same bridges.
+
+### Step 11 — docs
+
+- `skills/config-toml-spec/SKILL.md`: `autostart`, `dispatcher`.
+- User doc (patterns above, sample babysit dispatcher, backgrounding the loop,
+  `devsbd` commands, exit 75); `docs/high-level-architecture.md` and the
+  `AGENTS.md` module map for the new modules.
 
 ## Open questions
 
