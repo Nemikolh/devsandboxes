@@ -41,6 +41,18 @@ pub fn autostart(dir: &Path) {
     if sandboxes.is_empty() {
         return;
     }
+    // Not recorded either: with the runtime down (Docker Desktop not up yet,
+    // Apple `container system start` not run) every inspect reads as "no such
+    // container", so acting now would only print misleading notes and burn
+    // this boot's pass.
+    if let Err(e) = backend().list(false, crate::runtime::NAME_PREFIX) {
+        eprintln!(
+            "warning: autostart: {} is not reachable ({e:#}); retried on the next \
+             `run`/`start` or dashboard load",
+            runtime_label(backend().name())
+        );
+        return;
+    }
 
     state.autostart_boot.insert(project.clone(), boot);
     if let Err(e) = state.save() {
@@ -171,7 +183,7 @@ pub(crate) fn restart_decision(
         return (None, Vec::new());
     }
     if !supported {
-        let runtime = if backend == "container" { "Apple container" } else { backend };
+        let runtime = runtime_label(backend);
         return (
             None,
             vec![format!(
@@ -188,6 +200,11 @@ pub(crate) fn restart_decision(
         );
     }
     (Some(RUNTIME_RESTART), warnings)
+}
+
+/// Backend name as users know it in messages.
+fn runtime_label(backend: &str) -> &str {
+    if backend == "container" { "Apple container" } else { backend }
 }
 
 /// Whether the runtime itself restarts the container (`"runtime"` on a backend

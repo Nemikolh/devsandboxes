@@ -373,10 +373,35 @@ Landed limitations: the hook runs as the container's user, so a non-root `contai
   dispatcher.
 - TUI: a child's runs next to its processes.
 
-### Step 10 — Apple `container` pass
+### Step 10 — Apple `container` pass [x]
 
 - Re-check every step on Apple `container`: runtime mode falls back with a
   warning, notify + control work over the same bridges.
+
+Apple `container` (code audit on Linux, not run on a Mac; flags checked
+against apple/container's `docs/command-reference.md`):
+
+- **Verified by code.** `run` passes `--label` (`devsandbox.boot_hook`,
+  `devsandbox.dispatcher`) and the `sh -c '<hook>'` command after the image as
+  Apple's init-process arguments; `--restart` is never emitted there. `label`
+  reads `configuration.labels` from `inspect` JSON. Every exec argv the steps
+  added (`sync_boot`, bridges, `exec_argv` for runs, `devsbd run ls`) uses only
+  `-i`/`-d`/`-u`/`-w`/`-e`, which Apple's `exec` spells the same; runs already
+  go through `commands::exec::exec_argv`. Dispatch subprocesses get
+  `DEVSANDBOX_RUNTIME` pinned to the parent's backend.
+- **Degrades.** `autostart = "runtime"`: warning at `run`, then behaves as
+  `true` (once-per-boot pass from the TUI / first `run`/`start`); no restart
+  policy is touched, no boot file is written (`sync_boot` removes any), and
+  host `start` keeps running `postStartCommand` without reading the label.
+  Autostart skips (without recording the boot) when the runtime doesn't answer
+  `ls`, e.g. before `container system start`.
+- **Unverified on Apple.** `exec -i` carrying the bridge's binary mux stream
+  and the boot-file stdin byte-exact; `--` and dash-leading args after the
+  container id reaching the process unparsed (`devsbd run start -- …`,
+  `--offset`/`--timeout`); whether `/run/devsandbox` survives `container
+  stop`/`start` (host `start` reinstalls the helper anyway, so only the
+  in-container `devsbd boot` daemon restart would be lost); the macOS boot id
+  (`sysctl kern.boottime`) path.
 
 ### Step 11 — docs
 

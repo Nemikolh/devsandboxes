@@ -512,6 +512,9 @@ impl Executor for Subprocess {
             .stdout(log)
             .stderr(err)
             .env("GIT_TERMINAL_PROMPT", "0")
+            // Pin the child to this process's backend rather than letting it
+            // re-run default detection (macOS PATH probe for `docker`).
+            .env(crate::runtime::RUNTIME_ENV, backend().name())
             .status()
             .map_err(|e| format!("cannot run devsandbox: {e}"))?;
         if status.success() {
