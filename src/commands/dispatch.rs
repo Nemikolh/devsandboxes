@@ -31,12 +31,13 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
 use crate::config::Config;
 use crate::devsbd::control::{self, Op, Request, Response, Status};
-use crate::runtime::backend;
+use crate::runtime::{backend, bounded};
 use crate::state::{Instance, State};
 
 /// Longest accepted child key (the charset is checked by [`valid_key`]).
@@ -46,6 +47,27 @@ pub const MAX_KEY: usize = 40;
 /// handler thread and a `docker exec`; clients loop (`devsbd run wait`), and
 /// the daemon gives up on a reply after 30 minutes anyway.
 pub const MAX_WAIT: u64 = 300;
+
+/// Wall-clock limit on one dispatch `devsandbox` subprocess (`ensure`,
+/// `stop`, `rm`): it holds the host-wide control lock, so a wedged build or
+/// git call must not hold it forever. Killed with its process group.
+const DEVSANDBOX_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// Wall-clock limit on one run-op exec in a child ([`Executor::exec_in`]).
+const EXEC_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+/// Room over [`MAX_WAIT`] for a `run wait` exec, whose helper-side wait is
+/// already capped at that.
+const WAIT_SLACK: Duration = Duration::from_secs(30);
+
+/// The `exec_in` timeout for helper argv `command`: `run wait` may block up
+/// to [`MAX_WAIT`] by design, everything else gets [`EXEC_TIMEOUT`].
+fn exec_timeout(command: &[String]) -> Duration {
+    match command {
+        [_, run, wait, ..] if run == "run" && wait == "wait" => Duration::from_secs(MAX_WAIT) + WAIT_SLACK,
+        _ => EXEC_TIMEOUT,
+    }
+}
 
 /// What an in-container command left behind (see [`Executor::exec_in`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -528,7 +550,12 @@ impl Executor for Subprocess {
             .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
         let _ = writeln!(log, "$ devsandbox -C {} {}", config_dir.display(), args.join(" "));
         let err = log.try_clone().map_err(|e| e.to_string())?;
-        let status = Command::new(exe)
+        let mut timeout_log = log.try_clone().map_err(|e| e.to_string())?;
+        let mut cmd = Command::new(exe);
+        // Own process group, so a timeout kills docker/git grandchildren too.
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+        let mut child = cmd
             .arg("-C")
             .arg(config_dir)
             .args(args)
@@ -543,8 +570,22 @@ impl Executor for Subprocess {
             // Pin the child to this process's backend rather than letting it
             // re-run default detection (macOS PATH probe for `docker`).
             .env(crate::runtime::RUNTIME_ENV, backend().name())
-            .status()
+            .spawn()
             .map_err(|e| format!("cannot run devsandbox: {e}"))?;
+        let waited = bounded::wait_until(&mut child, Instant::now() + DEVSANDBOX_TIMEOUT, || false);
+        let status = match waited {
+            Ok(Some(status)) => status,
+            Ok(None) => {
+                bounded::kill_group(&mut child);
+                let why = format!("timed out after {}", bounded::human(DEVSANDBOX_TIMEOUT));
+                let _ = writeln!(timeout_log, "devsandbox: {why}, killed");
+                return Err(format!("`devsandbox {op}` {why}; log: {}", path.display()));
+            }
+            Err(e) => {
+                bounded::kill_group(&mut child);
+                return Err(format!("cannot wait for devsandbox: {e}"));
+            }
+        };
         if status.success() {
             return Ok(());
         }
@@ -560,11 +601,17 @@ impl Executor for Subprocess {
         let args = crate::commands::exec::exec_argv(child, false, false, command);
         let bin = backend().bin();
         // Captured, never inherited: this runs on the TUI's bridge worker.
-        let out = Command::new(bin)
-            .args(&args)
-            .stdin(Stdio::null())
-            .output()
-            .map_err(|e| format!("cannot run {bin}: {e}"))?;
+        // Bounded: the child's helper (container-controlled) picks the size
+        // and duration of its output.
+        let cap = control::MAX_RESPONSE;
+        let out = bounded::run(Command::new(bin).args(&args).stdin(Stdio::null()), cap, exec_timeout(command))
+            .map_err(|e| match e {
+                bounded::Error::Io(e) => format!("cannot run {bin}: {e}"),
+                e => format!("`devsbd {}` in the child {e}", command.get(1..3).unwrap_or_default().join(" ")),
+            })?;
+        if out.truncated {
+            return Err(format!("`devsbd` output in the child is longer than {cap} bytes"));
+        }
         Ok(ExecOutput {
             code: out.status.code().unwrap_or(1),
             stdout: out.stdout,
@@ -843,6 +890,15 @@ folder = "."
     }
 
     const RUN_ID: &str = "1790000000-a1b2";
+
+    #[test]
+    fn exec_timeout_allows_run_wait_its_wait() {
+        let wait = helper_argv(&run_req(Op::RunWait, "one"));
+        assert_eq!(exec_timeout(&wait), Duration::from_secs(MAX_WAIT) + WAIT_SLACK);
+        for op in [Op::Exec, Op::RunLs, Op::RunLogs] {
+            assert_eq!(exec_timeout(&helper_argv(&run_req(op, "one"))), EXEC_TIMEOUT, "{op:?}");
+        }
+    }
 
     fn run_req(op: Op, key: &str) -> Request {
         let mut r = req(op, None, Some(key));

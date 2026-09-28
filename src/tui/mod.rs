@@ -630,6 +630,24 @@ fn spawn_signal(sig: PendingSignal) -> Receiver<OpDone> {
     rx
 }
 
+/// Stdout kept from a child's `devsbd run ls` before it's given up on.
+const RUN_LS_CAP: usize = 64 * 1024;
+
+/// How long a child's `devsbd run ls` may take before it's killed.
+const RUN_LS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `devsbd run ls` in `container`, bounded in size and time (its output is
+/// container-controlled). `None` on any failure — no helper, one predating
+/// runs, a timeout, or output past [`RUN_LS_CAP`] (dropped whole rather than
+/// parsed cut off): the Procs view then just shows no runs.
+fn run_ls(container: &str) -> Option<String> {
+    let backend = crate::runtime::backend();
+    let mut cmd = std::process::Command::new(backend.bin());
+    cmd.args(["exec", container, crate::devsbd::BIN, "run", "ls"]).stdin(std::process::Stdio::null());
+    let out = crate::runtime::bounded::run(&mut cmd, RUN_LS_CAP, RUN_LS_TIMEOUT).ok()?;
+    (out.status.success() && !out.truncated).then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
 /// Spawn one detached thread that runs the runtime's `proc_list` for each target
 /// `(instance name, container)` and sends back a name→[`ProcState`] map. Docker
 /// calls go through the screen-safe quiet path; a per-container error becomes a
@@ -644,8 +662,7 @@ fn spawn_proc_fetch(targets: Vec<(String, String)>) -> Receiver<BTreeMap<String,
                     let mut rows = build_forest(parse_top(&list.text));
                     // A child's runs next to its processes (docs/automations.md,
                     // "Runs"). No helper, or one predating runs: no rows.
-                    let ls = ["exec", container.as_str(), crate::devsbd::BIN, "run", "ls"];
-                    if let Ok(text) = crate::runtime::backend().output_quiet(&ls) {
+                    if let Some(text) = run_ls(&container) {
                         rows.extend(procs::run_rows(&text));
                     }
                     ProcState::Rows { rows, signalable: list.container_pids }

@@ -7,6 +7,7 @@
 //! `--filter`) and which lacks `network connect`, `--network-alias` and `top`.
 
 mod apple;
+pub mod bounded;
 mod dockerlike;
 
 #[cfg(test)]

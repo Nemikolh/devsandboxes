@@ -3,7 +3,9 @@
 //! effort and fully quiet: a missing notifier (no `notify-send`, headless
 //! host) is skipped silently, and nothing inherits the TUI's terminal.
 
+use std::collections::HashMap;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use super::bridge::Notification;
 use super::notify::Level;
@@ -82,10 +84,100 @@ pub fn notify_desktop(n: &Notification) {
     }
 }
 
+/// Popups one instance may show back to back before [`RATE_REFILL`] applies.
+const RATE_BURST: u32 = 3;
+
+/// One more popup per instance is allowed every this long.
+const RATE_REFILL: Duration = Duration::from_secs(10);
+
+/// A keyed notification repeating the `(instance, key)` of one shown this
+/// recently isn't popped again (the inbox row is still updated).
+const COALESCE_WINDOW: Duration = Duration::from_secs(60);
+
+/// Which notifications become desktop popups: a token bucket per instance
+/// ([`RATE_BURST`], refilled one per [`RATE_REFILL`]) plus coalescing of
+/// repeated keys, so a container can't flood the desktop. The clock is passed
+/// in, so it's testable; only popups are limited, never inbox delivery.
+#[derive(Default)]
+pub struct RateLimit {
+    // instance → (tokens left, when the last token was credited).
+    buckets: HashMap<String, (u32, Instant)>,
+    // (instance, key) → when it last popped.
+    shown: HashMap<(String, String), Instant>,
+}
+
+impl RateLimit {
+    /// Whether `n` may pop up at `now`; a `true` consumes a token.
+    pub fn allow(&mut self, n: &Notification, now: Instant) -> bool {
+        self.shown.retain(|_, at| now.saturating_duration_since(*at) < COALESCE_WINDOW);
+        let key = n.record.key.as_ref().map(|k| (n.instance.clone(), k.clone()));
+        if key.as_ref().is_some_and(|k| self.shown.contains_key(k)) {
+            return false;
+        }
+        let (tokens, since) = self.buckets.entry(n.instance.clone()).or_insert((RATE_BURST, now));
+        let earned = (now.saturating_duration_since(*since).as_nanos() / RATE_REFILL.as_nanos()) as u32;
+        if earned > 0 {
+            *tokens = (*tokens).saturating_add(earned).min(RATE_BURST);
+            *since += RATE_REFILL * earned;
+        }
+        if *tokens == 0 {
+            return false;
+        }
+        *tokens -= 1;
+        if let Some(k) = key {
+            self.shown.insert(k, now);
+        }
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::devsbd::notify::Record;
+
+    fn from(instance: &str, key: Option<&str>) -> Notification {
+        Notification {
+            instance: instance.into(),
+            record: Record { level: Level::Info, key: key.map(Into::into), link: None, msg: "m".into(), at: 0 },
+        }
+    }
+
+    #[test]
+    fn rate_limit_bursts_then_refills_per_instance() {
+        let mut rl = RateLimit::default();
+        let t0 = Instant::now();
+        let a = from("a", None);
+        for _ in 0..RATE_BURST {
+            assert!(rl.allow(&a, t0));
+        }
+        assert!(!rl.allow(&a, t0), "burst spent");
+        // Another instance has its own bucket.
+        assert!(rl.allow(&from("b", None), t0));
+        assert!(!rl.allow(&a, t0 + RATE_REFILL - Duration::from_millis(1)));
+        assert!(rl.allow(&a, t0 + RATE_REFILL), "one token refilled");
+        assert!(!rl.allow(&a, t0 + RATE_REFILL));
+        // A long quiet spell refills to the burst, not beyond.
+        let later = t0 + RATE_REFILL * 100;
+        for _ in 0..RATE_BURST {
+            assert!(rl.allow(&a, later));
+        }
+        assert!(!rl.allow(&a, later));
+    }
+
+    #[test]
+    fn rate_limit_coalesces_repeated_keys() {
+        let mut rl = RateLimit::default();
+        let t0 = Instant::now();
+        assert!(rl.allow(&from("a", Some("pr-1")), t0));
+        assert!(!rl.allow(&from("a", Some("pr-1")), t0 + Duration::from_secs(1)), "repeat coalesced");
+        // Other key, other instance, unkeyed: not coalesced.
+        assert!(rl.allow(&from("a", Some("pr-2")), t0 + Duration::from_secs(1)));
+        assert!(rl.allow(&from("b", Some("pr-1")), t0 + Duration::from_secs(1)));
+        assert!(rl.allow(&from("a", None), t0 + Duration::from_secs(1)));
+        // Past the window the key pops again.
+        assert!(rl.allow(&from("a", Some("pr-1")), t0 + COALESCE_WINDOW + Duration::from_secs(1)));
+    }
 
     fn n(level: Level, msg: &str, link: Option<&str>) -> Notification {
         Notification {

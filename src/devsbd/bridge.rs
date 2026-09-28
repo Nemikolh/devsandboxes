@@ -11,7 +11,7 @@ use std::os::unix::net::UnixStream;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -158,6 +158,39 @@ struct Services {
     instance: String,
     sink: Sink,
     control: ControlHandler,
+    // Live notify/control handler threads of this bridge (see `HandlerSlot`).
+    handlers: Arc<AtomicUsize>,
+}
+
+impl Services {
+    fn new(instance: String, sink: Sink, control: ControlHandler) -> Services {
+        Services { instance, sink, control, handlers: Arc::default() }
+    }
+}
+
+/// Notify/control handler threads one bridge may run at once. The container
+/// controls its end of the mux, and a peer `Close` frees the mux entry while
+/// our handler keeps going, so `mux::MAX_STREAMS` alone doesn't bound these.
+const MAX_HANDLERS: usize = 8;
+
+/// One of a bridge's [`MAX_HANDLERS`] slots, held by a handler thread for its
+/// whole life and released on drop.
+struct HandlerSlot(Arc<AtomicUsize>);
+
+impl HandlerSlot {
+    /// A slot on `count`, or `None` when all are taken.
+    fn acquire(count: &Arc<AtomicUsize>) -> Option<HandlerSlot> {
+        count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < MAX_HANDLERS).then_some(n + 1))
+            .ok()
+            .map(|_| HandlerSlot(Arc::clone(count)))
+    }
+}
+
+impl Drop for HandlerSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// The caps a host bridge advertises in its `Caps` frame: `SSH_AGENT` only
@@ -211,8 +244,9 @@ const NOTIFY_REPLY_BAD: &[u8] = b"bad record";
 
 /// The local end for an `Open` on `channel`, or `None` to refuse it: agent
 /// streams connect to the host agent (when this bridge has a provider), notify
-/// and control streams go to a handler thread (when it has `services`). Must
-/// return at once: it runs on the mux's `serve` thread.
+/// and control streams go to a handler thread (when it has `services` and a
+/// free [`HandlerSlot`]). Must return at once: it runs on the mux's `serve`
+/// thread.
 fn open_stream(
     channel: u8,
     agent: Option<&impl Fn() -> Option<PathBuf>>,
@@ -225,8 +259,12 @@ fn open_stream(
         _ => return None,
     };
     let to = services?.clone();
+    let slot = HandlerSlot::acquire(&to.handlers)?;
     let (ours, theirs) = UnixStream::pair().ok()?;
-    std::thread::spawn(move || handler(ours, &to));
+    std::thread::spawn(move || {
+        let _slot = slot;
+        handler(ours, &to)
+    });
     Some(theirs.into())
 }
 
@@ -289,11 +327,7 @@ pub fn spawn(info: &Instance) -> Option<Bridge> {
 /// `with_agent`, notify + control only when `sink` is set.
 fn spawn_managed(key: &str, info: &Instance, with_agent: bool, sink: Option<&Sink>) -> Option<Bridge> {
     let hash = info.devsbd_arch.and_then(super::hash).unwrap_or_default();
-    let notify = sink.map(|s| Services {
-        instance: key.to_string(),
-        sink: Arc::clone(s),
-        control: Arc::new(dispatch_control),
-    });
+    let notify = sink.map(|s| Services::new(key.to_string(), Arc::clone(s), Arc::new(dispatch_control)));
     if with_agent {
         spawn_with(&info.container, hash, Some(host_agent), notify)
     } else {
@@ -574,11 +608,17 @@ impl Bridges {
     ///
     /// `sink` set → every helper-capable running instance gets a notify-serving
     /// bridge; each notification is shown on the desktop (from the stream's
-    /// handler thread) and then sent on `sink`, which the TUI drains.
+    /// handler thread) unless [`RateLimit`](super::desktop::RateLimit) holds
+    /// it back, and always sent on `sink`, which the TUI drains.
     pub fn spawn_worker(sink: Option<mpsc::Sender<Notification>>) -> BridgeWorker {
         let sink = sink.map(|tx| -> Sink {
+            // One limiter for every bridge, keyed by instance inside.
+            let limit = Mutex::new(super::desktop::RateLimit::default());
             Arc::new(move |n: Notification| {
-                super::desktop::notify_desktop(&n);
+                let pop = limit.lock().unwrap_or_else(|e| e.into_inner()).allow(&n, Instant::now());
+                if pop {
+                    super::desktop::notify_desktop(&n);
+                }
                 let _ = tx.send(n);
             })
         });
@@ -671,14 +711,10 @@ mod tests {
     fn services(instance: &str, control: ControlHandler) -> (Services, mpsc::Receiver<Notification>) {
         let (tx, rx) = mpsc::channel();
         let tx = Mutex::new(tx);
-        let to = Services {
-            instance: instance.into(),
-            sink: Arc::new(move |n| {
-                let _ = tx.lock().unwrap().send(n);
-            }),
-            control,
-        };
-        (to, rx)
+        let sink: Sink = Arc::new(move |n| {
+            let _ = tx.lock().unwrap().send(n);
+        });
+        (Services::new(instance.into(), sink, control), rx)
     }
 
     /// A control handler that must not be called.
@@ -778,6 +814,34 @@ mod tests {
         assert!(open_stream(proto::channel::NOTIFY, none.as_ref(), None).is_none());
         assert!(open_stream(proto::channel::CONTROL, none.as_ref(), None).is_none());
         assert!(open_stream(proto::channel::SSH_AGENT, none.as_ref(), None).is_none());
+    }
+
+    /// Past `MAX_HANDLERS` live handler threads a notify/control `Open` is
+    /// refused without spawning; a finished handler frees its slot. Agent
+    /// streams don't take slots.
+    #[test]
+    fn handler_slots_bound_notify_and_control_opens() {
+        let (to, _rx) = services("web-1", no_control());
+        let held: Vec<_> = (0..MAX_HANDLERS).map(|_| HandlerSlot::acquire(&to.handlers).unwrap()).collect();
+        let none: Option<fn() -> Option<PathBuf>> = None;
+        assert!(open_stream(proto::channel::NOTIFY, none.as_ref(), Some(&to)).is_none());
+        assert!(open_stream(proto::channel::CONTROL, none.as_ref(), Some(&to)).is_none());
+        assert_eq!(to.handlers.load(Ordering::Acquire), MAX_HANDLERS);
+        drop(held);
+        assert_eq!(to.handlers.load(Ordering::Acquire), 0);
+        // Accepted again; dropping our end ends the handler, freeing the slot.
+        let conn = open_stream(proto::channel::NOTIFY, none.as_ref(), Some(&to));
+        assert!(conn.is_some());
+        drop(conn);
+        let mut freed = false;
+        for _ in 0..100 {
+            if to.handlers.load(Ordering::Acquire) == 0 {
+                freed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(freed, "handler thread released its slot");
     }
 
     /// A control stream reaches the handler with this bridge's instance key

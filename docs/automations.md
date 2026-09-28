@@ -569,7 +569,7 @@ container trigger those host git calls itself (`ensure`, `rm`).
 - Tests: env deny table; dispatcher-sandbox spawn denied; child-as-dispatcher
   denied; default cap.
 
-### Step 20 — host-side limits and timeouts (Medium)
+### Step 20 — host-side limits and timeouts (Medium) [x]
 
 - Per-bridge semaphore for notify/control handler threads (e.g. 8), held for
   the handler's whole life (not the mux entry): over the limit → the `Open`

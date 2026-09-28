@@ -12,6 +12,10 @@ use super::{App, Tab};
 /// container outbox is the durable queue, the inbox is a session view.
 pub const INBOX_CAP: usize = 200;
 
+/// Entries kept per instance, within [`INBOX_CAP`]: one noisy container drops
+/// its own oldest rows instead of evicting every other instance's.
+pub const INBOX_INSTANCE_CAP: usize = 50;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InboxEntry {
     /// Stable per-session id, so the selection can follow an entry while rows
@@ -42,6 +46,12 @@ impl Inbox {
         }
         let id = self.next_id;
         self.next_id += 1;
+        let mine = self.entries.iter().filter(|e| e.instance == instance).count();
+        if mine >= INBOX_INSTANCE_CAP {
+            if let Some(oldest) = self.entries.iter().rposition(|e| e.instance == instance) {
+                self.entries.remove(oldest);
+            }
+        }
         self.entries.insert(0, InboxEntry { id, instance, record, unread });
         self.entries.truncate(INBOX_CAP);
     }
@@ -233,12 +243,33 @@ mod tests {
     #[test]
     fn capped_dropping_oldest() {
         let mut app = new_app();
+        // Spread over instances so only the global cap applies.
         for i in 0..INBOX_CAP + 5 {
-            app.push_notification("a".into(), rec(&i.to_string(), None, None));
+            let instance = format!("i{}", i % 10);
+            app.push_notification(instance, rec(&i.to_string(), None, None));
         }
         assert_eq!(app.inbox.entries.len(), INBOX_CAP);
         assert_eq!(app.inbox.entries[0].record.msg, (INBOX_CAP + 4).to_string());
         assert_eq!(app.inbox.entries.last().unwrap().record.msg, "5");
+    }
+
+    #[test]
+    fn per_instance_cap_drops_only_that_instances_oldest() {
+        let mut app = new_app();
+        app.push_notification("quiet".into(), rec("q0", None, None));
+        for i in 0..INBOX_INSTANCE_CAP {
+            app.push_notification("noisy".into(), rec(&i.to_string(), None, None));
+        }
+        app.push_notification("quiet".into(), rec("q1", None, None));
+        assert_eq!(app.inbox.entries.len(), INBOX_INSTANCE_CAP + 2);
+        // The 51st from `noisy` drops `noisy`'s oldest ("0"), not `quiet`'s.
+        app.push_notification("noisy".into(), rec("new", None, None));
+        let noisy: Vec<_> = msgs(&app).into_iter().filter(|(i, _)| *i == "noisy").map(|(_, m)| m).collect();
+        assert_eq!(noisy.len(), INBOX_INSTANCE_CAP);
+        assert_eq!(noisy[0], "new");
+        assert_eq!(*noisy.last().unwrap(), "1");
+        let quiet: Vec<_> = msgs(&app).into_iter().filter(|(i, _)| *i == "quiet").map(|(_, m)| m).collect();
+        assert_eq!(quiet, ["q1", "q0"]);
     }
 
     #[test]
