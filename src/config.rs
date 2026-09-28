@@ -52,7 +52,8 @@ pub struct SandboxProperties {
     #[serde(rename = "worktree-base")]
     pub worktree_base: Option<String>,
     /// Extra `.worktreeinclude` patterns (gitignore syntax): gitignored files
-    /// copied from the base repo into each new worktree. Applied after the
+    /// copied from the base repo into each worktree, on `run` and every
+    /// `rebuild` (never overwriting). Applied after the
     /// repo's own `.worktreeinclude`, so they can negate its patterns.
     #[serde(rename = "worktree-include")]
     pub worktree_include: Option<Vec<String>>,

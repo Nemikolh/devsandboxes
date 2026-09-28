@@ -58,6 +58,7 @@ devsbd ls; devsbd stop pr-123; devsbd rm pr-123
 - `start` sets the container's restart policy from `autostart`, overwriting a policy set by hand.
 - While the dashboard is open it keeps a helper connection to every running instance that has the helper, not only when an ssh-agent is being relayed.
 - `devsandbox status --json` instance rows include `instance_id` and, for children, `dispatcher`.
+- **`rebuild` applies `worktree-include`.** Before, adding a pattern marked instances as drifted, but the rebuild copied nothing. Now `rebuild` copies any missing matching files into the worktree; existing files are never overwritten. A copied file you delete on purpose comes back on the next rebuild, so drop the pattern instead.
 
 ### Security
 

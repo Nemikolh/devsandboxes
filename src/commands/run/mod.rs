@@ -190,7 +190,6 @@ pub fn run(
         worktree,
         branch,
         branch_created,
-        true,
         &extras,
         &mut state,
     )?;
@@ -227,9 +226,10 @@ fn worktree_branch(
 /// container/service/mount name derives from. `source` is what gets mounted as
 /// the working tree (a worktree when `worktree.is_some()`, else `folder`);
 /// `folder` is the canonicalized base folder, used for `base_folder` and the
-/// git companion mount. `fresh_worktree` seeds a just-created worktree with the
-/// `.worktreeinclude` copies (`rebuild` passes false: seeding is once only).
-/// `branch_created` is recorded for `rm` (see `Instance::branch_created`).
+/// git companion mount. A worktree gets the `.worktreeinclude` copies on every
+/// call, `rebuild` included, so adding a pattern and rebuilding (the fix the
+/// resulting drift points at) actually delivers the file; the copy never
+/// overwrites, so edits in the worktree survive. `branch_created` is recorded for `rm` (see `Instance::branch_created`).
 /// `extras.dispatcher` falls back to the entry being replaced, as does the
 /// recorded `config_dir`, so a `rebuild` keeps both.
 #[allow(clippy::too_many_arguments)]
@@ -245,7 +245,6 @@ pub(crate) fn materialize(
     worktree: Option<PathBuf>,
     branch: Option<String>,
     branch_created: bool,
-    fresh_worktree: bool,
     extras: &RunExtras,
     state: &mut State,
 ) -> Result<()> {
@@ -310,7 +309,7 @@ pub(crate) fn materialize(
         link_shared_files(&store, &trees, &links)?;
         Some(store)
     };
-    if fresh_worktree && worktree.is_some() {
+    if worktree.is_some() {
         let patterns = props.worktree_include.clone().unwrap_or_default();
         copy_worktree_includes(folder, source, &patterns);
     }

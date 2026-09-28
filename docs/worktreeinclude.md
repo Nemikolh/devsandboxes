@@ -12,12 +12,12 @@ These files come in two kinds, handled by two mechanisms:
 
 | Kind | Examples | Mechanism |
 |---|---|---|
-| Seed: copied once, then owned by each tree | `.vscode/tasks.json`, `.mise.local.toml` | **copy**: `.worktreeinclude` + `worktree-include` |
+| Seed: copied in, then owned by each tree | `.vscode/tasks.json`, `.mise.local.toml` | **copy**: `.worktreeinclude` + `worktree-include` |
 | Shared: one copy, edits seen by every instance | `.env`, `.env.local` | **link**: `worktree-link` |
 
 ```toml
 [template.base]
-worktree-include = [".vscode/tasks.json"]   # copied into each new worktree
+worktree-include = [".vscode/tasks.json"]   # copied into each worktree
 worktree-link    = [".env", ".env.local"]   # shared live by every instance
 ```
 
@@ -54,8 +54,12 @@ Rules (shared with the other tools):
 - **Existing files are never overwritten.**
 - The file is read from the **base repo** (where the ignored files live), not
   from the new worktree's branch.
-- Copies are made **once, when the worktree is created**. `rebuild` keeps the
-  worktree and doesn't copy again, so a file deleted on purpose stays deleted.
+- Copies are made when the worktree is created **and on every `rebuild`**.
+  Adding a pattern marks instances as drifted, so the rebuild that drift points
+  to has to deliver the file, or it would "fix" the drift without changing
+  anything. The flip side: a copied file deleted on purpose in a worktree comes
+  back on the next `rebuild`. Drop the pattern, or give that use case its own
+  sandbox, instead. `start` doesn't copy.
 
 Mechanism. Git does all the matching, so there is no gitignore-parser
 dependency:
@@ -77,8 +81,8 @@ dependency:
    and uses `copy_file_range` (reflink-capable) on Linux.
 
 Step 1 walks untracked directories (e.g. `node_modules`) looking for matches.
-That's git's own directory walk: fast in practice, and it runs once per
-worktree.
+That's git's own directory walk: fast in practice, and it only runs on `run`
+and `rebuild`.
 
 ## Link: `worktree-link`
 
@@ -155,8 +159,8 @@ from the TUI, and stdout carries the instance name for scripts.
 - `src/commands/run/worktree.rs` — `copy_worktree_includes` and
   `link_shared_files`, beside `create_worktree`.
 - `src/commands/run/mod.rs` (`materialize`) — after `initializeCommand`, first
-  links (store mount pushed onto `extra_mounts`), then the copy when
-  `fresh_worktree` (`run` passes true, `rebuild` false). Both happen before the
+  links (store mount pushed onto `extra_mounts`), then the copy for
+  worktree instances (`run` and `rebuild` alike). Both happen before the
   container exists, so lifecycle commands see the files.
 - `src/commands/rm.rs:67` — `git worktree remove` without `--force`. Verified
   that ignored files don't make a worktree unclean, so copies and links neither
@@ -167,6 +171,5 @@ from the TUI, and stdout carries the instance name for scripts.
 - `.worktreeinclude.local` (per-user additions and negations, read last).
 - `**` / `[...]` in `worktree-link`, read-only store mounts, a per-repo (rather than
   per-sandbox) store, and an `unlink`/restore command.
-- A command to re-seed copies into an existing instance.
 - Serving shared files through `devsbd` into a tmpfs, so secrets never sit in
   plaintext under the config dir.

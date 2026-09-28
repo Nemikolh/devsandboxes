@@ -119,7 +119,6 @@ fn rebuild_instance(
         worktree,
         branch,
         branch_created,
-        false,
         // No extras: `materialize` keeps the recorded dispatcher; `--env`s
         // aren't recorded, so they are dropped.
         &run::RunExtras::default(),
