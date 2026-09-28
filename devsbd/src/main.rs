@@ -11,6 +11,9 @@ mod outbox;
 #[path = "../../src/devsbd/bootfile.rs"]
 #[allow(dead_code)] // host-only serializer
 mod bootfile;
+#[path = "../../src/devsbd/control.rs"]
+#[allow(dead_code)] // the control CLI (`devsbd ensure|ls|stop|rm`) comes next
+mod control;
 #[path = "../../src/devsbd/escape.rs"]
 mod escape;
 #[path = "../../src/devsbd/mux.rs"]

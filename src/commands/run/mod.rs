@@ -35,12 +35,25 @@ use worktree::{copy_worktree_includes, create_worktree, git_companion_mount, lin
 /// after `--branch`.
 pub const DEFAULT_WORKTREE_BRANCH: &str = "sandbox/${instance}";
 
+/// Per-instance additions from the hidden `run` flags, which a dispatcher's
+/// control requests use (`commands::dispatch`). Not part of the config, so
+/// not hashed.
+#[derive(Debug, Clone, Default)]
+pub struct RunExtras {
+    /// Extra `-e K=V` for this instance only, after `containerEnv` (so they
+    /// win on a duplicate key). Not recorded: a `rebuild` drops them.
+    pub env: Vec<(String, String)>,
+    /// `instance_id` of the owning dispatcher.
+    pub dispatcher: Option<String>,
+}
+
 pub fn run(
     dir: &Path,
     sandbox_name: Option<String>,
     instance_name: Option<String>,
     branch_override: Option<String>,
     base_override: Option<String>,
+    extras: RunExtras,
 ) -> Result<()> {
     let config = match Config::load(dir) {
         Ok(config) if !config.sandboxes.is_empty() => config,
@@ -123,7 +136,9 @@ pub fn run(
         instance: &instance_id,
     };
 
-    let (source, worktree, branch) = if base_in_use(&state, &folder) {
+    // A dispatcher's child always gets a worktree, even as the folder's first
+    // instance: an unattended agent must never work in the user's checkout.
+    let (source, worktree, branch) = if base_in_use(&state, &folder) || extras.dispatcher.is_some() {
         // Branch for the worktree: `--branch` override, else the sandbox's
         // `worktree-branch`, else the default. `${instance}` (and the other mount
         // variables) are substituted so each instance gets a unique branch.
@@ -158,6 +173,7 @@ pub fn run(
         worktree,
         branch,
         true,
+        &extras,
         &mut state,
     )?;
 
@@ -177,6 +193,8 @@ pub fn run(
 /// `folder` is the canonicalized base folder, used for `base_folder` and the
 /// git companion mount. `fresh_worktree` seeds a just-created worktree with the
 /// `.worktreeinclude` copies (`rebuild` passes false: seeding is once only).
+/// `extras.dispatcher` falls back to the entry being replaced, as does the
+/// recorded `config_dir`, so a `rebuild` keeps both.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn materialize(
     dir: &Path,
@@ -190,9 +208,16 @@ pub(crate) fn materialize(
     worktree: Option<PathBuf>,
     branch: Option<String>,
     fresh_worktree: bool,
+    extras: &RunExtras,
     state: &mut State,
 ) -> Result<()> {
     let props = &sandbox.properties;
+    let prior = state.instances.get(instance);
+    let dispatcher = extras
+        .dispatcher
+        .clone()
+        .or_else(|| prior.and_then(|i| i.dispatcher.clone()));
+    let prior_config_dir = prior.and_then(|i| i.config_dir.clone());
     let container_name = format!("{NAME_PREFIX}{instance_id}");
     let basename = folder
         .file_name()
@@ -310,6 +335,7 @@ pub(crate) fn materialize(
     } else {
         None
     };
+    extra_env.extend(extras.env.iter().cloned());
     // `shell-rc`: host snippets mounted read-only, sourced by the rc files.
     let shell_rc = resolve_shell_rc(dir, &var_ctx, props)?;
     mounts.extend(shell_rc.iter().map(|(mount, _)| mount.clone()));
@@ -349,6 +375,7 @@ pub(crate) fn materialize(
         &endpoints,
         privileged,
         restart,
+        dispatcher.as_deref(),
     )?;
     let container = container_name.clone();
     // Before lifecycle commands, so they could already rely on the helper. In
@@ -399,6 +426,8 @@ pub(crate) fn materialize(
             ssh_auth_sock,
             devsbd_arch,
             volumes,
+            dispatcher,
+            config_dir: Some(prior_config_dir.unwrap_or(config_dir)),
             created_unix: Instance::now(),
         },
     );
@@ -574,6 +603,7 @@ fn run_container(
     endpoints: &[ServiceEndpoint],
     privileged: bool,
     restart: Option<&str>,
+    dispatcher: Option<&str>,
 ) -> Result<()> {
     let props = &sandbox.properties;
     let image = image_for(dir, sandbox)?;
@@ -606,6 +636,10 @@ fn run_container(
     if let Some(policy) = restart {
         args.push("--restart".into());
         args.push(policy.into());
+    }
+    if let Some(id) = dispatcher {
+        args.push("--label".into());
+        args.push(format!("{DISPATCHER_LABEL}={id}"));
     }
     if let Some(user) = &props.container_user {
         args.push("--user".into());
@@ -647,6 +681,9 @@ fn run_container(
 /// ([`container_command`]); older ones run a bare `sleep infinity`, so `start`
 /// must keep running their `postStartCommand` from the host.
 pub(crate) const BOOT_HOOK_LABEL: &str = "devsandbox.boot_hook";
+
+/// Label carrying the owning dispatcher's `instance_id` on a child container.
+pub(crate) const DISPATCHER_LABEL: &str = "devsandbox.dispatcher";
 
 /// The container command. Same trick as devcontainers: keep the container
 /// alive, work happens via exec. Before the keep-alive, in the background,
@@ -715,6 +752,8 @@ mod tests {
             ssh_auth_sock: None,
             devsbd_arch: None,
             volumes: Vec::new(),
+            dispatcher: None,
+            config_dir: None,
             created_unix: 0,
         }
     }

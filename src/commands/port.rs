@@ -690,6 +690,8 @@ image = "node"
             ssh_auth_sock: None,
             devsbd_arch: None,
             volumes: Vec::new(),
+            dispatcher: None,
+            config_dir: None,
             created_unix: 0,
         }
     }

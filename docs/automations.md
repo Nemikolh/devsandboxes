@@ -314,20 +314,32 @@ Landed limitations: the hook runs as the container's user, so a non-root `contai
 - `src/tui/mod.rs`: drain the sink each loop turn into `App`; fire the desktop
   notifier from the worker, not the UI thread.
 
-### Step 7 — `dispatcher` config + control handler (host, pure)
+### Step 7 — `dispatcher` config + control handler (host, pure) [x]
 
 - `src/config.rs`: `dispatcher: Option<Dispatcher { spawn: Vec<String>,
   max_instances: Option<u32> }>` (`"*"` = any sandbox of this root), validated
   at `ls` (unknown sandbox names error, except `"*"`).
 - `src/state.rs` `Instance`: `dispatcher: Option<String>` (owner
   `instance_id`); `run_container` adds label `devsandbox.dispatcher=<id>`.
-- New `src/commands/dispatch.rs`: request/response types (JSON) for `ensure`,
-  `ls`, `stop`, `rm`; pure authorization (`spawn` list, ownership, cap) and
-  naming (`<sandbox>-<key>`, key charset validated); execution reusing
-  `run::materialize` / `start_instance` / `stop` / `rm` in quiet mode.
-  `ensure` = create with `--branch`/`--env` if missing, start if stopped,
-  return the name.
-- Tests: authorization matrix, naming, cap, `ls` filters to owned children.
+- `Instance.config_dir: Option<PathBuf>` recorded at creation (state holds
+  only the project id today); the handler resolves a dispatcher's config root
+  from it.
+- Execution by **subprocess**, not in-process: the handler runs on the TUI's
+  bridge worker, and `run`/`start` print and stream docker/git output through
+  inherited stdio (`run_checked`, `src/runtime/mod.rs:165`), which would hit
+  the alternate screen. So each op spawns `current_exe() -C <config_dir> run …
+  | start … | stop … | rm …`, stdio to `<data>/devsandbox/logs/dispatch-*.log`,
+  and maps the exit status. New hidden `run` flags: `--env K=V` (extra
+  containerEnv for this instance) and `--dispatcher <instance_id>` (owner).
+- Wire format shared with the helper (`src/devsbd/control.rs`, `#[path]`,
+  line-based like `bootfile`/`notify` — the helper has no serde): request
+  `op`/`sandbox`/`key`/`branch`/`env` lines; response status + body (`ls` body
+  is JSON built on the host).
+- New `src/commands/dispatch.rs`: pure authorization (`spawn` list, ownership,
+  cap) and naming (`<sandbox>-<key>`, key charset validated), `ensure` = create
+  if missing, start if stopped, return the name; executor injectable for tests.
+- Tests: codec round-trip, authorization matrix, naming, cap, `ls` filters to
+  owned children, `ensure` decision per child state.
 
 ### Step 8 — control channel end to end
 

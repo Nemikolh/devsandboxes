@@ -12,6 +12,11 @@ pub mod bridge;
 // Shared with the helper; the parser is helper-only (the host only writes).
 #[allow(dead_code)]
 pub mod bootfile;
+// Shared with the helper, which sends requests; the host decodes them and
+// answers (`commands::dispatch`). Partly helper-only (`encode_request`,
+// `decode_response`, exit codes).
+#[allow(dead_code)]
+pub mod control;
 // Desktop delivery of container notifications, fed by `bridge`'s notify sink.
 #[cfg(unix)]
 pub mod desktop;

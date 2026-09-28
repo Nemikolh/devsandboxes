@@ -75,6 +75,11 @@ pub struct SandboxProperties {
     /// Bring this sandbox's instances up once per host boot (docs/automations.md).
     /// Excluded from `config_hash` so toggling it never marks instances drifted.
     pub autostart: Option<Autostart>,
+    /// Makes this sandbox a dispatcher: its instances may create and manage
+    /// child instances over the control API (docs/automations.md). Read from
+    /// config on every request and baked into nothing, so it's excluded from
+    /// `config_hash` like `autostart`.
+    pub dispatcher: Option<Dispatcher>,
 
     // --- implemented devcontainer properties ---
     pub image: Option<String>,
@@ -133,6 +138,27 @@ pub enum Autostart {
     Devsandbox,
     /// The container runtime restarts the containers on boot.
     Runtime,
+}
+
+/// `dispatcher = { spawn = [...], max-instances = N }`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Dispatcher {
+    /// Sandboxes of this config root the dispatcher may instantiate;
+    /// [`Dispatcher::ANY`] allows every one.
+    #[serde(default)]
+    pub spawn: Vec<String>,
+    /// Cap on the dispatcher's children (all recorded ones, stopped included).
+    #[serde(rename = "max-instances")]
+    pub max_instances: Option<u32>,
+}
+
+impl Dispatcher {
+    pub const ANY: &'static str = "*";
+
+    pub fn may_spawn(&self, sandbox: &str) -> bool {
+        self.spawn.iter().any(|s| s == Self::ANY || s == sandbox)
+    }
 }
 
 impl<'de> Deserialize<'de> for Autostart {
@@ -687,10 +713,32 @@ impl Config {
     }
 
     pub fn resolve_all(&self) -> Result<Vec<ResolvedSandbox>> {
-        self.sandboxes
+        let all = self
+            .sandboxes
             .keys()
             .map(|name| self.resolve_sandbox(name))
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        for sandbox in &all {
+            self.validate_dispatcher(sandbox)?;
+        }
+        Ok(all)
+    }
+
+    /// Cross-sandbox check `resolve_sandbox` can't do alone: every `spawn`
+    /// entry names a sandbox of this config (or is `"*"`).
+    pub fn validate_dispatcher(&self, sandbox: &ResolvedSandbox) -> Result<()> {
+        let Some(dispatcher) = &sandbox.properties.dispatcher else {
+            return Ok(());
+        };
+        for entry in &dispatcher.spawn {
+            if entry != Dispatcher::ANY && !self.sandboxes.contains_key(entry) {
+                bail!(
+                    "sandbox `{}`: `dispatcher.spawn` names unknown sandbox `{entry}`",
+                    sandbox.name
+                );
+            }
+        }
+        Ok(())
     }
 }
 
@@ -729,10 +777,12 @@ fn config_hash(table: &Table) -> String {
 }
 
 /// [`config_hash`] of a merged sandbox table minus the keys that apply without
-/// recreating the container (`autostart`), so flipping them isn't drift.
+/// recreating the container (`autostart`, `dispatcher`), so flipping them
+/// isn't drift.
 fn sandbox_hash(table: &Table) -> String {
     let mut table = table.clone();
     table.remove("autostart");
+    table.remove("dispatcher");
     config_hash(&table)
 }
 
@@ -880,6 +930,54 @@ folders = { "/workspaces/docs" = "../docs" }
         assert_eq!(table_hash, hash);
         // Still shown in the resolved view.
         assert!(table.contains_key("autostart"));
+    }
+
+    #[test]
+    fn dispatcher_parses_and_rejects_unknown_keys() {
+        let config = Config::parse(
+            "[sandbox.d]\nfolder = \".\"\ndispatcher = { spawn = [\"web\", \"*\"], max-instances = 3 }\n\
+             [sandbox.web]\nfolder = \".\"\n",
+        )
+        .unwrap();
+        let d = config.resolve_sandbox("d").unwrap().properties.dispatcher.unwrap();
+        assert_eq!(d.spawn, vec!["web", "*"]);
+        assert_eq!(d.max_instances, Some(3));
+        assert!(d.may_spawn("anything"));
+        assert_eq!(config.resolve_sandbox("web").unwrap().properties.dispatcher, None);
+
+        let bad = Config::parse("[sandbox.d]\ndispatcher = { spawn = [], max = 3 }\n").unwrap();
+        let err = format!("{:#}", bad.resolve_sandbox("d").unwrap_err());
+        assert!(err.contains("max"), "{err}");
+        // snake_case spelling is rejected too: the key is `max-instances`.
+        let bad = Config::parse("[sandbox.d]\ndispatcher = { max_instances = 3 }\n").unwrap();
+        assert!(bad.resolve_sandbox("d").is_err());
+    }
+
+    #[test]
+    fn dispatcher_spawn_list_is_checked_by_resolve_all() {
+        let ok = Config::parse(
+            "[sandbox.d]\ndispatcher = { spawn = [\"web\", \"*\", \"d\"] }\n[sandbox.web]\n",
+        )
+        .unwrap();
+        assert!(ok.resolve_all().is_ok());
+        let d = ok.resolve_sandbox("d").unwrap().properties.dispatcher.unwrap();
+        assert!(d.may_spawn("web") && d.may_spawn("d"));
+
+        let bad = Config::parse("[sandbox.d]\ndispatcher = { spawn = [\"nope\"] }\n").unwrap();
+        let err = bad.resolve_all().unwrap_err().to_string();
+        assert!(err.contains("unknown sandbox `nope`"), "{err}");
+        let only = bad.resolve_sandbox("d").unwrap().properties.dispatcher.unwrap();
+        assert!(!only.may_spawn("web"));
+    }
+
+    #[test]
+    fn dispatcher_excluded_from_config_hash() {
+        let base = "[sandbox.app]\nfolder = \"../app\"\n";
+        let plain = Config::parse(base).unwrap();
+        let with = Config::parse(&format!("{base}dispatcher = {{ spawn = [\"app\"] }}\n")).unwrap();
+        let hash = plain.resolve_sandbox("app").unwrap().config_hash;
+        assert_eq!(hash, with.resolve_sandbox("app").unwrap().config_hash);
+        assert_eq!(with.resolved_table("app").unwrap().1, hash);
     }
 
     #[test]

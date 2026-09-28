@@ -77,7 +77,8 @@ pub fn autostart(dir: &Path) {
             }
             Action::Run(sandbox) => {
                 println!("autostart: creating an instance of {sandbox}");
-                if let Err(e) = run::run(dir, Some(sandbox.clone()), None, None, None) {
+                let extras = Default::default();
+                if let Err(e) = run::run(dir, Some(sandbox.clone()), None, None, None, extras) {
                     eprintln!("warning: autostart: cannot run `{sandbox}`: {e:#}");
                 }
             }

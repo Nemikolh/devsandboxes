@@ -1,4 +1,5 @@
 pub mod autostart;
+pub mod dispatch;
 pub mod exec;
 pub mod inspect;
 pub mod logs;
@@ -227,6 +228,8 @@ mod tests {
             ssh_auth_sock: None,
             devsbd_arch: None,
             volumes: Vec::new(),
+            dispatcher: None,
+            config_dir: None,
             created_unix: 0,
         };
         state.instances.insert("web-aaaa".into(), mk("web", "/home/u/site"));
@@ -263,6 +266,8 @@ mod tests {
                 ssh_auth_sock: None,
                 devsbd_arch: None,
                 volumes: Vec::new(),
+                dispatcher: None,
+                config_dir: None,
                 created_unix: 0,
             },
         );

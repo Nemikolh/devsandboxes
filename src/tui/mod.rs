@@ -417,7 +417,14 @@ fn run_suspended(terminal: &mut Term, dir: &Path, action: PromptAction) -> Resul
 
     let result = match &action {
         PromptAction::Run { sandbox, name, branch, base } => {
-            commands::run::run(dir, Some(sandbox.clone()), name.clone(), branch.clone(), base.clone())
+            commands::run::run(
+                dir,
+                Some(sandbox.clone()),
+                name.clone(),
+                branch.clone(),
+                base.clone(),
+                Default::default(),
+            )
         }
         PromptAction::Exec { instance, argv } => {
             commands::exec::exec_status(instance, true, true, argv).map(|_| ())

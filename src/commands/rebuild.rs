@@ -118,6 +118,9 @@ fn rebuild_instance(
         worktree,
         branch,
         false,
+        // No extras: `materialize` keeps the recorded dispatcher; `--env`s
+        // aren't recorded, so they are dropped.
+        &run::RunExtras::default(),
         state,
     )?;
 
@@ -172,6 +175,8 @@ mod tests {
             ssh_auth_sock: None,
             devsbd_arch: None,
             volumes: Vec::new(),
+            dispatcher: None,
+            config_dir: None,
             created_unix: 0,
         }
     }

@@ -74,6 +74,16 @@ pub struct Instance {
     /// Accumulated across rebuilds, which keep them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub volumes: Vec<String>,
+    /// `instance_id` of the dispatcher that created this instance through the
+    /// control API (docs/automations.md); also the container's
+    /// `devsandbox.dispatcher` label. `None` for user-created instances.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatcher: Option<String>,
+    /// Canonical config root this instance was created from, so a request
+    /// arriving with only the instance (the control API) can re-read its
+    /// config. `None` for instances created before it was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_dir: Option<PathBuf>,
     pub created_unix: u64,
 }
 
@@ -165,6 +175,8 @@ mod tests {
                 ssh_auth_sock: None,
                 devsbd_arch: None,
                 volumes: Vec::new(),
+                dispatcher: Some("pr-dispatcher".into()),
+                config_dir: Some("/home/u/.devsandboxes".into()),
                 created_unix: Instance::now(),
             },
         );
@@ -174,6 +186,11 @@ mod tests {
         assert_eq!(back.instances["repo-abc1"].sandbox, "repository-1");
         assert_eq!(back.instances["repo-abc1"].instance_id, "repo-abc1");
         assert_eq!(back.autostart_boot["abc12345"], "3f2c-boot");
+        assert_eq!(back.instances["repo-abc1"].dispatcher.as_deref(), Some("pr-dispatcher"));
+        assert_eq!(
+            back.instances["repo-abc1"].config_dir.as_deref(),
+            Some(std::path::Path::new("/home/u/.devsandboxes"))
+        );
     }
 
     #[test]
@@ -201,5 +218,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(state.instances["repo"].instance_id, "");
+        assert_eq!(state.instances["repo"].dispatcher, None);
+        assert_eq!(state.instances["repo"].config_dir, None);
+        let text = toml::to_string_pretty(&state).unwrap();
+        assert!(!text.contains("dispatcher") && !text.contains("config_dir"), "{text}");
     }
 }

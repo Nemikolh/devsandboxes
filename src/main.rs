@@ -59,6 +59,12 @@ enum Command {
         /// overrides the sandbox's `worktree-base` and default-branch detection
         #[arg(long)]
         base: Option<String>,
+        /// Extra container env var for this instance only (dispatcher use)
+        #[arg(long = "env", hide = true, value_name = "K=V", value_parser = devsbd::control::parse_env)]
+        env: Vec<(String, String)>,
+        /// Owning dispatcher's instance id (dispatcher use)
+        #[arg(long, hide = true, value_name = "INSTANCE_ID")]
+        dispatcher: Option<String>,
     },
     /// Recreate an instance's container from the current config (keeps the
     /// worktree, branch, and per-instance state); no-op when there is no drift
@@ -222,10 +228,11 @@ fn main() -> Result<()> {
     match command {
         Command::Ls { json } => commands::ls::ls(&cli.dir, json),
         Command::Ps { all, json } => commands::ps::ps(all, json),
-        Command::Run { sandbox, name, branch, base } => {
+        Command::Run { sandbox, name, branch, base, env, dispatcher } => {
             // After, not before: `run web` for an autostart `web` must not
             // create two instances. Whatever `run` returned is kept.
-            let result = commands::run::run(&cli.dir, sandbox, name, branch, base);
+            let extras = commands::run::RunExtras { env, dispatcher };
+            let result = commands::run::run(&cli.dir, sandbox, name, branch, base, extras);
             commands::autostart::autostart(&cli.dir);
             result
         }
