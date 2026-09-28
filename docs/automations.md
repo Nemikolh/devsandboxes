@@ -204,7 +204,7 @@ Decisions taken while planning (differ from or sharpen the design above):
   (`src/devsbd.rs:111`); install also symlinks `/usr/local/bin/devsbd`
   (best-effort) so scripts call `devsbd notify`.
 
-### Step 1 — `autostart = true`
+### Step 1 — `autostart = true` [x]
 
 - `src/config.rs:30` `SandboxProperties`: `autostart: Option<Autostart>`,
   `enum Autostart { Off, Devsandbox, Runtime }` deserialized from `true` /

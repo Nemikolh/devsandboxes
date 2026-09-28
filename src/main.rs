@@ -223,7 +223,11 @@ fn main() -> Result<()> {
         Command::Ls { json } => commands::ls::ls(&cli.dir, json),
         Command::Ps { all, json } => commands::ps::ps(all, json),
         Command::Run { sandbox, name, branch, base } => {
-            commands::run::run(&cli.dir, sandbox, name, branch, base)
+            // After, not before: `run web` for an autostart `web` must not
+            // create two instances. Whatever `run` returned is kept.
+            let result = commands::run::run(&cli.dir, sandbox, name, branch, base);
+            commands::autostart::autostart(&cli.dir);
+            result
         }
         Command::Rebuild { name, all, force } => {
             commands::rebuild::rebuild(&cli.dir, name, all, force)
@@ -231,7 +235,11 @@ fn main() -> Result<()> {
         Command::Rename { name, new_name } => commands::rename::rename(&name, &new_name),
         Command::Rm { name } => commands::rm::rm(&name),
         Command::Stop { name, all } => commands::stop::stop(name, all),
-        Command::Start { name, all } => commands::start::start(&cli.dir, name, all),
+        Command::Start { name, all } => {
+            let result = commands::start::start(&cli.dir, name, all);
+            commands::autostart::autostart(&cli.dir);
+            result
+        }
         Command::Gc { force } => commands::services::gc(&cli.dir, force),
         Command::Service { cmd } => match cmd {
             ServiceCommand::Rebuild { name } => commands::services::rebuild(&cli.dir, &name),

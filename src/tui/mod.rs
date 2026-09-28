@@ -87,6 +87,8 @@ type Term = Terminal<CrosstermBackend<Stdout>>;
 /// path (normal, error, or panic).
 pub fn dashboard(dir: &Path) -> Result<()> {
     install_panic_hook();
+    // Before the alternate screen, so `run`/`start` output stays readable.
+    crate::commands::autostart::autostart(dir);
     let mut terminal = setup().context("failed to set up terminal")?;
 
     let result = run(&mut terminal, App::new(dir.to_path_buf()));

@@ -39,7 +39,7 @@ pub fn start(dir: &Path, name: Option<String>, all: bool) -> Result<()> {
     start_instance(dir, &key, info)
 }
 
-fn start_instance(dir: &Path, key: &str, info: &Instance) -> Result<()> {
+pub(crate) fn start_instance(dir: &Path, key: &str, info: &Instance) -> Result<()> {
     // Re-point the agent symlink before either start path so a restart after
     // host agent rotation re-captures the live socket (docs/ssh-agent.md).
     run::ssh_agent_refresh(info);

@@ -92,6 +92,10 @@ impl Instance {
 pub struct State {
     #[serde(default, rename = "instance")]
     pub instances: BTreeMap<String, Instance>,
+    /// Project id (`services::project_id`) -> host boot id of the last
+    /// autostart pass for that config root, so autostart runs once per boot.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub autostart_boot: BTreeMap<String, String>,
 }
 
 impl State {
@@ -164,10 +168,20 @@ mod tests {
                 created_unix: Instance::now(),
             },
         );
+        state.autostart_boot.insert("abc12345".into(), "3f2c-boot".into());
         let text = toml::to_string_pretty(&state).unwrap();
         let back: State = toml::from_str(&text).unwrap();
         assert_eq!(back.instances["repo-abc1"].sandbox, "repository-1");
         assert_eq!(back.instances["repo-abc1"].instance_id, "repo-abc1");
+        assert_eq!(back.autostart_boot["abc12345"], "3f2c-boot");
+    }
+
+    #[test]
+    fn empty_autostart_boot_is_omitted() {
+        let text = toml::to_string_pretty(&State::default()).unwrap();
+        assert!(!text.contains("autostart_boot"), "{text}");
+        let back: State = toml::from_str(&text).unwrap();
+        assert!(back.autostart_boot.is_empty());
     }
 
     #[test]

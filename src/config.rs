@@ -72,6 +72,9 @@ pub struct SandboxProperties {
     /// to the config dir). Each entry is bind-mounted at its key and listed in
     /// the generated `.code-workspace` file after `workspaceFolder`.
     pub folders: Option<BTreeMap<String, String>>,
+    /// Bring this sandbox's instances up once per host boot (docs/automations.md).
+    /// Excluded from `config_hash` so toggling it never marks instances drifted.
+    pub autostart: Option<Autostart>,
 
     // --- implemented devcontainer properties ---
     pub image: Option<String>,
@@ -117,6 +120,40 @@ pub struct SandboxProperties {
     pub host_requirements: Option<Value>,
     pub wait_for: Option<Value>,
     pub secrets: Option<Value>,
+}
+
+/// `autostart` mode: `false` / `true` / `"runtime"`. `Runtime` behaves like
+/// `Devsandbox` until the runtime restart policy lands.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Autostart {
+    #[default]
+    Off,
+    /// The first devsandbox process after a boot starts the instances.
+    Devsandbox,
+    /// The container runtime restarts the containers on boot.
+    Runtime,
+}
+
+impl<'de> Deserialize<'de> for Autostart {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> std::result::Result<Self, D::Error> {
+        struct V;
+        impl serde::de::Visitor<'_> for V {
+            type Value = Autostart;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("`true`, `false` or `\"runtime\"`")
+            }
+            fn visit_bool<E: serde::de::Error>(self, v: bool) -> std::result::Result<Autostart, E> {
+                Ok(if v { Autostart::Devsandbox } else { Autostart::Off })
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> std::result::Result<Autostart, E> {
+                match v {
+                    "runtime" => Ok(Autostart::Runtime),
+                    _ => Err(E::invalid_value(serde::de::Unexpected::Str(v), &self)),
+                }
+            }
+        }
+        de.deserialize_any(V)
+    }
 }
 
 impl SandboxProperties {
@@ -574,7 +611,7 @@ impl Config {
         let mut properties = self.resolve_extends(sandbox, &mut Vec::new())?;
         properties.remove("extends");
 
-        let config_hash = config_hash(&properties);
+        let config_hash = sandbox_hash(&properties);
         let properties: SandboxProperties = properties
             .try_into()
             .map_err(|e| anyhow!("sandbox `{name}`: {e}"))?;
@@ -602,7 +639,7 @@ impl Config {
         let sandbox = self.sandbox_table(name)?;
         let mut properties = self.resolve_extends(sandbox, &mut Vec::new())?;
         properties.remove("extends");
-        let hash = config_hash(&properties);
+        let hash = sandbox_hash(&properties);
         Ok((properties, hash))
     }
 
@@ -688,6 +725,14 @@ pub fn build_hash(dir: &Path, build: Option<&Build>) -> String {
 /// serialization is key-sorted and deterministic across runs.
 fn config_hash(table: &Table) -> String {
     short_hash(&toml::to_string(table).unwrap_or_default())
+}
+
+/// [`config_hash`] of a merged sandbox table minus the keys that apply without
+/// recreating the container (`autostart`), so flipping them isn't drift.
+fn sandbox_hash(table: &Table) -> String {
+    let mut table = table.clone();
+    table.remove("autostart");
+    config_hash(&table)
 }
 
 /// Deep merge: nested tables merge recursively, arrays concatenate
@@ -797,6 +842,43 @@ folders = { "/workspaces/docs" = "../docs" }
         assert_eq!(a, b, "same config must hash identically");
         let c = config.resolve_sandbox("repository-2").unwrap().config_hash;
         assert_ne!(a, c, "different configs must hash differently");
+    }
+
+    fn autostart_of(value: &str) -> Result<Option<Autostart>> {
+        let config = Config::parse(&format!(
+            "[sandbox.app]\nfolder = \"../app\"\nautostart = {value}\n"
+        ))?;
+        Ok(config.resolve_sandbox("app")?.properties.autostart)
+    }
+
+    #[test]
+    fn autostart_parses_bool_and_runtime() {
+        assert_eq!(autostart_of("true").unwrap(), Some(Autostart::Devsandbox));
+        assert_eq!(autostart_of("false").unwrap(), Some(Autostart::Off));
+        assert_eq!(autostart_of("\"runtime\"").unwrap(), Some(Autostart::Runtime));
+        let unset = Config::parse(EXAMPLE).unwrap().resolve_sandbox("repository-1").unwrap();
+        assert_eq!(unset.properties.autostart, None);
+    }
+
+    #[test]
+    fn autostart_rejects_other_values() {
+        for bad in ["\"bogus\"", "1"] {
+            let err = format!("{:#}", autostart_of(bad).unwrap_err());
+            assert!(err.contains("runtime") && err.contains("true"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn autostart_excluded_from_config_hash() {
+        let base = "[sandbox.app]\nfolder = \"../app\"\n";
+        let plain = Config::parse(base).unwrap();
+        let with = Config::parse(&format!("{base}autostart = true\n")).unwrap();
+        let hash = plain.resolve_sandbox("app").unwrap().config_hash;
+        assert_eq!(hash, with.resolve_sandbox("app").unwrap().config_hash);
+        let (table, table_hash) = with.resolved_table("app").unwrap();
+        assert_eq!(table_hash, hash);
+        // Still shown in the resolved view.
+        assert!(table.contains_key("autostart"));
     }
 
     #[test]

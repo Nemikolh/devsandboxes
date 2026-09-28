@@ -1,3 +1,4 @@
+pub mod autostart;
 pub mod exec;
 pub mod inspect;
 pub mod logs;

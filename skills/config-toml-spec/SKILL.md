@@ -63,6 +63,7 @@ Keys are devcontainer camelCase, except devsandbox extras noted in kebab-case. *
 | `worktree-link` | [string] | Gitignored paths from the repo root (`.env` = root only; leading `./` ok) shared live by all instances. `*`/`?` glob within one segment (`packages/*/.env`), matched against existing paths in the base repo and store; no `**`/`[...]`. For each: the base repo's file is moved to `shared-files/<sandbox>/<path>` and each tree gets an absolute symlink; that dir is mounted at its host path (works on Apple `container`). Tracked/non-ignored paths and existing conflicting files are skipped with a warning; `..`/absolute/`.git` entries error. Store kept on `rm`. |
 | `shell-rc` | [string] | Host shell snippets sourced by `~/.zshrc`/`~/.bashrc`. Must exist and be files (no auto-create). Parent dir mounted read-only at `/devsandbox/rc/<i>`. |
 | `folders` | {container path = host dir} | Extra VS Code workspace roots. Key must be absolute and differ from `workspaceFolder`; value must exist. |
+| `autostart` | `true` \| `false` \| `"runtime"` | Once per host boot (per config root), the first `devsandbox run` / `start` or TUI launch starts this sandbox's stopped instances (full `start` path), or `run`s one if it has none; containerless instances are skipped with a note. Any other value errors. `"runtime"` currently behaves as `true`. Not hashed for drift. |
 
 ### Implemented devcontainer properties
 
@@ -121,7 +122,7 @@ Sandboxes reach a service by its name as hostname (network alias, or `/etc/hosts
 
 ## Drift
 
-Each container is labelled with `config_hash` (hash of the merged sandbox table, or the service table) and `build_hash` (hash of the dockerfile *contents*). Any change to the merged config — including via a template — marks existing instances as drifted (`devsandbox rebuild <instance>`). Build context and feature contents are not hashed.
+Each container is labelled with `config_hash` (hash of the merged sandbox table, or the service table) and `build_hash` (hash of the dockerfile *contents*). Any change to the merged config — including via a template — marks existing instances as drifted (`devsandbox rebuild <instance>`), except `autostart`, which is stripped before hashing. Build context and feature contents are not hashed.
 
 ## Checking a config
 
