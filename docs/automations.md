@@ -484,6 +484,118 @@ Decision (user): dispatchers clear their runs through `devsbd`.
 daemon` once done (the daemon is long-lived anyway), removing that zombie.
 Run supervisors still need `init = true`. Skip unless approved.
 
+### Security fixes (steps 17–21)
+
+From a security review of the automations work. Threat model: a container
+(and any user in it) is untrusted relative to the host. Low findings are
+deferred.
+
+### Step 17 — host git never runs repo-controlled code (Critical)
+
+Every worktree instance bind-mounts the base repo's `.git` read-write
+(`git_companion_mount`, `src/commands/run/worktree.rs:10`), and the host runs
+git on that repo (`worktree add` / `fetch` / `worktree remove` / `branch -D`,
+`worktree.rs` + `src/commands/rm.rs`). A container can plant hooks or
+command-running config (`core.fsmonitor`, `core.sshCommand`, filter drivers,
+`include.path`, …) that the host then runs as the user. Dispatchers let a
+container trigger those host git calls itself (`ensure`, `rm`).
+
+- One wrapper for **every** host git invocation (all `Command::new("git")`
+  sites in `worktree.rs` and `rm.rs`): always prepend
+  `-c core.hooksPath=/dev/null -c core.fsmonitor=false`, stdin null, and
+  `GIT_TERMINAL_PROMPT=0`.
+- Before running, a pure check of the repo's local config: read
+  `<git-common-dir>/config` plus every `worktrees/*/config.worktree` **as
+  files** (parse the git config syntax — don't run `git config`, which could
+  resolve includes). Keys are checked against an **allowlist** (section names
+  compared case-insensitively):
+  - `core.{repositoryformatversion,filemode,bare,logallrefupdates,ignorecase,precomposeunicode,symlinks,autocrlf,eol,safecrlf}`
+  - `extensions.*`
+  - `remote.<n>.{url,pushurl,fetch,tagopt,prune,mirror}`
+  - `branch.<n>.{remote,merge,rebase,pushremote,description}`
+  - `user.{name,email}`
+  - `init.defaultbranch`, `pull.{rebase,ff}`, `push.{default,autosetupremote}`
+  - `fetch.prune`
+  - `gc.*` except `gc.*hook*`
+  - `lfs.*`, `submodule.<n>.{url,active,update}` where `update` is not a `!command`
+  - `worktree.*`
+  - `rerere.*`
+  - `color.*`
+  - `advice.*`
+
+  Anything else, notably `include*`, `filter.*`, `diff.*`, `merge.*`, `core.sshCommand`, `core.gitProxy`, `core.askPass`, `credential.*`, `url.*`, `protocol.*`, `http.*`, `uploadpack.*`, `receive.*`, `remote.*.uploadpack|receivepack|vcs|proxy`, and `core.alternateRefsCommand`, makes the op **refuse** with
+  `refusing to run git on <repo>: .git/config sets <key>, which can run
+  commands on the host; a sandbox may have written it — review and remove it`.
+  Remote URLs using `ext::` are refused the same way. Also check
+  `objects/info/alternates` exists → refuse (points host git elsewhere).
+- Tests: parser (sections, subsections with quotes, continuation lines,
+  comments, case), allowlist accept/reject tables, wrapper args; a test that
+  a planted `post-checkout` hook and `core.fsmonitor` do not run during
+  `create_worktree`/removal in a temp repo (the reviewer's PoC).
+- Document in the guide + `docs/high-level-architecture.md`.
+
+### Step 18 — dispatcher branch values are data, not templates (High)
+
+`req.branch` reaches `run --branch`, where `substitute` expands
+`${localEnv:…}` (host env) and path vars (`src/commands/run/mod.rs:~145`).
+
+- `control.rs`: `valid_branch` — `[A-Za-z0-9._/-]`, 1–200 chars, no leading
+  `-`/`/`/`.`, no `..`, `//`, `@{`, trailing `/`, `.lock` suffix (git
+  check-ref-format rules, implemented purely); checked in `check_fields`
+  (`dispatch.rs`) → `Usage`.
+- `run`: when `--dispatcher` is set, the `--branch` value is used verbatim
+  (no `substitute`); the sandbox's `worktree-branch` pattern (config, trusted)
+  still substitutes.
+- Tests: valid/invalid branch table; dispatcher branch with `${localEnv:X}` is
+  rejected at the boundary, and never expanded in `run`.
+
+### Step 19 — dispatcher authorization hardening (Medium ×2)
+
+- `--env` names: deny-list at the control boundary (`control::parse_env` or
+  `check_fields`) and in `run --env`: `PATH`, `HOME`, `SHELL`, `USER`, `ENV`,
+  `BASH_ENV`, `IFS`, `CDPATH`, `PS4`, `PROMPT_COMMAND`, `SSH_AUTH_SOCK`,
+  `LD_*`, `DYLD_*`, `GCONV_PATH`, `GIT_*`, `NODE_OPTIONS`, `PYTHON*`,
+  `PERL5*`, `RUBYOPT`, `TMPDIR` → `Denied` naming the var.
+- Root execs devsandbox runs in containers (`INSTALL_SCRIPT`, `sync_boot`,
+  `start_daemon`, bridge spawn — `src/devsbd.rs`, `src/devsbd/bridge.rs`)
+  invoke `/bin/sh` by absolute path.
+- Children can't be dispatchers: `ensure` of a sandbox that declares
+  `dispatcher` → `Denied` (even if named in `spawn`); a control request from an
+  instance with `Instance.dispatcher` set → `Denied`. `"*"` therefore never
+  matches dispatcher sandboxes.
+- `max-instances` defaults to 10 when unset.
+- Docs: config-spec skill + guide: `"*"` grants every non-dispatcher sandbox
+  of the root (their mounts, docker socket, privileges); the env deny-list.
+- Tests: env deny table; dispatcher-sandbox spawn denied; child-as-dispatcher
+  denied; default cap.
+
+### Step 20 — host-side limits and timeouts (Medium)
+
+- Per-bridge semaphore for notify/control handler threads (e.g. 8), held for
+  the handler's whole life (not the mux entry): over the limit → the `Open`
+  is refused (closed) without spawning (`src/devsbd/bridge.rs` `open_stream`).
+- Bounded, timed child I/O: `dispatch.rs` `exec_in` and the TUI's `run ls`
+  exec (`src/tui/mod.rs:~647`) read stdout through `take(MAX_RESPONSE + 1)`
+  (TUI: a smaller cap) with a wall-clock timeout that kills the child
+  (`exec_in`: 5 min except `run-wait`, which is already capped at 300 s + slack;
+  TUI `run ls`: 5 s). The dispatch `devsandbox` subprocess gets a timeout
+  (30 min, kill) so the host lock can't be held forever.
+- Desktop notifications rate-limited per instance (token bucket: burst 3, one
+  per 10 s), repeats of the same `(instance, key)` within the window coalesced;
+  inbox entries still arrive.
+- Inbox: per-instance cap (50) besides the global 200 (`src/tui/app/inbox.rs`).
+- Tests: semaphore refusal, bounded reader truncation + timeout kill (pure
+  helper over a spawned `sh -c`), token bucket, per-instance cap.
+
+### Step 21 — helper-side hardening of shared dirs (Medium, DoS part)
+
+- `run ls` (`devsbd/src/runs.rs`): newest 50 runs only, argv truncated
+  (200 chars), entries that aren't real dirs / regular files skipped.
+- `argv`/`meta` read with a size cap (`take`), so one huge file can't blow up
+  the output. FIFO/symlink hardening of the shared dirs is the deferred Low
+  finding (the host-side timeouts of step 20 bound its effect on the TUI).
+- Tests: cap on count and argv length; non-regular entries skipped.
+
 ## Open questions
 
 - Can the restart policy be changed in place on podman (`podman update --restart`, version-dependent), or does flipping `autostart` there require a recreate?
