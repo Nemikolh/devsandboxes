@@ -23,12 +23,16 @@ devsbd notify --level warn --key pr-123 --link https://github.com/o/r/pull/123 "
 ```
 
 - **Dispatchers**: a sandbox that declares `dispatcher` can manage child instances through `devsbd`, while the dashboard is open. Children are named `<sandbox>-<key>`, always get their own worktree, are marked `⇠ <dispatcher>` in the TUI, and outlive the dispatcher. Host-side operations log to `<data>/devsandbox/logs/dispatch-*.log`. Exit codes: 75 when no dashboard is connected, 77 when denied.
+  - `spawn = ["*"]` means every sandbox in the config root except other dispatchers, and it grants their mounts, docker socket and privileges. Children can never be dispatchers themselves.
+  - `max-instances` defaults to 10 and counts stopped children too.
+  - `--branch` accepts plain branch names only (`[A-Za-z0-9._/-]`) and is used literally, with no `${…}` expansion.
+  - `--env` refuses names that could take over processes in the child: `PATH`, `HOME`, `SHELL`, `LD_*`, `DYLD_*`, `GIT_*`, `NODE_OPTIONS`, `PYTHON*` and similar.
 
 ```toml
 [sandbox.pr-dispatcher]
 folder = "../pr-dispatcher"
 autostart = "runtime"
-dispatcher = { spawn = ["web"], max-instances = 10 }   # "*" = any sandbox
+dispatcher = { spawn = ["web"], max-instances = 10 }   # "*" = any non-dispatcher sandbox
 postStartCommand = "nohup ./loop.sh >loop.log 2>&1 &"
 ```
 
@@ -44,13 +48,42 @@ devsbd ls; devsbd stop pr-123; devsbd rm pr-123
 
 ### Changed
 
+- **Worktrees reuse existing branches.** `run --branch X`, and a dispatcher's `devsbd ensure --branch X`, no longer fail when `X` exists:
+  - a local `X` is checked out as it is;
+  - an `X` that only exists on `origin` (a PR head, for example) becomes a local branch tracking `origin/X`, so a plain `git push` updates it;
+  - a branch that's already checked out somewhere else gives an error saying where.
+
+  `rm` only offers to delete branches devsandbox created itself.
 - New containers use `sh -c '… devsbd boot & exec sleep infinity'` as their command instead of `sleep infinity`, so images need `/bin/sh`.
 - `start` sets the container's restart policy from `autostart`, overwriting a policy set by hand.
 - While the dashboard is open it keeps a helper connection to every running instance that has the helper, not only when an ssh-agent is being relayed.
 - `devsandbox status --json` instance rows include `instance_id` and, for children, `dispatcher`.
 
+### Security
+
+- **Git on the host can no longer run code planted by a sandbox.** Worktree instances mount the base repo's `.git` read-write, so a container could plant hooks or command-running config (`core.fsmonitor`, `core.sshCommand`, filter drivers, `include.path`, ...) that the host's `git worktree add` / `fetch` / `worktree remove` would then run as you.
+  - Every git command devsandbox runs on the host now has hooks and fsmonitor turned off.
+  - It first checks the repo's local config against an allowlist. If a key could run a command, it refuses and names the key: review it and remove it. `ext::` remotes and object alternates are refused as well.
+  - This affects every worktree instance, not only dispatcher children.
+- The commands devsandbox runs as root inside containers (helper install, boot file, Apple `/etc/hosts` update, workspace file) use `/bin/sh` with a fixed `PATH`, so they don't depend on the container's `PATH`.
+- **Limits on what a container can make the host do:**
+  - at most 8 concurrent notify/control handlers per container;
+  - output from host-run commands is capped and timed out (5 min for in-child commands, 30 min for dispatch operations, which are killed with their whole process group);
+  - desktop popups are rate-limited per instance (3 at once, then one every 10 s), and repeats of the same key within 60 s don't pop up again;
+  - the inbox keeps at most 50 entries per instance (200 overall);
+  - `devsbd run ls` lists only the newest 50 runs and shortens long command lines.
+
 <details><summary>Commits</summary>
 
+- d022e5c feat(run): reuse an existing local or origin branch for a worktree instead of refusing, so instances and dispatcher children can work on PR branches
+- 36f532a fix(port): look up lsof on the container's PATH again, the --env deny-list already closes the PATH injection and the fixed PATH hid lsof in /usr/local/bin
+- e5404ac fix(devsbd): cap run ls to the newest 50 runs and bounded argv/meta reads, so a container user can't make run listings unbounded
+- aac1539 fix(dispatch): bound handler threads, child output and runtimes, and rate-limit desktop popups, so a container can't exhaust the host or flood the desktop
+- 4c1549f fix(dispatch): deny dangerous --env names, keep children from being dispatchers, cap children at 10 by default and run host root execs with a fixed PATH, so a dispatcher can't gain root in a child or self-replicate
+- 11b9f7a fix(dispatch): validate dispatcher branch names and never template-expand them, so a container can't read host env through ${localEnv:…}
+- a5948da fix(run): host git runs with hooks and fsmonitor disabled and refuses repos whose local config can run commands, so a sandbox can't execute code on the host through the shared .git
+- c59d627 docs(automations): plan security fixes for host git, branch values, dispatcher authz and resource limits
+- f44f329 docs(changelog): unreleased notes for automations, and plan steps for the follow-up decisions
 - 5c2e49a docs(automations): user guide, architecture and module map for autostart, notify and dispatchers
 - b080bf1 fix(autostart): keep the boot's pass when the runtime is unreachable and pin dispatch subprocesses to the parent's backend, found auditing apple container
 - 7868cb5 feat(dispatch): tracked runs in child instances (devsbd exec, run ls/logs/wait), so dispatchers can start agents and follow their outcome
