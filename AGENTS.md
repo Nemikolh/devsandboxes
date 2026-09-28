@@ -72,3 +72,5 @@ git worktrees so working trees are never shared.
   `<type>(<what>): <description>` where `<type>` is `feat`, `fix`, `chore`,
   `docs`, `test`, `refactor`, … and `<what>` is the module or concept touched
   (`tui`, `rm` or any other command, `docker`, `apple`, `config`, …).
+- Releases: follow the `release` skill (`.agents/skills/release/SKILL.md`).
+  `CHANGELOG.md`'s `## Unreleased` section becomes the GitHub release body.

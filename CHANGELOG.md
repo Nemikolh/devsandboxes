@@ -2,12 +2,74 @@
 
 ## Unreleased
 
+Worktree instances can now bring along the gitignored files a repo needs to run, like `.env` files, instead of starting without them.
+
+### Added
+
+- **Copy gitignored files into new worktrees.** A repo's `.worktreeinclude` file is always honored, and `worktree-include` adds more patterns (gitignore syntax). Matching untracked files are copied from the base checkout into each **new** worktree and never overwrite existing files.
+- **Share gitignored files across all instances.** Each `worktree-link` path is moved to one shared copy under `shared-files/<sandbox>/`, and every worktree gets a symlink to it. An edit in one instance shows up in all of them. This also works on Apple `container`, which can't bind single files. Globs work within one path segment (`*` / `?`), and a leading `./` is accepted.
+
+```toml
+[sandbox.web]
+folder = "../web"
+worktree-include = ["fixtures/*.local.json"]   # copied once, per worktree
+worktree-link = [".env", "packages/*/.env"]    # one live copy shared by every instance
+```
+
+- A `CHANGELOG.md`, which is also used as the GitHub release notes.
+
+### Fixed
+
+- TUI: pressing `s` to start an instance refreshes the list shortly afterwards, so the new state appears right away.
+
+<details><summary>Commits</summary>
+
+- 9dff820 docs(changelog): backfill changelog and generate it on release so github releases carry notes
 - c6925a0 feat(run): one-segment globs and leading ./ in worktree-link
 - ebd7200 feat(run): carry gitignored files into worktrees via copy or shared link
 - d836a5a fix(tui): when start is pressed, refresh instance list after 500ms
 - 7005680 chore(ci): fix warnings reported
 
+</details>
+
 ## 0.3.4
+
+On-demand port forwarding, devcontainer features that need privileges or entrypoints (docker-in-docker works now), and a full `config.toml` reference.
+
+### Added
+
+- **`devsandbox port`**: makes a port inside an instance or one of its services reachable on the host, without publishing it when the container is created and without a restart. Forwards reconnect by themselves after the target restarts or is rebuilt. When the image has `lsof`, the command shows which process is listening. Unix hosts only.
+
+```bash
+devsandbox port api 3000                      # localhost:3000 -> api's :3000
+devsandbox port api 8080:3000                 # bind host :8080 instead
+devsandbox port api --service postgres 5432   # api's postgres, via the api container
+devsandbox port --service redis 6379          # a global service, no instance named
+```
+
+- **TUI Ports tab**: lists active forwards; `p` adds one and `d` removes one. Quitting never hangs on a forward that is still connecting.
+- **Privileged features and feature entrypoints.** A feature that declares `privileged: true` now runs the container `--privileged`, and feature entrypoints run at every container start, so features such as docker-in-docker work out of the box. `privileged` can also be set directly on a sandbox. Both are skipped with a warning on Apple `container`.
+
+```toml
+[sandbox.infra]
+image = "mcr.microsoft.com/devcontainers/base:ubuntu"
+[sandbox.infra.features]
+"ghcr.io/devcontainers/features/docker-in-docker:2" = {}
+```
+
+- **`config-toml-spec` skill**: the complete reference for `config.toml` (every key, merge rules, `${…}` variables), written for both people and agents.
+
+### Fixed
+
+- `${devcontainerId}` in feature mounts resolves to the instance id. Per-instance volumes are deleted on `rm` and kept on `rebuild`.
+- A sandbox mount on the same target now replaces a mount inherited from a template, instead of Docker rejecting the duplicate.
+- Nested mounts are applied parent-first on every runtime, not only on Docker.
+
+### Internal
+
+- `run.rs` and the TUI `app.rs` are split into per-concern modules. Docker-dependent tests are now required to pass on CI.
+
+<details><summary>Commits</summary>
 
 - ff124fb fix: don't specify the model on the skill
 - e45afbd docs: fix broken rustdoc intra-doc links
@@ -39,19 +101,64 @@
 - a7a3b7b chore(release): keep the readme's pinned download links on the released version
 - dc734b1 docs(readme): recommend npm and release archives, which embed devsbd, over the limited cargo install; document the relay as the main ssh-agent path
 
+</details>
+
 ## 0.3.3
+
+Release pipeline only: npm packages are now published with npm trusted publishing (OIDC) instead of a long-lived token. No changes to the CLI.
+
+<details><summary>Commits</summary>
 
 - cff095b ci(release): publish to npm with trusted publishing instead of a long-lived token
 
+</details>
+
 ## 0.3.2
+
+The npm root package is renamed to **`devsandboxes`**, because npm rejected `devsandbox` as too similar to an existing package. The installed binary is still called `devsandbox`.
+
+```bash
+npm i -g devsandboxes
+npx devsandboxes --help
+```
+
+<details><summary>Commits</summary>
 
 - 53cedc3 fix(npm): rename the root package to devsandboxes since npm rejects devsandbox as too similar to dev-sandbox
 
+</details>
+
 ## 0.3.1
+
+The CLI is now published to npm, so a Rust toolchain is no longer needed to install it. Prebuilt binaries ship as per-platform packages (linux x64/arm64, macOS arm64, windows x64), and the package also has a typed Node API.
+
+> The root package was renamed to `devsandboxes` in 0.3.2; install that version or later.
+
+<details><summary>Commits</summary>
 
 - 86df202 feat(npm): publish the cli to npm with per-platform binary packages and a typed node api, so npx devsandbox works without a rust toolchain
 
+</details>
+
 ## 0.3.0
+
+ssh-agent forwarding no longer needs a socket bind mount. A small static helper (`devsbd`) is embedded in the release binaries, installed into each container, and relays the host agent over `exec` stdio. This works on every runtime, including Apple `container`, and keeps working when the host agent socket changes.
+
+### Added
+
+- **Relayed ssh-agent forwarding** through the embedded `devsbd` helper, used by default. Relays detect wedged connections with keepalives and handshake timeouts, and restart the daemon if the container was restarted outside devsandbox. `git` over ssh works inside `postCreateCommand` and the other lifecycle commands.
+- **`devsandbox vscode <name>`** attaches VS Code to an instance from the CLI, using the same launch path as the TUI's `o` key.
+
+```bash
+devsandbox vscode web
+```
+
+### Changed
+
+- Release archives (and later the npm packages) embed the helper. `cargo install` builds don't, and fall back to the bind mount, which works only on Linux docker/podman.
+- The TUI manages ssh-agent bridges on a worker thread, so the dashboard never blocks on them.
+
+<details><summary>Commits</summary>
 
 - 3401365 docs(readme): say release binaries embed the helper now that the release job builds it
 - 0529cde fix(run): give lifecycle commands the forwarded ssh-agent so ssh git operations in setup commands work
@@ -72,12 +179,43 @@
 - 2a522c5 docs(devsbd): plan an embedded in-container helper for host<->container relays
 - 8840709 feat(vscode): add `devsandbox vscode` command to attach vs code from the cli, sharing the tui's launch path
 
+</details>
+
 ## 0.2.4
+
+Fixes the Windows build, which broke the 0.2.3 release: 0.2.3 has no published binaries, so this is the first release that ships its changes. Also clarifies the docs.
+
+<details><summary>Commits</summary>
 
 - b7449fc fix: clarify docs
 - fffd63e fix: windows build
 
+</details>
+
 ## 0.2.3
+
+ssh-agent forwarding, worktrees that start from the remote's default branch, and process signalling from the dashboard.
+
+> This tag never got a GitHub release (the Windows build failed); its changes shipped in 0.2.4.
+
+### Added
+
+- **ssh-agent forwarding.** The host `SSH_AUTH_SOCK` reaches every instance through a per-instance symlink mount, and `start` re-points it before the container starts. Forwarding therefore survives reboots and re-logins without a rebuild. `exec` sets `SSH_AUTH_SOCK` on every session. `rm` removes an instance's link and `gc` removes orphaned ones.
+- **Worktrees start from the remote's default branch.** Instead of branching from whatever is checked out in the base repo, `run` fetches `origin` and branches from `origin/HEAD` (or `main`/`master`), without touching the base checkout. Use `run --base` or `worktree-base` to pick a different start point.
+
+```toml
+[sandbox.api]
+folder = "../api"
+worktree-base = "origin/develop"
+```
+
+- **TUI process rows can be signalled**: `t` sends SIGTERM and `K` sends SIGKILL to the selected pid. `x` closes an exited terminal where it is.
+
+### Fixed
+
+- Process listings use pids from the container's namespace, so signals reach the right process. Images without `ps` fall back to `docker top` and are shown as not signalable. The listing no longer includes its own `ps` process.
+
+<details><summary>Commits</summary>
 
 - 1c56b2f feat(run): start worktrees from a fetched origin default branch
 - 5d339f3 fix(runtime): drop the self ps row from process listings
@@ -91,7 +229,32 @@
 - 7255429 feat(run): forward host ssh-agent via per-instance symlink mount
 - 9d77713 docs(ssh-agent): plan agent forwarding via re-pointable symlink mount
 
+</details>
+
 ## 0.2.2
+
+Renames no longer lose per-instance state, feature mounts are applied, and `rebuild --force` is added.
+
+### Added
+
+- **`rebuild --force`** recreates an instance even when no drift is detected. Use it to pick up devsandbox-side changes that the config hashes can't see.
+
+```bash
+devsandbox rebuild web --force
+devsandbox rebuild --all --force
+```
+
+- **Feature-declared mounts are applied**, such as the host docker socket from docker-outside-of-docker. A sandbox mount on the same target overrides the feature's, and mounts the host can't satisfy are skipped with a warning.
+- **Persistent instance ids.** Everything tied to an instance (`${instance}` mounts, worktree dir, shell history, isolated services) is keyed by an id that never changes, so renaming an instance is purely cosmetic.
+- TUI prompt completion is driven by the same spec table as parsing, so every flag completes (including `rebuild --force`).
+
+### Fixed
+
+- Shell history survives in VS Code terminals: `HISTFILE` is pinned in the rc files, not only in the container env.
+- `rename` requires the exact instance name and no longer hangs the TUI.
+- Missing instances can be rebuilt from the TUI.
+
+<details><summary>Commits</summary>
 
 - ad8c40b fix: make sure the subagent has a model specified
 - 947a512 docs(agents): note spec.rs in the tui module map
@@ -108,11 +271,71 @@
 - f9db061 refactor(features): drop unused cache_dir method
 - d0ff413 chore(cargo): exclude release.sh, .agents, .github from crate
 
+</details>
+
 ## 0.2.1
+
+Packaging only: the crate gains a description and the MIT license so it can be published on crates.io, and docs are excluded from it.
+
+```bash
+cargo install devsandbox
+```
+
+<details><summary>Commits</summary>
 
 - 9c03b41 chore(cargo): add description, mit license, exclude docs from crate
 
+</details>
+
 ## 0.2.0
+
+Instance lifecycle commands (`start`, `stop`, `rebuild`, `rename`), an integrated terminal in the dashboard, JSON output for scripts, drift detection for dockerfiles and services, and Apple `container` support.
+
+### Added
+
+- **Separate lifecycle verbs.** `run` always creates a fresh instance. `start` / `stop` resume and suspend existing ones (`--all` for every instance), and `rebuild` (alias `recreate`) applies config changes in place while keeping the worktree, branch and per-instance state.
+
+```bash
+devsandbox run web --branch me/login-fix
+devsandbox stop --all
+devsandbox start web
+devsandbox rebuild --all        # recreate every drifted instance
+```
+
+- **Integrated terminal in the TUI**: `t` opens a shell in the selected instance (zsh when available, otherwise bash) in its workspace folder. Terminals open as tabs; `[`/`]` cycle between them, `x` closes one, `ctrl-]`/`F12` leaves the terminal, and mouse scrollback works.
+- **Machine-readable output.** `status --json` prints the full dashboard snapshot in a versioned envelope, and `ps`, `ls`, `stats`, `inspect` accept `--json` (contract in `docs/json-output.md`).
+
+```bash
+devsandbox status --json | jq '.data'
+devsandbox ps --json
+```
+
+- **Service drift and rebuild.** Editing a dockerfile now counts as drift, for sandboxes and services alike. `service rebuild <name>` recreates a service and rewires running sandboxes without restarting them, and `service ls` lists services like `ls` lists sandboxes. Drifted services are marked in the TUI and can be rebuilt from there.
+
+```bash
+devsandbox service ls
+devsandbox service rebuild postgres
+```
+
+- **`rename`** (CLI and `r` in the TUI), plus **`logs`**, **`inspect`**, **`stats`** subcommands that work the same on every runtime.
+- **`shell-rc`**: host shell snippets sourced by the container's `~/.zshrc`/`~/.bashrc`.
+
+```toml
+[template.base]
+shell-rc = ["rc/aliases.sh"]
+```
+
+- **Configurable worktree branch** via `worktree-branch` (supports `${instance}`) or `run --branch`.
+- **Apple `container`** is supported as a runtime.
+- TUI: coding-agent processes are highlighted in the process tree, and the detail panel shows an agent count.
+- A `devsandbox-cli` skill that teaches coding agents to drive the CLI.
+
+### Fixed
+
+- Worktrees are created under the config dir instead of the base repo, and a branch name that already exists is rejected with a clear error.
+- The base folder is reused correctly once its direct-mount instance is removed.
+
+<details><summary>Commits</summary>
 
 - 7c5beb0 ci: release on crates.io
 - 5bd48a2 docs: document build-hash drift, service rebuild and service ls
@@ -155,7 +378,51 @@
 - 4cc7764 tui: highlight coding-agent processes blue in the process forest
 - 04aaf9e docs: add README.md
 
+</details>
+
 ## 0.1.1
+
+First release. devsandbox runs devcontainer-style sandboxes directly on docker/podman from one `config.toml`, with no devcontainer CLI and no daemon.
+
+### Highlights
+
+- **devcontainer semantics in TOML.** Sandboxes use devcontainer property names (`image`, `build`, `mounts`, `containerEnv`, `remoteUser`, the lifecycle commands, VS Code extensions…). Unknown keys are a hard error. `extends` composes reusable templates: tables merge, arrays concatenate.
+- **Native devcontainer features.** Features are fetched from their OCI registry and baked into a derived image, without the devcontainer CLI.
+- **Concurrent instances of one repo.** A second `run` of the same folder gets its own git worktree and branch, so instances never share a checkout. Instance names are deterministic (`web`, `web-2`, …).
+- **Services.** Sidecar containers are reachable by name. `scope = "isolated"` (the default) gives each instance its own copy; `scope = "global"` shares one per project. `gc` removes the ones no instance uses.
+- **Shared caches and state.** `caches` shares package caches across instances, `persist-shell-history` keeps a per-instance history, and `${sharedVolumes}` / `${instance}` place other state per instance.
+- **Config drift detection.** Each container records a hash of its merged config, so an edited config shows up as drift.
+- **VS Code.** Attach to an instance as a named workspace, with extra roots from `folders` and `remoteUser` honored.
+- **TUI dashboard** (run `devsandbox` with no arguments): a tree of sandboxes and instances with live CPU/memory, a process tree for each instance, a services view, a config explorer (original vs resolved, next to `docker inspect`), logs, and a `:` command prompt with history and completion.
+- Static release builds for Linux (musl), macOS and Windows.
+
+```toml
+[services.postgres]
+image = "postgres:16"
+
+[template.base]
+caches = ["pnpm", "cargo"]
+persist-shell-history = true
+[template.base.features]
+"ghcr.io/devcontainers/features/node:1" = { version = "lts" }
+
+[sandbox.web]
+extends = "base"
+folder = "../web"
+image = "mcr.microsoft.com/devcontainers/base:ubuntu"
+services = ["postgres"]
+postCreateCommand = "pnpm install"
+folders = { "/workspaces/shared-lib" = "../shared-lib" }
+```
+
+```bash
+devsandbox run web             # first instance mounts ../web directly
+devsandbox run web             # second instance: web-2, on its own worktree
+devsandbox exec -it web-2 zsh
+devsandbox rm web-2
+```
+
+<details><summary>Commits</summary>
 
 - afb786a fix: remove unused file
 - 362f295 gc: reap orphaned shell-history files
@@ -203,3 +470,5 @@
 - 722fe21 Add runtime basics: run, ps, exec, host-side state store
 - cad57f9 Add config core: TOML model, extends deep merge, ls command
 - 1fd3f93 initial commit
+
+</details>

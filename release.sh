@@ -16,6 +16,13 @@ fi
 
 git pull --ff-only origin main
 
+# The Unreleased section becomes the GitHub release body, so it has to be
+# written (see .agents/skills/release) before anything gets bumped.
+if ! scripts/changelog-section.sh Unreleased >/dev/null; then
+  echo "error: write the release notes under \"## Unreleased\" in CHANGELOG.md first" >&2
+  exit 1
+fi
+
 current=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
 IFS=. read -r major minor patch <<<"$current"
 case "$bump" in
@@ -56,23 +63,7 @@ if grep -noE "(/download/v|devsandbox-)[0-9]+\.[0-9]+\.[0-9]+" README.md \
   exit 1
 fi
 
-# The new section is every commit since the last tag; it replaces any
-# hand-written Unreleased section so the changelog never needs manual upkeep.
-last_tag=$(git describe --tags --abbrev=0)
-entries=$(git log --format='- %h %s' "$last_tag..HEAD")
-if [ -z "$entries" ]; then
-  echo "error: no commits since $last_tag" >&2
-  exit 1
-fi
-# Entries go through ENVIRON: `-v` rejects multi-line values on BSD awk and
-# would unescape backslashes in commit subjects.
-heading="## $new" entries="$entries" awk '
-  !done && /^## / { print ENVIRON["heading"] "\n\n" ENVIRON["entries"] "\n"; done = 1 }
-  /^## Unreleased$/ { skip = 1; next }
-  skip && /^## / { skip = 0 }
-  !skip { print }
-' CHANGELOG.md >CHANGELOG.md.tmp
-mv CHANGELOG.md.tmp CHANGELOG.md
+sed -i "0,/^## Unreleased$/s//## $new/" CHANGELOG.md
 if ! grep -qx "## $new" CHANGELOG.md; then
   echo "error: CHANGELOG.md was not updated with $new" >&2
   exit 1

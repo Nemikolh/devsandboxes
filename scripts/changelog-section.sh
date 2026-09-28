@@ -12,7 +12,7 @@ section=$(awk -v v="$version" '
 ' "$changelog" | sed -e '/./,$!d')
 
 if [ -z "$section" ]; then
-  echo "error: no \"## $version\" section in $changelog" >&2
+  echo "error: no \"## $version\" section in $changelog, or it is empty" >&2
   exit 1
 fi
 printf '%s\n' "$section"
