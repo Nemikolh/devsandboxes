@@ -60,6 +60,14 @@ Subcommands (argv[1], no clap — hand-parse to save size):
 
 - `version` — prints protocol version + build hash (install check).
 
+- `boot` — the container command's start hook: starts the daemon detached, then runs the `postStartCommand` recorded in `/run/devsandbox/boot` (log `/run/devsandbox/boot.log`). See `docs/automations.md`.
+
+- `notify [--level info|warn|error] [--link URL] [--key K] [--] <msg>...` — queues a record in `/var/lib/devsandbox/outbox/` and pokes the daemon, which flushes it to a host advertising `NOTIFY`.
+
+- `ensure|ls|stop|rm|exec`, `run ls|logs|wait <key> …` — a dispatcher's control commands: one request over `/run/devsandbox/api.sock`, relayed by the daemon to a host advertising `CONTROL`; exit 0/1/2, 75 (no host), 77 (denied).
+
+- `run start|ls|logs|wait` (no key) — tracked runs in this container under `/var/lib/devsandbox/runs/`; what the host execs in a child for the control `exec`/`run` verbs.
+
 ## Build + embedding
 
 The main crate must build for every release target (incl. macOS, Windows) while embedding *Linux* helper binaries. `build.rs` never invokes cargo itself: a nested `cargo build` deadlocks on the outer build's `target/` lock unless given its own target dir (second cache, cold rebuilds), inherits the outer build's env (`CARGO_ENCODED_RUSTFLAGS`, `TARGET`, … — e.g. Windows' `+crt-static` leaking into the musl build), runs on every `cargo check`/rust-analyzer pass, needs hand-maintained `rerun-if-changed` for devsbd sources, and can't work from the crates.io tarball anyway. A workspace doesn't remove the ordering problem — binary artifact dependencies (`-Z bindeps`) are nightly-only — so devsbd is built as a separate step and the main build only *reads* its output:
@@ -189,7 +197,9 @@ ssh (in container) ──unix──▶ devsbd daemon ◀──frames over exec s
   daemon's lifetime. The kernel drops the lock with the process, so a stale
   pidfile never blocks. Listens on `/run/devsandbox/ssh-agent.sock` (mode
   0666, daemon runs as root — fixes the uid-mismatch caveat of the bind mount)
-  and on a control socket `/run/devsandbox/devsbd.ctl` (0600) for bridges. If
+  on a control socket `/run/devsandbox/devsbd.ctl` (0600) for bridges, and on
+  `/run/devsandbox/api.sock` (0666) for in-container clients (`notify`'s poke,
+  control requests; `docs/automations.md`). If
   the agent path is taken (the bind mount), it logs and serves only the
   control socket.
 

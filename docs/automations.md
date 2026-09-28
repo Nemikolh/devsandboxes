@@ -39,9 +39,9 @@ autostart = true        # devsandbox-driven
 
 ### `true` — devsandbox-driven, once per boot
 
-The first devsandbox process after a boot (TUI load, or any CLI command) starts every `autostart` sandbox's instances (as `devsandbox start`: devsbd install, `postStartCommand`, bridges). A sandbox with no instance yet gets one (`run` semantics).
+The first TUI load, or the user's own `devsandbox run` / `start` (after it completes), after a boot starts every `autostart` sandbox's stopped instances (as `devsandbox start`: devsbd install, `postStartCommand`, bridges). A sandbox with no instance yet gets one (`run` semantics). Other CLI commands never trigger it.
 
-"Once per boot" is keyed on the host boot id, recorded in `state.toml` (`last_autostart_boot`):
+"Once per boot" is keyed on the host boot id, recorded per config root in `state.toml` (`autostart_boot`: project id → boot id):
 
 - Linux: `/proc/sys/kernel/random/boot_id`
 - macOS: `sysctl kern.boottime`
@@ -54,15 +54,15 @@ Created with `--restart unless-stopped` where the backend supports it:
 
 - docker: yes (Docker Desktop / dockerd starts on login/boot).
 
-- podman: only if the user has enabled `podman-restart.service`; devsandbox never installs units. Warn at `run` when it can't tell.
+- podman: only if the user has enabled `podman-restart.service`; devsandbox never installs units. Warns at `run`.
 
 - Apple `container`: tier 2 — falls back to `true` with a warning until it has a restart policy.
 
 The runtime only restarts the *container*. Nothing devsandbox runs via `exec` comes back: not `postStartCommand` (`src/commands/start.rs:61`), not the devsbd daemon (`src/devsbd.rs:108`), not host-side bridges or forwards. So `"runtime"` also needs an in-container boot path:
 
-- The generated entrypoint (`docs/entrypoint.md`) starts `devsbd daemon` itself when the binary is present, before the keep-alive.
+- The container command runs `devsbd boot` in the background when the binary is present, before the keep-alive (`sh -c '[ -x …/devsbd ] && …/devsbd boot & exec sleep infinity'`); it starts the daemon.
 
-- The daemon then runs `postStartCommand` once per container start (as `remoteUser`, `workspaceFolder`, `remoteEnv` — same as `start`), and records that it did so, so a later host `start` doesn't double-run it.
+- `devsbd boot` then runs `postStartCommand` on every container start (as `remoteUser`, `workspaceFolder`, `remoteEnv` — same as `start`), from a boot file the host writes at `/run/devsandbox/boot`, output appended to `/run/devsandbox/boot.log`. The host `start` never runs it for these instances (`run` still does at create, before the helper exists).
 
 This is what makes a dispatcher's loop survive a reboot with no devsandbox process around. Anything needing the host (control API, forwards, ssh-agent) resumes when one connects (see _No host connected_).
 
@@ -78,11 +78,11 @@ devsbd notify [--level info|warn|error] [--link URL] [--key K] "PR 123 needs you
 
 - Delivered to the TUI inbox (badge on the instance, an inbox view listing notifications with source instance, time, link) **and** as a desktop notification: `notify-send` on Linux, `osascript -e 'display notification …'` on macOS. A missing notifier is skipped silently.
 - `--key` dedupes: a newer notification with the same key replaces the older one (a dispatcher re-reporting "PR 123 conflicted" every poll doesn't spam).
-- **Queued**: written to a durable outbox in the container (`/var/lib/devsandbox/outbox/`, surviving container restarts), drained by the host whenever a bridge is up. One-shot CLI commands may drain pending notifications for desktop delivery; the TUI keeps the history.
+- **Queued**: written to a durable outbox in the container (`/var/lib/devsandbox/outbox/`, surviving container restarts), drained by the host whenever a notify-capable bridge is up. Only the TUI's bridges are (one-shot CLI commands don't drain), and the TUI keeps the history in memory.
 
 ## Dispatchers
 
-A dispatcher is an ordinary sandbox that declares `dispatcher`. Only such sandboxes get the control API; for every other sandbox the host refuses control streams.
+A dispatcher is an ordinary sandbox that declares `dispatcher`. Only such sandboxes get the control API: every TUI bridge advertises `CONTROL`, and the host re-checks the config on each request and denies (exit 77) every other sandbox.
 
 ```toml
 [sandbox.pr-dispatcher]
@@ -103,20 +103,23 @@ folder = "../web"
 ### Control API
 
 ```
-devsbd ensure <sandbox> --key <key> [--branch B] [--env K=V]…
-    # idempotent: creates <sandbox>-<key> if missing, starts it if stopped;
-    # prints the instance name. --branch sets the worktree branch at creation.
-devsbd ls                         # this dispatcher's children + status (JSON)
-devsbd stop <key>
-devsbd rm <key>
-devsbd exec <key> [--sandbox S] [--detach] -- <cmd>…   # a run; see _Runs_
+devsbd ensure <sandbox> --key <key> [--branch B] [--env K=V]...
+    # idempotent: creates <sandbox>-<key> if missing, starts it if stopped,
+    # rebuilds it if its container is gone; prints the instance name.
+    # --branch/--env apply at creation only.
+devsbd ls                                   # this dispatcher's children + state (JSON)
+devsbd stop <key> [--sandbox S]
+devsbd rm <key> [--sandbox S]
+devsbd exec <key> [--sandbox S] [--detach] -- <cmd>...   # a run; see _Runs_
 ```
+
+Exit codes: 0 ok, 1 failed, 2 usage (or a key shared by two sandboxes without `--sandbox`), 75 no host connected, 77 denied.
 
 - Children are named `<sandbox>-<key>` (e.g. `web-pr-123`): predictable, so a human can `devsandbox vscode web-pr-123`.
 
 - Children are labelled `devsandbox.dispatcher=<dispatcher instance_id>`, and recorded as such in `state.toml`. `ls`/`stop`/`rm`/`exec` only reach owned children.
 
-- The TUI tree nests children under their dispatcher.
+- The TUI tree keeps children under their own sandbox group, marked with a dim `⇠ <dispatcher>` suffix.
 
 ### Lifetime
 
@@ -134,7 +137,7 @@ Control needs the host (worktrees, `state.toml`, runtime calls, bridges), and af
 - `notify` is queued (above) — never lost.
 - Control operations **fail fast** with a dedicated exit code (e.g. 75, `EX_TEMPFAIL`) and a "no host connected" message. The script retries/waits. No durable command queue.
 
-The TUI serves control requests for every running dispatcher. Two TUIs don't both serve the same dispatcher: a per-dispatcher lock file (lease) in the data dir picks one. One-shot CLI commands don't serve control.
+The TUI serves control requests for every running dispatcher. Two TUIs don't both serve a request: the daemon routes each one to exactly one bridge, the newest whose host advertises `CONTROL`. One-shot CLI commands don't serve control.
 
 ## Runs
 
@@ -143,7 +146,7 @@ The TUI serves control requests for every running dispatcher. Two TUIs don't bot
 ```
 devsbd run ls <key> [--sandbox S]                      # id, state, start (UTC), argv; one line per run
 devsbd run logs <key> <id> [--sandbox S] [--follow]    # output so far; --follow until the run ends
-devsbd run wait <key> <id> [--sandbox S] [--timeout S] # prints `exited N` | `killed N` | `lost`,
+devsbd run wait <key> <id> [--sandbox S] [--timeout SECS] # prints `exited N` | `killed N` | `lost`,
                                                        # or `running` after --timeout; exit 0
 ```
 
@@ -154,10 +157,9 @@ States: `running`, `exited N`, `killed N` (signal), `lost` (its supervisor died 
 All of the above rides the existing devsbd frame channel (`docs/sandbox-helper.md`), container-initiated `Open` streams on new channels:
 
 - `channel::CONTROL` (request/response JSON over `Data`), `channel::NOTIFY`.
-- New caps bits so an old host/helper pair degrades cleanly.
+- New caps bits (`caps::NOTIFY`, `caps::CONTROL`) so an old host/helper pair degrades cleanly.
 
-Today the TUI only keeps bridges where there's something to relay: `Bridges::reconcile` (`src/devsbd/bridge.rs:359`) skips everything without a host ssh-agent.
-It must also keep a bridge to every running dispatcher (control + notify), and drain notify outboxes from any running instance (a periodic short-lived bridge is enough for non-dispatchers).
+In-container clients (`devsbd notify`'s poke, the control commands) talk to the daemon over `/run/devsandbox/api.sock`; the daemon sends each stream to the newest bridge whose host advertises the cap. The TUI keeps a bridge per running helper-capable instance (with or without a host ssh-agent) and only those advertise `NOTIFY` + `CONTROL`; short-lived CLI bridges (`exec`, lifecycle, forwards) advertise neither.
 
 ## Patterns (for the user docs)
 
@@ -173,7 +175,9 @@ devsandbox takes no stand; both are supported and documented:
   item; per-item memory is the script's concern.
 
 - **Idle children** — stop a child between runs and `ensure` it before the next
-  `exec`; `unless-stopped` keeps stopped children stopped across reboots.
+  `exec`. The boot pass starts every stopped instance of an `autostart`
+  sandbox, so leave `autostart` off on child sandboxes to keep idle children
+  stopped across reboots.
 
 - Sample dispatcher: a babysit loop polling `gh pr list`, a cheap
   needs-attention check per PR, `ensure` + `exec --detach` only when needed,
@@ -358,7 +362,8 @@ Landed limitations: the hook runs as the container's user, so a non-root `contai
   answers "no host connected" → the CLI exits 75.
 - Host: only bridges of instances whose sandbox declares `dispatcher`
   advertise `CONTROL`; the handler re-checks on every request (config may have
-  changed). Runs on the bridge worker thread, quiet, never the UI thread.
+  changed). (Landed differently: every TUI bridge advertises `CONTROL` and the
+  handler denies non-dispatchers.) Runs on the bridge worker thread, quiet, never the UI thread.
 - TUI tree marks children with a dim `⇠ <dispatcher>` suffix under their own
   sandbox group (no re-nesting); orphans marked `⇠ <id> (orphan)`.
 - Tests: exit 75 with no bridge; `#[test_utils::docker_test(helper)]`
@@ -403,7 +408,11 @@ against apple/container's `docs/command-reference.md`):
   in-container `devsbd boot` daemon restart would be lost); the macOS boot id
   (`sysctl kern.boottime`) path.
 
-### Step 11 — docs
+### Step 11 — docs [x]
+
+Landed as `docs/automations-guide.md` (user guide, linked from the README's
+_Automations_ section), plus the config spec, `docs/high-level-architecture.md`,
+`docs/sandbox-helper.md` and the `AGENTS.md` module map.
 
 - `skills/config-toml-spec/SKILL.md`: `autostart`, `dispatcher`.
 - User doc (patterns above, sample babysit dispatcher, backgrounding the loop,

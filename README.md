@@ -108,6 +108,20 @@ devsandbox port api 3000 --address 0.0.0.0    # bind all interfaces (default 127
 
 An instance port tunnels straight into its container; a service port is reached through a running instance that references it, falling back to injecting the helper into the service container when none is available. Forwards are also available from the TUI's Ports tab — `p` to add, `d` to remove. Unix hosts only for now.
 
+## Automations
+
+Sandboxes can come up on their own after a boot, notify you, and spawn child instances to do work, driven by a script you write:
+
+```toml
+[sandbox.pr-dispatcher]
+folder = "../pr-dispatcher"
+autostart = "runtime"       # true: devsandbox starts it once per boot; "runtime": docker/podman restart it
+dispatcher = { spawn = ["web"], max-instances = 10 }
+postStartCommand = "nohup ./babysit-loop.sh >babysit.log 2>&1 &"
+```
+
+Inside a sandbox, `devsbd notify "PR 123 needs you"` reaches the dashboard's Inbox tab and your desktop; a dispatcher manages its children with `devsbd ensure web --key pr-123`, `devsbd exec pr-123 --detach -- <agent>`, `devsbd rm pr-123`. Notifications and control need the dashboard open. Guide, sample dispatcher, and limitations: [`docs/automations-guide.md`](docs/automations-guide.md).
+
 ## Platform support
 
 | Feature                     | Linux (docker/podman) | macOS (docker: OrbStack / Docker Desktop) | macOS (Apple `container`) | Windows (docker) |

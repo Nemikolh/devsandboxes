@@ -50,6 +50,8 @@ devsandbox extras on a sandbox:
 | `persist-shell-history` | Per-instance history dir on the host, mounted at `/commandhistory` with `HISTFILE` set via container env and pinned in the rc files (VS Code's shell integration resets the env value); survives rebuilds, never shared between concurrent instances |
 | `shell-rc`              | Host shell snippets (e.g. `["${configDir}/shell/aliases.sh"]`) mounted read-only and sourced by `~/.zshrc` and `~/.bashrc` in the container; concatenates under `extends` |
 | `worktree-branch`       | Branch created for a worktree instance (supports `${instance}`); defaults to `sandbox/${instance}`; `run --branch` overrides it |
+| `autostart`             | `true` / `"runtime"`: bring instances up once per boot (see _Automations_); not hashed               |
+| `dispatcher`            | `{ spawn, max-instances }`: instances may manage child instances over `devsbd` (see _Automations_); not hashed |
 
 Mount sources support devcontainer-style variables: `${configDir}`, `${localWorkspaceFolder}`, `${localWorkspaceFolderBasename}`, `${localEnv:VAR}`. devsandbox adds `${sharedVolumes}` (the config root's persistent-state dir) and `${instance}` (the instance's persistent id: its name at creation, kept unique and unchanged by `rename`, so host paths anchored on `${instance}` never move).
 
@@ -62,7 +64,7 @@ Each container records two labels at creation:
 - `config_hash`: a hash of the merged config table.
 - `build_hash`: a hash of the build dockerfile's *contents*.
 
-A mismatch flags the instance or service for `rebuild`, both in CLI warnings and in the TUI. The build context and devcontainer features aren't hashed, so edits to those go undetected; `rebuild --force` covers them. Shared rule: `commands::drift_decision`. See `docs/rebuild.md`.
+`autostart` and `dispatcher` are stripped before hashing: they apply without recreating the container. A mismatch flags the instance or service for `rebuild`, both in CLI warnings and in the TUI. The build context and devcontainer features aren't hashed, so edits to those go undetected; `rebuild --force` covers them. Shared rule: `commands::drift_decision`. See `docs/rebuild.md`.
 
 ## Services
 
@@ -125,6 +127,35 @@ Config entries are validated in place, and broken sandboxes are flagged.
 One deliberate asymmetry: `s` starts or stops an instance on a background thread without leaving the dashboard. Its start is a quiet bare start (just
 `docker start` of the instance and its isolated services). It skips service recreation, DNS rewiring, and `postStartCommand`, because their output would corrupt the alternate screen. For the full path, use `:start <instance>`, which suspends the TUI. See `docs/tui.md`.
 
+## Automations
+
+Sandboxes that start themselves and manage their own child instances, with the logic in a user script (`docs/automations.md`, user guide `docs/automations-guide.md`). Still no host daemon: everything host-side runs inside a devsandbox process.
+
+- **`autostart`**: once per host boot per config root (boot id recorded in
+  state), the dashboard load or the user's own `run`/`start` starts the
+  sandbox's stopped instances, or `run`s one (`commands::autostart`).
+  `"runtime"` also creates the container with `--restart unless-stopped`
+  (docker/podman; Apple `container` falls back), applied in place since
+  `autostart` isn't hashed.
+- **Boot hook**: new containers run `devsbd boot &` before the keep-alive, so
+  a runtime restart brings back the helper daemon and, from the boot file the
+  host leaves at `/run/devsandbox/boot`, `postStartCommand` (log
+  `/run/devsandbox/boot.log`).
+- **Notify and control over devsbd**: in-container `devsbd notify` queues
+  records in an outbox; `devsbd ensure|ls|stop|rm|exec|run …` send requests to
+  the daemon's `/run/devsandbox/api.sock`. The daemon relays both over the
+  existing frame channel (`channel::NOTIFY`, `channel::CONTROL`) to the newest
+  bridge whose host advertises the cap. Only the dashboard's bridges do (one
+  per running helper instance), so notifications queue and control fails with
+  exit 75 while it's closed. The host re-checks `dispatcher` on every request
+  and denies everyone else.
+- **Dispatch as subprocesses**: the control handler runs on the dashboard's
+  bridge worker, so each child operation is a `devsandbox -C <config root>
+  run|start|rebuild|stop|rm` subprocess logging to
+  `<data-dir>/devsandbox/logs/dispatch-*.log`, never the alternate screen;
+  state-writing ops are serialized host-wide. Runs are `devsbd run start|ls|logs|wait` exec'd in
+  the child, which stores them under `/var/lib/devsandbox/runs/`.
+
 ## JSON output
 
 The read verbs emit JSON for scripts and external UIs:
@@ -143,8 +174,12 @@ Everything except `inspect` is wrapped as `{ "schema": 1, "data": … }`, and `s
 
 - **Instances:** `~/.local/share/devsandbox/state.toml` (`$XDG_DATA_HOME`
   honored). Maps each name to its container, folder, worktree, workspace,
-  remote env/user, and ssh-agent target. It's global across config roots
-  (`src/state.rs`).
+  remote env/user, ssh-agent target, config root (`config_dir`), and owning
+  dispatcher (`dispatcher`, for children). It's global across config roots
+  (`src/state.rs`); `autostart_boot` maps each config root's project id to
+  the boot id its autostart pass last ran for.
+
+- **Dispatch logs:** `<data-dir>/devsandbox/logs/dispatch-<unix>-<op>.log`.
 
 - **ssh-agent links** (bind-mount fallback only): `<data-dir>/devsandbox/agent/<instance>.sock`.
 
