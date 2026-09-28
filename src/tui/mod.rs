@@ -126,6 +126,7 @@ fn install_panic_hook() {
 
 fn run(terminal: &mut Term, mut app: App) -> Result<()> {
     let dir = app.dir.clone();
+    app.utc_offset = local_utc_offset();
     // At most one collection thread in flight; `Some` while one is running.
     let mut pending: Option<Receiver<Snapshot>> = Some(spawn_collect(&dir));
     // Background `s` stops/starts, each reporting completion over its own
@@ -242,6 +243,12 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
         if let Some(sig) = app.take_pending_signal() {
             signals.push(spawn_signal(sig));
         }
+        // An Inbox link: hand it to the desktop opener.
+        if let Some(link) = app.take_pending_open() {
+            if let Err(status) = open_link(&link) {
+                app.status = Some(status);
+            }
+        }
 
         // Ports tab: hand add/remove requests to the forwarder worker and drain
         // its updates into the app. All docker/config work happens on the worker,
@@ -260,12 +267,13 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
                     forwards::ForwardUpdate::Status(status) => app.status = Some(status),
                 }
             }
-            // Container notifications: the latest one on the status line (the
-            // inbox is step 6 of docs/automations.md).
+            // Container notifications: into the Inbox, and the latest one on
+            // the status line so it's noticed from any tab.
             while let Ok(n) = notifications.try_recv() {
                 // One status line: fold a multi-line message.
                 let msg = n.record.msg.split_whitespace().collect::<Vec<_>>().join(" ");
                 app.status = Some(format!("{}: {msg}", n.instance));
+                app.push_notification(n.instance, n.record);
             }
         }
         #[cfg(not(unix))]
@@ -496,6 +504,39 @@ fn launch_code(dir: &Path, instance: &str) -> String {
         return format!("code: unknown instance `{instance}`");
     };
     commands::vscode::launch(dir, instance, info).unwrap_or_else(|e| format!("{e:#}"))
+}
+
+/// Hand `link` to the desktop opener (`open` on macOS, `xdg-open` elsewhere),
+/// stdio null so it can't scribble on the TUI, reaped on its own thread so
+/// the loop never waits. `Err` carries a status line when it can't spawn.
+fn open_link(link: &str) -> std::result::Result<(), String> {
+    use std::process::{Command, Stdio};
+    let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    let mut child = Command::new(opener)
+        .arg(link)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("open: {opener}: {e}"))?;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
+/// Seconds east of UTC for the Inbox clock, from `date +%z` (std has no
+/// timezone support and no tz crate is in the tree). 0 (UTC) when `date` is
+/// missing or odd; read once, so a DST switch mid-session isn't picked up.
+fn local_utc_offset() -> i64 {
+    std::process::Command::new("date")
+        .arg("+%z")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .and_then(|o| app::parse_utc_offset(&String::from_utf8_lossy(&o.stdout)))
+        .unwrap_or(0)
 }
 
 /// Result of a background `s` stop/start, drained by the event loop.

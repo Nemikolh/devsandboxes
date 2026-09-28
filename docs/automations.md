@@ -305,7 +305,7 @@ Landed limitations: the hook runs as the container's user, so a non-root `contai
 - Desktop notifier: `notify-send` / `osascript`, spawned quietly, missing
   binary ignored; the argv builder is pure and tested.
 
-### Step 6 — notify: TUI inbox
+### Step 6 — notify: TUI inbox [x]
 
 - `src/tui/app/`: notifications list in `App` (dedupe by `key`, capped at 200,
   in memory), unread badge on the instance row, an inbox view listing

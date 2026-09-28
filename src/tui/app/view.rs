@@ -16,7 +16,7 @@ use super::{App, Tab};
 const HELP_BODY: &str = "\
 Global
   q, ctrl-c   quit
-  tab / S-tab switch tab      1/2/3  jump to tab
+  tab / S-tab switch tab      1-4  jump to tab
   :           command prompt  ?    this help
 
 Tables (Instances / Services)
@@ -35,6 +35,11 @@ Tables (Instances / Services)
 Ports tab
   ↑/k ↓/j     move selection
   d           stop the selected forward
+
+Inbox tab (container notifications: devsbd notify)
+  ↑/k ↓/j     move selection   (entering the tab marks all read)
+  enter       open the selected notification's link
+  d           dismiss          D   clear all
 
 Process rows (expanded instance)
   ←           jump to the parent instance
@@ -389,13 +394,14 @@ impl App {
                 let target = service_inspect_target(&row.containers);
                 (Self::build_service_view(&self.dir, &row.name), target)
             }
-            // The Ports tab has no config to explore; `enter`/`e` is a no-op.
-            Tab::Ports => return,
+            // The Ports and Inbox tabs have no config to explore; `e` is a
+            // no-op (`enter` on the Inbox opens a link instead).
+            Tab::Ports | Tab::Inbox => return,
         };
         let placeholder = match self.tab {
             Tab::Instances => "(no running instance)",
             Tab::Services => "(no containers)",
-            Tab::Ports => "",
+            Tab::Ports | Tab::Inbox => "",
         };
         set_inspect(&mut view, target, placeholder);
         self.modal = Modal::Config(view);

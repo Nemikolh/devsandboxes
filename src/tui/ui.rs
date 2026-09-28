@@ -9,13 +9,16 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Tabs};
 use tui_term::widget::{Cursor, PseudoTerminal};
 
-use super::app::{App, ConfigView, Focus, Modal, Pane, PortRow, Side, Tab, TextModal};
+use super::app::{
+    clock, App, ConfigView, Focus, InboxEntry, Modal, Pane, PortRow, Side, Tab, TextModal,
+};
 use super::data::{
     humanize_secs, sandbox_stats, totals_line, ContainerStatus, InstanceRow, Node, SandboxRow,
     ServiceRow, Snapshot,
 };
 use super::procs::{is_agent, ProcState, MESSAGE_ROW};
 use super::prompt::Prompt;
+use crate::devsbd::notify::Level;
 use crate::render::JsonLine;
 
 const ACCENT: Color = Color::Rgb(175, 135, 255);
@@ -65,7 +68,7 @@ fn draw_tabs(frame: &mut Frame, app: &App, area: Rect) {
         Layout::horizontal([Constraint::Min(0), Constraint::Length(reserve)]).areas(area);
 
     let selected = Tab::ALL.iter().position(|t| *t == app.tab).unwrap_or(0);
-    let tabs = Tabs::new(Tab::ALL.iter().map(|t| t.title()))
+    let tabs = Tabs::new(Tab::ALL.iter().map(|t| app.tab_title(*t)))
         .select(selected)
         .style(Style::default())
         .highlight_style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
@@ -86,6 +89,7 @@ fn draw_content(frame: &mut Frame, app: &App, area: Rect) {
         Tab::Instances => draw_instances(frame, app, area),
         Tab::Services => draw_services(frame, app, area),
         Tab::Ports => draw_ports(frame, app, area),
+        Tab::Inbox => draw_inbox(frame, app, area),
     }
 }
 
@@ -522,6 +526,119 @@ fn port_state_style(state: &str) -> Style {
     }
 }
 
+fn draw_inbox(frame: &mut Frame, app: &App, area: Rect) {
+    let (top, detail_area, terms_area) = content_areas(app, area);
+    let panel_focused = app.focus == Focus::Terminal;
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(dash_border_style(panel_focused))
+        .title(app.tab_title(Tab::Inbox));
+
+    if app.inbox.entries.is_empty() {
+        let text = Line::from(Span::styled(
+            "no notifications — containers send them with `devsbd notify \"…\"`",
+            Style::default().add_modifier(Modifier::DIM),
+        ))
+        .alignment(Alignment::Center);
+        frame.render_widget(Paragraph::new(text).block(block), top);
+    } else {
+        let header = Row::new(["TIME", "LEVEL", "INSTANCE", "MESSAGE"].into_iter().map(Cell::from))
+            .style(Style::default().add_modifier(Modifier::DIM));
+        let rows: Vec<Row> = app
+            .inbox
+            .entries
+            .iter()
+            .map(|e| inbox_row(e, app.utc_offset))
+            .collect();
+        let widths = [
+            Constraint::Length(5),
+            Constraint::Length(5),
+            Constraint::Length(20),
+            Constraint::Min(20),
+        ];
+        let table = Table::new(rows, widths)
+            .header(header)
+            .block(block)
+            .column_spacing(1)
+            .row_highlight_style(Style::default().fg(SELECTION).add_modifier(Modifier::BOLD));
+        let mut state = TableState::default().with_selected(Some(app.selected()));
+        frame.render_stateful_widget(table, top, &mut state);
+    }
+    draw_inbox_detail(frame, app.selected_inbox_entry(), app.utc_offset, detail_area, panel_focused);
+    if let Some(terms_area) = terms_area {
+        draw_terminal_panel(frame, app, terms_area);
+    }
+}
+
+fn level_style(level: Level) -> Style {
+    match level {
+        Level::Info => Style::default().add_modifier(Modifier::DIM),
+        Level::Warn => Style::default().fg(Color::Yellow),
+        Level::Error => Style::default().fg(Color::Red),
+    }
+}
+
+/// One Inbox row: the message's first line, `↗` when there's a link to
+/// open, bold while unread.
+fn inbox_row(e: &InboxEntry, utc_offset: i64) -> Row<'_> {
+    let first = e.record.msg.lines().next().unwrap_or("");
+    let mut msg = vec![Span::raw(first.to_string())];
+    if e.record.link.is_some() {
+        msg.push(Span::styled(" ↗", Style::default().fg(Color::Blue)));
+    }
+    let row = Row::new(vec![
+        Cell::from(Span::styled(
+            clock(e.record.at, utc_offset),
+            Style::default().add_modifier(Modifier::DIM),
+        )),
+        Cell::from(Span::styled(e.record.level.as_str(), level_style(e.record.level))),
+        Cell::from(e.instance.clone()),
+        Cell::from(Line::from(msg)),
+    ]);
+    if e.unread {
+        row.style(Style::default().add_modifier(Modifier::BOLD))
+    } else {
+        row
+    }
+}
+
+/// Detail for the selected notification: the full message plus its link and
+/// dedupe key.
+fn draw_inbox_detail(
+    frame: &mut Frame,
+    entry: Option<&InboxEntry>,
+    utc_offset: i64,
+    area: Rect,
+    term_focused: bool,
+) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(dash_border_style(term_focused))
+        .title("Detail");
+    let Some(e) = entry else {
+        frame.render_widget(Paragraph::new("").block(block), area);
+        return;
+    };
+    let mut lines = vec![Line::from(vec![
+        Span::styled(clock(e.record.at, utc_offset), Style::default().add_modifier(Modifier::DIM)),
+        Span::raw("  "),
+        Span::styled(e.record.level.as_str(), level_style(e.record.level)),
+        Span::raw("  "),
+        Span::raw(e.instance.clone()),
+    ])];
+    if let Some(link) = &e.record.link {
+        lines.push(kv("link (enter)", link));
+    }
+    if let Some(key) = &e.record.key {
+        lines.push(kv("key", key));
+    }
+    lines.extend(e.record.msg.lines().map(|l| Line::from(l.to_string())));
+    frame.render_widget(
+        Paragraph::new(lines).block(block).wrap(ratatui::widgets::Wrap { trim: false }),
+        area,
+    );
+}
+
 /// Pure tab labels for the terminal panel, one per open session: `{i+1}:{title}`
 /// with a ` (exited)` suffix on dead tabs. The single source of truth for both
 /// the rendered strip ([`terminal_tab_specs`]) and the mouse hit-test
@@ -745,7 +862,7 @@ fn tree_row<'a>(app: &App, snapshot: &'a Snapshot, node: Node) -> Row<'a> {
             None => Row::new(vec![Cell::from("")]),
         },
         Node::Instance(i) => match snapshot.instances.get(i) {
-            Some(inst) => instance_tree_row(inst),
+            Some(inst) => instance_tree_row(inst, app.inbox.unread_for(&inst.name)),
             None => Row::new(vec![Cell::from("")]),
         },
         Node::Empty(i) => {
@@ -827,7 +944,9 @@ fn source_folder_cell(sb: &SandboxRow) -> Line<'static> {
     Line::from(spans)
 }
 
-fn instance_tree_row(r: &InstanceRow) -> Row<'_> {
+/// `unread`: the instance's unread Inbox notifications, shown as a yellow
+/// `✉N` after the name.
+fn instance_tree_row(r: &InstanceRow, unread: usize) -> Row<'_> {
     let status = Cell::from(Span::styled(
         r.status.label().to_string(),
         status_style(&r.status),
@@ -842,8 +961,16 @@ fn instance_tree_row(r: &InstanceRow) -> Row<'_> {
     } else {
         r.services.join(",")
     };
+    let name = if unread > 0 {
+        Cell::from(Line::from(vec![
+            Span::raw(format!("  {}", r.name)),
+            Span::styled(format!(" ✉{unread}"), Style::default().fg(Color::Yellow)),
+        ]))
+    } else {
+        Cell::from(format!("  {}", r.name))
+    };
     Row::new(vec![
-        Cell::from(format!("  {}", r.name)),
+        name,
         status,
         Cell::from(humanize_secs(r.uptime_secs)),
         Cell::from(r.cpu.clone().unwrap_or_else(|| "-".to_string())),
@@ -1104,6 +1231,10 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
             }
             Tab::Ports => {
                 "q quit · tab switch · ↑↓ select · d stop forward · : port … · ? help".to_string()
+            }
+            Tab::Inbox => {
+                "q quit · tab switch · ↑↓ select · enter open link · d dismiss · D clear · ? help"
+                    .to_string()
             }
         },
     };

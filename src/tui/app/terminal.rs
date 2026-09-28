@@ -162,6 +162,7 @@ impl App {
             }
             // The Ports tab has no terminal target: forwards aren't containers.
             Tab::Ports => Err("terminal: not available on the Ports tab".to_string()),
+            Tab::Inbox => Err("terminal: not available on the Inbox tab".to_string()),
         }
     }
 

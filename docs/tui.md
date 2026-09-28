@@ -164,6 +164,32 @@ See `docs/port-forwarding.md` for the engine. The dashboard gains a third tab.
   spec is an inline prompt error. Submitting switches to the Ports tab and hands
   the request to the forwarder worker (it never suspends the TUI).
 
+## Phase 4 — Inbox tab (container notifications)
+
+See `docs/automations.md` ("`devsbd notify`") for the transport. The bridge
+worker drains each running instance's outbox; the event loop pushes every
+notification into `App` (`src/tui/app/inbox.rs`) and also shows it briefly on
+the status line so it's noticed from any tab. Desktop notifications fire from
+the worker, never the UI thread.
+
+- `Tab::Inbox` is the fourth tab: `4` jumps to it, `tab`/`S-tab` cycle over
+  all four. Its title carries the unread count (`Inbox (3)`).
+- In memory only, newest first, capped at 200 (oldest dropped). A notification
+  with a `--key` replaces the earlier one with the same `(instance, key)`,
+  moving to the top as unread; the same key from another instance is its own
+  row.
+- Unread: anything arriving while the Inbox isn't shown. Entering the tab marks
+  everything read. Unread rows are bold; an Instances-tab instance row with
+  unread notifications shows a yellow `✉N` after its name.
+- Table columns: `TIME` (`HH:MM`, local time from `date +%z` read once at
+  startup, UTC if unavailable), `LEVEL` (info dim / warn yellow / error red),
+  `INSTANCE`, `MESSAGE` (first line, `↗` when it has a link). The Detail panel
+  shows the full message, link and key.
+- Keys: `enter` opens the link (`xdg-open`, `open` on macOS; only `http(s)://`
+  links: the link comes from the container, so paths, `-options`, `file:` and
+  custom schemes are refused), `d` dismisses the selected
+  row, `D` clears the inbox.
+
 ## Step ordering / commits
 
 Each step = one review + one commit by the orchestrator. Steps 3 and 4 may share

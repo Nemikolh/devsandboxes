@@ -15,6 +15,7 @@ use super::term::TermTabs;
 
 mod actions;
 mod command_line;
+mod inbox;
 mod procs;
 mod terminal;
 #[cfg(test)]
@@ -22,26 +23,29 @@ mod test_support;
 mod tree;
 mod view;
 
+pub use inbox::{clock, parse_utc_offset, Inbox, InboxEntry};
 pub use procs::{PendingSignal, Signal};
 pub use view::{ConfigView, Modal, Pane, Side, TextModal};
 use view::{col_near, divider_pct};
 
-/// The three top-level views.
+/// The four top-level views.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tab {
     Instances,
     Services,
     Ports,
+    Inbox,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 3] = [Tab::Instances, Tab::Services, Tab::Ports];
+    pub const ALL: [Tab; 4] = [Tab::Instances, Tab::Services, Tab::Ports, Tab::Inbox];
 
     pub fn title(self) -> &'static str {
         match self {
             Tab::Instances => "Instances",
             Tab::Services => "Services",
             Tab::Ports => "Ports",
+            Tab::Inbox => "Inbox",
         }
     }
 
@@ -50,6 +54,7 @@ impl Tab {
             Tab::Instances => 0,
             Tab::Services => 1,
             Tab::Ports => 2,
+            Tab::Inbox => 3,
         }
     }
 }
@@ -97,7 +102,7 @@ pub struct App {
     pub dir: PathBuf,
     pub tab: Tab,
     /// Selected row per tab, indexed by `Tab::index`.
-    selected: [usize; 3],
+    selected: [usize; 4],
     /// Collapsed tree groups on the Instances tab, keyed by sandbox name (and
     /// [`ORPHANS_NAME`](super::data::ORPHANS_NAME) for the orphan group). Empty
     /// means all expanded; survives snapshot refreshes.
@@ -146,6 +151,14 @@ pub struct App {
     /// Id of a forward the event loop should stop (the `d` shortcut on the Ports
     /// tab). Consumed by step 10.
     pub pending_unport: Option<u64>,
+    /// Container notifications shown on the Inbox tab (docs/automations.md).
+    pub inbox: Inbox,
+    /// A notification link the event loop should hand to the desktop opener
+    /// (`enter` on the Inbox tab).
+    pub pending_open: Option<String>,
+    /// Seconds east of UTC for Inbox timestamps; the event loop sets it once
+    /// at startup (0 = UTC when unknown).
+    pub utc_offset: i64,
     /// One-line status shown in the help-bar area (e.g. `code` launch outcome).
     pub status: Option<String>,
     /// True while the config-modal divider is being dragged with the mouse.
@@ -163,7 +176,7 @@ impl App {
         Self {
             dir,
             tab: Tab::Instances,
-            selected: [0, 0, 0],
+            selected: [0; 4],
             collapsed: BTreeSet::new(),
             expanded_procs: BTreeSet::new(),
             procs: BTreeMap::new(),
@@ -180,6 +193,9 @@ impl App {
             ports: Vec::new(),
             pending_port: None,
             pending_unport: None,
+            inbox: Inbox::default(),
+            pending_open: None,
+            utc_offset: 0,
             status: None,
             dragging_divider: false,
             focus: Focus::Dashboard,
@@ -231,6 +247,7 @@ impl App {
             Tab::Instances => self.visible_nodes().len(),
             Tab::Services => self.snapshot.as_ref().map_or(0, |s| s.services.len()),
             Tab::Ports => self.ports.len(),
+            Tab::Inbox => self.inbox.entries.len(),
         }
     }
 
@@ -264,19 +281,13 @@ impl App {
     }
 
     pub fn next_tab(&mut self) {
-        self.tab = match self.tab {
-            Tab::Instances => Tab::Services,
-            Tab::Services => Tab::Ports,
-            Tab::Ports => Tab::Instances,
-        };
+        let i = self.tab.index();
+        self.set_tab(Tab::ALL[(i + 1) % Tab::ALL.len()]);
     }
 
     pub fn prev_tab(&mut self) {
-        self.tab = match self.tab {
-            Tab::Instances => Tab::Ports,
-            Tab::Services => Tab::Instances,
-            Tab::Ports => Tab::Services,
-        };
+        let i = self.tab.index();
+        self.set_tab(Tab::ALL[(i + Tab::ALL.len() - 1) % Tab::ALL.len()]);
     }
 
     /// Apply a key event to the state. No terminal I/O here (the modal open path
@@ -314,9 +325,10 @@ impl App {
             KeyCode::Char(':') => self.open_prompt(),
             KeyCode::Tab => self.next_tab(),
             KeyCode::BackTab => self.prev_tab(),
-            KeyCode::Char('1') => self.tab = Tab::Instances,
-            KeyCode::Char('2') => self.tab = Tab::Services,
-            KeyCode::Char('3') => self.tab = Tab::Ports,
+            KeyCode::Char('1') => self.set_tab(Tab::Instances),
+            KeyCode::Char('2') => self.set_tab(Tab::Services),
+            KeyCode::Char('3') => self.set_tab(Tab::Ports),
+            KeyCode::Char('4') => self.set_tab(Tab::Inbox),
             // Enter a terminal: ctrl-] or F12. No-op with a status hint when none
             // are open.
             KeyCode::Char(']') if ctrl => self.enter_terminal(),
@@ -335,6 +347,8 @@ impl App {
             KeyCode::Right if self.tab == Tab::Instances => self.tree_expand(),
             KeyCode::Char(' ') if self.tab == Tab::Instances => self.tree_toggle(),
             KeyCode::Left if self.tab == Tab::Instances => self.tree_collapse(),
+            // Inbox: `enter` opens the selected notification's link.
+            KeyCode::Enter if self.tab == Tab::Inbox => self.open_selected_link(),
             KeyCode::Enter | KeyCode::Char('e') if !on_proc => self.open_config(),
             KeyCode::Char('r') if self.tab == Tab::Instances && !on_proc => {
                 self.open_rename_or_run_prompt()
@@ -352,6 +366,8 @@ impl App {
             }
             KeyCode::Char('p') if self.tab == Tab::Services => self.open_port_prompt_service(),
             KeyCode::Char('d') if self.tab == Tab::Ports => self.stop_selected_forward(),
+            KeyCode::Char('d') if self.tab == Tab::Inbox => self.dismiss_selected_notification(),
+            KeyCode::Char('D') if self.tab == Tab::Inbox => self.clear_notifications(),
             KeyCode::Char('?') => self.open_help(),
             _ => {}
         }
@@ -407,15 +423,19 @@ mod tests {
         let mut app = new_app();
         assert_eq!(app.tab, Tab::Instances);
 
-        // `tab` cycles forward over all three tabs and wraps.
+        // `tab` cycles forward over all four tabs and wraps.
         app.on_key(key(KeyCode::Tab));
         assert_eq!(app.tab, Tab::Services);
         app.on_key(key(KeyCode::Tab));
         assert_eq!(app.tab, Tab::Ports);
         app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.tab, Tab::Inbox);
+        app.on_key(key(KeyCode::Tab));
         assert_eq!(app.tab, Tab::Instances);
 
         // `S-tab` cycles backward and wraps (no longer a toggle).
+        app.on_key(key(KeyCode::BackTab));
+        assert_eq!(app.tab, Tab::Inbox);
         app.on_key(key(KeyCode::BackTab));
         assert_eq!(app.tab, Tab::Ports);
         app.on_key(key(KeyCode::BackTab));
@@ -428,6 +448,8 @@ mod tests {
         assert_eq!(app.tab, Tab::Services);
         app.on_key(key(KeyCode::Char('3')));
         assert_eq!(app.tab, Tab::Ports);
+        app.on_key(key(KeyCode::Char('4')));
+        assert_eq!(app.tab, Tab::Inbox);
         app.on_key(key(KeyCode::Char('1')));
         assert_eq!(app.tab, Tab::Instances);
     }
