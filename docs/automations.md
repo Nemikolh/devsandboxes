@@ -534,7 +534,7 @@ container trigger those host git calls itself (`ensure`, `rm`).
   `create_worktree`/removal in a temp repo (the reviewer's PoC).
 - Document in the guide + `docs/high-level-architecture.md`.
 
-### Step 18 — dispatcher branch values are data, not templates (High)
+### Step 18 — dispatcher branch values are data, not templates (High) [x]
 
 `req.branch` reaches `run --branch`, where `substitute` expands
 `${localEnv:…}` (host env) and path vars (`src/commands/run/mod.rs:~145`).

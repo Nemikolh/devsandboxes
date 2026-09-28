@@ -100,6 +100,29 @@ pub fn valid_run_id(id: &str) -> bool {
         && b[11..].iter().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(c))
 }
 
+/// Longest branch name [`valid_branch`] accepts.
+pub const MAX_BRANCH: usize = 200;
+
+/// Short statement of the [`valid_branch`] rules, for error messages.
+pub const BRANCH_RULES: &str = "1-200 chars of [A-Za-z0-9._/-], not starting with `-`, `/` or `.`, \
+not ending with `/` or `.`, no `..` or `//`, no component starting with `.` or ending in `.lock`";
+
+/// A branch name a dispatcher may request: git check-ref-format `--branch`
+/// rules, checked purely, over a stricter charset. The value is data: it
+/// reaches host git as an argv word and `run --branch`, so anything that
+/// could read as an option (`-x`), a template (`${…}`), a revision
+/// expression (`@{`, `..`, `^`, `~`) or a path escape is refused.
+pub fn valid_branch(s: &str) -> bool {
+    let charset = |c: u8| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'/' | b'-');
+    (1..=MAX_BRANCH).contains(&s.len())
+        && s.bytes().all(charset)
+        && !s.starts_with('-')
+        && !s.ends_with('.')
+        && !s.contains("..")
+        // Empty components cover leading/trailing `/` and `//`.
+        && s.split('/').all(|c| !c.is_empty() && !c.starts_with('.') && !c.ends_with(".lock"))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Request {
     pub op: Op,
@@ -487,6 +510,23 @@ timeout 5\n";
         for bad in ["", "1790000000-A1B2", "1790000000-a1b", "179000000-a1b2c", "1790000000_a1b2",
                     "../../../etc-x", "1790000000-g1b2", "1790000000-a1b2 "] {
             assert!(!valid_run_id(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn branches() {
+        let max = "a".repeat(MAX_BRANCH);
+        for good in ["a", "feat/x", "joan/pr-12", "release-1.2", "a_b/c.d/e-f", "v1.2.3", "x-", max.as_str()] {
+            assert!(valid_branch(good), "{good:?}");
+        }
+        let long = "a".repeat(MAX_BRANCH + 1);
+        for bad in [
+            "", long.as_str(), "${localEnv:X}", "x-${localEnv:GITHUB_TOKEN}", "${instance}",
+            "--upload-pack=x", "-x", "/x", "x/", ".x", "x.", "a..b", "a//b", "a/.b", "x.lock",
+            "a/x.lock/b", "a@{1}", "a b", "a~1", "a^", "a:b", "a?", "a*", "a[b", "a\\b", "é",
+            "a\nb", "HEAD@{0}", ".", "..", "/",
+        ] {
+            assert!(!valid_branch(bad), "{bad:?}");
         }
     }
 

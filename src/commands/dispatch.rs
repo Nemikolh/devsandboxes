@@ -245,6 +245,10 @@ fn check_fields(req: &Request) -> Result<(), String> {
     if let Some(id) = req.id.as_deref().filter(|id| !control::valid_run_id(id)) {
         return Err(format!("bad run id `{id}`"));
     }
+    // Not echoed: it may hold control characters or template syntax.
+    if req.branch.as_deref().is_some_and(|b| !control::valid_branch(b)) {
+        return Err(format!("bad branch: use {}", control::BRANCH_RULES));
+    }
     Ok(())
 }
 
@@ -1019,6 +1023,27 @@ folder = "."
             assert_eq!(resp.status, Status::Usage, "{r:?}: {resp:?}");
             assert!(resp.body.contains(needle), "{r:?}: {resp:?}");
             assert!(fake.calls.is_empty());
+        }
+    }
+
+    /// A branch is data: anything `run` could expand (`${localEnv:…}`) or git
+    /// could read as an option or revision expression is refused up front.
+    #[test]
+    fn ensure_branch_validation() {
+        let s = state();
+        let with = |b: &str| Request { branch: Some(b.into()), ..req(Op::Ensure, Some("web"), Some("one")) };
+        for bad in ["${localEnv:X}", "x-${localEnv:GITHUB_TOKEN}", "--upload-pack=x", "a..b", "x.lock", "-x"] {
+            let mut fake = Fake::new();
+            let resp = call(&s, "d", &with(bad), &mut fake);
+            assert_eq!(resp.status, Status::Usage, "{bad:?}: {resp:?}");
+            assert!(resp.body.starts_with("bad branch: use "), "{resp:?}");
+            assert!(!resp.body.contains(bad), "value not echoed: {resp:?}");
+            assert!(fake.calls.is_empty());
+        }
+        for good in ["feat/x", "joan/pr-12", "release-1.2"] {
+            let mut fake = Fake::new();
+            let resp = call(&s, "d", &with(good), &mut fake);
+            assert_eq!(resp, Response::new(Status::Ok, "web-one"), "{good:?}");
         }
     }
 

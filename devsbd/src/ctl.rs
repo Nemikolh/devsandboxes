@@ -134,7 +134,13 @@ fn parse_args(verb: &str, args: &[String]) -> Result<Cmd, String> {
                 set_once(&mut cmd.deadline, secs, flag)?;
             }
             "--key" => set_once(&mut req.key, value()?, flag)?,
-            "--branch" => set_once(&mut req.branch, value()?, flag)?,
+            "--branch" => {
+                let b = value()?;
+                if !control::valid_branch(&b) {
+                    return Err(format!("bad --branch: use {}", control::BRANCH_RULES));
+                }
+                set_once(&mut req.branch, b, flag)?
+            }
             "--sandbox" => set_once(&mut req.sandbox, value()?, flag)?,
             "--env" => req.env.push(control::parse_env(&value()?)?),
             _ => positional.push(arg.clone()),
@@ -427,6 +433,10 @@ mod tests {
         assert_eq!(parse("ls", &["--key", "k"]).unwrap_err(), "unknown option `--key`");
         assert!(parse("stop", &[]).unwrap_err().contains("exactly one <key>"));
         assert_eq!(parse("rm", &["k", "--branch", "b"]).unwrap_err(), "unknown option `--branch`");
+        for bad in ["x-${localEnv:GITHUB_TOKEN}", "a..b", "x.lock", "-x"] {
+            let err = parse("ensure", &["web", "--key", "k", &format!("--branch={bad}")]).unwrap_err();
+            assert!(err.starts_with("bad --branch: use "), "{bad:?}: {err}");
+        }
         assert_eq!(parse("rm", &["k", "--sandbox="]).unwrap_err(), "--sandbox needs a value");
         assert!(parse("run", &[]).unwrap_err().contains("unknown command"));
         // Run verbs.

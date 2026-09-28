@@ -57,6 +57,13 @@ pub fn run(
     base_override: Option<String>,
     extras: RunExtras,
 ) -> Result<()> {
+    // The dispatcher boundary (`commands::dispatch`) checks this too; `run`'s
+    // hidden flags are callable directly, so check again before any work.
+    if extras.dispatcher.is_some()
+        && branch_override.as_deref().is_some_and(|b| !crate::devsbd::control::valid_branch(b))
+    {
+        bail!("bad --branch for a dispatcher child: use {}", crate::devsbd::control::BRANCH_RULES);
+    }
     let config = match Config::load(dir) {
         Ok(config) if !config.sandboxes.is_empty() => config,
         _ => return offer_example_config(dir),
@@ -141,13 +148,12 @@ pub fn run(
     // A dispatcher's child always gets a worktree, even as the folder's first
     // instance: an unattended agent must never work in the user's checkout.
     let (source, worktree, branch) = if base_in_use(&state, &folder) || extras.dispatcher.is_some() {
-        // Branch for the worktree: `--branch` override, else the sandbox's
-        // `worktree-branch`, else the default. `${instance}` (and the other mount
-        // variables) are substituted so each instance gets a unique branch.
-        let pattern = branch_override
-            .or_else(|| props.worktree_branch.clone())
-            .unwrap_or_else(|| DEFAULT_WORKTREE_BRANCH.to_string());
-        let branch = substitute(&pattern, &var_ctx);
+        let branch = worktree_branch(
+            branch_override,
+            extras.dispatcher.is_some(),
+            props.worktree_branch.as_deref(),
+            &var_ctx,
+        );
         // Must be absolute: `create_worktree` runs `git -C <base>`, so a
         // `dir`-relative path would resolve under the base repo instead of here,
         // and the mount/state would point at a different (empty) directory.
@@ -181,6 +187,24 @@ pub fn run(
 
     println!("{instance}");
     Ok(())
+}
+
+/// Branch for a new worktree: the `--branch` override, else the sandbox's
+/// `worktree-branch`, else the default. Patterns get `${instance}` (and the
+/// other mount variables) substituted so each instance gets a unique branch.
+/// A dispatcher's override is used verbatim: it comes from a container, and
+/// substitution would expand `${localEnv:…}` from the host's environment.
+fn worktree_branch(
+    branch_override: Option<String>,
+    dispatched: bool,
+    pattern: Option<&str>,
+    ctx: &MountContext,
+) -> String {
+    match branch_override {
+        Some(branch) if dispatched => branch,
+        Some(pattern) => substitute(&pattern, ctx),
+        None => substitute(pattern.unwrap_or(DEFAULT_WORKTREE_BRANCH), ctx),
+    }
 }
 
 /// Create (and start) the instance container and record it: run
@@ -757,6 +781,41 @@ mod tests {
             dispatcher: None,
             config_dir: None,
             created_unix: 0,
+        }
+    }
+
+    #[test]
+    fn worktree_branch_substitutes_only_trusted_patterns() {
+        let ctx = MountContext {
+            config_dir: "/cfg",
+            workspace_folder: "/src/repo",
+            workspace_folder_basename: "repo",
+            shared_volumes: "/cfg/shared-volumes",
+            instance: "web-1",
+        };
+        let own = |s: &str| Some(s.to_string());
+        // Config pattern and the default: substituted.
+        assert_eq!(worktree_branch(None, true, Some("agent/${instance}"), &ctx), "agent/web-1");
+        assert_eq!(worktree_branch(None, false, None, &ctx), "sandbox/web-1");
+        // A user's own `--branch` is a pattern too.
+        assert_eq!(worktree_branch(own("u/${instance}"), false, Some("x"), &ctx), "u/web-1");
+        // A dispatcher's override is data, never expanded.
+        assert_eq!(worktree_branch(own("d/${instance}"), true, Some("x"), &ctx), "d/${instance}");
+        assert_eq!(
+            worktree_branch(own("x-${localEnv:HOME}"), true, None, &ctx),
+            "x-${localEnv:HOME}"
+        );
+    }
+
+    #[test]
+    fn run_rejects_a_bad_dispatcher_branch_before_any_work() {
+        let extras = RunExtras { dispatcher: Some("d".into()), ..Default::default() };
+        for bad in ["x-${localEnv:HOME}", "-x", "a..b"] {
+            let dir = Path::new("/nonexistent/devsandbox-test");
+            let err = run(dir, Some("web".into()), None, Some(bad.into()), None, extras.clone())
+                .unwrap_err()
+                .to_string();
+            assert!(err.starts_with("bad --branch for a dispatcher child"), "{bad:?}: {err}");
         }
     }
 
