@@ -9,6 +9,9 @@
 
 #[cfg(unix)]
 pub mod bridge;
+// Shared with the helper; the parser is helper-only (the host only writes).
+#[allow(dead_code)]
+pub mod bootfile;
 // The forwarder engine (step 5); the CLI (`devsandbox port`) drives its full
 // public surface, the TUI Ports tab reuses it (docs/port-forwarding.md).
 #[cfg(unix)]
@@ -20,10 +23,12 @@ mod mux;
 pub mod proto;
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::io::Read;
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::LifecycleCommand;
 use crate::runtime::backend;
 use crate::state::{Instance, State};
 
@@ -111,11 +116,67 @@ fn decompress(zst: &[u8]) -> Option<Vec<u8>> {
 pub const BIN: &str = "/run/devsandbox/bin/devsbd";
 
 /// Write stdin to a temp file and rename, so a concurrent `devsbd version`
-/// never sees a half-written binary.
+/// never sees a half-written binary. The `/usr/local/bin` symlink puts
+/// `devsbd` on `PATH` for scripts; best-effort (the dir may be missing or
+/// read-only), so it can't turn a good install into a failure.
 const INSTALL_SCRIPT: &str = "mkdir -p /run/devsandbox/bin \
     && cat > /run/devsandbox/bin/devsbd.tmp \
     && chmod 755 /run/devsandbox/bin/devsbd.tmp \
-    && mv /run/devsandbox/bin/devsbd.tmp /run/devsandbox/bin/devsbd";
+    && mv /run/devsandbox/bin/devsbd.tmp /run/devsandbox/bin/devsbd \
+    && { ln -sf /run/devsandbox/bin/devsbd /usr/local/bin/devsbd 2>/dev/null || true; }";
+
+/// Boot file write, atomic for the same reason as `INSTALL_SCRIPT`: a hook
+/// firing mid-write must see the old file or the new one, never half.
+const BOOT_WRITE_SCRIPT: &str = "mkdir -p /run/devsandbox \
+    && cat > /run/devsandbox/boot.tmp \
+    && mv /run/devsandbox/boot.tmp /run/devsandbox/boot";
+
+/// What `devsbd boot` should run on the container's next start: `cmd` (a
+/// `postStartCommand`) with the context the host's lifecycle exec gives it
+/// (`run::exec_lifecycle`: `-w workspace`, `-u remote_user`, `remote_env`,
+/// then `SSH_AUTH_SOCK`). Empty argvs are dropped, as the exec path skips them.
+pub fn boot_spec(
+    cmd: &LifecycleCommand,
+    workspace: &str,
+    remote_env: Option<&BTreeMap<String, String>>,
+    remote_user: Option<&str>,
+    ssh_auth_sock: Option<&str>,
+) -> bootfile::BootSpec {
+    let mut env: Vec<(String, String)> =
+        remote_env.into_iter().flatten().map(|(k, v)| (k.clone(), v.clone())).collect();
+    if let Some(sock) = ssh_auth_sock {
+        env.push(("SSH_AUTH_SOCK".into(), sock.into()));
+    }
+    bootfile::BootSpec {
+        user: remote_user.map(str::to_string),
+        cwd: Some(workspace.to_string()),
+        env,
+        cmds: cmd.commands().into_iter().filter(|argv| !argv.is_empty()).collect(),
+    }
+}
+
+/// Write `spec` as `container`'s boot file, or remove the file when `None`.
+/// Best-effort: removal is silent (no file is the common case); a failed write
+/// gets a note, since the hook then won't rerun `postStartCommand` on restart.
+///
+/// Known gap: on `start` the runtime fires the hook before the host rewrites
+/// the file, so that one start runs the previously recorded command. Changing
+/// `postStartCommand` is config drift (rebuild) anyway.
+pub fn sync_boot(container: &str, spec: Option<&bootfile::BootSpec>, quiet: bool) {
+    match spec {
+        Some(spec) => {
+            let args = ["exec", "-i", "-u", "root", container, "sh", "-c", BOOT_WRITE_SCRIPT];
+            let text = bootfile::serialize(spec);
+            if let (Err(e), false) = (backend().run_with_stdin(&args, text.as_bytes()), quiet) {
+                eprintln!("note: couldn't write the boot hook's postStartCommand in `{container}`: {e:#}");
+            }
+        }
+        None => {
+            let _ = backend()
+                .output_quiet(&["exec", "-u", "root", container, "rm", "-f", bootfile::PATH]);
+        }
+    }
+}
 
 /// Build hash from `devsbd version` output (`devsbd <protocol> <hash>`). The
 /// hash pins the exact build, protocol version included.
@@ -328,6 +389,42 @@ mod tests {
             assert_eq!(installed_hash(&name).as_deref(), hash(retried));
         });
         Ok(())
+    }
+
+    #[test]
+    fn boot_spec_mirrors_the_lifecycle_exec() {
+        #[derive(Deserialize)]
+        struct W {
+            c: LifecycleCommand,
+        }
+        let w: W = toml::from_str("c = { b = [\"make\", \"up\"], a = \"echo hi\", z = [] }").unwrap();
+        let env = BTreeMap::from([("FOO".to_string(), "bar".to_string())]);
+        let spec = boot_spec(&w.c, "/workspaces/repo", Some(&env), Some("vscode"), Some("/run/sock"));
+        assert_eq!(
+            spec,
+            bootfile::BootSpec {
+                user: Some("vscode".into()),
+                cwd: Some("/workspaces/repo".into()),
+                // remote_env first, then SSH_AUTH_SOCK (`lifecycle_argv`'s order).
+                env: vec![("FOO".into(), "bar".into()), ("SSH_AUTH_SOCK".into(), "/run/sock".into())],
+                // Map form in key order, the empty argv dropped.
+                cmds: vec![
+                    vec!["sh".into(), "-c".into(), "echo hi".into()],
+                    vec!["make".into(), "up".into()],
+                ],
+            }
+        );
+        let bare = boot_spec(&w.c, "/w", None, None, None);
+        assert_eq!((bare.user, bare.env), (None, vec![]));
+        // What the host writes is what the helper reads.
+        assert_eq!(bootfile::parse(&bootfile::serialize(&spec)), Ok(spec));
+    }
+
+    #[test]
+    fn install_links_devsbd_onto_path_best_effort() {
+        assert!(INSTALL_SCRIPT.ends_with(
+            "&& { ln -sf /run/devsandbox/bin/devsbd /usr/local/bin/devsbd 2>/dev/null || true; }"
+        ));
     }
 
     #[test]

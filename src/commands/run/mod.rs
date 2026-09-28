@@ -417,6 +417,18 @@ pub(crate) fn materialize(
     let inst = state.instances.get(instance).expect("instance just inserted");
     let host_agent = crate::commands::exec::has_host_agent();
     let ssh_auth_sock = crate::commands::exec::ssh_auth_sock_env(inst, host_agent);
+    // Record the postStartCommand for the boot hook (the host still runs it
+    // below: the hook can't have, the helper wasn't installed yet).
+    let boot = boot_spec_for(
+        props.autostart,
+        devsbd_arch.is_some(),
+        props.post_start_command.as_ref(),
+        &workspace,
+        props.remote_env.as_ref(),
+        props.remote_user.as_deref(),
+        ssh_auth_sock,
+    );
+    crate::devsbd::sync_boot(&container, boot.as_ref(), false);
     #[cfg(unix)]
     let bridge = (crate::devsbd::relay_mode(inst) && host_agent)
         .then(|| crate::devsbd::bridge::spawn(inst))
@@ -463,6 +475,28 @@ pub(crate) fn materialize(
     }
 
     Ok(())
+}
+
+/// The boot file a container should carry: the `postStartCommand` when the
+/// runtime restarts the container itself (`autostart = "runtime"` on a backend
+/// with restart policies) and the helper that runs it is installed; `None`
+/// (remove the file) otherwise.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn boot_spec_for(
+    autostart: Option<crate::config::Autostart>,
+    helper: bool,
+    post_start: Option<&crate::config::LifecycleCommand>,
+    workspace: &str,
+    remote_env: Option<&std::collections::BTreeMap<String, String>>,
+    remote_user: Option<&str>,
+    ssh_auth_sock: Option<&str>,
+) -> Option<crate::devsbd::bootfile::BootSpec> {
+    let runtime = crate::commands::autostart::runtime_restarts(
+        autostart,
+        backend().supports_restart_policy(),
+    );
+    let cmd = post_start.filter(|_| runtime && helper)?;
+    Some(crate::devsbd::boot_spec(cmd, workspace, remote_env, remote_user, ssh_auth_sock))
 }
 
 /// Whether some instance (running or stopped — a stopped one can be started
@@ -553,10 +587,12 @@ fn run_container(
         build_hash(dir, sandbox.properties.build.as_ref())
     );
     let base_label = format!("devsandbox.base_folder={}", base_folder.display());
+    let boot_hook_label = format!("{BOOT_HOOK_LABEL}=1");
     let mut args: Vec<String> = [
         "run", "-d", "--name", container,
         "--label", &sandbox_label, "--label", &instance_label,
         "--label", &hash_label, "--label", &build_hash_label, "--label", &base_label,
+        "--label", &boot_hook_label,
         "-v", &mount, "-w", workspace,
     ]
     .map(str::to_string)
@@ -597,8 +633,7 @@ fn run_container(
         args.push(format!("{key}={value}"));
     }
     args.push(image);
-    // Same trick as devcontainers: keep the container alive, work happens via exec.
-    args.extend(["sleep".into(), "infinity".into()]);
+    args.extend(container_command());
 
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     backend().run_checked(&arg_refs)?;
@@ -606,6 +641,23 @@ fn run_container(
     backend().connect_networks(container, networks)?;
     backend().wire_service_dns(container, endpoints)?;
     Ok(())
+}
+
+/// Label marking containers whose command runs the boot hook
+/// ([`container_command`]); older ones run a bare `sleep infinity`, so `start`
+/// must keep running their `postStartCommand` from the host.
+pub(crate) const BOOT_HOOK_LABEL: &str = "devsandbox.boot_hook";
+
+/// The container command. Same trick as devcontainers: keep the container
+/// alive, work happens via exec. Before the keep-alive, in the background,
+/// `devsbd boot` brings back what the host set up via exec (the daemon, and
+/// `postStartCommand` in runtime mode) when the runtime restarts the container
+/// by itself (docs/automations.md). On first create the helper isn't installed
+/// yet, so the `-x` test makes the hook a no-op. It reaches a feature
+/// entrypoint chain as its `"$@"` like any command.
+fn container_command() -> Vec<String> {
+    let bin = crate::devsbd::BIN;
+    vec!["sh".into(), "-c".into(), format!("[ -x {bin} ] && {bin} boot & exec sleep infinity")]
 }
 
 fn offer_example_config(dir: &Path) -> Result<()> {
@@ -729,4 +781,81 @@ mod tests {
     }
 
     // --- folders / generated workspace file ---
+
+    #[test]
+    fn container_command_hooks_then_keeps_alive() {
+        assert_eq!(
+            container_command(),
+            vec![
+                "sh",
+                "-c",
+                "[ -x /run/devsandbox/bin/devsbd ] && /run/devsandbox/bin/devsbd boot & exec sleep infinity",
+            ]
+        );
+    }
+
+    /// Docker-gated: a container running the hook command, with the helper and
+    /// a boot file installed, reruns the recorded command (as the recorded
+    /// user, with its env) and brings the daemon back on a runtime restart.
+    #[test_utils::docker_test(helper)]
+    fn boot_hook_reruns_post_start_on_restart_with_docker() -> Result<(), &'static str> {
+        use std::process::Command;
+        use std::time::{Duration, Instant};
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let name = format!("devsandbox-boot-test-{stamp}");
+        let mut args = vec!["run".to_string(), "-d".into(), "--name".into(), name.clone(), "alpine:3.20".into()];
+        args.extend(container_command());
+        let up = Command::new("docker").args(&args).output().unwrap();
+        assert!(up.status.success(), "{}", String::from_utf8_lossy(&up.stderr));
+        let in_container = |script: &str| {
+            let out = Command::new("docker").args(["exec", &name, "sh", "-c", script]).output().unwrap();
+            out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        };
+        let poll = |script: &str| {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                if let Some(out) = in_container(script) {
+                    return Some(out);
+                }
+                if Instant::now() > deadline {
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        };
+
+        let cleanup = || {
+            let _ = Command::new("docker").args(["rm", "-f", &name]).output();
+        };
+        crate::test_support::with_cleanup(cleanup, || {
+            crate::devsbd::install(&name, None).unwrap();
+            let spec = crate::devsbd::bootfile::BootSpec {
+                user: Some("nobody".into()),
+                cwd: Some("/tmp".into()),
+                env: vec![("MARK".into(), "ok".into())],
+                cmds: vec![vec!["sh".into(), "-c".into(), "id -u > marker-$MARK; echo ran".into()]],
+            };
+            crate::devsbd::sync_boot(&name, Some(&spec), false);
+            // First start had no helper: the hook was a no-op.
+            assert_eq!(in_container("cat /tmp/marker-ok"), None);
+
+            let restart = Command::new("docker").args(["restart", "-t", "0", &name]).output().unwrap();
+            assert!(restart.status.success(), "{}", String::from_utf8_lossy(&restart.stderr));
+            assert_eq!(poll("cat /tmp/marker-ok").as_deref(), Some("65534"), "postStartCommand not rerun");
+            assert!(
+                poll("kill -0 \"$(cut -d' ' -f1 /run/devsandbox/devsbd.pid)\"").is_some(),
+                "daemon not running after restart"
+            );
+            let log = in_container("cat /run/devsandbox/boot.log").unwrap_or_default();
+            assert!(log.contains("devsbd boot ===") && log.contains("\nran"), "{log}");
+
+            // No boot file: the hook only restarts the daemon.
+            crate::devsbd::sync_boot(&name, None, false);
+            assert_eq!(in_container("test -e /run/devsandbox/boot && echo present"), None);
+        });
+        Ok(())
+    }
 }

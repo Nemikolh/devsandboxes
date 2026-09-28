@@ -59,14 +59,45 @@ pub(crate) fn start_instance(dir: &Path, key: &str, info: &Instance) -> Result<(
             let (_, endpoints) =
                 services::ensure_services(&config, dir, &project, &info.instance_id, &service_names)?;
             backend().wire_service_dns(&info.container, &endpoints)?;
-            if let Some(cmd) = &sandbox.properties.post_start_command {
-                // Same ssh-agent path as `run`'s lifecycle chain: read the rule
-                // off an instance carrying the just-established arch, hold one
-                // bridge (relay mode) for the command, report its failure after.
-                let mut fresh = info.clone();
-                fresh.devsbd_arch = arch;
-                let host_agent = crate::commands::exec::has_host_agent();
-                let ssh_auth_sock = crate::commands::exec::ssh_auth_sock_env(&fresh, host_agent);
+            // Same ssh-agent rule as `run`'s lifecycle chain, read off an
+            // instance carrying the just-established arch.
+            let mut fresh = info.clone();
+            fresh.devsbd_arch = arch;
+            let host_agent = crate::commands::exec::has_host_agent();
+            let ssh_auth_sock = crate::commands::exec::ssh_auth_sock_env(&fresh, host_agent);
+            let props = &sandbox.properties;
+            let boot = run::boot_spec_for(
+                props.autostart,
+                arch.is_some(),
+                props.post_start_command.as_ref(),
+                &info.workspace,
+                Some(&info.remote_env),
+                info.remote_user.as_deref(),
+                ssh_auth_sock,
+            );
+            crate::devsbd::sync_boot(&info.container, boot.as_ref(), false);
+            let runtime = autostart::runtime_restarts(props.autostart, backend().supports_restart_policy());
+            let post_start = match &props.post_start_command {
+                None => None,
+                Some(cmd) => {
+                    let hooked = runtime
+                        && backend().label(&info.container, run::BOOT_HOOK_LABEL)?.is_some();
+                    match post_start_runner(runtime, hooked) {
+                        PostStart::Hook => None,
+                        PostStart::HostPredatesHook => {
+                            eprintln!(
+                                "warning: {key} predates the runtime boot hook; recreate with \
+                                 `devsandbox rebuild --force {key}`"
+                            );
+                            Some(cmd)
+                        }
+                        PostStart::Host => Some(cmd),
+                    }
+                }
+            };
+            if let Some(cmd) = post_start {
+                // Hold one bridge (relay mode) for the command, report its
+                // failure after.
                 #[cfg(unix)]
                 let bridge = (crate::devsbd::relay_mode(&fresh) && host_agent)
                     .then(|| crate::devsbd::bridge::spawn(&fresh))
@@ -98,6 +129,29 @@ pub(crate) fn start_instance(dir: &Path, key: &str, info: &Instance) -> Result<(
     Ok(())
 }
 
+/// Who runs `postStartCommand` on `start`.
+#[derive(Debug, PartialEq, Eq)]
+enum PostStart {
+    /// The host, via exec (the usual path).
+    Host,
+    /// The container's boot hook already did on `docker start`; the host skips.
+    Hook,
+    /// Runtime mode, but the container predates the hook: the host, plus a
+    /// warning to recreate.
+    HostPredatesHook,
+}
+
+/// `runtime`: the runtime restarts the container itself
+/// (`autostart::runtime_restarts`); `hooked`: its command runs the boot hook
+/// (`run::BOOT_HOOK_LABEL`).
+fn post_start_runner(runtime: bool, hooked: bool) -> PostStart {
+    match (runtime, hooked) {
+        (false, _) => PostStart::Host,
+        (true, true) => PostStart::Hook,
+        (true, false) => PostStart::HostPredatesHook,
+    }
+}
+
 /// The instance's sandbox resolved against this config root, or `None` when
 /// the config doesn't load, the sandbox is gone from it, or the instance was
 /// created from a different config root (project mismatch) — the caller then
@@ -126,5 +180,19 @@ pub(crate) fn start_containers(container: &str, services: &[String], quiet: bool
         } else {
             let _ = backend().run_inherit(&["start", target]);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn post_start_runner_per_mode() {
+        assert_eq!(post_start_runner(false, false), PostStart::Host);
+        // Not runtime mode: the hook has no boot file, the host runs it.
+        assert_eq!(post_start_runner(false, true), PostStart::Host);
+        assert_eq!(post_start_runner(true, true), PostStart::Hook);
+        assert_eq!(post_start_runner(true, false), PostStart::HostPredatesHook);
     }
 }

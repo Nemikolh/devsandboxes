@@ -251,7 +251,9 @@ Decisions taken while planning (differ from or sharpen the design above):
   with `devsandbox rebuild --force`".
 - Tests: run-args builder includes/omits `--restart` per mode + backend.
 
-### Step 3 — in-container boot hook
+### Step 3 — in-container boot hook [x]
+
+Landed limitations: the hook runs as the container's user, so a non-root `containerUser` can't start the daemon or switch users (daemon returns on the next host `start`); switching from root drops supplementary groups (no `setgroups` without libc); one zombie per container start unless `init = true`.
 
 - Container command becomes a hook + keep-alive for **new** containers:
   `sh -c '[ -x /run/devsandbox/bin/devsbd ] && /run/devsandbox/bin/devsbd boot & exec sleep infinity'`

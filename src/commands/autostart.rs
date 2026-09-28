@@ -189,6 +189,14 @@ pub(crate) fn restart_decision(
     (Some(RUNTIME_RESTART), warnings)
 }
 
+/// Whether the runtime itself restarts the container (`"runtime"` on a backend
+/// with restart policies). Then the in-container boot hook, not the host, owns
+/// `postStartCommand` on `start` (docs/automations.md); elsewhere `"runtime"`
+/// behaves as `true` (see [`restart_decision`]).
+pub(crate) fn runtime_restarts(mode: Option<Autostart>, supported: bool) -> bool {
+    mode == Some(Autostart::Runtime) && supported
+}
+
 /// The policy to switch an existing container to so it matches `mode`, or
 /// `None` when `current` already does. `autostart` isn't hashed for drift, so
 /// a flip is applied in place on start instead of requiring a rebuild. An
@@ -367,6 +375,15 @@ mod tests {
                 ]
             )
         );
+    }
+
+    #[test]
+    fn runtime_restarts_needs_runtime_mode_and_support() {
+        assert!(runtime_restarts(Some(Autostart::Runtime), true));
+        assert!(!runtime_restarts(Some(Autostart::Runtime), false));
+        for mode in [None, Some(Autostart::Off), Some(Autostart::Devsandbox)] {
+            assert!(!runtime_restarts(mode, true));
+        }
     }
 
     #[test]
