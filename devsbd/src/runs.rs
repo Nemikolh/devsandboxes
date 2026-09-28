@@ -40,6 +40,19 @@ pub const DIR: &str = "/var/lib/devsandbox/runs";
 /// 3x after U+FFFD replacement) under `control::MAX_RESPONSE`.
 pub const MAX_CHUNK: u64 = 256 * 1024;
 
+/// `ls` lists only this many runs, the newest: the runs dir is world-writable,
+/// so anyone in the container can fill it, and the host reads `ls` often.
+const MAX_LS_RUNS: usize = 50;
+
+/// Characters of rendered (escaped) argv per `ls` line; longer is cut, `…`
+/// appended.
+const MAX_LS_ARGV_CHARS: usize = 200;
+
+/// Largest `argv` / `meta` read; a bigger file makes the run unreadable
+/// rather than parsed from a cut-off prefix.
+const MAX_ARGV_BYTES: u64 = 64 * 1024;
+const MAX_META_BYTES: u64 = 4 * 1024;
+
 /// `wait`'s default timeout, seconds.
 const DEFAULT_WAIT: u64 = 60;
 const POLL: Duration = Duration::from_millis(100);
@@ -194,10 +207,30 @@ fn now() -> u64 {
 
 fn run_dir(root: &Path, id: &str) -> io::Result<PathBuf> {
     let dir = root.join(id);
-    if !valid_run_id(id) || !dir.is_dir() {
+    if !valid_run_id(id) || !is_real_dir(&dir) {
         return Err(io::Error::new(io::ErrorKind::NotFound, format!("no run `{id}`")));
     }
     Ok(dir)
+}
+
+/// A directory itself, not a symlink to one (`ls` and `run_dir` skip those).
+fn is_real_dir(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
+}
+
+/// `path` as text, when it's a regular file (not a symlink, dir, FIFO, …) of
+/// at most `cap` bytes; anything else is an error, so a planted file can't
+/// make a reader block or buffer without bound.
+fn read_capped(path: &Path, cap: u64) -> io::Result<String> {
+    if !fs::symlink_metadata(path)?.is_file() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("{} is not a regular file", path.display())));
+    }
+    let mut buf = Vec::new();
+    File::open(path)?.take(cap + 1).read_to_end(&mut buf)?;
+    if buf.len() as u64 > cap {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("{} is over {cap} bytes", path.display())));
+    }
+    String::from_utf8(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 fn append(dir: &Path, text: &str) -> io::Result<()> {
@@ -262,7 +295,7 @@ fn start(root: &Path, argv: &[String], cwd: Option<&str>) -> io::Result<String> 
 }
 
 fn read_argv(dir: &Path) -> io::Result<Vec<String>> {
-    let text = fs::read_to_string(dir.join("argv"))?;
+    let text = read_capped(&dir.join("argv"), MAX_ARGV_BYTES)?;
     text.lines()
         .map(|l| {
             let v = l.strip_prefix("arg ").or((l == "arg").then_some("")).ok_or("bad argv line")?;
@@ -380,7 +413,7 @@ fn is_supervisor(pid: u32, id: &str) -> bool {
 }
 
 fn load_state(dir: &Path, id: &str) -> io::Result<(Meta, State)> {
-    let read = || fs::read_to_string(dir.join("meta")).map(|t| parse_meta(&t));
+    let read = || read_capped(&dir.join("meta"), MAX_META_BYTES).map(|t| parse_meta(&t));
     let meta = read()?;
     let state = state_of(&meta, now(), |pid| is_supervisor(pid, id));
     if state != State::Lost {
@@ -398,34 +431,56 @@ fn load_state(dir: &Path, id: &str) -> io::Result<(Meta, State)> {
     Ok((meta, state))
 }
 
-/// `run ls`: one line per run, oldest first:
-/// `<id> <state> <started, UTC> <argv…>` (state is one or two words:
-/// `running`, `exited N`, `killed N`, `lost`). Argv words are joined by
-/// spaces, escaped as in `escape.rs` so a run stays one line.
+/// `run ls`: one line per run, oldest first, only the newest
+/// [`MAX_LS_RUNS`]: `<id> <state> <started, UTC> <argv…>` (state is one or
+/// two words: `running`, `exited N`, `killed N`, `lost`). Argv words are
+/// joined by spaces, escaped as in `escape.rs` so a run stays one line, and
+/// cut at [`MAX_LS_ARGV_CHARS`]. Runs that aren't real dirs or whose
+/// `meta`/`argv` can't be read are skipped. The newest are picked by name
+/// (ids start with the start time) before anything is read, so a flood of
+/// dirs costs one `lstat` each.
 fn ls(root: &Path) -> io::Result<String> {
     let mut ids: Vec<String> = match fs::read_dir(root) {
         Ok(entries) => entries
             .filter_map(|e| e.ok()?.file_name().into_string().ok())
-            .filter(|n| valid_run_id(n))
+            .filter(|n| valid_run_id(n) && is_real_dir(&root.join(n)))
             .collect(),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
         Err(e) => return Err(e),
     };
     ids.sort();
     let mut out = String::new();
-    for id in ids {
-        let dir = root.join(&id);
-        let Ok((meta, state)) = load_state(&dir, &id) else { continue };
-        let argv = read_argv(&dir).unwrap_or_default();
+    for id in &ids[ids.len().saturating_sub(MAX_LS_RUNS)..] {
+        let dir = root.join(id);
+        let Ok((meta, state)) = load_state(&dir, id) else { continue };
+        let argv = match read_argv(&dir) {
+            Ok(argv) => argv,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
+            Err(_) => continue,
+        };
         let started = meta.started.or_else(|| id[..10].parse().ok()).unwrap_or(0);
         out.push_str(&format!("{id} {} {}", state.label(), crate::boot::format_utc(started)));
-        for arg in argv {
-            out.push(' ');
-            escape(&arg, &mut out);
-        }
+        out.push_str(&render_argv(&argv));
         out.push('\n');
     }
     Ok(out)
+}
+
+/// ` <word> <word>…`, escaped, cut to [`MAX_LS_ARGV_CHARS`] chars plus `…`.
+fn render_argv(argv: &[String]) -> String {
+    let mut text = String::new();
+    for arg in argv {
+        text.push(' ');
+        escape(arg, &mut text);
+    }
+    match text.char_indices().nth(MAX_LS_ARGV_CHARS + 1) {
+        Some((cut, _)) => {
+            text.truncate(cut);
+            text.push('…');
+            text
+        }
+        None => text,
+    }
 }
 
 /// `run logs`: up to `cap` bytes of the log from `offset` (none past the end,
@@ -594,6 +649,74 @@ mod tests {
         assert!(read_chunk(&root, "../lost", 0, 1).is_err());
         // An empty or missing root lists nothing.
         assert_eq!(ls(&temp_root("none")).unwrap(), "");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A finished run made by hand: `argv` and `meta` as given.
+    fn fake_run(root: &Path, id: &str, argv: &str, meta: &str) {
+        let dir = root.join(id);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("argv"), argv).unwrap();
+        fs::write(dir.join("meta"), meta).unwrap();
+    }
+
+    const DONE: &str = "started 1790000000\nended 1790000001\nexit 0\n";
+
+    #[test]
+    fn ls_lists_only_the_newest_runs() {
+        let root = temp_root("ls-cap");
+        for n in 0..60 {
+            fake_run(&root, &format!("{:010}-0000", 1790000000 + n), "arg true\n", DONE);
+        }
+        let listed = ls(&root).unwrap();
+        let ids: Vec<&str> = listed.lines().map(|l| l.split(' ').next().unwrap()).collect();
+        assert_eq!(ids.len(), MAX_LS_RUNS);
+        assert_eq!(ids.first(), Some(&"1790000010-0000"));
+        assert_eq!(ids.last(), Some(&"1790000059-0000"));
+        assert!(ids.windows(2).all(|w| w[0] < w[1]), "oldest first");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ls_truncates_long_argv() {
+        let root = temp_root("ls-argv");
+        fake_run(&root, "1790000000-0000", &format!("arg {}\n", "x".repeat(500)), DONE);
+        fake_run(&root, "1790000001-0000", &format!("arg {}\n", "y".repeat(MAX_LS_ARGV_CHARS)), DONE);
+        let listed = ls(&root).unwrap();
+        let lines: Vec<&str> = listed.lines().collect();
+        assert!(lines[0].ends_with(&format!(" {}\u{2026}", "x".repeat(MAX_LS_ARGV_CHARS))), "{}", lines[0]);
+        assert!(!lines[0].contains(&"x".repeat(MAX_LS_ARGV_CHARS + 1)));
+        // Exactly at the limit: kept whole, no marker.
+        assert!(lines[1].ends_with(&format!(" {}", "y".repeat(MAX_LS_ARGV_CHARS))), "{}", lines[1]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unreadable_runs_are_skipped_or_refused() {
+        let root = temp_root("ls-bad");
+        fake_run(&root, "1790000000-0000", "arg ok\n", DONE);
+        // Oversized argv / meta (padding lines a parser would ignore).
+        let big_argv = "arg a\n".repeat(MAX_ARGV_BYTES as usize / 6 + 1);
+        fake_run(&root, "1790000001-0000", &big_argv, DONE);
+        let big_meta = format!("{DONE}{}", "pad x\n".repeat(MAX_META_BYTES as usize / 6 + 1));
+        fake_run(&root, "1790000002-0000", "arg a\n", &big_meta);
+        // `meta` that's a directory, and a run dir that's a symlink.
+        let dir = root.join("1790000003-0000");
+        fs::create_dir_all(dir.join("meta")).unwrap();
+        fs::write(dir.join("argv"), "arg a\n").unwrap();
+        std::os::unix::fs::symlink(root.join("1790000000-0000"), root.join("1790000004-0000")).unwrap();
+        // A plain file with a run-id name.
+        fs::write(root.join("1790000005-0000"), DONE).unwrap();
+
+        let listed = ls(&root).unwrap();
+        assert_eq!(listed.lines().count(), 1, "{listed}");
+        assert!(listed.starts_with("1790000000-0000 exited 0 "), "{listed}");
+        for id in ["1790000002-0000", "1790000003-0000", "1790000004-0000", "1790000005-0000"] {
+            assert!(wait(&root, id, Duration::ZERO).is_err(), "{id}");
+        }
+        assert!(read_argv(&root.join("1790000001-0000")).is_err());
+        assert!(supervise(&root, "1790000001-0000").is_err());
+        assert!(read_chunk(&root, "1790000004-0000", 0, 1).is_err(), "symlinked run dir");
         let _ = fs::remove_dir_all(&root);
     }
 

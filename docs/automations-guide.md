@@ -81,7 +81,7 @@ devsbd run wait <key> <id> [--sandbox S] [--timeout SECS]
 - `ls` prints a JSON array of this dispatcher's children: `name`, `sandbox`, `key`, `state` (`running` | `stopped` | `missing`), `branch`.
 - `stop` / `rm` / `exec` / `run …` take the key; `--sandbox` disambiguates a key used under two sandboxes.
 - `exec` starts a tracked *run* in a running child (`ensure` it first), as the child's `remoteUser` in its workspace with its `remoteEnv`. With `--detach` it prints the run id and returns; without, it prints `devsbd: run <id>` to stderr, streams the output, and exits with the run's code (`killed N` → 128+N, `lost` → 1).
-- `run ls` prints one line per run, oldest first: `<id> <state> <started, UTC> <argv…>`. `run logs` prints the output so far (`--follow`: until the run ends). `run wait` prints the final state, or `running` once `--timeout` expires; it exits 0 either way.
+- `run ls` prints one line per run, oldest first, for the newest 50 runs only: `<id> <state> <started, UTC> <argv…>`, argv cut at 200 characters (ending in `…`). Runs whose files are oversized or not regular files are left out. `run logs` prints the output so far (`--follow`: until the run ends). `run wait` prints the final state, or `running` once `--timeout` expires; it exits 0 either way.
 - Run states: `running`, `exited N`, `killed N` (signal), `lost` (its supervisor died without recording an end, e.g. the child restarted). Runs are kept in the child under `/var/lib/devsandbox/runs/<id>/`. The dashboard shows a child's recent runs as dim `run` rows under its processes.
 
 Exit codes:

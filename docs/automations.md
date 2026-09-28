@@ -587,7 +587,7 @@ container trigger those host git calls itself (`ensure`, `rm`).
 - Tests: semaphore refusal, bounded reader truncation + timeout kill (pure
   helper over a spawned `sh -c`), token bucket, per-instance cap.
 
-### Step 21 — helper-side hardening of shared dirs (Medium, DoS part)
+### Step 21 — helper-side hardening of shared dirs (Medium, DoS part) [x]
 
 - `run ls` (`devsbd/src/runs.rs`): newest 50 runs only, argv truncated
   (200 chars), entries that aren't real dirs / regular files skipped.
