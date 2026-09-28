@@ -48,6 +48,38 @@ const TERM_POLL_INTERVAL: Duration = Duration::from_millis(30);
 const TICK_INTERVAL: Duration = Duration::from_secs(2);
 /// Process-refresh cadence for expanded instances (separate from the snapshot).
 const PROC_TICK: Duration = Duration::from_secs(5);
+/// Delay of the second refresh after a start/stop finishes. The immediate one
+/// can be skipped (a stale collection already in flight) or land before the
+/// containers settle (`health: starting`), so re-poll shortly after.
+const FOLLOWUP_DELAY: Duration = Duration::from_millis(500);
+
+/// One-shot delayed refresh armed when a start/stop finishes. Kept separate
+/// from the event loop so the timing is testable without a runtime.
+#[derive(Default)]
+struct FollowUp {
+    due: Option<Instant>,
+}
+
+impl FollowUp {
+    /// (Re)arm for `now + FOLLOWUP_DELAY`; a later op pushes the deadline out so
+    /// back-to-back ops collapse into one follow-up after the last.
+    fn schedule(&mut self, now: Instant) {
+        self.due = Some(now + FOLLOWUP_DELAY);
+    }
+
+    /// True once due and no collection is in flight (`busy`), disarming it. A
+    /// due follow-up stays armed while busy, so it runs as soon as the slot
+    /// frees instead of being dropped like a plain tick.
+    fn take_due(&mut self, now: Instant, busy: bool) -> bool {
+        match self.due {
+            Some(due) if now >= due && !busy => {
+                self.due = None;
+                true
+            }
+            _ => false,
+        }
+    }
+}
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
@@ -106,6 +138,10 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
     // At most one process fetch in flight; `Some` while one is running.
     let mut proc_pending: Option<Receiver<BTreeMap<String, ProcState>>> = None;
     let mut last_proc_tick = Instant::now();
+    let mut followup = FollowUp::default();
+    // Set while the follow-up's collection runs: proc targets come from the
+    // snapshot, so the proc refresh must wait for it to land.
+    let mut procs_after_snapshot = false;
     // ssh-agent relays, one per running instance while the dashboard is open
     // (docs/sandbox-helper.md). Owned by a worker thread so `State::load` and
     // the per-instance `exec` spawns never block the UI; the snapshot arm just
@@ -235,6 +271,7 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
                 app.stopping.remove(instance);
                 app.status = Some(done.status);
                 last_tick = Instant::now();
+                followup.schedule(last_tick);
                 if pending.is_none() {
                     pending = Some(spawn_collect(&dir));
                 }
@@ -252,6 +289,7 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
                 app.starting.remove(instance);
                 app.status = Some(done.status);
                 last_tick = Instant::now();
+                followup.schedule(last_tick);
                 if pending.is_none() {
                     pending = Some(spawn_collect(&dir));
                 }
@@ -293,11 +331,21 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
                     }
                     app.set_snapshot(snapshot);
                     pending = None;
+                    if procs_after_snapshot {
+                        procs_after_snapshot = false;
+                        app.needs_proc_fetch = true;
+                    }
                 }
                 Err(TryRecvError::Empty) => {}
                 // Thread died without sending; drop the slot so the next tick retries.
                 Err(TryRecvError::Disconnected) => pending = None,
             }
+        }
+
+        if followup.take_due(Instant::now(), pending.is_some()) {
+            last_tick = Instant::now();
+            pending = Some(spawn_collect(&dir));
+            procs_after_snapshot = true;
         }
 
         if last_tick.elapsed() >= TICK_INTERVAL {
@@ -554,4 +602,40 @@ fn spawn_collect(dir: &Path) -> Receiver<Snapshot> {
         let _ = tx.send(data::collect(&dir));
     });
     rx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn followup_fires_once_after_delay() {
+        let t0 = Instant::now();
+        let mut f = FollowUp::default();
+        assert!(!f.take_due(t0, false), "unarmed never fires");
+        f.schedule(t0);
+        assert!(!f.take_due(t0 + Duration::from_millis(499), false));
+        assert!(f.take_due(t0 + FOLLOWUP_DELAY, false));
+        assert!(!f.take_due(t0 + Duration::from_secs(5), false), "one-shot");
+    }
+
+    #[test]
+    fn followup_waits_for_in_flight_collection() {
+        let t0 = Instant::now();
+        let mut f = FollowUp::default();
+        f.schedule(t0);
+        let late = t0 + Duration::from_secs(1);
+        assert!(!f.take_due(late, true), "held while busy");
+        assert!(f.take_due(late, false), "runs once the slot frees");
+    }
+
+    #[test]
+    fn followup_reschedule_pushes_deadline() {
+        let t0 = Instant::now();
+        let mut f = FollowUp::default();
+        f.schedule(t0);
+        f.schedule(t0 + Duration::from_millis(300));
+        assert!(!f.take_due(t0 + FOLLOWUP_DELAY, false));
+        assert!(f.take_due(t0 + Duration::from_millis(800), false));
+    }
 }
