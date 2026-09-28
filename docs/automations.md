@@ -293,7 +293,7 @@ Landed limitations: the hook runs as the container's user, so a non-root `contai
 - Tests: record encode/decode, outbox ordering, flush-on-attach with an
   in-process mux pair (see existing daemon tests).
 
-### Step 5 — notify: host side
+### Step 5 — notify: host side [x]
 
 - `src/devsbd/bridge.rs`: bridges advertise `caps::NOTIFY` when given a
   notification sink; `on_open(NOTIFY)` reads the record, replies `ok`, hands a

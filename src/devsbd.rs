@@ -12,8 +12,12 @@ pub mod bridge;
 // Shared with the helper; the parser is helper-only (the host only writes).
 #[allow(dead_code)]
 pub mod bootfile;
+// Desktop delivery of container notifications, fed by `bridge`'s notify sink.
+#[cfg(unix)]
+pub mod desktop;
 mod escape;
-// Shared with the helper, which writes records; the host reads them (step 5).
+// Shared with the helper, which writes records; the host reads them
+// (`bridge`'s notify handler). Partly helper-only (`OUTBOX`, `encode`).
 #[allow(dead_code)]
 pub mod notify;
 // The forwarder engine (step 5); the CLI (`devsandbox port`) drives its full

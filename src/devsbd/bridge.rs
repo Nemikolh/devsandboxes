@@ -1,7 +1,11 @@
 //! Host half of the ssh-agent relay (docs/sandbox-helper.md): runs
 //! `exec -i <c> devsbd bridge` and serves the streams it carries, connecting
 //! each `Open` to the host agent. Owners: CLI `exec` (for the command's
-//! lifetime) and the TUI (one per running instance while open).
+//! lifetime) and the TUI (one per running instance while open). TUI bridges
+//! also take the container's `devsbd notify` records (docs/automations.md).
+
+use std::io::{Read, Write};
+use std::os::unix::net::UnixStream;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -12,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use super::mux::{self, Conn, Mux};
 use super::proto::caps;
-use super::{proto, relay_mode, BIN};
+use super::{notify, proto, relay_mode, BIN};
 use crate::runtime::backend;
 use crate::state::{Instance, State};
 
@@ -129,12 +133,112 @@ pub fn has_host_agent() -> bool {
     host_agent().is_some()
 }
 
+/// A container's `devsbd notify` record, tagged with the instance (state key)
+/// whose bridge delivered it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Notification {
+    pub instance: String,
+    pub record: notify::Record,
+}
+
+/// Where a bridge hands the notifications it takes. Called on the stream's
+/// handler thread (never the UI thread), after the daemon got its `ok`.
+pub type Sink = Arc<dyn Fn(Notification) + Send + Sync>;
+
+/// A bridge's notify wiring: its sink plus the instance it serves.
+#[derive(Clone)]
+struct NotifyTo {
+    instance: String,
+    sink: Sink,
+}
+
+/// The caps a host bridge advertises in its `Caps` frame: `SSH_AGENT` only
+/// with an agent socket, `NOTIFY` only with a sink — so short-lived sink-less
+/// bridges (`exec`, lifecycle, forwards) never take notify streams, which
+/// would drop the records with them.
+fn own_caps(has_agent: bool, has_sink: bool) -> u32 {
+    let agent = if has_agent { caps::SSH_AGENT } else { 0 };
+    let sink = if has_sink { caps::NOTIFY } else { 0 };
+    agent | sink
+}
+
+/// Room over `notify::MAX_RECORD` before a notify stream counts as oversized:
+/// the helper enforces the cap itself, this just bounds a misbehaving peer.
+const NOTIFY_SLACK: usize = 1024;
+
+/// A notify stream whose record doesn't end (no `Eof`) within this is dropped,
+/// so a wedged daemon can't pin handler threads.
+const NOTIFY_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Reply to an undecodable record: anything not starting with
+/// `notify::REPLY_OK` makes the daemon keep the file and retry later.
+const NOTIFY_REPLY_BAD: &[u8] = b"bad record";
+
+/// The local end for an `Open` on `channel`, or `None` to refuse it: agent
+/// streams connect to the host agent (when this bridge has a provider), notify
+/// streams go to a handler thread (when it has a sink). Must return at once:
+/// it runs on the mux's `serve` thread.
+fn open_stream(
+    channel: u8,
+    agent: Option<&impl Fn() -> Option<PathBuf>>,
+    notify: Option<&NotifyTo>,
+) -> Option<Conn> {
+    match channel {
+        proto::channel::SSH_AGENT => UnixStream::connect(agent?()?).ok().map(Into::into),
+        proto::channel::NOTIFY => {
+            let to = notify?.clone();
+            let (ours, theirs) = UnixStream::pair().ok()?;
+            std::thread::spawn(move || handle_notify(ours, &to));
+            Some(theirs.into())
+        }
+        _ => None,
+    }
+}
+
+/// One notify stream: read the record to EOF (the daemon's `Eof` half-closes
+/// our side), decode, reply `ok`, close, then hand it to the sink. Replying
+/// before delivering keeps the daemon's wait short; a failed reply write
+/// skips delivery, since the daemon will resend. Oversized or timed-out →
+/// close with no reply; undecodable → `NOTIFY_REPLY_BAD`. Silent throughout:
+/// the TUI owns the terminal.
+fn handle_notify(mut conn: UnixStream, to: &NotifyTo) {
+    let _ = conn.set_read_timeout(Some(NOTIFY_READ_TIMEOUT));
+    let limit = notify::MAX_RECORD + NOTIFY_SLACK;
+    let mut buf = Vec::new();
+    if (&conn).take(limit as u64 + 1).read_to_end(&mut buf).is_err() || buf.len() > limit {
+        return;
+    }
+    let decoded = std::str::from_utf8(&buf).map_err(|e| e.to_string()).and_then(notify::decode);
+    let Ok(record) = decoded else {
+        let _ = conn.write_all(NOTIFY_REPLY_BAD);
+        return;
+    };
+    if conn.write_all(notify::REPLY_OK).is_err() {
+        return;
+    }
+    drop(conn);
+    (to.sink)(Notification { instance: to.instance.clone(), record });
+}
+
 /// Start a bridge for `info` without waiting for its handshake (see
 /// `outcome`). Fully quiet (stderr captured), since the TUI owns the
 /// screen; `None` only when the `exec` can't even be spawned.
 pub fn spawn(info: &Instance) -> Option<Bridge> {
     let hash = info.devsbd_arch.and_then(super::hash).unwrap_or_default();
-    spawn_with(&info.container, hash, Some(host_agent))
+    spawn_with(&info.container, hash, Some(host_agent), None)
+}
+
+/// A `Bridges` bridge for instance `key`: the host agent only when
+/// `with_agent`, notify only when `sink` is set.
+fn spawn_managed(key: &str, info: &Instance, with_agent: bool, sink: Option<&Sink>) -> Option<Bridge> {
+    let hash = info.devsbd_arch.and_then(super::hash).unwrap_or_default();
+    let notify = sink.map(|s| NotifyTo { instance: key.to_string(), sink: Arc::clone(s) });
+    if with_agent {
+        spawn_with(&info.container, hash, Some(host_agent), notify)
+    } else {
+        let none: Option<fn() -> Option<PathBuf>> = None;
+        spawn_with(&info.container, hash, none, notify)
+    }
 }
 
 /// Start a bridge for `container` with helper `hash`, optionally serving the
@@ -145,21 +249,23 @@ pub fn spawn(info: &Instance) -> Option<Bridge> {
 /// 5) uses this so `spawn_with`'s generic agent type stays private.
 pub fn spawn_for(container: &str, hash: &str, with_agent: bool) -> Option<Bridge> {
     if with_agent {
-        spawn_with(container, hash, Some(host_agent))
+        spawn_with(container, hash, Some(host_agent), None)
     } else {
         let none: Option<fn() -> Option<PathBuf>> = None;
-        spawn_with(container, hash, none)
+        spawn_with(container, hash, none, None)
     }
 }
 
 /// Start a bridge. `agent` is the host ssh-agent socket provider, or `None` for
 /// an agent-less bridge (a `devsandbox port` forward): it advertises no
 /// `SSH_AGENT` cap and refuses agent `Open`s, so the daemon won't route agent
-/// clients to it and it can't steal ssh from an older agent bridge.
+/// clients to it and it can't steal ssh from an older agent bridge. `notify`
+/// set → the bridge advertises `NOTIFY` and takes the daemon's notify streams.
 fn spawn_with(
     container: &str,
     hash: &str,
     agent: Option<impl Fn() -> Option<PathBuf> + Send + 'static>,
+    notify: Option<NotifyTo>,
 ) -> Option<Bridge> {
     let mut child = Command::new(backend().bin())
         .args(["exec", "-i", "-u", "root", container, BIN, "bridge"])
@@ -252,12 +358,12 @@ fn spawn_with(
             let mux = Mux::new(stdin);
             // Tell the daemon our caps right after the handshake, on stream 0:
             // `SSH_AGENT` only when this bridge has an agent provider and it
-            // yields a socket now. An agent-less bridge (a `devsandbox port`
-            // forward) advertises 0, so the daemon won't route agent clients to
-            // it. Best effort — a send failure just means the connection died.
+            // yields a socket now; `NOTIFY` only with a sink (`own_caps`). An
+            // agent-less bridge (a `devsandbox port` forward) advertises no
+            // `SSH_AGENT`, so the daemon won't route agent clients to it. Best
+            // effort — a send failure just means the connection died.
             let has_agent = agent.as_ref().and_then(|a| a()).is_some();
-            let own = if has_agent { caps::SSH_AGENT } else { 0 };
-            let _ = mux.send(&proto::Frame::Caps(own));
+            let _ = mux.send(&proto::Frame::Caps(own_caps(has_agent, notify.is_some())));
             // Publish the mux + daemon caps *before* reporting the handshake
             // result, so a caller that sees `outcome() == Ok` can rely on
             // `peer_caps()` / `connect()` being ready (no publish race).
@@ -270,13 +376,7 @@ fn spawn_with(
             mux.keepalive(mux::KEEPALIVE_INTERVAL, mux::KEEPALIVE_TIMEOUT, move || {
                 let _ = dead_child.lock().unwrap().kill();
             });
-            mux.serve(stdout, move |_, channel| {
-                if channel != proto::channel::SSH_AGENT {
-                    return None;
-                }
-                let agent = agent.as_ref()?;
-                std::os::unix::net::UnixStream::connect(agent()?).ok().map(Into::into)
-            });
+            mux.serve(stdout, move |_, channel| open_stream(channel, agent.as_ref(), notify.as_ref()));
         }
         finished.store(true, Ordering::Relaxed);
     });
@@ -345,40 +445,63 @@ fn retry_decision(entry: Option<(bool, bool, Duration)>) -> Retry {
     }
 }
 
+/// Whether `reconcile` wants a bridge for one running instance, and if so
+/// whether it serves the host agent: `None` = no bridge, `Some(with_agent)`.
+/// The agent is relayed as ever (`relay_mode` + a host agent); a sink adds a
+/// bridge to every helper-capable instance so its notify outbox drains.
+fn wanted(helper: bool, relay: bool, host_agent: bool, has_sink: bool) -> Option<bool> {
+    let with_agent = host_agent && relay;
+    (with_agent || (has_sink && helper)).then_some(with_agent)
+}
+
 /// The TUI's set of bridges, reconciled against the running instances on each
 /// snapshot. Owned by a worker thread (`spawn_worker`), never touched on the UI
 /// thread.
 #[derive(Default)]
 pub struct Bridges {
-    live: HashMap<String, (Bridge, Instant)>,
+    // container → (bridge, spawned at, spawned with the agent provider).
+    live: HashMap<String, (Bridge, Instant, bool)>,
+    // Set → bridges advertise `NOTIFY` and are kept even without a host agent.
+    sink: Option<Sink>,
 }
 
 impl Bridges {
     /// Keep one bridge per running container in `running` whose instance
-    /// wants one; drop the rest. Dead bridges are retried per `retry_decision`.
+    /// wants one (`wanted`); drop the rest. Dead bridges are retried per
+    /// `retry_decision`; a bridge whose agent wiring no longer matches (host
+    /// agent came or went) is replaced at once.
     pub fn reconcile(&mut self, running: &[&str]) {
         self.live.retain(|c, _| running.contains(&c.as_str()));
-        // No host agent → nothing to relay; skip the per-instance `exec`.
-        if !has_host_agent() {
+        let host_agent = has_host_agent();
+        // No host agent and no sink → nothing to relay; skip the per-instance `exec`.
+        if !host_agent && self.sink.is_none() {
             self.live.clear();
             return;
         }
         let Ok(state) = State::load() else { return };
-        for info in state.instances.values() {
-            if !running.contains(&info.container.as_str()) || !relay_mode(info) {
+        let mut keep = Vec::new();
+        for (key, info) in &state.instances {
+            if !running.contains(&info.container.as_str()) {
                 continue;
             }
+            let helper = info.devsbd_arch.is_some();
+            let Some(with_agent) = wanted(helper, relay_mode(info), host_agent, self.sink.is_some()) else {
+                continue;
+            };
+            keep.push(info.container.clone());
             let entry = self
                 .live
                 .get(&info.container)
-                .map(|(b, at)| (b.is_done(), b.is_mismatch(), at.elapsed()));
+                .filter(|(.., agent)| *agent == with_agent)
+                .map(|(b, at, _)| (b.is_done(), b.is_mismatch(), at.elapsed()));
             if retry_decision(entry) != Retry::Keep {
                 self.live.remove(&info.container);
-                if let Some(b) = spawn(info) {
-                    self.live.insert(info.container.clone(), (b, Instant::now()));
+                if let Some(b) = spawn_managed(key, info, with_agent, self.sink.as_ref()) {
+                    self.live.insert(info.container.clone(), (b, Instant::now(), with_agent));
                 }
             }
         }
+        self.live.retain(|c, _| keep.contains(c));
     }
 
     /// Move a `Bridges` onto its own thread, fed running-container lists over an
@@ -386,10 +509,20 @@ impl Bridges {
     /// on the UI thread; the snapshot arm just `send`s the owned list. Dropping
     /// the returned [`BridgeWorker`] closes the channel and joins the thread,
     /// which drops every live `Bridge` (killing its `exec`) before returning.
-    pub fn spawn_worker() -> BridgeWorker {
+    ///
+    /// `sink` set → every helper-capable running instance gets a notify-serving
+    /// bridge; each notification is shown on the desktop (from the stream's
+    /// handler thread) and then sent on `sink`, which the TUI drains.
+    pub fn spawn_worker(sink: Option<mpsc::Sender<Notification>>) -> BridgeWorker {
+        let sink = sink.map(|tx| -> Sink {
+            Arc::new(move |n: Notification| {
+                super::desktop::notify_desktop(&n);
+                let _ = tx.send(n);
+            })
+        });
         let (tx, rx) = mpsc::channel::<Vec<String>>();
         let handle = std::thread::spawn(move || {
-            let mut bridges = Bridges::default();
+            let mut bridges = Bridges { sink, ..Bridges::default() };
             // Block for the next list, then coalesce: drain everything already
             // queued and reconcile only against the newest, so a burst of
             // snapshots costs one reconcile.
@@ -462,12 +595,110 @@ mod tests {
         assert_eq!(retry_decision(Some((true, true, MISMATCH_RETRY))), Retry::Respawn);
     }
 
+    #[test]
+    fn caps_advertise_notify_only_with_a_sink() {
+        assert_eq!(own_caps(false, false), 0);
+        assert_eq!(own_caps(true, false), caps::SSH_AGENT);
+        assert_eq!(own_caps(false, true), caps::NOTIFY);
+        assert_eq!(own_caps(true, true), caps::SSH_AGENT | caps::NOTIFY);
+    }
+
+    #[test]
+    fn wanted_bridges() {
+        // No sink: exactly the agent relay (relay mode + host agent).
+        for helper in [false, true] {
+            assert_eq!(wanted(helper, false, true, false), None);
+            assert_eq!(wanted(helper, false, false, false), None);
+        }
+        assert_eq!(wanted(true, true, true, false), Some(true));
+        assert_eq!(wanted(true, true, false, false), None);
+        // Sink: every helper-capable instance, agent only where relayed.
+        assert_eq!(wanted(true, false, false, true), Some(false));
+        assert_eq!(wanted(true, true, false, true), Some(false));
+        assert_eq!(wanted(true, false, true, true), Some(false));
+        assert_eq!(wanted(true, true, true, true), Some(true));
+        assert_eq!(wanted(false, false, true, true), None);
+    }
+
+    /// A daemon-side mux and a host bridge's `open_stream` joined by pipes;
+    /// the host has a notify sink for instance `web-1` and no agent.
+    fn notify_pair() -> (Arc<Mux>, mpsc::Receiver<Notification>) {
+        let (d_r, h_w) = std::io::pipe().unwrap();
+        let (h_r, d_w) = std::io::pipe().unwrap();
+        let daemon = Mux::new(d_w);
+        let host = Mux::new(h_w);
+        let (tx, rx) = mpsc::channel();
+        let tx = Mutex::new(tx);
+        let to = NotifyTo {
+            instance: "web-1".into(),
+            sink: Arc::new(move |n| {
+                let _ = tx.lock().unwrap().send(n);
+            }),
+        };
+        let d = Arc::clone(&daemon);
+        std::thread::spawn(move || d.serve(d_r, |_, _| None));
+        std::thread::spawn(move || {
+            let none: Option<fn() -> Option<PathBuf>> = None;
+            host.serve(h_r, move |_, ch| open_stream(ch, none.as_ref(), Some(&to)))
+        });
+        (daemon, rx)
+    }
+
+    /// What the daemon's `send_record` does: `Open(NOTIFY)`, the bytes as one
+    /// `Data`, `Eof`; returns everything the host wrote back before closing.
+    fn send_notify(daemon: &Arc<Mux>, stream: u32, bytes: &[u8]) -> Vec<u8> {
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+        ours.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        daemon.attach(stream, theirs, Some(proto::channel::NOTIFY)).unwrap();
+        daemon.send(&proto::Frame::Data { stream, bytes: bytes.to_vec() }).unwrap();
+        daemon.send(&proto::Frame::Eof { stream }).unwrap();
+        let mut reply = Vec::new();
+        ours.read_to_end(&mut reply).unwrap();
+        reply
+    }
+
+    #[test]
+    fn notify_stream_replies_ok_and_delivers() {
+        let (daemon, rx) = notify_pair();
+        let record = notify::Record {
+            level: notify::Level::Warn,
+            key: Some("pr-1".into()),
+            link: None,
+            msg: "PR 1\nneeds you".into(),
+            at: 7,
+        };
+        let reply = send_notify(&daemon, 1, notify::encode(&record).as_bytes());
+        assert!(reply.starts_with(notify::REPLY_OK), "reply: {reply:?}");
+        let got = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(got, Notification { instance: "web-1".into(), record });
+    }
+
+    #[test]
+    fn bad_or_oversized_notify_gets_no_ok_and_is_not_delivered() {
+        let (daemon, rx) = notify_pair();
+        let reply = send_notify(&daemon, 1, b"garbage");
+        assert!(!reply.starts_with(notify::REPLY_OK), "reply: {reply:?}");
+        let big = vec![b'x'; notify::MAX_RECORD + NOTIFY_SLACK + 1];
+        let reply = send_notify(&daemon, 3, &big);
+        assert!(reply.is_empty(), "oversized: closed without a reply");
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err(), "nothing delivered");
+    }
+
+    /// A sink-less bridge refuses notify streams (it never advertises NOTIFY,
+    /// but an old/confused daemon must still get no `ok`).
+    #[test]
+    fn sink_less_refuses_notify() {
+        let none: Option<fn() -> Option<PathBuf>> = None;
+        assert!(open_stream(proto::channel::NOTIFY, none.as_ref(), None).is_none());
+        assert!(open_stream(proto::channel::SSH_AGENT, none.as_ref(), None).is_none());
+    }
+
     /// The worker reconciles against only the newest queued list. With no host
     /// agent every reconcile is a cheap no-op (no `exec`), so this exercises the
     /// send/coalesce/join path without docker.
     #[test]
     fn worker_coalesces_and_joins() {
-        let worker = Bridges::spawn_worker();
+        let worker = Bridges::spawn_worker(None);
         for i in 0..100 {
             worker.send(vec![format!("devsandbox-c{i}")]);
         }
@@ -520,7 +751,7 @@ mod tests {
             let arch = install(&name, None).unwrap();
             let bridge = || {
                 let agent_path = sock.clone();
-                spawn_with(&name, hash(arch).unwrap(), Some(move || Some(agent_path.clone()))).unwrap()
+                spawn_with(&name, hash(arch).unwrap(), Some(move || Some(agent_path.clone())), None).unwrap()
             };
             let ssh_add = || {
                 Command::new("docker")
@@ -667,7 +898,7 @@ mod tests {
 
             // The agent bridge attaches first and lists the key.
             let agent_path = sock.clone();
-            let agent_bridge = spawn_with(&name, hash(arch).unwrap(), Some(move || Some(agent_path.clone()))).unwrap();
+            let agent_bridge = spawn_with(&name, hash(arch).unwrap(), Some(move || Some(agent_path.clone())), None).unwrap();
             assert_eq!(agent_bridge.outcome(Duration::from_secs(10)), Some(Ok(())), "agent bridge");
             assert!(list().contains("devsbd-agentroute"), "via agent bridge");
 
@@ -691,7 +922,7 @@ mod tests {
                         })
                         .collect();
                     let none: Option<fn() -> Option<PathBuf>> = None;
-                    let port_bridge = spawn_with(&name, hash(arch).unwrap(), none).unwrap();
+                    let port_bridge = spawn_with(&name, hash(arch).unwrap(), none, None).unwrap();
                     assert_eq!(port_bridge.outcome(Duration::from_secs(10)), Some(Ok(())), "agent-less bridge");
                     port_bridges.push(port_bridge);
                     clients.into_iter().map(|c| c.join().unwrap()).collect::<Vec<_>>()
@@ -702,6 +933,54 @@ mod tests {
             }
             // Settled (every `Caps(0)` in): still routed to the agent bridge.
             assert!(list().contains("devsbd-agentroute"), "agent-less bridge stole routing");
+            Ok(())
+        })
+    }
+
+    /// Docker-gated end to end: `devsbd notify` in a container reaches a
+    /// sink-bearing (agent-less) host bridge, and the outbox is emptied once
+    /// the host replied `ok`.
+    #[test_utils::docker_test(helper)]
+    fn delivers_container_notify_to_the_sink_with_docker() -> Result<(), &'static str> {
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let name = format!("devsandbox-notify-test-{stamp}");
+        let cleanup = || {
+            let _ = Command::new("docker").args(["rm", "-f", &name]).output();
+        };
+        crate::test_support::with_cleanup(cleanup, || {
+            assert!(ok(Command::new("docker").args(["run", "-d", "--name", &name, "alpine:3.20", "sleep", "300"])));
+            let arch = install(&name, None).unwrap();
+            start_daemon(&name);
+            let (tx, rx) = mpsc::channel();
+            let tx = Mutex::new(tx);
+            let to = NotifyTo {
+                instance: "notify-test".into(),
+                sink: Arc::new(move |n| {
+                    let _ = tx.lock().unwrap().send(n);
+                }),
+            };
+            let none: Option<fn() -> Option<PathBuf>> = None;
+            let bridge = spawn_with(&name, hash(arch).unwrap(), none, Some(to)).unwrap();
+            assert_eq!(bridge.outcome(Duration::from_secs(10)), Some(Ok(())), "bridge handshake");
+            assert!(ok(Command::new("docker").args(["exec", &name, BIN, "notify", "--key", "k", "hello"])));
+            let got = rx.recv_timeout(Duration::from_secs(15)).expect("notification delivered");
+            assert_eq!(got.instance, "notify-test");
+            assert_eq!(got.record.msg, "hello");
+            assert_eq!(got.record.key.as_deref(), Some("k"));
+            assert_eq!(got.record.level, notify::Level::Info);
+            // The daemon deletes the file after reading our `ok`, which races
+            // the sink: poll briefly.
+            let list = format!("ls -A {}", notify::OUTBOX);
+            let mut empty = false;
+            for _ in 0..50 {
+                let out = Command::new("docker").args(["exec", &name, "sh", "-c", &list]).output().unwrap();
+                if out.status.success() && out.stdout.is_empty() {
+                    empty = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            assert!(empty, "outbox drained");
             Ok(())
         })
     }
@@ -731,7 +1010,7 @@ mod tests {
             let arch = install(&name, None).unwrap();
             start_daemon(&name);
             let none: Option<fn() -> Option<PathBuf>> = None;
-            let bridge = spawn_with(&name, hash(arch).unwrap(), none).unwrap();
+            let bridge = spawn_with(&name, hash(arch).unwrap(), none, None).unwrap();
             assert_eq!(bridge.outcome(Duration::from_secs(10)), Some(Ok(())), "bridge handshake");
             assert_eq!(bridge.peer_caps(), Some(caps::TCP_FORWARD), "daemon advertises TCP_FORWARD");
 

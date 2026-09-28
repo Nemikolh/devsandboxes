@@ -150,8 +150,13 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
     // sends it the running set. Its `Drop` (any exit path, including `?` early
     // returns) closes the channel and joins the thread, killing every bridge
     // before the terminal is restored.
+    // With a notify sink, bridges also drain each instance's `devsbd notify`
+    // outbox (docs/automations.md); the worker shows desktop notifications,
+    // this loop just drains the channel.
     #[cfg(unix)]
-    let bridges = crate::devsbd::bridge::Bridges::spawn_worker();
+    let (notify_tx, notifications) = std::sync::mpsc::channel();
+    #[cfg(unix)]
+    let bridges = crate::devsbd::bridge::Bridges::spawn_worker(Some(notify_tx));
     // Ports-tab forwards (docs/port-forwarding.md, step 10). Same ownership as
     // `bridges`: a worker thread owns every `Forward`, doing all config/state/
     // docker work (route resolution, `ensure`, the `lsof` probe) off the UI
@@ -254,6 +259,13 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
                     forwards::ForwardUpdate::Rows(rows) => app.set_ports(rows),
                     forwards::ForwardUpdate::Status(status) => app.status = Some(status),
                 }
+            }
+            // Container notifications: the latest one on the status line (the
+            // inbox is step 6 of docs/automations.md).
+            while let Ok(n) = notifications.try_recv() {
+                // One status line: fold a multi-line message.
+                let msg = n.record.msg.split_whitespace().collect::<Vec<_>>().join(" ");
+                app.status = Some(format!("{}: {msg}", n.instance));
             }
         }
         #[cfg(not(unix))]
