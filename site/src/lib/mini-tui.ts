@@ -1,7 +1,7 @@
 /**
- * The landing page's mini dashboard as a pure state machine: what the "how it
- * works" script renders (`scripts/how-it-works.ts`) and what the autoplay
- * drives. Keys follow the real TUI (`HELP_BODY` in `src/tui/app/view.rs`), with
+ * The mini dashboard as a pure state machine: what the widget driver renders
+ * (`scripts/mini-tui.ts`, markup `components/MiniTui.astro`) and what the
+ * autoplay drives. Keys follow the real TUI (`HELP_BODY` in `src/tui/app/view.rs`), with
  * two deliberate differences, both spelled out in the `?` overlay:
  *
  * - Tab is left to the browser so keyboard users can always leave the widget;
@@ -65,6 +65,12 @@ export const CTRL_BRACKET = 'ctrl-]';
 
 /** `web` is your checkout; repeat instances are worktrees on `sandbox/<name>`. */
 export const BRANCH: Record<Instance, string> = { web: 'main', 'web-2': 'sandbox/web-2', 'web-3': 'sandbox/web-3' };
+
+/** Where each instance's files live, relative to the config dir (worktrees under `.worktrees/`). */
+export const FOLDER: Record<Instance, string> = { web: '../web', 'web-2': '.worktrees/web-2', 'web-3': '.worktrees/web-3' };
+
+/** The Instances table's UPTIME column. */
+export const UPTIME: Record<Instance, string> = { web: '2h05m', 'web-2': '48m', 'web-3': '12m' };
 
 /** What each agent has touched (web-3's agent is done and committed). */
 const CHANGED: Record<Instance, string | null> = { web: 'src/app.ts', 'web-2': 'src/api/users.ts', 'web-3': null };
@@ -348,6 +354,32 @@ export function settled(): State {
   let s = INITIAL;
   while (playing(s)) s = reduce(s, { type: 'tick' });
   return { ...s, message: null, step: -1 };
+}
+
+// ---- Pure render helpers: what the driver writes, kept here to be testable.
+
+/** Which hint bar shows (`data-tui-help`): the dashboard's, a live shell's, or an exited one's. */
+export type HelpMode = 'dashboard' | 'terminal' | 'exited';
+
+export function helpMode(s: State): HelpMode {
+  const term = activeTerm(s);
+  return s.focus === 'terminal' && term ? (term.exited ? 'exited' : 'terminal') : 'dashboard';
+}
+
+/** One tab in the terminal pane's title strip, like `TermTabs` titles. */
+export const termTabLabel = (t: Term, i: number): string => `${i + 1}:${t.name}${t.exited ? ' (exited)' : ''}`;
+
+/** The pane's rows: scrollback, then the prompt line while the shell lives (the cursor goes after it). */
+export const termRows = (t: Term): string[] => (t.exited ? [...t.lines] : [...t.lines, promptFor(t.name) + t.input]);
+
+/**
+ * The status-bar slot: a pending message wins, else the keys that work in the
+ * current focus while the widget has page focus, else the invitation to click.
+ */
+export function hintFor(s: State, pageFocus: boolean): { kind: 'message' | 'hint'; text: string } {
+  if (s.message) return { kind: 'message', text: s.message };
+  const keys = s.focus === 'terminal' ? 'ESC TO DASHBOARD · TAB LEAVES' : '? FOR KEYS · TAB LEAVES';
+  return { kind: 'hint', text: pageFocus ? keys : 'CLICK TO TRY IT' };
 }
 
 /** A short, polite announcement of what a user action changed (or null). */

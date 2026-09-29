@@ -4,6 +4,8 @@ import {
   CTRL_BRACKET,
   describe as announce,
   type Event,
+  helpMode,
+  hintFor,
   INITIAL,
   isHandledKey,
   keycapFor,
@@ -15,6 +17,8 @@ import {
   type State,
   STATIC,
   TERM_ROWS,
+  termRows,
+  termTabLabel,
   TIMELINE,
 } from './mini-tui';
 
@@ -308,5 +312,35 @@ describe('announcements', () => {
     expect(announce(open, keys(open, 'p'))).toBeNull();
     expect(announce(open, type(open, 'exit'))).toMatch(/^Shell exited/);
     expect(announce(open, keys(open, 'Escape', 'x'))).toBe('Terminal closed, none left');
+  });
+});
+
+describe('render helpers', () => {
+  it('pick the hint bar for the focus and the shell state', () => {
+    expect(helpMode(STATIC)).toBe('dashboard');
+    const open = keys(STATIC, 't');
+    expect(helpMode(open)).toBe('terminal');
+    expect(helpMode(keys(open, 'Escape'))).toBe('dashboard');
+    expect(helpMode(type(open, 'exit'))).toBe('exited');
+  });
+
+  it('label terminal tabs 1-based, marking exited ones', () => {
+    const s = type(keys(STATIC, 't'), 'exit');
+    expect(termTabLabel(s.terms[0], 0)).toBe('1:web (exited)');
+    expect(termTabLabel(keys(STATIC, 'j', 't').terms[0], 1)).toBe('2:web-2');
+  });
+
+  it('end a live shell with the prompt and the typed input, an exited one without', () => {
+    const s = keys(type(keys(STATIC, 't'), 'pwd'), 'l', 's');
+    expect(termRows(activeTerm(s)!)).toEqual([promptFor('web') + 'pwd', '/workspaces/web', promptFor('web') + 'ls']);
+    const done = type(s, '');
+    expect(termRows(activeTerm(type(done, 'exit'))!).at(-1)).toBe('logout');
+  });
+
+  it('show a message first, then the keys while focused, else the invitation', () => {
+    expect(hintFor(STATIC, false)).toEqual({ kind: 'hint', text: 'CLICK TO TRY IT' });
+    expect(hintFor(STATIC, true).text).toBe('? FOR KEYS · TAB LEAVES');
+    expect(hintFor(keys(STATIC, 't'), true).text).toBe('ESC TO DASHBOARD · TAB LEAVES');
+    expect(hintFor(keys(STATIC, 'o'), true)).toEqual({ kind: 'message', text: 'VS Code opened on web' });
   });
 });
