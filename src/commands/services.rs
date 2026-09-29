@@ -149,9 +149,10 @@ fn ensure_service(
             }
         }
         None => {
-            check_port_conflicts(container, &service.spec.ports)?;
+            let ports = prefer_same_host_ports(container, &service.spec.ports)?;
+            check_port_conflicts(container, &ports)?;
             let image = service_image(dir, service)?;
-            let args = service_run_args(backend(), container, network, &image, service, labels);
+            let args = service_run_args(backend(), container, network, &image, service, &ports, labels);
             let refs: Vec<&str> = args.iter().map(String::as_str).collect();
             backend().run_checked(&refs)?;
         }
@@ -238,6 +239,7 @@ pub fn service_run_args(
     network: &str,
     image: &str,
     service: &ResolvedService,
+    ports: &[String],
     labels: &[String],
 ) -> Vec<String> {
     let mut args: Vec<String> = vec!["run".into(), "-d".into(), "--name".into(), container.into()];
@@ -254,7 +256,7 @@ pub fn service_run_args(
         args.push("-e".into());
         args.push(format!("{key}={value}"));
     }
-    for port in &service.spec.ports {
+    for port in ports {
         args.push("-p".into());
         args.push(port.clone());
     }
@@ -272,6 +274,96 @@ pub fn service_run_args(
 fn host_port(spec: &str) -> Option<&str> {
     let parts: Vec<&str> = spec.split(':').collect();
     (parts.len() >= 2).then(|| parts[parts.len() - 2])
+}
+
+/// A `-p` spec that leaves the host port to the runtime: `5432`, `5432/udp`,
+/// `127.0.0.1::5432`. Ranges and other shapes aren't bare.
+#[derive(Debug, PartialEq)]
+struct BarePort<'a> {
+    ip: Option<&'a str>,
+    port: u16,
+    proto: Option<&'a str>,
+}
+
+impl BarePort<'_> {
+    fn parse(spec: &str) -> Option<BarePort<'_>> {
+        let (body, proto) = match spec.split_once('/') {
+            Some((body, proto)) => (body, Some(proto)),
+            None => (spec, None),
+        };
+        if !matches!(proto, None | Some("tcp") | Some("udp")) {
+            return None;
+        }
+        let parts: Vec<&str> = body.split(':').collect();
+        let (ip, port) = match parts[..] {
+            [port] => (None, port),
+            [ip, "", port] if !ip.is_empty() => (Some(ip), port),
+            _ => return None,
+        };
+        let port = port.parse().ok().filter(|p| *p != 0)?;
+        Some(BarePort { ip, port, proto })
+    }
+
+    fn udp(&self) -> bool {
+        self.proto == Some("udp")
+    }
+
+    /// The spec with the host port pinned to the container port.
+    fn pinned(&self) -> String {
+        let ip = self.ip.map(|ip| format!("{ip}:")).unwrap_or_default();
+        let proto = self.proto.map(|p| format!("/{p}")).unwrap_or_default();
+        format!("{ip}{0}:{0}{proto}", self.port)
+    }
+}
+
+/// Rewrite bare `-p` specs so the host port matches the container port when
+/// it's free (not published by another container, not bound on the host);
+/// otherwise leave the spec bare and let the runtime pick one. Nobody wants
+/// `5432` to land on a random host port when `5432` was available.
+fn prefer_same_host_ports(container: &str, ports: &[String]) -> Result<Vec<String>> {
+    if !ports.iter().any(|p| BarePort::parse(p).is_some()) {
+        return Ok(ports.to_vec());
+    }
+    let running = backend().list(false, "")?;
+    let published: BTreeSet<&str> = running
+        .iter()
+        .filter(|r| r.name != container)
+        .flat_map(|r| r.host_ports.iter().map(String::as_str))
+        .collect();
+    Ok(ports
+        .iter()
+        .map(|spec| match BarePort::parse(spec) {
+            Some(bare) if !published.contains(bare.port.to_string().as_str()) && host_port_free(&bare) => {
+                bare.pinned()
+            }
+            _ => spec.clone(),
+        })
+        .collect())
+}
+
+/// Best-effort probe that nothing on the host holds `bare`'s port. std's
+/// `TcpListener` sets `SO_REUSEADDR`, which on macOS lets a wildcard bind
+/// coexist with a loopback-only listener, so TCP also tries to connect. Any
+/// error (in use, privileged port) counts as taken; the runtime has the final
+/// say either way.
+fn host_port_free(bare: &BarePort) -> bool {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+    let ip: IpAddr = match bare.ip {
+        Some(ip) => match ip.parse() {
+            Ok(ip) => ip,
+            Err(_) => return false,
+        },
+        None => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+    };
+    let addr = SocketAddr::new(ip, bare.port);
+    if bare.udp() {
+        return UdpSocket::bind(addr).is_ok();
+    }
+    if TcpListener::bind(addr).is_err() {
+        return false;
+    }
+    let target = if ip.is_unspecified() { IpAddr::V4(Ipv4Addr::LOCALHOST) } else { ip };
+    TcpStream::connect_timeout(&SocketAddr::new(target, bare.port), std::time::Duration::from_millis(200)).is_err()
 }
 
 /// Fail before creating a service if another running container already
@@ -838,6 +930,7 @@ ports = ["5432:5432"]
             "devsandbox-net-proj-repo",
             "postgres:16",
             &svc,
+            &svc.spec.ports,
             &labels,
         );
         let joined = args.join(" ");
@@ -861,6 +954,7 @@ ports = ["5432:5432"]
             "devsandbox-net-proj-repo",
             "postgres:16",
             &svc,
+            &[],
             &[],
         );
         let joined = args.join(" ");
@@ -891,6 +985,27 @@ ports = ["5432:5432"]
         assert_eq!(host_port("8080:80"), Some("8080"));
         assert_eq!(host_port("127.0.0.1:8080:80"), Some("8080"));
         assert_eq!(host_port("80"), None);
+    }
+
+    #[test]
+    fn bare_port_parses_and_pins() {
+        let pin = |s: &str| BarePort::parse(s).map(|b| b.pinned());
+        assert_eq!(pin("5432").as_deref(), Some("5432:5432"));
+        assert_eq!(pin("53/udp").as_deref(), Some("53:53/udp"));
+        assert_eq!(pin("80/tcp").as_deref(), Some("80:80/tcp"));
+        assert_eq!(pin("127.0.0.1::5432").as_deref(), Some("127.0.0.1:5432:5432"));
+        // Already has a host port, or a shape we don't touch.
+        for spec in ["8080:80", "127.0.0.1:8080:80", "8000-8010", "0", "80/sctp", "::80", "x"] {
+            assert_eq!(BarePort::parse(spec), None, "{spec}");
+        }
+    }
+
+    #[test]
+    fn host_port_free_sees_loopback_listener() {
+        let taken = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = taken.local_addr().unwrap().port();
+        assert!(!host_port_free(&BarePort::parse(&port.to_string()).unwrap()));
+        assert!(!host_port_free(&BarePort::parse(&format!("127.0.0.1::{port}")).unwrap()));
     }
 
     #[test]

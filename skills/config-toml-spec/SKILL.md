@@ -116,7 +116,7 @@ Unknown keys error. No `extends` for services.
 | `scope` | `"isolated"` (default) \| `"global"` | isolated: one container per instance on a per-instance network; global: one container per config root. |
 | `image` / `build` | as sandbox | exactly one required. |
 | `env` | {string = string} | `-e` vars. |
-| `ports` | [string] | `docker run -p` specs (`"5432"`, `"5432:5432"`, `"127.0.0.1:5432:5432"`). A host port already published by another container errors. |
+| `ports` | [string] | `docker run -p` specs (`"5432"`, `"5432:5432"`, `"127.0.0.1:5432:5432"`). A bare container port (`"5432"`, `"53/udp"`, `"127.0.0.1::5432"`) gets the same host port when it's free, else one picked by the runtime. An explicit host port already published by another container errors. |
 | `command` | string \| [string] | Appended after the image. A string is passed as **one** argv item, not shell-split. |
 
 Sandboxes reach a service by its name as hostname (network alias, or `/etc/hosts` on runtimes without aliases). `devsandbox services gc` reaps unreferenced containers; `services rebuild <name>` recreates and rewires in place, without restarting the sandboxes.
