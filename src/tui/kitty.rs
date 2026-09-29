@@ -6,7 +6,8 @@
 //! plugs into the parser as its [`vt100::Callbacks`]: vt100 hands every CSI it
 //! doesn't implement to `unhandled_csi` together with the live screen, which is
 //! exactly the hook needed to track the app's flag stacks (one per screen, as
-//! the spec requires) and to queue the replies to its `CSI ? u` queries.
+//! the spec requires) and to queue the replies to its `CSI ? u` queries (plus
+//! XTVERSION, which some apps require before they trust that reply).
 //!
 //! Only honored when the outer terminal speaks the protocol too (probed by the
 //! dashboard at startup): otherwise devsandbox itself receives legacy bytes and
@@ -178,10 +179,23 @@ impl vt100::Callbacks for KittyState {
         params: &[&[u16]],
         c: char,
     ) {
-        if !self.enabled || c != 'u' || i2.is_some() {
+        if !self.enabled || i2.is_some() {
             return;
         }
         let param = |i: usize| params.get(i).and_then(|p| p.first()).copied();
+        // XTVERSION (`CSI > 0 q`). OpenTUI apps (zidane) only act on the
+        // `CSI ? u` reply once a terminal has identified itself this way, and
+        // real terminals answer it before `? u` because it is asked first. Only
+        // answered while emulating, so behind a legacy outer terminal the child
+        // sees exactly what it did before.
+        if c == 'q' && i1 == Some(b'>') && param(0).unwrap_or(0) == 0 {
+            let reply = format!("\x1bP>|devsandbox({})\x1b\\", env!("CARGO_PKG_VERSION"));
+            self.replies.extend_from_slice(reply.as_bytes());
+            return;
+        }
+        if c != 'u' {
+            return;
+        }
         let stack = if screen.alternate_screen() {
             &mut self.alt
         } else {
@@ -275,9 +289,18 @@ mod tests {
     }
 
     #[test]
+    fn xtversion_is_answered_before_the_flags_query() {
+        let mut p = parser(true);
+        // OpenTUI's startup order: XTVERSION first, then the flags query.
+        p.process(b"\x1b[>0q\x1b[?u");
+        let want = format!("\x1bP>|devsandbox({})\x1b\\\x1b[?0u", env!("CARGO_PKG_VERSION"));
+        assert_eq!(p.callbacks_mut().take_replies(), want.as_bytes());
+    }
+
+    #[test]
     fn disabled_ignores_everything() {
         let mut p = parser(false);
-        p.process(b"\x1b[>1u\x1b[?u");
+        p.process(b"\x1b[>0q\x1b[>1u\x1b[?u");
         assert_eq!(flags(&p), 0);
         assert!(p.callbacks_mut().take_replies().is_empty());
     }
