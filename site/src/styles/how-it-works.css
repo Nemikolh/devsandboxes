@@ -113,15 +113,25 @@
   stroke: #26494d;
 }
 
+/* Drawn from VS Code down to the sandbox when it attaches; erased on close. */
 .hiw-link--vscode {
   stroke: var(--vsc-blue);
   stroke-width: 1.6;
+  stroke-dasharray: 1 1;
+  stroke-dashoffset: 1;
   opacity: 0;
   filter: drop-shadow(0 0 4px #5ea4ff88);
+  transition:
+    stroke-dashoffset 0.2s,
+    opacity 0.2s;
 }
 
 .hiw-link--vscode[data-active] {
+  stroke-dashoffset: 0;
   opacity: 1;
+  transition:
+    stroke-dashoffset 0.6s 0.2s cubic-bezier(0.3, 0.6, 0.3, 1),
+    opacity 0.1s 0.2s;
 }
 
 .hiw-link[data-active]:not(.hiw-link--vscode) {
@@ -658,6 +668,16 @@
   margin-left: 0;
 }
 
+/* The widget is one tab stop (step 3 makes it focusable); keys only work while focused. */
+.tui-window:focus-within {
+  border-color: #6f9f5a;
+}
+
+.tui-window:focus-visible {
+  outline: 2px solid var(--lime);
+  outline-offset: 3px;
+}
+
 .tui-screen {
   padding: 12px 14px 12px;
   font: 12px/1.65 var(--font-mono);
@@ -712,8 +732,54 @@
 }
 
 .tui-body {
+  position: relative;
   display: grid;
   min-height: 290px;
+}
+
+/* The `?` overlay, a bordered ratatui modal over the tables. */
+.tui-modal {
+  position: absolute;
+  /* Below the Instances box title, so it reads as a modal over the table. */
+  inset: 16px 3ch auto;
+  z-index: 1;
+  padding: 12px 2ch 10px;
+  border: 1px solid var(--tui-accent);
+  border-radius: 2px;
+  background: #10191b;
+  box-shadow: 0 16px 40px #000a;
+}
+
+.tui-modal dl {
+  display: grid;
+  grid-template-columns: 9ch minmax(0, 1fr);
+  gap: 0 1ch;
+  margin: 0;
+}
+
+.tui-modal dt {
+  color: var(--tui-accent);
+}
+
+.tui-modal dd {
+  margin: 0;
+}
+
+.tui-modal p {
+  margin: 8px 0 0;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.tui-inbox-empty {
+  display: block;
+  padding: 0 0.5ch;
+  white-space: normal;
+}
+
+.tui-inbox-empty code {
+  font: inherit;
+  color: #c5d8d6;
 }
 
 .tui-panel {
@@ -901,6 +967,14 @@
 
 .tui-hint-slot {
   color: var(--lime);
+  letter-spacing: 0.06em;
+}
+
+/* An `o` / `t` result, in the case the TUI prints it (not uppercased). */
+.tui-hint-slot[data-kind='message'] {
+  color: #d8f7c0;
+  letter-spacing: 0;
+  text-transform: none;
 }
 
 /* Like the real header: totals only when they fit next to the tabs. */
@@ -1286,7 +1360,11 @@
 
   .hiw-sandbox,
   .hiw-vscode,
-  .hiw-link {
+  .hiw-link,
+  .hiw-link--vscode[data-active],
+  .tui-screen .tui-key,
+  .tui-screen .tui-tab,
+  .tui-row {
     transition: none;
   }
 }

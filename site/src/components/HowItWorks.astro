@@ -3,8 +3,9 @@
  * The "how it works" stage of the landing page: an architecture diagram
  * (host, sandboxes with your agents, the shared service, the dashboard, you,
  * VS Code) next to a mini dashboard modelled on the real TUI (`src/tui/ui.rs`),
- * plus a lighter stacked diagram for tablet/mobile. Static: the `data-*` hooks
- * are what the step-3 script drives (selection, tab, VS Code, agent statuses).
+ * plus a lighter stacked diagram for tablet/mobile. The markup is the no-JS
+ * state (`STATIC` in `lib/mini-tui.ts`); `scripts/how-it-works.ts` drives the
+ * `data-*` hooks (selection, tab, VS Code, agent statuses, inbox) from there.
  */
 import {
   Bot,
@@ -264,8 +265,13 @@ const title = (i: Instance) => `${i.name} · ${i.branch ?? i.folder} — Dev Con
       </div>
     </div>
 
-    <div class="tui-window" data-tui aria-hidden="true">
-      <div class="window-bar">
+    <div class="tui-window" data-tui role="group" aria-label="Dashboard preview" aria-describedby="hiw-tui-keys">
+      <p class="visually-hidden" id="hiw-tui-keys">
+        Arrow keys or j and k select an instance, o opens it in VS Code, Escape closes VS Code, left and right arrows or
+        1 to 4 switch tabs, question mark shows help. Tab leaves the preview.
+      </p>
+      <p class="visually-hidden" aria-live="polite" data-tui-live></p>
+      <div class="window-bar" aria-hidden="true">
         <div class="window-dots"><i></i><i></i><i></i></div>
         <div class="window-title"><SquareTerminal size={13} /> devsandbox — ~/sandboxes</div>
         <div class="window-bar-right">tui</div>
@@ -377,7 +383,10 @@ const title = (i: Instance) => `${i.name} · ${i.branch ?? i.folder} — Dev Con
               <div class="tui-tr tui-th tui-tr--inbox">
                 <span>TIME</span><span>LEVEL</span><span>INSTANCE</span><span>MESSAGE</span>
               </div>
-              <div class="tui-tr tui-row tui-tr--inbox" data-tui-row="notify-1" data-selected data-unread>
+              <span class="tui-dim tui-inbox-empty" data-tui-inbox-empty hidden>
+                no notifications — containers send them with <code>devsbd notify "…"</code>
+              </span>
+              <div class="tui-tr tui-row tui-tr--inbox" data-tui-row="notify-1" data-tui-notified data-selected data-unread>
                 <span class="tui-dim">14:32</span>
                 <span class="tui-dim">info</span>
                 <span>web-3</span>
@@ -386,11 +395,28 @@ const title = (i: Instance) => `${i.name} · ${i.branch ?? i.folder} — Dev Con
             </div>
             <div class="tui-box tui-detail">
               <span class="tui-box-title">Detail</span>
-              <div class="tui-kv">
+              <div class="tui-kv" data-tui-notified>
                 <div><span class="tui-dim">14:32</span>{'  '}<span class="tui-dim">info</span>{'  '}web-3</div>
                 <div>tests pass, ready for review</div>
               </div>
             </div>
+          </div>
+
+          {/* The `?` overlay: the real HELP_BODY's keys that work here, plus where this preview differs. */}
+          <div class="tui-modal" data-tui-help-overlay hidden>
+            <span class="tui-box-title">help — keys</span>
+            <dl>
+              <dt>↑/k ↓/j</dt><dd>move selection</dd>
+              <dt>o</dt><dd>open in VS Code (Instances)</dd>
+              <dt>t</dt><dd>terminal</dd>
+              <dt>tab 1-4</dt><dd>switch tab · jump to tab</dd>
+              <dt>?</dt><dd>this help</dd>
+            </dl>
+            <p class="tui-dim">
+              In this preview ←/→ switch tabs (Tab leaves it; click the <span class="tui-accent">tab</span> key instead)
+              and esc closes VS Code. In the dashboard, ←/→ fold rows.
+            </p>
+            <p class="tui-dim">esc or ? to close</p>
           </div>
         </div>
 
@@ -410,7 +436,7 @@ const title = (i: Instance) => `${i.name} · ${i.branch ?? i.folder} — Dev Con
         </div>
       </div>
 
-      <div class="terminal-status">
+      <div class="terminal-status" aria-hidden="true">
         <span><span class="status-indicator"></span> DASHBOARD PREVIEW</span>
         <span class="tui-hint-slot" data-tui-hint hidden>CLICK TO TRY IT</span>
         <span>DEVSANDBOX v{VERSION}</span>
@@ -483,3 +509,7 @@ const title = (i: Instance) => `${i.name} · ${i.branch ?? i.folder} — Dev Con
     <p>The dashboard shows every sandbox and the notifications sent from inside. Press <code>o</code> to open one in VS Code.</p>
   </li>
 </ol>
+
+<script>
+  import '../scripts/how-it-works';
+</script>
