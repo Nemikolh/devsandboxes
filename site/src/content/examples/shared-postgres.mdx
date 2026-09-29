@@ -1,0 +1,89 @@
+---
+title: One shared Postgres
+description: A single global database container that every sandbox and every instance of a config root connects to by name.
+order: 2
+icon: database
+tags: [services, databases]
+related: [isolated-services, parallel-agents, caches]
+---
+
+import AgentPrompt from '../../components/AgentPrompt.astro';
+import Callout from '../../components/Callout.astro';
+
+## The problem
+
+Your API and your web app both need the development database, and so does every extra instance you spin up for an agent. Giving each its own Postgres means as many containers, migrations and seeds as instances, and data that differs between them.
+
+A service with `scope = "global"` is created **once per config root** and shared: the first instance that lists it starts it, later ones join it, and every sandbox reaches it under the same hostname.
+
+## Config
+
+```toml title="config.toml"
+[services.postgres]
+image = "postgres:16"
+scope = "global"                       # one container for the whole config root
+env = { POSTGRES_PASSWORD = "postgres" }
+ports = ["127.0.0.1:5432:5432"]        # optional: reach it from the host too
+
+[template.base]
+image = "mcr.microsoft.com/devcontainers/base:ubuntu"
+services = ["postgres"]
+containerEnv = { DATABASE_URL = "postgres://postgres:postgres@postgres:5432/postgres" }
+
+[sandbox.api]
+extends = "base"
+folder = "../api"
+
+[sandbox.web]
+extends = "base"
+folder = "../web"
+```
+
+Both sandboxes get the service and the connection string from the template. The hostname in `DATABASE_URL` is the service's name, `postgres`.
+
+## Try it
+
+```bash
+devsandbox run api      # starts postgres, then api
+devsandbox run web      # joins the running postgres
+devsandbox run api      # api-2, on its own worktree, same database
+devsandbox service ls   # one row: postgres, global, used by all three
+```
+
+Check that an instance resolves the service, and connect from the host through the published port:
+
+```bash
+devsandbox exec api-2 getent hosts postgres
+psql postgres://postgres:postgres@127.0.0.1:5432/postgres
+```
+
+The database outlives any one sandbox: `devsandbox stop api` or `devsandbox rm api` leaves it running for the others. Once no running instance references it, `devsandbox gc` removes it.
+
+## How it works
+
+- **One container, one network.** The service runs as `devsandbox-svc-<project>-postgres` on the network `devsandbox-net-<project>`, where `<project>` is a short hash of the config dir's path, so two config roots never collide. Every instance that lists the service joins that network.
+- **Reached by name.** Sandboxes resolve a service by its name: a network alias on docker and podman, an `/etc/hosts` entry on Apple `container`.
+- **Service keys.** `[services.*]` takes only `scope`, `image` or `build`, `env`, `ports` and `command`; unknown keys are an error and services have no `extends` ([services reference](/docs/config#services-servicesname)).
+- **Publishing ports.** `ports` are `docker run -p` specs. A host port another container already publishes is an error, which is why a published port belongs on a global service, not an isolated one.
+- **Changing it.** Editing the service table marks its container drifted ([drift](/docs/config#drift)). `devsandbox service rebuild postgres` recreates it and rewires the running sandboxes in place, without restarting them.
+- **Arrays concatenate.** A sandbox extending `base` can add its own `services = ["redis"]` and still get `postgres` ([templates and `extends`](/docs/config#templates-and-extends)).
+
+<Callout variant="warning" title="The data lives in the container">
+  A service has no volume setting of its own, so its data stays in the service container. It survives sandboxes
+  stopping and starting, but `service rebuild postgres` and `gc` remove the container, and the recreated one starts
+  from an empty database. Keep a way to re-seed.
+</Callout>
+
+## Agent instructions
+
+<AgentPrompt
+  goal="Give my devsandbox sandboxes one shared Postgres database that every sandbox and every instance connects to."
+  steps={[
+    'Add `[services.postgres]` with `image = "postgres:<postgres version>"` (the version the repo targets), `scope = "global"` and `env = { POSTGRES_PASSWORD = "<password>" }`. Add `ports = ["127.0.0.1:5432:5432"]` only if I want to reach it from the host and that port is free.',
+    'Add "postgres" to `services` of every sandbox that needs it, or of a template they all extend, and point the app at it through `containerEnv` with host `postgres`, e.g. `DATABASE_URL = "postgres://postgres:<password>@postgres:5432/postgres"`. Use the variable name the repo already reads.',
+  ]}
+  verify={[
+    'Start the sandboxes with `devsandbox -C <config dir> run <sandbox>` and check `devsandbox -C <config dir> service ls` shows a single global postgres used by all of them.',
+    'Check an instance resolves it with `devsandbox -C <config dir> exec <instance> getent hosts postgres`, then run the repo\'s migrations inside that instance. Remember the data lives in the service container: `service rebuild postgres` and `gc` start it empty.',
+  ]}
+/>

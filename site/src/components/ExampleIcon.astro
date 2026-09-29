@@ -1,0 +1,40 @@
+---
+import {
+  Code,
+  Database,
+  FileCode,
+  GitBranch,
+  GitPullRequest,
+  HardDrive,
+  KeyRound,
+  Network,
+  Package,
+  Plug,
+} from '@lucide/astro';
+import type { ExampleIconName } from '../lib/examples';
+
+interface Props {
+  name: ExampleIconName;
+  size?: number;
+}
+
+// Exhaustive over `EXAMPLE_ICONS`: adding a name there without a component here
+// is a type error, so frontmatter icons can't silently render nothing.
+const ICONS: Record<ExampleIconName, typeof Database> = {
+  'git-branch': GitBranch,
+  database: Database,
+  network: Network,
+  'hard-drive': HardDrive,
+  'key-round': KeyRound,
+  plug: Plug,
+  code: Code,
+  package: Package,
+  'git-pull-request': GitPullRequest,
+  'file-code': FileCode,
+};
+
+const { name, size = 20 } = Astro.props;
+const Icon = ICONS[name];
+---
+
+<Icon size={size} aria-hidden="true" />

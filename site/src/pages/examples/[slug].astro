@@ -1,0 +1,36 @@
+---
+import type { GetStaticPaths } from 'astro';
+import { getCollection, render, type CollectionEntry } from 'astro:content';
+import Example from '../../layouts/Example.astro';
+import { exampleNeighbors, exampleNumber, resolveRelated, sortExamples } from '../../lib/examples';
+
+export const getStaticPaths = (async () => {
+  const examples = sortExamples(await getCollection('examples'));
+  return examples.map((entry, i) => ({
+    params: { slug: entry.id },
+    props: {
+      entry,
+      number: exampleNumber(i),
+      related: resolveRelated(entry, examples),
+      ...exampleNeighbors(examples, i),
+    },
+  }));
+}) satisfies GetStaticPaths;
+
+type Entry = CollectionEntry<'examples'>;
+
+interface Props {
+  entry: Entry;
+  number: string;
+  related: Entry[];
+  prev?: Entry;
+  next?: Entry;
+}
+
+const { entry, number, related, prev, next } = Astro.props;
+const { Content, headings } = await render(entry);
+---
+
+<Example entry={entry} number={number} headings={headings} related={related} prev={prev} next={next}>
+  <Content />
+</Example>

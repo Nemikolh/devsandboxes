@@ -19,18 +19,20 @@ export const headerNav: NavLink[] = [
   { href: REPO_URL, label: 'GitHub', external: true },
 ];
 
-export const sidebarGroups: NavGroup[] = [
-  { label: 'GETTING STARTED', links: [{ href: '/docs/quick-start', label: 'Quick start' }] },
-  {
-    label: 'REFERENCE',
-    links: [
-      { href: '/docs/config', label: 'Configuration' },
-      { href: '/docs/node-api', label: 'Node API' },
-    ],
-  },
-  // Every example gets appended here once the examples collection exists.
-  { label: 'EXAMPLES', links: [{ href: '/examples', label: 'All examples' }] },
-];
+/** Sidebar groups; `examples` are the collection's links in reading order. */
+export function sidebarGroups(examples: NavLink[]): NavGroup[] {
+  return [
+    { label: 'GETTING STARTED', links: [{ href: '/docs/quick-start', label: 'Quick start' }] },
+    {
+      label: 'REFERENCE',
+      links: [
+        { href: '/docs/config', label: 'Configuration' },
+        { href: '/docs/node-api', label: 'Node API' },
+      ],
+    },
+    { label: 'EXAMPLES', links: [{ href: '/examples', label: 'All examples' }, ...examples] },
+  ];
+}
 
 /** Strip a trailing slash so `/docs/x/` and `/docs/x` compare equal. */
 export function normalizePath(path: string): string {

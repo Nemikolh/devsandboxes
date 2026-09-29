@@ -1,0 +1,85 @@
+---
+import { getCollection } from 'astro:content';
+import { ArrowUpRight, Bot, FileCode, FlaskConical, Workflow } from '@lucide/astro';
+import ExampleIcon from '../../components/ExampleIcon.astro';
+import Base from '../../layouts/Base.astro';
+import { exampleNumber, sortExamples } from '../../lib/examples';
+import '../../styles/examples.css';
+
+const examples = sortExamples(await getCollection('examples'));
+const total = exampleNumber(examples.length - 1);
+
+// What every example page contains, in page order.
+const anatomy = [
+  { icon: FileCode, label: 'A complete config.toml' },
+  { icon: FlaskConical, label: 'Commands to try it' },
+  { icon: Workflow, label: 'How it works' },
+  { icon: Bot, label: 'A prompt for your agent' },
+];
+---
+
+<Base
+  title="Examples"
+  description="Complete, validated config.toml recipes for devsandboxes: parallel agents, shared and isolated services, caches, ssh-agent forwarding and more."
+>
+  <main id="main-content" class="examples-page" tabindex="-1">
+    <header class="examples-hero">
+      <div class="examples-hero-grid" aria-hidden="true"></div>
+      <div class="examples-hero-inner">
+        <div class="examples-hero-copy">
+          <p class="examples-kicker"><span>// EXAMPLES · {total} RECIPES</span></p>
+          <h1>Start from a recipe<span class="title-period" aria-hidden="true">.</span></h1>
+          <p class="examples-lead">
+            Each example is one use case, end to end: the whole config, the commands to try it, what happens underneath,
+            and a prompt that has your coding agent set it up in your own config.
+          </p>
+        </div>
+        <ol class="examples-anatomy" aria-label="Every example contains">
+          {
+            anatomy.map((a, i) => (
+              <li>
+                <span class="examples-anatomy-number">{exampleNumber(i)}</span>
+                <a.icon size={16} aria-hidden="true" />
+                {a.label}
+              </li>
+            ))
+          }
+        </ol>
+      </div>
+    </header>
+
+    <section class="examples-list" aria-label="All examples">
+      <div class="feature-grid examples-grid">
+        {
+          examples.map((e, i) => (
+            <a class="feature-card example-index-card" href={`/examples/${e.id}`}>
+              <div class="feature-top">
+                <span class="feature-icon">
+                  <ExampleIcon name={e.data.icon} size={21} />
+                </span>
+                <span class="feature-number">
+                  {exampleNumber(i)} / {total}
+                </span>
+              </div>
+              <h2>{e.data.title}</h2>
+              <p>{e.data.description}</p>
+              <ul class="example-card-tags" aria-label="Tags">
+                {e.data.tags.map((t) => (
+                  <li>{t}</li>
+                ))}
+              </ul>
+              <span class="feature-link">
+                Open the recipe
+                <ArrowUpRight size={16} aria-hidden="true" />
+              </span>
+            </a>
+          ))
+        }
+      </div>
+      <p class="examples-footnote">
+        New to devsandboxes? The <a href="/docs/quick-start">quick start</a> gets a first sandbox running; the{' '}
+        <a href="/docs/config">configuration reference</a> has every field these recipes use.
+      </p>
+    </section>
+  </main>
+</Base>

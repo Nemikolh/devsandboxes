@@ -35,6 +35,7 @@ const { title, description, eyebrow, headings, next, section = { label: 'Docs', 
       </nav>
       <div class="article-topline">
         <span class="eyebrow"><span class="eyebrow-line" aria-hidden="true"></span>{eyebrow}</span>
+        <slot name="topline" />
       </div>
       <h1>{title}<span class="title-period" aria-hidden="true">.</span></h1>
       <p class="article-lead">{description}</p>
@@ -42,11 +43,18 @@ const { title, description, eyebrow, headings, next, section = { label: 'Docs', 
       <article class="prose">
         <slot />
       </article>
+      {/* A `bottom` slot (examples: related + prev/next) replaces the lone next card. */}
       {
-        next && (
+        Astro.slots.has('bottom') ? (
           <div class="article-bottom">
-            <NextPage {...next} />
+            <slot name="bottom" />
           </div>
+        ) : (
+          next && (
+            <div class="article-bottom">
+              <NextPage {...next} />
+            </div>
+          )
         )
       }
     </main>

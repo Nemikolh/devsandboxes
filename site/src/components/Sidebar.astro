@@ -1,5 +1,7 @@
 ---
+import { getCollection } from 'astro:content';
 import { ChevronRight } from '@lucide/astro';
+import { sortExamples } from '../lib/examples';
 import { normalizePath, sidebarGroups } from '../lib/nav';
 
 interface Props {
@@ -9,7 +11,12 @@ interface Props {
 
 const { mobile = false } = Astro.props;
 const current = normalizePath(Astro.url.pathname);
-const total = sidebarGroups.reduce((n, g) => n + g.links.length, 0);
+const examples = sortExamples(await getCollection('examples')).map((e) => ({
+  href: `/examples/${e.id}`,
+  label: e.data.title,
+}));
+const groups = sidebarGroups(examples);
+const total = groups.reduce((n, g) => n + g.links.length, 0);
 const pad = (n: number) => String(n).padStart(2, '0');
 ---
 
@@ -19,7 +26,7 @@ const pad = (n: number) => String(n).padStart(2, '0');
     <span class="sidebar-number">01 — {pad(total)}</span>
   </div>
   {
-    sidebarGroups.map((group) => (
+    groups.map((group) => (
       <div class="nav-group">
         <p class="nav-group-label">{group.label}</p>
         <ul>

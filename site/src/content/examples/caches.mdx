@@ -1,0 +1,102 @@
+---
+title: Shared package caches
+description: One pnpm store and one cargo home shared by every sandbox of a config root, so new instances stop downloading the same packages again.
+order: 4
+icon: hard-drive
+tags: [caches, performance]
+related: [parallel-agents, shared-postgres, ssh-and-git-push]
+---
+
+import AgentPrompt from '../../components/AgentPrompt.astro';
+import Callout from '../../components/Callout.astro';
+
+## The problem
+
+Throwaway instances are only cheap if they start fast. Each new container begins with an empty package cache, so every `pnpm install` or `cargo build` downloads the same dependencies again, once per instance, per rebuild.
+
+`caches` fixes that with one line per tool: each named cache is a directory under the config dir's `shared-volumes/`, bind-mounted into every sandbox that lists it, with the tool's environment variables pointed at it. Downloads happen once and every instance reuses them.
+
+## Config
+
+```toml title="config.toml"
+[template.base]
+remoteUser = "root"                    # cache mounts live under /root
+image = "mcr.microsoft.com/devcontainers/base:ubuntu"
+caches = ["pnpm"]
+persist-shell-history = true
+[template.base.features]
+"ghcr.io/devcontainers/features/node:1" = { version = "lts" }
+
+[sandbox.web]
+extends = "base"
+folder = "../web"
+postCreateCommand = "pnpm install"
+
+[sandbox.engine]
+extends = "base"
+folder = "../engine"
+caches = ["cargo"]                     # concatenated: ["pnpm", "cargo"]
+postCreateCommand = "cargo fetch"
+[sandbox.engine.features]
+"ghcr.io/devcontainers/features/rust:1" = {}
+```
+
+Arrays concatenate under `extends`, so `web` gets the pnpm cache and `engine` gets both.
+
+## Try it
+
+From the config dir:
+
+```bash
+devsandbox run web      # pnpm install fills shared-volumes/pnpm-store
+devsandbox run web      # web-2: the same install, served from the store
+devsandbox run engine   # cargo fetch fills shared-volumes/cargo
+ls shared-volumes       # cargo  history  pnpm-store
+```
+
+Inside, the tools already point at the mounts:
+
+```bash
+devsandbox exec web sh -c 'echo $npm_config_store_dir'   # /root/.pnpm-store
+devsandbox exec engine sh -c 'echo $CARGO_HOME'           # /root/.cargo
+```
+
+Caches outlive every instance: `rm` never touches `shared-volumes/`, and neither does `gc` except for shell history. To start a cache over, delete its directory while no instance uses it.
+
+## How it works
+
+Each name maps to a fixed directory, mount target and set of variables. Unknown names are an error, and these are all of them:
+
+| cache | host dir in `shared-volumes/` | container path | variables set |
+|---|---|---|---|
+| `pnpm` | `pnpm-store` | `/root/.pnpm-store` | `npm_config_store_dir`, `pnpm_config_store_dir` |
+| `cargo` | `cargo` | `/root/.cargo` | `CARGO_HOME` |
+| `npm` | `npm` | `/root/.npm` | `npm_config_cache` |
+| `yarn` | `yarn` | `/root/.yarn-cache` | `YARN_CACHE_FOLDER` |
+| `go` | `go-mod` | `/root/go/pkg/mod` | `GOMODCACHE` |
+| `pip` | `pip` | `/root/.cache/pip` | `PIP_CACHE_DIR` |
+
+- **One store per config root.** The directories are created on first use and shared by every sandbox and instance of the config dir, on every runtime (they are directory mounts). A different config root has its own.
+- **Shell history** is per instance, not shared: `persist-shell-history` keeps each instance's `.zsh_history` in `shared-volumes/history/<instance>/`, mounted at `/commandhistory` with `HISTFILE` pointing into it. It is kept on `rm`, so a recreated instance of the same name gets its history back.
+- **Orphaned history.** `devsandbox gc` finds history left by removed instances and asks before deleting each file; `devsandbox gc --force` deletes them without asking. It also reaps unused services, so read what it lists.
+- **Reference.** [`caches` and `persist-shell-history`](/docs/config#devsandbox-extras), [arrays under `extends`](/docs/config#templates-and-extends), and [`${sharedVolumes}`](/docs/config#variables) for mounting your own state from the same folder.
+
+<Callout variant="note" title="Caches assume root">
+  Every mount target is under `/root`, which is why this config sets `remoteUser = "root"`. With a non-root user the
+  variables still point at `/root/…`, which that user may not be able to write.
+</Callout>
+
+## Agent instructions
+
+<AgentPrompt
+  goal="Share package caches across my devsandbox sandboxes so new instances stop re-downloading dependencies."
+  steps={[
+    'Find which package managers my sandboxes use and add them to `caches`. The only valid names are pnpm, cargo, npm, yarn, go and pip. Put shared ones in a template every sandbox `extends` if there is one (arrays concatenate, so a sandbox can add its own).',
+    'The cache mounts land under /root and the tools are pointed there by env vars, so check each sandbox runs as root (`remoteUser` / `containerUser`). Tell me about any that does not rather than changing its user.',
+    'If I want shell history to survive rebuilds, also set `persist-shell-history = true` in the same template.',
+  ]}
+  verify={[
+    'The change makes existing instances drift: list them with `devsandbox -C <config dir> ps -a` and ask me before running `devsandbox -C <config dir> rebuild <instance>` on each (worktrees and branches are kept).',
+    'Check `devsandbox -C <config dir> exec <instance> env` shows the cache variables (e.g. npm_config_store_dir, CARGO_HOME), and that <config dir>/shared-volumes/ fills up after an install.',
+  ]}
+/>

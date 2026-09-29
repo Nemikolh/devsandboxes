@@ -1,0 +1,20 @@
+---
+// One line of agent-prompt text: `code` runs and highlighted `<placeholders>`.
+import { promptRuns } from '../lib/examples';
+
+interface Props {
+  text: string;
+}
+
+const runs = promptRuns(Astro.props.text);
+---
+
+{
+  runs.map((run) =>
+    run.code ? (
+      <code>{run.parts.map((p) => (p.placeholder ? <mark>{p.text}</mark> : p.text))}</code>
+    ) : (
+      run.parts.map((p) => (p.placeholder ? <mark>{p.text}</mark> : p.text))
+    ),
+  )
+}

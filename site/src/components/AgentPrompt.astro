@@ -1,0 +1,52 @@
+---
+// A copyable prompt for a coding agent. The shared framing (skills, config
+// dir, validation, ask before destructive actions) comes from
+// `buildAgentPrompt`; an example only supplies what is specific to it.
+import { Bot, BookOpen, ArrowUpRight } from '@lucide/astro';
+import { agentPromptItems, buildAgentPrompt, SKILLS_URL, type AgentPromptSpec } from '../lib/examples';
+import PromptText from './PromptText.astro';
+
+type Props = AgentPromptSpec;
+
+const spec = Astro.props;
+const text = buildAgentPrompt(spec);
+const items = agentPromptItems(spec);
+---
+
+<figure class="agent-prompt" data-copy-text={text}>
+  <figcaption class="agent-prompt-head">
+    <span class="agent-prompt-badge" aria-hidden="true"><Bot size={18} /></span>
+    <span class="agent-prompt-title">
+      <strong>Prompt for your coding agent</strong>
+      <small>Paste into Claude Code, Codex or any agent with a shell.</small>
+    </span>
+    <button type="button" class="agent-prompt-copy" data-copy aria-label="Copy prompt">
+      <svg class="icon-copy" xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"></rect><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"></path></svg>
+      <svg class="icon-check" xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg>
+      <span class="copy-text" aria-live="polite">Copy prompt</span>
+    </button>
+  </figcaption>
+  <div class="agent-prompt-body">
+    <p class="agent-prompt-goal"><PromptText text={spec.goal} /></p>
+    <ol class="agent-prompt-steps">
+      {
+        items.map((item) => (
+          <li>
+            <PromptText text={item} />
+          </li>
+        ))
+      }
+    </ol>
+  </div>
+  <div class="agent-prompt-foot">
+    <span><mark aria-hidden="true">&lt;…&gt;</mark> fill in before sending</span>
+    <a href={SKILLS_URL} target="_blank" rel="noopener noreferrer">
+      <BookOpen size={13} aria-hidden="true" /> Agent skills <ArrowUpRight size={13} aria-hidden="true" />
+      <span class="visually-hidden">(opens in a new tab)</span>
+    </a>
+  </div>
+</figure>
+
+<script>
+  import '../scripts/copy-code';
+</script>

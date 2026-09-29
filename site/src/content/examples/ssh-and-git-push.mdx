@@ -1,0 +1,85 @@
+---
+title: ssh-agent and git push
+description: Agents push over ssh with your host's ssh-agent relayed into the sandbox; no private key ever enters the container.
+order: 5
+icon: key-round
+tags: [git, ssh, agents]
+related: [parallel-agents, caches, isolated-services]
+---
+
+import AgentPrompt from '../../components/AgentPrompt.astro';
+import Callout from '../../components/Callout.astro';
+
+## The problem
+
+An agent finishes its work on a branch and has to push it. Copying a private key into a throwaway container, or mounting `~/.ssh`, hands the key to everything that runs there.
+
+devsandbox forwards your host's **ssh-agent** instead, the way VS Code Dev Containers do: ssh inside the sandbox asks your host agent to sign, and the key never leaves the host. It needs no config. What it doesn't do is set up the rest of a push: trusting GitHub's host key, and your git identity, since devsandbox doesn't copy your host git config.
+
+## Config
+
+```toml title="config.toml"
+[sandbox.app]
+folder = "../app"
+image = "mcr.microsoft.com/devcontainers/base:ubuntu"
+remoteUser = "vscode"
+
+# Lifecycle commands see the forwarded agent too, so they can talk to GitHub.
+[sandbox.app.postCreateCommand]
+git-identity = "git config --global user.name 'Your Name' && git config --global user.email you@example.com"
+known-hosts = "mkdir -p ~/.ssh && ssh-keyscan github.com >> ~/.ssh/known_hosts"
+```
+
+The table form of a lifecycle command runs its entries one after another, in key order, as `remoteUser` (so `~` is `/home/vscode`). `ssh-keyscan` trusts whatever key github.com presents at creation time; check it against GitHub's published fingerprints if that matters to you.
+
+## Try it
+
+The host needs a running agent with your key loaded:
+
+```bash
+ssh-add -l                                  # on the host: lists your key
+devsandbox run app
+devsandbox exec app ssh-add -l              # the same key, seen from inside
+devsandbox exec app ssh -T git@github.com   # GitHub greets you by name
+devsandbox exec app git push -u origin HEAD
+```
+
+`ssh -T git@github.com` exits with status 1 even when it works: GitHub offers no shell. The push needs an ssh remote (`git@github.com:…`); an `https://` remote goes through git's credential helpers and never asks the agent.
+
+Worktree instances push the same way: each is on its own branch, so `git push -u origin HEAD` from any of them publishes that branch.
+
+## How it works
+
+- **Relay over exec.** Builds that embed the in-container helper `devsbd` (the npm package and the release archives) install it into every container at `run`. Its daemon listens on `/run/devsandbox/ssh-agent.sock` inside the container, and every `devsandbox exec`, dashboard terminal and lifecycle command gets `SSH_AUTH_SOCK` pointed at it. devsandbox relays the agent traffic over an exec's stdio to the host's current `$SSH_AUTH_SOCK`. An agent restarted on the host is picked up by the next connection.
+- **Only with a live agent.** `SSH_AUTH_SOCK` is injected only when the host has one set and the socket exists, so ssh never points at a dead socket.
+- **Who is covered.** Forwarding works while a devsandbox `exec` or the dashboard is attached. A plain `docker exec` shell gets none; VS Code's terminals get VS Code's own forwarding.
+- **Any container user.** The helper's socket is open to every user in the container, so a non-root `remoteUser` works.
+- **Fallback: bind mount.** A `cargo install` build has no helper. It bind-mounts a symlink to your agent socket instead, on docker or podman on Linux only. The socket belongs to your host uid, so the container user must be root or share that uid, and an agent that changes path while the container runs goes stale until `stop` + `start`. An instance keeps the mode it was created with until it is recreated.
+- **Not config.** Forwarding is a fact of the environment, so it never counts as config drift.
+
+| Platform | ssh-agent forwarding |
+|---|---|
+| Linux, docker / podman | ✅ relay, or bind mount on `cargo install` builds |
+| macOS, docker (OrbStack / Docker Desktop) | ✅ relay only |
+| macOS, Apple `container` | ⚠️ relay only, untested on a Mac |
+| Windows, native | ❌ use WSL2 |
+
+<Callout variant="warning" title="Windows: run it inside WSL2">
+  Native Windows builds don't forward the agent. Run the Linux build inside WSL2 and bridge the Windows agent into it
+  (for example with `socat` and `npiperelay.exe`); from there it is the Linux case.
+</Callout>
+
+## Agent instructions
+
+<AgentPrompt
+  goal="Make `git push` over ssh work from my devsandbox sandbox <sandbox name>, using my host's ssh-agent; no keys in the container."
+  steps={[
+    'Check the host side first: `ssh-add -l` lists a key, and devsandbox was installed from npm or a release archive (they embed the helper that relays the agent; a `cargo install` build only forwards via a bind mount on Linux docker/podman). Tell me if forwarding cannot work on my platform (native Windows needs WSL2).',
+    'Do not add keys or socket mounts: forwarding needs no config. In `[sandbox.<sandbox name>]`, add a `postCreateCommand` table that adds github.com to ~/.ssh/known_hosts (`ssh-keyscan`) and sets git `user.name` / `user.email` to <your name> / <your email>.',
+    'Check that the repo remote is an ssh URL (git@github.com:…); https remotes never use the agent. Ask me before changing it.',
+  ]}
+  verify={[
+    'The lifecycle commands only run at creation: ask me, then `devsandbox -C <config dir> rebuild <instance>` (the edit makes it drift) or start a new one with `devsandbox -C <config dir> run <sandbox name>`.',
+    'Check `devsandbox -C <config dir> exec <instance> ssh-add -l` lists my key and `devsandbox -C <config dir> exec <instance> ssh -T git@github.com` greets me (exit status 1 is normal). Push only when I ask for it.',
+  ]}
+/>
