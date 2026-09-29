@@ -949,6 +949,11 @@
     grid-template-columns: minmax(0, 54fr) minmax(0, 46fr);
     gap: 32px;
   }
+
+  /* The narrower gutter leaves the dashboard less room than above 1180px. */
+  .hiw-stage .tui-screen {
+    padding: 10px 11px;
+  }
 }
 
 @media (max-width: 980px) {

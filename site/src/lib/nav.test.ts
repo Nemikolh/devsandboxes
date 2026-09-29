@@ -1,15 +1,49 @@
 import { describe, expect, it } from 'vitest';
-import { EXAMPLES_INDEX, pagerKicker, readingNeighbors, readingOrder, type ReadingPage, sourceUrl } from './nav';
+import {
+  activeHeaderHref,
+  EXAMPLES_INDEX,
+  pagerKicker,
+  readingNeighbors,
+  readingOrder,
+  type ReadingPage,
+  sidebarGroups,
+  sourceUrl,
+} from './nav';
 
 const page = (href: string, kind: ReadingPage['kind']): ReadingPage => ({ href, title: href, description: '', kind });
 const quickStart = page('/docs/quick-start', 'docs');
+const dashboard = page('/docs/dashboard', 'docs');
 const first = page('/examples/a', 'example');
 const last = page('/examples/b', 'example');
-const order = readingOrder([quickStart], [first, last]);
+const order = readingOrder([quickStart, dashboard], [first, last]);
 
 describe('readingOrder', () => {
   it('runs docs, references, the examples index, then examples', () => {
-    expect(order.map((p) => p.href)).toEqual(['/docs/quick-start', '/docs/config', '/docs/node-api', '/examples', '/examples/a', '/examples/b']);
+    expect(order.map((p) => p.href)).toEqual([
+      '/docs/quick-start',
+      '/docs/dashboard',
+      '/docs/config',
+      '/docs/node-api',
+      '/examples',
+      '/examples/a',
+      '/examples/b',
+    ]);
+  });
+});
+
+describe('sidebarGroups', () => {
+  it('puts the dashboard tour right after getting started', () => {
+    const groups = sidebarGroups([]);
+    expect(groups.map((g) => g.label)).toEqual(['GETTING STARTED', 'DASHBOARD', 'REFERENCE', 'EXAMPLES']);
+    expect(groups[1].links.map((l) => l.href)).toEqual(['/docs/dashboard']);
+  });
+});
+
+describe('activeHeaderHref', () => {
+  it('keeps Docs current on every hand-written docs page', () => {
+    expect(activeHeaderHref('/docs/dashboard')).toBe('/docs/quick-start');
+    expect(activeHeaderHref('/docs/dashboard/')).toBe('/docs/quick-start');
+    expect(activeHeaderHref('/docs/node-api')).toBe('/docs/node-api');
   });
 });
 
@@ -21,7 +55,7 @@ describe('readingNeighbors', () => {
 
   it('hands the last reference over to the examples index, and the index to the first example', () => {
     expect(readingNeighbors(order, '/docs/node-api').next).toBe(EXAMPLES_INDEX);
-    expect(readingNeighbors(order, '/examples')).toEqual({ prev: order[2], next: first });
+    expect(readingNeighbors(order, '/examples')).toEqual({ prev: order[3], next: first });
   });
 
   it('rejects a page outside the order', () => {

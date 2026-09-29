@@ -4,7 +4,8 @@
  * The playable mini dashboard (`components/MiniTui.astro`): a ratatui screen
  * in a window. Colours are the real TUI's; the landing diagram repeats the
  * ones it shares (`.hiw` in `how-it-works.css`). Window chrome (`.window-bar`,
- * `.terminal-status`) comes from `home.css`.
+ * `.terminal-status`) comes from `components.css`; hosts tune the screen's
+ * padding to their layout (`how-it-works.css`, `dashboard-tour.css`).
  */
 .tui-window {
   --tui-accent: #af87ff;
@@ -608,12 +609,6 @@
   .tui-help {
     column-gap: 1.3ch;
     font-size: 10.5px;
-  }
-}
-
-@media (max-width: 1180px) {
-  .tui-screen {
-    padding: 10px 11px;
   }
 }
 

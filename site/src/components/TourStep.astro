@@ -1,0 +1,19 @@
+---
+/**
+ * One section of a `DashboardTour`: its text, and the scene (`SCENES` in
+ * `lib/dashboard-tour.ts`) the sticky dashboard switches to while it's the
+ * active section. An unknown scene fails the build.
+ */
+import { isSceneId } from '../lib/dashboard-tour';
+
+interface Props {
+  scene: string;
+}
+
+const { scene } = Astro.props;
+if (!isSceneId(scene)) throw new Error(`TourStep: unknown scene \`${scene}\` (see SCENES in lib/dashboard-tour.ts)`);
+---
+
+<section class="dash-step" data-dash-step={scene}>
+  <slot />
+</section>

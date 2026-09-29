@@ -23,6 +23,7 @@ export const headerNav: NavLink[] = [
 export function sidebarGroups(examples: NavLink[]): NavGroup[] {
   return [
     { label: 'GETTING STARTED', links: [{ href: '/docs/quick-start', label: 'Quick start' }] },
+    { label: 'DASHBOARD', links: [{ href: '/docs/dashboard', label: 'Dashboard tour' }] },
     {
       label: 'REFERENCE',
       links: [

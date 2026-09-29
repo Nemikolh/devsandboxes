@@ -1,0 +1,193 @@
+---
+title: Dashboard tour
+description: Every instance and service on one screen, with the CLI's actions one key away. Scroll through it next to a preview you can play with.
+eyebrow: DASHBOARD
+order: 2
+---
+
+import DashboardTour from '../../components/DashboardTour.astro';
+import TourStep from '../../components/TourStep.astro';
+import Try from '../../components/Try.astro';
+
+Run `devsandbox` with no arguments on a terminal and the dashboard opens. The preview next to the text follows along as you scroll: it shows what each section talks about. Click it and press the keys each section suggests; everything in it is fake, nothing runs.
+
+<DashboardTour>
+
+<TourStep scene="instances">
+
+## Instances
+
+The Instances tab lists each sandbox of your config with its instances under it. The first instance mounts your checkout; each repeat one has its own git worktree (`⎇ .worktrees/web-2`). Detail, below the table, shows the selected row.
+
+<Try>`↑` `↓` to move, or click the `▾ web` row for the sandbox itself.</Try>
+
+</TourStep>
+
+<TourStep scene="services">
+
+## Services
+
+Tab `2` lists the service containers your sandboxes use: shared by every instance (`global`) or one per instance, and who uses them.
+
+<Try>`enter` for the service's config, `1`–`4` or `←` `→` to switch tabs.</Try>
+
+</TourStep>
+
+<TourStep scene="config">
+
+## Config explorer
+
+`enter` opens the selected sandbox's config as written in `config.toml`, next to the `docker inspect` of its container. `t` flips to the resolved config, with templates and `extends` merged in.
+
+<Try>`t` to toggle, `↓` to scroll, `esc` to close.</Try>
+
+</TourStep>
+
+<TourStep scene="run">
+
+## Run, stop, start
+
+`r` on a sandbox row prefills `:run web`: Enter starts a new instance, on its own worktree. The dashboard steps aside while the command prints; any key brings it back. `s` stops the selected instance, or starts it again. On an instance row, `r` renames it.
+
+<Try>`enter` to run `web-4`, any key to come back, then `↓` to an instance and `s`.</Try>
+
+</TourStep>
+
+<TourStep scene="logs">
+
+## Logs
+
+`l` shows the last 50 lines of the instance's container log.
+
+<Try>`↓` to scroll, `g` / `G` for top and bottom, `esc` to close.</Try>
+
+</TourStep>
+
+<TourStep scene="terminal">
+
+## Terminal
+
+`t` opens a shell in the selected instance, inside the dashboard: the bottom half splits into Detail and the terminal, one tab per shell. While the terminal has focus, every key goes to the shell. `ctrl-]` (or `F12`) goes back and forth.
+
+<Try>type `ls` and `enter`, `esc` back to the dashboard (`ctrl-]` in the real one), `↓` `t` for a second shell, `esc` again, then `[` `]` to switch and `x` to close.</Try>
+
+</TourStep>
+
+<TourStep scene="ports">
+
+## Port forwards
+
+`p` prefills `:port web`: add a port and Enter, and it's on `127.0.0.1` on your machine. Forwards show in the Ports tab and last while the dashboard runs; `d` stops one. A sandbox's `forwardPorts` are forwarded for you. Linux and macOS hosts.
+
+<Try>`d` to stop it, then `1` `p`, type `8080:3000` and `enter`.</Try>
+
+</TourStep>
+
+<TourStep scene="vscode">
+
+## VS Code
+
+`o` opens VS Code attached to the instance's container, with the sandbox's extensions. See the [VS Code example](/examples/vscode) for the setup.
+
+<Try>`↓` `o` to open it on `web-2`; `esc` closes it (only in the preview).</Try>
+
+</TourStep>
+
+<TourStep scene="inbox">
+
+## Inbox
+
+A script or an agent in a sandbox reaches you with `devsbd notify "tests pass"`. It lands in the Inbox tab (`4`), with an unread count in the tab and a `✉` on the instance row, and pops up on your desktop.
+
+<Try>`1` for Instances: opening the Inbox marked it read, so `web-3` lost its `✉`.</Try>
+
+</TourStep>
+
+<TourStep scene="prompt">
+
+## Command prompt
+
+`:` opens a prompt for the CLI's verbs: `run`, `exec`, `rm`, `rename`, `stop`, `start`, `rebuild`, `port`, `code`. Tab completes commands, sandboxes and instances; `rm` asks before deleting a worktree's branch.
+
+<Try>`tab` to cycle, type `-3` and `enter` to remove `web-3`, then `y` or `n`.</Try>
+
+</TourStep>
+
+<TourStep scene="help">
+
+## Help
+
+`?` lists every key; `q` quits the dashboard.
+
+<Try>`esc` or `?` to close.</Try>
+
+</TourStep>
+
+</DashboardTour>
+
+## Every key
+
+The real dashboard's keys, also in its `?` screen. The Preview column says what the preview on this page fakes.
+
+### Everywhere
+
+| Key                 | Action               | Preview                          |
+| ------------------- | -------------------- | -------------------------------- |
+| `tab` / `shift-tab` | Next / previous tab  | `←` `→` instead (Tab leaves it) |
+| `1`–`4`             | Jump to a tab        | yes                              |
+| `:`                 | Command prompt       | yes                              |
+| `?`                 | Every key            | yes                              |
+| `q`, `ctrl-c`       | Quit                 | no                               |
+
+### Instances and Services
+
+| Key               | Action                                           | Preview                  |
+| ----------------- | ------------------------------------------------ | ------------------------ |
+| `↑` `k` / `↓` `j` | Move the selection                               | yes                      |
+| `→`, `space`      | Expand a sandbox's instances, an instance's processes | no                  |
+| `←`               | Collapse, or jump to the parent row              | no (switches tabs)       |
+| `enter`, `e`      | Config explorer                                  | yes                      |
+| `r`               | Run (sandbox row) / rename (instance row)        | run only                 |
+| `s`               | Stop / start                                     | yes                      |
+| `l`               | Logs (Instances)                                 | yes                      |
+| `p`               | Forward a port (instance or service)             | yes                      |
+| `o`               | Open in VS Code (Instances)                      | yes                      |
+| `t` / `K`         | SIGTERM / SIGKILL (process row)                  | no                       |
+
+### Ports and Inbox
+
+| Key     | Action                                     | Preview |
+| ------- | ------------------------------------------ | ------- |
+| `d`     | Stop the selected forward (Ports)          | yes     |
+| `enter` | Open the notification's link (Inbox)       | no      |
+| `d` `D` | Dismiss one / clear all (Inbox)            | no      |
+
+### Terminals
+
+| Key              | Action                                   | Preview                   |
+| ---------------- | ---------------------------------------- | ------------------------- |
+| `t`              | Open a terminal (instance or service)    | instances only            |
+| `T`              | Force a new terminal for the same target | no                        |
+| `[` / `]`        | Previous / next terminal tab             | yes                       |
+| `x`              | Close the active terminal                | yes                       |
+| `ctrl-]`, `F12`  | Terminal ⇄ dashboard                     | also `esc`                |
+
+### Config explorer and logs
+
+| Key                       | Action                                   | Preview        |
+| ------------------------- | ---------------------------------------- | -------------- |
+| `t`                       | Original / resolved config               | yes            |
+| `tab`                     | Switch pane (config ⇄ inspect)           | no             |
+| `<` / `>`                 | Resize the divider                       | no             |
+| `↑` `↓`, `pgup` `pgdn`    | Scroll                                   | yes            |
+| `g` / `G`                 | Top / bottom                             | yes            |
+| `esc`, `q`                | Close                                    | yes            |
+
+### Command prompt
+
+| Key               | Action                   | Preview |
+| ----------------- | ------------------------ | ------- |
+| `tab`             | Complete / cycle         | yes     |
+| `↑` `↓`           | History                  | no      |
+| `ctrl-u` `ctrl-w` | Clear line / delete word | no      |
+| `esc`             | Cancel                   | yes     |

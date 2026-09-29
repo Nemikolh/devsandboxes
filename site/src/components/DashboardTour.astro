@@ -1,0 +1,25 @@
+---
+/**
+ * Scrollytelling tour of the dashboard: the `TourStep` sections in the slot,
+ * next to one sticky mini dashboard that shows each section's scene and
+ * highlights the parts it talks about (`scripts/dashboard-tour.ts`). Wide
+ * screens get two columns and a playable widget; narrow ones a small,
+ * picture-only widget pinned above the text.
+ */
+import MiniTui from './MiniTui.astro';
+import '../styles/dashboard-tour.css';
+---
+
+<div class="dash-tour" data-dash-tour>
+  <div class="dash-tour-steps">
+    <slot />
+  </div>
+  <div class="dash-tour-stage" data-dash-tour-stage data-pagefind-ignore>
+    <MiniTui id="tour-tui" label="Dashboard preview for the section you're reading" />
+    <p class="dash-tour-narrow-note" aria-hidden="true">Playable on a wider screen</p>
+  </div>
+</div>
+
+<script>
+  import '../scripts/dashboard-tour';
+</script>

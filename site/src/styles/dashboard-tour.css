@@ -1,0 +1,214 @@
+/* ------------------------------------------------------- Dashboard tour */
+
+/*
+ * `components/DashboardTour.astro`: tour sections next to one mini dashboard
+ * that follows them (`scripts/dashboard-tour.ts`). Wide: two columns, the
+ * widget sticky on the right. Narrow: the widget, zoomed down, pinned above
+ * the stacked sections.
+ */
+
+.dash-tour {
+  --tour-accent: var(--lime);
+
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  margin: 36px 0 12px;
+}
+
+.dash-tour-steps {
+  grid-row: 2;
+  min-width: 0;
+}
+
+.dash-tour-stage {
+  grid-row: 1;
+  position: sticky;
+  top: var(--header-h);
+  z-index: 2;
+  min-width: 0;
+}
+
+.dash-step {
+  position: relative;
+}
+
+/* The step's own heading is its first child: no big top margin inside the tour. */
+.prose .dash-step > h2:first-child {
+  margin-top: 0;
+}
+
+.prose .dash-step h2 {
+  /* On top of the page's scroll-padding (the header): clear the pinned narrow widget. */
+  scroll-margin-top: calc(var(--tour-stage-h, 0px) + 16px);
+}
+
+.prose .dash-try {
+  margin-top: 14px;
+  color: var(--text-muted);
+}
+
+.dash-step code {
+  white-space: nowrap;
+}
+
+.dash-try-label {
+  margin-right: 6px;
+  font: 500 10px var(--font-mono);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--tour-accent);
+}
+
+.dash-tour-narrow-note {
+  display: none;
+}
+
+/* The key tables after the tour: keys on one line. */
+.docs-main:has(.dash-tour) .prose td:first-child {
+  white-space: nowrap;
+}
+
+/* ----- Highlight: the scene's regions outlined, the rest of the widget dimmed. */
+
+/*
+ * Down every level that holds a region, the children that neither are nor
+ * hold one dim; a dimmed box's own children are left alone, so the opacity
+ * never compounds.
+ */
+.dash-tour .tui-window :is(.tui-screen, .tui-body, .tui-panel, .terminal-status) > *,
+.dash-tour .tui-window > * {
+  transition: opacity 0.25s;
+}
+
+.dash-tour
+  .tui-window[data-tour-focus]
+  :is(.tui-screen, .tui-body, .tui-panel, .terminal-status):has([data-tour-hl])
+  > :not([data-tour-hl], :has([data-tour-hl])),
+.dash-tour .tui-window[data-tour-focus] > :not([data-tour-hl], :has([data-tour-hl])) {
+  opacity: 0.3;
+}
+
+/*
+ * A ring 3px out (a screen-coloured gap, then the accent) and a glow. A shadow,
+ * not an outline: it paints under the element's children, so box titles
+ * sitting on the border stay on top of it.
+ */
+.dash-tour [data-tour-hl] {
+  border-radius: var(--radius-sm);
+  box-shadow:
+    0 0 0 3px #10191b,
+    0 0 0 4px var(--tour-accent),
+    0 0 26px 4px #a9f36d2e;
+  transition: box-shadow 0.25s;
+}
+
+/* ----- Wide: text left, the playable widget sticky right; the TOC gives way. */
+
+@media (min-width: 1100px) {
+  .docs-shell:has(.dash-tour) {
+    grid-template-columns: 260px minmax(0, 1fr);
+  }
+
+  .docs-shell:has(.dash-tour) > .toc {
+    display: none;
+  }
+
+  .docs-main:has(.dash-tour) {
+    max-width: 1180px;
+  }
+
+  /* Prose outside the tour keeps the usual docs measure. */
+  .docs-main:has(.dash-tour) :is(.article-lead, .prose > :not(.dash-tour), .article-bottom) {
+    max-width: 706px;
+  }
+
+  .dash-tour {
+    grid-template-columns: minmax(250px, 1fr) minmax(0, 600px);
+    column-gap: 48px;
+  }
+
+  .dash-tour-steps,
+  .dash-tour-stage {
+    grid-row: 1;
+  }
+
+  .dash-tour-stage {
+    grid-column: 2;
+    align-self: start;
+    top: calc(var(--header-h) + 32px);
+  }
+
+  .dash-tour-steps {
+    grid-column: 1;
+    /* The last section can still reach the activation line. */
+    padding-bottom: 30vh;
+  }
+
+  .dash-step {
+    min-height: 52vh;
+    padding-left: 20px;
+    margin-left: -21px;
+    border-left: 1px solid transparent;
+    transition: border-color 0.25s;
+  }
+
+  .dash-step[data-active] {
+    border-left-color: var(--tour-accent);
+  }
+}
+
+@media (min-width: 1100px) and (max-width: 1180px) {
+  .docs-shell:has(.dash-tour) {
+    grid-template-columns: 220px minmax(0, 1fr);
+  }
+
+  .dash-tour {
+    column-gap: 32px;
+  }
+}
+
+/* ----- Narrow: a small picture pinned above the text (zoom set by the script). */
+
+@media (max-width: 1099px) {
+  .dash-tour-stage {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 12px 0 10px;
+    background: var(--bg);
+    border-bottom: 1px solid var(--border);
+  }
+
+  .dash-tour-stage .tui-window {
+    width: 560px;
+    flex-shrink: 0;
+    box-shadow: none;
+  }
+
+  .dash-tour-narrow-note {
+    display: block;
+    margin: 8px 0 0;
+    font: 9px var(--font-mono);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-faint);
+  }
+
+  .dash-tour-steps {
+    padding-top: 28px;
+    padding-bottom: 20vh;
+  }
+
+  .dash-step {
+    min-height: 45vh;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dash-tour .tui-window :is(.tui-screen, .tui-body, .tui-panel, .terminal-status) > *,
+  .dash-tour .tui-window > *,
+  .dash-tour [data-tour-hl],
+  .dash-step {
+    transition: none;
+  }
+}
