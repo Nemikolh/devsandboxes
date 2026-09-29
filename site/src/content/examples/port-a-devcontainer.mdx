@@ -1,6 +1,6 @@
 ---
 title: Port a devcontainer.json
-description: Turn an existing devcontainer.json into a config.toml sandbox, property by property, and know which keys carry over, which are ignored and which are errors.
+description: Turn an existing devcontainer.json into a devsandbox config.
 order: 10
 icon: file-code
 tags: [devcontainers, migration]
@@ -8,153 +8,115 @@ related: [features, vscode, isolated-services]
 ---
 
 import AgentPrompt from '../../components/AgentPrompt.astro';
-import Callout from '../../components/Callout.astro';
+import AgentPromptLink from '../../components/AgentPromptLink.astro';
 
 ## The problem
 
-Your repo already has a `.devcontainer/devcontainer.json`, and you want to run it with devsandbox: several instances, worktrees, shared services, no devcontainer CLI. Rewriting it from scratch risks losing something; you want a mechanical translation and a clear list of what doesn't carry over.
+Your repo already has a `.devcontainer/devcontainer.json` and you want to run it with devsandbox. Rewriting it from scratch risks losing something.
 
-`config.toml` uses the **same property names** as `devcontainer.json`, in TOML syntax, plus a few devsandbox extras. Most of a typical file moves over line by line. The differences: the config lives outside the repo, so `folder` says which repo a sandbox is for; a handful of properties are accepted but ignored; and compose-based setups become `[services.*]`.
+`config.toml` uses the same property names in TOML, so most of the file moves over line by line. The differences: `folder` says which repo the sandbox is for, some properties are ignored, and compose setups become `[services.*]`.
+
+<AgentPromptLink />
 
 ## Config
-
-The starting point, a common Node setup:
 
 ```jsonc title=".devcontainer/devcontainer.json (before)"
 {
   "name": "web",
   "image": "mcr.microsoft.com/devcontainers/typescript-node:22",
   "features": {
-    "ghcr.io/devcontainers/features/github-cli:1": {},
-    "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {}
+    "ghcr.io/devcontainers/features/github-cli:1": {}
   },
   "forwardPorts": [3000],
-  "runArgs": ["--add-host=host.docker.internal:host-gateway"],
   "containerEnv": { "NODE_ENV": "development" },
   "mounts": ["source=${localEnv:HOME}/.config/gh,target=/home/node/.config/gh,type=bind"],
   "remoteUser": "node",
   "postCreateCommand": "npm ci",
-  "postStartCommand": "npm run codegen",
   "customizations": {
     "vscode": {
-      "extensions": ["dbaeumer.vscode-eslint", "esbenp.prettier-vscode"],
+      "extensions": ["dbaeumer.vscode-eslint"],
       "settings": { "editor.formatOnSave": true }
     }
   }
 }
 ```
 
-The same sandbox in the config dir, next to the repo:
-
 ```toml title="config.toml (after)"
-# Was web/.devcontainer/devcontainer.json. The table key replaces `name`.
-[sandbox.web]
+[sandbox.web]                      # the table key replaces `name`
 folder = "../web"                  # the repo; config.toml lives outside it
 image = "mcr.microsoft.com/devcontainers/typescript-node:22"
-remoteUser = "node"
+forwardPorts = [3000]              # forwarded while the dashboard is open
 containerEnv = { NODE_ENV = "development" }
 mounts = ["source=${localEnv:HOME}/.config/gh,target=/home/node/.config/gh,type=bind"]
+remoteUser = "node"
 postCreateCommand = "npm ci"
-postStartCommand = "npm run codegen"
-# forwardPorts: gone, use `devsandbox port web 3000` when you need it.
-# runArgs: gone, `--add-host` has no equivalent (and is rarely needed).
-# settings: gone, keep them in the repo's .vscode/settings.json.
-customizations.vscode.extensions = ["dbaeumer.vscode-eslint", "esbenp.prettier-vscode"]
+# settings: ignored, keep them in the repo's .vscode/settings.json
+customizations.vscode.extensions = ["dbaeumer.vscode-eslint"]
 
 [sandbox.web.features]
 "ghcr.io/devcontainers/features/github-cli:1" = {}
-"ghcr.io/devcontainers/features/docker-outside-of-docker:1" = {}
 ```
-
-Keys keep their names and values; JSON objects become inline tables or `[sandbox.web.features]` sub-tables, Feature options included. The three dropped properties would still be accepted if you left them in, with a warning at every `run`.
 
 ## Try it
 
-Lay out the config dir next to your repo (`folder` is relative to the config dir):
+From the config dir:
 
 ```bash
-mkdir devsandboxes && cd devsandboxes    # holds config.toml; ../web is the repo
-devsandbox ls                            # validates every sandbox, no container needed
+devsandbox ls                  # validates the config, no container needed
 devsandbox run web
 devsandbox exec -it web zsh
 ```
 
-`ls` catches what doesn't translate: an unknown or misspelled key is a hard error naming it and listing every valid key, and so is a compose key. If you kept ignored properties, `run` says so:
-
-```text title="devsandbox run web"
-warning: ignoring unsupported properties: forwardPorts, runArgs, customizations.vscode.settings
-```
-
-Your `devcontainer.json` can stay in the repo for people using VS Code's Dev Containers or Codespaces; devsandbox never reads it.
-
 ## How it works
+
+The `devcontainer.json` can stay in the repo; devsandbox never reads it.
 
 ### Property mapping
 
 | devcontainer.json | config.toml | notes |
 |---|---|---|
-| the file's location in the repo | `folder = "../web"` | devsandbox extra, required by `run` |
-| `name` | the table key, `[sandbox.web]` | `name` itself is ignored |
-| `image` | `image` | same |
-| `build.dockerfile`, `build.context` | `build = { dockerfile, context }` | paths relative to the **config dir**, not to `.devcontainer/` |
-| `build.args`, `target`, `cacheFrom`, `options` | same keys in `build` | same |
-| `features` | `[sandbox.web.features]` | OCI references only |
-| `containerEnv`, `remoteEnv` | same | `containerEnv` is not `${…}`-substituted |
-| `containerUser`, `remoteUser` | same | `remoteUser` is also VS Code's attach user |
-| `mounts` | same, string or table form | missing bind sources are created |
-| `workspaceFolder` | same | default `/workspaces/<folder basename>`, as in VS Code |
-| `workspaceMount` | `folder` | ignored: `folder` decides what is mounted |
+| the file's location | `folder` | required by `run` |
+| `name` | the table key | `name` is ignored |
+| `image`, `features` | same | Features: OCI references only |
+| `build.*` | `build = { dockerfile, context, … }` | paths relative to the config dir |
+| `containerEnv`, `remoteEnv` | same | `containerEnv` not `${…}`-substituted |
+| `containerUser`, `remoteUser` | same | |
+| `mounts` | same | missing bind sources are created |
+| `workspaceFolder` | same | default `/workspaces/<folder basename>` |
+| `workspaceMount` | `folder` | ignored |
 | `init`, `privileged` | same | |
 | `initializeCommand` | same | runs on the host, in the config dir |
-| `onCreateCommand` … `postAttachCommand` | same | string, array or table form; tables run in order, not in parallel |
+| `onCreateCommand` … `postAttachCommand` | same | tables run in order, not in parallel |
 | `customizations.vscode.extensions` | same | |
 | `customizations.vscode.settings` | repo `.vscode/settings.json` | ignored |
-| `forwardPorts`, `appPort`, `portsAttributes` | `devsandbox port web 3000` | ignored; forward on demand |
+| `forwardPorts` | same | forwarded by the dashboard while open |
+| `appPort`, `portsAttributes` | `devsandbox port web 3000` | ignored |
 | `runArgs`, `capAdd`, `securityOpt` | none | ignored |
-| `dockerComposeFile`, `service`, `runServices` | `[services.*]` + `services` | **error** |
+| `dockerComposeFile`, `service`, `runServices` | `[services.*]` + `services` | error |
 
 ### Implemented, ignored, rejected
 
-- **Implemented:** `image`, `build`, `features`, `workspaceFolder`, `mounts`, `containerEnv`, `remoteEnv`, `containerUser`, `remoteUser`, `init`, `privileged`, all six lifecycle commands, and `customizations.vscode.extensions` ([implemented properties](/docs/config#implemented-devcontainer-properties)). Exactly one of `image` / `build` is required.
-- **Accepted but ignored** (a warning at `run`): `name`, `forwardPorts`, `appPort`, `portsAttributes`, `otherPortsAttributes`, `runArgs`, `workspaceMount`, `overrideFeatureInstallOrder`, `updateRemoteUserUID`, `userEnvProbe`, `overrideCommand`, `shutdownAction`, `capAdd`, `securityOpt`, `hostRequirements`, `waitFor`, `secrets`, `customizations.vscode.settings`, any other `customizations.vscode.*` key and any other `customizations.<tool>` ([accepted but ignored](/docs/config#accepted-but-ignored-warned-at-run)).
-- **Rejected:** the compose keys `dockerComposeFile`, `service` and `runServices`, and any key devsandbox doesn't know. Unknown keys are errors so that typos surface immediately.
-- **Variables:** `${localEnv:VAR}`, `${localWorkspaceFolder}`, `${localWorkspaceFolderBasename}` and `${devcontainerId}` work as in devcontainers, plus devsandbox's `${configDir}`, `${sharedVolumes}` and `${instance}`. They are substituted in `mounts`, `workspaceFolder`, `worktree-branch`, `shell-rc` and `folders`; anything else, like `${containerEnv:PATH}`, is left as written ([variables](/docs/config#variables)).
+`ls` errors on unknown keys; `run` warns about ignored ones.
+
+- **Implemented:** `image`, `build`, `features`, `workspaceFolder`, `mounts`, `containerEnv`, `remoteEnv`, `containerUser`, `remoteUser`, `init`, `privileged`, the six lifecycle commands, `customizations.vscode.extensions`, `forwardPorts` ([details](/docs/config#implemented-devcontainer-properties)).
+- **Ignored:** `name`, `appPort`, `portsAttributes`, `otherPortsAttributes`, `runArgs`, `workspaceMount`, `overrideFeatureInstallOrder`, `updateRemoteUserUID`, `userEnvProbe`, `overrideCommand`, `shutdownAction`, `capAdd`, `securityOpt`, `hostRequirements`, `waitFor`, `secrets`, other `customizations.*` ([details](/docs/config#accepted-but-ignored-warned-at-run)).
+- **Rejected:** `dockerComposeFile`, `service`, `runServices`, and any unknown key.
+- **Variables:** as in devcontainers, plus `${configDir}`, `${sharedVolumes}`, `${instance}`; substituted only in some keys ([variables](/docs/config#variables)).
 
 ### Coming from docker compose
 
-A compose-based devcontainer puts the app and its database in one `docker-compose.yml`. In devsandbox the app container is the sandbox, and each other compose service becomes a `[services.*]` table the sandbox lists by name; it is reachable under that name as hostname:
-
-```toml title="config.toml"
-[services.db]                      # was the `db` service of docker-compose.yml
-image = "postgres:16"
-env = { POSTGRES_PASSWORD = "postgres" }
-
-[sandbox.web]
-folder = "../web"
-image = "mcr.microsoft.com/devcontainers/typescript-node:22"
-services = ["db"]                  # replaces dockerComposeFile / service / runServices
-containerEnv = { DATABASE_URL = "postgres://postgres:postgres@db/postgres" }
-```
-
-Services are isolated per instance by default, so every instance gets its own `db`; `scope = "global"` shares one. See [private services per instance](/examples/isolated-services) and [one shared Postgres](/examples/shared-postgres).
-
-<Callout variant="tip" title="Several repos, one file">
-  Port each repo's `devcontainer.json` into its own `[sandbox.*]` table, then pull what they share (user, Features,
-  caches, mounts) into a `[template.*]` they `extends`. Tables merge recursively and arrays concatenate, so a sandbox
-  only states what is its own.
-</Callout>
+The app container is the sandbox; each other compose service becomes a `[services.<name>]` (`image`, `env`, `ports`, `command`) that the sandbox lists in `services` and reaches by name as hostname. See [private services per instance](/examples/isolated-services) and [one shared Postgres](/examples/shared-postgres).
 
 ## Agent instructions
 
 <AgentPrompt
   goal="Port the devcontainer.json of my repo at <repo path> to a sandbox in my devsandbox config.toml."
   steps={[
-    'Read <repo path>/.devcontainer/devcontainer.json (and any Dockerfile or docker-compose.yml it references). Do not modify or delete it.',
-    'Add a `[sandbox.<sandbox name>]` with `folder` pointing at <repo path> relative to the config dir, and copy every implemented property over under the same name. Rebase `build.dockerfile` / `build.context` paths onto the config dir.',
-    'Drop properties the config-toml-spec lists as accepted but ignored, and tell me what each one did and its devsandbox alternative (`devsandbox port` for forwardPorts, a repo .vscode/settings.json for VS Code settings). Turn compose services into `[services.*]` tables listed in `services`; compose keys are errors.',
-    'If a template in config.toml already provides some of these properties, extend it instead of repeating them.',
+    'Read <repo path>/.devcontainer/devcontainer.json and any Dockerfile or docker-compose.yml it references; do not modify them.',
+    'Add a `[sandbox.<sandbox name>]` with `folder` pointing at <repo path> (relative to the config dir) and copy the implemented properties over; rebase `build` paths onto the config dir. Extend an existing template instead of repeating what it provides.',
+    'Drop the properties the config-toml-spec lists as ignored and tell me what each did; turn compose services into `[services.*]` listed in `services`.',
   ]}
   verify={[
-    'Run `devsandbox -C <config dir> run <sandbox name>`, then `devsandbox -C <config dir> exec <instance> <a command the repo needs>`, and report any `warning:` lines from `run`.',
+    'Run `devsandbox -C <config dir> run <sandbox name>` and report any `warning:` lines, then `devsandbox -C <config dir> exec <instance> <a command the repo needs>`.',
   ]}
 />
