@@ -23,6 +23,10 @@ folders = { "/workspaces/.devsandboxes" = "../.devsandboxes" }
 - The window title is the file name — that is how the workspace gets named after
   the instance (VS Code has no separate workspace-name property). First instance
   = sandbox name, worktree instances `<sandbox>-2`, …
+- Inside it, the primary root is named after its path's basename (like the
+  extra roots) and `terminal.integrated.cwd` is pinned to it by that name. The
+  instance name is the fallback when the basename is empty or shared with a
+  `folders` entry, which would make `${workspaceFolder:<name>}` ambiguous.
 - `folders` supplements `folder`/`workspaceFolder`; the primary keeps driving
   the workdir, `${localWorkspaceFolder}` and worktrees. Extra folders are plain
   shared mounts: no worktree treatment, shared between concurrent instances.

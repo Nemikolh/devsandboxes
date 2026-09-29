@@ -93,6 +93,7 @@ forwardPorts = [3000, "8080:3000", "db:5432"]
 - A service `ports` entry that gives only the container port (`"5432"`) now gets the same port on the host when it's free, instead of a random one. If the port is taken, the runtime still picks one.
 - **An exact instance name wins.** With instances `web` and `web-2`, `devsandbox exec web` (and `rm`, `stop`, `logs`, …) now means the instance `web` instead of an ambiguity that failed off a TTY and prompted on one, including inside a pty. An exact instance id counts too; sandbox and folder names only apply when nothing matches exactly. `exec` now uses the same resolution as the other verbs, so it also accepts an instance's id after a rename.
 - **npm (breaking): `run()` resolves with the new instance's record** (`RunRecord`) instead of its name; use `(await run(...)).name` for the old value. It calls `run --json`, so build and autostart output can no longer end up as the "name".
+- In the generated VS Code workspace, the main folder is labelled with its directory name (`webcontainer`) instead of the instance name (`webcontainer-sqlite`), like the extra `folders` roots. If an extra root has the same directory name, the instance name is kept. Existing instances pick this up on `rebuild --force`.
 
 ### Fixed
 

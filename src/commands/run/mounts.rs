@@ -148,18 +148,20 @@ pub(super) fn resolve_folders(
 /// the fallback for backends where auto-install via `nameConfigs` is unavailable
 /// (see [`write_workspace_file`]).
 ///
-/// The primary folder is named after the instance and `terminal.integrated.cwd`
-/// is pinned to it via `${workspaceFolder:<name>}`: in a multi-root workspace
-/// VS Code otherwise picks the terminal cwd from whichever root holds the
-/// active editor, which lands new terminals in the extra roots.
+/// The primary folder gets an explicit name (see [`primary_folder_name`]) and
+/// `terminal.integrated.cwd` is pinned to it via `${workspaceFolder:<name>}`:
+/// in a multi-root workspace VS Code otherwise picks the terminal cwd from
+/// whichever root holds the active editor, which lands new terminals in the
+/// extra roots.
 fn workspace_file_json(
     instance: &str,
     workspace: &str,
     extra_folders: &[ResolvedFolder],
     recommendations: &[String],
 ) -> String {
+    let primary = primary_folder_name(instance, workspace, extra_folders);
     let folders: Vec<serde_json::Value> =
-        std::iter::once(serde_json::json!({ "name": instance, "path": workspace }))
+        std::iter::once(serde_json::json!({ "name": primary, "path": workspace }))
             .chain(
                 extra_folders
                     .iter()
@@ -169,13 +171,31 @@ fn workspace_file_json(
     let mut root = serde_json::json!({
         "folders": folders,
         "settings": {
-            "terminal.integrated.cwd": format!("${{workspaceFolder:{instance}}}"),
+            "terminal.integrated.cwd": format!("${{workspaceFolder:{primary}}}"),
         },
     });
     if !recommendations.is_empty() {
         root["extensions"] = serde_json::json!({ "recommendations": recommendations });
     }
     serde_json::to_string_pretty(&root).expect("workspace json serializes")
+}
+
+/// Explorer name of the primary root: its path's basename, so it reads like
+/// the extra roots (VS Code shows those by basename) instead of the instance
+/// name. Falls back to the instance when the basename is empty or shared with
+/// an extra root, where `${workspaceFolder:<name>}` would be ambiguous.
+fn primary_folder_name<'a>(
+    instance: &'a str,
+    workspace: &'a str,
+    extra_folders: &[ResolvedFolder],
+) -> &'a str {
+    fn basename(path: &str) -> Option<&str> {
+        path.rsplit('/').find(|s| !s.is_empty())
+    }
+    match basename(workspace) {
+        Some(name) if !extra_folders.iter().any(|f| basename(&f.target) == Some(name)) => name,
+        _ => instance,
+    }
 }
 
 /// Write `/workspaces/<instance>.code-workspace` inside the container so VS
@@ -737,16 +757,33 @@ mod tests {
         assert_eq!(
             parsed["folders"],
             serde_json::json!([
-                { "name": "app-2", "path": "/workspaces/app" },
+                { "name": "app", "path": "/workspaces/app" },
                 { "path": "/workspaces/.shared" }
             ])
         );
         assert_eq!(
             parsed["settings"]["terminal.integrated.cwd"],
-            "${workspaceFolder:app-2}"
+            "${workspaceFolder:app}"
         );
         // No recommendations passed → no `extensions` key at all.
         assert!(parsed.get("extensions").is_none());
+    }
+
+    #[test]
+    fn primary_folder_named_after_path_basename() {
+        assert_eq!(primary_folder_name("app-2", "/workspaces/app", &[]), "app");
+        assert_eq!(primary_folder_name("app-2", "/workspaces/app/", &[]), "app");
+    }
+
+    #[test]
+    fn primary_folder_falls_back_to_instance() {
+        assert_eq!(primary_folder_name("app-2", "/", &[]), "app-2");
+        let clash = vec![ResolvedFolder {
+            target: "/src/app".to_string(),
+            host: PathBuf::from("/x"),
+            mode: FolderWorktree::Auto,
+        }];
+        assert_eq!(primary_folder_name("app-2", "/workspaces/app", &clash), "app-2");
     }
 
     #[test]
