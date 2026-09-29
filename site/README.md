@@ -14,6 +14,14 @@ pnpm check:links  # scripts/check-links.mjs alone: every href="/…" / "#…" in
                   # dist/ must hit a built page and an existing id
 ```
 
+## Deployment
+
+CI (`.github/workflows/ci.yml`, job `site`) runs check, test and build on
+every PR and push to main. The site is deployed to GitHub Pages only on a
+release tag (`release.yml`, jobs `pages-build` / `pages-deploy`, after the
+GitHub release and npm publish), so the docs always match what users can
+install.
+
 ## Layout
 
 - `src/pages/` — routes. `src/layouts/` — `Base.astro` (head, header,
