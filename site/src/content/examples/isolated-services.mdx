@@ -1,6 +1,6 @@
 ---
 title: Private services per instance
-description: Every instance gets its own Postgres and Redis on its own network, so agents can migrate, seed and flush without touching each other.
+description: Every instance gets its own Postgres and Redis, so agents never touch each other's data.
 order: 3
 icon: network
 tags: [services, networking, agents]
@@ -8,82 +8,121 @@ related: [shared-postgres, parallel-agents, port-forwarding]
 ---
 
 import AgentPrompt from '../../components/AgentPrompt.astro';
-import Callout from '../../components/Callout.astro';
+import AgentPromptLink from '../../components/AgentPromptLink.astro';
+import Agent from '../../components/Agent.astro';
+import AgentOnly from '../../components/AgentOnly.astro';
+import AgentPicker from '../../components/AgentPicker.astro';
 
 ## The problem
 
 Parallel agents on one database step on each other: one runs a destructive migration while another's tests expect the old schema, one flushes Redis in the middle of another's run. For throwaway work each instance should own its backing services and be free to wreck them.
 
-That is the default. A service without `scope` is **isolated**: every instance that lists it gets its own container, on a network private to that instance, under the same hostname. The config never changes, however many instances you run.
+That is the default. A service without `scope` is **isolated**: every instance that lists it gets its own container, on a network private to that instance, under the same hostname.
+
+<AgentPromptLink />
 
 ## Config
 
-```toml title="config.toml"
+<AgentPicker />
+
+```toml title="config.toml" agent="claude"
 [services.postgres]
-image = "postgres:16"                  # scope defaults to "isolated"
+image = "postgres:16"                  # no scope: one per instance
 env = { POSTGRES_PASSWORD = "postgres" }
 
 [services.redis]
 image = "redis:7"
-command = ["redis-server", "--save", "", "--appendonly", "no"]
+command = ["redis-server", "--save", "", "--appendonly", "no"]  # in-memory only
 
 [sandbox.api]
-folder = "../api"
-image = "mcr.microsoft.com/devcontainers/base:ubuntu"
+folder = "../api"                      # your repo, next to this config dir
+image = "node:22"
 services = ["postgres", "redis"]
-containerEnv = { DATABASE_URL = "postgres://postgres:postgres@postgres:5432/postgres", REDIS_URL = "redis://redis:6379" }
+# Your Claude Code login and settings, from the host.
+mounts = ["source=${localEnv:HOME}/.claude,target=/root/.claude,type=bind"]
+
+[sandbox.api.containerEnv]  # same hostnames in every instance, its own containers
+DATABASE_URL = "postgres://postgres:postgres@postgres:5432/postgres"
+REDIS_URL = "redis://redis:6379"
+CLAUDE_CONFIG_DIR = "/root/.claude"
+
+[sandbox.api.postCreateCommand]  # once, when an instance is created
+agent = "npm install -g @anthropic-ai/claude-code"
 ```
 
-`command` is appended after the image: here Redis runs with persistence off, a pure in-memory cache. As an array each item is one argument; a plain string would be passed as a single argument, not split by a shell.
+```toml title="config.toml" agent="codex"
+[services.postgres]
+image = "postgres:16"                  # no scope: one per instance
+env = { POSTGRES_PASSWORD = "postgres" }
+
+[services.redis]
+image = "redis:7"
+command = ["redis-server", "--save", "", "--appendonly", "no"]  # in-memory only
+
+[sandbox.api]
+folder = "../api"                      # your repo, next to this config dir
+image = "node:22"
+services = ["postgres", "redis"]
+# Your Codex login and settings, from the host.
+mounts = ["source=${localEnv:HOME}/.codex,target=/root/.codex,type=bind"]
+
+[sandbox.api.containerEnv]  # same hostnames in every instance, its own containers
+DATABASE_URL = "postgres://postgres:postgres@postgres:5432/postgres"
+REDIS_URL = "redis://redis:6379"
+
+[sandbox.api.postCreateCommand]  # once, when an instance is created
+agent = "npm install -g @openai/codex"
+```
+
+<AgentOnly agent="claude">
+
+On macOS <Agent /> keeps its login in the Keychain: run `/login` once in any instance.
+
+</AgentOnly>
 
 ## Try it
 
+One instance per task, each with its own postgres and redis:
+
 ```bash
-devsandbox run api      # api, with its own postgres and redis
-devsandbox run api      # api-2 on a worktree, with a second pair
+devsandbox run api --name fix-login
+devsandbox run api --name add-search
 devsandbox stats        # both instances and all four service containers
 ```
 
-Each instance resolves the same names to its own containers:
+- `--name`: the instance name.
 
-```bash
-devsandbox exec api getent hosts postgres redis
-devsandbox exec api-2 getent hosts postgres redis   # different addresses
+Start <Agent /> in each:
+
+```bash agent="claude"
+devsandbox exec -it fix-login claude
+devsandbox exec -it add-search claude
 ```
 
-Services follow their instance: `devsandbox stop api-2` stops its postgres and redis too, `devsandbox start api-2` brings them back, and `devsandbox rm api-2` removes them along with the instance's network.
-
-Change a service and apply it to every instance at once:
-
-```bash
-devsandbox service rebuild redis
+```bash agent="codex"
+devsandbox exec -it fix-login codex
+devsandbox exec -it add-search codex
 ```
 
-This recreates the redis container of each running instance that uses it and rewires the instance in place; the sandboxes keep running. Stopped instances pick up the new container on their next `start`.
+`devsandbox rm add-search` removes the instance with its services and network.
 
 ## How it works
 
-- **Per-instance names.** An isolated service runs as `devsandbox-svc-<project>-<instance>-<service>` on the network `devsandbox-net-<project>-<instance>`. Both are keyed by the persistent instance id, so they survive a rename.
-- **Same hostname everywhere.** The sandbox reaches each service by its name, through a network alias on docker and podman or an `/etc/hosts` entry on Apple `container`. That is why one `DATABASE_URL` works for every instance.
-- **Mixing scopes.** A sandbox may list isolated and [global](/examples/shared-postgres) services together; the instance joins both its own network and the shared one.
-- **Keys.** Services accept `scope`, `image` or `build`, `env`, `ports` and `command` ([services reference](/docs/config#services-servicesname)). A `build` service is rebuilt from its dockerfile by `service rebuild`, and editing the dockerfile marks it drifted ([drift](/docs/config#drift)).
-- **Housekeeping.** `devsandbox gc` removes every service container no *running* instance references, and the networks of instances that are gone. That includes a stopped instance's services: its next `start` recreates them, empty.
-
-<Callout variant="warning" title="No host ports on isolated services">
-  A host port another container already publishes is an error, so `ports = ["5432:5432"]` on an isolated service
-  breaks the second instance. Reach a single instance's service from the host with `devsandbox port` instead, on demand.
-</Callout>
+- Services follow their instance through `stop`, `start` and `rm`.
+- `devsandbox service rebuild redis` recreates every running instance's redis in place ([services reference](/docs/config#services-servicesname)).
+- No host `ports` on isolated services (the second instance would collide): use `devsandbox port`.
 
 ## Agent instructions
 
 <AgentPrompt
-  goal="Give every instance of my devsandbox sandbox <sandbox name> its own private Postgres and Redis, so parallel instances never share data."
+  goal="Give every instance of my devsandbox sandbox <sandbox name> its own private Postgres and Redis, so parallel <agent> sessions never share data."
   steps={[
-    'Add `[services.postgres]` and `[services.redis]` without a `scope` (the default, isolated: one container per instance on a per-instance network). Match the images to the versions the repo targets (<postgres version>, <redis version>) and set `POSTGRES_PASSWORD` in `env`. Do not publish host `ports` on them: the second instance would collide on the host port.',
-    'Add both names to the sandbox\'s `services` and set the connection variables the repo reads (e.g. `DATABASE_URL`, `REDIS_URL`) in `containerEnv`, with hosts `postgres` and `redis`.',
+    'Add `[services.postgres]` and `[services.redis]` without a `scope` (isolated), with images matching the versions the repo targets and `POSTGRES_PASSWORD` in `env`. No host `ports`.',
+    'List both in the sandbox\'s `services` and set the connection variables the repo reads (e.g. `DATABASE_URL`, `REDIS_URL`) in `containerEnv`, with hosts `postgres` and `redis`.',
+    'Install <agent> in `postCreateCommand` and mount its host config dir (its login) into the container.',
   ]}
   verify={[
-    'Run two instances with `devsandbox -C <config dir> run <sandbox name>` (twice) and check `devsandbox -C <config dir> stats` lists a postgres and a redis container for each.',
-    'In each instance, check `devsandbox -C <config dir> exec <instance> getent hosts postgres redis` resolves; then run the migrations in one and confirm the other\'s database is untouched.',
+    'Start two instances with `devsandbox -C <config dir> run <sandbox name> --name <task>` and check `devsandbox -C <config dir> stats` lists a postgres and a redis for each.',
+    'Run the migrations in one instance and confirm the other\'s database is untouched; check `devsandbox -C <config dir> exec <task> <agent> --version` works.',
   ]}
 />
