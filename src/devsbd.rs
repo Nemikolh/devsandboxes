@@ -167,17 +167,18 @@ fn as_strs(args: &[String]) -> Vec<&str> {
 
 /// What `devsbd boot` should run on the container's next start: `cmd` (a
 /// `postStartCommand`) with the context the host's lifecycle exec gives it
-/// (`run::exec_lifecycle`: `-w workspace`, `-u remote_user`, `remote_env`,
-/// then `SSH_AUTH_SOCK`). Empty argvs are dropped, as the exec path skips them.
+/// (`run::exec_lifecycle`: `-w workspace`, `-u remote_user`, `exec_env` — the
+/// instance's `Instance::exec_env` — then `SSH_AUTH_SOCK`). Empty argvs are
+/// dropped, as the exec path skips them.
 pub fn boot_spec(
     cmd: &LifecycleCommand,
     workspace: &str,
-    remote_env: Option<&BTreeMap<String, String>>,
+    exec_env: Option<&BTreeMap<String, String>>,
     remote_user: Option<&str>,
     ssh_auth_sock: Option<&str>,
 ) -> bootfile::BootSpec {
     let mut env: Vec<(String, String)> =
-        remote_env.into_iter().flatten().map(|(k, v)| (k.clone(), v.clone())).collect();
+        exec_env.into_iter().flatten().map(|(k, v)| (k.clone(), v.clone())).collect();
     if let Some(sock) = ssh_auth_sock {
         env.push(("SSH_AUTH_SOCK".into(), sock.into()));
     }

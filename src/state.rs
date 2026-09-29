@@ -91,7 +91,9 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_dir: Option<PathBuf>,
     /// Extra `-e K=V` from `run --env` (a dispatcher's `ensure --env`),
-    /// recorded so `rebuild` recreates the container with them.
+    /// recorded so `rebuild` recreates the container with them. `ensure` on an
+    /// existing child replaces them; every devsandbox exec applies the saved
+    /// values ([`Instance::exec_env`]), so they take effect before a rebuild.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra_env: BTreeMap<String, String>,
     pub created_unix: u64,
@@ -111,6 +113,18 @@ impl Instance {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0)
+    }
+
+    /// The env every devsandbox exec into this instance sets (CLI/TUI exec,
+    /// dispatcher run ops, lifecycle commands, the boot file): `remoteEnv`
+    /// overlaid by `extra_env`. The instance-specific value wins, as at
+    /// `docker run` where `--env` comes after `containerEnv`; and the saved
+    /// `extra_env` may be newer than the container's own env (an `ensure`
+    /// replaced it), so it must override whatever the image or config set.
+    pub fn exec_env(&self) -> BTreeMap<String, String> {
+        let mut env = self.remote_env.clone();
+        env.extend(self.extra_env.iter().map(|(k, v)| (k.clone(), v.clone())));
+        env
     }
 }
 
@@ -248,6 +262,26 @@ mod tests {
         assert!(!text.contains("dispatcher") && !text.contains("config_dir"), "{text}");
         assert!(!text.contains("branch_created"), "{text}");
         assert!(!text.contains("extra_env"), "{text}");
+    }
+
+    #[test]
+    fn exec_env_overlays_extra_env_on_remote_env() {
+        let mut state: State = toml::from_str(
+            "[instance.a]\nsandbox = \"web\"\ncontainer = \"c\"\nfolder = \"/f\"\nworkspace = \"/w\"\ncreated_unix = 0\n",
+        )
+        .unwrap();
+        let inst = state.instances.get_mut("a").unwrap();
+        assert!(inst.exec_env().is_empty());
+        inst.remote_env = BTreeMap::from([("A".into(), "remote".into()), ("B".into(), "b".into())]);
+        inst.extra_env = BTreeMap::from([("A".into(), "extra".into()), ("C".into(), "c".into())]);
+        assert_eq!(
+            inst.exec_env(),
+            BTreeMap::from([
+                ("A".into(), "extra".into()),
+                ("B".into(), "b".into()),
+                ("C".into(), "c".into()),
+            ])
+        );
     }
 
     #[test]

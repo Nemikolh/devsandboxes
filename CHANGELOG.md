@@ -26,7 +26,7 @@ devsbd notify --level warn --key pr-123 --link https://github.com/o/r/pull/123 "
   - `spawn = ["*"]` means every sandbox in the config root except other dispatchers, and it grants their mounts, docker socket and privileges. Children can never be dispatchers themselves.
   - `max-instances` defaults to 10 and counts stopped children too.
   - `--branch` accepts plain branch names only (`[A-Za-z0-9._/-]`) and is used literally, with no `${…}` expansion.
-  - `--env` refuses names that could take over processes in the child: `PATH`, `HOME`, `SHELL`, `LD_*`, `DYLD_*`, `GIT_*`, `NODE_OPTIONS`, `PYTHON*` and similar. Its values are kept across a `devsandbox rebuild` of the child, including when `ensure` recreates a missing container.
+  - `--env` refuses names that could take over processes in the child: `PATH`, `HOME`, `SHELL`, `LD_*`, `DYLD_*`, `GIT_*`, `NODE_OPTIONS`, `PYTHON*` and similar. Its values are kept across a `devsandbox rebuild` of the child, including when `ensure` recreates a missing container. On an existing child, `ensure --env` replaces the saved values, and every command devsandbox runs in the child (`exec`, dashboard terminals, `devsbd exec` runs, lifecycle commands) uses them from then on, over a same-named `remoteEnv`; already-running processes keep the old ones until a rebuild.
 
 ```toml
 [sandbox.pr-dispatcher]

@@ -66,12 +66,15 @@ pub(crate) fn start_instance(dir: &Path, key: &str, info: &Instance) -> Result<(
             let host_agent = crate::commands::exec::has_host_agent();
             let ssh_auth_sock = crate::commands::exec::ssh_auth_sock_env(&fresh, host_agent);
             let props = &sandbox.properties;
+            // remoteEnv, then the saved `--env` (possibly newer than the
+            // container's own env: `ensure` replaces it without a rebuild).
+            let exec_env = info.exec_env();
             let boot = run::boot_spec_for(
                 props.autostart,
                 arch.is_some(),
                 props.post_start_command.as_ref(),
                 &info.workspace,
-                Some(&info.remote_env),
+                Some(&exec_env),
                 info.remote_user.as_deref(),
                 ssh_auth_sock,
             );
@@ -105,7 +108,7 @@ pub(crate) fn start_instance(dir: &Path, key: &str, info: &Instance) -> Result<(
                 run::exec_lifecycle(
                     &info.container,
                     &info.workspace,
-                    Some(&info.remote_env),
+                    Some(&exec_env),
                     info.remote_user.as_deref(),
                     ssh_auth_sock,
                     cmd,

@@ -25,11 +25,13 @@ pub(super) fn run_host_commands(dir: &Path, cmd: &LifecycleCommand) -> Result<()
     Ok(())
 }
 
-/// Run a lifecycle command inside the container via `exec`.
+/// Run a lifecycle command inside the container via `exec`. `env` is the
+/// instance's `Instance::exec_env` (remoteEnv, then the saved `--env`), the
+/// same set `devsandbox exec` passes.
 pub(crate) fn exec_lifecycle(
     container: &str,
     workspace: &str,
-    remote_env: Option<&BTreeMap<String, String>>,
+    env: Option<&BTreeMap<String, String>>,
     remote_user: Option<&str>,
     ssh_auth_sock: Option<&str>,
     cmd: &LifecycleCommand,
@@ -38,7 +40,7 @@ pub(crate) fn exec_lifecycle(
         if argv.is_empty() {
             continue;
         }
-        let args = lifecycle_argv(container, workspace, remote_env, remote_user, ssh_auth_sock, argv);
+        let args = lifecycle_argv(container, workspace, env, remote_user, ssh_auth_sock, argv);
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         backend().run_checked(&arg_refs)?;
     }
@@ -46,14 +48,14 @@ pub(crate) fn exec_lifecycle(
 }
 
 /// Pure argv builder for one lifecycle exec, mirroring
-/// `commands::exec::exec_argv_with`'s flag order (`-w`, `-u`, remote_env,
+/// `commands::exec::exec_argv_with`'s flag order (`-w`, `-u`, env,
 /// `SSH_AUTH_SOCK`, container, command) so lifecycle execs carry the same agent
 /// env the CLI/TUI do. `ssh_auth_sock` is the shared rule's result
 /// (`commands::exec::ssh_auth_sock_env`).
 fn lifecycle_argv(
     container: &str,
     workspace: &str,
-    remote_env: Option<&BTreeMap<String, String>>,
+    env: Option<&BTreeMap<String, String>>,
     remote_user: Option<&str>,
     ssh_auth_sock: Option<&str>,
     argv: Vec<String>,
@@ -63,7 +65,7 @@ fn lifecycle_argv(
         args.push("-u".into());
         args.push(user.to_string());
     }
-    for (key, value) in remote_env.into_iter().flatten() {
+    for (key, value) in env.into_iter().flatten() {
         args.push("-e".into());
         args.push(format!("{key}={value}"));
     }

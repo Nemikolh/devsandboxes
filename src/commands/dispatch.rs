@@ -13,12 +13,14 @@
 //! Children can't be dispatchers: `ensure` of a sandbox declaring
 //! `dispatcher` is denied whatever `spawn` says, and a request from a child
 //! instance (old state) is denied, so dispatch can't recurse. `--env` names
-//! on the control::denied_env list are denied.
+//! on the control::denied_env list are denied. `ensure --env` on an existing
+//! child replaces its saved env (`Instance::extra_env`) before (re)starting
+//! it, so every later devsandbox exec there sees the new values.
 //!
 //! Runs (`exec`, `run-ls|logs|wait`) live in the child: the host execs the
 //! child's own helper (`devsbd run start|ls|logs|wait`, `devsbd/src/runs.rs`)
-//! there, as the child's remote user in its workspace with its `remoteEnv`
-//! (the `devsandbox exec` argv), output captured, and answers with what it
+//! there, as the child's remote user in its workspace with its `remoteEnv` and
+//! saved env (the `devsandbox exec` argv), output captured, and answers with what it
 //! printed. Only owned, running children with a helper are reachable.
 //!
 //! Children are ordinary instances named `<sandbox>-<key>`. Operations run as
@@ -28,6 +30,7 @@
 //! on the alternate screen. Their output goes to
 //! `<data>/devsandbox/logs/dispatch-<unix>-<op>.log`.
 
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -86,9 +89,13 @@ pub trait Executor {
     /// for the response body.
     fn devsandbox(&mut self, config_dir: &Path, args: &[String]) -> Result<(), String>;
     /// Run `command` in `child`'s container as `devsandbox exec` would (user,
-    /// workspace, remoteEnv), stdin null, output captured; `Err` only when it
+    /// workspace, `Instance::exec_env`), stdin null, output captured; `Err` only when it
     /// couldn't run at all.
     fn exec_in(&mut self, child: &Instance, command: &[String]) -> Result<ExecOutput, String>;
+    /// Replace state entry `name`'s `extra_env` with `env` and save. Called
+    /// under the bridge's host-wide control lock, before the op's subprocess
+    /// (which then loads the updated entry).
+    fn save_env(&mut self, name: &str, env: &BTreeMap<String, String>) -> Result<(), String>;
 }
 
 /// Load state and the dispatcher's config, then [`handle_with`] the real
@@ -216,6 +223,13 @@ pub(crate) fn handle_with(
             let action = ensure_action(&name, child, owner_id, sandbox, owned, decl.cap(), |c| {
                 exec.is_running(c)
             });
+            if let (Ok(_), Some(child)) = (&action, child) {
+                if let Some(env) = replaced_env(child, &req.env) {
+                    if let Err(e) = exec.save_env(&name, &env) {
+                        return failed(e);
+                    }
+                }
+            }
             match action {
                 Err(resp) => resp,
                 Ok(Ensure::Nothing) => Response::new(Status::Ok, name),
@@ -417,8 +431,11 @@ enum Ensure {
 }
 
 /// The `ensure` decision: ownership, cap, and the child's state. An existing
-/// child is only (re)started; a changed `branch`/`env` is ignored, not merged
-/// (they apply at creation; a recreating `rebuild` keeps the recorded env).
+/// child is only (re)started; a changed `branch` is ignored (it applies at
+/// creation). A given `env` replaces the saved one ([`replaced_env`], saved by
+/// the caller whatever the action): every devsandbox exec applies it from then
+/// on, the container's own env (PID 1, running processes) only changes on
+/// `rebuild` — which the containerless case does, from the saved env.
 /// `liveness` is only consulted for an owned child.
 fn ensure_action(
     name: &str,
@@ -452,6 +469,18 @@ fn ensure_action(
         Ok(None) => Ok(Ensure::Rebuild),
         Err(e) => Err(failed(e)),
     }
+}
+
+/// The saved env an `ensure` of existing `child` leaves: exactly `given`
+/// (replace, not merge, so a dispatcher can drop a variable; last value wins
+/// on a duplicate key, as with `-e`). `None` = keep the saved env: no env
+/// given, or the same set.
+fn replaced_env(child: &Instance, given: &[(String, String)]) -> Option<BTreeMap<String, String>> {
+    if given.is_empty() {
+        return None;
+    }
+    let env: BTreeMap<String, String> = given.iter().cloned().collect();
+    (env != child.extra_env).then_some(env)
 }
 
 /// `devsandbox` argv (after `-C <dir>`) carrying out `action`.
@@ -639,6 +668,16 @@ impl Executor for Subprocess {
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         })
     }
+
+    fn save_env(&mut self, name: &str, env: &BTreeMap<String, String>) -> Result<(), String> {
+        let mut state = State::load().map_err(|e| format!("{e:#}"))?;
+        let info = state
+            .instances
+            .get_mut(name)
+            .ok_or_else(|| format!("`{name}` vanished from state"))?;
+        info.extra_env = env.clone();
+        state.save().map_err(|e| format!("{e:#}"))
+    }
 }
 
 /// `<data>/devsandbox/logs/dispatch-<unix>-<op>.log` (next to `state.toml`,
@@ -726,7 +765,8 @@ folder = "."
     }
 
     /// Records calls; `running`: container -> liveness (absent = no container).
-    /// `exec_in` answers `helper` and records `(container, argv)` in `execs`.
+    /// `exec_in` answers `helper` and records `(container, argv)` in `execs`;
+    /// `save_env` records `(name, env)` in `saved`.
     #[derive(Default)]
     struct Fake {
         running: BTreeMap<String, bool>,
@@ -734,6 +774,7 @@ folder = "."
         fail: bool,
         helper: ExecOutput,
         execs: Vec<(String, Vec<String>)>,
+        saved: Vec<(String, BTreeMap<String, String>)>,
     }
 
     impl Fake {
@@ -757,6 +798,10 @@ folder = "."
         fn exec_in(&mut self, child: &Instance, command: &[String]) -> Result<ExecOutput, String> {
             self.execs.push((child.container.clone(), command.to_vec()));
             if self.fail { Err("no docker".into()) } else { Ok(self.helper.clone()) }
+        }
+        fn save_env(&mut self, name: &str, env: &BTreeMap<String, String>) -> Result<(), String> {
+            self.saved.push((name.to_string(), env.clone()));
+            Ok(())
         }
     }
 
@@ -886,8 +931,9 @@ folder = "."
         let resp = call(&s, "d", &req(Op::Ensure, Some("web"), Some("one")), &mut fake);
         assert_eq!(resp, Response::new(Status::Ok, "web-one"));
         assert!(fake.calls.is_empty());
+        assert!(fake.saved.is_empty(), "no env given: saved env kept");
 
-        // Stopped: start (branch/env of an existing child are ignored).
+        // Stopped: start (the branch of an existing child is ignored).
         let resp = call(&s, "d", &r_with(Op::Ensure, "two"), &mut fake);
         assert_eq!(resp, Response::new(Status::Ok, "web-two"));
         assert_eq!(fake.calls, vec![argv(&["start", "web-two"])]);
@@ -902,6 +948,62 @@ folder = "."
         let mut fake = Fake { fail: true, ..Fake::new() };
         let resp = call(&s, "d", &r_with(Op::Ensure, "two"), &mut fake);
         assert_eq!(resp, Response::new(Status::Failed, "boom"));
+    }
+
+    /// `--env` on an existing child replaces its saved env (not merged), before
+    /// the op runs, whatever the child's liveness; no env, or the same set,
+    /// writes nothing.
+    #[test]
+    fn ensure_env_replaces_the_saved_env_of_an_existing_child() {
+        let mut s = state();
+        for key in ["web-one", "web-two"] {
+            s.instances.get_mut(key).unwrap().extra_env =
+                BTreeMap::from([("OLD".into(), "1".into()), ("X".into(), "old".into())]);
+        }
+        let want = BTreeMap::from([("X".to_string(), "y".to_string())]);
+        // Running, stopped, containerless.
+        for (key, running, call_args) in [
+            ("one", Some(true), None),
+            ("two", Some(false), Some(argv(&["start", "web-two"]))),
+            ("two", None, Some(argv(&["rebuild", "web-two"]))),
+        ] {
+            let mut fake = Fake::new();
+            match running {
+                Some(r) => {
+                    fake.running.insert(format!("devsandbox-web-{key}"), r);
+                }
+                None => {
+                    fake.running.remove(&format!("devsandbox-web-{key}"));
+                }
+            }
+            let resp = call(&s, "d", &r_with(Op::Ensure, key), &mut fake);
+            assert_eq!(resp.status, Status::Ok, "{key}: {resp:?}");
+            assert_eq!(fake.saved, vec![(format!("web-{key}"), want.clone())], "{key}");
+            assert_eq!(fake.calls, call_args.into_iter().collect::<Vec<_>>(), "{key}");
+        }
+        // Duplicate keys: last wins, as with `-e`.
+        let mut r = req(Op::Ensure, Some("web"), Some("one"));
+        r.env = vec![("A".into(), "1".into()), ("A".into(), "2".into())];
+        let mut fake = Fake::new();
+        call(&s, "d", &r, &mut fake);
+        assert_eq!(fake.saved, vec![("web-one".into(), BTreeMap::from([("A".into(), "2".into())]))]);
+        // No env, or the saved set again: nothing written.
+        let mut fake = Fake::new();
+        call(&s, "d", &req(Op::Ensure, Some("web"), Some("one")), &mut fake);
+        s.instances.get_mut("web-one").unwrap().extra_env = want.clone();
+        call(&s, "d", &r_with(Op::Ensure, "one"), &mut fake);
+        assert!(fake.saved.is_empty());
+        // Denied requests save nothing (not owned; a denied env name).
+        let mut fake = Fake::new();
+        call(&s, "d", &r_with(Op::Ensure, "other"), &mut fake);
+        let mut r = r_with(Op::Ensure, "one");
+        r.env.push(("PATH".into(), "/x".into()));
+        call(&s, "d", &r, &mut fake);
+        assert!(fake.saved.is_empty() && fake.calls.is_empty());
+        // A new child gets its env through `run --env`, not `save_env`.
+        let mut fake = Fake::new();
+        call(&s, "d", &r_with(Op::Ensure, "new"), &mut fake);
+        assert!(fake.saved.is_empty());
     }
 
     fn r_with(op: Op, key: &str) -> Request {

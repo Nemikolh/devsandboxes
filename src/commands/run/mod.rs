@@ -503,6 +503,8 @@ pub(crate) fn materialize(
     // included) spans shell-rc wiring + all five commands so each exec reaches
     // the host agent; its handshake failure is reported once, after the chain.
     let inst = state.instances.get(instance).expect("instance just inserted");
+    // Same env as `devsandbox exec`: remoteEnv, then the saved `--env`.
+    let exec_env = inst.exec_env();
     let host_agent = crate::commands::exec::has_host_agent();
     let ssh_auth_sock = crate::commands::exec::ssh_auth_sock_env(inst, host_agent);
     // Record the postStartCommand for the boot hook (the host still runs it
@@ -512,7 +514,7 @@ pub(crate) fn materialize(
         devsbd_arch.is_some(),
         props.post_start_command.as_ref(),
         &workspace,
-        props.remote_env.as_ref(),
+        Some(&exec_env),
         props.remote_user.as_deref(),
         ssh_auth_sock,
     );
@@ -527,7 +529,7 @@ pub(crate) fn materialize(
         exec_lifecycle(
             &container,
             &workspace,
-            props.remote_env.as_ref(),
+            Some(&exec_env),
             props.remote_user.as_deref(),
             ssh_auth_sock,
             &shell_rc_wiring(&paths, persist_history),
@@ -546,7 +548,7 @@ pub(crate) fn materialize(
             exec_lifecycle(
                 &container,
                 &workspace,
-                props.remote_env.as_ref(),
+                Some(&exec_env),
                 props.remote_user.as_deref(),
                 ssh_auth_sock,
                 cmd,
@@ -568,14 +570,17 @@ pub(crate) fn materialize(
 /// The boot file a container should carry: the `postStartCommand` when the
 /// runtime restarts the container itself (`autostart = "runtime"` on a backend
 /// with restart policies) and the helper that runs it is installed; `None`
-/// (remove the file) otherwise.
+/// (remove the file) otherwise. `env` is the instance's `Instance::exec_env`.
+/// The file is rewritten on `run`/`start`/`rebuild` only (and on `start`
+/// after the hook already fired, see `devsbd::sync_boot`), so a saved env an
+/// `ensure` changed reaches the hook from the start after the next one.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn boot_spec_for(
     autostart: Option<crate::config::Autostart>,
     helper: bool,
     post_start: Option<&crate::config::LifecycleCommand>,
     workspace: &str,
-    remote_env: Option<&std::collections::BTreeMap<String, String>>,
+    env: Option<&std::collections::BTreeMap<String, String>>,
     remote_user: Option<&str>,
     ssh_auth_sock: Option<&str>,
 ) -> Option<crate::devsbd::bootfile::BootSpec> {
@@ -584,7 +589,7 @@ pub(crate) fn boot_spec_for(
         backend().supports_restart_policy(),
     );
     let cmd = post_start.filter(|_| runtime && helper)?;
-    Some(crate::devsbd::boot_spec(cmd, workspace, remote_env, remote_user, ssh_auth_sock))
+    Some(crate::devsbd::boot_spec(cmd, workspace, env, remote_user, ssh_auth_sock))
 }
 
 /// Whether some instance (running or stopped — a stopped one can be started

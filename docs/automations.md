@@ -453,6 +453,15 @@ Decision (user): `run --env` values live in `state.toml` and survive
   is empty (same fallback shape as `dispatcher`/`config_dir`).
 - `ensure` on an existing child with different `--env`: still ignored
   (documented), not merged.
+- Follow-up (user decision): `ensure --env` on an existing child (running,
+  stopped, or containerless) *replaces* its `extra_env` with exactly the
+  given set (no `--env` keeps it), written by the host handler under the
+  control lock before the `start`/`rebuild` subprocess, which reads it back.
+  Every devsandbox exec uses `Instance::exec_env` = `remoteEnv` overlaid by
+  `extra_env` (instance-specific wins, as `docker run` puts `--env` after
+  `containerEnv`): `exec_argv` (CLI, TUI terminals, dispatcher run ops),
+  lifecycle execs, the boot file. The container's own env changes only on
+  `rebuild`.
 
 ### Step 14 — autostart skips dispatcher-owned instances [x]
 

@@ -66,7 +66,8 @@ pub fn exec_status(name: &str, interactive: bool, tty: bool, command: &[String])
 }
 
 /// Build the runtime `exec` argv for `instance`: the flags, workspace,
-/// remoteUser, remoteEnv, container, and command, in the order the CLI has
+/// remoteUser, env (`Instance::exec_env`: remoteEnv, then the saved
+/// `--env`), container, and command, in the order the CLI has
 /// always emitted them. Factored out so the dashboard's integrated terminal
 /// spawns the exact same command the CLI does and the two can't drift.
 pub fn exec_argv(
@@ -134,7 +135,7 @@ fn exec_argv_with(
         args.push("-u".into());
         args.push(user.clone());
     }
-    for (key, value) in &instance.remote_env {
+    for (key, value) in &instance.exec_env() {
         args.push("-e".into());
         args.push(format!("{key}={value}"));
     }
@@ -220,6 +221,32 @@ mod tests {
                 "devsandbox-repo-abc1",
                 "bash",
                 "-l",
+            ]
+        );
+    }
+
+    /// The saved `--env` rides every exec, overriding remoteEnv on a clash.
+    #[test]
+    fn argv_includes_extra_env_over_remote_env() {
+        let mut inst = instance();
+        inst.remote_env.insert("FOO".into(), "remote".into());
+        inst.remote_env.insert("BAZ".into(), "qux".into());
+        inst.extra_env.insert("FOO".into(), "extra".into());
+        inst.extra_env.insert("PR".into(), "42".into());
+        assert_eq!(
+            exec_argv_with(&inst, false, false, &["ls".into()], false),
+            vec![
+                "exec",
+                "-w",
+                "/workspaces/repository-1",
+                "-e",
+                "BAZ=qux",
+                "-e",
+                "FOO=extra",
+                "-e",
+                "PR=42",
+                "devsandbox-repo-abc1",
+                "ls",
             ]
         );
     }
