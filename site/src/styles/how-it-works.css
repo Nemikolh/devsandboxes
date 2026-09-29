@@ -903,6 +903,102 @@
   text-overflow: ellipsis;
 }
 
+/*
+ * With a terminal open, like the real layout: the bottom half of the body
+ * splits Detail 30% | terminal 70% and the table shrinks above. The body keeps
+ * its height so the stage doesn't jump. Panels dissolve into the body's grid.
+ */
+.tui-body[data-terms] {
+  height: 290px;
+  grid-template-columns: minmax(0, 3fr) minmax(0, 7fr);
+  grid-template-rows: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 14px 1ch;
+}
+
+.tui-body[data-terms] .tui-panel {
+  display: contents;
+}
+
+.tui-body[data-terms] .tui-table {
+  grid-column: 1 / -1;
+  min-height: 0;
+}
+
+.tui-body[data-terms] .tui-detail {
+  grid-column: 1;
+  min-height: 0;
+}
+
+.tui-body:not([data-terms]) .tui-detail--terms {
+  display: none;
+}
+
+/* Terminal focus: the pane's border in the accent, the dashboard's dimmed. */
+.tui-body[data-focus='terminal'] .tui-box:not(.tui-term) {
+  border-color: #2c3d40;
+}
+
+.tui-term {
+  grid-column: 2;
+  grid-row: 2;
+  min-width: 0;
+  min-height: 0;
+  padding-bottom: 6px;
+  border-color: #2c3d40;
+  cursor: text;
+}
+
+.tui-body[data-focus='terminal'] .tui-term {
+  border-color: var(--tui-accent);
+}
+
+.tui-term-tabs {
+  max-width: calc(100% - 2ch);
+  overflow: hidden;
+  white-space: pre;
+  text-overflow: ellipsis;
+}
+
+.tui-screen .tui-term-tab {
+  color: var(--tui-dim);
+}
+
+.tui-screen .tui-term-tab[data-active] {
+  color: var(--tui-accent);
+  font-weight: 500;
+}
+
+.tui-screen .tui-term-tab[data-exited] {
+  color: var(--tui-dim);
+  font-weight: 400;
+}
+
+.tui-term-mark {
+  color: var(--tui-accent);
+  font-weight: 500;
+}
+
+/* Newest line at the bottom; long lines wrap like a real terminal, the oldest clip. */
+.tui-term-screen {
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  height: 100%;
+  overflow: hidden;
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.tui-cursor {
+  display: inline-block;
+  width: 1ch;
+  height: 1.2em;
+  vertical-align: text-bottom;
+  background: #c5d8d6;
+}
+
 .tui-help {
   display: flex;
   flex-wrap: wrap;

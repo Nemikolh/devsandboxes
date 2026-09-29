@@ -267,8 +267,9 @@ const title = (i: Instance) => `${i.name} · ${i.branch ?? i.folder} — Dev Con
 
     <div class="tui-window" data-tui role="group" aria-label="Dashboard preview" aria-describedby="hiw-tui-keys">
       <p class="visually-hidden" id="hiw-tui-keys">
-        Arrow keys or j and k select an instance, o opens it in VS Code, Escape closes VS Code, left and right arrows or
-        1 to 4 switch tabs, question mark shows help. Tab leaves the preview.
+        Arrow keys or j and k select an instance, o opens it in VS Code, Escape closes VS Code, t opens a terminal on it,
+        left and right arrows or 1 to 4 switch tabs, question mark shows help. In a terminal, keys go to the shell and
+        Escape returns to the dashboard; square brackets switch terminals and x closes one. Tab leaves the preview.
       </p>
       <p class="visually-hidden" aria-live="polite" data-tui-live></p>
       <div class="window-bar" aria-hidden="true">
@@ -375,6 +376,10 @@ const title = (i: Instance) => `${i.name} · ${i.branch ?? i.folder} — Dev Con
               <span class="tui-box-title">Ports</span>
               <span class="tui-dim">no forwards — press p on an instance or service, or :port &lt;instance&gt; &lt;port&gt;</span>
             </div>
+            {/* Like the real Ports tab: an empty Detail keeps the terminal split aligned. */}
+            <div class="tui-box tui-detail tui-detail--terms">
+              <span class="tui-box-title">Detail</span>
+            </div>
           </div>
 
           <div class="tui-panel" data-tui-panel="inbox" hidden>
@@ -402,25 +407,35 @@ const title = (i: Instance) => `${i.name} · ${i.branch ?? i.folder} — Dev Con
             </div>
           </div>
 
+          {/* The integrated terminal (`draw_terminal_panel` in `src/tui/ui.rs`): tab strip as the title. */}
+          <div class="tui-box tui-term" data-tui-term hidden>
+            <span class="tui-box-title tui-term-tabs" data-tui-term-tabs></span>
+            <div class="tui-term-screen" data-tui-term-screen></div>
+          </div>
+
           {/* The `?` overlay: the real HELP_BODY's keys that work here, plus where this preview differs. */}
           <div class="tui-modal" data-tui-help-overlay hidden>
             <span class="tui-box-title">help — keys</span>
             <dl>
               <dt>↑/k ↓/j</dt><dd>move selection</dd>
               <dt>o</dt><dd>open in VS Code (Instances)</dd>
-              <dt>t</dt><dd>terminal</dd>
+              <dt>t</dt><dd>open terminal (Instances)</dd>
+              <dt>[ / ]</dt><dd>previous / next terminal</dd>
+              <dt>x</dt><dd>close the active terminal</dd>
+              <dt>ctrl-]</dt><dd>focus terminal ↔ dashboard</dd>
               <dt>tab 1-4</dt><dd>switch tab · jump to tab</dd>
               <dt>?</dt><dd>this help</dd>
             </dl>
             <p class="tui-dim">
               In this preview ←/→ switch tabs (Tab leaves it; click the <span class="tui-accent">tab</span> key instead)
-              and esc closes VS Code. In the dashboard, ←/→ fold rows.
+              and esc closes VS Code or leaves a terminal. In the dashboard, ←/→ fold rows.
             </p>
             <p class="tui-dim">esc or ? to close</p>
           </div>
         </div>
 
-        <div class="tui-help">
+        {/* One hint bar per focus, like `draw_help` in `src/tui/ui.rs`. */}
+        <div class="tui-help" data-tui-help="dashboard">
           <span class="tui-hint">
             <button type="button" tabindex="-1" class="tui-key" data-key="ArrowUp">↑</button><button
               type="button"
@@ -433,6 +448,29 @@ const title = (i: Instance) => `${i.name} · ${i.branch ?? i.folder} — Dev Con
           <span class="tui-hint"><button type="button" tabindex="-1" class="tui-key" data-key="t">t</button> terminal</span>
           <span class="tui-hint"><button type="button" tabindex="-1" class="tui-key" data-key="Tab">tab</button> switch</span>
           <span class="tui-hint"><button type="button" tabindex="-1" class="tui-key" data-key="?">?</button> help</span>
+          <span class="tui-hint" data-tui-terms-hint hidden>
+            <button type="button" tabindex="-1" class="tui-key" data-key="[">[</button><button
+              type="button"
+              tabindex="-1"
+              class="tui-key"
+              data-key="]">]</button
+            > terms
+          </span>
+          <span class="tui-hint" data-tui-terms-hint hidden>
+            <button type="button" tabindex="-1" class="tui-key" data-key="x">x</button> close term
+          </span>
+        </div>
+        <div class="tui-help" data-tui-help="terminal" hidden>
+          <span class="tui-hint">
+            <button type="button" tabindex="-1" class="tui-key" data-key="Escape">esc</button> / ctrl-] back to dashboard · all
+            other keys go to the shell
+          </span>
+        </div>
+        <div class="tui-help" data-tui-help="exited" hidden>
+          <span class="tui-hint">
+            terminal exited — <button type="button" tabindex="-1" class="tui-key" data-key="Escape">esc</button> back ·
+            <button type="button" tabindex="-1" class="tui-key" data-key="x">x</button> closes
+          </span>
         </div>
       </div>
 
