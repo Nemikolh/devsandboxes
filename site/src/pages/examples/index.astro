@@ -4,6 +4,7 @@ import { ArrowUpRight, Bot, FileCode, FlaskConical, Workflow } from '@lucide/ast
 import ExampleIcon from '../../components/ExampleIcon.astro';
 import Base from '../../layouts/Base.astro';
 import { exampleNumber, sortExamples } from '../../lib/examples';
+import { searchSection } from '../../lib/search';
 import '../../styles/examples.css';
 
 const examples = sortExamples(await getCollection('examples'));
@@ -22,13 +23,13 @@ const anatomy = [
   title="Examples"
   description="Complete, validated config.toml recipes for devsandboxes: parallel agents, shared and isolated services, caches, ssh-agent forwarding and more."
 >
-  <main id="main-content" class="examples-page" tabindex="-1">
+  <main id="main-content" class="examples-page" tabindex="-1" data-pagefind-body data-pagefind-meta={`section:${searchSection('/examples')}`}>
     <header class="examples-hero">
       <div class="examples-hero-grid" aria-hidden="true"></div>
       <div class="examples-hero-inner">
         <div class="examples-hero-copy">
           <p class="examples-kicker"><span>// EXAMPLES · {total} RECIPES</span></p>
-          <h1>Start from a recipe<span class="title-period" aria-hidden="true">.</span></h1>
+          <h1 data-pagefind-meta="title:Examples">Start from a recipe<span class="title-period" aria-hidden="true">.</span></h1>
           <p class="examples-lead">
             Each example is one use case, end to end: the whole config, the commands to try it, what happens underneath,
             and a prompt that has your coding agent set it up in your own config.
@@ -48,7 +49,8 @@ const anatomy = [
       </div>
     </header>
 
-    <section class="examples-list" aria-label="All examples">
+    {/* The cards repeat every example's title and description; those pages are indexed themselves. */}
+    <section class="examples-list" aria-label="All examples" data-pagefind-ignore>
       <div class="feature-grid examples-grid">
         {
           examples.map((e, i) => (

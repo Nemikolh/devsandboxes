@@ -24,6 +24,7 @@ import CodeBlock from '../components/CodeBlock.astro';
 import Base from '../layouts/Base.astro';
 import { psTable } from '../lib/home';
 import { VERSION } from '../lib/nav';
+import { searchSection } from '../lib/search';
 import { devsandboxesTheme } from '../lib/shiki-theme';
 import '../styles/home.css';
 
@@ -193,7 +194,14 @@ devsandbox run web`;
   fullTitle
   ogType="website"
 >
-  <main id="main-content" tabindex="-1">
+  {/* Indexed at a lower weight: an overview, so the docs page on a topic should rank above it. */}
+  <main
+    id="main-content"
+    tabindex="-1"
+    data-pagefind-body
+    data-pagefind-weight="0.5"
+    data-pagefind-meta={`section:${searchSection('/')}`}
+  >
     <section class="hero">
       <div class="hero-grid" aria-hidden="true"></div>
       <div class="hero-inner">
@@ -202,7 +210,7 @@ devsandbox run web`;
             <span class="kicker-symbol" aria-hidden="true">//</span> DEVCONTAINERS, MULTIPLIED
             <span class="kicker-line" aria-hidden="true"></span>
           </div>
-          <h1 class="reveal" style="--d: 0.08s">Many sandboxes.<br /><em>One config<span class="title-period">.</span></em></h1>
+          <h1 class="reveal" style="--d: 0.08s" data-pagefind-meta="title:devsandboxes">Many sandboxes.<br /><em>One config<span class="title-period">.</span></em></h1>
           <p class="reveal" style="--d: 0.16s">
             Devcontainer-style sandboxes on docker, podman and Apple container. Spin up as many throwaway instances of a
             repo as you have coding agents, each on its own git worktree.
@@ -218,7 +226,7 @@ devsandbox run web`;
           </ul>
         </div>
 
-        <div class="hero-workspace" role="img" aria-label="A terminal running devsandbox run web three times, creating instances web, web-2 and web-3, the last two on their own git worktrees, then devsandbox ps listing them next to a shared postgres service; beside it the config.toml that defines them.">
+        <div class="hero-workspace" data-pagefind-ignore role="img" aria-label="A terminal running devsandbox run web three times, creating instances web, web-2 and web-3, the last two on their own git worktrees, then devsandbox ps listing them next to a shared postgres service; beside it the config.toml that defines them.">
           <div class="workspace-glow"></div>
           <div class="terminal-window">
             <div class="window-bar">
@@ -275,7 +283,7 @@ devsandbox run web`;
           <div class="floating-tag"><span class="status-indicator"></span> 3 INSTANCES · 1 CONFIG</div>
         </div>
       </div>
-      <div class="hero-bottom">
+      <div class="hero-bottom" data-pagefind-ignore>
         <span>BUILT FOR CODING AGENTS</span>
         <a href="#devcontainers">SCROLL TO EXPLORE <ArrowDown size={14} aria-hidden="true" /></a>
       </div>

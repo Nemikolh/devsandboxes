@@ -23,6 +23,7 @@
     "@lucide/astro": "^1.48.0",
     "astro": "^7.3.5",
     "github-slugger": "^2.0.0",
+    "pagefind": "^1.5.2",
     "shiki": "4.4.3"
   },
   "devDependencies": {

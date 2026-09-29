@@ -686,15 +686,28 @@
 
 /* --------------------------------------------------------- Search dialog */
 
+/* A modal <dialog> covering the viewport; the panel inside is the visible box. */
 .dialog-overlay {
-  position: fixed;
-  inset: 0;
-  background: #050b0ccc;
-  z-index: 70;
+  margin: 0;
+  width: 100%;
+  height: 100%;
+  max-width: none;
+  max-height: none;
+  border: 0;
+  background: none;
+  color: var(--text);
+  padding: 14vh 20px 20px;
+  overflow: hidden;
+}
+
+.dialog-overlay[open] {
   display: flex;
   justify-content: center;
   align-items: flex-start;
-  padding: 14vh 20px 20px;
+}
+
+.dialog-overlay::backdrop {
+  background: #050b0ccc;
   backdrop-filter: blur(5px);
 }
 
@@ -705,6 +718,17 @@
   box-shadow: 0 28px 90px #000c;
   border-radius: var(--radius-lg);
   overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  max-height: 100%;
+  animation: search-in 0.14s ease-out;
+}
+
+@keyframes search-in {
+  from {
+    opacity: 0;
+    transform: translateY(-6px) scale(0.99);
+  }
 }
 
 .dialog-input {
@@ -742,9 +766,15 @@
 }
 
 .dialog-results {
-  max-height: 390px;
+  max-height: 420px;
+  min-height: 0;
   overflow: auto;
+  overscroll-behavior: contain;
   padding: 15px;
+}
+
+.dialog-results [role='group'] + [role='group'] {
+  margin-top: 10px;
 }
 
 .results-label {
@@ -770,11 +800,61 @@
   color: var(--lime);
 }
 
-.dialog-results a span {
+.search-option-icon,
+.search-option-arrow {
+  flex: none;
+}
+
+.search-option-arrow {
+  opacity: 0;
+}
+
+.dialog-results a[aria-selected='true'] .search-option-arrow {
+  opacity: 1;
+}
+
+.search-option-text {
   flex: 1;
+  min-width: 0;
   display: flex;
   flex-direction: column;
   gap: 4px;
+}
+
+.search-option-heading {
+  font: 11px var(--font-mono);
+  font-style: normal;
+  color: var(--cyan);
+  overflow-wrap: anywhere;
+}
+
+.search-option-heading::before {
+  content: '# ';
+  color: #6f8889;
+}
+
+.dialog-results mark {
+  background: #a9f36d24;
+  color: var(--lime);
+  border-radius: 2px;
+  padding: 0 1px;
+}
+
+.search-option-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.search-badge {
+  flex: none;
+  font: 9px var(--font-mono);
+  letter-spacing: 0.1em;
+  color: #9db2b1;
+  border: 1px solid #3d5154;
+  border-radius: var(--radius-sm);
+  padding: 3px 6px;
 }
 
 .dialog-results strong {
@@ -786,6 +866,7 @@
   font-size: 11px;
   color: #879e9e;
   line-height: 1.4;
+  overflow-wrap: anywhere;
 }
 
 .dialog-footer {
@@ -812,7 +893,15 @@
 
 @media (max-width: 700px) {
   .dialog-overlay {
-    padding-top: 10vh;
+    padding: 10vh 12px 12px;
+  }
+
+  .dialog-results {
+    padding: 10px;
+  }
+
+  .dialog-footer span:first-child {
+    display: none;
   }
 }
 

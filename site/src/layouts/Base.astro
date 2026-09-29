@@ -14,6 +14,7 @@ import '../styles/components.css';
 import Footer from '../components/Footer.astro';
 import Header from '../components/Header.astro';
 import MobileDrawer from '../components/MobileDrawer.astro';
+import Search from '../components/Search.astro';
 
 export interface Props {
   title: string;
@@ -57,6 +58,7 @@ const canonical = new URL(Astro.url.pathname, Astro.site);
     <slot />
     <Footer />
     <MobileDrawer />
+    <Search />
     <script>
       import '../scripts/copy-code';
     </script>

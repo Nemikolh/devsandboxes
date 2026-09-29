@@ -1,0 +1,99 @@
+---
+// The ⌘K / `/` search dialog. Before typing it lists every page (built here
+// from the collections, no index needed); while typing it shows Pagefind hits,
+// rendered client-side by `scripts/search.ts` from the templates below.
+import { getCollection } from 'astro:content';
+import { ArrowRight, BookOpen, Boxes, Braces, House, Search, X } from '@lucide/astro';
+import { sortExamples } from '../lib/examples';
+import { browseGroups, type SearchSection } from '../lib/search';
+
+const docs = (await getCollection('docs'))
+  .sort((a, b) => a.data.order - b.data.order)
+  .map((d) => ({ href: `/docs/${d.id}`, title: d.data.title, description: d.data.description }));
+const examples = sortExamples(await getCollection('examples')).map((e) => ({
+  href: `/examples/${e.id}`,
+  title: e.data.title,
+  description: e.data.description,
+}));
+const groups = browseGroups(docs, examples);
+const icons = { HOME: House, DOCS: BookOpen, REFERENCE: Braces, EXAMPLES: Boxes } satisfies Record<SearchSection, unknown>;
+const sections = Object.keys(icons) as SearchSection[];
+let n = 0;
+---
+
+<dialog id="search-dialog" class="dialog-overlay" aria-label="Search documentation">
+  <div class="search-dialog">
+    <div class="dialog-input">
+      <Search size={20} aria-hidden="true" />
+      <input
+        type="text"
+        role="combobox"
+        aria-label="Search documentation"
+        aria-autocomplete="list"
+        aria-expanded="true"
+        aria-controls="search-listbox"
+        placeholder="Search documentation..."
+        autocomplete="off"
+        autocapitalize="off"
+        spellcheck="false"
+        enterkeyhint="go"
+        data-search-input
+      />
+      <button type="button" data-search-close aria-label="Close search"><X size={18} aria-hidden="true" /></button>
+    </div>
+    <div class="dialog-results" data-search-scroll>
+      <div id="search-listbox" role="listbox" aria-label="Search results">
+        <div data-search-browse>
+          {
+            groups.map((g) => (
+              <div role="group" aria-labelledby={`search-group-${g.label.toLowerCase()}`}>
+                <div class="results-label" id={`search-group-${g.label.toLowerCase()}`}>
+                  {g.label}
+                </div>
+                {g.items.map((item) => {
+                  const Icon = icons[g.label];
+                  return (
+                    <a class="search-option" role="option" id={`search-opt-${n++}`} href={item.href} tabindex="-1" aria-selected="false">
+                      <Icon class="search-option-icon" size={17} aria-hidden="true" />
+                      <span class="search-option-text">
+                        <strong>{item.title}</strong>
+                        <small>{item.description}</small>
+                      </span>
+                      <ArrowRight class="search-option-arrow" size={16} aria-hidden="true" />
+                    </a>
+                  );
+                })}
+              </div>
+            ))
+          }
+        </div>
+        <div role="group" aria-labelledby="search-hits-label" data-search-hits hidden>
+          <div class="results-label" id="search-hits-label" data-search-hits-label></div>
+          <div data-search-hits-list></div>
+        </div>
+      </div>
+      <div class="empty-search" data-search-empty hidden></div>
+    </div>
+    <p class="visually-hidden" aria-live="polite" data-search-status></p>
+    <div class="dialog-footer" aria-hidden="true">
+      <span><kbd>↑</kbd> <kbd>↓</kbd> to move</span>
+      <span><kbd>↵</kbd> to open</span>
+      <span><kbd>ESC</kbd> to close</span>
+    </div>
+  </div>
+  {
+    sections.map((s) => {
+      const Icon = icons[s];
+      return (
+        <template data-search-icon={s}>
+          <Icon class="search-option-icon" size={17} aria-hidden="true" />
+        </template>
+      );
+    })
+  }
+  <template data-search-arrow><ArrowRight class="search-option-arrow" size={16} aria-hidden="true" /></template>
+</dialog>
+
+<script>
+  import '../scripts/search';
+</script>

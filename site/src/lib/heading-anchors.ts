@@ -68,6 +68,28 @@ export function dropSkillTitle(): HastPluginEntry {
 }
 
 /**
+ * Sätteri hast plugin: weight the first cell of each table body row up for
+ * Pagefind. In reference tables that cell is the key being defined
+ * (`worktree-link`, `scope`), so a search for it should land on its row's
+ * section rather than on a passing mention elsewhere.
+ */
+export function tableKeyWeight(): HastPluginEntry {
+  return {
+    name: 'devsandboxes:table-key-weight',
+    element: {
+      filter: ['td'],
+      visit(node, ctx) {
+        const row = ctx.parent(node);
+        const i = ctx.indexOf(node);
+        if (!row || i === undefined) return;
+        if (row.children.slice(0, i).some((c) => c.type === 'element')) return;
+        ctx.setProperty(node, 'dataPagefindWeight', '3');
+      },
+    },
+  };
+}
+
+/**
  * Sätteri hast plugin: wrap tables in a scroll container, so wide tables
  * scroll on their own on mobile while staying real full-width tables.
  */

@@ -4,6 +4,7 @@ import { ChevronRight } from '@lucide/astro';
 import NextPage, { type NextLink } from '../components/NextPage.astro';
 import Sidebar from '../components/Sidebar.astro';
 import Toc from '../components/Toc.astro';
+import { searchSection } from '../lib/search';
 import '../styles/docs.css';
 import Base from './Base.astro';
 
@@ -18,6 +19,8 @@ export interface Props {
 }
 
 const { title, description, eyebrow, headings, next, section = { label: 'Docs', href: '/docs/quick-start' } } = Astro.props;
+// Search indexes the main column minus the breadcrumb, the eyebrow/tags line
+// (excerpt noise) and the bottom cards (other pages' titles would match there).
 ---
 
 <Base title={title} description={description}>
@@ -25,19 +28,19 @@ const { title, description, eyebrow, headings, next, section = { label: 'Docs', 
     <aside class="docs-sidebar">
       <Sidebar />
     </aside>
-    <main id="main-content" class="docs-main" tabindex="-1">
-      <nav class="breadcrumb" aria-label="Breadcrumb">
+    <main id="main-content" class="docs-main" tabindex="-1" data-pagefind-body data-pagefind-meta={`section:${searchSection(Astro.url.pathname)}`}>
+      <nav class="breadcrumb" aria-label="Breadcrumb" data-pagefind-ignore>
         <ol>
           <li><a href="/">Home</a><ChevronRight size={13} aria-hidden="true" /></li>
           <li><a href={section.href}>{section.label}</a><ChevronRight size={13} aria-hidden="true" /></li>
           <li><span aria-current="page">{title}</span></li>
         </ol>
       </nav>
-      <div class="article-topline">
+      <div class="article-topline" data-pagefind-ignore>
         <span class="eyebrow"><span class="eyebrow-line" aria-hidden="true"></span>{eyebrow}</span>
         <slot name="topline" />
       </div>
-      <h1>{title}<span class="title-period" aria-hidden="true">.</span></h1>
+      <h1 data-pagefind-meta={`title:${title}`}>{title}<span class="title-period" aria-hidden="true">.</span></h1>
       <p class="article-lead">{description}</p>
       <hr class="article-divider" />
       <article class="prose">
@@ -46,12 +49,12 @@ const { title, description, eyebrow, headings, next, section = { label: 'Docs', 
       {/* A `bottom` slot (examples: related + prev/next) replaces the lone next card. */}
       {
         Astro.slots.has('bottom') ? (
-          <div class="article-bottom">
+          <div class="article-bottom" data-pagefind-ignore>
             <slot name="bottom" />
           </div>
         ) : (
           next && (
-            <div class="article-bottom">
+            <div class="article-bottom" data-pagefind-ignore>
               <NextPage {...next} />
             </div>
           )

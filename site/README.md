@@ -28,6 +28,12 @@ pnpm check      # astro check (types + .astro diagnostics)
   - `heading-anchors.ts` — Sätteri (Astro's Markdown pipeline) plugins for
     heading ids + `#` permalinks and scrollable table wrappers.
   - `nav.ts` — header nav and sidebar groups.
+  - `pagefind-integration.ts` — builds the Pagefind index over `dist/` after
+    `astro build`; `pnpm dev` serves the last build's `dist/pagefind/`, so
+    search in dev needs one `pnpm build` first.
+  - `search.ts` — pure helpers of the search dialog (`Search.astro` +
+    `scripts/search.ts`). Indexed regions are marked `data-pagefind-body`
+    in the layouts; chrome inside them is excluded in the integration.
 - The header version chip is the `[package] version` of `../Cargo.toml`, read
   in `astro.config.mjs` at build time.
 
