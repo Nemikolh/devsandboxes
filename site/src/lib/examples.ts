@@ -44,16 +44,6 @@ export function exampleNumber(index: number): string {
   return String(index + 1).padStart(2, '0');
 }
 
-export interface Neighbors<T> {
-  prev?: T;
-  next?: T;
-}
-
-/** Previous and next example in reading order (none past either end). */
-export function exampleNeighbors<T>(sorted: T[], index: number): Neighbors<T> {
-  return { prev: sorted[index - 1], next: sorted[index + 1] };
-}
-
 /**
  * Resolve `related` slugs against the collection. An unknown or self slug
  * throws, so a renamed example breaks the build instead of dropping a card.
@@ -115,6 +105,38 @@ export function promptParts(text: string): PromptPart[] {
 export interface PromptRun {
   code: boolean;
   parts: PromptPart[];
+}
+
+export type PromptWord = { space: string } | { parts: PromptPart[] };
+
+/**
+ * A code run's parts regrouped into words: whitespace between them, and each
+ * word the plain text and `<placeholders>` it's glued from (`[sandbox.` +
+ * `<sandbox name>` + `]` is one word). Rendered as unbreakable boxes, so a
+ * line wraps between words, not after `-` in `-C` or at a placeholder's edge.
+ */
+export function promptWords(parts: PromptPart[]): PromptWord[] {
+  const words: PromptWord[] = [];
+  let current: PromptPart[] = [];
+  const flush = () => {
+    if (current.length) words.push({ parts: current });
+    current = [];
+  };
+  for (const part of parts) {
+    if (part.placeholder) {
+      current.push(part);
+      continue;
+    }
+    for (const piece of part.text.split(/(\s+)/)) {
+      if (piece === '') continue;
+      if (/^\s+$/.test(piece)) {
+        flush();
+        words.push({ space: piece });
+      } else current.push({ text: piece, placeholder: false });
+    }
+  }
+  flush();
+  return words;
 }
 
 /** Backtick runs (odd ones are `code`), each split by `promptParts`. */

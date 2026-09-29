@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { extname, join, normalize, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { AstroIntegration } from 'astro';
@@ -11,6 +11,13 @@ import { close, createIndex } from 'pagefind';
  * `data-pagefind-ignore` sprinkled over every component that renders them.
  */
 export const EXCLUDE_SELECTORS = ['.code-head', '.agent-prompt-copy', '.heading-anchor', '.title-period'];
+
+/**
+ * Pagefind's stock UI bundles, which `writeFiles` always emits (no option to
+ * skip them). The site searches through `pagefind.js` (+ its worker, wasm and
+ * index) from its own dialog, so these are dead weight in `dist/`.
+ */
+export const STOCK_UI = /^pagefind-(?:ui|component-ui|modular-ui)\.(?:js|css)$|^pagefind-highlight\.js$/;
 
 const MIME: Record<string, string> = {
   '.js': 'text/javascript',
@@ -58,6 +65,8 @@ export function pagefind(): AstroIntegration {
         const written = await index.writeFiles({ outputPath: join(site, 'pagefind') });
         if (written.errors.length) throw new Error(`pagefind: ${written.errors.join('; ')}`);
         await close();
+        const bundle = join(site, 'pagefind');
+        for (const f of readdirSync(bundle)) if (STOCK_UI.test(f)) rmSync(join(bundle, f));
         logger.info(`indexed ${added.page_count} pages`);
       },
     },

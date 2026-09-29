@@ -1,0 +1,44 @@
+---
+import { ArrowRight, BookOpen, House, LayoutGrid, Search } from '@lucide/astro';
+import Base from '../layouts/Base.astro';
+import '../styles/not-found.css';
+
+const links = [
+  { href: '/docs/quick-start', label: 'Quick start', hint: 'A first sandbox in a few commands', icon: BookOpen },
+  { href: '/examples', label: 'Examples', hint: 'Complete configs for real setups', icon: LayoutGrid },
+  { href: '/', label: 'Home', hint: 'What devsandboxes is', icon: House },
+];
+---
+
+<Base title="Page not found" description="This page doesn't exist. Search the docs or start from the quick start or the examples.">
+  <main id="main-content" class="not-found" tabindex="-1">
+    <div class="not-found-grid" aria-hidden="true"></div>
+    <div class="not-found-inner">
+      <p class="not-found-kicker"><span>// ERROR · NOT FOUND</span></p>
+      <p class="not-found-code" aria-hidden="true">404<span class="not-found-cursor">_</span></p>
+      <h1>This page doesn't exist<span class="title-period" aria-hidden="true">.</span></h1>
+      <p class="not-found-lead">It may have moved, or the link is wrong. Search the docs, or pick up from one of these.</p>
+      <button type="button" class="not-found-search" data-search-open aria-label="Search documentation">
+        <Search size={17} aria-hidden="true" />
+        <span>Search docs...</span>
+        <kbd aria-hidden="true">/</kbd>
+      </button>
+      <ul class="not-found-links">
+        {
+          links.map((l) => (
+            <li>
+              <a href={l.href}>
+                <l.icon size={17} aria-hidden="true" />
+                <span>
+                  <strong>{l.label}</strong>
+                  <small>{l.hint}</small>
+                </span>
+                <ArrowRight class="not-found-arrow" size={15} aria-hidden="true" />
+              </a>
+            </li>
+          ))
+        }
+      </ul>
+    </div>
+  </main>
+</Base>

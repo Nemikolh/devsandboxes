@@ -57,7 +57,9 @@
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  padding: 0 11px;
+  /* Vertical room for titles that wrap in the narrower sidebars. */
+  padding: 7px 11px;
+  line-height: 1.35;
   border-radius: 4px;
   font-size: 12px;
   font-weight: 600;
@@ -200,7 +202,7 @@
   padding-top: 25px;
 }
 
-/* Provenance line under generated pages (config reference). */
+/* Provenance line closing every docs page: source file + GitHub link. */
 .prose .article-source {
   display: flex;
   flex-wrap: wrap;
@@ -217,6 +219,12 @@
   align-items: center;
   gap: 4px;
   margin-left: auto;
+}
+
+@media (max-width: 700px) {
+  .prose .article-source a {
+    margin-left: 0;
+  }
 }
 
 /* ----------------------------------------------------------------- Prose */

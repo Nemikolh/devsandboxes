@@ -26,7 +26,7 @@ const items = Astro.props.headings.filter((h) => h.depth === 2 || h.depth === 3)
     }
     <div class="toc-rule"></div>
     <a class="toc-external" href={REPO_URL} target="_blank" rel="noopener noreferrer">
-      View on GitHub <ExternalLink size={13} aria-hidden="true" />
+      View on GitHub <ExternalLink size={13} aria-hidden="true" /><span class="visually-hidden">(opens in a new tab)</span>
     </a>
   </div>
 </aside>

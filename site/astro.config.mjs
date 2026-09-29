@@ -27,5 +27,18 @@ export default defineConfig({
     define: {
       __DEVSANDBOX_VERSION__: JSON.stringify(version),
     },
+    build: {
+      rolldownOptions: {
+        onwarn(warning, warn) {
+          // Astro's content-assets plugin prefixes every MDX entry's
+          // `?astroPropagatedAssets` module with a `"use astro:head-inject"`
+          // marker that Astro reads itself; rolldown warns that bundling may
+          // drop it, once per MDX file. Upstream and harmless, so drop exactly
+          // that warning.
+          if (warning.code === 'MODULE_LEVEL_DIRECTIVE' && warning.message.includes('"use astro:head-inject"')) return;
+          warn(warning);
+        },
+      },
+    },
   },
 });

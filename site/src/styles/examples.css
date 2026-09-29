@@ -145,19 +145,53 @@
   margin-right: 1px;
 }
 
-.examples-footnote {
-  margin: 44px 0 0;
-  font-size: 13px;
-  color: #8ea3a2;
+/* The grid's last cell: a dashed call-out, not another recipe card. */
+.examples-closing {
+  grid-column: span var(--span-3, 1);
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 12px;
+  padding: 30px 34px;
+  border: 1px dashed #3c5053;
+  background:
+    linear-gradient(#b3ffff08 1px, transparent 1px) 0 0 / 32px 32px,
+    linear-gradient(90deg, #b3ffff08 1px, transparent 1px) 0 0 / 32px 32px,
+    #10181a;
 }
 
-.examples-footnote a {
-  color: var(--lime-soft);
-  font-weight: 700;
-}
-
-.examples-footnote a:hover {
+.examples-closing-kicker {
+  margin: 0;
+  font: 10px var(--font-mono);
+  letter-spacing: 0.14em;
   color: var(--lime);
+}
+
+.examples-closing h2 {
+  margin: 0;
+  font: 600 28px var(--font-heading);
+  letter-spacing: -0.04em;
+  color: var(--text);
+}
+
+.examples-closing p:not(.examples-closing-kicker) {
+  margin: 0;
+  max-width: 520px;
+  font-size: 14px;
+  line-height: 1.6;
+  color: #9fb2b1;
+}
+
+.examples-closing-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.examples-list .pager {
+  margin-top: 56px;
 }
 
 @media (max-width: 1180px) {
@@ -186,6 +220,10 @@
   .examples-grid {
     grid-template-columns: repeat(2, 1fr);
   }
+
+  .examples-closing {
+    grid-column: span var(--span-2, 1);
+  }
 }
 
 @media (max-width: 700px) {
@@ -213,6 +251,15 @@
   .examples-grid {
     grid-template-columns: 1fr;
     margin-top: 34px;
+  }
+
+  .examples-closing {
+    grid-column: auto;
+    padding: 26px 23px;
+  }
+
+  .examples-list .pager {
+    margin-top: 40px;
   }
 
   .example-index-card h2 {
@@ -367,12 +414,22 @@
   border-color: #2a3c3f;
 }
 
+/* Code in prompts wraps between words only (see `promptWords`); a word longer
+   than the line still splits rather than overflow. */
+.agent-prompt .prompt-word {
+  display: inline-block;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
 .agent-prompt mark {
   font: 500 0.9em var(--font-mono);
   color: #0f1a12;
   background: #b8f58a;
   border-radius: var(--radius-sm);
   padding: 0 4px;
+  /* `<config dir>` is one placeholder, never two lines. */
+  white-space: nowrap;
   box-decoration-break: clone;
   -webkit-box-decoration-break: clone;
 }
@@ -521,35 +578,11 @@
   translate: 2px -2px;
 }
 
-.example-pager {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 12px;
-}
-
-.example-related + .example-pager {
+.example-related + .pager {
   margin-top: 40px;
 }
 
-.example-pager-next {
-  grid-column: 2;
-  text-align: right;
-  align-items: flex-end;
-}
-
-.example-pager-prev > span {
-  color: #9fcfcf;
-}
-
 @media (max-width: 700px) {
-  .example-pager {
-    grid-template-columns: 1fr;
-  }
-
-  .example-pager-next {
-    grid-column: auto;
-  }
-
   .article-topline {
     flex-wrap: wrap;
     gap: 12px;

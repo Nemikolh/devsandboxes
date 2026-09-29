@@ -1,8 +1,6 @@
 ---
-import { ArrowUpRight } from '@lucide/astro';
 import { getCollection, render } from 'astro:content';
 import Docs from '../../layouts/Docs.astro';
-import { REPO_URL } from '../../lib/nav';
 
 // Rendered from the agent skill (the `spec` collection); its frontmatter
 // `description` is written for agents, so the lead here is site-owned.
@@ -18,17 +16,7 @@ const { Content, headings } = await render(entry);
   description="Every config.toml field, merge rule and variable: templates, sandboxes, services, and which devcontainer properties devsandbox implements."
   eyebrow="REFERENCE"
   headings={headings}
-  next={{
-    href: '/docs/node-api',
-    title: 'Node API',
-    description: 'Drive devsandbox from TypeScript with the typed devsandboxes package.',
-  }}
+  source={{ path: SOURCE_PATH, action: 'edit' }}
 >
   <Content />
-  <p class="article-source">
-    Source: <code>{SOURCE_PATH}</code>
-    <a href={`${REPO_URL}/blob/main/${SOURCE_PATH}`} target="_blank" rel="noopener noreferrer">
-      Edit on GitHub<ArrowUpRight size={13} aria-hidden="true" /><span class="visually-hidden">(opens in a new tab)</span>
-    </a>
-  </p>
 </Docs>

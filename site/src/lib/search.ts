@@ -1,17 +1,10 @@
 // Pure pieces of the search dialog: section badges, the "before typing" page
 // list, keyboard decisions and Pagefind result shaping. No DOM, no Pagefind
-// import, so vitest loads it and the client script stays thin. (Not importing
-// `nav.ts` either: it reads a Vite `define` that vitest doesn't set.)
+// import, so vitest loads it and the client script stays thin.
 
-const normalizePath = (path: string) => (path.length > 1 ? path.replace(/\/+$/, '') : path);
+import { normalizePath, REFERENCE_PAGES } from './nav';
 
 export type SearchSection = 'HOME' | 'DOCS' | 'REFERENCE' | 'EXAMPLES';
-
-/** Generated reference pages; their sidebar group is REFERENCE. */
-export const REFERENCE_PAGES = [
-  { href: '/docs/config', title: 'Configuration', description: 'Every config.toml field, merge rule and variable.' },
-  { href: '/docs/node-api', title: 'Node API', description: 'Drive devsandbox from TypeScript with the typed devsandboxes package.' },
-];
 
 /** Section badge (`data-pagefind-meta="section:…"`) of the page at `path`. */
 export function searchSection(path: string): SearchSection {

@@ -1,11 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import {
   buildAgentPrompt,
-  exampleNeighbors,
   exampleNumber,
   type ExampleMeta,
   promptParts,
   promptRuns,
+  promptWords,
   resolveRelated,
   sortExamples,
 } from './examples';
@@ -23,17 +23,10 @@ describe('sortExamples', () => {
   });
 });
 
-describe('exampleNumber / exampleNeighbors', () => {
+describe('exampleNumber', () => {
   it('pads the 1-based position', () => {
     expect(exampleNumber(0)).toBe('01');
     expect(exampleNumber(11)).toBe('12');
-  });
-
-  it('has no prev on the first and no next on the last', () => {
-    const list = ['a', 'b', 'c'];
-    expect(exampleNeighbors(list, 0)).toEqual({ prev: undefined, next: 'b' });
-    expect(exampleNeighbors(list, 1)).toEqual({ prev: 'a', next: 'c' });
-    expect(exampleNeighbors(list, 2)).toEqual({ prev: 'b', next: undefined });
   });
 });
 
@@ -98,5 +91,24 @@ describe('promptRuns', () => {
       { code: false, parts: [{ text: ' now', placeholder: false }] },
     ]);
     expect(promptRuns('`a`')).toEqual([{ code: true, parts: [{ text: 'a', placeholder: false }] }]);
+  });
+});
+
+describe('promptWords', () => {
+  const p = (text: string, placeholder = false) => ({ text, placeholder });
+
+  it('splits on whitespace and glues placeholders to adjacent text', () => {
+    expect(promptWords([p('devsandbox -C '), p('<config dir>', true), p(' ls')])).toEqual([
+      { parts: [p('devsandbox')] },
+      { space: ' ' },
+      { parts: [p('-C')] },
+      { space: ' ' },
+      { parts: [p('<config dir>', true)] },
+      { space: ' ' },
+      { parts: [p('ls')] },
+    ]);
+    expect(promptWords([p('[sandbox.'), p('<sandbox name>', true), p(']')])).toEqual([
+      { parts: [p('[sandbox.'), p('<sandbox name>', true), p(']')] },
+    ]);
   });
 });

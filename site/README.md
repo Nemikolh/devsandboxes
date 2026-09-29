@@ -6,9 +6,12 @@ Standalone pnpm project (Node >= 22.12), not part of the Cargo workspace.
 ```sh
 pnpm i
 pnpm dev        # http://localhost:4321, live reload
-pnpm build      # static output in dist/
+pnpm build      # static output in dist/, then the internal link check
 pnpm preview    # serve dist/
 pnpm check      # astro check (types + .astro diagnostics)
+pnpm test       # vitest over the pure helpers in src/lib/
+pnpm check:links  # scripts/check-links.mjs alone: every href="/…" / "#…" in
+                  # dist/ must hit a built page and an existing id
 ```
 
 ## Layout
@@ -16,7 +19,7 @@ pnpm check      # astro check (types + .astro diagnostics)
 - `src/pages/` — routes. `src/layouts/` — `Base.astro` (head, header,
   footer, mobile drawer) and `Docs.astro` (sidebar / article / TOC shell).
 - `src/components/` — header, sidebar, TOC, code block, callout, resource
-  link, next-page card, mobile drawer, accessible `Tabs` (panels are named
+  link, prev/next `Pager` (reading order from `nav.ts`), mobile drawer, accessible `Tabs` (panels are named
   slots), `InstallTabs` (install commands built from the Cargo.toml version).
 - `src/styles/` — plain CSS: `tokens.css` (palette, fonts, radii), `base.css`,
   `components.css`, `home.css`, `docs.css`. No Tailwind.
@@ -27,13 +30,17 @@ pnpm check      # astro check (types + .astro diagnostics)
     the language; copy button). Applies to `.md`, `.mdx` and `CodeBlock.astro`.
   - `heading-anchors.ts` — Sätteri (Astro's Markdown pipeline) plugins for
     heading ids + `#` permalinks and scrollable table wrappers.
-  - `nav.ts` — header nav and sidebar groups.
+  - `nav.ts` — header nav, sidebar groups, and the reading order behind
+    every prev/next pager (docs → references → examples index → examples).
   - `pagefind-integration.ts` — builds the Pagefind index over `dist/` after
     `astro build`; `pnpm dev` serves the last build's `dist/pagefind/`, so
     search in dev needs one `pnpm build` first.
   - `search.ts` — pure helpers of the search dialog (`Search.astro` +
     `scripts/search.ts`). Indexed regions are marked `data-pagefind-body`
     in the layouts; chrome inside them is excluded in the integration.
+- `public/og.png` — the 1200×630 social card every page's `og:image` points
+  at. A committed PNG (rendered once from HTML in the brand style); re-render
+  it by hand if the brand changes.
 - The header version chip is the `[package] version` of `../Cargo.toml`, read
   in `astro.config.mjs` at build time.
 

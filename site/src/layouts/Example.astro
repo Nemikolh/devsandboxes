@@ -1,11 +1,11 @@
 ---
 // Every example page: the docs shell with an `EXAMPLE 0N` eyebrow and tags on
-// top, and related examples + prev/next among examples at the bottom. The MDX
+// top, and related examples above the reading-order pager at the bottom. The MDX
 // body supplies the sections (problem, config, try it, how it works, agent
 // prompt); everything around them comes from the frontmatter.
 import type { MarkdownHeading } from 'astro';
 import type { CollectionEntry } from 'astro:content';
-import { ArrowLeft, ArrowRight, ArrowUpRight } from '@lucide/astro';
+import { ArrowUpRight } from '@lucide/astro';
 import ExampleIcon from '../components/ExampleIcon.astro';
 import '../styles/examples.css';
 import Docs from './Docs.astro';
@@ -18,11 +18,9 @@ interface Props {
   number: string;
   headings: MarkdownHeading[];
   related: Example[];
-  prev?: Example;
-  next?: Example;
 }
 
-const { entry, number, headings, related, prev, next } = Astro.props;
+const { entry, number, headings, related } = Astro.props;
 const RELATED_ID = 'related-examples';
 const toc = related.length ? [...headings, { depth: 2, slug: RELATED_ID, text: 'Related examples' }] : headings;
 ---
@@ -33,6 +31,7 @@ const toc = related.length ? [...headings, { depth: 2, slug: RELATED_ID, text: '
   eyebrow={`EXAMPLE ${number}`}
   headings={toc}
   section={{ label: 'Examples', href: '/examples' }}
+  source={{ path: `site/${entry.filePath}`, action: 'edit' }}
 >
   <ul class="example-page-tags" slot="topline" aria-label="Tags">
     {entry.data.tags.map((t) => <li>{t}</li>)}
@@ -60,37 +59,5 @@ const toc = related.length ? [...headings, { depth: 2, slug: RELATED_ID, text: '
         </section>
       )
     }
-    <nav class="example-pager" aria-label="More examples">
-      {
-        prev ? (
-          <a class="next-page example-pager-prev" href={`/examples/${prev.id}`} rel="prev">
-            <span>
-              <ArrowLeft size={13} aria-hidden="true" /> PREVIOUS EXAMPLE
-            </span>
-            <strong>{prev.data.title}</strong>
-            <small>{prev.data.description}</small>
-          </a>
-        ) : (
-          <a class="next-page example-pager-prev" href="/examples">
-            <span>
-              <ArrowLeft size={13} aria-hidden="true" /> ALL EXAMPLES
-            </span>
-            <strong>Examples</strong>
-            <small>Every recipe on one page.</small>
-          </a>
-        )
-      }
-      {
-        next && (
-          <a class="next-page example-pager-next" href={`/examples/${next.id}`} rel="next">
-            <span>
-              NEXT EXAMPLE <ArrowRight size={13} aria-hidden="true" />
-            </span>
-            <strong>{next.data.title}</strong>
-            <small>{next.data.description}</small>
-          </a>
-        )
-      }
-    </nav>
   </Fragment>
 </Docs>

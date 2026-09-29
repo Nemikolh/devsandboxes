@@ -1,0 +1,44 @@
+---
+// Prev/next cards for the current page, from the one reading order in
+// `nav.ts` (docs → references → examples index → examples).
+import { getCollection } from 'astro:content';
+import { ArrowLeft, ArrowRight } from '@lucide/astro';
+import { sortExamples } from '../lib/examples';
+import { pagerKicker, readingNeighbors, readingOrder } from '../lib/nav';
+
+const docs = (await getCollection('docs'))
+  .sort((a, b) => a.data.order - b.data.order)
+  .map((e) => ({ href: `/docs/${e.id}`, title: e.data.title, description: e.data.description, kind: 'docs' as const }));
+const examples = sortExamples(await getCollection('examples')).map((e) => ({
+  href: `/examples/${e.id}`,
+  title: e.data.title,
+  description: e.data.description,
+  kind: 'example' as const,
+}));
+const { prev, next } = readingNeighbors(readingOrder(docs, examples), Astro.url.pathname);
+---
+
+{
+  (prev || next) && (
+    <nav class="pager" aria-label="Previous and next page">
+      {prev && (
+        <a class="next-page pager-prev" href={prev.href} rel="prev">
+          <span>
+            <ArrowLeft size={13} aria-hidden="true" /> {pagerKicker(prev, 'prev')}
+          </span>
+          <strong>{prev.title}</strong>
+          <small>{prev.description}</small>
+        </a>
+      )}
+      {next && (
+        <a class="next-page pager-next" href={next.href} rel="next">
+          <span>
+            {pagerKicker(next, 'next')} <ArrowRight size={13} aria-hidden="true" />
+          </span>
+          <strong>{next.title}</strong>
+          <small>{next.description}</small>
+        </a>
+      )}
+    </nav>
+  )
+}

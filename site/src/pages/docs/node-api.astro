@@ -1,6 +1,5 @@
 ---
 import type { MarkdownHeading } from 'astro';
-import { ArrowUpRight } from '@lucide/astro';
 import ApiFunction from '../../components/api/ApiFunction.astro';
 import ApiHeading from '../../components/api/ApiHeading.astro';
 import ApiTable from '../../components/api/ApiTable.astro';
@@ -27,7 +26,6 @@ import {
 } from '../../lib/api';
 import { highlightTs } from '../../lib/api-highlight';
 import { parseDts, type Decl, type Signature } from '../../lib/dts';
-import { REPO_URL } from '../../lib/nav';
 import '../../styles/api.css';
 // `?raw` resolves relative to this file in dev and build alike, and the dev
 // server reloads the page when the typings or the README change.
@@ -152,11 +150,7 @@ const unwrapP = (html: string) => html.replace(/^<p>|<\/p>$/g, '');
   description="The devsandboxes npm package: the native devsandbox binary plus a typed, promise-based API over its JSON output. Generated from the package's index.d.ts."
   eyebrow="REFERENCE"
   headings={headings}
-  next={{
-    href: '/examples',
-    title: 'Examples',
-    description: 'Complete configs for real setups: parallel agents, shared services, caches and more.',
-  }}
+  source={{ path: SOURCE_PATH, action: 'view' }}
 >
   <h2 id="install"><a class="heading-anchor" href="#install" aria-label="Link to section: Install"></a>Install</h2>
   <p>The package ships the <code>devsandbox</code> binary for your platform next to the typed API, so one dependency covers both.</p>
@@ -319,11 +313,4 @@ const unwrapP = (html: string) => html.replace(/^<p>|<\/p>$/g, '');
       </section>
     ))
   }
-
-  <p class="article-source">
-    Source: <code>{SOURCE_PATH}</code>
-    <a href={`${REPO_URL}/blob/main/${SOURCE_PATH}`} target="_blank" rel="noopener noreferrer">
-      View on GitHub<ArrowUpRight size={13} aria-hidden="true" /><span class="visually-hidden">(opens in a new tab)</span>
-    </a>
-  </p>
 </Docs>

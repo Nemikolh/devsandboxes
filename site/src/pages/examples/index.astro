@@ -1,7 +1,8 @@
 ---
 import { getCollection } from 'astro:content';
-import { ArrowUpRight, Bot, FileCode, FlaskConical, Workflow } from '@lucide/astro';
+import { ArrowRight, ArrowUpRight, Bot, FileCode, FlaskConical, Workflow } from '@lucide/astro';
 import ExampleIcon from '../../components/ExampleIcon.astro';
+import Pager from '../../components/Pager.astro';
 import Base from '../../layouts/Base.astro';
 import { exampleNumber, sortExamples } from '../../lib/examples';
 import { searchSection } from '../../lib/search';
@@ -9,6 +10,10 @@ import '../../styles/examples.css';
 
 const examples = sortExamples(await getCollection('examples'));
 const total = exampleNumber(examples.length - 1);
+// The closing card takes whatever the last row leaves open (a full row when
+// the cards divide evenly), at both the 3- and 2-column layouts.
+const open = (cols: number) => cols - (examples.length % cols);
+const closingSpans = `--span-3: ${open(3)}; --span-2: ${open(2)}`;
 
 // What every example page contains, in page order.
 const anatomy = [
@@ -77,11 +82,26 @@ const anatomy = [
             </a>
           ))
         }
+        {/* Closes the grid: spans the columns the last row leaves open. */}
+        <aside class="examples-closing" aria-labelledby="examples-closing-title" style={closingSpans}>
+          <p class="examples-closing-kicker">// NEXT STEPS</p>
+          <h2 id="examples-closing-title">
+            New to devsandboxes<span class="title-period">?</span>
+          </h2>
+          <p>
+            The quick start gets a first sandbox running; the configuration reference has every field these recipes use.
+          </p>
+          <div class="examples-closing-actions">
+            <a class="button-primary" href="/docs/quick-start">
+              Quick start <ArrowRight size={16} aria-hidden="true" />
+            </a>
+            <a class="button-secondary" href="/docs/config">
+              Configuration reference
+            </a>
+          </div>
+        </aside>
       </div>
-      <p class="examples-footnote">
-        New to devsandboxes? The <a href="/docs/quick-start">quick start</a> gets a first sandbox running; the{' '}
-        <a href="/docs/config">configuration reference</a> has every field these recipes use.
-      </p>
+      <Pager />
     </section>
   </main>
 </Base>

@@ -1,9 +1,10 @@
 ---
 import type { MarkdownHeading } from 'astro';
-import { ChevronRight } from '@lucide/astro';
-import NextPage, { type NextLink } from '../components/NextPage.astro';
+import { ArrowUpRight, ChevronRight } from '@lucide/astro';
+import Pager from '../components/Pager.astro';
 import Sidebar from '../components/Sidebar.astro';
 import Toc from '../components/Toc.astro';
+import { sourceUrl } from '../lib/nav';
 import { searchSection } from '../lib/search';
 import '../styles/docs.css';
 import Base from './Base.astro';
@@ -13,12 +14,16 @@ export interface Props {
   description: string;
   eyebrow: string;
   headings: MarkdownHeading[];
-  next?: NextLink;
+  /**
+   * Repo-relative file the page comes from. `edit` for hand-written pages;
+   * `view` for generated ones, where the file isn't the page's text.
+   */
+  source: { path: string; action: 'edit' | 'view' };
   /** Breadcrumb section; defaults to Docs. */
   section?: { label: string; href: string };
 }
 
-const { title, description, eyebrow, headings, next, section = { label: 'Docs', href: '/docs/quick-start' } } = Astro.props;
+const { title, description, eyebrow, headings, source, section = { label: 'Docs', href: '/docs/quick-start' } } = Astro.props;
 // Search indexes the main column minus the breadcrumb, the eyebrow/tags line
 // (excerpt noise) and the bottom cards (other pages' titles would match there).
 ---
@@ -45,21 +50,19 @@ const { title, description, eyebrow, headings, next, section = { label: 'Docs', 
       <hr class="article-divider" />
       <article class="prose">
         <slot />
+        <p class="article-source" data-pagefind-ignore>
+          <span>Source: <code>{source.path}</code></span>
+          <a href={sourceUrl(source.path, source.action)} target="_blank" rel="noopener noreferrer">
+            {source.action === 'edit' ? 'Edit this page on GitHub' : 'View source on GitHub'}
+            <ArrowUpRight size={13} aria-hidden="true" /><span class="visually-hidden">(opens in a new tab)</span>
+          </a>
+        </p>
       </article>
-      {/* A `bottom` slot (examples: related + prev/next) replaces the lone next card. */}
-      {
-        Astro.slots.has('bottom') ? (
-          <div class="article-bottom" data-pagefind-ignore>
-            <slot name="bottom" />
-          </div>
-        ) : (
-          next && (
-            <div class="article-bottom" data-pagefind-ignore>
-              <NextPage {...next} />
-            </div>
-          )
-        )
-      }
+      {/* Examples put related cards above the pager through the `bottom` slot. */}
+      <div class="article-bottom" data-pagefind-ignore>
+        <slot name="bottom" />
+        <Pager />
+      </div>
     </main>
     <Toc headings={headings} />
   </div>
