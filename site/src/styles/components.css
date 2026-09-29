@@ -419,6 +419,132 @@
   margin: 0 0 8px;
 }
 
+/* ---------------------------------------------------------- Coding agent */
+
+/* Only the picked agent's variants show (one rule per agent in src/lib/agents.ts). */
+html[data-agent='claude'] [data-agent-only]:not([data-agent-only='claude']),
+html[data-agent='codex'] [data-agent-only]:not([data-agent-only='codex']) {
+  display: none !important;
+}
+
+[data-agent-tint='claude'] {
+  --agent-color: var(--agent-claude);
+}
+
+[data-agent-tint='codex'] {
+  --agent-color: var(--agent-codex);
+}
+
+/* An agent word (prose, code, prompt): its colour, dotted underline on hover, click to switch. */
+.agent-ref {
+  display: inline;
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  color: var(--agent-color);
+  cursor: pointer;
+  text-decoration: underline dotted transparent;
+  text-decoration-thickness: 1.5px;
+  text-underline-offset: 3px;
+  transition: text-decoration-color 0.15s;
+}
+
+.agent-ref > span {
+  color: var(--agent-color);
+}
+
+.agent-ref:hover,
+.agent-ref:focus-visible,
+.agent-ref[aria-expanded='true'] {
+  text-decoration-color: currentColor;
+}
+
+.agent-dot {
+  width: 8px;
+  height: 8px;
+  flex-shrink: 0;
+  border-radius: 50%;
+  background: var(--agent-color);
+}
+
+.agent-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin: 4px 0 8px;
+  padding: 6px 10px 6px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--border-strong);
+  background: var(--surface-raised);
+  color: var(--text-subtle);
+  font: inherit;
+  font-size: 14px;
+  cursor: pointer;
+  transition: border-color 0.15s;
+}
+
+.agent-chip:hover,
+.agent-chip[aria-expanded='true'] {
+  border-color: var(--text-faint);
+}
+
+.agent-chip-label {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.agent-chip-name {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--agent-color);
+  font-weight: 600;
+}
+
+.agent-menu {
+  position: absolute;
+  z-index: 60;
+  min-width: 170px;
+  padding: 5px;
+  display: flex;
+  flex-direction: column;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-strong);
+  background: var(--surface-raised);
+  box-shadow: 0 14px 40px -12px #000c;
+}
+
+.agent-menu[hidden] {
+  display: none;
+}
+
+.agent-menu [role='menuitemradio'] {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: var(--radius);
+  background: none;
+  color: var(--text);
+  font: inherit;
+  font-size: 14px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.agent-menu [role='menuitemradio']:hover,
+.agent-menu [role='menuitemradio']:focus-visible {
+  background: var(--surface-hover);
+}
+
+.agent-menu [aria-checked='true'] {
+  color: var(--agent-color);
+  font-weight: 600;
+}
+
 /* ------------------------------------------------------------------ Tabs */
 
 .tabs {

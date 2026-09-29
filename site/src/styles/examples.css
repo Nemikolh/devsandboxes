@@ -279,6 +279,49 @@
 
 /* ----------------------------------------------------------- Agent prompt */
 
+.agent-prompt-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin: 4px 0 8px;
+  padding: 8px 14px;
+  border-radius: 999px;
+  border: 1px solid #3d5f45;
+  background: #1c3325;
+  color: var(--lime);
+  font-weight: 500;
+  text-decoration: none;
+  transition:
+    background 0.15s,
+    border-color 0.15s;
+}
+
+.agent-prompt-link:hover {
+  background: #22402d;
+  border-color: var(--lime);
+  color: var(--lime-hover);
+}
+
+/* Arriving from the link: the prompt pulses once so the eye lands on it. */
+:target + .agent-prompt {
+  animation: agent-prompt-pop 1.2s ease-out;
+}
+
+@keyframes agent-prompt-pop {
+  0%,
+  30% {
+    box-shadow:
+      0 0 0 4px #a9f36d55,
+      0 18px 50px -24px #a9f36d66;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :target + .agent-prompt {
+    animation: none;
+  }
+}
+
 .agent-prompt {
   position: relative;
   margin: 28px 0;

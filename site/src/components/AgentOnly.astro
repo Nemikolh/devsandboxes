@@ -1,0 +1,14 @@
+---
+// Content for one coding agent only, shown while the reader has it picked.
+// For code, prefer a fence with `agent="<id>"` in its meta.
+import { findAgent } from '../lib/agents';
+
+interface Props {
+  agent: string;
+}
+
+const { agent } = Astro.props;
+if (!findAgent(agent)) throw new Error(`AgentOnly: unknown agent "${agent}"`);
+---
+
+<div class="agent-only" data-agent-only={agent}><slot /></div>

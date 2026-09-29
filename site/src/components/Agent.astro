@@ -1,0 +1,17 @@
+---
+// The reader's coding agent, inline: its name (or `cmd` for the command) in
+// its colour; a click opens the agent picker. Every agent is rendered and CSS
+// shows the picked one, so it's right before any script runs.
+import { AGENTS } from '../lib/agents';
+
+interface Props {
+  /** The command (`claude`) instead of the product name (`Claude Code`). */
+  cmd?: boolean;
+}
+
+const { cmd = false } = Astro.props;
+---
+
+<button type="button" class:list={['agent-ref', { 'agent-ref-cmd': cmd }]} data-agent-menu aria-haspopup="menu" title="Switch coding agent"
+  >{AGENTS.map((a) => <span data-agent-only={a.id} data-agent-tint={a.id}>{cmd ? a.cmd : a.name}</span>)}</button
+>

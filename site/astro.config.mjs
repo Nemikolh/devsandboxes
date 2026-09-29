@@ -5,6 +5,7 @@ import { satteri } from '@astrojs/markdown-satteri';
 import sitemap from '@astrojs/sitemap';
 import { defineConfig } from 'astro/config';
 import { packageVersion } from './src/lib/cargo.ts';
+import { agentCode } from './src/lib/agent-code.ts';
 import { codeChrome } from './src/lib/code-chrome.ts';
 import { dropSkillTitle, headingAnchors, tableKeyWeight, tableScroll } from './src/lib/heading-anchors.ts';
 import { pagefind } from './src/lib/pagefind-integration.ts';
@@ -20,7 +21,7 @@ export default defineConfig({
     processor: satteri({ hastPlugins: [dropSkillTitle(), headingAnchors(), tableKeyWeight(), tableScroll()] }),
     shikiConfig: {
       theme: devsandboxesTheme,
-      transformers: [codeChrome()],
+      transformers: [codeChrome(), agentCode()],
     },
   },
   vite: {

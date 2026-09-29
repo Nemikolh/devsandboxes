@@ -4,10 +4,15 @@ import type { ShikiTransformer } from 'shiki';
 // Shells render as a terminal, like the prototype's default label.
 const TERMINAL_LANGS = new Set(['bash', 'sh', 'shell', 'zsh', 'console', 'shellscript']);
 
+/** `<key>="…"` (or `<key>='…'`) from a fence's meta string. */
+export function metaAttr(meta: string | undefined, key: string): string | undefined {
+  const m = meta?.match(new RegExp(`(?:^|\\s)${key}=(?:"([^"]*)"|'([^']*)')`));
+  return m ? (m[1] ?? m[2]) : undefined;
+}
+
 /** `title="…"` (or `title='…'`) from a fence's meta string. */
 export function parseTitle(meta: string | undefined): string | undefined {
-  const m = meta?.match(/(?:^|\s)title=(?:"([^"]*)"|'([^']*)')/);
-  return m ? (m[1] ?? m[2]) : undefined;
+  return metaAttr(meta, 'title');
 }
 
 /** Header label: the fence title verbatim, else the language uppercased. */
@@ -23,7 +28,7 @@ export function codeLabel(lang: string | undefined, meta: string | undefined): s
  * Shiki's `meta` is `{ __raw }`, but Astro's Sätteri pipeline passes the raw
  * fence string itself; accept both.
  */
-function rawMeta(meta: unknown): string | undefined {
+export function rawMeta(meta: unknown): string | undefined {
   if (typeof meta === 'string') return meta;
   if (meta && typeof meta === 'object' && '__raw' in meta) {
     const raw = (meta as { __raw?: unknown }).__raw;

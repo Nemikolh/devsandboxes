@@ -1,6 +1,6 @@
 ---
 title: Parallel coding agents
-description: Several coding agents on one repo, each with its own instance, git worktree and branch, so no two of them ever edit the same checkout.
+description: Several coding agents on one repo, fully isolated from one another.
 order: 1
 icon: git-branch
 tags: [agents, worktrees, git]
@@ -8,7 +8,10 @@ related: [babysit-pr, ssh-and-git-push, isolated-services]
 ---
 
 import AgentPrompt from '../../components/AgentPrompt.astro';
-import Callout from '../../components/Callout.astro';
+import AgentPromptLink from '../../components/AgentPromptLink.astro';
+import Agent from '../../components/Agent.astro';
+import AgentOnly from '../../components/AgentOnly.astro';
+import AgentPicker from '../../components/AgentPicker.astro';
 
 ## The problem
 
@@ -16,81 +19,96 @@ Two agents in one checkout trip over each other: one switches branch while the o
 
 That is what repeat instances do. The first `devsandbox run` of a sandbox mounts the repo itself; every further instance of the same repo gets its own **git worktree** under the config dir, on its own branch, in its own container. Gitignored files a fresh checkout lacks, like `.env`, are copied or linked in for you.
 
+<AgentPromptLink />
+
 ## Config
 
-```toml title="config.toml"
-[template.base]
-remoteUser = "root"
-caches = ["pnpm"]
-persist-shell-history = true
-[template.base.features]
-"ghcr.io/devcontainers/features/node:1" = { version = "lts" }
+<AgentPicker />
 
+```toml title="config.toml" agent="claude"
 [sandbox.app]
-extends = "base"
-folder = "../app"                      # the repo every agent works on
-image = "mcr.microsoft.com/devcontainers/base:ubuntu"
-worktree-branch = "agent/${instance}"  # default: sandbox/${instance}
-worktree-include = [".vscode/settings.json"]  # copied into each worktree
-worktree-link = [".env"]               # one .env, shared live by every instance
-postCreateCommand = "pnpm install"
+folder = "../app"          # your repo, next to this config dir
+image = "node:22"          # any image with the repo's toolchain
+caches = ["npm"]           # one npm cache for every instance
+worktree-link = [".env"]   # one .env, shared by every instance
+
+# Your Claude Code login and settings, from the host.
+mounts = ["source=${localEnv:HOME}/.claude,target=/root/.claude,type=bind"]
+containerEnv = { CLAUDE_CONFIG_DIR = "/root/.claude" }
+
+[sandbox.app.postCreateCommand]  # once, when an instance is created
+deps = "npm install"
+agent = "npm install -g @anthropic-ai/claude-code"
 ```
 
-`folder` is relative to the config dir, so this assumes `app/` sits next to it. `worktree-branch` names the branch each worktree instance starts on; `${instance}` is the instance name at creation.
+```toml title="config.toml" agent="codex"
+[sandbox.app]
+folder = "../app"          # your repo, next to this config dir
+image = "node:22"          # any image with the repo's toolchain
+caches = ["npm"]           # one npm cache for every instance
+worktree-link = [".env"]   # one .env, shared by every instance
+
+# Your Codex login and settings, from the host.
+mounts = ["source=${localEnv:HOME}/.codex,target=/root/.codex,type=bind"]
+
+[sandbox.app.postCreateCommand]  # once, when an instance is created
+deps = "npm install"
+agent = "npm install -g @openai/codex"
+```
+
+<AgentOnly agent="claude">
+
+On macOS <Agent /> keeps its login in the Keychain: run `/login` once in any instance.
+
+</AgentOnly>
 
 ## Try it
 
-From the config dir, start one instance per agent. `run` works in the background and prints only the instance name:
+One instance per task:
 
 ```bash
-devsandbox run app --name claude   # first instance: mounts ../app itself
-devsandbox run app --name codex    # worktree .worktrees/codex, branch agent/codex
-devsandbox run app --name fix-login --branch fix/login --base origin/develop
+devsandbox run app --name fix-login                                 # your checkout, ../app
+devsandbox run app --name add-profile-pic --branch feat/profile-pic  # its own worktree
 devsandbox ps
 ```
 
-- `--name` picks the instance name; without it you get `app`, then `app-2`, `app-3`…
-- `--branch` overrides `worktree-branch` for that instance. An existing local branch is checked out as is, one that only exists on `origin` becomes a local branch tracking it, anything else is created. A branch already checked out in another worktree is an error that says where.
-- `--base` is the start point of a new branch (default: the remote's default branch). It is ignored when the branch already exists.
+- `--name`: the instance name.
+- `--branch`: the branch name (default `sandbox/<name>`).
 
-Each agent then works through its own instance, or directly in its worktree on the host (`.worktrees/codex/` in the config dir):
+Start <Agent /> in each:
 
-```bash
-devsandbox exec codex pnpm test
-devsandbox exec -it codex zsh
+```bash agent="claude"
+devsandbox exec -it fix-login claude
+devsandbox exec -it add-profile-pic claude
 ```
 
-When an agent is done, push its branch (see [ssh and git push](/examples/ssh-and-git-push)) and remove the instance:
-
-```bash
-devsandbox rm codex
+```bash agent="codex"
+devsandbox exec -it fix-login codex
+devsandbox exec -it add-profile-pic codex
 ```
 
-`rm` deletes the container and the worktree. On a terminal it asks whether to delete the branch too, and only for a branch `run` created.
+When a task is done, push its branch ([ssh and git push](/examples/ssh-and-git-push)) and remove the instance, container and worktree:
+
+```bash
+devsandbox rm add-profile-pic
+```
 
 ## How it works
 
-- **When a worktree is made.** A new instance gets a worktree whenever some other instance, running or stopped, already mounts the repo. The two containers never share a working tree. The base repo's `.git` is mounted at its own host path, so git inside a worktree container works as usual.
-- **Branch naming.** [`worktree-branch`](/docs/config#devsandbox-extras) accepts [`${…}` variables](/docs/config#variables) and defaults to `sandbox/${instance}`; [`worktree-base`](/docs/config#devsandbox-extras) sets the default start point. `run --branch` / `--base` override both.
-- **Copied files.** A fresh worktree has no untracked files. A `.worktreeinclude` at the repo root (the convention Claude Code, Codex and others use) is always honored; `worktree-include` adds gitignore-style patterns from the config, applied after the file so `!pattern` can negate it. Only files git reports as ignored are copied, never overwriting, on `run` and again on every `rebuild` (not on `start`). Each worktree then owns its copy.
-- **Linked files.** `worktree-link` is for files every instance should see live, like `.env`. The base repo's file is moved to `shared-files/app/` in the config dir, each tree gets an absolute symlink to it, and that directory is mounted at its host path so the links resolve inside containers too, on every runtime. Tracked or non-ignored paths are skipped with a warning. The store is kept on `rm`.
-- **Arrays concatenate.** Put `worktree-include` / `worktree-link` in a template and every sandbox extending it inherits them, adding its own entries ([templates and `extends`](/docs/config#templates-and-extends)).
-
-<Callout variant="tip" title="Where the agent runs">
-  An agent can run on the host and drive its instance with `devsandbox exec` (the `devsandbox-cli` skill teaches it
-  exactly that), or run inside the container when the image has it installed. Either way it edits its own worktree.
-</Callout>
+- Worktrees live in `.worktrees/<name>` next to `config.toml`; `rm` deletes them with the container.
+- [`worktree-link`](/docs/config#devsandbox-extras) symlinks one shared copy into each worktree; `worktree-include` or a `.worktreeinclude` copies instead.
+- <Agent />'s config dir is mounted from the host: one login for every instance.
 
 ## Agent instructions
 
 <AgentPrompt
-  goal="Set up devsandbox so several coding agents can work on my repo at <repo path> in parallel, each in its own sandbox instance on its own git worktree and branch."
+  goal="Set up devsandbox so several <agent> sessions can work on my repo at <repo path> in parallel, each in its own sandbox instance on its own git worktree and branch."
   steps={[
-    'In config.toml, add a `[sandbox.<sandbox name>]` whose `folder` points at <repo path> (relative to the config dir), with an `image` or `build` that has the toolchain the repo needs, and `worktree-branch = "agent/${instance}"`. Reuse an existing template through `extends` if there is one.',
-    'Find the gitignored files the repo needs to run (.env, local settings). Put files every agent should share live in `worktree-link` and files each worktree should get its own copy of in `worktree-include`, or suggest a `.worktreeinclude` for the repo. Only gitignored, untracked paths qualify.',
+    'In config.toml, add a `[sandbox.<sandbox name>]` whose `folder` points at <repo path> (relative to the config dir), with an `image` that has the toolchain the repo needs. Install <agent> in `postCreateCommand` and mount its host config dir (its login) into the container.',
+    'Put gitignored files every instance needs, like .env, in `worktree-link`.',
   ]}
   verify={[
-    'Start one instance per agent with `devsandbox -C <config dir> run <sandbox name> --name <agent>` for each of <agent names>. The first one uses the repo checkout; the others get worktrees under <config dir>/.worktrees/.',
-    'Check `devsandbox -C <config dir> ps`, then `devsandbox -C <config dir> exec <agent> git status` in each instance to confirm every agent is on its own branch.',
+    'Start one instance per task with `devsandbox -C <config dir> run <sandbox name> --name <task>` for each of <task names>.',
+    'Check `devsandbox -C <config dir> exec <task> git status` in each instance shows its own branch, and `devsandbox -C <config dir> exec <task> <agent> --version` works.',
   ]}
 />

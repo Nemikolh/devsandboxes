@@ -15,6 +15,7 @@ import Footer from '../components/Footer.astro';
 import Header from '../components/Header.astro';
 import MobileDrawer from '../components/MobileDrawer.astro';
 import Search from '../components/Search.astro';
+import { AGENT_STORAGE_KEY, AGENTS, DEFAULT_AGENT } from '../lib/agents';
 
 export interface Props {
   title: string;
@@ -33,8 +34,15 @@ const OG_IMAGE_ALT = 'devsandboxes, devcontainers for AI agents: Let agents loos
 ---
 
 <!doctype html>
-<html lang="en">
+<html lang="en" data-agent={DEFAULT_AGENT.id}>
   <head>
+    <!-- Before first paint, so the reader's agent shows without a flash of the default. -->
+    <script is:inline define:vars={{ key: AGENT_STORAGE_KEY, ids: AGENTS.map((a) => a.id) }}>
+      try {
+        const saved = localStorage.getItem(key);
+        if (ids.includes(saved)) document.documentElement.dataset.agent = saved;
+      } catch {}
+    </script>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>{pageTitle}</title>
@@ -71,6 +79,7 @@ const OG_IMAGE_ALT = 'devsandboxes, devcontainers for AI agents: Let agents loos
     <Search />
     <script>
       import '../scripts/copy-code';
+      import '../scripts/agent-picker';
     </script>
   </body>
 </html>

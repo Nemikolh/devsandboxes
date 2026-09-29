@@ -1,12 +1,17 @@
 ---
 // One line of agent-prompt text: `code` runs and highlighted `<placeholders>`.
-import { promptRuns, promptWords } from '../lib/examples';
+// `<agent>` is the reader's picked agent (command in code, name in prose),
+// filled in on copy.
+import { AGENT_PLACEHOLDER } from '../lib/agents';
+import { promptRuns, promptWords, type PromptPart } from '../lib/examples';
+import Agent from './Agent.astro';
 
 interface Props {
   text: string;
 }
 
 const runs = promptRuns(Astro.props.text);
+const isAgent = (p: PromptPart) => p.placeholder && p.text === AGENT_PLACEHOLDER;
 ---
 
 {
@@ -17,12 +22,12 @@ const runs = promptRuns(Astro.props.text);
           'space' in w ? (
             w.space
           ) : (
-            <span class="prompt-word">{w.parts.map((p) => (p.placeholder ? <mark>{p.text}</mark> : p.text))}</span>
+            <span class="prompt-word">{w.parts.map((p) => (isAgent(p) ? <Agent cmd /> : p.placeholder ? <mark>{p.text}</mark> : p.text))}</span>
           ),
         )}
       </code>
     ) : (
-      run.parts.map((p) => (p.placeholder ? <mark>{p.text}</mark> : p.text))
+      run.parts.map((p) => (isAgent(p) ? <Agent /> : p.placeholder ? <mark>{p.text}</mark> : p.text))
     ),
   )
 }

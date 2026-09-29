@@ -29,6 +29,10 @@
   --cyan-deep: #70d5db;
   --focus: #62dbe7;
 
+  /* Coding agents (src/lib/agents.ts) */
+  --agent-claude: #d97757;
+  --agent-codex: #8b9cff;
+
   /* Code (mirrors src/lib/shiki-theme.ts) */
   --code-base: #c9e0d7;
   --code-key: #85dce0;

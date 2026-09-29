@@ -1,0 +1,19 @@
+---
+// The coding-agent chip: shows the picked agent in its colour and opens the
+// picker (`scripts/agent-picker.ts`). One pick for the whole site.
+import { ChevronDown } from '@lucide/astro';
+import { AGENTS } from '../lib/agents';
+---
+
+<button type="button" class="agent-chip" data-agent-menu aria-haspopup="menu" aria-expanded="false">
+  <span class="agent-chip-label">Agent</span>
+  {
+    AGENTS.map((a) => (
+      <span class="agent-chip-name" data-agent-only={a.id} data-agent-tint={a.id}>
+        <span class="agent-dot" aria-hidden="true" />
+        {a.name}
+      </span>
+    ))
+  }
+  <ChevronDown size={14} aria-hidden="true" />
+</button>
