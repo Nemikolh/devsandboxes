@@ -99,8 +99,10 @@ impl TermSession {
             .context("failed to open pty")?;
 
         let mut cmd = CommandBuilder::from_argv(argv.into_iter().map(Into::into).collect());
-        // The command (`docker exec …`) runs on the host and dials into the
-        // container, so TERM here reaches the in-container shell via the exec.
+        // This TERM only reaches the runtime client (`docker exec …`) on the
+        // host: `exec` doesn't forward the caller's environment, so the shell in
+        // the container gets the runtime's default (`xterm` on docker) or
+        // whatever the image / `remoteEnv` sets.
         cmd.env("TERM", "xterm-256color");
         let child = pair
             .slave
