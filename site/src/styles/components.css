@@ -1005,6 +1005,101 @@
   color: var(--lime-soft);
 }
 
+/* Sidebar nav: shared by the docs sidebar and the mobile drawer, which
+   appears on pages that do not load docs.css. */
+
+.sidebar-heading {
+  display: flex;
+  justify-content: space-between;
+  color: #e7f1ee;
+  font: 500 10px var(--font-mono);
+  letter-spacing: 0.11em;
+  margin: 0 12px 38px;
+}
+
+.sidebar-number {
+  color: var(--text-faint);
+}
+
+.nav-group {
+  margin-bottom: 30px;
+}
+
+.nav-group-label {
+  font: 500 10px var(--font-mono);
+  letter-spacing: 0.13em;
+  color: #71898c;
+  padding: 0 12px;
+  margin: 0 0 12px;
+}
+
+.nav-group ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.side-link {
+  min-height: 37px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  /* Vertical room for titles that wrap in the narrower sidebars. */
+  padding: 7px 11px;
+  line-height: 1.35;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #9fb0af;
+  transition:
+    background 0.2s,
+    color 0.2s;
+}
+
+.side-link svg {
+  opacity: 0;
+  transition: opacity 0.2s;
+}
+
+.side-link:hover {
+  background: var(--surface-hover);
+  color: #ecf6f2;
+}
+
+.side-link:hover svg,
+.side-link:focus-visible svg {
+  opacity: 1;
+}
+
+.side-link[aria-current='page'] {
+  background: #1d3030;
+  color: var(--lime-soft);
+  border-left: 2px solid var(--lime);
+  padding-left: 9px;
+}
+
+.sidebar-bottom {
+  border-top: 1px solid #2c393b;
+  margin: 40px 11px 0;
+  padding-top: 20px;
+  font: 9px var(--font-mono);
+  letter-spacing: 0.05em;
+  color: #6b8888;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.sidebar-bottom .status-indicator {
+  height: 6px;
+  width: 6px;
+  border-radius: 50%;
+  background: #a9ef6b;
+  box-shadow: 0 0 9px #a9ef6b;
+  display: inline-block;
+}
+
 .drawer-nav .sidebar-heading {
   margin-left: 11px;
   margin-right: 11px;
