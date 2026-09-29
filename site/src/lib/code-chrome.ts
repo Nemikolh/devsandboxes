@@ -10,6 +10,41 @@ export function metaAttr(meta: string | undefined, key: string): string | undefi
   return m ? (m[1] ?? m[2]) : undefined;
 }
 
+/** Whether a fence's meta has the bare word `key` (` ```sh collapsed `), not inside a quoted value. */
+export function metaFlag(meta: string | undefined, key: string): boolean {
+  if (!meta) return false;
+  return meta
+    .replace(/"[^"]*"|'[^']*'/g, '""')
+    .split(/\s+/)
+    .includes(key);
+}
+
+/** Lines a `collapsed` block shows before its "Show all" toggle. */
+export const COLLAPSED_LINES = 10;
+
+/** The collapse toggle's label while the block is collapsed. */
+export function expandLabel(lines: number): string {
+  return `Show all ${lines} lines`;
+}
+
+export const COLLAPSE_LABEL = 'Show less';
+
+/** Shiki's lines: one `span.line` per source line, directly under `<code>`. */
+export function countLines(pre: Element): number {
+  const code = pre.children.find((n): n is Element => n.type === 'element' && n.tagName === 'code');
+  if (!code) return 0;
+  // Shiki sets `class: 'line'` (a string), not hast's `className` array.
+  return code.children.filter((n) => n.type === 'element' && String(n.properties.class).split(' ').includes('line'))
+    .length;
+}
+
+/** A page-unique-enough id for `aria-controls`: a hash of the block's code. */
+export function codeId(text: string): string {
+  let h = 5381;
+  for (let i = 0; i < text.length; i++) h = ((h * 33) ^ text.charCodeAt(i)) >>> 0;
+  return `code-${h.toString(36)}`;
+}
+
 /** `title="…"` (or `title='…'`) from a fence's meta string. */
 export function parseTitle(meta: string | undefined): string | undefined {
   return metaAttr(meta, 'title');
@@ -45,6 +80,8 @@ const COPY_ICON: IconNode = [
   ['path', { d: 'M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2' }],
 ];
 const CHECK_ICON: IconNode = [['path', { d: 'M20 6 9 17l-5-5' }]];
+// Lucide `chevron-down` (rotated by CSS when expanded).
+const CHEVRON_ICON: IconNode = [['path', { d: 'm6 9 6 6 6-6' }]];
 
 function el(tagName: string, properties: Element['properties'], children: ElementContent[] = []): Element {
   return { type: 'element', tagName, properties, children };
@@ -70,9 +107,41 @@ function icon(node: IconNode, className: string): Element {
   );
 }
 
+/**
+ * The collapse toggle under a `collapsed` block. The markup is the collapsed
+ * state, but CSS only clips while `<html data-js>` (set before first paint), so
+ * without JS the block reads in full and the toggle is hidden.
+ */
+function collapseFoot(id: string, lines: number): Element {
+  return el('div', { className: ['code-foot'] }, [
+    el(
+      'button',
+      {
+        type: 'button',
+        className: ['collapse-button'],
+        dataCollapseToggle: '',
+        ariaExpanded: 'false',
+        ariaControls: [id],
+      },
+      [
+        icon(CHEVRON_ICON, 'icon-chevron'),
+        el('span', { className: ['collapse-text'] }, [{ type: 'text', value: expandLabel(lines) }]),
+      ],
+    ),
+  ]);
+}
+
 /** The `.code-block` chrome (header label + copy button) around a `<pre>`. */
-export function codeChromeWrap(pre: Element, label: string, lang: string | undefined): Element {
-  return el('div', { className: ['code-block'], dataLang: lang ?? '' }, [
+export function codeChromeWrap(
+  pre: Element,
+  label: string,
+  lang: string | undefined,
+  collapse?: { id: string; lines: number },
+): Element {
+  if (collapse) pre.properties.id = collapse.id;
+  const props: Element['properties'] = { className: ['code-block'], dataLang: lang ?? '' };
+  if (collapse) Object.assign(props, { dataCollapsed: '', dataLines: String(collapse.lines) });
+  return el('div', props, [
     el('div', { className: ['code-head'] }, [
       el('span', {}, [el('span', { className: ['code-dot'], ariaHidden: 'true' }), { type: 'text', value: label }]),
       el(
@@ -91,6 +160,7 @@ export function codeChromeWrap(pre: Element, label: string, lang: string | undef
       ),
     ]),
     pre,
+    ...(collapse ? [collapseFoot(collapse.id, collapse.lines)] : []),
   ]);
 }
 
@@ -99,6 +169,7 @@ export function codeChromeWrap(pre: Element, label: string, lang: string | undef
  * transformer (not a rehype plugin) so it applies uniformly to `.md`, `.mdx`
  * (both go through Astro's Sätteri pipeline, which has no rehype) and direct
  * `codeToHtml` calls. `title` overrides the fence meta for direct calls.
+ * A `collapsed` fence longer than `COLLAPSED_LINES` gets a show-all toggle.
  */
 export function codeChrome(opts: { title?: string } = {}): ShikiTransformer {
   return {
@@ -112,8 +183,14 @@ export function codeChrome(opts: { title?: string } = {}): ShikiTransformer {
       const pre = root.children.find((n): n is Element => n.type === 'element' && n.tagName === 'pre');
       if (!pre) return;
       const lang = this.options.lang;
-      const label = opts.title ?? codeLabel(lang, rawMeta(this.options.meta));
-      root.children = [codeChromeWrap(pre, label, lang)];
+      const meta = rawMeta(this.options.meta);
+      const label = opts.title ?? codeLabel(lang, meta);
+      const lines = countLines(pre);
+      const collapse =
+        metaFlag(meta, 'collapsed') && lines > COLLAPSED_LINES
+          ? { id: codeId(`${meta}\n${this.source}`), lines }
+          : undefined;
+      root.children = [codeChromeWrap(pre, label, lang, collapse)];
     },
   };
 }

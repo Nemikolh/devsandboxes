@@ -1,0 +1,785 @@
+/* ------------------------------------------ Babysit PR diagram (examples) */
+
+/*
+ * `BabysitDiagram.astro`. Same colours as the landing diagram
+ * (`how-it-works.css`): purple the dashboard and its requests, green
+ * worktrees, lime you and pushes, cyan containers; yellow is notify. Desktop is
+ * one grid whose card rows have a fixed height (`--card-h`, `--gap`, set by the
+ * component with the SVG's numbers) so the fork's lines meet the cards; narrow
+ * screens stack it.
+ */
+.bsd {
+  /* Vertical links' x: centred on desktop, the icon rail when stacked. */
+  --lx: 50%;
+  --dash: #af87ff;
+  --dash-line: #7f65c4;
+  --notify: #e8c66f;
+  --push: #8fcf6a;
+  --gh-line: #56706f;
+
+  margin: 30px 0 34px;
+}
+
+.bsd-grid {
+  display: grid;
+  grid-template-columns: 12px minmax(0, 1fr) 70px minmax(0, 1fr) 76px minmax(0, 1.05fr) 12px;
+  grid-template-rows: auto 46px 34px var(--card-h) var(--gap) var(--card-h) 14px;
+}
+
+.bsd-github {
+  grid-area: 1 / 2 / 2 / 7;
+}
+
+.bsd-link--gh {
+  grid-area: 2 / 2 / 4 / 3;
+}
+
+.bsd-link--push {
+  grid-area: 2 / 6 / 4 / 7;
+}
+
+.bsd-host {
+  grid-area: 3 / 1 / 8 / 8;
+}
+
+.bsd-host-label {
+  grid-area: 3 / 3 / 4 / 6;
+}
+
+.bsd-dispatcher {
+  grid-area: 4 / 2 / 5 / 3;
+}
+
+.bsd-link--ctl {
+  grid-area: 4 / 3 / 5 / 4;
+}
+
+.bsd-center {
+  grid-area: 4 / 4 / 7 / 5;
+}
+
+.bsd-link--spawn {
+  grid-area: 4 / 5 / 7 / 6;
+}
+
+.bsd-children {
+  grid-area: 4 / 6 / 7 / 7;
+}
+
+/* ------------------------------------------------------------ Nodes */
+
+.bsd-github {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 52px;
+  padding: 0 14px 0 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  background: var(--surface-raised);
+  box-shadow: 0 12px 30px #0007;
+}
+
+.bsd-github-mark {
+  flex-shrink: 0;
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  background: #1d2a2d;
+  color: var(--text-bright);
+}
+
+.bsd-github-copy,
+.bsd-node-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  white-space: nowrap;
+}
+
+.bsd-github-copy strong,
+.bsd-node-copy strong {
+  font: 600 14px / 1.1 var(--font-heading);
+  letter-spacing: -0.02em;
+  color: var(--text-bright);
+}
+
+.bsd-github-copy span,
+.bsd-node-copy span {
+  font: 10px / 1.1 var(--font-mono);
+  color: var(--text-subtle);
+}
+
+.bsd-prs {
+  margin-left: auto;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.bsd-pr {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 24px;
+  padding: 0 8px;
+  border: 1px solid #35573a;
+  border-radius: 999px;
+  background: #142219;
+  color: #7fd67a;
+  font: 11px / 1 var(--font-mono);
+}
+
+.bsd-pr svg {
+  width: 12px;
+  height: 12px;
+}
+
+.bsd-host {
+  border: 1px dashed #2f474b;
+  border-radius: 14px;
+  background:
+    linear-gradient(#b3ffff06 1px, transparent 1px) 0 0 / 32px 32px,
+    linear-gradient(90deg, #b3ffff06 1px, transparent 1px) 0 0 / 32px 32px,
+    linear-gradient(180deg, #121d20cc, #0e1618aa);
+}
+
+.bsd-host-label {
+  align-self: center;
+  justify-self: center;
+  font: 9.5px / 1 var(--font-mono);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+
+.bsd-host-label span {
+  color: var(--lime);
+  border-left: 2px solid var(--lime);
+  padding-left: 8px;
+  margin-right: 6px;
+}
+
+.bsd-card {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  min-width: 0;
+  box-sizing: border-box;
+  height: var(--card-h);
+  padding: 11px;
+  border: 1px solid #2e4346;
+  border-radius: 10px;
+  background: linear-gradient(180deg, #162326, #111a1d);
+  box-shadow: 0 14px 30px #0007;
+}
+
+.bsd-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.bsd-icon {
+  flex-shrink: 0;
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border: 1px solid #2d4a4e;
+  border-radius: 6px;
+  background: #172b2e;
+  color: var(--cyan);
+}
+
+.bsd-icon svg {
+  width: 13px;
+  height: 13px;
+}
+
+.bsd-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font: 500 12.5px / 1 var(--font-mono);
+  color: var(--text-bright);
+}
+
+.bsd-chip {
+  align-self: flex-start;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 100%;
+  box-sizing: border-box;
+  height: 21px;
+  padding: 0 7px;
+  border: 1px solid #2f4448;
+  border-radius: 4px;
+  background: #13211f;
+  color: #a2b8b8;
+  font: 10.5px / 1 var(--font-mono);
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.bsd-chip.is-worktree {
+  border-color: #3b5c43;
+  background: #172a1f;
+  color: #b7ea89;
+}
+
+.bsd-chip svg {
+  flex-shrink: 0;
+  width: 11px;
+  height: 11px;
+}
+
+.bsd-sub {
+  font: 9.5px / 1.2 var(--font-mono);
+  color: var(--text-faint);
+  padding-left: 2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.bsd-center {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.bsd-dashboard {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  box-sizing: border-box;
+  width: 100%;
+  height: 60px;
+  margin-top: calc(var(--card-h) / 2 - 30px);
+  padding: 0 12px;
+  border: 1px solid #4c4384;
+  border-radius: 9px;
+  background: linear-gradient(180deg, #1b1a30, #151827);
+  box-shadow:
+    0 14px 34px #0008,
+    0 0 36px #af87ff1c;
+}
+
+.bsd-node-icon {
+  flex-shrink: 0;
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 7px;
+  background: #262147;
+  color: #c4b1ff;
+}
+
+.bsd-node-icon svg {
+  width: 16px;
+  height: 16px;
+}
+
+.bsd-dashboard .bsd-node-copy span {
+  color: #948bbd;
+}
+
+.bsd-center .bsd-link--inbox {
+  flex: 1;
+  width: 100%;
+}
+
+.bsd-you {
+  position: relative;
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 34px;
+  padding: 0 16px 0 12px;
+  border: 1px solid #4b7453;
+  border-radius: 999px;
+  background: #13211a;
+  color: var(--lime-soft);
+  font: 500 12px / 1 var(--font-mono);
+  box-shadow: 0 0 24px #a9f36d22;
+}
+
+.bsd-you svg {
+  width: 14px;
+  height: 14px;
+}
+
+/* `.bsd` twice: beats `.prose ul` / `.prose li`. */
+.bsd .bsd-children {
+  display: grid;
+  grid-template-rows: var(--card-h) var(--card-h);
+  row-gap: var(--gap);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.bsd .bsd-children > li {
+  margin: 0;
+  padding: 11px;
+}
+
+.bsd-agent {
+  margin-top: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 5px 7px;
+  border: 1px solid #25373a;
+  border-radius: 7px;
+  background: #0d1517;
+}
+
+.bsd-agent-icon {
+  flex-shrink: 0;
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: #18271f;
+  border: 1px solid #33503b;
+  color: var(--lime-soft);
+}
+
+.bsd-agent-icon svg {
+  width: 12px;
+  height: 12px;
+}
+
+.bsd-agent-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  font: 500 11px / 1.1 var(--font-body);
+  white-space: nowrap;
+}
+
+.bsd-agent-status {
+  --c: var(--text-subtle);
+
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  overflow: hidden;
+  font: 9.5px / 1 var(--font-mono);
+  color: var(--c);
+}
+
+.bsd-agent-status i {
+  flex-shrink: 0;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--c);
+}
+
+.bsd-agent[data-status='editing'] .bsd-agent-status {
+  --c: var(--lime);
+}
+
+.bsd-agent[data-status='editing'] .bsd-agent-status i {
+  box-shadow: 0 0 6px var(--c);
+}
+
+/* The dispatcher's loop: cyan, it's a script, not an agent. */
+.bsd-loop .bsd-agent-copy {
+  color: var(--text);
+}
+
+.bsd-loop .bsd-agent-icon {
+  color: var(--cyan);
+  border-color: #2d4a4e;
+  background: #152427;
+}
+
+.bsd-agent[data-status='idle'] .bsd-agent-icon {
+  color: var(--text-subtle);
+  border-color: #2e3f40;
+  background: #141d1f;
+}
+
+/* ------------------------------------------------------------ Links */
+
+/* A CSS arrow: `::before` the line, `::after` the head; `--c` its colour. */
+.bsd-link {
+  --c: var(--dash-line);
+  --label: var(--dash);
+
+  position: relative;
+  min-width: 0;
+  font: 10px / 1.3 var(--font-mono);
+  color: var(--label);
+}
+
+.bsd-link::before,
+.bsd-link::after {
+  content: '';
+  position: absolute;
+}
+
+.bsd-link::after {
+  width: 6px;
+  height: 6px;
+  border: solid var(--c);
+  border-width: 1.5px 1.5px 0 0;
+}
+
+.bsd-link--up::before,
+.bsd-link--down::before {
+  left: var(--lx);
+  top: 0;
+  bottom: 0;
+  border-left: 1.5px solid var(--c);
+}
+
+.bsd-link--up::after {
+  left: var(--lx);
+  top: 1px;
+  translate: -3px 0;
+  rotate: -45deg;
+}
+
+.bsd-link--down::after {
+  left: var(--lx);
+  bottom: 1px;
+  translate: -3px 0;
+  rotate: 135deg;
+}
+
+.bsd-link--up > span,
+.bsd-link--down > span {
+  position: absolute;
+  top: 50%;
+  left: calc(var(--lx) + 9px);
+  translate: 0 -50%;
+  white-space: nowrap;
+}
+
+.bsd-link--right::before {
+  top: 50%;
+  left: 0;
+  right: 1px;
+  border-top: 1.5px solid var(--c);
+}
+
+.bsd-link--right::after {
+  top: 50%;
+  right: 1px;
+  translate: 0 -3.5px;
+  rotate: 45deg;
+}
+
+.bsd-link--right > span {
+  position: absolute;
+  left: 4px;
+  right: 4px;
+  bottom: calc(50% + 7px);
+  text-align: center;
+}
+
+.bsd-link--gh {
+  --c: var(--gh-line);
+  --label: var(--text-muted);
+}
+
+.bsd-link--push {
+  --c: #4f7d3d;
+  --label: var(--push);
+}
+
+.bsd-link--inbox {
+  --c: #7d6b3a;
+  --label: var(--notify);
+
+  min-height: 34px;
+}
+
+/* The fork: SVG on desktop (lines meet the fixed card rows). */
+.bsd-link--spawn::before,
+.bsd-link--spawn::after {
+  display: none;
+}
+
+.bsd-fork {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+
+.bsd-fork line {
+  stroke-width: 1.5;
+  stroke-linecap: round;
+}
+
+.bsd-fork-spawn {
+  stroke: var(--dash-line);
+}
+
+.bsd-fork-notify {
+  stroke: var(--notify);
+  stroke-opacity: 0.7;
+  stroke-dasharray: 3 4;
+}
+
+.bsd-marker {
+  fill: none;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.bsd-marker--spawn {
+  stroke: var(--dash-line);
+}
+
+.bsd-marker--notify {
+  stroke: var(--notify);
+}
+
+.bsd-link--spawn > span {
+  position: absolute;
+  left: 6px;
+  right: 2px;
+  translate: none;
+  white-space: normal;
+}
+
+.bsd-link--spawn > .bsd-label-spawn {
+  top: auto;
+  bottom: calc(100% - var(--card-h) / 2 + 7px);
+}
+
+.bsd-link--spawn > .bsd-label-notify {
+  top: var(--notify-label);
+  color: var(--notify);
+  text-align: right;
+}
+
+/* ------------------------------------------------------ Narrow: stack */
+
+@media (max-width: 700px) {
+  /* One rail through the icons: card border + padding + half an icon. */
+  .bsd {
+    --card-h: auto !important;
+    --lx: 24px;
+  }
+
+  .bsd-grid {
+    grid-template-columns: 12px minmax(0, 1fr) 12px;
+    grid-template-rows: auto 48px 34px auto 52px auto 56px auto 36px 6px;
+  }
+
+  .bsd-grid > * {
+    grid-column: 2;
+  }
+
+  .bsd-github {
+    grid-row: 1;
+  }
+
+  .bsd-link--gh {
+    grid-row: 2 / 4;
+  }
+
+  .bsd-host {
+    grid-area: 3 / 1 / 11 / 4;
+  }
+
+  .bsd-host-label {
+    grid-row: 3;
+    justify-self: end;
+  }
+
+  .bsd-dispatcher {
+    grid-row: 4;
+  }
+
+  .bsd-link--ctl {
+    grid-row: 5;
+  }
+
+  .bsd-center {
+    grid-row: 6;
+  }
+
+  .bsd-link--spawn {
+    grid-row: 7;
+  }
+
+  .bsd .bsd-children {
+    grid-row: 8;
+    grid-template-rows: none;
+    row-gap: 10px;
+  }
+
+  /* git push: after the children, pointing back up to GitHub in words. */
+  .bsd-link--push {
+    grid-row: 9;
+    line-height: 36px;
+  }
+
+  .bsd-link--push::before,
+  .bsd-link--push::after {
+    display: none;
+  }
+
+  .bsd-link--push > span {
+    position: static;
+    translate: none;
+    padding-left: calc(var(--lx) - 4px);
+  }
+
+  .bsd-link--push > span::before {
+    content: '↑ ';
+  }
+
+  .bsd-link--push > span::after {
+    content: ' to GitHub';
+  }
+
+  .bsd-card {
+    gap: 8px;
+  }
+
+  /* Dashboard → you side by side, so the rail runs dashboard → children. */
+  .bsd-center {
+    flex-direction: row;
+    align-items: center;
+  }
+
+  .bsd-center .bsd-link--inbox {
+    flex: none;
+    align-self: stretch;
+    width: 64px;
+    height: auto;
+    min-height: 60px;
+  }
+
+  .bsd-link--inbox::before {
+    top: 50%;
+    bottom: auto;
+    left: 4px;
+    right: 5px;
+    border-left: 0;
+    border-top: 1.5px solid var(--c);
+  }
+
+  .bsd-link--inbox::after {
+    top: 50%;
+    bottom: auto;
+    left: auto;
+    right: 5px;
+    translate: 0 -3.5px;
+    rotate: 45deg;
+  }
+
+  .bsd-link--inbox > span {
+    top: auto;
+    bottom: calc(50% + 6px);
+    left: 0;
+    right: 0;
+    translate: none;
+    text-align: center;
+    white-space: normal;
+  }
+
+  .bsd-link--gh > span {
+    top: 38%;
+  }
+
+  .bsd-dashboard {
+    width: auto;
+    flex: 0 1 auto;
+    min-width: 0;
+    margin-top: 0;
+    padding: 0 12px 0 8px;
+  }
+
+  .bsd-you {
+    flex-shrink: 0;
+  }
+
+  /* Horizontal links turn down. */
+  .bsd-link--ctl::before {
+    left: var(--lx);
+    top: 0;
+    bottom: 0;
+    right: auto;
+    border-top: 0;
+    border-left: 1.5px solid var(--c);
+  }
+
+  .bsd-link--ctl::after {
+    top: auto;
+    left: var(--lx);
+    bottom: 1px;
+    right: auto;
+    translate: -3px 0;
+    rotate: 135deg;
+  }
+
+  .bsd-link--ctl > span {
+    top: 50%;
+    bottom: auto;
+    left: calc(var(--lx) + 9px);
+    right: auto;
+    translate: 0 -50%;
+    text-align: left;
+    white-space: nowrap;
+  }
+
+  .bsd-fork {
+    display: none;
+  }
+
+  .bsd-link--spawn::before,
+  .bsd-link--spawn::after {
+    display: block;
+  }
+
+  .bsd-link--spawn > .bsd-label-spawn,
+  .bsd-link--spawn > .bsd-label-notify {
+    top: auto;
+    bottom: auto;
+    left: calc(var(--lx) + 9px);
+    right: auto;
+    text-align: left;
+    white-space: nowrap;
+  }
+
+  .bsd-link--spawn > .bsd-label-spawn {
+    top: 10px;
+  }
+
+  .bsd-link--spawn > .bsd-label-notify {
+    top: 28px;
+  }
+
+  .bsd-label-notify::before {
+    content: '↑ ';
+  }
+}

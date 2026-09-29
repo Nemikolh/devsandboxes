@@ -36,8 +36,10 @@ const OG_IMAGE_ALT = 'devsandboxes, devcontainers for AI agents: Let agents loos
 <!doctype html>
 <html lang="en" data-agent={DEFAULT_AGENT.id}>
   <head>
-    <!-- Before first paint, so the reader's agent shows without a flash of the default. -->
+    <!-- Before first paint, so the reader's agent shows without a flash of the default,
+         and JS-only chrome (collapsed code) applies without a layout jump. -->
     <script is:inline define:vars={{ key: AGENT_STORAGE_KEY, ids: AGENTS.map((a) => a.id) }}>
+      document.documentElement.dataset.js = '';
       try {
         const saved = localStorage.getItem(key);
         if (ids.includes(saved)) document.documentElement.dataset.agent = saved;
@@ -79,6 +81,7 @@ const OG_IMAGE_ALT = 'devsandboxes, devcontainers for AI agents: Let agents loos
     <Search />
     <script>
       import '../scripts/copy-code';
+      import '../scripts/code-collapse';
       import '../scripts/agent-picker';
     </script>
   </body>

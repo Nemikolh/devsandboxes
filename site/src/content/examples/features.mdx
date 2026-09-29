@@ -8,7 +8,6 @@ related: [port-a-devcontainer, caches, vscode]
 ---
 
 import AgentPrompt from '../../components/AgentPrompt.astro';
-import AgentPromptLink from '../../components/AgentPromptLink.astro';
 
 ## The problem
 
@@ -16,7 +15,13 @@ Every repo needs a slightly different toolchain: this one Node 22, that one Rust
 
 devsandbox installs Features natively, without the devcontainer CLI: list them under `features` with the same references and options as in `devcontainer.json`.
 
-<AgentPromptLink />
+<AgentPrompt
+  goal="Look at my current devsandbox config and suggest devcontainer Features where they make sense."
+  steps={[
+    'Find toolchains installed by Dockerfiles, lifecycle commands or heavy images that an official Feature could provide. List each suggestion and what it replaces, and apply only the ones I pick.',
+  ]}
+  verify={[]}
+/>
 
 ## Config
 
@@ -59,18 +64,3 @@ devsandbox rebuild fix-login           # drifted: recreated with node 20
 - `features` tables merge key by key under `extends`: `web` gets gh and node ([templates](/docs/config#templates-and-extends)).
 - `= false` skips a Feature, e.g. one inherited from a template.
 - Adding, removing or changing a Feature makes existing instances drift; `devsandbox rebuild` applies it ([drift](/docs/config#drift)).
-
-## Agent instructions
-
-<AgentPrompt
-  goal="Install <tools> in my devsandbox sandbox <sandbox name> with devcontainer Features instead of a custom Dockerfile."
-  steps={[
-    'Find the official Feature for each tool (e.g. `ghcr.io/devcontainers/features/node:1`) and use only options its devcontainer-feature.json declares.',
-    'Add each to the sandbox\'s `features` as `"<oci ref>" = { <options> }`, a version string, or `true`; put ones several sandboxes share in a template they extend.',
-    'Remove whatever the Features replace (Dockerfile steps, install commands), but ask me before deleting a Dockerfile.',
-  ]}
-  verify={[
-    'Ask me, then run `devsandbox -C <config dir> rebuild <instance>` for an existing instance or `devsandbox -C <config dir> run <sandbox name>` for a new one.',
-    'Check each tool with `devsandbox -C <config dir> exec <instance> <tool> --version` and report the versions.',
-  ]}
-/>

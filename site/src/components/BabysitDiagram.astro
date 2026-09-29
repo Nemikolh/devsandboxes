@@ -1,0 +1,155 @@
+---
+/**
+ * The babysit-pr architecture: GitHub's open PRs, the dispatcher sandbox's
+ * loop, the dashboard serving its requests, one child per PR, and failures
+ * coming back to you. Static, in the landing diagram's visual language
+ * (`HowItWorks.astro`: purple dashboard, green worktrees, lime you) but with
+ * its own grid layout, stacked on narrow screens.
+ *
+ * The picture is `aria-hidden` + `inert` (its `<Agent />` words are buttons,
+ * which must not be focusable while hidden); the paragraph above it is the
+ * text alternative.
+ */
+import { Bot, Container, FileCode, GitBranch, GitPullRequest, LayoutDashboard, Repeat, UserRound } from '@lucide/astro';
+import { AGENTS } from '../lib/agents';
+import Agent from './Agent.astro';
+import GitHubMark from './GitHubMark.astro';
+import '../styles/babysit-diagram.css';
+
+// 123 merged cleanly (no agent); 124 conflicted, so its agent is at work.
+const children = [
+  { pr: 123, branch: 'fix/login', status: 'idle', statusLabel: 'not needed' },
+  { pr: 124, branch: 'add-search', status: 'editing', statusLabel: 'resolving' },
+];
+
+// Desktop card rows (px): the fork's SVG lines are drawn against them.
+const CARD_H = 136;
+const GAP = 12;
+const y1 = CARD_H / 2; // first child's (and the dashboard's) centre
+const y2 = CARD_H + GAP + CARD_H / 2; // second child's centre
+const yNotifyFrom = y2 + 26;
+const yNotifyTo = y1 + 22; // the dashboard's lower half
+---
+
+<figure class="bsd" data-pagefind-ignore style={`--card-h: ${CARD_H}px; --gap: ${GAP}px; --notify-label: ${yNotifyFrom + 8}px`}>
+  <p class="visually-hidden">
+    Diagram: in the pr-dispatcher sandbox on your machine, babysit-loop.sh polls GitHub's open pull requests #123 and #124
+    with gh. For each, it asks devsandbox, through devsbd ensure and exec, served while the dashboard is open, to create a
+    child instance: web-pr-123 and web-pr-124, each its own container and git worktree on the PR branch. A child merges
+    the base in, runs
+    {AGENTS.map((a) => <span data-agent-only={a.id}>{a.name}</span>)} only on a conflict, and git pushes back to the PR.
+    Failures go through devsbd notify to the dashboard's Inbox and your desktop.
+  </p>
+
+  <div class="bsd-grid" aria-hidden="true" inert>
+    <div class="bsd-github">
+      <span class="bsd-github-mark"><GitHubMark size={16} /></span>
+      <span class="bsd-github-copy">
+        <strong>GitHub</strong>
+        <span>owner/web</span>
+      </span>
+      <span class="bsd-prs">
+        {
+          children.map((c) => (
+            <span class="bsd-pr">
+              <GitPullRequest />#{c.pr}
+            </span>
+          ))
+        }
+      </span>
+    </div>
+
+    <div class="bsd-link bsd-link--up bsd-link--gh"><span>gh pr list</span></div>
+    <div class="bsd-link bsd-link--up bsd-link--push"><span>git push</span></div>
+
+    <div class="bsd-host" aria-hidden="true"></div>
+    <div class="bsd-host-label"><span>HOST</span> your machine</div>
+
+    <div class="bsd-card bsd-dispatcher">
+      <div class="bsd-head">
+        <span class="bsd-icon"><Container /></span>
+        <span class="bsd-name">pr-dispatcher</span>
+      </div>
+      <div class="bsd-chip"><FileCode />babysit-loop.sh</div>
+      <div class="bsd-agent bsd-loop">
+        <span class="bsd-agent-icon"><Repeat /></span>
+        <span class="bsd-agent-copy">
+          shell loop
+          <span class="bsd-agent-status"><i />every 5 min</span>
+        </span>
+      </div>
+    </div>
+
+    <div class="bsd-link bsd-link--right bsd-link--ctl"><span>devsbd ensure · exec</span></div>
+
+    <div class="bsd-center">
+      <div class="bsd-dashboard">
+        <span class="bsd-node-icon"><LayoutDashboard /></span>
+        <span class="bsd-node-copy">
+          <strong>dashboard</strong>
+          <span>devsandbox · open</span>
+        </span>
+      </div>
+      <div class="bsd-link bsd-link--down bsd-link--inbox"><span>Inbox · desktop</span></div>
+      <div class="bsd-you"><UserRound /> you</div>
+    </div>
+
+    {/*
+      Desktop: a fork to both children plus the notify path back, drawn in px
+      against the fixed card rows (see `--card-h` in babysit-diagram.css);
+      x in % so the column can flex. Narrow screens hide it for a CSS arrow.
+    */}
+    <div class="bsd-link bsd-link--down bsd-link--spawn">
+      <svg class="bsd-fork" fill="none">
+        <defs>
+          <marker id="bsd-arrow-spawn" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+            <path d="M1 1 8 5 1 9" class="bsd-marker bsd-marker--spawn" />
+          </marker>
+          <marker id="bsd-arrow-notify" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+            <path d="M1 1 8 5 1 9" class="bsd-marker bsd-marker--notify" />
+          </marker>
+        </defs>
+        <line class="bsd-fork-spawn" x1="0" y1={y1} x2="100%" y2={y1} marker-end="url(#bsd-arrow-spawn)" />
+        <line class="bsd-fork-spawn" x1="72%" y1={y1} x2="72%" y2={y2} />
+        <line class="bsd-fork-spawn" x1="72%" y1={y2} x2="100%" y2={y2} marker-end="url(#bsd-arrow-spawn)" />
+        <line class="bsd-fork-notify" x1="100%" y1={yNotifyFrom} x2="36%" y2={yNotifyFrom} />
+        <line class="bsd-fork-notify" x1="36%" y1={yNotifyFrom} x2="36%" y2={yNotifyTo} />
+        <line class="bsd-fork-notify" x1="36%" y1={yNotifyTo} x2="0" y2={yNotifyTo} marker-end="url(#bsd-arrow-notify)" />
+      </svg>
+      <span class="bsd-label-spawn">creates · runs</span>
+      <span class="bsd-label-notify">devsbd notify</span>
+    </div>
+
+    <ul class="bsd-children">
+      {
+        children.map((c) => (
+          <li class="bsd-card bsd-child">
+            <div class="bsd-head">
+              <span class="bsd-icon">
+                <Container />
+              </span>
+              <span class="bsd-name">web-pr-{c.pr}</span>
+            </div>
+            <div class="bsd-chip is-worktree">
+              <GitBranch />
+              {c.branch}
+            </div>
+            <div class="bsd-sub">worktree · merges main</div>
+            <div class="bsd-agent" data-status={c.status}>
+              <span class="bsd-agent-icon">
+                <Bot />
+              </span>
+              <span class="bsd-agent-copy">
+                <Agent />
+                <span class="bsd-agent-status">
+                  <i />
+                  {c.statusLabel}
+                </span>
+              </span>
+            </div>
+          </li>
+        ))
+      }
+    </ul>
+  </div>
+</figure>

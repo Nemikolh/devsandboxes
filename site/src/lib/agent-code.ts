@@ -36,8 +36,9 @@ export function splitTerms(value: string, agent: Agent): ElementContent[] {
 function wrapTerms(node: Element | Root, agent: Agent) {
   node.children = node.children.flatMap((child: RootContent): RootContent[] => {
     if (child.type === 'text') return splitTerms(child.value, agent);
-    // Skip the chrome (label, copy button): only the code itself is agent text.
-    if (child.type === 'element' && !(child.properties.className as string[] | undefined)?.includes('code-head'))
+    // Skip the chrome (label, copy button, collapse toggle): only the code itself is agent text.
+    const cls = child.type === 'element' ? (child.properties.className as string[] | undefined) : undefined;
+    if (child.type === 'element' && !cls?.includes('code-head') && !cls?.includes('code-foot'))
       wrapTerms(child, agent);
     return [child];
   });

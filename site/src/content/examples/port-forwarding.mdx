@@ -7,46 +7,20 @@ tags: [networking, services]
 related: [isolated-services, shared-postgres, vscode]
 ---
 
-import AgentPrompt from '../../components/AgentPrompt.astro';
-import AgentPromptLink from '../../components/AgentPromptLink.astro';
-
 ## The problem
 
 An agent started a dev server on port 3000 inside instance `api` and you want it in your browser, or `psql` on your host against that instance's Postgres. Publishing ports with `-p` has to happen at create time, collides as soon as a second instance wants the same port, and can't reach a server listening on the container's `127.0.0.1`.
 
 `devsandbox port` forwards a port **on demand**, like VS Code's _Ports_ tab: it is on `localhost` until you stop it.
 
-<AgentPromptLink />
-
-## Config
-
-Forwarding needs no config; any sandbox works. This one has a service to forward to as well:
-
-```toml title="config.toml"
-[services.postgres]                 # one per instance, no `ports` needed
-image = "postgres:16"
-env = { POSTGRES_PASSWORD = "postgres" }
-
-[sandbox.api]
-folder = "../api"
-image = "node:22"
-services = ["postgres"]
-postCreateCommand = "npm install"
-```
-
 ## Try it
 
-```bash
-devsandbox run api
-devsandbox exec -it api bash       # inside: npm run dev -- --port 3000
-```
-
-In another host terminal (runs until Ctrl-C):
+With an instance `api` running, from a host terminal (no config needed; runs until Ctrl-C):
 
 ```bash
 devsandbox port api 3000                        # http://localhost:3000
 devsandbox port api 8080:3000                   # host :8080 -> api's :3000
-devsandbox port api --service postgres 5432     # api's own postgres
+devsandbox port api --service postgres 5432     # a service api uses
 ```
 
 - `--service`: forward a service's port instead of the instance's.
@@ -60,16 +34,3 @@ From the dashboard: `p` on an instance or service, type the port; live forwards 
 - `--service` goes through a running instance that uses the service ([services](/docs/config#services-servicesname)).
 - A bare port taken on the host falls back to the next free one; the printed line says which.
 - Unix hosts, TCP only.
-
-## Agent instructions
-
-<AgentPrompt
-  goal="Let me reach port <container port> of my devsandbox instance <instance> (or of its service <service>) from my host, on demand."
-  steps={[
-    'Do not add `ports` or `-p` to config.toml. Check that <instance> is running (`devsandbox -C <config dir> ps`) and that something listens on the port inside it; if nothing does, tell me.',
-  ]}
-  verify={[
-    'Run `devsandbox -C <config dir> port <instance> <container port>` (add `--service <service>` for a service) in the background; it prints `127.0.0.1:<host port> -> <target>`.',
-    'Check it with `curl -sI http://127.0.0.1:<host port>` (or the matching client), report the mapping line, and never pass `--address 0.0.0.0` unless I ask.',
-  ]}
-/>

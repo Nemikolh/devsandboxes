@@ -12,12 +12,15 @@ import AgentPromptLink from '../../components/AgentPromptLink.astro';
 import Agent from '../../components/Agent.astro';
 import AgentOnly from '../../components/AgentOnly.astro';
 import AgentPicker from '../../components/AgentPicker.astro';
+import BabysitDiagram from '../../components/BabysitDiagram.astro';
 
 ## The problem
 
 Open pull requests rot: the base branch moves on, conflicts appear, and nobody notices until review. The fix is mostly mechanical: merge, resolve, push.
 
 A **dispatcher** sandbox runs a shell loop you own. For each PR that is conflicted or behind, it creates a **child** instance on the PR's branch, in its own worktree, merges the base in and starts <Agent /> only on a conflict. When it gives up, you get a notification.
+
+<BabysitDiagram />
 
 <AgentPromptLink />
 
@@ -86,7 +89,7 @@ On macOS <Agent /> keeps its login in the Keychain: run `/login` once in any ins
 
 The loop, in `pr-dispatcher/` next to `config.toml`, with a `.gitignore` for `babysit.log` and `.babysit/`. Set `REPO` and `chmod +x` it:
 
-```sh title="pr-dispatcher/babysit-loop.sh" agent="claude"
+```sh title="pr-dispatcher/babysit-loop.sh" agent="claude" collapsed
 #!/bin/sh
 set -u
 REPO=owner/web
@@ -185,7 +188,7 @@ while :; do
 done
 ```
 
-```sh title="pr-dispatcher/babysit-loop.sh" agent="codex"
+```sh title="pr-dispatcher/babysit-loop.sh" agent="codex" collapsed
 #!/bin/sh
 set -u
 REPO=owner/web

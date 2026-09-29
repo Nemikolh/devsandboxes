@@ -7,58 +7,27 @@ tags: [editors, devcontainers]
 related: [parallel-agents, port-a-devcontainer, features]
 ---
 
-import AgentPrompt from '../../components/AgentPrompt.astro';
-import AgentPromptLink from '../../components/AgentPromptLink.astro';
-
 ## The problem
 
 An agent works in instance `fix-login` and you want to read its diff, step through a test or poke at the running app in your editor. With several instances of one repo open, the windows all look alike, and an editor that attaches as the wrong user hits permission errors on the first save.
 
 `devsandbox vscode` (or `o` in the dashboard) opens a window attached to the instance's container, as the sandbox's `remoteUser`, with the sandbox's extensions, titled after the instance.
 
-<AgentPromptLink />
-
-## Config
-
-```toml title="config.toml"
-[sandbox.web]
-folder = "../web"
-image = "node:22"
-# Installed in the container on attach.
-customizations.vscode.extensions = ["dbaeumer.vscode-eslint", "esbenp.prettier-vscode"]
-```
-
 ## Try it
 
-You need VS Code with the **Dev Containers** extension and `code` on your `PATH`.
+No config needed, only VS Code with the **Dev Containers** extension and `code` on your `PATH`. With instances `fix-login` and `add-search` running:
 
 ```bash
-devsandbox run web --name fix-login     # your checkout, ../web
-devsandbox run web --name add-search    # its own worktree
-devsandbox vscode fix-login             # a window titled fix-login
-devsandbox vscode add-search            # a second one, titled add-search
+devsandbox vscode fix-login     # a window titled fix-login
+devsandbox vscode add-search    # a second one, titled add-search
 ```
-
-- `--name`: the instance name.
 
 In the dashboard, select an instance and press `o`, or type `:code add-search`.
 
 ## How it works
 
 - VS Code attaches to the container devsandbox already made, as [`remoteUser`](/docs/config#implemented-devcontainer-properties) if set.
+- Extensions in the sandbox's `customizations.vscode.extensions` are installed on attach.
 - The window opens `/workspaces/<instance>.code-workspace`, which is what names it.
 - `customizations.vscode.settings` is ignored ([accepted but ignored](/docs/config#accepted-but-ignored-warned-at-run)): keep settings in the repo's `.vscode/settings.json`.
 - Apple `container` is experimental: set `dev.containers.experimentalAppleContainerSupport` to `true` in VS Code first.
-
-## Agent instructions
-
-<AgentPrompt
-  goal="Set up my devsandbox sandbox <sandbox name> so I can attach VS Code to its instances with my extensions: <extension ids>."
-  steps={[
-    'Add the extension ids to `customizations.vscode.extensions` in `[sandbox.<sandbox name>]`, or in the template it extends if every sandbox should get them. Arrays concatenate under `extends`: do not repeat ids a template already lists.',
-    'Do not put editor settings in `customizations.vscode.settings`: devsandbox ignores them. Suggest a `.vscode/settings.json` in the repo instead.',
-  ]}
-  verify={[
-    'Tell me to run `devsandbox -C <config dir> vscode <instance>` (or press `o` on it in the dashboard); it needs `code` on PATH and the Dev Containers extension. Do not launch the editor yourself.',
-  ]}
-/>
