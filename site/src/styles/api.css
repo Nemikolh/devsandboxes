@@ -1,0 +1,469 @@
+/* Node API reference (src/pages/docs/node-api.astro). Builds on docs.css:
+   prose, .table-scroll and heading anchors come from there. */
+
+/* ------------------------------------------------------------ Headings */
+
+.prose h2 .api-h2-code {
+  font: 500 0.9em var(--font-mono);
+  letter-spacing: -0.02em;
+  color: var(--text);
+  background: none;
+  border: 0;
+  padding: 0;
+}
+
+/* Section divider inside Types: the typings' own `// Payloads` banners. */
+.prose .api-group {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin: 38px 0 -6px;
+  font: 500 10px var(--font-mono);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--lime);
+}
+
+.prose .api-group::before {
+  content: '//';
+  color: #4f6b45;
+  letter-spacing: 0;
+}
+
+.prose .api-group::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: linear-gradient(90deg, #3b5733, transparent);
+}
+
+/* --------------------------------------------------------------- Items */
+
+.api-item {
+  margin-top: 30px;
+  padding-top: 26px;
+  border-top: 1px solid #243134;
+}
+
+.prose h2 + .api-item,
+.prose h2 + p + .api-item {
+  border-top: 0;
+  padding-top: 4px;
+}
+
+.prose h3.api-name {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 0 0 12px;
+  font: 500 17px/30px var(--font-mono);
+  letter-spacing: -0.02em;
+  color: var(--text-bright);
+}
+
+.api-name-text {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.api-name-dim {
+  color: #6f8a8b;
+}
+
+.api-kind {
+  --kind: var(--lime);
+  --kind-border: #3b5733;
+  --kind-bg: #172419;
+  margin-left: auto;
+  flex: none;
+  font: 500 9px/1 var(--font-mono);
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+  color: var(--kind);
+  border: 1px solid var(--kind-border);
+  background: var(--kind-bg);
+  border-radius: var(--radius-sm);
+  padding: 5px 7px 4px;
+}
+
+.api-kind-interface,
+.api-kind-type {
+  --kind: var(--cyan);
+  --kind-border: #2f4d52;
+  --kind-bg: #132226;
+}
+
+.api-kind-class,
+.api-kind-const {
+  --kind: #d2dfa2;
+  --kind-border: #4a5236;
+  --kind-bg: #1c2119;
+}
+
+.api-doc > p {
+  margin: 0 0 10px;
+}
+
+.api-signature + .api-signature {
+  margin-top: 26px;
+}
+
+.prose .api-overload {
+  margin: 0 0 8px;
+  font: 500 10px var(--font-mono);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-subtle);
+}
+
+/* ----------------------------------------------------------- Signature */
+
+.api-sig pre {
+  margin: 14px 0 16px;
+  padding: 13px 17px;
+  overflow-x: auto;
+  border: 1px solid var(--border-strong);
+  border-left: 2px solid var(--lime);
+  border-radius: var(--radius-md);
+  background: var(--surface-code) !important;
+  font: 12.5px/1.75 var(--font-mono);
+  tab-size: 2;
+}
+
+.api-sig code {
+  font: inherit;
+}
+
+.api-sig-narrow {
+  display: none;
+}
+
+@media (max-width: 700px) {
+  .api-sig-wide {
+    display: none;
+  }
+
+  .api-sig-narrow {
+    display: block;
+  }
+}
+
+/* Linked type names keep their token colour; the link shows as an underline. */
+.prose .api-sig a.api-ref,
+.prose .api-type a.api-ref {
+  color: inherit;
+  text-decoration: underline dotted;
+  text-decoration-color: #4c7477;
+  text-underline-offset: 3px;
+}
+
+.prose .api-sig a.api-ref:hover,
+.prose .api-type a.api-ref:hover {
+  color: var(--lime);
+  text-decoration: underline solid var(--lime);
+}
+
+/* ---------------------------------------------------- Type expressions */
+
+.prose .api-type {
+  font: 12px/1.7 var(--font-mono);
+  color: var(--code-punctuation);
+  background: none;
+  border: 0;
+  padding: 0;
+  overflow-wrap: anywhere;
+}
+
+.prose .api-type a.api-ref {
+  color: var(--cyan);
+}
+
+.api-t-kw,
+.api-t-name {
+  color: var(--cyan);
+}
+
+.api-t-lit,
+.api-t-num {
+  color: #d2dfa2;
+}
+
+.api-t-str {
+  color: var(--code-string);
+}
+
+/* --------------------------------------------------------------- Meta */
+
+.prose .api-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px 10px;
+  margin: 12px 0 0;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.api-label {
+  flex: none;
+  min-width: 64px;
+  font: 500 9.5px var(--font-mono);
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+  color: var(--text-subtle);
+}
+
+.prose .api-meta a code {
+  color: var(--lime-soft);
+}
+
+.prose .api-meta a {
+  text-decoration: none;
+}
+
+.prose .api-meta a:hover code {
+  border-color: #4f6b45;
+}
+
+.api-inherits {
+  color: var(--text-subtle);
+  font-size: 12px;
+}
+
+.prose .api-inherits code {
+  font-size: 11px;
+  color: var(--text-muted);
+  background: none;
+  border-color: #253336;
+}
+
+/* -------------------------------------------------------------- Tables */
+
+.prose .api-table-wrap {
+  margin: 16px 0 0;
+}
+
+.prose .api-table {
+  font-size: 13px;
+}
+
+.prose .api-table td {
+  padding: 10px 16px;
+}
+
+.prose .api-table th {
+  padding: 9px 16px;
+}
+
+/* Same column rhythm in every table, whatever its content. */
+.prose table.api-table td.api-cell-name {
+  white-space: nowrap;
+  width: 29%;
+}
+
+.prose .api-table:has(th:nth-child(3)) .api-cell-type {
+  width: 33%;
+}
+
+.prose .api-table .api-cell-name code {
+  font: 500 12px var(--font-mono);
+  color: var(--text-bright);
+  background: none;
+  border: 0;
+  padding: 0;
+}
+
+.prose .api-table .api-cell-name a {
+  text-decoration: none;
+}
+
+.prose .api-table .api-cell-name a code {
+  color: var(--lime-soft);
+}
+
+.prose .api-table .api-cell-name a:hover code {
+  color: var(--lime);
+}
+
+.prose .api-table .api-cell-type {
+  min-width: 150px;
+}
+
+.prose .api-table .api-cell-doc {
+  color: var(--text-body);
+  min-width: 200px;
+}
+
+.prose .api-cell-doc p {
+  margin: 0;
+}
+
+.prose .api-cell-doc p + p {
+  margin-top: 6px;
+}
+
+.api-flag {
+  display: inline-block;
+  margin-left: 8px;
+  font: 500 8.5px/1 var(--font-mono);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: #7f9797;
+  border: 1px solid #2f3e41;
+  border-radius: var(--radius-sm);
+  padding: 3px 5px 2px;
+  vertical-align: 1px;
+}
+
+.api-none {
+  color: #4f6264;
+}
+
+/* `opts.all` under `opts`: the parent path dims, a rule shows the nesting. */
+.prose .api-row-sub .api-cell-name {
+  padding-left: 30px;
+  position: relative;
+}
+
+.prose .api-row-sub .api-cell-name::before {
+  content: '';
+  position: absolute;
+  left: 17px;
+  top: 0;
+  height: 21px;
+  width: 7px;
+  border-left: 1px solid #3b5733;
+  border-bottom: 1px solid #3b5733;
+}
+
+.prose tbody tr.api-row-sub {
+  background: transparent;
+}
+
+.prose .api-table tbody tr.api-row-sub td {
+  border-top-color: transparent;
+}
+
+.prose .api-overview .api-cell-doc {
+  font-size: 12.5px;
+}
+
+.prose table.api-overview td.api-cell-name {
+  width: 24%;
+}
+
+.prose table.api-overview:has(th:nth-child(3)) .api-cell-type {
+  width: 24%;
+  white-space: nowrap;
+}
+
+/* ---------------------------------------------------------- Breakpoints */
+
+/* Narrow screens: rows become stacked cards (name + type, then the
+   description) instead of a sideways-scrolling three-column grid. */
+@media (max-width: 700px) {
+  .prose .api-table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+  }
+
+  /* Stacked, so docs.css's 600px scroll floor for wide tables doesn't apply. */
+  .prose .api-table,
+  .prose .api-table:has(th:nth-child(3)),
+  .prose .api-table tbody,
+  .prose .api-table tr,
+  .prose .api-table td,
+  .prose table.api-table td.api-cell-name,
+  .prose .api-table:has(th:nth-child(3)) .api-cell-type {
+    display: block;
+    width: auto;
+    min-width: 0;
+  }
+
+  /* Name and type share a line; the description wraps under them. */
+  .prose .api-table tbody tr {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    column-gap: 12px;
+  }
+
+  .prose .api-table tbody td.api-cell-doc {
+    flex-basis: 100%;
+  }
+
+  .prose .api-table tr {
+    padding: 11px 14px;
+    border-top: 1px solid #253336;
+  }
+
+  .prose .api-table tbody tr:first-child {
+    border-top: 0;
+  }
+
+  .prose .api-table td,
+  .prose .api-table .api-cell-type,
+  .prose .api-table .api-cell-doc {
+    padding: 0;
+    border: 0;
+    min-width: 0;
+  }
+
+  .prose .api-table .api-cell-name {
+    white-space: normal;
+  }
+
+  .prose .api-table .api-cell-type {
+    margin-top: 0;
+  }
+
+  .prose .api-table .api-cell-doc {
+    margin-top: 6px;
+  }
+
+  .prose .api-table .api-cell-doc:has(.api-none) {
+    display: none;
+  }
+
+  .prose .api-row-sub .api-cell-name {
+    padding-left: 0;
+  }
+
+  .prose .api-row-sub .api-cell-name::before {
+    display: none;
+  }
+
+  .prose .api-table tr.api-row-sub {
+    padding-left: 30px;
+    position: relative;
+    border-top-color: transparent;
+  }
+
+  .prose .api-table tr.api-row-sub::before {
+    content: '';
+    position: absolute;
+    left: 16px;
+    top: 0;
+    height: 20px;
+    width: 7px;
+    border-left: 1px solid #3b5733;
+    border-bottom: 1px solid #3b5733;
+  }
+
+  .prose h3.api-name {
+    font-size: 15.5px;
+  }
+
+  /* The inline `#` sits in the flex gap already. */
+  .prose h3.api-name .heading-anchor {
+    margin-right: -4px;
+  }
+
+  .api-sig pre {
+    font-size: 11.5px;
+    padding: 12px 14px;
+  }
+}

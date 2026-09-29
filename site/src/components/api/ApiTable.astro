@@ -1,0 +1,44 @@
+---
+// Parameter / property table of the Node API page. The description column is
+// dropped when no row has one, rather than showing a column of dashes.
+import { typeHtml, type Row } from '../../lib/api';
+
+interface Props {
+  rows: Row[];
+  /** First column header. */
+  label: string;
+  known: ReadonlyMap<string, string>;
+}
+
+const { rows, label, known } = Astro.props;
+const withDoc = rows.some((r) => r.doc);
+---
+
+<div class="table-scroll api-table-wrap">
+  <table class="api-table">
+    <thead>
+      <tr>
+        <th scope="col">{label}</th>
+        <th scope="col">Type</th>
+        {withDoc && <th scope="col">Description</th>}
+      </tr>
+    </thead>
+    <tbody>
+      {
+        rows.map((r) => (
+          <tr class={r.sub ? 'api-row-sub' : undefined}>
+            <td class="api-cell-name">
+              <code>{r.name}</code>
+              {r.readonly && <span class="api-flag">readonly</span>}
+              {r.optional && <span class="api-flag">optional</span>}
+            </td>
+            <td class="api-cell-type">
+              <code class="api-type" set:html={typeHtml(r.type, known)} />
+            </td>
+            {withDoc && <td class="api-cell-doc" set:html={r.doc || '<span class="api-none">—</span>'} />}
+          </tr>
+        ))
+      }
+    </tbody>
+  </table>
+</div>

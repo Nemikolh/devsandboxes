@@ -1,0 +1,43 @@
+---
+// One function (or `service` method) of the Node API page: JSDoc, highlighted
+// signature, parameters, return type; one block per overload.
+import { anchorId, docHtml, paramRows, typeHtml } from '../../lib/api';
+import type { FunctionDecl, Signature } from '../../lib/dts';
+import ApiHeading from './ApiHeading.astro';
+import ApiTable from './ApiTable.astro';
+
+interface Props {
+  fn: FunctionDecl;
+  /** Owning object for methods (`service`). */
+  ns?: string;
+  known: ReadonlyMap<string, string>;
+  /** Pre-highlighted signature per overload; `narrow` when phones need other line breaks. */
+  highlighted: ReadonlyMap<Signature, { wide: string; narrow?: string }>;
+}
+
+const { fn, ns, known, highlighted } = Astro.props;
+const id = anchorId(ns ? `${ns}.${fn.name}` : fn.name);
+---
+
+<section class="api-item" aria-labelledby={id}>
+  <ApiHeading id={id} prefix={ns && `${ns}.`} name={fn.name} suffix="()" kind={ns ? 'method' : 'function'} />
+  {
+    fn.signatures.map((sig, n) => (
+      <div class="api-signature">
+        {fn.signatures.length > 1 && (
+          <p class="api-overload">
+            Overload {n + 1} of {fn.signatures.length}
+          </p>
+        )}
+        {sig.doc && <div class="api-doc" set:html={docHtml(sig.doc, known)} />}
+        <div class:list={['api-sig', highlighted.get(sig)?.narrow && 'api-sig-wide']} set:html={highlighted.get(sig)?.wide} />
+        {highlighted.get(sig)?.narrow && <div class="api-sig api-sig-narrow" set:html={highlighted.get(sig)?.narrow} />}
+        {sig.params.length > 0 && <ApiTable rows={paramRows(sig, known)} label="Parameter" known={known} />}
+        <p class="api-meta">
+          <span class="api-label">Returns</span>
+          <code class="api-type" set:html={typeHtml(sig.returns, known)} />
+        </p>
+      </div>
+    ))
+  }
+</section>

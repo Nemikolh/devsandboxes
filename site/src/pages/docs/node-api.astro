@@ -1,0 +1,329 @@
+---
+import type { MarkdownHeading } from 'astro';
+import { ArrowUpRight } from '@lucide/astro';
+import ApiFunction from '../../components/api/ApiFunction.astro';
+import ApiHeading from '../../components/api/ApiHeading.astro';
+import ApiTable from '../../components/api/ApiTable.astro';
+import Callout from '../../components/Callout.astro';
+import CodeBlock from '../../components/CodeBlock.astro';
+import Docs from '../../layouts/Docs.astro';
+import {
+  allFunctions,
+  anchorId,
+  docHtml,
+  inherited,
+  linkableTypes,
+  linkList,
+  markdownFence,
+  markdownParagraph,
+  memberRows,
+  NARROW,
+  resolvesTo,
+  signatureCode,
+  summaryHtml,
+  typeHtml,
+  usedBy,
+  WIDE,
+} from '../../lib/api';
+import { highlightTs } from '../../lib/api-highlight';
+import { parseDts, type Decl, type Signature } from '../../lib/dts';
+import { REPO_URL } from '../../lib/nav';
+import '../../styles/api.css';
+// `?raw` resolves relative to this file in dev and build alike, and the dev
+// server reloads the page when the typings or the README change.
+import dtsSource from '../../../../npm/devsandboxes/index.d.ts?raw';
+import readme from '../../../../npm/devsandboxes/README.md?raw';
+
+const SOURCE_PATH = 'npm/devsandboxes/index.d.ts';
+
+const groups = parseDts(dtsSource, SOURCE_PATH);
+const known = linkableTypes(groups);
+const users = usedBy(groups, known);
+const functionNames = new Set(allFunctions(groups).map((f) => f.qualified));
+
+// Page sections by kind; types keep the file's banner groups. The switch is
+// exhaustive, so a new declaration kind in dts.ts fails the type check.
+type Of<K extends Decl['kind']> = Extract<Decl, { kind: K }>;
+type TypeDecl = Of<'interface'> | Of<'type'>;
+const functions: Of<'function'>[] = [];
+const namespaces: Of<'namespace'>[] = [];
+const typeGroups: { title: string | null; decls: TypeDecl[] }[] = [];
+const classes: Of<'class'>[] = [];
+const consts: Of<'const'>[] = [];
+for (const g of groups) {
+  const types: TypeDecl[] = [];
+  for (const d of g.decls) {
+    switch (d.kind) {
+      case 'function':
+        functions.push(d);
+        break;
+      case 'namespace':
+        namespaces.push(d);
+        break;
+      case 'interface':
+      case 'type':
+        types.push(d);
+        break;
+      case 'class':
+        classes.push(d);
+        break;
+      case 'const':
+        consts.push(d);
+        break;
+      default: {
+        const never: never = d;
+        throw new Error(`node-api: no section for ${JSON.stringify(never)}`);
+      }
+    }
+  }
+  if (types.length) typeGroups.push({ title: g.title, decls: types });
+}
+
+const usage = markdownFence(readme, 'Node API', 'ts');
+const commonNote = markdownParagraph(readme, 'Every function takes');
+const platformsNote = markdownParagraph(readme, 'The binary comes from');
+
+// ---- Highlighted snippets (Shiki is async, the template isn't).
+
+// Two layouts per signature: phones get one parameter per line much sooner.
+const sigHtml = new Map<Signature, { wide: string; narrow?: string }>();
+async function addSignature(name: string, s: Signature, prefix: string, context?: { before: string; after: string }) {
+  const [wide, narrow] = [WIDE, NARROW].map((max) => signatureCode(name, s, max, prefix));
+  sigHtml.set(s, {
+    wide: await highlightTs(wide, known, context),
+    narrow: narrow === wide ? undefined : await highlightTs(narrow, known, context),
+  });
+}
+for (const fn of functions) for (const s of fn.signatures) await addSignature(fn.name, s, 'function ');
+for (const ns of namespaces) {
+  const context = { before: `declare const ${ns.name}: {\n`, after: '\n};' };
+  for (const fn of ns.functions) for (const s of fn.signatures) await addSignature(fn.name, s, '', context);
+}
+const aliasHtml = new Map<string, string>();
+for (const d of typeGroups.flatMap((g) => g.decls)) {
+  if (d.kind !== 'type') continue;
+  const body = d.type.includes('\n') ? `\n  ${d.type}` : ` ${d.type}`;
+  aliasHtml.set(d.name, await highlightTs(`type ${d.name}${d.typeParams} =${body};`, known));
+}
+const constHtml = new Map<string, string>();
+for (const c of consts) constHtml.set(c.name, await highlightTs(`const ${c.name}: ${c.type};`, known));
+
+const errorExample = `try {
+  await devsandbox.start('web');
+} catch (e) {
+  if (!(e instanceof devsandbox.DevsandboxError)) throw e;
+  console.error(e.args, e.exitCode, e.stderr);
+}`;
+
+// ---- TOC, plus the build-time guarantees: unique anchors, nothing dropped.
+
+const headings: MarkdownHeading[] = [];
+const h = (depth: 2 | 3, slug: string, text: string) => headings.push({ depth, slug, text });
+h(2, 'install', 'Install');
+h(2, 'usage', 'Usage');
+h(2, 'at-a-glance', 'At a glance');
+h(2, 'functions', 'Functions');
+for (const fn of functions) h(3, anchorId(fn.name), `${fn.name}()`);
+for (const ns of namespaces) {
+  h(2, anchorId(ns.name), ns.name);
+  for (const fn of ns.functions) h(3, anchorId(`${ns.name}.${fn.name}`), `${ns.name}.${fn.name}()`);
+}
+h(2, 'types', 'Types');
+for (const d of typeGroups.flatMap((g) => g.decls)) h(3, anchorId(d.name), d.name);
+h(2, 'errors', 'Errors');
+for (const c of classes) h(3, anchorId(c.name), c.name);
+if (consts.length) h(2, 'constants', 'Constants');
+for (const c of consts) h(3, anchorId(c.name), c.name);
+
+const slugs = headings.map((x) => x.slug);
+const dup = slugs.find((s, i) => slugs.indexOf(s) !== i);
+if (dup) throw new Error(`node-api: duplicate anchor #${dup}`);
+const rendered = functions.length + namespaces.length + typeGroups.flatMap((g) => g.decls).length + classes.length + consts.length;
+const declared = groups.flatMap((g) => g.decls).length;
+if (rendered !== declared) throw new Error(`node-api: rendered ${rendered} of ${declared} declarations`);
+for (const id of known.values()) if (!slugs.includes(id)) throw new Error(`node-api: link target #${id} has no heading`);
+
+const userLink = (u: string) => `<a href="#${anchorId(u)}"><code>${u}${functionNames.has(u) ? '()' : ''}</code></a>`;
+const unwrapP = (html: string) => html.replace(/^<p>|<\/p>$/g, '');
+---
+
+<Docs
+  title="Node API"
+  description="The devsandboxes npm package: the native devsandbox binary plus a typed, promise-based API over its JSON output. Generated from the package's index.d.ts."
+  eyebrow="REFERENCE"
+  headings={headings}
+  next={{
+    href: '/examples',
+    title: 'Examples',
+    description: 'Complete configs for real setups: parallel agents, shared services, caches and more.',
+  }}
+>
+  <h2 id="install"><a class="heading-anchor" href="#install" aria-label="Link to section: Install"></a>Install</h2>
+  <p>The package ships the <code>devsandbox</code> binary for your platform next to the typed API, so one dependency covers both.</p>
+  <CodeBlock code="npm i devsandboxes" />
+  <Callout variant="note" title="Platforms">
+    <Fragment set:html={unwrapP(docHtml(platformsNote, known))} />
+  </Callout>
+
+  <h2 id="usage"><a class="heading-anchor" href="#usage" aria-label="Link to section: Usage"></a>Usage</h2>
+  <CodeBlock code={usage} lang="ts" title="example.ts" />
+  <Fragment set:html={docHtml(commonNote, known)} />
+
+  <h2 id="at-a-glance"><a class="heading-anchor" href="#at-a-glance" aria-label="Link to section: At a glance"></a>At a glance</h2>
+  <div class="table-scroll api-table-wrap">
+    <table class="api-table api-overview">
+      <thead>
+        <tr><th scope="col">Function</th><th scope="col">Resolves to</th><th scope="col">Description</th></tr>
+      </thead>
+      <tbody>
+        {
+          allFunctions(groups).map(({ qualified, fn }) => (
+            <tr>
+              <td class="api-cell-name">
+                <a href={`#${anchorId(qualified)}`}>
+                  <code>{qualified}()</code>
+                </a>
+              </td>
+              <td class="api-cell-type">
+                <code class="api-type" set:html={typeHtml(resolvesTo(fn.signatures[0].returns), known)} />
+                {resolvesTo(fn.signatures[0].returns) === fn.signatures[0].returns && <span class="api-flag">sync</span>}
+              </td>
+              <td class="api-cell-doc" set:html={summaryHtml(fn.signatures[0].doc, known) || '<span class="api-none">—</span>'} />
+            </tr>
+          ))
+        }
+      </tbody>
+    </table>
+  </div>
+
+  <h2 id="functions"><a class="heading-anchor" href="#functions" aria-label="Link to section: Functions"></a>Functions</h2>
+  <p>
+    Named exports of <code>devsandboxes</code>. Everything but <code>binaryPath()</code> runs the CLI and returns a promise.
+  </p>
+  {functions.map((fn) => <ApiFunction fn={fn} known={known} highlighted={sigHtml} />)}
+
+  {
+    namespaces.map((ns) => (
+      <Fragment>
+        <h2 id={anchorId(ns.name)}>
+          <a class="heading-anchor" href={`#${anchorId(ns.name)}`} aria-label={`Link to section: ${ns.name}`} />
+          <code class="api-h2-code">{ns.name}</code>
+        </h2>
+        {ns.doc ? (
+          <Fragment set:html={docHtml(ns.doc, known)} />
+        ) : (
+          <p>
+            Methods of the exported <code>{ns.name}</code> object: <code>devsandbox.{ns.name}.{ns.functions[0].name}()</code>.
+          </p>
+        )}
+        {ns.functions.map((fn) => (
+          <ApiFunction fn={fn} ns={ns.name} known={known} highlighted={sigHtml} />
+        ))}
+      </Fragment>
+    ))
+  }
+
+  <h2 id="types"><a class="heading-anchor" href="#types" aria-label="Link to section: Types"></a>Types</h2>
+  <p>
+    Payloads mirror the CLI's <code>--json</code> output field for field: names stay <code>snake_case</code> and a Rust <code>Option&lt;T&gt;</code> arrives as
+    <code>T | null</code>.
+  </p>
+  {
+    typeGroups.map((g) => (
+      <Fragment>
+        {g.title && (
+          <p class="api-group">
+            <span>{g.title}</span>
+          </p>
+        )}
+        {g.decls.map((d) => {
+          const id = anchorId(d.name);
+          const bases = d.kind === 'interface' ? inherited(groups, d.name) : [];
+          const used = users.get(d.name) ?? [];
+          return (
+            <section class="api-item" aria-labelledby={id}>
+              <ApiHeading id={id} name={d.name} suffix={d.typeParams || undefined} kind={d.kind} />
+              {d.doc && <div class="api-doc" set:html={docHtml(d.doc, known)} />}
+              {d.kind === 'interface' && d.extends.length > 0 && (
+                <p class="api-meta">
+                  <span class="api-label">Extends</span>
+                  <Fragment set:html={linkList(d.extends, known)} />
+                  {bases.length > 0 && (
+                    <span class="api-inherits">
+                      inherits <Fragment set:html={bases.flatMap((b) => b.members).map((m) => `<code>${m}</code>`).join(' ')} />
+                    </span>
+                  )}
+                </p>
+              )}
+              {d.kind === 'type' && <div class="api-sig" set:html={aliasHtml.get(d.name)} />}
+              {d.kind === 'interface' && <ApiTable rows={memberRows(d.members, known)} label="Property" known={known} />}
+              {used.length > 0 && (
+                <p class="api-meta">
+                  <span class="api-label">Used by</span>
+                  <Fragment set:html={used.map(userLink).join(' ')} />
+                </p>
+              )}
+            </section>
+          );
+        })}
+      </Fragment>
+    ))
+  }
+
+  <h2 id="errors"><a class="heading-anchor" href="#errors" aria-label="Link to section: Errors"></a>Errors</h2>
+  <p>
+    A command that exits non-zero rejects with a <code>DevsandboxError</code> carrying its arguments and captured output. <code>exec()</code> is the exception:
+    it resolves with the command's exit code, and <code>cli()</code> does the same with <code>reject: false</code>.
+  </p>
+  {
+    classes.map((c) => {
+      const id = anchorId(c.name);
+      const used = users.get(c.name) ?? [];
+      return (
+        <section class="api-item" aria-labelledby={id}>
+          <ApiHeading id={id} name={c.name} kind="class" />
+          {c.doc && <div class="api-doc" set:html={docHtml(c.doc, known)} />}
+          {c.extends.length > 0 && (
+            <p class="api-meta">
+              <span class="api-label">Extends</span>
+              <Fragment set:html={linkList(c.extends, known)} />
+            </p>
+          )}
+          <ApiTable rows={memberRows(c.members, known)} label="Property" known={known} />
+          {used.length > 0 && (
+            <p class="api-meta">
+              <span class="api-label">Used by</span>
+              <Fragment set:html={used.map(userLink).join(' ')} />
+            </p>
+          )}
+        </section>
+      );
+    })
+  }
+  <CodeBlock code={errorExample} lang="ts" />
+
+  {
+    consts.length > 0 && (
+      <h2 id="constants">
+        <a class="heading-anchor" href="#constants" aria-label="Link to section: Constants" />
+        Constants
+      </h2>
+    )
+  }
+  {
+    consts.map((c) => (
+      <section class="api-item" aria-labelledby={anchorId(c.name)}>
+        <ApiHeading id={anchorId(c.name)} name={c.name} kind="const" />
+        {c.doc && <div class="api-doc" set:html={docHtml(c.doc, known)} />}
+        <div class="api-sig" set:html={constHtml.get(c.name)} />
+      </section>
+    ))
+  }
+
+  <p class="article-source">
+    Source: <code>{SOURCE_PATH}</code>
+    <a href={`${REPO_URL}/blob/main/${SOURCE_PATH}`} target="_blank" rel="noopener noreferrer">
+      View on GitHub<ArrowUpRight size={13} aria-hidden="true" /><span class="visually-hidden">(opens in a new tab)</span>
+    </a>
+  </p>
+</Docs>
