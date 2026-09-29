@@ -148,7 +148,10 @@ dumps) makes this the common case, not an edge case.
   connections), enforced on the daemon side.
 - **Non-blocking connect.** The daemon dials on a fresh thread, never on the
   serve thread: resolve with `to_socket_addrs`, then `connect_timeout` 5s per
-  address. On failure it sends `Close` with the error text.
+  address. When every address is loopback it also tries the other family's
+  loopback (`127.0.0.1` ↔ `::1`), since dev servers told `localhost` often
+  bind only `::1`. On failure it sends `Close` with the error text, naming the
+  requested address.
 
 ### Listening process (optional, `lsof`)
 
@@ -279,8 +282,8 @@ embedded blob, so a stale blob fails them.
 `devsbd/src/daemon.rs`, `devsbd/src/bridge.rs`, `src/devsbd/bridge.rs`.
 
 - The daemon advertises `TCP_FORWARD` in its `Hello`. Its `on_connect` dials as
-  specified (thread, resolve, `connect_timeout` 5s per address, `Close` with
-  the reason on failure).
+  specified (thread, resolve, `connect_timeout` 5s per address plus the
+  loopback fallback, `Close` with the reason on failure).
 - The bridge advertises `own & daemon` caps to the host (it learns the
   daemon's caps from its first handshake).
 - The host sends `Caps` right after its handshake: `SSH_AGENT` iff the bridge

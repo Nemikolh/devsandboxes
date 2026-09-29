@@ -20,7 +20,7 @@
 
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
@@ -367,10 +367,10 @@ fn serve_bridge(mut conn: UnixStream, bridges: Arc<Bridges>, hash: &str) {
 }
 
 /// Dial `host:port` inside the container for a forwarded stream: resolve, then
-/// `connect_timeout` each address in order. `Ok` disables Nagle (the mux
-/// already chunks). `Err` is a short human reason the host surfaces
-/// (`connection refused (127.0.0.1:3000)`, `cannot resolve postgres`,
-/// `timed out`).
+/// `connect_timeout` each address in order, then any [`loopback_fallback`].
+/// `Ok` disables Nagle (the mux already chunks). `Err` is a short human reason
+/// the host surfaces (`connection refused (127.0.0.1:3000)`, `cannot resolve
+/// postgres`, `timed out`); it names the requested address, not the fallback.
 fn dial(host: &str, port: u16) -> Result<Conn, String> {
     let addrs = match (host, port).to_socket_addrs() {
         Ok(a) => a.collect::<Vec<_>>(),
@@ -379,17 +379,39 @@ fn dial(host: &str, port: u16) -> Result<Conn, String> {
     if addrs.is_empty() {
         return Err(format!("cannot resolve {host}"));
     }
+    let fallback = loopback_fallback(&addrs);
     let mut last = String::new();
-    for addr in addrs {
-        match TcpStream::connect_timeout(&addr, DIAL_TIMEOUT) {
+    for (i, addr) in addrs.iter().chain(&fallback).enumerate() {
+        match TcpStream::connect_timeout(addr, DIAL_TIMEOUT) {
             Ok(stream) => {
                 let _ = stream.set_nodelay(true);
                 return Ok(stream.into());
             }
-            Err(e) => last = dial_error(&addr.to_string(), &e),
+            Err(e) if i < addrs.len() => last = dial_error(&addr.to_string(), &e),
+            Err(_) => {}
         }
     }
     Err(last)
+}
+
+/// When `addrs` are all loopback, the other family's loopback on the same port.
+/// Dev servers told `localhost` often bind only `::1` (Node 17+ resolves it
+/// IPv6-first) while forwards dial `127.0.0.1`, or the reverse; "a port on
+/// this container's loopback" should reach either. Non-loopback targets (a
+/// service alias) get nothing: their address is the one that was asked for.
+fn loopback_fallback(addrs: &[SocketAddr]) -> Vec<SocketAddr> {
+    if addrs.is_empty() || !addrs.iter().all(|a| a.ip().is_loopback()) {
+        return Vec::new();
+    }
+    let port = addrs[0].port();
+    let mut out = Vec::new();
+    if !addrs.iter().any(SocketAddr::is_ipv4) {
+        out.push(SocketAddr::from((Ipv4Addr::LOCALHOST, port)));
+    }
+    if !addrs.iter().any(SocketAddr::is_ipv6) {
+        out.push(SocketAddr::from((Ipv6Addr::LOCALHOST, port)));
+    }
+    out
 }
 
 /// A one-line reason for a failed dial, naming the address so the host can tell
@@ -677,6 +699,35 @@ mod tests {
         let (_pending, mut w) = pending_bridge(&bridges);
         proto::write_frame(&mut w, &Frame::Caps(0)).unwrap();
         assert!(bridges.route(caps::SSH_AGENT, HOLD).is_none());
+    }
+
+    #[test]
+    fn loopback_fallback_adds_the_other_family_only_for_loopback() {
+        let v4: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        let v6: SocketAddr = "[::1]:3000".parse().unwrap();
+        assert_eq!(loopback_fallback(&[v4]), vec![v6]);
+        assert_eq!(loopback_fallback(&[v6]), vec![v4]);
+        // Both families already there (`localhost` via /etc/hosts): nothing.
+        assert!(loopback_fallback(&[v6, v4]).is_empty());
+        // Any non-loopback address (a service alias): leave the dial alone.
+        let svc: SocketAddr = "172.18.0.3:5432".parse().unwrap();
+        assert!(loopback_fallback(&[svc]).is_empty());
+        assert!(loopback_fallback(&[svc, v4]).is_empty());
+        assert!(loopback_fallback(&[]).is_empty());
+    }
+
+    /// The case that motivated the fallback: a server bound only on `::1` is
+    /// reached by the forwarder's `127.0.0.1` dial.
+    #[test]
+    fn dial_v4_loopback_reaches_a_v6_only_listener() {
+        let listener = std::net::TcpListener::bind("[::1]:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(dial("127.0.0.1", port).is_ok());
+        // Nothing listening on either family: the note names the requested
+        // address, not the fallback.
+        drop(listener);
+        let err = dial("127.0.0.1", port).err().expect("no listener left");
+        assert_eq!(err, format!("connection refused (127.0.0.1:{port})"));
     }
 
     #[test]
