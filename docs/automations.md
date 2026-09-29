@@ -175,9 +175,9 @@ devsandbox takes no stand; both are supported and documented:
   item; per-item memory is the script's concern.
 
 - **Idle children** — stop a child between runs and `ensure` it before the next
-  `exec`. The boot pass starts every stopped instance of an `autostart`
-  sandbox, so leave `autostart` off on child sandboxes to keep idle children
-  stopped across reboots.
+  `exec`. The boot pass never starts children, so idle children stay stopped
+  across reboots (runtime-mode ones that were running come back via
+  `unless-stopped`).
 
 - Sample dispatcher: a babysit loop polling `gh pr list`, a cheap
   needs-attention check per PR, `ensure` + `exec --detach` only when needed,
@@ -452,7 +452,7 @@ Decision (user): `run --env` values live in `state.toml` and survive
 - `ensure` on an existing child with different `--env`: still ignored
   (documented), not merged.
 
-### Step 14 — autostart skips dispatcher-owned instances
+### Step 14 — autostart skips dispatcher-owned instances [x]
 
 Decision (user): the once-per-boot pass never starts or creates children.
 
@@ -600,7 +600,6 @@ container trigger those host git calls itself (`ensure`, `rm`).
 
 - Can the restart policy be changed in place on podman (`podman update --restart`, version-dependent), or does flipping `autostart` there require a recreate?
 - Should `postStartCommand` run by the daemon (runtime mode) and by `start` (host mode) be deduped by container start time, or should runtime-mode sandboxes just never have the host run it?
-- Children's `autostart`: inherit the child sandbox's own setting (current assumption), or never autostart and let the dispatcher `ensure` them?
 - Notification retention in the TUI (count/age), and whether "dismissed" is persisted in `state.toml`.
 
 ## Future

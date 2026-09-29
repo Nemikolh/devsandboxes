@@ -64,7 +64,12 @@ pub fn autostart(dir: &Path) {
     let rows: Vec<Row> = state
         .instances
         .iter()
-        .map(|(key, info)| Row { key, sandbox: &info.sandbox, project: &info.project })
+        .map(|(key, info)| Row {
+            key,
+            sandbox: &info.sandbox,
+            project: &info.project,
+            child: info.dispatcher.is_some(),
+        })
         .collect();
     let actions = actions(&project, &sandboxes, &rows, |key| {
         match backend().is_running(&state.instances[key].container) {
@@ -108,6 +113,8 @@ struct Row<'a> {
     key: &'a str,
     sandbox: &'a str,
     project: &'a str,
+    /// Dispatcher-owned (`Instance.dispatcher` set).
+    child: bool,
 }
 
 /// Container state of an instance. `Unknown` (the runtime query failed) is
@@ -141,6 +148,12 @@ fn due(recorded: Option<&str>, boot: &str) -> bool {
 /// noted when containerless; a sandbox with none gets a `Run`. Instances of
 /// other config roots are ignored. `liveness` is only queried for relevant
 /// instances, so unrelated containers cost no runtime call.
+///
+/// Dispatcher children are never started or noted (and not queried): their
+/// dispatcher `ensure`s them when it needs them. They still count as existing
+/// instances, so a sandbox whose only instances are children gets no `Run` —
+/// the dispatcher owns that fleet, and a stray non-child instance would be
+/// one nobody asked for.
 fn actions(
     project: &str,
     sandboxes: &[String],
@@ -152,6 +165,9 @@ fn actions(
         let mut any = false;
         for row in rows.iter().filter(|r| r.sandbox == sandbox && r.project == project) {
             any = true;
+            if row.child {
+                continue;
+            }
             match liveness(row.key) {
                 Liveness::Stopped => out.push(Action::Start(row.key.to_string())),
                 Liveness::Missing => out.push(Action::SkipMissing(row.key.to_string())),
@@ -292,7 +308,11 @@ mod tests {
     use super::*;
 
     fn row<'a>(key: &'a str, sandbox: &'a str, project: &'a str) -> Row<'a> {
-        Row { key, sandbox, project }
+        Row { key, sandbox, project, child: false }
+    }
+
+    fn child<'a>(key: &'a str, sandbox: &'a str, project: &'a str) -> Row<'a> {
+        Row { key, sandbox, project, child: true }
     }
 
     fn names(list: &[&str]) -> Vec<String> {
@@ -341,6 +361,29 @@ mod tests {
     fn unknown_liveness_neither_starts_nor_runs() {
         let rows = [row("web", "web", "p")];
         assert!(actions("p", &names(&["web"]), &rows, |_| Liveness::Unknown).is_empty());
+    }
+
+    #[test]
+    fn stopped_child_not_started_nor_queried() {
+        let rows = [child("triage-pr-1", "triage", "p")];
+        let got = actions("p", &names(&["triage"]), &rows, |_| panic!("not queried"));
+        assert!(got.is_empty(), "{got:?}");
+    }
+
+    #[test]
+    fn only_children_suppress_run() {
+        let rows = [child("triage-pr-1", "triage", "p"), child("triage-pr-2", "triage", "p")];
+        assert!(actions("p", &names(&["triage"]), &rows, |_| panic!("not queried")).is_empty());
+    }
+
+    #[test]
+    fn child_and_normal_instance_only_normal_started() {
+        let rows = [child("web-pr-1", "web", "p"), row("web", "web", "p")];
+        let got = actions("p", &names(&["web"]), &rows, |key| {
+            assert_eq!(key, "web", "child queried");
+            Liveness::Stopped
+        });
+        assert_eq!(got, [Action::Start("web".into())]);
     }
 
     #[test]

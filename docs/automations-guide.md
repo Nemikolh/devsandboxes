@@ -12,7 +12,7 @@ autostart = true         # devsandbox starts it once per boot
 # autostart = "runtime"  # the container runtime restarts it on boot
 ```
 
-**`true`**: once per host boot (per config root), the first dashboard launch, or the first `devsandbox run` / `devsandbox start` (after it finishes), starts every stopped instance of each `autostart` sandbox through the full `start` path (services, helper, `postStartCommand`). A sandbox with no instance yet gets one (`run`). Other commands (`ps`, `stop`, `status --json`, …) never trigger it. An instance you stop afterwards stays stopped until the next boot. If the runtime isn't reachable yet (Docker Desktop still starting, `container system start` not run), the pass is skipped and retried on the next trigger.
+**`true`**: once per host boot (per config root), the first dashboard launch, or the first `devsandbox run` / `devsandbox start` (after it finishes), starts every stopped instance of each `autostart` sandbox through the full `start` path (services, helper, `postStartCommand`). A sandbox with no instance yet gets one (`run`). Dispatcher-owned children are skipped (see below). Other commands (`ps`, `stop`, `status --json`, …) never trigger it. An instance you stop afterwards stays stopped until the next boot. If the runtime isn't reachable yet (Docker Desktop still starting, `container system start` not run), the pass is skipped and retried on the next trigger.
 
 **`"runtime"`**: the same pass, plus the container is created with `--restart unless-stopped`, so docker/podman bring it back at boot with no devsandbox process running:
 
@@ -103,7 +103,7 @@ Control is served only while the devsandbox **dashboard** is open (two open dash
 - Labelled with their owner and recorded in `state.toml`; a dispatcher only reaches its own children. The dashboard marks them with a dim `⇠ <dispatcher>` suffix, or `(orphan)` once the dispatcher is gone.
 - **Kept** when the dispatcher is stopped, removed, or rebuilt. Cleaning up is the script's job (`devsbd rm`); it should remember which keys it manages and can reconcile against `devsbd ls`. Orphans are removed by hand with `devsandbox rm`.
 - Each host-side operation runs as a `devsandbox` subprocess logging to `<data-dir>/devsandbox/logs/dispatch-<unix>-<op>.log` (next to `state.toml`, e.g. `~/.local/share/devsandbox/logs/`).
-- A child follows its own sandbox's `autostart`. Leave it off on child sandboxes if you want stopped children to stay stopped across reboots: the boot pass starts every stopped instance of an `autostart` sandbox, children included.
+- The boot pass never starts or creates children: the dispatcher `ensure`s them when it needs them. A sandbox whose only instances are children gets no extra instance either. Exception: children of an `autostart = "runtime"` sandbox carry `--restart unless-stopped`, so docker/podman bring back the ones that were running at shutdown (the runtime's rule, not devsandbox's).
 
 ## Patterns
 

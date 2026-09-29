@@ -6,7 +6,7 @@ Sandboxes can now start themselves after a reboot and run unattended **dispatche
 
 ### Added
 
-- **`autostart`**: a sandbox's instances come up once per boot, when the dashboard opens or after your first `devsandbox run` / `start`. A sandbox with no instance yet gets one.
+- **`autostart`**: a sandbox's instances come up once per boot, when the dashboard opens or after your first `devsandbox run` / `start`. A sandbox with no instance yet gets one; dispatcher children are left to their dispatcher.
 - **`autostart = "runtime"`**: docker and podman restart the containers themselves at boot (`--restart unless-stopped`), with no devsandbox process needed. Podman also needs `podman-restart.service` enabled. On Apple `container` it behaves like `true`. Changing `autostart` never marks an instance as drifted; the next `start` applies it in place.
 
 ```toml
