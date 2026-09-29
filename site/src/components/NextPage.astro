@@ -1,0 +1,21 @@
+---
+import { ArrowRight } from '@lucide/astro';
+
+export interface NextLink {
+  href: string;
+  title: string;
+  description?: string;
+}
+
+interface Props extends NextLink {
+  kicker?: string;
+}
+
+const { href, title, description, kicker = 'UP NEXT' } = Astro.props;
+---
+
+<a class="next-page" href={href}>
+  <span>{kicker} <ArrowRight size={13} aria-hidden="true" /></span>
+  <strong>{title}</strong>
+  {description && <small>{description}</small>}
+</a>

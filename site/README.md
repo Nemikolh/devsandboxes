@@ -1,0 +1,43 @@
+# devsandboxes docs site
+
+Static [Astro](https://astro.build) + MDX site for <https://devsandboxes.com>.
+Standalone pnpm project (Node >= 22.12), not part of the Cargo workspace.
+
+```sh
+pnpm i
+pnpm dev        # http://localhost:4321, live reload
+pnpm build      # static output in dist/
+pnpm preview    # serve dist/
+pnpm check      # astro check (types + .astro diagnostics)
+```
+
+## Layout
+
+- `src/pages/` — routes. `src/layouts/` — `Base.astro` (head, header,
+  footer, mobile drawer) and `Docs.astro` (sidebar / article / TOC shell).
+- `src/components/` — header, sidebar, TOC, code block, callout, resource
+  link, next-page card, mobile drawer.
+- `src/styles/` — plain CSS: `tokens.css` (palette, fonts, radii), `base.css`,
+  `components.css`, `home.css`, `docs.css`. No Tailwind.
+- `src/lib/` — build-time helpers:
+  - `shiki-theme.ts` — the syntax theme.
+  - `code-chrome.ts` — Shiki transformer wrapping every highlighted block in
+    the `.code-block` chrome (label from `title="…"` in the fence meta, else
+    the language; copy button). Applies to `.md`, `.mdx` and `CodeBlock.astro`.
+  - `heading-anchors.ts` — Sätteri (Astro's Markdown pipeline) plugins for
+    heading ids + `#` permalinks and scrollable table wrappers.
+  - `nav.ts` — header nav and sidebar groups.
+- The header version chip is the `[package] version` of `../Cargo.toml`, read
+  in `astro.config.mjs` at build time.
+
+## Content
+
+Hand-written pages are MDX under `src/`. Two pages are generated at build time
+from files elsewhere in the repo, so edit those, not the site:
+
+- `/docs/config` — rendered from `../skills/config-toml-spec/SKILL.md`.
+- `/docs/node-api` — generated from `../npm/devsandboxes/index.d.ts` with the
+  TypeScript compiler API.
+
+Every config snippet on the site must be valid: write it to a temp dir as
+`config.toml` and run `cargo run -q -- -C <dir> ls` from the repo root.

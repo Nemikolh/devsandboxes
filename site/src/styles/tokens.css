@@ -1,0 +1,67 @@
+:root {
+  /* Surfaces */
+  --bg: #0d1113;
+  --bg-header: #0e1315;
+  --surface: #131b1e;
+  --surface-code: #111b1e;
+  --surface-raised: #152023;
+  --surface-hover: #192629;
+  --surface-code-head: #1a282b;
+
+  /* Borders */
+  --border: #293234;
+  --border-strong: #344448;
+  --border-card: #2d3b3d;
+
+  /* Text */
+  --text: #e9efef;
+  --text-bright: #f3f8f6;
+  --text-body: #aebebc;
+  --text-muted: #a5b6b7;
+  --text-subtle: #798d8e;
+  --text-faint: #657a7c;
+
+  /* Accents */
+  --lime: #a9f36d;
+  --lime-hover: #c3ff8e;
+  --lime-soft: #b8f58a;
+  --cyan: #91e6e8;
+  --cyan-deep: #70d5db;
+  --focus: #62dbe7;
+
+  /* Code (mirrors src/lib/shiki-theme.ts) */
+  --code-base: #c9e0d7;
+  --code-key: #85dce0;
+  --code-string: #b7ea89;
+  --code-punctuation: #dae8d7;
+  --code-comment: #668086;
+
+  /* Fonts */
+  --font-heading: 'Space Grotesk', system-ui, sans-serif;
+  --font-body: 'DM Sans', system-ui, sans-serif;
+  --font-mono: 'DM Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  /* Radii */
+  --radius-sm: 3px;
+  --radius: 5px;
+  --radius-md: 6px;
+  --radius-lg: 9px;
+
+  /* Layout */
+  --page-max: 1600px;
+  --header-h: 72px;
+  --gutter: 56px;
+}
+
+@media (max-width: 1180px) {
+  :root {
+    --gutter: 32px;
+  }
+}
+
+@media (max-width: 700px) {
+  :root {
+    --header-h: 62px;
+    --gutter: 20px;
+  }
+}

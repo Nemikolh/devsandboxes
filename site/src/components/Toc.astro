@@ -1,0 +1,69 @@
+---
+import type { MarkdownHeading } from 'astro';
+import { ExternalLink } from '@lucide/astro';
+import { REPO_URL } from '../lib/nav';
+
+interface Props {
+  headings: MarkdownHeading[];
+}
+
+const items = Astro.props.headings.filter((h) => h.depth === 2 || h.depth === 3);
+---
+
+<aside class="toc" aria-label="On this page">
+  <div class="toc-inner">
+    <div class="toc-label" aria-hidden="true">ON THIS PAGE</div>
+    {
+      items.length > 0 && (
+        <ol class="toc-list" data-toc>
+          {items.map((h) => (
+            <li class={`toc-depth-${h.depth}`}>
+              <a href={`#${h.slug}`}>{h.text}</a>
+            </li>
+          ))}
+        </ol>
+      )
+    }
+    <div class="toc-rule"></div>
+    <a class="toc-external" href={REPO_URL} target="_blank" rel="noopener noreferrer">
+      View on GitHub <ExternalLink size={13} aria-hidden="true" />
+    </a>
+  </div>
+</aside>
+
+<script>
+  // Highlight the section being read: the last heading scrolled past the top
+  // band. The observer only signals "something moved across the band"; the
+  // pick itself is a position scan, so fast scrolls can't leave it stale.
+  const links = [...document.querySelectorAll<HTMLAnchorElement>('[data-toc] a')];
+  const targets = links
+    .map((a) => document.getElementById(decodeURIComponent(a.hash.slice(1))))
+    .filter((el): el is HTMLElement => el !== null);
+
+  if (targets.length > 0) {
+    const band = () => window.innerHeight * 0.3;
+    const update = () => {
+      let current = targets[0];
+      for (const t of targets) if (t.getBoundingClientRect().top <= band()) current = t;
+      // At the very bottom, the last heading may never reach the band.
+      if (window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 2) {
+        current = targets[targets.length - 1];
+      }
+      for (const a of links) {
+        const on = a.hash === `#${encodeURIComponent(current.id)}` || a.hash === `#${current.id}`;
+        if (on) {
+          a.dataset.active = '';
+          a.setAttribute('aria-current', 'location');
+        } else {
+          delete a.dataset.active;
+          a.removeAttribute('aria-current');
+        }
+      }
+    };
+    const io = new IntersectionObserver(update, { rootMargin: '0px 0px -70% 0px', threshold: [0, 1] });
+    for (const t of targets) io.observe(t);
+    window.addEventListener('hashchange', update);
+    window.addEventListener('scrollend', update, { passive: true });
+    update();
+  }
+</script>

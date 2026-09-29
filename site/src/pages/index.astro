@@ -1,0 +1,30 @@
+---
+// Step-1 stub; the real landing page lands in step 2.
+import { ArrowRight, ArrowUpRight } from '@lucide/astro';
+import Base from '../layouts/Base.astro';
+import '../styles/home.css';
+---
+
+<Base
+  title="devsandboxes — many sandboxes, one config"
+  description="Devcontainer-style sandboxes on docker, podman and Apple container: many throwaway instances per repo, each on its own git worktree."
+  fullTitle
+  ogType="website"
+>
+  <main id="main-content" tabindex="-1">
+    <section class="hero">
+      <div class="hero-grid" aria-hidden="true"></div>
+      <div class="hero-inner">
+        <div class="hero-copy">
+          <div class="hero-kicker"><span class="kicker-symbol" aria-hidden="true">//</span> DEVCONTAINERS, MULTIPLIED <span class="kicker-line" aria-hidden="true"></span></div>
+          <h1>Many sandboxes.<br /><em>One config<span class="title-period">.</span></em></h1>
+          <p>Devcontainer-style sandboxes on docker, podman and Apple container. Many throwaway instances per repo, built for coding agents.</p>
+          <div class="hero-cta">
+            <a class="button-primary" href="/docs/quick-start">Get started <ArrowRight size={18} aria-hidden="true" /></a>
+            <a class="button-secondary" href="/examples">Browse examples <ArrowUpRight size={17} aria-hidden="true" /></a>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+</Base>

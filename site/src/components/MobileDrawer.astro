@@ -1,0 +1,76 @@
+---
+import { ArrowUpRight, X } from '@lucide/astro';
+import { activeHeaderHref, headerNav, REPO_URL } from '../lib/nav';
+import Sidebar from './Sidebar.astro';
+
+const active = activeHeaderHref(Astro.url.pathname);
+const primary = headerNav.filter((l) => !l.external);
+---
+
+<dialog id="mobile-drawer" class="mobile-drawer" aria-label="Navigation menu">
+  <div class="drawer-header">
+    <span>MENU <span class="title-period">/</span></span>
+    <button type="button" data-drawer-close aria-label="Close navigation menu"><X size={21} aria-hidden="true" /></button>
+  </div>
+  <nav class="drawer-primary" aria-label="Main (menu)">
+    {
+      primary.map((link) => (
+        <a href={link.href} aria-current={active === link.href ? 'page' : undefined}>
+          {link.label}
+        </a>
+      ))
+    }
+  </nav>
+  <Sidebar mobile />
+  <div class="drawer-external">
+    <a href={REPO_URL} target="_blank" rel="noopener noreferrer">View on GitHub <ArrowUpRight size={16} aria-hidden="true" /></a>
+  </div>
+</dialog>
+
+<script>
+  // `showModal()` makes the page behind inert (focus stays in the drawer) and
+  // handles Esc; focus is restored to the opener explicitly on close.
+  const drawer = document.getElementById('mobile-drawer') as HTMLDialogElement | null;
+  const openers = document.querySelectorAll<HTMLButtonElement>('[data-drawer-open]');
+  let opener: HTMLElement | null = null;
+
+  if (drawer) {
+    const setExpanded = (v: boolean) => openers.forEach((b) => b.setAttribute('aria-expanded', String(v)));
+
+    openers.forEach((button) =>
+      button.addEventListener('click', () => {
+        opener = button;
+        drawer.showModal();
+        document.body.classList.add('scroll-locked');
+        setExpanded(true);
+        drawer.querySelector<HTMLElement>('[data-drawer-close]')?.focus();
+      }),
+    );
+
+    drawer.querySelector('[data-drawer-close]')?.addEventListener('click', () => drawer.close());
+
+    // A click on the ::backdrop lands on the <dialog> itself, outside its box.
+    drawer.addEventListener('click', (event) => {
+      if (event.target !== drawer) return;
+      const r = drawer.getBoundingClientRect();
+      const inside = event.clientX >= r.left && event.clientX <= r.right && event.clientY >= r.top && event.clientY <= r.bottom;
+      if (!inside) drawer.close();
+    });
+
+    // Following an in-page link (or the current page) must not leave the drawer over it.
+    drawer.addEventListener('click', (event) => {
+      if ((event.target as Element).closest('a[href]')) drawer.close();
+    });
+
+    drawer.addEventListener('close', () => {
+      document.body.classList.remove('scroll-locked');
+      setExpanded(false);
+      opener?.focus();
+    });
+
+    // Resizing up to the desktop layout hides the menu button; don't strand the drawer.
+    window.matchMedia('(min-width: 981px)').addEventListener('change', (e) => {
+      if (e.matches && drawer.open) drawer.close();
+    });
+  }
+</script>

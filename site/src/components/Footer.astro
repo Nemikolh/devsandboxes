@@ -1,0 +1,26 @@
+---
+import { ArrowUpRight } from '@lucide/astro';
+import { REPO_URL } from '../lib/nav';
+import Mark from './Mark.astro';
+
+const links = [
+  { href: REPO_URL, label: 'GitHub' },
+  { href: 'https://www.npmjs.com/package/devsandboxes', label: 'npm' },
+];
+---
+
+<div class="site-footer-wrap">
+  <footer class="site-footer">
+    <a class="footer-brand" href="/"><Mark /><span>devsandboxes</span></a>
+    <span>Devcontainer-style sandboxes on docker, podman and Apple container. MIT licensed.</span>
+    <div class="footer-links">
+      {
+        links.map((link) => (
+          <a href={link.href} target="_blank" rel="noopener noreferrer">
+            {link.label} <ArrowUpRight size={13} aria-hidden="true" />
+          </a>
+        ))
+      }
+    </div>
+  </footer>
+</div>

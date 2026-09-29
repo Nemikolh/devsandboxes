@@ -1,7 +1,7 @@
 # devsandbox
 
 Rust CLI (`devsandbox`) that manages devcontainer-style sandboxes on docker /
-podman / Apple container. Each sandbox config can spawn many *instances*
+podman / Apple container. Each sandbox config can spawn many _instances_
 (containers named `devsandbox-<instance>`); repeat instances of one repo get
 git worktrees so working trees are never shared.
 
@@ -26,10 +26,11 @@ git worktrees so working trees are never shared.
   dockerfile's contents (`build_hash` label); the shared rule is
   `commands::drift_decision`. The full user-facing format reference is the
   `skills/config-toml-spec/SKILL.md` skill: update it whenever a config field,
-  merge rule, or `${…}` variable changes.
+  merge rule, or `${…}` variable changes (the docs site renders it verbatim as
+  `/docs/config`).
 - `src/commands/services.rs` — service/network lifecycle. `scope = "isolated"`
   (default): one container per instance on a per-instance network. `scope =
-  "global"`: one shared container per config root. `gc` reaps unreferenced ones;
+"global"`: one shared container per config root. `gc` reaps unreferenced ones;
   `rebuild` recreates a service's containers and rewires running sandboxes in
   place (no restart, on any runtime).
 - Automations (`docs/automations.md` design + steps, `docs/automations-guide.md`
@@ -65,7 +66,7 @@ git worktrees so working trees are never shared.
   `procs.rs`, `inbox.rs` (Inbox tab: `devsbd notify` history, key dedupe,
   unread badges); shared test fixtures in `test_support.rs`. `tui/mod.rs` owns the terminal + event loop and runs
   docker work on background threads; `prompt.rs` is the `:` command line
-  (`spec.rs` is its declarative grammar table — parsing *and* tab completion
+  (`spec.rs` is its declarative grammar table — parsing _and_ tab completion
   derive from `SPECS`, so a new flag is one table entry);
   `term.rs` holds the integrated terminal's PTY sessions + tab strip
   (`TermSession`/`TermTabs`, `docker exec -it` shell rendered via vt100);
@@ -73,12 +74,14 @@ git worktrees so working trees are never shared.
   (route resolution + docker work off the UI thread), modelled on `BridgeWorker`;
   it also reconciles sandboxes' `forwardPorts` against the running instances
   each snapshot, with host ports saved in `state.toml`.
+- `site/` — Astro + MDX docs site (standalone pnpm project, not in the Cargo
+  workspace; see `site/README.md`). Checks: `cd site && pnpm check && pnpm build`.
 
 ## Conventions & checks
 
 - Docs in `docs/` are named after their topic, no `plan-` prefix or `-plan`
   suffix (e.g. `docs/rebuild.md`, not `docs/plan-rebuild.md`).
-- Doc comments explain *why*; keep them current when moving logic.
+- Doc comments explain _why_; keep them current when moving logic.
 - Tests live in `#[cfg(test)]` modules per file; most logic is factored to be
   testable without a container runtime.
 - Tests that need docker or the embedded helper use

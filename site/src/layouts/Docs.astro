@@ -1,0 +1,55 @@
+---
+import type { MarkdownHeading } from 'astro';
+import { ChevronRight } from '@lucide/astro';
+import NextPage, { type NextLink } from '../components/NextPage.astro';
+import Sidebar from '../components/Sidebar.astro';
+import Toc from '../components/Toc.astro';
+import '../styles/docs.css';
+import Base from './Base.astro';
+
+export interface Props {
+  title: string;
+  description: string;
+  eyebrow: string;
+  headings: MarkdownHeading[];
+  next?: NextLink;
+  /** Breadcrumb section; defaults to Docs. */
+  section?: { label: string; href: string };
+}
+
+const { title, description, eyebrow, headings, next, section = { label: 'Docs', href: '/docs/quick-start' } } = Astro.props;
+---
+
+<Base title={title} description={description}>
+  <div class="docs-shell">
+    <aside class="docs-sidebar">
+      <Sidebar />
+    </aside>
+    <main id="main-content" class="docs-main" tabindex="-1">
+      <nav class="breadcrumb" aria-label="Breadcrumb">
+        <ol>
+          <li><a href="/">Home</a><ChevronRight size={13} aria-hidden="true" /></li>
+          <li><a href={section.href}>{section.label}</a><ChevronRight size={13} aria-hidden="true" /></li>
+          <li><span aria-current="page">{title}</span></li>
+        </ol>
+      </nav>
+      <div class="article-topline">
+        <span class="eyebrow"><span class="eyebrow-line" aria-hidden="true"></span>{eyebrow}</span>
+      </div>
+      <h1>{title}<span class="title-period" aria-hidden="true">.</span></h1>
+      <p class="article-lead">{description}</p>
+      <hr class="article-divider" />
+      <article class="prose">
+        <slot />
+      </article>
+      {
+        next && (
+          <div class="article-bottom">
+            <NextPage {...next} />
+          </div>
+        )
+      }
+    </main>
+    <Toc headings={headings} />
+  </div>
+</Base>

@@ -1,0 +1,18 @@
+---
+interface Props {
+  variant?: 'note' | 'tip' | 'warning';
+  title?: string;
+}
+
+const { variant = 'note', title } = Astro.props;
+const defaults = { note: 'Note', tip: 'Tip', warning: 'Warning' } as const;
+const glyph = { note: 'i', tip: '✓', warning: '!' } as const;
+---
+
+<aside class={`callout callout-${variant}`} aria-label={title ?? defaults[variant]}>
+  <div class="callout-title">
+    <span class="callout-icon" aria-hidden="true">{glyph[variant]}</span>
+    {title ?? defaults[variant]}
+  </div>
+  <div class="callout-body"><slot /></div>
+</aside>

@@ -1,0 +1,75 @@
+---
+title: Quick start
+description: From an empty folder to a running sandbox, with a second instance on its own worktree.
+eyebrow: GETTING STARTED
+---
+
+import Callout from '../components/Callout.astro';
+import ResourceLink from '../components/ResourceLink.astro';
+
+{/* Step-1 placeholder exercising the prose styles; the real page lands in step 3. */}
+
+## Prerequisites
+
+You need a running container runtime: **docker**, **podman**, or Apple `container` on macOS. devsandboxes has no daemon of its own; the runtime is the source of truth.
+
+- Linux: docker or podman.
+- macOS: docker (OrbStack / Docker Desktop) or Apple `container`.
+- Windows: the Linux build inside WSL2.
+
+## Write a config
+
+A config root is a folder holding `config.toml`. Sandboxes point at repos with `folder`, relative to that root.
+
+```toml title="config.toml"
+[services.database]
+image = "postgres:16"
+scope = "global"            # one container shared by all instances
+
+[template.base]
+caches = ["pnpm"]
+persist-shell-history = true
+[template.base.features]
+"ghcr.io/devcontainers/features/node:1" = { version = "lts" }
+
+[sandbox.web]
+extends = "base"
+folder = "../web"           # host repo, mounted as the workspace
+services = ["database"]
+image = "mcr.microsoft.com/devcontainers/base:ubuntu"
+postCreateCommand = "pnpm install"
+```
+
+### How `extends` merges
+
+Tables merge recursively and arrays concatenate, so every sandbox that extends `base` gets its caches and features.
+
+| Value kind | Merge rule                         |
+| ---------- | ---------------------------------- |
+| Table      | Deep-merged, child keys win        |
+| Array      | Concatenated, template items first |
+| Scalar     | Replaced by the child              |
+
+## Run it
+
+```bash
+devsandbox run web          # start an instance in the background
+devsandbox exec -it web zsh # name = instance, sandbox, or folder basename
+devsandbox                  # no args on a TTY: interactive dashboard
+```
+
+1. The first `run` creates `web` on the repo itself.
+2. A second `run web` creates `web-2` on its own git worktree.
+3. `devsandbox ps` lists both.
+
+<Callout variant="tip" title="Point at another config">
+  `-C <dir>` points any command at a different config root.
+</Callout>
+
+<Callout variant="warning" title="Unix only">
+  `devsandbox port` forwarding is only available on unix hosts for now.
+</Callout>
+
+> Blockquotes read like this: a quieter aside than a callout.
+
+<ResourceLink href="https://github.com/Nemikolh/devsandboxes" label="Browse the source" description="Issues, releases and the full README on GitHub" />

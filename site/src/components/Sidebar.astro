@@ -1,0 +1,46 @@
+---
+import { ChevronRight } from '@lucide/astro';
+import { normalizePath, sidebarGroups } from '../lib/nav';
+
+interface Props {
+  /** Drawer copy: different class, and a distinct label so the two navs are distinguishable. */
+  mobile?: boolean;
+}
+
+const { mobile = false } = Astro.props;
+const current = normalizePath(Astro.url.pathname);
+const total = sidebarGroups.reduce((n, g) => n + g.links.length, 0);
+const pad = (n: number) => String(n).padStart(2, '0');
+---
+
+<nav class={mobile ? 'drawer-nav' : 'sidebar-nav'} aria-label={mobile ? 'Documentation (menu)' : 'Documentation'}>
+  <div class="sidebar-heading" aria-hidden="true">
+    <span>DOCUMENTATION</span>
+    <span class="sidebar-number">01 — {pad(total)}</span>
+  </div>
+  {
+    sidebarGroups.map((group) => (
+      <div class="nav-group">
+        <p class="nav-group-label">{group.label}</p>
+        <ul>
+          {group.links.map((link) => (
+            <li>
+              <a class="side-link" href={link.href} aria-current={current === link.href ? 'page' : undefined}>
+                {link.label}
+                <ChevronRight size={14} aria-hidden="true" />
+              </a>
+            </li>
+          ))}
+        </ul>
+      </div>
+    ))
+  }
+  {
+    !mobile && (
+      <div class="sidebar-bottom">
+        <span class="status-indicator" aria-hidden="true" />
+        MIT · NO DAEMON
+      </div>
+    )
+  }
+</nav>

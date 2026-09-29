@@ -1,0 +1,27 @@
+---
+// Code outside Markdown (landing page, generated pages). Same Shiki theme and
+// chrome as fenced blocks, so the two can't drift apart.
+import { codeToHtml } from 'shiki';
+import { codeChrome } from '../lib/code-chrome';
+import { devsandboxesTheme } from '../lib/shiki-theme';
+
+interface Props {
+  code: string;
+  lang?: string;
+  /** Header label; defaults to the language uppercased (`TERMINAL` for shells). */
+  title?: string;
+}
+
+const { code, lang = 'bash', title } = Astro.props;
+const html = await codeToHtml(code.replace(/\n$/, ''), {
+  lang,
+  theme: devsandboxesTheme,
+  transformers: [codeChrome({ title })],
+});
+---
+
+<Fragment set:html={html} />
+
+<script>
+  import '../scripts/copy-code';
+</script>

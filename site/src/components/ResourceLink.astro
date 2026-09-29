@@ -1,0 +1,21 @@
+---
+import { ArrowRight, ArrowUpRight } from '@lucide/astro';
+
+interface Props {
+  href: string;
+  label: string;
+  description?: string;
+}
+
+const { href, label, description } = Astro.props;
+const external = /^https?:\/\//.test(href);
+---
+
+<a class="resource-link" href={href} {...external ? { target: '_blank', rel: 'noopener noreferrer' } : {}}>
+  <span>
+    <strong>{label}</strong>
+    {description && <small>{description}</small>}
+  </span>
+  {external ? <ArrowUpRight size={18} aria-hidden="true" /> : <ArrowRight size={18} aria-hidden="true" />}
+  {external && <span class="visually-hidden">(opens in a new tab)</span>}
+</a>

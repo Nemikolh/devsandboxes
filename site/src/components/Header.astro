@@ -1,0 +1,46 @@
+---
+import { ArrowUpRight, Menu, Search } from '@lucide/astro';
+import { activeHeaderHref, headerNav, VERSION } from '../lib/nav';
+import Mark from './Mark.astro';
+
+const active = activeHeaderHref(Astro.url.pathname);
+---
+
+<header class="site-header">
+  <div class="header-inner">
+    <a class="brand" href="/" aria-label={`devsandboxes home (docs for v${VERSION})`}>
+      <Mark />
+      <span>devsandboxes</span>
+      <span class="brand-version">DOCS · v{VERSION}</span>
+    </a>
+    <nav class="header-nav" aria-label="Main">
+      {
+        headerNav.map((link) =>
+          link.external ? (
+            <a href={link.href} target="_blank" rel="noopener noreferrer">
+              {link.label} <ArrowUpRight size={13} aria-hidden="true" />
+              <span class="visually-hidden">(opens in a new tab)</span>
+            </a>
+          ) : (
+            <a href={link.href} aria-current={active === link.href ? 'page' : undefined}>
+              {link.label}
+            </a>
+          ),
+        )
+      }
+    </nav>
+    <div class="header-actions">
+      <button type="button" class="search-trigger" data-search-open aria-label="Search documentation" aria-keyshortcuts="Control+K Meta+K /">
+        <Search size={16} aria-hidden="true" />
+        <span>Search docs...</span>
+        <kbd aria-hidden="true">⌘ K</kbd>
+      </button>
+      <button type="button" class="mobile-search" data-search-open aria-label="Search documentation">
+        <Search size={20} aria-hidden="true" />
+      </button>
+      <button type="button" class="menu-button" data-drawer-open aria-label="Open navigation menu" aria-controls="mobile-drawer" aria-expanded="false">
+        <Menu size={21} aria-hidden="true" />
+      </button>
+    </div>
+  </div>
+</header>

@@ -1,0 +1,15 @@
+---
+// Step-1 placeholder route; replaced by the `docs` collection route in step 3.
+import Docs from '../../layouts/Docs.astro';
+import { Content, frontmatter, getHeadings } from '../../placeholder/quick-start.mdx';
+---
+
+<Docs
+  title={frontmatter.title}
+  description={frontmatter.description}
+  eyebrow={frontmatter.eyebrow}
+  headings={getHeadings()}
+  next={{ href: '/docs/config', title: 'Configuration', description: 'Every config.toml field, merge rule and variable.' }}
+>
+  <Content />
+</Docs>
