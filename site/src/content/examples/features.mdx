@@ -1,0 +1,95 @@
+---
+title: devcontainer Features
+description: Add Node, Rust and the GitHub CLI to any base image with devcontainer Features in TOML, share them through a template, and rebuild when they change.
+order: 8
+icon: package
+tags: [devcontainers, images]
+related: [port-a-devcontainer, caches, vscode]
+---
+
+import AgentPrompt from '../../components/AgentPrompt.astro';
+import Callout from '../../components/Callout.astro';
+
+## The problem
+
+Every repo needs a slightly different toolchain: this one Node 22 with pnpm, that one Rust, all of them `gh`. Writing and maintaining a Dockerfile per repo for that is busywork, and the devcontainer ecosystem already packages each tool as a **Feature**.
+
+devsandbox installs Features natively, without the devcontainer CLI: list them under `features` with the same references and options as in `devcontainer.json`, and `run` bakes them into an image derived from your `image` or `build`. Templates make one list reach every sandbox.
+
+## Config
+
+```toml title="config.toml"
+[template.tools]
+remoteUser = "vscode"
+[template.tools.features]
+"ghcr.io/devcontainers/features/github-cli:1" = true
+
+[sandbox.service]
+extends = "tools"
+folder = "../service"
+image = "mcr.microsoft.com/devcontainers/base:ubuntu"
+[sandbox.service.features]
+"ghcr.io/devcontainers/features/node:1" = { version = "22", pnpmVersion = "latest" }
+"ghcr.io/devcontainers/features/rust:1" = { version = "stable", profile = "minimal" }
+
+[sandbox.docs]
+extends = "tools"
+folder = "../docs"
+image = "mcr.microsoft.com/devcontainers/base:ubuntu"
+[sandbox.docs.features]
+"ghcr.io/devcontainers/features/node:1" = "lts"
+"ghcr.io/devcontainers/features/github-cli:1" = false   # inherited, not needed here
+```
+
+Each value takes one of four forms: a table of options, a string (shorthand for the `version` option), `true` (default options) or `false` (skip it, which is how `docs` drops the template's `gh`). Features tables merge key by key under `extends`, so `service` ends up with all three.
+
+## Try it
+
+```bash
+devsandbox run service    # fetches the features, builds devsandbox-img-service-feat
+devsandbox exec service node --version     # v22.x
+devsandbox exec service pnpm --version
+devsandbox exec service cargo --version
+devsandbox exec service gh --version
+```
+
+The first `run` of a sandbox with Features fetches each one and builds its image; the build output shows every feature's install script with the options it got. The next instance of the same sandbox is quick: the fetched Features are cached and the runtime's layer cache serves the build.
+
+Now change a Feature, say `version = "20"` for node in `service`, and bring the instance up to date:
+
+```bash
+devsandbox -C . ls                 # still valid?
+devsandbox rebuild service         # drifted: recreates it with node 20
+devsandbox rebuild --all           # or every drifted instance at once
+```
+
+`rebuild` keeps the instance's name, worktree and branch, and re-runs the lifecycle commands. On an instance without drift it does nothing.
+
+## How it works
+
+- **Fetch.** A Feature is an OCI artifact. devsandbox pulls it from its registry (anonymous token, manifest, layer) and extracts it into a per-user cache, `$XDG_CACHE_HOME/devsandbox/features/` (default `~/.cache/devsandbox/features/`). Only OCI references work: local paths and tarball URLs are an error ([`features`](/docs/config#implemented-devcontainer-properties)).
+- **Order and install.** Features install in `installsAfter` order (alphabetical when unconstrained). Each gets a `RUN` step in a generated Dockerfile `FROM` your `image` or `build` result, with its options as environment variables and `_REMOTE_USER` set from `remoteUser` (default `root`), like the devcontainer CLI does. The result is tagged `devsandbox-img-<sandbox>-feat`.
+- **What a Feature can declare.** Its `containerEnv` (such as `PATH` additions), `mounts`, `privileged` and `entrypoint` are applied; its `capAdd` is ignored. A sandbox `mounts` entry on the same target replaces a Feature's mount, and a mount the host or runtime can't satisfy is skipped with a warning.
+- **Drift.** The `features` table is part of the merged sandbox config, so adding, removing or changing the options of a Feature (here or in a template) marks existing instances as drifted: `start` warns and the dashboard's detail panel says `drift`. `devsandbox rebuild` applies it ([drift](/docs/config#drift)).
+- **Not refreshed by itself.** The contents of a Feature are not hashed, and a cached Feature is reused as is, so a new release behind a moving tag like `:1` is not picked up. To force one: delete its directory under the cache, then `devsandbox rebuild --force <instance>`.
+- **Not supported.** `overrideFeatureInstallOrder` is accepted but ignored; `dependsOn` isn't resolved, so list a Feature's dependencies yourself.
+
+<Callout variant="tip" title="Features and caches">
+  A Feature installs the tool; [shared caches](/examples/caches) keep what the tool downloads. The two combine, e.g. the
+  node Feature plus `caches = ["pnpm"]` on a root sandbox.
+</Callout>
+
+## Agent instructions
+
+<AgentPrompt
+  goal="Install <tools> in my devsandbox sandbox <sandbox name> with devcontainer Features instead of a custom Dockerfile."
+  steps={[
+    'Find the official Feature for each tool (for example `ghcr.io/devcontainers/features/node:1`, `rust:1`, `github-cli:1`) and read its options in its devcontainer-feature.json; use only options it declares.',
+    'Add them to `[sandbox.<sandbox name>.features]` as `"<oci ref>" = { <options> }`, a version string, or `true`. If several sandboxes need the same Feature, put it in a template they extend, and use `= false` in a sandbox that must not inherit one. OCI references only.',
+    'Remove whatever the Features replace (Dockerfile steps, install commands in `postCreateCommand`), but ask me before deleting a Dockerfile.',
+  ]}
+  verify={[
+    'Ask me, then apply it: `devsandbox -C <config dir> rebuild <instance>` for an existing instance (the edit makes it drift), or `devsandbox -C <config dir> run <sandbox name>` for a new one. The first build fetches the Features and can take minutes.',
+    'Check each tool with `devsandbox -C <config dir> exec <instance> <tool> --version` and report the versions.',
+  ]}
+/>
