@@ -1,6 +1,7 @@
 ---
 import { ArrowUpRight, Menu, Search } from '@lucide/astro';
 import { activeHeaderHref, headerNav, VERSION } from '../lib/nav';
+import GitHubMark from './GitHubMark.astro';
 import Mark from './Mark.astro';
 
 const active = activeHeaderHref(Astro.url.pathname);
@@ -17,7 +18,8 @@ const active = activeHeaderHref(Astro.url.pathname);
       {
         headerNav.map((link) =>
           link.external ? (
-            <a href={link.href} target="_blank" rel="noopener noreferrer">
+            <a class="header-github" href={link.href} target="_blank" rel="noopener noreferrer">
+              <GitHubMark size={16} />
               {link.label} <ArrowUpRight size={13} aria-hidden="true" />
               <span class="visually-hidden">(opens in a new tab)</span>
             </a>

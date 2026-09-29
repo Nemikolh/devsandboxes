@@ -90,6 +90,14 @@
   color: #f4faf8;
 }
 
+.header-nav a.header-github {
+  gap: 7px;
+}
+
+.header-nav a.header-github svg:first-child {
+  color: #e9efef;
+}
+
 .header-nav a[aria-current]::after {
   content: '';
   height: 2px;
