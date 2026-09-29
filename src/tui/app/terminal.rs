@@ -226,7 +226,7 @@ impl App {
             .active_session()
             .map(|s| s.size())
             .unwrap_or((24, 80));
-        match TermSession::spawn(title, container, argv, rows, cols) {
+        match TermSession::spawn(title, container, argv, rows, cols, self.kitty) {
             Ok(session) => {
                 self.terms.open(session);
                 self.focus = Focus::Terminal;

@@ -3,7 +3,8 @@
 //! A [`TermSession`] owns one child shell attached to a pseudo-terminal: the
 //! PTY byte stream is fed into a [`vt100::Parser`] on a background reader
 //! thread, so the ratatui event loop only has to render the parsed screen and
-//! forward key bytes. Everything here is deliberately self-contained so the
+//! forward key bytes. The parser's callbacks emulate the kitty keyboard
+//! protocol ([`super::kitty`]); the reader writes its query replies back. Everything here is deliberately self-contained so the
 //! app state machine ([`super::app`]) can stay I/O-free and unit-testable.
 //!
 //! [`TermTabs`] holds the open sessions as a pure tab strip (active index,
@@ -17,6 +18,16 @@ use std::thread;
 use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+
+use super::kitty::KittyState;
+
+/// The session's parsed screen, with the kitty protocol state riding along as
+/// the parser's callbacks.
+pub type TermParser = vt100::Parser<KittyState>;
+
+/// PTY write half, shared between the UI thread (keys) and the reader thread
+/// (replies to the child's terminal queries).
+type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 
 /// vt100 scrollback retained per session, in lines. Generous enough that a
 /// `cargo build` or a `git log` stays scrollable without unbounded growth.
@@ -45,13 +56,16 @@ pub struct TermSession {
     pub container: String,
     /// Shared parsed screen. The reader thread feeds bytes in; the UI thread
     /// reads it out to render. `Arc<Mutex<…>>` because both threads touch it.
-    parser: Arc<Mutex<vt100::Parser>>,
+    parser: Arc<Mutex<TermParser>>,
     /// PTY master. `None` in the test constructor (no real PTY). Kept so we can
     /// `resize()` the kernel winsize as the pane changes size.
     master: Option<Box<dyn MasterPty + Send>>,
     /// Write half of the PTY: key bytes go here. In tests this is an in-memory
     /// buffer so key encoding/forwarding can be asserted without a child.
-    writer: Box<dyn Write + Send>,
+    writer: SharedWriter,
+    /// The test writer's buffer, read back by [`Self::take_written`].
+    #[cfg(test)]
+    written: Arc<Mutex<Vec<u8>>>,
     /// Child handle, kept so [`Drop`] can kill+wait it. `None` in tests.
     child: Option<Box<dyn Child + Send + Sync>>,
     /// Set by the reader thread once the PTY hits EOF (shell exited / container
@@ -64,13 +78,16 @@ pub struct TermSession {
 impl TermSession {
     /// Spawn `argv` (the *full* runtime command, e.g. `docker exec -it …`) on a
     /// fresh PTY sized `rows`×`cols`, wire a reader thread that pumps output
-    /// into the vt100 parser, and return the live session.
+    /// into the vt100 parser, and return the live session. `kitty`: whether
+    /// the outer terminal speaks the kitty keyboard protocol, i.e. whether to
+    /// offer it to the child.
     pub fn spawn(
         title: String,
         container: String,
         argv: Vec<String>,
         rows: u16,
         cols: u16,
+        kitty: bool,
     ) -> Result<TermSession> {
         let pair = native_pty_system()
             .openpty(PtySize {
@@ -97,15 +114,16 @@ impl TermSession {
             .master
             .try_clone_reader()
             .context("failed to clone pty reader")?;
-        let writer = pair
-            .master
-            .take_writer()
-            .context("failed to take pty writer")?;
+        let writer: SharedWriter = Arc::new(Mutex::new(
+            pair.master
+                .take_writer()
+                .context("failed to take pty writer")?,
+        ));
 
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, SCROLLBACK)));
+        let parser = Arc::new(Mutex::new(new_parser(rows, cols, kitty)));
         let exited = Arc::new(AtomicBool::new(false));
 
-        spawn_reader(reader, parser.clone(), exited.clone());
+        spawn_reader(reader, parser.clone(), writer.clone(), exited.clone());
 
         Ok(TermSession {
             title,
@@ -113,6 +131,8 @@ impl TermSession {
             parser,
             master: Some(pair.master),
             writer,
+            #[cfg(test)]
+            written: Arc::default(),
             child: Some(child),
             exited,
             size: (rows, cols),
@@ -120,7 +140,7 @@ impl TermSession {
     }
 
     /// Shared screen, for the renderer.
-    pub fn parser(&self) -> &Arc<Mutex<vt100::Parser>> {
+    pub fn parser(&self) -> &Arc<Mutex<TermParser>> {
         &self.parser
     }
 
@@ -147,8 +167,7 @@ impl TermSession {
     /// Forward raw key bytes to the shell. Errors are ignored: once the child
     /// has exited the write fails benignly, and there is nothing to recover.
     pub fn write_key_bytes(&mut self, bytes: &[u8]) {
-        let _ = self.writer.write_all(bytes);
-        let _ = self.writer.flush();
+        write_pty(&self.writer, bytes);
     }
 
     /// Whether the child has exited (PTY EOF seen by the reader thread).
@@ -163,15 +182,18 @@ impl TermSession {
 
     /// Test constructor: an in-memory writer, no PTY, no child. Lets tab and
     /// key-forwarding logic be exercised without a container runtime. Shared with
-    /// [`super::app`]'s tests via `pub(crate)`.
+    /// [`super::app`]'s tests via `pub(crate)`. Kitty emulation is on, as
+    /// behind a supporting outer terminal.
     #[cfg(test)]
     pub(crate) fn test_session(title: &str, container: &str, rows: u16, cols: u16) -> TermSession {
+        let written: Arc<Mutex<Vec<u8>>> = Arc::default();
         TermSession {
             title: title.into(),
             container: container.into(),
-            parser: Arc::new(Mutex::new(vt100::Parser::new(rows, cols, SCROLLBACK))),
+            parser: Arc::new(Mutex::new(new_parser(rows, cols, true))),
             master: None,
-            writer: Box::new(Vec::<u8>::new()),
+            writer: Arc::new(Mutex::new(Box::new(TestWriter(written.clone())))),
+            written,
             child: None,
             exited: Arc::new(AtomicBool::new(false)),
             size: (rows, cols),
@@ -183,6 +205,48 @@ impl TermSession {
     #[cfg(test)]
     pub(crate) fn set_exited(&self) {
         self.exited.store(true, Ordering::Relaxed);
+    }
+
+    /// Test helper: drain what has been written to the PTY so far.
+    #[cfg(test)]
+    pub(crate) fn take_written(&self) -> Vec<u8> {
+        std::mem::take(&mut *self.written.lock().unwrap())
+    }
+
+    /// Test helper: feed child output through the reader thread's path (parse,
+    /// then answer queries) without a PTY.
+    #[cfg(test)]
+    pub(crate) fn feed_output(&self, bytes: &[u8]) {
+        process_output(&self.parser, &self.writer, bytes);
+    }
+}
+
+/// In-memory PTY stand-in for [`TermSession::test_session`].
+#[cfg(test)]
+struct TestWriter(Arc<Mutex<Vec<u8>>>);
+
+#[cfg(test)]
+impl Write for TestWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn new_parser(rows: u16, cols: u16, kitty: bool) -> TermParser {
+    vt100::Parser::new_with_callbacks(rows, cols, SCROLLBACK, KittyState::new(kitty))
+}
+
+/// Write to the PTY and flush. Errors are ignored: once the child has exited
+/// the write fails benignly, and there is nothing to recover.
+fn write_pty(writer: &SharedWriter, bytes: &[u8]) {
+    if let Ok(mut w) = writer.lock() {
+        let _ = w.write_all(bytes);
+        let _ = w.flush();
     }
 }
 
@@ -300,7 +364,8 @@ impl TermTabs {
 /// buffer diff collapses redraws that changed nothing.
 fn spawn_reader(
     mut reader: Box<dyn Read + Send>,
-    parser: Arc<Mutex<vt100::Parser>>,
+    parser: Arc<Mutex<TermParser>>,
+    writer: SharedWriter,
     exited: Arc<AtomicBool>,
 ) {
     thread::spawn(move || {
@@ -308,16 +373,31 @@ fn spawn_reader(
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => break,
-                Ok(n) => {
-                    if let Ok(mut parser) = parser.lock() {
-                        parser.process(&buf[..n]);
-                    }
-                }
+                Ok(n) => process_output(&parser, &writer, &buf[..n]),
                 Err(_) => break,
             }
         }
         exited.store(true, Ordering::Relaxed);
     });
+}
+
+/// Feed one chunk of child output to the parser, then write back the replies
+/// its kitty callbacks queued. The write happens after the parser lock is
+/// released so a slow PTY never stalls rendering.
+fn process_output(parser: &Mutex<TermParser>, writer: &SharedWriter, bytes: &[u8]) {
+    let replies = match parser.lock() {
+        Ok(mut parser) => {
+            parser.process(bytes);
+            if !parser.screen().alternate_screen() {
+                parser.callbacks_mut().reset_alt();
+            }
+            parser.callbacks_mut().take_replies()
+        }
+        Err(_) => return,
+    };
+    if !replies.is_empty() {
+        write_pty(writer, &replies);
+    }
 }
 
 /// Encode a crossterm key event into the byte sequence a terminal expects,
@@ -594,6 +674,18 @@ mod tests {
         assert_eq!(s.container, "devsandbox-web-1");
         assert_eq!(s.size(), (24, 80));
         assert!(!s.exited());
+    }
+
+    #[test]
+    fn kitty_query_is_answered_on_the_pty() {
+        let s = TermSession::test_session("web-1", "devsandbox-web-1", 24, 80);
+        s.feed_output(b"\x1b[?1049h\x1b[>1u\x1b[?u");
+        assert_eq!(s.take_written(), b"\x1b[?1u");
+        // Back on the main screen: the alt stack is dropped, so the next app to
+        // enter it starts clean.
+        s.feed_output(b"\x1b[?1049l");
+        s.feed_output(b"\x1b[?1049h\x1b[?u");
+        assert_eq!(s.take_written(), b"\x1b[?0u");
     }
 
     #[test]

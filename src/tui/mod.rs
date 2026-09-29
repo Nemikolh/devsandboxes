@@ -8,6 +8,7 @@ mod app;
 mod data;
 #[cfg(unix)]
 mod forwards;
+mod kitty;
 mod procs;
 mod prompt;
 mod spec;
@@ -169,6 +170,7 @@ fn install_panic_hook() {
 fn run(terminal: &mut Term, mut app: App) -> Result<()> {
     let dir = app.dir.clone();
     app.utc_offset = local_utc_offset();
+    app.kitty = KITTY.load(Ordering::Relaxed);
     // At most one collection thread in flight; `Some` while one is running.
     let mut pending: Option<Receiver<Snapshot>> = Some(spawn_collect(&dir));
     // Background `s` stops/starts, each reporting completion over its own

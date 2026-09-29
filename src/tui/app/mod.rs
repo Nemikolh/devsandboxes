@@ -170,6 +170,9 @@ pub struct App {
     /// Open integrated-terminal tabs, shared across both top-level tabs. Empty
     /// until the user opens one with `t`.
     pub terms: TermTabs,
+    /// Whether the outer terminal speaks the kitty keyboard protocol, so new
+    /// terminals offer it to their child. Set once by the event loop.
+    pub kitty: bool,
     pub should_quit: bool,
 }
 
@@ -202,6 +205,7 @@ impl App {
             dragging_divider: false,
             focus: Focus::Dashboard,
             terms: TermTabs::default(),
+            kitty: false,
             should_quit: false,
         }
     }
