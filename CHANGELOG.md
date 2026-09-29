@@ -76,6 +76,11 @@ devsbd ls; devsbd stop pr-123; devsbd rm pr-123
 
 <details><summary>Commits</summary>
 
+- 9d7efc8 feat(dispatch): devsbd run rm and run prune, so dispatchers can clear runs instead of letting them pile up
+- 2608a23 fix(autostart): never start or create dispatcher children at boot, so idle children the dispatcher parked stay stopped
+- 54193b6 feat(run): keep --env values in state so rebuilds, including a dispatcher recreating a child, don't drop them
+- 57237dc fix(rebuild): copy worktree-include files on rebuild so the drift a new pattern raises is actually fixed by rebuilding
+- 2feb352 docs(changelog): unreleased notes for the security hardening and existing-branch worktrees
 - d022e5c feat(run): reuse an existing local or origin branch for a worktree instead of refusing, so instances and dispatcher children can work on PR branches
 - 36f532a fix(port): look up lsof on the container's PATH again, the --env deny-list already closes the PATH injection and the fixed PATH hid lsof in /usr/local/bin
 - e5404ac fix(devsbd): cap run ls to the newest 50 runs and bounded argv/meta reads, so a container user can't make run listings unbounded
