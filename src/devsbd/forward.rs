@@ -283,6 +283,12 @@ fn accept_loop(listener: TcpListener, shared: Arc<Shared>, stop: Arc<AtomicBool>
     while !stop.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((sock, _)) => {
+                // macOS (BSD) sockets inherit the listener's O_NONBLOCK on
+                // accept, Linux ones don't; the relay reads blocking, so clear
+                // it or every read fails with WouldBlock.
+                if sock.set_nonblocking(false).is_err() {
+                    continue;
+                }
                 // A handler may wait (bounded) for a Connecting bridge; run it
                 // off the accept loop so one client's wait can't stall the next
                 // accept. Track it so `Drop` joins it, pruning finished ones.
