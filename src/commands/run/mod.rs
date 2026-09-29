@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
-use crate::config::{build_hash, substitute, Config, MountContext, ResolvedSandbox, CONFIG_FILE};
+use crate::config::{build_hash, short_hash, substitute, Config, MountContext, ResolvedSandbox, CONFIG_FILE};
 use crate::runtime::{backend, ServiceEndpoint, NAME_PREFIX};
 use crate::state::{Instance, State};
 
@@ -321,7 +321,7 @@ pub(crate) fn materialize(
     let link_store = if links.is_empty() {
         None
     } else {
-        let store = config_dir.join("shared-files").join(sandbox_name);
+        let store = link_store(&config_dir, folder, &basename);
         let mut trees = vec![folder];
         if worktree.is_some() {
             trees.push(source);
@@ -598,6 +598,15 @@ pub(crate) fn boot_spec_for(
 /// `folder` (the mounted source), not `base_folder`: worktree instances carry
 /// the base's `base_folder` but have their own working tree, so they must not
 /// keep the base checkout reserved after its direct-mount instance is removed.
+/// The `worktree-link` store for base repo `folder` (canonical). One per repo,
+/// not per sandbox: the base checkout holds a single link per path, so two
+/// sandboxes on one folder must share the copy it points at. The basename
+/// keeps it readable; the path hash keeps two same-named repos apart.
+fn link_store(config_dir: &Path, folder: &Path, basename: &str) -> PathBuf {
+    let hash = short_hash(&folder.to_string_lossy());
+    config_dir.join("shared-files").join(format!("{basename}-{}", &hash[..8]))
+}
+
 fn base_in_use(state: &State, folder: &Path) -> bool {
     state.instances.values().any(|i| i.folder == folder)
 }
@@ -904,6 +913,18 @@ mod tests {
     fn default_name_is_sandbox_when_absent() {
         let state = State::default();
         assert_eq!(default_instance_name(&state, "repo"), "repo");
+    }
+
+    #[test]
+    fn link_store_is_per_repo() {
+        let cfg = Path::new("/cfg");
+        let a = link_store(cfg, Path::new("/src/a/app"), "app");
+        assert!(a.starts_with("/cfg/shared-files"), "{}", a.display());
+        assert!(a.file_name().unwrap().to_string_lossy().starts_with("app-"));
+        // Same folder, same store (whichever sandbox asks); same basename
+        // elsewhere, a different one.
+        assert_eq!(a, link_store(cfg, Path::new("/src/a/app"), "app"));
+        assert_ne!(a, link_store(cfg, Path::new("/src/b/app"), "app"));
     }
 
     #[test]

@@ -108,9 +108,12 @@ no `**` and no `[...]` (`[` is literal).
   is linked as soon as the file shows up.
 - Every match goes through the same checks as an exact entry below.
 
-- **Store**: `<config>/shared-files/<sandbox>/<path>` holds the real file or
-  directory. There's one store per sandbox, shared by the base instance and
-  every worktree instance. `rm` never touches it.
+- **Store**: `<config>/shared-files/<folder-basename>-<hash>/<path>` holds the
+  real file or directory, where the hash is 8 hex chars of the canonical base
+  folder path. There's one store per **base repo**, shared by every sandbox on
+  that folder and all of their instances. It has to be per repo: the base
+  checkout holds a single link per path, so two sandboxes on one folder can
+  only share one copy. `rm` never touches it.
 - **Mount**: the store dir is mounted at its **identical absolute host path**,
   the same trick `git_companion_mount` uses for the base `.git`. The absolute
   symlinks then resolve inside the container too. The mount is read-write, so
@@ -135,6 +138,21 @@ that command generates is adopted. For each entry:
    hand and delete it; the next `run` or `rebuild` links it.
 4. If neither the store nor the base repo has the path, the entry is skipped
    silently, and a later run links it once the file exists.
+
+**Migration from per-sandbox stores.** Up to 0.4.0 the store was
+`shared-files/<sandbox>/`, so a second sandbox on the same folder found the
+base already linked into the first one's store and linked nothing. An absolute
+symlink into a *sibling* store under `shared-files/` is recognized as one of
+those old links:
+
+- in **adopt**, if the new store has no copy yet, the old store's copy that
+  the base link points to is moved into the new store;
+- in **link**, such a link is replaced rather than reported as a conflict. If
+  its old target still exists (two old stores held diverging copies), a warning
+  says where that copy was left.
+
+Symlinks pointing anywhere else are the user's and are never touched. Running
+containers still mount the old store until their next `rebuild`.
 
 Caveat: a `dir/` gitignore pattern matches directories only, and git sees a
 symlink as a file, so a linked directory shows up as untracked. The link step
@@ -169,7 +187,7 @@ from the TUI, and stdout carries the instance name for scripts.
 ## Out of scope (possible follow-ups)
 
 - `.worktreeinclude.local` (per-user additions and negations, read last).
-- `**` / `[...]` in `worktree-link`, read-only store mounts, a per-repo (rather than
-  per-sandbox) store, and an `unlink`/restore command.
+- `**` / `[...]` in `worktree-link`, read-only store mounts, and an
+  `unlink`/restore command.
 - Serving shared files through `devsbd` into a tmpfs, so secrets never sit in
   plaintext under the config dir.

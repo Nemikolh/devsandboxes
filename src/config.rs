@@ -58,7 +58,8 @@ pub struct SandboxProperties {
     #[serde(rename = "worktree-include")]
     pub worktree_include: Option<Vec<String>>,
     /// Repo-relative gitignored paths shared live by every instance: kept in
-    /// `shared-files/<sandbox>/` and symlinked into each working tree, the
+    /// `shared-files/<repo>-<hash>/` (one per base folder, shared by every
+    /// sandbox on it) and symlinked into each working tree, the
     /// store mounted at its host path (docs/worktreeinclude.md).
     #[serde(rename = "worktree-link")]
     pub worktree_link: Option<Vec<String>>,

@@ -60,6 +60,10 @@ devsbd ls; devsbd stop pr-123; devsbd rm pr-123
 - `devsandbox status --json` instance rows include `instance_id` and, for children, `dispatcher`.
 - **`rebuild` applies `worktree-include`.** Before, adding a pattern marked instances as drifted, but the rebuild copied nothing. Now `rebuild` copies any missing matching files into the worktree; existing files are never overwritten. A copied file you delete on purpose comes back on the next rebuild, so drop the pattern instead.
 
+### Fixed
+
+- **`worktree-link` works for several sandboxes on the same folder.** The shared copy used to live in one store per sandbox. The base checkout can only link to one of them, so the second sandbox's worktrees got nothing. The store is now per repo: `shared-files/<folder name>-<hash>/`, shared by every sandbox on that folder. The next `run` or `rebuild` moves files from the old `shared-files/<sandbox>/` stores and relinks the base checkout and worktrees. Instances still running on an old store need a `rebuild`. If two old stores held different copies of a file, the one the base checkout linked to wins, and the other stays where it was with a warning.
+
 ### Security
 
 - **Git on the host can no longer run code planted by a sandbox.** Worktree instances mount the base repo's `.git` read-write, so a container could plant hooks or command-running config (`core.fsmonitor`, `core.sshCommand`, filter drivers, `include.path`, ...) that the host's `git worktree add` / `fetch` / `worktree remove` would then run as you.
