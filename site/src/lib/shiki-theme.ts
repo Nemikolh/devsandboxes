@@ -47,6 +47,7 @@ export const devsandboxesTheme: ThemeRegistration = {
         'variable.parameter',
         'entity.other.attribute-name',
         'keyword.key.toml',
+        'variable.other.key.toml',
         'support.type.property-name.toml',
         'entity.name.section.toml',
         'entity.other.attribute-name.table.toml',
