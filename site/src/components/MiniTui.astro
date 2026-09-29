@@ -2,12 +2,28 @@
 /**
  * The mini dashboard: a playable window modelled on the real TUI
  * (`src/tui/ui.rs`). The markup is the no-JS state (`STATIC` in
- * `lib/mini-tui.ts`); a host script brings it to life with `mountMiniTui`
- * (`scripts/mini-tui.ts`), which drives the `data-tui-*` hooks and reports
- * state changes to the host (the landing diagram, a docs tutorial).
+ * `lib/mini-tui.ts`), rendered with the same span helpers the driver uses; a
+ * host script brings it to life with `mountMiniTui` (`scripts/mini-tui.ts`),
+ * which drives the `data-tui-*` hooks and reports state changes to the host
+ * (the landing diagram, a docs tutorial). Every part a host may point at
+ * carries `data-tui-region` (tabs, instances, detail, services, ports, inbox,
+ * terminal, prompt, hints, help, logs, config, suspended, status).
  */
 import { SquareTerminal } from '@lucide/astro';
-import { FOLDER, INSTANCES, NOTIFY_FROM, STATIC, TABS, TAB_LABEL, UPTIME, selectedName } from '../lib/mini-tui';
+import {
+  detailLines,
+  instanceCells,
+  type Line,
+  sandboxCells,
+  SANDBOX,
+  SERVICE,
+  STATIC,
+  TABS,
+  TAB_LABEL,
+  totalsLine,
+  usedBy,
+} from '../lib/mini-tui';
+import { SERVICE_CONTAINER } from '../lib/mini-tui-content';
 import { VERSION } from '../lib/nav';
 import '../styles/mini-tui.css';
 
@@ -23,11 +39,46 @@ interface Props {
 
 const { id = 'tui', autoplay = false, interactive = true, label = 'Dashboard preview' } = Astro.props;
 
-const selected = selectedName(STATIC);
 const unread = STATIC.unread;
-const service = 'postgres';
-const worktree = (name: string) => name !== 'web';
 const keysId = `${id}-keys`;
+const selected = STATIC.instances[STATIC.selected]?.name;
+const escape = (t: string) => t.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+/**
+ * A Line (spans with colour classes) as one HTML string: the rows are
+ * `white-space: pre`, so no formatting whitespace may sneak in between spans.
+ */
+const spansHtml = (line: Line) =>
+  line.map((s) => (s.cls ? `<span class="${s.cls}">${escape(s.text)}</span>` : escape(s.text))).join('');
+/** Keycap button, out of the tab order (the widget is one tab stop). */
+const cap = (key: string, text: string) => ({ key, text });
+/**
+ * A dashboard hint (`draw_help`'s per-tab list, trimmed): keycaps, a label, the
+ * tabs it shows on (all when unset), an optional live verb; `wide` ones only
+ * fit a wider widget than the landing page's (the `?` overlay lists them all).
+ */
+const dashHints: {
+  caps: { key: string; text: string }[];
+  text: string;
+  tabs?: string;
+  verb?: string;
+  terms?: boolean;
+  wide?: boolean;
+}[] = [
+  { caps: [cap('ArrowUp', '↑'), cap('ArrowDown', '↓')], text: 'select' },
+  { caps: [cap('Enter', 'enter')], text: 'config', tabs: 'instances services' },
+  { caps: [cap('o', 'o')], text: 'vscode', tabs: 'instances' },
+  { caps: [cap('s', 's')], text: 'stop', tabs: 'instances', verb: 's' },
+  { caps: [cap('l', 'l')], text: 'logs', tabs: 'instances', wide: true },
+  { caps: [cap('p', 'p')], text: 'forward', tabs: 'instances', wide: true },
+  { caps: [cap('p', 'p')], text: 'forward', tabs: 'services' },
+  { caps: [cap('d', 'd')], text: 'stop forward', tabs: 'ports' },
+  { caps: [cap('t', 't')], text: 'term', tabs: 'instances' },
+  { caps: [cap(':', ':')], text: 'cmd' },
+  { caps: [cap('Tab', 'tab')], text: 'switch', wide: true },
+  { caps: [cap('?', '?')], text: 'help' },
+  { caps: [cap('[', '['), cap(']', ']')], text: 'terms', terms: true },
+  { caps: [cap('x', 'x')], text: 'close term', terms: true },
+];
 ---
 
 <div
@@ -43,8 +94,10 @@ const keysId = `${id}-keys`;
     interactive && (
       <p class="visually-hidden" id={keysId}>
         Arrow keys or j and k select an instance, o opens it in VS Code, Escape closes VS Code, t opens a terminal on it,
-        left and right arrows or 1 to 4 switch tabs, question mark shows help. In a terminal, keys go to the shell and
-        Escape returns to the dashboard; square brackets switch terminals and x closes one. Tab leaves the preview.
+        s stops or starts it, l shows its logs, p forwards a port, Enter opens the config explorer, colon opens the
+        command prompt where Tab completes and Escape cancels, left and right arrows or 1 to 4 switch tabs, question
+        mark shows help. In a terminal, keys go to the shell and Escape returns to the dashboard; square brackets switch
+        terminals and x closes one. Tab leaves the preview.
       </p>
     )
   }
@@ -56,7 +109,7 @@ const keysId = `${id}-keys`;
   </div>
 
   <div class="tui-screen">
-    <div class="tui-tabs">
+    <div class="tui-tabs" data-tui-region="tabs">
       {
         TABS.map((t) => (
           <button type="button" tabindex="-1" class="tui-tab" data-tui-tab={t} data-active={t === STATIC.tab ? '' : undefined}>
@@ -69,79 +122,54 @@ const keysId = `${id}-keys`;
           </button>
         ))
       }
-      <span class="tui-totals">1 sandbox · 3 running / 0 stopped · 1 service container · docker 27.3.1</span>
+      <span class="tui-totals" data-tui-totals>{totalsLine(STATIC)}</span>
     </div>
 
     <div class="tui-body">
       <div class="tui-panel" data-tui-panel="instances">
-        <div class="tui-box tui-table">
+        <div class="tui-box tui-table" data-tui-region="instances">
           <span class="tui-box-title">Instances</span>
           <div class="tui-tr tui-th">
             <span>TREE</span><span>STATUS</span><span>UPTIME</span><span>FOLDER</span>
           </div>
-          <div class="tui-tr tui-group" data-tui-group="web">
-            <span class="tui-accent">▾ web</span>
-            <span class="tui-green">3/3 running</span>
-            <span></span>
-            <span><span class="tui-source">image node:22</span> <span class="tui-dim">../web</span></span>
+          <div class="tui-tr tui-row tui-group" data-tui-group={SANDBOX}>
+            {sandboxCells(STATIC).map((line) => <span><Fragment set:html={spansHtml(line)} /></span>)}
           </div>
-          {
-            INSTANCES.map((name) => (
-              <div class="tui-tr tui-row" data-tui-row={name} data-selected={name === selected ? '' : undefined}>
-                <span>
-                  {'  '}
-                  {name}
-                  <span class="tui-mail" data-tui-row-unread hidden={name !== NOTIFY_FROM || unread === 0}>
-                    {' '}✉{unread}
-                  </span>
-                </span>
-                <span class="tui-green">running</span>
-                <span>{UPTIME[name]}</span>
-                <span>{worktree(name) ? `⎇ ${FOLDER[name]}` : FOLDER[name]}</span>
-              </div>
-            ))
-          }
+          <div class="tui-rows" data-tui-rows>
+            {
+              STATIC.instances.map((i) => (
+                <div class="tui-tr tui-row" data-tui-row={i.name} data-selected={i.name === selected ? '' : undefined}>
+                  {instanceCells(STATIC, i).map((line) => <span><Fragment set:html={spansHtml(line)} /></span>)}
+                </div>
+              ))
+            }
+          </div>
         </div>
-        <div class="tui-box tui-detail">
+        <div class="tui-box tui-detail" data-tui-region="detail">
           <span class="tui-box-title">Detail</span>
-          {
-            INSTANCES.map((name) => (
-              <div class="tui-kv" data-tui-detail-for={name} hidden={name !== selected}>
-                <div><span class="tui-dim">container: </span>devsandbox-{name}</div>
-                <div><span class="tui-dim">workspace: </span>/workspaces/{name}</div>
-                <div><span class="tui-dim">agents: </span><span class="tui-blue">1</span></div>
-                {worktree(name) ? (
-                  <div>
-                    <span class="tui-dim">base: </span>../web{'   '}
-                    <span class="tui-dim">worktree: </span>
-                    {FOLDER[name]}
-                  </div>
-                ) : (
-                  <div><span class="tui-dim">base folder: </span>../web</div>
-                )}
-              </div>
-            ))
-          }
+          <div class="tui-kv" data-tui-detail>
+            {detailLines(STATIC).map((line) => <div><Fragment set:html={spansHtml(line)} /></div>)}
+          </div>
         </div>
       </div>
 
       <div class="tui-panel" data-tui-panel="services" hidden>
-        <div class="tui-box tui-table">
+        <div class="tui-box tui-table" data-tui-region="services">
           <span class="tui-box-title">Services</span>
           <div class="tui-tr tui-th tui-tr--services">
             <span>NAME</span><span>SCOPE</span><span>STATUS</span><span>USED BY</span>
           </div>
-          <div class="tui-tr tui-row tui-tr--services" data-tui-row={service} data-selected>
-            <span>{service}</span>
+          <div class="tui-tr tui-row tui-tr--services" data-tui-row={SERVICE} data-selected>
+            <span>{SERVICE}</span>
             <span class="tui-blue">global</span>
             <span class="tui-green">1 running</span>
-            <span>web,web-2,web-3</span>
+            <span data-tui-used-by>{usedBy(STATIC)}</span>
           </div>
         </div>
         <div class="tui-box tui-detail">
           <span class="tui-box-title">Detail</span>
           <div class="tui-kv">
-            <div>devsandbox-svc-3f9c21ab-{service}{'  '}<span class="tui-green">running</span></div>
+            <div>{SERVICE_CONTAINER}{'  '}<span class="tui-green">running</span></div>
             <div><span class="tui-dim">ports: </span>-</div>
             <div><span class="tui-dim">env: </span>1</div>
           </div>
@@ -149,9 +177,16 @@ const keysId = `${id}-keys`;
       </div>
 
       <div class="tui-panel" data-tui-panel="ports" hidden>
-        <div class="tui-box tui-table tui-empty">
+        {/* `draw_ports_empty` / `draw_ports_table`: one box, the empty line or the table. */}
+        <div class="tui-box tui-table tui-empty" data-tui-ports data-tui-region="ports">
           <span class="tui-box-title">Ports</span>
-          <span class="tui-dim">no forwards — press p on an instance or service, or :port &lt;instance&gt; &lt;port&gt;</span>
+          <span class="tui-dim" data-tui-ports-empty
+            >no forwards — press p on an instance or service, or :port &lt;instance&gt; &lt;port&gt;</span
+          >
+          <div class="tui-tr tui-th tui-tr--ports" data-tui-ports-head hidden>
+            <span>LOCAL</span><span>TARGET</span><span>PROCESS</span><span>STATE</span><span>CONNS</span>
+          </div>
+          <div class="tui-rows" data-tui-port-rows></div>
         </div>
         {/* Like the real Ports tab: an empty Detail keeps the terminal split aligned. */}
         <div class="tui-box tui-detail tui-detail--terms">
@@ -160,7 +195,7 @@ const keysId = `${id}-keys`;
       </div>
 
       <div class="tui-panel" data-tui-panel="inbox" hidden>
-        <div class="tui-box tui-table">
+        <div class="tui-box tui-table" data-tui-region="inbox">
           <span class="tui-box-title">Inbox</span>
           <div class="tui-tr tui-th tui-tr--inbox">
             <span>TIME</span><span>LEVEL</span><span>INSTANCE</span><span>MESSAGE</span>
@@ -171,89 +206,160 @@ const keysId = `${id}-keys`;
           <div class="tui-tr tui-row tui-tr--inbox" data-tui-row="notify-1" data-tui-notified data-selected data-unread>
             <span class="tui-dim">14:32</span>
             <span class="tui-dim">info</span>
-            <span>{NOTIFY_FROM}</span>
+            <span>web-3</span>
             <span>tests pass, ready for review</span>
           </div>
         </div>
         <div class="tui-box tui-detail">
           <span class="tui-box-title">Detail</span>
           <div class="tui-kv" data-tui-notified>
-            <div><span class="tui-dim">14:32</span>{'  '}<span class="tui-dim">info</span>{'  '}{NOTIFY_FROM}</div>
+            <div><span class="tui-dim">14:32</span>{'  '}<span class="tui-dim">info</span>{'  '}web-3</div>
             <div>tests pass, ready for review</div>
           </div>
         </div>
       </div>
 
       {/* The integrated terminal (`draw_terminal_panel` in `src/tui/ui.rs`): tab strip as the title. */}
-      <div class="tui-box tui-term" data-tui-term hidden>
+      <div class="tui-box tui-term" data-tui-term data-tui-region="terminal" hidden>
         <span class="tui-box-title tui-term-tabs" data-tui-term-tabs></span>
         <div class="tui-term-screen" data-tui-term-screen></div>
       </div>
 
+      {/* `l`: the logs modal (`Modal::Logs`, drawn by `draw_text_modal`). */}
+      <div class="tui-view" data-tui-view="logs" data-tui-region="logs" hidden>
+        <div class="tui-box tui-pane" data-focused>
+          <span class="tui-box-title" data-tui-logs-title></span>
+          <div class="tui-view-text" data-tui-logs-body></div>
+        </div>
+      </div>
+
+      {/* `enter`: the config explorer (`draw_config_modal`), config | inspect. */}
+      <div class="tui-view tui-view--split" data-tui-view="config" data-tui-region="config" hidden>
+        <div class="tui-box tui-pane" data-focused>
+          <span class="tui-box-title" data-tui-config-title></span>
+          <div class="tui-view-text" data-tui-config-body></div>
+        </div>
+        <div class="tui-box tui-pane">
+          <span class="tui-box-title" data-tui-inspect-title></span>
+          <div class="tui-view-text" data-tui-inspect-body></div>
+        </div>
+      </div>
+
       {/* The `?` overlay: the real HELP_BODY's keys that work here, plus where this preview differs. */}
-      <div class="tui-modal" data-tui-help-overlay hidden>
+      <div class="tui-modal" data-tui-help-overlay data-tui-region="help" hidden>
         <span class="tui-box-title">help — keys</span>
         <dl>
           <dt>↑/k ↓/j</dt><dd>move selection</dd>
-          <dt>o</dt><dd>open in VS Code (Instances)</dd>
-          <dt>t</dt><dd>open terminal (Instances)</dd>
-          <dt>[ / ]</dt><dd>previous / next terminal</dd>
-          <dt>x</dt><dd>close the active terminal</dd>
-          <dt>ctrl-]</dt><dd>focus terminal ↔ dashboard</dd>
-          <dt>tab 1-4</dt><dd>switch tab · jump to tab</dd>
-          <dt>?</dt><dd>this help</dd>
+          <dt>tab 1-4</dt><dd>switch · jump to tab</dd>
+          <dt>enter, e</dt><dd>config explorer</dd>
+          <dt>:</dt><dd>command prompt</dd>
+          <dt>r</dt><dd>run / rename</dd>
+          <dt>o</dt><dd>open in VS Code</dd>
+          <dt>s</dt><dd>stop / start</dd>
+          <dt>l</dt><dd>logs (Instances)</dd>
+          <dt>p</dt><dd>forward a port</dd>
+          <dt>d</dt><dd>stop forward (Ports)</dd>
+          <dt>t</dt><dd>open terminal</dd>
+          <dt>[ / ]</dt><dd>prev / next terminal</dd>
+          <dt>x</dt><dd>close terminal</dd>
+          <dt>ctrl-]</dt><dd>terminal ⇄ dashboard</dd>
         </dl>
         <p class="tui-dim">
-          In this preview ←/→ switch tabs (Tab leaves it; click the <span class="tui-accent">tab</span> key instead)
-          and esc closes VS Code or leaves a terminal. In the dashboard, ←/→ fold rows.
+          In this preview ←/→ switch tabs (Tab leaves it; click a tab instead), esc
+          closes VS Code or leaves a terminal, and the <span class="tui-accent">▾ web</span> row is picked with a click.
+          In the <span class="tui-accent">:</span> prompt Tab completes; in the config explorer{' '}
+          <span class="tui-accent">t</span> toggles original / resolved.
         </p>
         <p class="tui-dim">esc or ? to close</p>
       </div>
     </div>
 
-    {/* One hint bar per focus, like `draw_help` in `src/tui/ui.rs`. */}
-    <div class="tui-help" data-tui-help="dashboard">
+    {/* One hint bar per mode, like `draw_help` in `src/tui/ui.rs`; the prompt takes its place. */}
+    <div class="tui-help" data-tui-help="dashboard" data-tui-region="hints">
+      {
+        dashHints.map((h) => (
+          <span
+            class:list={['tui-hint', { 'tui-hint--wide': h.wide }]}
+            data-tui-for={h.tabs}
+            data-tui-terms-hint={h.terms ? '' : undefined}
+            hidden={(h.tabs !== undefined && !h.tabs.split(' ').includes(STATIC.tab)) || h.terms}
+          >
+            {h.caps.map((c) => (
+              <button type="button" tabindex="-1" class="tui-key" data-key={c.key}>
+                {c.text}
+              </button>
+            ))}
+            <span data-tui-verb={h.verb}>{h.text}</span>
+          </span>
+        ))
+      }
+    </div>
+    <div class="tui-help" data-tui-help="terminal" data-tui-region="hints" hidden>
+      <span class="tui-hint">
+        <button type="button" tabindex="-1" class="tui-key" data-key="Escape">esc</button> / ctrl-] back to dashboard · all
+        other keys go to the shell
+      </span>
+    </div>
+    <div class="tui-help" data-tui-help="exited" data-tui-region="hints" hidden>
+      <span class="tui-hint">
+        terminal exited — <button type="button" tabindex="-1" class="tui-key" data-key="Escape">esc</button> back ·
+        <button type="button" tabindex="-1" class="tui-key" data-key="x">x</button> closes
+      </span>
+    </div>
+    <div class="tui-help" data-tui-help="logs" data-tui-region="hints" hidden>
       <span class="tui-hint">
         <button type="button" tabindex="-1" class="tui-key" data-key="ArrowUp">↑</button><button
           type="button"
           tabindex="-1"
           class="tui-key"
           data-key="ArrowDown">↓</button
-        > select
+        > scroll
       </span>
-      <span class="tui-hint"><button type="button" tabindex="-1" class="tui-key" data-key="o">o</button> open in VS Code</span>
-      <span class="tui-hint"><button type="button" tabindex="-1" class="tui-key" data-key="t">t</button> terminal</span>
-      <span class="tui-hint"><button type="button" tabindex="-1" class="tui-key" data-key="Tab">tab</button> switch</span>
-      <span class="tui-hint"><button type="button" tabindex="-1" class="tui-key" data-key="?">?</button> help</span>
-      <span class="tui-hint" data-tui-terms-hint hidden>
-        <button type="button" tabindex="-1" class="tui-key" data-key="[">[</button><button
+      <span class="tui-hint">
+        <button type="button" tabindex="-1" class="tui-key" data-key="g">g</button><button
           type="button"
           tabindex="-1"
           class="tui-key"
-          data-key="]">]</button
-        > terms
+          data-key="G">G</button
+        > top / bottom
       </span>
-      <span class="tui-hint" data-tui-terms-hint hidden>
-        <button type="button" tabindex="-1" class="tui-key" data-key="x">x</button> close term
+      <span class="tui-hint"><button type="button" tabindex="-1" class="tui-key" data-key="Escape">esc</button> close</span>
+    </div>
+    <div class="tui-help" data-tui-help="config" data-tui-region="hints" hidden>
+      <span class="tui-hint"><button type="button" tabindex="-1" class="tui-key" data-key="t">t</button> toggle</span>
+      <span class="tui-hint">
+        <button type="button" tabindex="-1" class="tui-key" data-key="ArrowUp">↑</button><button
+          type="button"
+          tabindex="-1"
+          class="tui-key"
+          data-key="ArrowDown">↓</button
+        > scroll
+      </span>
+      <span class="tui-hint"><button type="button" tabindex="-1" class="tui-key" data-key="Escape">esc</button> close</span>
+    </div>
+    <div class="tui-help" data-tui-help="help" data-tui-region="hints" hidden>
+      <span class="tui-hint">
+        <button type="button" tabindex="-1" class="tui-key" data-key="Escape">esc</button> / ? close
       </span>
     </div>
-    <div class="tui-help" data-tui-help="terminal" hidden>
-      <span class="tui-hint">
-        <button type="button" tabindex="-1" class="tui-key" data-key="Escape">esc</button> / ctrl-] back to dashboard · all
-        other keys go to the shell
-      </span>
+    {/* `draw_prompt`: `: <input>` with the caret, then candidates (active one accented) or a red error. */}
+    <div class="tui-prompt" data-tui-help="prompt" data-tui-region="prompt" hidden>
+      <div class="tui-prompt-line"><span class="tui-accent">: </span><span data-tui-prompt-input></span><span class="tui-cursor"></span></div>
+      <div class="tui-prompt-hint" data-tui-prompt-hint></div>
     </div>
-    <div class="tui-help" data-tui-help="exited" hidden>
-      <span class="tui-hint">
-        terminal exited — <button type="button" tabindex="-1" class="tui-key" data-key="Escape">esc</button> back ·
-        <button type="button" tabindex="-1" class="tui-key" data-key="x">x</button> closes
-      </span>
+
+    {/* A suspending command (`run_suspended` in `src/tui/mod.rs`): the dashboard is gone until a key. */}
+    <div class="tui-suspended" data-tui-suspended data-tui-region="suspended" hidden>
+      <div class="tui-dim">you@laptop:~/sandboxes$ devsandbox</div>
+      <div data-tui-suspended-lines></div>
+      <div class="tui-dim" data-tui-suspended-return>press any key to return</div>
     </div>
   </div>
 
   <div class="terminal-status" aria-hidden="true">
     <span><span class="status-indicator"></span> DASHBOARD PREVIEW</span>
-    <span class="tui-hint-slot" data-tui-hint hidden>CLICK TO TRY IT</span>
+    <span class="tui-hint-slot" data-tui-hint data-tui-region="status" hidden>CLICK TO TRY IT</span>
     <span>DEVSANDBOX v{VERSION}</span>
   </div>
 </div>
+

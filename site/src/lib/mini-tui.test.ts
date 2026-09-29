@@ -20,6 +20,20 @@ import {
   termRows,
   termTabLabel,
   TIMELINE,
+  configLines,
+  configTitle,
+  detailLines,
+  inspectLines,
+  inspectTitle,
+  instanceCells,
+  logsTitle,
+  portCells,
+  runRenameHint,
+  SANDBOX_ROW,
+  stopStartHint,
+  suspendedLines,
+  totalsLine,
+  usedBy,
 } from './mini-tui';
 
 const keys = (s: State, ...ks: string[]) => ks.reduce((acc, key) => reduce(acc, { type: 'key', key }), s);
@@ -271,8 +285,9 @@ describe('autoplay', () => {
 describe('key plumbing', () => {
   it('handles only the documented keys, never Tab or /', () => {
     const dashboard = ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'j', 'k', 'o', 't', 'x', '[', ']', '?', '1', '4', 'q'];
-    for (const k of [...dashboard, 'Escape', 'F12', CTRL_BRACKET]) expect(isHandledKey(STATIC, k)).toBe(true);
-    for (const k of ['Tab', '/', 'K', 'Enter', ' ', '5', 'Shift', 'Backspace']) expect(isHandledKey(STATIC, k)).toBe(false);
+    const step3 = [':', 'p', 'l', 'r', 's', 'd', 'e', 'Enter'];
+    for (const k of [...dashboard, ...step3, 'Escape', 'F12', CTRL_BRACKET]) expect(isHandledKey(STATIC, k)).toBe(true);
+    for (const k of ['Tab', '/', 'K', ' ', '5', 'Shift', 'Backspace']) expect(isHandledKey(STATIC, k)).toBe(false);
   });
 
   it('a focused terminal takes every key but Tab', () => {
@@ -342,5 +357,353 @@ describe('render helpers', () => {
     expect(hintFor(STATIC, true).text).toBe('? FOR KEYS · TAB LEAVES');
     expect(hintFor(keys(STATIC, 't'), true).text).toBe('ESC TO DASHBOARD · TAB LEAVES');
     expect(hintFor(keys(STATIC, 'o'), true)).toEqual({ kind: 'message', text: 'VS Code opened on web' });
+  });
+});
+
+// ---- Step 3: the rest of the dashboard.
+
+const names = (s: State) => s.instances.map((i) => i.name);
+const inst = (s: State, name: string) => s.instances.find((i) => i.name === name);
+/** Open the prompt, type `line`, press Enter. */
+const command = (s: State, line: string) => keys(s, ':', ...line, 'Enter');
+/** Press any key on the suspended screen. */
+const back = (s: State) => keys(s, ' ');
+const text = (line: { text: string }[]) => line.map((sp) => sp.text).join('');
+
+describe(': prompt', () => {
+  it('opens empty, edits, and Esc cancels without running anything', () => {
+    const s = keys(STATIC, ':', 'r', 'u', 'x', 'Backspace');
+    expect(s.prompt).toEqual({ input: 'ru', completion: null, error: null });
+    expect(keys(s, 'Escape').prompt).toBeNull();
+    expect(keys(s, 'Escape')).toEqual({ ...STATIC });
+    expect(keys(STATIC, ':', 'Backspace').prompt?.input).toBe('');
+  });
+
+  it('takes every key while open, Tab included; dashboard keys are typed', () => {
+    const s = keys(STATIC, ':', 'j', 'o', 't', '2', '?');
+    expect(s.prompt?.input).toBe('jot2?');
+    expect(s.selected).toBe(0);
+    expect(s.vscode).toBeNull();
+    expect(s.help).toBe(false);
+    for (const k of ['Tab', 'Enter', 'Backspace', '/', 'Escape']) expect(isHandledKey(s, k)).toBe(true);
+    expect(keys(s, 'ArrowUp', 'Shift')).toEqual(s);
+  });
+
+  it('Tab completes commands and names, cycling', () => {
+    expect(keys(STATIC, ':', 'r', 'u', 'Tab').prompt?.input).toBe('run');
+    expect(keys(STATIC, ':', 'r', 'u', 'Tab', ' ', 'Tab').prompt?.input).toBe('run web');
+    const stop = keys(STATIC, ':', ...'stop w', 'Tab');
+    expect(stop.prompt?.input).toBe('stop web');
+    expect(stop.prompt?.completion?.candidates).toEqual(['web', 'web-2', 'web-3']);
+    expect(keys(stop, 'Tab', 'Tab').prompt?.input).toBe('stop web-3');
+    // Typing ends the cycle.
+    expect(keys(stop, 'x').prompt?.completion).toBeNull();
+  });
+
+  it('a parse error stays inline and keeps the prompt open', () => {
+    const s = command(STATIC, 'frob');
+    expect(s.prompt?.error).toBe('unknown command `frob` (run, exec, code, rm, rename, stop, start, rebuild, port)');
+    expect(command(STATIC, 'port web 0').prompt?.error).toBe('port spec `0`: port must not be 0');
+    expect(keys(s, 'Backspace').prompt?.error).toBeNull();
+    expect(keys(STATIC, ':', 'Enter').prompt?.error).toBe('empty command');
+  });
+
+  it('run web adds web-4 on a worktree, behind the suspended screen', () => {
+    const s = command(STATIC, 'run web');
+    expect(s.prompt).toBeNull();
+    expect(names(s)).toEqual(['web', 'web-2', 'web-3', 'web-4']);
+    expect(inst(s, 'web-4')).toEqual({ name: 'web-4', status: 'running', worktree: true, uptime: '0s' });
+    expect(s.agents['web-4']).toBe('idle');
+    expect(s.suspended?.lines).toEqual([
+      "Preparing worktree (new branch 'sandbox/web-4')",
+      'HEAD is now at 3f9c21a feat: users api',
+      'web-4',
+    ]);
+    // Any key returns (the real one waits for one too), the new row stays.
+    expect(back(s).suspended).toBeNull();
+    expect(names(back(s))).toHaveLength(4);
+    expect(names(back(command(back(s), 'run web')))).toContain('web-5');
+  });
+
+  it('run names like the real one: --name, the sandbox name when free, errors', () => {
+    expect(names(command(STATIC, 'run web --name api'))).toContain('api');
+    const taken = command(STATIC, 'run web --name web-2');
+    expect(taken.suspended?.lines[0]).toBe(
+      'error: instance `web-2` already exists; `devsandbox start web-2` restarts it, `devsandbox rm web-2` frees the name',
+    );
+    expect(command(STATIC, 'run api').suspended?.lines[0]).toBe('error: unknown sandbox `api`');
+    // With `web` removed the base checkout is free again: `run web` takes it back.
+    const freed = back(command(STATIC, 'rm web'));
+    const again = command(freed, 'run web');
+    expect(inst(again, 'web')).toMatchObject({ worktree: false });
+    expect(again.suspended?.lines).toEqual(['web']);
+  });
+
+  it('stop / start act on the named instance', () => {
+    const stopped = command(STATIC, 'stop web-2');
+    expect(stopped.suspended?.lines).toEqual(['stopped web-2']);
+    expect(inst(stopped, 'web-2')?.status).toBe('exited');
+    expect(stopped.agents['web-2']).toBe('stopped');
+    const started = command(back(stopped), 'start web-2');
+    expect(started.suspended?.lines).toEqual(['started web-2']);
+    expect(inst(started, 'web-2')?.status).toBe('running');
+    expect(command(STATIC, 'stop nope').suspended?.lines[0]).toBe(
+      'error: no sandbox instance matches `nope` (see `devsandbox ps -a`)',
+    );
+  });
+
+  it('rm asks about a worktree branch first, y / n / Enter answer', () => {
+    const asking = command(STATIC, 'rm web-2');
+    expect(names(asking)).toContain('web-2');
+    expect(suspendedLines(asking.suspended!)).toEqual(['delete branch `sandbox/web-2`? [y/N] ']);
+    expect(isHandledKey(asking, 'y')).toBe(true);
+    expect(keys(asking, 'x', 'q')).toEqual(asking);
+    const yes = keys(asking, 'y');
+    expect(yes.suspended?.lines).toEqual([
+      'delete branch `sandbox/web-2`? [y/N] y',
+      'Deleted branch sandbox/web-2 (was 3f9c21a).',
+      'removed web-2',
+    ]);
+    expect(names(yes)).toEqual(['web', 'web-3']);
+    expect(keys(asking, 'Enter').suspended?.lines).toEqual(['delete branch `sandbox/web-2`? [y/N] ', 'removed web-2']);
+    expect(back(yes).suspended).toBeNull();
+    // The base checkout has no branch of its own to offer.
+    expect(command(STATIC, 'rm web').suspended?.lines).toEqual(['removed web']);
+  });
+
+  it('rm keeps the cursor on its row, drops VS Code, terminals and forwards on it', () => {
+    const setup = back(command(keys(STATIC, 'j', 'o', 't', 'Escape'), 'port web-2 3000'));
+    const gone = keys(command(setup, 'rm web-2'), 'n');
+    expect(gone.vscode).toBeNull();
+    expect(gone.ports).toEqual([]);
+    expect(gone.terms.map((t) => t.exited)).toEqual([true]);
+    expect(selectedName(gone)).toBe('web-3');
+    const last = back(keys(command(back(command(STATIC, 'rm web')), 'rm web-2'), 'n'));
+    const empty = back(keys(command(last, 'rm web-3'), 'n'));
+    expect(empty.instances).toEqual([]);
+    expect(empty.selected).toBe(SANDBOX_ROW);
+  });
+
+  it('code is o; exec answers from the fake shell; rename/rebuild are not here', () => {
+    const code = command(STATIC, 'code web-3');
+    expect(code.vscode).toBe('web-3');
+    expect(code.message).toBe('VS Code opened on web-3');
+    expect(command(STATIC, 'code nope').message).toBe('code: unknown instance `nope`');
+    expect(command(STATIC, 'exec web-2 git status').suspended?.lines[0]).toBe('On branch sandbox/web-2');
+    expect(command(STATIC, 'exec web pwd').suspended?.lines).toEqual(['/workspaces/web']);
+    expect(command(STATIC, 'rename web-2 api').message).toBe('rename is not in this preview');
+    expect(command(STATIC, 'rebuild web').message).toBe('rebuild is not in this preview');
+  });
+});
+
+describe('ports', () => {
+  it('p prefills the port prompt for the instance (and the service)', () => {
+    expect(keys(STATIC, 'j', 'p').prompt?.input).toBe('port web-2 ');
+    expect(keys(STATIC, '2', 'p').prompt?.input).toBe('port web --service postgres ');
+    expect(keys(STATIC, '3', 'p').prompt).toBeNull();
+  });
+
+  it('Enter adds a forward on the same host port, the next free one when taken', () => {
+    const one = keys(STATIC, 'j', 'p', ...'3000', 'Enter');
+    expect(one.tab).toBe('ports');
+    expect(one.message).toBe('forwarding 127.0.0.1:3000 -> web-2:3000');
+    expect(one.ports).toEqual([
+      { id: 1, local: '127.0.0.1:3000', target: 'web-2:3000', process: 'node (pid 398)', state: 'active', conns: 0, instance: 'web-2' },
+    ]);
+    const two = command(one, 'port web 3000');
+    expect(two.ports.map((p) => p.local)).toEqual(['127.0.0.1:3000', '127.0.0.1:3001']);
+    expect(two.portSel).toBe(1);
+    expect(command(two, 'port web 3000:3000').message).toBe('port 3000: address in use');
+    expect(command(two, 'port web 3000:3000').ports).toHaveLength(2);
+    expect(command(two, 'port nope 80').message).toBe('no sandbox instance matches `nope` (see `devsandbox ps -a`)');
+  });
+
+  it('a service forward goes via the instance', () => {
+    const s = keys(STATIC, '2', 'p', ...'5432', 'Enter');
+    expect(s.ports[0]).toMatchObject({ local: '127.0.0.1:5432', target: 'postgres:5432 (via instance web)', process: null });
+    expect(s.message).toBe('forwarding 127.0.0.1:5432 -> postgres:5432');
+  });
+
+  it('j/k select a forward, d stops it', () => {
+    const two = command(command(STATIC, 'port web 3000'), 'port web-2 8080:3000');
+    const sel = keys(two, 'k');
+    expect(sel.portSel).toBe(0);
+    const stopped = keys(sel, 'd');
+    expect(stopped.message).toBe('stopped 127.0.0.1:3000');
+    expect(stopped.ports.map((p) => p.local)).toEqual(['127.0.0.1:8080']);
+    expect(keys(keys(stopped, 'd'), 'd').ports).toEqual([]);
+    expect(run(two, { type: 'selectPort', index: 0 }).portSel).toBe(0);
+  });
+
+  it('render the Ports columns', () => {
+    const s = command(STATIC, 'port web 3000');
+    expect(portCells(s.ports[0]).map(text)).toEqual(['127.0.0.1:3000', 'web:3000', 'node (pid 412)', 'active', '0']);
+  });
+});
+
+describe('stop / start (s)', () => {
+  it('stops the selected instance and starts it again', () => {
+    const stopped = keys(STATIC, 'j', 's');
+    expect(inst(stopped, 'web-2')?.status).toBe('exited');
+    expect(stopped.message).toBe('stopped web-2');
+    expect(stopped.agents['web-2']).toBe('stopped');
+    expect(stopStartHint(stopped)).toBe('start');
+    const started = keys(stopped, 's');
+    expect(inst(started, 'web-2')?.status).toBe('running');
+    expect(started.message).toBe('started web-2');
+    expect(started.agents['web-2']).toBe('idle');
+    expect(stopStartHint(started)).toBe('stop');
+  });
+
+  it('a stopped instance shows it: status, agents, terminal, forwards', () => {
+    const setup = back(command(keys(STATIC, 'j', 't', 'Escape'), 'port web-2 3000'));
+    const stopped = keys(setup, '1', 's');
+    expect(instanceCells(stopped, inst(stopped, 'web-2')!).map(text)).toEqual([
+      '  web-2',
+      'exited',
+      '48m',
+      '⎇ .worktrees/web-2',
+    ]);
+    expect(text(detailLines(stopped)[2])).toBe('agents: -');
+    expect(stopped.terms[0].exited).toBe(true);
+    expect(stopped.ports[0].state).toBe('error: instance `web-2` is not running (devsandbox start web-2)');
+    expect(keys(stopped, 't').message).toBe('terminal: `web-2` is not running');
+    expect(keys(stopped, 's').ports[0].state).toBe('active');
+    expect(totalsLine(stopped)).toBe('1 sandbox · 2 running / 1 stopped · 1 service container · docker 27.3.1');
+  });
+
+  it('is Instances-only, like the real one', () => {
+    expect(keys(STATIC, '2', 's').instances).toBe(STATIC.instances);
+  });
+});
+
+describe('r and the sandbox row', () => {
+  it('r on an instance prefills rename, like the real one', () => {
+    expect(runRenameHint(STATIC)).toBe('rename');
+    expect(keys(STATIC, 'r').prompt?.input).toBe('rename web ');
+  });
+
+  it('clicking the sandbox row selects it; r there prefills run, Enter runs it', () => {
+    const row = run(STATIC, { type: 'selectSandbox' });
+    expect(row.selected).toBe(SANDBOX_ROW);
+    expect(selectedName(row)).toBeNull();
+    expect(runRenameHint(row)).toBe('run');
+    expect(keys(row, 'r').prompt?.input).toBe('run web ');
+    expect(names(keys(row, 'r', 'Enter'))).toContain('web-4');
+    // ↓ goes to the first instance; o/s/l/p have nothing to act on.
+    expect(selectedName(keys(row, 'j'))).toBe('web');
+    expect(keys(row, 'o', 's', 'l', 'p')).toEqual({ ...row });
+    expect(keys(row, 't').message).toBe('terminal: select an instance');
+    expect(text(detailLines(row)[2])).toBe('config hash: c61bbaac526146dd');
+  });
+});
+
+describe('logs (l)', () => {
+  it('opens for the selected instance, scrolls clamped, Esc / q close', () => {
+    const s = keys(STATIC, 'j', 'l');
+    expect(s.modal).toEqual({ kind: 'logs', name: 'web-2', scroll: 0 });
+    expect(logsTitle('web-2')).toBe('logs — devsandbox-web-2 (last 50)');
+    expect(keys(s, 'j', 'j', 'k').modal).toMatchObject({ scroll: 1 });
+    expect(keys(s, 'G').modal).toMatchObject({ scroll: 10 });
+    expect(keys(s, 'G', 'j', 'g').modal).toMatchObject({ scroll: 0 });
+    expect(keys(s, 'Escape').modal).toBeNull();
+    expect(keys(s, 'q').modal).toBeNull();
+    // Swallows dashboard keys while up.
+    expect(keys(s, 'o', '2', 's').modal).toEqual(s.modal);
+    expect(keys(s, 'o', '2', 's').tab).toBe('instances');
+  });
+
+  it('is Instances-only and needs an instance', () => {
+    expect(keys(STATIC, '2', 'l').modal).toBeNull();
+    expect(run(STATIC, { type: 'selectSandbox' }, { type: 'key', key: 'l' }).modal).toBeNull();
+  });
+});
+
+describe('config explorer (enter)', () => {
+  it('opens on the sandbox, original first; t toggles resolved', () => {
+    const s = keys(STATIC, 'j', 'Enter');
+    expect(s.modal).toEqual({ kind: 'config', target: 'sandbox', side: 'original', scroll: 0, container: 'devsandbox-web-2' });
+    if (s.modal?.kind !== 'config') throw new Error('config');
+    expect(configTitle(s.modal)).toBe('▶ config: web — original (t: resolved) — c61bbaac526146dd');
+    expect(configLines(s.modal)).toContain('extends = "agent"');
+    const resolved = keys(s, 't');
+    if (resolved.modal?.kind !== 'config') throw new Error('config');
+    expect(resolved.modal.side).toBe('resolved');
+    expect(configTitle(resolved.modal)).toBe('▶ config: web — resolved (t: original) — c61bbaac526146dd');
+    expect(configLines(resolved.modal)).toContain('caches = ["pnpm"]');
+    expect(configLines(resolved.modal)).not.toContain('extends = "agent"');
+    expect(keys(resolved, 't').modal).toMatchObject({ side: 'original' });
+    expect(keys(s, 'Escape').modal).toBeNull();
+    expect(keys(STATIC, 'e').modal?.kind).toBe('config');
+  });
+
+  it('inspects the instance, the sandbox row its first running one, or says there is none', () => {
+    const s = keys(STATIC, 'Enter');
+    if (s.modal?.kind !== 'config') throw new Error('config');
+    expect(inspectTitle(s.modal)).toBe('inspect — devsandbox-web');
+    expect(inspectLines(s, s.modal)).toContain('    "Name": "/devsandbox-web",');
+    const row = keys(run(keys(STATIC, 's'), { type: 'selectSandbox' }), 'Enter');
+    expect(row.modal).toMatchObject({ container: 'devsandbox-web-2' });
+    const none = back(command(back(command(back(command(STATIC, 'stop web')), 'stop web-2')), 'stop web-3'));
+    const empty = keys(run(none, { type: 'selectSandbox' }), 'Enter');
+    if (empty.modal?.kind !== 'config') throw new Error('config');
+    expect(inspectLines(empty, empty.modal)).toEqual(['(no running instance)']);
+  });
+
+  it('on Services shows the service table; nothing on Ports / Inbox', () => {
+    const s = keys(STATIC, '2', 'Enter');
+    if (s.modal?.kind !== 'config') throw new Error('config');
+    expect(configTitle(s.modal)).toBe('▶ config: postgres — original (t: resolved)');
+    expect(configLines(s.modal)).toEqual(configLines({ ...s.modal, side: 'resolved' }));
+    expect(keys(STATIC, '3', 'Enter')).toEqual(keys(STATIC, '3'));
+    expect(keys(STATIC, '4', 'Enter').modal).toBeNull();
+  });
+});
+
+describe('step 3 plumbing', () => {
+  it('clicks do nothing under a prompt, a view or the suspended screen', () => {
+    for (const s of [keys(STATIC, ':'), keys(STATIC, 'l'), command(STATIC, 'stop web')]) {
+      expect(run(s, { type: 'select', name: 'web-3' })).toBe(s);
+      expect(run(s, { type: 'tab', tab: 'ports' })).toBe(s);
+      expect(run(s, { type: 'selectSandbox' })).toBe(s);
+    }
+  });
+
+  it('views take their own keys; the suspended screen any key but Tab', () => {
+    const logs = keys(STATIC, 'l');
+    for (const k of ['j', 'k', 'g', 'G', 'q', 'Escape', 't']) expect(isHandledKey(logs, k)).toBe(true);
+    expect(isHandledKey(logs, 'Tab')).toBe(false);
+    const sus = command(STATIC, 'stop web');
+    expect(isHandledKey(sus, 'x')).toBe(true);
+    expect(isHandledKey(sus, 'Tab')).toBe(false);
+  });
+
+  it('pick the hint bar and status slot for each mode', () => {
+    expect(helpMode(keys(STATIC, ':'))).toBe('prompt');
+    expect(helpMode(keys(STATIC, 'l'))).toBe('logs');
+    expect(helpMode(keys(STATIC, 'Enter'))).toBe('config');
+    expect(helpMode(keys(STATIC, '?'))).toBe('help');
+    expect(hintFor(keys(STATIC, ':'), true).text).toBe('TAB COMPLETES · ESC CANCELS');
+    expect(hintFor(command(STATIC, 'stop web'), true).text).toBe('ANY KEY RETURNS');
+    expect(hintFor(command(STATIC, 'rm web-2'), true).text).toBe('Y OR N ANSWERS');
+    expect(hintFor(keys(STATIC, 'l'), true).text).toBe('ESC CLOSES · TAB LEAVES');
+  });
+
+  it('keep the header and service columns in step with the instances', () => {
+    expect(totalsLine(STATIC)).toBe('1 sandbox · 3 running / 0 stopped · 1 service container · docker 27.3.1');
+    expect(usedBy(command(STATIC, 'run web'))).toBe('web,web-2,web-3,web-4');
+    expect(instanceCells(STATIC, STATIC.instances[2]).map(text)).toEqual(['  web-3 ✉1', 'running', '12m', '⎇ .worktrees/web-3']);
+  });
+
+  it('announce prompts, views and suspended output', () => {
+    expect(announce(STATIC, keys(STATIC, ':'))).toMatch(/^Command prompt\. Tab completes/);
+    expect(announce(STATIC, keys(STATIC, 'j', 'p'))).toMatch(/^Command prompt: port web-2 \./);
+    const open = keys(STATIC, ':', 'r', 'u');
+    expect(announce(open, keys(open, 'Tab'))).toBe('run');
+    expect(announce(open, keys(open, 'Enter'))).toMatch(/^unknown command `ru`/);
+    expect(announce(STATIC, command(STATIC, 'stop web'))).toBe('stopped web. Press any key to return.');
+    expect(announce(STATIC, keys(STATIC, 'l'))).toBe('logs — devsandbox-web (last 50). Escape closes.');
+    const cfg = keys(STATIC, 'Enter');
+    expect(announce(cfg, keys(cfg, 't'))).toBe('Showing resolved');
   });
 });

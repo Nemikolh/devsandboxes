@@ -177,9 +177,9 @@ const title = (i: Instance) => `${i.name} · ${i.branch ?? i.folder} — Dev Con
                   <Container aria-hidden="true" />
                 </span>
                 <span class="sb-name">{i.name}</span>
-                <span class="sb-state">
+                <span class="sb-state" data-sb-state={i.name}>
                   <i />
-                  running
+                  <span data-sb-state-label>running</span>
                 </span>
               </div>
               <div class={`sb-tree${i.branch ? ' is-worktree' : ''}`}>
@@ -322,3 +322,10 @@ const title = (i: Instance) => `${i.name} · ${i.branch ?? i.folder} — Dev Con
 <script>
   import '../scripts/how-it-works';
 </script>
+
+<style>
+  /* A card whose container the dashboard stopped (`s`, `:stop`): red like its STATUS cell. */
+  [data-sb-state][data-exited] {
+    color: #f08080;
+  }
+</style>

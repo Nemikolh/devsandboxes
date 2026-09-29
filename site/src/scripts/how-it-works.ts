@@ -17,29 +17,47 @@ function init(stage: HTMLElement, tui: HTMLElement) {
   const vscode = stage.querySelector<HTMLElement>('[data-vscode]');
   const setFlag = (el: Element, name: string, on: boolean) => el.toggleAttribute(name, on);
 
+  // Only the story's instances have a card: others (`:run` adds `web-4`) and
+  // the sandbox row select nothing here, VS Code on them shows as closed.
+  const known = (name: string | null): name is (typeof INSTANCES)[number] =>
+    (INSTANCES as readonly (string | null)[]).includes(name);
+
   // Writes only; nothing here reads layout, so a render never forces a reflow.
   function render(s: State) {
-    const sel = selectedName(s);
+    const picked = selectedName(s);
+    const sel = known(picked) ? picked : '';
+    const code = known(s.vscode) ? s.vscode : null;
     stage.dataset.selected = sel;
     stage.dataset.tab = s.tab;
 
     for (const el of $$('[data-sandbox-node]')) setFlag(el, 'data-selected', el.dataset.sandboxNode === sel);
     for (const el of $$('[data-connector="dashboard"]')) setFlag(el, 'data-active', el.dataset.sandbox === sel);
     for (const el of $$('[data-connector="service"]')) setFlag(el, 'data-active', el.dataset.sandbox === sel);
-    for (const el of $$('[data-connector="vscode"]')) setFlag(el, 'data-active', el.dataset.sandbox === s.vscode);
+    for (const el of $$('[data-connector="vscode"]')) setFlag(el, 'data-active', el.dataset.sandbox === code);
+    for (const el of $$('[data-sb-state]')) {
+      // An `rm`'d instance keeps its card as it last was.
+      const status = s.instances.find((i) => i.name === el.dataset.sbState)?.status;
+      if (!status) continue;
+      setFlag(el, 'data-exited', status === 'exited');
+      const label = el.querySelector('[data-sb-state-label]');
+      if (label) label.textContent = status;
+    }
     for (const name of INSTANCES) {
       const agent = stage.querySelector<HTMLElement>(`[data-agent="${name}"]`);
-      if (!agent) continue;
-      agent.dataset.status = s.agents[name];
+      // An `rm`'d instance keeps its card, with the agent it last had.
+      const status = s.agents[name];
+      if (!agent || !status) continue;
+      // A stopped container's agent looks idle on the card, labelled `stopped`.
+      agent.dataset.status = status === 'stopped' ? 'idle' : status;
       const label = agent.querySelector('[data-agent-status]');
-      if (label) label.textContent = STATUS_LABEL[s.agents[name]];
+      if (label) label.textContent = STATUS_LABEL[status];
     }
     if (vscode) {
-      vscode.dataset.open = String(s.vscode !== null);
+      vscode.dataset.open = String(code !== null);
       // Keep the last title while it fades out.
-      if (s.vscode) {
-        vscode.dataset.target = s.vscode;
-        for (const el of $$('[data-vscode-for]', vscode)) el.hidden = el.dataset.vscodeFor !== s.vscode;
+      if (code) {
+        vscode.dataset.target = code;
+        for (const el of $$('[data-vscode-for]', vscode)) el.hidden = el.dataset.vscodeFor !== code;
       }
     }
   }

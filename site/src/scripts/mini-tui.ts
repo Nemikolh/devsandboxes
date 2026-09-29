@@ -9,25 +9,42 @@
 import {
   CTRL_BRACKET,
   INITIAL,
-  INSTANCES,
-  NOTIFY_FROM,
   TABS,
+  configLines,
+  configTitle,
   describe,
+  detailLines,
   helpMode,
   hintFor,
+  inspectLines,
+  inspectTitle,
+  instanceCells,
   isHandledKey,
+  jsonSpans,
   keycapFor,
+  logsFor,
+  logsTitle,
   playing,
+  portCells,
   reduce,
+  runRenameHint,
+  sandboxCells,
   selectedName,
   settled,
+  stopStartHint,
+  suspendedLines,
   termRows,
   termTabLabel,
+  tomlSpans,
+  totalsLine,
+  usedBy,
   type Event,
-  type Instance,
+  type Line,
   type State,
   type Tab,
   TIMELINE,
+  SANDBOX,
+  SANDBOX_ROW,
 } from '../lib/mini-tui';
 
 /** How long a keycap looks pressed; the autoplay presses it this early. */
@@ -92,7 +109,21 @@ export function mountMiniTui(root: HTMLElement, opts: MiniTuiOptions = {}): Mini
   let messageTimer = 0;
   let visible = false;
 
-  // Writes only; nothing here reads layout, so a render never forces a reflow.
+  const rowsEl = one('[data-tui-rows]');
+  const groupRow = one('[data-tui-group]');
+  const detail = one('[data-tui-detail]');
+  const ports = one('[data-tui-ports]');
+  const portRows = one('[data-tui-port-rows]');
+  const logsView = one('[data-tui-view="logs"]');
+  const configView = one('[data-tui-view="config"]');
+  const promptInput = one('[data-tui-prompt-input]');
+  const promptHint = one('[data-tui-prompt-hint]');
+  const suspended = one('[data-tui-suspended]');
+  const suspendedOut = one('[data-tui-suspended-lines]');
+  const suspendedReturn = one('[data-tui-suspended-return]');
+
+  // Writes only (the row lists are rebuilt: a handful of nodes); the one
+  // layout read, keeping the selected row in view, waits for a frame.
   function render(s: State) {
     const sel = selectedName(s);
     for (const el of all('[data-tui-tab]')) {
@@ -101,22 +132,108 @@ export function mountMiniTui(root: HTMLElement, opts: MiniTuiOptions = {}): Mini
       el.setAttribute('aria-pressed', String(on));
     }
     for (const el of all('[data-tui-panel]')) el.hidden = el.dataset.tuiPanel !== s.tab;
-    for (const el of all('[data-tui-panel="instances"] [data-tui-row]')) flag(el, 'data-selected', el.dataset.tuiRow === sel);
-    for (const el of all('[data-tui-detail-for]')) el.hidden = el.dataset.tuiDetailFor !== sel;
+    for (const el of all('[data-tui-totals]')) el.textContent = totalsLine(s);
+    if (groupRow) {
+      groupRow.replaceChildren(...sandboxCells(s).map(cell));
+      flag(groupRow, 'data-selected', s.selected === SANDBOX_ROW);
+    }
+    if (rowsEl) {
+      rowsEl.replaceChildren(
+        ...s.instances.map((i) => row(instanceCells(s, i), { tuiRow: i.name }, i.name === sel)),
+        // `draw_tree`'s empty marker under a sandbox with no instances.
+        ...(s.instances.length ? [] : [row([[{ text: `  no instances — : run ${SANDBOX}`, cls: 'tui-dim' }]], {}, false)]),
+      );
+      if (s.instances.length > 4) requestAnimationFrame(() => keepInView(rowsEl));
+    }
+    detail?.replaceChildren(...detailLines(s).map((l) => line('div', l)));
+    for (const el of all('[data-tui-used-by]')) el.textContent = usedBy(s);
     for (const el of all('[data-tui-unread]')) {
       el.hidden = s.unread === 0;
       el.textContent = ` (${s.unread})`;
     }
-    for (const el of all('[data-tui-row-unread]')) {
-      const row = el.closest<HTMLElement>('[data-tui-row]');
-      el.hidden = s.unread === 0 || row?.dataset.tuiRow !== NOTIFY_FROM;
-    }
     for (const el of all('[data-tui-notified]')) el.hidden = !s.notified;
     for (const el of all('[data-tui-inbox-empty]')) el.hidden = s.notified;
     for (const el of all('[data-tui-row="notify-1"]')) flag(el, 'data-unread', s.unread > 0);
+    renderPorts(s);
     if (helpOverlay) helpOverlay.hidden = !s.help;
+    renderViews(s);
     renderTerms(s);
+    renderBars(s);
     renderHint(s);
+  }
+
+  function renderPorts(s: State) {
+    if (!ports || !portRows) return;
+    const empty = s.ports.length === 0;
+    ports.classList.toggle('tui-empty', empty);
+    for (const el of all('[data-tui-ports-empty]')) el.hidden = !empty;
+    for (const el of all('[data-tui-ports-head]')) el.hidden = empty;
+    portRows.replaceChildren(
+      ...s.ports.map((f, i) => {
+        const el = row(portCells(f), { tuiPort: String(i) }, i === s.portSel);
+        el.classList.add('tui-tr--ports');
+        return el;
+      }),
+    );
+  }
+
+  // Logs and the config explorer: the visible slice after `scroll`, like a ratatui Paragraph.
+  function renderViews(s: State) {
+    const m = s.modal;
+    if (logsView) logsView.hidden = m?.kind !== 'logs';
+    if (configView) configView.hidden = m?.kind !== 'config';
+    if (m?.kind === 'logs' && logsView) {
+      setText(logsView, '[data-tui-logs-title]', ` ${logsTitle(m.name)} `);
+      fill(logsView, '[data-tui-logs-body]', logsFor(m.name).slice(m.scroll).map((t) => [{ text: t }]));
+    }
+    if (m?.kind === 'config' && configView) {
+      setText(configView, '[data-tui-config-title]', ` ${configTitle(m)} `);
+      fill(configView, '[data-tui-config-body]', configLines(m).slice(m.scroll).map(tomlSpans));
+      setText(configView, '[data-tui-inspect-title]', ` ${inspectTitle(m)} `);
+      fill(configView, '[data-tui-inspect-body]', inspectLines(s, m).map(jsonSpans));
+    }
+  }
+
+  /** The hint bar for the mode (or the prompt in its place), and the suspended screen. */
+  function renderBars(s: State) {
+    const mode = helpMode(s);
+    for (const el of all('[data-tui-help]')) el.hidden = el.dataset.tuiHelp !== mode;
+    for (const el of all('[data-tui-for]')) el.hidden = !(el.dataset.tuiFor ?? '').split(' ').includes(s.tab);
+    for (const el of all('[data-tui-terms-hint]')) el.hidden = s.terms.length === 0;
+    for (const el of all('[data-tui-verb="s"]')) el.textContent = stopStartHint(s);
+    for (const el of all('[data-tui-verb="r"]')) el.textContent = runRenameHint(s);
+    const p = s.prompt;
+    if (p && promptInput && promptHint) {
+      promptInput.textContent = p.input;
+      flag(promptHint, 'data-error', Boolean(p.error));
+      if (p.error) promptHint.textContent = p.error;
+      else {
+        // `prompt_candidates_line`: space-joined, the applied one accented.
+        const cands = p.completion?.candidates ?? [];
+        promptHint.replaceChildren(
+          ...cands.flatMap((c, i) => [
+            ...(i > 0 ? [document.createTextNode(' ')] : []),
+            i === p.completion?.cycle ? span('tui-accent', c) : document.createTextNode(c),
+          ]),
+        );
+      }
+    }
+    if (suspended) suspended.hidden = !s.suspended;
+    if (s.suspended && suspendedOut && suspendedReturn) {
+      const lines = suspendedLines(s.suspended).map(div);
+      if (s.suspended.confirm) lines.at(-1)?.append(span('tui-cursor', ''));
+      suspendedOut.replaceChildren(...lines);
+      suspendedReturn.hidden = Boolean(s.suspended.confirm);
+    }
+  }
+
+  function setText(scope: HTMLElement, sel: string, text: string) {
+    const el = scope.querySelector(sel);
+    if (el) el.textContent = text;
+  }
+
+  function fill(scope: HTMLElement, sel: string, lines: Line[]) {
+    scope.querySelector(sel)?.replaceChildren(...lines.map((l) => line('div', l)));
   }
 
   // The terminal pane, rebuilt from state (a handful of nodes); text only, never HTML.
@@ -128,9 +245,6 @@ export function mountMiniTui(root: HTMLElement, opts: MiniTuiOptions = {}): Mini
       flag(body, 'data-terms', open);
       body.dataset.focus = s.focus;
     }
-    const mode = helpMode(s);
-    for (const el of all('[data-tui-help]')) el.hidden = el.dataset.tuiHelp !== mode;
-    for (const el of all('[data-tui-terms-hint]')) el.hidden = !open;
     if (!termPane || !termTabs || !termScreen) return;
     termPane.hidden = !open;
     if (!term) return;
@@ -253,8 +367,9 @@ export function mountMiniTui(root: HTMLElement, opts: MiniTuiOptions = {}): Mini
       const modified = !ctrlBracket && (event.metaKey || event.ctrlKey || event.altKey);
       if ((media && !media.matches) || modified || event.isComposing || !isHandledKey(state, key)) return;
       event.preventDefault();
-      // Typing into the shell doesn't flash dashboard keycaps (they're hidden anyway).
-      if (state.focus === 'dashboard' || keycapFor(key) === 'Escape' || key === 'x') flash(key);
+      // Typing into the shell or the prompt doesn't flash keycaps (they're hidden anyway).
+      const typing = state.prompt !== null || state.suspended !== null;
+      if (!typing && (state.focus === 'dashboard' || keycapFor(key) === 'Escape' || key === 'x')) flash(key);
       dispatch({ type: 'key', key }, true);
     });
 
@@ -262,20 +377,24 @@ export function mountMiniTui(root: HTMLElement, opts: MiniTuiOptions = {}): Mini
       const target = event.target as Element;
       const key = target.closest<HTMLElement>('.tui-key[data-key]')?.dataset.key;
       const tab = target.closest<HTMLElement>('[data-tui-tab]')?.dataset.tuiTab as Tab | undefined;
-      const row = target.closest<HTMLElement>('[data-tui-panel="instances"] [data-tui-row]')?.dataset.tuiRow as
-        | Instance
-        | undefined;
+      const row = target.closest<HTMLElement>('[data-tui-panel="instances"] [data-tui-row]')?.dataset.tuiRow;
+      const group = target.closest('[data-tui-group]');
+      const port = target.closest<HTMLElement>('[data-tui-port]')?.dataset.tuiPort;
       const inTerm = target.closest('[data-tui-term]');
       const termTab = target.closest<HTMLElement>('[data-tui-term-tab]')?.dataset.tuiTermTab;
       root.focus({ preventScroll: true });
       // Like the real mouse routing: a click on the pane focuses it (a tab title
-      // also activates that tab), a click elsewhere hands focus back.
-      if (inTerm) dispatch({ type: 'focus', focus: 'terminal', term: termTab === undefined ? undefined : Number(termTab) }, true);
+      // also activates that tab), a click elsewhere hands focus back. On the
+      // suspended screen a click is "any key" (the rm question wants y or n).
+      if (state.suspended) dispatch({ type: 'key', key: ' ' }, true);
+      else if (inTerm) dispatch({ type: 'focus', focus: 'terminal', term: termTab === undefined ? undefined : Number(termTab) }, true);
       else if (key) {
         flash(key);
         dispatch({ type: 'key', key }, true);
       } else if (tab && TABS.includes(tab)) dispatch({ type: 'tab', tab }, true);
-      else if (row && INSTANCES.includes(row)) dispatch({ type: 'select', name: row }, true);
+      else if (row) dispatch({ type: 'select', name: row }, true);
+      else if (group) dispatch({ type: 'selectSandbox' }, true);
+      else if (port !== undefined) dispatch({ type: 'selectPort', index: Number(port) }, true);
       else if (state.focus === 'terminal') dispatch({ type: 'focus', focus: 'dashboard' }, true);
       else stopAutoplay();
     });
@@ -318,4 +437,40 @@ function div(text: string) {
   // Keep empty lines one row tall.
   el.textContent = text || ' ';
   return el;
+}
+
+/** A `Line` as an element of `tag`: text nodes and classed spans, never HTML. */
+function line(tag: 'div' | 'span', l: Line) {
+  const el = document.createElement(tag);
+  el.append(...l.map((s) => (s.cls ? span(s.cls, s.text) : document.createTextNode(s.text))));
+  // Keep empty lines one row tall.
+  if (!l.some((s) => s.text)) el.textContent = ' ';
+  return el;
+}
+
+const cell = (l: Line) => {
+  const el = line('span', l);
+  if (!l.length) el.textContent = '';
+  return el;
+};
+
+/** A table row (`.tui-tr .tui-row`) of cells, with `data-*` hooks and the selection flag. */
+function row(cells: Line[], data: Record<string, string>, selected: boolean) {
+  const el = document.createElement('div');
+  el.className = 'tui-tr tui-row';
+  Object.assign(el.dataset, data);
+  el.toggleAttribute('data-selected', selected);
+  el.append(...cells.map(cell));
+  return el;
+}
+
+/** Scroll a clipped row list so its selected row shows, like ratatui's table offset. */
+function keepInView(list: HTMLElement) {
+  const sel = list.querySelector<HTMLElement>('[data-selected]');
+  if (!sel) return;
+  const top = sel.offsetTop - list.offsetTop;
+  if (top < list.scrollTop) list.scrollTop = top;
+  else if (top + sel.offsetHeight > list.scrollTop + list.clientHeight) {
+    list.scrollTop = top + sel.offsetHeight - list.clientHeight;
+  }
 }
