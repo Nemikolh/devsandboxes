@@ -7,10 +7,13 @@ use ratatui::layout::Rect;
 use crate::runtime::{backend, NAME_PREFIX};
 use crate::tui::data::ContainerStatus;
 use crate::tui::kitty;
-use crate::tui::term::{encode_key, TermSession, SHELL_FALLBACK_CMD};
+use crate::tui::term::{encode_key, encode_wheel, TermSession, SHELL_FALLBACK_CMD};
 
 use super::view::point_in;
 use super::{App, Focus, Tab};
+
+/// Lines one wheel notch scrolls, as scrollback or as arrow keys.
+const WHEEL_LINES: i16 = 3;
 
 impl App {
     /// Route a key to the active terminal. Only reached with `focus ==
@@ -72,9 +75,10 @@ impl App {
     /// config modal is open and at least one terminal exists. Left-click inside
     /// the panel focuses the terminal; a click on the title row's tab labels
     /// activates that tab; a left-click outside the panel while the terminal is
-    /// focused returns focus to the dashboard. The wheel scrolls the active
-    /// session's vt100 scrollback. All layout math is borrowed from `ui` so it
-    /// tracks exactly what the draw path lays out. I/O-free.
+    /// focused returns focus to the dashboard. The wheel goes to the active
+    /// session (see [`Self::wheel_active_terminal`]). All layout math is
+    /// borrowed from `ui` so it tracks exactly what the draw path lays out.
+    /// I/O-free.
     pub(super) fn terminal_mouse(&mut self, ev: &MouseEvent, area: Rect) {
         if self.terms.is_empty() {
             return;
@@ -98,9 +102,60 @@ impl App {
                     self.focus = Focus::Dashboard;
                 }
             }
-            MouseEventKind::ScrollUp if inside => self.scroll_active_terminal(3),
-            MouseEventKind::ScrollDown if inside => self.scroll_active_terminal(-3),
+            MouseEventKind::ScrollUp if inside => self.wheel_active_terminal(true, ev, panel),
+            MouseEventKind::ScrollDown if inside => self.wheel_active_terminal(false, ev, panel),
             _ => {}
+        }
+    }
+
+    /// One wheel notch over the active terminal, routed like xterm does:
+    /// - the child enabled mouse tracking (zidane, vim with `mouse=a`, htop):
+    ///   forward it as a wheel report at the pane-relative cell, so the app
+    ///   scrolls its own view;
+    /// - the child is on the alternate screen without mouse tracking (less,
+    ///   man): send arrow keys ("alternate scroll"), since that screen has no
+    ///   scrollback of its own;
+    /// - otherwise (a shell's main screen, or an exited session): scroll the
+    ///   vt100 scrollback.
+    fn wheel_active_terminal(&mut self, up: bool, ev: &MouseEvent, panel: Rect) {
+        let Some(session) = self.terms.active_session_mut() else {
+            return;
+        };
+        let bytes = {
+            let Ok(parser) = session.parser().lock() else {
+                return;
+            };
+            let screen = parser.screen();
+            let mode = screen.mouse_protocol_mode();
+            if session.exited()
+                || (mode == vt100::MouseProtocolMode::None && !screen.alternate_screen())
+            {
+                None
+            } else if mode != vt100::MouseProtocolMode::None {
+                // Body = panel minus its 1-cell border; clamp so a notch over
+                // the border still lands on an edge cell.
+                let cols = panel.width.saturating_sub(2).max(1);
+                let rows = panel.height.saturating_sub(2).max(1);
+                let col = ev.column.saturating_sub(panel.x + 1).min(cols - 1);
+                let row = ev.row.saturating_sub(panel.y + 1).min(rows - 1);
+                // An unencodable position drops the notch, as xterm does.
+                Some(
+                    encode_wheel(up, ev.modifiers, col, row, screen.mouse_protocol_encoding())
+                        .unwrap_or_default(),
+                )
+            } else {
+                let key = KeyEvent::new(
+                    if up { KeyCode::Up } else { KeyCode::Down },
+                    KeyModifiers::NONE,
+                );
+                encode_key(key, screen.application_cursor())
+                    .map(|b| b.repeat(WHEEL_LINES as usize))
+            }
+        };
+        match bytes {
+            Some(bytes) if !bytes.is_empty() => session.write_key_bytes(&bytes),
+            Some(_) => {}
+            None => self.scroll_active_terminal(if up { WHEEL_LINES } else { -WHEEL_LINES }),
         }
     }
 
@@ -375,6 +430,57 @@ mod tests {
         // The wheel outside the panel body is ignored (offset stays 0).
         app.on_mouse(&mouse_at(MouseEventKind::ScrollUp, 0, 0), FRAME);
         assert_eq!(offset(&app), 0);
+    }
+
+    #[test]
+    fn wheel_is_reported_to_a_child_tracking_the_mouse() {
+        let mut app = new_app();
+        app.terms.open(term_sess("web-1", "devsandbox-web-1"));
+        let session = app.terms.active_session().unwrap();
+        session.feed_output(b"\x1b[?1049h\x1b[?1000h\x1b[?1006h");
+        let panel = crate::tui::ui::terminal_panel_rect(FRAME, false);
+        // Body cell (2, 1): one column/row in from the border.
+        let (x, y) = (panel.x + 3, panel.y + 2);
+        app.on_mouse(&mouse_at(MouseEventKind::ScrollUp, x, y), FRAME);
+        app.on_mouse(&mouse_at(MouseEventKind::ScrollDown, x, y), FRAME);
+        let session = app.terms.active_session().unwrap();
+        assert_eq!(session.take_written(), b"\x1b[<64;3;2M\x1b[<65;3;2M");
+        // A notch over the border clamps onto the first body cell.
+        app.on_mouse(&mouse_at(MouseEventKind::ScrollUp, panel.x, panel.y), FRAME);
+        let session = app.terms.active_session().unwrap();
+        assert_eq!(session.take_written(), b"\x1b[<64;1;1M");
+    }
+
+    #[test]
+    fn wheel_sends_arrows_on_the_alternate_screen_without_mouse_tracking() {
+        let mut app = new_app();
+        app.terms.open(term_sess("web-1", "devsandbox-web-1"));
+        let session = app.terms.active_session().unwrap();
+        // less/man style: alternate screen plus application cursor keys.
+        session.feed_output(b"\x1b[?1049h\x1b[?1h");
+        let panel = crate::tui::ui::terminal_panel_rect(FRAME, false);
+        let (x, y) = (panel.x + 2, panel.y + 2);
+        app.on_mouse(&mouse_at(MouseEventKind::ScrollDown, x, y), FRAME);
+        let session = app.terms.active_session().unwrap();
+        assert_eq!(session.take_written(), b"\x1bOB\x1bOB\x1bOB");
+        assert_eq!(session.parser().lock().unwrap().screen().scrollback(), 0);
+    }
+
+    #[test]
+    fn wheel_on_an_exited_session_only_scrolls_back() {
+        let mut app = new_app();
+        app.terms.open(term_sess("web-1", "devsandbox-web-1"));
+        let session = app.terms.active_session().unwrap();
+        for i in 0..60 {
+            session.feed_output(format!("line {i}\r\n").as_bytes());
+        }
+        session.feed_output(b"\x1b[?1000h");
+        session.set_exited();
+        let panel = crate::tui::ui::terminal_panel_rect(FRAME, false);
+        app.on_mouse(&mouse_at(MouseEventKind::ScrollUp, panel.x + 2, panel.y + 2), FRAME);
+        let session = app.terms.active_session().unwrap();
+        assert!(session.take_written().is_empty());
+        assert_eq!(session.parser().lock().unwrap().screen().scrollback(), 3);
     }
 
     #[test]

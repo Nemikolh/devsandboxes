@@ -400,6 +400,53 @@ fn process_output(parser: &Mutex<TermParser>, writer: &SharedWriter, bytes: &[u8
     }
 }
 
+/// Encode a wheel notch as the mouse report a child that enabled mouse
+/// tracking expects: button 64 (up) / 65 (down) plus the xterm modifier bits,
+/// at the 0-based cell `(col, row)` of the terminal body, in the child's
+/// chosen encoding. The wheel only ever reports presses. `None` when the
+/// legacy encodings can't represent the position (they cap at 223 / 2015),
+/// where xterm drops the event too.
+///
+/// Pure: no I/O, so the encodings are unit-tested.
+pub fn encode_wheel(
+    up: bool,
+    modifiers: KeyModifiers,
+    col: u16,
+    row: u16,
+    encoding: vt100::MouseProtocolEncoding,
+) -> Option<Vec<u8>> {
+    let mut button: u32 = if up { 64 } else { 65 };
+    for (m, bit) in [
+        (KeyModifiers::SHIFT, 4),
+        (KeyModifiers::ALT, 8),
+        (KeyModifiers::CONTROL, 16),
+    ] {
+        if modifiers.contains(m) {
+            button |= bit;
+        }
+    }
+    // Protocol coordinates are 1-based.
+    let (x, y) = (u32::from(col) + 1, u32::from(row) + 1);
+    match encoding {
+        vt100::MouseProtocolEncoding::Sgr => Some(format!("\x1b[<{button};{x};{y}M").into_bytes()),
+        // X10: each value is one byte offset by 32.
+        vt100::MouseProtocolEncoding::Default => {
+            let byte = |v: u32| u8::try_from(v + 32).ok();
+            Some(vec![0x1b, b'[', b'M', byte(button)?, byte(x)?, byte(y)?])
+        }
+        // Same offsets, each value a UTF-8 encoded code point (max 2047).
+        vt100::MouseProtocolEncoding::Utf8 => {
+            let mut out = b"\x1b[M".to_vec();
+            for v in [button, x, y] {
+                let c = char::from_u32(v + 32).filter(|c| u32::from(*c) < 0x800)?;
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            }
+            Some(out)
+        }
+    }
+}
+
 /// Encode a crossterm key event into the byte sequence a terminal expects,
 /// or `None` for keys with no terminal representation. `application_cursor`
 /// selects SS3 (`ESC O …`) over CSI (`ESC [ …`) for the cursor/home/end keys,
@@ -665,6 +712,28 @@ mod tests {
     fn unmapped_returns_none() {
         assert_eq!(encode_key(key(KeyCode::Null), false), None);
         assert_eq!(encode_key(key(KeyCode::CapsLock), false), None);
+    }
+
+    #[test]
+    fn wheel_reports_in_each_encoding() {
+        use vt100::MouseProtocolEncoding::*;
+        let none = KeyModifiers::NONE;
+        assert_eq!(encode_wheel(true, none, 4, 9, Sgr), Some(b"\x1b[<64;5;10M".to_vec()));
+        assert_eq!(encode_wheel(false, none, 0, 0, Sgr), Some(b"\x1b[<65;1;1M".to_vec()));
+        assert_eq!(
+            encode_wheel(true, KeyModifiers::CONTROL | KeyModifiers::SHIFT, 0, 0, Sgr),
+            Some(b"\x1b[<84;1;1M".to_vec())
+        );
+        assert_eq!(
+            encode_wheel(true, none, 4, 9, Default),
+            Some(vec![0x1b, b'[', b'M', 96, 37, 42])
+        );
+        // X10 can't reach column 224+.
+        assert_eq!(encode_wheel(true, none, 223, 0, Default), None);
+        assert_eq!(
+            encode_wheel(false, none, 300, 0, Utf8),
+            Some([&b"\x1b[M"[..], "a".as_bytes(), 'ō'.to_string().as_bytes(), b"!"].concat())
+        );
     }
 
     #[test]
