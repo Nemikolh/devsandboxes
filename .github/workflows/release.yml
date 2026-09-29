@@ -186,45 +186,12 @@ jobs:
           done
 
   # Docs follow releases: deployed only once the binaries and npm packages the
-  # site's install commands point at are live. Pages source must be set to
-  # "GitHub Actions" in the repo settings (custom domain: devsandboxes.com).
-  pages-build:
+  # site's install commands point at are live.
+  pages:
     needs: [release, npm]
-    runs-on: ubuntu-latest
+    # A called workflow can't be granted more than its caller job has.
     permissions:
       contents: read
-    defaults:
-      run:
-        working-directory: site
-    steps:
-      - uses: actions/checkout@v5
-      - uses: pnpm/action-setup@v6
-        with:
-          package_json_file: site/package.json
-          cache: true
-          cache_dependency_path: site/pnpm-lock.yaml
-      - uses: actions/setup-node@v5
-        with:
-          node-version: 24
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm build
-      - uses: actions/upload-pages-artifact@v5
-        with:
-          path: site/dist
-
-  pages-deploy:
-    needs: pages-build
-    runs-on: ubuntu-latest
-    permissions:
       pages: write
       id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deploy.outputs.page_url }}
-    # Never cancel a deploy halfway; a newer release queues behind it.
-    concurrency:
-      group: pages
-      cancel-in-progress: false
-    steps:
-      - id: deploy
-        uses: actions/deploy-pages@v5
+    uses: ./.github/workflows/pages.yml

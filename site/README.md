@@ -17,10 +17,11 @@ pnpm check:links  # scripts/check-links.mjs alone: every href="/…" / "#…" in
 ## Deployment
 
 CI (`.github/workflows/ci.yml`, job `site`) runs check, test and build on
-every PR and push to main. The site is deployed to GitHub Pages only on a
-release tag (`release.yml`, jobs `pages-build` / `pages-deploy`, after the
-GitHub release and npm publish), so the docs always match what users can
-install.
+every PR and push to main. Deployment to GitHub Pages is
+`.github/workflows/pages.yml`: `release.yml` calls it on each release tag,
+after the GitHub release and npm publish, so the docs match what users can
+install. For docs-only changes between releases, run it by hand (Actions →
+Pages → Run workflow, pick the branch or tag to deploy).
 
 ## Layout
 
