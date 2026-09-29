@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
@@ -43,7 +44,8 @@ pub const DEFAULT_WORKTREE_BRANCH: &str = "sandbox/${instance}";
 #[derive(Debug, Clone, Default)]
 pub struct RunExtras {
     /// Extra `-e K=V` for this instance only, after `containerEnv` (so they
-    /// win on a duplicate key). Not recorded: a `rebuild` drops them.
+    /// win on a duplicate key). Recorded in state (`Instance::extra_env`) so a
+    /// `rebuild`, which passes none, keeps them.
     pub env: Vec<(String, String)>,
     /// `instance_id` of the owning dispatcher.
     pub dispatcher: Option<String>,
@@ -216,6 +218,22 @@ fn worktree_branch(
     }
 }
 
+/// The `run --env` set an instance gets and records: the given one (last
+/// value wins on a duplicate key, as with `-e`), or, when none is given (a
+/// `rebuild`), the one recorded on the entry being replaced. Recorded values
+/// passed the `run` boundary's checks when first given, so they aren't
+/// re-checked.
+fn effective_extra_env(
+    given: &[(String, String)],
+    prior: Option<&BTreeMap<String, String>>,
+) -> BTreeMap<String, String> {
+    if given.is_empty() {
+        prior.cloned().unwrap_or_default()
+    } else {
+        given.iter().cloned().collect()
+    }
+}
+
 /// Create (and start) the instance container and record it: run
 /// `initializeCommand`, bring up services, build the mount set (rebuilding the
 /// `${instance}` context from `instance_id` so per-instance mounts/history
@@ -230,8 +248,9 @@ fn worktree_branch(
 /// call, `rebuild` included, so adding a pattern and rebuilding (the fix the
 /// resulting drift points at) actually delivers the file; the copy never
 /// overwrites, so edits in the worktree survive. `branch_created` is recorded for `rm` (see `Instance::branch_created`).
-/// `extras.dispatcher` falls back to the entry being replaced, as does the
-/// recorded `config_dir`, so a `rebuild` keeps both.
+/// `extras.dispatcher` falls back to the entry being replaced, as do the
+/// recorded `config_dir` and extra env (`effective_extra_env`), so a
+/// `rebuild` keeps all three.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn materialize(
     dir: &Path,
@@ -255,6 +274,7 @@ pub(crate) fn materialize(
         .clone()
         .or_else(|| prior.and_then(|i| i.dispatcher.clone()));
     let prior_config_dir = prior.and_then(|i| i.config_dir.clone());
+    let run_env = effective_extra_env(&extras.env, prior.map(|i| &i.extra_env));
     let container_name = format!("{NAME_PREFIX}{instance_id}");
     let basename = folder
         .file_name()
@@ -372,7 +392,7 @@ pub(crate) fn materialize(
     } else {
         None
     };
-    extra_env.extend(extras.env.iter().cloned());
+    extra_env.extend(run_env.iter().map(|(k, v)| (k.clone(), v.clone())));
     // `shell-rc`: host snippets mounted read-only, sourced by the rc files.
     let shell_rc = resolve_shell_rc(dir, &var_ctx, props)?;
     mounts.extend(shell_rc.iter().map(|(mount, _)| mount.clone()));
@@ -466,6 +486,7 @@ pub(crate) fn materialize(
             volumes,
             dispatcher,
             config_dir: Some(prior_config_dir.unwrap_or(config_dir)),
+            extra_env: run_env,
             created_unix: Instance::now(),
         },
     );
@@ -793,8 +814,27 @@ mod tests {
             volumes: Vec::new(),
             dispatcher: None,
             config_dir: None,
+            extra_env: Default::default(),
             created_unix: 0,
         }
+    }
+
+    #[test]
+    fn extra_env_falls_back_to_the_prior_entry_only_when_none_given() {
+        let prior = BTreeMap::from([("PR_NUMBER".to_string(), "7".to_string())]);
+        // `rebuild` passes no env: the recorded one is kept.
+        assert_eq!(effective_extra_env(&[], Some(&prior)), prior);
+        assert!(effective_extra_env(&[], None).is_empty());
+        // Given env replaces the recorded one (not merged); a duplicate key
+        // keeps the last value, as `-e` would.
+        let given = vec![
+            ("A".to_string(), "1".to_string()),
+            ("A".to_string(), "2".to_string()),
+        ];
+        assert_eq!(
+            effective_extra_env(&given, Some(&prior)),
+            BTreeMap::from([("A".to_string(), "2".to_string())])
+        );
     }
 
     #[test]

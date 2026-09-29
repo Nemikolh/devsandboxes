@@ -940,6 +940,7 @@ ports = ["5432:5432"]
             volumes: Vec::new(),
             dispatcher: None,
             config_dir: None,
+            extra_env: Default::default(),
             created_unix: 0,
         }
     }

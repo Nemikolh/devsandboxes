@@ -231,6 +231,7 @@ mod tests {
             volumes: Vec::new(),
             dispatcher: None,
             config_dir: None,
+            extra_env: Default::default(),
             created_unix: 0,
         };
         state.instances.insert("web-aaaa".into(), mk("web", "/home/u/site"));
@@ -270,6 +271,7 @@ mod tests {
                 volumes: Vec::new(),
                 dispatcher: None,
                 config_dir: None,
+                extra_env: Default::default(),
                 created_unix: 0,
             },
         );

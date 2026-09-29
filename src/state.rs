@@ -90,6 +90,10 @@ pub struct Instance {
     /// config. `None` for instances created before it was recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_dir: Option<PathBuf>,
+    /// Extra `-e K=V` from `run --env` (a dispatcher's `ensure --env`),
+    /// recorded so `rebuild` recreates the container with them.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra_env: BTreeMap<String, String>,
     pub created_unix: u64,
 }
 
@@ -192,6 +196,7 @@ mod tests {
                 volumes: Vec::new(),
                 dispatcher: Some("pr-dispatcher".into()),
                 config_dir: Some("/home/u/.devsandboxes".into()),
+                extra_env: BTreeMap::from([("PR_NUMBER".into(), "42".into())]),
                 created_unix: Instance::now(),
             },
         );
@@ -206,6 +211,7 @@ mod tests {
             back.instances["repo-abc1"].config_dir.as_deref(),
             Some(std::path::Path::new("/home/u/.devsandboxes"))
         );
+        assert_eq!(back.instances["repo-abc1"].extra_env["PR_NUMBER"], "42");
     }
 
     #[test]
@@ -235,11 +241,13 @@ mod tests {
         assert_eq!(state.instances["repo"].instance_id, "");
         assert_eq!(state.instances["repo"].dispatcher, None);
         assert_eq!(state.instances["repo"].config_dir, None);
+        assert!(state.instances["repo"].extra_env.is_empty());
         // Pre-reuse entries always had a created branch: `rm` keeps offering it.
         assert!(state.instances["repo"].branch_created);
         let text = toml::to_string_pretty(&state).unwrap();
         assert!(!text.contains("dispatcher") && !text.contains("config_dir"), "{text}");
         assert!(!text.contains("branch_created"), "{text}");
+        assert!(!text.contains("extra_env"), "{text}");
     }
 
     #[test]

@@ -441,7 +441,7 @@ Decision (user): creating an instance on an existing branch must work, for
   (look for existing git fixtures in `worktree.rs` tests), plus the
   checked-out-elsewhere message.
 
-### Step 13 — `--env` persisted
+### Step 13 — `--env` persisted [x]
 
 Decision (user): `run --env` values live in `state.toml` and survive
 `rebuild` (including `ensure` recreating a containerless child).

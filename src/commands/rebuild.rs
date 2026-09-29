@@ -179,6 +179,7 @@ mod tests {
             volumes: Vec::new(),
             dispatcher: None,
             config_dir: None,
+            extra_env: Default::default(),
             created_unix: 0,
         }
     }

@@ -397,8 +397,9 @@ enum Ensure {
 }
 
 /// The `ensure` decision: ownership, cap, and the child's state. An existing
-/// child is only (re)started; a changed `branch`/`env` is ignored (they apply
-/// at creation). `liveness` is only consulted for an owned child.
+/// child is only (re)started; a changed `branch`/`env` is ignored, not merged
+/// (they apply at creation; a recreating `rebuild` keeps the recorded env).
+/// `liveness` is only consulted for an owned child.
 fn ensure_action(
     name: &str,
     child: Option<&Instance>,
@@ -680,6 +681,7 @@ folder = "."
             volumes: Vec::new(),
             dispatcher: owner.map(str::to_string),
             config_dir: Some("/cfg".into()),
+            extra_env: Default::default(),
             created_unix: 0,
         }
     }
