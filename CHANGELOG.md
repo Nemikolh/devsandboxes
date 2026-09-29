@@ -43,7 +43,7 @@ devsbd run logs pr-123 <id> --follow
 devsbd ls; devsbd stop pr-123; devsbd rm pr-123
 ```
 
-- **Runs**: commands started with `devsbd exec` are tracked in the child (id, log, exit status). Follow them with `devsbd run ls|logs|wait`; the TUI shows a child's last runs under its processes.
+- **Runs**: commands started with `devsbd exec` are tracked in the child (id, log, exit status). Follow them with `devsbd run ls|logs|wait`, clean them up with `devsbd run rm` (`--force` kills a running one) and `devsbd run prune --keep N`; the TUI shows a child's last runs under its processes.
 - `devsbd` is on `PATH` in containers (`/usr/local/bin/devsbd`).
 
 ### Changed

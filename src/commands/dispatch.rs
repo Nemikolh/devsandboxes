@@ -240,7 +240,7 @@ pub(crate) fn handle_with(
                 Err(e) => failed(e),
             }
         }
-        Op::Exec | Op::RunLs | Op::RunLogs | Op::RunWait => {
+        Op::Exec | Op::RunLs | Op::RunLogs | Op::RunWait | Op::RunRm | Op::RunPrune => {
             let key = req.key.as_deref().expect("checked by check_fields");
             let name = match find_child(state, owner_id, key, req.sandbox.as_deref()) {
                 Ok(name) => name,
@@ -277,9 +277,11 @@ fn check_fields(req: &Request) -> Result<(), String> {
         return Err(format!("`{op}` takes no `branch`/`env`"));
     }
     field("arg", only(&[Op::Exec], false), !req.argv.is_empty())?;
-    field("id", only(&[Op::RunLogs, Op::RunWait], false), req.id.is_some())?;
+    field("id", only(&[Op::RunLogs, Op::RunWait, Op::RunRm], false), req.id.is_some())?;
     field("offset", only(&[Op::RunLogs], true), req.offset.is_some())?;
     field("timeout", only(&[Op::RunWait], true), req.timeout.is_some())?;
+    field("force", only(&[Op::RunRm], true), req.force)?;
+    field("keep", only(&[Op::RunPrune], true), req.keep.is_some())?;
     if let Some(key) = &req.key {
         if !valid_key(key) {
             return Err(format!(
@@ -319,6 +321,18 @@ fn helper_argv(req: &Request) -> Vec<String> {
                 argv.extend([s("--timeout"), t.min(MAX_WAIT).to_string()]);
             }
         }
+        Op::RunRm => {
+            argv.extend([s("rm"), id()]);
+            if req.force {
+                argv.push(s("--force"));
+            }
+        }
+        Op::RunPrune => {
+            argv.push(s("prune"));
+            if let Some(keep) = req.keep {
+                argv.extend([s("--keep"), keep.to_string()]);
+            }
+        }
         Op::Ensure | Op::Ls | Op::Stop | Op::Rm => unreachable!("not a run op"),
     }
     argv
@@ -344,6 +358,12 @@ fn run_op(name: &str, child: &Instance, req: &Request, exec: &mut dyn Executor) 
         let why = out.stderr.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
         if out.code == control::EXIT_USAGE && why.starts_with("usage: devsbd version") {
             return failed(format!("child {name}'s devsbd predates runs; restart the child"));
+        }
+        // The host built this argv, so a usage error means an older helper.
+        if out.code == control::EXIT_USAGE && matches!(req.op, Op::RunRm | Op::RunPrune) {
+            return failed(format!(
+                "child {name}'s devsbd predates `run rm`/`run prune`; restart the child ({why})"
+            ));
         }
         return failed(format!("in {name}: {}", if why.is_empty() { "devsbd run failed" } else { why }));
     }
@@ -898,7 +918,7 @@ folder = "."
     fn exec_timeout_allows_run_wait_its_wait() {
         let wait = helper_argv(&run_req(Op::RunWait, "one"));
         assert_eq!(exec_timeout(&wait), Duration::from_secs(MAX_WAIT) + WAIT_SLACK);
-        for op in [Op::Exec, Op::RunLs, Op::RunLogs] {
+        for op in [Op::Exec, Op::RunLs, Op::RunLogs, Op::RunRm, Op::RunPrune] {
             assert_eq!(exec_timeout(&helper_argv(&run_req(op, "one"))), EXEC_TIMEOUT, "{op:?}");
         }
     }
@@ -907,7 +927,7 @@ folder = "."
         let mut r = req(op, None, Some(key));
         match op {
             Op::Exec => r.argv = argv(&["sh", "-c", "echo hi"]),
-            Op::RunLogs | Op::RunWait => r.id = Some(RUN_ID.into()),
+            Op::RunLogs | Op::RunWait | Op::RunRm => r.id = Some(RUN_ID.into()),
             _ => {}
         }
         r
@@ -929,7 +949,7 @@ folder = "."
     #[test]
     fn run_ops_reach_only_owned_running_children_with_a_helper() {
         let s = helper_state();
-        let run_ops = [Op::Exec, Op::RunLs, Op::RunLogs, Op::RunWait];
+        let run_ops = [Op::Exec, Op::RunLs, Op::RunLogs, Op::RunWait, Op::RunRm, Op::RunPrune];
         let cases: &[(&str, &str, Status, &str)] = &[
             ("p", "one", Status::Denied, "does not declare `dispatcher`"),
             ("d", "other", Status::Denied, "`web-other` is not this dispatcher's child"),
@@ -975,6 +995,12 @@ folder = "."
             // Capped.
             (Request { timeout: Some(99_999), ..run_req(Op::RunWait, "one") },
              vec![bin, "run", "wait", RUN_ID, "--timeout", "300"], "running\n", "running"),
+            (run_req(Op::RunRm, "one"), vec![bin, "run", "rm", RUN_ID], "", ""),
+            (Request { force: true, ..run_req(Op::RunRm, "one") },
+             vec![bin, "run", "rm", RUN_ID, "--force"], "", ""),
+            (run_req(Op::RunPrune, "one"), vec![bin, "run", "prune"], "removed 3\n", "removed 3"),
+            (Request { keep: Some(5), ..run_req(Op::RunPrune, "one") },
+             vec![bin, "run", "prune", "--keep", "5"], "removed 0\n", "removed 0"),
         ];
         for (r, want, stdout, body) in cases {
             let mut fake = Fake { helper: helper(0, stdout, ""), ..Fake::new() };
@@ -998,6 +1024,17 @@ folder = "."
         let mut fake = Fake { helper: helper(2, "", "usage: devsbd version|daemon|bridge\n"), ..Fake::new() };
         let resp = call(&s, "d", &r, &mut fake);
         assert!(resp.body.contains("predates runs"), "{resp:?}");
+        // A helper with runs but without `run rm`/`run prune`.
+        let old = helper(2, "", "devsbd run: unknown subcommand `rm`\nusage: devsbd run start\n");
+        for r in [run_req(Op::RunRm, "one"), run_req(Op::RunPrune, "one")] {
+            let resp = call(&s, "d", &r, &mut Fake { helper: old.clone(), ..Fake::new() });
+            assert!(resp.body.contains("predates `run rm`/`run prune`; restart the child"), "{resp:?}");
+        }
+        // A refusal from a current helper is passed through.
+        let busy = helper(1, "", "devsbd run: run `1790000000-a1b2` is running; `--force` kills it first\n");
+        let resp = call(&s, "d", &run_req(Op::RunRm, "one"), &mut Fake { helper: busy, ..Fake::new() });
+        assert_eq!(resp.status, Status::Failed);
+        assert!(resp.body.contains("is running; `--force`"), "{resp:?}");
         let mut fake = Fake { helper: helper(3, "", ""), ..Fake::new() };
         assert!(call(&s, "d", &r, &mut fake).body.contains("devsbd run failed"));
         let mut fake = Fake { fail: true, ..Fake::new() };
@@ -1019,6 +1056,13 @@ folder = "."
             (Request { argv: argv(&["x"]), ..req(Op::Stop, None, Some("one")) }, "`stop` takes no `arg`"),
             (Request { id: Some(RUN_ID.into()), ..req(Op::Ls, None, None) }, "`ls` takes no `id`"),
             (r_with(Op::Exec, "one"), "takes no `branch`/`env`"),
+            (req(Op::RunRm, None, Some("one")), "`run-rm` needs `id`"),
+            (Request { id: Some(RUN_ID.into()), ..run_req(Op::RunPrune, "one") }, "`run-prune` takes no `id`"),
+            (Request { force: true, ..run_req(Op::RunPrune, "one") }, "`run-prune` takes no `force`"),
+            (Request { force: true, ..run_req(Op::RunLs, "one") }, "`run-ls` takes no `force`"),
+            (Request { keep: Some(1), ..run_req(Op::RunRm, "one") }, "`run-rm` takes no `keep`"),
+            (Request { keep: Some(1), ..req(Op::Rm, None, Some("one")) }, "`rm` takes no `keep`"),
+            (Request { id: Some("../x".into()), ..run_req(Op::RunRm, "one") }, "bad run id `../x`"),
         ];
         for (r, needle) in cases {
             let mut fake = Fake::new();
@@ -1084,6 +1128,20 @@ folder = "."
             let resp = call(Request { id: Some("0000000000-0000".into()), ..with_id(Op::RunWait, None) });
             assert_eq!(resp.status, Status::Failed);
             assert!(resp.body.contains("no run `0000000000-0000`"), "{resp:?}");
+            // Clearing: a second run pruned, the first removed by id.
+            let exec = Request { argv: argv(&["true"]), ..req(Op::Exec, None, Some("one")) };
+            let id2 = call(exec).body;
+            assert_eq!(call(Request { id: Some(id2.clone()), timeout: Some(30), ..req(Op::RunWait, None, Some("one")) }).body, "exited 0");
+            let resp = call(Request { keep: Some(1), ..req(Op::RunPrune, None, Some("one")) });
+            assert_eq!(resp, Response::new(Status::Ok, "removed 1"));
+            // Newest by id: both may share a start second, so either is left.
+            let resp = call(req(Op::RunLs, None, Some("one")));
+            assert_eq!(resp.body.lines().count(), 1, "{resp:?}");
+            let left = resp.body.split(' ').next().unwrap().to_string();
+            assert!(left == id || left == id2, "{resp:?}");
+            let resp = call(Request { id: Some(left), ..req(Op::RunRm, None, Some("one")) });
+            assert_eq!(resp, Response::new(Status::Ok, ""));
+            assert_eq!(call(req(Op::RunLs, None, Some("one"))).body, "");
         });
         Ok(())
     }

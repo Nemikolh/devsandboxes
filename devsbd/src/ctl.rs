@@ -1,4 +1,4 @@
-//! `devsbd ensure|ls|stop|rm|exec` and `devsbd run ls|logs|wait <key> …`: a
+//! `devsbd ensure|ls|stop|rm|exec` and `devsbd run ls|logs|wait|rm|prune <key> …`: a
 //! dispatcher's control commands (docs/automations.md, "Control API",
 //! "Runs"). Each request is one encoded [`control::Request`] sent to the
 //! daemon over `daemon::API_SOCK`, which relays it to a host serving
@@ -23,7 +23,13 @@ const USAGE: &str = "usage: devsbd ensure <sandbox> --key <key> [--branch B] [--
        devsbd exec <key> [--sandbox S] [--detach] -- <cmd>...\n\
        devsbd run ls <key> [--sandbox S]\n\
        devsbd run logs <key> <id> [--sandbox S] [--follow]\n\
-       devsbd run wait <key> <id> [--sandbox S] [--timeout SECS]";
+       devsbd run wait <key> <id> [--sandbox S] [--timeout SECS]\n\
+       devsbd run rm <key> <id> [--sandbox S] [--force]\n\
+       devsbd run prune <key> [--sandbox S] [--keep N]";
+
+/// `devsbd run <sub>` forms that name a child (`run_remote`); each is the
+/// [`Op`] `run-<sub>`.
+const REMOTE_RUN_SUBS: [&str; 5] = ["ls", "logs", "wait", "rm", "prune"];
 
 /// Per-request wait while following a run: bounds how long each host
 /// round trip holds a bridge thread and a `docker exec`, and the latency of
@@ -54,7 +60,7 @@ pub fn run(verb: &str, args: &[String]) -> i32 {
 /// `devsbd run <sub> <key> …` (the dispatcher form; `runs::is_local` picks).
 pub fn run_remote(args: &[String]) -> i32 {
     match args.split_first() {
-        Some((sub, rest)) if matches!(sub.as_str(), "ls" | "logs" | "wait") => {
+        Some((sub, rest)) if REMOTE_RUN_SUBS.contains(&sub.as_str()) => {
             run(&format!("run-{sub}"), rest)
         }
         _ => {
@@ -114,6 +120,8 @@ fn parse_args(verb: &str, args: &[String]) -> Result<Cmd, String> {
             (Op::Exec, "--detach" | "--") => true,
             (Op::RunLogs, "--follow") => true,
             (Op::RunWait, "--timeout") => true,
+            (Op::RunRm, "--force") => true,
+            (Op::RunPrune, "--keep") => true,
             _ => false,
         };
         match flag {
@@ -125,9 +133,17 @@ fn parse_args(verb: &str, args: &[String]) -> Result<Cmd, String> {
                 dashdash = true;
                 break;
             }
-            "--detach" | "--follow" if inline.is_some() => return Err(format!("{flag} takes no value")),
+            "--detach" | "--follow" | "--force" if inline.is_some() => {
+                return Err(format!("{flag} takes no value"));
+            }
             "--detach" => cmd.detach = true,
             "--follow" => cmd.follow = true,
+            "--force" => req.force = true,
+            "--keep" => {
+                let v = value()?;
+                let n = v.parse().map_err(|_| format!("--keep: bad number `{v}`"))?;
+                set_once(&mut req.keep, n, flag)?;
+            }
             "--timeout" => {
                 let v = value()?;
                 let secs = v.parse().map_err(|_| format!("--timeout: bad number `{v}`"))?;
@@ -149,8 +165,8 @@ fn parse_args(verb: &str, args: &[String]) -> Result<Cmd, String> {
     let (wanted, what) = match op {
         Op::Ls => (0, "no arguments"),
         Op::Ensure => (1, "exactly one <sandbox>"),
-        Op::Stop | Op::Rm | Op::Exec | Op::RunLs => (1, "exactly one <key>"),
-        Op::RunLogs | Op::RunWait => (2, "<key> <id>"),
+        Op::Stop | Op::Rm | Op::Exec | Op::RunLs | Op::RunPrune => (1, "exactly one <key>"),
+        Op::RunLogs | Op::RunWait | Op::RunRm => (2, "<key> <id>"),
     };
     if positional.len() != wanted {
         return Err(format!("takes {what}"));
@@ -409,6 +425,41 @@ mod tests {
         let c = parse_cmd("run-wait", &["pr-1", ID, "--timeout", "30"]).unwrap();
         assert_eq!(c.deadline, Some(30));
         assert_eq!(c.req.timeout, None, "the overall timeout stays client-side");
+        assert_eq!(parse("run-rm", &["pr-1", ID]).unwrap(), Request { id: Some(ID.into()), ..req(Op::RunRm, None, Some("pr-1")) });
+        assert_eq!(
+            parse("run-rm", &["--force", "pr-1", "--sandbox=web", ID]).unwrap(),
+            Request { id: Some(ID.into()), force: true, ..req(Op::RunRm, Some("web"), Some("pr-1")) }
+        );
+        assert_eq!(parse("run-prune", &["pr-1"]).unwrap(), req(Op::RunPrune, None, Some("pr-1")));
+        assert_eq!(
+            parse("run-prune", &["pr-1", "--keep", "5", "--sandbox", "web"]).unwrap(),
+            Request { keep: Some(5), ..req(Op::RunPrune, Some("web"), Some("pr-1")) }
+        );
+        assert_eq!(parse("run-prune", &["--keep=0", "pr-1"]).unwrap().keep, Some(0));
+        let r = parse("run-rm", &["k", ID, "--force"]).unwrap();
+        assert_eq!(control::decode_request(&control::encode_request(&r)), Ok(r));
+    }
+
+    /// Every `devsbd run <sub> <key> …` form maps to an op `run_remote` can
+    /// send, and `main`'s local/remote split sends the child forms here.
+    #[test]
+    fn remote_run_subcommands_are_ops() {
+        for sub in REMOTE_RUN_SUBS {
+            assert!(Op::parse(&format!("run-{sub}")).is_some(), "{sub}");
+        }
+        let s = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for remote in [
+            &["rm", "pr-1", ID][..],
+            &["rm", "pr-1", ID, "--force", "--sandbox", "web"],
+            &["prune", "pr-1"],
+            &["prune", "pr-1", "--keep", "5"],
+            &["prune", "--keep", "5", "--sandbox", "web", "pr-1"],
+        ] {
+            let args = s(remote);
+            assert!(!crate::runs::is_local(&args), "{remote:?}");
+            let verb = format!("run-{}", args[0]);
+            assert!(parse_args(&verb, &args[1..]).is_ok(), "{remote:?}");
+        }
     }
 
     #[test]
@@ -452,6 +503,17 @@ mod tests {
         assert_eq!(parse("run-logs", &["k", ID, "--timeout", "1"]).unwrap_err(), "unknown option `--timeout`");
         assert!(parse("run-wait", &["k", ID, "--timeout", "x"]).unwrap_err().contains("bad number"));
         assert_eq!(parse("run-ls", &["k", ID]).unwrap_err(), "takes exactly one <key>");
+        assert!(parse("run-rm", &["k"]).unwrap_err().contains("<key> <id>"));
+        assert_eq!(parse("run-rm", &["k", "nope"]).unwrap_err(), "bad run id `nope`");
+        assert_eq!(parse("run-rm", &["k", ID, "--force=1"]).unwrap_err(), "--force takes no value");
+        assert_eq!(parse("run-rm", &["k", ID, "--keep", "1"]).unwrap_err(), "unknown option `--keep`");
+        assert_eq!(parse("run-prune", &["k", ID]).unwrap_err(), "takes exactly one <key>");
+        assert_eq!(parse("run-prune", &[]).unwrap_err(), "takes exactly one <key>");
+        assert_eq!(parse("run-prune", &["k", "--force"]).unwrap_err(), "unknown option `--force`");
+        assert!(parse("run-prune", &["k", "--keep", "-1"]).unwrap_err().contains("bad number"));
+        assert_eq!(parse("run-prune", &["k", "--keep"]).unwrap_err(), "--keep needs a value");
+        assert_eq!(parse("run-prune", &["k", "--keep", "1", "--keep=2"]).unwrap_err(), "--keep given twice");
+        assert_eq!(parse("stop", &["k", "--force"]).unwrap_err(), "unknown option `--force`");
     }
 
     /// A fake host over a scripted run: `log` is the whole output, `states`

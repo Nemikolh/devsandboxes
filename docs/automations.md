@@ -148,9 +148,11 @@ devsbd run ls <key> [--sandbox S]                      # id, state, start (UTC),
 devsbd run logs <key> <id> [--sandbox S] [--follow]    # output so far; --follow until the run ends
 devsbd run wait <key> <id> [--sandbox S] [--timeout SECS] # prints `exited N` | `killed N` | `lost`,
                                                        # or `running` after --timeout; exit 0
+devsbd run rm <key> <id> [--sandbox S] [--force]       # delete a run; --force kills a running one first
+devsbd run prune <key> [--sandbox S] [--keep N]        # delete ended/lost runs but the newest N (default 0)
 ```
 
-States: `running`, `exited N`, `killed N` (signal), `lost` (its supervisor died without recording an end, e.g. the child restarted). Without `--detach`, `exec` prints the id to stderr (`devsbd: run <id>`), streams the output, and exits with the run's code (`killed N` → 128+N, `lost` → 1). The child must be a running, owned child (`ensure` it first). Inside the child the same store is `devsbd run start [--cwd D] -- cmd…` / `run ls` / `run logs <id> [--offset N]` / `run wait <id> [--timeout S]` — what the host execs there. The TUI shows a child's last runs (dim `run` rows) after its processes.
+States: `running`, `exited N`, `killed N` (signal), `lost` (its supervisor died without recording an end, e.g. the child restarted). Without `--detach`, `exec` prints the id to stderr (`devsbd: run <id>`), streams the output, and exits with the run's code (`killed N` → 128+N, `lost` → 1). The child must be a running, owned child (`ensure` it first). Inside the child the same store is `devsbd run start [--cwd D] -- cmd…` / `run ls` / `run logs <id> [--offset N]` / `run wait <id> [--timeout S]` / `run rm <id> [--force]` / `run prune [--keep N]` — what the host execs there. The TUI shows a child's last runs (dim `run` rows) after its processes.
 
 ## Transport
 
@@ -463,7 +465,7 @@ Decision (user): the once-per-boot pass never starts or creates children.
 - `"runtime"` children still come back via the runtime's `unless-stopped`
   when they were running — that's the runtime's rule, documented.
 
-### Step 15 — clearing runs
+### Step 15 — clearing runs [x]
 
 Decision (user): dispatchers clear their runs through `devsbd`.
 

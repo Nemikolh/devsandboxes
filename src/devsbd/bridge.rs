@@ -220,14 +220,20 @@ const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// `run-wait` holds its handler for up to `dispatch::MAX_WAIT`.
 fn dispatch_control(key: &str, req: &Request) -> Response {
     use crate::commands::dispatch;
-    use crate::devsbd::control::Op;
     static LOCK: Mutex<()> = Mutex::new(());
-    let writes_state = matches!(req.op, Op::Ensure | Op::Stop | Op::Rm);
-    if !writes_state || !dispatch::declares_dispatcher(key) {
+    if !writes_state(req.op) || !dispatch::declares_dispatcher(key) {
         return dispatch::handle(key, req);
     }
     let _serial = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     dispatch::handle(key, req)
+}
+
+/// Whether `op` runs a `devsandbox` subprocess that writes `state.toml`
+/// ([`dispatch_control`] serializes those). Run ops, `run-rm`/`run-prune`
+/// included, only exec in a child.
+fn writes_state(op: crate::devsbd::control::Op) -> bool {
+    use crate::devsbd::control::Op;
+    matches!(op, Op::Ensure | Op::Stop | Op::Rm)
 }
 
 /// Room over `notify::MAX_RECORD` before a notify stream counts as oversized:
@@ -679,6 +685,13 @@ mod tests {
 
     fn ok(cmd: &mut Command) -> bool {
         matches!(cmd.output(), Ok(o) if o.status.success())
+    }
+
+    #[test]
+    fn only_state_writing_ops_take_the_control_lock() {
+        use crate::devsbd::control::Op;
+        let locked: Vec<Op> = Op::ALL.into_iter().filter(|op| writes_state(*op)).collect();
+        assert_eq!(locked, [Op::Ensure, Op::Stop, Op::Rm]);
     }
 
     #[test]

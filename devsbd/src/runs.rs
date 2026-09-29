@@ -1,4 +1,4 @@
-//! `devsbd run start|supervise|ls|logs|wait`: tracked runs inside one
+//! `devsbd run start|supervise|ls|logs|wait|rm|prune`: tracked runs inside one
 //! container (docs/automations.md, "Runs"). A dispatcher reaches a child's
 //! runs through the host (`devsbd exec` / `devsbd run … <key>`, `ctl.rs`),
 //! which execs these commands in the child; they work by hand in the child
@@ -8,7 +8,8 @@
 //!
 //! - `argv`: the command, one `arg <escaped>` line per word (`escape.rs`);
 //! - `out.log`: its stdout + stderr, appended as written;
-//! - `meta`: `started <unix>`, `supervisor <pid>`, `pid <pid>`, and at the end
+//! - `meta`: `started <unix>`, `supervisor <pid>`, `pid <pid>` + `pgid <pgid>`
+//!   (the command leads its own process group, what `rm --force` kills), and at the end
 //!   `ended <unix>` + `exit <code>` or `signal <n>` (one write, so both or
 //!   neither). Lines are appended by two processes, so order isn't fixed and
 //!   only `\n`-terminated lines count (a torn last line is ignored).
@@ -19,6 +20,9 @@
 //! supervisor is gone without an `ended` (container restart, killed) is
 //! `lost`. The supervisor is identified by its pid *and* its cmdline naming
 //! the id, since pids restart from 1 with the container.
+//!
+//! Runs are kept until `rm <id>` / `prune` deletes them (the dispatcher's
+//! job, through `devsbd run rm|prune <key>`).
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -62,24 +66,31 @@ const POLL: Duration = Duration::from_millis(100);
 /// `start` died in between and the run is `lost`.
 const STARTING_GRACE: u64 = 10;
 
+/// How long `rm --force` waits for a young run's supervisor to record the
+/// command's group, then for the killed run to be recorded as ended.
+const KILL_WAIT: Duration = Duration::from_secs(5);
+
 const USAGE: &str = "usage: devsbd run start [--cwd DIR] -- <cmd>...\n\
        devsbd run ls\n\
        devsbd run logs <id> [--offset N]\n\
-       devsbd run wait <id> [--timeout SECS]";
+       devsbd run wait <id> [--timeout SECS]\n\
+       devsbd run rm <id> [--force]\n\
+       devsbd run prune [--keep N]";
 
 /// Whether argv after `run` is this container's own form (else it names a
 /// child: `ctl::run_remote`). Decided by positional count: `ls` takes none
-/// here and a `<key>` remotely; `logs`/`wait` take `<id>` here and `<key>
-/// <id>` remotely. `start`/`supervise` only exist here.
+/// here and a `<key>` remotely; `logs`/`wait`/`rm` take `<id>` here and `<key>
+/// <id>` remotely; `prune` takes none here and a `<key>` remotely.
+/// `start`/`supervise` only exist here.
 pub fn is_local(args: &[String]) -> bool {
     let (sub, rest) = match args.split_first() {
         Some((sub, rest)) => (sub.as_str(), rest),
         None => return true,
     };
-    let positional = || positionals(rest, &["--offset", "--timeout", "--sandbox"]);
+    let positional = || positionals(rest, &["--offset", "--timeout", "--sandbox", "--keep"]);
     match sub {
-        "ls" => positional() == 0,
-        "logs" | "wait" => positional() <= 1,
+        "ls" | "prune" => positional() == 0,
+        "logs" | "wait" | "rm" => positional() <= 1,
         _ => true,
     }
 }
@@ -122,6 +133,8 @@ pub fn run(args: &[String]) -> i32 {
         Cmd::Wait { id, timeout } => {
             wait(root, &id, Duration::from_secs(timeout)).map(|s| println!("{}", s.label()))
         }
+        Cmd::Rm { id, force } => rm(root, &id, force),
+        Cmd::Prune { keep } => prune(root, keep).map(|n| println!("removed {n}")),
     };
     match result {
         Ok(()) => control::EXIT_OK,
@@ -139,12 +152,15 @@ enum Cmd {
     Ls,
     Logs { id: String, offset: u64 },
     Wait { id: String, timeout: u64 },
+    Rm { id: String, force: bool },
+    Prune { keep: usize },
 }
 
 fn parse(args: &[String]) -> Result<Cmd, String> {
     let (sub, rest) = args.split_first().ok_or("missing subcommand")?;
     let mut cwd = None;
-    let (mut offset, mut timeout) = (None, None);
+    let (mut offset, mut timeout, mut keep) = (None, None, None);
+    let mut force = false;
     let mut words: Vec<String> = Vec::new();
     let mut argv = None;
     let mut it = rest.iter();
@@ -166,6 +182,9 @@ fn parse(args: &[String]) -> Result<Cmd, String> {
             ("start", "--cwd") => once(&mut cwd, value()?, flag)?,
             ("logs", "--offset") => once(&mut offset, num(value()?)?, flag)?,
             ("wait", "--timeout") => once(&mut timeout, num(value()?)?, flag)?,
+            ("rm", "--force") if inline.is_none() => force = true,
+            ("rm", "--force") => return Err("--force takes no value".into()),
+            ("prune", "--keep") => once(&mut keep, num(value()?)?, flag)?,
             (_, f) if f.starts_with('-') && f.len() > 1 => return Err(format!("unknown option `{f}`")),
             _ => words.push(arg.clone()),
         }
@@ -190,6 +209,11 @@ fn parse(args: &[String]) -> Result<Cmd, String> {
         "ls" => Err("takes no arguments".into()),
         "logs" => Ok(Cmd::Logs { id: id(&mut words)?, offset: offset.unwrap_or(0) }),
         "wait" => Ok(Cmd::Wait { id: id(&mut words)?, timeout: timeout.unwrap_or(DEFAULT_WAIT) }),
+        "rm" => Ok(Cmd::Rm { id: id(&mut words)?, force }),
+        "prune" if words.is_empty() => {
+            Ok(Cmd::Prune { keep: usize::try_from(keep.unwrap_or(0)).unwrap_or(usize::MAX) })
+        }
+        "prune" => Err("takes no arguments".into()),
         other => Err(format!("unknown subcommand `{other}`")),
     }
 }
@@ -271,11 +295,26 @@ fn create(root: &Path, argv: &[String], now: u64) -> io::Result<String> {
 /// the command runs there; a bad `cwd` fails here, before anything runs),
 /// record the supervisor's pid.
 fn start(root: &Path, argv: &[String], cwd: Option<&str>) -> io::Result<String> {
+    let exe = std::env::current_exe()?;
+    start_with(root, argv, cwd, |id| {
+        let mut cmd = Command::new(&exe);
+        cmd.args(["run", "supervise", id]);
+        cmd
+    })
+}
+
+/// [`start`] with the supervisor command for run `id` from `supervisor`
+/// (tests run it from the test binary, over their own root).
+fn start_with(
+    root: &Path,
+    argv: &[String],
+    cwd: Option<&str>,
+    supervisor: impl FnOnce(&str) -> Command,
+) -> io::Result<String> {
     let id = create(root, argv, now())?;
     let dir = root.join(&id);
-    let mut cmd = Command::new(std::env::current_exe()?);
-    cmd.args(["run", "supervise", &id])
-        .stdin(Stdio::null())
+    let mut cmd = supervisor(&id);
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .process_group(0);
@@ -306,7 +345,10 @@ fn read_argv(dir: &Path) -> io::Result<Vec<String>> {
 }
 
 /// `run supervise`: run the command (stdin null, output to `out.log`, cwd and
-/// env inherited from `start`), record its pid, wait, record the end. A
+/// env inherited from `start`) as the leader of a new process group, record
+/// its pid and group, wait, record the end. The group is what `rm --force`
+/// kills: the command and whatever it forks, while the supervisor survives
+/// to record the end. A
 /// command that can't be spawned ends at once with exit 127, its error in the
 /// log, as a shell would.
 fn supervise(root: &Path, id: &str) -> io::Result<()> {
@@ -321,10 +363,12 @@ fn supervise(root: &Path, id: &str) -> io::Result<()> {
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log.try_clone()?)
+        .process_group(0)
         .spawn();
     let end = match spawned {
         Ok(mut child) => {
-            append(&dir, &format!("pid {}\n", child.id()))?;
+            let pid = child.id();
+            append(&dir, &format!("pid {pid}\npgid {pid}\n"))?;
             exit_line(child.wait()?)
         }
         Err(e) => {
@@ -347,6 +391,10 @@ fn exit_line(status: ExitStatus) -> String {
 struct Meta {
     started: Option<u64>,
     supervisor: Option<u32>,
+    pid: Option<u32>,
+    /// The command's process group (absent: not spawned yet, or a supervisor
+    /// from before `rm`, whose command shares the supervisor's group).
+    pgid: Option<u32>,
     ended: Option<u64>,
     exit: Option<State>,
 }
@@ -361,6 +409,8 @@ fn parse_meta(text: &str) -> Meta {
         match key {
             "started" => meta.started = value.parse().ok(),
             "supervisor" => meta.supervisor = value.parse().ok(),
+            "pid" => meta.pid = value.parse().ok(),
+            "pgid" => meta.pgid = value.parse().ok(),
             "ended" => meta.ended = value.parse().ok(),
             "exit" => meta.exit = value.parse().ok().map(State::Exited),
             "signal" => meta.exit = value.parse().ok().map(State::Killed),
@@ -440,15 +490,7 @@ fn load_state(dir: &Path, id: &str) -> io::Result<(Meta, State)> {
 /// (ids start with the start time) before anything is read, so a flood of
 /// dirs costs one `lstat` each.
 fn ls(root: &Path) -> io::Result<String> {
-    let mut ids: Vec<String> = match fs::read_dir(root) {
-        Ok(entries) => entries
-            .filter_map(|e| e.ok()?.file_name().into_string().ok())
-            .filter(|n| valid_run_id(n) && is_real_dir(&root.join(n)))
-            .collect(),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
-        Err(e) => return Err(e),
-    };
-    ids.sort();
+    let ids = run_ids(root)?;
     let mut out = String::new();
     for id in &ids[ids.len().saturating_sub(MAX_LS_RUNS)..] {
         let dir = root.join(id);
@@ -464,6 +506,22 @@ fn ls(root: &Path) -> io::Result<String> {
         out.push('\n');
     }
     Ok(out)
+}
+
+/// Every run id under `root` that is a real dir, sorted (start order; runs
+/// started in the same second tie-break on the id's random part). A missing
+/// root has none.
+fn run_ids(root: &Path) -> io::Result<Vec<String>> {
+    let mut ids: Vec<String> = match fs::read_dir(root) {
+        Ok(entries) => entries
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|n| valid_run_id(n) && is_real_dir(&root.join(n)))
+            .collect(),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(e),
+    };
+    ids.sort();
+    Ok(ids)
 }
 
 /// ` <word> <word>…`, escaped, cut to [`MAX_LS_ARGV_CHARS`] chars plus `…`.
@@ -512,6 +570,133 @@ fn wait(root: &Path, id: &str, timeout: Duration) -> io::Result<State> {
     }
 }
 
+fn other(msg: String) -> io::Error {
+    io::Error::other(msg)
+}
+
+/// `run rm`: delete a run's dir. A running run is refused unless `force`,
+/// which kills it first ([`kill_run`]); so is one whose `meta` can't be read
+/// (its state is unknown), which `force` deletes as is. The dir is checked to
+/// be a real one (`run_dir`), and `remove_dir_all` never follows symlinks,
+/// not even a dir swapped for one in between.
+fn rm(root: &Path, id: &str, force: bool) -> io::Result<()> {
+    let dir = run_dir(root, id)?;
+    match load_state(&dir, id) {
+        Ok((_, State::Running)) if !force => {
+            return Err(other(format!("run `{id}` is running; `--force` kills it first")));
+        }
+        Ok((meta, State::Running)) => kill_run(root, &dir, id, meta)?,
+        Ok(_) => {}
+        Err(e) if !force => {
+            return Err(io::Error::new(
+                e.kind(),
+                format!("cannot read run `{id}`: {e}; `--force` removes it anyway"),
+            ));
+        }
+        Err(_) => {}
+    }
+    fs::remove_dir_all(&dir)
+}
+
+/// SIGKILL running run `id`'s process group ([`kill_target`]) and wait for
+/// its end to be recorded, so the supervisor isn't writing into the dir as
+/// it's deleted. A young run whose command isn't spawned yet gets a moment to
+/// record it first.
+fn kill_run(root: &Path, dir: &Path, id: &str, mut meta: Meta) -> io::Result<()> {
+    let deadline = Instant::now() + KILL_WAIT;
+    while meta.pid.is_none() && Instant::now() < deadline {
+        std::thread::sleep(POLL);
+        let (fresh, state) = load_state(dir, id)?;
+        if state != State::Running {
+            return Ok(());
+        }
+        meta = fresh;
+    }
+    if let Some(pgid) = kill_target(&meta, proc_stat) {
+        kill_group(pgid)?;
+    }
+    if wait(root, id, KILL_WAIT)? == State::Running {
+        return Err(other(format!("run `{id}` is still running after the kill")));
+    }
+    Ok(())
+}
+
+/// `/proc/<pid>/stat`'s `(ppid, pgrp)`. The comm field is parenthesized and
+/// may hold spaces or `)`, so fields are counted from the last `)`.
+fn parse_stat(text: &str) -> Option<(u32, u32)> {
+    let mut fields = text[text.rfind(')')? + 1..].split_whitespace();
+    let _state = fields.next()?;
+    Some((fields.next()?.parse().ok()?, fields.next()?.parse().ok()?))
+}
+
+fn proc_stat(pid: u32) -> Option<(u32, u32)> {
+    parse_stat(&fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+}
+
+/// The process group `rm --force` kills for a running run, checked against
+/// the live process table (`stat`: pid → `(ppid, pgrp)`): `meta` is written
+/// by the run's user, so its numbers alone must not pick what gets killed.
+/// The command's group (`pgid`) while its leader is still the supervisor's
+/// child leading it; for a supervisor from before `pgid` (a `pid` without
+/// one: the command shares the supervisor's group) or one that never got to
+/// spawn, the supervisor's own group (it leads one: `start`). `None`: nothing
+/// verifiably the run's (e.g. the command just ended).
+fn kill_target(meta: &Meta, stat: impl Fn(u32) -> Option<(u32, u32)>) -> Option<u32> {
+    let sup = meta.supervisor?;
+    let target = match meta.pgid {
+        Some(pgid) => (stat(pgid) == Some((sup, pgid))).then_some(pgid),
+        None => (stat(sup).map(|(_, pgrp)| pgrp) == Some(sup)).then_some(sup),
+    }?;
+    // `kill(-1)` would signal everything we may, `kill(0)` our own group.
+    (target > 1).then_some(target)
+}
+
+/// SIGKILL process group `pgid` (> 1). libc's `kill` directly: std links it
+/// anyway (musl, static), unlike `/bin/kill`, which a minimal image may lack
+/// and whose group syntax differs between procps, util-linux and busybox. A
+/// group that's already gone is fine.
+fn kill_group(pgid: u32) -> io::Result<()> {
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    const SIGKILL: i32 = 9;
+    const ESRCH: i32 = 3;
+    let pgid = i32::try_from(pgid).map_err(|_| other(format!("bad process group {pgid}")))?;
+    // SAFETY: a plain syscall wrapper; no memory is shared.
+    if unsafe { kill(-pgid, SIGKILL) } != 0 {
+        let e = io::Error::last_os_error();
+        if e.raw_os_error() != Some(ESRCH) {
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
+/// `run prune`: delete ended (`exited`/`killed`) and `lost` runs but the
+/// newest `keep` of them ([`run_ids`] order); running runs and ones whose
+/// `meta` can't be read are left alone. Returns how many were deleted. One
+/// that can't be (another user's, in the sticky dir) doesn't stop the rest,
+/// but makes the result an error naming it.
+fn prune(root: &Path, keep: usize) -> io::Result<usize> {
+    let ended: Vec<String> = run_ids(root)?
+        .into_iter()
+        .filter(|id| matches!(load_state(&root.join(id), id), Ok((_, s)) if s != State::Running))
+        .collect();
+    let (mut removed, mut failed) = (0, None);
+    for id in &ended[..ended.len().saturating_sub(keep)] {
+        match fs::remove_dir_all(root.join(id)) {
+            Ok(()) => removed += 1,
+            Err(e) => {
+                failed.get_or_insert((id, e));
+            }
+        }
+    }
+    match failed {
+        None => Ok(removed),
+        Some((id, e)) => Err(io::Error::new(e.kind(), format!("removed {removed}; cannot remove run `{id}`: {e}"))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -541,6 +726,19 @@ mod tests {
         assert_eq!(p(&["wait", "--timeout", "3", id]), Ok(Cmd::Wait { id: id.into(), timeout: 3 }));
         assert_eq!(p(&["wait", id]), Ok(Cmd::Wait { id: id.into(), timeout: DEFAULT_WAIT }));
         assert_eq!(p(&["supervise", id]), Ok(Cmd::Supervise { id: id.into() }));
+        assert_eq!(p(&["rm", id]), Ok(Cmd::Rm { id: id.into(), force: false }));
+        assert_eq!(p(&["rm", "--force", id]), Ok(Cmd::Rm { id: id.into(), force: true }));
+        assert_eq!(p(&["prune"]), Ok(Cmd::Prune { keep: 0 }));
+        assert_eq!(p(&["prune", "--keep", "5"]), Ok(Cmd::Prune { keep: 5 }));
+        assert_eq!(p(&["prune", "--keep=0"]), Ok(Cmd::Prune { keep: 0 }));
+        assert!(p(&["rm"]).unwrap_err().contains("exactly one"));
+        assert!(p(&["rm", "../x"]).unwrap_err().contains("bad run id"));
+        assert_eq!(p(&["rm", id, "--force=1"]), Err("--force takes no value".into()));
+        assert!(p(&["rm", id, "--keep", "1"]).unwrap_err().contains("unknown option"));
+        assert!(p(&["prune", "x"]).unwrap_err().contains("no arguments"));
+        assert!(p(&["prune", "--keep", "-1"]).unwrap_err().contains("bad number"));
+        assert!(p(&["prune", "--keep", "1", "--keep", "2"]).unwrap_err().contains("twice"));
+        assert!(p(&["prune", "--force"]).unwrap_err().contains("unknown option"));
 
         assert!(p(&[]).is_err());
         assert!(p(&["start"]).unwrap_err().contains("missing `-- <cmd>"));
@@ -569,12 +767,33 @@ mod tests {
         assert!(!local(&["wait", "pr-1", id]));
         assert!(local(&["start", "--", "a", "b", "c"]));
         assert!(local(&[]));
+        assert!(local(&["rm", id]));
+        assert!(local(&["rm", "--force", id]));
+        assert!(!local(&["rm", "pr-1", id]));
+        assert!(!local(&["rm", "pr-1", id, "--force", "--sandbox", "web"]));
+        assert!(!local(&["rm", "--sandbox", "web", "pr-1", id]));
+        assert!(local(&["prune"]));
+        assert!(local(&["prune", "--keep", "5"]));
+        assert!(local(&["prune", "--keep=5"]));
+        assert!(!local(&["prune", "pr-1"]));
+        assert!(!local(&["prune", "--keep", "5", "pr-1"]));
+        assert!(!local(&["prune", "--sandbox", "web", "--keep", "5", "pr-1"]));
     }
 
     #[test]
     fn meta_parsing_and_state() {
-        let m = parse_meta("started 100\nsupervisor 7\npid 8\nended 105\nexit 3\n");
-        assert_eq!(m, Meta { started: Some(100), supervisor: Some(7), ended: Some(105), exit: Some(State::Exited(3)) });
+        let m = parse_meta("started 100\nsupervisor 7\npid 8\npgid 8\nended 105\nexit 3\n");
+        assert_eq!(
+            m,
+            Meta {
+                started: Some(100),
+                supervisor: Some(7),
+                pid: Some(8),
+                pgid: Some(8),
+                ended: Some(105),
+                exit: Some(State::Exited(3)),
+            }
+        );
         assert_eq!(state_of(&m, 200, |_| false), State::Exited(3));
         let m = parse_meta("started 100\nended 101\nsignal 9\nfuture x\n");
         assert_eq!(state_of(&m, 200, |_| true), State::Killed(9));
@@ -740,6 +959,201 @@ mod tests {
         let _ = sup.kill();
         let _ = sup.wait();
         assert_eq!(wait(&root, &id, Duration::ZERO).unwrap(), State::Lost);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A live stand-in supervisor for run `id`: its cmdline names the id
+    /// (`; :` keeps sh from exec'ing sleep in its place). Recorded in `meta`.
+    fn fake_supervisor(root: &Path, id: &str) -> std::process::Child {
+        let sup = Command::new("sh").args(["-c", "sleep 30; :", id]).spawn().unwrap();
+        append(&root.join(id), &format!("supervisor {}\n", sup.id())).unwrap();
+        let t = Instant::now();
+        while !is_supervisor(sup.id(), id) && t.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        sup
+    }
+
+    #[test]
+    fn rm_deletes_ended_runs_and_refuses_running_or_unreadable_ones() {
+        let root = temp_root("rm");
+        fake_run(&root, "1790000000-0000", "arg true\n", DONE);
+        rm(&root, "1790000000-0000", false).unwrap();
+        assert!(!root.join("1790000000-0000").exists());
+        assert_eq!(rm(&root, "1790000000-0000", false).unwrap_err().kind(), io::ErrorKind::NotFound);
+
+        // Running (a live supervisor, no command recorded): refused, kept.
+        let id = create(&root, &strings(&["true"]), now()).unwrap();
+        let mut sup = fake_supervisor(&root, &id);
+        let err = rm(&root, &id, false).unwrap_err().to_string();
+        assert!(err.contains("is running; `--force` kills it first"), "{err}");
+        assert!(root.join(&id).is_dir());
+        let _ = sup.kill();
+        let _ = sup.wait();
+
+        // State unknown (`meta` a directory): refused, `--force` deletes it.
+        let bad = root.join("1790000001-0000");
+        fs::create_dir_all(bad.join("meta")).unwrap();
+        let err = rm(&root, "1790000001-0000", false).unwrap_err().to_string();
+        assert!(err.contains("`--force` removes it anyway"), "{err}");
+        rm(&root, "1790000001-0000", true).unwrap();
+        assert!(!bad.exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rm_and_prune_never_follow_a_symlinked_run_dir() {
+        let root = temp_root("rm-link");
+        let target = temp_root("rm-link-target");
+        fake_run(&target, "1790000000-0000", "arg true\n", DONE);
+        fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink(target.join("1790000000-0000"), root.join("1790000000-0000")).unwrap();
+        for force in [false, true] {
+            assert_eq!(rm(&root, "1790000000-0000", force).unwrap_err().kind(), io::ErrorKind::NotFound);
+        }
+        assert_eq!(prune(&root, 0).unwrap(), 0);
+        assert!(fs::symlink_metadata(root.join("1790000000-0000")).is_ok(), "link kept");
+        assert!(target.join("1790000000-0000/meta").is_file(), "target untouched");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&target);
+    }
+
+    #[test]
+    fn prune_keeps_the_newest_ended_runs_and_never_running_ones() {
+        let root = temp_root("prune");
+        assert_eq!(prune(&root, 0).unwrap(), 0, "no root yet");
+        fake_run(&root, "1790000000-0000", "arg a\n", DONE);
+        fake_run(&root, "1790000001-0000", "arg a\n", "started 1790000001\nended 1790000002\nsignal 9\n");
+        fake_run(&root, "1790000002-0000", "arg a\n", "started 1790000002\nsupervisor 4294967\n");
+        fake_run(&root, "1790000003-0000", "arg a\n", "started 1790000003\n");
+        let mut sup = fake_supervisor(&root, "1790000003-0000");
+        fake_run(&root, "1790000004-0000", "arg a\n", DONE);
+        fs::create_dir_all(root.join("1790000005-0000/meta")).unwrap();
+        let left = || run_ids(&root).unwrap();
+
+        // Ended: 0 (exited), 1 (killed), 2 (lost), 4 (exited); keep the newest 2.
+        assert_eq!(prune(&root, 2).unwrap(), 2);
+        assert_eq!(left(), ["1790000002-0000", "1790000003-0000", "1790000004-0000", "1790000005-0000"]);
+        assert_eq!(prune(&root, 2).unwrap(), 0, "already at the limit");
+        assert_eq!(prune(&root, 99).unwrap(), 0);
+        assert_eq!(prune(&root, 0).unwrap(), 2);
+        // The running run and the unreadable one stay.
+        assert_eq!(left(), ["1790000003-0000", "1790000005-0000"]);
+        let _ = sup.kill();
+        let _ = sup.wait();
+        // Its supervisor gone, the run is lost: prunable now.
+        assert_eq!(prune(&root, 0).unwrap(), 1);
+        assert_eq!(left(), ["1790000005-0000"]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stat_parsing_and_kill_targets() {
+        assert_eq!(parse_stat("42 (sleep) S 7 42 42 0 -1 4194560"), Some((7, 42)));
+        assert_eq!(parse_stat("42 (a) b (c) R 7 40 40"), Some((7, 40)), "comm with `) `");
+        assert_eq!(parse_stat("42 (x"), None);
+        assert_eq!(parse_stat(""), None);
+
+        let meta = |text: &str| parse_meta(text);
+        // The command's group, only while its leader is the supervisor's child
+        // leading that group.
+        let stat = |pid: u32| match pid {
+            50 => Some((7, 50)),
+            60 => Some((1, 60)),
+            70 => Some((7, 50)),
+            7 => Some((1, 7)),
+            8 => Some((1, 3)),
+            _ => None,
+        };
+        assert_eq!(kill_target(&meta("supervisor 7\npid 50\npgid 50\n"), stat), Some(50));
+        assert_eq!(kill_target(&meta("supervisor 7\npid 60\npgid 60\n"), stat), None, "not its child");
+        assert_eq!(kill_target(&meta("supervisor 7\npid 70\npgid 70\n"), stat), None, "not a leader");
+        assert_eq!(kill_target(&meta("supervisor 7\npid 99\npgid 99\n"), stat), None, "gone");
+        // Older supervisor (no pgid): its own group, if it leads one.
+        assert_eq!(kill_target(&meta("supervisor 7\npid 50\n"), stat), Some(7));
+        assert_eq!(kill_target(&meta("supervisor 8\npid 50\n"), stat), None);
+        assert_eq!(kill_target(&meta("started 1\n"), stat), None, "no supervisor yet");
+        // Planted 0/1 never reach `kill`.
+        let all = |pid: u32| Some((pid, pid));
+        assert_eq!(kill_target(&meta("supervisor 1\npid 1\n"), all), None);
+        assert_eq!(kill_target(&meta("supervisor 0\npid 0\npgid 0\n"), all), None);
+        assert_eq!(kill_target(&meta("supervisor 1\npid 1\npgid 1\n"), all), None);
+    }
+
+    /// Not a test by itself: the supervisor process of
+    /// `rm_force_kills_a_real_runs_group` (run from this test binary, which
+    /// isn't devsbd), over the root and id in its env.
+    #[test]
+    #[ignore]
+    fn supervisor_process() {
+        let (Ok(root), Ok(id)) = (std::env::var("DEVSBD_TEST_RUNS_ROOT"), std::env::var("DEVSBD_TEST_RUN_ID")) else {
+            return;
+        };
+        supervise(Path::new(&root), &id).unwrap();
+    }
+
+    /// Whether `pid` is a live process (a zombie isn't: an orphan's may sit
+    /// unreaped under a non-reaping PID 1).
+    fn alive(pid: u32) -> bool {
+        fs::read_to_string(format!("/proc/{pid}/stat"))
+            .is_ok_and(|s| s.rfind(')').is_some_and(|i| !s[i + 1..].trim_start().starts_with('Z')))
+    }
+
+    /// Members of process group `pgid`, from `/proc`.
+    fn group_members(pgid: u32) -> Vec<u32> {
+        fs::read_dir("/proc")
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().to_str()?.parse::<u32>().ok())
+            .filter(|&pid| proc_stat(pid).is_some_and(|(_, g)| g == pgid) && alive(pid))
+            .collect()
+    }
+
+    /// The real start → supervise path (a separate supervisor process, the
+    /// command in its own group with a forked grandchild): `rm` refuses,
+    /// `rm --force` kills the whole group, lets the supervisor record the
+    /// kill, and deletes the run.
+    #[test]
+    fn rm_force_kills_a_real_runs_group() {
+        let root = temp_root("rm-kill");
+        let exe = std::env::current_exe().unwrap();
+        let argv = strings(&["sh", "-c", "sleep 300 & sleep 300; :"]);
+        let id = start_with(&root, &argv, None, |id| {
+            let mut cmd = Command::new(&exe);
+            cmd.args(["--exact", "--ignored", "runs::tests::supervisor_process", id])
+                .env("DEVSBD_TEST_RUNS_ROOT", &root)
+                .env("DEVSBD_TEST_RUN_ID", id);
+            cmd
+        })
+        .unwrap();
+        let dir = root.join(&id);
+        let t = Instant::now();
+        let pgid = loop {
+            let meta = parse_meta(&fs::read_to_string(dir.join("meta")).unwrap());
+            match meta.pgid {
+                Some(pgid) if group_members(pgid).len() >= 3 => break pgid,
+                _ if t.elapsed() > Duration::from_secs(10) => panic!("no command group: {meta:?}"),
+                _ => std::thread::sleep(Duration::from_millis(20)),
+            }
+        };
+        let members = group_members(pgid);
+        let meta = parse_meta(&fs::read_to_string(dir.join("meta")).unwrap());
+        assert_eq!(meta.pid, Some(pgid), "the command leads its group");
+        assert!(!members.contains(&meta.supervisor.unwrap()), "the supervisor is outside it");
+
+        let err = rm(&root, &id, false).unwrap_err().to_string();
+        assert!(err.contains("is running"), "{err}");
+        assert!(members.iter().all(|&p| alive(p)));
+
+        let result = rm(&root, &id, true);
+        let t = Instant::now();
+        while members.iter().any(|&p| alive(p)) && t.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let survivors: Vec<u32> = members.iter().copied().filter(|&p| alive(p)).collect();
+        let _ = kill_group(pgid);
+        result.unwrap();
+        assert!(survivors.is_empty(), "still alive: {survivors:?} of {members:?}");
+        assert!(!dir.exists());
         let _ = fs::remove_dir_all(&root);
     }
 }

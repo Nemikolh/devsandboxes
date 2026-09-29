@@ -8,7 +8,7 @@
 //! escaped as in `escape.rs` (`\\`, `\n`, `\0`). Request:
 //!
 //! ```text
-//! op ensure             required, once: ensure|ls|stop|rm|exec|run-ls|run-logs|run-wait
+//! op ensure             required, once: ensure|ls|stop|rm|exec|run-ls|run-logs|run-wait|run-rm|run-prune
 //! sandbox web           optional, at most once
 //! key pr-123            optional, at most once
 //! branch feat/x         optional, at most once
@@ -17,6 +17,8 @@
 //! id 1790000000-a1b2    optional, at most once: a run id (see `valid_run_id`)
 //! offset 1024           optional, at most once: decimal byte offset into a run's log
 //! timeout 5             optional, at most once: decimal seconds
+//! force                 optional, at most once, no value: a flag (`run-rm --force`)
+//! keep 5                optional, at most once: decimal count of runs to keep
 //! ```
 //!
 //! Which fields an op needs is the host handler's call (`commands::dispatch`),
@@ -26,7 +28,7 @@
 //! status ok             required, once: ok|denied|failed|no-host|usage
 //! body web-pr-123       required, once: instance name (ensure), JSON (ls),
 //!                       run id (exec), `devsbd run ls|wait` output (run-ls,
-//!                       run-wait), `<next offset>\n<log text>` (run-logs),
+//!                       run-wait, run-prune), `<next offset>\n<log text>` (run-logs),
 //!                       else a short message; may be empty
 //! ```
 //!
@@ -65,11 +67,25 @@ pub enum Op {
     RunLogs,
     /// Wait up to `timeout` for a run to end; body = its state.
     RunWait,
+    /// Delete a run (`force`: kill it first if running).
+    RunRm,
+    /// Delete a child's ended runs but the newest `keep`; body = the count.
+    RunPrune,
 }
 
 impl Op {
-    pub const ALL: [Op; 8] =
-        [Op::Ensure, Op::Ls, Op::Stop, Op::Rm, Op::Exec, Op::RunLs, Op::RunLogs, Op::RunWait];
+    pub const ALL: [Op; 10] = [
+        Op::Ensure,
+        Op::Ls,
+        Op::Stop,
+        Op::Rm,
+        Op::Exec,
+        Op::RunLs,
+        Op::RunLogs,
+        Op::RunWait,
+        Op::RunRm,
+        Op::RunPrune,
+    ];
 
     pub fn parse(s: &str) -> Option<Op> {
         Op::ALL.into_iter().find(|op| op.as_str() == s)
@@ -85,6 +101,8 @@ impl Op {
             Op::RunLs => "run-ls",
             Op::RunLogs => "run-logs",
             Op::RunWait => "run-wait",
+            Op::RunRm => "run-rm",
+            Op::RunPrune => "run-prune",
         }
     }
 }
@@ -134,6 +152,8 @@ pub struct Request {
     pub id: Option<String>,
     pub offset: Option<u64>,
     pub timeout: Option<u64>,
+    pub force: bool,
+    pub keep: Option<u64>,
 }
 
 impl Request {
@@ -149,6 +169,8 @@ impl Request {
             id: None,
             offset: None,
             timeout: None,
+            force: false,
+            keep: None,
         }
     }
 }
@@ -302,6 +324,12 @@ pub fn encode_request(r: &Request) -> String {
             line(&mut out, key, &value.to_string());
         }
     }
+    if r.force {
+        out.push_str("force\n");
+    }
+    if let Some(keep) = r.keep {
+        line(&mut out, "keep", &keep.to_string());
+    }
     out
 }
 
@@ -309,6 +337,7 @@ pub fn decode_request(text: &str) -> Result<Request, String> {
     let (mut op, mut sandbox, mut key, mut branch) = (None, None, None, None);
     let mut env = Vec::new();
     let (mut argv, mut id, mut offset, mut timeout) = (Vec::new(), None, None, None);
+    let (mut force, mut keep) = (None, None);
     for d in directives(text) {
         let (n, name, value) = d?;
         match name {
@@ -326,6 +355,9 @@ pub fn decode_request(text: &str) -> Result<Request, String> {
             "id" => set_once(&mut id, value, n, name)?,
             "offset" => set_once(&mut offset, number(&value, n, name)?, n, name)?,
             "timeout" => set_once(&mut timeout, number(&value, n, name)?, n, name)?,
+            "force" if value.is_empty() => set_once(&mut force, (), n, name)?,
+            "force" => return Err(format!("line {n}: `force` takes no value")),
+            "keep" => set_once(&mut keep, number(&value, n, name)?, n, name)?,
             other => return Err(format!("line {n}: unknown key `{other}`")),
         }
     }
@@ -339,6 +371,8 @@ pub fn decode_request(text: &str) -> Result<Request, String> {
         id,
         offset,
         timeout,
+        force: force.is_some(),
+        keep,
     })
 }
 
@@ -460,6 +494,42 @@ timeout 5\n";
         assert_eq!(decode_request(REQUEST), Ok(request()));
         assert_eq!(encode_request(&run_request()), RUN_REQUEST);
         assert_eq!(decode_request(RUN_REQUEST), Ok(run_request()));
+        assert_eq!(encode_request(&clear_request()), CLEAR_REQUEST);
+        assert_eq!(decode_request(CLEAR_REQUEST), Ok(clear_request()));
+    }
+
+    /// The run-clearing fields: `force` is a bare directive.
+    const CLEAR_REQUEST: &str = "op run-rm\n\
+key pr-1\n\
+id 1790000000-a1b2\n\
+force\n\
+keep 5\n";
+
+    fn clear_request() -> Request {
+        Request {
+            key: Some("pr-1".into()),
+            id: Some("1790000000-a1b2".into()),
+            force: true,
+            keep: Some(5),
+            ..Request::new(Op::RunRm)
+        }
+    }
+
+    #[test]
+    fn clear_fields_round_trip_and_reject_malformed() {
+        let prune = Request { key: Some("k".into()), keep: Some(0), ..Request::new(Op::RunPrune) };
+        assert_eq!(encode_request(&prune), "op run-prune\nkey k\nkeep 0\n");
+        assert_eq!(decode_request(&encode_request(&prune)), Ok(prune));
+        // `force ` (empty value after the space) is the same flag.
+        assert_eq!(decode_request("op run-rm\nforce \n").map(|r| r.force), Ok(true));
+        assert_eq!(decode_request("op run-rm\n").map(|r| r.force), Ok(false));
+        assert!(decode_request("op run-rm\nforce 1\n").unwrap_err().contains("takes no value"));
+        assert!(decode_request("op run-rm\nforce\nforce\n").unwrap_err().contains("repeated `force`"));
+        assert!(decode_request("op run-prune\nkeep 1\nkeep 2\n").unwrap_err().contains("repeated `keep`"));
+        for bad in ["", "-1", "+1", "x", "99999999999999999999"] {
+            let text = format!("op run-prune\nkeep {bad}\n");
+            assert!(decode_request(&text).is_err(), "keep {bad:?}");
+        }
     }
 
     #[test]
