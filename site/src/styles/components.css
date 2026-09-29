@@ -411,6 +411,80 @@
   margin: 0 0 8px;
 }
 
+/* ------------------------------------------------------------------ Tabs */
+
+.tabs {
+  margin: 26px 0;
+}
+
+.tab-list {
+  display: flex;
+  gap: 4px;
+  border-bottom: 1px solid var(--border);
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.tab-list [role='tab'] {
+  position: relative;
+  flex-shrink: 0;
+  background: none;
+  border: 0;
+  padding: 11px 14px 12px;
+  color: var(--text-subtle);
+  font: 12px var(--font-mono);
+  letter-spacing: 0.04em;
+  border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+  transition:
+    color 0.2s,
+    background 0.2s;
+}
+
+.tab-list [role='tab']:hover {
+  color: var(--text);
+  background: var(--surface);
+}
+
+.tab-list [role='tab'][aria-selected='true'] {
+  color: var(--text-bright);
+}
+
+.tab-list [role='tab'][aria-selected='true']::after {
+  content: '';
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  bottom: -1px;
+  height: 2px;
+  background: var(--lime);
+}
+
+.tab-list [role='tab']:focus-visible {
+  outline-offset: -2px;
+}
+
+.tab-panel > .code-block:first-child {
+  margin-top: 16px;
+}
+
+.tab-panel > :last-child {
+  margin-bottom: 0;
+}
+
+.tab-panel .callout {
+  margin: 16px 0 0;
+}
+
+.tabs .tab-note {
+  margin: 12px 0 0;
+  font-size: 13px;
+  color: var(--text-subtle);
+}
+
+.tab-panel .code-block + .tab-note {
+  margin-top: -12px;
+}
+
 /* --------------------------------------------------------- Resource link */
 
 .resource-link {
@@ -450,6 +524,24 @@
 
 .resource-link svg {
   color: var(--lime);
+  flex-shrink: 0;
+}
+
+/* Side-by-side resource links (e.g. "Next steps"). */
+.resource-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 12px;
+  margin: 22px 0;
+}
+
+.resource-grid .resource-link {
+  margin: 0;
+  align-items: flex-start;
+}
+
+.resource-grid .resource-link small {
+  line-height: 1.5;
 }
 
 /* ------------------------------------------------------------ Card grid */

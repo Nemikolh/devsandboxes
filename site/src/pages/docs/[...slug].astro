@@ -1,0 +1,37 @@
+---
+import type { GetStaticPaths } from 'astro';
+import { getCollection, render, type CollectionEntry } from 'astro:content';
+import type { NextLink } from '../../components/NextPage.astro';
+import Docs from '../../layouts/Docs.astro';
+
+export const getStaticPaths = (async () => {
+  // Hoisted by Astro: must not reference other frontmatter bindings.
+  // The generated reference pages (`config.astro`, `node-api.astro`) aren't in
+  // the collection; the last hand-written page hands over to the first of them.
+  const AFTER_LAST: NextLink = {
+    href: '/docs/config',
+    title: 'Configuration',
+    description: 'Every config.toml field, merge rule and variable.',
+  };
+  const docs = (await getCollection('docs')).sort((a, b) => a.data.order - b.data.order);
+  return docs.map((entry, i) => {
+    const following = docs[i + 1];
+    const next: NextLink = following
+      ? { href: `/docs/${following.id}`, title: following.data.title, description: following.data.description }
+      : AFTER_LAST;
+    return { params: { slug: entry.id }, props: { entry, next } };
+  });
+}) satisfies GetStaticPaths;
+
+interface Props {
+  entry: CollectionEntry<'docs'>;
+  next: NextLink;
+}
+
+const { entry, next } = Astro.props;
+const { Content, headings } = await render(entry);
+---
+
+<Docs title={entry.data.title} description={entry.data.description} eyebrow={entry.data.eyebrow} headings={headings} next={next}>
+  <Content />
+</Docs>

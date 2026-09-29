@@ -16,7 +16,8 @@ pnpm check      # astro check (types + .astro diagnostics)
 - `src/pages/` — routes. `src/layouts/` — `Base.astro` (head, header,
   footer, mobile drawer) and `Docs.astro` (sidebar / article / TOC shell).
 - `src/components/` — header, sidebar, TOC, code block, callout, resource
-  link, next-page card, mobile drawer.
+  link, next-page card, mobile drawer, accessible `Tabs` (panels are named
+  slots), `InstallTabs` (install commands built from the Cargo.toml version).
 - `src/styles/` — plain CSS: `tokens.css` (palette, fonts, radii), `base.css`,
   `components.css`, `home.css`, `docs.css`. No Tailwind.
 - `src/lib/` — build-time helpers:
@@ -32,7 +33,11 @@ pnpm check      # astro check (types + .astro diagnostics)
 
 ## Content
 
-Hand-written pages are MDX under `src/`. Two pages are generated at build time
+Hand-written docs pages are MDX in the `docs` content collection
+(`src/content/docs/<slug>.mdx` → `/docs/<slug>`, frontmatter `title`,
+`description`, `eyebrow`, `order`; schema in `src/content.config.ts`). The
+landing page links to `/docs/quick-start#the-dashboard`, so keep that heading's
+text. Two pages are generated at build time
 from files elsewhere in the repo, so edit those, not the site:
 
 - `/docs/config` — rendered from `../skills/config-toml-spec/SKILL.md`.

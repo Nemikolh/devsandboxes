@@ -1,0 +1,89 @@
+---
+// Accessible tabs (WAI-ARIA tabs pattern, automatic activation). Each tab's
+// panel is the named slot matching its `id`. Rendered with every panel but
+// the first `hidden`, so without JS the first panel still reads correctly.
+
+export interface Tab {
+  /** Slot name and id suffix; unique within this component. */
+  id: string;
+  label: string;
+}
+
+interface Props {
+  /** Prefix for element ids; unique on the page. */
+  id: string;
+  tabs: Tab[];
+  /** Accessible name of the tab list. */
+  label: string;
+}
+
+const { id, tabs, label } = Astro.props;
+const panels = await Promise.all(tabs.map((t) => Astro.slots.render(t.id)));
+---
+
+<div class="tabs" data-tabs>
+  <div class="tab-list" role="tablist" aria-label={label}>
+    {
+      tabs.map((t, i) => (
+        <button
+          type="button"
+          role="tab"
+          id={`${id}-tab-${t.id}`}
+          aria-controls={`${id}-panel-${t.id}`}
+          aria-selected={i === 0 ? 'true' : 'false'}
+          tabindex={i === 0 ? 0 : -1}
+        >
+          {t.label}
+        </button>
+      ))
+    }
+  </div>
+  {
+    tabs.map((t, i) => (
+      <div
+        class="tab-panel"
+        role="tabpanel"
+        id={`${id}-panel-${t.id}`}
+        aria-labelledby={`${id}-tab-${t.id}`}
+        hidden={i !== 0}
+        set:html={panels[i]}
+      />
+    ))
+  }
+</div>
+
+<script>
+  function select(tabs: HTMLElement[], next: HTMLElement, focus: boolean) {
+    for (const tab of tabs) {
+      const on = tab === next;
+      tab.setAttribute('aria-selected', String(on));
+      tab.tabIndex = on ? 0 : -1;
+      const panel = document.getElementById(tab.getAttribute('aria-controls') ?? '');
+      if (panel) panel.hidden = !on;
+    }
+    if (focus) next.focus();
+  }
+
+  for (const root of document.querySelectorAll<HTMLElement>('[data-tabs]')) {
+    const list = root.querySelector<HTMLElement>('[role="tablist"]');
+    if (!list) continue;
+    const tabs = [...list.querySelectorAll<HTMLElement>('[role="tab"]')];
+    list.addEventListener('click', (e) => {
+      const tab = (e.target as Element).closest<HTMLElement>('[role="tab"]');
+      if (tab) select(tabs, tab, false);
+    });
+    list.addEventListener('keydown', (e) => {
+      const i = tabs.indexOf(document.activeElement as HTMLElement);
+      if (i < 0) return;
+      const to =
+        e.key === 'ArrowRight' ? (i + 1) % tabs.length
+        : e.key === 'ArrowLeft' ? (i - 1 + tabs.length) % tabs.length
+        : e.key === 'Home' ? 0
+        : e.key === 'End' ? tabs.length - 1
+        : -1;
+      if (to < 0) return;
+      e.preventDefault();
+      select(tabs, tabs[to], true);
+    });
+  }
+</script>

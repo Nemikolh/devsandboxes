@@ -412,6 +412,11 @@
   color: #dbe7e4;
 }
 
+/* Keys, flags and field names in the first column shouldn't break mid-token. */
+.prose td:first-child code {
+  white-space: nowrap;
+}
+
 /* ------------------------------------------------------------------- TOC */
 
 .toc {

@@ -1,0 +1,66 @@
+---
+// Install commands per channel. Release URLs are built from the Cargo.toml
+// version so they never go stale on a release.
+import { REPO_URL, VERSION } from '../lib/nav';
+import Callout from './Callout.astro';
+import CodeBlock from './CodeBlock.astro';
+import Tabs from './Tabs.astro';
+
+const v = VERSION;
+const release = `${REPO_URL}/releases/download/v${v}`;
+
+const tabs = [
+  { id: 'npm', label: 'npm' },
+  { id: 'linux', label: 'Linux' },
+  { id: 'macos', label: 'macOS' },
+  { id: 'windows', label: 'Windows' },
+  { id: 'cargo', label: 'cargo' },
+];
+---
+
+<Tabs id="install" label="Install method" tabs={tabs}>
+  <Fragment slot="npm">
+    <CodeBlock
+      code={`npm i -g devsandboxes
+devsandbox --help
+
+npx devsandboxes --help   # without installing`}
+    />
+    <p class="tab-note">Native binaries for Linux x64/arm64, macOS arm64 and Windows x64, plus the typed Node API.</p>
+  </Fragment>
+  <Fragment slot="linux">
+    <CodeBlock
+      code={`curl -L ${release}/devsandbox-${v}-$(uname -m)-unknown-linux-musl.tar.gz | tar xz
+sudo mv devsandbox /usr/local/bin/   # or anywhere on your PATH`}
+    />
+    <p class="tab-note">Static binaries for x86_64 and aarch64.</p>
+  </Fragment>
+  <Fragment slot="macos">
+    <CodeBlock
+      code={`curl -L ${release}/devsandbox-${v}-aarch64-apple-darwin.tar.gz | tar xz
+sudo mv devsandbox /usr/local/bin/   # or anywhere on your PATH`}
+    />
+    <p class="tab-note">Apple silicon. Works with docker (OrbStack, Docker Desktop) and Apple <code>container</code>.</p>
+  </Fragment>
+  <Fragment slot="windows">
+    <CodeBlock
+      lang="powershell"
+      title="POWERSHELL"
+      code={`Invoke-WebRequest ${release}/devsandbox-${v}-x86_64-pc-windows-msvc.zip -OutFile devsandbox.zip
+Expand-Archive devsandbox.zip .`}
+    />
+    <p class="tab-note">
+      x86_64; put <code>devsandbox.exe</code> on your <code>PATH</code>. Native Windows is untested: the Linux build
+      inside WSL2 is the exercised path.
+    </p>
+  </Fragment>
+  <Fragment slot="cargo">
+    <CodeBlock code="cargo install devsandbox" />
+    <Callout variant="warning" title="No in-container helper">
+      <p>
+        crates.io builds don't embed <code>devsbd</code>, the helper that relays ssh-agent over <code>exec</code>. They fall
+        back to a socket bind mount, which only works with docker / podman on Linux. Prefer npm or a release archive.
+      </p>
+    </Callout>
+  </Fragment>
+</Tabs>

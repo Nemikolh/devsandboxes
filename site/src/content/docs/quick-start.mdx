@@ -1,0 +1,180 @@
+---
+title: Quick start
+description: From an empty folder to a running sandbox, with a second instance on its own git worktree, in a few commands.
+eyebrow: GETTING STARTED
+order: 1
+---
+
+import Callout from '../../components/Callout.astro';
+import CodeBlock from '../../components/CodeBlock.astro';
+import InstallTabs from '../../components/InstallTabs.astro';
+import ResourceLink from '../../components/ResourceLink.astro';
+import { REPO_URL, VERSION } from '../../lib/nav';
+
+## Prerequisites
+
+devsandboxes drives a container runtime directly: no devcontainer CLI, no daemon of its own. You need:
+
+- A running **docker**, **podman** or Apple **`container`** (macOS). The default is `container` on macOS and `docker` elsewhere; pick another with `DEVSANDBOX_RUNTIME=docker|podman|container`.
+- **`git`**, for the worktrees extra instances get.
+- **`curl`**, to fetch devcontainer Features.
+
+## Install
+
+The package is `devsandboxes`; the binary it installs is `devsandbox`.
+
+<InstallTabs />
+
+## Write a config
+
+A config root is a folder holding one `config.toml`. It lives **outside** your repos and describes every sandbox; each sandbox points at a repo with `folder`, relative to the config root. This guide uses this layout, with `web` being any git repository:
+
+```text title="LAYOUT"
+~/code/
+├── sandboxes/
+│   └── config.toml
+└── web/            # your repo
+```
+
+Put this in `~/code/sandboxes/config.toml`:
+
+```toml title="config.toml"
+[services.database]
+image = "postgres:16"
+scope = "global"            # one container shared by all instances
+
+[template.base]
+caches = ["pnpm"]
+persist-shell-history = true
+[template.base.features]
+"ghcr.io/devcontainers/features/node:1" = { version = "lts" }
+
+[sandbox.web]
+extends = "base"
+folder = "../web"           # the repo, relative to this folder
+services = ["database"]
+image = "mcr.microsoft.com/devcontainers/base:ubuntu"
+postCreateCommand = "pnpm install"
+```
+
+`[sandbox.web]` is a devcontainer definition in TOML: `image`, `features` and `postCreateCommand` mean what they mean in `devcontainer.json`. It `extends` the `base` template, which deep-merges into it (tables recurse, arrays concatenate), so every sandbox extending `base` shares the pnpm cache and the Node feature. `[services.database]` is a postgres sidecar; `scope = "global"` makes every instance share one container instead of getting its own.
+
+Check it from the config root. `ls` lists the sandboxes and fails loudly on unknown keys:
+
+```bash
+cd ~/code/sandboxes
+devsandbox ls
+```
+
+```text title="OUTPUT"
+NAME  SOURCE                                             FOLDER  SERVICES  EXTENDS
+web   image mcr.microsoft.com/devcontainers/base:ubuntu  ../web  database  base
+```
+
+<Callout variant="tip" title="No config yet?">
+  Run `devsandbox run` in an empty folder: on a terminal it offers to write an example `config.toml` for you to edit.
+</Callout>
+
+## Start a sandbox
+
+```bash
+devsandbox run web           # prints the instance name: web
+devsandbox exec -it web zsh  # a shell in the workspace
+devsandbox exec web pnpm test
+```
+
+`run` builds the image (Features included), starts the `database` service, creates the container `devsandbox-web` with `../web` mounted as the workspace, runs `postCreateCommand`, and returns once it's up. The instance runs in the background.
+
+`exec` runs in the workspace directory as the configured `remoteUser`, exits with the command's own status, and takes `-i` / `-t` only for interactive shells. Any command that takes a name accepts an instance name, a sandbox name or the repo folder's basename.
+
+<Callout variant="note" title="When a lifecycle command fails">
+  A failing `postCreateCommand` aborts `run` but keeps the container, so `devsandbox logs web` and `devsandbox exec web …` can show you why.
+</Callout>
+
+## A second instance
+
+Run the same sandbox again:
+
+```bash
+devsandbox run web   # prints: web-2
+devsandbox ps        # both instances
+```
+
+`web` is already using your checkout, so `web-2` gets its own **git worktree** in `~/code/sandboxes/.worktrees/web-2`, on a fresh `sandbox/web-2` branch. The two containers never share a working tree, which is the point when each one hosts a coding agent. Both reach the same global `database`.
+
+Pick the name with `--name`, or check out an existing branch with `--branch`:
+
+```bash
+devsandbox run web --name fix-login --branch fix/login
+```
+
+## The dashboard
+
+Run `devsandbox` with no arguments on a terminal to open the dashboard: every instance and service live, with the actions of the CLI one key away.
+
+```bash
+devsandbox
+```
+
+Four tabs (`1`–`4`): **Instances**, **Services**, **Ports** (forwards opened from the dashboard) and **Inbox** (notifications sent from inside sandboxes with `devsbd notify`). The keys you'll use first:
+
+| Key       | Action                                                             |
+| --------- | ------------------------------------------------------------------ |
+| `↑` `↓`   | Move the selection; `→` expands a sandbox's instances              |
+| `enter`   | Config explorer: the sandbox as written, or resolved after merging |
+| `r`       | Run a new instance of the selected sandbox                         |
+| `t`       | Integrated terminal in the selected instance or service            |
+| `s` `l`   | Stop or start · show logs                                          |
+| `p`       | Forward a port to the host (unix hosts)                            |
+| `o`       | Open the instance in VS Code                                       |
+| `:`       | Command prompt: `run`, `exec`, `rm`, `port`… with tab completion   |
+| `?` `q`   | Every key binding · quit                                           |
+
+The dashboard takes over the terminal; scripts and agents use the plain commands, whose output is uncoloured when piped.
+
+## From any directory
+
+Commands read the `config.toml` in the current directory. `-C <dir>` points any of them at another config root, so you don't have to `cd` first:
+
+```bash
+devsandbox -C ~/code/sandboxes run web
+devsandbox -C ~/code/sandboxes
+```
+
+## Clean up
+
+```bash
+devsandbox stop web-2   # stopped, kept: `start web-2` resumes it
+devsandbox rm web-2     # container, worktree and state entry gone
+devsandbox gc           # reap services nothing references
+```
+
+`rm` also removes the instance's isolated services and network, and on a terminal asks before deleting the branch it created. Managed shell history is kept. Global services such as `database` outlive every `rm` until `gc` finds nothing referencing them.
+
+## Give your agent the skills
+
+The repo ships two [agent skills](https://github.com/Nemikolh/devsandboxes/tree/main/skills), plain `SKILL.md` files a coding agent loads on demand:
+
+- **`devsandbox-cli`**: every subcommand, ordered by how useful it is to an agent, with the non-interactive rules (`run` prints only the instance name, `exec` exit codes, debugging loop).
+- **`config-toml-spec`**: the complete `config.toml` format, for writing or reviewing configs and porting a `devcontainer.json`.
+
+Copy them to wherever your agent reads skills from; for Claude Code that's `~/.claude/skills/`. Taking them from the release tag keeps them in step with your binary:
+
+<CodeBlock
+  code={`git clone --depth 1 --branch v${VERSION} ${REPO_URL}.git /tmp/ds
+mkdir -p ~/.claude/skills
+cp -r /tmp/ds/skills/* ~/.claude/skills/   # devsandbox-cli, config-toml-spec`}
+/>
+
+<div class="resource-grid">
+  <ResourceLink href="https://github.com/Nemikolh/devsandboxes/blob/main/skills/devsandbox-cli/SKILL.md" label="devsandbox-cli" description="skills/devsandbox-cli/SKILL.md on GitHub" />
+  <ResourceLink href="https://github.com/Nemikolh/devsandboxes/blob/main/skills/config-toml-spec/SKILL.md" label="config-toml-spec" description="skills/config-toml-spec/SKILL.md on GitHub" />
+</div>
+
+## Next steps
+
+<div class="resource-grid">
+  <ResourceLink href="/docs/config" label="Configuration" description="Every config.toml field, merge rule and ${…} variable" />
+  <ResourceLink href="/examples" label="Examples" description="Parallel agents, shared databases, caches, ssh-agent, automations" />
+  <ResourceLink href="/docs/node-api" label="Node API" description="Every command as a typed promise from the devsandboxes package" />
+</div>
