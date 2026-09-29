@@ -14,6 +14,8 @@
 //!
 //! Spec: <https://sw.kovidgoyal.net/kitty/keyboard-protocol/>.
 
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
 /// "Disambiguate escape codes": the only enhancement we implement. The others
 /// need input the dashboard doesn't receive (release/repeat events, the
 /// shifted and base-layout keys, associated text), so they are masked off and
@@ -104,6 +106,67 @@ impl KittyState {
     pub fn reset_alt(&mut self) {
         self.alt = FlagStack::default();
     }
+}
+
+/// Encode `key` for a child that enabled `flags`, or `None` when the legacy
+/// encoding ([`super::term::encode_key`]) is what the protocol mandates.
+/// Disambiguation only changes the keys legacy encoding conflates: Esc, and
+/// ctrl/alt/super chords of text keys (ctrl+m vs Enter, ctrl+[ vs Esc, ctrl+i
+/// vs Tab) become `CSI code;mods u`. Enter/Tab/Backspace stay legacy unless
+/// modified, per spec, so typing `reset` still works after a crashed app left
+/// the mode on; shift alone on a text key is just the shifted text.
+pub fn encode_key(key: KeyEvent, flags: u8) -> Option<Vec<u8>> {
+    if flags & DISAMBIGUATE == 0 {
+        return None;
+    }
+    let mut mods = modifier_bits(key.modifiers);
+    let code = match key.code {
+        KeyCode::Esc => 27,
+        KeyCode::Enter | KeyCode::Tab | KeyCode::Backspace if mods == 0 => return None,
+        KeyCode::Enter => 13,
+        KeyCode::Tab => 9,
+        KeyCode::Backspace => 127,
+        // crossterm folds shift+tab into BackTab; kitty reports it as tab+shift.
+        KeyCode::BackTab => {
+            mods |= SHIFT;
+            9
+        }
+        KeyCode::Char(c) => {
+            if mods & !SHIFT == 0 {
+                return None;
+            }
+            // The protocol reports the unshifted key plus the shift bit.
+            if mods & SHIFT != 0 {
+                c.to_ascii_lowercase() as u32
+            } else {
+                c as u32
+            }
+        }
+        _ => return None,
+    };
+    Some(if mods == 0 {
+        format!("\x1b[{code}u")
+    } else {
+        format!("\x1b[{code};{}u", mods + 1)
+    }
+    .into_bytes())
+}
+
+const SHIFT: u8 = 1;
+
+/// The spec's modifier bitfield (sent as value + 1).
+fn modifier_bits(m: KeyModifiers) -> u8 {
+    [
+        (KeyModifiers::SHIFT, SHIFT),
+        (KeyModifiers::ALT, 2),
+        (KeyModifiers::CONTROL, 4),
+        (KeyModifiers::SUPER, 8),
+        (KeyModifiers::HYPER, 16),
+        (KeyModifiers::META, 32),
+    ]
+    .into_iter()
+    .filter(|(m2, _)| m.contains(*m2))
+    .fold(0, |acc, (_, bit)| acc | bit)
 }
 
 impl vt100::Callbacks for KittyState {
@@ -217,6 +280,57 @@ mod tests {
         p.process(b"\x1b[>1u\x1b[?u");
         assert_eq!(flags(&p), 0);
         assert!(p.callbacks_mut().take_replies().is_empty());
+    }
+
+    fn enc(code: KeyCode, mods: KeyModifiers) -> Option<Vec<u8>> {
+        encode_key(KeyEvent::new(code, mods), DISAMBIGUATE)
+    }
+
+    #[test]
+    fn disambiguated_keys_use_csi_u() {
+        let ctrl = KeyModifiers::CONTROL;
+        let shift = KeyModifiers::SHIFT;
+        let alt = KeyModifiers::ALT;
+        for (code, mods, want) in [
+            (KeyCode::Esc, KeyModifiers::NONE, "\x1b[27u"),
+            (KeyCode::Char('m'), ctrl, "\x1b[109;5u"),
+            (KeyCode::Char('o'), ctrl, "\x1b[111;5u"),
+            (KeyCode::Char('['), ctrl, "\x1b[91;5u"),
+            (KeyCode::Char(' '), ctrl, "\x1b[32;5u"),
+            (KeyCode::Char('X'), ctrl | shift, "\x1b[120;6u"),
+            (KeyCode::Char('b'), alt, "\x1b[98;3u"),
+            (KeyCode::Char('c'), ctrl | alt, "\x1b[99;7u"),
+            (KeyCode::Char('s'), KeyModifiers::SUPER, "\x1b[115;9u"),
+            (KeyCode::Enter, shift, "\x1b[13;2u"),
+            (KeyCode::Enter, ctrl, "\x1b[13;5u"),
+            (KeyCode::Tab, ctrl, "\x1b[9;5u"),
+            (KeyCode::BackTab, shift, "\x1b[9;2u"),
+            (KeyCode::BackTab, KeyModifiers::NONE, "\x1b[9;2u"),
+            (KeyCode::Backspace, alt, "\x1b[127;3u"),
+        ] {
+            assert_eq!(enc(code, mods), Some(want.as_bytes().to_vec()), "{code:?} {mods:?}");
+        }
+    }
+
+    #[test]
+    fn keys_legacy_already_encodes_unambiguously_fall_back() {
+        for (code, mods) in [
+            (KeyCode::Char('a'), KeyModifiers::NONE),
+            (KeyCode::Char('A'), KeyModifiers::SHIFT),
+            (KeyCode::Enter, KeyModifiers::NONE),
+            (KeyCode::Tab, KeyModifiers::NONE),
+            (KeyCode::Backspace, KeyModifiers::NONE),
+            (KeyCode::Up, KeyModifiers::NONE),
+            (KeyCode::F(5), KeyModifiers::NONE),
+        ] {
+            assert_eq!(enc(code, mods), None, "{code:?} {mods:?}");
+        }
+    }
+
+    #[test]
+    fn no_flags_means_legacy() {
+        let key = KeyEvent::new(KeyCode::Char('m'), KeyModifiers::CONTROL);
+        assert_eq!(encode_key(key, 0), None);
     }
 
     #[test]

@@ -6,6 +6,7 @@ use ratatui::layout::Rect;
 
 use crate::runtime::{backend, NAME_PREFIX};
 use crate::tui::data::ContainerStatus;
+use crate::tui::kitty;
 use crate::tui::term::{encode_key, TermSession, SHELL_FALLBACK_CMD};
 
 use super::view::point_in;
@@ -15,7 +16,7 @@ impl App {
     /// Route a key to the active terminal. Only reached with `focus ==
     /// Terminal`. `ctrl-]` / `F12` leave; on an exited session every other key
     /// is swallowed; otherwise the key is encoded (honoring the shell's
-    /// application-cursor mode) and written to the PTY.
+    /// application-cursor mode and kitty keyboard flags) and written to the PTY.
     pub(super) fn on_key_terminal(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         // Leave keys: back to the dashboard.
@@ -41,13 +42,19 @@ impl App {
             }
             return;
         }
-        // DECCKM: the parser tracks whether the shell wants SS3 cursor keys.
-        let application_cursor = session
+        // DECCKM: the parser tracks whether the shell wants SS3 cursor keys;
+        // its callbacks track the kitty flags of the screen the app is on.
+        let (application_cursor, kitty_flags) = session
             .parser()
             .lock()
-            .map(|p| p.screen().application_cursor())
-            .unwrap_or(false);
-        if let Some(bytes) = encode_key(key, application_cursor) {
+            .map(|p| {
+                let screen = p.screen();
+                (screen.application_cursor(), p.callbacks().flags(screen.alternate_screen()))
+            })
+            .unwrap_or((false, 0));
+        let bytes =
+            kitty::encode_key(key, kitty_flags).or_else(|| encode_key(key, application_cursor));
+        if let Some(bytes) = bytes {
             session.write_key_bytes(&bytes);
         }
     }
@@ -368,6 +375,24 @@ mod tests {
         // The wheel outside the panel body is ignored (offset stays 0).
         app.on_mouse(&mouse_at(MouseEventKind::ScrollUp, 0, 0), FRAME);
         assert_eq!(offset(&app), 0);
+    }
+
+    #[test]
+    fn keys_follow_the_childs_kitty_flags() {
+        let mut app = new_app();
+        open_test_term(&mut app, "web-1", "devsandbox-web-1");
+        let ctrl_m = KeyEvent::new(KeyCode::Char('m'), KeyModifiers::CONTROL);
+        let written = |app: &App| app.terms.active_session().unwrap().take_written();
+        // No flags pushed: legacy, ctrl+m is the same `\r` as Enter.
+        app.on_key(ctrl_m);
+        assert_eq!(written(&app), b"\r");
+        // The child opts in on the alternate screen, like zidane does.
+        app.terms.active_session().unwrap().feed_output(b"\x1b[?1049h\x1b[>1u");
+        app.on_key(ctrl_m);
+        assert_eq!(written(&app), b"\x1b[109;5u");
+        // Plain text is unaffected.
+        app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert_eq!(written(&app), b"a");
     }
 
     #[test]
