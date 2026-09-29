@@ -17,14 +17,19 @@ mod ui;
 use std::collections::BTreeMap;
 use std::io::{self, Stdout, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
 use ratatui::layout::Rect;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    supports_keyboard_enhancement,
 };
 use crossterm::execute;
 use ratatui::Terminal;
@@ -83,6 +88,17 @@ impl FollowUp {
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
+/// Whether the outer terminal speaks the kitty keyboard protocol, probed once
+/// in [`setup`]. Without it the integrated terminal can't tell e.g. ctrl+m from
+/// Enter (both are `\r` in legacy encoding), so inner apps that bind such
+/// chords never see them. Statics rather than `App` fields because
+/// [`restore`] also runs from the panic hook.
+static KITTY: AtomicBool = AtomicBool::new(false);
+/// Whether our flags are currently pushed, so [`restore`] pops exactly once:
+/// it runs on suspend, on exit and possibly again from the panic hook, and an
+/// extra pop would clobber flags the user's shell pushed on the main screen.
+static KITTY_PUSHED: AtomicBool = AtomicBool::new(false);
+
 /// Launch the dashboard, guaranteeing the terminal is restored on every exit
 /// path (normal, error, or panic).
 pub fn dashboard(dir: &Path) -> Result<()> {
@@ -101,15 +117,41 @@ pub fn dashboard(dir: &Path) -> Result<()> {
 /// Enable raw mode, enter the alternate screen, build the ratatui terminal.
 fn setup() -> Result<Term> {
     enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
+    // crossterm sends `CSI ? u` followed by DA1, which every terminal answers,
+    // so an unsupporting terminal (gnome-terminal, tmux) replies at once
+    // instead of hitting the 2s timeout.
+    KITTY.store(matches!(supports_keyboard_enhancement(), Ok(true)), Ordering::Relaxed);
+    enter()?;
+    let terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     Ok(terminal)
 }
 
-/// Best-effort teardown: leave the alternate screen and disable raw mode.
-/// Errors are ignored — there is nothing useful to do while cleaning up.
+/// Enter the alternate screen with mouse capture and, when supported, kitty
+/// keyboard flags. Shared by [`setup`] and the re-entry after a suspended
+/// command. Only `DISAMBIGUATE_ESCAPE_CODES`: event types would add
+/// release/repeat events the dashboard doesn't want, and it is the one flag the
+/// integrated terminal emulates for inner apps. Pushed after entering the
+/// alternate screen because kitty keeps one flag stack per screen.
+fn enter() -> io::Result<()> {
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    if KITTY.load(Ordering::Relaxed) {
+        execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )?;
+        KITTY_PUSHED.store(true, Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+/// Best-effort teardown: pop our kitty flags, leave the alternate screen and
+/// disable raw mode. Errors are ignored — there is nothing useful to do while
+/// cleaning up.
 fn restore() {
+    if KITTY_PUSHED.swap(false, Ordering::Relaxed) {
+        let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+    }
     let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
     let _ = disable_raw_mode();
 }
@@ -468,8 +510,9 @@ fn run_suspended(terminal: &mut Term, dir: &Path, action: PromptAction) -> Resul
     enable_raw_mode()?;
     wait_for_key();
 
-    // Re-enter: the outer setup already ran once; re-arm the alt screen + mouse.
-    execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+    // Re-enter: the outer setup already ran once; re-arm the alt screen, mouse
+    // and kitty flags.
+    enter()?;
     terminal.hide_cursor()?;
     Ok(())
 }
