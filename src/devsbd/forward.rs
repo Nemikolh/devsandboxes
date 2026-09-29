@@ -41,13 +41,18 @@ pub struct Route {
     pub process_container: String,
 }
 
-/// The host port to bind. `Fixed` fails if the port is taken; `Prefer` falls
-/// back to an OS-assigned port (bind 0) when its preferred port is in use.
+/// The host port to bind. `Fixed` fails if the port is taken; `Prefer` walks
+/// up from its preferred port (`3000`, `3001`, … for [`PREFER_SPAN`] ports) so
+/// the result stays predictable, and only then takes an OS-assigned one.
+/// `Prefer(0)` is straight to OS-assigned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostPort {
     Fixed(u16),
     Prefer(u16),
 }
+
+/// How many ports `HostPort::Prefer` tries, its preferred one included.
+pub const PREFER_SPAN: u16 = 100;
 
 /// Everything `Forward::start` needs. `resolve` is called on the supervisor
 /// thread for each bridge (re)spawn, so it may touch config/state/docker; it
@@ -264,16 +269,22 @@ impl Drop for Forward {
 
 /// Bind the requested host port, honouring the `Prefer` fallback. `Fixed` maps
 /// any bind error straight through (a clear "address already in use"); `Prefer`
-/// retries on port 0 when its port is taken, so a busy default port doesn't
-/// abort the forward.
+/// moves on to the next port only when one is taken, so a busy default port
+/// doesn't abort the forward but other errors (a privileged port) still do.
 fn bind_listener(bind: IpAddr, host_port: HostPort) -> io::Result<TcpListener> {
-    match host_port {
-        HostPort::Fixed(port) => TcpListener::bind(SocketAddr::new(bind, port)),
-        HostPort::Prefer(port) => match TcpListener::bind(SocketAddr::new(bind, port)) {
-            Err(e) if e.kind() == io::ErrorKind::AddrInUse => TcpListener::bind(SocketAddr::new(bind, 0)),
-            other => other,
-        },
+    let port = match host_port {
+        HostPort::Fixed(port) => return TcpListener::bind(SocketAddr::new(bind, port)),
+        HostPort::Prefer(port) => port,
+    };
+    if port != 0 {
+        for p in port..=port.saturating_add(PREFER_SPAN - 1) {
+            match TcpListener::bind(SocketAddr::new(bind, p)) {
+                Err(e) if e.kind() == io::ErrorKind::AddrInUse => continue,
+                other => return other,
+            }
+        }
     }
+    TcpListener::bind(SocketAddr::new(bind, 0))
 }
 
 /// Accept connections until `stop`. Each accepted socket is dialed through the
@@ -585,12 +596,17 @@ mod tests {
     // ---- HostPort bind fallback, against real loopback listeners ----
 
     #[test]
-    fn prefer_falls_back_to_an_os_port_when_taken() {
-        // Occupy a port, then Prefer(that port) must bind a *different* one.
+    fn prefer_walks_up_when_taken() {
+        // Occupy a port, then Prefer(that port) must bind a *higher* one close
+        // by (usually port + 1; a parallel test may hold that one too).
         let taken = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let port = taken.local_addr().unwrap().port();
+        if port > u16::MAX - PREFER_SPAN {
+            return; // no room above an ephemeral port this high
+        }
         let listener = bind_listener(LOOPBACK, HostPort::Prefer(port)).unwrap();
-        assert_ne!(listener.local_addr().unwrap().port(), port, "fell back off the busy port");
+        let got = listener.local_addr().unwrap().port();
+        assert!(got > port && got < port + PREFER_SPAN, "{port} taken, bound {got}");
     }
 
     #[test]

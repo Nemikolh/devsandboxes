@@ -106,7 +106,15 @@ devsandbox port --service redis 6379    # a global service, no instance named
 devsandbox port api 3000 --address 0.0.0.0    # bind all interfaces (default 127.0.0.1)
 ```
 
-An instance port tunnels straight into its container; a service port is reached through a running instance that references it, falling back to injecting the helper into the service container when none is available. Forwards are also available from the TUI's Ports tab — `p` to add, `d` to remove. Unix hosts only for now.
+An instance port tunnels straight into its container; a service port is reached through a running instance that references it, falling back to injecting the helper into the service container when none is available. Forwards are also available from the TUI's Ports tab — `p` to add, `d` to remove. A busy host port moves to the next free one up (`3000` → `3001`). Unix hosts only for now.
+
+A sandbox's `forwardPorts` are forwarded by the TUI while it's open, for every running instance. Each instance keeps its host ports across dashboard restarts (saved in `state.toml`):
+
+```toml
+[sandbox.api]
+services = ["db"]
+forwardPorts = [3000, "8080:3000", "db:5432"]   # [host:][service:]port
+```
 
 ## Automations
 

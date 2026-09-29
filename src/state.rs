@@ -96,6 +96,11 @@ pub struct Instance {
     /// values ([`Instance::exec_env`]), so they take effect before a rebuild.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra_env: BTreeMap<String, String>,
+    /// Host ports the TUI picked for this instance's `forwardPorts`, keyed by
+    /// `ForwardPort::key` (`"8080:3000"` = 8081), so the instance gets the same
+    /// ports every time and no other instance takes them while it's stopped.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub forwarded_ports: BTreeMap<String, u16>,
     pub created_unix: u64,
 }
 
@@ -138,6 +143,11 @@ pub struct State {
     /// autostart pass for that config root, so autostart runs once per boot.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub autostart_boot: BTreeMap<String, String>,
+    /// Project id -> `forwardPorts` entry key -> host port, for entries that
+    /// forward a `global` service: one forward per config root however many
+    /// instances declare it, so its port can't live on any one instance.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub global_forwarded_ports: BTreeMap<String, BTreeMap<String, u16>>,
 }
 
 impl State {
@@ -211,6 +221,7 @@ mod tests {
                 dispatcher: Some("pr-dispatcher".into()),
                 config_dir: Some("/home/u/.devsandboxes".into()),
                 extra_env: BTreeMap::from([("PR_NUMBER".into(), "42".into())]),
+                forwarded_ports: BTreeMap::from([("8080:3000".into(), 8081)]),
                 created_unix: Instance::now(),
             },
         );
@@ -226,6 +237,7 @@ mod tests {
             Some(std::path::Path::new("/home/u/.devsandboxes"))
         );
         assert_eq!(back.instances["repo-abc1"].extra_env["PR_NUMBER"], "42");
+        assert_eq!(back.instances["repo-abc1"].forwarded_ports["8080:3000"], 8081);
     }
 
     #[test]

@@ -80,6 +80,7 @@ mod tests {
                 dispatcher: None,
                 config_dir: None,
                 extra_env: Default::default(),
+                forwarded_ports: Default::default(),
                 created_unix: 0,
             },
         );

@@ -741,6 +741,7 @@ folder = "."
             dispatcher: owner.map(str::to_string),
             config_dir: Some("/cfg".into()),
             extra_env: Default::default(),
+            forwarded_ports: Default::default(),
             created_unix: 0,
         }
     }

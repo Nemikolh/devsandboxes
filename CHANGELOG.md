@@ -45,6 +45,14 @@ devsbd ls; devsbd stop pr-123; devsbd rm pr-123
 
 - **Runs**: commands started with `devsbd exec` are tracked in the child (id, log, exit status). Follow them with `devsbd run ls|logs|wait`, clean them up with `devsbd run rm` (`--force` kills a running one) and `devsbd run prune --keep N`; the TUI shows a child's last runs under its processes.
 - `devsbd` is on `PATH` in containers (`/usr/local/bin/devsbd`).
+- **`forwardPorts`**: while the dashboard is open it forwards each running instance's configured ports to `127.0.0.1`, the same way `devsandbox port` does (no container restart). Each instance keeps its host ports across dashboard restarts, and a port already taken moves to the next free one up. A global service's port is forwarded once, however many instances list it. In the Ports tab these rows are marked `(config)`; `d` stops one until the dashboard reopens.
+
+```toml
+[sandbox.api]
+services = ["db"]
+# 3000, "db:5432" as in devcontainer.json; "8080:3000" / "15432:db:5432" pick the host port
+forwardPorts = [3000, "8080:3000", "db:5432"]
+```
 
 ### Changed
 
@@ -59,6 +67,7 @@ devsbd ls; devsbd stop pr-123; devsbd rm pr-123
 - While the dashboard is open it keeps a helper connection to every running instance that has the helper, not only when an ssh-agent is being relayed.
 - `devsandbox status --json` instance rows include `instance_id` and, for children, `dispatcher`.
 - **`rebuild` applies `worktree-include`.** Before, adding a pattern marked instances as drifted, but the rebuild copied nothing. Now `rebuild` copies any missing matching files into the worktree; existing files are never overwritten. A copied file you delete on purpose comes back on the next rebuild, so drop the pattern instead.
+- `devsandbox port 3000` (and the Ports tab) moves to 3001, 3002, … when 3000 is taken on the host, instead of a random port.
 - A service `ports` entry that gives only the container port (`"5432"`) now gets the same port on the host when it's free, instead of a random one. If the port is taken, the runtime still picks one.
 
 ### Fixed

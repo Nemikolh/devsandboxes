@@ -13,8 +13,8 @@ Two entry points, same engine:
 - **TUI** _Ports_ tab (third tab, next to Instances and Services): add/remove
   forwards live; they end when the dashboard quits.
 
-Static, config-declared forwards (`forwardPorts`) are out of scope (see
-_Future: static `forwardPorts`_).
+A third, config-declared: a sandbox's `forwardPorts`, run by the TUI while it's
+open (_Configured forwards_).
 
 ## Why tunnel through devsbd (not `-p`, not a socat sidecar)
 
@@ -73,8 +73,9 @@ curl ──tcp──▶ devsandbox (host listener 127.0.0.1:3000)
 
 - Default bind address `127.0.0.1`; `--address <ip>` opts in to others
   (`0.0.0.0`).
-- `<port>` alone: host port = container port; if taken, fall back to an
-  OS-assigned port and print it. `<host>:<port>` explicit: fail if taken.
+- `<port>` alone: host port = container port; if taken, the next free one up
+  (`HostPort::Prefer`, 100 ports, then OS-assigned) and print it, so the
+  result stays guessable. `<host>:<port>` explicit: fail if taken.
 
 ### Protocol additions (no `VERSION` bump)
 
@@ -306,8 +307,8 @@ embedded blob, so a stale blob fails them.
 New `src/devsbd/forward.rs` (unix-only, like `bridge.rs`).
 
 - `Forward::start(spec) -> io::Result<Forward>`. `spec` holds: the bind
-  address, the host port (`Fixed(p)` or `Prefer(p)`, where `Prefer` falls back
-  to an OS-assigned port), and a
+  address, the host port (`Fixed(p)` or `Prefer(p)`, where `Prefer` walks up
+  from `p`, then falls back to an OS-assigned port), and a
   `resolve: Box<dyn Fn() -> Result<Route, String> + Send>` where
   `Route { container, recorded_arch, host, port, label }`.
 - Binds the listener up front (the error is immediate and precise), then an
@@ -441,23 +442,46 @@ I/O-free.
   forward while its process is shown.
 - UDP not supported.
 
-## Future: static `forwardPorts`
+## Configured forwards (`forwardPorts`)
 
-`forwardPorts` / `portsAttributes` / `appPort` on a sandbox are parsed and
-flagged as not implemented (`src/config.rs:85`). They could ride the same
-engine. The open question is **who owns the forward** when nothing is in the
-foreground:
+A sandbox's `forwardPorts` (`config::ForwardPort`) rides the same engine, owned
+by the TUI while it's open (VS Code's model: no background daemon).
 
-- Several instances of one sandbox all declare `3000`; only one can hold host
-  `3000`. Options: first-come, per-instance port offset, or `Prefer(p)` with
-  fallback, shown in `ps` and the TUI.
-- Forwards need a long-lived host process. Options: the TUI while open
-  (VS Code's model), a `devsandbox port --all` foreground command, or a
-  background host daemon (new territory: lifecycle, logs, stale-state cleanup).
-- Where the resulting mapping is recorded (`state.toml` per instance) so the
-  CLI, TUI and `status --json` agree.
-- `portsAttributes.onAutoForward` / `label` map onto the Ports tab's
-  presentation.
+```toml
+[sandbox.api]
+services = ["db"]
+forwardPorts = [3000, "8080:3000", "db:5432", "15432:db:5432"]
+```
+
+- Entries are `[host:][service:]port`. `3000` and `"db:5432"` are the
+  devcontainer forms; a leading host port (`"8080:3000"`) is a devsandbox
+  extension. A leading number is always the host port, a name a service, which
+  must be in the sandbox's `services` (checked by `resolve_sandbox`).
+- Host-side only: excluded from `config_hash`, so editing it is never drift.
+- **Owner** (`tui::forwards::Owner`): an instance entry or an isolated
+  service's belongs to the instance; a `global` service's belongs to the config
+  root, one forward however many running instances declare it (routed with no
+  instance named, so it survives any one instance stopping).
+- **Lifetime:** every snapshot the event loop sends the running instances'
+  state keys (`ForwardWorker::sync`); the worker loads config + state, starts
+  missing forwards and stops those whose owner stopped or whose entry is gone.
+  `d` on a configured row (marked `(config)`) stops it for the session; a
+  forward that fails to start is reported once and retried when its owner
+  comes back.
+- **Host port:** always `127.0.0.1`. Candidates, in order: the saved port, then
+  the base (the entry's host port, else the target port) upward over
+  `PREFER_SPAN` (100) ports, skipping ports saved for *any* other forward, so a
+  stopped instance keeps its ports. Each is tried as `Fixed`; `AddrInUse` moves
+  on, any other bind error fails the forward.
+- **Persistence:** the chosen port is saved in `state.toml`, keyed by the
+  entry's canonical form: `Instance.forwarded_ports` (kept across `rebuild`,
+  dropped with the instance on `rm`), or `State.global_forwarded_ports[project]`
+  for global services. Each sync prunes saved ports of entries the config no
+  longer declares (global ones only when every sandbox resolves). The write
+  re-reads state first so a concurrent `run`/`rm` isn't undone.
+
+Not implemented: `portsAttributes`, `otherPortsAttributes`, `appPort` (still
+warned as ignored); configured forwards outside the TUI.
 
 Related follow-ups, not planned:
 

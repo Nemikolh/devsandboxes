@@ -350,6 +350,15 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
                             .map(|r| r.container.clone())
                             .collect();
                         bridges.send(running);
+                        // Configured `forwardPorts` follow the running set.
+                        forwards.sync(
+                            snapshot
+                                .instances
+                                .iter()
+                                .filter(|r| matches!(r.status, data::ContainerStatus::Running(_)))
+                                .map(|r| r.name.clone())
+                                .collect(),
+                        );
                     }
                     app.set_snapshot(snapshot);
                     pending = None;

@@ -274,6 +274,8 @@ pub(crate) fn materialize(
         .clone()
         .or_else(|| prior.and_then(|i| i.dispatcher.clone()));
     let prior_config_dir = prior.and_then(|i| i.config_dir.clone());
+    // A rebuild keeps the instance's host ports (docs/port-forwarding.md).
+    let forwarded_ports = prior.map(|i| i.forwarded_ports.clone()).unwrap_or_default();
     let run_env = effective_extra_env(&extras.env, prior.map(|i| &i.extra_env));
     let container_name = format!("{NAME_PREFIX}{instance_id}");
     let basename = folder
@@ -487,6 +489,7 @@ pub(crate) fn materialize(
             dispatcher,
             config_dir: Some(prior_config_dir.unwrap_or(config_dir)),
             extra_env: run_env,
+            forwarded_ports,
             created_unix: Instance::now(),
         },
     );
@@ -829,6 +832,7 @@ mod tests {
             dispatcher: None,
             config_dir: None,
             extra_env: Default::default(),
+            forwarded_ports: Default::default(),
             created_unix: 0,
         }
     }

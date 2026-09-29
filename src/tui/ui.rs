@@ -503,9 +503,13 @@ fn draw_ports_table(
 
 fn port_row(r: &PortRow) -> Row<'_> {
     let process = r.process.clone().unwrap_or_else(|| "-".to_string());
+    let mut target = vec![Span::raw(r.target.clone())];
+    if r.configured {
+        target.push(Span::styled(" (config)", Style::default().add_modifier(Modifier::DIM)));
+    }
     Row::new(vec![
         Cell::from(r.local.clone()),
-        Cell::from(r.target.clone()),
+        Cell::from(Line::from(target)),
         Cell::from(process),
         Cell::from(Span::styled(r.state.clone(), port_state_style(&r.state))),
         Cell::from(r.conns.to_string()),

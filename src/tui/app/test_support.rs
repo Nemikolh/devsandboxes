@@ -24,6 +24,7 @@ pub(super) fn port_rows(n: usize) -> Vec<PortRow> {
             process: None,
             state: "active".into(),
             conns: 0,
+            configured: false,
         })
         .collect()
 }

@@ -423,8 +423,8 @@ pub fn validate_port_spec(spec: &str) -> Result<(Option<u16>, u16), String> {
 
 /// Parse a CLI port spec into `(host binding, container port)`.
 ///
-/// - `<port>` → `(Prefer(port), port)`: same host port, OS-assigned fallback if
-///   taken (docs/port-forwarding.md, _Binding_).
+/// - `<port>` → `(Prefer(port), port)`: same host port, or the next free one
+///   up if taken (docs/port-forwarding.md, _Binding_).
 /// - `<host>:<port>` → `(Fixed(host), port)`: explicit host port, fail if taken.
 ///
 /// Shape validation is shared with the TUI via [`validate_port_spec`].
@@ -694,6 +694,7 @@ image = "node"
             dispatcher: None,
             config_dir: None,
             extra_env: Default::default(),
+            forwarded_ports: Default::default(),
             created_unix: 0,
         }
     }

@@ -154,12 +154,16 @@ See `docs/port-forwarding.md` for the engine. The dashboard gains a third tab.
   carrying any `(via instance …)` suffix — no separate VIA column), `PROCESS`
   (`node (pid 412)`, `-` when unknown), `STATE` (active green / connecting
   yellow / error red), `CONNS`. Empty state points at `p` / `:port`.
+- Running instances' `forwardPorts` are forwarded automatically, on the host
+  port saved for them in `state.toml` (docs/port-forwarding.md, _Configured
+  forwards_); their `TARGET` carries a dim `(config)`.
 - Keys:
   - `p` on an Instances row (not a process row) opens the prompt prefilled
     `port <instance> `; `p` on a Services row prefills
     `port <first used_by instance> --service <svc> ` (blank instance slot when
     the service has no user).
-  - `d` on the Ports tab stops the selected forward.
+  - `d` on the Ports tab stops the selected forward (a configured one stays
+    stopped until the dashboard reopens).
 - Prompt command
   `port <instance> [--service s] [--address a] <[host:]port>`: an instance is
   required (a global service is reached by naming any instance that references

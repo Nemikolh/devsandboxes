@@ -85,6 +85,8 @@ pub struct PortRow {
     pub state: String,
     /// Open connection count.
     pub conns: usize,
+    /// Started from a sandbox's `forwardPorts`, not by hand.
+    pub configured: bool,
 }
 
 /// A forward the user asked for, for the event loop (step 10) to start on its

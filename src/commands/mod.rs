@@ -232,6 +232,7 @@ mod tests {
             dispatcher: None,
             config_dir: None,
             extra_env: Default::default(),
+            forwarded_ports: Default::default(),
             created_unix: 0,
         };
         state.instances.insert("web-aaaa".into(), mk("web", "/home/u/site"));
@@ -272,6 +273,7 @@ mod tests {
                 dispatcher: None,
                 config_dir: None,
                 extra_env: Default::default(),
+                forwarded_ports: Default::default(),
                 created_unix: 0,
             },
         );

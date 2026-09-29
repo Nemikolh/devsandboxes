@@ -104,10 +104,13 @@ pub struct SandboxProperties {
     /// `privileged` (as the official CLI does), so `false` cannot veto a
     /// feature that needs it.
     pub privileged: Option<bool>,
+    /// Ports the TUI forwards to the host while it's open
+    /// (docs/port-forwarding.md, _Configured forwards_). Host-side only, so
+    /// excluded from `config_hash`.
+    pub forward_ports: Option<Vec<ForwardPort>>,
 
     // --- valid devcontainer properties, not implemented yet ---
     pub name: Option<Value>,
-    pub forward_ports: Option<Value>,
     pub app_port: Option<Value>,
     pub ports_attributes: Option<Value>,
     pub other_ports_attributes: Option<Value>,
@@ -212,7 +215,6 @@ impl SandboxProperties {
         }
         flag!(
             name => "name",
-            forward_ports => "forwardPorts",
             app_port => "appPort",
             ports_attributes => "portsAttributes",
             other_ports_attributes => "otherPortsAttributes",
@@ -252,6 +254,83 @@ impl SandboxProperties {
             .as_ref()?
             .extensions
             .as_deref()
+    }
+}
+
+/// A `forwardPorts` entry, `[host:][service:]port`: `3000`, `"8080:3000"`,
+/// `"db:5432"` (the devcontainer form for a service port), `"15432:db:5432"`.
+/// A leading number is always the host port; the host port forms are a
+/// devsandbox extension.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardPort {
+    /// Host port to start the search from; the target port when unset.
+    pub host: Option<u16>,
+    /// Service whose port is forwarded; the instance's own port when unset.
+    pub service: Option<String>,
+    pub port: u16,
+}
+
+impl ForwardPort {
+    pub fn parse(entry: &str) -> std::result::Result<ForwardPort, String> {
+        let port = |s: &str| match s.parse::<u16>() {
+            Ok(0) | Err(_) => Err(format!("forwardPorts entry `{entry}`: `{s}` is not a port number")),
+            Ok(p) => Ok(p),
+        };
+        let service = |s: &str| {
+            if s.is_empty() || s.parse::<u16>().is_ok() {
+                Err(format!("forwardPorts entry `{entry}`: `{s}` is not a service name"))
+            } else {
+                Ok(s.to_string())
+            }
+        };
+        match entry.split(':').collect::<Vec<_>>()[..] {
+            [p] => Ok(ForwardPort { host: None, service: None, port: port(p)? }),
+            [a, p] if a.parse::<u16>().is_ok() => Ok(ForwardPort { host: Some(port(a)?), service: None, port: port(p)? }),
+            [s, p] => Ok(ForwardPort { host: None, service: Some(service(s)?), port: port(p)? }),
+            [h, s, p] => Ok(ForwardPort { host: Some(port(h)?), service: Some(service(s)?), port: port(p)? }),
+            _ => Err(format!("forwardPorts entry `{entry}`: expected `[host:][service:]port`")),
+        }
+    }
+
+    /// Canonical form (`3000` and `"3000"` agree): the key the chosen host
+    /// port is saved under in state.
+    pub fn key(&self) -> String {
+        let mut key = String::new();
+        if let Some(host) = self.host {
+            key.push_str(&format!("{host}:"));
+        }
+        if let Some(service) = &self.service {
+            key.push_str(&format!("{service}:"));
+        }
+        key.push_str(&self.port.to_string());
+        key
+    }
+
+    /// Where the host port search starts.
+    pub fn base(&self) -> u16 {
+        self.host.unwrap_or(self.port)
+    }
+}
+
+impl<'de> Deserialize<'de> for ForwardPort {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> std::result::Result<Self, D::Error> {
+        struct V;
+        impl serde::de::Visitor<'_> for V {
+            type Value = ForwardPort;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a port number or a `[host:][service:]port` string")
+            }
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> std::result::Result<ForwardPort, E> {
+                ForwardPort::parse(&v.to_string()).map_err(E::custom)
+            }
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> std::result::Result<ForwardPort, E> {
+                ForwardPort::parse(&v.to_string()).map_err(E::custom)
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> std::result::Result<ForwardPort, E> {
+                ForwardPort::parse(v).map_err(E::custom)
+            }
+        }
+        de.deserialize_any(V)
     }
 }
 
@@ -656,9 +735,23 @@ impl Config {
         properties.remove("extends");
 
         let config_hash = sandbox_hash(&properties);
-        let properties: SandboxProperties = properties
+        let mut properties: SandboxProperties = properties
             .try_into()
             .map_err(|e| anyhow!("sandbox `{name}`: {e}"))?;
+        if let Some(forwards) = &mut properties.forward_ports {
+            // `extends` concatenates arrays, so a template and its sandbox may
+            // both list an entry; one forward each is enough.
+            let mut seen = std::collections::BTreeSet::new();
+            forwards.retain(|f| seen.insert(f.key()));
+            let services = properties.services.as_deref().unwrap_or_default();
+            for f in forwards.iter() {
+                if let Some(svc) = &f.service
+                    && !services.contains(svc)
+                {
+                    bail!("sandbox `{name}`: forwardPorts entry `{}` names `{svc}`, which isn't in its `services`", f.key());
+                }
+            }
+        }
 
         Ok(ResolvedSandbox {
             name: name.to_string(),
@@ -794,12 +887,13 @@ fn config_hash(table: &Table) -> String {
 }
 
 /// [`config_hash`] of a merged sandbox table minus the keys that apply without
-/// recreating the container (`autostart`, `dispatcher`), so flipping them
-/// isn't drift.
+/// recreating the container (`autostart`, `dispatcher`, the host-side
+/// `forwardPorts`), so changing them isn't drift.
 fn sandbox_hash(table: &Table) -> String {
     let mut table = table.clone();
     table.remove("autostart");
     table.remove("dispatcher");
+    table.remove("forwardPorts");
     config_hash(&table)
 }
 
@@ -1000,6 +1094,63 @@ folders = { "/workspaces/docs" = "../docs" }
     }
 
     #[test]
+    fn forward_ports_excluded_from_config_hash() {
+        let base = "[sandbox.app]\nfolder = \"../app\"\n";
+        let plain = Config::parse(base).unwrap();
+        let with = Config::parse(&format!("{base}forwardPorts = [3000]\n")).unwrap();
+        let hash = plain.resolve_sandbox("app").unwrap().config_hash;
+        assert_eq!(hash, with.resolve_sandbox("app").unwrap().config_hash);
+        assert_eq!(with.resolved_table("app").unwrap().1, hash);
+    }
+
+    #[test]
+    fn forward_port_entries_parse() {
+        let fp = |host, service: Option<&str>, port| ForwardPort { host, service: service.map(str::to_string), port };
+        assert_eq!(ForwardPort::parse("3000"), Ok(fp(None, None, 3000)));
+        assert_eq!(ForwardPort::parse("8080:3000"), Ok(fp(Some(8080), None, 3000)));
+        assert_eq!(ForwardPort::parse("db:5432"), Ok(fp(None, Some("db"), 5432)));
+        assert_eq!(ForwardPort::parse("15432:db:5432"), Ok(fp(Some(15432), Some("db"), 5432)));
+        for bad in ["", "0", "x", "70000", "8080:0", ":3000", "1:2:3", "db:", "a:b:c:d"] {
+            assert!(ForwardPort::parse(bad).is_err(), "{bad}");
+        }
+        assert_eq!(fp(Some(15432), Some("db"), 5432).key(), "15432:db:5432");
+        assert_eq!(fp(Some(15432), Some("db"), 5432).base(), 15432);
+        assert_eq!(fp(None, Some("db"), 5432).base(), 5432);
+    }
+
+    #[test]
+    fn forward_ports_accept_numbers_and_strings_dedupe_and_check_services() {
+        let config = Config::parse(
+            r#"
+[services.db]
+image = "postgres"
+
+[template.t]
+forwardPorts = [3000]
+
+[sandbox.app]
+extends = "t"
+services = ["db"]
+forwardPorts = ["3000", "8080:3000", "db:5432"]
+
+[sandbox.bad]
+forwardPorts = ["db:5432"]
+
+[sandbox.worse]
+forwardPorts = [true]
+"#,
+        )
+        .unwrap();
+        let app = config.resolve_sandbox("app").unwrap();
+        let keys: Vec<String> = app.properties.forward_ports.as_ref().unwrap().iter().map(ForwardPort::key).collect();
+        assert_eq!(keys, ["3000", "8080:3000", "db:5432"]);
+        assert!(app.properties.ignored().is_empty());
+        let err = config.resolve_sandbox("bad").unwrap_err().to_string();
+        assert!(err.contains("isn't in its `services`"), "{err}");
+        assert!(config.resolve_sandbox("worse").is_err());
+    }
+
+    #[test]
     fn build_hash_none_and_missing_are_empty() {
         let dir = std::env::temp_dir();
         // No build block at all.
@@ -1102,7 +1253,7 @@ folders = { "/workspaces/docs" = "../docs" }
             r#"
 [sandbox.s]
 image = "alpine"
-forwardPorts = [3000]
+appPort = [3000]
 runArgs = ["--gpus", "all"]
 customizations.vscode.settings = { "editor.formatOnSave" = true }
 customizations.jetbrains.plugins = ["x"]
@@ -1113,7 +1264,7 @@ customizations.jetbrains.plugins = ["x"]
         assert_eq!(
             sandbox.properties.ignored(),
             vec![
-                "forwardPorts",
+                "appPort",
                 "runArgs",
                 "customizations.vscode.settings",
                 "customizations.jetbrains",

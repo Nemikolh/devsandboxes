@@ -70,7 +70,9 @@ git worktrees so working trees are never shared.
   `term.rs` holds the integrated terminal's PTY sessions + tab strip
   (`TermSession`/`TermTabs`, `docker exec -it` shell rendered via vt100);
   `forwards.rs` is the Ports-tab worker thread that owns every live `Forward`
-  (route resolution + docker work off the UI thread), modelled on `BridgeWorker`.
+  (route resolution + docker work off the UI thread), modelled on `BridgeWorker`;
+  it also reconciles sandboxes' `forwardPorts` against the running instances
+  each snapshot, with host ports saved in `state.toml`.
 
 ## Conventions & checks
 

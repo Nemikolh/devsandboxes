@@ -9,17 +9,23 @@
 //! `exec`) is dropped before the terminal is restored. Nothing is ever written
 //! to stderr — the TUI owns the screen; errors surface as [`ForwardUpdate`]s.
 //!
+//! It also runs the sandboxes' `forwardPorts` ([`ForwardWorker::sync`]): every
+//! snapshot hands it the running instances, and it starts and stops their
+//! configured forwards to match, reusing the host port saved in state for each
+//! (docs/port-forwarding.md, _Configured forwards_).
+//!
 //! [`remove`]: ForwardWorker::remove
 
-use std::collections::BTreeMap;
-use std::net::IpAddr;
+use std::collections::{BTreeMap, BTreeSet};
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use crate::commands::port;
-use crate::devsbd::forward::{Forward, ForwardSpec, ForwardState, ForwardStatus, HostPort};
+use crate::commands::{port, services};
+use crate::config::{Config, ForwardPort, ServiceScope};
+use crate::devsbd::forward::{Forward, ForwardSpec, ForwardState, ForwardStatus, HostPort, PREFER_SPAN};
 use crate::state::State;
 
 use super::app::PortRow;
@@ -35,6 +41,8 @@ enum Cmd {
     Add(PortRequestOwned),
     /// Drop the forward with this id (the `d` shortcut).
     Remove(u64),
+    /// The running instances' state keys: reconcile configured forwards.
+    Sync(BTreeSet<String>),
 }
 
 /// The worker's owned copy of a `PortRequest` (the app's type is UI-side).
@@ -90,6 +98,14 @@ impl ForwardWorker {
         }
     }
 
+    /// Hand the worker the running instances (state keys) so it starts their
+    /// `forwardPorts` and stops those of instances that went away. Never blocks.
+    pub fn sync(&self, running: BTreeSet<String>) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Cmd::Sync(running));
+        }
+    }
+
     /// Next pending update, or `None` when nothing is queued. Non-blocking.
     pub fn try_recv(&self) -> Option<ForwardUpdate> {
         self.updates.try_recv().ok()
@@ -108,11 +124,40 @@ impl Drop for ForwardWorker {
     }
 }
 
+/// Who a configured forward belongs to, which is also where its host port is
+/// saved in state.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum Owner {
+    /// Instance state key: its own ports and its isolated services'.
+    Instance(String),
+    /// A `global` service's port: one forward per config root, however many
+    /// running instances declare it.
+    Global,
+}
+
+/// Identity of a configured forward: its owner plus the entry's
+/// [`ForwardPort::key`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct Configured {
+    owner: Owner,
+    entry: String,
+}
+
 /// The worker's owned forwards, keyed by the id it hands out (monotonic).
 struct Forwards {
     dir: PathBuf,
+    /// Config-root id (`services::project_id`), the key for global forwards'
+    /// saved ports. `None` when `dir` doesn't resolve: no configured forwards.
+    project: Option<String>,
     next_id: u64,
     live: BTreeMap<u64, Forward>,
+    /// Live configured forwards -> their id in `live`.
+    configured: BTreeMap<Configured, u64>,
+    /// Configured forwards stopped with `d`: not restarted this session.
+    suppressed: BTreeSet<Configured>,
+    /// Configured forwards that failed to start (reported once); retried when
+    /// their owner stops and comes back.
+    failed: BTreeSet<Configured>,
     /// Last rows sent, so an unchanged poll produces no `Rows` update.
     last_rows: Vec<PortRow>,
     /// Last status sent, so a repeated note isn't re-sent.
@@ -123,11 +168,23 @@ struct Forwards {
 /// for both commands and the periodic status poll. Returns (dropping every
 /// forward) once the command channel disconnects.
 fn run(dir: PathBuf, rx: Receiver<Cmd>, utx: Sender<ForwardUpdate>) {
-    let mut fwds = Forwards { dir, next_id: 1, live: BTreeMap::new(), last_rows: Vec::new(), last_status: None };
+    let project = services::project_id(&dir).ok();
+    let mut fwds = Forwards {
+        dir,
+        project,
+        next_id: 1,
+        live: BTreeMap::new(),
+        configured: BTreeMap::new(),
+        suppressed: BTreeSet::new(),
+        failed: BTreeSet::new(),
+        last_rows: Vec::new(),
+        last_status: None,
+    };
     loop {
         match rx.recv_timeout(POLL) {
             Ok(Cmd::Add(req)) => fwds.add(req, &utx),
             Ok(Cmd::Remove(id)) => fwds.remove(id, &utx),
+            Ok(Cmd::Sync(running)) => fwds.sync(&running, &utx),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             // UI dropped the worker: exit, dropping `fwds` (every Forward).
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
@@ -188,30 +245,138 @@ impl Forwards {
 
         let addr = forward.status().local_addr;
         let label = route_label_or(&forward, container_port, req);
-        let id = self.next_id;
-        self.next_id += 1;
-        self.live.insert(id, forward);
+        self.insert(forward);
         Ok((addr, label))
     }
 
+    fn insert(&mut self, forward: Forward) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.live.insert(id, forward);
+        id
+    }
+
     /// Drop the forward with `id` (its `Drop` kills the bridge/`exec`). Reports a
-    /// `stopped <local>` status; unknown ids are ignored (a stale `d`).
+    /// `stopped <local>` status; unknown ids are ignored (a stale `d`). A
+    /// configured forward stays stopped for the rest of the session instead of
+    /// coming straight back on the next sync.
     fn remove(&mut self, id: u64, utx: &Sender<ForwardUpdate>) {
         if let Some(forward) = self.live.remove(&id) {
             let addr = forward.status().local_addr;
             drop(forward);
-            let _ = utx.send(ForwardUpdate::Status(format!("stopped {addr}")));
+            let configured = self.configured.iter().find(|(_, v)| **v == id).map(|(c, _)| c.clone());
+            let msg = match configured {
+                Some(c) => {
+                    self.configured.remove(&c);
+                    self.suppressed.insert(c);
+                    format!("stopped {addr} (forwardPorts: back when the dashboard reopens)")
+                }
+                None => format!("stopped {addr}"),
+            };
+            let _ = utx.send(ForwardUpdate::Status(msg));
         }
+    }
+
+    /// Reconcile configured forwards with the running instances: stop those
+    /// no longer wanted, start the missing ones on their saved (or a newly
+    /// allocated) host port, and save newly chosen ports. Config or state that
+    /// doesn't load leaves everything as it is; the dashboard shows that error.
+    fn sync(&mut self, running: &BTreeSet<String>, utx: &Sender<ForwardUpdate>) {
+        let Some(project) = self.project.clone() else { return };
+        let (Ok(config), Ok(mut state)) = (Config::load(&self.dir), State::load()) else { return };
+        let wanted = wanted(&config, &state, running, &project);
+
+        let gone: Vec<Configured> = self.configured.keys().filter(|c| !wanted.contains_key(c)).cloned().collect();
+        for c in gone {
+            if let Some(id) = self.configured.remove(&c) {
+                self.live.remove(&id);
+            }
+        }
+        self.failed.retain(|c| wanted.contains_key(c));
+
+        // Stale saved ports would block allocation forever; prune before
+        // computing reservations.
+        let mut dirty = prune_saved(&mut state, &config, &project);
+        let mut chosen = Vec::new();
+        for (c, fp) in &wanted {
+            if self.configured.contains_key(c) || self.suppressed.contains(c) || self.failed.contains(c) {
+                continue;
+            }
+            match self.start_configured(&state, &project, c, fp) {
+                Ok((id, port, label)) => {
+                    self.configured.insert(c.clone(), id);
+                    let _ = utx.send(ForwardUpdate::Status(format!("forwarding 127.0.0.1:{port} -> {label}")));
+                    // Later allocations in this pass must see it as taken.
+                    dirty |= save_port(&mut state, &project, c, port);
+                    chosen.push((c.clone(), port));
+                }
+                Err(msg) => {
+                    self.failed.insert(c.clone());
+                    let _ = utx.send(ForwardUpdate::Status(msg));
+                }
+            }
+        }
+        if !dirty {
+            return;
+        }
+        // Re-read before writing so a `run`/`rm` since the load isn't undone.
+        let Ok(mut fresh) = State::load() else { return };
+        let mut changed = prune_saved(&mut fresh, &config, &project);
+        for (c, port) in &chosen {
+            changed |= save_port(&mut fresh, &project, c, *port);
+        }
+        if changed && let Err(e) = fresh.save() {
+            let _ = utx.send(ForwardUpdate::Status(format!("forwardPorts: {e:#}")));
+        }
+    }
+
+    /// Bind the first free candidate host port for `c` and start its forward.
+    /// Returns `(id, host port, route label)`.
+    fn start_configured(
+        &mut self,
+        state: &State,
+        project: &str,
+        c: &Configured,
+        fp: &ForwardPort,
+    ) -> Result<(u64, u16, String), String> {
+        let instance = match &c.owner {
+            Owner::Instance(key) => Some(key.clone()),
+            Owner::Global => None,
+        };
+        let saved = saved_port(state, project, c);
+        let reserved = reserved_ports(state, project, c);
+        for port in candidates(saved, fp.base(), &reserved) {
+            let spec = ForwardSpec {
+                bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                host_port: HostPort::Fixed(port),
+                resolve: port::resolver(self.dir.clone(), instance.clone(), fp.service.clone(), fp.port),
+                probe: Box::new(port::listening_procs),
+            };
+            match Forward::start(spec) {
+                Ok(forward) => {
+                    let label = match (&fp.service, &instance) {
+                        (Some(svc), _) => format!("{svc}:{}", fp.port),
+                        (None, Some(key)) => format!("{key}:{}", fp.port),
+                        (None, None) => fp.port.to_string(),
+                    };
+                    return Ok((self.insert(forward), port, label));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => continue,
+                Err(e) => return Err(format!("forwardPorts `{}`: port {port}: {}", c.entry, bind_reason(&e))),
+            }
+        }
+        Err(format!("forwardPorts `{}`: no free host port from {} up", c.entry, fp.base()))
     }
 
     /// Poll every forward's status: rebuild the rows and send `Rows` only when
     /// they changed, then drain each forward's notes and send the newest as a
     /// deduped `Status`.
     fn poll(&mut self, utx: &Sender<ForwardUpdate>) {
+        let configured: BTreeSet<u64> = self.configured.values().copied().collect();
         let rows: Vec<PortRow> = self
             .live
             .iter()
-            .map(|(&id, f)| status_to_row(id, &f.status()))
+            .map(|(&id, f)| status_to_row(id, &f.status(), configured.contains(&id)))
             .collect();
         if rows != self.last_rows {
             self.last_rows = rows.clone();
@@ -239,7 +404,7 @@ impl Forwards {
 
 /// Project a `ForwardStatus` into a Ports-tab row. Pure over `(id, status)` so
 /// the state-string mapping is unit-tested without a forwarder.
-fn status_to_row(id: u64, status: &ForwardStatus) -> PortRow {
+fn status_to_row(id: u64, status: &ForwardStatus, configured: bool) -> PortRow {
     PortRow {
         id,
         local: status.local_addr.to_string(),
@@ -247,7 +412,135 @@ fn status_to_row(id: u64, status: &ForwardStatus) -> PortRow {
         process: status.process.clone(),
         state: state_string(&status.state),
         conns: status.open_conns,
+        configured,
     }
+}
+
+/// Whether `service` is a `global` one (its forward is shared by the config
+/// root). An unknown service counts as isolated; its route reports the error.
+fn is_global(config: &Config, service: &str) -> bool {
+    config.resolve_service(service).is_ok_and(|s| s.spec.scope == ServiceScope::Global)
+}
+
+/// Whether `inst` belongs to this config root. Instances from before `project`
+/// was recorded match on the sandbox name alone.
+fn in_root(config: &Config, inst: &crate::state::Instance, project: &str) -> bool {
+    config.sandboxes.contains_key(&inst.sandbox) && (inst.project.is_empty() || inst.project == project)
+}
+
+/// The configured forwards the running instances declare. Pure over
+/// `(config, state, running)`. A global service's entry is keyed once for the
+/// whole root; sandboxes that don't resolve are skipped (the dashboard shows
+/// config errors elsewhere).
+fn wanted(
+    config: &Config,
+    state: &State,
+    running: &BTreeSet<String>,
+    project: &str,
+) -> BTreeMap<Configured, ForwardPort> {
+    let mut out = BTreeMap::new();
+    for key in running {
+        let Some(inst) = state.instances.get(key).filter(|i| in_root(config, i, project)) else { continue };
+        let Ok(sandbox) = config.resolve_sandbox(&inst.sandbox) else { continue };
+        for fp in sandbox.properties.forward_ports.unwrap_or_default() {
+            let owner = match &fp.service {
+                Some(svc) if is_global(config, svc) => Owner::Global,
+                _ => Owner::Instance(key.clone()),
+            };
+            out.entry(Configured { owner, entry: fp.key() }).or_insert(fp);
+        }
+    }
+    out
+}
+
+/// The host port saved for `c`, if any.
+fn saved_port(state: &State, project: &str, c: &Configured) -> Option<u16> {
+    match &c.owner {
+        Owner::Instance(key) => state.instances.get(key)?.forwarded_ports.get(&c.entry).copied(),
+        Owner::Global => state.global_forwarded_ports.get(project)?.get(&c.entry).copied(),
+    }
+}
+
+/// Every saved host port except `c`'s own: what other forwards (running or
+/// not, any config root) hold, so a stopped instance keeps its ports.
+fn reserved_ports(state: &State, project: &str, c: &Configured) -> BTreeSet<u16> {
+    let mut out = BTreeSet::new();
+    for (key, inst) in &state.instances {
+        for (entry, port) in &inst.forwarded_ports {
+            if !(c.owner == Owner::Instance(key.clone()) && *entry == c.entry) {
+                out.insert(*port);
+            }
+        }
+    }
+    for (root, entries) in &state.global_forwarded_ports {
+        for (entry, port) in entries {
+            if !(c.owner == Owner::Global && root == project && *entry == c.entry) {
+                out.insert(*port);
+            }
+        }
+    }
+    out
+}
+
+/// Host ports to try, in order: the saved one, then `base` upward over
+/// [`PREFER_SPAN`] ports, skipping ones other forwards hold.
+fn candidates(saved: Option<u16>, base: u16, reserved: &BTreeSet<u16>) -> Vec<u16> {
+    let scan = (base..=base.saturating_add(PREFER_SPAN - 1)).filter(|p| Some(*p) != saved && !reserved.contains(p));
+    saved.into_iter().chain(scan).collect()
+}
+
+/// Record `port` as `c`'s host port. Returns whether state changed.
+fn save_port(state: &mut State, project: &str, c: &Configured, port: u16) -> bool {
+    let map = match &c.owner {
+        Owner::Instance(key) => match state.instances.get_mut(key) {
+            Some(inst) => &mut inst.forwarded_ports,
+            None => return false,
+        },
+        Owner::Global => state.global_forwarded_ports.entry(project.to_string()).or_default(),
+    };
+    map.insert(c.entry.clone(), port) != Some(port)
+}
+
+/// Drop saved ports of entries this config root no longer declares, so they
+/// stop reserving host ports. Only touches instances of this root whose
+/// sandbox resolves; global entries only when every sandbox resolves (else an
+/// entry might just be unreadable right now). Returns whether state changed.
+fn prune_saved(state: &mut State, config: &Config, project: &str) -> bool {
+    let mut changed = false;
+    let mut global_keys = BTreeSet::new();
+    let mut all_resolved = true;
+    let mut per_sandbox: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
+    for name in config.sandboxes.keys() {
+        let Ok(sandbox) = config.resolve_sandbox(name) else {
+            all_resolved = false;
+            continue;
+        };
+        let keys = per_sandbox.entry(name).or_default();
+        for fp in sandbox.properties.forward_ports.unwrap_or_default() {
+            match &fp.service {
+                Some(svc) if is_global(config, svc) => global_keys.insert(fp.key()),
+                _ => keys.insert(fp.key()),
+            };
+        }
+    }
+    for inst in state.instances.values_mut() {
+        if inst.project != project {
+            continue;
+        }
+        let Some(keys) = per_sandbox.get(inst.sandbox.as_str()) else { continue };
+        let before = inst.forwarded_ports.len();
+        inst.forwarded_ports.retain(|entry, _| keys.contains(entry));
+        changed |= inst.forwarded_ports.len() != before;
+    }
+    if all_resolved && let Some(entries) = state.global_forwarded_ports.get_mut(project) {
+        let before = entries.len();
+        entries.retain(|entry, _| global_keys.contains(entry));
+        changed |= entries.len() != before;
+        if entries.is_empty() {
+            state.global_forwarded_ports.remove(project);
+        }
+    }
+    changed
 }
 
 /// The Ports-tab state string: `"active"`, `"connecting"`, or `"error: …"`.
@@ -288,7 +581,113 @@ fn route_label_or(forward: &Forward, container_port: u16, req: &PortRequestOwned
 mod tests {
     use super::*;
     use crate::devsbd::forward::{ForwardState, ForwardStatus};
+    use crate::state::Instance;
     use std::net::{Ipv4Addr, SocketAddr};
+
+    // ---- pure: configured forwards ----
+
+    const CONFIG: &str = r#"
+[services.db]
+image = "postgres"
+
+[services.redis]
+image = "redis"
+scope = "global"
+
+[sandbox.api]
+services = ["db", "redis"]
+forwardPorts = [3000, "8080:3000", "db:5432", "redis:6379"]
+
+[sandbox.web]
+services = ["redis"]
+forwardPorts = ["redis:6379"]
+"#;
+
+    fn inst(sandbox: &str, project: &str, saved: &[(&str, u16)]) -> Instance {
+        let mut i: Instance = toml::from_str(&format!(
+            "sandbox = \"{sandbox}\"\nproject = \"{project}\"\ncontainer = \"c\"\nfolder = \"/f\"\nworkspace = \"/w\"\ncreated_unix = 0\n"
+        ))
+        .unwrap();
+        i.forwarded_ports = saved.iter().map(|(k, p)| (k.to_string(), *p)).collect();
+        i
+    }
+
+    fn cfg(owner: Owner, entry: &str) -> Configured {
+        Configured { owner, entry: entry.into() }
+    }
+
+    fn fixture() -> (Config, State) {
+        let config = Config::parse(CONFIG).unwrap();
+        let mut state = State::default();
+        state.instances.insert("api".into(), inst("api", "p1", &[("3000", 3001)]));
+        state.instances.insert("api-2".into(), inst("api", "p1", &[]));
+        state.instances.insert("web".into(), inst("web", "p1", &[]));
+        state.instances.insert("elsewhere".into(), inst("api", "p2", &[("3000", 3000)]));
+        (config, state)
+    }
+
+    #[test]
+    fn wanted_per_instance_and_one_global_forward_per_root() {
+        let (config, state) = fixture();
+        let running: BTreeSet<String> = ["api", "web", "elsewhere"].map(String::from).into();
+        let keys: Vec<Configured> = wanted(&config, &state, &running, "p1").into_keys().collect();
+        let api = || Owner::Instance("api".into());
+        assert_eq!(
+            keys,
+            vec![
+                cfg(api(), "3000"),
+                cfg(api(), "8080:3000"),
+                cfg(api(), "db:5432"),
+                // Declared by both `api` and `web`, forwarded once.
+                cfg(Owner::Global, "redis:6379"),
+            ]
+        );
+        // Another root's instance and stopped instances contribute nothing.
+        assert!(wanted(&config, &state, &BTreeSet::new(), "p1").is_empty());
+    }
+
+    #[test]
+    fn candidates_try_saved_then_scan_up_skipping_reserved() {
+        let reserved: BTreeSet<u16> = [3001, 3003].into();
+        let got = candidates(Some(3002), 3000, &reserved);
+        assert_eq!(&got[..4], &[3002, 3000, 3004, 3005]);
+        assert_eq!(got.len(), PREFER_SPAN as usize - 2 - 1 + 1);
+        assert_eq!(candidates(None, u16::MAX, &BTreeSet::new()), vec![u16::MAX]);
+    }
+
+    #[test]
+    fn saved_and_reserved_ports_exclude_only_the_forward_itself() {
+        let (_, mut state) = fixture();
+        let api3000 = cfg(Owner::Instance("api".into()), "3000");
+        let api2 = cfg(Owner::Instance("api-2".into()), "3000");
+        assert_eq!(saved_port(&state, "p1", &api3000), Some(3001));
+        assert_eq!(saved_port(&state, "p1", &api2), None);
+        // `api-2` must not take `api`'s port, nor the other root's.
+        assert_eq!(reserved_ports(&state, "p1", &api2), [3000, 3001].into());
+        assert_eq!(reserved_ports(&state, "p1", &api3000), [3000].into());
+
+        let global = cfg(Owner::Global, "redis:6379");
+        assert!(save_port(&mut state, "p1", &global, 6379));
+        assert!(!save_port(&mut state, "p1", &global, 6379), "unchanged");
+        assert_eq!(saved_port(&state, "p1", &global), Some(6379));
+        assert_eq!(saved_port(&state, "p2", &global), None);
+        assert!(reserved_ports(&state, "p1", &api2).contains(&6379));
+        assert!(!save_port(&mut state, "p1", &cfg(Owner::Instance("ghost".into()), "3000"), 1));
+    }
+
+    #[test]
+    fn prune_drops_entries_no_longer_declared() {
+        let (config, mut state) = fixture();
+        state.instances.get_mut("api").unwrap().forwarded_ports.insert("4000".into(), 4000);
+        state.global_forwarded_ports.entry("p1".into()).or_default().insert("redis:6379".into(), 6379);
+        state.global_forwarded_ports.entry("p1".into()).or_default().insert("redis:1".into(), 1);
+        assert!(prune_saved(&mut state, &config, "p1"));
+        assert_eq!(state.instances["api"].forwarded_ports, BTreeMap::from([("3000".into(), 3001)]));
+        assert_eq!(state.global_forwarded_ports["p1"], BTreeMap::from([("redis:6379".into(), 6379)]));
+        // Other roots' instances are left alone.
+        assert_eq!(state.instances["elsewhere"].forwarded_ports["3000"], 3000);
+        assert!(!prune_saved(&mut state, &config, "p1"), "idempotent");
+    }
 
     fn status(state: ForwardState, process: Option<&str>, conns: usize) -> ForwardStatus {
         ForwardStatus {
@@ -304,21 +703,22 @@ mod tests {
 
     #[test]
     fn status_to_row_maps_state_strings() {
-        let row = status_to_row(7, &status(ForwardState::Active, Some("node (pid 412)"), 3));
+        let row = status_to_row(7, &status(ForwardState::Active, Some("node (pid 412)"), 3), true);
         assert_eq!(row.id, 7);
         assert_eq!(row.local, "127.0.0.1:3000");
         assert_eq!(row.target, "api:3000");
         assert_eq!(row.process.as_deref(), Some("node (pid 412)"));
         assert_eq!(row.state, "active");
         assert_eq!(row.conns, 3);
+        assert!(row.configured);
 
-        assert_eq!(status_to_row(1, &status(ForwardState::Connecting, None, 0)).state, "connecting");
+        assert_eq!(status_to_row(1, &status(ForwardState::Connecting, None, 0), false).state, "connecting");
         assert_eq!(
-            status_to_row(1, &status(ForwardState::Error("no such host db".into()), None, 0)).state,
+            status_to_row(1, &status(ForwardState::Error("no such host db".into()), None, 0), false).state,
             "error: no such host db"
         );
         // Unknown process → None (rendered as `-` by the table).
-        assert_eq!(status_to_row(1, &status(ForwardState::Connecting, None, 0)).process, None);
+        assert_eq!(status_to_row(1, &status(ForwardState::Connecting, None, 0), false).process, None);
     }
 
     // ---- pure: bind_reason ----
@@ -337,10 +737,10 @@ mod tests {
     /// (a new state string) does.
     #[test]
     fn rows_changed_gate() {
-        let a = vec![status_to_row(1, &status(ForwardState::Connecting, None, 0))];
+        let a = vec![status_to_row(1, &status(ForwardState::Connecting, None, 0), false)];
         let b = a.clone();
         assert_eq!(a, b, "identical rows compare equal (no update sent)");
-        let c = vec![status_to_row(1, &status(ForwardState::Active, None, 0))];
+        let c = vec![status_to_row(1, &status(ForwardState::Active, None, 0), false)];
         assert_ne!(a, c, "a state change makes rows differ (update sent)");
     }
 
