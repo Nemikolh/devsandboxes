@@ -20,12 +20,14 @@ import {
 } from '@lucide/astro';
 import { codeToHtml } from 'shiki';
 import CodeBlock from '../components/CodeBlock.astro';
+import HowItWorks from '../components/HowItWorks.astro';
 import Base from '../layouts/Base.astro';
 import { psTable } from '../lib/home';
 import { VERSION } from '../lib/nav';
 import { searchSection } from '../lib/search';
 import { devsandboxesTheme } from '../lib/shiki-theme';
 import '../styles/home.css';
+import '../styles/how-it-works.css';
 
 // Hero config. Validated with `devsandbox -C <dir> ls` (config dir next to a
 // `web/` folder); keep it valid when editing.
@@ -33,7 +35,7 @@ const heroConfig = `[template.agent]
 caches = ["pnpm"]
 persist-shell-history = true
 
-[services.db]
+[services.postgres]
 image = "postgres:16"
 scope = "global"
 env = { POSTGRES_PASSWORD = "dev" }
@@ -42,7 +44,7 @@ env = { POSTGRES_PASSWORD = "dev" }
 extends = "agent"
 folder = "../web"
 image = "node:22"
-services = ["db"]`;
+services = ["postgres"]`;
 
 const heroConfigHtml = await codeToHtml(heroConfig, { lang: 'toml', theme: devsandboxesTheme });
 
@@ -57,7 +59,7 @@ const runs = [
 const ps = psTable(
   ['NAME', 'IMAGE', 'STATUS'],
   [
-    ['devsandbox-svc-3f9c21ab-db', 'postgres:16', 'Up 3 minutes'],
+    ['devsandbox-svc-3f9c21ab-postgres', 'postgres:16', 'Up 3 minutes'],
     ['devsandbox-web', 'node:22', 'Up 3 minutes'],
     ['devsandbox-web-2', 'node:22', 'Up 2 minutes'],
     ['devsandbox-web-3', 'node:22', 'Up 41 seconds'],
@@ -260,6 +262,7 @@ devsandbox run web`;
           branch. The dashboard lists them all, and opens any of them in VS Code with one key.
         </p>
       </div>
+      <HowItWorks />
     </section>
 
     <section class="overview-section overview-features" id="features" aria-labelledby="features-title">

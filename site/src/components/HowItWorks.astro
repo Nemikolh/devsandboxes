@@ -1,0 +1,485 @@
+---
+/**
+ * The "how it works" stage of the landing page: an architecture diagram
+ * (host, sandboxes with your agents, the shared service, the dashboard, you,
+ * VS Code) next to a mini dashboard modelled on the real TUI (`src/tui/ui.rs`),
+ * plus a lighter stacked diagram for tablet/mobile. Static: the `data-*` hooks
+ * are what the step-3 script drives (selection, tab, VS Code, agent statuses).
+ */
+import {
+  Bot,
+  Code,
+  Container,
+  Database,
+  Files,
+  FolderGit2,
+  GitBranch,
+  LayoutDashboard,
+  Search,
+  SquareTerminal,
+  UserRound,
+} from '@lucide/astro';
+import { VERSION } from '../lib/nav';
+
+type AgentStatus = 'editing' | 'testing' | 'idle' | 'waiting';
+
+interface Instance {
+  name: string;
+  /** Where the instance's files live, relative to the config dir. */
+  folder: string;
+  /** Git branch of a worktree instance; the first instance uses your checkout. */
+  branch?: string;
+  uptime: string;
+  status: AgentStatus;
+  statusLabel: string;
+  unread: number;
+  /** Diagram card x, in the 640 × 560 canvas units. */
+  x: number;
+}
+
+// Repeat instances of one sandbox get `.worktrees/<instance>` on
+// `sandbox/<instance>` (the default branch pattern); the first uses `../web`.
+const instances: Instance[] = [
+  { name: 'web', folder: '../web', uptime: '2h05m', status: 'editing', statusLabel: 'editing', unread: 0, x: 16 },
+  {
+    name: 'web-2',
+    folder: '.worktrees/web-2',
+    branch: 'sandbox/web-2',
+    uptime: '48m',
+    status: 'testing',
+    statusLabel: 'running tests',
+    unread: 0,
+    x: 228,
+  },
+  {
+    name: 'web-3',
+    folder: '.worktrees/web-3',
+    branch: 'sandbox/web-3',
+    uptime: '12m',
+    status: 'idle',
+    statusLabel: 'idle',
+    unread: 1,
+    x: 440,
+  },
+];
+
+/** Initially selected instance (the first row, like the real dashboard). */
+const selected = 'web';
+const unread = instances.reduce((n, i) => n + i.unread, 0);
+const service = 'postgres';
+
+const tabs = [
+  { id: 'instances', label: 'Instances' },
+  { id: 'services', label: 'Services' },
+  { id: 'ports', label: 'Ports' },
+  { id: 'inbox', label: 'Inbox' },
+];
+
+// Canvas geometry (units of the 640 × 560 viewBox); the HTML nodes use the
+// same numbers through `--x/--y/--w/--h`, so connectors meet the node edges.
+const CARD_W = 184;
+const CARD_TOP = 228;
+const CARD_BOTTOM = 400;
+const center = (i: Instance) => i.x + CARD_W / 2;
+
+const dashboardLinks = instances.map((i) => {
+  const cx = center(i);
+  const sx = 320 + Math.sign(cx - 320) * 20;
+  return {
+    sandbox: i.name,
+    d: sx === cx ? `M${cx} 148 V${CARD_TOP}` : `M${sx} 148 C${sx} 196 ${cx} 184 ${cx} ${CARD_TOP}`,
+  };
+});
+const serviceLinks = instances.map((i) => {
+  const cx = center(i);
+  const ex = 320 + Math.sign(cx - 320) * 34;
+  return {
+    sandbox: i.name,
+    d: ex === cx ? `M${cx} ${CARD_BOTTOM} V452` : `M${cx} ${CARD_BOTTOM} C${cx} 436 ${ex} 420 ${ex} 452`,
+  };
+});
+// VS Code sits top-right (bottom edge at y 176); its link lands right of centre.
+const vscodeLinks = instances.map((i) => {
+  const tx = center(i) + 28;
+  return {
+    sandbox: i.name,
+    d: tx === 560 ? `M560 176 V${CARD_TOP}` : `M560 176 C560 206 ${tx} 198 ${tx} ${CARD_TOP}`,
+  };
+});
+
+const title = (i: Instance) => `${i.name} · ${i.branch ?? i.folder} — Dev Container`;
+---
+
+<div class="hiw" data-pagefind-ignore>
+  <p class="visually-hidden">
+    Diagram: on your machine, the devsandbox dashboard is connected to three sandboxes, web, web-2 and web-3. Each is
+    its own container with an agent you run inside it: web uses your checkout in ../web, web-2 and web-3 their own git
+    worktrees on branches sandbox/web-2 and sandbox/web-3. All three share one postgres service. From the dashboard you
+    open any sandbox in VS Code, attached to its container.
+  </p>
+
+  <div class="hiw-stage" data-hiw data-selected={selected} data-tab="instances">
+    <div class="hiw-diagram" aria-hidden="true">
+      <div class="hiw-canvas">
+        <svg class="hiw-links" viewBox="0 0 640 560" fill="none">
+          <path class="hiw-link hiw-link--you" data-connector="you" d="M320 54 V88" pathLength="1" />
+          {
+            dashboardLinks.map((l) => (
+              <path
+                class="hiw-link hiw-link--dashboard"
+                data-connector="dashboard"
+                data-sandbox={l.sandbox}
+                data-active={l.sandbox === selected ? '' : undefined}
+                d={l.d}
+                pathLength="1"
+              />
+            ))
+          }
+          {
+            serviceLinks.map((l) => (
+              <path class="hiw-link hiw-link--service" data-connector="service" data-sandbox={l.sandbox} d={l.d} pathLength="1" />
+            ))
+          }
+          {
+            vscodeLinks.map((l) => (
+              <path class="hiw-link hiw-link--vscode" data-connector="vscode" data-sandbox={l.sandbox} d={l.d} pathLength="1" />
+            ))
+          }
+          {/* Ambient "traffic": one short dash travelling along each link. */}
+          {
+            dashboardLinks.map((l, i) => (
+              <path class="hiw-pulse hiw-pulse--dashboard" style={`--p: ${i}`} d={l.d} pathLength="1" />
+            ))
+          }
+          {
+            serviceLinks.map((l, i) => (
+              <path class="hiw-pulse hiw-pulse--service" style={`--p: ${i}`} d={l.d} pathLength="1" />
+            ))
+          }
+        </svg>
+
+        <div class="hiw-host" style="--x: 0; --y: 36; --w: 640; --h: 524">
+          <div class="hiw-host-label"><span>HOST</span> your machine</div>
+          <div class="hiw-host-runtime">
+            <span class="hiw-runtime-label">RUNTIME</span>
+            <span>docker</span><span>podman</span><span>Apple container</span>
+          </div>
+        </div>
+
+        <div class="hiw-node hiw-you" data-node="you" style="--x: 272; --y: 18; --w: 96; --h: 36">
+          <UserRound aria-hidden="true" /> you
+        </div>
+
+        <div class="hiw-node hiw-dashboard" data-node="dashboard" style="--x: 235; --y: 88; --w: 170; --h: 60">
+          <span class="hiw-node-icon"><LayoutDashboard aria-hidden="true" /></span>
+          <span class="hiw-node-copy">
+            <strong>dashboard</strong>
+            <span>devsandbox · TUI</span>
+          </span>
+        </div>
+
+        {
+          instances.map((i) => (
+            <div
+              class="hiw-sandbox"
+              data-sandbox-node={i.name}
+              data-selected={i.name === selected ? '' : undefined}
+              style={`--x: ${i.x}; --y: ${CARD_TOP}; --w: ${CARD_W}; --h: ${CARD_BOTTOM - CARD_TOP}`}
+            >
+              <div class="sb-head">
+                <span class="sb-icon">
+                  <Container aria-hidden="true" />
+                </span>
+                <span class="sb-name">{i.name}</span>
+                <span class="sb-state">
+                  <i />
+                  running
+                </span>
+              </div>
+              <div class={`sb-tree${i.branch ? ' is-worktree' : ''}`}>
+                {i.branch ? <GitBranch aria-hidden="true" /> : <FolderGit2 aria-hidden="true" />}
+                {i.branch ?? i.folder}
+              </div>
+              <div class="sb-path">{i.branch ? i.folder : 'your checkout'}</div>
+              <div class="sb-agent" data-agent={i.name} data-status={i.status}>
+                <span class="agent-icon">
+                  <Bot aria-hidden="true" />
+                </span>
+                <span class="agent-copy">
+                  <span class="agent-label">your agent</span>
+                  <span class="agent-status">
+                    <i />
+                    <span data-agent-status>{i.statusLabel}</span>
+                  </span>
+                </span>
+              </div>
+            </div>
+          ))
+        }
+
+        <div class="hiw-node hiw-service" data-node="service" style="--x: 236; --y: 452; --w: 168; --h: 46">
+          <span class="hiw-node-icon"><Database aria-hidden="true" /></span>
+          <span class="hiw-node-copy">
+            <strong>{service}</strong>
+            <span>shared service</span>
+          </span>
+        </div>
+
+        <div class="hiw-vscode" data-vscode data-open="false" data-target="web-2" style="--x: 416; --y: 40; --w: 224; --h: 136">
+          <div class="vsc-bar">
+            <Code aria-hidden="true" />
+            {
+              instances.map((i) => (
+                <span class="vsc-title" data-vscode-for={i.name} hidden={i.name !== 'web-2'}>
+                  {title(i)}
+                </span>
+              ))
+            }
+          </div>
+          <div class="vsc-body">
+            <div class="vsc-activity">
+              <Files aria-hidden="true" />
+              <Search aria-hidden="true" />
+              <GitBranch aria-hidden="true" />
+            </div>
+            <div class="vsc-editor">
+              <i style="--w: 46%; --c: #85dce0"></i>
+              <i style="--w: 70%; --c: #b7ea89; --in: 1"></i>
+              <i style="--w: 58%; --c: #c9e0d7; --in: 1"></i>
+              <i style="--w: 34%; --c: #668086; --in: 2"></i>
+              <i style="--w: 62%; --c: #b7ea89; --in: 1"></i>
+              <i style="--w: 20%; --c: #dae8d7"></i>
+            </div>
+          </div>
+          <div class="vsc-status">
+            {
+              instances.map((i) => (
+                <span class="vsc-remote" data-vscode-for={i.name} hidden={i.name !== 'web-2'}>
+                  <span aria-hidden="true">&gt;&lt;</span> Container devsandbox-{i.name}
+                </span>
+              ))
+            }
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="tui-window" data-tui aria-hidden="true">
+      <div class="window-bar">
+        <div class="window-dots"><i></i><i></i><i></i></div>
+        <div class="window-title"><SquareTerminal size={13} /> devsandbox — ~/sandboxes</div>
+        <div class="window-bar-right">tui</div>
+      </div>
+
+      <div class="tui-screen">
+        <div class="tui-tabs">
+          {
+            tabs.map((t) => (
+              <button type="button" tabindex="-1" class="tui-tab" data-tui-tab={t.id} data-active={t.id === 'instances' ? '' : undefined}>
+                {t.label}
+                {t.id === 'inbox' && (
+                  <span class="tui-unread" data-tui-unread hidden={unread === 0}>
+                    {` (${unread})`}
+                  </span>
+                )}
+              </button>
+            ))
+          }
+          <span class="tui-totals">1 sandbox · 3 running / 0 stopped · 1 service container · docker 27.3.1</span>
+        </div>
+
+        <div class="tui-body">
+          <div class="tui-panel" data-tui-panel="instances">
+            <div class="tui-box tui-table">
+              <span class="tui-box-title">Instances</span>
+              <div class="tui-tr tui-th">
+                <span>TREE</span><span>STATUS</span><span>UPTIME</span><span>FOLDER</span>
+              </div>
+              <div class="tui-tr tui-group" data-tui-group="web">
+                <span class="tui-accent">▾ web</span>
+                <span class="tui-green">3/3 running</span>
+                <span></span>
+                <span><span class="tui-source">image node:22</span> <span class="tui-dim">../web</span></span>
+              </div>
+              {
+                instances.map((i) => (
+                  <div class="tui-tr tui-row" data-tui-row={i.name} data-selected={i.name === selected ? '' : undefined}>
+                    <span>
+                      {'  '}
+                      {i.name}
+                      <span class="tui-mail" data-tui-row-unread hidden={i.unread === 0}>
+                        {' '}✉{i.unread}
+                      </span>
+                    </span>
+                    <span class="tui-green">running</span>
+                    <span>{i.uptime}</span>
+                    <span>{i.branch ? `⎇ ${i.folder}` : i.folder}</span>
+                  </div>
+                ))
+              }
+            </div>
+            <div class="tui-box tui-detail">
+              <span class="tui-box-title">Detail</span>
+              {
+                instances.map((i) => (
+                  <div class="tui-kv" data-tui-detail-for={i.name} hidden={i.name !== selected}>
+                    <div><span class="tui-dim">container: </span>devsandbox-{i.name}</div>
+                    <div><span class="tui-dim">workspace: </span>/workspaces/{i.name}</div>
+                    <div><span class="tui-dim">agents: </span><span class="tui-blue">1</span></div>
+                    {i.branch ? (
+                      <div>
+                        <span class="tui-dim">base: </span>../web{'   '}
+                        <span class="tui-dim">worktree: </span>
+                        {i.folder}
+                      </div>
+                    ) : (
+                      <div><span class="tui-dim">base folder: </span>../web</div>
+                    )}
+                  </div>
+                ))
+              }
+            </div>
+          </div>
+
+          <div class="tui-panel" data-tui-panel="services" hidden>
+            <div class="tui-box tui-table">
+              <span class="tui-box-title">Services</span>
+              <div class="tui-tr tui-th tui-tr--services">
+                <span>NAME</span><span>SCOPE</span><span>STATUS</span><span>USED BY</span>
+              </div>
+              <div class="tui-tr tui-row tui-tr--services" data-tui-row={service} data-selected>
+                <span>{service}</span>
+                <span class="tui-blue">global</span>
+                <span class="tui-green">1 running</span>
+                <span>web,web-2,web-3</span>
+              </div>
+            </div>
+            <div class="tui-box tui-detail">
+              <span class="tui-box-title">Detail</span>
+              <div class="tui-kv">
+                <div>devsandbox-svc-3f9c21ab-{service}{'  '}<span class="tui-green">running</span></div>
+                <div><span class="tui-dim">ports: </span>-</div>
+                <div><span class="tui-dim">env: </span>1</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="tui-panel" data-tui-panel="ports" hidden>
+            <div class="tui-box tui-table tui-empty">
+              <span class="tui-box-title">Ports</span>
+              <span class="tui-dim">no forwards — press p on an instance or service, or :port &lt;instance&gt; &lt;port&gt;</span>
+            </div>
+          </div>
+
+          <div class="tui-panel" data-tui-panel="inbox" hidden>
+            <div class="tui-box tui-table">
+              <span class="tui-box-title">Inbox</span>
+              <div class="tui-tr tui-th tui-tr--inbox">
+                <span>TIME</span><span>LEVEL</span><span>INSTANCE</span><span>MESSAGE</span>
+              </div>
+              <div class="tui-tr tui-row tui-tr--inbox" data-tui-row="notify-1" data-selected data-unread>
+                <span class="tui-dim">14:32</span>
+                <span class="tui-dim">info</span>
+                <span>web-3</span>
+                <span>tests pass, ready for review</span>
+              </div>
+            </div>
+            <div class="tui-box tui-detail">
+              <span class="tui-box-title">Detail</span>
+              <div class="tui-kv">
+                <div><span class="tui-dim">14:32</span>{'  '}<span class="tui-dim">info</span>{'  '}web-3</div>
+                <div>tests pass, ready for review</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="tui-help">
+          <span class="tui-hint">
+            <button type="button" tabindex="-1" class="tui-key" data-key="ArrowUp">↑</button><button
+              type="button"
+              tabindex="-1"
+              class="tui-key"
+              data-key="ArrowDown">↓</button
+            > select
+          </span>
+          <span class="tui-hint"><button type="button" tabindex="-1" class="tui-key" data-key="o">o</button> open in VS Code</span>
+          <span class="tui-hint"><button type="button" tabindex="-1" class="tui-key" data-key="t">t</button> terminal</span>
+          <span class="tui-hint"><button type="button" tabindex="-1" class="tui-key" data-key="Tab">tab</button> switch</span>
+          <span class="tui-hint"><button type="button" tabindex="-1" class="tui-key" data-key="?">?</button> help</span>
+        </div>
+      </div>
+
+      <div class="terminal-status">
+        <span><span class="status-indicator"></span> DASHBOARD PREVIEW</span>
+        <span class="tui-hint-slot" data-tui-hint hidden>CLICK TO TRY IT</span>
+        <span>DEVSANDBOX v{VERSION}</span>
+      </div>
+    </div>
+  </div>
+
+  {/* Tablet / mobile: a stacked, CSS-only version of the same picture. */}
+  <div class="hiw-flow" aria-hidden="true">
+    <div class="flow-you"><UserRound /> you</div>
+    <div class="flow-host">
+      <div class="flow-host-label"><span>HOST</span> docker · podman · Apple container</div>
+      <div class="flow-node flow-dashboard">
+        <span class="hiw-node-icon"><LayoutDashboard /></span>
+        <span class="hiw-node-copy"><strong>dashboard</strong><span>devsandbox · TUI</span></span>
+      </div>
+      <ul class="flow-sandboxes">
+        {
+          instances.map((i) => (
+            <li class={i.name === 'web-2' ? 'is-attached' : undefined}>
+              <span class="sb-icon">
+                <Container />
+              </span>
+              <span class="flow-sb-copy">
+                <span class="sb-name">{i.name}</span>
+                <span class={`sb-tree${i.branch ? ' is-worktree' : ''}`}>
+                  {i.branch ? <GitBranch /> : <FolderGit2 />}
+                  {i.branch ?? i.folder}
+                </span>
+              </span>
+              <span class="sb-agent" data-status={i.status}>
+                <Bot />
+                <span class="agent-status">
+                  <i />
+                  {i.statusLabel}
+                </span>
+              </span>
+            </li>
+          ))
+        }
+      </ul>
+      <div class="flow-bottom">
+        <div class="flow-node flow-service">
+          <span class="hiw-node-icon"><Database /></span>
+          <span class="hiw-node-copy"><strong>{service}</strong><span>shared by all three</span></span>
+        </div>
+        <div class="flow-node flow-vscode">
+          <span class="hiw-node-icon"><Code /></span>
+          <span class="hiw-node-copy"><strong>VS Code</strong><span>attached to web-2</span></span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<ol class="hiw-steps">
+  <li>
+    <span class="hiw-step-no">01</span>
+    <h3>Define sandboxes once</h3>
+    <p>A <code>config.toml</code> names the image, your repo folder and the services, like postgres.</p>
+  </li>
+  <li>
+    <span class="hiw-step-no">02</span>
+    <h3>One sandbox per agent</h3>
+    <p>Each <code>devsandbox run</code> starts a container on its own worktree and branch. Start your agent inside it.</p>
+  </li>
+  <li>
+    <span class="hiw-step-no">03</span>
+    <h3>Watch and jump in</h3>
+    <p>The dashboard shows every sandbox and the notifications sent from inside. Press <code>o</code> to open one in VS Code.</p>
+  </li>
+</ol>
