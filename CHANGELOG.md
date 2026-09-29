@@ -63,6 +63,7 @@ devsbd ls; devsbd stop pr-123; devsbd rm pr-123
 ### Fixed
 
 - **`worktree-link` works for several sandboxes on the same folder.** The shared copy used to live in one store per sandbox. The base checkout can only link to one of them, so the second sandbox's worktrees got nothing. The store is now per repo: `shared-files/<folder name>-<hash>/`, shared by every sandbox on that folder. The next `run` or `rebuild` moves files from the old `shared-files/<sandbox>/` stores and relinks the base checkout and worktrees. Instances still running on an old store need a `rebuild`. If two old stores held different copies of a file, the one the base checkout linked to wins, and the other stays where it was with a warning.
+- **ssh-agent forwarding no longer breaks `run` on macOS + docker in builds without the helper** (`cargo install`). The fallback bind-mounted the Mac's launchd agent socket, which can't cross into the runtime VM, so `docker run` failed with `mkdir …/agent/<instance>.sock: file exists`. It now mounts Docker Desktop / OrbStack's `/run/host-services/ssh-auth.sock` instead. Builds that embed the helper were never affected.
 
 ### Security
 

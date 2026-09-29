@@ -13,6 +13,24 @@ use crate::state::{Instance, State};
 /// docs/ssh-agent.md).
 pub(crate) const SSH_AGENT_TARGET: &str = "/run/devsandbox/ssh-agent.sock";
 
+/// Docker Desktop / OrbStack's synthesized agent socket. The Mac's launchd
+/// socket can't cross into the runtime VM, so these runtimes forward the host
+/// agent through this path instead; it exists only inside the VM, never on
+/// the host (docs/ssh-agent.md, _macOS + docker_).
+const MAGIC_SSH_AUTH_SOCK: &str = "/run/host-services/ssh-auth.sock";
+
+/// Whether the agent mount binds [`MAGIC_SSH_AUTH_SOCK`] rather than a
+/// symlink to `$SSH_AUTH_SOCK`: macOS with the `docker` backend. Podman
+/// machine has no magic socket, and a raw host socket bind fails there too, so
+/// only `docker` qualifies. Pure so the rule is testable off a Mac.
+fn magic_socket(macos: bool, backend: &str) -> bool {
+    macos && backend == "docker"
+}
+
+fn host_magic_socket() -> bool {
+    magic_socket(cfg!(target_os = "macos"), backend().name())
+}
+
 /// `<data-dir>/agent`, the dir holding per-instance agent symlinks. `None` when
 /// the state path can't be resolved. One recipe so `run`, `rm`, and `gc` don't
 /// each re-derive it (docs/ssh-agent.md).
@@ -65,8 +83,11 @@ fn symlink(_src: &Path, _dst: &Path) -> std::io::Result<()> {
 /// `-v <link>:<target>` mount to push and the container target to persist, or
 /// `None` when forwarding is off. Gate (all silent on miss — an absent agent
 /// is the common case): the runtime binds files, `$SSH_AUTH_SOCK` is set, and
-/// its socket exists on the host. On a link error, warn and skip: forwarding
-/// is best-effort and must not fail container creation (docs/ssh-agent.md).
+/// its socket exists on the host. On macOS + docker the source is the magic
+/// socket instead, bound directly: it isn't on the host so the existence probe
+/// can't apply, and its path is stable so there's no link to re-point. On a
+/// link error, warn and skip: forwarding is best-effort and must not fail
+/// container creation (docs/ssh-agent.md).
 pub(super) fn ssh_agent_forward(instance_id: &str) -> Result<Option<(String, String)>> {
     if !cfg!(unix) || !backend().supports_file_binds() {
         return Ok(None);
@@ -74,6 +95,12 @@ pub(super) fn ssh_agent_forward(instance_id: &str) -> Result<Option<(String, Str
     let Some(sock) = std::env::var_os("SSH_AUTH_SOCK") else {
         return Ok(None);
     };
+    if host_magic_socket() {
+        return Ok(Some((
+            format!("{MAGIC_SSH_AUTH_SOCK}:{SSH_AGENT_TARGET}"),
+            SSH_AGENT_TARGET.to_string(),
+        )));
+    }
     let sock = PathBuf::from(sock);
     if std::fs::metadata(&sock).is_err() {
         return Ok(None);
@@ -95,13 +122,14 @@ pub(super) fn ssh_agent_forward(instance_id: &str) -> Result<Option<(String, Str
 /// container starts, so a restart after agent rotation (reboot, re-login)
 /// re-captures the live socket — bind sources re-resolve at every container
 /// start (docs/ssh-agent.md). Gate mirrors `ssh_agent_forward`: forwarding was
-/// on for this instance, `$SSH_AUTH_SOCK` is set, and its socket exists.
+/// on for this instance, `$SSH_AUTH_SOCK` is set, and its socket exists. A
+/// no-op on macOS + docker, whose magic-socket mount has no link.
 /// Fully silent — every gate miss and error is a no-op (the link stays as-is
 /// and forwarding is degraded for this run only): callers include the TUI
 /// background thread that owns the alternate screen, where a stray warning
 /// would corrupt the display, so screen safety wins over a lost warning.
 pub(crate) fn ssh_agent_refresh(info: &Instance) {
-    if !cfg!(unix) || info.ssh_auth_sock.is_none() {
+    if !cfg!(unix) || info.ssh_auth_sock.is_none() || host_magic_socket() {
         return;
     }
     let Some(sock) = std::env::var_os("SSH_AUTH_SOCK") else {
@@ -139,6 +167,14 @@ mod tests {
         assert_eq!(std::fs::read_link(&link).unwrap(), second);
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn magic_socket_only_on_macos_docker() {
+        assert!(magic_socket(true, "docker"));
+        assert!(!magic_socket(true, "podman"));
+        assert!(!magic_socket(true, "container"));
+        assert!(!magic_socket(false, "docker"));
     }
 
     #[test]

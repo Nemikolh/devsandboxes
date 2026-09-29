@@ -150,17 +150,22 @@ Only `start` needs this; `run` creates the link fresh (Step 1) and `rebuild` goe
   config; it must not enter the drift hash or every login would look like
   drift.
 
-## macOS + docker (Step, later)
+## macOS + docker
 
 The Mac host's real `$SSH_AUTH_SOCK` is a launchd socket under `/private/tmp/com.apple.launchd.*/Listeners` that **cannot** cross into the runtime's VM — sockets don't transmit across the hypervisor boundary. Docker Desktop and OrbStack work around this by synthesizing a **magic socket** the host filesystem doesn't actually contain: mount `/run/host-services/ssh-auth.sock` and set `SSH_AUTH_SOCK` to that same path, and the host agent is forwarded.
 
-Implication for the split above: only the **mount source** in Step 1 changes — macOS+docker binds the literal `/run/host-services/ssh-auth.sock` directly, with **no symlink**: the magic path is stable by construction, so there is nothing to rotate and Step 4 is a no-op on this runtime. The fixed container target and the Step 3 `exec -e` injection are unchanged. Detection: `cfg!(target_os = "macos")` && backend is docker.
+Implication for the split above: only the **mount source** in Step 1 changes — macOS+docker binds the literal `/run/host-services/ssh-auth.sock` directly, with **no symlink**: the magic path is stable by construction, so there is nothing to rotate and Step 4 is a no-op on this runtime. The fixed container target and the Step 3 `exec -e` injection are unchanged. Detection: `cfg!(target_os = "macos")` && backend is docker (`magic_socket`, `src/commands/run/ssh_agent.rs`). Podman machine has no magic socket, so macOS + podman gets no forwarding without the helper (the raw launchd socket can't cross the VM there either).
 
-Extra wrinkles to handle when this lands:
+Wrinkles:
 
 - The magic path does **not** exist on the host, so the Step 1
-  "socket exists" probe can't gate it. Mount unconditionally on macOS+docker
-  (or gate some other way).
+  "socket exists" probe can't gate it. The gate is `$SSH_AUTH_SOCK` being
+  set (launchd always sets it; unset means the user turned the agent off).
+
+- Assumes the `docker` context is Docker Desktop or OrbStack. Other VM-based
+  docker hosts on a Mac (e.g. Colima) don't provide the magic path, so the
+  mount forwards nothing there. Use a build with the embedded helper, which
+  never mounts.
 
 - It forwards whichever agent was in the environment when the runtime launched;
   no per-container control.
