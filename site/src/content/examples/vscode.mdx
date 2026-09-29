@@ -1,6 +1,6 @@
 ---
 title: Attach VS Code
-description: Open any instance in VS Code with one key, as the right user, with your extensions installed and the window named after the instance.
+description: Open any instance in VS Code with one key.
 order: 7
 icon: code
 tags: [editors, devcontainers]
@@ -8,75 +8,57 @@ related: [parallel-agents, port-a-devcontainer, features]
 ---
 
 import AgentPrompt from '../../components/AgentPrompt.astro';
-import Callout from '../../components/Callout.astro';
+import AgentPromptLink from '../../components/AgentPromptLink.astro';
 
 ## The problem
 
-An agent works in instance `web-3` and you want to read its diff, step through a test or poke at the running app in your editor. With several instances of one repo open, the windows all look alike, and an editor that attaches as the wrong user hits permission errors on the first save.
+An agent works in instance `fix-login` and you want to read its diff, step through a test or poke at the running app in your editor. With several instances of one repo open, the windows all look alike, and an editor that attaches as the wrong user hits permission errors on the first save.
 
-devsandbox wires VS Code's **Dev Containers** attach for you: one command (or `o` in the dashboard) opens a window attached to the instance's container, as the sandbox's `remoteUser`, with the sandbox's extensions, on a workspace named after the instance.
+`devsandbox vscode` (or `o` in the dashboard) opens a window attached to the instance's container, as the sandbox's `remoteUser`, with the sandbox's extensions, titled after the instance.
+
+<AgentPromptLink />
 
 ## Config
 
 ```toml title="config.toml"
-[template.base]
-customizations.vscode.extensions = ["editorconfig.editorconfig", "eamodio.gitlens"]
-
 [sandbox.web]
-extends = "base"
 folder = "../web"
-image = "mcr.microsoft.com/devcontainers/typescript-node:22"
-remoteUser = "node"                # VS Code attaches as this user too
-folders = { "/workspaces/design-system" = "../design-system" }
-postCreateCommand = "npm install"
-# Concatenated after the template's: all four get installed.
+image = "node:22"
+# Installed in the container on attach.
 customizations.vscode.extensions = ["dbaeumer.vscode-eslint", "esbenp.prettier-vscode"]
 ```
 
-`folders` adds `../design-system` (relative to the config dir) as a second root of the VS Code workspace, mounted at `/workspaces/design-system`. Drop it if one repo is all you need.
-
 ## Try it
 
-You need VS Code with the **Dev Containers** extension (`ms-vscode-remote.remote-containers`) and `code` on your `PATH`.
+You need VS Code with the **Dev Containers** extension and `code` on your `PATH`.
 
 ```bash
-devsandbox run web
-devsandbox vscode web        # opening VS Code → web
-devsandbox run web           # web-2, on its own worktree
-devsandbox vscode web-2      # a second window, titled web-2
+devsandbox run web --name fix-login     # your checkout, ../web
+devsandbox run web --name add-search    # its own worktree
+devsandbox vscode fix-login             # a window titled fix-login
+devsandbox vscode add-search            # a second one, titled add-search
 ```
 
-From the dashboard, select an instance and press `o`, or type `:code web-2`. Either way `code` is launched detached and the dashboard keeps running.
+- `--name`: the instance name.
 
-The window opens the workspace file `/workspaces/<instance>.code-workspace` inside the container: `workspaceFolder` first, then every `folders` root. VS Code titles the window after that file, which is how worktree instances stay tellable apart.
+In the dashboard, select an instance and press `o`, or type `:code add-search`.
 
 ## How it works
 
-- **Attach, not build.** VS Code doesn't create anything: devsandbox already made the container, and `code` is launched with a `vscode-remote://attached-container+<hex of the container name>/…` URI that opens it directly.
-- **User and extensions.** For attached containers VS Code reads a per-container config from the Dev Containers extension's storage. devsandbox writes it at `run` and again on every attach, with [`remoteUser`](/docs/config#implemented-devcontainer-properties) and the merged `customizations.vscode.extensions`, for every installed VS Code, Cursor and VSCodium, so the editor attaches as `node` here and installs the four extensions in the container.
-- **Extensions concatenate.** Arrays merge by concatenation under `extends`, so a template's extensions stay when a sandbox adds its own ([templates and `extends`](/docs/config#templates-and-extends)); the resolved list is visible in the dashboard's config explorer.
-- **The workspace file.** `run` writes `/workspaces/<instance>.code-workspace` and rewrites it whenever the instance is reused, so older instances pick up new `folders`. Instances created before the file existed open their folder instead.
-- **Worktrees and children.** Every instance attaches the same way, including worktree instances and a dispatcher's children like `web-pr-123` ([babysit pull requests](/examples/babysit-pr)).
-- **Settings aren't applied.** `customizations.vscode.settings` and every other `customizations.vscode.*` key besides `extensions` are accepted but ignored, with a warning at `run` ([accepted but ignored](/docs/config#accepted-but-ignored-warned-at-run)). Keep editor settings in the repo's `.vscode/settings.json`: a tracked one is in every worktree, a gitignored one can be copied into them with `worktree-include`.
-
-<Callout variant="warning" title="Apple container: experimental">
-  On Apple `container` the attach goes through the Dev Containers extension's experimental support: set
-  `dev.containers.experimentalAppleContainerSupport` to `true` in VS Code first (the status line reminds you). The
-  per-container config is ignored there, so extensions are written into the workspace file as recommendations and VS
-  Code offers to install them. Native Windows is untested.
-</Callout>
+- VS Code attaches to the container devsandbox already made, as [`remoteUser`](/docs/config#implemented-devcontainer-properties) if set.
+- The window opens `/workspaces/<instance>.code-workspace`, which is what names it.
+- `customizations.vscode.settings` is ignored ([accepted but ignored](/docs/config#accepted-but-ignored-warned-at-run)): keep settings in the repo's `.vscode/settings.json`.
+- Apple `container` is experimental: set `dev.containers.experimentalAppleContainerSupport` to `true` in VS Code first.
 
 ## Agent instructions
 
 <AgentPrompt
   goal="Set up my devsandbox sandbox <sandbox name> so I can attach VS Code to its instances with my extensions: <extension ids>."
   steps={[
-    'In `[sandbox.<sandbox name>]` (or the template it extends, if every sandbox should get them), add the extension ids to `customizations.vscode.extensions`. Arrays concatenate under `extends`, so do not repeat ids a template already lists.',
-    'Set `remoteUser` to the user the image is meant to be used as (for example `node` or `vscode` on the devcontainers images) if it is not set, so VS Code can write the files it opens. Ask me before changing an existing `remoteUser`.',
+    'Add the extension ids to `customizations.vscode.extensions` in `[sandbox.<sandbox name>]`, or in the template it extends if every sandbox should get them. Arrays concatenate under `extends`: do not repeat ids a template already lists.',
     'Do not put editor settings in `customizations.vscode.settings`: devsandbox ignores them. Suggest a `.vscode/settings.json` in the repo instead.',
   ]}
   verify={[
-    'Ask me before recreating anything: the new extensions apply on the next attach, but a changed `remoteUser` needs `devsandbox -C <config dir> rebuild <instance>`.',
-    'Tell me to run `devsandbox -C <config dir> vscode <instance>` (or press `o` on the instance in the dashboard); it needs `code` on PATH and the Dev Containers extension. Do not launch the editor yourself.',
+    'Tell me to run `devsandbox -C <config dir> vscode <instance>` (or press `o` on it in the dashboard); it needs `code` on PATH and the Dev Containers extension. Do not launch the editor yourself.',
   ]}
 />

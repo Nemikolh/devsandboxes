@@ -1,6 +1,6 @@
 ---
 title: Port forwarding on demand
-description: Reach a dev server or a service inside a running instance from your host browser or tools, without publishing ports at create time or restarting anything.
+description: Open a sandbox's dev server or database from your host, without restarting anything.
 order: 6
 icon: plug
 tags: [networking, services]
@@ -8,98 +8,68 @@ related: [isolated-services, shared-postgres, vscode]
 ---
 
 import AgentPrompt from '../../components/AgentPrompt.astro';
-import Callout from '../../components/Callout.astro';
+import AgentPromptLink from '../../components/AgentPromptLink.astro';
 
 ## The problem
 
-Your agent started a dev server on port 3000 inside instance `api`, and you want to look at it in your browser. Or you want `psql` on your host against that instance's private Postgres. Publishing ports with `-p` has to happen when the container is created, collides as soon as a second instance wants the same port, and can't reach a server that only listens on `127.0.0.1` inside the container.
+An agent started a dev server on port 3000 inside instance `api` and you want it in your browser, or `psql` on your host against that instance's Postgres. Publishing ports with `-p` has to happen at create time, collides as soon as a second instance wants the same port, and can't reach a server listening on the container's `127.0.0.1`.
 
-`devsandbox port` forwards a port **on demand**, VS Code *Ports* tab style: pick an instance or a service, pick a port, and it is on `localhost` until you stop it. No `-p`, no restart, on docker, podman and Apple `container`.
+`devsandbox port` forwards a port **on demand**, like VS Code's _Ports_ tab: it is on `localhost` until you stop it.
+
+<AgentPromptLink />
 
 ## Config
 
-Nothing to add: forwarding needs no config. This is an ordinary sandbox with one isolated and one global service to forward to:
+Forwarding needs no config; any sandbox works. This one has a service to forward to as well:
 
 ```toml title="config.toml"
-[services.postgres]                # isolated: one per instance
+[services.postgres]                 # one per instance, no `ports` needed
 image = "postgres:16"
 env = { POSTGRES_PASSWORD = "postgres" }
 
-[services.redis]                   # global: one for the whole config root
-image = "redis:7"
-scope = "global"
-
 [sandbox.api]
 folder = "../api"
-image = "mcr.microsoft.com/devcontainers/base:ubuntu"
-services = ["postgres", "redis"]
+image = "node:22"
+services = ["postgres"]
 postCreateCommand = "npm install"
-[sandbox.api.containerEnv]
-DATABASE_URL = "postgres://postgres:postgres@postgres/postgres"
-REDIS_URL = "redis://redis:6379"
-[sandbox.api.features]
-"ghcr.io/devcontainers/features/node:1" = "lts"
 ```
-
-The services publish no `ports`; they don't need to. `forwardPorts` from devcontainer.json is accepted but ignored ([accepted but ignored](/docs/config#accepted-but-ignored-warned-at-run)): forwards are started by you, not by the config.
 
 ## Try it
 
-Start an instance and a dev server in it (a terminal of its own, or the dashboard's integrated terminal):
-
 ```bash
 devsandbox run api
-devsandbox exec -it api zsh        # then, inside: npm run dev -- --port 3000
+devsandbox exec -it api bash       # inside: npm run dev -- --port 3000
 ```
 
-In another terminal on the host, forward it. The command runs in the foreground and prints one line per forward:
+In another host terminal (runs until Ctrl-C):
 
 ```bash
-devsandbox port api 3000
-# 127.0.0.1:3000 -> api:3000
-# forwarding; press Ctrl-C to stop
-```
-
-Open `http://localhost:3000`. Once the listening process is known the line is printed again with it, e.g. `[node (pid 412)]` (when the image has `lsof`). More forms:
-
-```bash
+devsandbox port api 3000                        # http://localhost:3000
 devsandbox port api 8080:3000                   # host :8080 -> api's :3000
-devsandbox port api 3000 5173                   # several ports, one command
 devsandbox port api --service postgres 5432     # api's own postgres
-devsandbox port --service redis 6379            # a global service: no instance needed
-devsandbox port api 3000 --address 0.0.0.0      # reachable from your LAN, not just loopback
 ```
 
-`<name>` is an instance, a sandbox or a folder basename, as everywhere in the CLI. Ctrl-C stops every forward of that command.
+- `--service`: forward a service's port instead of the instance's.
+- `--address`: the host address to bind (default `127.0.0.1`).
 
-### From the dashboard
-
-Run `devsandbox` with no arguments and use the **Ports** tab (`3`). Press `p` on an instance or a service to open the `port` prompt prefilled with it, type the port, `enter`. The tab lists each forward's local address, target, listening process, state and open connections; `d` stops the selected one. Dashboard forwards end when you quit it.
+From the dashboard: `p` on an instance or service, type the port; live forwards are on the **Ports** tab (`3`). To have the dashboard forward a port whenever the instance runs, add `forwardPorts = [3000]` to the sandbox ([`forwardPorts`](/docs/config#implemented-devcontainer-properties)).
 
 ## How it works
 
-- **Tunnelled through the helper.** Every instance runs the in-container helper `devsbd`. The host binds a local listener and carries each connection over a flow-controlled stream of an `exec`'d bridge into the container, where the helper dials the target. That is why a server bound to the container's `127.0.0.1` is reachable, and why nothing has to be published at create time.
-- **Instance route.** `devsandbox port api 3000` dials `127.0.0.1:3000` inside `api`'s container.
-- **Service route.** With `--service`, the tunnel goes into a running instance that references the service and dials `<service>:<port>` over their shared network, so nothing is injected into the service image. An isolated service goes through the instance you name; a global one through that instance if it references it, otherwise any running instance of the config root that does. With no usable instance, devsandbox injects the helper into the service container itself, which needs `/bin/sh`, root `exec` and a writable `/run` (distroless images fail with a one-line reason). See [services](/docs/config#services-servicesname).
-- **Self-healing.** The route is re-resolved on every reconnect, so a `devsandbox service rebuild` or an instance restart heals the forward without restarting it.
-- **Binding.** The default address is `127.0.0.1`; `--address 0.0.0.0` exposes the port beyond loopback. A bare `<port>` binds the same port on the host and falls back to a free one when it's taken (the line says `(3000 was in use)`); an explicit `<host>:<port>` fails instead.
-- **Owned by one process.** A forward lives as long as the `port` command or the dashboard that created them. The CLI's forwards and the dashboard's don't see each other, and nothing is recorded in state.
-
-<Callout variant="warning" title="Unix hosts only, TCP only">
-  Forwarding runs on Linux and macOS hosts. Native Windows isn't supported yet: run the Linux build inside WSL2. UDP
-  isn't forwarded.
-</Callout>
+- Each connection is tunnelled through the in-container helper, so a server on the container's `127.0.0.1` is reachable and nothing is published.
+- `--service` goes through a running instance that uses the service ([services](/docs/config#services-servicesname)).
+- A bare port taken on the host falls back to the next free one; the printed line says which.
+- Unix hosts, TCP only.
 
 ## Agent instructions
 
 <AgentPrompt
   goal="Let me reach port <container port> of my devsandbox instance <instance> (or of its service <service>) from my host, on demand."
   steps={[
-    'Do not add `ports`, `forwardPorts` or `-p` style mounts to config.toml: devsandbox forwards on demand and needs no config change. Only check that <instance> exists and is running (`devsandbox -C <config dir> ps`).',
-    'Confirm something listens on the port inside the container, e.g. `devsandbox -C <config dir> exec <instance> sh -c "ss -ltn || netstat -ltn"`; if nothing does, tell me instead of starting a server yourself.',
+    'Do not add `ports` or `-p` to config.toml. Check that <instance> is running (`devsandbox -C <config dir> ps`) and that something listens on the port inside it; if nothing does, tell me.',
   ]}
   verify={[
-    'Run the forward in the background of your own shell: `devsandbox -C <config dir> port <instance> <container port>` for the instance, or `devsandbox -C <config dir> port <instance> --service <service> <container port>` for a service. It runs until Ctrl-C and prints `127.0.0.1:<port> -> <target>`; the host port can differ if mine was taken.',
-    'Check it with `curl -sI http://127.0.0.1:<host port>` (or the matching client), report the mapping line to me, and stop the forward when I say so. Never pass `--address 0.0.0.0` unless I ask for it.',
+    'Run `devsandbox -C <config dir> port <instance> <container port>` (add `--service <service>` for a service) in the background; it prints `127.0.0.1:<host port> -> <target>`.',
+    'Check it with `curl -sI http://127.0.0.1:<host port>` (or the matching client), report the mapping line, and never pass `--address 0.0.0.0` unless I ask.',
   ]}
 />
