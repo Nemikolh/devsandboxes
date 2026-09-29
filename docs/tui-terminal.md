@@ -56,7 +56,52 @@ which is why F12 is an alias rather than the only binding, and why direct
 
 Mouse:
 - Click on the terminal body → focus it. Click on a tab title → activate it.
-- Wheel over the terminal body → vt100 scrollback (any new output snaps back).
+- Wheel over the terminal body, routed like xterm:
+  - the child enabled mouse tracking (`?1000h` and friends: zidane, vim
+    `mouse=a`, htop) → a wheel report (button 64/65 plus modifiers) at the
+    pane-relative cell, in the child's encoding (SGR, X10 or UTF-8);
+  - the child is on the alternate screen without mouse tracking (less, man)
+    → 3 ↑/↓ per notch, honoring DECCKM, because the alternate screen has
+    no scrollback;
+  - otherwise (a shell on the main screen, or an exited session) → vt100
+    scrollback.
+  Clicks and drags are never forwarded: left click stays "focus terminal".
+
+### Keyboard: kitty protocol
+
+Legacy key encoding conflates chords (ctrl+m and Enter are both `\r`,
+ctrl+i is Tab, ctrl+[ is Esc), so apps like zidane bind them through the
+[kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/).
+For that to work through the dashboard, both hops must speak it:
+
+- **Outer terminal → devsandbox** (`src/tui/mod.rs`): at startup crossterm's
+  `supports_keyboard_enhancement()` sends `CSI ? u` followed by DA1. If the
+  terminal answers the first, devsandbox pushes `DISAMBIGUATE_ESCAPE_CODES`
+  after entering the alternate screen (kitty keeps one stack per screen)
+  and pops it on every exit path: quit, error, panic hook, and around
+  suspended prompt commands. Only that flag: event types would add
+  release/repeat events the dashboard filters anyway.
+- **devsandbox → inner app** (`src/tui/kitty.rs`): vt100 ignores the
+  protocol, so `KittyState` rides along as the parser's `Callbacks` and
+  handles the `CSI > / < / = / ? … u` sequences vt100 passes to
+  `unhandled_csi`. It keeps one flag stack per screen, masks flags to the
+  disambiguate bit, and queues `CSI ? flags u` replies, which the reader
+  thread writes back to the PTY after each chunk. It also answers XTVERSION
+  (`CSI > 0 q` → `DCS > | devsandbox(<version>) ST`): OpenTUI apps such as
+  zidane ignore the `? u` reply unless a terminal identified itself first. The alternate screen's
+  stack is dropped whenever the child is back on the main screen, so an app
+  that exits (or crashes) without popping can't leave the shell in kitty
+  mode. Keys go through `kitty::encode_key` (Esc, and ctrl/alt/super chords
+  of text keys, become `CSI code;mods u`; modified Enter/Tab/Backspace too)
+  and fall back to the legacy `term::encode_key` otherwise.
+
+When the outer terminal doesn't support the protocol, the emulation stays
+off: queries go unanswered and pushes are ignored, so inner apps see what
+they'd see from a legacy terminal. Supported: kitty, Alacritty ≥ 0.13,
+Ghostty, WezTerm, foot, iTerm2 ≥ 3.5. GNOME Terminal (VTE) implements
+neither kitty nor modifyOtherKeys, so ctrl+m reaches devsandbox as `\r` and
+no layer can recover it; the same goes for tmux, which doesn't answer the
+query.
 
 ### Focus visibility
 
@@ -69,9 +114,11 @@ Mouse:
 
 ### Lifecycle
 
-- Shell: `sh -lc 'command -v bash >/dev/null 2>&1 && exec bash -l; exec sh -l'`
-  (bash when present, POSIX sh fallback — service images are often minimal).
-  `-e TERM=xterm-256color`. Instances reuse the exact `exec` argv the CLI
+- Shell: `SHELL_FALLBACK_CMD` probes zsh, then bash, then POSIX `sh`, all as
+  login shells (service images are often minimal). `TERM=xterm-256color` is
+  set on the runtime client only; `exec` doesn't forward it, so the
+  container shell gets the runtime's default (`xterm` on docker) unless the
+  image or `remoteEnv` sets one. Instances reuse the exact `exec` argv the CLI
   builds (workspace, remoteUser, remoteEnv); services get a plain
   `exec -it <container>`.
 - Child exit (shell `exit`, container stop) → tab marked `(exited)`, screen

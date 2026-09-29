@@ -70,6 +70,8 @@ git worktrees so working trees are never shared.
   derive from `SPECS`, so a new flag is one table entry);
   `term.rs` holds the integrated terminal's PTY sessions + tab strip
   (`TermSession`/`TermTabs`, `docker exec -it` shell rendered via vt100);
+  `kitty.rs` emulates the kitty keyboard protocol for those sessions (vt100
+  callbacks + key encoding; see `docs/tui-terminal.md`);
   `forwards.rs` is the Ports-tab worker thread that owns every live `Forward`
   (route resolution + docker work off the UI thread), modelled on `BridgeWorker`;
   it also reconciles sandboxes' `forwardPorts` against the running instances
