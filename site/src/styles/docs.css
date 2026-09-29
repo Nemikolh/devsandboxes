@@ -200,6 +200,25 @@
   padding-top: 25px;
 }
 
+/* Provenance line under generated pages (config reference). */
+.prose .article-source {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  margin: 48px 0 0;
+  font: 11px var(--font-mono);
+  letter-spacing: 0.04em;
+  color: var(--text-subtle);
+}
+
+.prose .article-source a {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+}
+
 /* ----------------------------------------------------------------- Prose */
 
 .prose {
@@ -412,9 +431,22 @@
   color: #dbe7e4;
 }
 
+/* The key column shrinks to its (unbreakable) content; auto layout would
+   otherwise hand it space by max-content share, starving the prose column. */
+.prose :is(th, td):first-child:not(:only-child) {
+  width: 1%;
+}
+
 /* Keys, flags and field names in the first column shouldn't break mid-token. */
 .prose td:first-child code {
   white-space: nowrap;
+}
+
+/* `anywhere` lets code shrink a column to one character wide (type columns
+   like `{ spawn = [string], … }` wrapped per token); `break-word` only breaks
+   when a token can't fit, so columns size to their words. */
+.prose td code {
+  overflow-wrap: break-word;
 }
 
 /* ------------------------------------------------------------------- TOC */
@@ -560,5 +592,11 @@
     position: static;
     margin-right: 9px;
     opacity: 1;
+  }
+
+  /* Three-plus columns squeezed into a phone make the prose column a few
+     words wide and the table thousands of pixels tall; scroll instead. */
+  .prose table:has(th:nth-child(3)) {
+    min-width: 600px;
   }
 }

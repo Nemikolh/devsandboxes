@@ -14,4 +14,14 @@ const docs = defineCollection({
   }),
 });
 
-export const collections = { docs };
+// The config reference: the agent skill *is* the spec, so the site renders it
+// as-is (`pages/docs/config.astro`) instead of keeping a second copy.
+const spec = defineCollection({
+  loader: glob({ base: '../skills/config-toml-spec', pattern: 'SKILL.md' }),
+  schema: z.object({
+    name: z.string(),
+    description: z.string(),
+  }),
+});
+
+export const collections = { docs, spec };

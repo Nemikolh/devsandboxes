@@ -26,7 +26,8 @@ export function headingAnchors(): HastPluginEntry {
         visit(node, ctx) {
           const text = ctx.textContent(node);
           const existing = node.properties?.id;
-          const slug = typeof existing === 'string' ? existing : slugger.slug(text);
+          // Leading punctuation (`${…} variables`) would slug to `-variables`.
+          const slug = typeof existing === 'string' ? existing : slugger.slug(text.replace(/^[^\p{L}\p{N}]+/u, ''));
           if (typeof existing !== 'string') ctx.setProperty(node, 'id', slug);
           if (!ANCHORED.has(node.tagName)) return;
           ctx.prependChild(node, {
@@ -39,6 +40,27 @@ export function headingAnchors(): HastPluginEntry {
             },
             children: [],
           });
+        },
+      },
+    };
+  };
+}
+
+/**
+ * Sätteri hast plugin: drop the H1 of agent skills (`SKILL.md`) rendered as
+ * pages. Their H1 is the skill's own title; the page layout owns the real one,
+ * and a second H1 would also land in the TOC data. Must run before
+ * `headingAnchors` so slug dedupe matches Astro's pass over the final tree.
+ */
+export function dropSkillTitle(): HastPluginEntry {
+  return ({ fileURL }) => {
+    if (!fileURL?.pathname.endsWith('/SKILL.md')) return null;
+    return {
+      name: 'devsandboxes:drop-skill-title',
+      element: {
+        filter: ['h1'],
+        visit(node, ctx) {
+          ctx.removeNode(node);
         },
       },
     };

@@ -6,7 +6,7 @@ import sitemap from '@astrojs/sitemap';
 import { defineConfig } from 'astro/config';
 import { packageVersion } from './src/lib/cargo.ts';
 import { codeChrome } from './src/lib/code-chrome.ts';
-import { headingAnchors, tableScroll } from './src/lib/heading-anchors.ts';
+import { dropSkillTitle, headingAnchors, tableScroll } from './src/lib/heading-anchors.ts';
 import { devsandboxesTheme } from './src/lib/shiki-theme.ts';
 
 // Resolved from this file, not the cwd, so `astro build --root site` works too.
@@ -16,7 +16,7 @@ export default defineConfig({
   site: 'https://devsandboxes.com',
   integrations: [mdx(), sitemap()],
   markdown: {
-    processor: satteri({ hastPlugins: [headingAnchors(), tableScroll()] }),
+    processor: satteri({ hastPlugins: [dropSkillTitle(), headingAnchors(), tableScroll()] }),
     shikiConfig: {
       theme: devsandboxesTheme,
       transformers: [codeChrome()],
