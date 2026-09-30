@@ -104,6 +104,12 @@
   border: 0;
 }
 
+/* An `h2` brings its own top margin; a page opening on prose needs one too, or
+   the text sits against the divider. */
+.prose > :first-child:not(h2) {
+  margin-top: 36px;
+}
+
 .article-bottom {
   border-top: 1px solid #334043;
   margin-top: 67px;
