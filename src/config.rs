@@ -947,7 +947,29 @@ fn sandbox_hash(table: &Table) -> String {
     table.remove("autostart");
     table.remove("dispatcher");
     table.remove("forwardPorts");
+    if let Some(toml::Value::Table(folders)) = table.get_mut("folders") {
+        normalize_folders(folders);
+    }
     config_hash(&table)
+}
+
+/// Rewrite `folders` table entries that only restate the default
+/// (`{ path = "x" }`, `{ path = "x", worktree = "auto" }`) to the plain string
+/// `"x"`, so spelling an entry either way isn't drift. `always`/`never` stay
+/// tables: they change the mount, applied on the next `rebuild`.
+fn normalize_folders(folders: &mut Table) {
+    for (_, entry) in folders.iter_mut() {
+        let toml::Value::Table(t) = entry else { continue };
+        let Some(toml::Value::String(path)) = t.get("path") else { continue };
+        let default_mode = match t.get("worktree") {
+            None => true,
+            Some(toml::Value::String(mode)) => mode == "auto",
+            Some(_) => false,
+        };
+        if default_mode && t.len() == 1 + usize::from(t.contains_key("worktree")) {
+            *entry = toml::Value::String(path.clone());
+        }
+    }
 }
 
 /// Deep merge: nested tables merge recursively, arrays concatenate
@@ -1082,7 +1104,13 @@ folders = { "/workspaces/docs" = "../docs", "/workspaces/lib" = { path = "../lib
             .unwrap()
             .config_hash
         };
-        assert_ne!(hash(r#""../lib""#), hash(r#"{ path = "../lib", worktree = "never" }"#));
+        let plain = hash(r#""../lib""#);
+        assert_ne!(plain, hash(r#"{ path = "../lib", worktree = "never" }"#));
+        assert_ne!(plain, hash(r#"{ path = "../lib", worktree = "always" }"#));
+        // Restating the default in table form is not drift.
+        assert_eq!(plain, hash(r#"{ path = "../lib" }"#));
+        assert_eq!(plain, hash(r#"{ path = "../lib", worktree = "auto" }"#));
+        assert_ne!(plain, hash(r#"{ path = "../other" }"#));
     }
 
     #[test]

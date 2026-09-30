@@ -124,7 +124,7 @@ Sandboxes reach a service by its name as hostname (network alias, or `/etc/hosts
 
 ## Drift
 
-Each container is labelled with `config_hash` (hash of the merged sandbox table, or the service table) and `build_hash` (hash of the dockerfile *contents*). Any change to the merged config — including via a template — marks existing instances as drifted (`devsandbox rebuild <instance>`), except `autostart` and `dispatcher`, which are stripped before hashing. Build context and feature contents are not hashed.
+Each container is labelled with `config_hash` (hash of the merged sandbox table, or the service table) and `build_hash` (hash of the dockerfile *contents*). Any change to the merged config — including via a template — marks existing instances as drifted (`devsandbox rebuild <instance>`), except `autostart`, `dispatcher` and `forwardPorts`, which are stripped before hashing. A `folders` table that only restates the default (`{ path = "x" }`, `worktree = "auto"`) hashes like the plain string `"x"`; `"always"`/`"never"` count as drift. Build context and feature contents are not hashed.
 
 ## Checking a config
 
