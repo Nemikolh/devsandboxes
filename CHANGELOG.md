@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-Sandboxes can now start themselves after a reboot and run unattended **dispatcher** scripts that create, drive and clean up their own child instances. Messages from inside containers show up in the dashboard and as desktop notifications. See `docs/automations-guide.md`.
+Sandboxes can now start themselves after a reboot and run unattended **dispatcher** scripts that create, drive and clean up their own child instances. Messages from inside containers show up in the dashboard and as desktop notifications. See `docs/automations-guide.md`. `run --json`, a command-less `exec` and exact-name matching make devsandbox easier to drive from scripts and other programs, and the docs now live at [devsandboxes.com](https://devsandboxes.com).
 
 ### Added
 
@@ -58,6 +58,7 @@ forwardPorts = [3000, "8080:3000", "db:5432"]
 - **`exec <name>` without a command** opens a login shell (zsh, else bash, else sh), the same one the dashboard's terminal opens. With neither `-i` nor `-t` given it runs with `-i`, plus `-t` when stdin is a TTY, so it works as is from a terminal or a pty (node-pty); explicit flags are used as given.
 - **npm: `execArgv(name, cmd?, { tty, interactive })`** returns `{ file, args }` for spawning `devsandbox exec` yourself (node-pty, `child_process.spawn`) without shell quoting.
 - **`rm --delete-branch` / `rm --keep-branch`** answer the "delete branch?" question without prompting, so scripts and other callers without a TTY can clean up the branch `run` created. `--delete-branch` deletes it like answering yes (`git branch -D`, so unmerged commits go too); `--keep-branch` keeps it. Branches `run` reused rather than created are always kept. With neither flag, `rm` still asks on a TTY and keeps the branch otherwise. npm: `rm(name, { deleteBranch })`, where `true` / `false` pass `--delete-branch` / `--keep-branch`.
+- **Docs site at [devsandboxes.com](https://devsandboxes.com)**: a quick start, a playable tour of the dashboard, the full `config.toml` reference, the Node API reference, ten worked examples (parallel coding agents, shared and per-instance services, package caches, ssh-agent and `git push`, babysitting pull requests, porting a `devcontainer.json`, …), full-text search (⌘K / Ctrl+K) and this changelog.
 
 ### Changed
 
@@ -85,6 +86,8 @@ forwardPorts = [3000, "8080:3000", "db:5432"]
 - **Forwarded ports reach servers listening only on IPv6 loopback.** Dev servers told `localhost` (webpack-dev-server, Vite, Node 17+) often bind only `[::1]`, while forwards dialed `127.0.0.1`, so every connection was refused. A loopback dial now also tries the other family (`127.0.0.1` ↔ `::1`). Running instances pick up the new helper when restarted.
 - **`worktree-link` works for several sandboxes on the same folder.** The shared copy used to live in one store per sandbox. The base checkout can only link to one of them, so the second sandbox's worktrees got nothing. The store is now per repo: `shared-files/<folder name>-<hash>/`, shared by every sandbox on that folder. The next `run` or `rebuild` moves files from the old `shared-files/<sandbox>/` stores and relinks the base checkout and worktrees. Instances still running on an old store need a `rebuild`. If two old stores held different copies of a file, the one the base checkout linked to wins, and the other stays where it was with a warning.
 - **ssh-agent forwarding no longer breaks `run` on macOS + docker in builds without the helper** (`cargo install`). The fallback bind-mounted the Mac's launchd agent socket, which can't cross into the runtime VM, so `docker run` failed with `mkdir …/agent/<instance>.sock: file exists`. It now mounts Docker Desktop / OrbStack's `/run/host-services/ssh-auth.sock` instead. Builds that embed the helper were never affected.
+- **`devsandbox port` and the Ports tab work on macOS.** Accepted connections inherited non-blocking mode from the listener there, so every relay read failed with `os error 35` and no forwarded connection got through.
+- **0.4.0 never reached crates.io** (the publish step failed on the release archives in the checkout); `cargo install devsandbox` goes straight from 0.3.4 to this release.
 
 ### Security
 
@@ -102,6 +105,53 @@ forwardPorts = [3000, "8080:3000", "db:5432"]
 
 <details><summary>Commits</summary>
 
+- c0af00e feat(site): add a changelog page rendered from CHANGELOG.md
+- d70eb16 fix(npm): keep execArgv names from parsing as flags, correct exec/run docs
+- d5e0884 fix(rm): refuse a dirty worktree before tearing anything down, add branch flags
+- 623710f feat(cli): make run, exec and name resolution usable from programs
+- 88a16b9 docs(site): add a dashboard tour page that walks through each feature beside a sticky, playable mini dashboard, so readers learn the tui before installing it
+- e3d2b28 feat(site): fake the command prompt, port forwards, logs, config explorer and run/stop in the mini dashboard, so the docs can teach every key hands-on
+- ef295b7 docs(tui): document kitty keyboard pass-through and wheel routing for integrated terminals
+- 47a6a19 docs(tui): correct the pty TERM comment, docker exec does not forward it into the container
+- ba99a4f fix(tui): answer xtversion in integrated terminals, since opentui apps like zidane ignore the kitty flags reply until the terminal identifies itself
+- 52d9194 fix(tui): send the mouse wheel to integrated-terminal apps that track the mouse or use the alternate screen, which has no scrollback to scroll
+- fb9e02d feat(tui): send kitty-encoded keys to integrated-terminal apps that enabled the protocol, so ctrl+m no longer arrives as enter
+- 95c6236 feat(tui): emulate the kitty keyboard protocol's flag stacks and queries in the integrated terminal, so apps inside can opt into it
+- 0ac6963 refactor(site): extract the mini dashboard into a mountable component, so the docs can host a second one driven from outside
+- dd3ad31 feat(tui): enable the kitty keyboard protocol on terminals that support it, so chords like ctrl+m can reach apps in the integrated terminal
+- 721b5ab feat(site): make t open a terminal in the landing mini dashboard, split and tabbed like the real one, so the preview shows the feature it advertises
+- 7ff786f fix(site): tighten the examples that need no setup and make the pr babysitter readable at a glance
+- b126a11 docs(site): trim the pr babysitter example to the new example shape and give its loop a codex variant, so it works with the reader's agent
+- f5cb4c1 docs(site): trim the features and devcontainer porting examples to the new example shape, keeping the porting reference tables readers come for
+- a1ee4f4 docs(site): trim the port forwarding and vs code examples to the new example shape, and stop calling forwardPorts ignored now the dashboard honours it
+- c0d24e9 docs(site): trim the caches and ssh push examples to the new example shape, with the agent picked by the reader on the push one
+- 2b6c5ae docs(site): trim the shared and isolated services examples to the new example shape, with the agent picked by the reader on the isolated one
+- 06fb312 feat(site): let readers pick their coding agent once and trim the parallel agents example, so examples read short and match the agent they use
+- 0e41f55 feat(site): animate the how-it-works section and make the mini dashboard playable, so pressing o shows vs code attaching to a sandbox
+- ab6d22b feat(site): how-it-works section with a host/sandboxes/agents diagram next to a mini dashboard, so visitors see how the tool is used
+- 59e5404 feat(site): position the landing page as devcontainers for ai agents and drop the devcontainer comparison the audience doesn't need
+- b0b5a9b fix: add github icon to link
+- edda15a ci(site): move pages deploy into a dispatchable workflow that release calls, so docs-only changes can ship between releases
+- 9e23dc4 ci(site): build the docs site on every pr and deploy it to pages on release, so the docs always match what users can install
+- 83bd81b fix(site): load sidebar nav styles on every page, so the mobile drawer outside /docs has no bullets or stray chevrons
+- 5c0961c docs(config): escape the pipes that truncated the dispatcher row and name the real service/gc commands
+- 9400e75 feat(site): 404, og image, one reading order with prev/next and edit links, a link check in the build, and a warning-free build
+- 874d74b feat(site): pagefind full-text search behind a ⌘k dialog, so any field, flag or example is one keystroke away
+- 6dd530f feat(site): remaining examples, port forwarding, vscode, features, the pr babysit dispatcher and porting a devcontainer.json
+- f140d5f feat(site): examples section with one recipe per use case and a copyable agent prompt, starting with worktrees, services, caches and ssh
+- 2fc8c4b feat(site): node api reference generated from the npm package's index.d.ts, so the docs follow the published typings
+- d127052 feat(site): config reference rendered from the config-toml-spec skill, so the site and the agent skill never drift
+- ce29397 feat(site): quick start page, from install to a second worktree instance and the dashboard
+- fc10522 feat(site): landing page that pitches devsandboxes as devcontainers multiplied, with a hero that mirrors real run/ps output
+- 7454a57 feat(site): scaffold the astro docs site with the prototype's design system, so docs pages can be written against a real shell
+- cd577ab feat(port): forward sandboxes' forwardPorts from the tui, keeping each instance's host ports in state so they stay the same across restarts
+- 70553ce feat(services): give a bare service port the same host port when it's free, instead of letting the runtime pick a random one
+- 043c1de fix(port): clear o_nonblock on accepted sockets, since macos inherits it from the listener and every relay read failed with os error 35
+- a0061d2 fix(port): try the other loopback family when dialing, so dev servers bound only on ::1 (node's localhost) are reachable
+- 44f357a fix(ssh-agent): mount docker's magic agent socket on macos, since the launchd socket can't cross into the vm and failed docker run
+- 5607ad3 fix(worktree): keep worktree-link files in one store per repo, so several sandboxes on the same folder all get the shared files
+- fb94fab feat(dispatch): ensure --env replaces a child's saved env and every exec applies it, so new values take effect without a rebuild
+- 37fc704 docs(changelog): list the step 13-15 commits
 - 9d7efc8 feat(dispatch): devsbd run rm and run prune, so dispatchers can clear runs instead of letting them pile up
 - 2608a23 fix(autostart): never start or create dispatcher children at boot, so idle children the dispatcher parked stay stopped
 - 54193b6 feat(run): keep --env values in state so rebuilds, including a dispatcher recreating a child, don't drop them
@@ -129,6 +179,7 @@ forwardPorts = [3000, "8080:3000", "db:5432"]
 - 9075dec feat(autostart): bring autostart sandboxes up once per boot from the tui or the first run/start, so automations survive a reboot
 - 74ff407 docs(automations): step plan, with triggers, per-root boot ids and runtime-mode poststart settled
 - 6bb660e docs(automations): design for autostarted sandboxes, notify and dispatcher-driven child instances
+- 0442d37 fix(ci): download release archives outside the checkout so cargo publish sees a clean tree
 
 </details>
 
