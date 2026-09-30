@@ -1,84 +1,30 @@
-# devsandbox
+<p align="center">
+  <a href="https://devsandboxes.com">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset=".github/assets/logo-dark.svg">
+      <img src=".github/assets/logo-light.svg" alt="devsandboxes" width="420">
+    </picture>
+  </a>
+</p>
 
-A Rust CLI + terminal dashboard that manages devcontainer-based sandboxes directly on top of a container runtime (docker, podman, or Apple `container`) — no devcontainer CLI, no daemon. One `config.toml` defines templates, sandboxes, and shared services; devsandbox derives the containers, networks, mounts, and VS Code wiring from it.
+<h3 align="center">Let agents loose. Safely.</h3>
 
-Built for running multiple coding-agent sandboxes against the same repositories: instances are cheap, isolated, discoverable, and safe to throw away.
+<p align="center">
+  Every coding agent gets its own container and git worktree of your repo.<br>
+  Watch them all from one dashboard, on docker, podman or Apple container.
+</p>
 
-- **devcontainer.json semantics in TOML**, plus `extends` deep-merge over reusable templates.
-- **Concurrent instances of one repo**: each extra instance gets its own git worktree.
-- **Shared caches and services** (e.g. one postgres per project or per instance).
-- **No daemon**: the runtime is the source of truth; everything is named `devsandbox-*`.
-
-How it works (config reference, state, runtimes, layout): [`docs/high-level-architecture.md`](docs/high-level-architecture.md).
-
-## Installation
-
-The binary name is `devsandbox`.
-
-If you're on **Node**, install from npm:
-
-```
-$ npm i -g devsandboxes
-$ npx devsandboxes --help
-```
-
-Grab a precompiled binary from the [latest release](https://github.com/Nemikolh/devsandboxes/releases) and put it on your `PATH`.
-
-**Linux** (x86_64 / aarch64, static):
-
-```
-$ curl -L https://github.com/Nemikolh/devsandboxes/releases/download/v0.5.0/devsandbox-0.5.0-$(uname -m)-unknown-linux-musl.tar.gz | tar xz
-```
-
-**macOS** (Apple silicon):
-
-```
-$ curl -L https://github.com/Nemikolh/devsandboxes/releases/download/v0.5.0/devsandbox-0.5.0-aarch64-apple-darwin.tar.gz | tar xz
-```
-
-**Windows** (x86_64, PowerShell):
-
-```
-> Invoke-WebRequest https://github.com/Nemikolh/devsandboxes/releases/download/v0.5.0/devsandbox-0.5.0-x86_64-pc-windows-msvc.zip -OutFile devsandbox.zip
-> Expand-Archive devsandbox.zip .
-```
-
-If you're a **Rust** user, you can install from crates.io. That build lacks the in-container helper, which limits ssh-agent forwarding (see [Platform support](#platform-support)):
-
-```
-$ cargo install devsandbox
-```
-
-## Quick start
-
-Create a `config.toml` (or just run `devsandbox run` — on a TTY it offers to generate an example):
-
-```toml
-[services.database]
-image = "postgres:16"
-scope = "global"            # one container shared by all instances; default is "isolated"
-
-[template.base]
-caches = ["pnpm"]
-persist-shell-history = true
-[template.base.features]
-"ghcr.io/devcontainers/features/node:1" = { version = "lts" }
-
-[sandbox.web]
-extends = "base"
-folder = "../web"           # host repo, mounted as the workspace
-services = ["database"]
-image = "mcr.microsoft.com/devcontainers/base:ubuntu"
-postCreateCommand = "pnpm install"
-```
+<p align="center">
+  <a href="https://devsandboxes.com/docs/quick-start"><img src="https://img.shields.io/badge/Get_started-devsandboxes.com-a9f36d?style=for-the-badge&labelColor=112014" alt="Get started at devsandboxes.com"></a>
+  <a href="https://devsandboxes.com/examples"><img src="https://img.shields.io/badge/Examples-browse-91e6e8?style=for-the-badge&labelColor=112014" alt="Examples"></a>
+  <a href="https://www.npmjs.com/package/devsandboxes"><img src="https://img.shields.io/npm/v/devsandboxes?style=for-the-badge&labelColor=112014&color=a9f36d" alt="npm version"></a>
+</p>
 
 ```bash
-devsandbox run web          # start an instance in the background
-devsandbox exec web         # login shell; name = instance, sandbox, or folder basename
-devsandbox                  # no args on a TTY: interactive dashboard
+npm i -g devsandboxes   # or a binary: https://devsandboxes.com/docs/quick-start#install
+devsandbox run web      # a sandbox from your config.toml
+devsandbox              # the dashboard
 ```
-
-`-C <dir>` points any command at a different config root.
 
 ## CLI
 
