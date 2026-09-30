@@ -114,7 +114,8 @@ query.
 
 ### Lifecycle
 
-- Shell: `SHELL_FALLBACK_CMD` probes zsh, then bash, then POSIX `sh`, all as
+- Shell: `SHELL_FALLBACK_CMD` (`commands/exec.rs`, shared with a command-less
+  `devsandbox exec <name>`) probes zsh, then bash, then POSIX `sh`, all as
   login shells (service images are often minimal). `TERM=xterm-256color` is
   set on the runtime client only; `exec` doesn't forward it, so the
   container shell gets the runtime's default (`xterm` on docker) unless the

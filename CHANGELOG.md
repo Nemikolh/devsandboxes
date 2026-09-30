@@ -54,6 +54,10 @@ services = ["db"]
 forwardPorts = [3000, "8080:3000", "db:5432"]
 ```
 
+- **`run --json`**: prints one `{"schema": 1, "data": {...}}` document for the new instance (`name`, `instance_id`, `sandbox`, `container`, `workspace`, `folder`, `base_folder`, `worktree`, `branch`; the last two `null` without a worktree). Everything child processes print (image builds, `docker run`, git, lifecycle hooks, autostart) goes to stderr, so stdout parses as-is for programmatic and GUI callers.
+- **`exec <name>` without a command** opens a login shell (zsh, else bash, else sh), the same one the dashboard's terminal opens. With neither `-i` nor `-t` given it runs with `-i`, plus `-t` when stdin is a TTY, so it works as is from a terminal or a pty (node-pty); explicit flags are used as given.
+- **npm: `execArgv(name, cmd?, { tty, interactive })`** returns `{ file, args }` for spawning `devsandbox exec` yourself (node-pty, `child_process.spawn`) without shell quoting.
+
 ### Changed
 
 - **Worktrees reuse existing branches.** `run --branch X`, and a dispatcher's `devsbd ensure --branch X`, no longer fail when `X` exists:
@@ -69,6 +73,8 @@ forwardPorts = [3000, "8080:3000", "db:5432"]
 - **`rebuild` applies `worktree-include`.** Before, adding a pattern marked instances as drifted, but the rebuild copied nothing. Now `rebuild` copies any missing matching files into the worktree; existing files are never overwritten. A copied file you delete on purpose comes back on the next rebuild, so drop the pattern instead.
 - `devsandbox port 3000` (and the Ports tab) moves to 3001, 3002, … when 3000 is taken on the host, instead of a random port.
 - A service `ports` entry that gives only the container port (`"5432"`) now gets the same port on the host when it's free, instead of a random one. If the port is taken, the runtime still picks one.
+- **An exact instance name wins.** With instances `web` and `web-2`, `devsandbox exec web` (and `rm`, `stop`, `logs`, …) now means the instance `web` instead of an ambiguity that failed off a TTY and prompted on one, including inside a pty. An exact instance id counts too; sandbox and folder names only apply when nothing matches exactly. `exec` now uses the same resolution as the other verbs, so it also accepts an instance's id after a rename.
+- **npm (breaking): `run()` resolves with the new instance's record** (`RunRecord`) instead of its name; use `(await run(...)).name` for the old value. It calls `run --json`, so build and autostart output can no longer end up as the "name".
 
 ### Fixed
 

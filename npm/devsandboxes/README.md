@@ -17,13 +17,19 @@ npx devsandboxes exec -it web zsh
 ## Node API
 
 ```ts
+import { spawn } from 'node:child_process';
 import * as devsandbox from 'devsandboxes';
 
-const name = await devsandbox.run('web', { dir: './sandboxes', stderr: 'inherit' });
+const { name, worktree } = await devsandbox.run('web', { dir: './sandboxes', stderr: 'inherit' });
 const { instances } = await devsandbox.status({ dir: './sandboxes' });
 for (const i of instances) console.log(i.name, i.status.state, i.drift);
 
 const { exitCode, stdout } = await devsandbox.exec(name, ['git', 'status']);
+
+// Your own process or pty (node-pty takes the same file/args): a login shell.
+const { file, args } = devsandbox.execArgv(name, [], { interactive: true, tty: true });
+spawn(file, args, { stdio: 'inherit' });
+
 await devsandbox.rm(name);
 ```
 
@@ -33,14 +39,15 @@ await devsandbox.rm(name);
 | `ls()` / `ps({ all })` / `stats()`         | `SandboxRow[]` / `ContainerRow[]` / `StatsRow[]` |
 | `service.ls()`                             | `ServiceRow[]`                       |
 | `inspect(name)`                            | runtime inspect document (`unknown`) |
-| `run(sandbox, { name, branch, base })`     | instance name                        |
+| `run(sandbox, { name, branch, base })`     | `RunRecord` (name, container, workspace, folder, worktree, branch) |
 | `start` / `stop` / `rebuild(name \| { all: true })` | `void`                      |
 | `rm(name)` / `rename(a, b)` / `gc()` / `service.rebuild(name)` | `void`          |
 | `logs(name, { lines })`                    | log text                             |
 | `exec(name, argv, { input })`              | `{ exitCode, stdout, stderr }` (never rejects on exit code) |
+| `execArgv(name, argv?, { tty, interactive })` | `{ file, args }` to spawn yourself (sync; no argv: login shell) |
 | `cli(args)`                                | raw `{ exitCode, stdout, stderr }`   |
 
-Every function takes `{ dir, cwd, env, signal, stderr }`. `dir` is the config root (`-C`). A failed command rejects with `DevsandboxError` (`exitCode`, `stdout`, `stderr`).
+Every function takes `{ dir, cwd, env, signal, stderr }`, except the synchronous `binaryPath()` and `execArgv()`. `dir` is the config root (`-C`). A failed command rejects with `DevsandboxError` (`exitCode`, `stdout`, `stderr`).
 
 ## Platforms
 

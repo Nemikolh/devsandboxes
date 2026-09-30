@@ -8,10 +8,14 @@ git worktrees so working trees are never shared.
 ## Module map
 
 - `src/main.rs` — clap CLI; no subcommand on a TTY opens the TUI dashboard.
+  `src/json_stdout.rs` points stdout at stderr for `run --json` so child
+  output can't corrupt the one JSON document.
 - `src/commands/*.rs` — one file per verb (`run`, `start`, `stop`, `rebuild`,
   `rm`, `ps`, `ls`, `exec`, `logs`, `inspect`, `stats`, `port`, `services::{gc,ls,rebuild}`). Shared name
-  resolution in `commands/mod.rs` (`resolve_instance`: instance | sandbox |
-  folder basename). `port.rs` resolves a forward route (instance | service via a
+  resolution in `commands/mod.rs` (`resolve_instance`: exact instance name/id
+  first, then sandbox | folder basename). `exec.rs` also owns
+  `SHELL_FALLBACK_CMD`, the login shell a command-less `exec` and the TUI
+  terminal open. `port.rs` resolves a forward route (instance | service via a
   running instance | injection fallback) and hosts the foreground `port` CLI.
   `run/` is split by concern: `mod.rs` (`run`/`materialize`, naming,
   `run_container`), `worktree.rs`, `git.rs` (`host_git`: the only way the

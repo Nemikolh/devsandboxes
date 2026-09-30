@@ -92,6 +92,34 @@ plain-passthrough flags don't need new tests beyond compilation.
 envelope, schema-versioning promise, the exec/PTY non-goal, and the parked
 raw-metrics idea. Keep it short; the schema is the Rust types.
 
+## Later: `run --json` and exec for pty consumers
+
+Programmatic and GUI consumers create instances and then attach their own
+PTY, so two gaps closed after the read verbs:
+
+- `run --json` prints `{"schema":1,"data":RunRecord}` (`src/commands/run/mod.rs`):
+
+  ```json
+  {"schema": 1, "data": {
+    "name": "web-2", "instance_id": "web-2", "sandbox": "web",
+    "container": "devsandbox-web-2", "workspace": "/workspaces/repo",
+    "folder": "/cfg/.worktrees/web-2", "base_folder": "/home/u/repo",
+    "worktree": "/cfg/.worktrees/web-2", "branch": "sandbox/web-2"
+  }}
+  ```
+
+  Names follow `InstanceRow`, except `worktree` is the host path (or `null`),
+  not a flag. Plain `run` printed the name as its last stdout line, but
+  `docker run -d`, image builds, git and lifecycle hooks write to the same
+  stdout; with `--json` the process's stdout is pointed at stderr before any
+  work (`src/json_stdout.rs`: `dup2` on unix, `SetStdHandle` on Windows), so
+  every inherited child stream moves too and only the document reaches stdout.
+  A failure prints nothing on stdout and exits non-zero.
+- The exec/PTY non-goal stands (no JSON for a terminal), but spawning one got
+  easier: `exec <name>` with no command opens the login shell the dashboard
+  uses (`SHELL_FALLBACK_CMD`), defaulting to `-i` plus `-t` when stdin is a TTY (explicit flags win),
+  and the npm package's `execArgv()` returns `{file, args}` to spawn directly.
+
 ## Commit per step (conventional commits, lowercase)
 
 1. `refactor(snapshot): extract snapshot collection from tui`

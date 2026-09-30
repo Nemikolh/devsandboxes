@@ -77,24 +77,33 @@ customizations.vscode.extensions = ["dbaeumer.vscode-eslint"]
 
 ## Commands (most to least useful for an agent)
 
-`<name>` accepts an **instance name**, a **sandbox config name**, or a **repository folder basename**. Ambiguity errors
-on a non-TTY (prompts on a TTY). Most commands are non-interactive-safe; anything needing a choice bails with the options
+`<name>` accepts an **instance name**, a **sandbox config name**, or a **repository folder basename**. An exact
+instance name (or instance id) always wins: with instances `web` and `web-2`, `web` is the instance `web`. Only when
+nothing matches exactly do sandbox/folder names count, and ambiguity there errors on a non-TTY (prompts on a TTY). Most commands are non-interactive-safe; anything needing a choice bails with the options
 listed when stdin is not a TTY.
 
-1. **`exec [-i] [-t] <name> <cmd…>`** — run a command inside the instance. Runs in
+1. **`exec [-i] [-t] <name> [cmd…]`** — run a command inside the instance. Runs in
    the workspace dir and honors the recorded `remoteEnv` / `remoteUser`. Exits
    with the command's own status. This is the agent's main way to do work inside a
-   sandbox. `--` is not needed (`allow_hyphen_values`), but `-i`/`-t` are
-   devsandbox flags and must precede `<name>`. Non-interactive commands need
-   neither `-i` nor `-t`; use `-it` only for a shell.
+   sandbox. `--` is only needed when the command's first word is `-i` or `-t`
+   (those are devsandbox flags, anywhere before the command). Non-interactive
+   commands need neither `-i` nor `-t`.
+
+   Without `cmd` it opens a login shell (zsh, else bash, else sh). With neither
+   flag given that shell gets `-i`, plus `-t` when stdin is a TTY; any explicit
+   flag is used as given instead.
 
    ```bash
    devsandbox exec web pnpm test
-   devsandbox exec -it web zsh
+   devsandbox exec web          # interactive login shell on a TTY
    ```
 
 2. **`run [sandbox] [--name <n>]`** — create/start an instance in the **background**.
-   Prints only the instance name to stdout (warnings go to stderr) — capture it.
+   Prints the instance name as its last stdout line, but child output (image
+   builds, `docker run`, git, hooks) may precede it. **`--json`** sends all of
+   that to stderr and prints only
+   `{"schema":1,"data":{"name","instance_id","sandbox","container","workspace","folder","base_folder","worktree","branch"}}`
+   (`worktree`/`branch` are `null` without a worktree) — prefer it when scripting.
    On a non-TTY the sandbox arg is **required** (it lists available names on
    error). Behavior worth knowing:
 

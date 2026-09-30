@@ -95,8 +95,10 @@ pub fn autostart(dir: &Path) {
             Action::Run(sandbox) => {
                 println!("autostart: creating an instance of {sandbox}");
                 let extras = Default::default();
-                if let Err(e) = run::run(dir, Some(sandbox.clone()), None, None, None, extras) {
-                    eprintln!("warning: autostart: cannot run `{sandbox}`: {e:#}");
+                match run::run(dir, Some(sandbox.clone()), None, None, None, extras) {
+                    Ok(Some(key)) => println!("{key}"),
+                    Ok(None) => {}
+                    Err(e) => eprintln!("warning: autostart: cannot run `{sandbox}`: {e:#}"),
                 }
             }
             Action::SkipMissing(key) => {

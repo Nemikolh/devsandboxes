@@ -478,6 +478,7 @@ fn run_suspended(terminal: &mut Term, dir: &Path, action: PromptAction) -> Resul
                 base.clone(),
                 Default::default(),
             )
+            .map(|key| key.into_iter().for_each(|key| println!("{key}")))
         }
         PromptAction::Exec { instance, argv } => {
             commands::exec::exec_status(instance, true, true, argv).map(|_| ())

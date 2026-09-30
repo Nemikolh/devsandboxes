@@ -78,6 +78,29 @@ export interface Snapshot {
   error: string | null;
 }
 
+/**
+ * The instance `run()` just created (`run --json`). Fields match
+ * {@link InstanceRow} where they overlap, except `worktree`, which is the path.
+ */
+export interface RunRecord {
+  /** Instance name; what every `name` argument accepts. */
+  name: string;
+  /** Persistent id; differs from `name` after a rename. */
+  instance_id: string;
+  sandbox: string;
+  container: string;
+  /** Workspace folder inside the container. */
+  workspace: string;
+  /** Host folder mounted as the workspace (the worktree for a worktree instance). */
+  folder: string;
+  /** Host base repo folder the instance derives from. */
+  base_folder: string;
+  /** Host worktree path; `null` when the instance runs on `base_folder`. */
+  worktree: string | null;
+  /** Worktree branch; `null` without a worktree. */
+  branch: string | null;
+}
+
 /** One container from the runtime listing (`ps()`). */
 export interface ContainerRow {
   name: string;
@@ -166,8 +189,8 @@ export interface RunOptions extends CommonOptions {
   /** Start point for the worktree branch, e.g. `origin/develop`. */
   base?: string;
 }
-/** Create and start an instance of `sandbox`; resolves with the instance name. */
-export declare function run(sandbox: string, opts?: RunOptions): Promise<string>;
+/** Create and start an instance of `sandbox`; resolves with where it lives. */
+export declare function run(sandbox: string, opts?: RunOptions): Promise<RunRecord>;
 export declare function start(target: Target, opts?: CommonOptions): Promise<void>;
 export declare function stop(target: Target, opts?: CommonOptions): Promise<void>;
 /** Recreate from current config when drifted (`force`: even without drift). */
@@ -190,6 +213,27 @@ export interface ExecOptions extends CommonOptions {
  * rejecting on non-zero.
  */
 export declare function exec(name: string, command: readonly string[], opts?: ExecOptions): Promise<CliResult>;
+
+export interface ExecArgvOptions {
+  /** Pass `-t` (allocate a pseudo-TTY). */
+  tty?: boolean;
+  /** Pass `-i` (keep stdin open). */
+  interactive?: boolean;
+}
+/** A spawnable `devsandbox exec` invocation: `spawn(file, args)`, no shell quoting. */
+export interface ExecInvocation {
+  /** The native binary, as `binaryPath()` returns it. */
+  file: string;
+  args: string[];
+}
+/**
+ * Argv for running `cmd` in an instance under your own process or pty
+ * (node-pty, `child_process.spawn`). Without `cmd`, a login shell (zsh, bash,
+ * or sh). With neither flag set the CLI picks: `-i`, plus `-t` when its stdin
+ * is a TTY (as under a pty); setting either passes exactly what you set, so
+ * set both for an interactive shell.
+ */
+export declare function execArgv(name: string, cmd?: readonly string[], opts?: ExecArgvOptions): ExecInvocation;
 
 export declare const service: {
   ls(opts?: CommonOptions): Promise<ServiceRow[]>;

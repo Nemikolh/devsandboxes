@@ -175,9 +175,13 @@ The read verbs emit JSON for scripts and external UIs:
   exit code stays `0`.
 - `ps`, `ls`, `service ls`, and `stats` return the same rows as their tables.
 - `inspect --json` returns the runtime's own document, with no envelope.
+- `run --json` returns the new instance (`RunRecord` in
+  `src/commands/run/mod.rs`: name, id, container, workspace, host folder,
+  worktree, branch). Stdout is redirected to stderr for the whole command
+  (`src/json_stdout.rs`), so build/hook/git output can't corrupt the document.
 
 Everything except `inspect` is wrapped as `{ "schema": 1, "data": … }`, and `schema` is bumped on breaking changes (`SCHEMA` in
-`src/commands/status.rs`). Field contract: the serialized types in `src/snapshot.rs`. See `docs/json-output.md`.
+`src/commands/status.rs`). Field contract: the serialized types in `src/snapshot.rs` (and `RunRecord`). See `docs/json-output.md`.
 
 ## State
 

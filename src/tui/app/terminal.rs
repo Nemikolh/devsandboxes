@@ -7,7 +7,8 @@ use ratatui::layout::Rect;
 use crate::runtime::{backend, NAME_PREFIX};
 use crate::tui::data::ContainerStatus;
 use crate::tui::kitty;
-use crate::tui::term::{encode_key, encode_wheel, TermSession, SHELL_FALLBACK_CMD};
+use crate::commands::exec::SHELL_FALLBACK_CMD;
+use crate::tui::term::{encode_key, encode_wheel, TermSession};
 
 use super::view::point_in;
 use super::{App, Focus, Tab};

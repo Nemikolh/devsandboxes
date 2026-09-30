@@ -51,6 +51,10 @@ pub struct RunExtras {
     pub dispatcher: Option<String>,
 }
 
+/// Create and start an instance; returns its name (state key), or `None` when
+/// there was nothing to run and an example config was written instead.
+/// Printing is the caller's: plain `run` prints the name, `run --json` a
+/// [`RunRecord`], autostart and the dashboard their own lines.
 pub fn run(
     dir: &Path,
     sandbox_name: Option<String>,
@@ -58,7 +62,7 @@ pub fn run(
     branch_override: Option<String>,
     base_override: Option<String>,
     extras: RunExtras,
-) -> Result<()> {
+) -> Result<Option<String>> {
     // The dispatcher boundary (`commands::dispatch`) checks this too; `run`'s
     // hidden flags are callable directly, so check again before any work.
     if extras.dispatcher.is_some()
@@ -73,7 +77,7 @@ pub fn run(
     }
     let config = match Config::load(dir) {
         Ok(config) if !config.sandboxes.is_empty() => config,
-        _ => return offer_example_config(dir),
+        _ => return offer_example_config(dir).map(|()| None),
     };
 
     let sandbox_name = match sandbox_name {
@@ -196,8 +200,62 @@ pub fn run(
         &mut state,
     )?;
 
-    println!("{instance}");
-    Ok(())
+    Ok(Some(instance))
+}
+
+/// `run --json` payload: where the new instance lives, so a programmatic
+/// caller can exec into it or open its folder without a follow-up `status`.
+/// Field names and meanings match [`crate::snapshot::InstanceRow`] where they
+/// overlap, except `worktree`, which is the path here (not a flag): a caller
+/// that just created the instance needs to know where it is. Runtime-derived
+/// fields (status, cpu, drift) are left to `status --json`.
+#[derive(Debug, serde::Serialize)]
+pub struct RunRecord {
+    /// Instance name (state key); what every `<name>` argument accepts.
+    pub name: String,
+    /// Persistent id (`Instance::instance_id`).
+    pub instance_id: String,
+    pub sandbox: String,
+    pub container: String,
+    /// Workspace folder inside the container.
+    pub workspace: String,
+    /// Host folder mounted as the workspace (the worktree for a worktree instance).
+    pub folder: String,
+    /// Host base repo folder the instance derives from.
+    pub base_folder: String,
+    /// Host worktree path, `None` when the instance runs on `base_folder`.
+    pub worktree: Option<String>,
+    /// Worktree branch, `None` without a worktree.
+    pub branch: Option<String>,
+}
+
+impl RunRecord {
+    pub fn new(name: &str, info: &Instance) -> Self {
+        let path = |p: &Path| p.display().to_string();
+        RunRecord {
+            name: name.to_string(),
+            instance_id: info.instance_id.clone(),
+            sandbox: info.sandbox.clone(),
+            container: info.container.clone(),
+            workspace: info.workspace.clone(),
+            folder: path(&info.folder),
+            base_folder: path(&info.base_folder),
+            worktree: info.worktree.as_deref().map(path),
+            branch: info.branch.clone(),
+        }
+    }
+}
+
+/// The enveloped `run --json` document for instance `key`, read back from
+/// state (what `run` just recorded).
+pub fn run_record_json(key: &str) -> Result<String> {
+    let state = State::load()?;
+    let info = state
+        .instances
+        .get(key)
+        .with_context(|| format!("instance `{key}` missing from state after run"))?;
+    serde_json::to_string_pretty(&super::status::Envelope::new(RunRecord::new(key, info)))
+        .context("serialize run record")
 }
 
 /// Branch for a new worktree: the `--branch` override, else the sandbox's
@@ -835,6 +893,42 @@ mod tests {
             forwarded_ports: Default::default(),
             created_unix: 0,
         }
+    }
+
+    /// The `run --json` document: schema-1 envelope, host paths as strings,
+    /// `worktree`/`branch` null without a worktree and set with one.
+    #[test]
+    fn run_record_serializes_in_the_envelope() {
+        let doc = |key: &str, info: &Instance| {
+            let json = serde_json::to_string(&crate::commands::status::Envelope::new(RunRecord::new(key, info)));
+            serde_json::from_str::<serde_json::Value>(&json.unwrap()).unwrap()
+        };
+        let base = doc("repo", &instance("repo"));
+        assert_eq!(
+            base,
+            serde_json::json!({"schema": 1, "data": {
+                "name": "repo",
+                "instance_id": "repo",
+                "sandbox": "repo",
+                "container": "devsandbox-repo",
+                "workspace": "/workspaces/repo",
+                "folder": "/tmp/repo",
+                "base_folder": "/tmp/repo",
+                "worktree": null,
+                "branch": null,
+            }})
+        );
+
+        let mut wt = instance("repo-2");
+        wt.folder = "/cfg/.worktrees/repo-2".into();
+        wt.worktree = Some("/cfg/.worktrees/repo-2".into());
+        wt.branch = Some("sandbox/repo-2".into());
+        let data = &doc("renamed", &wt)["data"];
+        assert_eq!(data["name"], "renamed");
+        assert_eq!(data["instance_id"], "repo-2");
+        assert_eq!(data["folder"], "/cfg/.worktrees/repo-2");
+        assert_eq!(data["worktree"], "/cfg/.worktrees/repo-2");
+        assert_eq!(data["branch"], "sandbox/repo-2");
     }
 
     #[test]

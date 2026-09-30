@@ -109,13 +109,13 @@ const status = (opts) => json(['status'], opts);
 // The runtime's own inspect document, not enveloped.
 const inspect = (name, opts) => cli(['inspect', name, '--json'], opts).then((r) => JSON.parse(r.stdout));
 
-// `run` prints the instance name as its last stdout line (build output may precede it).
+// `run --json` keeps stdout to the one document (build/hook output goes to stderr).
 function run(sandbox, opts = {}) {
   const args = ['run', sandbox];
   for (const flag of ['name', 'branch', 'base']) {
     if (opts[flag] !== undefined) args.push(`--${flag}`, opts[flag]);
   }
-  return cli(args, opts).then((r) => r.stdout.trim().split('\n').pop());
+  return json(args, opts);
 }
 const start = (t, opts) => cli(['start', ...target(t)], opts).then(unit);
 const stop = (t, opts) => cli(['stop', ...target(t)], opts).then(unit);
@@ -133,6 +133,19 @@ function logs(name, opts = {}) {
 // Resolves with the command's exit code instead of rejecting on non-zero.
 const exec = (name, command, opts = {}) =>
   cli(['exec', ...(opts.input !== undefined ? ['-i'] : []), name, ...command], { ...opts, reject: false });
+
+// argv for spawning `exec` yourself (node-pty, child_process) without a shell.
+// Unset flags are left to the CLI: no `cmd` gets a login shell with `-i`, plus
+// `-t` when its stdin is a TTY.
+function execArgv(name, cmd = [], opts = {}) {
+  const args = ['exec'];
+  if (opts.interactive) args.push('-i');
+  if (opts.tty) args.push('-t');
+  // `--` so a command word like `-t` reaches the container, not devsandbox's flags.
+  args.push(name);
+  if (cmd.length) args.push('--', ...cmd);
+  return { file: binaryPath(), args };
+}
 
 const service = {
   ls: (opts) => json(['service', 'ls'], opts),
@@ -159,5 +172,6 @@ module.exports = {
   gc,
   logs,
   exec,
+  execArgv,
   service,
 };

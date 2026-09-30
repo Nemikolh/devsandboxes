@@ -22,14 +22,18 @@ use std::io::{IsTerminal, Write};
 use anyhow::{bail, Context, Result};
 
 use crate::runtime::{backend, NAME_PREFIX};
-use crate::state::State;
+use crate::state::{Instance, State};
 
 /// Resolve a user-supplied `name` to a single instance key. `name` may be an
 /// instance name, its persistent id (they diverge after a rename — the id is
 /// what container/mount names show), a sandbox config name, or a repository
-/// (folder basename); every instance it could refer to is collected. Zero matches or (on a
+/// (folder basename). An exact instance name or id wins outright: with
+/// instances `web` and `web-2` of sandbox `web`, `web` must mean the instance,
+/// not an ambiguity that fails off a TTY and prompts on one (a programmatic
+/// caller's pty is a TTY). Only when nothing matches exactly is every instance
+/// the sandbox or folder name could refer to collected. Zero matches or (on a
 /// non-TTY) an ambiguous match bail; a TTY prompts interactively. Shared by
-/// `rm` and `stop`.
+/// every verb taking an instance `<name>` (`exec`, `rm`, `stop`, …).
 pub(crate) fn resolve_instance(state: &State, name: &str) -> Result<String> {
     resolve_instance_with(state, name, std::io::stdin().is_terminal())
 }
@@ -45,18 +49,24 @@ pub(crate) fn resolve_instance_noninteractive(state: &State, name: &str) -> Resu
 }
 
 fn resolve_instance_with(state: &State, name: &str, interactive: bool) -> Result<String> {
-    let mut matches: Vec<String> = state
-        .instances
-        .iter()
-        .filter(|(instance, info)| {
-            *instance == name
-                || info.instance_id == name
-                || info.sandbox == name
-                || info.folder.file_name().is_some_and(|f| f == name)
-        })
-        .map(|(instance, _)| instance.clone())
-        .collect();
-    matches.sort();
+    let keys = |pred: &dyn Fn(&str, &Instance) -> bool| -> Vec<String> {
+        let mut keys: Vec<String> = state
+            .instances
+            .iter()
+            .filter(|(instance, info)| pred(instance, info))
+            .map(|(instance, _)| instance.clone())
+            .collect();
+        keys.sort();
+        keys
+    };
+    // The exact tier can still hold two entries (a renamed instance's id equal
+    // to another's name); that stays ambiguous rather than guessing.
+    let mut matches = keys(&|instance, info| instance == name || info.instance_id == name);
+    if matches.is_empty() {
+        matches = keys(&|_, info| {
+            info.sandbox == name || info.folder.file_name().is_some_and(|f| f == name)
+        });
+    }
 
     match matches.len() {
         0 => bail!("no sandbox instance matches `{name}` (see `devsandbox ps -a`)"),
@@ -315,5 +325,42 @@ mod tests {
         assert!(err.contains("is ambiguous"), "{err}");
         assert!(err.contains("web-aaaa"), "{err}");
         assert!(err.contains("web-bbbb"), "{err}");
+    }
+
+    /// Instances `web` and `web-2` of sandbox `web`: `web` is the instance,
+    /// even interactively (no prompt), and the sandbox tier never runs.
+    #[test]
+    fn exact_name_beats_sandbox_name() {
+        let mut s = state();
+        let a = s.instances.remove("web-aaaa").unwrap();
+        let b = s.instances.remove("web-bbbb").unwrap();
+        s.instances.insert("web".into(), Instance { instance_id: "web".into(), ..a });
+        s.instances.insert("web-2".into(), Instance { instance_id: "web-2".into(), ..b });
+        assert_eq!(resolve_instance_with(&s, "web", false).unwrap(), "web");
+        assert_eq!(resolve_instance_with(&s, "web", true).unwrap(), "web");
+        assert_eq!(resolve_instance_with(&s, "web-2", false).unwrap(), "web-2");
+    }
+
+    /// A persistent id beats a folder basename it happens to equal.
+    #[test]
+    fn exact_id_beats_folder_basename() {
+        let mut s = state();
+        // `web-bbbb` lives in folder `other`; rename `web-aaaa` so its id is `other`.
+        let mut a = s.instances.remove("web-aaaa").unwrap();
+        a.instance_id = "other".into();
+        s.instances.insert("renamed".into(), a);
+        assert_eq!(resolve_instance_with(&s, "other", false).unwrap(), "renamed");
+    }
+
+    /// An id equal to another instance's name is an exact-tier tie: ambiguous,
+    /// not silently one of them.
+    #[test]
+    fn exact_tier_tie_is_ambiguous() {
+        let mut s = state();
+        let mut a = s.instances.remove("web-aaaa").unwrap();
+        a.instance_id = "web-bbbb".into();
+        s.instances.insert("renamed".into(), a);
+        let err = resolve_instance_with(&s, "web-bbbb", false).unwrap_err().to_string();
+        assert!(err.contains("is ambiguous: renamed, web-bbbb"), "{err}");
     }
 }

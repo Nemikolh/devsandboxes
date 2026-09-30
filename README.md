@@ -74,7 +74,7 @@ postCreateCommand = "pnpm install"
 
 ```bash
 devsandbox run web          # start an instance in the background
-devsandbox exec -it web zsh # name = instance, sandbox, or folder basename
+devsandbox exec web         # login shell; name = instance, sandbox, or folder basename
 devsandbox                  # no args on a TTY: interactive dashboard
 ```
 
@@ -90,11 +90,13 @@ devsandbox                  # no args on a TTY: interactive dashboard
 | `start` / `stop <name>\|--all`      | Restart (full path: services, DNS, `postStartCommand`) / stop             |
 | `rebuild <name>\|--all [--force]`   | Recreate from current config when drifted; worktree and state kept        |
 | `rm <name>`                         | Remove container, worktree, and state entry                               |
-| `exec [-i] [-t] <name> <cmd…>`      | Exec honoring `remoteEnv` / `remoteUser`                                  |
+| `exec [-i] [-t] <name> [cmd…]`      | Exec honoring `remoteEnv` / `remoteUser`; no `cmd`: login shell           |
 | `port <name> [--service s] <port…>` | Forward a container/service port to the host until Ctrl-C (unix only)     |
 | `service ls` / `service rebuild`    | List services / recreate one and rewire running sandboxes in place        |
 | `gc [--force]`                      | Reap unreferenced services, orphaned history files and agent links        |
-| `status --json`                     | Full snapshot for scripts; `ps`/`ls`/`stats`/`inspect` also take `--json` |
+| `status --json`                     | Full snapshot for scripts; `ps`/`ls`/`stats`/`inspect`/`run` take `--json` |
+
+`<name>` matching an instance name (or id) exactly always picks that instance; sandbox and folder names only count when nothing matches exactly. `run --json` prints only the new instance's record on stdout (build and hook output goes to stderr); every JSON payload but `inspect`'s (the runtime's own document) is wrapped in `{"schema": 1, "data": …}`.
 
 `devsandbox port` makes a port inside a running instance or service reachable on the host, on demand — no `-p` at create time, no restart. It runs in the foreground and stops on Ctrl-C.
 

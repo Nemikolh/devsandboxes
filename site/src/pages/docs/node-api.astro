@@ -192,7 +192,7 @@ const unwrapP = (html: string) => html.replace(/^<p>|<\/p>$/g, '');
 
   <h2 id="functions"><a class="heading-anchor" href="#functions" aria-label="Link to section: Functions"></a>Functions</h2>
   <p>
-    Named exports of <code>devsandboxes</code>. Everything but <code>binaryPath()</code> runs the CLI and returns a promise.
+    Named exports of <code>devsandboxes</code>. Everything but <code>binaryPath()</code> and <code>execArgv()</code> runs the CLI and returns a promise.
   </p>
   {functions.map((fn) => <ApiFunction fn={fn} known={known} highlighted={sigHtml} />)}
 

@@ -1,10 +1,22 @@
 use std::io::IsTerminal;
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 
-use super::pick;
+use super::resolve_instance;
 use crate::runtime::backend;
 use crate::state::{Instance, State};
+
+/// In-container login shell, as argv pieces: what `exec <name>` with no
+/// command runs, and what the dashboard's integrated terminal opens. Images
+/// are often minimal (no bash, no login profile wired up), so probe zsh first
+/// (most devsandboxes ship it), then bash, and fall back to POSIX `sh`, all as
+/// login shells. Shared so a CLI shell, a dashboard tab, and a programmatic
+/// pty consumer spawning `devsandbox exec <name>` all get the same shell.
+pub const SHELL_FALLBACK_CMD: [&str; 3] = [
+    "sh",
+    "-lc",
+    "command -v zsh >/dev/null 2>&1 && exec zsh -l; command -v bash >/dev/null 2>&1 && exec bash -l; exec sh -l",
+];
 
 /// CLI entry point: run the command, then exit the process with its status.
 pub fn exec(name: &str, interactive: bool, tty: bool, command: &[String]) -> Result<()> {
@@ -13,36 +25,20 @@ pub fn exec(name: &str, interactive: bool, tty: bool, command: &[String]) -> Res
 
 /// Run the command inside the matching instance and return its exit code.
 /// Split out of [`exec`] so callers that must not terminate the process (the
-/// dashboard prompt) can reuse it.
+/// dashboard prompt) can reuse it. An empty `command` opens the login shell
+/// ([`SHELL_FALLBACK_CMD`]) with [`shell_flags`] defaults.
 pub fn exec_status(name: &str, interactive: bool, tty: bool, command: &[String]) -> Result<i32> {
     let state = State::load()?;
+    let key = resolve_instance(&state, name)?;
+    let instance = state.instances.get(&key).expect("key came from state");
 
-    // <name> may be an instance name, a sandbox config name, or a repository
-    // (folder basename); collect every instance it could refer to.
-    let mut matches: Vec<(&String, &Instance)> = state
-        .instances
-        .iter()
-        .filter(|(instance, info)| {
-            *instance == name
-                || info.sandbox == name
-                || info.folder.file_name().is_some_and(|f| f == name)
-        })
-        .collect();
-
-    let (_, instance) = match matches.len() {
-        0 => bail!("no sandbox instance matches `{name}` (see `devsandbox ps`)"),
-        1 => matches.remove(0),
-        _ => {
-            let labels: Vec<String> = matches
-                .iter()
-                .map(|(instance, info)| format!("{instance} (sandbox {})", info.sandbox))
-                .collect();
-            let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
-            if !std::io::stdin().is_terminal() {
-                bail!("`{name}` is ambiguous: {}", labels.join(", "));
-            }
-            matches.remove(pick(&format!("`{name}` is ambiguous"), &label_refs)?)
-        }
+    let shell: Vec<String>;
+    let (command, interactive, tty) = if command.is_empty() {
+        shell = SHELL_FALLBACK_CMD.iter().map(|s| s.to_string()).collect();
+        let (i, t) = shell_flags(interactive, tty, std::io::stdin().is_terminal());
+        (shell.as_slice(), i, t)
+    } else {
+        (command, interactive, tty)
     };
 
     // ssh-agent relay for the command's lifetime, started optimistically
@@ -63,6 +59,20 @@ pub fn exec_status(name: &str, interactive: bool, tty: bool, command: &[String])
         eprintln!("note: ssh-agent relay unavailable in `{}`: {e}", instance.container);
     }
     Ok(code)
+}
+
+/// `-i`/`-t` for a command-less (login shell) exec. Explicit flags are taken
+/// as given. With neither, the shell keeps stdin open (`-i`: without it the
+/// shell reads EOF and exits at once, so piping a script in still works) and
+/// gets a pseudo-TTY when stdin is a terminal (`-t`), which is what an
+/// interactive user or a pty-hosting consumer (node-pty, a GUI terminal) wants
+/// without having to know the flags.
+fn shell_flags(interactive: bool, tty: bool, stdin_tty: bool) -> (bool, bool) {
+    if interactive || tty {
+        (interactive, tty)
+    } else {
+        (true, stdin_tty)
+    }
 }
 
 /// Build the runtime `exec` argv for `instance`: the flags, workspace,
@@ -301,6 +311,27 @@ mod tests {
             exec_argv_with(&inst, false, false, &["ls".into()], false),
             vec!["exec", "-w", "/workspaces/repository-1", "devsandbox-repo-abc1", "ls"]
         );
+    }
+
+    #[test]
+    fn shell_flags_default_only_without_explicit_flags() {
+        // Neither flag: stdin stays open, a TTY only when stdin is one.
+        assert_eq!(shell_flags(false, false, true), (true, true));
+        assert_eq!(shell_flags(false, false, false), (true, false));
+        // Any explicit flag is honored exactly, TTY or not.
+        assert_eq!(shell_flags(true, false, true), (true, false));
+        assert_eq!(shell_flags(false, true, false), (false, true));
+        assert_eq!(shell_flags(true, true, false), (true, true));
+    }
+
+    #[test]
+    fn shell_fallback_cmd_probes_zsh_bash_sh() {
+        assert_eq!(SHELL_FALLBACK_CMD[0], "sh");
+        assert_eq!(SHELL_FALLBACK_CMD[1], "-lc");
+        // zsh probed before bash before sh, all as login shells.
+        let at = |s: &str| SHELL_FALLBACK_CMD[2].find(s).unwrap();
+        assert!(at("exec zsh -l") < at("exec bash -l"));
+        assert!(at("exec bash -l") < at("exec sh -l"));
     }
 
     /// The shared rule the CLI/TUI builder and lifecycle execs both consult.

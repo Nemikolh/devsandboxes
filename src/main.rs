@@ -2,6 +2,7 @@ mod commands;
 mod config;
 mod devsbd;
 mod features;
+mod json_stdout;
 mod render;
 mod runtime;
 mod snapshot;
@@ -66,6 +67,10 @@ enum Command {
         /// Owning dispatcher's instance id (dispatcher use)
         #[arg(long, hide = true, value_name = "INSTANCE_ID")]
         dispatcher: Option<String>,
+        /// Print the new instance as one JSON document; child process output
+        /// (builds, hooks) goes to stderr so stdout stays parseable
+        #[arg(long)]
+        json: bool,
     },
     /// Recreate an instance's container from the current config (keeps the
     /// worktree, branch, and per-instance state); no-op when there is no drift
@@ -160,7 +165,7 @@ enum Command {
         #[arg(long, required = true)]
         json: bool,
     },
-    /// Run a command in a sandbox instance
+    /// Run a command in a sandbox instance (a login shell when none is given)
     Exec {
         /// Keep stdin open
         #[arg(short)]
@@ -170,8 +175,10 @@ enum Command {
         tty: bool,
         /// Instance name, sandbox config name, or repository folder name
         name: String,
-        /// Command and arguments to run
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        /// Command and arguments to run; omitted: a login shell (zsh, bash,
+        /// or sh), with `-i`, plus `-t` when stdin is a TTY, unless either
+        /// flag is given
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
     /// Forward a container port to the host until Ctrl-C
@@ -229,13 +236,24 @@ fn main() -> Result<()> {
     match command {
         Command::Ls { json } => commands::ls::ls(&cli.dir, json),
         Command::Ps { all, json } => commands::ps::ps(all, json),
-        Command::Run { sandbox, name, branch, base, env, dispatcher } => {
-            // After, not before: `run web` for an autostart `web` must not
-            // create two instances. Whatever `run` returned is kept.
+        Command::Run { sandbox, name, branch, base, env, dispatcher, json } => {
+            // Taken before any work so every child process (and autostart
+            // below) writes to stderr; only the final document hits stdout.
+            let json_out = json.then(json_stdout::JsonStdout::capture).transpose()?;
             let extras = commands::run::RunExtras { env, dispatcher };
             let result = commands::run::run(&cli.dir, sandbox, name, branch, base, extras);
+            if let (None, Ok(Some(key))) = (&json_out, &result) {
+                println!("{key}");
+            }
+            // After, not before: `run web` for an autostart `web` must not
+            // create two instances. Whatever `run` returned is kept.
             commands::autostart::autostart(&cli.dir);
-            result
+            match (result?, json_out) {
+                (Some(key), Some(out)) => out.emit(&commands::run::run_record_json(&key)?),
+                // Only a written example config gets here: no instance to report.
+                (None, Some(_)) => anyhow::bail!("no instance created"),
+                (_, None) => Ok(()),
+            }
         }
         Command::Rebuild { name, all, force } => {
             commands::rebuild::rebuild(&cli.dir, name, all, force)

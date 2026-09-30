@@ -157,7 +157,7 @@ devsandbox gc           # reap services nothing references
 
 The repo ships two [agent skills](https://github.com/Nemikolh/devsandboxes/tree/main/skills), plain `SKILL.md` files a coding agent loads on demand:
 
-- **`devsandbox-cli`**: every subcommand, ordered by how useful it is to an agent, with the non-interactive rules (`run` prints only the instance name, `exec` exit codes, debugging loop).
+- **`devsandbox-cli`**: every subcommand, ordered by how useful it is to an agent, with the non-interactive rules (`run --json` for a clean record of the new instance, `exec` exit codes, debugging loop).
 - **`config-toml-spec`**: the complete `config.toml` format, for writing or reviewing configs and porting a `devcontainer.json`.
 
 Copy them to wherever your agent reads skills from; for Claude Code that's `~/.claude/skills/`. Taking them from the release tag keeps them in step with your binary:
