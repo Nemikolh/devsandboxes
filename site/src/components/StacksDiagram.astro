@@ -1,0 +1,200 @@
+---
+/**
+ * The "low-level tooling" picture of the landing page: you ask your agent, it
+ * clones repos on your machine and drives devsandbox like docker to bring up
+ * stacks (one config root each, the compose-project analogue), and the edges
+ * between the sandboxes and the host: tunneled ports, the forwarded ssh-agent,
+ * `devsbd notify`, and the planned on-demand credentials. Static, in the
+ * landing diagram's visual language (`HowItWorks.astro`), laid out like
+ * `BabysitDiagram.astro`: one grid on desktop, stacked on narrow screens.
+ */
+import {
+  Bell,
+  Bot,
+  Container,
+  Database,
+  FolderGit2,
+  GitBranch,
+  KeyRound,
+  Layers,
+  LockKeyhole,
+  Plug,
+  UserRound,
+} from '@lucide/astro';
+import '../styles/stacks-diagram.css';
+
+interface Box {
+  name: string;
+  /** Sandboxes: the repo checkout, or the worktree branch of a repeat instance. */
+  tree?: string;
+  worktree?: boolean;
+  /** Services: `global` or `isolated`. */
+  scope?: string;
+}
+
+const stacks: { name: string; sandboxes: Box[]; services: Box[] }[] = [
+  {
+    name: 'shop',
+    sandboxes: [
+      { name: 'api', tree: '~/code/api' },
+      { name: 'web', tree: '~/code/web' },
+    ],
+    services: [{ name: 'postgres', scope: 'global' }],
+  },
+  {
+    name: 'billing',
+    sandboxes: [
+      { name: 'billing', tree: '~/code/billing' },
+      { name: 'billing-pr-42', tree: 'fix/invoice-rounding', worktree: true },
+    ],
+    services: [{ name: 'redis', scope: 'isolated' }],
+  },
+];
+
+const repos = ['api', 'web', 'billing'];
+
+// Bottom row: what crosses the sandbox boundary. `up` = from the host into
+// the sandboxes, else out of them.
+const edges = [
+  { id: 'ports', icon: Plug, label: 'devsandbox port', title: 'localhost:3000', sub: 'web:3000 · no -p' },
+  { id: 'ssh', icon: KeyRound, label: 'git push · pull', title: 'ssh-agent', sub: 'keys stay on the host', up: true },
+  { id: 'notify', icon: Bell, label: 'devsbd notify', title: 'you', sub: 'Inbox · desktop' },
+  {
+    id: 'creds',
+    icon: LockKeyhole,
+    label: 'on demand',
+    title: 'credentials',
+    sub: 'tokens stay on the host',
+    up: true,
+    planned: true,
+  },
+];
+---
+
+<figure class="sd" data-pagefind-ignore>
+  <p class="visually-hidden">
+    Diagram: on your machine, you ask your agent to set up an environment. It git clones the api, web and billing repos
+    into ~/code, then drives devsandbox with run --json and exec on your container runtime. There it brings up two
+    stacks, each one config.toml: shop, with sandboxes api and web on their checkouts and a global postgres, and
+    billing, with sandbox billing, a child instance billing-pr-42 on its own worktree of the PR branch
+    fix/invoice-rounding, and an isolated redis. Across the
+    sandbox boundary: ports tunneled to localhost with devsandbox port, your ssh-agent forwarded in so keys stay on the
+    host, devsbd notify reaching you in the dashboard's Inbox and on the desktop, and, planned, credentials handed out on
+    demand so tokens never live in a sandbox.
+  </p>
+
+  <div class="sd-host" aria-hidden="true">
+    <div class="sd-host-label"><span>HOST</span> your machine</div>
+
+    <div class="sd-grid">
+      <div class="sd-repos">
+        <div class="sd-head">
+          <span class="sd-icon"><FolderGit2 /></span>
+          <span class="sd-name">~/code</span>
+        </div>
+        <div class="sd-chips">
+          {
+            repos.map((r) => (
+              <span class="sd-chip">
+                <FolderGit2 />
+                {r}
+              </span>
+            ))
+          }
+        </div>
+      </div>
+
+      <div class="sd-link sd-link--left sd-link--clone"><span>git clone</span></div>
+
+      <div class="sd-agent">
+        <span class="sd-agent-icon"><Bot /></span>
+        <span class="sd-node-copy">
+          <strong>your agent</strong>
+          <span>on the host</span>
+        </span>
+      </div>
+
+      <div class="sd-ask">
+        <div class="sd-link sd-link--left sd-link--you"><span>“set up shop”</span></div>
+        <div class="sd-you"><UserRound /> you</div>
+      </div>
+
+      <div class="sd-link sd-link--down sd-link--mount"><span>folder · worktree</span></div>
+      <div class="sd-link sd-link--down sd-link--run"><span>devsandbox run --json · exec</span></div>
+
+      <div class="sd-runtime">
+        <div class="sd-runtime-label">
+          <span class="sd-runtime-title">RUNTIME</span>
+          <span>docker</span><span>podman</span><span>Apple container</span>
+        </div>
+        <ul class="sd-stacks">
+          {
+            stacks.map((s) => (
+              <li class="sd-stack">
+                <div class="sd-stack-head">
+                  <Layers />
+                  <strong>{s.name}</strong>
+                  <span>stacks/{s.name}/config.toml</span>
+                </div>
+                <div class="sd-boxes">
+                  {s.sandboxes.map((b) => (
+                    <div class="sd-box">
+                      <div class="sd-head">
+                        <span class="sd-icon">
+                          <Container />
+                        </span>
+                        <span class="sd-name">{b.name}</span>
+                      </div>
+                      <span class:list={['sd-chip', { 'is-worktree': b.worktree }]}>
+                        {b.worktree ? <GitBranch /> : <FolderGit2 />}
+                        {b.tree}
+                      </span>
+                    </div>
+                  ))}
+                  {s.services.map((b) => (
+                    <div class="sd-box sd-service">
+                      <div class="sd-head">
+                        <span class="sd-icon">
+                          <Database />
+                        </span>
+                        <span class="sd-name">{b.name}</span>
+                      </div>
+                      <span class="sd-sub">service · {b.scope}</span>
+                    </div>
+                  ))}
+                </div>
+              </li>
+            ))
+          }
+        </ul>
+      </div>
+
+      {
+        edges.map((e) => (
+          <div class:list={['sd-link', e.up ? 'sd-link--up' : 'sd-link--down', `sd-link--${e.id}`]}>
+            <span>{e.label}</span>
+          </div>
+        ))
+      }
+      {
+        edges.map((e) => (
+          <div class:list={['sd-edge', `sd-edge--${e.id}`]}>
+            <span class="sd-edge-icon">
+              <e.icon />
+            </span>
+            <span class="sd-node-copy">
+              <strong>
+                {e.title}
+                {e.planned && <em>planned</em>}
+              </strong>
+              <span>{e.sub}</span>
+            </span>
+            <span class="sd-edge-via">
+              {e.up ? '↑' : '↓'} {e.label}
+            </span>
+          </div>
+        ))
+      }
+    </div>
+  </div>
+</figure>

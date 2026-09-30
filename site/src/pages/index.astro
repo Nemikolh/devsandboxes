@@ -11,9 +11,7 @@ import {
   FolderGit2,
   GitBranch,
   GitFork,
-  GitPullRequest,
   HardDrive,
-  KeyRound,
   LayoutDashboard,
   Terminal,
   Workflow,
@@ -21,6 +19,7 @@ import {
 import { codeToHtml } from 'shiki';
 import CodeBlock from '../components/CodeBlock.astro';
 import HowItWorks from '../components/HowItWorks.astro';
+import StacksDiagram from '../components/StacksDiagram.astro';
 import Base from '../layouts/Base.astro';
 import { psTable } from '../lib/home';
 import { VERSION } from '../lib/nav';
@@ -111,34 +110,18 @@ const features = [
   },
 ];
 
-const examples = [
+const toolingSteps = [
   {
-    icon: GitBranch,
-    slug: 'parallel-agents',
-    title: 'Parallel coding agents',
-    text: 'Several agents on one repo, each in its own instance, worktree and branch.',
-    tags: ['agents', 'worktrees'],
+    title: 'Clone the repos',
+    text: 'Your agent clones what the task needs side by side on your machine, like `~/code/api` and `~/code/web`.',
   },
   {
-    icon: KeyRound,
-    slug: 'ssh-and-git-push',
-    title: 'ssh and git push',
-    text: 'Forward your ssh-agent so agents can push without keys in the container.',
-    tags: ['git', 'ssh'],
+    title: 'Describe the stack',
+    text: 'One `config.toml` per stack: a sandbox per repo, the services they share, caches. Unknown keys are errors, so a typo fails fast.',
   },
   {
-    icon: GitPullRequest,
-    slug: 'babysit-pr',
-    title: 'Babysit pull requests',
-    text: 'A dispatcher spawns a child per PR, fixes conflicts with an agent, and notifies you when it fails.',
-    tags: ['automations', 'agents'],
-  },
-  {
-    icon: FileCode,
-    slug: 'port-a-devcontainer',
-    title: 'Port a devcontainer.json',
-    text: 'Turn an existing `devcontainer.json` into a `config.toml` sandbox, property by property.',
-    tags: ['devcontainers'],
+    title: 'Run, exec, report back',
+    text: '`devsandbox run --json` returns the new instance and `exec` runs in it. From inside, `devsbd notify` reaches you when a human is needed.',
   },
 ];
 
@@ -298,6 +281,9 @@ devsandbox run web`;
           ))
         }
       </div>
+      <a class="section-link" href="/examples">
+        <Boxes size={16} aria-hidden="true" /> All examples <ArrowRight size={16} aria-hidden="true" />
+      </a>
     </section>
 
     <section class="command-section" aria-labelledby="command-title">
@@ -318,41 +304,38 @@ devsandbox run web`;
       </div>
     </section>
 
-    <section class="overview-section" id="examples" aria-labelledby="examples-title">
+    <section class="overview-section" id="tooling" aria-labelledby="tooling-title">
       <div class="section-intro">
         <div>
-          <div class="small-label"><span>04 / EXAMPLES</span></div>
-          <h2 id="examples-title">Start from a recipe<span class="title-period">.</span></h2>
+          <div class="small-label"><span>04 / LOW-LEVEL TOOLING</span></div>
+          <h2 id="tooling-title">Docker's verbs.<br />Local defaults<span class="title-period">.</span></h2>
         </div>
         <p>
-          Each example is a complete config.toml, the commands to try it, and a prompt you can hand to your coding agent
-          to set it up for you.
+          Under the dashboard is a plain CLI with docker's verbs: run, exec, ps, logs, rm. The compose file becomes one
+          config.toml per stack, with defaults made for your laptop: worktrees, shared services and caches, your
+          ssh-agent, ports tunneled on demand. Hand it to your agent and it sets up the whole stack.
         </p>
       </div>
-      <div class="example-grid">
+      <StacksDiagram />
+      <ol class="hiw-steps">
         {
-          examples.map((e) => (
-            <a class="example-card" href={`/examples/${e.slug}`}>
-              <span class="example-icon">
-                <e.icon size={18} aria-hidden="true" />
-              </span>
-              <div class="example-body">
-                <h3>{e.title}</h3>
-                <p>{ticks(e.text).map((t, j) => (j % 2 ? <code>{t}</code> : t))}</p>
-                <ul class="example-tags" aria-label="Tags">
-                  {e.tags.map((t) => (
-                    <li>{t}</li>
-                  ))}
-                </ul>
-              </div>
-              <ArrowUpRight class="example-arrow" size={17} aria-hidden="true" />
-            </a>
+          toolingSteps.map((s, i) => (
+            <li>
+              <span class="hiw-step-no">{String(i + 1).padStart(2, '0')}</span>
+              <h3>{s.title}</h3>
+              <p>{ticks(s.text).map((t, j) => (j % 2 ? <code>{t}</code> : t))}</p>
+            </li>
           ))
         }
+      </ol>
+      <div class="section-links">
+        <a class="section-link" href="https://github.com/Nemikolh/devsandboxes/blob/main/skills/devsandbox-cli/SKILL.md">
+          <Terminal size={16} aria-hidden="true" /> The devsandbox-cli skill <ArrowUpRight size={16} aria-hidden="true" />
+        </a>
+        <a class="section-link" href="/docs/node-api">
+          <Braces size={16} aria-hidden="true" /> Script it from Node <ArrowRight size={16} aria-hidden="true" />
+        </a>
       </div>
-      <a class="examples-all" href="/examples">
-        <Boxes size={16} aria-hidden="true" /> All examples <ArrowRight size={16} aria-hidden="true" />
-      </a>
     </section>
   </main>
 </Base>
