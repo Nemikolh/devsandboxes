@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   activeHeaderHref,
+  CHANGELOG_PAGE,
   EXAMPLES_INDEX,
   pagerKicker,
   readingNeighbors,
@@ -18,7 +19,7 @@ const last = page('/examples/b', 'example');
 const order = readingOrder([quickStart, dashboard], [first, last]);
 
 describe('readingOrder', () => {
-  it('runs docs, references, the examples index, then examples', () => {
+  it('runs docs, references, the examples index, examples, then the changelog', () => {
     expect(order.map((p) => p.href)).toEqual([
       '/docs/quick-start',
       '/docs/dashboard',
@@ -27,6 +28,7 @@ describe('readingOrder', () => {
       '/examples',
       '/examples/a',
       '/examples/b',
+      '/docs/changelog',
     ]);
   });
 });
@@ -34,8 +36,12 @@ describe('readingOrder', () => {
 describe('sidebarGroups', () => {
   it('puts the dashboard tour right after getting started', () => {
     const groups = sidebarGroups([]);
-    expect(groups.map((g) => g.label)).toEqual(['GETTING STARTED', 'DASHBOARD', 'REFERENCE', 'EXAMPLES']);
+    expect(groups.map((g) => g.label)).toEqual(['GETTING STARTED', 'DASHBOARD', 'REFERENCE', 'EXAMPLES', 'RELEASES']);
     expect(groups[1].links.map((l) => l.href)).toEqual(['/docs/dashboard']);
+  });
+
+  it('ends with the changelog', () => {
+    expect(sidebarGroups([]).at(-1)?.links).toEqual([{ href: CHANGELOG_PAGE.href, label: 'Changelog' }]);
   });
 });
 
@@ -50,7 +56,8 @@ describe('activeHeaderHref', () => {
 describe('readingNeighbors', () => {
   it('has no prev at the start and no next at the end', () => {
     expect(readingNeighbors(order, '/docs/quick-start')).toEqual({ prev: undefined, next: order[1] });
-    expect(readingNeighbors(order, '/examples/b/')).toEqual({ prev: first, next: undefined });
+    expect(readingNeighbors(order, '/examples/b/')).toEqual({ prev: first, next: CHANGELOG_PAGE });
+    expect(readingNeighbors(order, '/docs/changelog')).toEqual({ prev: last, next: undefined });
   });
 
   it('hands the last reference over to the examples index, and the index to the first example', () => {

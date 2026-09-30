@@ -9,7 +9,7 @@ import { packageVersion } from './src/lib/cargo.ts';
 import { agentCode } from './src/lib/agent-code.ts';
 import { codeChrome } from './src/lib/code-chrome.ts';
 import { configDeps, configDepsStamp, watchConfigDeps } from './src/lib/config-deps.ts';
-import { dropSkillTitle, headingAnchors, tableKeyWeight, tableScroll } from './src/lib/heading-anchors.ts';
+import { dropSourceTitle, headingAnchors, tableKeyWeight, tableScroll } from './src/lib/heading-anchors.ts';
 import { pagefind } from './src/lib/pagefind-integration.ts';
 import { devsandboxesTheme } from './src/lib/shiki-theme.ts';
 
@@ -22,7 +22,7 @@ export default defineConfig({
   site: 'https://devsandboxes.com',
   integrations: [mdx(), sitemap(), pagefind(), watchConfigDeps(deps)],
   markdown: {
-    processor: satteri({ hastPlugins: [dropSkillTitle(), headingAnchors(), tableKeyWeight(), tableScroll()] }),
+    processor: satteri({ hastPlugins: [dropSourceTitle(), headingAnchors(), tableKeyWeight(), tableScroll()] }),
     shikiConfig: {
       theme: devsandboxesTheme,
       transformers: [codeChrome(), agentCode(), configDepsStamp(deps)],

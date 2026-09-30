@@ -32,6 +32,7 @@ export function sidebarGroups(examples: NavLink[]): NavGroup[] {
       ],
     },
     { label: 'EXAMPLES', links: [{ href: '/examples', label: 'All examples' }, ...examples] },
+    { label: 'RELEASES', links: [{ href: CHANGELOG_PAGE.href, label: 'Changelog' }] },
   ];
 }
 
@@ -50,6 +51,14 @@ export const REFERENCE_PAGES: ReadingPage[] = [
   { href: '/docs/node-api', title: 'Node API', description: 'Drive devsandbox from TypeScript with the typed devsandboxes package.', kind: 'docs' },
 ];
 
+/** Rendered from the repo's `CHANGELOG.md`; last in the sidebar and the reading order. */
+export const CHANGELOG_PAGE: ReadingPage = {
+  href: '/docs/changelog',
+  title: 'Changelog',
+  description: 'What changed in each release, newest first.',
+  kind: 'docs',
+};
+
 export const EXAMPLES_INDEX: ReadingPage = {
   href: '/examples',
   title: 'Examples',
@@ -59,11 +68,11 @@ export const EXAMPLES_INDEX: ReadingPage = {
 
 /**
  * The one reading order behind every prev/next pager: hand-written docs, the
- * generated references, the examples index, then each example. Both lists
- * come in already sorted.
+ * generated references, the examples index, each example, then the
+ * changelog. Both lists come in already sorted.
  */
 export function readingOrder(docs: ReadingPage[], examples: ReadingPage[]): ReadingPage[] {
-  return [...docs, ...REFERENCE_PAGES, EXAMPLES_INDEX, ...examples];
+  return [...docs, ...REFERENCE_PAGES, EXAMPLES_INDEX, ...examples, CHANGELOG_PAGE];
 }
 
 /** Neighbours of `path` in `order`; a page missing from the order is a build error. */

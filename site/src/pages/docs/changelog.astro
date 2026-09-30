@@ -1,0 +1,24 @@
+---
+import Docs from '../../layouts/Docs.astro';
+import { CHANGELOG_PAGE } from '../../lib/nav';
+// The repo's CHANGELOG.md is the one copy of the release notes (it is also
+// the GitHub release body), so the page renders it as-is. A direct import
+// rather than a content collection: a glob loader based at the repo root
+// would make the dev server watch the whole repo, `target/` included.
+import { Content, getHeadings } from '../../../../CHANGELOG.md';
+
+const SOURCE_PATH = 'CHANGELOG.md';
+
+// One TOC entry per release; the Added/Changed/Fixed under each would repeat.
+const headings = getHeadings().filter((h) => h.depth === 2);
+---
+
+<Docs
+  title={CHANGELOG_PAGE.title}
+  description={CHANGELOG_PAGE.description}
+  eyebrow="RELEASES"
+  headings={headings}
+  source={{ path: SOURCE_PATH, action: 'edit' }}
+>
+  <Content />
+</Docs>

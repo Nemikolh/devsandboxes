@@ -47,16 +47,18 @@ export function headingAnchors(): HastPluginEntry {
 }
 
 /**
- * Sätteri hast plugin: drop the H1 of agent skills (`SKILL.md`) rendered as
- * pages. Their H1 is the skill's own title; the page layout owns the real one,
- * and a second H1 would also land in the TOC data. Must run before
- * `headingAnchors` so slug dedupe matches Astro's pass over the final tree.
+ * Sätteri hast plugin: drop the H1 of repo files rendered as pages (agent
+ * skills' `SKILL.md`, the root `CHANGELOG.md`). Their H1 is the file's own
+ * title; the page layout owns the real one, and a second H1 would also land in
+ * the TOC data. Must run before `headingAnchors` so slug dedupe matches
+ * Astro's pass over the final tree.
  */
-export function dropSkillTitle(): HastPluginEntry {
+export function dropSourceTitle(): HastPluginEntry {
   return ({ fileURL }) => {
-    if (!fileURL?.pathname.endsWith('/SKILL.md')) return null;
+    const path = fileURL?.pathname ?? '';
+    if (!path.endsWith('/SKILL.md') && !path.endsWith('/CHANGELOG.md')) return null;
     return {
-      name: 'devsandboxes:drop-skill-title',
+      name: 'devsandboxes:drop-source-title',
       element: {
         filter: ['h1'],
         visit(node, ctx) {
