@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.0
 
 Sandboxes can now start themselves after a reboot and run unattended **dispatcher** scripts that create, drive and clean up their own child instances. Messages from inside containers show up in the dashboard and as desktop notifications. See `docs/automations-guide.md`. `run --json`, a command-less `exec` and exact-name matching make devsandbox easier to drive from scripts and other programs, and the docs now live at [devsandboxes.com](https://devsandboxes.com).
 
