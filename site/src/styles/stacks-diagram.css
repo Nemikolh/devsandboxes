@@ -498,14 +498,14 @@
 }
 
 .sd-link--up::after {
-  left: calc(var(--lx) + 1px);
+  left: calc(var(--lx) + 0.5px);
   top: 1px;
   translate: -3px 0;
   rotate: -45deg;
 }
 
 .sd-link--down::after {
-  left: calc(var(--lx) + 1px);
+  left: calc(var(--lx) + 0.5px);
   bottom: 1px;
   translate: -3px 0;
   rotate: 135deg;
@@ -677,7 +677,7 @@
   .sd-link--left::after {
     top: auto;
     bottom: 1px;
-    left: calc(var(--lx) + 1px);
+    left: calc(var(--lx) + 0.5px);
     translate: -3px 0;
     rotate: 135deg;
   }

@@ -455,14 +455,14 @@
 }
 
 .bsd-link--up::after {
-  left: var(--lx);
+  left: calc(var(--lx) + 0.5px);
   top: 1px;
   translate: -3px 0;
   rotate: -45deg;
 }
 
 .bsd-link--down::after {
-  left: var(--lx);
+  left: calc(var(--lx) + 0.5px);
   bottom: 1px;
   translate: -3px 0;
   rotate: 135deg;
@@ -485,7 +485,7 @@
 }
 
 .bsd-link--right::after {
-  top: 50%;
+  top: calc(50% + 1px);
   right: 1px;
   translate: 0 -3.5px;
   rotate: 45deg;
@@ -689,7 +689,7 @@
   }
 
   .bsd-link--inbox::after {
-    top: 50%;
+    top: calc(50% + 1px);
     bottom: auto;
     left: auto;
     right: 5px;
@@ -735,7 +735,7 @@
 
   .bsd-link--ctl::after {
     top: auto;
-    left: var(--lx);
+    left: calc(var(--lx) + 0.5px);
     bottom: 1px;
     right: auto;
     translate: -3px 0;
