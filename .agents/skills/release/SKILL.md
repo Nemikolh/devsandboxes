@@ -1,6 +1,8 @@
 ---
 name: release
 description: Cut a devsandbox release - bring the CHANGELOG.md Unreleased section up to date with readable notes, then run release.sh, which tags the release and makes CI publish it with that section as the GitHub release body.
+metadata:
+  internal: true
 ---
 
 # Release

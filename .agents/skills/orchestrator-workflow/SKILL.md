@@ -1,6 +1,8 @@
 ---
 name: orchestrator-workflow
 description: Run a multi-step feature as orchestrator - plan in markdown, delegate each step to an implementer subagent, review, commit, repeat.
+metadata:
+  internal: true
 ---
 
 # Orchestrator workflow

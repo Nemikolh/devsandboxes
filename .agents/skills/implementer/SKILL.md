@@ -1,6 +1,8 @@
 ---
 name: implementer
 description: Standing directions for an implementer subagent executing one step of an orchestrator's plan.
+metadata:
+  internal: true
 ---
 
 # Implementer
