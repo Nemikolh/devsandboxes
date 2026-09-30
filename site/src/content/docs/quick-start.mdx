@@ -10,6 +10,7 @@ import Callout from '../../components/Callout.astro';
 import CodeBlock from '../../components/CodeBlock.astro';
 import InstallTabs from '../../components/InstallTabs.astro';
 import ResourceLink from '../../components/ResourceLink.astro';
+import Tabs from '../../components/Tabs.astro';
 import { REPO_URL, VERSION } from '../../lib/nav';
 
 ## Prerequisites
@@ -28,18 +29,27 @@ The package is `devsandboxes`; the binary it installs is `devsandbox`.
 
 ## Give your agent the skills
 
-The repo ships two [agent skills](https://github.com/Nemikolh/devsandboxes/tree/main/skills), plain `SKILL.md` files a coding agent loads on demand:
+The repo ships two [agent skills](https://agentskills.io):
 
-- **`devsandbox-cli`**: every subcommand, ordered by how useful it is to an agent, with the non-interactive rules (`run --json` for a clean record of the new instance, `exec` exit codes, debugging loop).
-- **`config-toml-spec`**: the complete `config.toml` format, for writing or reviewing configs and porting a `devcontainer.json`.
+- **`devsandbox-cli`**: how to use the CLI.
+- **`config-toml-spec`**: the config format.
 
-Copy them to wherever your agent reads skills from; for Claude Code that's `~/.claude/skills/`. Taking them from the release tag keeps them in step with your binary:
+Install them with [skills.sh](https://skills.sh), or copy them by hand:
 
-<CodeBlock
-  code={`git clone --depth 1 --branch v${VERSION} ${REPO_URL}.git /tmp/ds
+<Tabs id="skills" label="Skill install method" tabs={[{ id: 'skills-sh', label: 'skills.sh' }, { id: 'manual', label: 'Manually' }]}>
+  <Fragment slot="skills-sh">
+    <CodeBlock code={`npx skills add nemikolh/devsandboxes`} />
+    <p class="tab-note">Asks which agents to install them for: Claude Code, Codex, Cursor and many more. Takes them from the default branch.</p>
+  </Fragment>
+  <Fragment slot="manual">
+    <CodeBlock
+      code={`git clone --depth 1 --branch v${VERSION} ${REPO_URL}.git /tmp/ds
 mkdir -p ~/.claude/skills
 cp -r /tmp/ds/skills/* ~/.claude/skills/   # devsandbox-cli, config-toml-spec`}
-/>
+    />
+    <p class="tab-note">Into wherever your agent reads skills from; for Claude Code that's <code>~/.claude/skills/</code>. The release tag keeps them in step with your binary.</p>
+  </Fragment>
+</Tabs>
 
 <div class="resource-grid">
   <ResourceLink href="https://github.com/Nemikolh/devsandboxes/blob/main/skills/devsandbox-cli/SKILL.md" label="devsandbox-cli" description="skills/devsandbox-cli/SKILL.md on GitHub" />

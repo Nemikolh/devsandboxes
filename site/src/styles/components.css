@@ -1455,3 +1455,267 @@ html[data-agent='codex'] [data-agent-only]:not([data-agent-only='codex']) {
   display: inline-block;
   flex-shrink: 0;
 }
+
+/* ----------------------------------------------------------- Agent prompt */
+
+.agent-prompt-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin: 4px 0 8px;
+  padding: 8px 14px;
+  border-radius: 999px;
+  border: 1px solid #3d5f45;
+  background: #1c3325;
+  color: var(--lime);
+  font-weight: 500;
+  text-decoration: none;
+  transition:
+    background 0.15s,
+    border-color 0.15s;
+}
+
+.agent-prompt-link:hover {
+  background: #22402d;
+  border-color: var(--lime);
+  color: var(--lime-hover);
+}
+
+/* Arriving from the link: the prompt pulses once so the eye lands on it. */
+:target + .agent-prompt {
+  animation: agent-prompt-pop 1.2s ease-out;
+}
+
+@keyframes agent-prompt-pop {
+  0%,
+  30% {
+    box-shadow:
+      0 0 0 4px #a9f36d55,
+      0 18px 50px -24px #a9f36d66;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :target + .agent-prompt {
+    animation: none;
+  }
+}
+
+.agent-prompt {
+  position: relative;
+  margin: 28px 0;
+  border-radius: var(--radius-lg);
+  background:
+    linear-gradient(#10191c, #10191c) padding-box,
+    linear-gradient(135deg, #a9f36d99, #2f4447 38%, #2f4447 62%, #91e6e899) border-box;
+  border: 1px solid transparent;
+  box-shadow:
+    0 0 0 4px #a9f36d08,
+    0 18px 50px -24px #a9f36d33;
+  overflow: hidden;
+}
+
+.agent-prompt-head {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 16px 16px 16px 18px;
+  border-bottom: 1px solid #25383a;
+  background: linear-gradient(90deg, #172a24, #131f22 55%, #12202a);
+}
+
+.agent-prompt-badge {
+  flex-shrink: 0;
+  width: 36px;
+  height: 36px;
+  display: grid;
+  place-items: center;
+  border-radius: var(--radius);
+  border: 1px solid #3d5f45;
+  background: #1c3325;
+  color: var(--lime);
+}
+
+.agent-prompt-title {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+
+.agent-prompt-title strong {
+  font: 600 15px/1.3 var(--font-heading);
+  letter-spacing: -0.02em;
+  color: var(--text-bright);
+}
+
+.agent-prompt-title small {
+  font-size: 12px;
+  color: #8ea5a3;
+}
+
+.agent-prompt-copy {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 14px;
+  border: 0;
+  border-radius: var(--radius);
+  background: var(--lime);
+  color: #0d1113;
+  font: 600 10.5px var(--font-mono);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  transition:
+    background 0.2s,
+    transform 0.2s;
+}
+
+.agent-prompt-copy:hover {
+  background: var(--lime-hover);
+}
+
+.agent-prompt-copy:active {
+  transform: translateY(1px);
+}
+
+.agent-prompt-copy .icon-check,
+.agent-prompt-copy[data-copied] .icon-copy {
+  display: none;
+}
+
+.agent-prompt-copy[data-copied] .icon-check {
+  display: block;
+}
+
+.agent-prompt-body {
+  padding: 20px 22px 8px;
+  font-size: 13.5px;
+  line-height: 1.7;
+  color: #c3d4d1;
+  overflow-wrap: break-word;
+}
+
+.prose .agent-prompt-goal {
+  margin: 0 0 14px;
+  color: var(--text);
+  font-weight: 500;
+}
+
+.prose .agent-prompt-steps {
+  list-style: none;
+  counter-reset: prompt-step;
+  margin: 0;
+  padding: 0;
+}
+
+.prose .agent-prompt-steps li {
+  counter-increment: prompt-step;
+  position: relative;
+  padding: 9px 0 9px 38px;
+  margin: 0;
+  border-top: 1px dashed #243436;
+}
+
+.prose .agent-prompt-steps li::before {
+  content: counter(prompt-step, decimal-leading-zero);
+  position: absolute;
+  left: 0;
+  top: 11px;
+  font: 500 10.5px var(--font-mono);
+  letter-spacing: 0.04em;
+  color: #7fc35a;
+}
+
+.prose .agent-prompt :not(pre) > code {
+  font-size: 0.86em;
+  color: #cfe6e1;
+  background: #172427;
+  border-color: #2a3c3f;
+}
+
+/* Code in prompts wraps between words only (see `promptWords`); a word longer
+   than the line still splits rather than overflow. */
+.agent-prompt .prompt-word {
+  display: inline-block;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+.agent-prompt mark {
+  font: 500 0.9em var(--font-mono);
+  color: #0f1a12;
+  background: #b8f58a;
+  border-radius: var(--radius-sm);
+  padding: 0 4px;
+  /* `<config dir>` is one placeholder, never two lines. */
+  white-space: nowrap;
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+}
+
+.agent-prompt code mark {
+  font-size: 1em;
+  padding: 0 2px;
+}
+
+.agent-prompt-foot {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 22px 14px;
+  border-top: 1px solid #22322f;
+  font: 10px var(--font-mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #6f8787;
+}
+
+.agent-prompt-foot mark {
+  font-size: 10px;
+  margin-right: 6px;
+}
+
+.prose .agent-prompt-foot a {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: #9fcfcf;
+  text-decoration: none;
+}
+
+.prose .agent-prompt-foot a:hover {
+  color: var(--cyan);
+}
+
+@media (max-width: 700px) {
+  .agent-prompt-head {
+    flex-wrap: wrap;
+  }
+
+  .agent-prompt-title {
+    flex-basis: calc(100% - 50px);
+  }
+
+  .agent-prompt-copy {
+    width: 100%;
+    justify-content: center;
+  }
+
+  .agent-prompt-body {
+    padding: 16px 16px 6px;
+    font-size: 13px;
+  }
+
+  .prose .agent-prompt-steps li {
+    padding-left: 30px;
+  }
+
+  .agent-prompt-foot {
+    padding: 12px 16px;
+  }
+}
