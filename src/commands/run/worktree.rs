@@ -169,8 +169,6 @@ fn create_new_branch_worktree(
 /// Worktree of `base` for a `folders` entry: detached at the base checkout's
 /// current `HEAD`, so no branch is created (nothing for `rm` to delete, no
 /// "already checked out" clash) and it starts where the owner's checkout is.
-// Wired in by materialize (step 3).
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn create_detached_worktree(base: &Path, worktree: &Path) -> Result<()> {
     if let Some(parent) = worktree.parent() {
         std::fs::create_dir_all(parent)

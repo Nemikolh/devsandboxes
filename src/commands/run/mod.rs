@@ -335,6 +335,8 @@ pub(crate) fn materialize(
     let prior_config_dir = prior.and_then(|i| i.config_dir.clone());
     // A rebuild keeps the instance's host ports (docs/port-forwarding.md).
     let forwarded_ports = prior.map(|i| i.forwarded_ports.clone()).unwrap_or_default();
+    // A rebuild keeps its `folders` worktrees (see `folders::mount_folders`).
+    let prior_folders = prior.map(|i| i.folders.clone()).unwrap_or_default();
     let run_env = effective_extra_env(&extras.env, prior.map(|i| &i.extra_env));
     let container_name = format!("{NAME_PREFIX}{instance_id}");
     let basename = folder
@@ -395,6 +397,20 @@ pub(crate) fn materialize(
         copy_worktree_includes(folder, source, &patterns);
     }
 
+    // `folders` worktrees: after initializeCommand (it may create the repos),
+    // before the container, like the primary's links above.
+    let folder_mounts = folders::mount_folders(
+        config,
+        dir,
+        &config_dir,
+        state,
+        instance,
+        instance_id,
+        dispatcher.is_some(),
+        &prior_folders,
+        &extra_folders,
+    )?;
+
     // Bring up the sandbox's services (global shared + this instance's isolated)
     // and their networks; the instance container joins them to reach services by
     // name.
@@ -416,6 +432,14 @@ pub(crate) fn materialize(
     if let Some(store) = &link_store {
         extra_mounts.push(format!("{}:{}", store.display(), store.display()));
     }
+    // Each `folders` worktree needs its base's `.git` too; once per base (the
+    // primary may already mount the same one).
+    for fm in folder_mounts.iter().filter(|fm| fm.worktree.is_some()) {
+        let companion = git_companion_mount(&fm.base);
+        if !extra_mounts.contains(&companion) {
+            extra_mounts.push(companion);
+        }
+    }
     // ssh-agent: relay-first. On unix with an embedded helper we never mount
     // the socket — the in-container `devsbd` daemon serves it over exec stdio
     // (docs/sandbox-helper.md), which also fixes rotation-while-running and
@@ -435,11 +459,11 @@ pub(crate) fn materialize(
     };
     let ResolvedMounts { args: mut mounts, volumes: mut instance_volumes } =
         resolve_mounts(dir, folder, &basename, instance_id, sandbox)?;
-    for folder in &extra_folders {
+    for fm in &folder_mounts {
         mounts.push(format!(
             "type=bind,source={},target={}",
-            folder.host.display(),
-            folder.target
+            fm.worktree.as_deref().unwrap_or(&fm.base).display(),
+            fm.target
         ));
     }
     // Package-manager caches: shared bind mounts + the env vars pointing at them.
@@ -541,7 +565,7 @@ pub(crate) fn materialize(
             worktree,
             branch,
             branch_created,
-            folders: Vec::new(),
+            folders: folders::merge_folder_mounts(&prior_folders, folder_mounts),
             shell_history,
             workspace: workspace.clone(),
             workspace_file,

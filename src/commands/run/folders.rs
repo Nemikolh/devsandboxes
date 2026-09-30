@@ -3,15 +3,143 @@
 //! direct checkout; everyone else gets a worktree so no two instances write
 //! to one working tree. Pure over config + state so it's testable without git.
 
-// Wired in by materialize (step 3).
-#![cfg_attr(not(test), allow(dead_code))]
+use std::path::{Path, PathBuf};
 
-use std::path::Path;
+use anyhow::{bail, Context, Result};
 
-use anyhow::{bail, Result};
+use crate::config::{short_hash, Config, FolderWorktree};
+use crate::state::{FolderMount, State};
 
-use crate::config::{Config, FolderWorktree};
-use crate::state::State;
+use super::mounts::ResolvedFolder;
+use super::worktree::create_detached_worktree;
+
+/// The [`FolderMount`] for each current `folders` entry of `instance`, creating
+/// detached worktrees where [`needs_worktree`] says so. A `prior` record with
+/// the same target and base is reused as is, so a rebuild keeps the working
+/// tree (as it keeps the primary worktree) and the decision isn't re-made
+/// against a state that now contains this instance's own holds. A reused
+/// worktree that vanished from disk is recreated: the record is ours, and
+/// mounting a missing dir would fail (or, on some runtimes, create an empty
+/// one) less clearly than git does.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn mount_folders(
+    config: &Config,
+    dir: &Path,
+    config_dir: &Path,
+    state: &State,
+    instance: &str,
+    instance_id: &str,
+    dispatched: bool,
+    prior: &[FolderMount],
+    resolved: &[ResolvedFolder],
+) -> Result<Vec<FolderMount>> {
+    let mut out = Vec::with_capacity(resolved.len());
+    for entry in resolved {
+        let host = &entry.host;
+        let context = || format!("`folders` entry `{}` ({})", entry.target, host.display());
+        if let Some(fm) = reusable(prior, &entry.target, host, entry.mode) {
+            if let Some(wt) = fm.worktree.as_deref().filter(|wt| !wt.exists()) {
+                eprintln!("warning: worktree `{}` is missing; recreating it", wt.display());
+                super::check_repo(host).with_context(context)?;
+                create_detached_worktree(host, wt).with_context(context)?;
+            }
+            out.push(fm.clone());
+            continue;
+        }
+        let repo = is_repo_root(host);
+        // Only `auto` on a repo outside a dispatcher looks at who else holds
+        // it; skip the config/state scans otherwise.
+        let contested = entry.mode == FolderWorktree::Auto && repo && !dispatched;
+        let owned = contested && folder_owned(config, dir, state, host);
+        let direct = contested && !owned && folder_directly_mounted(state, host, Some(instance));
+        let worktree = if needs_worktree(entry.mode, repo, dispatched, owned, direct)
+            .with_context(context)?
+        {
+            let wt = folder_worktree_path(config_dir, instance_id, host);
+            super::check_repo(host).with_context(context)?;
+            if wt.exists() {
+                // A leftover of a failed run (materialize doesn't clean up):
+                // reuse it only if it's still a live worktree of this base.
+                if !is_worktree_of(&wt, host) {
+                    bail!(
+                        "{}: `{}` already exists and is not a worktree of it; remove it and retry",
+                        context(),
+                        wt.display()
+                    );
+                }
+            } else {
+                create_detached_worktree(host, &wt).with_context(context)?;
+            }
+            Some(wt)
+        } else {
+            None
+        };
+        out.push(FolderMount { target: entry.target.clone(), base: host.clone(), worktree });
+    }
+    Ok(out)
+}
+
+/// The prior record `target` -> `base` can be reused from, if any. Only one
+/// that fits `mode`: after switching an entry to `always`/`never`, the rebuild
+/// that drift points at must apply it. `auto` keeps whichever was mounted
+/// last (current records come first, see [`merge_folder_mounts`]); a worktree
+/// left unmounted by `never` stays recorded, so `always` picks it back up.
+fn reusable<'a>(
+    prior: &'a [FolderMount],
+    target: &str,
+    base: &Path,
+    mode: FolderWorktree,
+) -> Option<&'a FolderMount> {
+    prior.iter().find(|f| {
+        f.target == target
+            && f.base == base
+            && match mode {
+                FolderWorktree::Auto => true,
+                FolderWorktree::Always => f.worktree.is_some(),
+                FolderWorktree::Never => f.worktree.is_none(),
+            }
+    })
+}
+
+/// `<config_dir>/.worktrees/<instance_id>.folders/<basename>-<hash8>`: beside
+/// the primary worktree (which *is* `.worktrees/<instance_id>/`), the path
+/// hash keeping two same-named repos apart (as `link_store` does).
+fn folder_worktree_path(config_dir: &Path, instance_id: &str, base: &Path) -> PathBuf {
+    let basename = base.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let hash = short_hash(&base.to_string_lossy());
+    config_dir
+        .join(".worktrees")
+        .join(format!("{instance_id}.folders"))
+        .join(format!("{basename}-{}", &hash[..8]))
+}
+
+/// Whether `wt` is a registered worktree of `base`: its `.git` file points
+/// into `<base>/.git/worktrees/`, and that admin dir still exists (not pruned).
+fn is_worktree_of(wt: &Path, base: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(wt.join(".git")) else {
+        return false;
+    };
+    let Some(gitdir) = text.trim().strip_prefix("gitdir:").map(|g| PathBuf::from(g.trim())) else {
+        return false;
+    };
+    gitdir.starts_with(base.join(".git").join("worktrees")) && gitdir.is_dir()
+}
+
+/// The `folders` records to store: the current ones, plus prior records with
+/// a worktree that none of them carries on (entry removed, or its base
+/// changed), so `rm` still finds and cleans those worktrees. Prior direct
+/// records that aren't current are dropped: nothing mounts them anymore, and
+/// keeping them would keep the checkout reserved.
+pub(super) fn merge_folder_mounts(prior: &[FolderMount], current: Vec<FolderMount>) -> Vec<FolderMount> {
+    let kept: Vec<FolderMount> = prior
+        .iter()
+        .filter(|p| p.worktree.is_some() && !current.iter().any(|c| c.worktree == p.worktree))
+        .cloned()
+        .collect();
+    let mut out = current;
+    out.extend(kept);
+    out
+}
 
 /// The mount decision for one `folders` entry: `true` = detached worktree.
 /// `auto` checks, in order: a non-repo can't have one; a dispatcher child
@@ -82,7 +210,6 @@ mod tests {
 
     use super::super::tests::instance;
     use super::*;
-    use crate::state::FolderMount;
 
     use FolderWorktree::{Always, Auto, Never};
 
@@ -187,6 +314,139 @@ extends = "nope"
         state.instances.insert("lib".into(), i);
         assert!(folder_owned(&config, &root, &state, Path::new("/gone/lib")));
         assert!(!folder_owned(&config, &root, &state, &path));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn fm(target: &str, base: &str, worktree: Option<&str>) -> FolderMount {
+        FolderMount { target: target.into(), base: base.into(), worktree: worktree.map(Into::into) }
+    }
+
+    #[test]
+    fn merge_keeps_orphaned_worktrees_only() {
+        let prior = vec![
+            fm("/w/reused", "/r", Some("/wt/r")),
+            fm("/w/gone-wt", "/g", Some("/wt/g")),
+            fm("/w/gone-direct", "/d", None),
+            fm("/w/rebased", "/old", Some("/wt/old")),
+        ];
+        let current = vec![
+            fm("/w/reused", "/r", Some("/wt/r")),
+            fm("/w/rebased", "/new", None),
+            fm("/w/new", "/n", Some("/wt/n")),
+        ];
+        assert_eq!(
+            merge_folder_mounts(&prior, current),
+            vec![
+                fm("/w/reused", "/r", Some("/wt/r")),
+                fm("/w/rebased", "/new", None),
+                fm("/w/new", "/n", Some("/wt/n")),
+                // Removed entry, and the one whose base changed: rm must still see them.
+                fm("/w/gone-wt", "/g", Some("/wt/g")),
+                fm("/w/rebased", "/old", Some("/wt/old")),
+            ]
+        );
+    }
+
+    /// A mode switch must take effect on rebuild; `auto` keeps the last mount.
+    #[test]
+    fn reuse_respects_the_mode() {
+        // After `never` left the worktree recorded but unmounted.
+        let prior = vec![fm("/w/a", "/a", None), fm("/w/a", "/a", Some("/wt/a"))];
+        let base = Path::new("/a");
+        let pick = |mode| reusable(&prior, "/w/a", base, mode).cloned();
+        assert_eq!(pick(FolderWorktree::Auto), Some(fm("/w/a", "/a", None)));
+        assert_eq!(pick(FolderWorktree::Never), Some(fm("/w/a", "/a", None)));
+        assert_eq!(pick(FolderWorktree::Always), Some(fm("/w/a", "/a", Some("/wt/a"))));
+        let direct_only = vec![fm("/w/a", "/a", None)];
+        assert_eq!(reusable(&direct_only, "/w/a", base, FolderWorktree::Always), None);
+    }
+
+    #[test]
+    fn mount_folders_reuses_prior_and_mounts_non_repos_directly() {
+        let root = temp_root("mount");
+        for d in ["plain", "repo/.git", "wt"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        let (plain, repo) = (root.join("plain"), root.join("repo"));
+        let wt = root.join("wt");
+        let resolved = |target: &str, host: &Path, mode| ResolvedFolder {
+            target: target.into(),
+            host: host.to_path_buf(),
+            mode,
+        };
+        // Owned by a state instance, so `auto` would want a worktree: the
+        // matching prior record wins and no git runs.
+        let mut state = State::default();
+        let mut owner = instance("owner");
+        owner.base_folder = repo.clone();
+        state.instances.insert("owner".into(), owner);
+        let prior = vec![FolderMount {
+            target: "/w/repo".into(),
+            base: repo.clone(),
+            worktree: Some(wt.clone()),
+        }];
+        let out = mount_folders(
+            &Config::default(),
+            &root,
+            &root,
+            &state,
+            "me",
+            "me",
+            true,
+            &prior,
+            &[resolved("/w/repo", &repo, Auto), resolved("/w/plain", &plain, Auto)],
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            vec![
+                prior[0].clone(),
+                FolderMount { target: "/w/plain".into(), base: plain.clone(), worktree: None },
+            ]
+        );
+        // `always` on a non-repo names the entry.
+        let err = mount_folders(
+            &Config::default(),
+            &root,
+            &root,
+            &state,
+            "me",
+            "me",
+            false,
+            &[],
+            &[resolved("/w/plain", &plain, Always)],
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("`folders` entry `/w/plain`") && msg.contains("git repo root"), "{msg}");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn folder_worktree_path_is_per_instance_and_per_base() {
+        let a = folder_worktree_path(Path::new("/cfg"), "b-2", Path::new("/src/lib"));
+        let b = folder_worktree_path(Path::new("/cfg"), "b-2", Path::new("/other/lib"));
+        assert!(a.starts_with("/cfg/.worktrees/b-2.folders"), "{}", a.display());
+        let name = a.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("lib-") && name.len() == "lib-".len() + 8, "{name}");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn worktree_of_checks_the_gitdir_pointer() {
+        let root = temp_root("wt-of");
+        let base = root.join("base");
+        let admin = base.join(".git/worktrees/x");
+        std::fs::create_dir_all(&admin).unwrap();
+        let wt = root.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        assert!(!is_worktree_of(&wt, &base));
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
+        assert!(is_worktree_of(&wt, &base));
+        assert!(!is_worktree_of(&wt, &root.join("elsewhere")));
+        // Pruned admin dir: stale, not reusable.
+        std::fs::remove_dir_all(&admin).unwrap();
+        assert!(!is_worktree_of(&wt, &base));
         std::fs::remove_dir_all(&root).unwrap();
     }
 
