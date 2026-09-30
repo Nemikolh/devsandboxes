@@ -46,6 +46,12 @@ pub struct Instance {
     /// from before reuse existed always had a created branch.
     #[serde(default = "yes", skip_serializing_if = "is_true")]
     pub branch_created: bool,
+    /// Every `folders` entry as mounted (direct binds included), recorded so
+    /// the ownership rule (docs/folders-worktrees.md) sees other instances'
+    /// direct extra mounts and `rm` removes exactly the extra worktrees `run`
+    /// created. Empty for pre-upgrade instances until they're rebuilt.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub folders: Vec<FolderMount>,
     /// Host path of this instance's managed `.zsh_history` (inside the
     /// per-instance history dir bind-mounted at `/commandhistory`), when
     /// `persist-shell-history` is on. Kept on `rm` so a rebuilt instance with
@@ -102,6 +108,20 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub forwarded_ports: BTreeMap<String, u16>,
     pub created_unix: u64,
+}
+
+/// One `folders` entry of an instance: where it's mounted, the host folder it
+/// derives from, and the detached worktree mounted instead, if any.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FolderMount {
+    /// Container path.
+    pub target: String,
+    /// Canonical host folder the entry names.
+    pub base: PathBuf,
+    /// Detached worktree of `base` mounted at `target`; `None` = `base` is
+    /// bind-mounted directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<PathBuf>,
 }
 
 fn yes() -> bool {
@@ -210,6 +230,7 @@ mod tests {
                 worktree: None,
                 branch: None,
                 branch_created: true,
+                folders: Vec::new(),
                 shell_history: None,
                 workspace: "/workspaces/repository-1".into(),
                 workspace_file: None,

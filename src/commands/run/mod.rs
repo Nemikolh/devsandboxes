@@ -11,6 +11,7 @@ use crate::state::{Instance, State};
 use super::{container_drifted, pick, services};
 
 mod editor;
+mod folders;
 mod git;
 mod image;
 mod lifecycle;
@@ -540,6 +541,7 @@ pub(crate) fn materialize(
             worktree,
             branch,
             branch_created,
+            folders: Vec::new(),
             shell_history,
             workspace: workspace.clone(),
             workspace_file,
@@ -657,12 +659,6 @@ pub(crate) fn boot_spec_for(
     Some(crate::devsbd::boot_spec(cmd, workspace, env, remote_user, ssh_auth_sock))
 }
 
-/// Whether some instance (running or stopped — a stopped one can be started
-/// anytime) already mounts `folder` as its working tree; the new instance then
-/// gets a git worktree so two containers never share a working tree. Matched on
-/// `folder` (the mounted source), not `base_folder`: worktree instances carry
-/// the base's `base_folder` but have their own working tree, so they must not
-/// keep the base checkout reserved after its direct-mount instance is removed.
 /// The `worktree-link` store for base repo `folder` (canonical). One per repo,
 /// not per sandbox: the base checkout holds a single link per path, so two
 /// sandboxes on one folder must share the copy it points at. The basename
@@ -672,8 +668,15 @@ fn link_store(config_dir: &Path, folder: &Path, basename: &str) -> PathBuf {
     config_dir.join("shared-files").join(format!("{basename}-{}", &hash[..8]))
 }
 
+/// Whether some instance (running or stopped — a stopped one can be started
+/// anytime) already mounts `folder` directly, as its working tree or as a
+/// `folders` entry without a worktree; the new instance then gets a git
+/// worktree so two containers never share a working tree. Matched on the
+/// mounted source, not `base_folder`: worktree instances carry the base's
+/// `base_folder` but have their own working tree, so they must not keep the
+/// base checkout reserved after its direct-mount instance is removed.
 fn base_in_use(state: &State, folder: &Path) -> bool {
-    state.instances.values().any(|i| i.folder == folder)
+    folders::folder_directly_mounted(state, folder, None)
 }
 
 /// Default instance name: the sandbox name when it is free in state, else the
@@ -883,6 +886,7 @@ mod tests {
             worktree: None,
             branch: None,
             branch_created: true,
+            folders: Vec::new(),
             shell_history: None,
             workspace: "/workspaces/repo".into(),
             workspace_file: None,
@@ -1040,6 +1044,23 @@ mod tests {
         wt.worktree = Some("/cfg/.worktrees/repo-2".into());
         state.instances.insert("repo-2".into(), wt);
         assert!(!base_in_use(&state, base));
+
+        // A `folders` entry mounted through a worktree doesn't hold it either...
+        let mut other = instance("other");
+        other.folder = "/tmp/other".into();
+        other.base_folder = "/tmp/other".into();
+        other.folders.push(crate::state::FolderMount {
+            target: "/workspaces/repo".into(),
+            base: base.into(),
+            worktree: Some("/cfg/.worktrees/other.folders/repo-12345678".into()),
+        });
+        state.instances.insert("other".into(), other);
+        assert!(!base_in_use(&state, base));
+
+        // ...but a direct `folders` mount does.
+        state.instances.get_mut("other").unwrap().folders[0].worktree = None;
+        assert!(base_in_use(&state, base));
+        state.instances.remove("other");
 
         // A direct-mount instance (even stopped) reserves it.
         state.instances.insert("repo".into(), instance("repo"));

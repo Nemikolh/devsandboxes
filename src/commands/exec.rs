@@ -177,6 +177,7 @@ mod tests {
             worktree: None,
             branch: None,
             branch_created: true,
+            folders: Vec::new(),
             shell_history: None,
             workspace: "/workspaces/repository-1".into(),
             workspace_file: None,

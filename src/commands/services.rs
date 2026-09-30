@@ -1045,6 +1045,7 @@ ports = ["5432:5432"]
             worktree: None,
             branch: None,
             branch_created: true,
+            folders: Vec::new(),
             shell_history: None,
             workspace: String::new(),
             workspace_file: None,

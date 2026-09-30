@@ -169,6 +169,7 @@ mod tests {
             worktree: None,
             branch: None,
             branch_created: true,
+            folders: Vec::new(),
             shell_history: None,
             workspace: "/w".into(),
             workspace_file: None,

@@ -166,6 +166,41 @@ fn create_new_branch_worktree(
     ensure_populated(worktree)
 }
 
+/// Worktree of `base` for a `folders` entry: detached at the base checkout's
+/// current `HEAD`, so no branch is created (nothing for `rm` to delete, no
+/// "already checked out" clash) and it starts where the owner's checkout is.
+// Wired in by materialize (step 3).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn create_detached_worktree(base: &Path, worktree: &Path) -> Result<()> {
+    if let Some(parent) = worktree.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("cannot create {}", parent.display()))?;
+    }
+    // An unborn HEAD has nothing to detach at.
+    let head = host_git(base)?
+        .args(["rev-parse", "--verify", "HEAD^{commit}"])
+        .output()
+        .context("failed to run git (is it installed?)")?;
+    if !head.status.success() {
+        bail!(
+            "base repo `{}` has no commits; cannot create a worktree",
+            base.display()
+        );
+    }
+    let out = host_git(base)?
+        .args(["worktree", "add", "--detach", &worktree.to_string_lossy(), "HEAD"])
+        .output()
+        .context("failed to run git (is it installed?)")?;
+    if !out.status.success() {
+        bail!(
+            "git worktree add failed for `{}`: {}",
+            worktree.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    ensure_populated(worktree)
+}
+
 /// A real worktree always has a `.git` entry pointing back at the base repo;
 /// its absence means git exited 0 without checking anything out.
 fn ensure_populated(worktree: &Path) -> Result<()> {
@@ -964,6 +999,39 @@ mod tests {
         assert!(err.contains(".git/config sets core.fsmonitor"), "{err}");
         assert!(!marker.exists(), "fsmonitor ran on the host");
         assert!(!root.join("wt2").exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn detached_worktree_starts_at_base_head_without_a_branch() {
+        let root = std::env::temp_dir().join(format!("devsandbox-wtdet-{}", std::process::id()));
+        let base = repo(&root, "");
+        let branches = git(&base, &["branch", "--list"]);
+        let wt = root.join("nested/wt");
+
+        create_detached_worktree(&base, &wt).unwrap();
+        assert_eq!(git(&wt, &["rev-parse", "HEAD"]), git(&base, &["rev-parse", "HEAD"]));
+        let symbolic = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&wt)
+            .args(["symbolic-ref", "-q", "HEAD"])
+            .status()
+            .unwrap();
+        assert!(!symbolic.success(), "worktree HEAD is not detached");
+        assert_eq!(git(&base, &["branch", "--list"]), branches, "a branch was created");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn detached_worktree_needs_a_commit() {
+        let root = std::env::temp_dir().join(format!("devsandbox-wtdet0-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let base = root.join("base");
+        std::fs::create_dir_all(&base).unwrap();
+        git(&base, &["init", "-q", "-b", "main"]);
+        let err = create_detached_worktree(&base, &root.join("wt")).unwrap_err().to_string();
+        assert!(err.contains("has no commits"), "{err}");
+        assert!(!root.join("wt").exists());
         std::fs::remove_dir_all(&root).unwrap();
     }
 

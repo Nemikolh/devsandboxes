@@ -730,6 +730,7 @@ folder = "."
             worktree: None,
             branch: owner.map(|_| format!("sandbox/{id}")),
             branch_created: true,
+            folders: Vec::new(),
             shell_history: None,
             workspace: "/workspaces/w".into(),
             workspace_file: None,
