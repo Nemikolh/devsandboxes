@@ -73,8 +73,9 @@ pub struct SandboxProperties {
     pub shell_rc: Option<Vec<String>>,
     /// Extra VS Code workspace roots: container path -> host folder (relative
     /// to the config dir). Each entry is bind-mounted at its key and listed in
-    /// the generated `.code-workspace` file after `workspaceFolder`.
-    pub folders: Option<BTreeMap<String, String>>,
+    /// the generated `.code-workspace` file after `workspaceFolder`. A value is
+    /// the host dir, or a table adding its `worktree` mode (docs/folders-worktrees.md).
+    pub folders: Option<BTreeMap<String, FolderEntry>>,
     /// Bring this sandbox's instances up once per host boot (docs/automations.md).
     /// Excluded from `config_hash` so toggling it never marks instances drifted.
     pub autostart: Option<Autostart>,
@@ -178,6 +179,58 @@ impl Dispatcher {
     /// `spawn` says.
     pub fn may_spawn(&self, sandbox: &str) -> bool {
         self.spawn.iter().any(|s| s == Self::ANY || s == sandbox)
+    }
+}
+
+/// A `folders` value: `"<host dir>"` or `{ path = "<host dir>", worktree = … }`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(
+    untagged,
+    expecting = "a host dir string or { path = \"…\", worktree = \"auto\" | \"always\" | \"never\" }"
+)]
+pub enum FolderEntry {
+    Path(String),
+    Table(FolderTable),
+}
+
+/// Table form of a [`FolderEntry`]. A separate struct because
+/// `deny_unknown_fields` is a container attribute, so typos like `wroktree`
+/// error instead of silently defaulting the mode.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FolderTable {
+    pub path: String,
+    #[serde(default)]
+    pub worktree: Option<FolderWorktree>,
+}
+
+/// When a `folders` entry gets its own git worktree (docs/folders-worktrees.md).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FolderWorktree {
+    /// Worktree only when the checkout is owned or directly mounted elsewhere.
+    #[default]
+    Auto,
+    /// Always a worktree; the folder must be a git repo root.
+    Always,
+    /// Always the live host dir.
+    Never,
+}
+
+impl FolderEntry {
+    /// The host dir, unsubstituted and relative to the config dir.
+    pub fn path(&self) -> &str {
+        match self {
+            Self::Path(path) => path,
+            Self::Table(table) => &table.path,
+        }
+    }
+
+    pub fn worktree_mode(&self) -> FolderWorktree {
+        match self {
+            Self::Path(_) => FolderWorktree::Auto,
+            Self::Table(table) => table.worktree.unwrap_or_default(),
+        }
     }
 }
 
@@ -986,14 +1039,50 @@ folders = { "/workspaces/.shared" = "../.shared" }
 extends = "base"
 folder = "../app"
 image = "img"
-folders = { "/workspaces/docs" = "../docs" }
+folders = { "/workspaces/docs" = "../docs", "/workspaces/lib" = { path = "../lib", worktree = "always" }, "/workspaces/scratch" = { path = "../scratch", worktree = "never" }, "/workspaces/other" = { path = "../other" } }
 "#,
         )
         .unwrap();
         let sandbox = config.resolve_sandbox("app").unwrap();
+        assert!(!sandbox.config_hash.is_empty());
         let folders = sandbox.properties.folders.as_ref().unwrap();
-        assert_eq!(folders["/workspaces/.shared"], "../.shared");
-        assert_eq!(folders["/workspaces/docs"], "../docs");
+        let entry = |k: &str| (folders[k].path(), folders[k].worktree_mode());
+        assert_eq!(entry("/workspaces/.shared"), ("../.shared", FolderWorktree::Auto));
+        assert_eq!(entry("/workspaces/docs"), ("../docs", FolderWorktree::Auto));
+        assert_eq!(entry("/workspaces/lib"), ("../lib", FolderWorktree::Always));
+        assert_eq!(entry("/workspaces/scratch"), ("../scratch", FolderWorktree::Never));
+        assert_eq!(entry("/workspaces/other"), ("../other", FolderWorktree::Auto));
+    }
+
+    #[test]
+    fn folders_reject_bad_table_entries() {
+        for bad in [
+            r#"{ path = "../lib", worktree = "sometimes" }"#,
+            r#"{ path = "../lib", wroktree = "never" }"#,
+            r#"{ worktree = "never" }"#,
+            "1",
+        ] {
+            let result = Config::parse(&format!(
+                "[sandbox.app]\nfolder = \"../app\"\nimage = \"img\"\nfolders = {{ \"/workspaces/lib\" = {bad} }}\n"
+            ))
+            .and_then(|c| c.resolve_sandbox("app"));
+            let err = format!("{:#}", result.unwrap_err());
+            assert!(err.contains("host dir string"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn folders_worktree_mode_changes_config_hash() {
+        let hash = |entry: &str| {
+            Config::parse(&format!(
+                "[sandbox.app]\nfolder = \"../app\"\nimage = \"img\"\nfolders = {{ \"/workspaces/lib\" = {entry} }}\n"
+            ))
+            .unwrap()
+            .resolve_sandbox("app")
+            .unwrap()
+            .config_hash
+        };
+        assert_ne!(hash(r#""../lib""#), hash(r#"{ path = "../lib", worktree = "never" }"#));
     }
 
     #[test]

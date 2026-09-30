@@ -434,8 +434,12 @@ pub(crate) fn materialize(
     };
     let ResolvedMounts { args: mut mounts, volumes: mut instance_volumes } =
         resolve_mounts(dir, folder, &basename, instance_id, sandbox)?;
-    for (target, host) in &extra_folders {
-        mounts.push(format!("type=bind,source={},target={target}", host.display()));
+    for folder in &extra_folders {
+        mounts.push(format!(
+            "type=bind,source={},target={}",
+            folder.host.display(),
+            folder.target
+        ));
     }
     // Package-manager caches: shared bind mounts + the env vars pointing at them.
     let (cache_mounts, cache_env) = resolve_caches(&config_dir, props)?;

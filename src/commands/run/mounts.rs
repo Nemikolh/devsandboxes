@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 
 use crate::config::{
-    parse_shorthand, substitute, LifecycleCommand, MountContext, ResolvedMount, ResolvedSandbox,
-    SandboxProperties, SimpleCommand,
+    parse_shorthand, substitute, FolderWorktree, LifecycleCommand, MountContext, ResolvedMount,
+    ResolvedSandbox, SandboxProperties, SimpleCommand,
 };
 use crate::runtime::backend;
 
@@ -96,21 +96,32 @@ pub(super) fn sort_parents_first(mounts: &mut [String]) {
     mounts.sort_by_cached_key(key);
 }
 
-/// Resolve `folders` (container path -> host folder) into
-/// `(container path, host path)` pairs. Host paths behave like `folder`:
-/// relative to the config dir, must exist. Container paths must be absolute
-/// and distinct from `workspaceFolder`, which is always the first root.
+/// One resolved `folders` entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ResolvedFolder {
+    /// Container path.
+    pub target: String,
+    /// Canonical host folder.
+    pub host: PathBuf,
+    /// The entry's `worktree` mode.
+    pub mode: FolderWorktree,
+}
+
+/// Resolve `folders` (container path -> host folder) into [`ResolvedFolder`]s.
+/// Host paths behave like `folder`: relative to the config dir, must exist.
+/// Container paths must be absolute and distinct from `workspaceFolder`, which
+/// is always the first root.
 pub(super) fn resolve_folders(
     dir: &Path,
     ctx: &MountContext,
     workspace: &str,
     props: &SandboxProperties,
-) -> Result<Vec<(String, PathBuf)>> {
+) -> Result<Vec<ResolvedFolder>> {
     let Some(folders) = &props.folders else {
         return Ok(Vec::new());
     };
     let mut out = Vec::with_capacity(folders.len());
-    for (target, source) in folders {
+    for (target, entry) in folders {
         let target = substitute(target, ctx);
         if !target.starts_with('/') {
             bail!("`folders` key `{target}` must be an absolute container path");
@@ -121,12 +132,12 @@ pub(super) fn resolve_folders(
                  the primary folder is added automatically"
             );
         }
-        let source = substitute(source, ctx);
+        let source = substitute(entry.path(), ctx);
         let host = dir
             .join(&source)
             .canonicalize()
             .with_context(|| format!("`folders` entry `{source}` does not exist"))?;
-        out.push((target, host));
+        out.push(ResolvedFolder { target, host, mode: entry.worktree_mode() });
     }
     Ok(out)
 }
@@ -144,7 +155,7 @@ pub(super) fn resolve_folders(
 fn workspace_file_json(
     instance: &str,
     workspace: &str,
-    extra_folders: &[(String, PathBuf)],
+    extra_folders: &[ResolvedFolder],
     recommendations: &[String],
 ) -> String {
     let folders: Vec<serde_json::Value> =
@@ -152,7 +163,7 @@ fn workspace_file_json(
             .chain(
                 extra_folders
                     .iter()
-                    .map(|(target, _)| serde_json::json!({ "path": target })),
+                    .map(|folder| serde_json::json!({ "path": folder.target })),
             )
             .collect();
     let mut root = serde_json::json!({
@@ -176,7 +187,7 @@ pub(super) fn write_workspace_file(
     container: &str,
     instance: &str,
     workspace: &str,
-    extra_folders: &[(String, PathBuf)],
+    extra_folders: &[ResolvedFolder],
     extensions: &[String],
 ) -> Option<String> {
     let path = format!("/workspaces/{instance}.code-workspace");
@@ -424,6 +435,7 @@ fn ensure_bind_source(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{FolderEntry, FolderTable};
 
     fn ctx() -> MountContext<'static> {
         MountContext {
@@ -440,7 +452,7 @@ mod tests {
             folders: Some(
                 entries
                     .iter()
-                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .map(|(k, v)| (k.to_string(), FolderEntry::Path(v.to_string())))
                     .collect(),
             ),
             ..Default::default()
@@ -452,9 +464,38 @@ mod tests {
         let dir = std::env::temp_dir();
         let props = props_with_folders(&[("/workspaces/.shared", ".")]);
         let resolved = resolve_folders(&dir, &ctx(), "/workspaces/app", &props).unwrap();
+        assert_eq!(
+            resolved,
+            vec![ResolvedFolder {
+                target: "/workspaces/.shared".into(),
+                host: dir.canonicalize().unwrap(),
+                mode: FolderWorktree::Auto,
+            }]
+        );
+    }
+
+    #[test]
+    fn folders_table_form_substitutes_path_and_keeps_mode() {
+        let dir = std::env::temp_dir();
+        let props = SandboxProperties {
+            folders: Some(
+                [(
+                    "/workspaces/${instance}-lib".to_string(),
+                    FolderEntry::Table(FolderTable {
+                        path: "${configDir}/.".into(),
+                        worktree: Some(FolderWorktree::Never),
+                    }),
+                )]
+                .into(),
+            ),
+            ..Default::default()
+        };
+        let ctx = MountContext { config_dir: dir.to_str().unwrap(), ..ctx() };
+        let resolved = resolve_folders(&dir, &ctx, "/workspaces/app", &props).unwrap();
         assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].0, "/workspaces/.shared");
-        assert_eq!(resolved[0].1, dir.canonicalize().unwrap());
+        assert_eq!(resolved[0].target, "/workspaces/app-lib");
+        assert_eq!(resolved[0].host, dir.canonicalize().unwrap());
+        assert_eq!(resolved[0].mode, FolderWorktree::Never);
     }
 
     // --- shell-rc ---
@@ -686,7 +727,11 @@ mod tests {
 
     #[test]
     fn workspace_json_lists_primary_first() {
-        let extras = vec![("/workspaces/.shared".to_string(), PathBuf::from("/x"))];
+        let extras = vec![ResolvedFolder {
+            target: "/workspaces/.shared".into(),
+            host: PathBuf::from("/x"),
+            mode: FolderWorktree::Auto,
+        }];
         let json = workspace_file_json("app-2", "/workspaces/app", &extras, &[]);
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(
