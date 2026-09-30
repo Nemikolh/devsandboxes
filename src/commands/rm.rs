@@ -74,13 +74,13 @@ pub fn rm(name: &str, delete_branch: Option<bool>) -> Result<()> {
         let _ = std::fs::remove_file(link);
     }
 
-    // Before the primary: a failure keeps the instance in state so rm can be
-    // retried, and the retry skips extras already removed; the primary's
-    // `worktree remove` would fail on a path a previous pass removed.
+    // A failure keeps the instance in state so rm can be retried; worktrees a
+    // previous pass already removed are pruned, not removed (see
+    // `remove_or_prune`), so the retry gets past them.
     remove_folder_worktrees(&folders)?;
 
     if let Some(worktree) = worktree {
-        remove_worktree(&base_folder, &worktree)?;
+        remove_or_prune(&base_folder, &worktree)?;
         if let Some(branch) = branch {
             if branch_decision(delete_branch, || confirm(&format!("delete branch `{branch}`?")))? {
                 match host_git(&base_folder) {
@@ -122,7 +122,7 @@ fn branch_decision(flag: Option<bool>, ask: impl FnOnce() -> Result<bool>) -> Re
 /// worktree with modified, staged or untracked files, using this same
 /// `status` query (ignored files don't count). Run before any teardown so a
 /// refused rm leaves the instance intact. A worktree already gone from disk
-/// passes: `worktree remove` then just drops git's record of it.
+/// passes: [`remove_or_prune`] then drops any record git still has of it.
 fn check_worktree_removable(worktree: &Path) -> Result<()> {
     if !worktree.exists() {
         return Ok(());
@@ -178,19 +178,11 @@ fn check_folder_worktrees(folders: &[FolderMount]) -> Result<()> {
 }
 
 /// Remove the detached `folders` worktrees (no branches to offer), then
-/// their `<id>.folders/` parent dirs once empty. A worktree dir already gone
-/// (a previous, interrupted rm, or deleted by hand) is not handed to
-/// `worktree remove`, which fails once git's record is gone; `worktree prune`
-/// drops a leftover record instead.
+/// their `<id>.folders/` parent dirs once empty.
 fn remove_folder_worktrees(folders: &[FolderMount]) -> Result<()> {
     let worktrees = folder_worktrees(folders);
     for (f, wt) in &worktrees {
-        let removed = if wt.exists() {
-            remove_worktree(&f.base, wt)
-        } else {
-            prune_worktrees(&f.base)
-        };
-        removed.with_context(|| format!("folders entry `{}`", f.target))?;
+        remove_or_prune(&f.base, wt).with_context(|| format!("folders entry `{}`", f.target))?;
     }
     let mut parents: Vec<&Path> = worktrees.iter().filter_map(|(_, wt)| wt.parent()).collect();
     parents.dedup();
@@ -201,6 +193,19 @@ fn remove_folder_worktrees(folders: &[FolderMount]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `git worktree remove`, or `git worktree prune` when the dir is already
+/// gone (a previous rm removed it and then failed before dropping the
+/// instance from state, or it was deleted by hand): `remove` fails once git's
+/// record is gone, which would make every retry of rm fail; `prune` drops a
+/// leftover record and is a no-op otherwise.
+fn remove_or_prune(base: &Path, worktree: &Path) -> Result<()> {
+    if worktree.exists() {
+        remove_worktree(base, worktree)
+    } else {
+        prune_worktrees(base)
+    }
 }
 
 fn prune_worktrees(base: &Path) -> Result<()> {
@@ -306,6 +311,47 @@ mod tests {
         remove_worktree(&base, &wt).unwrap();
         // Already gone from disk: nothing to refuse.
         check_worktree_removable(&wt).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A retried rm (the previous pass removed the worktree, then failed
+    /// before dropping the instance) must get past the gone worktree, where a
+    /// second `git worktree remove` fails.
+    #[test]
+    fn worktree_removal_is_retryable() {
+        let root = std::env::temp_dir().join(format!("devsandbox-rmretry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (base, wt) = (root.join("base"), root.join("wt"));
+        std::fs::create_dir_all(&base).unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        assert!(git(&base, &["init", "-q", "-b", "main"]).status.success());
+        std::fs::write(base.join("tracked"), "a\n").unwrap();
+        assert!(git(&base, &["add", "."]).status.success());
+        assert!(git(&base, &["commit", "-q", "-m", "init"]).status.success());
+        let add = git(&base, &["worktree", "add", "-q", &wt.to_string_lossy(), "-b", "sandbox/r"]);
+        assert!(add.status.success());
+
+        remove_or_prune(&base, &wt).unwrap();
+        assert!(remove_worktree(&base, &wt).is_err(), "git refuses a second remove");
+        check_worktree_removable(&wt).unwrap();
+        remove_or_prune(&base, &wt).unwrap();
+
+        // Deleted by hand with git's record left: pruned away.
+        let wt2 = root.join("wt2");
+        let add = git(&base, &["worktree", "add", "-q", "--detach", &wt2.to_string_lossy()]);
+        assert!(add.status.success());
+        std::fs::remove_dir_all(&wt2).unwrap();
+        remove_or_prune(&base, &wt2).unwrap();
+        let list = git(&base, &["worktree", "list", "--porcelain"]);
+        assert!(!String::from_utf8_lossy(&list.stdout).contains("wt2"));
         std::fs::remove_dir_all(&root).unwrap();
     }
 
