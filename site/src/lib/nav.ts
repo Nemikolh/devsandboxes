@@ -22,7 +22,13 @@ export const headerNav: NavLink[] = [
 /** Sidebar groups; `examples` are the collection's links in reading order. */
 export function sidebarGroups(examples: NavLink[]): NavGroup[] {
   return [
-    { label: 'GETTING STARTED', links: [{ href: '/docs/quick-start', label: 'Quick start' }] },
+    {
+      label: 'GETTING STARTED',
+      links: [
+        { href: '/docs/quick-start', label: 'Quick start' },
+        { href: '/docs/going-further', label: 'Going further' },
+      ],
+    },
     { label: 'DASHBOARD', links: [{ href: '/docs/dashboard', label: 'Dashboard tour' }] },
     {
       label: 'REFERENCE',
