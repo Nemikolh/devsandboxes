@@ -1,5 +1,8 @@
 # Worktrees for `folders` entries
 
+Status: implemented (steps 1-5 below). Code: `src/commands/run/folders.rs`,
+`materialize` in `src/commands/run/mod.rs`, `src/commands/rm.rs`.
+
 ## Problem
 
 `folders` entries (`[sandbox.*].folders`, container path -> host dir) are
@@ -131,8 +134,10 @@ mounts are invisible to the rule until they're rebuilt. That's accepted.
   (`:369`), build the `FolderMount` list per entry:
 
   - if the prior state entry (`prior`, `:329`) recorded the same `target` with
-    the same `base`, **reuse** that record as-is (rebuild keeps the working tree,
-    like the primary worktree);
+    the same `base` in a form that fits the mode, **reuse** that record as-is
+    (rebuild keeps the working tree, like the primary worktree). `auto` keeps
+    whichever mount it had; `always` needs a recorded worktree and `never` a
+    direct record, so switching modes applies on the next rebuild;
 
   - otherwise decide with step 2's functions (`dispatched` =
     `dispatcher.is_some()`, `except_instance` = this instance) and create the
@@ -162,7 +167,9 @@ mounts are invisible to the rule until they're rebuilt. That's accepted.
   `check_worktree_removable` for **every** recorded extra worktree, before any
   teardown. After the container is gone, `remove_worktree(base, wt)` for each,
   then remove the empty `.worktrees/<id>.folders/` dir (best effort). No branch
-  handling is needed, since the worktrees are detached.
+  handling is needed, since the worktrees are detached. As built, the extras are
+  removed *before* the primary worktree, and a missing dir is pruned instead of
+  removed, so an rm that fails partway can be retried.
 
 - Tests: extend the existing temp-repo preflight test or add one for multiple worktrees.
 

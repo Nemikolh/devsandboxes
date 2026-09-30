@@ -41,8 +41,11 @@ resolve instance name (explicit --name | default deterministic)
         └─ new instance:
              resolve workspace source folder:
                  first instance for this base folder ──► mount folder directly
-                 base folder already used by another
-                 live instance of the same sandbox   ──► create git worktree (see §3)
+                 base folder already mounted directly by
+                 another instance (any sandbox, `folders`
+                 entries included)                   ──► create git worktree (see §3)
+             `folders` entries: same idea, detached worktrees
+                 (docs/folders-worktrees.md)
              initializeCommand (host)
              ensure shared services up (see §4)
              build image if build.dockerfile (tag devsandbox-img-<sandbox>)
@@ -87,6 +90,9 @@ When `run` targets a sandbox whose `folder` is already mounted by an existing in
   `run` created is deleted with `git branch -D` on `--delete-branch`, kept on
   `--keep-branch`; with neither flag `rm` prompts on a TTY and keeps it otherwise.
 - State gains `worktree: Option<PathBuf>` and `base_folder: PathBuf` per instance.
+- Extra `folders` roots follow the same idea, as detached worktrees with no branch.
+  They're recorded in `Instance.folders`, kept across `rebuild`, and removed by `rm`.
+  See `docs/folders-worktrees.md`.
 
 ## 4. Shared services (the docker-compose divergence)
 

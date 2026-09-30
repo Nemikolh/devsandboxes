@@ -4,6 +4,16 @@
 
 ### Changed
 
+- **`folders` entries get their own git worktree when the checkout belongs to someone else.** If an extra folder is a git repo and it's another sandbox's `folder`, or another instance already mounts it, the instance now gets a worktree of it, detached at that checkout's `HEAD`. Before, the instance mounted the live checkout, so the owner switching branches changed what the instance saw. The worktree is kept across `rebuild` and removed by `rm`. Dispatcher children always get one. To keep the old live view for an entry, write it as a table with `worktree = "never"`, or use `"always"` to force a worktree:
+
+```toml
+[sandbox.web]
+folder = "../web"
+folders = { "/workspaces/api" = "../api", "/workspaces/.shared" = { path = "../.shared", worktree = "never" } }
+```
+
+- A sandbox's own `folder` now also gets a worktree when another instance mounts that folder directly as a `folders` entry.
+
 - **`worktree-link` no longer migrates old `shared-files/<sandbox>/` stores.** The automatic move only relinked the instance being run, so every other instance on the same repo was left with dangling links. A link into an old store is now skipped with a warning that shows where the file should go. Move it there, delete the old link, and `rebuild`.
 
 ## 0.5.0
