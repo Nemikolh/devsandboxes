@@ -340,9 +340,9 @@ fn copy_entry(src: &Path, dst: &Path) -> Result<()> {
 /// fit (tracked path, conflicting file) only warns and is left untouched.
 ///
 /// `store` sits in a directory of stores (`shared-files/`); a link into a
-/// sibling store is devsandbox's own, left by the old one-store-per-sandbox
-/// layout, so it is migrated rather than reported as a conflict (see
-/// [`stale_link_target`]).
+/// sibling store is left over from the old one-store-per-sandbox layout. It is
+/// not migrated, only reported with how to move it by hand (see
+/// [`old_store_link`]).
 pub(super) fn link_shared_files(store: &Path, trees: &[&Path], entries: &[String]) -> Result<()> {
     let Some((base, _)) = trees.split_first() else { return Ok(()) };
     let stores = store.parent().unwrap_or(store);
@@ -502,28 +502,24 @@ fn git_ignores(tree: &Path, rel: &Path) -> bool {
 }
 
 /// First sighting: move the base repo's real file/dir into the empty store
-/// slot (its symlink is laid down by [`link_into`]). A base link into a
-/// sibling store (the old per-sandbox layout) has that store's copy moved
-/// over instead. No-op once the store has it, or when the base has nothing
-/// (or a foreign symlink) there.
+/// slot (its symlink is laid down by [`link_into`]). No-op once the store has
+/// it, or when the base has nothing (or a foreign symlink) there; a link into
+/// an old per-sandbox store is an error so the entry is skipped with a hint.
 fn adopt(base_path: &Path, shared: &Path, stores: &Path) -> Result<()> {
     if shared.symlink_metadata().is_ok() {
         return Ok(());
     }
     let Ok(meta) = base_path.symlink_metadata() else { return Ok(()) };
-    let src = if meta.file_type().is_symlink() {
-        match stale_link_target(base_path, shared, stores) {
-            Some(target) if target.symlink_metadata().is_ok() => target,
-            _ => return Ok(()),
+    if meta.file_type().is_symlink() {
+        if let Some(old) = old_store_link(base_path, shared, stores) {
+            return Err(old_layout_error(base_path, &old, shared));
         }
-    } else {
-        base_path.to_path_buf()
-    };
-    let meta = src.symlink_metadata()?;
+        return Ok(());
+    }
     if let Some(parent) = shared.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    if std::fs::rename(&src, shared).is_ok() {
+    if std::fs::rename(base_path, shared).is_ok() {
         return Ok(());
     }
     // rename fails across filesystems (repo and config on different mounts);
@@ -531,45 +527,53 @@ fn adopt(base_path: &Path, shared: &Path, stores: &Path) -> Result<()> {
     if !meta.is_file() {
         bail!(
             "cannot move `{}` into `{}`; move it there yourself",
-            src.display(),
+            base_path.display(),
             shared.display()
         );
     }
-    std::fs::copy(&src, shared)?;
-    std::fs::remove_file(&src)?;
+    std::fs::copy(base_path, shared)?;
+    std::fs::remove_file(base_path)?;
     Ok(())
 }
 
 /// Where `path` links to, when that is another devsandbox store under
 /// `stores` rather than `shared`: a link left by the old one-store-per-sandbox
-/// layout. Links anywhere else are the user's and never touched.
-fn stale_link_target(path: &Path, shared: &Path, stores: &Path) -> Option<PathBuf> {
+/// layout (0.4.0). Only detected, never rewritten: an automatic move
+/// broke every instance it didn't relink in the same run.
+fn old_store_link(path: &Path, shared: &Path, stores: &Path) -> Option<PathBuf> {
     let target = std::fs::read_link(path).ok()?;
     (target.is_absolute() && target.starts_with(stores) && target != shared).then_some(target)
 }
 
+fn old_layout_error(path: &Path, old: &Path, shared: &Path) -> anyhow::Error {
+    anyhow::anyhow!(
+        "`{}` links into an old per-sandbox store (`{}`); move the file to `{}` \
+         (keep one copy if several old stores differ), delete the link, then `rebuild`",
+        path.display(),
+        old.display(),
+        shared.display()
+    )
+}
+
 /// Point `path` at `shared` with an absolute symlink. `Ok(true)` when it
-/// created the link, `Ok(false)` when the right link already exists. A stale
-/// link into another store (see [`stale_link_target`]) is replaced; anything
-/// else at `path` (a real file, a foreign symlink) is an error, left alone.
+/// created the link, `Ok(false)` when the right link already exists. Anything
+/// else at `path` (a real file, a foreign symlink, a link into an old store)
+/// is an error, left alone.
 fn link_into(path: &Path, shared: &Path, stores: &Path) -> Result<bool> {
     match path.symlink_metadata() {
         Err(_) => {}
         Ok(m) if m.file_type().is_symlink() && std::fs::read_link(path)? == shared => {
             return Ok(false)
         }
-        Ok(m) if m.file_type().is_symlink() && stale_link_target(path, shared, stores).is_some() => {
-            let old = std::fs::read_link(path)?;
-            // Two old stores held diverging copies: the other one's is kept.
-            if old.symlink_metadata().is_ok() {
-                eprintln!(
-                    "warning: `{}` now links to `{}`; its previous copy is left at `{}`",
-                    path.display(),
-                    shared.display(),
-                    old.display()
-                );
+        Ok(m) if m.file_type().is_symlink() => {
+            if let Some(old) = old_store_link(path, shared, stores) {
+                return Err(old_layout_error(path, &old, shared));
             }
-            std::fs::remove_file(path)?;
+            bail!(
+                "`{}` already exists and is not a link to `{}`; merge it into the shared copy and delete it",
+                path.display(),
+                shared.display()
+            )
         }
         Ok(_) => bail!(
             "`{}` already exists and is not a link to `{}`; merge it into the shared copy and delete it",
@@ -826,45 +830,42 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    /// The old layout kept one store per sandbox, so a second sandbox on the
-    /// same repo found the base already linked into the first's store and got
-    /// nothing. The per-repo store takes over those copies and links.
+    /// Links into an old per-sandbox store (`shared-files/<sandbox>/`) are
+    /// reported, never moved or rewritten: migrating one run's trees silently
+    /// broke every other instance still pointing at the old store.
     #[test]
-    fn link_shared_files_migrates_per_sandbox_stores() {
+    fn link_shared_files_leaves_old_store_links_alone() {
         let root = std::env::temp_dir().join(format!("devsandbox-wtm-{}", std::process::id()));
         let base = repo(&root, ".env*\n");
         let stores = root.join("shared-files");
-        let (old_a, old_b, store) = (stores.join("web"), stores.join("web22"), stores.join("repo-1234"));
-        let (wt_a, wt_b) = (root.join("wt-a"), root.join("wt-b"));
-        create_worktree(&base, &wt_a, "sandbox/a", None, false, &Default::default()).unwrap();
-        create_worktree(&base, &wt_b, "sandbox/b", None, false, &Default::default()).unwrap();
-        std::fs::create_dir_all(&old_a).unwrap();
-        std::fs::create_dir_all(&old_b).unwrap();
-        std::fs::write(old_a.join(".env"), "a").unwrap();
-        std::fs::write(old_b.join(".env"), "b").unwrap();
+        let (old, store) = (stores.join("web"), stores.join("repo-1234"));
+        let wt = root.join("wt");
+        create_worktree(&base, &wt, "sandbox/a", None, false, &Default::default()).unwrap();
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join(".env"), "a").unwrap();
+        std::fs::write(old.join(".env.b"), "b").unwrap();
         let symlink = |target: &Path, at: &Path| std::os::unix::fs::symlink(target, at).unwrap();
-        symlink(&old_a.join(".env"), &base.join(".env"));
-        symlink(&old_a.join(".env"), &wt_a.join(".env"));
-        // Diverged: a copy only the other old store has.
-        symlink(&old_b.join(".env"), &wt_b.join(".env"));
-        // A user's own link outside the stores is never touched.
-        std::fs::write(root.join("mine"), "m").unwrap();
-        symlink(&root.join("mine"), &base.join(".env.local"));
-        let entries: Vec<String> = [".env", ".env.local"].map(String::from).into();
+        // Base itself on the old layout: nothing adopted.
+        symlink(&old.join(".env"), &base.join(".env"));
+        symlink(&old.join(".env"), &wt.join(".env"));
+        // Base already a real file, a worktree still on the old layout.
+        std::fs::write(base.join(".env.b"), "new").unwrap();
+        symlink(&old.join(".env.b"), &wt.join(".env.b"));
+        let entries: Vec<String> = [".env", ".env.b"].map(String::from).into();
 
-        for _ in 0..2 {
-            link_shared_files(&store, &[&base, &wt_a, &wt_b], &entries).unwrap();
-        }
+        link_shared_files(&store, &[&base, &wt], &entries).unwrap();
 
         let link = |p: &Path| std::fs::read_link(p).ok();
-        assert_eq!(std::fs::read_to_string(store.join(".env")).unwrap(), "a");
-        assert!(!old_a.join(".env").exists(), "moved, not copied");
-        for tree in [&base, &wt_a, &wt_b] {
-            assert_eq!(link(&tree.join(".env")), Some(store.join(".env")), "{}", tree.display());
-        }
-        assert_eq!(std::fs::read_to_string(old_b.join(".env")).unwrap(), "b");
-        assert_eq!(link(&base.join(".env.local")), Some(root.join("mine")));
-        assert!(!store.join(".env.local").exists());
+        assert_eq!(link(&base.join(".env")), Some(old.join(".env")));
+        assert_eq!(link(&wt.join(".env")), Some(old.join(".env")));
+        assert_eq!(std::fs::read_to_string(old.join(".env")).unwrap(), "a");
+        assert!(store.join(".env").symlink_metadata().is_err());
+        assert_eq!(link(&base.join(".env.b")), Some(store.join(".env.b")));
+        assert_eq!(link(&wt.join(".env.b")), Some(old.join(".env.b")));
+        assert_eq!(std::fs::read_to_string(old.join(".env.b")).unwrap(), "b");
+
+        let err = link_into(&wt.join(".env.b"), &store.join(".env.b"), &stores).unwrap_err();
+        assert!(err.to_string().contains("old per-sandbox store"), "{err}");
         std::fs::remove_dir_all(&root).unwrap();
     }
 

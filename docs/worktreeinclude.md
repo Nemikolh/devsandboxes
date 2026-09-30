@@ -139,20 +139,15 @@ that command generates is adopted. For each entry:
 4. If neither the store nor the base repo has the path, the entry is skipped
    silently, and a later run links it once the file exists.
 
-**Migration from per-sandbox stores.** Up to 0.4.0 the store was
-`shared-files/<sandbox>/`, so a second sandbox on the same folder found the
-base already linked into the first one's store and linked nothing. An absolute
-symlink into a *sibling* store under `shared-files/` is recognized as one of
-those old links:
-
-- in **adopt**, if the new store has no copy yet, the old store's copy that
-  the base link points to is moved into the new store;
-- in **link**, such a link is replaced rather than reported as a conflict. If
-  its old target still exists (two old stores held diverging copies), a warning
-  says where that copy was left.
-
-Symlinks pointing anywhere else are the user's and are never touched. Running
-containers still mount the old store until their next `rebuild`.
+**Old per-sandbox stores.** In 0.4.0 the store was `shared-files/<sandbox>/`,
+so a second sandbox on the same folder found the base already linked into the
+first one's store and linked nothing. An absolute symlink into a *sibling*
+store under `shared-files/` is recognized as one of those old links, but it is
+**not migrated**. 0.5.0 moved the copy automatically, which left every instance
+not relinked in that same run with dangling links. Now adopt and link skip the
+path and warn with both locations. To migrate by hand: move the file into the
+new store (keep one copy if several old stores differ), delete the old links,
+then `rebuild` each instance so it relinks and mounts the new store.
 
 Caveat: a `dir/` gitignore pattern matches directories only, and git sees a
 symlink as a file, so a linked directory shows up as untracked. The link step

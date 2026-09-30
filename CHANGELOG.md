@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **`worktree-link` no longer migrates old `shared-files/<sandbox>/` stores.** The automatic move only relinked the instance being run, so every other instance on the same repo was left with dangling links. A link into an old store is now skipped with a warning that shows where the file should go. Move it there, delete the old link, and `rebuild`.
+
 ## 0.5.0
 
 Sandboxes can now start themselves after a reboot and run unattended **dispatcher** scripts that create, drive and clean up their own child instances. Messages from inside containers show up in the dashboard and as desktop notifications. See `docs/automations-guide.md`. `run --json`, a command-less `exec` and exact-name matching make devsandbox easier to drive from scripts and other programs, and the docs now live at [devsandboxes.com](https://devsandboxes.com).
