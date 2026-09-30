@@ -109,9 +109,9 @@ PTY, so two gaps closed after the read verbs:
   ```
 
   Names follow `InstanceRow`, except `worktree` is the host path (or `null`),
-  not a flag. Plain `run` printed the name as its last stdout line, but
-  `docker run -d`, image builds, git and lifecycle hooks write to the same
-  stdout; with `--json` the process's stdout is pointed at stderr before any
+  not a flag. Plain `run` prints the name on stdout, but `docker run -d`,
+  image builds, git and lifecycle hooks write to the same stdout, and the
+  autostart pass after it prints its own lines; with `--json` the process's stdout is pointed at stderr before any
   work (`src/json_stdout.rs`: `dup2` on unix, `SetStdHandle` on Windows), so
   every inherited child stream moves too and only the document reaches stdout.
   A failure prints nothing on stdout and exits non-zero.

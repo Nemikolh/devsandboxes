@@ -85,9 +85,10 @@ listed when stdin is not a TTY.
 1. **`exec [-i] [-t] <name> [cmd…]`** — run a command inside the instance. Runs in
    the workspace dir and honors the recorded `remoteEnv` / `remoteUser`. Exits
    with the command's own status. This is the agent's main way to do work inside a
-   sandbox. `--` is only needed when the command's first word is `-i` or `-t`
-   (those are devsandbox flags, anywhere before the command). Non-interactive
-   commands need neither `-i` nor `-t`.
+   sandbox. `--` is only needed when the command's first word is a devsandbox
+   flag (`-i`, `-t`, `-h`/`--help`, `-C`/`--dir`): those are parsed as flags
+   anywhere before the command (`exec web -- -t`). Non-interactive commands
+   need neither `-i` nor `-t`.
 
    Without `cmd` it opens a login shell (zsh, else bash, else sh). With neither
    flag given that shell gets `-i`, plus `-t` when stdin is a TTY; any explicit
@@ -99,8 +100,9 @@ listed when stdin is not a TTY.
    ```
 
 2. **`run [sandbox] [--name <n>]`** — create/start an instance in the **background**.
-   Prints the instance name as its last stdout line, but child output (image
-   builds, `docker run`, git, hooks) may precede it. **`--json`** sends all of
+   Prints the instance name on stdout, but child output (image builds,
+   `docker run`, git, hooks) may precede it and an autostart pass may follow
+   it with its own lines. **`--json`** sends all of
    that to stderr and prints only
    `{"schema":1,"data":{"name","instance_id","sandbox","container","workspace","folder","base_folder","worktree","branch"}}`
    (`worktree`/`branch` are `null` without a worktree) — prefer it when scripting.

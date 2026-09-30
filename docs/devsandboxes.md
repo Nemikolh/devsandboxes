@@ -33,7 +33,7 @@ Core components:
 | `devsandbox ls`                          | List sandbox configs ("images") defined in the current folder's config.                                                                                                            |
 | `devsandbox ps`                          | List running sandbox instances (proxy to `docker ps` filtered by naming prefix).                                                                                                   |
 | `devsandbox run`                         | Start a new sandbox from a config; defaults to background; named (or name returned); interactive image picker when on a TTY; offers to generate an example config when none exist. |
-| `devsandbox exec [-it] <name> <command>` | docker-exec-like; `<name>` may be a repository or sandbox image name — interactive disambiguation on a TTY, error when ambiguous otherwise.                                        |
+| `devsandbox exec [-it] <name> [command]` | docker-exec-like, a login shell without a command; an exact instance name/id wins, else `<name>` may be a repository or sandbox name — interactive disambiguation on a TTY, error when ambiguous otherwise. |
 | `devsandbox vscode <sandboxid>`          | Open VS Code (or fork) attached to the sandbox in devcontainer mode.                                                                                                               |
 | `devsandbox init`                        | Config scaffolding — **deferred, not in v1**.                                                                                                                                      |
 

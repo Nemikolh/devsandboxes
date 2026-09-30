@@ -145,9 +145,9 @@ function execArgv(name, cmd = [], opts = {}) {
   const args = ['exec'];
   if (opts.interactive) args.push('-i');
   if (opts.tty) args.push('-t');
-  // `--` so a command word like `-t` reaches the container, not devsandbox's flags.
-  args.push(name);
-  if (cmd.length) args.push('--', ...cmd);
+  // `--` before `name` so neither a name nor a command word like `-t` is
+  // parsed as one of devsandbox's flags.
+  args.push('--', name, ...cmd);
   return { file: binaryPath(), args };
 }
 
