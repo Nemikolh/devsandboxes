@@ -196,8 +196,21 @@ export declare function stop(target: Target, opts?: CommonOptions): Promise<void
 /** Recreate from current config when drifted (`force`: even without drift). */
 export declare function rebuild(target: Target, opts?: CommonOptions & { force?: boolean }): Promise<void>;
 export declare function rename(name: string, newName: string, opts?: CommonOptions): Promise<void>;
-/** Remove container, worktree, and state entry. */
-export declare function rm(name: string, opts?: CommonOptions): Promise<void>;
+/**
+ * Remove container, worktree, and state entry. Rejects, removing nothing,
+ * when the worktree has uncommitted or untracked changes.
+ */
+export declare function rm(
+  name: string,
+  opts?: CommonOptions & {
+    /**
+     * The worktree branch `run` created: `true` deletes it (`git branch -D`,
+     * unmerged commits too), `false` or omitted keeps it. Branches `run`
+     * reused are always kept.
+     */
+    deleteBranch?: boolean;
+  },
+): Promise<void>;
 /** Remove unreferenced services (`force`: also orphaned shell-history files). */
 export declare function gc(opts?: CommonOptions & { force?: boolean }): Promise<void>;
 

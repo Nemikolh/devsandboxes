@@ -82,8 +82,10 @@ When `run` targets a sandbox whose `folder` is already mounted by an existing in
   mount. This is what the devcontainer CLI's `mountGitWorktreeCommonDir` option does.
   Alternative if we want to avoid host-path mirroring: run
   `git worktree repair` / relative gitdir rewriting inside the container — deferred.
-- Cleanup: `devsandbox rm <instance>` runs `git worktree remove` (and optionally deletes
-  the `sandbox/<instance>` branch if unmerged handling says so — prompt).
+- Cleanup: `devsandbox rm <instance>` runs `git worktree remove`, after first checking
+  the worktree is clean (a dirty one is refused before anything is torn down). A branch
+  `run` created is deleted with `git branch -D` on `--delete-branch`, kept on
+  `--keep-branch`; with neither flag `rm` prompts on a TTY and keeps it otherwise.
 - State gains `worktree: Option<PathBuf>` and `base_folder: PathBuf` per instance.
 
 ## 4. Shared services (the docker-compose divergence)

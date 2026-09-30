@@ -30,7 +30,7 @@ const { exitCode, stdout } = await devsandbox.exec(name, ['git', 'status']);
 const { file, args } = devsandbox.execArgv(name, [], { interactive: true, tty: true });
 spawn(file, args, { stdio: 'inherit' });
 
-await devsandbox.rm(name);
+await devsandbox.rm(name, { deleteBranch: true });
 ```
 
 | Function                                   | Resolves to                          |
@@ -41,13 +41,15 @@ await devsandbox.rm(name);
 | `inspect(name)`                            | runtime inspect document (`unknown`) |
 | `run(sandbox, { name, branch, base })`     | `RunRecord` (name, container, workspace, folder, worktree, branch) |
 | `start` / `stop` / `rebuild(name \| { all: true })` | `void`                      |
-| `rm(name)` / `rename(a, b)` / `gc()` / `service.rebuild(name)` | `void`          |
+| `rm(name, { deleteBranch })` / `rename(a, b)` / `gc()` / `service.rebuild(name)` | `void` |
 | `logs(name, { lines })`                    | log text                             |
 | `exec(name, argv, { input })`              | `{ exitCode, stdout, stderr }` (never rejects on exit code) |
 | `execArgv(name, argv?, { tty, interactive })` | `{ file, args }` to spawn yourself (sync; no argv: login shell) |
 | `cli(args)`                                | raw `{ exitCode, stdout, stderr }`   |
 
 Every function takes `{ dir, cwd, env, signal, stderr }`, except the synchronous `binaryPath()` and `execArgv()`. `dir` is the config root (`-C`). A failed command rejects with `DevsandboxError` (`exitCode`, `stdout`, `stderr`).
+
+`rm` never prompts: `deleteBranch: true` deletes the worktree branch `run` created (`git branch -D`, unmerged commits too); `false` or omitted keeps it. Branches `run` reused are always kept. It rejects, removing nothing, when the worktree has uncommitted or untracked changes.
 
 ## Platforms
 

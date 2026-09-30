@@ -121,7 +121,11 @@ const start = (t, opts) => cli(['start', ...target(t)], opts).then(unit);
 const stop = (t, opts) => cli(['stop', ...target(t)], opts).then(unit);
 const rebuild = (t, opts = {}) => cli(['rebuild', ...target(t), ...(opts.force ? ['--force'] : [])], opts).then(unit);
 const rename = (name, newName, opts) => cli(['rename', name, newName], opts).then(unit);
-const rm = (name, opts) => cli(['rm', name], opts).then(unit);
+// `deleteBranch` unset passes neither flag: the CLI then keeps the branch (no TTY here).
+const rm = (name, opts = {}) => {
+  const branch = opts.deleteBranch === undefined ? [] : [opts.deleteBranch ? '--delete-branch' : '--keep-branch'];
+  return cli(['rm', name, ...branch], opts).then(unit);
+};
 const gc = (opts = {}) => cli(['gc', ...(opts.force ? ['--force'] : [])], opts).then(unit);
 
 function logs(name, opts = {}) {

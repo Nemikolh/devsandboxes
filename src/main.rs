@@ -98,6 +98,13 @@ enum Command {
     Rm {
         /// Instance name, sandbox config name, or repository folder name
         name: String,
+        /// Delete the branch `run` created for the worktree without asking
+        /// (`git branch -D`: unmerged commits go too)
+        #[arg(long, conflicts_with = "keep_branch")]
+        delete_branch: bool,
+        /// Keep the branch `run` created without asking (the default off a TTY)
+        #[arg(long)]
+        keep_branch: bool,
     },
     /// Stop a sandbox instance (docker stop; `start` restarts it)
     Stop {
@@ -259,7 +266,9 @@ fn main() -> Result<()> {
             commands::rebuild::rebuild(&cli.dir, name, all, force)
         }
         Command::Rename { name, new_name } => commands::rename::rename(&name, &new_name),
-        Command::Rm { name } => commands::rm::rm(&name),
+        Command::Rm { name, delete_branch, keep_branch } => {
+            commands::rm::rm(&name, rm_branch_flag(delete_branch, keep_branch))
+        }
         Command::Stop { name, all } => commands::stop::stop(name, all),
         Command::Start { name, all } => {
             let result = commands::start::start(&cli.dir, name, all);
@@ -290,5 +299,41 @@ fn main() -> Result<()> {
                 anyhow::bail!("port forwarding is unix-only for now")
             }
         }
+    }
+}
+
+/// `rm`'s branch flags as the answer `commands::rm::rm` takes: `None` (no
+/// flag) keeps the prompt. clap makes the two mutually exclusive.
+fn rm_branch_flag(delete_branch: bool, keep_branch: bool) -> Option<bool> {
+    match (delete_branch, keep_branch) {
+        (true, _) => Some(true),
+        (_, true) => Some(false),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::{rm_branch_flag, Cli, Command};
+
+    fn rm_flag(args: &[&str]) -> Result<Option<bool>, clap::Error> {
+        let cli = Cli::try_parse_from(["devsandbox", "rm", "web"].iter().chain(args))?;
+        match cli.command {
+            Some(Command::Rm { delete_branch, keep_branch, .. }) => {
+                Ok(rm_branch_flag(delete_branch, keep_branch))
+            }
+            _ => panic!("not rm"),
+        }
+    }
+
+    #[test]
+    fn rm_branch_flags_parse_and_exclude_each_other() {
+        assert_eq!(rm_flag(&[]).unwrap(), None);
+        assert_eq!(rm_flag(&["--delete-branch"]).unwrap(), Some(true));
+        assert_eq!(rm_flag(&["--keep-branch"]).unwrap(), Some(false));
+        let err = rm_flag(&["--delete-branch", "--keep-branch"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 }

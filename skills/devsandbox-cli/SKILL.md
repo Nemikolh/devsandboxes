@@ -158,10 +158,15 @@ listed when stdin is not a TTY.
    rebuilds every drifted instance (every instance with `--force`), skipping
    ones from other config roots. The fix for the config-drift warning.
 
-10. **`rm <name>`** — remove container, its worktree (prompts to delete the
-   branch on a TTY, only when `run` created it), isolated services, per-instance network,
-   and the state entry. Managed shell history is **kept** so a rebuilt instance
-   inherits it. Global services are left for `gc`.
+10. **`rm <name> [--delete-branch | --keep-branch]`** — remove container, its
+   worktree, isolated services, per-instance network, and the state entry.
+   Managed shell history is **kept** so a rebuilt instance inherits it. Global
+   services are left for `gc`. A worktree with uncommitted or untracked changes
+   makes `rm` refuse up front, removing nothing: commit, stash or discard them
+   first. The worktree branch is only ever deleted when `run` created it:
+   `--delete-branch` deletes it (`git branch -D`, unmerged commits too),
+   `--keep-branch` keeps it; with neither, `rm` prompts on a TTY and keeps it
+   off one. Scripts wanting the branch gone must pass `--delete-branch`.
 
 11. **`gc [--force]`** — reap shared services no live instance references, orphaned
    networks, and orphaned shell-history files (`--force` skips the per-file

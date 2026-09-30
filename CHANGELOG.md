@@ -57,6 +57,7 @@ forwardPorts = [3000, "8080:3000", "db:5432"]
 - **`run --json`**: prints one `{"schema": 1, "data": {...}}` document for the new instance (`name`, `instance_id`, `sandbox`, `container`, `workspace`, `folder`, `base_folder`, `worktree`, `branch`; the last two `null` without a worktree). Everything child processes print (image builds, `docker run`, git, lifecycle hooks, autostart) goes to stderr, so stdout parses as-is for programmatic and GUI callers.
 - **`exec <name>` without a command** opens a login shell (zsh, else bash, else sh), the same one the dashboard's terminal opens. With neither `-i` nor `-t` given it runs with `-i`, plus `-t` when stdin is a TTY, so it works as is from a terminal or a pty (node-pty); explicit flags are used as given.
 - **npm: `execArgv(name, cmd?, { tty, interactive })`** returns `{ file, args }` for spawning `devsandbox exec` yourself (node-pty, `child_process.spawn`) without shell quoting.
+- **`rm --delete-branch` / `rm --keep-branch`** answer the "delete branch?" question without prompting, so scripts and other callers without a TTY can clean up the branch `run` created. `--delete-branch` deletes it like answering yes (`git branch -D`, so unmerged commits go too); `--keep-branch` keeps it. Branches `run` reused rather than created are always kept. With neither flag, `rm` still asks on a TTY and keeps the branch otherwise. npm: `rm(name, { deleteBranch })`, where `true` / `false` pass `--delete-branch` / `--keep-branch`.
 
 ### Changed
 
@@ -78,6 +79,7 @@ forwardPorts = [3000, "8080:3000", "db:5432"]
 
 ### Fixed
 
+- **`rm` on a dirty worktree no longer leaves an instance without its container.** `rm` removed the container, volumes and services first, then `git worktree remove` refused the uncommitted or untracked changes, stranding the instance. It now checks the worktree first and refuses with the list of changes, removing nothing.
 - **Keyboard chords like ctrl+m reach apps in dashboard terminals.** In terminals that support the kitty keyboard protocol (kitty, Alacritty ≥ 0.13, Ghostty, WezTerm, foot, iTerm2 ≥ 3.5), the dashboard now turns the protocol on and passes it through to apps inside its terminals that ask for it. zidane's ctrl+m, for example, no longer arrives as Enter. Shells and other apps that don't ask for it get the same keys as before. GNOME Terminal and tmux don't support the protocol, so there ctrl+m and Enter still can't be told apart.
 - **The mouse wheel scrolls full-screen apps in dashboard terminals.** It used to scroll only the terminal's own scrollback, which full-screen apps don't have. Now apps that track the mouse (zidane, vim with `mouse=a`, htop) get the wheel directly, and pagers like `less` and `man` get ↑/↓. Shells still scroll their history.
 - **Forwarded ports reach servers listening only on IPv6 loopback.** Dev servers told `localhost` (webpack-dev-server, Vite, Node 17+) often bind only `[::1]`, while forwards dialed `127.0.0.1`, so every connection was refused. A loopback dial now also tries the other family (`127.0.0.1` ↔ `::1`). Running instances pick up the new helper when restarted.
