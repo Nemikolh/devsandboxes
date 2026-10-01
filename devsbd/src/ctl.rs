@@ -167,6 +167,8 @@ fn parse_args(verb: &str, args: &[String]) -> Result<Cmd, String> {
         Op::Ensure => (1, "exactly one <sandbox>"),
         Op::Stop | Op::Rm | Op::Exec | Op::RunLs | Op::RunPrune => (1, "exactly one <key>"),
         Op::RunLogs | Op::RunWait | Op::RunRm => (2, "<key> <id>"),
+        // Not a CLI verb yet (`main.rs` doesn't route it).
+        Op::Branches => return Err(format!("unknown command `{verb}`")),
     };
     if positional.len() != wanted {
         return Err(format!("takes {what}"));

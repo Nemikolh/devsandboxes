@@ -23,6 +23,11 @@
 //! saved env (the `devsandbox exec` argv), output captured, and answers with what it
 //! printed. Only owned, running children with a helper are reachable.
 //!
+//! `branches` (read-only, a sandbox in `spawn`) lists the branches checked out
+//! in that sandbox's base repo, live from host `git worktree list`, each with
+//! its holder (this dispatcher's child, another instance, the base checkout,
+//! or a worktree devsandbox doesn't know), never a host path.
+//!
 //! Children are ordinary instances named `<sandbox>-<key>`. Operations run as
 //! `devsandbox -C <config root> run|start|rebuild|stop|rm …` subprocesses, not
 //! in-process: the handler runs on the TUI's bridge worker and those commands
@@ -30,7 +35,7 @@
 //! on the alternate screen. Their output goes to
 //! `<data>/devsandbox/logs/dispatch-<unix>-<op>.log`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -38,6 +43,7 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
+use crate::commands::run::{instance_at, parse_worktree_list};
 use crate::config::Config;
 use crate::devsbd::control::{self, Op, Request, Response, Status};
 use crate::runtime::{backend, bounded};
@@ -58,6 +64,9 @@ const DEVSANDBOX_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// Wall-clock limit on one run-op exec in a child ([`Executor::exec_in`]).
 const EXEC_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+/// Wall-clock limit on one host git call of `branches` ([`Executor::git`]).
+const GIT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Room over [`MAX_WAIT`] for a `run wait` exec, whose helper-side wait is
 /// already capped at that.
@@ -96,6 +105,9 @@ pub trait Executor {
     /// under the bridge's host-wide control lock, before the op's subprocess
     /// (which then loads the updated entry).
     fn save_env(&mut self, name: &str, env: &BTreeMap<String, String>) -> Result<(), String>;
+    /// Run host git (`host_git`) on `repo` with `args`, output captured;
+    /// stdout on success, else a short message.
+    fn git(&mut self, repo: &Path, args: &[String]) -> Result<String, String>;
 }
 
 /// Load state and the dispatcher's config, then [`handle_with`] the real
@@ -262,6 +274,30 @@ pub(crate) fn handle_with(
             };
             run_op(&name, &state.instances[&name], req, exec)
         }
+        Op::Branches => {
+            let sandbox = req.sandbox.as_deref().expect("checked by check_fields");
+            if !decl.may_spawn(sandbox) {
+                return denied(format!(
+                    "sandbox `{}` may not spawn `{sandbox}` (not in `dispatcher.spawn`)",
+                    owner.sandbox
+                ));
+            }
+            if !config.sandboxes.contains_key(sandbox) {
+                return denied(format!("unknown sandbox `{sandbox}`"));
+            }
+            let target = match config.resolve_sandbox(sandbox) {
+                Ok(target) => target,
+                Err(e) => return failed(format!("{e:#}")),
+            };
+            // As `run` resolves it.
+            let Some(folder) = target.folder() else {
+                return failed(format!("sandbox `{sandbox}` has no `folder`"));
+            };
+            let Ok(base) = config_dir.join(folder).canonicalize() else {
+                return failed(format!("sandbox folder `{folder}` does not exist"));
+            };
+            branches(state, owner_id, &base, req.ahead, exec)
+        }
     }
 }
 
@@ -273,6 +309,7 @@ fn check_fields(req: &Request) -> Result<(), String> {
     let (sandbox, key) = match req.op {
         Op::Ls => (Some(false), Some(false)),
         Op::Ensure => (Some(true), Some(true)),
+        Op::Branches => (Some(true), Some(false)),
         _ => (None, Some(true)),
     };
     let only = |ops: &[Op], optional: bool| match (ops.contains(&req.op), optional) {
@@ -296,6 +333,7 @@ fn check_fields(req: &Request) -> Result<(), String> {
     field("timeout", only(&[Op::RunWait], true), req.timeout.is_some())?;
     field("force", only(&[Op::RunRm], true), req.force)?;
     field("keep", only(&[Op::RunPrune], true), req.keep.is_some())?;
+    field("ahead", only(&[Op::Branches], true), req.ahead)?;
     if let Some(key) = &req.key {
         if !valid_key(key) {
             return Err(format!(
@@ -347,7 +385,7 @@ fn helper_argv(req: &Request) -> Vec<String> {
                 argv.extend([s("--keep"), keep.to_string()]);
             }
         }
-        Op::Ensure | Op::Ls | Op::Stop | Op::Rm => unreachable!("not a run op"),
+        Op::Ensure | Op::Ls | Op::Stop | Op::Rm | Op::Branches => unreachable!("not a run op"),
     }
     argv
 }
@@ -577,6 +615,119 @@ fn ls(state: &State, owner_id: &str, exec: &mut dyn Executor) -> Response {
     }
 }
 
+/// Who has a `branches` row's branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum Holder {
+    /// A worktree of one of this dispatcher's children.
+    Child,
+    /// A worktree of any other instance, from any config root.
+    Instance,
+    /// The base checkout itself.
+    Base,
+    /// A worktree devsandbox doesn't know.
+    External,
+    /// (`ahead` only) In no worktree, with commits `origin` doesn't have.
+    Local,
+}
+
+/// One `branches` entry. No path: host paths stay on the host.
+#[derive(Debug, Serialize)]
+struct BranchRow {
+    branch: String,
+    holder: Holder,
+    /// The holding instance's name (`child`, `instance`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instance: Option<String>,
+    /// Commits on the local branch not on `origin/<branch>`; `None` without
+    /// `ahead`, or when `origin/<branch>` doesn't exist.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ahead: Option<u64>,
+}
+
+/// The rows for `git worktree list --porcelain` output: one per worktree
+/// with a branch, detached and prunable ones left out. A worktree some
+/// instance's folder is reports that instance, even the base checkout.
+fn holder_rows(state: &State, owner_id: &str, porcelain: &str) -> Vec<BranchRow> {
+    parse_worktree_list(porcelain)
+        .into_iter()
+        .enumerate()
+        .filter(|(_, w)| !w.prunable)
+        .filter_map(|(i, w)| {
+            let branch = w.branch?;
+            let instance = instance_at(state, &w.path);
+            let holder = match &instance {
+                Some(name) if state.instances[name].dispatcher.as_deref() == Some(owner_id) => Holder::Child,
+                Some(_) => Holder::Instance,
+                // Git always lists the main worktree first.
+                None if i == 0 => Holder::Base,
+                None => Holder::External,
+            };
+            Some(BranchRow { branch, holder, instance, ahead: None })
+        })
+        .collect()
+}
+
+/// `for-each-ref --format=%(refname) refs/heads refs/remotes/origin` output
+/// → (local branches, branches on `origin`). `origin/HEAD` is not a branch.
+fn split_refs(refs: &str) -> (BTreeSet<String>, BTreeSet<String>) {
+    let (mut local, mut pushed) = (BTreeSet::new(), BTreeSet::new());
+    for line in refs.lines().map(str::trim) {
+        if let Some(b) = line.strip_prefix("refs/heads/") {
+            local.insert(b.to_string());
+        } else if let Some(b) = line.strip_prefix("refs/remotes/origin/").filter(|b| *b != "HEAD") {
+            pushed.insert(b.to_string());
+        }
+    }
+    (local, pushed)
+}
+
+/// The `branches` op on base repo `base` (see [`Holder`]). With `ahead`,
+/// one `rev-list` per local branch that has an `origin` counterpart.
+fn branches(state: &State, owner_id: &str, base: &Path, ahead: bool, exec: &mut dyn Executor) -> Response {
+    let s = |v: &str| v.to_string();
+    let porcelain = match exec.git(base, &[s("worktree"), s("list"), s("--porcelain")]) {
+        Ok(out) => out,
+        Err(e) => return failed(e),
+    };
+    let mut rows = holder_rows(state, owner_id, &porcelain);
+    if ahead {
+        let refs_args = [s("for-each-ref"), s("--format=%(refname)"), s("refs/heads"), s("refs/remotes/origin")];
+        let refs = match exec.git(base, &refs_args) {
+            Ok(out) => out,
+            Err(e) => return failed(e),
+        };
+        let (local, pushed) = split_refs(&refs);
+        let mut counts = BTreeMap::new();
+        for b in local.intersection(&pushed) {
+            // Full refs: a branch name can't read as an option.
+            let range = format!("refs/remotes/origin/{b}..refs/heads/{b}");
+            let out = match exec.git(base, &[s("rev-list"), s("--count"), range]) {
+                Ok(out) => out,
+                Err(e) => return failed(e),
+            };
+            match out.trim().parse::<u64>() {
+                Ok(n) => counts.insert(b.as_str(), n),
+                Err(_) => return failed(format!("`git rev-list --count` printed `{}`", out.trim())),
+            };
+        }
+        for row in &mut rows {
+            row.ahead = counts.get(row.branch.as_str()).copied();
+        }
+        let held: BTreeSet<String> = rows.iter().map(|r| r.branch.clone()).collect();
+        for (b, n) in counts {
+            if n > 0 && !held.contains(b) {
+                rows.push(BranchRow { branch: b.to_string(), holder: Holder::Local, instance: None, ahead: Some(n) });
+            }
+        }
+    }
+    rows.sort_by(|a, b| a.branch.cmp(&b.branch));
+    match serde_json::to_string_pretty(&rows) {
+        Ok(json) => Response::new(Status::Ok, json),
+        Err(e) => failed(e.to_string()),
+    }
+}
+
 /// The real executor: the runtime for liveness, a quiet `devsandbox`
 /// subprocess for everything else.
 struct Subprocess;
@@ -678,6 +829,27 @@ impl Executor for Subprocess {
         info.extra_env = env.clone();
         state.save().map_err(|e| format!("{e:#}"))
     }
+
+    fn git(&mut self, repo: &Path, args: &[String]) -> Result<String, String> {
+        let mut cmd = crate::commands::run::host_git(repo).map_err(|e| format!("{e:#}"))?;
+        // Captured, never inherited: this runs on the TUI's bridge worker.
+        // Bounded like `exec_in`: a wedged git must not pin the handler.
+        let cap = control::MAX_RESPONSE;
+        let out = bounded::run(cmd.args(args).stdin(Stdio::null()), cap, GIT_TIMEOUT).map_err(|e| match e {
+            bounded::Error::Io(e) => format!("cannot run git: {e}"),
+            e => format!("`git {}` {e}", args.first().map(String::as_str).unwrap_or("?")),
+        })?;
+        if out.truncated {
+            return Err(format!("`git` output is longer than {cap} bytes"));
+        }
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let why = stderr.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+            let verb = args.first().map(String::as_str).unwrap_or("?");
+            return Err(format!("`git {verb}` failed ({}): {why}", out.status));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
 }
 
 /// `<data>/devsandbox/logs/dispatch-<unix>-<op>.log` (next to `state.toml`,
@@ -768,7 +940,8 @@ folder = "."
 
     /// Records calls; `running`: container -> liveness (absent = no container).
     /// `exec_in` answers `helper` and records `(container, argv)` in `execs`;
-    /// `save_env` records `(name, env)` in `saved`.
+    /// `save_env` records `(name, env)` in `saved`; `git` answers `git_out`
+    /// by argv (absent = an error) and records `(repo, argv)` in `gits`.
     #[derive(Default)]
     struct Fake {
         running: BTreeMap<String, bool>,
@@ -777,6 +950,8 @@ folder = "."
         helper: ExecOutput,
         execs: Vec<(String, Vec<String>)>,
         saved: Vec<(String, BTreeMap<String, String>)>,
+        git_out: BTreeMap<Vec<String>, String>,
+        gits: Vec<(PathBuf, Vec<String>)>,
     }
 
     impl Fake {
@@ -804,6 +979,10 @@ folder = "."
         fn save_env(&mut self, name: &str, env: &BTreeMap<String, String>) -> Result<(), String> {
             self.saved.push((name.to_string(), env.clone()));
             Ok(())
+        }
+        fn git(&mut self, repo: &Path, args: &[String]) -> Result<String, String> {
+            self.gits.push((repo.to_path_buf(), args.to_vec()));
+            self.git_out.get(args).cloned().ok_or_else(|| format!("no canned `git {}`", args.join(" ")))
         }
     }
 
@@ -1394,6 +1573,144 @@ folder = "."
         s.instances.remove("web-other");
         let resp = call(&s, "a", &req(Op::Ls, None, None), &mut Fake::default());
         assert_eq!(resp.body, "[]");
+    }
+
+    const WORKTREES: &[&str] = &["worktree", "list", "--porcelain"];
+    const REFS: &[&str] = &["for-each-ref", "--format=%(refname)", "refs/heads", "refs/remotes/origin"];
+
+    fn rev_list(b: &str) -> Vec<String> {
+        argv(&["rev-list", "--count", &format!("refs/remotes/origin/{b}..refs/heads/{b}")])
+    }
+
+    /// `state()` with `d`'s config root a real dir (the base repo path is
+    /// canonicalized, as `run` does), and the base checkout: `/w/base`.
+    fn branches_state() -> (State, PathBuf) {
+        let mut s = state();
+        let root = std::env::temp_dir();
+        s.instances.get_mut("d").unwrap().config_dir = Some(root.clone());
+        (s, root.canonicalize().unwrap())
+    }
+
+    /// One record per holder kind, plus a detached and a prunable worktree.
+    /// `web-one` was created on `sandbox/web-one` but switched by hand.
+    const PORCELAIN: &str = "worktree /w/base\nHEAD 1\nbranch refs/heads/master\n\n\
+        worktree /w/web-one\nHEAD 2\nbranch refs/heads/feat/switched\n\n\
+        worktree /w/web-mine\nHEAD 3\nbranch refs/heads/joan/mine\n\n\
+        worktree /w/web-other\nHEAD 4\nbranch refs/heads/other/kid\n\n\
+        worktree /elsewhere/hand\nHEAD 5\nbranch refs/heads/joan/hand-made\n\n\
+        worktree /w/web-two\nHEAD 6\ndetached\n\n\
+        worktree /gone\nHEAD 7\nbranch refs/heads/joan/gone\nprunable gitdir file points to non-existent location\n\n";
+
+    fn branches_fake() -> Fake {
+        let mut fake = Fake::new();
+        fake.git_out.insert(argv(WORKTREES), PORCELAIN.into());
+        fake
+    }
+
+    fn branches_req(sandbox: &str, ahead: bool) -> Request {
+        Request { ahead, ..req(Op::Branches, Some(sandbox), None) }
+    }
+
+    #[test]
+    fn branches_lists_holders_from_live_worktrees() {
+        let (s, base) = branches_state();
+        let mut fake = branches_fake();
+        let resp = call(&s, "d", &branches_req("web", false), &mut fake);
+        assert_eq!(resp.status, Status::Ok, "{resp:?}");
+        let rows: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        // Sorted by branch; no `ahead`, no `local` rows; detached `web-two`
+        // and the prunable record left out; the live branch, not `sandbox/web-one`.
+        assert_eq!(
+            rows,
+            serde_json::json!([
+                {"branch": "feat/switched", "holder": "child", "instance": "web-one"},
+                {"branch": "joan/hand-made", "holder": "external"},
+                {"branch": "joan/mine", "holder": "instance", "instance": "web-mine"},
+                {"branch": "master", "holder": "base"},
+                {"branch": "other/kid", "holder": "instance", "instance": "web-other"},
+            ])
+        );
+        assert!(!resp.body.contains("/w/") && !resp.body.contains("/elsewhere"), "no host paths");
+        assert_eq!(fake.gits, vec![(base, argv(WORKTREES))], "no ref or rev-list calls");
+        assert!(fake.calls.is_empty() && fake.execs.is_empty());
+        // An instance on the base checkout itself reports as `instance`.
+        let mut s = s;
+        s.instances.get_mut("web-mine").unwrap().folder = "/w/base".into();
+        let resp = call(&s, "d", &branches_req("web", false), &mut branches_fake());
+        let rows: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(rows[3], serde_json::json!({"branch": "master", "holder": "instance", "instance": "web-mine"}));
+    }
+
+    #[test]
+    fn branches_ahead_counts_and_local_rows() {
+        let (s, _) = branches_state();
+        let mut fake = branches_fake();
+        let refs = [
+            "refs/heads/master", "refs/heads/feat/switched", "refs/heads/joan/mine",
+            "refs/heads/other/kid", "refs/heads/joan/hand-made", "refs/heads/joan/wip",
+            "refs/heads/joan/synced", "refs/heads/never-pushed",
+            "refs/remotes/origin/HEAD", "refs/remotes/origin/master", "refs/remotes/origin/feat/switched",
+            "refs/remotes/origin/joan/wip", "refs/remotes/origin/joan/synced", "refs/remotes/origin/only-remote",
+        ];
+        fake.git_out.insert(argv(REFS), refs.join("\n") + "\n");
+        for (b, n) in [("master", "0"), ("feat/switched", "2"), ("joan/wip", "3"), ("joan/synced", "0")] {
+            fake.git_out.insert(rev_list(b), format!("{n}\n"));
+        }
+        let resp = call(&s, "d", &branches_req("web", true), &mut fake);
+        assert_eq!(resp.status, Status::Ok, "{resp:?}");
+        let rows: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(
+            rows,
+            serde_json::json!([
+                {"branch": "feat/switched", "holder": "child", "instance": "web-one", "ahead": 2},
+                // Never pushed: no `ahead`.
+                {"branch": "joan/hand-made", "holder": "external"},
+                {"branch": "joan/mine", "holder": "instance", "instance": "web-mine"},
+                // Unpushed commits in no worktree; `joan/synced` (0) and
+                // `never-pushed` (no origin) get no row.
+                {"branch": "joan/wip", "holder": "local", "ahead": 3},
+                {"branch": "master", "holder": "base", "ahead": 0},
+                {"branch": "other/kid", "holder": "instance", "instance": "web-other"},
+            ])
+        );
+        // One ref listing, then rev-list only where `origin/B` exists.
+        let mut called: Vec<Vec<String>> = fake.gits.into_iter().map(|(_, a)| a).collect();
+        assert_eq!(called.drain(..2).collect::<Vec<_>>(), vec![argv(WORKTREES), argv(REFS)]);
+        called.sort();
+        let mut want: Vec<_> = ["feat/switched", "joan/synced", "joan/wip", "master"].map(rev_list).into();
+        want.sort();
+        assert_eq!(called, want);
+    }
+
+    #[test]
+    fn branches_auth_and_fields() {
+        let (mut s, _) = branches_state();
+        let cases: &[(&str, Request, Status, &str)] = &[
+            ("d", branches_req("api", false), Status::Denied, "may not spawn `api`"),
+            ("a", branches_req("nope", false), Status::Denied, "unknown sandbox `nope`"),
+            ("p", branches_req("web", false), Status::Denied, "does not declare `dispatcher`"),
+            ("d", req(Op::Branches, None, None), Status::Usage, "`branches` needs `sandbox`"),
+            ("d", req(Op::Branches, Some("web"), Some("one")), Status::Usage, "`branches` takes no `key`"),
+            ("d", Request { ahead: true, ..req(Op::Ls, None, None) }, Status::Usage, "`ls` takes no `ahead`"),
+            ("d", Request { ahead: true, ..req(Op::Ensure, Some("web"), Some("x")) }, Status::Usage, "`ensure` takes no `ahead`"),
+            ("d", Request { branch: Some("x".into()), ..branches_req("web", false) }, Status::Usage, "takes no `branch`/`env`"),
+        ];
+        for (who, r, status, needle) in cases {
+            let mut fake = branches_fake();
+            let resp = call(&s, who, r, &mut fake);
+            assert_eq!(resp.status, *status, "{who} {r:?}: {resp:?}");
+            assert!(resp.body.contains(needle), "{who} {r:?}: {resp:?}");
+            assert!(fake.gits.is_empty(), "no git call: {r:?}");
+        }
+        // A missing base folder (as `run`) and a git failure are `failed`.
+        let resp = call(&state(), "d", &branches_req("web", false), &mut branches_fake());
+        assert_eq!(resp, Response::new(Status::Failed, "sandbox folder `.` does not exist"));
+        let resp = call(&s, "d", &branches_req("web", false), &mut Fake::new());
+        assert_eq!(resp.status, Status::Failed, "{resp:?}");
+        let resp = call(&s, "d", &branches_req("web", true), &mut branches_fake());
+        assert!(resp.body.contains("no canned `git for-each-ref"), "{resp:?}");
+        s.instances.get_mut("a").unwrap().config_dir = s.instances["d"].config_dir.clone();
+        assert_eq!(call(&s, "a", &branches_req("web", false), &mut branches_fake()).status, Status::Ok);
     }
 
     #[test]

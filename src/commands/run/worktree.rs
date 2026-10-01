@@ -232,30 +232,48 @@ fn fetch_origin_branch(base: &Path, branch: &str) {
 /// included), if anywhere.
 fn checked_out_at(base: &Path, branch: &str) -> Option<PathBuf> {
     let list = git_query(base, &["worktree", "list", "--porcelain"])?;
-    worktree_with_branch(&list, branch)
+    parse_worktree_list(&list)
+        .into_iter()
+        .find(|w| w.branch.as_deref() == Some(branch))
+        .map(|w| w.path)
+}
+
+/// One record of `git worktree list --porcelain`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorktreeEntry {
+    pub path: PathBuf,
+    /// The checked-out branch, `refs/heads/` stripped; `None` when detached
+    /// (or bare).
+    pub branch: Option<String>,
+    /// Its directory is gone (`git worktree prune` would drop it).
+    pub prunable: bool,
 }
 
 /// Parse `git worktree list --porcelain`: blank-line-separated records, each
-/// `worktree <path>` then e.g. `branch refs/heads/<name>`.
-fn worktree_with_branch(porcelain: &str, branch: &str) -> Option<PathBuf> {
-    let want = format!("refs/heads/{branch}");
-    porcelain.split("\n\n").find_map(|record| {
-        let mut path = None;
-        let mut hit = false;
-        for line in record.lines() {
-            if let Some(p) = line.strip_prefix("worktree ") {
-                path = Some(PathBuf::from(p));
-            } else if line.strip_prefix("branch ") == Some(want.as_str()) {
-                hit = true;
+/// `worktree <path>` then e.g. `branch refs/heads/<name>`, `detached`,
+/// `prunable [reason]`. Git lists the main worktree first; order is kept.
+pub(crate) fn parse_worktree_list(porcelain: &str) -> Vec<WorktreeEntry> {
+    porcelain
+        .split("\n\n")
+        .filter_map(|record| {
+            let (mut path, mut branch, mut prunable) = (None, None, false);
+            for line in record.lines() {
+                if let Some(p) = line.strip_prefix("worktree ") {
+                    path = Some(PathBuf::from(p));
+                } else if let Some(b) = line.strip_prefix("branch ") {
+                    branch = b.strip_prefix("refs/heads/").map(str::to_string);
+                } else if line == "prunable" || line.starts_with("prunable ") {
+                    prunable = true;
+                }
             }
-        }
-        path.filter(|_| hit)
-    })
+            Some(WorktreeEntry { path: path?, branch, prunable })
+        })
+        .collect()
 }
 
 /// The instance whose working tree is `path` (a worktree, or a base-folder
 /// instance's checkout). Paths compare canonicalized: git prints real paths.
-fn instance_at(state: &crate::state::State, path: &Path) -> Option<String> {
+pub(crate) fn instance_at(state: &crate::state::State, path: &Path) -> Option<String> {
     let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
     let want = canon(path);
     state
@@ -1108,11 +1126,25 @@ mod tests {
     fn worktree_list_porcelain_finds_branch() {
         let list = "worktree /r\nHEAD 1111\nbranch refs/heads/main\n\n\
                     worktree /w/a\nHEAD 2222\ndetached\n\n\
-                    worktree /w/b\nHEAD 3333\nbranch refs/heads/feat/x\n";
-        assert_eq!(worktree_with_branch(list, "main"), Some(PathBuf::from("/r")));
-        assert_eq!(worktree_with_branch(list, "feat/x"), Some(PathBuf::from("/w/b")));
-        assert_eq!(worktree_with_branch(list, "feat"), None);
-        assert_eq!(worktree_with_branch(list, "x"), None);
+                    worktree /w/b\nHEAD 3333\nbranch refs/heads/feat/x\n\n\
+                    worktree /w/gone\nHEAD 4444\nbranch refs/heads/old\nprunable gitdir file points to non-existent location\n\n\
+                    worktree /w/gone2\nHEAD 5555\ndetached\nlocked\nprunable\n\n";
+        let entry = |path: &str, branch: Option<&str>, prunable| WorktreeEntry {
+            path: path.into(),
+            branch: branch.map(str::to_string),
+            prunable,
+        };
+        assert_eq!(
+            parse_worktree_list(list),
+            vec![
+                entry("/r", Some("main"), false),
+                entry("/w/a", None, false),
+                entry("/w/b", Some("feat/x"), false),
+                entry("/w/gone", Some("old"), true),
+                entry("/w/gone2", None, true),
+            ]
+        );
+        assert_eq!(parse_worktree_list(""), vec![]);
     }
 
     fn head_branch(wt: &Path) -> String {

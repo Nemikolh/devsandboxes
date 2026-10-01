@@ -1,4 +1,4 @@
-//! Control requests and responses: what `devsbd ensure|ls|stop|rm|exec|run`
+//! Control requests and responses: what `devsbd ensure|ls|stop|rm|exec|run|branches`
 //! sends from a dispatcher's container to the host, and what comes back
 //! (docs/automations.md, "Dispatchers"). One file shared by both crates
 //! (devsbd includes it via `#[path]`) so both ends can't drift; std-only and
@@ -8,7 +8,7 @@
 //! escaped as in `escape.rs` (`\\`, `\n`, `\0`). Request:
 //!
 //! ```text
-//! op ensure             required, once: ensure|ls|stop|rm|exec|run-ls|run-logs|run-wait|run-rm|run-prune
+//! op ensure             required, once: ensure|ls|stop|rm|exec|run-ls|run-logs|run-wait|run-rm|run-prune|branches
 //! sandbox web           optional, at most once
 //! key pr-123            optional, at most once
 //! branch feat/x         optional, at most once
@@ -19,6 +19,7 @@
 //! timeout 5             optional, at most once: decimal seconds
 //! force                 optional, at most once, no value: a flag (`run-rm --force`)
 //! keep 5                optional, at most once: decimal count of runs to keep
+//! ahead                 optional, at most once, no value: a flag (`branches --ahead`)
 //! ```
 //!
 //! Which fields an op needs is the host handler's call (`commands::dispatch`),
@@ -26,7 +27,7 @@
 //!
 //! ```text
 //! status ok             required, once: ok|denied|failed|no-host|usage
-//! body web-pr-123       required, once: instance name (ensure), JSON (ls),
+//! body web-pr-123       required, once: instance name (ensure), JSON (ls, branches),
 //!                       run id (exec), `devsbd run ls|wait` output (run-ls,
 //!                       run-wait, run-prune), `<next offset>\n<log text>` (run-logs),
 //!                       else a short message; may be empty
@@ -71,10 +72,12 @@ pub enum Op {
     RunRm,
     /// Delete a child's ended runs but the newest `keep`; body = the count.
     RunPrune,
+    /// Branches checked out in a sandbox's base repo, and who holds them.
+    Branches,
 }
 
 impl Op {
-    pub const ALL: [Op; 10] = [
+    pub const ALL: [Op; 11] = [
         Op::Ensure,
         Op::Ls,
         Op::Stop,
@@ -85,6 +88,7 @@ impl Op {
         Op::RunWait,
         Op::RunRm,
         Op::RunPrune,
+        Op::Branches,
     ];
 
     pub fn parse(s: &str) -> Option<Op> {
@@ -103,6 +107,7 @@ impl Op {
             Op::RunWait => "run-wait",
             Op::RunRm => "run-rm",
             Op::RunPrune => "run-prune",
+            Op::Branches => "branches",
         }
     }
 }
@@ -154,6 +159,7 @@ pub struct Request {
     pub timeout: Option<u64>,
     pub force: bool,
     pub keep: Option<u64>,
+    pub ahead: bool,
 }
 
 impl Request {
@@ -171,6 +177,7 @@ impl Request {
             timeout: None,
             force: false,
             keep: None,
+            ahead: false,
         }
     }
 }
@@ -330,6 +337,9 @@ pub fn encode_request(r: &Request) -> String {
     if let Some(keep) = r.keep {
         line(&mut out, "keep", &keep.to_string());
     }
+    if r.ahead {
+        out.push_str("ahead\n");
+    }
     out
 }
 
@@ -337,7 +347,7 @@ pub fn decode_request(text: &str) -> Result<Request, String> {
     let (mut op, mut sandbox, mut key, mut branch) = (None, None, None, None);
     let mut env = Vec::new();
     let (mut argv, mut id, mut offset, mut timeout) = (Vec::new(), None, None, None);
-    let (mut force, mut keep) = (None, None);
+    let (mut force, mut keep, mut ahead) = (None, None, None);
     for d in directives(text) {
         let (n, name, value) = d?;
         match name {
@@ -358,6 +368,8 @@ pub fn decode_request(text: &str) -> Result<Request, String> {
             "force" if value.is_empty() => set_once(&mut force, (), n, name)?,
             "force" => return Err(format!("line {n}: `force` takes no value")),
             "keep" => set_once(&mut keep, number(&value, n, name)?, n, name)?,
+            "ahead" if value.is_empty() => set_once(&mut ahead, (), n, name)?,
+            "ahead" => return Err(format!("line {n}: `ahead` takes no value")),
             other => return Err(format!("line {n}: unknown key `{other}`")),
         }
     }
@@ -373,6 +385,7 @@ pub fn decode_request(text: &str) -> Result<Request, String> {
         timeout,
         force: force.is_some(),
         keep,
+        ahead: ahead.is_some(),
     })
 }
 
@@ -496,6 +509,23 @@ timeout 5\n";
         assert_eq!(decode_request(RUN_REQUEST), Ok(run_request()));
         assert_eq!(encode_request(&clear_request()), CLEAR_REQUEST);
         assert_eq!(decode_request(CLEAR_REQUEST), Ok(clear_request()));
+        assert_eq!(encode_request(&branches_request()), BRANCHES_REQUEST);
+        assert_eq!(decode_request(BRANCHES_REQUEST), Ok(branches_request()));
+    }
+
+    /// `ahead` is a bare directive, like `force`.
+    const BRANCHES_REQUEST: &str = "op branches\nsandbox web\nahead\n";
+
+    fn branches_request() -> Request {
+        Request { sandbox: Some("web".into()), ahead: true, ..Request::new(Op::Branches) }
+    }
+
+    #[test]
+    fn ahead_flag_rejects_a_value_and_a_repeat() {
+        assert_eq!(decode_request("op branches\nahead \n").map(|r| r.ahead), Ok(true));
+        assert_eq!(decode_request("op branches\n").map(|r| r.ahead), Ok(false));
+        assert!(decode_request("op branches\nahead 1\n").unwrap_err().contains("takes no value"));
+        assert!(decode_request("op branches\nahead\nahead\n").unwrap_err().contains("repeated `ahead`"));
     }
 
     /// The run-clearing fields: `force` is a bare directive.

@@ -33,6 +33,7 @@ use mounts::{
 };
 use ssh_agent::ssh_agent_forward;
 use worktree::{copy_worktree_includes, create_worktree, git_companion_mount, link_shared_files};
+pub(crate) use worktree::{instance_at, parse_worktree_list};
 
 /// Branch pattern for worktree instances when neither `--branch` nor the
 /// sandbox's `worktree-branch` is set. Also the TUI prompt's completion base
