@@ -92,6 +92,9 @@ impl App {
                 self.starting.insert(name.clone());
                 self.pending_start = Some(name);
             }
+            ContainerStatus::Unknown => {
+                self.status = Some(format!("{name}: status still loading"));
+            }
             ContainerStatus::Missing => {
                 // No container to start: recreate it via the CLI rebuild on the
                 // suspend path (its "config label gone → rebuild anyway" rule
@@ -223,6 +226,19 @@ mod tests {
         assert_eq!(app.status.as_deref(), Some("starting inst0…"));
         assert_eq!(app.take_pending_start(), Some("inst0".into()));
         assert_eq!(app.take_pending_stop(), None);
+    }
+
+    /// Before the runtime is listed, `s` can't know whether to stop or start.
+    #[test]
+    fn s_on_unknown_instance_does_nothing() {
+        let mut app = new_app();
+        app.set_snapshot(snapshot_with_status(1, ContainerStatus::Unknown));
+        app.on_key(key(KeyCode::Down)); // onto inst0
+        app.on_key(key(KeyCode::Char('s')));
+        assert_eq!(app.status.as_deref(), Some("inst0: status still loading"));
+        assert_eq!(app.take_pending_stop(), None);
+        assert_eq!(app.take_pending_start(), None);
+        assert_eq!(app.take_pending_action(), None);
     }
 
     #[test]

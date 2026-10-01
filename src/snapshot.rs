@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use serde::Serialize;
 
-use crate::commands::{container_drifted, drift_decision};
+use crate::commands::drift_decision;
 use crate::commands::services::{isolated_service_container, project_id, service_container};
 use crate::config::{
     build_hash, parse_shorthand, Config, Mount, MountContext, ResolvedSandbox, ServiceScope,
@@ -31,6 +31,8 @@ pub enum ContainerStatus {
     Exited(String),
     /// No container by that name in `docker ps --all`.
     Missing,
+    /// The runtime wasn't asked yet ([`Depth::Disk`]); never in CLI output.
+    Unknown,
 }
 
 impl ContainerStatus {
@@ -40,6 +42,7 @@ impl ContainerStatus {
             ContainerStatus::Running(_) => "running",
             ContainerStatus::Exited(_) => "exited",
             ContainerStatus::Missing => "missing",
+            ContainerStatus::Unknown => "…",
         }
     }
 }
@@ -310,7 +313,7 @@ fn build_service_rows(
             // container or missing label contributes nothing — the lenient rule
             // shared with the instance drift path.
             let drift = containers.iter().any(|(name, _)| {
-                service_container_drifted(name, &config_hash, &build_hash, ps)
+                listed_drifted(name, &config_hash, &build_hash, ps)
             });
 
             ServiceRow {
@@ -332,12 +335,12 @@ fn build_service_rows(
         .collect()
 }
 
-/// Whether one backing service container drifted, applying the shared
+/// Whether one instance or service container drifted, applying the shared
 /// [`drift_decision`] rule against the labels the `ps` listing already carries.
 /// A container absent from `ps` (never created, or removed) is not drift — you
 /// can't be stale against a config you were never built from. Zero docker calls:
 /// the labels ride along on the listing rows.
-fn service_container_drifted(
+fn listed_drifted(
     container: &str,
     expected_config: &str,
     expected_build: &str,
@@ -521,14 +524,26 @@ pub fn sandbox_rows(dir: &Path, config: &Config) -> (Vec<SandboxRow>, Vec<String
 /// with liveness and resource usage. When it or config is unavailable the rows
 /// still render (status `Missing`, no cpu/mem) and `error` is set.
 pub fn collect(dir: &Path) -> Snapshot {
-    collect_with(dir, true)
+    collect_with(dir, Depth::Full)
 }
 
-/// [`collect`], optionally skipping the runtime's stats call (cpu/mem stay
-/// `None`). `stats --no-stream` samples twice and dominates collection time
-/// (~1.5s on docker vs tens of ms for everything else), so the TUI's first
-/// frame skips it and fills cpu/mem in with the next, full collection.
-pub fn collect_with(dir: &Path, stats: bool) -> Snapshot {
+/// How much of the runtime a [`collect_with`] asks, cheapest first. The TUI
+/// walks all three on startup so the tree renders from disk at once and the
+/// runtime data fills in as it arrives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Depth {
+    /// State + config only, no runtime calls: every container status is
+    /// [`ContainerStatus::Unknown`], no drift, cpu/mem or runtime version.
+    Disk,
+    /// Plus the listing + version (tens of ms): statuses and drift, no cpu/mem.
+    Listing,
+    /// Plus `stats --no-stream`, which samples twice and dominates collection
+    /// time (~1.5s on docker).
+    Full,
+}
+
+/// [`collect`] down to `depth` (see [`Depth`]).
+pub fn collect_with(dir: &Path, depth: Depth) -> Snapshot {
     let collected_at = Instant::now();
     let now_unix = Instance::now();
 
@@ -552,15 +567,17 @@ pub fn collect_with(dir: &Path, stats: bool) -> Snapshot {
 
     // One listing and one stats call for the whole snapshot.
     let rt = backend();
-    let ps = match rt.list(true, NAME_PREFIX) {
-        Ok(rows) => rows,
-        Err(e) => {
+    let listed = depth != Depth::Disk;
+    let ps = match listed.then(|| rt.list(true, NAME_PREFIX)) {
+        None => Vec::new(),
+        Some(Ok(rows)) => rows,
+        Some(Err(e)) => {
             errors.push(format!("{} unavailable: {e:#}", rt.name()));
             Vec::new()
         }
     };
 
-    let stats: BTreeMap<String, (String, String)> = match stats.then(|| rt.stats()) {
+    let stats: BTreeMap<String, (String, String)> = match (depth == Depth::Full).then(|| rt.stats()) {
         None => BTreeMap::new(),
         Some(Ok(rows)) => rows.into_iter().map(|s| (s.name, (s.cpu, s.mem))).collect(),
         // Only report a stats error if the listing succeeded; otherwise that
@@ -576,7 +593,10 @@ pub fn collect_with(dir: &Path, stats: bool) -> Snapshot {
     // Runtime version for the header; best-effort (None when down). Kept off
     // the UI thread like every other runtime call here. Cheap enough to run
     // each collection, so no caching is threaded through.
-    let runtime_version = rt.server_version().ok().filter(|v| !v.is_empty());
+    let runtime_version = listed
+        .then(|| rt.server_version().ok())
+        .flatten()
+        .filter(|v| !v.is_empty());
 
     // Load config once; resolve every sandbox for the tree, services + drift
     // hash. `resolved` maps sandbox name → (services, hash) for the instance join.
@@ -612,7 +632,7 @@ pub fn collect_with(dir: &Path, stats: bool) -> Snapshot {
         };
         let (services, drift) = match resolved.get(&inst.sandbox) {
             Some((svcs, hash, build)) => {
-                (svcs.clone(), drifted(&inst.container, hash, build))
+                (svcs.clone(), listed_drifted(&inst.container, hash, build, &ps))
             }
             None => (Vec::new(), false),
         };
@@ -654,7 +674,7 @@ pub fn collect_with(dir: &Path, stats: bool) -> Snapshot {
         })
         .collect();
 
-    let services = match (&config, project_id(dir)) {
+    let mut services = match (&config, project_id(dir)) {
         (Ok(cfg), Ok(project)) => {
             let (rows, mut svc_errors) = service_rows(dir, &project, cfg, &instance_services, &ps);
             errors.append(&mut svc_errors);
@@ -669,6 +689,18 @@ pub fn collect_with(dir: &Path, stats: bool) -> Snapshot {
         _ => Vec::new(),
     };
 
+    // Not listed: the empty `ps` above classified everything `Missing`, which
+    // would be a lie.
+    if !listed {
+        let statuses = instances.iter_mut().map(|r| &mut r.status);
+        let service_statuses = services
+            .iter_mut()
+            .flat_map(|s| s.containers.iter_mut().map(|(_, st)| st));
+        for status in statuses.chain(service_statuses) {
+            *status = ContainerStatus::Unknown;
+        }
+    }
+
     Snapshot {
         instances,
         sandboxes,
@@ -679,15 +711,6 @@ pub fn collect_with(dir: &Path, stats: bool) -> Snapshot {
         collected_at,
         error: if errors.is_empty() { None } else { Some(errors.join("; ")) },
     }
-}
-
-/// True when the container's recorded config *or* build hash differs from the
-/// freshly resolved one (the shared [`container_drifted`] rule, so dockerfile
-/// edits flag too). A missing label or a failed inspect is treated as "no
-/// drift" — the TUI stays lenient rather than surfacing an inspect error as
-/// phantom drift.
-fn drifted(container: &str, expected_config: &str, expected_build: &str) -> bool {
-    container_drifted(container, expected_config, expected_build).unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -781,6 +804,18 @@ extends = "does-not-exist"
         row.labels
             .insert("devsandbox.build_hash".into(), build_hash.into());
         row
+    }
+
+    /// Instance drift reads the matching `ps` row's labels, not its neighbours'.
+    #[test]
+    fn listed_drifted_matches_by_container_name() {
+        let ps = vec![
+            ps_labeled("devsandbox-a", "cfg", "bld"),
+            ps_labeled("devsandbox-b", "old", "bld"),
+        ];
+        assert!(!listed_drifted("devsandbox-a", "cfg", "bld", &ps));
+        assert!(listed_drifted("devsandbox-b", "cfg", "bld", &ps));
+        assert!(!listed_drifted("devsandbox-gone", "cfg", "bld", &ps), "absent: no drift");
     }
 
     #[test]

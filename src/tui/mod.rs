@@ -176,10 +176,11 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
         Err(e) => app.status = Some(format!("inbox not loaded: {e:#}")),
     }
     // At most one collection thread in flight; `Some` while one is running.
-    // The first one skips stats so the tree shows in ms rather than after
-    // `stats --no-stream`'s ~1.5s; `stats_pending` chains the full one right after.
-    let mut pending: Option<Receiver<Snapshot>> = Some(spawn_collect_with(&dir, false));
-    let mut stats_pending = true;
+    // Startup walks the `Depth`s cheapest first, so the tree renders straight
+    // from disk and statuses, then cpu/mem, fill in as the runtime answers;
+    // `deeper` holds the collections still to chain (popped from the back).
+    let mut pending: Option<Receiver<Snapshot>> = Some(spawn_collect_with(&dir, data::Depth::Disk));
+    let mut deeper = vec![data::Depth::Full, data::Depth::Listing];
     // Background `s` stops/starts, each reporting completion over its own
     // channel; paired with the instance name so the guard clears even if the
     // thread dies.
@@ -418,8 +419,7 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
                         );
                     }
                     app.set_snapshot(snapshot);
-                    pending = std::mem::take(&mut stats_pending)
-                        .then(|| spawn_collect(&dir));
+                    pending = deeper.pop().map(|depth| spawn_collect_with(&dir, depth));
                     if procs_after_snapshot {
                         procs_after_snapshot = false;
                         app.needs_proc_fetch = true;
@@ -779,17 +779,16 @@ fn spawn_proc_fetch(targets: Vec<(String, String)>) -> Receiver<BTreeMap<String,
 /// Spawn a detached thread that collects one [`Snapshot`] and sends it back.
 /// The receiver is polled from the event loop, keeping [`App`] I/O-free.
 fn spawn_collect(dir: &Path) -> Receiver<Snapshot> {
-    spawn_collect_with(dir, true)
+    spawn_collect_with(dir, data::Depth::Full)
 }
 
-/// [`spawn_collect`], optionally without the slow stats call
-/// (`data::collect_with`).
-fn spawn_collect_with(dir: &Path, stats: bool) -> Receiver<Snapshot> {
+/// [`spawn_collect`] down to `depth` (`data::collect_with`).
+fn spawn_collect_with(dir: &Path, depth: data::Depth) -> Receiver<Snapshot> {
     let (tx, rx) = mpsc::channel();
     let dir: PathBuf = dir.to_path_buf();
     std::thread::spawn(move || {
         // Receiver may be gone if the UI quit mid-collection; ignore send errors.
-        let _ = tx.send(data::collect_with(&dir, stats));
+        let _ = tx.send(data::collect_with(&dir, depth));
     });
     rx
 }

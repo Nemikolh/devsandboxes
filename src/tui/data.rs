@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::procs::{ProcState, MESSAGE_ROW};
 
-pub use crate::snapshot::{collect_with, ContainerStatus, InstanceRow, SandboxRow, ServiceRow, Snapshot};
+pub use crate::snapshot::{collect_with, ContainerStatus, Depth, InstanceRow, SandboxRow, ServiceRow, Snapshot};
 
 /// The literal sandbox name of the synthetic group holding instances whose
 /// sandbox is not in config. Keyed by this string in the collapsed set.
@@ -170,13 +170,18 @@ pub fn totals_line(snapshot: &Snapshot, age: std::time::Duration) -> String {
         .iter()
         .filter(|r| matches!(r.status, ContainerStatus::Running(_)))
         .count();
-    let stopped = snapshot.instances.len() - running;
+    // Not-yet-listed (`Unknown`) rows count as neither.
+    let stopped = snapshot
+        .instances
+        .iter()
+        .filter(|r| matches!(r.status, ContainerStatus::Exited(_) | ContainerStatus::Missing))
+        .count();
     // Service containers that actually exist (any non-Missing backing container).
     let service_containers: usize = snapshot
         .services
         .iter()
         .flat_map(|s| &s.containers)
-        .filter(|(_, st)| !matches!(st, ContainerStatus::Missing))
+        .filter(|(_, st)| !matches!(st, ContainerStatus::Missing | ContainerStatus::Unknown))
         .count();
     let version = snapshot.runtime_version.as_deref().unwrap_or("?");
 
@@ -291,6 +296,21 @@ mod tests {
         assert_eq!(
             totals_line(&s, std::time::Duration::from_secs(0)),
             "3 sandboxes · 1 running / 2 stopped · 1 service container · docker 24.0.7",
+        );
+    }
+
+    /// A disk-only snapshot (statuses `Unknown`) claims nothing running or stopped.
+    #[test]
+    fn totals_line_skips_unlisted_rows() {
+        let s = snap(
+            vec![inst("a", ContainerStatus::Unknown)],
+            vec![svc_row(vec![ContainerStatus::Unknown])],
+            1,
+            None,
+        );
+        assert_eq!(
+            totals_line(&s, std::time::Duration::from_secs(0)),
+            "1 sandbox · 0 running / 0 stopped · 0 service containers · docker ?",
         );
     }
 

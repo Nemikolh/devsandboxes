@@ -344,8 +344,12 @@ fn source_style(source: &str) -> Style {
 }
 
 /// Summarize a service's backing containers into one STATUS cell: `N running`
-/// (green) when any are up, else `N exited` (red) when any exist, else `-` dim.
+/// (green) when any are up, else `N exited` (red) when any exist, else `-` dim
+/// (`…` dim while the runtime hasn't been listed yet).
 fn service_status_cell(r: &ServiceRow) -> Cell<'static> {
+    if r.containers.iter().any(|(_, s)| *s == ContainerStatus::Unknown) {
+        return Cell::from(Span::styled("…", Style::default().add_modifier(Modifier::DIM)));
+    }
     let running = r
         .containers
         .iter()
@@ -1140,7 +1144,9 @@ fn status_style(status: &ContainerStatus) -> Style {
     match status {
         ContainerStatus::Running(_) => Style::default().fg(Color::Green),
         ContainerStatus::Exited(_) => Style::default().fg(Color::Red),
-        ContainerStatus::Missing => Style::default().add_modifier(Modifier::DIM),
+        ContainerStatus::Missing | ContainerStatus::Unknown => {
+            Style::default().add_modifier(Modifier::DIM)
+        }
     }
 }
 
