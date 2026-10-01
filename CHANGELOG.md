@@ -22,6 +22,10 @@ folders = { "/workspaces/api" = "../api", "/workspaces/.shared" = { path = "../.
 
 - **`worktree-link` no longer migrates old `shared-files/<sandbox>/` stores.** The automatic move only relinked the instance being run, so every other instance on the same repo was left with dangling links. A link into an old store is now skipped with a warning that shows where the file should go. Move it there, delete the old link, and `rebuild`.
 
+### Fixed
+
+- **Opening VS Code no longer clears an instance's extensions.** `devsandbox vscode` and the dashboard's `o` read the sandbox config from the current directory, not from the instance's own config directory. Run from anywhere else, the extensions list was rewritten as empty, so VS Code didn't install anything. They now read the instance's own config. If that config still can't be read, the list is left as it was. Instances already hit by this get their list back the next time you open VS Code from the new version.
+
 ## 0.5.0
 
 Sandboxes can now start themselves after a reboot and run unattended **dispatcher** scripts that create, drive and clean up their own child instances. Messages from inside containers show up in the dashboard and as desktop notifications. See `docs/automations-guide.md`. `run --json`, a command-less `exec` and exact-name matching make devsandbox easier to drive from scripts and other programs, and the docs now live at [devsandboxes.com](https://devsandboxes.com).

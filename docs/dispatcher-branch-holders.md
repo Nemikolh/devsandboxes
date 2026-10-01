@@ -133,14 +133,6 @@ One commit per step. Checks: `cargo test --workspace` (steps 1-3); `pnpm check &
 - `CHANGELOG.md`: an `### Added` entry under `## Unreleased`.
 - This doc: `Status: implemented.`
 
-### Step 4: the babysitter (`../.devsandboxes/dispatcher`, its own repo `../.devsandboxes`)
-
-- `src/devsbd.ts`: `branches(sandbox)` → `devsbd branches <sandbox> --ahead`, parsed JSON, non-mutating, like `ls()` (and the same dry-run fallback). A `Holder` type next to `Child`.
-- A pure helper in `src/attention.ts` next to `ineligible`: given the rows, the PR's branch, and its own child's instance name `<sandbox>-pr-<N>`, the holder that makes the PR ineligible (or none). `local` counts; its own `child` does not.
-- `src/babysit.ts`: call `branches` once per repo per pass (in the repo loop, before `handlePr`), pass the rows in. In `handlePr`, after `ineligible(pr)` and before `decide`: held → skip, notify `pr-<N>-checked-out` (info, "#N skipped: checked out in `bolt-restate`") only when the holder changed since the last pass (remember it on `PrState`, cleared when no longer held). A PR with an active run (`st.run`) is left to it.
-- `test/attention.test.ts`: unit tests for the helper (each holder kind, own child, other branch, no rows).
-- Commit in `../.devsandboxes`, staging only the dispatcher files touched (that repo has unrelated untracked files).
-
 ## Non-goals
 
 - **Other clones.** A branch checked out in a clone devsandbox doesn't manage
