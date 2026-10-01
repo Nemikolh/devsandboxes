@@ -9,9 +9,11 @@ use anyhow::{Context, Result};
 /// Remote-Containers extension by writing its per-container-name config file.
 /// Without `remoteUser`, VS Code attaches as the editor's default user and
 /// hits EACCES on root-owned files (e.g. rootless docker).
+/// `extensions: None` (sandbox config unresolvable) keeps the file's existing
+/// list rather than wiping what `run` registered.
 pub(crate) fn write_vscode_name_config(
     container: &str,
-    extensions: &[String],
+    extensions: Option<&[String]>,
     remote_user: Option<&str>,
 ) -> Result<()> {
     let base = editor_config_base()?;
@@ -54,10 +56,11 @@ fn editor_config_base() -> Result<PathBuf> {
 }
 
 /// Existing name-config JSON (if any) with `extensions` and `remoteUser`
-/// replaced. `remoteUser: None` removes the key so the file tracks the config.
+/// replaced. `extensions: None` leaves that key untouched; `remoteUser: None`
+/// removes the key so the file tracks the config.
 fn merged_name_config(
     existing: Option<&str>,
-    extensions: &[String],
+    extensions: Option<&[String]>,
     remote_user: Option<&str>,
 ) -> Result<String> {
     let mut root = match existing {
@@ -69,7 +72,9 @@ fn merged_name_config(
     let obj = root
         .as_object_mut()
         .context("existing config is not a JSON object")?;
-    obj.insert("extensions".into(), serde_json::json!(extensions));
+    if let Some(extensions) = extensions {
+        obj.insert("extensions".into(), serde_json::json!(extensions));
+    }
     match remote_user {
         Some(user) => {
             obj.insert("remoteUser".into(), serde_json::json!(user));
@@ -87,7 +92,7 @@ mod tests {
 
     #[test]
     fn name_config_from_scratch() {
-        let json = merged_name_config(None, &["a.b".into(), "c.d".into()], None).unwrap();
+        let json = merged_name_config(None, Some(&["a.b".into(), "c.d".into()]), None).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["extensions"], serde_json::json!(["a.b", "c.d"]));
         assert!(parsed.get("remoteUser").is_none());
@@ -96,7 +101,7 @@ mod tests {
     #[test]
     fn name_config_preserves_other_keys() {
         let existing = r#"{"settings": {"x": 1}, "extensions": ["old.ext"]}"#;
-        let json = merged_name_config(Some(existing), &["new.ext".into()], None).unwrap();
+        let json = merged_name_config(Some(existing), Some(&["new.ext".into()]), None).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["extensions"], serde_json::json!(["new.ext"]));
         assert_eq!(parsed["settings"]["x"], 1);
@@ -104,13 +109,26 @@ mod tests {
 
     #[test]
     fn name_config_sets_and_clears_remote_user() {
-        let json = merged_name_config(None, &[], Some("root")).unwrap();
+        let json = merged_name_config(None, Some(&[]), Some("root")).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["remoteUser"], "root");
 
         // remote_user gone from config → key removed from an existing file.
-        let json = merged_name_config(Some(&json), &[], None).unwrap();
+        let json = merged_name_config(Some(&json), Some(&[]), None).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(parsed.get("remoteUser").is_none());
+    }
+
+    #[test]
+    fn name_config_unknown_extensions_keeps_existing() {
+        // An unresolvable config must not wipe the list `run` registered.
+        let existing = r#"{"extensions": ["keep.me"], "remoteUser": "root"}"#;
+        let json = merged_name_config(Some(existing), None, Some("root")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["extensions"], serde_json::json!(["keep.me"]));
+
+        let json = merged_name_config(None, None, None).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(parsed.get("extensions").is_none());
     }
 }

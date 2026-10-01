@@ -585,7 +585,7 @@ pub(crate) fn materialize(
 
     let extensions = props.vscode_extensions().unwrap_or(&[]);
     if !extensions.is_empty() || props.remote_user.is_some() {
-        write_vscode_name_config(&container, extensions, props.remote_user.as_deref())?;
+        write_vscode_name_config(&container, Some(extensions), props.remote_user.as_deref())?;
     }
 
     // ssh-agent for the lifecycle chain. The instance was just saved, so read

@@ -21,23 +21,25 @@ pub fn vscode(dir: &Path, name: &str) -> Result<()> {
 /// extensions name-config (best-effort), then spawns `code`. Returns a one-line
 /// status. Shared with the TUI's `o` so both open identically.
 pub fn launch(dir: &Path, instance: &str, info: &Instance) -> Result<String> {
-    // Extensions and remoteUser come from the resolved sandbox; failure to
-    // resolve is non-fatal — fall back to the remote user recorded in state at
-    // run time so the attach still opens with write access.
-    let resolved = Config::load(dir)
-        .ok()
-        .and_then(|cfg| cfg.resolve_sandbox(&info.sandbox).ok());
-    let extensions: Vec<String> = resolved
-        .as_ref()
-        .and_then(|sb| sb.properties.vscode_extensions().map(<[String]>::to_vec))
-        .unwrap_or_default();
+    // Extensions and remoteUser come from the resolved sandbox, read from the
+    // instance's own config root: state is global, so `dir` (the cwd by
+    // default) may be another root or none. Failure to resolve is non-fatal —
+    // keep the extensions `run` registered and fall back to the remote user
+    // recorded in state so the attach still opens with write access.
+    let config_dir = info.config_dir.as_deref().unwrap_or(dir);
+    let resolved = Config::load(config_dir)
+        .and_then(|cfg| cfg.resolve_sandbox(&info.sandbox))
+        .ok();
+    let extensions: Option<Vec<String>> = resolved.as_ref().map(|sb| {
+        sb.properties.vscode_extensions().map(<[String]>::to_vec).unwrap_or_default()
+    });
     let remote_user = resolved
         .as_ref()
         .and_then(|sb| sb.properties.remote_user.clone())
         .or_else(|| info.remote_user.clone());
     let _ = super::run::write_vscode_name_config(
         &info.container,
-        &extensions,
+        extensions.as_deref(),
         remote_user.as_deref(),
     );
 
