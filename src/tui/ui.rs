@@ -829,7 +829,14 @@ fn draw_instances(frame: &mut Frame, app: &App, area: Rect) {
     let panel_focused = app.focus == Focus::Terminal;
 
     if nodes.is_empty() {
-        draw_empty(frame, table_area, panel_focused);
+        // No snapshot yet means the first collection is still running, not
+        // that the config is empty.
+        let message = if snapshot.is_some() {
+            "no sandboxes defined — check config.toml"
+        } else {
+            "loading…"
+        };
+        draw_empty(frame, table_area, panel_focused, message);
         draw_detail(frame, snapshot, None, None, detail_area, panel_focused);
     } else {
         let snapshot = snapshot.expect("non-empty nodes imply a snapshot");
@@ -857,13 +864,13 @@ fn draw_instances(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-fn draw_empty(frame: &mut Frame, area: Rect, term_focused: bool) {
+fn draw_empty(frame: &mut Frame, area: Rect, term_focused: bool, message: &str) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(dash_border_style(term_focused))
         .title(Tab::Instances.title());
     let text = Line::from(Span::styled(
-        "no sandboxes defined — check config.toml",
+        message,
         Style::default().add_modifier(Modifier::DIM),
     ))
     .alignment(Alignment::Center);

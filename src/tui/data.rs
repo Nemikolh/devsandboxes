@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::procs::{ProcState, MESSAGE_ROW};
 
-pub use crate::snapshot::{collect, ContainerStatus, InstanceRow, SandboxRow, ServiceRow, Snapshot};
+pub use crate::snapshot::{collect_with, ContainerStatus, InstanceRow, SandboxRow, ServiceRow, Snapshot};
 
 /// The literal sandbox name of the synthetic group holding instances whose
 /// sandbox is not in config. Keyed by this string in the collapsed set.

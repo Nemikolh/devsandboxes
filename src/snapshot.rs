@@ -521,6 +521,14 @@ pub fn sandbox_rows(dir: &Path, config: &Config) -> (Vec<SandboxRow>, Vec<String
 /// with liveness and resource usage. When it or config is unavailable the rows
 /// still render (status `Missing`, no cpu/mem) and `error` is set.
 pub fn collect(dir: &Path) -> Snapshot {
+    collect_with(dir, true)
+}
+
+/// [`collect`], optionally skipping the runtime's stats call (cpu/mem stay
+/// `None`). `stats --no-stream` samples twice and dominates collection time
+/// (~1.5s on docker vs tens of ms for everything else), so the TUI's first
+/// frame skips it and fills cpu/mem in with the next, full collection.
+pub fn collect_with(dir: &Path, stats: bool) -> Snapshot {
     let collected_at = Instant::now();
     let now_unix = Instance::now();
 
@@ -552,11 +560,12 @@ pub fn collect(dir: &Path) -> Snapshot {
         }
     };
 
-    let stats: BTreeMap<String, (String, String)> = match rt.stats() {
-        Ok(rows) => rows.into_iter().map(|s| (s.name, (s.cpu, s.mem))).collect(),
+    let stats: BTreeMap<String, (String, String)> = match stats.then(|| rt.stats()) {
+        None => BTreeMap::new(),
+        Some(Ok(rows)) => rows.into_iter().map(|s| (s.name, (s.cpu, s.mem))).collect(),
         // Only report a stats error if the listing succeeded; otherwise that
         // error already covers "runtime is down".
-        Err(e) => {
+        Some(Err(e)) => {
             if errors.is_empty() {
                 errors.push(format!("{} stats: {e:#}", rt.name()));
             }
