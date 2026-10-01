@@ -69,6 +69,7 @@ Run from inside a dispatcher instance:
 ```
 devsbd ensure <sandbox> --key <key> [--branch B] [--env K=V]...
 devsbd ls
+devsbd branches <sandbox> [--ahead]
 devsbd stop <key> [--sandbox S]
 devsbd rm <key> [--sandbox S]
 devsbd exec <key> [--sandbox S] [--detach] -- <cmd>...
@@ -81,6 +82,16 @@ devsbd run prune <key> [--sandbox S] [--keep N]
 
 - `ensure` is idempotent: creates `<sandbox>-<key>` if missing, starts it if stopped, recreates it if its container is gone, and prints the instance name. `--branch` applies only at creation (ignored for an existing child). `--env` values are recorded and kept when the child is rebuilt or its container recreated; on an existing child, `--env` replaces the recorded set with exactly the given one (a variable left out is dropped; no `--env` keeps it). Every command devsandbox runs in the child uses the recorded values from then on (`devsandbox exec`, the dashboard's terminals, `devsbd exec` runs, lifecycle commands), overriding a `remoteEnv` entry of the same name. The container's own environment is only set when it's created, so processes already running, PID 1, and a hand-run `docker exec` keep the old values until `devsandbox rebuild`. `--branch` names the branch of the child's worktree: an existing local branch is checked out as is, one only on `origin` (e.g. a PR head) is fetched and checked out as a local branch tracking `origin/<branch>` (so a plain `git push` updates the PR), anything else is created from the repo's default base. A branch already checked out elsewhere (the base checkout, another instance) is an error naming where. `rm` only offers to delete a branch the child created. The name is taken literally (no `${…}` substitution, unlike the sandbox's `worktree-branch` pattern) and must be 1–200 chars of `[A-Za-z0-9._/-]`, not start with `-`, `/` or `.`, not end with `/` or `.`, and contain no `..`, `//`, component starting with `.` or ending in `.lock`; anything else is a usage error (exit 2). Without `--branch` the child's branch comes from `worktree-branch` (default `sandbox/${instance}`). `--env` may not set variables that steer what runs (denied, exit 77): `PATH`, `HOME`, `SHELL`, `USER`, `ENV`, `BASH_ENV`, `IFS`, `CDPATH`, `PS4`, `PROMPT_COMMAND`, `SSH_AUTH_SOCK`, `TMPDIR`, `GCONV_PATH`, `NODE_OPTIONS`, `RUBYOPT`, and anything starting with `LD_`, `DYLD_`, `GIT_`, `PYTHON` or `PERL5` (matched case-insensitively).
 - `ls` prints a JSON array of this dispatcher's children: `name`, `sandbox`, `key`, `state` (`running` | `stopped` | `missing`), `branch`.
+- `branches` prints a JSON array, sorted by `branch`, of the branches checked out in any worktree of `<sandbox>`'s repo (its `folder`), read live from git on the host, so a `git switch` inside an instance or a worktree made by hand shows up (`ls`'s `branch` is the one at creation). `holder` says who has it: `child` (one of this dispatcher's children), `instance` (any other instance, from any config root, including one on the folder itself), `base` (the folder's own checkout), `external` (a worktree devsandbox doesn't know); `instance` names the instance for the first two. Stopped instances still hold their branch; detached worktrees and ones whose directory is gone are left out. `--ahead` adds `ahead`, the commits on the local branch that `origin/<branch>` doesn't have (left out when `origin/<branch>` doesn't exist), and lists local branches in no worktree with `ahead > 0` as `holder: "local"`. `<sandbox>` must be in `spawn` (exit 77), but may be a dispatcher itself, since nothing is created; no `folder`, or a missing one, fails (exit 1). Read-only, so it never waits behind another dispatcher's `ensure`. A dispatcher created before this version needs a restart (`devsandbox stop` + `start`) to get the verb.
+
+  ```json
+  [
+    {"branch": "fix/login", "holder": "instance", "instance": "web-2", "ahead": 2},
+    {"branch": "main", "holder": "base", "ahead": 0},
+    {"branch": "wip/unpushed", "holder": "local", "ahead": 3}
+  ]
+  ```
+
 - `stop` / `rm` / `exec` / `run …` take the key; `--sandbox` disambiguates a key used under two sandboxes.
 - `exec` starts a tracked *run* in a running child (`ensure` it first), as the child's `remoteUser` in its workspace with its `remoteEnv`. With `--detach` it prints the run id and returns; without, it prints `devsbd: run <id>` to stderr, streams the output, and exits with the run's code (`killed N` → 128+N, `lost` → 1).
 - `run ls` prints one line per run, oldest first, for the newest 50 runs only: `<id> <state> <started, UTC> <argv…>`, argv cut at 200 characters (ending in `…`). Runs whose files are oversized or not regular files are left out. `run logs` prints the output so far (`--follow`: until the run ends). `run wait` prints the final state, or `running` once `--timeout` expires; it exits 0 either way.
@@ -95,7 +106,7 @@ Exit codes:
 | 1 | failed (the message says why; host-side details in the log below) |
 | 2 | usage error, or an ambiguous key (pass `--sandbox`) |
 | 75 | no host connected: the dashboard isn't open (or the helper daemon isn't running). Retry later. |
-| 77 | denied: not a dispatcher (or a dispatcher's child), sandbox not in `spawn` or itself a dispatcher, not this dispatcher's child, `max-instances` reached, a denied `--env` name |
+| 77 | denied: not a dispatcher (or a dispatcher's child), sandbox not in `spawn` (or, for `ensure`, itself a dispatcher), not this dispatcher's child, `max-instances` reached, a denied `--env` name |
 
 Control is served only while the devsandbox **dashboard** is open (two open dashboards are fine: each request goes to one of them). Nothing is queued: a script must retry on 75.
 
@@ -116,6 +127,7 @@ devsandbox takes no stand; pick per use case.
 - **Worker pool**: keys `worker-1`, `worker-2`, …; the script assigns items to workers. Resources stay bounded regardless of item count; per-item memory is the script's concern.
 - **`stop` vs `rm`**: `stop` keeps the container, worktree and any uncommitted work; `rm` deletes container, worktree and state entry.
 - **Idle children**: `stop` a child between runs and `ensure` it before the next `exec`, so nothing runs while nothing needs doing.
+- **Skip items whose branch is checked out elsewhere**: before acting on a PR (pushing, `gh pr update-branch`, starting an agent), look its head branch up in `devsbd branches <sandbox> --ahead` and skip it when anything but its own child holds it, `local` included. Otherwise a checkout left behind `origin` can later force-push over the dispatcher's work. Call it once per repo per pass, not per item.
 
 ## Sample: PR babysit dispatcher
 

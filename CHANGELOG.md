@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- **`devsbd branches <sandbox>` tells a dispatcher which branches are already checked out.** It prints a JSON list of every branch in a worktree of the sandbox's repo and who holds it: one of the dispatcher's own children, another instance, the base checkout, or a worktree devsandbox doesn't know. It reads git on the host each time, so a `git switch` inside an instance is seen. With `--ahead`, each row also gets the number of commits `origin` doesn't have yet, and local branches that are ahead but not checked out are listed too. A dispatcher can use it to leave alone PRs that someone is working on locally. The sandbox must be in the dispatcher's `spawn`. Running dispatchers pick up the new helper when restarted.
+
 ### Changed
 
 - **`folders` entries get their own git worktree when the checkout belongs to someone else.** If an extra folder is a git repo and it's another sandbox's `folder`, or another instance already mounts it, the instance now gets a worktree of it, detached at that checkout's `HEAD`. Before, the instance mounted the live checkout, so the owner switching branches changed what the instance saw. The worktree is kept across `rebuild` and removed by `rm`. Dispatcher children always get one. To keep the old live view for an entry, write it as a table with `worktree = "never"`, or use `"always"` to force a worktree:

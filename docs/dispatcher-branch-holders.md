@@ -1,6 +1,6 @@
 # Dispatchers: which branches are already checked out
 
-Status: proposed.
+Status: implemented.
 
 ## Problem
 

@@ -108,6 +108,8 @@ devsbd ensure <sandbox> --key <key> [--branch B] [--env K=V]...
     # rebuilds it if its container is gone; prints the instance name.
     # --branch/--env apply at creation only.
 devsbd ls                                   # this dispatcher's children + state (JSON)
+devsbd branches <sandbox> [--ahead]         # who holds each branch of <sandbox>'s repo (JSON);
+                                            # read-only, see docs/dispatcher-branch-holders.md
 devsbd stop <key> [--sandbox S]
 devsbd rm <key> [--sandbox S]
 devsbd exec <key> [--sandbox S] [--detach] -- <cmd>...   # a run; see _Runs_
@@ -348,8 +350,9 @@ Landed limitations: the hook runs as the container's user, so a non-root `contai
   containerEnv for this instance) and `--dispatcher <instance_id>` (owner).
 - Wire format shared with the helper (`src/devsbd/control.rs`, `#[path]`,
   line-based like `bootfile`/`notify` — the helper has no serde): request
-  `op`/`sandbox`/`key`/`branch`/`env` lines; response status + body (`ls` body
-  is JSON built on the host).
+  `op`/`sandbox`/`key`/`branch`/`env` lines (later `force`, and a bare `ahead`
+  for `branches`); response status + body (`ls` and `branches` bodies are JSON
+  built on the host).
 - New `src/commands/dispatch.rs`: pure authorization (`spawn` list, ownership,
   cap) and naming (`<sandbox>-<key>`, key charset validated), `ensure` = create
   if missing, start if stopped, return the name; executor injectable for tests.
