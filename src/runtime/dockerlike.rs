@@ -78,7 +78,7 @@ impl Backend for Dockerlike {
         if !name_prefix.is_empty() {
             args.extend(["--filter", &filter]);
         }
-        args.extend(["--format", "{{json .}}"]);
+        args.extend(["--format", PS_FORMAT]);
         let out = self.output_quiet(&args)?;
         Ok(parse_ps(&out)
             .into_iter()
@@ -248,7 +248,16 @@ struct PsLine {
     ports: Option<serde_json::Value>,
 }
 
-/// Parse `ps --format {{json .}}` output (one JSON object per line).
+/// `ps --format` template naming only the [`PsLine`] fields. Never `{{json .}}`:
+/// a template that touches `.Size` (as `{{json .}}` does) makes the docker CLI
+/// request `size=1`, so the daemon computes every listed container's disk usage
+/// on each call (~300ms and a dockerd CPU spike per TUI tick, vs ~20ms).
+const PS_FORMAT: &str = concat!(
+    r#"{"Names":{{json .Names}},"Image":{{json .Image}},"Status":{{json .Status}},"#,
+    r#""State":{{json .State}},"Labels":{{json .Labels}},"Ports":{{json .Ports}}}"#,
+);
+
+/// Parse `ps --format` [`PS_FORMAT`] output (one JSON object per line).
 /// Unparseable lines are skipped rather than failing the whole listing.
 fn parse_ps(out: &str) -> Vec<ContainerRow> {
     out.lines()
@@ -316,6 +325,15 @@ fn parse_stats(out: &str) -> Vec<StatsRow> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every field `PsLine` reads, and nothing that triggers `size=1`.
+    #[test]
+    fn ps_format_names_fields_without_size() {
+        for field in ["Names", "Image", "Status", "State", "Labels", "Ports"] {
+            assert!(PS_FORMAT.contains(&format!("\"{field}\":{{{{json .{field}}}}}")), "{field}");
+        }
+        assert!(!PS_FORMAT.contains("Size") && !PS_FORMAT.contains("json .}}"));
+    }
 
     #[test]
     fn parse_ps_docker_shape() {
