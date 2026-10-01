@@ -11,7 +11,10 @@ use serde::Serialize;
 
 use crate::commands::{container_drifted, drift_decision};
 use crate::commands::services::{isolated_service_container, project_id, service_container};
-use crate::config::{build_hash, Config, MountContext, ResolvedSandbox, ServiceScope};
+use crate::config::{
+    build_hash, parse_shorthand, Config, Mount, MountContext, ResolvedSandbox, ServiceScope,
+    INSTANCE_VARS,
+};
 use crate::runtime::{backend, ContainerRow, NAME_PREFIX};
 use crate::state::{Instance, State};
 
@@ -374,7 +377,10 @@ fn classify(container: &str, ps: &[ContainerRow]) -> ContainerStatus {
 ///   (`dir.join(folder).canonicalize()`).
 /// - **mounts**: each must resolve (`${…}` substitution + a source for binds);
 ///   a bind source that does not exist on the host is flagged as a warning
-///   (`run` would create it — see `ensure_bind_source`).
+///   (`run` would create it — see `ensure_bind_source`), except under
+///   `${sharedVolumes}` or templated on the instance id: those are expected to
+///   be absent until an instance has run, and the instance path is only a guess
+///   here anyway.
 ///
 /// Returns one message per problem, in check order; empty means it validates.
 fn validate_sandbox(dir: &Path, sb: &ResolvedSandbox) -> Vec<String> {
@@ -430,6 +436,8 @@ fn validate_sandbox(dir: &Path, sb: &ResolvedSandbox) -> Vec<String> {
                 Ok(rm) if rm.kind == "bind" => {
                     if let Some(source) = &rm.source
                         && !Path::new(source).exists()
+                        && !Path::new(source).starts_with(&shared_volumes)
+                        && !mount_source_uses_instance(mount)
                     {
                         issues.push(format!(
                             "mount source `{source}` not found on host (run creates it)"
@@ -443,6 +451,15 @@ fn validate_sandbox(dir: &Path, sb: &ResolvedSandbox) -> Vec<String> {
     }
 
     issues
+}
+
+/// Whether a mount's unsubstituted source references the instance id.
+fn mount_source_uses_instance(mount: &Mount) -> bool {
+    let source = match mount {
+        Mount::Shorthand(s) => parse_shorthand(s).ok().and_then(|parts| parts.1),
+        Mount::Object(o) => o.source.clone(),
+    };
+    source.is_some_and(|s| INSTANCE_VARS.iter().any(|v| s.contains(v)))
 }
 
 /// Build one [`SandboxRow`] per configured sandbox, in config order. A sandbox
@@ -957,6 +974,17 @@ extends = "does-not-exist"
         assert_eq!(issues.len(), 2, "got: {issues:?}");
         assert!(issues[0].contains("folder `nope` does not resolve"), "got: {issues:?}");
         assert!(issues[1].contains("not found on host"), "got: {issues:?}");
+
+        // Auto-created sources (shared volumes, per-instance paths) never warn.
+        let auto = mk(
+            Some("repo"),
+            Some(vec![
+                Mount::Shorthand("source=${sharedVolumes}/agent,target=/a".into()),
+                Mount::Shorthand("source=/no/such/${instance}/x,target=/b".into()),
+                Mount::Shorthand("source=/no/such/${devcontainerId},target=/c".into()),
+            ]),
+        );
+        assert!(validate_sandbox(&root, &auto).is_empty(), "{:?}", validate_sandbox(&root, &auto));
 
         let _ = std::fs::remove_dir_all(&root);
     }

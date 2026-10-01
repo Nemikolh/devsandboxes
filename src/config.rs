@@ -452,7 +452,7 @@ pub struct ResolvedMount {
 
 /// Variables that resolve to the instance id; a volume named with one is
 /// per-instance.
-const INSTANCE_VARS: [&str; 2] = ["${instance}", "${devcontainerId}"];
+pub(crate) const INSTANCE_VARS: [&str; 2] = ["${instance}", "${devcontainerId}"];
 
 impl Mount {
     /// Apply variable substitution and defaults. `bind` mounts require a source.
