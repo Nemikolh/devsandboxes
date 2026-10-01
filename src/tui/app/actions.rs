@@ -146,7 +146,6 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::tui::app::test_support::*;
     use crate::tui::app::*;
 

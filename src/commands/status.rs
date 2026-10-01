@@ -78,6 +78,7 @@ mod tests {
             runtime_name: "docker",
             runtime_version: None,
             collected_at: Instant::now(),
+            stats: true,
             error: None,
         };
 

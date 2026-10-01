@@ -274,6 +274,7 @@ mod tests {
             runtime_name: "docker",
             runtime_version: runtime_version.map(str::to_string),
             collected_at: Instant::now(),
+            stats: true,
             error: None,
         }
     }

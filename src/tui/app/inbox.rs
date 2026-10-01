@@ -354,8 +354,12 @@ impl App {
         self.clamp_selection();
     }
 
-    /// Switch tabs; entering the Inbox marks everything read.
+    /// Switch tabs; entering the Inbox marks everything read, entering
+    /// Instances refreshes the process rows (they aren't fetched elsewhere).
     pub(super) fn set_tab(&mut self, tab: Tab) {
+        if tab == Tab::Instances && self.tab != tab {
+            self.needs_proc_fetch = true;
+        }
         self.tab = tab;
         if tab == Tab::Inbox {
             self.inbox.mark_all_read();

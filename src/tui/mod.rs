@@ -52,6 +52,10 @@ const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const TERM_POLL_INTERVAL: Duration = Duration::from_millis(30);
 /// Data-refresh cadence: how often a background collection is kicked off.
 const TICK_INTERVAL: Duration = Duration::from_secs(2);
+/// Cpu/mem cadence: at most one stats collection per interval, the ticks in
+/// between are listing-only (`StatsClock`). `stats --no-stream` samples every
+/// running container twice, the bulk of the TUI's dockerd load.
+const STATS_INTERVAL: Duration = Duration::from_secs(7);
 /// Process-refresh cadence for expanded instances (separate from the snapshot).
 const PROC_TICK: Duration = Duration::from_secs(5);
 /// Delay of the second refresh after a start/stop finishes. The immediate one
@@ -84,6 +88,25 @@ impl FollowUp {
             }
             _ => false,
         }
+    }
+}
+
+/// Picks each collection's depth so stats run at most every `STATS_INTERVAL`.
+/// Kept separate from the event loop so the timing is testable without a
+/// runtime.
+#[derive(Default)]
+struct StatsClock {
+    last: Option<Instant>,
+}
+
+impl StatsClock {
+    /// `Full` (recording `now`) when stats are due, else `Listing`.
+    fn depth(&mut self, now: Instant) -> data::Depth {
+        if self.last.is_some_and(|last| now < last + STATS_INTERVAL) {
+            return data::Depth::Listing;
+        }
+        self.last = Some(now);
+        data::Depth::Full
     }
 }
 
@@ -181,6 +204,7 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
     // `deeper` holds the collections still to chain (popped from the back).
     let mut pending: Option<Receiver<Snapshot>> = Some(spawn_collect_with(&dir, data::Depth::Disk));
     let mut deeper = vec![data::Depth::Full, data::Depth::Listing];
+    let mut stats_clock = StatsClock::default();
     // Background `s` stops/starts, each reporting completion over its own
     // channel; paired with the instance name so the guard clears even if the
     // thread dies.
@@ -270,7 +294,7 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
                         Err(e) => format!("rename failed: {e:#}"),
                     });
                     last_tick = Instant::now();
-                    pending = Some(spawn_collect(&dir));
+                    pending = Some(spawn_collect(&dir, &mut stats_clock));
                 }
                 other => {
                     run_suspended(terminal, &dir, other)?;
@@ -278,7 +302,7 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
                     terminal.clear()?;
                     // Refresh data now rather than waiting for the next tick.
                     last_tick = Instant::now();
-                    pending = Some(spawn_collect(&dir));
+                    pending = Some(spawn_collect(&dir, &mut stats_clock));
                 }
             }
         }
@@ -353,7 +377,7 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
                 last_tick = Instant::now();
                 followup.schedule(last_tick);
                 if pending.is_none() {
-                    pending = Some(spawn_collect(&dir));
+                    pending = Some(spawn_collect(&dir, &mut stats_clock));
                 }
                 false
             }
@@ -371,7 +395,7 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
                 last_tick = Instant::now();
                 followup.schedule(last_tick);
                 if pending.is_none() {
-                    pending = Some(spawn_collect(&dir));
+                    pending = Some(spawn_collect(&dir, &mut stats_clock));
                 }
                 false
             }
@@ -419,7 +443,12 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
                         );
                     }
                     app.set_snapshot(snapshot);
-                    pending = deeper.pop().map(|depth| spawn_collect_with(&dir, depth));
+                    pending = deeper.pop().map(|depth| {
+                        if depth == data::Depth::Full {
+                            stats_clock.last = Some(Instant::now());
+                        }
+                        spawn_collect_with(&dir, depth)
+                    });
                     if procs_after_snapshot {
                         procs_after_snapshot = false;
                         app.needs_proc_fetch = true;
@@ -433,7 +462,7 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
 
         if followup.take_due(Instant::now(), pending.is_some()) {
             last_tick = Instant::now();
-            pending = Some(spawn_collect(&dir));
+            pending = Some(spawn_collect(&dir, &mut stats_clock));
             procs_after_snapshot = true;
         }
 
@@ -441,7 +470,7 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
             last_tick = Instant::now();
             // Skip if a collection is still running so docker calls can't pile up.
             if pending.is_none() {
-                pending = Some(spawn_collect(&dir));
+                pending = Some(spawn_collect(&dir, &mut stats_clock));
             }
         }
 
@@ -778,11 +807,12 @@ fn spawn_proc_fetch(targets: Vec<(String, String)>) -> Receiver<BTreeMap<String,
 
 /// Spawn a detached thread that collects one [`Snapshot`] and sends it back.
 /// The receiver is polled from the event loop, keeping [`App`] I/O-free.
-fn spawn_collect(dir: &Path) -> Receiver<Snapshot> {
-    spawn_collect_with(dir, data::Depth::Full)
+/// A refresh collection, with stats only when `clock` says they're due.
+fn spawn_collect(dir: &Path, clock: &mut StatsClock) -> Receiver<Snapshot> {
+    spawn_collect_with(dir, clock.depth(Instant::now()))
 }
 
-/// [`spawn_collect`] down to `depth` (`data::collect_with`).
+/// A collection down to `depth` (`data::collect_with`).
 fn spawn_collect_with(dir: &Path, depth: data::Depth) -> Receiver<Snapshot> {
     let (tx, rx) = mpsc::channel();
     let dir: PathBuf = dir.to_path_buf();
@@ -796,6 +826,17 @@ fn spawn_collect_with(dir: &Path, depth: data::Depth) -> Receiver<Snapshot> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stats_clock_runs_stats_at_most_once_per_interval() {
+        let t0 = Instant::now();
+        let mut c = StatsClock::default();
+        assert_eq!(c.depth(t0), data::Depth::Full, "first refresh has stats");
+        assert_eq!(c.depth(t0 + TICK_INTERVAL), data::Depth::Listing);
+        assert_eq!(c.depth(t0 + STATS_INTERVAL - Duration::from_millis(1)), data::Depth::Listing);
+        assert_eq!(c.depth(t0 + STATS_INTERVAL), data::Depth::Full);
+        assert_eq!(c.depth(t0 + STATS_INTERVAL + TICK_INTERVAL), data::Depth::Listing);
+    }
 
     #[test]
     fn followup_fires_once_after_delay() {

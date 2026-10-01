@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
-use super::data::{visible_nodes, Node, Snapshot};
+use super::data::{visible_nodes, ContainerStatus, Node, Snapshot};
 use super::procs::ProcState;
 use super::prompt::{Prompt, PromptAction};
 use super::term::TermTabs;
@@ -211,8 +211,21 @@ impl App {
     }
 
     /// Install a freshly collected snapshot and re-clamp the Instances selection
-    /// in case rows shrank. I/O-free: the caller does the collecting.
-    pub fn set_snapshot(&mut self, snapshot: Snapshot) {
+    /// in case rows shrank. I/O-free: the caller does the collecting. A snapshot
+    /// collected without stats keeps the previous cpu/mem of containers that
+    /// are still running, so the columns don't blank between stats rounds.
+    pub fn set_snapshot(&mut self, mut snapshot: Snapshot) {
+        if let (false, Some(prev)) = (snapshot.stats, &self.snapshot) {
+            for row in &mut snapshot.instances {
+                if !matches!(row.status, ContainerStatus::Running(_)) {
+                    continue;
+                }
+                if let Some(old) = prev.instances.iter().find(|o| o.container == row.container) {
+                    row.cpu.clone_from(&old.cpu);
+                    row.mem.clone_from(&old.mem);
+                }
+            }
+        }
         self.snapshot = Some(snapshot);
         self.clamp_selection();
     }

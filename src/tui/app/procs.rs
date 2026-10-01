@@ -143,8 +143,13 @@ impl App {
     /// row stored directly here — no fetch — and are omitted from the returned
     /// list. Instances no longer in the snapshot are dropped from the cache. The
     /// selected running instance is appended (deduped) so the Detail agent count
-    /// has a fresh forest even when its process layer isn't expanded.
+    /// has a fresh forest even when its process layer isn't expanded. Empty off
+    /// the Instances tab: nothing there shows processes, and each target costs
+    /// two `docker exec`s.
     pub fn proc_fetch_targets(&mut self) -> Vec<(String, String)> {
+        if self.tab != Tab::Instances {
+            return Vec::new();
+        }
         let Some(snapshot) = &self.snapshot else {
             return Vec::new();
         };
@@ -185,6 +190,42 @@ mod tests {
     use super::*;
     use crate::tui::app::test_support::*;
     use crate::tui::app::*;
+
+    /// Off the Instances tab nothing shows processes, so nothing is fetched;
+    /// coming back asks for a fetch right away.
+    #[test]
+    fn proc_fetch_only_on_instances_tab() {
+        let mut app = new_app();
+        app.set_snapshot(snapshot_with_status(1, running()));
+        app.on_key(key(KeyCode::Down)); // onto inst0
+        assert_eq!(app.proc_fetch_targets().len(), 1);
+        app.set_tab(Tab::Ports);
+        assert!(app.proc_fetch_targets().is_empty());
+        app.take_needs_proc_fetch();
+        app.set_tab(Tab::Instances);
+        assert!(app.take_needs_proc_fetch());
+        assert_eq!(app.proc_fetch_targets().len(), 1);
+    }
+
+    /// A stats-less snapshot keeps the last cpu/mem of still-running containers.
+    #[test]
+    fn stats_less_snapshot_carries_cpu_mem_while_running() {
+        let mut app = new_app();
+        let mut full = snapshot_with_status(2, running());
+        for row in &mut full.instances {
+            row.cpu = Some("1%".into());
+            row.mem = Some("1MiB".into());
+        }
+        app.set_snapshot(full);
+        let mut listing = snapshot_with_status(2, running());
+        listing.stats = false;
+        listing.instances[1].status = ContainerStatus::Exited("Exited (0)".into());
+        app.set_snapshot(listing);
+        let rows = &app.snapshot.as_ref().unwrap().instances;
+        assert_eq!(rows[0].cpu.as_deref(), Some("1%"));
+        assert_eq!(rows[0].mem.as_deref(), Some("1MiB"));
+        assert_eq!(rows[1].cpu, None, "stopped: no stale cpu");
+    }
 
     #[test]
     fn instance_shortcuts_disabled_on_proc_row() {
@@ -329,6 +370,7 @@ mod tests {
             runtime_name: "docker",
             runtime_version: None,
             collected_at: std::time::Instant::now(),
+            stats: true,
             error: None,
         };
         app.set_snapshot(snap);
@@ -420,6 +462,7 @@ mod tests {
             runtime_name: "docker",
             runtime_version: None,
             collected_at: std::time::Instant::now(),
+            stats: true,
             error: None,
         });
 

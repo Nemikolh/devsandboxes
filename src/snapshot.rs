@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::Instant;
 
 use serde::Serialize;
@@ -153,6 +154,10 @@ pub struct Snapshot {
     /// off-process; a JSON consumer prints at collection time itself.
     #[serde(skip)]
     pub collected_at: Instant,
+    /// Whether cpu/mem were collected ([`Depth::Full`]). The TUI collects them
+    /// on a slower cadence and carries the last values over otherwise.
+    #[serde(skip)]
+    pub stats: bool,
     pub error: Option<String>,
 }
 
@@ -558,6 +563,7 @@ pub fn collect_with(dir: &Path, depth: Depth) -> Snapshot {
                 runtime_name: backend().name(),
                 runtime_version: None,
                 collected_at,
+                stats: false,
                 error: Some(format!("state: {e:#}")),
             };
         }
@@ -591,12 +597,9 @@ pub fn collect_with(dir: &Path, depth: Depth) -> Snapshot {
     };
 
     // Runtime version for the header; best-effort (None when down). Kept off
-    // the UI thread like every other runtime call here. Cheap enough to run
-    // each collection, so no caching is threaded through.
-    let runtime_version = listed
-        .then(|| rt.server_version().ok())
-        .flatten()
-        .filter(|v| !v.is_empty());
+    // the UI thread like every other runtime call here, and asked once per
+    // process: the TUI would otherwise spend a docker call per tick on it.
+    let runtime_version = if listed { runtime_version(rt) } else { None };
 
     // Load config once; resolve every sandbox for the tree, services + drift
     // hash. `resolved` maps sandbox name → (services, hash) for the instance join.
@@ -709,8 +712,21 @@ pub fn collect_with(dir: &Path, depth: Depth) -> Snapshot {
         runtime_name: rt.name(),
         runtime_version,
         collected_at,
+        stats: depth == Depth::Full,
         error: if errors.is_empty() { None } else { Some(errors.join("; ")) },
     }
+}
+
+/// The runtime's server version, cached for the process once it answers (a
+/// failure is retried next collection, so a runtime that starts late still
+/// shows up).
+fn runtime_version(rt: &dyn crate::runtime::Backend) -> Option<String> {
+    static CACHED: Mutex<Option<String>> = Mutex::new(None);
+    let mut cached = CACHED.lock().unwrap_or_else(|e| e.into_inner());
+    if cached.is_none() {
+        *cached = rt.server_version().ok().filter(|v| !v.is_empty());
+    }
+    cached.clone()
 }
 
 #[cfg(test)]

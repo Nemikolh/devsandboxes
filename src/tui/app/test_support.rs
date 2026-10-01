@@ -74,6 +74,7 @@ pub(super) fn snapshot_with(n: usize) -> Snapshot {
         runtime_name: "docker",
         runtime_version: None,
         collected_at: std::time::Instant::now(),
+        stats: true,
         error: None,
     }
 }
@@ -136,6 +137,7 @@ pub(super) fn orphan_snapshot() -> Snapshot {
         runtime_name: "docker",
         runtime_version: None,
         collected_at: std::time::Instant::now(),
+        stats: true,
         error: None,
     }
 }
@@ -233,6 +235,7 @@ pub(super) fn service_snapshot(containers: Vec<(String, ContainerStatus)>) -> Sn
         runtime_name: "docker",
         runtime_version: None,
         collected_at: std::time::Instant::now(),
+        stats: true,
         error: None,
     }
 }
