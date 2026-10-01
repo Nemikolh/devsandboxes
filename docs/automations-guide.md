@@ -34,9 +34,9 @@ devsbd notify [--level info|warn|error] [--link URL] [--key K] [--] <msg>...
 
 - Queued first: each call writes a record to a durable outbox in the container (`/var/lib/devsandbox/outbox/`, survives container restarts) and succeeds even with no host attached.
 - Delivered while the **dashboard is open**: it shows up in the Inbox tab (`4`; unread count in the title, a yellow `✉N` on the instance row) and as a desktop notification (`notify-send` on Linux, `osascript` on macOS; skipped silently when missing). One-shot CLI commands don't deliver; the queue waits for the next dashboard.
-- `--key` dedupes per instance: a newer notification with the same key replaces the older one, so a script re-reporting "PR 123 conflicted" every poll doesn't spam.
-- `--link` (http(s) only) opens with `enter` in the Inbox. `d` dismisses a row, `D` clears the inbox. History is in memory only.
-- Limits: desktop popups are rate-limited per instance (a burst of 3, then one per 10 s) and a keyed notification repeating one popped in the last minute doesn't pop again; the Inbox still gets every one. The Inbox keeps 50 entries per instance (200 overall), so a noisy instance drops its own oldest rows, not others'.
+- `--key` threads per instance: a newer notification with the same key becomes the thread's single row, with the older ones folded under it (`→` to show the trace), so a script re-reporting "PR 123 conflicted" every poll doesn't spam.
+- `--link` (http(s) only) opens with `enter` in the Inbox. With several instances sending, the Inbox groups them per instance. `d` dismisses a history row, a thread or an instance's group; `D` clears the inbox. History is saved in `inbox.toml` next to `state.toml` and survives dashboard restarts; dismissed entries are removed from it.
+- Limits: desktop popups are rate-limited per instance (a burst of 3, then one per 10 s) and a keyed notification repeating one popped in the last minute doesn't pop again; the Inbox still gets every one. The Inbox keeps 200 notifications per instance (thread history included), so a noisy instance drops its own oldest, not others'.
 - Flags are recognized anywhere before `--`; everything after `--` is message.
 
 ## Dispatchers

@@ -23,7 +23,7 @@ mod test_support;
 mod tree;
 mod view;
 
-pub use inbox::{clock, parse_utc_offset, Inbox, InboxEntry};
+pub use inbox::{clock, parse_utc_offset, Inbox, InboxRow, Thread};
 pub use procs::{PendingSignal, Signal};
 pub use view::{ConfigView, Modal, Pane, Side, TextModal};
 use view::{col_near, divider_pct};
@@ -253,7 +253,7 @@ impl App {
             Tab::Instances => self.visible_nodes().len(),
             Tab::Services => self.snapshot.as_ref().map_or(0, |s| s.services.len()),
             Tab::Ports => self.ports.len(),
-            Tab::Inbox => self.inbox.entries.len(),
+            Tab::Inbox => self.inbox.rows().len(),
         }
     }
 
@@ -353,6 +353,9 @@ impl App {
             KeyCode::Right if self.tab == Tab::Instances => self.tree_expand(),
             KeyCode::Char(' ') if self.tab == Tab::Instances => self.tree_toggle(),
             KeyCode::Left if self.tab == Tab::Instances => self.tree_collapse(),
+            KeyCode::Right if self.tab == Tab::Inbox => self.inbox_expand(),
+            KeyCode::Char(' ') if self.tab == Tab::Inbox => self.inbox_toggle(),
+            KeyCode::Left if self.tab == Tab::Inbox => self.inbox_collapse(),
             // Inbox: `enter` opens the selected notification's link.
             KeyCode::Enter if self.tab == Tab::Inbox => self.open_selected_link(),
             KeyCode::Enter | KeyCode::Char('e') if !on_proc => self.open_config(),

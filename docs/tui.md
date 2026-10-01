@@ -182,21 +182,30 @@ the worker, never the UI thread.
 
 - `Tab::Inbox` is the fourth tab: `4` jumps to it, `tab`/`S-tab` cycle over
   all four. Its title carries the unread count (`Inbox (3)`).
-- In memory only, newest first, capped at 200 (oldest dropped). A notification
-  with a `--key` replaces the earlier one with the same `(instance, key)`,
-  moving to the top as unread; the same key from another instance is its own
-  row.
+- Newest first, saved to `inbox.toml` next to `state.toml` after every change
+  (atomic temp + rename) and loaded at startup, so history survives restarts.
+  Capped at 200 records per instance, thread history included; the
+  instance's oldest record drops first, never another instance's.
+- A notification with a `--key` becomes the new head of the thread with the
+  same `(instance, key)`, moving to the top as unread; older ones stay as its
+  history (folded, `(+N)` on the head, `→`/`space` to show). The same key from
+  another instance is its own thread. Only heads count as unread.
+- With more than one instance in the inbox, threads are grouped under a
+  foldable header per instance (`▾ name  N ✉unread`), ordered by newest
+  thread; with one instance the list stays flat.
 - Unread: anything arriving while the Inbox isn't shown. Entering the tab marks
   everything read. Unread rows are bold; an Instances-tab instance row with
   unread notifications shows a yellow `✉N` after its name.
 - Table columns: `TIME` (`HH:MM`, local time from `date +%z` read once at
   startup, UTC if unavailable), `LEVEL` (info dim / warn yellow / error red),
-  `INSTANCE`, `MESSAGE` (first line, `↗` when it has a link). The Detail panel
-  shows the full message, link and key.
+  `INSTANCE` (flat only; grouped, the header carries it), `MESSAGE` (first
+  line, `↗` when it has a link). The Detail panel shows the full message, link
+  and key, or a group's counts.
 - Keys: `enter` opens the link (`xdg-open`, `open` on macOS; only `http(s)://`
   links: the link comes from the container, so paths, `-options`, `file:` and
-  custom schemes are refused), `d` dismisses the selected
-  row, `D` clears the inbox.
+  custom schemes are refused), `→`/`space`/`←` fold like the Instances tree,
+  `d` dismisses the selected history record, whole thread (on its head) or
+  whole instance (on its header), `D` clears the inbox. Dismissals are saved.
 
 ## Step ordering / commits
 

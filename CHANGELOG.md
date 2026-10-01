@@ -14,6 +14,8 @@ folders = { "/workspaces/api" = "../api", "/workspaces/.shared" = { path = "../.
 
 - A sandbox's own `folder` now also gets a worktree when another instance mounts that folder directly as a `folders` entry.
 
+- **The Inbox keeps its history.** Notifications are saved in `inbox.toml` next to `state.toml`, so they survive closing the dashboard; `d`/`D` remove them from the file too. A notification with the same `--key` no longer replaces the earlier one: it becomes the head of a thread, with the older ones folded under it (`→` to show them). With more than one instance sending, the Inbox groups them per instance, foldable like the Instances tree. The limit is now 200 notifications per instance (was 50, and 200 overall).
+
 - **`worktree-link` no longer migrates old `shared-files/<sandbox>/` stores.** The automatic move only relinked the instance being run, so every other instance on the same repo was left with dangling links. A link into an old store is now skipped with a warning that shows where the file should go. Move it there, delete the old link, and `rebuild`.
 
 ## 0.5.0

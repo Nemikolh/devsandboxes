@@ -10,7 +10,7 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, 
 use tui_term::widget::{Cursor, PseudoTerminal};
 
 use super::app::{
-    clock, App, ConfigView, Focus, InboxEntry, Modal, Pane, PortRow, Side, Tab, TextModal,
+    clock, App, ConfigView, Focus, InboxRow, Modal, Pane, PortRow, Side, Tab, TextModal, Thread,
 };
 use super::data::{
     humanize_secs, sandbox_stats, totals_line, ContainerStatus, InstanceRow, Node, SandboxRow,
@@ -538,7 +538,7 @@ fn draw_inbox(frame: &mut Frame, app: &App, area: Rect) {
         .border_style(dash_border_style(panel_focused))
         .title(app.tab_title(Tab::Inbox));
 
-    if app.inbox.entries.is_empty() {
+    if app.inbox.threads.is_empty() {
         let text = Line::from(Span::styled(
             "no notifications — containers send them with `devsbd notify \"…\"`",
             Style::default().add_modifier(Modifier::DIM),
@@ -546,20 +546,25 @@ fn draw_inbox(frame: &mut Frame, app: &App, area: Rect) {
         .alignment(Alignment::Center);
         frame.render_widget(Paragraph::new(text).block(block), top);
     } else {
-        let header = Row::new(["TIME", "LEVEL", "INSTANCE", "MESSAGE"].into_iter().map(Cell::from))
+        // Grouped, the instance lives in the group header; flat (one
+        // instance), it keeps its own column.
+        let grouped = app.inbox.grouped();
+        let mut titles = vec!["TIME", "LEVEL"];
+        let mut widths = vec![Constraint::Length(5), Constraint::Length(5)];
+        if !grouped {
+            titles.push("INSTANCE");
+            widths.push(Constraint::Length(20));
+        }
+        titles.push("MESSAGE");
+        widths.push(Constraint::Min(20));
+        let header = Row::new(titles.into_iter().map(Cell::from))
             .style(Style::default().add_modifier(Modifier::DIM));
         let rows: Vec<Row> = app
             .inbox
-            .entries
+            .rows()
             .iter()
-            .map(|e| inbox_row(e, app.utc_offset))
+            .map(|r| inbox_row(app, r, grouped))
             .collect();
-        let widths = [
-            Constraint::Length(5),
-            Constraint::Length(5),
-            Constraint::Length(20),
-            Constraint::Min(20),
-        ];
         let table = Table::new(rows, widths)
             .header(header)
             .block(block)
@@ -568,7 +573,7 @@ fn draw_inbox(frame: &mut Frame, app: &App, area: Rect) {
         let mut state = TableState::default().with_selected(Some(app.selected()));
         frame.render_stateful_widget(table, top, &mut state);
     }
-    draw_inbox_detail(frame, app.selected_inbox_entry(), app.utc_offset, detail_area, panel_focused);
+    draw_inbox_detail(frame, app, detail_area, panel_focused);
     if let Some(terms_area) = terms_area {
         draw_terminal_panel(frame, app, terms_area);
     }
@@ -582,61 +587,118 @@ fn level_style(level: Level) -> Style {
     }
 }
 
-/// One Inbox row: the message's first line, `↗` when there's a link to
-/// open, bold while unread.
-fn inbox_row(e: &InboxEntry, utc_offset: i64) -> Row<'_> {
-    let first = e.record.msg.lines().next().unwrap_or("");
-    let mut msg = vec![Span::raw(first.to_string())];
-    if e.record.link.is_some() {
-        msg.push(Span::styled(" ↗", Style::default().fg(Color::Blue)));
-    }
-    let row = Row::new(vec![
-        Cell::from(Span::styled(
-            clock(e.record.at, utc_offset),
-            Style::default().add_modifier(Modifier::DIM),
-        )),
-        Cell::from(Span::styled(e.record.level.as_str(), level_style(e.record.level))),
-        Cell::from(e.instance.clone()),
-        Cell::from(Line::from(msg)),
-    ]);
-    if e.unread {
-        row.style(Style::default().add_modifier(Modifier::BOLD))
-    } else {
-        row
+/// One Inbox row. A group header: `▾ name`, its record count and unread
+/// badge. A thread head: the message's first line, a ▸/▾ marker and `(+N)`
+/// when it has history, `↗` when there's a link, bold while unread. History:
+/// indented under its head, dim.
+fn inbox_row<'a>(app: &App, row: &InboxRow, grouped: bool) -> Row<'a> {
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let inbox = &app.inbox;
+    let thread_cells = |t: &Thread, note: usize, msg: Vec<Span<'static>>| {
+        let r = &t.notes[note].record;
+        let mut cells = vec![
+            Cell::from(Span::styled(clock(r.at, app.utc_offset), dim)),
+            Cell::from(Span::styled(r.level.as_str(), level_style(r.level))),
+        ];
+        if !grouped {
+            cells.push(Cell::from(t.instance.clone()));
+        }
+        cells.push(Cell::from(Line::from(msg)));
+        cells
+    };
+    let first_line = |msg: &str| msg.lines().next().unwrap_or("").to_string();
+    let indent = if grouped { "  " } else { "" };
+    match row {
+        InboxRow::Group(name) => {
+            let marker = if inbox.is_collapsed(name) { '▸' } else { '▾' };
+            let newest = inbox.threads.iter().find(|t| &t.instance == name);
+            let mut msg = vec![
+                Span::styled(format!("{marker} {name}"), Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+                Span::styled(format!("  {}", inbox.count_for(name)), dim),
+            ];
+            let unread = inbox.unread_for(name);
+            if unread > 0 {
+                msg.push(Span::styled(format!(" ✉{unread}"), Style::default().fg(Color::Yellow)));
+            }
+            Row::new(vec![
+                Cell::from(Span::styled(newest.map_or(String::new(), |t| clock(t.head().at, app.utc_offset)), dim)),
+                Cell::from(""),
+                Cell::from(Line::from(msg)),
+            ])
+        }
+        InboxRow::Thread(i) => {
+            let t = &inbox.threads[*i];
+            let marker = match (t.history(), inbox.is_expanded(t)) {
+                (0, _) => "  ",
+                (_, true) => "▾ ",
+                (_, false) => "▸ ",
+            };
+            let mut msg = vec![Span::raw(format!("{indent}{marker}{}", first_line(&t.head().msg)))];
+            if t.head().link.is_some() {
+                msg.push(Span::styled(" ↗", Style::default().fg(Color::Blue)));
+            }
+            if t.history() > 0 {
+                msg.push(Span::styled(format!(" (+{})", t.history()), dim));
+            }
+            let row = Row::new(thread_cells(t, 0, msg));
+            if t.unread {
+                row.style(Style::default().add_modifier(Modifier::BOLD))
+            } else {
+                row
+            }
+        }
+        InboxRow::History { thread, note } => {
+            let t = &inbox.threads[*thread];
+            let r = &t.notes[*note].record;
+            let mut msg = vec![Span::styled(format!("{indent}    {}", first_line(&r.msg)), dim)];
+            if r.link.is_some() {
+                msg.push(Span::styled(" ↗", Style::default().fg(Color::Blue)));
+            }
+            Row::new(thread_cells(t, *note, msg))
+        }
     }
 }
 
-/// Detail for the selected notification: the full message plus its link and
-/// dedupe key.
-fn draw_inbox_detail(
-    frame: &mut Frame,
-    entry: Option<&InboxEntry>,
-    utc_offset: i64,
-    area: Rect,
-    term_focused: bool,
-) {
+/// Detail for the selected row: a record's full message plus its link and
+/// thread key (and history size on a head), or a group's summary.
+fn draw_inbox_detail(frame: &mut Frame, app: &App, area: Rect, term_focused: bool) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(dash_border_style(term_focused))
         .title("Detail");
-    let Some(e) = entry else {
-        frame.render_widget(Paragraph::new("").block(block), area);
-        return;
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let lines = match (app.selected_inbox_row(), app.selected_inbox_record()) {
+        (Some(InboxRow::Group(name)), _) => {
+            let threads = app.inbox.threads.iter().filter(|t| t.instance == name).count();
+            vec![
+                Line::from(name.clone()),
+                kv("notifications", &app.inbox.count_for(&name).to_string()),
+                kv("threads", &threads.to_string()),
+                kv("unread", &app.inbox.unread_for(&name).to_string()),
+            ]
+        }
+        (Some(row), Some((t, r))) => {
+            let mut lines = vec![Line::from(vec![
+                Span::styled(clock(r.at, app.utc_offset), dim),
+                Span::raw("  "),
+                Span::styled(r.level.as_str(), level_style(r.level)),
+                Span::raw("  "),
+                Span::raw(t.instance.clone()),
+            ])];
+            if let Some(link) = &r.link {
+                lines.push(kv("link (enter)", link));
+            }
+            if let Some(key) = &r.key {
+                lines.push(kv("key", key));
+            }
+            if matches!(row, InboxRow::Thread(_)) && t.history() > 0 {
+                lines.push(kv("history", &format!("{} earlier (→ to show)", t.history())));
+            }
+            lines.extend(r.msg.lines().map(|l| Line::from(l.to_string())));
+            lines
+        }
+        _ => Vec::new(),
     };
-    let mut lines = vec![Line::from(vec![
-        Span::styled(clock(e.record.at, utc_offset), Style::default().add_modifier(Modifier::DIM)),
-        Span::raw("  "),
-        Span::styled(e.record.level.as_str(), level_style(e.record.level)),
-        Span::raw("  "),
-        Span::raw(e.instance.clone()),
-    ])];
-    if let Some(link) = &e.record.link {
-        lines.push(kv("link (enter)", link));
-    }
-    if let Some(key) = &e.record.key {
-        lines.push(kv("key", key));
-    }
-    lines.extend(e.record.msg.lines().map(|l| Line::from(l.to_string())));
     frame.render_widget(
         Paragraph::new(lines).block(block).wrap(ratatui::widgets::Wrap { trim: false }),
         area,
@@ -1242,7 +1304,7 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
                 "q quit · tab switch · ↑↓ select · d stop forward · : port … · ? help".to_string()
             }
             Tab::Inbox => {
-                "q quit · tab switch · ↑↓ select · enter open link · d dismiss · D clear · ? help"
+                "q quit · tab switch · ↑↓ select · ←→ fold · enter open link · d dismiss · D clear · ? help"
                     .to_string()
             }
         },

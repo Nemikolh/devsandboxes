@@ -594,7 +594,8 @@ container trigger those host git calls itself (`ensure`, `rm`).
 - Desktop notifications rate-limited per instance (token bucket: burst 3, one
   per 10 s), repeats of the same `(instance, key)` within the window coalesced;
   inbox entries still arrive.
-- Inbox: per-instance cap (50) besides the global 200 (`src/tui/app/inbox.rs`).
+- Inbox: per-instance cap of 200 records, thread history included; no global
+  cap (`src/tui/app/inbox.rs`).
 - Tests: semaphore refusal, bounded reader truncation + timeout kill (pure
   helper over a spawned `sh -c`), token bucket, per-instance cap.
 

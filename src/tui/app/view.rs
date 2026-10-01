@@ -38,8 +38,11 @@ Ports tab
 
 Inbox tab (container notifications: devsbd notify)
   ↑/k ↓/j     move selection   (entering the tab marks all read)
+  → / space   expand a thread's history / an instance group (toggle)
+  ←           collapse, or jump to the parent
   enter       open the selected notification's link
-  d           dismiss          D   clear all
+  d           dismiss (history row / whole thread / whole instance)
+  D           clear all
 
 Process rows (expanded instance)
   ←           jump to the parent instance
