@@ -892,8 +892,18 @@ fn draw_tree(
         Constraint::Min(12),
     ];
     if show_type {
-        titles.push("TYPE");
-        widths.push(Constraint::Length(10));
+        // SERVICES hugs its longest value and a trailing spacer takes the slack,
+        // so TYPE sits next to the services instead of at the far right edge.
+        let services = snapshot
+            .instances
+            .iter()
+            .map(|r| r.services.join(",").chars().count())
+            .chain([titles[6].len()])
+            .max()
+            .unwrap_or_default();
+        widths[6] = Constraint::Length(services as u16);
+        titles.extend(["TYPE", ""]);
+        widths.extend([Constraint::Length(10), Constraint::Min(0)]);
     }
     let header = Row::new(titles.into_iter().map(Cell::from))
         .style(Style::default().add_modifier(Modifier::DIM));
