@@ -105,6 +105,10 @@ enum Command {
         /// Keep the branch `run` created without asking (the default off a TTY)
         #[arg(long)]
         keep_branch: bool,
+        /// Remove even with uncommitted changes in the worktree (discarded)
+        /// or when a teardown step fails (warned, then skipped)
+        #[arg(short, long)]
+        force: bool,
     },
     /// Stop a sandbox instance (docker stop; `start` restarts it)
     Stop {
@@ -266,8 +270,8 @@ fn main() -> Result<()> {
             commands::rebuild::rebuild(&cli.dir, name, all, force)
         }
         Command::Rename { name, new_name } => commands::rename::rename(&name, &new_name),
-        Command::Rm { name, delete_branch, keep_branch } => {
-            commands::rm::rm(&name, rm_branch_flag(delete_branch, keep_branch))
+        Command::Rm { name, delete_branch, keep_branch, force } => {
+            commands::rm::rm(&name, rm_branch_flag(delete_branch, keep_branch), force)
         }
         Command::Stop { name, all } => commands::stop::stop(name, all),
         Command::Start { name, all } => {
