@@ -198,7 +198,7 @@ export declare function rebuild(target: Target, opts?: CommonOptions & { force?:
 export declare function rename(name: string, newName: string, opts?: CommonOptions): Promise<void>;
 /**
  * Remove container, worktree, and state entry. Rejects, removing nothing,
- * when the worktree has uncommitted or untracked changes.
+ * when the worktree has uncommitted or untracked changes, unless `force`.
  */
 export declare function rm(
   name: string,
@@ -209,6 +209,12 @@ export declare function rm(
      * reused are always kept.
      */
     deleteBranch?: boolean;
+    /**
+     * Remove anyway: uncommitted or untracked worktree changes are
+     * discarded, and a failed step (logged on stderr) is skipped so the
+     * instance still leaves state; what failed stays on disk.
+     */
+    force?: boolean;
   },
 ): Promise<void>;
 /** Remove unreferenced services (`force`: also orphaned shell-history files). */

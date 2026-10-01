@@ -41,7 +41,7 @@ await devsandbox.rm(name, { deleteBranch: true });
 | `inspect(name)`                            | runtime inspect document (`unknown`) |
 | `run(sandbox, { name, branch, base })`     | `RunRecord` (name, container, workspace, folder, worktree, branch) |
 | `start` / `stop` / `rebuild(name \| { all: true })` | `void`                      |
-| `rm(name, { deleteBranch })` / `rename(a, b)` / `gc()` / `service.rebuild(name)` | `void` |
+| `rm(name, { deleteBranch, force })` / `rename(a, b)` / `gc()` / `service.rebuild(name)` | `void` |
 | `logs(name, { lines })`                    | log text                             |
 | `exec(name, argv, { input })`              | `{ exitCode, stdout, stderr }` (never rejects on exit code) |
 | `execArgv(name, argv?, { tty, interactive })` | `{ file, args }` to spawn yourself (sync; no argv: login shell) |
@@ -49,7 +49,7 @@ await devsandbox.rm(name, { deleteBranch: true });
 
 Every function takes `{ dir, cwd, env, signal, stderr }`, except the synchronous `binaryPath()` and `execArgv()`. `dir` is the config root (`-C`). A failed command rejects with `DevsandboxError` (`exitCode`, `stdout`, `stderr`).
 
-`rm` never prompts: `deleteBranch: true` deletes the worktree branch `run` created (`git branch -D`, unmerged commits too); `false` or omitted keeps it. Branches `run` reused are always kept. It rejects, removing nothing, when the worktree has uncommitted or untracked changes.
+`rm` never prompts: `deleteBranch: true` deletes the worktree branch `run` created (`git branch -D`, unmerged commits too); `false` or omitted keeps it. Branches `run` reused are always kept. It rejects, removing nothing, when the worktree has uncommitted or untracked changes, unless `force: true`: that discards them, and a step that fails is skipped with a warning on stderr so the instance is still removed.
 
 ## Platforms
 
