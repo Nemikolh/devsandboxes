@@ -92,6 +92,9 @@ pub struct SandboxRow {
     /// shown in the Detail panel. Empty when the sandbox validates or failed to
     /// resolve at all (the resolve error is reported separately).
     pub issues: Vec<String>,
+    /// Whether the sandbox has a `dispatcher` table (the TUI's TYPE column).
+    #[serde(skip)]
+    pub dispatcher: bool,
 }
 
 /// One service row, everything the Services view needs pre-joined.
@@ -473,6 +476,7 @@ pub fn sandbox_rows(dir: &Path, config: &Config) -> (Vec<SandboxRow>, Vec<String
                     config_hash: rs.config_hash,
                     build_hash,
                     issues,
+                    dispatcher: rs.properties.dispatcher.is_some(),
                 });
             }
             Err(e) => {
@@ -486,6 +490,7 @@ pub fn sandbox_rows(dir: &Path, config: &Config) -> (Vec<SandboxRow>, Vec<String
                     config_hash: String::new(),
                     build_hash: String::new(),
                     issues: Vec::new(),
+                    dispatcher: false,
                 });
             }
         }

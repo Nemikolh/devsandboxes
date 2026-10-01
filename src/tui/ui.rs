@@ -879,19 +879,10 @@ fn draw_tree(
     area: Rect,
     term_focused: bool,
 ) {
-    let header = Row::new(
-        ["TREE", "STATUS", "UPTIME", "CPU", "MEM", "FOLDER", "SERVICES"]
-            .into_iter()
-            .map(Cell::from),
-    )
-    .style(Style::default().add_modifier(Modifier::DIM));
-
-    let table_rows: Vec<Row> = nodes
-        .iter()
-        .map(|node| tree_row(app, snapshot, *node))
-        .collect();
-
-    let widths = [
+    // TYPE only earns its width when some sandbox is a dispatcher.
+    let show_type = snapshot.sandboxes.iter().any(|s| s.dispatcher);
+    let mut titles = vec!["TREE", "STATUS", "UPTIME", "CPU", "MEM", "FOLDER", "SERVICES"];
+    let mut widths = vec![
         Constraint::Min(20),
         Constraint::Length(9),
         Constraint::Length(7),
@@ -900,6 +891,17 @@ fn draw_tree(
         Constraint::Min(20),
         Constraint::Min(12),
     ];
+    if show_type {
+        titles.push("TYPE");
+        widths.push(Constraint::Length(10));
+    }
+    let header = Row::new(titles.into_iter().map(Cell::from))
+        .style(Style::default().add_modifier(Modifier::DIM));
+
+    let table_rows: Vec<Row> = nodes
+        .iter()
+        .map(|node| tree_row(app, snapshot, *node, show_type))
+        .collect();
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -920,8 +922,9 @@ fn draw_tree(
 
 /// Render one tree node into a table row. Sandbox / orphan-group rows carry their
 /// stats in the STATUS column and leave the instance columns blank; instance
-/// rows fill the columns and indent the TREE cell.
-fn tree_row<'a>(app: &App, snapshot: &'a Snapshot, node: Node) -> Row<'a> {
+/// rows fill the columns and indent the TREE cell. `show_type`: the TYPE column
+/// is present (some sandbox is a dispatcher).
+fn tree_row<'a>(app: &App, snapshot: &'a Snapshot, node: Node, show_type: bool) -> Row<'a> {
     match node {
         Node::Sandbox(i) => match snapshot.sandboxes.get(i) {
             Some(sb) => sandbox_tree_row(app, snapshot, sb),
@@ -932,6 +935,13 @@ fn tree_row<'a>(app: &App, snapshot: &'a Snapshot, node: Node) -> Row<'a> {
                 inst,
                 app.inbox.unread_for(&inst.name),
                 super::data::dispatcher_label(inst, &snapshot.instances),
+                show_type.then(|| {
+                    let dispatcher = snapshot
+                        .sandboxes
+                        .iter()
+                        .any(|s| s.name == inst.sandbox && s.dispatcher);
+                    if dispatcher { "dispatcher" } else { "-" }
+                }),
             ),
             None => Row::new(vec![Cell::from("")]),
         },
@@ -1016,8 +1026,14 @@ fn source_folder_cell(sb: &SandboxRow) -> Line<'static> {
 
 /// `unread`: the instance's unread Inbox notifications, shown as a yellow
 /// `✉N` after the name. `owner`: a dispatcher child's dim
-/// `⇠ <dispatcher>` suffix (`data::dispatcher_label`).
-fn instance_tree_row(r: &InstanceRow, unread: usize, owner: Option<String>) -> Row<'_> {
+/// `⇠ <dispatcher>` suffix (`data::dispatcher_label`). `kind`: the TYPE cell,
+/// `None` when that column is hidden.
+fn instance_tree_row(
+    r: &InstanceRow,
+    unread: usize,
+    owner: Option<String>,
+    kind: Option<&'static str>,
+) -> Row<'static> {
     let status = Cell::from(Span::styled(
         r.status.label().to_string(),
         status_style(&r.status),
@@ -1040,7 +1056,7 @@ fn instance_tree_row(r: &InstanceRow, unread: usize, owner: Option<String>) -> R
         name.push(Span::styled(format!(" {owner}"), Style::default().add_modifier(Modifier::DIM)));
     }
     let name = Cell::from(Line::from(name));
-    Row::new(vec![
+    let mut cells = vec![
         name,
         status,
         Cell::from(humanize_secs(r.uptime_secs)),
@@ -1048,7 +1064,9 @@ fn instance_tree_row(r: &InstanceRow, unread: usize, owner: Option<String>) -> R
         Cell::from(r.mem.clone().unwrap_or_else(|| "-".to_string())),
         Cell::from(folder),
         Cell::from(services),
-    ])
+    ];
+    cells.extend(kind.map(Cell::from));
+    Row::new(cells)
 }
 
 /// Render a process row (or its placeholder) for the instance at `instance`.
