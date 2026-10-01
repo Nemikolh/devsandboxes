@@ -1,4 +1,4 @@
-//! `devsbd ensure|ls|stop|rm|exec` and `devsbd run ls|logs|wait|rm|prune <key> …`: a
+//! `devsbd ensure|ls|branches|stop|rm|exec` and `devsbd run ls|logs|wait|rm|prune <key> …`: a
 //! dispatcher's control commands (docs/automations.md, "Control API",
 //! "Runs"). Each request is one encoded [`control::Request`] sent to the
 //! daemon over `daemon::API_SOCK`, which relays it to a host serving
@@ -18,6 +18,7 @@ use crate::daemon;
 
 const USAGE: &str = "usage: devsbd ensure <sandbox> --key <key> [--branch B] [--env K=V]...\n\
        devsbd ls\n\
+       devsbd branches <sandbox> [--ahead]\n\
        devsbd stop <key> [--sandbox S]\n\
        devsbd rm <key> [--sandbox S]\n\
        devsbd exec <key> [--sandbox S] [--detach] -- <cmd>...\n\
@@ -115,7 +116,8 @@ fn parse_args(verb: &str, args: &[String]) -> Result<Cmd, String> {
         };
         let allowed = match (op, flag) {
             (Op::Ensure, "--key" | "--branch" | "--env") => true,
-            (Op::Ls | Op::Ensure, _) => false,
+            (Op::Branches, "--ahead") => true,
+            (Op::Ls | Op::Ensure | Op::Branches, _) => false,
             (_, "--sandbox") => true,
             (Op::Exec, "--detach" | "--") => true,
             (Op::RunLogs, "--follow") => true,
@@ -133,12 +135,13 @@ fn parse_args(verb: &str, args: &[String]) -> Result<Cmd, String> {
                 dashdash = true;
                 break;
             }
-            "--detach" | "--follow" | "--force" if inline.is_some() => {
+            "--detach" | "--follow" | "--force" | "--ahead" if inline.is_some() => {
                 return Err(format!("{flag} takes no value"));
             }
             "--detach" => cmd.detach = true,
             "--follow" => cmd.follow = true,
             "--force" => req.force = true,
+            "--ahead" => req.ahead = true,
             "--keep" => {
                 let v = value()?;
                 let n = v.parse().map_err(|_| format!("--keep: bad number `{v}`"))?;
@@ -164,11 +167,9 @@ fn parse_args(verb: &str, args: &[String]) -> Result<Cmd, String> {
     }
     let (wanted, what) = match op {
         Op::Ls => (0, "no arguments"),
-        Op::Ensure => (1, "exactly one <sandbox>"),
+        Op::Ensure | Op::Branches => (1, "exactly one <sandbox>"),
         Op::Stop | Op::Rm | Op::Exec | Op::RunLs | Op::RunPrune => (1, "exactly one <key>"),
         Op::RunLogs | Op::RunWait | Op::RunRm => (2, "<key> <id>"),
-        // Not a CLI verb yet (`main.rs` doesn't route it).
-        Op::Branches => return Err(format!("unknown command `{verb}`")),
     };
     if positional.len() != wanted {
         return Err(format!("takes {what}"));
@@ -181,6 +182,7 @@ fn parse_args(verb: &str, args: &[String]) -> Result<Cmd, String> {
                 return Err("--key is required".into());
             }
         }
+        Op::Branches => req.sandbox = positional.next(),
         Op::Ls => {}
         _ => req.key = positional.next(),
     }
@@ -408,6 +410,11 @@ mod tests {
         assert_eq!(parse("ls", &[]).unwrap(), req(Op::Ls, None, None));
         assert_eq!(parse("stop", &["pr-1"]).unwrap(), req(Op::Stop, None, Some("pr-1")));
         assert_eq!(parse("rm", &["pr-1", "--sandbox", "web"]).unwrap(), req(Op::Rm, Some("web"), Some("pr-1")));
+        assert_eq!(parse("branches", &["web"]).unwrap(), req(Op::Branches, Some("web"), None));
+        assert_eq!(
+            parse("branches", &["--ahead", "web"]).unwrap(),
+            Request { ahead: true, ..req(Op::Branches, Some("web"), None) }
+        );
     }
 
     #[test]
@@ -470,6 +477,10 @@ mod tests {
         assert_eq!(control::decode_request(&control::encode_request(&r)), Ok(r));
         let r = parse("exec", &["k", "--", "sh", "-c", "a\nb", ""]).unwrap();
         assert_eq!(control::decode_request(&control::encode_request(&r)), Ok(r));
+        for args in [&["web"][..], &["web", "--ahead"]] {
+            let r = parse("branches", args).unwrap();
+            assert_eq!(control::decode_request(&control::encode_request(&r)), Ok(r));
+        }
     }
 
     #[test]
@@ -516,6 +527,14 @@ mod tests {
         assert_eq!(parse("run-prune", &["k", "--keep"]).unwrap_err(), "--keep needs a value");
         assert_eq!(parse("run-prune", &["k", "--keep", "1", "--keep=2"]).unwrap_err(), "--keep given twice");
         assert_eq!(parse("stop", &["k", "--force"]).unwrap_err(), "unknown option `--force`");
+        // Branches.
+        assert_eq!(parse("branches", &[]).unwrap_err(), "takes exactly one <sandbox>");
+        assert_eq!(parse("branches", &["a", "b"]).unwrap_err(), "takes exactly one <sandbox>");
+        assert_eq!(parse("branches", &["web", "--ahead=1"]).unwrap_err(), "--ahead takes no value");
+        assert_eq!(parse("branches", &["web", "--key", "k"]).unwrap_err(), "unknown option `--key`");
+        assert_eq!(parse("branches", &["web", "--sandbox", "x"]).unwrap_err(), "unknown option `--sandbox`");
+        assert_eq!(parse("ls", &["--ahead"]).unwrap_err(), "unknown option `--ahead`");
+        assert_eq!(parse("run-rm", &["k", ID, "--ahead"]).unwrap_err(), "unknown option `--ahead`");
     }
 
     /// A fake host over a scripted run: `log` is the whole output, `states`
