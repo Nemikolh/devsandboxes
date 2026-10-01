@@ -6,6 +6,8 @@
 
 - **`devsbd branches <sandbox>` tells a dispatcher which branches are already checked out.** It prints a JSON list of every branch in a worktree of the sandbox's repo and who holds it: one of the dispatcher's own children, another instance, the base checkout, or a worktree devsandbox doesn't know. It reads git on the host each time, so a `git switch` inside an instance is seen. With `--ahead`, each row also gets the number of commits `origin` doesn't have yet, and local branches that are ahead but not checked out are listed too. A dispatcher can use it to leave alone PRs that someone is working on locally. The sandbox must be in the dispatcher's `spawn`. Running dispatchers pick up the new helper when restarted.
 
+- **The dashboard's Instances tree has a TYPE column when a sandbox is a dispatcher.** Instances of a dispatcher sandbox read `dispatcher`, the others `-`. Without any dispatcher in the config the column isn't shown.
+
 ### Changed
 
 - **`folders` entries get their own git worktree when the checkout belongs to someone else.** If an extra folder is a git repo and it's another sandbox's `folder`, or another instance already mounts it, the instance now gets a worktree of it, detached at that checkout's `HEAD`. Before, the instance mounted the live checkout, so the owner switching branches changed what the instance saw. The worktree is kept across `rebuild` and removed by `rm`. Dispatcher children always get one. To keep the old live view for an entry, write it as a table with `worktree = "never"`, or use `"always"` to force a worktree:
@@ -22,7 +24,13 @@ folders = { "/workspaces/api" = "../api", "/workspaces/.shared" = { path = "../.
 
 - **`worktree-link` no longer migrates old `shared-files/<sandbox>/` stores.** The automatic move only relinked the instance being run, so every other instance on the same repo was left with dangling links. A link into an old store is now skipped with a warning that shows where the file should go. Move it there, delete the old link, and `rebuild`.
 
+- **The dashboard opens instantly and fills in as the runtime answers.** The tree is drawn from `state.toml` and the config right away, statuses (`…` until then) arrive with the first container listing, and CPU/MEM after that. Before, the dashboard waited about 1.5s for `docker stats` and showed "no sandboxes defined" meanwhile.
+
+- **The dashboard puts much less load on dockerd.** CPU/MEM now refresh every 7s instead of every 2s (statuses still every 2s), the runtime version is asked once, and process lists are only fetched while the Instances tab is open. Instance drift is read from the container listing instead of two `docker inspect`s per instance.
+
 ### Fixed
+
+- **Listing containers no longer makes dockerd compute their disk sizes.** Every `ls`, `ps`, `gc`, autostart pass and dashboard refresh asked for container sizes as a side effect of the output format, which spiked dockerd's CPU every 2s while the dashboard was open and made each listing take ~300ms instead of ~20ms.
 
 - **Opening VS Code no longer clears an instance's extensions.** `devsandbox vscode` and the dashboard's `o` read the sandbox config from the current directory, not from the instance's own config directory. Run from anywhere else, the extensions list was rewritten as empty, so VS Code didn't install anything. They now read the instance's own config. If that config still can't be read, the list is left as it was. Instances already hit by this get their list back the next time you open VS Code from the new version.
 
