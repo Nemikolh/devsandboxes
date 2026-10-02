@@ -48,7 +48,10 @@ Inbox tab (dispatcher threads + devsbd notify records)
 Inbox thread pane (shadows the dashboard keys while open)
   ↑/k ↓/j     scroll    pgup/pgdn  page   g / G  top / bottom
   enter       open the thread's link
-  1-9         run an action (not yet: shown only)
+  1-9         run an action: host verbs run now; greyed ones (and the
+              dispatcher part of a host action) need events, not yet
+  o t l p     VS Code / terminal / logs / forward prompt on the thread's
+              child (or its sender when it has none)
   esc         close     q quit   : prompt   ? help
 
 Process rows (expanded instance)
@@ -351,7 +354,13 @@ impl App {
             return;
         };
         let container = row.container.clone();
-        let body = match backend().logs_tail(&container, 50) {
+        self.open_logs_for(&container);
+    }
+
+    /// The log tail modal for `container`, whatever is selected: the Inbox
+    /// thread pane targets a thread's child, not a table row.
+    pub(super) fn open_logs_for(&mut self, container: &str) {
+        let body = match backend().logs_tail(container, 50) {
             Ok(out) if out.trim().is_empty() => "(no log output)".to_string(),
             Ok(out) => out,
             Err(e) => format!("{e:#}"),

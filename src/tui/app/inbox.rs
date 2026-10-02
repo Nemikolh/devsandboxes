@@ -281,13 +281,19 @@ pub fn pane_lines(t: &Thread, child: Option<&ChildInfo>, utc_offset: i64) -> Vec
     if !t.actions.is_empty() {
         out.push(Vec::new());
         for (i, a) in t.actions.iter().enumerate() {
-            let mut row = vec![(Tone::Bold, format!("[{}] ", i + 1)), (Tone::Plain, a.label.clone())];
-            // Host actions run in the dashboard; the rest go to the owner.
-            if a.host.is_some() {
+            // Host actions run in the dashboard; the rest go to the owner as
+            // events, which don't exist yet, so they're greyed out.
+            let runnable = a.host.is_some();
+            let (num, label) = if runnable { (Tone::Bold, Tone::Plain) } else { (Tone::Dim, Tone::Dim) };
+            let mut row = vec![(num, format!("[{}] ", i + 1)), (label, a.label.clone())];
+            if runnable {
                 row.push((Tone::Dim, "  ⌂ host".into()));
             }
             if a.done {
                 row.push((Tone::Dim, "  ✓ done".into()));
+            }
+            if !runnable {
+                row.push((Tone::Dim, "  (needs events)".into()));
             }
             out.push(row);
         }
@@ -426,8 +432,9 @@ impl App {
             self.inbox.open = None;
             return;
         };
+        // Owned: the action keys below borrow `self` mutably.
+        let t = t.clone();
         let (kind, link) = (t.kind, t.link.clone().or_else(|| t.head().and_then(|r| r.link.clone())));
-        let labels: Vec<String> = t.actions.iter().map(|a| a.label.clone()).collect();
         let replies = t.reply.is_some();
         match key.code {
             KeyCode::Esc => self.inbox.open = None,
@@ -439,13 +446,13 @@ impl App {
                 Some(link) => self.request_open_link(link),
                 None => self.status = Some("no link on this thread".into()),
             },
-            KeyCode::Char(c @ '1'..='9') => {
-                let n = c as usize - '1' as usize;
-                self.status = Some(match labels.get(n) {
-                    Some(label) => format!("[{c}] {label}: actions arrive in the next step"),
-                    None => format!("no action {c}"),
-                });
-            }
+            KeyCode::Char(c @ '1'..='9') => self.run_thread_action(&t, c as usize - '1' as usize),
+            // The instance keys, aimed at the thread's target rather than a
+            // table row (docs/inbox-threads.md, *Decisions*).
+            KeyCode::Char('o') => self.thread_code(&t),
+            KeyCode::Char('t') => self.thread_terminal(&t),
+            KeyCode::Char('l') => self.thread_logs(&t),
+            KeyCode::Char('p') => self.thread_port_prompt(&t),
             KeyCode::Char('r') if replies => self.status = Some("replies arrive with events".into()),
             KeyCode::Char('u') if kind == Kind::Thread => {
                 self.status = Some("reopen arrives with events".into())
@@ -482,7 +489,7 @@ impl App {
 
     /// Ask the event loop to open `link`. A non-URL link (it comes from inside
     /// the container) only gets a status line.
-    fn request_open_link(&mut self, link: String) {
+    pub(super) fn request_open_link(&mut self, link: String) {
         if is_url(&link) {
             self.status = Some(format!("opening {link}"));
             self.pending_open = Some(link);
@@ -939,7 +946,12 @@ mod tests {
         assert!(has("drafts ready"));
         assert!(has("timeline"));
         assert!(has("[1] Open draft  ⌂ host"), "{text:#?}");
-        assert!(has("[2] Post replies") && !has("[2] Post replies  ⌂"));
+        assert!(has("[2] Post replies  (needs events)") && !has("[2] Post replies  ⌂"));
+        // Runnable actions are bold-numbered; event-only ones are dim throughout.
+        let lines = pane_lines(&t, Some(&child), 0);
+        let row = |n: &str| lines.iter().find(|l| l.first().is_some_and(|(_, s)| s == n)).unwrap();
+        assert_eq!(row("[1] ")[..2].iter().map(|(t, _)| *t).collect::<Vec<_>>(), [Tone::Bold, Tone::Plain]);
+        assert!(row("[2] ").iter().all(|(t, _)| *t == Tone::Dim));
         assert!(has("[3] Done  ✓ done"));
         assert!(has("reply: next run"));
 

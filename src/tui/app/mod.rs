@@ -18,6 +18,7 @@ mod command_line;
 mod inbox;
 mod procs;
 mod terminal;
+mod thread_actions;
 #[cfg(test)]
 mod test_support;
 mod tree;
@@ -130,6 +131,11 @@ pub struct App {
     /// Action awaiting execution by the event loop (it owns the terminal
     /// suspend + command call, keeping [`App`] I/O-free).
     pub pending_action: Option<PromptAction>,
+    /// Appended to the status line the event loop writes after launching a
+    /// [`PromptAction::Code`]: an Inbox `vscode` action's caveats (path/line
+    /// not honored yet, dispatcher part pending), which would otherwise be
+    /// overwritten by the launch outcome.
+    pub code_note: Option<String>,
     /// Instance name whose stop the event loop should spawn on a background
     /// thread (the `s` shortcut on a running instance; runs without suspending
     /// the TUI).
@@ -199,6 +205,7 @@ impl App {
             modal: Modal::None,
             prompt: None,
             pending_action: None,
+            code_note: None,
             pending_stop: None,
             stopping: BTreeSet::new(),
             pending_start: None,

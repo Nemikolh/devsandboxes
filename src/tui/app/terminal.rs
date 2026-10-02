@@ -5,7 +5,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use ratatui::layout::Rect;
 
 use crate::runtime::{backend, NAME_PREFIX};
-use crate::tui::data::ContainerStatus;
+use crate::tui::data::{ContainerStatus, InstanceRow};
 use crate::tui::kitty;
 use crate::commands::exec::SHELL_FALLBACK_CMD;
 use crate::tui::term::{encode_key, encode_wheel, TermSession};
@@ -199,10 +199,7 @@ impl App {
                     .instances
                     .get(idx)
                     .ok_or_else(|| "terminal: select an instance".to_string())?;
-                if !matches!(row.status, ContainerStatus::Running(_)) {
-                    return Err(format!("terminal: `{}` is not running", row.name));
-                }
-                Ok((row.name.clone(), row.container.clone(), true))
+                instance_term_target(row)
             }
             Tab::Services => {
                 let row = snapshot
@@ -237,7 +234,25 @@ impl App {
     /// [`Self::open_logs`] / [`Self::open_config`] doing user-triggered work
     /// without going through the event loop. Failures land in `self.status`.
     pub(super) fn open_terminal(&mut self, force_new: bool) {
-        let (title, container, is_instance) = match self.term_target() {
+        let target = self.term_target();
+        self.open_terminal_to(target, force_new);
+    }
+
+    /// Open (or focus) a terminal on instance `name`, whatever is selected:
+    /// the Inbox thread pane targets a thread's child, not a table row.
+    pub(super) fn open_instance_terminal(&mut self, name: &str) {
+        let target = match self.snapshot.as_ref().map(|s| s.instances.iter().find(|r| r.name == name)) {
+            None => Err("terminal: no data yet".to_string()),
+            Some(None) => Err(format!("terminal: `{name}` not in the snapshot")),
+            Some(Some(row)) => instance_term_target(row),
+        };
+        self.open_terminal_to(target, false);
+    }
+
+    /// The shared tail of [`Self::open_terminal`] and
+    /// [`Self::open_instance_terminal`]: dedup, argv, spawn, focus.
+    fn open_terminal_to(&mut self, target: Result<(String, String, bool), String>, force_new: bool) {
+        let (title, container, is_instance) = match target {
             Ok(t) => t,
             Err(msg) => {
                 self.status = Some(msg);
@@ -298,6 +313,14 @@ impl App {
             Err(e) => self.status = Some(format!("terminal: {e:#}")),
         }
     }
+}
+
+/// Terminal target for an instance row, which must be running.
+fn instance_term_target(row: &InstanceRow) -> Result<(String, String, bool), String> {
+    if !matches!(row.status, ContainerStatus::Running(_)) {
+        return Err(format!("terminal: `{}` is not running", row.name));
+    }
+    Ok((row.name.clone(), row.container.clone(), true))
 }
 
 #[cfg(test)]

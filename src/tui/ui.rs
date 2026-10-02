@@ -1400,7 +1400,7 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
                 "q quit · tab switch · ↑↓ select · d stop forward · : port … · ? help".to_string()
             }
             Tab::Inbox if app.inbox.is_open() => {
-                "esc close · ↑↓ scroll · enter open link · 1-9 actions (soon) · q quit · ? help".to_string()
+                "esc close · ↑↓ scroll · enter open link · 1-9 actions · o vscode · t term · l logs · p forward · q quit · ? help".to_string()
             }
             Tab::Inbox => {
                 "q quit · tab switch · ↑↓ select · enter open · v view · d dismiss · D clear notify · ? help"

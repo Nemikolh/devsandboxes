@@ -288,7 +288,11 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
         if let Some(action) = app.take_pending_action() {
             match action {
                 PromptAction::Code { instance } => {
-                    app.status = Some(launch_code(&dir, &instance));
+                    let outcome = launch_code(&dir, &instance);
+                    app.status = Some(match app.code_note.take() {
+                        Some(note) => format!("{outcome} · {note}"),
+                        None => outcome,
+                    });
                 }
                 // Rename is pure state I/O (`rename_exact`: no stdout, no
                 // prompts — plain `rename` would scribble on the alternate

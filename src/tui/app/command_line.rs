@@ -65,6 +65,12 @@ impl App {
         let Some(name) = self.selected_instance_name() else {
             return;
         };
+        self.open_port_prompt_for(&name);
+    }
+
+    /// The prompt prefilled `port <name> `, whatever is selected (the Inbox
+    /// thread pane's `p` targets the thread's child).
+    pub(super) fn open_port_prompt_for(&mut self, name: &str) {
         self.status = None;
         let history = crate::tui::prompt::load_history();
         self.prompt = Some(Prompt::with_input(history, format!("port {name} ")));
@@ -89,6 +95,16 @@ impl App {
         let history = crate::tui::prompt::load_history();
         self.prompt =
             Some(Prompt::with_input(history, format!("port {instance} --service {svc} ")));
+    }
+
+    /// Hand a forward to the event loop and show the Ports tab, where it
+    /// appears. Shared by the `port` prompt and the Inbox `forward` host
+    /// action, so both start forwards the same way. The tab is set directly,
+    /// not via `set_tab`: an open thread pane stays open for the way back.
+    pub(super) fn request_port(&mut self, req: PortRequest) {
+        self.status = Some(format!("forwarding {} …", req.spec));
+        self.pending_port = Some(req);
+        self.tab = Tab::Ports;
     }
 
     /// Key handling while the prompt is open. `esc` cancels, `enter` parses
@@ -117,9 +133,7 @@ impl App {
                     // the Ports tab. Handled before the generic `pending_action`
                     // path so the loop never suspends the screen for it.
                     if let PromptAction::Port { instance, service, address, spec } = action {
-                        self.status = Some(format!("forwarding {spec} …"));
-                        self.pending_port = Some(PortRequest { instance, service, address, spec });
-                        self.tab = Tab::Ports;
+                        self.request_port(PortRequest { instance, service, address, spec });
                         self.prompt = None;
                         return;
                     }
