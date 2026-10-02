@@ -2,6 +2,7 @@ mod commands;
 mod config;
 mod devsbd;
 mod features;
+mod inbox;
 mod json_stdout;
 mod render;
 mod runtime;

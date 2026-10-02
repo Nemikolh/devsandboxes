@@ -139,6 +139,7 @@ mod tests {
     fn from(instance: &str, key: Option<&str>) -> Notification {
         Notification {
             instance: instance.into(),
+            instance_id: format!("{instance}-id"),
             record: Record { level: Level::Info, key: key.map(Into::into), link: None, msg: "m".into(), at: 0 },
         }
     }
@@ -182,6 +183,7 @@ mod tests {
     fn n(level: Level, msg: &str, link: Option<&str>) -> Notification {
         Notification {
             instance: "web-pr-1".into(),
+            instance_id: "web-pr-1-id".into(),
             record: Record { level, key: None, link: link.map(Into::into), msg: msg.into(), at: 0 },
         }
     }

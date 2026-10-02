@@ -543,7 +543,7 @@ fn draw_inbox(frame: &mut Frame, app: &App, area: Rect) {
         .border_style(dash_border_style(panel_focused))
         .title(app.tab_title(Tab::Inbox));
 
-    if app.inbox.threads.is_empty() {
+    if app.inbox.threads().is_empty() {
         let text = Line::from(Span::styled(
             "no notifications — containers send them with `devsbd notify \"…\"`",
             Style::default().add_modifier(Modifier::DIM),
@@ -611,7 +611,7 @@ fn inbox_row<'a>(app: &App, row: &InboxRow, grouped: bool, now: u64) -> Row<'a> 
             Cell::from(Span::styled(r.level.as_str(), level_style(r.level))),
         ];
         if !grouped {
-            cells.push(Cell::from(t.instance.clone()));
+            cells.push(Cell::from(t.owner_name.clone()));
         }
         cells.push(Cell::from(Line::from(msg)));
         cells
@@ -619,14 +619,15 @@ fn inbox_row<'a>(app: &App, row: &InboxRow, grouped: bool, now: u64) -> Row<'a> 
     let first_line = |msg: &str| msg.lines().next().unwrap_or("").to_string();
     let indent = if grouped { "  " } else { "" };
     match row {
-        InboxRow::Group(name) => {
-            let marker = if inbox.is_collapsed(name) { '▸' } else { '▾' };
-            let newest = inbox.threads.iter().find(|t| &t.instance == name);
+        InboxRow::Group(owner) => {
+            let marker = if inbox.is_collapsed(owner) { '▸' } else { '▾' };
+            let newest = inbox.threads().iter().find(|t| &t.owner == owner);
+            let name = inbox.owner_name(owner);
             let mut msg = vec![
                 Span::styled(format!("{marker} {name}"), Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
-                Span::styled(format!("  {}", inbox.count_for(name)), dim),
+                Span::styled(format!("  {}", inbox.count_for(owner)), dim),
             ];
-            let unread = inbox.unread_for(name);
+            let unread = inbox.unread_for(owner);
             if unread > 0 {
                 msg.push(Span::styled(format!(" ✉{unread}"), Style::default().fg(Color::Yellow)));
             }
@@ -637,7 +638,7 @@ fn inbox_row<'a>(app: &App, row: &InboxRow, grouped: bool, now: u64) -> Row<'a> 
             ])
         }
         InboxRow::Thread(i) => {
-            let t = &inbox.threads[*i];
+            let t = &inbox.threads()[*i];
             let marker = match (t.history(), inbox.is_expanded(t)) {
                 (0, _) => "  ",
                 (_, true) => "▾ ",
@@ -658,7 +659,7 @@ fn inbox_row<'a>(app: &App, row: &InboxRow, grouped: bool, now: u64) -> Row<'a> 
             }
         }
         InboxRow::History { thread, note } => {
-            let t = &inbox.threads[*thread];
+            let t = &inbox.threads()[*thread];
             let r = &t.notes[*note].record;
             let mut msg = vec![Span::styled(format!("{indent}    {}", first_line(&r.msg)), dim)];
             if r.link.is_some() {
@@ -678,13 +679,13 @@ fn draw_inbox_detail(frame: &mut Frame, app: &App, area: Rect, term_focused: boo
         .title("Detail");
     let dim = Style::default().add_modifier(Modifier::DIM);
     let lines = match (app.selected_inbox_row(), app.selected_inbox_record()) {
-        (Some(InboxRow::Group(name)), _) => {
-            let threads = app.inbox.threads.iter().filter(|t| t.instance == name).count();
+        (Some(InboxRow::Group(owner)), _) => {
+            let threads = app.inbox.threads().iter().filter(|t| t.owner == owner).count();
             vec![
-                Line::from(name.clone()),
-                kv("notifications", &app.inbox.count_for(&name).to_string()),
+                Line::from(app.inbox.owner_name(&owner).to_string()),
+                kv("notifications", &app.inbox.count_for(&owner).to_string()),
                 kv("threads", &threads.to_string()),
-                kv("unread", &app.inbox.unread_for(&name).to_string()),
+                kv("unread", &app.inbox.unread_for(&owner).to_string()),
             ]
         }
         (Some(row), Some((t, r))) => {
@@ -693,7 +694,7 @@ fn draw_inbox_detail(frame: &mut Frame, app: &App, area: Rect, term_focused: boo
                 Span::raw("  "),
                 Span::styled(r.level.as_str(), level_style(r.level)),
                 Span::raw("  "),
-                Span::raw(t.instance.clone()),
+                Span::raw(t.owner_name.clone()),
             ])];
             if let Some(link) = &r.link {
                 lines.push(kv("link (enter)", link));
@@ -960,7 +961,7 @@ fn tree_row<'a>(app: &App, snapshot: &'a Snapshot, node: Node, show_type: bool) 
         Node::Instance(i) => match snapshot.instances.get(i) {
             Some(inst) => instance_tree_row(
                 inst,
-                app.inbox.unread_for(&inst.name),
+                app.inbox.unread_for_name(&inst.name),
                 super::data::dispatcher_label(inst, &snapshot.instances),
                 show_type.then(|| {
                     let dispatcher = snapshot

@@ -37,6 +37,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 use crate::commands;
+use crate::inbox;
 
 use app::{App, PendingSignal};
 use data::Snapshot;
@@ -194,10 +195,15 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
     let dir = app.dir.clone();
     app.utc_offset = local_utc_offset();
     app.kitty = KITTY.load(Ordering::Relaxed);
-    match load_inbox() {
+    match inbox::store::load() {
         Ok(inbox) => app.set_inbox(inbox),
         Err(e) => app.status = Some(format!("inbox not loaded: {e:#}")),
     }
+    // The store is shared with every other dashboard and the bridge worker:
+    // reload whenever its mtime/size moved (a cheap stat each tick), or at
+    // once when something here poked it.
+    let mut inbox_stamp = inbox::store::stamp();
+    let mut reload_inbox = false;
     // At most one collection thread in flight; `Some` while one is running.
     // Startup walks the `Depth`s cheapest first, so the tree renders straight
     // from disk and statuses, then cpu/mem, fill in as the runtime answers;
@@ -343,13 +349,14 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
                     forwards::ForwardUpdate::Status(status) => app.status = Some(status),
                 }
             }
-            // Container notifications: into the Inbox, and the latest one on
-            // the status line so it's noticed from any tab.
+            // Container notifications: the bridge worker already wrote them
+            // to the store, so this is a "reload now" poke plus the latest
+            // one on the status line, so it's noticed from any tab.
             while let Ok(n) = notifications.try_recv() {
                 // One status line: fold a multi-line message.
                 let msg = n.record.msg.split_whitespace().collect::<Vec<_>>().join(" ");
                 app.status = Some(format!("{}: {msg}", n.instance));
-                app.push_notification(n.instance, n.record);
+                reload_inbox = true;
             }
         }
         #[cfg(not(unix))]
@@ -360,10 +367,25 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
             // No forwards exist off unix, so a stale unport is just dropped.
             let _ = app.take_pending_unport();
         }
-        // Persist the Inbox after any change (arrival, read, dismiss, clear).
-        if app.inbox.take_dirty() {
-            if let Err(e) = save_inbox(&app.inbox) {
+        // The Inbox lives in one shared file (`crate::inbox::store`), so any
+        // dashboard's change must reach this one: push what the keys asked
+        // for, then reload when the store moved (ours or someone else's).
+        let ops = app.take_pending_inbox();
+        if !ops.is_empty() {
+            if let Err(e) = inbox::store::update(|i| ops.iter().for_each(|op| i.apply(op))) {
                 app.status = Some(format!("inbox not saved: {e:#}"));
+            }
+            reload_inbox = true;
+        }
+        let stamp = inbox::store::stamp();
+        if reload_inbox || stamp != inbox_stamp {
+            // Stamp before loading: a write in between only costs one more
+            // reload, while stamping after could hide it until the next one.
+            inbox_stamp = stamp;
+            reload_inbox = false;
+            match inbox::store::load() {
+                Ok(loaded) => app.set_inbox(loaded),
+                Err(e) => app.status = Some(format!("inbox not loaded: {e:#}")),
             }
         }
 
@@ -585,36 +607,6 @@ fn log_error(action: &PromptAction, err: &anyhow::Error) -> Option<PathBuf> {
     let path = dir.join(format!("{verb}-{}.log", crate::state::Instance::now()));
     std::fs::write(&path, format!("{verb} failed: {err:#}\n")).ok()?;
     Some(path)
-}
-
-/// `inbox.toml`, next to `state.toml`: the Inbox history across dashboard
-/// sessions (the container outbox forgets a record once a dashboard took it).
-fn inbox_path() -> Result<PathBuf> {
-    let state = crate::state::State::path()?;
-    Ok(state.with_file_name("inbox.toml"))
-}
-
-/// The saved Inbox; a missing file is an empty one.
-fn load_inbox() -> Result<app::Inbox> {
-    let path = inbox_path()?;
-    match std::fs::read_to_string(&path) {
-        Ok(text) => app::Inbox::from_toml(&text)
-            .map_err(|e| anyhow::anyhow!("invalid {}: {e}", path.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(app::Inbox::default()),
-        Err(e) => Err(e).with_context(|| format!("cannot read {}", path.display())),
-    }
-}
-
-/// Write the Inbox atomically (temp file + rename), so a crash mid-write
-/// can't leave a truncated file that fails to load next time.
-fn save_inbox(inbox: &app::Inbox) -> Result<()> {
-    let path = inbox_path()?;
-    let dir = path.parent().expect("inbox path has a parent");
-    std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
-    let text = inbox.to_toml().map_err(|e| anyhow::anyhow!("cannot serialize inbox: {e}"))?;
-    let tmp = path.with_file_name(format!(".inbox.toml.{}.tmp", std::process::id()));
-    std::fs::write(&tmp, text).with_context(|| format!("cannot write {}", tmp.display()))?;
-    std::fs::rename(&tmp, &path).with_context(|| format!("cannot write {}", path.display()))
 }
 
 /// Block until the next key press (consuming it), ignoring release/repeat.

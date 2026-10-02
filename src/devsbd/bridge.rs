@@ -135,17 +135,22 @@ pub fn has_host_agent() -> bool {
     host_agent().is_some()
 }
 
-/// A container's `devsbd notify` record, tagged with the instance (state key)
-/// whose bridge delivered it.
+/// A container's `devsbd notify` record, tagged with the instance whose
+/// bridge delivered it: its state key (for display) and its `instance_id`
+/// (the owner identity the Inbox store threads by), so the sink needs no
+/// state lookup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Notification {
     pub instance: String,
+    pub instance_id: String,
     pub record: notify::Record,
 }
 
 /// Where a bridge hands the notifications it takes. Called on the stream's
-/// handler thread (never the UI thread), after the daemon got its `ok`.
-pub type Sink = Arc<dyn Fn(Notification) + Send + Sync>;
+/// handler thread (never the UI thread), *before* the daemon gets its `ok`:
+/// an `Err` (the store wouldn't take it) means no reply, so the daemon keeps
+/// the record and retries.
+pub type Sink = Arc<dyn Fn(Notification) -> Result<(), String> + Send + Sync>;
 
 /// Serves one control request that arrived on instance `key`'s (state key)
 /// bridge. Blocking; called on the stream's handler thread.
@@ -156,6 +161,7 @@ pub type ControlHandler = Arc<dyn Fn(&str, &Request) -> Response + Send + Sync>;
 #[derive(Clone)]
 struct Services {
     instance: String,
+    instance_id: String,
     sink: Sink,
     control: ControlHandler,
     // Live notify/control handler threads of this bridge (see `HandlerSlot`).
@@ -163,8 +169,8 @@ struct Services {
 }
 
 impl Services {
-    fn new(instance: String, sink: Sink, control: ControlHandler) -> Services {
-        Services { instance, sink, control, handlers: Arc::default() }
+    fn new(instance: String, instance_id: String, sink: Sink, control: ControlHandler) -> Services {
+        Services { instance, instance_id, sink, control, handlers: Arc::default() }
     }
 }
 
@@ -297,9 +303,10 @@ fn handle_control(mut conn: UnixStream, to: &Services) {
 }
 
 /// One notify stream: read the record to EOF (the daemon's `Eof` half-closes
-/// our side), decode, reply `ok`, close, then hand it to the sink. Replying
-/// before delivering keeps the daemon's wait short; a failed reply write
-/// skips delivery, since the daemon will resend. Oversized or timed-out →
+/// our side), decode, hand it to the sink, and only then reply `ok`. Applying
+/// before acking is what makes delivery durable: a host that dies between the
+/// two (or a store that won't take the record) leaves the record in the
+/// container's outbox, and the daemon resends it. Oversized or timed-out →
 /// close with no reply; undecodable → `NOTIFY_REPLY_BAD`. Silent throughout:
 /// the TUI owns the terminal.
 fn handle_notify(mut conn: UnixStream, to: &Services) {
@@ -314,11 +321,14 @@ fn handle_notify(mut conn: UnixStream, to: &Services) {
         let _ = conn.write_all(NOTIFY_REPLY_BAD);
         return;
     };
-    if conn.write_all(notify::REPLY_OK).is_err() {
-        return;
+    let n = Notification {
+        instance: to.instance.clone(),
+        instance_id: to.instance_id.clone(),
+        record,
+    };
+    if (to.sink)(n).is_ok() {
+        let _ = conn.write_all(notify::REPLY_OK);
     }
-    drop(conn);
-    (to.sink)(Notification { instance: to.instance.clone(), record });
 }
 
 /// Start a bridge for `info` without waiting for its handshake (see
@@ -333,7 +343,14 @@ pub fn spawn(info: &Instance) -> Option<Bridge> {
 /// `with_agent`, notify + control only when `sink` is set.
 fn spawn_managed(key: &str, info: &Instance, with_agent: bool, sink: Option<&Sink>) -> Option<Bridge> {
     let hash = info.devsbd_arch.and_then(super::hash).unwrap_or_default();
-    let notify = sink.map(|s| Services::new(key.to_string(), Arc::clone(s), Arc::new(dispatch_control)));
+    let notify = sink.map(|s| {
+        Services::new(
+            key.to_string(),
+            info.instance_id.clone(),
+            Arc::clone(s),
+            Arc::new(dispatch_control),
+        )
+    });
     if with_agent {
         spawn_with(&info.container, hash, Some(host_agent), notify)
     } else {
@@ -632,19 +649,27 @@ impl Bridges {
     /// which drops every live `Bridge` (killing its `exec`) before returning.
     ///
     /// `sink` set → every helper-capable running instance gets a notify-serving
-    /// bridge; each notification is shown on the desktop (from the stream's
-    /// handler thread) unless [`RateLimit`](super::desktop::RateLimit) holds
-    /// it back, and always sent on `sink`, which the TUI drains.
+    /// bridge; each record is written into the shared Inbox store first (that
+    /// write is what the daemon's `ok` acknowledges, so a failed one is
+    /// retried), then shown on the desktop (from the stream's handler thread)
+    /// unless [`RateLimit`](super::desktop::RateLimit) holds it back, and
+    /// finally sent on `sink` as a "the store changed" poke the TUI drains
+    /// (it also puts the message on the status line).
     pub fn spawn_worker(sink: Option<mpsc::Sender<Notification>>) -> BridgeWorker {
         let sink = sink.map(|tx| -> Sink {
             // One limiter for every bridge, keyed by instance inside.
             let limit = Mutex::new(super::desktop::RateLimit::default());
             Arc::new(move |n: Notification| {
+                crate::inbox::store::update(|inbox| {
+                    inbox.push(n.instance_id.clone(), n.instance.clone(), n.record.clone(), true)
+                })
+                .map_err(|e| format!("{e:#}"))?;
                 let pop = limit.lock().unwrap_or_else(|e| e.into_inner()).allow(&n, Instant::now());
                 if pop {
                     super::desktop::notify_desktop(&n);
                 }
                 let _ = tx.send(n);
+                Ok(())
             })
         });
         let (tx, rx) = mpsc::channel::<Vec<String>>();
@@ -738,15 +763,29 @@ mod tests {
         assert_eq!(own_caps(true, true), caps::SSH_AGENT | SERVED);
     }
 
-    /// `Services` for instance `instance` whose notifications go to the
-    /// returned channel and whose control handler is `control`.
-    fn services(instance: &str, control: ControlHandler) -> (Services, mpsc::Receiver<Notification>) {
+    /// `Services` for instance `instance` (owner id `<instance>-id`) whose
+    /// notifications go to the returned channel and whose control handler is
+    /// `control`. `accept` = false makes the sink fail, as a store write that
+    /// won't go through does.
+    fn services_with(
+        instance: &str,
+        control: ControlHandler,
+        accept: bool,
+    ) -> (Services, mpsc::Receiver<Notification>) {
         let (tx, rx) = mpsc::channel();
         let tx = Mutex::new(tx);
         let sink: Sink = Arc::new(move |n| {
+            if !accept {
+                return Err("store is unhappy".into());
+            }
             let _ = tx.lock().unwrap().send(n);
+            Ok(())
         });
-        (Services::new(instance.into(), sink, control), rx)
+        (Services::new(instance.into(), format!("{instance}-id"), sink, control), rx)
+    }
+
+    fn services(instance: &str, control: ControlHandler) -> (Services, mpsc::Receiver<Notification>) {
+        services_with(instance, control, true)
     }
 
     /// A control handler that must not be called.
@@ -774,16 +813,24 @@ mod tests {
     /// A daemon-side mux and a host bridge's `open_stream` joined by pipes;
     /// the host has a notify sink for instance `web-1` and no agent.
     fn notify_pair() -> (Arc<Mux>, mpsc::Receiver<Notification>) {
-        service_pair(no_control())
+        service_pair_with(no_control(), true)
     }
 
     /// `notify_pair` with control requests going to `control`.
     fn service_pair(control: ControlHandler) -> (Arc<Mux>, mpsc::Receiver<Notification>) {
+        service_pair_with(control, true)
+    }
+
+    /// `notify_pair` whose sink refuses every record when `accept` is false.
+    fn service_pair_with(
+        control: ControlHandler,
+        accept: bool,
+    ) -> (Arc<Mux>, mpsc::Receiver<Notification>) {
         let (d_r, h_w) = std::io::pipe().unwrap();
         let (h_r, d_w) = std::io::pipe().unwrap();
         let daemon = Mux::new(d_w);
         let host = Mux::new(h_w);
-        let (to, rx) = services("web-1", control);
+        let (to, rx) = services_with("web-1", control, accept);
         let d = Arc::clone(&daemon);
         std::thread::spawn(move || d.serve(d_r, |_, _| None));
         std::thread::spawn(move || {
@@ -824,7 +871,10 @@ mod tests {
         let reply = send_notify(&daemon, 1, notify::encode(&record).as_bytes());
         assert!(reply.starts_with(notify::REPLY_OK), "reply: {reply:?}");
         let got = rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert_eq!(got, Notification { instance: "web-1".into(), record });
+        assert_eq!(
+            got,
+            Notification { instance: "web-1".into(), instance_id: "web-1-id".into(), record }
+        );
     }
 
     #[test]
@@ -836,6 +886,22 @@ mod tests {
         let reply = send_notify(&daemon, 3, &big);
         assert!(reply.is_empty(), "oversized: closed without a reply");
         assert!(rx.recv_timeout(Duration::from_millis(200)).is_err(), "nothing delivered");
+    }
+
+    /// Apply, then ack: a record the sink won't take (the Inbox store failed
+    /// to write) gets no `ok`, so the daemon keeps it and resends.
+    #[test]
+    fn a_failing_sink_gets_no_ok() {
+        let (daemon, _rx) = service_pair_with(no_control(), false);
+        let record = notify::Record {
+            level: notify::Level::Info,
+            key: None,
+            link: None,
+            msg: "m".into(),
+            at: 1,
+        };
+        let reply = send_notify(&daemon, 1, notify::encode(&record).as_bytes());
+        assert!(reply.is_empty(), "reply: {reply:?}");
     }
 
     /// A sink-less bridge refuses notify and control streams (it never
@@ -1175,8 +1241,8 @@ mod tests {
             assert_eq!(got.record.msg, "hello");
             assert_eq!(got.record.key.as_deref(), Some("k"));
             assert_eq!(got.record.level, notify::Level::Info);
-            // The daemon deletes the file after reading our `ok`, which races
-            // the sink: poll briefly.
+            // The daemon deletes the file after reading the `ok` the sink
+            // already earned, which races this check: poll briefly.
             let list = format!("ls -A {}", notify::OUTBOX);
             let mut empty = false;
             for _ in 0..50 {

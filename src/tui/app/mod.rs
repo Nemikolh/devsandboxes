@@ -23,7 +23,8 @@ mod test_support;
 mod tree;
 mod view;
 
-pub use inbox::{parse_utc_offset, stamp, when, Inbox, InboxRow, Thread};
+pub use crate::inbox::Thread;
+pub use inbox::{parse_utc_offset, stamp, when, InboxRow, InboxView};
 pub use procs::{PendingSignal, Signal};
 pub use view::{ConfigView, Modal, Pane, Side, TextModal};
 use view::{col_near, divider_pct};
@@ -153,8 +154,12 @@ pub struct App {
     /// Id of a forward the event loop should stop (the `d` shortcut on the Ports
     /// tab). Consumed by step 10.
     pub pending_unport: Option<u64>,
-    /// Container notifications shown on the Inbox tab (docs/automations.md).
-    pub inbox: Inbox,
+    /// Container notifications shown on the Inbox tab (docs/automations.md),
+    /// as last loaded from the shared store (`crate::inbox::store`).
+    pub inbox: InboxView,
+    /// Changes the event loop owes the store (`d`, `D`, mark-read); already
+    /// applied to `inbox`, which the reload after them confirms.
+    pub pending_inbox: Vec<crate::inbox::Op>,
     /// A notification link the event loop should hand to the desktop opener
     /// (`enter` on the Inbox tab).
     pub pending_open: Option<String>,
@@ -198,7 +203,8 @@ impl App {
             ports: Vec::new(),
             pending_port: None,
             pending_unport: None,
-            inbox: Inbox::default(),
+            inbox: InboxView::default(),
+            pending_inbox: Vec::new(),
             pending_open: None,
             utc_offset: 0,
             status: None,

@@ -44,6 +44,10 @@ git worktrees so working trees are never shared.
   dispatcher control API: authorization against current config, child naming
   (`<sandbox>-<key>`), ops as logged `devsandbox` subprocesses, run ops exec'd
   in the child's helper (executor injectable for tests).
+- `src/inbox/` — the shared Inbox store (`inbox.toml`, next to `state.toml`):
+  `mod.rs` is the pure model (threads keyed by `(owner instance_id, key)`,
+  per-owner cap, `Op` mutations, v1→v2 migration), `store.rs` the locked
+  read-modify-write every dashboard and the bridge's notify sink go through.
 - `src/runtime/` — backend abstraction over docker/podman/Apple container.
 - `devsbd/` — static in-container helper (workspace member), built by
   `scripts/build-devsbd.sh` and embedded by `build.rs`; `src/devsbd.rs` holds
