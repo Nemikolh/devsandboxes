@@ -4,7 +4,7 @@
 //! styled [`Line`]s out, so every rule is unit-testable.
 //!
 //! Two modes. [`render`] (a thread's `message`, a notify body) renders
-//! blocks: headings, lists, quotes, code blocks, rules. [`inline_spans`]
+//! blocks: headings, lists, quotes, code blocks, rules, tables. [`inline_spans`]
 //! (titles, statuses, timeline rows, cards) is one line: only code, emphasis
 //! and links as text, newlines folded to spaces, and block syntax at its
 //! start (`1. `, `- `, `# `, `> `) kept as the literal text it is in a title.
@@ -17,7 +17,7 @@
 //! as the two cells they take. Input is [`sanitize`]d first: what's already
 //! in the store predates the apply-boundary pass, and this is cheap.
 
-use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, Event, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
@@ -189,8 +189,9 @@ struct Blocks {
     /// The text of the code or HTML block being read.
     code: Option<String>,
     html: Option<String>,
-    /// Inside a table: its events are skipped, its source is shown.
-    table: bool,
+    /// The table being read: its cells are collected, then laid out at its
+    /// end ([`Blocks::table_block`]).
+    table: Option<Table>,
     /// A blank row is owed before the next block (blocks are separated, a
     /// tight list's items are not).
     gap: bool,
@@ -206,20 +207,29 @@ impl Blocks {
             lists: Vec::new(),
             code: None,
             html: None,
-            table: false,
+            table: None,
             gap: false,
         }
     }
 
     fn run(mut self, md: &str) -> Vec<Line<'static>> {
-        // Tables are parsed only so their source can be shown as is (step 16
-        // lays them out); without the option their rows would fold into one
-        // paragraph.
+        // Offsets: a table too wide to lay out falls back to its source.
         let parser = Parser::new_ext(md, Options::ENABLE_TABLES).into_offset_iter();
         for (event, range) in parser {
-            if self.table {
-                if matches!(event, Event::End(TagEnd::Table)) {
-                    self.table = false;
+            if let Some(table) = &mut self.table {
+                match event {
+                    Event::End(TagEnd::TableCell) => table.row.push(std::mem::take(&mut self.inl.spans)),
+                    Event::End(TagEnd::TableHead | TagEnd::TableRow) => table.rows.push(std::mem::take(&mut table.row)),
+                    Event::End(TagEnd::Table) => {
+                        let table = self.table.take().unwrap();
+                        self.inl.urls = true;
+                        self.table_block(table);
+                    }
+                    // Cell text: inline events only; row/cell starts carry
+                    // nothing.
+                    event => {
+                        self.inl.event(&event);
+                    }
                 }
                 continue;
             }
@@ -281,10 +291,11 @@ impl Blocks {
                     let html = self.html.take().unwrap_or_default();
                     self.source_lines(&html);
                 }
-                Event::Start(Tag::Table(_)) => {
+                Event::Start(Tag::Table(aligns)) => {
                     self.flush();
-                    self.table = true;
-                    self.source_lines(&md[range]);
+                    // A cell is a few columns: a link's URL would blow it up.
+                    self.inl.urls = false;
+                    self.table = Some(Table { aligns, rows: Vec::new(), row: Vec::new(), source: md[range].to_string() });
                 }
                 Event::Start(Tag::List(start)) => {
                     self.flush();
@@ -344,7 +355,64 @@ impl Blocks {
         self.gap = true;
     }
 
-    /// Raw HTML and (until step 16) tables: their source lines, wrapped.
+    /// A finished table: aligned columns when [`layout_columns`] finds room
+    /// under the current prefix, else its source lines (as step 15 showed
+    /// every table), which wrap but stay readable.
+    fn table_block(&mut self, table: Table) {
+        let Table { aligns, rows, source, .. } = table;
+        let avail = self.width.saturating_sub(width_of(&self.prefix(false)));
+        // The header and its delimiter row fix the column count: a short row
+        // is padded with empty cells, extra cells are dropped (GFM).
+        let n = aligns.len();
+        let rows: Vec<Vec<Vec<Span<'static>>>> = rows
+            .into_iter()
+            .map(|mut r| {
+                r.resize_with(n, Vec::new);
+                r
+            })
+            .collect();
+        let natural: Vec<usize> = (0..n).map(|c| rows.iter().map(|r| width_of(&r[c])).max().unwrap_or(0).max(1)).collect();
+        let Some(widths) = layout_columns(&natural, avail) else {
+            self.source_lines(&source);
+            return;
+        };
+        let total = widths.iter().sum::<usize>() + TABLE_GAP.len() * (n - 1);
+        for (i, row) in rows.iter().enumerate() {
+            let mut line = Vec::new();
+            for (c, cell) in row.iter().enumerate() {
+                if c > 0 {
+                    line.push(Span::raw(TABLE_GAP));
+                }
+                let mut cell = fit_cell(cell, widths[c]);
+                if i == 0 {
+                    for s in &mut cell {
+                        s.style = s.style.add_modifier(Modifier::BOLD);
+                    }
+                }
+                let pad = widths[c] - width_of(&cell);
+                let (left, right) = match aligns[c] {
+                    Alignment::Right => (pad, 0),
+                    Alignment::Center => (pad / 2, pad - pad / 2),
+                    Alignment::Left | Alignment::None => (0, pad),
+                };
+                if left > 0 {
+                    line.push(Span::raw(" ".repeat(left)));
+                }
+                line.extend(cell);
+                if right > 0 {
+                    line.push(Span::raw(" ".repeat(right)));
+                }
+            }
+            // Fits by construction: one row each, trailing padding trimmed.
+            self.emit(&line, false, None);
+            if i == 0 {
+                self.emit(&[Span::styled("─".repeat(total), DIM)], false, None);
+            }
+        }
+        self.gap = true;
+    }
+
+    /// Raw HTML and tables too wide to lay out: their source lines, wrapped.
     fn source_lines(&mut self, text: &str) {
         for l in text.trim_end_matches('\n').split('\n') {
             self.emit(&[Span::raw(l.trim_end().to_string())], false, None);
@@ -395,6 +463,87 @@ impl Blocks {
             }
         }
     }
+}
+
+/// A table being read: per column its alignment, the finished rows (the
+/// header first), each a list of cells, each cell its inline spans.
+struct Table {
+    aligns: Vec<Alignment>,
+    rows: Vec<Vec<Vec<Span<'static>>>>,
+    row: Vec<Vec<Span<'static>>>,
+    /// Its markdown, for the fallback.
+    source: String,
+}
+
+/// Between two columns: whitespace only, no borders, so a table reads like
+/// the rest of the pane and costs the fewest columns.
+const TABLE_GAP: &str = "  ";
+
+/// The narrowest a column is shrunk to (unless its content is narrower):
+/// below this a truncated cell stops being readable, and the source is the
+/// better view.
+const MIN_COLUMN: usize = 8;
+
+/// Column widths for a table whose columns want `natural` display widths,
+/// separated by [`TABLE_GAP`], in `available` columns. As is when that fits;
+/// otherwise the widest columns are shrunk first (a common cap, so short
+/// columns stay whole) but none below [`MIN_COLUMN`], their cells then
+/// truncated with `…`. `None` when even that doesn't fit: the caller shows
+/// the source.
+pub fn layout_columns(natural: &[usize], available: usize) -> Option<Vec<usize>> {
+    let gaps = TABLE_GAP.len() * natural.len().saturating_sub(1);
+    let room = available.checked_sub(gaps)?;
+    let capped = |cap: usize| -> Vec<usize> { natural.iter().map(|&w| w.min(cap.max(MIN_COLUMN))).collect() };
+    let sum = |cap: usize| capped(cap).iter().sum::<usize>();
+    let widest = natural.iter().copied().max().unwrap_or(0);
+    if sum(widest) <= room {
+        return Some(natural.to_vec());
+    }
+    if sum(MIN_COLUMN) > room {
+        return None;
+    }
+    // The largest cap that fits (`sum` grows with the cap), then the columns
+    // it cut get the leftover, a column each, left to right.
+    let (mut lo, mut hi) = (MIN_COLUMN, widest);
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if sum(mid) <= room {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    let mut widths = capped(lo);
+    let mut left = room - sum(lo);
+    for (w, &n) in widths.iter_mut().zip(natural) {
+        if left > 0 && n > *w {
+            *w += 1;
+            left -= 1;
+        }
+    }
+    Some(widths)
+}
+
+/// `cell` cut to `width` display columns, its last one a `…` (styled like
+/// the text it cut, so a code span keeps its tint) when it didn't fit.
+fn fit_cell(cell: &[Span<'static>], width: usize) -> Vec<Span<'static>> {
+    if width_of(cell) <= width {
+        return cell.to_vec();
+    }
+    let mut out = Vec::new();
+    let mut used = 0;
+    for s in cell {
+        for c in s.content.chars() {
+            let cw = char_width(c);
+            if used + cw + 1 > width {
+                push_char(&mut out, '…', s.style);
+                return out;
+            }
+            push_char(&mut out, c, s.style);
+            used += cw;
+        }
+    }
+    out
 }
 
 fn width_of(spans: &[Span]) -> usize {
@@ -652,8 +801,75 @@ mod tests {
     }
 
     #[test]
-    fn tables_stay_as_their_source() {
-        assert_eq!(full("| a | b |\n|---|---|\n| 1 | 2 |\n\nafter", 40), ["| a | b |", "|---|---|", "| 1 | 2 |", "", "after"]);
+    fn layout_columns_fits_shrinks_or_gives_up() {
+        // Fits: as is (3 + 2 + 5 + 2 + 4 = 16).
+        assert_eq!(layout_columns(&[3, 5, 4], 16), Some(vec![3, 5, 4]));
+        // The widest shrinks first; short columns stay whole.
+        assert_eq!(layout_columns(&[3, 30, 4], 30), Some(vec![3, 19, 4]));
+        // Two wide ones share a cap; the leftover goes left to right.
+        assert_eq!(layout_columns(&[20, 20, 3], 30), Some(vec![12, 11, 3]));
+        assert_eq!(layout_columns(&[20, 20], 22), Some(vec![10, 10]));
+        // Never below the minimum (narrower content stays narrower).
+        assert_eq!(layout_columns(&[20, 20], 18), Some(vec![8, 8]));
+        assert_eq!(layout_columns(&[20, 20], 17), None);
+        assert_eq!(layout_columns(&[2, 2, 2], 3), None, "not even the gaps");
+        assert_eq!(layout_columns(&[5], 5), Some(vec![5]));
+    }
+
+    #[test]
+    fn tables_are_aligned_under_a_bold_header_and_a_rule() {
+        let md = "| name | n | state |\n|:--|--:|:-:|\n| api | 12 | ok |\n| a | 3 | failing |\n\nafter";
+        let lines = render(md, 40);
+        assert_eq!(
+            texts(&lines),
+            ["name   n   state", "─────────────────", "api   12    ok", "a      3  failing", "", "after"]
+        );
+        assert!(style_of(&lines, "name").add_modifier.contains(Modifier::BOLD));
+        assert_eq!(style_of(&lines, "───"), DIM);
+        assert!(!style_of(&lines, "api").add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn a_table_too_wide_shrinks_then_falls_back_to_its_source() {
+        let md = "| key | description |\n|---|---|\n| a | a long description here |";
+        // 3 + 2 + 24 = 29 fits; at 20 the description is cut to 15.
+        assert_eq!(full(md, 29)[2], "a    a long description here");
+        assert_eq!(full(md, 20), ["key  description", "────────────────────", "a    a long descrip…"]);
+        // 3 + 2 + 8 needs 13.
+        assert_eq!(full(md, 12), ["| key |", "description", "|", "|---|---|", "| a | a long", "description", "here |"]);
+    }
+
+    #[test]
+    fn table_cells_keep_inline_styles_and_drop_urls() {
+        let lines = render("| cmd | see |\n|---|---|\n| `make` | [docs](https://x) **now** |", 40);
+        assert_eq!(texts(&lines)[2], "make  docs now");
+        assert_eq!(style_of(&lines, "make"), CODE);
+        assert_eq!(style_of(&lines, "docs"), LINK);
+        // A truncated code cell keeps its tint up to the `…`.
+        let lines = render("| a | b |\n|---|---|\n| x | `0123456789abcdef` |", 13);
+        assert_eq!(texts(&lines)[2], "x  012345678…");
+        assert_eq!(style_of(&lines, "012345678…"), CODE);
+    }
+
+    #[test]
+    fn table_cells_count_wide_glyphs_as_two_columns() {
+        let lines = render("| 名前 | x |\n|---|--:|\n| 世界世界 | 1 |", 40);
+        assert_eq!(texts(&lines), ["名前      x", "───────────", "世界世界  1"]);
+        for l in &lines {
+            assert_eq!(l.width(), 11, "{l:?}");
+        }
+    }
+
+    #[test]
+    fn ragged_rows_empty_cells_and_escaped_pipes() {
+        let md = "| a | b | c |\n|---|---|---|\n| 1 |\n|  | x \\| y | `p\\|q` |\n| 1 | 2 | 3 | 4 |";
+        assert_eq!(full(md, 40), ["a  b      c", "─────────────", "1", "   x | y  p|q", "1  2      3"]);
+    }
+
+    #[test]
+    fn a_table_in_a_list_item_or_quote_sits_under_its_prefix() {
+        assert_eq!(full("- | a | b |\n  |---|---|\n  | 1 | 2 |", 20), ["• a  b", "  ────", "  1  2"]);
+        assert_eq!(full("> | a |\n> |---|\n> | 1 |", 20), ["│ a", "│ ─", "│ 1"]);
     }
 
     #[test]

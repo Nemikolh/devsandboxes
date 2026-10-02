@@ -39,7 +39,7 @@ devsandbox vscode web-2 --goto src/main.rs:42:7
 
 - **The dashboard takes more mouse clicks.** Click a tab title to switch tabs. In the Inbox, click a card to select it, a view name to switch views, the thread or its reply box to focus them; the wheel moves through the cards or scrolls the thread.
 
-- **Inbox text is rendered as markdown.** A thread's message and notification bodies show headings, lists, code blocks, quotes and links instead of raw `**` and backticks; titles and statuses get inline code and emphasis. Long lines wrap at word boundaries. Press `m` on a thread to see the source. Control characters from containers are stripped before they are stored or drawn.
+- **Inbox text is rendered as markdown.** A thread's message and notification bodies show headings, lists, code blocks, quotes, links and tables (aligned when they fit) instead of raw `**` and backticks; titles and statuses get inline code and emphasis. Long lines wrap at word boundaries. Press `m` on a thread to see the source. Control characters from containers are stripped before they are stored or drawn.
 
 - **An open dashboard updates the helper in running instances.** Before, a running dispatcher only got new `devsbd` verbs after `devsandbox start`; now opening the dashboard of a newer devsandbox is enough.
 

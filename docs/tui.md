@@ -260,7 +260,9 @@ dashboard, `→ <sender>` sends an event, `✓ done`).
 blocks (bold accented headings, emphasis, tinted inline code and code
 blocks, bullet/numbered lists with hanging indents, `│` quotes, dim rules,
 links as underlined text plus a dim `(url)`, raw HTML literal, images as
-their alt text, tables as their source lines); the title, status, timeline
+their alt text, tables as aligned columns under a bold header and a dim
+rule when they fit, widest columns cut to 8 with `…` first, else their
+source lines); the title, status, timeline
 rows and the cards' title/status inline only (code, emphasis, links as text,
 one line). Every pane line is word-wrapped by display width by the renderer
 itself, so the scroll bound is the exact row count. `m` shows the source

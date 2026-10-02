@@ -2564,6 +2564,29 @@ See [PR 6900](https://github.com/o/r/pull/6900).";
     }
 
     #[test]
+    fn thread_pane_lays_out_a_table() {
+        let mut app = message_app("Checks:\n\n| check | took | result |\n|:--|--:|:-:|\n| `cargo test` | 41s | ok |\n| e2e | 3m | failing |");
+        let buf = draw_buffer(&app, 100, 20);
+        let rows = rows_of(&buf);
+        if std::env::var_os("SHOW_INBOX").is_some() {
+            println!("{}", rows.join("\n"));
+        }
+        let screen = rows.join("\n");
+        let (x, y) = find_cell(&rows, "check       took  result");
+        assert!(buf[(x, y)].style().add_modifier.contains(Modifier::BOLD), "bold header");
+        let rule = &rows[y as usize + 1];
+        assert_eq!(rule.chars().skip(x as usize).take_while(|c| *c == '─').count(), 25, "{screen}");
+        assert!(buf[(x, y + 1)].style().add_modifier.contains(Modifier::DIM), "dim rule");
+        let (cx, cy) = find_cell(&rows, "cargo test   41s    ok");
+        assert_eq!((cx, cy), (x, y + 2), "{screen}");
+        assert_eq!(buf[(cx, cy)].style().bg, markdown::CODE.bg, "inline code keeps its tint");
+        assert_eq!(find_cell(&rows, "e2e           3m  failing"), (x, y + 3), "{screen}");
+        // Raw: the source.
+        app.on_key(KeyEvent::from(KeyCode::Char('m')));
+        assert!(render(&app, 100, 20).contains("| `cargo test` | 41s | ok |"));
+    }
+
+    #[test]
     fn m_toggles_the_raw_source() {
         let mut app = message_app(LLM_MESSAGE);
         app.on_key(KeyEvent::from(KeyCode::Char('m')));
@@ -2583,7 +2606,8 @@ See [PR 6900](https://github.com/o/r/pull/6900).";
     #[test]
     fn the_pane_scroll_bound_is_exact() {
         let long: String = (1..=40).map(|i| format!("- item {i} with a few words to wrap\n")).collect();
-        let mut app = message_app(&format!("{long}\nTHE END"));
+        let table = "| a | b |\n|---|--:|\n| 1 | 2 |\n| `x` | 3 |\n";
+        let mut app = message_app(&format!("{table}\n{long}\n{table}\nTHE END"));
         // Draw once so the bound is known, then jump to the bottom.
         render(&app, 80, 24);
         app.on_key(KeyEvent::from(KeyCode::Char('G')));
