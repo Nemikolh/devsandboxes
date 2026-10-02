@@ -49,8 +49,9 @@ use crate::devsbd::control::{self, Op, Request, Response, Status};
 use crate::runtime::{backend, bounded};
 use crate::state::{Instance, State};
 
-/// Longest accepted child key (the charset is checked by [`valid_key`]).
-pub const MAX_KEY: usize = 40;
+// The key rule lives in `control`, which the helper compiles too: `devsbd
+// thread put|rm` checks its key before queuing, and both sides must agree.
+pub use crate::devsbd::control::{valid_key, MAX_KEY};
 
 /// Cap on a `run-wait` request's `timeout`, seconds: each wait holds a bridge
 /// handler thread and a `docker exec`; clients loop (`devsbd run wait`), and
@@ -424,17 +425,6 @@ fn run_op(name: &str, child: &Instance, req: &Request, exec: &mut dyn Executor) 
         _ => String::from_utf8_lossy(&out.stdout).trim_end().to_string(),
     };
     Response::new(Status::Ok, body)
-}
-
-/// `[a-z0-9][a-z0-9-]{0,39}`: always a valid tail for an instance name, a
-/// container name (`devsandbox-<sandbox>-<key>`), and a path segment
-/// (`.worktrees/<id>`).
-pub fn valid_key(key: &str) -> bool {
-    let mut chars = key.chars();
-    let lower_alnum = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit();
-    key.len() <= MAX_KEY
-        && chars.next().is_some_and(lower_alnum)
-        && chars.all(|c| lower_alnum(c) || c == '-')
 }
 
 pub fn child_name(sandbox: &str, key: &str) -> String {
@@ -1470,12 +1460,7 @@ folder = "."
 
     #[test]
     fn key_and_field_validation() {
-        for good in ["a", "0", "pr-123", "a-", &"x".repeat(MAX_KEY)] {
-            assert!(valid_key(good), "{good}");
-        }
-        for bad in ["", "-a", "PR-1", "a_b", "a.b", "a/b", "a b", "é", &"x".repeat(MAX_KEY + 1)] {
-            assert!(!valid_key(bad), "{bad}");
-        }
+        // The rule itself is tested in `control`; this covers how `handle` uses it.
         let s = state();
         let cases: &[(Request, &str)] = &[
             (req(Op::Ensure, Some("web"), Some("Bad")), "bad key `Bad`"),

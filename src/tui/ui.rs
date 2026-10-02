@@ -20,6 +20,7 @@ use super::data::{
 use super::procs::{is_agent, ProcState, MESSAGE_ROW};
 use super::prompt::Prompt;
 use crate::devsbd::notify::Level;
+use crate::inbox::{EntryKind, Kind, State};
 use crate::render::JsonLine;
 
 const ACCENT: Color = Color::Rgb(175, 135, 255);
@@ -632,20 +633,28 @@ fn inbox_row<'a>(app: &App, row: &InboxRow, grouped: bool, now: u64) -> Row<'a> 
                 msg.push(Span::styled(format!(" ✉{unread}"), Style::default().fg(Color::Yellow)));
             }
             Row::new(vec![
-                Cell::from(Span::styled(newest.map_or(String::new(), |t| when(t.head().at, now, app.utc_offset)), dim)),
+                Cell::from(Span::styled(
+                    newest.map_or(String::new(), |t| when(t.changed_at(), now, app.utc_offset)),
+                    dim,
+                )),
                 Cell::from(""),
                 Cell::from(Line::from(msg)),
             ])
         }
+        // A dispatcher thread has no records: its own fields are the row.
+        InboxRow::Thread(i) if inbox.threads()[*i].kind == Kind::Thread => {
+            thread_row(&inbox.threads()[*i], grouped, now, app.utc_offset, indent)
+        }
         InboxRow::Thread(i) => {
             let t = &inbox.threads()[*i];
+            let head = t.head().expect("a notify thread always has a head record");
             let marker = match (t.history(), inbox.is_expanded(t)) {
                 (0, _) => "  ",
                 (_, true) => "▾ ",
                 (_, false) => "▸ ",
             };
-            let mut msg = vec![Span::raw(format!("{indent}{marker}{}", first_line(&t.head().msg)))];
-            if t.head().link.is_some() {
+            let mut msg = vec![Span::raw(format!("{indent}{marker}{}", first_line(&head.msg)))];
+            if head.link.is_some() {
                 msg.push(Span::styled(" ↗", Style::default().fg(Color::Blue)));
             }
             if t.history() > 0 {
@@ -670,8 +679,55 @@ fn inbox_row<'a>(app: &App, row: &InboxRow, grouped: bool, now: u64) -> Row<'a> 
     }
 }
 
+/// A dispatcher thread's row: its state in the LEVEL slot, title and status
+/// chip in MESSAGE. Step 4 gives threads their own columns; until then the
+/// state label is clipped to the 5-wide LEVEL column.
+fn thread_row<'a>(t: &Thread, grouped: bool, now: u64, utc_offset: i64, indent: &str) -> Row<'a> {
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let state = t.state.unwrap_or_default();
+    let mut cells = vec![
+        Cell::from(Span::styled(when(t.changed_at(), now, utc_offset), dim)),
+        Cell::from(Span::styled(state_chip(state), state_style(state))),
+    ];
+    if !grouped {
+        cells.push(Cell::from(t.owner_name.clone()));
+    }
+    let mut msg = vec![Span::raw(format!("{indent}  {}", t.title))];
+    if t.link.is_some() {
+        msg.push(Span::styled(" \u{2197}", Style::default().fg(Color::Blue)));
+    }
+    if let Some(status) = &t.status {
+        msg.push(Span::styled(format!("  {status}"), dim));
+    }
+    cells.push(Cell::from(Line::from(msg)));
+    let row = Row::new(cells);
+    if t.unread {
+        row.style(Style::default().add_modifier(Modifier::BOLD))
+    } else {
+        row
+    }
+}
+
+/// The thread state, clipped to fit the 5-wide LEVEL column.
+fn state_chip(state: State) -> &'static str {
+    match state {
+        State::NeedsYou => "needs",
+        State::Active => "activ",
+        State::Done => "done",
+    }
+}
+
+fn state_style(state: State) -> Style {
+    match state {
+        State::NeedsYou => Style::default().fg(Color::Yellow),
+        State::Active => Style::default(),
+        State::Done => Style::default().add_modifier(Modifier::DIM),
+    }
+}
+
 /// Detail for the selected row: a record's full message plus its link and
-/// thread key (and history size on a head), or a group's summary.
+/// thread key (and history size on a head), or a dispatcher thread's fields
+/// and timeline, or a group's summary.
 fn draw_inbox_detail(frame: &mut Frame, app: &App, area: Rect, term_focused: bool) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -708,12 +764,77 @@ fn draw_inbox_detail(frame: &mut Frame, app: &App, area: Rect, term_focused: boo
             lines.extend(r.msg.lines().map(|l| Line::from(l.to_string())));
             lines
         }
+        // A dispatcher thread: no record to show, so read it off the thread.
+        // Actions are listed, not runnable — that's step 5.
+        (Some(InboxRow::Thread(_)), None) => match app.selected_inbox_thread() {
+            Some(t) => thread_detail(t, app.utc_offset, dim),
+            None => Vec::new(),
+        },
         _ => Vec::new(),
     };
     frame.render_widget(
         Paragraph::new(lines).block(block).wrap(ratatui::widgets::Wrap { trim: false }),
         area,
     );
+}
+
+/// The detail lines for a dispatcher thread: its fields, its message, the
+/// timeline the host keeps, and the action labels.
+fn thread_detail<'a>(t: &Thread, utc_offset: i64, dim: Style) -> Vec<Line<'a>> {
+    let state = t.state.unwrap_or_default();
+    let mut lines = vec![Line::from(vec![
+        Span::styled(stamp(t.changed_at(), utc_offset), dim),
+        Span::raw("  "),
+        Span::styled(state.as_str(), state_style(state)),
+        Span::raw("  "),
+        Span::raw(t.owner_name.clone()),
+    ])];
+    lines.push(Line::from(t.title.clone()));
+    if let Some(link) = &t.link {
+        lines.push(kv("link", link));
+    }
+    if let Some(status) = &t.status {
+        lines.push(kv("status", status));
+    }
+    if let Some(child) = &t.child {
+        lines.push(kv("child", child));
+    }
+    if let Some(key) = &t.key {
+        lines.push(kv("key", key));
+    }
+    if let Some(message) = &t.message {
+        lines.extend(message.lines().map(|l| Line::from(l.to_string())));
+    }
+    if !t.actions.is_empty() {
+        let labels: Vec<String> = t
+            .actions
+            .iter()
+            .enumerate()
+            .map(|(i, a)| format!("{}:{}", i + 1, a.label))
+            .collect();
+        lines.push(kv("actions", &labels.join("  ")));
+    }
+    for entry in &t.entries {
+        lines.push(Line::from(vec![
+            Span::styled(format!("{}  ", stamp(entry.at, utc_offset)), dim),
+            Span::styled(format!("{:7}", entry_label(entry.kind)), dim),
+            Span::raw(one_line(&entry.text)),
+        ]));
+    }
+    lines
+}
+
+fn entry_label(kind: EntryKind) -> &'static str {
+    match kind {
+        EntryKind::Message => "message",
+        EntryKind::State => "state",
+        EntryKind::Status => "status",
+    }
+}
+
+/// A multi-line value folded onto one timeline row.
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Pure tab labels for the terminal panel, one per open session: `{i+1}:{title}`

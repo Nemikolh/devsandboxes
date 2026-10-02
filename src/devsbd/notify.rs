@@ -8,16 +8,27 @@
 //! escaped as in `escape.rs` (`\\`, `\n`, `\0`):
 //!
 //! ```text
-//! level warn               required, once: info|warn|error
+//! kind thread-put          optional, at most once: thread-put|thread-rm.
+//!                          Absent = a plain notify record, which is why old
+//!                          helpers' records still decode byte for byte.
 //! at 1790000000            required, once: unix seconds when queued
-//! key pr-123               optional, at most once: dedupe key
-//! link https://…           optional, at most once
-//! msg PR 123\nneeds you    required, once
+//! level warn               notify only, required: info|warn|error
+//! key pr-123               notify: optional dedupe key; thread-*: required
+//! link https://…           notify only, optional
+//! msg PR 123\nneeds you    notify only, required
+//! body {"key":"pr-123",…}  thread-put only, required: the thread JSON. The
+//!                          helper only syntax-checks it (docs/inbox-threads.md,
+//!                          "Decisions"); the host owns the schema.
 //! ```
 //!
-//! Unknown keys, repeats, a missing required key, or a bad escape are parse
-//! errors (the daemon moves such a file aside so it can't block the queue).
-//! The host answers each stream with [`REPLY_OK`] once it has the record.
+//! A thread record repeats the `key` the helper pulled out of `body`, so the
+//! outbox can coalesce same-key puts and the host can route and report a
+//! rejected body without parsing JSON twice.
+//!
+//! Unknown keys, repeats, a missing required key, a directive on the wrong
+//! kind, or a bad escape are parse errors (the daemon moves such a file aside
+//! so it can't block the queue). The host answers each stream with
+//! [`REPLY_OK`] once it has the record.
 
 use super::escape::{escape, unescape};
 
@@ -70,7 +81,65 @@ pub struct Record {
     pub at: u64,
 }
 
-pub fn encode(r: &Record) -> String {
+/// What one outbox file holds: the original `devsbd notify` record, or one of
+/// the `devsbd thread` verbs (docs/inbox-threads.md). They share the queue,
+/// the transport and the `ok` handshake; only the directives differ.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Message {
+    Notify(Record),
+    /// `devsbd thread put`: the whole thread state as JSON, opaque here.
+    ThreadPut { at: u64, key: String, body: String },
+    /// `devsbd thread rm <key>`.
+    ThreadRm { at: u64, key: String },
+}
+
+impl Message {
+    /// Unix seconds when the helper queued it.
+    pub fn at(&self) -> u64 {
+        match self {
+            Message::Notify(r) => r.at,
+            Message::ThreadPut { at, .. } | Message::ThreadRm { at, .. } => *at,
+        }
+    }
+
+    /// The thread (or dedupe) key, when the message carries one.
+    pub fn key(&self) -> Option<&str> {
+        match self {
+            Message::Notify(r) => r.key.as_deref(),
+            Message::ThreadPut { key, .. } | Message::ThreadRm { key, .. } => Some(key),
+        }
+    }
+
+    /// A thread verb for `key`: what the outbox coalesces on. Plain notify
+    /// records are a log and are never dropped, even with the same key.
+    pub fn is_thread_op_for(&self, key: &str) -> bool {
+        matches!(self, Message::ThreadPut { key: k, .. } | Message::ThreadRm { key: k, .. } if k == key)
+    }
+}
+
+impl From<Record> for Message {
+    fn from(r: Record) -> Message {
+        Message::Notify(r)
+    }
+}
+
+/// The `kind` directive's values; absent means [`Message::Notify`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    ThreadPut,
+    ThreadRm,
+}
+
+impl Kind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Kind::ThreadPut => "thread-put",
+            Kind::ThreadRm => "thread-rm",
+        }
+    }
+}
+
+pub fn encode(m: &Message) -> String {
     let mut out = String::new();
     let mut line = |key: &str, value: &str| {
         out.push_str(key);
@@ -78,20 +147,38 @@ pub fn encode(r: &Record) -> String {
         escape(value, &mut out);
         out.push('\n');
     };
-    line("level", r.level.as_str());
-    line("at", &r.at.to_string());
-    if let Some(key) = &r.key {
-        line("key", key);
+    match m {
+        // Unchanged from before `kind` existed, so a host that predates threads
+        // still reads what this helper queues.
+        Message::Notify(r) => {
+            line("level", r.level.as_str());
+            line("at", &r.at.to_string());
+            if let Some(key) = &r.key {
+                line("key", key);
+            }
+            if let Some(link) = &r.link {
+                line("link", link);
+            }
+            line("msg", &r.msg);
+        }
+        Message::ThreadPut { at, key, body } => {
+            line("kind", Kind::ThreadPut.as_str());
+            line("at", &at.to_string());
+            line("key", key);
+            line("body", body);
+        }
+        Message::ThreadRm { at, key } => {
+            line("kind", Kind::ThreadRm.as_str());
+            line("at", &at.to_string());
+            line("key", key);
+        }
     }
-    if let Some(link) = &r.link {
-        line("link", link);
-    }
-    line("msg", &r.msg);
     out
 }
 
-pub fn decode(text: &str) -> Result<Record, String> {
-    let (mut level, mut at, mut key, mut link, mut msg) = (None, None, None, None, None);
+pub fn decode(text: &str) -> Result<Message, String> {
+    let (mut kind, mut level, mut at) = (None, None, None);
+    let (mut key, mut link, mut msg, mut body) = (None, None, None, None);
     for (n, line) in text.split('\n').enumerate() {
         if line.is_empty() {
             continue;
@@ -101,6 +188,16 @@ pub fn decode(text: &str) -> Result<Record, String> {
         let value = unescape(rest).map_err(err)?;
         let repeated = || err(format!("repeated `{name}`"));
         match name {
+            "kind" => {
+                let k = match value.as_str() {
+                    "thread-put" => Kind::ThreadPut,
+                    "thread-rm" => Kind::ThreadRm,
+                    _ => return Err(err(format!("bad kind `{value}`"))),
+                };
+                if kind.replace(k).is_some() {
+                    return Err(repeated());
+                }
+            }
             "level" => {
                 let l = Level::parse(&value).ok_or_else(|| err(format!("bad level `{value}`")))?;
                 if level.replace(l).is_some() {
@@ -113,11 +210,12 @@ pub fn decode(text: &str) -> Result<Record, String> {
                     return Err(repeated());
                 }
             }
-            "key" | "link" | "msg" => {
+            "key" | "link" | "msg" | "body" => {
                 let slot = match name {
                     "key" => &mut key,
                     "link" => &mut link,
-                    _ => &mut msg,
+                    "msg" => &mut msg,
+                    _ => &mut body,
                 };
                 if slot.replace(value).is_some() {
                     return Err(repeated());
@@ -127,13 +225,32 @@ pub fn decode(text: &str) -> Result<Record, String> {
         }
     }
     let missing = |k: &str| format!("missing `{k}`");
-    Ok(Record {
-        level: level.ok_or_else(|| missing("level"))?,
-        at: at.ok_or_else(|| missing("at"))?,
-        msg: msg.ok_or_else(|| missing("msg"))?,
-        key,
-        link,
-    })
+    let at = at.ok_or_else(|| missing("at"))?;
+    let Some(kind) = kind else {
+        if body.is_some() {
+            return Err("`body` needs `kind thread-put`".into());
+        }
+        return Ok(Message::Notify(Record {
+            level: level.ok_or_else(|| missing("level"))?,
+            at,
+            msg: msg.ok_or_else(|| missing("msg"))?,
+            key,
+            link,
+        }));
+    };
+    // The notify-only directives would be silently dropped otherwise, hiding a
+    // sender that mixed the two forms.
+    for (name, present) in [("level", level.is_some()), ("link", link.is_some()), ("msg", msg.is_some())] {
+        if present {
+            return Err(format!("`{name}` is not allowed on a `{}` record", kind.as_str()));
+        }
+    }
+    let key = key.ok_or_else(|| missing("key"))?;
+    match kind {
+        Kind::ThreadPut => Ok(Message::ThreadPut { at, key, body: body.ok_or_else(|| missing("body"))? }),
+        Kind::ThreadRm if body.is_some() => Err("`body` is not allowed on a `thread-rm` record".into()),
+        Kind::ThreadRm => Ok(Message::ThreadRm { at, key }),
+    }
 }
 
 #[cfg(test)]
@@ -148,13 +265,30 @@ key pr-123\n\
 link https://example.com/pr/123\n\
 msg PR 123\\nneeds you\n";
 
-    fn fixture() -> Record {
-        Record {
+    /// The thread verbs, checked from both crates for the same reason.
+    const PUT_FIXTURE: &str = "kind thread-put\n\
+at 1790000000\n\
+key pr-123\n\
+body {\"key\":\"pr-123\",\"title\":\"a\\nb\"}\n";
+
+    const RM_FIXTURE: &str = "kind thread-rm\nat 1790000000\nkey pr-123\n";
+
+    fn fixture() -> Message {
+        Message::Notify(Record {
             level: Level::Warn,
             key: Some("pr-123".into()),
             link: Some("https://example.com/pr/123".into()),
             msg: "PR 123\nneeds you".into(),
             at: 1_790_000_000,
+        })
+    }
+
+    fn put_fixture() -> Message {
+        Message::ThreadPut {
+            at: 1_790_000_000,
+            key: "pr-123".into(),
+            // A newline inside the JSON body: escaped on the wire, not a line break.
+            body: "{\"key\":\"pr-123\",\"title\":\"a\nb\"}".into(),
         }
     }
 
@@ -165,14 +299,30 @@ msg PR 123\\nneeds you\n";
     }
 
     #[test]
+    fn thread_fixtures_round_trip() {
+        assert_eq!(encode(&put_fixture()), PUT_FIXTURE);
+        assert_eq!(decode(PUT_FIXTURE), Ok(put_fixture()));
+        let rm = Message::ThreadRm { at: 1_790_000_000, key: "pr-123".into() };
+        assert_eq!(encode(&rm), RM_FIXTURE);
+        assert_eq!(decode(RM_FIXTURE), Ok(rm.clone()));
+        // Accessors the outbox and the host route on.
+        assert_eq!((put_fixture().at(), put_fixture().key()), (1_790_000_000, Some("pr-123")));
+        assert!(put_fixture().is_thread_op_for("pr-123"));
+        assert!(rm.is_thread_op_for("pr-123"));
+        assert!(!rm.is_thread_op_for("pr-124"));
+        // A notify record with the same key is a log entry, never coalesced.
+        assert!(!fixture().is_thread_op_for("pr-123"));
+    }
+
+    #[test]
     fn newlines_nuls_and_backslashes_round_trip() {
-        let r = Record {
+        let r = Message::Notify(Record {
             level: Level::Error,
             key: Some("k\0\\".into()),
             link: None,
             msg: "a\nb\0c\\n\n".into(),
             at: 0,
-        };
+        });
         let text = encode(&r);
         assert_eq!(text.lines().count(), 4, "one line per directive");
         assert!(!text.contains('\0'));
@@ -181,7 +331,8 @@ msg PR 123\\nneeds you\n";
 
     #[test]
     fn optional_fields_and_empty_msg() {
-        let r = Record { level: Level::Info, key: None, link: None, msg: String::new(), at: 5 };
+        let r =
+            Message::Notify(Record { level: Level::Info, key: None, link: None, msg: String::new(), at: 5 });
         assert_eq!(encode(&r), "level info\nat 5\nmsg \n");
         assert_eq!(decode("level info\nat 5\nmsg \n"), Ok(r.clone()));
         // A bare `msg` (no space) is an empty value too; order doesn't matter.
@@ -201,7 +352,8 @@ msg PR 123\\nneeds you\n";
     fn rejects_malformed() {
         let ok = "level info\nat 1\nmsg hi\n";
         assert!(decode(ok).is_ok());
-        assert!(decode("").unwrap_err().contains("missing `level`"));
+        assert!(decode("").unwrap_err().contains("missing `at`"));
+        assert!(decode("at 1\nmsg hi\n").unwrap_err().contains("missing `level`"));
         assert!(decode("level info\nmsg hi\n").unwrap_err().contains("missing `at`"));
         assert!(decode("level info\nat 1\n").unwrap_err().contains("missing `msg`"));
         assert!(decode("level loud\nat 1\nmsg hi\n").unwrap_err().contains("bad level"));
@@ -212,5 +364,24 @@ msg PR 123\\nneeds you\n";
         assert!(decode("level info\nat 1\nmsg a\\tb\n").unwrap_err().contains("bad escape"));
         // Binary junk (e.g. a truncated or foreign file) is rejected, not guessed at.
         assert!(decode("\u{1}\u{2}garbage").is_err());
+    }
+
+    #[test]
+    fn rejects_malformed_thread_records() {
+        assert!(decode(PUT_FIXTURE).is_ok());
+        assert!(decode("kind thread-ls\nat 1\nkey k\n").unwrap_err().contains("bad kind"));
+        assert!(decode("kind thread-put\nat 1\nkey k\n").unwrap_err().contains("missing `body`"));
+        assert!(decode("kind thread-put\nat 1\nbody {}\n").unwrap_err().contains("missing `key`"));
+        assert!(decode("kind thread-rm\nkey k\n").unwrap_err().contains("missing `at`"));
+        assert!(decode("kind thread-rm\nat 1\n").unwrap_err().contains("missing `key`"));
+        // Directives from the other form are a mistake, not something to drop.
+        assert!(decode("kind thread-rm\nat 1\nkey k\nbody {}\n").unwrap_err().contains("`body` is not allowed"));
+        for bad in ["level info", "link https://x", "msg hi"] {
+            let err = decode(&format!("kind thread-put\nat 1\nkey k\nbody {{}}\n{bad}\n")).unwrap_err();
+            assert!(err.contains("is not allowed on a `thread-put` record"), "{bad}: {err}");
+        }
+        assert!(decode("level info\nat 1\nmsg hi\nbody {}\n").unwrap_err().contains("`body` needs"));
+        assert!(decode(&format!("{PUT_FIXTURE}kind thread-rm\n")).unwrap_err().contains("repeated `kind`"));
+        assert!(decode(&format!("{PUT_FIXTURE}body x\n")).unwrap_err().contains("repeated `body`"));
     }
 }

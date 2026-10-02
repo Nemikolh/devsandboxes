@@ -106,8 +106,27 @@ pub fn rm(name: &str, delete_branch: Option<bool>, force: bool) -> Result<()> {
 
     state.instances.remove(&key);
     state.save()?;
+    archive_inbox(&key, &instance_id);
     println!("removed {key}");
     Ok(())
+}
+
+/// Mark the removed instance's Inbox threads read-only, after its state entry
+/// is gone: it can never send again, and instance ids are never reused, so the
+/// threads stay as history until retention drops them. A store failure is a
+/// warning — the instance is already removed, and failing here would say
+/// otherwise.
+fn archive_inbox(key: &str, instance_id: &str) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let updated = crate::inbox::store::update(|inbox| {
+        inbox.archive_owner(instance_id);
+        inbox.prune(now);
+    });
+    if let Err(e) = updated {
+        eprintln!("warning: cannot archive `{key}`'s inbox threads: {e:#}");
+    }
 }
 
 /// A teardown step's result: an error aborts rm, or with `force` only warns.

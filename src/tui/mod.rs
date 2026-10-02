@@ -349,13 +349,12 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
                     forwards::ForwardUpdate::Status(status) => app.status = Some(status),
                 }
             }
-            // Container notifications: the bridge worker already wrote them
-            // to the store, so this is a "reload now" poke plus the latest
-            // one on the status line, so it's noticed from any tab.
-            while let Ok(n) = notifications.try_recv() {
-                // One status line: fold a multi-line message.
-                let msg = n.record.msg.split_whitespace().collect::<Vec<_>>().join(" ");
-                app.status = Some(format!("{}: {msg}", n.instance));
+            // Container messages: the bridge worker already wrote them to the
+            // store and rendered the status line, so this is a "reload now"
+            // poke plus the latest line, so it's noticed from any tab. A put
+            // that changed nothing never arrives here.
+            while let Ok(line) = notifications.try_recv() {
+                app.status = Some(line);
                 reload_inbox = true;
             }
         }

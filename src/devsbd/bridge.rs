@@ -135,15 +135,15 @@ pub fn has_host_agent() -> bool {
     host_agent().is_some()
 }
 
-/// A container's `devsbd notify` record, tagged with the instance whose
-/// bridge delivered it: its state key (for display) and its `instance_id`
-/// (the owner identity the Inbox store threads by), so the sink needs no
-/// state lookup.
+/// A container's outbox message (`devsbd notify` or `devsbd thread put|rm`),
+/// tagged with the instance whose bridge delivered it: its state key (for
+/// display and the dispatcher check) and its `instance_id` (the owner
+/// identity the Inbox store threads by), so the sink needs no state lookup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Notification {
     pub instance: String,
     pub instance_id: String,
-    pub record: notify::Record,
+    pub message: notify::Message,
 }
 
 /// Where a bridge hands the notifications it takes. Called on the stream's
@@ -317,14 +317,14 @@ fn handle_notify(mut conn: UnixStream, to: &Services) {
         return;
     }
     let decoded = std::str::from_utf8(&buf).map_err(|e| e.to_string()).and_then(notify::decode);
-    let Ok(record) = decoded else {
+    let Ok(message) = decoded else {
         let _ = conn.write_all(NOTIFY_REPLY_BAD);
         return;
     };
     let n = Notification {
         instance: to.instance.clone(),
         instance_id: to.instance_id.clone(),
-        record,
+        message,
     };
     if (to.sink)(n).is_ok() {
         let _ = conn.write_all(notify::REPLY_OK);
@@ -649,26 +649,30 @@ impl Bridges {
     /// which drops every live `Bridge` (killing its `exec`) before returning.
     ///
     /// `sink` set → every helper-capable running instance gets a notify-serving
-    /// bridge; each record is written into the shared Inbox store first (that
+    /// bridge; each message is applied to the shared Inbox store first (that
     /// write is what the daemon's `ok` acknowledges, so a failed one is
     /// retried), then shown on the desktop (from the stream's handler thread)
     /// unless [`RateLimit`](super::desktop::RateLimit) holds it back, and
-    /// finally sent on `sink` as a "the store changed" poke the TUI drains
-    /// (it also puts the message on the status line).
-    pub fn spawn_worker(sink: Option<mpsc::Sender<Notification>>) -> BridgeWorker {
+    /// finally the status line is sent on `sink` as a "the store changed" poke
+    /// the TUI drains. A put that changed nothing produces neither, so a
+    /// dispatcher re-asserting its threads is invisible.
+    pub fn spawn_worker(sink: Option<mpsc::Sender<String>>) -> BridgeWorker {
         let sink = sink.map(|tx| -> Sink {
             // One limiter for every bridge, keyed by instance inside.
             let limit = Mutex::new(super::desktop::RateLimit::default());
             Arc::new(move |n: Notification| {
-                crate::inbox::store::update(|inbox| {
-                    inbox.push(n.instance_id.clone(), n.instance.clone(), n.record.clone(), true)
-                })
-                .map_err(|e| format!("{e:#}"))?;
-                let pop = limit.lock().unwrap_or_else(|e| e.into_inner()).allow(&n, Instant::now());
-                if pop {
-                    super::desktop::notify_desktop(&n);
+                let shown = apply_message(n)?;
+                let Some((instance, shown)) = shown else { return Ok(()) };
+                if let Some(popup) = shown.popup {
+                    let allowed = limit
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .allow(&instance, popup.key.as_deref(), Instant::now());
+                    if allowed {
+                        super::desktop::notify_desktop(&instance, &popup);
+                    }
                 }
-                let _ = tx.send(n);
+                let _ = tx.send(shown.line);
                 Ok(())
             })
         });
@@ -689,6 +693,27 @@ impl Bridges {
         });
         BridgeWorker { tx: Some(tx), handle: Some(handle) }
     }
+}
+
+/// Store one delivered message and report what to show, if anything. Split
+/// out of the sink closure so the store write (the thing the daemon's `ok`
+/// acknowledges) and the display decision are one read-modify-write.
+///
+/// Authorization is only evaluated for thread messages: `declares_dispatcher`
+/// loads `state.toml` and the config, which a plain notify must not pay for.
+fn apply_message(n: Notification) -> Result<Option<(String, crate::inbox::Shown)>, String> {
+    use crate::commands::dispatch;
+    let threaded = !matches!(n.message, notify::Message::Notify(_));
+    let declares = threaded && dispatch::declares_dispatcher(&n.instance);
+    let action = crate::inbox::decide(&n.instance, declares, n.message);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let shown = crate::inbox::store::update(|inbox| {
+        inbox.apply_sink(&n.instance_id, &n.instance, now, action)
+    })
+    .map_err(|e| format!("{e:#}"))?;
+    Ok(shown.map(|shown| (n.instance, shown)))
 }
 
 /// Handle to the bridge worker thread. Send running-container lists with
@@ -861,20 +886,36 @@ mod tests {
     #[test]
     fn notify_stream_replies_ok_and_delivers() {
         let (daemon, rx) = notify_pair();
-        let record = notify::Record {
+        let message = notify::Message::Notify(notify::Record {
             level: notify::Level::Warn,
             key: Some("pr-1".into()),
             link: None,
             msg: "PR 1\nneeds you".into(),
             at: 7,
-        };
-        let reply = send_notify(&daemon, 1, notify::encode(&record).as_bytes());
+        });
+        let reply = send_notify(&daemon, 1, notify::encode(&message).as_bytes());
         assert!(reply.starts_with(notify::REPLY_OK), "reply: {reply:?}");
         let got = rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(
             got,
-            Notification { instance: "web-1".into(), instance_id: "web-1-id".into(), record }
+            Notification { instance: "web-1".into(), instance_id: "web-1-id".into(), message }
         );
+    }
+
+    /// A thread verb reaches the sink as a `ThreadPut`, undecoded: the bridge
+    /// never parses the body, `inbox::decide` does.
+    #[test]
+    fn thread_stream_replies_ok_and_delivers() {
+        let (daemon, rx) = notify_pair();
+        let message = notify::Message::ThreadPut {
+            at: 7,
+            key: "pr-1".into(),
+            body: r#"{"key":"pr-1"}"#.into(),
+        };
+        let reply = send_notify(&daemon, 1, notify::encode(&message).as_bytes());
+        assert!(reply.starts_with(notify::REPLY_OK), "reply: {reply:?}");
+        let got = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(got.message, message);
     }
 
     #[test]
@@ -893,14 +934,14 @@ mod tests {
     #[test]
     fn a_failing_sink_gets_no_ok() {
         let (daemon, _rx) = service_pair_with(no_control(), false);
-        let record = notify::Record {
+        let message = notify::Message::Notify(notify::Record {
             level: notify::Level::Info,
             key: None,
             link: None,
             msg: "m".into(),
             at: 1,
-        };
-        let reply = send_notify(&daemon, 1, notify::encode(&record).as_bytes());
+        });
+        let reply = send_notify(&daemon, 1, notify::encode(&message).as_bytes());
         assert!(reply.is_empty(), "reply: {reply:?}");
     }
 
@@ -1238,9 +1279,16 @@ mod tests {
             assert!(ok(Command::new("docker").args(["exec", &name, BIN, "notify", "--key", "k", "hello"])));
             let got = rx.recv_timeout(Duration::from_secs(15)).expect("notification delivered");
             assert_eq!(got.instance, "notify-test");
-            assert_eq!(got.record.msg, "hello");
-            assert_eq!(got.record.key.as_deref(), Some("k"));
-            assert_eq!(got.record.level, notify::Level::Info);
+            assert_eq!(
+                got.message,
+                notify::Message::Notify(notify::Record {
+                    level: notify::Level::Info,
+                    key: Some("k".into()),
+                    link: None,
+                    msg: "hello".into(),
+                    at: got.message.at(),
+                })
+            );
             // The daemon deletes the file after reading the `ok` the sink
             // already earned, which races this check: poll briefly.
             let list = format!("ls -A {}", notify::OUTBOX);
@@ -1254,6 +1302,55 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(100));
             }
             assert!(empty, "outbox drained");
+            Ok(())
+        })
+    }
+
+    /// Docker-gated end to end: with no host attached, a second `devsbd thread
+    /// put` for the same key replaces the queued first one, so a dispatcher
+    /// re-asserting its threads for hours doesn't deliver a backlog when a
+    /// dashboard finally opens. A keyed `notify` queued alongside is a log
+    /// entry and survives.
+    #[test_utils::docker_test(helper)]
+    fn coalesces_queued_thread_puts_with_docker() -> Result<(), &'static str> {
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let name = format!("devsandbox-thread-test-{stamp}");
+        let cleanup = || {
+            let _ = Command::new("docker").args(["rm", "-f", &name]).output();
+        };
+        crate::test_support::with_cleanup(cleanup, || {
+            assert!(ok(Command::new("docker").args(["run", "-d", "--name", &name, "alpine:3.20", "sleep", "300"])));
+            let arch = install(&name, None).unwrap();
+            start_daemon(&name);
+
+            // No bridge yet, so nothing can drain: both puts sit in the outbox.
+            let put = |title: &str| {
+                let json = format!(r#"{{"key":"pr-1","title":"{title}","state":"active"}}"#);
+                ok(Command::new("docker").args(["exec", &name, BIN, "thread", "put", "--json", &json]))
+            };
+            assert!(put("first"));
+            assert!(put("second"));
+            assert!(ok(Command::new("docker").args(["exec", &name, BIN, "notify", "--key", "pr-1", "hello"])));
+            let count = format!("ls -A {} | wc -l", notify::OUTBOX);
+            let out = Command::new("docker").args(["exec", &name, "sh", "-c", &count]).output().unwrap();
+            assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "2", "the first put was replaced");
+
+            let (to, rx) = services("thread-test", no_control());
+            let none: Option<fn() -> Option<PathBuf>> = None;
+            let bridge = spawn_with(&name, hash(arch).unwrap(), none, Some(to)).unwrap();
+            assert_eq!(bridge.outcome(Duration::from_secs(10)), Some(Ok(())), "bridge handshake");
+
+            let first = rx.recv_timeout(Duration::from_secs(15)).expect("put delivered");
+            match first.message {
+                notify::Message::ThreadPut { key, body, .. } => {
+                    assert_eq!(key, "pr-1");
+                    assert!(body.contains("second"), "the newest put won: {body}");
+                }
+                other => panic!("expected a thread put, got {other:?}"),
+            }
+            let second = rx.recv_timeout(Duration::from_secs(15)).expect("notify delivered");
+            assert!(matches!(second.message, notify::Message::Notify(_)), "{:?}", second.message);
+            assert!(rx.recv_timeout(Duration::from_secs(2)).is_err(), "exactly one put arrived");
             Ok(())
         })
     }

@@ -170,7 +170,7 @@ mod tests {
         update_at(&path, |i| i.push("a-id".into(), "a".into(), rec("one"), true)).unwrap();
         let loaded = load_at(&path).unwrap();
         assert_eq!(loaded.threads.len(), 1);
-        assert_eq!(loaded.threads[0].head().msg, "one");
+        assert_eq!(loaded.threads[0].head().unwrap().msg, "one");
         assert!(stamp_at(&path).is_some());
     }
 
@@ -216,7 +216,7 @@ mod tests {
         assert_eq!(inbox.threads.len(), 100);
         assert_eq!(inbox.count_for("a-id"), 50);
         assert_eq!(inbox.count_for("b-id"), 50);
-        let mut msgs: Vec<&str> = inbox.threads.iter().map(|t| t.head().msg.as_str()).collect();
+        let mut msgs: Vec<&str> = inbox.threads.iter().map(|t| t.head().unwrap().msg.as_str()).collect();
         msgs.sort_unstable();
         msgs.dedup();
         assert_eq!(msgs.len(), 100, "every push is distinct and present");
@@ -225,6 +225,35 @@ mod tests {
         ids.sort_unstable();
         ids.dedup();
         assert_eq!(ids.len(), 100);
+    }
+
+    /// A dispatcher re-asserting its threads every pass must cost nothing: an
+    /// identical put leaves the file byte for byte as it was, so no dashboard
+    /// polling the mtime even reloads.
+    #[test]
+    fn an_identical_put_does_not_touch_the_file() {
+        use crate::inbox::{State, ThreadPut};
+        let path = tmpdir("idempotent-put").join("inbox.toml");
+        let put = || ThreadPut {
+            key: "pr-1".into(),
+            title: "PR 1".into(),
+            state: State::NeedsYou,
+            status: Some("review".into()),
+            ..ThreadPut::default()
+        };
+        update_at(&path, |i| i.put("web-id", "web", 10, put())).unwrap();
+        let before = stamp_at(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        // Far enough apart that a coarse mtime would still move.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let out = update_at(&path, |i| i.put("web-id", "web", 99, put())).unwrap();
+        assert_eq!(out, crate::inbox::PutOutcome::Unchanged);
+        assert_eq!(stamp_at(&path).unwrap(), before, "no write, no mtime bump");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        // A real change does write.
+        let changed = ThreadPut { status: Some("merged".into()), ..put() };
+        update_at(&path, |i| i.put("web-id", "web", 99, changed)).unwrap();
+        assert_ne!(stamp_at(&path).unwrap(), before);
     }
 
     /// A v1 file on disk is migrated on load and rewritten as v2 by the next
@@ -239,7 +268,7 @@ mod tests {
         .unwrap();
         let inbox = load_at(&path).unwrap();
         assert_eq!(inbox.threads[0].owner_name, "web");
-        assert_eq!(inbox.threads[0].head().msg, "hi");
+        assert_eq!(inbox.threads[0].head().unwrap().msg, "hi");
         update_at(&path, |_| {}).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("version = 2"), "{text}");

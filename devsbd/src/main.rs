@@ -5,6 +5,7 @@ mod boot;
 mod bridge;
 mod ctl;
 mod daemon;
+mod json;
 mod outbox;
 mod runs;
 
@@ -48,6 +49,7 @@ fn main() {
         Some("bridge") => exit_on_err(bridge::run(&build_hash())),
         Some("boot") => exit_on_err(boot::run()),
         Some("notify") => exit_on_err(outbox::run(&args.collect::<Vec<_>>())),
+        Some("thread") => exit_on_err(outbox::thread(&args.collect::<Vec<_>>())),
         Some(verb @ ("ensure" | "ls" | "branches" | "stop" | "rm" | "exec")) => {
             std::process::exit(ctl::run(verb, &args.collect::<Vec<_>>()))
         }
@@ -57,7 +59,9 @@ fn main() {
             std::process::exit(code)
         }
         _ => {
-            eprintln!("usage: devsbd version|daemon|bridge|boot|notify|ensure|ls|branches|stop|rm|exec|run");
+            eprintln!(
+                "usage: devsbd version|daemon|bridge|boot|notify|thread|ensure|ls|branches|stop|rm|exec|run"
+            );
             std::process::exit(2);
         }
     }

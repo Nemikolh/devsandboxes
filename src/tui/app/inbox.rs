@@ -17,7 +17,7 @@
 use std::collections::BTreeSet;
 
 use crate::devsbd::notify::Record;
-use crate::inbox::{Inbox, Op, Thread};
+use crate::inbox::{is_url, Inbox, Op, Thread};
 
 use super::{App, Tab};
 
@@ -142,26 +142,21 @@ impl InboxView {
     }
 }
 
-/// Whether `link` is an `http(s)://` URL. The link comes from inside the
-/// container and ends up as the opener's argv, so only web links pass: no
-/// bare paths, no leading `-` (an option to `xdg-open`/`open`), and no
-/// `file:` or custom schemes that would hand the container a host handler.
-fn is_url(link: &str) -> bool {
-    ["http://", "https://"]
-        .iter()
-        .any(|p| link.len() > p.len() && link[..p.len()].eq_ignore_ascii_case(p))
-}
-
 impl App {
     /// Install Inbox content loaded from the store (startup and every reload),
     /// keeping the cursor on the row it was on. A cursor on the top row stays
     /// on top (the newest); one moved down stays on its row, wherever that
     /// moved to.
-    pub fn set_inbox(&mut self, inbox: Inbox) {
+    pub fn set_inbox(&mut self, mut inbox: Inbox) {
         let selected = match self.selected[Tab::Inbox.index()] {
             0 => None,
             _ => self.selected_inbox_row_id(),
         };
+        // Archived threads (their instance is gone) stay in the store as
+        // history but are out of the live list; step 4 adds the All view that
+        // shows them. Dropping them from the view copy keeps every row index
+        // and every `Op` id consistent with what is on screen.
+        inbox.threads.retain(|t| !t.archived);
         self.inbox.content = inbox;
         self.reselect_inbox(selected);
         // A record arriving while the Inbox is shown counts as seen.
@@ -214,11 +209,21 @@ impl App {
     pub fn selected_inbox_record(&self) -> Option<(&Thread, &Record)> {
         match self.selected_inbox_row()? {
             InboxRow::Group(_) => None,
-            InboxRow::Thread(i) => self.inbox.threads().get(i).map(|t| (t, t.head())),
+            // A dispatcher thread has no records at all; its fields and
+            // timeline are read off the `Thread` itself.
+            InboxRow::Thread(i) => self.inbox.threads().get(i).and_then(|t| Some((t, t.head()?))),
             InboxRow::History { thread, note } => {
                 let t = self.inbox.threads().get(thread)?;
                 Some((t, &t.notes.get(note)?.record))
             }
+        }
+    }
+
+    /// The thread under the Inbox cursor (a head row), whatever its kind.
+    pub fn selected_inbox_thread(&self) -> Option<&Thread> {
+        match self.selected_inbox_row()? {
+            InboxRow::Thread(i) => self.inbox.threads().get(i),
+            _ => None,
         }
     }
 
@@ -441,7 +446,7 @@ mod tests {
         app.inbox
             .threads()
             .iter()
-            .map(|t| (t.owner_name.as_str(), t.head().msg.as_str()))
+            .map(|t| (t.owner_name.as_str(), t.head().unwrap().msg.as_str()))
             .collect()
     }
 
@@ -452,7 +457,7 @@ mod tests {
             .iter()
             .map(|r| match r {
                 InboxRow::Group(owner) => format!("[{}]", app.inbox.owner_name(owner)),
-                InboxRow::Thread(i) => app.inbox.threads()[*i].head().msg.clone(),
+                InboxRow::Thread(i) => app.inbox.threads()[*i].head().unwrap().msg.clone(),
                 InboxRow::History { thread, note } => {
                     format!("  {}", app.inbox.threads()[*thread].notes[*note].record.msg)
                 }

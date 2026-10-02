@@ -123,6 +123,22 @@ pub fn valid_run_id(id: &str) -> bool {
         && b[11..].iter().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(c))
 }
 
+/// Longest accepted child/thread key (the charset is checked by [`valid_key`]).
+pub const MAX_KEY: usize = 40;
+
+/// `[a-z0-9][a-z0-9-]{0,39}`: always a valid tail for an instance name, a
+/// container name (`devsandbox-<sandbox>-<key>`), and a path segment
+/// (`.worktrees/<id>`). It lives here rather than in `commands::dispatch`
+/// because the helper checks `devsbd thread put|rm` keys before queuing them,
+/// and the two sides must agree on what a key is.
+pub fn valid_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    let lower_alnum = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit();
+    key.len() <= MAX_KEY
+        && chars.next().is_some_and(lower_alnum)
+        && chars.all(|c| lower_alnum(c) || c == '-')
+}
+
 /// Longest branch name [`valid_branch`] accepts.
 pub const MAX_BRANCH: usize = 200;
 
@@ -629,6 +645,16 @@ keep 5\n";
         for bad in ["", "1790000000-A1B2", "1790000000-a1b", "179000000-a1b2c", "1790000000_a1b2",
                     "../../../etc-x", "1790000000-g1b2", "1790000000-a1b2 "] {
             assert!(!valid_run_id(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn keys() {
+        for good in ["a", "0", "pr-123", "a-", &"x".repeat(MAX_KEY)] {
+            assert!(valid_key(good), "{good}");
+        }
+        for bad in ["", "-a", "PR-1", "a_b", "a.b", "a/b", "a b", "é", &"x".repeat(MAX_KEY + 1)] {
+            assert!(!valid_key(bad), "{bad}");
         }
     }
 

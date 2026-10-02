@@ -560,14 +560,21 @@ fn flush(dir: &Path, bridges: &Bridges, ids: &AtomicU32, timeout: Duration) -> u
                 let _ = outbox::move_aside(&path);
                 continue;
             }
+            // Gone since `pending` listed it: `devsbd thread put` coalesces its
+            // key's pending files (outbox::enqueue_thread) and queues a newer
+            // one, so this is routine, not a reason to stall the queue.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
             Err(_) => break,
         };
         if send_record(&mux, next_stream_id(ids), &record, timeout).is_err() {
             break;
         }
         // Delivered but undeletable would resend it forever; stop instead.
-        if fs::remove_file(&path).is_err() {
-            break;
+        // Already gone (coalesced mid-send) is fine: it won't be resent.
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => break,
         }
         sent += 1;
     }
@@ -832,8 +839,14 @@ mod tests {
         rx
     }
 
-    fn record(at: u64, msg: &str) -> notify::Record {
-        notify::Record { level: notify::Level::Info, key: None, link: None, msg: msg.into(), at }
+    fn record(at: u64, msg: &str) -> notify::Message {
+        notify::Message::Notify(notify::Record {
+            level: notify::Level::Info,
+            key: None,
+            link: None,
+            msg: msg.into(),
+            at,
+        })
     }
 
     /// Wait (bounded) for the host's `Caps` to land, so `flush`'s zero-hold
