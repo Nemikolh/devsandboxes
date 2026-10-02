@@ -2,13 +2,31 @@
 
 ## Unreleased
 
+The config file is now `devsandboxes.toml`, and it can be written in YAML too; an existing `config.toml` is renamed for you. Extra `folders` get their own worktree when someone else owns the checkout, `rm --force` clears out stuck instances, dispatchers can see which branches are in use, and the dashboard opens instantly and keeps its Inbox across restarts while putting far less load on dockerd.
+
 ### Added
 
 - **YAML configs.** `devsandboxes.yaml` (or `.yml`) works in place of `devsandboxes.toml`: same keys, `extends` merging and validation, only the syntax differs. A sandbox hashes the same in either format, so converting a config doesn't mark instances for rebuild. Keep one config file per config dir; with more than one, devsandbox stops with an error.
 
+```yaml
+sandbox:
+  web:
+    folder: ../web
+    image: mcr.microsoft.com/devcontainers/base:ubuntu
+    services: [database]
+```
+
 - **`devsbd branches <sandbox>` tells a dispatcher which branches are already checked out.** It prints a JSON list of every branch in a worktree of the sandbox's repo and who holds it: one of the dispatcher's own children, another instance, the base checkout, or a worktree devsandbox doesn't know. It reads git on the host each time, so a `git switch` inside an instance is seen. With `--ahead`, each row also gets the number of commits `origin` doesn't have yet, and local branches that are ahead but not checked out are listed too. A dispatcher can use it to leave alone PRs that someone is working on locally. The sandbox must be in the dispatcher's `spawn`. Running dispatchers pick up the new helper when restarted.
 
+```bash
+devsbd branches web --ahead
+```
+
 - **`rm --force` (`-f`) removes an instance whatever state it's in.** A worktree with uncommitted or untracked changes is removed anyway, changes discarded, instead of `rm` refusing. A step that fails (a worktree git won't remove, a repo the host refuses to run git in) prints a warning and `rm` carries on, so the instance still leaves the list. Whatever couldn't be removed stays on disk. The branch of a worktree that was left in place is kept. In the dashboard: `:rm --force <instance>`. npm: `rm(name, { force: true })`.
+
+```bash
+devsandbox rm --force web-2
+```
 
 - **The dashboard's Instances tree has a TYPE column when a sandbox is a dispatcher.** Instances of a dispatcher sandbox read `dispatcher`, the others `-`. Without any dispatcher in the config the column isn't shown.
 
@@ -41,6 +59,53 @@ folders = { "/workspaces/api" = "../api", "/workspaces/.shared" = { path = "../.
 - **Listing containers no longer makes dockerd compute their disk sizes.** Every `ls`, `ps`, `gc`, autostart pass and dashboard refresh asked for container sizes as a side effect of the output format, which spiked dockerd's CPU every 2s while the dashboard was open and made each listing take ~300ms instead of ~20ms.
 
 - **Opening VS Code no longer clears an instance's extensions.** `devsandbox vscode` and the dashboard's `o` read the sandbox config from the current directory, not from the instance's own config directory. Run from anywhere else, the extensions list was rewritten as empty, so VS Code didn't install anything. They now read the instance's own config. If that config still can't be read, the list is left as it was. Instances already hit by this get their list back the next time you open VS Code from the new version.
+
+- **An `rm` that failed partway can be retried.** A worktree an earlier `rm` had already removed made the next `rm` fail too; it is now pruned instead.
+
+- **The dashboard no longer warns about mount sources `run` creates itself.** `shared-volumes` paths and per-instance mount sources that don't exist yet are made by `run`, so a sandbox with no instance no longer shows them as problems.
+
+- **VS Code labels the primary workspace root by its folder name**, matching the extra `folders` roots, instead of the instance name.
+
+<details><summary>Commits</summary>
+
+- 3a63926 feat(config): read devsandboxes.toml (or .yaml/.yml) and rename a legacy config.toml, so the config file is recognizable on its own and can be written in yaml
+- b25563f feat(tui): show inbox times as how long ago, then date and time after a week, so older notifications don't pass for today's
+- 16e793a feat(tui): accept --force on the :rm prompt so the dashboard can remove instances the cli's rm --force can
+- 2b0bb63 feat(npm): let rm pass --force so node callers can remove instances with uncommitted changes or failed teardown steps
+- 647b127 feat(rm): add --force so an instance can be removed despite uncommitted worktree changes or failed teardown steps
+- aa50d82 docs(changelog): note the dashboard startup, dockerd load and type column changes
+- 3aacc06 perf(tui): collect stats every 7s, ask the runtime version once and fetch processes only on the instances tab to cut idle dockerd load
+- bff0cf7 perf(docker): list containers with an explicit ps template so the cli stops asking dockerd to compute every container's disk size
+- fe376b0 perf(tui): render the tree from state and config before asking the runtime, and read instance drift from ps labels instead of two inspects per instance
+- 376bdb6 fix(tui): show the tree right away on startup instead of a false 'no sandboxes' message while docker stats samples
+- 092958d fix(tui): size the services column to its content when type is shown so the type column sits beside it, not at the far edge
+- 8dcbfd2 fix(tui): stop warning about shared-volumes and per-instance mount sources that run creates before any instance exists
+- b0ad91f feat(tui): add a type column to the instances tree so dispatcher instances stand out from the ones they spawn
+- e7239b9 fix: update changelog and cleanup plan
+- 20d8f6a docs(dispatch): document devsbd branches in the automations guide, design and changelog so dispatcher authors know to check branch holders before acting
+- f2a9e43 feat(devsbd): expose the branches op as devsbd branches <sandbox> [--ahead] so dispatcher scripts can call it
+- 985f9ef feat(dispatch): add a read-only branches control op so a dispatcher can see which branches are checked out, and unpushed, before touching a PR
+- 1a723d4 docs(dispatcher): plan a devsbd branches op so dispatchers can tell which branches are in use
+- 2a485c4 fix(vscode): resolve extensions from the instance's config root and keep the registered ones when it can't be resolved, so opening from another directory no longer wipes them
+- 11081b9 feat(tui): persist the inbox and thread keyed notifications per instance
+- f655b58 fix(vscode): label the primary workspace root by its directory name, so it matches the extra folders instead of showing the instance name
+- 3975498 fix(rm): prune instead of remove a worktree a previous rm already removed, so an rm that failed later can be retried
+- deb0e1a fix(config): hash folders tables that restate the default like the plain string, so moving an entry to the table form isn't drift
+- c2acba2 docs(folders): document per-entry worktrees in the run design doc and changelog so the release notes explain the new default and the never opt-out
+- f756796 feat(rm): remove an instance's folders worktrees too, before the primary so an interrupted rm can be retried
+- 756df51 feat(run): give folders entries a detached worktree when another sandbox owns or already mounts the checkout, so its branch can't shift underneath the instance
+- 435549b feat(run): record folders mounts and decide per entry who owns the live checkout, so a direct extra mount also reserves it from other instances
+- 878e1e7 feat(config): accept { path, worktree } folders entries so each extra folder can opt in or out of its own worktree
+- 0997d43 fix(worktree): stop migrating old per-sandbox worktree-link stores, since moving the copy left every other instance's links dangling; old links are now reported for a manual move
+- 0467ffb docs(readme): lead with a theme-aware logo and a short pitch pointing at the docs site
+- c8be397 fix(site): space pages that open on prose from the article divider
+- b72fa8d docs(site): install skills via skills.sh in the quick start, style the agent prompt outside examples
+- 78d0afd docs(site): lead the quick start with the agent, move the cli walkthrough to going further
+- 61b2cdb chore(skills): hide repo-only skills from npx skills add
+- e750396 fix(site): center diagram arrowheads on their lines
+- 5ffe39b feat(site): pitch the CLI as low-level local tooling on the landing page, so readers see devsandbox can replace docker compose for agent-built stacks
+
+</details>
 
 ## 0.5.0
 
