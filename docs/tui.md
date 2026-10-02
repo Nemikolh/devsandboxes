@@ -255,6 +255,19 @@ notify thread, its earlier records); `N events waiting for <sender>` until
 the dispatcher acks them; the numbered actions (`⌂ host` runs in the
 dashboard, `→ <sender>` sends an event, `✓ done`).
 
+**Markdown.** Dispatcher text is often LLM output, so the pane renders it
+(`src/tui/markdown.rs`, `pulldown-cmark`): the message and notify bodies as
+blocks (bold accented headings, emphasis, tinted inline code and code
+blocks, bullet/numbered lists with hanging indents, `│` quotes, dim rules,
+links as underlined text plus a dim `(url)`, raw HTML literal, images as
+their alt text, tables as their source lines); the title, status, timeline
+rows and the cards' title/status inline only (code, emphasis, links as text,
+one line). Every pane line is word-wrapped by display width by the renderer
+itself, so the scroll bound is the exact row count. `m` shows the source
+instead (pane title `Thread · raw`), for every thread, this session only.
+Container text has its control characters stripped when stored
+(`inbox::sanitize`, in `Inbox::apply_sink`) and again when drawn.
+
 | key | does |
 |---|---|
 | `esc` | back to the list |
@@ -265,6 +278,7 @@ dashboard, `→ <sender>` sends an event, `✓ done`).
 | `r`/`i` | focus the reply input, when the thread takes replies; otherwise a status hint and focus stays |
 | `d` | mark done: an event, and the child marked done |
 | `u` | reopen a done thread: back to `active`, an event, and the child's done mark cleared |
+| `m` | toggle rendered markdown / raw source (all threads, not saved) |
 
 **The reply input** sits at the bottom of the thread pane, three rows, and is
 only drawn when the thread sets `reply` (`draw_inbox_pane`/`draw_reply_input`,

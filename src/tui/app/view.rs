@@ -62,6 +62,7 @@ Inbox thread (shadows the dashboard keys while focused)
   d / u       mark done / reopen (each also an event for the dispatcher;
               also marks / clears the thread's child done)
   o t l p     as in the list
+  m           markdown: rendered / raw source (every thread, this session)
   esc         back to the list     q quit   : prompt   ? help
 Inbox reply input
   enter       send (the input stays, empty, for the next message)

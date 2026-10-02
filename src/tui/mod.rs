@@ -9,6 +9,7 @@ mod data;
 #[cfg(unix)]
 mod forwards;
 mod kitty;
+mod markdown;
 mod procs;
 mod prompt;
 mod spec;

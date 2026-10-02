@@ -185,6 +185,8 @@ devsbd thread ls
 | `actions` | no | buttons, numbered `1`–`9` in the pane | at most 9 |
 | `reply` | no | `{ "placeholder": "…" }` (placeholder optional): allow free-text replies | placeholder 100 bytes |
 
+The `message` (and a `notify` body) is rendered as markdown in the thread pane; `title` and `status` take inline markdown (code, emphasis, links). Control characters in anything a container sends are stripped before it's stored.
+
 Each action:
 
 | field | meaning | limit |

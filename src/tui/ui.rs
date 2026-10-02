@@ -18,12 +18,13 @@ use super::data::{
     ServiceRow, Snapshot,
 };
 use super::procs::{is_agent, ProcState, MESSAGE_ROW};
+use super::markdown;
 use super::prompt::Prompt;
 use crate::devsbd::notify::Level;
 use crate::inbox::{Kind, State};
 use crate::render::JsonLine;
 
-const ACCENT: Color = Color::Rgb(175, 135, 255);
+pub(super) const ACCENT: Color = Color::Rgb(175, 135, 255);
 const SELECTION: Color = Color::Rgb(0, 215, 135);
 
 pub fn draw(frame: &mut Frame, app: &App) {
@@ -717,21 +718,31 @@ fn restyle(parts: &[(String, Style)], fitted: &str) -> Vec<Span<'static>> {
     out
 }
 
-/// A card's state chip: a dispatcher thread's state (its status while
-/// active), or a notify record's level.
-fn chip(t: &Thread) -> (String, Style) {
+/// A card's state chip, as styled parts: a dispatcher thread's state (its
+/// status while active, as inline markdown), or a notify record's level.
+fn chip(t: &Thread) -> Vec<(String, Style)> {
     let dim = Style::default().add_modifier(Modifier::DIM);
+    let one = |text: &str, style: Style| vec![(text.to_string(), style)];
     match (t.kind, t.state, t.head().map(|r| r.level)) {
-        (Kind::Thread, Some(State::NeedsYou), _) => ("● needs you".into(), state_style(State::NeedsYou)),
-        (Kind::Thread, Some(State::Done), _) => ("✓ done".into(), state_style(State::Done)),
+        (Kind::Thread, Some(State::NeedsYou), _) => one("● needs you", state_style(State::NeedsYou)),
+        (Kind::Thread, Some(State::Done), _) => one("✓ done", state_style(State::Done)),
         (Kind::Thread, _, _) => {
-            let status = t.status.as_deref().map(str::trim).filter(|s| !s.is_empty()).unwrap_or("active");
-            (format!("○ {}", status.lines().next().unwrap_or(status)), state_style(State::Active))
+            let style = state_style(State::Active);
+            let status = t.status.as_deref().map(markdown::inline_spans).filter(|s| !s.is_empty());
+            let Some(status) = status else { return one("○ active", style) };
+            let mut parts = one("○ ", style);
+            parts.extend(styled_parts(status, style));
+            parts
         }
-        (Kind::Notify, _, Some(Level::Error)) => ("✖ error".into(), level_style(Level::Error)),
-        (Kind::Notify, _, Some(Level::Warn)) => ("▲ warn".into(), level_style(Level::Warn)),
-        (Kind::Notify, _, _) => ("· info".into(), dim),
+        (Kind::Notify, _, Some(Level::Error)) => one("✖ error", level_style(Level::Error)),
+        (Kind::Notify, _, Some(Level::Warn)) => one("▲ warn", level_style(Level::Warn)),
+        (Kind::Notify, _, _) => one("· info", dim),
     }
+}
+
+/// Inline-markdown `spans` as [`card_line`] parts, each on `base`.
+fn styled_parts(spans: Vec<Span<'static>>, base: Style) -> Vec<(String, Style)> {
+    spans.into_iter().map(|s| (s.content.into_owned(), base.patch(s.style))).collect()
 }
 
 /// Background of the selected card. A mid-dark gray, paired with an explicit
@@ -785,14 +796,14 @@ fn card_lines(t: &Thread, width: usize, selected: bool, focused: bool, now: u64,
     let dim = Style::default().add_modifier(Modifier::DIM);
     let fade = |s: Style| if t.archived { s.add_modifier(Modifier::DIM) } else { s };
     let title_style = if t.unread { Style::default().add_modifier(Modifier::BOLD) } else { Style::default() };
-    let mut title = vec![(title_of(t).lines().next().unwrap_or("").to_string(), fade(title_style))];
+    let mut title = styled_parts(markdown::inline_spans(&title_of(t)), fade(title_style));
     if t.link.is_some() || t.head().is_some_and(|r| r.link.is_some()) {
         title.push((" ↗".into(), fade(Style::default().fg(Color::Blue))));
     }
     if t.archived {
         title.push((" · archived".into(), dim));
     }
-    let (chip, chip_style) = chip(t);
+    let chip: Vec<(String, Style)> = chip(t).into_iter().map(|(s, style)| (s, fade(style))).collect();
     let age = (short_age(t.changed_at(), now, utc_offset), dim);
     let from = (t.owner_name.clone(), dim);
     let (bar, base) = if selected {
@@ -803,7 +814,7 @@ fn card_lines(t: &Thread, width: usize, selected: bool, focused: bool, now: u64,
     };
     [
         card_line(&title, age, width, bar, base),
-        card_line(&[(chip, fade(chip_style))], from, width, bar, base),
+        card_line(&chip, from, width, bar, base),
     ]
 }
 
@@ -1053,43 +1064,42 @@ fn state_style(state: State) -> Style {
 
 fn tone_style(tone: Tone) -> Style {
     match tone {
-        Tone::Plain => Style::default(),
+        Tone::Plain | Tone::Text | Tone::Markdown => Style::default(),
         Tone::Dim => Style::default().add_modifier(Modifier::DIM),
-        Tone::Bold => Style::default().add_modifier(Modifier::BOLD),
+        Tone::Bold | Tone::Title => Style::default().add_modifier(Modifier::BOLD),
         Tone::Link => Style::default().fg(Color::Blue),
         Tone::State(s) => state_style(s),
         Tone::Level(l) => level_style(l),
     }
 }
 
-/// Hard-wrap one pane line at `width` columns, so the pane knows exactly how
-/// many rows it renders and can bound its scroll. By char, not display width:
-/// the pane is mostly ASCII, and a wide glyph only costs a clipped cell.
-fn wrap_pane_line(line: &PaneLine, width: usize) -> Vec<Line<'static>> {
-    let width = width.max(1);
-    let mut out = Vec::new();
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut used = 0;
+/// One pane line as the rows it takes at `width` columns. The pane draws
+/// exactly these rows (no `Paragraph` wrap), so their count is what bounds
+/// its scroll. A [`Tone::Markdown`] line is a whole document, rendered as
+/// blocks; elsewhere [`Tone::Text`]/[`Tone::Title`] segments are inline
+/// markdown on their tone's style, the rest plain; then the line is word
+/// wrapped by display width. `raw` (`m`) shows the markdown as its source.
+/// Every segment is sanitized: it may be stored text from before the
+/// apply-boundary pass.
+fn pane_rows(line: &PaneLine, width: u16, raw: bool) -> Vec<Line<'static>> {
+    if let [(Tone::Markdown, md)] = line.as_slice() {
+        return if raw { markdown::raw(md, width) } else { markdown::render(md, width) };
+    }
+    let mut spans = Vec::new();
     for (tone, text) in line {
-        let style = tone_style(*tone);
-        let mut buf = String::new();
-        for ch in text.chars() {
-            if used == width {
-                if !buf.is_empty() {
-                    spans.push(Span::styled(std::mem::take(&mut buf), style));
-                }
-                out.push(Line::from(std::mem::take(&mut spans)));
-                used = 0;
-            }
-            buf.push(ch);
-            used += 1;
-        }
-        if !buf.is_empty() {
-            spans.push(Span::styled(buf, style));
+        let base = tone_style(*tone);
+        match tone {
+            Tone::Text | Tone::Title | Tone::Markdown if !raw => spans.extend(
+                markdown::inline_spans(text).into_iter().map(|s| {
+                    let style = base.patch(s.style);
+                    s.style(style)
+                }),
+            ),
+            Tone::Text | Tone::Title | Tone::Markdown => spans.push(Span::styled(markdown::fold(text), base)),
+            _ => spans.push(Span::styled(crate::inbox::sanitize(text), base)),
         }
     }
-    out.push(Line::from(spans));
-    out
+    markdown::wrap(&spans, width as usize, &[], &[], false)
 }
 
 /// The thread pane: the selected thread's content, then its input (a thread
@@ -1102,7 +1112,7 @@ fn draw_inbox_pane(frame: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(zone_border_style(app, InboxFocus::Thread))
-        .title(" Thread ");
+        .title(if app.inbox.raw { " Thread · raw " } else { " Thread " });
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let dim = Style::default().add_modifier(Modifier::DIM);
@@ -1116,7 +1126,7 @@ fn draw_inbox_pane(frame: &mut Frame, app: &App, area: Rect) {
     let child = app.thread_child(t);
     let lines: Vec<Line> = pane_lines(t, child.as_ref(), app.utc_offset)
         .iter()
-        .flat_map(|l| wrap_pane_line(l, content.width as usize))
+        .flat_map(|l| pane_rows(l, content.width, app.inbox.raw))
         .collect();
     let rows = lines.len().min(u16::MAX as usize) as u16;
     let max = rows.saturating_sub(content.height);
@@ -1807,7 +1817,7 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
                         .to_string()
                 }
                 InboxFocus::Thread => {
-                    "esc list · ↑↓ scroll · enter open link · 1-9 actions · r reply · d done · u reopen · o vscode · t term · l logs · p forward · q quit · ? help".to_string()
+                    "esc list · ↑↓ scroll · enter open link · 1-9 actions · r reply · d done · u reopen · o vscode · t term · l logs · p forward · m raw · q quit · ? help".to_string()
                 }
                 InboxFocus::Input => {
                     "enter send · esc back to thread · ←→ home end edit · ctrl-u clear · ctrl-w delete word"
@@ -2238,7 +2248,7 @@ mod tests {
 
     #[test]
     fn chip_per_kind_state_and_level() {
-        let c = |t: &Thread| chip(t).0;
+        let c = |t: &Thread| chip(t).into_iter().map(|(s, _)| s).collect::<String>();
         assert_eq!(c(&dthread("t", State::NeedsYou, Some("x"))), "● needs you");
         assert_eq!(c(&dthread("t", State::Active, Some("running ci"))), "○ running ci");
         assert_eq!(c(&dthread("t", State::Active, None)), "○ active");
@@ -2247,8 +2257,12 @@ mod tests {
         assert_eq!(c(&note("m", Level::Warn, 0)), "▲ warn");
         assert_eq!(c(&note("m", Level::Error, 0)), "✖ error");
         assert_eq!(c(&note("m", Level::Info, 0)), "· info");
-        assert_eq!(chip(&dthread("t", State::NeedsYou, None)).1.fg, Some(Color::Yellow));
-        assert_eq!(chip(&note("m", Level::Error, 0)).1.fg, Some(Color::Red));
+        assert_eq!(chip(&dthread("t", State::NeedsYou, None))[0].1.fg, Some(Color::Yellow));
+        assert_eq!(chip(&note("m", Level::Error, 0))[0].1.fg, Some(Color::Red));
+        // A status is inline markdown.
+        let parts = chip(&dthread("t", State::Active, Some("run `ci`\nnext")));
+        assert_eq!(parts.iter().map(|(s, _)| s.as_str()).collect::<String>(), "○ run ci next");
+        assert_eq!(parts.iter().find(|(s, _)| s == "ci").unwrap().1.bg, markdown::CODE.bg);
     }
 
     #[test]
@@ -2460,6 +2474,143 @@ mod tests {
             assert_eq!(inbox_hit(&app, frame, 60, row), Some(InboxHit::Input), "row {row}");
         }
         assert_eq!(inbox_hit(&app, frame, 60, top - 1), Some(InboxHit::Thread));
+    }
+
+    const LLM_MESSAGE: &str = "## Review summary
+
+I checked **4 comments** from Greptile:
+
+- `parse_port` overflows on `0`
+- the retry loop never backs off
+  - nested: also in `connect`
+
+```rust
+fn parse(s: &str) -> u16 {
+\ts.parse().unwrap()
+}
+```
+
+> CI is green on the branch.
+
+See [PR 6900](https://github.com/o/r/pull/6900).";
+
+    /// The Inbox showing one thread with `message`, its pane focused.
+    fn message_app(message: &str) -> App {
+        let mut t = dthread("#6900 fix `parse_port`", State::NeedsYou, Some("review **drafts**"));
+        t.id = 1;
+        t.owner = "bab-disp-id".into();
+        t.message = Some(message.into());
+        let mut inbox = Inbox::default();
+        inbox.threads = vec![t];
+        let mut app = App::new(PathBuf::from("/tmp"));
+        app.set_inbox(inbox);
+        app.on_key(KeyEvent::from(KeyCode::Char('4')));
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        app
+    }
+
+    fn draw_buffer(app: &App, w: u16, h: u16) -> ratatui::buffer::Buffer {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| draw(f, app)).unwrap();
+        term.backend().buffer().clone()
+    }
+
+    fn rows_of(buf: &ratatui::buffer::Buffer) -> Vec<String> {
+        let a = buf.area;
+        (0..a.height).map(|y| (0..a.width).map(|x| buf[(x, y)].symbol().to_string()).collect()).collect()
+    }
+
+    /// Where `needle` starts on screen, as a cell position (wide-glyph-free
+    /// rows, so a char index is a column).
+    fn find_cell(rows: &[String], needle: &str) -> (u16, u16) {
+        let y = rows.iter().position(|r| r.contains(needle)).unwrap_or_else(|| panic!("{needle}:\n{}", rows.join("\n")));
+        let x = rows[y][..rows[y].find(needle).unwrap()].chars().count();
+        (x as u16, y as u16)
+    }
+
+    #[test]
+    fn thread_pane_renders_a_typical_llm_message() {
+        let app = message_app(LLM_MESSAGE);
+        let buf = draw_buffer(&app, 100, 34);
+        let rows = rows_of(&buf);
+        if std::env::var_os("SHOW_INBOX").is_some() {
+            println!("{}", rows.join("\n"));
+        }
+        let screen = rows.join("\n");
+        for gone in ["##", "**", "```", "`parse_port`", "](https"] {
+            assert!(!screen.contains(gone), "{gone} in\n{screen}");
+        }
+        let style = |needle: &str| buf[find_cell(&rows, needle)].style();
+        let heading = style("Review summary");
+        assert_eq!((heading.fg, heading.add_modifier.contains(Modifier::BOLD)), (Some(ACCENT), true));
+        assert!(style("4 comments").add_modifier.contains(Modifier::BOLD));
+        assert_eq!(style("parse_port overflows").bg, markdown::CODE.bg);
+        assert!(screen.contains("• parse_port overflows on 0"), "{screen}");
+        assert!(screen.contains("  • nested: also in connect"), "{screen}");
+        // The code block: tinted, its tab expanded, padded across the pane.
+        let (x, y) = find_cell(&rows, "fn parse(s: &str)");
+        assert_eq!(buf[(x, y)].style().bg, markdown::CODE.bg);
+        assert!(rows[y as usize + 1].contains("    s.parse().unwrap()"), "{screen}");
+        assert_eq!(buf[(98 - 1, y)].style().bg, markdown::CODE.bg, "padded to the pane's inner edge");
+        assert!(screen.contains("│ CI is green on the branch."), "{screen}");
+        assert!(style("PR 6900").add_modifier.contains(Modifier::UNDERLINED));
+        assert!(screen.contains("See PR 6900 (https://github.com/o/r/pull/6900)."), "{screen}");
+        // Title and status are inline markdown too (the status only shows in
+        // the pane; the title also on the card, left of column 40).
+        assert!(style("drafts").add_modifier.contains(Modifier::BOLD));
+        let y = rows.iter().position(|r| r.chars().skip(40).collect::<String>().contains("#6900 fix parse_port")).unwrap();
+        let x = 40 + rows[y].chars().skip(40).collect::<String>().find("parse_port").unwrap() as u16;
+        assert_eq!(buf[(x, y as u16)].style().bg, markdown::CODE.bg);
+    }
+
+    #[test]
+    fn m_toggles_the_raw_source() {
+        let mut app = message_app(LLM_MESSAGE);
+        app.on_key(KeyEvent::from(KeyCode::Char('m')));
+        assert!(app.inbox.raw);
+        let screen = render(&app, 100, 34);
+        assert!(screen.contains("╭ Thread · raw "), "{screen}");
+        assert!(screen.contains("## Review summary"), "{screen}");
+        assert!(screen.contains("I checked **4 comments** from Greptile:"), "{screen}");
+        assert!(screen.contains("```rust"), "{screen}");
+        assert!(screen.contains("review **drafts**"), "{screen}");
+        app.on_key(KeyEvent::from(KeyCode::Char('m')));
+        assert!(!render(&app, 100, 34).contains("```rust"));
+    }
+
+    /// The scroll bound is the rows drawn: scrolled to the bottom, the last
+    /// line sits on the pane's last content row, right above the hint.
+    #[test]
+    fn the_pane_scroll_bound_is_exact() {
+        let long: String = (1..=40).map(|i| format!("- item {i} with a few words to wrap\n")).collect();
+        let mut app = message_app(&format!("{long}\nTHE END"));
+        // Draw once so the bound is known, then jump to the bottom.
+        render(&app, 80, 24);
+        app.on_key(KeyEvent::from(KeyCode::Char('G')));
+        let rows: Vec<String> = render(&app, 80, 24).lines().map(str::to_string).collect();
+        let (_, end) = find_cell(&rows, "THE END");
+        let (_, hint) = find_cell(&rows, "this thread takes no replies");
+        assert_eq!(end + 1, hint, "{}", rows.join("\n"));
+        // One more line down is not possible.
+        let scroll = app.inbox.scroll;
+        app.on_key(KeyEvent::from(KeyCode::Down));
+        assert_eq!(app.inbox.scroll, scroll);
+    }
+
+    #[test]
+    fn a_card_title_renders_inline_code_without_backticks() {
+        let mut t = dthread("fix `parse_port` *now*", State::NeedsYou, None);
+        t.updated_at = 1000;
+        let [l1, _] = card_lines(&t, 40, false, true, 1000, 0);
+        assert!(text(&l1).starts_with(" fix parse_port now  ") && text(&l1).ends_with(" now "), "{l1:?}");
+        assert_eq!(l1.width(), 40);
+        let code = l1.spans.iter().find(|s| s.content == "parse_port").unwrap();
+        assert_eq!(code.style.bg, markdown::CODE.bg);
+        assert!(l1.spans.iter().find(|s| s.content == "now").unwrap().style.add_modifier.contains(Modifier::ITALIC));
+        // Truncated, the code keeps its tint up to the `…`.
+        let [cut, _] = card_lines(&t, 12, false, true, 1000, 0);
+        assert_eq!(text(&cut), " fix parse… ");
+        assert_eq!(cut.spans.iter().find(|s| s.content == "parse…").unwrap().style.bg, markdown::CODE.bg);
     }
 
     #[test]

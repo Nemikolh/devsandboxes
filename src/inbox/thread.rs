@@ -249,8 +249,10 @@ fn check_text(field: &str, value: &str, max: usize) -> Result<(), String> {
     if value.len() > max {
         return Err(format!("`{field}` is longer than {max} bytes"));
     }
-    // Control characters other than newline would corrupt a terminal row.
-    if value.chars().any(|c| c.is_control() && c != '\n') {
+    // Control characters would corrupt a terminal row. Tabs and CRs are
+    // allowed: `sanitize` expands/normalizes them right after, and LLM code
+    // blocks are often tab-indented or CRLF.
+    if value.chars().any(|c| c.is_control() && !matches!(c, '\n' | '\t' | '\r')) {
         return Err(format!("`{field}` contains a control character"));
     }
     Ok(())
@@ -405,6 +407,9 @@ mod tests {
         let err = parse(&put(&format!(r#","actions":[{}]"#, actions.join(",")))).unwrap_err();
         assert!(err.contains("at most 9 allowed"), "{err}");
         assert!(parse(&put(&format!(r#","actions":[{}]"#, actions[..9].join(",")))).is_ok());
+        // Tab-indented, CRLF text (common in LLM code blocks) passes;
+        // `sanitize` normalizes it after.
+        assert!(parse(&put(r#","message":"```\r\n\tfn x() {}\r\n```""#)).is_ok());
     }
 
     #[test]

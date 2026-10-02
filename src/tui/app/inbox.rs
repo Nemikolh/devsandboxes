@@ -140,6 +140,10 @@ pub struct InboxView {
     list_offset: Cell<usize>,
     /// The reply input's line, while the input has focus.
     pub reply: Option<ReplyBox>,
+    /// `m`: show every thread's text as its markdown source instead of
+    /// rendered. For this session only: it's for the odd message the
+    /// renderer gets wrong, not a preference.
+    pub raw: bool,
 }
 
 impl Default for InboxView {
@@ -155,6 +159,7 @@ impl Default for InboxView {
             pane_max: Cell::new(0),
             list_offset: Cell::new(0),
             reply: None,
+            raw: false,
         }
     }
 }
@@ -236,7 +241,7 @@ pub struct ChildInfo {
 }
 
 /// How a pane segment is drawn; the renderer maps these to styles, so the
-/// content stays plain data that tests can read.
+/// content stays plain data (the source text) that tests can read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tone {
     Plain,
@@ -245,6 +250,14 @@ pub enum Tone {
     Link,
     State(State),
     Level(Level),
+    /// Inline markdown (code, emphasis, links as text) on a plain base:
+    /// statuses and timeline rows.
+    Text,
+    /// Inline markdown on a bold base: the title.
+    Title,
+    /// A whole markdown document (the message, a notify body), rendered as
+    /// blocks; always alone on its line.
+    Markdown,
 }
 
 /// One pane line: styled segments, unwrapped.
@@ -285,7 +298,7 @@ fn pending_line(t: &Thread) -> Option<String> {
 /// like a dispatcher's entries), then the numbered actions. Pure, so what the
 /// pane says is unit-testable.
 pub fn pane_lines(t: &Thread, child: Option<&ChildInfo>, utc_offset: i64) -> Vec<PaneLine> {
-    let mut out = vec![line(Tone::Bold, title_of(t))];
+    let mut out = vec![line(Tone::Title, title_of(t))];
     let mut head: PaneLine = Vec::new();
     match (t.kind, t.state, t.head()) {
         (Kind::Thread, Some(state), _) => head.push((Tone::State(state), state.as_str().to_string())),
@@ -294,7 +307,7 @@ pub fn pane_lines(t: &Thread, child: Option<&ChildInfo>, utc_offset: i64) -> Vec
     }
     if let Some(status) = &t.status {
         head.push((Tone::Dim, "  ·  ".into()));
-        head.push((Tone::Plain, status.clone()));
+        head.push((Tone::Text, status.clone()));
     }
     head.push((Tone::Dim, format!("  ·  {}", stamp(t.changed_at(), utc_offset))));
     out.push(head);
@@ -324,7 +337,7 @@ pub fn pane_lines(t: &Thread, child: Option<&ChildInfo>, utc_offset: i64) -> Vec
     };
     if let Some(message) = message {
         out.push(Vec::new());
-        out.extend(message.lines().map(|l| line(Tone::Plain, l)));
+        out.push(line(Tone::Markdown, message));
     }
 
     let timeline: Vec<PaneLine> = match t.kind {
@@ -334,7 +347,7 @@ pub fn pane_lines(t: &Thread, child: Option<&ChildInfo>, utc_offset: i64) -> Vec
             .map(|e| {
                 vec![
                     (Tone::Dim, format!("{}  {:7} ", stamp(e.at, utc_offset), entry_label(e.kind))),
-                    (Tone::Plain, one_line(&e.text)),
+                    (Tone::Text, one_line(&e.text)),
                 ]
             })
             .collect(),
@@ -349,7 +362,7 @@ pub fn pane_lines(t: &Thread, child: Option<&ChildInfo>, utc_offset: i64) -> Vec
                 vec![
                     (Tone::Dim, format!("{}  ", stamp(r.at, utc_offset))),
                     (Tone::Level(r.level), format!("{:7} ", r.level.as_str())),
-                    (Tone::Plain, one_line(&r.msg)),
+                    (Tone::Text, one_line(&r.msg)),
                 ]
             })
             .collect(),
@@ -615,6 +628,7 @@ impl App {
             },
             KeyCode::Char(c @ '1'..='9') => self.run_thread_action(&t, c as usize - '1' as usize),
             KeyCode::Char('r' | 'i') => self.open_reply(&t),
+            KeyCode::Char('m') if !ctrl => self.inbox.raw = !self.inbox.raw,
             _ => {
                 let lines = self.inbox.pane_max.get().saturating_add(1);
                 let mut scroll = self.inbox.scroll;
@@ -1576,6 +1590,29 @@ mod tests {
         assert_eq!(selected(&app).as_deref(), Some("other"));
         assert!(app.inbox.reply.is_none());
         assert_eq!(app.inbox.focus, InboxFocus::Thread);
+    }
+
+    #[test]
+    fn m_in_the_thread_toggles_raw_for_every_thread() {
+        let mut app = new_app();
+        open_asks(&mut app, Some(Reply::default()));
+        put(&mut app, "d", 20, body("other", State::NeedsYou));
+        app.on_key(key(KeyCode::Char('m')));
+        assert!(app.inbox.raw);
+        // Not per thread: it holds on the next one.
+        app.on_key(key(KeyCode::Esc));
+        app.on_key(key(KeyCode::Up));
+        assert_eq!(selected(&app).as_deref(), Some("other"));
+        assert!(app.inbox.raw);
+        // In the input, `m` is text.
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Char('r')));
+        app.on_key(key(KeyCode::Char('m')));
+        assert_eq!(app.inbox.reply.as_ref().unwrap().line.input(), "m");
+        assert!(app.inbox.raw);
+        app.on_key(key(KeyCode::Esc));
+        app.on_key(key(KeyCode::Char('m')));
+        assert!(!app.inbox.raw);
     }
 
     #[test]

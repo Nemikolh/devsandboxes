@@ -28,6 +28,7 @@
 //! Everything here is plain state: threading, cap, unread, retention, the put
 //! transition and the bridge's decision stay unit-testable without a store.
 
+pub mod sanitize;
 pub mod store;
 pub mod thread;
 
@@ -37,6 +38,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::devsbd::notify::{Level, Message, Record};
 
+pub use sanitize::sanitize;
 pub use thread::{Action, Reply, State, ThreadPut};
 
 /// Records kept per owner, thread history included; the owner's oldest record
@@ -442,10 +444,12 @@ impl Inbox {
 
     /// Apply one decoded [`SinkAction`] from the bridge and say what to
     /// surface. Retention runs here because this is the one write path every
-    /// container message takes, so a store nobody else touches still ages out.
+    /// container message takes, so a store nobody else touches still ages out;
+    /// for the same reason its text is [`sanitize`]d here, before it is stored
+    /// or shown in the status line or a desktop popup.
     pub fn apply_sink(&mut self, owner: &str, owner_name: &str, now: u64, action: SinkAction) -> Option<Shown> {
         self.prune(now);
-        match action {
+        match sanitize_action(action) {
             SinkAction::Push(record) => {
                 let shown = Shown {
                     line: format!("{owner_name}: {}", one_line(&record.msg)),
@@ -1007,6 +1011,49 @@ pub fn decide(instance: &str, declares_dispatcher: bool, message: Message) -> Si
     }
 }
 
+/// Every container-provided string in `action`, [`sanitize`]d. Keys and ids
+/// are already held to `[a-z0-9-]` (put) but go through too, so no field can
+/// be missed when one is added.
+fn sanitize_action(action: SinkAction) -> SinkAction {
+    use thread::HostVerb;
+    let opt = |s: Option<String>| s.map(|s| sanitize(&s));
+    match action {
+        SinkAction::Push(r) => SinkAction::Push(Record {
+            key: opt(r.key),
+            link: opt(r.link),
+            msg: sanitize(&r.msg),
+            ..r
+        }),
+        SinkAction::Rm { key } => SinkAction::Rm { key: sanitize(&key) },
+        SinkAction::Put { at, put } => {
+            let actions = put
+                .actions
+                .into_iter()
+                .map(|a| {
+                    let host = a.host.map(|h| match h {
+                        HostVerb::Vscode(v) => HostVerb::Vscode(thread::Vscode { path: opt(v.path), ..v }),
+                        HostVerb::Open(o) => HostVerb::Open(thread::Open { url: sanitize(&o.url) }),
+                        other => other,
+                    });
+                    Action { id: sanitize(&a.id), label: sanitize(&a.label), host, ..a }
+                })
+                .collect();
+            let put = ThreadPut {
+                key: sanitize(&put.key),
+                title: sanitize(&put.title),
+                link: opt(put.link),
+                status: opt(put.status),
+                child: opt(put.child),
+                message: opt(put.message),
+                actions,
+                reply: put.reply.map(|r| Reply { placeholder: opt(r.placeholder) }),
+                ..put
+            };
+            SinkAction::Put { at, put }
+        }
+    }
+}
+
 fn refused(at: u64, key: &str, msg: &str) -> SinkAction {
     SinkAction::Push(Record {
         level: Level::Error,
@@ -1418,6 +1465,37 @@ mod tests {
         let rm = SinkAction::Rm { key: "pr-1".into() };
         assert!(inbox.apply_sink("web-id", "web", 1000, rm).is_none());
         assert!(find(&inbox, "pr-1").is_none());
+    }
+
+    /// Control characters never reach the store, the status line or a popup:
+    /// a notify record, and a put built directly (past `thread::parse`, which
+    /// rejects them, so the sink's own pass is what's tested).
+    #[test]
+    fn the_sink_strips_control_characters() {
+        let mut inbox = Inbox::default();
+        let note = rec("\x1b]0;pwned\x07hi\u{9b}2J\u{202E}", Some("k\x1b"), Some("https://x\x1b[0m"));
+        let shown = inbox.apply_sink("web-id", "web", 1000, SinkAction::Push(note)).unwrap();
+        assert_eq!(shown.line, "web: ]0;pwnedhi2J");
+        let popup = shown.popup.unwrap();
+        assert_eq!((popup.key.as_deref(), popup.body.as_str()), (Some("k"), "]0;pwnedhi2J\nhttps://x[0m"));
+        let r = inbox.threads[0].head().unwrap();
+        assert_eq!((r.msg.as_str(), r.link.as_deref()), ("]0;pwnedhi2J", Some("https://x[0m")));
+
+        let put = ThreadPut {
+            title: "t\x1b[1m".into(),
+            status: Some("s\x07".into()),
+            message: Some("a\tb\r\nc\u{85}".into()),
+            actions: vec![Action { id: "go".into(), label: "Go\x1b".into(), ..Action::default() }],
+            reply: Some(Reply { placeholder: Some("p\x1b".into()) }),
+            ..put_body("pr-1")
+        };
+        inbox.apply_sink("web-id", "web", 1000, SinkAction::Put { at: 5, put });
+        let t = find(&inbox, "pr-1").unwrap();
+        assert_eq!(t.title, "t[1m");
+        assert_eq!(t.status.as_deref(), Some("s"));
+        assert_eq!(t.message.as_deref(), Some("a   b\nc"));
+        assert_eq!(t.actions[0].label, "Go");
+        assert_eq!(t.reply.as_ref().unwrap().placeholder.as_deref(), Some("p"));
     }
 
     #[test]
