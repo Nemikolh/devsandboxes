@@ -737,3 +737,42 @@ Decisions:
 - `docs/tui.md` Inbox section, `site/src/content/docs/dashboard.mdx` key
   tables, the CHANGELOG `## Unreleased` "The Inbox shows…" entry (`←`/`→`,
   side-by-side, input in the pane).
+
+## Markdown in threads
+
+Dispatcher text is often LLM output, i.e. markdown, and showed up raw. Agreed:
+always rendered (no protocol field), with a raw toggle; opening body links is
+out for now.
+
+### Step 15: markdown renderer, word wrap, raw toggle, control-char stripping
+
+- New dependency `pulldown-cmark` (host only, default features off unless
+  needed; not in `devsbd/`). New `src/tui/markdown.rs`: markdown → styled
+  blocks → wrapped `Line`s for a width. Block rules: headings bold + accent;
+  emphasis/strong; inline code tinted; fenced/indented code blocks tinted, no
+  highlighting, wrapped hard (they're code); bullet and numbered lists with
+  hanging indent (nested); block quotes with a dim `│` prefix; rules as a
+  dim line; links as underlined text + dim ` (url)`; raw HTML and images as
+  literal text/alt text; tables are left as their source lines (step 16).
+- Word wrap aware of each block's prefix/indent, by display width, replacing
+  the char-count `wrap_pane_line` (`src/tui/ui.rs`) for every pane line, plain
+  ones too, so the pane's scroll bound stays exact.
+- Applies to: the thread `message` and notify bodies (full markdown);
+  titles, statuses, timeline entry texts and replies (inline only: code,
+  emphasis, links as text), the cards included.
+- `m` in the Thread zone toggles rendered/raw for the session (not saved);
+  raw is the escaped source, still wrapped.
+- Control characters: everything a container sends is stripped of C0/C1
+  controls (keeping `\n`, and `\t` expanded to spaces) before it is stored
+  or drawn. Check whether ratatui passes escape sequences through to the
+  terminal today, and say what the risk was. Strip at the host apply
+  boundary (`src/inbox/`, put + notify) **and** defensively in the renderer.
+- Tests: each block rule, nesting, wrap with prefixes and wide glyphs,
+  inline-only mode, raw toggle, the control-char stripping (incl. ESC/CSI/OSC
+  and C1 `\u{9b}`), and a TestBackend render of a typical LLM message.
+
+### Step 16: tables
+
+- GFM tables (`pulldown-cmark`'s table option): columns aligned with a dim
+  header rule when the table fits the pane width, else the source lines as
+  in step 15. Tests for fit/no-fit, alignment, wide glyphs.
