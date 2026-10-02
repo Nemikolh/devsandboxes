@@ -332,6 +332,10 @@ opens, and the status line says the line was dropped.
 
 ### Inbox UI
 
+Superseded by *Inbox layout v2* below: the open/close pane and `v` cycling
+here shipped in step 4 and were replaced by the side-by-side layout, cards and
+`←`/`→` in steps 11-13.
+
 Gmail-like rather than a log:
 
 - **List:** one row per thread, sorted by last change. Columns: state marker,

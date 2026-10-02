@@ -193,52 +193,75 @@ worker, never the UI thread.
   Needs-you = dispatcher threads in state `needs-you` plus unread notify
   records; archived threads never count. Unread alone doesn't, so a
   dispatcher re-asserting threads can't inflate it.
-- One row per thread, last change first. Two kinds share the list: a
-  dispatcher thread (`devsbd thread put`), and a notify thread (the records
-  sharing an `(instance, key)`; an unkeyed record is its own row). Columns:
-  a one-cell marker (thread: `●` needs-you yellow, `○` active, `✓` done dim;
-  notify: `✖` error, `▲` warn, `·` info), `FROM` (sender instance), `TITLE`
-  (thread title, or the newest record's first line; `↗` when there's a link,
-  `(archived)` when the sender was removed), `STATUS` (the thread's status
-  chip, or a notify record's level above info), `AGE` (`just now`, `5 min
-  ago`, … then a date after a week; local time from `date +%z` read once at
-  startup). Unread rows are bold, archived ones dim.
-- **Views**, cycled with `v`, shown with their counts as the list title:
-  **Needs you** (default), **Active**, **Done**, **All**. Archived threads
-  and read notify records only show in All.
-- **Read.** A thread is read when opened in the pane, and again whenever it
-  changes while open. Notify records are also marked read when you leave
-  the Inbox from Needs you or All, since they were on screen: a notify record
-  has no state to resolve it, so it would otherwise sit in Needs you until
-  opened.
-- The Detail panel previews the selected thread (the pane's content).
-- List keys: `enter` opens the **thread pane**; `d` dismisses a notify
-  thread with its history, or marks a dispatcher thread done (with an event,
-  and its child done); `D` clears every notify thread (dispatcher threads are
-  state their dispatcher re-asserts, so they stay).
+- **Layout: side by side, always.** The list is on the left, the selected
+  thread's pane on the right — no open/close, the pane always shows whatever
+  the cursor is on (`src/tui/ui.rs` `draw_inbox`/`inbox_areas`). The divider
+  can be dragged with the mouse (`InboxView::split_pct`, `src/tui/app/inbox.rs`
+  `inbox_mouse`), clamped 20-80%, default 40%, not saved. With terminals open,
+  the split sits in the area above the terminal panel, which stays where it is
+  on every tab.
+- **Cards**, one per thread, last change first, two lines plus a blank
+  spacer (`draw_inbox_list`, `card_lines`): line 1 is the title (bold while
+  unread, `↗` when there's a link, `· archived` when the sender is gone) with
+  a compact age on the right (`now`, `5m`, `3h`, `2d`, then a date like
+  `Oct 12` past a week, `short_age`); line 2 is the state or level chip
+  (`● needs you`, `○ <status or active>`, `✓ done`, `▲ warn`, `✖ error`,
+  `· info`) with the sender on the right. The selected card gets an accent
+  bar in the first column and a background tint over both lines; archived
+  cards are dimmed throughout.
+- **Views**, stepped with `←`/`→` (clamped at the ends, no wraparound; `v` no
+  longer cycles them), shown as a one-line strip above the list:
+  `‹ Needs you 3 │ Active 5 │ Done │ All ›`, zero counts left out, the
+  current view accented. **Needs you** (default), **Active**, **Done**,
+  **All**. Archived threads and read notify records only show in All.
+- **Read.** A thread is read when it becomes the selected one (it's on
+  screen in the pane), and again whenever it changes while selected. Notify
+  records are also marked read when you leave the Inbox from Needs you or
+  All, since they were on screen: a notify record has no state to resolve
+  it, so it would otherwise sit in Needs you until selected. The selected
+  thread stays listed until the cursor leaves it, so the next row doesn't
+  slide under the cursor and get read in turn.
+- List keys: `↑`/`↓` select; `←`/`→` step the view; `enter` focuses the
+  thread pane; `r`/`i` focus its reply input (when the thread takes
+  replies); `o`/`t`/`l`/`p` target the selected thread's child (or its
+  sender with none); `d` dismisses a notify thread with its history, or
+  marks a dispatcher thread done (with an event, and its child done); `u`
+  reopens a done thread; `D` clears every notify thread (dispatcher threads
+  are state their dispatcher re-asserts, so they stay); `1`–`4` still switch
+  tabs.
 
-The **thread pane** replaces the list and shadows the dashboard keys while
-open (a tier in `App::on_key` after the terminal, like a modal): the `1`–`4`
-tab keys, `t`, `l` and the rest act on the thread, not on rows the user
-can't see. `q`, `:` and `?` stay. It shows the title; state (or level),
-status and time; `from` (sender, `(archived: instance removed)`); `link`;
-`child` (resolved among the sender's own children, with its run state, or
-`(no such child)`); the message; the timeline (put changes, actions,
-replies, done/reopen; for a notify thread, its earlier records); `N events
-waiting for <sender>` until the dispatcher acks them; the numbered actions
-(`⌂ host` runs in the dashboard, `→ <sender>` sends an event, `✓ done`);
-the reply hint.
+Keys go to one of three focus zones (`InboxFocus`): **List** (above), the
+**thread pane**, and its reply **input**. `enter` on the list moves focus to
+the thread; `esc` steps back one zone at a time (input → thread → list). The
+focused zone's border is highlighted. While the thread or its input has
+focus it shadows the dashboard keys (a tier in `App::on_key` after the
+terminal, like a modal): the `1`–`4` tab keys and the rest act on the
+thread, not on rows the user can't see. `q`, `:` and `?` stay reachable. The
+pane shows the title; state (or level), status and time; `from` (sender,
+`(archived: instance removed)`); `link`; `child` (resolved among the
+sender's own children, with its run state, or `(no such child)`); the
+message; the timeline (put changes, actions, replies, done/reopen; for a
+notify thread, its earlier records); `N events waiting for <sender>` until
+the dispatcher acks them; the numbered actions (`⌂ host` runs in the
+dashboard, `→ <sender>` sends an event, `✓ done`).
 
 | key | does |
 |---|---|
-| `esc` | close the pane |
+| `esc` | back to the list |
 | `↑`/`k` `↓`/`j`, `pgup`/`pgdn`, `g`/`G` | scroll |
 | `enter` | open the link (`xdg-open`, `open` on macOS; only `http(s)://`: the link comes from the container) |
 | `1`–`9` | run that action: a host verb (`vscode`, `terminal`, `logs`, `forward`, `open`, `rm`) runs at once on the thread's child, else on its sender; the rest is an event for the sender (`src/tui/app/thread_actions.rs`) |
 | `o` `t` `l` `p` | VS Code / terminal / logs / forward prompt on the child, or the sender without one |
-| `r` | reply, when the thread takes replies: a one-line box (the `:` prompt's editing keys) with the thread's placeholder; `enter` sends a non-empty reply, `esc` cancels |
+| `r`/`i` | focus the reply input, when the thread takes replies; otherwise a status hint and focus stays |
 | `d` | mark done: an event, and the child marked done |
 | `u` | reopen a done thread: back to `active`, an event, and the child's done mark cleared |
+
+**The reply input** sits at the bottom of the thread pane, three rows, and is
+only drawn when the thread sets `reply` (`draw_inbox_pane`/`draw_reply_input`,
+`src/tui/ui.rs`); a thread without one gets a one-line dim hint in its place,
+a notify thread gets nothing. `enter` sends a non-empty reply (the same
+`Op::Reply`) and keeps the input focused and empty for the next message;
+`esc` steps back to the thread. Its editing keys are the `:` prompt's.
 
 Archived threads refuse actions, replies, `d` and `u` with a status line. A
 host action whose child isn't found is refused rather than run on the sender,

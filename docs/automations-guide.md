@@ -35,8 +35,8 @@ devsbd notify [--level info|warn|error] [--link URL] [--key K] [--] <msg>...
 - Queued first: each call writes a record to a durable outbox in the container (`/var/lib/devsandbox/outbox/`, survives container restarts) and succeeds even with no host attached.
 - Delivered while the **dashboard is open**: it shows up in the Inbox tab (`4`) and as a desktop notification (`notify-send` on Linux, `osascript` on macOS; skipped silently when missing). One-shot CLI commands don't deliver; the queue waits for the next dashboard. A record is acknowledged to the container only after it is saved, so a dashboard that dies mid-delivery loses nothing: the record is resent.
 - An unread notification counts in the Inbox title (`Inbox (N)`) and the yellow `✉N` on its instance row, and sits in the **Needs you** view. It is marked read when you open it, or when you leave the Inbox after it was on screen (in Needs you or All).
-- `--key` threads per instance: a newer notification with the same key becomes the head of that row, and the older ones are listed under *earlier* in the thread pane (`enter`), so a script re-reporting "PR 123 conflicted" every poll doesn't spam.
-- `--link` (http(s) only) opens with `enter` in the thread pane. `d` dismisses a notification row with its history; `D` clears every notification (dispatcher threads stay). History is saved in `inbox.toml` next to `state.toml`, shared by every open dashboard and kept across restarts; a dismissal in one dashboard is gone from all of them.
+- `--key` threads per instance: a newer notification with the same key becomes the head of that row, and the older ones are listed under *earlier* in the thread pane beside it, so a script re-reporting "PR 123 conflicted" every poll doesn't spam.
+- `--link` (http(s) only) opens with `enter` once the thread has focus. `d` dismisses a notification row with its history; `D` clears every notification (dispatcher threads stay). History is saved in `inbox.toml` next to `state.toml`, shared by every open dashboard and kept across restarts; a dismissal in one dashboard is gone from all of them.
 - Limits: desktop popups are rate-limited per instance (a burst of 3, then one per 10 s) and a keyed notification repeating one popped in the last minute doesn't pop again; the Inbox still gets every one. The Inbox keeps 200 items per instance (notifications, thread timelines and pending events together), so a noisy instance drops its own oldest, not others'.
 - Flags are recognized anywhere before `--`; everything after `--` is message.
 
@@ -178,7 +178,7 @@ devsbd thread ls
 | `key` | yes | the thread's id, per sending instance | key rules: lowercase letters, digits, `-`, starting with a letter or digit, at most 40 chars |
 | `title` | yes | one line: what the thread is about | non-empty, 200 bytes |
 | `state` | yes | `needs-you`, `active` or `done`: drives the Inbox views and the badges | one of the three |
-| `link` | no | opened with `enter` in the thread pane | http(s) only, 2000 bytes |
+| `link` | no | opened with `enter` once the thread has focus | http(s) only, 2000 bytes |
 | `status` | no | free text, your lifecycle stage (`running ci`, `merged`), shown as a chip on the row | 60 bytes |
 | `child` | no | key of one of your children: the instance the thread is about, which host actions and the pane's `o`/`t`/`l`/`p` target | key rules |
 | `message` | no | the current explanation: what happened, what you expect from the user | 4000 bytes |
