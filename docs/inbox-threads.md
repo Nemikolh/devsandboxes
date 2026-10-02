@@ -639,3 +639,97 @@ module, in the style of its neighbors. Container paths use
 - Its "needs an instance restart" for a missing verb is really "needs
   `devsandbox start`"; after step 1, an open dashboard is enough.
 - Thread puts are dropped unless the sender declares `dispatcher`.
+
+## Inbox layout v2 (feedback after the first build)
+
+Feedback on the step 4 UI: the list + full-screen pane layout is clumsy, rows
+read like an old-school table, and `v` is a poor view switcher. Agreed shape:
+
+```
+ ‹ Needs you 3 │ Active 5 │ Done │ All ›
+╭─ Inbox ──────────────────╮╭─ #6900 feat/agent-run-cost ──────────────╮
+│▌#6900 feat/agent-run…  2m││ review draft replies · pr-6900 (running) │
+│▌● needs you   bab-disp   ││ 4 Greptile comments reviewed…             │
+│                          ││ ── timeline ──                            │
+│ #7414 fix/login     1h   ││ 12:00 state → needs-you                   │
+│ ○ running ci  bab-disp   ││ [1] Open draft  [2] Post replies  [3] Done│
+│                          ││╭─────────────────────────────────────────╮│
+│ ci failed on main   3d   │││ Instructions for the next run…          ││
+│ ▲ warn        builder    ││╰─────────────────────────────────────────╯│
+╰──────────────────────────╯╰───────────────────────────────────────────╯
+```
+
+Decisions:
+- **Side by side:** the list on the left, the selected thread on the right,
+  always shown (no more open/close pane). Split 40:60, and the divider can be
+  dragged with the mouse like the config modal's (`view.rs` `divider_pct`/
+  `col_near`, `app/mod.rs:437`). The split isn't saved. With terminals
+  open, the bottom terminal panel stays as it is on other tabs
+  (`ui.rs` `content_areas`), and the split uses the area above it.
+- **Two focus zones, plus the input.** The **list** has focus by default:
+  `↑`/`↓` select, `←`/`→` switch views (replacing `v`), `d`/`u`/`o`/`t`/`l`/`p`
+  act on the selected thread, and `1`–`4` keep switching tabs. `enter` moves
+  focus to the **thread**: `1`–`9` run actions, `↑`/`↓`/PgUp/PgDn scroll, and
+  `enter` opens the link. `r` or `i` (from either zone) focus the **input**.
+  `esc` steps back one zone: input → thread → list. The focused zone's border
+  is highlighted.
+- **Input at the bottom of the thread pane**, replacing the bottom-bar reply
+  box (`ui.rs:41`, `draw_reply` `:1462`). It's shown only when the thread
+  sets `reply` (placeholder dim inside it). Other threads get a one-line dim
+  hint in its place, and notifications get nothing. `enter` sends (the same
+  `Op::Reply`), and the box stays focused and empty for the next message.
+- **Cards instead of table rows:** two lines plus a blank spacer, no border.
+  Line 1: title (bold while unread) left, age right. Line 2: the state or
+  level chip left (`● needs you`, `○ <status or active>`, `✓ done`, `▲ warn`,
+  `✖ error`, `· info`), the sender right. When selected: an accent bar `▌` in
+  the first column and a subtle background tint over both lines. Archived
+  cards are dimmed. The view switcher is a one-line strip above the list,
+  with `‹`/`›` and the current view highlighted.
+
+### Step 11: side-by-side layout, focus zones, arrows, input in the pane
+
+- `src/tui/app/inbox.rs`: replace `InboxView::open` (open/esc pane) with a
+  focus enum `List | Thread | Input`. The right pane follows the selection,
+  and keeps its scroll per selected thread id, reset on change. Re-target
+  the pane key tier in `App::on_key` (`app/mod.rs`, after the terminal
+  check) so it applies only when focus is `Thread`/`Input`. List-zone keys
+  go in the normal Inbox arms: `←`/`→` views (remove `v`), `d`/`u`/
+  `o`/`t`/`l`/`p` on the selected thread (reusing `thread_actions.rs`), `enter`
+  → Thread focus, `r`/`i` → Input when `reply` is set (hint otherwise).
+  Leaving the Inbox tab resets focus to List. "Mark read when opened" becomes
+  "when selected", and also "when it changes while selected".
+- `ReplyBox`'s submit keeps focus in the input and clears it. Its edit keys
+  stay as they are.
+- `src/tui/ui.rs`: `draw_inbox` lays out `[list | thread]` horizontally in
+  the top area (terminal panel unchanged). The thread pane is a vertical
+  `[content | input(3 rows) or hint(1 row)]`. Remove the bottom-bar reply
+  drawing and `draw_inbox_detail`. Focus-highlighted borders.
+- Footer hints and `?` help per zone.
+- Tests: rewrite the pane tests for the zones (`enter`/`esc` steps; `1` in
+  List switches tabs, in Thread runs an action; `←`/`→` views; `r` focus
+  and multi-send; read-on-select).
+
+### Step 12: card rendering
+
+- `src/tui/ui.rs`: `draw_inbox_list` renders cards (a `List`, or manual
+  `Paragraph`s with offset handling, so the selection stays visible: 3 rows
+  per card). Age right-aligned on line 1, sender right-aligned on line 2,
+  truncating the left text with `…` to fit. Selection: `▌` accent plus a
+  background tint (pick a subtle `Color::Rgb`/indexed value that also reads
+  on light terminals, falling back to `REVERSED`-free styling). The view strip
+  sits above the list. Keep the pure layout bits (truncate-to-fit, chip text)
+  as tested fns.
+
+### Step 13: draggable divider
+
+- Mouse press near the list/thread divider then drag sets `split_pct`
+  (clamped like `clamp_split`). It lives on `InboxView`, defaults to 40, and
+  isn't persisted. It reuses `divider_pct`/`col_near`, and the hit-test uses
+  the same area function as `draw_inbox` so they can't drift. Tests mirror
+  the config modal's drag tests.
+
+### Step 14: docs
+
+- `docs/tui.md` Inbox section, `site/src/content/docs/dashboard.mdx` key
+  tables, the CHANGELOG `## Unreleased` "The Inbox shows…" entry (`←`/`→`,
+  side-by-side, input in the pane).
