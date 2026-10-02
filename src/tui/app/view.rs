@@ -39,25 +39,33 @@ Ports tab
   d           stop the selected forward
 
 Inbox tab (dispatcher threads + devsbd notify records)
+  The list is on the left, the selected thread on the right; selecting a
+  thread marks it read. esc steps back: input → thread → list.
+Inbox list
   ↑/k ↓/j     move selection
-  v           cycle views: Needs you / Active / Done / All
+  ← / →       previous / next view: Needs you / Active / Done / All
               (Needs you: threads asking for you + unread notify records;
                leaving the tab marks the notify records it showed read)
-  enter       open the thread pane (marks it read)
+  enter       focus the thread
+  r / i       focus the reply input (when the thread takes replies)
   d           dismiss a notify record; on a dispatcher thread, mark it done
+  u           reopen a done thread
   D           clear all notify records (dispatcher threads stay)
-
-Inbox thread pane (shadows the dashboard keys while open)
+  o t l p     VS Code / terminal / logs / forward prompt on the thread's
+              child (or its sender when it has none)
+Inbox thread (shadows the dashboard keys while focused)
   ↑/k ↓/j     scroll    pgup/pgdn  page   g / G  top / bottom
   enter       open the thread's link
   1-9         run an action: host verbs run now; the rest (→ owner) is
               an event the dispatcher pulls with `devsbd events`
-  r           reply (when the thread takes replies): enter sends, esc cancels
+  r / i       focus the reply input
   d / u       mark done / reopen (each also an event for the dispatcher;
               also marks / clears the thread's child done)
-  o t l p     VS Code / terminal / logs / forward prompt on the thread's
-              child (or its sender when it has none)
-  esc         close     q quit   : prompt   ? help
+  o t l p     as in the list
+  esc         back to the list     q quit   : prompt   ? help
+Inbox reply input
+  enter       send (the input stays, empty, for the next message)
+  esc         back to the thread
 
 Process rows (expanded instance)
   ←           jump to the parent instance
@@ -420,7 +428,7 @@ impl App {
                 (Self::build_service_view(&self.dir, &row.name), target)
             }
             // The Ports and Inbox tabs have no config to explore; `e` is a
-            // no-op (`enter` on the Inbox opens the thread pane instead).
+            // no-op (`enter` on the Inbox focuses the thread instead).
             Tab::Ports | Tab::Inbox => return,
         };
         let placeholder = match self.tab {

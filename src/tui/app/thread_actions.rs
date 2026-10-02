@@ -1,6 +1,6 @@
 //! Actions on an Inbox thread (docs/inbox-threads.md, *Actions*): the `1`-`9`
-//! buttons and the pane's fixed `o`/`t`/`l`/`p` keys. A host verb maps onto
-//! the plumbing the dashboard already has for a selected instance
+//! buttons and the fixed `o`/`t`/`l`/`p` keys (Inbox list or thread). A host
+//! verb maps onto the plumbing the dashboard already has for a selected instance
 //! (`PromptAction::Code`, the terminal panel, the logs modal, `pending_port`,
 //! `pending_open`, `PromptAction::Rm`), aimed at the thread's target instead
 //! of a table row. A button's dispatcher half (no `host`, `notify`, `done`)
@@ -151,7 +151,7 @@ impl App {
         }
     }
 
-    /// Pane `o`: VS Code on the thread's target.
+    /// `o`: VS Code on the thread's target.
     pub(super) fn thread_code(&mut self, t: &Thread) {
         match self.thread_target(t) {
             Ok(name) => self.pending_action = Some(PromptAction::Code { instance: name, goto: None }),
@@ -159,8 +159,8 @@ impl App {
         }
     }
 
-    /// Pane `t`: a terminal on the thread's target. It takes focus like `t`
-    /// does elsewhere; the pane stays open underneath, so leaving the
+    /// `t`: a terminal on the thread's target. It takes focus like `t`
+    /// does elsewhere; the Inbox keeps its focus underneath, so leaving the
     /// terminal comes back to the thread.
     pub(super) fn thread_terminal(&mut self, t: &Thread) {
         match self.thread_target(t) {
@@ -169,8 +169,8 @@ impl App {
         }
     }
 
-    /// Pane `l`: the logs modal for the thread's target; closing it comes
-    /// back to the pane.
+    /// `l`: the logs modal for the thread's target; closing it comes
+    /// back to the thread.
     pub(super) fn thread_logs(&mut self, t: &Thread) {
         match self.thread_target(t) {
             Ok(name) => self.logs_on(&name),
@@ -178,7 +178,7 @@ impl App {
         }
     }
 
-    /// Pane `p`: the `port` prompt prefilled for the thread's target.
+    /// `p`: the `port` prompt prefilled for the thread's target.
     pub(super) fn thread_port_prompt(&mut self, t: &Thread) {
         match self.thread_target(t) {
             Ok(name) => self.open_port_prompt_for(&name),
@@ -205,7 +205,7 @@ mod tests {
     use crossterm::event::KeyCode;
 
     use super::super::test_support::*;
-    use super::super::{Focus, Modal, Tab};
+    use super::super::{Focus, InboxFocus, Modal, Tab};
     use super::*;
     use crate::inbox::thread::{Forward, NoArgs, Open, Vscode};
     use crate::inbox::{Action, Inbox, State, ThreadPut};
@@ -226,7 +226,7 @@ mod tests {
     }
 
     /// A thread from `d-id` (named `inst0`) with `child` and `actions`,
-    /// installed and opened in the pane.
+    /// installed, selected and focused.
     fn open_thread(app: &mut App, child: Option<&str>, actions: Vec<Action>) {
         let mut inbox = Inbox::default();
         let put = ThreadPut {
@@ -241,7 +241,7 @@ mod tests {
         app.set_inbox(inbox);
         app.on_key(key(KeyCode::Char('4')));
         app.on_key(key(KeyCode::Enter));
-        assert!(app.inbox.is_open());
+        assert_eq!(app.inbox.focus, InboxFocus::Thread);
         app.take_pending_inbox();
     }
 
@@ -250,7 +250,7 @@ mod tests {
     }
 
     fn target(app: &App) -> Result<String, String> {
-        app.thread_target(app.inbox.open_thread().unwrap())
+        app.thread_target(app.selected_inbox_thread().unwrap())
     }
 
     #[test]
@@ -347,7 +347,7 @@ mod tests {
         // Fixed `o`: the same target, no goto.
         app.on_key(key(KeyCode::Char('o')));
         assert_eq!(app.pending_action.take(), Some(PromptAction::Code { instance: "inst1".into(), goto: None }));
-        assert!(app.inbox.is_open());
+        assert_eq!(app.inbox.focus, InboxFocus::Thread);
     }
 
     #[test]
@@ -368,7 +368,7 @@ mod tests {
         // Like the `port` prompt: on to the Ports tab, the pane kept for later.
         assert_eq!(app.tab, Tab::Ports);
         app.on_key(key(KeyCode::Char('4')));
-        assert!(app.inbox.is_open());
+        assert_eq!(app.inbox.focus, InboxFocus::Thread);
     }
 
     #[test]
@@ -389,7 +389,7 @@ mod tests {
         // Back from the terminal: the pane is still there.
         app.on_key(crossterm::event::KeyEvent::new(KeyCode::Char(']'), crossterm::event::KeyModifiers::CONTROL));
         assert_eq!(app.focus, Focus::Dashboard);
-        assert!(app.inbox.is_open());
+        assert_eq!(app.inbox.focus, InboxFocus::Thread);
 
         // Fixed `t`: same target. A stopped child is refused by name.
         app.terms.set_active(0);
@@ -415,7 +415,7 @@ mod tests {
         // Closing it returns to the pane.
         app.on_key(key(KeyCode::Esc));
         assert!(matches!(app.modal, Modal::None));
-        assert!(app.inbox.is_open());
+        assert_eq!(app.inbox.focus, InboxFocus::Thread);
 
         app.on_key(key(KeyCode::Char('l')));
         assert!(matches!(app.modal, Modal::Logs(_)));
@@ -440,7 +440,7 @@ mod tests {
             Action { done: true, ..act("Code", Some(HostVerb::Vscode(Vscode::default()))) },
         ]);
 
-        let id = app.inbox.open_thread().unwrap().id;
+        let id = app.selected_inbox_thread().unwrap().id;
         let acted = |action: &str| vec![Op::Act { thread: id, action: action.into() }];
 
         // No host: only the event, for the store to stamp.
@@ -448,7 +448,7 @@ mod tests {
         assert_eq!(app.take_pending_inbox(), acted("post"));
         assert_eq!(app.status.as_deref(), Some("[1] Post · event queued for inst0"));
         assert_eq!((app.take_pending_open(), app.pending_action.take()), (None, None));
-        assert!(app.inbox.open_thread().unwrap().events.is_empty(), "not applied to the local copy");
+        assert!(app.selected_inbox_thread().unwrap().events.is_empty(), "not applied to the local copy");
 
         // Host + notify: the host part runs, and the event is queued.
         app.on_key(key(KeyCode::Char('2')));
@@ -493,7 +493,7 @@ mod tests {
         app.on_key(key(KeyCode::Char('4')));
         app.inbox.view = super::super::View::All;
         app.on_key(key(KeyCode::Enter));
-        assert!(app.inbox.is_open());
+        assert_eq!(app.inbox.focus, InboxFocus::Thread);
         app.on_key(key(KeyCode::Char('u')));
         assert_eq!(app.take_pending_done(), child_done("inst1", false));
         assert!(app.status.as_deref().unwrap().starts_with("reopened · child inst1 not done"), "{:?}", app.status);

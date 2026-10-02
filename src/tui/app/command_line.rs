@@ -100,7 +100,7 @@ impl App {
     /// Hand a forward to the event loop and show the Ports tab, where it
     /// appears. Shared by the `port` prompt and the Inbox `forward` host
     /// action, so both start forwards the same way. The tab is set directly,
-    /// not via `set_tab`: an open thread pane stays open for the way back.
+    /// not via `set_tab`: a focused Inbox thread stays focused for the way back.
     pub(super) fn request_port(&mut self, req: PortRequest) {
         self.status = Some(format!("forwarding {} …", req.spec));
         self.pending_port = Some(req);

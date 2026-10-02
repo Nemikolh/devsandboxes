@@ -25,7 +25,9 @@ mod tree;
 mod view;
 
 pub use crate::inbox::Thread;
-pub use inbox::{pane_lines, parse_utc_offset, title_of, when, InboxView, PaneLine, ReplyBox, Tone, View};
+pub use inbox::{
+    pane_lines, parse_utc_offset, title_of, when, InboxFocus, InboxView, PaneLine, Tone, View,
+};
 pub use actions::PendingDone;
 pub use procs::{PendingSignal, Signal};
 pub use view::{ConfigView, Modal, Pane, Side, TextModal};
@@ -336,6 +338,13 @@ impl App {
     /// Apply a key event to the state. No terminal I/O here (the modal open path
     /// reads config/fs, which is local and user-triggered — see [`Self::open_config`]).
     pub fn on_key(&mut self, key: KeyEvent) {
+        self.dispatch_key(key);
+        // Whatever the key did to the Inbox cursor (moved it, dismissed the
+        // row under it, switched views), the pane follows in one place.
+        self.sync_inbox_selection();
+    }
+
+    fn dispatch_key(&mut self, key: KeyEvent) {
         // The prompt swallows every key while open, ahead of the modal and the
         // dashboard bindings.
         if self.prompt.is_some() {
@@ -354,10 +363,9 @@ impl App {
             self.on_key_terminal(key);
             return;
         }
-        // An open Inbox thread pane is a focused view: it shadows the
-        // dashboard keys (the `1`-`9` action keys over the tab keys, `t`/`l`
-        // over the selected instance's).
-        if self.tab == Tab::Inbox && self.inbox.is_open() {
+        // A focused Inbox thread (or its input) shadows the dashboard keys:
+        // the `1`-`9` action keys over the tab keys, text over everything.
+        if self.tab == Tab::Inbox && self.inbox.focus != InboxFocus::List {
             self.on_key_inbox_pane(key);
             return;
         }
@@ -383,6 +391,11 @@ impl App {
             // are open.
             KeyCode::Char(']') if ctrl => self.enter_terminal(),
             KeyCode::F(12) => self.enter_terminal(),
+            // Inbox list: `o`/`t`/`l`/`p`/`d`/`u` act on the selected thread,
+            // ahead of the instance keys they share letters with.
+            KeyCode::Char('o' | 't' | 'l' | 'p' | 'd' | 'u') if self.tab == Tab::Inbox && !ctrl => {
+                self.on_inbox_thread_key(key.code);
+            }
             // Process-row signals; `t` doubles as SIGTERM there, otherwise it
             // opens a terminal.
             KeyCode::Char('t') if on_proc => self.signal_selected_proc(Signal::Term),
@@ -397,10 +410,13 @@ impl App {
             KeyCode::Right if self.tab == Tab::Instances => self.tree_expand(),
             KeyCode::Char(' ') if self.tab == Tab::Instances => self.tree_toggle(),
             KeyCode::Left if self.tab == Tab::Instances => self.tree_collapse(),
-            // Inbox: `enter` opens the selected thread in the pane (whose own
-            // `enter` opens the link); `v` cycles the views.
-            KeyCode::Enter if self.tab == Tab::Inbox => self.open_selected_thread(),
-            KeyCode::Char('v') if self.tab == Tab::Inbox => self.cycle_inbox_view(),
+            // Inbox list: `enter` focuses the selected thread (whose own
+            // `enter` opens the link), `r`/`i` its input; `←`/`→` step the
+            // views.
+            KeyCode::Enter if self.tab == Tab::Inbox => self.focus_inbox_thread(),
+            KeyCode::Char('r' | 'i') if self.tab == Tab::Inbox => self.focus_inbox_input(),
+            KeyCode::Left if self.tab == Tab::Inbox => self.step_inbox_view(-1),
+            KeyCode::Right if self.tab == Tab::Inbox => self.step_inbox_view(1),
             KeyCode::Enter | KeyCode::Char('e') if !on_proc => self.open_config(),
             KeyCode::Char('r') if self.tab == Tab::Instances && !on_proc => {
                 self.open_rename_or_run_prompt()
@@ -420,7 +436,6 @@ impl App {
             }
             KeyCode::Char('p') if self.tab == Tab::Services => self.open_port_prompt_service(),
             KeyCode::Char('d') if self.tab == Tab::Ports => self.stop_selected_forward(),
-            KeyCode::Char('d') if self.tab == Tab::Inbox => self.dismiss_selected_notification(),
             KeyCode::Char('D') if self.tab == Tab::Inbox => self.clear_notifications(),
             KeyCode::Char('?') => self.open_help(),
             _ => {}

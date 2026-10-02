@@ -6,12 +6,12 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Tabs};
+use ratatui::widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table, TableState, Tabs};
 use tui_term::widget::{Cursor, PseudoTerminal};
 
 use super::app::{
-    pane_lines, title_of, when, App, ConfigView, Focus, Modal, PaneLine, Pane, PortRow, Side, Tab,
-    TextModal, Thread, Tone, View,
+    pane_lines, title_of, when, App, ConfigView, Focus, InboxFocus, Modal, PaneLine, Pane, PortRow,
+    Side, Tab, TextModal, Thread, Tone, View,
 };
 use super::data::{
     humanize_secs, sandbox_stats, totals_line, ContainerStatus, InstanceRow, Node, SandboxRow,
@@ -38,11 +38,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     draw_tabs(frame, app, tab_area);
     draw_content(frame, app, content_area);
-    let reply = app.inbox.reply.as_ref().filter(|_| app.tab == Tab::Inbox && app.inbox.is_open());
     if let Some(prompt) = &app.prompt {
         draw_prompt(frame, prompt, bottom_area);
-    } else if let Some(reply) = reply {
-        draw_reply(frame, reply, bottom_area);
     } else {
         draw_help(frame, app, bottom_area);
     }
@@ -541,21 +538,34 @@ fn port_state_style(state: &str) -> Style {
 
 fn draw_inbox(frame: &mut Frame, app: &App, area: Rect) {
     let (top, detail_area, terms_area) = content_areas(app, area);
-    let panel_focused = app.focus == Focus::Terminal;
-    match app.inbox.open_thread() {
-        // The focused pane replaces the list and its detail; with terminals
-        // open it keeps to the top area, which is full width there.
-        Some(t) => {
-            let pane = if terms_area.is_some() { top } else { top.union(detail_area) };
-            draw_inbox_pane(frame, app, t, pane, panel_focused);
-        }
-        None => {
-            draw_inbox_list(frame, app, top, panel_focused);
-            draw_inbox_detail(frame, app, detail_area, panel_focused);
-        }
-    }
+    // The Inbox has no Detail box (the thread pane is its detail): without
+    // terminals the split takes the whole content area; with them, the top,
+    // the terminal panel staying where it is on every tab.
+    let region = if terms_area.is_some() { top } else { top.union(detail_area) };
+    let (list_area, thread_area) = inbox_areas(region, app.inbox.split_pct);
+    draw_inbox_list(frame, app, list_area);
+    draw_inbox_pane(frame, app, thread_area);
     if let Some(terms_area) = terms_area {
         draw_terminal_panel(frame, app, terms_area);
+    }
+}
+
+/// The Inbox's `(list, thread)` split of `area`, the list taking `split_pct`
+/// percent of the width. The one place the split is computed, so a mouse
+/// hit-test on the divider can't drift from what was drawn.
+fn inbox_areas(area: Rect, split_pct: u16) -> (Rect, Rect) {
+    let [list, thread] =
+        Layout::horizontal([Constraint::Percentage(split_pct), Constraint::Min(0)]).areas(area);
+    (list, thread)
+}
+
+/// Border of an Inbox zone: accented while it has the keys, dim otherwise
+/// (also while a terminal has them), like the config modal's panes.
+fn zone_border_style(app: &App, zone: InboxFocus) -> Style {
+    if app.focus == Focus::Dashboard && app.inbox.focus == zone {
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().add_modifier(Modifier::DIM)
     }
 }
 
@@ -575,43 +585,52 @@ fn inbox_view_header(app: &App) -> Line<'static> {
         };
         spans.push(Span::styled(format!("{} ({})", view.title(), app.inbox.count(*view)), style));
     }
-    spans.push(Span::styled("  v cycles ", dim));
+    spans.push(Span::styled("  ←/→ ", dim));
     Line::from(spans)
 }
 
-fn draw_inbox_list(frame: &mut Frame, app: &App, area: Rect, term_focused: bool) {
+/// Narrowest list (inner width) that still fits the FROM column.
+const INBOX_FROM_MIN_WIDTH: u16 = 60;
+
+fn draw_inbox_list(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(dash_border_style(term_focused))
+        .border_style(zone_border_style(app, InboxFocus::List))
         .title(inbox_view_header(app));
+    let from = block.inner(area).width >= INBOX_FROM_MIN_WIDTH;
     let rows = app.inbox.rows();
     if rows.is_empty() {
         let text = if app.inbox.threads().is_empty() {
             "no notifications — containers send them with `devsbd notify \"…\"`".to_string()
         } else {
-            format!("nothing in {} — v cycles the views", app.inbox.view.title())
+            format!("nothing in {} — ←/→ switch views", app.inbox.view.title())
         };
         let text = Line::from(Span::styled(text, Style::default().add_modifier(Modifier::DIM)))
             .alignment(Alignment::Center);
         frame.render_widget(Paragraph::new(text).block(block), area);
         return;
     }
-    let header = Row::new(["", "FROM", "TITLE", "STATUS", "AGE"].into_iter().map(Cell::from))
-        .style(Style::default().add_modifier(Modifier::DIM));
+    let mut header = vec!["", "FROM", "TITLE", "STATUS", "AGE"];
     // AGE: a week-old date ("Oct 12 14:32") is the widest value (see `when`).
-    let widths = [
+    let mut widths = vec![
         Constraint::Length(1),
-        Constraint::Length(20),
-        Constraint::Min(20),
-        Constraint::Length(24),
+        Constraint::Length(12),
+        Constraint::Min(16),
+        Constraint::Length(12),
         Constraint::Length(12),
     ];
+    if !from {
+        header.remove(1);
+        widths.remove(1);
+    }
+    let header =
+        Row::new(header.into_iter().map(Cell::from)).style(Style::default().add_modifier(Modifier::DIM));
     // Wall clock read per frame, so relative times tick between snapshots.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     let threads = app.inbox.threads();
-    let rows: Vec<Row> = rows.iter().map(|&i| inbox_row(&threads[i], now, app.utc_offset)).collect();
+    let rows: Vec<Row> = rows.iter().map(|&i| inbox_row(&threads[i], from, now, app.utc_offset)).collect();
     let table = Table::new(rows, widths)
         .header(header)
         .block(block)
@@ -650,10 +669,10 @@ fn thread_marker(t: &Thread) -> (&'static str, Style) {
     }
 }
 
-/// One Inbox row: marker, sender, title (`↗` when there's a link), status
-/// chip (a notify record's level when it's above info), age. Bold while
-/// unread; dim when archived (its instance is gone).
-fn inbox_row<'a>(t: &Thread, now: u64, utc_offset: i64) -> Row<'a> {
+/// One Inbox row: marker, sender (when `from`), title (`↗` when there's a
+/// link), status chip (a notify record's level when it's above info), age.
+/// Bold while unread; dim when archived (its instance is gone).
+fn inbox_row<'a>(t: &Thread, from: bool, now: u64, utc_offset: i64) -> Row<'a> {
     let dim = Style::default().add_modifier(Modifier::DIM);
     let (marker, marker_style) = thread_marker(t);
     let mut title = vec![Span::raw(title_of(t))];
@@ -670,13 +689,16 @@ fn inbox_row<'a>(t: &Thread, now: u64, utc_offset: i64) -> Row<'a> {
         }
         (Kind::Notify, _) => Span::raw(""),
     };
-    let row = Row::new(vec![
+    let mut cells = vec![
         Cell::from(Span::styled(marker, marker_style)),
-        Cell::from(t.owner_name.clone()),
         Cell::from(Line::from(title)),
         Cell::from(status),
         Cell::from(Span::styled(when(t.changed_at(), now, utc_offset), dim)),
-    ]);
+    ];
+    if from {
+        cells.insert(1, Cell::from(t.owner_name.clone()));
+    }
+    let row = Row::new(cells);
     if t.archived {
         row.style(dim)
     } else if t.unread {
@@ -727,44 +749,77 @@ fn wrap_pane_line(line: &PaneLine, width: usize) -> Vec<Line<'static>> {
     out
 }
 
-/// The focused thread pane. Records its scroll bound for the scroll keys
-/// (`InboxView::set_pane_max`), since only here are the size and wrapping
-/// known.
-fn draw_inbox_pane(frame: &mut Frame, app: &App, t: &Thread, area: Rect, term_focused: bool) {
+/// The thread pane: the selected thread's content, then its input (a thread
+/// taking replies), a one-line hint (one that doesn't) or nothing (a notify
+/// thread, which can't be replied to). Records the content's scroll bound for
+/// the scroll keys (`InboxView::set_pane_max`), since only here are the size
+/// and wrapping known.
+fn draw_inbox_pane(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(dash_border_style(term_focused))
-        .title(" Thread · esc closes ");
+        .border_style(zone_border_style(app, InboxFocus::Thread))
+        .title(" Thread ");
     let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let Some(t) = app.selected_inbox_thread() else {
+        let text = Line::from(Span::styled("no thread selected", dim)).alignment(Alignment::Center);
+        frame.render_widget(Paragraph::new(text), inner);
+        return;
+    };
+    let bottom = match (t.kind, &t.reply) {
+        (_, Some(_)) => 3,
+        (Kind::Thread, None) => 1,
+        (Kind::Notify, None) => 0,
+    };
+    let [content, bottom_area] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(bottom)]).areas(inner);
     let child = app.thread_child(t);
     let lines: Vec<Line> = pane_lines(t, child.as_ref(), app.utc_offset)
         .iter()
-        .flat_map(|l| wrap_pane_line(l, inner.width as usize))
+        .flat_map(|l| wrap_pane_line(l, content.width as usize))
         .collect();
     let rows = lines.len().min(u16::MAX as usize) as u16;
-    let max = rows.saturating_sub(inner.height);
+    let max = rows.saturating_sub(content.height);
     app.inbox.set_pane_max(max);
     let scroll = app.inbox.scroll.min(max);
-    frame.render_widget(Paragraph::new(lines).block(block).scroll((scroll, 0)), area);
+    frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), content);
+    match &t.reply {
+        Some(reply) => draw_reply_input(frame, app, reply.placeholder.as_deref(), bottom_area),
+        None if bottom > 0 => {
+            frame.render_widget(Paragraph::new(Span::styled("this thread takes no replies", dim)), bottom_area);
+        }
+        None => {}
+    }
 }
 
-/// Preview of the selected thread: the pane's content, unscrolled.
-fn draw_inbox_detail(frame: &mut Frame, app: &App, area: Rect, term_focused: bool) {
+/// The thread pane's reply input: a rounded box holding the line being typed,
+/// or the thread's placeholder dim while it's empty. The caret is placed (like
+/// the `:` prompt's) only while the input has focus, so it doesn't blink in
+/// a box the keys don't reach.
+fn draw_reply_input(frame: &mut Frame, app: &App, placeholder: Option<&str>, area: Rect) {
+    let reply = app.inbox.reply.as_ref().filter(|_| app.inbox.focus == InboxFocus::Input);
+    let title = if reply.is_some() { " enter sends · esc back " } else { " r reply " };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(dash_border_style(term_focused))
-        .title("Detail (enter opens)");
-    let lines: Vec<Line> = match app.selected_inbox_thread() {
-        Some(t) => pane_lines(t, app.thread_child(t).as_ref(), app.utc_offset)
-            .into_iter()
-            .map(|l| Line::from(l.into_iter().map(|(tone, s)| Span::styled(s, tone_style(tone))).collect::<Vec<_>>()))
-            .collect(),
-        None => Vec::new(),
+        .border_type(BorderType::Rounded)
+        .border_style(zone_border_style(app, InboxFocus::Input))
+        .title(title);
+    let inner = block.inner(area);
+    let input = reply.map_or("", |r| r.line.input());
+    let line = if input.is_empty() {
+        let hint = placeholder.unwrap_or("reply to the dispatcher");
+        Line::from(Span::styled(hint.to_string(), Style::default().add_modifier(Modifier::DIM)))
+    } else {
+        Line::from(input.to_string())
     };
-    frame.render_widget(
-        Paragraph::new(lines).block(block).wrap(ratatui::widgets::Wrap { trim: false }),
-        area,
-    );
+    frame.render_widget(Paragraph::new(line).block(block), area);
+    if let Some(reply) = reply {
+        if app.focus == Focus::Dashboard && inner.width > 0 && inner.height > 0 {
+            let col = inner.x + reply.line.cursor() as u16;
+            frame.set_cursor_position((col.min(inner.right().saturating_sub(1)), inner.y));
+        }
+    }
 }
 
 /// Pure tab labels for the terminal panel, one per open session: `{i+1}:{title}`
@@ -1407,17 +1462,25 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
             Tab::Ports => {
                 "q quit · tab switch · ↑↓ select · d stop forward · : port … · ? help".to_string()
             }
-            Tab::Inbox if app.inbox.is_open() => {
-                "esc close · ↑↓ scroll · enter open link · 1-9 actions · r reply · d done · u reopen · o vscode · t term · l logs · p forward · q quit · ? help".to_string()
-            }
-            Tab::Inbox => {
-                "q quit · tab switch · ↑↓ select · enter open · v view · d dismiss/done · D clear notify · ? help"
-                    .to_string()
-            }
+            Tab::Inbox => match app.inbox.focus {
+                InboxFocus::List => {
+                    "q quit · tab switch · ↑↓ select · ←→ view · enter thread · r reply · d dismiss/done · u reopen · D clear notify · o vscode · t term · l logs · p forward · ? help"
+                        .to_string()
+                }
+                InboxFocus::Thread => {
+                    "esc list · ↑↓ scroll · enter open link · 1-9 actions · r reply · d done · u reopen · o vscode · t term · l logs · p forward · q quit · ? help".to_string()
+                }
+                InboxFocus::Input => {
+                    "enter send · esc back to thread · ←→ home end edit · ctrl-u clear · ctrl-w delete word"
+                        .to_string()
+                }
+            },
         },
     };
     // On the dashboard with terminals open, append the terminal-cycle hints.
-    let text = if matches!(app.modal, Modal::None) && !app.terms.is_empty() {
+    // Not over a focused Inbox thread or input: they shadow those keys.
+    let shadowed = app.tab == Tab::Inbox && app.inbox.focus != InboxFocus::List;
+    let text = if matches!(app.modal, Modal::None) && !app.terms.is_empty() && !shadowed {
         format!("{base} · [/] terms · ctrl-] focus term · x close term")
     } else {
         base
@@ -1454,24 +1517,6 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt, area: Rect) {
         prompt_candidates_line(prompt)
     };
     frame.render_widget(Paragraph::new(hint), hint_area);
-}
-
-/// Render the thread pane's reply box in the bottom bar: `reply › <input>`,
-/// the thread's placeholder dim while the line is empty, caret placed like
-/// the prompt's. One line, so opening it doesn't resize anything above.
-fn draw_reply(frame: &mut Frame, reply: &super::app::ReplyBox, area: Rect) {
-    let prefix = "reply › ";
-    let input = reply.line.input();
-    let mut spans = vec![Span::styled(prefix, Style::default().fg(ACCENT))];
-    if input.is_empty() {
-        let hint = reply.placeholder.as_deref().unwrap_or("enter sends · esc cancels");
-        spans.push(Span::styled(hint.to_string(), Style::default().add_modifier(Modifier::DIM)));
-    } else {
-        spans.push(Span::raw(input.to_string()));
-    }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
-    let col = area.x + prefix.chars().count() as u16 + reply.line.cursor() as u16;
-    frame.set_cursor_position((col.min(area.right().saturating_sub(1)), area.y));
 }
 
 /// Completion-candidate hint: candidates space-joined, the active one bold cyan.
@@ -1674,6 +1719,18 @@ mod tests {
     fn term_pane_size_tiny_frame_is_none() {
         // Too small to carve a usable inner screen.
         assert_eq!(term_pane_size(Rect::new(0, 0, 4, 4), false), None);
+    }
+
+    #[test]
+    fn inbox_areas_split_the_width_at_split_pct() {
+        let area = Rect::new(2, 3, 100, 20);
+        let (list, thread) = inbox_areas(area, 40);
+        assert_eq!((list.x, list.width), (2, 40));
+        assert_eq!((thread.x, thread.width), (42, 60));
+        assert_eq!((list.y, list.height, thread.y, thread.height), (3, 20, 3, 20));
+        // The default split, on an odd width: the thread pane takes the rest.
+        let (list, thread) = inbox_areas(Rect::new(0, 0, 81, 10), crate::tui::app::InboxView::default().split_pct);
+        assert_eq!((list.width, thread.width), (32, 49));
     }
 
     #[test]

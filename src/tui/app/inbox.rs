@@ -2,7 +2,7 @@
 //! `inbox.toml`). The content comes from the store — loaded at startup,
 //! reloaded whenever the file changes, since any dashboard or CLI may write
 //! it — and everything here is view state: the current view, the selection,
-//! the open thread pane, all unit-testable without touching the file.
+//! the focused zone, all unit-testable without touching the file.
 //!
 //! Mutations (`d`, `D`, mark-read, and the pane's actions, replies, done and
 //! reopen) are only *requested* here, as [`crate::inbox::Op`]s the event loop
@@ -13,15 +13,19 @@
 //! requested the same way (`pending_open`).
 //!
 //! The list is one row per thread, newest change first, filtered by a
-//! [`View`] (docs/inbox-threads.md, *Inbox UI*). History lives in the focused
-//! thread pane (`enter`), which shows a thread's timeline, or a notify
-//! thread's earlier records, and shadows the dashboard keys while open.
+//! [`View`] (docs/inbox-threads.md, *Inbox UI* and *Inbox layout v2*). The
+//! thread pane beside it always shows the selected thread: its timeline, or a
+//! notify thread's earlier records. Keys go to one of three [`InboxFocus`]
+//! zones; the thread and its input shadow the dashboard keys.
 //!
-//! Read semantics: a thread is read when it's opened in the pane, and again
-//! whenever it changes while open. Notify records are also read when the user
-//! leaves the Inbox after it showed them: a notify record has no state to
-//! resolve it, so without that every unkeyed `notify` would sit in Needs you
-//! until opened one by one.
+//! Read semantics: a thread is read when it becomes the selected one (it's on
+//! screen in the pane), and again whenever it changes while selected. Reading
+//! a notify record drops it from Needs you, so the selected thread stays
+//! listed until the cursor leaves it ([`InboxView::shown`]); otherwise the
+//! next row would slide under the cursor, get read, and so on down the list.
+//! Notify records are also read when the user leaves the Inbox after it
+//! showed them: a notify record has no state to resolve it, so without that
+//! every unkeyed `notify` would sit in Needs you until selected one by one.
 
 use std::cell::Cell;
 use std::cmp::Reverse;
@@ -34,7 +38,7 @@ use crate::tui::prompt::Prompt;
 
 use super::{App, Tab};
 
-/// Which threads the list shows, cycled with `v`.
+/// Which threads the list shows, stepped with `←`/`→`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum View {
     /// Waiting on the user ([`Thread::needs_you`]): the default, and what the
@@ -59,9 +63,12 @@ impl View {
         }
     }
 
-    fn next(self) -> View {
-        let i = View::ALL.iter().position(|v| *v == self).unwrap_or(0);
-        View::ALL[(i + 1) % View::ALL.len()]
+    /// The view `step` places over (negative: left), clamped at the ends:
+    /// the views read as a strip, and wrapping would jump from All back to
+    /// Needs you on a held arrow key.
+    fn step(self, step: isize) -> View {
+        let i = View::ALL.iter().position(|v| *v == self).unwrap_or(0) as isize;
+        View::ALL[(i + step).clamp(0, View::ALL.len() as isize - 1) as usize]
     }
 
     /// Whether `t` belongs in this view. Archived threads (their owner is
@@ -83,14 +90,36 @@ impl View {
     }
 }
 
+/// Where Inbox keys go. The list is the dashboard's own zone (its keys are
+/// the normal Inbox arms); the thread and the input shadow the dashboard, so
+/// `1`-`9` and the letter keys mean the thread's actions and text there.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum InboxFocus {
+    #[default]
+    List,
+    Thread,
+    /// The reply input at the bottom of the thread pane; always paired with
+    /// [`InboxView::reply`].
+    Input,
+}
+
+/// The list's default share of the Inbox width, in percent.
+const DEFAULT_SPLIT_PCT: u16 = 40;
+
 /// The loaded Inbox plus this dashboard's view state, which is never
 /// persisted: it keys off thread ids, which outlive a reload.
-#[derive(Default)]
 pub struct InboxView {
     content: Inbox,
     pub view: View,
-    /// Id of the thread open in the focused pane.
-    open: Option<u64>,
+    pub focus: InboxFocus,
+    /// The list's share of the width, in percent (the thread pane gets the
+    /// rest). Not saved.
+    pub split_pct: u16,
+    /// Id of the thread the pane shows, i.e. the selected one, as of the last
+    /// [`App::sync_inbox_selection`]. The pane's scroll and reply box belong
+    /// to it, and it stays listed while shown even once it leaves the view
+    /// (see the module doc). `None` off the Inbox tab.
+    shown: Option<u64>,
     /// First pane row shown.
     pub scroll: u16,
     /// Largest useful `scroll`, written by the renderer, which alone knows the
@@ -98,19 +127,32 @@ pub struct InboxView {
     /// the app immutably; it only bounds the scroll keys, so a stale value
     /// costs at most a frame of overscroll.
     pane_max: Cell<u16>,
-    /// The reply input (`r` in the pane), when open.
+    /// The reply input's line, while the input has focus.
     pub reply: Option<ReplyBox>,
 }
 
-/// The one-line reply input over the open thread pane. It reuses the `:`
+impl Default for InboxView {
+    fn default() -> Self {
+        Self {
+            content: Inbox::default(),
+            view: View::default(),
+            focus: InboxFocus::default(),
+            split_pct: DEFAULT_SPLIT_PCT,
+            shown: None,
+            scroll: 0,
+            pane_max: Cell::new(0),
+            reply: None,
+        }
+    }
+}
+
+/// The one-line reply input at the bottom of the thread pane. It reuses the `:`
 /// prompt's editing ([`Prompt`], with no history and no completion): only
 /// what `enter` does differs.
 pub struct ReplyBox {
     /// Id of the thread being replied to.
     pub thread: u64,
     pub line: Prompt,
-    /// The thread's `reply.placeholder`, shown dim while the line is empty.
-    pub placeholder: Option<String>,
 }
 
 impl InboxView {
@@ -133,24 +175,16 @@ impl InboxView {
         self.threads().iter().filter(|t| view.shows(t)).count()
     }
 
-    /// The visible rows: indices into [`Self::threads`] in the current view,
-    /// last change first. The sort is stable, so ties keep the store's order
-    /// (newest arrival first). Cheap, recomputed on demand.
+    /// The visible rows: indices into [`Self::threads`] in the current view
+    /// (plus the shown thread, see [`Self::shown`]), last change first. The
+    /// sort is stable, so ties keep the store's order (newest arrival first).
+    /// Cheap, recomputed on demand.
     pub fn rows(&self) -> Vec<usize> {
         let threads = self.threads();
-        let mut rows: Vec<usize> = (0..threads.len()).filter(|&i| self.view.shows(&threads[i])).collect();
+        let listed = |t: &Thread| self.view.shows(t) || Some(t.id) == self.shown;
+        let mut rows: Vec<usize> = (0..threads.len()).filter(|&i| listed(&threads[i])).collect();
         rows.sort_by_key(|&i| Reverse(threads[i].changed_at()));
         rows
-    }
-
-    /// The thread open in the pane, if it still exists.
-    pub fn open_thread(&self) -> Option<&Thread> {
-        let id = self.open?;
-        self.threads().iter().find(|t| t.id == id)
-    }
-
-    pub fn is_open(&self) -> bool {
-        self.open.is_some()
     }
 
     /// Renderer hook: the pane's largest scroll offset at its current size.
@@ -224,10 +258,10 @@ fn pending_line(t: &Thread) -> Option<String> {
     }
 }
 
-/// Everything the focused pane (and the list's preview) shows for `t`: the
-/// header fields, the message, the timeline (a notify thread's records,
-/// oldest first like a dispatcher's entries), then the numbered actions and
-/// the reply hint. Pure, so what the pane says is unit-testable.
+/// Everything the thread pane shows for `t` above its input: the header
+/// fields, the message, the timeline (a notify thread's records, oldest first
+/// like a dispatcher's entries), then the numbered actions. Pure, so what the
+/// pane says is unit-testable.
 pub fn pane_lines(t: &Thread, child: Option<&ChildInfo>, utc_offset: i64) -> Vec<PaneLine> {
     let mut out = vec![line(Tone::Bold, title_of(t))];
     let mut head: PaneLine = Vec::new();
@@ -330,42 +364,33 @@ pub fn pane_lines(t: &Thread, child: Option<&ChildInfo>, utc_offset: i64) -> Vec
             out.push(row);
         }
     }
-    if let Some(reply) = &t.reply {
-        let hint = reply.placeholder.as_deref().unwrap_or("reply");
-        out.push(Vec::new());
-        out.push(vec![(Tone::Bold, "r ".into()), (Tone::Dim, format!("reply: {hint}"))]);
-    }
+    // No reply hint here: the pane's input box (or its no-replies line) says it.
     out
 }
 
 impl App {
     /// Install Inbox content loaded from the store (startup and every reload),
-    /// keeping the cursor on the thread it was on. A cursor on the top row
-    /// stays on top (the newest); one moved down stays on its thread, wherever
-    /// that moved to.
+    /// keeping the cursor on the thread it was on. In the list, a cursor on
+    /// the top row stays on top (the newest); one moved down stays on its
+    /// thread, wherever that moved to. With the thread or its input focused
+    /// the cursor always stays on its thread: a new arrival must not swap the
+    /// pane (and drop a half-typed reply) under the user.
     pub fn set_inbox(&mut self, inbox: Inbox) {
-        let selected = match self.selected[Tab::Inbox.index()] {
-            0 => None,
+        let selected = match (self.selected[Tab::Inbox.index()], self.inbox.focus) {
+            (0, InboxFocus::List) => None,
             _ => self.selected_inbox_id(),
         };
         self.inbox.content = inbox;
-        match self.inbox.open_thread().map(|t| (t.id, t.unread)) {
-            // Changed while open: the user is looking right at it.
-            Some((id, true)) => self.request_inbox(Op::MarkRead(id)),
-            Some(_) => {}
-            // Removed under the pane (another dashboard, `thread rm`).
-            None => {
-                self.inbox.open = None;
-                self.inbox.reply = None;
-            }
-        }
         self.reselect_inbox(selected);
+        // A change to the selected thread reads it again; one that removed it
+        // (another dashboard, `thread rm`) moves the pane on.
+        self.sync_inbox_selection();
     }
 
     /// Ask the event loop to apply `op` to the store, and apply it here at
     /// once so the next frame shows it (the reload that follows confirms it).
     /// The cursor stays on its thread, or on its row when the thread left
-    /// the view (e.g. a read notify record leaving Needs you).
+    /// the view (e.g. a dismissed notify record).
     pub(super) fn request_inbox(&mut self, op: Op) {
         let selected = self.selected_inbox_id();
         // An event-enqueuing op is the store's to stamp (see the module doc).
@@ -381,22 +406,29 @@ impl App {
         std::mem::take(&mut self.pending_inbox)
     }
 
-    /// Switch tabs. Leaving the Inbox reads the notify records it showed (see
-    /// the module doc); entering Instances refreshes the process rows (they
-    /// aren't fetched elsewhere).
+    /// Switch tabs. Leaving the Inbox resets it to the list and reads the
+    /// notify records it showed (see the module doc); entering it reads the
+    /// selected thread, now in the pane. Entering Instances refreshes the
+    /// process rows (they aren't fetched elsewhere).
     pub(super) fn set_tab(&mut self, tab: Tab) {
         if self.tab == Tab::Inbox && tab != Tab::Inbox {
-            self.inbox.open = None;
+            self.inbox.focus = InboxFocus::List;
             self.inbox.reply = None;
             let unread_notify = self.inbox.threads().iter().any(|t| t.kind == Kind::Notify && t.unread);
             if self.inbox.view.shows_notify() && unread_notify {
                 self.request_inbox(Op::MarkNotifyRead);
             }
+            // Unpinned only now: the cursor follows its thread through the
+            // read above, then the read records may leave the list.
+            let selected = self.selected_inbox_id();
+            self.inbox.shown = None;
+            self.reselect_inbox(selected);
         }
         if tab == Tab::Instances && self.tab != tab {
             self.needs_proc_fetch = true;
         }
         self.tab = tab;
+        self.sync_inbox_selection();
     }
 
     /// Tab-bar title, carrying the needs-you count on the Inbox.
@@ -407,7 +439,7 @@ impl App {
         }
     }
 
-    /// The thread under the Inbox cursor, if any.
+    /// The thread under the Inbox cursor, if any: the one the pane shows.
     pub fn selected_inbox_thread(&self) -> Option<&Thread> {
         let i = *self.inbox.rows().get(self.selected[Tab::Inbox.index()])?;
         self.inbox.threads().get(i)
@@ -429,23 +461,84 @@ impl App {
         self.clamp_selection();
     }
 
-    /// `v` (Inbox tab): the next view, the cursor following its thread.
-    pub(super) fn cycle_inbox_view(&mut self) {
+    /// Bring the pane in line with the cursor, after anything that may have
+    /// moved it (a key, a reload, entering the tab). A newly selected thread
+    /// gets a fresh scroll, drops the previous thread's reply box and stays
+    /// listed while shown; the selected thread is read if it isn't (newly
+    /// selected, or changed while selected). Off the Inbox nothing is on
+    /// screen, so nothing is read.
+    pub(super) fn sync_inbox_selection(&mut self) {
+        if self.tab != Tab::Inbox {
+            return;
+        }
+        let selected = self.selected_inbox_thread().map(|t| (t.id, t.unread));
+        let id = selected.map(|(id, _)| id);
+        if id != self.inbox.shown {
+            self.inbox.shown = id;
+            self.inbox.scroll = 0;
+            self.inbox.reply = None;
+            self.inbox.focus = match (id, self.inbox.focus) {
+                (None, _) => InboxFocus::List,
+                (Some(_), InboxFocus::Input) => InboxFocus::Thread,
+                (Some(_), focus) => focus,
+            };
+            // Pinning it may bring back rows the old pin hid; stay on it.
+            self.reselect_inbox(id);
+        }
+        if let Some((id, true)) = selected {
+            self.request_inbox(Op::MarkRead(id));
+        }
+    }
+
+    /// `←`/`→` (Inbox list): the view `step` over, clamped at the ends, the
+    /// cursor following its thread when the new view lists it.
+    pub(super) fn step_inbox_view(&mut self, step: isize) {
         let selected = self.selected_inbox_id();
-        self.inbox.view = self.inbox.view.next();
+        // Unpinned, so a thread the new view doesn't list isn't kept in it.
+        self.inbox.shown = None;
+        self.inbox.view = self.inbox.view.step(step);
         self.reselect_inbox(selected);
     }
 
-    /// `enter` (Inbox tab): open the selected thread in the pane, reading it.
-    pub(super) fn open_selected_thread(&mut self) {
-        let Some((id, unread)) = self.selected_inbox_thread().map(|t| (t.id, t.unread)) else {
-            return;
-        };
-        self.inbox.open = Some(id);
-        self.inbox.scroll = 0;
-        if unread {
-            self.request_inbox(Op::MarkRead(id));
+    /// `enter` (Inbox list): focus the selected thread's pane.
+    pub(super) fn focus_inbox_thread(&mut self) {
+        if self.selected_inbox_thread().is_some() {
+            self.inbox.focus = InboxFocus::Thread;
         }
+    }
+
+    /// `r`/`i` (list or thread): focus the selected thread's input, when it
+    /// takes replies.
+    pub(super) fn focus_inbox_input(&mut self) {
+        if let Some(t) = self.selected_inbox_thread().cloned() {
+            self.open_reply(&t);
+        }
+    }
+
+    /// The selected thread, owned: the action keys borrow `self` mutably.
+    fn selected_inbox_owned(&self) -> Option<Thread> {
+        self.selected_inbox_thread().cloned()
+    }
+
+    /// The thread keys both zones share, on the selected thread: `o`/`t`/
+    /// `l`/`p` aimed at the thread's target rather than a table row
+    /// (docs/inbox-threads.md, *Decisions*), `d`/`u` done and reopen.
+    /// Whether `key` was one of them.
+    pub(super) fn on_inbox_thread_key(&mut self, key: KeyCode) -> bool {
+        if !matches!(key, KeyCode::Char('o' | 't' | 'l' | 'p' | 'd' | 'u')) {
+            return false;
+        }
+        let Some(t) = self.selected_inbox_owned() else { return true };
+        match key {
+            KeyCode::Char('o') => self.thread_code(&t),
+            KeyCode::Char('t') => self.thread_terminal(&t),
+            KeyCode::Char('l') => self.thread_logs(&t),
+            KeyCode::Char('p') => self.thread_port_prompt(&t),
+            KeyCode::Char('d') => self.dismiss_selected_notification(),
+            KeyCode::Char('u') if t.kind == Kind::Thread => self.reopen_thread(&t),
+            _ => {}
+        }
+        true
     }
 
     /// The child of `t`, resolved through the map the event loop refreshes
@@ -461,26 +554,28 @@ impl App {
         Some(ChildInfo { key, name, status })
     }
 
-    /// Keys while the thread pane is open. It shadows the dashboard like a
-    /// modal does: tab keys, `t`/`l`, `d` and the rest must not act on rows
-    /// the user can't see. Quit, the prompt and help stay reachable.
+    /// Keys while the thread pane or its input has focus. They shadow the
+    /// dashboard like a modal does: tab keys, `d` and the rest mean the
+    /// thread's actions, not the list's. Quit, the prompt and help stay
+    /// reachable.
     pub(super) fn on_key_inbox_pane(&mut self, key: KeyEvent) {
-        // The reply box, when open, takes every key (like the `:` prompt).
-        if self.inbox.reply.is_some() {
+        // The input, when focused, takes every key (like the `:` prompt).
+        if self.inbox.focus == InboxFocus::Input {
             self.on_key_reply(key);
             return;
         }
         self.status = None;
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let Some(t) = self.inbox.open_thread() else {
-            self.inbox.open = None;
+        let Some(t) = self.selected_inbox_owned() else {
+            self.inbox.focus = InboxFocus::List;
             return;
         };
-        // Owned: the action keys below borrow `self` mutably.
-        let t = t.clone();
-        let (kind, link) = (t.kind, t.link.clone().or_else(|| t.head().and_then(|r| r.link.clone())));
+        if !ctrl && self.on_inbox_thread_key(key.code) {
+            return;
+        }
+        let link = t.link.clone().or_else(|| t.head().and_then(|r| r.link.clone()));
         match key.code {
-            KeyCode::Esc => self.inbox.open = None,
+            KeyCode::Esc => self.inbox.focus = InboxFocus::List,
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('c') if ctrl => self.should_quit = true,
             KeyCode::Char(':') => self.open_prompt(),
@@ -490,15 +585,7 @@ impl App {
                 None => self.status = Some("no link on this thread".into()),
             },
             KeyCode::Char(c @ '1'..='9') => self.run_thread_action(&t, c as usize - '1' as usize),
-            // The instance keys, aimed at the thread's target rather than a
-            // table row (docs/inbox-threads.md, *Decisions*).
-            KeyCode::Char('o') => self.thread_code(&t),
-            KeyCode::Char('t') => self.thread_terminal(&t),
-            KeyCode::Char('l') => self.thread_logs(&t),
-            KeyCode::Char('p') => self.thread_port_prompt(&t),
-            KeyCode::Char('r') if kind == Kind::Thread => self.open_reply(&t),
-            KeyCode::Char('u') if kind == Kind::Thread => self.reopen_thread(&t),
-            KeyCode::Char('d') if kind == Kind::Thread => self.mark_thread_done(&t),
+            KeyCode::Char('r' | 'i') => self.open_reply(&t),
             _ => {
                 let lines = self.inbox.pane_max.get().saturating_add(1);
                 let mut scroll = self.inbox.scroll;
@@ -508,10 +595,11 @@ impl App {
         }
     }
 
-    /// `d` (Inbox tab): dismiss a notify thread (its history with it). A
-    /// dispatcher thread is the dispatcher's to drop, so `d` marks it done.
+    /// `d` (Inbox list or thread): dismiss a notify thread (its history with
+    /// it). A dispatcher thread is the dispatcher's to drop, so `d` marks it
+    /// done.
     pub(super) fn dismiss_selected_notification(&mut self) {
-        let Some(t) = self.selected_inbox_thread().cloned() else {
+        let Some(t) = self.selected_inbox_owned() else {
             return;
         };
         match t.kind {
@@ -529,7 +617,7 @@ impl App {
         t.archived
     }
 
-    /// `d` on a dispatcher thread (list or pane): done, with an event.
+    /// `d` on a dispatcher thread: done, with an event.
     pub(super) fn mark_thread_done(&mut self, t: &Thread) {
         if self.refuse_user_op(t) {
             return;
@@ -543,8 +631,8 @@ impl App {
         self.status = Some(format!("marked done{child} · event queued for {}", t.owner_name));
     }
 
-    /// `u` in the pane: reopen a done thread, with an event; its child's done
-    /// flag is cleared too.
+    /// `u`: reopen a done thread, with an event; its child's done flag is
+    /// cleared too.
     fn reopen_thread(&mut self, t: &Thread) {
         if self.refuse_user_op(t) {
             return;
@@ -558,39 +646,41 @@ impl App {
         self.status = Some(format!("reopened{child} · event queued for {}", t.owner_name));
     }
 
-    /// `r` in the pane: open the reply box, when the thread takes replies.
+    /// `r`/`i`: focus the input with an empty line, when the thread takes
+    /// replies; otherwise focus stays where it is, with a hint.
     fn open_reply(&mut self, t: &Thread) {
         if self.refuse_user_op(t) {
             return;
         }
-        let Some(reply) = &t.reply else {
+        if t.reply.is_none() {
             self.status = Some("this thread takes no replies".into());
             return;
-        };
-        self.inbox.reply = Some(ReplyBox {
-            thread: t.id,
-            line: Prompt::new(Vec::new()),
-            placeholder: reply.placeholder.clone(),
-        });
+        }
+        self.inbox.reply = Some(ReplyBox { thread: t.id, line: Prompt::new(Vec::new()) });
+        self.inbox.focus = InboxFocus::Input;
     }
 
-    /// Keys while the reply box is open: `esc` cancels, `enter` sends a
-    /// non-empty reply (an empty one does nothing and keeps the box), the
-    /// rest edits the line as the `:` prompt does.
+    /// Keys while the input has focus: `esc` goes back to the thread (the
+    /// line with it), `enter` sends a non-empty reply and keeps the input,
+    /// empty, for the next one (an empty `enter` does nothing), the rest
+    /// edits the line as the `:` prompt does.
     fn on_key_reply(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let Some(rb) = &mut self.inbox.reply else { return };
+        let Some(rb) = &mut self.inbox.reply else {
+            self.inbox.focus = InboxFocus::Thread;
+            return;
+        };
         let line = &mut rb.line;
         match key.code {
-            KeyCode::Esc => self.inbox.reply = None,
-            KeyCode::Char('c') if ctrl => self.inbox.reply = None,
+            KeyCode::Esc => self.leave_reply(),
+            KeyCode::Char('c') if ctrl => self.leave_reply(),
             KeyCode::Enter => {
                 let text = line.input().trim().to_string();
                 if text.is_empty() {
                     return;
                 }
+                line.clear();
                 let thread = rb.thread;
-                self.inbox.reply = None;
                 let owner = self.inbox.threads().iter().find(|t| t.id == thread).map(|t| t.owner_name.clone());
                 self.request_inbox(Op::Reply { thread, text });
                 self.status = Some(format!("reply queued for {}", owner.unwrap_or_default()));
@@ -606,6 +696,11 @@ impl App {
             KeyCode::Char(c) if !ctrl => line.insert_char(c),
             _ => {}
         }
+    }
+
+    fn leave_reply(&mut self) {
+        self.inbox.reply = None;
+        self.inbox.focus = InboxFocus::Thread;
     }
 
     /// `D` (Inbox tab): clear every notify thread; dispatcher threads stay.
@@ -805,30 +900,38 @@ mod tests {
     }
 
     #[test]
-    fn v_cycles_views_and_selection_follows_the_thread() {
+    fn arrows_step_views_clamped_and_selection_follows_the_thread() {
         let mut app = new_app();
         mixed(&mut app);
         inbox_tab(&mut app);
         assert_eq!(app.inbox.view, View::NeedsYou);
         assert_eq!(rows(&app), ["unread note", "asks"]);
+        app.on_key(key(KeyCode::Left));
+        assert_eq!(app.inbox.view, View::NeedsYou, "clamped at the left end");
         for want in [View::Active, View::Done, View::All] {
-            app.on_key(key(KeyCode::Char('v')));
+            app.on_key(key(KeyCode::Right));
             assert_eq!(app.inbox.view, want);
         }
+        app.on_key(key(KeyCode::Right));
+        assert_eq!(app.inbox.view, View::All, "clamped at the right end");
         for _ in 0..4 {
             app.on_key(key(KeyCode::Down));
         }
         assert_eq!(selected(&app).as_deref(), Some("asks"));
         assert_eq!(app.selected(), 4);
-        // Still visible in the next view: the cursor follows it.
         app.on_key(key(KeyCode::Char('v')));
-        assert_eq!(app.inbox.view, View::NeedsYou, "wraps");
-        assert_eq!(selected(&app).as_deref(), Some("asks"));
-        assert_eq!(app.selected(), 1);
+        assert_eq!(app.inbox.view, View::All, "`v` no longer switches views");
         // Into a view without it: the index clamps.
-        app.on_key(key(KeyCode::Char('v'))); // Active: one row
+        app.on_key(key(KeyCode::Left)); // Done: one row
         assert_eq!(app.selected(), 0);
-        assert_eq!(selected(&app).as_deref(), Some("busy"));
+        assert_eq!(selected(&app).as_deref(), Some("over"));
+        // Still visible in the next view: the cursor follows it.
+        for _ in 0..2 {
+            app.on_key(key(KeyCode::Right));
+        }
+        assert_eq!(app.inbox.view, View::All);
+        assert_eq!(selected(&app).as_deref(), Some("over"));
+        assert_eq!(app.selected(), 2);
     }
 
     #[test]
@@ -836,10 +939,10 @@ mod tests {
         let mut app = new_app();
         mixed(&mut app);
         inbox_tab(&mut app);
-        app.on_key(key(KeyCode::Char('v')));
-        app.on_key(key(KeyCode::Char('v')));
+        app.on_key(key(KeyCode::Right));
+        app.on_key(key(KeyCode::Right));
         // Done's only row, "over", is followed into All.
-        app.on_key(key(KeyCode::Char('v'))); // All
+        app.on_key(key(KeyCode::Right)); // All
         assert_eq!(selected(&app).as_deref(), Some("over"));
         assert_eq!(app.selected(), 2);
 
@@ -859,24 +962,79 @@ mod tests {
         assert_eq!(rows(&app).len(), 1);
     }
 
+    /// A new arrival on top moves a top-row cursor in the list, but never
+    /// one whose thread has focus.
     #[test]
-    fn enter_opens_the_pane_and_esc_closes_it() {
+    fn a_focused_thread_keeps_the_cursor_through_new_arrivals() {
+        let mut app = new_app();
+        put(&mut app, "d", 10, ThreadPut { reply: Some(Reply::default()), ..body("asks", State::NeedsYou) });
+        inbox_tab(&mut app);
+        app.on_key(key(KeyCode::Char('r')));
+        typed(&mut app, "half");
+        put(&mut app, "d", 20, body("newer", State::NeedsYou));
+        assert_eq!(selected(&app).as_deref(), Some("asks"));
+        assert_eq!(app.inbox.focus, InboxFocus::Input);
+        assert_eq!(app.inbox.reply.as_ref().unwrap().line.input(), "half");
+
+        app.on_key(key(KeyCode::Esc));
+        app.on_key(key(KeyCode::Esc));
+        put(&mut app, "d", 30, body("newest", State::NeedsYou));
+        assert_eq!(selected(&app).as_deref(), Some("asks"), "moved down, so it stays");
+        app.on_key(key(KeyCode::Up));
+        app.on_key(key(KeyCode::Up));
+        put(&mut app, "d", 40, body("latest", State::NeedsYou));
+        assert_eq!(selected(&app).as_deref(), Some("latest"), "the top row stays on top");
+    }
+
+    #[test]
+    fn enter_and_esc_step_between_the_zones() {
         let mut app = new_app();
         mixed(&mut app);
         inbox_tab(&mut app);
+        assert_eq!(app.inbox.focus, InboxFocus::List);
         app.on_key(key(KeyCode::Down)); // "asks"
         app.on_key(key(KeyCode::Enter));
-        assert_eq!(app.inbox.open_thread().map(title_of).as_deref(), Some("asks"));
+        assert_eq!(app.inbox.focus, InboxFocus::Thread);
+        assert_eq!(selected(&app).as_deref(), Some("asks"));
         assert_eq!(app.take_pending_open(), None, "enter on the list doesn't open the link");
         app.on_key(key(KeyCode::Esc));
-        assert!(!app.inbox.is_open());
+        assert_eq!(app.inbox.focus, InboxFocus::List);
         assert_eq!(app.tab, Tab::Inbox);
+
+        // Nothing selected: enter stays in the list.
+        app.on_key(key(KeyCode::Right)); // Active
+        app.on_key(key(KeyCode::Right)); // Done
+        let mut inbox = app.inbox.content.clone();
+        inbox.apply(&Op::RemoveThread(thread(&app, "over").id), 0);
+        app.set_inbox(inbox);
+        assert_eq!(selected(&app), None);
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.inbox.focus, InboxFocus::List);
     }
 
-    /// While the pane is open, dashboard keys don't reach the rows or tabs
-    /// underneath.
     #[test]
-    fn the_pane_shadows_dashboard_keys() {
+    fn number_keys_switch_tabs_in_the_list_and_run_actions_in_the_thread() {
+        let mut app = new_app();
+        let actions = vec![Action { id: "post".into(), label: "Post replies".into(), ..Action::default() }];
+        put(&mut app, "d", 10, ThreadPut { actions, ..body("asks", State::NeedsYou) });
+        let id = thread(&app, "asks").id;
+        inbox_tab(&mut app);
+        app.take_pending_inbox();
+        app.on_key(key(KeyCode::Char('1')));
+        assert_eq!(app.tab, Tab::Instances);
+        assert_eq!(app.take_pending_inbox(), []);
+
+        inbox_tab(&mut app);
+        app.on_key(key(KeyCode::Enter));
+        app.on_key(key(KeyCode::Char('1')));
+        assert_eq!(app.tab, Tab::Inbox);
+        assert_eq!(app.take_pending_inbox(), [Op::Act { thread: id, action: "post".into() }]);
+    }
+
+    /// While the thread has focus, dashboard keys don't reach the rows or
+    /// tabs underneath.
+    #[test]
+    fn the_thread_shadows_dashboard_keys() {
         let mut app = new_app();
         push(&mut app, "a", rec("note", None, Some("https://x/1")));
         put(
@@ -891,18 +1049,18 @@ mod tests {
         );
         inbox_tab(&mut app);
         app.on_key(key(KeyCode::Enter)); // "asks", the newest
-        assert_eq!(app.inbox.open_thread().map(title_of).as_deref(), Some("asks"));
+        assert_eq!(app.inbox.focus, InboxFocus::Thread);
         app.take_pending_inbox();
 
-        for c in ['2', '3', '4', 't', 'l', 'D', 'v', 'T', 'x'] {
+        for c in ['2', '3', '4', 'D', 'v', 'T', 'x'] {
             app.on_key(key(KeyCode::Char(c)));
         }
         app.on_key(key(KeyCode::Tab));
+        app.on_key(key(KeyCode::Right));
         assert_eq!(app.tab, Tab::Inbox, "tab keys are shadowed");
-        assert!(app.inbox.is_open());
-        assert_eq!(app.inbox.view, View::NeedsYou, "`v` didn't reach the list");
-        assert!(app.terms.is_empty(), "`t` opened no terminal");
-        assert!(matches!(app.modal, super::super::Modal::None), "`l` opened no logs");
+        assert_eq!(app.inbox.focus, InboxFocus::Thread);
+        assert_eq!(app.inbox.view, View::NeedsYou, "`→` didn't reach the list");
+        assert!(app.terms.is_empty(), "`T` opened no terminal");
         assert_eq!(app.take_pending_inbox(), [], "`D` dismissed nothing");
         assert_eq!(app.inbox.threads().len(), 2);
 
@@ -927,9 +1085,10 @@ mod tests {
     }
 
     #[test]
-    fn pane_scrolls_within_the_rendered_bound() {
+    fn pane_scrolls_within_the_rendered_bound_and_resets_on_selection() {
         let mut app = new_app();
         put(&mut app, "d", 10, body("asks", State::NeedsYou));
+        put(&mut app, "d", 20, body("other", State::NeedsYou));
         inbox_tab(&mut app);
         app.on_key(key(KeyCode::Enter));
         app.inbox.set_pane_max(3);
@@ -939,35 +1098,69 @@ mod tests {
         assert_eq!(app.inbox.scroll, 3);
         app.on_key(key(KeyCode::PageUp));
         assert_eq!(app.inbox.scroll, 0);
+        app.on_key(key(KeyCode::Char('G')));
+        assert_eq!(app.inbox.scroll, 3);
+        // Another thread starts at the top.
+        app.on_key(key(KeyCode::Esc));
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(app.inbox.scroll, 0);
     }
 
     #[test]
-    fn opening_reads_and_a_change_while_open_reads_again() {
+    fn selecting_reads_and_a_change_while_selected_reads_again() {
         let mut app = new_app();
         put(&mut app, "d", 10, body("asks", State::NeedsYou));
-        inbox_tab(&mut app);
-        assert_eq!(app.take_pending_inbox(), [], "entering the tab reads nothing");
-        let id = thread(&app, "asks").id;
-        assert!(thread(&app, "asks").unread);
+        put(&mut app, "d", 20, body("other", State::NeedsYou));
+        assert_eq!(app.take_pending_inbox(), [], "off the Inbox nothing is read");
+        let (asks, other) = (thread(&app, "asks").id, thread(&app, "other").id);
 
-        app.on_key(key(KeyCode::Enter));
-        assert_eq!(app.take_pending_inbox(), [Op::MarkRead(id)]);
+        // Entering the tab reads the first row: it's in the pane.
+        inbox_tab(&mut app);
+        assert_eq!(app.take_pending_inbox(), [Op::MarkRead(other)]);
+        assert!(thread(&app, "asks").unread);
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(app.take_pending_inbox(), [Op::MarkRead(asks)]);
         assert!(!thread(&app, "asks").unread);
 
-        // The dispatcher changes it while it's open: read again on reload.
-        put(&mut app, "d", 20, ThreadPut { status: Some("ci".into()), ..body("asks", State::NeedsYou) });
-        assert_eq!(app.take_pending_inbox(), [Op::MarkRead(id)]);
+        // The dispatcher changes it while it's selected: read again on reload.
+        // (It moves to the top; a cursor moved down stays on it.)
+        put(&mut app, "d", 30, ThreadPut { status: Some("ci".into()), ..body("asks", State::NeedsYou) });
+        assert_eq!(selected(&app).as_deref(), Some("asks"));
+        assert_eq!(app.take_pending_inbox(), [Op::MarkRead(asks)]);
         assert!(!thread(&app, "asks").unread);
         // A change to another thread isn't read for it.
-        put(&mut app, "d", 30, body("other", State::NeedsYou));
+        put(&mut app, "d", 5, ThreadPut { status: Some("x".into()), ..body("other", State::NeedsYou) });
         assert_eq!(app.take_pending_inbox(), []);
         assert!(thread(&app, "other").unread);
 
-        // The open thread removed elsewhere: the pane closes.
+        // The selected thread removed elsewhere: the next one is read.
+        app.on_key(key(KeyCode::Enter));
         let mut inbox = app.inbox.content.clone();
-        inbox.apply(&Op::RemoveThread(id), 0);
+        inbox.apply(&Op::RemoveThread(asks), 0);
         app.set_inbox(inbox);
-        assert!(!app.inbox.is_open());
+        assert_eq!(selected(&app).as_deref(), Some("other"));
+        assert_eq!(app.take_pending_inbox(), [Op::MarkRead(other)]);
+        assert_eq!(app.inbox.focus, InboxFocus::Thread);
+    }
+
+    /// Reading a notify record drops it from Needs you; it stays listed while
+    /// selected, so the cursor doesn't slide onto (and read) the next one.
+    #[test]
+    fn a_read_notify_record_stays_listed_while_selected() {
+        let mut app = new_app();
+        push(&mut app, "a", Record { at: 10, ..rec("n1", None, None) });
+        push(&mut app, "a", Record { at: 20, ..rec("n2", None, None) });
+        push(&mut app, "a", Record { at: 30, ..rec("n3", None, None) });
+        inbox_tab(&mut app);
+        assert_eq!(app.take_pending_inbox(), [Op::MarkRead(thread(&app, "n3").id)]);
+        assert_eq!(rows(&app), ["n3", "n2", "n1"]);
+        assert_eq!(app.inbox.count(View::NeedsYou), 2);
+        // Moving on drops the read one, and reads only the next.
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(app.take_pending_inbox(), [Op::MarkRead(thread(&app, "n2").id)]);
+        assert_eq!(rows(&app), ["n2", "n1"]);
+        assert_eq!(selected(&app).as_deref(), Some("n2"));
+        assert!(thread(&app, "n1").unread);
     }
 
     /// Notify records have no state: leaving the Inbox after seeing them in
@@ -982,18 +1175,37 @@ mod tests {
         assert_eq!(app.take_pending_inbox(), []);
         inbox_tab(&mut app);
         assert_eq!(rows(&app), ["asks", "one"]);
+        assert_eq!(app.take_pending_inbox(), [Op::MarkRead(thread(&app, "asks").id)]);
         app.on_key(key(KeyCode::Char('1')));
         assert_eq!(app.take_pending_inbox(), [Op::MarkNotifyRead]);
         assert_eq!(app.inbox.needs_you(), 1, "the dispatcher's thread still asks");
-        assert!(thread(&app, "asks").unread);
 
         // From a view that doesn't list notify records, nothing is read.
         push(&mut app, "a", rec("two", None, None));
         inbox_tab(&mut app);
-        app.on_key(key(KeyCode::Char('v'))); // Active
+        app.on_key(key(KeyCode::Right)); // Active: empty
+        app.take_pending_inbox();
         app.on_key(key(KeyCode::Char('1')));
         assert_eq!(app.take_pending_inbox(), []);
         assert!(thread(&app, "two").unread);
+    }
+
+    #[test]
+    fn leaving_the_tab_resets_focus_and_drops_the_reply_box() {
+        let mut app = new_app();
+        open_asks(&mut app, Some(Reply::default()));
+        app.on_key(key(KeyCode::Char('r')));
+        typed(&mut app, "half");
+        app.set_tab(Tab::Instances);
+        assert_eq!(app.inbox.focus, InboxFocus::List);
+        assert!(app.inbox.reply.is_none());
+        inbox_tab(&mut app);
+        assert_eq!(app.inbox.focus, InboxFocus::List);
+
+        // From the thread zone too (`tab` is shadowed there, `:` isn't).
+        app.on_key(key(KeyCode::Enter));
+        app.next_tab();
+        assert_eq!(app.inbox.focus, InboxFocus::List);
     }
 
     #[test]
@@ -1002,16 +1214,20 @@ mod tests {
         put(&mut app, "d", 10, body("asks", State::NeedsYou));
         push(&mut app, "a", Record { at: 20, ..rec("n1", None, None) });
         push(&mut app, "a", Record { at: 30, ..rec("n2", None, None) });
+        app.inbox.view = View::All;
         inbox_tab(&mut app);
         assert_eq!(rows(&app), ["n2", "n1", "asks"]);
-        let n2 = thread(&app, "n2").id;
+        let (n1, n2) = (thread(&app, "n1").id, thread(&app, "n2").id);
+        app.take_pending_inbox();
         app.on_key(key(KeyCode::Char('d')));
         assert_eq!(rows(&app), ["n1", "asks"]);
-        assert_eq!(app.take_pending_inbox(), [Op::RemoveThread(n2)]);
+        // The row under the cursor is gone: the next one is selected, so read.
+        assert_eq!(app.take_pending_inbox(), [Op::RemoveThread(n2), Op::MarkRead(n1)]);
 
         // On a dispatcher thread, `d` marks it done (an event for the store).
         app.on_key(key(KeyCode::Down));
         let asks = thread(&app, "asks").id;
+        assert_eq!(app.take_pending_inbox(), [Op::MarkRead(asks)]);
         app.on_key(key(KeyCode::Char('d')));
         assert_eq!(app.take_pending_inbox(), [Op::MarkDone(asks)]);
         assert_eq!(app.status.as_deref(), Some("marked done · event queued for d"));
@@ -1021,6 +1237,25 @@ mod tests {
         assert_eq!(app.take_pending_inbox(), [Op::ClearNotify]);
         assert_eq!(rows(&app), ["asks"]);
         assert_eq!(app.selected(), 0, "re-clamped");
+    }
+
+    #[test]
+    fn list_keys_act_on_the_selected_thread() {
+        let mut app = new_app();
+        put(&mut app, "d", 10, body("asks", State::NeedsYou));
+        put(&mut app, "d", 20, body("other", State::NeedsYou));
+        inbox_tab(&mut app);
+        app.on_key(key(KeyCode::Down)); // "asks"
+        app.take_pending_inbox();
+        // `o` aims at the thread's owner, not an Instances row: none here.
+        app.on_key(key(KeyCode::Char('o')));
+        assert_eq!(app.pending_action, None);
+        assert_eq!(app.status.as_deref(), Some("`d` not found"));
+        assert_eq!(app.inbox.focus, InboxFocus::List);
+        app.on_key(key(KeyCode::Char('d')));
+        assert_eq!(app.take_pending_inbox(), [Op::MarkDone(thread(&app, "asks").id)]);
+        app.on_key(key(KeyCode::Char('u')));
+        assert_eq!(app.status.as_deref(), Some("not done: nothing to reopen"));
     }
 
     #[test]
@@ -1081,7 +1316,7 @@ mod tests {
             assert_eq!(row(n)[..2].iter().map(|(t, _)| *t).collect::<Vec<_>>(), [Tone::Bold, Tone::Plain]);
         }
         assert!(has("[3] Done  → d  ✓ done"), "{text:#?}");
-        assert!(has("reply: next run"));
+        assert!(!has("next run"), "the input shows the placeholder, not the content");
         assert!(!has("waiting for"), "no events yet");
 
         // A child key the owner doesn't have stays visible, unresolved.
@@ -1122,7 +1357,8 @@ mod tests {
         }
     }
 
-    /// `asks` from `d`, taking replies, open in the pane, its read mark flushed.
+    /// `asks` from `d`, taking replies, its thread focused, its read mark
+    /// flushed.
     fn open_asks(app: &mut App, reply: Option<Reply>) -> u64 {
         put(app, "d", 10, ThreadPut { reply, ..body("asks", State::NeedsYou) });
         inbox_tab(app);
@@ -1132,12 +1368,13 @@ mod tests {
     }
 
     #[test]
-    fn r_opens_a_reply_box_that_sends_a_reply() {
+    fn r_focuses_the_input_which_sends_replies_and_stays() {
         let mut app = new_app();
         let id = open_asks(&mut app, Some(Reply { placeholder: Some("next run".into()) }));
         app.on_key(key(KeyCode::Char('r')));
+        assert_eq!(app.inbox.focus, InboxFocus::Input);
         let rb = app.inbox.reply.as_ref().expect("reply box open");
-        assert_eq!((rb.thread, rb.placeholder.as_deref(), rb.line.input()), (id, Some("next run"), ""));
+        assert_eq!((rb.thread, rb.line.input()), (id, ""));
 
         // Keys edit the line, not the pane: `d`, `q`, `1` are just text.
         typed(&mut app, "do q1x");
@@ -1149,10 +1386,19 @@ mod tests {
         assert_eq!(app.take_pending_inbox(), []);
 
         app.on_key(key(KeyCode::Enter));
-        assert!(app.inbox.reply.is_none());
-        assert!(app.inbox.is_open(), "back on the pane");
+        assert_eq!(app.inbox.focus, InboxFocus::Input, "still in the input");
+        assert_eq!(app.inbox.reply.as_ref().unwrap().line.input(), "", "cleared for the next one");
         assert_eq!(app.status.as_deref(), Some("reply queued for d"));
         assert_eq!(flush(&mut app, 20), [Op::Reply { thread: id, text: ">do q1".into() }]);
+        // And again, without leaving the input.
+        typed(&mut app, "more");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.take_pending_inbox(), [Op::Reply { thread: id, text: "more".into() }]);
+        assert_eq!(app.inbox.focus, InboxFocus::Input);
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.inbox.focus, InboxFocus::Thread);
+        app.on_key(key(KeyCode::Char('i')));
+        assert_eq!(app.inbox.focus, InboxFocus::Input, "`i` focuses it too");
         let text: Vec<String> = pane_lines(thread(&app, "asks"), None, 0)
             .iter()
             .map(|l| l.iter().map(|(_, s)| s.as_str()).collect())
@@ -1173,13 +1419,29 @@ mod tests {
         typed(&mut app, "half");
         app.on_key(key(KeyCode::Esc));
         assert!(app.inbox.reply.is_none());
-        assert!(app.inbox.is_open(), "esc closes the box, not the pane");
+        assert_eq!(app.inbox.focus, InboxFocus::Thread, "esc steps back to the thread");
         assert_eq!(app.take_pending_inbox(), []);
-        // Leaving the tab drops a box left open.
+        // From the list, `r` goes straight to the input.
+        app.on_key(key(KeyCode::Esc));
         app.on_key(key(KeyCode::Char('r')));
-        app.inbox.open = None;
-        app.set_tab(Tab::Instances);
+        assert_eq!(app.inbox.focus, InboxFocus::Input);
+        assert!(app.inbox.reply.is_some());
+    }
+
+    #[test]
+    fn a_selection_change_drops_the_reply_box() {
+        let mut app = new_app();
+        open_asks(&mut app, Some(Reply::default()));
+        put(&mut app, "d", 20, body("other", State::NeedsYou));
+        app.on_key(key(KeyCode::Char('r')));
+        typed(&mut app, "half");
+        // The thread is removed under the input: the pane moves on.
+        let mut inbox = app.inbox.content.clone();
+        inbox.apply(&Op::RemoveThread(thread(&app, "asks").id), 0);
+        app.set_inbox(inbox);
+        assert_eq!(selected(&app).as_deref(), Some("other"));
         assert!(app.inbox.reply.is_none());
+        assert_eq!(app.inbox.focus, InboxFocus::Thread);
     }
 
     #[test]
@@ -1189,6 +1451,11 @@ mod tests {
         app.on_key(key(KeyCode::Char('r')));
         assert!(app.inbox.reply.is_none());
         assert_eq!(app.status.as_deref(), Some("this thread takes no replies"));
+        assert_eq!(app.inbox.focus, InboxFocus::Thread, "focus stays");
+        app.on_key(key(KeyCode::Esc));
+        app.on_key(key(KeyCode::Char('i')));
+        assert_eq!(app.status.as_deref(), Some("this thread takes no replies"));
+        assert_eq!(app.inbox.focus, InboxFocus::List, "focus stays");
         assert_eq!(app.take_pending_inbox(), []);
     }
 
@@ -1201,7 +1468,7 @@ mod tests {
         app.on_key(key(KeyCode::Char('d')));
         assert_eq!(flush(&mut app, 20), [Op::MarkDone(id)]);
         assert_eq!(thread(&app, "asks").state, Some(State::Done));
-        assert!(app.inbox.is_open(), "the pane stays on the thread");
+        assert_eq!(app.inbox.focus, InboxFocus::Thread, "the pane stays on the thread");
         app.on_key(key(KeyCode::Char('d')));
         assert_eq!(app.status.as_deref(), Some("already done"));
         assert_eq!(app.take_pending_inbox(), []);
