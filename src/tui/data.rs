@@ -238,6 +238,7 @@ mod tests {
             drift: false,
             instance_id: String::new(),
             dispatcher: None,
+            done: false,
         }
     }
 

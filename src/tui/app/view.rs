@@ -31,6 +31,8 @@ Tables (Instances / Services)
                :start runs services + postStartCommand too; a drifted
                exited instance is rebuilt instead)
   p           forward a port (instance / service selection prefills the prompt)
+  d / u       mark the instance done / not done (Instances; dimmed, kept
+              until removed)
 
 Ports tab
   ↑/k ↓/j     move selection
@@ -51,7 +53,8 @@ Inbox thread pane (shadows the dashboard keys while open)
   1-9         run an action: host verbs run now; the rest (→ owner) is
               an event the dispatcher pulls with `devsbd events`
   r           reply (when the thread takes replies): enter sends, esc cancels
-  d / u       mark done / reopen (each also an event for the dispatcher)
+  d / u       mark done / reopen (each also an event for the dispatcher;
+              also marks / clears the thread's child done)
   o t l p     VS Code / terminal / logs / forward prompt on the thread's
               child (or its sender when it has none)
   esc         close     q quit   : prompt   ? help
@@ -837,6 +840,7 @@ mod tests {
             drift: false,
             instance_id: String::new(),
             dispatcher: None,
+            done: false,
         };
         let rows = vec![
             mk("a", "s", ContainerStatus::Exited("x".into())),

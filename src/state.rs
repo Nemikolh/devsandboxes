@@ -107,6 +107,12 @@ pub struct Instance {
     /// ports every time and no other instance takes them while it's stopped.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub forwarded_ports: BTreeMap<String, u16>,
+    /// Unix secs since the instance was marked done (docs/inbox-threads.md
+    /// "Done instances"): the user (or its dispatcher) is finished with it,
+    /// but it's kept as is until removed. Only display and dispatcher policy
+    /// read it; `start`/autostart leave it set. `None` = not done.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub done: Option<u64>,
     pub created_unix: u64,
 }
 
@@ -243,6 +249,7 @@ mod tests {
                 config_dir: Some("/home/u/.devsandboxes".into()),
                 extra_env: BTreeMap::from([("PR_NUMBER".into(), "42".into())]),
                 forwarded_ports: BTreeMap::from([("8080:3000".into(), 8081)]),
+                done: Some(1_790_900_000),
                 created_unix: Instance::now(),
             },
         );
@@ -259,6 +266,7 @@ mod tests {
         );
         assert_eq!(back.instances["repo-abc1"].extra_env["PR_NUMBER"], "42");
         assert_eq!(back.instances["repo-abc1"].forwarded_ports["8080:3000"], 8081);
+        assert_eq!(back.instances["repo-abc1"].done, Some(1_790_900_000));
     }
 
     #[test]
@@ -289,12 +297,14 @@ mod tests {
         assert_eq!(state.instances["repo"].dispatcher, None);
         assert_eq!(state.instances["repo"].config_dir, None);
         assert!(state.instances["repo"].extra_env.is_empty());
+        assert_eq!(state.instances["repo"].done, None);
         // Pre-reuse entries always had a created branch: `rm` keeps offering it.
         assert!(state.instances["repo"].branch_created);
         let text = toml::to_string_pretty(&state).unwrap();
         assert!(!text.contains("dispatcher") && !text.contains("config_dir"), "{text}");
         assert!(!text.contains("branch_created"), "{text}");
         assert!(!text.contains("extra_env"), "{text}");
+        assert!(!text.contains("done"), "{text}");
     }
 
     #[test]

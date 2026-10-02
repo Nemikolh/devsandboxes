@@ -1,4 +1,4 @@
-//! Control requests and responses: what `devsbd ensure|ls|stop|rm|exec|run|branches|events|thread ls`
+//! Control requests and responses: what `devsbd ensure|ls|stop|rm|done|exec|run|branches|events|thread ls`
 //! sends from a dispatcher's container to the host, and what comes back
 //! (docs/automations.md, "Dispatchers"). One file shared by both crates
 //! (devsbd includes it via `#[path]`) so both ends can't drift; std-only and
@@ -8,8 +8,8 @@
 //! escaped as in `escape.rs` (`\\`, `\n`, `\0`). Request:
 //!
 //! ```text
-//! op ensure             required, once: ensure|ls|stop|rm|exec|run-ls|run-logs|run-wait|run-rm|run-prune|branches|
-//!                       events|events-ack|thread-ls
+//! op ensure             required, once: ensure|ls|stop|rm|done|exec|run-ls|run-logs|run-wait|run-rm|run-prune|
+//!                       branches|events|events-ack|thread-ls
 //! sandbox web           optional, at most once
 //! key pr-123            optional, at most once
 //! branch feat/x         optional, at most once
@@ -84,6 +84,9 @@ pub enum Op {
     Ls,
     Stop,
     Rm,
+    /// Mark a child done (docs/inbox-threads.md, "Done instances"); an
+    /// `ensure` that reuses it clears the flag again.
+    Done,
     /// Start a run in a child (`devsbd run start` there); body = run id.
     Exec,
     /// A child's runs (`devsbd run ls` there).
@@ -107,11 +110,12 @@ pub enum Op {
 }
 
 impl Op {
-    pub const ALL: [Op; 14] = [
+    pub const ALL: [Op; 15] = [
         Op::Ensure,
         Op::Ls,
         Op::Stop,
         Op::Rm,
+        Op::Done,
         Op::Exec,
         Op::RunLs,
         Op::RunLogs,
@@ -134,6 +138,7 @@ impl Op {
             Op::Ls => "ls",
             Op::Stop => "stop",
             Op::Rm => "rm",
+            Op::Done => "done",
             Op::Exec => "exec",
             Op::RunLs => "run-ls",
             Op::RunLogs => "run-logs",

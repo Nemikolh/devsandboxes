@@ -1,12 +1,57 @@
-//! One-key instance actions (stop/start, open in VS Code, stop forward) and
-//! the pending-request queue `tui::mod` drains onto background threads.
+//! One-key instance actions (stop/start, done/undone, open in VS Code, stop
+//! forward) and the pending-request queue `tui::mod` drains onto background
+//! threads.
 
 use crate::tui::data::ContainerStatus;
 use crate::tui::prompt::PromptAction;
 
 use super::{App, PortRequest};
 
+/// A done-flag write for the event loop (`commands::done::set_saved`, off the
+/// UI thread).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingDone {
+    /// State key (a snapshot row name).
+    pub instance: String,
+    /// Set (`true`) or clear the flag.
+    pub done: bool,
+    /// Whether the outcome replaces the status line. A thread's child write
+    /// leaves the thread's own status (which already names the child) unless
+    /// it fails.
+    pub report: bool,
+}
+
 impl App {
+    /// `d` / `u` (Instances tab): mark the instance under the cursor done, or
+    /// clear it. A no-op off an instance (process rows are filtered by the
+    /// caller); an instance already in the wanted state only gets a status.
+    pub(super) fn set_selected_done(&mut self, done: bool) {
+        let Some(i) = self.selected_instance_index() else {
+            return;
+        };
+        let Some(row) = self.snapshot.as_ref().and_then(|s| s.instances.get(i)) else {
+            return;
+        };
+        let name = row.name.clone();
+        if row.done == done {
+            self.status = Some(if done { format!("`{name}` is already done") } else { format!("`{name}` is not done") });
+            return;
+        }
+        self.status = Some(format!("marking {name} {}…", if done { "done" } else { "not done" }));
+        self.pending_done.push(PendingDone { instance: name, done, report: true });
+    }
+
+    /// Queue a done-flag write for `instance` on behalf of an Inbox thread
+    /// (its outcome only shows on failure).
+    pub(super) fn request_child_done(&mut self, instance: String, done: bool) {
+        self.pending_done.push(PendingDone { instance, done, report: false });
+    }
+
+    /// Take the pending done-flag writes for the event loop to spawn.
+    pub fn take_pending_done(&mut self) -> Vec<PendingDone> {
+        std::mem::take(&mut self.pending_done)
+    }
+
     /// `d` (Ports tab): stop the selected forward, queuing its id for the event
     /// loop (step 10) to remove on its worker thread. No-op with no row selected.
     pub(super) fn stop_selected_forward(&mut self) {
@@ -158,6 +203,54 @@ mod tests {
         app.on_key(key(KeyCode::Char('d')));
         assert_eq!(app.take_pending_unport(), Some(1));
         assert_eq!(app.status.as_deref(), Some("stopping 127.0.0.1:3001"));
+    }
+
+    #[test]
+    fn d_and_u_on_an_instance_queue_the_done_flag() {
+        let mut app = new_app();
+        app.set_snapshot(snapshot_with(1));
+        app.on_key(key(KeyCode::Down)); // onto inst0
+        app.on_key(key(KeyCode::Char('d')));
+        assert_eq!(
+            app.take_pending_done(),
+            [PendingDone { instance: "inst0".into(), done: true, report: true }]
+        );
+        assert_eq!(app.status.as_deref(), Some("marking inst0 done…"));
+        // Not done yet: `u` only says so.
+        app.on_key(key(KeyCode::Char('u')));
+        assert_eq!(app.take_pending_done(), []);
+        assert_eq!(app.status.as_deref(), Some("`inst0` is not done"));
+
+        let mut snap = snapshot_with(1);
+        snap.instances[0].done = true;
+        app.set_snapshot(snap);
+        app.on_key(key(KeyCode::Char('u')));
+        assert_eq!(
+            app.take_pending_done(),
+            [PendingDone { instance: "inst0".into(), done: false, report: true }]
+        );
+        app.on_key(key(KeyCode::Char('d')));
+        assert_eq!(app.take_pending_done(), []);
+        assert_eq!(app.status.as_deref(), Some("`inst0` is already done"));
+    }
+
+    #[test]
+    fn d_and_u_off_an_instance_queue_nothing() {
+        // A process row.
+        let mut app = app_on_proc_row(&["10"]);
+        app.on_key(key(KeyCode::Char('d')));
+        app.on_key(key(KeyCode::Char('u')));
+        assert_eq!(app.take_pending_done(), []);
+        // The sandbox node.
+        let mut app = new_app();
+        app.set_snapshot(snapshot_with(1));
+        app.on_key(key(KeyCode::Char('d')));
+        assert_eq!(app.take_pending_done(), []);
+        // Another tab.
+        app.on_key(key(KeyCode::Down));
+        app.tab = Tab::Services;
+        app.on_key(key(KeyCode::Char('d')));
+        assert_eq!(app.take_pending_done(), []);
     }
 
     #[test]

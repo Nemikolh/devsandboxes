@@ -74,6 +74,8 @@ pub struct InstanceRow {
     /// instance that no longer exists (an orphaned child).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dispatcher: Option<String>,
+    /// Marked done (`state::Instance::done`): shown dimmed until removed.
+    pub done: bool,
 }
 
 /// One sandbox row from `devsandboxes.toml`, everything the Instances tree needs to
@@ -628,37 +630,7 @@ pub fn collect_with(dir: &Path, depth: Depth) -> Snapshot {
 
     let mut instances = Vec::with_capacity(state.instances.len());
     for (name, inst) in &state.instances {
-        let status = classify(&inst.container, &ps);
-        let (cpu, mem) = match stats.get(&inst.container) {
-            Some((c, m)) => (Some(c.clone()), Some(m.clone())),
-            None => (None, None),
-        };
-        let (services, drift) = match resolved.get(&inst.sandbox) {
-            Some((svcs, hash, build)) => {
-                (svcs.clone(), listed_drifted(&inst.container, hash, build, &ps))
-            }
-            None => (Vec::new(), false),
-        };
-
-        instances.push(InstanceRow {
-            name: name.clone(),
-            sandbox: inst.sandbox.clone(),
-            container: inst.container.clone(),
-            status,
-            uptime_secs: now_unix.saturating_sub(inst.created_unix),
-            cpu,
-            mem,
-            folder: inst.folder.display().to_string(),
-            worktree: inst.worktree.is_some(),
-            services,
-            workspace: inst.workspace.clone(),
-            remote_user: inst.remote_user.clone(),
-            remote_env_len: inst.remote_env.len(),
-            base_folder: inst.base_folder.display().to_string(),
-            drift,
-            instance_id: inst.instance_id.clone(),
-            dispatcher: inst.dispatcher.clone(),
-        });
+        instances.push(instance_row(name, inst, &ps, &stats, &resolved, now_unix));
     }
 
     // Services view: (instance name, persistent id, service list of its
@@ -720,6 +692,47 @@ pub fn collect_with(dir: &Path, depth: Depth) -> Snapshot {
 /// The runtime's server version, cached for the process once it answers (a
 /// failure is retried next collection, so a runtime that starts late still
 /// shows up).
+/// Join one state entry with the runtime listing, stats and its resolved
+/// sandbox (`resolved`: name → (services, config hash, build hash)).
+fn instance_row(
+    name: &str,
+    inst: &crate::state::Instance,
+    ps: &[ContainerRow],
+    stats: &BTreeMap<String, (String, String)>,
+    resolved: &BTreeMap<String, (Vec<String>, String, String)>,
+    now_unix: u64,
+) -> InstanceRow {
+    let status = classify(&inst.container, ps);
+    let (cpu, mem) = match stats.get(&inst.container) {
+        Some((c, m)) => (Some(c.clone()), Some(m.clone())),
+        None => (None, None),
+    };
+    let (services, drift) = match resolved.get(&inst.sandbox) {
+        Some((svcs, hash, build)) => (svcs.clone(), listed_drifted(&inst.container, hash, build, ps)),
+        None => (Vec::new(), false),
+    };
+    InstanceRow {
+        name: name.to_string(),
+        sandbox: inst.sandbox.clone(),
+        container: inst.container.clone(),
+        status,
+        uptime_secs: now_unix.saturating_sub(inst.created_unix),
+        cpu,
+        mem,
+        folder: inst.folder.display().to_string(),
+        worktree: inst.worktree.is_some(),
+        services,
+        workspace: inst.workspace.clone(),
+        remote_user: inst.remote_user.clone(),
+        remote_env_len: inst.remote_env.len(),
+        base_folder: inst.base_folder.display().to_string(),
+        drift,
+        instance_id: inst.instance_id.clone(),
+        dispatcher: inst.dispatcher.clone(),
+        done: inst.done.is_some(),
+    }
+}
+
 fn runtime_version(rt: &dyn crate::runtime::Backend) -> Option<String> {
     static CACHED: Mutex<Option<String>> = Mutex::new(None);
     let mut cached = CACHED.lock().unwrap_or_else(|e| e.into_inner());
@@ -770,6 +783,22 @@ extends = "does-not-exist"
 
         assert_eq!(errors.len(), 1, "got: {errors:?}");
         assert!(errors[0].contains("sandbox `broken`"), "got: {errors:?}");
+    }
+
+    #[test]
+    fn instance_row_carries_the_done_flag() {
+        let mut state: crate::state::State = toml::from_str(
+            "[instance.a]\nsandbox = \"web\"\ncontainer = \"c\"\nfolder = \"/f\"\nworkspace = \"/w\"\ncreated_unix = 0\n",
+        )
+        .unwrap();
+        let (ps, stats, resolved) = (Vec::new(), BTreeMap::new(), BTreeMap::new());
+        let row = instance_row("a", &state.instances["a"], &ps, &stats, &resolved, 0);
+        assert!(!row.done);
+        assert_eq!(serde_json::to_value(&row).unwrap()["done"], false);
+        state.instances.get_mut("a").unwrap().done = Some(5);
+        let row = instance_row("a", &state.instances["a"], &ps, &stats, &resolved, 0);
+        assert!(row.done);
+        assert_eq!(serde_json::to_value(&row).unwrap()["done"], true);
     }
 
     #[test]

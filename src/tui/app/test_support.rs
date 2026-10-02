@@ -53,6 +53,7 @@ pub(super) fn snapshot_with(n: usize) -> Snapshot {
             drift: false,
             instance_id: String::new(),
             dispatcher: None,
+            done: false,
         })
         .collect();
     let sandboxes = vec![SandboxRow {
@@ -128,6 +129,7 @@ pub(super) fn orphan_snapshot() -> Snapshot {
         drift: false,
         instance_id: String::new(),
         dispatcher: None,
+        done: false,
     }];
     Snapshot {
         instances,

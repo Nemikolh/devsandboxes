@@ -61,14 +61,15 @@ impl App {
             return;
         }
         let queued = action.enqueues_event().then(|| {
-            // Step 7: a `done: true` action also marks the child done here.
             let what = if action.done { "done" } else { "event" };
             format!("{what} queued for {}", t.owner_name)
         });
         let act = Op::Act { thread: t.id, action: action.id.clone() };
         let Some(host) = &action.host else {
-            self.request_inbox(act);
-            self.status = Some(format!("[{}] {} · {}", n + 1, action.label, queued.unwrap_or_default()));
+            let child = self.send_act(t, act, action.done);
+            let parts: Vec<String> =
+                [Some(format!("[{}] {}", n + 1, action.label)), child, queued].into_iter().flatten().collect();
+            self.status = Some(parts.join(" · "));
             return;
         };
         let later = queued.as_deref();
@@ -87,12 +88,11 @@ impl App {
         match host {
             HostVerb::Vscode(v) => {
                 let dropped = v.path.as_ref().map(|p| format!("{p} not opened: no --goto yet"));
-                let note: Vec<&str> = dropped.as_deref().into_iter().chain(later).collect();
+                let child = later.is_some().then(|| self.send_act(t, act, action.done)).flatten();
+                let note: Vec<&str> =
+                    dropped.as_deref().into_iter().chain(child.as_deref()).chain(later).collect();
                 self.code_note = (!note.is_empty()).then(|| note.join(" · "));
                 self.pending_action = Some(PromptAction::Code { instance: target });
-                if later.is_some() {
-                    self.request_inbox(act);
-                }
                 return;
             }
             HostVerb::Terminal(_) => self.open_instance_terminal(&target),
@@ -110,11 +110,37 @@ impl App {
             }
         }
         if let Some(later) = later {
-            self.request_inbox(act);
-            self.status = Some(match self.status.take() {
-                Some(s) => format!("{s} · {later}"),
-                None => later.to_string(),
-            });
+            let child = self.send_act(t, act, action.done);
+            let parts: Vec<String> =
+                [self.status.take(), child, Some(later.to_string())].into_iter().flatten().collect();
+            self.status = Some(parts.join(" · "));
+        }
+    }
+
+    /// Queue `act`'s event; a `done: true` action also marks the thread's
+    /// child done (docs/inbox-threads.md, *Actions*). The child's status note,
+    /// if any.
+    fn send_act(&mut self, t: &Thread, act: Op, done: bool) -> Option<String> {
+        self.request_inbox(act);
+        if done { self.mark_thread_child(t, true) } else { None }
+    }
+
+    /// Set or clear the done flag of `t`'s `child` (*Decisions*: the thread's
+    /// done/reopen carries to its child), resolved like [`Self::thread_target`]
+    /// but never falling back to the owner: a dispatcher isn't done because
+    /// one of its threads is. The status note: what was queued, or why the
+    /// child was left alone (the thread op still happens); `None` without a
+    /// `child`.
+    pub(super) fn mark_thread_child(&mut self, t: &Thread, done: bool) -> Option<String> {
+        let key = t.child.as_ref()?;
+        let what = if done { "done" } else { "not done" };
+        match self.thread_children.get(&t.owner).and_then(|keys| keys.get(key)).cloned() {
+            Some(name) => {
+                let note = format!("child {name} {what}");
+                self.request_child_done(name, done);
+                Some(note)
+            }
+            None => Some(format!("child `{key}` not found: not marked {what}")),
         }
     }
 
@@ -424,6 +450,79 @@ mod tests {
         assert_eq!((app.take_pending_open(), app.pending_action.take(), app.take_pending_port()), (None, None, None));
         assert!(app.terms.is_empty() && matches!(app.modal, Modal::None));
         assert_eq!(app.take_pending_inbox(), []);
+    }
+
+    fn child_done(name: &str, done: bool) -> Vec<super::super::PendingDone> {
+        vec![super::super::PendingDone { instance: name.into(), done, report: false }]
+    }
+
+    #[test]
+    fn done_and_reopen_carry_to_the_child() {
+        let mut app = app_with_instances();
+        children(&mut app, "d-id", "pr-1", "inst1");
+        open_thread(&mut app, Some("pr-1"), Vec::new());
+        app.on_key(key(KeyCode::Char('d')));
+        assert_eq!(app.take_pending_done(), child_done("inst1", true));
+        assert_eq!(app.status.as_deref(), Some("marked done · child inst1 done · event queued for inst0"));
+
+        // `u` on a done thread clears the child's flag.
+        let mut app = app_with_instances();
+        children(&mut app, "d-id", "pr-1", "inst1");
+        let mut inbox = Inbox::default();
+        let put = ThreadPut { key: "k".into(), title: "asks".into(), state: State::Done, child: Some("pr-1".into()), ..ThreadPut::default() };
+        inbox.put("d-id", "inst0", 10, put);
+        app.set_inbox(inbox);
+        app.on_key(key(KeyCode::Char('4')));
+        app.inbox.view = super::super::View::All;
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.inbox.is_open());
+        app.on_key(key(KeyCode::Char('u')));
+        assert_eq!(app.take_pending_done(), child_done("inst1", false));
+        assert!(app.status.as_deref().unwrap().starts_with("reopened · child inst1 not done"), "{:?}", app.status);
+    }
+
+    #[test]
+    fn done_without_a_resolvable_child_is_thread_only() {
+        // No child: nothing to mark, nothing said about it.
+        let mut app = app_with_instances();
+        open_thread(&mut app, None, Vec::new());
+        app.on_key(key(KeyCode::Char('d')));
+        assert_eq!(app.take_pending_done(), []);
+        assert_eq!(app.status.as_deref(), Some("marked done · event queued for inst0"));
+        // A child that's gone: the thread is still done, with a note.
+        let mut app = app_with_instances();
+        open_thread(&mut app, Some("pr-1"), Vec::new());
+        app.on_key(key(KeyCode::Char('d')));
+        assert_eq!(app.take_pending_done(), []);
+        assert!(!app.take_pending_inbox().is_empty());
+        assert!(app.status.as_deref().unwrap().contains("child `pr-1` not found: not marked done"), "{:?}", app.status);
+    }
+
+    #[test]
+    fn a_done_action_marks_the_child_done() {
+        let mut app = app_with_instances();
+        children(&mut app, "d-id", "pr-1", "inst1");
+        open_thread(&mut app, Some("pr-1"), vec![
+            Action { done: true, ..act("Merged", None) },
+            Action { done: true, ..act("Code", Some(HostVerb::Vscode(Vscode::default()))) },
+            Action { done: true, ..act("Logs", Some(HostVerb::Logs(NoArgs {}))) },
+            act("Post", None),
+        ]);
+        app.on_key(key(KeyCode::Char('1')));
+        assert_eq!(app.take_pending_done(), child_done("inst1", true));
+        assert_eq!(app.status.as_deref(), Some("[1] Merged · child inst1 done · done queued for inst0"));
+
+        app.on_key(key(KeyCode::Char('2')));
+        assert_eq!(app.take_pending_done(), child_done("inst1", true));
+        assert_eq!(app.code_note.take().as_deref(), Some("child inst1 done · done queued for inst0"));
+
+        app.on_key(key(KeyCode::Char('3')));
+        assert_eq!(app.take_pending_done(), child_done("inst1", true));
+        app.on_key(key(KeyCode::Esc)); // close the logs modal
+
+        // A plain event action leaves the child alone.
+        app.on_key(key(KeyCode::Char('4')));
+        assert_eq!(app.take_pending_done(), []);
     }
 
     /// A host-only button never reaches the owner; one whose host verb

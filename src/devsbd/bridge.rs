@@ -234,12 +234,12 @@ fn dispatch_control(key: &str, req: &Request) -> Response {
     dispatch::handle(key, req)
 }
 
-/// Whether `op` runs a `devsandbox` subprocess that writes `state.toml`
-/// ([`dispatch_control`] serializes those). Run ops, `run-rm`/`run-prune`
-/// included, only exec in a child.
+/// Whether `op` writes `state.toml`, by a `devsandbox` subprocess or (`done`)
+/// in the handler ([`dispatch_control`] serializes those). Run ops,
+/// `run-rm`/`run-prune` included, only exec in a child.
 fn writes_state(op: crate::devsbd::control::Op) -> bool {
     use crate::devsbd::control::Op;
-    matches!(op, Op::Ensure | Op::Stop | Op::Rm)
+    matches!(op, Op::Ensure | Op::Stop | Op::Rm | Op::Done)
 }
 
 /// Room over `notify::MAX_RECORD` before a notify stream counts as oversized:
@@ -760,7 +760,7 @@ mod tests {
     fn only_state_writing_ops_take_the_control_lock() {
         use crate::devsbd::control::Op;
         let locked: Vec<Op> = Op::ALL.into_iter().filter(|op| writes_state(*op)).collect();
-        assert_eq!(locked, [Op::Ensure, Op::Stop, Op::Rm]);
+        assert_eq!(locked, [Op::Ensure, Op::Stop, Op::Rm, Op::Done]);
     }
 
     #[test]

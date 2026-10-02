@@ -33,6 +33,8 @@ export interface InstanceRow {
   base_folder: string;
   /** Container no longer matches the current config/dockerfile; `rebuild` recreates it. */
   drift: boolean;
+  /** Marked done (`done()`); kept as is until removed. */
+  done: boolean;
 }
 
 /** One `[sandbox.*]` from devsandboxes.toml (`ls()`, `status().sandboxes`). */
@@ -111,6 +113,8 @@ export interface ContainerRow {
   state: string;
   labels: Record<string, string>;
   host_ports: string[];
+  /** The container's instance is marked done (`false` for service containers). */
+  done: boolean;
 }
 
 /** Resource usage of one running container (`stats()`), pre-rendered. */
@@ -196,6 +200,10 @@ export declare function stop(target: Target, opts?: CommonOptions): Promise<void
 /** Recreate from current config when drifted (`force`: even without drift). */
 export declare function rebuild(target: Target, opts?: CommonOptions & { force?: boolean }): Promise<void>;
 export declare function rename(name: string, newName: string, opts?: CommonOptions): Promise<void>;
+/** Mark an instance done: kept as is (container, worktree), shown dimmed until removed. */
+export declare function done(name: string, opts?: CommonOptions): Promise<void>;
+/** Clear an instance's done mark. */
+export declare function undone(name: string, opts?: CommonOptions): Promise<void>;
 /**
  * Remove container, worktree, and state entry. Rejects, removing nothing,
  * when the worktree has uncommitted or untracked changes, unless `force`.

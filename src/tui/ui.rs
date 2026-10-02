@@ -1134,6 +1134,9 @@ fn instance_tree_row(
     if let Some(owner) = owner {
         name.push(Span::styled(format!(" {owner}"), Style::default().add_modifier(Modifier::DIM)));
     }
+    if r.done {
+        name.push(Span::raw(" ✓"));
+    }
     let name = Cell::from(Line::from(name));
     let mut cells = vec![
         name,
@@ -1145,7 +1148,9 @@ fn instance_tree_row(
         Cell::from(services),
     ];
     cells.extend(kind.map(Cell::from));
-    Row::new(cells)
+    // Done: kept as is until removed, so it stays listed but recedes.
+    let style = if r.done { Style::default().add_modifier(Modifier::DIM) } else { Style::default() };
+    Row::new(cells).style(style)
 }
 
 /// Render a process row (or its placeholder) for the instance at `instance`.
@@ -1391,7 +1396,7 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
             // `r` and `s` mirror what the key would do to the selection:
             // run vs rename, stop vs start.
             Tab::Instances => format!(
-                "q quit · tab switch · ↑↓ select · ←→ fold · enter config · r {} · o vscode · s {} · l logs · p forward · t term · : cmd · ? help",
+                "q quit · tab switch · ↑↓ select · ←→ fold · enter config · r {} · o vscode · s {} · d/u done · l logs · p forward · t term · : cmd · ? help",
                 app.run_rename_hint(),
                 app.stop_start_hint()
             ),

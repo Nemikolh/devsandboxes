@@ -1,4 +1,4 @@
-//! `devsbd ensure|ls|branches|stop|rm|exec`, `devsbd run ls|logs|wait|rm|prune <key> …`,
+//! `devsbd ensure|ls|branches|stop|rm|done|exec`, `devsbd run ls|logs|wait|rm|prune <key> …`,
 //! `devsbd events [--wait SECS]`, `devsbd events ack <id>...` and `devsbd
 //! thread ls`: a dispatcher's control commands (docs/automations.md, "Control
 //! API", "Runs"; docs/inbox-threads.md, *Events*). Each request is one encoded [`control::Request`] sent to the
@@ -22,6 +22,7 @@ const USAGE: &str = "usage: devsbd ensure <sandbox> --key <key> [--branch B] [--
        devsbd branches <sandbox> [--ahead]\n\
        devsbd stop <key> [--sandbox S]\n\
        devsbd rm <key> [--sandbox S]\n\
+       devsbd done <key> [--sandbox S]\n\
        devsbd exec <key> [--sandbox S] [--detach] -- <cmd>...\n\
        devsbd run ls <key> [--sandbox S]\n\
        devsbd run logs <key> <id> [--sandbox S] [--follow]\n\
@@ -191,7 +192,7 @@ fn parse_args(verb: &str, args: &[String]) -> Result<Cmd, String> {
     let (wanted, what) = match op {
         Op::Ls | Op::Events | Op::ThreadLs | Op::EventsAck => (0, "no arguments"),
         Op::Ensure | Op::Branches => (1, "exactly one <sandbox>"),
-        Op::Stop | Op::Rm | Op::Exec | Op::RunLs | Op::RunPrune => (1, "exactly one <key>"),
+        Op::Stop | Op::Rm | Op::Done | Op::Exec | Op::RunLs | Op::RunPrune => (1, "exactly one <key>"),
         Op::RunLogs | Op::RunWait | Op::RunRm => (2, "<key> <id>"),
     };
     if positional.len() != wanted {
@@ -433,6 +434,10 @@ mod tests {
         assert_eq!(parse("ls", &[]).unwrap(), req(Op::Ls, None, None));
         assert_eq!(parse("stop", &["pr-1"]).unwrap(), req(Op::Stop, None, Some("pr-1")));
         assert_eq!(parse("rm", &["pr-1", "--sandbox", "web"]).unwrap(), req(Op::Rm, Some("web"), Some("pr-1")));
+        assert_eq!(parse("done", &["pr-1"]).unwrap(), req(Op::Done, None, Some("pr-1")));
+        assert_eq!(parse("done", &["pr-1", "--sandbox=web"]).unwrap(), req(Op::Done, Some("web"), Some("pr-1")));
+        assert!(parse("done", &[]).unwrap_err().contains("exactly one <key>"));
+        assert_eq!(parse("done", &["k", "--force"]).unwrap_err(), "unknown option `--force`");
         assert_eq!(parse("branches", &["web"]).unwrap(), req(Op::Branches, Some("web"), None));
         assert_eq!(
             parse("branches", &["--ahead", "web"]).unwrap(),

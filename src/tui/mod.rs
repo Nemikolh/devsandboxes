@@ -219,6 +219,9 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
     // Background process signals (SIGTERM/SIGKILL from a process row); no guard
     // needed since each keypress targets a concrete pid.
     let mut signals: Vec<Receiver<OpDone>> = Vec::new();
+    // Background done-flag writes (`d`/`u`, a thread's child); the `bool` is
+    // `PendingDone::report`.
+    let mut dones: Vec<(bool, Receiver<OpDone>)> = Vec::new();
     let mut last_tick = Instant::now();
     // At most one process fetch in flight; `Some` while one is running.
     let mut proc_pending: Option<Receiver<BTreeMap<String, ProcState>>> = None;
@@ -328,6 +331,9 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
         // A process-row SIGTERM/SIGKILL was requested: send it off-thread.
         if let Some(sig) = app.take_pending_signal() {
             signals.push(spawn_signal(sig));
+        }
+        for req in app.take_pending_done() {
+            dones.push((req.report, spawn_done(req.instance, req.done)));
         }
         // An Inbox link: hand it to the desktop opener.
         if let Some(link) = app.take_pending_open() {
@@ -440,6 +446,24 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
             Ok(done) => {
                 app.status = Some(done.status);
                 app.needs_proc_fetch = true;
+                false
+            }
+            Err(TryRecvError::Empty) => true,
+            Err(TryRecvError::Disconnected) => false,
+        });
+
+        // Drain finished done-flag writes: report (a thread's child only on
+        // failure) and resnapshot so the row dims or brightens now.
+        dones.retain_mut(|(report, rx)| match rx.try_recv() {
+            Ok(done) => {
+                if *report || done.failed {
+                    app.status = Some(done.status);
+                }
+                last_tick = Instant::now();
+                followup.schedule(last_tick);
+                if pending.is_none() {
+                    pending = Some(spawn_collect(&dir, &mut stats_clock));
+                }
                 false
             }
             Err(TryRecvError::Empty) => true,
@@ -677,6 +701,9 @@ fn local_utc_offset() -> i64 {
 struct OpDone {
     /// One-line outcome for the help-bar status.
     status: String,
+    /// The op failed (only `spawn_done` reads it: a thread's child write
+    /// reports failures alone).
+    failed: bool,
 }
 
 /// Spawn a detached thread that stops `instance` (docker stop can block ~10s on
@@ -699,7 +726,7 @@ fn spawn_stop(instance: &str) -> Receiver<OpDone> {
             },
             Err(e) => format!("stop: {e:#}"),
         };
-        let _ = tx.send(OpDone { status });
+        let _ = tx.send(OpDone { status, failed: false });
     });
     rx
 }
@@ -733,7 +760,23 @@ fn spawn_start(instance: &str) -> Receiver<OpDone> {
             },
             Err(e) => format!("start: {e:#}"),
         };
-        let _ = tx.send(OpDone { status });
+        let _ = tx.send(OpDone { status, failed: false });
+    });
+    rx
+}
+
+/// Spawn a detached thread that sets or clears `instance`'s done flag in
+/// state (`commands::done::set_saved`: no stdout/stderr, the TUI owns the
+/// terminal) and reports a one-line status back. `instance` is a state key.
+fn spawn_done(instance: String, done: bool) -> Receiver<OpDone> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let verb = if done { "done" } else { "undone" };
+        let (status, failed) = match commands::done::set_saved(&instance, done) {
+            Ok(status) => (status, false),
+            Err(e) => (format!("{verb}: {e:#}"), true),
+        };
+        let _ = tx.send(OpDone { status, failed });
     });
     rx
 }
@@ -752,7 +795,7 @@ fn spawn_signal(sig: PendingSignal) -> Receiver<OpDone> {
             Ok(()) => format!("sent {} to pid {}", sig.signal.name(), sig.pid),
             Err(e) => format!("{}: {e:#}", sig.signal.name()),
         };
-        let _ = tx.send(OpDone { status });
+        let _ = tx.send(OpDone { status, failed: false });
     });
     rx
 }

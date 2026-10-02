@@ -1,5 +1,6 @@
 pub mod autostart;
 pub mod dispatch;
+pub mod done;
 pub mod exec;
 pub mod inspect;
 pub mod logs;
@@ -244,6 +245,7 @@ mod tests {
             config_dir: None,
             extra_env: Default::default(),
             forwarded_ports: Default::default(),
+            done: None,
             created_unix: 0,
         };
         state.instances.insert("web-aaaa".into(), mk("web", "/home/u/site"));
@@ -286,6 +288,7 @@ mod tests {
                 config_dir: None,
                 extra_env: Default::default(),
                 forwarded_ports: Default::default(),
+                done: None,
                 created_unix: 0,
             },
         );

@@ -82,6 +82,7 @@ mod tests {
                 config_dir: None,
                 extra_env: Default::default(),
                 forwarded_ports: Default::default(),
+                done: None,
                 created_unix: 0,
             },
         );

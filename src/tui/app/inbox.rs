@@ -538,13 +538,13 @@ impl App {
             self.status = Some("already done".into());
             return;
         }
-        // Step 7 also marks the thread's child done here (`done: true` too).
         self.request_inbox(Op::MarkDone(t.id));
-        self.status = Some(format!("marked done · event queued for {}", t.owner_name));
+        let child = self.mark_thread_child(t, true).map(|c| format!(" · {c}")).unwrap_or_default();
+        self.status = Some(format!("marked done{child} · event queued for {}", t.owner_name));
     }
 
-    /// `u` in the pane: reopen a done thread, with an event. Step 7 also
-    /// clears the child's done flag here.
+    /// `u` in the pane: reopen a done thread, with an event; its child's done
+    /// flag is cleared too.
     fn reopen_thread(&mut self, t: &Thread) {
         if self.refuse_user_op(t) {
             return;
@@ -554,7 +554,8 @@ impl App {
             return;
         }
         self.request_inbox(Op::Reopen(t.id));
-        self.status = Some(format!("reopened · event queued for {}", t.owner_name));
+        let child = self.mark_thread_child(t, false).map(|c| format!(" · {c}")).unwrap_or_default();
+        self.status = Some(format!("reopened{child} · event queued for {}", t.owner_name));
     }
 
     /// `r` in the pane: open the reply box, when the thread takes replies.

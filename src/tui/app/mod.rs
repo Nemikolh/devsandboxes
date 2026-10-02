@@ -26,6 +26,7 @@ mod view;
 
 pub use crate::inbox::Thread;
 pub use inbox::{pane_lines, parse_utc_offset, title_of, when, InboxView, PaneLine, ReplyBox, Tone, View};
+pub use actions::PendingDone;
 pub use procs::{PendingSignal, Signal};
 pub use view::{ConfigView, Modal, Pane, Side, TextModal};
 use view::{col_near, divider_pct};
@@ -148,6 +149,10 @@ pub struct App {
     pub pending_start: Option<String>,
     /// Instances with a start in flight (same dedup rule as `stopping`).
     pub starting: BTreeSet<String>,
+    /// Done-flag changes the event loop should write to state on a
+    /// background thread (`d`/`u` on an instance row, and a thread's child
+    /// on the Inbox thread `done`/reopen).
+    pub pending_done: Vec<PendingDone>,
     /// A `kill` the event loop should spawn on a background thread (the
     /// SIGTERM/SIGKILL shortcuts on a process row). Runs without suspending.
     pub pending_signal: Option<PendingSignal>,
@@ -211,6 +216,7 @@ impl App {
             pending_start: None,
             starting: BTreeSet::new(),
             pending_signal: None,
+            pending_done: Vec::new(),
             ports: Vec::new(),
             pending_port: None,
             pending_unport: None,
@@ -403,6 +409,8 @@ impl App {
             KeyCode::Char('s') if self.tab == Tab::Instances && !on_proc => {
                 self.stop_or_start_instance()
             }
+            KeyCode::Char('d') if self.tab == Tab::Instances && !on_proc => self.set_selected_done(true),
+            KeyCode::Char('u') if self.tab == Tab::Instances && !on_proc => self.set_selected_done(false),
             KeyCode::Char('l') if !on_proc => self.open_logs(),
             // Forwarding: `p` opens the `port` prompt prefilled from the selected
             // instance (Instances, not a process row) or service (Services); `d`

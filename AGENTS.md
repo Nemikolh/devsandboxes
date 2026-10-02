@@ -11,7 +11,7 @@ git worktrees so working trees are never shared.
   `src/json_stdout.rs` points stdout at stderr for `run --json` so child
   output can't corrupt the one JSON document.
 - `src/commands/*.rs` — one file per verb (`run`, `start`, `stop`, `rebuild`,
-  `rm`, `ps`, `ls`, `exec`, `logs`, `inspect`, `stats`, `port`, `services::{gc,ls,rebuild}`). Shared name
+  `rm`, `ps`, `ls`, `exec`, `done`, `logs`, `inspect`, `stats`, `port`, `services::{gc,ls,rebuild}`). Shared name
   resolution in `commands/mod.rs` (`resolve_instance`: exact instance name/id
   first, then sandbox | folder basename). `exec.rs` also owns
   `SHELL_FALLBACK_CMD`, the login shell a command-less `exec` and the TUI

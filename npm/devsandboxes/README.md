@@ -41,7 +41,7 @@ await devsandbox.rm(name, { deleteBranch: true });
 | `inspect(name)`                            | runtime inspect document (`unknown`) |
 | `run(sandbox, { name, branch, base })`     | `RunRecord` (name, container, workspace, folder, worktree, branch) |
 | `start` / `stop` / `rebuild(name \| { all: true })` | `void`                      |
-| `rm(name, { deleteBranch, force })` / `rename(a, b)` / `gc()` / `service.rebuild(name)` | `void` |
+| `rm(name, { deleteBranch, force })` / `rename(a, b)` / `done(name)` / `undone(name)` / `gc()` / `service.rebuild(name)` | `void` |
 | `logs(name, { lines })`                    | log text                             |
 | `exec(name, argv, { input })`              | `{ exitCode, stdout, stderr }` (never rejects on exit code) |
 | `execArgv(name, argv?, { tty, interactive })` | `{ file, args }` to spawn yourself (sync; no argv: login shell) |

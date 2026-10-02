@@ -65,7 +65,7 @@ fn main() {
             };
             std::process::exit(code)
         }
-        Some(verb @ ("ensure" | "ls" | "branches" | "stop" | "rm" | "exec")) => {
+        Some(verb @ ("ensure" | "ls" | "branches" | "stop" | "rm" | "done" | "exec")) => {
             std::process::exit(ctl::run(verb, &args.collect::<Vec<_>>()))
         }
         Some("run") => {
@@ -75,7 +75,7 @@ fn main() {
         }
         _ => {
             eprintln!(
-                "usage: devsbd version|daemon|bridge|boot|notify|thread|events|ensure|ls|branches|stop|rm|exec|run"
+                "usage: devsbd version|daemon|bridge|boot|notify|thread|events|ensure|ls|branches|stop|rm|done|exec|run"
             );
             std::process::exit(2);
         }

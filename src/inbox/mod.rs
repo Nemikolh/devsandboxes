@@ -575,8 +575,8 @@ impl Inbox {
         let (entry_seq, event_seq) = (self.next_id(), self.next_id());
         let t = &mut self.threads[pos];
         if let Some(state) = op.state {
-            // Step 7 also marks a `done` thread's child done; that flag lives
-            // in `state.toml`, so it's the dashboard's to set, next to this op.
+            // A `done` thread's child is marked done too, but that flag lives
+            // in `state.toml`: the dashboard queues it next to this op.
             t.state = Some(state);
         }
         t.updated_at = t.updated_at.max(now);

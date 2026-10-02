@@ -7,7 +7,7 @@
 //! Every request is checked against the config as it is *now*: the
 //! dispatcher's sandbox (resolved from the config root recorded on its
 //! instance) must declare `dispatcher`, `ensure` needs the target in its
-//! `spawn` list, `stop`/`rm` only reach instances it owns, and `ensure` of a
+//! `spawn` list, `stop`/`rm`/`done` only reach instances it owns, and `ensure` of a
 //! new child respects `max-instances` (all owned children in state count,
 //! stopped ones included; unset = `Dispatcher::DEFAULT_MAX_INSTANCES`).
 //! Children can't be dispatchers: `ensure` of a sandbox declaring
@@ -15,7 +15,10 @@
 //! instance (old state) is denied, so dispatch can't recurse. `--env` names
 //! on the control::denied_env list are denied. `ensure --env` on an existing
 //! child replaces its saved env (`Instance::extra_env`) before (re)starting
-//! it, so every later devsandbox exec there sees the new values.
+//! it, so every later devsandbox exec there sees the new values. `done`
+//! marks a child done (docs/inbox-threads.md, "Done instances"); an `ensure`
+//! that reuses a done child clears the flag, since the dispatcher is putting
+//! it back to work.
 //!
 //! Runs (`exec`, `run-ls|logs|wait`) live in the child: the host execs the
 //! child's own helper (`devsbd run start|ls|logs|wait`, `devsbd/src/runs.rs`)
@@ -115,6 +118,10 @@ pub trait Executor {
     /// under the bridge's host-wide control lock, before the op's subprocess
     /// (which then loads the updated entry).
     fn save_env(&mut self, name: &str, env: &BTreeMap<String, String>) -> Result<(), String>;
+    /// Set state entry `name`'s done flag (`Instance::done`) and save. Under
+    /// the control lock like [`Executor::save_env`]: `done` is a
+    /// state-writing op (`bridge::writes_state`).
+    fn set_done(&mut self, name: &str, done: Option<u64>) -> Result<(), String>;
     /// Run host git (`host_git`) on `repo` with `args`, output captured;
     /// stdout on success, else a short message.
     fn git(&mut self, repo: &Path, args: &[String]) -> Result<String, String>;
@@ -254,6 +261,13 @@ pub(crate) fn handle_with(
                         return failed(e);
                     }
                 }
+                // Reusing a done child puts it back to work. Before the
+                // subprocess, which loads (and a rebuild keeps) the flag.
+                if child.done.is_some() {
+                    if let Err(e) = exec.set_done(&name, None) {
+                        return failed(e);
+                    }
+                }
             }
             match action {
                 Err(resp) => resp,
@@ -275,6 +289,22 @@ pub(crate) fn handle_with(
             };
             let args = vec![req.op.as_str().to_string(), name.clone()];
             match exec.devsandbox(config_dir, &args) {
+                Ok(()) => Response::new(Status::Ok, name),
+                Err(e) => failed(e),
+            }
+        }
+        Op::Done => {
+            let key = req.key.as_deref().expect("checked by check_fields");
+            let name = match find_child(state, owner_id, key, req.sandbox.as_deref()) {
+                Ok(name) => name,
+                Err(resp) => return resp,
+            };
+            // Idempotent, keeping the original since: a dispatcher may repeat
+            // it every pass.
+            if state.instances[&name].done.is_some() {
+                return Response::new(Status::Ok, name);
+            }
+            match exec.set_done(&name, Some(Instance::now())) {
                 Ok(()) => Response::new(Status::Ok, name),
                 Err(e) => failed(e),
             }
@@ -504,7 +534,7 @@ fn helper_argv(req: &Request) -> Vec<String> {
                 argv.extend([s("--keep"), keep.to_string()]);
             }
         }
-        Op::Ensure | Op::Ls | Op::Stop | Op::Rm | Op::Branches | Op::Events | Op::EventsAck | Op::ThreadLs => {
+        Op::Ensure | Op::Ls | Op::Stop | Op::Rm | Op::Done | Op::Branches | Op::Events | Op::EventsAck | Op::ThreadLs => {
             unreachable!("not a run op")
         }
     }
@@ -688,7 +718,7 @@ fn ensure_args(action: &Ensure, sandbox: &str, name: &str, req: &Request, owner:
     }
 }
 
-/// Resolve `stop`/`rm`'s `key` (optionally narrowed by `sandbox`) to one of
+/// Resolve `stop`/`rm`/`done`'s `key` (optionally narrowed by `sandbox`) to one of
 /// `owner_id`'s children.
 fn find_child(
     state: &State,
@@ -736,6 +766,8 @@ struct ChildRow<'a> {
     key: Option<&'a str>,
     state: ChildState,
     branch: Option<&'a str>,
+    /// Marked done (`Instance::done`): the dispatcher may evict it.
+    done: bool,
 }
 
 fn ls(state: &State, owner_id: &str, exec: &mut dyn Executor) -> Response {
@@ -753,6 +785,7 @@ fn ls(state: &State, owner_id: &str, exec: &mut dyn Executor) -> Response {
             key: child_key(name, info),
             state: live,
             branch: info.branch.as_deref(),
+            done: info.done.is_some(),
         });
     }
     match serde_json::to_string_pretty(&rows) {
@@ -976,6 +1009,16 @@ impl Executor for Subprocess {
         state.save().map_err(|e| format!("{e:#}"))
     }
 
+    fn set_done(&mut self, name: &str, done: Option<u64>) -> Result<(), String> {
+        let mut state = State::load().map_err(|e| format!("{e:#}"))?;
+        let info = state
+            .instances
+            .get_mut(name)
+            .ok_or_else(|| format!("`{name}` vanished from state"))?;
+        info.done = done;
+        state.save().map_err(|e| format!("{e:#}"))
+    }
+
     fn git(&mut self, repo: &Path, args: &[String]) -> Result<String, String> {
         let mut cmd = crate::commands::run::host_git(repo).map_err(|e| format!("{e:#}"))?;
         // Captured, never inherited: this runs on the TUI's bridge worker.
@@ -1065,6 +1108,7 @@ folder = "."
             config_dir: Some("/cfg".into()),
             extra_env: Default::default(),
             forwarded_ports: Default::default(),
+            done: None,
             created_unix: 0,
         }
     }
@@ -1100,6 +1144,8 @@ folder = "."
         helper: ExecOutput,
         execs: Vec<(String, Vec<String>)>,
         saved: Vec<(String, BTreeMap<String, String>)>,
+        /// `set_done` calls, `(name, done)`.
+        dones: Vec<(String, Option<u64>)>,
         git_out: BTreeMap<Vec<String>, String>,
         gits: Vec<(PathBuf, Vec<String>)>,
         /// The Inbox store the event ops use; `None` = the ops fail.
@@ -1131,6 +1177,10 @@ folder = "."
         fn save_env(&mut self, name: &str, env: &BTreeMap<String, String>) -> Result<(), String> {
             self.saved.push((name.to_string(), env.clone()));
             Ok(())
+        }
+        fn set_done(&mut self, name: &str, done: Option<u64>) -> Result<(), String> {
+            self.dones.push((name.to_string(), done));
+            if self.fail { Err("boom".into()) } else { Ok(()) }
         }
         fn git(&mut self, repo: &Path, args: &[String]) -> Result<String, String> {
             self.gits.push((repo.to_path_buf(), args.to_vec()));
@@ -1681,6 +1731,79 @@ folder = "."
     }
 
     #[test]
+    fn done_marks_owned_children_only() {
+        let s = state();
+        let mut fake = Fake::new();
+        let resp = call(&s, "d", &req(Op::Done, None, Some("one")), &mut fake);
+        assert_eq!(resp, Response::new(Status::Ok, "web-one"));
+        let resp = call(&s, "d", &req(Op::Done, Some("web"), Some("two")), &mut fake);
+        assert_eq!(resp, Response::new(Status::Ok, "web-two"));
+        let names: Vec<&str> = fake.dones.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["web-one", "web-two"]);
+        assert!(fake.dones.iter().all(|(_, d)| d.is_some()));
+        assert!(fake.calls.is_empty(), "no subprocess: an in-process state write");
+
+        // Not owned / unknown / not a dispatcher: nothing written.
+        for (who, r, status, needle) in [
+            ("d", req(Op::Done, None, Some("other")), Status::Denied, "`web-other` is not"),
+            ("d", req(Op::Done, None, Some("mine")), Status::Denied, "`web-mine` is not"),
+            ("d", req(Op::Done, None, Some("zzz")), Status::Failed, "no child with key `zzz`"),
+            ("p", req(Op::Done, None, Some("one")), Status::Denied, "does not declare"),
+            ("d", req(Op::Done, None, None), Status::Usage, "needs `key`"),
+            ("d", r_with(Op::Done, "one"), Status::Usage, "takes no `branch`/`env`"),
+        ] {
+            let mut fake = Fake::new();
+            let resp = call(&s, who, &r, &mut fake);
+            assert_eq!(resp.status, status, "{r:?}: {resp:?}");
+            assert!(resp.body.contains(needle), "{r:?}: {resp:?}");
+            assert!(fake.dones.is_empty(), "{r:?}");
+        }
+
+        // Already done: Ok, the original since kept (no write).
+        let mut s = state();
+        s.instances.get_mut("web-one").unwrap().done = Some(7);
+        let mut fake = Fake::new();
+        let resp = call(&s, "d", &req(Op::Done, None, Some("one")), &mut fake);
+        assert_eq!(resp, Response::new(Status::Ok, "web-one"));
+        assert!(fake.dones.is_empty());
+
+        // A failed write is reported.
+        let mut fake = Fake { fail: true, ..Fake::new() };
+        let resp = call(&state(), "d", &req(Op::Done, None, Some("one")), &mut fake);
+        assert_eq!(resp, Response::new(Status::Failed, "boom"));
+    }
+
+    #[test]
+    fn ensure_reusing_a_done_child_clears_it() {
+        let mut s = state();
+        s.instances.get_mut("web-one").unwrap().done = Some(7);
+        s.instances.get_mut("web-two").unwrap().done = Some(7);
+        // Running: nothing to run, but the flag is cleared.
+        let mut fake = Fake::new();
+        let resp = call(&s, "d", &req(Op::Ensure, Some("web"), Some("one")), &mut fake);
+        assert_eq!(resp, Response::new(Status::Ok, "web-one"));
+        assert_eq!(fake.dones, vec![("web-one".to_string(), None)]);
+        assert!(fake.calls.is_empty());
+        // Stopped: cleared, then started.
+        let mut fake = Fake::new();
+        let resp = call(&s, "d", &req(Op::Ensure, Some("web"), Some("two")), &mut fake);
+        assert_eq!(resp, Response::new(Status::Ok, "web-two"));
+        assert_eq!(fake.dones, vec![("web-two".to_string(), None)]);
+        assert_eq!(fake.calls, vec![argv(&["start", "web-two"])]);
+        // Not done: no write.
+        let mut fake = Fake::new();
+        call(&state(), "d", &req(Op::Ensure, Some("web"), Some("one")), &mut fake);
+        assert!(fake.dones.is_empty());
+        // Denied (foreign child): nothing cleared.
+        let mut s = state();
+        s.instances.get_mut("web-other").unwrap().done = Some(7);
+        let mut fake = Fake::new();
+        let resp = call(&s, "d", &req(Op::Ensure, Some("web"), Some("other")), &mut fake);
+        assert_eq!(resp.status, Status::Denied);
+        assert!(fake.dones.is_empty());
+    }
+
+    #[test]
     fn stop_with_a_key_shared_across_sandboxes_is_ambiguous() {
         let mut s = state();
         s.instances.insert("api-one".into(), inst("api", "api-one", Some("d")));
@@ -1699,6 +1822,7 @@ folder = "."
         let mut renamed = inst("web", "web-x", Some("d"));
         renamed.branch = None;
         s.instances.insert("renamed".into(), renamed);
+        s.instances.get_mut("web-two").unwrap().done = Some(5);
         let mut fake = Fake::new();
         let resp = call(&s, "d", &req(Op::Ls, None, None), &mut fake);
         assert_eq!(resp.status, Status::Ok, "{resp:?}");
@@ -1707,11 +1831,11 @@ folder = "."
             rows,
             serde_json::json!([
                 {"name": "renamed", "sandbox": "web", "key": null, "state": "missing",
-                 "branch": null},
+                 "branch": null, "done": false},
                 {"name": "web-one", "sandbox": "web", "key": "one", "state": "running",
-                 "branch": "sandbox/web-one"},
+                 "branch": "sandbox/web-one", "done": false},
                 {"name": "web-two", "sandbox": "web", "key": "two", "state": "stopped",
-                 "branch": "sandbox/web-two"},
+                 "branch": "sandbox/web-two", "done": true},
             ])
         );
         assert!(fake.calls.is_empty());

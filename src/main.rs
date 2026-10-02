@@ -164,6 +164,17 @@ enum Command {
         /// Instance name, sandbox config name, or repository folder name
         name: String,
     },
+    /// Mark a sandbox instance done: kept as is (container, worktree), shown
+    /// dimmed until removed
+    Done {
+        /// Instance name, sandbox config name, or repository folder name
+        name: String,
+    },
+    /// Clear an instance's done mark
+    Undone {
+        /// Instance name, sandbox config name, or repository folder name
+        name: String,
+    },
     /// Show CPU/memory usage of running devsandbox containers
     Stats {
         /// Output JSON instead of a table
@@ -297,6 +308,8 @@ fn main() -> Result<()> {
         Command::Logs { name, lines } => commands::logs::logs(&name, lines),
         Command::Inspect { name, json } => commands::inspect::inspect(&name, json),
         Command::Vscode { name } => commands::vscode::vscode(&cli.dir, &name),
+        Command::Done { name } => commands::done::done(&name, true),
+        Command::Undone { name } => commands::done::done(&name, false),
         Command::Stats { json } => commands::stats::stats(json),
         Command::Status { json: _ } => commands::status::status(&cli.dir),
         Command::Exec { interactive, tty, name, command } => {

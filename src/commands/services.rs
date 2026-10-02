@@ -1058,6 +1058,7 @@ ports = ["5432:5432"]
             config_dir: None,
             extra_env: Default::default(),
             forwarded_ports: Default::default(),
+            done: None,
             created_unix: 0,
         }
     }

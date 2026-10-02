@@ -336,6 +336,9 @@ pub(crate) fn materialize(
     let prior_config_dir = prior.and_then(|i| i.config_dir.clone());
     // A rebuild keeps the instance's host ports (docs/port-forwarding.md).
     let forwarded_ports = prior.map(|i| i.forwarded_ports.clone()).unwrap_or_default();
+    // A rebuild keeps the done flag: recreating the container doesn't mean
+    // the user is back on it (only `undone`/`ensure` clear it).
+    let done = prior.and_then(|i| i.done);
     // A rebuild keeps its `folders` worktrees (see `folders::mount_folders`).
     let prior_folders = prior.map(|i| i.folders.clone()).unwrap_or_default();
     let run_env = effective_extra_env(&extras.env, prior.map(|i| &i.extra_env));
@@ -579,6 +582,7 @@ pub(crate) fn materialize(
             config_dir: Some(prior_config_dir.unwrap_or(config_dir)),
             extra_env: run_env,
             forwarded_ports,
+            done,
             created_unix: Instance::now(),
         },
     );
@@ -925,6 +929,7 @@ mod tests {
             config_dir: None,
             extra_env: Default::default(),
             forwarded_ports: Default::default(),
+            done: None,
             created_unix: 0,
         }
     }
