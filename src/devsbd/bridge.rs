@@ -571,7 +571,14 @@ impl Bridges {
     /// Keep one bridge per running container in `running` whose instance
     /// wants one (`wanted`); drop the rest. Dead bridges are retried per
     /// `retry_decision`; a bridge whose agent wiring no longer matches (host
-    /// agent came or went) is replaced at once.
+    /// agent came or went) is replaced at once. Every (re)spawn first
+    /// `ensure_recorded`s the instance's helper, so a CLI upgrade reaches a
+    /// running instance once a dashboard is open: otherwise only
+    /// `run`/`start`/`port` rewrite it, and a running dispatcher never gets new
+    /// verbs. Keyed on spawns, not `is_mismatch`: a stale helper with the same
+    /// protocol `VERSION` still bridges fine, it just lacks verbs. Spawns are
+    /// rare (first sight, or a dead bridge's retry gap), so this is one extra
+    /// `exec` per spawn, not per snapshot.
     pub fn reconcile(&mut self, running: &[&str]) {
         self.live.retain(|c, _| running.contains(&c.as_str()));
         let host_agent = has_host_agent();
@@ -598,6 +605,17 @@ impl Bridges {
                 .map(|(b, at, _)| (b.is_done(), b.is_mismatch(), at.elapsed()));
             if retry_decision(entry) != Retry::Keep {
                 self.live.remove(&info.container);
+                let healed;
+                let info = match helper.then(|| crate::devsbd::ensure_recorded(key, info, true)).flatten() {
+                    Some(arch) if Some(arch) != info.devsbd_arch => {
+                        healed = Instance { devsbd_arch: Some(arch), ..info.clone() };
+                        &healed
+                    }
+                    // Current, or the install failed: spawn on the recorded
+                    // helper as before, so a failing install waits out the
+                    // bridge's retry gap instead of re-running every snapshot.
+                    _ => info,
+                };
                 if let Some(b) = spawn_managed(key, info, with_agent, self.sink.as_ref()) {
                     self.live.insert(info.container.clone(), (b, Instant::now(), with_agent));
                 }
@@ -607,7 +625,8 @@ impl Bridges {
     }
 
     /// Move a `Bridges` onto its own thread, fed running-container lists over an
-    /// mpsc. Reconcile (which does `State::load` and `exec` spawns) never runs
+    /// mpsc. Reconcile (which does `State::load`, `exec` spawns and a helper
+    /// reinstall check before each one) never runs
     /// on the UI thread; the snapshot arm just `send`s the owned list. Dropping
     /// the returned [`BridgeWorker`] closes the channel and joins the thread,
     /// which drops every live `Bridge` (killing its `exec`) before returning.
