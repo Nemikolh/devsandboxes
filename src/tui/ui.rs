@@ -10,7 +10,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table, 
 use tui_term::widget::{Cursor, PseudoTerminal};
 
 use super::app::{
-    pane_lines, title_of, when, App, ConfigView, Focus, InboxFocus, Modal, PaneLine, Pane, PortRow,
+    pane_lines, short_age, title_of, App, ConfigView, Focus, InboxFocus, Modal, PaneLine, Pane, PortRow,
     Side, Tab, TextModal, Thread, Tone, View,
 };
 use super::data::{
@@ -569,35 +569,235 @@ fn zone_border_style(app: &App, zone: InboxFocus) -> Style {
     }
 }
 
-/// The view switcher, as the list's title: every view with its count, the
-/// current one highlighted.
-fn inbox_view_header(app: &App) -> Line<'static> {
-    let dim = Style::default().add_modifier(Modifier::DIM);
-    let mut spans = vec![Span::raw(" ")];
-    for (i, view) in View::ALL.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::styled(" · ", dim));
-        }
-        let style = if *view == app.inbox.view {
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
-        } else {
-            dim
-        };
-        spans.push(Span::styled(format!("{} ({})", view.title(), app.inbox.count(*view)), style));
-    }
-    spans.push(Span::styled("  ←/→ ", dim));
-    Line::from(spans)
+/// Display width of `s` in terminal columns. Through ratatui's `Span::width`
+/// (unicode-width underneath), so a wide glyph in a title counts as the two
+/// cells it takes, without a direct dependency.
+fn cols(s: &str) -> usize {
+    Span::raw(s).width()
 }
 
-/// Narrowest list (inner width) that still fits the FROM column.
-const INBOX_FROM_MIN_WIDTH: u16 = 60;
+/// `s` cut to at most `width` columns, ending in `…` when anything was cut.
+fn truncate(s: &str, width: usize) -> String {
+    if cols(s) <= width {
+        return s.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    let mut buf = [0u8; 4];
+    for ch in s.chars() {
+        let w = cols(ch.encode_utf8(&mut buf));
+        if used + w > width - 1 {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    out.push('…');
+    out
+}
+
+/// Fewest columns the left text keeps before the right text is dropped: a
+/// title cut to a couple of letters says less than no age at all.
+const FIT_MIN_LEFT: usize = 8;
+
+/// `left` and `right` laid out in `width` columns with at least one space
+/// between them: the left text is truncated with `…` to make room, and when
+/// even that leaves it fewer than [`FIT_MIN_LEFT`] columns (or its whole
+/// self, if shorter) the right text is dropped (returned empty) instead.
+fn fit(left: &str, right: &str, width: usize) -> (String, String) {
+    let (lw, rw) = (cols(left), cols(right));
+    if rw == 0 {
+        return (truncate(left, width), String::new());
+    }
+    if lw + 1 + rw <= width {
+        return (left.to_string(), right.to_string());
+    }
+    if width >= rw + 1 + lw.min(FIT_MIN_LEFT) {
+        return (truncate(left, width - rw - 1), right.to_string());
+    }
+    (truncate(left, width), String::new())
+}
+
+/// Re-applies `parts`' styles to `fitted`, a [`fit`] of their concatenation:
+/// truncation only cuts a tail and adds `…`, so the fitted text's chars line
+/// up with the parts' in order (the `…` takes the style of the part it lands
+/// in).
+fn restyle(parts: &[(String, Style)], fitted: &str) -> Vec<Span<'static>> {
+    let mut chars = fitted.chars();
+    let mut out = Vec::new();
+    for (text, style) in parts {
+        let piece: String = chars.by_ref().take(text.chars().count()).collect();
+        if piece.is_empty() {
+            break;
+        }
+        out.push(Span::styled(piece, *style));
+    }
+    out
+}
+
+/// A card's state chip: a dispatcher thread's state (its status while
+/// active), or a notify record's level.
+fn chip(t: &Thread) -> (String, Style) {
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    match (t.kind, t.state, t.head().map(|r| r.level)) {
+        (Kind::Thread, Some(State::NeedsYou), _) => ("● needs you".into(), state_style(State::NeedsYou)),
+        (Kind::Thread, Some(State::Done), _) => ("✓ done".into(), state_style(State::Done)),
+        (Kind::Thread, _, _) => {
+            let status = t.status.as_deref().map(str::trim).filter(|s| !s.is_empty()).unwrap_or("active");
+            (format!("○ {}", status.lines().next().unwrap_or(status)), state_style(State::Active))
+        }
+        (Kind::Notify, _, Some(Level::Error)) => ("✖ error".into(), level_style(Level::Error)),
+        (Kind::Notify, _, Some(Level::Warn)) => ("▲ warn".into(), level_style(Level::Warn)),
+        (Kind::Notify, _, _) => ("· info".into(), dim),
+    }
+}
+
+/// Background of the selected card. A mid-dark gray, paired with an explicit
+/// foreground ([`CARD_SELECTED_FG`]) so the text reads the same on dark and
+/// light terminal themes (a bare tint under the theme's own dark text would
+/// vanish on a light one); `REVERSED` would be anything but subtle.
+const CARD_TINT: Color = Color::Indexed(236);
+const CARD_SELECTED_FG: Color = Color::Indexed(252);
+/// The selection bar while the list has no keys: still there, quieter.
+const ACCENT_DIM: Color = Color::Rgb(110, 85, 160);
+
+/// Rows a card takes: two content lines and a spacer (dropped after the last
+/// card when it doesn't fit).
+const CARD_ROWS: usize = 3;
+
+/// One line of a card, exactly `width` columns: column 0 holds the selection
+/// bar (or a space, so text aligns), then the left parts, padding, the right
+/// text, and one trailing space off the border. Padded explicitly so the
+/// selected card's tint spans the whole width.
+fn card_line(
+    left: &[(String, Style)],
+    right: (String, Style),
+    width: usize,
+    bar: Option<Color>,
+    base: Style,
+) -> Line<'static> {
+    let mut spans = vec![match bar {
+        Some(color) => Span::styled("▌", Style::default().fg(color)),
+        None => Span::raw(" "),
+    }];
+    let avail = width.saturating_sub(2);
+    let plain: String = left.iter().map(|(s, _)| s.as_str()).collect();
+    let (l, r) = fit(&plain, &right.0, avail);
+    let used = cols(&l) + cols(&r);
+    spans.extend(restyle(left, &l));
+    spans.push(Span::raw(" ".repeat(avail.saturating_sub(used))));
+    if !r.is_empty() {
+        spans.push(Span::styled(r, right.1));
+    }
+    if width >= 2 {
+        spans.push(Span::raw(" "));
+    }
+    Line::from(spans).style(base)
+}
+
+/// A card's two content lines: title (bold while unread, `↗` with a link,
+/// ` · archived` when its instance is gone) with the age, then the state chip
+/// with the sender. Archived cards are dimmed throughout; the selected one
+/// gets the bar ([`ACCENT`] while the list has the keys) and the tint.
+fn card_lines(t: &Thread, width: usize, selected: bool, focused: bool, now: u64, utc_offset: i64) -> [Line<'static>; 2] {
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let fade = |s: Style| if t.archived { s.add_modifier(Modifier::DIM) } else { s };
+    let title_style = if t.unread { Style::default().add_modifier(Modifier::BOLD) } else { Style::default() };
+    let mut title = vec![(title_of(t).lines().next().unwrap_or("").to_string(), fade(title_style))];
+    if t.link.is_some() || t.head().is_some_and(|r| r.link.is_some()) {
+        title.push((" ↗".into(), fade(Style::default().fg(Color::Blue))));
+    }
+    if t.archived {
+        title.push((" · archived".into(), dim));
+    }
+    let (chip, chip_style) = chip(t);
+    let age = (short_age(t.changed_at(), now, utc_offset), dim);
+    let from = (t.owner_name.clone(), dim);
+    let (bar, base) = if selected {
+        let bar = if focused { ACCENT } else { ACCENT_DIM };
+        (Some(bar), Style::default().bg(CARD_TINT).fg(CARD_SELECTED_FG))
+    } else {
+        (None, Style::default())
+    };
+    [
+        card_line(&title, age, width, bar, base),
+        card_line(&[(chip, fade(chip_style))], from, width, bar, base),
+    ]
+}
+
+/// First card to show so `selected` is fully visible in `height` rows,
+/// moving `prev` (last frame's) as little as possible: the list holds still
+/// while the cursor moves inside it. Also pulled back so a shrunk list or a
+/// taller pane doesn't leave blank rows under the last card.
+fn card_offset(prev: usize, selected: usize, len: usize, height: usize) -> usize {
+    // n cards need 3n - 1 rows: the last one's spacer can go.
+    let fit = ((height + 1) / CARD_ROWS).max(1);
+    let mut off = prev.min(len.saturating_sub(fit));
+    if selected < off {
+        off = selected;
+    } else if selected >= off + fit {
+        off = selected + 1 - fit;
+    }
+    off
+}
+
+/// Short view names, for a strip too narrow for the full ones.
+fn view_short(view: View) -> &'static str {
+    match view {
+        View::NeedsYou => "Needs",
+        other => other.title(),
+    }
+}
+
+/// The view switcher above the list: `‹ Needs you 3 │ Active 5 │ Done │ All ›`,
+/// the current view accented, the arrows dim at the ends (the views clamp,
+/// see `View::step`), zero counts left out. Narrower widths drop the counts,
+/// then shorten the names.
+fn view_strip(current: View, counts: [usize; 4], width: usize) -> Line<'static> {
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let build = |counts_on: bool, short: bool| {
+        let first = current == View::ALL[0];
+        let last = current == View::ALL[View::ALL.len() - 1];
+        let mut spans = vec![Span::raw(" "), Span::styled("‹ ", if first { dim } else { Style::default() })];
+        for (i, view) in View::ALL.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled(" │ ", dim));
+            }
+            let style = if *view == current {
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+            } else {
+                dim
+            };
+            spans.push(Span::styled(if short { view_short(*view) } else { view.title() }, style));
+            if counts_on && counts[i] > 0 {
+                spans.push(Span::styled(format!(" {}", counts[i]), dim));
+            }
+        }
+        spans.push(Span::styled(" ›", if last { dim } else { Style::default() }));
+        Line::from(spans)
+    };
+    [(true, false), (false, false)]
+        .into_iter()
+        .map(|(c, s)| build(c, s))
+        .find(|l| l.width() <= width)
+        .unwrap_or_else(|| build(false, true))
+}
 
 fn draw_inbox_list(frame: &mut Frame, app: &App, area: Rect) {
+    let [strip_area, list_area] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+    let counts = View::ALL.map(|v| app.inbox.count(v));
+    frame.render_widget(Paragraph::new(view_strip(app.inbox.view, counts, strip_area.width as usize)), strip_area);
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(zone_border_style(app, InboxFocus::List))
-        .title(inbox_view_header(app));
-    let from = block.inner(area).width >= INBOX_FROM_MIN_WIDTH;
+        .title(" Inbox ");
+    let inner = block.inner(list_area);
+    frame.render_widget(block, list_area);
+    let dim = Style::default().add_modifier(Modifier::DIM);
     let rows = app.inbox.rows();
     if rows.is_empty() {
         let text = if app.inbox.threads().is_empty() {
@@ -605,39 +805,33 @@ fn draw_inbox_list(frame: &mut Frame, app: &App, area: Rect) {
         } else {
             format!("nothing in {} — ←/→ switch views", app.inbox.view.title())
         };
-        let text = Line::from(Span::styled(text, Style::default().add_modifier(Modifier::DIM)))
-            .alignment(Alignment::Center);
-        frame.render_widget(Paragraph::new(text).block(block), area);
+        let mut lines = vec![Line::default(); (inner.height as usize).saturating_sub(1) / 2];
+        lines.push(Line::from(Span::styled(text, dim)).alignment(Alignment::Center));
+        frame.render_widget(Paragraph::new(lines), inner);
         return;
     }
-    let mut header = vec!["", "FROM", "TITLE", "STATUS", "AGE"];
-    // AGE: a week-old date ("Oct 12 14:32") is the widest value (see `when`).
-    let mut widths = vec![
-        Constraint::Length(1),
-        Constraint::Length(12),
-        Constraint::Min(16),
-        Constraint::Length(12),
-        Constraint::Length(12),
-    ];
-    if !from {
-        header.remove(1);
-        widths.remove(1);
-    }
-    let header =
-        Row::new(header.into_iter().map(Cell::from)).style(Style::default().add_modifier(Modifier::DIM));
     // Wall clock read per frame, so relative times tick between snapshots.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
+    let selected = app.selected().min(rows.len() - 1);
+    let height = inner.height as usize;
+    let off = card_offset(app.inbox.list_offset(), selected, rows.len(), height);
+    app.inbox.set_list_offset(off);
+    let focused = app.focus == Focus::Dashboard && app.inbox.focus == InboxFocus::List;
     let threads = app.inbox.threads();
-    let rows: Vec<Row> = rows.iter().map(|&i| inbox_row(&threads[i], from, now, app.utc_offset)).collect();
-    let table = Table::new(rows, widths)
-        .header(header)
-        .block(block)
-        .column_spacing(1)
-        .row_highlight_style(Style::default().fg(SELECTION).add_modifier(Modifier::BOLD));
-    let mut state = TableState::default().with_selected(Some(app.selected()));
-    frame.render_stateful_widget(table, area, &mut state);
+    let width = inner.width as usize;
+    let mut lines: Vec<Line> = Vec::with_capacity(height + CARD_ROWS);
+    for (pos, &i) in rows.iter().enumerate().skip(off) {
+        if lines.len() >= height {
+            break;
+        }
+        if pos > off {
+            lines.push(Line::default());
+        }
+        lines.extend(card_lines(&threads[i], width, pos == selected, focused, now, app.utc_offset));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn level_style(level: Level) -> Style {
@@ -653,58 +847,6 @@ fn state_style(state: State) -> Style {
         State::NeedsYou => Style::default().fg(Color::Yellow),
         State::Active => Style::default(),
         State::Done => Style::default().add_modifier(Modifier::DIM),
-    }
-}
-
-/// The one-cell state marker: a dispatcher thread's state, or a notify
-/// record's level.
-fn thread_marker(t: &Thread) -> (&'static str, Style) {
-    match (t.kind, t.state, t.head().map(|r| r.level)) {
-        (Kind::Thread, Some(State::NeedsYou), _) => ("●", state_style(State::NeedsYou)),
-        (Kind::Thread, Some(State::Done), _) => ("✓", state_style(State::Done)),
-        (Kind::Thread, _, _) => ("○", state_style(State::Active)),
-        (Kind::Notify, _, Some(Level::Error)) => ("✖", level_style(Level::Error)),
-        (Kind::Notify, _, Some(Level::Warn)) => ("▲", level_style(Level::Warn)),
-        (Kind::Notify, _, _) => ("·", level_style(Level::Info)),
-    }
-}
-
-/// One Inbox row: marker, sender (when `from`), title (`↗` when there's a
-/// link), status chip (a notify record's level when it's above info), age.
-/// Bold while unread; dim when archived (its instance is gone).
-fn inbox_row<'a>(t: &Thread, from: bool, now: u64, utc_offset: i64) -> Row<'a> {
-    let dim = Style::default().add_modifier(Modifier::DIM);
-    let (marker, marker_style) = thread_marker(t);
-    let mut title = vec![Span::raw(title_of(t))];
-    if t.link.is_some() || t.head().is_some_and(|r| r.link.is_some()) {
-        title.push(Span::styled(" ↗", Style::default().fg(Color::Blue)));
-    }
-    if t.archived {
-        title.push(Span::styled(" (archived)", dim));
-    }
-    let status = match (t.kind, t.head()) {
-        (Kind::Thread, _) => Span::styled(t.status.clone().unwrap_or_default(), dim),
-        (Kind::Notify, Some(r)) if r.level != Level::Info => {
-            Span::styled(r.level.as_str(), level_style(r.level))
-        }
-        (Kind::Notify, _) => Span::raw(""),
-    };
-    let mut cells = vec![
-        Cell::from(Span::styled(marker, marker_style)),
-        Cell::from(Line::from(title)),
-        Cell::from(status),
-        Cell::from(Span::styled(when(t.changed_at(), now, utc_offset), dim)),
-    ];
-    if from {
-        cells.insert(1, Cell::from(t.owner_name.clone()));
-    }
-    let row = Row::new(cells);
-    if t.archived {
-        row.style(dim)
-    } else if t.unread {
-        row.style(Style::default().add_modifier(Modifier::BOLD))
-    } else {
-        row
     }
 }
 
@@ -757,6 +899,7 @@ fn wrap_pane_line(line: &PaneLine, width: usize) -> Vec<Line<'static>> {
 fn draw_inbox_pane(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(zone_border_style(app, InboxFocus::Thread))
         .title(" Thread ");
     let inner = block.inner(area);
@@ -1809,5 +1952,204 @@ mod tests {
         let plain = highlight_json_line("    \"abc\"");
         assert_eq!(plain.spans.len(), 1);
         assert_eq!(plain.spans[0].style.fg, None);
+    }
+
+    use crate::devsbd::notify::Record;
+    use crate::inbox::{Inbox, Note};
+    use crossterm::event::{KeyCode, KeyEvent};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn text(line: &Line) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    fn dthread(title: &str, state: State, status: Option<&str>) -> Thread {
+        Thread {
+            kind: Kind::Thread,
+            title: title.into(),
+            owner_name: "bab-disp".into(),
+            state: Some(state),
+            status: status.map(str::to_string),
+            ..Thread::default()
+        }
+    }
+
+    fn note(msg: &str, level: Level, at: u64) -> Thread {
+        Thread {
+            kind: Kind::Notify,
+            owner_name: "builder".into(),
+            notes: vec![Note { id: 1, record: Record { level, key: None, link: None, msg: msg.into(), at } }],
+            ..Thread::default()
+        }
+    }
+
+    #[test]
+    fn fit_keeps_both_with_a_gap_and_truncates_left_first() {
+        assert_eq!(fit("title", "2m", 20), ("title".into(), "2m".into()));
+        // Exactly fits with one space.
+        assert_eq!(fit("title", "2m", 8), ("title".into(), "2m".into()));
+        // Left cut with `…` to keep the gap.
+        assert_eq!(fit("a long title here", "2m", 14), ("a long tit…".into(), "2m".into()));
+        // Too narrow to keep FIT_MIN_LEFT columns of title: the right goes.
+        assert_eq!(fit("a long title here", "12 min ago", 15), ("a long title h…".into(), String::new()));
+        // A short left needs only its own width.
+        assert_eq!(fit("ok", "12 min ago", 13), ("ok".into(), "12 min ago".into()));
+        assert_eq!(fit("anything", "", 4), ("any…".into(), String::new()));
+        assert_eq!(fit("x", "y", 0), (String::new(), String::new()));
+    }
+
+    #[test]
+    fn fit_counts_display_width() {
+        // `界` is two columns: 4 glyphs = 8 columns.
+        assert_eq!(fit("世界世界", "1h", 11), ("世界世界".into(), "1h".into()));
+        // 8 columns for the left: three wide glyphs (6) + `…`, as a fourth
+        // wouldn't leave room for it.
+        let (l, r) = fit("世界世界世界", "1h", 11);
+        assert_eq!((l.as_str(), r.as_str()), ("世界世…", "1h"));
+        assert!(cols(&l) <= 8);
+        // A wide glyph that would straddle the limit is dropped whole.
+        assert_eq!(truncate("a世界", 3), "a…");
+    }
+
+    #[test]
+    fn chip_per_kind_state_and_level() {
+        let c = |t: &Thread| chip(t).0;
+        assert_eq!(c(&dthread("t", State::NeedsYou, Some("x"))), "● needs you");
+        assert_eq!(c(&dthread("t", State::Active, Some("running ci"))), "○ running ci");
+        assert_eq!(c(&dthread("t", State::Active, None)), "○ active");
+        assert_eq!(c(&dthread("t", State::Active, Some("  "))), "○ active");
+        assert_eq!(c(&dthread("t", State::Done, None)), "✓ done");
+        assert_eq!(c(&note("m", Level::Warn, 0)), "▲ warn");
+        assert_eq!(c(&note("m", Level::Error, 0)), "✖ error");
+        assert_eq!(c(&note("m", Level::Info, 0)), "· info");
+        assert_eq!(chip(&dthread("t", State::NeedsYou, None)).1.fg, Some(Color::Yellow));
+        assert_eq!(chip(&note("m", Level::Error, 0)).1.fg, Some(Color::Red));
+    }
+
+    #[test]
+    fn card_lines_layout_and_selection() {
+        let mut t = dthread("#6900 feat/agent-run-cost", State::NeedsYou, None);
+        t.unread = true;
+        t.updated_at = 1000 - 120;
+        let [l1, l2] = card_lines(&t, 30, false, true, 1000, 0);
+        assert_eq!(text(&l1), " #6900 feat/agent-run-cost 2m ");
+        assert_eq!(text(&l2), " ● needs you         bab-disp ");
+        assert_eq!((l1.width(), l2.width()), (30, 30));
+        assert!(l1.spans[1].style.add_modifier.contains(Modifier::BOLD), "unread title is bold");
+        assert_eq!(l1.style.bg, None);
+
+        let [s1, s2] = card_lines(&t, 30, true, true, 1000, 0);
+        for (line, bar) in [(&s1, ACCENT), (&s2, ACCENT)] {
+            assert_eq!(line.spans[0].content, "▌");
+            assert_eq!(line.spans[0].style.fg, Some(bar));
+            assert_eq!(line.style.bg, Some(CARD_TINT));
+        }
+        let [u1, _] = card_lines(&t, 30, true, false, 1000, 0);
+        assert_eq!(u1.spans[0].style.fg, Some(ACCENT_DIM));
+
+        // Link + archived suffixes; archived dims the title.
+        t.link = Some("https://x".into());
+        t.archived = true;
+        t.title = "fix".into();
+        let [a1, _] = card_lines(&t, 40, false, true, 1000, 0);
+        assert!(text(&a1).starts_with(" fix ↗ · archived "));
+        assert!(a1.spans[1].style.add_modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn card_offset_scrolls_minimally() {
+        // 11 rows hold 4 cards (the last spacer dropped).
+        assert_eq!(card_offset(0, 3, 10, 11), 0);
+        assert_eq!(card_offset(0, 4, 10, 11), 1);
+        // Moving up inside the window keeps it still.
+        assert_eq!(card_offset(3, 4, 10, 11), 3);
+        assert_eq!(card_offset(3, 2, 10, 11), 2);
+        // A shrunk list pulls the window back.
+        assert_eq!(card_offset(8, 5, 6, 11), 2);
+        // Too short for even one card: the selected one leads.
+        assert_eq!(card_offset(0, 5, 10, 1), 5);
+    }
+
+    #[test]
+    fn view_strip_shortens_to_fit() {
+        let counts = [3, 5, 0, 9];
+        let full = view_strip(View::NeedsYou, counts, 80);
+        assert_eq!(text(&full), " ‹ Needs you 3 │ Active 5 │ Done │ All 9 ›");
+        let current = full.spans.iter().find(|s| s.content == "Needs you").unwrap();
+        assert_eq!(current.style.fg, Some(ACCENT));
+        assert!(full.spans[1].style.add_modifier.contains(Modifier::DIM), "‹ dim at the left end");
+        assert_eq!(text(&view_strip(View::Active, counts, 36)), " ‹ Needs you │ Active │ Done │ All ›");
+        assert_eq!(text(&view_strip(View::All, counts, 20)), " ‹ Needs │ Active │ Done │ All ›");
+    }
+
+    fn render(app: &App, w: u16, h: u16) -> String {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| draw(f, app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..h)
+            .map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn inbox_app() -> App {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let mut a = dthread("#6900 feat/agent-run-cost", State::NeedsYou, Some("review draft replies"));
+        a.updated_at = now - 120;
+        a.unread = true;
+        a.link = Some("https://example.com/pr/6900".into());
+        let mut b = dthread("#7414 fix/login", State::Active, Some("running ci"));
+        b.updated_at = now - 3600;
+        let c = note("ci failed on main", Level::Warn, now - 3 * 86_400);
+        let mut d = dthread("#7001 docs/config", State::Done, None);
+        d.updated_at = now - 5 * 86_400;
+        let e = note("image rebuilt", Level::Info, now - 6 * 86_400);
+        let mut threads = vec![a, b, c, d, e];
+        for (i, t) in threads.iter_mut().enumerate() {
+            t.id = i as u64 + 1;
+            t.owner = format!("{}-id", t.owner_name);
+        }
+        let mut inbox = Inbox::default();
+        inbox.threads = threads;
+        let mut app = App::new(PathBuf::from("/tmp"));
+        app.set_inbox(inbox);
+        app.on_key(KeyEvent::from(KeyCode::Char('4')));
+        for _ in 0..3 {
+            app.on_key(KeyEvent::from(KeyCode::Right));
+        }
+        app
+    }
+
+    #[test]
+    fn inbox_renders_cards() {
+        let app = inbox_app();
+        let screen = render(&app, 120, 30);
+        if std::env::var_os("SHOW_INBOX").is_some() {
+            println!("{screen}");
+        }
+        assert!(screen.contains("‹ Needs you 1 │ Active 1 │ Done 1 │ All 5 ›"), "{screen}");
+        assert!(screen.contains("╭ Inbox "), "{screen}");
+        // Needs you → Active → Done → All: each view without the selected
+        // thread starts at its top, and All keeps Done's `#7001` by id.
+        assert!(screen.contains("▌#7001 docs/config"), "{screen}");
+        assert!(screen.contains(" #6900 feat/agent-run-cost ↗"), "{screen}");
+        assert!(screen.contains("▲ warn"), "{screen}");
+    }
+
+    #[test]
+    fn tiny_inbox_keeps_the_selected_card_visible() {
+        let mut app = inbox_app();
+        for _ in 0..4 {
+            app.on_key(KeyEvent::from(KeyCode::Down));
+        }
+        let screen = render(&app, 30, 8);
+        assert!(screen.contains("▌image"), "{screen}");
+        // Back up to the top: the window follows.
+        for _ in 0..4 {
+            app.on_key(KeyEvent::from(KeyCode::Up));
+        }
+        let screen = render(&app, 30, 8);
+        assert!(screen.contains("▌#6"), "{screen}");
     }
 }

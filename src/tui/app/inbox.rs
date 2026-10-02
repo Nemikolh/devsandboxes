@@ -127,6 +127,10 @@ pub struct InboxView {
     /// the app immutably; it only bounds the scroll keys, so a stale value
     /// costs at most a frame of overscroll.
     pane_max: Cell<u16>,
+    /// First list card shown, written by the renderer (which alone knows the
+    /// list's height) and read back next frame, so the list only scrolls when
+    /// the selection would leave it instead of re-centering on every move.
+    list_offset: Cell<usize>,
     /// The reply input's line, while the input has focus.
     pub reply: Option<ReplyBox>,
 }
@@ -141,6 +145,7 @@ impl Default for InboxView {
             shown: None,
             scroll: 0,
             pane_max: Cell::new(0),
+            list_offset: Cell::new(0),
             reply: None,
         }
     }
@@ -190,6 +195,15 @@ impl InboxView {
     /// Renderer hook: the pane's largest scroll offset at its current size.
     pub fn set_pane_max(&self, max: u16) {
         self.pane_max.set(max);
+    }
+
+    /// Renderer hook: the list's first visible card, as of the last frame.
+    pub fn list_offset(&self) -> usize {
+        self.list_offset.get()
+    }
+
+    pub fn set_list_offset(&self, offset: usize) {
+        self.list_offset.set(offset);
     }
 }
 
@@ -491,13 +505,20 @@ impl App {
     }
 
     /// `←`/`→` (Inbox list): the view `step` over, clamped at the ends, the
-    /// cursor following its thread when the new view lists it.
+    /// cursor following its thread when the new view lists it, else starting
+    /// at the top: the old row number means nothing in another view.
     pub(super) fn step_inbox_view(&mut self, step: isize) {
         let selected = self.selected_inbox_id();
         // Unpinned, so a thread the new view doesn't list isn't kept in it.
         self.inbox.shown = None;
         self.inbox.view = self.inbox.view.step(step);
-        self.reselect_inbox(selected);
+        let threads = self.inbox.threads();
+        let pos = selected.and_then(|id| self.inbox.rows().iter().position(|&i| threads[i].id == id));
+        if pos.is_none() {
+            self.inbox.set_list_offset(0);
+        }
+        self.selected[Tab::Inbox.index()] = pos.unwrap_or(0);
+        self.clamp_selection();
     }
 
     /// `enter` (Inbox list): focus the selected thread's pane.
@@ -725,30 +746,31 @@ impl App {
     }
 }
 
-/// Past this age the Inbox switches from "N days ago" to a date.
+/// Past this age a card shows a date instead of a relative age.
 const RELATIVE_FOR: u64 = 7 * 86_400;
 
-/// The Inbox TIME column: how long before `now` unix time `at` was ("just
-/// now", "12s ago", "5 min ago", "3h ago", "6 days ago"), then [`stamp`] once it's a week
-/// old. A timestamp ahead of `now` (container clock skew) reads "just now".
-pub fn when(at: u64, now: u64, utc_offset: i64) -> String {
-    let age = now.saturating_sub(at);
-    match age {
-        0 => "just now".into(),
-        a if a < 60 => format!("{a}s ago"),
-        a if a < 3600 => format!("{} min ago", a / 60),
-        a if a < 86_400 => format!("{}h ago", a / 3600),
-        a if a < 2 * 86_400 => "1 day ago".into(),
-        a if a < RELATIVE_FOR => format!("{} days ago", a / 86_400),
-        _ => stamp(at, utc_offset),
+/// A card's age, as short as it gets (`now`, `5m`, `3h`, `2d`), then the
+/// date alone (`Oct 12`) once it's a week old: a card's corner has no room
+/// for words, and the pane shows the full [`stamp`]. A timestamp
+/// ahead of `now` (clock skew) reads `now`.
+pub fn short_age(at: u64, now: u64, utc_offset: i64) -> String {
+    match now.saturating_sub(at) {
+        a if a < 60 => "now".into(),
+        a if a < 3600 => format!("{}m", a / 60),
+        a if a < 86_400 => format!("{}h", a / 3600),
+        a if a < RELATIVE_FOR => format!("{}d", a / 86_400),
+        _ => {
+            let (month, day) = month_day((at as i64 + utc_offset).div_euclid(86_400));
+            format!("{} {day}", MONTHS[month as usize - 1])
+        }
     }
 }
+
+const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
 /// `Oct 2 14:32` of unix time `at`, shifted by `utc_offset` seconds (no year:
 /// the Inbox only holds recent notifications).
 pub fn stamp(at: u64, utc_offset: i64) -> String {
-    const MONTHS: [&str; 12] =
-        ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
     let local = at as i64 + utc_offset;
     let (days, secs) = (local.div_euclid(86_400), local.rem_euclid(86_400));
     let (month, day) = month_day(days);
@@ -921,7 +943,7 @@ mod tests {
         assert_eq!(app.selected(), 4);
         app.on_key(key(KeyCode::Char('v')));
         assert_eq!(app.inbox.view, View::All, "`v` no longer switches views");
-        // Into a view without it: the index clamps.
+        // Into a view without it: the top row.
         app.on_key(key(KeyCode::Left)); // Done: one row
         assert_eq!(app.selected(), 0);
         assert_eq!(selected(&app).as_deref(), Some("over"));
@@ -1520,20 +1542,59 @@ mod tests {
     }
 
     #[test]
-    fn relative_time_then_date() {
+    fn short_age_then_date() {
         let now = 1_000_000_000;
-        assert_eq!(when(now, now, 0), "just now");
-        assert_eq!(when(now + 5, now, 0), "just now", "skewed clock");
-        assert_eq!(when(now - 1, now, 0), "1s ago");
-        assert_eq!(when(now - 59, now, 0), "59s ago");
-        assert_eq!(when(now - 60, now, 0), "1 min ago");
-        assert_eq!(when(now - 3599, now, 0), "59 min ago");
-        assert_eq!(when(now - 2 * 3600, now, 0), "2h ago");
-        assert_eq!(when(now - 86_400, now, 0), "1 day ago");
-        assert_eq!(when(now - 2 * 86_400, now, 0), "2 days ago");
-        assert_eq!(when(now - (7 * 86_400 - 1), now, 0), "6 days ago");
-        // 1_000_000_000 is 2001-09-09 01:46:40 UTC.
-        assert_eq!(when(now - 7 * 86_400, now, 0), "Sep 2 01:46");
+        assert_eq!(short_age(now, now, 0), "now");
+        assert_eq!(short_age(now + 5, now, 0), "now", "skewed clock");
+        assert_eq!(short_age(now - 59, now, 0), "now");
+        assert_eq!(short_age(now - 60, now, 0), "1m");
+        assert_eq!(short_age(now - 5 * 60 - 30, now, 0), "5m");
+        assert_eq!(short_age(now - 3599, now, 0), "59m");
+        assert_eq!(short_age(now - 3 * 3600, now, 0), "3h");
+        assert_eq!(short_age(now - 86_399, now, 0), "23h");
+        assert_eq!(short_age(now - 2 * 86_400, now, 0), "2d");
+        assert_eq!(short_age(now - (7 * 86_400 - 1), now, 0), "6d");
+        // 1_000_000_000 is 2001-09-09 01:46:40 UTC: a week back is Sep 2,
+        // and the date follows the local offset across midnight.
+        assert_eq!(short_age(now - 7 * 86_400, now, 0), "Sep 2");
+        assert_eq!(short_age(now - 7 * 86_400, now, -2 * 3600), "Sep 1");
+    }
+
+    #[test]
+    fn view_change_keeps_the_thread_or_goes_to_the_top() {
+        let mut app = new_app();
+        mixed(&mut app);
+        inbox_tab(&mut app);
+        for _ in 0..3 {
+            app.on_key(key(KeyCode::Right)); // All
+        }
+        // In All, select "over"; Done lists it too, at another row.
+        let pos = rows(&app).iter().position(|r| r == "over").unwrap();
+        assert_ne!(pos, 0);
+        app.selected[Tab::Inbox.index()] = pos;
+        app.sync_inbox_selection();
+        app.inbox.set_list_offset(3);
+        app.on_key(key(KeyCode::Left)); // Done
+        assert_eq!(app.inbox.view, View::Done);
+        assert_eq!((app.selected(), selected(&app).as_deref()), (0, Some("over")), "kept by id");
+        assert_eq!(app.inbox.list_offset(), 3, "offset left to the renderer");
+        app.on_key(key(KeyCode::Left)); // Active
+        app.on_key(key(KeyCode::Left)); // Needs you
+
+        // A second Active thread, so "top" differs from the old row number.
+        put(&mut app, "d", 15, body("busy2", State::Active));
+        put(&mut app, "d", 12, body("asks2", State::NeedsYou));
+        assert_eq!(rows(&app), ["asks2", "asks"]);
+        app.selected[Tab::Inbox.index()] = 1;
+        app.sync_inbox_selection();
+        assert_eq!(selected(&app).as_deref(), Some("asks"));
+        app.inbox.set_list_offset(2);
+        app.on_key(key(KeyCode::Right)); // Active: busy, busy2
+        assert_eq!(app.inbox.view, View::Active);
+        assert_eq!(rows(&app), ["busy", "busy2"]);
+        assert_eq!(app.selected(), 0, "top of the new view, not row 1");
+        assert_eq!(selected(&app).as_deref(), Some("busy"));
+        assert_eq!(app.inbox.list_offset(), 0, "offset reset");
     }
 
     #[test]
