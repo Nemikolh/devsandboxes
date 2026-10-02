@@ -33,6 +33,17 @@ use super::proto::{self, Frame, INITIAL_WINDOW};
 /// Read chunk for local stream -> `Data` frames; far below `MAX_PAYLOAD`.
 const CHUNK: usize = 16 * 1024;
 
+/// Stack for the per-stream threads (`pump`, `flow_pump`, `flow_writer`), one
+/// or two per live connection. Their buffers live on the heap, so the 2 MiB
+/// default only reserves address space; 128 KiB still leaves room for a host
+/// panic (message + backtrace) on one of them.
+const STREAM_STACK: usize = 128 * 1024;
+
+/// `std::thread::spawn` with [`STREAM_STACK`]; panics on failure like it.
+fn spawn_stream_thread(f: impl FnOnce() + Send + 'static) {
+    std::thread::Builder::new().stack_size(STREAM_STACK).spawn(f).expect("failed to spawn stream thread");
+}
+
 /// Keepalive `Ping` cadence and the inbound-silence window after which the
 /// peer is declared dead (`on_dead`). A wedged peer that stops reading (so our
 /// `Ping`s pile up unanswered) is caught within `KEEPALIVE_TIMEOUT`.
@@ -500,7 +511,7 @@ impl Mux {
             }
         }
         let mux = Arc::clone(self);
-        std::thread::spawn(move || mux.pump(stream, reader));
+        spawn_stream_thread(move || mux.pump(stream, reader));
         Ok(())
     }
 
@@ -598,9 +609,9 @@ impl Mux {
         // Data queued before the attach needs no wake-up: the writer checks
         // the queue before its first wait.
         let (mux, f) = (Arc::clone(self), Arc::clone(flow));
-        std::thread::spawn(move || mux.flow_writer(stream, f, conn));
+        spawn_stream_thread(move || mux.flow_writer(stream, f, conn));
         let (mux, f) = (Arc::clone(self), Arc::clone(flow));
-        std::thread::spawn(move || mux.flow_pump(stream, f, reader));
+        spawn_stream_thread(move || mux.flow_pump(stream, f, reader));
     }
 
     /// Local socket -> `Data`, never more than the peer granted: reads at most
