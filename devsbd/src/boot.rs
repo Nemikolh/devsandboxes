@@ -111,17 +111,17 @@ impl Log {
 
 /// Who to run as: what `docker exec -u` would pick for the same spec.
 #[derive(Debug, PartialEq, Eq)]
-struct Account {
+pub(crate) struct Account {
     name: Option<String>,
     uid: u32,
     gid: u32,
-    home: String,
+    pub(crate) home: String,
 }
 
 /// Resolve `name|uid[:group|gid]` against `/etc/passwd` and `/etc/group`
 /// contents. A numeric uid missing from passwd is still valid (gid 0, home
 /// `/`, as docker does); an unknown name or group is `None`.
-fn resolve_user(passwd: &str, group: &str, spec: &str) -> Option<Account> {
+pub(crate) fn resolve_user(passwd: &str, group: &str, spec: &str) -> Option<Account> {
     let (user, grp) = match spec.split_once(':') {
         Some((u, g)) => (u, Some(g)),
         None => (spec, None),

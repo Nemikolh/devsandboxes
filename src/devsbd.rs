@@ -473,6 +473,92 @@ mod tests {
         Ok(())
     }
 
+    /// `devsbd vscode-goto` against a fake VS Code server: a python "node"
+    /// with argv `--type=extensionHost` listening on a `/tmp/vscode-ipc-*.sock`
+    /// as a non-root user, a newer decoy socket (an integrated terminal's), and
+    /// a remote-cli script that records how it was run. Root (no
+    /// `CAP_SYS_PTRACE`) can't read the user's fds, so this also covers the
+    /// helper rerunning itself as the owner. python:alpine because busybox
+    /// can't listen on a unix socket.
+    #[test_utils::docker_test(helper)]
+    fn vscode_goto_runs_the_window_cli_as_its_owner_with_docker() -> Result<(), &'static str> {
+        use std::process::Command;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let name = format!("devsandbox-devsbd-vscode-test-{stamp}");
+        let up = Command::new("docker")
+            .args(["run", "-d", "--rm", "--name", &name, "python:3.13-alpine", "sleep", "300"])
+            .output()
+            .unwrap();
+        assert!(up.status.success(), "{}", String::from_utf8_lossy(&up.stderr));
+        let exec = |args: &[&str]| Command::new("docker").arg("exec").args(args).output().unwrap();
+        let sh = |script: &str| {
+            let out = exec(&[&name, "sh", "-c", script]);
+            assert!(out.status.success(), "{script}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        let cleanup = || {
+            let _ = Command::new("docker").args(["rm", "-f", &name]).output();
+        };
+        crate::test_support::with_cleanup(cleanup, || {
+            install(&name, None).unwrap();
+            let goto = |wait: &str| exec(&[&name, BIN, "vscode-goto", "/work/a.rs:4:2", "--wait", wait]);
+
+            let none = goto("1");
+            assert_eq!(none.status.code(), Some(3));
+            assert!(String::from_utf8_lossy(&none.stderr).contains("no VS Code window attached"));
+
+            let bin = "/home/u/.vscode-server/bin/abc";
+            sh(&format!(
+                "adduser -D -u 1234 u && mkdir -p {bin}/bin/remote-cli /tmp/rec && chmod 777 /tmp/rec \
+                 && ln -s \"$(command -v python3)\" {bin}/node \
+                 && cat > {bin}/bin/remote-cli/code <<'EOF'
+#!/bin/sh
+id -u > /tmp/rec/uid
+env > /tmp/rec/env
+printf '%s\\n' \"$@\" > /tmp/rec/argv
+EOF
+chmod 755 {bin}/bin/remote-cli/code && chown -R u /home/u"
+            ));
+            let listen = |sock: &str| {
+                format!(
+                    "import socket,time;s=socket.socket(socket.AF_UNIX);s.bind('{sock}');s.listen();time.sleep(300)"
+                )
+            };
+            let node = format!("{bin}/node");
+            let ext = listen("/tmp/vscode-ipc-x.sock");
+            let ok = exec(&["-d", "-u", "u", &name, &node, "-c", &ext, "--type=extensionHost"]);
+            assert!(ok.status.success());
+            sh("for i in $(seq 50); do [ -S /tmp/vscode-ipc-x.sock ] && break; sleep 0.1; done");
+            let term = listen("/tmp/vscode-ipc-term.sock");
+            assert!(exec(&["-d", "-u", "u", &name, &node, "-c", &term]).status.success());
+            sh("for i in $(seq 50); do [ -S /tmp/vscode-ipc-term.sock ] && break; sleep 0.1; done");
+
+            let out = goto("10");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(out.status.success(), "{stdout}{}", String::from_utf8_lossy(&out.stderr));
+            assert!(stdout.starts_with("socket=/tmp/vscode-ipc-x.sock pid="), "{stdout}");
+            assert!(stdout.trim_end().ends_with(&format!(" cli={bin}/bin/remote-cli/code")), "{stdout}");
+
+            assert_eq!(sh("cat /tmp/rec/uid").trim(), "1234");
+            assert_eq!(sh("cat /tmp/rec/argv"), "-g\n/work/a.rs:4:2\n");
+            let env = sh("cat /tmp/rec/env");
+            let mut vars: Vec<&str> = env
+                .lines()
+                // Set by the shell running the script, not passed in.
+                .filter(|l| !l.starts_with("PWD=") && !l.starts_with("SHLVL="))
+                .collect();
+            vars.sort();
+            assert_eq!(
+                vars,
+                ["HOME=/home/u", "PATH=/usr/local/bin:/usr/bin:/bin", "VSCODE_IPC_HOOK_CLI=/tmp/vscode-ipc-x.sock"]
+            );
+        });
+        Ok(())
+    }
+
     #[test]
     fn boot_spec_mirrors_the_lifecycle_exec() {
         #[derive(Deserialize)]

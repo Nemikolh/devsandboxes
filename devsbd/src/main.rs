@@ -8,6 +8,7 @@ mod daemon;
 mod json;
 mod outbox;
 mod runs;
+mod vscode;
 
 // Shared with the host so the two sides can't drift; they live in the root
 // crate because devsbd/ isn't packaged (see proto.rs's module doc).
@@ -68,6 +69,7 @@ fn main() {
         Some(verb @ ("ensure" | "ls" | "branches" | "stop" | "rm" | "done" | "exec")) => {
             std::process::exit(ctl::run(verb, &args.collect::<Vec<_>>()))
         }
+        Some("vscode-goto") => std::process::exit(vscode::run(&args.collect::<Vec<_>>())),
         Some("run") => {
             let args = args.collect::<Vec<_>>();
             let code = if runs::is_local(&args) { runs::run(&args) } else { ctl::run_remote(&args) };
@@ -75,7 +77,7 @@ fn main() {
         }
         _ => {
             eprintln!(
-                "usage: devsbd version|daemon|bridge|boot|notify|thread|events|ensure|ls|branches|stop|rm|done|exec|run"
+                "usage: devsbd version|daemon|bridge|boot|notify|thread|events|ensure|ls|branches|stop|rm|done|exec|run|vscode-goto"
             );
             std::process::exit(2);
         }
