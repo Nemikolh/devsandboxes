@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 /// A running (or previously started) sandbox instance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Instance {
-    /// Sandbox config name from config.toml.
+    /// Sandbox config name from devsandboxes.toml.
     pub sandbox: String,
     /// Persistent identity: the instance's name at creation, unique across all
     /// instances and never changed by `rename` (which only moves the state

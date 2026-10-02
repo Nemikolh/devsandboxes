@@ -864,7 +864,8 @@ fn container_command() -> Vec<String> {
 }
 
 fn offer_example_config(dir: &Path) -> Result<()> {
-    let path = dir.join(CONFIG_FILE);
+    let existing = crate::config::find(dir)?;
+    let path = existing.clone().unwrap_or_else(|| dir.join(CONFIG_FILE));
     eprintln!("No sandboxes defined in {}.", path.display());
     if !std::io::stdin().is_terminal() {
         bail!("nothing to run");
@@ -876,7 +877,7 @@ fn offer_example_config(dir: &Path) -> Result<()> {
     if !matches!(answer.trim(), "y" | "Y") {
         bail!("nothing to run");
     }
-    if path.exists() {
+    if existing.is_some() {
         bail!("{} already exists, not overwriting", path.display());
     }
     std::fs::write(&path, EXAMPLE_CONFIG)

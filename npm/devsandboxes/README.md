@@ -1,6 +1,6 @@
 # devsandboxes
 
-Manage devcontainer-style sandboxes on docker, podman, or Apple `container`: many throwaway instances per repo from one `config.toml`. This package ships the native `devsandbox` binary (Linux x64/arm64, macOS arm64, Windows x64) plus a typed Node API.
+Manage devcontainer-style sandboxes on docker, podman, or Apple `container`: many throwaway instances per repo from one `devsandboxes.toml`. This package ships the native `devsandbox` binary (Linux x64/arm64, macOS arm64, Windows x64) plus a typed Node API.
 
 The package installs a `devsandbox` command (`npm i -g devsandboxes`); `npx devsandboxes` runs it without installing.
 

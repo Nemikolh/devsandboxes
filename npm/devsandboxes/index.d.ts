@@ -35,7 +35,7 @@ export interface InstanceRow {
   drift: boolean;
 }
 
-/** One `[sandbox.*]` from config.toml (`ls()`, `status().sandboxes`). */
+/** One `[sandbox.*]` from devsandboxes.toml (`ls()`, `status().sandboxes`). */
 export interface SandboxRow {
   name: string;
   /** `image X`, `dockerfile Y`, or `?` when the sandbox failed to resolve. */
@@ -50,7 +50,7 @@ export interface SandboxRow {
   issues: string[];
 }
 
-/** One `[services.*]` from config.toml (`service.ls()`, `status().services`). */
+/** One `[services.*]` from devsandboxes.toml (`service.ls()`, `status().services`). */
 export interface ServiceRow {
   name: string;
   scope: 'global' | 'isolated';
@@ -124,7 +124,7 @@ export interface StatsRow {
 // Options & results
 
 export interface CommonOptions {
-  /** Config root containing config.toml (the CLI's `-C`). Defaults to `cwd`. */
+  /** Config root containing devsandboxes.toml (the CLI's `-C`). Defaults to `cwd`. */
   dir?: string;
   cwd?: string;
   env?: NodeJS.ProcessEnv;
@@ -170,7 +170,7 @@ export declare function binaryPath(): string;
 /** Run the CLI with raw arguments. */
 export declare function cli(args: readonly string[], opts?: CliOptions): Promise<CliResult>;
 
-/** Sandbox configs in config.toml. */
+/** Sandbox configs in devsandboxes.toml. */
 export declare function ls(opts?: CommonOptions): Promise<SandboxRow[]>;
 /** Running devsandbox containers (`all` includes stopped ones). */
 export declare function ps(opts?: CommonOptions & { all?: boolean }): Promise<ContainerRow[]>;

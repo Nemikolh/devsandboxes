@@ -27,8 +27,8 @@ pub fn ls(dir: &Path, json: bool) -> Result<()> {
     let sandboxes = config.resolve_all()?;
     if sandboxes.is_empty() {
         println!(
-            "no sandboxes defined in {}/config.toml",
-            dir.display()
+            "no sandboxes defined in {}",
+            crate::config::display_path(dir).display()
         );
         return Ok(());
     }

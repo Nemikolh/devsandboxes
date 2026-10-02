@@ -67,4 +67,4 @@ from files elsewhere in the repo, so edit those, not the site:
   TypeScript compiler API.
 
 Every config snippet on the site must be valid: write it to a temp dir as
-`config.toml` and run `cargo run -q -- -C <dir> ls` from the repo root.
+`devsandboxes.toml` and run `cargo run -q -- -C <dir> ls` from the repo root.

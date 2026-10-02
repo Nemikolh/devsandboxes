@@ -100,7 +100,7 @@ docker-compose ties service lifetime to one project; we want `[services.*]` shar
 **all instances** that declare them. Design:
 
 - One **docker network per config root**: `devsandbox-net-<project-id>` where
-  `project-id` = short hash of the canonicalized config.toml directory. Created
+  `project-id` = short hash of the canonicalized devsandboxes.toml directory. Created
   idempotently; every sandbox instance container joins it.
 - Each service runs as a standalone container `devsandbox-svc-<project-id>-<name>`,
   labeled `devsandbox.service=<name>`, with a network **alias = service name** so

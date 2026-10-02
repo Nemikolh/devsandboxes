@@ -28,7 +28,7 @@ Topic docs in `docs/` go deeper on single features.
   else, an `ext::` remote, or an `objects/info/alternates` file refuses the
   operation with the file and key named; the user reviews and removes it.
 
-## config.toml
+## devsandboxes.toml
 
 Three top-level tables:
 
@@ -207,7 +207,7 @@ Everything except `inspect` is wrapped as `{ "schema": 1, "data": … }`, and `s
 ```
 src/
   main.rs             CLI (clap) and dispatch; bare TTY invocation → TUI
-  config.rs           config.toml model, extends deep-merge, mounts, validation
+  config.rs           devsandboxes.toml model, extends deep-merge, mounts, validation
   features.rs         devcontainer features: OCI fetch, metadata, install order
   state.rs            host-side instance store (no daemon)
   snapshot.rs         serializable rows shared by JSON output and the TUI

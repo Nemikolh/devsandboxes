@@ -75,7 +75,7 @@ const edges = [
   <p class="visually-hidden">
     Diagram: on your machine, you ask your agent to set up an environment. It git clones the api, web and billing repos
     into ~/code, then drives devsandbox with run --json and exec on your container runtime. There it brings up two
-    stacks, each one config.toml: shop, with sandboxes api and web on their checkouts and a global postgres, and
+    stacks, each one devsandboxes.toml: shop, with sandboxes api and web on their checkouts and a global postgres, and
     billing, with sandbox billing, a child instance billing-pr-42 on its own worktree of the PR branch
     fix/invoice-rounding, and an isolated redis. Across the
     sandbox boundary: ports tunneled to localhost with devsandbox port, your ssh-agent forwarded in so keys stay on the
@@ -134,7 +134,7 @@ const edges = [
                 <div class="sd-stack-head">
                   <Layers />
                   <strong>{s.name}</strong>
-                  <span>stacks/{s.name}/config.toml</span>
+                  <span>stacks/{s.name}/devsandboxes.toml</span>
                 </div>
                 <div class="sd-boxes">
                   {s.sandboxes.map((b) => (

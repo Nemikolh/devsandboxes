@@ -1,15 +1,15 @@
 ---
 name: devsandbox-cli
 description: |
-  Use the devsandbox CLI to create, run, exec into, and tear down devcontainer-based sandboxes from a config.toml file.
-  Covers every subcommand, ordered by how useful each is to an agent, plus a config.toml overview (full format: the `config-toml-spec` skill).
+  Use the devsandbox CLI to create, run, exec into, and tear down devcontainer-based sandboxes from a devsandboxes.toml file.
+  Covers every subcommand, ordered by how useful each is to an agent, plus a devsandboxes.toml overview (full format: the `config-toml-spec` skill).
 ---
 
 # devsandbox CLI
 
 `devsandbox` manages devcontainer-style sandboxes directly on a container runtime
 (docker / podman / Apple `container`) — no devcontainer CLI, no daemon. One
-`config.toml` that lives outside of any project, unique per user.
+`devsandboxes.toml` that lives outside of any project, unique per user.
 
 It defines templates, sandboxes, and shared services; the CLI derives containers, networks,
 mounts, caches, and VS Code wiring from it.
@@ -36,9 +36,9 @@ falls back to the default.
 `-C <dir>` (global flag) points any command at a different config root; default is
 the current directory.
 
-## config.toml
+## devsandboxes.toml
 
-TOML, not JSON. Three top-level table families:
+TOML, not JSON (`devsandboxes.yaml` / `.yml` work too, same schema). Three top-level table families:
 
 - `[template.<name>]` — reusable property sets, referenced via `extends`.
 - `[sandbox.<name>]` — a devcontainer definition plus devsandbox extras.
@@ -143,7 +143,7 @@ listed when stdin is not a TTY.
 6. **`stats`** — one-shot CPU/memory usage of every running `devsandbox-*`
    container (instances and services). Columns: NAME, CPU, MEM.
 
-7. **`ls`** — list sandbox _configs_ from `config.toml` (NAME, SOURCE, FOLDER,
+7. **`ls`** — list sandbox _configs_ from `devsandboxes.toml` (NAME, SOURCE, FOLDER,
    SERVICES, EXTENDS). Use to discover what can be `run` and to catch config
    parse/validation errors.
 

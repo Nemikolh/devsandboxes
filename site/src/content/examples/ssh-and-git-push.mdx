@@ -25,7 +25,7 @@ devsandbox forwards your host's **ssh-agent** instead: ssh inside the sandbox as
 
 <AgentPicker />
 
-```toml title="config.toml" agent="claude"
+```toml title="devsandboxes.toml" agent="claude"
 [sandbox.app]
 folder = "../app"          # your repo, next to this config dir
 image = "node:22"
@@ -39,7 +39,7 @@ known-hosts = "mkdir -p ~/.ssh && ssh-keyscan github.com >> ~/.ssh/known_hosts" 
 agent = "npm install -g @anthropic-ai/claude-code"
 ```
 
-```toml title="config.toml" agent="codex"
+```toml title="devsandboxes.toml" agent="codex"
 [sandbox.app]
 folder = "../app"          # your repo, next to this config dir
 image = "node:22"

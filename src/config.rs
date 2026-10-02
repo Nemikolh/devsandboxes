@@ -1,13 +1,67 @@
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 use toml::{Table, Value};
 
-pub const CONFIG_FILE: &str = "config.toml";
+/// Default config file name, written by `run`'s example-config offer.
+pub const CONFIG_FILE: &str = "devsandboxes.toml";
+/// Every accepted config file name; more than one present is an error rather
+/// than a silent precedence pick.
+const CONFIG_FILES: [&str; 3] = [CONFIG_FILE, "devsandboxes.yaml", "devsandboxes.yml"];
+/// Pre-0.5.1 name. Still read when nothing else exists, and renamed to
+/// [`CONFIG_FILE`] by [`migrate_legacy`].
+const LEGACY_CONFIG_FILE: &str = "config.toml";
 
-/// Raw `config.toml` contents. Template and sandbox bodies are kept as
+/// The config file in `dir`: one of [`CONFIG_FILES`], else a legacy
+/// `config.toml` that looks like a devsandbox config, else `None`.
+pub fn find(dir: &Path) -> Result<Option<PathBuf>> {
+    let present: Vec<PathBuf> =
+        CONFIG_FILES.iter().map(|f| dir.join(f)).filter(|p| p.is_file()).collect();
+    match present.as_slice() {
+        [] => Ok(legacy(dir)),
+        [one] => Ok(Some(one.clone())),
+        many => bail!(
+            "several config files in {}: {}; keep only one",
+            dir.display(),
+            many.iter().filter_map(|p| p.file_name()?.to_str()).collect::<Vec<_>>().join(", ")
+        ),
+    }
+}
+
+/// The config file [`Config::load`] reads in `dir`, for messages: the default
+/// name when there is none (or the lookup fails).
+pub fn display_path(dir: &Path) -> PathBuf {
+    find(dir).ok().flatten().unwrap_or_else(|| dir.join(CONFIG_FILE))
+}
+
+/// A legacy `config.toml` in `dir`, only if it has a devsandbox top-level
+/// table: the name is common enough (Hugo, …) that an unrelated file must not
+/// be read, let alone renamed.
+fn legacy(dir: &Path) -> Option<PathBuf> {
+    let path = dir.join(LEGACY_CONFIG_FILE);
+    let table: Table = toml::from_str(&std::fs::read_to_string(&path).ok()?).ok()?;
+    ["sandbox", "template", "services"]
+        .iter()
+        .any(|k| table.contains_key(*k))
+        .then_some(path)
+}
+
+/// Rename a legacy `config.toml` in `dir` to [`CONFIG_FILE`] when no current
+/// config file exists. Returns the new path when it renamed.
+pub fn migrate_legacy(dir: &Path) -> Result<Option<PathBuf>> {
+    let Some(old) = find(dir)? else { return Ok(None) };
+    if old.file_name().and_then(|n| n.to_str()) != Some(LEGACY_CONFIG_FILE) {
+        return Ok(None);
+    }
+    let new = dir.join(CONFIG_FILE);
+    std::fs::rename(&old, &new)
+        .with_context(|| format!("cannot rename {} to {}", old.display(), new.display()))?;
+    Ok(Some(new))
+}
+
+/// Raw `devsandboxes.toml` (or `.yaml`) contents (TOML or YAML, same schema). Template and sandbox bodies are kept as
 /// free-form tables so `extends` can deep-merge them; the merged result is
 /// validated into [`SandboxProperties`] by `resolve_sandbox`.
 #[derive(Debug, Default, Deserialize)]
@@ -420,7 +474,7 @@ pub struct MountObject {
 /// Values for the devcontainer `${…}` variables devsandbox substitutes in mount
 /// sources. `localEnv:*` is read from the process environment separately.
 pub struct MountContext<'a> {
-    /// Directory holding `config.toml` (`${configDir}`).
+    /// Directory holding `devsandboxes.toml` (`${configDir}`).
     pub config_dir: &'a str,
     /// Host path of the project checkout (`${localWorkspaceFolder}`).
     pub workspace_folder: &'a str,
@@ -749,6 +803,16 @@ impl Config {
         toml::from_str(contents).context("invalid config")
     }
 
+    /// YAML lands in the same `toml::Table`s as TOML, so `extends`, merging
+    /// and drift hashes behave identically: the same config in either format
+    /// hashes the same.
+    pub fn parse_yaml(contents: &str) -> Result<Self> {
+        // An empty (or comment-only) document is an empty config, as in TOML.
+        let config: Option<Self> =
+            serde_saphyr::from_str(contents).map_err(|e| anyhow!("{e}")).context("invalid config")?;
+        Ok(config.unwrap_or_default())
+    }
+
     pub fn resolve_service(&self, name: &str) -> Result<ResolvedService> {
         let table = self
             .services
@@ -772,10 +836,14 @@ impl Config {
     }
 
     pub fn load(dir: &Path) -> Result<Self> {
-        let path = dir.join(CONFIG_FILE);
+        let path = find(dir)?.unwrap_or_else(|| dir.join(CONFIG_FILE));
         let contents = std::fs::read_to_string(&path)
             .with_context(|| format!("cannot read {}", path.display()))?;
-        Self::parse(&contents).with_context(|| format!("in {}", path.display()))
+        let parsed = match path.extension().and_then(|e| e.to_str()) {
+            Some("yaml" | "yml") => Self::parse_yaml(&contents),
+            _ => Self::parse(&contents),
+        };
+        parsed.with_context(|| format!("in {}", path.display()))
     }
 
     pub fn resolve_sandbox(&self, name: &str) -> Result<ResolvedSandbox> {
@@ -1028,6 +1096,98 @@ build.args = { B = "3" }
         assert_eq!(config.services.len(), 1);
         assert_eq!(config.templates.len(), 1);
         assert_eq!(config.sandboxes.len(), 2);
+    }
+
+    const EXAMPLE_YAML: &str = r#"
+services:
+  database:
+    image: postgres
+
+template:
+  base-sandbox:
+    caches: [pnpm]
+    build:
+      args: { A: "1", B: "2" }
+
+sandbox:
+  repository-1:
+    extends: base-sandbox
+    folder: ../repository-1
+    image: node-22
+  repository-2:
+    extends: base-sandbox
+    folder: ../repository-2
+    services: [database]
+    build:
+      dockerfile: ./Dockerfile
+      args: { B: "3" }
+"#;
+
+    #[test]
+    fn yaml_resolves_and_hashes_like_toml() {
+        let toml = Config::parse(EXAMPLE).unwrap();
+        let yaml = Config::parse_yaml(EXAMPLE_YAML).unwrap();
+        for name in ["repository-1", "repository-2"] {
+            let (t, t_hash) = toml.resolved_table(name).unwrap();
+            let (y, y_hash) = yaml.resolved_table(name).unwrap();
+            assert_eq!(t, y, "{name}");
+            assert_eq!(t_hash, y_hash, "{name}");
+        }
+        assert_eq!(
+            toml.resolve_service("database").unwrap().config_hash,
+            yaml.resolve_service("database").unwrap().config_hash
+        );
+    }
+
+    #[test]
+    fn yaml_empty_and_invalid() {
+        assert!(Config::parse_yaml("").unwrap().sandboxes.is_empty());
+        assert!(Config::parse_yaml("# nothing yet\n").unwrap().sandboxes.is_empty());
+        assert!(Config::parse_yaml("sandbox: [").is_err());
+        // TOML has no null; resolving would otherwise see a key TOML can't express.
+        assert!(Config::parse_yaml("sandbox: {s: {image: ~}}").is_err());
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("devsandbox-cfgfile-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn load_picks_format_by_extension() {
+        let dir = scratch("ext");
+        std::fs::write(dir.join("devsandboxes.yml"), EXAMPLE_YAML).unwrap();
+        assert_eq!(Config::load(&dir).unwrap().sandboxes.len(), 2);
+        std::fs::write(dir.join("devsandboxes.toml"), EXAMPLE).unwrap();
+        let err = format!("{:#}", Config::load(&dir).unwrap_err());
+        assert!(err.contains("devsandboxes.toml, devsandboxes.yml"), "{err}");
+        std::fs::remove_file(dir.join("devsandboxes.yml")).unwrap();
+        assert_eq!(Config::load(&dir).unwrap().sandboxes.len(), 2);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_config_is_read_then_migrated() {
+        let dir = scratch("legacy");
+        std::fs::write(dir.join("config.toml"), EXAMPLE).unwrap();
+        assert_eq!(Config::load(&dir).unwrap().sandboxes.len(), 2);
+        assert_eq!(migrate_legacy(&dir).unwrap(), Some(dir.join(CONFIG_FILE)));
+        assert!(!dir.join("config.toml").exists());
+        assert_eq!(Config::load(&dir).unwrap().sandboxes.len(), 2);
+        assert_eq!(migrate_legacy(&dir).unwrap(), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn unrelated_config_toml_is_left_alone() {
+        let dir = scratch("unrelated");
+        std::fs::write(dir.join("config.toml"), "baseURL = \"https://example.org\"\n").unwrap();
+        assert_eq!(migrate_legacy(&dir).unwrap(), None);
+        assert!(dir.join("config.toml").exists());
+        assert!(Config::load(&dir).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

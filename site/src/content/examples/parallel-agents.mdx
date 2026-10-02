@@ -25,7 +25,7 @@ That is what repeat instances do. The first `devsandbox run` of a sandbox mounts
 
 <AgentPicker />
 
-```toml title="config.toml" agent="claude"
+```toml title="devsandboxes.toml" agent="claude"
 [sandbox.app]
 folder = "../app"          # your repo, next to this config dir
 image = "node:22"          # any image with the repo's toolchain
@@ -41,7 +41,7 @@ deps = "npm install"
 agent = "npm install -g @anthropic-ai/claude-code"
 ```
 
-```toml title="config.toml" agent="codex"
+```toml title="devsandboxes.toml" agent="codex"
 [sandbox.app]
 folder = "../app"          # your repo, next to this config dir
 image = "node:22"          # any image with the repo's toolchain
@@ -95,7 +95,7 @@ devsandbox rm add-profile-pic
 
 ## How it works
 
-- Worktrees live in `.worktrees/<name>` next to `config.toml`; `rm` deletes them with the container.
+- Worktrees live in `.worktrees/<name>` next to `devsandboxes.toml`; `rm` deletes them with the container.
 - [`worktree-link`](/docs/config#devsandbox-extras) symlinks one shared copy into each worktree; `worktree-include` or a `.worktreeinclude` copies instead.
 - <Agent />'s config dir is mounted from the host: one login for every instance.
 
@@ -104,7 +104,7 @@ devsandbox rm add-profile-pic
 <AgentPrompt
   goal="Set up devsandbox so several <agent> sessions can work on my repo at <repo path> in parallel, each in its own sandbox instance on its own git worktree and branch."
   steps={[
-    'In config.toml, add a `[sandbox.<sandbox name>]` whose `folder` points at <repo path> (relative to the config dir), with an `image` that has the toolchain the repo needs. Install <agent> in `postCreateCommand` and mount its host config dir (its login) into the container.',
+    'In devsandboxes.toml, add a `[sandbox.<sandbox name>]` whose `folder` points at <repo path> (relative to the config dir), with an `image` that has the toolchain the repo needs. Install <agent> in `postCreateCommand` and mount its host config dir (its login) into the container.',
     'Put gitignored files every instance needs, like .env, in `worktree-link`.',
   ]}
   verify={[

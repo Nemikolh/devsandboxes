@@ -53,7 +53,7 @@ export interface ReadingPage {
 
 /** The pages that aren't collection entries, with their pager card text. */
 export const REFERENCE_PAGES: ReadingPage[] = [
-  { href: '/docs/config', title: 'Configuration', description: 'Every config.toml field, merge rule and variable.', kind: 'docs' },
+  { href: '/docs/config', title: 'Configuration', description: 'Every devsandboxes.toml field, merge rule and variable.', kind: 'docs' },
   { href: '/docs/node-api', title: 'Node API', description: 'Drive devsandbox from TypeScript with the typed devsandboxes package.', kind: 'docs' },
 ];
 

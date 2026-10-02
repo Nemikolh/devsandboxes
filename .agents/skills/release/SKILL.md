@@ -46,7 +46,7 @@ Never use a `## ` heading inside the section (it would end the section); use `##
 
 ## 3. Pick the bump
 
-`patch` for fixes and small additions, `minor` for new commands, config keys or behavior changes, `major` for breaking config/CLI changes (pre-1.0 too, if it would break existing `config.toml` files). Ask the user if it's unclear.
+`patch` for fixes and small additions, `minor` for new commands, config keys or behavior changes, `major` for breaking config/CLI changes (pre-1.0 too, if it would break existing `devsandboxes.toml` files). Ask the user if it's unclear.
 
 ## 4. Commit and release
 

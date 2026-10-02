@@ -22,7 +22,7 @@
 
 ```bash
 npm i -g devsandboxes   # or a binary: https://devsandboxes.com/docs/quick-start#install
-devsandbox run web      # a sandbox from your config.toml
+devsandbox run web      # a sandbox from your devsandboxes.toml
 devsandbox              # the dashboard
 ```
 

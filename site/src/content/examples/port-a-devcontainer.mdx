@@ -14,7 +14,7 @@ import AgentPromptLink from '../../components/AgentPromptLink.astro';
 
 Your repo already has a `.devcontainer/devcontainer.json` and you want to run it with devsandbox. Rewriting it from scratch risks losing something.
 
-`config.toml` uses the same property names in TOML, so most of the file moves over line by line. The differences: `folder` says which repo the sandbox is for, some properties are ignored, and compose setups become `[services.*]`.
+`devsandboxes.toml` uses the same property names in TOML, so most of the file moves over line by line. The differences: `folder` says which repo the sandbox is for, some properties are ignored, and compose setups become `[services.*]`.
 
 <AgentPromptLink />
 
@@ -41,9 +41,9 @@ Your repo already has a `.devcontainer/devcontainer.json` and you want to run it
 }
 ```
 
-```toml title="config.toml (after)"
+```toml title="devsandboxes.toml (after)"
 [sandbox.web]                      # the table key replaces `name`
-folder = "../web"                  # the repo; config.toml lives outside it
+folder = "../web"                  # the repo; devsandboxes.toml lives outside it
 image = "mcr.microsoft.com/devcontainers/typescript-node:22"
 forwardPorts = [3000]              # forwarded while the dashboard is open
 containerEnv = { NODE_ENV = "development" }
@@ -73,7 +73,7 @@ The `devcontainer.json` can stay in the repo; devsandbox never reads it.
 
 ### Property mapping
 
-| devcontainer.json | config.toml | notes |
+| devcontainer.json | devsandboxes.toml | notes |
 |---|---|---|
 | the file's location | `folder` | required by `run` |
 | `name` | the table key | `name` is ignored |
@@ -110,7 +110,7 @@ The app container is the sandbox; each other compose service becomes a `[service
 ## Agent instructions
 
 <AgentPrompt
-  goal="Port the devcontainer.json of my repo at <repo path> to a sandbox in my devsandbox config.toml."
+  goal="Port the devcontainer.json of my repo at <repo path> to a sandbox in my devsandbox devsandboxes.toml."
   steps={[
     'Read <repo path>/.devcontainer/devcontainer.json and any Dockerfile or docker-compose.yml it references; do not modify them.',
     'Add a `[sandbox.<sandbox name>]` with `folder` pointing at <repo path> (relative to the config dir) and copy the implemented properties over; rebase `build` paths onto the config dir. Extend an existing template instead of repeating what it provides.',

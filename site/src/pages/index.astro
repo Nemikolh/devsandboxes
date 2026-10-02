@@ -117,7 +117,7 @@ const toolingSteps = [
   },
   {
     title: 'Describe the stack',
-    text: 'One `config.toml` per stack: a sandbox per repo, the services they share, caches. Unknown keys are errors, so a typo fails fast.',
+    text: 'One `devsandboxes.toml` per stack: a sandbox per repo, the services they share, caches. Unknown keys are errors, so a typo fails fast.',
   },
   {
     title: 'Run, exec, report back',
@@ -171,7 +171,7 @@ devsandbox run web`;
           </ul>
         </div>
 
-        <div class="hero-workspace" data-pagefind-ignore role="img" aria-label="A terminal running devsandbox run web three times, creating instances web, web-2 and web-3, the last two on their own git worktrees, then devsandbox ps listing them next to a shared postgres service; beside it the config.toml that defines them.">
+        <div class="hero-workspace" data-pagefind-ignore role="img" aria-label="A terminal running devsandbox run web three times, creating instances web, web-2 and web-3, the last two on their own git worktrees, then devsandbox ps listing them next to a shared postgres service; beside it the devsandboxes.toml that defines them.">
           <div class="workspace-glow"></div>
           <div class="terminal-window">
             <div class="window-bar">
@@ -220,7 +220,7 @@ devsandbox run web`;
           <div class="config-window">
             <div class="config-bar">
               <FileCode size={14} />
-              <span>config.toml</span>
+              <span>devsandboxes.toml</span>
               <span class="config-close" aria-hidden="true">×</span>
             </div>
             <div class="config-code" set:html={heroConfigHtml} />
@@ -312,7 +312,7 @@ devsandbox run web`;
         </div>
         <p>
           Under the dashboard is a plain CLI with docker's verbs: run, exec, ps, logs, rm. The compose file becomes one
-          config.toml per stack, with defaults made for your laptop: worktrees, shared services and caches, your
+          devsandboxes.toml per stack, with defaults made for your laptop: worktrees, shared services and caches, your
           ssh-agent, ports tunneled on demand. Hand it to your agent and it sets up the whole stack.
         </p>
       </div>

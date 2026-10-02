@@ -4,6 +4,8 @@
 
 ### Added
 
+- **YAML configs.** `devsandboxes.yaml` (or `.yml`) works in place of `devsandboxes.toml`: same keys, `extends` merging and validation, only the syntax differs. A sandbox hashes the same in either format, so converting a config doesn't mark instances for rebuild. Keep one config file per config dir; with more than one, devsandbox stops with an error.
+
 - **`devsbd branches <sandbox>` tells a dispatcher which branches are already checked out.** It prints a JSON list of every branch in a worktree of the sandbox's repo and who holds it: one of the dispatcher's own children, another instance, the base checkout, or a worktree devsandbox doesn't know. It reads git on the host each time, so a `git switch` inside an instance is seen. With `--ahead`, each row also gets the number of commits `origin` doesn't have yet, and local branches that are ahead but not checked out are listed too. A dispatcher can use it to leave alone PRs that someone is working on locally. The sandbox must be in the dispatcher's `spawn`. Running dispatchers pick up the new helper when restarted.
 
 - **`rm --force` (`-f`) removes an instance whatever state it's in.** A worktree with uncommitted or untracked changes is removed anyway, changes discarded, instead of `rm` refusing. A step that fails (a worktree git won't remove, a repo the host refuses to run git in) prints a warning and `rm` carries on, so the instance still leaves the list. Whatever couldn't be removed stays on disk. The branch of a worktree that was left in place is kept. In the dashboard: `:rm --force <instance>`. npm: `rm(name, { force: true })`.
@@ -11,6 +13,8 @@
 - **The dashboard's Instances tree has a TYPE column when a sandbox is a dispatcher.** Instances of a dispatcher sandbox read `dispatcher`, the others `-`. Without any dispatcher in the config the column isn't shown.
 
 ### Changed
+
+- **The config file is now `devsandboxes.toml`.** An existing `config.toml` is renamed the next time `devsandbox` runs in its config dir (with a notice on stderr), and is read as-is until then. A `config.toml` with no `sandbox`, `template` or `services` table isn't a devsandbox config and is left alone.
 
 - **Inbox times say how long ago a notification came in.** The TIME column reads `just now`, `12s ago`, `5 min ago`, `3h ago`, `1 day ago`, … `6 days ago`, then the date and time (`Oct 2 14:32`) once a notification is a week old. Before, it showed only the time of day, so yesterday's notifications looked like today's. The Detail pane shows the date and time.
 

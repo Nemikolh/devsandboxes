@@ -20,7 +20,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 #[derive(Parser)]
 #[command(name = "devsandbox", about = "Manage devcontainer-based sandboxes")]
 struct Cli {
-    /// Directory containing config.toml (defaults to the current directory).
+    /// Directory containing devsandboxes.toml (defaults to the current directory).
     #[arg(short = 'C', long, global = true, default_value = ".")]
     dir: PathBuf,
 
@@ -30,7 +30,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// List the sandbox configs defined in config.toml
+    /// List the sandbox configs defined in devsandboxes.toml
     Ls {
         /// Output JSON instead of a table
         #[arg(long)]
@@ -222,10 +222,10 @@ enum ServiceCommand {
     /// Recreate a service's container(s) from the current config and rewire
     /// every running sandbox that references it (no sandbox restart)
     Rebuild {
-        /// Service name from config.toml
+        /// Service name from devsandboxes.toml
         name: String,
     },
-    /// List the services defined in config.toml
+    /// List the services defined in devsandboxes.toml
     Ls {
         /// Output JSON instead of a table
         #[arg(long)]
@@ -235,6 +235,15 @@ enum ServiceCommand {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // Here rather than in `Config::load`: that also runs on TUI threads, where
+    // a notice would garble the screen. A failure leaves the legacy file read
+    // in place, so it only warns.
+    match config::migrate_legacy(&cli.dir) {
+        Ok(Some(new)) => eprintln!("devsandbox: renamed config.toml to {}", new.display()),
+        Ok(None) => {}
+        Err(e) => eprintln!("devsandbox: warning: {e:#}"),
+    }
 
     let Some(command) = cli.command else {
         if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {

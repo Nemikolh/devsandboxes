@@ -1,15 +1,17 @@
 ---
 name: config-toml-spec
-description: Reference for devsandbox's `config.toml` format — `[template.*]`, `[sandbox.*]`, `[services.*]`, `extends` merge rules, `${…}` variables, and which devcontainer properties are implemented. Use when writing, editing, reviewing, or debugging a devsandbox config (e.g. porting a devcontainer.json to it).
+description: Reference for devsandbox's `devsandboxes.toml` format — `[template.*]`, `[sandbox.*]`, `[services.*]`, `extends` merge rules, `${…}` variables, and which devcontainer properties are implemented. Use when writing, editing, reviewing, or debugging a devsandbox config (e.g. porting a devcontainer.json to it).
 ---
 
-# devsandbox `config.toml` spec
+# devsandbox `devsandboxes.toml` spec
 
-`config.toml` is devsandbox's single source of truth: one file, outside any project, describing every sandbox. It replaces per-repo `devcontainer.json` (same property names, TOML syntax, plus devsandbox extras).
+`devsandboxes.toml` is devsandbox's single source of truth: one file, outside any project, describing every sandbox. It replaces per-repo `devcontainer.json` (same property names, TOML syntax, plus devsandbox extras).
 
 ## File layout
 
-`config.toml` lives in the *config dir* (`-C <dir>`, default `.`). Three top-level tables, all optional:
+`devsandboxes.toml` lives in the *config dir* (`-C <dir>`, default `.`). `devsandboxes.yaml` / `devsandboxes.yml` are read instead when present: same schema, merge rules and validation, only the syntax differs (`sandbox: {web: {image: …}}` for `[sandbox.web]`), and a YAML config hashes the same as its TOML equivalent, so switching formats doesn't flag drift. YAML `null` is not a valid value. More than one of the three in a config dir is an error. A legacy `config.toml` (pre-0.5.1 name) is still read when none exist, and is renamed to `devsandboxes.toml` the next time `devsandbox` runs there; one without a `sandbox`, `template` or `services` table is not a devsandbox config and is left alone.
+
+Three top-level tables, all optional:
 
 ```toml
 [template.<name>]   # reusable, never run directly

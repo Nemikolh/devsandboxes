@@ -45,7 +45,7 @@ devsandbox run web --name fix-login --branch fix/login
 
 ## From any directory
 
-Commands read the `config.toml` in the current directory. `-C <dir>` points any of them at another config root, so you don't have to `cd` first:
+Commands read the `devsandboxes.toml` in the current directory. `-C <dir>` points any of them at another config root, so you don't have to `cd` first:
 
 ```bash
 devsandbox -C ~/code/sandboxes run web
@@ -66,6 +66,6 @@ devsandbox gc           # reap services nothing references
 
 <div class="resource-grid">
   <ResourceLink href="/docs/dashboard" label="Dashboard tour" description="Every tab and key, next to a preview you can play with" />
-  <ResourceLink href="/docs/config" label="Configuration" description="Every config.toml field, merge rule and ${…} variable" />
+  <ResourceLink href="/docs/config" label="Configuration" description="Every devsandboxes.toml field, merge rule and ${…} variable" />
   <ResourceLink href="/examples" label="Examples" description="Parallel agents, shared databases, caches, ssh-agent, automations" />
 </div>

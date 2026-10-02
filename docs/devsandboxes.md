@@ -4,7 +4,7 @@ A Rust CLI that layers sandbox management on top of devcontainers: shared caches
 
 ## Goals
 
-- Stay **compatible with devcontainer.json semantics** (features, image, build.dockerfile, dockerComposeFile) while adding a config layer (`config.toml`) with templates, deep-merge `extends`, shared services, and shared caching between all devcontainers.
+- Stay **compatible with devcontainer.json semantics** (features, image, build.dockerfile, dockerComposeFile) while adding a config layer (`devsandboxes.toml`) with templates, deep-merge `extends`, shared services, and shared caching between all devcontainers.
 - **No daemon**: the CLI defers to docker for runtime; host-side state stored in a user location (e.g. `~/.local/share/devsandboxes`).
 - **Security boundary**: an orchestrator/agent driving the CLI must not be able to mutate the host — no arbitrary mounts, only start/exec inside sandboxes.
 
@@ -13,14 +13,14 @@ A Rust CLI that layers sandbox management on top of devcontainers: shared caches
 ```
 .devsandbox/            versioned sandbox definitions (git repo)
   .worktrees/           git worktrees to avoid recloning projects
-  config.toml           services, templates, sandboxes
+  devsandboxes.toml           services, templates, sandboxes
   dockerfiles/          supporting build files
 repository-1/           sibling project folders referenced by sandboxes (but they could be wherever)
 ```
 
 Core components:
 
-1. **Config layer** — parse `config.toml`: `[services.*]`, `[template.*]`, `[sandbox.*]`. Resolve `extends` as a deep merge (sandbox overrides template). Validate at the boundary; sandbox entries accept devcontainer.json properties plus `extends`, `folder`, `services`, `cache-folder`.
+1. **Config layer** — parse `devsandboxes.toml`: `[services.*]`, `[template.*]`, `[sandbox.*]`. Resolve `extends` as a deep merge (sandbox overrides template). Validate at the boundary; sandbox entries accept devcontainer.json properties plus `extends`, `folder`, `services`, `cache-folder`.
 2. **Devcontainer derivation** — translate a resolved sandbox config into an effective devcontainer configuration (image / Dockerfile / compose), including shared cache mounts (e.g. `.pnpm-store`) managed by the CLI, never user-specified arbitrary mounts.
 3. **Runtime layer** — shell out to docker / docker-compose. Containers named with a `devsandbox-` style prefix so they can be discovered via `docker ps` filtering. Linked services (e.g. postgres) started alongside and networked to the sandbox.
 4. **State store** — record created sandboxes (name, image/config used, folder, containers) in a user-level location; no daemon.

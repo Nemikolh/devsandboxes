@@ -81,7 +81,7 @@ export function buildAgentPrompt(spec: AgentPromptSpec): string {
 export function agentPromptItems({ steps, verify }: AgentPromptSpec): string[] {
   return [
     `Read the devsandbox-cli and config-toml-spec skills first (load them if they are installed, otherwise read them from ${SKILLS_URL}). Follow them over your own assumptions: unknown config keys are hard errors.`,
-    'Find my devsandbox config dir: the folder holding config.toml, passed to devsandbox as `-C <config dir>`. If you cannot tell which one, ask me.',
+    'Find my devsandbox config dir: the folder holding devsandboxes.toml, passed to devsandbox as `-C <config dir>`. If you cannot tell which one, ask me.',
     ...steps,
     'Validate with `devsandbox -C <config dir> ls` and fix every error it reports before going on.',
     ...verify,

@@ -58,12 +58,12 @@ cp -r /tmp/ds/skills/* ~/.claude/skills/   # devsandbox-cli, config-toml-spec`}
 
 ## Write a config
 
-A config root is a folder holding one `config.toml`. It lives **outside** your repos and describes every sandbox; each sandbox points at a repo with `folder`, relative to the config root. This guide uses this layout, with `web` being any git repository:
+A config root is a folder holding one `devsandboxes.toml` (or `devsandboxes.yaml`, same schema). It lives **outside** your repos and describes every sandbox; each sandbox points at a repo with `folder`, relative to the config root. This guide uses this layout, with `web` being any git repository:
 
 ```text title="LAYOUT"
 ~/code/
 ├── sandboxes/
-│   └── config.toml
+│   └── devsandboxes.toml
 └── web/            # your repo
 ```
 
@@ -72,7 +72,7 @@ A config root is a folder holding one `config.toml`. It lives **outside** your r
 Paste this into your agent and let it do the typing:
 
 <AgentPrompt
-  goal="Create a devsandbox config dir at ~/code/sandboxes with a config.toml holding a sandbox for my repo at ~/code/web, plus a postgres service it can use."
+  goal="Create a devsandbox config dir at ~/code/sandboxes with a devsandboxes.toml holding a sandbox for my repo at ~/code/web, plus a postgres service it can use."
   steps={[
     'Look at ~/code/web to pick the base image, devcontainer Features and `postCreateCommand` it needs (package manager, language toolchains); if it has a `.devcontainer/devcontainer.json`, port that instead.',
     'Put the shared parts (features, caches, `persist-shell-history`) in a `[template.base]` the sandbox `extends`, and add a `[services.database]` on `postgres:16` with `scope = "global"`, listed in the sandbox\'s `services`.',
@@ -84,9 +84,9 @@ Paste this into your agent and let it do the typing:
 
 ### By hand
 
-Put this in `~/code/sandboxes/config.toml`:
+Put this in `~/code/sandboxes/devsandboxes.toml`:
 
-```toml title="config.toml"
+```toml title="devsandboxes.toml"
 [services.database]
 image = "postgres:16"
 scope = "global"            # one container shared by all instances
@@ -120,7 +120,7 @@ web   image mcr.microsoft.com/devcontainers/base:ubuntu  ../web  database  base
 ```
 
 <Callout variant="tip" title="No config yet?">
-  Run `devsandbox run` in an empty folder: on a terminal it offers to write an example `config.toml` for you to edit.
+  Run `devsandbox run` in an empty folder: on a terminal it offers to write an example `devsandboxes.toml` for you to edit.
 </Callout>
 
 ## The dashboard
@@ -137,7 +137,7 @@ Select `web` and press `r` to run an instance, `t` for a terminal inside it, `?`
 
 <div class="resource-grid">
   <ResourceLink href="/docs/going-further" label="Going further" description="The same, from the CLI: run, exec, parallel instances, clean up" />
-  <ResourceLink href="/docs/config" label="Configuration" description="Every config.toml field, merge rule and ${…} variable" />
+  <ResourceLink href="/docs/config" label="Configuration" description="Every devsandboxes.toml field, merge rule and ${…} variable" />
   <ResourceLink href="/examples" label="Examples" description="Parallel agents, shared databases, caches, ssh-agent, automations" />
   <ResourceLink href="/docs/node-api" label="Node API" description="Every command as a typed promise from the devsandboxes package" />
 </div>

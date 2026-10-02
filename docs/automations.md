@@ -619,6 +619,6 @@ container trigger those host git calls itself (`ensure`, `rm`).
 
 ## Future
 
-- **`npx devsandboxes init dispatcher`** — scaffold a dispatcher repo: `config.toml` snippet, dispatcher script, git init, `AGENTS.md` + skills. To be explored.
+- **`npx devsandboxes init dispatcher`** — scaffold a dispatcher repo: `devsandboxes.toml` snippet, dispatcher script, git init, `AGENTS.md` + skills. To be explored.
 - Declarative `[automation.*]` sugar (source / key / when / run) compiled onto the dispatcher primitives, once a few real dispatchers show the common shape.
 - Webhook sources (`gh webhook forward`) instead of polling.

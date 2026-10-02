@@ -25,7 +25,7 @@ That is the default. A service without `scope` is **isolated**: every instance t
 
 <AgentPicker />
 
-```toml title="config.toml" agent="claude"
+```toml title="devsandboxes.toml" agent="claude"
 [services.postgres]
 image = "postgres:16"                  # no scope: one per instance
 env = { POSTGRES_PASSWORD = "postgres" }
@@ -50,7 +50,7 @@ CLAUDE_CONFIG_DIR = "/root/.claude"
 agent = "npm install -g @anthropic-ai/claude-code"
 ```
 
-```toml title="config.toml" agent="codex"
+```toml title="devsandboxes.toml" agent="codex"
 [services.postgres]
 image = "postgres:16"                  # no scope: one per instance
 env = { POSTGRES_PASSWORD = "postgres" }

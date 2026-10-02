@@ -17,7 +17,7 @@ Constraints for the implementing agent:
 
 `src/commands/ls.rs` currently prints raw `\t`-separated fields.
 
-- No sandboxes in config → print `no sandboxes defined in <dir>/config.toml` (stderr? no: stdout, exit 0).
+- No sandboxes in config → print `no sandboxes defined in <dir>/devsandboxes.toml` (stderr? no: stdout, exit 0).
 - Otherwise render a borderless ("invisible") table: column widths computed from content,
   two-space gutter, dim uppercase header row.
 - Columns: `NAME`, `SOURCE`, `FOLDER`, `SERVICES` (comma list, `-` when none),
@@ -94,7 +94,7 @@ which live instances reference it. Same table/detail-panel pattern as step 3.
 
 - `?` help overlay listing all keys.
 - Error toast (bottom-right, auto-dismiss on next key) instead of crashing on docker/config
-  errors; dashboard must start fine with no config.toml, no docker, or empty state.
+  errors; dashboard must start fine with no devsandboxes.toml, no docker, or empty state.
 - Logs preview: `l` on an instance shows last ~50 container log lines in the modal.
 - Header line with totals: N sandboxes, N running / N stopped instances, N service
   containers, docker version (cached).

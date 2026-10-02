@@ -76,7 +76,7 @@ pub struct InstanceRow {
     pub dispatcher: Option<String>,
 }
 
-/// One sandbox row from `config.toml`, everything the Instances tree needs to
+/// One sandbox row from `devsandboxes.toml`, everything the Instances tree needs to
 /// render a sandbox node. Every configured sandbox gets one, even with zero
 /// instances; a sandbox that fails to resolve still gets a row with source `?`.
 #[derive(Clone, Debug, Serialize)]
@@ -137,11 +137,11 @@ pub struct ServiceRow {
 #[derive(Clone, Debug, Serialize)]
 pub struct Snapshot {
     pub instances: Vec<InstanceRow>,
-    /// Sandboxes from `config.toml`, in config order. Empty when config is
+    /// Sandboxes from `devsandboxes.toml`, in config order. Empty when config is
     /// absent or unreadable. Roots of the Instances tree.
     pub sandboxes: Vec<SandboxRow>,
     pub services: Vec<ServiceRow>,
-    /// Number of sandboxes defined in `config.toml` (0 when config is absent or
+    /// Number of sandboxes defined in `devsandboxes.toml` (0 when config is absent or
     /// unreadable). Feeds the header totals line.
     pub sandbox_count: usize,
     /// Runtime name for the header (`docker`, `podman`, `container`).

@@ -676,7 +676,7 @@ pub fn ls(dir: &Path, json: bool) -> Result<()> {
     }
 
     if rows.is_empty() {
-        println!("no services defined in {}/config.toml", dir.display());
+        println!("no services defined in {}", crate::config::display_path(dir).display());
         return Ok(());
     }
 

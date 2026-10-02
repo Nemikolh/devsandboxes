@@ -246,7 +246,7 @@ fn draw_services_empty(frame: &mut Frame, area: Rect, term_focused: bool) {
         .border_style(dash_border_style(term_focused))
         .title(Tab::Services.title());
     let text = Line::from(Span::styled(
-        "no services defined in config.toml",
+        "no services defined in devsandboxes.toml",
         Style::default().add_modifier(Modifier::DIM),
     ))
     .alignment(Alignment::Center);
@@ -842,7 +842,7 @@ fn draw_instances(frame: &mut Frame, app: &App, area: Rect) {
         // No snapshot yet means the first collection is still running, not
         // that the config is empty.
         let message = if snapshot.is_some() {
-            "no sandboxes defined — check config.toml"
+            "no sandboxes defined — check devsandboxes.toml"
         } else {
             "loading…"
         };
@@ -1185,7 +1185,7 @@ fn draw_detail(
             None => Vec::new(),
         },
         (_, Some(Node::Orphans)) => vec![Line::from(Span::styled(
-            "instances whose sandbox is no longer in config.toml",
+            "instances whose sandbox is no longer in devsandboxes.toml",
             Style::default().add_modifier(Modifier::DIM),
         ))],
         _ => Vec::new(),

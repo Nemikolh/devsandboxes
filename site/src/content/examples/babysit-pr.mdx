@@ -28,7 +28,7 @@ A **dispatcher** sandbox runs a shell loop you own. For each PR that is conflict
 
 <AgentPicker />
 
-```toml title="config.toml" agent="claude"
+```toml title="devsandboxes.toml" agent="claude"
 [template.base]
 image = "node:22"
 # One gh login for every sandbox: `gh auth login` once, in any of them.
@@ -55,7 +55,7 @@ git-identity = "git config --global user.name 'PR babysitter' && git config --gl
 agent = "npm install -g @anthropic-ai/claude-code"
 ```
 
-```toml title="config.toml" agent="codex"
+```toml title="devsandboxes.toml" agent="codex"
 [template.base]
 image = "node:22"
 # One gh login for every sandbox: `gh auth login` once, in any of them.
@@ -87,7 +87,7 @@ On macOS <Agent /> keeps its login in the Keychain: run `/login` once in any ins
 
 </AgentOnly>
 
-The loop, in `pr-dispatcher/` next to `config.toml`, with a `.gitignore` for `babysit.log` and `.babysit/`. Set `REPO` and `chmod +x` it:
+The loop, in `pr-dispatcher/` next to `devsandboxes.toml`, with a `.gitignore` for `babysit.log` and `.babysit/`. Set `REPO` and `chmod +x` it:
 
 ```sh title="pr-dispatcher/babysit-loop.sh" agent="claude" collapsed
 #!/bin/sh
@@ -324,7 +324,7 @@ devsandbox exec -it web-pr-123 bash               # look at a child
   goal="Set up a devsandbox PR babysitter for the GitHub repo <owner/repo> (checked out at <repo path>): a dispatcher spawns a child per open PR that is conflicted or behind, merges the base in, runs <agent> non-interactively on conflicts, pushes, and notifies me on failure."
   steps={[
     'Read docs/automations-guide.md in the devsandboxes repo (https://github.com/Nemikolh/devsandboxes/blob/main/docs/automations-guide.md); use only the devsbd commands and flags it documents.',
-    'In config.toml, add a sandbox for the repo (`folder` = <repo path>) with the github-cli Feature, a shared `${sharedVolumes}/gh` mount, `gh auth setup-git` and a git identity of <your name> / <your email> in `postCreateCommand`. Install <agent> there too and mount its host config dir (its login) into the container.',
+    'In devsandboxes.toml, add a sandbox for the repo (`folder` = <repo path>) with the github-cli Feature, a shared `${sharedVolumes}/gh` mount, `gh auth setup-git` and a git identity of <your name> / <your email> in `postCreateCommand`. Install <agent> there too and mount its host config dir (its login) into the container.',
     'Add a `[sandbox.pr-dispatcher]` with its own `folder` (a new git repo next to the config dir), `autostart = "runtime"`, `dispatcher = { spawn = ["<sandbox name>"] }` (never `"*"`) and `postStartCommand = "nohup ./babysit-loop.sh >babysit.log 2>&1 &"`.',
     'Write babysit-loop.sh in that folder from https://devsandboxes.com/examples/babysit-pr (the <agent> variant), with `REPO=<owner/repo>` and the sandbox name in `devsbd ensure`; `chmod +x` it, gitignore `babysit.log` and `.babysit/`, check it with `sh -n`.',
   ]}
