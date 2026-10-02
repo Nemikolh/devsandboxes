@@ -445,6 +445,42 @@ fn children<'a>(
     state.instances.iter().filter(move |(_, i)| i.dispatcher.as_deref() == Some(owner_id))
 }
 
+/// `owner_id`'s children by the key they were ensured with, for callers that
+/// need to name a child without being a control op. Pure over state: the
+/// dashboard refreshes this when its snapshot moves, so the Inbox thread pane
+/// can resolve a thread's `child` without reading `state.toml` every frame.
+/// A child renamed away from `<sandbox>-<key>` has no key left and is skipped.
+pub fn child_names(state: &State, owner_id: &str) -> BTreeMap<String, String> {
+    children(state, owner_id)
+        .filter_map(|(name, info)| child_key(name, info).map(|k| (k.to_string(), name.clone())))
+        .collect()
+}
+
+/// The instance `owner_id`'s thread `child` key names, by the same rule as
+/// the `stop`/`rm` control ops ([`find_child`]): never another dispatcher's
+/// child, and `None` when the key is ambiguous across sandboxes, since the
+/// pane would otherwise show (and step 5 act on) a guess.
+pub fn resolve_child(state: &State, owner_id: &str, key: &str) -> Option<String> {
+    find_child(state, owner_id, key, None).ok()
+}
+
+/// Every dispatcher's resolvable children, owner id → key → instance name.
+/// The dashboard computes this off the UI thread with each snapshot, so the
+/// thread pane resolves a `child` from memory.
+pub fn thread_children(state: &State) -> BTreeMap<String, BTreeMap<String, String>> {
+    let owners: std::collections::BTreeSet<&str> =
+        state.instances.values().filter_map(|i| i.dispatcher.as_deref()).collect();
+    owners
+        .into_iter()
+        .map(|owner| {
+            let mut keys = child_names(state, owner);
+            keys.retain(|key, _| resolve_child(state, owner, key).is_some());
+            (owner.to_string(), keys)
+        })
+        .filter(|(_, keys)| !keys.is_empty())
+        .collect()
+}
+
 /// What `ensure` must do for the child it names.
 #[derive(Debug, PartialEq, Eq)]
 enum Ensure {
@@ -1558,6 +1594,49 @@ folder = "."
         s.instances.remove("web-other");
         let resp = call(&s, "a", &req(Op::Ls, None, None), &mut Fake::default());
         assert_eq!(resp.body, "[]");
+    }
+
+    /// The Inbox pane's resolver: a thread's `child` key to its instance name,
+    /// over state alone (no runtime, no control op).
+    #[test]
+    fn child_names_maps_keys_to_instances() {
+        let mut s = state();
+        // A child renamed away from `<sandbox>-<key>` has no key to map.
+        let mut renamed = inst("web", "web-x", Some("d"));
+        renamed.branch = None;
+        s.instances.insert("renamed".into(), renamed);
+
+        let mine = child_names(&s, "d");
+        assert_eq!(mine.get("one").map(String::as_str), Some("web-one"));
+        assert_eq!(mine.get("two").map(String::as_str), Some("web-two"));
+        assert_eq!(mine.len(), 2, "the renamed child is unresolvable: {mine:?}");
+        // Another dispatcher's child is never visible, and a dispatcher with
+        // no children resolves nothing.
+        assert!(!mine.contains_key("other"));
+        assert_eq!(child_names(&s, "a").get("other").map(String::as_str), Some("web-other"));
+        assert!(child_names(&s, "p").is_empty());
+    }
+
+    /// The pane resolves a thread's `child` like `stop`/`rm` would: the owner's
+    /// own child only, and nothing on an ambiguous key.
+    #[test]
+    fn resolve_child_is_owned_and_unambiguous() {
+        let mut s = state();
+        assert_eq!(resolve_child(&s, "d", "one").as_deref(), Some("web-one"));
+        assert_eq!(resolve_child(&s, "d", "other"), None, "another dispatcher's child");
+        assert_eq!(resolve_child(&s, "d", "nope"), None);
+        assert_eq!(resolve_child(&s, "p", "one"), None, "not a dispatcher");
+
+        let all = thread_children(&s);
+        assert_eq!(all.keys().collect::<Vec<_>>(), ["a", "d"], "owners with children only");
+        assert_eq!(all["d"].get("two").map(String::as_str), Some("web-two"));
+        assert_eq!(all["a"].get("other").map(String::as_str), Some("web-other"));
+
+        // Same key in a second sandbox: `stop one` would need the sandbox, so
+        // the pane doesn't guess either.
+        s.instances.insert("api-one".into(), inst("api", "api-one", Some("d")));
+        assert_eq!(resolve_child(&s, "d", "one"), None);
+        assert!(!thread_children(&s)["d"].contains_key("one"));
     }
 
     const WORKTREES: &[&str] = &["worktree", "list", "--porcelain"];

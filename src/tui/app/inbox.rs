@@ -1,8 +1,8 @@
 //! Inbox tab: this dashboard's view of the shared store (`crate::inbox`,
 //! `inbox.toml`). The content comes from the store — loaded at startup,
 //! reloaded whenever the file changes, since any dashboard or CLI may write
-//! it — and everything here is view state: selection, folds and the rows they
-//! produce, all unit-testable without touching the file.
+//! it — and everything here is view state: the current view, the selection,
+//! the open thread pane, all unit-testable without touching the file.
 //!
 //! Mutations (`d`, `D`, mark-read) are only *requested* here, as
 //! [`crate::inbox::Op`]s the event loop applies through `store::update`
@@ -10,47 +10,91 @@
 //! already shows the result. Opening a link is requested the same way
 //! (`pending_open`).
 //!
-//! Records sharing an `(owner, key)` form a thread: the newest is the head
-//! row, older ones are its foldable history. With more than one owner in the
-//! inbox, threads are grouped under a foldable header per owner.
+//! The list is one row per thread, newest change first, filtered by a
+//! [`View`] (docs/inbox-threads.md, *Inbox UI*). History lives in the focused
+//! thread pane (`enter`), which shows a thread's timeline, or a notify
+//! thread's earlier records, and shadows the dashboard keys while open.
+//!
+//! Read semantics: a thread is read when it's opened in the pane, and again
+//! whenever it changes while open. Notify records are also read when the user
+//! leaves the Inbox after it showed them: a notify record has no state to
+//! resolve it, so without that every unkeyed `notify` would sit in Needs you
+//! until opened one by one.
 
-use std::collections::BTreeSet;
+use std::cell::Cell;
+use std::cmp::Reverse;
 
-use crate::devsbd::notify::Record;
-use crate::inbox::{is_url, Inbox, Op, Thread};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+use crate::devsbd::notify::Level;
+use crate::inbox::{is_url, EntryKind, Inbox, Kind, Op, State, Thread};
 
 use super::{App, Tab};
 
-/// One visible Inbox row, indexing into [`InboxView::threads`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum InboxRow {
-    /// Owner header (only when more than one owner has entries), carrying the
-    /// owner's `instance_id`.
-    Group(String),
-    /// A thread's head.
-    Thread(usize),
-    /// `notes[note]` (≥ 1) of thread `thread`, shown while it is expanded.
-    History { thread: usize, note: usize },
+/// Which threads the list shows, cycled with `v`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum View {
+    /// Waiting on the user ([`Thread::needs_you`]): the default, and what the
+    /// badges count.
+    #[default]
+    NeedsYou,
+    Active,
+    Done,
+    /// Everything, archived threads and read notify records included.
+    All,
 }
 
-/// Row identity that survives inserts, removals and store reloads, for keeping
-/// the cursor.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum RowId {
-    Group(String),
-    Thread(u64),
-    Note(u64),
+impl View {
+    pub const ALL: [View; 4] = [View::NeedsYou, View::Active, View::Done, View::All];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            View::NeedsYou => "Needs you",
+            View::Active => "Active",
+            View::Done => "Done",
+            View::All => "All",
+        }
+    }
+
+    fn next(self) -> View {
+        let i = View::ALL.iter().position(|v| *v == self).unwrap_or(0);
+        View::ALL[(i + 1) % View::ALL.len()]
+    }
+
+    /// Whether `t` belongs in this view. Archived threads (their owner is
+    /// gone) are history and only show in All; so do read notify records,
+    /// which have no state to file them under.
+    pub fn shows(self, t: &Thread) -> bool {
+        match self {
+            View::NeedsYou => t.needs_you(),
+            View::Active => !t.archived && t.state == Some(State::Active),
+            View::Done => !t.archived && t.state == Some(State::Done),
+            View::All => true,
+        }
+    }
+
+    /// Whether this view lists unread notify records, i.e. leaving the Inbox
+    /// from it means the user has seen them.
+    fn shows_notify(self) -> bool {
+        matches!(self, View::NeedsYou | View::All)
+    }
 }
 
-/// The loaded Inbox plus this dashboard's fold state. Folds are per dashboard
-/// and never persisted, so they key off ids that outlive a reload.
+/// The loaded Inbox plus this dashboard's view state, which is never
+/// persisted: it keys off thread ids, which outlive a reload.
 #[derive(Default)]
 pub struct InboxView {
     content: Inbox,
-    /// Folded owner groups, by owner id.
-    collapsed: BTreeSet<String>,
-    /// Threads (by id) whose history is shown.
-    expanded: BTreeSet<u64>,
+    pub view: View,
+    /// Id of the thread open in the focused pane.
+    open: Option<u64>,
+    /// First pane row shown.
+    pub scroll: u16,
+    /// Largest useful `scroll`, written by the renderer, which alone knows the
+    /// pane's size and how its lines wrap. A `Cell` because drawing borrows
+    /// the app immutably; it only bounds the scroll keys, so a stale value
+    /// costs at most a frame of overscroll.
+    pane_max: Cell<u16>,
 }
 
 impl InboxView {
@@ -58,116 +102,234 @@ impl InboxView {
         &self.content.threads
     }
 
-    pub fn unread(&self) -> usize {
-        self.content.unread()
+    /// The tab-title badge: threads waiting on the user.
+    pub fn needs_you(&self) -> usize {
+        self.content.needs_you()
     }
 
-    /// Unread threads from owner id `owner` (group header).
-    pub fn unread_for(&self, owner: &str) -> usize {
-        self.content.unread_for(owner)
+    /// The Instances-row badge for owner id `owner`.
+    pub fn needs_you_for(&self, owner: &str) -> usize {
+        self.content.needs_you_for(owner)
     }
 
-    /// Unread threads from the instance named `name` (Instances-row badge).
-    pub fn unread_for_name(&self, name: &str) -> usize {
-        self.content.unread_for_name(name)
+    /// Threads in `view`, for the view header.
+    pub fn count(&self, view: View) -> usize {
+        self.threads().iter().filter(|t| view.shows(t)).count()
     }
 
-    /// Records (history included) from owner id `owner`.
-    pub fn count_for(&self, owner: &str) -> usize {
-        self.content.count_for(owner)
-    }
-
-    /// Display name of owner id `owner`.
-    pub fn owner_name<'a>(&'a self, owner: &'a str) -> &'a str {
-        self.content.owner_name(owner)
-    }
-
-    /// Whether rows are grouped per owner: only once a second owner shows up,
-    /// so a single sender keeps a flat list.
-    pub fn grouped(&self) -> bool {
+    /// The visible rows: indices into [`Self::threads`] in the current view,
+    /// last change first. The sort is stable, so ties keep the store's order
+    /// (newest arrival first). Cheap, recomputed on demand.
+    pub fn rows(&self) -> Vec<usize> {
         let threads = self.threads();
-        threads.iter().any(|t| t.owner != threads[0].owner)
-    }
-
-    pub fn is_collapsed(&self, owner: &str) -> bool {
-        self.collapsed.contains(owner)
-    }
-
-    pub fn is_expanded(&self, thread: &Thread) -> bool {
-        self.expanded.contains(&thread.id)
-    }
-
-    /// The visible rows for the current threads and fold state. Groups are
-    /// ordered by their newest thread; cheap, recomputed on demand.
-    pub fn rows(&self) -> Vec<InboxRow> {
-        let threads = self.threads();
-        let mut rows = Vec::new();
-        let push_thread = |rows: &mut Vec<InboxRow>, i: usize| {
-            rows.push(InboxRow::Thread(i));
-            if self.expanded.contains(&threads[i].id) {
-                rows.extend((1..threads[i].notes.len()).map(|note| InboxRow::History { thread: i, note }));
-            }
-        };
-        if !self.grouped() {
-            for i in 0..threads.len() {
-                push_thread(&mut rows, i);
-            }
-            return rows;
-        }
-        let mut seen: Vec<&str> = Vec::new();
-        for t in threads {
-            if !seen.contains(&t.owner.as_str()) {
-                seen.push(&t.owner);
-            }
-        }
-        for owner in seen {
-            rows.push(InboxRow::Group(owner.to_string()));
-            if self.collapsed.contains(owner) {
-                continue;
-            }
-            for (i, _) in threads.iter().enumerate().filter(|(_, t)| t.owner == owner) {
-                push_thread(&mut rows, i);
-            }
-        }
+        let mut rows: Vec<usize> = (0..threads.len()).filter(|&i| self.view.shows(&threads[i])).collect();
+        rows.sort_by_key(|&i| Reverse(threads[i].changed_at()));
         rows
     }
 
-    fn row_id(&self, row: &InboxRow) -> RowId {
-        let threads = self.threads();
-        match row {
-            InboxRow::Group(owner) => RowId::Group(owner.clone()),
-            InboxRow::Thread(i) => RowId::Thread(threads[*i].id),
-            InboxRow::History { thread, note } => RowId::Note(threads[*thread].notes[*note].id),
+    /// The thread open in the pane, if it still exists.
+    pub fn open_thread(&self) -> Option<&Thread> {
+        let id = self.open?;
+        self.threads().iter().find(|t| t.id == id)
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.open.is_some()
+    }
+
+    /// Renderer hook: the pane's largest scroll offset at its current size.
+    pub fn set_pane_max(&self, max: u16) {
+        self.pane_max.set(max);
+    }
+}
+
+/// A thread's one-line title: a dispatcher thread's `title`, or a notify
+/// thread's newest message, first line only.
+pub fn title_of(t: &Thread) -> String {
+    match t.kind {
+        Kind::Thread => t.title.clone(),
+        Kind::Notify => t.head().map_or("", |r| r.msg.lines().next().unwrap_or("")).to_string(),
+    }
+}
+
+/// The resolved `child` of a thread, for the pane.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChildInfo {
+    pub key: String,
+    /// Instance name, `None` when the key resolves to none of the owner's
+    /// children (removed, renamed away from `<sandbox>-<key>`, or ambiguous).
+    pub name: Option<String>,
+    /// The container's run state from the latest snapshot.
+    pub status: Option<String>,
+}
+
+/// How a pane segment is drawn; the renderer maps these to styles, so the
+/// content stays plain data that tests can read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tone {
+    Plain,
+    Dim,
+    Bold,
+    Link,
+    State(State),
+    Level(Level),
+}
+
+/// One pane line: styled segments, unwrapped.
+pub type PaneLine = Vec<(Tone, String)>;
+
+fn line(tone: Tone, text: impl Into<String>) -> PaneLine {
+    vec![(tone, text.into())]
+}
+
+/// A multi-line value folded onto one timeline row.
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn entry_label(kind: EntryKind) -> &'static str {
+    match kind {
+        EntryKind::Message => "message",
+        EntryKind::State => "state",
+        EntryKind::Status => "status",
+    }
+}
+
+/// Everything the focused pane (and the list's preview) shows for `t`: the
+/// header fields, the message, the timeline (a notify thread's records,
+/// oldest first like a dispatcher's entries), then the numbered actions and
+/// the reply hint. Pure, so what the pane says is unit-testable.
+pub fn pane_lines(t: &Thread, child: Option<&ChildInfo>, utc_offset: i64) -> Vec<PaneLine> {
+    let mut out = vec![line(Tone::Bold, title_of(t))];
+    let mut head: PaneLine = Vec::new();
+    match (t.kind, t.state, t.head()) {
+        (Kind::Thread, Some(state), _) => head.push((Tone::State(state), state.as_str().to_string())),
+        (Kind::Notify, _, Some(r)) => head.push((Tone::Level(r.level), r.level.as_str().to_string())),
+        _ => {}
+    }
+    if let Some(status) = &t.status {
+        head.push((Tone::Dim, "  ·  ".into()));
+        head.push((Tone::Plain, status.clone()));
+    }
+    head.push((Tone::Dim, format!("  ·  {}", stamp(t.changed_at(), utc_offset))));
+    out.push(head);
+    let mut from = vec![(Tone::Dim, "from   ".to_string()), (Tone::Plain, t.owner_name.clone())];
+    if t.archived {
+        from.push((Tone::Dim, "  (archived: instance removed)".into()));
+    }
+    out.push(from);
+    let link = t.link.as_ref().or_else(|| t.head().and_then(|r| r.link.as_ref()));
+    if let Some(link) = link {
+        out.push(vec![(Tone::Dim, "link   ".into()), (Tone::Link, link.clone()), (Tone::Dim, "  (enter)".into())]);
+    }
+    if let Some(c) = child {
+        let mut row = vec![(Tone::Dim, "child  ".to_string())];
+        match &c.name {
+            Some(name) => {
+                row.push((Tone::Plain, name.clone()));
+                row.push((Tone::Dim, format!("  {}", c.status.as_deref().unwrap_or("not in snapshot"))));
+            }
+            None => row.push((Tone::Dim, format!("{} (no such child)", c.key))),
+        }
+        out.push(row);
+    }
+    let message = match t.kind {
+        Kind::Thread => t.message.as_deref(),
+        Kind::Notify => t.head().map(|r| r.msg.as_str()),
+    };
+    if let Some(message) = message {
+        out.push(Vec::new());
+        out.extend(message.lines().map(|l| line(Tone::Plain, l)));
+    }
+
+    let timeline: Vec<PaneLine> = match t.kind {
+        Kind::Thread => t
+            .entries
+            .iter()
+            .map(|e| {
+                vec![
+                    (Tone::Dim, format!("{}  {:7} ", stamp(e.at, utc_offset), entry_label(e.kind))),
+                    (Tone::Plain, one_line(&e.text)),
+                ]
+            })
+            .collect(),
+        // The head is the message above; the timeline is what came before.
+        Kind::Notify => t
+            .notes
+            .iter()
+            .skip(1)
+            .rev()
+            .map(|n| {
+                let r = &n.record;
+                vec![
+                    (Tone::Dim, format!("{}  ", stamp(r.at, utc_offset))),
+                    (Tone::Level(r.level), format!("{:7} ", r.level.as_str())),
+                    (Tone::Plain, one_line(&r.msg)),
+                ]
+            })
+            .collect(),
+    };
+    if !timeline.is_empty() {
+        out.push(Vec::new());
+        out.push(line(Tone::Dim, match t.kind {
+            Kind::Thread => "timeline",
+            Kind::Notify => "earlier",
+        }));
+        out.extend(timeline);
+    }
+
+    if !t.actions.is_empty() {
+        out.push(Vec::new());
+        for (i, a) in t.actions.iter().enumerate() {
+            let mut row = vec![(Tone::Bold, format!("[{}] ", i + 1)), (Tone::Plain, a.label.clone())];
+            // Host actions run in the dashboard; the rest go to the owner.
+            if a.host.is_some() {
+                row.push((Tone::Dim, "  ⌂ host".into()));
+            }
+            if a.done {
+                row.push((Tone::Dim, "  ✓ done".into()));
+            }
+            out.push(row);
         }
     }
+    if let Some(reply) = &t.reply {
+        let hint = reply.placeholder.as_deref().unwrap_or("reply");
+        out.push(Vec::new());
+        out.push(vec![(Tone::Bold, "r ".into()), (Tone::Dim, format!("reply: {hint}"))]);
+    }
+    out
 }
 
 impl App {
     /// Install Inbox content loaded from the store (startup and every reload),
-    /// keeping the cursor on the row it was on. A cursor on the top row stays
-    /// on top (the newest); one moved down stays on its row, wherever that
-    /// moved to.
-    pub fn set_inbox(&mut self, mut inbox: Inbox) {
+    /// keeping the cursor on the thread it was on. A cursor on the top row
+    /// stays on top (the newest); one moved down stays on its thread, wherever
+    /// that moved to.
+    pub fn set_inbox(&mut self, inbox: Inbox) {
         let selected = match self.selected[Tab::Inbox.index()] {
             0 => None,
-            _ => self.selected_inbox_row_id(),
+            _ => self.selected_inbox_id(),
         };
-        // Archived threads (their instance is gone) stay in the store as
-        // history but are out of the live list; step 4 adds the All view that
-        // shows them. Dropping them from the view copy keeps every row index
-        // and every `Op` id consistent with what is on screen.
-        inbox.threads.retain(|t| !t.archived);
         self.inbox.content = inbox;
+        match self.inbox.open_thread().map(|t| (t.id, t.unread)) {
+            // Changed while open: the user is looking right at it.
+            Some((id, true)) => self.request_inbox(Op::MarkRead(id)),
+            Some(_) => {}
+            // Removed under the pane (another dashboard, `thread rm`).
+            None => self.inbox.open = None,
+        }
         self.reselect_inbox(selected);
-        // A record arriving while the Inbox is shown counts as seen.
-        self.mark_inbox_read_if_shown();
     }
 
     /// Ask the event loop to apply `op` to the store, and apply it here at
     /// once so the next frame shows it (the reload that follows confirms it).
+    /// The cursor stays on its thread, or on its row when the thread left
+    /// the view (e.g. a read notify record leaving Needs you).
     fn request_inbox(&mut self, op: Op) {
+        let selected = self.selected_inbox_id();
         self.inbox.content.apply(&op);
         self.pending_inbox.push(op);
+        self.reselect_inbox(selected);
     }
 
     /// Take the mutations the event loop owes the store.
@@ -175,175 +337,152 @@ impl App {
         std::mem::take(&mut self.pending_inbox)
     }
 
-    fn mark_inbox_read_if_shown(&mut self) {
-        if self.tab == Tab::Inbox && self.inbox.unread() > 0 {
-            self.request_inbox(Op::MarkAllRead);
-        }
-    }
-
-    /// Switch tabs; entering the Inbox marks everything read, entering
-    /// Instances refreshes the process rows (they aren't fetched elsewhere).
+    /// Switch tabs. Leaving the Inbox reads the notify records it showed (see
+    /// the module doc); entering Instances refreshes the process rows (they
+    /// aren't fetched elsewhere).
     pub(super) fn set_tab(&mut self, tab: Tab) {
+        if self.tab == Tab::Inbox && tab != Tab::Inbox {
+            self.inbox.open = None;
+            let unread_notify = self.inbox.threads().iter().any(|t| t.kind == Kind::Notify && t.unread);
+            if self.inbox.view.shows_notify() && unread_notify {
+                self.request_inbox(Op::MarkNotifyRead);
+            }
+        }
         if tab == Tab::Instances && self.tab != tab {
             self.needs_proc_fetch = true;
         }
         self.tab = tab;
-        self.mark_inbox_read_if_shown();
     }
 
-    /// Tab-bar title, carrying the unread count on the Inbox.
+    /// Tab-bar title, carrying the needs-you count on the Inbox.
     pub fn tab_title(&self, tab: Tab) -> String {
-        match (tab, self.inbox.unread()) {
+        match (tab, self.inbox.needs_you()) {
             (Tab::Inbox, n) if n > 0 => format!("{} ({n})", tab.title()),
             _ => tab.title().to_string(),
         }
     }
 
-    /// The row under the Inbox cursor, if any.
-    pub fn selected_inbox_row(&self) -> Option<InboxRow> {
-        self.inbox.rows().into_iter().nth(self.selected[Tab::Inbox.index()])
-    }
-
-    /// The record under the Inbox cursor (a head or a history row) with its
-    /// thread; `None` on a group header.
-    pub fn selected_inbox_record(&self) -> Option<(&Thread, &Record)> {
-        match self.selected_inbox_row()? {
-            InboxRow::Group(_) => None,
-            // A dispatcher thread has no records at all; its fields and
-            // timeline are read off the `Thread` itself.
-            InboxRow::Thread(i) => self.inbox.threads().get(i).and_then(|t| Some((t, t.head()?))),
-            InboxRow::History { thread, note } => {
-                let t = self.inbox.threads().get(thread)?;
-                Some((t, &t.notes.get(note)?.record))
-            }
-        }
-    }
-
-    /// The thread under the Inbox cursor (a head row), whatever its kind.
+    /// The thread under the Inbox cursor, if any.
     pub fn selected_inbox_thread(&self) -> Option<&Thread> {
-        match self.selected_inbox_row()? {
-            InboxRow::Thread(i) => self.inbox.threads().get(i),
-            _ => None,
-        }
+        let i = *self.inbox.rows().get(self.selected[Tab::Inbox.index()])?;
+        self.inbox.threads().get(i)
     }
 
-    fn selected_inbox_row_id(&self) -> Option<RowId> {
-        self.selected_inbox_row().map(|r| self.inbox.row_id(&r))
+    fn selected_inbox_id(&self) -> Option<u64> {
+        self.selected_inbox_thread().map(|t| t.id)
     }
 
-    /// Put the cursor back on row `id` if it is still visible, else re-clamp.
-    fn reselect_inbox(&mut self, id: Option<RowId>) {
+    /// Put the cursor back on thread `id` if it is still visible, else leave
+    /// the index and re-clamp.
+    fn reselect_inbox(&mut self, id: Option<u64>) {
         if let Some(id) = id {
-            if let Some(pos) = self.inbox.rows().iter().position(|r| self.inbox.row_id(r) == id) {
+            let threads = self.inbox.threads();
+            if let Some(pos) = self.inbox.rows().iter().position(|&i| threads[i].id == id) {
                 self.selected[Tab::Inbox.index()] = pos;
             }
         }
         self.clamp_selection();
     }
 
-    /// Index of the visible row with identity `id`.
-    fn inbox_row_position(&self, id: &RowId) -> Option<usize> {
-        self.inbox.rows().iter().position(|r| self.inbox.row_id(r) == *id)
+    /// `v` (Inbox tab): the next view, the cursor following its thread.
+    pub(super) fn cycle_inbox_view(&mut self) {
+        let selected = self.selected_inbox_id();
+        self.inbox.view = self.inbox.view.next();
+        self.reselect_inbox(selected);
     }
 
-    /// `→` (Inbox tab): unfold the group or thread under the cursor.
-    pub(super) fn inbox_expand(&mut self) {
-        match self.selected_inbox_row() {
-            Some(InboxRow::Group(owner)) => {
-                self.inbox.collapsed.remove(&owner);
-            }
-            Some(InboxRow::Thread(i)) if self.inbox.threads()[i].history() > 0 => {
-                self.inbox.expanded.insert(self.inbox.threads()[i].id);
-            }
-            _ => {}
-        }
-        self.clamp_selection();
-    }
-
-    /// `space` (Inbox tab): toggle the group or thread under the cursor.
-    pub(super) fn inbox_toggle(&mut self) {
-        match self.selected_inbox_row() {
-            Some(InboxRow::Group(owner)) => {
-                if !self.inbox.collapsed.remove(&owner) {
-                    self.inbox.collapsed.insert(owner);
-                }
-            }
-            Some(InboxRow::Thread(i)) if self.inbox.threads()[i].history() > 0 => {
-                let id = self.inbox.threads()[i].id;
-                if !self.inbox.expanded.remove(&id) {
-                    self.inbox.expanded.insert(id);
-                }
-            }
-            _ => {}
-        }
-        self.clamp_selection();
-    }
-
-    /// `←` (Inbox tab): fold one level. A group folds; an expanded thread
-    /// folds; otherwise jump to the parent (thread for history, group for a
-    /// thread when grouped).
-    pub(super) fn inbox_collapse(&mut self) {
-        let slot = Tab::Inbox.index();
-        match self.selected_inbox_row() {
-            Some(InboxRow::Group(owner)) => {
-                self.inbox.collapsed.insert(owner);
-            }
-            Some(InboxRow::Thread(i)) => {
-                let t = &self.inbox.threads()[i];
-                let (id, owner) = (t.id, t.owner.clone());
-                if !self.inbox.expanded.remove(&id) && self.inbox.grouped() {
-                    if let Some(pos) = self.inbox_row_position(&RowId::Group(owner)) {
-                        self.selected[slot] = pos;
-                    }
-                }
-            }
-            Some(InboxRow::History { thread, .. }) => {
-                let id = RowId::Thread(self.inbox.threads()[thread].id);
-                if let Some(pos) = self.inbox_row_position(&id) {
-                    self.selected[slot] = pos;
-                }
-            }
-            None => {}
-        }
-        self.clamp_selection();
-    }
-
-    /// `d` (Inbox tab): dismiss what's under the cursor: a history record, a
-    /// whole thread (on its head), or an owner's entries (on its header).
-    pub(super) fn dismiss_selected_notification(&mut self) {
-        let op = match self.selected_inbox_row() {
-            Some(InboxRow::Group(owner)) => {
-                self.inbox.collapsed.remove(&owner);
-                Op::RemoveOwner(owner)
-            }
-            Some(InboxRow::Thread(i)) => {
-                let id = self.inbox.threads()[i].id;
-                self.inbox.expanded.remove(&id);
-                Op::RemoveThread(id)
-            }
-            Some(InboxRow::History { thread, note }) => {
-                Op::RemoveNote(self.inbox.threads()[thread].notes[note].id)
-            }
-            None => return,
-        };
-        self.request_inbox(op);
-        self.clamp_selection();
-    }
-
-    /// `D` (Inbox tab): clear the inbox.
-    pub(super) fn clear_notifications(&mut self) {
-        self.request_inbox(Op::Clear);
-        self.inbox.collapsed.clear();
-        self.inbox.expanded.clear();
-        self.clamp_selection();
-    }
-
-    /// `enter` (Inbox tab): ask the event loop to open the selected record's
-    /// link. No link → no-op; a non-URL link → status line, nothing opened.
-    pub(super) fn open_selected_link(&mut self) {
-        let Some(link) = self.selected_inbox_record().and_then(|(_, r)| r.link.clone()) else {
+    /// `enter` (Inbox tab): open the selected thread in the pane, reading it.
+    pub(super) fn open_selected_thread(&mut self) {
+        let Some((id, unread)) = self.selected_inbox_thread().map(|t| (t.id, t.unread)) else {
             return;
         };
+        self.inbox.open = Some(id);
+        self.inbox.scroll = 0;
+        if unread {
+            self.request_inbox(Op::MarkRead(id));
+        }
+    }
+
+    /// The child of `t`, resolved through the map the event loop refreshes
+    /// with each snapshot, plus that instance's run state.
+    pub fn thread_child(&self, t: &Thread) -> Option<ChildInfo> {
+        let key = t.child.clone()?;
+        let name = self.thread_children.get(&t.owner).and_then(|keys| keys.get(&key)).cloned();
+        let status = name.as_ref().and_then(|name| {
+            let snapshot = self.snapshot.as_ref()?;
+            let row = snapshot.instances.iter().find(|r| &r.name == name)?;
+            Some(row.status.label().to_string())
+        });
+        Some(ChildInfo { key, name, status })
+    }
+
+    /// Keys while the thread pane is open. It shadows the dashboard like a
+    /// modal does: tab keys, `t`/`l`, `d` and the rest must not act on rows
+    /// the user can't see. Quit, the prompt and help stay reachable.
+    pub(super) fn on_key_inbox_pane(&mut self, key: KeyEvent) {
+        self.status = None;
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let Some(t) = self.inbox.open_thread() else {
+            self.inbox.open = None;
+            return;
+        };
+        let (kind, link) = (t.kind, t.link.clone().or_else(|| t.head().and_then(|r| r.link.clone())));
+        let labels: Vec<String> = t.actions.iter().map(|a| a.label.clone()).collect();
+        let replies = t.reply.is_some();
+        match key.code {
+            KeyCode::Esc => self.inbox.open = None,
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('c') if ctrl => self.should_quit = true,
+            KeyCode::Char(':') => self.open_prompt(),
+            KeyCode::Char('?') => self.open_help(),
+            KeyCode::Enter => match link {
+                Some(link) => self.request_open_link(link),
+                None => self.status = Some("no link on this thread".into()),
+            },
+            KeyCode::Char(c @ '1'..='9') => {
+                let n = c as usize - '1' as usize;
+                self.status = Some(match labels.get(n) {
+                    Some(label) => format!("[{c}] {label}: actions arrive in the next step"),
+                    None => format!("no action {c}"),
+                });
+            }
+            KeyCode::Char('r') if replies => self.status = Some("replies arrive with events".into()),
+            KeyCode::Char('u') if kind == Kind::Thread => {
+                self.status = Some("reopen arrives with events".into())
+            }
+            KeyCode::Char('d') if kind == Kind::Thread => {
+                self.status = Some("mark done arrives with events".into())
+            }
+            _ => {
+                let lines = self.inbox.pane_max.get().saturating_add(1);
+                let mut scroll = self.inbox.scroll;
+                super::view::scroll_key(&mut scroll, lines, key);
+                self.inbox.scroll = scroll;
+            }
+        }
+    }
+
+    /// `d` (Inbox tab): dismiss a notify thread (its history with it). A
+    /// dispatcher thread is the dispatcher's to drop; `d` will mark it done
+    /// once events exist.
+    pub(super) fn dismiss_selected_notification(&mut self) {
+        let Some((id, kind)) = self.selected_inbox_thread().map(|t| (t.id, t.kind)) else {
+            return;
+        };
+        match kind {
+            Kind::Notify => self.request_inbox(Op::RemoveThread(id)),
+            Kind::Thread => self.status = Some("mark done arrives with events".into()),
+        }
+    }
+
+    /// `D` (Inbox tab): clear every notify thread; dispatcher threads stay.
+    pub(super) fn clear_notifications(&mut self) {
+        self.request_inbox(Op::ClearNotify);
+    }
+
+    /// Ask the event loop to open `link`. A non-URL link (it comes from inside
+    /// the container) only gets a status line.
+    fn request_open_link(&mut self, link: String) {
         if is_url(&link) {
             self.status = Some(format!("opening {link}"));
             self.pending_open = Some(link);
@@ -420,8 +559,8 @@ pub fn parse_utc_offset(s: &str) -> Option<i64> {
 mod tests {
     use super::super::test_support::*;
     use super::*;
-    use crate::devsbd::notify::Level;
-    use crossterm::event::KeyCode;
+    use crate::devsbd::notify::Record;
+    use crate::inbox::{Action, Reply, ThreadPut};
 
     fn rec(msg: &str, key: Option<&str>, link: Option<&str>) -> Record {
         Record {
@@ -441,204 +580,313 @@ mod tests {
         app.set_inbox(inbox);
     }
 
-    /// Thread heads, newest first.
-    fn msgs(app: &App) -> Vec<(&str, &str)> {
-        app.inbox
-            .threads()
-            .iter()
-            .map(|t| (t.owner_name.as_str(), t.head().unwrap().msg.as_str()))
-            .collect()
+    fn body(key: &str, state: State) -> ThreadPut {
+        ThreadPut { key: key.into(), title: key.into(), state, ..ThreadPut::default() }
     }
 
-    /// Visible rows rendered as short strings: `[inst]`, `msg`, `  msg`.
+    /// The same for a `thread put` from `name` at time `at`.
+    fn put(app: &mut App, name: &str, at: u64, put: ThreadPut) {
+        let mut inbox = app.inbox.content.clone();
+        inbox.put(&format!("{name}-id"), name, at, put);
+        app.set_inbox(inbox);
+    }
+
+    /// Visible rows by title, in order.
     fn rows(app: &App) -> Vec<String> {
-        app.inbox
-            .rows()
-            .iter()
-            .map(|r| match r {
-                InboxRow::Group(owner) => format!("[{}]", app.inbox.owner_name(owner)),
-                InboxRow::Thread(i) => app.inbox.threads()[*i].head().unwrap().msg.clone(),
-                InboxRow::History { thread, note } => {
-                    format!("  {}", app.inbox.threads()[*thread].notes[*note].record.msg)
-                }
-            })
-            .collect()
+        app.inbox.rows().iter().map(|&i| title_of(&app.inbox.threads()[i])).collect()
     }
 
-    fn selected_msg(app: &App) -> Option<String> {
-        app.selected_inbox_record().map(|(_, r)| r.msg.clone())
+    fn selected(app: &App) -> Option<String> {
+        app.selected_inbox_thread().map(title_of)
     }
 
-    #[test]
-    fn flat_with_one_instance_grouped_with_two() {
-        let mut app = new_app();
-        push(&mut app, "a", rec("a1", None, None));
-        push(&mut app, "a", rec("a2", None, None));
-        assert!(!app.inbox.grouped());
-        assert_eq!(rows(&app), ["a2", "a1"]);
-        push(&mut app, "b", rec("b1", None, None));
-        push(&mut app, "a", rec("a3", None, None));
-        // Groups ordered by their newest thread.
-        assert_eq!(rows(&app), ["[a]", "a3", "a2", "a1", "[b]", "b1"]);
+    fn thread<'a>(app: &'a App, title: &str) -> &'a Thread {
+        app.inbox.threads().iter().find(|t| title_of(t) == title).unwrap()
     }
 
-    #[test]
-    fn fold_groups_and_threads() {
-        let mut app = new_app();
-        push(&mut app, "b", rec("b1", None, None));
-        push(&mut app, "a", rec("v1", Some("k"), None));
-        push(&mut app, "a", rec("v2", Some("k"), None));
-        push(&mut app, "a", rec("v3", Some("k"), None));
+    fn inbox_tab(app: &mut App) {
         app.on_key(key(KeyCode::Char('4')));
-        assert_eq!(rows(&app), ["[a]", "v3", "[b]", "b1"]);
+    }
 
-        app.on_key(key(KeyCode::Down)); // v3
-        app.on_key(key(KeyCode::Right));
-        assert_eq!(rows(&app), ["[a]", "v3", "  v2", "  v1", "[b]", "b1"]);
-        app.on_key(key(KeyCode::Down)); // v2 (history)
-        assert_eq!(selected_msg(&app).as_deref(), Some("v2"));
-        app.on_key(key(KeyCode::Left)); // history → its head
-        assert_eq!(app.selected(), 1);
-        app.on_key(key(KeyCode::Left)); // expanded thread folds
-        assert_eq!(rows(&app), ["[a]", "v3", "[b]", "b1"]);
-        app.on_key(key(KeyCode::Left)); // folded thread → its group
-        assert_eq!(app.selected(), 0);
-        app.on_key(key(KeyCode::Char(' '))); // fold the group
-        assert_eq!(rows(&app), ["[a]", "[b]", "b1"]);
-        app.on_key(key(KeyCode::Right));
-        assert_eq!(rows(&app), ["[a]", "v3", "[b]", "b1"]);
-        // A thread without history doesn't expand.
-        app.on_key(key(KeyCode::Down));
-        app.on_key(key(KeyCode::Down));
-        app.on_key(key(KeyCode::Down)); // b1
-        app.on_key(key(KeyCode::Char(' ')));
-        assert_eq!(rows(&app), ["[a]", "v3", "[b]", "b1"]);
+    /// One of each kind of thread, at increasing times (so `old` is oldest).
+    fn mixed(app: &mut App) {
+        put(app, "d", 10, body("asks", State::NeedsYou));
+        put(app, "d", 20, body("busy", State::Active));
+        put(app, "d", 30, body("over", State::Done));
+        push(app, "a", Record { at: 40, ..rec("unread note", None, None) });
+        push(app, "a", Record { at: 50, ..rec("read note", None, None) });
+        let id = thread(app, "read note").id;
+        let mut inbox = app.inbox.content.clone();
+        inbox.apply(&Op::MarkRead(id));
+        app.set_inbox(inbox);
     }
 
     #[test]
-    fn unread_count_and_read_on_entering_tab() {
+    fn view_membership() {
         let mut app = new_app();
-        push(&mut app, "a", rec("one", None, None));
-        push(&mut app, "a", rec("two", None, None));
-        assert_eq!(app.inbox.unread(), 2);
+        mixed(&mut app);
+        put(&mut app, "gone", 60, body("orphan", State::NeedsYou));
+        let mut inbox = app.inbox.content.clone();
+        inbox.archive_owner("gone-id");
+        app.set_inbox(inbox);
+
+        let titles = |view: View| -> Vec<String> {
+            let mut t: Vec<String> =
+                app.inbox.threads().iter().filter(|t| view.shows(t)).map(title_of).collect();
+            t.sort();
+            t
+        };
+        // Unread notify joins needs-you; the read note and the archived
+        // needs-you thread only show in All.
+        assert_eq!(titles(View::NeedsYou), ["asks", "unread note"]);
+        assert_eq!(titles(View::Active), ["busy"]);
+        assert_eq!(titles(View::Done), ["over"]);
+        assert_eq!(titles(View::All).len(), 6);
+        assert_eq!(app.inbox.count(View::NeedsYou), 2);
+        assert_eq!(app.inbox.count(View::All), 6);
+    }
+
+    #[test]
+    fn rows_sort_by_last_change() {
+        let mut app = new_app();
+        mixed(&mut app);
+        app.inbox.view = View::All;
+        assert_eq!(rows(&app), ["read note", "unread note", "over", "busy", "asks"]);
+        // A thread that changes moves to the top, wherever it was.
+        put(&mut app, "d", 70, ThreadPut { status: Some("ci".into()), ..body("asks", State::NeedsYou) });
+        assert_eq!(rows(&app)[0], "asks");
+    }
+
+    #[test]
+    fn badges_count_needs_you_and_unread_notify() {
+        let mut app = new_app();
+        mixed(&mut app);
         assert_eq!(app.tab_title(Tab::Inbox), "Inbox (2)");
         assert_eq!(app.tab_title(Tab::Ports), "Ports");
-
-        app.on_key(key(KeyCode::Char('4')));
-        assert_eq!(app.tab, Tab::Inbox);
-        assert_eq!(app.inbox.unread(), 0);
-        assert_eq!(app.tab_title(Tab::Inbox), "Inbox");
-        assert_eq!(app.take_pending_inbox(), [Op::MarkAllRead]);
-
-        // Arriving while the Inbox is shown counts as seen.
-        push(&mut app, "a", rec("three", None, None));
-        assert_eq!(app.inbox.unread(), 0);
-        assert_eq!(app.take_pending_inbox(), [Op::MarkAllRead]);
-
-        // Tab-cycling into the Inbox marks read too.
-        app.on_key(key(KeyCode::Char('1')));
-        push(&mut app, "a", rec("four", None, None));
-        app.on_key(key(KeyCode::BackTab)); // Instances → Inbox (wraps)
-        assert_eq!(app.tab, Tab::Inbox);
-        assert_eq!(app.inbox.unread(), 0);
+        assert_eq!(app.inbox.needs_you_for("d-id"), 1);
+        assert_eq!(app.inbox.needs_you_for("a-id"), 1);
+        assert_eq!(app.inbox.needs_you_for("x-id"), 0);
+        // Noise that's merely unread doesn't count: an active thread changing.
+        put(&mut app, "d", 80, ThreadPut { status: Some("new".into()), ..body("busy", State::Active) });
+        assert_eq!(app.inbox.needs_you(), 2);
     }
 
     #[test]
-    fn badge_count_per_instance() {
+    fn v_cycles_views_and_selection_follows_the_thread() {
         let mut app = new_app();
-        push(&mut app, "a", rec("1", None, None));
-        push(&mut app, "a", rec("2", None, None));
-        push(&mut app, "a", rec("3", Some("k"), None));
-        push(&mut app, "a", rec("4", Some("k"), None));
-        push(&mut app, "b", rec("5", None, None));
-        // A thread counts once, however long its history.
-        assert_eq!(app.inbox.unread_for_name("a"), 3);
-        assert_eq!(app.inbox.unread_for_name("b"), 1);
-        assert_eq!(app.inbox.unread_for_name("c"), 0);
-        assert_eq!(app.inbox.unread_for("a-id"), 3);
-        app.set_tab(Tab::Inbox);
-        assert_eq!(app.inbox.unread_for_name("a"), 0);
-    }
-
-    #[test]
-    fn dismiss_and_clear() {
-        let mut app = new_app();
-        for m in ["1", "2", "3"] {
-            push(&mut app, "a", rec(m, None, None));
+        mixed(&mut app);
+        inbox_tab(&mut app);
+        assert_eq!(app.inbox.view, View::NeedsYou);
+        assert_eq!(rows(&app), ["unread note", "asks"]);
+        for want in [View::Active, View::Done, View::All] {
+            app.on_key(key(KeyCode::Char('v')));
+            assert_eq!(app.inbox.view, want);
         }
-        app.on_key(key(KeyCode::Char('4')));
-        app.on_key(key(KeyCode::Down)); // "2"
-        app.on_key(key(KeyCode::Char('d')));
-        assert_eq!(msgs(&app), [("a", "3"), ("a", "1")]);
+        for _ in 0..4 {
+            app.on_key(key(KeyCode::Down));
+        }
+        assert_eq!(selected(&app).as_deref(), Some("asks"));
+        assert_eq!(app.selected(), 4);
+        // Still visible in the next view: the cursor follows it.
+        app.on_key(key(KeyCode::Char('v')));
+        assert_eq!(app.inbox.view, View::NeedsYou, "wraps");
+        assert_eq!(selected(&app).as_deref(), Some("asks"));
         assert_eq!(app.selected(), 1);
-        app.on_key(key(KeyCode::Char('d'))); // last row: selection re-clamps
-        assert_eq!(msgs(&app), [("a", "3")]);
+        // Into a view without it: the index clamps.
+        app.on_key(key(KeyCode::Char('v'))); // Active: one row
         assert_eq!(app.selected(), 0);
-
-        push(&mut app, "a", rec("4", None, None));
-        app.on_key(key(KeyCode::Char('D')));
-        assert!(app.inbox.threads().is_empty());
-        assert_eq!(app.selected(), 0);
-        // Empty inbox: `d` is a no-op, not a panic.
-        app.on_key(key(KeyCode::Char('d')));
+        assert_eq!(selected(&app).as_deref(), Some("busy"));
     }
 
     #[test]
-    fn dismiss_history_thread_and_group() {
+    fn reload_keeps_selection_by_id_and_clamps() {
         let mut app = new_app();
-        push(&mut app, "b", rec("b1", None, None));
-        push(&mut app, "b", rec("b2", None, None));
-        for v in ["v1", "v2", "v3"] {
-            push(&mut app, "a", rec(v, Some("k"), None));
+        mixed(&mut app);
+        inbox_tab(&mut app);
+        app.on_key(key(KeyCode::Char('v')));
+        app.on_key(key(KeyCode::Char('v')));
+        // Done's only row, "over", is followed into All.
+        app.on_key(key(KeyCode::Char('v'))); // All
+        assert_eq!(selected(&app).as_deref(), Some("over"));
+        assert_eq!(app.selected(), 2);
+
+        // Another writer adds a newer thread above it: the cursor follows.
+        put(&mut app, "d", 90, body("newer", State::Active));
+        assert_eq!(selected(&app).as_deref(), Some("over"));
+        assert_eq!(app.selected(), 3);
+
+        // ... and removes it: the index stays, clamped into the list.
+        let mut inbox = app.inbox.content.clone();
+        let ids: Vec<u64> = inbox.threads.iter().map(|t| t.id).collect();
+        for id in &ids[1..] {
+            inbox.apply(&Op::RemoveThread(*id));
         }
-        app.on_key(key(KeyCode::Char('4')));
-        app.on_key(key(KeyCode::Down)); // v3
-        app.on_key(key(KeyCode::Right));
-        app.on_key(key(KeyCode::Down)); // v2
-        app.on_key(key(KeyCode::Char('d')));
-        assert_eq!(rows(&app), ["[a]", "v3", "  v1", "[b]", "b2", "b1"]);
-        app.on_key(key(KeyCode::Up)); // v3: the whole thread goes
-        app.on_key(key(KeyCode::Char('d')));
-        // `a` is gone, so only `b` is left: flat again.
-        assert_eq!(rows(&app), ["b2", "b1"]);
-
-        push(&mut app, "a", rec("a1", None, None));
-        assert_eq!(rows(&app), ["[a]", "a1", "[b]", "b2", "b1"]);
-        assert_eq!(app.selected(), 4); // the cursor followed "b1"
-        app.on_key(key(KeyCode::Up));
-        app.on_key(key(KeyCode::Up));
-        assert_eq!(app.selected_inbox_row(), Some(InboxRow::Group("b-id".into())));
-        app.on_key(key(KeyCode::Char('d'))); // header: all of `b`
-        assert_eq!(rows(&app), ["a1"]);
+        app.set_inbox(inbox);
+        assert_eq!(app.selected(), 0);
+        assert_eq!(rows(&app).len(), 1);
     }
 
-    /// Every key mutation is requested by id for the store to apply; the
-    /// local copy is updated at once so the view doesn't lag a tick.
     #[test]
-    fn key_mutations_are_requested_not_saved() {
+    fn enter_opens_the_pane_and_esc_closes_it() {
         let mut app = new_app();
-        push(&mut app, "a", rec("v1", Some("k"), None));
-        push(&mut app, "a", rec("v2", Some("k"), None));
-        push(&mut app, "a", rec("other", None, None));
-        let thread = app.inbox.threads()[1].id; // the keyed thread
-        let history = app.inbox.threads()[1].notes[1].id;
-        app.on_key(key(KeyCode::Char('4'))); // marks read
-        assert_eq!(app.take_pending_inbox(), [Op::MarkAllRead]);
-        app.on_key(key(KeyCode::Char('1')));
-        app.on_key(key(KeyCode::Char('4'))); // nothing unread: no request
-        assert_eq!(app.take_pending_inbox(), []);
+        mixed(&mut app);
+        inbox_tab(&mut app);
+        app.on_key(key(KeyCode::Down)); // "asks"
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.inbox.open_thread().map(title_of).as_deref(), Some("asks"));
+        assert_eq!(app.take_pending_open(), None, "enter on the list doesn't open the link");
+        app.on_key(key(KeyCode::Esc));
+        assert!(!app.inbox.is_open());
+        assert_eq!(app.tab, Tab::Inbox);
+    }
 
-        app.on_key(key(KeyCode::Down)); // the keyed thread's head
-        app.on_key(key(KeyCode::Right));
-        app.on_key(key(KeyCode::Down)); // its history
-        app.on_key(key(KeyCode::Char('d')));
-        app.on_key(key(KeyCode::Char('d'))); // re-clamped onto the head
-        app.on_key(key(KeyCode::Char('D')));
-        assert_eq!(
-            app.take_pending_inbox(),
-            [Op::RemoveNote(history), Op::RemoveThread(thread), Op::Clear]
+    /// While the pane is open, dashboard keys don't reach the rows or tabs
+    /// underneath.
+    #[test]
+    fn the_pane_shadows_dashboard_keys() {
+        let mut app = new_app();
+        push(&mut app, "a", rec("note", None, Some("https://x/1")));
+        put(
+            &mut app,
+            "d",
+            10,
+            ThreadPut {
+                link: Some("https://x/pr/1".into()),
+                actions: vec![Action { id: "post".into(), label: "Post replies".into(), ..Action::default() }],
+                ..body("asks", State::NeedsYou)
+            },
         );
-        assert!(app.inbox.threads().is_empty());
+        inbox_tab(&mut app);
+        app.on_key(key(KeyCode::Enter)); // "asks", the newest
+        assert_eq!(app.inbox.open_thread().map(title_of).as_deref(), Some("asks"));
+        app.take_pending_inbox();
+
+        for c in ['1', '2', '3', '4', 't', 'l', 'd', 'D', 'v', 'T', 'x'] {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.tab, Tab::Inbox, "tab keys are shadowed");
+        assert!(app.inbox.is_open());
+        assert_eq!(app.inbox.view, View::NeedsYou, "`v` didn't reach the list");
+        assert!(app.terms.is_empty(), "`t` opened no terminal");
+        assert!(matches!(app.modal, super::super::Modal::None), "`l` opened no logs");
+        assert_eq!(app.take_pending_inbox(), [], "`d`/`D` dismissed nothing");
+        assert_eq!(app.inbox.threads().len(), 2);
+
+        app.on_key(key(KeyCode::Char('1')));
+        assert!(app.status.as_deref().unwrap().contains("Post replies"), "{:?}", app.status);
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.take_pending_open().as_deref(), Some("https://x/pr/1"));
+        // Quit still works.
+        app.on_key(key(KeyCode::Char('q')));
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn pane_enter_refuses_non_url_links() {
+        let mut app = new_app();
+        push(&mut app, "a", rec("x", None, Some("--help")));
+        inbox_tab(&mut app);
+        app.on_key(key(KeyCode::Enter));
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.take_pending_open(), None);
+        assert!(app.status.as_deref().unwrap().starts_with("not a URL"));
+    }
+
+    #[test]
+    fn pane_scrolls_within_the_rendered_bound() {
+        let mut app = new_app();
+        put(&mut app, "d", 10, body("asks", State::NeedsYou));
+        inbox_tab(&mut app);
+        app.on_key(key(KeyCode::Enter));
+        app.inbox.set_pane_max(3);
+        for _ in 0..5 {
+            app.on_key(key(KeyCode::Char('j')));
+        }
+        assert_eq!(app.inbox.scroll, 3);
+        app.on_key(key(KeyCode::PageUp));
+        assert_eq!(app.inbox.scroll, 0);
+    }
+
+    #[test]
+    fn opening_reads_and_a_change_while_open_reads_again() {
+        let mut app = new_app();
+        put(&mut app, "d", 10, body("asks", State::NeedsYou));
+        inbox_tab(&mut app);
+        assert_eq!(app.take_pending_inbox(), [], "entering the tab reads nothing");
+        let id = thread(&app, "asks").id;
+        assert!(thread(&app, "asks").unread);
+
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.take_pending_inbox(), [Op::MarkRead(id)]);
+        assert!(!thread(&app, "asks").unread);
+
+        // The dispatcher changes it while it's open: read again on reload.
+        put(&mut app, "d", 20, ThreadPut { status: Some("ci".into()), ..body("asks", State::NeedsYou) });
+        assert_eq!(app.take_pending_inbox(), [Op::MarkRead(id)]);
+        assert!(!thread(&app, "asks").unread);
+        // A change to another thread isn't read for it.
+        put(&mut app, "d", 30, body("other", State::NeedsYou));
+        assert_eq!(app.take_pending_inbox(), []);
+        assert!(thread(&app, "other").unread);
+
+        // The open thread removed elsewhere: the pane closes.
+        let mut inbox = app.inbox.content.clone();
+        inbox.apply(&Op::RemoveThread(id));
+        app.set_inbox(inbox);
+        assert!(!app.inbox.is_open());
+    }
+
+    /// Notify records have no state: leaving the Inbox after seeing them in
+    /// Needs you reads them, so they don't pile up there.
+    #[test]
+    fn leaving_the_inbox_reads_the_notify_records_it_showed() {
+        let mut app = new_app();
+        push(&mut app, "a", rec("one", None, None));
+        put(&mut app, "d", 10, body("asks", State::NeedsYou));
+        // Not shown yet: nothing read.
+        app.on_key(key(KeyCode::Char('2')));
+        assert_eq!(app.take_pending_inbox(), []);
+        inbox_tab(&mut app);
+        assert_eq!(rows(&app), ["asks", "one"]);
+        app.on_key(key(KeyCode::Char('1')));
+        assert_eq!(app.take_pending_inbox(), [Op::MarkNotifyRead]);
+        assert_eq!(app.inbox.needs_you(), 1, "the dispatcher's thread still asks");
+        assert!(thread(&app, "asks").unread);
+
+        // From a view that doesn't list notify records, nothing is read.
+        push(&mut app, "a", rec("two", None, None));
+        inbox_tab(&mut app);
+        app.on_key(key(KeyCode::Char('v'))); // Active
+        app.on_key(key(KeyCode::Char('1')));
+        assert_eq!(app.take_pending_inbox(), []);
+        assert!(thread(&app, "two").unread);
+    }
+
+    #[test]
+    fn d_dismisses_notify_only_and_capital_d_clears_notify_only() {
+        let mut app = new_app();
+        put(&mut app, "d", 10, body("asks", State::NeedsYou));
+        push(&mut app, "a", Record { at: 20, ..rec("n1", None, None) });
+        push(&mut app, "a", Record { at: 30, ..rec("n2", None, None) });
+        inbox_tab(&mut app);
+        assert_eq!(rows(&app), ["n2", "n1", "asks"]);
+        let n2 = thread(&app, "n2").id;
+        app.on_key(key(KeyCode::Char('d')));
+        assert_eq!(rows(&app), ["n1", "asks"]);
+        assert_eq!(app.take_pending_inbox(), [Op::RemoveThread(n2)]);
+
+        // On a dispatcher thread, `d` is a hint until events exist.
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Char('d')));
+        assert_eq!(app.take_pending_inbox(), []);
+        assert!(app.status.as_deref().unwrap().contains("mark done"));
+        assert_eq!(rows(&app), ["n1", "asks"]);
+
+        app.on_key(key(KeyCode::Char('D')));
+        assert_eq!(app.take_pending_inbox(), [Op::ClearNotify]);
+        assert_eq!(rows(&app), ["asks"]);
+        assert_eq!(app.selected(), 0, "re-clamped");
     }
 
     #[test]
@@ -652,92 +900,69 @@ mod tests {
     }
 
     #[test]
-    fn selection_follows_row_on_push() {
+    fn pane_lines_show_child_timeline_actions_and_reply() {
         let mut app = new_app();
-        push(&mut app, "a", rec("1", None, None));
-        push(&mut app, "a", rec("2", Some("k"), None));
-        app.on_key(key(KeyCode::Char('4')));
-        app.on_key(key(KeyCode::Down)); // "1"
-        push(&mut app, "a", rec("3", None, None));
-        assert_eq!(selected_msg(&app).as_deref(), Some("1"));
-        // A thread moving from above the cursor to the top keeps it on "1".
-        push(&mut app, "a", rec("2b", Some("k"), None));
-        assert_eq!(selected_msg(&app).as_deref(), Some("1"));
-        // Switching to grouped (a second instance) keeps it on "1" too.
-        push(&mut app, "b", rec("b", None, None));
-        assert_eq!(selected_msg(&app).as_deref(), Some("1"));
-        // A cursor on the top row stays on top.
-        while app.selected() > 0 {
-            app.on_key(key(KeyCode::Up));
-        }
-        push(&mut app, "c", rec("4", None, None));
-        assert_eq!(app.selected(), 0);
-        assert_eq!(app.selected_inbox_row(), Some(InboxRow::Group("c-id".into())));
+        let actions = vec![
+            Action {
+                id: "open".into(),
+                label: "Open draft".into(),
+                host: Some(crate::inbox::thread::HostVerb::Terminal(Default::default())),
+                ..Action::default()
+            },
+            Action { id: "post".into(), label: "Post replies".into(), ..Action::default() },
+            Action { id: "done".into(), label: "Done".into(), done: true, ..Action::default() },
+        ];
+        let full = ThreadPut {
+            link: Some("https://x/pr/1".into()),
+            status: Some("review".into()),
+            child: Some("pr-1".into()),
+            message: Some("drafts ready".into()),
+            actions,
+            reply: Some(Reply { placeholder: Some("next run".into()) }),
+            ..body("asks", State::NeedsYou)
+        };
+        put(&mut app, "d", 10, full);
+        app.thread_children.insert("d-id".into(), [("pr-1".to_string(), "inst0".to_string())].into());
+        app.set_snapshot(snapshot_with_status(1, running()));
+
+        let t = thread(&app, "asks").clone();
+        let child = app.thread_child(&t).unwrap();
+        assert_eq!(child.name.as_deref(), Some("inst0"));
+        assert_eq!(child.status.as_deref(), Some("running"));
+        let text: Vec<String> = pane_lines(&t, Some(&child), 0)
+            .iter()
+            .map(|l| l.iter().map(|(_, s)| s.as_str()).collect())
+            .collect();
+        let has = |want: &str| text.iter().any(|l| l.contains(want));
+        assert!(has("child  inst0  running"), "{text:#?}");
+        assert!(has("https://x/pr/1"));
+        assert!(has("drafts ready"));
+        assert!(has("timeline"));
+        assert!(has("[1] Open draft  ⌂ host"), "{text:#?}");
+        assert!(has("[2] Post replies") && !has("[2] Post replies  ⌂"));
+        assert!(has("[3] Done  ✓ done"));
+        assert!(has("reply: next run"));
+
+        // A child key the owner doesn't have stays visible, unresolved.
+        app.thread_children.clear();
+        let child = app.thread_child(&t).unwrap();
+        assert_eq!(child.name, None);
+        assert!(pane_lines(&t, Some(&child), 0).iter().any(|l| l.iter().any(|(_, s)| s.contains("no such child"))));
     }
 
-    /// A reload (another dashboard changed the store) keeps the cursor on the
-    /// same thread, wherever it moved to, and keeps the folds.
     #[test]
-    fn reload_preserves_selection_by_thread_id() {
+    fn notify_pane_shows_earlier_records() {
         let mut app = new_app();
         push(&mut app, "a", rec("v1", Some("k"), None));
         push(&mut app, "a", rec("v2", Some("k"), None));
-        push(&mut app, "a", rec("other", None, None));
-        app.on_key(key(KeyCode::Char('4')));
-        app.on_key(key(KeyCode::Down)); // the keyed thread, now second
-        app.on_key(key(KeyCode::Right)); // expanded
-        let id = app.inbox.threads()[1].id;
-        assert_eq!(rows(&app), ["other", "v2", "  v1"]);
-
-        // Another writer dismissed "other" and added a record to the thread,
-        // moving it to the top.
-        let mut store = app.inbox.content.clone();
-        store.apply(&Op::RemoveThread(store.threads[0].id));
-        store.push("a-id".into(), "a".into(), rec("v3", Some("k"), None), true);
-        store.push("b-id".into(), "b".into(), rec("b1", None, None), true);
-        app.set_inbox(store);
-
-        assert_eq!(app.inbox.threads()[1].id, id, "same thread, same id");
-        assert_eq!(rows(&app), ["[b]", "b1", "[a]", "v3", "  v2", "  v1"]);
-        assert_eq!(selected_msg(&app).as_deref(), Some("v3"), "cursor followed the thread");
-        assert_eq!(app.selected(), 3);
-    }
-
-    #[test]
-    fn enter_opens_link_only_when_present() {
-        let mut app = new_app();
-        push(&mut app, "a", rec("no link", None, None));
-        push(&mut app, "a", rec("pr", None, Some("https://x/pr/1")));
-        app.on_key(key(KeyCode::Char('4')));
-        app.on_key(key(KeyCode::Enter));
-        assert_eq!(app.take_pending_open().as_deref(), Some("https://x/pr/1"));
-        assert!(matches!(app.modal, super::super::Modal::None));
-
-        app.on_key(key(KeyCode::Down));
-        app.on_key(key(KeyCode::Enter));
-        assert_eq!(app.take_pending_open(), None);
-    }
-
-    #[test]
-    fn enter_on_history_opens_its_own_link() {
-        let mut app = new_app();
-        push(&mut app, "a", rec("v1", Some("k"), Some("https://x/1")));
-        push(&mut app, "a", rec("v2", Some("k"), Some("https://x/2")));
-        app.on_key(key(KeyCode::Char('4')));
-        app.on_key(key(KeyCode::Right));
-        app.on_key(key(KeyCode::Down));
-        app.on_key(key(KeyCode::Enter));
-        assert_eq!(app.take_pending_open().as_deref(), Some("https://x/1"));
-    }
-
-    #[test]
-    fn enter_refuses_non_url_links() {
-        let mut app = new_app();
-        push(&mut app, "a", rec("x", None, Some("--help")));
-        app.on_key(key(KeyCode::Char('4')));
-        app.on_key(key(KeyCode::Enter));
-        assert_eq!(app.take_pending_open(), None);
-        assert!(app.status.as_deref().unwrap().starts_with("not a URL"));
+        push(&mut app, "a", rec("v3", Some("k"), None));
+        let t = thread(&app, "v3").clone();
+        let text: Vec<String> =
+            pane_lines(&t, None, 0).iter().map(|l| l.iter().map(|(_, s)| s.as_str()).collect()).collect();
+        let at = |want: &str| text.iter().position(|l| l.ends_with(want)).unwrap();
+        // The head is the message; history is oldest first under "earlier".
+        assert!(at("earlier") < at("v1") && at("v1") < at("v2"), "{text:#?}");
+        assert_eq!(text.iter().filter(|l| l.ends_with("v3")).count(), 2, "title and message");
     }
 
     #[test]

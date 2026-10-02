@@ -36,13 +36,20 @@ Ports tab
   ↑/k ↓/j     move selection
   d           stop the selected forward
 
-Inbox tab (container notifications: devsbd notify)
-  ↑/k ↓/j     move selection   (entering the tab marks all read)
-  → / space   expand a thread's history / an instance group (toggle)
-  ←           collapse, or jump to the parent
-  enter       open the selected notification's link
-  d           dismiss (history row / whole thread / whole instance)
-  D           clear all
+Inbox tab (dispatcher threads + devsbd notify records)
+  ↑/k ↓/j     move selection
+  v           cycle views: Needs you / Active / Done / All
+              (Needs you: threads asking for you + unread notify records;
+               leaving the tab marks the notify records it showed read)
+  enter       open the thread pane (marks it read)
+  d           dismiss a notify record (marking a thread done comes later)
+  D           clear all notify records (dispatcher threads stay)
+
+Inbox thread pane (shadows the dashboard keys while open)
+  ↑/k ↓/j     scroll    pgup/pgdn  page   g / G  top / bottom
+  enter       open the thread's link
+  1-9         run an action (not yet: shown only)
+  esc         close     q quit   : prompt   ? help
 
 Process rows (expanded instance)
   ←           jump to the parent instance
@@ -114,8 +121,8 @@ fn line_count(body: &str) -> u16 {
 
 /// Apply a scroll key to `scroll`, clamped to `[0, lines-1]`. Returns `true`
 /// when the key was a scroll key (consumed), `false` otherwise. Shared by the
-/// config modal and [`TextModal`].
-fn scroll_key(scroll: &mut u16, lines: u16, key: KeyEvent) -> bool {
+/// config modal, [`TextModal`] and the Inbox thread pane.
+pub(super) fn scroll_key(scroll: &mut u16, lines: u16, key: KeyEvent) -> bool {
     let max = lines.saturating_sub(1);
     match key.code {
         KeyCode::Up | KeyCode::Char('k') => *scroll = scroll.saturating_sub(1),
@@ -398,7 +405,7 @@ impl App {
                 (Self::build_service_view(&self.dir, &row.name), target)
             }
             // The Ports and Inbox tabs have no config to explore; `e` is a
-            // no-op (`enter` on the Inbox opens a link instead).
+            // no-op (`enter` on the Inbox opens the thread pane instead).
             Tab::Ports | Tab::Inbox => return,
         };
         let placeholder = match self.tab {

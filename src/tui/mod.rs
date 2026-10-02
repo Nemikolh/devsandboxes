@@ -208,7 +208,7 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
     // Startup walks the `Depth`s cheapest first, so the tree renders straight
     // from disk and statuses, then cpu/mem, fill in as the runtime answers;
     // `deeper` holds the collections still to chain (popped from the back).
-    let mut pending: Option<Receiver<Snapshot>> = Some(spawn_collect_with(&dir, data::Depth::Disk));
+    let mut pending: Option<Receiver<Collected>> = Some(spawn_collect_with(&dir, data::Depth::Disk));
     let mut deeper = vec![data::Depth::Full, data::Depth::Listing];
     let mut stats_clock = StatsClock::default();
     // Background `s` stops/starts, each reporting completion over its own
@@ -442,7 +442,8 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
         // Drain a finished collection into the app, freeing the in-flight slot.
         if let Some(rx) = &pending {
             match rx.try_recv() {
-                Ok(snapshot) => {
+                Ok((snapshot, children)) => {
+                    app.thread_children = children;
                     #[cfg(unix)]
                     {
                         // Owned list handed to the worker; never blocks the UI.
@@ -796,20 +797,30 @@ fn spawn_proc_fetch(targets: Vec<(String, String)>) -> Receiver<BTreeMap<String,
     rx
 }
 
+/// One collection: the snapshot, plus every dispatcher's children by key
+/// (`dispatch::thread_children`) for the Inbox thread pane. Read from
+/// `state.toml` on the collector thread, with the snapshot, so the pane never
+/// touches the file per frame; an unreadable state resolves no child.
+type Collected = (Snapshot, BTreeMap<String, BTreeMap<String, String>>);
+
 /// Spawn a detached thread that collects one [`Snapshot`] and sends it back.
 /// The receiver is polled from the event loop, keeping [`App`] I/O-free.
 /// A refresh collection, with stats only when `clock` says they're due.
-fn spawn_collect(dir: &Path, clock: &mut StatsClock) -> Receiver<Snapshot> {
+fn spawn_collect(dir: &Path, clock: &mut StatsClock) -> Receiver<Collected> {
     spawn_collect_with(dir, clock.depth(Instant::now()))
 }
 
 /// A collection down to `depth` (`data::collect_with`).
-fn spawn_collect_with(dir: &Path, depth: data::Depth) -> Receiver<Snapshot> {
+fn spawn_collect_with(dir: &Path, depth: data::Depth) -> Receiver<Collected> {
     let (tx, rx) = mpsc::channel();
     let dir: PathBuf = dir.to_path_buf();
     std::thread::spawn(move || {
+        let snapshot = data::collect_with(&dir, depth);
+        let children = crate::state::State::load()
+            .map(|s| crate::commands::dispatch::thread_children(&s))
+            .unwrap_or_default();
         // Receiver may be gone if the UI quit mid-collection; ignore send errors.
-        let _ = tx.send(data::collect_with(&dir, depth));
+        let _ = tx.send((snapshot, children));
     });
     rx
 }

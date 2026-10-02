@@ -186,7 +186,7 @@ mod tests {
         update_at(&path, |i| i.apply(&Op::RemoveThread(9999))).unwrap();
         assert_eq!(stamp_at(&path).unwrap(), before, "no write, no mtime bump");
         let out = update_at(&path, |i| {
-            i.apply(&Op::MarkAllRead);
+            i.apply(&Op::MarkNotifyRead);
             42
         })
         .unwrap();
@@ -214,8 +214,8 @@ mod tests {
         });
         let inbox = load_at(&path).unwrap();
         assert_eq!(inbox.threads.len(), 100);
-        assert_eq!(inbox.count_for("a-id"), 50);
-        assert_eq!(inbox.count_for("b-id"), 50);
+        assert_eq!(inbox.weight_for("a-id"), 50);
+        assert_eq!(inbox.weight_for("b-id"), 50);
         let mut msgs: Vec<&str> = inbox.threads.iter().map(|t| t.head().unwrap().msg.as_str()).collect();
         msgs.sort_unstable();
         msgs.dedup();

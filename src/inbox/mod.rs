@@ -2,7 +2,7 @@
 //! docs/automations.md) as threads, newest first. This is the persisted half,
 //! out of `src/tui/` because the bridge writes records here while any number
 //! of dashboards read them (see [`store`]); the TUI keeps only view state
-//! (selection, folds).
+//! (view, selection, the open thread).
 //!
 //! Two kinds of thread share the store:
 //!
@@ -115,7 +115,7 @@ pub struct Entry {
 /// without checking.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Thread {
-    /// Stable id, persisted: selection and fold state follow it across the
+    /// Stable id, persisted: selection and the open pane follow it across the
     /// reloads every dashboard does when the store changes.
     pub id: u64,
     /// `instance_id` of the sender (stable across stop/restart/rebuild).
@@ -155,16 +155,23 @@ impl Thread {
         self.notes.first().map(|n| &n.record)
     }
 
-    /// Older records under the head.
-    pub fn history(&self) -> usize {
-        self.notes.len().saturating_sub(1)
-    }
-
     /// When the thread last changed: the newest put, else its head record.
     pub fn changed_at(&self) -> u64 {
         self.updated_at.max(self.head().map_or(0, |r| r.at))
     }
 
+    /// Whether the thread is waiting on the user: what the **Needs you** view
+    /// and both badges count. A dispatcher thread earns it by saying so
+    /// (`needs-you`); a plain notify record by being unread, so a
+    /// non-dispatcher's `notify` still surfaces (docs/inbox-threads.md,
+    /// *Decisions*). An archived thread has no live owner, so it never counts.
+    pub fn needs_you(&self) -> bool {
+        !self.archived
+            && match self.kind {
+                Kind::Notify => self.unread,
+                Kind::Thread => self.state == Some(State::NeedsYou),
+            }
+    }
 }
 
 /// A mutation a dashboard asks the store to apply. Row indices can't cross the
@@ -172,15 +179,18 @@ impl Thread {
 /// variant names what it touches by a stable id.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Op {
-    MarkAllRead,
+    /// Mark one thread read: the Inbox marks what the user actually opened,
+    /// not everything the tab happened to show.
+    MarkRead(u64),
+    /// Mark every notify record read: they were on screen when the user left
+    /// the Inbox. Dispatcher threads are only read by opening them, since
+    /// their state, not their unread flag, is what asks for attention.
+    MarkNotifyRead,
     /// Dismiss a whole thread (its history with it).
     RemoveThread(u64),
-    /// Dismiss one record, by its note `seq`.
-    RemoveNote(u64),
-    /// Dismiss everything from one owner.
-    RemoveOwner(String),
-    /// Dismiss everything.
-    Clear,
+    /// Dismiss every notify record. Dispatcher threads are state a dispatcher
+    /// re-asserts, so clearing them would only make them come back.
+    ClearNotify,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -399,25 +409,18 @@ impl Inbox {
     /// Apply one dashboard-requested [`Op`].
     pub fn apply(&mut self, op: &Op) {
         match op {
-            Op::MarkAllRead => self.mark_all_read(),
-            Op::RemoveThread(id) => self.threads.retain(|t| t.id != *id),
-            Op::RemoveNote(seq) => self.remove_note(*seq),
-            Op::RemoveOwner(owner) => self.threads.retain(|t| &t.owner != owner),
-            Op::Clear => self.threads.clear(),
-        }
-    }
-
-    /// Drop the note with arrival id `seq`, and its thread when it was the
-    /// last one.
-    fn remove_note(&mut self, seq: u64) {
-        for i in 0..self.threads.len() {
-            if let Some(pos) = self.threads[i].notes.iter().position(|n| n.id == seq) {
-                self.threads[i].notes.remove(pos);
-                if self.threads[i].notes.is_empty() {
-                    self.threads.remove(i);
+            Op::MarkNotifyRead => {
+                for t in self.threads.iter_mut().filter(|t| t.kind == Kind::Notify) {
+                    t.unread = false;
                 }
-                return;
             }
+            Op::MarkRead(id) => {
+                if let Some(t) = self.threads.iter_mut().find(|t| t.id == *id) {
+                    t.unread = false;
+                }
+            }
+            Op::RemoveThread(id) => self.threads.retain(|t| t.id != *id),
+            Op::ClearNotify => self.threads.retain(|t| t.kind != Kind::Notify),
         }
     }
 
@@ -492,44 +495,16 @@ impl Inbox {
         true
     }
 
-    pub fn unread(&self) -> usize {
-        self.threads.iter().filter(|t| t.unread).count()
+    /// Threads waiting on the user ([`Thread::needs_you`]): the tab-title count.
+    pub fn needs_you(&self) -> usize {
+        self.threads.iter().filter(|t| t.needs_you()).count()
     }
 
-
-    /// Unread threads from `owner` (an `instance_id`), for the group header.
-    pub fn unread_for(&self, owner: &str) -> usize {
-        self.threads.iter().filter(|t| t.unread && t.owner == owner).count()
-    }
-
-    /// Unread threads from the instance currently *named* `name`, for the
-    /// Instances-row badge: a snapshot row knows the name, not the id.
-    pub fn unread_for_name(&self, name: &str) -> usize {
-        self.threads.iter().filter(|t| t.unread && t.owner_name == name).count()
-    }
-
-    /// Records (history included) from `owner`.
-    pub fn count_for(&self, owner: &str) -> usize {
-        self.threads
-            .iter()
-            .filter(|t| t.owner == owner)
-            .map(|t| t.notes.len())
-            .sum()
-    }
-
-    /// Name to show for `owner`, from its newest thread; the id itself when
-    /// the owner has no threads left.
-    pub fn owner_name<'a>(&'a self, owner: &'a str) -> &'a str {
-        self.threads
-            .iter()
-            .find(|t| t.owner == owner)
-            .map_or(owner, |t| t.owner_name.as_str())
-    }
-
-    fn mark_all_read(&mut self) {
-        for t in &mut self.threads {
-            t.unread = false;
-        }
+    /// The same count for owner `owner` (an `instance_id`), for the
+    /// Instances-row badge. By id, which every snapshot row carries, so a
+    /// renamed instance keeps its badge and a reused name never inherits one.
+    pub fn needs_you_for(&self, owner: &str) -> usize {
+        self.threads.iter().filter(|t| t.needs_you() && t.owner == owner).count()
     }
 
     /// The `inbox.toml` contents (always v2).
@@ -1171,7 +1146,7 @@ mod tests {
         let t = &inbox.threads[0];
         assert_eq!(t.notes.iter().map(|n| n.record.msg.as_str()).collect::<Vec<_>>(), ["pr 1 v2", "pr 1 v1"]);
         assert!(t.unread);
-        assert_eq!(inbox.unread(), 1);
+        assert_eq!(inbox.threads.iter().filter(|t| t.unread).count(), 1);
     }
 
     #[test]
@@ -1181,9 +1156,9 @@ mod tests {
         inbox.push("id-1".into(), "web-2".into(), rec("v2", Some("k"), None), true);
         assert_eq!(inbox.threads.len(), 1);
         assert_eq!(inbox.threads[0].owner_name, "web-2");
-        assert_eq!(inbox.unread_for("id-1"), 1);
-        assert_eq!(inbox.unread_for_name("web-2"), 1);
-        assert_eq!(inbox.unread_for_name("web"), 0);
+        // The badge follows the id, not whatever the instance is called now.
+        assert_eq!(inbox.needs_you_for("id-1"), 1);
+        assert_eq!(inbox.needs_you_for("web"), 0);
     }
 
     #[test]
@@ -1194,21 +1169,21 @@ mod tests {
         for i in 1..INBOX_INSTANCE_CAP {
             push(&mut inbox, "noisy", rec(&i.to_string(), None, None), true);
         }
-        assert_eq!(inbox.count_for("noisy-id"), INBOX_INSTANCE_CAP);
+        assert_eq!(inbox.weight_for("noisy-id"), INBOX_INSTANCE_CAP);
         // A new record in the keyed thread: noisy's oldest record is the
         // thread's own first one ("k0"), dropped from its history.
         push(&mut inbox, "noisy", rec("k1", Some("k"), None), true);
-        assert_eq!(inbox.count_for("noisy-id"), INBOX_INSTANCE_CAP);
+        assert_eq!(inbox.weight_for("noisy-id"), INBOX_INSTANCE_CAP);
         assert_eq!(
             inbox.threads[0].notes.iter().map(|n| n.record.msg.as_str()).collect::<Vec<_>>(),
             ["k1"]
         );
         // Next: the oldest unkeyed one ("1") goes, its thread with it.
         push(&mut inbox, "noisy", rec("new", None, None), true);
-        assert_eq!(inbox.count_for("noisy-id"), INBOX_INSTANCE_CAP);
+        assert_eq!(inbox.weight_for("noisy-id"), INBOX_INSTANCE_CAP);
         assert!(!msgs(&inbox).contains(&("noisy", "1")));
         assert!(msgs(&inbox).contains(&("noisy", "2")));
-        assert_eq!(inbox.count_for("quiet-id"), 1);
+        assert_eq!(inbox.weight_for("quiet-id"), 1);
     }
 
     #[test]
@@ -1219,29 +1194,56 @@ mod tests {
         push(&mut inbox, "a", rec("solo", None, None), true);
         push(&mut inbox, "b", rec("b1", None, None), true);
 
-        let thread = inbox.threads.iter().find(|t| t.key.is_some()).unwrap();
-        let history = thread.notes[1].id;
-        let (thread_id, solo_id) = (thread.id, inbox.threads[1].id);
-        inbox.apply(&Op::RemoveNote(history));
-        assert_eq!(msgs(&inbox), [("b", "b1"), ("a", "solo"), ("a", "v2")]);
+        let thread_id = inbox.threads.iter().find(|t| t.key.is_some()).unwrap().id;
         inbox.apply(&Op::RemoveThread(thread_id));
         assert_eq!(msgs(&inbox), [("b", "b1"), ("a", "solo")]);
-        // Removing a thread's last note drops the thread.
-        inbox.apply(&Op::RemoveNote(inbox.threads[1].notes[0].id));
-        assert_eq!(msgs(&inbox), [("b", "b1")]);
         // Unknown ids are no-ops, not panics.
-        inbox.apply(&Op::RemoveNote(solo_id));
         inbox.apply(&Op::RemoveThread(thread_id));
-        assert_eq!(msgs(&inbox), [("b", "b1")]);
+        inbox.apply(&Op::MarkRead(thread_id));
+        assert_eq!(msgs(&inbox), [("b", "b1"), ("a", "solo")]);
 
-        push(&mut inbox, "a", rec("again", None, None), true);
-        assert_eq!(inbox.unread(), 2);
-        inbox.apply(&Op::MarkAllRead);
-        assert_eq!(inbox.unread(), 0);
-        inbox.apply(&Op::RemoveOwner("a-id".into()));
-        assert_eq!(msgs(&inbox), [("b", "b1")]);
-        inbox.apply(&Op::Clear);
-        assert!(inbox.threads.is_empty());
+        // Leaving the Inbox reads every notify record, and only those.
+        inbox.put("a-id", "a", 10, put_body("pr-1"));
+        inbox.apply(&Op::MarkNotifyRead);
+        let unread: Vec<Kind> = inbox.threads.iter().filter(|t| t.unread).map(|t| t.kind).collect();
+        assert_eq!(unread, [Kind::Thread]);
+        inbox.apply(&Op::ClearNotify);
+        assert_eq!(inbox.threads.len(), 1, "the dispatcher thread stays");
+    }
+
+    /// What the Needs-you view and both badges count, and the two ops the
+    /// Inbox pane leans on.
+    #[test]
+    fn needs_you_counts_and_targeted_ops() {
+        let mut inbox = Inbox::default();
+        push(&mut inbox, "a", rec("unread note", None, None), true);
+        push(&mut inbox, "a", rec("read note", Some("k"), None), false);
+        inbox.put("a-id", "a", 10, ThreadPut { state: State::NeedsYou, ..put_body("asks") });
+        inbox.put("a-id", "a", 10, put_body("busy"));
+        inbox.put("b-id", "b", 10, ThreadPut { state: State::Done, ..put_body("over") });
+        // Unread notify + needs-you threads, nothing else.
+        assert_eq!(inbox.needs_you(), 2);
+        assert_eq!(inbox.needs_you_for("a-id"), 2);
+        assert_eq!(inbox.needs_you_for("b-id"), 0);
+
+        // Marking the unread record read drops only its own count; an unknown
+        // id is a no-op, and a needs-you thread is not an unread flag.
+        let note = inbox.threads.iter().find(|t| t.key.is_none()).unwrap().id;
+        inbox.apply(&Op::MarkRead(note));
+        inbox.apply(&Op::MarkRead(u64::MAX));
+        assert_eq!(inbox.needs_you(), 1);
+        let asks = find(&inbox, "asks").unwrap().id;
+        inbox.apply(&Op::MarkRead(asks));
+        assert_eq!(inbox.needs_you(), 1);
+
+        // An archived thread is history: it never asks for anything.
+        inbox.archive_owner("a-id");
+        assert_eq!(inbox.needs_you(), 0);
+
+        // `D` clears notify records and leaves the dispatcher's threads.
+        inbox.apply(&Op::ClearNotify);
+        assert_eq!(inbox.threads.len(), 3);
+        assert!(inbox.threads.iter().all(|t| t.kind == Kind::Thread));
     }
 
     #[test]
@@ -1255,7 +1257,7 @@ mod tests {
         let text = inbox.to_toml().unwrap();
         assert!(text.contains("version = 2"), "{text}");
         let loaded = Inbox::from_toml(&text, &BTreeMap::new()).unwrap();
-        // Thread ids survive, so selection and folds follow a reload.
+        // Thread ids survive, so selection and the open pane follow a reload.
         assert_eq!(loaded, inbox);
         // Notify-only threads write exactly what they did before threads
         // existed, so a v2 file from either build reads the same.

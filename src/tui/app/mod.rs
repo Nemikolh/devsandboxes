@@ -24,7 +24,7 @@ mod tree;
 mod view;
 
 pub use crate::inbox::Thread;
-pub use inbox::{parse_utc_offset, stamp, when, InboxRow, InboxView};
+pub use inbox::{pane_lines, parse_utc_offset, title_of, when, InboxView, PaneLine, Tone, View};
 pub use procs::{PendingSignal, Signal};
 pub use view::{ConfigView, Modal, Pane, Side, TextModal};
 use view::{col_near, divider_pct};
@@ -161,8 +161,12 @@ pub struct App {
     /// applied to `inbox`, which the reload after them confirms.
     pub pending_inbox: Vec<crate::inbox::Op>,
     /// A notification link the event loop should hand to the desktop opener
-    /// (`enter` on the Inbox tab).
+    /// (`enter` in the Inbox thread pane).
     pub pending_open: Option<String>,
+    /// Every dispatcher's children by key, owner id → key → instance name
+    /// (`dispatch::thread_children`), refreshed by the event loop with each
+    /// snapshot so the thread pane resolves a `child` without reading state.
+    pub thread_children: BTreeMap<String, BTreeMap<String, String>>,
     /// Seconds east of UTC for Inbox timestamps; the event loop sets it once
     /// at startup (0 = UTC when unknown).
     pub utc_offset: i64,
@@ -206,6 +210,7 @@ impl App {
             inbox: InboxView::default(),
             pending_inbox: Vec::new(),
             pending_open: None,
+            thread_children: BTreeMap::new(),
             utc_offset: 0,
             status: None,
             dragging_divider: false,
@@ -336,6 +341,13 @@ impl App {
             self.on_key_terminal(key);
             return;
         }
+        // An open Inbox thread pane is a focused view: it shadows the
+        // dashboard keys (the `1`-`9` action keys over the tab keys, `t`/`l`
+        // over the selected instance's).
+        if self.tab == Tab::Inbox && self.inbox.is_open() {
+            self.on_key_inbox_pane(key);
+            return;
+        }
         // Any dashboard key dismisses a lingering status line.
         self.status = None;
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -372,11 +384,10 @@ impl App {
             KeyCode::Right if self.tab == Tab::Instances => self.tree_expand(),
             KeyCode::Char(' ') if self.tab == Tab::Instances => self.tree_toggle(),
             KeyCode::Left if self.tab == Tab::Instances => self.tree_collapse(),
-            KeyCode::Right if self.tab == Tab::Inbox => self.inbox_expand(),
-            KeyCode::Char(' ') if self.tab == Tab::Inbox => self.inbox_toggle(),
-            KeyCode::Left if self.tab == Tab::Inbox => self.inbox_collapse(),
-            // Inbox: `enter` opens the selected notification's link.
-            KeyCode::Enter if self.tab == Tab::Inbox => self.open_selected_link(),
+            // Inbox: `enter` opens the selected thread in the pane (whose own
+            // `enter` opens the link); `v` cycles the views.
+            KeyCode::Enter if self.tab == Tab::Inbox => self.open_selected_thread(),
+            KeyCode::Char('v') if self.tab == Tab::Inbox => self.cycle_inbox_view(),
             KeyCode::Enter | KeyCode::Char('e') if !on_proc => self.open_config(),
             KeyCode::Char('r') if self.tab == Tab::Instances && !on_proc => {
                 self.open_rename_or_run_prompt()
