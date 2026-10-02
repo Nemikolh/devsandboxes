@@ -10,6 +10,7 @@
 //! `child` (one of the owner's dispatcher children), else the owner itself.
 //! Nothing a container writes can aim a host action at another instance.
 
+use crate::commands::vscode::Goto;
 use crate::inbox::thread::HostVerb;
 use crate::inbox::{Op, Thread};
 use crate::tui::prompt::PromptAction;
@@ -87,12 +88,18 @@ impl App {
         };
         match host {
             HostVerb::Vscode(v) => {
-                let dropped = v.path.as_ref().map(|p| format!("{p} not opened: no --goto yet"));
+                // Checked at put time, but a column without a line or a 0 still
+                // gets here: open the window anyway and say why the spot wasn't.
+                let (goto, dropped) = match v.path.as_deref().map(|p| Goto::new(p, v.line, v.col)) {
+                    Some(Ok(goto)) => (Some(goto), None),
+                    Some(Err(why)) => (None, Some(format!("--goto dropped ({why})"))),
+                    None => (None, None),
+                };
                 let child = later.is_some().then(|| self.send_act(t, act, action.done)).flatten();
                 let note: Vec<&str> =
                     dropped.as_deref().into_iter().chain(child.as_deref()).chain(later).collect();
                 self.code_note = (!note.is_empty()).then(|| note.join(" · "));
-                self.pending_action = Some(PromptAction::Code { instance: target });
+                self.pending_action = Some(PromptAction::Code { instance: target, goto });
                 return;
             }
             HostVerb::Terminal(_) => self.open_instance_terminal(&target),
@@ -147,7 +154,7 @@ impl App {
     /// Pane `o`: VS Code on the thread's target.
     pub(super) fn thread_code(&mut self, t: &Thread) {
         match self.thread_target(t) {
-            Ok(name) => self.pending_action = Some(PromptAction::Code { instance: name }),
+            Ok(name) => self.pending_action = Some(PromptAction::Code { instance: name, goto: None }),
             Err(why) => self.status = Some(why),
         }
     }
@@ -308,27 +315,38 @@ mod tests {
     fn vscode_and_rm_queue_prompt_actions_on_the_target() {
         let mut app = app_with_instances();
         children(&mut app, "d-id", "pr-1", "inst1");
-        let vscode = HostVerb::Vscode(Vscode { path: Some("src/a.rs".into()), line: Some(3), col: None });
+        let vscode = HostVerb::Vscode(Vscode { path: Some("src/a.rs".into()), line: Some(3), col: Some(5) });
+        // Passes put-time validation, but a column needs a line.
+        let col_only = HostVerb::Vscode(Vscode { path: Some("a.rs".into()), line: None, col: Some(2) });
         open_thread(&mut app, Some("pr-1"), vec![
             act("Code", Some(vscode)),
             act("Remove", Some(HostVerb::Rm(NoArgs {}))),
             act("Plain", Some(HostVerb::Vscode(Vscode::default()))),
+            act("Col", Some(col_only)),
         ]);
         app.on_key(key(KeyCode::Char('1')));
-        assert_eq!(app.pending_action.take(), Some(PromptAction::Code { instance: "inst1".into() }));
-        assert!(app.code_note.take().unwrap().contains("src/a.rs not opened"));
+        let goto = Goto { path: "src/a.rs".into(), line: Some(3), col: Some(5) };
+        assert_eq!(
+            app.pending_action.take(),
+            Some(PromptAction::Code { instance: "inst1".into(), goto: Some(goto) })
+        );
+        assert_eq!(app.code_note, None);
+
+        app.on_key(key(KeyCode::Char('4')));
+        assert_eq!(app.pending_action.take(), Some(PromptAction::Code { instance: "inst1".into(), goto: None }));
+        assert_eq!(app.code_note.take().as_deref(), Some("--goto dropped (goto column needs a line)"));
 
         app.on_key(key(KeyCode::Char('2')));
         assert_eq!(app.pending_action.take(), Some(PromptAction::Rm { instance: "inst1".into(), force: false }));
 
         // No path: nothing to say about it.
         app.on_key(key(KeyCode::Char('3')));
-        assert!(app.pending_action.take().is_some());
+        assert_eq!(app.pending_action.take(), Some(PromptAction::Code { instance: "inst1".into(), goto: None }));
         assert_eq!(app.code_note, None);
 
-        // Fixed `o`: the same target.
+        // Fixed `o`: the same target, no goto.
         app.on_key(key(KeyCode::Char('o')));
-        assert_eq!(app.pending_action.take(), Some(PromptAction::Code { instance: "inst1".into() }));
+        assert_eq!(app.pending_action.take(), Some(PromptAction::Code { instance: "inst1".into(), goto: None }));
         assert!(app.inbox.is_open());
     }
 

@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 
 use super::spec;
+use crate::commands::vscode::Goto;
 
 /// Command names offered for first-token completion, in display order.
 /// Derived from [`spec::SPECS`] (primary names only; aliases parse but
@@ -29,7 +30,9 @@ const HISTORY_CAP: usize = 200;
 pub enum PromptAction {
     Run { sandbox: String, name: Option<String>, branch: Option<String>, base: Option<String> },
     Exec { instance: String, argv: Vec<String> },
-    Code { instance: String },
+    /// `goto`: also open a file at a line in the window (`--goto`, an Inbox
+    /// `vscode` action's path/line/col).
+    Code { instance: String, goto: Option<Goto> },
     Rename { instance: String, new_name: String },
     Rm { instance: String, force: bool },
     Stop { instance: String },
@@ -389,7 +392,10 @@ fn parse_line(line: &str) -> Result<PromptAction, String> {
         "exec" => {
             Ok(PromptAction::Exec { instance: args.positionals.remove(0), argv: args.trailing })
         }
-        "code" => Ok(PromptAction::Code { instance: args.positionals.remove(0) }),
+        "code" => Ok(PromptAction::Code {
+            instance: args.positionals.remove(0),
+            goto: args.value("--goto").map(Goto::parse).transpose()?,
+        }),
         "rm" => Ok(PromptAction::Rm {
             instance: args.positionals.remove(0),
             force: args.flag("--force"),
@@ -652,7 +658,15 @@ mod tests {
 
     #[test]
     fn parse_code_and_rm() {
-        assert_eq!(parse_line("code box"), Ok(PromptAction::Code { instance: "box".into() }));
+        assert_eq!(parse_line("code box"), Ok(PromptAction::Code { instance: "box".into(), goto: None }));
+        assert_eq!(
+            parse_line("code box --goto src/a.rs:3:4"),
+            Ok(PromptAction::Code {
+                instance: "box".into(),
+                goto: Some(Goto { path: "src/a.rs".into(), line: Some(3), col: Some(4) }),
+            })
+        );
+        assert!(parse_line("code box --goto ../x").is_err());
         assert_eq!(parse_line("rm box"), Ok(PromptAction::Rm { instance: "box".into(), force: false }));
         assert_eq!(
             parse_line("rm --force box"),

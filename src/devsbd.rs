@@ -324,6 +324,45 @@ pub fn ensure_recorded(key: &str, info: &Instance, quiet: bool) -> Option<Arch> 
     arch
 }
 
+/// A fake attached VS Code window in the running python:alpine `container`
+/// (busybox can't listen on a unix socket), for `vscode-goto` tests: a python
+/// "node" with argv `--type=extensionHost` listening on
+/// `/tmp/vscode-ipc-x.sock` as non-root user `u` (uid 1234), a newer decoy
+/// socket (an integrated terminal's), and a remote-cli script that records its
+/// uid, env and argv under `/tmp/rec/`. Returns the server's `bin/<commit>` dir.
+#[cfg(test)]
+pub(crate) fn fake_vscode_window(container: &str) -> &'static str {
+    use std::process::Command;
+    let exec = |args: &[&str]| Command::new("docker").arg("exec").args(args).output().unwrap();
+    let sh = |script: &str| {
+        let out = exec(&[container, "sh", "-c", script]);
+        assert!(out.status.success(), "{script}: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    let bin = "/home/u/.vscode-server/bin/abc";
+    sh(&format!(
+        "adduser -D -u 1234 u && mkdir -p {bin}/bin/remote-cli /tmp/rec && chmod 777 /tmp/rec \
+         && ln -s \"$(command -v python3)\" {bin}/node \
+         && cat > {bin}/bin/remote-cli/code <<'EOF'
+#!/bin/sh
+id -u > /tmp/rec/uid
+env > /tmp/rec/env
+printf '%s\\n' \"$@\" > /tmp/rec/argv
+EOF
+chmod 755 {bin}/bin/remote-cli/code && chown -R u /home/u"
+    ));
+    let listen = |sock: &str| {
+        format!("import socket,time;s=socket.socket(socket.AF_UNIX);s.bind('{sock}');s.listen();time.sleep(300)")
+    };
+    let node = format!("{bin}/node");
+    let ext = listen("/tmp/vscode-ipc-x.sock");
+    assert!(exec(&["-d", "-u", "u", container, &node, "-c", &ext, "--type=extensionHost"]).status.success());
+    sh("for i in $(seq 50); do [ -S /tmp/vscode-ipc-x.sock ] && break; sleep 0.1; done");
+    let term = listen("/tmp/vscode-ipc-term.sock");
+    assert!(exec(&["-d", "-u", "u", container, &node, "-c", &term]).status.success());
+    sh("for i in $(seq 50); do [ -S /tmp/vscode-ipc-term.sock ] && break; sleep 0.1; done");
+    bin
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -510,32 +549,7 @@ mod tests {
             assert_eq!(none.status.code(), Some(3));
             assert!(String::from_utf8_lossy(&none.stderr).contains("no VS Code window attached"));
 
-            let bin = "/home/u/.vscode-server/bin/abc";
-            sh(&format!(
-                "adduser -D -u 1234 u && mkdir -p {bin}/bin/remote-cli /tmp/rec && chmod 777 /tmp/rec \
-                 && ln -s \"$(command -v python3)\" {bin}/node \
-                 && cat > {bin}/bin/remote-cli/code <<'EOF'
-#!/bin/sh
-id -u > /tmp/rec/uid
-env > /tmp/rec/env
-printf '%s\\n' \"$@\" > /tmp/rec/argv
-EOF
-chmod 755 {bin}/bin/remote-cli/code && chown -R u /home/u"
-            ));
-            let listen = |sock: &str| {
-                format!(
-                    "import socket,time;s=socket.socket(socket.AF_UNIX);s.bind('{sock}');s.listen();time.sleep(300)"
-                )
-            };
-            let node = format!("{bin}/node");
-            let ext = listen("/tmp/vscode-ipc-x.sock");
-            let ok = exec(&["-d", "-u", "u", &name, &node, "-c", &ext, "--type=extensionHost"]);
-            assert!(ok.status.success());
-            sh("for i in $(seq 50); do [ -S /tmp/vscode-ipc-x.sock ] && break; sleep 0.1; done");
-            let term = listen("/tmp/vscode-ipc-term.sock");
-            assert!(exec(&["-d", "-u", "u", &name, &node, "-c", &term]).status.success());
-            sh("for i in $(seq 50); do [ -S /tmp/vscode-ipc-term.sock ] && break; sleep 0.1; done");
-
+            let bin = fake_vscode_window(&name);
             let out = goto("10");
             let stdout = String::from_utf8_lossy(&out.stdout);
             assert!(out.status.success(), "{stdout}{}", String::from_utf8_lossy(&out.stderr));

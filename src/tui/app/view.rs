@@ -89,7 +89,8 @@ Logs modal
 Command prompt (:)
   run <sandbox> [--name n] [--branch b] [--base ref]
   exec <instance> <cmd…>
-  code <instance>   rm <instance>   rename <instance> <new-name>
+  code <instance> [--goto path[:line[:col]]]
+  rm <instance>   rename <instance> <new-name>
   stop <instance>   start <instance>
   port <instance> [--service s] [--address a] <[host:]port>
               (an instance is required; a global service is reached by

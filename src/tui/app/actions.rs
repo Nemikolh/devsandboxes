@@ -86,7 +86,7 @@ impl App {
         let Some(row) = snapshot.instances.get(i) else {
             return;
         };
-        self.pending_action = Some(PromptAction::Code { instance: row.name.clone() });
+        self.pending_action = Some(PromptAction::Code { instance: row.name.clone(), goto: None });
     }
 
     /// `s` (Instances tab): stop the running instance under the cursor, or
@@ -270,7 +270,7 @@ mod tests {
         app.on_key(key(KeyCode::Char('o')));
         assert_eq!(
             app.take_pending_action(),
-            Some(PromptAction::Code { instance: "inst0".into() }),
+            Some(PromptAction::Code { instance: "inst0".into(), goto: None }),
         );
     }
 
@@ -283,7 +283,7 @@ mod tests {
         app.on_key(key(KeyCode::Char('o')));
         assert_eq!(
             app.take_pending_action(),
-            Some(PromptAction::Code { instance: "orphan0".into() }),
+            Some(PromptAction::Code { instance: "orphan0".into(), goto: None }),
         );
     }
 

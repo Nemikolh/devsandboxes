@@ -133,9 +133,9 @@ pub struct App {
     /// suspend + command call, keeping [`App`] I/O-free).
     pub pending_action: Option<PromptAction>,
     /// Appended to the status line the event loop writes after launching a
-    /// [`PromptAction::Code`]: an Inbox `vscode` action's caveats (path/line
-    /// not honored yet, dispatcher part pending), which would otherwise be
-    /// overwritten by the launch outcome.
+    /// [`PromptAction::Code`]: an Inbox `vscode` action's caveats (a goto it
+    /// couldn't honor, the event and child done queued), which would
+    /// otherwise be overwritten by the launch outcome.
     pub code_note: Option<String>,
     /// Instance name whose stop the event loop should spawn on a background
     /// thread (the `s` shortcut on a running instance; runs without suspending

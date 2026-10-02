@@ -37,6 +37,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 use crate::commands;
+use crate::commands::vscode::Goto;
 use crate::inbox;
 
 use app::{App, PendingSignal};
@@ -219,6 +220,10 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
     // Background process signals (SIGTERM/SIGKILL from a process row); no guard
     // needed since each keypress targets a concrete pid.
     let mut signals: Vec<Receiver<OpDone>> = Vec::new();
+    // Background VS Code launches (`o`, `:code`, a thread's `vscode`): a
+    // `--goto` waits up to 30 s for the window. No guard: a second launch
+    // just focuses the same window.
+    let mut codes: Vec<Receiver<OpDone>> = Vec::new();
     // Background done-flag writes (`d`/`u`, a thread's child); the `bool` is
     // `PendingDone::report`.
     let mut dones: Vec<(bool, Receiver<OpDone>)> = Vec::new();
@@ -286,16 +291,14 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
             }
         }
 
-        // A prompt command is ready: suspend the TUI (or, for `code`, just
-        // launch it), then force a redraw + immediate refresh on return.
+        // A prompt command is ready: suspend the TUI (or, for `code`, launch
+        // it in the background), then force a redraw + immediate refresh on
+        // return.
         if let Some(action) = app.take_pending_action() {
             match action {
-                PromptAction::Code { instance } => {
-                    let outcome = launch_code(&dir, &instance);
-                    app.status = Some(match app.code_note.take() {
-                        Some(note) => format!("{outcome} · {note}"),
-                        None => outcome,
-                    });
+                PromptAction::Code { instance, goto } => {
+                    app.status = Some("opening VS Code…".into());
+                    codes.push(spawn_code(dir.clone(), instance, goto, app.code_note.take()));
                 }
                 // Rename is pure state I/O (`rename_exact`: no stdout, no
                 // prompts — plain `rename` would scribble on the alternate
@@ -446,6 +449,14 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
             Ok(done) => {
                 app.status = Some(done.status);
                 app.needs_proc_fetch = true;
+                false
+            }
+            Err(TryRecvError::Empty) => true,
+            Err(TryRecvError::Disconnected) => false,
+        });
+        codes.retain_mut(|rx| match rx.try_recv() {
+            Ok(done) => {
+                app.status = Some(done.status);
                 false
             }
             Err(TryRecvError::Empty) => true,
@@ -652,8 +663,9 @@ fn wait_for_key() {
 }
 
 /// Launch VS Code attached to `instance` (a snapshot row name, which equals
-/// the state instance key). Returns a one-line status for the help-bar.
-fn launch_code(dir: &Path, instance: &str) -> String {
+/// the state instance key), at `goto` when given. Returns a one-line status
+/// for the help-bar.
+fn launch_code(dir: &Path, instance: &str, goto: Option<&Goto>) -> String {
     let state = match crate::state::State::load() {
         Ok(s) => s,
         Err(e) => return format!("code: {e:#}"),
@@ -661,7 +673,23 @@ fn launch_code(dir: &Path, instance: &str) -> String {
     let Some(info) = state.instances.get(instance) else {
         return format!("code: unknown instance `{instance}`");
     };
-    commands::vscode::launch(dir, instance, info).unwrap_or_else(|e| format!("{e:#}"))
+    commands::vscode::launch(dir, instance, info, goto).unwrap_or_else(|e| format!("{e:#}"))
+}
+
+/// Spawn a detached thread running [`launch_code`] (a goto blocks while the
+/// helper waits for the window) and reporting its status, with `note` (the
+/// Inbox action's caveats, [`App::code_note`]) appended.
+fn spawn_code(dir: PathBuf, instance: String, goto: Option<Goto>, note: Option<String>) -> Receiver<OpDone> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let outcome = launch_code(&dir, &instance, goto.as_ref());
+        let status = match note {
+            Some(note) => format!("{outcome} · {note}"),
+            None => outcome,
+        };
+        let _ = tx.send(OpDone { status, failed: false });
+    });
+    rx
 }
 
 /// Hand `link` to the desktop opener (`open` on macOS, `xdg-open` elsewhere),

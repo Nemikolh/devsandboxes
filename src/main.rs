@@ -163,6 +163,11 @@ enum Command {
     Vscode {
         /// Instance name, sandbox config name, or repository folder name
         name: String,
+        /// Also open this file (relative to the instance's workspace folder)
+        /// at a line and column in the attached window; waits up to 30 s for
+        /// the window to attach
+        #[arg(long, value_name = "PATH[:LINE[:COL]]", value_parser = commands::vscode::Goto::parse)]
+        goto: Option<commands::vscode::Goto>,
     },
     /// Mark a sandbox instance done: kept as is (container, worktree), shown
     /// dimmed until removed
@@ -307,7 +312,7 @@ fn main() -> Result<()> {
         },
         Command::Logs { name, lines } => commands::logs::logs(&name, lines),
         Command::Inspect { name, json } => commands::inspect::inspect(&name, json),
-        Command::Vscode { name } => commands::vscode::vscode(&cli.dir, &name),
+        Command::Vscode { name, goto } => commands::vscode::vscode(&cli.dir, &name, goto.as_ref()),
         Command::Done { name } => commands::done::done(&name, true),
         Command::Undone { name } => commands::done::done(&name, false),
         Command::Stats { json } => commands::stats::stats(json),
