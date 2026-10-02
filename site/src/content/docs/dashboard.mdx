@@ -97,9 +97,9 @@ Tab `2` lists the service containers your sandboxes use: shared by every instanc
 
 ## Inbox
 
-A script or an agent in a sandbox reaches you with `devsbd notify "tests pass"`. It lands in the Inbox tab (`4`), with an unread count in the tab and a `✉` on the instance row, and pops up on your desktop.
+A script or an agent in a sandbox reaches you with `devsbd notify "tests pass"`. It lands in the Inbox tab (`4`), with a count in the tab and a `✉` on the instance row, and pops up on your desktop. A [dispatcher](https://github.com/Nemikolh/devsandboxes/blob/main/docs/automations-guide.md#inbox-threads) can also keep one thread per item there, with buttons and a reply box; `v` cycles the views (Needs you, Active, Done, All) and `enter` opens a thread.
 
-<Try>`1` for Instances: opening the Inbox marked it read, so `web-3` lost its `✉`.</Try>
+<Try>`1` for Instances: leaving the Inbox marked it read, so `web-3` lost its `✉`.</Try>
 
 </TourStep>
 
@@ -152,6 +152,7 @@ The real dashboard's keys, also in its `?` screen. The Preview column says what 
 | `l`               | Logs (Instances)                                 | yes                      |
 | `p`               | Forward a port (instance or service)             | yes                      |
 | `o`               | Open in VS Code (Instances)                      | yes                      |
+| `d` / `u`         | Mark the instance done / not done (Instances)    | no                       |
 | `t` / `K`         | SIGTERM / SIGKILL (process row)                  | no                       |
 
 ### Ports and Inbox
@@ -159,8 +160,21 @@ The real dashboard's keys, also in its `?` screen. The Preview column says what 
 | Key     | Action                                     | Preview |
 | ------- | ------------------------------------------ | ------- |
 | `d`     | Stop the selected forward (Ports)          | yes     |
-| `enter` | Open the notification's link (Inbox)       | no      |
-| `d` `D` | Dismiss one / clear all (Inbox)            | no      |
+| `v`     | Cycle the views (Inbox)                    | no      |
+| `enter` | Open the thread (Inbox)                    | no      |
+| `d`     | Dismiss a notification / mark a thread done (Inbox) | no |
+| `D`     | Clear all notifications (Inbox)            | no      |
+
+### Inbox thread
+
+| Key       | Action                                                    | Preview |
+| --------- | --------------------------------------------------------- | ------- |
+| `esc`     | Close the thread                                          | no      |
+| `enter`   | Open its link                                             | no      |
+| `1`–`9`   | Run a button                                              | no      |
+| `r`       | Reply                                                     | no      |
+| `d` / `u` | Mark done / reopen                                        | no      |
+| `o` `t` `l` `p` | VS Code / terminal / logs / forward on the thread's instance | no |
 
 ### Terminals
 

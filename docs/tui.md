@@ -172,40 +172,94 @@ See `docs/port-forwarding.md` for the engine. The dashboard gains a third tab.
   spec is an inline prompt error. Submitting switches to the Ports tab and hands
   the request to the forwarder worker (it never suspends the TUI).
 
-## Phase 4 — Inbox tab (container notifications)
+## Phase 4 — Inbox tab (notifications and dispatcher threads)
 
-See `docs/automations.md` ("`devsbd notify`") for the transport. The bridge
-worker drains each running instance's outbox; the event loop pushes every
-notification into `App` (`src/tui/app/inbox.rs`) and also shows it briefly on
-the status line so it's noticed from any tab. Desktop notifications fire from
-the worker, never the UI thread.
+Transport: `docs/automations.md` ("`devsbd notify`", _Inbox threads_);
+threads, events and their design: `docs/inbox-threads.md`. The Inbox shows the
+shared store (`inbox.toml` next to `state.toml`, `src/inbox/`), which every
+dashboard reads and writes under a lock: the bridge worker applies each
+delivered record to it, then pokes the event loop, which reloads (also
+whenever the file's mtime or length moves, e.g. another dashboard dismissed
+something) and shows the record briefly on the status line. `App`
+(`src/tui/app/inbox.rs`) only holds view state: the view, the selection, the
+open thread. `d`/`D`/mark-read and the pane's actions are `inbox::Op`s the
+event loop applies through `store::update`. Desktop popups fire from the
+worker, never the UI thread.
 
 - `Tab::Inbox` is the fourth tab: `4` jumps to it, `tab`/`S-tab` cycle over
-  all four. Its title carries the unread count (`Inbox (3)`).
-- Newest first, saved to `inbox.toml` next to `state.toml` after every change
-  (atomic temp + rename) and loaded at startup, so history survives restarts.
-  Capped at 200 records per instance, thread history included; the
-  instance's oldest record drops first, never another instance's.
-- A notification with a `--key` becomes the new head of the thread with the
-  same `(instance, key)`, moving to the top as unread; older ones stay as its
-  history (folded, `(+N)` on the head, `→`/`space` to show). The same key from
-  another instance is its own thread. Only heads count as unread.
-- With more than one instance in the inbox, threads are grouped under a
-  foldable header per instance (`▾ name  N ✉unread`), ordered by newest
-  thread; with one instance the list stays flat.
-- Unread: anything arriving while the Inbox isn't shown. Entering the tab marks
-  everything read. Unread rows are bold; an Instances-tab instance row with
-  unread notifications shows a yellow `✉N` after its name.
-- Table columns: `TIME` (`HH:MM`, local time from `date +%z` read once at
-  startup, UTC if unavailable), `LEVEL` (info dim / warn yellow / error red),
-  `INSTANCE` (flat only; grouped, the header carries it), `MESSAGE` (first
-  line, `↗` when it has a link). The Detail panel shows the full message, link
-  and key, or a group's counts.
-- Keys: `enter` opens the link (`xdg-open`, `open` on macOS; only `http(s)://`
-  links: the link comes from the container, so paths, `-options`, `file:` and
-  custom schemes are refused), `→`/`space`/`←` fold like the Instances tree,
-  `d` dismisses the selected history record, whole thread (on its head) or
-  whole instance (on its header), `D` clears the inbox. Dismissals are saved.
+  all four. Its title carries the **needs-you** count (`Inbox (3)`), and an
+  Instances row shows the same count for that instance as a yellow `✉N`
+  after its name (matched by `instance_id`, so a renamed instance keeps it).
+  Needs-you = dispatcher threads in state `needs-you` plus unread notify
+  records; archived threads never count. Unread alone doesn't, so a
+  dispatcher re-asserting threads can't inflate it.
+- One row per thread, last change first. Two kinds share the list: a
+  dispatcher thread (`devsbd thread put`), and a notify thread (the records
+  sharing an `(instance, key)`; an unkeyed record is its own row). Columns:
+  a one-cell marker (thread: `●` needs-you yellow, `○` active, `✓` done dim;
+  notify: `✖` error, `▲` warn, `·` info), `FROM` (sender instance), `TITLE`
+  (thread title, or the newest record's first line; `↗` when there's a link,
+  `(archived)` when the sender was removed), `STATUS` (the thread's status
+  chip, or a notify record's level above info), `AGE` (`just now`, `5 min
+  ago`, … then a date after a week; local time from `date +%z` read once at
+  startup). Unread rows are bold, archived ones dim.
+- **Views**, cycled with `v`, shown with their counts as the list title:
+  **Needs you** (default), **Active**, **Done**, **All**. Archived threads
+  and read notify records only show in All.
+- **Read.** A thread is read when opened in the pane, and again whenever it
+  changes while open. Notify records are also marked read when you leave
+  the Inbox from Needs you or All, since they were on screen: a notify record
+  has no state to resolve it, so it would otherwise sit in Needs you until
+  opened.
+- The Detail panel previews the selected thread (the pane's content).
+- List keys: `enter` opens the **thread pane**; `d` dismisses a notify
+  thread with its history, or marks a dispatcher thread done (with an event,
+  and its child done); `D` clears every notify thread (dispatcher threads are
+  state their dispatcher re-asserts, so they stay).
+
+The **thread pane** replaces the list and shadows the dashboard keys while
+open (a tier in `App::on_key` after the terminal, like a modal): the `1`–`4`
+tab keys, `t`, `l` and the rest act on the thread, not on rows the user
+can't see. `q`, `:` and `?` stay. It shows the title; state (or level),
+status and time; `from` (sender, `(archived: instance removed)`); `link`;
+`child` (resolved among the sender's own children, with its run state, or
+`(no such child)`); the message; the timeline (put changes, actions,
+replies, done/reopen; for a notify thread, its earlier records); `N events
+waiting for <sender>` until the dispatcher acks them; the numbered actions
+(`⌂ host` runs in the dashboard, `→ <sender>` sends an event, `✓ done`);
+the reply hint.
+
+| key | does |
+|---|---|
+| `esc` | close the pane |
+| `↑`/`k` `↓`/`j`, `pgup`/`pgdn`, `g`/`G` | scroll |
+| `enter` | open the link (`xdg-open`, `open` on macOS; only `http(s)://`: the link comes from the container) |
+| `1`–`9` | run that action: a host verb (`vscode`, `terminal`, `logs`, `forward`, `open`, `rm`) runs at once on the thread's child, else on its sender; the rest is an event for the sender (`src/tui/app/thread_actions.rs`) |
+| `o` `t` `l` `p` | VS Code / terminal / logs / forward prompt on the child, or the sender without one |
+| `r` | reply, when the thread takes replies: a one-line box (the `:` prompt's editing keys) with the thread's placeholder; `enter` sends a non-empty reply, `esc` cancels |
+| `d` | mark done: an event, and the child marked done |
+| `u` | reopen a done thread: back to `active`, an event, and the child's done mark cleared |
+
+Archived threads refuse actions, replies, `d` and `u` with a status line. A
+host action whose child isn't found is refused rather than run on the sender,
+and sends no event. The `rm` verb goes through the `:rm` path (the CLI's own
+confirm on the suspended screen).
+
+## Phase 5 — done instances, VS Code at a line
+
+- An instance marked done (`state::Instance::done`) stays in the tree,
+  dimmed, with a `✓` after its name. `d` / `u` on an Instances row mark it
+  done / clear it, written off the UI thread (`commands::done::set_saved`);
+  the same flag is set by `devsandbox done|undone`, `devsbd done`, and a
+  thread's done/reopen on its child.
+- `:code <instance> [--goto path[:line[:col]]]` opens VS Code and then the
+  file (relative to the instance's workspace folder) at the line, via
+  `devsbd vscode-goto` in the container (`docs/sandbox-helper.md`). It runs
+  in the background, since the in-container half waits up to 30 s for the
+  window to attach; the outcome is the status line (`opened VS Code at
+  <path>:<line>`, or `opened VS Code; --goto dropped (<reason>)`). The
+  thread `vscode` action passes its `path`/`line`/`col` the same way; `o`
+  opens no file.
 
 ## Step ordering / commits
 

@@ -37,6 +37,8 @@ devsandbox              # the dashboard
 | `rebuild <name>\|--all [--force]`   | Recreate from current config when drifted; worktree and state kept        |
 | `rm <name>`                         | Remove container, worktree, and state entry                               |
 | `exec [-i] [-t] <name> [cmd…]`      | Exec honoring `remoteEnv` / `remoteUser`; no `cmd`: login shell           |
+| `vscode <name> [--goto PATH[:LINE[:COL]]]` | Open VS Code attached to the instance, optionally at a file and line |
+| `done` / `undone <name>`            | Mark an instance done (kept as is, shown dimmed) / clear the mark         |
 | `port <name> [--service s] <port…>` | Forward a container/service port to the host until Ctrl-C (unix only)     |
 | `service ls` / `service rebuild`    | List services / recreate one and rewire running sandboxes in place        |
 | `gc [--force]`                      | Reap unreferenced services, orphaned history files and agent links        |
@@ -76,7 +78,7 @@ dispatcher = { spawn = ["web"], max-instances = 10 }
 postStartCommand = "nohup ./babysit-loop.sh >babysit.log 2>&1 &"
 ```
 
-Inside a sandbox, `devsbd notify "PR 123 needs you"` reaches the dashboard's Inbox tab and your desktop; a dispatcher manages its children with `devsbd ensure web --key pr-123`, `devsbd exec pr-123 --detach -- <agent>`, `devsbd rm pr-123`. Notifications and control need the dashboard open. Guide, sample dispatcher, and limitations: [`docs/automations-guide.md`](docs/automations-guide.md).
+Inside a sandbox, `devsbd notify "PR 123 needs you"` reaches the dashboard's Inbox tab and your desktop; a dispatcher manages its children with `devsbd ensure web --key pr-123`, `devsbd exec pr-123 --detach -- <agent>`, `devsbd rm pr-123`, and keeps one Inbox thread per item (`devsbd thread put`) with buttons and replies it reads back with `devsbd events`. Notifications and control need the dashboard open. Guide, sample dispatcher, and limitations: [`docs/automations-guide.md`](docs/automations-guide.md).
 
 ## Platform support
 

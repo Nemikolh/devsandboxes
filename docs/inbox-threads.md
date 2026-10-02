@@ -1,6 +1,9 @@
 # Inbox threads: dispatchers that ask, users that answer
 
-Status: planned (see *Decisions* and *Implementation steps*). Companion plan for the PR babysitter:
+Status: implemented (steps 1-10). Where the code differs from the design, the
+sections below say so; *Decisions* records what was settled before the build.
+User reference: `automations-guide.md` (*Inbox threads*); protocol:
+`automations.md` (*Inbox threads*). Companion plan for the PR babysitter:
 `../.devsandboxes/dispatcher-threads-plan.md`.
 
 ## Why
@@ -27,7 +30,8 @@ The PR babysitter (see `automations.md` and `automations-guide.md`) works, but i
 
 - **Restarts clutter it.** Restarting the dispatcher re-sends notifications
   its in-memory dedup had suppressed. Restarting the dashboard seems to add
-  more; not yet reproduced (see *Open questions*).
+  more: most likely an older dashboard re-saving records dismissed in another
+  (see *Decisions*, "One shared store").
 
 - **No way to answer.** `notify` is one-way. The next use case, a triage agent
   asking "send this email or not?", needs the user to answer from the Inbox.
@@ -103,9 +107,20 @@ devsbd thread put < thread.json      # or: devsbd thread put --json '<json>'
 - **Transport:** the existing durable outbox, like `notify`, so a put works
   with no dashboard open and is delivered later, in order.
 
-- **`devsbd thread rm <key>`** drops a thread (e.g. on state loss cleanup).
-  Threads in `done` are archived after a retention period (default 14 days,
-  or past the existing per-instance cap of 200).
+- **`devsbd thread rm <key>`** drops a thread (e.g. on state loss cleanup),
+  pending events included. As built, `done` and archived threads are
+  *dropped* 14 days after their last change (a done thread still holding
+  unacked events is kept until they're acked); past the per-instance cap of
+  200 (records, timeline entries and pending events together), archived
+  threads go first, then done ones without pending events, then the oldest
+  single items. Events are never evicted by the cap; each thread keeps at
+  most 100, oldest dropped.
+
+- A put changing `message`, `state` or `status` adds one timeline entry each
+  and marks the thread unread; a change to `title`, `link`, `child`,
+  `actions` or `reply` is applied silently. The put always wins over the
+  user: a thread the user marked done comes back if the dispatcher puts it
+  as `needs-you` again, so a dispatcher must record the `done` event.
 
 - **`notify` stays** for one-off alerts. Internally it can become a thread
   with no `state` and no actions, so both share one store and one UI.
@@ -139,11 +154,18 @@ Two kinds, which can be combined on one button:
   "Send / Skip", or "Retry" are wired: devsandbox doesn't know what they do.
 
 - **`done: true`** is a built-in: it sets the thread to `done`, marks its
-  `child` done (below), and enqueues an event.
+  `child` done (below), and enqueues one `done` event whose `action` is the
+  button's id (not an `action` event too), so a dispatcher handles "done" in
+  one place and still knows which button it was.
+
+Host verbs are written `"host": { "<verb>": { …args } }`, `{}` for a verb
+with no args, exactly one verb per action.
 
 The thread pane also has fixed keys that need no declaration: the host verbs
-on the thread's child (`o`, `t`, `l`), `r` to reply (when `reply` is set), `d`
-to mark done, `u` to reopen (which enqueues a `reopen` event).
+on the thread's child (`o`, `t`, `l`, and `p` for the forward prompt; `o`
+opens no file), `r` to reply (when `reply` is set), `d` to mark done (a
+`done` event without `action`), `u` to reopen (the thread goes back to
+`active`, a `reopen` event). `d` and `u` only act on a real transition.
 
 ### Events: pull, not push
 
@@ -155,7 +177,15 @@ devsbd events ack <id>...
 ```json
 {"id": "e-1790900001-3f2a", "key": "pr-6900", "kind": "action", "action": "post", "at": "2026-10-02T12:00:01Z"}
 {"id": "e-1790900042-77c1", "key": "pr-6900", "kind": "reply", "text": "Also rename the event to agent_run.cost", "at": "2026-10-02T12:00:42Z"}
+{"id": "e-1790900050-0b9e", "key": "pr-6900", "kind": "done", "action": "done", "at": "2026-10-02T12:00:50Z"}
 ```
+
+As built: ids are `e-<unix secs:010>-<4 hex>`; `kind` is
+`action|reply|done|reopen`; `action` and `text` are left out when absent;
+`at` is RFC 3339 UTC from the dashboard host's clock (the store keeps unix
+seconds). `events ack` prints how many it dropped and ignores unknown ids.
+One `events` answer stops at about half of the 1 MiB response cap; the rest
+comes after an ack.
 
 - **Held by the host** in `inbox.toml`, with the thread, until acked.
   Delivery is at least once: the dispatcher acks after it has saved its own
@@ -245,10 +275,13 @@ owner's cmdline for `--type=extensionHost`.
 `VSCODE_RECONNECTION_GRACE_TIME=10800000`: it outlives a closed window by 3 h,
 socket included. A connectable socket doesn't prove a window is there.
 
-`launch` with `--goto`:
+`launch` with `--goto` (as built: no snapshot step; the host opens the
+window, then execs `devsbd vscode-goto <abs path>[:line[:col]] --wait 30` as
+root, and the helper polls for an extension host; the steps below otherwise
+hold):
 
 1. **Snapshot** the extension-host sockets in the container (step 3's
-   helper).
+   helper). Not built: polling after step 2 covers both cases.
 
 2. **Open or focus the window from the host, always**, as `launch` does today
    (`code --file-uri <workspace file>`). VS Code focuses an existing window
@@ -273,9 +306,18 @@ socket included. A connectable socket doesn't prove a window is there.
    `VSCODE_IPC_HOOK_CLI=<socket>`, `-g <workspace>/<path>:<line>:<col>`.
 
 Steps 1, 3 and 4 run inside the container as one helper op
-(`devsbd vscode-goto <path:line:col> [--wait SECS]`, internal, called by the
-host through exec). The `/proc` scan stays in Rust next to the rest of
-`devsbd`, not in a shell snippet. It prints the socket and pid it used.
+(`devsbd vscode-goto <ABS_PATH>[:LINE[:COL]] [--wait SECS]`, `--wait` at most
+60, internal, called by the host through exec). The `/proc` scan stays in Rust
+next to the rest of `devsbd`, not in a shell snippet. It prints
+`socket=… pid=… cli=…` and exits 3 when no window appeared.
+
+**Root can't see the socket, so the helper re-execs.** docker drops
+`CAP_SYS_PTRACE`, so root in the container can't `readlink` another user's
+`/proc/<pid>/fd` entries. The helper finds extension hosts from
+world-readable `cmdline`/`stat`/`status`; when the newest one's fds are off
+limits, it re-runs `vscode-goto` as that process's uid/gid with the remaining
+wait, and the owner reads its own fds and runs the CLI. Run as a non-root user
+other than the owner, it refuses.
 
 This doesn't depend on the host `code` CLI or the authority format, so it's
 the same on docker, podman and Apple `container`. Build-time test cases:
@@ -300,8 +342,12 @@ Gmail-like rather than a log:
   `needs-you` threads, not unread records. Noise can no longer inflate it.
 
 - **Thread pane:** title, link, status, the child with its run state, the
-  `message`, the timeline, then numbered actions (`1`–`9`) and a reply box
-  (`r`). A thread that changes while open marks itself read.
+  `message`, the timeline, the count of events the owner hasn't pulled yet,
+  then numbered actions (`1`–`9`) and a reply box (`r`). A thread is read
+  when opened, and a thread that changes while open marks itself read.
+  Plain notify records are also marked read when the user leaves the Inbox
+  from **Needs you** or **All**, where they were on screen: they have no
+  state to resolve them.
 
 - Desktop popups only fire when a thread enters `needs-you`, or for `notify`
   records as today.
@@ -399,6 +445,10 @@ module, in the style of its neighbors. Container paths use
   never the UI thread.
 - Test: decision factored as a pure fn (when to reinstall), unit-tested next
   to `retry_decision`.
+- As built: the check runs before *every* (re)spawn, not only after a
+  mismatch, since a stale helper with the same protocol `VERSION` bridges
+  fine and only lacks verbs. Spawns are rare, so it's one extra `exec` per
+  spawn.
 
 ### Step 2: shared inbox store (format v2), no UI change
 

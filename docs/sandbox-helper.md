@@ -64,7 +64,13 @@ Subcommands (argv[1], no clap — hand-parse to save size):
 
 - `notify [--level info|warn|error] [--link URL] [--key K] [--] <msg>...` — queues a record in `/var/lib/devsandbox/outbox/` and pokes the daemon, which flushes it to a host advertising `NOTIFY`.
 
-- `ensure|ls|stop|rm|exec`, `run ls|logs|wait <key> …` — a dispatcher's control commands: one request over `/run/devsandbox/api.sock`, relayed by the daemon to a host advertising `CONTROL`; exit 0/1/2, 75 (no host), 77 (denied).
+- `thread put [--json '<json>']` (stdin without `--json`) / `thread rm <key>` — queue a dispatcher's Inbox thread in the same outbox, as a `kind thread-put|thread-rm` record. The helper only checks JSON syntax (`json.rs`, std-only) and the key; the host owns the schema. A new record for a key deletes the pending ones for that key. See `docs/automations.md`, _Inbox threads_.
+
+- `ensure|ls|branches|stop|rm|done|exec`, `run ls|logs|wait|rm|prune <key> …`, `events [--wait SECS]`, `events ack <id>...`, `thread ls` — a dispatcher's control commands: one request over `/run/devsandbox/api.sock`, relayed by the daemon to a host advertising `CONTROL`; exit 0/1/2, 75 (no host), 77 (denied).
+
+- `vscode-goto <ABS_PATH>[:LINE[:COL]] [--wait SECS]` — local, no host round trip; what `devsandbox vscode --goto` execs as root in the container. Opens the file at the line in the VS Code window attached to this container by running that window's own remote CLI (`code -g`) against its IPC socket. The window's socket is the `/tmp/vscode-ipc-*.sock` listener (from `/proc/net/unix`) held by a `--type=extensionHost` process: the server also owns one per integrated terminal, and the agent host one, so "newest socket" would usually pick a terminal's. With several extension hosts the most recently started wins. The CLI is the single script in `<server>/bin/<commit>/bin/remote-cli/` (`code`, `code-insiders`, `cursor`), found from the extension host's argv0, and runs as the extension host's owner with a clean env (`PATH`, `HOME` from `/etc/passwd`, `VSCODE_IPC_HOOK_CLI`). `--wait` (at most 60 s) polls for a window to appear; exit 3 when none does. Prints `socket=… pid=… cli=…`.
+
+  **Why it re-execs.** docker drops `CAP_SYS_PTRACE`, so root in the container can't `readlink` another user's `/proc/<pid>/fd` entries and can't tell which socket the extension host holds. Candidates are found from world-readable files (`cmdline`, `stat`, `status`); when the newest one's fds are off limits (`EACCES`), the helper re-runs itself as that process's uid/gid (`vscode-goto` again, with what's left of the wait), and the owner can read its own fds. Running the CLI as the owner also matters on its own: the CLI path comes from a cmdline that user controls, so it never runs as anyone else.
 
 - `run start|ls|logs|wait` (no key) — tracked runs in this container under `/var/lib/devsandbox/runs/`; what the host execs in a child for the control `exec`/`run` verbs.
 
@@ -171,7 +177,10 @@ The main crate must build for every release target (incl. macOS, Windows) while 
 - **When:** in `run` after create (next to lifecycle commands) and in
   `start_instance` (`src/commands/start.rs:42`, both the resolved and bare
   branches) after the container starts, plus the TUI's bare `s` start
-  (`spawn_start`, silently). On docker `/run` is in the container's writable
+  (`spawn_start`, silently), and in the dashboard before every bridge
+  (re)spawn (`Bridges::reconcile`, on the bridge worker), so an open
+  dashboard upgrades a running instance's helper and the daemon of the new
+  build takes over. On docker `/run` is in the container's writable
   layer, so the binary survives a restart (only the daemon doesn't — the bridge
   self-heals that); reinstall on start stays for CLI upgrades and images that
   do mount a tmpfs at `/run`. Reinstall is cheap and the hash check makes it a
@@ -421,10 +430,10 @@ kind: 0 Hello(u32 version, u8 hash_len, hash utf-8, u32 caps)  1 Open(channel: u
   serves `Connect` with flow control + half-close), `SSH_AGENT = 1 << 1` (host
   serves ssh-agent streams), `NOTIFY = 1 << 2` (host serves `channel::NOTIFY`
   streams: the daemon sends one outbox record as `Data` then `Eof`, the host
-  replies `ok`; a legacy `Open` stream half-closes on a peer `Eof`, see
+  replies `ok` once the record is in the Inbox store (no reply = resend); a legacy `Open` stream half-closes on a peer `Eof`, see
   `mux.rs`, docs/automations.md), `CONTROL = 1 << 3` (host serves
-  `channel::CONTROL` streams: a dispatcher's `devsbd ensure|ls|stop|rm|exec`
-  or `devsbd run ls|logs|wait <key> …` request, sent the same way (run ops
+  `channel::CONTROL` streams: a dispatcher's `devsbd ensure|ls|stop|rm|done|exec`,
+  `devsbd run … <key> …`, `devsbd events`, `events ack` or `thread ls` request, sent the same way (run ops
   are then carried out by the host exec'ing `devsbd run …` in the child;
   runs themselves never touch the frame channel), answered with an encoded response and a close;
   only sink-bearing TUI bridges advertise it, and the host's handler refuses

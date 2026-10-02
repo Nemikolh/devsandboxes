@@ -1,5 +1,50 @@
 # Changelog
 
+## Unreleased
+
+Dispatchers can now keep one Inbox thread per item, with a state, buttons and a reply box, and read your clicks and replies back. The Inbox becomes a list of what's waiting on you rather than a log, it's shared by every open dashboard, and instances can be marked done instead of removed. VS Code can open straight at a file and line.
+
+### Added
+
+- **Inbox threads for dispatchers.** `devsbd thread put` puts one thread per item in the Inbox: a title, a link, a state (`needs-you`, `active` or `done`), a status, a message, up to 9 buttons and an optional reply box. A put that changes nothing is ignored (no unread mark, no popup), so a dispatcher can simply re-send all its threads on every pass; a desktop popup only fires when a thread enters `needs-you`. Puts are queued like `notify`, so they work with no dashboard open, and a newer put for the same thread replaces the queued one. `devsbd thread rm` drops a thread, `devsbd thread ls` lists yours back. Only sandboxes that declare `dispatcher` may send threads; a rejected one shows up as an error notification from your instance, with the reason. Full reference: `docs/automations-guide.md`.
+
+```bash
+devsbd thread put --json '{"key":"pr-123","title":"#123 fix login","state":"needs-you","status":"review replies","child":"pr-123","actions":[{"id":"post","label":"Post replies"},{"id":"done","label":"Done","done":true}],"reply":{}}'
+```
+
+- **Thread buttons that act right away.** A button can carry a built-in host action that runs in the dashboard with no round trip: open VS Code on the thread's child (at a file and line), a terminal, its logs, a port forward, a link, or `rm` with the usual confirm. The target is always the thread's child or the dispatcher itself, never another instance, and there is no arbitrary host command.
+
+- **Events: your clicks and replies, back to the dispatcher.** Every other button, a reply, marking a thread done and reopening it become events the dispatcher reads with `devsbd events` (JSON lines). `--wait SECS` returns as soon as there's one, so a dispatcher can replace its sleep with it and react within seconds. Delivery is at least once: events stay until the dispatcher acks them with `devsbd events ack <id>…` after saving its own state.
+
+```bash
+devsbd events --wait 300
+devsbd events ack e-1790900001-3f2a
+```
+
+- **Done instances.** An instance marked done keeps its container, worktree and runs, and shows dimmed with a `✓` in the dashboard and `(done)` in `ps`, until you remove it. Mark it with `devsandbox done <instance>`, `d` on its row, a thread's Done, or a dispatcher's `devsbd done <key>`; clear it with `devsandbox undone`, `u`, or a dispatcher's `ensure` reusing it. `devsbd ls`, `ps --json` and `status --json` report `done`. npm: `done(name)` / `undone(name)`, and `done` on instance rows.
+
+```bash
+devsandbox done web-pr-123
+```
+
+- **`devsandbox vscode --goto` opens VS Code at a file and line.** The path is relative to the instance's workspace folder. It opens (or focuses) the window as before, then has the in-container helper open the file in that window, waiting up to 30 s for it to attach; if that fails, the window still opens and the output says why the line was dropped. In the dashboard: `:code <instance> --goto path:line`.
+
+```bash
+devsandbox vscode web-2 --goto src/main.rs:42:7
+```
+
+### Changed
+
+- **The Inbox shows what's waiting on you.** One row per thread or notification, newest change first, with views cycled by `v`: **Needs you** (the default), **Active**, **Done** and **All**. The tab count and the yellow `✉N` on instance rows now count threads that need you and unread notifications, not every unread record. `enter` opens a thread pane with its message, timeline and numbered buttons; there `1`–`9` run buttons, `r` replies, `d` marks done, `u` reopens, `o`/`t`/`l`/`p` act on the thread's child, and `enter` opens the link. The per-instance grouping and inline folding are gone: a notification's earlier records are listed in the pane. Notifications are marked read when you open them or leave the Inbox after seeing them. `d` on a notification dismisses it and on a thread marks it done; `D` clears notifications only.
+
+- **An open dashboard updates the helper in running instances.** Before, a running dispatcher only got new `devsbd` verbs after `devsandbox start`; now opening the dashboard of a newer devsandbox is enough.
+
+### Fixed
+
+- **Dismissed notifications no longer come back with several dashboards open.** Each dashboard kept its own copy of the Inbox and saved it over the others', so records dismissed in one reappeared from another, and restarts seemed to add clutter. All dashboards now share one store, so a dismissal in one is gone from all.
+
+- **A notification is no longer lost if the dashboard dies while receiving it.** The container's copy was dropped as soon as the dashboard said it had it, before it was saved; now it's saved first, and resent otherwise.
+
 ## 0.6.0
 
 The config file is now `devsandboxes.toml`, and it can be written in YAML too; an existing `config.toml` is renamed for you. Extra `folders` get their own worktree when someone else owns the checkout, `rm --force` clears out stuck instances, dispatchers can see which branches are in use, and the dashboard opens instantly and keeps its Inbox across restarts while putting far less load on dockerd.
