@@ -457,6 +457,11 @@ module, in the style of its neighbors. Container paths use
   reject becomes an `error` notify record from that owner.
 - Popups (`desktop.rs`, called from the sink): threads only on the
   needs-you transition; notify records as today.
+- Archive: `devsandbox rm` (`src/commands/rm.rs`) marks the removed
+  instance's threads (notify ones too) `archived` through `store::update`,
+  after the state entry is gone. Retention drops `done`/archived threads
+  14 days after their last change; the per-owner cap evicts archived, then
+  done, then the oldest.
 - Tests: apply idempotence and timeline, every validation rule, the deny path,
   coalescing, and a docker helper test: `thread put` with no host, then
   attach, and exactly one record arrives.
