@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.6.0
 
 The config file is now `devsandboxes.toml`, and it can be written in YAML too; an existing `config.toml` is renamed for you. Extra `folders` get their own worktree when someone else owns the checkout, `rm --force` clears out stuck instances, dispatchers can see which branches are in use, and the dashboard opens instantly and keeps its Inbox across restarts while putting far less load on dockerd.
 

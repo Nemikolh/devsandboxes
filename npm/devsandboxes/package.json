@@ -1,6 +1,6 @@
 {
   "name": "devsandboxes",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Manage devcontainer-style sandboxes on docker, podman, or Apple container, from the CLI or a typed Node API.",
   "license": "MIT",
   "repository": {
@@ -19,9 +19,9 @@
     "node": ">=18"
   },
   "optionalDependencies": {
-    "@devsandboxes/darwin-arm64": "0.5.0",
-    "@devsandboxes/linux-arm64": "0.5.0",
-    "@devsandboxes/linux-x64": "0.5.0",
-    "@devsandboxes/win32-x64": "0.5.0"
+    "@devsandboxes/darwin-arm64": "0.6.0",
+    "@devsandboxes/linux-arm64": "0.6.0",
+    "@devsandboxes/linux-x64": "0.6.0",
+    "@devsandboxes/win32-x64": "0.6.0"
   }
 }
