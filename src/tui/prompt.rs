@@ -31,7 +31,7 @@ pub enum PromptAction {
     Exec { instance: String, argv: Vec<String> },
     Code { instance: String },
     Rename { instance: String, new_name: String },
-    Rm { instance: String },
+    Rm { instance: String, force: bool },
     Stop { instance: String },
     Start { instance: String },
     Rebuild { instance: String, force: bool },
@@ -390,7 +390,10 @@ fn parse_line(line: &str) -> Result<PromptAction, String> {
             Ok(PromptAction::Exec { instance: args.positionals.remove(0), argv: args.trailing })
         }
         "code" => Ok(PromptAction::Code { instance: args.positionals.remove(0) }),
-        "rm" => Ok(PromptAction::Rm { instance: args.positionals.remove(0) }),
+        "rm" => Ok(PromptAction::Rm {
+            instance: args.positionals.remove(0),
+            force: args.flag("--force"),
+        }),
         "rename" => {
             let mut pos = args.positionals.into_iter();
             Ok(PromptAction::Rename {
@@ -650,7 +653,11 @@ mod tests {
     #[test]
     fn parse_code_and_rm() {
         assert_eq!(parse_line("code box"), Ok(PromptAction::Code { instance: "box".into() }));
-        assert_eq!(parse_line("rm box"), Ok(PromptAction::Rm { instance: "box".into() }));
+        assert_eq!(parse_line("rm box"), Ok(PromptAction::Rm { instance: "box".into(), force: false }));
+        assert_eq!(
+            parse_line("rm --force box"),
+            Ok(PromptAction::Rm { instance: "box".into(), force: true })
+        );
         assert!(parse_line("code").is_err());
         assert!(parse_line("code a b").is_err());
         assert!(parse_line("rm").is_err());

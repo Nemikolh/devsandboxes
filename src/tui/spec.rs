@@ -77,8 +77,8 @@ pub const SPECS: &[CommandSpec] = &[
     CommandSpec {
         name: "rm",
         aliases: &[],
-        usage: "rm <instance>",
-        flags: &[],
+        usage: "rm [--force] <instance>",
+        flags: &[FlagSpec { name: "--force", value: None }],
         positionals: &[ArgValue::Instance],
         trailing: false,
     },
@@ -281,7 +281,10 @@ mod tests {
         assert_eq!(parse("rm box").unwrap().positionals, vec!["box".to_string()]);
         assert_eq!(parse("code"), Err("usage: code <instance>".into()));
         assert_eq!(parse("code a b"), Err("unexpected argument `b`".into()));
-        assert_eq!(parse("rm"), Err("usage: rm <instance>".into()));
+        assert_eq!(parse("rm"), Err("usage: rm [--force] <instance>".into()));
+        assert!(!parse("rm box").unwrap().flag("--force"));
+        assert!(parse("rm --force box").unwrap().flag("--force"));
+        assert!(parse("rm box --force").unwrap().flag("--force"));
     }
 
     #[test]
@@ -331,7 +334,7 @@ mod tests {
     #[test]
     fn parse_empty_tokens_wants_usage() {
         let spec = find("rm").unwrap();
-        assert_eq!(parse_args(spec, &[]), Err("usage: rm <instance>".into()));
+        assert_eq!(parse_args(spec, &[]), Err("usage: rm [--force] <instance>".into()));
     }
 
     #[test]

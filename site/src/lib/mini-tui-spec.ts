@@ -45,7 +45,14 @@ export const SPECS: readonly CommandSpec[] = [
   },
   { name: 'exec', aliases: [], usage: 'exec <instance> <cmd…>', flags: [], positionals: ['instance'], trailing: true },
   { name: 'code', aliases: [], usage: 'code <instance>', flags: [], positionals: ['instance'], trailing: false },
-  { name: 'rm', aliases: [], usage: 'rm <instance>', flags: [], positionals: ['instance'], trailing: false },
+  {
+    name: 'rm',
+    aliases: [],
+    usage: 'rm [--force] <instance>',
+    flags: [{ name: '--force' }],
+    positionals: ['instance'],
+    trailing: false,
+  },
   {
     name: 'rename',
     aliases: [],

@@ -526,7 +526,7 @@ fn run_suspended(terminal: &mut Term, dir: &Path, action: PromptAction) -> Resul
         PromptAction::Exec { instance, argv } => {
             commands::exec::exec_status(instance, true, true, argv).map(|_| ())
         }
-        PromptAction::Rm { instance } => commands::rm::rm(instance, None, false),
+        PromptAction::Rm { instance, force } => commands::rm::rm(instance, None, *force),
         PromptAction::Stop { instance } => commands::stop::stop(Some(instance.clone()), false),
         PromptAction::Start { instance } => {
             commands::start::start(dir, Some(instance.clone()), false)
