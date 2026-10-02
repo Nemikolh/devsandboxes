@@ -446,10 +446,12 @@ impl App {
     /// open) owns the mouse: a press/drag on or near the divider column resizes
     /// the split; the scroll wheel scrolls the pane under the cursor. Otherwise,
     /// with terminals open, clicks and the wheel drive the terminal panel
-    /// ([`Self::terminal_mouse`]). I/O-free.
+    /// ([`Self::terminal_mouse`]); on the Inbox tab, the list/thread divider
+    /// drags too ([`Self::inbox_mouse`]). I/O-free.
     pub fn on_mouse(&mut self, ev: &MouseEvent, area: Rect) {
         let Modal::Config(view) = &mut self.modal else {
             self.dragging_divider = false;
+            self.inbox_mouse(ev, area);
             self.terminal_mouse(ev, area);
             return;
         };

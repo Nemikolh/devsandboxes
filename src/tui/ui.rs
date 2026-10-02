@@ -154,7 +154,14 @@ pub fn term_pane_size(frame: Rect, prompt_open: bool) -> Option<(u16, u16)> {
 /// `!app.terms.is_empty()` — so the mouse hit-test and the PTY-size math share
 /// exactly one layout definition. `pub(crate)` for the event loop's mouse routing.
 pub(crate) fn terminal_panel_rect(frame: Rect, prompt_open: bool) -> Rect {
-    // Mirror draw()'s vertical split: tab bar (1), content (Min 0), bottom bar.
+    let (_top, _detail, panel) = open_bottom_split(frame_content_area(frame, prompt_open));
+    panel
+}
+
+/// The content area of a frame of size `frame`, mirroring `draw()`'s vertical
+/// split: tab bar (1), content (Min 0), bottom bar (2 rows with the prompt
+/// open, else 1). Shared by the mouse hit-tests that only know the frame size.
+fn frame_content_area(frame: Rect, prompt_open: bool) -> Rect {
     let bottom = if prompt_open { 2 } else { 1 };
     let [_tab_area, content_area, _bottom_area] = Layout::vertical([
         Constraint::Length(1),
@@ -162,8 +169,7 @@ pub(crate) fn terminal_panel_rect(frame: Rect, prompt_open: bool) -> Rect {
         Constraint::Length(bottom),
     ])
     .areas(frame);
-    let (_top, _detail, panel) = open_bottom_split(content_area);
-    panel
+    content_area
 }
 
 /// Mouse hit-test for the terminal panel's tab strip. Given the panel Rect, the
@@ -537,17 +543,41 @@ fn port_state_style(state: &str) -> Style {
 }
 
 fn draw_inbox(frame: &mut Frame, app: &App, area: Rect) {
-    let (top, detail_area, terms_area) = content_areas(app, area);
-    // The Inbox has no Detail box (the thread pane is its detail): without
-    // terminals the split takes the whole content area; with them, the top,
-    // the terminal panel staying where it is on every tab.
-    let region = if terms_area.is_some() { top } else { top.union(detail_area) };
+    let (_top, _detail, terms_area) = content_areas(app, area);
+    let region = inbox_region(area, terms_area.is_some());
     let (list_area, thread_area) = inbox_areas(region, app.inbox.split_pct);
     draw_inbox_list(frame, app, list_area);
     draw_inbox_pane(frame, app, thread_area);
     if let Some(terms_area) = terms_area {
         draw_terminal_panel(frame, app, terms_area);
     }
+}
+
+/// The part of a tab's content `area` the Inbox's list/thread split fills.
+/// The Inbox has no Detail box (the thread pane is its detail): without
+/// terminals that's the whole content area; with them, the top, the terminal
+/// panel staying where it is on every tab. Derived from [`content_areas`]'s
+/// own splits so it can't drift from them.
+fn inbox_region(area: Rect, terms_open: bool) -> Rect {
+    if terms_open {
+        open_bottom_split(area).0
+    } else {
+        area
+    }
+}
+
+/// The Rect [`inbox_areas`] splits for a frame of size `frame`: what
+/// [`draw_inbox`] lays out, computed from the frame size alone so the
+/// divider's mouse hit-test (in the I/O-free `App`) matches the drawing.
+pub(crate) fn inbox_split_rect(frame: Rect, prompt_open: bool, terms_open: bool) -> Rect {
+    inbox_region(frame_content_area(frame, prompt_open), terms_open)
+}
+
+/// Column of the list/thread divider in `region` at `split_pct`: the thread
+/// pane's left border, right next to the list's right one, so a press within
+/// a cell of it ([`App`]'s `col_near`) grabs either border.
+pub(crate) fn inbox_divider_col(region: Rect, split_pct: u16) -> u16 {
+    inbox_areas(region, split_pct).1.x
 }
 
 /// The Inbox's `(list, thread)` split of `area`, the list taking `split_pct`
@@ -1874,6 +1904,34 @@ mod tests {
         // The default split, on an odd width: the thread pane takes the rest.
         let (list, thread) = inbox_areas(Rect::new(0, 0, 81, 10), crate::tui::app::InboxView::default().split_pct);
         assert_eq!((list.width, thread.width), (32, 49));
+    }
+
+    #[test]
+    fn inbox_split_rect_matches_draw_inbox() {
+        let frame = Rect::new(0, 0, 100, 40);
+        for prompt_open in [false, true] {
+            // Content = frame minus the tab line and the 1-2 row bottom bar.
+            let bottom = if prompt_open { 2 } else { 1 };
+            let content = Rect::new(0, 1, 100, 39 - bottom);
+            // No terminals: the whole content area, as draw_inbox lays it out.
+            let closed = App::new(PathBuf::from("/tmp"));
+            let (top, detail, terms) = content_areas(&closed, content);
+            assert!(terms.is_none());
+            let rect = inbox_split_rect(frame, prompt_open, false);
+            assert_eq!(rect, top.union(detail));
+            assert_eq!(rect, content);
+            // Terminals open: the top only, ending where the panel starts.
+            let open = app_with_terms(vec![TermSession::test_session("web-1", "devsandbox-web-1", 24, 80)]);
+            let (top, _detail, terms) = content_areas(&open, content);
+            let rect = inbox_split_rect(frame, prompt_open, true);
+            assert_eq!(rect, top);
+            assert_eq!(rect.bottom(), terminal_panel_rect(frame, prompt_open).y);
+            assert_eq!(terms, Some(terminal_panel_rect(frame, prompt_open)));
+            // The divider is the thread pane's left edge.
+            let (_list, thread) = inbox_areas(rect, 40);
+            assert_eq!(inbox_divider_col(rect, 40), thread.x);
+            assert_eq!(thread.x, 40);
+        }
     }
 
     #[test]

@@ -30,13 +30,16 @@
 use std::cell::Cell;
 use std::cmp::Reverse;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::Rect;
 
 use crate::devsbd::notify::Level;
 use crate::inbox::{is_url, EntryKind, Inbox, Kind, Op, State, Thread};
 use crate::tui::prompt::Prompt;
 
-use super::{App, Tab};
+use super::view::{col_near, divider_pct, point_in};
+use super::{App, Modal, Tab};
+use crate::tui::ui;
 
 /// Which threads the list shows, stepped with `←`/`→`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -115,6 +118,10 @@ pub struct InboxView {
     /// The list's share of the width, in percent (the thread pane gets the
     /// rest). Not saved.
     pub split_pct: u16,
+    /// True while the list/thread divider is being dragged with the mouse.
+    /// Separate from the config modal's drag flag so a drag in flight on one
+    /// can't carry over to the other when the modal opens or closes.
+    dragging: bool,
     /// Id of the thread the pane shows, i.e. the selected one, as of the last
     /// [`App::sync_inbox_selection`]. The pane's scroll and reply box belong
     /// to it, and it stays listed while shown even once it leaves the view
@@ -142,6 +149,7 @@ impl Default for InboxView {
             view: View::default(),
             focus: InboxFocus::default(),
             split_pct: DEFAULT_SPLIT_PCT,
+            dragging: false,
             shown: None,
             scroll: 0,
             pane_max: Cell::new(0),
@@ -743,6 +751,37 @@ impl App {
     /// Take the pending link for the event loop to open, if any.
     pub fn take_pending_open(&mut self) -> Option<String> {
         self.pending_open.take()
+    }
+
+    /// Drag the list/thread divider on a frame of size `area`: a left press
+    /// on (or a cell off) the divider, within the split's rows, starts a drag
+    /// and every drag event moves it, clamped like the config modal's split;
+    /// release ends it. Only on the Inbox tab with no modal or prompt over it,
+    /// since then the divider is what's under the mouse. The hit-test reuses
+    /// `ui`'s layout functions so it lands where the divider is drawn. Never
+    /// consumes the event: a press elsewhere is the caller's to route.
+    /// I/O-free.
+    pub(super) fn inbox_mouse(&mut self, ev: &MouseEvent, area: Rect) {
+        if self.tab != Tab::Inbox || self.prompt.is_some() || !matches!(self.modal, Modal::None) {
+            self.inbox.dragging = false;
+            return;
+        }
+        let rect = ui::inbox_split_rect(area, false, !self.terms.is_empty());
+        let divider = ui::inbox_divider_col(rect, self.inbox.split_pct);
+        let pct = divider_pct(ev.column.saturating_sub(rect.x), rect.width);
+        match ev.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if point_in(rect, ev.column, ev.row) && col_near(ev.column, divider) {
+                    self.inbox.dragging = true;
+                    self.inbox.split_pct = pct;
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.inbox.dragging => {
+                self.inbox.split_pct = pct;
+            }
+            MouseEventKind::Up(MouseButton::Left) => self.inbox.dragging = false,
+            _ => {}
+        }
     }
 }
 
@@ -1595,6 +1634,80 @@ mod tests {
         assert_eq!(app.selected(), 0, "top of the new view, not row 1");
         assert_eq!(selected(&app).as_deref(), Some("busy"));
         assert_eq!(app.inbox.list_offset(), 0, "offset reset");
+    }
+
+    // FRAME (100x40, no prompt): content rows 1..=38; without terminals the
+    // split fills them all, the 40% divider (thread pane's left border) at 40.
+    const ROW: u16 = 10;
+
+    #[test]
+    fn inbox_mouse_drag_resizes_divider() {
+        let mut app = new_app();
+        inbox_tab(&mut app);
+        assert_eq!(app.inbox.split_pct, 40);
+        // A cell off the divider still grabs it.
+        app.on_mouse(&mouse_at(MouseEventKind::Down(MouseButton::Left), 39, ROW), FRAME);
+        assert!(app.inbox.dragging);
+        app.on_mouse(&mouse_at(MouseEventKind::Drag(MouseButton::Left), 30, ROW), FRAME);
+        assert_eq!(app.inbox.split_pct, 30);
+        // Clamped like the config modal's split, both ways.
+        app.on_mouse(&mouse_at(MouseEventKind::Drag(MouseButton::Left), 2, ROW), FRAME);
+        assert_eq!(app.inbox.split_pct, 20);
+        app.on_mouse(&mouse_at(MouseEventKind::Drag(MouseButton::Left), 99, ROW), FRAME);
+        assert_eq!(app.inbox.split_pct, 80);
+        // Release; a later drag with no press does nothing.
+        app.on_mouse(&mouse_at(MouseEventKind::Up(MouseButton::Left), 99, ROW), FRAME);
+        assert!(!app.inbox.dragging);
+        app.on_mouse(&mouse_at(MouseEventKind::Drag(MouseButton::Left), 50, ROW), FRAME);
+        assert_eq!(app.inbox.split_pct, 80);
+    }
+
+    #[test]
+    fn inbox_mouse_press_off_the_divider_ignored() {
+        let mut app = new_app();
+        inbox_tab(&mut app);
+        // Too far left, and on the divider's column but in the tab line or
+        // the help bar (outside the split's rows).
+        for (col, row) in [(37, ROW), (40, 0), (40, 39)] {
+            app.on_mouse(&mouse_at(MouseEventKind::Down(MouseButton::Left), col, row), FRAME);
+            app.on_mouse(&mouse_at(MouseEventKind::Drag(MouseButton::Left), 60, row), FRAME);
+            assert_eq!(app.inbox.split_pct, 40, "press at ({col}, {row})");
+        }
+    }
+
+    #[test]
+    fn inbox_mouse_only_on_the_inbox_tab_unobstructed() {
+        let mut app = new_app();
+        // Another tab: the same press does nothing.
+        app.on_mouse(&mouse_at(MouseEventKind::Down(MouseButton::Left), 40, ROW), FRAME);
+        app.on_mouse(&mouse_at(MouseEventKind::Drag(MouseButton::Left), 60, ROW), FRAME);
+        assert_eq!(app.inbox.split_pct, 40);
+        // Nor with the prompt over the Inbox.
+        inbox_tab(&mut app);
+        app.on_key(key(KeyCode::Char(':')));
+        assert!(app.prompt.is_some());
+        app.on_mouse(&mouse_at(MouseEventKind::Down(MouseButton::Left), 40, ROW), FRAME);
+        app.on_mouse(&mouse_at(MouseEventKind::Drag(MouseButton::Left), 60, ROW), FRAME);
+        assert_eq!(app.inbox.split_pct, 40);
+    }
+
+    #[test]
+    fn inbox_mouse_with_terminals_stays_above_the_panel() {
+        let mut app = new_app();
+        inbox_tab(&mut app);
+        open_test_term(&mut app, "web-1", "devsandbox-web-1");
+        let panel = crate::tui::ui::terminal_panel_rect(FRAME, false);
+        // In the terminal panel's rows: not the divider; the click focuses
+        // the terminal as before.
+        app.focus = super::super::Focus::Dashboard;
+        app.on_mouse(&mouse_at(MouseEventKind::Down(MouseButton::Left), 40, panel.y + 1), FRAME);
+        app.on_mouse(&mouse_at(MouseEventKind::Drag(MouseButton::Left), 60, panel.y + 1), FRAME);
+        assert_eq!(app.inbox.split_pct, 40);
+        assert_eq!(app.focus, super::super::Focus::Terminal);
+        // Above it: drags.
+        app.on_mouse(&mouse_at(MouseEventKind::Down(MouseButton::Left), 40, panel.y - 1), FRAME);
+        app.on_mouse(&mouse_at(MouseEventKind::Drag(MouseButton::Left), 60, panel.y - 1), FRAME);
+        assert_eq!(app.inbox.split_pct, 60);
     }
 
     #[test]
