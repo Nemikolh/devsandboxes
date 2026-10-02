@@ -730,11 +730,19 @@ mod tests {
         let listener = std::net::TcpListener::bind("[::1]:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         assert!(dial("127.0.0.1", port).is_ok());
-        // Nothing listening on either family: the note names the requested
-        // address, not the fallback.
         drop(listener);
-        let err = dial("127.0.0.1", port).err().expect("no listener left");
-        assert_eq!(err, format!("connection refused (127.0.0.1:{port})"));
+        // Nothing listening on either family: the note names the requested
+        // address, not the fallback. A freed ephemeral port can be taken at
+        // once by another test binding in parallel, so a dial that connects
+        // means "port reused", not a failure: retry on a fresh one.
+        for _ in 0..20 {
+            let port = std::net::TcpListener::bind("[::1]:0").unwrap().local_addr().unwrap().port();
+            if let Err(err) = dial("127.0.0.1", port) {
+                assert_eq!(err, format!("connection refused (127.0.0.1:{port})"));
+                return;
+            }
+        }
+        panic!("every freed port was reused before it could be dialed");
     }
 
     #[test]
