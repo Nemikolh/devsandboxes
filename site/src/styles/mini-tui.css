@@ -246,7 +246,7 @@
 }
 
 .tui-tr--inbox {
-  grid-template-columns: 6ch 5ch 9ch minmax(0, 1fr);
+  grid-template-columns: 9ch 5ch 9ch minmax(0, 1fr);
 }
 
 .tui-th {

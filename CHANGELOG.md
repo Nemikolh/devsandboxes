@@ -12,6 +12,8 @@
 
 ### Changed
 
+- **Inbox times say how long ago a notification came in.** The TIME column reads `just now`, `12s ago`, `5 min ago`, `3h ago`, `1 day ago`, … `6 days ago`, then the date and time (`Oct 2 14:32`) once a notification is a week old. Before, it showed only the time of day, so yesterday's notifications looked like today's. The Detail pane shows the date and time.
+
 - **`folders` entries get their own git worktree when the checkout belongs to someone else.** If an extra folder is a git repo and it's another sandbox's `folder`, or another instance already mounts it, the instance now gets a worktree of it, detached at that checkout's `HEAD`. Before, the instance mounted the live checkout, so the owner switching branches changed what the instance saw. The worktree is kept across `rebuild` and removed by `rm`. Dispatcher children always get one. To keep the old live view for an entry, write it as a table with `worktree = "never"`, or use `"always"` to force a worktree:
 
 ```toml

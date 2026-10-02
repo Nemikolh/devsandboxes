@@ -10,7 +10,8 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, 
 use tui_term::widget::{Cursor, PseudoTerminal};
 
 use super::app::{
-    clock, App, ConfigView, Focus, InboxRow, Modal, Pane, PortRow, Side, Tab, TextModal, Thread,
+    stamp, when, App, ConfigView, Focus, InboxRow, Modal, Pane, PortRow, Side, Tab, TextModal,
+    Thread,
 };
 use super::data::{
     humanize_secs, sandbox_stats, totals_line, ContainerStatus, InstanceRow, Node, SandboxRow,
@@ -554,7 +555,8 @@ fn draw_inbox(frame: &mut Frame, app: &App, area: Rect) {
         // instance), it keeps its own column.
         let grouped = app.inbox.grouped();
         let mut titles = vec!["TIME", "LEVEL"];
-        let mut widths = vec![Constraint::Length(5), Constraint::Length(5)];
+        // TIME: a week-old date ("Oct 12 14:32") is the widest value (see `when`).
+        let mut widths = vec![Constraint::Length(12), Constraint::Length(5)];
         if !grouped {
             titles.push("INSTANCE");
             widths.push(Constraint::Length(20));
@@ -563,11 +565,15 @@ fn draw_inbox(frame: &mut Frame, app: &App, area: Rect) {
         widths.push(Constraint::Min(20));
         let header = Row::new(titles.into_iter().map(Cell::from))
             .style(Style::default().add_modifier(Modifier::DIM));
+        // Wall clock read per frame, so relative times tick between snapshots.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
         let rows: Vec<Row> = app
             .inbox
             .rows()
             .iter()
-            .map(|r| inbox_row(app, r, grouped))
+            .map(|r| inbox_row(app, r, grouped, now))
             .collect();
         let table = Table::new(rows, widths)
             .header(header)
@@ -595,13 +601,13 @@ fn level_style(level: Level) -> Style {
 /// badge. A thread head: the message's first line, a ▸/▾ marker and `(+N)`
 /// when it has history, `↗` when there's a link, bold while unread. History:
 /// indented under its head, dim.
-fn inbox_row<'a>(app: &App, row: &InboxRow, grouped: bool) -> Row<'a> {
+fn inbox_row<'a>(app: &App, row: &InboxRow, grouped: bool, now: u64) -> Row<'a> {
     let dim = Style::default().add_modifier(Modifier::DIM);
     let inbox = &app.inbox;
     let thread_cells = |t: &Thread, note: usize, msg: Vec<Span<'static>>| {
         let r = &t.notes[note].record;
         let mut cells = vec![
-            Cell::from(Span::styled(clock(r.at, app.utc_offset), dim)),
+            Cell::from(Span::styled(when(r.at, now, app.utc_offset), dim)),
             Cell::from(Span::styled(r.level.as_str(), level_style(r.level))),
         ];
         if !grouped {
@@ -625,7 +631,7 @@ fn inbox_row<'a>(app: &App, row: &InboxRow, grouped: bool) -> Row<'a> {
                 msg.push(Span::styled(format!(" ✉{unread}"), Style::default().fg(Color::Yellow)));
             }
             Row::new(vec![
-                Cell::from(Span::styled(newest.map_or(String::new(), |t| clock(t.head().at, app.utc_offset)), dim)),
+                Cell::from(Span::styled(newest.map_or(String::new(), |t| when(t.head().at, now, app.utc_offset)), dim)),
                 Cell::from(""),
                 Cell::from(Line::from(msg)),
             ])
@@ -683,7 +689,7 @@ fn draw_inbox_detail(frame: &mut Frame, app: &App, area: Rect, term_focused: boo
         }
         (Some(row), Some((t, r))) => {
             let mut lines = vec![Line::from(vec![
-                Span::styled(clock(r.at, app.utc_offset), dim),
+                Span::styled(stamp(r.at, app.utc_offset), dim),
                 Span::raw("  "),
                 Span::styled(r.level.as_str(), level_style(r.level)),
                 Span::raw("  "),

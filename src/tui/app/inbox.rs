@@ -525,10 +525,46 @@ impl App {
     }
 }
 
-/// `HH:MM` of unix time `at`, shifted by `utc_offset` seconds.
-pub fn clock(at: u64, utc_offset: i64) -> String {
-    let secs = (at as i64 + utc_offset).rem_euclid(86_400);
-    format!("{:02}:{:02}", secs / 3600, secs % 3600 / 60)
+/// Past this age the Inbox switches from "N days ago" to a date.
+const RELATIVE_FOR: u64 = 7 * 86_400;
+
+/// The Inbox TIME column: how long before `now` unix time `at` was ("just
+/// now", "12s ago", "5 min ago", "3h ago", "6 days ago"), then [`stamp`] once it's a week
+/// old. A timestamp ahead of `now` (container clock skew) reads "just now".
+pub fn when(at: u64, now: u64, utc_offset: i64) -> String {
+    let age = now.saturating_sub(at);
+    match age {
+        0 => "just now".into(),
+        a if a < 60 => format!("{a}s ago"),
+        a if a < 3600 => format!("{} min ago", a / 60),
+        a if a < 86_400 => format!("{}h ago", a / 3600),
+        a if a < 2 * 86_400 => "1 day ago".into(),
+        a if a < RELATIVE_FOR => format!("{} days ago", a / 86_400),
+        _ => stamp(at, utc_offset),
+    }
+}
+
+/// `Oct 2 14:32` of unix time `at`, shifted by `utc_offset` seconds (no year:
+/// the Inbox only holds recent notifications).
+pub fn stamp(at: u64, utc_offset: i64) -> String {
+    const MONTHS: [&str; 12] =
+        ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let local = at as i64 + utc_offset;
+    let (days, secs) = (local.div_euclid(86_400), local.rem_euclid(86_400));
+    let (month, day) = month_day(days);
+    format!("{} {day} {:02}:{:02}", MONTHS[month as usize - 1], secs / 3600, secs % 3600 / 60)
+}
+
+/// (month 1-12, day 1-31) of `days` since 1970-01-01 in the proleptic
+/// Gregorian calendar (Howard Hinnant's `civil_from_days`; std has no dates).
+fn month_day(days: i64) -> (i64, i64) {
+    let z = days + 719_468;
+    let doe = z - z.div_euclid(146_097) * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    (if mp < 10 { mp + 3 } else { mp - 9 }, day)
 }
 
 /// Parse `date +%z` output (`+0200`, `-0530`) into seconds east of UTC.
@@ -918,11 +954,32 @@ mod tests {
     }
 
     #[test]
-    fn clock_and_offset() {
-        assert_eq!(clock(0, 0), "00:00");
-        assert_eq!(clock(13 * 3600 + 7 * 60 + 59, 0), "13:07");
-        assert_eq!(clock(23 * 3600, 2 * 3600), "01:00");
-        assert_eq!(clock(3600, -2 * 3600), "23:00");
+    fn relative_time_then_date() {
+        let now = 1_000_000_000;
+        assert_eq!(when(now, now, 0), "just now");
+        assert_eq!(when(now + 5, now, 0), "just now", "skewed clock");
+        assert_eq!(when(now - 1, now, 0), "1s ago");
+        assert_eq!(when(now - 59, now, 0), "59s ago");
+        assert_eq!(when(now - 60, now, 0), "1 min ago");
+        assert_eq!(when(now - 3599, now, 0), "59 min ago");
+        assert_eq!(when(now - 2 * 3600, now, 0), "2h ago");
+        assert_eq!(when(now - 86_400, now, 0), "1 day ago");
+        assert_eq!(when(now - 2 * 86_400, now, 0), "2 days ago");
+        assert_eq!(when(now - (7 * 86_400 - 1), now, 0), "6 days ago");
+        // 1_000_000_000 is 2001-09-09 01:46:40 UTC.
+        assert_eq!(when(now - 7 * 86_400, now, 0), "Sep 2 01:46");
+    }
+
+    #[test]
+    fn stamp_and_offset() {
+        assert_eq!(stamp(0, 0), "Jan 1 00:00");
+        assert_eq!(stamp(13 * 3600 + 7 * 60 + 59, 0), "Jan 1 13:07");
+        assert_eq!(stamp(23 * 3600, 2 * 3600), "Jan 2 01:00");
+        assert_eq!(stamp(3600, -2 * 3600), "Dec 31 23:00");
+        // Leap day, and the day after (2024-02-29 / 03-01, noon UTC).
+        assert_eq!(stamp(1_709_208_000, 0), "Feb 29 12:00");
+        assert_eq!(stamp(1_709_294_400, 0), "Mar 1 12:00");
+        assert_eq!(stamp(1_000_000_000, 0), "Sep 9 01:46");
         assert_eq!(parse_utc_offset("+0200\n"), Some(7200));
         assert_eq!(parse_utc_offset("-0530"), Some(-(5 * 3600 + 30 * 60)));
         assert_eq!(parse_utc_offset("CEST"), None);

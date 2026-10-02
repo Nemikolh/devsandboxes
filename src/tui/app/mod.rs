@@ -23,7 +23,7 @@ mod test_support;
 mod tree;
 mod view;
 
-pub use inbox::{clock, parse_utc_offset, Inbox, InboxRow, Thread};
+pub use inbox::{parse_utc_offset, stamp, when, Inbox, InboxRow, Thread};
 pub use procs::{PendingSignal, Signal};
 pub use view::{ConfigView, Modal, Pane, Side, TextModal};
 use view::{col_near, divider_pct};
