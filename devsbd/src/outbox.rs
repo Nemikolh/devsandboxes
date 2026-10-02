@@ -37,7 +37,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
     Ok(())
 }
 
-const THREAD_USAGE: &str = "usage: devsbd thread put [--json '<json>']   (reads stdin without --json)\n       devsbd thread rm <key>";
+const THREAD_USAGE: &str = "usage: devsbd thread put [--json '<json>']   (reads stdin without --json)\n       devsbd thread rm <key>\n       devsbd thread ls";
 
 /// What `devsbd thread <verb>` was asked to do. `Put`'s payload is `None`
 /// until stdin has been read, which [`thread`] does outside the parser.

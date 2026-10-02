@@ -1,6 +1,7 @@
-//! `devsbd ensure|ls|branches|stop|rm|exec` and `devsbd run ls|logs|wait|rm|prune <key> …`: a
-//! dispatcher's control commands (docs/automations.md, "Control API",
-//! "Runs"). Each request is one encoded [`control::Request`] sent to the
+//! `devsbd ensure|ls|branches|stop|rm|exec`, `devsbd run ls|logs|wait|rm|prune <key> …`,
+//! `devsbd events [--wait SECS]`, `devsbd events ack <id>...` and `devsbd
+//! thread ls`: a dispatcher's control commands (docs/automations.md, "Control
+//! API", "Runs"; docs/inbox-threads.md, *Events*). Each request is one encoded [`control::Request`] sent to the
 //! daemon over `daemon::API_SOCK`, which relays it to a host serving
 //! `CONTROL` (or answers `NoHost` itself); the command exits with the
 //! response's [`control::Status::exit_code`]. `exec` without `--detach`,
@@ -26,7 +27,10 @@ const USAGE: &str = "usage: devsbd ensure <sandbox> --key <key> [--branch B] [--
        devsbd run logs <key> <id> [--sandbox S] [--follow]\n\
        devsbd run wait <key> <id> [--sandbox S] [--timeout SECS]\n\
        devsbd run rm <key> <id> [--sandbox S] [--force]\n\
-       devsbd run prune <key> [--sandbox S] [--keep N]";
+       devsbd run prune <key> [--sandbox S] [--keep N]\n\
+       devsbd events [--wait SECS]\n\
+       devsbd events ack <id>...\n\
+       devsbd thread ls";
 
 /// `devsbd run <sub>` forms that name a child (`run_remote`); each is the
 /// [`Op`] `run-<sub>`.
@@ -40,12 +44,13 @@ const FOLLOW_WAIT: u64 = 5;
 const WAIT_STEP: u64 = 60;
 
 /// Run control verb `verb` with its argv (after the verb); returns the exit
-/// code. `verb` is an [`Op`] name: `run ls` arrives as `run-ls`.
+/// code. `verb` is an [`Op`] name: `run ls` arrives as `run-ls`, `events ack`
+/// as `events-ack`, `thread ls` as `thread-ls`.
 pub fn run(verb: &str, args: &[String]) -> i32 {
     let cmd = match parse_args(verb, args) {
         Ok(cmd) => cmd,
         Err(e) => {
-            let shown = verb.replacen("run-", "run ", 1);
+            let shown = verb.replacen('-', " ", 1);
             eprintln!("devsbd {shown}: {e}\n{USAGE}");
             return control::EXIT_USAGE;
         }
@@ -117,7 +122,8 @@ fn parse_args(verb: &str, args: &[String]) -> Result<Cmd, String> {
         let allowed = match (op, flag) {
             (Op::Ensure, "--key" | "--branch" | "--env") => true,
             (Op::Branches, "--ahead") => true,
-            (Op::Ls | Op::Ensure | Op::Branches, _) => false,
+            (Op::Events, "--wait") => true,
+            (Op::Ls | Op::Ensure | Op::Branches | Op::Events | Op::EventsAck | Op::ThreadLs, _) => false,
             (_, "--sandbox") => true,
             (Op::Exec, "--detach" | "--") => true,
             (Op::RunLogs, "--follow") => true,
@@ -152,6 +158,13 @@ fn parse_args(verb: &str, args: &[String]) -> Result<Cmd, String> {
                 let secs = v.parse().map_err(|_| format!("--timeout: bad number `{v}`"))?;
                 set_once(&mut cmd.deadline, secs, flag)?;
             }
+            // Capped like the host does, so a long `--wait` still waits
+            // (the most the host would) instead of failing.
+            "--wait" => {
+                let v = value()?;
+                let secs: u64 = v.parse().map_err(|_| format!("--wait: bad number `{v}`"))?;
+                set_once(&mut req.timeout, secs.min(control::MAX_WAIT), flag)?;
+            }
             "--key" => set_once(&mut req.key, value()?, flag)?,
             "--branch" => {
                 let b = value()?;
@@ -165,8 +178,18 @@ fn parse_args(verb: &str, args: &[String]) -> Result<Cmd, String> {
             _ => positional.push(arg.clone()),
         }
     }
+    if op == Op::EventsAck {
+        if positional.is_empty() {
+            return Err("takes one or more <id>".into());
+        }
+        if let Some(bad) = positional.iter().find(|id| !control::valid_event_id(id)) {
+            return Err(format!("bad event id `{bad}`"));
+        }
+        req.ack = positional;
+        return Ok(cmd);
+    }
     let (wanted, what) = match op {
-        Op::Ls => (0, "no arguments"),
+        Op::Ls | Op::Events | Op::ThreadLs | Op::EventsAck => (0, "no arguments"),
         Op::Ensure | Op::Branches => (1, "exactly one <sandbox>"),
         Op::Stop | Op::Rm | Op::Exec | Op::RunLs | Op::RunPrune => (1, "exactly one <key>"),
         Op::RunLogs | Op::RunWait | Op::RunRm => (2, "<key> <id>"),
@@ -183,7 +206,7 @@ fn parse_args(verb: &str, args: &[String]) -> Result<Cmd, String> {
             }
         }
         Op::Branches => req.sandbox = positional.next(),
-        Op::Ls => {}
+        Op::Ls | Op::Events | Op::EventsAck | Op::ThreadLs => {}
         _ => req.key = positional.next(),
     }
     if let Some(id) = positional.next() {
@@ -469,6 +492,51 @@ mod tests {
             let verb = format!("run-{}", args[0]);
             assert!(parse_args(&verb, &args[1..]).is_ok(), "{remote:?}");
         }
+    }
+
+    #[test]
+    fn parses_event_verbs() {
+        let e1 = "e-1790900001-3f2a";
+        let e2 = "e-1790900042-77c1";
+        assert_eq!(parse("events", &[]).unwrap(), Request::new(Op::Events));
+        assert_eq!(parse("events", &["--wait", "30"]).unwrap().timeout, Some(30));
+        assert_eq!(parse("events", &["--wait=0"]).unwrap().timeout, Some(0));
+        assert_eq!(parse("events", &["--wait", "9999"]).unwrap().timeout, Some(control::MAX_WAIT), "capped");
+        let ack = parse("events-ack", &[e1, e2]).unwrap();
+        assert_eq!(ack, Request { ack: vec![e1.into(), e2.into()], ..Request::new(Op::EventsAck) });
+        assert_eq!(control::decode_request(&control::encode_request(&ack)), Ok(ack));
+        assert_eq!(parse("thread-ls", &[]).unwrap(), Request::new(Op::ThreadLs));
+
+        assert!(parse("events", &["--wait", "x"]).unwrap_err().contains("bad number"));
+        assert_eq!(parse("events", &["--wait"]).unwrap_err(), "--wait needs a value");
+        assert_eq!(parse("events", &["--wait", "1", "--wait", "2"]).unwrap_err(), "--wait given twice");
+        assert_eq!(parse("events", &["x"]).unwrap_err(), "takes no arguments");
+        assert_eq!(parse("events", &["--sandbox", "x"]).unwrap_err(), "unknown option `--sandbox`");
+        assert_eq!(parse("events-ack", &[]).unwrap_err(), "takes one or more <id>");
+        assert_eq!(parse("events-ack", &[e1, "nope"]).unwrap_err(), "bad event id `nope`");
+        assert_eq!(parse("events-ack", &[e1, "--wait", "1"]).unwrap_err(), "unknown option `--wait`");
+        assert_eq!(parse("thread-ls", &["k"]).unwrap_err(), "takes no arguments");
+        assert_eq!(parse("thread-ls", &["--key", "k"]).unwrap_err(), "unknown option `--key`");
+    }
+
+    /// `events` prints the body as is (one JSON line per event), nothing
+    /// when empty; a missing host is exit 75 like every control op.
+    #[test]
+    fn events_print_the_body() {
+        let lines = "{\"id\":\"e-1\"}\n{\"id\":\"e-2\"}";
+        let mut send = |r: &Request| {
+            assert_eq!(r.op, Op::Events);
+            Response::new(Status::Ok, lines)
+        };
+        let mut out = Vec::new();
+        let cmd = parse_cmd("events", &[]).unwrap();
+        assert_eq!(execute(&cmd, &mut send, &mut out, 1), Ok(0));
+        assert_eq!(String::from_utf8(out).unwrap(), format!("{lines}\n"));
+        let mut out = Vec::new();
+        assert_eq!(execute(&cmd, &mut |_: &Request| Response::new(Status::Ok, ""), &mut out, 1), Ok(0));
+        assert!(out.is_empty());
+        let resp = request("/nonexistent/devsbd-api.sock", &Request::new(Op::Events));
+        assert_eq!(resp.status.exit_code(), control::EXIT_NO_HOST);
     }
 
     #[test]

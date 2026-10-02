@@ -38,8 +38,11 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     draw_tabs(frame, app, tab_area);
     draw_content(frame, app, content_area);
+    let reply = app.inbox.reply.as_ref().filter(|_| app.tab == Tab::Inbox && app.inbox.is_open());
     if let Some(prompt) = &app.prompt {
         draw_prompt(frame, prompt, bottom_area);
+    } else if let Some(reply) = reply {
+        draw_reply(frame, reply, bottom_area);
     } else {
         draw_help(frame, app, bottom_area);
     }
@@ -1400,10 +1403,10 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
                 "q quit · tab switch · ↑↓ select · d stop forward · : port … · ? help".to_string()
             }
             Tab::Inbox if app.inbox.is_open() => {
-                "esc close · ↑↓ scroll · enter open link · 1-9 actions · o vscode · t term · l logs · p forward · q quit · ? help".to_string()
+                "esc close · ↑↓ scroll · enter open link · 1-9 actions · r reply · d done · u reopen · o vscode · t term · l logs · p forward · q quit · ? help".to_string()
             }
             Tab::Inbox => {
-                "q quit · tab switch · ↑↓ select · enter open · v view · d dismiss · D clear notify · ? help"
+                "q quit · tab switch · ↑↓ select · enter open · v view · d dismiss/done · D clear notify · ? help"
                     .to_string()
             }
         },
@@ -1446,6 +1449,24 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt, area: Rect) {
         prompt_candidates_line(prompt)
     };
     frame.render_widget(Paragraph::new(hint), hint_area);
+}
+
+/// Render the thread pane's reply box in the bottom bar: `reply › <input>`,
+/// the thread's placeholder dim while the line is empty, caret placed like
+/// the prompt's. One line, so opening it doesn't resize anything above.
+fn draw_reply(frame: &mut Frame, reply: &super::app::ReplyBox, area: Rect) {
+    let prefix = "reply › ";
+    let input = reply.line.input();
+    let mut spans = vec![Span::styled(prefix, Style::default().fg(ACCENT))];
+    if input.is_empty() {
+        let hint = reply.placeholder.as_deref().unwrap_or("enter sends · esc cancels");
+        spans.push(Span::styled(hint.to_string(), Style::default().add_modifier(Modifier::DIM)));
+    } else {
+        spans.push(Span::raw(input.to_string()));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    let col = area.x + prefix.chars().count() as u16 + reply.line.cursor() as u16;
+    frame.set_cursor_position((col.min(area.right().saturating_sub(1)), area.y));
 }
 
 /// Completion-candidate hint: candidates space-joined, the active one bold cyan.

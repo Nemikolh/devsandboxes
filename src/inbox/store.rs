@@ -183,10 +183,10 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(1100));
         // A no-op closure, and an op that matches nothing.
         update_at(&path, |_| {}).unwrap();
-        update_at(&path, |i| i.apply(&Op::RemoveThread(9999))).unwrap();
+        update_at(&path, |i| i.apply(&Op::RemoveThread(9999), 0)).unwrap();
         assert_eq!(stamp_at(&path).unwrap(), before, "no write, no mtime bump");
         let out = update_at(&path, |i| {
-            i.apply(&Op::MarkNotifyRead);
+            i.apply(&Op::MarkNotifyRead, 0);
             42
         })
         .unwrap();

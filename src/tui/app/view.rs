@@ -42,14 +42,16 @@ Inbox tab (dispatcher threads + devsbd notify records)
               (Needs you: threads asking for you + unread notify records;
                leaving the tab marks the notify records it showed read)
   enter       open the thread pane (marks it read)
-  d           dismiss a notify record (marking a thread done comes later)
+  d           dismiss a notify record; on a dispatcher thread, mark it done
   D           clear all notify records (dispatcher threads stay)
 
 Inbox thread pane (shadows the dashboard keys while open)
   ↑/k ↓/j     scroll    pgup/pgdn  page   g / G  top / bottom
   enter       open the thread's link
-  1-9         run an action: host verbs run now; greyed ones (and the
-              dispatcher part of a host action) need events, not yet
+  1-9         run an action: host verbs run now; the rest (→ owner) is
+              an event the dispatcher pulls with `devsbd events`
+  r           reply (when the thread takes replies): enter sends, esc cancels
+  d / u       mark done / reopen (each also an event for the dispatcher)
   o t l p     VS Code / terminal / logs / forward prompt on the thread's
               child (or its sender when it has none)
   esc         close     q quit   : prompt   ? help

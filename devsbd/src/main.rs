@@ -49,7 +49,22 @@ fn main() {
         Some("bridge") => exit_on_err(bridge::run(&build_hash())),
         Some("boot") => exit_on_err(boot::run()),
         Some("notify") => exit_on_err(outbox::run(&args.collect::<Vec<_>>())),
-        Some("thread") => exit_on_err(outbox::thread(&args.collect::<Vec<_>>())),
+        // `put`/`rm` queue in the outbox (no host needed); `ls` asks the host.
+        Some("thread") => {
+            let args = args.collect::<Vec<_>>();
+            match args.split_first() {
+                Some((ls, rest)) if ls == "ls" => std::process::exit(ctl::run("thread-ls", rest)),
+                _ => exit_on_err(outbox::thread(&args)),
+            }
+        }
+        Some("events") => {
+            let args = args.collect::<Vec<_>>();
+            let code = match args.split_first() {
+                Some((ack, rest)) if ack == "ack" => ctl::run("events-ack", rest),
+                _ => ctl::run("events", &args),
+            };
+            std::process::exit(code)
+        }
         Some(verb @ ("ensure" | "ls" | "branches" | "stop" | "rm" | "exec")) => {
             std::process::exit(ctl::run(verb, &args.collect::<Vec<_>>()))
         }
@@ -60,7 +75,7 @@ fn main() {
         }
         _ => {
             eprintln!(
-                "usage: devsbd version|daemon|bridge|boot|notify|thread|ensure|ls|branches|stop|rm|exec|run"
+                "usage: devsbd version|daemon|bridge|boot|notify|thread|events|ensure|ls|branches|stop|rm|exec|run"
             );
             std::process::exit(2);
         }

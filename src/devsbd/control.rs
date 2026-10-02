@@ -1,4 +1,4 @@
-//! Control requests and responses: what `devsbd ensure|ls|stop|rm|exec|run|branches`
+//! Control requests and responses: what `devsbd ensure|ls|stop|rm|exec|run|branches|events|thread ls`
 //! sends from a dispatcher's container to the host, and what comes back
 //! (docs/automations.md, "Dispatchers"). One file shared by both crates
 //! (devsbd includes it via `#[path]`) so both ends can't drift; std-only and
@@ -8,7 +8,8 @@
 //! escaped as in `escape.rs` (`\\`, `\n`, `\0`). Request:
 //!
 //! ```text
-//! op ensure             required, once: ensure|ls|stop|rm|exec|run-ls|run-logs|run-wait|run-rm|run-prune|branches
+//! op ensure             required, once: ensure|ls|stop|rm|exec|run-ls|run-logs|run-wait|run-rm|run-prune|branches|
+//!                       events|events-ack|thread-ls
 //! sandbox web           optional, at most once
 //! key pr-123            optional, at most once
 //! branch feat/x         optional, at most once
@@ -16,10 +17,11 @@
 //! arg zidane            optional, repeatable: `exec`'s command, one line per argv word
 //! id 1790000000-a1b2    optional, at most once: a run id (see `valid_run_id`)
 //! offset 1024           optional, at most once: decimal byte offset into a run's log
-//! timeout 5             optional, at most once: decimal seconds
+//! timeout 5             optional, at most once: decimal seconds (run-wait, events)
 //! force                 optional, at most once, no value: a flag (`run-rm --force`)
 //! keep 5                optional, at most once: decimal count of runs to keep
 //! ahead                 optional, at most once, no value: a flag (`branches --ahead`)
+//! ack e-1790900001-3f2a optional, repeatable: an event id to ack (see `valid_event_id`)
 //! ```
 //!
 //! Which fields an op needs is the host handler's call (`commands::dispatch`),
@@ -30,8 +32,24 @@
 //! body web-pr-123       required, once: instance name (ensure), JSON (ls, branches),
 //!                       run id (exec), `devsbd run ls|wait` output (run-ls,
 //!                       run-wait, run-prune), `<next offset>\n<log text>` (run-logs),
-//!                       else a short message; may be empty
+//!                       JSON lines (events), a count (events-ack), a JSON array
+//!                       (thread-ls), else a short message; may be empty
 //! ```
+//!
+//! `events` answers the requester's pending Inbox events, oldest first, one
+//! JSON object per line, all of them until acked (delivery is at least once):
+//!
+//! ```text
+//! {"id":"e-1790900001-3f2a","key":"pr-6900","kind":"action","action":"post","at":"2026-10-02T12:00:01Z"}
+//! {"id":"e-1790900042-77c1","key":"pr-6900","kind":"reply","text":"…","at":"2026-10-02T12:00:42Z"}
+//! ```
+//!
+//! `kind` is action|reply|done|reopen; `action` (the button's id: an
+//! `action`, or a `done` from a `done: true` button) and `text` (a `reply`)
+//! are left out when absent; `at` is RFC 3339 UTC. With a `timeout`, an empty
+//! queue is waited on up to that many seconds (at most [`MAX_WAIT`]); the
+//! body stays empty if nothing arrives. `thread-ls` answers the requester's
+//! live threads in `thread put` shape.
 //!
 //! Unknown keys, repeats of a non-repeatable key, a missing required key, or
 //! a bad escape are decode errors.
@@ -54,6 +72,12 @@ pub const MAX_REQUEST: usize = 64 * 1024;
 /// Longest encoded response the daemon and CLI accept (`ls` JSON is the big one).
 pub const MAX_RESPONSE: usize = 1024 * 1024;
 
+/// Cap on a long-polling request's `timeout` (`run-wait`, `events`), seconds:
+/// each wait holds a bridge handler thread; clients loop instead (`devsbd run
+/// wait`), and the daemon gives up on a reply after 30 minutes anyway. Here so
+/// the helper caps `events --wait` with the host's own number.
+pub const MAX_WAIT: u64 = 300;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
     Ensure,
@@ -74,10 +98,16 @@ pub enum Op {
     RunPrune,
     /// Branches checked out in a sandbox's base repo, and who holds them.
     Branches,
+    /// The requester's pending Inbox events (optionally waiting `timeout`).
+    Events,
+    /// Drop the `ack`ed events; body = how many.
+    EventsAck,
+    /// The requester's live Inbox threads, in put shape.
+    ThreadLs,
 }
 
 impl Op {
-    pub const ALL: [Op; 11] = [
+    pub const ALL: [Op; 14] = [
         Op::Ensure,
         Op::Ls,
         Op::Stop,
@@ -89,6 +119,9 @@ impl Op {
         Op::RunRm,
         Op::RunPrune,
         Op::Branches,
+        Op::Events,
+        Op::EventsAck,
+        Op::ThreadLs,
     ];
 
     pub fn parse(s: &str) -> Option<Op> {
@@ -108,6 +141,9 @@ impl Op {
             Op::RunRm => "run-rm",
             Op::RunPrune => "run-prune",
             Op::Branches => "branches",
+            Op::Events => "events",
+            Op::EventsAck => "events-ack",
+            Op::ThreadLs => "thread-ls",
         }
     }
 }
@@ -121,6 +157,13 @@ pub fn valid_run_id(id: &str) -> bool {
         && b[..10].iter().all(u8::is_ascii_digit)
         && b[10] == b'-'
         && b[11..].iter().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(c))
+}
+
+/// An Inbox event id as the host mints them: `e-<unix secs:010>-<4 lowercase
+/// hex>`. Checked on both ends, so a typo in `devsbd events ack` is a usage
+/// error rather than a silent no-op.
+pub fn valid_event_id(id: &str) -> bool {
+    id.strip_prefix("e-").is_some_and(valid_run_id)
 }
 
 /// Longest accepted child/thread key (the charset is checked by [`valid_key`]).
@@ -176,6 +219,7 @@ pub struct Request {
     pub force: bool,
     pub keep: Option<u64>,
     pub ahead: bool,
+    pub ack: Vec<String>,
 }
 
 impl Request {
@@ -194,6 +238,7 @@ impl Request {
             force: false,
             keep: None,
             ahead: false,
+            ack: Vec::new(),
         }
     }
 }
@@ -356,6 +401,9 @@ pub fn encode_request(r: &Request) -> String {
     if r.ahead {
         out.push_str("ahead\n");
     }
+    for id in &r.ack {
+        line(&mut out, "ack", id);
+    }
     out
 }
 
@@ -364,6 +412,7 @@ pub fn decode_request(text: &str) -> Result<Request, String> {
     let mut env = Vec::new();
     let (mut argv, mut id, mut offset, mut timeout) = (Vec::new(), None, None, None);
     let (mut force, mut keep, mut ahead) = (None, None, None);
+    let mut ack = Vec::new();
     for d in directives(text) {
         let (n, name, value) = d?;
         match name {
@@ -386,6 +435,7 @@ pub fn decode_request(text: &str) -> Result<Request, String> {
             "keep" => set_once(&mut keep, number(&value, n, name)?, n, name)?,
             "ahead" if value.is_empty() => set_once(&mut ahead, (), n, name)?,
             "ahead" => return Err(format!("line {n}: `ahead` takes no value")),
+            "ack" => ack.push(value),
             other => return Err(format!("line {n}: unknown key `{other}`")),
         }
     }
@@ -402,6 +452,7 @@ pub fn decode_request(text: &str) -> Result<Request, String> {
         force: force.is_some(),
         keep,
         ahead: ahead.is_some(),
+        ack,
     })
 }
 
@@ -527,6 +578,35 @@ timeout 5\n";
         assert_eq!(decode_request(CLEAR_REQUEST), Ok(clear_request()));
         assert_eq!(encode_request(&branches_request()), BRANCHES_REQUEST);
         assert_eq!(decode_request(BRANCHES_REQUEST), Ok(branches_request()));
+    }
+
+    /// `ack` repeats, in order; `events` takes a `timeout` like `run-wait`.
+    const ACK_REQUEST: &str = "op events-ack\nack e-1790900001-3f2a\nack e-1790900042-77c1\n";
+
+    #[test]
+    fn event_requests_round_trip() {
+        let ack = Request {
+            ack: vec!["e-1790900001-3f2a".into(), "e-1790900042-77c1".into()],
+            ..Request::new(Op::EventsAck)
+        };
+        assert_eq!(encode_request(&ack), ACK_REQUEST);
+        assert_eq!(decode_request(ACK_REQUEST), Ok(ack));
+        let wait = Request { timeout: Some(300), ..Request::new(Op::Events) };
+        assert_eq!(encode_request(&wait), "op events\ntimeout 300\n");
+        assert_eq!(decode_request("op events\ntimeout 300\n"), Ok(wait));
+        assert_eq!(decode_request("op thread-ls\n"), Ok(Request::new(Op::ThreadLs)));
+        // The codec only carries the ids; their shape is the host's check.
+        assert_eq!(decode_request("op events-ack\nack x\n").map(|r| r.ack), Ok(vec!["x".to_string()]));
+    }
+
+    #[test]
+    fn event_ids() {
+        assert!(valid_event_id("e-1790900001-3f2a"));
+        assert!(valid_event_id("e-0000000000-0000"));
+        for bad in ["", "1790900001-3f2a", "e-1790900001-3F2A", "e-179090000-3f2a", "e-1790900001-3f2",
+                    "e-1790900001-3f2ab", "E-1790900001-3f2a", "e-1790900001-3f2a ", "e-../../x"] {
+            assert!(!valid_event_id(bad), "{bad:?}");
+        }
     }
 
     /// `ahead` is a bare directive, like `force`.

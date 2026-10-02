@@ -49,26 +49,27 @@ impl State {
     }
 }
 
-/// One `devsbd thread put` body.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+/// One `devsbd thread put` body. Also serialized (as JSON) by `devsbd thread
+/// ls`, which hands a dispatcher back exactly what it put.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ThreadPut {
     pub key: String,
     pub title: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link: Option<String>,
     pub state: State,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
     /// Key of one of the sender's dispatcher children: the instance the
     /// thread is about, and what its host actions target.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub child: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub actions: Vec<Action>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply: Option<Reply>,
 }
 
@@ -89,6 +90,14 @@ pub struct Action {
     /// action is only an event for the owner.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<HostVerb>,
+}
+
+impl Action {
+    /// Whether pressing it enqueues an event for the owner: a dispatcher
+    /// action (no `host`), `notify: true`, or the `done: true` built-in.
+    pub fn enqueues_event(&self) -> bool {
+        self.host.is_none() || self.notify || self.done
+    }
 }
 
 /// The fixed host-action table (docs/inbox-threads.md, *Actions*). Externally

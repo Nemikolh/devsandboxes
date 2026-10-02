@@ -4,11 +4,13 @@
 //! it — and everything here is view state: the current view, the selection,
 //! the open thread pane, all unit-testable without touching the file.
 //!
-//! Mutations (`d`, `D`, mark-read) are only *requested* here, as
-//! [`crate::inbox::Op`]s the event loop applies through `store::update`
-//! before reloading; the local copy is updated at once so the next frame
-//! already shows the result. Opening a link is requested the same way
-//! (`pending_open`).
+//! Mutations (`d`, `D`, mark-read, and the pane's actions, replies, done and
+//! reopen) are only *requested* here, as [`crate::inbox::Op`]s the event loop
+//! applies through `store::update` before reloading; the local copy is
+//! updated at once so the next frame already shows the result, except for
+//! ops that enqueue an event: their ids and times are minted under the store
+//! lock, and the reload in the same loop pass shows them. Opening a link is
+//! requested the same way (`pending_open`).
 //!
 //! The list is one row per thread, newest change first, filtered by a
 //! [`View`] (docs/inbox-threads.md, *Inbox UI*). History lives in the focused
@@ -28,6 +30,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::devsbd::notify::Level;
 use crate::inbox::{is_url, EntryKind, Inbox, Kind, Op, State, Thread};
+use crate::tui::prompt::Prompt;
 
 use super::{App, Tab};
 
@@ -95,6 +98,19 @@ pub struct InboxView {
     /// the app immutably; it only bounds the scroll keys, so a stale value
     /// costs at most a frame of overscroll.
     pane_max: Cell<u16>,
+    /// The reply input (`r` in the pane), when open.
+    pub reply: Option<ReplyBox>,
+}
+
+/// The one-line reply input over the open thread pane. It reuses the `:`
+/// prompt's editing ([`Prompt`], with no history and no completion): only
+/// what `enter` does differs.
+pub struct ReplyBox {
+    /// Id of the thread being replied to.
+    pub thread: u64,
+    pub line: Prompt,
+    /// The thread's `reply.placeholder`, shown dim while the line is empty.
+    pub placeholder: Option<String>,
 }
 
 impl InboxView {
@@ -192,6 +208,19 @@ fn entry_label(kind: EntryKind) -> &'static str {
         EntryKind::Message => "message",
         EntryKind::State => "state",
         EntryKind::Status => "status",
+        EntryKind::Action => "action",
+        EntryKind::Reply => "reply",
+        EntryKind::Done => "done",
+        EntryKind::Reopen => "reopen",
+    }
+}
+
+/// "2 events waiting for web": what the owner hasn't pulled yet.
+fn pending_line(t: &Thread) -> Option<String> {
+    match t.events.len() {
+        0 => None,
+        1 => Some(format!("1 event waiting for {}", t.owner_name)),
+        n => Some(format!("{n} events waiting for {}", t.owner_name)),
     }
 }
 
@@ -278,22 +307,25 @@ pub fn pane_lines(t: &Thread, child: Option<&ChildInfo>, utc_offset: i64) -> Vec
         out.extend(timeline);
     }
 
+    if let Some(pending) = pending_line(t) {
+        out.push(Vec::new());
+        out.push(line(Tone::Dim, pending));
+    }
+
     if !t.actions.is_empty() {
         out.push(Vec::new());
         for (i, a) in t.actions.iter().enumerate() {
-            // Host actions run in the dashboard; the rest go to the owner as
-            // events, which don't exist yet, so they're greyed out.
-            let runnable = a.host.is_some();
-            let (num, label) = if runnable { (Tone::Bold, Tone::Plain) } else { (Tone::Dim, Tone::Dim) };
-            let mut row = vec![(num, format!("[{}] ", i + 1)), (label, a.label.clone())];
-            if runnable {
+            // Host actions run in the dashboard; the rest (and a host
+            // action's `notify`/`done` half) go to the owner as an event.
+            let mut row = vec![(Tone::Bold, format!("[{}] ", i + 1)), (Tone::Plain, a.label.clone())];
+            if a.host.is_some() {
                 row.push((Tone::Dim, "  ⌂ host".into()));
+            }
+            if a.enqueues_event() {
+                row.push((Tone::Dim, format!("  → {}", t.owner_name)));
             }
             if a.done {
                 row.push((Tone::Dim, "  ✓ done".into()));
-            }
-            if !runnable {
-                row.push((Tone::Dim, "  (needs events)".into()));
             }
             out.push(row);
         }
@@ -322,7 +354,10 @@ impl App {
             Some((id, true)) => self.request_inbox(Op::MarkRead(id)),
             Some(_) => {}
             // Removed under the pane (another dashboard, `thread rm`).
-            None => self.inbox.open = None,
+            None => {
+                self.inbox.open = None;
+                self.inbox.reply = None;
+            }
         }
         self.reselect_inbox(selected);
     }
@@ -331,9 +366,12 @@ impl App {
     /// once so the next frame shows it (the reload that follows confirms it).
     /// The cursor stays on its thread, or on its row when the thread left
     /// the view (e.g. a read notify record leaving Needs you).
-    fn request_inbox(&mut self, op: Op) {
+    pub(super) fn request_inbox(&mut self, op: Op) {
         let selected = self.selected_inbox_id();
-        self.inbox.content.apply(&op);
+        // An event-enqueuing op is the store's to stamp (see the module doc).
+        if !op.enqueues_event() {
+            self.inbox.content.apply(&op, 0);
+        }
         self.pending_inbox.push(op);
         self.reselect_inbox(selected);
     }
@@ -349,6 +387,7 @@ impl App {
     pub(super) fn set_tab(&mut self, tab: Tab) {
         if self.tab == Tab::Inbox && tab != Tab::Inbox {
             self.inbox.open = None;
+            self.inbox.reply = None;
             let unread_notify = self.inbox.threads().iter().any(|t| t.kind == Kind::Notify && t.unread);
             if self.inbox.view.shows_notify() && unread_notify {
                 self.request_inbox(Op::MarkNotifyRead);
@@ -426,6 +465,11 @@ impl App {
     /// modal does: tab keys, `t`/`l`, `d` and the rest must not act on rows
     /// the user can't see. Quit, the prompt and help stay reachable.
     pub(super) fn on_key_inbox_pane(&mut self, key: KeyEvent) {
+        // The reply box, when open, takes every key (like the `:` prompt).
+        if self.inbox.reply.is_some() {
+            self.on_key_reply(key);
+            return;
+        }
         self.status = None;
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let Some(t) = self.inbox.open_thread() else {
@@ -435,7 +479,6 @@ impl App {
         // Owned: the action keys below borrow `self` mutably.
         let t = t.clone();
         let (kind, link) = (t.kind, t.link.clone().or_else(|| t.head().and_then(|r| r.link.clone())));
-        let replies = t.reply.is_some();
         match key.code {
             KeyCode::Esc => self.inbox.open = None,
             KeyCode::Char('q') => self.should_quit = true,
@@ -453,13 +496,9 @@ impl App {
             KeyCode::Char('t') => self.thread_terminal(&t),
             KeyCode::Char('l') => self.thread_logs(&t),
             KeyCode::Char('p') => self.thread_port_prompt(&t),
-            KeyCode::Char('r') if replies => self.status = Some("replies arrive with events".into()),
-            KeyCode::Char('u') if kind == Kind::Thread => {
-                self.status = Some("reopen arrives with events".into())
-            }
-            KeyCode::Char('d') if kind == Kind::Thread => {
-                self.status = Some("mark done arrives with events".into())
-            }
+            KeyCode::Char('r') if kind == Kind::Thread => self.open_reply(&t),
+            KeyCode::Char('u') if kind == Kind::Thread => self.reopen_thread(&t),
+            KeyCode::Char('d') if kind == Kind::Thread => self.mark_thread_done(&t),
             _ => {
                 let lines = self.inbox.pane_max.get().saturating_add(1);
                 let mut scroll = self.inbox.scroll;
@@ -470,15 +509,101 @@ impl App {
     }
 
     /// `d` (Inbox tab): dismiss a notify thread (its history with it). A
-    /// dispatcher thread is the dispatcher's to drop; `d` will mark it done
-    /// once events exist.
+    /// dispatcher thread is the dispatcher's to drop, so `d` marks it done.
     pub(super) fn dismiss_selected_notification(&mut self) {
-        let Some((id, kind)) = self.selected_inbox_thread().map(|t| (t.id, t.kind)) else {
+        let Some(t) = self.selected_inbox_thread().cloned() else {
             return;
         };
-        match kind {
-            Kind::Notify => self.request_inbox(Op::RemoveThread(id)),
-            Kind::Thread => self.status = Some("mark done arrives with events".into()),
+        match t.kind {
+            Kind::Notify => self.request_inbox(Op::RemoveThread(t.id)),
+            Kind::Thread => self.mark_thread_done(&t),
+        }
+    }
+
+    /// Why `t` takes no user op, if it doesn't: an archived thread's owner is
+    /// gone, so nobody would ever pull the event.
+    fn refuse_user_op(&mut self, t: &Thread) -> bool {
+        if t.archived {
+            self.status = Some(format!("archived: `{}` was removed", t.owner_name));
+        }
+        t.archived
+    }
+
+    /// `d` on a dispatcher thread (list or pane): done, with an event.
+    pub(super) fn mark_thread_done(&mut self, t: &Thread) {
+        if self.refuse_user_op(t) {
+            return;
+        }
+        if t.state == Some(State::Done) {
+            self.status = Some("already done".into());
+            return;
+        }
+        // Step 7 also marks the thread's child done here (`done: true` too).
+        self.request_inbox(Op::MarkDone(t.id));
+        self.status = Some(format!("marked done · event queued for {}", t.owner_name));
+    }
+
+    /// `u` in the pane: reopen a done thread, with an event. Step 7 also
+    /// clears the child's done flag here.
+    fn reopen_thread(&mut self, t: &Thread) {
+        if self.refuse_user_op(t) {
+            return;
+        }
+        if t.state != Some(State::Done) {
+            self.status = Some("not done: nothing to reopen".into());
+            return;
+        }
+        self.request_inbox(Op::Reopen(t.id));
+        self.status = Some(format!("reopened · event queued for {}", t.owner_name));
+    }
+
+    /// `r` in the pane: open the reply box, when the thread takes replies.
+    fn open_reply(&mut self, t: &Thread) {
+        if self.refuse_user_op(t) {
+            return;
+        }
+        let Some(reply) = &t.reply else {
+            self.status = Some("this thread takes no replies".into());
+            return;
+        };
+        self.inbox.reply = Some(ReplyBox {
+            thread: t.id,
+            line: Prompt::new(Vec::new()),
+            placeholder: reply.placeholder.clone(),
+        });
+    }
+
+    /// Keys while the reply box is open: `esc` cancels, `enter` sends a
+    /// non-empty reply (an empty one does nothing and keeps the box), the
+    /// rest edits the line as the `:` prompt does.
+    fn on_key_reply(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let Some(rb) = &mut self.inbox.reply else { return };
+        let line = &mut rb.line;
+        match key.code {
+            KeyCode::Esc => self.inbox.reply = None,
+            KeyCode::Char('c') if ctrl => self.inbox.reply = None,
+            KeyCode::Enter => {
+                let text = line.input().trim().to_string();
+                if text.is_empty() {
+                    return;
+                }
+                let thread = rb.thread;
+                self.inbox.reply = None;
+                let owner = self.inbox.threads().iter().find(|t| t.id == thread).map(|t| t.owner_name.clone());
+                self.request_inbox(Op::Reply { thread, text });
+                self.status = Some(format!("reply queued for {}", owner.unwrap_or_default()));
+            }
+            KeyCode::Left => line.left(),
+            KeyCode::Right => line.right(),
+            KeyCode::Home => line.home(),
+            KeyCode::End => line.end(),
+            KeyCode::Backspace => line.backspace(),
+            KeyCode::Delete => line.delete(),
+            KeyCode::Char('u') if ctrl => line.clear(),
+            KeyCode::Char('w') if ctrl => line.delete_word(),
+            KeyCode::Char(c) if !ctrl => line.insert_char(c),
+            _ => {}
         }
     }
 
@@ -624,7 +749,7 @@ mod tests {
         push(app, "a", Record { at: 50, ..rec("read note", None, None) });
         let id = thread(app, "read note").id;
         let mut inbox = app.inbox.content.clone();
-        inbox.apply(&Op::MarkRead(id));
+        inbox.apply(&Op::MarkRead(id), 0);
         app.set_inbox(inbox);
     }
 
@@ -726,7 +851,7 @@ mod tests {
         let mut inbox = app.inbox.content.clone();
         let ids: Vec<u64> = inbox.threads.iter().map(|t| t.id).collect();
         for id in &ids[1..] {
-            inbox.apply(&Op::RemoveThread(*id));
+            inbox.apply(&Op::RemoveThread(*id), 0);
         }
         app.set_inbox(inbox);
         assert_eq!(app.selected(), 0);
@@ -768,7 +893,7 @@ mod tests {
         assert_eq!(app.inbox.open_thread().map(title_of).as_deref(), Some("asks"));
         app.take_pending_inbox();
 
-        for c in ['1', '2', '3', '4', 't', 'l', 'd', 'D', 'v', 'T', 'x'] {
+        for c in ['2', '3', '4', 't', 'l', 'D', 'v', 'T', 'x'] {
             app.on_key(key(KeyCode::Char(c)));
         }
         app.on_key(key(KeyCode::Tab));
@@ -777,7 +902,7 @@ mod tests {
         assert_eq!(app.inbox.view, View::NeedsYou, "`v` didn't reach the list");
         assert!(app.terms.is_empty(), "`t` opened no terminal");
         assert!(matches!(app.modal, super::super::Modal::None), "`l` opened no logs");
-        assert_eq!(app.take_pending_inbox(), [], "`d`/`D` dismissed nothing");
+        assert_eq!(app.take_pending_inbox(), [], "`D` dismissed nothing");
         assert_eq!(app.inbox.threads().len(), 2);
 
         app.on_key(key(KeyCode::Char('1')));
@@ -839,7 +964,7 @@ mod tests {
 
         // The open thread removed elsewhere: the pane closes.
         let mut inbox = app.inbox.content.clone();
-        inbox.apply(&Op::RemoveThread(id));
+        inbox.apply(&Op::RemoveThread(id), 0);
         app.set_inbox(inbox);
         assert!(!app.inbox.is_open());
     }
@@ -883,12 +1008,13 @@ mod tests {
         assert_eq!(rows(&app), ["n1", "asks"]);
         assert_eq!(app.take_pending_inbox(), [Op::RemoveThread(n2)]);
 
-        // On a dispatcher thread, `d` is a hint until events exist.
+        // On a dispatcher thread, `d` marks it done (an event for the store).
         app.on_key(key(KeyCode::Down));
+        let asks = thread(&app, "asks").id;
         app.on_key(key(KeyCode::Char('d')));
-        assert_eq!(app.take_pending_inbox(), []);
-        assert!(app.status.as_deref().unwrap().contains("mark done"));
-        assert_eq!(rows(&app), ["n1", "asks"]);
+        assert_eq!(app.take_pending_inbox(), [Op::MarkDone(asks)]);
+        assert_eq!(app.status.as_deref(), Some("marked done · event queued for d"));
+        assert_eq!(rows(&app), ["n1", "asks"], "applied by the store, not here");
 
         app.on_key(key(KeyCode::Char('D')));
         assert_eq!(app.take_pending_inbox(), [Op::ClearNotify]);
@@ -946,14 +1072,16 @@ mod tests {
         assert!(has("drafts ready"));
         assert!(has("timeline"));
         assert!(has("[1] Open draft  ⌂ host"), "{text:#?}");
-        assert!(has("[2] Post replies  (needs events)") && !has("[2] Post replies  ⌂"));
-        // Runnable actions are bold-numbered; event-only ones are dim throughout.
+        assert!(has("[2] Post replies  → d") && !has("[2] Post replies  ⌂"));
+        // Every action is runnable now: bold number, plain label.
         let lines = pane_lines(&t, Some(&child), 0);
         let row = |n: &str| lines.iter().find(|l| l.first().is_some_and(|(_, s)| s == n)).unwrap();
-        assert_eq!(row("[1] ")[..2].iter().map(|(t, _)| *t).collect::<Vec<_>>(), [Tone::Bold, Tone::Plain]);
-        assert!(row("[2] ").iter().all(|(t, _)| *t == Tone::Dim));
-        assert!(has("[3] Done  ✓ done"));
+        for n in ["[1] ", "[2] "] {
+            assert_eq!(row(n)[..2].iter().map(|(t, _)| *t).collect::<Vec<_>>(), [Tone::Bold, Tone::Plain]);
+        }
+        assert!(has("[3] Done  → d  ✓ done"), "{text:#?}");
         assert!(has("reply: next run"));
+        assert!(!has("waiting for"), "no events yet");
 
         // A child key the owner doesn't have stays visible, unresolved.
         app.thread_children.clear();
@@ -975,6 +1103,138 @@ mod tests {
         // The head is the message; history is oldest first under "earlier".
         assert!(at("earlier") < at("v1") && at("v1") < at("v2"), "{text:#?}");
         assert_eq!(text.iter().filter(|l| l.ends_with("v3")).count(), 2, "title and message");
+    }
+
+    /// What the event loop does with the queued ops: apply them to the store
+    /// at time `now`, then reload.
+    fn flush(app: &mut App, now: u64) -> Vec<Op> {
+        let ops = app.take_pending_inbox();
+        let mut inbox = app.inbox.content.clone();
+        ops.iter().for_each(|op| inbox.apply(op, now));
+        app.set_inbox(inbox);
+        ops
+    }
+
+    fn typed(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+    }
+
+    /// `asks` from `d`, taking replies, open in the pane, its read mark flushed.
+    fn open_asks(app: &mut App, reply: Option<Reply>) -> u64 {
+        put(app, "d", 10, ThreadPut { reply, ..body("asks", State::NeedsYou) });
+        inbox_tab(app);
+        app.on_key(key(KeyCode::Enter));
+        flush(app, 10);
+        thread(app, "asks").id
+    }
+
+    #[test]
+    fn r_opens_a_reply_box_that_sends_a_reply() {
+        let mut app = new_app();
+        let id = open_asks(&mut app, Some(Reply { placeholder: Some("next run".into()) }));
+        app.on_key(key(KeyCode::Char('r')));
+        let rb = app.inbox.reply.as_ref().expect("reply box open");
+        assert_eq!((rb.thread, rb.placeholder.as_deref(), rb.line.input()), (id, Some("next run"), ""));
+
+        // Keys edit the line, not the pane: `d`, `q`, `1` are just text.
+        typed(&mut app, "do q1x");
+        app.on_key(key(KeyCode::Backspace));
+        app.on_key(key(KeyCode::Home));
+        app.on_key(key(KeyCode::Char('>')));
+        assert!(!app.should_quit);
+        assert_eq!(app.inbox.reply.as_ref().unwrap().line.input(), ">do q1");
+        assert_eq!(app.take_pending_inbox(), []);
+
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.inbox.reply.is_none());
+        assert!(app.inbox.is_open(), "back on the pane");
+        assert_eq!(app.status.as_deref(), Some("reply queued for d"));
+        assert_eq!(flush(&mut app, 20), [Op::Reply { thread: id, text: ">do q1".into() }]);
+        let text: Vec<String> = pane_lines(thread(&app, "asks"), None, 0)
+            .iter()
+            .map(|l| l.iter().map(|(_, s)| s.as_str()).collect())
+            .collect();
+        assert!(text.iter().any(|l| l.contains("reply") && l.ends_with(">do q1")), "{text:#?}");
+        assert!(text.contains(&"1 event waiting for d".to_string()), "{text:#?}");
+    }
+
+    #[test]
+    fn the_reply_box_cancels_and_ignores_empty() {
+        let mut app = new_app();
+        open_asks(&mut app, Some(Reply::default()));
+        app.on_key(key(KeyCode::Char('r')));
+        // Empty (or blank) enter: nothing sent, the box stays.
+        typed(&mut app, "  ");
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.inbox.reply.is_some());
+        typed(&mut app, "half");
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.inbox.reply.is_none());
+        assert!(app.inbox.is_open(), "esc closes the box, not the pane");
+        assert_eq!(app.take_pending_inbox(), []);
+        // Leaving the tab drops a box left open.
+        app.on_key(key(KeyCode::Char('r')));
+        app.inbox.open = None;
+        app.set_tab(Tab::Instances);
+        assert!(app.inbox.reply.is_none());
+    }
+
+    #[test]
+    fn r_without_a_reply_box_is_a_hint() {
+        let mut app = new_app();
+        open_asks(&mut app, None);
+        app.on_key(key(KeyCode::Char('r')));
+        assert!(app.inbox.reply.is_none());
+        assert_eq!(app.status.as_deref(), Some("this thread takes no replies"));
+        assert_eq!(app.take_pending_inbox(), []);
+    }
+
+    #[test]
+    fn pane_d_marks_done_and_u_reopens() {
+        let mut app = new_app();
+        let id = open_asks(&mut app, None);
+        app.on_key(key(KeyCode::Char('u')));
+        assert_eq!(app.status.as_deref(), Some("not done: nothing to reopen"));
+        app.on_key(key(KeyCode::Char('d')));
+        assert_eq!(flush(&mut app, 20), [Op::MarkDone(id)]);
+        assert_eq!(thread(&app, "asks").state, Some(State::Done));
+        assert!(app.inbox.is_open(), "the pane stays on the thread");
+        app.on_key(key(KeyCode::Char('d')));
+        assert_eq!(app.status.as_deref(), Some("already done"));
+        assert_eq!(app.take_pending_inbox(), []);
+        app.on_key(key(KeyCode::Char('u')));
+        assert_eq!(app.status.as_deref(), Some("reopened · event queued for d"));
+        assert_eq!(flush(&mut app, 30), [Op::Reopen(id)]);
+        let t = thread(&app, "asks");
+        assert_eq!(t.state, Some(State::Active));
+        assert_eq!(t.events.len(), 2);
+        let text: Vec<String> =
+            pane_lines(t, None, 0).iter().map(|l| l.iter().map(|(_, s)| s.as_str()).collect()).collect();
+        assert!(text.iter().any(|l| l.contains("done") && l.ends_with("marked done")), "{text:#?}");
+        assert!(text.iter().any(|l| l.contains("reopen") && l.ends_with("reopened")), "{text:#?}");
+        assert!(text.contains(&"2 events waiting for d".to_string()), "{text:#?}");
+    }
+
+    #[test]
+    fn archived_threads_take_no_user_ops() {
+        let mut app = new_app();
+        put(&mut app, "d", 10, ThreadPut { reply: Some(Reply::default()), ..body("asks", State::NeedsYou) });
+        let mut inbox = app.inbox.content.clone();
+        inbox.archive_owner("d-id");
+        app.set_inbox(inbox);
+        inbox_tab(&mut app);
+        app.inbox.view = View::All;
+        app.on_key(key(KeyCode::Char('d')));
+        app.on_key(key(KeyCode::Enter));
+        flush(&mut app, 10);
+        for c in ['r', 'd', 'u'] {
+            app.on_key(key(KeyCode::Char(c)));
+            assert!(app.status.as_deref().unwrap().starts_with("archived"), "{c}: {:?}", app.status);
+        }
+        assert!(app.inbox.reply.is_none());
+        assert_eq!(app.take_pending_inbox(), []);
     }
 
     #[test]

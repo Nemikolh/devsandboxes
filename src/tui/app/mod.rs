@@ -25,7 +25,7 @@ mod tree;
 mod view;
 
 pub use crate::inbox::Thread;
-pub use inbox::{pane_lines, parse_utc_offset, title_of, when, InboxView, PaneLine, Tone, View};
+pub use inbox::{pane_lines, parse_utc_offset, title_of, when, InboxView, PaneLine, ReplyBox, Tone, View};
 pub use procs::{PendingSignal, Signal};
 pub use view::{ConfigView, Modal, Pane, Side, TextModal};
 use view::{col_near, divider_pct};

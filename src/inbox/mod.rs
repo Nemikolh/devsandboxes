@@ -17,6 +17,14 @@
 //! ids are never reused, so `devsandbox rm` can archive a gone instance's
 //! threads instead of deleting them.
 //!
+//! A dispatcher thread also holds its pending **events** ([`Event`],
+//! docs/inbox-threads.md, *Events: pull, not push*): what the user did in a
+//! dashboard (a dispatcher action, a reply, done, reopen), held here until the
+//! owner pulls and acks them (`devsbd events`, `commands::dispatch`). They
+//! are delivery state, not history: the per-owner cap counts them but never
+//! evicts them (each thread keeps at most [`MAX_EVENTS`], oldest dropped), and
+//! no put touches them.
+//!
 //! Everything here is plain state: threading, cap, unread, retention, the put
 //! transition and the bridge's decision stay unit-testable without a store.
 
@@ -44,6 +52,15 @@ pub const VERSION: u32 = 2;
 
 /// How long an archived or `done` thread is kept after its last change.
 pub const RETENTION: u64 = 14 * 86_400;
+
+/// Unacked events kept per thread; the oldest is dropped past this. A
+/// dispatcher that never acks can't grow the store without bound, and a user
+/// clicking a hundred times ahead of one is not a case worth keeping.
+pub const MAX_EVENTS: usize = 100;
+
+/// Longest reply kept, in chars; the rest is cut. The reply box is one line,
+/// so this only bounds a paste.
+pub const MAX_REPLY: usize = 2000;
 
 /// Whether `link` is an `http(s)://` URL. The link comes from inside the
 /// container and ends up as the opener's argv, so only web links pass: no
@@ -90,14 +107,67 @@ impl Kind {
 /// a thread has no live sender, so it loads archived.
 const UNRESOLVED_OWNER: &str = "name:";
 
-/// One timeline entry on a thread-kind thread. Steps 6-7 add action, reply,
-/// done and reopen kinds; the shape (a kind plus one text) already fits them.
+/// One timeline entry on a thread-kind thread: what a put changed, or what
+/// the user did (the last four, each with the event it enqueued).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum EntryKind {
     Message,
     State,
     Status,
+    /// A dispatcher action; text = its label.
+    Action,
+    /// text = the reply.
+    Reply,
+    /// Marked done (`d`, or a `done: true` action: text = its label).
+    Done,
+    Reopen,
+}
+
+/// What an [`Event`] tells the owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EventKind {
+    /// A dispatcher action (no `host`, or `notify: true`); `action` = its id.
+    Action,
+    /// `text` = the reply.
+    Reply,
+    /// The thread was set done: by `d` (no `action`), or by a `done: true`
+    /// action (`action` = its id). One event either way, so a dispatcher
+    /// handles "done" in one place and still knows which button it was.
+    Done,
+    /// `u` on a done thread.
+    Reopen,
+}
+
+impl EventKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EventKind::Action => "action",
+            EventKind::Reply => "reply",
+            EventKind::Done => "done",
+            EventKind::Reopen => "reopen",
+        }
+    }
+}
+
+/// One pending event for a thread's owner. Field order is load-bearing for
+/// TOML only in that every field is a scalar.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Event {
+    /// `e-<unix secs:010>-<4 hex>` (`control::valid_event_id`), unique across
+    /// the store: what the owner acks, and what stops two dispatchers' reads
+    /// (or two dashboards) handling one click twice.
+    pub id: String,
+    /// Arrival order across the inbox, like [`Entry::seq`]: orders events
+    /// across threads within one second. Never sent to the owner.
+    pub seq: u64,
+    pub kind: EventKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    pub at: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -147,6 +217,8 @@ pub struct Thread {
     pub updated_at: u64,
     /// Oldest first, so appending is the common case.
     pub entries: Vec<Entry>,
+    /// Unacked events for the owner, oldest first.
+    pub events: Vec<Event>,
 }
 
 impl Thread {
@@ -191,6 +263,27 @@ pub enum Op {
     /// Dismiss every notify record. Dispatcher threads are state a dispatcher
     /// re-asserts, so clearing them would only make them come back.
     ClearNotify,
+    // The user ops below each add a timeline entry and enqueue an event for
+    // the owner. Their ids and times are minted under the store lock
+    // ([`Inbox::apply`]), so a dashboard never applies them to its own copy.
+    /// `1`-`9` on a dispatcher action (the dispatcher half of a button; the
+    /// host half runs in the dashboard). A `done: true` action also sets the
+    /// thread done.
+    Act { thread: u64, action: String },
+    /// `r`: a free-text reply, on a thread that allows them.
+    Reply { thread: u64, text: String },
+    /// `d`: set the thread done.
+    MarkDone(u64),
+    /// `u`: reopen a done thread (back to `active` until the dispatcher says
+    /// otherwise: it owns what the thread means).
+    Reopen(u64),
+}
+
+impl Op {
+    /// Whether this op enqueues an event, so only the store may apply it.
+    pub fn enqueues_event(&self) -> bool {
+        matches!(self, Op::Act { .. } | Op::Reply { .. } | Op::MarkDone(_) | Op::Reopen(_))
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -335,11 +428,13 @@ impl Inbox {
 
     /// Drop archived and `done` threads whose last change is older than
     /// [`RETENTION`]. Live threads are never dropped by age: only the
-    /// per-owner cap bounds those.
+    /// per-owner cap bounds those. A done thread with unacked events stays
+    /// until its owner acks them (they're delivery state, e.g. the `done`
+    /// itself); an archived owner is gone and can never ack, so it doesn't.
     pub fn prune(&mut self, now: u64) -> usize {
         let before = self.threads.len();
         self.threads.retain(|t| {
-            let retired = t.archived || t.state == Some(State::Done);
+            let retired = t.archived || (t.state == Some(State::Done) && t.events.is_empty());
             !(retired && now.saturating_sub(t.changed_at()) > RETENTION)
         });
         before - self.threads.len()
@@ -406,9 +501,50 @@ impl Inbox {
         }
     }
 
-    /// Apply one dashboard-requested [`Op`].
-    pub fn apply(&mut self, op: &Op) {
+    /// Apply one dashboard-requested [`Op`] at unix time `now` (the stamp of
+    /// any entry and event it adds).
+    pub fn apply(&mut self, op: &Op, now: u64) {
         match op {
+            Op::Act { thread, action } => self.user_op(*thread, now, |t| {
+                let a = t.actions.iter().find(|a| &a.id == action)?;
+                // A host-only button never reaches the owner; refusing it
+                // here keeps a stale or forged op from inventing one.
+                if !a.enqueues_event() {
+                    return None;
+                }
+                Some(match a.done {
+                    true => UserOp::done(Some(a.id.clone()), a.label.clone()),
+                    false => UserOp {
+                        state: None,
+                        entry: (EntryKind::Action, a.label.clone()),
+                        event: (EventKind::Action, Some(a.id.clone()), None),
+                    },
+                })
+            }),
+            Op::Reply { thread, text } => self.user_op(*thread, now, |t| {
+                let text = text.trim();
+                if t.reply.is_none() || text.is_empty() {
+                    return None;
+                }
+                let text: String = text.chars().take(MAX_REPLY).collect();
+                Some(UserOp {
+                    state: None,
+                    entry: (EntryKind::Reply, text.clone()),
+                    event: (EventKind::Reply, None, Some(text)),
+                })
+            }),
+            // Only a real transition counts: a second `d` (or `u` on a live
+            // thread) would hand the owner an event for nothing.
+            Op::MarkDone(thread) => self.user_op(*thread, now, |t| {
+                (t.state != Some(State::Done)).then(|| UserOp::done(None, "marked done".into()))
+            }),
+            Op::Reopen(thread) => self.user_op(*thread, now, |t| {
+                (t.state == Some(State::Done)).then(|| UserOp {
+                    state: Some(State::Active),
+                    entry: (EntryKind::Reopen, "reopened".into()),
+                    event: (EventKind::Reopen, None, None),
+                })
+            }),
             Op::MarkNotifyRead => {
                 for t in self.threads.iter_mut().filter(|t| t.kind == Kind::Notify) {
                     t.unread = false;
@@ -424,15 +560,105 @@ impl Inbox {
         }
     }
 
+    /// Apply a user op to thread-kind thread `id`: `decide` says what it does
+    /// (`None`: nothing, e.g. a stale action id). An archived thread's owner
+    /// is gone, so it takes no new events; a notify thread has no owner to
+    /// answer it.
+    fn user_op(&mut self, id: u64, now: u64, decide: impl FnOnce(&Thread) -> Option<UserOp>) {
+        let Some(pos) = self.threads.iter().position(|t| t.id == id) else { return };
+        let t = &self.threads[pos];
+        if t.kind != Kind::Thread || t.archived {
+            return;
+        }
+        let Some(op) = decide(t) else { return };
+        let event_id = self.mint_event_id(now);
+        let (entry_seq, event_seq) = (self.next_id(), self.next_id());
+        let t = &mut self.threads[pos];
+        if let Some(state) = op.state {
+            // Step 7 also marks a `done` thread's child done; that flag lives
+            // in `state.toml`, so it's the dashboard's to set, next to this op.
+            t.state = Some(state);
+        }
+        t.updated_at = t.updated_at.max(now);
+        let (kind, text) = op.entry;
+        t.entries.push(Entry { seq: entry_seq, at: now, kind, text });
+        let (kind, action, text) = op.event;
+        t.events.push(Event { id: event_id, seq: event_seq, kind, action, text, at: now });
+        if t.events.len() > MAX_EVENTS {
+            let extra = t.events.len() - MAX_EVENTS;
+            t.events.drain(..extra);
+        }
+        let owner = t.owner.clone();
+        self.enforce_cap(&owner);
+    }
+
+    /// A fresh event id for time `now`, unique in the store. The 4 hex digits
+    /// come from std's per-process random hash keys: cheap, no dependency,
+    /// and a collision (same second, same digits) is simply retried, which
+    /// always ends since events are bounded far below 65536 per second.
+    fn mint_event_id(&self, now: u64) -> String {
+        use std::hash::{BuildHasher, Hasher};
+        loop {
+            let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+            h.write_u64(now);
+            let id = format!("e-{now:010}-{:04x}", h.finish() as u16);
+            if !self.threads.iter().any(|t| t.events.iter().any(|e| e.id == id)) {
+                return id;
+            }
+        }
+    }
+
+    /// `owner`'s pending events with their thread keys, oldest first: all of
+    /// them, not just new ones, since delivery is at least once until acked.
+    pub fn events_for(&self, owner: &str) -> Vec<(String, Event)> {
+        let mut out: Vec<(String, Event)> = self
+            .threads
+            .iter()
+            .filter(|t| t.owner == owner && t.kind == Kind::Thread)
+            .flat_map(|t| {
+                let key = t.key.clone().unwrap_or_default();
+                t.events.iter().map(move |e| (key.clone(), e.clone()))
+            })
+            .collect();
+        out.sort_by_key(|(_, e)| e.seq);
+        out
+    }
+
+    /// Drop `owner`'s events with these ids; how many were dropped. Unknown
+    /// ids (already acked, or another owner's) are skipped, so a retried ack
+    /// is harmless and an owner can't ack what isn't its own.
+    pub fn ack(&mut self, owner: &str, ids: &[String]) -> usize {
+        let mut dropped = 0;
+        for t in self.threads.iter_mut().filter(|t| t.owner == owner) {
+            let before = t.events.len();
+            t.events.retain(|e| !ids.contains(&e.id));
+            dropped += before - t.events.len();
+        }
+        dropped
+    }
+
+    /// `owner`'s live dispatcher threads, for `devsbd thread ls`: what a
+    /// dispatcher that lost its own state can read back. Archived ones are
+    /// history it can no longer change.
+    pub fn threads_for(&self, owner: &str) -> Vec<&Thread> {
+        self.threads
+            .iter()
+            .filter(|t| t.owner == owner && t.kind == Kind::Thread && !t.archived)
+            .collect()
+    }
+
     /// Keep `owner` within the cap: archived threads go first, then `done`
     /// ones, and only then does a live thread lose its oldest record or
     /// timeline entry. Retired threads are the cheapest thing to lose, so a
     /// busy dispatcher doesn't shed the history of what it's working on now.
+    /// Events count but are never dropped here: a done thread still holding
+    /// unacked events is kept whole (an archived one goes: its owner can never
+    /// pull them).
     fn enforce_cap(&mut self, owner: &str) {
         while self.weight_for(owner) > INBOX_INSTANCE_CAP {
-            let retired = self
-                .oldest_thread(owner, |t| t.archived)
-                .or_else(|| self.oldest_thread(owner, |t| t.state == Some(State::Done)));
+            let retired = self.oldest_thread(owner, |t| t.archived).or_else(|| {
+                self.oldest_thread(owner, |t| t.state == Some(State::Done) && t.events.is_empty())
+            });
             if let Some(pos) = retired {
                 self.threads.remove(pos);
                 continue;
@@ -443,12 +669,13 @@ impl Inbox {
         }
     }
 
-    /// What `owner` holds against the cap: records and timeline entries alike.
+    /// What `owner` holds against the cap: records, timeline entries and
+    /// pending events alike.
     fn weight_for(&self, owner: &str) -> usize {
         self.threads
             .iter()
             .filter(|t| t.owner == owner)
-            .map(|t| t.notes.len() + t.entries.len())
+            .map(|t| t.notes.len() + t.entries.len() + t.events.len())
             .sum()
     }
 
@@ -533,6 +760,7 @@ impl Inbox {
                     reply: t.reply.clone(),
                     actions: t.actions.clone(),
                     entries: t.entries.clone(),
+                    events: t.events.clone(),
                     notes: t
                         .notes
                         .iter()
@@ -612,6 +840,7 @@ impl Inbox {
                 reply: t.reply,
                 updated_at: t.updated_at,
                 entries: t.entries,
+                events: t.events,
             });
         }
         // Ids keep growing past everything loaded, so arrival order (which the
@@ -623,10 +852,64 @@ impl Inbox {
                 std::iter::once(t.id)
                     .chain(t.notes.iter().map(|n| n.id))
                     .chain(t.entries.iter().map(|e| e.seq))
+                    .chain(t.events.iter().map(|e| e.seq))
             })
             .max()
             .map_or(0, |m| m + 1);
         Ok(inbox)
+    }
+}
+
+/// What one user op does to a thread: an optional state change, the timeline
+/// entry, and the event `(kind, action, text)` for the owner.
+struct UserOp {
+    state: Option<State>,
+    entry: (EntryKind, String),
+    event: (EventKind, Option<String>, Option<String>),
+}
+
+impl UserOp {
+    fn done(action: Option<String>, label: String) -> UserOp {
+        UserOp { state: Some(State::Done), entry: (EntryKind::Done, label), event: (EventKind::Done, action, None) }
+    }
+}
+
+/// `2026-10-02T12:00:01Z` for unix time `at`: the `at` of an event as the
+/// owner sees it (std has no dates; Howard Hinnant's `civil_from_days`).
+pub fn rfc3339(at: u64) -> String {
+    let (days, secs) = ((at / 86_400) as i64, at % 86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        secs / 3600,
+        secs % 3600 / 60,
+        secs % 60
+    )
+}
+
+impl Thread {
+    /// The thread as its owner last put it (`devsbd thread ls`): the put
+    /// shape, so a dispatcher can feed it straight back.
+    pub fn to_put(&self) -> ThreadPut {
+        ThreadPut {
+            key: self.key.clone().unwrap_or_default(),
+            title: self.title.clone(),
+            link: self.link.clone(),
+            state: self.state.unwrap_or_default(),
+            status: self.status.clone(),
+            child: self.child.clone(),
+            message: self.message.clone(),
+            actions: self.actions.clone(),
+            reply: self.reply.clone(),
+        }
     }
 }
 
@@ -805,6 +1088,9 @@ struct SavedThread {
     actions: Vec<Action>,
     #[serde(default, rename = "entry", skip_serializing_if = "Vec::is_empty")]
     entries: Vec<Entry>,
+    /// Pending events (`[[thread.event]]`); defaulted, so no version bump.
+    #[serde(default, rename = "event", skip_serializing_if = "Vec::is_empty")]
+    events: Vec<Event>,
     #[serde(default, rename = "note", skip_serializing_if = "Vec::is_empty")]
     notes: Vec<SavedNote>,
 }
@@ -879,6 +1165,10 @@ mod tests {
                     EntryKind::Message => "message",
                     EntryKind::State => "state",
                     EntryKind::Status => "status",
+                    EntryKind::Action => "action",
+                    EntryKind::Reply => "reply",
+                    EntryKind::Done => "done",
+                    EntryKind::Reopen => "reopen",
                 };
                 (kind, e.text.as_str())
             })
@@ -1013,6 +1303,12 @@ mod tests {
         assert_eq!(inbox.prune(day + RETENTION + 1), 3);
         assert_eq!(inbox.threads.len(), 1);
         assert_eq!(inbox.threads[0].key.as_deref(), Some("old-active"));
+
+        // A done thread whose owner hasn't acked its events yet is kept.
+        inbox.put("web-id", "web", day, ThreadPut { state: State::Done, ..put_body("unacked") });
+        let event = Event { id: "e-0000086400-abcd".into(), seq: 0, kind: EventKind::Done, action: None, text: None, at: day };
+        inbox.threads.iter_mut().find(|t| t.key.as_deref() == Some("unacked")).unwrap().events.push(event);
+        assert_eq!(inbox.prune(day + RETENTION + 1), 0);
 
         // A put from a live container un-archives (ids are never reused, so
         // this only happens to a thread archived in error).
@@ -1195,19 +1491,19 @@ mod tests {
         push(&mut inbox, "b", rec("b1", None, None), true);
 
         let thread_id = inbox.threads.iter().find(|t| t.key.is_some()).unwrap().id;
-        inbox.apply(&Op::RemoveThread(thread_id));
+        inbox.apply(&Op::RemoveThread(thread_id), 0);
         assert_eq!(msgs(&inbox), [("b", "b1"), ("a", "solo")]);
         // Unknown ids are no-ops, not panics.
-        inbox.apply(&Op::RemoveThread(thread_id));
-        inbox.apply(&Op::MarkRead(thread_id));
+        inbox.apply(&Op::RemoveThread(thread_id), 0);
+        inbox.apply(&Op::MarkRead(thread_id), 0);
         assert_eq!(msgs(&inbox), [("b", "b1"), ("a", "solo")]);
 
         // Leaving the Inbox reads every notify record, and only those.
         inbox.put("a-id", "a", 10, put_body("pr-1"));
-        inbox.apply(&Op::MarkNotifyRead);
+        inbox.apply(&Op::MarkNotifyRead, 0);
         let unread: Vec<Kind> = inbox.threads.iter().filter(|t| t.unread).map(|t| t.kind).collect();
         assert_eq!(unread, [Kind::Thread]);
-        inbox.apply(&Op::ClearNotify);
+        inbox.apply(&Op::ClearNotify, 0);
         assert_eq!(inbox.threads.len(), 1, "the dispatcher thread stays");
     }
 
@@ -1229,11 +1525,11 @@ mod tests {
         // Marking the unread record read drops only its own count; an unknown
         // id is a no-op, and a needs-you thread is not an unread flag.
         let note = inbox.threads.iter().find(|t| t.key.is_none()).unwrap().id;
-        inbox.apply(&Op::MarkRead(note));
-        inbox.apply(&Op::MarkRead(u64::MAX));
+        inbox.apply(&Op::MarkRead(note), 0);
+        inbox.apply(&Op::MarkRead(u64::MAX), 0);
         assert_eq!(inbox.needs_you(), 1);
         let asks = find(&inbox, "asks").unwrap().id;
-        inbox.apply(&Op::MarkRead(asks));
+        inbox.apply(&Op::MarkRead(asks), 0);
         assert_eq!(inbox.needs_you(), 1);
 
         // An archived thread is history: it never asks for anything.
@@ -1241,7 +1537,7 @@ mod tests {
         assert_eq!(inbox.needs_you(), 0);
 
         // `D` clears notify records and leaves the dispatcher's threads.
-        inbox.apply(&Op::ClearNotify);
+        inbox.apply(&Op::ClearNotify, 0);
         assert_eq!(inbox.threads.len(), 3);
         assert!(inbox.threads.iter().all(|t| t.kind == Kind::Thread));
     }
@@ -1310,11 +1606,253 @@ mod tests {
             reply: Some(Reply { placeholder: Some("next run".into()) }),
         };
         inbox.put("a-id", "a", 7, full);
+        let id = find(&inbox, "pr-1").unwrap().id;
+        inbox.apply(&Op::Act { thread: id, action: "post".into() }, 8);
+        inbox.apply(&Op::Reply { thread: id, text: "multi \"q\" \\ x".into() }, 8);
         inbox.put("a-id", "a", 9, ThreadPut { status: Some("merged".into()), ..put_body("pr-2") });
         inbox.archive_owner("a-id");
 
         let text = inbox.to_toml().unwrap();
-        assert_eq!(Inbox::from_toml(&text, &BTreeMap::new()).unwrap(), inbox, "{text}");
+        assert!(text.contains("[[thread.event]]"), "{text}");
+        let loaded = Inbox::from_toml(&text, &BTreeMap::new()).unwrap();
+        assert_eq!(loaded, inbox, "{text}");
+        // Event seqs count toward the id counter, so nothing minted later
+        // reuses one.
+        let max = inbox.threads.iter().flat_map(|t| &t.events).map(|e| e.seq).max().unwrap();
+        assert!(loaded.next_id > max);
+    }
+
+    /// The thread pr-1 from `web-id`, with a reply box and three buttons: a
+    /// dispatcher action, a host-only one and a `done: true` one.
+    fn asking(inbox: &mut Inbox) -> u64 {
+        let put = ThreadPut {
+            state: State::NeedsYou,
+            actions: vec![
+                Action { id: "post".into(), label: "Post replies".into(), ..Action::default() },
+                Action {
+                    id: "look".into(),
+                    label: "Look".into(),
+                    host: Some(thread::HostVerb::Terminal(thread::NoArgs {})),
+                    ..Action::default()
+                },
+                Action { id: "fin".into(), label: "Finish".into(), done: true, ..Action::default() },
+            ],
+            reply: Some(Reply { placeholder: None }),
+            ..put_body("pr-1")
+        };
+        inbox.put("web-id", "web", 100, put);
+        find(inbox, "pr-1").unwrap().id
+    }
+
+    fn events(inbox: &Inbox) -> Vec<(EventKind, Option<&str>, Option<&str>)> {
+        let t = find(inbox, "pr-1").unwrap();
+        t.events.iter().map(|e| (e.kind, e.action.as_deref(), e.text.as_deref())).collect()
+    }
+
+    #[test]
+    fn user_ops_add_an_entry_and_an_event() {
+        let mut inbox = Inbox::default();
+        let id = asking(&mut inbox);
+        let before = timeline(find(&inbox, "pr-1").unwrap()).len();
+
+        inbox.apply(&Op::Act { thread: id, action: "post".into() }, 200);
+        inbox.apply(&Op::Reply { thread: id, text: "  rename it  ".into() }, 201);
+        let t = find(&inbox, "pr-1").unwrap();
+        assert_eq!(t.state, Some(State::NeedsYou), "a plain action leaves the state to the dispatcher");
+        assert_eq!(t.updated_at, 201);
+        assert_eq!(timeline(t)[before..], [("action", "Post replies"), ("reply", "rename it")]);
+        assert_eq!(events(&inbox), [
+            (EventKind::Action, Some("post"), None),
+            (EventKind::Reply, None, Some("rename it")),
+        ]);
+
+        // `done: true`: the thread is done, and one `done` event names the button.
+        inbox.apply(&Op::Act { thread: id, action: "fin".into() }, 202);
+        assert_eq!(find(&inbox, "pr-1").unwrap().state, Some(State::Done));
+        assert_eq!(events(&inbox)[2], (EventKind::Done, Some("fin"), None));
+        // Already done: `d` is no transition, so nothing at all.
+        let snapshot = inbox.clone();
+        inbox.apply(&Op::MarkDone(id), 203);
+        assert_eq!(inbox, snapshot);
+        // `u` reopens (active), and only a done thread.
+        inbox.apply(&Op::Reopen(id), 204);
+        inbox.apply(&Op::Reopen(id), 205);
+        assert_eq!(find(&inbox, "pr-1").unwrap().state, Some(State::Active));
+        // `d` on a live thread.
+        inbox.apply(&Op::MarkDone(id), 206);
+        let t = find(&inbox, "pr-1").unwrap();
+        assert_eq!(t.state, Some(State::Done));
+        assert_eq!(
+            timeline(t)[before + 2..],
+            [("done", "Finish"), ("reopen", "reopened"), ("done", "marked done")]
+        );
+        assert_eq!(events(&inbox)[3..], [(EventKind::Reopen, None, None), (EventKind::Done, None, None)]);
+        assert_eq!(t.events.iter().map(|e| e.at).collect::<Vec<_>>(), [200, 201, 202, 204, 206]);
+    }
+
+    #[test]
+    fn user_ops_that_do_nothing() {
+        let mut inbox = Inbox::default();
+        let id = asking(&mut inbox);
+        let snapshot = inbox.clone();
+        for op in [
+            // A host-only button, an unknown action, an empty reply.
+            Op::Act { thread: id, action: "look".into() },
+            Op::Act { thread: id, action: "gone".into() },
+            Op::Reply { thread: id, text: " \n ".into() },
+            Op::Reopen(id),
+            Op::MarkDone(u64::MAX),
+        ] {
+            inbox.apply(&op, 300);
+        }
+        assert_eq!(inbox, snapshot);
+
+        // No reply box: no reply.
+        let plain = put_body("plain");
+        inbox.put("web-id", "web", 100, plain);
+        let plain = find(&inbox, "plain").unwrap().id;
+        inbox.apply(&Op::Reply { thread: plain, text: "hi".into() }, 300);
+        assert!(find(&inbox, "plain").unwrap().events.is_empty());
+
+        // A notify thread has nobody to answer it.
+        push(&mut inbox, "web", rec("note", None, None), true);
+        let note = inbox.threads.iter().find(|t| t.kind == Kind::Notify).unwrap().id;
+        inbox.apply(&Op::MarkDone(note), 300);
+        assert!(inbox.threads.iter().all(|t| t.events.is_empty() || t.key.as_deref() == Some("pr-1")));
+
+        // Archived: read-only, no new events.
+        inbox.archive_owner("web-id");
+        let snapshot = inbox.clone();
+        inbox.apply(&Op::Act { thread: id, action: "post".into() }, 300);
+        inbox.apply(&Op::MarkDone(id), 300);
+        assert_eq!(inbox, snapshot);
+    }
+
+    #[test]
+    fn a_long_reply_is_cut() {
+        let mut inbox = Inbox::default();
+        let id = asking(&mut inbox);
+        inbox.apply(&Op::Reply { thread: id, text: "é".repeat(MAX_REPLY + 5) }, 1);
+        assert_eq!(events(&inbox)[0].2.unwrap().chars().count(), MAX_REPLY);
+    }
+
+    #[test]
+    fn event_ids_have_the_shape_and_are_unique() {
+        let mut inbox = Inbox::default();
+        let id = asking(&mut inbox);
+        // Same second, many events: ids never repeat.
+        for _ in 0..MAX_EVENTS {
+            inbox.apply(&Op::Act { thread: id, action: "post".into() }, 1_790_900_001);
+        }
+        let t = find(&inbox, "pr-1").unwrap();
+        let mut ids: Vec<&str> = t.events.iter().map(|e| e.id.as_str()).collect();
+        assert!(ids.iter().all(|id| crate::devsbd::control::valid_event_id(id)), "{ids:?}");
+        assert!(ids.iter().all(|id| id.starts_with("e-1790900001-")));
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), MAX_EVENTS);
+        // Small times are zero-padded to the same shape.
+        inbox.apply(&Op::Reply { thread: id, text: "x".into() }, 5);
+        let last = &find(&inbox, "pr-1").unwrap().events.last().unwrap().id;
+        assert!(last.starts_with("e-0000000005-"), "{last}");
+    }
+
+    #[test]
+    fn events_are_bounded_per_thread_oldest_first() {
+        let mut inbox = Inbox::default();
+        let id = asking(&mut inbox);
+        for i in 0..MAX_EVENTS + 3 {
+            inbox.apply(&Op::Reply { thread: id, text: format!("r{i}") }, i as u64);
+        }
+        let t = find(&inbox, "pr-1").unwrap();
+        assert_eq!(t.events.len(), MAX_EVENTS);
+        assert_eq!(t.events[0].text.as_deref(), Some("r3"), "the oldest three went");
+    }
+
+    #[test]
+    fn ack_is_idempotent_and_scoped_to_the_owner() {
+        let mut inbox = Inbox::default();
+        let id = asking(&mut inbox);
+        inbox.put("other-id", "other", 100, ThreadPut { reply: Some(Reply::default()), ..put_body("o") });
+        let other = find(&inbox, "o").unwrap().id;
+        inbox.apply(&Op::Reply { thread: other, text: "theirs".into() }, 10);
+        inbox.apply(&Op::Reply { thread: id, text: "one".into() }, 11);
+        inbox.apply(&Op::Act { thread: id, action: "post".into() }, 11);
+
+        let mine = inbox.events_for("web-id");
+        assert_eq!(mine.iter().map(|(k, e)| (k.as_str(), e.kind)).collect::<Vec<_>>(), [
+            ("pr-1", EventKind::Reply),
+            ("pr-1", EventKind::Action),
+        ]);
+        let theirs = inbox.events_for("other-id");
+        assert_eq!(theirs.len(), 1);
+
+        // Another owner's id is not mine to ack.
+        assert_eq!(inbox.ack("web-id", &[theirs[0].1.id.clone()]), 0);
+        assert_eq!(inbox.events_for("other-id").len(), 1);
+        let first = vec![mine[0].1.id.clone()];
+        assert_eq!(inbox.ack("web-id", &first), 1);
+        assert_eq!(inbox.ack("web-id", &first), 0, "acking again is harmless");
+        assert_eq!(inbox.events_for("web-id").len(), 1);
+    }
+
+    /// Events are delivery state: a dispatcher's re-put (even one that
+    /// changes the state back) leaves them and the timeline alone.
+    #[test]
+    fn events_survive_a_put() {
+        let mut inbox = Inbox::default();
+        let id = asking(&mut inbox);
+        inbox.apply(&Op::Act { thread: id, action: "fin".into() }, 200);
+        let entries = find(&inbox, "pr-1").unwrap().entries.len();
+        let again = ThreadPut { status: Some("posting".into()), ..find(&inbox, "pr-1").unwrap().to_put() };
+        let again = ThreadPut { state: State::NeedsYou, ..again };
+        inbox.put("web-id", "web", 300, again);
+        let t = find(&inbox, "pr-1").unwrap();
+        assert_eq!(t.state, Some(State::NeedsYou), "the dispatcher owns the meaning");
+        assert_eq!(t.events.len(), 1);
+        assert_eq!(t.entries.len(), entries + 2, "state + status entries appended, none lost");
+    }
+
+    /// Unacked events count toward the cap but are never what it evicts:
+    /// a done thread still holding events is kept whole.
+    #[test]
+    fn the_cap_keeps_pending_events() {
+        let mut inbox = Inbox::default();
+        let id = asking(&mut inbox);
+        inbox.apply(&Op::Act { thread: id, action: "fin".into() }, 200);
+        let weight = inbox.weight_for("web-id");
+        for i in 0..INBOX_INSTANCE_CAP {
+            push(&mut inbox, "web", rec(&format!("n{i}"), None, None), true);
+        }
+        assert_eq!(inbox.weight_for("web-id"), INBOX_INSTANCE_CAP);
+        let t = find(&inbox, "pr-1").expect("the done thread with an event stays");
+        assert_eq!(t.events.len(), 1);
+        assert!(t.entries.is_empty(), "its history went first ({weight} before)");
+    }
+
+    #[test]
+    fn thread_ls_shape_round_trips_the_put() {
+        let mut inbox = Inbox::default();
+        asking(&mut inbox);
+        inbox.put("web-id", "web", 100, put_body("gone"));
+        inbox.put("other-id", "other", 100, put_body("theirs"));
+        push(&mut inbox, "web", rec("note", Some("pr-1"), None), true);
+        let mine: Vec<ThreadPut> = inbox.threads_for("web-id").iter().map(|t| t.to_put()).collect();
+        assert_eq!(mine.len(), 2, "dispatcher threads only, the owner's only");
+        let json = serde_json::to_string(&mine[1]).unwrap();
+        assert_eq!(thread::parse(&json).as_ref(), Ok(&mine[1]), "{json}");
+        assert!(!json.contains("null"), "absent fields are left out: {json}");
+        inbox.archive_owner("web-id");
+        assert!(inbox.threads_for("web-id").is_empty());
+    }
+
+    #[test]
+    fn rfc3339_dates() {
+        assert_eq!(rfc3339(0), "1970-01-01T00:00:00Z");
+        assert_eq!(rfc3339(1_709_208_000), "2024-02-29T12:00:00Z");
+        assert_eq!(rfc3339(1_790_900_001), "2026-10-02T00:13:21Z");
+        assert_eq!(rfc3339(951_782_400), "2000-02-29T00:00:00Z");
+        assert_eq!(rfc3339(1_735_689_599), "2024-12-31T23:59:59Z");
     }
 
     /// A v1 file (no `version`, threads keyed by instance name, the key on the

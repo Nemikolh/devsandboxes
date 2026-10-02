@@ -28,6 +28,11 @@
 //! its holder (this dispatcher's child, another instance, the base checkout,
 //! or a worktree devsandbox doesn't know), never a host path.
 //!
+//! `events`, `events-ack` and `thread-ls` (docs/inbox-threads.md) read the
+//! shared Inbox store (`crate::inbox::store`) for the requester's own
+//! `instance_id` only: another instance never sees or acks them. `events`
+//! may long-poll up to [`MAX_WAIT`] on the bridge handler thread.
+//!
 //! Children are ordinary instances named `<sandbox>-<key>`. Operations run as
 //! `devsandbox -C <config root> run|start|rebuild|stop|rm …` subprocesses, not
 //! in-process: the handler runs on the TUI's bridge worker and those commands
@@ -46,6 +51,7 @@ use serde::Serialize;
 use crate::commands::run::{instance_at, parse_worktree_list};
 use crate::config::Config;
 use crate::devsbd::control::{self, Op, Request, Response, Status};
+use crate::inbox::{store, Event};
 use crate::runtime::{backend, bounded};
 use crate::state::{Instance, State};
 
@@ -53,10 +59,13 @@ use crate::state::{Instance, State};
 // thread put|rm` checks its key before queuing, and both sides must agree.
 pub use crate::devsbd::control::{valid_key, MAX_KEY};
 
-/// Cap on a `run-wait` request's `timeout`, seconds: each wait holds a bridge
-/// handler thread and a `docker exec`; clients loop (`devsbd run wait`), and
-/// the daemon gives up on a reply after 30 minutes anyway.
-pub const MAX_WAIT: u64 = 300;
+/// Cap on a `run-wait`/`events` request's `timeout`, seconds (a `run-wait`
+/// also holds a `docker exec`). Lives in `control` so the helper caps
+/// `events --wait` with the same number.
+pub use crate::devsbd::control::MAX_WAIT;
+
+/// How often a waiting `events` request re-checks the store's stamp.
+const EVENTS_POLL: Duration = Duration::from_millis(500);
 
 /// Wall-clock limit on one dispatch `devsandbox` subprocess (`ensure`,
 /// `stop`, `rm`): it holds the host-wide control lock, so a wedged build or
@@ -109,6 +118,9 @@ pub trait Executor {
     /// Run host git (`host_git`) on `repo` with `args`, output captured;
     /// stdout on success, else a short message.
     fn git(&mut self, repo: &Path, args: &[String]) -> Result<String, String>;
+    /// The Inbox store file (`inbox::store::path`) the event ops read and
+    /// ack; a temp file in tests.
+    fn inbox_path(&self) -> Result<PathBuf, String>;
 }
 
 /// Load state and the dispatcher's config, then [`handle_with`] the real
@@ -299,6 +311,106 @@ pub(crate) fn handle_with(
             };
             branches(state, owner_id, &base, req.ahead, exec)
         }
+        Op::Events | Op::EventsAck | Op::ThreadLs => {
+            let path = match exec.inbox_path() {
+                Ok(path) => path,
+                Err(e) => return failed(e),
+            };
+            match req.op {
+                Op::Events => events(&path, owner_id, req.timeout.unwrap_or(0).min(MAX_WAIT)),
+                Op::EventsAck => match store::update_at(&path, |i| i.ack(owner_id, &req.ack)) {
+                    Ok(n) => Response::new(Status::Ok, n.to_string()),
+                    Err(e) => failed(format!("{e:#}")),
+                },
+                _ => thread_ls(&path, owner_id),
+            }
+        }
+    }
+}
+
+/// Room left in a response for the event ops' JSON: the response encoding
+/// escapes backslashes and newlines again, so a body may double in size.
+const EVENTS_BODY_CAP: usize = control::MAX_RESPONSE / 2 - 1024;
+
+/// One `events` line: the module doc of `devsbd::control` is the format.
+#[derive(Serialize)]
+struct EventLine<'a> {
+    id: &'a str,
+    key: &'a str,
+    kind: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    action: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<&'a str>,
+    at: String,
+}
+
+/// The `events` body for `pending` (oldest first): JSON lines, cut before
+/// [`EVENTS_BODY_CAP`] — the rest is still pending and comes with the next
+/// call, once the owner acked these.
+fn events_body(pending: &[(String, Event)]) -> String {
+    let mut body = String::new();
+    for (key, e) in pending {
+        let line = EventLine {
+            id: &e.id,
+            key,
+            kind: e.kind.as_str(),
+            action: e.action.as_deref(),
+            text: e.text.as_deref(),
+            at: crate::inbox::rfc3339(e.at),
+        };
+        let Ok(json) = serde_json::to_string(&line) else { continue };
+        if !body.is_empty() && body.len() + json.len() + 1 > EVENTS_BODY_CAP {
+            break;
+        }
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        body.push_str(&json);
+    }
+    body
+}
+
+/// `events`: `owner_id`'s pending events in the store at `path`. With
+/// nothing pending and a `timeout`, wait on the handler thread, re-reading
+/// the store only when its stamp moves (checked every [`EVENTS_POLL`]); an
+/// empty body on timeout. Reads only: no lock beyond the store's own shared
+/// one, so a waiting `events` never holds up a click being written.
+fn events(path: &Path, owner_id: &str, timeout: u64) -> Response {
+    let deadline = Instant::now() + Duration::from_secs(timeout);
+    let mut seen = None;
+    loop {
+        // Stamp before reading: a write in between only costs one more read.
+        let stamp = Some(store::stamp_at(path));
+        if stamp != seen {
+            seen = stamp;
+            let pending = match store::load_at(path) {
+                Ok(inbox) => inbox.events_for(owner_id),
+                Err(e) => return failed(format!("{e:#}")),
+            };
+            if !pending.is_empty() {
+                return Response::new(Status::Ok, events_body(&pending));
+            }
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Response::new(Status::Ok, "");
+        }
+        std::thread::sleep(left.min(EVENTS_POLL));
+    }
+}
+
+/// `thread-ls`: `owner_id`'s live threads as a JSON array of put bodies.
+fn thread_ls(path: &Path, owner_id: &str) -> Response {
+    let inbox = match store::load_at(path) {
+        Ok(inbox) => inbox,
+        Err(e) => return failed(format!("{e:#}")),
+    };
+    let puts: Vec<_> = inbox.threads_for(owner_id).iter().map(|t| t.to_put()).collect();
+    match serde_json::to_string(&puts) {
+        Ok(json) if json.len() > EVENTS_BODY_CAP => failed(format!("{} threads: too large to list", puts.len())),
+        Ok(json) => Response::new(Status::Ok, json),
+        Err(e) => failed(e.to_string()),
     }
 }
 
@@ -311,6 +423,8 @@ fn check_fields(req: &Request) -> Result<(), String> {
         Op::Ls => (Some(false), Some(false)),
         Op::Ensure => (Some(true), Some(true)),
         Op::Branches => (Some(true), Some(false)),
+        // Always the requester's own: nothing to name.
+        Op::Events | Op::EventsAck | Op::ThreadLs => (Some(false), Some(false)),
         _ => (None, Some(true)),
     };
     let only = |ops: &[Op], optional: bool| match (ops.contains(&req.op), optional) {
@@ -331,7 +445,8 @@ fn check_fields(req: &Request) -> Result<(), String> {
     field("arg", only(&[Op::Exec], false), !req.argv.is_empty())?;
     field("id", only(&[Op::RunLogs, Op::RunWait, Op::RunRm], false), req.id.is_some())?;
     field("offset", only(&[Op::RunLogs], true), req.offset.is_some())?;
-    field("timeout", only(&[Op::RunWait], true), req.timeout.is_some())?;
+    field("timeout", only(&[Op::RunWait, Op::Events], true), req.timeout.is_some())?;
+    field("ack", only(&[Op::EventsAck], false), !req.ack.is_empty())?;
     field("force", only(&[Op::RunRm], true), req.force)?;
     field("keep", only(&[Op::RunPrune], true), req.keep.is_some())?;
     field("ahead", only(&[Op::Branches], true), req.ahead)?;
@@ -345,6 +460,9 @@ fn check_fields(req: &Request) -> Result<(), String> {
     }
     if let Some(id) = req.id.as_deref().filter(|id| !control::valid_run_id(id)) {
         return Err(format!("bad run id `{id}`"));
+    }
+    if let Some(id) = req.ack.iter().find(|id| !control::valid_event_id(id)) {
+        return Err(format!("bad event id `{id}`"));
     }
     // Not echoed: it may hold control characters or template syntax.
     if req.branch.as_deref().is_some_and(|b| !control::valid_branch(b)) {
@@ -386,7 +504,9 @@ fn helper_argv(req: &Request) -> Vec<String> {
                 argv.extend([s("--keep"), keep.to_string()]);
             }
         }
-        Op::Ensure | Op::Ls | Op::Stop | Op::Rm | Op::Branches => unreachable!("not a run op"),
+        Op::Ensure | Op::Ls | Op::Stop | Op::Rm | Op::Branches | Op::Events | Op::EventsAck | Op::ThreadLs => {
+            unreachable!("not a run op")
+        }
     }
     argv
 }
@@ -876,6 +996,10 @@ impl Executor for Subprocess {
         }
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
+
+    fn inbox_path(&self) -> Result<PathBuf, String> {
+        store::path().map_err(|e| format!("{e:#}"))
+    }
 }
 
 /// `<data>/devsandbox/logs/dispatch-<unix>-<op>.log` (next to `state.toml`,
@@ -978,6 +1102,8 @@ folder = "."
         saved: Vec<(String, BTreeMap<String, String>)>,
         git_out: BTreeMap<Vec<String>, String>,
         gits: Vec<(PathBuf, Vec<String>)>,
+        /// The Inbox store the event ops use; `None` = the ops fail.
+        inbox: Option<PathBuf>,
     }
 
     impl Fake {
@@ -1009,6 +1135,9 @@ folder = "."
         fn git(&mut self, repo: &Path, args: &[String]) -> Result<String, String> {
             self.gits.push((repo.to_path_buf(), args.to_vec()));
             self.git_out.get(args).cloned().ok_or_else(|| format!("no canned `git {}`", args.join(" ")))
+        }
+        fn inbox_path(&self) -> Result<PathBuf, String> {
+            self.inbox.clone().ok_or_else(|| "no inbox in this test".into())
         }
     }
 
@@ -1775,6 +1904,188 @@ folder = "."
         assert!(resp.body.contains("no canned `git for-each-ref"), "{resp:?}");
         s.instances.get_mut("a").unwrap().config_dir = s.instances["d"].config_dir.clone();
         assert_eq!(call(&s, "a", &branches_req("web", false), &mut branches_fake()).status, Status::Ok);
+    }
+
+    /// A fresh store under the temp dir with a reply-taking thread `pr-1`
+    /// for each of dispatchers `d` and `a` (owner id = state key here), and
+    /// a Fake pointing at it.
+    fn inbox_fake(name: &str) -> (PathBuf, Fake) {
+        use crate::inbox::{Reply, State as TState, ThreadPut};
+        let dir = std::env::temp_dir().join(format!("devsandbox-dispatch-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("inbox.toml");
+        store::update_at(&path, |i| {
+            for owner in ["d", "a"] {
+                let put = ThreadPut {
+                    key: "pr-1".into(),
+                    title: "PR 1".into(),
+                    state: TState::NeedsYou,
+                    reply: Some(Reply::default()),
+                    ..ThreadPut::default()
+                };
+                i.put(owner, owner, 1, put);
+            }
+        })
+        .unwrap();
+        let fake = Fake { inbox: Some(path.clone()), ..Fake::new() };
+        (path, fake)
+    }
+
+    /// The user replies `text` on `owner`'s thread, as a dashboard would.
+    fn reply(path: &Path, owner: &str, text: &str, at: u64) {
+        store::update_at(path, |i| {
+            let id = i.threads.iter().find(|t| t.owner == owner).unwrap().id;
+            i.apply(&crate::inbox::Op::Reply { thread: id, text: text.into() }, at);
+        })
+        .unwrap();
+    }
+
+    fn lines(resp: &Response) -> Vec<serde_json::Value> {
+        resp.body.lines().map(|l| serde_json::from_str(l).unwrap()).collect()
+    }
+
+    #[test]
+    fn events_are_the_owners_own_as_json_lines() {
+        let s = state();
+        let (path, mut fake) = inbox_fake("lines");
+        reply(&path, "d", "first \"one\"", 1_790_900_001);
+        reply(&path, "a", "not yours", 1_790_900_002);
+        reply(&path, "d", "second", 1_790_900_042);
+
+        let resp = call(&s, "d", &Request::new(Op::Events), &mut fake);
+        assert_eq!(resp.status, Status::Ok, "{resp:?}");
+        let got = lines(&resp);
+        assert_eq!(got.len(), 2, "{}", resp.body);
+        assert_eq!(got[0]["key"], "pr-1");
+        assert_eq!(got[0]["kind"], "reply");
+        assert_eq!(got[0]["text"], "first \"one\"");
+        assert_eq!(got[0]["at"], "2026-10-02T00:13:21Z");
+        assert!(got[0].get("action").is_none(), "absent fields are left out");
+        assert!(control::valid_event_id(got[0]["id"].as_str().unwrap()));
+        assert_eq!(got[1]["text"], "second", "oldest first");
+        // Survives the response encoding.
+        let wire = control::decode_response(&control::encode_response(&resp)).unwrap();
+        assert_eq!(wire, resp);
+
+        // At least once: asking again returns the same, until acked.
+        assert_eq!(call(&s, "d", &Request::new(Op::Events), &mut fake), resp);
+        let ids: Vec<String> = got.iter().map(|e| e["id"].as_str().unwrap().to_string()).collect();
+        let theirs = lines(&call(&s, "a", &Request::new(Op::Events), &mut fake));
+        assert_eq!(theirs.len(), 1);
+        assert_eq!(theirs[0]["text"], "not yours");
+
+        // Acking another dispatcher's id does nothing to it.
+        let foreign = Request { ack: vec![theirs[0]["id"].as_str().unwrap().into()], ..Request::new(Op::EventsAck) };
+        assert_eq!(call(&s, "d", &foreign, &mut fake).body, "0");
+        assert_eq!(lines(&call(&s, "a", &Request::new(Op::Events), &mut fake)).len(), 1);
+        let ack = Request { ack: ids, ..Request::new(Op::EventsAck) };
+        assert_eq!(call(&s, "d", &ack, &mut fake), Response::new(Status::Ok, "2"));
+        assert_eq!(call(&s, "d", &ack, &mut fake), Response::new(Status::Ok, "0"), "idempotent");
+        assert_eq!(call(&s, "d", &Request::new(Op::Events), &mut fake), Response::new(Status::Ok, ""));
+    }
+
+    #[test]
+    fn event_ops_need_a_dispatcher_and_well_formed_fields() {
+        let s = state();
+        let (_path, mut fake) = inbox_fake("auth");
+        let id = "e-1790900001-3f2a";
+        let ack = |ids: &[&str]| Request { ack: ids.iter().map(|s| s.to_string()).collect(), ..Request::new(Op::EventsAck) };
+        let cases: &[(&str, Request, Status, &str)] = &[
+            ("p", Request::new(Op::Events), Status::Denied, "does not declare `dispatcher`"),
+            ("p", ack(&[id]), Status::Denied, "does not declare"),
+            ("p", Request::new(Op::ThreadLs), Status::Denied, "does not declare"),
+            ("web-one", Request::new(Op::Events), Status::Denied, "children can't be dispatchers"),
+            ("ghost", Request::new(Op::ThreadLs), Status::Denied, "not an instance"),
+            ("d", Request::new(Op::EventsAck), Status::Usage, "`events-ack` needs `ack`"),
+            ("d", ack(&["e-1"]), Status::Usage, "bad event id `e-1`"),
+            ("d", Request { ack: vec![id.into()], ..Request::new(Op::Events) }, Status::Usage, "`events` takes no `ack`"),
+            ("d", Request { timeout: Some(1), ..Request::new(Op::ThreadLs) }, Status::Usage, "`thread-ls` takes no `timeout`"),
+            ("d", Request { key: Some("pr-1".into()), ..Request::new(Op::Events) }, Status::Usage, "`events` takes no `key`"),
+            ("d", Request { sandbox: Some("web".into()), ..Request::new(Op::ThreadLs) }, Status::Usage, "takes no `sandbox`"),
+            ("d", Request { timeout: Some(1), ..run_req(Op::RunLs, "one") }, Status::Usage, "`run-ls` takes no `timeout`"),
+            ("d", Request { ack: vec![id.into()], ..run_req(Op::RunLs, "one") }, Status::Usage, "takes no `ack`"),
+        ];
+        for (who, r, status, needle) in cases {
+            let resp = call(&s, who, r, &mut fake);
+            assert_eq!(resp.status, *status, "{who} {r:?}: {resp:?}");
+            assert!(resp.body.contains(needle), "{who} {r:?}: {resp:?}");
+        }
+        // No store: a failure, not a panic.
+        let resp = call(&s, "d", &Request::new(Op::Events), &mut Fake::new());
+        assert_eq!(resp, Response::new(Status::Failed, "no inbox in this test"));
+    }
+
+    #[test]
+    fn events_wait_wakes_on_an_enqueue_and_times_out_empty() {
+        let s = state();
+        let (path, mut fake) = inbox_fake("wait");
+        // Nothing pending: an empty body once the timeout passes.
+        let started = Instant::now();
+        let resp = call(&s, "d", &Request { timeout: Some(1), ..Request::new(Op::Events) }, &mut fake);
+        assert_eq!(resp, Response::new(Status::Ok, ""));
+        assert!(started.elapsed() >= Duration::from_secs(1));
+        // No timeout: at once.
+        let started = Instant::now();
+        assert_eq!(call(&s, "d", &Request::new(Op::Events), &mut fake).body, "");
+        assert!(started.elapsed() < Duration::from_millis(500));
+
+        // Another dispatcher's event doesn't wake this one; ours does, well
+        // before the timeout.
+        let writer = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                reply(&path, "a", "theirs", 10);
+                std::thread::sleep(Duration::from_millis(700));
+                reply(&path, "d", "ours", 11);
+            })
+        };
+        let started = Instant::now();
+        let resp = call(&s, "d", &Request { timeout: Some(30), ..Request::new(Op::Events) }, &mut fake);
+        writer.join().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+        let got = lines(&resp);
+        assert_eq!(got.len(), 1, "{resp:?}");
+        assert_eq!(got[0]["text"], "ours");
+    }
+
+    #[test]
+    fn thread_ls_lists_the_owners_threads_in_put_shape() {
+        let s = state();
+        let (path, mut fake) = inbox_fake("ls");
+        let resp = call(&s, "d", &Request::new(Op::ThreadLs), &mut fake);
+        assert_eq!(resp.status, Status::Ok, "{resp:?}");
+        let got: Vec<crate::inbox::ThreadPut> = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!((got[0].key.as_str(), got[0].title.as_str()), ("pr-1", "PR 1"));
+        assert!(got[0].reply.is_some());
+        // Archived (the owner was removed) is history, not listed.
+        store::update_at(&path, |i| i.archive_owner("d")).unwrap();
+        assert_eq!(call(&s, "d", &Request::new(Op::ThreadLs), &mut fake).body, "[]");
+        assert_eq!(call(&s, "a", &Request::new(Op::ThreadLs), &mut fake).body.matches("\"key\"").count(), 1);
+    }
+
+    #[test]
+    fn events_body_stops_at_the_size_cap() {
+        let big = "x".repeat(1000);
+        let pending: Vec<(String, Event)> = (0..2000)
+            .map(|i| {
+                let e = Event {
+                    id: format!("e-0000000000-{:04x}", i),
+                    seq: i,
+                    kind: crate::inbox::EventKind::Reply,
+                    action: None,
+                    text: Some(big.clone()),
+                    at: 0,
+                };
+                ("k".to_string(), e)
+            })
+            .collect();
+        let body = events_body(&pending);
+        assert!(body.len() <= EVENTS_BODY_CAP);
+        let n = body.lines().count();
+        assert!(n > 100 && n < 2000, "{n}");
+        assert!(body.lines().next().unwrap().contains("e-0000000000-0000"), "oldest kept");
     }
 
     #[test]

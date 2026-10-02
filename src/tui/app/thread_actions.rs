@@ -1,23 +1,20 @@
-//! Host actions on an Inbox thread (docs/inbox-threads.md, *Actions*, step
-//! 5): the `1`-`9` buttons with a `host` verb and the pane's fixed `o`/`t`/
-//! `l`/`p` keys. Each maps onto the plumbing the dashboard already has for a
-//! selected instance (`PromptAction::Code`, the terminal panel, the logs
-//! modal, `pending_port`, `pending_open`, `PromptAction::Rm`), aimed at the
-//! thread's target instead of a table row.
+//! Actions on an Inbox thread (docs/inbox-threads.md, *Actions*): the `1`-`9`
+//! buttons and the pane's fixed `o`/`t`/`l`/`p` keys. A host verb maps onto
+//! the plumbing the dashboard already has for a selected instance
+//! (`PromptAction::Code`, the terminal panel, the logs modal, `pending_port`,
+//! `pending_open`, `PromptAction::Rm`), aimed at the thread's target instead
+//! of a table row. A button's dispatcher half (no `host`, `notify`, `done`)
+//! is an [`Op::Act`] for the store, which enqueues the owner's event.
 //!
 //! The target is the one thing a thread body can't choose freely: its
 //! `child` (one of the owner's dispatcher children), else the owner itself.
 //! Nothing a container writes can aim a host action at another instance.
 
 use crate::inbox::thread::HostVerb;
-use crate::inbox::Thread;
+use crate::inbox::{Op, Thread};
 use crate::tui::prompt::PromptAction;
 
 use super::{App, PortRequest};
-
-/// What a button's dispatcher half (an event for the owner) shows until
-/// events exist (step 6).
-const EVENTS_LATER: &str = "the dispatcher part arrives with events";
 
 impl App {
     /// The instance `t`'s host actions act on, or a status line saying why
@@ -51,17 +48,30 @@ impl App {
 
     /// `1`-`9`: run action `n` (0-based) of `t`. A host verb runs now; the
     /// dispatcher half of an action (`notify`, `done`, or no `host` at all)
-    /// waits for events, and the status line says so.
+    /// is queued as an event for the owner, and the status line says so. A
+    /// host verb that can't run (no target) sends no event either: the click
+    /// didn't do what the button says.
     pub(super) fn run_thread_action(&mut self, t: &Thread, n: usize) {
         let Some(action) = t.actions.get(n) else {
             self.status = Some(format!("no action {}", n + 1));
             return;
         };
+        if t.archived {
+            self.status = Some(format!("archived: `{}` was removed", t.owner_name));
+            return;
+        }
+        let queued = action.enqueues_event().then(|| {
+            // Step 7: a `done: true` action also marks the child done here.
+            let what = if action.done { "done" } else { "event" };
+            format!("{what} queued for {}", t.owner_name)
+        });
+        let act = Op::Act { thread: t.id, action: action.id.clone() };
         let Some(host) = &action.host else {
-            self.status = Some(format!("[{}] {}: needs events", n + 1, action.label));
+            self.request_inbox(act);
+            self.status = Some(format!("[{}] {} · {}", n + 1, action.label, queued.unwrap_or_default()));
             return;
         };
-        let later = (action.notify || action.done).then_some(EVENTS_LATER);
+        let later = queued.as_deref();
         // `open` needs no instance, but an archived thread is read-only all
         // the same.
         let target = match host {
@@ -80,6 +90,9 @@ impl App {
                 let note: Vec<&str> = dropped.as_deref().into_iter().chain(later).collect();
                 self.code_note = (!note.is_empty()).then(|| note.join(" · "));
                 self.pending_action = Some(PromptAction::Code { instance: target });
+                if later.is_some() {
+                    self.request_inbox(act);
+                }
                 return;
             }
             HostVerb::Terminal(_) => self.open_instance_terminal(&target),
@@ -97,6 +110,7 @@ impl App {
             }
         }
         if let Some(later) = later {
+            self.request_inbox(act);
             self.status = Some(match self.status.take() {
                 Some(s) => format!("{s} · {later}"),
                 None => later.to_string(),
@@ -382,18 +396,26 @@ mod tests {
             Action { done: true, ..act("Code", Some(HostVerb::Vscode(Vscode::default()))) },
         ]);
 
-        // No host: greyed, a hint, nothing queued.
-        app.on_key(key(KeyCode::Char('1')));
-        assert_eq!(app.status.as_deref(), Some("[1] Post: needs events"));
-        assert_eq!((app.take_pending_open(), app.pending_action.take()), (None, None));
+        let id = app.inbox.open_thread().unwrap().id;
+        let acted = |action: &str| vec![Op::Act { thread: id, action: action.into() }];
 
-        // Host + notify: the host part runs, the rest is announced.
+        // No host: only the event, for the store to stamp.
+        app.on_key(key(KeyCode::Char('1')));
+        assert_eq!(app.take_pending_inbox(), acted("post"));
+        assert_eq!(app.status.as_deref(), Some("[1] Post · event queued for inst0"));
+        assert_eq!((app.take_pending_open(), app.pending_action.take()), (None, None));
+        assert!(app.inbox.open_thread().unwrap().events.is_empty(), "not applied to the local copy");
+
+        // Host + notify: the host part runs, and the event is queued.
         app.on_key(key(KeyCode::Char('2')));
         assert_eq!(app.take_pending_open().as_deref(), Some("https://x/1"));
-        assert!(app.status.as_deref().unwrap().ends_with(EVENTS_LATER), "{:?}", app.status);
+        assert_eq!(app.take_pending_inbox(), acted("look"));
+        assert!(app.status.as_deref().unwrap().ends_with("event queued for inst0"), "{:?}", app.status);
+        // Host + done: VS Code, plus the done event (noted on the launch).
         app.on_key(key(KeyCode::Char('3')));
         assert!(app.pending_action.take().is_some());
-        assert_eq!(app.code_note.take().as_deref(), Some(EVENTS_LATER));
+        assert_eq!(app.take_pending_inbox(), acted("code"));
+        assert_eq!(app.code_note.take().as_deref(), Some("done queued for inst0"));
 
         // Past the last action: nothing at all.
         app.on_key(key(KeyCode::Char('4')));
@@ -401,5 +423,21 @@ mod tests {
         assert_eq!(app.tab, Tab::Inbox, "`4` stays shadowed");
         assert_eq!((app.take_pending_open(), app.pending_action.take(), app.take_pending_port()), (None, None, None));
         assert!(app.terms.is_empty() && matches!(app.modal, Modal::None));
+        assert_eq!(app.take_pending_inbox(), []);
+    }
+
+    /// A host-only button never reaches the owner; one whose host verb
+    /// can't run sends nothing either.
+    #[test]
+    fn host_only_and_refused_targets_queue_no_event() {
+        let mut app = app_with_instances();
+        open_thread(&mut app, Some("gone"), vec![
+            act("Shell", Some(HostVerb::Terminal(NoArgs {}))),
+            Action { notify: true, ..act("Logs", Some(HostVerb::Logs(NoArgs {}))) },
+        ]);
+        app.on_key(key(KeyCode::Char('1')));
+        app.on_key(key(KeyCode::Char('2')));
+        assert!(app.status.as_deref().unwrap().contains("child `gone` not found"), "{:?}", app.status);
+        assert_eq!(app.take_pending_inbox(), []);
     }
 }

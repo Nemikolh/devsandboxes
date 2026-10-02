@@ -375,7 +375,10 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
         // for, then reload when the store moved (ours or someone else's).
         let ops = app.take_pending_inbox();
         if !ops.is_empty() {
-            if let Err(e) = inbox::store::update(|i| ops.iter().for_each(|op| i.apply(op))) {
+            // Stamped here, under the store lock, not in `App`: event ids
+            // and times are minted where every dashboard's writes serialize.
+            let now = crate::state::Instance::now();
+            if let Err(e) = inbox::store::update(|i| ops.iter().for_each(|op| i.apply(op, now))) {
                 app.status = Some(format!("inbox not saved: {e:#}"));
             }
             reload_inbox = true;
