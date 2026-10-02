@@ -3,10 +3,10 @@
 //! data from the latest snapshot.
 
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table, TableState, Tabs};
+use ratatui::widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table, TableState};
 use tui_term::widget::{Cursor, PseudoTerminal};
 
 use super::app::{
@@ -53,8 +53,10 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
 }
 
-fn draw_tabs(frame: &mut Frame, app: &App, area: Rect) {
-    // Right-aligned totals summary shares the tab-bar row; tabs take the rest.
+/// The tab bar row's `(tabs, totals)` split, plus the totals text. The
+/// right-aligned totals share the row; the tabs take the rest. Shared by the
+/// draw path and [`tab_hit`], so a click can't land on a clipped title.
+fn tab_bar_areas(app: &App, area: Rect) -> (Rect, Rect, Option<String>) {
     let totals = app
         .snapshot
         .as_ref()
@@ -68,21 +70,68 @@ fn draw_tabs(frame: &mut Frame, app: &App, area: Rect) {
     };
     let [tabs_area, totals_area] =
         Layout::horizontal([Constraint::Min(0), Constraint::Length(reserve)]).areas(area);
+    (tabs_area, totals_area, (reserve > 0).then_some(totals).flatten())
+}
 
-    let selected = Tab::ALL.iter().position(|t| *t == app.tab).unwrap_or(0);
-    let tabs = Tabs::new(Tab::ALL.iter().map(|t| app.tab_title(*t)))
-        .select(selected)
-        .style(Style::default())
-        .highlight_style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
-        .divider(" ");
-    frame.render_widget(tabs, tabs_area);
+/// Padding on each side of a tab title, and the divider between tabs: what
+/// ratatui's `Tabs` drew (its default padding, our `" "` divider) before the
+/// bar was rendered by hand for click hit-testing.
+const TAB_PAD: u16 = 1;
+const TAB_DIVIDER: u16 = 1;
 
-    if reserve > 0 {
-        if let Some(totals) = totals {
-            let line = Line::from(Span::styled(totals, Style::default().add_modifier(Modifier::DIM)))
-                .alignment(Alignment::Right);
-            frame.render_widget(Paragraph::new(line), totals_area);
+/// Every tab with its title and the columns it covers (title plus its
+/// padding), relative to the tab area's left edge and unclipped. The one
+/// layout both [`draw_tabs`] and [`tab_hit`] read, so a click lands on the
+/// tab drawn there; `Tabs`' internal layout isn't exposed to mirror.
+pub(crate) fn tab_spans(app: &App) -> Vec<(Tab, String, std::ops::Range<u16>)> {
+    let mut x = 0;
+    Tab::ALL
+        .iter()
+        .map(|&tab| {
+            let title = app.tab_title(tab);
+            let end = x + TAB_PAD + cols(&title) as u16 + TAB_PAD;
+            let span = (tab, title, x..end);
+            x = end + TAB_DIVIDER;
+            span
+        })
+        .collect()
+}
+
+/// The tab under a click at `(col, row)` on a frame of size `frame`: the tab
+/// bar is the frame's first row (see [`draw`]).
+pub(crate) fn tab_hit(app: &App, frame: Rect, col: u16, row: u16) -> Option<Tab> {
+    if row != frame.y || frame.height == 0 {
+        return None;
+    }
+    let (tabs_area, _, _) = tab_bar_areas(app, Rect { height: 1, ..frame });
+    if col < tabs_area.x || col >= tabs_area.right() {
+        return None;
+    }
+    let rel = col - tabs_area.x;
+    tab_spans(app).into_iter().find(|(_, _, r)| r.contains(&rel)).map(|(t, _, _)| t)
+}
+
+fn draw_tabs(frame: &mut Frame, app: &App, area: Rect) {
+    let (tabs_area, totals_area, totals) = tab_bar_areas(app, area);
+
+    let highlight = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
+    let pad = " ".repeat(TAB_PAD as usize);
+    let mut spans = Vec::new();
+    for (i, (tab, title, _)) in tab_spans(app).into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw(" ".repeat(TAB_DIVIDER as usize)));
         }
+        let style = if tab == app.tab { highlight } else { Style::default() };
+        spans.push(Span::raw(pad.clone()));
+        spans.push(Span::styled(title, style));
+        spans.push(Span::raw(pad.clone()));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), tabs_area);
+
+    if let Some(totals) = totals {
+        let line = Line::from(Span::styled(totals, Style::default().add_modifier(Modifier::DIM)))
+            .alignment(Alignment::Right);
+        frame.render_widget(Paragraph::new(line), totals_area);
     }
 }
 
@@ -787,37 +836,159 @@ fn view_short(view: View) -> &'static str {
 /// see `View::step`), zero counts left out. Narrower widths drop the counts,
 /// then shorten the names.
 fn view_strip(current: View, counts: [usize; 4], width: usize) -> Line<'static> {
+    Line::from(view_strip_parts(current, counts, width).into_iter().map(|(s, _)| s).collect::<Vec<_>>())
+}
+
+/// What a click on a view-strip span does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StripHit {
+    /// `‹`: one view left.
+    Prev,
+    /// `›`: one view right.
+    Next,
+    /// A view's name (or its count).
+    View(View),
+}
+
+/// [`view_strip`]'s spans, each tagged with what a click on it does, so
+/// drawing and [`view_strip_hit`] can't disagree on where a name sits.
+fn view_strip_parts(current: View, counts: [usize; 4], width: usize) -> Vec<(Span<'static>, Option<StripHit>)> {
     let dim = Style::default().add_modifier(Modifier::DIM);
     let build = |counts_on: bool, short: bool| {
         let first = current == View::ALL[0];
         let last = current == View::ALL[View::ALL.len() - 1];
-        let mut spans = vec![Span::raw(" "), Span::styled("‹ ", if first { dim } else { Style::default() })];
+        let mut spans = vec![
+            (Span::raw(" "), None),
+            (Span::styled("‹ ", if first { dim } else { Style::default() }), Some(StripHit::Prev)),
+        ];
         for (i, view) in View::ALL.iter().enumerate() {
             if i > 0 {
-                spans.push(Span::styled(" │ ", dim));
+                spans.push((Span::styled(" │ ", dim), None));
             }
             let style = if *view == current {
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
             } else {
                 dim
             };
-            spans.push(Span::styled(if short { view_short(*view) } else { view.title() }, style));
+            let hit = Some(StripHit::View(*view));
+            spans.push((Span::styled(if short { view_short(*view) } else { view.title() }, style), hit));
             if counts_on && counts[i] > 0 {
-                spans.push(Span::styled(format!(" {}", counts[i]), dim));
+                spans.push((Span::styled(format!(" {}", counts[i]), dim), hit));
             }
         }
-        spans.push(Span::styled(" ›", if last { dim } else { Style::default() }));
-        Line::from(spans)
+        spans.push((Span::styled(" ›", if last { dim } else { Style::default() }), Some(StripHit::Next)));
+        spans
     };
+    let width_of = |parts: &[(Span, Option<StripHit>)]| parts.iter().map(|(s, _)| s.width()).sum::<usize>();
     [(true, false), (false, false)]
         .into_iter()
         .map(|(c, s)| build(c, s))
-        .find(|l| l.width() <= width)
+        .find(|p| width_of(p) <= width)
         .unwrap_or_else(|| build(false, true))
 }
 
+/// What a click `x` columns into a `width`-wide view strip hits.
+pub(crate) fn view_strip_hit(current: View, counts: [usize; 4], width: usize, x: u16) -> Option<StripHit> {
+    let mut start = 0;
+    for (span, hit) in view_strip_parts(current, counts, width) {
+        let end = start + span.width();
+        if (start..end).contains(&(x as usize)) {
+            return hit;
+        }
+        start = end;
+    }
+    None
+}
+
+/// The list column's `(view strip, list block)` split.
+fn inbox_list_areas(area: Rect) -> (Rect, Rect) {
+    let [strip, list] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+    (strip, list)
+}
+
+/// Position (into `InboxView::rows`) of the card drawn at `row` in the list
+/// block's `inner` area, cards starting at `offset`: three rows per card, the
+/// third a spacer that hits nothing (see [`draw_inbox_list`]).
+fn card_at(inner: Rect, offset: usize, len: usize, row: u16) -> Option<usize> {
+    if row < inner.y || row >= inner.bottom() {
+        return None;
+    }
+    let rel = (row - inner.y) as usize;
+    let pos = offset + rel / CARD_ROWS;
+    (rel % CARD_ROWS != CARD_ROWS - 1 && pos < len).then_some(pos)
+}
+
+/// Rows the thread pane keeps under its content: the reply input (a thread
+/// taking replies), a one-line hint (a dispatcher thread that doesn't), or
+/// none (a notify thread, which can't be replied to).
+fn pane_bottom_rows(t: &Thread) -> u16 {
+    match (t.kind, &t.reply) {
+        (_, Some(_)) => 3,
+        (Kind::Thread, None) => 1,
+        (Kind::Notify, None) => 0,
+    }
+}
+
+/// The thread pane's `(content, bottom)` split of its block's inner area.
+fn pane_areas(inner: Rect, bottom: u16) -> (Rect, Rect) {
+    let [content, bottom_area] = Layout::vertical([Constraint::Min(0), Constraint::Length(bottom)]).areas(inner);
+    (content, bottom_area)
+}
+
+/// What a click on the Inbox tab lands on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InboxHit {
+    Strip(StripHit),
+    /// A card, by position in `InboxView::rows`.
+    Card(usize),
+    /// The list block off any card: a spacer, a border, blank rows.
+    ListBlank,
+    /// The thread pane above its input or hint (borders included).
+    Thread,
+    /// The reply input box.
+    Input,
+    /// The "takes no replies" hint row.
+    Hint,
+}
+
+/// What's under `(col, row)` on the Inbox tab for a frame of size `frame`,
+/// from the same layout functions [`draw_inbox`] uses and the list offset it
+/// last drew with, so a click hits what is on screen.
+pub(crate) fn inbox_hit(app: &App, frame: Rect, col: u16, row: u16) -> Option<InboxHit> {
+    let at = Position::new(col, row);
+    let region = inbox_split_rect(frame, app.prompt.is_some(), !app.terms.is_empty());
+    if !region.contains(at) {
+        return None;
+    }
+    let (list, thread) = inbox_areas(region, app.inbox.split_pct);
+    if list.contains(at) {
+        let (strip, block) = inbox_list_areas(list);
+        if strip.contains(at) {
+            let counts = View::ALL.map(|v| app.inbox.count(v));
+            return view_strip_hit(app.inbox.view, counts, strip.width as usize, col - strip.x).map(InboxHit::Strip);
+        }
+        let inner = Block::bordered().inner(block);
+        let card = card_at(inner, app.inbox.list_offset(), app.inbox.rows().len(), row);
+        return Some(match card {
+            Some(pos) if inner.contains(at) => InboxHit::Card(pos),
+            _ => InboxHit::ListBlank,
+        });
+    }
+    let Some(t) = app.selected_inbox_thread() else {
+        return Some(InboxHit::Thread);
+    };
+    let (_, bottom) = pane_areas(Block::bordered().inner(thread), pane_bottom_rows(t));
+    if !bottom.contains(at) {
+        Some(InboxHit::Thread)
+    } else if t.reply.is_some() {
+        Some(InboxHit::Input)
+    } else {
+        Some(InboxHit::Hint)
+    }
+}
+
 fn draw_inbox_list(frame: &mut Frame, app: &App, area: Rect) {
-    let [strip_area, list_area] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+    let (strip_area, list_area) = inbox_list_areas(area);
     let counts = View::ALL.map(|v| app.inbox.count(v));
     frame.render_widget(Paragraph::new(view_strip(app.inbox.view, counts, strip_area.width as usize)), strip_area);
     let block = Block::default()
@@ -940,13 +1111,8 @@ fn draw_inbox_pane(frame: &mut Frame, app: &App, area: Rect) {
         frame.render_widget(Paragraph::new(text), inner);
         return;
     };
-    let bottom = match (t.kind, &t.reply) {
-        (_, Some(_)) => 3,
-        (Kind::Thread, None) => 1,
-        (Kind::Notify, None) => 0,
-    };
-    let [content, bottom_area] =
-        Layout::vertical([Constraint::Min(0), Constraint::Length(bottom)]).areas(inner);
+    let bottom = pane_bottom_rows(t);
+    let (content, bottom_area) = pane_areas(inner, bottom);
     let child = app.thread_child(t);
     let lines: Vec<Line> = pane_lines(t, child.as_ref(), app.utc_offset)
         .iter()
@@ -2193,6 +2359,107 @@ mod tests {
         assert!(screen.contains("▌#7001 docs/config"), "{screen}");
         assert!(screen.contains(" #6900 feat/agent-run-cost ↗"), "{screen}");
         assert!(screen.contains("▲ warn"), "{screen}");
+    }
+
+    #[test]
+    fn tab_spans_match_the_rendered_tab_line() {
+        let app = inbox_app();
+        assert_eq!(app.tab_title(Tab::Inbox), "Inbox (1)");
+        let screen = render(&app, 120, 30);
+        let first: Vec<char> = screen.lines().next().unwrap().chars().collect();
+        let frame = Rect::new(0, 0, 120, 30);
+        let spans = tab_spans(&app);
+        for (tab, title, r) in &spans {
+            let drawn: String = first[r.start as usize..r.end as usize].iter().collect();
+            assert_eq!(drawn, format!(" {title} "));
+            assert_eq!(tab_hit(&app, frame, r.start, 0), Some(*tab));
+            assert_eq!(tab_hit(&app, frame, r.end - 1, 0), Some(*tab));
+            // Not on the content row below.
+            assert_eq!(tab_hit(&app, frame, r.start, 1), None);
+        }
+        // The dividers between tabs and the rest of the row hit nothing.
+        for w in spans.windows(2) {
+            assert_eq!(w[0].2.end + 1, w[1].2.start);
+            assert_eq!(tab_hit(&app, frame, w[0].2.end, 0), None);
+        }
+        assert_eq!(tab_hit(&app, frame, spans.last().unwrap().2.end + 5, 0), None);
+    }
+
+    #[test]
+    fn view_strip_hits_follow_the_drawn_spans() {
+        let counts = [3, 5, 0, 9];
+        let line = text(&view_strip(View::NeedsYou, counts, 80));
+        let col = |needle: &str| line[..line.find(needle).unwrap()].chars().count() as u16;
+        let hit = |x| view_strip_hit(View::NeedsYou, counts, 80, x);
+        assert_eq!(hit(0), None, "leading space");
+        assert_eq!(hit(col("‹")), Some(StripHit::Prev));
+        assert_eq!(hit(col("Needs you")), Some(StripHit::View(View::NeedsYou)));
+        assert_eq!(hit(col("Active 5") + 7), Some(StripHit::View(View::Active)), "the count is the view's too");
+        assert_eq!(hit(col("Active") - 2), None, "separator");
+        assert_eq!(hit(col("Done")), Some(StripHit::View(View::Done)));
+        assert_eq!(hit(col("All")), Some(StripHit::View(View::All)));
+        assert_eq!(hit(col("›")), Some(StripHit::Next));
+        assert_eq!(hit(col("›") + 1), None, "past the end");
+        // Narrow: the short names move everything left.
+        let narrow = text(&view_strip(View::All, counts, 20));
+        let at = narrow.find("Active").map(|b| narrow[..b].chars().count() as u16).unwrap();
+        assert_eq!(view_strip_hit(View::All, counts, 20, at), Some(StripHit::View(View::Active)));
+    }
+
+    #[test]
+    fn card_at_maps_rows_to_cards_past_the_offset() {
+        let inner = Rect::new(1, 3, 30, 10);
+        assert_eq!(card_at(inner, 0, 5, 2), None, "above");
+        assert_eq!(card_at(inner, 0, 5, 3), Some(0));
+        assert_eq!(card_at(inner, 0, 5, 4), Some(0));
+        assert_eq!(card_at(inner, 0, 5, 5), None, "spacer");
+        assert_eq!(card_at(inner, 0, 5, 6), Some(1));
+        assert_eq!(card_at(inner, 2, 5, 3), Some(2), "offset");
+        assert_eq!(card_at(inner, 2, 5, 9), Some(4));
+        assert_eq!(card_at(inner, 2, 5, 12), None, "past the last card");
+        assert_eq!(card_at(inner, 0, 5, 13), None, "below");
+    }
+
+    #[test]
+    fn inbox_hit_lands_on_what_is_drawn() {
+        let mut app = inbox_app();
+        let frame = Rect::new(0, 0, 120, 30);
+        let screen: Vec<String> = render(&app, 120, 30).lines().map(str::to_string).collect();
+        // Every card's title row hits that card.
+        let threads = app.inbox.threads().to_vec();
+        for (pos, &i) in app.inbox.rows().iter().enumerate() {
+            let title = title_of(&threads[i]);
+            // Within the list's 48 columns (40% of 120): the pane repeats the
+            // selected title.
+            let in_list = |l: &String| l.chars().take(48).collect::<String>().contains(title.as_str());
+            let row = screen.iter().position(in_list).unwrap() as u16;
+            assert_eq!(inbox_hit(&app, frame, 5, row), Some(InboxHit::Card(pos)), "{title}");
+            assert_eq!(inbox_hit(&app, frame, 5, row + 2), Some(InboxHit::ListBlank), "spacer under {title}");
+        }
+        // The strip's row: `All` is current; `‹` steps back.
+        let strip = &screen[1];
+        let col = strip[..strip.find('‹').unwrap()].chars().count() as u16;
+        assert_eq!(inbox_hit(&app, frame, col, 1), Some(InboxHit::Strip(StripHit::Prev)));
+        // Thread pane (list 40% of 120 = 48 cols): content, then the
+        // selected `#7001` takes no replies, so its last inner row is the hint.
+        let hint = screen.iter().position(|l| l.contains("this thread takes no replies")).unwrap() as u16;
+        assert_eq!(inbox_hit(&app, frame, 60, hint), Some(InboxHit::Hint));
+        assert_eq!(inbox_hit(&app, frame, 60, hint - 1), Some(InboxHit::Thread));
+        assert_eq!(inbox_hit(&app, frame, 60, 1), Some(InboxHit::Thread), "border");
+        assert_eq!(inbox_hit(&app, frame, 60, 0), None, "tab line");
+        assert_eq!(inbox_hit(&app, frame, 60, 29), None, "help bar");
+        // A thread taking replies: the input box's three rows.
+        let sel = app.inbox.rows()[app.selected()];
+        let mut inbox = Inbox::default();
+        inbox.threads = threads;
+        inbox.threads[sel].reply = Some(Default::default());
+        app.set_inbox(inbox);
+        let screen: Vec<String> = render(&app, 120, 30).lines().map(str::to_string).collect();
+        let top = screen.iter().position(|l| l.contains("╭ r reply")).unwrap() as u16;
+        for row in top..top + 3 {
+            assert_eq!(inbox_hit(&app, frame, 60, row), Some(InboxHit::Input), "row {row}");
+        }
+        assert_eq!(inbox_hit(&app, frame, 60, top - 1), Some(InboxHit::Thread));
     }
 
     #[test]

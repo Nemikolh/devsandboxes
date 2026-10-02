@@ -200,6 +200,16 @@ worker, never the UI thread.
   `inbox_mouse`), clamped 20-80%, default 40%, not saved. With terminals open,
   the split sits in the area above the terminal panel, which stays where it is
   on every tab.
+- **Mouse.** A press off the divider is a click (`inbox_click`, hit-tested by
+  `ui::inbox_hit` from the draw path's own layout fns and last list offset):
+  a card selects its thread and focuses the list (the spacer row hits
+  nothing), a view name in the strip switches to it (`‹`/`›` step), the pane
+  focuses the thread, the input box the input (left like `esc` by a click on
+  the pane), the hint row the thread. The wheel moves the selection one card
+  over the list and scrolls the pane over it. A click on a tab title (any
+  tab, `ui::tab_hit` over `ui::tab_spans`, which the tab bar is drawn from)
+  switches tabs like `1`–`4`. None of it under a modal or the prompt; a
+  click outside the terminal panel still unfocuses a terminal.
 - **Cards**, one per thread, last change first, two lines plus a blank
   spacer (`draw_inbox_list`, `card_lines`): line 1 is the title (bold while
   unread, `↗` when there's a link, `· archived` when the sender is gone) with

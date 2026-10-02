@@ -757,9 +757,11 @@ impl App {
     /// on (or a cell off) the divider, within the split's rows, starts a drag
     /// and every drag event moves it, clamped like the config modal's split;
     /// release ends it. Only on the Inbox tab with no modal or prompt over it,
-    /// since then the divider is what's under the mouse. The hit-test reuses
-    /// `ui`'s layout functions so it lands where the divider is drawn. Never
-    /// consumes the event: a press elsewhere is the caller's to route.
+    /// since then the divider is what's under the mouse. A press off the
+    /// divider is a click ([`Self::inbox_click`]); the wheel goes to
+    /// [`Self::inbox_wheel`]. The hit-tests reuse `ui`'s layout functions so
+    /// they land where things are drawn. Never consumes the event: the
+    /// terminal panel still sees it (a click here unfocuses a terminal).
     /// I/O-free.
     pub(super) fn inbox_mouse(&mut self, ev: &MouseEvent, area: Rect) {
         if self.tab != Tab::Inbox || self.prompt.is_some() || !matches!(self.modal, Modal::None) {
@@ -774,16 +776,87 @@ impl App {
                 if point_in(rect, ev.column, ev.row) && col_near(ev.column, divider) {
                     self.inbox.dragging = true;
                     self.inbox.split_pct = pct;
+                } else {
+                    self.inbox_click(ui::inbox_hit(self, area, ev.column, ev.row));
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) if self.inbox.dragging => {
                 self.inbox.split_pct = pct;
             }
             MouseEventKind::Up(MouseButton::Left) => self.inbox.dragging = false,
+            MouseEventKind::ScrollUp => self.inbox_wheel(ui::inbox_hit(self, area, ev.column, ev.row), true),
+            MouseEventKind::ScrollDown => self.inbox_wheel(ui::inbox_hit(self, area, ev.column, ev.row), false),
             _ => {}
         }
     }
+
+    /// A left click on the Inbox: a card selects its thread and focuses the
+    /// list (the caller's [`Self::sync_inbox_selection`] reads it), the strip
+    /// switches views, the pane focuses the thread, the input box the input.
+    /// The keys' own paths, so a click does what the matching key would.
+    fn inbox_click(&mut self, hit: Option<ui::InboxHit>) {
+        use ui::{InboxHit, StripHit};
+        match hit {
+            Some(InboxHit::Card(pos)) => {
+                self.selected[Tab::Inbox.index()] = pos;
+                self.focus_inbox_list();
+            }
+            Some(InboxHit::Strip(strip)) => {
+                let at = |v: View| View::ALL.iter().position(|w| *w == v).unwrap_or(0) as isize;
+                let step = match strip {
+                    StripHit::Prev => -1,
+                    StripHit::Next => 1,
+                    StripHit::View(v) => at(v) - at(self.inbox.view),
+                };
+                if step != 0 {
+                    self.step_inbox_view(step);
+                }
+                self.focus_inbox_list();
+            }
+            // Out of the input like `esc`, its line with it: the box is only
+            // drawn live while focused.
+            Some(InboxHit::Thread | InboxHit::Hint) if self.inbox.focus == InboxFocus::Input => self.leave_reply(),
+            Some(InboxHit::Thread | InboxHit::Hint) => self.focus_inbox_thread(),
+            // Already in it: keep the half-typed line `open_reply` would clear.
+            Some(InboxHit::Input) if self.inbox.focus == InboxFocus::Input => {}
+            Some(InboxHit::Input) => self.focus_inbox_input(),
+            Some(InboxHit::ListBlank) | None => {}
+        }
+    }
+
+    /// One wheel notch on the Inbox: over the list it moves the selection a
+    /// card, over the thread pane it scrolls the pane like its scroll keys.
+    fn inbox_wheel(&mut self, hit: Option<ui::InboxHit>, up: bool) {
+        use ui::InboxHit;
+        match hit {
+            Some(InboxHit::Card(_) | InboxHit::ListBlank) => {
+                if up {
+                    self.select_up();
+                } else {
+                    self.select_down();
+                }
+            }
+            Some(InboxHit::Thread) => {
+                let max = self.inbox.pane_max.get();
+                self.inbox.scroll = if up {
+                    self.inbox.scroll.saturating_sub(INBOX_WHEEL_LINES)
+                } else {
+                    self.inbox.scroll.saturating_add(INBOX_WHEEL_LINES).min(max)
+                };
+            }
+            _ => {}
+        }
+    }
+
+    /// Focus the list, dropping any reply box with the input's focus.
+    fn focus_inbox_list(&mut self) {
+        self.inbox.focus = InboxFocus::List;
+        self.inbox.reply = None;
+    }
 }
+
+/// Thread-pane lines one wheel notch scrolls.
+const INBOX_WHEEL_LINES: u16 = 3;
 
 /// Past this age a card shows a date instead of a relative age.
 const RELATIVE_FOR: u64 = 7 * 86_400;
@@ -1708,6 +1781,169 @@ mod tests {
         app.on_mouse(&mouse_at(MouseEventKind::Down(MouseButton::Left), 40, panel.y - 1), FRAME);
         app.on_mouse(&mouse_at(MouseEventKind::Drag(MouseButton::Left), 60, panel.y - 1), FRAME);
         assert_eq!(app.inbox.split_pct, 60);
+    }
+
+    // FRAME without terminals: view strip on row 1 (cols 0..40), list block
+    // rows 2..=38 with cards from row 3 (card 0: rows 3-4, spacer 5, card 1:
+    // rows 6-7); thread pane cols 40..100, rows 1..=38, inner rows 2..=37: an
+    // input in rows 35..=37, or the hint on row 37.
+    fn click(app: &mut App, col: u16, row: u16) {
+        app.on_mouse(&mouse_at(MouseEventKind::Down(MouseButton::Left), col, row), FRAME);
+        app.on_mouse(&mouse_at(MouseEventKind::Up(MouseButton::Left), col, row), FRAME);
+    }
+
+    #[test]
+    fn click_card_selects_reads_and_focuses_the_list() {
+        let mut app = new_app();
+        put(&mut app, "d", 10, body("asks", State::NeedsYou));
+        put(&mut app, "d", 20, body("other", State::NeedsYou));
+        inbox_tab(&mut app);
+        let asks = thread(&app, "asks").id;
+        app.take_pending_inbox();
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.inbox.focus, InboxFocus::Thread);
+
+        click(&mut app, 10, 6);
+        assert_eq!(selected(&app).as_deref(), Some("asks"));
+        assert_eq!(app.inbox.focus, InboxFocus::List);
+        assert_eq!(app.take_pending_inbox(), [Op::MarkRead(asks)]);
+        // The spacer and rows past the last card select nothing.
+        click(&mut app, 10, 5);
+        click(&mut app, 10, 9);
+        assert_eq!(selected(&app).as_deref(), Some("asks"));
+        // The offset the renderer last drew with shifts the cards.
+        app.inbox.set_list_offset(1);
+        click(&mut app, 10, 3);
+        assert_eq!(selected(&app).as_deref(), Some("asks"));
+        app.inbox.set_list_offset(0);
+        click(&mut app, 10, 3);
+        assert_eq!(selected(&app).as_deref(), Some("other"));
+        // A press on the divider still drags, and isn't a click.
+        app.on_key(key(KeyCode::Enter));
+        app.on_mouse(&mouse_at(MouseEventKind::Down(MouseButton::Left), 40, 6), FRAME);
+        assert!(app.inbox.dragging);
+        assert_eq!(app.inbox.focus, InboxFocus::Thread);
+    }
+
+    #[test]
+    fn click_pane_and_input_focus_them() {
+        let mut app = new_app();
+        put(&mut app, "d", 10, ThreadPut { reply: Some(Reply::default()), ..body("asks", State::NeedsYou) });
+        inbox_tab(&mut app);
+        click(&mut app, 60, 10);
+        assert_eq!(app.inbox.focus, InboxFocus::Thread);
+        click(&mut app, 60, 36);
+        assert_eq!(app.inbox.focus, InboxFocus::Input);
+        typed(&mut app, "half");
+        // Clicking the input again keeps the line.
+        click(&mut app, 60, 35);
+        assert_eq!(app.inbox.reply.as_ref().unwrap().line.input(), "half");
+        // Back to the thread, like `esc`.
+        click(&mut app, 60, 10);
+        assert_eq!(app.inbox.focus, InboxFocus::Thread);
+        assert!(app.inbox.reply.is_none());
+        // The list, on a card.
+        click(&mut app, 10, 3);
+        assert_eq!(app.inbox.focus, InboxFocus::List);
+    }
+
+    #[test]
+    fn click_where_a_no_reply_thread_has_its_hint_focuses_the_thread() {
+        let mut app = new_app();
+        put(&mut app, "d", 10, body("asks", State::NeedsYou));
+        inbox_tab(&mut app);
+        for row in [36, 37] {
+            app.inbox.focus = InboxFocus::List;
+            click(&mut app, 60, row);
+            assert_eq!(app.inbox.focus, InboxFocus::Thread, "row {row}");
+            assert!(app.inbox.reply.is_none());
+        }
+    }
+
+    #[test]
+    fn click_strip_switches_views() {
+        let mut app = new_app();
+        put(&mut app, "d", 10, body("asks", State::NeedsYou));
+        put(&mut app, "d", 20, body("busy", State::Active));
+        inbox_tab(&mut app);
+        // 40 columns drop the counts: ` ‹ Needs you │ Active │ Done │ All ›`.
+        click(&mut app, 16, 1);
+        assert_eq!(app.inbox.view, View::Active);
+        assert_eq!(selected(&app).as_deref(), Some("busy"));
+        click(&mut app, 35, 1); // ›
+        assert_eq!(app.inbox.view, View::Done);
+        click(&mut app, 2, 1); // ‹
+        assert_eq!(app.inbox.view, View::Active);
+        click(&mut app, 32, 1);
+        assert_eq!(app.inbox.view, View::All);
+        click(&mut app, 14, 1); // the separator before Active
+        assert_eq!(app.inbox.view, View::All);
+    }
+
+    #[test]
+    fn inbox_wheel_moves_the_selection_and_scrolls_the_pane() {
+        let mut app = new_app();
+        put(&mut app, "d", 10, body("asks", State::NeedsYou));
+        put(&mut app, "d", 20, body("other", State::NeedsYou));
+        inbox_tab(&mut app);
+        app.on_mouse(&mouse_at(MouseEventKind::ScrollDown, 10, 10), FRAME);
+        assert_eq!(selected(&app).as_deref(), Some("asks"));
+        app.on_mouse(&mouse_at(MouseEventKind::ScrollUp, 10, 10), FRAME);
+        assert_eq!(selected(&app).as_deref(), Some("other"));
+        app.inbox.set_pane_max(4);
+        app.on_mouse(&mouse_at(MouseEventKind::ScrollDown, 60, 10), FRAME);
+        assert_eq!(app.inbox.scroll, 3);
+        app.on_mouse(&mouse_at(MouseEventKind::ScrollDown, 60, 10), FRAME);
+        assert_eq!(app.inbox.scroll, 4, "clamped to the drawn bound");
+        app.on_mouse(&mouse_at(MouseEventKind::ScrollUp, 60, 10), FRAME);
+        assert_eq!(app.inbox.scroll, 1);
+        assert_eq!(selected(&app).as_deref(), Some("other"));
+    }
+
+    #[test]
+    fn inbox_clicks_ignored_under_a_modal_or_the_prompt() {
+        let mut app = new_app();
+        put(&mut app, "d", 10, body("asks", State::NeedsYou));
+        put(&mut app, "d", 20, body("other", State::NeedsYou));
+        inbox_tab(&mut app);
+        app.on_key(key(KeyCode::Char(':')));
+        click(&mut app, 10, 6);
+        click(&mut app, 60, 10);
+        assert_eq!((selected(&app).as_deref(), app.inbox.focus), (Some("other"), InboxFocus::List));
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.prompt.is_none());
+        app.on_key(key(KeyCode::Char('?')));
+        assert!(!matches!(app.modal, Modal::None));
+        click(&mut app, 10, 6);
+        click(&mut app, 60, 10);
+        assert_eq!((selected(&app).as_deref(), app.inbox.focus), (Some("other"), InboxFocus::List));
+    }
+
+    #[test]
+    fn click_thread_while_a_terminal_has_focus_moves_focus_there() {
+        let mut app = new_app();
+        put(&mut app, "d", 10, body("asks", State::NeedsYou));
+        inbox_tab(&mut app);
+        open_test_term(&mut app, "web-1", "devsandbox-web-1");
+        assert_eq!(app.focus, super::super::Focus::Terminal);
+        // With terminals the split ends above the panel; row 5 is in the pane.
+        click(&mut app, 60, 5);
+        assert_eq!(app.focus, super::super::Focus::Dashboard);
+        assert_eq!(app.inbox.focus, InboxFocus::Thread);
+    }
+
+    #[test]
+    fn click_tab_leaving_the_inbox_reads_its_notify_records() {
+        let mut app = new_app();
+        push(&mut app, "a", rec("note", None, None));
+        push(&mut app, "b", rec("other note", None, None));
+        inbox_tab(&mut app); // reads the selected one only
+        app.take_pending_inbox();
+        let tabs = crate::tui::ui::tab_spans(&app);
+        let services = tabs.iter().find(|(t, _, _)| *t == Tab::Services).unwrap().2.start;
+        click(&mut app, services, 0);
+        assert_eq!(app.tab, Tab::Services);
+        assert_eq!(app.take_pending_inbox(), [Op::MarkNotifyRead]);
     }
 
     #[test]

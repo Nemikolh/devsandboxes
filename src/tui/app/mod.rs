@@ -447,12 +447,16 @@ impl App {
     /// the split; the scroll wheel scrolls the pane under the cursor. Otherwise,
     /// with terminals open, clicks and the wheel drive the terminal panel
     /// ([`Self::terminal_mouse`]); on the Inbox tab, the list/thread divider
-    /// drags too ([`Self::inbox_mouse`]). I/O-free.
+    /// drags and the list and pane take clicks ([`Self::inbox_mouse`]); a
+    /// click on a tab title switches to it ([`Self::tab_bar_mouse`]). I/O-free.
     pub fn on_mouse(&mut self, ev: &MouseEvent, area: Rect) {
         let Modal::Config(view) = &mut self.modal else {
             self.dragging_divider = false;
             self.inbox_mouse(ev, area);
+            self.tab_bar_mouse(ev, area);
             self.terminal_mouse(ev, area);
+            // As after a key: a click or wheel may have moved the Inbox cursor.
+            self.sync_inbox_selection();
             return;
         };
         // Divider column: the boundary between the left (config) pane and the
@@ -480,6 +484,24 @@ impl App {
                 Self::wheel_scroll(view, ev.column, divider, -3);
             }
             _ => {}
+        }
+    }
+
+    /// A left press on a tab title switches to that tab, through [`Self::set_tab`]
+    /// like the `1`-`4` keys (so leaving the Inbox reads what it showed). Not
+    /// under a modal or the prompt, which own the input. Unlike the keys it
+    /// works while an Inbox thread has focus: the click names its target.
+    /// The terminal panel's click-away unfocuses a focused terminal on the
+    /// same press. The hit-test is `ui`'s, shared with the drawing.
+    fn tab_bar_mouse(&mut self, ev: &MouseEvent, area: Rect) {
+        if ev.kind != MouseEventKind::Down(MouseButton::Left)
+            || self.prompt.is_some()
+            || !matches!(self.modal, Modal::None)
+        {
+            return;
+        }
+        if let Some(tab) = super::ui::tab_hit(self, area, ev.column, ev.row) {
+            self.set_tab(tab);
         }
     }
 }
@@ -523,6 +545,44 @@ mod tests {
         assert_eq!(app.tab, Tab::Inbox);
         app.on_key(key(KeyCode::Char('1')));
         assert_eq!(app.tab, Tab::Instances);
+    }
+
+    #[test]
+    fn click_tab_title_switches_tabs() {
+        let mut app = new_app();
+        let press = |col, row| mouse_at(MouseEventKind::Down(MouseButton::Left), col, row);
+        let start = |app: &App, tab: Tab| {
+            super::super::ui::tab_spans(app).into_iter().find(|(t, _, _)| *t == tab).unwrap().2
+        };
+        for tab in [Tab::Services, Tab::Ports, Tab::Inbox, Tab::Instances] {
+            let r = start(&app, tab);
+            app.on_mouse(&press(r.end - 1, 0), FRAME);
+            assert_eq!(app.tab, tab);
+        }
+        // The divider after a title and the row below hit nothing.
+        let r = start(&app, Tab::Services);
+        app.on_mouse(&press(r.end, 0), FRAME);
+        app.on_mouse(&press(r.start, 1), FRAME);
+        assert_eq!(app.tab, Tab::Instances);
+        // Not under the prompt or a modal.
+        app.on_key(key(KeyCode::Char(':')));
+        app.on_mouse(&press(r.start, 0), FRAME);
+        assert_eq!(app.tab, Tab::Instances);
+        app.on_key(key(KeyCode::Esc));
+        app.on_key(key(KeyCode::Char('?')));
+        app.on_mouse(&press(r.start, 0), FRAME);
+        assert_eq!(app.tab, Tab::Instances);
+    }
+
+    #[test]
+    fn click_tab_unfocuses_a_terminal() {
+        let mut app = new_app();
+        open_test_term(&mut app, "web-1", "devsandbox-web-1");
+        assert_eq!(app.focus, Focus::Terminal);
+        let r = super::super::ui::tab_spans(&app).into_iter().find(|(t, _, _)| *t == Tab::Ports).unwrap().2;
+        app.on_mouse(&mouse_at(MouseEventKind::Down(MouseButton::Left), r.start, 0), FRAME);
+        assert_eq!(app.tab, Tab::Ports);
+        assert_eq!(app.focus, Focus::Dashboard);
     }
 
     #[test]

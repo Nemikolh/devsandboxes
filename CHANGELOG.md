@@ -37,6 +37,8 @@ devsandbox vscode web-2 --goto src/main.rs:42:7
 
 - **The Inbox shows what's waiting on you.** Side by side: a card list on the left (title, compact age, state/level chip and sender; a selected card gets an accent bar), the selected thread always open on the right, with a `‹ Needs you │ Active │ Done │ All ›` strip above the list stepped by `←`/`→`. The tab count and the yellow `✉N` on instance rows now count threads that need you and unread notifications, not every unread record. `enter` moves focus into the thread pane: `1`–`9` run buttons, `r` replies in a box at the bottom of the pane (shown only when the thread takes replies), `d` marks done, `u` reopens, `o`/`t`/`l`/`p` act on the thread's child, and `enter` opens the link; `esc` steps back. The per-instance grouping and inline folding are gone: a notification's earlier records are listed in the pane. A thread is read when selected and again if it changes while selected; notifications are marked read the same way or when you leave the Inbox after seeing them. `d` on a notification dismisses it and on a thread marks it done; `D` clears notifications only.
 
+- **The dashboard takes more mouse clicks.** Click a tab title to switch tabs. In the Inbox, click a card to select it, a view name to switch views, the thread or its reply box to focus them; the wheel moves through the cards or scrolls the thread.
+
 - **An open dashboard updates the helper in running instances.** Before, a running dispatcher only got new `devsbd` verbs after `devsandbox start`; now opening the dashboard of a newer devsandbox is enough.
 
 ### Fixed
