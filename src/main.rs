@@ -99,11 +99,11 @@ enum Command {
     Rm {
         /// Instance name, sandbox config name, or repository folder name
         name: String,
-        /// Delete the branch `run` created for the worktree without asking
-        /// (`git branch -D`: unmerged commits go too)
+        /// Delete the worktree's branch without asking (`git branch -D`:
+        /// unmerged commits go too)
         #[arg(long, conflicts_with = "keep_branch")]
         delete_branch: bool,
-        /// Keep the branch `run` created without asking (the default off a TTY)
+        /// Keep the worktree's branch, even one already merged or on its remote
         #[arg(long)]
         keep_branch: bool,
         /// Remove even with uncommitted changes in the worktree (discarded)

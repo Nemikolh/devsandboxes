@@ -166,10 +166,14 @@ listed when stdin is not a TTY.
    services are left for `gc`. A worktree with uncommitted or untracked changes
    makes `rm` refuse up front, removing nothing: commit, stash or discard them
    first, or pass `--force` (`-f`) to discard them. `--force` also warns and
-   moves on when a teardown step fails, so the instance always leaves state. The worktree branch is only ever deleted when `run` created it:
+   moves on when a teardown step fails, so the instance always leaves state. Branch handling applies to the worktree's current branch (the
+   recorded one when detached), never the remote's default branch:
    `--delete-branch` deletes it (`git branch -D`, unmerged commits too),
-   `--keep-branch` keeps it; with neither, `rm` prompts on a TTY and keeps it
-   off one. Scripts wanting the branch gone must pass `--delete-branch`.
+   `--keep-branch` keeps it. With neither, `rm` runs `git fetch --prune origin`,
+   then deletes it without asking when all its commits are on its remote branch
+   or its upstream is gone (merged PR). Otherwise it prompts on a TTY and keeps it
+   off one. The recorded branch is deleted along with it when it is an ancestor.
+   Scripts that need a local-only branch gone must pass `--delete-branch`.
 
 11. **`gc [--force]`** — reap shared services no live instance references, orphaned
    networks, and orphaned shell-history files (`--force` skips the per-file

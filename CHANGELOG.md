@@ -47,6 +47,8 @@ devsandbox vscode web-2 --goto src/main.rs:42:7
 
 - **An open dashboard updates the helper in running instances.** Before, a running dispatcher only got new `devsbd` verbs after `devsandbox start`; now opening the dashboard of a newer devsandbox is enough.
 
+- **`rm` cleans up merged branches without asking.** With no flag, `rm` first runs `git fetch --prune origin`, then decides about the branch the worktree has checked out. If every commit on it is already on its remote branch, or the remote branch it tracked has been deleted (a merged PR), the branch is deleted without a prompt. Only a branch with commits that exist nowhere else still prompts, and off a TTY it is kept. Branches you reused with `--branch` follow the same rules now. The default branch (`origin/HEAD`, `main`, `master`) is never deleted. When `rm` deletes a branch, it also deletes the branch `run` created if that branch is an ancestor of it. `--delete-branch` / `--keep-branch` still decide outright.
+
 ### Fixed
 
 - **A press in the Inbox thread pane no longer grabs the divider.** A press on the pane's first text column started resizing the list/thread split; now only the borders do.
@@ -58,6 +60,8 @@ devsandbox vscode web-2 --goto src/main.rs:42:7
 - **Dismissed notifications no longer come back with several dashboards open.** Each dashboard kept its own copy of the Inbox and saved it over the others', so records dismissed in one reappeared from another, and restarts seemed to add clutter. All dashboards now share one store, so a dismissal in one is gone from all.
 
 - **A notification is no longer lost if the dashboard dies while receiving it.** The container's copy was dropped as soon as the dashboard said it had it, before it was saved; now it's saved first, and resent otherwise.
+
+- **`rm` asks about the right branch.** It used to name the branch `run` created, even after the worktree had switched to or renamed another branch. Now it reads the worktree's current branch before removing it. For instances from before branches were recorded that have since been renamed, the old fallback guessed the branch name from the new name; it now uses the instance's original name.
 
 ## 0.6.0
 

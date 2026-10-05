@@ -7,9 +7,9 @@ use crate::commands::run::host_git;
 use crate::runtime::backend;
 use crate::state::{FolderMount, State};
 
-/// `delete_branch` is the answer to "delete the branch `run` created?":
-/// `Some` from `--delete-branch` / `--keep-branch`, `None` to ask (see
-/// [`branch_decision`]).
+/// `delete_branch` answers "delete the worktree's branch?": `Some` from
+/// `--delete-branch` / `--keep-branch`, `None` to decide from the remote and
+/// ask only when that can't (see [`branch_action`]).
 ///
 /// `force` skips the dirty-worktree preflight, discards uncommitted changes
 /// (`git worktree remove --force`) and turns a failed teardown step into a
@@ -24,7 +24,7 @@ pub fn rm(name: &str, delete_branch: Option<bool>, force: bool) -> Result<()> {
     let instance_id = info.instance_id.clone();
     let container = info.container.clone();
     let worktree = info.worktree.clone();
-    let branch = branch_to_offer(info.branch.clone(), info.branch_created, &key);
+    let recorded = recorded_branch(info.branch.clone(), info.branch_created, &info.instance_id);
     let base_folder = info.base_folder.clone();
     let project = info.project.clone();
     let volumes = info.volumes.clone();
@@ -41,6 +41,16 @@ pub fn rm(name: &str, delete_branch: Option<bool>, force: bool) -> Result<()> {
         }
         check_folder_worktrees(&folders)?;
     }
+
+    // Before teardown: the worktree's HEAD is the only record of the branch
+    // it ended on, and it goes with the worktree.
+    let plan = worktree.as_deref().and_then(|wt| branch_plan(&base_folder, wt, recorded));
+    let action = plan.as_ref().map(|p| {
+        if delete_branch.is_none() {
+            fetch_prune(&base_folder);
+        }
+        branch_action(delete_branch, remote_state(&base_folder, &p.branch))
+    });
 
     // Remove the container; ignore failure (it may already be gone).
     let _ = backend().remove_force(&container);
@@ -90,15 +100,22 @@ pub fn rm(name: &str, delete_branch: Option<bool>, force: bool) -> Result<()> {
         let removed = tolerate(force, remove_or_prune(&base_folder, &worktree, force))?;
         // A forced rm that left the worktree keeps its branch: `branch -D`
         // fails on a checked-out branch anyway.
-        if let (Some(branch), true) = (branch, removed) {
-            if branch_decision(delete_branch, || confirm(&format!("delete branch `{branch}`?")))? {
-                match host_git(&base_folder) {
-                    Ok(mut git) => {
-                        // `-D`: the branch is sandbox scratch `run` created, so
-                        // unmerged commits are deleted too, as a yes always did.
-                        let _ = git.args(["branch", "-D", &branch]).status();
-                    }
-                    Err(e) => eprintln!("warning: branch `{branch}` not deleted: {e:#}"),
+        if let (Some(plan), Some(action), true) = (plan, action, removed) {
+            let delete = match action {
+                BranchAction::Delete => true,
+                BranchAction::Keep => false,
+                BranchAction::Ask => {
+                    let also = plan.also.as_ref().map(|s| format!(" (and `{s}`, merged into it)"));
+                    confirm(&format!(
+                        "delete branch `{}`{}? it has commits not on its remote",
+                        plan.branch,
+                        also.unwrap_or_default()
+                    ))?
+                }
+            };
+            if delete {
+                for branch in std::iter::once(&plan.branch).chain(&plan.also) {
+                    delete_branch_ref(&base_folder, branch);
                 }
             }
         }
@@ -142,21 +159,135 @@ fn tolerate(force: bool, result: Result<()>) -> Result<bool> {
     }
 }
 
-/// The branch `rm` offers to delete: only one `run` created (a reused PR or
-/// feature branch is the user's). Entries from before branches were recorded
-/// fall back to the legacy default.
-fn branch_to_offer(branch: Option<String>, created: bool, key: &str) -> Option<String> {
-    created.then(|| branch.unwrap_or_else(|| format!("sandbox/{key}")))
+/// The branch `run` checked out in the worktree. Entries from before branches
+/// were recorded fall back to the default pattern, which is keyed by the
+/// instance id (not the state key, which a rename changes).
+fn recorded_branch(branch: Option<String>, created: bool, instance_id: &str) -> Option<String> {
+    branch.or_else(|| created.then(|| format!("sandbox/{instance_id}")))
 }
 
-/// Whether to delete the branch `run` created: an explicit flag answers
-/// without prompting, so scripted callers (off a TTY `confirm` is always no)
-/// can still clean up; no flag asks.
-fn branch_decision(flag: Option<bool>, ask: impl FnOnce() -> Result<bool>) -> Result<bool> {
-    match flag {
-        Some(delete) => Ok(delete),
-        None => ask(),
+/// What `rm` decides about: `branch`, the worktree's current branch (the
+/// recorded one when the worktree is detached or already gone from disk),
+/// and `also`, the recorded branch when the worktree moved off it and it is
+/// an ancestor of `branch` (its work lives on there, so it goes along).
+#[derive(Debug, PartialEq)]
+struct BranchPlan {
+    branch: String,
+    also: Option<String>,
+}
+
+/// `None` when there is no branch to consider. The remote's default branch
+/// is never a candidate: a worktree switched to `main` must not delete it.
+fn branch_plan(base: &Path, worktree: &Path, recorded: Option<String>) -> Option<BranchPlan> {
+    let protected = default_branches(base);
+    let usable = |b: &String| !protected.contains(b) && has_ref(base, &format!("refs/heads/{b}"));
+    let current = worktree
+        .exists()
+        .then(|| git_query(worktree, &["symbolic-ref", "--quiet", "--short", "HEAD"]))
+        .flatten()
+        .filter(usable);
+    let recorded = recorded.filter(usable);
+    let branch = current.or_else(|| recorded.clone())?;
+    let also = recorded.filter(|r| {
+        *r != branch && git_query(base, &["merge-base", "--is-ancestor", r, &branch]).is_some()
+    });
+    Some(BranchPlan { branch, also })
+}
+
+/// `origin/HEAD`'s branch plus the conventional names, as local branch names.
+fn default_branches(base: &Path) -> Vec<String> {
+    let mut names = vec!["main".to_string(), "master".to_string()];
+    if let Some(head) = git_query(base, &["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"]) {
+        names.extend(head.strip_prefix("origin/").map(str::to_string));
     }
+    names
+}
+
+/// Where `branch` stands against its remote.
+#[derive(Debug, PartialEq)]
+enum RemoteState {
+    /// Every local commit is on the remote branch (which may be ahead).
+    InSync,
+    /// It tracked a remote branch that no longer exists: the merged-PR case.
+    Gone,
+    /// Local-only commits: never pushed, ahead, or diverged.
+    Unsynced,
+}
+
+/// The remote branch is the configured upstream, else `origin/<branch>`
+/// (pushed without `-u`). "Gone" needs an upstream: a never-pushed branch has
+/// no `origin/<branch>` either, and its commits exist nowhere else.
+fn remote_state(base: &Path, branch: &str) -> RemoteState {
+    let line = git_query(
+        base,
+        &["for-each-ref", "--format=%(upstream) %(upstream:track)", &format!("refs/heads/{branch}")],
+    )
+    .unwrap_or_default();
+    let (upstream, track) = line.split_once(' ').unwrap_or((&line, ""));
+    if !upstream.is_empty() && track == "[gone]" {
+        return RemoteState::Gone;
+    }
+    let remote = if upstream.is_empty() { format!("refs/remotes/origin/{branch}") } else { upstream.to_string() };
+    let contained = has_ref(base, &remote)
+        && git_query(base, &["merge-base", "--is-ancestor", branch, &remote]).is_some();
+    if contained { RemoteState::InSync } else { RemoteState::Unsynced }
+}
+
+#[derive(Debug, PartialEq)]
+enum BranchAction {
+    Delete,
+    Keep,
+    Ask,
+}
+
+/// An explicit flag answers outright, so scripted callers can still clean up.
+/// Otherwise a branch whose work is safe on (or merged through) its remote is
+/// deleted without asking; only local-only commits prompt (off a TTY
+/// `confirm` says no, so they are kept).
+fn branch_action(flag: Option<bool>, remote: RemoteState) -> BranchAction {
+    match (flag, remote) {
+        (Some(true), _) => BranchAction::Delete,
+        (Some(false), _) => BranchAction::Keep,
+        (None, RemoteState::InSync | RemoteState::Gone) => BranchAction::Delete,
+        (None, RemoteState::Unsynced) => BranchAction::Ask,
+    }
+}
+
+/// Refresh `origin` and drop remote-tracking refs of deleted branches, so a
+/// merged PR reads as gone. Best-effort: offline, the last-fetched refs
+/// decide (a stale ref only ever makes `rm` ask more, never delete more).
+fn fetch_prune(base: &Path) {
+    if git_query(base, &["remote", "get-url", "origin"]).is_none() {
+        return;
+    }
+    if git_query(base, &["fetch", "--quiet", "--prune", "origin"]).is_none() {
+        eprintln!("warning: `git fetch --prune origin` failed; using the last-fetched remote refs");
+    }
+}
+
+/// `-D`: unmerged commits go too; [`branch_action`] already decided they may.
+fn delete_branch_ref(base: &Path, branch: &str) {
+    let out = host_git(base).and_then(|mut git| {
+        git.args(["branch", "-D", branch]).output().context("failed to run git (is it installed?)")
+    });
+    match out {
+        Ok(o) if o.status.success() => println!("deleted branch {branch}"),
+        Ok(o) => eprintln!(
+            "warning: branch `{branch}` not deleted: {}",
+            String::from_utf8_lossy(&o.stderr).trim()
+        ),
+        Err(e) => eprintln!("warning: branch `{branch}` not deleted: {e:#}"),
+    }
+}
+
+fn has_ref(base: &Path, r: &str) -> bool {
+    git_query(base, &["show-ref", "--verify", "--quiet", r]).is_some()
+}
+
+/// Git's trimmed stdout for `git -C dir <args>` on success, `None` otherwise.
+fn git_query(dir: &Path, args: &[&str]) -> Option<String> {
+    let out = host_git(dir).ok()?.args(args).output().ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 /// Refuse when `git worktree remove` (no `--force`) would: it rejects a
@@ -293,10 +424,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_created_branches_are_offered_for_deletion() {
-        assert_eq!(branch_to_offer(Some("feat/x".into()), true, "k").as_deref(), Some("feat/x"));
-        assert_eq!(branch_to_offer(None, true, "k").as_deref(), Some("sandbox/k"));
-        assert_eq!(branch_to_offer(Some("pr/1".into()), false, "k"), None);
+    fn recorded_branch_falls_back_to_the_id_pattern() {
+        assert_eq!(recorded_branch(Some("feat/x".into()), true, "id").as_deref(), Some("feat/x"));
+        // A reused branch is recorded too, and decided like any other.
+        assert_eq!(recorded_branch(Some("pr/1".into()), false, "id").as_deref(), Some("pr/1"));
+        // Legacy entry: the pattern used the id, not the (renamable) key.
+        assert_eq!(recorded_branch(None, true, "id").as_deref(), Some("sandbox/id"));
+        assert_eq!(recorded_branch(None, false, "id"), None);
     }
 
     #[test]
@@ -307,13 +441,100 @@ mod tests {
     }
 
     #[test]
-    fn branch_flags_answer_without_asking() {
-        let never = || -> Result<bool> { panic!("prompted despite a flag") };
-        assert!(branch_decision(Some(true), never).unwrap());
-        assert!(!branch_decision(Some(false), never).unwrap());
-        // No flag: the prompt's answer (off a TTY, `confirm` says no).
-        assert!(branch_decision(None, || Ok(true)).unwrap());
-        assert!(!branch_decision(None, || Ok(false)).unwrap());
+    fn branch_action_asks_only_for_local_only_work() {
+        use {BranchAction::*, RemoteState::*};
+        for remote in [InSync, Gone, Unsynced] {
+            assert_eq!(branch_action(Some(true), remote), Delete);
+        }
+        for remote in [InSync, Gone, Unsynced] {
+            assert_eq!(branch_action(Some(false), remote), Keep);
+        }
+        assert_eq!(branch_action(None, InSync), Delete);
+        assert_eq!(branch_action(None, Gone), Delete);
+        assert_eq!(branch_action(None, Unsynced), Ask);
+    }
+
+    /// Base clone of a bare remote, with a worktree on `sandbox/r` as `run`
+    /// lays it out.
+    #[test]
+    fn branch_plan_and_remote_state_follow_the_worktree() {
+        let root = std::env::temp_dir().join(format!("devsandbox-rmbranch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (remote, base, wt) = (root.join("remote.git"), root.join("base"), root.join("wt"));
+        std::fs::create_dir_all(&root).unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(&root, &["init", "-q", "--bare", "-b", "main", &remote.to_string_lossy()]);
+        git(&root, &["clone", "-q", &remote.to_string_lossy(), &base.to_string_lossy()]);
+        git(&base, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        git(&base, &["push", "-q", "origin", "main"]);
+        git(&base, &["remote", "set-head", "origin", "main"]);
+        git(&base, &["worktree", "add", "-q", &wt.to_string_lossy(), "-b", "sandbox/r", "--no-track", "origin/main"]);
+        git(&wt, &["commit", "-q", "--allow-empty", "-m", "work"]);
+        let plan = |recorded: &str| branch_plan(&base, &wt, Some(recorded.into()));
+        let state = |b: &str| remote_state(&base, b);
+
+        // Still on the recorded branch, never pushed: local-only.
+        assert_eq!(plan("sandbox/r"), Some(BranchPlan { branch: "sandbox/r".into(), also: None }));
+        assert_eq!(state("sandbox/r"), RemoteState::Unsynced);
+
+        // Moved on to `feat` (the reported bug): decided on `feat`, and the
+        // recorded branch, an ancestor, goes along.
+        git(&wt, &["checkout", "-q", "-b", "feat"]);
+        git(&wt, &["commit", "-q", "--allow-empty", "-m", "more"]);
+        let moved = Some(BranchPlan { branch: "feat".into(), also: Some("sandbox/r".into()) });
+        assert_eq!(plan("sandbox/r"), moved);
+        // A recorded branch with work of its own is not swept along.
+        git(&base, &["branch", "other", "origin/main"]);
+        git(&base, &["commit", "-q", "--allow-empty", "-m", "base"]);
+        git(&base, &["branch", "-f", "other", "main"]);
+        assert_eq!(plan("other"), Some(BranchPlan { branch: "feat".into(), also: None }));
+        // Recorded branch renamed away: nothing extra to delete.
+        assert_eq!(plan("gone/branch"), Some(BranchPlan { branch: "feat".into(), also: None }));
+
+        // Pushed with upstream: in sync; one more local commit: ahead.
+        git(&wt, &["push", "-q", "-u", "origin", "feat"]);
+        assert_eq!(state("feat"), RemoteState::InSync);
+        git(&wt, &["commit", "-q", "--allow-empty", "-m", "ahead"]);
+        assert_eq!(state("feat"), RemoteState::Unsynced);
+        // Remote ahead of local still counts as in sync: nothing local is lost.
+        git(&wt, &["push", "-q", "origin", "feat"]);
+        git(&wt, &["reset", "-q", "--hard", "HEAD~1"]);
+        assert_eq!(state("feat"), RemoteState::InSync);
+        // Merged PR: the remote branch is deleted upstream; the prune sees it.
+        git(&remote, &["branch", "-q", "-D", "feat"]);
+        assert_eq!(state("feat"), RemoteState::InSync, "stale ref before the fetch");
+        fetch_prune(&base);
+        assert_eq!(state("feat"), RemoteState::Gone);
+
+        // Pushed without `-u`: `origin/<branch>` still counts.
+        git(&wt, &["checkout", "-q", "-b", "plain"]);
+        git(&wt, &["push", "-q", "origin", "plain"]);
+        assert_eq!(state("plain"), RemoteState::InSync);
+
+        // Detached: falls back to the recorded branch.
+        git(&wt, &["checkout", "-q", "--detach"]);
+        assert_eq!(plan("feat"), Some(BranchPlan { branch: "feat".into(), also: None }));
+        // The default branch is never a candidate.
+        assert_eq!(plan("main"), None);
+        git(&base, &["checkout", "-q", "--detach"]);
+        git(&wt, &["checkout", "-q", "main"]);
+        assert_eq!(plan("sandbox/r"), Some(BranchPlan { branch: "sandbox/r".into(), also: None }));
+        // Worktree gone from disk (a retried rm): the recorded branch.
+        git(&base, &["worktree", "remove", &wt.to_string_lossy()]);
+        assert_eq!(plan("feat"), Some(BranchPlan { branch: "feat".into(), also: None }));
+
+        delete_branch_ref(&base, "feat");
+        assert!(!has_ref(&base, "refs/heads/feat"));
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// The preflight refuses exactly what `git worktree remove` refuses, so rm

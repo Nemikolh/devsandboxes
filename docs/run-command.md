@@ -86,9 +86,14 @@ When `run` targets a sandbox whose `folder` is already mounted by an existing in
   Alternative if we want to avoid host-path mirroring: run
   `git worktree repair` / relative gitdir rewriting inside the container — deferred.
 - Cleanup: `devsandbox rm <instance>` runs `git worktree remove`, after first checking
-  the worktree is clean (a dirty one is refused before anything is torn down). A branch
-  `run` created is deleted with `git branch -D` on `--delete-branch`, kept on
-  `--keep-branch`; with neither flag `rm` prompts on a TTY and keeps it otherwise.
+  the worktree is clean (a dirty one is refused before anything is torn down). The
+  branch decided on is the worktree's current one (the recorded one when detached),
+  never the remote's default branch. `--delete-branch` deletes it with `git branch -D`,
+  `--keep-branch` keeps it. With neither flag, `rm` runs `git fetch --prune origin`
+  and then deletes it without asking when all its commits are on its remote branch or
+  its upstream is gone (a merged PR). Otherwise it prompts on a TTY and keeps the
+  branch off one. When it is deleted, the recorded branch goes too if it is an
+  ancestor.
 - State gains `worktree: Option<PathBuf>` and `base_folder: PathBuf` per instance.
 - Extra `folders` roots follow the same idea, as detached worktrees with no branch.
   They're recorded in `Instance.folders`, kept across `rebuild`, and removed by `rm`.
