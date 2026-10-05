@@ -2,6 +2,7 @@
 //! and selection logic stay unit-testable; `mod.rs` owns the crossterm/ratatui
 //! side and feeds decoded key events in here.
 
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
@@ -11,12 +12,14 @@ use ratatui::layout::Rect;
 use super::data::{visible_nodes, ContainerStatus, Node, Snapshot};
 use super::procs::ProcState;
 use super::prompt::{Prompt, PromptAction};
+use super::select::{Candidate, Region, Selection};
 use super::term::TermTabs;
 
 mod actions;
 mod command_line;
 mod inbox;
 mod procs;
+mod selection;
 mod terminal;
 mod thread_actions;
 #[cfg(test)]
@@ -195,6 +198,20 @@ pub struct App {
     /// Whether the outer terminal speaks the kitty keyboard protocol, so new
     /// terminals offer it to their child. Set once by the event loop.
     pub kitty: bool,
+    /// The mouse text selection, shown until a press elsewhere, `esc`, a tab
+    /// switch or a modal opening/closing clears it (`selection.rs`).
+    selection: Option<Selection>,
+    /// A left press inside a region that a drag would turn into a selection.
+    candidate: Option<Candidate>,
+    /// Selectable regions of the last frame, registered by `ui::draw` (hence
+    /// the `RefCell`: drawing borrows the app immutably), so a press is
+    /// hit-tested against what is on screen.
+    regions: RefCell<Vec<Region>>,
+    /// Set by a release ending a selection drag: the next draw reads the text
+    /// off the frame it drew into `clipboard`.
+    copy_requested: Cell<bool>,
+    /// Text the event loop owes the clipboard (OSC 52), filled by the draw.
+    clipboard: RefCell<Option<String>>,
     pub should_quit: bool,
 }
 
@@ -232,6 +249,11 @@ impl App {
             focus: Focus::Dashboard,
             terms: TermTabs::default(),
             kitty: false,
+            selection: None,
+            candidate: None,
+            regions: RefCell::new(Vec::new()),
+            copy_requested: Cell::new(false),
+            clipboard: RefCell::new(None),
             should_quit: false,
         }
     }
@@ -338,13 +360,26 @@ impl App {
     /// Apply a key event to the state. No terminal I/O here (the modal open path
     /// reads config/fs, which is local and user-triggered — see [`Self::open_config`]).
     pub fn on_key(&mut self, key: KeyEvent) {
+        let modal = std::mem::discriminant(&self.modal);
         self.dispatch_key(key);
+        // A modal opening or closing changes what's on screen under the
+        // selection.
+        if std::mem::discriminant(&self.modal) != modal {
+            self.clear_selection();
+        }
         // Whatever the key did to the Inbox cursor (moved it, dismissed the
         // row under it, switched views), the pane follows in one place.
         self.sync_inbox_selection();
     }
 
     fn dispatch_key(&mut self, key: KeyEvent) {
+        // `esc` drops a selection first, and only that, wherever the keys go
+        // except a focused terminal's shell, which owns its `esc`.
+        let to_shell = self.prompt.is_none() && matches!(self.modal, Modal::None) && self.focus == Focus::Terminal;
+        if key.code == KeyCode::Esc && self.selection.is_some() && !to_shell {
+            self.clear_selection();
+            return;
+        }
         // The prompt swallows every key while open, ahead of the modal and the
         // dashboard bindings.
         if self.prompt.is_some() {
@@ -448,8 +483,24 @@ impl App {
     /// with terminals open, clicks and the wheel drive the terminal panel
     /// ([`Self::terminal_mouse`]); on the Inbox tab, the list/thread divider
     /// drags and the list and pane take clicks ([`Self::inbox_mouse`]); a
-    /// click on a tab title switches to it ([`Self::tab_bar_mouse`]). I/O-free.
+    /// click on a tab title switches to it ([`Self::tab_bar_mouse`]). Text
+    /// selection comes first ([`Self::selection_mouse`]): a drag it owns
+    /// never reaches them, and a press reaches both. I/O-free.
     pub fn on_mouse(&mut self, ev: &MouseEvent, area: Rect) {
+        let modal = std::mem::discriminant(&self.modal);
+        if !self.selection_mouse(ev) {
+            self.route_mouse(ev, area);
+            if ev.kind == MouseEventKind::Down(MouseButton::Left) {
+                self.selection_press(ev);
+            }
+        }
+        if std::mem::discriminant(&self.modal) != modal {
+            self.clear_selection();
+        }
+    }
+
+    /// [`Self::on_mouse`] for everything but text selection.
+    fn route_mouse(&mut self, ev: &MouseEvent, area: Rect) {
         let Modal::Config(view) = &mut self.modal else {
             self.dragging_divider = false;
             self.inbox_mouse(ev, area);

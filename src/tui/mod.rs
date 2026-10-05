@@ -5,6 +5,7 @@
 //! machine ([`app::App`]) and rendering ([`ui::draw`]) stay I/O-free.
 
 mod app;
+mod clipboard;
 mod data;
 #[cfg(unix)]
 mod forwards;
@@ -12,6 +13,7 @@ mod kitty;
 mod markdown;
 mod procs;
 mod prompt;
+mod select;
 mod spec;
 mod term;
 mod ui;
@@ -275,6 +277,21 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
         }
 
         terminal.draw(|frame| ui::draw(frame, &app))?;
+        // A released selection was read from the frame just drawn; send it
+        // to the outer terminal's clipboard. OSC 52 has no reply, hence the
+        // status line.
+        if let Some(text) = app.take_clipboard() {
+            let sent = clipboard::cap(&text);
+            let mut out = io::stdout();
+            out.write_all(&clipboard::osc52(sent, std::env::var_os("TMUX").is_some()))?;
+            out.flush()?;
+            let n = sent.chars().count();
+            app.status = Some(if sent.len() < text.len() {
+                format!("copied {n} chars (cut at 1 MiB)")
+            } else {
+                format!("copied {n} chars")
+            });
+        }
 
         // Shorter cadence while terminals are open so shell echo stays snappy.
         let poll = if app.terms.is_empty() {

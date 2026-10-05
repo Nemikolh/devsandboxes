@@ -37,7 +37,7 @@ use crate::devsbd::notify::Level;
 use crate::inbox::{is_url, EntryKind, Inbox, Kind, Op, State, Thread};
 use crate::tui::prompt::Prompt;
 
-use super::view::{col_near, divider_pct, point_in};
+use super::view::{divider_pct, point_in};
 use super::{App, Modal, Tab};
 use crate::tui::ui;
 
@@ -121,7 +121,7 @@ pub struct InboxView {
     /// True while the list/thread divider is being dragged with the mouse.
     /// Separate from the config modal's drag flag so a drag in flight on one
     /// can't carry over to the other when the modal opens or closes.
-    dragging: bool,
+    pub(super) dragging: bool,
     /// Id of the thread the pane shows, i.e. the selected one, as of the last
     /// [`App::sync_inbox_selection`]. The pane's scroll and reply box belong
     /// to it, and it stays listed while shown even once it leaves the view
@@ -444,8 +444,10 @@ impl App {
     /// Switch tabs. Leaving the Inbox resets it to the list and reads the
     /// notify records it showed (see the module doc); entering it reads the
     /// selected thread, now in the pane. Entering Instances refreshes the
-    /// process rows (they aren't fetched elsewhere).
+    /// process rows (they aren't fetched elsewhere). A selection goes with
+    /// the screen it was on.
     pub(super) fn set_tab(&mut self, tab: Tab) {
+        self.clear_selection();
         if self.tab == Tab::Inbox && tab != Tab::Inbox {
             self.inbox.focus = InboxFocus::List;
             self.inbox.reply = None;
@@ -787,7 +789,9 @@ impl App {
         let pct = divider_pct(ev.column.saturating_sub(rect.x), rect.width);
         match ev.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                if point_in(rect, ev.column, ev.row) && col_near(ev.column, divider) {
+                // The two border columns only (list's right, pane's left): a
+                // press on the first text column starts a text selection.
+                if point_in(rect, ev.column, ev.row) && (divider.saturating_sub(1)..=divider).contains(&ev.column) {
                     self.inbox.dragging = true;
                     self.inbox.split_pct = pct;
                 } else {

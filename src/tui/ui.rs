@@ -20,6 +20,7 @@ use super::data::{
 use super::procs::{is_agent, ProcState, MESSAGE_ROW};
 use super::markdown;
 use super::prompt::Prompt;
+use super::select::{self, RegionId};
 use crate::devsbd::notify::Level;
 use crate::inbox::{Kind, State};
 use crate::render::JsonLine;
@@ -28,6 +29,8 @@ pub(super) const ACCENT: Color = Color::Rgb(175, 135, 255);
 const SELECTION: Color = Color::Rgb(0, 215, 135);
 
 pub fn draw(frame: &mut Frame, app: &App) {
+    // Every pane drawn below registers its selectable text area anew.
+    app.clear_regions();
     // The prompt needs a second bottom line for its candidates/error hint.
     let bottom = if app.prompt.is_some() { 2 } else { 1 };
     let [tab_area, content_area, bottom_area] = Layout::vertical([
@@ -45,13 +48,35 @@ pub fn draw(frame: &mut Frame, app: &App) {
         draw_help(frame, app, bottom_area);
     }
 
-    // A modal draws over everything, using the full frame.
+    // A modal draws over everything, using the full frame: only its own
+    // regions may be hit, not the panes it hides.
+    if !matches!(app.modal, Modal::None) {
+        app.clear_regions();
+    }
     match &app.modal {
         Modal::None => {}
-        Modal::Config(view) => draw_config_modal(frame, view),
-        Modal::Help(view) => draw_text_modal(frame, view),
-        Modal::Logs(view) => draw_text_modal(frame, view),
+        Modal::Config(view) => draw_config_modal(frame, app, view),
+        Modal::Help(view) => draw_text_modal(frame, app, view),
+        Modal::Logs(view) => draw_text_modal(frame, app, view),
     }
+
+    // Last, so nothing drawn hides it; and the copy reads the very cells
+    // this frame shows.
+    let copy = app.take_copy_request();
+    if let Some((region, sel)) = app.selection_in_frame() {
+        let buf = frame.buffer_mut();
+        if copy {
+            app.set_clipboard(select::extract(buf, &region, &sel));
+        }
+        select::highlight(buf, &region, &sel);
+    }
+}
+
+/// Register the inner text area of a bordered pane drawn at `area` as
+/// selectable. Every dashboard pane is a `Borders::ALL` block with its title
+/// on the top border, so the inner rect is the same as the drawn block's.
+fn selectable(app: &App, id: RegionId, area: Rect) {
+    app.add_region(id, Block::bordered().inner(area));
 }
 
 /// The tab bar row's `(tabs, totals)` split, plus the totals text. The
@@ -292,6 +317,8 @@ fn draw_services(frame: &mut Frame, app: &App, area: Rect) {
         draw_services_table(frame, app, rows, table_area, panel_focused);
         draw_service_detail(frame, rows.get(app.selected()), detail_area, panel_focused);
     }
+    selectable(app, RegionId::ServicesTable, table_area);
+    selectable(app, RegionId::ServiceDetail, detail_area);
     if let Some(terms_area) = terms_area {
         draw_terminal_panel(frame, app, terms_area);
     }
@@ -499,6 +526,7 @@ fn draw_ports(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         draw_ports_table(frame, app, rows, top, panel_focused);
     }
+    selectable(app, RegionId::PortsTable, top);
     // No per-row detail for forwards; a plain block keeps the layout aligned with
     // the other tabs (and reserves the terminal-panel geometry).
     let detail = Block::default()
@@ -624,8 +652,8 @@ pub(crate) fn inbox_split_rect(frame: Rect, prompt_open: bool, terms_open: bool)
 }
 
 /// Column of the list/thread divider in `region` at `split_pct`: the thread
-/// pane's left border, right next to the list's right one, so a press within
-/// a cell of it ([`App`]'s `col_near`) grabs either border.
+/// pane's left border, right next to the list's right one; a press on
+/// either border grabs it.
 pub(crate) fn inbox_divider_col(region: Rect, split_pct: u16) -> u16 {
     inbox_areas(region, split_pct).1.x
 }
@@ -1009,6 +1037,7 @@ fn draw_inbox_list(frame: &mut Frame, app: &App, area: Rect) {
         .title(" Inbox ");
     let inner = block.inner(list_area);
     frame.render_widget(block, list_area);
+    app.add_region(RegionId::InboxList, inner);
     let dim = Style::default().add_modifier(Modifier::DIM);
     let rows = app.inbox.rows();
     if rows.is_empty() {
@@ -1123,6 +1152,8 @@ fn draw_inbox_pane(frame: &mut Frame, app: &App, area: Rect) {
     };
     let bottom = pane_bottom_rows(t);
     let (content, bottom_area) = pane_areas(inner, bottom);
+    // The content only: the input / hint below it is not message text.
+    app.add_region(RegionId::InboxThread, content);
     let child = app.thread_child(t);
     let lines: Vec<Line> = pane_lines(t, child.as_ref(), app.utc_offset)
         .iter()
@@ -1265,6 +1296,7 @@ fn draw_terminal_panel(frame: &mut Frame, app: &App, area: Rect) {
     if !focused {
         cursor.hide();
     }
+    app.add_region(RegionId::Terminal, block.inner(area));
     let widget = PseudoTerminal::new(screen).block(block).cursor(cursor);
     frame.render_widget(&widget, area);
 }
@@ -1304,6 +1336,8 @@ fn draw_instances(frame: &mut Frame, app: &App, area: Rect) {
         };
         draw_empty(frame, table_area, panel_focused, message);
         draw_detail(frame, snapshot, None, None, detail_area, panel_focused);
+        selectable(app, RegionId::InstancesTree, table_area);
+        selectable(app, RegionId::Detail, detail_area);
     } else {
         let snapshot = snapshot.expect("non-empty nodes imply a snapshot");
         draw_tree(frame, app, snapshot, &nodes, table_area, panel_focused);
@@ -1324,6 +1358,8 @@ fn draw_instances(frame: &mut Frame, app: &App, area: Rect) {
             detail_area,
             panel_focused,
         );
+        selectable(app, RegionId::InstancesTree, table_area);
+        selectable(app, RegionId::Detail, detail_area);
     }
     if let Some(terms_area) = terms_area {
         draw_terminal_panel(frame, app, terms_area);
@@ -1895,7 +1931,7 @@ fn prompt_candidates_line(prompt: &Prompt) -> Line<'static> {
 /// the left, `docker inspect` (JSON) on the right, split at `split_pct` with the
 /// two panes' shared border acting as the divider. The focused pane is marked in
 /// its title.
-fn draw_config_modal(frame: &mut Frame, view: &ConfigView) {
+fn draw_config_modal(frame: &mut Frame, app: &App, view: &ConfigView) {
     let area = frame.area();
 
     // Clear whatever is underneath so the modal is opaque, then split.
@@ -1928,6 +1964,7 @@ fn draw_config_modal(frame: &mut Frame, view: &ConfigView) {
             .scroll((view.scroll, 0)),
         left_area,
     );
+    selectable(app, RegionId::ConfigLeft, left_area);
 
     let inspect_mark = if config_focused { "" } else { "▶ " };
     let inspect_title = if view.inspect_container.is_empty() {
@@ -1942,6 +1979,7 @@ fn draw_config_modal(frame: &mut Frame, view: &ConfigView) {
             .scroll((view.inspect_scroll, 0)),
         right_area,
     );
+    selectable(app, RegionId::ConfigRight, right_area);
 }
 
 /// Border style for the dashboard's table / Detail blocks: normally ACCENT, but
@@ -1971,7 +2009,7 @@ fn pane_block(title: String, focused: bool) -> Block<'static> {
 
 /// Render a plain scrollable text modal (help, logs) full-screen. No per-line
 /// highlighting — the body is shown verbatim.
-fn draw_text_modal(frame: &mut Frame, view: &TextModal) {
+fn draw_text_modal(frame: &mut Frame, app: &App, view: &TextModal) {
     let area = frame.area();
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1980,6 +2018,7 @@ fn draw_text_modal(frame: &mut Frame, view: &TextModal) {
     let paragraph = Paragraph::new(view.body.clone()).block(block).scroll((view.scroll, 0));
     frame.render_widget(ratatui::widgets::Clear, area);
     frame.render_widget(paragraph, area);
+    selectable(app, RegionId::TextModal, area);
 }
 
 /// Light per-line TOML highlighting: `[section]` headers cyan bold, comments
