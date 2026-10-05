@@ -44,7 +44,7 @@ devsandbox              # the dashboard
 | `gc [--force]`                             | Reap unreferenced services, orphaned history files and agent links        |
 | `status --json`                            | Full snapshot for scripts; `ps`/`ls`/`stats`/`inspect`/`run` take `--json` |
 
-`devsandbox port` makes a port inside a running instance or service reachable on the host. It runs in the foreground and stops on Ctrl-C.
+`devsandbox port` makes a port inside a running instance or service reachable on the host:
 
 ```bash
 devsandbox port api 3000                # localhost:3000 -> api's :3000
