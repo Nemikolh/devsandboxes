@@ -387,6 +387,25 @@ impl App {
             self.clear_selection();
             return;
         }
+        // The copy shortcut over a selection, even into a focused terminal
+        // (this runs ahead of `on_key_terminal`): it re-copies rather than
+        // reaching the PTY. Without a selection it goes on as before.
+        if self.selection_key(&key) {
+            return;
+        }
+        // A legacy terminal sends ctrl+shift+c as plain ctrl+c, which would
+        // quit: over a dashboard selection it copies (a second one, with the
+        // selection cleared by `esc` or a click, still quits). A focused shell
+        // keeps its ctrl+c (SIGINT), the prompt its own.
+        if self.selection.is_some()
+            && !to_shell
+            && self.prompt.is_none()
+            && key.code == KeyCode::Char('c')
+            && key.modifiers == KeyModifiers::CONTROL
+        {
+            self.copy_requested.set(true);
+            return;
+        }
         // The prompt swallows every key while open, ahead of the modal and the
         // dashboard bindings.
         if self.prompt.is_some() {

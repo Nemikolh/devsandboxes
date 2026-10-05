@@ -1,5 +1,8 @@
 # Mouse text selection in the dashboard
 
+**Status: implemented (steps 1-4).** User-facing behaviour: `docs/tui.md`,
+*Mouse selection*; terminal specifics: `docs/tui-terminal.md`, *Mouse*.
+
 ## Problem
 
 Text selection with the mouse does not work anywhere in `devsandbox` (the TUI dashboard).

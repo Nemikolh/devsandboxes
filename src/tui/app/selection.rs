@@ -5,13 +5,24 @@
 
 use std::rc::Rc;
 
-use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
 use crate::tui::select::{Candidate, Region, RegionId, RowText, Selection, Source};
 
 use super::view::{Modal, Pane};
 use super::App;
+
+/// The copy shortcut: ctrl+shift+c, or cmd/super+c. The release already
+/// copied, so this only matters where the emulator passes the key through
+/// instead of binding it. Crossterm reports the letter as `c` or `C` with
+/// SHIFT depending on the kitty flags, and SUPER only under kitty flags;
+/// a legacy terminal sends ctrl+shift+c as plain ctrl+c, which this isn't.
+pub(super) fn is_copy_key(key: &KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('c' | 'C'))
+        && (key.modifiers.contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+            || key.modifiers.contains(KeyModifiers::SUPER))
+}
 
 impl App {
     /// Renderer hook: forget the last frame's regions, before drawing a new one.
@@ -90,6 +101,17 @@ impl App {
         self.selection = None;
         self.candidate = None;
         self.copy_requested.set(false);
+    }
+
+    /// The copy shortcut ([`is_copy_key`]) over a live selection: ask the
+    /// next draw for its text again, as a release does. Returns whether it
+    /// consumed the key; without a selection the key goes on as before.
+    pub(super) fn selection_key(&mut self, key: &KeyEvent) -> bool {
+        if self.selection.is_none() || !is_copy_key(key) {
+            return false;
+        }
+        self.copy_requested.set(true);
+        true
     }
 
     /// Renderer hook: whether a release asked for the selection's text; asks
@@ -702,6 +724,65 @@ fn main() { println!(\"hi\"); }
         // And while it tracks, the body is no region at all.
         assert!(app.selection_in_frame().is_none());
         assert!(!app.regions.borrow().iter().any(|r| r.id == RegionId::Terminal));
+    }
+
+    fn mods(code: char, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(code), modifiers)
+    }
+
+    #[test]
+    fn the_copy_shortcut_copies_the_selection_again() {
+        let mut app = inbox_app();
+        ev(&mut app, DOWN, 42, 2);
+        ev(&mut app, DRAG, 60, 4);
+        ev(&mut app, UP, 60, 4);
+        draw(&app);
+        let first = app.take_clipboard().expect("copied on release");
+        let ctrl_shift = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+        for key in [mods('C', ctrl_shift), mods('c', ctrl_shift), mods('c', KeyModifiers::SUPER)] {
+            app.on_key(key);
+            assert!(!app.should_quit, "{key:?}");
+            draw(&app);
+            assert_eq!(app.take_clipboard().as_ref(), Some(&first), "{key:?}");
+            assert!(app.selection.is_some());
+        }
+        // Plain `c` is no copy key.
+        app.on_key(mods('c', KeyModifiers::NONE));
+        draw(&app);
+        assert_eq!(app.take_clipboard(), None);
+        // Ctrl+c (a legacy ctrl+shift+c) copies over a selection, quits without.
+        app.on_key(mods('c', KeyModifiers::CONTROL));
+        assert!(!app.should_quit);
+        draw(&app);
+        assert_eq!(app.take_clipboard().as_ref(), Some(&first));
+        app.on_key(key(KeyCode::Esc));
+        app.on_key(mods('c', KeyModifiers::CONTROL));
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn the_copy_shortcut_in_a_focused_terminal() {
+        let (mut app, b) = term_app("hello world\r\n");
+        ev(&mut app, DOWN, b.x, b.y);
+        ev(&mut app, DRAG, b.x + 4, b.y);
+        ev(&mut app, UP, b.x + 4, b.y);
+        assert_eq!(app.focus, Focus::Terminal);
+        draw(&app);
+        assert_eq!(app.take_clipboard().as_deref(), Some("hello"));
+        let written = |app: &App| app.terms.active_session().unwrap().take_written();
+        let copy = mods('C', KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        // Over a selection: copied again, the shell sees nothing.
+        app.on_key(copy);
+        draw(&app);
+        assert_eq!(app.take_clipboard().as_deref(), Some("hello"));
+        assert!(written(&app).is_empty());
+        // Without one the key is the shell's, as before.
+        app.clear_selection();
+        app.on_key(copy);
+        draw(&app);
+        assert_eq!(app.take_clipboard(), None);
+        assert!(!written(&app).is_empty(), "reaches the PTY");
+        assert_eq!(app.focus, Focus::Terminal);
     }
 
     #[test]

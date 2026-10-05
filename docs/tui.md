@@ -310,6 +310,71 @@ confirm on the suspended screen).
   thread `vscode` action passes its `path`/`line`/`col` the same way; `o`
   opens no file.
 
+## Mouse selection
+
+Design and steps: `docs/tui-selection.md`. Code: `src/tui/select.rs` (model,
+extraction, highlight), `src/tui/app/selection.rs` (routing),
+`src/tui/clipboard.rs` (OSC 52).
+
+- **Select.** A left drag in any pane selects text inside that pane only:
+  its inner text area, so borders, block titles, the tab bar, the help/status
+  line, the prompt and other panes are never part of it. The selection is
+  shown reversed. A press and release without movement is still a click
+  (card, tab, terminal focus); a divider drag still resizes.
+- **Copy.** Releasing the mouse copies, so the text is on the clipboard
+  before you reach for a shortcut; the status line says `copied N chars`.
+  The selection stays shown until `esc` (except in a focused terminal: the
+  shell owns its `esc`), a click elsewhere, a tab switch, a
+  modal opening or closing, another Inbox thread, `m` (rendered ⇄ raw) or
+  another terminal tab clears it.
+- **Copy again.** `ctrl-shift-c`, or `cmd-c` / `super-c`, copies the live
+  selection again, everywhere (prompt, modals, a focused terminal included).
+  Usually it never reaches the dashboard: most emulators bind it to their
+  own copy, which under mouse capture has no selection of its own to copy.
+  That's why the copy already happened on release. Crossterm sees
+  `ctrl-shift-c` and `super-c` only from a terminal speaking the kitty
+  keyboard protocol (docs/tui-terminal.md, *Keyboard*); a legacy terminal
+  that doesn't bind it sends plain `ctrl-c`, so over a dashboard selection
+  `ctrl-c` copies too instead of quitting (a focused shell keeps its
+  `ctrl-c`; with no selection it quits as before).
+- **Documents** (the Inbox thread pane, the config/inspect modal, the help
+  and logs modals): the copy is the rendered text, as shown: list bullets and
+  numbers, quote bars, table rules and columns, code text, links as
+  `text (url)`. Rows our own wrap split are joined back into one line (code
+  rows without adding a space). Dragging past the pane's top or bottom
+  scrolls it a row per drag event, and the wheel scrolls during a selection
+  and keeps it, so a long document copies whole. Config and inspect lines
+  wider than the pane are cut at its edge; a selection whose end reaches the
+  last visible column copies such a line whole.
+- **Other panes** (tables, detail, cards): the cells on screen, trailing
+  spaces trimmed per row.
+- **Integrated terminal**: a child that tracks the mouse gets the drag
+  instead; otherwise a local selection over the screen and its scrollback.
+  Details and limits in docs/tui-terminal.md, *Mouse*.
+- **The terminal's own selection.** `shift`-drag (`option`-drag on macOS)
+  bypasses mouse capture in most emulators and gives their native selection:
+  whole screen rows, borders and the next pane included.
+
+### Clipboard: OSC 52
+
+The copy is `ESC ] 52 ; c ; <base64> BEL` written to the outer terminal, so
+it needs no host clipboard and works over SSH and from inside a container.
+At most 1 MiB is sent (some terminals cap the payload lower); a cut copy
+says `(cut at 1 MiB)`. OSC 52 has no reply: a terminal that ignores it
+leaves the clipboard unchanged, with the status line still saying `copied`.
+
+Supported by VS Code's terminal (1.93 and later), kitty, WezTerm,
+Alacritty, foot, iTerm2, Windows Terminal and Ghostty; some ask before
+letting a program write the clipboard, or have it as a setting.
+GNOME Terminal and other VTE terminals: support depends on the VTE
+version; check yours.
+
+Under tmux (`$TMUX` set) the sequence goes through tmux's DCS passthrough
+(`ESC P tmux ; … ESC \`), which hands it unchanged to the terminal tmux
+runs in. tmux 3.3 and later drop passthrough unless enabled:
+`set -g allow-passthrough on`. `set-clipboard` plays no part in this path,
+and the terminal outside tmux must support OSC 52 itself.
+
 ## Step ordering / commits
 
 Each step = one review + one commit by the orchestrator. Steps 3 and 4 may share

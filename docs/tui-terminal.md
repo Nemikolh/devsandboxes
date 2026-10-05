@@ -65,7 +65,33 @@ Mouse:
     no scrollback;
   - otherwise (a shell on the main screen, or an exited session) → vt100
     scrollback.
-  Clicks and drags are never forwarded: left click stays "focus terminal".
+- Buttons (docs/tui-selection.md, step 3), also routed by whether the child
+  tracks the mouse. A click on the body still focuses the terminal either way.
+  - **Tracking child** (zidane, vim `mouse=a`, tmux): a press on the body,
+    any button, is forwarded at its pane-relative cell, and from then on that
+    button's drags and release, in the child's mode and encoding: `?1000`
+    gets presses and releases, `?1002` drags too. `?1003` (any motion) is
+    treated as `?1002`: the dashboard doesn't ask the outer terminal for
+    plain motion, so a move without a button held is never forwarded. A drag
+    or release outside the panel is clamped to the body's edge, so a child
+    that saw the press always sees the release. Only after a press on the
+    body: a drag that started elsewhere (a pane, the border, the tab strip)
+    never reaches the child. The child does its own selection and copy; the
+    dashboard forms none.
+  - **Otherwise** (a shell prompt, `less` without mouse, an exited session):
+    a left drag is a local selection over the vt100 screen, copied on
+    release like every other pane (docs/tui.md, *Mouse selection*). It
+    reaches into the scrollback: drag past the body's top or bottom to
+    scroll a line per drag event, or use the wheel; the selection stays.
+    Wrapped lines copy as one line. Limits: positions count rows from the
+    oldest scrollback line, so new output doesn't move the selection, until
+    the 5000-line scrollback is full; from then on each new line drops the
+    oldest and the text under the selection shifts a row. A program that
+    redraws in place (a progress bar, `top`) changes the text under the
+    selection, and the copy is what's there at the time of the copy.
+    Switching terminal tab, or closing one, clears the selection.
+  - `ctrl-shift-c` with a selection copies it again instead of reaching the
+    shell; without one it goes to the shell as before.
 
 ### Keyboard: kitty protocol
 

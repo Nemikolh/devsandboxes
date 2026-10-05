@@ -18,6 +18,8 @@ Global
   q, ctrl-c   quit
   tab / S-tab switch tab      1-4  jump to tab
   :           command prompt  ?    this help
+  drag        select & copy to the clipboard (OSC 52)   ctrl-shift-c  copy again
+  shift-drag  the outer terminal's own selection (whole rows, across panes)
 
 Tables (Instances / Services)
   ↑/k ↓/j     move selection

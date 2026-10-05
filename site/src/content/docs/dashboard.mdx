@@ -127,7 +127,7 @@ A script or an agent in a sandbox reaches you with `devsbd notify "tests pass"`.
 
 ## Every key
 
-The real dashboard's keys, also in its `?` screen. The Preview column says what the preview on this page fakes. Clicking a tab title switches to it, like `1`–`4`.
+The real dashboard's keys, also in its `?` screen. The Preview column says what the preview on this page fakes. Clicking a tab title switches to it, like `1`–`4`. Dragging selects text and copies it on release; an app in the integrated terminal that uses the mouse (vim, tmux) gets the drag instead.
 
 ### Everywhere
 
@@ -138,6 +138,9 @@ The real dashboard's keys, also in its `?` screen. The Preview column says what 
 | `:`                 | Command prompt       | yes                              |
 | `?`                 | Every key            | yes                              |
 | `q`, `ctrl-c`       | Quit                 | no                               |
+| drag                | Select text in one pane; release copies it to your clipboard (OSC 52) | no |
+| `ctrl-shift-c`      | Copy the selection again, if your terminal passes the key on | no |
+| `shift`-drag        | Your terminal's own selection (whole rows, across panes) | no |
 
 ### Instances and Services
 
