@@ -16,11 +16,17 @@
 //! Widths are display widths (ratatui's `Span::width`), so wide glyphs count
 //! as the two cells they take. Input is [`sanitize`]d first: what's already
 //! in the store predates the apply-boundary pass, and this is cheap.
+//!
+//! The `*_rows` variants also say, per row, how it continues the logical
+//! line before it ([`RowMeta`]), so a mouse selection copies a wrapped
+//! paragraph back as one line (docs/tui-selection.md, step 2); the plain
+//! ones drop that.
 
 use pulldown_cmark::{Alignment, Event, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
+use super::select::{Join, RowMeta};
 use super::ui::ACCENT;
 use crate::inbox::sanitize;
 
@@ -34,16 +40,33 @@ const DIM: Style = Style::new().add_modifier(Modifier::DIM);
 const HEADING: Style = Style::new().fg(ACCENT).add_modifier(Modifier::BOLD);
 const LINK: Style = Style::new().add_modifier(Modifier::UNDERLINED);
 
-/// `md` rendered as blocks for `width` columns. Empty input renders no
-/// lines.
+/// [`render_rows`]' lines alone. The pane needs the metadata too, so only
+/// the tests read these plain variants.
+#[cfg(test)]
 pub fn render(md: &str, width: u16) -> Vec<Line<'static>> {
+    lines(render_rows(md, width))
+}
+
+/// `md` rendered as blocks for `width` columns, each row with its
+/// [`RowMeta`]. Empty input renders no lines.
+pub fn render_rows(md: &str, width: u16) -> Vec<(Line<'static>, RowMeta)> {
     Blocks::new(width as usize).run(&sanitize(md))
 }
 
-/// The source text, unrendered: each line word-wrapped, nothing styled (the
-/// pane's `m` raw view).
+#[cfg(test)]
 pub fn raw(text: &str, width: u16) -> Vec<Line<'static>> {
-    sanitize(text).lines().flat_map(|l| wrap(&[Span::raw(l.to_string())], width as usize, &[], &[], false)).collect()
+    lines(raw_rows(text, width))
+}
+
+/// The source text, unrendered: each line word-wrapped, nothing styled (the
+/// pane's `m` raw view). A source line's wrapped rows join back into it.
+pub fn raw_rows(text: &str, width: u16) -> Vec<(Line<'static>, RowMeta)> {
+    sanitize(text).lines().flat_map(|l| wrap_rows(&[Span::raw(l.to_string())], width as usize, &[], &[], false)).collect()
+}
+
+#[cfg(test)]
+fn lines(rows: Vec<(Line<'static>, RowMeta)>) -> Vec<Line<'static>> {
+    rows.into_iter().map(|(l, _)| l).collect()
 }
 
 /// `md` as one line of styled spans, unwrapped: for a single-row context
@@ -181,7 +204,7 @@ enum Container {
 /// rows into `out`.
 struct Blocks {
     width: usize,
-    out: Vec<Line<'static>>,
+    out: Vec<(Line<'static>, RowMeta)>,
     inl: Inlines,
     containers: Vec<Container>,
     /// Per open list: the next number (ordered) or `None` (bullets).
@@ -212,7 +235,7 @@ impl Blocks {
         }
     }
 
-    fn run(mut self, md: &str) -> Vec<Line<'static>> {
+    fn run(mut self, md: &str) -> Vec<(Line<'static>, RowMeta)> {
         // Offsets: a table too wide to lay out falls back to its source.
         let parser = Parser::new_ext(md, Options::ENABLE_TABLES).into_offset_iter();
         for (event, range) in parser {
@@ -403,7 +426,8 @@ impl Blocks {
                     line.push(Span::raw(" ".repeat(right)));
                 }
             }
-            // Fits by construction: one row each, trailing padding trimmed.
+            // Fits by construction: one row each (so never a continuation
+            // a copy would join), trailing padding trimmed.
             self.emit(&line, false, None);
             if i == 0 {
                 self.emit(&[Span::styled("─".repeat(total), DIM)], false, None);
@@ -412,7 +436,8 @@ impl Blocks {
         self.gap = true;
     }
 
-    /// Raw HTML and tables too wide to lay out: their source lines, wrapped.
+    /// Raw HTML and tables too wide to lay out: their source lines, wrapped
+    /// (and so joined back into them by a copy, like a paragraph).
     fn source_lines(&mut self, text: &str) {
         for l in text.trim_end_matches('\n').split('\n') {
             self.emit(&[Span::raw(l.trim_end().to_string())], false, None);
@@ -438,24 +463,27 @@ impl Blocks {
         if self.gap && !self.out.is_empty() {
             let bars: String = self.prefix(false).iter().map(|s| s.content.as_ref()).collect();
             let bars = bars.trim_end().to_string();
-            self.out.push(if bars.is_empty() { Line::default() } else { Line::from(Span::styled(bars, DIM)) });
+            let line = if bars.is_empty() { Line::default() } else { Line::from(Span::styled(bars, DIM)) };
+            self.out.push((line, RowMeta::default()));
         }
         self.gap = false;
     }
 
     /// Wrap `content` under the current prefixes into `out`; `fill` pads each
-    /// row to the width (a code block reads as one tinted box).
+    /// row to the width (a code block reads as one tinted box), recorded in
+    /// [`RowMeta::fill`] as not being text.
     fn emit(&mut self, content: &[Span<'static>], hard: bool, fill: Option<Style>) {
         self.pay_gap();
-        let lines = wrap(content, self.width, &self.prefix(true), &self.prefix(false), hard);
-        for mut line in lines {
+        let rows = wrap_rows(content, self.width, &self.prefix(true), &self.prefix(false), hard);
+        for (mut line, mut meta) in rows {
             if let Some(fill) = fill {
                 let pad = self.width.saturating_sub(line.width());
                 if pad > 0 {
                     line.spans.push(Span::styled(" ".repeat(pad), fill));
+                    meta.fill = pad as u16;
                 }
             }
-            self.out.push(line);
+            self.out.push((line, meta));
         }
         for c in &mut self.containers {
             if let Container::Item { fresh, .. } = c {
@@ -577,16 +605,33 @@ fn trim_end(content: &mut Vec<Span<'static>>) {
     }
 }
 
+#[cfg(test)]
+pub fn wrap(content: &[Span<'static>], width: usize, first: &[Span<'static>], cont: &[Span<'static>], hard: bool) -> Vec<Line<'static>> {
+    lines(wrap_rows(content, width, first, cont, hard))
+}
+
 /// Wrap one logical line of styled `content` into rows of at most `width`
 /// display columns, `first` leading the first row and `cont` every later
 /// one. Word wrap breaks at spaces (dropped at the break) and splits a word
 /// wider than the row; `hard` (code) breaks at the width, keeping every
 /// space. Always at least one row, so an empty line still takes its row.
-pub fn wrap(content: &[Span<'static>], width: usize, first: &[Span<'static>], cont: &[Span<'static>], hard: bool) -> Vec<Line<'static>> {
+///
+/// Each row comes with its [`RowMeta`]: the first starts a line, a row
+/// after a word-wrap break continues it with the space the break dropped
+/// ([`Join::Space`]), one after a split word or a `hard` break with nothing
+/// ([`Join::Tight`]); a continuation's `prefix` is `cont`'s width.
+pub fn wrap_rows(
+    content: &[Span<'static>],
+    width: usize,
+    first: &[Span<'static>],
+    cont: &[Span<'static>],
+    hard: bool,
+) -> Vec<(Line<'static>, RowMeta)> {
     let width = width.max(1);
     let cells: Vec<(char, Style)> =
         content.iter().flat_map(|s| s.content.chars().map(move |c| (c, s.style))).collect();
-    let mut rows = Rows { out: Vec::new(), row: first.to_vec(), at: first.len(), used: width_of(first), cont, hard };
+    let meta = RowMeta { join: Join::Newline, prefix: width_of(first) as u16, fill: 0 };
+    let mut rows = Rows { out: Vec::new(), row: first.to_vec(), at: first.len(), used: width_of(first), meta, cont, hard };
     let mut wrapped = false;
     let mut i = 0;
     while i < cells.len() {
@@ -602,36 +647,40 @@ pub fn wrap(content: &[Span<'static>], width: usize, first: &[Span<'static>], co
             if rows.used + w <= width {
                 run.iter().for_each(|(c, s)| rows.push(*c, *s, 1));
             } else if !rows.empty() {
-                rows.newline();
+                rows.newline(Join::Space);
                 wrapped = true;
             }
             continue;
         }
         let w: usize = run.iter().map(|(c, _)| char_width(*c)).sum();
+        // Runs alternate, so the row ends in the spaces before this word:
+        // the break is at them.
         if !hard && !rows.empty() && rows.used + w > width {
-            rows.newline();
+            rows.newline(Join::Space);
             wrapped = true;
         }
         for (c, s) in run {
             let cw = char_width(*c);
             if !rows.empty() && rows.used + cw > width {
-                rows.newline();
+                rows.newline(Join::Tight);
                 wrapped = true;
             }
             rows.push(*c, *s, cw);
         }
     }
-    rows.newline();
+    rows.newline(Join::Newline);
     rows.out
 }
 
 /// [`wrap`]'s output so far and the row being filled.
 struct Rows<'a> {
-    out: Vec<Line<'static>>,
+    out: Vec<(Line<'static>, RowMeta)>,
     /// The row: its prefix spans, then content from index `at`.
     row: Vec<Span<'static>>,
     at: usize,
     used: usize,
+    /// The row's own metadata, given by the break that started it.
+    meta: RowMeta,
     cont: &'a [Span<'static>],
     hard: bool,
 }
@@ -650,14 +699,16 @@ impl Rows<'_> {
         self.used += width;
     }
 
-    fn newline(&mut self) {
+    /// End the row; `join` is how the next one continues it.
+    fn newline(&mut self, join: Join) {
         let mut content = self.row.split_off(self.at);
         if !self.hard {
             trim_end(&mut content);
         }
         let mut row = std::mem::replace(&mut self.row, self.cont.to_vec());
         row.append(&mut content);
-        self.out.push(Line::from(row));
+        let next = RowMeta { join, prefix: width_of(self.cont) as u16, fill: 0 };
+        self.out.push((Line::from(row), std::mem::replace(&mut self.meta, next)));
         self.at = self.cont.len();
         self.used = width_of(self.cont);
     }
@@ -902,6 +953,33 @@ mod tests {
         // The tab goes to the next stop: column 8, once ESC and CSI are gone.
         assert_eq!(texts(&lines), ["a[31mbc d"]);
         assert_eq!(text(&Line::from(inline_spans("x\x1b]0;t\x07"))), "x]0;t");
+    }
+
+    /// `(text, join, prefix, fill)` per row of [`render_rows`].
+    fn metas(md: &str, width: u16) -> Vec<(String, Join, u16, u16)> {
+        render_rows(md, width).iter().map(|(l, m)| (text(l), m.join, m.prefix, m.fill)).collect()
+    }
+
+    #[test]
+    fn rows_say_how_they_continue_their_line() {
+        use Join::*;
+        let s = |t: &str, j, p, f| (t.to_string(), j, p, f);
+        // A word-wrap break joins with a space, a split word without; the
+        // hanging indent and quote bar are the continuation's prefix.
+        assert_eq!(metas("- one two three", 9), [s("• one two", Newline, 2, 0), s("  three", Space, 2, 0)]);
+        assert_eq!(metas("> abcdefghij", 6), [s("│ abcd", Newline, 2, 0), s("│ efgh", Tight, 2, 0), s("│ ij", Tight, 2, 0)]);
+        // Code rows break tight; the tint padding is fill, not text.
+        assert_eq!(metas("```\nab cd ef\n```", 4), [s("ab c", Newline, 0, 0), s("d ef", Tight, 0, 0)]);
+        assert_eq!(metas("```\nab\n```", 4), [s("ab  ", Newline, 0, 2)]);
+        // Gaps and laid-out table rows stand alone.
+        let table = metas("a\n\n| k | v |\n|---|---|\n| 1 | 2 |", 20);
+        assert!(table.iter().all(|r| r.1 == Newline), "{table:?}");
+        // A table too wide falls back to its source, whose lines rejoin.
+        let fallback = metas("| key | description |\n|---|---|\n| a | a long description here |", 12);
+        assert_eq!(fallback[1], s("description", Space, 0, 0));
+        // Raw and plain wraps carry the same metadata.
+        let raw: Vec<Join> = raw_rows("aa bb cc\ndd", 5).iter().map(|(_, m)| m.join).collect();
+        assert_eq!(raw, [Newline, Space, Newline]);
     }
 
     #[test]

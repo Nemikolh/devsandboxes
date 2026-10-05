@@ -130,6 +130,12 @@ impl TextModal {
     fn on_scroll_key(&mut self, key: KeyEvent) -> bool {
         scroll_key(&mut self.scroll, line_count(&self.body), key)
     }
+
+    /// Scroll by `delta` lines, clamped like the scroll keys; the new scroll.
+    pub(super) fn scroll_by(&mut self, delta: i16) -> u16 {
+        self.scroll = apply_delta(self.scroll, delta, line_count(&self.body).saturating_sub(1));
+        self.scroll
+    }
 }
 
 /// Line count of `body`, clamped to `u16`, for scroll bounds.
@@ -236,6 +242,22 @@ impl ConfigView {
         }
     }
 
+    /// Scroll `pane` by `delta` lines, clamped to its line count; its new
+    /// scroll.
+    pub(super) fn scroll_pane(&mut self, pane: Pane, delta: i16) -> u16 {
+        match pane {
+            Pane::Config => {
+                self.scroll = apply_delta(self.scroll, delta, self.line_count().saturating_sub(1));
+                self.scroll
+            }
+            Pane::Inspect => {
+                let max = line_count(&self.inspect).saturating_sub(1);
+                self.inspect_scroll = apply_delta(self.inspect_scroll, delta, max);
+                self.inspect_scroll
+            }
+        }
+    }
+
     /// Move the divider by `delta` percent, clamped to [SPLIT_MIN, SPLIT_MAX].
     fn resize(&mut self, delta: i16) {
         self.split_pct = clamp_split(self.split_pct as i16 + delta);
@@ -292,13 +314,7 @@ impl App {
     /// Scroll the pane under `col` (left of `divider` = config, else inspect) by
     /// `delta` lines, clamped to that pane's line count.
     pub(super) fn wheel_scroll(view: &mut ConfigView, col: u16, divider: u16, delta: i16) {
-        if col < divider {
-            let max = view.line_count().saturating_sub(1);
-            view.scroll = apply_delta(view.scroll, delta, max);
-        } else {
-            let max = line_count(&view.inspect).saturating_sub(1);
-            view.inspect_scroll = apply_delta(view.inspect_scroll, delta, max);
-        }
+        view.scroll_pane(if col < divider { Pane::Config } else { Pane::Inspect }, delta);
     }
 
     /// Key handling while any modal is open. `esc`/`q` (and `?` for the help

@@ -3,11 +3,14 @@
 //! here), so a press is hit-tested against what is on screen; the selected
 //! text is read off the next frame by `ui::draw` and sent by the event loop.
 
+use std::rc::Rc;
+
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
-use crate::tui::select::{Candidate, Region, RegionId, Selection, Source};
+use crate::tui::select::{Candidate, Region, RegionId, RowText, Selection, Source};
 
+use super::view::{Modal, Pane};
 use super::App;
 
 impl App {
@@ -18,13 +21,52 @@ impl App {
 
     /// Renderer hook: `rect` (a pane's inner text area) is selectable as `id`.
     pub fn add_region(&self, id: RegionId, rect: Rect) {
+        self.add_source_region(id, rect, Source::Screen);
+    }
+
+    /// Renderer hook: `rect` shows `rows` of a document from row `scroll` on
+    /// ([`Source::Rows`]).
+    pub fn add_rows_region(&self, id: RegionId, rect: Rect, scroll: usize, rows: Vec<RowText>) {
+        self.add_source_region(id, rect, Source::Rows { scroll, rows: Rc::from(rows) });
+    }
+
+    fn add_source_region(&self, id: RegionId, rect: Rect, source: Source) {
         if !rect.is_empty() {
-            self.regions.borrow_mut().push(Region { id, rect, source: Source::Screen });
+            self.regions.borrow_mut().push(Region { id, rect, source });
         }
     }
 
+    /// Region `id` of the last frame; a cheap clone (a `Rows` document is
+    /// shared).
     fn region(&self, id: RegionId) -> Option<Region> {
         self.regions.borrow().iter().find(|r| r.id == id).cloned()
+    }
+
+    /// Autoscroll: a drag at screen row `row`, above or below scrolled
+    /// region `id`, scrolls its document one row toward the pointer, through
+    /// the pane's own scroll state and clamp, and the frame's copy of the
+    /// region follows so later drags before the next draw see it. Returns
+    /// the region as it is now.
+    fn autoscroll(&mut self, id: RegionId, row: u16) -> Option<Region> {
+        let region = self.region(id)?;
+        let delta: i16 = match region.source {
+            Source::Rows { .. } if row < region.rect.y => -1,
+            Source::Rows { .. } if row >= region.rect.bottom() => 1,
+            _ => return Some(region),
+        };
+        let scroll = match (id, &mut self.modal) {
+            (RegionId::InboxThread, _) => self.inbox.scroll_pane(delta),
+            (RegionId::ConfigLeft, Modal::Config(view)) => view.scroll_pane(Pane::Config, delta),
+            (RegionId::ConfigRight, Modal::Config(view)) => view.scroll_pane(Pane::Inspect, delta),
+            (RegionId::TextModal, Modal::Help(view) | Modal::Logs(view)) => view.scroll_by(delta),
+            _ => return Some(region),
+        } as usize;
+        let mut regions = self.regions.borrow_mut();
+        let region = regions.iter_mut().find(|r| r.id == id)?;
+        if let Source::Rows { scroll: s, .. } = &mut region.source {
+            *s = scroll;
+        }
+        Some(region.clone())
     }
 
     /// The live selection and its region in the frame being drawn, for the
@@ -67,11 +109,13 @@ impl App {
     pub(super) fn selection_mouse(&mut self, ev: &MouseEvent) -> bool {
         match ev.kind {
             MouseEventKind::Drag(MouseButton::Left) => {
-                if let Some(sel) = self.selection.as_mut().filter(|s| s.dragging) {
-                    let Some(region) = self.regions.borrow().iter().find(|r| r.id == sel.region).cloned() else {
-                        return true;
-                    };
-                    sel.head = region.pos_at(ev.column, ev.row);
+                if let Some(id) = self.selection.filter(|s| s.dragging).map(|s| s.region) {
+                    // Past a scrolled region's top or bottom, the head goes
+                    // to the row scrolled in: dragging there extends the
+                    // selection one row per event.
+                    if let (Some(region), Some(sel)) = (self.autoscroll(id, ev.row), self.selection.as_mut()) {
+                        sel.head = region.pos_at(ev.column, ev.row);
+                    }
                     return true;
                 }
                 let Some(c) = self.candidate.filter(|c| c.at != (ev.column, ev.row)) else {
@@ -147,6 +191,12 @@ mod tests {
 
     /// The Inbox with two notify threads, drawn once so its regions exist.
     fn inbox_app() -> App {
+        notes_app(&["first message", "second message"])
+    }
+
+    /// The Inbox with a notify thread per message (ids from 1, the first
+    /// selected), drawn once.
+    fn notes_app(msgs: &[&str]) -> App {
         let mut app = new_app();
         let note = |id: u64, msg: &str| {
             let mut t = Thread { id, kind: Kind::Notify, owner_name: "builder".into(), unread: true, ..Thread::default() };
@@ -157,7 +207,7 @@ mod tests {
             t
         };
         let mut inbox = Inbox::default();
-        inbox.threads = vec![note(1, "first message"), note(2, "second message")];
+        inbox.threads = msgs.iter().enumerate().map(|(i, m)| note(i as u64 + 1, m)).collect();
         app.set_inbox(inbox);
         app.on_key(key(KeyCode::Char('4')));
         draw(&app);
@@ -349,5 +399,216 @@ mod tests {
         app.focus = Focus::Terminal;
         app.on_key(key(KeyCode::Esc));
         assert!(app.selection.is_some());
+    }
+
+    // The thread pane's content area at FRAME size: columns 41-98, rows 2-37.
+    const PANE_TOP: u16 = 2;
+    const PANE_BOTTOM: u16 = 37;
+
+    /// Drag from the thread pane's first cell to past its bottom until it
+    /// stops scrolling, release, and return the copy.
+    fn copy_whole_pane(app: &mut App) -> String {
+        ev(app, DOWN, 41, PANE_TOP);
+        ev(app, DRAG, 98, PANE_BOTTOM);
+        for _ in 0..200 {
+            ev(app, DRAG, 98, PANE_BOTTOM + 2);
+        }
+        ev(app, UP, 98, PANE_BOTTOM + 2);
+        draw(app);
+        app.take_clipboard().expect("copied")
+    }
+
+    const DOC: &str = "\
+# Build report
+
+The build **finished** with two warnings; see [the PR](https://example.com/pr/1).
+
+- first bullet
+- second bullet
+
+1. step one
+2. step two
+
+> quoted note
+
+```rust
+fn main() { println!(\"hi\"); }
+```
+
+| name | state |
+|------|-------|
+| api  | ok    |
+";
+
+    #[test]
+    fn a_rendered_markdown_copy_keeps_what_the_pane_shows() {
+        let mut app = notes_app(&[DOC]);
+        let text = copy_whole_pane(&mut app);
+        for want in [
+            "Build report",
+            "The build finished with two warnings; see the PR (https://example.com/pr/1).",
+            "• first bullet\n• second bullet",
+            "1. step one\n2. step two",
+            "│ quoted note",
+            "fn main() { println!(\"hi\"); }",
+            "name  state\n───────────\napi   ok",
+        ] {
+            assert!(text.contains(want), "{want:?} not in {text:?}");
+        }
+        // No code-block fill or other trailing blanks.
+        assert!(text.lines().all(|l| !l.ends_with(' ')), "{text:?}");
+    }
+
+    #[test]
+    fn soft_wrapped_rows_copy_as_one_line_without_their_decoration() {
+        let long = "the quick brown fox jumps over the lazy dog and keeps running past the fence into the far field at dusk while the farmer watches";
+        let mut app = notes_app(&[&format!("- {long}\n\n> {long}\n\n{long}")]);
+        // 58 columns: each takes 2-3 rows.
+        let rows = crate::tui::markdown::render_rows(&format!("> {long}"), 58);
+        assert_eq!(rows.len(), 3);
+        let text = copy_whole_pane(&mut app);
+        assert!(text.contains(&format!("• {long}\n")), "{text:?}");
+        assert!(text.contains(&format!("│ {long}\n")), "{text:?}");
+        assert!(text.ends_with(&format!("\n{long}")), "{text:?}");
+    }
+
+    #[test]
+    fn a_hard_wrapped_code_line_copies_without_inserted_spaces() {
+        // The break falls right after the space: the first row is the a's
+        // and it, the space must neither be lost nor doubled.
+        let code = format!("{} {} end", "a".repeat(57), "b".repeat(70));
+        let mut app = notes_app(&[&format!("```\n{code}\n  indented\n```")]);
+        let text = copy_whole_pane(&mut app);
+        assert!(text.contains(&format!("{code}\n  indented")), "{text:?}");
+    }
+
+    /// A code block of 80 numbered rows: far taller than the pane.
+    fn tall_app() -> App {
+        let body: String = (1..=80).map(|i| format!("row {i:02}\n")).collect();
+        notes_app(&[&format!("```\n{body}```")])
+    }
+
+    #[test]
+    fn a_drag_past_the_bottom_autoscrolls_and_copies_off_screen_rows() {
+        let mut app = tall_app();
+        assert!(!rows(&draw(&app)).iter().any(|r| r.contains("row 80")), "off screen");
+        ev(&mut app, DOWN, 41, PANE_TOP);
+        ev(&mut app, DRAG, 60, 10);
+        assert_eq!(app.inbox.scroll, 0);
+        // One row per drag event below the pane, up to the bound.
+        ev(&mut app, DRAG, 60, PANE_BOTTOM + 1);
+        assert_eq!(app.inbox.scroll, 1);
+        assert_eq!(app.selection.unwrap().head.row, (PANE_BOTTOM - PANE_TOP + 1) as usize);
+        for _ in 0..200 {
+            ev(&mut app, DRAG, 60, PANE_BOTTOM + 1);
+        }
+        let max = app.inbox.scroll;
+        assert!(max > 40, "{max}");
+        ev(&mut app, UP, 60, PANE_BOTTOM + 1);
+        let buf = draw(&app);
+        let text = app.take_clipboard().expect("copied");
+        assert!(text.contains("row 01\nrow 02") && text.ends_with("row 79\nrow 80"), "{text:?}");
+        // Highlighted where it is on screen now: the bottom row, scrolled in.
+        assert!(buf[(41, PANE_BOTTOM)].modifier.contains(Modifier::REVERSED));
+
+        // The wheel scrolls the pane and keeps the selection (content rows).
+        let sel = app.selection.unwrap();
+        ev(&mut app, MouseEventKind::ScrollUp, 60, 10);
+        assert_eq!(app.inbox.scroll, max - 3);
+        assert_eq!(app.selection, Some(sel));
+        draw(&app);
+        assert_eq!(app.selection, Some(sel), "a redraw keeps it too");
+    }
+
+    #[test]
+    fn a_drag_above_the_top_autoscrolls_up() {
+        let mut app = tall_app();
+        for _ in 0..30 {
+            ev(&mut app, MouseEventKind::ScrollDown, 60, 10);
+        }
+        assert!(app.inbox.scroll > 40);
+        draw(&app);
+        ev(&mut app, DOWN, 98, PANE_BOTTOM);
+        ev(&mut app, DRAG, 60, 10);
+        for _ in 0..200 {
+            ev(&mut app, DRAG, 60, PANE_TOP - 1); // the pane's border row
+        }
+        assert_eq!(app.inbox.scroll, 0);
+        ev(&mut app, UP, 60, PANE_TOP - 1);
+        draw(&app);
+        let text = app.take_clipboard().expect("copied");
+        assert!(text.contains("row 01\nrow 02") && text.contains("row 79"), "{text:?}");
+    }
+
+    #[test]
+    fn a_raw_mode_copy_equals_the_source_lines() {
+        let long = "a long **source** line that the raw view wraps over two rows, at least, at this width";
+        let src = format!("# Title\n\n- item `code`\n{long}\n> quote");
+        let mut app = notes_app(&[&src]);
+        app.on_key(key(KeyCode::Enter)); // the thread focused: `m` is its key
+        draw(&app);
+        ev(&mut app, DOWN, 42, PANE_TOP);
+        ev(&mut app, DRAG, 50, PANE_TOP + 1);
+        app.on_key(key(KeyCode::Char('m')));
+        assert!(app.inbox.raw);
+        assert!(app.selection.is_none(), "`m` re-renders the rows under it");
+        draw(&app);
+        let text = copy_whole_pane(&mut app);
+        assert!(text.ends_with(&src), "{text:?}");
+    }
+
+    #[test]
+    fn a_config_line_wider_than_its_pane_copies_whole_from_the_right_edge() {
+        let mut app = new_app();
+        open_modal(&mut app);
+        let wide = format!("image = \"{}\"", "x".repeat(100));
+        if let Modal::Config(v) = &mut app.modal {
+            v.original = format!("[sandbox.s]\n{wide}\nnext = 1\n");
+        }
+        draw(&app);
+        // The left pane's text is columns 1-48; 49 is its right border.
+        let copy = |app: &mut App, from: (u16, u16), to: (u16, u16)| {
+            ev(app, DOWN, from.0, from.1);
+            ev(app, DRAG, to.0, to.1);
+            ev(app, UP, to.0, to.1);
+            draw(app);
+            app.take_clipboard().expect("copied")
+        };
+        assert_eq!(copy(&mut app, (1, 2), (49, 2)), wide);
+        assert_eq!(copy(&mut app, (1, 2), (48, 2)), wide, "the last visible column");
+        assert_eq!(copy(&mut app, (1, 2), (5, 2)), "image", "short of it: what's under the drag");
+        // A middle row is whole whatever the columns.
+        assert_eq!(copy(&mut app, (2, 1), (3, 3)), format!("sandbox.s]\n{wide}\nnex"));
+
+        // Scrolled: the positions are content rows, so the copy is too.
+        ev(&mut app, MouseEventKind::ScrollDown, 10, 10);
+        assert_eq!(view(&app).scroll, 2);
+        draw(&app);
+        assert_eq!(copy(&mut app, (1, 1), (4, 1)), "next");
+    }
+
+    #[test]
+    fn a_thread_change_clears_the_selection() {
+        let mut app = notes_app(&["one", "two", "three"]);
+        let select = |app: &mut App| {
+            draw(app);
+            ev(app, DOWN, 42, PANE_TOP);
+            ev(app, DRAG, 50, PANE_TOP + 1);
+            ev(app, UP, 50, PANE_TOP + 1);
+            assert!(app.selection.is_some());
+        };
+        select(&mut app);
+        // The wheel over the list moves the cursor to the next thread.
+        ev(&mut app, MouseEventKind::ScrollDown, 5, 10);
+        assert_eq!(app.selected_inbox_thread().map(|t| t.id), Some(2));
+        assert!(app.selection.is_none());
+        draw(&app);
+        assert_eq!(app.take_clipboard(), None);
+        // So does a key moving it.
+        select(&mut app);
+        app.inbox.focus = InboxFocus::List;
+        app.on_key(key(KeyCode::Char('j')));
+        assert_eq!(app.selected_inbox_thread().map(|t| t.id), Some(3));
+        assert!(app.selection.is_none());
     }
 }

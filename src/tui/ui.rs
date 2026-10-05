@@ -1109,10 +1109,11 @@ fn tone_style(tone: Tone) -> Style {
 /// markdown on their tone's style, the rest plain; then the line is word
 /// wrapped by display width. `raw` (`m`) shows the markdown as its source.
 /// Every segment is sanitized: it may be stored text from before the
-/// apply-boundary pass.
-fn pane_rows(line: &PaneLine, width: u16, raw: bool) -> Vec<Line<'static>> {
+/// apply-boundary pass. Each row comes with how a copy joins it
+/// ([`select::RowMeta`]).
+fn pane_rows(line: &PaneLine, width: u16, raw: bool) -> Vec<(Line<'static>, select::RowMeta)> {
     if let [(Tone::Markdown, md)] = line.as_slice() {
-        return if raw { markdown::raw(md, width) } else { markdown::render(md, width) };
+        return if raw { markdown::raw_rows(md, width) } else { markdown::render_rows(md, width) };
     }
     let mut spans = Vec::new();
     for (tone, text) in line {
@@ -1128,7 +1129,7 @@ fn pane_rows(line: &PaneLine, width: u16, raw: bool) -> Vec<Line<'static>> {
             _ => spans.push(Span::styled(crate::inbox::sanitize(text), base)),
         }
     }
-    markdown::wrap(&spans, width as usize, &[], &[], false)
+    markdown::wrap_rows(&spans, width as usize, &[], &[], false)
 }
 
 /// The thread pane: the selected thread's content, then its input (a thread
@@ -1152,17 +1153,21 @@ fn draw_inbox_pane(frame: &mut Frame, app: &App, area: Rect) {
     };
     let bottom = pane_bottom_rows(t);
     let (content, bottom_area) = pane_areas(inner, bottom);
-    // The content only: the input / hint below it is not message text.
-    app.add_region(RegionId::InboxThread, content);
     let child = app.thread_child(t);
-    let lines: Vec<Line> = pane_lines(t, child.as_ref(), app.utc_offset)
+    let (lines, texts): (Vec<Line>, Vec<select::RowText>) = pane_lines(t, child.as_ref(), app.utc_offset)
         .iter()
         .flat_map(|l| pane_rows(l, content.width, app.inbox.raw))
-        .collect();
+        .map(|(line, meta)| {
+            let text = select::RowText::new(&line, meta);
+            (line, text)
+        })
+        .unzip();
     let rows = lines.len().min(u16::MAX as usize) as u16;
     let max = rows.saturating_sub(content.height);
     app.inbox.set_pane_max(max);
     let scroll = app.inbox.scroll.min(max);
+    // The content only: the input / hint below it is not message text.
+    app.add_rows_region(RegionId::InboxThread, content, scroll as usize, texts);
     frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), content);
     match &t.reply {
         Some(reply) => draw_reply_input(frame, app, reply.placeholder.as_deref(), bottom_area),
@@ -1964,7 +1969,7 @@ fn draw_config_modal(frame: &mut Frame, app: &App, view: &ConfigView) {
             .scroll((view.scroll, 0)),
         left_area,
     );
-    selectable(app, RegionId::ConfigLeft, left_area);
+    selectable_lines(app, RegionId::ConfigLeft, left_area, view.scroll, view.body());
 
     let inspect_mark = if config_focused { "" } else { "▶ " };
     let inspect_title = if view.inspect_container.is_empty() {
@@ -1979,7 +1984,7 @@ fn draw_config_modal(frame: &mut Frame, app: &App, view: &ConfigView) {
             .scroll((view.inspect_scroll, 0)),
         right_area,
     );
-    selectable(app, RegionId::ConfigRight, right_area);
+    selectable_lines(app, RegionId::ConfigRight, right_area, view.inspect_scroll, &view.inspect);
 }
 
 /// Border style for the dashboard's table / Detail blocks: normally ACCENT, but
@@ -2018,7 +2023,15 @@ fn draw_text_modal(frame: &mut Frame, app: &App, view: &TextModal) {
     let paragraph = Paragraph::new(view.body.clone()).block(block).scroll((view.scroll, 0));
     frame.render_widget(ratatui::widgets::Clear, area);
     frame.render_widget(paragraph, area);
-    selectable(app, RegionId::TextModal, area);
+    selectable_lines(app, RegionId::TextModal, area, view.scroll, &view.body);
+}
+
+/// [`selectable`] for a bordered `Paragraph` of `body` scrolled to `scroll`
+/// without wrap: one row per line, copied whole past the pane's right edge
+/// ([`select::extract_rows`]).
+fn selectable_lines(app: &App, id: RegionId, area: Rect, scroll: u16, body: &str) {
+    let rows = body.lines().map(select::RowText::plain).collect();
+    app.add_rows_region(id, Block::bordered().inner(area), scroll as usize, rows);
 }
 
 /// Light per-line TOML highlighting: `[section]` headers cyan bold, comments

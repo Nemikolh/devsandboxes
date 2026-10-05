@@ -210,6 +210,14 @@ impl InboxView {
         self.pane_max.set(max);
     }
 
+    /// Scroll the pane by `delta` rows within the rendered bound; the new
+    /// scroll.
+    pub(super) fn scroll_pane(&mut self, delta: i16) -> u16 {
+        let max = self.pane_max.get();
+        self.scroll = (self.scroll.min(max) as i32 + delta as i32).clamp(0, max as i32) as u16;
+        self.scroll
+    }
+
     /// Renderer hook: the list's first visible card, as of the last frame.
     pub fn list_offset(&self) -> usize {
         self.list_offset.get()
@@ -511,6 +519,9 @@ impl App {
         let selected = self.selected_inbox_thread().map(|t| (t.id, t.unread));
         let id = selected.map(|(id, _)| id);
         if id != self.inbox.shown {
+            // A selection's rows are the old thread's: copying it now would
+            // read another thread's text.
+            self.clear_selection();
             self.inbox.shown = id;
             self.inbox.scroll = 0;
             self.inbox.reply = None;
@@ -630,7 +641,11 @@ impl App {
             },
             KeyCode::Char(c @ '1'..='9') => self.run_thread_action(&t, c as usize - '1' as usize),
             KeyCode::Char('r' | 'i') => self.open_reply(&t),
-            KeyCode::Char('m') if !ctrl => self.inbox.raw = !self.inbox.raw,
+            KeyCode::Char('m') if !ctrl => {
+                // Raw rows aren't the rendered ones a selection points into.
+                self.clear_selection();
+                self.inbox.raw = !self.inbox.raw;
+            }
             _ => {
                 let lines = self.inbox.pane_max.get().saturating_add(1);
                 let mut scroll = self.inbox.scroll;
@@ -855,12 +870,8 @@ impl App {
                 }
             }
             Some(InboxHit::Thread) => {
-                let max = self.inbox.pane_max.get();
-                self.inbox.scroll = if up {
-                    self.inbox.scroll.saturating_sub(INBOX_WHEEL_LINES)
-                } else {
-                    self.inbox.scroll.saturating_add(INBOX_WHEEL_LINES).min(max)
-                };
+                let lines = INBOX_WHEEL_LINES as i16;
+                self.inbox.scroll_pane(if up { -lines } else { lines });
             }
             _ => {}
         }
