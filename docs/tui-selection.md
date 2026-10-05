@@ -1,6 +1,6 @@
 # Mouse text selection in the dashboard
 
-**Status: steps 1-4 implemented; follow-up steps 5-8 planned.** User-facing behaviour: `docs/tui.md`,
+**Status: steps 1-8 implemented.** User-facing behaviour: `docs/tui.md`,
 *Mouse selection*; terminal specifics: `docs/tui-terminal.md`, *Mouse*.
 
 ## Problem

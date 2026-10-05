@@ -117,7 +117,7 @@ A script or an agent in a sandbox reaches you with `devsbd notify "tests pass"`.
 
 ## Help
 
-`?` lists every key; `q` quits the dashboard.
+`?` opens *Settings & help*: a few settings on top (`space` toggles, saved for next time) and every key below; `q` quits the dashboard.
 
 <Try>`esc` or `?` to close.</Try>
 
@@ -127,7 +127,7 @@ A script or an agent in a sandbox reaches you with `devsbd notify "tests pass"`.
 
 ## Every key
 
-The real dashboard's keys, also in its `?` screen. The Preview column says what the preview on this page fakes. Clicking a tab title switches to it, like `1`–`4`. Dragging selects text and copies it on release; an app in the integrated terminal that uses the mouse (vim, tmux) gets the drag instead.
+The real dashboard's keys, also in its `?` screen. The Preview column says what the preview on this page fakes. Clicking a tab title switches to it, like `1`–`4`. Dragging selects text and `ctrl-shift-c` copies it (or turn on *copy on select* in `?` to copy on release); an app in the integrated terminal that uses the mouse (vim, tmux) gets the drag and hover instead, and what it copies reaches your clipboard (*terminal clipboard* in `?` turns that off).
 
 ### Everywhere
 
@@ -136,10 +136,10 @@ The real dashboard's keys, also in its `?` screen. The Preview column says what 
 | `tab` / `shift-tab` | Next / previous tab  | `←` `→` instead (Tab leaves it) |
 | `1`–`4`             | Jump to a tab        | yes                              |
 | `:`                 | Command prompt       | yes                              |
-| `?`                 | Every key            | yes                              |
+| `?`                 | Settings & help: `space` / `enter` / click toggles a setting, `tab` moves between them | help only |
 | `q`, `ctrl-c`       | Quit                 | no                               |
-| drag                | Select text in one pane; release copies it to your clipboard (OSC 52) | no |
-| `ctrl-shift-c`      | Copy the selection again, if your terminal passes the key on | no |
+| drag                | Select text in one pane; release copies it only with *copy on select* on | no |
+| `ctrl-shift-c`, `cmd-c` | Copy the selection to your clipboard (OSC 52); `ctrl-c` too over a selection, in terminals that send it plain | no |
 | `shift`-drag        | Your terminal's own selection (whole rows, across panes) | no |
 
 ### Instances and Services

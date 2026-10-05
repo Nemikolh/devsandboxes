@@ -92,7 +92,7 @@ which live instances reference it. Same table/detail-panel pattern as step 3.
 
 ## Step 7 — Polish + extras  ✅ done
 
-- `?` help overlay listing all keys.
+- `?` help overlay listing all keys (now *Settings & help*, see *Settings* below).
 - Error toast (bottom-right, auto-dismiss on next key) instead of crashing on docker/config
   errors; dashboard must start fine with no devsandboxes.toml, no docker, or empty state.
 - Logs preview: `l` on an instance shows last ~50 container log lines in the modal.
@@ -314,29 +314,31 @@ confirm on the suspended screen).
 
 Design and steps: `docs/tui-selection.md`. Code: `src/tui/select.rs` (model,
 extraction, highlight), `src/tui/app/selection.rs` (routing),
-`src/tui/clipboard.rs` (OSC 52).
+`src/tui/clipboard.rs` (OSC 52), `src/tui/settings.rs` (*copy on select*).
 
 - **Select.** A left drag in any pane selects text inside that pane only:
   its inner text area, so borders, block titles, the tab bar, the help/status
   line, the prompt and other panes are never part of it. The selection is
   shown reversed. A press and release without movement is still a click
   (card, tab, terminal focus); a divider drag still resizes.
-- **Copy.** Releasing the mouse copies, so the text is on the clipboard
-  before you reach for a shortcut; the status line says `copied N chars`.
+- **Release.** By default releasing copies nothing: the selection stays and
+  the status line says `selected N chars — ctrl-shift-c copies`, so a stray
+  drag never clobbers the clipboard. With the *copy on select* setting on
+  (*Settings*), releasing copies and the status line says `copied N chars`.
   The selection stays shown until `esc` (except in a focused terminal: the
   shell owns its `esc`), a click elsewhere, a tab switch, a
   modal opening or closing, another Inbox thread, `m` (rendered ⇄ raw) or
   another terminal tab clears it.
-- **Copy again.** `ctrl-shift-c`, or `cmd-c` / `super-c`, copies the live
-  selection again, everywhere (prompt, modals, a focused terminal included).
-  Usually it never reaches the dashboard: most emulators bind it to their
-  own copy, which under mouse capture has no selection of its own to copy.
-  That's why the copy already happened on release. Crossterm sees
-  `ctrl-shift-c` and `super-c` only from a terminal speaking the kitty
-  keyboard protocol (docs/tui-terminal.md, *Keyboard*); a legacy terminal
-  that doesn't bind it sends plain `ctrl-c`, so over a dashboard selection
-  `ctrl-c` copies too instead of quitting (a focused shell keeps its
-  `ctrl-c`; with no selection it quits as before).
+- **Copy keys.** `ctrl-shift-c`, or `cmd-c` / `super-c`, copies the live
+  selection whatever the setting, everywhere (prompt, modals, a focused
+  terminal included). Crossterm sees `ctrl-shift-c` and `super-c` only from
+  a terminal speaking the kitty keyboard protocol (docs/tui-terminal.md,
+  *Keyboard*), and many emulators bind them to their own copy, which under
+  mouse capture has nothing to copy; there, *copy on select* is the way. A
+  legacy terminal that doesn't bind it sends plain `ctrl-c`, so over a
+  dashboard selection `ctrl-c` copies too instead of quitting (a focused
+  shell or the prompt keeps its `ctrl-c`; with no selection it quits as
+  before).
 - **Documents** (the Inbox thread pane, the config/inspect modal, the help
   and logs modals): the copy is the rendered text, as shown: list bullets and
   numbers, quote bars, table rules and columns, code text, links as
@@ -349,8 +351,11 @@ extraction, highlight), `src/tui/app/selection.rs` (routing),
 - **Other panes** (tables, detail, cards): the cells on screen, trailing
   spaces trimmed per row.
 - **Integrated terminal**: a child that tracks the mouse gets the drag
-  instead; otherwise a local selection over the screen and its scrollback.
-  Details and limits in docs/tui-terminal.md, *Mouse*.
+  instead (and hover, if it asked for any motion), and its own OSC 52
+  copies are relayed to the outer clipboard (status `copied from <tab
+  title>`; the *terminal clipboard* setting turns it off); otherwise a local
+  selection over the screen and its scrollback. Details and limits in
+  docs/tui-terminal.md, *Mouse*.
 - **The terminal's own selection.** `shift`-drag (`option`-drag on macOS)
   bypasses mouse capture in most emulators and gives their native selection:
   whole screen rows, borders and the next pane included.
@@ -374,6 +379,44 @@ Under tmux (`$TMUX` set) the sequence goes through tmux's DCS passthrough
 runs in. tmux 3.3 and later drop passthrough unless enabled:
 `set -g allow-passthrough on`. `set-clipboard` plays no part in this path,
 and the terminal outside tmux must support OSC 52 itself.
+
+## Settings
+
+Per-user dashboard toggles (`src/tui/settings.rs`), saved at
+`<data dir>/devsandbox/dashboard.toml` (`$XDG_DATA_HOME`, else
+`~/.local/share`; the same base dir as `state.toml`):
+
+```toml
+copy_on_select = false
+terminal_clipboard = true
+```
+
+| key | default | on means |
+|---|---|---|
+| `copy_on_select` | off | releasing a mouse selection copies it (else the copy keys do; *Mouse selection*) |
+| `terminal_clipboard` | on | apps in the integrated terminal may set the clipboard through OSC 52, relayed to the outer terminal (docs/tui-terminal.md, *Mouse*) |
+
+Every field defaults on its own, so a partial or older file loads and
+unknown keys are ignored. A missing file is the defaults; an invalid one too,
+with a `settings not loaded, using defaults: …` status line. The file is
+loaded once at startup and written by the event loop after each toggle
+(`App` only marks it for saving, staying I/O-free); a failed write says
+`settings not saved: …`.
+
+They are shown and changed in the `?` modal, now **Settings & help**: the
+settings as `[x]` rows on top, the key reference below (selectable like any
+document).
+
+| key | does |
+|---|---|
+| `tab` / `shift-tab` | move the setting cursor |
+| `space`, `enter`, click on a row | toggle that setting (and save) |
+| `↑`/`k` `↓`/`j`, `pgup`/`pgdn`, `g`/`G` | scroll the help |
+| `esc`, `q`, `?` | close |
+
+A new setting is a field on `Settings` (with its default) plus one entry in
+the `SETTINGS` table: its key, label and one-line help, a getter and a
+setter. The modal's rows, toggling and hit-testing all derive from that table.
 
 ## Step ordering / commits
 

@@ -70,17 +70,17 @@ Mouse:
   - **Tracking child** (zidane, vim `mouse=a`, tmux): a press on the body,
     any button, is forwarded at its pane-relative cell, and from then on that
     button's drags and release, in the child's mode and encoding: `?1000`
-    gets presses and releases, `?1002` drags too. `?1003` (any motion) is
-    treated as `?1002`: the dashboard doesn't ask the outer terminal for
-    plain motion, so a move without a button held is never forwarded. A drag
+    gets presses and releases, `?1002` drags too, `?1003` hover as well (see
+    *Hover* below). A drag
     or release outside the panel is clamped to the body's edge, so a child
     that saw the press always sees the release. Only after a press on the
     body: a drag that started elsewhere (a pane, the border, the tab strip)
     never reaches the child. The child does its own selection and copy; the
-    dashboard forms none.
+    dashboard forms none (its copy reaches the clipboard through the OSC 52
+    relay below).
   - **Otherwise** (a shell prompt, `less` without mouse, an exited session):
-    a left drag is a local selection over the vt100 screen, copied on
-    release like every other pane (docs/tui.md, *Mouse selection*). It
+    a left drag is a local selection over the vt100 screen, copied like
+    every other pane's (docs/tui.md, *Mouse selection*). It
     reaches into the scrollback: drag past the body's top or bottom to
     scroll a line per drag event, or use the wheel; the selection stays.
     Wrapped lines copy as one line. Limits: positions count rows from the
@@ -90,8 +90,33 @@ Mouse:
     redraws in place (a progress bar, `top`) changes the text under the
     selection, and the copy is what's there at the time of the copy.
     Switching terminal tab, or closing one, clears the selection.
-  - `ctrl-shift-c` with a selection copies it again instead of reaching the
+  - `ctrl-shift-c` with a selection copies it instead of reaching the
     shell; without one it goes to the shell as before.
+- Hover (docs/tui-selection.md, step 7): crossterm's `EnableMouseCapture`
+  already turns on `?1003` in the outer terminal, so button-less motion
+  arrives as `Moved`. Over the body of the active live session whose child
+  is in `AnyMotion` (`?1003`: hover highlights, tooltips), it is forwarded
+  as button 35 (3 + 32, plus modifier bits) at the pane-relative cell, once
+  per cell: crossterm reports a move on every cell change, and a repeat of
+  the last forwarded cell for the same session is dropped (a press, or
+  leaving the body, resets that, so the next move reports). No modal may be
+  open. `ButtonMotion`
+  and the other modes never get it. Nothing is sent off the body, and the
+  protocol has no leave event, so a child keeps its last hover when the
+  pointer leaves. Hover never touches the local selection.
+- Clipboard (docs/tui-selection.md, step 5): an app copies by sending OSC 52
+  to *its* terminal, our vt100 emulator. `KittyState::copy_to_clipboard`
+  (`src/tui/kitty.rs`, active whether or not the kitty emulation is) queues
+  the base64 payload as is, newest wins; an empty payload, or one over the
+  dashboard's own 1 MiB copy cap, is dropped whole (cut base64 could decode
+  to broken UTF-8). The selector is ignored: the relay always writes `c`.
+  The event loop drains every session after each draw and writes the last
+  copy to the outer terminal (tmux-wrapped like our own copies, docs/tui.md,
+  *Clipboard: OSC 52*); the status line says `copied from <tab title>`.
+  OSC 52 *reads* are never answered: an app in a container must not read the
+  host clipboard. The `terminal_clipboard` setting (on by default,
+  docs/tui.md, *Settings*) turns the relay off; queues are drained anyway,
+  so a copy made while it's off is not sent later.
 
 ### Keyboard: kitty protocol
 

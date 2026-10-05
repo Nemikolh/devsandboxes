@@ -33,7 +33,9 @@ devsandbox done web-pr-123
 devsandbox vscode web-2 --goto src/main.rs:42:7
 ```
 
-- **Select and copy text with the mouse in the dashboard.** Drag in any pane to select text inside it, without borders or the panes next to it; releasing copies it to your clipboard through your terminal (OSC 52, so it works over SSH and from a container; under tmux, enable `allow-passthrough`). Inbox threads copy as rendered, with bullets, quotes, tables and links as shown and wrapped lines joined back, and dragging past the edge scrolls so a long message copies whole; the config, help and logs views work the same way. `ctrl-shift-c` copies the selection again when your terminal passes it on, and `shift`-drag still gives your terminal's own selection. In the integrated terminal, apps that use the mouse (vim, tmux, zidane) now get your clicks and drags; in a plain shell you select the output, scrollback included.
+- **Select and copy text with the mouse in the dashboard.** Drag in any pane to select text inside it, without borders or the panes next to it. `ctrl-shift-c` or `cmd-c` copies it to your clipboard (so does `ctrl-c` over a selection, in terminals that send that key plain), or turn on *copy on select* in the new settings to copy on release. The copy goes through your terminal (OSC 52), so it works over SSH and from a container; under tmux, enable `allow-passthrough`. Inbox threads copy as rendered, with bullets, quotes, tables and links as shown and wrapped lines joined back, and dragging past the edge scrolls so a long message copies whole; the config, help and logs views work the same way. `shift`-drag still gives your terminal's own selection. In the integrated terminal, apps that use the mouse (vim, tmux, zidane) now get your clicks, drags and hover, and what they copy to the clipboard now reaches yours (a setting turns that off); in a plain shell you select the output, scrollback included.
+
+- **Dashboard settings.** `?` is now *Settings & help*: the settings on top, toggled with `space`, `enter` or a click (`tab` moves between them), and the key reference below. They are saved per user in `~/.local/share/devsandbox/dashboard.toml`. *copy on select* (off) copies a mouse selection on release; *terminal clipboard* (on) lets apps in the integrated terminal set your clipboard.
 
 ### Changed
 
@@ -46,6 +48,12 @@ devsandbox vscode web-2 --goto src/main.rs:42:7
 - **An open dashboard updates the helper in running instances.** Before, a running dispatcher only got new `devsbd` verbs after `devsandbox start`; now opening the dashboard of a newer devsandbox is enough.
 
 ### Fixed
+
+- **A press in the Inbox thread pane no longer grabs the divider.** A press on the pane's first text column started resizing the list/thread split; now only the borders do.
+
+- **The help and logs screens keep the mouse to themselves.** With either open, clicks and the wheel reached the integrated terminal hidden underneath.
+
+- **Apps in the integrated terminal get the mouse and the clipboard.** They never received clicks or drags, and what they copied to the clipboard was dropped.
 
 - **Dismissed notifications no longer come back with several dashboards open.** Each dashboard kept its own copy of the Inbox and saved it over the others', so records dismissed in one reappeared from another, and restarts seemed to add clutter. All dashboards now share one store, so a dismissal in one is gone from all.
 
