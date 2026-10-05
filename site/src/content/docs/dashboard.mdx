@@ -127,7 +127,7 @@ A script or an agent in a sandbox reaches you with `devsbd notify "tests pass"`.
 
 ## Every key
 
-The real dashboard's keys, also in its `?` screen. The Preview column says what the preview on this page fakes. Clicking a tab title switches to it, like `1`–`4`. Dragging selects text and `ctrl-shift-c` copies it (or turn on *copy on select* in `?` to copy on release); an app in the integrated terminal that uses the mouse (vim, tmux) gets the drag and hover instead, and what it copies reaches your clipboard (*terminal clipboard* in `?` turns that off).
+The real dashboard's keys, also in its `?` screen. The Preview column says what the preview on this page fakes. Clicking a tab title switches to it, like `1`–`4`. Dragging selects text and releasing copies it (*copy on select*, on by default; turn it off in `?` to copy only with `ctrl-shift-c`, or `ctrl-c` in terminals that keep `ctrl-shift-c` for themselves, as the dashboard tells you); an app in the integrated terminal that uses the mouse (vim, tmux) gets the drag and hover instead, and what it copies reaches your clipboard (*terminal clipboard* in `?` turns that off).
 
 ### Everywhere
 
@@ -138,8 +138,8 @@ The real dashboard's keys, also in its `?` screen. The Preview column says what 
 | `:`                 | Command prompt       | yes                              |
 | `?`                 | Settings & help: `space` / `enter` / click toggles a setting, `tab` moves between them | help only |
 | `q`, `ctrl-c`       | Quit                 | no                               |
-| drag                | Select text in one pane; release copies it only with *copy on select* on | no |
-| `ctrl-shift-c`, `cmd-c` | Copy the selection to your clipboard (OSC 52); `ctrl-c` too over a selection, in terminals that send it plain | no |
+| drag                | Select text in one pane; release copies it while *copy on select* is on (the default) | no |
+| `ctrl-shift-c`, `cmd-c` | Copy the selection to your clipboard (OSC 52); `ctrl-c` too over a dashboard selection, for terminals that send it plain or keep `ctrl-shift-c` (Alacritty, GNOME Terminal, kitty, …) | no |
 | `shift`-drag        | Your terminal's own selection (whole rows, across panes) | no |
 
 ### Instances and Services

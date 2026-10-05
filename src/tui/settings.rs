@@ -18,8 +18,11 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    /// Releasing a mouse selection copies it. Off: the copy keys do, so a
-    /// stray drag never clobbers the clipboard.
+    /// Releasing a mouse selection copies it. On by default: most Linux
+    /// terminals keep ctrl+shift+c for their own copy, and in the integrated
+    /// terminal ctrl+c is the shell's, so the release is the one copy that
+    /// always works. Off: only the copy keys do, so a stray drag never
+    /// clobbers the clipboard.
     pub copy_on_select: bool,
     /// Relay integrated-terminal apps' OSC 52 copies to the outer clipboard.
     /// On, as real terminals do; an off switch since it lets an app in a
@@ -29,7 +32,7 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { copy_on_select: false, terminal_clipboard: true }
+        Self { copy_on_select: true, terminal_clipboard: true }
     }
 }
 
@@ -40,8 +43,10 @@ pub struct SettingSpec {
     #[allow(dead_code)] // documents the row's file key; not rendered
     pub key: &'static str,
     pub label: &'static str,
-    /// One line saying what "on" does.
-    pub help: &'static str,
+    /// One line saying what "on" does, given whether the outer terminal
+    /// keeps ctrl+shift+c (`App::copy_key_intercepted`), so a key it names
+    /// reaches us.
+    pub help: fn(bool) -> &'static str,
     pub get: fn(&Settings) -> bool,
     pub set: fn(&mut Settings, bool),
 }
@@ -50,14 +55,17 @@ pub const SETTINGS: &[SettingSpec] = &[
     SettingSpec {
         key: "copy_on_select",
         label: "copy on select",
-        help: "releasing a mouse selection copies it (else ctrl-shift-c / cmd-c)",
+        help: |intercepted| match intercepted {
+            false => "releasing a mouse selection copies it (else ctrl-shift-c / cmd-c)",
+            true => "releasing a mouse selection copies it (else ctrl-c / cmd-c)",
+        },
         get: |s| s.copy_on_select,
         set: |s, v| s.copy_on_select = v,
     },
     SettingSpec {
         key: "terminal_clipboard",
         label: "terminal clipboard",
-        help: "apps in the integrated terminal may set the clipboard (OSC 52)",
+        help: |_| "apps in the integrated terminal may set the clipboard (OSC 52)",
         get: |s| s.terminal_clipboard,
         set: |s, v| s.terminal_clipboard = v,
     },
@@ -119,17 +127,17 @@ mod tests {
     #[test]
     fn defaults() {
         let s = Settings::default();
-        assert!(!s.copy_on_select);
+        assert!(s.copy_on_select);
         assert!(s.terminal_clipboard);
         assert_eq!(parse("").unwrap(), s, "an empty file is the defaults");
     }
 
     #[test]
     fn a_partial_file_keeps_the_other_defaults_and_ignores_unknown_keys() {
-        let s = parse("copy_on_select = true\nfrom_the_future = 3\n").unwrap();
-        assert_eq!(s, Settings { copy_on_select: true, terminal_clipboard: true });
+        let s = parse("copy_on_select = false\nfrom_the_future = 3\n").unwrap();
+        assert_eq!(s, Settings { copy_on_select: false, terminal_clipboard: true });
         let s = parse("terminal_clipboard = false").unwrap();
-        assert_eq!(s, Settings { copy_on_select: false, terminal_clipboard: false });
+        assert_eq!(s, Settings { copy_on_select: true, terminal_clipboard: false });
     }
 
     #[test]
@@ -160,8 +168,15 @@ mod tests {
             s.toggle(i);
             assert_eq!((spec.get)(&s), !before, "{}", spec.key);
         }
-        assert_eq!(s, Settings { copy_on_select: true, terminal_clipboard: false });
+        assert_eq!(s, Settings { copy_on_select: false, terminal_clipboard: false });
         s.toggle(SETTINGS.len()); // out of range: no-op
-        assert_eq!(s, Settings { copy_on_select: true, terminal_clipboard: false });
+        assert_eq!(s, Settings { copy_on_select: false, terminal_clipboard: false });
+    }
+
+    #[test]
+    fn the_copy_help_names_a_key_that_reaches_us() {
+        let help = SETTINGS[0].help;
+        assert!(help(false).contains("ctrl-shift-c"));
+        assert!(help(true).contains("(else ctrl-c / cmd-c)"), "{}", help(true));
     }
 }

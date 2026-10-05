@@ -13,15 +13,15 @@ use crate::tui::settings::{SETTINGS, Settings};
 
 use super::{App, Tab};
 
-/// Keybinding reference shown by the `?` overlay, grouped by context.
+/// Keybinding reference shown by the `?` overlay, grouped by context;
+/// `{copy}` is the copy-key lines, [`help_body`] picks them.
 const HELP_BODY: &str = "\
 Global
   q, ctrl-c   quit
   tab / S-tab switch tab      1-4  jump to tab
   :           command prompt  ?    settings & help
   drag        select (copies on release with \"copy on select\" on, above)
-  ctrl-shift-c / cmd-c  copy the selection to the clipboard (OSC 52)
-              (ctrl-c too over a dashboard selection: legacy terminals)
+{copy}
   shift-drag  the outer terminal's own selection (whole rows, across panes)
 
 Tables (Instances / Services)
@@ -113,6 +113,20 @@ Command prompt (:)
   ↑ ↓         history
   ctrl-u      clear line       ctrl-w  delete word
   esc         cancel";
+
+/// [`HELP_BODY`] with copy keys that reach us. Where the outer terminal
+/// keeps ctrl+shift+c (`App::copy_key_intercepted`) ctrl+c is the dashboard's
+/// copy key, except in a focused shell, which gets it as usual.
+fn help_body(copy_key_intercepted: bool) -> String {
+    let copy = if copy_key_intercepted {
+        "  ctrl-c / cmd-c        copy the selection to the clipboard (OSC 52)\n              \
+         (ctrl-c not in a focused terminal: the shell gets it there)"
+    } else {
+        "  ctrl-shift-c / cmd-c  copy the selection to the clipboard (OSC 52)\n              \
+         (ctrl-c too over a dashboard selection: legacy terminals)"
+    };
+    HELP_BODY.replacen("{copy}", copy, 1)
+}
 
 /// A scrollable full-screen text overlay (help, logs). Body is captured once at
 /// open time; scrolling is the only interaction. Shared scroll math lives in
@@ -387,7 +401,7 @@ impl App {
     /// Open the Settings & help overlay: the settings, then all keybindings
     /// grouped by context.
     pub(super) fn open_help(&mut self) {
-        let text = TextModal::new(" settings & help ".to_string(), HELP_BODY.to_string());
+        let text = TextModal::new(" settings & help ".to_string(), help_body(self.copy_key_intercepted));
         self.modal = Modal::Help(HelpModal { text, cursor: 0 });
     }
 
@@ -737,7 +751,7 @@ mod tests {
         assert_eq!(app.take_settings_save(), None, "opening changes nothing");
         assert_eq!(help(&app).cursor, 0);
         app.on_key(key(KeyCode::Char(' ')));
-        assert!(app.settings.copy_on_select);
+        assert!(!app.settings.copy_on_select, "on by default");
         assert_eq!(app.take_settings_save(), Some(app.settings));
         assert_eq!(app.take_settings_save(), None, "once per change");
         // tab / S-tab move the cursor (wrapping); enter toggles too.
@@ -754,8 +768,29 @@ mod tests {
         assert_eq!((help(&app).cursor, help(&app).text.scroll), (1, 1));
         assert_eq!(
             app.take_settings_save(),
-            Some(Settings { copy_on_select: true, terminal_clipboard: false })
+            Some(Settings { copy_on_select: false, terminal_clipboard: false })
         );
+    }
+
+    #[test]
+    fn the_help_names_ctrl_c_where_the_terminal_keeps_ctrl_shift_c() {
+        let body = |intercepted| {
+            let mut app = new_app();
+            app.copy_key_intercepted = intercepted;
+            app.on_key(key(KeyCode::Char('?')));
+            help(&app).text.body.clone()
+        };
+        let plain = body(false);
+        let line = |b: &str, start: &str| b.lines().find(|l| l.starts_with(start)).map(str::to_string);
+        let copy = line(&plain, "  ctrl-shift-c / cmd-c").expect("copy line");
+        assert!(!plain.contains("{copy}"));
+        let moved = body(true);
+        assert!(line(&moved, "  ctrl-shift-c").is_none(), "{moved}");
+        let ctrl_c = line(&moved, "  ctrl-c / cmd-c ").expect("ctrl-c line");
+        // The description stays in the same column.
+        let col = |l: &str| l.find("copy the selection").unwrap();
+        assert_eq!(col(&ctrl_c), col(&copy));
+        assert_eq!(plain.lines().count(), moved.lines().count());
     }
 
     #[test]
@@ -776,7 +811,7 @@ mod tests {
         // Not without the modal.
         app.on_key(key(KeyCode::Esc));
         app.on_mouse(&press(5, 1), FRAME);
-        assert_eq!(app.settings, Settings { copy_on_select: false, terminal_clipboard: false });
+        assert_eq!(app.settings, Settings { copy_on_select: true, terminal_clipboard: false });
     }
 
     #[test]

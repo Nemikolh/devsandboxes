@@ -13,7 +13,7 @@ use ratatui::layout::Rect;
 use super::data::{visible_nodes, ContainerStatus, Node, Snapshot};
 use super::procs::ProcState;
 use super::prompt::{Prompt, PromptAction};
-use super::select::{Candidate, Region, Selection};
+use super::select::{Candidate, Region, RegionId, Selection};
 use super::settings::Settings;
 use super::term::{TermParser, TermTabs};
 
@@ -35,7 +35,7 @@ pub use inbox::{
 };
 pub use actions::PendingDone;
 pub use procs::{PendingSignal, Signal};
-pub use selection::Extract;
+pub use selection::{copy_key_intercepted, Extract};
 pub use view::{ConfigView, HelpModal, Modal, Pane, Side, TextModal};
 use view::{col_near, divider_pct};
 
@@ -218,12 +218,16 @@ pub struct App {
     clipboard: RefCell<Option<String>>,
     /// Char count of a selection released without copying (copy on select
     /// off), filled by the draw for the event loop's status hint.
-    measured: Cell<Option<usize>>,
+    measured: Cell<Option<(usize, RegionId)>>,
     /// Dashboard settings (`settings.rs`), loaded by the event loop at
     /// startup; the `?` modal flips them.
     pub settings: Settings,
     /// A toggle changed `settings` since the event loop last saved them.
     settings_dirty: bool,
+    /// The outer terminal keeps ctrl+shift+c for its own copy
+    /// (`selection::copy_key_intercepted`, detected by the event loop at
+    /// startup): hints and help name ctrl-c instead. Wording only.
+    pub copy_key_intercepted: bool,
     /// The button of a press forwarded to a mouse-tracking terminal child,
     /// until its release: its drags and release go to the child too (clamped
     /// to the body when they leave it), and the press forms no selection.
@@ -280,6 +284,7 @@ impl App {
             measured: Cell::new(None),
             settings: Settings::default(),
             settings_dirty: false,
+            copy_key_intercepted: false,
             term_mouse_down: None,
             term_hover: None,
             should_quit: false,

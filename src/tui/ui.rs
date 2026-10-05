@@ -2099,7 +2099,7 @@ fn draw_help_modal(frame: &mut Frame, app: &App, view: &HelpModal) {
             };
             Line::from(vec![
                 Span::styled(format!("{} [{on}] {:<width$}  ", if cursor { '›' } else { ' ' }, spec.label), style),
-                Span::styled(spec.help, Style::default().add_modifier(Modifier::DIM)),
+                Span::styled((spec.help)(app.copy_key_intercepted), Style::default().add_modifier(Modifier::DIM)),
             ])
         })
         .collect();

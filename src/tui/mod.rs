@@ -200,6 +200,7 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
     let dir = app.dir.clone();
     app.utc_offset = local_utc_offset();
     app.kitty = KITTY.load(Ordering::Relaxed);
+    app.copy_key_intercepted = app::copy_key_intercepted(|var| std::env::var(var).ok());
     // Before the inbox, whose error would otherwise hide this one: an
     // invalid file runs on the defaults, and the first toggle overwrites it.
     match settings::load() {

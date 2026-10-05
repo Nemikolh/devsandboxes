@@ -321,10 +321,11 @@ extraction, highlight), `src/tui/app/selection.rs` (routing),
   line, the prompt and other panes are never part of it. The selection is
   shown reversed. A press and release without movement is still a click
   (card, tab, terminal focus); a divider drag still resizes.
-- **Release.** By default releasing copies nothing: the selection stays and
-  the status line says `selected N chars — ctrl-shift-c copies`, so a stray
-  drag never clobbers the clipboard. With the *copy on select* setting on
-  (*Settings*), releasing copies and the status line says `copied N chars`.
+- **Release.** By default (*copy on select* on, *Settings*) releasing copies
+  and the status line says `copied N chars`. With the setting off, releasing
+  copies nothing, so a stray drag never clobbers the clipboard: the selection
+  stays and the status line names a copy key, `selected N chars —
+  ctrl-shift-c copies` (see *Copy-key wording* below for the other forms).
   The selection stays shown until `esc` (except in a focused terminal: the
   shell owns its `esc`), a click elsewhere, a tab switch, a
   modal opening or closing, another Inbox thread, `m` (rendered ⇄ raw) or
@@ -338,7 +339,24 @@ extraction, highlight), `src/tui/app/selection.rs` (routing),
   legacy terminal that doesn't bind it sends plain `ctrl-c`, so over a
   dashboard selection `ctrl-c` copies too instead of quitting (a focused
   shell or the prompt keeps its `ctrl-c`; with no selection it quits as
-  before).
+  before). That fallback is also the key that works in terminals binding
+  `ctrl-shift-c` themselves.
+- **Copy-key wording.** At startup the dashboard guesses whether the outer
+  terminal binds `ctrl-shift-c` to its own copy by default
+  (`copy_key_intercepted` in `src/tui/app/selection.rs`), from the env vars
+  each one sets: Alacritty (`ALACRITTY_WINDOW_ID`, `ALACRITTY_SOCKET`,
+  `TERM=alacritty`), kitty (`KITTY_WINDOW_ID`, `TERM=xterm-kitty`), WezTerm
+  (`WEZTERM_PANE`, `WEZTERM_EXECUTABLE`), VTE terminals such as GNOME
+  Terminal (`VTE_VERSION`), Konsole (`KONSOLE_VERSION`), foot
+  (`TERM=foot`/`foot-extra`), Ghostty (`TERM_PROGRAM=ghostty`,
+  `GHOSTTY_RESOURCES_DIR`), Windows Terminal (`WT_SESSION`), VS Code
+  (`TERM_PROGRAM=vscode`). If so, the release hint, the help's copy line and
+  the *copy on select* help name `ctrl-c` instead; over the integrated
+  terminal's local selection, where `ctrl-c` is the shell's and
+  `ctrl-shift-c` never arrives, the hint says `selected N chars — turn on
+  copy on select (?) to copy here`. Under tmux or ssh the vars may be missing
+  or stale, so the guess can be wrong; it only changes wording, every copy
+  key behaves the same.
 - **Documents** (the Inbox thread pane, the config/inspect modal, the help
   and logs modals): the copy is the rendered text, as shown: list bullets and
   numbers, quote bars, table rules and columns, code text, links as
@@ -387,13 +405,13 @@ Per-user dashboard toggles (`src/tui/settings.rs`), saved at
 `~/.local/share`; the same base dir as `state.toml`):
 
 ```toml
-copy_on_select = false
+copy_on_select = true
 terminal_clipboard = true
 ```
 
 | key | default | on means |
 |---|---|---|
-| `copy_on_select` | off | releasing a mouse selection copies it (else the copy keys do; *Mouse selection*) |
+| `copy_on_select` | on | releasing a mouse selection copies it (else the copy keys do; *Mouse selection*) |
 | `terminal_clipboard` | on | apps in the integrated terminal may set the clipboard through OSC 52, relayed to the outer terminal (docs/tui-terminal.md, *Mouse*) |
 
 Every field defaults on its own, so a partial or older file loads and
