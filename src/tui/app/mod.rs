@@ -212,6 +212,10 @@ pub struct App {
     copy_requested: Cell<bool>,
     /// Text the event loop owes the clipboard (OSC 52), filled by the draw.
     clipboard: RefCell<Option<String>>,
+    /// The button of a press forwarded to a mouse-tracking terminal child,
+    /// until its release: its drags and release go to the child too (clamped
+    /// to the body when they leave it), and the press forms no selection.
+    term_mouse_down: Option<MouseButton>,
     pub should_quit: bool,
 }
 
@@ -254,6 +258,7 @@ impl App {
             regions: RefCell::new(Vec::new()),
             copy_requested: Cell::new(false),
             clipboard: RefCell::new(None),
+            term_mouse_down: None,
             should_quit: false,
         }
     }
@@ -361,10 +366,12 @@ impl App {
     /// reads config/fs, which is local and user-triggered — see [`Self::open_config`]).
     pub fn on_key(&mut self, key: KeyEvent) {
         let modal = std::mem::discriminant(&self.modal);
+        let term = (self.terms.active(), self.terms.sessions().len());
         self.dispatch_key(key);
-        // A modal opening or closing changes what's on screen under the
-        // selection.
-        if std::mem::discriminant(&self.modal) != modal {
+        // A modal opening or closing, or another terminal tab (`[`/`]`/`x`,
+        // `t`), changes what's on screen under the selection: a terminal
+        // selection would otherwise read the next session's rows.
+        if std::mem::discriminant(&self.modal) != modal || (self.terms.active(), self.terms.sessions().len()) != term {
             self.clear_selection();
         }
         // Whatever the key did to the Inbox cursor (moved it, dismissed the

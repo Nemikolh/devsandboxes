@@ -4,8 +4,9 @@
 //! registers the regions and patches the highlight into the frame it drew.
 //!
 //! Positions are in a region's own coordinates ([`Pos`]), not screen cells,
-//! so a scrolled document ([`Source::Rows`]; step 3's vt100 scrollback
-//! likewise) counts rows in content and keeps a selection across a scroll.
+//! so a scrolled document ([`Source::Rows`], the terminal's vt100 scrollback
+//! [`Source::Terminal`]) counts rows in content and keeps a selection across
+//! a scroll.
 //! A [`Source::Screen`] region is the identity case: row 0 is its rect's
 //! top.
 
@@ -43,6 +44,16 @@ pub enum Source {
     /// a scroll and can span rows that are off screen. `Rc`: the region is
     /// cloned per mouse event and frame.
     Rows { scroll: usize, rows: Rc<[RowText]> },
+    /// The integrated terminal's vt100 screen, rows counted from the oldest
+    /// scrollback line ([`terminal_top`]): `top` is the row at the rect's
+    /// top. Output scrolling lines into the scrollback leaves a row's number
+    /// on the same text, so new output doesn't drift a selection, until the
+    /// scrollback is full and drops its oldest line per new one (then the
+    /// text shifts up one row under it), or the child redraws in place
+    /// (clear, full-screen apps): the numbers stay, the text under them
+    /// changes. Either way the highlight and the copy read the same rows.
+    /// The text is read from vt100 ([`extract_terminal`]), not the frame.
+    Terminal { top: usize },
 }
 
 /// How a [`RowText`] continues the row before it when copied.
@@ -137,6 +148,7 @@ impl Region {
         match self.source {
             Source::Screen => 0,
             Source::Rows { scroll, .. } => scroll,
+            Source::Terminal { top } => top,
         }
     }
 
@@ -295,11 +307,68 @@ fn cols(text: &str, start: usize, end: usize) -> String {
     out
 }
 
-/// The selected text of `region` as drawn in `buf`.
+/// The number of `screen`'s scrollback lines, which vt100 doesn't expose:
+/// the offset clamps to it. The view is put back.
+fn scrollback_len(screen: &mut vt100::Screen) -> usize {
+    let offset = screen.scrollback();
+    screen.set_scrollback(usize::MAX);
+    let len = screen.scrollback();
+    screen.set_scrollback(offset);
+    len
+}
+
+/// The [`Source::Terminal`] row shown at the top of `screen`'s view: the
+/// scrollback lines above it. The alternate screen has no scrollback, so
+/// there it is 0 and rows are screen rows.
+pub fn terminal_top(screen: &mut vt100::Screen) -> usize {
+    scrollback_len(screen) - screen.scrollback()
+}
+
+/// The text of the stream `from..=to` of a [`Source::Terminal`] screen,
+/// rows past the view included: the view is moved over them a screenful at
+/// a time (vt100 reads only what is in view) and put back. Lines vt100
+/// wrapped join without a break, like [`vt100::Screen::contents_between`],
+/// which reads each screenful. Trailing spaces are trimmed per line, like
+/// every source, and so are trailing blank lines: the rows below a shell's
+/// cursor that a drag past the bottom takes in are nothing to paste.
+pub fn extract_terminal(screen: &mut vt100::Screen, from: Pos, to: Pos) -> String {
+    let (rows, cols) = screen.size();
+    if rows == 0 {
+        return String::new();
+    }
+    let (offset, len) = (screen.scrollback(), scrollback_len(screen));
+    let last = to.row.min(len + rows as usize - 1);
+    let mut out = String::new();
+    let mut row = from.row;
+    while row <= last {
+        // The view with `row` at its top, or as high as it goes.
+        screen.set_scrollback(len.saturating_sub(row));
+        let top = len - screen.scrollback();
+        let (r0, r1) = ((row - top) as u16, (last.min(top + rows as usize - 1) - top) as u16);
+        let c0 = if row == from.row { from.col.min(cols) } else { 0 };
+        let end = top + r1 as usize == to.row;
+        let c1 = if end { to.col.saturating_add(1).min(cols) } else { cols };
+        out.push_str(&screen.contents_between(r0, c0, r1, c1));
+        // A screenful's last row carries no break of its own; the last
+        // one read needs none.
+        if top + (r1 as usize) < last && !screen.row_wrapped(r1) {
+            out.push('\n');
+        }
+        row = top + r1 as usize + 1;
+    }
+    screen.set_scrollback(offset);
+    let lines: Vec<&str> = out.split('\n').map(|l| l.trim_end_matches(' ')).collect();
+    lines.join("\n").trim_end_matches('\n').to_string()
+}
+
+/// The selected text of `region` as drawn in `buf`. Not a
+/// [`Source::Terminal`]'s, which the frame doesn't hold: that is
+/// [`extract_terminal`]'s, over the session's screen.
 pub fn extract(buf: &Buffer, region: &Region, sel: &Selection) -> String {
     let (from, to) = sel.range();
     match &region.source {
         Source::Screen => extract_screen(buf, region.rect, from, to),
+        Source::Terminal { .. } => String::new(),
         Source::Rows { rows, .. } => extract_rows(rows, region.rect.width, from, to),
     }
 }
@@ -471,6 +540,29 @@ mod tests {
         let rev = |x, y| buf[(x, y)].modifier.contains(Modifier::REVERSED);
         assert!((1..5).all(|x| (1..4).all(|y| rev(x, y))));
         assert!(!rev(0, 1) && !rev(1, 4) && !rev(1, 0));
+    }
+
+    #[test]
+    fn terminal_rows_count_from_the_oldest_scrollback_line() {
+        let mut parser = vt100::Parser::new(3, 10, 100);
+        for i in 0..8 {
+            parser.process(format!("line {i}\r\n").as_bytes());
+        }
+        // 3 rows: "line 6", "line 7", the cursor's empty row; 6 lines above.
+        let screen = parser.screen_mut();
+        assert_eq!(terminal_top(screen), 6);
+        screen.set_scrollback(2);
+        assert_eq!(terminal_top(screen), 4);
+        // From the middle of row 1 to row 7, scrolled out of view both ends,
+        // read a screenful at a time; the view is put back.
+        assert_eq!(extract_terminal(screen, pos(1, 2), pos(7, 3)), "ne 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline");
+        assert_eq!(screen.scrollback(), 2);
+        assert_eq!(extract_terminal(screen, pos(6, 0), pos(6, 9)), "line 6");
+        assert_eq!(extract_terminal(screen, pos(0, 0), pos(99, 9)).lines().count(), 8, "clamped to the last row");
+        // A line vt100 wrapped joins without a break.
+        let mut parser = vt100::Parser::new(3, 4, 0);
+        parser.process(b"abcdefg\r\nxy");
+        assert_eq!(extract_terminal(parser.screen_mut(), pos(0, 1), pos(2, 3)), "bcdefg\nxy");
     }
 
     #[test]

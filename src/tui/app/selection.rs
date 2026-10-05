@@ -30,6 +30,13 @@ impl App {
         self.add_source_region(id, rect, Source::Rows { scroll, rows: Rc::from(rows) });
     }
 
+    /// Renderer hook: the terminal body `rect` shows its screen from
+    /// [`Source::Terminal`] row `top` on. Only while the child doesn't track
+    /// the mouse: then the mouse is the child's, not a selection's.
+    pub fn add_terminal_region(&self, rect: Rect, top: usize) {
+        self.add_source_region(RegionId::Terminal, rect, Source::Terminal { top });
+    }
+
     fn add_source_region(&self, id: RegionId, rect: Rect, source: Source) {
         if !rect.is_empty() {
             self.regions.borrow_mut().push(Region { id, rect, source });
@@ -50,20 +57,23 @@ impl App {
     fn autoscroll(&mut self, id: RegionId, row: u16) -> Option<Region> {
         let region = self.region(id)?;
         let delta: i16 = match region.source {
-            Source::Rows { .. } if row < region.rect.y => -1,
-            Source::Rows { .. } if row >= region.rect.bottom() => 1,
+            Source::Rows { .. } | Source::Terminal { .. } if row < region.rect.y => -1,
+            Source::Rows { .. } | Source::Terminal { .. } if row >= region.rect.bottom() => 1,
             _ => return Some(region),
         };
         let scroll = match (id, &mut self.modal) {
-            (RegionId::InboxThread, _) => self.inbox.scroll_pane(delta),
-            (RegionId::ConfigLeft, Modal::Config(view)) => view.scroll_pane(Pane::Config, delta),
-            (RegionId::ConfigRight, Modal::Config(view)) => view.scroll_pane(Pane::Inspect, delta),
-            (RegionId::TextModal, Modal::Help(view) | Modal::Logs(view)) => view.scroll_by(delta),
+            (RegionId::InboxThread, _) => self.inbox.scroll_pane(delta) as usize,
+            (RegionId::ConfigLeft, Modal::Config(view)) => view.scroll_pane(Pane::Config, delta) as usize,
+            (RegionId::ConfigRight, Modal::Config(view)) => view.scroll_pane(Pane::Inspect, delta) as usize,
+            (RegionId::TextModal, Modal::Help(view) | Modal::Logs(view)) => view.scroll_by(delta) as usize,
+            // Up is older output, a larger scrollback offset; vt100 clamps
+            // it (the alternate screen has none: it stays put).
+            (RegionId::Terminal, _) => self.scroll_terminal_selection(-delta)?,
             _ => return Some(region),
-        } as usize;
+        };
         let mut regions = self.regions.borrow_mut();
         let region = regions.iter_mut().find(|r| r.id == id)?;
-        if let Source::Rows { scroll: s, .. } = &mut region.source {
+        if let Source::Rows { scroll: s, .. } | Source::Terminal { top: s } = &mut region.source {
             *s = scroll;
         }
         Some(region.clone())
@@ -148,10 +158,11 @@ impl App {
 
     /// A left press, after the other handlers saw it: drop the old selection
     /// (a click elsewhere clears it) and, inside a region, record a
-    /// [`Candidate`]. Not when the press grabbed a divider: that drag resizes.
+    /// [`Candidate`]. Not when the press grabbed a divider: that drag resizes;
+    /// nor when it went to a mouse-tracking terminal child, whose drag it is.
     pub(super) fn selection_press(&mut self, ev: &MouseEvent) {
         self.clear_selection();
-        if self.dragging_divider || self.inbox.dragging {
+        if self.dragging_divider || self.inbox.dragging || self.term_mouse_down.is_some() {
             return;
         }
         let hit = self.regions.borrow().iter().rev().find(|r| r.contains(ev.column, ev.row)).cloned();
@@ -171,7 +182,7 @@ mod tests {
     use super::super::test_support::*;
     use super::super::*;
     use crate::inbox::{Inbox, Kind};
-    use crate::tui::select::Pos;
+    use crate::tui::select::{Pos, RegionId};
 
     /// Draw `app` into a [`FRAME`]-sized test terminal, as the event loop
     /// would between events: registers the regions, reads a pending copy.
@@ -585,6 +596,112 @@ fn main() { println!(\"hi\"); }
         assert_eq!(view(&app).scroll, 2);
         draw(&app);
         assert_eq!(copy(&mut app, (1, 1), (4, 1)), "next");
+    }
+
+    /// A terminal sized to its panel's body (as the event loop does before
+    /// a draw) that printed `output`, and the body.
+    fn term_app(output: &str) -> (App, ratatui::layout::Rect) {
+        let mut app = new_app();
+        app.terms.open(term_sess("web-1", "devsandbox-web-1"));
+        let body = ratatui::widgets::Block::bordered().inner(crate::tui::ui::terminal_panel_rect(FRAME, false));
+        let session = app.terms.active_session_mut().unwrap();
+        session.resize(body.height, body.width);
+        session.feed_output(output.as_bytes());
+        draw(&app);
+        (app, body)
+    }
+
+    #[test]
+    fn a_shell_without_mouse_tracking_selects_locally() {
+        let (mut app, b) = term_app("hello world\r\nsecond line\r\n$ ");
+        // From the body's first cell to "second", dragging from below.
+        ev(&mut app, DOWN, b.x + 5, b.y + 1);
+        ev(&mut app, DRAG, b.x, b.y);
+        ev(&mut app, UP, b.x, b.y);
+        let buf = draw(&app);
+        assert_eq!(app.take_clipboard().as_deref(), Some("hello world\nsecond"));
+        assert!(buf[(b.x, b.y)].modifier.contains(Modifier::REVERSED));
+        assert!(!buf[(b.x - 1, b.y)].modifier.contains(Modifier::REVERSED), "border untouched");
+        // Nothing went to the shell.
+        assert!(app.terms.active_session().unwrap().take_written().is_empty());
+        // Past the panel's edges: clamped to the body, no border or tab title.
+        ev(&mut app, DOWN, b.x + 2, b.y);
+        ev(&mut app, DRAG, 0, 0);
+        ev(&mut app, DRAG, 200, 200);
+        ev(&mut app, UP, 200, 200);
+        draw(&app);
+        assert_eq!(app.take_clipboard().as_deref(), Some("llo world\nsecond line\n$"));
+    }
+
+    #[test]
+    fn switching_terminal_tabs_clears_a_terminal_selection() {
+        let (mut app, b) = term_app("hello world\r\n");
+        app.terms.open(term_sess("api-2", "devsandbox-api-2"));
+        app.terms.set_active(0);
+        draw(&app);
+        ev(&mut app, DOWN, b.x, b.y);
+        ev(&mut app, DRAG, b.x + 4, b.y);
+        ev(&mut app, UP, b.x + 4, b.y);
+        assert!(app.selection.is_some());
+        app.focus = Focus::Dashboard;
+        app.on_key(key(KeyCode::Char(']')));
+        assert_eq!(app.terms.active(), 1);
+        assert!(app.selection.is_none(), "would read the other session's rows");
+    }
+
+    #[test]
+    fn a_terminal_selection_spans_the_scrollback() {
+        let out: String = (0..100).map(|i| format!("line {i:02}\r\n")).collect();
+        let (mut app, b) = term_app(&out);
+        let offset = |app: &App| app.terms.active_session().unwrap().parser().lock().unwrap().screen().scrollback();
+        // "line 99" sits right above the cursor's empty last row.
+        ev(&mut app, DOWN, b.x + 6, b.bottom() - 2);
+        ev(&mut app, DRAG, b.x + 3, b.y + 1);
+        // One line of scrollback per drag above the body, to its oldest.
+        ev(&mut app, DRAG, b.x, b.y - 1);
+        assert_eq!(offset(&app), 1);
+        for _ in 0..200 {
+            ev(&mut app, DRAG, b.x, b.y - 1);
+        }
+        let max = offset(&app);
+        assert_eq!(max, 100 + 1 - b.height as usize);
+        ev(&mut app, UP, b.x, b.y - 1);
+        let buf = draw(&app);
+        let text = app.take_clipboard().expect("copied");
+        let want: Vec<String> = (0..100).map(|i| format!("line {i:02}")).collect();
+        assert_eq!(text, want.join("\n"));
+        assert!(buf[(b.x, b.y)].modifier.contains(Modifier::REVERSED), "the top, scrolled in");
+        // The wheel scrolls back down and keeps the selection; the copy
+        // still reads rows out of view.
+        let sel = app.selection.unwrap();
+        ev(&mut app, MouseEventKind::ScrollDown, b.x + 2, b.y + 2);
+        assert_eq!(offset(&app), max - 3);
+        assert_eq!(app.selection, Some(sel));
+        // New output doesn't drift it: rows count from the oldest line.
+        app.terms.active_session().unwrap().feed_output(b"more\r\n");
+        draw(&app);
+        assert_eq!(app.selection, Some(sel));
+        app.copy_requested.set(true);
+        draw(&app);
+        assert_eq!(app.take_clipboard().as_deref(), Some(&*want.join("\n")));
+    }
+
+    #[test]
+    fn a_press_forwarded_to_a_tracking_child_forms_no_selection() {
+        // Drawn while not tracking: the body was a region. The child turns
+        // tracking on before the next frame; the press is the child's.
+        let (mut app, b) = term_app("text\r\n");
+        app.terms.active_session().unwrap().feed_output(b"\x1b[?1002h\x1b[?1006h");
+        ev(&mut app, DOWN, b.x, b.y);
+        ev(&mut app, DRAG, b.x + 3, b.y);
+        ev(&mut app, UP, b.x + 3, b.y);
+        assert!(app.selection.is_none() && app.candidate.is_none());
+        assert_eq!(app.terms.active_session().unwrap().take_written(), b"\x1b[<0;1;1M\x1b[<32;4;1M\x1b[<0;4;1m");
+        draw(&app);
+        assert_eq!(app.take_clipboard(), None);
+        // And while it tracks, the body is no region at all.
+        assert!(app.selection_in_frame().is_none());
+        assert!(!app.regions.borrow().iter().any(|r| r.id == RegionId::Terminal));
     }
 
     #[test]

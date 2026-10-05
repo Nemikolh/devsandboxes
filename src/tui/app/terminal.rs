@@ -3,14 +3,16 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
+use ratatui::widgets::Block;
 
 use crate::runtime::{backend, NAME_PREFIX};
 use crate::tui::data::{ContainerStatus, InstanceRow};
 use crate::tui::kitty;
 use crate::commands::exec::SHELL_FALLBACK_CMD;
-use crate::tui::term::{encode_key, encode_wheel, TermSession};
+use crate::tui::select;
+use crate::tui::term::{encode_key, encode_mouse, encode_wheel, TermSession};
 
-use super::view::point_in;
+use super::view::{point_in, Modal};
 use super::{App, Focus, Tab};
 
 /// Lines one wheel notch scrolls, as scrollback or as arrow keys.
@@ -73,20 +75,22 @@ impl App {
     }
 
     /// Mouse routing for the integrated-terminal panel, active only when no
-    /// config modal is open and at least one terminal exists. Left-click inside
-    /// the panel focuses the terminal; a click on the title row's tab labels
-    /// activates that tab; a left-click outside the panel while the terminal is
-    /// focused returns focus to the dashboard. The wheel goes to the active
-    /// session (see [`Self::wheel_active_terminal`]). All layout math is
-    /// borrowed from `ui` so it tracks exactly what the draw path lays out.
-    /// I/O-free.
+    /// modal is open (it hides the panel) and at least one terminal exists.
+    /// Left-click inside the panel focuses the terminal; a click on the title
+    /// row's tab labels activates that tab; a left-click outside the panel
+    /// while the terminal is focused returns focus to the dashboard. The wheel
+    /// goes to the active session (see [`Self::wheel_active_terminal`]), and
+    /// so do the buttons while its child tracks the mouse
+    /// ([`Self::forward_terminal_mouse`]). All layout math is borrowed from
+    /// `ui` so it tracks exactly what the draw path lays out. I/O-free.
     pub(super) fn terminal_mouse(&mut self, ev: &MouseEvent, area: Rect) {
-        if self.terms.is_empty() {
+        if self.terms.is_empty() || !matches!(self.modal, Modal::None) {
             return;
         }
         let prompt_open = self.prompt.is_some();
         let panel = crate::tui::ui::terminal_panel_rect(area, prompt_open);
         let inside = point_in(panel, ev.column, ev.row);
+        self.forward_terminal_mouse(ev, panel);
         match ev.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 if inside {
@@ -107,6 +111,58 @@ impl App {
             MouseEventKind::ScrollDown if inside => self.wheel_active_terminal(false, ev, panel),
             _ => {}
         }
+    }
+
+    /// Buttons for a child that enabled mouse tracking (zidane, vim
+    /// `mouse=a`, tmux), so it can do its own selection: a press on the body
+    /// is reported at its pane-relative cell, and from then on that button's
+    /// drags and release, clamped to the body when the pointer left it, so a
+    /// child that saw the press always sees the release. The report is in the
+    /// child's mode and encoding ([`encode_mouse`] drops what the mode doesn't
+    /// ask for); [`Self::selection_press`] forms no selection under a
+    /// forwarded press. A child not tracking, or an exited session, gets
+    /// nothing: the body is a local selection region then (`ui`).
+    fn forward_terminal_mouse(&mut self, ev: &MouseEvent, panel: Rect) {
+        let body = Block::bordered().inner(panel);
+        let button = match ev.kind {
+            MouseEventKind::Down(b) if point_in(body, ev.column, ev.row) => b,
+            MouseEventKind::Down(_) => {
+                self.term_mouse_down = None;
+                return;
+            }
+            MouseEventKind::Drag(b) | MouseEventKind::Up(b) if self.term_mouse_down == Some(b) => b,
+            _ => return,
+        };
+        if let MouseEventKind::Up(_) = ev.kind {
+            self.term_mouse_down = None;
+        }
+        let Some(session) = self.terms.active_session_mut() else {
+            return;
+        };
+        let modes = session.parser().lock().ok().map(|p| {
+            let screen = p.screen();
+            (screen.mouse_protocol_mode(), screen.mouse_protocol_encoding())
+        });
+        let Some((mode, encoding)) = modes.filter(|(m, _)| *m != vt100::MouseProtocolMode::None && !session.exited())
+        else {
+            return;
+        };
+        if let MouseEventKind::Down(_) = ev.kind {
+            self.term_mouse_down = Some(button);
+        }
+        let (col, row) = body_cell(body, ev);
+        if let Some(bytes) = encode_mouse(ev.kind, ev.modifiers, col, row, mode, encoding) {
+            session.write_key_bytes(&bytes);
+        }
+    }
+
+    /// Autoscroll of a terminal selection: scroll the active session's
+    /// scrollback by `delta` lines (positive: older) and return the
+    /// [`Source::Terminal`](crate::tui::select::Source) row now at the top.
+    pub(super) fn scroll_terminal_selection(&mut self, delta: i16) -> Option<usize> {
+        self.scroll_active_terminal(delta);
+        let mut parser = self.terms.active_session()?.parser().lock().ok()?;
+        Some(select::terminal_top(parser.screen_mut()))
     }
 
     /// One wheel notch over the active terminal, routed like xterm does:
@@ -133,12 +189,8 @@ impl App {
             {
                 None
             } else if mode != vt100::MouseProtocolMode::None {
-                // Body = panel minus its 1-cell border; clamp so a notch over
-                // the border still lands on an edge cell.
-                let cols = panel.width.saturating_sub(2).max(1);
-                let rows = panel.height.saturating_sub(2).max(1);
-                let col = ev.column.saturating_sub(panel.x + 1).min(cols - 1);
-                let row = ev.row.saturating_sub(panel.y + 1).min(rows - 1);
+                // A notch over the border still lands on an edge cell.
+                let (col, row) = body_cell(Block::bordered().inner(panel), ev);
                 // An unencodable position drops the notch, as xterm does.
                 Some(
                     encode_wheel(up, ev.modifiers, col, row, screen.mouse_protocol_encoding())
@@ -315,6 +367,14 @@ impl App {
     }
 }
 
+/// The 0-based cell of the terminal `body` under `ev`, clamped onto the body
+/// when the pointer is off it (the border, or past the panel mid-drag).
+fn body_cell(body: Rect, ev: &MouseEvent) -> (u16, u16) {
+    let col = ev.column.saturating_sub(body.x).min(body.width.saturating_sub(1));
+    let row = ev.row.saturating_sub(body.y).min(body.height.saturating_sub(1));
+    (col, row)
+}
+
 /// Terminal target for an instance row, which must be running.
 fn instance_term_target(row: &InstanceRow) -> Result<(String, String, bool), String> {
     if !matches!(row.status, ContainerStatus::Running(_)) {
@@ -473,6 +533,89 @@ mod tests {
         app.on_mouse(&mouse_at(MouseEventKind::ScrollUp, panel.x, panel.y), FRAME);
         let session = app.terms.active_session().unwrap();
         assert_eq!(session.take_written(), b"\x1b[<64;1;1M");
+    }
+
+    /// A terminal whose child enabled `modes`, and its panel.
+    fn tracking_app(modes: &[u8]) -> (App, Rect) {
+        let mut app = new_app();
+        app.terms.open(term_sess("web-1", "devsandbox-web-1"));
+        app.terms.active_session().unwrap().feed_output(modes);
+        (app, crate::tui::ui::terminal_panel_rect(FRAME, false))
+    }
+
+    fn written(app: &App) -> Vec<u8> {
+        app.terms.active_session().unwrap().take_written()
+    }
+
+    #[test]
+    fn a_tracking_child_gets_press_drag_and_release() {
+        let (mut app, panel) = tracking_app(b"\x1b[?1000h\x1b[?1002h\x1b[?1006h");
+        // Body cell (2, 1): 1-based (3, 2) in the report.
+        let (x, y) = (panel.x + 3, panel.y + 2);
+        app.on_mouse(&mouse_at(MouseEventKind::Down(MouseButton::Left), x, y), FRAME);
+        assert_eq!(written(&app), b"\x1b[<0;3;2M");
+        assert_eq!(app.focus, Focus::Terminal, "the click still focuses");
+        app.on_mouse(&mouse_at(MouseEventKind::Drag(MouseButton::Left), x + 4, y + 1), FRAME);
+        assert_eq!(written(&app), b"\x1b[<32;7;3M");
+        // Dragged off the panel: clamped onto the body's last cell.
+        app.on_mouse(&mouse_at(MouseEventKind::Drag(MouseButton::Left), 200, 200), FRAME);
+        let (w, h) = (panel.width - 2, panel.height - 2);
+        assert_eq!(written(&app), format!("\x1b[<32;{w};{h}M").into_bytes());
+        // Released outside the panel: still sent, clamped onto the body.
+        app.on_mouse(&mouse_at(MouseEventKind::Up(MouseButton::Left), 0, 0), FRAME);
+        assert_eq!(written(&app), b"\x1b[<0;1;1m");
+        assert!(app.selection.is_none() && app.candidate.is_none());
+        assert_eq!(app.term_mouse_down, None);
+        // Nothing after the release: a drag without a press isn't the child's.
+        app.on_mouse(&mouse_at(MouseEventKind::Drag(MouseButton::Left), x, y), FRAME);
+        assert!(written(&app).is_empty());
+        // The other buttons too, and modifiers.
+        let mut right = mouse_at(MouseEventKind::Down(MouseButton::Right), x, y);
+        right.modifiers = KeyModifiers::CONTROL;
+        app.on_mouse(&right, FRAME);
+        app.on_mouse(&mouse_at(MouseEventKind::Up(MouseButton::Right), x, y), FRAME);
+        app.on_mouse(&mouse_at(MouseEventKind::Down(MouseButton::Middle), x, y), FRAME);
+        app.on_mouse(&mouse_at(MouseEventKind::Up(MouseButton::Middle), x, y), FRAME);
+        assert_eq!(written(&app), b"\x1b[<18;3;2M\x1b[<2;3;2m\x1b[<1;3;2M\x1b[<1;3;2m");
+    }
+
+    #[test]
+    fn forwarding_follows_the_childs_mode_and_encoding() {
+        // `?1000` alone, X10 encoding: press and release, no drags.
+        let (mut app, panel) = tracking_app(b"\x1b[?1000h");
+        let (x, y) = (panel.x + 1, panel.y + 1);
+        app.on_mouse(&mouse_at(MouseEventKind::Down(MouseButton::Left), x, y), FRAME);
+        app.on_mouse(&mouse_at(MouseEventKind::Drag(MouseButton::Left), x + 1, y), FRAME);
+        app.on_mouse(&mouse_at(MouseEventKind::Up(MouseButton::Left), x + 1, y), FRAME);
+        assert_eq!(written(&app), b"\x1b[M !!\x1b[M#\"!");
+        // A press on the title row or border isn't the child's, nor its release.
+        app.on_mouse(&mouse_at(MouseEventKind::Down(MouseButton::Left), panel.x + 5, panel.y), FRAME);
+        app.on_mouse(&mouse_at(MouseEventKind::Up(MouseButton::Left), panel.x + 5, panel.y), FRAME);
+        assert!(written(&app).is_empty());
+        // Not tracking (or exited): nothing is forwarded.
+        let (mut app, panel) = tracking_app(b"");
+        app.on_mouse(&mouse_at(MouseEventKind::Down(MouseButton::Left), panel.x + 2, panel.y + 2), FRAME);
+        assert!(written(&app).is_empty() && app.term_mouse_down.is_none());
+        let (mut app, panel) = tracking_app(b"\x1b[?1000h");
+        app.terms.active_session().unwrap().set_exited();
+        app.on_mouse(&mouse_at(MouseEventKind::Down(MouseButton::Left), panel.x + 2, panel.y + 2), FRAME);
+        assert!(written(&app).is_empty());
+    }
+
+    #[test]
+    fn a_modal_hides_the_terminal_from_the_mouse() {
+        let (mut app, panel) = tracking_app(b"");
+        for i in 0..60 {
+            app.terms.active_session().unwrap().feed_output(format!("line {i}\r\n").as_bytes());
+        }
+        app.on_key(key(KeyCode::Char('?')));
+        assert!(matches!(app.modal, Modal::Help(_)));
+        let (x, y) = (panel.x + 2, panel.y + 2);
+        app.on_mouse(&mouse_at(MouseEventKind::Down(MouseButton::Left), x, y), FRAME);
+        app.on_mouse(&mouse_at(MouseEventKind::ScrollUp, x, y), FRAME);
+        assert_eq!(app.focus, Focus::Dashboard);
+        let session = app.terms.active_session().unwrap();
+        assert_eq!(session.parser().lock().unwrap().screen().scrollback(), 0);
     }
 
     #[test]

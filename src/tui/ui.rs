@@ -66,10 +66,24 @@ pub fn draw(frame: &mut Frame, app: &App) {
     if let Some((region, sel)) = app.selection_in_frame() {
         let buf = frame.buffer_mut();
         if copy {
-            app.set_clipboard(select::extract(buf, &region, &sel));
+            app.set_clipboard(match region.source {
+                // Off the vt100 screen, scrollback included; the panel's
+                // lock is long released.
+                select::Source::Terminal { .. } => terminal_selection_text(app, &sel),
+                _ => select::extract(buf, &region, &sel),
+            });
         }
         select::highlight(buf, &region, &sel);
     }
+}
+
+/// The text of a terminal selection, read from the active session's screen.
+fn terminal_selection_text(app: &App, sel: &select::Selection) -> String {
+    let Some(Ok(mut parser)) = app.terms.active_session().map(|s| s.parser().lock()) else {
+        return String::new();
+    };
+    let (from, to) = sel.range();
+    select::extract_terminal(parser.screen_mut(), from, to)
 }
 
 /// Register the inner text area of a bordered pane drawn at `area` as
@@ -1289,10 +1303,16 @@ fn draw_terminal_panel(frame: &mut Frame, app: &App, area: Rect) {
 
     // Lock the active screen to render it. A poisoned lock (a reader thread
     // panicked) is unrecoverable here — skip the body but still show the block.
-    let Ok(parser) = session.parser().lock() else {
+    let Ok(mut parser) = session.parser().lock() else {
         frame.render_widget(block, area);
         return;
     };
+    // The body is selectable unless the child tracks the mouse (it gets the
+    // buttons then, `App::terminal_mouse`); an exited one tracks nothing.
+    let screen = parser.screen_mut();
+    if screen.mouse_protocol_mode() == vt100::MouseProtocolMode::None || session.exited() {
+        app.add_terminal_region(block.inner(area), select::terminal_top(screen));
+    }
     let screen = parser.screen();
 
     // Show the cursor only when the terminal is focused; hide it otherwise so a
@@ -1301,7 +1321,6 @@ fn draw_terminal_panel(frame: &mut Frame, app: &App, area: Rect) {
     if !focused {
         cursor.hide();
     }
-    app.add_region(RegionId::Terminal, block.inner(area));
     let widget = PseudoTerminal::new(screen).block(block).cursor(cursor);
     frame.render_widget(&widget, area);
 }
