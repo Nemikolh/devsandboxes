@@ -3,12 +3,13 @@
 
 use std::path::PathBuf;
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
 use crate::config::Config;
 use crate::runtime::backend;
 use crate::tui::data::{ContainerStatus, InstanceRow, Node};
+use crate::tui::settings::{SETTINGS, Settings};
 
 use super::{App, Tab};
 
@@ -17,8 +18,10 @@ const HELP_BODY: &str = "\
 Global
   q, ctrl-c   quit
   tab / S-tab switch tab      1-4  jump to tab
-  :           command prompt  ?    this help
-  drag        select & copy to the clipboard (OSC 52)   ctrl-shift-c  copy again
+  :           command prompt  ?    settings & help
+  drag        select (copies on release with \"copy on select\" on, above)
+  ctrl-shift-c / cmd-c  copy the selection to the clipboard (OSC 52)
+              (ctrl-c too over a dashboard selection: legacy terminals)
   shift-drag  the outer terminal's own selection (whole rows, across panes)
 
 Tables (Instances / Services)
@@ -138,6 +141,17 @@ impl TextModal {
         self.scroll = apply_delta(self.scroll, delta, line_count(&self.body).saturating_sub(1));
         self.scroll
     }
+}
+
+/// The `?` Settings & help modal: the settings rows (from
+/// [`SETTINGS`](crate::tui::settings::SETTINGS)) with a cursor on top, the
+/// key reference below in a [`TextModal`] that scrolls and selects as
+/// before. The settings own `tab`/`S-tab` and `space`/`enter`, keys the
+/// text never used, so the help keeps its `↑↓`/`j`/`k` scrolling.
+pub struct HelpModal {
+    pub text: TextModal,
+    /// Index into `SETTINGS` of the row `space`/`enter` toggles.
+    pub cursor: usize,
 }
 
 /// Line count of `body`, clamped to `u16`, for scroll bounds.
@@ -306,8 +320,8 @@ fn apply_delta(scroll: u16, delta: i16, max: u16) -> u16 {
 pub enum Modal {
     None,
     Config(ConfigView),
-    /// Keybinding reference (`?`).
-    Help(TextModal),
+    /// Settings & keybinding reference (`?`).
+    Help(HelpModal),
     /// Container log tail (`l` on the Instances tab).
     Logs(TextModal),
 }
@@ -346,10 +360,18 @@ impl App {
                 _ => view.scroll_focused(key),
             },
             Modal::Help(view) => {
-                if matches!(key.code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?')) {
-                    self.modal = Modal::None;
-                } else {
-                    view.on_scroll_key(key);
+                let n = SETTINGS.len();
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => self.modal = Modal::None,
+                    KeyCode::Tab if n > 0 => view.cursor = (view.cursor + 1) % n,
+                    KeyCode::BackTab if n > 0 => view.cursor = (view.cursor + n - 1) % n,
+                    KeyCode::Char(' ') | KeyCode::Enter => {
+                        let i = view.cursor;
+                        self.toggle_setting(i);
+                    }
+                    _ => {
+                        view.text.on_scroll_key(key);
+                    }
                 }
             }
             Modal::Logs(view) => {
@@ -362,9 +384,41 @@ impl App {
         }
     }
 
-    /// Open the help overlay listing all keybindings grouped by context.
+    /// Open the Settings & help overlay: the settings, then all keybindings
+    /// grouped by context.
     pub(super) fn open_help(&mut self) {
-        self.modal = Modal::Help(TextModal::new(" help — keys ".to_string(), HELP_BODY.to_string()));
+        let text = TextModal::new(" settings & help ".to_string(), HELP_BODY.to_string());
+        self.modal = Modal::Help(HelpModal { text, cursor: 0 });
+    }
+
+    /// Flip setting `i` of `SETTINGS` (a key or a click in the `?` modal),
+    /// with its cursor following a click, and mark the settings for the
+    /// event loop to save.
+    pub(super) fn toggle_setting(&mut self, i: usize) {
+        if i >= SETTINGS.len() {
+            return;
+        }
+        self.settings.toggle(i);
+        self.settings_dirty = true;
+        if let Modal::Help(view) = &mut self.modal {
+            view.cursor = i;
+        }
+    }
+
+    /// The settings to save, once after each change; `None` when unchanged.
+    pub fn take_settings_save(&mut self) -> Option<Settings> {
+        std::mem::take(&mut self.settings_dirty).then_some(self.settings)
+    }
+
+    /// A left press on a settings row of the `?` modal toggles it. The
+    /// hit-test is `ui`'s, shared with the drawing.
+    pub(super) fn help_mouse(&mut self, ev: &MouseEvent, area: Rect) {
+        if ev.kind != MouseEventKind::Down(MouseButton::Left) || !matches!(self.modal, Modal::Help(_)) {
+            return;
+        }
+        if let Some(i) = crate::tui::ui::help_setting_hit(area, ev.column, ev.row) {
+            self.toggle_setting(i);
+        }
     }
 
     /// Open a full-screen log tail for the selected instance's container.
@@ -667,6 +721,62 @@ mod tests {
         app.on_key(key(KeyCode::Char('?')));
         app.on_key(key(KeyCode::Char('q')));
         assert!(matches!(app.modal, Modal::None));
+    }
+
+    fn help(app: &App) -> &HelpModal {
+        match &app.modal {
+            Modal::Help(v) => v,
+            _ => panic!("help not open"),
+        }
+    }
+
+    #[test]
+    fn settings_toggle_in_the_help_modal_and_are_marked_for_saving() {
+        let mut app = new_app();
+        app.on_key(key(KeyCode::Char('?')));
+        assert_eq!(app.take_settings_save(), None, "opening changes nothing");
+        assert_eq!(help(&app).cursor, 0);
+        app.on_key(key(KeyCode::Char(' ')));
+        assert!(app.settings.copy_on_select);
+        assert_eq!(app.take_settings_save(), Some(app.settings));
+        assert_eq!(app.take_settings_save(), None, "once per change");
+        // tab / S-tab move the cursor (wrapping); enter toggles too.
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(help(&app).cursor, 1);
+        app.on_key(key(KeyCode::Enter));
+        assert!(!app.settings.terminal_clipboard);
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(help(&app).cursor, 0);
+        app.on_key(key(KeyCode::BackTab));
+        assert_eq!(help(&app).cursor, 1);
+        // ↑↓ still scroll the help, not the settings.
+        app.on_key(key(KeyCode::Down));
+        assert_eq!((help(&app).cursor, help(&app).text.scroll), (1, 1));
+        assert_eq!(
+            app.take_settings_save(),
+            Some(Settings { copy_on_select: true, terminal_clipboard: false })
+        );
+    }
+
+    #[test]
+    fn a_click_on_a_settings_row_toggles_it() {
+        let mut app = new_app();
+        app.on_key(key(KeyCode::Char('?')));
+        let press = |col, row| mouse_at(MouseEventKind::Down(MouseButton::Left), col, row);
+        // Inside the border: row 1 is the first setting, row 2 the second.
+        app.on_mouse(&press(5, 2), FRAME);
+        assert!(!app.settings.terminal_clipboard);
+        assert_eq!(help(&app).cursor, 1, "the cursor follows");
+        assert!(app.take_settings_save().is_some());
+        // The border, the gap row and the help text toggle nothing.
+        for (col, row) in [(5, 0), (0, 1), (5, 3), (5, 10)] {
+            app.on_mouse(&press(col, row), FRAME);
+            assert_eq!(app.take_settings_save(), None, "({col}, {row})");
+        }
+        // Not without the modal.
+        app.on_key(key(KeyCode::Esc));
+        app.on_mouse(&press(5, 1), FRAME);
+        assert_eq!(app.settings, Settings { copy_on_select: false, terminal_clipboard: false });
     }
 
     #[test]

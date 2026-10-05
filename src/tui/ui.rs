@@ -10,9 +10,10 @@ use ratatui::widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table, 
 use tui_term::widget::{Cursor, PseudoTerminal};
 
 use super::app::{
-    pane_lines, short_age, title_of, App, ConfigView, Focus, InboxFocus, Modal, PaneLine, Pane, PortRow,
-    Side, Tab, TextModal, Thread, Tone, View,
+    pane_lines, short_age, title_of, App, ConfigView, Extract, Focus, HelpModal, InboxFocus, Modal, PaneLine,
+    Pane, PortRow, Side, Tab, TextModal, Thread, Tone, View,
 };
+use super::settings::SETTINGS;
 use super::data::{
     humanize_secs, sandbox_stats, totals_line, ContainerStatus, InstanceRow, Node, SandboxRow,
     ServiceRow, Snapshot,
@@ -56,22 +57,26 @@ pub fn draw(frame: &mut Frame, app: &App) {
     match &app.modal {
         Modal::None => {}
         Modal::Config(view) => draw_config_modal(frame, app, view),
-        Modal::Help(view) => draw_text_modal(frame, app, view),
+        Modal::Help(view) => draw_help_modal(frame, app, view),
         Modal::Logs(view) => draw_text_modal(frame, app, view),
     }
 
-    // Last, so nothing drawn hides it; and the copy reads the very cells
-    // this frame shows.
-    let copy = app.take_copy_request();
+    // Last, so nothing drawn hides it; and the copy (or the count a release
+    // without copy on select shows) reads the very cells this frame shows.
+    let extract = app.take_extract_request();
     if let Some((region, sel)) = app.selection_in_frame() {
         let buf = frame.buffer_mut();
-        if copy {
-            app.set_clipboard(match region.source {
+        if let Some(extract) = extract {
+            let text = match region.source {
                 // Off the vt100 screen, scrollback included; the panel's
                 // lock is long released.
                 select::Source::Terminal { .. } => terminal_selection_text(app, &sel),
                 _ => select::extract(buf, &region, &sel),
-            });
+            };
+            match extract {
+                Extract::Copy => app.set_clipboard(text),
+                Extract::Measure => app.set_measured(&text),
+            }
         }
         select::highlight(buf, &region, &sel);
     }
@@ -1843,7 +1848,10 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
 
     let base = match app.modal {
         Modal::Config(_) => "t toggle · tab pane · <> resize · ↑↓ scroll · esc close".to_string(),
-        Modal::Help(_) => "↑↓ scroll · pgup/pgdn · g/G · esc/? close".to_string(),
+        Modal::Help(_) => {
+            "tab/S-tab setting · space/enter/click toggle · ↑↓ scroll · pgup/pgdn · g/G · esc/? close"
+                .to_string()
+        }
         Modal::Logs(_) => "↑↓ scroll · pgup/pgdn · g/G · esc close".to_string(),
         Modal::None => match app.tab {
             // A process row acts only on itself: signals, nothing forwarded to
@@ -2043,6 +2051,63 @@ fn draw_text_modal(frame: &mut Frame, app: &App, view: &TextModal) {
     frame.render_widget(ratatui::widgets::Clear, area);
     frame.render_widget(paragraph, area);
     selectable_lines(app, RegionId::TextModal, area, view.scroll, &view.body);
+}
+
+/// The `?` modal's `(settings, help body)` areas inside its border over the
+/// full frame `area`: one row per [`SETTINGS`] entry, a blank row, then the
+/// help text. Shared by the draw and [`help_setting_hit`].
+fn help_layout(area: Rect) -> (Rect, Rect) {
+    let inner = Block::bordered().inner(area);
+    let n = (SETTINGS.len() as u16).min(inner.height);
+    let settings = Rect { height: n, ..inner };
+    let gap = (n + 1).min(inner.height);
+    let body = Rect { y: inner.y + gap, height: inner.height - gap, ..inner };
+    (settings, body)
+}
+
+/// The [`SETTINGS`] row under `(col, row)` of the `?` modal drawn over the
+/// full frame `area`, if any.
+pub fn help_setting_hit(area: Rect, col: u16, row: u16) -> Option<usize> {
+    let (settings, _) = help_layout(area);
+    settings.contains(Position::new(col, row)).then(|| (row - settings.y) as usize)
+}
+
+/// The `?` Settings & help modal: the settings rows on top (`[x]` per
+/// value, the cursor row accented), the key reference below, scrolling and
+/// selectable like any [`TextModal`] (the settings rows are no region: a
+/// press there is a toggle, not a selection).
+fn draw_help_modal(frame: &mut Frame, app: &App, view: &HelpModal) {
+    let area = frame.area();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ACCENT))
+        .title(view.text.title.clone());
+    frame.render_widget(ratatui::widgets::Clear, area);
+    frame.render_widget(block, area);
+    let (settings_area, body_area) = help_layout(area);
+    let width = SETTINGS.iter().map(|s| s.label.chars().count()).max().unwrap_or(0);
+    let rows: Vec<Line> = SETTINGS
+        .iter()
+        .enumerate()
+        .map(|(i, spec)| {
+            let on = if (spec.get)(&app.settings) { 'x' } else { ' ' };
+            let cursor = i == view.cursor;
+            let style = if cursor {
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            Line::from(vec![
+                Span::styled(format!("{} [{on}] {:<width$}  ", if cursor { '›' } else { ' ' }, spec.label), style),
+                Span::styled(spec.help, Style::default().add_modifier(Modifier::DIM)),
+            ])
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(rows), settings_area);
+    let body = &view.text.body;
+    frame.render_widget(Paragraph::new(body.clone()).scroll((view.text.scroll, 0)), body_area);
+    let rows = body.lines().map(select::RowText::plain).collect();
+    app.add_rows_region(RegionId::TextModal, body_area, view.text.scroll as usize, rows);
 }
 
 /// [`selectable`] for a bordered `Paragraph` of `body` scrolled to `scroll`

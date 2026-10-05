@@ -14,6 +14,7 @@ mod markdown;
 mod procs;
 mod prompt;
 mod select;
+mod settings;
 mod spec;
 mod term;
 mod ui;
@@ -199,6 +200,12 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
     let dir = app.dir.clone();
     app.utc_offset = local_utc_offset();
     app.kitty = KITTY.load(Ordering::Relaxed);
+    // Before the inbox, whose error would otherwise hide this one: an
+    // invalid file runs on the defaults, and the first toggle overwrites it.
+    match settings::load() {
+        Ok(s) => app.settings = s,
+        Err(e) => app.status = Some(format!("settings not loaded, using defaults: {e:#}")),
+    }
     match inbox::store::load() {
         Ok(inbox) => app.set_inbox(inbox),
         Err(e) => app.status = Some(format!("inbox not loaded: {e:#}")),
@@ -292,11 +299,14 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
                 format!("copied {n} chars")
             });
         }
+        // A release with copy on select off: say what a copy key would copy.
+        if let Some(hint) = app.take_selected_hint() {
+            app.status = Some(hint);
+        }
         // Apps in the integrated terminal copy with OSC 52 to *their*
         // terminal, our vt100 emulator, whose callbacks queue it; relay it to
-        // the outer one. Several tabs copying in one frame: only the last is
-        // sent, since it would overwrite the others on the clipboard anyway.
-        if let Some((title, b64)) = app.terms.take_clipboards().pop() {
+        // the outer one (unless the `terminal_clipboard` setting is off).
+        if let Some((title, b64)) = app.take_terminal_clipboard() {
             let mut out = io::stdout();
             out.write_all(&clipboard::osc52_base64(&b64, std::env::var_os("TMUX").is_some()))?;
             out.flush()?;
@@ -316,6 +326,13 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
                 // terminal-panel hit-testing stay I/O-free.
                 Event::Mouse(ev) => app.on_mouse(&ev, area),
                 _ => {}
+            }
+        }
+        // A toggle in the `?` modal: persist it now, best-effort (the toggle
+        // holds for this session either way).
+        if let Some(s) = app.take_settings_save() {
+            if let Err(e) = settings::save(&s) {
+                app.status = Some(format!("settings not saved: {e:#}"));
             }
         }
 

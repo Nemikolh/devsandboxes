@@ -10,12 +10,26 @@ use ratatui::layout::Rect;
 
 use crate::tui::select::{Candidate, Region, RegionId, RowText, Selection, Source};
 
-use super::view::{Modal, Pane};
+use super::view::{HelpModal, Modal, Pane};
 use super::App;
 
-/// The copy shortcut: ctrl+shift+c, or cmd/super+c. The release already
-/// copied, so this only matters where the emulator passes the key through
-/// instead of binding it. Crossterm reports the letter as `c` or `C` with
+/// What the next draw should do with the selection's text: [`Copy`] it to
+/// the clipboard, or only [`Measure`] it for the `selected N chars` hint
+/// (a release with copy on select off). Read off the drawn frame either way,
+/// so the count is exactly what a copy would send.
+///
+/// [`Copy`]: Extract::Copy
+/// [`Measure`]: Extract::Measure
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Extract {
+    Copy,
+    Measure,
+}
+
+/// The copy shortcut: ctrl+shift+c, or cmd/super+c. It copies whatever
+/// the copy-on-select setting; where the emulator binds it to its own copy
+/// instead, the key never reaches us (and the release copies only with the
+/// setting on). Crossterm reports the letter as `c` or `C` with
 /// SHIFT depending on the kitty flags, and SUPER only under kitty flags;
 /// a legacy terminal sends ctrl+shift+c as plain ctrl+c, which this isn't.
 pub(super) fn is_copy_key(key: &KeyEvent) -> bool {
@@ -76,7 +90,9 @@ impl App {
             (RegionId::InboxThread, _) => self.inbox.scroll_pane(delta) as usize,
             (RegionId::ConfigLeft, Modal::Config(view)) => view.scroll_pane(Pane::Config, delta) as usize,
             (RegionId::ConfigRight, Modal::Config(view)) => view.scroll_pane(Pane::Inspect, delta) as usize,
-            (RegionId::TextModal, Modal::Help(view) | Modal::Logs(view)) => view.scroll_by(delta) as usize,
+            (RegionId::TextModal, Modal::Help(HelpModal { text: view, .. }) | Modal::Logs(view)) => {
+                view.scroll_by(delta) as usize
+            }
             // Up is older output, a larger scrollback offset; vt100 clamps
             // it (the alternate screen has none: it stays put).
             (RegionId::Terminal, _) => self.scroll_terminal_selection(-delta)?,
@@ -100,24 +116,38 @@ impl App {
     pub(super) fn clear_selection(&mut self) {
         self.selection = None;
         self.candidate = None;
-        self.copy_requested.set(false);
+        self.extract_requested.set(None);
     }
 
     /// The copy shortcut ([`is_copy_key`]) over a live selection: ask the
-    /// next draw for its text again, as a release does. Returns whether it
-    /// consumed the key; without a selection the key goes on as before.
+    /// next draw to copy its text, whatever the copy-on-select setting.
+    /// Returns whether it consumed the key; without a selection the key goes
+    /// on as before.
     pub(super) fn selection_key(&mut self, key: &KeyEvent) -> bool {
         if self.selection.is_none() || !is_copy_key(key) {
             return false;
         }
-        self.copy_requested.set(true);
+        self.extract_requested.set(Some(Extract::Copy));
         true
     }
 
-    /// Renderer hook: whether a release asked for the selection's text; asks
-    /// once.
-    pub fn take_copy_request(&self) -> bool {
-        self.copy_requested.take()
+    /// Renderer hook: what a release or copy key asked of the selection's
+    /// text; asks once.
+    pub fn take_extract_request(&self) -> Option<Extract> {
+        self.extract_requested.take()
+    }
+
+    /// Renderer hook: a measured (not copied) selection's text. Blank counts
+    /// as nothing, as for [`Self::set_clipboard`].
+    pub fn set_measured(&self, text: &str) {
+        if !text.trim().is_empty() {
+            self.measured.set(Some(text.chars().count()));
+        }
+    }
+
+    /// The status hint for a selection released without copying, once.
+    pub fn take_selected_hint(&mut self) -> Option<String> {
+        self.measured.take().map(|n| format!("selected {n} chars — ctrl-shift-c copies"))
     }
 
     /// Renderer hook: the copied text, for the event loop. An all-blank
@@ -136,7 +166,7 @@ impl App {
     /// The selection's share of a mouse event, ahead of every other handler:
     /// a drag from a pressed cell to another starts the selection, drags move
     /// its head (clamped to its region), the release ends it and asks for
-    /// the copy. Returns whether it consumed the event; it doesn't while no
+    /// the copy, or with copy on select off only for its size. Returns whether it consumed the event; it doesn't while no
     /// drag-selection is live, so a press stays a click everywhere.
     pub(super) fn selection_mouse(&mut self, ev: &MouseEvent) -> bool {
         match ev.kind {
@@ -168,7 +198,8 @@ impl App {
                 match self.selection.as_mut().filter(|s| s.dragging) {
                     Some(sel) => {
                         sel.dragging = false;
-                        self.copy_requested.set(true);
+                        let want = if self.settings.copy_on_select { Extract::Copy } else { Extract::Measure };
+                        self.extract_requested.set(Some(want));
                         true
                     }
                     None => false,
@@ -227,10 +258,18 @@ mod tests {
         notes_app(&["first message", "second message"])
     }
 
-    /// The Inbox with a notify thread per message (ids from 1, the first
-    /// selected), drawn once.
-    fn notes_app(msgs: &[&str]) -> App {
+    /// [`new_app`] with copy on select on: most tests here read the copy a
+    /// release makes; the default (off) has its own tests.
+    fn copying_app() -> App {
         let mut app = new_app();
+        app.settings.copy_on_select = true;
+        app
+    }
+
+    /// The Inbox with a notify thread per message (ids from 1, the first
+    /// selected), drawn once; copy on select on.
+    fn notes_app(msgs: &[&str]) -> App {
+        let mut app = copying_app();
         let note = |id: u64, msg: &str| {
             let mut t = Thread { id, kind: Kind::Notify, owner_name: "builder".into(), unread: true, ..Thread::default() };
             t.notes = vec![crate::inbox::Note {
@@ -353,7 +392,7 @@ mod tests {
 
     #[test]
     fn config_divider_drag_resizes_and_never_selects() {
-        let mut app = new_app();
+        let mut app = copying_app();
         open_modal(&mut app);
         draw(&app);
         // Divider at 50 of 100; 51 is inside the right pane's text.
@@ -405,11 +444,12 @@ mod tests {
         ev(&mut app, UP, 10, 4);
         app.on_key(key(KeyCode::Char('?')));
         assert!(app.selection.is_none(), "modal open");
-        // A selection in the help modal goes when it closes.
+        // A selection in the help modal (its text, below the settings rows)
+        // goes when it closes.
         draw(&app);
-        ev(&mut app, DOWN, 2, 2);
-        ev(&mut app, DRAG, 6, 3);
-        ev(&mut app, UP, 6, 3);
+        ev(&mut app, DOWN, 2, 5);
+        ev(&mut app, DRAG, 6, 6);
+        ev(&mut app, UP, 6, 6);
         assert!(app.selection.is_some());
         app.on_key(key(KeyCode::Char('q')));
         assert!(app.selection.is_none(), "modal closed");
@@ -592,7 +632,7 @@ fn main() { println!(\"hi\"); }
 
     #[test]
     fn a_config_line_wider_than_its_pane_copies_whole_from_the_right_edge() {
-        let mut app = new_app();
+        let mut app = copying_app();
         open_modal(&mut app);
         let wide = format!("image = \"{}\"", "x".repeat(100));
         if let Modal::Config(v) = &mut app.modal {
@@ -621,9 +661,9 @@ fn main() { println!(\"hi\"); }
     }
 
     /// A terminal sized to its panel's body (as the event loop does before
-    /// a draw) that printed `output`, and the body.
+    /// a draw) that printed `output`, and the body; copy on select on.
     fn term_app(output: &str) -> (App, ratatui::layout::Rect) {
-        let mut app = new_app();
+        let mut app = copying_app();
         app.terms.open(term_sess("web-1", "devsandbox-web-1"));
         let body = ratatui::widgets::Block::bordered().inner(crate::tui::ui::terminal_panel_rect(FRAME, false));
         let session = app.terms.active_session_mut().unwrap();
@@ -703,7 +743,7 @@ fn main() { println!(\"hi\"); }
         app.terms.active_session().unwrap().feed_output(b"more\r\n");
         draw(&app);
         assert_eq!(app.selection, Some(sel));
-        app.copy_requested.set(true);
+        app.extract_requested.set(Some(Extract::Copy));
         draw(&app);
         assert_eq!(app.take_clipboard().as_deref(), Some(&*want.join("\n")));
     }
@@ -808,5 +848,64 @@ fn main() { println!(\"hi\"); }
         app.on_key(key(KeyCode::Char('j')));
         assert_eq!(app.selected_inbox_thread().map(|t| t.id), Some(3));
         assert!(app.selection.is_none());
+    }
+
+    #[test]
+    fn without_copy_on_select_a_release_only_counts_and_the_keys_copy() {
+        let mut app = inbox_app();
+        app.settings.copy_on_select = false;
+        let screen = rows(&draw(&app));
+        let y = screen.iter().position(|r| r[r.char_indices().nth(41).unwrap().0..].contains("first message")).unwrap() as u16;
+        let x = 41 + screen[y as usize].chars().skip(41).collect::<String>().find("first message").unwrap() as u16;
+        ev(&mut app, DOWN, x, y);
+        ev(&mut app, DRAG, x + 12, y);
+        ev(&mut app, UP, x + 12, y);
+        let buf = draw(&app);
+        assert_eq!(app.take_clipboard(), None, "nothing copied");
+        assert_eq!(app.take_selected_hint().as_deref(), Some("selected 13 chars — ctrl-shift-c copies"));
+        assert_eq!(app.take_selected_hint(), None, "once");
+        assert!(app.selection.is_some_and(|s| !s.dragging), "kept");
+        assert!(buf[(x, y)].modifier.contains(Modifier::REVERSED), "still highlighted");
+        // Every copy key copies whatever the setting.
+        for k in [mods('C', KeyModifiers::CONTROL | KeyModifiers::SHIFT), mods('c', KeyModifiers::SUPER), mods('c', KeyModifiers::CONTROL)] {
+            app.on_key(k);
+            draw(&app);
+            assert_eq!(app.take_clipboard().as_deref(), Some("first message"), "{k:?}");
+            assert_eq!(app.take_selected_hint(), None, "{k:?}");
+        }
+    }
+
+    #[test]
+    fn with_copy_on_select_a_release_copies_and_shows_no_count() {
+        let mut app = inbox_app();
+        assert!(app.settings.copy_on_select);
+        ev(&mut app, DOWN, 42, 2);
+        ev(&mut app, DRAG, 60, 4);
+        ev(&mut app, UP, 60, 4);
+        draw(&app);
+        assert!(app.take_clipboard().is_some());
+        assert_eq!(app.take_selected_hint(), None);
+    }
+
+    #[test]
+    fn the_help_text_stays_selectable_below_the_settings() {
+        let mut app = new_app();
+        app.on_key(key(KeyCode::Char('?')));
+        let screen = rows(&draw(&app));
+        let y = screen.iter().position(|r| r.contains("Global")).unwrap() as u16;
+        assert!(y > crate::tui::settings::SETTINGS.len() as u16, "under the settings rows");
+        ev(&mut app, DOWN, 1, y);
+        ev(&mut app, DRAG, 6, y);
+        ev(&mut app, UP, 6, y);
+        app.on_key(mods('C', KeyModifiers::CONTROL | KeyModifiers::SHIFT));
+        draw(&app);
+        assert_eq!(app.take_clipboard().as_deref(), Some("Global"));
+        assert_eq!(app.settings, crate::tui::settings::Settings::default(), "no toggle");
+        // A drag from a settings row toggles it and selects nothing.
+        ev(&mut app, DOWN, 3, 1);
+        ev(&mut app, DRAG, 10, y);
+        ev(&mut app, UP, 10, y);
+        assert!(app.selection.is_none());
+        assert!(app.settings.copy_on_select);
     }
 }

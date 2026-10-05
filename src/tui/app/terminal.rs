@@ -19,6 +19,16 @@ use super::{App, Focus, Tab};
 const WHEEL_LINES: i16 = 3;
 
 impl App {
+    /// The OSC 52 copy (tab title, base64) the event loop should relay from
+    /// the integrated terminals to the outer clipboard: the last of this
+    /// frame's (it would overwrite the others there anyway), and only with
+    /// the `terminal_clipboard` setting on. Every session's queue is drained
+    /// either way, so a copy made while it's off isn't sent later on.
+    pub fn take_terminal_clipboard(&mut self) -> Option<(String, Vec<u8>)> {
+        let last = self.terms.take_clipboards().pop();
+        last.filter(|_| self.settings.terminal_clipboard)
+    }
+
     /// Route a key to the active terminal. Only reached with `focus ==
     /// Terminal`. `ctrl-]` / `F12` leave; on an exited session every other key
     /// is swallowed; otherwise the key is encoded (honoring the shell's
@@ -388,6 +398,23 @@ mod tests {
     use super::*;
     use crate::tui::app::test_support::*;
     use crate::tui::app::*;
+
+    #[test]
+    fn terminal_clipboard_relay_follows_the_setting_and_always_drains() {
+        let mut app = new_app();
+        app.terms.open(term_sess("web-1", "devsandbox-web-1"));
+        let copy = |app: &App, b64: &str| {
+            app.terms.active_session().unwrap().feed_output(format!("\x1b]52;c;{b64}\x07").as_bytes())
+        };
+        copy(&app, "aGk=");
+        assert_eq!(app.take_terminal_clipboard(), Some(("web-1".to_string(), b"aGk=".to_vec())), "on by default");
+        app.settings.terminal_clipboard = false;
+        copy(&app, "b2Zm");
+        assert_eq!(app.take_terminal_clipboard(), None);
+        // Drained while off: turning it on doesn't send the old copy.
+        app.settings.terminal_clipboard = true;
+        assert_eq!(app.take_terminal_clipboard(), None);
+    }
 
     #[test]
     fn mouse_click_in_panel_focuses_terminal() {

@@ -13,6 +13,7 @@ use super::data::{visible_nodes, ContainerStatus, Node, Snapshot};
 use super::procs::ProcState;
 use super::prompt::{Prompt, PromptAction};
 use super::select::{Candidate, Region, Selection};
+use super::settings::Settings;
 use super::term::TermTabs;
 
 mod actions;
@@ -33,7 +34,8 @@ pub use inbox::{
 };
 pub use actions::PendingDone;
 pub use procs::{PendingSignal, Signal};
-pub use view::{ConfigView, Modal, Pane, Side, TextModal};
+pub use selection::Extract;
+pub use view::{ConfigView, HelpModal, Modal, Pane, Side, TextModal};
 use view::{col_near, divider_pct};
 
 /// The four top-level views.
@@ -207,11 +209,20 @@ pub struct App {
     /// the `RefCell`: drawing borrows the app immutably), so a press is
     /// hit-tested against what is on screen.
     regions: RefCell<Vec<Region>>,
-    /// Set by a release ending a selection drag: the next draw reads the text
-    /// off the frame it drew into `clipboard`.
-    copy_requested: Cell<bool>,
+    /// Set by a release ending a selection drag or a copy key: the next draw
+    /// reads the text off the frame it drew, into `clipboard` to copy it, or
+    /// into `measured` for the `selected N chars` hint.
+    extract_requested: Cell<Option<Extract>>,
     /// Text the event loop owes the clipboard (OSC 52), filled by the draw.
     clipboard: RefCell<Option<String>>,
+    /// Char count of a selection released without copying (copy on select
+    /// off), filled by the draw for the event loop's status hint.
+    measured: Cell<Option<usize>>,
+    /// Dashboard settings (`settings.rs`), loaded by the event loop at
+    /// startup; the `?` modal flips them.
+    pub settings: Settings,
+    /// A toggle changed `settings` since the event loop last saved them.
+    settings_dirty: bool,
     /// The button of a press forwarded to a mouse-tracking terminal child,
     /// until its release: its drags and release go to the child too (clamped
     /// to the body when they leave it), and the press forms no selection.
@@ -256,8 +267,11 @@ impl App {
             selection: None,
             candidate: None,
             regions: RefCell::new(Vec::new()),
-            copy_requested: Cell::new(false),
+            extract_requested: Cell::new(None),
             clipboard: RefCell::new(None),
+            measured: Cell::new(None),
+            settings: Settings::default(),
+            settings_dirty: false,
             term_mouse_down: None,
             should_quit: false,
         }
@@ -403,7 +417,7 @@ impl App {
             && key.code == KeyCode::Char('c')
             && key.modifiers == KeyModifiers::CONTROL
         {
-            self.copy_requested.set(true);
+            self.extract_requested.set(Some(Extract::Copy));
             return;
         }
         // The prompt swallows every key while open, ahead of the modal and the
@@ -529,6 +543,7 @@ impl App {
     fn route_mouse(&mut self, ev: &MouseEvent, area: Rect) {
         let Modal::Config(view) = &mut self.modal else {
             self.dragging_divider = false;
+            self.help_mouse(ev, area);
             self.inbox_mouse(ev, area);
             self.tab_bar_mouse(ev, area);
             self.terminal_mouse(ev, area);
