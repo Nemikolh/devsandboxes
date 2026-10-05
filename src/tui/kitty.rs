@@ -14,6 +14,10 @@
 //! could not produce the disambiguated encodings it would advertise.
 //!
 //! Spec: <https://sw.kovidgoyal.net/kitty/keyboard-protocol/>.
+//!
+//! Being the parser's only callbacks, [`KittyState`] also carries the OSC 52
+//! clipboard relay (see `copy_to_clipboard` below), which is not a kitty
+//! feature and works whether or not the emulation is on.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -66,7 +70,8 @@ impl FlagStack {
     }
 }
 
-/// Per-session protocol state, owned by the session's `vt100::Parser`.
+/// Per-session protocol state, owned by the session's `vt100::Parser`. Also
+/// queues the child's OSC 52 clipboard writes for the event loop to relay.
 #[derive(Debug, Default)]
 pub struct KittyState {
     /// Whether to emulate at all (the outer terminal speaks the protocol).
@@ -79,6 +84,10 @@ pub struct KittyState {
     /// inside `Parser::process` under the parser lock; the reader thread takes
     /// them afterwards and writes them to the PTY.
     replies: Vec<u8>,
+    /// The child's latest OSC 52 copy, still base64, waiting for the event
+    /// loop to relay it to the outer terminal. One slot: a newer copy
+    /// replaces an unrelayed one, as it would on the clipboard anyway.
+    clipboard: Option<Vec<u8>>,
 }
 
 impl KittyState {
@@ -98,6 +107,11 @@ impl KittyState {
     /// Drain the queued query replies.
     pub fn take_replies(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.replies)
+    }
+
+    /// Take the queued clipboard copy (base64), if any.
+    pub fn take_clipboard(&mut self) -> Option<Vec<u8>> {
+        self.clipboard.take()
     }
 
     /// Forget the alternate screen's stack. Called by the reader whenever the
@@ -212,6 +226,22 @@ impl vt100::Callbacks for KittyState {
             }
             _ => {}
         }
+    }
+
+    /// OSC 52 write. vt100 has already checked `data` is base64, so it is
+    /// queued as is and relayed without decoding. Not gated by `enabled`:
+    /// that flag is about the outer terminal's keyboard protocol, which has
+    /// nothing to do with whether it accepts OSC 52. Ignored: the selector
+    /// `ty` (the relay always targets `c`), an empty payload (a "clear" with
+    /// nothing to report), and a payload over the dashboard's own copy cap,
+    /// dropped whole rather than cut since cut base64 can decode to broken
+    /// UTF-8. `paste_from_clipboard` (OSC 52 reads) is deliberately left
+    /// unanswered: an app in a container must not read the host clipboard.
+    fn copy_to_clipboard(&mut self, _: &mut vt100::Screen, _ty: &[u8], data: &[u8]) {
+        if data.is_empty() || data.len() > super::clipboard::MAX_COPY_BASE64 {
+            return;
+        }
+        self.clipboard = Some(data.to_vec());
     }
 }
 

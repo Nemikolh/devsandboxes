@@ -135,6 +135,12 @@ impl TermSession {
         &self.parser
     }
 
+    /// Take the child's latest OSC 52 copy (base64), queued by the parser's
+    /// callbacks, for the event loop to relay to the outer clipboard.
+    pub fn take_clipboard(&self) -> Option<Vec<u8>> {
+        self.parser.lock().ok()?.callbacks_mut().take_clipboard()
+    }
+
     /// Propagate a new pane size to the kernel winsize and the parser. No-op
     /// when unchanged so we don't churn on every redraw.
     pub fn resize(&mut self, rows: u16, cols: u16) {
@@ -285,6 +291,16 @@ impl TermTabs {
         for session in &mut self.sessions {
             session.resize(rows, cols);
         }
+    }
+
+    /// Drain every session's queued OSC 52 copy, in tab order, with the tab's
+    /// title for the status line. The caller relays them in order, so the
+    /// last one is what ends up on the clipboard.
+    pub fn take_clipboards(&self) -> Vec<(String, Vec<u8>)> {
+        self.sessions
+            .iter()
+            .filter_map(|s| Some((s.title.clone(), s.take_clipboard()?)))
+            .collect()
     }
 
     /// The active session, or `None` when no terminals are open.
@@ -846,6 +862,62 @@ mod tests {
         s.feed_output(b"\x1b[?1049l");
         s.feed_output(b"\x1b[?1049h\x1b[?u");
         assert_eq!(s.take_written(), b"\x1b[?0u");
+    }
+
+    #[test]
+    fn osc52_copy_is_queued_newest_wins() {
+        let s = TermSession::test_session("web-1", "devsandbox-web-1", 24, 80);
+        s.feed_output(b"\x1b]52;c;aGk=\x07");
+        assert_eq!(s.take_clipboard().as_deref(), Some(&b"aGk="[..]));
+        assert_eq!(s.take_clipboard(), None);
+        // ST terminator; a later copy replaces an unrelayed one.
+        s.feed_output(b"\x1b]52;c;b2xk\x1b\\\x1b]52;p;bmV3\x1b\\");
+        assert_eq!(s.take_clipboard().as_deref(), Some(&b"bmV3"[..]));
+        // Nothing is ever answered on the PTY.
+        assert_eq!(s.take_written(), b"");
+    }
+
+    #[test]
+    fn osc52_read_and_oversized_copy_are_ignored() {
+        let s = TermSession::test_session("web-1", "devsandbox-web-1", 24, 80);
+        s.feed_output(b"\x1b]52;c;?\x07");
+        assert_eq!(s.take_clipboard(), None);
+        assert_eq!(s.take_written(), b"");
+
+        let max = super::super::clipboard::MAX_COPY_BASE64;
+        let mut seq = b"\x1b]52;c;".to_vec();
+        seq.extend(std::iter::repeat_n(b'A', max + 4));
+        seq.push(0x07);
+        s.feed_output(&seq);
+        assert_eq!(s.take_clipboard(), None);
+        // Right at the cap still goes through.
+        seq.truncate(7 + max);
+        seq.push(0x07);
+        s.feed_output(&seq);
+        assert_eq!(s.take_clipboard().map(|c| c.len()), Some(max));
+    }
+
+    #[test]
+    fn osc52_copy_relays_without_kitty_emulation() {
+        let s = TermSession::test_session("web-1", "devsandbox-web-1", 24, 80);
+        *s.parser.lock().unwrap() = new_parser(24, 80, false);
+        s.feed_output(b"\x1b]52;c;aGk=\x07");
+        assert_eq!(s.take_clipboard().as_deref(), Some(&b"aGk="[..]));
+    }
+
+    #[test]
+    fn tabs_take_clipboards_drains_in_tab_order() {
+        let mut tabs = TermTabs::default();
+        tabs.open(sess("a", "devsandbox-a"));
+        tabs.open(sess("b", "devsandbox-b"));
+        tabs.open(sess("c", "devsandbox-c"));
+        tabs.sessions()[0].feed_output(b"\x1b]52;c;YQ==\x07");
+        tabs.sessions()[2].feed_output(b"\x1b]52;c;Yw==\x07");
+        assert_eq!(
+            tabs.take_clipboards(),
+            [("a".to_string(), b"YQ==".to_vec()), ("c".to_string(), b"Yw==".to_vec())]
+        );
+        assert!(tabs.take_clipboards().is_empty());
     }
 
     #[test]

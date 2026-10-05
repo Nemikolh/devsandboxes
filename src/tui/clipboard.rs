@@ -8,6 +8,10 @@
 /// copy was cut (see [`cap`]).
 pub const MAX_COPY: usize = 1 << 20;
 
+/// [`MAX_COPY`] as base64 length: the bound on an OSC 52 payload relayed from
+/// a terminal app, which arrives already encoded.
+pub const MAX_COPY_BASE64: usize = MAX_COPY.div_ceil(3) * 4;
+
 /// `text` cut to at most [`MAX_COPY`] bytes on a char boundary. The caller
 /// compares lengths to report a cut.
 pub fn cap(text: &str) -> &str {
@@ -25,12 +29,20 @@ pub fn cap(text: &str) -> &str {
 /// BEL`. Under tmux (`tmux`), wrapped in its DCS passthrough with every ESC
 /// doubled, so tmux hands it to the outer terminal instead of eating it.
 pub fn osc52(text: &str, tmux: bool) -> Vec<u8> {
-    let seq = format!("\x1b]52;c;{}\x07", base64(text.as_bytes()));
+    osc52_base64(base64(text.as_bytes()).as_bytes(), tmux)
+}
+
+/// [`osc52`] for a payload that is already base64, as relayed from an app in
+/// the integrated terminal: passed through untouched, never re-encoded.
+pub fn osc52_base64(b64: &[u8], tmux: bool) -> Vec<u8> {
+    let mut seq = b"\x1b]52;c;".to_vec();
+    seq.extend_from_slice(b64);
+    seq.push(0x07);
     if !tmux {
-        return seq.into_bytes();
+        return seq;
     }
     let mut out = b"\x1bPtmux;".to_vec();
-    for b in seq.bytes() {
+    for b in seq {
         if b == 0x1b {
             out.push(0x1b);
         }
@@ -84,6 +96,13 @@ mod tests {
     fn osc52_plain_and_under_tmux() {
         assert_eq!(osc52("foo", false), b"\x1b]52;c;Zm9v\x07");
         assert_eq!(osc52("foo", true), b"\x1bPtmux;\x1b\x1b]52;c;Zm9v\x07\x1b\\");
+    }
+
+    #[test]
+    fn osc52_base64_passes_payload_through() {
+        assert_eq!(osc52_base64(b"aGk=", false), b"\x1b]52;c;aGk=\x07");
+        assert_eq!(osc52_base64(b"aGk=", true), b"\x1bPtmux;\x1b\x1b]52;c;aGk=\x07\x1b\\");
+        assert_eq!(MAX_COPY_BASE64, base64(&vec![0; MAX_COPY]).len());
     }
 
     #[test]

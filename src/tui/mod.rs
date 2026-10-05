@@ -292,6 +292,16 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
                 format!("copied {n} chars")
             });
         }
+        // Apps in the integrated terminal copy with OSC 52 to *their*
+        // terminal, our vt100 emulator, whose callbacks queue it; relay it to
+        // the outer one. Several tabs copying in one frame: only the last is
+        // sent, since it would overwrite the others on the clipboard anyway.
+        if let Some((title, b64)) = app.terms.take_clipboards().pop() {
+            let mut out = io::stdout();
+            out.write_all(&clipboard::osc52_base64(&b64, std::env::var_os("TMUX").is_some()))?;
+            out.flush()?;
+            app.status = Some(format!("copied from {title}"));
+        }
 
         // Shorter cadence while terminals are open so shell echo stays snappy.
         let poll = if app.terms.is_empty() {
