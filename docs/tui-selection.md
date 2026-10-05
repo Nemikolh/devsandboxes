@@ -1,6 +1,6 @@
 # Mouse text selection in the dashboard
 
-**Status: implemented (steps 1-4).** User-facing behaviour: `docs/tui.md`,
+**Status: steps 1-4 implemented; follow-up steps 5-8 planned.** User-facing behaviour: `docs/tui.md`,
 *Mouse selection*; terminal specifics: `docs/tui-terminal.md`, *Mouse*.
 
 ## Problem
@@ -238,6 +238,115 @@ the event is forwarded instead (step 3).
   mouse (`site/`, check `docs/dashboard-docs.md`). `CHANGELOG.md` `## Unreleased`
   → one "Added" entry. **The worktree already has unrelated `CHANGELOG.md`
   edits: stage only this hunk** (`git add -p`).
+
+## Follow-up (feedback after steps 1-4)
+
+Feedback from using it:
+
+1. In the integrated terminal, selecting in a mouse-tracking app (zidane) works,
+   but its copy never reaches the clipboard. In a login shell, where our local
+   selection is used, it does. **Root cause:** a terminal app copies by sending
+   OSC 52 to *its* terminal, which here is our vt100 emulator. `KittyState`, our
+   `vt100::Callbacks` impl (`src/tui/kitty.rs:173`), doesn't implement
+   `copy_to_clipboard`, so vt100 parses the sequence (`perform.rs`, `[b"52",
+   ty, data]`) and it is dropped. Ctrl+Shift+C does reach the app: with kitty
+   flags it's encoded as `CSI 99;6u` (`kitty::encode_key`).
+2. Copy on release should be an **option, off by default**. Copy then happens
+   with Ctrl+Shift+C / Cmd+C (or Ctrl+C over a dashboard selection, for legacy
+   terminals). The dashboard has no settings yet: add them, shown in the `?`
+   modal, which becomes **Settings & help**.
+3. The review fixes go into `CHANGELOG.md`.
+4. Forward hover (button-less motion) to apps that ask for it.
+
+### Step 5: relay terminal apps' OSC 52 to the outer clipboard
+
+- `KittyState` (it's the session's only `vt100::Callbacks`) implements
+  `copy_to_clipboard(screen, ty, data)`. It queues `data`, which is already
+  base64 (vt100 checks the alphabet), in a bounded field next to `replies`,
+  e.g. `clipboard: Option<Vec<u8>>`. The newest copy wins, capped at the same
+  1 MiB as `clipboard::MAX_COPY` (base64 length ≈ 4/3 of that). The selector
+  (`ty`) is ignored and always written as `c`. This works whether or not the
+  kitty emulation is enabled: clipboard relay is not a kitty feature, so
+  `enabled` must not gate it. `paste_from_clipboard` (OSC 52 *reads*) stays
+  unanswered: a container app must not read the host clipboard.
+- `TermSession` exposes `take_clipboard() -> Option<Vec<u8>>` (locks the
+  parser, takes the field). The event loop (`src/tui/mod.rs`, next to the
+  existing `app.take_clipboard()` after `terminal.draw`) drains every session.
+  It writes the payload through a new `clipboard::osc52_base64(b64, tmux)`
+  that shares the framing and tmux wrapping with `osc52`. The status line says
+  `copied from <tab title>`. All of this stays I/O-free in `App` (go through
+  `app.terms`).
+- Gate: a setting `terminal_clipboard` (default **on**, since that's what
+  real terminals do and what the feedback expects). Step 5 lands before the
+  settings exist (step 6), so it hard-codes on; step 6 wires the setting.
+  *(Orchestrator's suggestion, not in the feedback: an app in a container
+  writing the host clipboard is worth an off switch.)*
+- Tests: feeding `\x1b]52;c;aGk=\x07` to a test session queues `aGk=`. A
+  `?` read queues nothing. The newest copy wins. Oversized payloads are
+  dropped. `osc52_base64` framing works with and without tmux.
+
+### Step 6: dashboard settings + copy-on-select option (off by default)
+
+- New `src/tui/settings.rs`: `Settings { copy_on_select: bool (false),
+  terminal_clipboard: bool (true) }`, serde with `#[serde(default)]` per field
+  so an older or partial file loads. It's persisted per user at
+  `<data>/devsandbox/dashboard.toml`, using `State::path`'s base-dir logic, like
+  `prompt::history_path` (`src/tui/prompt.rs:449`). Load once at startup;
+  a missing or invalid file means defaults, plus a status-line warning if it's
+  invalid. Save best-effort from the event loop when `App` marks the settings
+  changed, so `App` stays I/O-free.
+- `?` modal → **Settings & help** (`src/tui/app/view.rs:366` `open_help`,
+  `HELP_BODY` at `:16`, drawn by `draw_text_modal` in `src/tui/ui.rs`).
+  - A settings section on top: one row per setting, `[x] copy on select —
+    releasing a mouse selection copies it`, a cursor row, `space`/`enter`
+    toggles and saves. Below it, the existing help text, scrolling as today.
+  - Keep the help body selectable (its `Rows` region).
+  - Model it as data (a `SETTINGS` table of `(key, label, get, set)`) so a new
+    setting is one entry.
+  - Update the bottom help line for the modal (`ui.rs` ~1846).
+- Selection: on release, copy only if `copy_on_select`. Otherwise keep the
+  selection and show `selected N chars — ctrl-shift-c copies` (count from the
+  extraction, i.e. extract without sending). Step 5's relay checks
+  `terminal_clipboard`.
+- Tests: defaults, loading a partial or invalid file, a toggle marks the
+  settings for saving, release with the option off copies nothing (with the
+  hint), and with it on copies. Update the existing selection tests, which
+  assume copy on release: they set the option on, or use the key.
+
+### Step 7: hover forwarding to `AnyMotion` children
+
+- crossterm's `EnableMouseCapture` already enables `?1003`, so
+  `MouseEventKind::Moved` arrives. Today it is dropped.
+- `term::encode_mouse` (`src/tui/term.rs` ~440): motion with no button is
+  button 3 + 32 (= 35) plus the modifier bits; SGR final `M`. Sent only when
+  the mode is `AnyMotion`. `ButtonMotion` keeps dropping it.
+- `App::terminal_mouse`: forward `Moved` over the body of the active live
+  session to an `AnyMotion` child. Skip it when it's the same cell as the last
+  forwarded motion (crossterm reports every pixel-cell change; this avoids
+  duplicate reports). Nothing outside the body: there's no leave event in the
+  protocol.
+- Tests: encodings for motion, mode filtering, routing, duplicate suppression.
+
+### Step 8: CHANGELOG and docs pass
+
+- Update the selection bullet in `## Unreleased` → *Added*: copy on select is an
+  option (off by default) in the new Settings & help screen (`?`); otherwise
+  Ctrl+Shift+C / Cmd+C copies (Ctrl+C over a dashboard selection in terminals
+  that send it plain). Terminal apps can set the clipboard. Hover reaches apps
+  that ask for it.
+- *Fixed* entries for pre-existing bugs found in review:
+  - A press on the Inbox thread pane's first text column grabbed the
+    list/thread divider. It now grabs only on the borders.
+  - With help or logs open, clicks and the wheel reached the hidden integrated
+    terminal underneath.
+  - Apps in the integrated terminal never received clicks or drags, and their
+    clipboard copies (OSC 52) were dropped.
+- The tab-switch clearing and the Ctrl+C copy fixes are part of the new feature,
+  so they're covered by the *Added* bullet, not *Fixed*.
+- Docs: `docs/tui.md` (*Mouse selection*, new *Settings* section),
+  `docs/tui-terminal.md` (*Mouse*: hover, OSC 52 relay), and the site
+  (`site/src/content/docs/dashboard.mdx`: the `?` row, the drag row).
+  Run `cd site && pnpm check && pnpm build`.
 
 ## Parked (not in scope)
 
