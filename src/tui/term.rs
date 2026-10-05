@@ -424,17 +424,19 @@ pub fn encode_wheel(
 /// Encode a mouse event as the xterm report a child that enabled mouse
 /// tracking expects, at the 0-based cell `(col, row)` of the terminal body,
 /// in the child's chosen encoding. Button codes: 0/1/2 left/middle/right,
-/// +32 for a drag, 64/65 for the wheel, plus the modifier bits. A release
-/// is SGR's final `m` with the button it releases, or the legacy encodings'
-/// button 3 (they can't say which).
+/// +32 for a drag, 35 ("no button" 3, +32) for button-less motion, 64/65
+/// for the wheel, plus the modifier bits. A release is SGR's final `m` with
+/// the button it releases, or the legacy encodings' button 3 (they can't say
+/// which).
 ///
 /// `mode` filters what the child asked for: `Press` (`?9`) presses and the
 /// wheel only, `PressRelease` (`?1000`) adds releases, `ButtonMotion`
-/// (`?1002`) adds drags. `AnyMotion` (`?1003`) is treated as `ButtonMotion`:
-/// plain motion isn't forwarded. `None` for an event the mode doesn't
-/// report, an event with no report (motion, horizontal wheel), and a
-/// position the legacy encodings can't represent (they cap at 223 / 2015),
-/// where xterm drops the event too.
+/// (`?1002`) adds drags, `AnyMotion` (`?1003`) adds plain motion (hover:
+/// crossterm reports it as `Moved` because `EnableMouseCapture` turns on
+/// `?1003` in the outer terminal). `None` for an event the mode doesn't
+/// report, an event with no report (horizontal wheel), and a position the
+/// legacy encodings can't represent (they cap at 223 / 2015), where xterm
+/// drops the event too.
 ///
 /// Pure: no I/O, so the encodings are unit-tested.
 pub fn encode_mouse(
@@ -455,6 +457,7 @@ pub fn encode_mouse(
         MouseEventKind::Down(_) | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => mode != M::None,
         MouseEventKind::Up(_) => matches!(mode, M::PressRelease | M::ButtonMotion | M::AnyMotion),
         MouseEventKind::Drag(_) => matches!(mode, M::ButtonMotion | M::AnyMotion),
+        MouseEventKind::Moved => mode == M::AnyMotion,
         _ => false,
     };
     if !reported {
@@ -466,6 +469,7 @@ pub fn encode_mouse(
         MouseEventKind::Up(b) if sgr => (code(b), true),
         MouseEventKind::Up(_) => (3, true),
         MouseEventKind::Drag(b) => (code(b) + 32, false),
+        MouseEventKind::Moved => (3 + 32, false),
         MouseEventKind::ScrollUp => (64, false),
         MouseEventKind::ScrollDown => (65, false),
         _ => return None,
@@ -820,7 +824,27 @@ mod tests {
         assert_eq!(enc(Drag(MouseButton::Right), all, 0, Sgr), Some(b"\x1b[<62;1;10M".to_vec()));
         assert_eq!(enc(Up(MouseButton::Left), KeyModifiers::CONTROL, 0, Default), Some(vec![0x1b, b'[', b'M', 51, 33, 42]));
         assert_eq!(enc(Down(MouseButton::Left), none, 223, Default), None, "X10 can't reach column 224");
-        assert_eq!(enc(MouseEventKind::Moved, none, 0, Sgr), None);
+        assert_eq!(enc(MouseEventKind::Moved, none, 0, Sgr), None, "ButtonMotion drops hover");
+    }
+
+    #[test]
+    fn hover_reports_in_each_encoding() {
+        use vt100::MouseProtocolEncoding::{Default, Sgr, Utf8};
+        let enc = |mods, col, enc| {
+            encode_mouse(MouseEventKind::Moved, mods, col, 9, vt100::MouseProtocolMode::AnyMotion, enc)
+        };
+        let none = KeyModifiers::NONE;
+        // Button 3 ("none") + 32 for motion; SGR always ends in `M`.
+        assert_eq!(enc(none, 4, Sgr), Some(b"\x1b[<35;5;10M".to_vec()));
+        assert_eq!(enc(none, 4, Default), Some(vec![0x1b, b'[', b'M', 67, 37, 42]));
+        let far = |v: u8| [&b"\x1b[M"[..], &[v], 'ō'.to_string().as_bytes(), b"*"].concat();
+        assert_eq!(enc(none, 300, Utf8), Some(far(67)));
+        assert_eq!(enc(none, 223, Default), None, "X10 can't reach column 224");
+        // Modifier bits on top: shift 4, alt 8, ctrl 16.
+        assert_eq!(enc(KeyModifiers::SHIFT, 0, Sgr), Some(b"\x1b[<39;1;10M".to_vec()));
+        let all = KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL;
+        assert_eq!(enc(all, 0, Sgr), Some(b"\x1b[<63;1;10M".to_vec()));
+        assert_eq!(enc(KeyModifiers::CONTROL, 0, Default), Some(vec![0x1b, b'[', b'M', 83, 33, 42]));
     }
 
     #[test]
@@ -834,7 +858,7 @@ mod tests {
             (Press, [true, false, false, true, false]),
             (PressRelease, [true, true, false, true, false]),
             (ButtonMotion, [true, true, true, true, false]),
-            (AnyMotion, [true, true, true, true, false]),
+            (AnyMotion, [true, true, true, true, true]),
         ] {
             let got = kinds.map(|k| {
                 encode_mouse(k, KeyModifiers::NONE, 0, 0, mode, vt100::MouseProtocolEncoding::Sgr).is_some()

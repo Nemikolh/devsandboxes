@@ -5,6 +5,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use std::sync::{Mutex, Weak};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
@@ -14,7 +15,7 @@ use super::procs::ProcState;
 use super::prompt::{Prompt, PromptAction};
 use super::select::{Candidate, Region, Selection};
 use super::settings::Settings;
-use super::term::TermTabs;
+use super::term::{TermParser, TermTabs};
 
 mod actions;
 mod command_line;
@@ -227,6 +228,13 @@ pub struct App {
     /// until its release: its drags and release go to the child too (clamped
     /// to the body when they leave it), and the press forms no selection.
     term_mouse_down: Option<MouseButton>,
+    /// The last hover report sent to an `AnyMotion` terminal child: which
+    /// session (a `Weak` so a closed tab's slot can't be mistaken for a new
+    /// one) and the body cell. crossterm reports a `Moved` per pixel-cell
+    /// change in the *outer* terminal, so the same body cell repeats; this
+    /// sends each cell once. Cleared off the body and on any press, so the
+    /// next hover after either is always reported.
+    term_hover: Option<(Weak<Mutex<TermParser>>, (u16, u16))>,
     pub should_quit: bool,
 }
 
@@ -273,6 +281,7 @@ impl App {
             settings: Settings::default(),
             settings_dirty: false,
             term_mouse_down: None,
+            term_hover: None,
             should_quit: false,
         }
     }

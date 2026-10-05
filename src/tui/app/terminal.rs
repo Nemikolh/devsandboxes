@@ -1,6 +1,8 @@
 //! Integrated terminal panel: opening/targeting sessions, focus, and
 //! key/mouse routing into the active PTY.
 
+use std::sync::{Arc, Weak};
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 use ratatui::widgets::Block;
@@ -91,7 +93,8 @@ impl App {
     /// while the terminal is focused returns focus to the dashboard. The wheel
     /// goes to the active session (see [`Self::wheel_active_terminal`]), and
     /// so do the buttons while its child tracks the mouse
-    /// ([`Self::forward_terminal_mouse`]). All layout math is borrowed from
+    /// ([`Self::forward_terminal_mouse`]), and hover when it asked for any
+    /// motion ([`Self::hover_terminal`]). All layout math is borrowed from
     /// `ui` so it tracks exactly what the draw path lays out. I/O-free.
     pub(super) fn terminal_mouse(&mut self, ev: &MouseEvent, area: Rect) {
         if self.terms.is_empty() || !matches!(self.modal, Modal::None) {
@@ -100,6 +103,11 @@ impl App {
         let prompt_open = self.prompt.is_some();
         let panel = crate::tui::ui::terminal_panel_rect(area, prompt_open);
         let inside = point_in(panel, ev.column, ev.row);
+        if let MouseEventKind::Down(_) = ev.kind {
+            // The press (or the drag after it) moves the child's idea of the
+            // pointer: the next hover is news even on the old cell.
+            self.term_hover = None;
+        }
         self.forward_terminal_mouse(ev, panel);
         match ev.kind {
             MouseEventKind::Down(MouseButton::Left) => {
@@ -119,8 +127,48 @@ impl App {
             }
             MouseEventKind::ScrollUp if inside => self.wheel_active_terminal(true, ev, panel),
             MouseEventKind::ScrollDown if inside => self.wheel_active_terminal(false, ev, panel),
+            MouseEventKind::Moved => self.hover_terminal(ev, panel),
             _ => {}
         }
+    }
+
+    /// Button-less motion over the active session's body, reported to a
+    /// live child in `AnyMotion` (`?1003`: hover highlights, tooltips) at the
+    /// pane-relative cell, once per cell ([`App::term_hover`]). Off the body
+    /// (border, title row, elsewhere) nothing is sent, not even clamped as a
+    /// drag is: the protocol has no leave event, and a fake edge position
+    /// would be a lie. Leaving clears the dedupe so coming back reports. Any
+    /// other mode, or an exited session, gets nothing: [`encode_mouse`]
+    /// drops `Moved` outside `AnyMotion`. Never touches the local selection
+    /// (`selection_mouse` ignores `Moved`).
+    fn hover_terminal(&mut self, ev: &MouseEvent, panel: Rect) {
+        let body = Block::bordered().inner(panel);
+        if !point_in(body, ev.column, ev.row) {
+            self.term_hover = None;
+            return;
+        }
+        let Some(session) = self.terms.active_session_mut() else {
+            return;
+        };
+        if session.exited() {
+            return;
+        }
+        let cell = body_cell(body, ev);
+        let same_session = |w: &Weak<_>| w.upgrade().is_some_and(|p| Arc::ptr_eq(&p, session.parser()));
+        if matches!(&self.term_hover, Some((w, c)) if *c == cell && same_session(w)) {
+            return;
+        }
+        let Some((mode, encoding)) = session.parser().lock().ok().map(|p| {
+            let screen = p.screen();
+            (screen.mouse_protocol_mode(), screen.mouse_protocol_encoding())
+        }) else {
+            return;
+        };
+        let Some(bytes) = encode_mouse(ev.kind, ev.modifiers, cell.0, cell.1, mode, encoding) else {
+            return;
+        };
+        session.write_key_bytes(&bytes);
+        self.term_hover = Some((Arc::downgrade(session.parser()), cell));
     }
 
     /// Buttons for a child that enabled mouse tracking (zidane, vim
@@ -626,6 +674,68 @@ mod tests {
         let (mut app, panel) = tracking_app(b"\x1b[?1000h");
         app.terms.active_session().unwrap().set_exited();
         app.on_mouse(&mouse_at(MouseEventKind::Down(MouseButton::Left), panel.x + 2, panel.y + 2), FRAME);
+        assert!(written(&app).is_empty());
+    }
+
+    #[test]
+    fn hover_goes_to_an_any_motion_child_once_per_cell() {
+        let (mut app, panel) = tracking_app(b"\x1b[?1003h\x1b[?1006h");
+        let moved = |x, y| mouse_at(MouseEventKind::Moved, x, y);
+        // Body cell (2, 1): 1-based (3, 2) in the report.
+        let (x, y) = (panel.x + 3, panel.y + 2);
+        app.on_mouse(&moved(x, y), FRAME);
+        assert_eq!(written(&app), b"\x1b[<35;3;2M");
+        // Same cell again: suppressed. A new cell is reported.
+        app.on_mouse(&moved(x, y), FRAME);
+        assert!(written(&app).is_empty());
+        app.on_mouse(&moved(x + 1, y), FRAME);
+        assert_eq!(written(&app), b"\x1b[<35;4;2M");
+        // Border, title row, outside the panel: nothing, and leaving resets
+        // the dedupe so coming back to the same cell reports again.
+        for (bx, by) in [(panel.x, panel.y + 2), (panel.x + 5, panel.y), (0, 0)] {
+            app.on_mouse(&moved(bx, by), FRAME);
+        }
+        assert!(written(&app).is_empty());
+        app.on_mouse(&moved(x + 1, y), FRAME);
+        assert_eq!(written(&app), b"\x1b[<35;4;2M");
+        // A press resets it too (the child saw the pointer at the press).
+        app.on_mouse(&mouse_at(MouseEventKind::Down(MouseButton::Left), x + 1, y), FRAME);
+        app.on_mouse(&mouse_at(MouseEventKind::Up(MouseButton::Left), x + 1, y), FRAME);
+        assert_eq!(written(&app), b"\x1b[<0;4;2M\x1b[<0;4;2m");
+        app.on_mouse(&moved(x + 1, y), FRAME);
+        assert_eq!(written(&app), b"\x1b[<35;4;2M");
+        assert!(app.selection.is_none() && app.candidate.is_none(), "hover never selects");
+        // Modifiers ride along.
+        let mut ctrl = moved(x, y);
+        ctrl.modifiers = KeyModifiers::CONTROL;
+        app.on_mouse(&ctrl, FRAME);
+        assert_eq!(written(&app), b"\x1b[<51;3;2M");
+    }
+
+    #[test]
+    fn hover_resets_when_the_active_session_changes() {
+        let (mut app, panel) = tracking_app(b"\x1b[?1003h\x1b[?1006h");
+        let (x, y) = (panel.x + 3, panel.y + 2);
+        app.on_mouse(&mouse_at(MouseEventKind::Moved, x, y), FRAME);
+        assert_eq!(written(&app), b"\x1b[<35;3;2M");
+        app.terms.open(term_sess("api-2", "devsandbox-api-2"));
+        app.terms.active_session().unwrap().feed_output(b"\x1b[?1003h\x1b[?1006h");
+        // Same cell, other session: it hasn't seen the pointer yet.
+        app.on_mouse(&mouse_at(MouseEventKind::Moved, x, y), FRAME);
+        assert_eq!(written(&app), b"\x1b[<35;3;2M");
+    }
+
+    #[test]
+    fn hover_is_dropped_without_any_motion() {
+        for modes in [&b""[..], b"\x1b[?9h", b"\x1b[?1000h\x1b[?1006h", b"\x1b[?1002h\x1b[?1006h"] {
+            let (mut app, panel) = tracking_app(modes);
+            app.on_mouse(&mouse_at(MouseEventKind::Moved, panel.x + 3, panel.y + 2), FRAME);
+            assert!(written(&app).is_empty(), "{modes:?}");
+        }
+        // An exited AnyMotion session gets nothing either.
+        let (mut app, panel) = tracking_app(b"\x1b[?1003h");
+        app.terms.active_session().unwrap().set_exited();
+        app.on_mouse(&mouse_at(MouseEventKind::Moved, panel.x + 3, panel.y + 2), FRAME);
         assert!(written(&app).is_empty());
     }
 
