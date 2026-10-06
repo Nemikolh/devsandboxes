@@ -30,6 +30,7 @@
 //! transition and the bridge's decision stay unit-testable without a store.
 
 pub mod feed;
+pub mod form;
 pub mod message;
 pub mod ops;
 pub mod sanitize;
@@ -44,6 +45,7 @@ use serde::{Deserialize, Serialize};
 use crate::devsbd::notify::{Level, Message, Record};
 
 pub use feed::{Block, FeedItem, Field, ItemKind, Marker, MAX_FEED};
+pub use form::{Answer, FormRecord, FormState};
 pub use message::MessageSend;
 pub use sanitize::sanitize;
 pub use thread::{Action, Compose, Reply, State, ThreadPut};
@@ -129,6 +131,9 @@ pub enum EventKind {
     Done,
     /// `u` on a done thread.
     Reopen,
+    /// A form was submitted: `message`, `form`, and every question's
+    /// `answers` (defaults filled in).
+    Submit,
 }
 
 impl EventKind {
@@ -138,6 +143,7 @@ impl EventKind {
             EventKind::Reply => "reply",
             EventKind::Done => "done",
             EventKind::Reopen => "reopen",
+            EventKind::Submit => "submit",
         }
     }
 }
@@ -159,7 +165,23 @@ pub struct Event {
     pub action: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    /// `submit`: the message id and the form id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub form: Option<String>,
+    /// `submit`: [`form::answers_json`], the shape the owner receives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answers: Option<serde_json::Value>,
     pub at: u64,
+}
+
+impl Event {
+    /// An event of `kind` with no payload, not yet stamped: [`Inbox::apply`]
+    /// mints its id, seq and time under the store lock.
+    fn of(kind: EventKind) -> Event {
+        Event { id: String::new(), seq: 0, kind, action: None, text: None, message: None, form: None, answers: None, at: 0 }
+    }
 }
 
 /// A keyed record's history, or a single unkeyed record, or one owner
@@ -277,12 +299,18 @@ pub enum Op {
     /// `u`: reopen a done thread (back to `active` until the dispatcher says
     /// otherwise: it owns what the thread means).
     Reopen(u64),
+    /// Merge `answers` (any subset of the questions) into the draft of
+    /// message `message`'s open form. No event, no feed item.
+    SaveDraft { thread: u64, message: String, answers: BTreeMap<String, Answer> },
+    /// Submit message `message`'s open form: `answers` over the draft over
+    /// the defaults ([`form::resolve_submission`]).
+    Submit { thread: u64, message: String, answers: BTreeMap<String, Answer> },
 }
 
 impl Op {
     /// Whether this op enqueues an event, so only the store may apply it.
     pub fn enqueues_event(&self) -> bool {
-        matches!(self, Op::Act { .. } | Op::Reply { .. } | Op::MarkDone(_) | Op::Reopen(_))
+        matches!(self, Op::Act { .. } | Op::Reply { .. } | Op::MarkDone(_) | Op::Reopen(_) | Op::Submit { .. })
     }
 }
 
@@ -533,18 +561,17 @@ impl Inbox {
                         self.apply_sink(owner, owner_name, now, refused(at, &key, &why))
                     }
                     // A repeat is invisible; an edit is quiet (no unread, no
-                    // popup, no status line).
-                    Some(feed::Sent::Unchanged | feed::Sent::Edited) => None,
-                    Some(feed::Sent::Inserted) => {
+                    // popup, no status line), unless it opened a form.
+                    Some(feed::Sent::Unchanged | feed::Sent::Edited { form_opened: false }) => None,
+                    Some(feed::Sent::Inserted | feed::Sent::Edited { form_opened: true }) => {
                         let t = self.owner_thread(owner, &key).map(|pos| &self.threads[pos])?;
                         let summary = one_line(&text);
                         let line = match summary.is_empty() {
                             true => format!("{owner_name}: {}", t.title),
                             false => format!("{owner_name}: {} — {summary}", t.title),
                         };
-                        // A new message on a thread waiting on the user is
-                        // what earns a popup. step 15: a message bringing a
-                        // form also does, whatever the header says.
+                        // A new message (or a form entering the feed) on a
+                        // thread waiting on the user is what earns a popup.
                         let popup = (t.state == Some(State::NeedsYou)).then(|| ShownPopup {
                             key: Some(format!("thread:{key}")),
                             level: Level::Warn,
@@ -575,20 +602,21 @@ impl Inbox {
     /// (the message's time if it's new, like a put's markers). `None` when
     /// the owner has no such thread: a message needs its header first.
     ///
-    /// See [`feed::send`] for insert / replace / no-op. A new message marks
-    /// the thread unread and moves it to the top; an edit leaves both alone
-    /// (it isn't news), only refreshing `updated_at` for retention.
+    /// See [`feed::send`] for insert / replace / no-op (and what a re-send
+    /// does to a form). A new message marks the thread unread and moves it to
+    /// the top, and so does an edit that opened a form; any other edit leaves
+    /// both alone (it isn't news), only refreshing `updated_at` for retention.
     pub fn send(&mut self, owner: &str, at: u64, send: MessageSend) -> Option<feed::Sent> {
         let pos = self.owner_thread(owner, &send.thread)?;
         let mut thread = self.threads.remove(pos);
         let sent = feed::send(&mut thread.feed, &send.id, send.blocks, || self.next_id(), at);
         match sent {
             feed::Sent::Unchanged => self.threads.insert(pos, thread),
-            feed::Sent::Edited => {
+            feed::Sent::Edited { form_opened: false } => {
                 thread.updated_at = thread.updated_at.max(at);
                 self.threads.insert(pos, thread);
             }
-            feed::Sent::Inserted => {
+            feed::Sent::Inserted | feed::Sent::Edited { form_opened: true } => {
                 feed::cap(&mut thread.feed, MAX_FEED);
                 thread.unread = true;
                 thread.updated_at = thread.updated_at.max(at);
@@ -627,12 +655,14 @@ impl Inbox {
                     true => UserOp {
                         state: Some(State::Done),
                         items: vec![pressed, ItemKind::Marker(Marker::Done { client })],
-                        event: (EventKind::Done, Some(a.id.clone()), None),
+                        event: Event { action: Some(a.id.clone()), ..Event::of(EventKind::Done) },
+                        submitted: None,
                     },
                     false => UserOp {
                         state: None,
                         items: vec![pressed],
-                        event: (EventKind::Action, Some(a.id.clone()), None),
+                        event: Event { action: Some(a.id.clone()), ..Event::of(EventKind::Action) },
+                        submitted: None,
                     },
                 })
             }),
@@ -645,7 +675,8 @@ impl Inbox {
                 Some(UserOp {
                     state: None,
                     items: vec![ItemKind::Reply { text: text.clone(), client }],
-                    event: (EventKind::Reply, None, Some(text)),
+                    event: Event { text: Some(text), ..Event::of(EventKind::Reply) },
+                    submitted: None,
                 })
             }),
             // Only a real transition counts: a second `d` (or `u` on a live
@@ -654,14 +685,47 @@ impl Inbox {
                 (t.state != Some(State::Done)).then(|| UserOp {
                     state: Some(State::Done),
                     items: vec![ItemKind::Marker(Marker::Done { client })],
-                    event: (EventKind::Done, None, None),
+                    event: Event::of(EventKind::Done),
+                    submitted: None,
                 })
             }),
             Op::Reopen(thread) => self.user_op(*thread, now, |t| {
                 (t.state == Some(State::Done)).then(|| UserOp {
                     state: Some(State::Active),
                     items: vec![ItemKind::Marker(Marker::Reopen { client })],
-                    event: (EventKind::Reopen, None, None),
+                    event: Event::of(EventKind::Reopen),
+                    submitted: None,
+                })
+            }),
+            Op::SaveDraft { thread, message, answers } => {
+                let Some(t) = self.threads.iter_mut().find(|t| t.id == *thread) else { return };
+                if t.kind != Kind::Thread || t.archived {
+                    return;
+                }
+                let Some((form, record)) = feed::form_of(&t.feed, message) else { return };
+                let Ok(answers) = form::validate_draft(form, record, answers) else { return };
+                if let Some(record) = feed::form_record_mut(&mut t.feed, message) {
+                    record.draft.extend(answers);
+                }
+            }
+            Op::Submit { thread, message, answers } => self.user_op(*thread, now, |t| {
+                let (form, record) = feed::form_of(&t.feed, message)?;
+                let resolved = form::resolve_submission(form, record, answers).ok()?;
+                Some(UserOp {
+                    state: None,
+                    items: vec![ItemKind::Submission {
+                        message: message.clone(),
+                        form: form.id.clone(),
+                        answers: resolved.clone(),
+                        client: client.clone(),
+                    }],
+                    event: Event {
+                        message: Some(message.clone()),
+                        form: Some(form.id.clone()),
+                        answers: Some(form::answers_json(form, &resolved)),
+                        ..Event::of(EventKind::Submit)
+                    },
+                    submitted: Some((message.clone(), FormState::Submitted { at: now, answers: resolved, client })),
                 })
             }),
             Op::MarkNotifyRead => {
@@ -700,12 +764,17 @@ impl Inbox {
             t.state = Some(state);
         }
         t.updated_at = t.updated_at.max(now);
+        if let Some((message, state)) = op.submitted {
+            if let Some(record) = feed::form_record_mut(&mut t.feed, &message) {
+                record.state = state;
+                record.draft.clear();
+            }
+        }
         for (seq, kind) in seqs.into_iter().zip(op.items) {
             feed::push(&mut t.feed, FeedItem { seq, at: now, kind });
         }
         feed::cap(&mut t.feed, MAX_FEED);
-        let (kind, action, text) = op.event;
-        t.events.push(Event { id: event_id, seq: event_seq, kind, action, text, at: now });
+        t.events.push(Event { id: event_id, seq: event_seq, at: now, ..op.event });
         if t.events.len() > MAX_EVENTS {
             let extra = t.events.len() - MAX_EVENTS;
             t.events.drain(..extra);
@@ -977,11 +1046,13 @@ impl Inbox {
 }
 
 /// What one user op does to a thread: an optional state change, the feed
-/// items, and the event `(kind, action, text)` for the owner.
+/// items, the event for the owner (unstamped, [`Event::of`]), and a form
+/// the op submitted (message id, its new state).
 struct UserOp {
     state: Option<State>,
     items: Vec<ItemKind>,
-    event: (EventKind, Option<String>, Option<String>),
+    event: Event,
+    submitted: Option<(String, FormState)>,
 }
 
 /// `2026-10-02T12:00:01Z` for unix time `at`: the `at` of an event as the
@@ -1118,6 +1189,7 @@ fn sanitize_action(action: SinkAction) -> SinkAction {
                             .map(|f| Field { label: sanitize(&f.label), value: sanitize(&f.value) })
                             .collect(),
                     },
+                    Block::Form(f) => Block::Form(form::sanitized(f)),
                 })
                 .collect();
             let send = MessageSend { thread: sanitize(&send.thread), id: sanitize(&send.id), blocks };
@@ -1343,7 +1415,7 @@ mod tests {
         t.feed
             .iter()
             .map(|i| match &i.kind {
-                ItemKind::Message { id, blocks, edited, withdrawn } => {
+                ItemKind::Message { id, blocks, edited, withdrawn, .. } => {
                     let tags = match (edited, withdrawn) {
                         (_, true) => " (withdrawn)",
                         (true, false) => " (edited)",
@@ -1352,6 +1424,9 @@ mod tests {
                     format!("message {id}: {}{tags}", feed::markdown_of(blocks))
                 }
                 ItemKind::Reply { text, client } => format!("reply {text} [{client}]"),
+                ItemKind::Submission { message, form, answers, client } => {
+                    format!("submission {message}/{form}: {} answers [{client}]", answers.len())
+                }
                 ItemKind::Action { action, label, client } => format!("action {action} {label} [{client}]"),
                 ItemKind::Marker(Marker::Done { client }) => format!("done [{client}]"),
                 ItemKind::Marker(Marker::Reopen { client }) => format!("reopen [{client}]"),
@@ -1535,7 +1610,7 @@ mod tests {
 
         // A done thread whose owner hasn't acked its events yet is kept.
         inbox.put("web-id", "web", day, ThreadPut { state: State::Done, ..put_body("unacked") });
-        let event = Event { id: "e-0000086400-abcd".into(), seq: 0, kind: EventKind::Done, action: None, text: None, at: day };
+        let event = Event { id: "e-0000086400-abcd".into(), seq: 0, kind: EventKind::Done, action: None, text: None, message: None, form: None, answers: None, at: day };
         inbox.threads.iter_mut().find(|t| t.key.as_deref() == Some("unacked")).unwrap().events.push(event);
         assert_eq!(inbox.prune(day + RETENTION + 1), 0);
 
@@ -1739,9 +1814,9 @@ mod tests {
             SinkAction::Push(r) => r.msg,
             other => panic!("not rejected: {other:?}"),
         };
-        let unknown = r#"{"thread":"pr-1","id":"a","blocks":[{"type":"form","id":"f"}]}"#;
+        let unknown = r#"{"thread":"pr-1","id":"a","blocks":[{"type":"poll","id":"f"}]}"#;
         let msg = reject(Message::ThreadSend { at: 8, key: "pr-1".into(), id: "a".into(), body: unknown.into() });
-        assert!(msg.starts_with("thread send rejected: unknown variant `form`"), "{msg}");
+        assert!(msg.starts_with("thread send rejected: unknown variant `poll`"), "{msg}");
         let msg = reject(Message::ThreadSend { at: 8, key: "pr-2".into(), id: "a".into(), body: send_body("pr-1", "a", "x") });
         assert!(msg.contains("body thread `pr-1` is not the queued thread"), "{msg}");
         let msg = reject(Message::ThreadSend { at: 8, key: "pr-1".into(), id: "b".into(), body: send_body("pr-1", "a", "x") });
@@ -1836,6 +1911,153 @@ mod tests {
                 Block::Fields { items: vec![Field { label: "L".into(), value: "v2J".into() }] },
             ]
         );
+    }
+
+    /// A send of message `id` on `thread`: a markdown block, then `form`.
+    fn send_form(at: u64, thread: &str, id: &str, text: &str, form: &str) -> Message {
+        let body = format!(r#"{{"thread":"{thread}","id":"{id}","blocks":[{{"type":"markdown","text":"{text}"}},{form}]}}"#);
+        Message::ThreadSend { at, key: thread.into(), id: id.into(), body }
+    }
+
+    fn form_state(inbox: &Inbox, key: &str, message: &str) -> Option<FormRecord> {
+        let t = find(inbox, key).unwrap();
+        feed::form_of(&t.feed, message).map(|(_, r)| r.clone()).or_else(|| {
+            t.feed.iter().find_map(|i| match &i.kind {
+                ItemKind::Message { id, form, .. } if id == message => form.clone(),
+                _ => None,
+            })
+        })
+    }
+
+    /// Forms through the sink: a form entering the feed is news (unread, and
+    /// a popup on a needs-you thread) even as an edit; a re-send keeps the
+    /// draft answers that still fit; withdrawing withdraws the form.
+    #[test]
+    fn forms_through_the_sink() {
+        let mut inbox = Inbox::default();
+        let sink = |inbox: &mut Inbox, m: Message| inbox.apply_sink("web-id", "web", 1000, decide("web", true, m));
+        let put = r#"{"key":"pr-1","title":"PR 1","state":"needs-you"}"#;
+        sink(&mut inbox, Message::ThreadPut { at: 1, key: "pr-1".into(), body: put.into() });
+        let id = find(&inbox, "pr-1").unwrap().id;
+        sink(&mut inbox, send_msg(2, "pr-1", "run-1", "no form yet"));
+        inbox.apply(&Op::MarkRead(id), 1000, "tui");
+
+        // The same message, now with a form: unread, a status line, a popup.
+        let confirm = r#"{"type":"form","id":"f","questions":[{"id":"ok","label":"Merge?","type":"confirm"},{"id":"why","label":"Why","type":"text"}]}"#;
+        let shown = sink(&mut inbox, send_form(3, "pr-1", "run-1", "no form yet", confirm)).unwrap();
+        assert_eq!(shown.popup.unwrap().body, "PR 1\nno form yet");
+        assert!(find(&inbox, "pr-1").unwrap().unread);
+        assert_eq!(form_state(&inbox, "pr-1", "run-1"), Some(FormRecord::open("f")));
+        inbox.apply(&Op::MarkRead(id), 1000, "tui");
+        // Re-asserted: invisible.
+        assert!(sink(&mut inbox, send_form(4, "pr-1", "run-1", "no form yet", confirm)).is_none());
+
+        // A draft, then a changed form: the answer to the gone question goes.
+        let draft = [("ok".to_string(), Answer::Confirm(true)), ("why".to_string(), Answer::Text("because".into()))];
+        inbox.apply(&Op::SaveDraft { thread: id, message: "run-1".into(), answers: draft.into() }, 1000, "tui");
+        let changed = r#"{"type":"form","id":"f","questions":[{"id":"ok","label":"Merge now?","type":"confirm"}]}"#;
+        assert!(sink(&mut inbox, send_form(5, "pr-1", "run-1", "no form yet", changed)).is_none(), "a quiet edit");
+        let r = form_state(&inbox, "pr-1", "run-1").unwrap();
+        assert_eq!(r.draft, [("ok".to_string(), Answer::Confirm(true))].into());
+        assert!(!find(&inbox, "pr-1").unwrap().unread);
+
+        // Withdrawn with the message.
+        sink(&mut inbox, Message::ThreadWithdraw { at: 6, key: "pr-1".into(), id: "run-1".into() });
+        assert_eq!(form_state(&inbox, "pr-1", "run-1").unwrap().state, FormState::Withdrawn);
+        // On an active thread a new form is news but no popup.
+        let put = r#"{"key":"pr-1","title":"PR 1","state":"active"}"#;
+        sink(&mut inbox, Message::ThreadPut { at: 7, key: "pr-1".into(), body: put.into() });
+        let shown = sink(&mut inbox, send_form(8, "pr-1", "run-2", "again", confirm)).unwrap();
+        assert!(shown.popup.is_none());
+        // Form text is sanitized on the way in (escapes are a schema reject;
+        // tabs and CRs pass and are normalized).
+        let dirty = r#"{"type":"form","id":"g","title":"T\tx","questions":[{"id":"q","label":"L\tx","context":"a\r\nb","type":"confirm","yes":"Y\tx"}]}"#;
+        sink(&mut inbox, send_form(9, "pr-1", "run-3", "x", dirty));
+        let t = find(&inbox, "pr-1").unwrap();
+        let (f, _) = feed::form_of(&t.feed, "run-3").unwrap();
+        assert_eq!(f.title.as_deref(), Some("T   x"));
+        assert_eq!((f.questions[0].label.as_str(), f.questions[0].context.as_deref()), ("L   x", Some("a\nb")));
+        assert!(matches!(&f.questions[0].kind, form::QuestionKind::Confirm { yes: Some(y), .. } if y == "Y   x"));
+        let escape = r#"{"type":"form","id":"h","title":"T\u001b[1m","questions":[{"id":"q","label":"L","type":"confirm"}]}"#;
+        assert!(sink(&mut inbox, send_form(10, "pr-1", "run-4", "x", escape)).unwrap().line.contains("control character"));
+    }
+
+    /// The thread `pr-1` of `web-id`, with message `run-1` carrying the
+    /// plan's example form; its store id.
+    fn with_example_form(inbox: &mut Inbox) -> u64 {
+        inbox.apply_sink("web-id", "web", 1000, SinkAction::Put { at: 1, put: put_body("pr-1") });
+        let body = format!(r#"{{"thread":"pr-1","id":"run-1","blocks":[{}]}}"#, form::tests::EXAMPLE);
+        let SinkAction::Send { at, send } = decide("web", true, Message::ThreadSend { at: 2, key: "pr-1".into(), id: "run-1".into(), body }) else {
+            panic!("refused")
+        };
+        inbox.apply_sink("web-id", "web", 1000, SinkAction::Send { at, send });
+        find(inbox, "pr-1").unwrap().id
+    }
+
+    #[test]
+    fn drafts_merge_quietly_and_bad_ones_are_dropped() {
+        let mut inbox = Inbox::default();
+        let id = with_example_form(&mut inbox);
+        let draft = |inbox: &mut Inbox, pairs: &[(&str, Answer)]| {
+            let answers = pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+            inbox.apply(&Op::SaveDraft { thread: id, message: "run-1".into(), answers }, 50, "tui");
+        };
+        draft(&mut inbox, &[("notes", Answer::Text("a".into()))]);
+        draft(&mut inbox, &[("c-3726888733", Answer::Choice("skip".into()))]);
+        draft(&mut inbox, &[("notes", Answer::Text("b\x1b".into()))]);
+        let r = form_state(&inbox, "pr-1", "run-1").unwrap();
+        assert_eq!(
+            r.draft,
+            [("c-3726888733".to_string(), Answer::Choice("skip".into())), ("notes".to_string(), Answer::Text("b".into()))].into()
+        );
+        // A bad answer refuses the whole op; no event, no feed item ever.
+        draft(&mut inbox, &[("notes", Answer::Text("c".into())), ("c-3726888733", Answer::Choice("nope".into()))]);
+        draft(&mut inbox, &[("unknown", Answer::Text("x".into()))]);
+        assert_eq!(form_state(&inbox, "pr-1", "run-1").unwrap(), r);
+        let t = find(&inbox, "pr-1").unwrap();
+        assert!(t.events.is_empty());
+        assert_eq!(t.feed.len(), 1);
+    }
+
+    #[test]
+    fn a_submission_freezes_the_form_and_enqueues_one_event() {
+        let mut inbox = Inbox::default();
+        let id = with_example_form(&mut inbox);
+        let draft = [("notes".to_string(), Answer::Text("from the draft".into()))].into();
+        inbox.apply(&Op::SaveDraft { thread: id, message: "run-1".into(), answers: draft }, 50, "tui");
+        // Missing required answers or a bad value: nothing happens.
+        let given = [("c-3726888733".to_string(), Answer::Choice("nope".into()))].into();
+        inbox.apply(&Op::Submit { thread: id, message: "run-1".into(), answers: given }, 60, "tui");
+        assert!(find(&inbox, "pr-1").unwrap().events.is_empty());
+
+        let given = [("c-3726888733".to_string(), Answer::Choice("skip".into()))].into();
+        inbox.apply(&Op::Submit { thread: id, message: "run-1".into(), answers: given }, 70, "api:x");
+        let t = find(&inbox, "pr-1").unwrap();
+        let reply = "Already batched in `flush()` (src/cost.ts:88), so this would double-buffer.";
+        let answers = serde_json::json!({"c-3726888733": "skip", "c-3726888733-text": reply, "notes": "from the draft"});
+        let [e] = &t.events[..] else { panic!("{:?}", t.events) };
+        assert_eq!(e.kind, EventKind::Submit);
+        assert_eq!((e.message.as_deref(), e.form.as_deref(), e.answers.as_ref(), e.at), (Some("run-1"), Some("drafts"), Some(&answers), 70));
+        assert_eq!(feed(t).last().unwrap(), "submission run-1/drafts: 3 answers [api:x]");
+        let r = form_state(&inbox, "pr-1", "run-1").unwrap();
+        let FormState::Submitted { at: 70, client, answers: stored } = &r.state else { panic!("{r:?}") };
+        assert_eq!(client, "api:x");
+        assert_eq!(form::answers_json(&form::tests::example(), stored), answers);
+        assert!(r.draft.is_empty());
+
+        // Closed: no second submission, no draft.
+        inbox.apply(&Op::Submit { thread: id, message: "run-1".into(), answers: BTreeMap::new() }, 80, "tui");
+        let notes = [("notes".to_string(), Answer::Text("late".into()))].into();
+        inbox.apply(&Op::SaveDraft { thread: id, message: "run-1".into(), answers: notes }, 80, "tui");
+        let t = find(&inbox, "pr-1").unwrap();
+        assert_eq!(t.events.len(), 1);
+        assert_eq!(form_state(&inbox, "pr-1", "run-1").unwrap(), r);
+        // Unknown message: a no-op.
+        inbox.apply(&Op::Submit { thread: id, message: "nope".into(), answers: BTreeMap::new() }, 80, "tui");
+        assert_eq!(find(&inbox, "pr-1").unwrap().events.len(), 1);
+        // The event never says which client.
+        let json = serde_json::to_string(&find(&inbox, "pr-1").unwrap().events).unwrap();
+        assert!(!json.contains("api:x"), "{json}");
     }
 
     #[test]

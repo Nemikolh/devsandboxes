@@ -208,6 +208,14 @@ fn op_call(op: &Op) -> (&'static str, Value) {
         Op::Reply { thread, text } => ("inbox.thread.reply", json!({ "thread": thread, "text": text })),
         Op::MarkDone(id) => ("inbox.thread.done", json!({ "thread": id })),
         Op::Reopen(id) => ("inbox.thread.reopen", json!({ "thread": id })),
+        Op::SaveDraft { thread, message, answers } => (
+            "inbox.form.saveDraft",
+            json!({ "thread": thread, "message": message, "answers": inbox::form::partial_json(answers) }),
+        ),
+        Op::Submit { thread, message, answers } => (
+            "inbox.form.submit",
+            json!({ "thread": thread, "message": message, "answers": inbox::form::partial_json(answers) }),
+        ),
     }
 }
 
@@ -545,6 +553,16 @@ mod tests {
             (Op::Reply { thread: 6, text: "hi".into() }, "inbox.thread.reply", json!({"thread": 6, "text": "hi"})),
             (Op::MarkDone(7), "inbox.thread.done", json!({"thread": 7})),
             (Op::Reopen(8), "inbox.thread.reopen", json!({"thread": 8})),
+            (
+                Op::SaveDraft { thread: 9, message: "m".into(), answers: [("q".to_string(), inbox::Answer::Choices(vec!["a".into()]))].into() },
+                "inbox.form.saveDraft",
+                json!({"thread": 9, "message": "m", "answers": {"q": ["a"]}}),
+            ),
+            (
+                Op::Submit { thread: 9, message: "m".into(), answers: [("q".to_string(), inbox::Answer::Confirm(true))].into() },
+                "inbox.form.submit",
+                json!({"thread": 9, "message": "m", "answers": {"q": true}}),
+            ),
         ];
         for (op, method, params) in cases {
             assert_eq!(op_call(&op), (method, params), "{op:?}");
@@ -569,6 +587,9 @@ mod tests {
                 ..ThreadPut::default()
             };
             store::update_at(path, |i| i.put("d-id", "d", 1, put)).unwrap();
+            let blocks = vec![inbox::Block::Form(inbox::form::tests::mixed())];
+            let send = inbox::MessageSend { thread: "k".into(), id: "m".into(), blocks };
+            store::update_at(path, |i| i.send("d-id", 1, send)).unwrap();
             let record = Record { level: Level::Info, key: None, link: None, msg: "n".into(), at: 1 };
             store::update_at(path, |i| i.push("w-id".into(), "w".into(), record, true)).unwrap();
         };
@@ -586,6 +607,8 @@ mod tests {
             Op::Reply { thread, text: "hi".into() },
             Op::MarkDone(thread),
             Op::Reopen(thread),
+            Op::SaveDraft { thread, message: "m".into(), answers: [("pick".to_string(), inbox::Answer::Choice("a".into()))].into() },
+            Op::Submit { thread, message: "m".into(), answers: [("note".to_string(), inbox::Answer::Text("hi".into()))].into() },
             Op::MarkNotifyRead,
             Op::RemoveThread(note),
             Op::ClearNotify,
@@ -600,7 +623,7 @@ mod tests {
             let i = inbox::ops::load(path).unwrap();
             let events = inbox::ops::events(path, "d-id").unwrap();
             let t: Vec<_> = i.threads.iter().map(|t| (t.id, t.kind, t.state, t.unread, t.feed.iter().map(|f| f.kind.clone()).collect::<Vec<_>>())).collect();
-            let e: Vec<_> = events.into_iter().map(|(_, e)| (e.kind.as_str().to_string(), e.action, e.text)).collect();
+            let e: Vec<_> = events.into_iter().map(|(_, e)| (e.kind.as_str().to_string(), e.action, e.text, e.message, e.form, e.answers)).collect();
             format!("{t:?} {e:?}")
         };
         assert_eq!(strip(&via_api), strip(&via_ops));

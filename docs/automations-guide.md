@@ -270,10 +270,83 @@ Blocks, by `type`:
 |---|---|---|---|
 | `markdown` | `text` | markdown, like a `notify` body | non-empty, 16 KiB |
 | `fields` | `items`: `[{ "label", "value" }]` | aligned `label  value` rows | 1–20 items; one-line `label` (non-empty, 60 bytes) and `value` (200 bytes) |
+| `form` | see [Forms](#forms) | questions the user answers and submits | one per message |
 
 Unknown fields and unknown block types are rejected, as are control characters other than newline (and newlines in a field). The helper checks the JSON syntax, `thread`, `id` and the 48 KiB budget before queuing (exit 2, nothing queued); the dashboard checks the rest and reports a reject as an `error` notification, `thread send rejected: <why>`, like a bad put.
 
-`thread ls --feed` lists each thread's messages as `"messages": [{ "id", "at", "blocks", "edited", "withdrawn" }]` (your messages only, not the user's replies), `blocks` in the shape you sent them, so a dispatcher that lost its state can see what it already said. On an older helper `thread send` fails with `unknown verb`; check with `devsbd features | grep -qx thread-send` (an older helper has no `features` either and prints nothing to stdout).
+`thread ls --feed` lists each thread's messages as `"messages": [{ "id", "at", "blocks", "edited", "withdrawn", "form"? }]` (your messages only, not the user's replies), `blocks` in the shape you sent them, so a dispatcher that lost its state can see what it already said. On an older helper `thread send` fails with `unknown verb`; check with `devsbd features | grep -qx thread-send` (an older helper has no `features` either and prints nothing to stdout).
+
+### Forms
+
+A `form` block asks the user questions they answer and submit once; you get one `submit` event with every answer. Labels below are the PR babysitter's own wording:
+
+```json
+{
+  "type": "form",
+  "id": "drafts",
+  "title": "Replies to post",
+  "submit": "Post replies",
+  "questions": [
+    {
+      "id": "c-3726888733",
+      "label": "greptile on `src/cost.ts:42`",
+      "context": "> Consider batching these writes.\n\nNot changed: writes are already batched in `flush()`.",
+      "type": "choice",
+      "options": [
+        { "id": "post", "label": "Post the reply" },
+        { "id": "skip", "label": "Don't reply" }
+      ],
+      "default": "post"
+    },
+    {
+      "id": "c-3726888733-text",
+      "label": "Reply",
+      "type": "text",
+      "multiline": true,
+      "default": "Already batched in `flush()` (src/cost.ts:88), so this would double-buffer.",
+      "placeholder": "Reply to post on the comment"
+    },
+    {
+      "id": "notes",
+      "label": "Anything else for the agent?",
+      "type": "text",
+      "multiline": true,
+      "required": false,
+      "placeholder": "Leave empty to just post"
+    }
+  ]
+}
+```
+
+| field | meaning | limit |
+|---|---|---|
+| `id` | the form's id | lowercase letters, digits, `-`, 1–60 chars |
+| `title` | optional heading | one line, 200 bytes |
+| `submit` | the submit button's label, default `Submit` | one line, 40 bytes |
+| `questions` | what to ask, in order | 1–30 |
+
+Every question has an `id` (unique in the form, same rule as the form's), a `label` (inline markdown, one line, 200 bytes), an optional `context` (markdown shown above the input, 4 KiB) and `required` (default `true` for `choice` and `confirm`, `false` for `text`). By `type`:
+
+| type | fields | answer |
+|---|---|---|
+| `choice` | `options`: 1–20 `{ "id", "label", "description"? }` (one-line `label` 200 bytes, `description` 4 KiB); `multiple` (default `false`); `default`: an option id, or an array of ids when `multiple` | the option id; an array of ids when `multiple` |
+| `text` | `placeholder` (200 bytes), `default` (prefilled and editable: how you offer a draft for editing), `multiline` (default `false`), `max` (1–8192 bytes, default 2048) | the text |
+| `confirm` | `yes` / `no` labels (one line, 40 bytes), `default` (`true`/`false`) | `true` or `false` |
+
+One form per message. Defaults must be valid answers (known option ids, an array exactly when `multiple`, text within `max`, no newline in a single-line default). Unknown fields and question types are rejected like any other bad send.
+
+**Lifecycle**, kept by the host:
+
+- A form is **open** from the send that brings it. A message bringing a form into the feed (a new message, or a re-send adding one) marks the thread unread and pops up when the thread is `needs-you`.
+- While open, the user's half-filled answers are a **draft** stored with the message in the host, so any dashboard or API client sees the same one. Re-sending the message (same `id`) with a changed form replaces the form and keeps only the draft answers that still fit (same question id, same type, a valid value). Re-sending it without the form, or withdrawing the message, **withdraws** the form.
+- **Submitted** once, it is **frozen**: re-sending its message can still change the other blocks (tagged "edited"), but the form block you send is ignored and the stored form keeps the user's answers. Re-sending your original message stays a no-op, so a re-asserting dispatcher changes nothing. A form can't be submitted twice: send a new message for another round.
+- Like the rest of the feed, the 300-items-per-thread cap never drops a message whose form is still open.
+
+The submission arrives as one event (below), `answers` keyed by question id with **every** question present and defaults filled in: you never merge defaults yourself. An optional text left empty is `""`, an optional `multiple` choice with no pick `[]`, an optional choice or confirm left unanswered `null`.
+
+`thread ls --feed` gives each message that has carried a form a `"form": { "id", "state", "answers"? }`: `state` is `open`, `submitted` or `withdrawn`, and `answers` (only when submitted) is what the `submit` event carried, so a dispatcher that lost its state, or acked nothing yet, can recover the answers.
+
+API clients answer forms with `inbox.form.saveDraft` and `inbox.form.submit` (docs/api.md). The dashboard shows a form as a one-line placeholder until its form UI lands.
 
 ### Events
 
@@ -288,6 +361,7 @@ devsbd events ack <id>...
 {"id":"e-1790900001-3f2a","key":"pr-6900","kind":"action","action":"post","at":"2026-10-02T12:00:01Z"}
 {"id":"e-1790900042-77c1","key":"pr-6900","kind":"reply","text":"Also rename the event to agent_run.cost","at":"2026-10-02T12:00:42Z"}
 {"id":"e-1790900050-0b9e","key":"pr-6900","kind":"done","action":"done","at":"2026-10-02T12:00:50Z"}
+{"id":"e-1790900061-5d10","key":"pr-6900","kind":"submit","message":"run-1791277117","form":"drafts","answers":{"c-3726888733":"post","c-3726888733-text":"Already batched…","notes":""},"at":"2026-10-02T12:01:01Z"}
 ```
 
 | `kind` | sent when | extra field |
@@ -296,6 +370,7 @@ devsbd events ack <id>...
 | `reply` | `r` in the pane, then `enter` (trimmed, at most 2000 chars) | `text` |
 | `done` | `d` on the thread (list or pane), or a `done: true` button | `action`: the button's `id`, only from a button |
 | `reopen` | `u` in the pane on a done thread (it goes back to `active`) | |
+| `submit` | a form was submitted ([Forms](#forms)) | `message`, `form`: the message's and the form's ids; `answers`: every question's answer |
 
 `at` is RFC 3339 UTC, by the host's clock. `d` and `u` only send an event when they change something (`d` on a done thread, `u` on a live one, do nothing). Each event also adds a timeline entry, and the pane shows how many are still waiting for you. Archived threads take no events.
 

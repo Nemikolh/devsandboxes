@@ -45,13 +45,16 @@
 //! {"id":"e-1790900042-77c1","key":"pr-6900","kind":"reply","text":"…","at":"2026-10-02T12:00:42Z"}
 //! ```
 //!
-//! `kind` is action|reply|done|reopen; `action` (the button's id: an
-//! `action`, or a `done` from a `done: true` button) and `text` (a `reply`)
-//! are left out when absent; `at` is RFC 3339 UTC. With a `timeout`, an empty
-//! queue is waited on up to that many seconds (at most [`MAX_WAIT`]); the
-//! body stays empty if nothing arrives. `thread-ls` answers the requester's
-//! live threads in `thread put` shape; with `feed`, each also carries
-//! `"messages"`: the owner's messages, `{id, at, blocks, edited, withdrawn}`.
+//! `kind` is action|reply|done|reopen|submit; `action` (the button's id: an
+//! `action`, or a `done` from a `done: true` button), `text` (a `reply`) and
+//! `message`, `form`, `answers` (a `submit`: every question's answer, by
+//! question id) are left out when absent; `at` is RFC 3339 UTC. With a
+//! `timeout`, an empty queue is waited on up to that many seconds (at most
+//! [`MAX_WAIT`]); the body stays empty if nothing arrives. `thread-ls`
+//! answers the requester's live threads in `thread put` shape; with `feed`,
+//! each also carries `"messages"`: the owner's messages, `{id, at, blocks,
+//! edited, withdrawn}`, plus `form: {id, state, answers?}` on one that has
+//! carried a form.
 //!
 //! Unknown keys, repeats of a non-repeatable key, a missing required key, or
 //! a bad escape are decode errors.

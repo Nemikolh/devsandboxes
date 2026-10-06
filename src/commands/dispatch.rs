@@ -413,6 +413,12 @@ struct EventLine<'a> {
     action: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     text: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    form: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    answers: Option<&'a serde_json::Value>,
     at: String,
 }
 
@@ -428,6 +434,9 @@ fn events_body(pending: &[(String, Event)]) -> String {
             kind: e.kind.as_str(),
             action: e.action.as_deref(),
             text: e.text.as_deref(),
+            message: e.message.as_deref(),
+            form: e.form.as_deref(),
+            answers: e.answers.as_ref(),
             at: crate::inbox::rfc3339(e.at),
         };
         let Ok(json) = serde_json::to_string(&line) else { continue };
@@ -492,11 +501,40 @@ struct MessageRow<'a> {
     blocks: &'a [crate::inbox::Block],
     edited: bool,
     withdrawn: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    form: Option<FormRow<'a>>,
 }
 
-/// The owner's messages in `t`'s feed, first-insert order. Replies, actions
-/// and markers are the user's or the host's, not what the owner sent; form
-/// submissions join with forms (step 15).
+/// A message's form as `thread ls --feed` lists it: enough for a
+/// dispatcher that lost its state to see what the user already answered.
+#[derive(serde::Serialize)]
+struct FormRow<'a> {
+    id: &'a str,
+    /// `open` | `submitted` | `withdrawn`.
+    state: &'static str,
+    /// When submitted: the answers, as the `submit` event carried them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    answers: Option<serde_json::Value>,
+}
+
+impl<'a> FormRow<'a> {
+    fn of(r: &'a crate::inbox::FormRecord, blocks: &[crate::inbox::Block]) -> Self {
+        use crate::inbox::{form, FormState};
+        let answers = match &r.state {
+            FormState::Submitted { answers, .. } => Some(match form::form_in(blocks) {
+                Some(f) => form::answers_json(f, answers),
+                None => form::partial_json(answers),
+            }),
+            _ => None,
+        };
+        FormRow { id: &r.id, state: r.state.as_str(), answers }
+    }
+}
+
+/// The owner's messages in `t`'s feed, first-insert order, each with its
+/// form's state. Replies, actions, submissions and markers are the user's
+/// or the host's, not what the owner sent (a submission's answers are on
+/// its message's `form`).
 fn message_rows(t: &crate::inbox::Thread) -> Vec<MessageRow<'_>> {
     t.feed
         .iter()
@@ -504,9 +542,14 @@ fn message_rows(t: &crate::inbox::Thread) -> Vec<MessageRow<'_>> {
             // v2 put compat, removed in step 13b: the header message is the
             // put's `message`, already in the row.
             crate::inbox::ItemKind::Message { id, .. } if id == crate::inbox::feed::HEADER_MESSAGE => None,
-            crate::inbox::ItemKind::Message { id, blocks, edited, withdrawn } => {
-                Some(MessageRow { id, at: i.at, blocks, edited: *edited, withdrawn: *withdrawn })
-            }
+            crate::inbox::ItemKind::Message { id, blocks, edited, withdrawn, form } => Some(MessageRow {
+                id,
+                at: i.at,
+                blocks,
+                edited: *edited,
+                withdrawn: *withdrawn,
+                form: form.as_ref().map(|r| FormRow::of(r, blocks)),
+            }),
             _ => None,
         })
         .collect()
@@ -2382,6 +2425,58 @@ folder = "."
         assert_eq!((resp.status, resp.body.as_str()), (Status::Usage, "`events` takes no `feed`"));
     }
 
+    /// A form's submission reaches the owner as one `submit` line with every
+    /// answer and no client, and `thread ls --feed` shows each form's state
+    /// (answers once submitted), so a dispatcher can recover.
+    #[test]
+    fn forms_show_in_events_and_thread_ls() {
+        use crate::inbox::{message, Answer, Op as InboxOp};
+        let s = state();
+        let (path, mut fake) = inbox_fake("forms");
+        let form = |id: &str| {
+            format!(
+                r#"{{"type":"form","id":"{id}","questions":[{{"id":"ok","label":"Merge?","type":"confirm"}},{{"id":"why","label":"Why","type":"text"}},{{"id":"pick","label":"P","type":"choice","required":false,"options":[{{"id":"a","label":"A"}}]}}]}}"#
+            )
+        };
+        store::update_at(&path, |i| {
+            for (msg, f) in [("run-1", "f1"), ("run-2", "f2"), ("run-3", "f3")] {
+                let body = format!(r#"{{"thread":"pr-1","id":"{msg}","blocks":[{}]}}"#, form(f));
+                i.send("d", 5, message::parse(&body).unwrap());
+            }
+            i.withdraw("d", "pr-1", "run-3");
+            let id = i.threads.iter().find(|t| t.owner == "d").unwrap().id;
+            let answers = [("ok".to_string(), Answer::Confirm(true))].into();
+            i.apply(&InboxOp::Submit { thread: id, message: "run-1".into(), answers }, 1_790_900_001, "api:some-gui");
+        })
+        .unwrap();
+
+        let resp = call(&s, "d", &Request::new(Op::Events), &mut fake);
+        assert_eq!(resp.status, Status::Ok, "{resp:?}");
+        let mut got = lines(&resp);
+        assert_eq!(got.len(), 1, "{}", resp.body);
+        assert!(control::valid_event_id(got[0]["id"].as_str().unwrap()));
+        got[0].as_object_mut().unwrap().remove("id");
+        assert_eq!(
+            got[0],
+            serde_json::json!({"key": "pr-1", "kind": "submit", "message": "run-1", "form": "f1",
+                "answers": {"ok": true, "why": "", "pick": null}, "at": "2026-10-02T00:13:21Z"})
+        );
+        assert!(!resp.body.contains("client") && !resp.body.contains("some-gui"), "{}", resp.body);
+
+        let resp = call(&s, "d", &Request { feed: true, ..Request::new(Op::ThreadLs) }, &mut fake);
+        let got: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        let forms: Vec<_> = got[0]["messages"].as_array().unwrap().iter().map(|m| m["form"].clone()).collect();
+        assert_eq!(
+            forms,
+            [
+                serde_json::json!({"id": "f1", "state": "submitted", "answers": {"ok": true, "why": "", "pick": null}}),
+                serde_json::json!({"id": "f2", "state": "open"}),
+                serde_json::json!({"id": "f3", "state": "withdrawn"}),
+            ]
+        );
+        assert!(!resp.body.contains("some-gui"), "{}", resp.body);
+    }
+
     #[test]
     fn events_body_stops_at_the_size_cap() {
         let big = "x".repeat(1000);
@@ -2393,6 +2488,9 @@ folder = "."
                     kind: crate::inbox::EventKind::Reply,
                     action: None,
                     text: Some(big.clone()),
+                    message: None,
+                    form: None,
+                    answers: None,
                     at: 0,
                 };
                 ("k".to_string(), e)

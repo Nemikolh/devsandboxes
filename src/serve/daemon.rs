@@ -817,7 +817,7 @@ pub(crate) mod tests {
             reader.read_line(&mut out).unwrap();
             serde_json::from_str::<Value>(&out).unwrap()
         };
-        let r = ask(r#"{"id":7,"method":"inbox.form.submit"}"#);
+        let r = ask(r#"{"id":7,"method":"inbox.poll.vote"}"#);
         assert_eq!(r["id"], 7);
         assert_eq!(r["error"]["code"], "unknown-method");
         let r = ask("not json");

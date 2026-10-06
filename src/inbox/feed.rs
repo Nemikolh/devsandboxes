@@ -5,8 +5,9 @@
 //! is not in the feed; a put only leaves a marker when its state or status
 //! changes.
 //!
-//! Submissions (a form's answers) join the feed with forms (step 15); there
-//! is no variant for them yet.
+//! A message may carry a form (`form.rs`): its lifecycle and draft live on
+//! the message item ([`ItemKind::Message::form`]), and the user's answers
+//! join the feed as a **submission**.
 //!
 //! Every user item records the client that made it (`tui`, `cli`,
 //! `api:<name>`) for the user's own audit. It stays in the store: events and
@@ -17,6 +18,9 @@
 
 use serde::{Deserialize, Serialize};
 
+use std::collections::BTreeMap;
+
+use super::form::{self, Answer, Form, FormRecord};
 use super::State;
 
 /// Feed items kept per thread; past it, [`cap`] drops the least valuable.
@@ -49,23 +53,31 @@ pub enum ItemKind {
         /// The owner took it back; kept so the story stays readable.
         #[serde(default)]
         withdrawn: bool,
+        /// Set once the message has carried a form: its state and draft.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        form: Option<FormRecord>,
     },
     /// The user's free text from the composer.
     Reply { text: String, client: String },
+    /// The user submitted form `form` of message `message`: the complete
+    /// answers, as the owner's event carried them.
+    Submission { message: String, form: String, answers: BTreeMap<String, Answer>, client: String },
     /// The user pressed a header button: its id and its label at the time.
     Action { action: String, label: String, client: String },
     Marker(Marker),
 }
 
-/// A message block (docs/inbox-redesign.md, *Messages*); `form` arrives with
-/// forms (step 15). Serialized in the same shape `thread send` takes, so
-/// `thread ls --feed` hands an owner back what it sent.
+/// A message block (docs/inbox-redesign.md, *Messages*). Serialized in the
+/// same shape `thread send` takes, so `thread ls --feed` hands an owner back
+/// what it sent.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Block {
     Markdown { text: String },
     /// A compact key/value list.
     Fields { items: Vec<Field> },
+    /// Questions for the user (`form.rs`); at most one per message.
+    Form(Form),
 }
 
 /// One row of a [`Block::Fields`].
@@ -90,7 +102,8 @@ impl FeedItem {
     /// A message of one markdown block (the only block there is yet).
     pub fn markdown(seq: u64, at: u64, id: &str, text: &str) -> FeedItem {
         let blocks = vec![Block::Markdown { text: text.to_string() }];
-        FeedItem { seq, at, kind: ItemKind::Message { id: id.to_string(), blocks, edited: false, withdrawn: false } }
+        let kind = ItemKind::Message { id: id.to_string(), blocks, edited: false, withdrawn: false, form: None };
+        FeedItem { seq, at, kind }
     }
 
     fn is_marker(&self) -> bool {
@@ -100,6 +113,29 @@ impl FeedItem {
     fn is_message(&self) -> bool {
         matches!(self.kind, ItemKind::Message { .. })
     }
+
+    /// A message whose form still waits for the user: [`cap`] never drops it.
+    fn has_open_form(&self) -> bool {
+        matches!(&self.kind, ItemKind::Message { form: Some(r), .. } if r.is_open())
+    }
+}
+
+/// Message `id`'s form and its record, when it has a form block.
+pub fn form_of<'a>(feed: &'a [FeedItem], id: &str) -> Option<(&'a Form, &'a FormRecord)> {
+    feed.iter().find_map(|i| match &i.kind {
+        ItemKind::Message { id: have, blocks, form: Some(record), .. } if have == id => {
+            form::form_in(blocks).map(|f| (f, record))
+        }
+        _ => None,
+    })
+}
+
+/// Message `id`'s form record, to change it.
+pub fn form_record_mut<'a>(feed: &'a mut [FeedItem], id: &str) -> Option<&'a mut FormRecord> {
+    feed.iter_mut().find_map(|i| match &mut i.kind {
+        ItemKind::Message { id: have, form: Some(record), .. } if have == id => Some(record),
+        _ => None,
+    })
 }
 
 /// A message's markdown blocks joined by a blank line (other blocks left
@@ -109,7 +145,7 @@ pub fn markdown_of(blocks: &[Block]) -> String {
         .iter()
         .filter_map(|b| match b {
             Block::Markdown { text } => Some(text.as_str()),
-            Block::Fields { .. } => None,
+            Block::Fields { .. } | Block::Form(_) => None,
         })
         .collect::<Vec<_>>()
         .join("\n\n")
@@ -121,7 +157,9 @@ pub enum Sent {
     /// Same id, same blocks, not withdrawn: nothing to do.
     Unchanged,
     /// Same id, replaced in place (`edited`), or a withdrawn one sent again.
-    Edited,
+    /// `form_opened`: it brought a form where none was open (news, like an
+    /// insert).
+    Edited { form_opened: bool },
     /// A new id, appended.
     Inserted,
 }
@@ -133,21 +171,34 @@ pub enum Sent {
 /// A withdrawn message sent again comes back, replaced and `edited` even with
 /// the same blocks: it was gone from the reader's view, so it changed. `seq`
 /// is only called for an insert, so a no-op mints no id.
+///
+/// A form block moves the message's form record ([`form::resend`]): a
+/// re-send while open replaces the form and prunes the draft, one without
+/// the form withdraws it, and a **submitted form is frozen**: the re-send's
+/// form block is ignored and the stored form keeps its answers, so a
+/// dispatcher re-asserting its original message stays a no-op.
 pub fn send(feed: &mut Vec<FeedItem>, id: &str, blocks: Vec<Block>, seq: impl FnOnce() -> u64, at: u64) -> Sent {
     let existing = feed.iter_mut().find_map(|i| match &mut i.kind {
-        ItemKind::Message { id: have, blocks, edited, withdrawn } if have == id => Some((blocks, edited, withdrawn)),
+        ItemKind::Message { id: have, blocks, edited, withdrawn, form } if have == id => {
+            Some((blocks, edited, withdrawn, form))
+        }
         _ => None,
     });
     match existing {
-        Some((have, _, withdrawn)) if *have == blocks && !*withdrawn => Sent::Unchanged,
-        Some((have, edited, withdrawn)) => {
-            *have = blocks;
+        Some((have, edited, withdrawn, record)) => {
+            let resent = form::resend(have, record.as_ref(), blocks);
+            if resent.blocks == *have && resent.record == *record && !*withdrawn {
+                return Sent::Unchanged;
+            }
+            *have = resent.blocks;
+            *record = resent.record;
             *edited = true;
             *withdrawn = false;
-            Sent::Edited
+            Sent::Edited { form_opened: resent.opened }
         }
         None => {
-            let kind = ItemKind::Message { id: id.to_string(), blocks, edited: false, withdrawn: false };
+            let form = form::form_in(&blocks).map(|f| FormRecord::open(&f.id));
+            let kind = ItemKind::Message { id: id.to_string(), blocks, edited: false, withdrawn: false, form };
             push(feed, FeedItem { seq: seq(), at, kind });
             Sent::Inserted
         }
@@ -155,12 +206,16 @@ pub fn send(feed: &mut Vec<FeedItem>, id: &str, blocks: Vec<Block>, seq: impl Fn
 }
 
 /// Withdraw owner message `id`: tagged `withdrawn` and kept, so the story
-/// stays readable. Whether anything changed (an unknown or already withdrawn
-/// id is a no-op).
+/// stays readable; an open form on it is withdrawn too (a submitted one
+/// keeps its answers). Whether anything changed (an unknown or already
+/// withdrawn id is a no-op).
 pub fn withdraw(feed: &mut [FeedItem], id: &str) -> bool {
     feed.iter_mut().any(|i| match &mut i.kind {
-        ItemKind::Message { id: have, withdrawn, .. } if have == id && !*withdrawn => {
+        ItemKind::Message { id: have, withdrawn, form, .. } if have == id && !*withdrawn => {
             *withdrawn = true;
+            if let Some(record) = form {
+                record.withdraw();
+            }
             true
         }
         _ => false,
@@ -192,16 +247,18 @@ pub fn push(feed: &mut Vec<FeedItem>, item: FeedItem) {
 }
 
 /// Bring `feed` down to `max` items: the oldest markers go first, then the
-/// oldest messages, then the oldest replies and actions (the user's own
-/// words outlast the owner's narration, which it can re-send).
+/// oldest messages, then the oldest replies, actions and submissions (the
+/// user's own words outlast the owner's narration, which it can re-send).
+/// A message whose form is open is never dropped: it is still waiting on
+/// the user. Past only those, the cap goes soft.
 pub fn cap(feed: &mut Vec<FeedItem>, max: usize) {
     while feed.len() > max {
         let pos = feed
             .iter()
             .position(FeedItem::is_marker)
-            // step 15: skip messages with an open form.
-            .or_else(|| feed.iter().position(FeedItem::is_message))
-            .unwrap_or(0);
+            .or_else(|| feed.iter().position(|i| i.is_message() && !i.has_open_form()))
+            .or_else(|| feed.iter().position(|i| !i.has_open_form()));
+        let Some(pos) = pos else { return };
         feed.remove(pos);
     }
 }
@@ -250,7 +307,7 @@ pub fn header_change(feed: &[FeedItem], want: Option<&str>) -> HeaderChange {
 /// compat, removed in step 13b.
 pub fn apply_header_change(feed: &mut Vec<FeedItem>, change: HeaderChange, seq: u64, at: u64) {
     let item = feed.iter_mut().find_map(|i| match &mut i.kind {
-        ItemKind::Message { id, blocks, edited, withdrawn } if id == HEADER_MESSAGE => Some((blocks, edited, withdrawn)),
+        ItemKind::Message { id, blocks, edited, withdrawn, .. } if id == HEADER_MESSAGE => Some((blocks, edited, withdrawn)),
         _ => None,
     });
     match (change, item) {
@@ -400,7 +457,7 @@ mod tests {
     fn message(feed: &[FeedItem], id: &str) -> (u64, u64, Vec<Block>, bool, bool) {
         feed.iter()
             .find_map(|i| match &i.kind {
-                ItemKind::Message { id: have, blocks, edited, withdrawn } if have == id => {
+                ItemKind::Message { id: have, blocks, edited, withdrawn, .. } if have == id => {
                     Some((i.seq, i.at, blocks.clone(), *edited, *withdrawn))
                 }
                 _ => None,
@@ -416,7 +473,7 @@ mod tests {
         // Same content: nothing, and no id minted.
         assert_eq!(send(&mut feed, "a", md("one"), || panic!("minted"), 40), Sent::Unchanged);
         // New content: replaced in place, first-insert seq/time/position kept.
-        assert_eq!(send(&mut feed, "a", md("uno"), || panic!("minted"), 50), Sent::Edited);
+        assert_eq!(send(&mut feed, "a", md("uno"), || panic!("minted"), 50), Sent::Edited { form_opened: false });
         assert_eq!(message(&feed, "a"), (2, 20, md("uno"), true, false));
         assert_eq!(feed.iter().map(|i| i.seq).collect::<Vec<_>>(), [1, 2, 3]);
         // The edited content again is a no-op too.
@@ -432,9 +489,90 @@ mod tests {
         assert!(!withdraw(&mut feed, "a"), "already withdrawn");
         assert_eq!(message(&feed, "a"), (1, 10, md("one"), false, true));
         // Sent again, same blocks: back, in place, and tagged edited.
-        assert_eq!(send(&mut feed, "a", md("one"), || panic!("minted"), 20), Sent::Edited);
+        assert_eq!(send(&mut feed, "a", md("one"), || panic!("minted"), 20), Sent::Edited { form_opened: false });
         assert_eq!(message(&feed, "a"), (1, 10, md("one"), true, false));
         assert_eq!(feed.len(), 1);
+    }
+
+    fn with_form(text: &str) -> Vec<Block> {
+        vec![Block::Markdown { text: text.into() }, Block::Form(form::tests::mixed())]
+    }
+
+    fn record(feed: &[FeedItem], id: &str) -> Option<FormRecord> {
+        feed.iter().find_map(|i| match &i.kind {
+            ItemKind::Message { id: have, form, .. } if have == id => Some(form.clone()),
+            _ => None,
+        })?
+    }
+
+    #[test]
+    fn a_form_opens_with_its_message_and_withdraws_with_it() {
+        let mut feed = Vec::new();
+        assert_eq!(send(&mut feed, "a", with_form("one"), || 1, 10), Sent::Inserted);
+        assert_eq!(record(&feed, "a"), Some(FormRecord::open("f")));
+        assert_eq!(form_of(&feed, "a").map(|(f, _)| f.id.as_str()), Some("f"));
+        assert!(form_of(&feed, "nope").is_none());
+        // Re-asserted: nothing. A changed markdown block: an edit, form open.
+        assert_eq!(send(&mut feed, "a", with_form("one"), || panic!(), 11), Sent::Unchanged);
+        assert_eq!(send(&mut feed, "a", with_form("uno"), || panic!(), 12), Sent::Edited { form_opened: false });
+        // Withdrawing the message withdraws the open form.
+        assert!(withdraw(&mut feed, "a"));
+        assert_eq!(record(&feed, "a").unwrap().state, form::FormState::Withdrawn);
+        // Sent again: back, with a fresh open form (news).
+        assert_eq!(send(&mut feed, "a", with_form("uno"), || panic!(), 13), Sent::Edited { form_opened: true });
+        assert_eq!(record(&feed, "a"), Some(FormRecord::open("f")));
+        // A form added to a message that had none.
+        send(&mut feed, "b", md("two"), || 2, 20);
+        assert_eq!(record(&feed, "b"), None);
+        assert_eq!(send(&mut feed, "b", with_form("two"), || panic!(), 21), Sent::Edited { form_opened: true });
+        // The form dropped while open: withdrawn, a quiet edit.
+        assert_eq!(send(&mut feed, "b", md("two"), || panic!(), 22), Sent::Edited { form_opened: false });
+        assert_eq!(record(&feed, "b").unwrap().state, form::FormState::Withdrawn);
+        assert!(form_of(&feed, "b").is_none(), "no form block left");
+        assert_eq!(send(&mut feed, "b", md("two"), || panic!(), 23), Sent::Unchanged);
+    }
+
+    #[test]
+    fn a_submitted_form_survives_resends_and_withdrawal() {
+        let mut feed = Vec::new();
+        send(&mut feed, "a", with_form("one"), || 1, 10);
+        let answers: BTreeMap<String, Answer> = [("note".to_string(), Answer::Text("hi".into()))].into();
+        let submitted = form::FormState::Submitted { at: 11, answers, client: "tui".into() };
+        form_record_mut(&mut feed, "a").unwrap().state = submitted.clone();
+        // The original again: invisible.
+        assert_eq!(send(&mut feed, "a", with_form("one"), || panic!(), 12), Sent::Unchanged);
+        // Other blocks change, the stored form doesn't, whatever was sent.
+        let other = vec![Block::Markdown { text: "uno".into() }, Block::Form(form::tests::example())];
+        assert_eq!(send(&mut feed, "a", other.clone(), || panic!(), 13), Sent::Edited { form_opened: false });
+        assert_eq!(message(&feed, "a").2, with_form("uno"));
+        assert_eq!(record(&feed, "a").unwrap().state, submitted);
+        assert_eq!(send(&mut feed, "a", other, || panic!(), 14), Sent::Unchanged, "frozen re-sends settle");
+        // Withdrawn: the answers stay.
+        withdraw(&mut feed, "a");
+        assert_eq!(record(&feed, "a").unwrap().state, submitted);
+    }
+
+    #[test]
+    fn cap_never_drops_an_open_form() {
+        let open = |seq: u64, id: &str| {
+            let mut feed = Vec::new();
+            send(&mut feed, id, with_form("q"), || seq, seq * 10);
+            feed.pop().unwrap()
+        };
+        let mut done = open(3, "m3");
+        if let ItemKind::Message { form: Some(r), .. } = &mut done.kind {
+            r.withdraw();
+        }
+        let mut feed = vec![open(1, "m1"), reply(2), done, FeedItem::markdown(4, 40, "m4", "x"), status(5, None, Some("s"))];
+        let seqs = |feed: &[FeedItem]| feed.iter().map(|i| i.seq).collect::<Vec<_>>();
+        cap(&mut feed, 4);
+        assert_eq!(seqs(&feed), [1, 2, 3, 4], "markers first");
+        cap(&mut feed, 2);
+        assert_eq!(seqs(&feed), [1, 2], "then messages, skipping the open form; a withdrawn one goes");
+        cap(&mut feed, 1);
+        assert_eq!(seqs(&feed), [1], "then user items, still skipping it");
+        cap(&mut feed, 0);
+        assert_eq!(seqs(&feed), [1], "only open forms left: the cap goes soft");
     }
 
     #[test]
@@ -451,7 +589,28 @@ mod tests {
     fn store_shape_round_trips() {
         let fields = vec![Block::Fields { items: vec![Field { label: "Head".into(), value: "36b1".into() }] }];
         let feed = vec![
-            FeedItem { seq: 8, at: 80, kind: ItemKind::Message { id: "f".into(), blocks: fields, edited: true, withdrawn: false } },
+            FeedItem { seq: 8, at: 80, kind: ItemKind::Message { id: "f".into(), blocks: fields, edited: true, withdrawn: false, form: None } },
+            FeedItem {
+                seq: 9,
+                at: 90,
+                kind: ItemKind::Message {
+                    id: "q".into(),
+                    blocks: vec![Block::Form(form::tests::mixed())],
+                    edited: false,
+                    withdrawn: false,
+                    form: Some(FormRecord { draft: [("note".to_string(), Answer::Text("n".into()))].into(), ..FormRecord::open("f") }),
+                },
+            },
+            FeedItem {
+                seq: 10,
+                at: 100,
+                kind: ItemKind::Submission {
+                    message: "q".into(),
+                    form: "f".into(),
+                    answers: [("sure".to_string(), Answer::Confirm(true))].into(),
+                    client: "tui".into(),
+                },
+            },
             FeedItem::markdown(1, 10, "m", "hi"),
             reply(2),
             FeedItem { seq: 3, at: 30, kind: ItemKind::Action { action: "go".into(), label: "Go".into(), client: "api:x".into() } },

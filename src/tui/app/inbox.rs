@@ -351,7 +351,7 @@ fn feed_lines(t: &Thread, utc_offset: i64) -> Vec<PaneLine> {
         let block = matches!(item.kind, ItemKind::Message { .. } | ItemKind::Reply { .. });
         let mut lines = Vec::new();
         match &item.kind {
-            ItemKind::Message { blocks, edited, withdrawn, .. } => {
+            ItemKind::Message { blocks, edited, withdrawn, form, .. } => {
                 let tag = match (edited, withdrawn) {
                     (_, true) => "  (withdrawn)",
                     (true, false) => "  (edited)",
@@ -363,6 +363,12 @@ fn feed_lines(t: &Thread, utc_offset: i64) -> Vec<PaneLine> {
                         match block {
                             feed::Block::Markdown { text } => lines.push(line(Tone::Markdown, text.clone())),
                             feed::Block::Fields { items } => lines.extend(field_rows(items)),
+                            // Placeholder until the form widgets (step 16).
+                            feed::Block::Form(f) => {
+                                let state = form.as_ref().map_or("open", |r| r.state.as_str());
+                                let title = f.title.as_deref().unwrap_or(&f.id);
+                                lines.push(line(Tone::Dim, format!("form: {title} ({} questions, {state})", f.questions.len())));
+                            }
                         }
                     }
                 }
@@ -373,6 +379,9 @@ fn feed_lines(t: &Thread, utc_offset: i64) -> Vec<PaneLine> {
             }
             ItemKind::Action { label, .. } => {
                 lines.push(vec![(Tone::Dim, format!("{at}  ")), (Tone::Text, format!("you: {label}"))]);
+            }
+            ItemKind::Submission { answers, .. } => {
+                lines.push(vec![(Tone::Dim, format!("{at}  ")), (Tone::Text, format!("you answered {} questions", answers.len()))]);
             }
             ItemKind::Marker(m) => lines.push(line(Tone::Dim, format!("{at}  · {}", marker_text(m)))),
         }
@@ -1701,7 +1710,7 @@ mod tests {
         t.feed.push(feed::FeedItem {
             seq,
             at: 50,
-            kind: ItemKind::Message { id: "f".into(), blocks: fields, edited: false, withdrawn: false },
+            kind: ItemKind::Message { id: "f".into(), blocks: fields, edited: false, withdrawn: false, form: None },
         });
         app.set_inbox(inbox);
         let (s10, s20, s30, s40, s50) = (stamp(10, 0), stamp(20, 0), stamp(30, 0), stamp(40, 0), stamp(50, 0));

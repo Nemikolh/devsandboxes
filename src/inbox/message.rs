@@ -4,13 +4,14 @@
 //! host, like the put schema in `thread.rs`.
 //!
 //! The wire types are separate from the store's [`Block`]: they deny unknown
-//! fields and unknown block types, so a newer owner (forms, a new block) on an
+//! fields and unknown block types, so a newer owner (a new block type) on an
 //! older host fails loudly with an `error` record instead of rendering half a
 //! message, while the store type stays free to grow.
 
 use serde::Deserialize;
 
 use super::feed::{Block, Field, HEADER_MESSAGE};
+use super::form;
 use super::thread::{check_key, check_text};
 use crate::devsbd::control::{valid_message_id, MAX_MESSAGE_ID};
 use crate::devsbd::notify::MAX_SEND_BODY;
@@ -45,6 +46,8 @@ struct Wire {
 enum WireBlock {
     Markdown { text: String },
     Fields { items: Vec<WireField> },
+    /// Checked by [`form::check`].
+    Form(form::WireForm),
 }
 
 #[derive(Deserialize)]
@@ -76,12 +79,16 @@ pub fn parse(body: &str) -> Result<MessageSend, String> {
     if wire.blocks.len() > MAX_BLOCKS {
         return Err(format!("{} blocks, at most {MAX_BLOCKS} allowed", wire.blocks.len()));
     }
-    let blocks = wire
+    let blocks: Vec<Block> = wire
         .blocks
         .into_iter()
         .enumerate()
         .map(|(n, b)| block(n + 1, b))
         .collect::<Result<_, _>>()?;
+    // The form's lifecycle is the message's (`form::FormRecord`).
+    if blocks.iter().filter(|b| matches!(b, Block::Form(_))).count() > 1 {
+        return Err("more than one form block; one form per message".into());
+    }
     Ok(MessageSend { thread: wire.thread, id: wire.id, blocks })
 }
 
@@ -119,6 +126,7 @@ fn block(n: usize, b: WireBlock) -> Result<Block, String> {
                 .collect::<Result<_, String>>()?;
             Ok(Block::Fields { items })
         }
+        WireBlock::Form(f) => form::check(n, f).map(Block::Form),
     }
 }
 
@@ -161,9 +169,9 @@ mod tests {
 
     #[test]
     fn rejects_unknown_fields_and_block_types() {
-        // A newer owner on this host: forms aren't known here yet.
-        let form = parse(&with_blocks(r#"{"type":"form","id":"f","questions":[]}"#)).unwrap_err();
-        assert!(form.contains("unknown variant `form`"), "{form}");
+        // A newer owner on this host: a block type not known here yet.
+        let poll = parse(&with_blocks(r#"{"type":"poll","id":"f"}"#)).unwrap_err();
+        assert!(poll.contains("unknown variant `poll`"), "{poll}");
         for bad in [
             r#"{"thread":"t","id":"m","blocks":[{"type":"markdown","text":"x"}],"extra":1}"#.to_string(),
             with_blocks(r#"{"type":"markdown","text":"x","style":"bold"}"#),
@@ -207,6 +215,10 @@ mod tests {
         assert!(parse(&fields(&[field(&"l".repeat(60), &"v".repeat(200))])).is_ok());
         assert_eq!(err(&fields(&[field(" ", "v")])), "block 1: a field has an empty label");
         assert!(err(&fields(&[field("a", "b\\nc")])).contains("spans lines"));
+        // Forms: one per message (the rest of the rules are form.rs's).
+        let form = r#"{"type":"form","id":"f","questions":[{"id":"q","label":"Q","type":"confirm"}]}"#;
+        assert!(parse(&with_blocks(&format!(r#"{{"type":"markdown","text":"x"}},{form}"#))).is_ok());
+        assert_eq!(err(&with_blocks(&[form, form].join(","))), "more than one form block; one form per message");
         // The whole body's budget.
         let pad = "x".repeat(MAX_SEND_BODY);
         assert!(err(&format!(r#"{{"thread":"t","id":"m","blocks":[],"p":"{pad}"}}"#)).contains("longer than 49152"));

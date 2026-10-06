@@ -26,7 +26,8 @@ use serde_json::{Value, json};
 
 use super::forwards::{AddRequest, Added, ForwardRow, Removed};
 use crate::inbox::thread::HostVerb;
-use crate::inbox::{Block, FeedItem, Inbox, ItemKind, Kind, Marker, Op, Thread, View, ops};
+use crate::inbox::form::{self, ChoiceDefault, FormError, QuestionKind};
+use crate::inbox::{Block, FeedItem, FormRecord, Inbox, ItemKind, Kind, Marker, Op, Thread, View, feed, ops};
 
 /// What a handler needs from the daemon. The store path is injectable so
 /// tests (and a test daemon) use their own file.
@@ -99,6 +100,11 @@ impl ApiError {
         Self::new("denied", message)
     }
 
+    /// A form that was already submitted or withdrawn.
+    pub fn closed_form(message: impl Into<String>) -> Self {
+        Self::new("closed-form", message)
+    }
+
     /// A forward's host port couldn't be bound (in use, privileged, an
     /// address not on this host).
     pub fn bind_failed(message: impl Into<String>) -> Self {
@@ -135,6 +141,8 @@ pub fn call(method: &str, params: Value, ctx: &Ctx) -> Answer {
             let addr: Addr = parse(params)?;
             mutate(ctx, |inbox| Ok(vec![Op::Reopen(user_target(inbox, &addr)?.id)]))
         }
+        "inbox.form.saveDraft" => form_save_draft(parse(params)?, ctx),
+        "inbox.form.submit" => form_submit(parse(params)?, ctx),
         "inbox.notify.dismiss" => dismiss(parse(params)?, ctx),
         "inbox.notify.markRead" => notify_mark_read(parse(params)?, ctx),
         "instances.list" => instances_list(parse(params)?),
@@ -285,6 +293,9 @@ pub enum FeedItemView {
     Message { seq: u64, at: u64, id: String, blocks: Vec<BlockView>, edited: bool, withdrawn: bool },
     Reply { seq: u64, at: u64, text: String },
     Action { seq: u64, at: u64, action: String, label: String },
+    /// The user submitted form `form` of message `message`: every question's
+    /// answer (`null`: an optional one left unanswered).
+    Submission { seq: u64, at: u64, message: String, form: String, answers: Value },
     /// `marker`: `done` | `reopen` (the user's; no `from`/`to`), `state` |
     /// `status` (the owner's change, `from` -> `to`).
     Marker { seq: u64, at: u64, marker: &'static str, from: Option<String>, to: Option<String> },
@@ -297,6 +308,128 @@ pub enum BlockView {
     Markdown { text: String },
     /// A compact key/value list, in order.
     Fields { items: Vec<FieldView> },
+    /// Questions for the user. `state` is `open` | `submitted` |
+    /// `withdrawn`; `draft` the saved partial answers of an open form;
+    /// `answers` every question's answer once submitted, else `null`.
+    Form {
+        id: String,
+        title: Option<String>,
+        submit: String,
+        questions: Vec<QuestionView>,
+        state: &'static str,
+        draft: Value,
+        answers: Option<Value>,
+    },
+}
+
+/// One question of a form block, tagged by `type`.
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum QuestionView {
+    /// `default`: an option id, ids when `multiple`, or `null`.
+    Choice {
+        id: String,
+        label: String,
+        context: Option<String>,
+        required: bool,
+        options: Vec<OptionView>,
+        multiple: bool,
+        default: Option<Value>,
+    },
+    Text {
+        id: String,
+        label: String,
+        context: Option<String>,
+        required: bool,
+        placeholder: Option<String>,
+        default: Option<String>,
+        multiline: bool,
+        /// Longest answer, in bytes.
+        max: usize,
+    },
+    Confirm {
+        id: String,
+        label: String,
+        context: Option<String>,
+        required: bool,
+        yes: Option<String>,
+        no: Option<String>,
+        default: Option<bool>,
+    },
+}
+
+/// One option of a choice question.
+#[derive(Debug, Serialize)]
+pub struct OptionView {
+    pub id: String,
+    pub label: String,
+    pub description: Option<String>,
+}
+
+impl BlockView {
+    /// `record`: the message's form record (a form block always has one).
+    fn of(b: &Block, record: Option<&FormRecord>) -> Self {
+        match b {
+            Block::Markdown { text } => BlockView::Markdown { text: text.clone() },
+            Block::Fields { items } => BlockView::Fields {
+                items: items.iter().map(|f| FieldView { label: f.label.clone(), value: f.value.clone() }).collect(),
+            },
+            Block::Form(f) => {
+                let (state, draft, answers) = match record.map(|r| (&r.state, &r.draft)) {
+                    Some((form::FormState::Submitted { answers, .. }, _)) => {
+                        ("submitted", json!({}), Some(form::answers_json(f, answers)))
+                    }
+                    Some((state, draft)) => (state.as_str(), form::partial_json(draft), None),
+                    None => ("open", json!({}), None),
+                };
+                BlockView::Form {
+                    id: f.id.clone(),
+                    title: f.title.clone(),
+                    submit: f.submit.clone(),
+                    questions: f.questions.iter().map(QuestionView::of).collect(),
+                    state,
+                    draft,
+                    answers,
+                }
+            }
+        }
+    }
+}
+
+impl QuestionView {
+    fn of(q: &form::Question) -> Self {
+        let (id, label, context, required) = (q.id.clone(), q.label.clone(), q.context.clone(), q.required);
+        match &q.kind {
+            QuestionKind::Choice { options, multiple, default } => QuestionView::Choice {
+                id,
+                label,
+                context,
+                required,
+                options: options
+                    .iter()
+                    .map(|o| OptionView { id: o.id.clone(), label: o.label.clone(), description: o.description.clone() })
+                    .collect(),
+                multiple: *multiple,
+                default: default.as_ref().map(|d| match d {
+                    ChoiceDefault::One(o) => json!(o),
+                    ChoiceDefault::Many(os) => json!(os),
+                }),
+            },
+            QuestionKind::Text { placeholder, default, multiline, max } => QuestionView::Text {
+                id,
+                label,
+                context,
+                required,
+                placeholder: placeholder.clone(),
+                default: default.clone(),
+                multiline: *multiline,
+                max: *max,
+            },
+            QuestionKind::Confirm { yes, no, default } => {
+                QuestionView::Confirm { id, label, context, required, yes: yes.clone(), no: no.clone(), default: *default }
+            }
+        }
+    }
 }
 
 /// One row of a `fields` block.
@@ -307,27 +440,31 @@ pub struct FieldView {
 }
 
 impl FeedItemView {
-    pub fn of(item: &FeedItem) -> Self {
+    /// `item` of `thread_feed` (a submission's answers are typed by its
+    /// message's form).
+    pub fn of(item: &FeedItem, thread_feed: &[FeedItem]) -> Self {
         let (seq, at) = (item.seq, item.at);
         match &item.kind {
-            ItemKind::Message { id, blocks, edited, withdrawn } => FeedItemView::Message {
+            ItemKind::Message { id, blocks, edited, withdrawn, form } => FeedItemView::Message {
                 seq,
                 at,
                 id: id.clone(),
-                blocks: blocks
-                    .iter()
-                    .map(|b| match b {
-                        Block::Markdown { text } => BlockView::Markdown { text: text.clone() },
-                        Block::Fields { items } => BlockView::Fields {
-                            items: items
-                                .iter()
-                                .map(|f| FieldView { label: f.label.clone(), value: f.value.clone() })
-                                .collect(),
-                        },
-                    })
-                    .collect(),
+                blocks: blocks.iter().map(|b| BlockView::of(b, form.as_ref())).collect(),
                 edited: *edited,
                 withdrawn: *withdrawn,
+            },
+            ItemKind::Submission { message, form: form_id, answers, .. } => FeedItemView::Submission {
+                seq,
+                at,
+                message: message.clone(),
+                form: form_id.clone(),
+                // Every question, as the owner's event had them, while the
+                // message still holds the form (it always does: submitted
+                // forms are frozen).
+                answers: match feed::form_of(thread_feed, message) {
+                    Some((f, _)) if &f.id == form_id => form::answers_json(f, answers),
+                    _ => form::partial_json(answers),
+                },
             },
             ItemKind::Reply { text, .. } => FeedItemView::Reply { seq, at, text: text.clone() },
             ItemKind::Action { action, label, .. } => {
@@ -428,7 +565,7 @@ impl ThreadDetail {
                     sends_event: a.enqueues_event(),
                 })
                 .collect(),
-            feed: t.feed.iter().map(FeedItemView::of).collect(),
+            feed: t.feed.iter().map(|i| FeedItemView::of(i, &t.feed)).collect(),
             notes: t
                 .notes
                 .iter()
@@ -594,6 +731,58 @@ fn reply(p: ReplyParams, ctx: &Ctx) -> Answer {
             return Err(ApiError::denied(format!("thread {} takes no replies", t.id)));
         }
         Ok(vec![Op::Reply { thread: t.id, text: p.text }])
+    })
+}
+
+#[derive(Deserialize)]
+struct FormParams {
+    #[serde(flatten)]
+    addr: Addr,
+    /// The message holding the form (the owner's id for it).
+    message: String,
+    /// Answers by question id: a subset for a draft, any subset for a
+    /// submission (the draft and the defaults fill in the rest).
+    #[serde(default)]
+    answers: serde_json::Map<String, Value>,
+}
+
+/// The form of `p.message` on `p`'s thread, and `p.answers` typed by its
+/// questions: `not-found` (thread, message, no form), `invalid` (unknown
+/// question, wrong type).
+fn form_target<'a>(
+    inbox: &'a Inbox,
+    p: &FormParams,
+) -> Result<(&'a Thread, &'a form::Form, &'a FormRecord, std::collections::BTreeMap<String, form::Answer>), ApiError> {
+    let t = user_target(inbox, &p.addr)?;
+    let (f, record) = feed::form_of(&t.feed, &p.message)
+        .ok_or_else(|| ApiError::not_found(format!("thread {} has no message `{}` with a form", t.id, p.message)))?;
+    let answers = form::answers_from_json(f, &p.answers).map_err(ApiError::invalid)?;
+    Ok((t, f, record, answers))
+}
+
+fn form_error(e: FormError) -> ApiError {
+    match e {
+        FormError::Closed(why) => ApiError::closed_form(why),
+        FormError::Invalid(why) => ApiError::invalid(why),
+    }
+}
+
+/// Save a partial set of answers as the form's draft (no event): checked
+/// here first, so a bad one is refused rather than dropped.
+fn form_save_draft(p: FormParams, ctx: &Ctx) -> Answer {
+    mutate(ctx, |inbox| {
+        let (t, f, record, answers) = form_target(inbox, &p)?;
+        form::validate_draft(f, record, &answers).map_err(form_error)?;
+        Ok(vec![Op::SaveDraft { thread: t.id, message: p.message.clone(), answers }])
+    })
+}
+
+/// Submit the form: the owner gets one `submit` event with every answer.
+fn form_submit(p: FormParams, ctx: &Ctx) -> Answer {
+    mutate(ctx, |inbox| {
+        let (t, f, record, answers) = form_target(inbox, &p)?;
+        form::resolve_submission(f, record, &answers).map_err(form_error)?;
+        Ok(vec![Op::Submit { thread: t.id, message: p.message.clone(), answers }])
     })
 }
 
@@ -1107,6 +1296,79 @@ mod tests {
         assert_eq!(ops::events(&path, "d-id").unwrap().len(), 4, "refused ops enqueue nothing");
     }
 
+    /// Thread `pr-1` of `d-id` with message `run-1` carrying `mixed()`:
+    /// `pick` (required choice a|b), `tags` (optional multiple x|y), `note`
+    /// (required text, max 5), `sure` (optional confirm).
+    fn with_form(path: &Path) -> u64 {
+        put(path, "d-id", "d", "pr-1", State::NeedsYou);
+        let blocks = vec![Block::Form(form::tests::mixed())];
+        let send = crate::inbox::MessageSend { thread: "pr-1".into(), id: "run-1".into(), blocks };
+        store::update_at(path, |i| i.send("d-id", 11, send)).unwrap();
+        id_of(path, "d-id", "pr-1")
+    }
+
+    #[test]
+    fn form_methods_check_before_applying() {
+        let path = store_path("forms");
+        let id = with_form(&path);
+        let call = |method: &str, answers: Value| run(&path, method, json!({"thread": id, "message": "run-1", "answers": answers}));
+
+        // Drafts: partial, merged, no event.
+        assert_eq!(call("inbox.form.saveDraft", json!({"pick": "b"})).unwrap(), json!({"ok": true}));
+        assert_eq!(call("inbox.form.saveDraft", json!({"tags": ["y"]})).unwrap(), json!({"ok": true}));
+        let t = run(&path, "inbox.thread.get", json!({"thread": id})).unwrap();
+        let block = &t["feed"][0]["blocks"][0];
+        assert_eq!((block["state"].clone(), block["draft"].clone()), (json!("open"), json!({"pick": "b", "tags": ["y"]})));
+        assert_eq!(block["answers"], Value::Null);
+        for bad in [json!({"nope": "a"}), json!({"pick": "z"}), json!({"pick": ["a"]}), json!({"note": "toolong"}), json!({"sure": "yes"})] {
+            assert_eq!(code(call("inbox.form.saveDraft", bad.clone())), "invalid", "{bad}");
+        }
+        // Submit: required answers checked, listing what's missing.
+        let missing = call("inbox.form.submit", json!({})).unwrap_err();
+        assert_eq!((missing.code, missing.message.as_str()), ("invalid", "required questions unanswered: note"));
+        assert_eq!(code(call("inbox.form.submit", json!({"note": "hi", "tags": "x"}))), "invalid");
+        assert!(ops::events(&path, "d-id").unwrap().is_empty(), "refused ops enqueue nothing");
+        assert_eq!(call("inbox.form.submit", json!({"note": "hi"})).unwrap(), json!({"ok": true}));
+        let events = ops::events(&path, "d-id").unwrap();
+        let [(_, e)] = &events[..] else { panic!("{events:?}") };
+        assert_eq!(e.answers, Some(json!({"pick": "b", "tags": ["y"], "note": "hi", "sure": null})));
+
+        // Closed now; the view shows the answers and the submission item.
+        assert_eq!(code(call("inbox.form.submit", json!({}))), "closed-form");
+        assert_eq!(code(call("inbox.form.saveDraft", json!({"note": "x"}))), "closed-form");
+        let t = run(&path, "inbox.thread.get", json!({"thread": id})).unwrap();
+        let block = &t["feed"][0]["blocks"][0];
+        assert_eq!(block["state"], "submitted");
+        assert_eq!(block["draft"], json!({}));
+        assert_eq!(block["answers"], json!({"pick": "b", "tags": ["y"], "note": "hi", "sure": null}));
+        let sub = &t["feed"][1];
+        assert_eq!((sub["type"].as_str(), sub["message"].as_str(), sub["form"].as_str()), (Some("submission"), Some("run-1"), Some("f")));
+        assert_eq!(sub["answers"], json!({"pick": "b", "tags": ["y"], "note": "hi", "sure": null}));
+        assert!(!t.to_string().contains("api:test"), "{t}");
+
+        // Addressing: by owner and key too; unknown message or no form.
+        let by_key = json!({"owner": "d", "key": "pr-1", "message": "run-1", "answers": {}});
+        assert_eq!(code(run(&path, "inbox.form.submit", by_key)), "closed-form");
+        let none = json!({"thread": id, "message": "nope", "answers": {}});
+        assert_eq!(code(run(&path, "inbox.form.saveDraft", none)), "not-found");
+        assert_eq!(code(run(&path, "inbox.form.submit", json!({"thread": 999, "message": "run-1"}))), "not-found");
+        assert_eq!(code(run(&path, "inbox.form.submit", json!({"thread": id}))), "invalid", "no message");
+        store::update_at(&path, |i| {
+            let send = crate::inbox::MessageSend { thread: "pr-1".into(), id: "plain".into(), blocks: vec![Block::Markdown { text: "x".into() }] };
+            i.send("d-id", 12, send)
+        })
+        .unwrap();
+        assert_eq!(code(run(&path, "inbox.form.submit", json!({"thread": id, "message": "plain"}))), "not-found");
+        // A withdrawn form is closed too.
+        let other = crate::inbox::MessageSend { thread: "pr-1".into(), id: "run-2".into(), blocks: vec![Block::Form(form::tests::mixed())] };
+        store::update_at(&path, |i| {
+            i.send("d-id", 13, other);
+            i.withdraw("d-id", "pr-1", "run-2")
+        })
+        .unwrap();
+        assert_eq!(code(run(&path, "inbox.form.submit", json!({"thread": id, "message": "run-2"}))), "closed-form");
+    }
+
     #[test]
     fn host_only_actions_and_replyless_threads_are_refused() {
         let path = store_path("refused");
@@ -1182,7 +1444,7 @@ mod tests {
         assert_eq!(code(run(&path, "instances.list", json!({}))), "invalid");
         assert_eq!(code(run(&path, "instances.list", json!({"dir": "rel/dir"}))), "invalid");
         assert_eq!(code(run(&path, "instances.list", json!({"dir": "/nonexistent/devsandbox-api"}))), "not-found");
-        assert_eq!(code(run(&path, "inbox.form.submit", json!({}))), "unknown-method");
+        assert_eq!(code(run(&path, "inbox.poll.vote", json!({}))), "unknown-method");
     }
 
     #[test]
@@ -1382,8 +1644,40 @@ mod tests {
         for (iface, value) in &variants {
             assert_variant(iface, value);
         }
-        assert_eq!(union_members("FeedItem"), ["FeedMessage", "FeedReply", "FeedAction", "FeedMarker"]);
-        assert_eq!(union_members("MessageBlock"), ["MarkdownBlock", "FieldsBlock"]);
+        // Forms: the block (open and submitted), each question type, the
+        // submission item.
+        let mixed = form::tests::mixed();
+        let open = FormRecord::open("f");
+        let submitted = FormRecord {
+            state: form::FormState::Submitted { at: 1, answers: Default::default(), client: "tui".into() },
+            ..open.clone()
+        };
+        let example = form::tests::example();
+        let questions: Vec<Value> = example.questions.iter().chain(&mixed.questions).map(|q| v(&QuestionView::of(q))).collect();
+        let forms: Vec<(&str, Value)> = [
+            ("FormBlock", v(&BlockView::of(&Block::Form(mixed.clone()), Some(&open)))),
+            ("FormBlock", v(&BlockView::of(&Block::Form(mixed.clone()), Some(&submitted)))),
+            ("FeedSubmission", v(&FeedItemView::Submission { seq: 1, at: 1, message: "m".into(), form: "f".into(), answers: json!({}) })),
+        ]
+        .into_iter()
+        .chain(questions.into_iter().map(|q| {
+            let iface = match q["type"].as_str() {
+                Some("choice") => "ChoiceQuestion",
+                Some("text") => "TextQuestion",
+                _ => "ConfirmQuestion",
+            };
+            (iface, q)
+        }))
+        .collect();
+        for (iface, value) in &forms {
+            assert_variant(iface, value);
+        }
+        assert_matches("ChoiceOption", &v(&OptionView { id: "a".into(), label: "A".into(), description: None }));
+        assert_eq!(union_members("FeedItem"), ["FeedMessage", "FeedReply", "FeedAction", "FeedSubmission", "FeedMarker"]);
+        assert_eq!(union_members("MessageBlock"), ["MarkdownBlock", "FieldsBlock", "FormBlock"]);
+        assert_eq!(union_members("FormQuestion"), ["ChoiceQuestion", "TextQuestion", "ConfirmQuestion"]);
+        assert_eq!(crate::serve::dts::prop_type("FormBlock", "state").as_deref(), Some("'open' | 'submitted' | 'withdrawn'"));
+        assert_eq!(union_members("FormAnswer"), ["string", "string[]", "boolean"]);
         assert_eq!(
             crate::serve::dts::prop_type("FeedMarker", "marker").as_deref(),
             Some("'done' | 'reopen' | 'state' | 'status'")

@@ -385,7 +385,7 @@ export interface ThreadAction {
 }
 
 /** One item of a thread's feed, by `type`. */
-export type FeedItem = FeedMessage | FeedReply | FeedAction | FeedMarker;
+export type FeedItem = FeedMessage | FeedReply | FeedAction | FeedSubmission | FeedMarker;
 
 /** What every feed item carries. */
 export interface FeedItemBase {
@@ -422,6 +422,17 @@ export interface FeedAction extends FeedItemBase {
   label: string;
 }
 
+/** The user submitted a form (`inbox.form.submit`). */
+export interface FeedSubmission extends FeedItemBase {
+  type: 'submission';
+  /** The message holding the form. */
+  message: string;
+  /** The form's id. */
+  form: string;
+  /** Every question's answer; `null` for an optional one left unanswered. */
+  answers: Record<string, FormAnswer | null>;
+}
+
 /** A one-line marker: the user's done/reopen, the owner's state or status change. */
 export interface FeedMarker extends FeedItemBase {
   type: 'marker';
@@ -433,7 +444,7 @@ export interface FeedMarker extends FeedItemBase {
 }
 
 /** One block of a message, by `type`. */
-export type MessageBlock = MarkdownBlock | FieldsBlock;
+export type MessageBlock = MarkdownBlock | FieldsBlock | FormBlock;
 
 /** Markdown text. */
 export interface MarkdownBlock {
@@ -452,6 +463,83 @@ export interface MessageField {
   label: string;
   value: string;
 }
+
+/**
+ * Questions for the user, answered once (`inbox.form.submit`). A submitted
+ * form is frozen: re-sends of its message never change it.
+ */
+export interface FormBlock {
+  type: 'form';
+  id: string;
+  title: string | null;
+  /** The submit button's label. */
+  submit: string;
+  questions: FormQuestion[];
+  /** `withdrawn`: the owner withdrew the message or dropped the form. */
+  state: 'open' | 'submitted' | 'withdrawn';
+  /** Saved partial answers (`inbox.form.saveDraft`) of an open form; `{}` otherwise. */
+  draft: Record<string, FormAnswer>;
+  /** Once submitted, every question's answer (`null`: optional, unanswered); `null` before. */
+  answers: Record<string, FormAnswer | null> | null;
+}
+
+/** One question of a form, by `type`. */
+export type FormQuestion = ChoiceQuestion | TextQuestion | ConfirmQuestion;
+
+/** An answer: an option id (choice), option ids (`multiple` choice), text, or a confirm's yes/no. */
+export type FormAnswer = string | string[] | boolean;
+
+/** What every question carries. */
+export interface QuestionBase {
+  /** Unique in the form; what answers are keyed by. */
+  id: string;
+  /** Inline markdown, one line. */
+  label: string;
+  /** Markdown shown above the input. */
+  context: string | null;
+  /** Must be answered to submit (text: not blank; `multiple`: one pick at least). */
+  required: boolean;
+}
+
+/** Pick one option, or several when `multiple`. */
+export interface ChoiceQuestion extends QuestionBase {
+  type: 'choice';
+  options: ChoiceOption[];
+  multiple: boolean;
+  /** An option id, or ids when `multiple`. */
+  default: string | string[] | null;
+}
+
+/** One option of a choice question. */
+export interface ChoiceOption {
+  id: string;
+  label: string;
+  description: string | null;
+}
+
+/** Free text. */
+export interface TextQuestion extends QuestionBase {
+  type: 'text';
+  placeholder: string | null;
+  /** Prefilled, editable. */
+  default: string | null;
+  multiline: boolean;
+  /** Longest answer, in bytes. */
+  max: number;
+}
+
+/** Yes or no. */
+export interface ConfirmQuestion extends QuestionBase {
+  type: 'confirm';
+  /** Label of the yes choice; `null`: the client's own. */
+  yes: string | null;
+  /** Label of the no choice; `null`: the client's own. */
+  no: string | null;
+  default: boolean | null;
+}
+
+/** `inbox.form.*` params: the message holding the form, and answers by question id. */
+export type FormParams = ThreadAddress & { message: string; answers?: Record<string, FormAnswer> };
 
 /** One record of a notification thread. */
 export interface ThreadNote {
@@ -578,6 +666,10 @@ export interface ApiMethods {
   'inbox.thread.reply': { params: ThreadAddress & { text: string }; result: OkResult };
   'inbox.thread.done': { params: ThreadAddress; result: OkResult };
   'inbox.thread.reopen': { params: ThreadAddress; result: OkResult };
+  /** Merge `answers` (any subset) into an open form's draft; no event. */
+  'inbox.form.saveDraft': { params: FormParams; result: OkResult };
+  /** Submit an open form: `answers` over the draft over the defaults; the owner gets one `submit` event. */
+  'inbox.form.submit': { params: FormParams; result: OkResult };
   'inbox.notify.dismiss': { params: NotifyTarget; result: OkResult };
   'inbox.notify.markRead': { params: NotifyTarget; result: OkResult };
   'instances.list': { params: { dir: string }; result: Snapshot };
@@ -665,7 +757,7 @@ export declare function connect(opts?: ConnectOptions): Promise<Api>;
 
 /**
  * Rejection of an API call. `code` is the daemon's (`not-found`, `invalid`,
- * `denied`, `bind-failed`, `unknown-method`, `internal`, …) or the client's
+ * `denied`, `closed-form`, `bind-failed`, `unknown-method`, `internal`, …) or the client's
  * own: `closed` (the connection ended), `protocol`, `unsupported`.
  */
 export declare class DevsandboxApiError extends Error {

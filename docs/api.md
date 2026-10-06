@@ -76,7 +76,8 @@ match on `code`:
 | `invalid` | bad params (missing, wrong type, unknown value), or an op that makes no sense for its target |
 | `unknown-method` | no such method on this daemon |
 | `denied` | the target refuses it (an archived thread is read-only; a thread that takes no replies) |
-| `conflict` | reserved (forms) |
+| `closed-form` | the form was already submitted, or withdrawn by its owner |
+| `conflict` | reserved |
 | `bind-failed` | a forward's host port couldn't be bound (in use, privileged, an address not on this host) |
 | `internal` | the daemon failed (store unreadable, …); logged in `serve.log` |
 
@@ -150,8 +151,9 @@ Each item has `type`, `seq` (arrival order across the whole Inbox) and `at`
 
 | `type` | fields | |
 |---|---|---|
-| `message` | `id`, `blocks`, `edited`, `withdrawn` | from the owner (`devsbd thread send`); `blocks`, by `type`: `{"type":"markdown","text"}`, or `{"type":"fields","items":[{"label","value"}]}` (a key/value list, in order; clients show aligned `label  value` rows). `edited`: replaced in place since first sent; `withdrawn`: the owner took it back |
+| `message` | `id`, `blocks`, `edited`, `withdrawn` | from the owner (`devsbd thread send`); `blocks`, by `type`: `{"type":"markdown","text"}`, or `{"type":"fields","items":[{"label","value"}]}` (a key/value list, in order; clients show aligned `label  value` rows). or `{"type":"form",…}` (see *Forms*). `edited`: replaced in place since first sent; `withdrawn`: the owner took it back |
 | `reply` | `text` | the user's reply |
+| `submission` | `message`, `form`, `answers` | the user submitted form `form` of message `message`: every question's answer (see *Forms*) |
 | `action` | `action`, `label` | the user pressed an action (its id, its label then) |
 | `marker` | `marker`, `from`, `to` | one line: `done` / `reopen` by the user (`from`/`to` `null`), or the owner's `state` / `status` change (`from` → `to`, a status may be `null`). Consecutive status changes collapse into one marker |
 
@@ -171,8 +173,33 @@ event the dashboard would (the owner pulls it with `devsbd events`).
 | `inbox.thread.reply` | address + `"text": "…"` | a `reply` event; trimmed, cut at 2000 chars | `invalid` (empty, notification), `denied` (archived, takes no replies) |
 | `inbox.thread.done` | address | set done (a `done` event); already done: nothing | `invalid` (notification), `denied` (archived) |
 | `inbox.thread.reopen` | address | reopen a done thread (a `reopen` event); not done: nothing | `invalid` (notification), `denied` (archived) |
+| `inbox.form.saveDraft` | address + `"message": "<id>"`, `"answers": {…}` | merge `answers` (any subset of the questions) into the form's draft; no event | `not-found` (thread, message, or no form on it), `closed-form`, `invalid` (unknown question, wrong type, bad value; one bad answer refuses all), `denied` (archived) |
+| `inbox.form.submit` | address + `"message": "<id>"`, `"answers": {…}` | submit the form: `answers` over the draft over the defaults, one `submit` event with every answer | as `saveDraft`, and `invalid` listing the required questions left unanswered |
 | `inbox.notify.dismiss` | `{"thread": id}`, or `{"all": true}` | remove one notification thread, or every one | `not-found`, `invalid` (a dispatcher thread, or `all` with a thread) |
 | `inbox.notify.markRead` | `{"thread": id}`, or `{"all": true}` | mark one notification thread read, or every one (dispatcher threads are untouched) | `not-found`, `invalid` (a dispatcher thread, or `all` with a thread) |
+
+### Forms
+
+A message block `{"type":"form", …}` (docs/automations-guide.md, *Forms*):
+
+| field | |
+|---|---|
+| `id` | the form's id |
+| `title` | or `null` |
+| `submit` | the submit button's label |
+| `questions` | by `type`, each with `id`, `label` (inline markdown), `context` (markdown or `null`), `required`: `{"type":"choice","options":[{"id","label","description"}],"multiple","default"}` (`default`: an option id, ids when `multiple`, or `null`), `{"type":"text","placeholder","default","multiline","max"}` (`max` in bytes), `{"type":"confirm","yes","no","default"}` (`yes`/`no`: labels or `null`) |
+| `state` | `open` \| `submitted` \| `withdrawn` (the owner withdrew the message, or re-sent it without the form) |
+| `draft` | an open form's saved answers (`inbox.form.saveDraft`), `{}` otherwise |
+| `answers` | once submitted, every question's answer; `null` before |
+
+Answers are keyed by question id: a choice takes an option id, a
+`multiple` choice an array of ids, a text question a string (at most `max`
+bytes), a confirm `true`/`false`. A submission's answers have every
+question, defaults filled in: unanswered optional text is `""`, an
+unanswered `multiple` choice `[]`, an unanswered optional choice or
+confirm `null`. A required question needs an answer (text: not blank;
+`multiple`: at least one id). A form is submitted once; a submitted form
+is frozen, whatever its owner re-sends.
 
 Host verbs (`vscode`, `terminal`, …) run in the client that shows the
 button; the API doesn't run them, and refuses a host-only action. An action
