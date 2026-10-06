@@ -1058,7 +1058,7 @@ struct PaneLayout {
 
 fn thread_pane_layout(app: &App, t: &Thread, inner: Rect) -> PaneLayout {
     let child = app.thread_child(t);
-    let header = header_lines(&pane_header(t, child.as_ref(), app.utc_offset), inner.width, app.inbox.raw);
+    let header = header_lines(&pane_header(t, child.as_ref(), app.thread_target_stopped(t), app.utc_offset), inner.width, app.inbox.raw);
     let rows = header.len().min(u16::MAX as usize) as u16;
     let forms = form_rows(app, t, inner.width);
     let want = forms.lines.len().min(u16::MAX as usize) as u16;
@@ -2689,7 +2689,7 @@ mod tests {
             note("m", Level::Warn, 0),
         ] {
             let card: String = card_chip(&t).into_iter().map(|(s, _)| s).collect();
-            let pane = &header_lines(&pane_header(&t, None, 0), 200, false)[1];
+            let pane = &header_lines(&pane_header(&t, None, false, 0), 200, false)[1];
             assert!(row_text(pane).starts_with(&format!("{card}  ·  ")), "{card:?} vs {:?}", row_text(pane));
         }
     }

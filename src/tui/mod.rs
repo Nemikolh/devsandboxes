@@ -482,8 +482,8 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
         });
         starts.retain_mut(|(instance, rx)| match rx.try_recv() {
             Ok(done) => {
-                app.starting.remove(instance);
-                app.status = Some(done.status);
+                // Also runs a thread action that was waiting on this start.
+                app.start_finished(instance, Some(done.status), done.failed);
                 last_tick = Instant::now();
                 followup.schedule(last_tick);
                 if pending.is_none() {
@@ -494,7 +494,7 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
             Err(TryRecvError::Empty) => true,
             // Thread died without sending; clear the guard so `s` works again.
             Err(TryRecvError::Disconnected) => {
-                app.starting.remove(instance);
+                app.start_finished(instance, None, true);
                 false
             }
         });
@@ -764,8 +764,9 @@ pub(crate) fn local_utc_offset() -> i64 {
 struct OpDone {
     /// One-line outcome for the help-bar status.
     status: String,
-    /// The op failed (only `spawn_done` reads it: a thread's child write
-    /// reports failures alone).
+    /// The op failed. Read for `spawn_done` (a thread's child write reports
+    /// failures alone) and `spawn_start` (a thread action waiting on the
+    /// start is dropped).
     failed: bool,
 }
 
@@ -804,7 +805,7 @@ fn spawn_start(instance: &str) -> Receiver<OpDone> {
     let (tx, rx) = mpsc::channel();
     let instance = instance.to_string();
     std::thread::spawn(move || {
-        let status = match crate::state::State::load() {
+        let (status, failed) = match crate::state::State::load() {
             Ok(state) => match state.instances.get(&instance) {
                 Some(info) => {
                     // Bare start bypasses `start_instance`, so re-point the agent
@@ -814,16 +815,24 @@ fn spawn_start(instance: &str) -> Receiver<OpDone> {
                     let services =
                         commands::stop::service_containers(&info.project, &info.instance_id);
                     commands::start::start_containers(&info.container, &services, true);
-                    // Reinstall the helper (no-op when current): covers CLI
-                    // upgrades and images that mount a tmpfs at `/run`.
-                    crate::devsbd::ensure_recorded(&instance, info, true);
-                    format!("started {instance}")
+                    // `start_containers` ignores exit codes; whether the
+                    // instance is up decides if a waiting thread action runs.
+                    match crate::runtime::backend().is_running(&info.container) {
+                        Ok(Some(true)) => {
+                            // Reinstall the helper (no-op when current): covers CLI
+                            // upgrades and images that mount a tmpfs at `/run`.
+                            crate::devsbd::ensure_recorded(&instance, info, true);
+                            (format!("started {instance}"), false)
+                        }
+                        Ok(_) => (format!("start: {instance} did not come up (see its logs)"), true),
+                        Err(e) => (format!("start: {e:#}"), true),
+                    }
                 }
-                None => format!("start: unknown instance `{instance}`"),
+                None => (format!("start: unknown instance `{instance}`"), true),
             },
-            Err(e) => format!("start: {e:#}"),
+            Err(e) => (format!("start: {e:#}"), true),
         };
-        let _ = tx.send(OpDone { status, failed: false });
+        let _ = tx.send(OpDone { status, failed });
     });
     rx
 }

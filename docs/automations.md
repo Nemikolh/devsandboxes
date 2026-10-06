@@ -106,14 +106,16 @@ folder = "../web"
 ```
 devsbd ensure <sandbox> --key <key> [--branch B] [--env K=V]...
     # idempotent: creates <sandbox>-<key> if missing, starts it if stopped,
-    # rebuilds it if its container is gone; prints the instance name.
+    # rebuilds it if its container is gone; answers
+    # {"name","key","sandbox","state":"running","created","started"}.
     # --branch/--env apply at creation only.
 devsbd ls                                   # this dispatcher's children + state (JSON)
 devsbd branches <sandbox> [--ahead]         # who holds each branch of <sandbox>'s repo (JSON);
                                             # read-only, see docs/dispatcher-branch-holders.md
-devsbd stop <key> [--sandbox S]
-devsbd rm <key> [--sandbox S]
-devsbd done <key> [--sandbox S]             # mark a child done; `ensure` reusing it clears it
+devsbd stop <key> [--sandbox S]             # {"name","key","state":"stopped"}
+devsbd rm <key> [--sandbox S]               # {"name","key","removed":true}
+devsbd done <key> [--sandbox S]             # mark a child done; `ensure` reusing it clears it;
+                                            # {"name","key","done":true}
 devsbd exec <key> [--sandbox S] [--detach] -- <cmd>...   # a run; see _Runs_
 devsbd events [--wait SECS] [--thread KEY]  # pending Inbox events (JSON lines); see _Inbox threads_
 devsbd events --follow [--thread KEY]       # the same, pushed over one held-open stream
@@ -122,6 +124,8 @@ devsbd thread ls                            # this instance's live threads (JSON
 ```
 
 Exit codes: 0 ok, 1 failed, 2 usage (or a key shared by two sandboxes without `--sandbox`), 75 no host connected, 77 denied.
+
+The child-management ops answer JSON on stdout, so a dispatcher never parses prose: `ensure`/`stop`/`rm`/`done` one compact object line (above; `created` = the child didn't exist, `started` = it existed but wasn't up, both false = already running), `ls`/`branches` an array. Errors answer no JSON: a non-zero exit and the message on stderr.
 
 - Children are named `<sandbox>-<key>` (e.g. `web-pr-123`): predictable, so a human can `devsandbox vscode web-pr-123`.
 

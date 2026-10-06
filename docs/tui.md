@@ -277,7 +277,9 @@ shared with `inbox_hit`). Top to bottom:
   the dashboard; `✓` = also marks done; the rest is an event for the sender,
   which the status line says on press) and `[o] VS Code  [t] Terminal  [l]
   Logs  [p] Port`, the target keys, on a live dispatcher thread whose target
-  resolves. The row wraps between buttons. A notify thread's header is its
+  resolves. A button that would start its stopped target first (below) gets
+  a dim ` (stopped)` after its label: a `vscode`/`terminal`/`forward` host
+  action and `[o]`/`[t]`/`[p]`, not `[l]`. The row wraps between buttons. A notify thread's header is its
   title and level chip.
 - A **separator** joined to the pane's border (`├─┤`).
 - **Open forms, pinned** (below): each open form of the thread, newest
@@ -381,6 +383,20 @@ Archived threads refuse actions, replies, `d` and `u` with a status line. A
 host action whose child isn't found is refused rather than run on the sender,
 and sends no event. The `rm` verb goes through the `:rm` path (the CLI's own
 confirm on the suspended screen).
+
+On a stopped target (the child, or the sender with none), `vscode`,
+`terminal`, `forward` and `o`/`t`/`p` start it first: the status line says
+`starting <name>…`, the background start of `s` runs, and the verb is kept
+in `App::after_start` (`thread_actions::Deferred`). The event loop reports
+the start's end to `App::start_finished`: on success the verb runs (a
+terminal opens without waiting for the snapshot to say running, the start
+having checked the container is up); on failure (`spawn_start` checks
+`is_running`, since `start_containers` ignores exit codes) the status line
+shows why and the verb is dropped. A newer such action replaces a waiting
+one; a second click on the same target doesn't start it twice. `logs` never
+starts it (a stopped container's logs say why it stopped), nor do `open` and
+`rm`. A target whose container is gone is refused with a hint to rebuild
+it. Any event the button also queues for the sender is sent on the click.
 
 ## Phase 5 — done instances, VS Code at a line
 

@@ -359,6 +359,17 @@ impl App {
         self.open_terminal_to(target, false);
     }
 
+    /// [`Self::open_instance_terminal`] right after a start this dashboard
+    /// ran confirmed `name` is up: the snapshot says stopped until the
+    /// refresh that start triggered lands, so its status isn't checked.
+    pub(super) fn open_started_terminal(&mut self, name: &str) {
+        let target = match self.snapshot.as_ref().and_then(|s| s.instances.iter().find(|r| r.name == name)) {
+            Some(row) => Ok((row.name.clone(), row.container.clone(), true)),
+            None => Err(format!("terminal: `{name}` not in the snapshot")),
+        };
+        self.open_terminal_to(target, false);
+    }
+
     /// The shared tail of [`Self::open_terminal`] and
     /// [`Self::open_instance_terminal`]: dedup, argv, spawn, focus.
     fn open_terminal_to(&mut self, target: Result<(String, String, bool), String>, force_new: bool) {

@@ -377,13 +377,23 @@ pub(crate) fn handle_with(
                     }
                 }
             }
+            let ensured = |action: &Ensure| {
+                answer(&Ensured {
+                    name: &name,
+                    key,
+                    sandbox,
+                    state: ChildState::Running,
+                    created: *action == Ensure::Run,
+                    started: matches!(action, Ensure::Start | Ensure::Rebuild),
+                })
+            };
             match action {
                 Err(resp) => resp,
-                Ok(Ensure::Nothing) => Response::new(Status::Ok, name),
+                Ok(Ensure::Nothing) => ensured(&Ensure::Nothing),
                 Ok(action) => {
                     let args = ensure_args(&action, sandbox, &name, req, owner_id);
                     match exec.devsandbox(config_dir, &args) {
-                        Ok(()) => Response::new(Status::Ok, name),
+                        Ok(()) => ensured(&action),
                         Err(e) => failed(e),
                     }
                 }
@@ -397,7 +407,10 @@ pub(crate) fn handle_with(
             };
             let args = vec![req.op.as_str().to_string(), name.clone()];
             match exec.devsandbox(config_dir, &args) {
-                Ok(()) => Response::new(Status::Ok, name),
+                Ok(()) if req.op == Op::Stop => {
+                    answer(&Stopped { name: &name, key, state: ChildState::Stopped })
+                }
+                Ok(()) => answer(&Removed { name: &name, key, removed: true }),
                 Err(e) => failed(e),
             }
         }
@@ -409,11 +422,12 @@ pub(crate) fn handle_with(
             };
             // Idempotent, keeping the original since: a dispatcher may repeat
             // it every pass.
+            let marked = answer(&Marked { name: &name, key, done: true });
             if state.instances[&name].done.is_some() {
-                return Response::new(Status::Ok, name);
+                return marked;
             }
             match exec.set_done(&name, Some(Instance::now())) {
-                Ok(()) => Response::new(Status::Ok, name),
+                Ok(()) => marked,
                 Err(e) => failed(e),
             }
         }
@@ -975,6 +989,52 @@ fn find_child(
     }
 }
 
+/// A child op's answer as one compact JSON line, so a dispatcher never
+/// parses prose (docs/automations.md, *Control API*).
+fn answer(body: &impl Serialize) -> Response {
+    match serde_json::to_string(body) {
+        Ok(json) => Response::new(Status::Ok, json),
+        Err(e) => failed(e.to_string()),
+    }
+}
+
+/// The `ensure` answer. `created`: the child didn't exist (`run`);
+/// `started`: it existed but wasn't up (`start`, or `rebuild` without a
+/// container). Both false: it was already running.
+#[derive(Serialize)]
+struct Ensured<'a> {
+    name: &'a str,
+    key: &'a str,
+    sandbox: &'a str,
+    state: ChildState,
+    created: bool,
+    started: bool,
+}
+
+/// The `stop` answer.
+#[derive(Serialize)]
+struct Stopped<'a> {
+    name: &'a str,
+    key: &'a str,
+    state: ChildState,
+}
+
+/// The `rm` answer.
+#[derive(Serialize)]
+struct Removed<'a> {
+    name: &'a str,
+    key: &'a str,
+    removed: bool,
+}
+
+/// The `done` answer (also when it already was).
+#[derive(Serialize)]
+struct Marked<'a> {
+    name: &'a str,
+    key: &'a str,
+    done: bool,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum ChildState {
@@ -1439,6 +1499,25 @@ folder = "."
         v.iter().map(|s| s.to_string()).collect()
     }
 
+    /// The JSON answer of an `ensure` of `<sandbox>-<key>`.
+    fn ensured(sandbox: &str, key: &str, created: bool, started: bool) -> Response {
+        let body = format!(
+            r#"{{"name":"{sandbox}-{key}","key":"{key}","sandbox":"{sandbox}","state":"running","created":{created},"started":{started}}}"#
+        );
+        Response::new(Status::Ok, body)
+    }
+
+    /// The JSON answer of `stop`/`rm`/`done` on child `name`.
+    fn answered(op: Op, name: &str, key: &str) -> Response {
+        let fact = match op {
+            Op::Stop => r#""state":"stopped""#,
+            Op::Rm => r#""removed":true"#,
+            Op::Done => r#""done":true"#,
+            _ => unreachable!(),
+        };
+        Response::new(Status::Ok, format!(r#"{{"name":"{name}","key":"{key}",{fact}}}"#))
+    }
+
     #[test]
     fn authorization_matrix() {
         let s = state();
@@ -1533,7 +1612,7 @@ folder = "."
         r.branch = Some("feat/x".into());
         r.env = vec![("A".into(), "1".into())];
         let resp = call(&s, "d", &r, &mut fake);
-        assert_eq!(resp, Response::new(Status::Ok, "web-pr-1"));
+        assert_eq!(resp, ensured("web", "pr-1", true, false));
         assert_eq!(
             fake.calls,
             vec![argv(&[
@@ -1542,23 +1621,24 @@ folder = "."
             ])]
         );
 
-        // Running: nothing, still the name.
+        // Running: nothing, still the answer.
         let s = state();
         let mut fake = Fake::new();
         let resp = call(&s, "d", &req(Op::Ensure, Some("web"), Some("one")), &mut fake);
-        assert_eq!(resp, Response::new(Status::Ok, "web-one"));
+        assert_eq!(resp, ensured("web", "one", false, false));
         assert!(fake.calls.is_empty());
         assert!(fake.saved.is_empty(), "no env given: saved env kept");
 
         // Stopped: start (the branch of an existing child is ignored).
         let resp = call(&s, "d", &r_with(Op::Ensure, "two"), &mut fake);
-        assert_eq!(resp, Response::new(Status::Ok, "web-two"));
+        assert_eq!(resp, ensured("web", "two", false, true));
         assert_eq!(fake.calls, vec![argv(&["start", "web-two"])]);
 
         // No container: rebuild, keeping the worktree.
         let mut fake = Fake::new();
         fake.running.remove("devsandbox-web-two");
-        call(&s, "d", &r_with(Op::Ensure, "two"), &mut fake);
+        let resp = call(&s, "d", &r_with(Op::Ensure, "two"), &mut fake);
+        assert_eq!(resp, ensured("web", "two", false, true));
         assert_eq!(fake.calls, vec![argv(&["rebuild", "web-two"])]);
 
         // A failing subprocess is Failed with its message.
@@ -1879,7 +1959,7 @@ folder = "."
         assert_eq!(resp.status, Status::Ok);
         // No `max-instances`: `a` gets the default cap; others' children don't count.
         let resp = call(&s, "a", &req(Op::Ensure, Some("web"), Some("three")), &mut fake);
-        assert_eq!(resp, Response::new(Status::Ok, "web-three"));
+        assert_eq!(resp, ensured("web", "three", true, false));
         let mut s = state();
         let cap = crate::config::Dispatcher::DEFAULT_MAX_INSTANCES as usize;
         for i in 1..cap {
@@ -1943,7 +2023,7 @@ folder = "."
         for good in ["feat/x", "joan/pr-12", "release-1.2"] {
             let mut fake = Fake::new();
             let resp = call(&s, "d", &with(good), &mut fake);
-            assert_eq!(resp, Response::new(Status::Ok, "web-one"), "{good:?}");
+            assert_eq!(resp, ensured("web", "one", false, false), "{good:?}");
         }
     }
 
@@ -1952,9 +2032,9 @@ folder = "."
         let s = state();
         let mut fake = Fake::new();
         let resp = call(&s, "d", &req(Op::Stop, None, Some("one")), &mut fake);
-        assert_eq!(resp, Response::new(Status::Ok, "web-one"));
+        assert_eq!(resp, answered(Op::Stop, "web-one", "one"));
         let resp = call(&s, "d", &req(Op::Rm, Some("web"), Some("two")), &mut fake);
-        assert_eq!(resp, Response::new(Status::Ok, "web-two"));
+        assert_eq!(resp, answered(Op::Rm, "web-two", "two"));
         assert_eq!(fake.calls, vec![argv(&["stop", "web-one"]), argv(&["rm", "web-two"])]);
         // The sandbox filter narrows the lookup.
         let resp = call(&s, "d", &req(Op::Stop, Some("api"), Some("one")), &mut fake);
@@ -1966,9 +2046,9 @@ folder = "."
         let s = state();
         let mut fake = Fake::new();
         let resp = call(&s, "d", &req(Op::Done, None, Some("one")), &mut fake);
-        assert_eq!(resp, Response::new(Status::Ok, "web-one"));
+        assert_eq!(resp, answered(Op::Done, "web-one", "one"));
         let resp = call(&s, "d", &req(Op::Done, Some("web"), Some("two")), &mut fake);
-        assert_eq!(resp, Response::new(Status::Ok, "web-two"));
+        assert_eq!(resp, answered(Op::Done, "web-two", "two"));
         let names: Vec<&str> = fake.dones.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, ["web-one", "web-two"]);
         assert!(fake.dones.iter().all(|(_, d)| d.is_some()));
@@ -1995,7 +2075,7 @@ folder = "."
         s.instances.get_mut("web-one").unwrap().done = Some(7);
         let mut fake = Fake::new();
         let resp = call(&s, "d", &req(Op::Done, None, Some("one")), &mut fake);
-        assert_eq!(resp, Response::new(Status::Ok, "web-one"));
+        assert_eq!(resp, answered(Op::Done, "web-one", "one"));
         assert!(fake.dones.is_empty());
 
         // A failed write is reported.
@@ -2012,13 +2092,13 @@ folder = "."
         // Running: nothing to run, but the flag is cleared.
         let mut fake = Fake::new();
         let resp = call(&s, "d", &req(Op::Ensure, Some("web"), Some("one")), &mut fake);
-        assert_eq!(resp, Response::new(Status::Ok, "web-one"));
+        assert_eq!(resp, ensured("web", "one", false, false));
         assert_eq!(fake.dones, vec![("web-one".to_string(), None)]);
         assert!(fake.calls.is_empty());
         // Stopped: cleared, then started.
         let mut fake = Fake::new();
         let resp = call(&s, "d", &req(Op::Ensure, Some("web"), Some("two")), &mut fake);
-        assert_eq!(resp, Response::new(Status::Ok, "web-two"));
+        assert_eq!(resp, ensured("web", "two", false, true));
         assert_eq!(fake.dones, vec![("web-two".to_string(), None)]);
         assert_eq!(fake.calls, vec![argv(&["start", "web-two"])]);
         // Not done: no write.
@@ -2043,7 +2123,7 @@ folder = "."
         assert_eq!(resp.status, Status::Usage);
         assert!(resp.body.contains("api-one, web-one"), "{resp:?}");
         let resp = call(&s, "d", &req(Op::Stop, Some("api"), Some("one")), &mut fake);
-        assert_eq!(resp, Response::new(Status::Ok, "api-one"));
+        assert_eq!(resp, answered(Op::Stop, "api-one", "one"));
     }
 
     #[test]

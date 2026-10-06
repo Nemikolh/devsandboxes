@@ -53,6 +53,8 @@ devsandbox vscode web-2 --goto src/main.rs:42:7
 
 - **An open dashboard updates the helper in running instances.** Before, a running dispatcher only got new `devsbd` verbs after `devsandbox start`; now opening the dashboard of a newer devsandbox is enough.
 
+- **`devsbd ensure`, `stop`, `rm` and `done` answer JSON.** Each prints one JSON line instead of the bare instance name, so a dispatcher never parses prose: `ensure` gives `name`, `key`, `sandbox`, `state`, and whether the child was `created` or `started`; `stop` gives `state: "stopped"`, `rm` `removed: true`, `done` `done: true`. A script that read the name from stdout reads `.name` now. Errors are unchanged: a message on stderr and a non-zero exit.
+
 - **`rm` cleans up merged branches without asking.** With no flag, `rm` first runs `git fetch --prune origin`, then decides about the branch the worktree has checked out. If every commit on it is already on its remote branch, or the remote branch it tracked has been deleted (a merged PR), the branch is deleted without a prompt. Only a branch with commits that exist nowhere else still prompts, and off a TTY it is kept. Branches you reused with `--branch` follow the same rules now. The default branch (`origin/HEAD`, `main`, `master`) is never deleted. When `rm` deletes a branch, it also deletes the branch `run` created if that branch is an ancestor of it. `--delete-branch` / `--keep-branch` still decide outright.
 
 ### Fixed

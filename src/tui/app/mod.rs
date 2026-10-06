@@ -160,6 +160,10 @@ pub struct App {
     pub pending_start: Option<String>,
     /// Instances with a start in flight (same dedup rule as `stopping`).
     pub starting: BTreeSet<String>,
+    /// A thread host action waiting on the start of its stopped target
+    /// (`thread_actions.rs`): run by [`App::start_finished`] once that
+    /// start succeeds, dropped if it fails. A newer such action replaces it.
+    after_start: Option<(String, thread_actions::Deferred)>,
     /// Done-flag changes the event loop should write to state on a
     /// background thread (`d`/`u` on an instance row, and a thread's child
     /// on the Inbox thread `done`/reopen).
@@ -268,6 +272,7 @@ impl App {
             stopping: BTreeSet::new(),
             pending_start: None,
             starting: BTreeSet::new(),
+            after_start: None,
             pending_signal: None,
             pending_done: Vec::new(),
             ports: Vec::new(),

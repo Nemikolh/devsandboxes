@@ -472,8 +472,13 @@ pub enum HeaderRow {
 }
 
 /// The thread-target keys ([`App::on_inbox_thread_key`]) the action row
-/// offers next to the owner's actions, with their button labels.
-const TARGET_KEYS: [(char, &str); 4] = [('o', "VS Code"), ('t', "Terminal"), ('l', "Logs"), ('p', "Port")];
+/// offers next to the owner's actions, with their button labels and whether
+/// they start a stopped target first (`l` works on a stopped one).
+const TARGET_KEYS: [(char, &str, bool); 4] =
+    [('o', "VS Code", true), ('t', "Terminal", true), ('l', "Logs", false), ('p', "Port", true)];
+
+/// The dim suffix of a button that will start its stopped target first.
+const STOPPED: &str = " (stopped)";
 
 /// The thread pane's pinned header for `t`: the title (`↗` with a link), the
 /// chip and stamp with `owner · key` on the right, the child (with
@@ -482,8 +487,10 @@ const TARGET_KEYS: [(char, &str); 4] = [('o', "VS Code"), ('t', "Terminal"), ('l
 /// an event for the owner, which the status line says on press) and the
 /// target keys. Those are offered on a live dispatcher thread whose target
 /// resolves (not on an unresolved child); a notify thread's header is its
-/// title and level chip. Pure, so what the header says is unit-testable.
-pub fn pane_header(t: &Thread, child: Option<&ChildInfo>, utc_offset: i64) -> Vec<HeaderRow> {
+/// title and level chip. `target_stopped` ([`App::thread_target_stopped`])
+/// marks the buttons that would start the target first `(stopped)`. Pure,
+/// so what the header says is unit-testable.
+pub fn pane_header(t: &Thread, child: Option<&ChildInfo>, target_stopped: bool, utc_offset: i64) -> Vec<HeaderRow> {
     let mut title = line(Tone::Title, title_of(t));
     if t.link.is_some() || t.head().is_some_and(|r| r.link.is_some()) {
         title.push((Tone::Link, " ↗".into()));
@@ -521,6 +528,9 @@ pub fn pane_header(t: &Thread, child: Option<&ChildInfo>, utc_offset: i64) -> Ve
         .enumerate()
         .map(|(i, a)| {
             let mut b = vec![(Tone::Bold, format!("[{}] ", i + 1)), (Tone::Plain, a.label.clone())];
+            if target_stopped && a.host.as_ref().is_some_and(super::thread_actions::starts_target) {
+                b.push((Tone::Dim, STOPPED.into()));
+            }
             if a.host.is_some() {
                 b.push((Tone::Dim, " ⌂".into()));
             }
@@ -532,7 +542,13 @@ pub fn pane_header(t: &Thread, child: Option<&ChildInfo>, utc_offset: i64) -> Ve
         .collect();
     let target = t.kind == Kind::Thread && !t.archived && child.is_none_or(|c| c.name.is_some());
     if target {
-        buttons.extend(TARGET_KEYS.iter().map(|(k, label)| vec![(Tone::Bold, format!("[{k}] ")), (Tone::Plain, label.to_string())]));
+        buttons.extend(TARGET_KEYS.iter().map(|(k, label, starts)| {
+            let mut b = vec![(Tone::Bold, format!("[{k}] ")), (Tone::Plain, label.to_string())];
+            if target_stopped && *starts {
+                b.push((Tone::Dim, STOPPED.into()));
+            }
+            b
+        }));
     }
     if !buttons.is_empty() {
         rows.push(HeaderRow::Buttons(buttons));
@@ -1700,7 +1716,7 @@ mod tests {
         let t = thread(&app, "asks").clone();
         let child = app.thread_child(&t).unwrap();
         assert_eq!((child.name.as_deref(), child.status.as_deref(), child.stopped), (Some("inst0"), Some("running"), false));
-        let rows = pane_header(&t, Some(&child), 0);
+        let rows = pane_header(&t, Some(&child), false, 0);
         assert_eq!(header_texts(&rows), [
             "asks ↗".to_string(),
             format!("● review  ·  {} | d · asks", stamp(10, 0)),
@@ -1725,14 +1741,23 @@ mod tests {
         app.set_snapshot(snapshot_with_status(1, ContainerStatus::Exited("Exited (0)".into())));
         let child = app.thread_child(&t).unwrap();
         assert!(child.stopped);
-        assert_eq!(header_texts(&pane_header(&t, Some(&child), 0))[2], "child inst0  (stopped)");
+        assert!(app.thread_target_stopped(&t));
+        let text = header_texts(&pane_header(&t, Some(&child), app.thread_target_stopped(&t), 0));
+        assert_eq!(text[2], "child inst0  (stopped)");
+        // The buttons that start it first say so; `[l]` works stopped, and a
+        // button without a host action doesn't touch the child.
+        assert_eq!(
+            text[3],
+            "buttons: [1] Open draft (stopped) ⌂  [2] Post replies  [3] Done ✓  [o] VS Code (stopped)  \
+             [t] Terminal (stopped)  [l] Logs  [p] Port (stopped)"
+        );
 
         // A child key the owner doesn't have stays visible, unresolved, and
         // the target keys go: they'd only say "not found".
         app.thread_children.clear();
         let child = app.thread_child(&t).unwrap();
         assert_eq!(child.name, None);
-        let text = header_texts(&pane_header(&t, Some(&child), 0));
+        let text = header_texts(&pane_header(&t, Some(&child), false, 0));
         assert_eq!(text[2], "child pr-1 (no such child)");
         assert_eq!(text[3], "buttons: [1] Open draft ⌂  [2] Post replies  [3] Done ✓");
     }
@@ -1743,17 +1768,27 @@ mod tests {
         put(&mut app, "d", 10, body("asks", State::Active));
         let t = thread(&app, "asks").clone();
         // No child row; the target keys aim at the owner.
-        assert_eq!(header_texts(&pane_header(&t, None, 0)), [
+        assert_eq!(header_texts(&pane_header(&t, None, false, 0)), [
             "asks".to_string(),
             format!("○ active  ·  {} | d · asks", stamp(10, 0)),
             "buttons: [o] VS Code  [t] Terminal  [l] Logs  [p] Port".into(),
         ]);
+        // A stopped owner, the fallback target, is marked the same way.
+        assert!(!app.thread_target_stopped(&t), "not in a snapshot: unknown, not stopped");
+        let mut snap = snapshot_with_status(1, ContainerStatus::Exited("Exited (0)".into()));
+        snap.instances[0].instance_id = "d-id".into();
+        app.set_snapshot(snap);
+        assert!(app.thread_target_stopped(&t));
+        assert_eq!(
+            header_texts(&pane_header(&t, None, true, 0))[2],
+            "buttons: [o] VS Code (stopped)  [t] Terminal (stopped)  [l] Logs  [p] Port (stopped)"
+        );
         // Archived: said in the header, and no keys (every one is refused).
         let mut inbox = app.inbox.content.clone();
         inbox.archive_owner("d-id");
         app.set_inbox(inbox);
         let t = thread(&app, "asks").clone();
-        assert_eq!(header_texts(&pane_header(&t, None, 0)), [
+        assert_eq!(header_texts(&pane_header(&t, None, false, 0)), [
             "asks".to_string(),
             format!("○ active  ·  {} | d · asks", stamp(10, 0)),
             "(archived: instance removed)".into(),
@@ -1765,13 +1800,13 @@ mod tests {
         let mut app = new_app();
         push(&mut app, "a", Record { level: Level::Warn, at: 5, ..rec("disk low\nmore", Some("k"), Some("https://x")) });
         let t = thread(&app, "disk low").clone();
-        assert_eq!(header_texts(&pane_header(&t, None, 0)), [
+        assert_eq!(header_texts(&pane_header(&t, None, false, 0)), [
             "disk low ↗".to_string(),
             format!("▲ warn  ·  {} | a · k", stamp(5, 0)),
         ]);
         push(&mut app, "a", rec("unkeyed", None, None));
         let t = thread(&app, "unkeyed").clone();
-        assert_eq!(header_texts(&pane_header(&t, None, 0))[1], format!("· info  ·  {} | a", stamp(0, 0)));
+        assert_eq!(header_texts(&pane_header(&t, None, false, 0))[1], format!("· info  ·  {} | a", stamp(0, 0)));
     }
 
     /// The feed newest first: messages under their author's stamp row with
@@ -1931,7 +1966,7 @@ mod tests {
         put(&mut app, "d", 10, body("idle", State::Active));
         put(&mut app, "d", 10, ThreadPut { status: Some("merged".into()), ..body("fin", State::Done) });
         push(&mut app, "a", Record { level: Level::Error, ..rec("boom", None, None) });
-        let head = |title: &str| match pane_header(thread(&app, title), None, 0).swap_remove(1) {
+        let head = |title: &str| match pane_header(thread(&app, title), None, false, 0).swap_remove(1) {
             HeaderRow::Line { left, .. } => left,
             row => panic!("{row:?}"),
         };

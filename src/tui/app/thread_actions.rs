@@ -9,15 +9,109 @@
 //! The target is the one thing a thread body can't choose freely: its
 //! `child` (one of the owner's dispatcher children), else the owner itself.
 //! Nothing a container writes can aim a host action at another instance.
+//!
+//! `vscode`, `terminal` and `forward` (and the `o`/`t`/`p` keys) need their
+//! target up: on a stopped one they start it first and run once that start
+//! succeeds ([`Deferred`], [`App::start_finished`]). `logs` doesn't (logs of
+//! a stopped container say why it stopped), nor do `open` and `rm`.
 
 use crate::commands::vscode::Goto;
 use crate::inbox::thread::HostVerb;
 use crate::inbox::{Op, Thread};
+use crate::snapshot::ContainerStatus;
 use crate::tui::prompt::PromptAction;
 
 use super::{App, PortRequest};
 
+/// A host action that needs its target running, kept while a start of it
+/// is in flight. The instance is held next to it in `App::after_start`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum Deferred {
+    /// VS Code, with the click's note for the launch line.
+    Code { goto: Option<Goto>, note: Option<String> },
+    Terminal,
+    Forward(PortRequest),
+    /// `p`: the `port` prompt prefilled for the target.
+    PortPrompt,
+}
+
+/// Whether `host` starts a stopped target first (see the module doc).
+pub(super) fn starts_target(host: &HostVerb) -> bool {
+    matches!(host, HostVerb::Vscode(_) | HostVerb::Terminal(_) | HostVerb::Forward(_))
+}
+
 impl App {
+    /// Whether `t`'s target resolves to an instance whose container exists
+    /// in the snapshot but isn't up (exited or gone): the header marks the
+    /// actions that would start it `(stopped)`.
+    pub fn thread_target_stopped(&self, t: &Thread) -> bool {
+        self.thread_target(t).is_ok_and(|name| {
+            self.instance_status(&name).is_some_and(|s| matches!(s, ContainerStatus::Exited(_) | ContainerStatus::Missing))
+        })
+    }
+
+    fn instance_status(&self, name: &str) -> Option<&ContainerStatus> {
+        let snapshot = self.snapshot.as_ref()?;
+        snapshot.instances.iter().find(|r| r.name == name).map(|r| &r.status)
+    }
+
+    /// Run `verb` on instance `name` now if it's up (or its state is
+    /// unknown: the verb's own checks speak), else start it and keep `verb`
+    /// for [`Self::start_finished`]. Either way a pending one is replaced:
+    /// the latest click is what the user wants. A container that's gone
+    /// needs a rebuild, which isn't this dashboard's to run unasked.
+    fn when_up(&mut self, name: String, verb: Deferred) {
+        self.after_start = None;
+        match self.instance_status(&name) {
+            Some(ContainerStatus::Exited(_)) => {
+                self.status = Some(format!("starting {name}…"));
+                // Already starting (`s`, or an earlier click): just wait on it.
+                if self.starting.insert(name.clone()) {
+                    self.pending_start = Some(name.clone());
+                }
+                self.after_start = Some((name, verb));
+            }
+            Some(ContainerStatus::Missing) => {
+                self.status = Some(format!("`{name}` has no container: rebuild it first (`s` on its row)"));
+            }
+            _ => self.run_deferred(&name, verb, false),
+        }
+    }
+
+    /// Carry out `verb` on `name`. `started`: a start this dashboard ran just
+    /// confirmed it's up, though the snapshot may still say otherwise.
+    fn run_deferred(&mut self, name: &str, verb: Deferred, started: bool) {
+        match verb {
+            Deferred::Code { goto, note } => {
+                self.code_note = note;
+                self.pending_action = Some(PromptAction::Code { instance: name.to_string(), goto });
+            }
+            Deferred::Terminal if started => self.open_started_terminal(name),
+            Deferred::Terminal => self.open_instance_terminal(name),
+            Deferred::Forward(req) => self.request_port(req),
+            Deferred::PortPrompt => self.open_port_prompt_for(name),
+        }
+    }
+
+    /// The event loop's report that a background start of `instance` ended:
+    /// clear its in-flight guard, show `status` (`None`: the worker died
+    /// without one), and run the action waiting on it if the start worked.
+    /// A failed start drops it; its status line says why.
+    pub fn start_finished(&mut self, instance: &str, status: Option<String>, failed: bool) {
+        self.starting.remove(instance);
+        if let Some(status) = status {
+            self.status = Some(status);
+        }
+        match self.after_start.take() {
+            Some((name, verb)) if name == instance => {
+                if !failed {
+                    self.run_deferred(&name, verb, true);
+                }
+            }
+            other => self.after_start = other,
+        }
+    }
+
     /// The instance `t`'s host actions act on, or a status line saying why
     /// there is none.
     ///
@@ -98,18 +192,16 @@ impl App {
                 let child = later.is_some().then(|| self.send_act(t, act, action.done)).flatten();
                 let note: Vec<&str> =
                     dropped.as_deref().into_iter().chain(child.as_deref()).chain(later).collect();
-                self.code_note = (!note.is_empty()).then(|| note.join(" · "));
-                self.pending_action = Some(PromptAction::Code { instance: target, goto });
+                let note = (!note.is_empty()).then(|| note.join(" · "));
+                self.when_up(target, Deferred::Code { goto, note });
                 return;
             }
-            HostVerb::Terminal(_) => self.open_instance_terminal(&target),
+            HostVerb::Terminal(_) => self.when_up(target, Deferred::Terminal),
             HostVerb::Logs(_) => self.logs_on(&target),
-            HostVerb::Forward(f) => self.request_port(PortRequest {
-                instance: target,
-                service: None,
-                address: None,
-                spec: f.port.to_string(),
-            }),
+            HostVerb::Forward(f) => {
+                let req = PortRequest { instance: target.clone(), service: None, address: None, spec: f.port.to_string() };
+                self.when_up(target, Deferred::Forward(req))
+            }
             HostVerb::Open(o) => self.request_open_link(o.url.clone()),
             // The `:rm` path: the CLI's own confirm, on the suspended screen.
             HostVerb::Rm(_) => {
@@ -154,7 +246,7 @@ impl App {
     /// `o`: VS Code on the thread's target.
     pub(super) fn thread_code(&mut self, t: &Thread) {
         match self.thread_target(t) {
-            Ok(name) => self.pending_action = Some(PromptAction::Code { instance: name, goto: None }),
+            Ok(name) => self.when_up(name, Deferred::Code { goto: None, note: None }),
             Err(why) => self.status = Some(why),
         }
     }
@@ -164,7 +256,7 @@ impl App {
     /// terminal comes back to the thread.
     pub(super) fn thread_terminal(&mut self, t: &Thread) {
         match self.thread_target(t) {
-            Ok(name) => self.open_instance_terminal(&name),
+            Ok(name) => self.when_up(name, Deferred::Terminal),
             Err(why) => self.status = Some(why),
         }
     }
@@ -181,7 +273,7 @@ impl App {
     /// `p`: the `port` prompt prefilled for the thread's target.
     pub(super) fn thread_port_prompt(&mut self, t: &Thread) {
         match self.thread_target(t) {
-            Ok(name) => self.open_port_prompt_for(&name),
+            Ok(name) => self.when_up(name, Deferred::PortPrompt),
             Err(why) => self.status = Some(why),
         }
     }
@@ -391,7 +483,8 @@ mod tests {
         assert_eq!(app.focus, Focus::Dashboard);
         assert_eq!(app.inbox.focus, InboxFocus::Thread);
 
-        // Fixed `t`: same target. A stopped child is refused by name.
+        // Fixed `t`: same target. A child without a container is refused by
+        // name (a rebuild isn't started unasked).
         app.terms.set_active(0);
         app.on_key(key(KeyCode::Char('t')));
         assert_eq!(app.terms.active(), 1);
@@ -400,7 +493,139 @@ mod tests {
         snap.instances[1].status = crate::tui::data::ContainerStatus::Missing;
         app.set_snapshot(snap);
         app.on_key(key(KeyCode::Char('t')));
-        assert_eq!(app.status.as_deref(), Some("terminal: `inst1` is not running"));
+        assert_eq!(app.status.as_deref(), Some("`inst1` has no container: rebuild it first (`s` on its row)"));
+        assert_eq!((app.take_pending_start(), app.after_start.clone()), (None, None));
+    }
+
+    /// `snapshot_with_status(2, running())` with `inst1` (the child `pr-1`)
+    /// exited, and a thread on it with `actions`.
+    fn stopped_child(actions: Vec<Action>) -> App {
+        let mut app = app_with_instances();
+        let mut snap = app.snapshot.clone().unwrap();
+        snap.instances[1].status = ContainerStatus::Exited("Exited (0)".into());
+        app.set_snapshot(snap);
+        children(&mut app, "d-id", "pr-1", "inst1");
+        open_thread(&mut app, Some("pr-1"), actions);
+        app
+    }
+
+    #[test]
+    fn host_verbs_on_a_stopped_child_start_it_then_run() {
+        let vscode = HostVerb::Vscode(Vscode { path: Some("a.rs".into()), line: Some(2), col: None });
+        let mut app = stopped_child(vec![
+            act("Code", Some(vscode)),
+            act("Forward", Some(HostVerb::Forward(Forward { port: 3000 }))),
+        ]);
+
+        // Stopped: a start queued, the verb kept, nothing run yet.
+        app.on_key(key(KeyCode::Char('1')));
+        assert_eq!(app.status.as_deref(), Some("starting inst1…"));
+        assert_eq!(app.take_pending_start().as_deref(), Some("inst1"));
+        assert!(app.starting.contains("inst1"));
+        assert_eq!(app.pending_action, None);
+
+        // Another instance's start ending leaves it waiting.
+        app.start_finished("inst0", Some("started inst0".into()), false);
+        assert_eq!(app.pending_action, None);
+        assert!(app.after_start.is_some());
+
+        // Its start worked: the verb runs.
+        app.start_finished("inst1", Some("started inst1".into()), false);
+        assert!(!app.starting.contains("inst1"));
+        let goto = Goto { path: "a.rs".into(), line: Some(2), col: None };
+        assert_eq!(app.pending_action.take(), Some(PromptAction::Code { instance: "inst1".into(), goto: Some(goto) }));
+        assert_eq!(app.after_start, None, "run once");
+        app.start_finished("inst1", None, false);
+        assert_eq!(app.pending_action, None);
+
+        // A failed start drops it, its status says why.
+        app.on_key(key(KeyCode::Char('2')));
+        assert_eq!(app.take_pending_start().as_deref(), Some("inst1"));
+        app.start_finished("inst1", Some("start: inst1 did not come up (see its logs)".into()), true);
+        assert_eq!(app.take_pending_port(), None);
+        assert_eq!(app.status.as_deref(), Some("start: inst1 did not come up (see its logs)"));
+        assert_eq!(app.after_start, None);
+    }
+
+    #[test]
+    fn a_second_action_replaces_the_pending_one_without_a_second_start() {
+        let mut app = stopped_child(vec![act("Forward", Some(HostVerb::Forward(Forward { port: 3000 })))]);
+        app.on_key(key(KeyCode::Char('o')));
+        assert_eq!(app.take_pending_start().as_deref(), Some("inst1"));
+        // Same target, start in flight: only the verb changes.
+        app.on_key(key(KeyCode::Char('1')));
+        assert_eq!(app.take_pending_start(), None, "one start");
+        app.start_finished("inst1", Some("started inst1".into()), false);
+        assert_eq!(app.pending_action, None, "the `o` was replaced");
+        assert_eq!(
+            app.take_pending_port(),
+            Some(PortRequest { instance: "inst1".into(), service: None, address: None, spec: "3000".into() })
+        );
+
+        // An action that runs at once also clears a pending one.
+        let mut app = stopped_child(Vec::new());
+        app.on_key(key(KeyCode::Char('o')));
+        let mut snap = app.snapshot.clone().unwrap();
+        snap.instances[1].status = running();
+        app.set_snapshot(snap);
+        app.on_key(key(KeyCode::Char('p')));
+        assert_eq!(prompt(&app).input(), "port inst1 ");
+        app.prompt = None;
+        app.start_finished("inst1", Some("started inst1".into()), false);
+        assert_eq!(app.pending_action, None);
+    }
+
+    #[test]
+    fn target_keys_on_a_stopped_child_wait_for_the_start() {
+        let mut app = stopped_child(Vec::new());
+        app.terms.open(term_sess("inst1", "devsandbox-inst1"));
+        app.on_key(key(KeyCode::Char('t')));
+        assert_eq!(app.status.as_deref(), Some("starting inst1…"));
+        assert_eq!(app.focus, Focus::Dashboard);
+        // The snapshot still says exited: the confirmed start is trusted.
+        app.start_finished("inst1", Some("started inst1".into()), false);
+        assert_eq!(app.focus, Focus::Terminal);
+
+        let mut app = stopped_child(Vec::new());
+        app.on_key(key(KeyCode::Char('p')));
+        assert!(app.prompt.is_none());
+        app.start_finished("inst1", Some("started inst1".into()), false);
+        assert_eq!(prompt(&app).input(), "port inst1 ");
+    }
+
+    #[test]
+    fn logs_open_rm_on_a_stopped_child_start_nothing() {
+        let mut app = stopped_child(vec![
+            act("Logs", Some(HostVerb::Logs(NoArgs {}))),
+            act("Remove", Some(HostVerb::Rm(NoArgs {}))),
+            act("PR", Some(HostVerb::Open(Open { url: "https://x/1".into() }))),
+        ]);
+        app.on_key(key(KeyCode::Char('1')));
+        assert!(matches!(app.modal, Modal::Logs(_)), "logs of a stopped container say why it stopped");
+        app.on_key(key(KeyCode::Esc));
+        app.on_key(key(KeyCode::Char('l')));
+        assert!(matches!(app.modal, Modal::Logs(_)));
+        app.on_key(key(KeyCode::Esc));
+        app.on_key(key(KeyCode::Char('2')));
+        assert_eq!(app.pending_action.take(), Some(PromptAction::Rm { instance: "inst1".into(), force: false }));
+        app.on_key(key(KeyCode::Char('3')));
+        assert_eq!(app.take_pending_open().as_deref(), Some("https://x/1"));
+        assert_eq!((app.take_pending_start(), app.after_start.clone()), (None, None));
+        assert!(app.starting.is_empty());
+    }
+
+    /// A stopped owner (no `child`) is started the same way.
+    #[test]
+    fn a_stopped_owner_is_started_too() {
+        let mut app = app_with_instances();
+        let mut snap = app.snapshot.clone().unwrap();
+        snap.instances[0].status = ContainerStatus::Exited("Exited (0)".into());
+        app.set_snapshot(snap);
+        open_thread(&mut app, None, Vec::new());
+        app.on_key(key(KeyCode::Char('o')));
+        assert_eq!(app.take_pending_start().as_deref(), Some("inst0"));
+        app.start_finished("inst0", Some("started inst0".into()), false);
+        assert_eq!(app.pending_action.take(), Some(PromptAction::Code { instance: "inst0".into(), goto: None }));
     }
 
     #[test]

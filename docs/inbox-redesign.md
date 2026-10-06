@@ -276,8 +276,9 @@ rm|prune` stay as they are (`src/commands/dispatch.rs:197-358`). Two changes:
   prose.
 - Host actions on a **stopped** child no longer fail silently or half-work
   (today "Open draft" on a stopped child is broken): `vscode`, `terminal`,
-  `logs`, `forward` start the child first (status line `starting
-  <child>…`), and the button shows `(stopped)` next to its label.
+  `forward` start the child first (status line `starting <child>…`), and
+  the button shows `(stopped)` next to its label. `logs` doesn't: a stopped
+  container's logs are how you see why it stopped.
 
 ### Threads and messages
 
