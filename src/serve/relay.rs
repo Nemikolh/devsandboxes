@@ -249,7 +249,8 @@ mod tests {
     #[test]
     fn relays_a_real_daemon_without_its_own_hello() {
         let dir = scratch("relay");
-        let daemon = spawn_daemon(&dir, opts(1, 200));
+        // 1 s idle: 200 ms flaked under a loaded parallel test run.
+        let daemon = spawn_daemon(&dir, opts(1, 1000));
         let probe = || {
             let v = Version { semver: "0.6.0".into(), build: 1 };
             client::connect_with(&dir, "api", &v, client::START_TIMEOUT, &|_, _| Ok(()))
