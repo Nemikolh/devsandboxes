@@ -1,5 +1,6 @@
 mod commands;
 mod config;
+mod daemon_config;
 mod devsbd;
 mod features;
 mod inbox;

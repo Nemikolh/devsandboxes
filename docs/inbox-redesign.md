@@ -408,7 +408,8 @@ the countdown.
 Not holders: plain running containers (their outbox is durable and drains at
 the next start; only their popups are late) and stopped instances. With a
 dispatcher running the daemon never idles, by design.
-`serve.keep-alive = true` (global config) disables the idle exit. If plain
+`serve.keep-alive = true` (global config,
+`<data-dir>/devsandbox/daemon.config.toml`, step 10a) disables the idle exit. If plain
 `inbox = true` posters holding it turns out wasteful, narrow that row to
 "has a follower or an open thread"; start simple.
 

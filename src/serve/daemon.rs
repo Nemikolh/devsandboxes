@@ -64,9 +64,9 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct Options {
     pub version: Version,
-    /// No idle exit. `serve.keep-alive = true` in a global config will set
-    /// this too once one exists (there is none yet: config is per `-C` root,
-    /// the daemon per user); the unit `serve install` writes passes it.
+    /// No idle exit: `--keep-alive` (the unit `serve install` writes passes
+    /// it) or `[serve] keep-alive = true` in the per-user global config
+    /// ([`crate::daemon_config`]), resolved once by [`serve`].
     pub keep_alive: bool,
     /// [`idle::IDLE_TIMEOUT`] outside tests.
     pub idle_timeout: Duration,
@@ -99,13 +99,18 @@ pub enum Exit {
 
 /// `devsandbox serve`: run the daemon in the foreground until it idles out or
 /// hands off. `socket_dir` overrides [`endpoint::socket_dir`] (the lazy start
-/// passes the dir its client resolved, so both agree).
+/// passes the dir its client resolved, so both agree). The global config is
+/// read once here; a bad one is logged and ignored so the daemon still starts.
 pub fn serve(socket_dir: Option<PathBuf>, keep_alive: bool) -> Result<()> {
     let dir = match socket_dir {
         Some(dir) => dir,
         None => endpoint::socket_dir()?,
     };
-    let opts = Options::new(keep_alive);
+    let config = crate::daemon_config::load().unwrap_or_else(|e| {
+        log(&format!("warning: {e:#}; using defaults"));
+        Default::default()
+    });
+    let opts = Options::new(keep_alive || config.serve.keep_alive);
     match run(&dir, &opts)? {
         Exit::AlreadyRunning => {}
         Exit::Idle => log("idle, exiting"),

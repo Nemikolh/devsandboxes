@@ -184,8 +184,19 @@ restarts them on its first poll. Ad-hoc forwards are lost on a handoff
 (the dashboard's Ports tab shows them gone; add them again). A running
 autostart pass is waited for.
 
-`--keep-alive` disables the idle exit. A `serve.keep-alive` setting in a
-global config is planned but there's no global config yet; the unit
+`--keep-alive` disables the idle exit; so does the per-user global config
+`<data-dir>/devsandbox/daemon.config.toml` (next to `state.toml`;
+`$XDG_DATA_HOME` or `~/.local/share`):
+
+```toml
+[serve]
+keep-alive = true
+```
+
+The effective value is the flag OR the file, read once at daemon start
+(the start log line says `keep-alive` when on). A missing file is the
+defaults; unknown keys are ignored; a file that doesn't parse is logged as
+a warning to `serve.log` and the defaults are used. The unit
 `devsandbox serve install` writes passes `--keep-alive` (*Boot start*).
 
 Exiting on a `shutdown` request (`docs/api.md`) is the same drain, with
