@@ -140,7 +140,7 @@ pub fn capture(get: impl Fn(&str) -> Option<String>) -> Vec<(String, String)> {
 /// handoff exits 0, and the manager must not respawn the (now stale) binary
 /// in a loop against the newer daemon.
 pub fn render_systemd(spec: &Spec) -> String {
-    let exec: Vec<String> = spec.argv().iter().map(|w| systemd_word(w)).collect();
+    let exec: Vec<String> = spec.argv().iter().enumerate().map(|(i, w)| systemd_word(w, i > 0)).collect();
     let mut out = String::from(
         "# Written by `devsandbox serve install`; run it again to refresh,\n\
          # `devsandbox serve uninstall` to remove.\n\
@@ -182,14 +182,17 @@ fn systemd_quoted(s: &str) -> String {
     out
 }
 
-/// One `ExecStart=` word: `%` and `$` doubled (specifiers and variable
-/// expansion), quoted when it holds anything but plain path characters.
-fn systemd_word(w: &str) -> String {
+/// One `ExecStart=` word: `%` doubled (specifiers), and in an argument `$`
+/// too (variable expansion; systemd takes the executable path's `$`
+/// literally), quoted when it holds anything but plain path characters.
+/// systemd refuses an executable path with `"`, `\` or `'` however escaped.
+fn systemd_word(w: &str, arg: bool) -> String {
     let plain = !w.is_empty() && w.chars().all(|c| c.is_ascii_alphanumeric() || "/._-+:=,@%$".contains(c));
+    let dollar = if arg { "$$" } else { "$" };
     if plain {
-        w.replace('%', "%%").replace('$', "$$")
+        w.replace('%', "%%").replace('$', dollar)
     } else {
-        format!("\"{}\"", systemd_quoted(w).replace('$', "$$"))
+        format!("\"{}\"", systemd_quoted(w).replace('$', dollar))
     }
 }
 
@@ -242,7 +245,7 @@ pub fn unit_exe(manager: Manager, text: &str) -> Option<String> {
 }
 
 /// The first word of an `ExecStart=` value: quoted (C escapes) or bare, with
-/// `%%` and `$$` collapsed.
+/// `%%` collapsed (an executable path's `$` is literal).
 fn systemd_first_word(value: &str) -> Option<String> {
     let value = value.trim_start();
     let (quoted, mut chars) = match value.strip_prefix('"') {
@@ -258,7 +261,7 @@ fn systemd_first_word(value: &str) -> Option<String> {
                 'n' => out.push('\n'),
                 c => out.push(c),
             },
-            '%' | '$' => {
+            '%' => {
                 let mut peek = chars.clone();
                 if peek.next() == Some(c) {
                     chars = peek;
@@ -679,10 +682,12 @@ WantedBy=default.target
 
     #[test]
     fn systemd_exec_words_escape_specifiers_and_expansion() {
-        assert_eq!(systemd_word("/usr/bin/devsandbox"), "/usr/bin/devsandbox");
-        assert_eq!(systemd_word("/a/100%/$HOME"), "/a/100%%/$$HOME");
-        assert_eq!(systemd_word(r#"/a b/"q"\$x%"#), r#""/a b/\"q\"\\$$x%%""#);
-        assert_eq!(systemd_word(""), r#""""#);
+        assert_eq!(systemd_word("/usr/bin/devsandbox", false), "/usr/bin/devsandbox");
+        assert_eq!(systemd_word("/a/100%/$HOME", true), "/a/100%%/$$HOME");
+        assert_eq!(systemd_word("/a/100%/$HOME", false), "/a/100%%/$HOME");
+        assert_eq!(systemd_word(r#"/a b/"q"\$x%"#, true), r#""/a b/\"q\"\\$$x%%""#);
+        assert_eq!(systemd_word("/a b/$x", false), r#""/a b/$x""#);
+        assert_eq!(systemd_word("", true), r#""""#);
         let log = Spec { log: "/st/100%/serve.log".into(), ..spec() };
         assert!(render_systemd(&log).contains("StandardOutput=append:/st/100%%/serve.log\n"));
     }
