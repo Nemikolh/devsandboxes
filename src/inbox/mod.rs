@@ -49,7 +49,7 @@ pub use feed::{Block, FeedItem, Field, ItemKind, Marker, MAX_FEED};
 pub use form::{Answer, FormRecord, FormState};
 pub use message::MessageSend;
 pub use sanitize::sanitize;
-pub use thread::{Action, Compose, Reply, State, ThreadPut};
+pub use thread::{Action, Compose, State, ThreadPut};
 pub use view::View;
 
 /// Threads kept per owner; the least valuable goes beyond this
@@ -262,9 +262,6 @@ impl Thread {
             child: self.child.clone(),
             actions: self.actions.clone(),
             compose: self.compose.clone(),
-            // v2 put compat, removed in step 13b: what a v2 dispatcher put.
-            message: feed::header_message(&self.feed),
-            reply: self.compose.as_ref().map(|c| Reply { placeholder: c.placeholder.clone() }),
         }
     }
 }
@@ -381,7 +378,6 @@ impl Inbox {
     /// write and the file's mtime doesn't move. That idempotence is the
     /// point: a dispatcher is meant to re-assert every thread on every pass.
     pub fn put(&mut self, owner: &str, owner_name: &str, at: u64, put: ThreadPut) -> PutOutcome {
-        let compose = put.compose();
         let pos = self.threads.iter().position(|t| {
             t.owner == owner && t.kind == Kind::Thread && t.key.as_deref() == Some(put.key.as_str())
         });
@@ -398,10 +394,7 @@ impl Inbox {
                 ..Thread::default()
             };
             // No markers: nothing changed yet, the header says it all.
-            // v2 put compat, removed in step 13b.
-            let header = feed::header_change(&thread.feed, put.message.as_deref());
-            self.apply_header(&mut thread, header, at);
-            apply_put(&mut thread, put, compose);
+            apply_put(&mut thread, put);
             let entered = thread.state == Some(State::NeedsYou);
             self.threads.insert(0, thread);
             self.enforce_cap(owner, id);
@@ -409,8 +402,6 @@ impl Inbox {
         };
 
         let old = &self.threads[pos];
-        // v2 put compat, removed in step 13b.
-        let header = feed::header_change(&old.feed, put.message.as_deref());
         let state = old.state != Some(put.state);
         let status = old.status != put.status;
         let cosmetic = old.owner_name != owner_name
@@ -418,15 +409,14 @@ impl Inbox {
             || old.link != put.link
             || old.child != put.child
             || old.actions != put.actions
-            || old.compose != compose
+            || old.compose != put.compose
             || old.archived;
-        if !(state || status || cosmetic || header != feed::HeaderChange::Unchanged) {
+        if !(state || status || cosmetic) {
             return PutOutcome::Unchanged;
         }
         let entered = state && put.state == State::NeedsYou;
-        // A new message is news; an edit or a withdrawal isn't, nor is a
-        // cosmetic change (a new label, a rename).
-        let news = state || status || matches!(header, feed::HeaderChange::Insert(_));
+        // A cosmetic change (a new label, a rename) isn't news.
+        let news = state || status;
         let mut markers = Vec::new();
         if state {
             markers.push(Marker::State { from: old.state.unwrap_or_default(), to: put.state });
@@ -441,27 +431,16 @@ impl Inbox {
         thread.archived = false;
         thread.unread = thread.unread || news;
         thread.updated_at = at;
-        self.apply_header(&mut thread, header, at);
         for marker in markers {
             let seq = self.next_id();
             feed::push(&mut thread.feed, FeedItem { seq, at, kind: ItemKind::Marker(marker) });
         }
         feed::cap(&mut thread.feed, MAX_FEED);
-        apply_put(&mut thread, put, compose);
+        apply_put(&mut thread, put);
         let id = thread.id;
         self.threads.insert(0, thread);
         self.enforce_cap(owner, id);
         PutOutcome::Applied { created: false, entered_needs_you: entered }
-    }
-
-    /// v2 put compat, removed in step 13b: apply what a put's `message` does
-    /// to the `header-message` feed item.
-    fn apply_header(&mut self, thread: &mut Thread, change: feed::HeaderChange, at: u64) {
-        let seq = match change {
-            feed::HeaderChange::Insert(_) => self.next_id(),
-            _ => 0,
-        };
-        feed::apply_header_change(&mut thread.feed, change, seq, at);
     }
 
     /// `devsbd thread rm <key>`: drop `owner`'s thread with that key.
@@ -532,12 +511,7 @@ impl Inbox {
                     Some(status) => format!("{owner_name}: {} — {status}", put.title),
                     None => format!("{owner_name}: {}", put.title),
                 };
-                // v2 put compat, removed in step 13b: the popup quotes the
-                // put's message.
-                let body = match &put.message {
-                    Some(message) => format!("{}\n{message}", put.title),
-                    None => put.title.clone(),
-                };
+                let body = put.title.clone();
                 match self.put(owner, owner_name, at, put) {
                     // No marker, no unread, no write, and nothing on the
                     // status line: a re-asserted thread is invisible.
@@ -1092,14 +1066,14 @@ pub enum PutOutcome {
 
 /// Copy a put's header onto a thread. Actions and compose are replaced
 /// wholesale: the put is the owner's whole current view of the header.
-fn apply_put(thread: &mut Thread, put: ThreadPut, compose: Option<Compose>) {
+fn apply_put(thread: &mut Thread, put: ThreadPut) {
     thread.title = put.title;
     thread.link = put.link;
     thread.state = Some(put.state);
     thread.status = put.status;
     thread.child = put.child;
     thread.actions = put.actions;
-    thread.compose = compose;
+    thread.compose = put.compose;
 }
 
 /// What the bridge's notify sink does with one decoded message. Split out of
@@ -1217,9 +1191,6 @@ fn sanitize_action(action: SinkAction) -> SinkAction {
                 child: opt(put.child),
                 actions,
                 compose: put.compose.map(|c| Compose { placeholder: opt(c.placeholder), hint: opt(c.hint) }),
-                // v2 put compat, removed in step 13b.
-                message: opt(put.message),
-                reply: put.reply.map(|r| Reply { placeholder: opt(r.placeholder) }),
                 ..put
             };
             SinkAction::Put { at, put }
@@ -1467,7 +1438,7 @@ mod tests {
     #[test]
     fn an_identical_put_changes_nothing() {
         let mut inbox = Inbox::default();
-        let full = ThreadPut { message: Some("ci started".into()), compose: Some(Compose::default()), ..put_body("pr-1") };
+        let full = ThreadPut { compose: Some(Compose::default()), ..put_body("pr-1") };
         inbox.put("web-id", "web", 100, full.clone());
         let before = inbox.clone();
         assert_eq!(inbox.put("web-id", "web", 200, full), PutOutcome::Unchanged);
@@ -1518,38 +1489,17 @@ mod tests {
         assert_eq!(feed(find(&inbox, "pr-1").unwrap()), ["state active -> needs-you"]);
     }
 
-    /// v2 put compat, removed in step 13b: `message` is the `header-message`
-    /// feed item, `reply` is `compose`.
+    /// An older store's `header-message` item (what a put's since-removed
+    /// `message` became) is history: puts no longer touch it.
     #[test]
-    fn a_v2_message_is_one_feed_item_replaced_in_place() {
+    fn puts_leave_an_old_header_message_alone() {
         let mut inbox = Inbox::default();
-        let v2 = |message: Option<&str>| ThreadPut {
-            message: message.map(str::to_string),
-            reply: Some(Reply { placeholder: Some("next run".into()) }),
-            ..put_body("pr-1")
-        };
-        inbox.put("web-id", "web", 1, v2(Some("ci started")));
+        inbox.put("web-id", "web", 1, put_body("pr-1"));
+        inbox.threads[0].feed.push(FeedItem::markdown(50, 1, "header-message", "ci started"));
+        assert_eq!(inbox.put("web-id", "web", 2, put_body("pr-1")), PutOutcome::Unchanged);
+        inbox.put("web-id", "web", 3, ThreadPut { status: Some("merged".into()), ..put_body("pr-1") });
         let t = &inbox.threads[0];
-        assert_eq!(feed(t), ["message header-message: ci started"]);
-        assert_eq!(t.compose, Some(Compose { placeholder: Some("next run".into()), hint: None }), "reply is compose");
-        assert_eq!(inbox.put("web-id", "web", 2, v2(Some("ci started"))), PutOutcome::Unchanged);
-
-        // Changed: replaced in place, `edited`, not news.
-        inbox.threads[0].unread = false;
-        assert!(matches!(inbox.put("web-id", "web", 3, v2(Some("ci green"))), PutOutcome::Applied { .. }));
-        let t = &inbox.threads[0];
-        assert_eq!(feed(t), ["message header-message: ci green (edited)"]);
-        assert_eq!(t.feed[0].at, 1, "first-insert time");
-        assert!(!t.unread, "an edit is not news");
-
-        // A status change in between: the message stays where it was.
-        inbox.put("web-id", "web", 4, ThreadPut { status: Some("merged".into()), ..v2(Some("ci green")) });
-        // Omitted: withdrawn, kept; an empty one counts as omitted.
-        inbox.put("web-id", "web", 5, ThreadPut { status: Some("merged".into()), ..v2(None) });
-        let t = &inbox.threads[0];
-        assert_eq!(feed(t), ["message header-message: ci green (withdrawn)", "status running ci -> merged"]);
-        assert_eq!(t.to_put().message, None);
-        assert_eq!(inbox.put("web-id", "web", 6, ThreadPut { status: Some("merged".into()), ..v2(Some(" ")) }), PutOutcome::Unchanged);
+        assert_eq!(feed(t), ["message header-message: ci started", "status running ci -> merged"]);
     }
 
     #[test]
@@ -1714,6 +1664,14 @@ mod tests {
         let mismatch = Message::ThreadPut { at: 8, key: "pr-1".into(), body: swapped.into() };
         let SinkAction::Push(r) = decide("web", true, mismatch) else { panic!("not rejected") };
         assert!(r.msg.contains("is not the queued key"), "{}", r.msg);
+        // A put in the removed shape is an error record that says what to do.
+        for (field, why) in [(r#""message":"m""#, "`message` was removed"), (r#""reply":{}"#, "`reply` was renamed `compose`")] {
+            let body = format!(r#"{{"key":"pr-1","title":"t","state":"active",{field}}}"#);
+            let old = Message::ThreadPut { at: 8, key: "pr-1".into(), body };
+            let SinkAction::Push(r) = decide("web", true, old) else { panic!("not rejected") };
+            assert_eq!(r.level, Level::Error);
+            assert!(r.msg.starts_with(&format!("thread put rejected: {why}")), "{}", r.msg);
+        }
         // `rm` is authorized the same way.
         let rm = Message::ThreadRm { at: 9, key: "pr-1".into() };
         assert_eq!(decide("web", true, rm.clone()), SinkAction::Rm { key: "pr-1".into() });
@@ -1728,7 +1686,7 @@ mod tests {
     fn the_sink_surfaces_only_what_is_new() {
         let mut inbox = Inbox::default();
         let action = |state: &str, status: &str, at: u64| {
-            let body = format!(r#"{{"key":"pr-1","title":"PR 1","state":"{state}","status":"{status}","message":"look"}}"#);
+            let body = format!(r#"{{"key":"pr-1","title":"PR 1","state":"{state}","status":"{status}"}}"#);
             decide("web", true, Message::ThreadPut { at, key: "pr-1".into(), body })
         };
         // Created active: a status line, no popup.
@@ -1737,12 +1695,11 @@ mod tests {
         assert!(shown.popup.is_none());
         // Re-asserted: nothing at all, not even a status line.
         assert!(inbox.apply_sink("web-id", "web", 1000, action("active", "ci", 11)).is_none());
-        // Into needs-you: a popup, coalescable per thread, quoting the v2
-        // message.
+        // Into needs-you: a popup, coalescable per thread.
         let shown = inbox.apply_sink("web-id", "web", 1000, action("needs-you", "ci", 12)).unwrap();
         let popup = shown.popup.unwrap();
         assert_eq!((popup.key.as_deref(), popup.level), (Some("thread:pr-1"), Level::Warn));
-        assert_eq!(popup.body, "PR 1\nlook");
+        assert_eq!(popup.body, "PR 1");
         // Still needs-you, new status: shown, but no second popup.
         let shown = inbox.apply_sink("web-id", "web", 1000, action("needs-you", "merged", 13)).unwrap();
         assert!(shown.popup.is_none());
@@ -1774,7 +1731,6 @@ mod tests {
         let put = ThreadPut {
             title: "t\x1b[1m".into(),
             status: Some("s\x07".into()),
-            message: Some("a\tb\r\nc\u{85}".into()),
             actions: vec![Action { id: "go".into(), label: "Go\x1b".into(), ..Action::default() }],
             compose: Some(Compose { placeholder: Some("p\x1b".into()), hint: Some("h\x07".into()) }),
             ..put_body("pr-1")
@@ -1783,14 +1739,9 @@ mod tests {
         let t = find(&inbox, "pr-1").unwrap();
         assert_eq!(t.title, "t[1m");
         assert_eq!(t.status.as_deref(), Some("s"));
-        assert_eq!(feed::header_message(&t.feed).as_deref(), Some("a   b\nc"));
         assert_eq!(t.actions[0].label, "Go");
         let compose = t.compose.as_ref().unwrap();
         assert_eq!((compose.placeholder.as_deref(), compose.hint.as_deref()), (Some("p"), Some("h")));
-        // The v2 `reply` goes through too.
-        let put = ThreadPut { reply: Some(Reply { placeholder: Some("r\x1b".into()) }), ..put_body("pr-2") };
-        inbox.apply_sink("web-id", "web", 1000, SinkAction::Put { at: 5, put });
-        assert_eq!(find(&inbox, "pr-2").unwrap().compose.as_ref().unwrap().placeholder.as_deref(), Some("r"));
     }
 
     fn send_body(thread: &str, id: &str, text: &str) -> String {
@@ -2216,16 +2167,17 @@ mod tests {
                 Action { id: "fin".into(), label: "Finish".into(), done: true, ..Action::default() },
             ],
             compose: Some(Compose { placeholder: Some("next run".into()), hint: Some("starts a run".into()) }),
-            message: Some("multi\nline \"q\"".into()),
-            reply: None,
         };
         inbox.put("a-id", "a", 7, full.clone());
+        let md = vec![feed::Block::Markdown { text: "multi\nline \"q\"".into() }];
+        inbox.send("a-id", 7, MessageSend { thread: "pr-1".into(), id: "m".into(), blocks: md });
         let id = find(&inbox, "pr-1").unwrap().id;
         inbox.apply(&Op::Act { thread: id, action: "post".into() }, 8, "api:x");
         inbox.apply(&Op::Reply { thread: id, text: "multi \"q\" \\ x".into() }, 8, "cli");
         inbox.apply(&Op::Act { thread: id, action: "fin".into() }, 8, "tui");
         inbox.apply(&Op::Reopen(id), 8, "tui");
-        inbox.put("a-id", "a", 9, ThreadPut { status: Some("merged".into()), message: None, ..full });
+        inbox.withdraw("a-id", "pr-1", "m");
+        inbox.put("a-id", "a", 9, ThreadPut { status: Some("merged".into()), ..full });
         inbox.archive_owner("a-id");
 
         let text = inbox.to_json().unwrap();
@@ -2235,7 +2187,7 @@ mod tests {
         assert_eq!(
             feed(find(&loaded, "pr-1").unwrap()),
             [
-                "message header-message: multi\nline \"q\" (withdrawn)",
+                "message m: multi\nline \"q\" (withdrawn)",
                 "action post Post [api:x]",
                 "reply multi \"q\" \\ x [cli]",
                 "action fin Finish [tui]",
@@ -2553,7 +2505,7 @@ msg = "old"
     fn thread_ls_shape_round_trips_the_put() {
         let mut inbox = Inbox::default();
         asking(&mut inbox);
-        inbox.put("web-id", "web", 100, ThreadPut { message: Some("hello".into()), ..put_body("gone") });
+        inbox.put("web-id", "web", 100, put_body("gone"));
         inbox.put("other-id", "other", 100, put_body("theirs"));
         push(&mut inbox, "web", rec("note", Some("pr-1"), None), true);
         let mine: Vec<ThreadPut> = inbox.threads_for("web-id").iter().map(|t| t.to_put()).collect();
@@ -2563,11 +2515,8 @@ msg = "old"
             assert_eq!(thread::parse(&json).as_ref(), Ok(put), "{json}");
             assert!(!json.contains("null"), "absent fields are left out: {json}");
         }
-        // v2 put compat: the header message and `reply` come back too.
-        let json = serde_json::to_string(&mine[0]).unwrap();
-        assert!(json.contains(r#""message":"hello""#), "{json}");
         let json = serde_json::to_string(&mine[1]).unwrap();
-        assert!(json.contains(r#""compose":{}"#) && json.contains(r#""reply":{}"#), "{json}");
+        assert!(json.contains(r#""compose":{}"#) && !json.contains("reply"), "{json}");
         // Re-putting what `ls` returned changes nothing.
         for put in mine {
             assert_eq!(inbox.put("web-id", "web", 999, put), PutOutcome::Unchanged);

@@ -1,7 +1,6 @@
 # Inbox redesign: conversations, forms, any client
 
-Status: implemented through step 20 (2026-10-06); 13b (remove the v2
-put/event compat) pending, timed with the dispatcher's migration. Supersedes
+Status: implemented through step 20 and 13b (2026-10-06). Supersedes
 the thread model of
 `inbox-threads.md` (single overwritten `message` + field-change timeline,
 free-text reply only, TUI-only events, dashboard-only control path, threads
@@ -257,7 +256,7 @@ to the owner in events.
   pass) except plain notify records, which are carried over as notify
   threads. No compatibility shim for v2 `thread put` bodies: the helper
   version bump (below) makes the host reject old shapes with an error record
-  that says to update the dispatcher. (As built: a temporary shim keeps
+  that says to update the dispatcher. (As built: a temporary shim kept
   v2 puts and the event `key` working until 13b, *Follow-ups*.)
 - The per-owner cap of 200 records is too small once messages exist. New caps:
   200 threads per owner, 300 feed items per thread (oldest markers dropped
@@ -679,7 +678,7 @@ closed), switch to messages after 13, forms after 17, and `--follow` after 18.
 
 ## Follow-ups
 
-### 13b
+### 13b (done 2026-10-06)
 
 Step 13 landed as 13a (`thread send`/`withdraw`, `thread ls --feed`) with
 the v2 shapes still accepted, so the running PR babysitter keeps working.

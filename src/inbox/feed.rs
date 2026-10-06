@@ -26,10 +26,6 @@ use super::State;
 /// Feed items kept per thread; past it, [`cap`] drops the least valuable.
 pub const MAX_FEED: usize = 300;
 
-/// v2 put compat, removed in step 13b: the id of the message a v2 put's
-/// `message` field becomes, replaced in place as the field changes.
-pub const HEADER_MESSAGE: &str = "header-message";
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FeedItem {
     /// Arrival order across the whole Inbox (like `Note::id`).
@@ -99,7 +95,8 @@ pub enum Marker {
 }
 
 impl FeedItem {
-    /// A message of one markdown block (the only block there is yet).
+    /// A message of one markdown block, for tests.
+    #[cfg(test)]
     pub fn markdown(seq: u64, at: u64, id: &str, text: &str) -> FeedItem {
         let blocks = vec![Block::Markdown { text: text.to_string() }];
         let kind = ItemKind::Message { id: id.to_string(), blocks, edited: false, withdrawn: false, form: None };
@@ -139,7 +136,7 @@ pub fn form_record_mut<'a>(feed: &'a mut [FeedItem], id: &str) -> Option<&'a mut
 }
 
 /// A message's markdown blocks joined by a blank line (other blocks left
-/// out): the header message's text, and a message's one-line summary.
+/// out): a message's one-line summary.
 pub fn markdown_of(blocks: &[Block]) -> String {
     blocks
         .iter()
@@ -263,68 +260,6 @@ pub fn cap(feed: &mut Vec<FeedItem>, max: usize) {
     }
 }
 
-/// The text of the [`HEADER_MESSAGE`] item, when present and not withdrawn.
-/// v2 put compat, removed in step 13b.
-pub fn header_message(feed: &[FeedItem]) -> Option<String> {
-    feed.iter().find_map(|i| match &i.kind {
-        ItemKind::Message { id, blocks, withdrawn: false, .. } if id == HEADER_MESSAGE => Some(markdown_of(blocks)),
-        _ => None,
-    })
-}
-
-/// What a v2 put's `message` does to the feed. v2 put compat, removed in
-/// step 13b.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum HeaderChange {
-    Unchanged,
-    /// No header message yet: a new item (news).
-    Insert(String),
-    /// Replace its text in place (or bring a withdrawn one back): `edited`.
-    Edit(String),
-    /// The put dropped the field: withdraw the item.
-    Withdraw,
-}
-
-/// Decide [`HeaderChange`] for a put whose `message` is `want` (empty counts
-/// as absent). v2 put compat, removed in step 13b.
-pub fn header_change(feed: &[FeedItem], want: Option<&str>) -> HeaderChange {
-    let want = want.filter(|m| !m.trim().is_empty());
-    let current = feed.iter().find_map(|i| match &i.kind {
-        ItemKind::Message { id, blocks, withdrawn, .. } if id == HEADER_MESSAGE => Some((markdown_of(blocks), *withdrawn)),
-        _ => None,
-    });
-    match (current, want) {
-        (None, None) => HeaderChange::Unchanged,
-        (None, Some(text)) => HeaderChange::Insert(text.to_string()),
-        (Some((_, true)), None) => HeaderChange::Unchanged,
-        (Some(_), None) => HeaderChange::Withdraw,
-        (Some((text, false)), Some(want)) if text == want => HeaderChange::Unchanged,
-        (Some(_), Some(want)) => HeaderChange::Edit(want.to_string()),
-    }
-}
-
-/// Apply a [`HeaderChange`]; `seq`/`at` stamp an inserted item. v2 put
-/// compat, removed in step 13b.
-pub fn apply_header_change(feed: &mut Vec<FeedItem>, change: HeaderChange, seq: u64, at: u64) {
-    let item = feed.iter_mut().find_map(|i| match &mut i.kind {
-        ItemKind::Message { id, blocks, edited, withdrawn, .. } if id == HEADER_MESSAGE => Some((blocks, edited, withdrawn)),
-        _ => None,
-    });
-    match (change, item) {
-        (HeaderChange::Insert(text), _) => push(feed, FeedItem::markdown(seq, at, HEADER_MESSAGE, &text)),
-        (HeaderChange::Edit(text), Some((blocks, edited, withdrawn))) => {
-            let new = vec![Block::Markdown { text }];
-            if *blocks != new {
-                *blocks = new;
-                *edited = true;
-            }
-            *withdrawn = false;
-        }
-        (HeaderChange::Withdraw, Some((_, _, withdrawn))) => *withdrawn = true,
-        _ => {}
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,38 +351,6 @@ mod tests {
         assert_eq!(seqs(&feed), [1, 4, 6], "then the oldest message");
         cap(&mut feed, 1);
         assert_eq!(seqs(&feed), [6], "then the oldest replies");
-    }
-
-    #[test]
-    fn header_message_inserts_edits_and_withdraws() {
-        let mut feed = Vec::new();
-        assert_eq!(header_change(&feed, None), HeaderChange::Unchanged);
-        assert_eq!(header_change(&feed, Some("  ")), HeaderChange::Unchanged, "empty is absent");
-        let change = header_change(&feed, Some("one"));
-        assert_eq!(change, HeaderChange::Insert("one".into()));
-        apply_header_change(&mut feed, change, 7, 70);
-        assert_eq!(feed, [FeedItem::markdown(7, 70, HEADER_MESSAGE, "one")]);
-        assert_eq!(header_message(&feed).as_deref(), Some("one"));
-        assert_eq!(header_change(&feed, Some("one")), HeaderChange::Unchanged);
-
-        // Replaced in place: same seq and time, `edited`.
-        let change = header_change(&feed, Some("two"));
-        apply_header_change(&mut feed, change, 8, 80);
-        let ItemKind::Message { blocks, edited, withdrawn, .. } = &feed[0].kind else { panic!() };
-        assert_eq!((feed.len(), feed[0].seq, feed[0].at), (1, 7, 70));
-        assert_eq!((markdown_of(blocks).as_str(), *edited, *withdrawn), ("two", true, false));
-
-        // Dropped: withdrawn, kept; withdrawing again is nothing.
-        let change = header_change(&feed, None);
-        apply_header_change(&mut feed, change, 9, 90);
-        assert!(matches!(feed[0].kind, ItemKind::Message { withdrawn: true, .. }));
-        assert_eq!(header_message(&feed), None);
-        assert_eq!(header_change(&feed, None), HeaderChange::Unchanged);
-        // Back with the same text: un-withdrawn in place.
-        assert_eq!(header_change(&feed, Some("two")), HeaderChange::Edit("two".into()));
-        apply_header_change(&mut feed, HeaderChange::Edit("two".into()), 10, 100);
-        assert_eq!(feed.len(), 1);
-        assert_eq!(header_message(&feed).as_deref(), Some("two"));
     }
 
     fn md(text: &str) -> Vec<Block> {

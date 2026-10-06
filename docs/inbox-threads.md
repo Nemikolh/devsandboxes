@@ -188,7 +188,7 @@ opens no file), `r` to reply (when `reply` is set), `d` to mark done (a
 ### Events: pull, not push
 
 > *Superseded* by `inbox-redesign.md` (*Events*, *Host daemon*): events carry
-> `thread` (`key` is a deprecated alias), gain `submit`, filter with
+> `thread`, gain `submit`, filter with
 > `--thread` and stream with `--follow`; they're held in `inbox.json`, served
 > by the host daemon rather than a dashboard, and produced by any client (the
 > dashboard, `devsandbox inbox`, the API), not only dashboard clicks.

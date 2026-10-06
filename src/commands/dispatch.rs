@@ -495,8 +495,6 @@ const EVENTS_BODY_CAP: usize = control::MAX_RESPONSE / 2 - 1024;
 struct EventLine<'a> {
     id: &'a str,
     thread: &'a str,
-    // v2 event compat (key), removed in step 13b: `thread` under its old name.
-    key: &'a str,
     kind: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     action: Option<&'a str>,
@@ -535,7 +533,6 @@ fn event_json(thread: &str, e: &Event) -> Option<String> {
     let line = EventLine {
         id: &e.id,
         thread,
-        key: thread,
         kind: e.kind.as_str(),
         action: e.action.as_deref(),
         text: e.text.as_deref(),
@@ -645,9 +642,6 @@ fn message_rows(t: &crate::inbox::Thread) -> Vec<MessageRow<'_>> {
     t.feed
         .iter()
         .filter_map(|i| match &i.kind {
-            // v2 put compat, removed in step 13b: the header message is the
-            // put's `message`, already in the row.
-            crate::inbox::ItemKind::Message { id, .. } if id == crate::inbox::feed::HEADER_MESSAGE => None,
             crate::inbox::ItemKind::Message { id, blocks, edited, withdrawn, form } => Some(MessageRow {
                 id,
                 at: i.at,
@@ -2392,8 +2386,7 @@ folder = "."
         let got = lines(&resp);
         assert_eq!(got.len(), 2, "{}", resp.body);
         assert_eq!(got[0]["thread"], "pr-1");
-        // v2 event compat (key), removed in step 13b.
-        assert_eq!(got[0]["key"], "pr-1");
+        assert!(got[0].get("key").is_none(), "`thread` only");
         assert_eq!(got[0]["kind"], "reply");
         assert_eq!(got[0]["text"], "first \"one\"");
         assert_eq!(got[0]["at"], "2026-10-02T00:13:21Z");
@@ -2625,7 +2618,7 @@ folder = "."
         assert_eq!(texts(&call(&s, "d", &Request::new(Op::Events), &mut fake)), ["one", "two", "three"]);
         let resp = call(&s, "d", &on("pr-2"), &mut fake);
         assert_eq!(texts(&resp), ["two"]);
-        assert_eq!((lines(&resp)[0]["thread"].as_str(), lines(&resp)[0]["key"].as_str()), (Some("pr-2"), Some("pr-2")));
+        assert_eq!(lines(&resp)[0]["thread"], "pr-2");
         assert_eq!(texts(&call(&s, "d", &on("pr-1"), &mut fake)), ["one", "three"]);
         // Unknown (not put yet) or another owner's: nothing, not an error.
         assert_eq!(call(&s, "d", &on("pr-9"), &mut fake), Response::new(Status::Ok, ""));
@@ -2683,8 +2676,6 @@ folder = "."
         assert_eq!(got.len(), 1);
         assert_eq!((got[0].key.as_str(), got[0].title.as_str()), ("pr-1", "PR 1"));
         assert!(got[0].compose.is_some());
-        // v2 put compat, removed in step 13b: `reply` mirrors `compose`.
-        assert!(got[0].reply.is_some());
         // Archived (the owner was removed) is history, not listed.
         store::update_at(&path, |i| i.archive_owner("d")).unwrap();
         assert_eq!(call(&s, "d", &Request::new(Op::ThreadLs), &mut fake).body, "[]");
@@ -2725,6 +2716,15 @@ folder = "."
                 {"id": "run-2", "at": 6, "edited": false, "withdrawn": true, "blocks": [{"type": "markdown", "text": "x"}]},
             ])
         );
+        // An older store's `header-message` item is an ordinary message now.
+        store::update_at(&path, |i| {
+            let t = i.threads.iter_mut().find(|t| t.owner == "d").unwrap();
+            t.feed.push(crate::inbox::FeedItem::markdown(99, 8, "header-message", "old"));
+        })
+        .unwrap();
+        let resp = call(&s, "d", &Request { feed: true, ..Request::new(Op::ThreadLs) }, &mut fake);
+        let got: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(got[0]["messages"][2]["id"], "header-message", "{}", resp.body);
         // Another owner's thread with no messages lists an empty array.
         let other = call(&s, "a", &Request { feed: true, ..Request::new(Op::ThreadLs) }, &mut fake);
         assert!(other.body.contains("\"messages\":[]"), "{}", other.body);
@@ -2766,8 +2766,7 @@ folder = "."
         got[0].as_object_mut().unwrap().remove("id");
         assert_eq!(
             got[0],
-            // v2 event compat (key), removed in step 13b: `key` mirrors `thread`.
-            serde_json::json!({"thread": "pr-1", "key": "pr-1", "kind": "submit", "message": "run-1", "form": "f1",
+            serde_json::json!({"thread": "pr-1", "kind": "submit", "message": "run-1", "form": "f1",
                 "answers": {"ok": true, "why": "", "pick": null}, "at": "2026-10-02T00:13:21Z"})
         );
         assert!(!resp.body.contains("client") && !resp.body.contains("some-gui"), "{}", resp.body);

@@ -41,13 +41,13 @@
 //! JSON object per line, all of them until acked (delivery is at least once):
 //!
 //! ```text
-//! {"id":"e-1790900001-3f2a","thread":"pr-6900","key":"pr-6900","kind":"action","action":"post","at":"2026-10-02T12:00:01Z"}
-//! {"id":"e-1790900042-77c1","thread":"pr-6900","key":"pr-6900","kind":"reply","text":"…","at":"2026-10-02T12:00:42Z"}
+//! {"id":"e-1790900001-3f2a","thread":"pr-6900","kind":"action","action":"post","at":"2026-10-02T12:00:01Z"}
+//! {"id":"e-1790900042-77c1","thread":"pr-6900","kind":"reply","text":"…","at":"2026-10-02T12:00:42Z"}
 //! ```
 //!
-//! `thread` is the thread's key; `key` is its deprecated alias (v2 event
-//! compat, removed in step 13b). With a `key`, only that thread's events are
-//! answered (and waited for); an unknown thread answers none. `kind` is action|reply|done|reopen|submit; `action` (the button's id: an
+//! `thread` is the thread's key. With the request's `key` (`events
+//! --thread`), only that thread's events are answered (and waited for); an
+//! unknown thread answers none. `kind` is action|reply|done|reopen|submit; `action` (the button's id: an
 //! `action`, or a `done` from a `done: true` button), `text` (a `reply`) and
 //! `message`, `form`, `answers` (a `submit`: every question's answer, by
 //! question id) are left out when absent; `at` is RFC 3339 UTC. With a
@@ -71,7 +71,7 @@
 //! ```text
 //! status ok
 //! body 
-//! {"id":"e-1790900001-3f2a","thread":"pr-6900","key":"pr-6900","kind":"reply","text":"…","at":"…"}
+//! {"id":"e-1790900001-3f2a","thread":"pr-6900","kind":"reply","text":"…","at":"…"}
 //! {"kind":"ping"}
 //! {"kind":"replaced"}
 //! ```

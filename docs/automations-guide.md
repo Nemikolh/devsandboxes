@@ -192,8 +192,6 @@ devsbd thread ls
 | `actions` | no | buttons, numbered `1`–`9` in the pane | at most 9 |
 | `compose` | no | `{ "placeholder": "…", "hint": "…" }` (both optional): allow free-text replies. `hint` is one dim line under the reply box saying what sending does now; re-put it when that changes | 100 bytes each |
 
-Two older fields are still accepted while dispatchers move over, and will be removed: `message` (4000 bytes; shown as a message in the feed, replaced in place as it changes: use `thread send`) and `reply` (`{ "placeholder" }`, `compose` without a hint).
-
 `title` and `status` take inline markdown (code, emphasis, links). Control characters in anything a container sends are stripped before it's stored.
 
 Each action:
@@ -235,7 +233,7 @@ While no host daemon runs, a queued `put` replaces any older queued `put` for th
 
 ### Messages (`devsbd thread send`)
 
-The header (`put`) says where a thread stands; **messages** tell the story under it: what a run did, what it needs from the user. They replace the header's old `message` field.
+The header (`put`) says where a thread stands; **messages** tell the story under it: what a run did, what it needs from the user. They replace the header's old `message` field, which a put now rejects.
 
 ```sh
 devsbd thread send < message.json
@@ -360,10 +358,10 @@ devsbd events ack <id>...
 ```
 
 ```json
-{"id":"e-1790900001-3f2a","thread":"pr-6900","key":"pr-6900","kind":"action","action":"post","at":"2026-10-02T12:00:01Z"}
-{"id":"e-1790900042-77c1","thread":"pr-6900","key":"pr-6900","kind":"reply","text":"Also rename the event to agent_run.cost","at":"2026-10-02T12:00:42Z"}
-{"id":"e-1790900050-0b9e","thread":"pr-6900","key":"pr-6900","kind":"done","action":"done","at":"2026-10-02T12:00:50Z"}
-{"id":"e-1790900061-5d10","thread":"pr-6900","key":"pr-6900","kind":"submit","message":"run-1791277117","form":"drafts","answers":{"c-3726888733":"post","c-3726888733-text":"Already batched…","notes":""},"at":"2026-10-02T12:01:01Z"}
+{"id":"e-1790900001-3f2a","thread":"pr-6900","kind":"action","action":"post","at":"2026-10-02T12:00:01Z"}
+{"id":"e-1790900042-77c1","thread":"pr-6900","kind":"reply","text":"Also rename the event to agent_run.cost","at":"2026-10-02T12:00:42Z"}
+{"id":"e-1790900050-0b9e","thread":"pr-6900","kind":"done","action":"done","at":"2026-10-02T12:00:50Z"}
+{"id":"e-1790900061-5d10","thread":"pr-6900","kind":"submit","message":"run-1791277117","form":"drafts","answers":{"c-3726888733":"post","c-3726888733-text":"Already batched…","notes":""},"at":"2026-10-02T12:01:01Z"}
 ```
 
 | `kind` | sent when | extra field |
@@ -376,7 +374,7 @@ devsbd events ack <id>...
 
 The keys are the dashboard's; `devsandbox inbox reply|act|submit|done|reopen` (docs/inbox-cli.md) and API clients (docs/api.md) produce the same events, and you can't tell which one the user used.
 
-`thread` is the key of the thread it happened on (the `key` you put it with). `key` carries the same value under the old name: it's deprecated and will be removed, so read `thread`. `at` is RFC 3339 UTC, by the host's clock. `d` and `u` only send an event when they change something (`d` on a done thread, `u` on a live one, do nothing). Each event also shows in the feed (the reply, the action, the folded submission, a done/reopen marker), and the pane shows how many are still waiting for you. Archived threads take no events.
+`thread` is the key of the thread it happened on (the `key` you put it with). `at` is RFC 3339 UTC, by the host's clock. `d` and `u` only send an event when they change something (`d` on a done thread, `u` on a live one, do nothing). Each event also shows in the feed (the reply, the action, the folded submission, a done/reopen marker), and the pane shows how many are still waiting for you. Archived threads take no events.
 
 - **At least once.** `events` prints every pending event, not just new ones, until they're acked. Ack after you've saved what the event changed in your own state, and make handlers idempotent: a crash between the two replays the event. The `id` tells two deliveries of one event apart.
 - `events ack` prints how many it dropped; an id that's unknown, already acked or another instance's is ignored, so a retried ack is harmless. A malformed id is a usage error (exit 2).

@@ -10,7 +10,7 @@
 
 use serde::Deserialize;
 
-use super::feed::{Block, Field, HEADER_MESSAGE};
+use super::feed::{Block, Field};
 use super::form;
 use super::thread::{check_key, check_text};
 use crate::devsbd::control::{valid_message_id, MAX_MESSAGE_ID};
@@ -68,11 +68,9 @@ pub fn parse(body: &str) -> Result<MessageSend, String> {
     if !valid_message_id(&wire.id) {
         return Err(format!("bad `id` `{}`: lowercase letters, digits and `-`, 1-{MAX_MESSAGE_ID} chars", wire.id));
     }
-    // v2 put compat, removed in step 13b: a v2 put's `message` lives under
-    // this id, and the put would withdraw or overwrite a sent one.
-    if wire.id == HEADER_MESSAGE {
-        return Err(format!("`id` `{HEADER_MESSAGE}` is reserved"));
-    }
+    // No id is reserved. An older store may hold a `header-message` item
+    // (what a put's since-removed `message` field became): it stays as
+    // history, and a send with that id edits it like any other message.
     if wire.blocks.is_empty() {
         return Err("no blocks".into());
     }
@@ -190,7 +188,8 @@ mod tests {
         assert!(err(r#"{"thread":"PR","id":"m","blocks":[]}"#).starts_with("bad `thread` `PR`"));
         assert!(err(r#"{"thread":"t","id":"M","blocks":[]}"#).starts_with("bad `id` `M`"));
         assert!(err(&format!(r#"{{"thread":"t","id":"{}","blocks":[]}}"#, "x".repeat(61))).starts_with("bad `id`"));
-        assert_eq!(err(r#"{"thread":"t","id":"header-message","blocks":[]}"#), "`id` `header-message` is reserved");
+        // Not reserved any more: an older store's header message is ordinary.
+        assert!(parse(r#"{"thread":"t","id":"header-message","blocks":[{"type":"markdown","text":"x"}]}"#).is_ok());
         assert_eq!(err(&with_blocks("")), "no blocks");
         let nine = vec![r#"{"type":"markdown","text":"x"}"#; 9].join(",");
         assert_eq!(err(&with_blocks(&nine)), "9 blocks, at most 8 allowed");

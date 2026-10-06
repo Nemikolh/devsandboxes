@@ -23,7 +23,6 @@ pub const MAX_ACTIONS: usize = 9;
 /// `notify::MAX_RECORD`, so a runaway dispatcher can't fill the store.
 const MAX_TITLE: usize = 200;
 const MAX_STATUS: usize = 60;
-const MAX_MESSAGE: usize = 4000;
 const MAX_LINK: usize = 2000;
 const MAX_LABEL: usize = 60;
 const MAX_PATH: usize = 400;
@@ -72,22 +71,6 @@ pub struct ThreadPut {
     /// Present when the thread takes replies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compose: Option<Compose>,
-    // v2 put compat, removed in step 13b: `message` becomes the feed's
-    // `header-message` item, `reply` is `compose` without a hint.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reply: Option<Reply>,
-}
-
-impl ThreadPut {
-    /// The composer this put asks for: `compose`, else (v2 put compat,
-    /// removed in step 13b) the old `reply`.
-    pub fn compose(&self) -> Option<Compose> {
-        self.compose
-            .clone()
-            .or_else(|| self.reply.as_ref().map(|r| Compose { placeholder: r.placeholder.clone(), hint: None }))
-    }
 }
 
 /// A button on the thread. Field order is load-bearing for TOML: `host` is a
@@ -163,14 +146,6 @@ pub struct Open {
     pub url: String,
 }
 
-/// v2 put compat, removed in step 13b: the old name of [`Compose`].
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Reply {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub placeholder: Option<String>,
-}
-
 /// The reply box: its placeholder, and `hint`, one dim line under it saying
 /// what sending does now ("Starts a comments run with your message").
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -182,12 +157,28 @@ pub struct Compose {
     pub hint: Option<String>,
 }
 
+/// Fields a put used to take, with what to do instead: `deny_unknown_fields`
+/// rejects them anyway, but serde's "unknown field" doesn't say where they
+/// went.
+const REMOVED: &[(&str, &str)] = &[
+    ("message", "`message` was removed: send explanations with `devsbd thread send` (docs/automations-guide.md, Messages)"),
+    ("reply", "`reply` was renamed `compose`"),
+];
+
 /// Parse and check one put body. `Err` is a single line naming the field to
 /// fix: it is shown to the sender as an `error` record.
 pub fn parse(body: &str) -> Result<ThreadPut, String> {
-    let put: ThreadPut = serde_json::from_str(body).map_err(|e| e.to_string())?;
+    let put: ThreadPut = serde_json::from_str(body).map_err(|e| removed_field(body).unwrap_or_else(|| e.to_string()))?;
     validate(&put)?;
     Ok(put)
+}
+
+/// The reason for the first [`REMOVED`] field in `body`, if it has one. Only
+/// called on a body that already failed, so the second parse costs nothing
+/// on the happy path.
+fn removed_field(body: &str) -> Option<String> {
+    let serde_json::Value::Object(map) = serde_json::from_str(body).ok()? else { return None };
+    REMOVED.iter().find(|(field, _)| map.contains_key(*field)).map(|(_, why)| why.to_string())
 }
 
 fn validate(put: &ThreadPut) -> Result<(), String> {
@@ -206,9 +197,6 @@ fn validate(put: &ThreadPut) -> Result<(), String> {
     if let Some(child) = &put.child {
         check_key("child", child)?;
     }
-    if let Some(message) = &put.message {
-        check_text("message", message, MAX_MESSAGE)?;
-    }
     if put.actions.len() > MAX_ACTIONS {
         return Err(format!("{} actions, at most {MAX_ACTIONS} allowed", put.actions.len()));
     }
@@ -226,9 +214,6 @@ fn validate(put: &ThreadPut) -> Result<(), String> {
         if let Some(hint) = &compose.hint {
             check_text("compose.hint", hint, MAX_HINT)?;
         }
-    }
-    if let Some(placeholder) = put.reply.as_ref().and_then(|r| r.placeholder.as_ref()) {
-        check_text("reply.placeholder", placeholder, MAX_PLACEHOLDER)?;
     }
     Ok(())
 }
@@ -337,13 +322,12 @@ mod tests {
       "state": "needs-you",
       "status": "review draft replies",
       "child": "pr-6900",
-      "message": "4 Greptile comments reviewed.",
       "actions": [
         { "id": "open-draft", "label": "Open draft", "host": { "vscode": { "path": ".dispatcher/pr-6900-replies.md", "line": 1 } } },
         { "id": "post", "label": "Post replies" },
         { "id": "done", "label": "Done", "done": true }
       ],
-      "reply": { "placeholder": "Instructions for the next run" }
+      "compose": { "placeholder": "Instructions for the next run" }
     }"##;
 
     #[test]
@@ -363,19 +347,18 @@ mod tests {
         );
         assert_eq!(put.actions[1].host, None, "no `host` = a dispatcher action");
         assert!(put.actions[2].done);
-        // v2 put compat: `reply` is `compose` without a hint.
-        let compose = put.compose().unwrap();
+        let compose = put.compose.unwrap();
         assert_eq!(compose.placeholder.as_deref(), Some("Instructions for the next run"));
         assert_eq!(compose.hint, None);
     }
 
     #[test]
-    fn compose_takes_a_placeholder_and_a_hint_and_wins_over_reply() {
-        let body = r#"{"key":"k","title":"t","state":"active","compose":{"placeholder":"p","hint":"Starts a run"},"reply":{"placeholder":"old"}}"#;
+    fn compose_takes_a_placeholder_and_a_hint() {
+        let body = r#"{"key":"k","title":"t","state":"active","compose":{"placeholder":"p","hint":"Starts a run"}}"#;
         let put = parse(body).unwrap();
-        assert_eq!(put.compose(), Some(Compose { placeholder: Some("p".into()), hint: Some("Starts a run".into()) }));
+        assert_eq!(put.compose, Some(Compose { placeholder: Some("p".into()), hint: Some("Starts a run".into()) }));
         let none = parse(r#"{"key":"k","title":"t","state":"active"}"#).unwrap();
-        assert_eq!(none.compose(), None);
+        assert_eq!(none.compose, None);
         assert!(parse(r#"{"key":"k","title":"t","state":"active","compose":{"nope":1}}"#).is_err());
     }
 
@@ -407,7 +390,6 @@ mod tests {
             r#"{"key":"k","state":"active"}"#,                         // no title
             r#"{"title":"t","state":"active"}"#,                       // no key
             r#"{"key":"k","title":"t","state":"later"}"#,              // unknown state
-            r#"{"key":"k","title":"t","state":"active","reply":{"x":1}}"#,
             // Exactly one verb per action, with its own fields only.
             r#"{"key":"k","title":"t","state":"active","actions":[{"id":"a","label":"A","host":{"terminal":{},"logs":{}}}]}"#,
             r#"{"key":"k","title":"t","state":"active","actions":[{"id":"a","label":"A","host":{"shell":{}}}]}"#,
@@ -429,11 +411,9 @@ mod tests {
             (r#"{"key":"k","title":"  ","state":"active"}"#.into(), "`title` is empty"),
             (format!(r#"{{"key":"k","title":"{}","state":"active"}}"#, "x".repeat(MAX_TITLE + 1)), "`title` is longer"),
             (put(&format!(r#","status":"{}""#, "x".repeat(MAX_STATUS + 1))), "`status` is longer"),
-            (put(&format!(r#","message":"{}""#, "x".repeat(MAX_MESSAGE + 1))), "`message` is longer"),
-            (put(r#","message":"a\u0007b""#), "control character"),
+            (put(r#","status":"a\u0007b""#), "control character"),
             (put(r#","link":"ftp://x""#), "`link` is not an http(s) URL"),
             (put(r#","link":"/etc/passwd""#), "`link` is not an http(s) URL"),
-            (put(r#","reply":{"placeholder":"PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP"}"#), "`reply.placeholder` is longer"),
             (put(&format!(r#","compose":{{"placeholder":"{}"}}"#, "p".repeat(MAX_PLACEHOLDER + 1))), "`compose.placeholder` is longer"),
             (put(&format!(r#","compose":{{"hint":"{}"}}"#, "h".repeat(MAX_HINT + 1))), "`compose.hint` is longer"),
             (put(r#","compose":{"hint":"a\u0007b"}"#), "control character"),
@@ -462,7 +442,23 @@ mod tests {
         assert!(parse(&put(&format!(r#","actions":[{}]"#, actions[..9].join(",")))).is_ok());
         // Tab-indented, CRLF text (common in LLM code blocks) passes;
         // `sanitize` normalizes it after.
-        assert!(parse(&put(r#","message":"```\r\n\tfn x() {}\r\n```""#)).is_ok());
+        assert!(parse(&put(r#","status":"\tfn x()\r\n""#)).is_ok());
+    }
+
+    /// The fields puts used to take fail with where they went, not serde's
+    /// generic "unknown field".
+    #[test]
+    fn rejects_removed_fields_with_what_to_do_instead() {
+        let message = parse(r#"{"key":"k","title":"t","state":"active","message":"hi"}"#).unwrap_err();
+        assert_eq!(
+            message,
+            "`message` was removed: send explanations with `devsbd thread send` (docs/automations-guide.md, Messages)"
+        );
+        let reply = parse(r#"{"key":"k","title":"t","state":"active","reply":{"placeholder":"p"}}"#).unwrap_err();
+        assert_eq!(reply, "`reply` was renamed `compose`");
+        // Any other unknown field keeps serde's reason.
+        let other = parse(r#"{"key":"k","title":"t","state":"active","nope":1}"#).unwrap_err();
+        assert!(other.contains("unknown field `nope`"), "{other}");
     }
 
     #[test]

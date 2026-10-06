@@ -1703,8 +1703,6 @@ mod tests {
             link: Some("https://x/pr/1".into()),
             status: Some("review".into()),
             child: Some("pr-1".into()),
-            // v2 put compat, removed in step 13b: the header message.
-            message: Some("drafts ready".into()),
             actions: header_actions(),
             compose: Some(Compose { placeholder: Some("next run".into()), hint: Some("starts a run".into()) }),
             ..body("asks", State::NeedsYou)
@@ -1731,9 +1729,9 @@ mod tests {
         for b in [&buttons[0], &buttons[4]] {
             assert_eq!(b[..2].iter().map(|(t, _)| *t).collect::<Vec<_>>(), [Tone::Bold, Tone::Plain]);
         }
-        // The message, compose text and events are the feed's and composer's.
+        // Compose text and events are the composer's and the feed's.
         let all = header_texts(&rows).join("\n");
-        for gone in ["drafts ready", "next run", "starts a run", "waiting for", "https://x"] {
+        for gone in ["next run", "starts a run", "waiting for", "https://x"] {
             assert!(!all.contains(gone), "{gone} in {all}");
         }
 
@@ -1815,20 +1813,26 @@ mod tests {
     #[test]
     fn pane_feed_is_newest_first() {
         let mut app = new_app();
-        let v2 = |message: Option<&str>, state: State, status: &str| ThreadPut {
+        let header = |state: State, status: &str| ThreadPut {
             status: Some(status.into()),
-            message: message.map(str::to_string),
             compose: Some(Compose::default()),
             actions: vec![Action { id: "post".into(), label: "Post replies".into(), ..Action::default() }],
             ..body("asks", state)
         };
-        put(&mut app, "d", 10, v2(Some("one"), State::Active, "running"));
+        let send = |text: &str| crate::inbox::MessageSend {
+            thread: "asks".into(),
+            id: "m".into(),
+            blocks: vec![feed::Block::Markdown { text: text.into() }],
+        };
+        put(&mut app, "d", 10, header(State::Active, "running"));
         let id = thread(&app, "asks").id;
         let mut inbox = app.inbox.content.clone();
+        inbox.send("d-id", 10, send("one"));
         inbox.apply(&Op::Act { thread: id, action: "post".into() }, 20, "tui");
         inbox.apply(&Op::MarkDone(id), 20, "tui");
         inbox.apply(&Op::Reopen(id), 20, "tui");
-        inbox.put("d-id", "d", 30, v2(Some("two"), State::NeedsYou, "review"));
+        inbox.put("d-id", "d", 30, header(State::NeedsYou, "review"));
+        inbox.send("d-id", 30, send("two"));
         inbox.apply(&Op::Reply { thread: id, text: "ok".into() }, 40, "tui");
         // A fields message, straight into the feed (no put field makes one yet).
         let fields = vec![feed::Block::Fields { items: vec![feed::Field { label: "CI".into(), value: "green".into() }] }];
@@ -1868,7 +1872,7 @@ mod tests {
 
         // Withdrawn: its row stays, tagged, without the text.
         let mut inbox = app.inbox.content.clone();
-        inbox.put("d-id", "d", 60, v2(None, State::NeedsYou, "review"));
+        inbox.withdraw("d-id", "asks", "m");
         app.set_inbox(inbox);
         let text = texts(&pane_feed(thread(&app, "asks"), 0));
         assert_eq!(text.last(), Some(&format!("{s10}  d  (withdrawn)")), "{text:#?}");

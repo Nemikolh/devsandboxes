@@ -668,23 +668,35 @@ mod tests {
     #[test]
     fn detail_feed_wire_shape() {
         let path = store_path("feed");
-        let v2 = |message: Option<&str>, state: State, status: &str| ThreadPut {
+        let header = |state: State, status: &str| ThreadPut {
             key: "pr-1".into(),
             title: "t".into(),
             state,
             status: Some(status.into()),
-            message: message.map(str::to_string),
             compose: Some(Compose { placeholder: Some("p".into()), hint: Some("h".into()) }),
             actions: vec![action("go"), Action { done: true, ..action("fin") }],
             ..ThreadPut::default()
         };
-        store::update_at(&path, |i| i.put("d-id", "d", 10, v2(Some("hello"), State::Active, "a"))).unwrap();
+        let send = |text: &str| crate::inbox::MessageSend {
+            thread: "pr-1".into(),
+            id: "m".into(),
+            blocks: vec![Block::Markdown { text: text.into() }],
+        };
+        store::update_at(&path, |i| {
+            i.put("d-id", "d", 10, header(State::Active, "a"));
+            i.send("d-id", 10, send("hello"));
+        })
+        .unwrap();
         let id = id_of(&path, "d-id", "pr-1");
         run(&path, "inbox.thread.act", json!({"thread": id, "action": "go"})).unwrap();
         run(&path, "inbox.thread.reply", json!({"thread": id, "text": "hi"})).unwrap();
         run(&path, "inbox.thread.done", json!({"thread": id})).unwrap();
         run(&path, "inbox.thread.reopen", json!({"thread": id})).unwrap();
-        store::update_at(&path, |i| i.put("d-id", "d", 20, v2(Some("hello again"), State::NeedsYou, "b"))).unwrap();
+        store::update_at(&path, |i| {
+            i.put("d-id", "d", 20, header(State::NeedsYou, "b"));
+            i.send("d-id", 20, send("hello again"));
+        })
+        .unwrap();
 
         let t = run(&path, "inbox.thread.get", json!({"thread": id})).unwrap();
         assert_eq!(t["compose"], json!({"placeholder": "p", "hint": "h"}));
@@ -699,7 +711,7 @@ mod tests {
         assert_eq!(
             feed,
             json!([
-                {"type": "message", "id": "header-message", "blocks": [{"type": "markdown", "text": "hello again"}], "edited": true, "withdrawn": false},
+                {"type": "message", "id": "m", "blocks": [{"type": "markdown", "text": "hello again"}], "edited": true, "withdrawn": false},
                 {"type": "action", "action": "go", "label": "GO"},
                 {"type": "reply", "text": "hi"},
                 {"type": "marker", "marker": "done", "from": null, "to": null},
