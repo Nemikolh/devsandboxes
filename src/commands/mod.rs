@@ -41,9 +41,9 @@ pub(crate) fn resolve_instance(state: &State, name: &str) -> Result<String> {
 
 /// Non-interactive [`resolve_instance`]: an ambiguous `name` bails instead of
 /// prompting. For callers where prompting is impossible or wrong even though
-/// stdin is a TTY — the TUI worker thread owns no console (the dashboard does),
-/// so a `pick` there would fight the alternate screen.
-// Only the unix-only TUI forwarder worker calls this.
+/// stdin is a TTY — the daemon's forward registry (`serve::forwards`) owns no
+/// console, and a prompt there would block a `forwards.add` forever.
+// Only the unix-only daemon's forward registry calls this.
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn resolve_instance_noninteractive(state: &State, name: &str) -> Result<String> {
     resolve_instance_with(state, name, false)

@@ -8,7 +8,8 @@
 //! every [`POLL`], counts the live-instance holders and hands the list to the
 //! bridge worker (`Bridges::spawn_worker`, its own thread, which owns every
 //! bridge), and bumps [`Host::changes`] when the list moved (the API's
-//! `instances.changed`). A [`Waker`] (the API's `bridges.ensure`) cuts the
+//! `instances.changed`), and hands the list to the forward registry too
+//! (`forwards.rs`: configured `forwardPorts` follow it). A [`Waker`] (the API's `bridges.ensure`) cuts the
 //! poll's sleep short and marks its container urgent, so a CLI command or a
 //! dashboard terminal gets its bridge now rather than within [`POLL`]. A
 //! `serve-autostart` thread runs the autostart pass once per config
@@ -29,6 +30,9 @@ use crate::state::State;
 /// its bridge (and counts as a holder) within this; bridge deaths are retried
 /// on their own gaps (`bridge::RETRY`), checked on each poll.
 pub const POLL: Duration = Duration::from_secs(5);
+
+/// Called with each successful poll's running container names.
+pub type OnRunning = Box<dyn Fn(&[String]) + Send>;
 
 /// What the poll thread sleeps on: stop, or containers a client asked a
 /// bridge for.
@@ -91,8 +95,9 @@ pub struct Host {
 impl Host {
     /// Start the poll (bridges) and autostart threads. `log` writes one
     /// `serve.log` line; `on_shown` gets each stored container message's
-    /// status line (the API's `inbox.shown`).
-    pub fn start(log: fn(&str), on_shown: OnShown) -> Host {
+    /// status line (the API's `inbox.shown`); `on_running` gets each poll's
+    /// running containers (the forward registry's sync; it must not block).
+    pub fn start(log: fn(&str), on_shown: OnShown, on_running: OnRunning) -> Host {
         let stop: Shared = Arc::default();
         let board = BridgeBoard::default();
         let live = Arc::new(AtomicUsize::new(0));
@@ -104,7 +109,7 @@ impl Host {
             let (stop, live, changes, board) = (Arc::clone(&stop), Arc::clone(&live), Arc::clone(&changes), board.clone());
             std::thread::Builder::new()
                 .name("serve-poll".into())
-                .spawn(move || poll(&stop, &live, &changes, log, on_shown, board))
+                .spawn(move || poll(&stop, &live, &changes, log, on_shown, on_running, board))
         };
         match spawned {
             Ok(t) => threads.push(t),
@@ -178,6 +183,7 @@ fn poll(
     changes: &AtomicU64,
     log: fn(&str),
     on_shown: OnShown,
+    on_running: OnRunning,
     board: BridgeBoard,
 ) {
     let worker = Bridges::spawn_worker(Some(Some(on_shown)), board);
@@ -201,6 +207,7 @@ fn poll(
                 if let Ok(state) = State::load() {
                     live.store(live_instances(&running, &state, expects_host), Ordering::Release);
                 }
+                on_running(&running);
                 worker.send(running, std::mem::take(&mut urgent));
             }
             Err(e) => {
@@ -248,7 +255,7 @@ fn live_instances(running: &[String], state: &State, expects: impl Fn(&str) -> b
 
 /// Every distinct config root recorded in `state`, sorted. Instances from
 /// before roots were recorded have none and are skipped.
-fn config_roots(state: &State) -> Vec<PathBuf> {
+pub(super) fn config_roots(state: &State) -> Vec<PathBuf> {
     let roots: BTreeSet<PathBuf> = state.instances.values().filter_map(|i| i.config_dir.clone()).collect();
     roots.into_iter().collect()
 }

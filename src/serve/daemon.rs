@@ -9,8 +9,9 @@
 //! down the read side of every connection, so idle ones end at once while a
 //! request in flight still writes its response, and waits up to
 //! [`DRAIN_TIMEOUT`] for them. Then the live host side ([`Host`]: bridges,
-//! autostart) stops, killing every bridge. The start lock is released last,
-//! so a successor never binds (or bridges) while this one drains.
+//! autostart) stops, killing every bridge, and so does the forward
+//! [`Registry`], closing every forward's listener. The start lock is released
+//! last, so a successor never binds (or bridges) while this one drains.
 //!
 //! Notifications (docs/api.md): one daemon-wide `serve-watch` thread notices
 //! changes (store writes by this process at once, by others within [`WATCH`]
@@ -19,7 +20,8 @@
 //! client can't hold up the others. A connection's first `subscribe` starts
 //! its `serve-notify-<n>` thread, which writes the flagged notifications.
 //! Flags coalesce (one pending `inbox.changed` however many writes; the
-//! host's sink posts `inbox.shown` the same way, latest line only), so the
+//! host's sink posts `inbox.shown` the same way, latest line only, and the
+//! forward registry `forwards.changed` / `forwards.status`), so the
 //! queue is bounded by construction; every write to a connection, response
 //! or notification, goes through its one writer lock, and a client that
 //! doesn't drain its socket for [`WRITE_TIMEOUT`] is disconnected.
@@ -39,6 +41,7 @@ use serde_json::{Value, json};
 
 use super::api::{self, Topic};
 use super::endpoint::{self, Listener, Stream};
+use super::forwards::{self, Registry};
 use super::host::{Host, Waker};
 use super::idle::{self, Decision, Holders};
 use super::proto::{self, HelloParams, HelloResult, Notification, Request, Response, Version};
@@ -130,9 +133,26 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
     ));
 
     let shared = Arc::new(Shared::new(opts.version.clone(), inbox));
+    let registry = opts.host.then(|| {
+        let shared = Arc::clone(&shared);
+        Registry::spawn(log, Box::new(move |event| shared.publish_forwards(event)))
+    });
+    if let Some(registry) = &registry {
+        let _ = shared.forwards.set(registry.handle());
+    }
     let host = opts.host.then(|| {
         let shared = Arc::clone(&shared);
-        Host::start(log, Box::new(move |instance: &str, line: String| shared.publish_shown(instance, line)))
+        // Configured `forwardPorts` follow the running containers.
+        let sync = registry.as_ref().map(Registry::handle);
+        Host::start(
+            log,
+            Box::new(move |instance: &str, line: String| shared.publish_shown(instance, line)),
+            Box::new(move |running: &[String]| {
+                if let Some(sync) = &sync {
+                    sync.sync(running.to_vec());
+                }
+            }),
+        )
     });
     if let Some(host) = &host {
         let _ = shared.bridges.set(host.waker());
@@ -144,7 +164,7 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
             break Exit::Handoff;
         }
         let now = Instant::now();
-        let holders = shared.holders(host.as_ref());
+        let holders = shared.holders(host.as_ref(), registry.as_ref());
         if holders.any() {
             *shared.idle_since.lock().unwrap() = now;
         }
@@ -181,6 +201,9 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
     // Before the lock goes: a successor's bridges must not overlap ours (two
     // sink bridges on one container would split its notify/control streams).
     drop(host);
+    // Likewise the forwards: their listeners close here, so a successor can
+    // bind the configured ones' saved host ports again. Ad-hoc ones are lost.
+    drop(registry);
     Ok(exit)
 }
 
@@ -234,6 +257,8 @@ struct Shared {
     closed: (Mutex<bool>, Condvar),
     /// The host side's bridges, for `bridges.ensure`; unset without one.
     bridges: OnceLock<Waker>,
+    /// The forward registry, for `forwards.*`; unset without a host side.
+    forwards: OnceLock<forwards::Handle>,
 }
 
 impl Shared {
@@ -247,14 +272,17 @@ impl Shared {
             handoff: AtomicBool::new(false),
             closed: (Mutex::new(false), Condvar::new()),
             bridges: OnceLock::new(),
+            forwards: OnceLock::new(),
         }
     }
 
-    fn holders(&self, host: Option<&Host>) -> Holders {
+    fn holders(&self, host: Option<&Host>, registry: Option<&Registry>) -> Holders {
         let clients = self.conns.lock().unwrap().len();
-        let Some(host) = host else { return Holders { clients, ..Default::default() } };
+        let forwards = registry.map_or(0, Registry::active);
+        let Some(host) = host else { return Holders { clients, forwards, ..Default::default() } };
         Holders {
             clients,
+            forwards,
             live_instances: host.live_instances(),
             control: host.control(),
             autostart: host.autostarting(),
@@ -317,6 +345,15 @@ impl Shared {
         self.publish(Topic::Inbox, |p| p.shown = Some((instance.to_string(), line.clone())));
     }
 
+    /// The registry's events, to `forwards` subscribers: `forwards.changed`,
+    /// and `forwards.status` lines, latest wins like `inbox.shown`.
+    fn publish_forwards(&self, event: forwards::Event) {
+        match event {
+            forwards::Event::Changed => self.publish(Topic::Forwards, |p| p.forwards = true),
+            forwards::Event::Status(line) => self.publish(Topic::Forwards, |p| p.forwards_status = Some(line.clone())),
+        }
+    }
+
     /// The reconnect hint: tell every subscriber the daemon is going away
     /// (`reason`: `handoff` or `idle`), before the drain closes them.
     fn publish_closing(&self, reason: &'static str) {
@@ -371,6 +408,10 @@ struct Pending {
     /// `inbox.shown` with `(instance, line)`, the latest only.
     shown: Option<(String, String)>,
     instances: bool,
+    /// `forwards.changed`.
+    forwards: bool,
+    /// `forwards.status` with this line, the latest only.
+    forwards_status: Option<String>,
     /// `closing` with this reason; written last.
     closing: Option<&'static str>,
     /// The connection ended: the notifier writes what's left and exits.
@@ -379,7 +420,12 @@ struct Pending {
 
 impl Pending {
     fn any(&self) -> bool {
-        self.inbox.is_some() || self.shown.is_some() || self.instances || self.closing.is_some()
+        self.inbox.is_some()
+            || self.shown.is_some()
+            || self.instances
+            || self.forwards
+            || self.forwards_status.is_some()
+            || self.closing.is_some()
     }
 
     fn take(&mut self) -> Vec<Notification> {
@@ -392,6 +438,12 @@ impl Pending {
         }
         if std::mem::take(&mut self.instances) {
             out.push(Notification { method: "instances.changed".into(), params: json!({}) });
+        }
+        if std::mem::take(&mut self.forwards) {
+            out.push(Notification { method: "forwards.changed".into(), params: json!({}) });
+        }
+        if let Some(line) = self.forwards_status.take() {
+            out.push(Notification { method: "forwards.status".into(), params: json!({ "line": line }) });
         }
         if let Some(reason) = self.closing.take() {
             out.push(Notification { method: "closing".into(), params: json!({ "reason": reason }) });
@@ -557,7 +609,8 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Response {
         "unsubscribe" => subscribe(req.params, conn, false),
         method => {
             let bridges = shared.bridges.get().map(|w| w as &dyn api::Bridging);
-            api::call(method, req.params, &api::Ctx { inbox: &shared.inbox, bridges })
+            let forwards = shared.forwards.get().map(|h| h as &dyn api::Forwarding);
+            api::call(method, req.params, &api::Ctx { inbox: &shared.inbox, bridges, forwards })
         }
     };
     match answer {
@@ -593,6 +646,10 @@ fn subscribe(params: Value, conn: &mut ConnState, on: bool) -> Result<Value, api
                         p.shown = None;
                     }
                     Topic::Instances => p.instances = false,
+                    Topic::Forwards => {
+                        p.forwards = false;
+                        p.forwards_status = None;
+                    }
                 }
             }
         }
@@ -888,6 +945,72 @@ pub(crate) mod tests {
         reader.get_ref().set_read_timeout(Some(Duration::from_millis(300))).unwrap();
         let mut line = String::new();
         assert!(reader.read_line(&mut line).is_err() || line.is_empty(), "{line}");
+    }
+
+    /// A connection over a socket pair, subscribed to `topics`.
+    fn subscribed(shared: &Arc<Shared>, id: u64, topics: Value) -> BufReader<std::os::unix::net::UnixStream> {
+        let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
+        shared.spawn_conn(id, server);
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        let mut writer = client;
+        writeln!(writer, "{}", json!({"id": 1, "method": "subscribe", "params": {"topics": topics}})).unwrap();
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&line).unwrap()["result"], json!({"ok": true}));
+        reader.get_ref().set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        // Dropping `writer` closes one fd; the reader's clone keeps the socket.
+        reader
+    }
+
+    #[test]
+    fn forwards_subscribers_hear_changes_and_status_lines() {
+        let shared = Arc::new(Shared::new(v(1), scratch("fwd-store").join("inbox.toml")));
+        let mut fwd = subscribed(&shared, 1, json!(["forwards"]));
+        let mut other = subscribed(&shared, 2, json!(["inbox", "instances"]));
+        shared.publish_forwards(forwards::Event::Changed);
+        let mut line = String::new();
+        fwd.read_line(&mut line).unwrap();
+        let n: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!((n["method"].as_str(), &n["params"]), (Some("forwards.changed"), &json!({})));
+        shared.publish_forwards(forwards::Event::Status("3000: connection refused".into()));
+        line.clear();
+        fwd.read_line(&mut line).unwrap();
+        let n: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(n["method"], "forwards.status");
+        assert_eq!(n["params"]["line"], "3000: connection refused");
+        // Not subscribed to `forwards`: nothing.
+        other.get_ref().set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        line.clear();
+        assert!(other.read_line(&mut line).is_err() || line.is_empty(), "{line}");
+    }
+
+    #[test]
+    fn active_forwards_are_holders() {
+        let shared = Shared::new(v(1), scratch("fwd-hold").join("inbox.toml"));
+        let registry = Registry::spawn(|_| {}, Box::new(|_| {}));
+        assert_eq!(shared.holders(None, Some(&registry)), Holders::default());
+        let dir = scratch("fwd-hold-root");
+        std::fs::create_dir_all(&dir).unwrap();
+        let req = forwards::AddRequest {
+            dir: dir.clone(),
+            instance: None,
+            service: Some("db".into()),
+            bind: std::net::Ipv4Addr::LOCALHOST.into(),
+            host_port: crate::devsbd::forward::HostPort::Prefer(0),
+            container_port: 5432,
+        };
+        let h = registry.handle();
+        let added = api::Forwarding::add(&h, req).unwrap();
+        // A request behind the post-command poll: the count is current.
+        api::Forwarding::list(&h, None).unwrap();
+        let holders = shared.holders(None, Some(&registry));
+        assert_eq!(holders, Holders { forwards: 1, ..Default::default() });
+        assert!(holders.any());
+        api::Forwarding::rm(&h, added.id).unwrap();
+        api::Forwarding::list(&h, None).unwrap();
+        assert!(!shared.holders(None, Some(&registry)).any());
+        drop(registry);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

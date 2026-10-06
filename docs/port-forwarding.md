@@ -11,10 +11,12 @@ Two entry points, same engine:
 
 - **CLI** `devsandbox port …`: runs in the foreground, forwards until Ctrl-C.
 - **TUI** _Ports_ tab (third tab, next to Instances and Services): add/remove
-  forwards live; they end when the dashboard quits.
+  forwards live. The host daemon (`docs/serve.md`, _Forwards_) owns them, so
+  they outlive the dashboard; the tab is a client of its `forwards.*` API
+  (`docs/api.md`).
 
-A third, config-declared: a sandbox's `forwardPorts`, run by the TUI while it's
-open (_Configured forwards_).
+A third, config-declared: a sandbox's `forwardPorts`, run by the host daemon
+for every running instance (_Configured forwards_).
 
 ## Why tunnel through devsbd (not `-p`, not a socat sidecar)
 
@@ -61,11 +63,17 @@ curl ──tcp──▶ devsandbox (host listener 127.0.0.1:3000)
 
 ### Lifetime and ownership
 
-- Forwards live in the process that created them: the CLI command (until
-  Ctrl-C — SIGINT hits the whole foreground process group, so the `exec`
-  children die with it; no signal crate needed) or the TUI (until quit).
-- No persistence in `state.toml` in v1; the Ports tab lists only this TUI's
-  forwards.
+- CLI forwards live in the command's process (until Ctrl-C — SIGINT hits the
+  whole foreground process group, so the `exec` children die with it; no
+  signal crate needed).
+- Ports-tab and configured forwards live in the host daemon
+  (`src/serve/forwards.rs`, `docs/serve.md`), until removed, until their
+  owner stops (configured), or until the daemon exits. They count as daemon
+  holders. A daemon exit drops them all; its successor restarts the
+  configured ones on their saved ports, ad-hoc ones are lost.
+- Ad-hoc forwards aren't persisted in `state.toml`; the Ports tab lists the
+  daemon's forwards of its config root, so every open dashboard of that root
+  sees the same ones.
 - Each forward owns its own bridge (`exec -i … devsbd bridge`). Sharing one
   bridge per container across forwards is a later optimisation.
 
@@ -435,7 +443,7 @@ I/O-free.
   work from docs/sandbox-helper.md).
 - One bridge per forward (extra `exec`s when forwarding many ports from one
   container).
-- CLI forwards are invisible to the TUI and vice versa.
+- CLI forwards are invisible to the TUI (and the daemon) and vice versa.
 - The injection route needs `/bin/sh` + root `exec` + writable `/run` in the
   service image.
 - The listening-process probe runs `lsof` (a plain `exec`) every 10s per active
@@ -445,7 +453,9 @@ I/O-free.
 ## Configured forwards (`forwardPorts`)
 
 A sandbox's `forwardPorts` (`config::ForwardPort`) rides the same engine, owned
-by the TUI while it's open (VS Code's model: no background daemon).
+by the host daemon (`src/serve/forwards.rs`), so they run whether or not a
+dashboard is open. (Until step 8 of `docs/inbox-redesign.md` the TUI ran them
+while open.)
 
 ```toml
 [sandbox.api]
@@ -458,16 +468,18 @@ forwardPorts = [3000, "8080:3000", "db:5432", "15432:db:5432"]
   extension. A leading number is always the host port, a name a service, which
   must be in the sandbox's `services` (checked by `resolve_sandbox`).
 - Host-side only: excluded from `config_hash`, so editing it is never drift.
-- **Owner** (`tui::forwards::Owner`): an instance entry or an isolated
+- **Owner** (`serve::forwards::Owner`): an instance entry or an isolated
   service's belongs to the instance; a `global` service's belongs to the config
   root, one forward however many running instances declare it (routed with no
   instance named, so it survives any one instance stopping).
-- **Lifetime:** every snapshot the event loop sends the running instances'
-  state keys (`ForwardWorker::sync`); the worker loads config + state, starts
-  missing forwards and stops those whose owner stopped or whose entry is gone.
-  `d` on a configured row (marked `(config)`) stops it for the session; a
-  forward that fails to start is reported once and retried when its owner
-  comes back.
+- **Lifetime:** every 5 s container poll hands the registry the running
+  containers; for every config root recorded in `state.toml` it loads config
+  + state, starts missing forwards and stops those whose owner stopped or
+  whose entry is gone. `d` on a configured row (marked `(config)`), i.e.
+  `forwards.rm`, stops it until its owner stops and runs again; a forward that
+  fails to start is reported once (`forwards.status`, `serve.log`) and retried
+  the same way. Configured forwards keep the daemon alive while their
+  instances run.
 - **Host port:** always `127.0.0.1`. Candidates, in order: the saved port, then
   the base (the entry's host port, else the target port) upward over
   `PREFER_SPAN` (100) ports, skipping ports saved for *any* other forward, so a
@@ -481,7 +493,7 @@ forwardPorts = [3000, "8080:3000", "db:5432", "15432:db:5432"]
   re-reads state first so a concurrent `run`/`rm` isn't undone.
 
 Not implemented: `portsAttributes`, `otherPortsAttributes`, `appPort` (still
-warned as ignored); configured forwards outside the TUI.
+warned as ignored).
 
 Related follow-ups, not planned:
 

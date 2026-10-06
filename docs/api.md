@@ -4,7 +4,8 @@ What `devsandbox serve` answers on its socket, for the dashboard, the CLI
 and external clients (editor extensions, GUIs). Design and roadmap:
 `docs/inbox-redesign.md`, "One API, served by the daemon". Code:
 `src/serve/api.rs` (methods), `src/serve/daemon.rs` (connections,
-`subscribe`), `src/serve/proto.rs` (envelope).
+`subscribe`), `src/serve/proto.rs` (envelope), `src/serve/forwards.rs`
+(the forwards behind `forwards.*`).
 
 ## Transport
 
@@ -70,11 +71,12 @@ match on `code`:
 
 | code | |
 |---|---|
-| `not-found` | the thread, action, directory or instance named doesn't exist |
+| `not-found` | the thread, action, directory, instance or forward named doesn't exist |
 | `invalid` | bad params (missing, wrong type, unknown value), or an op that makes no sense for its target |
 | `unknown-method` | no such method on this daemon |
 | `denied` | the target refuses it (an archived thread is read-only; a thread that takes no replies) |
 | `conflict` | reserved (forms) |
+| `bind-failed` | a forward's host port couldn't be bound (in use, privileged, an address not on this host) |
 | `internal` | the daemon failed (store unreadable, …); logged in `serve.log` |
 
 ## Threads
@@ -214,11 +216,72 @@ Errors: `not-found` (no such instance; nothing is recorded), `invalid`
 (missing `instance`, relative or empty `agent`, negative or non-numeric
 `wait`).
 
+## Forwards
+
+Port forwards (`docs/port-forwarding.md`) live in the daemon: ad-hoc ones
+added here, and every running instance's configured `forwardPorts`, which
+the daemon starts and stops itself for every config root recorded in
+`state.toml`, following its 5 s container poll. They outlive the client
+that added them and keep the daemon alive (`docs/serve.md`, *Idle exit*).
+A daemon exit (idle or handoff) closes them all; the successor restarts the
+configured ones on their saved host ports, ad-hoc ones are gone. The
+foreground `devsandbox port` command doesn't use the daemon, and its
+forwards aren't listed here.
+
+### Forward row
+
+| field | |
+|---|---|
+| `id` | daemon-wide id (u64), what `forwards.rm` takes; not reused within a daemon's life |
+| `dir` | the canonical config root |
+| `local` | the bound host address, e.g. `127.0.0.1:3000` |
+| `target` | route label, e.g. `api:3000` or `db:5432 (via instance api)`; empty until the route first resolves |
+| `process` | the listening process (`node (pid 412)`), or `null` |
+| `state` | `active`, `connecting`, or `error: <reason>` |
+| `conns` | open connections |
+| `configured` | from a sandbox's `forwardPorts`, not `forwards.add` |
+
+### `forwards.list`
+
+Params: `{"dir": "/abs/config-root"}`, optional. Result: the rows of that
+config root (canonicalized), or of every root without `dir`, by `id`.
+
+Errors: `invalid` (relative `dir`).
+
+### `forwards.add`
+
+Params: `{"dir": "/abs/config-root", "instance": "<name>", "service":
+"<svc>", "address": "<ip>", "spec": "[host:]port"}`, the inputs of
+`devsandbox port`: `instance` (resolved like the CLI's instance argument,
+but never prompting: a name that matches several instances is
+`not-found`), `service` (forward one of its services
+instead), or both; `address` defaults to `127.0.0.1`. `spec` `3000` binds
+host port 3000 or the next free one up; `8080:3000` exactly 8080.
+
+Result: `{"id": 4, "local": "127.0.0.1:3000", "target": "api:3000"}` once
+the listener is bound; the route resolves on (re)connect, so a missing
+container shows up later as the row's `state`. `target` this early is
+usually the request's own `<instance or service>:<port>`.
+
+Errors: `invalid` (relative `dir`, neither `instance` nor `service`, a bad
+`spec` or `address`), `not-found` (no such directory or instance),
+`bind-failed` (`"port 8080: address in use"`).
+
+### `forwards.rm`
+
+Params: `{"id": 4}`. Stops the forward (closing its listener and its
+connections). Result: `{"ok": true, "local": "127.0.0.1:3000",
+"configured": false}`. A configured forward stays stopped until its owner
+stops and runs again (an instance; for a `global` service's port, every
+running instance that declares it).
+
+Errors: `not-found` (no forward `id`; another client may have stopped it).
+
 ## Notifications
 
 ### `subscribe` / `unsubscribe`
 
-Params: `{"topics": ["inbox", "instances"]}`. Result: `{"ok": true}`.
+Params: `{"topics": ["inbox", "instances", "forwards"]}`. Result: `{"ok": true}`.
 Unknown topics are `invalid`. Notifications are coarse ("something
 changed, re-fetch"): subscribe first, then fetch, so nothing falls in
 between.
@@ -228,6 +291,8 @@ between.
 | `inbox.changed` | `inbox` | `{"generation": n}` | the store changed: through the daemon at once, through other processes (the dashboard, `devsandbox rm`) within 0.5 s. `n` grows per change the daemon saw; compare within one connection only |
 | `inbox.shown` | `inbox` | `{"instance": "<name>", "line": "<name>: <text>"}` | a container message the daemon stored is worth a status line (a `devsbd notify`, a thread put that changed something); `line` is the dashboard's status-line text. Latest only: lines that arrive faster than the client reads are dropped |
 | `instances.changed` | `instances` | `{}` | the running containers changed (the daemon polls every 5 s) |
+| `forwards.changed` | `forwards` | `{}` | any forward's row changed (added, stopped, state, process, connections; checked every 0.5 s), in any config root |
+| `forwards.status` | `forwards` | `{"line": "…"}` | a one-line status: a configured forward started (`forwarding 127.0.0.1:3000 -> api:3000`) or failed, a connection note (`3000: connection refused`). Latest only, like `inbox.shown` |
 | `closing` | any | `{"reason": "handoff" \| "idle"}` | the daemon is exiting; reconnect (which starts a new one) |
 
 Notifications coalesce: many changes before one is written are one line.
@@ -236,13 +301,14 @@ A client that doesn't read its socket for 5 s is disconnected.
 ## Holders
 
 A connected client keeps the daemon alive (`docs/serve.md`, *Idle exit*);
-hang up when done. A CLI command holding a relay (`bridges.ensure`) stays
+hang up when done. So does every forward, ad-hoc or configured, whether or
+not its client is still connected: stop ad-hoc ones with `forwards.rm`. A CLI command holding a relay (`bridges.ensure`) stays
 connected for its whole run for that reason.
 
 ## The dashboard as a client
 
 The dashboard holds one connection for its life (`src/tui/daemon.rs`),
-subscribed to `inbox` and `instances`, and reconnects after `closing` or a
+subscribed to `inbox`, `instances` and `forwards`, and reconnects after `closing` or a
 lost connection (at once, then 1 s, 2 s, … up to 30 s apart; after a
 handoff it waits up to 5 s for the successor before starting a daemon).
 Its Inbox writes go through the `inbox.*` mutations while connected, and
@@ -251,5 +317,9 @@ itself, reloading on `inbox.changed`, and keeps its own instance snapshot
 (with processes and stats), refreshed early on `instances.changed`.
 `inbox.shown` is its status line. Opening an integrated terminal on a
 relay-mode instance sends `bridges.ensure` with the dashboard's
-`$SSH_AUTH_SOCK` (skipped while disconnected). Two dashboards share one
-daemon.
+`$SSH_AUTH_SOCK` (skipped while disconnected). Its Ports tab is
+`forwards.list` for its config root, re-fetched on `forwards.changed` and
+after every reconnect; `p` / `:port` is `forwards.add`, `d` is
+`forwards.rm`, `forwards.status` its status line. While disconnected the
+tab is empty and an add says the daemon is needed. Two dashboards share one
+daemon, and the same forwards.

@@ -23,10 +23,18 @@
 //! that agent at once. Disconnected, it's skipped: no local bridge exists to
 //! fall back to, and the daemon bridges running instances on its own poll.
 //!
-//! Modelled on `forwards.rs`'s `ForwardWorker`; nothing is ever written to
+//! Ports tab: the daemon owns every forward (`serve::forwards`), so they
+//! outlive the dashboard. The worker subscribes to `forwards` too and, on
+//! `forwards.changed` and after every (re)connect, fetches `forwards.list`
+//! for the dashboard's config root ([`DaemonUpdate::Ports`]); `forwards.status`
+//! lines are status lines. Adds and stops go out as `forwards.add` /
+//! `forwards.rm` ([`Cmd::ForwardAdd`], [`Cmd::ForwardRm`]). Disconnected, the
+//! tab has no rows and an add says the daemon is needed.
+//!
+//! A command channel plus a short-joining `Drop`; nothing is ever written to
 //! stderr, failures are [`DaemonUpdate::Status`] lines.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -36,8 +44,10 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use serde_json::{Value, json};
 
+use super::app::{PortRequest, PortRow};
 use crate::inbox::{self, Op};
 use crate::serve::client::{self, Conn};
+use crate::serve::forwards::{Added, ForwardRow};
 use crate::serve::endpoint;
 use crate::serve::proto::Version;
 
@@ -58,6 +68,9 @@ pub enum DaemonUpdate {
     InstancesChanged,
     /// A container message's status line (`inbox.shown`).
     Shown(String),
+    /// The Ports tab's rows: this config root's forwards, or none while
+    /// disconnected.
+    Ports(Vec<PortRow>),
     /// A one-line status: the daemon is unavailable, a write failed.
     Status(String),
 }
@@ -69,6 +82,10 @@ enum Cmd {
     Inbox(Vec<Op>),
     /// `bridges.ensure` for `instance` (a state key), reporting `agent`.
     EnsureBridge { instance: String, agent: Option<PathBuf> },
+    /// `forwards.add` in the dashboard's config root.
+    ForwardAdd(PortRequest),
+    /// `forwards.rm`.
+    ForwardRm(u64),
 }
 
 /// Handle to the daemon worker. Never blocks the UI thread; dropping it
@@ -81,14 +98,16 @@ pub struct DaemonWorker {
 }
 
 impl DaemonWorker {
-    pub fn spawn() -> DaemonWorker {
+    /// Spawn the worker for the dashboard of config root `dir` (whose
+    /// forwards the Ports tab lists).
+    pub fn spawn(dir: PathBuf) -> DaemonWorker {
         let (tx, rx) = mpsc::channel();
         let (utx, updates) = mpsc::channel();
         let connected = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&connected);
         let handle = std::thread::Builder::new()
             .name("tui-daemon".into())
-            .spawn(move || run(rx, utx, &flag))
+            .spawn(move || run(&root_dir(dir), rx, utx, &flag))
             .ok();
         DaemonWorker { tx: Some(tx), updates, connected, handle }
     }
@@ -108,6 +127,17 @@ impl DaemonWorker {
     /// dashboard's `SSH_AUTH_SOCK`). Never blocks; dropped while disconnected.
     pub fn ensure_bridge(&self, instance: String, agent: Option<PathBuf>) {
         self.send(Cmd::EnsureBridge { instance, agent });
+    }
+
+    /// Ask the daemon to start a forward. Never blocks; the outcome is a
+    /// status line.
+    pub fn forward_add(&self, req: PortRequest) {
+        self.send(Cmd::ForwardAdd(req));
+    }
+
+    /// Ask the daemon to stop forward `id`. Never blocks.
+    pub fn forward_rm(&self, id: u64) {
+        self.send(Cmd::ForwardRm(id));
     }
 
     fn send(&self, cmd: Cmd) {
@@ -187,6 +217,69 @@ fn ensure_call(instance: &str, agent: Option<&std::path::Path>) -> (&'static str
     ("bridges.ensure", json!({ "instance": instance, "agent": agent.and_then(|p| p.to_str()) }))
 }
 
+/// The config root as the daemon keys it: canonical (what `run` records),
+/// else at least absolute (the API refuses relative dirs).
+fn root_dir(dir: PathBuf) -> PathBuf {
+    dir.canonicalize().or_else(|_| std::path::absolute(&dir)).unwrap_or(dir)
+}
+
+/// The API call for `forwards.list` of config root `dir`.
+fn list_call(dir: &Path) -> (&'static str, Value) {
+    ("forwards.list", json!({ "dir": dir.to_string_lossy() }))
+}
+
+/// The API call for [`Cmd::ForwardAdd`]. An empty instance (a typed
+/// `port --service …` without one) is a service-only forward.
+fn add_call(dir: &Path, req: &PortRequest) -> (&'static str, Value) {
+    let params = json!({
+        "dir": dir.to_string_lossy(),
+        "instance": (!req.instance.is_empty()).then_some(&req.instance),
+        "service": req.service,
+        "address": req.address,
+        "spec": req.spec,
+    });
+    ("forwards.add", params)
+}
+
+/// The API call for [`Cmd::ForwardRm`].
+fn rm_call(id: u64) -> (&'static str, Value) {
+    ("forwards.rm", json!({ "id": id }))
+}
+
+/// `forwards.list`'s rows as the Ports tab's.
+fn port_rows(result: Value) -> Result<Vec<PortRow>> {
+    let rows: Vec<ForwardRow> = serde_json::from_value(result)?;
+    Ok(rows
+        .into_iter()
+        .map(|r| PortRow {
+            id: r.id,
+            local: r.local,
+            target: r.target,
+            process: r.process,
+            state: r.state,
+            conns: r.conns,
+            configured: r.configured,
+        })
+        .collect())
+}
+
+/// The status line for a `forwards.add` answer.
+fn added_status(result: Value) -> String {
+    match serde_json::from_value::<Added>(result) {
+        Ok(a) => format!("forwarding {} -> {}", a.local, a.target),
+        Err(_) => "forwarding".into(),
+    }
+}
+
+/// The status line for a `forwards.rm` answer.
+fn removed_status(result: &Value) -> String {
+    let local = result.get("local").and_then(Value::as_str).unwrap_or("forward");
+    match result.get("configured").and_then(Value::as_bool) {
+        Some(true) => format!("stopped {local} (forwardPorts: back when its instance restarts)"),
+        _ => format!("stopped {local}"),
+    }
+}
+
 /// Whether an API error on `op` is worth a status line. A `not-found` on a
 /// mark-read or dismiss is a thread another dashboard (or `thread rm`)
 /// removed first: the local path ignores it too.
@@ -207,7 +300,7 @@ fn open(after_handoff: bool) -> Result<Conn> {
         Some(conn) => conn,
         None => client::connect(&dir, "tui")?,
     };
-    let r = conn.call("subscribe", json!({ "topics": ["inbox", "instances"] }))?;
+    let r = conn.call("subscribe", json!({ "topics": ["inbox", "instances", "forwards"] }))?;
     if let Some(e) = r.error {
         anyhow::bail!("subscribe: {} ({})", e.message, e.code);
     }
@@ -215,6 +308,8 @@ fn open(after_handoff: bool) -> Result<Conn> {
 }
 
 struct Worker<'a> {
+    /// The dashboard's config root, as [`root_dir`] made it.
+    dir: &'a Path,
     utx: Sender<DaemonUpdate>,
     connected: &'a AtomicBool,
     conn: Option<Conn>,
@@ -223,10 +318,13 @@ struct Worker<'a> {
     after_handoff: bool,
     /// Last connect error shown, so a daemon that stays down is one line.
     last_error: Option<String>,
+    /// Why the last connect failed, for a forward asked for meanwhile.
+    down: Option<String>,
 }
 
-fn run(rx: Receiver<Cmd>, utx: Sender<DaemonUpdate>, connected: &AtomicBool) {
+fn run(dir: &Path, rx: Receiver<Cmd>, utx: Sender<DaemonUpdate>, connected: &AtomicBool) {
     let mut w = Worker {
+        dir,
         utx,
         connected,
         conn: None,
@@ -234,6 +332,7 @@ fn run(rx: Receiver<Cmd>, utx: Sender<DaemonUpdate>, connected: &AtomicBool) {
         next_attempt: Instant::now(),
         after_handoff: false,
         last_error: None,
+        down: None,
     };
     loop {
         if w.conn.is_none() && Instant::now() >= w.next_attempt {
@@ -246,6 +345,8 @@ fn run(rx: Receiver<Cmd>, utx: Sender<DaemonUpdate>, connected: &AtomicBool) {
         match rx.recv_timeout(wait) {
             Ok(Cmd::Inbox(ops)) => w.apply(ops),
             Ok(Cmd::EnsureBridge { instance, agent }) => w.ensure_bridge(&instance, agent.as_deref()),
+            Ok(Cmd::ForwardAdd(req)) => w.forward_add(&req),
+            Ok(Cmd::ForwardRm(id)) => w.forward_rm(id),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return,
         }
@@ -265,10 +366,14 @@ impl Worker<'_> {
                 self.connected.store(true, Ordering::Release);
                 self.backoff.reset();
                 self.last_error = None;
+                self.down = None;
                 // Changes while disconnected only reached us by the stamp.
                 self.send(DaemonUpdate::InboxChanged);
+                // A new daemon may hold other forwards than the last one.
+                self.fetch_ports();
             }
             Err(e) => {
+                self.down = Some(format!("{e:#}"));
                 let msg = format!("host daemon unavailable: {e:#}");
                 if self.last_error.as_ref() != Some(&msg) {
                     self.send(DaemonUpdate::Status(msg.clone()));
@@ -288,6 +393,8 @@ impl Worker<'_> {
     fn lost(&mut self, after_handoff: bool) {
         self.conn = None;
         self.connected.store(false, Ordering::Release);
+        // No live rows without the daemon that holds them.
+        self.send(DaemonUpdate::Ports(Vec::new()));
         self.after_handoff = after_handoff;
         self.next_attempt = Instant::now() + self.backoff.next();
     }
@@ -303,6 +410,12 @@ impl Worker<'_> {
         match note.method.as_str() {
             "inbox.changed" => self.send(DaemonUpdate::InboxChanged),
             "instances.changed" => self.send(DaemonUpdate::InstancesChanged),
+            "forwards.changed" => self.fetch_ports(),
+            "forwards.status" => {
+                if let Some(line) = note.params.get("line").and_then(Value::as_str) {
+                    self.send(DaemonUpdate::Status(line.to_string()));
+                }
+            }
             "inbox.shown" => {
                 if let Some(line) = note.params.get("line").and_then(Value::as_str) {
                     self.send(DaemonUpdate::Shown(line.to_string()));
@@ -325,6 +438,58 @@ impl Worker<'_> {
         let (method, params) = ensure_call(instance, agent);
         if conn.call(method, params).is_err() {
             self.lost(false);
+        }
+    }
+
+    /// `forwards.list` for this root, into the Ports tab.
+    fn fetch_ports(&mut self) {
+        let Some(conn) = self.conn.as_mut() else { return };
+        let (method, params) = list_call(self.dir);
+        match conn.call(method, params) {
+            Ok(r) => match (r.result, r.error) {
+                (_, Some(e)) => self.send(DaemonUpdate::Status(format!("ports: {}", e.message))),
+                (Some(result), None) => match port_rows(result) {
+                    Ok(rows) => self.send(DaemonUpdate::Ports(rows)),
+                    Err(e) => self.send(DaemonUpdate::Status(format!("ports: {e:#}"))),
+                },
+                (None, None) => {}
+            },
+            Err(_) => self.lost(false),
+        }
+    }
+
+    /// `forwards.add`; the answer (or why there's none) is a status line. The
+    /// row arrives with the `forwards.changed` that follows.
+    fn forward_add(&mut self, req: &PortRequest) {
+        let Some(conn) = self.conn.as_mut() else {
+            let why = self.down.as_deref().unwrap_or("not connected");
+            return self.send(DaemonUpdate::Status(format!("port forwarding needs the host daemon: {why}")));
+        };
+        let (method, params) = add_call(self.dir, req);
+        match conn.call(method, params) {
+            Ok(r) => self.send(DaemonUpdate::Status(match (r.result, r.error) {
+                (_, Some(e)) => e.message,
+                (result, None) => added_status(result.unwrap_or_default()),
+            })),
+            Err(e) => {
+                self.lost(false);
+                self.send(DaemonUpdate::Status(format!("port forwarding needs the host daemon: {e:#}")));
+            }
+        }
+    }
+
+    /// `forwards.rm`. Disconnected there are no rows to stop. A `not-found`
+    /// is a forward another client stopped first: quiet.
+    fn forward_rm(&mut self, id: u64) {
+        let Some(conn) = self.conn.as_mut() else { return };
+        let (method, params) = rm_call(id);
+        match conn.call(method, params) {
+            Ok(r) => match (r.result, r.error) {
+                (_, Some(e)) if e.code == "not-found" => {}
+                (_, Some(e)) => self.send(DaemonUpdate::Status(e.message)),
+                (result, None) => self.send(DaemonUpdate::Status(removed_status(&result.unwrap_or_default()))),
+            },
+            Err(_) => self.lost(false),
         }
     }
 
@@ -427,7 +592,7 @@ mod tests {
         ];
         for op in &ops {
             let (method, params) = op_call(op);
-            api::call(method, params, &Ctx { inbox: &via_api, bridges: None }).unwrap_or_else(|e| panic!("{op:?}: {e:?}"));
+            api::call(method, params, &Ctx { inbox: &via_api, bridges: None, forwards: None }).unwrap_or_else(|e| panic!("{op:?}: {e:?}"));
             inbox::ops::apply(&via_ops, std::slice::from_ref(op)).unwrap();
         }
         // Ids and times aside (minted at apply time): threads, then events.
@@ -478,7 +643,93 @@ mod tests {
         }
         let path = std::env::temp_dir().join(format!("devsandbox-tui-ensure-{}", std::process::id())).join("inbox.toml");
         let (method, params) = ensure_call("web", Some(std::path::Path::new("/a")));
-        assert_eq!(api::call(method, params, &Ctx { inbox: &path, bridges: Some(&Knows) }), Ok(json!({"ok": true})));
+        assert_eq!(api::call(method, params, &Ctx { inbox: &path, bridges: Some(&Knows), forwards: None }), Ok(json!({"ok": true})));
+    }
+
+    fn port_req(instance: &str, service: Option<&str>) -> PortRequest {
+        PortRequest { instance: instance.into(), service: service.map(String::from), address: None, spec: "8080:3000".into() }
+    }
+
+    #[test]
+    fn forward_commands_queue_and_map_to_their_api_methods() {
+        let (tx, rx) = mpsc::channel();
+        let (_utx, updates) = mpsc::channel();
+        let worker = DaemonWorker { tx: Some(tx), updates, connected: Arc::default(), handle: None };
+        worker.forward_add(port_req("web", None));
+        worker.forward_rm(4);
+        assert_eq!(rx.try_recv().unwrap(), Cmd::ForwardAdd(port_req("web", None)));
+        assert_eq!(rx.try_recv().unwrap(), Cmd::ForwardRm(4));
+
+        let dir = Path::new("/cfg");
+        assert_eq!(list_call(dir), ("forwards.list", json!({"dir": "/cfg"})));
+        assert_eq!(rm_call(4), ("forwards.rm", json!({"id": 4})));
+        assert_eq!(
+            add_call(dir, &port_req("web", None)),
+            (
+                "forwards.add",
+                json!({"dir": "/cfg", "instance": "web", "service": null, "address": null, "spec": "8080:3000"})
+            )
+        );
+        // No instance typed: a service-only forward.
+        assert_eq!(add_call(dir, &port_req("", Some("db"))).1["instance"], Value::Null);
+        assert!(root_dir(PathBuf::from("rel/dir")).is_absolute());
+    }
+
+    /// The calls are what the API takes, and its answers become rows and
+    /// status lines.
+    #[test]
+    fn forward_calls_are_accepted_by_the_api_and_answers_render() {
+        use crate::serve::api::{self, ApiError, Ctx, Forwarding};
+        use crate::serve::forwards::{AddRequest, Removed};
+        struct Fake;
+        impl Forwarding for Fake {
+            fn list(&self, dir: Option<PathBuf>) -> Result<Vec<ForwardRow>, ApiError> {
+                assert_eq!(dir.as_deref(), Some(Path::new("/cfg")));
+                Ok(vec![ForwardRow {
+                    id: 3,
+                    dir: "/cfg".into(),
+                    local: "127.0.0.1:8080".into(),
+                    target: "web:3000".into(),
+                    process: Some("node (pid 1)".into()),
+                    state: "active".into(),
+                    conns: 2,
+                    configured: true,
+                }])
+            }
+            fn add(&self, req: AddRequest) -> Result<Added, ApiError> {
+                assert_eq!(req.instance.as_deref(), Some("web"));
+                Ok(Added { id: 3, local: "127.0.0.1:8080".into(), target: "web:3000".into() })
+            }
+            fn rm(&self, _: u64) -> Result<Removed, ApiError> {
+                Ok(Removed { local: "127.0.0.1:8080".into(), configured: true })
+            }
+        }
+        let path = std::env::temp_dir().join(format!("devsandbox-tui-fwd-{}", std::process::id())).join("inbox.toml");
+        let ctx = Ctx { inbox: &path, bridges: None, forwards: Some(&Fake) };
+        let dir = Path::new("/cfg");
+
+        let (method, params) = list_call(dir);
+        let rows = port_rows(api::call(method, params, &ctx).unwrap()).unwrap();
+        assert_eq!(
+            rows,
+            [PortRow {
+                id: 3,
+                local: "127.0.0.1:8080".into(),
+                target: "web:3000".into(),
+                process: Some("node (pid 1)".into()),
+                state: "active".into(),
+                conns: 2,
+                configured: true,
+            }]
+        );
+        let (method, params) = add_call(dir, &port_req("web", None));
+        assert_eq!(added_status(api::call(method, params, &ctx).unwrap()), "forwarding 127.0.0.1:8080 -> web:3000");
+        let (method, params) = rm_call(3);
+        assert_eq!(
+            removed_status(&api::call(method, params, &ctx).unwrap()),
+            "stopped 127.0.0.1:8080 (forwardPorts: back when its instance restarts)"
+        );
+        assert_eq!(removed_status(&json!({"ok": true, "local": "127.0.0.1:1", "configured": false})), "stopped 127.0.0.1:1");
     }
 
     #[test]

@@ -1,5 +1,6 @@
 //! The daemon's API methods (docs/api.md): the method table and one thin
-//! handler per method, each a call into `inbox::ops` or `snapshot`. Params
+//! handler per method, each a call into `inbox::ops`, `snapshot`, or the
+//! daemon's bridges and forwards (behind [`Bridging`] / [`Forwarding`]). Params
 //! parse through serde structs; results are explicit wire views
 //! ([`ThreadSummary`], [`ThreadDetail`]), never the store model, whose TOML
 //! shape is internal and is replaced at store v3.
@@ -22,6 +23,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use super::forwards::{AddRequest, Added, ForwardRow, Removed};
 use crate::inbox::thread::HostVerb;
 use crate::inbox::{EntryKind, Inbox, Kind, Op, Thread, View, ops};
 
@@ -32,6 +34,20 @@ pub struct Ctx<'a> {
     /// The bridges `bridges.ensure` acts on; `None` on a daemon that runs no
     /// host side (tests).
     pub bridges: Option<&'a dyn Bridging>,
+    /// The port forwards `forwards.*` act on; `None` like `bridges`.
+    pub forwards: Option<&'a dyn Forwarding>,
+}
+
+/// The daemon's forward registry as `forwards.*` sees it
+/// (`forwards::Handle` in production), so the handlers are tested with a
+/// fake. Params are validated before these are called.
+pub trait Forwarding {
+    /// Every forward, or those of config root `dir` (absolute).
+    fn list(&self, dir: Option<PathBuf>) -> Result<Vec<ForwardRow>, ApiError>;
+    /// Start an ad-hoc forward: `not-found` (instance, dir), `bind-failed`.
+    fn add(&self, req: AddRequest) -> Result<Added, ApiError>;
+    /// Stop forward `id`: `not-found`.
+    fn rm(&self, id: u64) -> Result<Removed, ApiError>;
 }
 
 /// The daemon's bridges as `bridges.ensure` sees them (`host::Waker` in
@@ -79,6 +95,12 @@ impl ApiError {
         Self::new("denied", message)
     }
 
+    /// A forward's host port couldn't be bound (in use, privileged, an
+    /// address not on this host).
+    pub fn bind_failed(message: impl Into<String>) -> Self {
+        Self::new("bind-failed", message)
+    }
+
     pub fn internal(e: anyhow::Error) -> Self {
         Self::new("internal", format!("{e:#}"))
     }
@@ -113,6 +135,9 @@ pub fn call(method: &str, params: Value, ctx: &Ctx) -> Answer {
         "inbox.notify.markRead" => notify_mark_read(parse(params)?, ctx),
         "instances.list" => instances_list(parse(params)?),
         "bridges.ensure" => bridges_ensure(parse(params)?, ctx),
+        "forwards.list" => forwards_list(parse(params)?, ctx),
+        "forwards.add" => forwards_add(parse(params)?, ctx),
+        "forwards.rm" => forwards_rm(parse(params)?, ctx),
         other => Err(ApiError::unknown_method(other)),
     }
 }
@@ -131,6 +156,9 @@ pub enum Topic {
     Inbox,
     /// `instances.changed`: the running containers changed, re-fetch.
     Instances,
+    /// `forwards.changed`: the forwards' rows changed, re-fetch; and
+    /// `forwards.status` lines.
+    Forwards,
 }
 
 impl Topic {
@@ -138,6 +166,7 @@ impl Topic {
         match s {
             "inbox" => Some(Topic::Inbox),
             "instances" => Some(Topic::Instances),
+            "forwards" => Some(Topic::Forwards),
             _ => None,
         }
     }
@@ -153,7 +182,7 @@ pub fn topics(params: Value) -> Result<Vec<Topic>, ApiError> {
     let p: TopicsParams = parse(params)?;
     p.topics
         .iter()
-        .map(|t| Topic::parse(t).ok_or_else(|| ApiError::invalid(format!("unknown topic `{t}` (inbox, instances)"))))
+        .map(|t| Topic::parse(t).ok_or_else(|| ApiError::invalid(format!("unknown topic `{t}` (inbox, instances, forwards)"))))
         .collect()
 }
 
@@ -601,6 +630,77 @@ fn bridges_ensure(p: EnsureParams, ctx: &Ctx) -> Answer {
     Ok(json!({ "ok": true, "ready": r.ready, "error": r.error }))
 }
 
+fn forwarding<'a>(ctx: &Ctx<'a>) -> Result<&'a dyn Forwarding, ApiError> {
+    ctx.forwards.ok_or_else(|| ApiError::internal(anyhow::anyhow!("this daemon runs no forwards")))
+}
+
+fn absolute_dir(dir: &Path) -> Result<(), ApiError> {
+    if dir.is_absolute() {
+        Ok(())
+    } else {
+        Err(ApiError::invalid(format!("`dir` must be absolute, got `{}`", dir.display())))
+    }
+}
+
+#[derive(Deserialize)]
+struct ForwardsListParams {
+    #[serde(default)]
+    dir: Option<PathBuf>,
+}
+
+fn forwards_list(p: ForwardsListParams, ctx: &Ctx) -> Answer {
+    let forwards = forwarding(ctx)?;
+    if let Some(dir) = &p.dir {
+        absolute_dir(dir)?;
+    }
+    serde_json::to_value(forwards.list(p.dir)?).map_err(|e| ApiError::internal(e.into()))
+}
+
+#[derive(Deserialize)]
+struct ForwardsAddParams {
+    dir: PathBuf,
+    #[serde(default)]
+    instance: Option<String>,
+    #[serde(default)]
+    service: Option<String>,
+    #[serde(default)]
+    address: Option<String>,
+    spec: String,
+}
+
+/// `forwards.add`'s params, checked: everything that needs no state or
+/// socket. Empty `instance` / `service` count as absent.
+fn add_request(p: ForwardsAddParams) -> Result<AddRequest, ApiError> {
+    absolute_dir(&p.dir)?;
+    let instance = p.instance.filter(|s| !s.is_empty());
+    let service = p.service.filter(|s| !s.is_empty());
+    if instance.is_none() && service.is_none() {
+        return Err(ApiError::invalid("name an `instance`, a `service`, or both"));
+    }
+    let (host_port, container_port) = crate::commands::port::parse_port_spec(&p.spec).map_err(ApiError::invalid)?;
+    let bind = match &p.address {
+        Some(a) => a.parse().map_err(|_| ApiError::invalid(format!("bad address `{a}`")))?,
+        None => std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+    };
+    Ok(AddRequest { dir: p.dir, instance, service, bind, host_port, container_port })
+}
+
+fn forwards_add(p: ForwardsAddParams, ctx: &Ctx) -> Answer {
+    let forwards = forwarding(ctx)?;
+    let added = forwards.add(add_request(p)?)?;
+    serde_json::to_value(added).map_err(|e| ApiError::internal(e.into()))
+}
+
+#[derive(Deserialize)]
+struct ForwardsRmParams {
+    id: u64,
+}
+
+fn forwards_rm(p: ForwardsRmParams, ctx: &Ctx) -> Answer {
+    let removed = forwarding(ctx)?.rm(p.id)?;
+    Ok(json!({ "ok": true, "local": removed.local, "configured": removed.configured }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -635,7 +735,7 @@ mod tests {
     }
 
     fn run(path: &Path, method: &str, params: Value) -> Answer {
-        call(method, params, &Ctx { inbox: path, bridges: None })
+        call(method, params, &Ctx { inbox: path, bridges: None, forwards: None })
     }
 
     /// Records what `bridges.ensure` asked for; knows instance `web` only.
@@ -675,7 +775,7 @@ mod tests {
         let path = store_path("ensure-wait");
         let not = Readiness { ready: false, error: Some("helper in devsandbox-web is outdated".into()) };
         let fake = FakeBridges { readiness: Some(not), ..FakeBridges::default() };
-        let ensure = |params: Value| call("bridges.ensure", params, &Ctx { inbox: &path, bridges: Some(&fake) });
+        let ensure = |params: Value| call("bridges.ensure", params, &Ctx { inbox: &path, bridges: Some(&fake), forwards: None });
 
         assert_eq!(ensure(json!({"instance": "web"})).unwrap(), json!({"ok": true}), "no wait: unchanged");
         assert!(fake.waits.borrow().is_empty());
@@ -695,7 +795,7 @@ mod tests {
         assert_eq!(fake.woken.borrow().len(), 4, "a bad wait wakes nothing");
 
         let ready = FakeBridges { readiness: Some(Readiness { ready: true, error: None }), ..FakeBridges::default() };
-        let r = call("bridges.ensure", json!({"instance": "web", "wait": 10}), &Ctx { inbox: &path, bridges: Some(&ready) });
+        let r = call("bridges.ensure", json!({"instance": "web", "wait": 10}), &Ctx { inbox: &path, bridges: Some(&ready), forwards: None });
         assert_eq!(r.unwrap(), json!({"ok": true, "ready": true, "error": null}));
     }
 
@@ -703,7 +803,7 @@ mod tests {
     fn bridges_ensure_records_the_agent_and_reconciles_the_instance() {
         let path = store_path("ensure");
         let fake = FakeBridges::default();
-        let ensure = |params: Value| call("bridges.ensure", params, &Ctx { inbox: &path, bridges: Some(&fake) });
+        let ensure = |params: Value| call("bridges.ensure", params, &Ctx { inbox: &path, bridges: Some(&fake), forwards: None });
 
         assert_eq!(ensure(json!({"instance": "web", "agent": "/tmp/ssh-x/agent.1"})).unwrap(), json!({"ok": true}));
         assert_eq!(ensure(json!({"instance": "web", "agent": null})).unwrap(), json!({"ok": true}));
@@ -951,8 +1051,113 @@ mod tests {
 
     #[test]
     fn topics_parse_and_reject_unknown_ones() {
-        assert_eq!(topics(json!({"topics":["inbox","instances"]})).unwrap(), [Topic::Inbox, Topic::Instances]);
-        assert_eq!(topics(json!({"topics":["forwards"]})).unwrap_err().code, "invalid");
+        assert_eq!(
+            topics(json!({"topics":["inbox","instances","forwards"]})).unwrap(),
+            [Topic::Inbox, Topic::Instances, Topic::Forwards]
+        );
+        assert_eq!(topics(json!({"topics":["ports"]})).unwrap_err().code, "invalid");
         assert_eq!(topics(Value::Null).unwrap_err().code, "invalid");
+    }
+
+    /// Records what `forwards.*` asked for; forward 1 exists (configured),
+    /// instance `web` exists.
+    #[derive(Default)]
+    struct FakeForwards {
+        adds: std::cell::RefCell<Vec<AddRequest>>,
+        lists: std::cell::RefCell<Vec<Option<PathBuf>>>,
+    }
+
+    impl Forwarding for FakeForwards {
+        fn list(&self, dir: Option<PathBuf>) -> Result<Vec<ForwardRow>, ApiError> {
+            self.lists.borrow_mut().push(dir);
+            Ok(vec![ForwardRow {
+                id: 1,
+                dir: "/cfg".into(),
+                local: "127.0.0.1:3000".into(),
+                target: "web:3000".into(),
+                process: None,
+                state: "active".into(),
+                conns: 0,
+                configured: true,
+            }])
+        }
+        fn add(&self, req: AddRequest) -> Result<Added, ApiError> {
+            if req.instance.as_deref().is_some_and(|i| i != "web") {
+                return Err(ApiError::not_found("no instance"));
+            }
+            self.adds.borrow_mut().push(req);
+            Ok(Added { id: 2, local: "127.0.0.1:3001".into(), target: "web:3000".into() })
+        }
+        fn rm(&self, id: u64) -> Result<Removed, ApiError> {
+            match id {
+                1 => Ok(Removed { local: "127.0.0.1:3000".into(), configured: true }),
+                _ => Err(ApiError::not_found(format!("no forward {id}"))),
+            }
+        }
+    }
+
+    #[test]
+    fn forwards_methods_validate_then_call_the_registry() {
+        use crate::devsbd::forward::HostPort;
+        let path = store_path("forwards");
+        let fake = FakeForwards::default();
+        let fwd = |method: &str, params: Value| call(method, params, &Ctx { inbox: &path, bridges: None, forwards: Some(&fake) });
+
+        let rows = fwd("forwards.list", json!({"dir": "/cfg"})).unwrap();
+        assert_eq!(rows[0]["id"], 1);
+        assert_eq!(rows[0]["configured"], true);
+        fwd("forwards.list", Value::Null).unwrap();
+        assert_eq!(*fake.lists.borrow(), [Some(PathBuf::from("/cfg")), None]);
+        assert_eq!(code(fwd("forwards.list", json!({"dir": "rel"}))), "invalid");
+
+        let added = fwd("forwards.add", json!({"dir": "/cfg", "instance": "web", "spec": "8080:3000"})).unwrap();
+        assert_eq!(added, json!({"id": 2, "local": "127.0.0.1:3001", "target": "web:3000"}));
+        fwd("forwards.add", json!({"dir": "/cfg", "instance": "", "service": "db", "address": "0.0.0.0", "spec": "5432"}))
+            .unwrap();
+        let adds = fake.adds.borrow().clone();
+        assert_eq!(
+            adds,
+            [
+                AddRequest {
+                    dir: "/cfg".into(),
+                    instance: Some("web".into()),
+                    service: None,
+                    bind: "127.0.0.1".parse().unwrap(),
+                    host_port: HostPort::Fixed(8080),
+                    container_port: 3000,
+                },
+                AddRequest {
+                    dir: "/cfg".into(),
+                    instance: None,
+                    service: Some("db".into()),
+                    bind: "0.0.0.0".parse().unwrap(),
+                    host_port: HostPort::Prefer(5432),
+                    container_port: 5432,
+                },
+            ]
+        );
+        // Refused before the registry sees them.
+        for bad in [
+            json!({"dir": "rel", "instance": "web", "spec": "3000"}),
+            json!({"dir": "/cfg", "spec": "3000"}),
+            json!({"dir": "/cfg", "instance": "web", "spec": "0"}),
+            json!({"dir": "/cfg", "instance": "web", "spec": "a:b"}),
+            json!({"dir": "/cfg", "instance": "web", "spec": "3000", "address": "localhost"}),
+            json!({"dir": "/cfg", "instance": "web"}),
+        ] {
+            assert_eq!(code(fwd("forwards.add", bad.clone())), "invalid", "{bad}");
+        }
+        assert_eq!(fake.adds.borrow().len(), 2);
+        assert_eq!(code(fwd("forwards.add", json!({"dir": "/cfg", "instance": "nope", "spec": "3000"}))), "not-found");
+
+        assert_eq!(
+            fwd("forwards.rm", json!({"id": 1})).unwrap(),
+            json!({"ok": true, "local": "127.0.0.1:3000", "configured": true})
+        );
+        assert_eq!(code(fwd("forwards.rm", json!({"id": 9}))), "not-found");
+        assert_eq!(code(fwd("forwards.rm", json!({}))), "invalid");
+
+        // A daemon without a host side says so.
+        assert_eq!(code(run(&path, "forwards.list", json!({}))), "internal");
     }
 }

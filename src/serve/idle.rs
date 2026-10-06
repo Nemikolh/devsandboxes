@@ -7,13 +7,13 @@ use std::time::{Duration, Instant};
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// What keeps the daemon alive, one field per row of the holder table (plus
-/// `autostart`). `forwards` and `followers` stay 0 until their step fills them.
+/// `autostart`). `followers` stays 0 until step 18 fills it.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Holders {
     /// Connected clients: TUI, `api --stdio`, an `inbox` command, an `exec`
     /// session using the ssh-agent relay.
     pub clients: usize,
-    /// Active port forwards (step 8).
+    /// Live port forwards, ad-hoc and configured (`forwards::Registry`).
     pub forwards: usize,
     /// Running instances declaring `dispatcher` (`inbox = true` joins in
     /// step 11), as of the daemon's last container poll.

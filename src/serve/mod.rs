@@ -15,12 +15,14 @@
 //! - `idle`: the pure idle countdown over a holder snapshot
 //! - `daemon`: the accept loop, lock, handoff and idle exit
 //! - `host`: the live host side: the bridge poll and the autostart pass
+//! - `forwards`: the port forwards (ad-hoc and configured), on their own thread
 //! - `client`: connect-or-lazy-start for commands
 
 pub mod api;
 pub mod client;
 pub mod daemon;
 pub mod endpoint;
+pub mod forwards;
 mod host;
 pub mod idle;
 pub mod proto;

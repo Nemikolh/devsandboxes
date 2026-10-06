@@ -521,8 +521,8 @@ const localPort = (f: Forward): number => Number(f.local.slice(f.local.lastIndex
 const PREFER_TRIES = 10;
 
 /**
- * A `port` request, as the forwarder worker handles it (`Forwards::start` in
- * `src/tui/forwards.rs`): same host port or the next free one up for `3000`,
+ * A `port` request, as the daemon's forward registry handles it (`Root::start`
+ * in `src/serve/forwards.rs`): same host port or the next free one up for `3000`,
  * exactly that one for `8080:3000`; the status line says what it bound.
  */
 function addForward(s: State, a: Extract<Action, { cmd: 'port' }>): State {

@@ -147,6 +147,11 @@ sandboxes from config, instances nested below:
 ## Phase 3 — Ports tab (on-demand port forwarding)
 
 See `docs/port-forwarding.md` for the engine. The dashboard gains a third tab.
+The host daemon owns the forwards (`docs/serve.md`, _Forwards_): the tab
+lists its forwards of this config root (`forwards.list`, re-fetched on
+`forwards.changed`), so they survive quitting the dashboard and every
+dashboard of the root shows the same ones. Without a daemon connection the
+tab is empty and `p` says `port forwarding needs the host daemon: …`.
 
 - `Tab::Ports` sits next to Instances and Services: `1/2/3` jump to a tab and
   `tab`/`S-tab` cycle over all three (no longer a two-tab toggle).
@@ -154,23 +159,26 @@ See `docs/port-forwarding.md` for the engine. The dashboard gains a third tab.
   carrying any `(via instance …)` suffix — no separate VIA column), `PROCESS`
   (`node (pid 412)`, `-` when unknown), `STATE` (active green / connecting
   yellow / error red), `CONNS`. Empty state points at `p` / `:port`.
-- Running instances' `forwardPorts` are forwarded automatically, on the host
-  port saved for them in `state.toml` (docs/port-forwarding.md, _Configured
-  forwards_); their `TARGET` carries a dim `(config)`.
+- Running instances' `forwardPorts` are forwarded automatically by the
+  daemon, on the host port saved for them in `state.toml`
+  (docs/port-forwarding.md, _Configured forwards_); their `TARGET` carries a
+  dim `(config)`. The daemon's `forwards.status` lines (a configured forward
+  started, a connection note) are status lines.
 - Keys:
   - `p` on an Instances row (not a process row) opens the prompt prefilled
     `port <instance> `; `p` on a Services row prefills
     `port <first used_by instance> --service <svc> ` (blank instance slot when
     the service has no user).
-  - `d` on the Ports tab stops the selected forward (a configured one stays
-    stopped until the dashboard reopens).
+  - `d` on the Ports tab stops the selected forward (`forwards.rm`; a
+    configured one stays stopped until its instance stops and runs again).
 - Prompt command
   `port <instance> [--service s] [--address a] <[host:]port>`: an instance is
   required (a global service is reached by naming any instance that references
   it); `--service` completes service names. The port spec is validated on submit
   (`p` or `h:p`, non-zero u16s) via `commands::port::validate_port_spec`; a bad
   spec is an inline prompt error. Submitting switches to the Ports tab and hands
-  the request to the forwarder worker (it never suspends the TUI).
+  the request to the daemon worker (`src/tui/daemon.rs`), which sends
+  `forwards.add` (it never suspends the TUI); the answer is the status line.
 
 ## Phase 4 — Inbox tab (notifications and dispatcher threads)
 

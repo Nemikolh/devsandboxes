@@ -59,7 +59,11 @@ git worktrees so working trees are never shared.
   start + hello; `ensure_running` for `run`/`start`; `Conn` sets
   notifications aside), `idle.rs` (pure idle countdown over `Holders`),
   `proto.rs` (JSON-lines wire, `PROTOCOL`), `api.rs` (the API's method table
-  and wire views over `inbox::ops`/`snapshot`, socket-free; `docs/api.md`).
+  and wire views over `inbox::ops`/`snapshot`, socket-free; `docs/api.md`),
+  `forwards.rs` (the `serve-forwards` thread owning every Ports-tab `Forward`,
+  one registry per config root, daemon-wide ids; reconciles sandboxes'
+  `forwardPorts` against `host.rs`'s running poll, with host ports saved in
+  `state.toml`; `forwards.*` talk to it over a request/reply channel).
   `daemon.rs` also owns `subscribe`: a `serve-watch` thread flags changes on
   each connection's `Outbox`, a per-connection notifier writes them.
 - `src/runtime/` — backend abstraction over docker/podman/Apple container.
@@ -94,14 +98,12 @@ git worktrees so working trees are never shared.
   (`TermSession`/`TermTabs`, `docker exec -it` shell rendered via vt100);
   `kitty.rs` emulates the kitty keyboard protocol for those sessions (vt100
   callbacks + key encoding; see `docs/tui-terminal.md`);
-  `forwards.rs` is the Ports-tab worker thread that owns every live `Forward`
-  (route resolution + docker work off the UI thread), modelled on `BridgeWorker`;
-  it also reconciles sandboxes' `forwardPorts` against the running instances
-  each snapshot, with host ports saved in `state.toml`.
   `daemon.rs` is the host-daemon worker thread (unix): owns the `serve`
   connection (the dashboard as a holder; reconnect with backoff), relays
   `inbox.changed`/`instances.changed`/`inbox.shown`, sends Inbox `Op`s as
-  API calls while connected (else the loop applies them locally).
+  API calls while connected (else the loop applies them locally), and is
+  the Ports tab's client (`forwards.list` on `forwards.changed`,
+  `forwards.add`/`rm`; the daemon owns the forwards).
   Mouse selection (`docs/tui-selection.md`): `select.rs` is the pure model
   (extraction, highlight), `app/selection.rs` its routing, `clipboard.rs` the
   OSC 52 writer; `settings.rs` the dashboard settings (`dashboard.toml` next

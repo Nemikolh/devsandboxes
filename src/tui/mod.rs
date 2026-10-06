@@ -9,8 +9,6 @@ mod clipboard;
 #[cfg(unix)]
 mod daemon;
 mod data;
-#[cfg(unix)]
-mod forwards;
 mod kitty;
 mod markdown;
 mod procs;
@@ -254,17 +252,11 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
     // (`daemon.rs`) holds the connection for the dashboard's life (so the
     // dashboard is a holder), reconnecting after a handoff or a death, and
     // relays its notifications. Without one the dashboard works on the
-    // store alone, minus the live features.
+    // store alone, minus the live features. The daemon also owns the
+    // Ports tab's forwards (they outlive the dashboard); the worker relays
+    // adds/stops and this root's rows.
     #[cfg(unix)]
-    let daemon = daemon::DaemonWorker::spawn();
-    // Ports-tab forwards (docs/port-forwarding.md, step 10). A worker thread
-    // owns every `Forward`, doing all config/state/docker work (route
-    // resolution, `ensure`, the `lsof` probe) off the UI thread; its `Drop`
-    // (any exit path, including `?`) closes the channel and joins, dropping
-    // every forward — killing its bridge/`exec` — before the terminal is
-    // restored.
-    #[cfg(unix)]
-    let forwards = forwards::ForwardWorker::spawn(dir.clone());
+    let daemon = daemon::DaemonWorker::spawn(dir.clone());
 
     while !app.should_quit {
         // Full-frame area, shared by the pre-draw PTY resize and mouse routing.
@@ -388,26 +380,21 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
             }
         }
 
-        // Ports tab: hand add/remove requests to the forwarder worker and drain
-        // its updates into the app. All docker/config work happens on the worker,
-        // never here. Off unix the mux (and thus forwarding) doesn't exist.
+        // Ports tab: hand add/remove requests to the daemon worker (the daemon
+        // owns the forwards) and drain its updates into the app. Off unix the
+        // mux (and thus forwarding) doesn't exist.
         #[cfg(unix)]
         {
             if let Some(req) = app.take_pending_port() {
-                forwards.add(req);
+                daemon.forward_add(req);
             }
             if let Some(id) = app.take_pending_unport() {
-                forwards.remove(id);
-            }
-            while let Some(update) = forwards.try_recv() {
-                match update {
-                    forwards::ForwardUpdate::Rows(rows) => app.set_ports(rows),
-                    forwards::ForwardUpdate::Status(status) => app.status = Some(status),
-                }
+                daemon.forward_rm(id);
             }
             while let Some(update) = daemon.try_recv() {
                 match update {
                     daemon::DaemonUpdate::InboxChanged => reload_inbox = true,
+                    daemon::DaemonUpdate::Ports(rows) => app.set_ports(rows),
                     // The daemon's 5 s poll saw containers come or go:
                     // resnapshot soon rather than on the next tick.
                     daemon::DaemonUpdate::InstancesChanged => followup.schedule(Instant::now()),
@@ -552,18 +539,6 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
             match rx.try_recv() {
                 Ok((snapshot, children)) => {
                     app.thread_children = children;
-                    #[cfg(unix)]
-                    {
-                        // Configured `forwardPorts` follow the running set.
-                        forwards.sync(
-                            snapshot
-                                .instances
-                                .iter()
-                                .filter(|r| matches!(r.status, data::ContainerStatus::Running(_)))
-                                .map(|r| r.name.clone())
-                                .collect(),
-                        );
-                    }
                     app.set_snapshot(snapshot);
                     pending = deeper.pop().map(|depth| {
                         if depth == data::Depth::Full {

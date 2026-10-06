@@ -1,20 +1,20 @@
 # `devsandbox serve`: the host daemon
 
 A per-user, per-host background process that owns the live host side of
-devsandbox (bridges, popups, control ops, the API; later forwards) so it
+devsandbox (bridges, popups, control ops, port forwards, the API) so it
 keeps working with the dashboard closed. Design and roadmap:
 `docs/inbox-redesign.md`, "Host daemon". Unix only; the command doesn't
 exist on Windows.
 
-This page covers what exists today (steps 4-7 of that plan, and step 8's
-ssh-agent half): the socket, start, handoff, idle exit, the bridges (the
-ssh-agent relay included) and the startup autostart pass. The
+This page covers what exists today (steps 4-8 of that plan): the socket,
+start, handoff, idle exit, the bridges (the ssh-agent relay included), the
+port forwards and the startup autostart pass. The
 API on the socket has its own page, `docs/api.md`. Marked below is what
 later steps add.
 
 Code: `src/serve/` (`endpoint.rs` paths + bind/connect/accept, `daemon.rs`,
-`host.rs` bridges + autostart, `api.rs` methods, `client.rs`, `idle.rs`,
-`proto.rs`).
+`host.rs` bridges + autostart, `forwards.rs` port forwards, `api.rs`
+methods, `client.rs`, `idle.rs`, `proto.rs`).
 
 ## Paths and permissions
 
@@ -57,7 +57,8 @@ their container is up (best effort: a failure is one `warning:` line on
 stderr, the command still succeeds; they hang up right away), and every
 command that relays the ssh-agent into a relay-mode instance (`exec`,
 `start`'s `postStartCommand`, `run`'s lifecycle chain) for its bridge (see
-*Bridges*). `port` and `inbox` follow in steps 8-19; `devsandbox api
+*Bridges*). `inbox` follows in step 19 (the foreground `port` command
+doesn't use the daemon); `devsandbox api
 --stdio` in step 9.
 
 The daemon inherits the environment of the process that started it: the
@@ -106,6 +107,22 @@ without a daemon connection, `devsandbox rm`).
 Each message the sink stores that earns a status line also goes to `inbox`
 subscribers as `inbox.shown`: that's the dashboard's status line.
 
+## Forwards
+
+The daemon owns every Ports-tab forward (`docs/port-forwarding.md`), on its
+own `serve-forwards` thread: ad-hoc ones added through `forwards.add` (the
+dashboard's `p` / `:port`), and every running instance's configured
+`forwardPorts`, for every config root recorded in `state.toml`. The
+configured ones follow the 5 s container poll: started on the host port
+saved in `state.toml` when their instance runs, stopped when it stops, so
+they work with no dashboard open. Each forward keeps its own bridge (an
+`exec -i … devsbd bridge` of its own, self-healing), separate from the
+instance's daemon bridge; sharing that bridge's mux is a later
+optimization. Status lines (a configured forward started or failed, a
+connection note) go to `forwards` subscribers as `forwards.status` and to
+`serve.log`. The foreground `devsandbox port` command still forwards in its
+own process, without the daemon.
+
 ## Autostart
 
 At start the daemon runs the `autostart = true` pass
@@ -148,14 +165,19 @@ the close.
 The daemon exits 10 minutes after its last *holder* left; a new holder
 cancels the countdown. Holders today: connected clients (an open
 dashboard, a running `exec` that relays the agent), running instances that declare `dispatcher` (as of the last
-poll; `inbox = true` joins in step 11), in-flight control requests, and the
+poll; `inbox = true` joins in step 11), in-flight control requests, every
+live port forward (ad-hoc or configured, whatever its state), and the
 startup autostart pass while it runs. So with a dispatcher running the
-daemon never idles. Later steps add port forwards (step 8) and `--follow`
-subscribers (step 18).
+daemon never idles, and by design neither does it while an instance with
+`forwardPorts` runs, or an ad-hoc forward exists (stop it in the Ports tab
+with `d`). A later step adds `--follow` subscribers (step 18).
 
-Exiting (idle or handoff) kills every bridge before the start lock is
-released, so a successor's bridges never overlap. A running autostart pass
-is waited for.
+Exiting (idle or handoff) kills every bridge and closes every forward
+before the start lock is released, so a successor's bridges never overlap
+and it can bind the configured forwards' saved host ports again; it
+restarts them on its first poll. Ad-hoc forwards are lost on a handoff
+(the dashboard's Ports tab shows them gone; add them again). A running
+autostart pass is waited for.
 
 `--keep-alive` disables the idle exit. A `serve.keep-alive` setting in a
 global config is planned but there's no global config yet; `devsandbox serve
@@ -165,5 +187,6 @@ install` (step 10, systemd user unit / LaunchAgent) will imply keep-alive.
 
 `serve.log` gets one timestamped line (`[<unix secs>] devsandbox serve: …`)
 at start (socket, pid, version, keep-alive), at a handoff request, when the
-runtime stops or starts answering, and at exit; plus the autostart pass's
-own notes (untimestamped). It's appended to, never rotated.
+runtime stops or starts answering, at each forwards status line
+(`forwards: …`), and at exit; plus the autostart pass's own notes
+(untimestamped). It's appended to, never rotated.
