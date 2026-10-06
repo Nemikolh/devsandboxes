@@ -41,22 +41,12 @@ use super::view::{divider_pct, point_in};
 use super::{App, Modal, Tab};
 use crate::tui::ui;
 
-/// Which threads the list shows, stepped with `←`/`→`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum View {
-    /// Waiting on the user ([`Thread::needs_you`]): the default, and what the
-    /// badges count.
-    #[default]
-    NeedsYou,
-    Active,
-    Done,
-    /// Everything, archived threads and read notify records included.
-    All,
-}
+/// Which threads the list shows, stepped with `←`/`→`. The membership rule
+/// ([`View::shows`]) lives in `crate::inbox::view`, shared with the daemon
+/// API; this adds the dashboard's display bits.
+pub use crate::inbox::View;
 
 impl View {
-    pub const ALL: [View; 4] = [View::NeedsYou, View::Active, View::Done, View::All];
-
     pub fn title(self) -> &'static str {
         match self {
             View::NeedsYou => "Needs you",
@@ -72,18 +62,6 @@ impl View {
     fn step(self, step: isize) -> View {
         let i = View::ALL.iter().position(|v| *v == self).unwrap_or(0) as isize;
         View::ALL[(i + step).clamp(0, View::ALL.len() as isize - 1) as usize]
-    }
-
-    /// Whether `t` belongs in this view. Archived threads (their owner is
-    /// gone) are history and only show in All; so do read notify records,
-    /// which have no state to file them under.
-    pub fn shows(self, t: &Thread) -> bool {
-        match self {
-            View::NeedsYou => t.needs_you(),
-            View::Active => !t.archived && t.state == Some(State::Active),
-            View::Done => !t.archived && t.state == Some(State::Done),
-            View::All => true,
-        }
     }
 
     /// Whether this view lists unread notify records, i.e. leaving the Inbox

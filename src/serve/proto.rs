@@ -1,12 +1,12 @@
-//! The daemon's wire format: JSON lines, one request or response per line.
-//! Step 4 knows only `hello`; step 6 adds the API (docs/inbox-redesign.md
-//! "One API, served by the daemon") on the same envelope.
+//! The daemon's wire format: JSON lines, one request, response or
+//! notification per line (docs/api.md; the methods are in `api.rs`).
 //!
 //! ```text
 //! → {"id":1,"method":"hello","params":{"version":"0.6.0","build":1767225600,"client":"tui"}}
-//! ← {"id":1,"result":{"version":"0.6.0","build":1767225600}}
-//! ← {"id":1,"result":{"version":"0.6.0","build":1767225600,"handoff":true}}   (client is newer)
+//! ← {"id":1,"result":{"version":"0.6.0","build":1767225600,"protocol":1}}
+//! ← {"id":1,"result":{"version":"0.6.0","build":1767225600,"protocol":1,"handoff":true}}   (client is newer)
 //! ← {"id":2,"error":{"code":"unknown-method","message":"…"}}
+//! ← {"method":"inbox.changed","params":{"generation":3}}                  (no id: a notification)
 //! ```
 
 use serde::{Deserialize, Serialize};
@@ -14,6 +14,11 @@ use serde_json::Value;
 
 /// Longest request line the daemon reads; longer ones close the connection.
 pub const MAX_LINE: u64 = 1 << 20;
+
+/// The API's protocol number, sent in every hello reply. Changes within one
+/// number are additive only (new methods, new fields, new error codes); a
+/// breaking change bumps it.
+pub const PROTOCOL: u32 = 1;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Request {
@@ -66,10 +71,22 @@ pub struct HelloParams {
 pub struct HelloResult {
     pub version: String,
     pub build: u64,
+    /// [`PROTOCOL`]; 0 from a daemon that predates it (no API).
+    #[serde(default)]
+    pub protocol: u32,
     /// The client is newer: the daemon is draining and will exit; the client
     /// should start its own.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub handoff: bool,
+}
+
+/// A daemon-to-client message with no `id`: `inbox.changed`,
+/// `instances.changed`, `closing`. A line with a `method` is one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Notification {
+    pub method: String,
+    #[serde(default)]
+    pub params: Value,
 }
 
 /// A daemon or client version: the semver plus the binary's mtime, so a
@@ -148,11 +165,20 @@ mod tests {
         let hello: HelloParams = serde_json::from_value(req.params).unwrap();
         assert_eq!((hello.version.as_str(), hello.build, hello.client.as_str()), ("0.6.0", 2, "cli"));
 
-        let quiet = HelloResult { version: "0.6.0".into(), build: 1, handoff: false };
+        let quiet = HelloResult { version: "0.6.0".into(), build: 1, protocol: PROTOCOL, handoff: false };
         let ok = Response::ok(Some(1), serde_json::to_value(&quiet).unwrap());
-        assert_eq!(serde_json::to_value(&ok).unwrap(), serde_json::json!({"id":1,"result":{"version":"0.6.0","build":1}}));
+        assert_eq!(
+            serde_json::to_value(&ok).unwrap(),
+            serde_json::json!({"id":1,"result":{"version":"0.6.0","build":1,"protocol":1}})
+        );
         let handoff = HelloResult { handoff: true, ..quiet };
-        assert_eq!(serde_json::to_string(&handoff).unwrap(), r#"{"version":"0.6.0","build":1,"handoff":true}"#);
+        assert_eq!(serde_json::to_string(&handoff).unwrap(), r#"{"version":"0.6.0","build":1,"protocol":1,"handoff":true}"#);
+        // A pre-API daemon's reply still parses.
+        let old: HelloResult = serde_json::from_str(r#"{"version":"0.6.0","build":1}"#).unwrap();
+        assert_eq!(old.protocol, 0);
+
+        let note = Notification { method: "inbox.changed".into(), params: serde_json::json!({"generation":2}) };
+        assert_eq!(serde_json::to_string(&note).unwrap(), r#"{"method":"inbox.changed","params":{"generation":2}}"#);
 
         let err = Response::err(Some(3), "unknown-method", "nope");
         assert_eq!(

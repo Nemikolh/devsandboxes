@@ -57,6 +57,19 @@ pub fn apply(path: &Path, ops: &[Op]) -> Result<()> {
     })
 }
 
+/// [`apply`] with a check against the current store, in the same write:
+/// `decide` sees the Inbox under the lock and returns the ops to apply, or
+/// why not. What an API client needs, since [`Inbox::apply`] treats a stale
+/// id or action as a silent no-op and the client must hear `not-found`.
+pub fn apply_if<E>(path: &Path, decide: impl FnOnce(&Inbox) -> Result<Vec<Op>, E>) -> Result<Result<(), E>> {
+    store::update_at(path, |inbox| {
+        let ops = decide(inbox)?;
+        let now = now();
+        ops.iter().for_each(|op| inbox.apply(op, now));
+        Ok(())
+    })
+}
+
 /// The notify sink: store one decoded container message from `owner`
 /// (`instance_id`; `owner_name` for display) and say what to surface.
 pub fn sink(path: &Path, owner: &str, owner_name: &str, action: SinkAction) -> Result<Option<Shown>> {
@@ -91,7 +104,6 @@ pub fn threads(path: &Path, owner: &str) -> Result<Vec<Thread>> {
 /// The store id of `owner`'s dispatcher thread `key`, archived or not. Only
 /// thread-kind threads: a notify record may share the key, but `(owner,
 /// key)` names a `thread put`, as it does for [`Inbox::put`].
-#[allow(dead_code)] // for the API (docs/inbox-redesign.md step 6), which addresses threads this way
 pub fn thread_id(inbox: &Inbox, owner: &str, key: &str) -> Option<u64> {
     inbox
         .threads

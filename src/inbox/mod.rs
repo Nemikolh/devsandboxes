@@ -32,6 +32,7 @@ pub mod ops;
 pub mod sanitize;
 pub mod store;
 pub mod thread;
+pub mod view;
 
 use std::collections::BTreeMap;
 
@@ -41,6 +42,7 @@ use crate::devsbd::notify::{Level, Message, Record};
 
 pub use sanitize::sanitize;
 pub use thread::{Action, Reply, State, ThreadPut};
+pub use view::View;
 
 /// Records kept per owner, thread history included; the owner's oldest record
 /// drops off beyond this. Per owner only, so a noisy container never evicts

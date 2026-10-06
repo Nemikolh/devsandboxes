@@ -3,30 +3,45 @@
 //!
 //! Threading: the calling thread runs the accept loop, waking every [`TICK`]
 //! to re-check the idle countdown and the handoff flag; each connection gets
-//! its own thread reading JSON lines. Exiting (idle or handoff) closes the
-//! listener and removes the socket first, then shuts down the read side of
-//! every connection, so idle ones end at once while a request in flight still
-//! writes its response, and waits up to [`DRAIN_TIMEOUT`] for them. Then the
-//! live host side ([`Host`]: bridges, autostart) stops, killing every bridge.
-//! The start lock is released last, so a successor never binds (or bridges)
-//! while this one drains.
+//! its own thread reading JSON lines and answering them (the API methods are
+//! in `api.rs`). Exiting (idle or handoff) closes the listener and removes
+//! the socket first, sends subscribers a `closing` notification, then shuts
+//! down the read side of every connection, so idle ones end at once while a
+//! request in flight still writes its response, and waits up to
+//! [`DRAIN_TIMEOUT`] for them. Then the live host side ([`Host`]: bridges,
+//! autostart) stops, killing every bridge. The start lock is released last,
+//! so a successor never binds (or bridges) while this one drains.
+//!
+//! Notifications (docs/api.md): one daemon-wide `serve-watch` thread notices
+//! changes (store writes by this process at once, by others within [`WATCH`]
+//! via the file stamp; the host's container poll) and only *flags* them on
+//! each subscribed connection's [`Outbox`]; it never does I/O, so a slow
+//! client can't hold up the others. A connection's first `subscribe` starts
+//! its `serve-notify-<n>` thread, which writes the flagged notifications.
+//! Flags coalesce (one pending `inbox.changed` however many writes), so the
+//! queue is bounded by construction; every write to a connection, response
+//! or notification, goes through its one writer lock, and a client that
+//! doesn't drain its socket for [`WRITE_TIMEOUT`] is disconnected.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::{File, TryLockError};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::Shutdown;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use serde_json::Value;
+use serde_json::{Value, json};
 
+use super::api::{self, Topic};
 use super::endpoint::{self, Listener, Stream};
 use super::host::Host;
 use super::idle::{self, Decision, Holders};
-use super::proto::{self, HelloParams, HelloResult, Request, Response, Version};
+use super::proto::{self, HelloParams, HelloResult, Notification, Request, Response, Version};
+use crate::inbox::ops;
 
 /// How often the accept loop wakes without a connection.
 const TICK: Duration = Duration::from_millis(100);
@@ -36,6 +51,12 @@ pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// (starting up, or draining after a handoff). Longer than [`DRAIN_TIMEOUT`].
 const LOCK_WAIT: Duration = Duration::from_secs(10);
 const LOCK_POLL: Duration = Duration::from_millis(50);
+/// How often the watcher re-checks the store file for writes by other
+/// processes (the dashboard, `devsandbox rm`); this process's own writes
+/// wake it at once.
+const WATCH: Duration = Duration::from_millis(500);
+/// A client that doesn't drain its socket for this long is disconnected.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct Options {
     pub version: Version,
@@ -48,11 +69,14 @@ pub struct Options {
     /// Run the live host side ([`Host`]: bridges, popups, autostart). Off in
     /// tests, which must not touch the user's state or containers.
     pub host: bool,
+    /// The Inbox store the API serves; `None` is the default
+    /// (`inbox::store::path`). Tests point it at their own file.
+    pub inbox: Option<PathBuf>,
 }
 
 impl Options {
     pub fn new(keep_alive: bool) -> Self {
-        Self { version: Version::current(), keep_alive, idle_timeout: idle::IDLE_TIMEOUT, host: true }
+        Self { version: Version::current(), keep_alive, idle_timeout: idle::IDLE_TIMEOUT, host: true, inbox: None }
     }
 }
 
@@ -90,6 +114,10 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
     let Some(_lock) = acquire_lock(dir)? else {
         return Ok(Exit::AlreadyRunning);
     };
+    let inbox = match &opts.inbox {
+        Some(path) => path.clone(),
+        None => crate::inbox::store::path()?,
+    };
     let listener = Listener::bind(dir)?;
     log(&format!(
         "listening on {} (pid {}, version {} build {}{})",
@@ -101,7 +129,8 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
     ));
 
     let host = opts.host.then(|| Host::start(log));
-    let shared = Arc::new(Shared::new(opts.version.clone()));
+    let shared = Arc::new(Shared::new(opts.version.clone(), inbox));
+    let watcher = Watcher::spawn(&shared, host.as_ref().map(Host::changes));
     let mut next_conn = 0u64;
     let exit = loop {
         if shared.handoff.load(Ordering::SeqCst) {
@@ -136,7 +165,12 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
     // daemon and giving up.
     listener.remove();
     shared.close();
+    shared.publish_closing(match exit {
+        Exit::Handoff => "handoff",
+        _ => "idle",
+    });
     shared.drain(DRAIN_TIMEOUT);
+    drop(watcher);
     // Before the lock goes: a successor's bridges must not overlap ours (two
     // sink bridges on one container would split its notify/control streams).
     drop(host);
@@ -178,9 +212,13 @@ fn acquire_lock(dir: &Path) -> Result<Option<File>> {
 
 struct Shared {
     version: Version,
-    /// Live connections (a clone of each stream, for the drain's shutdown).
-    /// Its size is the `clients` holder count.
-    conns: Mutex<HashMap<u64, Stream>>,
+    /// The Inbox store the API serves.
+    inbox: PathBuf,
+    /// Live connections. Its size is the `clients` holder count.
+    conns: Mutex<HashMap<u64, ConnEntry>>,
+    /// Inbox changes this daemon has seen: the `generation` of
+    /// `inbox.changed`.
+    inbox_generation: AtomicU64,
     /// The last moment a holder was seen.
     idle_since: Mutex<Instant>,
     /// A newer client asked for a handoff.
@@ -190,10 +228,12 @@ struct Shared {
 }
 
 impl Shared {
-    fn new(version: Version) -> Self {
+    fn new(version: Version, inbox: PathBuf) -> Self {
         Self {
             version,
+            inbox,
             conns: Mutex::new(HashMap::new()),
+            inbox_generation: AtomicU64::new(0),
             idle_since: Mutex::new(Instant::now()),
             handoff: AtomicBool::new(false),
             closed: (Mutex::new(false), Condvar::new()),
@@ -215,11 +255,16 @@ impl Shared {
     /// Register before the thread starts, so the next holder snapshot counts
     /// it even if the client is gone by then.
     fn spawn_conn(self: &Arc<Self>, id: u64, stream: Stream) {
-        let Ok(clone) = stream.try_clone() else { return };
-        self.conns.lock().unwrap().insert(id, clone);
+        let (Ok(clone), Ok(writer), Ok(ctl)) = (stream.try_clone(), stream.try_clone(), stream.try_clone()) else {
+            return;
+        };
+        // A socket option: covers every clone, responses and notifications.
+        let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
+        let out = Arc::new(Outbox::new(writer, ctl));
+        self.conns.lock().unwrap().insert(id, ConnEntry { stream: clone, out: Arc::clone(&out) });
         let shared = Arc::clone(self);
         let spawned = std::thread::Builder::new().name(format!("serve-conn-{id}")).spawn(move || {
-            serve_conn(stream, &shared);
+            serve_conn(id, stream, &shared, out);
             shared.conns.lock().unwrap().remove(&id);
             *shared.idle_since.lock().unwrap() = Instant::now();
         });
@@ -243,9 +288,36 @@ impl Shared {
         let _ = cvar.wait_timeout_while(guard, Duration::from_secs(2), |closed| !*closed);
     }
 
+    /// Flag a notification on every connection subscribed to `topic`.
+    fn publish(&self, topic: Topic, set: impl Fn(&mut Pending)) {
+        for conn in self.conns.lock().unwrap().values() {
+            conn.out.post(|p| {
+                let subscribed = p.topics.contains(&topic);
+                if subscribed {
+                    set(p);
+                }
+                subscribed
+            });
+        }
+    }
+
+    /// The reconnect hint: tell every subscriber the daemon is going away
+    /// (`reason`: `handoff` or `idle`), before the drain closes them.
+    fn publish_closing(&self, reason: &'static str) {
+        for conn in self.conns.lock().unwrap().values() {
+            conn.out.post(|p| {
+                let subscribed = !p.topics.is_empty();
+                if subscribed {
+                    p.closing = Some(reason);
+                }
+                subscribed
+            });
+        }
+    }
+
     fn drain(&self, timeout: Duration) {
-        for stream in self.conns.lock().unwrap().values() {
-            let _ = stream.shutdown(Shutdown::Read);
+        for conn in self.conns.lock().unwrap().values() {
+            let _ = conn.stream.shutdown(Shutdown::Read);
         }
         let deadline = Instant::now() + timeout;
         while !self.conns.lock().unwrap().is_empty() && Instant::now() < deadline {
@@ -254,14 +326,182 @@ impl Shared {
     }
 }
 
+struct ConnEntry {
+    /// For the drain's shutdown.
+    stream: Stream,
+    out: Arc<Outbox>,
+}
+
+/// Everything written to one connection goes through here: the writer lock
+/// serializes responses (from the connection thread) with notifications
+/// (from its notifier thread), and `pending` holds the flagged
+/// notifications the notifier hasn't written yet.
+struct Outbox {
+    writer: Mutex<Stream>,
+    /// Unlocked clone, to cut the connection while a write holds `writer`.
+    ctl: Stream,
+    pending: Mutex<Pending>,
+    wake: Condvar,
+}
+
+/// A connection's subscriptions and flagged notifications. Flags, not a
+/// queue: notifications are coarse ("re-fetch"), so any number of changes
+/// before the notifier runs is one line per topic.
+#[derive(Default)]
+struct Pending {
+    topics: BTreeSet<Topic>,
+    /// `inbox.changed` with this generation.
+    inbox: Option<u64>,
+    instances: bool,
+    /// `closing` with this reason; written last.
+    closing: Option<&'static str>,
+    /// The connection ended: the notifier writes what's left and exits.
+    closed: bool,
+}
+
+impl Pending {
+    fn any(&self) -> bool {
+        self.inbox.is_some() || self.instances || self.closing.is_some()
+    }
+
+    fn take(&mut self) -> Vec<Notification> {
+        let mut out = Vec::new();
+        if let Some(generation) = self.inbox.take() {
+            out.push(Notification { method: "inbox.changed".into(), params: json!({ "generation": generation }) });
+        }
+        if std::mem::take(&mut self.instances) {
+            out.push(Notification { method: "instances.changed".into(), params: json!({}) });
+        }
+        if let Some(reason) = self.closing.take() {
+            out.push(Notification { method: "closing".into(), params: json!({ "reason": reason }) });
+        }
+        out
+    }
+}
+
+impl Outbox {
+    fn new(writer: Stream, ctl: Stream) -> Self {
+        Self { writer: Mutex::new(writer), ctl, pending: Mutex::new(Pending::default()), wake: Condvar::new() }
+    }
+
+    /// One JSON line, whole, under the writer lock.
+    fn send(&self, msg: &impl serde::Serialize) -> std::io::Result<()> {
+        let mut line = serde_json::to_vec(msg)?;
+        line.push(b'\n');
+        let mut writer = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        writer.write_all(&line)?;
+        writer.flush()
+    }
+
+    /// Change `pending` under its lock; `f` says whether to wake the
+    /// notifier.
+    fn post(&self, f: impl FnOnce(&mut Pending) -> bool) {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        if f(&mut pending) {
+            self.wake.notify_all();
+        }
+    }
+}
+
+/// A connection's notifier thread: write what's flagged, until the
+/// connection ends. A failed (or timed-out) write cuts the connection, which
+/// ends its reader too.
+fn notifier(out: &Outbox) {
+    loop {
+        let (notes, closed) = {
+            let mut p = out.pending.lock().unwrap_or_else(|e| e.into_inner());
+            while !p.any() && !p.closed {
+                p = out.wake.wait(p).unwrap_or_else(|e| e.into_inner());
+            }
+            (p.take(), p.closed)
+        };
+        for note in &notes {
+            if out.send(note).is_err() {
+                let _ = out.ctl.shutdown(Shutdown::Both);
+                return;
+            }
+        }
+        if closed {
+            return;
+        }
+    }
+}
+
+/// The daemon-wide change watcher (see the module doc). Dropping it stops
+/// and joins the thread (within [`WATCH`]).
+struct Watcher {
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Watcher {
+    fn spawn(shared: &Arc<Shared>, instances: Option<Arc<AtomicU64>>) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread = {
+            let (shared, stop) = (Arc::clone(shared), Arc::clone(&stop));
+            std::thread::Builder::new().name("serve-watch".into()).spawn(move || watch(&shared, instances, &stop))
+        };
+        let thread = thread.map_err(|e| log(&format!("cannot start the notification thread: {e}"))).ok();
+        Self { stop, thread }
+    }
+}
+
+impl Drop for Watcher {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+fn watch(shared: &Shared, instances: Option<Arc<AtomicU64>>, stop: &AtomicBool) {
+    let mut seen = ops::generation();
+    let mut stamp = ops::stamp(&shared.inbox);
+    let instances_now = || instances.as_ref().map_or(0, |c| c.load(Ordering::Acquire));
+    let mut instances_seen = instances_now();
+    while !stop.load(Ordering::SeqCst) {
+        let generation = ops::wait_changed(seen, WATCH);
+        let now = ops::stamp(&shared.inbox);
+        if generation != seen || now != stamp {
+            (seen, stamp) = (generation, now);
+            let g = shared.inbox_generation.fetch_add(1, Ordering::SeqCst) + 1;
+            shared.publish(Topic::Inbox, |p| p.inbox = Some(g));
+        }
+        let n = instances_now();
+        if n != instances_seen {
+            instances_seen = n;
+            shared.publish(Topic::Instances, |p| p.instances = true);
+        }
+    }
+}
+
+/// A connection's own state, on its thread.
+struct ConnState {
+    id: u64,
+    /// The hello's `client` (`tui`, `cli`, `api:<name>`), for the log.
+    client: String,
+    out: Arc<Outbox>,
+    notifier: Option<JoinHandle<()>>,
+}
+
+impl ConnState {
+    fn label(&self) -> String {
+        match self.client.as_str() {
+            "" => format!("connection {}", self.id),
+            client => format!("connection {} ({client})", self.id),
+        }
+    }
+}
+
 /// One connection: a request per line, a response per request, until EOF.
-fn serve_conn(stream: Stream, shared: &Shared) {
-    let Ok(mut writer) = stream.try_clone() else { return };
+fn serve_conn(id: u64, stream: Stream, shared: &Shared, out: Arc<Outbox>) {
+    let mut conn = ConnState { id, client: String::new(), out, notifier: None };
     let mut reader = BufReader::new(stream);
     loop {
         let mut line = Vec::new();
         match (&mut reader).take(proto::MAX_LINE).read_until(b'\n', &mut line) {
-            Ok(0) | Err(_) => return,
+            Ok(0) | Err(_) => break,
             Ok(_) => {}
         }
         let too_long = !line.ends_with(b"\n") && line.len() as u64 >= proto::MAX_LINE;
@@ -270,32 +510,76 @@ fn serve_conn(stream: Stream, shared: &Shared) {
         } else if line.trim_ascii().is_empty() {
             continue;
         } else {
-            handle(&line, shared)
+            handle(&line, shared, &mut conn)
         };
-        let Ok(mut out) = serde_json::to_vec(&response) else { return };
-        out.push(b'\n');
-        if writer.write_all(&out).and_then(|()| writer.flush()).is_err() || too_long {
-            return;
+        if conn.out.send(&response).is_err() || too_long {
+            break;
         }
+    }
+    conn.out.post(|p| {
+        p.closed = true;
+        true
+    });
+    if let Some(t) = conn.notifier.take() {
+        let _ = t.join();
     }
 }
 
-fn handle(line: &[u8], shared: &Shared) -> Response {
+fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Response {
     let req: Request = match serde_json::from_slice(line) {
         Ok(req) => req,
         Err(e) => return Response::err(None, "invalid", format!("not a request: {e}")),
     };
-    match req.method.as_str() {
-        "hello" => hello(req.id, req.params, shared),
-        other => Response::err(req.id, "unknown-method", format!("unknown method `{other}`")),
+    let answer = match req.method.as_str() {
+        "hello" => return hello(req.id, req.params, shared, conn),
+        "subscribe" => subscribe(req.params, conn, true),
+        "unsubscribe" => subscribe(req.params, conn, false),
+        method => api::call(method, req.params, &api::Ctx { inbox: &shared.inbox }),
+    };
+    match answer {
+        Ok(result) => Response::ok(req.id, result),
+        Err(e) => {
+            if e.code == "internal" {
+                log(&format!("{}: {}: {}", conn.label(), req.method, e.message));
+            }
+            Response::err(req.id, e.code, e.message)
+        }
     }
 }
 
-fn hello(id: Option<u64>, params: Value, shared: &Shared) -> Response {
+/// `subscribe` (`on`) / `unsubscribe`. The first subscribe starts the
+/// connection's notifier. Nothing is sent for the past: a client subscribes,
+/// then fetches.
+fn subscribe(params: Value, conn: &mut ConnState, on: bool) -> Result<Value, api::ApiError> {
+    let topics = api::topics(params)?;
+    if on && conn.notifier.is_none() {
+        let out = Arc::clone(&conn.out);
+        let spawned = std::thread::Builder::new().name(format!("serve-notify-{}", conn.id)).spawn(move || notifier(&out));
+        conn.notifier = Some(spawned.map_err(|e| api::ApiError::internal(e.into()))?);
+    }
+    conn.out.post(|p| {
+        for topic in topics {
+            if on {
+                p.topics.insert(topic);
+            } else {
+                p.topics.remove(&topic);
+                match topic {
+                    Topic::Inbox => p.inbox = None,
+                    Topic::Instances => p.instances = false,
+                }
+            }
+        }
+        false
+    });
+    Ok(json!({ "ok": true }))
+}
+
+fn hello(id: Option<u64>, params: Value, shared: &Shared, conn: &mut ConnState) -> Response {
     let params: HelloParams = match serde_json::from_value(params) {
         Ok(p) => p,
         Err(e) => return Response::err(id, "invalid", format!("bad hello params: {e}")),
     };
+    conn.client.clone_from(&params.client);
     let client = Version { semver: params.version, build: params.build };
     let handoff = client.is_newer_than(&shared.version);
     if handoff {
@@ -305,7 +589,12 @@ fn hello(id: Option<u64>, params: Value, shared: &Shared) -> Response {
         ));
         shared.begin_handoff();
     }
-    let result = HelloResult { version: shared.version.semver.clone(), build: shared.version.build, handoff };
+    let result = HelloResult {
+        version: shared.version.semver.clone(),
+        build: shared.version.build,
+        protocol: proto::PROTOCOL,
+        handoff,
+    };
     Response::ok(id, serde_json::to_value(result).unwrap_or(Value::Null))
 }
 
@@ -332,6 +621,7 @@ pub(crate) mod tests {
             keep_alive: false,
             idle_timeout: Duration::from_millis(idle_ms),
             host: false,
+            inbox: Some(std::env::temp_dir().join(format!("dsv-inbox-{}", std::process::id())).join("inbox.toml")),
         }
     }
 
@@ -419,7 +709,7 @@ pub(crate) mod tests {
             reader.read_line(&mut out).unwrap();
             serde_json::from_str::<Value>(&out).unwrap()
         };
-        let r = ask(r#"{"id":7,"method":"inbox.threads.list"}"#);
+        let r = ask(r#"{"id":7,"method":"inbox.form.submit"}"#);
         assert_eq!(r["id"], 7);
         assert_eq!(r["error"]["code"], "unknown-method");
         let r = ask("not json");
@@ -430,6 +720,86 @@ pub(crate) mod tests {
         drop(writer);
         drop(reader);
         assert_eq!(daemon.join().unwrap().unwrap(), Exit::Idle);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn connect(dir: &Path) -> client::Conn {
+        client::connect_with(dir, "test", &v(1), client::START_TIMEOUT, &|_| Ok(())).unwrap()
+    }
+
+    fn note(path: &Path, msg: &str) {
+        use crate::devsbd::notify::{Level, Record};
+        let record = Record { level: Level::Info, key: None, link: None, msg: msg.into(), at: 1 };
+        crate::inbox::store::update_at(path, |i| i.push("w-id".into(), "w".into(), record, true)).unwrap();
+    }
+
+    /// Notifications from other tests' store writes (the in-process
+    /// generation is process-wide) are harmless extras: drop what's queued.
+    fn drain_notes(conn: &mut client::Conn, wait: Duration) {
+        while conn.next_notification(wait).unwrap().is_some() {}
+    }
+
+    #[test]
+    fn subscribers_hear_inbox_changes_between_responses() {
+        let dir = scratch("notify");
+        let store = scratch("notify-store").join("inbox.toml");
+        let daemon = spawn_daemon(&dir, Options { inbox: Some(store.clone()), ..opts(1, 200) });
+        let mut conn = connect(&dir);
+        assert_eq!(conn.daemon.protocol, proto::PROTOCOL);
+
+        let r = conn.call("subscribe", json!({"topics": ["nope"]})).unwrap();
+        assert_eq!(r.error.unwrap().code, "invalid");
+        let r = conn.call("subscribe", json!({"topics": ["inbox"]})).unwrap();
+        assert_eq!(r.result, Some(json!({"ok": true})));
+        drain_notes(&mut conn, Duration::from_millis(200));
+
+        note(&store, "one");
+        let n = conn.next_notification(Duration::from_secs(3)).unwrap().expect("no inbox.changed");
+        assert_eq!(n.method, "inbox.changed");
+        assert!(n.params["generation"].as_u64().unwrap() >= 1, "{n:?}");
+
+        // A notification sent before a response doesn't break the call: it's
+        // set aside, and handed out without touching the socket.
+        drain_notes(&mut conn, Duration::from_millis(100));
+        note(&store, "two");
+        std::thread::sleep(Duration::from_millis(300));
+        let r = conn.call("inbox.threads.list", json!({"view": "all"})).unwrap();
+        assert_eq!(r.result.unwrap().as_array().unwrap().len(), 2);
+        let n = conn.next_notification(Duration::ZERO).unwrap().expect("not set aside by call");
+        assert_eq!(n.method, "inbox.changed");
+
+        // API errors carry the request's id.
+        let r = conn.call("inbox.thread.get", json!({"thread": 999})).unwrap();
+        assert_eq!(r.error.unwrap().code, "not-found");
+
+        let r = conn.call("unsubscribe", json!({"topics": ["inbox"]})).unwrap();
+        assert!(r.error.is_none());
+        drain_notes(&mut conn, Duration::ZERO);
+        note(&store, "three");
+        assert!(conn.next_notification(Duration::from_millis(800)).unwrap().is_none());
+
+        drop(conn);
+        assert_eq!(daemon.join().unwrap().unwrap(), Exit::Idle);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(store.parent().unwrap());
+    }
+
+    #[test]
+    fn subscribers_get_a_closing_hint_on_handoff() {
+        let dir = scratch("closing");
+        let daemon = spawn_daemon(&dir, opts(1, 60_000));
+        let mut conn = connect(&dir);
+        conn.call("subscribe", json!({"topics": ["inbox", "instances"]})).unwrap();
+        let (_newer, h) = hello_at(&dir, &v(2));
+        assert!(matches!(h, Hello::Handoff));
+        let closing = loop {
+            let n = conn.next_notification(Duration::from_secs(3)).unwrap().expect("no closing hint");
+            if n.method == "closing" {
+                break n;
+            }
+        };
+        assert_eq!(closing.params["reason"], "handoff");
+        assert_eq!(daemon.join().unwrap().unwrap(), Exit::Handoff);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

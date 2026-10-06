@@ -7,13 +7,14 @@
 //! Threading: a `serve-poll` thread lists the runtime's running containers
 //! every [`POLL`], counts the live-instance holders and hands the list to the
 //! bridge worker (`Bridges::spawn_worker`, its own thread, which owns every
-//! bridge). A `serve-autostart` thread runs the autostart pass once per config
+//! bridge), and bumps [`Host::changes`] when the list moved (the API's
+//! `instances.changed`). A `serve-autostart` thread runs the autostart pass once per config
 //! root recorded in `state.toml`. Dropping [`Host`] stops the poll, drops the
 //! worker (killing every bridge's `exec`) and joins both threads.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -30,6 +31,7 @@ pub struct Host {
     stop: Arc<(Mutex<bool>, Condvar)>,
     live: Arc<AtomicUsize>,
     autostarting: Arc<AtomicUsize>,
+    changes: Arc<AtomicU64>,
     threads: Vec<JoinHandle<()>>,
 }
 
@@ -41,10 +43,13 @@ impl Host {
         let live = Arc::new(AtomicUsize::new(0));
         // Counted before the thread runs, so the first idle check sees it.
         let autostarting = Arc::new(AtomicUsize::new(1));
+        let changes = Arc::new(AtomicU64::new(0));
         let mut threads = Vec::new();
         let spawned = {
-            let (stop, live) = (Arc::clone(&stop), Arc::clone(&live));
-            std::thread::Builder::new().name("serve-poll".into()).spawn(move || poll(&stop, &live, log))
+            let (stop, live, changes) = (Arc::clone(&stop), Arc::clone(&live), Arc::clone(&changes));
+            std::thread::Builder::new()
+                .name("serve-poll".into())
+                .spawn(move || poll(&stop, &live, &changes, log))
         };
         match spawned {
             Ok(t) => threads.push(t),
@@ -64,7 +69,13 @@ impl Host {
                 log(&format!("cannot start the autostart thread: {e}"));
             }
         }
-        Host { stop, live, autostarting, threads }
+        Host { stop, live, autostarting, changes, threads }
+    }
+
+    /// Bumped each time a poll finds the running containers changed; the
+    /// daemon's notification watcher compares it.
+    pub fn changes(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.changes)
     }
 
     /// Running instances that expect a live host, as of the last poll.
@@ -100,12 +111,18 @@ impl Drop for Host {
 /// The poll loop: list, count, reconcile, sleep, until stopped. With the
 /// runtime unreachable the last list stands (bridges and the holder count
 /// are kept, not torn down on a blip); the outage is logged once.
-fn poll(stop: &(Mutex<bool>, Condvar), live: &AtomicUsize, log: fn(&str)) {
+fn poll(stop: &(Mutex<bool>, Condvar), live: &AtomicUsize, changes: &AtomicU64, log: fn(&str)) {
     let worker = Bridges::spawn_worker(Some(None));
     let mut down = false;
+    let mut last: Vec<String> = Vec::new();
     loop {
         match running_containers() {
-            Ok(running) => {
+            Ok(mut running) => {
+                running.sort();
+                if running != last {
+                    changes.fetch_add(1, Ordering::Release);
+                    last.clone_from(&running);
+                }
                 if down {
                     log("the container runtime answers again");
                     down = false;

@@ -5,8 +5,11 @@
 //! The socket and its permissions, the start lock, lazy start from clients,
 //! version handoff and the idle exit (step 4); the bridges, with the outbox
 //! drain, popups and control ops, and the startup autostart pass (step 5).
-//! The API methods come at step 6.
+//! The API (step 6, docs/api.md): `api` methods over the same wire,
+//! `subscribe` notifications.
 //!
+//! - `api`: the method table and handlers (thin calls into `inbox::ops`,
+//!   `snapshot`), testable without a socket
 //! - `endpoint`: the `local_endpoint` abstraction (paths, bind/connect/accept)
 //! - `proto`: the JSON-lines wire bits (`hello`, ids, errors)
 //! - `idle`: the pure idle countdown over a holder snapshot
@@ -14,6 +17,7 @@
 //! - `host`: the live host side: the bridge poll and the autostart pass
 //! - `client`: connect-or-lazy-start for commands
 
+pub mod api;
 pub mod client;
 pub mod daemon;
 pub mod endpoint;

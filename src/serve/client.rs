@@ -2,7 +2,8 @@
 //! (the lazy start), and handle a version handoff. Commands that need live
 //! features call [`connect`] (steps 5-8 wire them in).
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::collections::VecDeque;
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -12,7 +13,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
 use super::endpoint::{self, Stream};
-use super::proto::{self, HelloParams, HelloResult, Request, Response, Version};
+use super::proto::{self, HelloParams, HelloResult, Notification, Request, Response, Version};
 
 /// How long [`connect`] waits for a daemon it started (or one handing off).
 pub const START_TIMEOUT: Duration = Duration::from_secs(5);
@@ -20,38 +21,98 @@ const POLL: Duration = Duration::from_millis(50);
 
 /// A connection past the hello. `daemon` is what the daemon reported. Held
 /// open, it makes its client a holder (the TUI holds one for its life).
-#[allow(dead_code)] // `reader`/`daemon`: the API (step 6)
+///
+/// Sync and single-threaded: [`call`](Self::call) sets aside any
+/// notification that arrives before its response, and
+/// [`next_notification`](Self::next_notification) hands them out, oldest
+/// first, then waits for the next.
+#[allow(dead_code)] // `daemon` and the API calls: the TUI as a client (step 7)
 pub struct Conn {
     reader: BufReader<Stream>,
     writer: Stream,
     next_id: u64,
     pub daemon: HelloResult,
+    /// Notifications read while waiting for a response.
+    notes: VecDeque<Notification>,
+    /// A line cut short by a read timeout, completed by the next read.
+    partial: Vec<u8>,
 }
 
-#[allow(dead_code)] // the API (step 6) builds on it
+/// One line from the daemon.
+enum Incoming {
+    Response(Response),
+    Notification(Notification),
+}
+
+#[allow(dead_code)] // the TUI as a client (step 7) builds on it
 impl Conn {
     fn new(stream: Stream, daemon: HelloResult) -> Result<Self> {
         let reader = BufReader::new(stream.try_clone().context("cannot clone the daemon connection")?);
-        Ok(Self { reader, writer: stream, next_id: 1, daemon })
+        Ok(Self { reader, writer: stream, next_id: 1, daemon, notes: VecDeque::new(), partial: Vec::new() })
     }
 
-    /// One request, one response. No notifications exist yet (step 6 adds
-    /// `subscribe`, and with it a reader that sets them aside).
+    /// One request, one response; notifications read meanwhile are kept for
+    /// [`next_notification`](Self::next_notification).
     pub fn call(&mut self, method: &str, params: Value) -> Result<Response> {
         let id = self.next_id;
         self.next_id += 1;
         let mut line = serde_json::to_vec(&Request { id: Some(id), method: method.into(), params })?;
         line.push(b'\n');
         self.writer.write_all(&line).context("cannot write to devsandbox serve")?;
-        let mut reply = String::new();
-        if (&mut self.reader).take(proto::MAX_LINE).read_line(&mut reply).context("cannot read from devsandbox serve")? == 0 {
+        self.reader.get_ref().set_read_timeout(None).context("cannot clear the read timeout")?;
+        loop {
+            match self.read()? {
+                Some(Incoming::Notification(n)) => self.notes.push_back(n),
+                Some(Incoming::Response(r)) if r.id == Some(id) => return Ok(r),
+                Some(Incoming::Response(r)) => bail!("devsandbox serve answered request {:?}, expected {id}", r.id),
+                None => bail!("timed out reading from devsandbox serve"),
+            }
+        }
+    }
+
+    /// The oldest notification set aside, else wait up to `timeout` for one;
+    /// `None` when none came.
+    pub fn next_notification(&mut self, timeout: Duration) -> Result<Option<Notification>> {
+        if let Some(n) = self.notes.pop_front() {
+            return Ok(Some(n));
+        }
+        let deadline = Instant::now() + timeout;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Ok(None);
+            }
+            self.reader.get_ref().set_read_timeout(Some(left)).context("cannot set a read timeout")?;
+            match self.read()? {
+                Some(Incoming::Notification(n)) => return Ok(Some(n)),
+                Some(Incoming::Response(r)) => bail!("devsandbox serve sent a response {:?} nobody asked for", r.id),
+                None => {}
+            }
+        }
+    }
+
+    /// One line, `None` on a read timeout (a partial line is kept for the
+    /// next call). A line with a `method` is a notification.
+    fn read(&mut self) -> Result<Option<Incoming>> {
+        let limit = proto::MAX_LINE.saturating_sub(self.partial.len() as u64);
+        match (&mut self.reader).take(limit).read_until(b'\n', &mut self.partial) {
+            Ok(_) => {}
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => return Ok(None),
+            Err(e) => return Err(e).context("cannot read from devsandbox serve"),
+        }
+        if !self.partial.ends_with(b"\n") {
+            if self.partial.len() as u64 >= proto::MAX_LINE {
+                bail!("devsandbox serve sent a line over {} bytes", proto::MAX_LINE);
+            }
             bail!("devsandbox serve closed the connection");
         }
-        let response: Response = serde_json::from_str(&reply).context("bad response from devsandbox serve")?;
-        if response.id != Some(id) {
-            bail!("devsandbox serve answered request {:?}, expected {id}", response.id);
-        }
-        Ok(response)
+        let line = std::mem::take(&mut self.partial);
+        let value: Value = serde_json::from_slice(&line).context("bad message from devsandbox serve")?;
+        Ok(Some(if value.get("method").is_some() {
+            Incoming::Notification(serde_json::from_value(value).context("bad notification from devsandbox serve")?)
+        } else {
+            Incoming::Response(serde_json::from_value(value).context("bad response from devsandbox serve")?)
+        }))
     }
 }
 
@@ -227,7 +288,7 @@ mod tests {
         let (count, daemons) = (AtomicUsize::new(0), Daemons::default());
         let mut conn = connect_with(&dir, "test", &v(1), START_TIMEOUT, &fake_spawn(1, &count, &daemons)).unwrap();
         assert_eq!(count.load(Ordering::SeqCst), 1);
-        assert_eq!(conn.daemon, HelloResult { version: "0.6.0".into(), build: 1, handoff: false });
+        assert_eq!(conn.daemon, HelloResult { version: "0.6.0".into(), build: 1, protocol: proto::PROTOCOL, handoff: false });
         let r = conn.call("nope", Value::Null).unwrap();
         assert_eq!(r.error.unwrap().code, "unknown-method");
 

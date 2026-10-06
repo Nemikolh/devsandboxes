@@ -1,17 +1,19 @@
 # `devsandbox serve`: the host daemon
 
 A per-user, per-host background process that owns the live host side of
-devsandbox (bridges, popups, control ops; later forwards and the API) so it
+devsandbox (bridges, popups, control ops, the API; later forwards) so it
 keeps working with the dashboard closed. Design and roadmap:
 `docs/inbox-redesign.md`, "Host daemon". Unix only; the command doesn't
 exist on Windows.
 
-This page covers what exists today (steps 4-5 of that plan): the socket,
-start, handoff, idle exit, the bridges and the startup autostart pass.
-Marked below is what later steps add.
+This page covers what exists today (steps 4-6 of that plan): the socket,
+start, handoff, idle exit, the bridges and the startup autostart pass. The
+API on the socket has its own page, `docs/api.md`. Marked below is what
+later steps add.
 
 Code: `src/serve/` (`endpoint.rs` paths + bind/connect/accept, `daemon.rs`,
-`host.rs` bridges + autostart, `client.rs`, `idle.rs`, `proto.rs`).
+`host.rs` bridges + autostart, `api.rs` methods, `client.rs`, `idle.rs`,
+`proto.rs`).
 
 ## Paths and permissions
 
@@ -92,13 +94,12 @@ first request is the handshake:
 
 ```
 → {"id":0,"method":"hello","params":{"version":"0.6.0","build":1767225600,"client":"tui"}}
-← {"id":0,"result":{"version":"0.6.0","build":1767225600}}
+← {"id":0,"result":{"version":"0.6.0","build":1767225600,"protocol":1}}
 ```
 
 `build` is the binary's mtime in unix seconds, so a rebuilt dev binary with
-the same version counts as newer. Any other method answers
-`{"id":n,"error":{"code":"unknown-method","message":"…"}}` until step 6 adds
-the API; malformed lines answer `invalid`.
+the same version counts as newer. The methods, errors and notifications
+after the hello: `docs/api.md`.
 
 ## Version handoff
 
@@ -111,8 +112,9 @@ is newer than the daemon, the daemon:
 4. exits, releasing the lock.
 
 The client then spawns its own daemon, which waits for the lock and takes
-over. Older and equal clients just proceed. (Step 6: subscribers get a
-reconnect hint before the close.)
+over. Older and equal clients just proceed. Connections that subscribed to
+notifications get a `closing` notification (`"reason":"handoff"`) before
+the close.
 
 ## Idle exit
 
