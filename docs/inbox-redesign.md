@@ -51,15 +51,16 @@ First real use of threads (2026-10-02 → 10-06) with the PR babysitter:
    *structured content* in threads, and *events* back. It knows nothing about
    PRs, drafts or emails.
 2. **A thread is a conversation.** A small, re-assertable *header* (what it
-   is, its state, what you can do) plus an append-only *feed* of posts by the
-   owner and by the user. Nothing in the feed is a diff of the header.
-3. **Structured input is data, not files.** Questions are JSON in a post;
-   answers are JSON in an event. Rendering is the client's business.
+   is, its state, what you can do) plus an append-only *feed*: *messages*
+   from the owner, and the user's *replies*, *actions* and *submissions*.
+   Nothing in the feed is a diff of the header.
+3. **Structured input is data, not files.** Questions are a form in a
+   message; answers are a submission event. Rendering is the client's business.
 4. **Every client is equal.** The TUI, the CLI and a custom GUI all talk to
    the same API served by the host daemon (`devsandbox serve`) and produce
    identical events. The owner can't tell, and must not care, where an event
    came from.
-5. **The owner's state stays the source of truth.** Every put and post is
+5. **The owner's state stays the source of truth.** Every put and send is
    idempotent by id, so an owner re-asserts freely and losing the Inbox loses
    nothing it can't rebuild.
 6. **Files stay the source of truth on the host.** The daemon holds only
@@ -71,7 +72,7 @@ First real use of threads (2026-10-02 → 10-06) with the PR babysitter:
 ### Ownership
 
 - **Owning threads is its own capability:** a sandbox opts in with
-  `inbox = true`. Its instances may `thread put|post|rm|ls` and pull or
+  `inbox = true`. Its instances may `thread put|send|withdraw|rm|ls` and pull or
   follow events for their own threads. Others get the existing `error`
   record ("thread put denied").
 - **`dispatcher` only grants direct ops on children** (`ensure`, `exec`,
@@ -92,14 +93,29 @@ First real use of threads (2026-10-02 → 10-06) with the PR babysitter:
 | `state` | unchanged: `needs-you` / `active` / `done` |
 | `status` | unchanged (≤60 B), but now always shown next to the state, in the card and the pane alike |
 | `actions` | unchanged (host verbs, `done`, `notify`) |
-| `message` | **removed.** Explanations are posts |
+| `message` | **removed.** Explanations are messages in the feed (`thread send`) |
 | `reply` | **renamed `compose`**: `{ "placeholder": "…", "hint": "…" }`. `hint` is one dim line under the box saying what sending does *now* ("Starts a comments run with your message"); the owner re-puts it when that changes |
 
 A put only touches the header. A put that changes nothing is still a no-op.
 State and status transitions are recorded as compact *markers* in the feed
 (below), not as entries per field.
 
-### Posts (`thread post`)
+### Terminology
+
+One name per direction, used by the CLI, the API, events and the TUI alike:
+
+| direction | item | made by |
+|---|---|---|
+| owner → user | **message**: blocks (markdown, fields, forms) | `devsbd thread send` |
+| user → owner | **reply**: free text from the composer | `inbox.thread.reply` |
+| user → owner | **action**: a header button | `inbox.thread.act` |
+| user → owner | **submission**: a form's answers | `inbox.form.submit` |
+| either | **marker**: done/reopen, state/status change | host-recorded |
+
+The header (`thread put`) is not a feed item. Earlier drafts called messages
+"posts"; that name is gone everywhere.
+
+### Messages (`thread send`)
 
 ```json
 {
@@ -113,25 +129,26 @@ State and status transitions are recorded as compact *markers* in the feed
 ```
 
 - `id` (`[a-z0-9-]{1,60}`, unique per thread) is the owner's idempotency key.
-  Posting the same id with the same content is a no-op; with different
-  content it **replaces the post in place** (shown as "edited", no new
+  Sending the same id with the same content is a no-op; with different
+  content it **replaces the message in place** (shown as "edited", no new
   unread/popup unless a form was added). Owners use stable ids derived from
-  their own state (a run id), so a restarted dispatcher re-posts for free.
-- `thread post --rm <thread> <id>` withdraws a post (rendered as a dim
+  their own state (a run id), so a restarted dispatcher re-sends for free.
+- `thread withdraw <thread> <id>` withdraws a message (rendered as a dim
   "withdrawn" line, kept in the feed so the story stays readable).
 - Host-stamped `at` on first insert; order in the feed is first-insert order.
 - Blocks, v1: `markdown` (≤16 KiB, rendered with `src/tui/markdown.rs`),
   `form` (below), `fields` (a compact key/value list: `{ "type": "fields",
   "items": [{ "label": "Head", "value": "36b13d41" }] }`, ≤20 items). Unknown
   block types are a schema reject, so a newer owner on an older host fails
-  loudly instead of rendering half a post.
-- A post is ≤48 KiB serialized (it must fit the 64 KiB outbox record,
-  `src/devsbd/notify.rs:42`). At most 8 blocks per post.
+  loudly instead of rendering half a message.
+- A message is ≤48 KiB serialized (it must fit the 64 KiB outbox record,
+  `src/devsbd/notify.rs:42`). At most 8 blocks per message.
 
 ### Forms
 
-A form is a block in a post: a list of questions the user answers and submits
-once.
+A form is a block in a message: a list of questions the user answers and
+submits once (the *submission*). Labels in the example below are the PR
+babysitter's own wording (posting replies on GitHub), not devsandbox terms.
 
 ```json
 {
@@ -180,18 +197,18 @@ once.
 - Common: `id` (`[a-z0-9-]{1,60}`, unique in the form), `label` (inline
   markdown, ≤200 B), `context` (markdown shown above the input, ≤4 KiB),
   `required` (default true for `choice`/`confirm`, false for `text`).
-- ≤30 questions per form, one open form per post. No conditional questions in
-  v1: owners split into two posts instead.
-- **Lifecycle, kept by the host:** `open` → `submitted` (answers stored with
-  the post, the form renders read-only with the answers) or `withdrawn` (the
-  owner replaced or removed the post). A submitted form can't be resubmitted;
-  the owner posts a new one if it needs another round.
-- **Drafts of answers** (half-filled forms) are stored with the post in the
+- ≤30 questions per form, one form per message. No conditional questions in
+  v1: owners split into two messages instead.
+- **Lifecycle, kept by the host:** `open` → `submitted` (the submission is
+  stored with the message, the form renders read-only with the answers) or
+  `withdrawn` (the owner replaced or withdrew the message). A submitted form
+  can't be resubmitted; the owner sends a new one if it needs another round.
+- **Drafts of answers** (half-filled forms) are stored with the message in the
   host store, not in the TUI, so they survive a dashboard restart and any
   client sees the same partial state.
-- Submitting produces one event (`kind: "form"`, below) with all answers,
+- Submitting produces one event (`kind: "submit"`, below) with all answers,
   defaults included, so the owner never has to merge defaults itself.
-- A form-bearing post entering the feed sets the thread unread and fires the
+- A form-bearing message entering the feed sets the thread unread and fires the
   needs-you popup if the header is `needs-you`.
 
 ### Feed
@@ -200,13 +217,13 @@ What the pane shows under the header, **newest first**:
 
 | item | author | rendering |
 |---|---|---|
-| post | owner | full markdown blocks; forms inline (open ones first, see layout) |
+| message | owner | full markdown blocks; forms inline (open ones pinned, see layout) |
 | reply | user | the text, full, as markdown (no more `one_line`) |
 | action | user | `you: Retry` |
-| form answers | user | folded summary (`you answered 4 questions`), expandable |
-| done / reopen | user | one dim marker line |
-| state / status change | owner | one dim marker line; consecutive status-only changes collapse (`running comments → review drafts`) |
-| post withdrawn / edited | owner | dim tag on the post |
+| submission | user | folded summary (`you answered 4 questions`), expandable |
+| done / reopen marker | user | one dim line |
+| state / status marker | owner | one dim line; consecutive status-only changes collapse (`running comments → review drafts`) |
+| message withdrawn / edited | owner | dim tag on the message |
 
 Every user item records *which client* produced it in the store (`tui`,
 `cli`, `stdio:<name>`) for the user's own audit, but this is **not** exposed
@@ -215,7 +232,7 @@ to the owner in events.
 ### Events
 
 ```json
-{"id":"e-…","thread":"pr-6900","kind":"form","post":"run-1791277117","form":"drafts","answers":{"c-3726888733":"post","c-3726888733-text":"Already batched…","notes":""},"at":"…"}
+{"id":"e-…","thread":"pr-6900","kind":"submit","message":"run-1791277117","form":"drafts","answers":{"c-3726888733":"post","c-3726888733-text":"Already batched…","notes":""},"at":"…"}
 {"id":"e-…","thread":"pr-6900","kind":"reply","text":"Is this PR still relevant?","at":"…"}
 {"id":"e-…","thread":"pr-6900","kind":"action","action":"retry","at":"…"}
 {"id":"e-…","thread":"pr-6900","kind":"done","action":"done","at":"…"}
@@ -223,7 +240,7 @@ to the owner in events.
 ```
 
 - `key` is renamed `thread` (it was ambiguous next to child keys).
-- `kind` gains `form`. Answers: choice → id or `[ids]`, text → string,
+- `kind` gains `submit` (a form submission). Answers: choice → id or `[ids]`, text → string,
   confirm → bool.
 - At-least-once with explicit ack stays. Ids, scoping to the owner, the
   100-per-thread cap stay.
@@ -239,9 +256,9 @@ to the owner in events.
   threads. No compatibility shim for v2 `thread put` bodies: the helper
   version bump (below) makes the host reject old shapes with an error record
   that says to update the dispatcher.
-- The per-owner cap of 200 records is too small once posts exist. New caps:
+- The per-owner cap of 200 records is too small once messages exist. New caps:
   200 threads per owner, 300 feed items per thread (oldest markers dropped
-  first, then oldest posts without an open form), events unchanged. Retention
+  first, then oldest messages without an open form), events unchanged. Retention
   unchanged (done/archived dropped after 14 days).
 - TOML is a poor fit for nested blocks/forms. Switch the store to JSON
   (`inbox.json`, same lock + tmp/rename discipline), keeping v2 → v3 load of
@@ -262,26 +279,26 @@ rm|prune` stay as they are (`src/commands/dispatch.rs:197-358`). Two changes:
   `logs`, `forward` start the child first (status line `starting
   <child>…`), and the button shows `(stopped)` next to its label.
 
-### Threads and posts
+### Threads and messages
 
 ```
-devsbd thread put   [--json '<json>' | stdin]   # header
-devsbd thread post  [--json '<json>' | stdin]   # post (blocks, forms)
-devsbd thread post --rm <thread> <post-id>
+devsbd thread put      [--json '<json>' | stdin]   # header
+devsbd thread send     [--json '<json>' | stdin]   # message (blocks, forms)
+devsbd thread withdraw <thread> <message-id>
 devsbd thread rm <key>
-devsbd thread ls [--feed]                        # headers; --feed adds posts, form states and answers
+devsbd thread ls [--feed]                           # headers; --feed adds messages, form states and submissions
 ```
 
-`put`, `post`, `rm` go through the durable outbox (with the same per-key
-coalescing for puts; posts coalesce per `(thread, id)`). `thread ls --feed`
+`put`, `send`, `withdraw`, `rm` go through the durable outbox (with the same
+per-key coalescing for puts; sends coalesce per `(thread, id)`). `thread ls --feed`
 lets a dispatcher that lost its state recover which forms were already
 answered, so answers are never lost even if an event was acked and the
 dispatcher crashed before saving (it can't happen with ack-after-save, but
 recovery should not depend on that).
 
 The std-only validator (`devsbd/src/json.rs`) keeps doing syntax + top-level
-field extraction (`key` for put, `thread` + `id` for post); schema stays
-host-side with serde (`src/inbox/thread.rs`, new `post.rs`, `form.rs`).
+field extraction (`key` for put, `thread` + `id` for send); schema stays
+host-side with serde (`src/inbox/thread.rs`, new `message.rs`, `form.rs`).
 
 ### Events: listeners
 
@@ -340,7 +357,7 @@ Gradle daemon than to dockerd:
 | One bridge per running instance with a helper: spawn, reconcile, reinstall a stale `devsbd` | the TUI |
 | Every channel on that bridge: ssh-agent relay, HTTP proxy, notify, control, TCP forwards | TUI bridges, plus per-command bridges in `exec`/`start` |
 | Control ops (`ensure`, `exec`, `run …`, `events`, `thread ls`, `Subscribe`) | the TUI, exit 75 without it |
-| Draining outboxes into the store (notify, thread put/post/rm) | the TUI |
+| Draining outboxes into the store (notify, thread put/send/withdraw/rm) | the TUI |
 | Change notifications: `--follow` subscribers, API `subscribe` | 500 ms mtime polling per request |
 | Port forwards (survive closing the TUI) | the TUI; they die with it |
 | Desktop popups (needs-you transitions, notify records) | the TUI |
@@ -441,7 +458,7 @@ JSON lines over the socket, request/response plus notifications. Namespaces:
 → {"id":2,"method":"subscribe","params":{"topics":["inbox"]}}
 ← {"id":2,"result":{"ok":true}}
 ← {"method":"inbox.changed","params":{"owner":"…","key":"pr-6900"}}
-→ {"id":3,"method":"inbox.form.submit","params":{"owner":"…","key":"pr-6900","post":"run-…","answers":{…}}}
+→ {"id":3,"method":"inbox.form.submit","params":{"owner":"…","key":"pr-6900","message":"run-…","answers":{…}}}
 ```
 
 Errors: `{"id":n,"error":{"code":"…","message":"…"}}`, stable codes
@@ -469,7 +486,7 @@ devsandbox inbox ls [--view needs-you|active|done|all] [--json]
 devsandbox inbox show <owner>/<key> [--json]
 devsandbox inbox reply <owner>/<key> <text|->       # - reads stdin
 devsandbox inbox act <owner>/<key> <action-id>
-devsandbox inbox answer <owner>/<key> <post-id> --json '<answers>'   # or stdin
+devsandbox inbox submit <owner>/<key> <message-id> --json '<answers>'   # or stdin
 devsandbox inbox done|reopen <owner>/<key>
 ```
 
@@ -484,7 +501,7 @@ Keep the side-by-side layout and cards (`inbox-threads.md`, *Inbox layout
 v2*). Change the thread pane:
 
 ```
-╭─ #6900 feat/agent-run-cost-event ↗ ─────────────────────╮
+╭─ #6900 feat/agent-run-cost-event ↗ ───────────────────╮
 │ ● needs you · review drafts          bab-disp · pr-6900 │  header (pinned)
 │ [1] Retry  [2] Done  [o] VS Code  [l] Logs              │
 ├─────────────────────────────────────────────────────────┤
@@ -493,7 +510,7 @@ v2*). Change the thread pane:
 │ │   > Consider batching these writes.                  ││
 │ │   (•) Post the reply   ( ) Don't reply               ││
 │ │   Reply: Already batched in `flush()` (src/cos…      ││
-│ │ [Tab] next  [Space] pick  [e] edit  [Ctrl-S] Post    ││
+│ │ [Tab] next  [Space] pick  [e] edit  [Enter] Confirm  ││
 │ ╰──────────────────────────────────────────────────────╯│
 │ 2m  bab-disp                                            │  feed, newest first
 │     Addressed 3 of 4 comments, 1 needs your call. …     │
@@ -502,9 +519,9 @@ v2*). Change the thread pane:
 │ 9m  · active → running comments                         │
 ├─────────────────────────────────────────────────────────┤
 │ ╭──────────────────────────────────────────────────────╮│  composer (grows
-│ │ Instructions for a comments run…                     ││   to 6 rows)
+│ │ Instructions for this PR…                            ││   to 6 rows)
 │ ╰──────────────────────────────────────────────────────╯│
-│  Starts a comments run with your message                │  compose.hint
+│  Starts an agent with your message                      │  compose.hint
 ╰─────────────────────────────────────────────────────────╯
 ```
 
@@ -514,12 +531,15 @@ v2*). Change the thread pane:
   actions plus the always-available child keys.
 - **Open forms pinned under the header** while open, newest first, then the
   feed newest first. Scroll starts at the top, which is now the newest
-  thing. Submitted forms move into the feed as answered posts.
+  thing. Submitted forms move into the feed as answered messages, with the
+  submission folded under them.
 - **Form editing** is its own focus zone (list → thread → form/composer):
   `Tab`/`Shift-Tab` move between questions, `↑`/`↓` move within options,
-  `Space` picks, `Enter` on a text question opens it in the textarea
-  (`Esc` keeps the edit), `Ctrl-S` submits after confirming missing required
-  answers. Every change saves the draft through `form.saveDraft`.
+  `Space` picks, `e` on a text question opens it in the textarea (`Enter`
+  or `Esc` keeps the edit, `Alt-Enter` inserts a newline). `Enter` outside a
+  text edit is **Confirm**: it shows a one-line summary (`submit 4 answers?`,
+  missing required answers named) and a second `Enter` submits, `Esc`
+  cancels. Every change saves the draft through `form.saveDraft`.
 - **Composer**: a real wrapping textarea, shared by text questions. Wraps by
   display width, grows from 1 to 6 rows then scrolls vertically, keeps the
   cursor visible (fixes the clipping bug at `ui.rs:1204-1227`); `Enter`
@@ -603,25 +623,32 @@ store ops, schema rules), TestBackend renders for the pane and form.
     site config page); thread verbs check it instead of `dispatcher`;
     `dispatcher` keeps child ops only.
 12. **Store v3 (JSON) + feed model.** Header without `message`, `compose`,
-    feed items (post, reply, action, answers, markers), caps and retention,
-    v2 notify carry-over, v2 threads dropped. Rewrite the apply logic in
-    `src/inbox/mod.rs` (markers instead of per-field entries; marker
-    collapsing as a pure fn).
-13. **`thread post` end to end.** Schema (`src/inbox/post.rs`, blocks
-    `markdown`/`fields`), outbox kind `thread-post` + coalescing per
-    `(thread, id)` (`devsbd/src/outbox.rs`, `src/devsbd/notify.rs`),
-    validator extraction of `thread`/`id`, host apply (insert / replace /
-    withdraw, edited tag), `thread ls --feed`. Bump the helper's thread
-    capability; old-shape puts become an error record.
+    feed items (message, reply, action, submission, markers), caps and
+    retention, v2 notify carry-over, v2 threads dropped. Rewrite the apply
+    logic in `src/inbox/mod.rs` (markers instead of per-field entries; marker
+    collapsing as a pure fn). Each user item records its client (`tui`,
+    `cli`, `api:<name>` from the hello; deferred here from step 6), never
+    exposed to owners. The API view structs (`src/serve/api.rs`) and the
+    npm typings move to the v3 shapes in the same commit (the drift guard in
+    `src/serve/dts.rs` enforces it); the current pane is adapted just enough
+    to render v3 until step 14 rewrites it.
+13. **`thread send` / `thread withdraw` end to end.** Schema
+    (`src/inbox/message.rs`, blocks `markdown`/`fields`), outbox kinds
+    `thread-send` / `thread-withdraw` + coalescing per `(thread, id)`
+    (`devsbd/src/outbox.rs`, `src/devsbd/notify.rs`), validator extraction
+    of `thread`/`id`, host apply (insert / replace / withdraw, edited tag),
+    `thread ls --feed`. Bump the helper's thread capability; old-shape puts
+    become an error record.
 14. **Pane layout v3.** Pinned header + action row, feed newest first,
     composer + `compose.hint`, stopped-child labels. Rewrite the pane tests.
 15. **Forms: schema and store.** `src/inbox/form.rs` (types, limits,
-    validation), lifecycle (open/submitted/withdrawn), drafts, `form` event
-    with defaults filled in, `inbox.form.saveDraft`/`inbox.form.submit`.
+    validation), lifecycle (open/submitted/withdrawn), drafts, `submit` event
+    with defaults filled in, `inbox.form.saveDraft`/`inbox.form.submit`
+    (API, `docs/api.md`, npm typings).
 16. **Forms: TUI.** Pinned open forms, form focus zone, choice/text/confirm
-    widgets (text uses step 1's textarea), submit confirm, answered
-    rendering in the feed.
-17. **Events v3.** `thread` instead of `key`, `form` kind, `--thread`
+    widgets (text uses step 1's textarea), `Enter` Confirm, submissions
+    folded in the feed.
+17. **Events v3.** `thread` instead of `key`, `submit` kind, `--thread`
     filter.
 18. **`--follow`.** `Subscribe` control op with a held-open response fed by
     step 5's notifications, pings, one follower per owner (`replaced`),
@@ -629,10 +656,11 @@ store ops, schema rules), TestBackend renders for the pane and form.
     enqueue from the host, line arrives; second follower replaces the
     first; kill the daemon, exit 75.
 19. **CLI** `devsandbox inbox …` (reads from the store, mutations via the
-    API), `--json` envelope.
+    API with the TUI's fallback to `inbox::ops` when no daemon answers, so
+    events are identical either way), `--json` envelope.
 20. **Host actions on stopped children** (start first, `(stopped)` label);
     JSON answers for `ensure`/`done`/`stop`/`rm`.
-21. **Docs.** `automations-guide.md` (`inbox = true`, threads, posts,
+21. **Docs.** `automations-guide.md` (`inbox = true`, threads, messages,
     forms, events, follow), `automations.md` (protocol), `sandbox-helper.md`
     (verbs, `Subscribe`, bridges owned by the daemon), `ssh-agent.md`,
     `port-forwarding.md`, `tui.md`, `json-output.md`, `api.md`, site pages
@@ -640,16 +668,12 @@ store ops, schema rules), TestBackend renders for the pane and form.
     superseded where this doc replaces it.
 
 The dispatcher plan can start right after step 5 (it works with the TUI
-closed), switch to posts after 13, forms after 17, and `--follow` after 18.
+closed), switch to messages after 13, forms after 17, and `--follow` after 18.
 
 ## Open questions
 
-- **Feed order in the TUI**: newest first (above) matches "the newest thing
-  is at the top" and removes the jump, but replies then read bottom-up in a
-  back-and-forth. Alternative: chat order (oldest first) with the pane
-  scrolled to the bottom and the header pinned. Decide after a mock with a
-  real thread; the store and API don't depend on it.
-- **Multiple open forms per thread**: allowed (one per post). Should a new
+- ~~Feed order in the TUI~~: decided 2026-10-06, **newest first**.
+- **Multiple open forms per thread**: allowed (one per message). Should a new
   form from the same owner auto-withdraw older open ones? Leaning no: the
   owner withdraws explicitly.
 - **Windows daemon**: named pipe via `local_endpoint` once bridging is
