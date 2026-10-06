@@ -43,6 +43,18 @@ pub fn helper_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     gated(vec![quote!(Helper)], parse_macro_input!(item as ItemFn)).into()
 }
 
+/// A test whose requirement only its body can probe (a host tool, a service
+/// manager): no declared needs, so `Err(why)` is the whole gate. Same
+/// contract as [`docker_test`].
+#[proc_macro_attribute]
+pub fn host_test(attr: TokenStream, item: TokenStream) -> TokenStream {
+    if !attr.is_empty() {
+        let msg = "host_test takes no arguments";
+        return syn::Error::new(Span::call_site(), msg).to_compile_error().into();
+    }
+    gated(vec![], parse_macro_input!(item as ItemFn)).into()
+}
+
 fn gated(needs: Vec<TokenStream2>, func: ItemFn) -> TokenStream2 {
     let ItemFn { attrs, vis, sig, block } = func;
     if !sig.inputs.is_empty() || sig.asyncness.is_some() || !sig.generics.params.is_empty() {

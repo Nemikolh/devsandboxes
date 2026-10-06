@@ -692,6 +692,39 @@ WantedBy=default.target
         assert!(render_systemd(&log).contains("StandardOutput=append:/st/100%%/serve.log\n"));
     }
 
+    /// systemd's own parser accepts the unit with every escape in play. The
+    /// binary must exist (`verify` checks `ExecStart`), so a mis-escaped path
+    /// names a missing file and fails.
+    #[cfg(target_os = "linux")]
+    #[test_utils::host_test]
+    fn systemd_analyze_verifies_the_rendered_unit() -> Result<(), String> {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch("sd-verify");
+        let bin = root.join("dev sandbox 100% $HOME;x");
+        std::fs::create_dir_all(&bin).unwrap();
+        let exe = bin.join("devsandbox");
+        std::fs::write(&exe, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let spec = Spec {
+            exe: exe.to_str().unwrap().into(),
+            socket_dir: root.join("sock 100% $HOME").to_str().unwrap().into(),
+            log: root.join("state 100%/serve.log").to_str().unwrap().into(),
+            ..spec()
+        };
+        let unit = root.join(SYSTEMD_UNIT);
+        std::fs::write(&unit, render_systemd(&spec)).unwrap();
+        let out = match Command::new("systemd-analyze").args(["--user", "--man=no", "verify"]).arg(&unit).output() {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err("systemd-analyze not installed".into()),
+            r => r.unwrap(),
+        };
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // Unknown or malformed keys are only warnings, so any line naming the
+        // unit fails too.
+        assert!(out.status.success() && !stderr.contains(SYSTEMD_UNIT), "{stderr}");
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
+    }
+
     #[test]
     fn launchd_plist_escapes_xml() {
         let plist = render_launchd(&spec());

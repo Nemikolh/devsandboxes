@@ -15,10 +15,28 @@ jobs:
       # to install. Those tests fail rather than skip on CI (src/test_support.rs).
       - run: rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
       - run: scripts/build-devsbd.sh
+      # tests/service_manager.rs needs a systemd user manager; the runner has
+      # no login session, so linger starts one.
+      - name: Start a systemd user manager
+        run: |
+          sudo loginctl enable-linger "$USER"
+          dir="/run/user/$(id -u)"
+          for _ in $(seq 100); do [ -S "$dir/systemd/private" ] && break; sleep 0.1; done
+          echo "XDG_RUNTIME_DIR=$dir" >> "$GITHUB_ENV"
       - run: cargo check
       - run: cargo test --workspace
         env:
           DEVSANDBOX_DEVSBD_REQUIRED: "1"
+          DEVSANDBOX_SERVICE_MANAGER_E2E: "1"
+
+  # `serve install` under a real launchd (the Linux job covers systemd).
+  service-manager-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: cargo test --test service_manager
+        env:
+          DEVSANDBOX_SERVICE_MANAGER_E2E: "1"
 
   # The docs site deploys only on release (release.yml); this keeps main
   # always deployable. It reads ../Cargo.toml, ../skills and ../npm, so

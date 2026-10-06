@@ -269,6 +269,16 @@ clean exit doesn't. Deliberately: a version handoff exits 0, and an
 a loop. So would a manager-started daemon finding another one already
 answering (it exits 0 at once, *Start*).
 
+**Tested against the real managers.** `tests/service_manager.rs` installs
+under the user's own systemd / launchd and checks the manager runs the
+binary it names, respawns a `SIGKILL`, leaves a handoff's exit down, and
+that reinstall and uninstall work. It replaces the user's unit, so it only
+runs with `DEVSANDBOX_SERVICE_MANAGER_E2E=1` and no unit installed (CI: the
+Linux test job via `loginctl enable-linger`, plus a macOS job). The rendered
+unit also goes through `systemd-analyze verify` / `plutil -lint`. systemd
+refuses an executable path containing a double quote, a backslash or an
+apostrophe, however escaped.
+
 **Starts with a unit installed.** Every lazy start (*Start*) first checks
 for the unit file above. Without one it spawns detached, as before. With
 one, the unit follows upgrades:

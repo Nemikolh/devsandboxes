@@ -1,6 +1,7 @@
 //! Shared helpers for tests that need a real container runtime or the embedded
 //! devsbd helper. Tests opt in with `#[test_utils::docker_test]` /
-//! `#[test_utils::helper_test]`, which expand to a call to [`gated`].
+//! `#[test_utils::helper_test]` / `#[test_utils::host_test]`, which expand to
+//! a call to [`gated`].
 
 use std::fmt::Display;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
