@@ -31,7 +31,7 @@ mod view;
 
 pub use crate::inbox::Thread;
 pub use inbox::{
-    pane_lines, parse_utc_offset, short_age, title_of, InboxFocus, InboxView, PaneLine, Tone, View,
+    chip, pane_lines, parse_utc_offset, short_age, title_of, InboxFocus, InboxView, PaneLine, Tone, View,
 };
 pub use actions::PendingDone;
 pub use procs::{PendingSignal, Signal};

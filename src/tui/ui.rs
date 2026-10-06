@@ -10,7 +10,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table, 
 use tui_term::widget::{Cursor, PseudoTerminal};
 
 use super::app::{
-    pane_lines, short_age, title_of, App, ConfigView, Extract, Focus, HelpModal, InboxFocus, Modal, PaneLine,
+    chip, pane_lines, short_age, title_of, App, ConfigView, Extract, Focus, HelpModal, InboxFocus, Modal, PaneLine,
     Pane, PortRow, Side, Tab, TextModal, Thread, Tone, View,
 };
 use super::settings::SETTINGS;
@@ -766,26 +766,16 @@ fn restyle(parts: &[(String, Style)], fitted: &str) -> Vec<Span<'static>> {
     out
 }
 
-/// A card's state chip, as styled parts: a dispatcher thread's state (its
-/// status while active, as inline markdown), or a notify record's level.
-fn chip(t: &Thread) -> Vec<(String, Style)> {
-    let dim = Style::default().add_modifier(Modifier::DIM);
-    let one = |text: &str, style: Style| vec![(text.to_string(), style)];
-    match (t.kind, t.state, t.head().map(|r| r.level)) {
-        (Kind::Thread, Some(State::NeedsYou), _) => one("● needs you", state_style(State::NeedsYou)),
-        (Kind::Thread, Some(State::Done), _) => one("✓ done", state_style(State::Done)),
-        (Kind::Thread, _, _) => {
-            let style = state_style(State::Active);
-            let status = t.status.as_deref().map(markdown::inline_spans).filter(|s| !s.is_empty());
-            let Some(status) = status else { return one("○ active", style) };
-            let mut parts = one("○ ", style);
-            parts.extend(styled_parts(status, style));
-            parts
-        }
-        (Kind::Notify, _, Some(Level::Error)) => one("✖ error", level_style(Level::Error)),
-        (Kind::Notify, _, Some(Level::Warn)) => one("▲ warn", level_style(Level::Warn)),
-        (Kind::Notify, _, _) => one("· info", dim),
-    }
+/// A card's state chip ([`chip`], shared with the pane head) as styled
+/// parts: the tones' styles, a status as inline markdown.
+fn card_chip(t: &Thread) -> Vec<(String, Style)> {
+    chip(t)
+        .into_iter()
+        .flat_map(|(tone, text)| match tone {
+            Tone::Text => styled_parts(markdown::inline_spans(&text), tone_style(tone)),
+            _ => vec![(text, tone_style(tone))],
+        })
+        .collect()
 }
 
 /// Inline-markdown `spans` as [`card_line`] parts, each on `base`.
@@ -851,7 +841,7 @@ fn card_lines(t: &Thread, width: usize, selected: bool, focused: bool, now: u64,
     if t.archived {
         title.push((" · archived".into(), dim));
     }
-    let chip: Vec<(String, Style)> = chip(t).into_iter().map(|(s, style)| (s, fade(style))).collect();
+    let chip: Vec<(String, Style)> = card_chip(t).into_iter().map(|(s, style)| (s, fade(style))).collect();
     let age = (short_age(t.changed_at(), now, utc_offset), dim);
     let from = (t.owner_name.clone(), dim);
     let (bar, base) = if selected {
@@ -2398,21 +2388,41 @@ mod tests {
 
     #[test]
     fn chip_per_kind_state_and_level() {
-        let c = |t: &Thread| chip(t).into_iter().map(|(s, _)| s).collect::<String>();
-        assert_eq!(c(&dthread("t", State::NeedsYou, Some("x"))), "● needs you");
+        let c = |t: &Thread| card_chip(t).into_iter().map(|(s, _)| s).collect::<String>();
+        // The status shows next to every state, not just active.
+        assert_eq!(c(&dthread("t", State::NeedsYou, Some("x"))), "● x");
+        assert_eq!(c(&dthread("t", State::NeedsYou, None)), "● needs you");
         assert_eq!(c(&dthread("t", State::Active, Some("running ci"))), "○ running ci");
         assert_eq!(c(&dthread("t", State::Active, None)), "○ active");
         assert_eq!(c(&dthread("t", State::Active, Some("  "))), "○ active");
         assert_eq!(c(&dthread("t", State::Done, None)), "✓ done");
+        assert_eq!(c(&dthread("t", State::Done, Some("merged"))), "✓ merged");
         assert_eq!(c(&note("m", Level::Warn, 0)), "▲ warn");
         assert_eq!(c(&note("m", Level::Error, 0)), "✖ error");
         assert_eq!(c(&note("m", Level::Info, 0)), "· info");
-        assert_eq!(chip(&dthread("t", State::NeedsYou, None))[0].1.fg, Some(Color::Yellow));
-        assert_eq!(chip(&note("m", Level::Error, 0))[0].1.fg, Some(Color::Red));
+        assert_eq!(card_chip(&dthread("t", State::NeedsYou, None))[0].1.fg, Some(Color::Yellow));
+        assert_eq!(card_chip(&dthread("t", State::NeedsYou, Some("x")))[0].1.fg, Some(Color::Yellow));
+        assert_eq!(card_chip(&note("m", Level::Error, 0))[0].1.fg, Some(Color::Red));
         // A status is inline markdown.
-        let parts = chip(&dthread("t", State::Active, Some("run `ci`\nnext")));
+        let parts = card_chip(&dthread("t", State::Active, Some("run `ci`\nnext")));
         assert_eq!(parts.iter().map(|(s, _)| s.as_str()).collect::<String>(), "○ run ci next");
         assert_eq!(parts.iter().find(|(s, _)| s == "ci").unwrap().1.bg, markdown::CODE.bg);
+    }
+
+    #[test]
+    fn card_chip_and_pane_head_agree() {
+        let row_text = |l: &Line| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>();
+        for t in [
+            dthread("t", State::NeedsYou, Some("review `drafts`")),
+            dthread("t", State::Active, None),
+            dthread("t", State::Done, None),
+            note("m", Level::Warn, 0),
+        ] {
+            let card: String = card_chip(&t).into_iter().map(|(s, _)| s).collect();
+            let head = &pane_lines(&t, None, 0)[1];
+            let (pane, _) = &pane_rows(head, 200, false)[0];
+            assert!(row_text(pane).starts_with(&format!("{card}  ·  ")), "{card:?} vs {:?}", row_text(pane));
+        }
     }
 
     #[test]

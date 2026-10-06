@@ -275,6 +275,35 @@ fn line(tone: Tone, text: impl Into<String>) -> PaneLine {
     vec![(tone, text.into())]
 }
 
+/// A thread's state chip, the one source of its text for the card and the
+/// pane head: a dispatcher thread's state marker with its status (inline
+/// markdown) or, without one, the state's name; a notify thread's level.
+pub fn chip(t: &Thread) -> PaneLine {
+    match t.kind {
+        Kind::Thread => {
+            let state = t.state.unwrap_or(State::Active);
+            let (marker, name) = match state {
+                State::NeedsYou => ("●", "needs you"),
+                State::Active => ("○", "active"),
+                State::Done => ("✓", "done"),
+            };
+            match t.status.as_deref().filter(|s| !s.trim().is_empty()) {
+                Some(status) => vec![(Tone::State(state), format!("{marker} ")), (Tone::Text, status.to_string())],
+                None => line(Tone::State(state), format!("{marker} {name}")),
+            }
+        }
+        Kind::Notify => {
+            let level = t.head().map_or(Level::Info, |r| r.level);
+            let marker = match level {
+                Level::Error => "✖",
+                Level::Warn => "▲",
+                Level::Info => "·",
+            };
+            line(Tone::Level(level), format!("{marker} {}", level.as_str()))
+        }
+    }
+}
+
 /// A multi-line value folded onto one timeline row.
 fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -307,16 +336,7 @@ fn pending_line(t: &Thread) -> Option<String> {
 /// pane says is unit-testable.
 pub fn pane_lines(t: &Thread, child: Option<&ChildInfo>, utc_offset: i64) -> Vec<PaneLine> {
     let mut out = vec![line(Tone::Title, title_of(t))];
-    let mut head: PaneLine = Vec::new();
-    match (t.kind, t.state, t.head()) {
-        (Kind::Thread, Some(state), _) => head.push((Tone::State(state), state.as_str().to_string())),
-        (Kind::Notify, _, Some(r)) => head.push((Tone::Level(r.level), r.level.as_str().to_string())),
-        _ => {}
-    }
-    if let Some(status) = &t.status {
-        head.push((Tone::Dim, "  ·  ".into()));
-        head.push((Tone::Text, status.clone()));
-    }
+    let mut head = chip(t);
     head.push((Tone::Dim, format!("  ·  {}", stamp(t.changed_at(), utc_offset))));
     out.push(head);
     let mut from = vec![(Tone::Dim, "from   ".to_string()), (Tone::Plain, t.owner_name.clone())];
@@ -349,14 +369,17 @@ pub fn pane_lines(t: &Thread, child: Option<&ChildInfo>, utc_offset: i64) -> Vec
     }
 
     let timeline: Vec<PaneLine> = match t.kind {
+        // A reply is the user's own words, possibly several lines: its stamp
+        // row, then the full text as a document. The rest stay one row.
         Kind::Thread => t
             .entries
             .iter()
-            .map(|e| {
-                vec![
-                    (Tone::Dim, format!("{}  {:7} ", stamp(e.at, utc_offset), entry_label(e.kind))),
-                    (Tone::Text, one_line(&e.text)),
-                ]
+            .flat_map(|e| {
+                let label = format!("{}  {:7} ", stamp(e.at, utc_offset), entry_label(e.kind));
+                match e.kind {
+                    EntryKind::Reply => vec![line(Tone::Dim, label.trim_end()), line(Tone::Markdown, e.text.clone())],
+                    _ => vec![vec![(Tone::Dim, label), (Tone::Text, one_line(&e.text))]],
+                }
             })
             .collect(),
         // The head is the message above; the timeline is what came before.
@@ -1572,8 +1595,46 @@ mod tests {
             .iter()
             .map(|l| l.iter().map(|(_, s)| s.as_str()).collect())
             .collect();
-        assert!(text.iter().any(|l| l.contains("reply") && l.ends_with(">do q1")), "{text:#?}");
+        assert!(text.windows(2).any(|w| w[0].ends_with("reply") && w[1] == ">do q1"), "{text:#?}");
         assert!(text.contains(&"1 event waiting for d".to_string()), "{text:#?}");
+    }
+
+    #[test]
+    fn pane_head_is_the_chip_then_the_stamp() {
+        let mut app = new_app();
+        put(&mut app, "d", 10, ThreadPut { status: Some("review `drafts`".into()), ..body("asks", State::NeedsYou) });
+        put(&mut app, "d", 10, body("idle", State::Active));
+        put(&mut app, "d", 10, ThreadPut { status: Some("merged".into()), ..body("fin", State::Done) });
+        push(&mut app, "a", Record { level: Level::Error, ..rec("boom", None, None) });
+        let head = |title: &str| pane_lines(thread(&app, title), None, 0).swap_remove(1);
+        let at10 = (Tone::Dim, format!("  ·  {}", stamp(10, 0)));
+        assert_eq!(head("asks"), [
+            (Tone::State(State::NeedsYou), "● ".into()),
+            (Tone::Text, "review `drafts`".into()),
+            at10.clone()
+        ]);
+        assert_eq!(head("idle"), [(Tone::State(State::Active), "○ active".into()), at10.clone()]);
+        assert_eq!(head("fin"), [(Tone::State(State::Done), "✓ ".into()), (Tone::Text, "merged".into()), at10]);
+        assert_eq!(head("boom")[..2], [
+            (Tone::Level(Level::Error), "✖ error".into()),
+            (Tone::Dim, format!("  ·  {}", stamp(thread(&app, "boom").changed_at(), 0)))
+        ]);
+        for title in ["asks", "idle", "fin", "boom"] {
+            assert!(head(title).starts_with(&chip(thread(&app, title))), "pane head starts with the chip: {title}");
+        }
+    }
+
+    #[test]
+    fn a_multi_line_reply_keeps_its_lines_as_markdown() {
+        let mut app = new_app();
+        let id = open_asks(&mut app, Some(Reply::default()));
+        let mut inbox = app.inbox.content.clone();
+        inbox.apply(&Op::Reply { thread: id, text: "first line\n\n- a\n- b".into() }, 20);
+        app.set_inbox(inbox);
+        let lines = pane_lines(thread(&app, "asks"), None, 0);
+        let at = lines.iter().position(|l| l.len() == 1 && l[0].0 == Tone::Dim && l[0].1.ends_with("reply")).unwrap();
+        assert_eq!(lines[at][0].1, format!("{}  reply", stamp(20, 0)));
+        assert_eq!(lines[at + 1], [(Tone::Markdown, "first line\n\n- a\n- b".to_string())]);
     }
 
     #[test]

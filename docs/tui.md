@@ -215,8 +215,9 @@ worker, never the UI thread.
   unread, `↗` when there's a link, `· archived` when the sender is gone) with
   a compact age on the right (`now`, `5m`, `3h`, `2d`, then a date like
   `Oct 12` past a week, `short_age`); line 2 is the state or level chip
-  (`● needs you`, `○ <status or active>`, `✓ done`, `▲ warn`, `✖ error`,
-  `· info`) with the sender on the right. The selected card gets an accent
+  (`●`/`○`/`✓` then the status, or without one `needs you`/`active`/`done`;
+  `▲ warn`, `✖ error`, `· info`; one function, `tui::app::inbox::chip`, shared with
+  the pane head) with the sender on the right. The selected card gets an accent
   bar in the first column and a background tint over both lines; archived
   cards are dimmed throughout.
 - **Views**, stepped with `←`/`→` (clamped at the ends, no wraparound; `v` no
@@ -247,7 +248,7 @@ focused zone's border is highlighted. While the thread or its input has
 focus it shadows the dashboard keys (a tier in `App::on_key` after the
 terminal, like a modal): the `1`–`4` tab keys and the rest act on the
 thread, not on rows the user can't see. `q`, `:` and `?` stay reachable. The
-pane shows the title; state (or level), status and time; `from` (sender,
+pane shows the title; the card's chip and the time; `from` (sender,
 `(archived: instance removed)`); `link`; `child` (resolved among the
 sender's own children, with its run state, or `(no such child)`); the
 message; the timeline (put changes, actions, replies, done/reopen; for a
@@ -262,8 +263,9 @@ blocks, bullet/numbered lists with hanging indents, `│` quotes, dim rules,
 links as underlined text plus a dim `(url)`, raw HTML literal, images as
 their alt text, tables as aligned columns under a bold header and a dim
 rule when they fit, widest columns cut to 8 with `…` first, else their
-source lines); the title, status, timeline
-rows and the cards' title/status inline only (code, emphasis, links as text,
+source lines), and a reply's full text the same way, under its timeline
+row; the title, status, other timeline rows and the cards' title/status
+inline only (code, emphasis, links as text,
 one line). Every pane line is word-wrapped by display width by the renderer
 itself, so the scroll bound is the exact row count. `m` shows the source
 instead (pane title `Thread · raw`), for every thread, this session only.
