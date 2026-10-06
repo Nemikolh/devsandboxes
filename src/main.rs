@@ -6,6 +6,8 @@ mod inbox;
 mod json_stdout;
 mod render;
 mod runtime;
+#[cfg(unix)]
+mod serve;
 mod snapshot;
 mod state;
 #[cfg(test)]
@@ -232,6 +234,20 @@ enum Command {
         /// Ports to forward, each `<port>` or `<host>:<port>` (at least one)
         ports: Vec<String>,
     },
+    /// Run the per-user host daemon in the foreground (docs/serve.md)
+    ///
+    /// Plumbing: commands start it on demand, detached, and it exits after
+    /// 10 minutes without clients. Exits at once (status 0) when one is
+    /// already running.
+    #[cfg(unix)]
+    Serve {
+        /// Never exit for idleness
+        #[arg(long)]
+        keep_alive: bool,
+        /// Socket dir (the lazy start passes the one its client resolved)
+        #[arg(long, hide = true, value_name = "DIR")]
+        socket_dir: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -331,6 +347,8 @@ fn main() -> Result<()> {
                 anyhow::bail!("port forwarding is unix-only for now")
             }
         }
+        #[cfg(unix)]
+        Command::Serve { keep_alive, socket_dir } => serve::daemon::serve(socket_dir, keep_alive),
     }
 }
 

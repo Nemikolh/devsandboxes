@@ -48,6 +48,11 @@ git worktrees so working trees are never shared.
   `mod.rs` is the pure model (threads keyed by `(owner instance_id, key)`,
   per-owner cap, `Op` mutations, v1→v2 migration), `store.rs` the locked
   read-modify-write every dashboard and the bridge's notify sink go through.
+- `src/serve/` — the per-user host daemon `devsandbox serve` (unix-only, see
+  `docs/serve.md`): `endpoint.rs` (socket dir/paths, bind/connect: the
+  `local_endpoint` seam), `daemon.rs` (start lock, accept loop, version
+  handoff, drain), `client.rs` (`connect`: lazy start + hello), `idle.rs`
+  (pure idle countdown over `Holders`), `proto.rs` (JSON-lines wire).
 - `src/runtime/` — backend abstraction over docker/podman/Apple container.
 - `devsbd/` — static in-container helper (workspace member), built by
   `scripts/build-devsbd.sh` and embedded by `build.rs`; `src/devsbd.rs` holds

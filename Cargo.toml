@@ -10,6 +10,8 @@ exclude = ["docs/", "release.sh", ".agents/", ".github/", "/devsbd/", "/test-uti
 anyhow = "1.0.104"
 clap = { version = "4.6.6", features = ["derive"] }
 crossterm = "0.29.0"
+# `setsid` for the detached `devsandbox serve` lazy start, `poll` for its accept loop.
+libc = "0.2"
 portable-pty = "0.9"
 # Inbox thread markdown; the defaults only add a CLI (getopts) and HTML output.
 pulldown-cmark = { version = "0.13.4", default-features = false }
