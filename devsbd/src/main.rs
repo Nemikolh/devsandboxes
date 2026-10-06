@@ -42,15 +42,25 @@ fn build_hash() -> String {
     String::from_utf8_lossy(&slot[18..]).into_owned()
 }
 
+/// What `devsbd features` prints, one per line: the verbs a dispatcher may
+/// probe for before using them (`devsbd features | grep -qx thread-send`).
+/// An older helper has no `features` verb at all (usage error, exit 2),
+/// which reads as "none of these". Append-only; separate from `version`,
+/// whose one-line output is the host's install check, and from the frame
+/// protocol's `caps`, which describe the host link, not the CLI.
+const FEATURES: &[&str] = &["thread-send", "thread-withdraw", "thread-ls-feed"];
+
 fn main() {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("version") => println!("devsbd {} {}", proto::VERSION, build_hash()),
+        Some("features") => FEATURES.iter().for_each(|f| println!("{f}")),
         Some("daemon") => exit_on_err(daemon::run(&build_hash())),
         Some("bridge") => exit_on_err(bridge::run(&build_hash())),
         Some("boot") => exit_on_err(boot::run()),
         Some("notify") => exit_on_err(outbox::run(&args.collect::<Vec<_>>())),
-        // `put`/`rm` queue in the outbox (no host needed); `ls` asks the host.
+        // `put`/`send`/`withdraw`/`rm` queue in the outbox (no host needed);
+        // `ls` asks the host.
         Some("thread") => {
             let args = args.collect::<Vec<_>>();
             match args.split_first() {
@@ -77,7 +87,7 @@ fn main() {
         }
         _ => {
             eprintln!(
-                "usage: devsbd version|daemon|bridge|boot|notify|thread|events|ensure|ls|branches|stop|rm|done|exec|run|vscode-goto"
+                "usage: devsbd version|features|daemon|bridge|boot|notify|thread|events|ensure|ls|branches|stop|rm|done|exec|run|vscode-goto"
             );
             std::process::exit(2);
         }

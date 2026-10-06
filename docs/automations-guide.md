@@ -189,7 +189,7 @@ devsbd thread ls
 | `link` | no | opened with `enter` once the thread has focus | http(s) only, 2000 bytes |
 | `status` | no | free text, your lifecycle stage (`running ci`, `merged`), shown as a chip on the row | 60 bytes |
 | `child` | no | key of one of your children: the instance the thread is about, which host actions and the pane's `o`/`t`/`l`/`p` target | key rules |
-| `message` | no | the current explanation: what happened, what you expect from the user | 4000 bytes |
+| `message` | no | the current explanation: what happened, what you expect from the user. Being replaced by messages (`thread send`, below): prefer those in new dispatchers | 4000 bytes |
 | `actions` | no | buttons, numbered `1`–`9` in the pane | at most 9 |
 | `reply` | no | `{ "placeholder": "…" }` (placeholder optional): allow free-text replies | placeholder 100 bytes |
 
@@ -228,9 +228,52 @@ Every text field refuses control characters other than newline, and unknown fiel
 
 Your put always wins: if the user marked a thread done and your next pass puts it as `needs-you` again, it's back in Needs you. Handle the `done` event (below) and put the thread as `done` from then on.
 
-While no host daemon runs, a queued `put` or `rm` for a key replaces any older queued `put`/`rm` for the same key (notifications are never coalesced), so a dispatcher re-asserting every few minutes overnight doesn't pile up files.
+While no host daemon runs, a queued `put` replaces any older queued `put` for the same key, and an `rm` replaces queued `put`s, `rm`s, `send`s and `withdraw`s for its key (notifications are never coalesced), so a dispatcher re-asserting every few minutes overnight doesn't pile up files. A replacing record keeps the queue position of the one it replaced, so the order you sent things in is the order they arrive.
 
-`thread rm <key>` drops one of your threads, its pending events with it. `thread ls` prints a JSON array of your live threads in `put` shape (the `state` reflects the user's done/reopen too), for an owner that lost its own state; it needs the host daemon (exit 75 otherwise). Threads are tied to your instance's id, not its name: they survive stop, restart and rebuild. `devsandbox rm` of the owner archives them (read-only, shown only in **All**). Done and archived threads are dropped 14 days after their last change, unless a done thread still has events you haven't acked; past the 200-per-instance cap, archived threads go first, then done ones.
+`thread rm <key>` drops one of your threads, its pending events with it. `thread ls` prints a JSON array of your live threads in `put` shape (the `state` reflects the user's done/reopen too), for an owner that lost its own state; `thread ls --feed` adds each thread's `messages` (below). Both need the host daemon (exit 75 otherwise). Threads are tied to your instance's id, not its name: they survive stop, restart and rebuild. `devsandbox rm` of the owner archives them (read-only, shown only in **All**). Done and archived threads are dropped 14 days after their last change, unless a done thread still has events you haven't acked; past the 200-per-instance cap, archived threads go first, then done ones.
+
+### Messages (`devsbd thread send`)
+
+The header (`put`) says where a thread stands; **messages** tell the story under it: what a run did, what it needs from the user. They replace the header's `message` field.
+
+```sh
+devsbd thread send < message.json
+devsbd thread send --json '<json>'
+devsbd thread withdraw <thread> <id>
+```
+
+```json
+{
+  "thread": "pr-6900",
+  "id": "run-1791277117",
+  "blocks": [
+    { "type": "markdown", "text": "Addressed 3 of 4 comments, **1 needs your call**." },
+    { "type": "fields", "items": [{ "label": "Head", "value": "36b13d41" }, { "label": "CI", "value": "green" }] }
+  ]
+}
+```
+
+- **Put the thread first.** A send to a thread you haven't put is rejected (`thread send rejected: no thread `<key>`; put it first`).
+- **`id` is your idempotency key** within the thread: derive it from your own state (a run id), so a restarted dispatcher can re-send everything for free. The same id with the same blocks is a no-op; with other blocks it **replaces the message in place**, tagged "edited", without marking the thread unread or popping up. A new id is appended to the feed (the feed keeps first-send order), marks the thread unread, and pops up when the thread is `needs-you`.
+- **`withdraw`** takes a message back: it stays in the feed as a dim "withdrawn" line so the story stays readable. Withdrawing an id the host never saw is a silent no-op. Sending a withdrawn id again brings it back in place, tagged "edited".
+- Like puts, sends and withdraws queue in the outbox with no host daemon running; a newer send or withdraw of the same `(thread, id)` replaces the queued one.
+
+| field | meaning | limit |
+|---|---|---|
+| `thread` | the key of one of your threads | key rules |
+| `id` | the message's id, unique in the thread | lowercase letters, digits, `-`, 1–60 chars |
+| `blocks` | what the message shows, in order | 1–8 blocks; the whole body at most 48 KiB |
+
+Blocks, by `type`:
+
+| type | fields | renders as | limit |
+|---|---|---|---|
+| `markdown` | `text` | markdown, like a `notify` body | non-empty, 16 KiB |
+| `fields` | `items`: `[{ "label", "value" }]` | aligned `label  value` rows | 1–20 items; one-line `label` (non-empty, 60 bytes) and `value` (200 bytes) |
+
+Unknown fields and unknown block types are rejected, as are control characters other than newline (and newlines in a field). The helper checks the JSON syntax, `thread`, `id` and the 48 KiB budget before queuing (exit 2, nothing queued); the dashboard checks the rest and reports a reject as an `error` notification, `thread send rejected: <why>`, like a bad put.
+
+`thread ls --feed` lists each thread's messages as `"messages": [{ "id", "at", "blocks", "edited", "withdrawn" }]` (your messages only, not the user's replies), `blocks` in the shape you sent them, so a dispatcher that lost its state can see what it already said. On an older helper `thread send` fails with `unknown verb`; check with `devsbd features | grep -qx thread-send` (an older helper has no `features` either and prints nothing to stdout).
 
 ### Events
 

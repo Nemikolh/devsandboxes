@@ -1,9 +1,10 @@
-//! A JSON syntax checker (RFC 8259) that also pulls the top-level object's
-//! `key` out, for `devsbd thread put` (docs/inbox-threads.md, *Decisions*:
-//! "Helper: syntax check only"). The helper has no dependencies on purpose,
-//! and the thread schema belongs to the host, so this validates the document
-//! and extracts the one field the outbox and the wire record need — nothing
-//! else is decoded or kept.
+//! A JSON syntax checker (RFC 8259) that also pulls top-level string fields
+//! out: `key` for `devsbd thread put`, `thread` + `id` for `devsbd thread
+//! send` (docs/inbox-threads.md, *Decisions*: "Helper: syntax check only";
+//! docs/inbox-redesign.md, *Threads and messages*). The helper has no
+//! dependencies on purpose, and the schema belongs to the host, so this
+//! validates the document and extracts the fields the outbox and the wire
+//! record need — nothing else is decoded or kept.
 //!
 //! Rejecting malformed JSON here, rather than letting the host do it, keeps a
 //! typo from becoming an error record minutes later with no exit status for
@@ -17,13 +18,21 @@ const MAX_DEPTH: usize = 32;
 /// Validate `text` as exactly one JSON document and return its top-level
 /// object's `key` field. The error is one line, fit for stderr.
 pub fn parse_key(text: &str) -> Result<String, String> {
+    let [key] = parse_fields(text, ["key"])?;
+    Ok(key)
+}
+
+/// Validate `text` as exactly one JSON document and return the top-level
+/// object's string fields `names`, in that order; each must be present and a
+/// string. The error is one line, fit for stderr.
+pub fn parse_fields<const N: usize>(text: &str, names: [&str; N]) -> Result<[String; N], String> {
     let mut p = Parser { b: text.as_bytes(), i: 0 };
     p.ws();
     if p.peek() != Some(b'{') {
         return Err(p.err("expected a JSON object"));
     }
     // Outer: the member was seen; inner: its value, `None` when not a string.
-    let mut key: Option<Option<String>> = None;
+    let mut found: [Option<Option<String>>; N] = std::array::from_fn(|_| None);
     p.i += 1;
     p.ws();
     if p.peek() == Some(b'}') {
@@ -35,9 +44,9 @@ pub fn parse_key(text: &str) -> Result<String, String> {
             p.ws();
             p.expect(b':')?;
             p.ws();
-            // Only `key` is decoded; every other value is validated and dropped.
-            if name == "key" {
-                key = Some(match p.peek() {
+            // Only `names` are decoded; every other value is validated and dropped.
+            if let Some(slot) = names.iter().position(|n| *n == name) {
+                found[slot] = Some(match p.peek() {
                     Some(b'"') => Some(p.string()?),
                     _ => {
                         p.value(1)?;
@@ -59,11 +68,15 @@ pub fn parse_key(text: &str) -> Result<String, String> {
     if p.i != p.b.len() {
         return Err(p.err("trailing data after the JSON value"));
     }
-    match key {
-        Some(Some(k)) => Ok(k),
-        Some(None) => Err("`key` is not a string".into()),
-        None => Err("no `key` field".into()),
+    let mut out: [String; N] = std::array::from_fn(|_| String::new());
+    for ((name, value), slot) in names.iter().zip(found).zip(out.iter_mut()) {
+        *slot = match value {
+            Some(Some(v)) => v,
+            Some(None) => return Err(format!("`{name}` is not a string")),
+            None => return Err(format!("no `{name}` field")),
+        };
     }
+    Ok(out)
 }
 
 struct Parser<'a> {
@@ -326,6 +339,17 @@ mod tests {
         assert_eq!(parse_key(r#"{"key":1}"#).unwrap_err(), "`key` is not a string");
         assert_eq!(parse_key(r#"{"key":null}"#).unwrap_err(), "`key` is not a string");
         assert_eq!(parse_key(r#"{"key":["a"]}"#).unwrap_err(), "`key` is not a string");
+    }
+
+    #[test]
+    fn extracts_several_fields_in_the_asked_order() {
+        let json = r#"{"blocks":[{"type":"markdown","text":"hi","id":"inner"}],"id":"run-1","thread":"pr-1"}"#;
+        assert_eq!(parse_fields(json, ["thread", "id"]), Ok(["pr-1".to_string(), "run-1".to_string()]));
+        // Nested members with the same name are not top-level fields.
+        assert_eq!(parse_fields(r#"{"thread":"t","x":{"id":"a"}}"#, ["thread", "id"]).unwrap_err(), "no `id` field");
+        assert_eq!(parse_fields(r#"{"id":"a"}"#, ["thread", "id"]).unwrap_err(), "no `thread` field");
+        assert_eq!(parse_fields(r#"{"thread":"t","id":7}"#, ["thread", "id"]).unwrap_err(), "`id` is not a string");
+        assert!(parse_fields(r#"{"thread":"t","id":"a""#, ["thread", "id"]).is_err());
     }
 
     #[test]

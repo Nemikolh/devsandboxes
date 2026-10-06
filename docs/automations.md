@@ -152,22 +152,28 @@ Design and rationale: `docs/inbox-threads.md`; user reference: `docs/automations
 
 ### Outbox records
 
-`devsbd thread put|rm` use the `notify` outbox and stream. The record format (`src/devsbd/notify.rs`) gained an optional `kind` line:
+`devsbd thread put|send|withdraw|rm` use the `notify` outbox and stream. The record format (`src/devsbd/notify.rs`) gained an optional `kind` line:
 
 - absent: a plain notify record (`level`, `key?`, `link?`, `msg`), byte-for-byte what older helpers write;
 - `kind thread-put`: `key` plus `body`, the thread JSON, escaped and opaque to the helper;
-- `kind thread-rm`: `key` only.
+- `kind thread-rm`: `key` only;
+- `kind thread-send`: `key` (the thread), `id` (the message id) plus `body`, the message JSON (docs/inbox-redesign.md, *Messages*);
+- `kind thread-withdraw`: `key` and `id`.
 
-The helper checks JSON syntax with a std-only validator (`devsbd/src/json.rs`, nesting capped at 32), pulls out `key` and checks it with `control::valid_key`; the schema belongs to the host (`src/inbox/thread.rs`, serde, `deny_unknown_fields`). Queuing a `thread-*` record deletes any pending `thread-*` file for the same key first (`outbox::enqueue_thread`): a put carries the whole thread, so only the newest matters. Notify records are never coalesced.
+The helper checks JSON syntax with a std-only validator (`devsbd/src/json.rs`, nesting capped at 32) and pulls out the routing fields: `key` for a put, `thread` + `id` for a send. Keys are checked with `control::valid_key`, message ids with `control::valid_message_id` (`[a-z0-9-]{1,60}`), and a send body is capped at 48 KiB (`notify::MAX_SEND_BODY`, leaving room in the 64 KiB record); any of these fails with exit 2 and nothing queued. The schema belongs to the host (`src/inbox/thread.rs` for puts, `src/inbox/message.rs` for sends; serde, `deny_unknown_fields`, unknown block types rejected).
+
+**Coalescing** (`outbox::enqueue_thread`, rule in `Message::supersedes`): queuing a record drops the pending ones it makes pointless. A put replaces a queued put of its thread; an rm replaces a queued put or rm of its thread and every queued send/withdraw in it; a send or withdraw replaces a queued send or withdraw of the same `(thread, id)`, either way round. A put never replaces a queued rm (rm then put is a fresh thread, not the old one re-headed). Notify records are never coalesced. The new record takes the **position** of the oldest record it replaces (written as `<that name's base>+<n:06>`, which sorts right after it), not the tail of the queue: the host appends a message to the feed when it first sees its id, so moving `send a` behind a later `send b` would swap them, and moving a put behind the sends that need its thread would get them rejected.
 
 ### Apply, then ack
 
 The bridge's notify handler applies a record to the store *before* replying `ok` (`bridge::handle_notify` → `apply_message` → `inbox::ops::sink`). A store failure sends no reply, the daemon keeps the file and resends it, so a dashboard dying mid-delivery loses nothing. `inbox::decide` turns each message into one store action:
 
 - notify → push the record;
-- thread message from an instance whose sandbox doesn't declare `inbox = true` (`dispatch::declares_inbox`, evaluated only for thread messages) → an `error` notify record from that instance, key `thread:<key>`, `thread put|rm denied: …`;
-- put whose body fails the schema, or whose body `key` differs from the record's → the same, `thread put rejected: <why>`;
-- valid put → `Inbox::put`; rm → drop the thread.
+- thread message from an instance whose sandbox doesn't declare `inbox = true` (`dispatch::declares_inbox`, evaluated only for thread messages) → an `error` notify record from that instance, key `thread:<key>`, `thread put|rm|send|withdraw denied: …`;
+- put whose body fails the schema, or whose body `key` differs from the record's → the same, `thread put rejected: <why>`; a send likewise (`thread send rejected: <why>`, also when its body `thread`/`id` differ from the record's);
+- valid put → `Inbox::put`; rm → drop the thread;
+- valid send → `Inbox::send`: no such thread of this owner → `thread send rejected: no thread `<key>`; put it first`; a new id is appended to the feed (`feed::send`), marks the thread unread and returns a popup when the header is `needs-you`; the same id with other blocks replaces the message in place and tags it `edited` (no unread, no popup); the same blocks again is a no-op; a withdrawn id sent again comes back in place, `edited`;
+- withdraw → `Inbox::withdraw`: tags the message `withdrawn` and keeps it; an unknown thread or id is a silent no-op.
 
 A put that changes nothing leaves the store byte-identical, so no write, no mtime bump, no popup, no status line. A change to `message`/`state`/`status` adds one timeline entry each and marks the thread unread; entering `needs-you` returns a desktop popup (key `thread:<key>`, through the per-instance rate limit). Retention (`Inbox::prune`) runs on this path: archived threads, and done threads with no pending events, go 14 days after their last change.
 

@@ -60,13 +60,15 @@ Subcommands (argv[1], no clap — hand-parse to save size):
 
 - `version` — prints protocol version + build hash (install check).
 
+- `features` — prints the CLI verbs a dispatcher may probe for, one per line: `thread-send`, `thread-withdraw`, `thread-ls-feed`, append-only. An older helper has no `features` verb (usage error, exit 2, nothing on stdout), which reads as "none". Kept separate from `version` on purpose: `version`'s one line is the host's install check (`devsbd::parse_version` rejects extra words), and the frame protocol's `caps` bits describe the host link, not the CLI. New verbs therefore need neither a `VERSION` bump (which would make every running container's helper a mismatch until restarted) nor a new caps bit: the host is version-locked to the helper it installs, so only a dispatcher script needs to ask.
+
 - `boot` — the container command's start hook: starts the daemon detached, then runs the `postStartCommand` recorded in `/run/devsandbox/boot` (log `/run/devsandbox/boot.log`). See `docs/automations.md`.
 
 - `notify [--level info|warn|error] [--link URL] [--key K] [--] <msg>...` — queues a record in `/var/lib/devsandbox/outbox/` and pokes the daemon, which flushes it to a host advertising `NOTIFY`.
 
-- `thread put [--json '<json>']` (stdin without `--json`) / `thread rm <key>` — queue a dispatcher's Inbox thread in the same outbox, as a `kind thread-put|thread-rm` record. The helper only checks JSON syntax (`json.rs`, std-only) and the key; the host owns the schema. A new record for a key deletes the pending ones for that key. See `docs/automations.md`, _Inbox threads_.
+- `thread put [--json '<json>']` (stdin without `--json`) / `thread rm <key>` — queue a dispatcher's Inbox thread in the same outbox, as a `kind thread-put|thread-rm` record. `thread send [--json '<json>']` / `thread withdraw <thread> <id>` — queue a message in one of those threads (`kind thread-send|thread-withdraw`). The helper only checks JSON syntax (`json.rs`, std-only), the key (and a message's `thread`, `id` and 48 KiB budget); the host owns the schema. A new record drops the pending ones it supersedes and takes the oldest one's queue position (`notify::Message::supersedes`). See `docs/automations.md`, _Inbox threads_.
 
-- `ensure|ls|branches|stop|rm|done|exec`, `run ls|logs|wait|rm|prune <key> …`, `events [--wait SECS]`, `events ack <id>...`, `thread ls` — a dispatcher's control commands: one request over `/run/devsandbox/api.sock`, relayed by the daemon to a host advertising `CONTROL`; exit 0/1/2, 75 (no host), 77 (denied).
+- `ensure|ls|branches|stop|rm|done|exec`, `run ls|logs|wait|rm|prune <key> …`, `events [--wait SECS]`, `events ack <id>...`, `thread ls [--feed]` — a dispatcher's control commands: one request over `/run/devsandbox/api.sock`, relayed by the daemon to a host advertising `CONTROL`; exit 0/1/2, 75 (no host), 77 (denied).
 
 - `vscode-goto <ABS_PATH>[:LINE[:COL]] [--wait SECS]` — local, no host round trip; what `devsandbox vscode --goto` execs as root in the container. Opens the file at the line in the VS Code window attached to this container by running that window's own remote CLI (`code -g`) against its IPC socket. The window's socket is the `/tmp/vscode-ipc-*.sock` listener (from `/proc/net/unix`) held by a `--type=extensionHost` process: the server also owns one per integrated terminal, and the agent host one, so "newest socket" would usually pick a terminal's. With several extension hosts the most recently started wins. The CLI is the single script in `<server>/bin/<commit>/bin/remote-cli/` (`code`, `code-insiders`, `cursor`), found from the extension host's argv0, and runs as the extension host's owner with a clean env (`PATH`, `HOME` from `/etc/passwd`, `VSCODE_IPC_HOOK_CLI`). `--wait` (at most 60 s) polls for a window to appear; exit 3 when none does. Prints `socket=… pid=… cli=…`.
 
@@ -454,7 +456,7 @@ kind: 0 Hello(u32 version, u8 hash_len, hash utf-8, u32 caps)  1 Open(channel: u
   replies `ok` once the record is in the Inbox store (no reply = resend); a legacy `Open` stream half-closes on a peer `Eof`, see
   `mux.rs`, docs/automations.md), `CONTROL = 1 << 3` (host serves
   `channel::CONTROL` streams: a dispatcher's `devsbd ensure|ls|stop|rm|done|exec`,
-  `devsbd run … <key> …`, `devsbd events`, `events ack` or `thread ls` request, sent the same way (run ops
+  `devsbd run … <key> …`, `devsbd events`, `events ack` or `thread ls [--feed]` request, sent the same way (run ops
   are then carried out by the host exec'ing `devsbd run …` in the child;
   runs themselves never touch the frame channel), answered with an encoded response and a close;
   only sink-bearing (host daemon) bridges advertise it, and the host's handler refuses

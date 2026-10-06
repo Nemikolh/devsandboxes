@@ -393,7 +393,7 @@ pub(crate) fn handle_with(
                     Ok(n) => Response::new(Status::Ok, n.to_string()),
                     Err(e) => failed(format!("{e:#}")),
                 },
-                _ => thread_ls(&path, owner_id),
+                _ => thread_ls(&path, owner_id, req.feed),
             }
         }
     }
@@ -474,13 +474,55 @@ fn events(path: &Path, owner_id: &str, timeout: u64) -> Response {
     }
 }
 
-/// `thread-ls`: `owner_id`'s live threads as a JSON array of put bodies.
-fn thread_ls(path: &Path, owner_id: &str) -> Response {
+/// One `thread-ls` row: the put body, plus the owner's messages with `feed`.
+#[derive(serde::Serialize)]
+struct ThreadLsRow<'a> {
+    #[serde(flatten)]
+    put: crate::inbox::ThreadPut,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    messages: Option<Vec<MessageRow<'a>>>,
+}
+
+/// An owner message as `thread ls --feed` lists it: `blocks` in the shape
+/// `thread send` takes, so a dispatcher can compare or re-send them.
+#[derive(serde::Serialize)]
+struct MessageRow<'a> {
+    id: &'a str,
+    at: u64,
+    blocks: &'a [crate::inbox::Block],
+    edited: bool,
+    withdrawn: bool,
+}
+
+/// The owner's messages in `t`'s feed, first-insert order. Replies, actions
+/// and markers are the user's or the host's, not what the owner sent; form
+/// submissions join with forms (step 15).
+fn message_rows(t: &crate::inbox::Thread) -> Vec<MessageRow<'_>> {
+    t.feed
+        .iter()
+        .filter_map(|i| match &i.kind {
+            // v2 put compat, removed in step 13b: the header message is the
+            // put's `message`, already in the row.
+            crate::inbox::ItemKind::Message { id, .. } if id == crate::inbox::feed::HEADER_MESSAGE => None,
+            crate::inbox::ItemKind::Message { id, blocks, edited, withdrawn } => {
+                Some(MessageRow { id, at: i.at, blocks, edited: *edited, withdrawn: *withdrawn })
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// `thread-ls`: `owner_id`'s live threads as a JSON array of put bodies;
+/// with `feed`, each with its `messages` too.
+fn thread_ls(path: &Path, owner_id: &str, feed: bool) -> Response {
     let threads = match inbox_ops::threads(path, owner_id) {
         Ok(threads) => threads,
         Err(e) => return failed(format!("{e:#}")),
     };
-    let puts: Vec<_> = threads.iter().map(|t| t.to_put()).collect();
+    let puts: Vec<_> = threads
+        .iter()
+        .map(|t| ThreadLsRow { put: t.to_put(), messages: feed.then(|| message_rows(t)) })
+        .collect();
     match serde_json::to_string(&puts) {
         Ok(json) if json.len() > EVENTS_BODY_CAP => failed(format!("{} threads: too large to list", puts.len())),
         Ok(json) => Response::new(Status::Ok, json),
@@ -524,6 +566,7 @@ fn check_fields(req: &Request) -> Result<(), String> {
     field("force", only(&[Op::RunRm], true), req.force)?;
     field("keep", only(&[Op::RunPrune], true), req.keep.is_some())?;
     field("ahead", only(&[Op::Branches], true), req.ahead)?;
+    field("feed", only(&[Op::ThreadLs], true), req.feed)?;
     if let Some(key) = &req.key {
         if !valid_key(key) {
             return Err(format!(
@@ -2289,12 +2332,54 @@ folder = "."
         assert_eq!(got.len(), 1);
         assert_eq!((got[0].key.as_str(), got[0].title.as_str()), ("pr-1", "PR 1"));
         assert!(got[0].compose.is_some());
-        // v2 put compat, removed in step 13: `reply` mirrors `compose`.
+        // v2 put compat, removed in step 13b: `reply` mirrors `compose`.
         assert!(got[0].reply.is_some());
         // Archived (the owner was removed) is history, not listed.
         store::update_at(&path, |i| i.archive_owner("d")).unwrap();
         assert_eq!(call(&s, "d", &Request::new(Op::ThreadLs), &mut fake).body, "[]");
         assert_eq!(call(&s, "a", &Request::new(Op::ThreadLs), &mut fake).body.matches("\"key\"").count(), 1);
+    }
+
+    #[test]
+    fn thread_ls_feed_adds_the_owners_messages() {
+        use crate::inbox::{Block, Field, MessageSend};
+        let s = state();
+        let (path, mut fake) = inbox_fake("ls-feed");
+        store::update_at(&path, |i| {
+            let blocks = vec![
+                Block::Markdown { text: "hi".into() },
+                Block::Fields { items: vec![Field { label: "Head".into(), value: "36b1".into() }] },
+            ];
+            i.send("d", 5, MessageSend { thread: "pr-1".into(), id: "run-1".into(), blocks });
+            i.send("d", 6, MessageSend { thread: "pr-1".into(), id: "run-2".into(), blocks: vec![Block::Markdown { text: "x".into() }] });
+            i.withdraw("d", "pr-1", "run-2");
+            // A user reply is not an owner message.
+            let id = i.threads.iter().find(|t| t.owner == "d").unwrap().id;
+            i.apply(&crate::inbox::Op::Reply { thread: id, text: "ok".into() }, 7, "tui");
+        })
+        .unwrap();
+        let plain = call(&s, "d", &Request::new(Op::ThreadLs), &mut fake);
+        assert!(!plain.body.contains("\"messages\""), "{}", plain.body);
+        let resp = call(&s, "d", &Request { feed: true, ..Request::new(Op::ThreadLs) }, &mut fake);
+        assert_eq!(resp.status, Status::Ok, "{resp:?}");
+        let got: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+        assert_eq!(got[0]["key"], "pr-1", "still the put shape");
+        assert_eq!(
+            got[0]["messages"],
+            serde_json::json!([
+                {"id": "run-1", "at": 5, "edited": false, "withdrawn": false, "blocks": [
+                    {"type": "markdown", "text": "hi"},
+                    {"type": "fields", "items": [{"label": "Head", "value": "36b1"}]},
+                ]},
+                {"id": "run-2", "at": 6, "edited": false, "withdrawn": true, "blocks": [{"type": "markdown", "text": "x"}]},
+            ])
+        );
+        // Another owner's thread with no messages lists an empty array.
+        let other = call(&s, "a", &Request { feed: true, ..Request::new(Op::ThreadLs) }, &mut fake);
+        assert!(other.body.contains("\"messages\":[]"), "{}", other.body);
+        // Only `thread-ls` takes `feed`.
+        let resp = call(&s, "d", &Request { feed: true, ..Request::new(Op::Events) }, &mut fake);
+        assert_eq!((resp.status, resp.body.as_str()), (Status::Usage, "`events` takes no `feed`"));
     }
 
     #[test]

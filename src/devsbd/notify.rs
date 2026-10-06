@@ -8,22 +8,27 @@
 //! escaped as in `escape.rs` (`\\`, `\n`, `\0`):
 //!
 //! ```text
-//! kind thread-put          optional, at most once: thread-put|thread-rm.
-//!                          Absent = a plain notify record, which is why old
-//!                          helpers' records still decode byte for byte.
+//! kind thread-put          optional, at most once: thread-put|thread-rm|
+//!                          thread-send|thread-withdraw. Absent = a plain
+//!                          notify record, which is why old helpers' records
+//!                          still decode byte for byte.
 //! at 1790000000            required, once: unix seconds when queued
 //! level warn               notify only, required: info|warn|error
 //! key pr-123               notify: optional dedupe key; thread-*: required
+//!                          (send/withdraw: the thread the message is in)
+//! id run-1791277117        thread-send|thread-withdraw only, required: the
+//!                          message id
 //! link https://…           notify only, optional
 //! msg PR 123\nneeds you    notify only, required
-//! body {"key":"pr-123",…}  thread-put only, required: the thread JSON. The
-//!                          helper only syntax-checks it (docs/inbox-threads.md,
-//!                          "Decisions"); the host owns the schema.
+//! body {"key":"pr-123",…}  thread-put|thread-send only, required: the JSON
+//!                          body. The helper only syntax-checks it
+//!                          (docs/inbox-threads.md, "Decisions"); the host
+//!                          owns the schema.
 //! ```
 //!
-//! A thread record repeats the `key` the helper pulled out of `body`, so the
-//! outbox can coalesce same-key puts and the host can route and report a
-//! rejected body without parsing JSON twice.
+//! A thread record repeats the `key` (and a message's `id`) the helper pulled
+//! out of `body`, so the outbox can coalesce ([`Message::supersedes`]) and the
+//! host can route and report a rejected body without parsing JSON twice.
 //!
 //! Unknown keys, repeats, a missing required key, a directive on the wrong
 //! kind, or a bad escape are parse errors (the daemon moves such a file aside
@@ -40,6 +45,11 @@ pub const OUTBOX: &str = "/var/lib/devsandbox/outbox";
 /// notification is a line of text, and the record travels as one `Data` frame
 /// (well under `proto::MAX_PAYLOAD`).
 pub const MAX_RECORD: usize = 64 * 1024;
+
+/// Cap on a `thread send` body (docs/inbox-redesign.md, *Messages*): leaves
+/// room under [`MAX_RECORD`] for the directives and the escaping. Checked by
+/// the helper before queuing and by the host's schema.
+pub const MAX_SEND_BODY: usize = 48 * 1024;
 
 /// What the host writes back on a notify stream once it has taken the record;
 /// the daemon deletes the outbox file only after reading it.
@@ -91,6 +101,11 @@ pub enum Message {
     ThreadPut { at: u64, key: String, body: String },
     /// `devsbd thread rm <key>`.
     ThreadRm { at: u64, key: String },
+    /// `devsbd thread send`: one message (`id`) in thread `key`, its JSON
+    /// body opaque here.
+    ThreadSend { at: u64, key: String, id: String, body: String },
+    /// `devsbd thread withdraw <key> <id>`.
+    ThreadWithdraw { at: u64, key: String, id: String },
 }
 
 impl Message {
@@ -98,22 +113,49 @@ impl Message {
     pub fn at(&self) -> u64 {
         match self {
             Message::Notify(r) => r.at,
-            Message::ThreadPut { at, .. } | Message::ThreadRm { at, .. } => *at,
+            Message::ThreadPut { at, .. }
+            | Message::ThreadRm { at, .. }
+            | Message::ThreadSend { at, .. }
+            | Message::ThreadWithdraw { at, .. } => *at,
         }
     }
 
     /// The thread (or dedupe) key, when the message carries one.
+    #[allow(dead_code)] // host-only: the helper coalesces on `supersedes`
     pub fn key(&self) -> Option<&str> {
         match self {
             Message::Notify(r) => r.key.as_deref(),
-            Message::ThreadPut { key, .. } | Message::ThreadRm { key, .. } => Some(key),
+            Message::ThreadPut { key, .. }
+            | Message::ThreadRm { key, .. }
+            | Message::ThreadSend { key, .. }
+            | Message::ThreadWithdraw { key, .. } => Some(key),
         }
     }
 
-    /// A thread verb for `key`: what the outbox coalesces on. Plain notify
-    /// records are a log and are never dropped, even with the same key.
-    pub fn is_thread_op_for(&self, key: &str) -> bool {
-        matches!(self, Message::ThreadPut { key: k, .. } | Message::ThreadRm { key: k, .. } if k == key)
+    /// Whether queuing `self` makes the still-queued `older` pointless, so
+    /// the outbox can drop it (docs/automations.md, *Inbox threads*):
+    ///
+    /// - a put replaces a queued put for its thread (the newest header wins);
+    /// - an rm replaces a queued put or rm for its thread, and every queued
+    ///   send/withdraw in it (they'd only hit a removed thread);
+    /// - a send or withdraw replaces a queued send or withdraw of the same
+    ///   `(thread, id)` (the newest body, or the withdrawal, wins).
+    ///
+    /// A put never replaces a queued rm: rm then put is a fresh thread with an
+    /// empty feed, not the old one re-headed. Plain notify records are a log
+    /// and are never dropped, even with the same key.
+    pub fn supersedes(&self, older: &Message) -> bool {
+        use Message::*;
+        match (self, older) {
+            (ThreadPut { key: a, .. }, ThreadPut { key: b, .. }) => a == b,
+            (ThreadRm { key: a, .. }, ThreadPut { key: b, .. } | ThreadRm { key: b, .. }) => a == b,
+            (ThreadRm { key: a, .. }, ThreadSend { key: b, .. } | ThreadWithdraw { key: b, .. }) => a == b,
+            (
+                ThreadSend { key: a, id: i, .. } | ThreadWithdraw { key: a, id: i, .. },
+                ThreadSend { key: b, id: j, .. } | ThreadWithdraw { key: b, id: j, .. },
+            ) => a == b && i == j,
+            _ => false,
+        }
     }
 }
 
@@ -128,14 +170,28 @@ impl From<Record> for Message {
 enum Kind {
     ThreadPut,
     ThreadRm,
+    ThreadSend,
+    ThreadWithdraw,
 }
 
 impl Kind {
+    const ALL: [Kind; 4] = [Kind::ThreadPut, Kind::ThreadRm, Kind::ThreadSend, Kind::ThreadWithdraw];
+
     fn as_str(self) -> &'static str {
         match self {
             Kind::ThreadPut => "thread-put",
             Kind::ThreadRm => "thread-rm",
+            Kind::ThreadSend => "thread-send",
+            Kind::ThreadWithdraw => "thread-withdraw",
         }
+    }
+
+    fn has_body(self) -> bool {
+        matches!(self, Kind::ThreadPut | Kind::ThreadSend)
+    }
+
+    fn has_id(self) -> bool {
+        matches!(self, Kind::ThreadSend | Kind::ThreadWithdraw)
     }
 }
 
@@ -172,13 +228,26 @@ pub fn encode(m: &Message) -> String {
             line("at", &at.to_string());
             line("key", key);
         }
+        Message::ThreadSend { at, key, id, body } => {
+            line("kind", Kind::ThreadSend.as_str());
+            line("at", &at.to_string());
+            line("key", key);
+            line("id", id);
+            line("body", body);
+        }
+        Message::ThreadWithdraw { at, key, id } => {
+            line("kind", Kind::ThreadWithdraw.as_str());
+            line("at", &at.to_string());
+            line("key", key);
+            line("id", id);
+        }
     }
     out
 }
 
 pub fn decode(text: &str) -> Result<Message, String> {
     let (mut kind, mut level, mut at) = (None, None, None);
-    let (mut key, mut link, mut msg, mut body) = (None, None, None, None);
+    let (mut key, mut link, mut msg, mut body, mut id) = (None, None, None, None, None);
     for (n, line) in text.split('\n').enumerate() {
         if line.is_empty() {
             continue;
@@ -189,11 +258,10 @@ pub fn decode(text: &str) -> Result<Message, String> {
         let repeated = || err(format!("repeated `{name}`"));
         match name {
             "kind" => {
-                let k = match value.as_str() {
-                    "thread-put" => Kind::ThreadPut,
-                    "thread-rm" => Kind::ThreadRm,
-                    _ => return Err(err(format!("bad kind `{value}`"))),
-                };
+                let k = Kind::ALL
+                    .into_iter()
+                    .find(|k| k.as_str() == value)
+                    .ok_or_else(|| err(format!("bad kind `{value}`")))?;
                 if kind.replace(k).is_some() {
                     return Err(repeated());
                 }
@@ -210,11 +278,12 @@ pub fn decode(text: &str) -> Result<Message, String> {
                     return Err(repeated());
                 }
             }
-            "key" | "link" | "msg" | "body" => {
+            "key" | "link" | "msg" | "body" | "id" => {
                 let slot = match name {
                     "key" => &mut key,
                     "link" => &mut link,
                     "msg" => &mut msg,
+                    "id" => &mut id,
                     _ => &mut body,
                 };
                 if slot.replace(value).is_some() {
@@ -228,7 +297,10 @@ pub fn decode(text: &str) -> Result<Message, String> {
     let at = at.ok_or_else(|| missing("at"))?;
     let Some(kind) = kind else {
         if body.is_some() {
-            return Err("`body` needs `kind thread-put`".into());
+            return Err("`body` needs `kind thread-put|thread-send`".into());
+        }
+        if id.is_some() {
+            return Err("`id` needs `kind thread-send|thread-withdraw`".into());
         }
         return Ok(Message::Notify(Record {
             level: level.ok_or_else(|| missing("level"))?,
@@ -245,12 +317,23 @@ pub fn decode(text: &str) -> Result<Message, String> {
             return Err(format!("`{name}` is not allowed on a `{}` record", kind.as_str()));
         }
     }
-    let key = key.ok_or_else(|| missing("key"))?;
-    match kind {
-        Kind::ThreadPut => Ok(Message::ThreadPut { at, key, body: body.ok_or_else(|| missing("body"))? }),
-        Kind::ThreadRm if body.is_some() => Err("`body` is not allowed on a `thread-rm` record".into()),
-        Kind::ThreadRm => Ok(Message::ThreadRm { at, key }),
+    for (name, present, allowed) in [("body", body.is_some(), kind.has_body()), ("id", id.is_some(), kind.has_id())] {
+        if present && !allowed {
+            return Err(format!("`{name}` is not allowed on a `{}` record", kind.as_str()));
+        }
     }
+    let key = key.ok_or_else(|| missing("key"))?;
+    let body = || body.ok_or_else(|| missing("body"));
+    let id = || id.clone().ok_or_else(|| missing("id"));
+    Ok(match kind {
+        Kind::ThreadPut => Message::ThreadPut { at, key, body: body()? },
+        Kind::ThreadRm => Message::ThreadRm { at, key },
+        Kind::ThreadSend => {
+            let id = id()?;
+            Message::ThreadSend { at, key, id, body: body()? }
+        }
+        Kind::ThreadWithdraw => Message::ThreadWithdraw { at, key, id: id()? },
+    })
 }
 
 #[cfg(test)]
@@ -307,11 +390,90 @@ body {\"key\":\"pr-123\",\"title\":\"a\\nb\"}\n";
         assert_eq!(decode(RM_FIXTURE), Ok(rm.clone()));
         // Accessors the outbox and the host route on.
         assert_eq!((put_fixture().at(), put_fixture().key()), (1_790_000_000, Some("pr-123")));
-        assert!(put_fixture().is_thread_op_for("pr-123"));
-        assert!(rm.is_thread_op_for("pr-123"));
-        assert!(!rm.is_thread_op_for("pr-124"));
+        assert!(put_fixture().supersedes(&put_fixture()));
+        assert!(rm.supersedes(&put_fixture()));
+        assert!(rm.supersedes(&rm));
+        assert!(!Message::ThreadRm { at: 1, key: "pr-124".into() }.supersedes(&put_fixture()));
+        // rm then put is a fresh thread: the put keeps the rm.
+        assert!(!put_fixture().supersedes(&rm));
         // A notify record with the same key is a log entry, never coalesced.
-        assert!(!fixture().is_thread_op_for("pr-123"));
+        assert!(!put_fixture().supersedes(&fixture()));
+        assert!(!rm.supersedes(&fixture()));
+        assert!(!fixture().supersedes(&fixture()));
+    }
+
+    const SEND_FIXTURE: &str = "kind thread-send\n\
+at 1790000000\n\
+key pr-123\n\
+id run-1\n\
+body {\"thread\":\"pr-123\",\"id\":\"run-1\",\"blocks\":[]}\n";
+
+    const WITHDRAW_FIXTURE: &str = "kind thread-withdraw\nat 1790000000\nkey pr-123\nid run-1\n";
+
+    fn send(key: &str, id: &str) -> Message {
+        Message::ThreadSend {
+            at: 1_790_000_000,
+            key: key.into(),
+            id: id.into(),
+            body: format!("{{\"thread\":\"{key}\",\"id\":\"{id}\",\"blocks\":[]}}"),
+        }
+    }
+
+    fn withdraw(key: &str, id: &str) -> Message {
+        Message::ThreadWithdraw { at: 1_790_000_000, key: key.into(), id: id.into() }
+    }
+
+    #[test]
+    fn message_fixtures_round_trip() {
+        assert_eq!(encode(&send("pr-123", "run-1")), SEND_FIXTURE);
+        assert_eq!(decode(SEND_FIXTURE), Ok(send("pr-123", "run-1")));
+        assert_eq!(encode(&withdraw("pr-123", "run-1")), WITHDRAW_FIXTURE);
+        assert_eq!(decode(WITHDRAW_FIXTURE), Ok(withdraw("pr-123", "run-1")));
+        assert_eq!((send("pr-123", "a").at(), send("pr-123", "a").key()), (1_790_000_000, Some("pr-123")));
+        assert_eq!(withdraw("pr-9", "a").key(), Some("pr-9"));
+    }
+
+    #[test]
+    fn messages_coalesce_per_thread_and_id() {
+        let (s, w) = (send("t", "a"), withdraw("t", "a"));
+        // Same (thread, id): the newer send or withdraw wins, either way round.
+        assert!(s.supersedes(&send("t", "a")));
+        assert!(w.supersedes(&s));
+        assert!(s.supersedes(&w));
+        assert!(w.supersedes(&w));
+        // Another id or another thread: both kept, in order.
+        assert!(!s.supersedes(&send("t", "b")));
+        assert!(!s.supersedes(&send("u", "a")));
+        assert!(!w.supersedes(&send("t", "b")));
+        // Headers and messages don't replace each other, except an rm,
+        // which takes the thread's messages with it.
+        let put = Message::ThreadPut { at: 1, key: "t".into(), body: "{}".into() };
+        let rm = Message::ThreadRm { at: 1, key: "t".into() };
+        assert!(!put.supersedes(&s));
+        assert!(!s.supersedes(&put));
+        assert!(!s.supersedes(&rm));
+        assert!(rm.supersedes(&s));
+        assert!(rm.supersedes(&w));
+        assert!(!Message::ThreadRm { at: 1, key: "u".into() }.supersedes(&s));
+    }
+
+    #[test]
+    fn rejects_malformed_message_records() {
+        assert!(decode("kind thread-send\nat 1\nkey k\nbody {}\n").unwrap_err().contains("missing `id`"));
+        assert!(decode("kind thread-send\nat 1\nkey k\nid a\n").unwrap_err().contains("missing `body`"));
+        assert!(decode("kind thread-withdraw\nat 1\nkey k\n").unwrap_err().contains("missing `id`"));
+        assert!(decode("kind thread-withdraw\nat 1\nid a\n").unwrap_err().contains("missing `key`"));
+        let err = decode("kind thread-withdraw\nat 1\nkey k\nid a\nbody {}\n").unwrap_err();
+        assert!(err.contains("`body` is not allowed on a `thread-withdraw` record"), "{err}");
+        let err = decode("kind thread-put\nat 1\nkey k\nid a\nbody {}\n").unwrap_err();
+        assert!(err.contains("`id` is not allowed on a `thread-put` record"), "{err}");
+        assert!(decode("kind thread-rm\nat 1\nkey k\nid a\n").unwrap_err().contains("`id` is not allowed"));
+        assert!(decode("level info\nat 1\nmsg hi\nid a\n").unwrap_err().contains("`id` needs"));
+        assert!(decode(&format!("{SEND_FIXTURE}id b\n")).unwrap_err().contains("repeated `id`"));
+        for bad in ["level info", "link https://x", "msg hi"] {
+            let err = decode(&format!("{WITHDRAW_FIXTURE}{bad}\n")).unwrap_err();
+            assert!(err.contains("is not allowed on a `thread-withdraw` record"), "{bad}: {err}");
+        }
     }
 
     #[test]

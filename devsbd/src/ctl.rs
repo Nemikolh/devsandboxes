@@ -32,7 +32,7 @@ const USAGE: &str = "usage: devsbd ensure <sandbox> --key <key> [--branch B] [--
        devsbd run prune <key> [--sandbox S] [--keep N]\n\
        devsbd events [--wait SECS]\n\
        devsbd events ack <id>...\n\
-       devsbd thread ls";
+       devsbd thread ls [--feed]";
 
 /// `devsbd run <sub>` forms that name a child (`run_remote`); each is the
 /// [`Op`] `run-<sub>`.
@@ -125,6 +125,7 @@ fn parse_args(verb: &str, args: &[String]) -> Result<Cmd, String> {
             (Op::Ensure, "--key" | "--branch" | "--env") => true,
             (Op::Branches, "--ahead") => true,
             (Op::Events, "--wait") => true,
+            (Op::ThreadLs, "--feed") => true,
             (Op::Ls | Op::Ensure | Op::Branches | Op::Events | Op::EventsAck | Op::ThreadLs, _) => false,
             (_, "--sandbox") => true,
             (Op::Exec, "--detach" | "--") => true,
@@ -143,13 +144,14 @@ fn parse_args(verb: &str, args: &[String]) -> Result<Cmd, String> {
                 dashdash = true;
                 break;
             }
-            "--detach" | "--follow" | "--force" | "--ahead" if inline.is_some() => {
+            "--detach" | "--follow" | "--force" | "--ahead" | "--feed" if inline.is_some() => {
                 return Err(format!("{flag} takes no value"));
             }
             "--detach" => cmd.detach = true,
             "--follow" => cmd.follow = true,
             "--force" => req.force = true,
             "--ahead" => req.ahead = true,
+            "--feed" => req.feed = true,
             "--keep" => {
                 let v = value()?;
                 let n = v.parse().map_err(|_| format!("--keep: bad number `{v}`"))?;
@@ -523,6 +525,12 @@ mod tests {
         assert_eq!(parse("events-ack", &[e1, "--wait", "1"]).unwrap_err(), "unknown option `--wait`");
         assert_eq!(parse("thread-ls", &["k"]).unwrap_err(), "takes no arguments");
         assert_eq!(parse("thread-ls", &["--key", "k"]).unwrap_err(), "unknown option `--key`");
+        let feed = parse("thread-ls", &["--feed"]).unwrap();
+        assert_eq!(feed, Request { feed: true, ..Request::new(Op::ThreadLs) });
+        assert_eq!(control::decode_request(&control::encode_request(&feed)), Ok(feed));
+        assert_eq!(parse("thread-ls", &["--feed=1"]).unwrap_err(), "--feed takes no value");
+        assert_eq!(parse("events", &["--feed"]).unwrap_err(), "unknown option `--feed`");
+        assert_eq!(parse("ls", &["--feed"]).unwrap_err(), "unknown option `--feed`");
     }
 
     /// `events` prints the body as is (one JSON line per event), nothing

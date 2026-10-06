@@ -22,7 +22,7 @@ use super::State;
 /// Feed items kept per thread; past it, [`cap`] drops the least valuable.
 pub const MAX_FEED: usize = 300;
 
-/// v2 put compat, removed in step 13: the id of the message a v2 put's
+/// v2 put compat, removed in step 13b: the id of the message a v2 put's
 /// `message` field becomes, replaced in place as the field changes.
 pub const HEADER_MESSAGE: &str = "header-message";
 
@@ -57,12 +57,22 @@ pub enum ItemKind {
     Marker(Marker),
 }
 
-/// A message block. Only markdown so far; `fields` arrives with `thread
-/// send` (step 13), `form` with forms (step 15).
+/// A message block (docs/inbox-redesign.md, *Messages*); `form` arrives with
+/// forms (step 15). Serialized in the same shape `thread send` takes, so
+/// `thread ls --feed` hands an owner back what it sent.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Block {
     Markdown { text: String },
+    /// A compact key/value list.
+    Fields { items: Vec<Field> },
+}
+
+/// One row of a [`Block::Fields`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Field {
+    pub label: String,
+    pub value: String,
 }
 
 /// A one-line feed item. Done/Reopen are the user's (with the client),
@@ -92,11 +102,69 @@ impl FeedItem {
     }
 }
 
-/// A message's markdown, blocks joined by a blank line.
+/// A message's markdown blocks joined by a blank line (other blocks left
+/// out): the header message's text, and a message's one-line summary.
 pub fn markdown_of(blocks: &[Block]) -> String {
-    blocks.iter().map(|b| match b {
-        Block::Markdown { text } => text.as_str(),
-    }).collect::<Vec<_>>().join("\n\n")
+    blocks
+        .iter()
+        .filter_map(|b| match b {
+            Block::Markdown { text } => Some(text.as_str()),
+            Block::Fields { .. } => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// What a `thread send` did to the feed ([`send`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sent {
+    /// Same id, same blocks, not withdrawn: nothing to do.
+    Unchanged,
+    /// Same id, replaced in place (`edited`), or a withdrawn one sent again.
+    Edited,
+    /// A new id, appended.
+    Inserted,
+}
+
+/// Apply owner message `id` with `blocks` (docs/inbox-redesign.md,
+/// *Messages*): the id is the owner's idempotency key, so the same content is
+/// a no-op, other content replaces the message in place (its `seq`, `at` and
+/// feed position stay: order is first-insert order) and tags it `edited`.
+/// A withdrawn message sent again comes back, replaced and `edited` even with
+/// the same blocks: it was gone from the reader's view, so it changed. `seq`
+/// is only called for an insert, so a no-op mints no id.
+pub fn send(feed: &mut Vec<FeedItem>, id: &str, blocks: Vec<Block>, seq: impl FnOnce() -> u64, at: u64) -> Sent {
+    let existing = feed.iter_mut().find_map(|i| match &mut i.kind {
+        ItemKind::Message { id: have, blocks, edited, withdrawn } if have == id => Some((blocks, edited, withdrawn)),
+        _ => None,
+    });
+    match existing {
+        Some((have, _, withdrawn)) if *have == blocks && !*withdrawn => Sent::Unchanged,
+        Some((have, edited, withdrawn)) => {
+            *have = blocks;
+            *edited = true;
+            *withdrawn = false;
+            Sent::Edited
+        }
+        None => {
+            let kind = ItemKind::Message { id: id.to_string(), blocks, edited: false, withdrawn: false };
+            push(feed, FeedItem { seq: seq(), at, kind });
+            Sent::Inserted
+        }
+    }
+}
+
+/// Withdraw owner message `id`: tagged `withdrawn` and kept, so the story
+/// stays readable. Whether anything changed (an unknown or already withdrawn
+/// id is a no-op).
+pub fn withdraw(feed: &mut [FeedItem], id: &str) -> bool {
+    feed.iter_mut().any(|i| match &mut i.kind {
+        ItemKind::Message { id: have, withdrawn, .. } if have == id && !*withdrawn => {
+            *withdrawn = true;
+            true
+        }
+        _ => false,
+    })
 }
 
 /// Append `item`, collapsing status changes: a status marker right after
@@ -139,7 +207,7 @@ pub fn cap(feed: &mut Vec<FeedItem>, max: usize) {
 }
 
 /// The text of the [`HEADER_MESSAGE`] item, when present and not withdrawn.
-/// v2 put compat, removed in step 13.
+/// v2 put compat, removed in step 13b.
 pub fn header_message(feed: &[FeedItem]) -> Option<String> {
     feed.iter().find_map(|i| match &i.kind {
         ItemKind::Message { id, blocks, withdrawn: false, .. } if id == HEADER_MESSAGE => Some(markdown_of(blocks)),
@@ -148,7 +216,7 @@ pub fn header_message(feed: &[FeedItem]) -> Option<String> {
 }
 
 /// What a v2 put's `message` does to the feed. v2 put compat, removed in
-/// step 13.
+/// step 13b.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HeaderChange {
     Unchanged,
@@ -161,7 +229,7 @@ pub enum HeaderChange {
 }
 
 /// Decide [`HeaderChange`] for a put whose `message` is `want` (empty counts
-/// as absent). v2 put compat, removed in step 13.
+/// as absent). v2 put compat, removed in step 13b.
 pub fn header_change(feed: &[FeedItem], want: Option<&str>) -> HeaderChange {
     let want = want.filter(|m| !m.trim().is_empty());
     let current = feed.iter().find_map(|i| match &i.kind {
@@ -179,7 +247,7 @@ pub fn header_change(feed: &[FeedItem], want: Option<&str>) -> HeaderChange {
 }
 
 /// Apply a [`HeaderChange`]; `seq`/`at` stamp an inserted item. v2 put
-/// compat, removed in step 13.
+/// compat, removed in step 13b.
 pub fn apply_header_change(feed: &mut Vec<FeedItem>, change: HeaderChange, seq: u64, at: u64) {
     let item = feed.iter_mut().find_map(|i| match &mut i.kind {
         ItemKind::Message { id, blocks, edited, withdrawn } if id == HEADER_MESSAGE => Some((blocks, edited, withdrawn)),
@@ -325,9 +393,65 @@ mod tests {
         assert_eq!(header_message(&feed).as_deref(), Some("two"));
     }
 
+    fn md(text: &str) -> Vec<Block> {
+        vec![Block::Markdown { text: text.into() }]
+    }
+
+    fn message(feed: &[FeedItem], id: &str) -> (u64, u64, Vec<Block>, bool, bool) {
+        feed.iter()
+            .find_map(|i| match &i.kind {
+                ItemKind::Message { id: have, blocks, edited, withdrawn } if have == id => {
+                    Some((i.seq, i.at, blocks.clone(), *edited, *withdrawn))
+                }
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn send_inserts_edits_in_place_and_ignores_repeats() {
+        let mut feed = vec![reply(1)];
+        assert_eq!(send(&mut feed, "a", md("one"), || 2, 20), Sent::Inserted);
+        assert_eq!(send(&mut feed, "b", md("two"), || 3, 30), Sent::Inserted);
+        // Same content: nothing, and no id minted.
+        assert_eq!(send(&mut feed, "a", md("one"), || panic!("minted"), 40), Sent::Unchanged);
+        // New content: replaced in place, first-insert seq/time/position kept.
+        assert_eq!(send(&mut feed, "a", md("uno"), || panic!("minted"), 50), Sent::Edited);
+        assert_eq!(message(&feed, "a"), (2, 20, md("uno"), true, false));
+        assert_eq!(feed.iter().map(|i| i.seq).collect::<Vec<_>>(), [1, 2, 3]);
+        // The edited content again is a no-op too.
+        assert_eq!(send(&mut feed, "a", md("uno"), || panic!("minted"), 60), Sent::Unchanged);
+    }
+
+    #[test]
+    fn withdraw_keeps_the_message_and_a_resend_brings_it_back() {
+        let mut feed = Vec::new();
+        send(&mut feed, "a", md("one"), || 1, 10);
+        assert!(!withdraw(&mut feed, "nope"), "an unknown id is a no-op");
+        assert!(withdraw(&mut feed, "a"));
+        assert!(!withdraw(&mut feed, "a"), "already withdrawn");
+        assert_eq!(message(&feed, "a"), (1, 10, md("one"), false, true));
+        // Sent again, same blocks: back, in place, and tagged edited.
+        assert_eq!(send(&mut feed, "a", md("one"), || panic!("minted"), 20), Sent::Edited);
+        assert_eq!(message(&feed, "a"), (1, 10, md("one"), true, false));
+        assert_eq!(feed.len(), 1);
+    }
+
+    #[test]
+    fn markdown_of_skips_fields() {
+        let blocks = vec![
+            Block::Markdown { text: "a".into() },
+            Block::Fields { items: vec![Field { label: "Head".into(), value: "36b1".into() }] },
+            Block::Markdown { text: "b".into() },
+        ];
+        assert_eq!(markdown_of(&blocks), "a\n\nb");
+    }
+
     #[test]
     fn store_shape_round_trips() {
+        let fields = vec![Block::Fields { items: vec![Field { label: "Head".into(), value: "36b1".into() }] }];
         let feed = vec![
+            FeedItem { seq: 8, at: 80, kind: ItemKind::Message { id: "f".into(), blocks: fields, edited: true, withdrawn: false } },
             FeedItem::markdown(1, 10, "m", "hi"),
             reply(2),
             FeedItem { seq: 3, at: 30, kind: ItemKind::Action { action: "go".into(), label: "Go".into(), client: "api:x".into() } },
@@ -338,6 +462,7 @@ mod tests {
         ];
         let json = serde_json::to_string(&feed).unwrap();
         assert!(json.contains(r#""kind":{"type":"marker","marker":"done","client":"cli"}"#), "{json}");
+        assert!(json.contains(r#""blocks":[{"type":"fields","items":[{"label":"Head","value":"36b1"}]}]"#), "{json}");
         assert_eq!(serde_json::from_str::<Vec<FeedItem>>(&json).unwrap(), feed);
     }
 }

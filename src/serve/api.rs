@@ -295,6 +295,15 @@ pub enum FeedItemView {
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum BlockView {
     Markdown { text: String },
+    /// A compact key/value list, in order.
+    Fields { items: Vec<FieldView> },
+}
+
+/// One row of a `fields` block.
+#[derive(Debug, Serialize)]
+pub struct FieldView {
+    pub label: String,
+    pub value: String,
 }
 
 impl FeedItemView {
@@ -309,6 +318,12 @@ impl FeedItemView {
                     .iter()
                     .map(|b| match b {
                         Block::Markdown { text } => BlockView::Markdown { text: text.clone() },
+                        Block::Fields { items } => BlockView::Fields {
+                            items: items
+                                .iter()
+                                .map(|f| FieldView { label: f.label.clone(), value: f.value.clone() })
+                                .collect(),
+                        },
                     })
                     .collect(),
                 edited: *edited,
@@ -1352,21 +1367,23 @@ mod tests {
         for (iface, value) in &cases {
             assert_matches(iface, value);
         }
+        assert_matches("MessageField", &v(&FieldView { label: "Head".into(), value: "36b1".into() }));
         // Tagged unions: one interface per variant, its `type` (and a
         // marker's `marker`) a literal the d.ts union is built from.
         let blocks = vec![BlockView::Markdown { text: "t".into() }];
-        let variants: [(&str, Value); 5] = [
+        let variants: [(&str, Value); 6] = [
             ("FeedMessage", v(&FeedItemView::Message { seq: 1, at: 1, id: "m".into(), blocks, edited: false, withdrawn: false })),
             ("FeedReply", v(&FeedItemView::Reply { seq: 1, at: 1, text: "t".into() })),
             ("FeedAction", v(&FeedItemView::Action { seq: 1, at: 1, action: "go".into(), label: "Go".into() })),
             ("FeedMarker", v(&FeedItemView::Marker { seq: 1, at: 1, marker: "done", from: None, to: None })),
             ("MarkdownBlock", v(&BlockView::Markdown { text: "t".into() })),
+            ("FieldsBlock", v(&BlockView::Fields { items: vec![FieldView { label: "l".into(), value: "v".into() }] })),
         ];
         for (iface, value) in &variants {
             assert_variant(iface, value);
         }
         assert_eq!(union_members("FeedItem"), ["FeedMessage", "FeedReply", "FeedAction", "FeedMarker"]);
-        assert_eq!(union_members("MessageBlock"), ["MarkdownBlock"]);
+        assert_eq!(union_members("MessageBlock"), ["MarkdownBlock", "FieldsBlock"]);
         assert_eq!(
             crate::serve::dts::prop_type("FeedMarker", "marker").as_deref(),
             Some("'done' | 'reopen' | 'state' | 'status'")

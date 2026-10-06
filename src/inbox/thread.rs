@@ -72,7 +72,7 @@ pub struct ThreadPut {
     /// Present when the thread takes replies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compose: Option<Compose>,
-    // v2 put compat, removed in step 13: `message` becomes the feed's
+    // v2 put compat, removed in step 13b: `message` becomes the feed's
     // `header-message` item, `reply` is `compose` without a hint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
@@ -82,7 +82,7 @@ pub struct ThreadPut {
 
 impl ThreadPut {
     /// The composer this put asks for: `compose`, else (v2 put compat,
-    /// removed in step 13) the old `reply`.
+    /// removed in step 13b) the old `reply`.
     pub fn compose(&self) -> Option<Compose> {
         self.compose
             .clone()
@@ -163,7 +163,7 @@ pub struct Open {
     pub url: String,
 }
 
-/// v2 put compat, removed in step 13: the old name of [`Compose`].
+/// v2 put compat, removed in step 13b: the old name of [`Compose`].
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Reply {
@@ -272,7 +272,7 @@ fn valid_action_id(id: &str) -> bool {
         && id.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
 }
 
-fn check_key(field: &str, key: &str) -> Result<(), String> {
+pub(super) fn check_key(field: &str, key: &str) -> Result<(), String> {
     if valid_key(key) {
         return Ok(());
     }
@@ -282,7 +282,7 @@ fn check_key(field: &str, key: &str) -> Result<(), String> {
     ))
 }
 
-fn check_text(field: &str, value: &str, max: usize) -> Result<(), String> {
+pub(super) fn check_text(field: &str, value: &str, max: usize) -> Result<(), String> {
     if value.len() > max {
         return Err(format!("`{field}` is longer than {max} bytes"));
     }

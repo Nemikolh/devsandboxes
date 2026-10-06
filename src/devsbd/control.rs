@@ -22,6 +22,7 @@
 //! keep 5                optional, at most once: decimal count of runs to keep
 //! ahead                 optional, at most once, no value: a flag (`branches --ahead`)
 //! ack e-1790900001-3f2a optional, repeatable: an event id to ack (see `valid_event_id`)
+//! feed                  optional, at most once, no value: a flag (`thread ls --feed`)
 //! ```
 //!
 //! Which fields an op needs is the host handler's call (`commands::dispatch`),
@@ -49,7 +50,8 @@
 //! are left out when absent; `at` is RFC 3339 UTC. With a `timeout`, an empty
 //! queue is waited on up to that many seconds (at most [`MAX_WAIT`]); the
 //! body stays empty if nothing arrives. `thread-ls` answers the requester's
-//! live threads in `thread put` shape.
+//! live threads in `thread put` shape; with `feed`, each also carries
+//! `"messages"`: the owner's messages, `{id, at, blocks, edited, withdrawn}`.
 //!
 //! Unknown keys, repeats of a non-repeatable key, a missing required key, or
 //! a bad escape are decode errors.
@@ -187,6 +189,18 @@ pub fn valid_key(key: &str) -> bool {
         && chars.all(|c| lower_alnum(c) || c == '-')
 }
 
+/// Longest accepted message id (`devsbd thread send|withdraw`).
+pub const MAX_MESSAGE_ID: usize = 60;
+
+/// `[a-z0-9-]{1,60}`: a message's id, the owner's idempotency key in its
+/// thread (docs/inbox-redesign.md, *Messages*). Only ever a JSON value and a
+/// store field, never a name or a path, so a leading `-` is harmless. Checked
+/// by the helper before queuing and by the host's schema.
+pub fn valid_message_id(id: &str) -> bool {
+    (1..=MAX_MESSAGE_ID).contains(&id.len())
+        && id.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+}
+
 /// Longest branch name [`valid_branch`] accepts.
 pub const MAX_BRANCH: usize = 200;
 
@@ -225,6 +239,7 @@ pub struct Request {
     pub keep: Option<u64>,
     pub ahead: bool,
     pub ack: Vec<String>,
+    pub feed: bool,
 }
 
 impl Request {
@@ -244,6 +259,7 @@ impl Request {
             keep: None,
             ahead: false,
             ack: Vec::new(),
+            feed: false,
         }
     }
 }
@@ -410,6 +426,9 @@ pub fn encode_request(r: &Request) -> String {
     for id in &r.ack {
         line(&mut out, "ack", id);
     }
+    if r.feed {
+        out.push_str("feed\n");
+    }
     out
 }
 
@@ -417,7 +436,7 @@ pub fn decode_request(text: &str) -> Result<Request, String> {
     let (mut op, mut sandbox, mut key, mut branch) = (None, None, None, None);
     let mut env = Vec::new();
     let (mut argv, mut id, mut offset, mut timeout) = (Vec::new(), None, None, None);
-    let (mut force, mut keep, mut ahead) = (None, None, None);
+    let (mut force, mut keep, mut ahead, mut feed) = (None, None, None, None);
     let mut ack = Vec::new();
     for d in directives(text) {
         let (n, name, value) = d?;
@@ -442,6 +461,8 @@ pub fn decode_request(text: &str) -> Result<Request, String> {
             "ahead" if value.is_empty() => set_once(&mut ahead, (), n, name)?,
             "ahead" => return Err(format!("line {n}: `ahead` takes no value")),
             "ack" => ack.push(value),
+            "feed" if value.is_empty() => set_once(&mut feed, (), n, name)?,
+            "feed" => return Err(format!("line {n}: `feed` takes no value")),
             other => return Err(format!("line {n}: unknown key `{other}`")),
         }
     }
@@ -459,6 +480,7 @@ pub fn decode_request(text: &str) -> Result<Request, String> {
         keep,
         ahead: ahead.is_some(),
         ack,
+        feed: feed.is_some(),
     })
 }
 
@@ -601,6 +623,11 @@ timeout 5\n";
         assert_eq!(encode_request(&wait), "op events\ntimeout 300\n");
         assert_eq!(decode_request("op events\ntimeout 300\n"), Ok(wait));
         assert_eq!(decode_request("op thread-ls\n"), Ok(Request::new(Op::ThreadLs)));
+        let feed = Request { feed: true, ..Request::new(Op::ThreadLs) };
+        assert_eq!(encode_request(&feed), "op thread-ls\nfeed\n");
+        assert_eq!(decode_request("op thread-ls\nfeed\n"), Ok(feed));
+        assert!(decode_request("op thread-ls\nfeed 1\n").unwrap_err().contains("takes no value"));
+        assert!(decode_request("op thread-ls\nfeed\nfeed\n").unwrap_err().contains("repeated `feed`"));
         // The codec only carries the ids; their shape is the host's check.
         assert_eq!(decode_request("op events-ack\nack x\n").map(|r| r.ack), Ok(vec!["x".to_string()]));
     }
@@ -741,6 +768,16 @@ keep 5\n";
         }
         for bad in ["", "-a", "PR-1", "a_b", "a.b", "a/b", "a b", "é", &"x".repeat(MAX_KEY + 1)] {
             assert!(!valid_key(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn message_ids() {
+        for good in ["a", "0", "-", "run-1791277117", &"x".repeat(MAX_MESSAGE_ID)] {
+            assert!(valid_message_id(good), "{good}");
+        }
+        for bad in ["", "A", "a_b", "a.b", "a/b", "a b", "é", &"x".repeat(MAX_MESSAGE_ID + 1)] {
+            assert!(!valid_message_id(bad), "{bad}");
         }
     }
 

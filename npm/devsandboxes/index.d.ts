@@ -433,12 +433,24 @@ export interface FeedMarker extends FeedItemBase {
 }
 
 /** One block of a message, by `type`. */
-export type MessageBlock = MarkdownBlock;
+export type MessageBlock = MarkdownBlock | FieldsBlock;
 
 /** Markdown text. */
 export interface MarkdownBlock {
   type: 'markdown';
   text: string;
+}
+
+/** A compact key/value list, shown as aligned `label  value` rows. */
+export interface FieldsBlock {
+  type: 'fields';
+  items: MessageField[];
+}
+
+/** One row of a `fields` block. */
+export interface MessageField {
+  label: string;
+  value: string;
 }
 
 /** One record of a notification thread. */

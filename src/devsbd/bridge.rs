@@ -1740,6 +1740,62 @@ mod tests {
         })
     }
 
+    /// Docker-gated: `devsbd thread send|withdraw` queue with no host, coalesce
+    /// per `(thread, id)` in place (cross-id order kept), and arrive after the
+    /// put they need; a bad id is a usage error that never queues; `devsbd
+    /// features` advertises the verbs.
+    #[test_utils::docker_test(helper)]
+    fn coalesces_queued_thread_sends_with_docker() -> Result<(), &'static str> {
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let name = format!("devsandbox-send-test-{stamp}");
+        let cleanup = || {
+            let _ = Command::new("docker").args(["rm", "-f", &name]).output();
+        };
+        crate::test_support::with_cleanup(cleanup, || {
+            assert!(ok(Command::new("docker").args(["run", "-d", "--name", &name, "alpine:3.20", "sleep", "300"])));
+            let arch = install(&name, None).unwrap();
+            start_daemon(&name);
+            let devsbd = |args: &[&str]| Command::new("docker").args(["exec", &name, BIN]).args(args).output().unwrap();
+
+            let features = devsbd(&["features"]);
+            assert!(String::from_utf8_lossy(&features.stdout).lines().any(|l| l == "thread-send"), "{features:?}");
+
+            let put = r#"{"key":"pr-1","title":"PR 1","state":"active"}"#;
+            assert!(devsbd(&["thread", "put", "--json", put]).status.success());
+            let send = |id: &str, text: &str| {
+                let json = format!(r#"{{"thread":"pr-1","id":"{id}","blocks":[{{"type":"markdown","text":"{text}"}}]}}"#);
+                devsbd(&["thread", "send", "--json", &json])
+            };
+            assert!(send("a", "a1").status.success());
+            assert!(send("b", "b1").status.success());
+            assert!(send("a", "a2").status.success());
+            assert!(devsbd(&["thread", "withdraw", "pr-1", "b"]).status.success());
+            let bad = send("Bad", "x");
+            assert_eq!(bad.status.code(), Some(2), "{bad:?}");
+            assert!(String::from_utf8_lossy(&bad.stderr).contains("bad id `Bad`"), "{bad:?}");
+            let count = format!("ls -A {} | wc -l", notify::OUTBOX);
+            let out = Command::new("docker").args(["exec", &name, "sh", "-c", &count]).output().unwrap();
+            assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "3", "put, send a, withdraw b");
+
+            let (to, rx) = services("send-test", no_control());
+            let none: Option<fn() -> Option<PathBuf>> = None;
+            let bridge = spawn_with(&name, hash(arch).unwrap(), none, Some(to)).unwrap();
+            assert_eq!(bridge.outcome(Duration::from_secs(10)), Some(Ok(())), "bridge handshake");
+            let mut got = Vec::new();
+            for _ in 0..3 {
+                got.push(rx.recv_timeout(Duration::from_secs(15)).expect("record delivered").message);
+            }
+            assert!(matches!(&got[0], notify::Message::ThreadPut { key, .. } if key == "pr-1"), "{got:?}");
+            assert!(
+                matches!(&got[1], notify::Message::ThreadSend { key, id, body, .. } if key == "pr-1" && id == "a" && body.contains("a2")),
+                "a's newest body, ahead of b: {got:?}"
+            );
+            assert!(matches!(&got[2], notify::Message::ThreadWithdraw { id, .. } if id == "b"), "{got:?}");
+            assert!(rx.recv_timeout(Duration::from_secs(2)).is_err(), "nothing else arrived");
+            Ok(())
+        })
+    }
+
     /// Docker-gated end to end: `devsbd ensure` in a container reaches a
     /// sink-bearing bridge's control handler (a stub, so no real state is
     /// touched) and prints its answer; with no bridge it exits 75.

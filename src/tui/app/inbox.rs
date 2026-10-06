@@ -253,6 +253,21 @@ fn line(tone: Tone, text: impl Into<String>) -> PaneLine {
     vec![(tone, text.into())]
 }
 
+/// A `fields` block as `label  value` rows, labels padded to the widest one
+/// (display columns, so wide glyphs line up). Minimal until the pane's v3
+/// layout (step 14) restyles it.
+fn field_rows(items: &[feed::Field]) -> Vec<PaneLine> {
+    let cols = |s: &str| ratatui::text::Span::raw(s).width();
+    let width = items.iter().map(|f| cols(&f.label)).max().unwrap_or(0);
+    items
+        .iter()
+        .map(|f| {
+            let pad = " ".repeat(width - cols(&f.label) + 2);
+            vec![(Tone::Dim, format!("{}{pad}", f.label)), (Tone::Plain, f.value.clone())]
+        })
+        .collect()
+}
+
 /// A thread's state chip, the one source of its text for the card and the
 /// pane head: a dispatcher thread's state marker with its status (inline
 /// markdown) or, without one, the state's name; a notify thread's level.
@@ -335,7 +350,12 @@ fn feed_lines(t: &Thread, utc_offset: i64) -> Vec<PaneLine> {
                 };
                 out.push(line(Tone::Dim, format!("{at}  {}{tag}", t.owner_name)));
                 if !withdrawn {
-                    out.push(line(Tone::Markdown, feed::markdown_of(blocks)));
+                    for block in blocks {
+                        match block {
+                            feed::Block::Markdown { text } => out.push(line(Tone::Markdown, text.clone())),
+                            feed::Block::Fields { items } => out.extend(field_rows(items)),
+                        }
+                    }
                 }
             }
             ItemKind::Reply { text, .. } => {
@@ -1000,6 +1020,16 @@ mod tests {
     use crate::devsbd::notify::Record;
     use crate::inbox::{Action, Compose, ThreadPut};
 
+    #[test]
+    fn fields_render_as_aligned_rows() {
+        let f = |label: &str, value: &str| feed::Field { label: label.into(), value: value.into() };
+        let rows = field_rows(&[f("Head", "36b13d41"), f("CI", "green"), f("界面", "wide")]);
+        let text: Vec<String> = rows.iter().map(|r| r.iter().map(|(_, s)| s.as_str()).collect()).collect();
+        // Values start in one column; the CJK label counts as 4 cells.
+        assert_eq!(text, ["Head  36b13d41", "CI    green", "界面  wide"]);
+        assert_eq!(rows[0], vec![(Tone::Dim, "Head  ".to_string()), (Tone::Plain, "36b13d41".to_string())]);
+    }
+
     fn rec(msg: &str, key: Option<&str>, link: Option<&str>) -> Record {
         Record {
             level: Level::Info,
@@ -1495,7 +1525,7 @@ mod tests {
             link: Some("https://x/pr/1".into()),
             status: Some("review".into()),
             child: Some("pr-1".into()),
-            // v2 put compat, removed in step 13: the header message.
+            // v2 put compat, removed in step 13b: the header message.
             message: Some("drafts ready".into()),
             actions,
             compose: Some(Compose { placeholder: Some("next run".into()), hint: Some("starts a run".into()) }),

@@ -150,7 +150,7 @@ Each item has `type`, `seq` (arrival order across the whole Inbox) and `at`
 
 | `type` | fields | |
 |---|---|---|
-| `message` | `id`, `blocks`, `edited`, `withdrawn` | from the owner; `blocks` is `[{"type":"markdown","text"}]`. `edited`: replaced in place since first sent; `withdrawn`: the owner took it back |
+| `message` | `id`, `blocks`, `edited`, `withdrawn` | from the owner (`devsbd thread send`); `blocks`, by `type`: `{"type":"markdown","text"}`, or `{"type":"fields","items":[{"label","value"}]}` (a key/value list, in order; clients show aligned `label  value` rows). `edited`: replaced in place since first sent; `withdrawn`: the owner took it back |
 | `reply` | `text` | the user's reply |
 | `action` | `action`, `label` | the user pressed an action (its id, its label then) |
 | `marker` | `marker`, `from`, `to` | one line: `done` / `reopen` by the user (`from`/`to` `null`), or the owner's `state` / `status` change (`from` → `to`, a status may be `null`). Consecutive status changes collapse into one marker |

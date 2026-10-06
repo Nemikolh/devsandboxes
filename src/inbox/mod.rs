@@ -30,6 +30,7 @@
 //! transition and the bridge's decision stay unit-testable without a store.
 
 pub mod feed;
+pub mod message;
 pub mod ops;
 pub mod sanitize;
 pub mod store;
@@ -42,7 +43,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::devsbd::notify::{Level, Message, Record};
 
-pub use feed::{Block, FeedItem, ItemKind, Marker, MAX_FEED};
+pub use feed::{Block, FeedItem, Field, ItemKind, Marker, MAX_FEED};
+pub use message::MessageSend;
 pub use sanitize::sanitize;
 pub use thread::{Action, Compose, Reply, State, ThreadPut};
 pub use view::View;
@@ -237,7 +239,7 @@ impl Thread {
             child: self.child.clone(),
             actions: self.actions.clone(),
             compose: self.compose.clone(),
-            // v2 put compat, removed in step 13: what a v2 dispatcher put.
+            // v2 put compat, removed in step 13b: what a v2 dispatcher put.
             message: feed::header_message(&self.feed),
             reply: self.compose.as_ref().map(|c| Reply { placeholder: c.placeholder.clone() }),
         }
@@ -367,7 +369,7 @@ impl Inbox {
                 ..Thread::default()
             };
             // No markers: nothing changed yet, the header says it all.
-            // v2 put compat, removed in step 13.
+            // v2 put compat, removed in step 13b.
             let header = feed::header_change(&thread.feed, put.message.as_deref());
             self.apply_header(&mut thread, header, at);
             apply_put(&mut thread, put, compose);
@@ -378,7 +380,7 @@ impl Inbox {
         };
 
         let old = &self.threads[pos];
-        // v2 put compat, removed in step 13.
+        // v2 put compat, removed in step 13b.
         let header = feed::header_change(&old.feed, put.message.as_deref());
         let state = old.state != Some(put.state);
         let status = old.status != put.status;
@@ -423,7 +425,7 @@ impl Inbox {
         PutOutcome::Applied { created: false, entered_needs_you: entered }
     }
 
-    /// v2 put compat, removed in step 13: apply what a put's `message` does
+    /// v2 put compat, removed in step 13b: apply what a put's `message` does
     /// to the `header-message` feed item.
     fn apply_header(&mut self, thread: &mut Thread, change: feed::HeaderChange, at: u64) {
         let seq = match change {
@@ -501,7 +503,7 @@ impl Inbox {
                     Some(status) => format!("{owner_name}: {} — {status}", put.title),
                     None => format!("{owner_name}: {}", put.title),
                 };
-                // v2 put compat, removed in step 13: the popup quotes the
+                // v2 put compat, removed in step 13b: the popup quotes the
                 // put's message.
                 let body = match &put.message {
                     Some(message) => format!("{}\n{message}", put.title),
@@ -521,6 +523,88 @@ impl Inbox {
                     }),
                 }
             }
+            SinkAction::Send { at, send } => {
+                let key = send.thread.clone();
+                let text = feed::markdown_of(&send.blocks);
+                match self.send(owner, at, send) {
+                    // Refused like a bad body: the owner's author sees why.
+                    None => {
+                        let why = format!("thread send rejected: no thread `{key}`; put it first");
+                        self.apply_sink(owner, owner_name, now, refused(at, &key, &why))
+                    }
+                    // A repeat is invisible; an edit is quiet (no unread, no
+                    // popup, no status line).
+                    Some(feed::Sent::Unchanged | feed::Sent::Edited) => None,
+                    Some(feed::Sent::Inserted) => {
+                        let t = self.owner_thread(owner, &key).map(|pos| &self.threads[pos])?;
+                        let summary = one_line(&text);
+                        let line = match summary.is_empty() {
+                            true => format!("{owner_name}: {}", t.title),
+                            false => format!("{owner_name}: {} — {summary}", t.title),
+                        };
+                        // A new message on a thread waiting on the user is
+                        // what earns a popup. step 15: a message bringing a
+                        // form also does, whatever the header says.
+                        let popup = (t.state == Some(State::NeedsYou)).then(|| ShownPopup {
+                            key: Some(format!("thread:{key}")),
+                            level: Level::Warn,
+                            body: match text.is_empty() {
+                                true => t.title.clone(),
+                                false => format!("{}\n{text}", t.title),
+                            },
+                        });
+                        Some(Shown { line, popup })
+                    }
+                }
+            }
+            SinkAction::Withdraw { thread, id } => {
+                self.withdraw(owner, &thread, &id);
+                None
+            }
+        }
+    }
+
+    /// Position of `owner`'s owner thread `key`.
+    fn owner_thread(&self, owner: &str, key: &str) -> Option<usize> {
+        self.threads
+            .iter()
+            .position(|t| t.owner == owner && t.kind == Kind::Thread && t.key.as_deref() == Some(key))
+    }
+
+    /// Apply one `devsbd thread send` from `owner`, at container time `at`
+    /// (the message's time if it's new, like a put's markers). `None` when
+    /// the owner has no such thread: a message needs its header first.
+    ///
+    /// See [`feed::send`] for insert / replace / no-op. A new message marks
+    /// the thread unread and moves it to the top; an edit leaves both alone
+    /// (it isn't news), only refreshing `updated_at` for retention.
+    pub fn send(&mut self, owner: &str, at: u64, send: MessageSend) -> Option<feed::Sent> {
+        let pos = self.owner_thread(owner, &send.thread)?;
+        let mut thread = self.threads.remove(pos);
+        let sent = feed::send(&mut thread.feed, &send.id, send.blocks, || self.next_id(), at);
+        match sent {
+            feed::Sent::Unchanged => self.threads.insert(pos, thread),
+            feed::Sent::Edited => {
+                thread.updated_at = thread.updated_at.max(at);
+                self.threads.insert(pos, thread);
+            }
+            feed::Sent::Inserted => {
+                feed::cap(&mut thread.feed, MAX_FEED);
+                thread.unread = true;
+                thread.updated_at = thread.updated_at.max(at);
+                self.threads.insert(0, thread);
+            }
+        }
+        Some(sent)
+    }
+
+    /// `devsbd thread withdraw <thread> <id>`: tag the message withdrawn,
+    /// keeping it. An unknown thread or id is a silent no-op (the owner may
+    /// be cleaning up after a send that never landed). Whether it changed.
+    pub fn withdraw(&mut self, owner: &str, thread: &str, id: &str) -> bool {
+        match self.owner_thread(owner, thread) {
+            Some(pos) => feed::withdraw(&mut self.threads[pos].feed, id),
+            None => false,
         }
     }
 
@@ -956,6 +1040,10 @@ pub enum SinkAction {
     Push(Record),
     Put { at: u64, put: ThreadPut },
     Rm { key: String },
+    /// `thread send`, schema-checked; the thread may still not exist (the
+    /// store is what knows, [`Inbox::apply_sink`]).
+    Send { at: u64, send: MessageSend },
+    Withdraw { thread: String, id: String },
 }
 
 /// Decide what to do with `message` from `instance` (its state key).
@@ -966,24 +1054,40 @@ pub enum SinkAction {
 /// instance, keyed by the thread, so the owner's author sees the reason
 /// in the Inbox instead of a message that quietly never appears.
 pub fn decide(instance: &str, declares_inbox: bool, message: Message) -> SinkAction {
-    let (at, key, body) = match message {
+    let message = match message {
         Message::Notify(record) => return SinkAction::Push(record),
-        Message::ThreadPut { at, key, body } => (at, key, Some(body)),
-        Message::ThreadRm { at, key } => (at, key, None),
+        thread_op => thread_op,
     };
-    let verb = if body.is_some() { "put" } else { "rm" };
+    let verb = match &message {
+        Message::Notify(_) => unreachable!("returned above"),
+        Message::ThreadPut { .. } => "put",
+        Message::ThreadRm { .. } => "rm",
+        Message::ThreadSend { .. } => "send",
+        Message::ThreadWithdraw { .. } => "withdraw",
+    };
+    let (at, key) = (message.at(), message.key().unwrap_or_default().to_string());
     if !declares_inbox {
         let why = format!("`{instance}` doesn't declare inbox = true (add it to the sandbox in devsandboxes.toml)");
         return refused(at, &key, &format!("thread {verb} denied: {why}"));
     }
-    let Some(body) = body else { return SinkAction::Rm { key } };
-    match thread::parse(&body) {
-        Ok(put) if put.key != key => {
-            let why = format!("body key `{}` is not the queued key", put.key);
-            refused(at, &key, &format!("thread put rejected: {why}"))
-        }
-        Ok(put) => SinkAction::Put { at, put },
-        Err(why) => refused(at, &key, &format!("thread put rejected: {why}")),
+    let rejected = |why: &str| refused(at, &key, &format!("thread {verb} rejected: {why}"));
+    match message {
+        Message::Notify(_) => unreachable!("returned above"),
+        Message::ThreadRm { key, .. } => SinkAction::Rm { key },
+        Message::ThreadWithdraw { key, id, .. } => SinkAction::Withdraw { thread: key, id },
+        Message::ThreadPut { body, .. } => match thread::parse(&body) {
+            Ok(put) if put.key != key => rejected(&format!("body key `{}` is not the queued key", put.key)),
+            Ok(put) => SinkAction::Put { at, put },
+            Err(why) => rejected(&why),
+        },
+        Message::ThreadSend { id, body, .. } => match message::parse(&body) {
+            Ok(send) if send.thread != key => {
+                rejected(&format!("body thread `{}` is not the queued thread", send.thread))
+            }
+            Ok(send) if send.id != id => rejected(&format!("body id `{}` is not the queued id", send.id)),
+            Ok(send) => SinkAction::Send { at, send },
+            Err(why) => rejected(&why),
+        },
     }
 }
 
@@ -1001,6 +1105,24 @@ fn sanitize_action(action: SinkAction) -> SinkAction {
             ..r
         }),
         SinkAction::Rm { key } => SinkAction::Rm { key: sanitize(&key) },
+        SinkAction::Withdraw { thread, id } => SinkAction::Withdraw { thread: sanitize(&thread), id: sanitize(&id) },
+        SinkAction::Send { at, send } => {
+            let blocks = send
+                .blocks
+                .into_iter()
+                .map(|b| match b {
+                    Block::Markdown { text } => Block::Markdown { text: sanitize(&text) },
+                    Block::Fields { items } => Block::Fields {
+                        items: items
+                            .into_iter()
+                            .map(|f| Field { label: sanitize(&f.label), value: sanitize(&f.value) })
+                            .collect(),
+                    },
+                })
+                .collect();
+            let send = MessageSend { thread: sanitize(&send.thread), id: sanitize(&send.id), blocks };
+            SinkAction::Send { at, send }
+        }
         SinkAction::Put { at, put } => {
             let actions = put
                 .actions
@@ -1022,7 +1144,7 @@ fn sanitize_action(action: SinkAction) -> SinkAction {
                 child: opt(put.child),
                 actions,
                 compose: put.compose.map(|c| Compose { placeholder: opt(c.placeholder), hint: opt(c.hint) }),
-                // v2 put compat, removed in step 13.
+                // v2 put compat, removed in step 13b.
                 message: opt(put.message),
                 reply: put.reply.map(|r| Reply { placeholder: opt(r.placeholder) }),
                 ..put
@@ -1320,7 +1442,7 @@ mod tests {
         assert_eq!(feed(find(&inbox, "pr-1").unwrap()), ["state active -> needs-you"]);
     }
 
-    /// v2 put compat, removed in step 13: `message` is the `header-message`
+    /// v2 put compat, removed in step 13b: `message` is the `header-message`
     /// feed item, `reply` is `compose`.
     #[test]
     fn a_v2_message_is_one_feed_item_replaced_in_place() {
@@ -1593,6 +1715,127 @@ mod tests {
         let put = ThreadPut { reply: Some(Reply { placeholder: Some("r\x1b".into()) }), ..put_body("pr-2") };
         inbox.apply_sink("web-id", "web", 1000, SinkAction::Put { at: 5, put });
         assert_eq!(find(&inbox, "pr-2").unwrap().compose.as_ref().unwrap().placeholder.as_deref(), Some("r"));
+    }
+
+    fn send_body(thread: &str, id: &str, text: &str) -> String {
+        format!(r#"{{"thread":"{thread}","id":"{id}","blocks":[{{"type":"markdown","text":"{text}"}}]}}"#)
+    }
+
+    fn send_msg(at: u64, thread: &str, id: &str, text: &str) -> Message {
+        Message::ThreadSend { at, key: thread.into(), id: id.into(), body: send_body(thread, id, text) }
+    }
+
+    #[test]
+    fn the_sink_authorizes_and_checks_sends_and_withdraws() {
+        let send = send_msg(7, "pr-1", "run-1", "hi");
+        let SinkAction::Push(r) = decide("web", false, send.clone()) else { panic!("not refused") };
+        assert_eq!((r.level, r.key.as_deref(), r.at), (Level::Error, Some("thread:pr-1"), 7));
+        assert!(r.msg.starts_with("thread send denied: `web` doesn't declare inbox = true"), "{}", r.msg);
+        let SinkAction::Send { at: 7, send: s } = decide("web", true, send) else { panic!("not applied") };
+        assert_eq!((s.thread.as_str(), s.id.as_str()), ("pr-1", "run-1"));
+        assert_eq!(s.blocks, [Block::Markdown { text: "hi".into() }]);
+        // Schema rejects and routing mismatches come back as error records.
+        let reject = |m: Message| match decide("web", true, m) {
+            SinkAction::Push(r) => r.msg,
+            other => panic!("not rejected: {other:?}"),
+        };
+        let unknown = r#"{"thread":"pr-1","id":"a","blocks":[{"type":"form","id":"f"}]}"#;
+        let msg = reject(Message::ThreadSend { at: 8, key: "pr-1".into(), id: "a".into(), body: unknown.into() });
+        assert!(msg.starts_with("thread send rejected: unknown variant `form`"), "{msg}");
+        let msg = reject(Message::ThreadSend { at: 8, key: "pr-2".into(), id: "a".into(), body: send_body("pr-1", "a", "x") });
+        assert!(msg.contains("body thread `pr-1` is not the queued thread"), "{msg}");
+        let msg = reject(Message::ThreadSend { at: 8, key: "pr-1".into(), id: "b".into(), body: send_body("pr-1", "a", "x") });
+        assert!(msg.contains("body id `a` is not the queued id"), "{msg}");
+        // Withdraw: authorized like the rest, then passed through.
+        let w = Message::ThreadWithdraw { at: 9, key: "pr-1".into(), id: "a".into() };
+        assert_eq!(decide("web", true, w.clone()), SinkAction::Withdraw { thread: "pr-1".into(), id: "a".into() });
+        let SinkAction::Push(r) = decide("web", false, w) else { panic!("not refused") };
+        assert!(r.msg.starts_with("thread withdraw denied:"), "{}", r.msg);
+    }
+
+    /// `thread send` / `withdraw` end to end through `decide` and the sink:
+    /// a send needs its thread; a new id is news, an edit and a repeat
+    /// aren't; a withdrawal keeps the message; order is first-insert order.
+    #[test]
+    fn sends_insert_edit_and_withdraw_through_the_sink() {
+        let mut inbox = Inbox::default();
+        let sink = |inbox: &mut Inbox, m: Message| inbox.apply_sink("web-id", "web", 1000, decide("web", true, m));
+
+        // No thread yet: an error record naming the fix, nothing else.
+        let shown = sink(&mut inbox, send_msg(5, "pr-1", "a", "early")).unwrap();
+        assert_eq!(shown.line, "web: thread send rejected: no thread `pr-1`; put it first");
+        assert_eq!(shown.popup.unwrap().level, Level::Error);
+        assert_eq!(inbox.threads.len(), 1);
+        assert_eq!(inbox.threads[0].kind, Kind::Notify);
+
+        let put = r#"{"key":"pr-1","title":"PR 1","state":"active"}"#;
+        sink(&mut inbox, Message::ThreadPut { at: 6, key: "pr-1".into(), body: put.into() });
+        let id = find(&inbox, "pr-1").unwrap().id;
+        inbox.apply(&Op::MarkRead(id), 1000, "tui");
+
+        // A new message: unread, on top, a status line; no popup while active.
+        let shown = sink(&mut inbox, send_msg(10, "pr-1", "a", "one")).unwrap();
+        assert_eq!(shown.line, "web: PR 1 — one");
+        assert!(shown.popup.is_none());
+        let t = find(&inbox, "pr-1").unwrap();
+        assert!(t.unread);
+        assert_eq!(inbox.threads[0].id, id, "moved to the top");
+        assert_eq!(feed(t), ["message a: one"]);
+        sink(&mut inbox, send_msg(11, "pr-1", "b", "two"));
+        inbox.apply(&Op::MarkRead(id), 1000, "tui");
+
+        // The same again: invisible. New content: edited in place, quiet.
+        assert!(sink(&mut inbox, send_msg(12, "pr-1", "a", "one")).is_none());
+        assert!(sink(&mut inbox, send_msg(13, "pr-1", "a", "uno")).is_none());
+        let t = find(&inbox, "pr-1").unwrap();
+        assert!(!t.unread, "an edit isn't news");
+        assert_eq!(feed(t), ["message a: uno (edited)", "message b: two"]);
+        assert_eq!(t.feed[0].at, 10, "first-insert time kept");
+
+        // Withdrawn: kept, tagged; unknown ids and threads are no-ops.
+        assert!(sink(&mut inbox, Message::ThreadWithdraw { at: 14, key: "pr-1".into(), id: "b".into() }).is_none());
+        assert!(sink(&mut inbox, Message::ThreadWithdraw { at: 14, key: "pr-1".into(), id: "zz".into() }).is_none());
+        assert!(sink(&mut inbox, Message::ThreadWithdraw { at: 14, key: "nope".into(), id: "b".into() }).is_none());
+        let t = find(&inbox, "pr-1").unwrap();
+        assert_eq!(feed(t), ["message a: uno (edited)", "message b: two (withdrawn)"]);
+        assert_eq!(inbox.threads.len(), 2, "no error record for an unknown withdraw");
+        // Sent again after a withdrawal: back in place, edited, still quiet.
+        assert!(sink(&mut inbox, send_msg(15, "pr-1", "b", "two")).is_none());
+        assert_eq!(feed(find(&inbox, "pr-1").unwrap()), ["message a: uno (edited)", "message b: two (edited)"]);
+
+        // On a needs-you thread a new message pops up (quoting it); an edit
+        // still doesn't.
+        let put = r#"{"key":"pr-1","title":"PR 1","state":"needs-you"}"#;
+        sink(&mut inbox, Message::ThreadPut { at: 16, key: "pr-1".into(), body: put.into() });
+        let popup = sink(&mut inbox, send_msg(17, "pr-1", "c", "your call")).unwrap().popup.unwrap();
+        assert_eq!((popup.key.as_deref(), popup.level, popup.body.as_str()), (Some("thread:pr-1"), Level::Warn, "PR 1\nyour call"));
+        assert!(sink(&mut inbox, send_msg(18, "pr-1", "c", "your call, edited")).is_none());
+        // Another owner can't send into this thread: it isn't theirs.
+        let shown = inbox.apply_sink("other-id", "other", 1000, decide("other", true, send_msg(19, "pr-1", "x", "hi"))).unwrap();
+        assert!(shown.line.contains("no thread `pr-1`"), "{}", shown.line);
+    }
+
+    #[test]
+    fn the_sink_strips_control_characters_from_messages() {
+        let mut inbox = Inbox::default();
+        inbox.apply_sink("web-id", "web", 1000, SinkAction::Put { at: 5, put: put_body("pr-1") });
+        let send = MessageSend {
+            thread: "pr-1".into(),
+            id: "a".into(),
+            blocks: vec![
+                Block::Markdown { text: "a\x1b[1mb".into() },
+                Block::Fields { items: vec![Field { label: "L\x07".into(), value: "v\u{9b}2J".into() }] },
+            ],
+        };
+        inbox.apply_sink("web-id", "web", 1000, SinkAction::Send { at: 6, send });
+        let ItemKind::Message { blocks, .. } = &find(&inbox, "pr-1").unwrap().feed.last().unwrap().kind else { panic!() };
+        assert_eq!(
+            blocks,
+            &[
+                Block::Markdown { text: "a[1mb".into() },
+                Block::Fields { items: vec![Field { label: "L".into(), value: "v2J".into() }] },
+            ]
+        );
     }
 
     #[test]
