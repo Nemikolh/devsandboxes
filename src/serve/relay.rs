@@ -92,10 +92,14 @@ where
         .name("api-relay-up".into())
         .spawn(move || {
             let r = copy(input, &to_daemon);
-            if r.is_ok() {
+            let eof = r.is_ok();
+            // Report before half-closing: once shut, the daemon may answer and
+            // hang up before this thread runs again, and a `Down` seen first
+            // would read as the daemon leaving (exit 75) instead of stdin's EOF.
+            let _ = up.send(Event::Up(r));
+            if eof {
                 let _ = to_daemon.shutdown(Shutdown::Write);
             }
-            let _ = up.send(Event::Up(r));
         })
         .context("cannot start the relay")?;
     std::thread::Builder::new()
