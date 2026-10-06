@@ -23,6 +23,9 @@ fn serve(runtime: &Path) -> Command {
     cmd.arg("serve")
         .env("XDG_RUNTIME_DIR", runtime)
         .env("XDG_STATE_HOME", runtime.join("state"))
+        // The daemon's host side reads state.toml (bridges, autostart) and
+        // restores forwards.toml from here: never the user's real ones.
+        .env("XDG_DATA_HOME", runtime.join("data"))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());

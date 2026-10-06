@@ -126,7 +126,18 @@ they work with no dashboard open. Each forward keeps its own bridge (an
 instance's daemon bridge; sharing that bridge's mux is a later
 optimization. Status lines (a configured forward started or failed, a
 connection note) go to `forwards` subscribers as `forwards.status` and to
-`serve.log`. The foreground `devsandbox port` command still forwards in its
+`serve.log`.
+
+Ad-hoc forwards survive a handoff, a restart and a reboot: each is saved in
+`<data-dir>/devsandbox/forwards.toml` (next to `state.toml`) with the host
+port it bound, and a starting daemon recreates them (fresh ids) before it
+serves requests: on the saved port, or the next free one up when that's
+taken now (logged, and saved). An entry whose instance was removed is
+dropped (logged); one whose instance is stopped comes back and heals when it
+runs. Only `forwards.rm` removes an entry; a daemon exiting leaves the file
+alone, so an overlapping handoff can't wipe it (writes are locked, atomic
+read-modify-writes). Configured forwards aren't in this file: their ports
+are in `state.toml`. The foreground `devsandbox port` command still forwards in its
 own process, without the daemon.
 
 ## Autostart
@@ -184,9 +195,8 @@ with `d`). A later step adds `--follow` subscribers (step 18).
 Exiting (idle or handoff) kills every bridge and closes every forward
 before the start lock is released, so a successor's bridges never overlap
 and it can bind the configured forwards' saved host ports again; it
-restarts them on its first poll. Ad-hoc forwards are lost on a handoff
-(the dashboard's Ports tab shows them gone; add them again). A running
-autostart pass is waited for.
+restarts the configured ones on its first poll and the ad-hoc ones at
+start (*Forwards*). A running autostart pass is waited for.
 
 `--keep-alive` disables the idle exit; so does the per-user global config
 `<data-dir>/devsandbox/daemon.config.toml` (next to `state.toml`;

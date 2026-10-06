@@ -142,10 +142,13 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
     ));
 
     let shared = Arc::new(Shared::new(opts.version.clone(), inbox));
-    let registry = opts.host.then(|| {
+    let registry = if opts.host {
         let shared = Arc::clone(&shared);
-        Registry::spawn(log, Box::new(move |event| shared.publish_forwards(event)))
-    });
+        let store = super::forward_store::path()?;
+        Some(Registry::spawn(log, store, Box::new(move |event| shared.publish_forwards(event))))
+    } else {
+        None
+    };
     if let Some(registry) = &registry {
         let _ = shared.forwards.set(registry.handle());
     }
@@ -1004,7 +1007,7 @@ pub(crate) mod tests {
     #[test]
     fn active_forwards_are_holders() {
         let shared = Shared::new(v(1), scratch("fwd-hold").join("inbox.toml"));
-        let registry = Registry::spawn(|_| {}, Box::new(|_| {}));
+        let registry = Registry::spawn(|_| {}, scratch("fwd-hold-store").join("forwards.toml"), Box::new(|_| {}));
         assert_eq!(shared.holders(None, Some(&registry)), Holders::default());
         let dir = scratch("fwd-hold-root");
         std::fs::create_dir_all(&dir).unwrap();

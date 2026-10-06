@@ -70,10 +70,16 @@ curl ──tcp──▶ devsandbox (host listener 127.0.0.1:3000)
   (`src/serve/forwards.rs`, `docs/serve.md`), until removed, until their
   owner stops (configured), or until the daemon exits. They count as daemon
   holders. A daemon exit drops them all; its successor restarts the
-  configured ones on their saved ports, ad-hoc ones are lost.
-- Ad-hoc forwards aren't persisted in `state.toml`; the Ports tab lists the
-  daemon's forwards of its config root, so every open dashboard of that root
-  sees the same ones.
+  configured ones on their saved ports and restores the ad-hoc ones.
+- Ad-hoc forwards persist in `<data-dir>/devsandbox/forwards.toml` (not
+  `state.toml`; `src/serve/forward_store.rs`): canonical root, instance
+  state key, service, address, container port, and the host port actually
+  bound. `forwards.rm` removes an entry; a daemon exiting doesn't. At start
+  the daemon recreates each on its saved host port, else (taken) the next
+  free one up, which it saves; an entry whose instance is gone from state is
+  dropped; a stopped instance's forward comes back and heals when it runs.
+- The Ports tab lists the daemon's forwards of its config root, so every
+  open dashboard of that root sees the same ones.
 - Each forward owns its own bridge (`exec -i … devsbd bridge`). Sharing one
   bridge per container across forwards is a later optimisation.
 

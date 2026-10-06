@@ -63,7 +63,9 @@ git worktrees so working trees are never shared.
   `forwards.rs` (the `serve-forwards` thread owning every Ports-tab `Forward`,
   one registry per config root, daemon-wide ids; reconciles sandboxes'
   `forwardPorts` against `host.rs`'s running poll, with host ports saved in
-  `state.toml`; `forwards.*` talk to it over a request/reply channel).
+  `state.toml`; `forwards.*` talk to it over a request/reply channel),
+  `forward_store.rs` (`forwards.toml`: the ad-hoc forwards, with their bound
+  host ports, that a starting registry restores; locked atomic writes).
   `daemon.rs` also owns `subscribe`: a `serve-watch` thread flags changes on
   each connection's `Outbox`, a per-connection notifier writes them.
   `relay.rs` is `devsandbox api --stdio` (byte relay stdin/stdout ↔ socket,

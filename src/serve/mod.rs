@@ -16,6 +16,7 @@
 //! - `daemon`: the accept loop, lock, handoff and idle exit
 //! - `host`: the live host side: the bridge poll and the autostart pass
 //! - `forwards`: the port forwards (ad-hoc and configured), on their own thread
+//! - `forward_store`: `forwards.toml`, the ad-hoc forwards a successor restores
 //! - `client`: connect-or-lazy-start for commands
 //! - `relay`: `devsandbox api --stdio`, stdin/stdout ↔ the socket (step 9)
 //! - `install`: `serve install|uninstall`, the systemd user unit / LaunchAgent
@@ -25,6 +26,7 @@ pub mod api;
 pub mod client;
 pub mod daemon;
 pub mod endpoint;
+pub mod forward_store;
 pub mod forwards;
 mod host;
 pub mod idle;

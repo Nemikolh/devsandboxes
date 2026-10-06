@@ -225,7 +225,8 @@ the daemon starts and stops itself for every config root recorded in
 `state.toml`, following its 5 s container poll. They outlive the client
 that added them and keep the daemon alive (`docs/serve.md`, *Idle exit*).
 A daemon exit (idle or handoff) closes them all; the successor restarts the
-configured ones on their saved host ports, ad-hoc ones are gone. The
+configured ones on their saved host ports (`state.toml`) and the ad-hoc ones
+on theirs (`<data-dir>/devsandbox/forwards.toml`, new ids). The
 foreground `devsandbox port` command doesn't use the daemon, and its
 forwards aren't listed here.
 
@@ -264,6 +265,10 @@ the listener is bound; the route resolves on (re)connect, so a missing
 container shows up later as the row's `state`. `target` this early is
 usually the request's own `<instance or service>:<port>`.
 
+The forward is saved in `<data-dir>/devsandbox/forwards.toml` with the host
+port it bound (an automatic one too), so later daemons recreate it on that
+port (on a free one near it if it's taken by then) until `forwards.rm`.
+
 Errors: `invalid` (relative `dir`, neither `instance` nor `service`, a bad
 `spec` or `address`), `not-found` (no such directory or instance),
 `bind-failed` (`"port 8080: address in use"`).
@@ -271,7 +276,8 @@ Errors: `invalid` (relative `dir`, neither `instance` nor `service`, a bad
 ### `forwards.rm`
 
 Params: `{"id": 4}`. Stops the forward (closing its listener and its
-connections). Result: `{"ok": true, "local": "127.0.0.1:3000",
+connections); an ad-hoc one is also removed from `forwards.toml`, so no
+later daemon restores it. Result: `{"ok": true, "local": "127.0.0.1:3000",
 "configured": false}`. A configured forward stays stopped until its owner
 stops and runs again (an instance; for a `global` service's port, every
 running instance that declares it).

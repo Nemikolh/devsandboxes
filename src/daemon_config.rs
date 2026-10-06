@@ -31,14 +31,20 @@ pub fn path() -> Result<PathBuf> {
     path_from(std::env::var_os("XDG_DATA_HOME"), std::env::var_os("HOME"))
 }
 
-/// `<data>/devsandbox/daemon.config.toml`, next to `state.toml`: `State::path`'s
-/// base-dir logic over the given `$XDG_DATA_HOME` / `$HOME`.
+/// `<data>/devsandbox/daemon.config.toml`, next to `state.toml`.
 fn path_from(xdg_data_home: Option<OsString>, home: Option<OsString>) -> Result<PathBuf> {
+    Ok(data_dir_from(xdg_data_home, home)?.join("daemon.config.toml"))
+}
+
+/// `<data>/devsandbox`, the dir of `state.toml`: `State::path`'s base-dir logic
+/// over the given `$XDG_DATA_HOME` / `$HOME`. Shared by the daemon's other
+/// per-user files (`serve::forward_store`).
+pub fn data_dir_from(xdg_data_home: Option<OsString>, home: Option<OsString>) -> Result<PathBuf> {
     let base = xdg_data_home
         .map(PathBuf::from)
         .or_else(|| home.map(|h| PathBuf::from(h).join(".local/share")))
         .context("cannot determine user data dir ($XDG_DATA_HOME or $HOME)")?;
-    Ok(base.join("devsandbox/daemon.config.toml"))
+    Ok(base.join("devsandbox"))
 }
 
 /// The global config; a missing file is the defaults.

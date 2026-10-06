@@ -20,6 +20,11 @@
 //! status lines goes out through [`Event`]s (the API's `forwards.changed` /
 //! `forwards.status`) and `serve.log`; nothing else is printed.
 //!
+//! Ad-hoc forwards persist in `forwards.toml` ([`forward_store`]): an add
+//! appends, an rm removes, and the thread restores them first thing, on
+//! their saved host ports, so they survive a handoff or restart. Stopping
+//! the thread leaves the file alone: dropping forwards on exit isn't removal.
+//!
 //! Each forward keeps its own self-healing bridge (`Forward::start`), as in
 //! the dashboard; riding the instance's daemon bridge mux instead is a later
 //! optimization.
@@ -36,6 +41,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use super::api::ApiError;
+use super::forward_store::{self, Entry};
 use crate::commands::{port, services};
 use crate::config::{Config, ForwardPort, ServiceScope};
 use crate::devsbd::forward::{Forward, ForwardSpec, ForwardState, ForwardStatus, HostPort, PREFER_SPAN};
@@ -139,15 +145,19 @@ pub struct Handle {
 }
 
 impl Registry {
-    /// Start the registry thread. `log` writes one `serve.log` line; `on_event`
-    /// gets every [`Event`] (called on the registry thread: it must not block).
-    pub fn spawn(log: fn(&str), on_event: OnEvent) -> Registry {
+    /// Start the registry thread. `log` writes one `serve.log` line; `store`
+    /// is the ad-hoc forwards' file ([`forward_store::path`] outside tests),
+    /// restored before any request is served; `on_event` gets every [`Event`]
+    /// (called on the registry thread: it must not block).
+    pub fn spawn(log: fn(&str), store: PathBuf, on_event: OnEvent) -> Registry {
         let (tx, rx) = mpsc::channel();
         let active = Arc::new(AtomicUsize::new(0));
         let thread = {
             let active = Arc::clone(&active);
             std::thread::Builder::new().name("serve-forwards".into()).spawn(move || {
-                let mut daemon = Daemon::new(log, on_event, active);
+                let mut daemon = Daemon::new(log, store, on_event, active);
+                daemon.restore();
+                daemon.poll();
                 daemon.run(&rx);
             })
         };
@@ -213,6 +223,8 @@ impl super::api::Forwarding for Handle {
 /// The registry thread's state.
 struct Daemon {
     log: fn(&str),
+    /// `forwards.toml`.
+    store: PathBuf,
     on_event: OnEvent,
     active: Arc<AtomicUsize>,
     roots: BTreeMap<PathBuf, Root>,
@@ -224,8 +236,17 @@ struct Daemon {
 }
 
 impl Daemon {
-    fn new(log: fn(&str), on_event: OnEvent, active: Arc<AtomicUsize>) -> Self {
-        Self { log, on_event, active, roots: BTreeMap::new(), next_id: 1, last_rows: Vec::new(), last_status: None }
+    fn new(log: fn(&str), store: PathBuf, on_event: OnEvent, active: Arc<AtomicUsize>) -> Self {
+        Self {
+            log,
+            store,
+            on_event,
+            active,
+            roots: BTreeMap::new(),
+            next_id: 1,
+            last_rows: Vec::new(),
+            last_status: None,
+        }
     }
 
     fn run(&mut self, rx: &Receiver<Cmd>) {
@@ -246,7 +267,8 @@ impl Daemon {
             }
             self.poll();
         }
-        // Every Forward drops here: listeners close, bridges die.
+        // Every Forward drops here: listeners close, bridges die. The store
+        // keeps them, for the successor.
         self.roots.clear();
         self.active.store(0, Ordering::Release);
     }
@@ -280,18 +302,118 @@ impl Daemon {
             .canonicalize()
             .map_err(|e| ApiError::not_found(format!("no directory {}: {e}", req.dir.display())))?;
         let mut next_id = self.next_id;
-        let added = self.root(&dir).start(&req, &mut next_id);
+        let started = self.root(&dir).start(&req, &mut next_id);
         self.next_id = next_id;
-        added
+        let (added, entry) = started?;
+        self.persist(|entries| entries.push(entry));
+        Ok(added)
     }
 
     fn remove(&mut self, id: u64) -> Result<Removed, ApiError> {
-        for root in self.roots.values_mut() {
-            if let Some(removed) = root.remove(id) {
-                return Ok(removed);
+        let found = self.roots.values_mut().find_map(|root| root.remove(id));
+        let Some((removed, entry)) = found else {
+            return Err(ApiError::not_found(format!("no forward {id}")));
+        };
+        if let Some(entry) = entry {
+            self.persist(|entries| {
+                forward_store::remove(entries, &entry);
+            });
+        }
+        Ok(removed)
+    }
+
+    /// Apply `f` to the store. A failure is logged, never the request's.
+    fn persist(&self, f: impl FnOnce(&mut Vec<Entry>)) {
+        if let Err(e) = forward_store::update(&self.store, f) {
+            (self.log)(&format!("forwards: cannot save {}: {e:#}", self.store.display()));
+        }
+    }
+
+    /// Recreate the saved ad-hoc forwards: each on its saved host port, else
+    /// (taken now) on an automatic one near it, which the store then records.
+    /// Entries of instances gone from state are dropped from the store; a
+    /// stopped instance's forward is restored anyway (it heals when the
+    /// instance runs). Other failures are logged and the entry kept.
+    fn restore(&mut self) {
+        let saved = match forward_store::load(&self.store) {
+            Ok(saved) if saved.is_empty() => return,
+            Ok(saved) => saved,
+            Err(e) => return (self.log)(&format!("forwards: cannot restore: {e:#}")),
+        };
+        let state = match State::load() {
+            Ok(state) => state,
+            Err(e) => return (self.log)(&format!("forwards: cannot restore: {e:#}")),
+        };
+        let (keep, dropped) = restorable(saved, &state);
+        // (old entry, its replacement; `None` drops it), applied as diffs so a
+        // write by an overlapping daemon since the load isn't undone.
+        let mut changes: Vec<(Entry, Option<Entry>)> = Vec::new();
+        for entry in dropped {
+            (self.log)(&format!(
+                "forwards: dropping saved {}: instance {} no longer exists",
+                describe(&entry),
+                entry.instance.as_deref().unwrap_or_default()
+            ));
+            changes.push((entry, None));
+        }
+        for entry in keep {
+            if let Some(now) = self.restore_one(&entry)
+                && now != entry
+            {
+                changes.push((entry, Some(now)));
             }
         }
-        Err(ApiError::not_found(format!("no forward {id}")))
+        if !changes.is_empty() {
+            self.persist(|entries| {
+                for (old, new) in changes {
+                    let Some(i) = entries.iter().position(|e| *e == old) else { continue };
+                    match new {
+                        Some(new) => entries[i] = new,
+                        None => {
+                            entries.remove(i);
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    /// Start one saved forward; the entry as it now runs, `None` when it
+    /// couldn't start (logged).
+    fn restore_one(&mut self, entry: &Entry) -> Option<Entry> {
+        let log = self.log;
+        let Ok(dir) = entry.dir.canonicalize() else {
+            log(&format!("forwards: cannot restore {}: no directory {}", describe(entry), entry.dir.display()));
+            return None;
+        };
+        let mut next_id = self.next_id;
+        let root = self.root(&dir);
+        let started = match root.start_adhoc(entry.clone(), HostPort::Fixed(entry.host_port), &mut next_id) {
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => root
+                .start_adhoc(entry.clone(), HostPort::Prefer(entry.host_port), &mut next_id)
+                .map(|(_, now)| (now, true)),
+            started => started.map(|(_, now)| (now, false)),
+        };
+        self.next_id = next_id;
+        match started {
+            Ok((now, fell_back)) => {
+                if fell_back {
+                    log(&format!(
+                        "forwards: restored {} on port {} (port {} is taken)",
+                        describe(entry),
+                        now.host_port,
+                        entry.host_port
+                    ));
+                } else {
+                    log(&format!("forwards: restored {}", describe(entry)));
+                }
+                Some(now)
+            }
+            Err(e) => {
+                log(&format!("forwards: cannot restore {}: {}", describe(entry), bind_reason(&e)));
+                None
+            }
+        }
     }
 
     /// Reconcile configured forwards for every config root recorded in state
@@ -381,6 +503,9 @@ struct Root {
     /// saved ports. `None` when `dir` doesn't resolve: no configured forwards.
     project: Option<String>,
     live: BTreeMap<u64, Forward>,
+    /// Live ad-hoc forwards' ids -> their store entry, what `forwards.rm`
+    /// removes from the store.
+    adhoc: BTreeMap<u64, Entry>,
     /// Live configured forwards -> their id in `live`.
     configured: BTreeMap<Configured, u64>,
     /// Configured forwards stopped by `forwards.rm`: not restarted until their
@@ -398,6 +523,7 @@ impl Root {
             dir,
             project,
             live: BTreeMap::new(),
+            adhoc: BTreeMap::new(),
             configured: BTreeMap::new(),
             suppressed: BTreeSet::new(),
             failed: BTreeSet::new(),
@@ -421,7 +547,8 @@ impl Root {
 
     /// Start one ad-hoc forward: resolve the instance name non-interactively,
     /// bind the listener. The route resolves on the forward's own thread.
-    fn start(&mut self, req: &AddRequest, next_id: &mut u64) -> Result<Added, ApiError> {
+    /// Returns the answer and the store entry to save.
+    fn start(&mut self, req: &AddRequest, next_id: &mut u64) -> Result<(Added, Entry), ApiError> {
         let instance_key = match &req.instance {
             Some(name) => {
                 let state = State::load().map_err(ApiError::internal)?;
@@ -432,36 +559,56 @@ impl Root {
             }
             None => None,
         };
-        let resolve = port::resolver(self.dir.clone(), instance_key, req.service.clone(), req.container_port);
-        let probe = Box::new(port::listening_procs);
-        let forward = Forward::start(ForwardSpec { bind: req.bind, host_port: req.host_port, resolve, probe })
-            .map_err(|e| {
-                // Bind errors are the immediate, precise ones worth naming a port for.
-                let port = match req.host_port {
-                    HostPort::Fixed(p) | HostPort::Prefer(p) => p,
-                };
-                ApiError::bind_failed(format!("port {port}: {}", bind_reason(&e)))
-            })?;
+        let entry = Entry {
+            dir: self.dir.clone(),
+            instance: instance_key,
+            service: req.service.clone(),
+            address: Entry::address_of(req.bind),
+            container_port: req.container_port,
+            host_port: 0,
+        };
+        let (id, entry) = self.start_adhoc(entry, req.host_port, next_id).map_err(|e| {
+            // Bind errors are the immediate, precise ones worth naming a port for.
+            let port = match req.host_port {
+                HostPort::Fixed(p) | HostPort::Prefer(p) => p,
+            };
+            ApiError::bind_failed(format!("port {port}: {}", bind_reason(&e)))
+        })?;
+        let forward = &self.live[&id];
         let local = forward.status().local_addr.to_string();
-        let target = route_label_or(&forward, req);
+        let target = route_label_or(forward, req);
+        Ok((Added { id, local, target }, entry))
+    }
+
+    /// Bind `entry`'s forward on `host_port` (its saved `host_port` is
+    /// ignored) and register it as ad-hoc. Returns its id and the entry with
+    /// the bound host port.
+    fn start_adhoc(&mut self, mut entry: Entry, host_port: HostPort, next_id: &mut u64) -> std::io::Result<(u64, Entry)> {
+        entry.dir = self.dir.clone();
+        let resolve = port::resolver(self.dir.clone(), entry.instance.clone(), entry.service.clone(), entry.container_port);
+        let probe = Box::new(port::listening_procs);
+        let forward = Forward::start(ForwardSpec { bind: entry.bind(), host_port, resolve, probe })?;
+        entry.host_port = forward.status().local_addr.port();
         let id = self.insert(forward, next_id);
-        Ok(Added { id, local, target })
+        self.adhoc.insert(id, entry.clone());
+        Ok((id, entry))
     }
 
     /// Drop the forward with `id` (its `Drop` kills the bridge/`exec`), `None`
     /// when this root has no such forward. A configured forward stays stopped
     /// until its owner restarts instead of coming straight back on the next
-    /// sync.
-    fn remove(&mut self, id: u64) -> Option<Removed> {
+    /// sync. An ad-hoc one comes with its store entry.
+    fn remove(&mut self, id: u64) -> Option<(Removed, Option<Entry>)> {
         let forward = self.live.remove(&id)?;
         let local = forward.status().local_addr.to_string();
         drop(forward);
+        let entry = self.adhoc.remove(&id);
         let configured = self.configured.iter().find(|(_, v)| **v == id).map(|(c, _)| c.clone());
         if let Some(c) = &configured {
             self.configured.remove(c);
             self.suppressed.insert(c.clone());
         }
-        Some(Removed { local, configured: configured.is_some() })
+        Some((Removed { local, configured: configured.is_some() }, entry))
     }
 
     /// Reconcile configured forwards with the running instances: stop those
@@ -718,6 +865,22 @@ fn bind_reason(e: &std::io::Error) -> String {
     }
 }
 
+/// Split saved entries into those to restore and those whose instance is
+/// gone from state (a service-only entry always stays). Pure over `state`.
+fn restorable(entries: Vec<Entry>, state: &State) -> (Vec<Entry>, Vec<Entry>) {
+    entries.into_iter().partition(|e| e.instance.as_ref().is_none_or(|key| state.instances.contains_key(key)))
+}
+
+/// A saved forward for `serve.log`: `db:5432 on 127.0.0.1:15432`.
+fn describe(entry: &Entry) -> String {
+    let target = match (&entry.service, &entry.instance) {
+        (Some(svc), _) => format!("{svc}:{}", entry.container_port),
+        (None, Some(instance)) => format!("{instance}:{}", entry.container_port),
+        (None, None) => entry.container_port.to_string(),
+    };
+    format!("{target} on {}", std::net::SocketAddr::new(entry.bind(), entry.host_port))
+}
+
 /// The route label for `forwards.add`'s answer: the resolved label once the
 /// supervisor has published one, else a best-effort `target:port` from the
 /// request (the resolve runs on the forward's thread, so it's usually empty
@@ -941,11 +1104,26 @@ forwardPorts = ["redis:6379"]
 
     fn quiet(_: &str) {}
 
+    /// A registry on a store of its own (in a fresh temp dir).
     fn registry() -> (Registry, Arc<Mutex<Vec<Event>>>) {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        registry_at(&tmp(&format!("store-{n}")).join("forwards.toml"))
+    }
+
+    fn registry_at(store: &Path) -> (Registry, Arc<Mutex<Vec<Event>>>) {
         let events = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&events);
-        let reg = Registry::spawn(quiet, Box::new(move |e| sink.lock().unwrap().push(e)));
+        let reg = Registry::spawn(quiet, store.to_path_buf(), Box::new(move |e| sink.lock().unwrap().push(e)));
         (reg, events)
+    }
+
+    /// A fresh empty dir under the test tmp dir.
+    fn tmp(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("devsandbox-fwd-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     fn request(dir: &Path, instance: Option<&str>, service: Option<&str>) -> AddRequest {
@@ -1030,5 +1208,92 @@ forwardPorts = ["redis:6379"]
         assert_eq!((e.code, e.message), ("bind-failed", format!("port {port}: address in use")));
         assert!(reg.handle().list(None).unwrap().is_empty());
         assert_eq!(reg.active(), 0);
+    }
+
+    // ---- persistence (forwards.toml) ----
+
+    fn saved(dir: &Path, instance: Option<&str>, host_port: u16) -> Entry {
+        Entry {
+            dir: dir.to_path_buf(),
+            instance: instance.map(String::from),
+            service: Some("db".into()),
+            address: None,
+            container_port: 5432,
+            host_port,
+        }
+    }
+
+    fn port_of(local: &str) -> u16 {
+        local.parse::<std::net::SocketAddr>().unwrap().port()
+    }
+
+    #[test]
+    fn restorable_drops_only_entries_of_removed_instances() {
+        let mut state = State::default();
+        state.instances.insert("api".into(), inst("api", "p1", &[]));
+        let dir = Path::new("/cfg");
+        let (keep, dropped) =
+            restorable(vec![saved(dir, Some("api"), 1), saved(dir, Some("gone"), 2), saved(dir, None, 3)], &state);
+        assert_eq!(keep, vec![saved(dir, Some("api"), 1), saved(dir, None, 3)]);
+        assert_eq!(dropped, vec![saved(dir, Some("gone"), 2)]);
+        assert_eq!(describe(&saved(dir, None, 3)), "db:5432 on 127.0.0.1:3");
+    }
+
+    /// An add saves the bound port (an automatic one here), an rm removes only
+    /// its entry, stopping the registry leaves the file alone, and a successor
+    /// on the same store brings the forward back on the same host port.
+    #[test]
+    fn adds_persist_rm_removes_its_entry_and_a_successor_restores_them() {
+        let root = tmp("persist-root");
+        let canonical = root.canonicalize().unwrap();
+        let store = tmp("persist").join("forwards.toml");
+        let (reg, _) = registry_at(&store);
+        let h = reg.handle();
+        let a = h.add(request(&root, None, Some("db"))).unwrap();
+        let b = h.add(request(&root, None, Some("db"))).unwrap();
+        assert_eq!(
+            forward_store::load(&store).unwrap(),
+            vec![saved(&canonical, None, port_of(&a.local)), saved(&canonical, None, port_of(&b.local))]
+        );
+        h.rm(a.id).unwrap();
+        assert_eq!(forward_store::load(&store).unwrap(), vec![saved(&canonical, None, port_of(&b.local))]);
+
+        let text = std::fs::read_to_string(&store).unwrap();
+        drop(reg);
+        assert_eq!(std::fs::read_to_string(&store).unwrap(), text, "stopping is not a removal");
+
+        let (successor, _) = registry_at(&store);
+        let rows = successor.handle().list(None).unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!((rows[0].local.as_str(), &rows[0].dir, rows[0].configured), (b.local.as_str(), &canonical, false));
+        assert_eq!(std::fs::read_to_string(&store).unwrap(), text, "restored as saved: no rewrite");
+        // The restored forward is removable like any other.
+        successor.handle().rm(rows[0].id).unwrap();
+        assert_eq!(forward_store::load(&store).unwrap(), vec![]);
+        drop(successor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A saved port that's taken now: restored on an automatic port, which
+    /// the store then records. An entry whose instance is gone from state is
+    /// dropped (the name is chosen to be absurd, as above).
+    #[test]
+    fn restore_falls_back_from_a_taken_port_and_drops_removed_instances() {
+        let root = tmp("restore-root").canonicalize().unwrap();
+        let store = tmp("restore").join("forwards.toml");
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = taken.local_addr().unwrap().port();
+        let ghost = saved(&root, Some("ghost-instance-xyz"), 1);
+        forward_store::update(&store, |e| e.extend([saved(&root, None, port), ghost])).unwrap();
+
+        let (reg, _) = registry_at(&store);
+        let rows = reg.handle().list(None).unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let now = port_of(&rows[0].local);
+        assert_ne!(now, port);
+        assert_eq!(forward_store::load(&store).unwrap(), vec![saved(&root, None, now)]);
+        drop(reg);
+        drop(taken);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
