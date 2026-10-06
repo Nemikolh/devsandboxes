@@ -252,7 +252,7 @@ mod tests {
         let daemon = spawn_daemon(&dir, opts(1, 200));
         let probe = || {
             let v = Version { semver: "0.6.0".into(), build: 1 };
-            client::connect_with(&dir, "api", &v, client::START_TIMEOUT, &|_| Ok(()))
+            client::connect_with(&dir, "api", &v, client::START_TIMEOUT, &|_, _| Ok(()))
         };
         let stream = open(&dir, probe).unwrap();
         let (mut stdin, stdin_r) = UnixStream::pair().unwrap();

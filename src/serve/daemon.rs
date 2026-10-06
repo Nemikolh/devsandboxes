@@ -825,7 +825,7 @@ pub(crate) mod tests {
     }
 
     fn connect(dir: &Path) -> client::Conn {
-        client::connect_with(dir, "test", &v(1), client::START_TIMEOUT, &|_| Ok(())).unwrap()
+        client::connect_with(dir, "test", &v(1), client::START_TIMEOUT, &|_, _| Ok(())).unwrap()
     }
 
     fn note(path: &Path, msg: &str) {

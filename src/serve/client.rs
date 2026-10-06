@@ -125,10 +125,20 @@ pub enum Hello {
     Closed,
 }
 
+/// Why [`connect_with`] starts a daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartReason {
+    /// Nothing answered on the socket (the plain lazy start).
+    NothingAnswering,
+    /// The daemon answered `handoff`: this client is newer.
+    Handoff,
+}
+
 /// Connect to the daemon in `dir`, starting it if nothing answers, and say
-/// hello as `client` (`tui`, `cli`, …).
+/// hello as `client` (`tui`, `cli`, …). The start goes through the service
+/// manager when `serve install` installed a unit ([`super::install::lazy_start`]).
 pub fn connect(dir: &Path, client: &str) -> Result<Conn> {
-    connect_with(dir, client, &Version::current(), START_TIMEOUT, &spawn_detached)
+    connect_with(dir, client, &Version::current(), START_TIMEOUT, &super::install::lazy_start)
 }
 
 /// Make sure a daemon runs (lazy start), for a command that just started a
@@ -205,7 +215,7 @@ pub(crate) fn connect_with(
     client: &str,
     version: &Version,
     timeout: Duration,
-    spawn: &dyn Fn(&Path) -> Result<()>,
+    spawn: &dyn Fn(&Path, StartReason) -> Result<()>,
 ) -> Result<Conn> {
     let deadline = Instant::now() + timeout;
     let mut spawned = false;
@@ -219,15 +229,17 @@ pub(crate) fn connect_with(
                         stream.set_read_timeout(None).context("cannot clear the read timeout")?;
                         return Conn::new(stream, daemon);
                     }
-                    Hello::Handoff => true,
+                    Hello::Handoff => Some(StartReason::Handoff),
                     // Exiting daemon: its lock holds off a successor, retry.
-                    Hello::Closed => false,
+                    Hello::Closed => None,
                 }
             }
-            Err(_) => true,
+            Err(_) => Some(StartReason::NothingAnswering),
         };
-        if start && !spawned {
-            spawn(dir)?;
+        if let Some(reason) = start
+            && !spawned
+        {
+            spawn(dir, reason)?;
             spawned = true;
         }
         if Instant::now() >= deadline {
@@ -271,7 +283,7 @@ pub(crate) fn hello(stream: &mut Stream, version: &Version, client: &str) -> Res
 /// (`setsid`, so the terminal's hangup and Ctrl-C don't reach it), cwd `/`
 /// (pins no directory), stdin from /dev/null, stdout+stderr appended to
 /// `serve.log`.
-fn spawn_detached(dir: &Path) -> Result<()> {
+pub(super) fn spawn_detached(dir: &Path) -> Result<()> {
     let exe = std::env::current_exe().context("cannot locate the devsandbox binary")?;
     let log_path = endpoint::log_path()?;
     if let Some(parent) = log_path.parent() {
@@ -303,6 +315,22 @@ fn spawn_detached(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Append one line to `serve.log`, formatted like the daemon's own. For the
+/// client side of a start, which must never print (the TUI calls it). Best
+/// effort.
+pub(super) fn log_line(msg: &str) {
+    let Ok(path) = endpoint::log_path() else { return };
+    if let Some(parent) = path.parent()
+        && endpoint::ensure_private_dir(parent).is_err()
+    {
+        return;
+    }
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    if let Ok(mut f) = std::fs::File::options().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "[{secs}] devsandbox serve: {msg}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
@@ -319,8 +347,12 @@ mod tests {
     }
 
     /// A spawner that runs an in-process daemon of `build`, counting calls.
-    fn fake_spawn<'a>(build: u64, count: &'a AtomicUsize, daemons: &'a Daemons) -> impl Fn(&Path) -> Result<()> + 'a {
-        move |dir| {
+    fn fake_spawn<'a>(
+        build: u64,
+        count: &'a AtomicUsize,
+        daemons: &'a Daemons,
+    ) -> impl Fn(&Path, StartReason) -> Result<()> + 'a {
+        move |dir, _| {
             count.fetch_add(1, Ordering::SeqCst);
             daemons.lock().unwrap().push(spawn_daemon(dir, opts(build, 200)));
             Ok(())
@@ -353,7 +385,8 @@ mod tests {
     fn lazy_start_gives_up_when_the_daemon_never_answers() {
         let dir = scratch("never");
         let count = AtomicUsize::new(0);
-        let spawn = |_: &Path| {
+        let spawn = |_: &Path, reason| {
+            assert_eq!(reason, StartReason::NothingAnswering);
             count.fetch_add(1, Ordering::SeqCst);
             Ok(())
         };
@@ -382,7 +415,7 @@ mod tests {
     #[test]
     fn spawn_failure_is_reported() {
         let dir = scratch("spawnfail");
-        let err = connect_with(&dir, "test", &v(1), START_TIMEOUT, &|_| bail!("no exe")).err().unwrap();
+        let err = connect_with(&dir, "test", &v(1), START_TIMEOUT, &|_, _| bail!("no exe")).err().unwrap();
         assert_eq!(format!("{err:#}"), "no exe");
     }
 
@@ -399,7 +432,13 @@ mod tests {
         assert_eq!((equal.daemon.build, count.load(Ordering::SeqCst)), (1, 0));
         drop(equal);
 
-        let conn = connect_with(&dir, "new", &v(2), START_TIMEOUT, &fake_spawn(2, &count, &daemons)).unwrap();
+        let reasons = Mutex::new(Vec::new());
+        let spawn = |d: &Path, reason| {
+            reasons.lock().unwrap().push(reason);
+            fake_spawn(2, &count, &daemons)(d, reason)
+        };
+        let conn = connect_with(&dir, "new", &v(2), START_TIMEOUT, &spawn).unwrap();
+        assert_eq!(*reasons.lock().unwrap(), [StartReason::Handoff]);
         assert_eq!(conn.daemon.build, 2);
         assert_eq!(count.load(Ordering::SeqCst), 1);
         assert_eq!(old.join().unwrap().unwrap(), Exit::Handoff);

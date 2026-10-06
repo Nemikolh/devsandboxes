@@ -294,7 +294,7 @@ fn reports(op: &Op, code: &str) -> bool {
 fn open(after_handoff: bool) -> Result<Conn> {
     let dir = endpoint::socket_dir()?;
     let waited = after_handoff
-        .then(|| client::connect_with(&dir, "tui", &Version::current(), client::START_TIMEOUT, &|_| Ok(())).ok())
+        .then(|| client::connect_with(&dir, "tui", &Version::current(), client::START_TIMEOUT, &|_, _| Ok(())).ok())
         .flatten();
     let mut conn = match waited {
         Some(conn) => conn,

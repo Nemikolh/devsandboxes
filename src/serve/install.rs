@@ -6,6 +6,11 @@
 //! [`render_launchd`]); [`install`] / [`uninstall`] take every path, the uid
 //! and the command runner as a [`Setup`], so tests never touch the real
 //! service manager or `~/.config/systemd` / `~/Library/LaunchAgents`.
+//!
+//! Also the manager-aware side of the lazy start ([`lazy_start`], docs/serve.md,
+//! *Start*): with a unit installed, clients start (and after a handoff,
+//! repoint and restart) it through the manager instead of spawning an
+//! unmanaged daemon.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -15,7 +20,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use serde_json::json;
 
-use super::client;
+use super::client::{self, StartReason};
 use super::endpoint;
 use super::proto::Version;
 
@@ -221,6 +226,56 @@ pub fn render_launchd(spec: &Spec) -> String {
     out
 }
 
+/// The binary an existing unit runs: the first `ExecStart=` word (systemd,
+/// undoing [`systemd_word`]) or the first `ProgramArguments` string (launchd,
+/// undoing [`xml`]). `None` when the text has none.
+pub fn unit_exe(manager: Manager, text: &str) -> Option<String> {
+    match manager {
+        Manager::Systemd => text.lines().find_map(|l| l.trim_start().strip_prefix("ExecStart=")).and_then(systemd_first_word),
+        Manager::Launchd => {
+            let args = &text[text.find("<key>ProgramArguments</key>")?..];
+            let start = args.find("<string>")? + "<string>".len();
+            let len = args[start..].find("</string>")?;
+            Some(unxml(&args[start..start + len]))
+        }
+    }
+}
+
+/// The first word of an `ExecStart=` value: quoted (C escapes) or bare, with
+/// `%%` and `$$` collapsed.
+fn systemd_first_word(value: &str) -> Option<String> {
+    let value = value.trim_start();
+    let (quoted, mut chars) = match value.strip_prefix('"') {
+        Some(rest) => (true, rest.chars()),
+        None => (false, value.chars()),
+    };
+    let mut out = String::new();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' if quoted => return Some(out),
+            c if c.is_whitespace() && !quoted => break,
+            '\\' if quoted => match chars.next()? {
+                'n' => out.push('\n'),
+                c => out.push(c),
+            },
+            '%' | '$' => {
+                let mut peek = chars.clone();
+                if peek.next() == Some(c) {
+                    chars = peek;
+                }
+                out.push(c);
+            }
+            c => out.push(c),
+        }
+    }
+    // An unterminated quote isn't a word.
+    (!quoted && !out.is_empty()).then_some(out)
+}
+
+fn unxml(s: &str) -> String {
+    s.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&apos;", "'").replace("&amp;", "&")
+}
+
 fn xml(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -322,18 +377,7 @@ fn run_command(program: &str, args: &[&str]) -> Result<Output> {
 /// answers. Idempotent: running it again rewrites the unit and restarts.
 /// Returns the line to print.
 pub fn install(s: &Setup, spec: &Spec) -> Result<String> {
-    let unit = s.unit_path();
-    std::fs::create_dir_all(&s.unit_dir).with_context(|| format!("cannot create {}", s.unit_dir.display()))?;
-    // The manager appends to serve.log; its dir must exist.
-    if let Some(parent) = Path::new(&spec.log).parent() {
-        endpoint::ensure_private_dir(parent)?;
-    }
-    let text = match s.manager {
-        Manager::Systemd => render_systemd(spec),
-        Manager::Launchd => render_launchd(spec),
-    };
-    std::fs::write(&unit, text).with_context(|| format!("cannot write {}", unit.display()))?;
-
+    let unit = write_unit(s, spec)?;
     let dir = Path::new(&spec.socket_dir);
     let started = stop_running(dir, &s.version, s.stop_wait).and_then(|()| start(s, &unit));
     started.with_context(|| format!("wrote {}, but couldn't start it", unit.display()))?;
@@ -351,6 +395,23 @@ pub fn install(s: &Setup, spec: &Spec) -> Result<String> {
     Ok(format!("installed {}; devsandbox serve is running (keep-alive) on {}", unit.display(), socket.display()))
 }
 
+/// Write the unit file for `spec` (creating its dir and the `serve.log`
+/// dir), as `serve install` and a handoff's rewrite do. Returns its path.
+fn write_unit(s: &Setup, spec: &Spec) -> Result<PathBuf> {
+    let unit = s.unit_path();
+    std::fs::create_dir_all(&s.unit_dir).with_context(|| format!("cannot create {}", s.unit_dir.display()))?;
+    // The manager appends to serve.log; its dir must exist.
+    if let Some(parent) = Path::new(&spec.log).parent() {
+        endpoint::ensure_private_dir(parent)?;
+    }
+    let text = match s.manager {
+        Manager::Systemd => render_systemd(spec),
+        Manager::Launchd => render_launchd(spec),
+    };
+    std::fs::write(&unit, text).with_context(|| format!("cannot write {}", unit.display()))?;
+    Ok(unit)
+}
+
 /// Have the manager load the unit and (re)start its daemon.
 fn start(s: &Setup, unit: &Path) -> Result<()> {
     match s.manager {
@@ -361,22 +422,138 @@ fn start(s: &Setup, unit: &Path) -> Result<()> {
             // after the shutdown counts as active, and `start` would no-op.
             s.check("systemctl", &["--user", "restart", SYSTEMD_UNIT])
         }
+        Manager::Launchd => bootstrap(s, unit),
+    }
+}
+
+/// `launchctl bootout` (not loaded is fine), then `bootstrap`, retried: the
+/// way to (re)load a plist that changed, and to restart its job.
+fn bootstrap(s: &Setup, unit: &Path) -> Result<()> {
+    let target = s.launchd_target();
+    let _ = (s.run)("launchctl", &["bootout", &target]);
+    let domain = format!("gui/{}", s.uid);
+    let plist = unit.to_str().context("the plist path is not UTF-8")?;
+    let mut attempt = 1;
+    loop {
+        match s.check("launchctl", &["bootstrap", &domain, plist]) {
+            Ok(()) => return Ok(()),
+            Err(e) if attempt >= BOOTSTRAP_ATTEMPTS => return Err(e),
+            Err(_) => {
+                attempt += 1;
+                std::thread::sleep(s.retry_gap);
+            }
+        }
+    }
+}
+
+/// How a client's start goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Via {
+    /// Through the service manager, which runs the installed unit.
+    Manager,
+    /// [`client::spawn_detached`]: an unmanaged daemon.
+    Detached,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Plan {
+    /// Rewrite the unit from this binary and the current env first.
+    pub rewrite: bool,
+    pub via: Via,
+}
+
+/// A client's start, given whether a unit is installed and whether the binary
+/// it runs still exists. A handoff (this client is newer) always repoints the
+/// unit at this binary: the newest binary wins, dev builds included. A plain
+/// start leaves a working unit alone, so an older binary doesn't take it
+/// over, and only repoints one whose binary is gone (a Homebrew `Cellar` or
+/// npm path an upgrade removed).
+pub fn plan(unit_installed: bool, unit_exe_exists: bool, reason: StartReason) -> Plan {
+    if !unit_installed {
+        return Plan { rewrite: false, via: Via::Detached };
+    }
+    let rewrite = match reason {
+        StartReason::Handoff => true,
+        StartReason::NothingAnswering => !unit_exe_exists,
+    };
+    Plan { rewrite, via: Via::Manager }
+}
+
+/// The default spawner of [`client::connect`]: [`managed_start`] with the
+/// real environment. No supported manager or no `HOME` means no unit.
+pub(crate) fn lazy_start(dir: &Path, reason: StartReason) -> Result<()> {
+    let detached = || client::spawn_detached(dir);
+    let Ok(s) = Setup::current(&run_command) else { return detached() };
+    let spec = || Ok(Spec { socket_dir: utf8(dir.to_owned(), "the socket dir")?, ..Spec::current()? });
+    managed_start(&s, reason, &spec, &detached, &client::log_line)
+}
+
+/// Start a daemon as [`plan`] says. With a unit installed: rewrite it from
+/// `spec` if planned, then have the manager start it ([`manager_start`]).
+/// Any failure there is one `log` line and a `detached` start instead; the
+/// client's poll then connects to whichever daemon comes up.
+fn managed_start(
+    s: &Setup,
+    reason: StartReason,
+    spec: &dyn Fn() -> Result<Spec>,
+    detached: &dyn Fn() -> Result<()>,
+    log: &dyn Fn(&str),
+) -> Result<()> {
+    let unit = s.unit_path();
+    let installed = unit.is_file();
+    // Unreadable or unparsable counts as gone: rewriting it is the fix.
+    let exe_exists = installed
+        && std::fs::read_to_string(&unit)
+            .ok()
+            .and_then(|text| unit_exe(s.manager, &text))
+            .is_some_and(|exe| Path::new(&exe).exists());
+    let plan = plan(installed, exe_exists, reason);
+    if plan.via == Via::Detached {
+        return detached();
+    }
+    let managed = (|| {
+        if plan.rewrite {
+            let spec = spec()?;
+            write_unit(s, &spec)?;
+            let why = if reason == StartReason::Handoff { "newer binary" } else { "its binary is gone" };
+            log(&format!("pointed {} at {} ({why})", unit.display(), spec.exe));
+        }
+        manager_start(s, &unit, reason, plan.rewrite)
+    })();
+    match managed {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            log(&format!(
+                "cannot start {} through the service manager, starting an unmanaged daemon: {e:#}",
+                unit.display()
+            ));
+            detached()
+        }
+    }
+}
+
+/// The manager calls for a client's start. A handoff restarts (the old
+/// daemon may still be draining, which counts as running; the new one waits
+/// for its lock). A plain start starts, reloading first if the unit was
+/// rewritten. launchd: a changed plist or a handoff is bootout + bootstrap;
+/// otherwise `kickstart` (starts the loaded job if it isn't running), and
+/// bootstrap if that fails (the job isn't loaded).
+fn manager_start(s: &Setup, unit: &Path, reason: StartReason, rewrote: bool) -> Result<()> {
+    match s.manager {
+        Manager::Systemd => {
+            if rewrote {
+                s.check("systemctl", &["--user", "daemon-reload"])?;
+            }
+            let verb = if reason == StartReason::Handoff { "restart" } else { "start" };
+            s.check("systemctl", &["--user", verb, SYSTEMD_UNIT])
+        }
         Manager::Launchd => {
-            let target = s.launchd_target();
-            // Not loaded is fine (a first install).
-            let _ = (s.run)("launchctl", &["bootout", &target]);
-            let domain = format!("gui/{}", s.uid);
-            let plist = unit.to_str().context("the plist path is not UTF-8")?;
-            let mut attempt = 1;
-            loop {
-                match s.check("launchctl", &["bootstrap", &domain, plist]) {
-                    Ok(()) => return Ok(()),
-                    Err(e) if attempt >= BOOTSTRAP_ATTEMPTS => return Err(e),
-                    Err(_) => {
-                        attempt += 1;
-                        std::thread::sleep(s.retry_gap);
-                    }
-                }
+            if rewrote || reason == StartReason::Handoff {
+                return bootstrap(s, unit);
+            }
+            match s.check("launchctl", &["kickstart", &s.launchd_target()]) {
+                Ok(()) => Ok(()),
+                Err(_) => bootstrap(s, unit),
             }
         }
     }
@@ -455,6 +632,7 @@ pub fn uninstall(s: &Setup) -> Result<String> {
 mod tests {
     use std::os::unix::process::ExitStatusExt;
     use std::process::ExitStatus;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use super::*;
@@ -791,5 +969,195 @@ WantedBy=default.target
         assert_eq!(stop(&sock, &Mutex::new(Some(lazy))), Exit::Shutdown);
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&sock);
+    }
+
+    #[test]
+    fn client_starts_plan_by_reason_and_unit_state() {
+        use StartReason::{Handoff, NothingAnswering};
+        let p = |rewrite, via| Plan { rewrite, via };
+        assert_eq!(plan(false, false, Handoff), p(false, Via::Detached));
+        assert_eq!(plan(false, true, NothingAnswering), p(false, Via::Detached));
+        assert_eq!(plan(true, true, Handoff), p(true, Via::Manager), "newest binary wins");
+        assert_eq!(plan(true, false, Handoff), p(true, Via::Manager));
+        assert_eq!(plan(true, true, NothingAnswering), p(false, Via::Manager), "an older binary keeps its hands off");
+        assert_eq!(plan(true, false, NothingAnswering), p(true, Via::Manager), "a stale path is repointed");
+    }
+
+    #[test]
+    fn unit_exe_reads_back_what_render_wrote() {
+        let exes = [
+            "/usr/bin/devsandbox",
+            "/opt/dev sandbox/bin/devsandbox",
+            "/a/100%/$HOME",
+            "/a/%%/$$",
+            r#"/a b/"q"\$x%"#,
+            "/x/<&amp;>'\"/y",
+            "/n\nl",
+        ];
+        for exe in exes {
+            let spec = Spec { exe: exe.into(), ..spec() };
+            assert_eq!(unit_exe(Manager::Systemd, &render_systemd(&spec)).as_deref(), Some(exe), "{exe:?}");
+            assert_eq!(unit_exe(Manager::Launchd, &render_launchd(&spec)).as_deref(), Some(exe), "{exe:?}");
+        }
+        assert_eq!(unit_exe(Manager::Systemd, "[Service]\nExecStart=\"/unterminated\n"), None);
+        assert_eq!(unit_exe(Manager::Systemd, "[Service]\nExecStart=\n"), None);
+        assert_eq!(unit_exe(Manager::Systemd, "x"), None);
+        assert_eq!(unit_exe(Manager::Launchd, "<key>ProgramArguments</key><array></array>"), None);
+    }
+
+    /// [`managed_start`] with `spec` as this binary's: how many detached
+    /// starts it made, and its log lines.
+    fn managed(s: &Setup, reason: StartReason, spec: &Spec) -> (usize, Vec<String>) {
+        let detached = AtomicUsize::new(0);
+        let logs = Mutex::new(Vec::new());
+        let spawn = || {
+            detached.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        };
+        managed_start(s, reason, &|| Ok(spec.clone()), &spawn, &|m| logs.lock().unwrap().push(m.to_string())).unwrap();
+        (detached.into_inner(), logs.into_inner().unwrap())
+    }
+
+    /// A unit spec whose binary exists (this test binary), and one whose is gone.
+    fn alive_and_gone(new: &Spec, root: &Path) -> (Spec, Spec) {
+        let alive = std::env::current_exe().unwrap().to_str().unwrap().to_string();
+        let gone = root.join("gone/devsandbox").to_str().unwrap().to_string();
+        (Spec { exe: alive, ..new.clone() }, Spec { exe: gone, ..new.clone() })
+    }
+
+    #[test]
+    fn systemd_client_start_follows_the_plan() {
+        use StartReason::{Handoff, NothingAnswering};
+        let root = scratch("ms-sd");
+        let units = root.join("systemd/user");
+        let fake = Fake::new(|_, _| output(0, ""));
+        let run = |p: &str, a: &[&str]| fake.run(p, a);
+        let s = setup(Manager::Systemd, &units, &run);
+        let new = spec_at(&root.join("sock"), &root);
+        let (old, gone) = alive_and_gone(&new, &root);
+        let unit = || std::fs::read_to_string(s.unit_path()).unwrap();
+
+        // No unit: detached, as before; nothing written, no manager call.
+        assert_eq!(managed(&s, Handoff, &new), (1, vec![]));
+        assert_eq!(managed(&s, NothingAnswering, &new), (1, vec![]));
+        assert!(fake.calls().is_empty() && !s.unit_path().exists());
+
+        // A plain start with the unit's binary present leaves the unit alone.
+        write_unit(&s, &old).unwrap();
+        assert_eq!(managed(&s, NothingAnswering, &new), (0, vec![]));
+        assert_eq!(unit(), render_systemd(&old));
+        assert_eq!(fake.calls(), ["systemctl --user start devsandbox.service"]);
+
+        // A handoff repoints it at this binary and restarts it.
+        let (detached, logs) = managed(&s, Handoff, &new);
+        assert_eq!(detached, 0);
+        assert_eq!(unit(), render_systemd(&new));
+        assert_eq!(logs.len(), 1);
+        assert!(logs[0].contains("at /usr/bin/devsandbox (newer binary)"), "{logs:?}");
+        assert_eq!(fake.calls()[1..], ["systemctl --user daemon-reload", "systemctl --user restart devsandbox.service"]);
+
+        // The unit's binary is gone: a plain start repoints it first.
+        write_unit(&s, &gone).unwrap();
+        let (detached, logs) = managed(&s, NothingAnswering, &new);
+        assert_eq!(detached, 0);
+        assert_eq!(unit(), render_systemd(&new));
+        assert!(logs[0].contains("(its binary is gone)"), "{logs:?}");
+        assert_eq!(fake.calls()[3..], ["systemctl --user daemon-reload", "systemctl --user start devsandbox.service"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn launchd_client_start_kickstarts_or_reloads() {
+        use StartReason::{Handoff, NothingAnswering};
+        let root = scratch("ms-ld");
+        let agents = root.join("Library/LaunchAgents");
+        let loaded = Arc::new(AtomicBool::new(true));
+        let fake = {
+            let loaded = Arc::clone(&loaded);
+            Fake::new(move |call, _| {
+                if call.starts_with("launchctl kickstart") && !loaded.load(Ordering::SeqCst) {
+                    return output(113, "Could not find service");
+                }
+                output(0, "")
+            })
+        };
+        let run = |p: &str, a: &[&str]| fake.run(p, a);
+        let s = setup(Manager::Launchd, &agents, &run);
+        let new = spec_at(&root.join("sock"), &root);
+        let (old, gone) = alive_and_gone(&new, &root);
+        let plist = || std::fs::read_to_string(s.unit_path()).unwrap();
+        let kickstart = "launchctl kickstart gui/501/dev.devsandbox.serve".to_string();
+        let bootout = "launchctl bootout gui/501/dev.devsandbox.serve".to_string();
+        let bootstrap = format!("launchctl bootstrap gui/501 {}", s.unit_path().display());
+
+        // Loaded and present: kickstart, the plist untouched.
+        write_unit(&s, &old).unwrap();
+        assert_eq!(managed(&s, NothingAnswering, &new), (0, vec![]));
+        assert_eq!(plist(), render_launchd(&old));
+        assert_eq!(fake.calls(), [kickstart.clone()]);
+
+        // Not loaded: kickstart fails, so bootstrap it.
+        loaded.store(false, Ordering::SeqCst);
+        assert_eq!(managed(&s, NothingAnswering, &new), (0, vec![]));
+        assert_eq!(fake.calls()[1..], [kickstart, bootout.clone(), bootstrap.clone()]);
+
+        // A handoff rewrites and reloads.
+        let (detached, logs) = managed(&s, Handoff, &new);
+        assert_eq!((detached, logs.len()), (0, 1));
+        assert_eq!(plist(), render_launchd(&new));
+        assert_eq!(fake.calls()[4..], [bootout.clone(), bootstrap.clone()]);
+
+        // A stale binary path: rewrite and reload, no kickstart.
+        write_unit(&s, &gone).unwrap();
+        let (detached, logs) = managed(&s, NothingAnswering, &new);
+        assert_eq!((detached, logs.len()), (0, 1));
+        assert_eq!(plist(), render_launchd(&new));
+        assert_eq!(fake.calls()[6..], [bootout, bootstrap]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_failing_manager_falls_back_to_a_detached_start() {
+        use StartReason::{Handoff, NothingAnswering};
+        let root = scratch("ms-fail");
+        let units = root.join("systemd/user");
+        let new = spec_at(&root.join("sock"), &root);
+        let (old, _) = alive_and_gone(&new, &root);
+
+        // The manager refuses: the unit is still rewritten, the start detached.
+        let fake = Fake::new(|call, _| match call {
+            "systemctl --user restart devsandbox.service" => output(1, "Failed to connect to bus: No medium found"),
+            _ => output(0, ""),
+        });
+        let run = |p: &str, a: &[&str]| fake.run(p, a);
+        let s = setup(Manager::Systemd, &units, &run);
+        write_unit(&s, &old).unwrap();
+        let (detached, logs) = managed(&s, Handoff, &new);
+        assert_eq!((detached, logs.len()), (1, 2));
+        assert!(logs[1].contains("unmanaged") && logs[1].contains("No medium found"), "{logs:?}");
+
+        // No `systemctl` at all.
+        let missing = |p: &str, _: &[&str]| -> Result<Output> { bail!("cannot run `{p}`") };
+        let s = setup(Manager::Systemd, &units, &missing);
+        write_unit(&s, &old).unwrap();
+        let (detached, logs) = managed(&s, NothingAnswering, &new);
+        assert_eq!((detached, logs.len()), (1, 1));
+        assert!(logs[0].contains("cannot run `systemctl`"), "{logs:?}");
+
+        // This binary's spec can't be built: the unit is left as it was.
+        let fake = Fake::new(|_, _| output(0, ""));
+        let run = |p: &str, a: &[&str]| fake.run(p, a);
+        let s = setup(Manager::Systemd, &units, &run);
+        write_unit(&s, &old).unwrap();
+        let detached = AtomicUsize::new(0);
+        let spawn = || {
+            detached.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        };
+        managed_start(&s, Handoff, &|| bail!("the socket dir is not UTF-8"), &spawn, &|_| {}).unwrap();
+        assert_eq!(detached.into_inner(), 1);
+        assert_eq!(std::fs::read_to_string(s.unit_path()).unwrap(), render_systemd(&old));
+        assert!(fake.calls().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

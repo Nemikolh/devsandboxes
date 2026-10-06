@@ -42,7 +42,9 @@ plumbing: commands start it themselves (*lazy start*):
 1. The client connects to `serve.sock` and sends a `hello`.
 2. Nothing answers: it spawns `devsandbox serve` detached (`setsid`, cwd `/`,
    stdin `/dev/null`, stdout+stderr appended to `serve.log`) and polls the
-   socket for up to 5 s. It starts at most one daemon per attempt.
+   socket for up to 5 s. It starts at most one daemon per attempt. With a
+   unit installed (*Boot start*), it starts that unit through the service
+   manager instead (*Starts with a unit installed*).
 3. **Races:** the daemon holds an exclusive lock on `serve.lock` for its whole
    life. A second daemon that finds the lock held and the socket answering
    exits 0 quietly, so of two concurrent starts the loser's client connects
@@ -159,8 +161,10 @@ is newer than the daemon, the daemon:
 3. closes idle connections and lets in-flight requests finish (up to 5 s),
 4. exits, releasing the lock.
 
-The client then spawns its own daemon, which waits for the lock and takes
-over. Older and equal clients just proceed. Connections that subscribed to
+The client then starts its own daemon, which waits for the lock and takes
+over: spawned detached, or, with a unit installed, the unit repointed at
+the client's binary and restarted through the manager (*Boot start*), so
+the managed daemon follows upgrades. Older and equal clients just proceed. Connections that subscribed to
 notifications get a `closing` notification (`"reason":"handoff"`) before
 the close.
 
@@ -220,7 +224,8 @@ for you.
 | macOS | `~/Library/LaunchAgents/dev.devsandbox.serve.plist` (label `dev.devsandbox.serve`) | `launchctl bootout gui/<uid>/dev.devsandbox.serve` (failure ignored), `launchctl bootstrap gui/<uid> <plist>` (retried up to 3 times) |
 
 Other unix systems get an error. The unit runs the installing binary's
-absolute, symlink-resolved path with `serve --keep-alive --socket-dir
+(or, after a handoff, the newer client's; see below) absolute,
+symlink-resolved path with `serve --keep-alive --socket-dir
 <dir>`, the socket dir resolved at install time, and appends stdout and
 stderr to `serve.log` (systemd `StandardOutput=append:`, launchd
 `StandardOutPath`).
@@ -234,9 +239,8 @@ your shell's commands). Not `SSH_AUTH_SOCK`: it rotates, and clients report
 theirs (`bridges.ensure`, *Bridges*). Not `DISPLAY` either: popups from a
 managed daemon need the manager to have it (`systemctl --user
 import-environment DISPLAY`). **Run `serve install` again** after changing
-`PATH`, the runtime or its context, or the binary's location (a package
-manager upgrade that moves the resolved path, e.g. Homebrew's versioned
-`Cellar` dir, breaks the unit until you do).
+`PATH`, the runtime or its context (a handoff's rewrite, below, also
+captures them afresh, from whichever command triggered it).
 
 **Install steps.** Write the unit (creating its dir and the `serve.log`
 dir). If a daemon answers on the socket, managed or started on demand, send
@@ -255,13 +259,33 @@ clean exit doesn't. Deliberately: a version handoff exits 0, and an
 a loop. So would a manager-started daemon finding another one already
 answering (it exits 0 at once, *Start*).
 
-**Handoff with a managed daemon.** When a newer CLI connects (an upgrade, a
-rebuilt dev binary), the managed daemon hands off as usual and exits 0; the
-newer client starts its own daemon *on demand*: unmanaged, without
-`--keep-alive`, so it idles out like any other. The unit stays stopped
-(systemd shows it inactive, not failed) until the next login or
-`devsandbox serve install`, which also points the unit at the new binary.
-Run `install` after every upgrade.
+**Starts with a unit installed.** Every lazy start (*Start*) first checks
+for the unit file above. Without one it spawns detached, as before. With
+one, the unit follows upgrades:
+
+| why the client starts one | unit's binary | what it does |
+|---|---|---|
+| handoff (the client is newer) | any | rewrite the unit from the client's binary and env (what `serve install` writes), then systemd `daemon-reload` + `restart devsandbox.service` / launchd bootout + bootstrap (retried) |
+| nothing answers | still exists | leave the unit as is; systemd `start devsandbox.service` / launchd `kickstart gui/<uid>/dev.devsandbox.serve`, else (not loaded) bootout + bootstrap |
+| nothing answers | gone | rewrite as for a handoff, then systemd `daemon-reload` + `start` / launchd bootout + bootstrap |
+
+"The unit's binary" is the first `ExecStart=` word / `ProgramArguments`
+string; a unit it can't read or parse counts as gone. So an upgrade that
+removes the old path (Homebrew's versioned `Cellar` dir, an npm install)
+repairs the unit on the next start, and an older binary starting a daemon
+doesn't take a working unit over. No `shutdown` is sent: after a handoff
+the old daemon is already draining, and the new one waits for its lock.
+The restart does signal a still-draining managed daemon, though, cutting
+its drain short (the manager's stop, not the 5 s drain).
+
+**Newest binary wins, dev builds included**: a rebuilt dev binary (newer
+`build`) that connects takes the unit over. Run `devsandbox serve install`
+from the binary you want to keep to point it back.
+
+A manager call that fails, or a manager that isn't there, is one line in
+`serve.log` and a detached start instead; the client's 5 s poll then
+connects to whichever daemon comes up. A rewrite is a `serve.log` line too.
+Nothing goes to stderr (the dashboard starts daemons too).
 
 **Uninstall.** `devsandbox serve uninstall`: on Linux `systemctl --user
 disable --now devsandbox.service`, remove the file, `daemon-reload` (a
