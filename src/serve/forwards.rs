@@ -54,6 +54,9 @@ pub const POLL: Duration = Duration::from_millis(500);
 /// How long an API request waits for the registry's answer (a sync binding
 /// several configured forwards may be ahead of it in the queue).
 const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a restore retries a saved host port that's taken before it
+/// falls back to the next free one.
+const RESTORE_PORT_WAIT: Duration = Duration::from_secs(1);
 
 /// One row of `forwards.list`: the dashboard's Ports-tab row plus the forward's
 /// config root.
@@ -388,7 +391,18 @@ impl Daemon {
         };
         let mut next_id = self.next_id;
         let root = self.root(&dir);
-        let started = match root.start_adhoc(entry.clone(), HostPort::Fixed(entry.host_port), &mut next_id) {
+        // Retried briefly before falling back: right after a handoff, or while
+        // some process's fork briefly holds the old listener, the saved port
+        // frees within moments, and moving the forward would surprise.
+        let deadline = std::time::Instant::now() + RESTORE_PORT_WAIT;
+        let mut first = root.start_adhoc(entry.clone(), HostPort::Fixed(entry.host_port), &mut next_id);
+        while matches!(&first, Err(e) if e.kind() == std::io::ErrorKind::AddrInUse)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(50));
+            first = root.start_adhoc(entry.clone(), HostPort::Fixed(entry.host_port), &mut next_id);
+        }
+        let started = match first {
             Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => root
                 .start_adhoc(entry.clone(), HostPort::Prefer(entry.host_port), &mut next_id)
                 .map(|(_, now)| (now, true)),
