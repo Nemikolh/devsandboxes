@@ -180,12 +180,13 @@ tab is empty and `p` says `port forwarding needs the host daemon: …`.
   the request to the daemon worker (`src/tui/daemon.rs`), which sends
   `forwards.add` (it never suspends the TUI); the answer is the status line.
 
-## Phase 4 — Inbox tab (notifications and dispatcher threads)
+## Phase 4 — Inbox tab (notifications and owner threads)
 
 Transport: `docs/automations.md` ("`devsbd notify`", _Inbox threads_);
-threads, events and their design: `docs/inbox-threads.md`. The Inbox shows the
-shared store (`inbox.toml` next to `state.toml`, `src/inbox/`), which every
-dashboard reads under a lock. The host daemon (`devsandbox serve`) applies
+threads, events and their design: `docs/inbox-redesign.md` (superseding the
+thread model of `docs/inbox-threads.md`). The Inbox shows the shared store
+(`inbox.json` next to `state.toml`, `src/inbox/`), which every dashboard
+reads under a lock. The host daemon (`devsandbox serve`) applies
 each delivered record to it; the dashboard's daemon worker
 (`src/tui/daemon.rs`) relays its `inbox.changed` (reload now) and
 `inbox.shown` (the record, briefly on the status line). The event loop also
@@ -200,9 +201,9 @@ is connected, else applied through `inbox::ops::apply` by the event loop
   all four. Its title carries the **needs-you** count (`Inbox (3)`), and an
   Instances row shows the same count for that instance as a yellow `✉N`
   after its name (matched by `instance_id`, so a renamed instance keeps it).
-  Needs-you = dispatcher threads in state `needs-you` plus unread notify
-  records; archived threads never count. Unread alone doesn't, so a
-  dispatcher re-asserting threads can't inflate it.
+  Needs-you = owner threads in state `needs-you` plus unread notify
+  records; archived threads never count. Unread alone doesn't, so an
+  owner re-asserting threads can't inflate it.
 - **Layout: side by side, always.** The list is on the left, the selected
   thread's pane on the right — no open/close, the pane always shows whatever
   the cursor is on (`src/tui/ui.rs` `draw_inbox`/`inbox_areas`). The divider
@@ -249,9 +250,9 @@ is connected, else applied through `inbox::ops::apply` by the event loop
   thread pane; `r`/`i` focus its reply input (when the thread takes
   replies); `o`/`t`/`l`/`p` target the selected thread's child (or its
   sender with none); `d` dismisses a notify thread with its history, or
-  marks a dispatcher thread done (with an event, and its child done); `u`
-  reopens a done thread; `D` clears every notify thread (dispatcher threads
-  are state their dispatcher re-asserts, so they stay); `1`–`4` still switch
+  marks an owner thread done (with an event, and its child done); `u`
+  reopens a done thread; `D` clears every notify thread (owner threads
+  are state their owner re-asserts, so they stay); `1`–`4` still switch
   tabs.
 
 Keys go to one of four focus zones (`InboxFocus`): **List** (above), the
@@ -276,7 +277,7 @@ shared with `inbox_hit`). Top to bottom:
   **action row**: `[1] Label` per owner action (`⌂` = a host verb, run in
   the dashboard; `✓` = also marks done; the rest is an event for the sender,
   which the status line says on press) and `[o] VS Code  [t] Terminal  [l]
-  Logs  [p] Port`, the target keys, on a live dispatcher thread whose target
+  Logs  [p] Port`, the target keys, on a live owner thread whose target
   resolves. A button that would start its stopped target first (below) gets
   a dim ` (stopped)` after its label: a `vscode`/`terminal`/`forward` host
   action and `[o]`/`[t]`/`[p]`, not `[l]`. The row wraps between buttons. A notify thread's header is its
@@ -289,7 +290,7 @@ shared with `inbox_hit`). Top to bottom:
   wheel over it too).
 - **Feed, newest first** (`app::inbox::pane_feed`), scrolling on its own
   (scroll 0 = the newest item at the top, `g`/`G` newest/oldest): `N events
-  waiting for <sender>` first while the dispatcher hasn't acked them (state,
+  waiting for <sender>` first while the owner hasn't acked them (state,
   not history), then messages (stamp + author, `(edited)`/`(withdrawn)`,
   markdown and fields blocks; a form block is one dim `form: <title> · open,
   pinned above` line while open, `form: <title> · submitted <time>` over
@@ -306,15 +307,15 @@ Mouse selection: the feed is `RegionId::InboxThread` (a rows document, so a
 selection outlives a scroll); the header is `RegionId::InboxHeader`, plain
 screen cells (it doesn't scroll). The composer isn't selectable.
 
-**Markdown.** Dispatcher text is often LLM output, so the pane renders it
-(`src/tui/markdown.rs`, `pulldown-cmark`): the message and notify bodies as
-blocks (bold accented headings, emphasis, tinted inline code and code
+**Markdown.** Owner text is often LLM output, so the pane renders it
+(`src/tui/markdown.rs`, `pulldown-cmark`): messages' markdown blocks and
+notify bodies as blocks (bold accented headings, emphasis, tinted inline code and code
 blocks, bullet/numbered lists with hanging indents, `│` quotes, dim rules,
 links as underlined text plus a dim `(url)`, raw HTML literal, images as
 their alt text, tables as aligned columns under a bold header and a dim
 rule when they fit, widest columns cut to 8 with `…` first, else their
-source lines), and a reply's full text the same way, under its timeline
-row; the title, status, other timeline rows and the cards' title/status
+source lines), and a reply's full text the same way, under its feed
+row; the title, status, other feed rows and the cards' title/status
 inline only (code, emphasis, links as text,
 one line). Every pane line is word-wrapped by display width by the renderer
 itself, so the scroll bound is the exact row count. `m` shows the source
@@ -336,7 +337,7 @@ Container text has its control characters stripped when stored
 | `m` | toggle rendered markdown / raw source (all threads, not saved) |
 
 **The reply input** sits at the bottom of the thread pane and is only drawn
-when the thread sets `reply` (`draw_inbox_pane`/`draw_reply_input`,
+when the thread sets `compose` (or the older `reply`; `draw_inbox_pane`/`draw_reply_input`,
 `src/tui/ui.rs`), with the thread's `compose.hint` as one dim row under the
 box (cut to the width with `…`); a thread without one gets a one-line dim
 no-replies hint in its place, a notify thread gets nothing. It wraps what's typed by display width

@@ -26,7 +26,7 @@ devsandbox port api --service postgres 5432     # a service api uses
 - `--service`: forward a service's port instead of the instance's.
 - `--address`: the host address to bind (default `127.0.0.1`).
 
-From the dashboard: `p` on an instance or service, type the port; live forwards are on the **Ports** tab (`3`). To have the dashboard forward a port whenever the instance runs, add `forwardPorts = [3000]` to the sandbox ([`forwardPorts`](/docs/config#implemented-devcontainer-properties)).
+From the dashboard: `p` on an instance or service, type the port; live forwards are on the **Ports** tab (`3`). The [host daemon](/docs/host-daemon) keeps them, so they last after you close the dashboard and come back on the same host port, until `d` stops them; `devsandbox port` forwards only while it runs. To forward a port whenever the instance runs, add `forwardPorts = [3000]` to the sandbox ([`forwardPorts`](/docs/config#implemented-devcontainer-properties)).
 
 ## How it works
 

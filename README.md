@@ -40,7 +40,8 @@ devsandbox              # the dashboard
 | `vscode <name> [--goto PATH[:LINE[:COL]]]` | Open VS Code attached to the instance, optionally at a file and line      |
 | `done` / `undone <name>`                   | Mark an instance done (kept as is, shown dimmed) / clear the mark         |
 | `port <name> [--service s] <port…>`        | Forward a container/service port to the host until exited                 |
-| `inbox ls\|show\|reply\|act\|submit\|done`  | Read and answer Inbox threads (docs/inbox-cli.md)                          |
+| `inbox ls\|show\|reply\|act\|submit\|done\|reopen` | Read and answer Inbox threads (docs/inbox-cli.md)                   |
+| `serve install` / `serve uninstall`        | Run the host daemon from login (it otherwise starts on demand; docs/serve.md) |
 | `service ls` / `service rebuild`           | List services / recreate one and rewire running sandboxes in place        |
 | `gc [--force]`                             | Reap unreferenced services, orphaned history files and agent links        |
 | `status --json`                            | Full snapshot for scripts; `ps`/`ls`/`stats`/`inspect`/`run`/`inbox` take `--json` |
@@ -64,7 +65,7 @@ dispatcher = { spawn = ["web-app"], max-instances = 2 }
 postStartCommand = "nohup ./babysit-loop.sh >babysit.log 2>&1 &"
 ```
 
-Inside a sandbox, `devsbd notify "PR 123 needs you"` reaches the dashboard's Inbox tab and your desktop; a dispatcher manages its children with `devsbd`, an embedded in-container helper present in all sandboxes to interact with the host. Notifications and control need the dashboard open. Guide, sample dispatcher, and limitations: [`docs/automations-guide.md`](docs/automations-guide.md).
+Inside a sandbox, `devsbd notify "PR 123 needs you"` reaches the dashboard's Inbox tab and your desktop; a dispatcher manages its children with `devsbd`, an embedded in-container helper present in all sandboxes to interact with the host. Notifications, control and port forwards are served by a per-user host daemon (`devsandbox serve`) that devsandbox starts on demand, so they keep working with the dashboard closed; `devsandbox serve install` starts it at login for sandboxes the runtime restarts on boot. Guide, sample dispatcher, and limitations: [`docs/automations-guide.md`](docs/automations-guide.md).
 
 ## Platform support
 

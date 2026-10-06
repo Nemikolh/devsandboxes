@@ -1,6 +1,8 @@
 # Inbox redesign: conversations, forms, any client
 
-Status: planned (2026-10-06). Supersedes the thread model of
+Status: implemented through step 20 (2026-10-06); 13b (remove the v2
+put/event compat) pending, timed with the dispatcher's migration. Supersedes
+the thread model of
 `inbox-threads.md` (single overwritten `message` + field-change timeline,
 free-text reply only, TUI-only events, dashboard-only control path, threads
 reserved to `dispatcher` instances). The locked store, done instances, host
@@ -255,7 +257,8 @@ to the owner in events.
   pass) except plain notify records, which are carried over as notify
   threads. No compatibility shim for v2 `thread put` bodies: the helper
   version bump (below) makes the host reject old shapes with an error record
-  that says to update the dispatcher.
+  that says to update the dispatcher. (As built: a temporary shim keeps
+  v2 puts and the event `key` working until 13b, *Follow-ups*.)
 - The per-owner cap of 200 records is too small once messages exist. New caps:
   200 threads per owner, 300 feed items per thread (oldest markers dropped
   first, then oldest messages without an open form), events unchanged. Retention
@@ -673,6 +676,38 @@ store ops, schema rules), TestBackend renders for the pane and form.
 
 The dispatcher plan can start right after step 5 (it works with the TUI
 closed), switch to messages after 13, forms after 17, and `--follow` after 18.
+
+## Follow-ups
+
+### 13b
+
+Step 13 landed as 13a (`thread send`/`withdraw`, `thread ls --feed`) with
+the v2 shapes still accepted, so the running PR babysitter keeps working.
+13b removes that compat once the dispatcher has moved to messages, `compose`
+and `thread`. Every site is tagged `v2 put compat` or `v2 event compat` in
+`src/`:
+
+- **Puts.** `ThreadPut::message` and `ThreadPut::reply`, the `Reply` type,
+  `ThreadPut::compose()`'s fallback to `reply` and the `reply.placeholder`
+  check (`src/inbox/thread.rs`); the `header-message` feed item a put's
+  `message` becomes, `feed::HEADER_MESSAGE`, `header_message`,
+  `HeaderChange`, `header_change`, `apply_header_change`
+  (`src/inbox/feed.rs`), `Inbox::apply_header` and its calls in
+  `Inbox::put`, the popup body quoting `message`, the sanitizing of both
+  fields (`src/inbox/mod.rs`); the reserved `header-message` id in
+  `src/inbox/message.rs`. With `deny_unknown_fields`, an old-shape put then
+  becomes a `thread put rejected` error record.
+- **`thread ls`.** `Thread::to_put` stops echoing `message`/`reply`
+  (`src/inbox/mod.rs`), and `message_rows` stops skipping the header message
+  (`src/commands/dispatch.rs`).
+- **Events.** `EventLine::key`, the deprecated alias of `thread`
+  (`src/commands/dispatch.rs`), and its mention in `src/devsbd/control.rs`'s
+  module doc.
+- **Tests and docs.** The tagged tests in `src/inbox/mod.rs`,
+  `src/commands/dispatch.rs` and `src/tui/app/inbox.rs`; the compat notes in
+  `docs/automations-guide.md` (the put's old fields, `key` on events) and
+  `docs/automations.md` (`key` in the `events` line, the `header-message`
+  item).
 
 ## Open questions
 

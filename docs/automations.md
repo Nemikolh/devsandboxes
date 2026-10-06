@@ -18,7 +18,7 @@ Two shapes fall out:
 
 devsandbox does **not** grow a workflow DSL. The logic (what to watch, when to act) lives in a user-written **dispatcher script** running in a sandbox; devsandbox gives it a small, capability-scoped control API. A declarative layer may emerge later from real dispatchers (_Future_).
 
-Non-goals: launchd/systemd units or any always-on host daemon; credential isolation (see `docs/cli-proxy.md`, orthogonal); webhooks/inbound events.
+Non-goals: credential isolation (see `docs/cli-proxy.md`, orthogonal); webhooks/inbound events. (An always-on host daemon started as a non-goal; it exists now as `devsandbox serve`, with opt-in systemd/launchd units, because a dispatcher needs a live host with no dashboard open: `docs/serve.md`.)
 
 ## Building blocks
 
@@ -28,7 +28,7 @@ Non-goals: launchd/systemd units or any always-on host daemon; credential isolat
 | `devsbd notify` | every sandbox, no opt-in | tell the human something (TUI + desktop) |
 | `dispatcher` control API | only sandboxes declaring `dispatcher` | ensure/stop/rm/done/exec child instances |
 | runs | dispatchers (via `exec --detach`) | tracked, logged agent invocations |
-| Inbox threads + events | only sandboxes declaring `inbox = true` (a dispatcher wanting threads declares both) | open items the user can act on; their clicks and replies come back as events (_Inbox threads_, `docs/inbox-threads.md`) |
+| Inbox threads + events | only sandboxes declaring `inbox = true` (a dispatcher wanting threads declares both) | open items the user can act on; their replies, actions and form submissions come back as events (_Inbox threads_, `docs/inbox-redesign.md`) |
 
 ## `autostart`
 
@@ -40,7 +40,7 @@ autostart = true        # devsandbox-driven
 
 ### `true` — devsandbox-driven, once per boot
 
-The first TUI load, or the user's own `devsandbox run` / `start` (after it completes), after a boot starts every `autostart` sandbox's stopped instances (as `devsandbox start`: devsbd install, `postStartCommand`, bridges). A sandbox with no instance yet gets one (`run` semantics). Other CLI commands never trigger it.
+The host daemon's start (`devsandbox serve`, `docs/serve.md`, _Autostart_), the first TUI load, or the user's own `devsandbox run` / `start` (after it completes), after a boot starts every `autostart` sandbox's stopped instances (as `devsandbox start`: devsbd install, `postStartCommand`, bridges). A sandbox with no instance yet gets one (`run` semantics). Other CLI commands never trigger it.
 
 "Once per boot" is keyed on the host boot id, recorded per config root in `state.toml` (`autostart_boot`: project id → boot id):
 
@@ -65,7 +65,7 @@ The runtime only restarts the *container*. Nothing devsandbox runs via `exec` co
 
 - `devsbd boot` then runs `postStartCommand` on every container start (as `remoteUser`, `workspaceFolder`, `remoteEnv` — same as `start`), from a boot file the host writes at `/run/devsandbox/boot`, output appended to `/run/devsandbox/boot.log`. The host `start` never runs it for these instances (`run` still does at create, before the helper exists).
 
-This is what makes a dispatcher's loop survive a reboot with no devsandbox process around. Anything needing the host (control API, forwards, ssh-agent) resumes when one connects (see _No host connected_).
+This is what makes a dispatcher's loop survive a reboot with no devsandbox process around. Anything needing the host (control API, forwards, ssh-agent) resumes once the host daemon runs: started by the first devsandbox command that needs it, or at login with `devsandbox serve install` (see _No host connected_).
 
 `autostart` should be excluded from `config_hash`: flipping it can be applied in place (`docker update --restart …`) instead of marking the instance drifted.
 
@@ -79,7 +79,7 @@ devsbd notify [--level info|warn|error] [--link URL] [--key K] "PR 123 needs you
 
 - Delivered to the TUI inbox (badge on the instance, an inbox view listing notifications with source instance, time, link) **and** as a desktop notification: `notify-send` on Linux, `osascript -e 'display notification …'` on macOS. A missing notifier is skipped silently.
 - `--key` dedupes: a newer notification with the same key replaces the older one (a dispatcher re-reporting "PR 123 conflicted" every poll doesn't spam).
-- **Queued**: written to a durable outbox in the container (`/var/lib/devsandbox/outbox/`, surviving container restarts), drained by the host whenever a notify-capable bridge is up. Only the host daemon's (`devsandbox serve`) bridges are (one-shot CLI commands don't drain). The history lives in the shared Inbox store (`inbox.toml`, _Inbox threads_ below), not in a dashboard.
+- **Queued**: written to a durable outbox in the container (`/var/lib/devsandbox/outbox/`, surviving container restarts), drained by the host whenever a notify-capable bridge is up. Only the host daemon's (`devsandbox serve`) bridges are (one-shot CLI commands don't drain). The history lives in the shared Inbox store (`inbox.json`, _Inbox threads_ below), not in a dashboard.
 
 ## Dispatchers
 
@@ -120,10 +120,10 @@ devsbd exec <key> [--sandbox S] [--detach] -- <cmd>...   # a run; see _Runs_
 devsbd events [--wait SECS] [--thread KEY]  # pending Inbox events (JSON lines); see _Inbox threads_
 devsbd events --follow [--thread KEY]       # the same, pushed over one held-open stream
 devsbd events ack <id>...
-devsbd thread ls                            # this instance's live threads (JSON; needs inbox = true)
+devsbd thread ls [--feed]                   # this instance's live threads (JSON; needs inbox = true)
 ```
 
-Exit codes: 0 ok, 1 failed, 2 usage (or a key shared by two sandboxes without `--sandbox`), 75 no host connected, 77 denied.
+Exit codes: 0 ok, 1 failed, 2 usage (or a key shared by two sandboxes without `--sandbox`), 75 no host connected (no host daemon reachable), 77 denied.
 
 The child-management ops answer JSON on stdout, so a dispatcher never parses prose: `ensure`/`stop`/`rm`/`done` one compact object line (above; `created` = the child didn't exist, `started` = it existed but wasn't up, both false = already running), `ls`/`branches` an array. Errors answer no JSON: a non-zero exit and the message on stderr.
 
@@ -149,11 +149,11 @@ Control needs the host (worktrees, `state.toml`, runtime calls, bridges), and af
 - `notify` is queued (above) — never lost.
 - Control operations **fail fast** with a dedicated exit code (e.g. 75, `EX_TEMPFAIL`) and a "no host connected" message. The script retries/waits. No durable command queue.
 
-The TUI serves control requests for every running dispatcher. Two TUIs don't both serve a request: the daemon routes each one to exactly one bridge, the newest whose host advertises `CONTROL`. One-shot CLI commands don't serve control.
+The host daemon (`devsandbox serve`, one per user) serves control requests for every running instance through its bridges; a running dispatcher or `inbox = true` instance keeps it from idling out. The in-container daemon routes each request to exactly one bridge, the newest whose host advertises `CONTROL`. Dashboards and one-shot CLI commands don't serve control.
 
 ## Inbox threads
 
-Design and rationale: `docs/inbox-threads.md`; user reference: `docs/automations-guide.md`. A sandbox declaring `inbox = true` (typically a dispatcher) puts **threads** (one item each: state, status, message, actions, reply box) into the Inbox and pulls **events** (what the user clicked or typed) back.
+Design and rationale: `docs/inbox-redesign.md` (which supersedes the thread model of `docs/inbox-threads.md`); user reference: `docs/automations-guide.md`. A sandbox declaring `inbox = true` (typically a dispatcher) puts **threads** into the Inbox (one item each: a header with state, status, actions and a reply box, plus a feed of the owner's messages and the user's replies, actions, submissions and markers) and pulls or follows **events** (what the user answered) back.
 
 ### Outbox records
 
@@ -171,7 +171,7 @@ The helper checks JSON syntax with a std-only validator (`devsbd/src/json.rs`, n
 
 ### Apply, then ack
 
-The bridge's notify handler applies a record to the store *before* replying `ok` (`bridge::handle_notify` → `apply_message` → `inbox::ops::sink`). A store failure sends no reply, the daemon keeps the file and resends it, so a dashboard dying mid-delivery loses nothing. `inbox::decide` turns each message into one store action:
+The bridge's notify handler applies a record to the store *before* replying `ok` (`bridge::handle_notify` → `apply_message` → `inbox::ops::sink`). A store failure sends no reply, the in-container daemon keeps the file and resends it, so a host daemon dying mid-delivery loses nothing. `inbox::decide` turns each message into one store action:
 
 - notify → push the record;
 - thread message from an instance whose sandbox doesn't declare `inbox = true` (`dispatch::declares_inbox`, evaluated only for thread messages) → an `error` notify record from that instance, key `thread:<key>`, `thread put|rm|send|withdraw denied: …`;
@@ -180,22 +180,22 @@ The bridge's notify handler applies a record to the store *before* replying `ok`
 - valid send → `Inbox::send`: no such thread of this owner → `thread send rejected: no thread `<key>`; put it first`; a new id is appended to the feed (`feed::send`), marks the thread unread and returns a popup when the header is `needs-you`; the same id with other blocks replaces the message in place and tags it `edited` (no unread, no popup); the same blocks again is a no-op; a withdrawn id sent again comes back in place, `edited`;
 - withdraw → `Inbox::withdraw`: tags the message `withdrawn` and keeps it; an unknown thread or id is a silent no-op.
 
-A put that changes nothing leaves the store byte-identical, so no write, no mtime bump, no popup, no status line. A change to `message`/`state`/`status` adds one timeline entry each and marks the thread unread; entering `needs-you` returns a desktop popup (key `thread:<key>`, through the per-instance rate limit). Retention (`Inbox::prune`) runs on this path: archived threads, and done threads with no pending events, go 14 days after their last change.
+A put that changes nothing leaves the store byte-identical, so no write, no mtime bump, no popup, no status line. A change to `state`/`status` adds a marker each (consecutive status-only markers collapse into one, `feed::push`) and marks the thread unread; a v2 put's `message` becomes the `header-message` feed item, inserted, edited in place or withdrawn as the field changes (v2 put compat, `docs/inbox-redesign.md`, _13b_); entering `needs-you` returns a desktop popup (key `thread:<key>`, through the per-instance rate limit). Retention (`Inbox::prune`) runs on this path: archived threads, and done threads with no pending events, go 14 days after their last change.
 
 ### The shared store
 
-`inbox.toml` next to `state.toml` (`src/inbox/store.rs`, format v2; v1 files migrate on load, names resolved to instance ids through `state.toml`, unresolvable ones archived). Every writer (bridges' notify sinks, every dashboard's `d`/`D`/mark-read and pane ops, the control handlers, `devsandbox rm`) goes through `src/inbox/ops.rs`, one `store::update_at` per op: exclusive `File::lock` on the sibling `inbox.lock`, load, mutate, write through a temp file + rename only when the content changed. Readers take a shared lock, best-effort. Dashboards reload when the file's mtime or length changes (checked each tick), so a dismissal in one is a dismissal in all. Before this, each dashboard kept its own copy and overwrote the file: an older dashboard brought back records dismissed in a newer one.
+`inbox.json` next to `state.toml` (`src/inbox/store.rs`, schema `version` 3). A missing store with an older `inbox.toml` (v1/v2) beside it starts from that file's notify records only (`Inbox::import_v2`; v1 names resolved to instance ids through `state.toml`); its threads are dropped (projections: an owner re-puts them) and the TOML file is left alone. Every writer (bridges' notify sinks, the API's `inbox.*` handlers, a dashboard without a daemon connection, `devsandbox inbox` with no daemon answering, the control handlers, `devsandbox rm`) goes through `src/inbox/ops.rs`, one `store::update_at` per op: exclusive `File::lock` on the sibling `inbox.lock`, load, mutate, write through a temp file + rename only when the content changed. Readers take a shared lock, best-effort. In-process writes wake waiters at once (`store::wait_changed`, the daemon's `inbox.changed`); dashboards also reload when the file's mtime or length changes (checked each tick), so a dismissal in one is a dismissal in all.
 
-Threads are keyed by `(owner instance_id, key)` and kind (a notify key and a thread key can coincide without meeting). Events live on their thread (`[[thread.event]]`) until acked; user ops (`Act`, `Reply`, `MarkDone`, `Reopen`) mint the event id (`e-<unix secs:010>-<4 hex>`) and time under the store lock, so a dashboard never applies them to its own copy first. The per-owner cap (200) counts notes, timeline entries and pending events; it evicts archived threads first, then done threads without pending events, then single oldest items, and never drops an event (each thread keeps at most 100, oldest dropped).
+Threads are keyed by `(owner instance_id, key)` and kind (a notify key and a thread key can coincide without meeting). Events live on their thread until acked; user ops (`Act`, `Reply`, `Submit`, `MarkDone`, `Reopen`) mint the event id (`e-<unix secs:010>-<4 hex>`) and time under the store lock, so a client never applies them to its own copy first. Each user feed item records the client that made it (`tui`, `cli`, `api:<name>`), never shown to owners. Caps: 200 threads per owner (`THREADS_PER_OWNER`: archived threads go first, then done ones without pending events, then the least recently changed without pending events; a thread holding unacked events is never evicted), 300 feed items per thread (`MAX_FEED`: oldest markers first, then the oldest messages without an open form) and 300 records per notify thread, 100 unacked events per thread (oldest dropped).
 
 ### Control ops
 
 `events`, `events-ack`, `thread-ls` and `done` join the control codec (`src/devsbd/control.rs`, whose module doc has the line format and the `events` JSON). `events` takes `timeout` (capped at `MAX_WAIT`, 300 s, by the helper and the host), `events-ack` a repeatable `ack <id>` field; neither takes `sandbox`, since they always address the requester's own threads. `events` takes an optional `key`: the thread filter (`devsbd events --thread`), reusing the codec's existing field rather than adding one, since a thread key has the child key's charset (`valid_key`); `events-ack` and `thread-ls` take no `key`.
 
-- `events`: the requester's pending events, oldest first across threads, one JSON object per line (`id`, `thread`, `key`, `kind` = action|reply|done|reopen|submit, `action?`, `text?`, `message?`, `form?`, `answers?`, `at` RFC 3339 UTC). `key` is the deprecated v2 name of `thread`, same value, removed with the other v2 compat (step 13b of `docs/inbox-redesign.md`). All of them until acked: delivery is at least once. With a `key` filter, only that thread's events are answered and waited for; an unknown thread answers none (a dispatcher may filter before its first put lands). With a `timeout` and nothing pending, the handler thread waits, re-reading the store only when its stamp moves (every 500 ms). It holds no lock beyond the store's shared one and skips the host control lock, so a waiting `events` never delays a click being written or another dispatcher's `ensure`. The body stops at about half of `MAX_RESPONSE`; the rest follows after an ack.
+- `events`: the requester's pending events, oldest first across threads, one JSON object per line (`id`, `thread`, `key`, `kind` = action|reply|done|reopen|submit, `action?`, `text?`, `message?`, `form?`, `answers?`, `at` RFC 3339 UTC). `key` is the deprecated v2 name of `thread`, same value, removed with the rest of the v2 compat (`docs/inbox-redesign.md`, _13b_). All of them until acked: delivery is at least once. With a `key` filter, only that thread's events are answered and waited for; an unknown thread answers none (a dispatcher may filter before its first put lands). With a `timeout` and nothing pending, the handler thread waits, woken at once by in-process store writes (`inbox::ops::wait_changed`) and re-reading the store when its stamp moves (checked every 500 ms) for other processes' writes. It holds no lock beyond the store's shared one and skips the host control lock, so a waiting `events` never delays a click being written or another dispatcher's `ensure`. The body stops at about half of `MAX_RESPONSE`; the rest follows after an ack.
 - `events-ack`: drops the requester's events with those ids, answers the count; unknown ids are skipped.
 - `events-follow` (`devsbd events --follow`, `Op::Subscribe`): the requester's events pushed over a held-open response; see _Following events_ below.
-- `thread-ls`: the requester's live (non-archived) threads as a JSON array in `thread put` shape.
+- `thread-ls`: the requester's live (non-archived) threads as a JSON array in `thread put` shape; with the `feed` flag (`thread ls --feed`), each with its `messages` and their forms' state and answers.
 - `done`: sets `done = <unix secs>` on an owned child in `state.toml` (through an `Executor` method, so tests stay fake), under the host control lock like `ensure`/`stop`/`rm`. `ensure` reusing a done child clears it before its subprocess runs.
 
 ### Following events
@@ -224,7 +224,7 @@ Only instances whose sandbox declares `inbox = true` put threads or read events 
 
 ### Helper self-heal
 
-New verbs need a new `devsbd` in the running dispatcher, and only `run`/`start`/`port` used to reinstall it. Now `Bridges::reconcile` runs `devsbd::ensure_recorded` (a no-op hash check when current) before every bridge (re)spawn, on the bridge worker thread; the daemon of the old build is taken over by the new one. Opening a newer dashboard is enough.
+New verbs need a new `devsbd` in the running dispatcher. `Bridges::reconcile` (in the host daemon) runs `devsbd::ensure_recorded` (a no-op hash check when current) before every bridge (re)spawn, on the bridge worker thread; the in-container daemon of the old build is taken over by the new one. Any newer devsandbox command that reaches the host daemon hands it off to the new build (`docs/serve.md`, _Version handoff_), whose bridges then reinstall.
 
 ## Runs
 
@@ -248,7 +248,7 @@ All of the above rides the existing devsbd frame channel (`docs/sandbox-helper.m
 - `channel::CONTROL` (line-based request/response over `Data`, see `src/devsbd/control.rs`), `channel::NOTIFY`.
 - New caps bits (`caps::NOTIFY`, `caps::CONTROL`) so an old host/helper pair degrades cleanly.
 
-In-container clients (`devsbd notify`'s poke, the control commands) talk to the daemon over `/run/devsandbox/api.sock`; the daemon sends each stream to the newest bridge whose host advertises the cap. The TUI keeps a bridge per running helper-capable instance (with or without a host ssh-agent) and only those advertise `NOTIFY` + `CONTROL`; short-lived CLI bridges (`exec`, lifecycle, forwards) advertise neither.
+In-container clients (`devsbd notify`'s poke, the control commands) talk to the daemon over `/run/devsandbox/api.sock`; the daemon sends each stream to the newest bridge whose host advertises the cap. The host daemon (`devsandbox serve`) keeps a bridge per running helper-capable instance (with or without a host ssh-agent) and only those advertise `NOTIFY` + `CONTROL`; a forward's own bridge (the daemon's forwards, a foreground `devsandbox port`) advertises neither.
 
 ## Patterns (for the user docs)
 
@@ -273,6 +273,8 @@ devsandbox takes no stand; both are supported and documented:
   `notify` on anything needing a human.
 
 ## Steps
+
+How this design landed, kept as history: the sections above describe the current system, and the step notes below may name code that has since moved (the TUI's bridges and control serving now live in the host daemon, `docs/serve.md`; the Inbox store is `inbox.json`).
 
 One step = one commit. Each implementer re-reads the landmarks it's given before editing (line numbers drift as steps land). After any change under `devsbd/` or to `src/devsbd/{proto,mux}.rs`, rebuild the helper with `scripts/build-devsbd.sh` before `cargo test --workspace` (a stale embedded blob fails the helper tests).
 

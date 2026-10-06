@@ -123,7 +123,7 @@ fi
 git push || fail "git push failed"
 '
 
-# Run a control command, retrying while no dashboard is open (exit 75).
+# Run a control command, retrying while no host daemon is reachable (exit 75).
 ctl() {
   while :; do
     "$@" </dev/null; rc=$?
@@ -222,7 +222,7 @@ fi
 git push || fail "git push failed"
 '
 
-# Run a control command, retrying while no dashboard is open (exit 75).
+# Run a control command, retrying while no host daemon is reachable (exit 75).
 ctl() {
   while :; do
     "$@" </dev/null; rc=$?
@@ -294,7 +294,7 @@ It is the [sample from the automations guide](https://github.com/Nemikolh/devsan
 ```bash
 devsandbox run pr-dispatcher                     # starts the loop (idle until gh works)
 devsandbox exec -it pr-dispatcher gh auth login  # once, before the first child
-devsandbox                                       # the dashboard: keep it open
+devsandbox                                       # the dashboard, to watch it work
 ```
 
 Every five minutes the loop checks the PRs; a child `web-pr-<number>` appears in the Instances tab for each one that needs work. Failures land in the Inbox tab (`4`) and on your desktop. Follow along:
@@ -308,7 +308,7 @@ devsandbox exec -it web-pr-123 bash               # look at a child
 ## How it works
 
 - [`dispatcher`](/docs/config#devsandbox-extras) lets the dispatcher create, stop and remove children of the sandboxes in `spawn`; `devsbd ensure` / `exec` / `rm` are those requests.
-- Control commands only succeed while the dashboard is open (exit `75` otherwise, which `ctl` retries); notifications wait for it.
+- Control commands are served by the [host daemon](/docs/host-daemon), which `run` started and the running dispatcher keeps up, dashboard open or not. Exit `75` means no daemon is reachable (after a reboot, until your first `devsandbox` command; `devsandbox serve install` avoids that), which `ctl` retries; notifications wait for it.
 - `autostart = "runtime"` restarts the dispatcher, and so the loop, after a reboot.
 - Each child runs <Agent /> unattended with your `gh` login and pushes to your PR branches: keep `spawn` to what it needs and review what it pushes.
 
@@ -330,6 +330,6 @@ devsandbox exec -it web-pr-123 bash               # look at a child
   ]}
   verify={[
     'Ask me before starting anything. Then `devsandbox -C <config dir> run pr-dispatcher` and tell me to run `devsandbox -C <config dir> exec -it pr-dispatcher gh auth login` myself.',
-    'Tell me to keep the dashboard (`devsandbox`) open, then check `devsandbox -C <config dir> exec pr-dispatcher tail babysit.log` and `devsandbox -C <config dir> exec pr-dispatcher devsbd ls` after the first round. Never push, merge or remove children yourself.',
+    'Then check `devsandbox -C <config dir> exec pr-dispatcher tail babysit.log` and `devsandbox -C <config dir> exec pr-dispatcher devsbd ls` after the first round. Never push, merge or remove children yourself.',
   ]}
 />

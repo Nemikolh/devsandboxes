@@ -92,7 +92,7 @@ plain-passthrough flags don't need new tests beyond compilation.
 envelope, schema-versioning promise, the exec/PTY non-goal, and the parked
 raw-metrics idea. Keep it short; the schema is the Rust types.
 
-## Later: `run --json` and exec for pty consumers
+## Added after: `run --json` and exec for pty consumers
 
 Programmatic and GUI consumers create instances and then attach their own
 PTY, so two gaps closed after the read verbs:
@@ -120,7 +120,7 @@ PTY, so two gaps closed after the read verbs:
   uses (`SHELL_FALLBACK_CMD`), defaulting to `-i` plus `-t` when stdin is a TTY (explicit flags win),
   and the npm package's `execArgv()` returns `{file, args}` to spawn directly.
 
-## Later: `inbox ls` / `inbox show`
+## Added after: `inbox ls` / `inbox show`
 
 `devsandbox inbox ls --json` and `inbox show <thread> --json` print the
 API's own views (`ThreadSummary` list, one `ThreadDetail`; docs/api.md) in

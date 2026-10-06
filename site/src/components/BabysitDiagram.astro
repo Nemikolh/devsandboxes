@@ -34,7 +34,7 @@ const yNotifyTo = y1 + 22; // the dashboard's lower half
 <figure class="bsd" data-pagefind-ignore style={`--card-h: ${CARD_H}px; --gap: ${GAP}px; --notify-label: ${yNotifyFrom + 8}px`}>
   <p class="visually-hidden">
     Diagram: in the pr-dispatcher sandbox on your machine, babysit-loop.sh polls GitHub's open pull requests #123 and #124
-    with gh. For each, it asks devsandbox, through devsbd ensure and exec, served while the dashboard is open, to create a
+    with gh. For each, it asks devsandbox, through devsbd ensure and exec, served by the host daemon, to create a
     child instance: web-pr-123 and web-pr-124, each its own container and git worktree on the PR branch. A child merges
     the base in, runs
     {AGENTS.map((a) => <span data-agent-only={a.id}>{a.name}</span>)} only on a conflict, and git pushes back to the PR.

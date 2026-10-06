@@ -1,8 +1,8 @@
 # Automations: user guide
 
-Sandboxes that come up on their own after a boot, tell you when they need you, and spawn their own child instances to do work. devsandbox provides the plumbing only; what to watch and when to act lives in a script you write. Design and internals: [`docs/automations.md`](automations.md) and [`docs/inbox-threads.md`](inbox-threads.md).
+Sandboxes that come up on their own after a boot, tell you when they need you, and spawn their own child instances to do work. devsandbox provides the plumbing only; what to watch and when to act lives in a script you write. Design and internals: [`docs/automations.md`](automations.md), [`docs/inbox-redesign.md`](inbox-redesign.md) and [`docs/serve.md`](serve.md) (the host daemon).
 
-Everything here except `autostart = true` needs the embedded `devsbd` helper (release archives, npm package, local builds after `scripts/build-devsbd.sh`; not `cargo install`). Inside a sandbox it is on `PATH` as `devsbd` (a best-effort `/usr/local/bin/devsbd` symlink; the binary is `/run/devsandbox/bin/devsbd`). The host daemon (`devsandbox serve`, docs/serve.md) updates the helper of every running instance it bridges, so a running dispatcher gets new `devsbd` verbs without a restart once a newer devsandbox's daemon runs (the first dashboard, `run` or `start` of the new version takes over).
+Everything here except `autostart = true` needs the embedded `devsbd` helper (release archives, npm package, local builds after `scripts/build-devsbd.sh`; not `cargo install`). Inside a sandbox it is on `PATH` as `devsbd` (a best-effort `/usr/local/bin/devsbd` symlink; the binary is `/run/devsandbox/bin/devsbd`). The host daemon (`devsandbox serve`, docs/serve.md) updates the helper of every running instance it bridges, so a running dispatcher gets new `devsbd` verbs without a restart once a newer devsandbox's daemon runs (the first command of the new version that reaches the daemon, a dashboard, `run` or `start`, hands it over).
 
 ## `autostart`
 
@@ -12,7 +12,7 @@ autostart = true         # devsandbox starts it once per boot
 # autostart = "runtime"  # the container runtime restarts it on boot
 ```
 
-**`true`**: once per host boot (per config root), the first dashboard launch, or the first `devsandbox run` / `devsandbox start` (after it finishes), starts every stopped instance of each `autostart` sandbox through the full `start` path (services, helper, `postStartCommand`). A sandbox with no instance yet gets one (`run`). Dispatcher-owned children are skipped (see below). Other commands (`ps`, `stop`, `status --json`, …) never trigger it. An instance you stop afterwards stays stopped until the next boot. If the runtime isn't reachable yet (Docker Desktop still starting, `container system start` not run), the pass is skipped and retried on the next trigger.
+**`true`**: once per host boot (per config root), the host daemon's start (`devsandbox serve`, started on demand or at login), the first dashboard launch, or the first `devsandbox run` / `devsandbox start` (after it finishes), whichever comes first, starts every stopped instance of each `autostart` sandbox through the full `start` path (services, helper, `postStartCommand`). A sandbox with no instance yet gets one (`run`). Dispatcher-owned children are skipped (see below). Other commands (`ps`, `stop`, `status --json`, …) never trigger it. An instance you stop afterwards stays stopped until the next boot. If the runtime isn't reachable yet (Docker Desktop still starting, `container system start` not run), the pass is skipped and retried on the next trigger.
 
 **`"runtime"`**: the same pass, plus the container is created with `--restart unless-stopped`, so docker/podman bring it back at boot with no devsandbox process running:
 
@@ -20,7 +20,7 @@ autostart = true         # devsandbox starts it once per boot
 - podman: only with `podman-restart.service` enabled (`systemctl --user enable podman-restart.service`); devsandbox never installs units and warns at `run`.
 - Apple `container`: no restart policy; warns and behaves as `true`.
 
-The runtime restarts only the container command, so new containers carry a boot hook: on every container start it brings back the `devsbd` daemon and re-runs `postStartCommand` (as `remoteUser`, in `workspaceFolder`, with `remoteEnv`), appending its output to `/run/devsandbox/boot.log`. For these instances `devsandbox start` no longer runs `postStartCommand` from the host (`run` still does, at create). Containers created before the hook existed warn on `start`: recreate them with `devsandbox rebuild --force <instance>`. Host-side things (ssh-agent relay, port forwards, notify delivery, the control API) resume when a devsandbox process connects.
+The runtime restarts only the container command, so new containers carry a boot hook: on every container start it brings back the `devsbd` daemon and re-runs `postStartCommand` (as `remoteUser`, in `workspaceFolder`, with `remoteEnv`), appending its output to `/run/devsandbox/boot.log`. For these instances `devsandbox start` no longer runs `postStartCommand` from the host (`run` still does, at create). Containers created before the hook existed warn on `start`: recreate them with `devsandbox rebuild --force <instance>`. Host-side things (ssh-agent relay, port forwards, notify delivery, the control API) resume once the host daemon runs: the first `devsandbox` command that needs it starts it, or, with `devsandbox serve install`, the user's service manager does at login (docs/serve.md, *Boot start*).
 
 Flipping `autostart` is not drift: `start` updates the restart policy of an existing container in place (a podman too old for `update --restart` warns to `rebuild --force`).
 
@@ -33,11 +33,11 @@ devsbd notify [--level info|warn|error] [--link URL] [--key K] [--] <msg>...
 ```
 
 - Queued first: each call writes a record to a durable outbox in the container (`/var/lib/devsandbox/outbox/`, survives container restarts) and succeeds even with no host attached.
-- Delivered while the **host daemon** (`devsandbox serve`) runs: it shows up in the Inbox tab (`4`) and as a desktop notification (`notify-send` on Linux, `osascript` on macOS; skipped silently when missing). The dashboard, `run` and `start` start the daemon; it keeps running while a dispatcher or an `inbox = true` instance does, and otherwise exits 10 minutes after the last dashboard closed. Without it the queue waits. A record is acknowledged to the container only after it is saved, so a host that dies mid-delivery loses nothing: the record is resent.
+- Delivered while the **host daemon** (`devsandbox serve`) runs: it shows up in the Inbox tab (`4`) and as a desktop notification (`notify-send` on Linux, `osascript` on macOS; skipped silently when missing). The dashboard, `run` and `start` start the daemon on demand; it keeps running while a dispatcher or an `inbox = true` instance does, and otherwise exits 10 minutes after its last client (a dashboard, a port forward, …) left. `devsandbox serve install` keeps it running from login instead. Without it the queue waits. A record is acknowledged to the container only after it is saved, so a host that dies mid-delivery loses nothing: the record is resent.
 - An unread notification counts in the Inbox title (`Inbox (N)`) and the yellow `✉N` on its instance row, and sits in the **Needs you** view. It is marked read when you open it, or when you leave the Inbox after it was on screen (in Needs you or All).
 - `--key` threads per instance: a newer notification with the same key becomes the head of that row, and the older ones are listed under *earlier* in the thread pane beside it, so a script re-reporting "PR 123 conflicted" every poll doesn't spam.
-- `--link` (http(s) only) opens with `enter` once the thread has focus. `d` dismisses a notification row with its history; `D` clears every notification (dispatcher threads stay). History is saved in `inbox.toml` next to `state.toml`, shared by every open dashboard and kept across restarts; a dismissal in one dashboard is gone from all of them.
-- Limits: desktop popups are rate-limited per instance (a burst of 3, then one per 10 s) and a keyed notification repeating one popped in the last minute doesn't pop again; the Inbox still gets every one. The Inbox keeps 200 items per instance (notifications, thread timelines and pending events together), so a noisy instance drops its own oldest, not others'.
+- `--link` (http(s) only) opens with `enter` once the thread has focus. `d` dismisses a notification row with its history; `D` clears every notification (owner threads stay). History is saved in `inbox.json` next to `state.toml`, shared by every open dashboard, the host daemon and `devsandbox inbox`, and kept across restarts; a dismissal in one dashboard is gone from all of them.
+- Limits: desktop popups are rate-limited per instance (a burst of 3, then one per 10 s) and a keyed notification repeating one popped in the last minute doesn't pop again; the Inbox still gets every one. The Inbox keeps 200 threads per instance (a keyed notification row counts as one, holding its newest 300 records), so a noisy instance drops its own oldest, not others'.
 - Flags are recognized anywhere before `--`; everything after `--` is message.
 
 `notify` is for one-off news from any sandbox: a run finished, a check failed. For an item that stays open until someone deals with it, and that the user may act on from the dashboard, a sandbox declaring `inbox = true` uses a thread (below).
@@ -83,8 +83,9 @@ devsbd run wait <key> <id> [--sandbox S] [--timeout SECS]
 devsbd run rm <key> <id> [--sandbox S] [--force]
 devsbd run prune <key> [--sandbox S] [--keep N]
 devsbd events [--wait SECS] [--thread KEY]
+devsbd events --follow [--thread KEY]
 devsbd events ack <id>...
-devsbd thread ls
+devsbd thread ls [--feed]
 ```
 
 `events`, `events ack` and `thread ls` need `inbox = true` rather than `dispatcher`; they're covered under [Inbox threads](#inbox-threads).
@@ -115,10 +116,10 @@ Exit codes:
 | 0 | ok |
 | 1 | failed (the message says why; host-side details in the log below) |
 | 2 | usage error, or an ambiguous key (pass `--sandbox`) |
-| 75 | no host connected: the host daemon (`devsandbox serve`) isn't running (or the helper daemon isn't). Retry later. |
-| 77 | denied: not a dispatcher (or a dispatcher's child), sandbox not in `spawn` (or, for `ensure`, itself a dispatcher), not this dispatcher's child, `max-instances` reached, a denied `--env` name |
+| 75 | no host connected: no host daemon (`devsandbox serve`) is reachable (or the helper daemon in the container isn't running). Retry later. |
+| 77 | denied: not a dispatcher (or a dispatcher's child; for `events` and `thread ls`: no `inbox = true`), sandbox not in `spawn` (or, for `ensure`, itself a dispatcher), not this dispatcher's child, `max-instances` reached, a denied `--env` name |
 
-Control is served by the host daemon (`devsandbox serve`), which the dashboard, `run` and `start` start and which stays up while a dispatcher runs, dashboard closed or not. It can still be missing, e.g. after a reboot when the runtime restarted the dispatcher before any `devsandbox` command ran. Nothing is queued: a script must retry on 75.
+Control is served by the host daemon (`devsandbox serve`), which the dashboard, `run` and `start` start and which stays up while a dispatcher runs, dashboard closed or not. It can still be missing, e.g. after a reboot when the runtime restarted the dispatcher before any `devsandbox` command ran (`devsandbox serve install` closes that gap). Nothing is queued: a script must retry on 75.
 
 ### Children
 
@@ -140,7 +141,7 @@ A child marked **done** is kept as is (container, worktree, runs), shown dimmed 
 
 ## Inbox threads
 
-A sandbox that declares `inbox = true` (typically a dispatcher) can put **threads** in the Inbox: one row per item it tracks (a PR, an email to answer), with a state, a status, a message, buttons and an optional reply box. The owner decides what they mean; devsandbox stores them, shows them, runs the built-in buttons and hands everything else back as **events** the owner pulls. Its own state stays the source of truth: threads are a projection of it, so losing the Inbox loses nothing.
+A sandbox that declares `inbox = true` (typically a dispatcher) can put **threads** in the Inbox: one row per item it tracks (a PR, an email to answer). A thread is a small **header** (title, state, status, buttons, an optional reply box) the owner re-asserts, and a **feed** under it: the owner's **messages** (markdown, key/value fields, forms), and the user's **replies**, **actions** (button presses) and **submissions** (answered forms), with one-line **markers** for done/reopen and state or status changes. The owner decides what they mean; devsandbox stores them, shows them, runs the built-in buttons and hands everything else back as **events** the owner pulls. Its own state stays the source of truth: threads are a projection of it, so losing the Inbox loses nothing.
 
 Use `notify` for one-off news, from any sandbox. Use a thread for anything still open that the user may act on: it stays in one row, changes state instead of piling up messages, and leaves **Needs you** once it's resolved. Only instances whose sandbox declares `inbox = true` may put, remove or list threads and read their events:
 
@@ -161,7 +162,7 @@ devsbd thread rm <key>
 devsbd thread ls
 ```
 
-`put` queues the whole thread in the same durable outbox as `notify`, so it works with no dashboard open and is delivered later, in order. The helper only checks JSON syntax, that `key` is a valid key and that the record fits in 64 KiB (exit 2 otherwise); the dashboard checks the rest when it applies the put. A rejected put (or any thread message from a sandbox that doesn't declare `inbox = true`) becomes an `error` notification from your own instance in the Inbox, keyed `thread:<key>`, reading `thread put rejected: <why>` or `thread put denied: <why>`: watch for those while writing a dispatcher.
+`put` queues the whole header in the same durable outbox as `notify`, so it works with no host daemon running and is delivered later, in order. The helper only checks JSON syntax, that `key` is a valid key and that the record fits in 64 KiB (exit 2 otherwise); the host checks the rest when it applies the put. A rejected put (or any thread message from a sandbox that doesn't declare `inbox = true`) becomes an `error` notification from your own instance in the Inbox, keyed `thread:<key>`, reading `thread put rejected: <why>` or `thread put denied: <why>`: watch for those while writing a dispatcher.
 
 ```json
 {
@@ -171,13 +172,12 @@ devsbd thread ls
   "state": "needs-you",
   "status": "review draft replies",
   "child": "pr-6900",
-  "message": "4 review comments checked, no code change needed. Draft replies are ready; nothing posted.",
   "actions": [
-    { "id": "open-draft", "label": "Open draft", "host": { "vscode": { "path": ".dispatcher/pr-6900-replies.md", "line": 1 } } },
-    { "id": "post", "label": "Post replies" },
+    { "id": "code", "label": "VS Code", "host": { "vscode": { "path": "src/cost.ts", "line": 42 } } },
+    { "id": "retry", "label": "Retry" },
     { "id": "done", "label": "Done", "done": true }
   ],
-  "reply": { "placeholder": "Instructions for the next run" }
+  "compose": { "placeholder": "Instructions for the next run", "hint": "Starts a comments run with your message" }
 }
 ```
 
@@ -188,12 +188,13 @@ devsbd thread ls
 | `state` | yes | `needs-you`, `active` or `done`: drives the Inbox views and the badges | one of the three |
 | `link` | no | opened with `enter` once the thread has focus | http(s) only, 2000 bytes |
 | `status` | no | free text, your lifecycle stage (`running ci`, `merged`), shown as a chip on the row | 60 bytes |
-| `child` | no | key of one of your children: the instance the thread is about, which host actions and the pane's `o`/`t`/`l`/`p` target | key rules |
-| `message` | no | the current explanation: what happened, what you expect from the user. Being replaced by messages (`thread send`, below): prefer those in new dispatchers | 4000 bytes |
+| `child` | no | for a dispatcher: the `--key` of one of its children, the instance the thread is about, which host actions and the pane's `o`/`t`/`l`/`p` target. Left out (always, for an owner without children): they target your own instance | key rules |
 | `actions` | no | buttons, numbered `1`–`9` in the pane | at most 9 |
-| `reply` | no | `{ "placeholder": "…" }` (placeholder optional): allow free-text replies | placeholder 100 bytes |
+| `compose` | no | `{ "placeholder": "…", "hint": "…" }` (both optional): allow free-text replies. `hint` is one dim line under the reply box saying what sending does now; re-put it when that changes | 100 bytes each |
 
-The `message` (and a `notify` body) is rendered as markdown in the thread pane; `title` and `status` take inline markdown (code, emphasis, links). Control characters in anything a container sends are stripped before it's stored.
+Two older fields are still accepted while dispatchers move over, and will be removed: `message` (4000 bytes; shown as a message in the feed, replaced in place as it changes: use `thread send`) and `reply` (`{ "placeholder" }`, `compose` without a hint).
+
+`title` and `status` take inline markdown (code, emphasis, links). Control characters in anything a container sends are stripped before it's stored.
 
 Each action:
 
@@ -201,7 +202,7 @@ Each action:
 |---|---|---|
 | `id` | what your event carries back | lowercase letters, digits, `-`, 1–40 chars, unique in the thread |
 | `label` | the button text | non-empty, 60 bytes |
-| `host` | a built-in verb the dashboard runs at once (table below). Absent: the button only sends you an `action` event | exactly one verb |
+| `host` | a built-in verb the dashboard runs at once (table below; `devsandbox inbox` and API clients refuse host-only buttons). Absent: the button only sends you an `action` event | exactly one verb |
 | `notify` | `true`: also send an `action` event when the button has a `host` verb | |
 | `done` | `true`: set the thread done, mark its `child` done, and send one `done` event carrying this `id` (instead of an `action` event) | |
 
@@ -216,25 +217,25 @@ Host verbs, written `"host": { "<verb>": { …args } }` (`{}` for none):
 | `open` | `url` (http/https) | opens the URL on the host |
 | `rm` | | `devsandbox rm` of the target, with the CLI's own confirm |
 
-The target is the thread's `child`, or your own instance when there is no `child`; a host action can't reach any other instance, and a `child` that isn't one of yours (or is gone) makes the button fail with a status line. There is no arbitrary host command. A `vscode.path` must be relative, without `..`, empty components or a leading `~`, at most 400 bytes.
+The target is the thread's `child`, or your own instance when there is no `child`; a host action can't reach any other instance, and a `child` that isn't one of yours (or is gone) makes the button fail with a status line. A stopped target is started first for `vscode`, `terminal` and `forward` (the button shows `(stopped)`, the status line `starting <name>…`); `logs` reads a stopped container's log as is. There is no arbitrary host command. A `vscode.path` must be relative, without `..`, empty components or a leading `~`, at most 400 bytes.
 
 Every text field refuses control characters other than newline, and unknown fields are rejected.
 
-**Re-assert every pass.** A put that changes nothing is dropped by the dashboard: no write, no unread mark, no timeline entry, no popup. So the intended use is to put every open thread on every pass, from your own state, rather than tracking what you already sent. What a put does when it does change something:
+**Re-assert every pass.** A put that changes nothing is dropped by the host: no write, no unread mark, no marker, no popup. So the intended use is to put every open thread on every pass, from your own state, rather than tracking what you already sent. What a put does when it does change something:
 
-- `message`, `state` or `status` changed: one timeline entry each, and the thread is unread again.
+- `state` or `status` changed: a marker in the feed (consecutive status-only changes collapse into one, `running comments → review drafts`), and the thread is unread again.
 - `state` entered `needs-you` (or a new thread starts there): a desktop popup, rate-limited like `notify`.
-- `title`, `link`, `child`, `actions`, `reply` changed: updated silently. `actions` and `reply` are replaced wholesale.
+- `title`, `link`, `child`, `actions`, `compose` changed: updated silently. `actions` and `compose` are replaced wholesale.
 
 Your put always wins: if the user marked a thread done and your next pass puts it as `needs-you` again, it's back in Needs you. Handle the `done` event (below) and put the thread as `done` from then on.
 
 While no host daemon runs, a queued `put` replaces any older queued `put` for the same key, and an `rm` replaces queued `put`s, `rm`s, `send`s and `withdraw`s for its key (notifications are never coalesced), so a dispatcher re-asserting every few minutes overnight doesn't pile up files. A replacing record keeps the queue position of the one it replaced, so the order you sent things in is the order they arrive.
 
-`thread rm <key>` drops one of your threads, its pending events with it. `thread ls` prints a JSON array of your live threads in `put` shape (the `state` reflects the user's done/reopen too), for an owner that lost its own state; `thread ls --feed` adds each thread's `messages` (below). Both need the host daemon (exit 75 otherwise). Threads are tied to your instance's id, not its name: they survive stop, restart and rebuild. `devsandbox rm` of the owner archives them (read-only, shown only in **All**). Done and archived threads are dropped 14 days after their last change, unless a done thread still has events you haven't acked; past the 200-per-instance cap, archived threads go first, then done ones.
+`thread rm <key>` drops one of your threads, its pending events with it. `thread ls` prints a JSON array of your live threads in `put` shape (the `state` reflects the user's done/reopen too), for an owner that lost its own state; `thread ls --feed` adds each thread's `messages` (below). Both need the host daemon (exit 75 otherwise). Threads are tied to your instance's id, not its name: they survive stop, restart and rebuild. `devsandbox rm` of the owner archives them (read-only, shown only in **All**). Done and archived threads are dropped 14 days after their last change, unless a done thread still has events you haven't acked; past the 200-per-instance cap, archived threads go first, then done ones. Each thread's feed keeps 300 items: past that, the oldest markers go first, then the oldest messages without an open form.
 
 ### Messages (`devsbd thread send`)
 
-The header (`put`) says where a thread stands; **messages** tell the story under it: what a run did, what it needs from the user. They replace the header's `message` field.
+The header (`put`) says where a thread stands; **messages** tell the story under it: what a run did, what it needs from the user. They replace the header's old `message` field.
 
 ```sh
 devsbd thread send < message.json
@@ -272,7 +273,7 @@ Blocks, by `type`:
 | `fields` | `items`: `[{ "label", "value" }]` | aligned `label  value` rows | 1–20 items; one-line `label` (non-empty, 60 bytes) and `value` (200 bytes) |
 | `form` | see [Forms](#forms) | questions the user answers and submits | one per message |
 
-Unknown fields and unknown block types are rejected, as are control characters other than newline (and newlines in a field). The helper checks the JSON syntax, `thread`, `id` and the 48 KiB budget before queuing (exit 2, nothing queued); the dashboard checks the rest and reports a reject as an `error` notification, `thread send rejected: <why>`, like a bad put.
+Unknown fields and unknown block types are rejected, as are control characters other than newline (and newlines in a field). The helper checks the JSON syntax, `thread`, `id` and the 48 KiB budget before queuing (exit 2, nothing queued); the host checks the rest and reports a reject as an `error` notification, `thread send rejected: <why>`, like a bad put. Markdown blocks render like a `notify` body (headings, lists, code, quotes, links, tables).
 
 `thread ls --feed` lists each thread's messages as `"messages": [{ "id", "at", "blocks", "edited", "withdrawn", "form"? }]` (your messages only, not the user's replies), `blocks` in the shape you sent them, so a dispatcher that lost its state can see what it already said. On an older helper `thread send` fails with `unknown verb`; check with `devsbd features | grep -qx thread-send` (an older helper has no `features` either and prints nothing to stdout).
 
@@ -346,7 +347,7 @@ The submission arrives as one event (below), `answers` keyed by question id with
 
 `thread ls --feed` gives each message that has carried a form a `"form": { "id", "state", "answers"? }`: `state` is `open`, `submitted` or `withdrawn`, and `answers` (only when submitted) is what the `submit` event carried, so a dispatcher that lost its state, or acked nothing yet, can recover the answers.
 
-API clients answer forms with `inbox.form.saveDraft` and `inbox.form.submit` (docs/api.md). The dashboard shows a form as a one-line placeholder until its form UI lands.
+The dashboard pins open forms under the thread's header and answers them in place (docs/tui.md, *Forms*); `devsandbox inbox submit` answers from a shell (docs/inbox-cli.md), API clients with `inbox.form.saveDraft` and `inbox.form.submit` (docs/api.md).
 
 ### Events
 
@@ -373,13 +374,15 @@ devsbd events ack <id>...
 | `reopen` | `u` in the pane on a done thread (it goes back to `active`) | |
 | `submit` | a form was submitted ([Forms](#forms)) | `message`, `form`: the message's and the form's ids; `answers`: every question's answer |
 
-`thread` is the key of the thread it happened on (the `key` you put it with). `key` carries the same value under the old name: it's deprecated and will be removed, so read `thread`. `at` is RFC 3339 UTC, by the host's clock. `d` and `u` only send an event when they change something (`d` on a done thread, `u` on a live one, do nothing). Each event also adds a timeline entry, and the pane shows how many are still waiting for you. Archived threads take no events.
+The keys are the dashboard's; `devsandbox inbox reply|act|submit|done|reopen` (docs/inbox-cli.md) and API clients (docs/api.md) produce the same events, and you can't tell which one the user used.
+
+`thread` is the key of the thread it happened on (the `key` you put it with). `key` carries the same value under the old name: it's deprecated and will be removed, so read `thread`. `at` is RFC 3339 UTC, by the host's clock. `d` and `u` only send an event when they change something (`d` on a done thread, `u` on a live one, do nothing). Each event also shows in the feed (the reply, the action, the folded submission, a done/reopen marker), and the pane shows how many are still waiting for you. Archived threads take no events.
 
 - **At least once.** `events` prints every pending event, not just new ones, until they're acked. Ack after you've saved what the event changed in your own state, and make handlers idempotent: a crash between the two replays the event. The `id` tells two deliveries of one event apart.
 - `events ack` prints how many it dropped; an id that's unknown, already acked or another instance's is ignored, so a retried ack is harmless. A malformed id is a usage error (exit 2).
 - `--wait SECS` (at most 300) returns as soon as anything is pending, or prints nothing after `SECS`. Use it in place of your loop's sleep and a click gets handled within seconds. Without `--wait`, `events` answers at once.
 - `--thread KEY` answers only that thread's events, and with `--wait` waits for one there (an event on another of your threads doesn't end the wait). A thread you haven't put (yet) just has none: an empty answer, not an error. The others stay pending for an unfiltered `events`.
-- Events are a control command: they need the host daemon (exit 75 otherwise). An event only exists because someone clicked in a dashboard, so there's nothing to miss meanwhile; they wait in `inbox.toml`.
+- Events are a control command: they need the host daemon (exit 75 otherwise). An event only exists because the user answered (in a dashboard, `devsandbox inbox` or an API client), so there's nothing to miss meanwhile; they wait in `inbox.json`.
 - Each thread keeps at most 100 unacked events (the oldest is dropped beyond that), and one `events` answer stops at about 512 KiB: ack what you got and call again for the rest.
 - You only ever see and ack events of your own threads.
 
@@ -425,7 +428,7 @@ done
 
 ### Sample: a thread loop
 
-For a sandbox with `inbox = true`. One file per item in `.items/` holds its state; the loop re-puts every thread, then waits for clicks. POSIX sh, with `jq`.
+For a sandbox with `inbox = true`. One file per item in `.items/` holds its state; the loop re-puts every thread and re-sends its message (both no-ops when unchanged), then waits for clicks. POSIX sh, with `jq`.
 
 ```sh
 #!/bin/sh
@@ -433,16 +436,21 @@ set -u
 ITEMS=.items; TODO=.todo      # this dispatcher's own state; gitignored
 mkdir -p "$ITEMS" "$TODO"
 
-put() {  # <key> <state> <message>
-  jq -cn --arg k "$1" --arg s "$2" --arg m "$3" '{
-    key: $k, title: "Item \($k)", state: $s, child: $k, message: $m,
+put() {  # <key> <state>
+  jq -cn --arg k "$1" --arg s "$2" '{
+    key: $k, title: "Item \($k)", state: $s, child: $k,
     actions: [
       {id: "open", label: "Open the draft", host: {vscode: {path: "DRAFT.md", line: 1}}},
       {id: "send", label: "Send it"},
       {id: "skip", label: "Skip", done: true}
     ],
-    reply: {placeholder: "What should change?"}
+    compose: {placeholder: "What should change?", hint: "Queues your note for the next draft"}
   }' | devsbd thread put
+}
+
+say() {  # <key> <message id> <markdown>
+  jq -cn --arg k "$1" --arg i "$2" --arg m "$3" \
+    '{thread: $k, id: $i, blocks: [{type: "markdown", text: $m}]}' | devsbd thread send
 }
 
 while :; do
@@ -451,7 +459,8 @@ while :; do
   # Re-assert every thread; unchanged ones cost nothing.
   for f in "$ITEMS"/*; do
     [ -e "$f" ] || continue
-    put "${f##*/}" "$(cat "$f")" "Draft ready in DRAFT.md."
+    put "${f##*/}" "$(cat "$f")"
+    say "${f##*/}" draft "Draft ready in \`DRAFT.md\`."
   done
 
   # Sleep up to 5 min, or until the user clicks.

@@ -77,7 +77,7 @@ Tab `2` lists the service containers your sandboxes use: shared by every instanc
 
 ## Port forwards
 
-`p` prefills `:port web`: add a port and Enter, and it's on `127.0.0.1` on your machine. Forwards show in the Ports tab and last while the dashboard runs; `d` stops one. A sandbox's `forwardPorts` are forwarded for you. Linux and macOS hosts.
+`p` prefills `:port web`: add a port and Enter, and it's on `127.0.0.1` on your machine. Forwards show in the Ports tab and are kept by the [host daemon](/docs/host-daemon), so they outlive the dashboard and come back on the same host port after a restart, until `d` stops one. A sandbox's `forwardPorts` are forwarded for you while its instance runs. Linux and macOS hosts.
 
 <Try>`d` to stop it, then `1` `p`, type `8080:3000` and `enter`.</Try>
 
@@ -97,7 +97,7 @@ Tab `2` lists the service containers your sandboxes use: shared by every instanc
 
 ## Inbox
 
-A script or an agent in a sandbox reaches you with `devsbd notify "tests pass"`. It lands in the Inbox tab (`4`), with a count in the tab and a `✉` on the instance row, and pops up on your desktop. A sandbox with [`inbox = true`](https://github.com/Nemikolh/devsandboxes/blob/main/docs/automations-guide.md#inbox-threads) (typically a dispatcher) can also keep one thread per item there, with buttons and a reply box: cards on the left, the selected thread always open on the right, `←`/`→` to step through Needs you / Active / Done / All, and `enter` to focus the thread. The mouse works there too: click a card, a view name, the thread or its reply box; the wheel moves through the cards or scrolls the thread.
+A script or an agent in a sandbox reaches you with `devsbd notify "tests pass"`. It lands in the Inbox tab (`4`), with a count in the tab and a `✉` on the instance row, and pops up on your desktop. A sandbox with [`inbox = true`](https://github.com/Nemikolh/devsandboxes/blob/main/docs/automations-guide.md#inbox-threads) (typically a dispatcher) can also keep one thread per item there: cards on the left, the selected thread always open on the right, `←`/`→` to step through Needs you / Active / Done / All, and `enter` to focus the thread. The thread's header stays pinned at the top (state and status, its buttons), any open form sits under it, and the conversation below runs newest first: the sandbox's messages, your replies and answers. The reply box at the bottom grows as you type and says what sending does. The mouse works there too: click a card, a view name, the thread, a form question or the reply box; the wheel moves through the cards or scrolls the thread. You can answer from a shell too, with `devsandbox inbox`.
 
 <Try>`1` for Instances: leaving the Inbox marked it read, so `web-3` lost its `✉`.</Try>
 
@@ -172,18 +172,34 @@ The real dashboard's keys, also in its `?` screen. The Preview column says what 
 
 ### Inbox thread
 
-The selected thread's pane sits to the right of the list, always open; these keys apply once it (or its reply input) has focus.
+The selected thread's pane sits to the right of the list, always open; these keys apply once it (or its form or reply input) has focus.
 
 | Key       | Action                                                    | Preview |
 | --------- | --------------------------------------------------------- | ------- |
-| `esc`     | Back to the list (input → thread → list)                 | no      |
+| `esc`     | Back to the list (input or form → thread → list)         | no      |
 | `enter`   | Open its link                                             | no      |
-| `1`–`9`   | Run a button                                              | no      |
+| `1`–`9`   | Run a button; one on a stopped instance starts it first   | no      |
+| `↑` `↓`, `pgup` `pgdn`, `g` / `G` | Scroll the conversation (`g`: newest)  | no      |
+| `tab`     | Focus the open form, else the reply input                 | no      |
 | `r` / `i` | Focus the reply input                                     | no      |
 | `d` / `u` | Mark done / reopen                                        | no      |
-| `o` `t` `l` `p` | VS Code / terminal / logs / forward on the thread's instance | no |
+| `o` `t` `l` `p` | VS Code / terminal / logs / forward on the thread's instance (starting it first if it's stopped, except logs) | no |
 | `m`       | Show the markdown source instead of the rendered text (every thread, until you quit) | no |
 | `enter` (input) | Send the reply; it stays open, empty, for the next one | no |
+| `alt-enter` (input) | New line (`shift-enter` too, where the terminal reports it) | no |
+
+### Inbox form
+
+An open form is pinned under the thread's header. Your answers are saved as you go, so you can leave and come back, from this dashboard or another.
+
+| Key                 | Action                                                    | Preview |
+| ------------------- | --------------------------------------------------------- | ------- |
+| `tab` / `shift-tab` | Next / previous question                                  | no      |
+| `↑` `↓`             | Move over the options                                     | no      |
+| `space`             | Pick an option (toggle, when several can be picked)       | no      |
+| `e`                 | Edit a text answer in the reply box; `enter` or `esc` keeps it, `alt-enter` adds a line | no |
+| `enter`             | Confirm: shows what will be sent (or what's missing); `enter` again submits | no |
+| `esc`               | Cancel the confirm, else back to the thread               | no      |
 
 ### Terminals
 

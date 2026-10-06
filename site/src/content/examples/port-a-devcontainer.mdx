@@ -45,7 +45,7 @@ Your repo already has a `.devcontainer/devcontainer.json` and you want to run it
 [sandbox.web]                      # the table key replaces `name`
 folder = "../web"                  # the repo; devsandboxes.toml lives outside it
 image = "mcr.microsoft.com/devcontainers/typescript-node:22"
-forwardPorts = [3000]              # forwarded while the dashboard is open
+forwardPorts = [3000]              # forwarded while the instance runs
 containerEnv = { NODE_ENV = "development" }
 mounts = ["source=${localEnv:HOME}/.config/gh,target=/home/node/.config/gh,type=bind"]
 remoteUser = "node"
@@ -89,7 +89,7 @@ The `devcontainer.json` can stay in the repo; devsandbox never reads it.
 | `onCreateCommand` … `postAttachCommand` | same | tables run in order, not in parallel |
 | `customizations.vscode.extensions` | same | |
 | `customizations.vscode.settings` | repo `.vscode/settings.json` | ignored |
-| `forwardPorts` | same | forwarded by the dashboard while open |
+| `forwardPorts` | same | forwarded by the [host daemon](/docs/host-daemon) while the instance runs |
 | `appPort`, `portsAttributes` | `devsandbox port web 3000` | ignored |
 | `runArgs`, `capAdd`, `securityOpt` | none | ignored |
 | `dockerComposeFile`, `service`, `runServices` | `[services.*]` + `services` | error |

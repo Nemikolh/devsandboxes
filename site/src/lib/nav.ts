@@ -33,6 +33,8 @@ export function sidebarGroups(examples: NavLink[]): NavGroup[] {
     {
       label: 'REFERENCE',
       links: [
+        // A collection page (order 4, last of the docs), so it reads right before the generated references.
+        { href: '/docs/host-daemon', label: 'Host daemon' },
         { href: '/docs/config', label: 'Configuration' },
         { href: '/docs/node-api', label: 'Node API' },
       ],

@@ -1,0 +1,50 @@
+---
+title: Host daemon
+description: The per-user background process behind notifications, dispatchers, port forwards and the API. It starts on its own; install it to run from login.
+eyebrow: REFERENCE
+order: 4
+---
+
+import Callout from '../../components/Callout.astro';
+import ResourceLink from '../../components/ResourceLink.astro';
+
+`devsandbox serve` is a small background process, one per user, that holds the live side of devsandbox on your machine: the connection to each running sandbox's helper, the ssh-agent relay, port forwards, desktop notifications, the control commands dispatchers use, and the API other tools talk to. Because it lives outside the dashboard, all of that keeps working when you close it.
+
+## You don't start it
+
+The dashboard, `run`, `start` and the commands that relay your ssh-agent start it when it isn't running, and a newer devsandbox takes over from an older one by itself. It exits 10 minutes after its last user left: no dashboard, no port forward, no running dispatcher or `inbox = true` sandbox. Files stay the source of truth (`state.toml`, the Inbox), so stopping it loses nothing, and read-only commands such as `ps` or `devsandbox inbox ls` don't need it.
+
+What it keeps across restarts:
+
+- **Port forwards.** Ports-tab forwards survive closing the dashboard and come back on the same host port when the daemon restarts; a sandbox's `forwardPorts` follow its instance.
+- **Dispatchers.** `devsbd ensure`, `exec`, `events` and the rest are served whether or not a dashboard is open. A control command exits `75` only when no daemon is reachable; scripts retry.
+
+## Start it at login
+
+A sandbox the container runtime restarts on boot (`autostart = "runtime"`) can't start a host process itself, so until your first `devsandbox` command its control commands wait. Hand the daemon to your service manager to close that gap:
+
+```bash
+devsandbox serve install     # a systemd user unit (Linux) or a LaunchAgent (macOS)
+devsandbox serve uninstall
+```
+
+The installed daemon never idles out and follows upgrades: a newer devsandbox repoints the unit at its own binary. Run `install` again after changing `PATH` or your container runtime's settings. To only keep the daemon from idling, without a unit, set it in `~/.local/share/devsandbox/daemon.config.toml`:
+
+```toml
+[serve]
+keep-alive = true
+```
+
+<Callout variant="note" title="Who can use it">
+  The daemon listens on a unix socket only you can open. Anyone who can connect to it can act as you on every sandbox, like with `docker.sock`. Linux and macOS only.
+</Callout>
+
+## Talk to it
+
+Editors and GUIs reach the same Inbox, instances and forwards as the dashboard through a JSON-lines API: spawn `devsandbox api --stdio`, or use the typed client of the npm package, `connect()`.
+
+<div class="resource-grid">
+  <ResourceLink href="/docs/node-api" label="Node API" description="connect(): the Inbox, instances and port forwards, typed" />
+  <ResourceLink href="https://github.com/Nemikolh/devsandboxes/blob/main/docs/serve.md" label="docs/serve.md" description="Start, handoff, idle exit, boot start, logs" />
+  <ResourceLink href="https://github.com/Nemikolh/devsandboxes/blob/main/docs/api.md" label="docs/api.md" description="Every API method, notification and error code" />
+</div>

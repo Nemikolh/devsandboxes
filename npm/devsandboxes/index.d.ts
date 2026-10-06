@@ -333,7 +333,7 @@ export interface ThreadSummary {
   kind: 'thread' | 'notify';
   /** `null` on a notification. */
   state: ThreadState | null;
-  /** The dispatcher's status line. */
+  /** The owner's status line. */
   status: string | null;
   /** A thread's title; a notification's newest message, first line. */
   title: string;
@@ -352,7 +352,7 @@ export interface ThreadSummary {
 export interface ThreadDetail extends ThreadSummary {
   /** `http(s)` link. */
   link: string | null;
-  /** Key of the dispatcher child it's about. */
+  /** The key, among the owner's dispatcher children, of the child it's about; `null`: the owner itself. */
   child: string | null;
   /** Set when the thread takes replies (`inbox.reply()`). */
   compose: ThreadCompose | null;
@@ -372,7 +372,7 @@ export interface ThreadCompose {
   hint: string | null;
 }
 
-/** A dispatcher action button (`inbox.act()`). */
+/** An owner's action button (`inbox.act()`). */
 export interface ThreadAction {
   id: string;
   label: string;
@@ -551,7 +551,7 @@ export interface ThreadNote {
   at: number;
 }
 
-/** A thread by store id, or a dispatcher thread by owner (instance name or id) and key. */
+/** A thread by store id, or an owner thread by owner (instance name or id) and key. */
 export type ThreadAddress = { thread: number } | { owner: string; key: string };
 
 /** One notification thread by store id, or every one. */
@@ -688,7 +688,7 @@ export interface ApiInbox {
   list: (view?: InboxView) => Promise<ThreadSummary[]>;
   get: (thread: ThreadAddress) => Promise<ThreadDetail>;
   markRead: (thread: ThreadAddress) => Promise<void>;
-  /** Press a dispatcher action (its event; host-only actions are refused). */
+  /** Press an owner's action (its event; host-only actions are refused). */
   act: (thread: ThreadAddress, action: string) => Promise<void>;
   /** Send a reply; trimmed, cut at 2000 chars. */
   reply: (thread: ThreadAddress, text: string) => Promise<void>;

@@ -66,9 +66,9 @@ Subcommands (argv[1], no clap — hand-parse to save size):
 
 - `notify [--level info|warn|error] [--link URL] [--key K] [--] <msg>...` — queues a record in `/var/lib/devsandbox/outbox/` and pokes the daemon, which flushes it to a host advertising `NOTIFY`.
 
-- `thread put [--json '<json>']` (stdin without `--json`) / `thread rm <key>` — queue a dispatcher's Inbox thread in the same outbox, as a `kind thread-put|thread-rm` record. `thread send [--json '<json>']` / `thread withdraw <thread> <id>` — queue a message in one of those threads (`kind thread-send|thread-withdraw`). The helper only checks JSON syntax (`json.rs`, std-only), the key (and a message's `thread`, `id` and 48 KiB budget); the host owns the schema. A new record drops the pending ones it supersedes and takes the oldest one's queue position (`notify::Message::supersedes`). See `docs/automations.md`, _Inbox threads_.
+- `thread put [--json '<json>']` (stdin without `--json`) / `thread rm <key>` — queue an Inbox thread's header (owners: `inbox = true`) in the same outbox, as a `kind thread-put|thread-rm` record. `thread send [--json '<json>']` / `thread withdraw <thread> <id>` — queue a message in one of those threads (`kind thread-send|thread-withdraw`). The helper only checks JSON syntax (`json.rs`, std-only), the key (and a message's `thread`, `id` and 48 KiB budget); the host owns the schema. A new record drops the pending ones it supersedes and takes the oldest one's queue position (`notify::Message::supersedes`). See `docs/automations.md`, _Inbox threads_.
 
-- `ensure|ls|branches|stop|rm|done|exec`, `run ls|logs|wait|rm|prune <key> …`, `events [--wait SECS] [--thread KEY]`, `events ack <id>...`, `thread ls [--feed]` — a dispatcher's control commands: one request over `/run/devsandbox/api.sock`, relayed by the daemon to a host advertising `CONTROL`; exit 0/1/2, 75 (no host), 77 (denied).
+- `ensure|ls|branches|stop|rm|done|exec`, `run ls|logs|wait|rm|prune <key> …`, `events [--wait SECS] [--thread KEY]`, `events ack <id>...`, `thread ls [--feed]` — control commands (the child ops need `dispatcher`, `events` and `thread ls` need `inbox = true`): one request over `/run/devsandbox/api.sock`, relayed by the daemon to a host advertising `CONTROL` (the host daemon's bridges); exit 0/1/2, 75 (no host reachable), 77 (denied).
 
 - `events --follow [--thread KEY]` — the same request shape, op `events-follow`, but the host's response stays open: after a `status ok` header it streams the owner's events as JSON lines (pending first, then each new one, a ping every 30 s idle), and the daemon relays them as they arrive instead of buffering to EOF. Exits 0 after a `{"kind":"replaced"}` line (a newer follower of the same instance took over), 75 when the stream ends otherwise (bridge dropped, daemon died, 90 s of silence), 2 on `--wait` too or an older host. Framing and timeouts: `docs/automations.md`, _Following events_.
 
@@ -458,11 +458,12 @@ kind: 0 Hello(u32 version, u8 hash_len, hash utf-8, u32 caps)  1 Open(channel: u
   replies `ok` once the record is in the Inbox store (no reply = resend); a legacy `Open` stream half-closes on a peer `Eof`, see
   `mux.rs`, docs/automations.md), `CONTROL = 1 << 3` (host serves
   `channel::CONTROL` streams: a dispatcher's `devsbd ensure|ls|stop|rm|done|exec`,
-  `devsbd run … <key> …`, `devsbd events`, `events ack` or `thread ls [--feed]` request, sent the same way (run ops
+  `devsbd run … <key> …`, or an owner's `devsbd events`, `events ack` or `thread ls [--feed]` request, sent the same way (run ops
   are then carried out by the host exec'ing `devsbd run …` in the child;
-  runs themselves never touch the frame channel), answered with an encoded response and a close;
+  runs themselves never touch the frame channel), answered with an encoded response and a close
+  (`events --follow` keeps the response open, docs/automations.md, _Following events_);
   only sink-bearing (host daemon) bridges advertise it, and the host's handler refuses
-  non-dispatchers). The bridge does two separate handshakes and copies
+  child ops without `dispatcher` and thread ops without `inbox = true`). The bridge does two separate handshakes and copies
   bytes, so caps don't flow end to end by themselves:
   - The daemon's `Hello` advertises `TCP_FORWARD`.
   - The bridge advertises `own & daemon` caps to the host (its `OWN_CAPS` ANDed

@@ -88,8 +88,8 @@ Every `inbox.thread.*` method names its thread one of two ways:
 
 - `{"thread": 12}`: the store id, from any summary. Stable for the
   thread's life.
-- `{"owner": "bab-disp", "key": "pr-6900"}`: a dispatcher thread by its
-  owner, the instance name or `instance_id`, and its key. The id is tried
+- `{"owner": "bab-disp", "key": "pr-6900"}`: an owner thread (`devsbd
+  thread put`) by its owner, the instance name or `instance_id`, and its key. The id is tried
   first; a name that named several instances over time (removed instances
   keep theirs on archived threads) picks the live thread, then the most
   recently changed. Notification threads aren't addressable this way.
@@ -109,7 +109,7 @@ What `inbox.threads.list` returns per thread, and the top of
 | `key` | thread key, or `null` (an unkeyed notification) |
 | `kind` | `thread` (`devsbd thread put`) or `notify` (`devsbd notify` records) |
 | `state` | `needs-you` \| `active` \| `done`; `null` on a notification |
-| `status` | the dispatcher's status line, or `null` |
+| `status` | the owner's status line, or `null` |
 | `title` | a thread's title; a notification's newest message, first line |
 | `level` | a notification's newest level (`info` \| `warn` \| `error`), else `null` |
 | `unread` | |
@@ -136,7 +136,7 @@ Params: a thread address. Result: the summary's fields plus
 | field | |
 |---|---|
 | `link` | `http(s)` link, or `null` |
-| `child` | key of the dispatcher child it's about, or `null` |
+| `child` | the key, among the owner's dispatcher children, of the child it's about (host actions target it), or `null`: the thread is about the owner itself |
 | `compose` | `{"placeholder": …, "hint": …}` when it takes replies, else `null`; `hint` is one line saying what sending does now |
 | `actions` | `[{"id","label","done","host","sends_event"}]`: `host` is the host verb (`vscode`, `terminal`, `logs`, `forward`, `open`, `rm`) or `null`; `sends_event: false` means host-only |
 | `feed` | an owner thread's feed, oldest first (first-insert order); see *Feed items* |
@@ -152,7 +152,7 @@ Each item has `type`, `seq` (arrival order across the whole Inbox) and `at`
 
 | `type` | fields | |
 |---|---|---|
-| `message` | `id`, `blocks`, `edited`, `withdrawn` | from the owner (`devsbd thread send`); `blocks`, by `type`: `{"type":"markdown","text"}`, or `{"type":"fields","items":[{"label","value"}]}` (a key/value list, in order; clients show aligned `label  value` rows). or `{"type":"form",…}` (see *Forms*). `edited`: replaced in place since first sent; `withdrawn`: the owner took it back |
+| `message` | `id`, `blocks`, `edited`, `withdrawn` | from the owner (`devsbd thread send`); `blocks`, by `type`: `{"type":"markdown","text"}`, or `{"type":"fields","items":[{"label","value"}]}` (a key/value list, in order; clients show aligned `label  value` rows), or `{"type":"form",…}` (see *Forms*). `edited`: replaced in place since first sent; `withdrawn`: the owner took it back |
 | `reply` | `text` | the user's reply |
 | `submission` | `message`, `form`, `answers` | the user submitted form `form` of message `message`: every question's answer (see *Forms*) |
 | `action` | `action`, `label` | the user pressed an action (its id, its label then) |
@@ -165,19 +165,20 @@ made each user item; the API and owners' events never carry it.
 ### Mutations
 
 Each answers `{"ok": true}`, is one locked store write, and enqueues the
-event the dashboard would (the owner pulls it with `devsbd events`).
+event the dashboard would (the owner pulls it with `devsbd events`, or gets
+it at once on `devsbd events --follow`).
 
 | method | params | does | errors |
 |---|---|---|---|
 | `inbox.thread.markRead` | address | mark read | `not-found` |
-| `inbox.thread.act` | address + `"action": "<id>"` | press a dispatcher action: an `action` event (a `done: true` action also sets the thread done) | `not-found` (thread or action), `invalid` (host-only action, notification), `denied` (archived) |
+| `inbox.thread.act` | address + `"action": "<id>"` | press an owner's action: an `action` event (a `done: true` action also sets the thread done) | `not-found` (thread or action), `invalid` (host-only action, notification), `denied` (archived) |
 | `inbox.thread.reply` | address + `"text": "…"` | a `reply` event; trimmed, cut at 2000 chars | `invalid` (empty, notification), `denied` (archived, takes no replies) |
 | `inbox.thread.done` | address | set done (a `done` event); already done: nothing | `invalid` (notification), `denied` (archived) |
 | `inbox.thread.reopen` | address | reopen a done thread (a `reopen` event); not done: nothing | `invalid` (notification), `denied` (archived) |
 | `inbox.form.saveDraft` | address + `"message": "<id>"`, `"answers": {…}` | merge `answers` (any subset of the questions) into the form's draft; no event | `not-found` (thread, message, or no form on it), `closed-form`, `invalid` (unknown question, wrong type, bad value; one bad answer refuses all), `denied` (archived) |
 | `inbox.form.submit` | address + `"message": "<id>"`, `"answers": {…}` | submit the form: `answers` over the draft over the defaults, one `submit` event with every answer | as `saveDraft`, and `invalid` listing the required questions left unanswered |
-| `inbox.notify.dismiss` | `{"thread": id}`, or `{"all": true}` | remove one notification thread, or every one | `not-found`, `invalid` (a dispatcher thread, or `all` with a thread) |
-| `inbox.notify.markRead` | `{"thread": id}`, or `{"all": true}` | mark one notification thread read, or every one (dispatcher threads are untouched) | `not-found`, `invalid` (a dispatcher thread, or `all` with a thread) |
+| `inbox.notify.dismiss` | `{"thread": id}`, or `{"all": true}` | remove one notification thread, or every one | `not-found`, `invalid` (an owner thread, or `all` with a thread) |
+| `inbox.notify.markRead` | `{"thread": id}`, or `{"all": true}` | mark one notification thread read, or every one (owner threads are untouched) | `not-found`, `invalid` (an owner thread, or `all` with a thread) |
 
 ### Forms
 

@@ -1,10 +1,18 @@
 # Inbox threads: dispatchers that ask, users that answer
 
-Status: implemented (steps 1-10). Where the code differs from the design, the
-sections below say so; *Decisions* records what was settled before the build.
-User reference: `automations-guide.md` (*Inbox threads*); protocol:
-`automations.md` (*Inbox threads*). Companion plan for the PR babysitter:
-`../.devsandboxes/dispatcher-threads-plan.md`.
+Status: implemented (steps 1-10), then **superseded by
+`inbox-redesign.md`** (2026-10-06) for the thread model (one overwritten
+`message` + a per-field timeline, now a header + a feed of messages, replies,
+actions, submissions and markers), reply-only input (now also forms),
+TUI-only events (now any client: `devsandbox inbox`, the API), the
+dashboard-only control path (now the host daemon, `serve.md`) and
+dispatcher-only threads (now `inbox = true`). What still holds: the locked
+store (now `inbox.json`), done instances, host actions, `vscode-goto` and
+markdown rendering. Sections replaced are marked *Superseded* inline; read
+this doc as history, and the current system in the user docs:
+`automations-guide.md` (*Inbox threads*), `inbox-cli.md`, `api.md`,
+`tui.md`; protocol: `automations.md` (*Inbox threads*). Companion plan for
+the PR babysitter: `../.devsandboxes/dispatcher-threads-plan.md`.
 
 ## Why
 
@@ -57,6 +65,12 @@ Inbox loses nothing.
 ## Design
 
 ### Threads
+
+> *Superseded* by `inbox-redesign.md` (*Model*): `message` is gone from the
+> header (messages are feed items, `thread send`), `reply` is `compose`, the
+> timeline is a feed with collapsing markers, and threads need `inbox = true`,
+> not `dispatcher`. Identity, idempotent puts, the outbox transport and
+> `thread rm` still hold.
 
 A thread is identified by `(owner, key)`, where `owner` is the sending
 instance's `instance_id` (stable across stop, restart and rebuild; never
@@ -127,6 +141,10 @@ devsbd thread put < thread.json      # or: devsbd thread put --json '<json>'
 
 ### Actions
 
+Still holds (host verbs, owner actions, `done: true`). Since
+`inbox-redesign.md`: a `vscode`/`terminal`/`forward` action on a stopped
+target starts it first, and `r` replies when the thread sets `compose`.
+
 Two kinds, which can be combined on one button:
 
 - **Host actions** run in the dashboard immediately, with no dispatcher round
@@ -168,6 +186,13 @@ opens no file), `r` to reply (when `reply` is set), `d` to mark done (a
 `active`, a `reopen` event). `d` and `u` only act on a real transition.
 
 ### Events: pull, not push
+
+> *Superseded* by `inbox-redesign.md` (*Events*, *Host daemon*): events carry
+> `thread` (`key` is a deprecated alias), gain `submit`, filter with
+> `--thread` and stream with `--follow`; they're held in `inbox.json`, served
+> by the host daemon rather than a dashboard, and produced by any client (the
+> dashboard, `devsandbox inbox`, the API), not only dashboard clicks.
+> At-least-once delivery with explicit acks still holds.
 
 ```bash
 devsbd events [--wait SECS]        # JSON lines, oldest first
@@ -332,7 +357,8 @@ opens, and the status line says the line was dropped.
 
 ### Inbox UI
 
-Superseded by *Inbox layout v2* below: the open/close pane and `v` cycling
+*Superseded* by *Inbox layout v2* below, whose thread pane is in turn
+superseded by `inbox-redesign.md` (*TUI Inbox*): the open/close pane and `v` cycling
 here shipped in step 4 and were replaced by the side-by-side layout, cards and
 `←`/`→` in steps 11-13.
 
@@ -358,7 +384,8 @@ Gmail-like rather than a log:
 
 ## Out of scope / later
 
-- The bidirectional stream (above).
+- The bidirectional stream (above): built since, `devsbd events --follow`
+  (`inbox-redesign.md`).
 - **Shared threads across users.** Assumed: each user runs their own
   devsandbox and dispatcher, so the host-local store is enough. Several people
   acting on one dispatcher's threads would need a store off the host.
@@ -387,7 +414,8 @@ where the two disagree.
   nothing, and the daemon retries.
 
 - **Threads belong to the owner's `instance_id`**, and only `dispatcher`
-  instances may send them (others get an `error` record: "thread put denied").
+  instances may send them (*superseded*: `inbox = true` instances, since
+  `inbox-redesign.md`) (others get an `error` record: "thread put denied").
   A stopped, restarted or rebuilt dispatcher keeps its threads, and can read
   them back with `devsbd thread ls` (e.g. after losing its own state). No
   other instance can read or change them. `devsandbox rm` of the owner
@@ -421,7 +449,7 @@ where the two disagree.
   proposal, not in the design above). Otherwise a non-dispatcher's `notify`
   would only show up under **All**.
 
-- **Helper self-heal.** A running instance only gets a new `devsbd` on
+- **Helper self-heal** (now done by the host daemon's bridges, `serve.md`). A running instance only gets a new `devsbd` on
   `run`/`start`/`port` (`src/commands/start.rs:54`), never from an open
   dashboard. So a running dispatcher wouldn't get `thread`/`events` until
   `devsandbox start`. The dashboard now reinstalls a stale helper when it
@@ -645,6 +673,11 @@ module, in the style of its neighbors. Container paths use
 - Thread puts are dropped unless the sender declares `dispatcher`.
 
 ## Inbox layout v2 (feedback after the first build)
+
+The side-by-side layout, cards, view strip, focus zones and divider still
+hold; the thread pane drawn below (message, then timeline, actions at the
+bottom) is *superseded* by `inbox-redesign.md` (*TUI Inbox*: pinned header
+and action row, open forms, feed newest first).
 
 Feedback on the step 4 UI: the list + full-screen pane layout is clumsy, rows
 read like an old-school table, and `v` is a poor view switcher. Agreed shape:

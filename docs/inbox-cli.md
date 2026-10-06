@@ -48,7 +48,7 @@ running (never lazy-started), as the API methods `inbox.thread.reply` /
 owner's `--follow` wake at once. With no daemon answering (or off unix,
 where there's none) they apply the same ops to the store directly through
 the same checks, so the owner's events and the errors are identical either
-way; the owner sees them on its next `devsbd thread events`.
+way; the owner sees them on its next `devsbd events`.
 
 Success prints one line on stderr and nothing on stdout. A refusal exits
 non-zero with the API's message and code, e.g. `no thread 5 (not-found)`,

@@ -2,11 +2,25 @@
 
 ## Unreleased
 
-Dispatchers can now keep one Inbox thread per item, with a state, buttons and a reply box, and read your clicks and replies back. The Inbox becomes a list of what's waiting on you rather than a log, it's shared by every open dashboard, and instances can be marked done instead of removed. VS Code can open straight at a file and line.
+A per-user host daemon now keeps notifications, dispatchers and port forwards working with the dashboard closed, and serves an API that editors, GUIs and the new npm `connect()` client can drive. Sandboxes can keep one Inbox thread per item: a header with a state and buttons, and a conversation of messages, forms and your replies, answered from the dashboard, the new `devsandbox inbox` command or any API client, with events streamed back as they happen. The Inbox becomes a list of what's waiting on you rather than a log, and instances can be marked done instead of removed. VS Code can open straight at a file and line.
 
 ### Added
 
-- **Inbox threads for dispatchers.** `devsbd thread put` puts one thread per item in the Inbox: a title, a link, a state (`needs-you`, `active` or `done`), a status, a message, up to 9 buttons and an optional reply box. A put that changes nothing is ignored (no unread mark, no popup), so a dispatcher can simply re-send all its threads on every pass; a desktop popup only fires when a thread enters `needs-you`. Puts are queued like `notify`, so they work with no dashboard open, and a newer put for the same thread replaces the queued one. `devsbd thread rm` drops a thread, `devsbd thread ls` lists yours back. Only sandboxes that declare `inbox = true` may send threads and read their events; `dispatcher` alone only grants the child commands, so a dispatcher that wants threads declares both. A rejected one shows up as an error notification from your instance, with the reason. Full reference: `docs/automations-guide.md`.
+- **A host daemon keeps devsandbox live with the dashboard closed.** `devsandbox serve` is a per-user background process that now owns the connection to every running sandbox's helper: the ssh-agent relay, notifications and desktop popups, dispatcher control commands and port forwards. You don't start it: the dashboard, `run`, `start` and the commands that relay your ssh-agent start it when needed, and it exits 10 minutes after its last user left (a dashboard, a forward, a running dispatcher or `inbox = true` sandbox). A newer devsandbox takes over from an older daemon by itself. `devsandbox serve install` runs it from login as a systemd user unit (Linux) or a LaunchAgent (macOS), for sandboxes the container runtime restarts on boot; an upgrade repoints the installed unit at the new binary, and `serve uninstall` removes it. To keep it from idling without a unit, use `devsandbox serve --keep-alive` or `~/.local/share/devsandbox/daemon.config.toml`. `exec`, `start` and `run` no longer start an ssh-agent bridge of their own: one bridge per container, relaying the agent of whichever session last ran a command. Details: `docs/serve.md`.
+
+```toml
+# ~/.local/share/devsandbox/daemon.config.toml
+[serve]
+keep-alive = true
+```
+
+```bash
+devsandbox serve install
+```
+
+- **Port forwards outlive the dashboard.** Ports-tab forwards and every sandbox's `forwardPorts` now run in the host daemon, so closing the dashboard no longer drops them, and every open dashboard shows the same ones. Forwards you add are saved in `~/.local/share/devsandbox/forwards.toml` and come back on the same host port after a daemon restart or a reboot, until `d` stops them. `devsandbox port` still forwards in the foreground until you stop it.
+
+- **Inbox threads.** A sandbox that declares `inbox = true` can keep one thread per item in the Inbox (a PR, an email to answer). `devsbd thread put` sets its header: a title, a link, a state (`needs-you`, `active` or `done`), a status, the child instance it's about, up to 9 buttons and an optional reply box (`compose`, with a `hint` line under it saying what sending does). A put that changes nothing is ignored (no unread mark, no popup), so a sandbox can simply re-send all its threads on every pass; a desktop popup only fires when a thread enters `needs-you`, and state and status changes show as one-line markers in the thread. `devsbd thread send` adds a message under the header: markdown and key/value `fields` blocks, identified by an id of your choosing, so re-sending the same message is free and sending changed content edits it in place; `devsbd thread withdraw` takes one back. Everything is queued like `notify`, so it works with no daemon running. `devsbd thread rm` drops a thread, `devsbd thread ls [--feed]` lists yours back, messages included. `dispatcher` alone only grants the child commands, so a dispatcher that wants threads declares both. A rejected put or send shows up as an error notification from your instance, with the reason. Full reference: `docs/automations-guide.md`.
 
 ```toml
 [sandbox.pr-dispatcher]
@@ -15,15 +29,33 @@ inbox = true
 ```
 
 ```bash
-devsbd thread put --json '{"key":"pr-123","title":"#123 fix login","state":"needs-you","status":"review replies","child":"pr-123","actions":[{"id":"post","label":"Post replies"},{"id":"done","label":"Done","done":true}],"reply":{}}'
+devsbd thread put --json '{"key":"pr-123","title":"#123 fix login","state":"needs-you","status":"review replies","child":"pr-123","actions":[{"id":"retry","label":"Retry"},{"id":"done","label":"Done","done":true}],"compose":{"hint":"Starts a run with your message"}}'
+devsbd thread send --json '{"thread":"pr-123","id":"run-1","blocks":[{"type":"markdown","text":"Addressed 3 of 4 comments, **1 needs your call**."}]}'
 ```
 
-- **Thread buttons that act right away.** A button can carry a built-in host action that runs in the dashboard with no round trip: open VS Code on the thread's child (at a file and line), a terminal, its logs, a port forward, a link, or `rm` with the usual confirm. The target is always the thread's child or the dispatcher itself, never another instance, and there is no arbitrary host command.
+- **Forms in messages.** A message can carry a form: choice, text and yes/no questions, with defaults (a text default is how you offer a draft for editing). The dashboard pins open forms under the thread's header: `tab` between questions, `space` to pick, `e` to edit a text answer, `enter` to see what will be sent and `enter` again to submit. Half-filled answers are saved as you go, so they survive a restart and show the same in every dashboard. Submitting sends one `submit` event with every answer, defaults filled in, and the form stays in the thread read-only with your answers.
 
-- **Events: your clicks and replies, back to the dispatcher.** Every other button, a reply, marking a thread done and reopening it become events the dispatcher reads with `devsbd events` (JSON lines). `--wait SECS` returns as soon as there's one, so a dispatcher can replace its sleep with it and react within seconds. Delivery is at least once: events stay until the dispatcher acks them with `devsbd events ack <id>…` after saving its own state.
+- **`devsandbox inbox` answers threads from a shell.** `ls` and `show` (with `--json`) read the Inbox without the daemon; `reply`, `act`, `submit`, `done` and `reopen` answer a thread, named `<owner>/<key>` or by the id `ls` shows. The owner gets the same events as from the dashboard.
 
 ```bash
-devsbd events --wait 300
+devsandbox inbox ls --view needs-you
+devsandbox inbox reply pr-dispatcher/pr-123 "Rebase it first"
+```
+
+- **An API for editors and GUIs.** The host daemon serves a JSON-lines API on a unix socket: the Inbox (threads, replies, actions, forms, done/reopen, notifications), instances, port forwards, and change notifications. `devsandbox api --stdio` relays it over stdin/stdout for clients that can only spawn a process; it exits 0 when its input ends and 75 only when the daemon hung up first. The npm package's `connect()` wraps it with typed `inbox`, `instances` and `forwards` methods and events. Whoever can open the socket can act as you on every sandbox, like `docker.sock`. Reference: `docs/api.md`.
+
+```ts
+const api = await devsandbox.connect({ name: 'my-tool' });
+await api.subscribe(['inbox']);
+const [t] = await api.inbox.list('needs-you');
+```
+
+- **Thread buttons that act right away.** A button can carry a built-in host action that runs in the dashboard with no round trip: open VS Code on the thread's child (at a file and line), a terminal, its logs, a port forward, a link, or `rm` with the usual confirm. On a stopped child, VS Code, the terminal and the forward start it first (the button says `(stopped)`); logs don't, since a stopped container's log says why it stopped. The target is always the thread's child or the thread's owner itself, never another instance, and there is no arbitrary host command.
+
+- **Events: your answers, back to the thread's owner.** Every other button, a reply, a form submission, marking a thread done and reopening it become events the owner reads with `devsbd events` (JSON lines, each naming its `thread`). `--wait SECS` returns as soon as there's one; `--follow` keeps a stream open and prints each event the moment it happens, with a ping after 30 s of quiet, and a newer follower from the same instance replaces the older one, so two copies of a loop never both act on a click. `--thread KEY` narrows either to one thread. Delivery is at least once: events stay until the owner acks them with `devsbd events ack <id>…` after saving its own state. `devsbd features` lists the newer verbs a helper has (`thread-send`, `events-follow`, …), so a script can check before using them.
+
+```bash
+devsbd events --follow
 devsbd events ack e-1790900001-3f2a
 ```
 
@@ -45,19 +77,23 @@ devsandbox vscode web-2 --goto src/main.rs:42:7
 
 ### Changed
 
-- **The Inbox shows what's waiting on you.** Side by side: a card list on the left (title, compact age, state/level chip and sender; a selected card gets an accent bar), the selected thread always open on the right, with a `‹ Needs you │ Active │ Done │ All ›` strip above the list stepped by `←`/`→`. The tab count and the yellow `✉N` on instance rows now count threads that need you and unread notifications, not every unread record. `enter` moves focus into the thread pane: `1`–`9` run buttons, `r` replies in a box at the bottom of the pane (shown only when the thread takes replies), `d` marks done, `u` reopens, `o`/`t`/`l`/`p` act on the thread's child, and `enter` opens the link; `esc` steps back. The per-instance grouping and inline folding are gone: a notification's earlier records are listed in the pane. A thread is read when selected and again if it changes while selected; notifications are marked read the same way or when you leave the Inbox after seeing them. `d` on a notification dismisses it and on a thread marks it done; `D` clears notifications only.
+- **The Inbox shows what's waiting on you.** Side by side: a card list on the left (title, compact age, state/level chip and sender; a selected card gets an accent bar), the selected thread always open on the right, with a `‹ Needs you │ Active │ Done │ All ›` strip above the list stepped by `←`/`→`. The tab count and the yellow `✉N` on instance rows now count threads that need you and unread notifications, not every unread record. In the thread, the header stays pinned at the top (title, the same state and status chip as the card, the child and whether it's stopped, the buttons), open forms sit under it, and the conversation runs newest first, so the newest thing is read first. `enter` moves focus into the thread pane: `1`–`9` run buttons, `r` replies in a box at the bottom of the pane (shown only when the thread takes replies; it wraps, grows to six rows, and the line under it says what sending does; `alt-enter` adds a line), `tab` moves to an open form, `d` marks done, `u` reopens, `o`/`t`/`l`/`p` act on the thread's child, and `enter` opens the link; `esc` steps back. The per-instance grouping and inline folding are gone: a notification's earlier records are listed in the pane. A thread is read when selected and again if it changes while selected; notifications are marked read the same way or when you leave the Inbox after seeing them. `d` on a notification dismisses it and on a thread marks it done; `D` clears notifications only.
 
 - **The dashboard takes more mouse clicks.** Click a tab title to switch tabs. In the Inbox, click a card to select it, a view name to switch views, the thread or its reply box to focus them; the wheel moves through the cards or scrolls the thread.
 
-- **Inbox text is rendered as markdown.** A thread's message and notification bodies show headings, lists, code blocks, quotes, links and tables (aligned when they fit) instead of raw `**` and backticks; titles and statuses get inline code and emphasis. Long lines wrap at word boundaries. Press `m` on a thread to see the source. Control characters from containers are stripped before they are stored or drawn.
+- **Inbox text is rendered as markdown.** Thread messages, replies and notification bodies show headings, lists, code blocks, quotes, links and tables (aligned when they fit) instead of raw `**` and backticks; titles and statuses get inline code and emphasis. Long lines wrap at word boundaries. Press `m` on a thread to see the source. Control characters from containers are stripped before they are stored or drawn.
 
-- **An open dashboard updates the helper in running instances.** Before, a running dispatcher only got new `devsbd` verbs after `devsandbox start`; now opening the dashboard of a newer devsandbox is enough.
+- **A newer devsandbox updates the helper in running instances.** Before, a running dispatcher only got new `devsbd` verbs after `devsandbox start`; now the host daemon of a newer devsandbox installs them, so opening its dashboard (or any command that starts the daemon) is enough.
+
+- **The Inbox is stored in `inbox.json`.** It's shared by every dashboard, the host daemon and `devsandbox inbox`. On first use, the notifications of the old `inbox.toml` are carried over; threads from earlier builds aren't (their owners re-send them on their next pass).
 
 - **`devsbd ensure`, `stop`, `rm` and `done` answer JSON.** Each prints one JSON line instead of the bare instance name, so a dispatcher never parses prose: `ensure` gives `name`, `key`, `sandbox`, `state`, and whether the child was `created` or `started`; `stop` gives `state: "stopped"`, `rm` `removed: true`, `done` `done: true`. A script that read the name from stdout reads `.name` now. Errors are unchanged: a message on stderr and a non-zero exit.
 
 - **`rm` cleans up merged branches without asking.** With no flag, `rm` first runs `git fetch --prune origin`, then decides about the branch the worktree has checked out. If every commit on it is already on its remote branch, or the remote branch it tracked has been deleted (a merged PR), the branch is deleted without a prompt. Only a branch with commits that exist nowhere else still prompts, and off a TTY it is kept. Branches you reused with `--branch` follow the same rules now. The default branch (`origin/HEAD`, `main`, `master`) is never deleted. When `rm` deletes a branch, it also deletes the branch `run` created if that branch is an ancestor of it. `--delete-branch` / `--keep-branch` still decide outright.
 
 ### Fixed
+
+- **Long commands in the `:` prompt stay visible.** Text past the prompt's width was hidden though it was still run; the prompt now scrolls sideways to keep the cursor in view.
 
 - **A press in the Inbox thread pane no longer grabs the divider.** A press on the pane's first text column started resizing the list/thread split; now only the borders do.
 

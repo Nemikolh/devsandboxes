@@ -6,11 +6,10 @@ keeps working with the dashboard closed. Design and roadmap:
 `docs/inbox-redesign.md`, "Host daemon". Unix only; the command doesn't
 exist on Windows.
 
-This page covers what exists today (steps 4-10 of that plan): the socket,
-start, handoff, idle exit, the bridges (the ssh-agent relay included), the
-port forwards, the startup autostart pass and boot start. The
-API on the socket has its own page, `docs/api.md`. Marked below is what
-later steps add.
+This page covers the socket, start, handoff, idle exit, the bridges (the
+ssh-agent relay and the control ops included), the port forwards, the
+startup autostart pass and boot start. The API on the socket has its own
+page, `docs/api.md`.
 
 Code: `src/serve/` (`endpoint.rs` paths + bind/connect/accept, `daemon.rs`,
 `host.rs` bridges + autostart, `forwards.rs` port forwards, `api.rs`
@@ -31,7 +30,7 @@ short on purpose (macOS caps socket paths at 104 bytes): one daemon per
 user, no config root in the path.
 
 **Access control is the file permissions.** Whoever can connect to the
-socket can (once the API lands) exec into every container, like
+socket can exec into every container (`docs/api.md`), like
 `docker.sock`. There is no TCP listener.
 
 ## Start
@@ -62,8 +61,9 @@ command that relays the ssh-agent into a relay-mode instance (`exec`,
 `start`'s `postStartCommand`, `run`'s lifecycle chain) for its bridge (see
 *Bridges*), and `devsandbox api --stdio` (the relay external clients and
 the npm package spawn; it stays connected while it runs, see `docs/api.md`,
-*Relay*). `inbox` follows in step 19 (the foreground `port` command
-doesn't use the daemon).
+*Relay*). `devsandbox inbox`'s mutations use a daemon that's already
+running but never start one (`docs/inbox-cli.md`); the foreground `port`
+command doesn't use the daemon.
 
 The daemon inherits the environment of the process that started it: the
 runtime choice (`DEVSANDBOX_RUNTIME`), `SSH_AUTH_SOCK` (the agent its bridges
@@ -74,16 +74,17 @@ instead (see *Boot start*).
 
 ## Bridges
 
-The daemon keeps one bridge per running instance with a helper, the way the
-dashboard did until now (`devsbd::bridge::Bridges`): it lists the runtime's
-running containers every 5 s and reconciles. Each bridge relays the host
-ssh-agent (when there is one), drains the container's outbox (`devsbd
-notify`, `devsbd thread put|rm`) into `inbox.toml`, shows desktop popups
-(rate-limited per instance), and serves the dispatcher's control ops
-(`ensure`, `exec`, `run …`, `events`, `thread ls`). Before each (re)spawn
-it reinstalls a stale helper, so a running dispatcher gets new `devsbd`
-verbs once a newer daemon runs. The dashboard no longer bridges, and neither
-do CLI commands.
+The daemon keeps one bridge per running instance with a helper
+(`devsbd::bridge::Bridges`): it lists the runtime's running containers
+every 5 s and reconciles. Each bridge relays the host ssh-agent (when there
+is one), drains the container's outbox (`devsbd notify`, `devsbd thread
+put|send|withdraw|rm`) into `inbox.json`, shows desktop popups
+(rate-limited per instance), and serves the in-container control ops: a
+dispatcher's child ops (`ensure`, `exec`, `run …`, …) and a thread owner's
+`events` (`--follow` included) and `thread ls`. Before each (re)spawn it
+reinstalls a stale helper, so a running dispatcher gets new `devsbd` verbs
+once a newer daemon runs. Neither the dashboard nor CLI commands bridge;
+only a forward has a bridge of its own (*Forwards*).
 
 **ssh-agent through the daemon.** A command that injects `SSH_AUTH_SOCK`
 into a relay-mode instance (`exec`, `start`'s `postStartCommand`, `run`'s
@@ -105,10 +106,11 @@ With the runtime unreachable, the last list stands (bridges and holders are
 kept, not torn down on a blip) and `serve.log` gets one line; another when
 it answers again.
 
-`events --wait` wakes as soon as the daemon itself writes the store (the
-notify sink, an ack, a connected dashboard's clicks through the API), and
-re-checks the file every 500 ms for writes by other processes (a dashboard
-without a daemon connection, `devsandbox rm`).
+`events --wait` and `events --follow` wake as soon as the daemon itself
+writes the store (the notify sink, an ack, any client's answers through the
+API), and re-check the file every 500 ms for writes by other processes (a
+dashboard without a daemon connection, `devsandbox inbox` with no daemon
+answering, `devsandbox rm`).
 
 Each message the sink stores that earns a status line also goes to `inbox`
 subscribers as `inbox.shown`: that's the dashboard's status line.
@@ -123,8 +125,7 @@ configured ones follow the 5 s container poll: started on the host port
 saved in `state.toml` when their instance runs, stopped when it stops, so
 they work with no dashboard open. Each forward keeps its own bridge (an
 `exec -i … devsbd bridge` of its own, self-healing), separate from the
-instance's daemon bridge; sharing that bridge's mux is a later
-optimization. Status lines (a configured forward started or failed, a
+instance's daemon bridge (*Future work*). Status lines (a configured forward started or failed, a
 connection note) go to `forwards` subscribers as `forwards.status` and to
 `serve.log`.
 
@@ -245,7 +246,7 @@ stderr to `serve.log` (systemd `StandardOutput=append:`, launchd
 minimal `PATH`, so the unit carries, as set (and non-empty) when you ran
 `install`: `PATH`, `DEVSANDBOX_RUNTIME`, `DOCKER_HOST`, `DOCKER_CONTEXT`,
 `CONTAINER_HOST`, `XDG_DATA_HOME`, `XDG_STATE_HOME` (the last two keep the
-managed daemon on the same `state.toml`, `inbox.toml` and `serve.log` as
+managed daemon on the same `state.toml`, `inbox.json` and `serve.log` as
 your shell's commands). Not `SSH_AUTH_SOCK`: it rotates, and clients report
 theirs (`bridges.ensure`, *Bridges*). Not `DISPLAY` either: popups from a
 managed daemon need the manager to have it (`systemctl --user

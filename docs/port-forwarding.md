@@ -81,7 +81,8 @@ curl ──tcp──▶ devsandbox (host listener 127.0.0.1:3000)
 - The Ports tab lists the daemon's forwards of its config root, so every
   open dashboard of that root sees the same ones.
 - Each forward owns its own bridge (`exec -i … devsbd bridge`). Sharing one
-  bridge per container across forwards is a later optimisation.
+  bridge per container across forwards is open (`docs/serve.md`, _Future
+  work_).
 
 ### Binding
 
@@ -449,7 +450,8 @@ I/O-free.
   work from docs/sandbox-helper.md).
 - One bridge per forward (extra `exec`s when forwarding many ports from one
   container).
-- CLI forwards are invisible to the TUI (and the daemon) and vice versa.
+- Foreground `devsandbox port` forwards are invisible to the daemon (and so
+  the Ports tab and API clients), and vice versa.
 - The injection route needs `/bin/sh` + root `exec` + writable `/run` in the
   service image.
 - The listening-process probe runs `lsof` (a plain `exec`) every 10s per active
@@ -460,8 +462,7 @@ I/O-free.
 
 A sandbox's `forwardPorts` (`config::ForwardPort`) rides the same engine, owned
 by the host daemon (`src/serve/forwards.rs`), so they run whether or not a
-dashboard is open. (Until step 8 of `docs/inbox-redesign.md` the TUI ran them
-while open.)
+dashboard is open.
 
 ```toml
 [sandbox.api]
