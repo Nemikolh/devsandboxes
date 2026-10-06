@@ -6,7 +6,7 @@
 //!
 //! Mutations (`d`, `D`, mark-read, and the pane's actions, replies, done and
 //! reopen) are only *requested* here, as [`crate::inbox::Op`]s the event loop
-//! applies through `store::update` before reloading; the local copy is
+//! applies through `inbox::ops::apply` before reloading; the local copy is
 //! updated at once so the next frame already shows the result, except for
 //! ops that enqueue an event: their ids and times are minted under the store
 //! lock, and the reload in the same loop pass shows them. Opening a link is

@@ -28,6 +28,7 @@
 //! Everything here is plain state: threading, cap, unread, retention, the put
 //! transition and the bridge's decision stay unit-testable without a store.
 
+pub mod ops;
 pub mod sanitize;
 pub mod store;
 pub mod thread;

@@ -134,13 +134,7 @@ pub fn rm(name: &str, delete_branch: Option<bool>, force: bool) -> Result<()> {
 /// warning — the instance is already removed, and failing here would say
 /// otherwise.
 fn archive_inbox(key: &str, instance_id: &str) {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    let updated = crate::inbox::store::update(|inbox| {
-        inbox.archive_owner(instance_id);
-        inbox.prune(now);
-    });
+    let updated = crate::inbox::store::path().and_then(|path| crate::inbox::ops::archive(&path, instance_id));
     if let Err(e) = updated {
         eprintln!("warning: cannot archive `{key}`'s inbox threads: {e:#}");
     }

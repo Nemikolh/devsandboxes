@@ -162,7 +162,7 @@ The helper checks JSON syntax with a std-only validator (`devsbd/src/json.rs`, n
 
 ### Apply, then ack
 
-The bridge's notify handler applies a record to the store *before* replying `ok` (`bridge::handle_notify` → `apply_message` → `store::update`). A store failure sends no reply, the daemon keeps the file and resends it, so a dashboard dying mid-delivery loses nothing. `inbox::decide` turns each message into one store action:
+The bridge's notify handler applies a record to the store *before* replying `ok` (`bridge::handle_notify` → `apply_message` → `inbox::ops::sink`). A store failure sends no reply, the daemon keeps the file and resends it, so a dashboard dying mid-delivery loses nothing. `inbox::decide` turns each message into one store action:
 
 - notify → push the record;
 - thread message from an instance whose sandbox doesn't declare `dispatcher` (`dispatch::declares_dispatcher`, evaluated only for thread messages) → an `error` notify record from that instance, key `thread:<key>`, `thread put|rm denied: …`;
@@ -173,7 +173,7 @@ A put that changes nothing leaves the store byte-identical, so no write, no mtim
 
 ### The shared store
 
-`inbox.toml` next to `state.toml` (`src/inbox/store.rs`, format v2; v1 files migrate on load, names resolved to instance ids through `state.toml`, unresolvable ones archived). Every writer (bridges' notify sinks, every dashboard's `d`/`D`/mark-read and pane ops, the control handlers, `devsandbox rm`) goes through `store::update`: exclusive `File::lock` on the sibling `inbox.lock`, load, mutate, write through a temp file + rename only when the content changed. Readers take a shared lock, best-effort. Dashboards reload when the file's mtime or length changes (checked each tick), so a dismissal in one is a dismissal in all. Before this, each dashboard kept its own copy and overwrote the file: an older dashboard brought back records dismissed in a newer one.
+`inbox.toml` next to `state.toml` (`src/inbox/store.rs`, format v2; v1 files migrate on load, names resolved to instance ids through `state.toml`, unresolvable ones archived). Every writer (bridges' notify sinks, every dashboard's `d`/`D`/mark-read and pane ops, the control handlers, `devsandbox rm`) goes through `src/inbox/ops.rs`, one `store::update_at` per op: exclusive `File::lock` on the sibling `inbox.lock`, load, mutate, write through a temp file + rename only when the content changed. Readers take a shared lock, best-effort. Dashboards reload when the file's mtime or length changes (checked each tick), so a dismissal in one is a dismissal in all. Before this, each dashboard kept its own copy and overwrote the file: an older dashboard brought back records dismissed in a newer one.
 
 Threads are keyed by `(owner instance_id, key)` and kind (a notify key and a thread key can coincide without meeting). Events live on their thread (`[[thread.event]]`) until acked; user ops (`Act`, `Reply`, `MarkDone`, `Reopen`) mint the event id (`e-<unix secs:010>-<4 hex>`) and time under the store lock, so a dashboard never applies them to its own copy first. The per-owner cap (200) counts notes, timeline entries and pending events; it evicts archived threads first, then done threads without pending events, then single oldest items, and never drops an event (each thread keeps at most 100, oldest dropped).
 

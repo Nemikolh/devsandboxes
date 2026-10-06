@@ -706,13 +706,9 @@ fn apply_message(n: Notification) -> Result<Option<(String, crate::inbox::Shown)
     let threaded = !matches!(n.message, notify::Message::Notify(_));
     let declares = threaded && dispatch::declares_dispatcher(&n.instance);
     let action = crate::inbox::decide(&n.instance, declares, n.message);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    let shown = crate::inbox::store::update(|inbox| {
-        inbox.apply_sink(&n.instance_id, &n.instance, now, action)
-    })
-    .map_err(|e| format!("{e:#}"))?;
+    let shown = crate::inbox::store::path()
+        .and_then(|path| crate::inbox::ops::sink(&path, &n.instance_id, &n.instance, action))
+        .map_err(|e| format!("{e:#}"))?;
     Ok(shown.map(|shown| (n.instance, shown)))
 }
 

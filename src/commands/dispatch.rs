@@ -54,7 +54,7 @@ use serde::Serialize;
 use crate::commands::run::{instance_at, parse_worktree_list};
 use crate::config::Config;
 use crate::devsbd::control::{self, Op, Request, Response, Status};
-use crate::inbox::{store, Event};
+use crate::inbox::{ops as inbox_ops, store, Event};
 use crate::runtime::{backend, bounded};
 use crate::state::{Instance, State};
 
@@ -348,7 +348,7 @@ pub(crate) fn handle_with(
             };
             match req.op {
                 Op::Events => events(&path, owner_id, req.timeout.unwrap_or(0).min(MAX_WAIT)),
-                Op::EventsAck => match store::update_at(&path, |i| i.ack(owner_id, &req.ack)) {
+                Op::EventsAck => match inbox_ops::ack(&path, owner_id, &req.ack) {
                     Ok(n) => Response::new(Status::Ok, n.to_string()),
                     Err(e) => failed(format!("{e:#}")),
                 },
@@ -411,11 +411,11 @@ fn events(path: &Path, owner_id: &str, timeout: u64) -> Response {
     let mut seen = None;
     loop {
         // Stamp before reading: a write in between only costs one more read.
-        let stamp = Some(store::stamp_at(path));
+        let stamp = Some(inbox_ops::stamp(path));
         if stamp != seen {
             seen = stamp;
-            let pending = match store::load_at(path) {
-                Ok(inbox) => inbox.events_for(owner_id),
+            let pending = match inbox_ops::events(path, owner_id) {
+                Ok(pending) => pending,
                 Err(e) => return failed(format!("{e:#}")),
             };
             if !pending.is_empty() {
@@ -432,11 +432,11 @@ fn events(path: &Path, owner_id: &str, timeout: u64) -> Response {
 
 /// `thread-ls`: `owner_id`'s live threads as a JSON array of put bodies.
 fn thread_ls(path: &Path, owner_id: &str) -> Response {
-    let inbox = match store::load_at(path) {
-        Ok(inbox) => inbox,
+    let threads = match inbox_ops::threads(path, owner_id) {
+        Ok(threads) => threads,
         Err(e) => return failed(format!("{e:#}")),
     };
-    let puts: Vec<_> = inbox.threads_for(owner_id).iter().map(|t| t.to_put()).collect();
+    let puts: Vec<_> = threads.iter().map(|t| t.to_put()).collect();
     match serde_json::to_string(&puts) {
         Ok(json) if json.len() > EVENTS_BODY_CAP => failed(format!("{} threads: too large to list", puts.len())),
         Ok(json) => Response::new(Status::Ok, json),

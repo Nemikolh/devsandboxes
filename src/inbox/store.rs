@@ -5,11 +5,12 @@
 //! bringing back records another one dismissed.
 //!
 //! Every change is a read-modify-write under an exclusive lock on the sibling
-//! `inbox.lock` ([`update`]), written to a temp file and renamed, so a crash
+//! `inbox.lock` ([`update_at`]), written to a temp file and renamed, so a crash
 //! mid-write can't leave a truncated file and a reader never sees a partial
-//! one. Readers ([`load`]) take a shared lock and are best-effort about it:
-//! the atomic rename already makes an unlocked read safe. [`stamp`] is the
-//! cheap "did it change" check dashboards run each tick.
+//! one. Readers ([`load_at`]) take a shared lock and are best-effort about it:
+//! the atomic rename already makes an unlocked read safe. [`stamp_at`] is the
+//! cheap "did it change" check dashboards run each tick. Callers outside
+//! tests go through [`super::ops`], which names each read and mutation.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -32,13 +33,7 @@ fn lock_path(path: &Path) -> PathBuf {
     path.with_file_name("inbox.lock")
 }
 
-/// The saved Inbox; a missing file is an empty one.
-pub fn load() -> Result<Inbox> {
-    load_at(&path()?)
-}
-
-/// [`load`] from an explicit path (tests, and the one call site that already
-/// resolved it).
+/// The saved Inbox at `path`; a missing file is an empty one.
 pub fn load_at(path: &Path) -> Result<Inbox> {
     let _shared = lock(path, false);
     read(path).map(|(inbox, _)| inbox)
@@ -86,11 +81,6 @@ fn names_from_state() -> BTreeMap<String, String> {
 /// Read-modify-write under the exclusive lock: load, run `f`, and save only if
 /// the content changed, so an update that decides to do nothing doesn't bump
 /// the mtime other dashboards poll.
-pub fn update<T>(f: impl FnOnce(&mut Inbox) -> T) -> Result<T> {
-    update_at(&path()?, f)
-}
-
-/// [`update`] on an explicit path (tests).
 pub fn update_at<T>(path: &Path, f: impl FnOnce(&mut Inbox) -> T) -> Result<T> {
     let dir = path.parent().context("inbox path has no parent")?;
     std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
@@ -134,11 +124,6 @@ fn write_atomic(path: &Path, text: &str) -> Result<()> {
 
 /// Cheap change check: the store's mtime and length, `None` when it doesn't
 /// exist yet. Dashboards compare it each tick and reload when it moves.
-pub fn stamp() -> Option<(SystemTime, u64)> {
-    stamp_at(&path().ok()?)
-}
-
-/// [`stamp`] of an explicit path (tests).
 pub fn stamp_at(path: &Path) -> Option<(SystemTime, u64)> {
     let meta = std::fs::metadata(path).ok()?;
     Some((meta.modified().ok()?, meta.len()))

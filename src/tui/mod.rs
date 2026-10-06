@@ -208,14 +208,14 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
         Ok(s) => app.settings = s,
         Err(e) => app.status = Some(format!("settings not loaded, using defaults: {e:#}")),
     }
-    match inbox::store::load() {
+    match inbox::store::path().and_then(|p| inbox::ops::load(&p)) {
         Ok(inbox) => app.set_inbox(inbox),
         Err(e) => app.status = Some(format!("inbox not loaded: {e:#}")),
     }
     // The store is shared with every other dashboard and the bridge worker:
     // reload whenever its mtime/size moved (a cheap stat each tick), or at
     // once when something here poked it.
-    let mut inbox_stamp = inbox::store::stamp();
+    let mut inbox_stamp = inbox::store::path().ok().and_then(|p| inbox::ops::stamp(&p));
     let mut reload_inbox = false;
     // At most one collection thread in flight; `Some` while one is running.
     // Startup walks the `Depth`s cheapest first, so the tree renders straight
@@ -431,21 +431,21 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
         // for, then reload when the store moved (ours or someone else's).
         let ops = app.take_pending_inbox();
         if !ops.is_empty() {
-            // Stamped here, under the store lock, not in `App`: event ids
-            // and times are minted where every dashboard's writes serialize.
-            let now = crate::state::Instance::now();
-            if let Err(e) = inbox::store::update(|i| ops.iter().for_each(|op| i.apply(op, now))) {
+            // Stamped by `ops::apply`, under the store lock, not in `App`:
+            // event ids and times are minted where every dashboard's writes
+            // serialize.
+            if let Err(e) = inbox::store::path().and_then(|p| inbox::ops::apply(&p, &ops)) {
                 app.status = Some(format!("inbox not saved: {e:#}"));
             }
             reload_inbox = true;
         }
-        let stamp = inbox::store::stamp();
+        let stamp = inbox::store::path().ok().and_then(|p| inbox::ops::stamp(&p));
         if reload_inbox || stamp != inbox_stamp {
             // Stamp before loading: a write in between only costs one more
             // reload, while stamping after could hide it until the next one.
             inbox_stamp = stamp;
             reload_inbox = false;
-            match inbox::store::load() {
+            match inbox::store::path().and_then(|p| inbox::ops::load(&p)) {
                 Ok(loaded) => app.set_inbox(loaded),
                 Err(e) => app.status = Some(format!("inbox not loaded: {e:#}")),
             }

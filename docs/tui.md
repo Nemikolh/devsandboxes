@@ -183,7 +183,7 @@ whenever the file's mtime or length moves, e.g. another dashboard dismissed
 something) and shows the record briefly on the status line. `App`
 (`src/tui/app/inbox.rs`) only holds view state: the view, the selection, the
 open thread. `d`/`D`/mark-read and the pane's actions are `inbox::Op`s the
-event loop applies through `store::update`. Desktop popups fire from the
+event loop applies through `inbox::ops::apply`. Desktop popups fire from the
 worker, never the UI thread.
 
 - `Tab::Inbox` is the fourth tab: `4` jumps to it, `tab`/`S-tab` cycle over
