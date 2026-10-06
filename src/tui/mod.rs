@@ -17,6 +17,7 @@ mod select;
 mod settings;
 mod spec;
 mod term;
+mod textarea;
 mod ui;
 
 use std::collections::BTreeMap;

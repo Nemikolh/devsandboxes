@@ -282,12 +282,17 @@ Container text has its control characters stripped when stored
 | `u` | reopen a done thread: back to `active`, an event, and the child's done mark cleared |
 | `m` | toggle rendered markdown / raw source (all threads, not saved) |
 
-**The reply input** sits at the bottom of the thread pane, three rows, and is
-only drawn when the thread sets `reply` (`draw_inbox_pane`/`draw_reply_input`,
+**The reply input** sits at the bottom of the thread pane and is only drawn
+when the thread sets `reply` (`draw_inbox_pane`/`draw_reply_input`,
 `src/tui/ui.rs`); a thread without one gets a one-line dim hint in its place,
-a notify thread gets nothing. `enter` sends a non-empty reply (the same
-`Op::Reply`) and keeps the input focused and empty for the next message;
-`esc` steps back to the thread. Its editing keys are the `:` prompt's.
+a notify thread gets nothing. It wraps what's typed by display width
+(`src/tui/textarea.rs`) and grows from one to six rows, then scrolls to keep
+the cursor in view. `enter` sends a non-empty reply (the same `Op::Reply`)
+and keeps the input focused and empty for the next message; `alt-enter` (or
+`shift-enter`, where the terminal reports it) inserts a newline; `esc` steps
+back to the thread. Its editing keys are the `:` prompt's, with `↑`/`↓` and
+`home`/`end` moving on the wrapped rows. The `:` prompt itself scrolls
+sideways once the line outgrows the bar.
 
 Archived threads refuse actions, replies, `d` and `u` with a status line. A
 host action whose child isn't found is refused rather than run on the sender,

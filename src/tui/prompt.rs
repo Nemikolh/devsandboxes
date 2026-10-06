@@ -197,6 +197,13 @@ impl Prompt {
         self.completion = None;
     }
 
+    /// Move the cursor to char index `at` (clamped), for callers that lay
+    /// the text out themselves (the wrapping [`super::textarea::TextArea`]).
+    pub fn set_cursor(&mut self, at: usize) {
+        self.cursor = at.min(self.char_len());
+        self.completion = None;
+    }
+
     /// Ctrl-U: clear the whole line.
     pub fn clear(&mut self) {
         self.input.clear();

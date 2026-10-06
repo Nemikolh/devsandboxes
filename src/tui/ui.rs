@@ -21,6 +21,7 @@ use super::data::{
 use super::procs::{is_agent, ProcState, MESSAGE_ROW};
 use super::markdown;
 use super::prompt::Prompt;
+use super::textarea::{self, TextArea};
 use super::select::{self, RegionId};
 use crate::devsbd::notify::Level;
 use crate::inbox::{Kind, State};
@@ -976,12 +977,21 @@ fn card_at(inner: Rect, offset: usize, len: usize, row: u16) -> Option<usize> {
     (rel % CARD_ROWS != CARD_ROWS - 1 && pos < len).then_some(pos)
 }
 
-/// Rows the thread pane keeps under its content: the reply input (a thread
-/// taking replies), a one-line hint (a dispatcher thread that doesn't), or
-/// none (a notify thread, which can't be replied to).
-fn pane_bottom_rows(t: &Thread) -> u16 {
+/// The reply text the input box shows: only while it has focus (unfocused,
+/// it shows the placeholder). Shared by drawing and hit-testing so both size
+/// the box alike.
+fn focused_reply(app: &App) -> Option<&TextArea> {
+    app.inbox.reply.as_ref().filter(|_| app.inbox.focus == InboxFocus::Input).map(|r| &r.line)
+}
+
+/// Rows the thread pane keeps under its content, `width` the pane's inner
+/// width: the reply input (a thread taking replies), its border plus 1 to
+/// [`textarea::MAX_ROWS`] rows of wrapped `reply`; a one-line hint (a
+/// dispatcher thread that doesn't); or none (a notify thread, which can't be
+/// replied to).
+fn pane_bottom_rows(t: &Thread, reply: Option<&TextArea>, width: u16) -> u16 {
     match (t.kind, &t.reply) {
-        (_, Some(_)) => 3,
+        (_, Some(_)) => 2 + reply.map_or(1, |r| r.height(width.saturating_sub(2))),
         (Kind::Thread, None) => 1,
         (Kind::Notify, None) => 0,
     }
@@ -1035,7 +1045,8 @@ pub(crate) fn inbox_hit(app: &App, frame: Rect, col: u16, row: u16) -> Option<In
     let Some(t) = app.selected_inbox_thread() else {
         return Some(InboxHit::Thread);
     };
-    let (_, bottom) = pane_areas(Block::bordered().inner(thread), pane_bottom_rows(t));
+    let inner = Block::bordered().inner(thread);
+    let (_, bottom) = pane_areas(inner, pane_bottom_rows(t, focused_reply(app), inner.width));
     if !bottom.contains(at) {
         Some(InboxHit::Thread)
     } else if t.reply.is_some() {
@@ -1170,7 +1181,7 @@ fn draw_inbox_pane(frame: &mut Frame, app: &App, area: Rect) {
         frame.render_widget(Paragraph::new(text), inner);
         return;
     };
-    let bottom = pane_bottom_rows(t);
+    let bottom = pane_bottom_rows(t, focused_reply(app), inner.width);
     let (content, bottom_area) = pane_areas(inner, bottom);
     let child = app.thread_child(t);
     let (lines, texts): (Vec<Line>, Vec<select::RowText>) = pane_lines(t, child.as_ref(), app.utc_offset)
@@ -1197,12 +1208,13 @@ fn draw_inbox_pane(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-/// The thread pane's reply input: a rounded box holding the line being typed,
-/// or the thread's placeholder dim while it's empty. The caret is placed (like
-/// the `:` prompt's) only while the input has focus, so it doesn't blink in
-/// a box the keys don't reach.
+/// The thread pane's reply input: a rounded box holding the text being typed,
+/// wrapped and scrolled to the cursor ([`TextArea::view`]), or the thread's
+/// placeholder dim while it's empty. The caret is placed (like the `:`
+/// prompt's) only while the input has focus, so it doesn't blink in a box the
+/// keys don't reach.
 fn draw_reply_input(frame: &mut Frame, app: &App, placeholder: Option<&str>, area: Rect) {
-    let reply = app.inbox.reply.as_ref().filter(|_| app.inbox.focus == InboxFocus::Input);
+    let reply = focused_reply(app);
     let title = if reply.is_some() { " enter sends · esc back " } else { " r reply " };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1210,18 +1222,21 @@ fn draw_reply_input(frame: &mut Frame, app: &App, placeholder: Option<&str>, are
         .border_style(zone_border_style(app, InboxFocus::Input))
         .title(title);
     let inner = block.inner(area);
-    let input = reply.map_or("", |r| r.line.input());
-    let line = if input.is_empty() {
-        let hint = placeholder.unwrap_or("reply to the dispatcher");
-        Line::from(Span::styled(hint.to_string(), Style::default().add_modifier(Modifier::DIM)))
-    } else {
-        Line::from(input.to_string())
+    let view = reply.map(|r| r.view(inner.width, inner.height));
+    let lines: Vec<Line> = match &view {
+        Some(v) if reply.is_some_and(|r| !r.input().is_empty()) => {
+            v.lines.iter().map(|l| Line::from(l.clone())).collect()
+        }
+        _ => {
+            let hint = placeholder.unwrap_or("reply to the dispatcher");
+            vec![Line::from(Span::styled(hint.to_string(), Style::default().add_modifier(Modifier::DIM)))]
+        }
     };
-    frame.render_widget(Paragraph::new(line).block(block), area);
-    if let Some(reply) = reply {
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+    if let Some(v) = view {
         if app.focus == Focus::Dashboard && inner.width > 0 && inner.height > 0 {
-            let col = inner.x + reply.line.cursor() as u16;
-            frame.set_cursor_position((col.min(inner.right().saturating_sub(1)), inner.y));
+            let (col, row) = v.caret;
+            frame.set_cursor_position((inner.x + col.min(inner.width - 1), inner.y + row.min(inner.height - 1)));
         }
     }
 }
@@ -1888,7 +1903,7 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
                     "esc list · ↑↓ scroll · enter open link · 1-9 actions · r reply · d done · u reopen · o vscode · t term · l logs · p forward · m raw · q quit · ? help".to_string()
                 }
                 InboxFocus::Input => {
-                    "enter send · esc back to thread · ←→ home end edit · ctrl-u clear · ctrl-w delete word"
+                    "enter send · alt-enter newline · esc back to thread · ←→↑↓ home end edit · ctrl-u clear · ctrl-w delete word"
                         .to_string()
                 }
             },
@@ -1917,14 +1932,13 @@ fn draw_prompt(frame: &mut Frame, prompt: &Prompt, area: Rect) {
     .areas(area);
 
     let prefix = ": ";
-    let line = Line::from(vec![
-        Span::styled(prefix, Style::default().fg(ACCENT)),
-        Span::raw(prompt.input().to_string()),
-    ]);
+    // Scrolled sideways so the caret stays in view past the right edge.
+    let room = input_area.width.saturating_sub(prefix.len() as u16);
+    let (_, shown, caret) = textarea::hscroll(prompt.input(), prompt.cursor(), room as usize);
+    let line = Line::from(vec![Span::styled(prefix, Style::default().fg(ACCENT)), Span::raw(shown)]);
     frame.render_widget(Paragraph::new(line), input_area);
 
-    // Caret: prefix width + cursor char offset, clamped to the area.
-    let col = input_area.x + prefix.len() as u16 + prompt.cursor() as u16;
+    let col = input_area.x + prefix.len() as u16 + caret;
     frame.set_cursor_position((col.min(input_area.right().saturating_sub(1)), input_area.y));
 
     // Hint line: parse error (red) takes precedence over completion candidates.
@@ -2326,7 +2340,7 @@ mod tests {
 
     use crate::devsbd::notify::Record;
     use crate::inbox::{Inbox, Note};
-    use crossterm::event::{KeyCode, KeyEvent};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -2610,6 +2624,103 @@ mod tests {
             assert_eq!(inbox_hit(&app, frame, 60, row), Some(InboxHit::Input), "row {row}");
         }
         assert_eq!(inbox_hit(&app, frame, 60, top - 1), Some(InboxHit::Thread));
+    }
+
+    /// The reply box wraps what's typed, grows with it up to
+    /// `textarea::MAX_ROWS` rows then scrolls to the cursor, and hit-testing
+    /// sees the same box.
+    #[test]
+    fn reply_box_wraps_grows_and_follows_the_cursor() {
+        let mut app = inbox_app();
+        let sel = app.inbox.rows()[app.selected()];
+        let mut inbox = Inbox::default();
+        inbox.threads = app.inbox.threads().to_vec();
+        inbox.threads[sel].reply = Some(Default::default());
+        app.set_inbox(inbox);
+        app.on_key(KeyEvent::from(KeyCode::Char('r')));
+        assert_eq!(app.inbox.focus, InboxFocus::Input);
+        let frame = Rect::new(0, 0, 120, 30);
+        // The box's rows (borders included), its inner columns, the caret.
+        let draw = |app: &App| {
+            let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+            term.draw(|f| draw(f, app)).unwrap();
+            let buf = term.backend().buffer().clone();
+            let screen: Vec<String> =
+                (0..30).map(|y| (0..120).map(|x| buf[(x, y)].symbol().to_string()).collect()).collect();
+            let top = screen.iter().position(|l| l.contains("╭ enter sends")).unwrap();
+            let bottom = top + screen[top..].iter().position(|l| l.contains('╰')).unwrap();
+            let border = &screen[top];
+            let left = border.chars().position(|c| c == '╭').unwrap();
+            let right = border.chars().position(|c| c == '╮').unwrap();
+            let rows: Vec<String> =
+                screen[top + 1..bottom].iter().map(|l| l.chars().skip(left + 1).take(right - left - 1).collect()).collect();
+            let caret = term.get_cursor_position().unwrap();
+            (top as u16, bottom as u16, left as u16 + 1, rows, (caret.x, caret.y))
+        };
+        let typed = |app: &mut App, s: &str| s.chars().for_each(|c| app.on_key(KeyEvent::from(KeyCode::Char(c))));
+
+        // Empty: one row, the placeholder.
+        let (_, _, _, rows, _) = draw(&app);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].starts_with("reply to the dispatcher"), "{rows:?}");
+
+        // Longer than a row: wrapped, nothing lost, caret after the last char.
+        let (_, _, x0, rows, _) = draw(&app);
+        let width = rows[0].chars().count();
+        let text = format!("start{}END", "x".repeat(width * 2));
+        typed(&mut app, &text);
+        let (top, bottom, _, rows, caret) = draw(&app);
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert!(rows[0].starts_with("start"));
+        assert_eq!(rows.concat().trim_end(), text);
+        let end = rows[2].trim_end().chars().count() as u16;
+        assert_eq!(caret, (x0 + end, top + 3));
+        for row in top..=bottom {
+            assert_eq!(inbox_hit(&app, frame, x0 + 1, row), Some(InboxHit::Input), "row {row}");
+        }
+        assert_eq!(inbox_hit(&app, frame, x0 + 1, top - 1), Some(InboxHit::Thread));
+
+        // A newline (alt-enter) starts a row; plain enter would send.
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        typed(&mut app, "next");
+        let (_, _, _, rows, _) = draw(&app);
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[3].trim_end(), "next");
+
+        // Past the cap: six rows, scrolled so the caret's row is the last.
+        for _ in 0..5 {
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        }
+        typed(&mut app, "tail");
+        let (top, bottom, _, rows, caret) = draw(&app);
+        assert_eq!(rows.len(), textarea::MAX_ROWS as usize);
+        assert_eq!(rows[5].trim_end(), "tail");
+        assert!(!rows.iter().any(|r| r.starts_with("start")), "scrolled past the top");
+        assert_eq!(caret, (x0 + 4, top + 6));
+        assert_eq!(inbox_hit(&app, frame, x0 + 1, bottom), Some(InboxHit::Input));
+        assert_eq!(inbox_hit(&app, frame, x0 + 1, top), Some(InboxHit::Input));
+
+        // Enter sends and the box shrinks back to one row.
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        let (_, _, _, rows, _) = draw(&app);
+        assert_eq!(rows.len(), 1);
+    }
+
+    /// The `:` prompt scrolls sideways so the caret stays on screen.
+    #[test]
+    fn prompt_scrolls_to_the_caret() {
+        let mut app = App::new(PathBuf::from("/tmp"));
+        app.on_key(KeyEvent::from(KeyCode::Char(':')));
+        let text = format!("exec {}Z", "a".repeat(60));
+        text.chars().for_each(|c| app.on_key(KeyEvent::from(KeyCode::Char(c))));
+        let mut term = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        term.draw(|f| draw(f, &app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let line: String = (0..40).map(|x| buf[(x, 8)].symbol().to_string()).collect();
+        assert!(line.starts_with(": "), "{line:?}");
+        assert!(line.trim_end().ends_with('Z'), "{line:?}");
+        let caret = term.get_cursor_position().unwrap();
+        assert_eq!((caret.x, caret.y), (39, 8));
     }
 
     const LLM_MESSAGE: &str = "## Review summary

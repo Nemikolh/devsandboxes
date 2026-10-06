@@ -35,7 +35,7 @@ use ratatui::layout::Rect;
 
 use crate::devsbd::notify::Level;
 use crate::inbox::{is_url, EntryKind, Inbox, Kind, Op, State, Thread};
-use crate::tui::prompt::Prompt;
+use crate::tui::textarea::TextArea;
 
 use super::view::{divider_pct, point_in};
 use super::{App, Modal, Tab};
@@ -164,13 +164,13 @@ impl Default for InboxView {
     }
 }
 
-/// The one-line reply input at the bottom of the thread pane. It reuses the `:`
-/// prompt's editing ([`Prompt`], with no history and no completion): only
-/// what `enter` does differs.
+/// The reply input at the bottom of the thread pane: a wrapping
+/// [`TextArea`] (the `:` prompt's editing over text that may hold newlines)
+/// that grows with what's typed.
 pub struct ReplyBox {
     /// Id of the thread being replied to.
     pub thread: u64,
-    pub line: Prompt,
+    pub line: TextArea,
 }
 
 impl InboxView {
@@ -716,16 +716,19 @@ impl App {
             self.status = Some("this thread takes no replies".into());
             return;
         }
-        self.inbox.reply = Some(ReplyBox { thread: t.id, line: Prompt::new(Vec::new()) });
+        self.inbox.reply = Some(ReplyBox { thread: t.id, line: TextArea::new() });
         self.inbox.focus = InboxFocus::Input;
     }
 
     /// Keys while the input has focus: `esc` goes back to the thread (the
     /// line with it), `enter` sends a non-empty reply and keeps the input,
-    /// empty, for the next one (an empty `enter` does nothing), the rest
-    /// edits the line as the `:` prompt does.
+    /// empty, for the next one (an empty `enter` does nothing); `alt-enter`
+    /// (and `shift-enter`, where the terminal reports it) inserts a newline;
+    /// the rest edits the text as the `:` prompt does, with `↑`/`↓` and
+    /// `home`/`end` on its visual rows.
     fn on_key_reply(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let newline = key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::SHIFT);
         let Some(rb) = &mut self.inbox.reply else {
             self.inbox.focus = InboxFocus::Thread;
             return;
@@ -734,6 +737,7 @@ impl App {
         match key.code {
             KeyCode::Esc => self.leave_reply(),
             KeyCode::Char('c') if ctrl => self.leave_reply(),
+            KeyCode::Enter if newline => line.newline(),
             KeyCode::Enter => {
                 let text = line.input().trim().to_string();
                 if text.is_empty() {
@@ -747,6 +751,8 @@ impl App {
             }
             KeyCode::Left => line.left(),
             KeyCode::Right => line.right(),
+            KeyCode::Up => line.up(),
+            KeyCode::Down => line.down(),
             KeyCode::Home => line.home(),
             KeyCode::End => line.end(),
             KeyCode::Backspace => line.backspace(),
