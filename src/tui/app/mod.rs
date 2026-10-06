@@ -19,6 +19,7 @@ use super::term::{TermParser, TermTabs};
 
 mod actions;
 mod command_line;
+mod forms;
 mod inbox;
 mod procs;
 mod selection;
@@ -34,6 +35,7 @@ pub use inbox::{
     chip, pane_feed, pane_header, parse_utc_offset, short_age, title_of, HeaderRow, InboxFocus, InboxView, PaneLine, Tone,
     View,
 };
+pub use forms::{form_lines, form_title, forms_offset, pinned_forms, FormSpot};
 pub use actions::PendingDone;
 pub use procs::{PendingSignal, Signal};
 pub use selection::{copy_key_intercepted, Extract};

@@ -199,6 +199,12 @@ impl TextArea {
         Self { edit: Prompt::new(Vec::new()), top: Cell::new(0), width: Cell::new(usize::MAX) }
     }
 
+    /// Pre-filled with `text`, the cursor at its end: a form's text question
+    /// opened on its current answer.
+    pub fn with_text(text: &str) -> Self {
+        Self { edit: Prompt::with_input(Vec::new(), text.to_string()), ..Self::new() }
+    }
+
     pub fn input(&self) -> &str {
         self.edit.input()
     }

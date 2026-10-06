@@ -100,7 +100,7 @@ git worktrees so working trees are never shared.
   (modals, config/inspect view), `command_line.rs` (`:` prompt handling and
   completion), `terminal.rs`, `actions.rs` (one-key actions + pending queue),
   `procs.rs`, `inbox.rs` (Inbox tab: `devsbd notify` history, key dedupe,
-  unread badges); shared test fixtures in `test_support.rs`. `tui/mod.rs` owns the terminal + event loop and runs
+  unread badges), `forms.rs` (pinned open forms: rendering, form zone keys); shared test fixtures in `test_support.rs`. `tui/mod.rs` owns the terminal + event loop and runs
   docker work on background threads; `prompt.rs` is the `:` command line
   (`spec.rs` is its declarative grammar table — parsing _and_ tab completion
   derive from `SPECS`, so a new flag is one table entry);

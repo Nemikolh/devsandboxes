@@ -10,8 +10,9 @@ use ratatui::widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table, 
 use tui_term::widget::{Cursor, PseudoTerminal};
 
 use super::app::{
-    chip, pane_feed, pane_header, short_age, title_of, App, ConfigView, Extract, Focus, HeaderRow, HelpModal, InboxFocus,
-    Modal, PaneLine, Pane, PortRow, Side, Tab, TextModal, Thread, Tone, View,
+    chip, form_lines, form_title, forms_offset, pane_feed, pane_header, pinned_forms, short_age, title_of, App,
+    ConfigView, Extract, Focus, FormSpot, HeaderRow, HelpModal, InboxFocus, Modal, PaneLine, Pane, PortRow, Side, Tab,
+    TextModal, Thread, Tone, View,
 };
 use super::settings::SETTINGS;
 use super::data::{
@@ -705,7 +706,7 @@ fn cols(s: &str) -> usize {
 }
 
 /// `s` cut to at most `width` columns, ending in `…` when anything was cut.
-fn truncate(s: &str, width: usize) -> String {
+pub(crate) fn truncate(s: &str, width: usize) -> String {
     if cols(s) <= width {
         return s.to_string();
     }
@@ -974,6 +975,12 @@ fn focused_reply(app: &App) -> Option<&TextArea> {
     app.inbox.reply.as_ref().filter(|_| app.inbox.focus == InboxFocus::Input).map(|r| &r.line)
 }
 
+/// What the composer box holds: a form's text question being edited (the
+/// box is shared with it), else the focused reply.
+fn composer_text(app: &App) -> Option<&TextArea> {
+    app.form_text_edit().or_else(|| focused_reply(app))
+}
+
 /// A thread's `compose.hint`, when it says anything: one dim row under the
 /// input box.
 fn compose_hint(t: &Thread) -> Option<&str> {
@@ -985,7 +992,11 @@ fn compose_hint(t: &Thread) -> Option<&str> {
 /// plus 1 to [`textarea::MAX_ROWS`] rows of wrapped `reply`, and a row for
 /// `compose.hint` when there is one; a one-line hint (a dispatcher thread that
 /// takes no replies); or none (a notify thread, which can't be replied to).
-fn pane_bottom_rows(t: &Thread, reply: Option<&TextArea>, width: u16) -> u16 {
+fn pane_bottom_rows(t: &Thread, reply: Option<&TextArea>, form_edit: bool, width: u16) -> u16 {
+    if let (true, Some(edit)) = (form_edit, reply) {
+        // A form's text edit: the box alone, on any thread.
+        return 2 + edit.height(width.saturating_sub(2));
+    }
     match (t.kind, &t.compose) {
         (_, Some(_)) => {
             2 + reply.map_or(1, |r| r.height(width.saturating_sub(2))) + u16::from(compose_hint(t).is_some())
@@ -996,41 +1007,118 @@ fn pane_bottom_rows(t: &Thread, reply: Option<&TextArea>, width: u16) -> u16 {
 }
 
 /// The thread pane's areas inside its block, top to bottom: the pinned
-/// header, the separator row under it, the scrolling feed and the composer
-/// (or the no-replies line). Room goes to the composer first, then the
-/// header, the separator, and the feed gets the rest, so a short pane keeps
-/// what the keys act on.
+/// header, the separator row under it, the pinned open forms, the scrolling
+/// feed and the composer (or the no-replies line). Room goes to the composer
+/// first, then the header, the separator, then the forms (at most half the
+/// pane: past that their box scrolls), and the feed gets the rest, so a
+/// short pane keeps what the keys act on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PaneAreas {
     header: Rect,
     sep: Rect,
+    forms: Rect,
     feed: Rect,
     bottom: Rect,
 }
 
-fn pane_areas(inner: Rect, header: u16, bottom: u16) -> PaneAreas {
+fn pane_areas(inner: Rect, header: u16, forms: u16, bottom: u16) -> PaneAreas {
     let bottom = bottom.min(inner.height);
     let header = header.min(inner.height - bottom);
     let sep = 1.min(inner.height - bottom - header);
-    let feed = inner.height - bottom - header - sep;
+    let rest = inner.height - bottom - header - sep;
+    let forms = forms.min(inner.height / 2).min(rest);
+    let feed = rest - forms;
     let row = |y: u16, height: u16| Rect { y, height, ..inner };
+    let top = inner.y + header + sep;
     PaneAreas {
         header: row(inner.y, header),
         sep: row(inner.y + header, sep),
-        feed: row(inner.y + header + sep, feed),
-        bottom: row(inner.y + header + sep + feed, bottom),
+        forms: row(top, forms),
+        feed: row(top + forms, feed),
+        bottom: row(top + forms + feed, bottom),
     }
 }
 
-/// The thread pane's pinned header for `t` as the rows drawn at the pane's
-/// inner `width`, and its areas: shared by drawing and hit-testing, so a
-/// click lands where things are.
-fn thread_pane_layout(app: &App, t: &Thread, inner: Rect) -> (Vec<Line<'static>>, PaneAreas) {
+/// The pinned forms as drawn: every box's rows (borders included), which
+/// form and question each row belongs to, and the focused question's rows.
+struct FormRows {
+    lines: Vec<Line<'static>>,
+    spots: Vec<FormSpot>,
+    focus: Option<std::ops::Range<usize>>,
+}
+
+/// The thread pane's layout for `t`: the pinned header as the rows drawn at
+/// the pane's inner width, the pinned forms' rows and the areas. Shared by
+/// drawing and hit-testing, so a click lands where things are.
+struct PaneLayout {
+    header: Vec<Line<'static>>,
+    forms: FormRows,
+    areas: PaneAreas,
+}
+
+fn thread_pane_layout(app: &App, t: &Thread, inner: Rect) -> PaneLayout {
     let child = app.thread_child(t);
     let header = header_lines(&pane_header(t, child.as_ref(), app.utc_offset), inner.width, app.inbox.raw);
     let rows = header.len().min(u16::MAX as usize) as u16;
-    let areas = pane_areas(inner, rows, pane_bottom_rows(t, focused_reply(app), inner.width));
-    (header, areas)
+    let forms = form_rows(app, t, inner.width);
+    let want = forms.lines.len().min(u16::MAX as usize) as u16;
+    let bottom = pane_bottom_rows(t, composer_text(app), app.form_text_edit().is_some(), inner.width);
+    let areas = pane_areas(inner, rows, want, bottom);
+    PaneLayout { header, forms, areas }
+}
+
+/// `t`'s open forms (newest first) as rounded boxes `width` wide: the
+/// form's title on the top border with ` open form ` on the right, the
+/// content ([`form_lines`]) wrapped inside a one-column margin. The box
+/// with the form cursor is accented while the dashboard has the keys.
+fn form_rows(app: &App, t: &Thread, width: u16) -> FormRows {
+    let mut out = FormRows { lines: Vec::new(), spots: Vec::new(), focus: None };
+    let width = width as usize;
+    if width < 8 {
+        return out;
+    }
+    let inner = width - 4;
+    for (fi, p) in pinned_forms(t).iter().enumerate() {
+        let cursor = app.form_cursor(t.id, p.message);
+        let style = if cursor.is_some() && app.focus == Focus::Dashboard {
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().add_modifier(Modifier::DIM)
+        };
+        let spot = |question| FormSpot { form: fi, question };
+        let title = truncate(&crate::inbox::sanitize(form_title(p.form)), width.saturating_sub(6));
+        let right = if cols(&title) + 17 <= width { " open form " } else { "" };
+        let fill = width.saturating_sub(cols(&title) + cols(right) + 4);
+        out.lines.push(Line::from(vec![
+            Span::styled("╭ ", style),
+            Span::styled(title, style.remove_modifier(Modifier::DIM).add_modifier(Modifier::BOLD)),
+            Span::styled(format!(" {}{right}╮", "─".repeat(fill)), style),
+        ]));
+        out.spots.push(spot(None));
+        let content = form_lines(p.form, p.record, cursor.as_ref(), inner);
+        for (li, line) in content.lines.iter().enumerate() {
+            let question = content.questions.iter().position(|r| r.contains(&li));
+            let start = out.lines.len();
+            for (row, _) in pane_rows(line, inner as u16, app.inbox.raw) {
+                let pad = inner.saturating_sub(row.width());
+                let mut spans = vec![Span::styled("│ ", style)];
+                spans.extend(row.spans);
+                spans.push(Span::raw(" ".repeat(pad)));
+                spans.push(Span::styled(" │", style));
+                out.lines.push(Line::from(spans));
+                out.spots.push(spot(question));
+            }
+            if let (Some(c), Some(q)) = (&cursor, question) {
+                if c.question == q {
+                    let r = out.focus.get_or_insert(start..start);
+                    r.end = out.lines.len();
+                }
+            }
+        }
+        out.lines.push(Line::from(Span::styled(format!("╰{}╯", "─".repeat(width - 2)), style)));
+        out.spots.push(spot(None));
+    }
+    out
 }
 
 /// `spans` cut to `width` columns, ending in `…` when cut, styles kept.
@@ -1100,6 +1188,9 @@ pub(crate) enum InboxHit {
     /// The thread pane above its composer or hint: header, separator,
     /// feed (borders included).
     Thread,
+    /// The pinned forms: the form and question under the row, if any; or
+    /// (`None`) the composer box while it holds a form's text edit.
+    Form(Option<FormSpot>),
     /// The composer: the reply input box and its `compose.hint` row.
     Input,
     /// The "takes no replies" hint row.
@@ -1133,11 +1224,17 @@ pub(crate) fn inbox_hit(app: &App, frame: Rect, col: u16, row: u16) -> Option<In
         return Some(InboxHit::Thread);
     };
     let inner = Block::bordered().inner(thread);
-    let (_, areas) = thread_pane_layout(app, t, inner);
+    let PaneLayout { forms, areas, .. } = thread_pane_layout(app, t, inner);
+    if areas.forms.contains(at) {
+        let row = (row - areas.forms.y) as usize + app.inbox.forms_scroll();
+        return Some(InboxHit::Form(forms.spots.get(row).copied()));
+    }
     // The header, separator and feed are all the thread; the composer's
     // hint row is part of it, so a click there doesn't drop a typed reply.
     if !areas.bottom.contains(at) {
         Some(InboxHit::Thread)
+    } else if app.form_text_edit().is_some() {
+        Some(InboxHit::Form(None))
     } else if t.compose.is_some() {
         Some(InboxHit::Input)
     } else {
@@ -1213,6 +1310,7 @@ fn state_style(state: State) -> Style {
 fn tone_style(tone: Tone) -> Style {
     match tone {
         Tone::Plain | Tone::Text | Tone::Markdown => Style::default(),
+        Tone::Cursor => Style::default().add_modifier(Modifier::REVERSED),
         Tone::Dim => Style::default().add_modifier(Modifier::DIM),
         Tone::Bold | Tone::Title => Style::default().add_modifier(Modifier::BOLD),
         Tone::Link => Style::default().fg(Color::Blue),
@@ -1263,7 +1361,9 @@ fn pane_spans(line: &PaneLine, raw: bool) -> Vec<Span<'static>> {
 /// `compose.hint`), a one-line no-replies hint, or nothing (a notify thread).
 /// Records the feed's scroll bound for the scroll keys
 /// (`InboxView::set_pane_max`), since only here are the size and wrapping
-/// known. Step 16's open forms go between the separator and the feed.
+/// known. The thread's open forms are pinned between the separator and the
+/// feed ([`form_rows`]), their box scrolled to the form cursor
+/// ([`forms_offset`]); a form's text edit takes the composer box.
 fn draw_inbox_pane(frame: &mut Frame, app: &App, area: Rect) {
     let border = zone_border_style(app, InboxFocus::Thread);
     let block = Block::default()
@@ -1279,7 +1379,7 @@ fn draw_inbox_pane(frame: &mut Frame, app: &App, area: Rect) {
         frame.render_widget(Paragraph::new(text), inner);
         return;
     };
-    let (header, areas) = thread_pane_layout(app, t, inner);
+    let PaneLayout { header, forms, areas } = thread_pane_layout(app, t, inner);
     // Screen cells: the header never scrolls, so what's drawn is the text.
     app.add_region(RegionId::InboxHeader, areas.header);
     frame.render_widget(Paragraph::new(header), areas.header);
@@ -1287,6 +1387,14 @@ fn draw_inbox_pane(frame: &mut Frame, app: &App, area: Rect) {
         let rule = format!("├{}┤", "─".repeat(area.width as usize - 2));
         let row = Rect { x: area.x, width: area.width, ..areas.sep };
         frame.render_widget(Paragraph::new(Span::styled(rule, border)), row);
+    }
+    let (total, height) = (forms.lines.len(), areas.forms.height as usize);
+    let follow = app.inbox.take_forms_follow();
+    let off = forms_offset(app.inbox.forms_scroll(), forms.focus, total, height, follow);
+    app.inbox.set_forms_scroll(off, total.saturating_sub(height));
+    if height > 0 {
+        let off = off.min(u16::MAX as usize) as u16;
+        frame.render_widget(Paragraph::new(forms.lines).scroll((off, 0)), areas.forms);
     }
     let feed = areas.feed;
     let (lines, texts): (Vec<Line>, Vec<select::RowText>) = pane_feed(t, app.utc_offset)
@@ -1305,6 +1413,18 @@ fn draw_inbox_pane(frame: &mut Frame, app: &App, area: Rect) {
     app.add_rows_region(RegionId::InboxThread, feed, scroll as usize, texts);
     frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), feed);
     let bottom = areas.bottom;
+    if let (Some(edit), Some(q)) = (app.form_text_edit(), app.editing_question()) {
+        let multiline = matches!(q.kind, crate::inbox::form::QuestionKind::Text { multiline: true, .. });
+        let keys = if multiline { "enter/esc keep · alt-enter newline" } else { "enter/esc keep" };
+        let label = markdown::fold(&q.label);
+        let title = format!(" {} · {keys} ", truncate(&label, (bottom.width as usize).saturating_sub(cols(keys) + 8)));
+        let placeholder = match &q.kind {
+            crate::inbox::form::QuestionKind::Text { placeholder: Some(p), .. } => p.as_str(),
+            _ => "",
+        };
+        draw_text_box(frame, app, Some(edit), &title, placeholder, InboxFocus::Form, bottom);
+        return;
+    }
     match &t.compose {
         Some(compose) => {
             let hint = compose_hint(t).filter(|_| bottom.height > 0);
@@ -1331,11 +1451,28 @@ fn draw_inbox_pane(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_reply_input(frame: &mut Frame, app: &App, placeholder: Option<&str>, area: Rect) {
     let reply = focused_reply(app);
     let title = if reply.is_some() { " enter sends · esc back " } else { " r reply " };
+    let placeholder = placeholder.unwrap_or("reply to the owner");
+    draw_text_box(frame, app, reply, title, placeholder, InboxFocus::Input, area);
+}
+
+/// The composer box: `text` (the focused reply, or a form's text edit)
+/// wrapped and scrolled to the cursor, else `placeholder` dim; the caret
+/// placed while the dashboard has the keys. Its border follows `zone`.
+fn draw_text_box(
+    frame: &mut Frame,
+    app: &App,
+    text: Option<&TextArea>,
+    title: &str,
+    placeholder: &str,
+    zone: InboxFocus,
+    area: Rect,
+) {
+    let reply = text;
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(zone_border_style(app, InboxFocus::Input))
-        .title(title);
+        .border_style(zone_border_style(app, zone))
+        .title(title.to_string());
     let inner = block.inner(area);
     let view = reply.map(|r| r.view(inner.width, inner.height));
     let lines: Vec<Line> = match &view {
@@ -1343,8 +1480,7 @@ fn draw_reply_input(frame: &mut Frame, app: &App, placeholder: Option<&str>, are
             v.lines.iter().map(|l| Line::from(l.clone())).collect()
         }
         _ => {
-            let hint = placeholder.unwrap_or("reply to the owner");
-            vec![Line::from(Span::styled(hint.to_string(), Style::default().add_modifier(Modifier::DIM)))]
+            vec![Line::from(Span::styled(placeholder.to_string(), Style::default().add_modifier(Modifier::DIM)))]
         }
     };
     frame.render_widget(Paragraph::new(lines).block(block), area);
@@ -2015,12 +2151,21 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
                         .to_string()
                 }
                 InboxFocus::Thread => {
-                    "esc list · ↑↓ scroll · enter open link · 1-9 actions · r reply · d done · u reopen · o vscode · t term · l logs · p forward · m raw · q quit · ? help".to_string()
+                    "esc list · ↑↓ scroll · tab form/reply · enter open link · 1-9 actions · r reply · d done · u reopen · o vscode · t term · l logs · p forward · m raw · q quit · ? help".to_string()
                 }
                 InboxFocus::Input => {
                     "enter send · alt-enter newline · esc back to thread · ←→↑↓ home end edit · ctrl-u clear · ctrl-w delete word"
                         .to_string()
                 }
+                InboxFocus::Form => match &app.inbox.form {
+                    Some(e) if e.editing.is_some() => {
+                        "enter/esc keep the edit · alt-enter newline · ←→↑↓ home end edit · ctrl-u clear · ctrl-w delete word"
+                            .to_string()
+                    }
+                    Some(e) if e.confirming => "enter submit · esc cancel".to_string(),
+                    _ => "tab/S-tab question · ↑↓ option · space pick · e edit text · enter confirm · r reply · esc thread · q quit · ? help"
+                        .to_string(),
+                },
             },
         },
     };
@@ -3125,6 +3270,120 @@ See [PR 6900](https://github.com/o/r/pull/6900).";
         );
         assert_eq!(app.inbox.focus, InboxFocus::Input);
         assert_eq!(app.inbox.reply.as_ref().unwrap().line.input(), typed);
+    }
+
+    /// [`feed_app`] whose newest message carries an open form of `n`
+    /// questions: the first a choice with context, the rest confirms.
+    fn form_feed_app(n: usize) -> App {
+        use crate::inbox::form::{ChoiceOption, Form, Question, QuestionKind};
+        let mut app = feed_app(3, None);
+        let mut questions = vec![Question {
+            id: "c-1".into(),
+            label: "greptile on `src/cost.ts:42`".into(),
+            context: Some("> Consider batching these writes.".into()),
+            required: true,
+            kind: QuestionKind::Choice {
+                options: vec![
+                    ChoiceOption { id: "post".into(), label: "Post the reply".into(), description: None },
+                    ChoiceOption { id: "skip".into(), label: "Don't reply".into(), description: None },
+                ],
+                multiple: false,
+                default: Some(crate::inbox::form::ChoiceDefault::One("post".into())),
+            },
+        }];
+        questions.extend((2..=n).map(|i| Question {
+            id: format!("q-{i}"),
+            label: format!("Question {i}?"),
+            context: None,
+            required: false,
+            kind: QuestionKind::Confirm { yes: None, no: None, default: None },
+        }));
+        let form = Form { id: "drafts".into(), title: Some("Replies to post".into()), submit: "Post".into(), questions };
+        let mut t = app.selected_inbox_thread().unwrap().clone();
+        let blocks = vec![crate::inbox::Block::Form(form)];
+        let record = crate::inbox::FormRecord::open("drafts");
+        let kind = crate::inbox::ItemKind::Message { id: "m4".into(), blocks, edited: false, withdrawn: false, form: Some(record) };
+        t.feed.push(crate::inbox::FeedItem { seq: 4, at: 240, kind });
+        let mut inbox = Inbox::default();
+        inbox.threads = vec![t];
+        app.set_inbox(inbox);
+        app
+    }
+
+    fn press(app: &mut App, frame: Rect, kind: crossterm::event::MouseEventKind, row: u16) {
+        app.on_mouse(&crossterm::event::MouseEvent { kind, column: 60, row, modifiers: KeyModifiers::NONE }, frame);
+    }
+
+    // At 100x24: the pane's inner area is columns 41-98, rows 2-21; the
+    // header takes rows 2-5, the separator row 6.
+    #[test]
+    fn open_forms_are_pinned_between_the_header_and_the_feed_and_hits_agree() {
+        let mut app = form_feed_app(2);
+        let frame = Rect::new(0, 0, 100, 24);
+        let pane: Vec<String> = rows_of(&draw_buffer(&app, 100, 24)).iter().map(|r| pane_part(r)).collect();
+        if std::env::var_os("SHOW_INBOX").is_some() {
+            println!("{}", pane.join("\n"));
+        }
+        assert_eq!(pane[6], format!("├{}┤", "─".repeat(58)));
+        assert!(pane[7].starts_with("│╭ Replies to post ─") && pane[7].ends_with("─ open form ╮│"), "{:?}", pane[7]);
+        assert_eq!(pane[8], format!("││ {:54} ││", "  1/2 greptile on src/cost.ts:42"));
+        assert_eq!(pane[9], format!("││ {:54} ││", "    (•) Post the reply   ( ) Don't reply"));
+        assert_eq!(pane[10], format!("││ {:54} ││", "  2/2 Question 2?"));
+        assert_eq!(pane[12], format!("││ {:54} ││", "[Tab] next  [Space] pick  [e] edit  [Enter] Confirm"));
+        assert_eq!(pane[13], format!("│╰{}╯│", "─".repeat(56)));
+        // The feed right under it, newest first: the form's message.
+        assert!(pane[14].trim_end_matches('│').trim_end().ends_with("  bab-disp"), "{}", pane.join("\n"));
+        assert!(pane[15].contains("form: Replies to post · open, pinned above"), "{}", pane.join("\n"));
+
+        // Hits: the box is the form zone, by question; around it the thread.
+        let spot = |question| Some(InboxHit::Form(Some(FormSpot { form: 0, question })));
+        assert_eq!(inbox_hit(&app, frame, 60, 6), Some(InboxHit::Thread));
+        assert_eq!(inbox_hit(&app, frame, 60, 7), spot(None));
+        assert_eq!(inbox_hit(&app, frame, 60, 8), spot(Some(0)));
+        assert_eq!(inbox_hit(&app, frame, 60, 11), spot(Some(1)));
+        assert_eq!(inbox_hit(&app, frame, 60, 12), spot(None));
+        assert_eq!(inbox_hit(&app, frame, 60, 14), Some(InboxHit::Thread));
+
+        // A click on question 2 focuses it; the box is accented, the focused
+        // question marked; question 1's context stays folded.
+        press(&mut app, frame, crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left), 11);
+        assert_eq!(app.inbox.focus, InboxFocus::Form);
+        assert_eq!(app.inbox.form.as_ref().map(|e| e.question), Some(1));
+        let pane: Vec<String> = rows_of(&draw_buffer(&app, 100, 24)).iter().map(|r| pane_part(r)).collect();
+        assert_eq!(pane[10], format!("││ {:54} ││", "› 2/2 Question 2?"));
+        // Back to question 1: its context shows, the box grows a row.
+        app.on_key(KeyEvent::from(KeyCode::Tab));
+        let pane: Vec<String> = rows_of(&draw_buffer(&app, 100, 24)).iter().map(|r| pane_part(r)).collect();
+        assert!(pane[9].contains("Consider batching these writes."), "{}", pane.join("\n"));
+        assert!(pane[14].starts_with("│╰"), "{}", pane.join("\n"));
+    }
+
+    #[test]
+    fn a_tall_form_takes_half_the_pane_and_scrolls_to_the_cursor() {
+        let mut app = form_feed_app(12);
+        let frame = Rect::new(0, 0, 100, 24);
+        let pane: Vec<String> = rows_of(&draw_buffer(&app, 100, 24)).iter().map(|r| pane_part(r)).collect();
+        // Half of the 20 inner rows: 7-16, then the feed.
+        assert!(pane[7].starts_with("│╭ Replies to post"), "{}", pane.join("\n"));
+        assert!(pane[17].trim_end_matches('│').trim_end().ends_with("  bab-disp"), "{}", pane.join("\n"));
+        assert_eq!(inbox_hit(&app, frame, 60, 16), Some(InboxHit::Form(Some(FormSpot { form: 0, question: Some(4) }))));
+        assert_eq!(inbox_hit(&app, frame, 60, 17), Some(InboxHit::Thread));
+        // Focus the last question: the box scrolls to it.
+        app.on_key(KeyEvent::from(KeyCode::Tab));
+        app.on_key(KeyEvent::from(KeyCode::BackTab));
+        let pane: Vec<String> = rows_of(&draw_buffer(&app, 100, 24)).iter().map(|r| pane_part(r)).collect();
+        assert!(pane[7..=16].iter().any(|r| r.contains("› 12/12 Question 12?")), "{}", pane.join("\n"));
+        assert!(!pane[7..=16].iter().any(|r| r.contains("Replies to post")), "scrolled past the top border");
+        let scrolled = app.inbox.forms_scroll();
+        assert!(scrolled > 0);
+        // The wheel over the box scrolls it, and the cursor doesn't pull it back.
+        press(&mut app, frame, crossterm::event::MouseEventKind::ScrollUp, 10);
+        assert_eq!(app.inbox.forms_scroll(), scrolled - 3);
+        draw_buffer(&app, 100, 24);
+        assert_eq!(app.inbox.forms_scroll(), scrolled - 3);
+        // A text-free form: `e` does nothing to the composer.
+        app.on_key(KeyEvent::from(KeyCode::Char('e')));
+        assert_eq!(inbox_hit(&app, frame, 60, 21), Some(InboxHit::Hint));
     }
 
     #[test]

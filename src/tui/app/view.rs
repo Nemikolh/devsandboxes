@@ -66,11 +66,23 @@ Inbox thread (shadows the dashboard keys while focused)
   1-9         run an action: host verbs (⌂) run now; the rest is an
               event the dispatcher pulls with `devsbd events` (✓ = done)
   r / i       focus the reply input
+  tab         focus the open forms (pinned under the header), else the
+              reply input
   d / u       mark done / reopen (each also an event for the dispatcher;
               also marks / clears the thread's child done)
   o t l p     as in the list (the [o] [t] [l] [p] buttons)
   m           markdown: rendered / raw source (every thread, this session)
   esc         back to the list     q quit   : prompt   ? help
+Inbox form (the open forms pinned under the thread's header)
+  tab / S-tab next / previous question (across every open form)
+  ↑ ↓ ← →     move over the options
+  space       pick (several-pick: toggle; a text question: edit)
+  e           edit a text question in the composer box; enter or esc
+              keeps the edit, alt-enter inserts a newline
+  enter       confirm: the summary (or what's missing); enter again
+              submits, esc cancels
+  r / i       the reply input    esc  back to the thread
+  (every pick and kept edit is saved as the form's draft)
 Inbox reply input
   enter       send (the input stays, empty, for the next message)
   esc         back to the thread

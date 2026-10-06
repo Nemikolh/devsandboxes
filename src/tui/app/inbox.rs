@@ -15,8 +15,9 @@
 //! The list is one row per thread, newest change first, filtered by a
 //! [`View`] (docs/inbox-threads.md, *Inbox UI* and *Inbox layout v2*). The
 //! thread pane beside it always shows the selected thread: a pinned header
-//! ([`pane_header`]) over its feed, newest first ([`pane_feed`]). Keys go to one of three [`InboxFocus`]
-//! zones; the thread and its input shadow the dashboard keys.
+//! ([`pane_header`]), the thread's open forms pinned under it (`forms.rs`),
+//! then its feed, newest first ([`pane_feed`]). Keys go to one of four
+//! [`InboxFocus`] zones; all but the list shadow the dashboard keys.
 //!
 //! Read semantics: a thread is read when it becomes the selected one (it's on
 //! screen in the pane), and again whenever it changes while selected. Reading
@@ -37,6 +38,7 @@ use crate::devsbd::notify::Level;
 use crate::inbox::{feed, is_url, Inbox, ItemKind, Kind, Marker, Op, State, Thread};
 use crate::tui::textarea::TextArea;
 
+use super::forms::{self, FormEdit};
 use super::view::{divider_pct, point_in};
 use super::{App, Modal, Tab};
 use crate::tui::ui;
@@ -79,6 +81,9 @@ pub enum InboxFocus {
     #[default]
     List,
     Thread,
+    /// The thread's pinned open forms (`forms.rs`); always paired with
+    /// [`InboxView::form`].
+    Form,
     /// The reply input at the bottom of the thread pane; always paired with
     /// [`InboxView::reply`].
     Input,
@@ -118,6 +123,15 @@ pub struct InboxView {
     list_offset: Cell<usize>,
     /// The reply input's line, while the input has focus.
     pub reply: Option<ReplyBox>,
+    /// The form cursor, while the form zone has focus.
+    pub form: Option<FormEdit>,
+    /// First row of the pinned forms box shown, and its largest useful
+    /// value: renderer hooks like [`Self::pane_max`].
+    forms_scroll: Cell<usize>,
+    forms_max: Cell<usize>,
+    /// The form cursor moved: the next frame scrolls the forms box to it
+    /// (`forms::forms_offset`); the wheel clears it.
+    pub(super) forms_follow: Cell<bool>,
     /// `m`: show every thread's text as its markdown source instead of
     /// rendered. For this session only: it's for the odd message the
     /// renderer gets wrong, not a preference.
@@ -137,6 +151,10 @@ impl Default for InboxView {
             pane_max: Cell::new(0),
             list_offset: Cell::new(0),
             reply: None,
+            form: None,
+            forms_scroll: Cell::new(0),
+            forms_max: Cell::new(0),
+            forms_follow: Cell::new(false),
             raw: false,
         }
     }
@@ -204,6 +222,27 @@ impl InboxView {
     pub fn set_list_offset(&self, offset: usize) {
         self.list_offset.set(offset);
     }
+
+    /// Renderer hook: the forms box's first row as last drawn.
+    pub fn forms_scroll(&self) -> usize {
+        self.forms_scroll.get()
+    }
+
+    /// Renderer hook: whether to scroll the forms box to the cursor, once.
+    pub fn take_forms_follow(&self) -> bool {
+        self.forms_follow.replace(false)
+    }
+
+    /// Renderer hook: the forms box's scroll and its bound, as drawn.
+    pub fn set_forms_scroll(&self, scroll: usize, max: usize) {
+        self.forms_scroll.set(scroll);
+        self.forms_max.set(max);
+    }
+
+    #[cfg(test)]
+    pub(super) fn content_clone(&self) -> Inbox {
+        self.content.clone()
+    }
 }
 
 /// A thread's one-line title: a dispatcher thread's `title`, or a notify
@@ -247,6 +286,8 @@ pub enum Tone {
     /// A whole markdown document (the message, a notify body), rendered as
     /// blocks; always alone on its line.
     Markdown,
+    /// The form option under the cursor: highlighted, plain text.
+    Cursor,
 }
 
 /// One pane line: styled segments, unwrapped.
@@ -363,13 +404,13 @@ fn feed_lines(t: &Thread, utc_offset: i64) -> Vec<PaneLine> {
                         match block {
                             feed::Block::Markdown { text } => lines.push(line(Tone::Markdown, text.clone())),
                             feed::Block::Fields { items } => lines.extend(field_rows(items)),
-                            // Placeholder until the form widgets (step 16).
-                            feed::Block::Form(f) => {
-                                let state = form.as_ref().map_or("open", |r| r.state.as_str());
-                                let title = f.title.as_deref().unwrap_or(&f.id);
-                                lines.push(line(Tone::Dim, format!("form: {title} ({} questions, {state})", f.questions.len())));
-                            }
+                            feed::Block::Form(f) => lines.extend(forms::feed_form_lines(f, form.as_ref(), utc_offset)),
                         }
+                    }
+                    // A re-send that dropped the form withdrew it.
+                    let has_form = blocks.iter().any(|b| matches!(b, feed::Block::Form(_)));
+                    if !has_form && form.as_ref().is_some_and(|r| r.state == crate::inbox::FormState::Withdrawn) {
+                        lines.push(line(Tone::Dim, "form withdrawn"));
                     }
                 }
             }
@@ -380,8 +421,11 @@ fn feed_lines(t: &Thread, utc_offset: i64) -> Vec<PaneLine> {
             ItemKind::Action { label, .. } => {
                 lines.push(vec![(Tone::Dim, format!("{at}  ")), (Tone::Text, format!("you: {label}"))]);
             }
+            // Folded: the answers show under the message's form.
             ItemKind::Submission { answers, .. } => {
-                lines.push(vec![(Tone::Dim, format!("{at}  ")), (Tone::Text, format!("you answered {} questions", answers.len()))]);
+                let n = forms::answer_count(answers);
+                let s = if n == 1 { "" } else { "s" };
+                lines.push(line(Tone::Dim, format!("{at}  you answered {n} question{s}")));
             }
             ItemKind::Marker(m) => lines.push(line(Tone::Dim, format!("{at}  · {}", marker_text(m)))),
         }
@@ -533,6 +577,7 @@ impl App {
         // A change to the selected thread reads it again; one that removed it
         // (another dashboard, `thread rm`) moves the pane on.
         self.sync_inbox_selection();
+        self.check_form_edit();
     }
 
     /// Ask the event loop to apply `op` to the store, and apply it here at
@@ -562,6 +607,7 @@ impl App {
     pub(super) fn set_tab(&mut self, tab: Tab) {
         self.clear_selection();
         if self.tab == Tab::Inbox && tab != Tab::Inbox {
+            self.close_form_edit();
             self.inbox.focus = InboxFocus::List;
             self.inbox.reply = None;
             let unread_notify = self.inbox.threads().iter().any(|t| t.kind == Kind::Notify && t.unread);
@@ -627,12 +673,15 @@ impl App {
             // A selection's rows are the old thread's: copying it now would
             // read another thread's text.
             self.clear_selection();
+            // Before `shown` moves: a text edit is saved on its own thread.
+            self.close_form_edit();
             self.inbox.shown = id;
             self.inbox.scroll = 0;
+            self.inbox.set_forms_scroll(0, 0);
             self.inbox.reply = None;
             self.inbox.focus = match (id, self.inbox.focus) {
                 (None, _) => InboxFocus::List,
-                (Some(_), InboxFocus::Input) => InboxFocus::Thread,
+                (Some(_), InboxFocus::Input | InboxFocus::Form) => InboxFocus::Thread,
                 (Some(_), focus) => focus,
             };
             // Pinning it may bring back rows the old pin hid; stay on it.
@@ -676,7 +725,7 @@ impl App {
     }
 
     /// The selected thread, owned: the action keys borrow `self` mutably.
-    fn selected_inbox_owned(&self) -> Option<Thread> {
+    pub(super) fn selected_inbox_owned(&self) -> Option<Thread> {
         self.selected_inbox_thread().cloned()
     }
 
@@ -727,6 +776,10 @@ impl App {
             self.on_key_reply(key);
             return;
         }
+        if self.inbox.focus == InboxFocus::Form {
+            self.on_key_form(key);
+            return;
+        }
         self.status = None;
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let Some(t) = self.selected_inbox_owned() else {
@@ -749,6 +802,12 @@ impl App {
             },
             KeyCode::Char(c @ '1'..='9') => self.run_thread_action(&t, c as usize - '1' as usize),
             KeyCode::Char('r' | 'i') => self.open_reply(&t),
+            // The next zone down: the pinned forms, else the composer.
+            KeyCode::Tab => {
+                if !self.focus_inbox_form(None) {
+                    self.open_reply(&t);
+                }
+            }
             KeyCode::Char('m') if !ctrl => {
                 // Raw rows aren't the rendered ones a selection points into.
                 self.clear_selection();
@@ -778,7 +837,7 @@ impl App {
 
     /// Why `t` takes no user op, if it doesn't: an archived thread's owner is
     /// gone, so nobody would ever pull the event.
-    fn refuse_user_op(&mut self, t: &Thread) -> bool {
+    pub(super) fn refuse_user_op(&mut self, t: &Thread) -> bool {
         if t.archived {
             self.status = Some(format!("archived: `{}` was removed", t.owner_name));
         }
@@ -816,7 +875,7 @@ impl App {
 
     /// `r`/`i`: focus the input with an empty line, when the thread takes
     /// replies; otherwise focus stays where it is, with a hint.
-    fn open_reply(&mut self, t: &Thread) {
+    pub(super) fn open_reply(&mut self, t: &Thread) {
         if self.refuse_user_op(t) {
             return;
         }
@@ -857,18 +916,7 @@ impl App {
                 self.request_inbox(Op::Reply { thread, text });
                 self.status = Some(format!("reply queued for {}", owner.unwrap_or_default()));
             }
-            KeyCode::Left => line.left(),
-            KeyCode::Right => line.right(),
-            KeyCode::Up => line.up(),
-            KeyCode::Down => line.down(),
-            KeyCode::Home => line.home(),
-            KeyCode::End => line.end(),
-            KeyCode::Backspace => line.backspace(),
-            KeyCode::Delete => line.delete(),
-            KeyCode::Char('u') if ctrl => line.clear(),
-            KeyCode::Char('w') if ctrl => line.delete_word(),
-            KeyCode::Char(c) if !ctrl => line.insert_char(c),
-            _ => {}
+            _ => edit_text(line, key),
         }
     }
 
@@ -963,10 +1011,24 @@ impl App {
             // Out of the input like `esc`, its line with it: the box is only
             // drawn live while focused.
             Some(InboxHit::Thread | InboxHit::Hint) if self.inbox.focus == InboxFocus::Input => self.leave_reply(),
-            Some(InboxHit::Thread | InboxHit::Hint) => self.focus_inbox_thread(),
+            Some(InboxHit::Thread | InboxHit::Hint) => {
+                self.close_form_edit();
+                self.focus_inbox_thread();
+            }
             // Already in it: keep the half-typed line `open_reply` would clear.
             Some(InboxHit::Input) if self.inbox.focus == InboxFocus::Input => {}
-            Some(InboxHit::Input) => self.focus_inbox_input(),
+            Some(InboxHit::Input) => {
+                self.close_form_edit();
+                self.focus_inbox_input();
+            }
+            // The composer box while a text question is edited in it.
+            Some(InboxHit::Form(None)) if self.inbox.focus == InboxFocus::Form => {}
+            Some(InboxHit::Form(spot)) => {
+                if self.inbox.focus == InboxFocus::Input {
+                    self.leave_reply();
+                }
+                self.focus_inbox_form(spot);
+            }
             Some(InboxHit::ListBlank) | None => {}
         }
     }
@@ -987,14 +1049,44 @@ impl App {
                 let lines = INBOX_WHEEL_LINES as i16;
                 self.inbox.scroll_pane(if up { -lines } else { lines });
             }
+            Some(InboxHit::Form(_)) => {
+                let (scroll, max) = (self.inbox.forms_scroll.get(), self.inbox.forms_max.get());
+                let lines = INBOX_WHEEL_LINES as usize;
+                let scroll = if up { scroll.saturating_sub(lines) } else { (scroll + lines).min(max) };
+                self.inbox.set_forms_scroll(scroll, max);
+                self.inbox.forms_follow.set(false);
+            }
             _ => {}
         }
     }
 
-    /// Focus the list, dropping any reply box with the input's focus.
+    /// Focus the list, dropping any reply box with the input's focus (and
+    /// the form cursor, a text edit saved).
     fn focus_inbox_list(&mut self) {
+        self.close_form_edit();
         self.inbox.focus = InboxFocus::List;
         self.inbox.reply = None;
+    }
+}
+
+/// The editing keys a [`TextArea`] takes in the reply input and a form's
+/// text edit: the `:` prompt's, with `↑`/`↓` and `home`/`end` on its visual
+/// rows.
+pub(super) fn edit_text(line: &mut TextArea, key: KeyEvent) {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Left => line.left(),
+        KeyCode::Right => line.right(),
+        KeyCode::Up => line.up(),
+        KeyCode::Down => line.down(),
+        KeyCode::Home => line.home(),
+        KeyCode::End => line.end(),
+        KeyCode::Backspace => line.backspace(),
+        KeyCode::Delete => line.delete(),
+        KeyCode::Char('u') if ctrl => line.clear(),
+        KeyCode::Char('w') if ctrl => line.delete_word(),
+        KeyCode::Char(c) if !ctrl => line.insert_char(c),
+        _ => {}
     }
 }
 

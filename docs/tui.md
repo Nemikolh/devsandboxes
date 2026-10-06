@@ -216,9 +216,10 @@ is connected, else applied through `inbox::ops::apply` by the event loop
   nothing), a view name in the strip switches to it (`‹`/`›` step), the pane
   (header, separator or feed) focuses the thread, the composer (the input
   box and its `compose.hint` row) the input (left like `esc` by a click on
-  the rest of the pane), the no-replies row the thread. The wheel moves the
-  selection one card over the list and scrolls the feed over the pane
-  (header included). A click on a tab title (any
+  the rest of the pane), the no-replies row the thread, the pinned forms box
+  the form zone at the clicked question. The wheel moves the selection one
+  card over the list, scrolls the forms box over it and the feed over the
+  rest of the pane (header included). A click on a tab title (any
   tab, `ui::tab_hit` over `ui::tab_spans`, which the tab bar is drawn from)
   switches tabs like `1`–`4`. None of it under a modal or the prompt; a
   click outside the terminal panel still unfocuses a terminal.
@@ -253,11 +254,12 @@ is connected, else applied through `inbox::ops::apply` by the event loop
   are state their dispatcher re-asserts, so they stay); `1`–`4` still switch
   tabs.
 
-Keys go to one of three focus zones (`InboxFocus`): **List** (above), the
-**thread pane**, and its reply **input**. `enter` on the list moves focus to
-the thread; `esc` steps back one zone at a time (input → thread → list). The
-focused zone's border is highlighted. While the thread or its input has
-focus it shadows the dashboard keys (a tier in `App::on_key` after the
+Keys go to one of four focus zones (`InboxFocus`): **List** (above), the
+**thread pane**, its pinned **forms** (when the thread has an open form) and
+its reply **input**. `enter` on the list moves focus to the thread; `tab` in
+the thread moves on to the forms, else the input; `esc` steps back one zone
+at a time (input or form → thread → list). The focused zone's border is
+highlighted. While any zone but the list has focus it shadows the dashboard keys (a tier in `App::on_key` after the
 terminal, like a modal): the `1`–`4` tab keys and the rest act on the
 thread, not on rows the user can't see. `q`, `:` and `?` stay reachable.
 
@@ -278,12 +280,22 @@ shared with `inbox_hit`). Top to bottom:
   resolves. The row wraps between buttons. A notify thread's header is its
   title and level chip.
 - A **separator** joined to the pane's border (`├─┤`).
+- **Open forms, pinned** (below): each open form of the thread, newest
+  message first, in a rounded box titled with the form's title (or `Form`)
+  and ` open form ` on the right. They get the rows they need, at most half
+  the pane; past that the box scrolls (to the form cursor as it moves, the
+  wheel over it too).
 - **Feed, newest first** (`app::inbox::pane_feed`), scrolling on its own
   (scroll 0 = the newest item at the top, `g`/`G` newest/oldest): `N events
   waiting for <sender>` first while the dispatcher hasn't acked them (state,
   not history), then messages (stamp + author, `(edited)`/`(withdrawn)`,
-  markdown and fields blocks), replies (`you`), actions (`you: <label>`) and
-  markers (`· done`, `· active → needs you`, status changes); for a notify
+  markdown and fields blocks; a form block is one dim `form: <title> · open,
+  pinned above` line while open, `form: <title> · submitted <time>` over
+  its answers read-only (`label: value`: option and yes/no labels, the text,
+  a multi-line text as markdown under its label) once submitted, `form
+  withdrawn` once withdrawn), replies (`you`), actions (`you: <label>`),
+  submissions folded to one dim `you answered N questions` row (not
+  expandable: the answers are always under the message) and markers (`· done`, `· active → needs you`, status changes); for a notify
   thread, its records, the head first, each a stamp + level row over its
   markdown.
 - The **composer** (below).
@@ -316,6 +328,7 @@ Container text has its control characters stripped when stored
 | `1`–`9` | run that action: a host verb (`vscode`, `terminal`, `logs`, `forward`, `open`, `rm`) runs at once on the thread's child, else on its sender; the rest is an event for the sender (`src/tui/app/thread_actions.rs`) |
 | `o` `t` `l` `p` | VS Code / terminal / logs / forward prompt on the child, or the sender without one |
 | `r`/`i` | focus the reply input, when the thread takes replies; otherwise a status hint and focus stays |
+| `tab` | focus the pinned forms (an open form), else the reply input |
 | `d` | mark done: an event, and the child marked done |
 | `u` | reopen a done thread: back to `active`, an event, and the child's done mark cleared |
 | `m` | toggle rendered markdown / raw source (all threads, not saved) |
@@ -332,6 +345,37 @@ and keeps the input focused and empty for the next message; `alt-enter` (or
 back to the thread. Its editing keys are the `:` prompt's, with `↑`/`↓` and
 `home`/`end` moving on the wrapped rows. The `:` prompt itself scrolls
 sideways once the line outgrows the bar.
+
+**Forms** (`docs/inbox-redesign.md` *Forms*; `src/tui/app/forms.rs`, drawn
+by `ui::form_rows`). Per question: `i/N` and the label (inline markdown), a
+yellow `*` while it's required and unanswered, the `context` (markdown) of
+the focused question only (the box stays short; the context is what you read
+while answering), then the widget: `(•) A   ( ) B` (one pick), `[x] A   [ ]
+B` (several), `(•) Yes   ( ) No` (or the form's labels), a text answer's
+first line cut with `…` (a multi-line one's first three lines) or its
+placeholder dim. The option under the cursor is highlighted (its
+`description` dim under it), the focused question marked `›`; a hint row
+ends the box. The answers shown are the stored draft over the defaults, so
+any dashboard or client sees the same half-filled form.
+
+| key (form zone) | does |
+|---|---|
+| `tab`/`S-tab` | next / previous question, across every pinned form, wrapping |
+| `↑`/`↓` (`←`/`→`) | move over the options |
+| `space` | pick (several-pick: toggle; a text question: edit it) |
+| `e` | edit a text question in the composer box (titled with its label, on any thread): `enter` or `esc` keeps the edit, `alt-enter` inserts a newline on a multi-line question; too long is refused with a status line, the edit stays open |
+| `enter` | Confirm: the summary row (`<submit>: submit N answers?`, or `missing: <labels>`, where a second `enter` does nothing); `enter` again submits (`Op::Submit` with the answers resolved, defaults filled in), back to the thread with `submitted to <owner>` |
+| `esc` | cancel Confirm, else back to the thread |
+| `r`/`i` | the reply input |
+
+Every pick and kept edit is an `Op::SaveDraft` of that one answer
+(`inbox.form.saveDraft` through the daemon), applied to the local copy at
+once; typing in an edit saves nothing until it's kept. Leaving the zone any
+other way (a click, another thread, another tab) keeps an edit too. A form
+submitted or withdrawn elsewhere while the cursor is on it leaves the zone
+with `form is no longer open`. A click in the forms box focuses the clicked
+form and question; archived threads refuse the form like the other user
+ops.
 
 Archived threads refuse actions, replies, `d` and `u` with a status line. A
 host action whose child isn't found is refused rather than run on the sender,
