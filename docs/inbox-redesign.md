@@ -490,10 +490,13 @@ devsandbox inbox submit <owner>/<key> <message-id> --json '<answers>'   # or std
 devsandbox inbox done|reopen <owner>/<key>
 ```
 
-`<owner>` is the instance name (resolved to its id); `--json` uses the
-`{"schema":1,"data":…}` envelope of `docs/json-output.md`. `ls`/`show` read
-the store directly (work without the daemon); mutations go through the API
-so the daemon notifies subscribers and owners at once.
+`<owner>/<key>` may also be a numeric store id (as `ls` shows; notify
+threads have no key). `<owner>` is the instance name (resolved to its id); `--json` uses the
+`{"schema":1,"data":…}` envelope of `docs/json-output.md` around the API's
+view structs (`src/inbox/wire.rs`). `ls`/`show` read the store directly
+(work without the daemon); mutations go through a running daemon's API
+(never lazy-started) so subscribers and owners are notified at once, else
+apply locally through the same checks. See `docs/inbox-cli.md`.
 
 ### TUI Inbox
 

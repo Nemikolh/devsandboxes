@@ -40,9 +40,10 @@ devsandbox              # the dashboard
 | `vscode <name> [--goto PATH[:LINE[:COL]]]` | Open VS Code attached to the instance, optionally at a file and line      |
 | `done` / `undone <name>`                   | Mark an instance done (kept as is, shown dimmed) / clear the mark         |
 | `port <name> [--service s] <port…>`        | Forward a container/service port to the host until exited                 |
+| `inbox ls\|show\|reply\|act\|submit\|done`  | Read and answer Inbox threads (docs/inbox-cli.md)                          |
 | `service ls` / `service rebuild`           | List services / recreate one and rewire running sandboxes in place        |
 | `gc [--force]`                             | Reap unreferenced services, orphaned history files and agent links        |
-| `status --json`                            | Full snapshot for scripts; `ps`/`ls`/`stats`/`inspect`/`run` take `--json` |
+| `status --json`                            | Full snapshot for scripts; `ps`/`ls`/`stats`/`inspect`/`run`/`inbox` take `--json` |
 
 `devsandbox port` makes a port inside a running instance or service reachable on the host:
 

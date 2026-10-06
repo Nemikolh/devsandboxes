@@ -120,6 +120,13 @@ PTY, so two gaps closed after the read verbs:
   uses (`SHELL_FALLBACK_CMD`), defaulting to `-i` plus `-t` when stdin is a TTY (explicit flags win),
   and the npm package's `execArgv()` returns `{file, args}` to spawn directly.
 
+## Later: `inbox ls` / `inbox show`
+
+`devsandbox inbox ls --json` and `inbox show <thread> --json` print the
+API's own views (`ThreadSummary` list, one `ThreadDetail`; docs/api.md) in
+the same envelope, read from the store without the daemon. The mutating
+`inbox` verbs print nothing on stdout. See docs/inbox-cli.md.
+
 ## Commit per step (conventional commits, lowercase)
 
 1. `refactor(snapshot): extract snapshot collection from tui`

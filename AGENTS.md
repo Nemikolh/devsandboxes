@@ -11,12 +11,15 @@ git worktrees so working trees are never shared.
   `src/json_stdout.rs` points stdout at stderr for `run --json` so child
   output can't corrupt the one JSON document.
 - `src/commands/*.rs` — one file per verb (`run`, `start`, `stop`, `rebuild`,
-  `rm`, `ps`, `ls`, `exec`, `done`, `logs`, `inspect`, `stats`, `port`, `services::{gc,ls,rebuild}`). Shared name
+  `rm`, `ps`, `ls`, `exec`, `done`, `inbox`, `logs`, `inspect`, `stats`, `port`, `services::{gc,ls,rebuild}`). Shared name
   resolution in `commands/mod.rs` (`resolve_instance`: exact instance name/id
   first, then sandbox | folder basename). `exec.rs` also owns
   `SHELL_FALLBACK_CMD`, the login shell a command-less `exec` and the TUI
   terminal open. `port.rs` resolves a forward route (instance | service via a
   running instance | injection fallback) and hosts the foreground `port` CLI.
+  `inbox.rs` is `devsandbox inbox …` (docs/inbox-cli.md): reads from the
+  store, mutations via a running daemon's API, else the same `wire::decide_*`
+  ops locally.
   `run/` is split by concern: `mod.rs` (`run`/`materialize`, naming,
   `run_container`), `worktree.rs`, `git.rs` (`host_git`: the only way the
   host runs git — hooks/fsmonitor off, repo config allowlist-checked),
@@ -51,7 +54,10 @@ git worktrees so working trees are never shared.
   cap as pure fns), `store.rs` the locked
   read-modify-write every dashboard and the bridge's notify sink go through,
   `ops.rs` every read/mutation as a fn over a store path, `view.rs` the
-  Inbox views' membership (shared by the TUI and the API).
+  Inbox views' membership (shared by the TUI and the API), `wire.rs` the
+  API's wire views (`ThreadSummary`/`ThreadDetail`), addressing and the user
+  ops' `decide_*` checks (platform-neutral: `serve::api` serves them, the
+  CLI's local fallback runs them).
 - `src/serve/` — the per-user host daemon `devsandbox serve` (unix-only, see
   `docs/serve.md`): `endpoint.rs` (socket dir/paths, bind/connect: the
   `local_endpoint` seam), `daemon.rs` (start lock, accept loop, version

@@ -37,6 +37,7 @@ pub mod sanitize;
 pub mod store;
 pub mod thread;
 pub mod view;
+pub mod wire;
 
 use std::collections::BTreeMap;
 

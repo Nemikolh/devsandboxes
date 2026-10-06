@@ -2,6 +2,7 @@ pub mod autostart;
 pub mod dispatch;
 pub mod done;
 pub mod exec;
+pub mod inbox;
 pub mod inspect;
 pub mod logs;
 pub mod ls;
@@ -42,9 +43,9 @@ pub(crate) fn resolve_instance(state: &State, name: &str) -> Result<String> {
 /// Non-interactive [`resolve_instance`]: an ambiguous `name` bails instead of
 /// prompting. For callers where prompting is impossible or wrong even though
 /// stdin is a TTY — the daemon's forward registry (`serve::forwards`) owns no
-/// console, and a prompt there would block a `forwards.add` forever.
-// Only the unix-only daemon's forward registry calls this.
-#[cfg_attr(not(unix), allow(dead_code))]
+/// console, and a prompt there would block a `forwards.add` forever — and
+/// `devsandbox inbox`, whose owner falls back to a thread's last-known name
+/// rather than asking.
 pub(crate) fn resolve_instance_noninteractive(state: &State, name: &str) -> Result<String> {
     resolve_instance_with(state, name, false)
 }

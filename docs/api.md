@@ -3,7 +3,8 @@
 What `devsandbox serve` answers on its socket, for the dashboard, the CLI
 and external clients (editor extensions, GUIs). Design and roadmap:
 `docs/inbox-redesign.md`, "One API, served by the daemon". Code:
-`src/serve/api.rs` (methods), `src/serve/daemon.rs` (connections,
+`src/serve/api.rs` (methods), `src/inbox/wire.rs` (the views and the
+user ops' checks, shared with `devsandbox inbox`: docs/inbox-cli.md), `src/serve/daemon.rs` (connections,
 `subscribe`), `src/serve/proto.rs` (envelope), `src/serve/forwards.rs`
 (the forwards behind `forwards.*`), `src/serve/relay.rs` (`api --stdio`),
 `npm/devsandboxes/index.js` (the Node client).

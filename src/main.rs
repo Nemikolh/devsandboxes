@@ -144,6 +144,11 @@ enum Command {
         #[command(subcommand)]
         cmd: ServiceCommand,
     },
+    /// Read and answer Inbox threads (docs/inbox-cli.md)
+    Inbox {
+        #[command(subcommand)]
+        cmd: InboxCommand,
+    },
     /// Show the last lines of a container's logs
     Logs {
         /// Instance name, sandbox config name, repository folder name, or
@@ -278,6 +283,71 @@ enum ServeCommand {
     Uninstall,
 }
 
+/// `<thread>`: `<owner>/<key>` (owner: instance name or id) or the id `inbox ls` shows.
+type ThreadArg = commands::inbox::ThreadArg;
+
+#[derive(Subcommand)]
+enum InboxCommand {
+    /// List threads, last change first
+    Ls {
+        /// Which threads
+        #[arg(long, default_value = "all", value_parser = ["needs-you", "active", "done", "all"])]
+        view: String,
+        /// Output JSON instead of a table
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show a thread: header, then its feed newest first
+    Show {
+        /// `<owner>/<key>` or a thread id
+        #[arg(value_parser = ThreadArg::parse)]
+        thread: ThreadArg,
+        /// Output JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
+    /// Reply to a thread's owner
+    Reply {
+        /// `<owner>/<key>` or a thread id
+        #[arg(value_parser = ThreadArg::parse)]
+        thread: ThreadArg,
+        /// The reply; `-` reads it from stdin
+        text: String,
+    },
+    /// Press one of a thread's actions (by its id)
+    Act {
+        /// `<owner>/<key>` or a thread id
+        #[arg(value_parser = ThreadArg::parse)]
+        thread: ThreadArg,
+        action: String,
+    },
+    /// Submit the form of one of a thread's messages
+    Submit {
+        /// `<owner>/<key>` or a thread id
+        #[arg(value_parser = ThreadArg::parse)]
+        thread: ThreadArg,
+        /// The message holding the form
+        message: String,
+        /// Answers as a JSON object of question id -> answer (any subset:
+        /// the draft and the defaults fill in the rest); read from stdin
+        /// when absent
+        #[arg(long, value_name = "ANSWERS")]
+        json: Option<String>,
+    },
+    /// Mark a thread done
+    Done {
+        /// `<owner>/<key>` or a thread id
+        #[arg(value_parser = ThreadArg::parse)]
+        thread: ThreadArg,
+    },
+    /// Reopen a done thread
+    Reopen {
+        /// `<owner>/<key>` or a thread id
+        #[arg(value_parser = ThreadArg::parse)]
+        thread: ThreadArg,
+    },
+}
+
 #[derive(Subcommand)]
 enum ServiceCommand {
     /// Recreate a service's container(s) from the current config and rewire
@@ -363,6 +433,21 @@ fn main() -> Result<()> {
             ServiceCommand::Rebuild { name } => commands::services::rebuild(&cli.dir, &name),
             ServiceCommand::Ls { json } => commands::services::ls(&cli.dir, json),
         },
+        Command::Inbox { cmd } => {
+            use commands::inbox::{self, Mutation};
+            match cmd {
+                InboxCommand::Ls { view, json } => inbox::ls(&view, json),
+                InboxCommand::Show { thread, json } => inbox::show(&thread, json),
+                InboxCommand::Reply { thread, text } => inbox::mutate(&thread, Mutation::Reply(inbox::reply_text(&text)?)),
+                InboxCommand::Act { thread, action } => inbox::mutate(&thread, Mutation::Act(action)),
+                InboxCommand::Submit { thread, message, json } => {
+                    let answers = inbox::submit_answers(json.as_deref())?;
+                    inbox::mutate(&thread, Mutation::Submit { message, answers })
+                }
+                InboxCommand::Done { thread } => inbox::mutate(&thread, Mutation::Done),
+                InboxCommand::Reopen { thread } => inbox::mutate(&thread, Mutation::Reopen),
+            }
+        }
         Command::Logs { name, lines } => commands::logs::logs(&name, lines),
         Command::Inspect { name, json } => commands::inspect::inspect(&name, json),
         Command::Vscode { name, goto } => commands::vscode::vscode(&cli.dir, &name, goto.as_ref()),

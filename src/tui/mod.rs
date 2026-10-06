@@ -46,6 +46,8 @@ use crate::commands::vscode::Goto;
 use crate::inbox;
 
 use app::{App, PendingSignal};
+// `devsandbox inbox` dates its rows like the dashboard's cards.
+pub(crate) use app::short_age;
 use data::Snapshot;
 use procs::{parse_top, build_forest, ProcState};
 use prompt::PromptAction;
@@ -747,7 +749,7 @@ fn open_link(link: &str) -> std::result::Result<(), String> {
 /// Seconds east of UTC for the Inbox clock, from `date +%z` (std has no
 /// timezone support and no tz crate is in the tree). 0 (UTC) when `date` is
 /// missing or odd; read once, so a DST switch mid-session isn't picked up.
-fn local_utc_offset() -> i64 {
+pub(crate) fn local_utc_offset() -> i64 {
     std::process::Command::new("date")
         .arg("+%z")
         .stdin(std::process::Stdio::null())
