@@ -19,7 +19,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use crate::devsbd::bridge::{self, Bridges};
+use crate::devsbd::bridge::{self, Bridges, OnShown};
 use crate::state::State;
 
 /// How often the daemon re-lists the running containers. A new instance gets
@@ -37,8 +37,9 @@ pub struct Host {
 
 impl Host {
     /// Start the poll (bridges) and autostart threads. `log` writes one
-    /// `serve.log` line.
-    pub fn start(log: fn(&str)) -> Host {
+    /// `serve.log` line; `on_shown` gets each stored container message's
+    /// status line (the API's `inbox.shown`).
+    pub fn start(log: fn(&str), on_shown: OnShown) -> Host {
         let stop = Arc::new((Mutex::new(false), Condvar::new()));
         let live = Arc::new(AtomicUsize::new(0));
         // Counted before the thread runs, so the first idle check sees it.
@@ -49,7 +50,7 @@ impl Host {
             let (stop, live, changes) = (Arc::clone(&stop), Arc::clone(&live), Arc::clone(&changes));
             std::thread::Builder::new()
                 .name("serve-poll".into())
-                .spawn(move || poll(&stop, &live, &changes, log))
+                .spawn(move || poll(&stop, &live, &changes, log, on_shown))
         };
         match spawned {
             Ok(t) => threads.push(t),
@@ -111,8 +112,8 @@ impl Drop for Host {
 /// The poll loop: list, count, reconcile, sleep, until stopped. With the
 /// runtime unreachable the last list stands (bridges and the holder count
 /// are kept, not torn down on a blip); the outage is logged once.
-fn poll(stop: &(Mutex<bool>, Condvar), live: &AtomicUsize, changes: &AtomicU64, log: fn(&str)) {
-    let worker = Bridges::spawn_worker(Some(None));
+fn poll(stop: &(Mutex<bool>, Condvar), live: &AtomicUsize, changes: &AtomicU64, log: fn(&str), on_shown: OnShown) {
+    let worker = Bridges::spawn_worker(Some(Some(on_shown)));
     let mut down = false;
     let mut last: Vec<String> = Vec::new();
     loop {

@@ -84,6 +84,7 @@ pub fn call(method: &str, params: Value, ctx: &Ctx) -> Answer {
             mutate(ctx, |inbox| Ok(vec![Op::Reopen(user_target(inbox, &addr)?.id)]))
         }
         "inbox.notify.dismiss" => dismiss(parse(params)?, ctx),
+        "inbox.notify.markRead" => notify_mark_read(parse(params)?, ctx),
         "instances.list" => instances_list(parse(params)?),
         other => Err(ApiError::unknown_method(other)),
     }
@@ -491,6 +492,23 @@ fn dismiss(p: DismissParams, ctx: &Ctx) -> Answer {
     })
 }
 
+/// Mark one notify thread read, or every one (`all`): what the dashboard
+/// does with the notifications it showed when the user leaves the Inbox.
+fn notify_mark_read(p: DismissParams, ctx: &Ctx) -> Answer {
+    match (p.all, p.addr.is_empty()) {
+        (true, true) => return mutate(ctx, |_| Ok(vec![Op::MarkNotifyRead])),
+        (true, false) => return Err(ApiError::invalid("`all` takes no thread")),
+        (false, _) => {}
+    }
+    mutate(ctx, |inbox| {
+        let t = resolve(inbox, &p.addr)?;
+        if t.kind != Kind::Notify {
+            return Err(ApiError::invalid(format!("thread {} is a dispatcher thread, not a notification", t.id)));
+        }
+        Ok(vec![Op::MarkRead(t.id)])
+    })
+}
+
 #[derive(Deserialize)]
 struct InstancesParams {
     dir: PathBuf,
@@ -734,6 +752,32 @@ mod tests {
         let left = ops::load(&path).unwrap();
         assert_eq!(left.threads.len(), 1);
         assert_eq!(left.threads[0].id, thread);
+    }
+
+    #[test]
+    fn notify_mark_read_reads_notifications_only() {
+        let path = store_path("markread");
+        put(&path, "d-id", "d", "pr-1", State::NeedsYou);
+        notify(&path, "w-id", "a");
+        notify(&path, "v-id", "b");
+        let unread = |path: &Path| -> Vec<(Kind, bool)> {
+            ops::load(path).unwrap().threads.iter().map(|t| (t.kind, t.unread)).collect()
+        };
+        let thread = id_of(&path, "d-id", "pr-1");
+        let notes: Vec<u64> = ops::load(&path).unwrap().threads.iter().filter(|t| t.kind == Kind::Notify).map(|t| t.id).collect();
+
+        run(&path, "inbox.notify.markRead", json!({ "thread": notes[0] })).unwrap();
+        assert_eq!(unread(&path).iter().filter(|(_, u)| *u).count(), 2);
+        assert_eq!(code(run(&path, "inbox.notify.markRead", json!({ "thread": thread }))), "invalid");
+        assert_eq!(code(run(&path, "inbox.notify.markRead", json!({ "thread": 999 }))), "not-found");
+        assert_eq!(code(run(&path, "inbox.notify.markRead", json!({"all": true, "thread": notes[1]}))), "invalid");
+        assert_eq!(code(run(&path, "inbox.notify.markRead", json!({}))), "invalid");
+
+        assert_eq!(run(&path, "inbox.notify.markRead", json!({"all": true})).unwrap(), json!({"ok": true}));
+        // Every notification read; the dispatcher thread is only read by opening it.
+        for (kind, unread) in unread(&path) {
+            assert_eq!(unread, kind == Kind::Thread, "{kind:?}");
+        }
     }
 
     #[test]

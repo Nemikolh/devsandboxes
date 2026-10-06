@@ -18,7 +18,8 @@
 //! each subscribed connection's [`Outbox`]; it never does I/O, so a slow
 //! client can't hold up the others. A connection's first `subscribe` starts
 //! its `serve-notify-<n>` thread, which writes the flagged notifications.
-//! Flags coalesce (one pending `inbox.changed` however many writes), so the
+//! Flags coalesce (one pending `inbox.changed` however many writes; the
+//! host's sink posts `inbox.shown` the same way, latest line only), so the
 //! queue is bounded by construction; every write to a connection, response
 //! or notification, goes through its one writer lock, and a client that
 //! doesn't drain its socket for [`WRITE_TIMEOUT`] is disconnected.
@@ -128,8 +129,11 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
         if opts.keep_alive { ", keep-alive" } else { "" },
     ));
 
-    let host = opts.host.then(|| Host::start(log));
     let shared = Arc::new(Shared::new(opts.version.clone(), inbox));
+    let host = opts.host.then(|| {
+        let shared = Arc::clone(&shared);
+        Host::start(log, Box::new(move |instance: &str, line: String| shared.publish_shown(instance, line)))
+    });
     let watcher = Watcher::spawn(&shared, host.as_ref().map(Host::changes));
     let mut next_conn = 0u64;
     let exit = loop {
@@ -301,6 +305,12 @@ impl Shared {
         }
     }
 
+    /// `inbox.shown`: a container message's status line, to `inbox`
+    /// subscribers. Latest wins: under backpressure older lines are dropped.
+    fn publish_shown(&self, instance: &str, line: String) {
+        self.publish(Topic::Inbox, |p| p.shown = Some((instance.to_string(), line.clone())));
+    }
+
     /// The reconnect hint: tell every subscriber the daemon is going away
     /// (`reason`: `handoff` or `idle`), before the drain closes them.
     fn publish_closing(&self, reason: &'static str) {
@@ -352,6 +362,8 @@ struct Pending {
     topics: BTreeSet<Topic>,
     /// `inbox.changed` with this generation.
     inbox: Option<u64>,
+    /// `inbox.shown` with `(instance, line)`, the latest only.
+    shown: Option<(String, String)>,
     instances: bool,
     /// `closing` with this reason; written last.
     closing: Option<&'static str>,
@@ -361,13 +373,16 @@ struct Pending {
 
 impl Pending {
     fn any(&self) -> bool {
-        self.inbox.is_some() || self.instances || self.closing.is_some()
+        self.inbox.is_some() || self.shown.is_some() || self.instances || self.closing.is_some()
     }
 
     fn take(&mut self) -> Vec<Notification> {
         let mut out = Vec::new();
         if let Some(generation) = self.inbox.take() {
             out.push(Notification { method: "inbox.changed".into(), params: json!({ "generation": generation }) });
+        }
+        if let Some((instance, line)) = self.shown.take() {
+            out.push(Notification { method: "inbox.shown".into(), params: json!({ "instance": instance, "line": line }) });
         }
         if std::mem::take(&mut self.instances) {
             out.push(Notification { method: "instances.changed".into(), params: json!({}) });
@@ -564,7 +579,10 @@ fn subscribe(params: Value, conn: &mut ConnState, on: bool) -> Result<Value, api
             } else {
                 p.topics.remove(&topic);
                 match topic {
-                    Topic::Inbox => p.inbox = None,
+                    Topic::Inbox => {
+                        p.inbox = None;
+                        p.shown = None;
+                    }
                     Topic::Instances => p.instances = false,
                 }
             }
@@ -782,6 +800,85 @@ pub(crate) mod tests {
         assert_eq!(daemon.join().unwrap().unwrap(), Exit::Idle);
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(store.parent().unwrap());
+    }
+
+    /// The next notification named `method`, skipping others (stray
+    /// `inbox.changed` from other tests' writes).
+    fn wait_for(conn: &mut client::Conn, method: &str) -> Notification {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let n = conn.next_notification(left).unwrap().unwrap_or_else(|| panic!("no {method}"));
+            if n.method == method {
+                return n;
+            }
+        }
+    }
+
+    #[test]
+    fn two_dashboards_hear_one_write() {
+        let dir = scratch("two");
+        let store = scratch("two-store").join("inbox.toml");
+        let daemon = spawn_daemon(&dir, Options { inbox: Some(store.clone()), ..opts(1, 200) });
+        let (mut a, mut b) = (connect(&dir), connect(&dir));
+        for conn in [&mut a, &mut b] {
+            conn.call("subscribe", json!({"topics": ["inbox"]})).unwrap();
+        }
+        note(&store, "one");
+        let id = ops::load(&store).unwrap().threads[0].id;
+        drain_notes(&mut a, Duration::from_millis(700));
+        drain_notes(&mut b, Duration::ZERO);
+        // One write through the API, from `a`: both hear it.
+        let r = a.call("inbox.thread.markRead", json!({ "thread": id })).unwrap();
+        assert!(r.error.is_none(), "{r:?}");
+        wait_for(&mut a, "inbox.changed");
+        wait_for(&mut b, "inbox.changed");
+        drop((a, b));
+        assert_eq!(daemon.join().unwrap().unwrap(), Exit::Idle);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(store.parent().unwrap());
+    }
+
+    #[test]
+    fn shown_lines_reach_inbox_subscribers_latest_first() {
+        use std::os::unix::net::UnixStream;
+        let shared = Arc::new(Shared::new(v(1), scratch("shown-store").join("inbox.toml")));
+        let mut clients = Vec::new();
+        for (id, topics) in [(1, json!(["inbox"])), (2, json!(["inbox"])), (3, json!(["instances"]))] {
+            let (server, client) = UnixStream::pair().unwrap();
+            shared.spawn_conn(id, server);
+            let mut reader = BufReader::new(client.try_clone().unwrap());
+            let mut writer = client;
+            writeln!(writer, "{}", json!({"id": 1, "method": "subscribe", "params": {"topics": topics}})).unwrap();
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert_eq!(serde_json::from_str::<Value>(&line).unwrap()["result"], json!({"ok": true}));
+            reader.get_ref().set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            clients.push((reader, writer));
+        }
+        // Coalescing keeps the latest line when two land before a write;
+        // either way the last one seen is the newest.
+        shared.publish_shown("disp", "disp: first".into());
+        shared.publish_shown("disp", "disp: second".into());
+        for (reader, _) in &mut clients[..2] {
+            let last = loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let n: Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(n["method"], "inbox.shown", "{n}");
+                assert_eq!(n["params"]["instance"], "disp");
+                if n["params"]["line"] == "disp: second" {
+                    break n;
+                }
+                assert_eq!(n["params"]["line"], "disp: first");
+            };
+            assert!(last.get("id").is_none());
+        }
+        // Not subscribed to `inbox`: nothing.
+        let (reader, _) = &mut clients[2];
+        reader.get_ref().set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        let mut line = String::new();
+        assert!(reader.read_line(&mut line).is_err() || line.is_empty(), "{line}");
     }
 
     #[test]

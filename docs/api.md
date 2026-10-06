@@ -154,6 +154,7 @@ event the dashboard would (the owner pulls it with `devsbd events`).
 | `inbox.thread.done` | address | set done (a `done` event); already done: nothing | `invalid` (notification), `denied` (archived) |
 | `inbox.thread.reopen` | address | reopen a done thread (a `reopen` event); not done: nothing | `invalid` (notification), `denied` (archived) |
 | `inbox.notify.dismiss` | `{"thread": id}`, or `{"all": true}` | remove one notification thread, or every one | `not-found`, `invalid` (a dispatcher thread, or `all` with a thread) |
+| `inbox.notify.markRead` | `{"thread": id}`, or `{"all": true}` | mark one notification thread read, or every one (dispatcher threads are untouched) | `not-found`, `invalid` (a dispatcher thread, or `all` with a thread) |
 
 Host verbs (`vscode`, `terminal`, …) run in the client that shows the
 button; the API doesn't run them, and refuses a host-only action. An action
@@ -186,6 +187,7 @@ between.
 | notification | topic | params | when |
 |---|---|---|---|
 | `inbox.changed` | `inbox` | `{"generation": n}` | the store changed: through the daemon at once, through other processes (the dashboard, `devsandbox rm`) within 0.5 s. `n` grows per change the daemon saw; compare within one connection only |
+| `inbox.shown` | `inbox` | `{"instance": "<name>", "line": "<name>: <text>"}` | a container message the daemon stored is worth a status line (a `devsbd notify`, a thread put that changed something); `line` is the dashboard's status-line text. Latest only: lines that arrive faster than the client reads are dropped |
 | `instances.changed` | `instances` | `{}` | the running containers changed (the daemon polls every 5 s) |
 | `closing` | any | `{"reason": "handoff" \| "idle"}` | the daemon is exiting; reconnect (which starts a new one) |
 
@@ -196,3 +198,15 @@ A client that doesn't read its socket for 5 s is disconnected.
 
 A connected client keeps the daemon alive (`docs/serve.md`, *Idle exit*);
 hang up when done.
+
+## The dashboard as a client
+
+The dashboard holds one connection for its life (`src/tui/daemon.rs`),
+subscribed to `inbox` and `instances`, and reconnects after `closing` or a
+lost connection (at once, then 1 s, 2 s, … up to 30 s apart; after a
+handoff it waits up to 5 s for the successor before starting a daemon).
+Its Inbox writes go through the `inbox.*` mutations while connected, and
+straight to the store (the same code) while not. It reads the store file
+itself, reloading on `inbox.changed`, and keeps its own instance snapshot
+(with processes and stats), refreshed early on `instances.changed`.
+`inbox.shown` is its status line. Two dashboards share one daemon.

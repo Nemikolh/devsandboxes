@@ -81,7 +81,7 @@ pub struct HelloResult {
 }
 
 /// A daemon-to-client message with no `id`: `inbox.changed`,
-/// `instances.changed`, `closing`. A line with a `method` is one.
+/// `inbox.shown`, `instances.changed`, `closing`. A line with a `method` is one.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Notification {
     pub method: String,

@@ -6,7 +6,7 @@ keeps working with the dashboard closed. Design and roadmap:
 `docs/inbox-redesign.md`, "Host daemon". Unix only; the command doesn't
 exist on Windows.
 
-This page covers what exists today (steps 4-6 of that plan): the socket,
+This page covers what exists today (steps 4-7 of that plan): the socket,
 start, handoff, idle exit, the bridges and the startup autostart pass. The
 API on the socket has its own page, `docs/api.md`. Marked below is what
 later steps add.
@@ -49,7 +49,9 @@ plumbing: commands start it themselves (*lazy start*):
    `serve.sock` from a crashed daemon is replaced.
 
 Who starts it today: the dashboard (at launch, on a background thread; it
-keeps the connection open for its whole life), and `run` / `start` once
+keeps the connection open for its whole life and reconnects, starting a
+new daemon if needed, after a handoff or the daemon's death; see
+`docs/api.md`, *The dashboard as a client*), and `run` / `start` once
 their container is up (best effort: a failure is one `warning:` line on
 stderr, the command still succeeds; they hang up right away). `exec`,
 `port` and `inbox` follow in steps 6-8; `devsandbox api --stdio` in step 9.
@@ -75,9 +77,12 @@ kept, not torn down on a blip) and `serve.log` gets one line; another when
 it answers again.
 
 `events --wait` wakes as soon as the daemon itself writes the store (the
-notify sink, an ack), and re-checks the file every 500 ms for writes by
-other processes (dashboard clicks, `devsandbox rm`) until those go through
-the daemon too (step 7).
+notify sink, an ack, a connected dashboard's clicks through the API), and
+re-checks the file every 500 ms for writes by other processes (a dashboard
+without a daemon connection, `devsandbox rm`).
+
+Each message the sink stores that earns a status line also goes to `inbox`
+subscribers as `inbox.shown`: that's the dashboard's status line.
 
 ## Autostart
 

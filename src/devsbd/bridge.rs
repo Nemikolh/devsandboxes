@@ -700,7 +700,7 @@ impl Bridges {
                     }
                 }
                 if let Some(on_shown) = &on_shown {
-                    on_shown(shown.line);
+                    on_shown(&instance, shown.line);
                 }
                 Ok(())
             })
@@ -724,9 +724,9 @@ impl Bridges {
     }
 }
 
-/// Gets the status line of every message the sink stored and showed (see
-/// [`Bridges::spawn_worker`]). Runs on a bridge's handler thread.
-pub type OnShown = Box<dyn Fn(String) + Send + Sync>;
+/// Gets `(instance, status line)` for every message the sink stored and
+/// showed (see [`Bridges::spawn_worker`]). Runs on a bridge's handler thread.
+pub type OnShown = Box<dyn Fn(&str, String) + Send + Sync>;
 
 /// Store one delivered message and report what to show, if anything. Split
 /// out of the sink closure so the store write (the thing the daemon's `ok`

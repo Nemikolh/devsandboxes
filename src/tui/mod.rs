@@ -6,6 +6,8 @@
 
 mod app;
 mod clipboard;
+#[cfg(unix)]
+mod daemon;
 mod data;
 #[cfg(unix)]
 mod forwards;
@@ -248,22 +250,13 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
     // snapshot, so the proc refresh must wait for it to land.
     let mut procs_after_snapshot = false;
     // The host daemon (docs/serve.md) owns the bridges: ssh-agent relays,
-    // the notify drain, popups and control ops. Lazy-started off the UI
-    // thread (the start waits up to 5 s); the connection is then held for the
-    // dashboard's life, so the dashboard counts as a holder. A failure is a
-    // status line: the dashboard works without it, minus the live features.
+    // the notify drain, popups and control ops. Its worker thread
+    // (`daemon.rs`) holds the connection for the dashboard's life (so the
+    // dashboard is a holder), reconnecting after a handoff or a death, and
+    // relays its notifications. Without one the dashboard works on the
+    // store alone, minus the live features.
     #[cfg(unix)]
-    let mut daemon_rx = Some({
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let conn = crate::serve::endpoint::socket_dir()
-                .and_then(|dir| crate::serve::client::connect(&dir, "tui"));
-            let _ = tx.send(conn);
-        });
-        rx
-    });
-    #[cfg(unix)]
-    let mut _daemon: Option<crate::serve::client::Conn> = None;
+    let daemon = daemon::DaemonWorker::spawn();
     // Ports-tab forwards (docs/port-forwarding.md, step 10). A worker thread
     // owns every `Forward`, doing all config/state/docker work (route
     // resolution, `ensure`, the `lsof` probe) off the UI thread; its `Drop`
@@ -412,20 +405,15 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
                     forwards::ForwardUpdate::Status(status) => app.status = Some(status),
                 }
             }
-            // The daemon connection, once the lazy start is done. Container
-            // messages reach the Inbox through the store's stamp below.
-            if let Some(rx) = &daemon_rx {
-                match rx.try_recv() {
-                    Ok(Ok(conn)) => {
-                        _daemon = Some(conn);
-                        daemon_rx = None;
+            while let Some(update) = daemon.try_recv() {
+                match update {
+                    daemon::DaemonUpdate::InboxChanged => reload_inbox = true,
+                    // The daemon's 5 s poll saw containers come or go:
+                    // resnapshot soon rather than on the next tick.
+                    daemon::DaemonUpdate::InstancesChanged => followup.schedule(Instant::now()),
+                    daemon::DaemonUpdate::Shown(line) | daemon::DaemonUpdate::Status(line) => {
+                        app.status = Some(line)
                     }
-                    Ok(Err(e)) => {
-                        app.status = Some(format!("host daemon unavailable: {e:#}"));
-                        daemon_rx = None;
-                    }
-                    Err(TryRecvError::Empty) => {}
-                    Err(TryRecvError::Disconnected) => daemon_rx = None,
                 }
             }
         }
@@ -441,6 +429,15 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
         // dashboard's change must reach this one: push what the keys asked
         // for, then reload when the store moved (ours or someone else's).
         let ops = app.take_pending_inbox();
+        #[cfg(unix)]
+        let ops = if !ops.is_empty() && daemon.connected() {
+            // Through the API; the worker says when they landed. No reload
+            // before then: it would undo `App`'s optimistic copy.
+            daemon.apply(ops);
+            Vec::new()
+        } else {
+            ops
+        };
         if !ops.is_empty() {
             // Stamped by `ops::apply`, under the store lock, not in `App`:
             // event ids and times are minted where every dashboard's writes

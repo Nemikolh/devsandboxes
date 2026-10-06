@@ -54,7 +54,8 @@ git worktrees so working trees are never shared.
   `docs/serve.md`): `endpoint.rs` (socket dir/paths, bind/connect: the
   `local_endpoint` seam), `daemon.rs` (start lock, accept loop, version
   handoff, drain), `host.rs` (the bridges, polled every 5 s, and the startup
-  autostart pass; the TUI no longer bridges), `client.rs` (`connect`: lazy
+  autostart pass; the TUI no longer bridges; the sink's status lines go out
+  as `inbox.shown`), `client.rs` (`connect`: lazy
   start + hello; `ensure_running` for `run`/`start`; `Conn` sets
   notifications aside), `idle.rs` (pure idle countdown over `Holders`),
   `proto.rs` (JSON-lines wire, `PROTOCOL`), `api.rs` (the API's method table
@@ -97,6 +98,10 @@ git worktrees so working trees are never shared.
   (route resolution + docker work off the UI thread), modelled on `BridgeWorker`;
   it also reconciles sandboxes' `forwardPorts` against the running instances
   each snapshot, with host ports saved in `state.toml`.
+  `daemon.rs` is the host-daemon worker thread (unix): owns the `serve`
+  connection (the dashboard as a holder; reconnect with backoff), relays
+  `inbox.changed`/`instances.changed`/`inbox.shown`, sends Inbox `Op`s as
+  API calls while connected (else the loop applies them locally).
   Mouse selection (`docs/tui-selection.md`): `select.rs` is the pure model
   (extraction, highlight), `app/selection.rs` its routing, `clipboard.rs` the
   OSC 52 writer; `settings.rs` the dashboard settings (`dashboard.toml` next

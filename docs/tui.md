@@ -177,14 +177,16 @@ See `docs/port-forwarding.md` for the engine. The dashboard gains a third tab.
 Transport: `docs/automations.md` ("`devsbd notify`", _Inbox threads_);
 threads, events and their design: `docs/inbox-threads.md`. The Inbox shows the
 shared store (`inbox.toml` next to `state.toml`, `src/inbox/`), which every
-dashboard reads and writes under a lock: the bridge worker applies each
-delivered record to it, then pokes the event loop, which reloads (also
-whenever the file's mtime or length moves, e.g. another dashboard dismissed
-something) and shows the record briefly on the status line. `App`
-(`src/tui/app/inbox.rs`) only holds view state: the view, the selection, the
-open thread. `d`/`D`/mark-read and the pane's actions are `inbox::Op`s the
-event loop applies through `inbox::ops::apply`. Desktop popups fire from the
-worker, never the UI thread.
+dashboard reads under a lock. The host daemon (`devsandbox serve`) applies
+each delivered record to it; the dashboard's daemon worker
+(`src/tui/daemon.rs`) relays its `inbox.changed` (reload now) and
+`inbox.shown` (the record, briefly on the status line). The event loop also
+reloads whenever the file's mtime or length moves, which is all there is
+without a daemon. `App` (`src/tui/app/inbox.rs`) only holds view state: the
+view, the selection, the open thread. `d`/`D`/mark-read and the pane's
+actions are `inbox::Op`s: sent to the daemon as API calls while the worker
+is connected, else applied through `inbox::ops::apply` by the event loop
+(same code, same events). Desktop popups fire from the daemon.
 
 - `Tab::Inbox` is the fourth tab: `4` jumps to it, `tab`/`S-tab` cycle over
   all four. Its title carries the **needs-you** count (`Inbox (3)`), and an

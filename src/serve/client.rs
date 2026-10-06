@@ -26,11 +26,11 @@ const POLL: Duration = Duration::from_millis(50);
 /// notification that arrives before its response, and
 /// [`next_notification`](Self::next_notification) hands them out, oldest
 /// first, then waits for the next.
-#[allow(dead_code)] // `daemon` and the API calls: the TUI as a client (step 7)
 pub struct Conn {
     reader: BufReader<Stream>,
     writer: Stream,
     next_id: u64,
+    #[allow(dead_code)] // read by tests; clients that check `protocol` will
     pub daemon: HelloResult,
     /// Notifications read while waiting for a response.
     notes: VecDeque<Notification>,
@@ -44,7 +44,6 @@ enum Incoming {
     Notification(Notification),
 }
 
-#[allow(dead_code)] // the TUI as a client (step 7) builds on it
 impl Conn {
     fn new(stream: Stream, daemon: HelloResult) -> Result<Self> {
         let reader = BufReader::new(stream.try_clone().context("cannot clone the daemon connection")?);
