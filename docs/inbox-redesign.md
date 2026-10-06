@@ -573,9 +573,28 @@ store ops, schema rules), TestBackend renders for the pane and form.
    (`exec` sessions are holders); `forwards.*` API, forwards survive closing
    the TUI and are holders. Remove the per-command bridge code.
 9. **`devsandbox api --stdio`** relay, npm wrapper (`inbox`, `instances`,
-   `forwards`) with generated types.
+   `forwards`) with hand-written types guarded by a Rust drift test
+   (`src/serve/dts.rs`; no codegen dependency).
 10. **`devsandbox serve install|uninstall`** (systemd user unit,
     LaunchAgent), implies keep-alive.
+
+**Follow-ups agreed after step 10 (2026-10-06):**
+
+10a. **Per-user global config** `<data-dir>/devsandbox/daemon.config.toml`
+     (next to `state.toml`; `$XDG_DATA_HOME` or `~/.local/share`) with
+     `[serve] keep-alive = true`, read by `devsandbox serve`.
+10b. **Upgrades keep the installed unit.** A newer client that triggers a
+     handoff while a unit is installed rewrites the unit to point at its own
+     binary (same captured env as `serve install`) and restarts it through
+     the manager, instead of spawning an unmanaged daemon. Newest binary
+     always wins, dev builds included (re-run `serve install` from the binary
+     you want to keep).
+10c. **Ad-hoc forwards persist** in `<data-dir>/devsandbox/forwards.toml`, so
+     a successor daemon (handoff, restart, boot) recreates them on their host
+     ports; `forwards.rm` removes them.
+10d. **Docs: future work.** The TUI still collects its own instance snapshot
+     (not `instances.list`); instances with `forwardPorts` hold the daemon
+     forever. Both recorded in `docs/serve.md` as things to revisit.
 
 **Content model:**
 
