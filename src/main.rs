@@ -238,9 +238,12 @@ enum Command {
     ///
     /// Plumbing: commands start it on demand, detached, and it exits after
     /// 10 minutes without clients. Exits at once (status 0) when one is
-    /// already running.
+    /// already running. `serve install` starts it at login instead.
     #[cfg(unix)]
+    #[command(args_conflicts_with_subcommands = true)]
     Serve {
+        #[command(subcommand)]
+        cmd: Option<ServeCommand>,
         /// Never exit for idleness
         #[arg(long)]
         keep_alive: bool,
@@ -262,6 +265,16 @@ enum Command {
         #[arg(long, default_value = "api")]
         client: String,
     },
+}
+
+#[cfg(unix)]
+#[derive(Subcommand)]
+enum ServeCommand {
+    /// Start the daemon at login, keep-alive: a systemd user unit (Linux) or
+    /// a LaunchAgent (macOS). Run again to refresh its PATH and runtime env
+    Install,
+    /// Stop the daemon `serve install` manages and remove its unit
+    Uninstall,
 }
 
 #[derive(Subcommand)]
@@ -371,7 +384,11 @@ fn main() -> Result<()> {
             }
         }
         #[cfg(unix)]
-        Command::Serve { keep_alive, socket_dir } => serve::daemon::serve(socket_dir, keep_alive),
+        Command::Serve { cmd, keep_alive, socket_dir } => match cmd {
+            None => serve::daemon::serve(socket_dir, keep_alive),
+            Some(ServeCommand::Install) => serve::install::install_cli(),
+            Some(ServeCommand::Uninstall) => serve::install::uninstall_cli(),
+        },
         #[cfg(unix)]
         Command::Api { stdio: _, client } => std::process::exit(serve::relay::stdio(&client)?),
     }

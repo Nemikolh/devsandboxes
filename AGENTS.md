@@ -69,6 +69,9 @@ git worktrees so working trees are never shared.
   `relay.rs` is `devsandbox api --stdio` (byte relay stdin/stdout ↔ socket,
   what the npm `connect()` spawns); `dts.rs` (test-only) checks the wire
   structs against the hand-written `npm/devsandboxes/index.d.ts`.
+  `install.rs` is `serve install|uninstall` (systemd user unit / LaunchAgent:
+  pure render fns, manager calls through an injected runner; `shutdown`
+  stops a running daemon first).
 - `src/runtime/` — backend abstraction over docker/podman/Apple container.
 - `devsbd/` — static in-container helper (workspace member), built by
   `scripts/build-devsbd.sh` and embedded by `build.rs`; `src/devsbd.rs` holds

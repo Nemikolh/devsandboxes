@@ -6,16 +6,16 @@ keeps working with the dashboard closed. Design and roadmap:
 `docs/inbox-redesign.md`, "Host daemon". Unix only; the command doesn't
 exist on Windows.
 
-This page covers what exists today (steps 4-9 of that plan): the socket,
+This page covers what exists today (steps 4-10 of that plan): the socket,
 start, handoff, idle exit, the bridges (the ssh-agent relay included), the
-port forwards and the startup autostart pass. The
+port forwards, the startup autostart pass and boot start. The
 API on the socket has its own page, `docs/api.md`. Marked below is what
 later steps add.
 
 Code: `src/serve/` (`endpoint.rs` paths + bind/connect/accept, `daemon.rs`,
 `host.rs` bridges + autostart, `forwards.rs` port forwards, `api.rs`
-methods, `client.rs`, `relay.rs` the `api --stdio` relay, `idle.rs`,
-`proto.rs`).
+methods, `client.rs`, `relay.rs` the `api --stdio` relay, `install.rs`
+`serve install|uninstall`, `idle.rs`, `proto.rs`).
 
 ## Paths and permissions
 
@@ -66,7 +66,9 @@ doesn't use the daemon).
 The daemon inherits the environment of the process that started it: the
 runtime choice (`DEVSANDBOX_RUNTIME`), `SSH_AUTH_SOCK` (the agent its bridges
 relay until a client reports one, see *Bridges*), `DISPLAY` /
-`DBUS_SESSION_BUS_ADDRESS` (popups), `XDG_*`.
+`DBUS_SESSION_BUS_ADDRESS` (popups), `XDG_*`. A daemon the service manager
+starts has the manager's environment plus what `serve install` captured
+instead (see *Boot start*).
 
 ## Bridges
 
@@ -183,13 +185,86 @@ restarts them on its first poll. Ad-hoc forwards are lost on a handoff
 autostart pass is waited for.
 
 `--keep-alive` disables the idle exit. A `serve.keep-alive` setting in a
-global config is planned but there's no global config yet; `devsandbox serve
-install` (step 10, systemd user unit / LaunchAgent) will imply keep-alive.
+global config is planned but there's no global config yet; the unit
+`devsandbox serve install` writes passes `--keep-alive` (*Boot start*).
+
+Exiting on a `shutdown` request (`docs/api.md`) is the same drain, with
+`closing` `"reason":"shutdown"`.
+
+## Boot start
+
+Opt-in: `devsandbox serve install` hands the daemon to the user's service
+manager, so it runs from login without any devsandbox command. That's what
+dispatcher / inbox containers the runtime restarts by itself
+(`autostart = "runtime"`) need: a container can't start a host process, so
+without it they wait (exit 75, retrying) until the first `devsandbox`
+command. It's a *user* service: it starts when the user's session (systemd
+user manager / launchd `gui` domain) does, i.e. at login; on Linux,
+`loginctl enable-linger` makes that boot, and `serve install` doesn't do it
+for you.
+
+| | unit file | manager calls |
+|---|---|---|
+| Linux | `$XDG_CONFIG_HOME/systemd/user/devsandbox.service`, else `~/.config/systemd/user/` | `systemctl --user daemon-reload`, `enable devsandbox.service`, `restart devsandbox.service` |
+| macOS | `~/Library/LaunchAgents/dev.devsandbox.serve.plist` (label `dev.devsandbox.serve`) | `launchctl bootout gui/<uid>/dev.devsandbox.serve` (failure ignored), `launchctl bootstrap gui/<uid> <plist>` (retried up to 3 times) |
+
+Other unix systems get an error. The unit runs the installing binary's
+absolute, symlink-resolved path with `serve --keep-alive --socket-dir
+<dir>`, the socket dir resolved at install time, and appends stdout and
+stderr to `serve.log` (systemd `StandardOutput=append:`, launchd
+`StandardOutPath`).
+
+**Captured environment.** systemd and launchd start services with a
+minimal `PATH`, so the unit carries, as set (and non-empty) when you ran
+`install`: `PATH`, `DEVSANDBOX_RUNTIME`, `DOCKER_HOST`, `DOCKER_CONTEXT`,
+`CONTAINER_HOST`, `XDG_DATA_HOME`, `XDG_STATE_HOME` (the last two keep the
+managed daemon on the same `state.toml`, `inbox.toml` and `serve.log` as
+your shell's commands). Not `SSH_AUTH_SOCK`: it rotates, and clients report
+theirs (`bridges.ensure`, *Bridges*). Not `DISPLAY` either: popups from a
+managed daemon need the manager to have it (`systemctl --user
+import-environment DISPLAY`). **Run `serve install` again** after changing
+`PATH`, the runtime or its context, or the binary's location (a package
+manager upgrade that moves the resolved path, e.g. Homebrew's versioned
+`Cellar` dir, breaks the unit until you do).
+
+**Install steps.** Write the unit (creating its dir and the `serve.log`
+dir). If a daemon answers on the socket, managed or started on demand, send
+it `shutdown` and wait (up to 10 s) until nothing answers, so the manager's
+daemon can bind (an older daemon already hands off on the hello; one that
+answers `shutdown` with an error is reported: stop it, run `install`
+again). Then the manager calls above, then wait (up to 5 s)
+for a daemon to answer and print where the unit is. Not answering in time,
+or a manager call failing, is an error naming the unit file it wrote.
+Running `install` again rewrites the unit and restarts the daemon.
+
+**Restart policy.** `Restart=on-failure` (`RestartSec=5`) /
+`KeepAlive {SuccessfulExit false}` + `RunAtLoad`: a crash restarts it, a
+clean exit doesn't. Deliberately: a version handoff exits 0, and an
+`always` policy would respawn the stale binary against the newer daemon in
+a loop. So would a manager-started daemon finding another one already
+answering (it exits 0 at once, *Start*).
+
+**Handoff with a managed daemon.** When a newer CLI connects (an upgrade, a
+rebuilt dev binary), the managed daemon hands off as usual and exits 0; the
+newer client starts its own daemon *on demand*: unmanaged, without
+`--keep-alive`, so it idles out like any other. The unit stays stopped
+(systemd shows it inactive, not failed) until the next login or
+`devsandbox serve install`, which also points the unit at the new binary.
+Run `install` after every upgrade.
+
+**Uninstall.** `devsandbox serve uninstall`: on Linux `systemctl --user
+disable --now devsandbox.service`, remove the file, `daemon-reload` (a
+failing `systemctl` is a warning; the file is removed anyway); on macOS
+`launchctl bootout gui/<uid>/dev.devsandbox.serve`, remove the plist. The
+manager stops its daemon with a signal, not the drain: clients see the
+connection drop without a `closing` notification, and reconnect starting
+one on demand. A daemon started on demand isn't touched. No unit file:
+one line saying it's not installed, exit 0.
 
 ## Log
 
 `serve.log` gets one timestamped line (`[<unix secs>] devsandbox serve: …`)
-at start (socket, pid, version, keep-alive), at a handoff request, when the
+at start (socket, pid, version, keep-alive), at a handoff or shutdown request, when the
 runtime stops or starts answering, at each forwards status line
 (`forwards: …`), and at exit; plus the autostart pass's own notes
 (untimestamped). It's appended to, never rotated.

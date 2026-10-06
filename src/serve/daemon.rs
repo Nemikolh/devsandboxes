@@ -2,9 +2,9 @@
 //! handoff and idle exit (docs/serve.md).
 //!
 //! Threading: the calling thread runs the accept loop, waking every [`TICK`]
-//! to re-check the idle countdown and the handoff flag; each connection gets
-//! its own thread reading JSON lines and answering them (the API methods are
-//! in `api.rs`). Exiting (idle or handoff) closes the listener and removes
+//! to re-check the idle countdown and the stop request (handoff, `shutdown`);
+//! each connection gets its own thread reading JSON lines and answering them
+//! (the API methods are in `api.rs`). Exiting (idle, handoff or shutdown) closes the listener and removes
 //! the socket first, sends subscribers a `closing` notification, then shuts
 //! down the read side of every connection, so idle ones end at once while a
 //! request in flight still writes its response, and waits up to
@@ -66,7 +66,7 @@ pub struct Options {
     pub version: Version,
     /// No idle exit. `serve.keep-alive = true` in a global config will set
     /// this too once one exists (there is none yet: config is per `-C` root,
-    /// the daemon per user); `serve install` (step 10) implies it.
+    /// the daemon per user); the unit `serve install` writes passes it.
     pub keep_alive: bool,
     /// [`idle::IDLE_TIMEOUT`] outside tests.
     pub idle_timeout: Duration,
@@ -92,6 +92,9 @@ pub enum Exit {
     Idle,
     /// A newer client asked; it starts the successor.
     Handoff,
+    /// A client sent `shutdown` (`serve install`, before the service manager
+    /// starts its own daemon).
+    Shutdown,
 }
 
 /// `devsandbox serve`: run the daemon in the foreground until it idles out or
@@ -107,6 +110,7 @@ pub fn serve(socket_dir: Option<PathBuf>, keep_alive: bool) -> Result<()> {
         Exit::AlreadyRunning => {}
         Exit::Idle => log("idle, exiting"),
         Exit::Handoff => log("handed off to a newer version, exiting"),
+        Exit::Shutdown => log("shutdown requested, exiting"),
     }
     Ok(())
 }
@@ -160,8 +164,8 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
     let watcher = Watcher::spawn(&shared, host.as_ref().map(Host::changes));
     let mut next_conn = 0u64;
     let exit = loop {
-        if shared.handoff.load(Ordering::SeqCst) {
-            break Exit::Handoff;
+        if let Some(exit) = *shared.stop.lock().unwrap() {
+            break exit;
         }
         let now = Instant::now();
         let holders = shared.holders(host.as_ref(), registry.as_ref());
@@ -186,14 +190,15 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
         }
     };
 
-    // Stop accepting before anything else, then release the handoff replies:
-    // once a newer client reads `handoff`, nothing answers on the socket, so
-    // the successor it spawns waits for this lock instead of seeing a live
-    // daemon and giving up.
+    // Stop accepting before anything else, then release the handoff and
+    // shutdown replies: once a client reads one, nothing answers on the
+    // socket, so the successor it (or the service manager) starts waits for
+    // this lock instead of seeing a live daemon and giving up.
     listener.remove();
     shared.close();
     shared.publish_closing(match exit {
         Exit::Handoff => "handoff",
+        Exit::Shutdown => "shutdown",
         _ => "idle",
     });
     shared.drain(DRAIN_TIMEOUT);
@@ -251,9 +256,10 @@ struct Shared {
     inbox_generation: AtomicU64,
     /// The last moment a holder was seen.
     idle_since: Mutex<Instant>,
-    /// A newer client asked for a handoff.
-    handoff: AtomicBool,
-    /// The listener is gone; handoff replies may go out.
+    /// A client asked the daemon to exit: [`Exit::Handoff`] or
+    /// [`Exit::Shutdown`]. The first request wins.
+    stop: Mutex<Option<Exit>>,
+    /// The listener is gone; handoff and shutdown replies may go out.
     closed: (Mutex<bool>, Condvar),
     /// The host side's bridges, for `bridges.ensure`; unset without one.
     bridges: OnceLock<Waker>,
@@ -269,7 +275,7 @@ impl Shared {
             conns: Mutex::new(HashMap::new()),
             inbox_generation: AtomicU64::new(0),
             idle_since: Mutex::new(Instant::now()),
-            handoff: AtomicBool::new(false),
+            stop: Mutex::new(None),
             closed: (Mutex::new(false), Condvar::new()),
             bridges: OnceLock::new(),
             forwards: OnceLock::new(),
@@ -317,10 +323,11 @@ impl Shared {
         cvar.notify_all();
     }
 
-    /// Flag the handoff and wait (bounded) until the accept loop has closed
-    /// the listener; see the comment at the end of [`run`].
-    fn begin_handoff(&self) {
-        self.handoff.store(true, Ordering::SeqCst);
+    /// Ask the accept loop to exit with `exit` (a handoff or shutdown) and
+    /// wait (bounded) until it has closed the listener; see the comment at
+    /// the end of [`run`].
+    fn begin_stop(&self, exit: Exit) {
+        self.stop.lock().unwrap().get_or_insert(exit);
         let (lock, cvar) = &self.closed;
         let guard = lock.lock().unwrap();
         let _ = cvar.wait_timeout_while(guard, Duration::from_secs(2), |closed| !*closed);
@@ -355,7 +362,7 @@ impl Shared {
     }
 
     /// The reconnect hint: tell every subscriber the daemon is going away
-    /// (`reason`: `handoff` or `idle`), before the drain closes them.
+    /// (`reason`: `handoff`, `shutdown` or `idle`), before the drain closes them.
     fn publish_closing(&self, reason: &'static str) {
         for conn in self.conns.lock().unwrap().values() {
             conn.out.post(|p| {
@@ -607,6 +614,11 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Response {
         "hello" => return hello(req.id, req.params, shared, conn),
         "subscribe" => subscribe(req.params, conn, true),
         "unsubscribe" => subscribe(req.params, conn, false),
+        "shutdown" => {
+            log(&format!("{}: shutdown requested", conn.label()));
+            shared.begin_stop(Exit::Shutdown);
+            Ok(json!({ "ok": true }))
+        }
         method => {
             let bridges = shared.bridges.get().map(|w| w as &dyn api::Bridging);
             let forwards = shared.forwards.get().map(|h| h as &dyn api::Forwarding);
@@ -671,7 +683,7 @@ fn hello(id: Option<u64>, params: Value, shared: &Shared, conn: &mut ConnState) 
             "client `{}` has version {} build {}: handing off",
             params.client, client.semver, client.build
         ));
-        shared.begin_handoff();
+        shared.begin_stop(Exit::Handoff);
     }
     let result = HelloResult {
         version: shared.version.semver.clone(),
@@ -1032,6 +1044,31 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn shutdown_answers_drains_and_exits() {
+        let dir = scratch("shutdown");
+        let daemon = spawn_daemon(&dir, Options { keep_alive: true, ..opts(1, 50) });
+        let mut sub = connect(&dir);
+        sub.call("subscribe", json!({"topics": ["instances"]})).unwrap();
+        let (mut idle_client, _) = hello_at(&dir, &v(1));
+
+        let started = Instant::now();
+        let mut conn = connect(&dir);
+        let r = conn.call("shutdown", json!({})).unwrap();
+        assert_eq!(r.result, Some(json!({"ok": true})), "{r:?}");
+        // The answer goes out once nothing answers on the socket any more.
+        assert!(endpoint::connect(&dir).is_err());
+        let closing = wait_for(&mut sub, "closing");
+        assert_eq!(closing.params, json!({"reason": "shutdown"}));
+        assert_eq!(daemon.join().unwrap().unwrap(), Exit::Shutdown);
+        // Idle connections are closed, not waited out.
+        assert!(started.elapsed() < DRAIN_TIMEOUT);
+        let mut buf = [0u8; 1];
+        assert_eq!(idle_client.read(&mut buf).unwrap(), 0);
+        assert!(!endpoint::socket_path(&dir).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Every notification is an `ApiEvents` key in the npm typings, its
     /// params matching the interface it names (`serve::dts`).
     #[test]
@@ -1074,7 +1111,7 @@ pub(crate) mod tests {
         let _ = hello_at(&dir, &v(1));
         std::thread::sleep(Duration::from_millis(400));
         assert!(!daemon.is_finished(), "keep-alive daemon idled out");
-        // Stop it the only way there is: a handoff.
+        // Stop it with a handoff (`shutdown` is the other way, tested above).
         let (_c, h) = hello_at(&dir, &v(2));
         assert!(matches!(h, Hello::Handoff));
         assert_eq!(daemon.join().unwrap().unwrap(), Exit::Handoff);

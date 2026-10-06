@@ -178,6 +178,21 @@ fn readiness(result: &Value) -> Option<crate::devsbd::bridge::Readiness> {
     Some(crate::devsbd::bridge::Readiness { ready, error })
 }
 
+/// Connect to a daemon already running in `dir`, without the lazy start:
+/// `None` when nothing answers, or the one answering is exiting (a handoff,
+/// which this `version` may have just triggered). `timeout` bounds the hello.
+pub(crate) fn connect_running(dir: &Path, client: &str, version: &Version, timeout: Duration) -> Result<Option<Conn>> {
+    let Ok(mut stream) = endpoint::connect(dir) else { return Ok(None) };
+    stream.set_read_timeout(Some(timeout)).context("cannot set a read timeout")?;
+    match hello(&mut stream, version, client)? {
+        Hello::Ready(daemon) => {
+            stream.set_read_timeout(None).context("cannot clear the read timeout")?;
+            Ok(Some(Conn::new(stream, daemon)?))
+        }
+        Hello::Handoff | Hello::Closed => Ok(None),
+    }
+}
+
 /// [`connect`] with the version, timeout and spawner injectable for tests.
 ///
 /// Starts at most one daemon: when the connect fails, or when the daemon

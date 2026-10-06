@@ -480,7 +480,7 @@ export interface ForwardsStatus {
 
 /** `closing` params: the daemon is exiting; connect again (which starts a new one). */
 export interface Closing {
-  reason: 'handoff' | 'idle';
+  reason: 'handoff' | 'idle' | 'shutdown';
 }
 
 /** Any daemon notification, known or not (the `notification` event). */
@@ -527,6 +527,8 @@ export interface ApiMethods {
   'forwards.rm': { params: { id: number }; result: ForwardRemoved };
   subscribe: { params: { topics: ApiTopic[] }; result: OkResult };
   unsubscribe: { params: { topics: ApiTopic[] }; result: OkResult };
+  /** Stop the daemon (it drains, then exits); `devsandbox serve install` sends it. */
+  shutdown: { params: {}; result: OkResult };
 }
 
 /** `inbox.*` methods; mutations resolve once the store is written. */

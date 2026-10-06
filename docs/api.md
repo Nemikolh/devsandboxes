@@ -294,10 +294,24 @@ between.
 | `instances.changed` | `instances` | `{}` | the running containers changed (the daemon polls every 5 s) |
 | `forwards.changed` | `forwards` | `{}` | any forward's row changed (added, stopped, state, process, connections; checked every 0.5 s), in any config root |
 | `forwards.status` | `forwards` | `{"line": "…"}` | a one-line status: a configured forward started (`forwarding 127.0.0.1:3000 -> api:3000`) or failed, a connection note (`3000: connection refused`). Latest only, like `inbox.shown` |
-| `closing` | any | `{"reason": "handoff" \| "idle"}` | the daemon is exiting; reconnect (which starts a new one) |
+| `closing` | any | `{"reason": "handoff" \| "idle" \| "shutdown"}` | the daemon is exiting; reconnect (which starts a new one) |
 
 Notifications coalesce: many changes before one is written are one line.
 A client that doesn't read its socket for 5 s is disconnected.
+
+## Daemon
+
+### `shutdown`
+
+Params: `{}`. Result: `{"ok": true}`. The daemon stops accepting and
+removes `serve.sock` before it answers, then exits the way a handoff does
+(`docs/serve.md`, *Version handoff*): subscribers get `closing` with
+`"reason": "shutdown"`, idle connections are closed, in-flight requests
+finish (up to 5 s), bridges and forwards stop, the start lock goes last.
+The next client that connects starts a new daemon. `devsandbox serve
+install` sends it so the service manager's daemon can take over
+(`docs/serve.md`, *Boot start*). A daemon older than this method answers
+`unknown-method`.
 
 ## Holders
 
