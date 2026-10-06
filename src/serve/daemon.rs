@@ -30,7 +30,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::Shutdown;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -39,7 +39,7 @@ use serde_json::{Value, json};
 
 use super::api::{self, Topic};
 use super::endpoint::{self, Listener, Stream};
-use super::host::Host;
+use super::host::{Host, Waker};
 use super::idle::{self, Decision, Holders};
 use super::proto::{self, HelloParams, HelloResult, Notification, Request, Response, Version};
 use crate::inbox::ops;
@@ -134,6 +134,9 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
         let shared = Arc::clone(&shared);
         Host::start(log, Box::new(move |instance: &str, line: String| shared.publish_shown(instance, line)))
     });
+    if let Some(host) = &host {
+        let _ = shared.bridges.set(host.waker());
+    }
     let watcher = Watcher::spawn(&shared, host.as_ref().map(Host::changes));
     let mut next_conn = 0u64;
     let exit = loop {
@@ -229,6 +232,8 @@ struct Shared {
     handoff: AtomicBool,
     /// The listener is gone; handoff replies may go out.
     closed: (Mutex<bool>, Condvar),
+    /// The host side's bridges, for `bridges.ensure`; unset without one.
+    bridges: OnceLock<Waker>,
 }
 
 impl Shared {
@@ -241,6 +246,7 @@ impl Shared {
             idle_since: Mutex::new(Instant::now()),
             handoff: AtomicBool::new(false),
             closed: (Mutex::new(false), Condvar::new()),
+            bridges: OnceLock::new(),
         }
     }
 
@@ -549,7 +555,10 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Response {
         "hello" => return hello(req.id, req.params, shared, conn),
         "subscribe" => subscribe(req.params, conn, true),
         "unsubscribe" => subscribe(req.params, conn, false),
-        method => api::call(method, req.params, &api::Ctx { inbox: &shared.inbox }),
+        method => {
+            let bridges = shared.bridges.get().map(|w| w as &dyn api::Bridging);
+            api::call(method, req.params, &api::Ctx { inbox: &shared.inbox, bridges })
+        }
     };
     match answer {
         Ok(result) => Response::ok(req.id, result),

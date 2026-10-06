@@ -1,6 +1,6 @@
 //! The client side: connect to the daemon, starting it when nothing answers
 //! (the lazy start), and handle a version handoff. Commands that need live
-//! features call [`connect`] (steps 5-8 wire them in).
+//! features call [`connect`] ([`ensure_bridge`] for the ssh-agent relay).
 
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
@@ -141,6 +141,41 @@ pub fn ensure_running(client: &str) {
     if let Err(e) = endpoint::socket_dir().and_then(|dir| connect(&dir, client)) {
         eprintln!("warning: devsandbox serve: {e:#}");
     }
+}
+
+/// Ask the daemon (lazy start, as `cli`) for instance `instance`'s bridge
+/// (`bridges.ensure`, docs/api.md), reporting `agent`, the caller's own
+/// `SSH_AUTH_SOCK`. Without `wait` it returns once the daemon took the
+/// request; with it, once the bridge's handshake is decided or `wait` ran out,
+/// with the [`Readiness`](crate::devsbd::bridge::Readiness) (`None` from a
+/// daemon too old to wait). Hold the returned connection while the command
+/// that needs the relay runs: it makes the command a holder.
+pub fn ensure_bridge(
+    instance: &str,
+    agent: Option<&Path>,
+    wait: Option<Duration>,
+) -> Result<(Conn, Option<crate::devsbd::bridge::Readiness>)> {
+    let mut conn = connect(&endpoint::socket_dir()?, "cli")?;
+    // A non-UTF-8 path can't go on the wire: the daemon falls back to its own.
+    let agent = agent.and_then(Path::to_str);
+    let mut params = serde_json::json!({ "instance": instance, "agent": agent });
+    if let Some(wait) = wait {
+        params["wait"] = wait.as_secs_f64().into();
+    }
+    let r = conn.call("bridges.ensure", params)?;
+    if let Some(e) = r.error {
+        bail!("devsandbox serve: {} ({})", e.message, e.code);
+    }
+    let ready = readiness(&r.result.unwrap_or(Value::Null));
+    Ok((conn, ready))
+}
+
+/// A waited `bridges.ensure` result's readiness; `None` without `ready` (a
+/// daemon that predates `wait` answers a plain `{"ok":true}`).
+fn readiness(result: &Value) -> Option<crate::devsbd::bridge::Readiness> {
+    let ready = result.get("ready")?.as_bool()?;
+    let error = result.get("error").and_then(Value::as_str).map(str::to_string);
+    Some(crate::devsbd::bridge::Readiness { ready, error })
 }
 
 /// [`connect`] with the version, timeout and spawner injectable for tests.
@@ -313,6 +348,20 @@ mod tests {
         assert!(started.elapsed() >= Duration::from_millis(300));
         assert_eq!(count.load(Ordering::SeqCst), 1, "spawned more than once");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn waited_ensure_results_parse() {
+        use crate::devsbd::bridge::Readiness;
+        assert_eq!(readiness(&serde_json::json!({"ok": true})), None, "older daemon");
+        assert_eq!(
+            readiness(&serde_json::json!({"ok": true, "ready": true, "error": null})),
+            Some(Readiness { ready: true, error: None })
+        );
+        assert_eq!(
+            readiness(&serde_json::json!({"ok": true, "ready": false, "error": "outdated"})),
+            Some(Readiness { ready: false, error: Some("outdated".into()) })
+        );
     }
 
     #[test]

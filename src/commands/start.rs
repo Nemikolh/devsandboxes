@@ -99,12 +99,11 @@ pub(crate) fn start_instance(dir: &Path, key: &str, info: &Instance) -> Result<(
                 }
             };
             if let Some(cmd) = post_start {
-                // Hold one bridge (relay mode) for the command, report its
-                // failure after.
+                // The daemon's bridge (relay mode) up before the command (it
+                // may clone over ssh at once), held while it runs.
                 #[cfg(unix)]
-                let bridge = (crate::devsbd::relay_mode(&fresh) && host_agent)
-                    .then(|| crate::devsbd::bridge::spawn(&fresh))
-                    .flatten();
+                let _relay = (crate::devsbd::relay_mode(&fresh) && host_agent)
+                    .then(|| crate::commands::exec::AgentRelay::ready(key, &info.container));
                 run::exec_lifecycle(
                     &info.container,
                     &info.workspace,
@@ -114,12 +113,6 @@ pub(crate) fn start_instance(dir: &Path, key: &str, info: &Instance) -> Result<(
                     cmd,
                 )
                 .context("postStartCommand failed")?;
-                #[cfg(unix)]
-                if let Some(Err(e)) =
-                    bridge.as_ref().and_then(|b| b.outcome(std::time::Duration::ZERO))
-                {
-                    eprintln!("note: ssh-agent relay unavailable in `{}`: {e}", info.container);
-                }
             }
         }
         None => {

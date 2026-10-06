@@ -1,7 +1,8 @@
 //! Host half of the ssh-agent relay (docs/sandbox-helper.md): runs
 //! `exec -i <c> devsbd bridge` and serves the streams it carries, connecting
-//! each `Open` to the host agent. Owners: CLI `exec` (for the command's
-//! lifetime) and `devsandbox serve` (one per running instance, docs/serve.md).
+//! each `Open` to the host agent. Owners: `devsandbox serve` (one per running
+//! instance, docs/serve.md; CLI commands ask it through `bridges.ensure`) and
+//! the forwarder engine (`spawn_for`).
 //! The daemon's bridges also take the container's `devsbd notify` records and
 //! serve its `devsbd ensure|ls|stop|rm` control requests (docs/automations.md).
 
@@ -9,10 +10,10 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::mux::{self, Conn, Mux};
@@ -120,17 +121,71 @@ impl Drop for Bridge {
     }
 }
 
-/// The host agent socket, read per stream so agent rotation needs no restart.
-/// `$SSH_AUTH_SOCK` set and its path present on the host; the existence check
-/// also gates whether a bridge is worth spawning (`has_host_agent`).
+/// How many client-reported agents [`AgentCandidates`] remembers.
+const MAX_AGENTS: usize = 8;
+
+/// The host agent sockets this process knows of, most recent first: what
+/// clients reported through `bridges.ensure` (docs/api.md). Only the daemon
+/// gets reports; everywhere else the list stays empty and the own
+/// `$SSH_AUTH_SOCK`, the last fallback of [`pick`](Self::pick), is all there
+/// is. This is what keeps the daemon's relay working when the agent it
+/// inherited is gone or rotated (a new `ssh -A` session): the next client
+/// command brings the live one.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct AgentCandidates {
+    recent: Vec<PathBuf>,
+}
+
+impl AgentCandidates {
+    /// `path` becomes the most recent; a repeat moves to the front; the
+    /// oldest past [`MAX_AGENTS`] is forgotten.
+    pub fn report(&mut self, path: PathBuf) {
+        self.recent.retain(|p| *p != path);
+        self.recent.insert(0, path);
+        self.recent.truncate(MAX_AGENTS);
+    }
+
+    /// The first candidate `live` accepts, the reported ones (newest first)
+    /// before `fallback` (the process's own `$SSH_AUTH_SOCK`).
+    pub fn pick(&self, fallback: Option<PathBuf>, live: impl Fn(&Path) -> bool) -> Option<PathBuf> {
+        self.recent.iter().cloned().chain(fallback).find(|p| live(p))
+    }
+}
+
+static AGENTS: Mutex<AgentCandidates> = Mutex::new(AgentCandidates { recent: Vec::new() });
+
+/// Record a client's agent socket (`bridges.ensure`) for every bridge of this
+/// process; see [`AgentCandidates`].
+pub fn report_agent(path: PathBuf) {
+    AGENTS.lock().unwrap_or_else(|e| e.into_inner()).report(path);
+}
+
+/// This process's own `$SSH_AUTH_SOCK`, unchecked: what a client reports to
+/// the daemon.
+pub fn own_agent() -> Option<PathBuf> {
+    std::env::var_os("SSH_AUTH_SOCK").filter(|s| !s.is_empty()).map(PathBuf::from)
+}
+
+/// A socket that accepts a connection right now: a leftover socket file whose
+/// agent died fails this, unlike an existence check.
+fn agent_live(path: &Path) -> bool {
+    UnixStream::connect(path).is_ok()
+}
+
+/// The host agent socket, chosen per stream so agent rotation needs no
+/// restart: the first live [`AgentCandidates`] entry, else `$SSH_AUTH_SOCK`
+/// when live. Also gates whether a bridge is worth spawning
+/// (`has_host_agent`).
 fn host_agent() -> Option<PathBuf> {
-    let sock = PathBuf::from(std::env::var_os("SSH_AUTH_SOCK")?);
-    std::fs::metadata(&sock).is_ok().then_some(sock)
+    let candidates = AGENTS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    candidates.pick(own_agent(), agent_live)
 }
 
 /// Whether the host has a usable ssh-agent right now. Gates bridge spawning
-/// (`exec_status`, `Bridges::reconcile`) and `SSH_AUTH_SOCK` injection: with no
-/// agent a bridge and the env var only cost an extra `exec` that can't help.
+/// (`Bridges::reconcile`, the CLI's `bridges.ensure`) and `SSH_AUTH_SOCK`
+/// injection: with no agent a bridge and the env var only cost an extra
+/// `exec` that can't help. In the daemon it counts client-reported agents, so
+/// a report replaces its agent-less bridges (see `reconcile`).
 pub fn has_host_agent() -> bool {
     host_agent().is_some()
 }
@@ -201,7 +256,7 @@ impl Drop for HandlerSlot {
 
 /// The caps a host bridge advertises in its `Caps` frame: `SSH_AGENT` only
 /// with an agent socket, `NOTIFY` and `CONTROL` only with a sink (the daemon's
-/// bridges) — so short-lived sink-less bridges (`exec`, lifecycle, forwards)
+/// bridges) — so short-lived sink-less bridges (forwards)
 /// never take notify streams, which would drop the records with them, nor
 /// control requests, which must outlive a one-shot command. Every such bridge
 /// advertises `CONTROL`, dispatcher or not: `dispatch::handle` re-checks the
@@ -359,17 +414,16 @@ fn handle_notify(mut conn: UnixStream, to: &Services) {
     }
 }
 
-/// Start a bridge for `info` without waiting for its handshake (see
-/// `outcome`). Fully quiet (stderr captured), since the TUI owns the
-/// screen; `None` only when the `exec` can't even be spawned.
-pub fn spawn(info: &Instance) -> Option<Bridge> {
-    let hash = info.devsbd_arch.and_then(super::hash).unwrap_or_default();
-    spawn_with(&info.container, hash, Some(host_agent), None)
-}
-
 /// A `Bridges` bridge for instance `key`: the host agent only when
-/// `with_agent`, notify + control only when `sink` is set.
-fn spawn_managed(key: &str, info: &Instance, with_agent: bool, sink: Option<&Sink>) -> Option<Bridge> {
+/// `with_agent`, notify + control only when `sink` is set. `observe` gets its
+/// handshake outcome and its end (see [`BridgeBoard`]).
+fn spawn_managed(
+    key: &str,
+    info: &Instance,
+    with_agent: bool,
+    sink: Option<&Sink>,
+    observe: Observer,
+) -> Option<Bridge> {
     let hash = info.devsbd_arch.and_then(super::hash).unwrap_or_default();
     let notify = sink.map(|s| {
         Services::new(
@@ -380,10 +434,10 @@ fn spawn_managed(key: &str, info: &Instance, with_agent: bool, sink: Option<&Sin
         )
     });
     if with_agent {
-        spawn_with(&info.container, hash, Some(host_agent), notify)
+        spawn_observed(&info.container, hash, Some(host_agent), notify, Some(observe))
     } else {
         let none: Option<fn() -> Option<PathBuf>> = None;
-        spawn_with(&info.container, hash, none, notify)
+        spawn_observed(&info.container, hash, none, notify, Some(observe))
     }
 }
 
@@ -402,8 +456,10 @@ pub fn spawn_for(container: &str, hash: &str, with_agent: bool) -> Option<Bridge
     }
 }
 
-/// Start a bridge. `agent` is the host ssh-agent socket provider, or `None` for
-/// an agent-less bridge (a `devsandbox port` forward): it advertises no
+/// Start a bridge without waiting for its handshake (see `outcome`). Fully
+/// quiet (stderr captured), since the TUI owns the screen; `None` only when
+/// the `exec` can't even be spawned. `agent` is the host ssh-agent socket
+/// provider, or `None` for an agent-less bridge (a `devsandbox port` forward): it advertises no
 /// `SSH_AGENT` cap and refuses agent `Open`s, so the daemon won't route agent
 /// clients to it and it can't steal ssh from an older agent bridge. `notify`
 /// set → the bridge advertises `NOTIFY` + `CONTROL` and takes the daemon's
@@ -414,6 +470,27 @@ fn spawn_with(
     agent: Option<impl Fn() -> Option<PathBuf> + Send + 'static>,
     notify: Option<Services>,
 ) -> Option<Bridge> {
+    spawn_observed(container, hash, agent, notify, None)
+}
+
+/// Gets a bridge's status changes from its handshake thread: `Ready` or
+/// `Failed` once the handshake is decided (after `peer_caps` is published),
+/// then `Failed` again when a healthy bridge ends. Must return at once.
+type Observer = Box<dyn Fn(BridgeStatus) + Send>;
+
+/// [`spawn_with`], plus an [`Observer`] (the daemon's [`BridgeBoard`]).
+fn spawn_observed(
+    container: &str,
+    hash: &str,
+    agent: Option<impl Fn() -> Option<PathBuf> + Send + 'static>,
+    notify: Option<Services>,
+    observe: Option<Observer>,
+) -> Option<Bridge> {
+    let observe = move |s: BridgeStatus| {
+        if let Some(o) = &observe {
+            o(s)
+        }
+    };
     let mut child = Command::new(backend().bin())
         .args(["exec", "-i", "-u", "root", container, BIN, "bridge"])
         .stdin(Stdio::piped())
@@ -496,9 +573,13 @@ fn spawn_with(
         let ok = result.is_ok();
         // Stop the watchdog from racing a kill against a healthy bridge.
         bridged.store(ok, Ordering::Relaxed);
-        if !ok {
+        if let Err(e) = &result {
+            let why = e.clone();
             let _ = tx.send(result);
             finished.store(true, Ordering::Relaxed);
+            // After `done`: a reconcile that sees the failure also sees the
+            // bridge dead, so an urgent one respawns it.
+            observe(BridgeStatus::Failed(why));
             return;
         }
         {
@@ -515,6 +596,7 @@ fn spawn_with(
             // result, so a caller that sees `outcome() == Ok` can rely on
             // `peer_caps()` / `connect()` being ready (no publish race).
             let _ = hs_forward.set(Forward { mux: Arc::clone(&mux), peer_caps: daemon_caps });
+            observe(BridgeStatus::Ready);
             let _ = tx.send(result);
             // Keepalive: a wedged daemon (stopped reading) is caught by inbound
             // silence; `on_dead` kills the child, ending the `serve` read below
@@ -526,6 +608,7 @@ fn spawn_with(
             mux.serve(stdout, move |_, channel| open_stream(channel, agent.as_ref(), notify.as_ref()));
         }
         finished.store(true, Ordering::Relaxed);
+        observe(BridgeStatus::Failed("the bridge ended (container stopped or helper gone)".into()));
     });
     Some(Bridge { child, done, mismatch, handshake, forward, container: bridge_container })
 }
@@ -580,10 +663,13 @@ enum Retry {
 /// without a container runtime. `entry` is the current live bridge's state, or
 /// `None` when there is none: `(done, mismatch, since_spawn)`. A dead bridge
 /// is retried after `RETRY`, or `MISMATCH_RETRY` when it died on a version
-/// mismatch (a restart, which drops the entry, retries at once).
-fn retry_decision(entry: Option<(bool, bool, Duration)>) -> Retry {
+/// mismatch (a restart, which drops the entry, retries at once). `urgent`: a
+/// client just asked for this container's bridge (`bridges.ensure`, e.g. right
+/// after `start` rewrote its helper), so a dead one is retried at once.
+fn retry_decision(entry: Option<(bool, bool, Duration)>, urgent: bool) -> Retry {
     match entry {
         None => Retry::Spawn,
+        Some((true, ..)) if urgent => Retry::Respawn,
         Some((true, mismatch, since)) => {
             let gap = if mismatch { MISMATCH_RETRY } else { RETRY };
             if since >= gap { Retry::Respawn } else { Retry::Keep }
@@ -601,6 +687,145 @@ fn wanted(helper: bool, relay: bool, host_agent: bool, has_sink: bool) -> Option
     (with_agent || (has_sink && helper)).then_some(with_agent)
 }
 
+/// Where one daemon bridge stands, as [`BridgeBoard`] shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BridgeStatus {
+    /// Spawned, handshake not decided yet.
+    Pending,
+    /// Handshake done (`peer_caps` known), still running.
+    Ready,
+    /// The handshake failed (its message, e.g. a helper version mismatch),
+    /// the `exec` couldn't start, or a healthy bridge ended.
+    Failed(String),
+}
+
+/// What `bridges.ensure` with `wait` answers: whether the container's
+/// bridge is up, else why not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Readiness {
+    pub ready: bool,
+    pub error: Option<String>,
+}
+
+impl Readiness {
+    fn ready() -> Readiness {
+        Readiness { ready: true, error: None }
+    }
+
+    fn not(why: impl Into<String>) -> Readiness {
+        Readiness { ready: false, error: Some(why.into()) }
+    }
+}
+
+/// The board's data: each daemon bridge's status by container (tagged with a
+/// spawn id so a replaced bridge's late news can't overwrite its
+/// successor's), and the newest `bridges.ensure` ticket the worker has
+/// reconciled for.
+#[derive(Debug, Default)]
+struct Board {
+    handled: u64,
+    next_id: u64,
+    bridges: HashMap<String, (u64, BridgeStatus)>,
+}
+
+/// The daemon bridges' statuses, shared by the worker (spawns, removals,
+/// handled tickets), each bridge's handshake thread (its outcome and end) and
+/// the API's `bridges.ensure` (waits on it). Every writer only takes the lock
+/// briefly, so a waiting handler never holds up the worker. Cloneable.
+#[derive(Clone, Default)]
+pub struct BridgeBoard {
+    inner: Arc<(Mutex<Board>, Condvar)>,
+    tickets: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl BridgeBoard {
+    /// A new `bridges.ensure` ticket, to queue with its urgent container.
+    pub fn ticket(&self) -> u64 {
+        self.tickets.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    fn update(&self, f: impl FnOnce(&mut Board)) {
+        let (lock, cvar) = &*self.inner;
+        f(&mut lock.lock().unwrap_or_else(|e| e.into_inner()));
+        cvar.notify_all();
+    }
+
+    /// `container` gets a fresh bridge: `Pending`, and the [`Observer`] its
+    /// handshake thread reports through.
+    fn spawning(&self, container: &str) -> Observer {
+        let mut id = 0;
+        self.update(|b| {
+            b.next_id += 1;
+            id = b.next_id;
+            b.bridges.insert(container.to_string(), (id, BridgeStatus::Pending));
+        });
+        let (board, container) = (self.clone(), container.to_string());
+        Box::new(move |status| {
+            board.update(|b| {
+                if let Some(entry) = b.bridges.get_mut(&container).filter(|(at, _)| *at == id) {
+                    entry.1 = status;
+                }
+            })
+        })
+    }
+
+    fn set(&self, container: &str, status: BridgeStatus) {
+        self.update(|b| {
+            b.next_id += 1;
+            let id = b.next_id;
+            b.bridges.insert(container.to_string(), (id, status));
+        });
+    }
+
+    /// Forget every container but `keep` (their bridges were dropped).
+    fn retain(&self, keep: &[String]) {
+        self.update(|b| b.bridges.retain(|c, _| keep.contains(c)));
+    }
+
+    /// The worker reconciled with every ticket up to `ticket`.
+    fn handled(&self, ticket: u64) {
+        self.update(|b| b.handled = b.handled.max(ticket));
+    }
+
+    /// Wait up to `timeout` for `container`'s bridge as of ticket `ticket`
+    /// (see [`verdict`]); past it, why it isn't ready ([`timed_out`]).
+    pub fn wait(&self, container: &str, ticket: u64, timeout: Duration) -> Readiness {
+        let (lock, cvar) = &*self.inner;
+        let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let (guard, _) = cvar
+            .wait_timeout_while(guard, timeout, |b| verdict(b, container, ticket).is_none())
+            .unwrap_or_else(|e| e.into_inner());
+        verdict(&guard, container, ticket).unwrap_or_else(|| timed_out(&guard, ticket, timeout))
+    }
+}
+
+/// `container`'s readiness once it's decided, `None` while still waiting:
+/// until the worker has reconciled with `ticket` (so an urgent respawn of a
+/// dead bridge has happened), then until its bridge's handshake is decided.
+/// No bridge after that reconcile: the daemon doesn't bridge it.
+fn verdict(b: &Board, container: &str, ticket: u64) -> Option<Readiness> {
+    if b.handled < ticket {
+        return None;
+    }
+    match b.bridges.get(container).map(|(_, s)| s) {
+        None => Some(Readiness::not("the host daemon keeps no bridge for it (not running, or no helper)")),
+        Some(BridgeStatus::Pending) => None,
+        Some(BridgeStatus::Ready) => Some(Readiness::ready()),
+        Some(BridgeStatus::Failed(why)) => Some(Readiness::not(why.clone())),
+    }
+}
+
+/// Why a bridge isn't ready after waiting `waited` (only called while
+/// [`verdict`] is still `None`).
+fn timed_out(b: &Board, ticket: u64, waited: Duration) -> Readiness {
+    let secs = waited.as_secs_f64();
+    if b.handled < ticket {
+        Readiness::not(format!("the host daemon didn't get to it within {secs}s (container runtime slow?)"))
+    } else {
+        Readiness::not(format!("the helper handshake didn't finish within {secs}s"))
+    }
+}
+
 /// The daemon's set of bridges (`devsandbox serve`), reconciled against the
 /// running instances on each poll. Owned by a worker thread (`spawn_worker`).
 #[derive(Default)]
@@ -609,6 +834,8 @@ pub struct Bridges {
     live: HashMap<String, (Bridge, Instant, bool)>,
     // Set → bridges advertise `NOTIFY` and are kept even without a host agent.
     sink: Option<Sink>,
+    // Every live bridge's status, for `bridges.ensure` waits.
+    board: BridgeBoard,
 }
 
 impl Bridges {
@@ -622,13 +849,15 @@ impl Bridges {
     /// verbs. Keyed on spawns, not `is_mismatch`: a stale helper with the same
     /// protocol `VERSION` still bridges fine, it just lacks verbs. Spawns are
     /// rare (first sight, or a dead bridge's retry gap), so this is one extra
-    /// `exec` per spawn, not per snapshot.
-    pub fn reconcile(&mut self, running: &[&str]) {
+    /// `exec` per spawn, not per snapshot. `urgent` containers skip a dead
+    /// bridge's retry gap (`retry_decision`).
+    pub fn reconcile(&mut self, running: &[&str], urgent: &[String]) {
         self.live.retain(|c, _| running.contains(&c.as_str()));
         let host_agent = has_host_agent();
         // No host agent and no sink → nothing to relay; skip the per-instance `exec`.
         if !host_agent && self.sink.is_none() {
             self.live.clear();
+            self.board.retain(&[]);
             return;
         }
         let Ok(state) = State::load() else { return };
@@ -647,7 +876,7 @@ impl Bridges {
                 .get(&info.container)
                 .filter(|(.., agent)| *agent == with_agent)
                 .map(|(b, at, _)| (b.is_done(), b.is_mismatch(), at.elapsed()));
-            if retry_decision(entry) != Retry::Keep {
+            if retry_decision(entry, urgent.contains(&info.container)) != Retry::Keep {
                 self.live.remove(&info.container);
                 let healed;
                 let info = match helper.then(|| crate::devsbd::ensure_recorded(key, info, true)).flatten() {
@@ -660,16 +889,24 @@ impl Bridges {
                     // bridge's retry gap instead of re-running every snapshot.
                     _ => info,
                 };
-                if let Some(b) = spawn_managed(key, info, with_agent, self.sink.as_ref()) {
-                    self.live.insert(info.container.clone(), (b, Instant::now(), with_agent));
+                let observe = self.board.spawning(&info.container);
+                match spawn_managed(key, info, with_agent, self.sink.as_ref(), observe) {
+                    Some(b) => {
+                        self.live.insert(info.container.clone(), (b, Instant::now(), with_agent));
+                    }
+                    None => self.board.set(
+                        &info.container,
+                        BridgeStatus::Failed(format!("cannot run `{} exec` for the bridge", backend().bin())),
+                    ),
                 }
             }
         }
         self.live.retain(|c, _| keep.contains(c));
+        self.board.retain(&keep);
     }
 
-    /// Move a `Bridges` onto its own thread, fed running-container lists over an
-    /// mpsc. Reconcile (which does `State::load`, `exec` spawns and a helper
+    /// Move a `Bridges` onto its own thread, fed running-container lists (plus
+    /// the urgent containers, see `reconcile`) over an mpsc. Reconcile (which does `State::load`, `exec` spawns and a helper
     /// reinstall check before each one) never runs on the caller's thread; it
     /// just `send`s the owned list. Dropping the returned [`BridgeWorker`]
     /// closes the channel and joins the thread, which drops every live
@@ -683,7 +920,9 @@ impl Bridges {
     /// finally its status line ("<instance>: <msg>") goes to the sink's
     /// [`OnShown`], if any. A put that changed nothing produces neither, so a
     /// dispatcher re-asserting its threads is invisible.
-    pub fn spawn_worker(sink: Option<Option<OnShown>>) -> BridgeWorker {
+    /// `board` gets every bridge's status and, after each reconcile, the
+    /// newest ticket it covered (the `urgent` pairs' second half).
+    pub fn spawn_worker(sink: Option<Option<OnShown>>, board: BridgeBoard) -> BridgeWorker {
         let sink = sink.map(|on_shown| -> Sink {
             // One limiter for every bridge, keyed by instance inside.
             let limit = Mutex::new(super::desktop::RateLimit::default());
@@ -705,18 +944,24 @@ impl Bridges {
                 Ok(())
             })
         });
-        let (tx, rx) = mpsc::channel::<Vec<String>>();
+        let (tx, rx) = mpsc::channel::<(Vec<String>, Vec<(String, u64)>)>();
         let handle = std::thread::spawn(move || {
-            let mut bridges = Bridges { sink, ..Bridges::default() };
+            let mut bridges = Bridges { sink, board, ..Bridges::default() };
             // Block for the next list, then coalesce: drain everything already
-            // queued and reconcile only against the newest, so a burst of
-            // snapshots costs one reconcile.
-            while let Ok(mut running) = rx.recv() {
-                while let Ok(next) = rx.try_recv() {
+            // queued and reconcile only against the newest list (with every
+            // urgent container queued meanwhile), so a burst of snapshots
+            // costs one reconcile.
+            while let Ok((mut running, mut urgent)) = rx.recv() {
+                while let Ok((next, more)) = rx.try_recv() {
                     running = next;
+                    urgent.extend(more);
                 }
                 let refs: Vec<&str> = running.iter().map(String::as_str).collect();
-                bridges.reconcile(&refs);
+                let containers: Vec<String> = urgent.iter().map(|(c, _)| c.clone()).collect();
+                bridges.reconcile(&refs, &containers);
+                if let Some(ticket) = urgent.iter().map(|(_, t)| *t).max() {
+                    bridges.board.handled(ticket);
+                }
             }
             // Sender dropped: `bridges` drops here, killing every live bridge.
         });
@@ -749,16 +994,18 @@ fn apply_message(n: Notification) -> Result<Option<(String, crate::inbox::Shown)
 /// [`send`](Self::send); on drop the channel closes and the thread is joined,
 /// so all bridges are killed before the caller (the daemon) releases its lock.
 pub struct BridgeWorker {
-    tx: Option<mpsc::Sender<Vec<String>>>,
+    tx: Option<mpsc::Sender<(Vec<String>, Vec<(String, u64)>)>>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl BridgeWorker {
-    /// Hand the worker the current running-container set. Never blocks; a
-    /// dead worker (thread gone) is silently ignored.
-    pub fn send(&self, running: Vec<String>) {
+    /// Hand the worker the current running-container set, and the containers
+    /// whose bridge a client asked for since the last one (`urgent`, each with
+    /// its [`BridgeBoard::ticket`]). Never blocks; a dead worker (thread gone)
+    /// is silently ignored.
+    pub fn send(&self, running: Vec<String>, urgent: Vec<(String, u64)>) {
         if let Some(tx) = &self.tx {
-            let _ = tx.send(running);
+            let _ = tx.send((running, urgent));
         }
     }
 }
@@ -795,17 +1042,126 @@ mod tests {
     #[test]
     fn retry_policy() {
         // No entry: always start one.
-        assert_eq!(retry_decision(None), Retry::Spawn);
+        assert_eq!(retry_decision(None, false), Retry::Spawn);
         // Alive (not done): keep, regardless of elapsed time.
         let (zero, day) = (Duration::ZERO, Duration::from_secs(86_400));
-        assert_eq!(retry_decision(Some((false, false, zero))), Retry::Keep);
-        assert_eq!(retry_decision(Some((false, false, day))), Retry::Keep);
+        assert_eq!(retry_decision(Some((false, false, zero)), false), Retry::Keep);
+        assert_eq!(retry_decision(Some((false, false, day)), false), Retry::Keep);
         // Dead, not a mismatch: retried after RETRY.
-        assert_eq!(retry_decision(Some((true, false, zero))), Retry::Keep);
-        assert_eq!(retry_decision(Some((true, false, RETRY))), Retry::Respawn);
+        assert_eq!(retry_decision(Some((true, false, zero)), false), Retry::Keep);
+        assert_eq!(retry_decision(Some((true, false, RETRY)), false), Retry::Respawn);
         // Dead on a mismatch: only after the long MISMATCH_RETRY.
-        assert_eq!(retry_decision(Some((true, true, RETRY))), Retry::Keep);
-        assert_eq!(retry_decision(Some((true, true, MISMATCH_RETRY))), Retry::Respawn);
+        assert_eq!(retry_decision(Some((true, true, RETRY)), false), Retry::Keep);
+        assert_eq!(retry_decision(Some((true, true, MISMATCH_RETRY)), false), Retry::Respawn);
+        // Urgent (a client asked): a dead bridge is retried at once, mismatch
+        // or not; a live one is still kept.
+        assert_eq!(retry_decision(None, true), Retry::Spawn);
+        assert_eq!(retry_decision(Some((true, false, zero)), true), Retry::Respawn);
+        assert_eq!(retry_decision(Some((true, true, zero)), true), Retry::Respawn);
+        assert_eq!(retry_decision(Some((false, false, zero)), true), Retry::Keep);
+    }
+
+    #[test]
+    fn board_verdict_waits_for_the_ticket_then_the_handshake() {
+        let board = BridgeBoard::default();
+        let t = board.ticket();
+        let at = |b: &BridgeBoard| verdict(&b.inner.0.lock().unwrap(), "c", t);
+        // An old Ready entry doesn't count before the worker handled the ticket.
+        board.set("c", BridgeStatus::Ready);
+        assert_eq!(at(&board), None);
+        let observe = board.spawning("c");
+        board.handled(t);
+        assert_eq!(at(&board), None, "pending");
+        observe(BridgeStatus::Failed("helper in c is outdated".into()));
+        assert_eq!(at(&board), Some(Readiness::not("helper in c is outdated")));
+        // A replacement: the old bridge's late news can't overwrite it.
+        let fresh = board.spawning("c");
+        observe(BridgeStatus::Ready);
+        assert_eq!(at(&board), None, "stale observer ignored");
+        fresh(BridgeStatus::Ready);
+        assert_eq!(at(&board), Some(Readiness::ready()));
+        // Dropped by a reconcile: no bridge.
+        board.retain(&[]);
+        assert!(!at(&board).unwrap().ready);
+        // Tickets grow; `handled` never goes back.
+        let t2 = board.ticket();
+        assert!(t2 > t);
+        board.handled(t2);
+        board.handled(t);
+        assert_eq!(board.inner.0.lock().unwrap().handled, t2);
+    }
+
+    #[test]
+    fn board_wait_wakes_on_news_and_times_out_with_a_reason() {
+        let board = BridgeBoard::default();
+        let t = board.ticket();
+        let short = Duration::from_millis(30);
+        assert!(board.wait("c", t, short).error.unwrap().contains("didn't get to it"));
+        let observe = board.spawning("c");
+        board.handled(t);
+        assert!(board.wait("c", t, short).error.unwrap().contains("handshake didn't finish"));
+        let started = Instant::now();
+        let waiter = {
+            let board = board.clone();
+            std::thread::spawn(move || board.wait("c", t, Duration::from_secs(10)))
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        observe(BridgeStatus::Ready);
+        assert_eq!(waiter.join().unwrap(), Readiness::ready());
+        assert!(started.elapsed() < Duration::from_secs(5), "woken, not timed out");
+    }
+
+    #[test]
+    fn agent_candidates_are_newest_first_deduped_and_bounded() {
+        let mut c = AgentCandidates::default();
+        c.report("/a".into());
+        c.report("/b".into());
+        c.report("/a".into());
+        assert_eq!(c.recent, [PathBuf::from("/a"), PathBuf::from("/b")], "a repeat moves to the front");
+        for i in 0..20 {
+            c.report(format!("/n{i}").into());
+        }
+        assert_eq!(c.recent.len(), MAX_AGENTS);
+        assert_eq!(c.recent[0], PathBuf::from("/n19"));
+        assert!(!c.recent.contains(&PathBuf::from("/a")), "the oldest is forgotten");
+    }
+
+    #[test]
+    fn agent_pick_takes_the_first_live_one_then_the_fallback() {
+        let live = |names: &'static [&'static str]| move |p: &Path| names.iter().any(|n| p == Path::new(n));
+        let mut c = AgentCandidates::default();
+        // Nothing reported: the own `$SSH_AUTH_SOCK`, when live.
+        assert_eq!(c.pick(Some("/env".into()), live(&["/env"])), Some("/env".into()));
+        assert_eq!(c.pick(Some("/env".into()), live(&[])), None);
+        assert_eq!(c.pick(None, live(&["/env"])), None);
+        c.report("/old".into());
+        c.report("/new".into());
+        // The newest live report wins over older ones and the fallback.
+        assert_eq!(c.pick(Some("/env".into()), live(&["/old", "/new", "/env"])), Some("/new".into()));
+        // A dead newest (the `ssh -A` session ended) falls through in order.
+        assert_eq!(c.pick(Some("/env".into()), live(&["/old", "/env"])), Some("/old".into()));
+        assert_eq!(c.pick(Some("/env".into()), live(&["/env"])), Some("/env".into()));
+        assert_eq!(c.pick(Some("/env".into()), live(&[])), None);
+    }
+
+    #[test]
+    fn agent_live_needs_a_listening_socket() {
+        let dir = std::env::temp_dir().join(format!("devsbd-agentlive-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("agent.sock");
+        assert!(!agent_live(&sock), "missing");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        assert!(agent_live(&sock), "listening");
+        drop(listener);
+        // Polled: another test forking a child (`pre_exec` forces fork) can
+        // hold the listener fd for the moment until that child execs.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while agent_live(&sock) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!agent_live(&sock), "a leftover socket file is dead");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1048,9 +1404,9 @@ mod tests {
     /// send/coalesce/join path without docker.
     #[test]
     fn worker_coalesces_and_joins() {
-        let worker = Bridges::spawn_worker(None);
+        let worker = Bridges::spawn_worker(None, BridgeBoard::default());
         for i in 0..100 {
-            worker.send(vec![format!("devsandbox-c{i}")]);
+            worker.send(vec![format!("devsandbox-c{i}")], vec![(format!("devsandbox-c{i}"), i)]);
         }
         // Dropping joins the thread; it must have drained without deadlock.
         drop(worker);

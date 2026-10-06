@@ -6,8 +6,9 @@ keeps working with the dashboard closed. Design and roadmap:
 `docs/inbox-redesign.md`, "Host daemon". Unix only; the command doesn't
 exist on Windows.
 
-This page covers what exists today (steps 4-7 of that plan): the socket,
-start, handoff, idle exit, the bridges and the startup autostart pass. The
+This page covers what exists today (steps 4-7 of that plan, and step 8's
+ssh-agent half): the socket, start, handoff, idle exit, the bridges (the
+ssh-agent relay included) and the startup autostart pass. The
 API on the socket has its own page, `docs/api.md`. Marked below is what
 later steps add.
 
@@ -53,12 +54,16 @@ keeps the connection open for its whole life and reconnects, starting a
 new daemon if needed, after a handoff or the daemon's death; see
 `docs/api.md`, *The dashboard as a client*), and `run` / `start` once
 their container is up (best effort: a failure is one `warning:` line on
-stderr, the command still succeeds; they hang up right away). `exec`,
-`port` and `inbox` follow in steps 6-8; `devsandbox api --stdio` in step 9.
+stderr, the command still succeeds; they hang up right away), and every
+command that relays the ssh-agent into a relay-mode instance (`exec`,
+`start`'s `postStartCommand`, `run`'s lifecycle chain) for its bridge (see
+*Bridges*). `port` and `inbox` follow in steps 8-19; `devsandbox api
+--stdio` in step 9.
 
 The daemon inherits the environment of the process that started it: the
 runtime choice (`DEVSANDBOX_RUNTIME`), `SSH_AUTH_SOCK` (the agent its bridges
-relay), `DISPLAY` / `DBUS_SESSION_BUS_ADDRESS` (popups), `XDG_*`.
+relay until a client reports one, see *Bridges*), `DISPLAY` /
+`DBUS_SESSION_BUS_ADDRESS` (popups), `XDG_*`.
 
 ## Bridges
 
@@ -70,7 +75,24 @@ notify`, `devsbd thread put|rm`) into `inbox.toml`, shows desktop popups
 (rate-limited per instance), and serves the dispatcher's control ops
 (`ensure`, `exec`, `run …`, `events`, `thread ls`). Before each (re)spawn
 it reinstalls a stale helper, so a running dispatcher gets new `devsbd`
-verbs once a newer daemon runs. The dashboard no longer bridges.
+verbs once a newer daemon runs. The dashboard no longer bridges, and neither
+do CLI commands.
+
+**ssh-agent through the daemon.** A command that injects `SSH_AUTH_SOCK`
+into a relay-mode instance (`exec`, `start`'s `postStartCommand`, `run`'s
+lifecycle chain, a dashboard terminal) sends `bridges.ensure` (`docs/api.md`)
+with its own `$SSH_AUTH_SOCK`. The daemon puts that agent first in its
+candidates (up to 8 reported agents, newest first, then its inherited
+`$SSH_AUTH_SOCK`), wakes the poll for that container (a dead bridge there is
+respawned at once, retry gap or not) and answers without waiting for the
+bridge, unless asked to `wait`: then once the bridge's handshake is decided
+(`run`'s and `start`'s lifecycle commands wait, up to 12 s, before they
+start). Each agent stream connects to the first candidate that accepts a
+connection; a bridge spawned while no candidate was live is replaced once
+one is. So the relay follows whichever session last ran a command, and
+survives the agent the daemon was started with going away. A CLI command
+keeps its connection open while it runs, so it's a holder; a relay that
+isn't there is one `note:` line (after an `exec`, before a lifecycle chain).
 
 With the runtime unreachable, the last list stands (bridges and holders are
 kept, not torn down on a blip) and `serve.log` gets one line; another when
@@ -125,7 +147,7 @@ the close.
 
 The daemon exits 10 minutes after its last *holder* left; a new holder
 cancels the countdown. Holders today: connected clients (an open
-dashboard), running instances that declare `dispatcher` (as of the last
+dashboard, a running `exec` that relays the agent), running instances that declare `dispatcher` (as of the last
 poll; `inbox = true` joins in step 11), in-flight control requests, and the
 startup autostart pass while it runs. So with a dispatcher running the
 daemon never idles. Later steps add port forwards (step 8) and `--follow`

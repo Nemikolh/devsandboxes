@@ -384,6 +384,9 @@ impl App {
         // emits (workspace, remoteUser, remoteEnv) so the two can't drift;
         // services get a plain interactive `exec`.
         let shell: Vec<String> = SHELL_FALLBACK_CMD.iter().map(|s| s.to_string()).collect();
+        // The instance to ask the daemon's bridge for, on the same probe that
+        // decides the `SSH_AUTH_SOCK` injection (the CLI's `exec` gate).
+        let mut relay = None;
         let mut argv = if is_instance {
             let state = match crate::state::State::load() {
                 Ok(s) => s,
@@ -396,7 +399,11 @@ impl App {
                 self.status = Some(format!("terminal: `{title}` not in state"));
                 return;
             };
-            crate::commands::exec::exec_argv(instance, true, true, &shell)
+            let host_agent = crate::devsbd::relay_mode(instance) && crate::commands::exec::has_host_agent();
+            if host_agent {
+                relay = Some(title.clone());
+            }
+            crate::commands::exec::exec_argv_with(instance, true, true, &shell, host_agent)
         } else {
             let mut a = vec!["exec".to_string(), "-i".to_string(), "-t".to_string()];
             a.push(container.clone());
@@ -419,9 +426,16 @@ impl App {
                 self.terms.open(session);
                 self.focus = Focus::Terminal;
                 self.status = None;
+                self.pending_bridges.extend(relay);
             }
             Err(e) => self.status = Some(format!("terminal: {e:#}")),
         }
+    }
+
+    /// Take the instances whose daemon bridge the event loop owes a
+    /// `bridges.ensure` (see `pending_bridges`).
+    pub fn take_pending_bridges(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.pending_bridges)
     }
 }
 

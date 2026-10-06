@@ -41,24 +41,89 @@ pub fn exec_status(name: &str, interactive: bool, tty: bool, command: &[String])
         (command, interactive, tty)
     };
 
-    // ssh-agent relay for the command's lifetime, started optimistically
-    // alongside it: no handshake wait, the daemon holds an agent client that
-    // beats the bridge (docs/sandbox-helper.md). Only when a host agent exists,
-    // same gate as the `SSH_AUTH_SOCK` injection below.
+    // Same gate as the `SSH_AUTH_SOCK` injection: relay mode with a host agent.
+    let host_agent = crate::devsbd::relay_mode(instance) && has_host_agent();
+    // The daemon's bridge for the command's lifetime, asked for alongside it:
+    // the in-container daemon holds an agent client until the bridge attaches
+    // (docs/sandbox-helper.md).
     #[cfg(unix)]
-    let bridge = (crate::devsbd::relay_mode(instance)
-        && crate::devsbd::bridge::has_host_agent())
-    .then(|| crate::devsbd::bridge::spawn(instance))
-    .flatten();
-    let args = exec_argv(instance, interactive, tty, command);
+    let relay = host_agent.then(|| AgentRelay::start(&key));
+    let args = exec_argv_with(instance, interactive, tty, command, host_agent);
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let code = backend().run_inherit(&arg_refs)?;
-    // Reported after the command so it can't interleave with its output.
     #[cfg(unix)]
-    if let Some(Err(e)) = bridge.as_ref().and_then(|b| b.outcome(std::time::Duration::ZERO)) {
-        eprintln!("note: ssh-agent relay unavailable in `{}`: {e}", instance.container);
+    if let Some(relay) = relay {
+        relay.finish(&instance.container);
     }
     Ok(code)
+}
+
+/// The ssh-agent relay a CLI command holds while it runs in a container
+/// (`exec`, `start`'s postStartCommand, `run`'s lifecycle chain): a
+/// `bridges.ensure` to the daemon, which owns the one bridge per container
+/// (docs/ssh-agent.md). Two shapes: [`start`](Self::start) (`exec`) asks on a
+/// background thread and never waits, since the poll normally bridged a
+/// running instance already; [`ready`](Self::ready) (lifecycle commands,
+/// which may `git clone` over ssh at once) waits for the bridge before the
+/// command starts. Either way the connection stays open while the command
+/// runs, which makes it a daemon holder, and nothing fails the command: a
+/// relay that isn't there is one `note:`.
+#[cfg(unix)]
+pub(crate) struct AgentRelay(std::thread::JoinHandle<Result<crate::serve::client::Conn>>);
+
+/// How long a lifecycle command waits for its bridge: past the bridge's own
+/// 10 s handshake timeout, so a timed-out handshake still says so.
+#[cfg(unix)]
+const LIFECYCLE_RELAY_WAIT: std::time::Duration = std::time::Duration::from_secs(12);
+
+/// Why a waited relay isn't usable, if it isn't: `None` when ready, or when
+/// an older daemon couldn't wait (no answer either way).
+#[cfg(unix)]
+fn relay_note(ready: Option<crate::devsbd::bridge::Readiness>) -> Option<String> {
+    match ready {
+        None => None,
+        Some(r) if r.ready => None,
+        Some(r) => Some(r.error.unwrap_or_else(|| "the bridge isn't ready".into())),
+    }
+}
+
+#[cfg(unix)]
+impl AgentRelay {
+    /// Ask for instance `key`'s bridge, reporting this process's agent.
+    pub(crate) fn start(key: &str) -> AgentRelay {
+        let key = key.to_string();
+        AgentRelay(std::thread::spawn(move || {
+            let agent = crate::devsbd::bridge::own_agent();
+            crate::serve::client::ensure_bridge(&key, agent.as_deref(), None).map(|(conn, _)| conn)
+        }))
+    }
+
+    /// Ask for instance `key`'s bridge and wait (up to
+    /// [`LIFECYCLE_RELAY_WAIT`]) for its handshake, before a lifecycle command
+    /// starts. Not ready → the `note:` now, on stderr (stdout stays clean for
+    /// `run --json`); the command runs anyway. Hold the returned connection
+    /// until the command is over.
+    pub(crate) fn ready(key: &str, container: &str) -> Option<crate::serve::client::Conn> {
+        let agent = crate::devsbd::bridge::own_agent();
+        let (conn, note) = match crate::serve::client::ensure_bridge(key, agent.as_deref(), Some(LIFECYCLE_RELAY_WAIT)) {
+            Ok((conn, ready)) => (Some(conn), relay_note(ready)),
+            Err(e) => (None, Some(format!("{e:#}"))),
+        };
+        if let Some(why) = note {
+            eprintln!("note: ssh-agent relay unavailable in `{container}`: {why}");
+        }
+        conn
+    }
+
+    /// The command is over: wait for the request if it's still out, report
+    /// a failure (on stderr, after the command so it can't interleave with
+    /// its output; stdout stays clean for `run --json`) and hang up.
+    pub(crate) fn finish(self, container: &str) {
+        let result = self.0.join().unwrap_or_else(|_| Err(anyhow::anyhow!("the request panicked")));
+        if let Err(e) = result {
+            eprintln!("note: ssh-agent relay unavailable in `{container}`: {e:#}");
+        }
+    }
 }
 
 /// `-i`/`-t` for a command-less (login shell) exec. Explicit flags are taken
@@ -125,8 +190,9 @@ pub(crate) fn ssh_auth_sock_env(instance: &Instance, host_agent: bool) -> Option
 }
 
 /// Pure argv builder. `host_agent` says the host has a live agent (relay mode
-/// only); mount mode ignores it and injects unconditionally.
-fn exec_argv_with(
+/// only); mount mode ignores it and injects unconditionally. For callers that
+/// probed it already (to ask the daemon for a bridge on the same answer).
+pub(crate) fn exec_argv_with(
     instance: &Instance,
     interactive: bool,
     tty: bool,
@@ -313,6 +379,17 @@ mod tests {
             exec_argv_with(&inst, false, false, &["ls".into()], false),
             vec!["exec", "-w", "/workspaces/repository-1", "devsandbox-repo-abc1", "ls"]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relay_note_only_for_a_relay_known_not_ready() {
+        use crate::devsbd::bridge::Readiness;
+        assert_eq!(relay_note(None), None, "older daemon: no verdict");
+        assert_eq!(relay_note(Some(Readiness { ready: true, error: None })), None);
+        let outdated = Readiness { ready: false, error: Some("helper in c is outdated".into()) };
+        assert_eq!(relay_note(Some(outdated)).as_deref(), Some("helper in c is outdated"));
+        assert_eq!(relay_note(Some(Readiness { ready: false, error: None })).as_deref(), Some("the bridge isn't ready"));
     }
 
     #[test]

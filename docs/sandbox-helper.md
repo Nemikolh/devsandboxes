@@ -214,14 +214,16 @@ ssh (in container) ──unix──▶ devsbd daemon ◀──frames over exec s
 
 - **Version mismatch / takeover.** A CLI upgrade while a container runs
   leaves the old binary and old daemon in it. Outcomes:
-  - `exec`/TUI before any reinstall: the host runs the *old* `bridge`. A
+  - A bridge before any reinstall: the host runs the *old* `bridge`. A
     differing build hash is fine (bridge and daemon are the same old build;
     only `VERSION` must match). A differing `VERSION` fails the host handshake
     with a typed error carrying both versions, phrased with direction: the
     helper older → `helper in <c> is outdated (protocol N, need M): restart
     the instance`, the helper newer → `this devsandbox is older than the
-    helper in <c> (protocol N, need M)`. `exec` prints it as a `note:` after
-    the command; the TUI stays silent.
+    helper in <c> (protocol N, need M)`. The host daemon reinstalls the
+    helper before each spawn, so an older helper usually heals itself; when
+    it doesn't, `run`/`start` show the line as their relay `note:` (a waited
+    `bridges.ensure` returns it) and a `devsandbox port` forward reports it.
   - `stop` + `start` / `rebuild`: clean, no process survives.
   - `start` on a still-running container (`start.rs` accepts it): `ensure`
     rewrites the binary (hash differs) and starts a new daemon. The lock is
@@ -274,8 +276,9 @@ ssh (in container) ──unix──▶ devsbd daemon ◀──frames over exec s
   client is held up to 1s for one to attach, then closed (ssh reports "agent
   refused", same as no agent). The hold is what makes the optimistic `exec` below safe; its cost
   is a 1s delay before "refused" when no devsandbox process is alive. The daemon
-  keeps every connected bridge, so when the newest ends (a CLI `exec`),
-  routing falls back to the next newest (the TUI's) instead of to nothing.
+  keeps every connected bridge, so when the newest ends (a `devsandbox port`
+  forward's), routing falls back to the next newest (the host daemon's)
+  instead of to nothing.
 
 - **Stream routing** (`src/devsbd/mux.rs`, shared via `#[path]` like the
   protocol): the same `Mux` runs in the daemon and on the host. Whoever sees
@@ -312,12 +315,15 @@ ssh (in container) ──unix──▶ devsbd daemon ◀──frames over exec s
       ssh-agent streams keep the inline write on the reader thread (small
       request/response messages), so their behavior is unchanged.
 
-- **Host side:** for each `Open` the host connects to the *current*
-  `$SSH_AUTH_SOCK` (so rotation is a non-issue) — or, later, the Windows
-  named pipe. Owner of the host side:
+- **Host side:** for each `Open` the host connects to the first live agent it
+  knows (`AgentCandidates` in `src/devsbd/bridge.rs`): in the host daemon the
+  `$SSH_AUTH_SOCK`s clients reported through `bridges.ensure`, newest first,
+  then its own; elsewhere just the *current* `$SSH_AUTH_SOCK` (so rotation is a
+  non-issue) — or, later, the Windows named pipe. Owner of the host side:
   - Each host process owns its bridges; they're never shared across processes.
-    Several bridges per container are normal (the daemon routes agent streams to
-    the newest agent-capable one, see _Bridge_).
+    Several bridges per container still happen (the host daemon's, a
+    `devsandbox port` forward's); the in-container daemon routes agent streams
+    to the newest agent-capable one, see _Bridge_.
   - Host daemon (`devsandbox serve`, docs/serve.md): one bridge per running
     instance while it runs, used by every integrated terminal tab on that
     instance (`devsbd::bridge::Bridges`). The dashboard no longer bridges; it
@@ -329,19 +335,34 @@ ssh (in container) ──unix──▶ devsbd daemon ◀──frames over exec s
     except a protocol **version mismatch** (host- or daemon-side, see _Bridge_),
     which is retried only every 5 min, since only a helper rewrite fixes it
     (`start`, which may not take the container out of the running set; a real
-    restart drops the entry and retries at once). On daemon exit `BridgeWorker`'s `Drop` closes the channel and joins the
+    restart drops the entry and retries at once). A `bridges.ensure`
+    (docs/api.md) wakes the poll at once and marks its container urgent: a dead
+    bridge there is respawned without waiting out either gap. On daemon exit `BridgeWorker`'s `Drop` closes the channel and joins the
     worker, so every bridge is killed before the daemon releases its lock.
   - CLI `exec` (including the TUI's suspended `:exec`, which goes through
-    `exec_status`): its own bridge for the lifetime of the exec, started
-    optimistically alongside the command, with no handshake wait and so no added
-    latency. The daemon's hold covers a command that reaches the agent
-    first (a `docker exec` startup is ~60–100 ms). A failed handshake is
-    reported after the command exits, so it can't interleave with its output.
+    `exec_status`), `start`'s `postStartCommand` and `run`'s lifecycle chain:
+    no bridge of their own. They connect to the host daemon (lazy start) and
+    send `bridges.ensure` with their `$SSH_AUTH_SOCK`, holding the connection
+    until the command ends (so the daemon doesn't idle out under it). `exec`
+    does it on a background thread with no handshake wait: the in-container
+    daemon's 1s hold covers a command that reaches the agent before the
+    bridge attaches, which is normally already there (the daemon bridges
+    running instances on its poll); a daemon that can't be reached is reported
+    after the command exits, so it can't interleave with its output. The
+    lifecycle paths instead wait (`"wait": 12`) for the bridge's handshake
+    before their first command, since a fresh container's bridge (helper
+    check, `exec`, handshake) can take longer than that hold and lifecycle
+    commands often clone over ssh at once; not ready → a `note:` with the
+    reason (the handshake error, a version mismatch included) before the
+    chain, which runs anyway.
+  - Dashboard integrated terminals: opening one on a relay-mode instance has
+    the dashboard's daemon connection send the same `bridges.ensure`
+    (skipped while disconnected).
   - Bridges run for instances in relay mode (`devsbd::relay_mode`: helper
     installed, no bind mount) when the host has a live agent. A mounted
     instance stays on the mount (the mount occupies the daemon's socket path).
   - Everything else (VS Code terminals, plain `docker exec`): covered whenever
-    the host daemon or a devsandbox exec is alive; otherwise not. VS Code keeps its own
+    the host daemon is alive; otherwise not. VS Code keeps its own
     forwarding. Document the gap; a `devsandbox agent <instance>` foreground
     command is a cheap follow-up if needed.
 
@@ -350,7 +371,7 @@ ssh (in container) ──unix──▶ devsbd daemon ◀──frames over exec s
   `Instance.ssh_auth_sock` and always injects. Relay mode is inferred
   (`devsbd::relay_mode` = `devsbd_arch.is_some() && ssh_auth_sock.is_none()`,
   `false` off unix) and injects the fixed `SSH_AGENT_TARGET` **only when the
-  host has a live agent** (`$SSH_AUTH_SOCK` set and the path exists), so an
+  host has a live agent** (`$SSH_AUTH_SOCK` set and its socket accepts a connection), so an
   agent-less exec doesn't point ssh at a dead socket. Same probe gates bridge
   spawning (`bridge::has_host_agent`, from `exec_status` and
   `Bridges::reconcile`): no host agent → no extra `exec` that can't help. No
@@ -559,7 +580,7 @@ over; document it), agent socket stays **0666** (document the consequence).
   mount keep mount mode until recreated.
 - `exec_argv` (`src/commands/exec.rs:94`): mount mode unchanged; relay mode
   injects `-e SSH_AUTH_SOCK=<SSH_AGENT_TARGET>` **only when the host has a
-  usable agent** (`$SSH_AUTH_SOCK` set and the path exists). Keep the builder
+  usable agent** (`$SSH_AUTH_SOCK` set and its socket accepts a connection). Keep the builder
   testable: the env probe is one small fn, the argv logic takes its result
   (e.g. an inner `exec_argv_with(.., host_agent: bool)`); no env mutation in
   tests.

@@ -14,6 +14,9 @@
 //! into a silent no-op.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use crate::devsbd::bridge::Readiness;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -26,7 +29,30 @@ use crate::inbox::{EntryKind, Inbox, Kind, Op, Thread, View, ops};
 /// tests (and a test daemon) use their own file.
 pub struct Ctx<'a> {
     pub inbox: &'a Path,
+    /// The bridges `bridges.ensure` acts on; `None` on a daemon that runs no
+    /// host side (tests).
+    pub bridges: Option<&'a dyn Bridging>,
 }
+
+/// The daemon's bridges as `bridges.ensure` sees them (`host::Waker` in
+/// production), so the handler is tested without state or a runtime.
+pub trait Bridging {
+    /// The container of instance `instance` (a `state.toml` key), `None`
+    /// when there's no such instance.
+    fn container(&self, instance: &str) -> anyhow::Result<Option<String>>;
+    /// A client's host agent socket, now the preferred candidate
+    /// (`devsbd::bridge::AgentCandidates`).
+    fn report_agent(&self, path: PathBuf);
+    /// Reconcile `container`'s bridge now; doesn't wait for it. Returns the
+    /// request's ticket, for [`wait_ready`](Self::wait_ready).
+    fn reconcile_now(&self, container: String) -> u64;
+    /// Block up to `timeout` for `container`'s bridge as of `ticket`.
+    fn wait_ready(&self, container: &str, ticket: u64, timeout: Duration) -> Readiness;
+}
+
+/// The longest `bridges.ensure` `wait`: a bit over the bridge's own 10 s
+/// handshake timeout, so a handshake that times out still reports why.
+pub const MAX_ENSURE_WAIT: Duration = Duration::from_secs(15);
 
 /// An error answer: a stable machine `code` (docs/api.md, *Errors*) and a
 /// human message.
@@ -86,6 +112,7 @@ pub fn call(method: &str, params: Value, ctx: &Ctx) -> Answer {
         "inbox.notify.dismiss" => dismiss(parse(params)?, ctx),
         "inbox.notify.markRead" => notify_mark_read(parse(params)?, ctx),
         "instances.list" => instances_list(parse(params)?),
+        "bridges.ensure" => bridges_ensure(parse(params)?, ctx),
         other => Err(ApiError::unknown_method(other)),
     }
 }
@@ -527,6 +554,53 @@ fn instances_list(p: InstancesParams) -> Answer {
     serde_json::to_value(crate::snapshot::collect(&p.dir)).map_err(|e| ApiError::internal(e.into()))
 }
 
+#[derive(Deserialize)]
+struct EnsureParams {
+    instance: String,
+    #[serde(default)]
+    agent: Option<PathBuf>,
+    /// Seconds to wait for the bridge's handshake (capped at
+    /// [`MAX_ENSURE_WAIT`]); absent: don't wait.
+    #[serde(default)]
+    wait: Option<f64>,
+}
+
+/// Record the caller's agent (if any), then have the daemon reconcile the
+/// instance's bridge now. Without `wait` it doesn't wait for the bridge: the
+/// in-container daemon holds agent clients briefly until one attaches
+/// (docs/sandbox-helper.md). With it (lifecycle commands, which may `git
+/// clone` over ssh at once), it answers once the bridge's handshake is
+/// decided or the wait ran out: `ready`, and `error` saying why not. The
+/// params are checked first, so a bad request records nothing.
+fn bridges_ensure(p: EnsureParams, ctx: &Ctx) -> Answer {
+    let Some(bridges) = ctx.bridges else {
+        return Err(ApiError::internal(anyhow::anyhow!("this daemon runs no bridges")));
+    };
+    if let Some(agent) = &p.agent {
+        if !agent.is_absolute() {
+            return Err(ApiError::invalid(format!("`agent` must be an absolute path, got `{}`", agent.display())));
+        }
+    }
+    let wait = match p.wait {
+        None => None,
+        Some(secs) if secs.is_finite() && secs >= 0.0 => {
+            Some(Duration::from_secs_f64(secs.min(MAX_ENSURE_WAIT.as_secs_f64())))
+        }
+        Some(secs) => return Err(ApiError::invalid(format!("`wait` must be seconds >= 0, got {secs}"))),
+    };
+    let container = bridges
+        .container(&p.instance)
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found(format!("no instance `{}`", p.instance)))?;
+    if let Some(agent) = p.agent {
+        bridges.report_agent(agent);
+    }
+    let ticket = bridges.reconcile_now(container.clone());
+    let Some(wait) = wait else { return ok() };
+    let r = bridges.wait_ready(&container, ticket, wait);
+    Ok(json!({ "ok": true, "ready": r.ready, "error": r.error }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -561,7 +635,93 @@ mod tests {
     }
 
     fn run(path: &Path, method: &str, params: Value) -> Answer {
-        call(method, params, &Ctx { inbox: path })
+        call(method, params, &Ctx { inbox: path, bridges: None })
+    }
+
+    /// Records what `bridges.ensure` asked for; knows instance `web` only.
+    /// Waits answer `readiness` at once, recording `(ticket, timeout)`.
+    #[derive(Default)]
+    struct FakeBridges {
+        agents: std::cell::RefCell<Vec<PathBuf>>,
+        woken: std::cell::RefCell<Vec<String>>,
+        waits: std::cell::RefCell<Vec<(u64, Duration)>>,
+        readiness: Option<Readiness>,
+    }
+
+    impl Bridging for FakeBridges {
+        fn container(&self, instance: &str) -> anyhow::Result<Option<String>> {
+            match instance {
+                "web" => Ok(Some("devsandbox-web".into())),
+                "broken" => anyhow::bail!("state unreadable"),
+                _ => Ok(None),
+            }
+        }
+        fn report_agent(&self, path: PathBuf) {
+            self.agents.borrow_mut().push(path);
+        }
+        fn reconcile_now(&self, container: String) -> u64 {
+            self.woken.borrow_mut().push(container);
+            self.woken.borrow().len() as u64
+        }
+        fn wait_ready(&self, container: &str, ticket: u64, timeout: Duration) -> Readiness {
+            assert_eq!(container, "devsandbox-web");
+            self.waits.borrow_mut().push((ticket, timeout));
+            self.readiness.clone().unwrap()
+        }
+    }
+
+    #[test]
+    fn bridges_ensure_waits_only_when_asked_and_caps_the_wait() {
+        let path = store_path("ensure-wait");
+        let not = Readiness { ready: false, error: Some("helper in devsandbox-web is outdated".into()) };
+        let fake = FakeBridges { readiness: Some(not), ..FakeBridges::default() };
+        let ensure = |params: Value| call("bridges.ensure", params, &Ctx { inbox: &path, bridges: Some(&fake) });
+
+        assert_eq!(ensure(json!({"instance": "web"})).unwrap(), json!({"ok": true}), "no wait: unchanged");
+        assert!(fake.waits.borrow().is_empty());
+        assert_eq!(
+            ensure(json!({"instance": "web", "wait": 10})).unwrap(),
+            json!({"ok": true, "ready": false, "error": "helper in devsandbox-web is outdated"})
+        );
+        ensure(json!({"instance": "web", "wait": 0.5})).unwrap();
+        ensure(json!({"instance": "web", "wait": 3600})).unwrap();
+        // Each wait is on its own request's ticket, capped.
+        assert_eq!(
+            *fake.waits.borrow(),
+            [(2, Duration::from_secs(10)), (3, Duration::from_millis(500)), (4, MAX_ENSURE_WAIT)]
+        );
+        assert_eq!(code(ensure(json!({"instance": "web", "wait": -1}))), "invalid");
+        assert_eq!(code(ensure(json!({"instance": "web", "wait": "soon"}))), "invalid");
+        assert_eq!(fake.woken.borrow().len(), 4, "a bad wait wakes nothing");
+
+        let ready = FakeBridges { readiness: Some(Readiness { ready: true, error: None }), ..FakeBridges::default() };
+        let r = call("bridges.ensure", json!({"instance": "web", "wait": 10}), &Ctx { inbox: &path, bridges: Some(&ready) });
+        assert_eq!(r.unwrap(), json!({"ok": true, "ready": true, "error": null}));
+    }
+
+    #[test]
+    fn bridges_ensure_records_the_agent_and_reconciles_the_instance() {
+        let path = store_path("ensure");
+        let fake = FakeBridges::default();
+        let ensure = |params: Value| call("bridges.ensure", params, &Ctx { inbox: &path, bridges: Some(&fake) });
+
+        assert_eq!(ensure(json!({"instance": "web", "agent": "/tmp/ssh-x/agent.1"})).unwrap(), json!({"ok": true}));
+        assert_eq!(ensure(json!({"instance": "web", "agent": null})).unwrap(), json!({"ok": true}));
+        assert_eq!(ensure(json!({"instance": "web"})).unwrap(), json!({"ok": true}));
+        assert_eq!(*fake.agents.borrow(), [PathBuf::from("/tmp/ssh-x/agent.1")]);
+        assert_eq!(*fake.woken.borrow(), ["devsandbox-web"; 3]);
+
+        // Refused before anything is recorded or woken.
+        assert_eq!(code(ensure(json!({"instance": "nope", "agent": "/a"}))), "not-found");
+        assert_eq!(code(ensure(json!({"instance": "web", "agent": "rel/agent"}))), "invalid");
+        assert_eq!(code(ensure(json!({"instance": "web", "agent": ""}))), "invalid");
+        assert_eq!(code(ensure(json!({"agent": "/a"}))), "invalid");
+        assert_eq!(code(ensure(json!({"instance": "broken"}))), "internal");
+        assert_eq!(fake.agents.borrow().len(), 1);
+        assert_eq!(fake.woken.borrow().len(), 3);
+
+        // A daemon without a host side says so.
+        assert_eq!(code(run(&path, "bridges.ensure", json!({"instance": "web"}))), "internal");
     }
 
     fn code(r: Answer) -> &'static str {

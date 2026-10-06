@@ -182,6 +182,10 @@ pub struct App {
     /// A notification link the event loop should hand to the desktop opener
     /// (`enter` in the Inbox thread pane).
     pub pending_open: Option<String>,
+    /// Instances (state keys) whose daemon bridge the event loop should ask
+    /// for (`bridges.ensure`): a terminal just opened on them, relaying the
+    /// ssh-agent.
+    pub pending_bridges: Vec<String>,
     /// Every dispatcher's children by key, owner id → key → instance name
     /// (`dispatch::thread_children`), refreshed by the event loop with each
     /// snapshot so the thread pane resolves a `child` without reading state.
@@ -269,6 +273,7 @@ impl App {
             inbox: InboxView::default(),
             pending_inbox: Vec::new(),
             pending_open: None,
+            pending_bridges: Vec::new(),
             thread_children: BTreeMap::new(),
             utc_offset: 0,
             status: None,

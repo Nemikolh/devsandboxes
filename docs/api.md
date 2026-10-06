@@ -70,7 +70,7 @@ match on `code`:
 
 | code | |
 |---|---|
-| `not-found` | the thread, action or directory named doesn't exist |
+| `not-found` | the thread, action, directory or instance named doesn't exist |
 | `invalid` | bad params (missing, wrong type, unknown value), or an op that makes no sense for its target |
 | `unknown-method` | no such method on this daemon |
 | `denied` | the target refuses it (an archived thread is read-only; a thread that takes no replies) |
@@ -175,6 +175,45 @@ can take a moment.
 Errors: `invalid` (missing or relative `dir`), `not-found` (no such
 directory).
 
+## Bridges
+
+### `bridges.ensure`
+
+Params: `{"instance": "<name>", "agent": "/abs/path" | null, "wait": <seconds>}`.
+`instance` is the instance name (its `state.toml` key); `agent` is the
+caller's `$SSH_AUTH_SOCK`, optional. The daemon records `agent` as its
+preferred host agent (the most recently reported live one wins; up to 8 are
+kept, the daemon's own `$SSH_AUTH_SOCK` last), then reconciles that
+instance's bridge at once instead of on its next 5 s poll: one is spawned if
+missing, a dead one is respawned. Whether the instance gets a bridge at all
+is the daemon's usual rule (running, helper installed; relays the agent in
+relay mode). What `exec`, `start`, `run` and the dashboard's terminals send
+before they inject `SSH_AUTH_SOCK` (`docs/serve.md`, *Bridges*).
+
+Without `wait`, the result is `{"ok": true}` as soon as that's queued, not
+when the bridge is up; ssh in the container waits up to 1 s for it
+(`docs/sandbox-helper.md`).
+
+With `wait` (seconds, a number ≥ 0, capped at 15), the answer comes once
+that reconcile has run and the instance's bridge has finished its handshake
+(it's then routing agent streams), or once `wait` runs out:
+
+```
+← {"id":4,"result":{"ok":true,"ready":true,"error":null}}
+← {"id":5,"result":{"ok":true,"ready":false,"error":"helper in devsandbox-web is outdated (protocol 3, need 4): restart the instance"}}
+```
+
+`error` says why it isn't ready: the handshake failure (a helper version
+mismatch, `helper handshake timed out`, …), the bridge `exec` not starting,
+no bridge for the instance (not running, no helper), or the wait running out
+(the daemon not reaching it, or a handshake still going). `run` and `start`
+send `"wait": 12` before their lifecycle commands, which may `git clone` over
+ssh right away. An older daemon ignores `wait` and answers `{"ok": true}`.
+
+Errors: `not-found` (no such instance; nothing is recorded), `invalid`
+(missing `instance`, relative or empty `agent`, negative or non-numeric
+`wait`).
+
 ## Notifications
 
 ### `subscribe` / `unsubscribe`
@@ -197,7 +236,8 @@ A client that doesn't read its socket for 5 s is disconnected.
 ## Holders
 
 A connected client keeps the daemon alive (`docs/serve.md`, *Idle exit*);
-hang up when done.
+hang up when done. A CLI command holding a relay (`bridges.ensure`) stays
+connected for its whole run for that reason.
 
 ## The dashboard as a client
 
@@ -209,4 +249,7 @@ Its Inbox writes go through the `inbox.*` mutations while connected, and
 straight to the store (the same code) while not. It reads the store file
 itself, reloading on `inbox.changed`, and keeps its own instance snapshot
 (with processes and stats), refreshed early on `instances.changed`.
-`inbox.shown` is its status line. Two dashboards share one daemon.
+`inbox.shown` is its status line. Opening an integrated terminal on a
+relay-mode instance sends `bridges.ensure` with the dashboard's
+`$SSH_AUTH_SOCK` (skipped while disconnected). Two dashboards share one
+daemon.

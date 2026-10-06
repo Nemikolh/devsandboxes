@@ -8,7 +8,10 @@
 //! every [`POLL`], counts the live-instance holders and hands the list to the
 //! bridge worker (`Bridges::spawn_worker`, its own thread, which owns every
 //! bridge), and bumps [`Host::changes`] when the list moved (the API's
-//! `instances.changed`). A `serve-autostart` thread runs the autostart pass once per config
+//! `instances.changed`). A [`Waker`] (the API's `bridges.ensure`) cuts the
+//! poll's sleep short and marks its container urgent, so a CLI command or a
+//! dashboard terminal gets its bridge now rather than within [`POLL`]. A
+//! `serve-autostart` thread runs the autostart pass once per config
 //! root recorded in `state.toml`. Dropping [`Host`] stops the poll, drops the
 //! worker (killing every bridge's `exec`) and joins both threads.
 
@@ -19,7 +22,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use crate::devsbd::bridge::{self, Bridges, OnShown};
+use crate::devsbd::bridge::{self, BridgeBoard, Bridges, OnShown, Readiness};
 use crate::state::State;
 
 /// How often the daemon re-lists the running containers. A new instance gets
@@ -27,8 +30,58 @@ use crate::state::State;
 /// on their own gaps (`bridge::RETRY`), checked on each poll.
 pub const POLL: Duration = Duration::from_secs(5);
 
+/// What the poll thread sleeps on: stop, or containers a client asked a
+/// bridge for.
+#[derive(Default)]
+struct Signal {
+    stop: bool,
+    /// `(container, ticket)`: see `bridge::BridgeBoard`.
+    urgent: Vec<(String, u64)>,
+}
+
+type Shared = Arc<(Mutex<Signal>, Condvar)>;
+
+/// Wakes the poll thread for one container: it re-lists at once and the
+/// bridge worker reconciles with that container urgent
+/// (`Bridges::reconcile`). Cloneable; outlives nothing (a wake after the
+/// poll stopped is ignored). Carries the bridges' [`BridgeBoard`], so the
+/// API can wait for a bridge without touching the worker.
+#[derive(Clone)]
+pub struct Waker(Shared, BridgeBoard);
+
+impl Waker {
+    /// Queue `container` urgent; returns its ticket on the board.
+    pub fn wake(&self, container: String) -> u64 {
+        let ticket = self.1.ticket();
+        let (lock, cvar) = &*self.0;
+        lock.lock().unwrap_or_else(|e| e.into_inner()).urgent.push((container, ticket));
+        cvar.notify_all();
+        ticket
+    }
+}
+
+/// `bridges.ensure` against the real state and this daemon's bridges.
+impl super::api::Bridging for Waker {
+    fn container(&self, instance: &str) -> anyhow::Result<Option<String>> {
+        Ok(State::load()?.instances.get(instance).map(|i| i.container.clone()))
+    }
+
+    fn report_agent(&self, path: PathBuf) {
+        bridge::report_agent(path);
+    }
+
+    fn reconcile_now(&self, container: String) -> u64 {
+        self.wake(container)
+    }
+
+    fn wait_ready(&self, container: &str, ticket: u64, timeout: Duration) -> Readiness {
+        self.1.wait(container, ticket, timeout)
+    }
+}
+
 pub struct Host {
-    stop: Arc<(Mutex<bool>, Condvar)>,
+    stop: Shared,
+    board: BridgeBoard,
     live: Arc<AtomicUsize>,
     autostarting: Arc<AtomicUsize>,
     changes: Arc<AtomicU64>,
@@ -40,17 +93,18 @@ impl Host {
     /// `serve.log` line; `on_shown` gets each stored container message's
     /// status line (the API's `inbox.shown`).
     pub fn start(log: fn(&str), on_shown: OnShown) -> Host {
-        let stop = Arc::new((Mutex::new(false), Condvar::new()));
+        let stop: Shared = Arc::default();
+        let board = BridgeBoard::default();
         let live = Arc::new(AtomicUsize::new(0));
         // Counted before the thread runs, so the first idle check sees it.
         let autostarting = Arc::new(AtomicUsize::new(1));
         let changes = Arc::new(AtomicU64::new(0));
         let mut threads = Vec::new();
         let spawned = {
-            let (stop, live, changes) = (Arc::clone(&stop), Arc::clone(&live), Arc::clone(&changes));
+            let (stop, live, changes, board) = (Arc::clone(&stop), Arc::clone(&live), Arc::clone(&changes), board.clone());
             std::thread::Builder::new()
                 .name("serve-poll".into())
-                .spawn(move || poll(&stop, &live, &changes, log, on_shown))
+                .spawn(move || poll(&stop, &live, &changes, log, on_shown, board))
         };
         match spawned {
             Ok(t) => threads.push(t),
@@ -70,7 +124,12 @@ impl Host {
                 log(&format!("cannot start the autostart thread: {e}"));
             }
         }
-        Host { stop, live, autostarting, changes, threads }
+        Host { stop, board, live, autostarting, changes, threads }
+    }
+
+    /// The poll's [`Waker`], for the API.
+    pub fn waker(&self) -> Waker {
+        Waker(Arc::clone(&self.stop), self.board.clone())
     }
 
     /// Bumped each time a poll finds the running containers changed; the
@@ -99,7 +158,7 @@ impl Host {
 impl Drop for Host {
     fn drop(&mut self) {
         let (lock, cvar) = &*self.stop;
-        *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        lock.lock().unwrap_or_else(|e| e.into_inner()).stop = true;
         cvar.notify_all();
         // The poll thread drops the bridge worker, which kills every bridge;
         // autostart is waited out (see `autostarting`).
@@ -109,13 +168,22 @@ impl Drop for Host {
     }
 }
 
-/// The poll loop: list, count, reconcile, sleep, until stopped. With the
-/// runtime unreachable the last list stands (bridges and the holder count
-/// are kept, not torn down on a blip); the outage is logged once.
-fn poll(stop: &(Mutex<bool>, Condvar), live: &AtomicUsize, changes: &AtomicU64, log: fn(&str), on_shown: OnShown) {
-    let worker = Bridges::spawn_worker(Some(Some(on_shown)));
+/// The poll loop: list, count, reconcile, sleep (until [`POLL`] passes or a
+/// [`Waker`] fires), until stopped. With the runtime unreachable the last list
+/// stands (bridges and the holder count are kept, not torn down on a blip);
+/// the outage is logged once, and urgent containers wait for the next list.
+fn poll(
+    stop: &(Mutex<Signal>, Condvar),
+    live: &AtomicUsize,
+    changes: &AtomicU64,
+    log: fn(&str),
+    on_shown: OnShown,
+    board: BridgeBoard,
+) {
+    let worker = Bridges::spawn_worker(Some(Some(on_shown)), board);
     let mut down = false;
     let mut last: Vec<String> = Vec::new();
+    let mut urgent: Vec<(String, u64)> = Vec::new();
     loop {
         match running_containers() {
             Ok(mut running) => {
@@ -133,7 +201,7 @@ fn poll(stop: &(Mutex<bool>, Condvar), live: &AtomicUsize, changes: &AtomicU64, 
                 if let Ok(state) = State::load() {
                     live.store(live_instances(&running, &state, expects_host), Ordering::Release);
                 }
-                worker.send(running);
+                worker.send(running, std::mem::take(&mut urgent));
             }
             Err(e) => {
                 if !down {
@@ -144,10 +212,13 @@ fn poll(stop: &(Mutex<bool>, Condvar), live: &AtomicUsize, changes: &AtomicU64, 
         }
         let (lock, cvar) = stop;
         let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-        let (guard, _) = cvar.wait_timeout_while(guard, POLL, |stopped| !*stopped).unwrap_or_else(|e| e.into_inner());
-        if *guard {
+        let (mut guard, _) = cvar
+            .wait_timeout_while(guard, POLL, |s| !s.stop && s.urgent.is_empty())
+            .unwrap_or_else(|e| e.into_inner());
+        if guard.stop {
             break;
         }
+        urgent.append(&mut guard.urgent);
     }
     // `worker` drops here: closes its channel and joins, killing every bridge.
 }

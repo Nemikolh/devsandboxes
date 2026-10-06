@@ -17,9 +17,16 @@
 //! the same either way. Reads stay local (the store file is the truth): an
 //! `inbox.changed` only makes the loop reload at once.
 //!
+//! Terminals: when the dashboard opens one on a relay-mode instance, the
+//! loop has the worker `bridges.ensure` it with the dashboard's own
+//! `SSH_AUTH_SOCK` ([`Cmd::EnsureBridge`]), so the daemon's bridge relays
+//! that agent at once. Disconnected, it's skipped: no local bridge exists to
+//! fall back to, and the daemon bridges running instances on its own poll.
+//!
 //! Modelled on `forwards.rs`'s `ForwardWorker`; nothing is ever written to
 //! stderr, failures are [`DaemonUpdate::Status`] lines.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -55,10 +62,19 @@ pub enum DaemonUpdate {
     Status(String),
 }
 
+/// From the event loop to the worker.
+#[derive(Debug, PartialEq)]
+enum Cmd {
+    /// Inbox writes, in order (see the module doc).
+    Inbox(Vec<Op>),
+    /// `bridges.ensure` for `instance` (a state key), reporting `agent`.
+    EnsureBridge { instance: String, agent: Option<PathBuf> },
+}
+
 /// Handle to the daemon worker. Never blocks the UI thread; dropping it
 /// closes the channel and joins briefly (see [`JOIN_TIMEOUT`]).
 pub struct DaemonWorker {
-    tx: Option<Sender<Vec<Op>>>,
+    tx: Option<Sender<Cmd>>,
     updates: Receiver<DaemonUpdate>,
     connected: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
@@ -85,8 +101,18 @@ impl DaemonWorker {
 
     /// Send inbox ops to the daemon, in order. Never blocks.
     pub fn apply(&self, ops: Vec<Op>) {
+        self.send(Cmd::Inbox(ops));
+    }
+
+    /// Ask the daemon for `instance`'s bridge, reporting `agent` (the
+    /// dashboard's `SSH_AUTH_SOCK`). Never blocks; dropped while disconnected.
+    pub fn ensure_bridge(&self, instance: String, agent: Option<PathBuf>) {
+        self.send(Cmd::EnsureBridge { instance, agent });
+    }
+
+    fn send(&self, cmd: Cmd) {
         if let Some(tx) = &self.tx {
-            let _ = tx.send(ops);
+            let _ = tx.send(cmd);
         }
     }
 
@@ -155,6 +181,12 @@ fn op_call(op: &Op) -> (&'static str, Value) {
     }
 }
 
+/// The API call for [`Cmd::EnsureBridge`]. A non-UTF-8 agent path can't go
+/// on the wire; the daemon then uses the agents it knows.
+fn ensure_call(instance: &str, agent: Option<&std::path::Path>) -> (&'static str, Value) {
+    ("bridges.ensure", json!({ "instance": instance, "agent": agent.and_then(|p| p.to_str()) }))
+}
+
 /// Whether an API error on `op` is worth a status line. A `not-found` on a
 /// mark-read or dismiss is a thread another dashboard (or `thread rm`)
 /// removed first: the local path ignores it too.
@@ -193,7 +225,7 @@ struct Worker<'a> {
     last_error: Option<String>,
 }
 
-fn run(rx: Receiver<Vec<Op>>, utx: Sender<DaemonUpdate>, connected: &AtomicBool) {
+fn run(rx: Receiver<Cmd>, utx: Sender<DaemonUpdate>, connected: &AtomicBool) {
     let mut w = Worker {
         utx,
         connected,
@@ -212,7 +244,8 @@ fn run(rx: Receiver<Vec<Op>>, utx: Sender<DaemonUpdate>, connected: &AtomicBool)
             None => w.next_attempt.saturating_duration_since(Instant::now()).min(POLL),
         };
         match rx.recv_timeout(wait) {
-            Ok(ops) => w.apply(ops),
+            Ok(Cmd::Inbox(ops)) => w.apply(ops),
+            Ok(Cmd::EnsureBridge { instance, agent }) => w.ensure_bridge(&instance, agent.as_deref()),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return,
         }
@@ -281,6 +314,17 @@ impl Worker<'_> {
             }
             // Newer notifications this build doesn't know.
             _ => {}
+        }
+    }
+
+    /// `bridges.ensure`, while connected. Quiet: an error answer (an instance
+    /// removed meanwhile, an older daemon without the method) only means the
+    /// daemon's own poll bridges it.
+    fn ensure_bridge(&mut self, instance: &str, agent: Option<&std::path::Path>) {
+        let Some(conn) = self.conn.as_mut() else { return };
+        let (method, params) = ensure_call(instance, agent);
+        if conn.call(method, params).is_err() {
+            self.lost(false);
         }
     }
 
@@ -383,7 +427,7 @@ mod tests {
         ];
         for op in &ops {
             let (method, params) = op_call(op);
-            api::call(method, params, &Ctx { inbox: &via_api }).unwrap_or_else(|e| panic!("{op:?}: {e:?}"));
+            api::call(method, params, &Ctx { inbox: &via_api, bridges: None }).unwrap_or_else(|e| panic!("{op:?}: {e:?}"));
             inbox::ops::apply(&via_ops, std::slice::from_ref(op)).unwrap();
         }
         // Ids and times aside (minted at apply time): threads, then events.
@@ -396,6 +440,45 @@ mod tests {
         };
         assert_eq!(strip(&via_api), strip(&via_ops));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn commands_map_to_their_api_methods() {
+        assert_eq!(
+            ensure_call("web", Some(std::path::Path::new("/tmp/ssh-x/agent.1"))),
+            ("bridges.ensure", json!({"instance": "web", "agent": "/tmp/ssh-x/agent.1"}))
+        );
+        assert_eq!(ensure_call("web", None), ("bridges.ensure", json!({"instance": "web", "agent": null})));
+        // The handle queues each request as its command, in order.
+        let (tx, rx) = mpsc::channel();
+        let (_utx, updates) = mpsc::channel();
+        let worker = DaemonWorker { tx: Some(tx), updates, connected: Arc::default(), handle: None };
+        worker.apply(vec![Op::MarkRead(1)]);
+        worker.ensure_bridge("web".into(), Some("/a".into()));
+        assert_eq!(rx.try_recv().unwrap(), Cmd::Inbox(vec![Op::MarkRead(1)]));
+        assert_eq!(rx.try_recv().unwrap(), Cmd::EnsureBridge { instance: "web".into(), agent: Some("/a".into()) });
+    }
+
+    /// `ensure_call`'s method and params are what the API handler takes.
+    #[test]
+    fn ensure_call_is_accepted_by_the_api() {
+        use crate::serve::api::{self, Bridging, Ctx};
+        struct Knows;
+        impl Bridging for Knows {
+            fn container(&self, _: &str) -> anyhow::Result<Option<String>> {
+                Ok(Some("devsandbox-web".into()))
+            }
+            fn report_agent(&self, _: PathBuf) {}
+            fn reconcile_now(&self, _: String) -> u64 {
+                1
+            }
+            fn wait_ready(&self, _: &str, _: u64, _: std::time::Duration) -> crate::devsbd::bridge::Readiness {
+                unreachable!("the dashboard never waits")
+            }
+        }
+        let path = std::env::temp_dir().join(format!("devsandbox-tui-ensure-{}", std::process::id())).join("inbox.toml");
+        let (method, params) = ensure_call("web", Some(std::path::Path::new("/a")));
+        assert_eq!(api::call(method, params, &Ctx { inbox: &path, bridges: Some(&Knows) }), Ok(json!({"ok": true})));
     }
 
     #[test]

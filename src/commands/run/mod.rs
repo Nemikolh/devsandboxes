@@ -595,9 +595,11 @@ pub(crate) fn materialize(
 
     // ssh-agent for the lifecycle chain. The instance was just saved, so read
     // the agent rule off it (mount → always; relay → only with a host agent).
-    // In relay mode one bridge (RAII-dropped before this fn returns, `?` paths
-    // included) spans shell-rc wiring + all five commands so each exec reaches
-    // the host agent; its handshake failure is reported once, after the chain.
+    // In relay mode the daemon's bridge (`bridges.ensure`; saved state is what
+    // the daemon reads) is waited for before the chain starts (its commands
+    // may clone over ssh at once) and spans shell-rc wiring + all five
+    // commands, the connection held until this fn returns (`?` paths
+    // included). Not ready: one note before the chain, which runs anyway.
     let inst = state.instances.get(instance).expect("instance just inserted");
     // Same env as `devsandbox exec`: remoteEnv, then the saved `--env`.
     let exec_env = inst.exec_env();
@@ -615,10 +617,23 @@ pub(crate) fn materialize(
         ssh_auth_sock,
     );
     crate::devsbd::sync_boot(&container, boot.as_ref(), false);
+    // Nothing to run in the container: no bridge to wait for.
+    let lifecycle = !shell_rc.is_empty()
+        || persist_history
+        || [
+            &props.on_create_command,
+            &props.update_content_command,
+            &props.post_create_command,
+            &props.post_start_command,
+            &props.post_attach_command,
+        ]
+        .iter()
+        .any(|c| c.is_some());
     #[cfg(unix)]
-    let bridge = (crate::devsbd::relay_mode(inst) && host_agent)
-        .then(|| crate::devsbd::bridge::spawn(inst))
-        .flatten();
+    let _relay = (lifecycle && crate::devsbd::relay_mode(inst) && host_agent)
+        .then(|| crate::commands::exec::AgentRelay::ready(instance, &container));
+    #[cfg(not(unix))]
+    let _ = lifecycle;
 
     if !shell_rc.is_empty() || persist_history {
         let paths: Vec<&str> = shell_rc.iter().map(|(_, path)| path.as_str()).collect();
@@ -651,13 +666,6 @@ pub(crate) fn materialize(
             )
             .with_context(|| format!("{name} failed (container `{container}` kept)"))?;
         }
-    }
-
-    // Chain succeeded: surface a relay handshake failure once (as `exec_status`
-    // does). On the error paths above the error is what matters, not this note.
-    #[cfg(unix)]
-    if let Some(Err(e)) = bridge.as_ref().and_then(|b| b.outcome(std::time::Duration::ZERO)) {
-        eprintln!("note: ssh-agent relay unavailable in `{container}`: {e}");
     }
 
     Ok(())

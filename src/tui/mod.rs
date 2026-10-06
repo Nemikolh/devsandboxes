@@ -428,6 +428,17 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
         // The Inbox lives in one shared file (`crate::inbox::store`), so any
         // dashboard's change must reach this one: push what the keys asked
         // for, then reload when the store moved (ours or someone else's).
+        // Terminals just opened on relay-mode instances: the daemon's bridge
+        // relays this dashboard's agent. Disconnected: skipped (no fallback).
+        let bridges = app.take_pending_bridges();
+        #[cfg(unix)]
+        if daemon.connected() {
+            for instance in bridges {
+                daemon.ensure_bridge(instance, crate::devsbd::bridge::own_agent());
+            }
+        }
+        #[cfg(not(unix))]
+        drop(bridges);
         let ops = app.take_pending_inbox();
         #[cfg(unix)]
         let ops = if !ops.is_empty() && daemon.connected() {
