@@ -51,7 +51,9 @@ git worktrees so working trees are never shared.
 - `src/serve/` — the per-user host daemon `devsandbox serve` (unix-only, see
   `docs/serve.md`): `endpoint.rs` (socket dir/paths, bind/connect: the
   `local_endpoint` seam), `daemon.rs` (start lock, accept loop, version
-  handoff, drain), `client.rs` (`connect`: lazy start + hello), `idle.rs`
+  handoff, drain), `host.rs` (the bridges, polled every 5 s, and the startup
+  autostart pass; the TUI no longer bridges), `client.rs` (`connect`: lazy
+  start + hello; `ensure_running` for `run`/`start`), `idle.rs`
   (pure idle countdown over `Holders`), `proto.rs` (JSON-lines wire).
 - `src/runtime/` — backend abstraction over docker/podman/Apple container.
 - `devsbd/` — static in-container helper (workspace member), built by

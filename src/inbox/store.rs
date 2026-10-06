@@ -11,11 +11,18 @@
 //! the atomic rename already makes an unlocked read safe. [`stamp_at`] is the
 //! cheap "did it change" check dashboards run each tick. Callers outside
 //! tests go through [`super::ops`], which names each read and mutation.
+//!
+//! [`generation`] / [`wait_changed`] are the in-process change notification:
+//! every write [`update_at`] makes bumps a counter and wakes its waiters, so
+//! a long-polling `events --wait` in the daemon hears the notify sink's and
+//! the acks' writes at once. Writes by other processes don't reach it; they
+//! still need the [`stamp_at`] check.
 
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::sync::{Condvar, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
 
@@ -91,8 +98,42 @@ pub fn update_at<T>(path: &Path, f: impl FnOnce(&mut Inbox) -> T) -> Result<T> {
     let after = serialize(&inbox)?;
     if after != before || migrated {
         write_atomic(path, &after)?;
+        bump();
     }
     Ok(out)
+}
+
+/// Store writes made by this process, any path. Process-wide rather than
+/// per path: there is one store outside tests, and a spurious wake only costs
+/// a waiter one re-read.
+static CHANGES: (Mutex<u64>, Condvar) = (Mutex::new(0), Condvar::new());
+
+fn bump() {
+    let (lock, cvar) = &CHANGES;
+    *lock.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+    cvar.notify_all();
+}
+
+/// The current write generation. Take it *before* reading the store, then
+/// pass it to [`wait_changed`], so a write in between isn't slept through.
+pub fn generation() -> u64 {
+    *CHANGES.0.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Block until this process wrote the store since generation `seen`, or
+/// `timeout` passed; the generation at return either way.
+pub fn wait_changed(seen: u64, timeout: Duration) -> u64 {
+    let (lock, cvar) = &CHANGES;
+    let deadline = Instant::now() + timeout;
+    let mut current = lock.lock().unwrap_or_else(|e| e.into_inner());
+    while *current == seen {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        current = cvar.wait_timeout(current, left).unwrap_or_else(|e| e.into_inner()).0;
+    }
+    *current
 }
 
 fn serialize(inbox: &Inbox) -> Result<String> {
@@ -145,6 +186,35 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn a_write_wakes_a_waiter_and_a_quiet_store_times_out() {
+        let path = tmpdir("notify").join("inbox.toml");
+        let seen = generation();
+        let writer = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                update_at(&path, |i| i.push("a-id".into(), "a".into(), rec("one"), true)).unwrap();
+            })
+        };
+        let started = Instant::now();
+        assert!(wait_changed(seen, Duration::from_secs(10)) > seen);
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        writer.join().unwrap();
+
+        // A no-op update writes nothing, so it wakes nobody. Other tests in
+        // this process may write their own stores meanwhile, so only bound
+        // the wait from above: it returns by the timeout at the latest.
+        update_at(&path, |_| {}).unwrap();
+        let started = Instant::now();
+        wait_changed(generation(), Duration::from_millis(200));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        // An already-passed generation returns at once.
+        let started = Instant::now();
+        assert!(wait_changed(seen, Duration::from_secs(10)) > seen);
+        assert!(started.elapsed() < Duration::from_millis(100));
     }
 
     #[test]

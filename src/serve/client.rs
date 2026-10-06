@@ -18,8 +18,9 @@ use super::proto::{self, HelloParams, HelloResult, Request, Response, Version};
 pub const START_TIMEOUT: Duration = Duration::from_secs(5);
 const POLL: Duration = Duration::from_millis(50);
 
-/// A connection past the hello. `daemon` is what the daemon reported.
-#[allow(dead_code)] // used from step 5 on (bridges in the daemon) and step 6 (the API)
+/// A connection past the hello. `daemon` is what the daemon reported. Held
+/// open, it makes its client a holder (the TUI holds one for its life).
+#[allow(dead_code)] // `reader`/`daemon`: the API (step 6)
 pub struct Conn {
     reader: BufReader<Stream>,
     writer: Stream,
@@ -66,9 +67,20 @@ pub enum Hello {
 
 /// Connect to the daemon in `dir`, starting it if nothing answers, and say
 /// hello as `client` (`tui`, `cli`, …).
-#[allow(dead_code)] // first caller: step 5 (commands ensure the daemon for bridges)
 pub fn connect(dir: &Path, client: &str) -> Result<Conn> {
     connect_with(dir, client, &Version::current(), START_TIMEOUT, &spawn_detached)
+}
+
+/// Make sure a daemon runs (lazy start), for a command that just started a
+/// container: its dispatcher must get a live host even with no dashboard
+/// open. Best effort: a failure is one warning line on stderr (stdout stays
+/// clean for `run --json`), never an error. The connection is dropped at
+/// once; from then on the running instance holds the daemon, if it's one
+/// that expects a host.
+pub fn ensure_running(client: &str) {
+    if let Err(e) = endpoint::socket_dir().and_then(|dir| connect(&dir, client)) {
+        eprintln!("warning: devsandbox serve: {e:#}");
+    }
 }
 
 /// [`connect`] with the version, timeout and spawner injectable for tests.

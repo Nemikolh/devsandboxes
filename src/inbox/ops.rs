@@ -37,6 +37,17 @@ pub fn stamp(path: &Path) -> Option<(SystemTime, u64)> {
     store::stamp_at(path)
 }
 
+/// This process's store write generation (`store::generation`).
+pub fn generation() -> u64 {
+    store::generation()
+}
+
+/// Wait for a store write by this process after generation `seen`, up to
+/// `timeout` (`store::wait_changed`).
+pub fn wait_changed(seen: u64, timeout: std::time::Duration) -> u64 {
+    store::wait_changed(seen, timeout)
+}
+
 /// Apply a batch of user [`Op`]s in one write, all stamped with one `now`
 /// minted under the lock (event ids and times are never minted by a client).
 pub fn apply(path: &Path, ops: &[Op]) -> Result<()> {

@@ -2,7 +2,7 @@
 
 Sandboxes that come up on their own after a boot, tell you when they need you, and spawn their own child instances to do work. devsandbox provides the plumbing only; what to watch and when to act lives in a script you write. Design and internals: [`docs/automations.md`](automations.md) and [`docs/inbox-threads.md`](inbox-threads.md).
 
-Everything here except `autostart = true` needs the embedded `devsbd` helper (release archives, npm package, local builds after `scripts/build-devsbd.sh`; not `cargo install`). Inside a sandbox it is on `PATH` as `devsbd` (a best-effort `/usr/local/bin/devsbd` symlink; the binary is `/run/devsandbox/bin/devsbd`). An open dashboard updates the helper of every running instance it bridges, so a running dispatcher gets new `devsbd` verbs without a restart once you open the dashboard of a newer devsandbox.
+Everything here except `autostart = true` needs the embedded `devsbd` helper (release archives, npm package, local builds after `scripts/build-devsbd.sh`; not `cargo install`). Inside a sandbox it is on `PATH` as `devsbd` (a best-effort `/usr/local/bin/devsbd` symlink; the binary is `/run/devsandbox/bin/devsbd`). The host daemon (`devsandbox serve`, docs/serve.md) updates the helper of every running instance it bridges, so a running dispatcher gets new `devsbd` verbs without a restart once a newer devsandbox's daemon runs (the first dashboard, `run` or `start` of the new version takes over).
 
 ## `autostart`
 
@@ -33,7 +33,7 @@ devsbd notify [--level info|warn|error] [--link URL] [--key K] [--] <msg>...
 ```
 
 - Queued first: each call writes a record to a durable outbox in the container (`/var/lib/devsandbox/outbox/`, survives container restarts) and succeeds even with no host attached.
-- Delivered while the **dashboard is open**: it shows up in the Inbox tab (`4`) and as a desktop notification (`notify-send` on Linux, `osascript` on macOS; skipped silently when missing). One-shot CLI commands don't deliver; the queue waits for the next dashboard. A record is acknowledged to the container only after it is saved, so a dashboard that dies mid-delivery loses nothing: the record is resent.
+- Delivered while the **host daemon** (`devsandbox serve`) runs: it shows up in the Inbox tab (`4`) and as a desktop notification (`notify-send` on Linux, `osascript` on macOS; skipped silently when missing). The dashboard, `run` and `start` start the daemon; it keeps running while a dispatcher does, and otherwise exits 10 minutes after the last dashboard closed. Without it the queue waits. A record is acknowledged to the container only after it is saved, so a host that dies mid-delivery loses nothing: the record is resent.
 - An unread notification counts in the Inbox title (`Inbox (N)`) and the yellow `✉N` on its instance row, and sits in the **Needs you** view. It is marked read when you open it, or when you leave the Inbox after it was on screen (in Needs you or All).
 - `--key` threads per instance: a newer notification with the same key becomes the head of that row, and the older ones are listed under *earlier* in the thread pane beside it, so a script re-reporting "PR 123 conflicted" every poll doesn't spam.
 - `--link` (http(s) only) opens with `enter` once the thread has focus. `d` dismisses a notification row with its history; `D` clears every notification (dispatcher threads stay). History is saved in `inbox.toml` next to `state.toml`, shared by every open dashboard and kept across restarts; a dismissal in one dashboard is gone from all of them.
@@ -115,10 +115,10 @@ Exit codes:
 | 0 | ok |
 | 1 | failed (the message says why; host-side details in the log below) |
 | 2 | usage error, or an ambiguous key (pass `--sandbox`) |
-| 75 | no host connected: the dashboard isn't open (or the helper daemon isn't running). Retry later. |
+| 75 | no host connected: the host daemon (`devsandbox serve`) isn't running (or the helper daemon isn't). Retry later. |
 | 77 | denied: not a dispatcher (or a dispatcher's child), sandbox not in `spawn` (or, for `ensure`, itself a dispatcher), not this dispatcher's child, `max-instances` reached, a denied `--env` name |
 
-Control is served only while the devsandbox **dashboard** is open (two open dashboards are fine: each request goes to one of them). Nothing is queued: a script must retry on 75.
+Control is served by the host daemon (`devsandbox serve`), which the dashboard, `run` and `start` start and which stays up while a dispatcher runs, dashboard closed or not. It can still be missing, e.g. after a reboot when the runtime restarted the dispatcher before any `devsandbox` command ran. Nothing is queued: a script must retry on 75.
 
 ### Children
 
@@ -220,13 +220,13 @@ Every text field refuses control characters other than newline, and unknown fiel
 
 Your put always wins: if the user marked a thread done and your next pass puts it as `needs-you` again, it's back in Needs you. Handle the `done` event (below) and put the thread as `done` from then on.
 
-While no dashboard is open, a queued `put` or `rm` for a key replaces any older queued `put`/`rm` for the same key (notifications are never coalesced), so a dispatcher re-asserting every few minutes overnight doesn't pile up files.
+While no host daemon runs, a queued `put` or `rm` for a key replaces any older queued `put`/`rm` for the same key (notifications are never coalesced), so a dispatcher re-asserting every few minutes overnight doesn't pile up files.
 
-`thread rm <key>` drops one of your threads, its pending events with it. `thread ls` prints a JSON array of your live threads in `put` shape (the `state` reflects the user's done/reopen too), for a dispatcher that lost its own state; it needs an open dashboard (exit 75 otherwise). Threads are tied to your instance's id, not its name: they survive stop, restart and rebuild. `devsandbox rm` of the dispatcher archives them (read-only, shown only in **All**). Done and archived threads are dropped 14 days after their last change, unless a done thread still has events you haven't acked; past the 200-per-instance cap, archived threads go first, then done ones.
+`thread rm <key>` drops one of your threads, its pending events with it. `thread ls` prints a JSON array of your live threads in `put` shape (the `state` reflects the user's done/reopen too), for a dispatcher that lost its own state; it needs the host daemon (exit 75 otherwise). Threads are tied to your instance's id, not its name: they survive stop, restart and rebuild. `devsandbox rm` of the dispatcher archives them (read-only, shown only in **All**). Done and archived threads are dropped 14 days after their last change, unless a done thread still has events you haven't acked; past the 200-per-instance cap, archived threads go first, then done ones.
 
 ### Events
 
-What the user does on a thread comes back as an event, held by the dashboard host until you ack it:
+What the user does on a thread comes back as an event, held by the host until you ack it:
 
 ```
 devsbd events [--wait SECS]     # JSON lines, oldest first
@@ -246,12 +246,12 @@ devsbd events ack <id>...
 | `done` | `d` on the thread (list or pane), or a `done: true` button | `action`: the button's `id`, only from a button |
 | `reopen` | `u` in the pane on a done thread (it goes back to `active`) | |
 
-`at` is RFC 3339 UTC, by the dashboard host's clock. `d` and `u` only send an event when they change something (`d` on a done thread, `u` on a live one, do nothing). Each event also adds a timeline entry, and the pane shows how many are still waiting for you. Archived threads take no events.
+`at` is RFC 3339 UTC, by the host's clock. `d` and `u` only send an event when they change something (`d` on a done thread, `u` on a live one, do nothing). Each event also adds a timeline entry, and the pane shows how many are still waiting for you. Archived threads take no events.
 
 - **At least once.** `events` prints every pending event, not just new ones, until they're acked. Ack after you've saved what the event changed in your own state, and make handlers idempotent: a crash between the two replays the event. The `id` tells two deliveries of one event apart.
 - `events ack` prints how many it dropped; an id that's unknown, already acked or another instance's is ignored, so a retried ack is harmless. A malformed id is a usage error (exit 2).
 - `--wait SECS` (at most 300) returns as soon as anything is pending, or prints nothing after `SECS`. Use it in place of your loop's sleep and a click gets handled within seconds. Without `--wait`, `events` answers at once.
-- Events are a control command: they need an open dashboard (exit 75 otherwise). An event only exists because someone clicked in a dashboard, so there's nothing to miss meanwhile; they wait in `inbox.toml`.
+- Events are a control command: they need the host daemon (exit 75 otherwise). An event only exists because someone clicked in a dashboard, so there's nothing to miss meanwhile; they wait in `inbox.toml`.
 - Each thread keeps at most 100 unacked events (the oldest is dropped beyond that), and one `events` answer stops at about 512 KiB: ack what you got and call again for the rest.
 - You only ever see and ack events of your own threads.
 
@@ -288,7 +288,7 @@ while :; do
 
   # Sleep up to 5 min, or until the user clicks.
   out=$(devsbd events --wait 300); rc=$?
-  if [ "$rc" -eq 75 ]; then sleep 60; continue; fi   # no dashboard open
+  if [ "$rc" -eq 75 ]; then sleep 60; continue; fi   # no host daemon
   [ "$rc" -eq 0 ] && [ -n "$out" ] || continue
   printf '%s\n' "$out" | while IFS= read -r ev; do
     key=$(printf '%s' "$ev" | jq -r .key)
@@ -329,7 +329,7 @@ REPO=owner/web
 STATE=.babysit            # key -> run id; gitignored
 mkdir -p "$STATE"
 
-# Run a control command, retrying while no dashboard is open (exit 75).
+# Run a control command, retrying while no host daemon runs (exit 75).
 ctl() {
   while :; do
     "$@"; rc=$?
@@ -387,6 +387,6 @@ Notes: `--branch "$branch"` puts the child's worktree on the PR head, tracking `
 - **Supplementary groups**: when the boot hook switches from root to `remoteUser`, the user's supplementary groups are dropped.
 - **Zombies**: one zombie process per container start unless the sandbox sets `init = true`.
 - **Runs are kept until deleted**: `/var/lib/devsandbox/runs/` grows until the child is removed or rebuilt; clean up with `devsbd run prune <key> [--keep N]` (or `run rm` for one run).
-- **Host-side limits**: a dashboard serves at most 8 notify/control requests per instance at once (more are refused and retried, or fail with "host disconnected"). A dispatched `ensure`/`stop`/`rm` is killed after 30 min (with its docker/git children) and answers `timed out after 30 min`; a run command (`exec`, `run ls|logs|rm|prune`) after 5 min, `run wait` after its 300 s cap plus 30 s; run-command output over 1 MiB is an error, not a cut-off answer.
-- **The dashboard must be open** for notifications to be delivered and for control commands to succeed (exit 75 otherwise). Notifications queue; control requests don't.
+- **Host-side limits**: the host serves at most 8 notify/control requests per instance at once (more are refused and retried, or fail with "host disconnected"). A dispatched `ensure`/`stop`/`rm` is killed after 30 min (with its docker/git children) and answers `timed out after 30 min`; a run command (`exec`, `run ls|logs|rm|prune`) after 5 min, `run wait` after its 300 s cap plus 30 s; run-command output over 1 MiB is an error, not a cut-off answer.
+- **The host daemon must be running** (`devsandbox serve`, started by the dashboard, `run` and `start`) for notifications to be delivered and for control commands to succeed (exit 75 otherwise). Notifications queue; control requests don't.
 - **Host git refuses repos with command-running config**: every sandbox can write the repo's `.git` (worktree instances share the base repo's), so host git — `worktree add`/`remove`, `fetch`, `branch -D`, which `ensure` and `rm` trigger — runs with hooks and `core.fsmonitor` disabled and first checks the repo's local config files (`.git/config`, `config.worktree`s) against an allowlist of keys that can't run commands. Anything else (`core.sshCommand`, `filter.*`, `include.path`, `credential.*`, an `ext::` remote URL, …) or an `objects/info/alternates` file makes the command fail with `refusing to run git on <repo>: … sets <key>`. A sandbox may have written it: review the key and remove it (`git config --unset <key>` after checking it is yours); put personal settings in `~/.gitconfig`, which isn't checked.

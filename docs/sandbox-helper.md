@@ -177,10 +177,10 @@ The main crate must build for every release target (incl. macOS, Windows) while 
 - **When:** in `run` after create (next to lifecycle commands) and in
   `start_instance` (`src/commands/start.rs:42`, both the resolved and bare
   branches) after the container starts, plus the TUI's bare `s` start
-  (`spawn_start`, silently), and in the dashboard before every bridge
-  (re)spawn (`Bridges::reconcile`, on the bridge worker), so an open
-  dashboard upgrades a running instance's helper and the daemon of the new
-  build takes over. On docker `/run` is in the container's writable
+  (`spawn_start`, silently), and in the host daemon (`devsandbox serve`)
+  before every bridge (re)spawn (`Bridges::reconcile`, on the bridge
+  worker), so a newer daemon upgrades a running instance's helper and the
+  in-container daemon of the new build takes over. On docker `/run` is in the container's writable
   layer, so the binary survives a restart (only the daemon doesn't — the bridge
   self-heals that); reinstall on start stays for CLI upgrades and images that
   do mount a tmpfs at `/run`. Reinstall is cheap and the hash check makes it a
@@ -318,19 +318,19 @@ ssh (in container) ──unix──▶ devsbd daemon ◀──frames over exec s
   - Each host process owns its bridges; they're never shared across processes.
     Several bridges per container are normal (the daemon routes agent streams to
     the newest agent-capable one, see _Bridge_).
-  - TUI: one bridge per running instance while the dashboard is open, used by
-    every integrated terminal tab on that instance (`devsbd::bridge::Bridges`).
-    Owned by a worker thread (`Bridges::spawn_worker` → `BridgeWorker`), not the
-    UI thread: the snapshot arm in `src/tui/mod.rs` just `send`s the worker the
-    owned list of running containers, and the worker does `State::load` + the
-    per-instance `exec` off-thread, coalescing a burst of snapshots to the
-    newest list before reconciling. A dead bridge is retried at most every 10s —
+  - Host daemon (`devsandbox serve`, docs/serve.md): one bridge per running
+    instance while it runs, used by every integrated terminal tab on that
+    instance (`devsbd::bridge::Bridges`). The dashboard no longer bridges; it
+    keeps the daemon alive while open. Owned by a worker thread
+    (`Bridges::spawn_worker` → `BridgeWorker`): the daemon's poll thread
+    (`src/serve/host.rs`, every 5 s) `send`s the worker the owned list of
+    running containers, and the worker does `State::load` + the per-instance
+    `exec`, coalescing a burst of lists to the newest before reconciling. A dead bridge is retried at most every 10s —
     except a protocol **version mismatch** (host- or daemon-side, see _Bridge_),
     which is retried only every 5 min, since only a helper rewrite fixes it
     (`start`, which may not take the container out of the running set; a real
-    restart drops the entry and retries at once). On TUI exit `BridgeWorker`'s `Drop` closes the channel and joins the
-    worker (any exit path, including `?` early returns), so every bridge is
-    killed before the terminal is restored.
+    restart drops the entry and retries at once). On daemon exit `BridgeWorker`'s `Drop` closes the channel and joins the
+    worker, so every bridge is killed before the daemon releases its lock.
   - CLI `exec` (including the TUI's suspended `:exec`, which goes through
     `exec_status`): its own bridge for the lifetime of the exec, started
     optimistically alongside the command, with no handshake wait and so no added
@@ -341,7 +341,7 @@ ssh (in container) ──unix──▶ devsbd daemon ◀──frames over exec s
     installed, no bind mount) when the host has a live agent. A mounted
     instance stays on the mount (the mount occupies the daemon's socket path).
   - Everything else (VS Code terminals, plain `docker exec`): covered whenever
-    a devsandbox TUI/exec is alive; otherwise not. VS Code keeps its own
+    the host daemon or a devsandbox exec is alive; otherwise not. VS Code keeps its own
     forwarding. Document the gap; a `devsandbox agent <instance>` foreground
     command is a cheap follow-up if needed.
 
@@ -436,7 +436,7 @@ kind: 0 Hello(u32 version, u8 hash_len, hash utf-8, u32 caps)  1 Open(channel: u
   `devsbd run … <key> …`, `devsbd events`, `events ack` or `thread ls` request, sent the same way (run ops
   are then carried out by the host exec'ing `devsbd run …` in the child;
   runs themselves never touch the frame channel), answered with an encoded response and a close;
-  only sink-bearing TUI bridges advertise it, and the host's handler refuses
+  only sink-bearing (host daemon) bridges advertise it, and the host's handler refuses
   non-dispatchers). The bridge does two separate handshakes and copies
   bytes, so caps don't flow end to end by themselves:
   - The daemon's `Hello` advertises `TCP_FORWARD`.
@@ -448,7 +448,7 @@ kind: 0 Hello(u32 version, u8 hash_len, hash utf-8, u32 caps)  1 Open(channel: u
   - The host sends `Caps` right after its handshake; it passes through the
     bridge verbatim to the daemon (an old daemon skips the unknown kind). The
     host advertises `SSH_AGENT` only when its bridge has a live agent provider,
-    `NOTIFY` + `CONTROL` only when it has a notification sink (the TUI's).
+    `NOTIFY` + `CONTROL` only when it has a notification sink (the host daemon's).
 - Payload capped at 1 MiB (`MAX_PAYLOAD`): stray bytes on the stream (a shell
   banner on stdout) become an `InvalidData` error, not a huge allocation.
   Malformed `Hello`/`Open` payloads are errors too. **Unknown kinds are

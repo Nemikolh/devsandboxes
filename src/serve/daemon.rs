@@ -6,8 +6,10 @@
 //! its own thread reading JSON lines. Exiting (idle or handoff) closes the
 //! listener and removes the socket first, then shuts down the read side of
 //! every connection, so idle ones end at once while a request in flight still
-//! writes its response, and waits up to [`DRAIN_TIMEOUT`] for them. The start
-//! lock is released last, so a successor never binds while this one drains.
+//! writes its response, and waits up to [`DRAIN_TIMEOUT`] for them. Then the
+//! live host side ([`Host`]: bridges, autostart) stops, killing every bridge.
+//! The start lock is released last, so a successor never binds (or bridges)
+//! while this one drains.
 
 use std::collections::HashMap;
 use std::fs::{File, TryLockError};
@@ -22,6 +24,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
 use super::endpoint::{self, Listener, Stream};
+use super::host::Host;
 use super::idle::{self, Decision, Holders};
 use super::proto::{self, HelloParams, HelloResult, Request, Response, Version};
 
@@ -42,11 +45,14 @@ pub struct Options {
     pub keep_alive: bool,
     /// [`idle::IDLE_TIMEOUT`] outside tests.
     pub idle_timeout: Duration,
+    /// Run the live host side ([`Host`]: bridges, popups, autostart). Off in
+    /// tests, which must not touch the user's state or containers.
+    pub host: bool,
 }
 
 impl Options {
     pub fn new(keep_alive: bool) -> Self {
-        Self { version: Version::current(), keep_alive, idle_timeout: idle::IDLE_TIMEOUT }
+        Self { version: Version::current(), keep_alive, idle_timeout: idle::IDLE_TIMEOUT, host: true }
     }
 }
 
@@ -94,6 +100,7 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
         if opts.keep_alive { ", keep-alive" } else { "" },
     ));
 
+    let host = opts.host.then(|| Host::start(log));
     let shared = Arc::new(Shared::new(opts.version.clone()));
     let mut next_conn = 0u64;
     let exit = loop {
@@ -101,7 +108,7 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
             break Exit::Handoff;
         }
         let now = Instant::now();
-        let holders = shared.holders();
+        let holders = shared.holders(host.as_ref());
         if holders.any() {
             *shared.idle_since.lock().unwrap() = now;
         }
@@ -130,6 +137,9 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
     listener.remove();
     shared.close();
     shared.drain(DRAIN_TIMEOUT);
+    // Before the lock goes: a successor's bridges must not overlap ours (two
+    // sink bridges on one container would split its notify/control streams).
+    drop(host);
     Ok(exit)
 }
 
@@ -190,8 +200,16 @@ impl Shared {
         }
     }
 
-    fn holders(&self) -> Holders {
-        Holders { clients: self.conns.lock().unwrap().len(), ..Default::default() }
+    fn holders(&self, host: Option<&Host>) -> Holders {
+        let clients = self.conns.lock().unwrap().len();
+        let Some(host) = host else { return Holders { clients, ..Default::default() } };
+        Holders {
+            clients,
+            live_instances: host.live_instances(),
+            control: host.control(),
+            autostart: host.autostarting(),
+            ..Default::default()
+        }
     }
 
     /// Register before the thread starts, so the next holder snapshot counts
@@ -292,7 +310,7 @@ fn hello(id: Option<u64>, params: Value, shared: &Shared) -> Response {
 }
 
 /// One line to stderr, which the lazy start points at `serve.log`.
-fn log(msg: &str) {
+pub(super) fn log(msg: &str) {
     let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     eprintln!("[{secs}] devsandbox serve: {msg}");
 }
@@ -313,6 +331,7 @@ pub(crate) mod tests {
             version: Version { semver: "0.6.0".into(), build },
             keep_alive: false,
             idle_timeout: Duration::from_millis(idle_ms),
+            host: false,
         }
     }
 

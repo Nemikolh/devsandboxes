@@ -67,7 +67,10 @@ pub use crate::devsbd::control::{valid_key, MAX_KEY};
 /// `events --wait` with the same number.
 pub use crate::devsbd::control::MAX_WAIT;
 
-/// How often a waiting `events` request re-checks the store's stamp.
+/// How often a waiting `events` request re-checks the store's stamp. Writes
+/// made in this process (the daemon's notify sink and acks) wake it at once
+/// (`inbox_ops::wait_changed`); this fallback is for the other processes
+/// still writing the store (dashboard ops, `devsandbox rm`).
 const EVENTS_POLL: Duration = Duration::from_millis(500);
 
 /// Wall-clock limit on one dispatch `devsandbox` subprocess (`ensure`,
@@ -132,8 +135,8 @@ pub trait Executor {
 
 /// Load state and the dispatcher's config, then [`handle_with`] the real
 /// executor. `dispatcher_key` is the state key of the instance whose bridge
-/// the request arrived on. Blocking (it waits for the subprocess): run it off
-/// the UI thread. Called by the TUI bridges' `CONTROL` handler
+/// the request arrived on. Blocking (it waits for the subprocess). Called by
+/// the host daemon's bridges' `CONTROL` handler
 /// (`devsbd::bridge`), which is unix-only.
 #[cfg_attr(not(unix), allow(dead_code))]
 pub fn handle(dispatcher_key: &str, req: &Request) -> Response {
@@ -403,15 +406,18 @@ fn events_body(pending: &[(String, Event)]) -> String {
 
 /// `events`: `owner_id`'s pending events in the store at `path`. With
 /// nothing pending and a `timeout`, wait on the handler thread, re-reading
-/// the store only when its stamp moves (checked every [`EVENTS_POLL`]); an
-/// empty body on timeout. Reads only: no lock beyond the store's own shared
-/// one, so a waiting `events` never holds up a click being written.
+/// the store only when this process wrote it or its stamp moved (checked
+/// every [`EVENTS_POLL`]); an empty body on timeout. Reads only: no lock
+/// beyond the store's own shared one, so a waiting `events` never holds up
+/// a click being written.
 fn events(path: &Path, owner_id: &str, timeout: u64) -> Response {
     let deadline = Instant::now() + Duration::from_secs(timeout);
     let mut seen = None;
     loop {
         // Stamp before reading: a write in between only costs one more read.
-        let stamp = Some(inbox_ops::stamp(path));
+        // The generation too, so two writes inside one mtime tick still read.
+        let generation = inbox_ops::generation();
+        let stamp = Some((generation, inbox_ops::stamp(path)));
         if stamp != seen {
             seen = stamp;
             let pending = match inbox_ops::events(path, owner_id) {
@@ -426,7 +432,7 @@ fn events(path: &Path, owner_id: &str, timeout: u64) -> Response {
         if left.is_zero() {
             return Response::new(Status::Ok, "");
         }
-        std::thread::sleep(left.min(EVENTS_POLL));
+        inbox_ops::wait_changed(generation, left.min(EVENTS_POLL));
     }
 }
 
@@ -2171,6 +2177,47 @@ folder = "."
         let got = lines(&resp);
         assert_eq!(got.len(), 1, "{resp:?}");
         assert_eq!(got[0]["text"], "ours");
+    }
+
+    /// An in-process write (the daemon's sink, an ack) wakes a waiter at once,
+    /// not at the next [`EVENTS_POLL`]; a write by another process (here: a
+    /// rename that bypasses `update_at`) is still seen by the stamp fallback.
+    #[test]
+    fn events_wait_hears_in_process_writes_at_once_and_others_by_polling() {
+        let s = state();
+        let (path, mut fake) = inbox_fake("notify");
+        let writer = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                reply(&path, "d", "fast", 10);
+            })
+        };
+        let started = Instant::now();
+        let resp = call(&s, "d", &Request { timeout: Some(30), ..Request::new(Op::Events) }, &mut fake);
+        writer.join().unwrap();
+        assert!(started.elapsed() < Duration::from_millis(450), "{:?}", started.elapsed());
+        assert_eq!(lines(&resp)[0]["text"], "fast");
+        let ack = Request { ack: vec![lines(&resp)[0]["id"].as_str().unwrap().into()], ..Request::new(Op::EventsAck) };
+        assert_eq!(call(&s, "d", &ack, &mut fake).body, "1");
+
+        // Prepare the next store beside it (this bumps the generation now,
+        // before the wait starts), then swap it in without a bump.
+        let next = path.with_file_name("next.toml");
+        std::fs::copy(&path, &next).unwrap();
+        reply(&next, "d", "slow", 11);
+        let writer = {
+            let (path, next) = (path.clone(), next.clone());
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                std::fs::rename(&next, &path).unwrap();
+            })
+        };
+        let started = Instant::now();
+        let resp = call(&s, "d", &Request { timeout: Some(30), ..Request::new(Op::Events) }, &mut fake);
+        writer.join().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        assert_eq!(lines(&resp)[0]["text"], "slow");
     }
 
     #[test]

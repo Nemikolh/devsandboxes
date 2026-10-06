@@ -79,11 +79,11 @@ devsbd notify [--level info|warn|error] [--link URL] [--key K] "PR 123 needs you
 
 - Delivered to the TUI inbox (badge on the instance, an inbox view listing notifications with source instance, time, link) **and** as a desktop notification: `notify-send` on Linux, `osascript -e 'display notification …'` on macOS. A missing notifier is skipped silently.
 - `--key` dedupes: a newer notification with the same key replaces the older one (a dispatcher re-reporting "PR 123 conflicted" every poll doesn't spam).
-- **Queued**: written to a durable outbox in the container (`/var/lib/devsandbox/outbox/`, surviving container restarts), drained by the host whenever a notify-capable bridge is up. Only the TUI's bridges are (one-shot CLI commands don't drain). The history lives in the shared Inbox store (`inbox.toml`, _Inbox threads_ below), not in a dashboard.
+- **Queued**: written to a durable outbox in the container (`/var/lib/devsandbox/outbox/`, surviving container restarts), drained by the host whenever a notify-capable bridge is up. Only the host daemon's (`devsandbox serve`) bridges are (one-shot CLI commands don't drain). The history lives in the shared Inbox store (`inbox.toml`, _Inbox threads_ below), not in a dashboard.
 
 ## Dispatchers
 
-A dispatcher is an ordinary sandbox that declares `dispatcher`. Only such sandboxes get the control API: every TUI bridge advertises `CONTROL`, and the host re-checks the config on each request and denies (exit 77) every other sandbox.
+A dispatcher is an ordinary sandbox that declares `dispatcher`. Only such sandboxes get the control API: every host daemon bridge advertises `CONTROL`, and the host re-checks the config on each request and denies (exit 77) every other sandbox.
 
 ```toml
 [sandbox.pr-dispatcher]

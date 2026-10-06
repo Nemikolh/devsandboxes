@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
-/// What keeps the daemon alive, one field per row of the holder table. Only
-/// `clients` is counted so far; the rest stay 0 until their step fills them.
+/// What keeps the daemon alive, one field per row of the holder table (plus
+/// `autostart`). `forwards` and `followers` stay 0 until their step fills them.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Holders {
     /// Connected clients: TUI, `api --stdio`, an `inbox` command, an `exec`
@@ -15,18 +15,22 @@ pub struct Holders {
     pub clients: usize,
     /// Active port forwards (step 8).
     pub forwards: usize,
-    /// Running instances declaring `dispatcher` or `inbox = true` (step 5).
+    /// Running instances declaring `dispatcher` (`inbox = true` joins in
+    /// step 11), as of the daemon's last container poll.
     pub live_instances: usize,
-    /// In-flight control requests (step 5).
+    /// In-flight control requests.
     pub control: usize,
     /// `--follow` subscribers (step 18).
     pub followers: usize,
+    /// 1 while the startup `autostart = true` pass runs (it may be creating
+    /// an instance; an idle exit would cut it off).
+    pub autostart: usize,
 }
 
 impl Holders {
     pub fn any(&self) -> bool {
-        let Holders { clients, forwards, live_instances, control, followers } = *self;
-        clients + forwards + live_instances + control + followers > 0
+        let Holders { clients, forwards, live_instances, control, followers, autostart } = *self;
+        clients + forwards + live_instances + control + followers + autostart > 0
     }
 }
 
@@ -81,6 +85,7 @@ mod tests {
             Holders { live_instances: 1, ..Default::default() },
             Holders { control: 1, ..Default::default() },
             Holders { followers: 1, ..Default::default() },
+            Holders { autostart: 1, ..Default::default() },
         ];
         for h in rows {
             assert_eq!(decide(&h, start, late, false, T), Decision::Hold, "{h:?}");

@@ -247,26 +247,29 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
     // Set while the follow-up's collection runs: proc targets come from the
     // snapshot, so the proc refresh must wait for it to land.
     let mut procs_after_snapshot = false;
-    // ssh-agent relays, one per running instance while the dashboard is open
-    // (docs/sandbox-helper.md). Owned by a worker thread so `State::load` and
-    // the per-instance `exec` spawns never block the UI; the snapshot arm just
-    // sends it the running set. Its `Drop` (any exit path, including `?` early
-    // returns) closes the channel and joins the thread, killing every bridge
-    // before the terminal is restored.
-    // With a notify sink, bridges also drain each instance's `devsbd notify`
-    // outbox (docs/automations.md); the worker shows desktop notifications,
-    // this loop just drains the channel.
+    // The host daemon (docs/serve.md) owns the bridges: ssh-agent relays,
+    // the notify drain, popups and control ops. Lazy-started off the UI
+    // thread (the start waits up to 5 s); the connection is then held for the
+    // dashboard's life, so the dashboard counts as a holder. A failure is a
+    // status line: the dashboard works without it, minus the live features.
     #[cfg(unix)]
-    let (notify_tx, notifications) = std::sync::mpsc::channel();
+    let mut daemon_rx = Some({
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let conn = crate::serve::endpoint::socket_dir()
+                .and_then(|dir| crate::serve::client::connect(&dir, "tui"));
+            let _ = tx.send(conn);
+        });
+        rx
+    });
     #[cfg(unix)]
-    let bridges = crate::devsbd::bridge::Bridges::spawn_worker(Some(notify_tx));
-    // Ports-tab forwards (docs/port-forwarding.md, step 10). Same ownership as
-    // `bridges`: a worker thread owns every `Forward`, doing all config/state/
-    // docker work (route resolution, `ensure`, the `lsof` probe) off the UI
-    // thread; its `Drop` (any exit path, including `?`) closes the channel and
-    // joins, dropping every forward — killing its bridge/`exec` — before the
-    // terminal is restored. Declared after `bridges` so it drops first (LIFO),
-    // though the two are independent.
+    let mut _daemon: Option<crate::serve::client::Conn> = None;
+    // Ports-tab forwards (docs/port-forwarding.md, step 10). A worker thread
+    // owns every `Forward`, doing all config/state/docker work (route
+    // resolution, `ensure`, the `lsof` probe) off the UI thread; its `Drop`
+    // (any exit path, including `?`) closes the channel and joins, dropping
+    // every forward — killing its bridge/`exec` — before the terminal is
+    // restored.
     #[cfg(unix)]
     let forwards = forwards::ForwardWorker::spawn(dir.clone());
 
@@ -409,13 +412,21 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
                     forwards::ForwardUpdate::Status(status) => app.status = Some(status),
                 }
             }
-            // Container messages: the bridge worker already wrote them to the
-            // store and rendered the status line, so this is a "reload now"
-            // poke plus the latest line, so it's noticed from any tab. A put
-            // that changed nothing never arrives here.
-            while let Ok(line) = notifications.try_recv() {
-                app.status = Some(line);
-                reload_inbox = true;
+            // The daemon connection, once the lazy start is done. Container
+            // messages reach the Inbox through the store's stamp below.
+            if let Some(rx) = &daemon_rx {
+                match rx.try_recv() {
+                    Ok(Ok(conn)) => {
+                        _daemon = Some(conn);
+                        daemon_rx = None;
+                    }
+                    Ok(Err(e)) => {
+                        app.status = Some(format!("host daemon unavailable: {e:#}"));
+                        daemon_rx = None;
+                    }
+                    Err(TryRecvError::Empty) => {}
+                    Err(TryRecvError::Disconnected) => daemon_rx = None,
+                }
             }
         }
         #[cfg(not(unix))]
@@ -535,14 +546,6 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
                     app.thread_children = children;
                     #[cfg(unix)]
                     {
-                        // Owned list handed to the worker; never blocks the UI.
-                        let running: Vec<String> = snapshot
-                            .instances
-                            .iter()
-                            .filter(|r| matches!(r.status, data::ContainerStatus::Running(_)))
-                            .map(|r| r.container.clone())
-                            .collect();
-                        bridges.send(running);
                         // Configured `forwardPorts` follow the running set.
                         forwards.sync(
                             snapshot

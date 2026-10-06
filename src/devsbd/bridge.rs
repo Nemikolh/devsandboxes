@@ -1,9 +1,9 @@
 //! Host half of the ssh-agent relay (docs/sandbox-helper.md): runs
 //! `exec -i <c> devsbd bridge` and serves the streams it carries, connecting
 //! each `Open` to the host agent. Owners: CLI `exec` (for the command's
-//! lifetime) and the TUI (one per running instance while open). TUI bridges
-//! also take the container's `devsbd notify` records and serve its
-//! `devsbd ensure|ls|stop|rm` control requests (docs/automations.md).
+//! lifetime) and `devsandbox serve` (one per running instance, docs/serve.md).
+//! The daemon's bridges also take the container's `devsbd notify` records and
+//! serve its `devsbd ensure|ls|stop|rm` control requests (docs/automations.md).
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -156,7 +156,7 @@ pub type Sink = Arc<dyn Fn(Notification) -> Result<(), String> + Send + Sync>;
 /// bridge. Blocking; called on the stream's handler thread.
 pub type ControlHandler = Arc<dyn Fn(&str, &Request) -> Response + Send + Sync>;
 
-/// What a long-lived (TUI) bridge serves beyond the agent: notify into its
+/// What a long-lived (daemon) bridge serves beyond the agent: notify into its
 /// sink, control through its handler, both tagged with the instance it serves.
 #[derive(Clone)]
 struct Services {
@@ -200,7 +200,7 @@ impl Drop for HandlerSlot {
 }
 
 /// The caps a host bridge advertises in its `Caps` frame: `SSH_AGENT` only
-/// with an agent socket, `NOTIFY` and `CONTROL` only with a sink (the TUI's
+/// with an agent socket, `NOTIFY` and `CONTROL` only with a sink (the daemon's
 /// bridges) — so short-lived sink-less bridges (`exec`, lifecycle, forwards)
 /// never take notify streams, which would drop the records with them, nor
 /// control requests, which must outlive a one-shot command. Every such bridge
@@ -227,11 +227,39 @@ const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(30);
 fn dispatch_control(key: &str, req: &Request) -> Response {
     use crate::commands::dispatch;
     static LOCK: Mutex<()> = Mutex::new(());
+    let _in_flight = InFlight::enter();
     if !writes_state(req.op) || !dispatch::declares_dispatcher(key) {
         return dispatch::handle(key, req);
     }
     let _serial = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     dispatch::handle(key, req)
+}
+
+/// Control requests being handled by [`dispatch_control`] right now, waiting
+/// ones (`events --wait`, `run wait`) included: a daemon holder row.
+static CONTROL_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+/// How many control requests this process is serving (see
+/// [`CONTROL_IN_FLIGHT`]).
+pub fn control_in_flight() -> usize {
+    CONTROL_IN_FLIGHT.load(Ordering::Acquire)
+}
+
+/// Counts one request in [`CONTROL_IN_FLIGHT`] until dropped, so a panicking
+/// handler still leaves the count right.
+struct InFlight;
+
+impl InFlight {
+    fn enter() -> InFlight {
+        CONTROL_IN_FLIGHT.fetch_add(1, Ordering::AcqRel);
+        InFlight
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        CONTROL_IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// Whether `op` writes `state.toml`, by a `devsandbox` subprocess or (`done`)
@@ -573,9 +601,8 @@ fn wanted(helper: bool, relay: bool, host_agent: bool, has_sink: bool) -> Option
     (with_agent || (has_sink && helper)).then_some(with_agent)
 }
 
-/// The TUI's set of bridges, reconciled against the running instances on each
-/// snapshot. Owned by a worker thread (`spawn_worker`), never touched on the UI
-/// thread.
+/// The daemon's set of bridges (`devsandbox serve`), reconciled against the
+/// running instances on each poll. Owned by a worker thread (`spawn_worker`).
 #[derive(Default)]
 pub struct Bridges {
     // container → (bridge, spawned at, spawned with the agent provider).
@@ -590,7 +617,7 @@ impl Bridges {
     /// `retry_decision`; a bridge whose agent wiring no longer matches (host
     /// agent came or went) is replaced at once. Every (re)spawn first
     /// `ensure_recorded`s the instance's helper, so a CLI upgrade reaches a
-    /// running instance once a dashboard is open: otherwise only
+    /// running instance once the daemon bridges it: otherwise only
     /// `run`/`start`/`port` rewrite it, and a running dispatcher never gets new
     /// verbs. Keyed on spawns, not `is_mismatch`: a stale helper with the same
     /// protocol `VERSION` still bridges fine, it just lacks verbs. Spawns are
@@ -643,21 +670,21 @@ impl Bridges {
 
     /// Move a `Bridges` onto its own thread, fed running-container lists over an
     /// mpsc. Reconcile (which does `State::load`, `exec` spawns and a helper
-    /// reinstall check before each one) never runs
-    /// on the UI thread; the snapshot arm just `send`s the owned list. Dropping
-    /// the returned [`BridgeWorker`] closes the channel and joins the thread,
-    /// which drops every live `Bridge` (killing its `exec`) before returning.
+    /// reinstall check before each one) never runs on the caller's thread; it
+    /// just `send`s the owned list. Dropping the returned [`BridgeWorker`]
+    /// closes the channel and joins the thread, which drops every live
+    /// `Bridge` (killing its `exec`) before returning.
     ///
     /// `sink` set → every helper-capable running instance gets a notify-serving
     /// bridge; each message is applied to the shared Inbox store first (that
     /// write is what the daemon's `ok` acknowledges, so a failed one is
     /// retried), then shown on the desktop (from the stream's handler thread)
     /// unless [`RateLimit`](super::desktop::RateLimit) holds it back, and
-    /// finally the status line is sent on `sink` as a "the store changed" poke
-    /// the TUI drains. A put that changed nothing produces neither, so a
+    /// finally its status line ("<instance>: <msg>") goes to the sink's
+    /// [`OnShown`], if any. A put that changed nothing produces neither, so a
     /// dispatcher re-asserting its threads is invisible.
-    pub fn spawn_worker(sink: Option<mpsc::Sender<String>>) -> BridgeWorker {
-        let sink = sink.map(|tx| -> Sink {
+    pub fn spawn_worker(sink: Option<Option<OnShown>>) -> BridgeWorker {
+        let sink = sink.map(|on_shown| -> Sink {
             // One limiter for every bridge, keyed by instance inside.
             let limit = Mutex::new(super::desktop::RateLimit::default());
             Arc::new(move |n: Notification| {
@@ -672,7 +699,9 @@ impl Bridges {
                         super::desktop::notify_desktop(&instance, &popup);
                     }
                 }
-                let _ = tx.send(shown.line);
+                if let Some(on_shown) = &on_shown {
+                    on_shown(shown.line);
+                }
                 Ok(())
             })
         });
@@ -695,6 +724,10 @@ impl Bridges {
     }
 }
 
+/// Gets the status line of every message the sink stored and showed (see
+/// [`Bridges::spawn_worker`]). Runs on a bridge's handler thread.
+pub type OnShown = Box<dyn Fn(String) + Send + Sync>;
+
 /// Store one delivered message and report what to show, if anything. Split
 /// out of the sink closure so the store write (the thing the daemon's `ok`
 /// acknowledges) and the display decision are one read-modify-write.
@@ -714,15 +747,15 @@ fn apply_message(n: Notification) -> Result<Option<(String, crate::inbox::Shown)
 
 /// Handle to the bridge worker thread. Send running-container lists with
 /// [`send`](Self::send); on drop the channel closes and the thread is joined,
-/// so all bridges are killed before the caller (the TUI) restores the terminal.
+/// so all bridges are killed before the caller (the daemon) releases its lock.
 pub struct BridgeWorker {
     tx: Option<mpsc::Sender<Vec<String>>>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl BridgeWorker {
-    /// Hand the worker the current running-container set. Never blocks the UI
-    /// thread; a dead worker (thread gone) is silently ignored.
+    /// Hand the worker the current running-container set. Never blocks; a
+    /// dead worker (thread gone) is silently ignored.
     pub fn send(&self, running: Vec<String>) {
         if let Some(tx) = &self.tx {
             let _ = tx.send(running);
@@ -734,7 +767,7 @@ impl Drop for BridgeWorker {
     fn drop(&mut self) {
         // Close the channel first so the worker's `recv` returns and it drops
         // `Bridges` (killing every bridge), then join so that teardown finishes
-        // before the terminal is restored.
+        // before the owner goes on (the daemon releasing its lock).
         self.tx.take();
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();

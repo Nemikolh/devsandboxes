@@ -301,6 +301,11 @@ fn main() -> Result<()> {
             // After, not before: `run web` for an autostart `web` must not
             // create two instances. Whatever `run` returned is kept.
             commands::autostart::autostart(&cli.dir);
+            // After autostart, so the daemon's own pass finds this boot done.
+            #[cfg(unix)]
+            if matches!(result, Ok(Some(_))) {
+                serve::client::ensure_running("cli");
+            }
             match (result?, json_out) {
                 (Some(key), Some(out)) => out.emit(&commands::run::run_record_json(&key)?),
                 // Only a written example config gets here: no instance to report.
@@ -319,6 +324,10 @@ fn main() -> Result<()> {
         Command::Start { name, all } => {
             let result = commands::start::start(&cli.dir, name, all);
             commands::autostart::autostart(&cli.dir);
+            #[cfg(unix)]
+            if result.is_ok() {
+                serve::client::ensure_running("cli");
+            }
             result
         }
         Command::Gc { force } => commands::services::gc(&cli.dir, force),
