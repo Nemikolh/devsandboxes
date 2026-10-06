@@ -277,6 +277,16 @@ pub struct NoteView {
     pub at: u64,
 }
 
+/// `forwards.rm`'s answer.
+#[derive(Debug, Serialize)]
+pub struct ForwardRemoved {
+    pub ok: bool,
+    /// The host address it was bound to.
+    pub local: String,
+    /// It was a configured forward: stopped until its owner runs again.
+    pub configured: bool,
+}
+
 fn kind_str(kind: Kind) -> &'static str {
     match kind {
         Kind::Notify => "notify",
@@ -698,7 +708,8 @@ struct ForwardsRmParams {
 
 fn forwards_rm(p: ForwardsRmParams, ctx: &Ctx) -> Answer {
     let removed = forwarding(ctx)?.rm(p.id)?;
-    Ok(json!({ "ok": true, "local": removed.local, "configured": removed.configured }))
+    let view = ForwardRemoved { ok: true, local: removed.local, configured: removed.configured };
+    serde_json::to_value(view).map_err(|e| ApiError::internal(e.into()))
 }
 
 #[cfg(test)]
@@ -1159,5 +1170,80 @@ mod tests {
 
         // A daemon without a host side says so.
         assert_eq!(code(run(&path, "forwards.list", json!({}))), "internal");
+    }
+
+    /// Every wire struct the npm package types matches its `index.d.ts`
+    /// interface (`serve::dts`). Option fields serialize as `null`, so one
+    /// value of each shows every key.
+    #[test]
+    fn npm_typings_match_the_wire_structs() {
+        use crate::serve::dts::assert_matches;
+        use crate::serve::proto::{ErrorBody, HelloParams, HelloResult};
+        fn v(x: &impl Serialize) -> Value {
+            serde_json::to_value(x).unwrap()
+        }
+        let summary = || ThreadSummary {
+            id: 1,
+            owner: "o-id".into(),
+            owner_name: "o".into(),
+            key: Some("k".into()),
+            kind: "thread",
+            state: Some("active"),
+            status: Some("s".into()),
+            title: "t".into(),
+            level: None,
+            unread: true,
+            archived: false,
+            needs_you: false,
+            changed_at: 1,
+        };
+        let detail = ThreadDetail {
+            summary: summary(),
+            link: None,
+            child: None,
+            message: None,
+            reply: Some(ReplyView { placeholder: None }),
+            actions: vec![],
+            entries: vec![],
+            notes: vec![],
+            events_pending: 0,
+        };
+        let action = ActionView { id: "go".into(), label: "Go".into(), done: false, host: None, sends_event: true };
+        let entry = EntryView { seq: 1, at: 1, kind: "message", text: "t".into() };
+        let note = NoteView { id: 1, level: "info", msg: "m".into(), link: None, at: 1 };
+        let row = ForwardRow {
+            id: 1,
+            dir: "/cfg".into(),
+            local: "127.0.0.1:3000".into(),
+            target: "web:3000".into(),
+            process: None,
+            state: "active".into(),
+            conns: 0,
+            configured: false,
+        };
+        let added = Added { id: 1, local: "127.0.0.1:3000".into(), target: "web:3000".into() };
+        let removed = ForwardRemoved { ok: true, local: "127.0.0.1:3000".into(), configured: false };
+        let hello = HelloParams { version: "0.6.0".into(), build: 1, client: "api:x".into() };
+        let hello_result = HelloResult { version: "0.6.0".into(), build: 1, protocol: 1, handoff: true };
+        let error = ErrorBody { code: "invalid".into(), message: "m".into() };
+
+        let cases: [(&str, Value); 13] = [
+            ("ThreadSummary", v(&summary())),
+            ("ThreadDetail", v(&detail)),
+            ("ThreadReply", v(&ReplyView { placeholder: None })),
+            ("ThreadAction", v(&action)),
+            ("ThreadEntry", v(&entry)),
+            ("ThreadNote", v(&note)),
+            ("ForwardRow", v(&row)),
+            ("ForwardAdded", v(&added)),
+            ("ForwardRemoved", v(&removed)),
+            ("HelloParams", v(&hello)),
+            ("HelloResult", v(&hello_result)),
+            ("ApiErrorBody", v(&error)),
+            ("OkResult", ok().unwrap()),
+        ];
+        for (iface, value) in &cases {
+            assert_matches(iface, value);
+        }
     }
 }

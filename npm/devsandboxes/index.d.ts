@@ -267,3 +267,349 @@ export declare const service: {
   /** Recreate a service's containers and rewire running sandboxes in place. */
   rebuild(name: string, opts?: CommonOptions): Promise<void>;
 };
+
+// ---------------------------------------------------------------------------
+// Daemon API
+
+// The host daemon's JSON-lines API (docs/api.md), over `devsandbox api
+// --stdio`. Mirrors the serde structs in src/serve/{api,proto,forwards}.rs;
+// a Rust test (src/serve/dts.rs) fails when a wire struct and its interface
+// here disagree.
+
+/** The API protocol number this package speaks; `connect()` rejects any other. */
+export declare const PROTOCOL: 1;
+
+/** `hello` params: what `connect()` sends first. */
+export interface HelloParams {
+  /** The client's devsandbox version; `connect()` sends `0.0.0` (the relay already handled any version handoff). */
+  version: string;
+  /** Unix mtime of a dev build; 0 otherwise. */
+  build: number;
+  /** Who's calling (`npm:<name>`), for `serve.log`. */
+  client: string;
+}
+
+/** The daemon's answer to `hello` (`api.daemon`). */
+export interface HelloResult {
+  version: string;
+  build: number;
+  /** The API protocol number; see {@link PROTOCOL}. */
+  protocol: number;
+  /** The client is newer: the daemon is exiting. */
+  handoff?: boolean;
+}
+
+/** An error response's body: `code` is stable, `message` is for humans. */
+export interface ApiErrorBody {
+  code: string;
+  message: string;
+}
+
+/** What a mutation answers. */
+export interface OkResult {
+  ok: true;
+}
+
+/** A thread state; `needs-you` is waiting on the user. */
+export type ThreadState = 'needs-you' | 'active' | 'done';
+
+/** An `inbox.threads.list` view, as in the dashboard. */
+export type InboxView = 'needs-you' | 'active' | 'done' | 'all';
+
+/** A notification topic for `subscribe`. */
+export type ApiTopic = 'inbox' | 'instances' | 'forwards';
+
+/** One Inbox thread (`inbox.list()`), and the head of {@link ThreadDetail}. */
+export interface ThreadSummary {
+  /** Store id, stable for the thread's life: what `{ thread: id }` takes. */
+  id: number;
+  /** Owner's `instance_id`. */
+  owner: string;
+  /** Owner's instance name when it last wrote. */
+  owner_name: string;
+  /** Thread key; `null` on an unkeyed notification. */
+  key: string | null;
+  /** `thread` (`devsbd thread put`) or `notify` (`devsbd notify` records). */
+  kind: 'thread' | 'notify';
+  /** `null` on a notification. */
+  state: ThreadState | null;
+  /** The dispatcher's status line. */
+  status: string | null;
+  /** A thread's title; a notification's newest message, first line. */
+  title: string;
+  /** A notification's newest level. */
+  level: 'info' | 'warn' | 'error' | null;
+  unread: boolean;
+  /** The owner was removed: read-only history. */
+  archived: boolean;
+  /** In the `needs-you` view (what badges count). */
+  needs_you: boolean;
+  /** Unix seconds of the last change. */
+  changed_at: number;
+}
+
+/** A thread with everything the dashboard's pane shows (`inbox.get()`). */
+export interface ThreadDetail extends ThreadSummary {
+  /** `http(s)` link. */
+  link: string | null;
+  /** Key of the dispatcher child it's about. */
+  child: string | null;
+  /** The dispatcher's message. */
+  message: string | null;
+  /** Set when the thread takes replies (`inbox.reply()`). */
+  reply: ThreadReply | null;
+  actions: ThreadAction[];
+  /** A thread's timeline, oldest first. */
+  entries: ThreadEntry[];
+  /** A notification's records, newest first. */
+  notes: ThreadNote[];
+  /** Events the owner hasn't acked yet. */
+  events_pending: number;
+}
+
+/** How a thread takes free-text replies. */
+export interface ThreadReply {
+  placeholder: string | null;
+}
+
+/** A dispatcher action button (`inbox.act()`). */
+export interface ThreadAction {
+  id: string;
+  label: string;
+  /** Pressing it also sets the thread done. */
+  done: boolean;
+  /** The host verb it runs in the client that shows it; the API runs none. */
+  host: 'vscode' | 'terminal' | 'logs' | 'forward' | 'open' | 'rm' | null;
+  /** `false`: host-only, which `inbox.act()` refuses. */
+  sends_event: boolean;
+}
+
+/** One timeline entry of a thread. */
+export interface ThreadEntry {
+  /** Arrival order across the whole Inbox. */
+  seq: number;
+  /** Unix seconds. */
+  at: number;
+  kind: 'message' | 'state' | 'status' | 'action' | 'reply' | 'done' | 'reopen';
+  text: string;
+}
+
+/** One record of a notification thread. */
+export interface ThreadNote {
+  id: number;
+  level: 'info' | 'warn' | 'error';
+  msg: string;
+  link: string | null;
+  /** Unix seconds. */
+  at: number;
+}
+
+/** A thread by store id, or a dispatcher thread by owner (instance name or id) and key. */
+export type ThreadAddress = { thread: number } | { owner: string; key: string };
+
+/** One notification thread by store id, or every one. */
+export type NotifyTarget = { thread: number } | { all: true };
+
+/** One daemon port forward (`forwards.list()`). */
+export interface ForwardRow {
+  /** Daemon-wide id: what `forwards.rm()` takes. */
+  id: number;
+  /** The canonical config root. */
+  dir: string;
+  /** The bound host address, e.g. `127.0.0.1:3000`. */
+  local: string;
+  /** Route label, e.g. `api:3000`; empty until the route first resolves. */
+  target: string;
+  /** The listening process (`node (pid 412)`). */
+  process: string | null;
+  /** `active`, `connecting`, or `error: <reason>`. */
+  state: string;
+  /** Open connections. */
+  conns: number;
+  /** From a sandbox's `forwardPorts`, not `forwards.add()`. */
+  configured: boolean;
+}
+
+/** `forwards.add()` params; `instance`, `service`, or both. */
+export interface ForwardAddParams {
+  /** Config root (the CLI's `-C`); resolved against `process.cwd()`. */
+  dir: string;
+  /** Instance name, as the CLI takes it (never prompts). */
+  instance?: string;
+  /** Forward one of its services instead. */
+  service?: string;
+  /** Host address to bind. Default `127.0.0.1`. */
+  address?: string;
+  /** `port` (that host port or the next free one up) or `host:port` (exactly). */
+  spec: string;
+}
+
+/** A forward `forwards.add()` bound. */
+export interface ForwardAdded {
+  id: number;
+  local: string;
+  /** Route label, best effort this early. */
+  target: string;
+}
+
+/** What `forwards.rm()` stopped. */
+export interface ForwardRemoved {
+  ok: true;
+  local: string;
+  /** A configured forward stays stopped until its owner runs again. */
+  configured: boolean;
+}
+
+/** `inbox.changed` params: the store changed, re-fetch. */
+export interface InboxChanged {
+  /** Grows per change this daemon saw; compare within one connection only. */
+  generation: number;
+}
+
+/** `inbox.shown` params: a container message worth a status line. */
+export interface InboxShown {
+  instance: string;
+  /** The dashboard's status-line text. */
+  line: string;
+}
+
+/** `forwards.status` params: a one-line forward status. */
+export interface ForwardsStatus {
+  line: string;
+}
+
+/** `closing` params: the daemon is exiting; connect again (which starts a new one). */
+export interface Closing {
+  reason: 'handoff' | 'idle';
+}
+
+/** Any daemon notification, known or not (the `notification` event). */
+export interface ApiNotification {
+  method: string;
+  params: unknown;
+}
+
+/** Why a connection closed (the `close` event). */
+export interface ApiClose {
+  /** The relay's exit code: 0 after `close()`, 75 when the daemon hung up. */
+  code: number | null;
+  signal: NodeJS.Signals | null;
+}
+
+/** Events an {@link Api} emits, by name. Notifications need `subscribe()` first. */
+export interface ApiEvents {
+  'inbox.changed': InboxChanged;
+  'inbox.shown': InboxShown;
+  'instances.changed': {};
+  'forwards.changed': {};
+  'forwards.status': ForwardsStatus;
+  closing: Closing;
+  /** Every notification, including ones this package doesn't know yet. */
+  notification: ApiNotification;
+  /** The relay exited; pending calls were rejected with code `closed`. */
+  close: ApiClose;
+}
+
+/** Params and result of each typed method, for {@link Api}'s `call`. */
+export interface ApiMethods {
+  'inbox.threads.list': { params: { view?: InboxView }; result: ThreadSummary[] };
+  'inbox.thread.get': { params: ThreadAddress; result: ThreadDetail };
+  'inbox.thread.markRead': { params: ThreadAddress; result: OkResult };
+  'inbox.thread.act': { params: ThreadAddress & { action: string }; result: OkResult };
+  'inbox.thread.reply': { params: ThreadAddress & { text: string }; result: OkResult };
+  'inbox.thread.done': { params: ThreadAddress; result: OkResult };
+  'inbox.thread.reopen': { params: ThreadAddress; result: OkResult };
+  'inbox.notify.dismiss': { params: NotifyTarget; result: OkResult };
+  'inbox.notify.markRead': { params: NotifyTarget; result: OkResult };
+  'instances.list': { params: { dir: string }; result: Snapshot };
+  'forwards.list': { params: { dir?: string }; result: ForwardRow[] };
+  'forwards.add': { params: ForwardAddParams; result: ForwardAdded };
+  'forwards.rm': { params: { id: number }; result: ForwardRemoved };
+  subscribe: { params: { topics: ApiTopic[] }; result: OkResult };
+  unsubscribe: { params: { topics: ApiTopic[] }; result: OkResult };
+}
+
+/** `inbox.*` methods; mutations resolve once the store is written. */
+export interface ApiInbox {
+  /** Threads in `view` (default `all`), last change first. */
+  list: (view?: InboxView) => Promise<ThreadSummary[]>;
+  get: (thread: ThreadAddress) => Promise<ThreadDetail>;
+  markRead: (thread: ThreadAddress) => Promise<void>;
+  /** Press a dispatcher action (its event; host-only actions are refused). */
+  act: (thread: ThreadAddress, action: string) => Promise<void>;
+  /** Send a reply; trimmed, cut at 2000 chars. */
+  reply: (thread: ThreadAddress, text: string) => Promise<void>;
+  done: (thread: ThreadAddress) => Promise<void>;
+  reopen: (thread: ThreadAddress) => Promise<void>;
+  /** Remove one notification thread, or every one. */
+  dismiss: (target: NotifyTarget) => Promise<void>;
+  /** Mark one notification thread read, or every one. */
+  markNotifyRead: (target: NotifyTarget) => Promise<void>;
+}
+
+/** `instances.*` methods. */
+export interface ApiInstances {
+  /** The {@link status} snapshot of config root `dir` (resolved against `process.cwd()`). */
+  list: (dir: string) => Promise<Snapshot>;
+}
+
+/** `forwards.*` methods. Ad-hoc forwards outlive the connection until `rm`. */
+export interface ApiForwards {
+  /** Forwards of config root `dir`, or of every root. */
+  list: (dir?: string) => Promise<ForwardRow[]>;
+  /** Start an ad-hoc forward; resolves once its listener is bound. */
+  add: (params: ForwardAddParams) => Promise<ForwardAdded>;
+  rm: (id: number) => Promise<ForwardRemoved>;
+}
+
+/** A connection to the daemon (`connect()`), an EventEmitter of {@link ApiEvents}. */
+export interface Api {
+  /** The daemon's `hello` answer. */
+  readonly daemon: HelloResult;
+  /** The relay has exited; calls reject with code `closed`. */
+  readonly closed: boolean;
+  /** Any method; typed for {@link ApiMethods}, `unknown` for the rest. */
+  call: <M extends string>(
+    method: M,
+    params?: M extends keyof ApiMethods ? ApiMethods[M]['params'] : unknown,
+  ) => Promise<M extends keyof ApiMethods ? ApiMethods[M]['result'] : unknown>;
+  /** Start notifications for `topics`; subscribe first, then fetch. */
+  subscribe: (topics: readonly ApiTopic[]) => Promise<void>;
+  unsubscribe: (topics: readonly ApiTopic[]) => Promise<void>;
+  on: <E extends keyof ApiEvents>(event: E, listener: (params: ApiEvents[E]) => void) => Api;
+  once: <E extends keyof ApiEvents>(event: E, listener: (params: ApiEvents[E]) => void) => Api;
+  off: <E extends keyof ApiEvents>(event: E, listener: (params: ApiEvents[E]) => void) => Api;
+  /** Hang up: closes the relay's stdin, resolves once it exited. */
+  close: () => Promise<void>;
+  inbox: ApiInbox;
+  instances: ApiInstances;
+  forwards: ApiForwards;
+}
+
+export interface ConnectOptions {
+  /** Sent as `npm:<name>` in the hello and passed to the relay, for `serve.log`. Default `node`. */
+  name?: string;
+  env?: NodeJS.ProcessEnv;
+  /** `inherit` passes the relay's diagnostics to this process's stderr. Default `pipe` (kept for error messages). */
+  stderr?: 'pipe' | 'inherit';
+}
+
+/**
+ * Connect to the host daemon through `devsandbox api --stdio`, starting the
+ * daemon if needed, and say hello. Rejects with {@link DevsandboxApiError}:
+ * `unsupported` on Windows (the daemon is unix only), `protocol` when the
+ * daemon speaks another protocol, `closed` when the relay exits first.
+ */
+export declare function connect(opts?: ConnectOptions): Promise<Api>;
+
+/**
+ * Rejection of an API call. `code` is the daemon's (`not-found`, `invalid`,
+ * `denied`, `bind-failed`, `unknown-method`, `internal`, …) or the client's
+ * own: `closed` (the connection ended), `protocol`, `unsupported`.
+ */
+export declare class DevsandboxApiError extends Error {
+  readonly name: 'DevsandboxApiError';
+  readonly code: string;
+  /** The method called; `hello` for a failed connect. */
+  readonly method: string;
+}

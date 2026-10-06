@@ -1032,6 +1032,33 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Every notification is an `ApiEvents` key in the npm typings, its
+    /// params matching the interface it names (`serve::dts`).
+    #[test]
+    fn npm_typings_match_every_notification() {
+        use crate::serve::dts;
+        let mut p = Pending {
+            inbox: Some(1),
+            shown: Some(("disp".into(), "disp: hi".into())),
+            instances: true,
+            forwards: true,
+            forwards_status: Some("forwarding".into()),
+            closing: Some("idle"),
+            ..Pending::default()
+        };
+        let notes = p.take();
+        assert_eq!(notes.len(), 6, "a Pending flag isn't covered here");
+        for n in notes {
+            let ty = dts::prop_type("ApiEvents", &n.method)
+                .unwrap_or_else(|| panic!("index.d.ts `ApiEvents` lacks `'{}'`", n.method));
+            if ty == "{}" {
+                assert_eq!(n.params, json!({}), "{}", n.method);
+            } else {
+                dts::assert_matches(&ty, &n.params);
+            }
+        }
+    }
+
     #[test]
     fn a_connected_client_holds_and_keep_alive_never_idles() {
         let dir = scratch("hold");

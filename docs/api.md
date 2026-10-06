@@ -5,16 +5,17 @@ and external clients (editor extensions, GUIs). Design and roadmap:
 `docs/inbox-redesign.md`, "One API, served by the daemon". Code:
 `src/serve/api.rs` (methods), `src/serve/daemon.rs` (connections,
 `subscribe`), `src/serve/proto.rs` (envelope), `src/serve/forwards.rs`
-(the forwards behind `forwards.*`).
+(the forwards behind `forwards.*`), `src/serve/relay.rs` (`api --stdio`),
+`npm/devsandboxes/index.js` (the Node client).
 
 ## Transport
 
 A unix socket, `serve.sock` in the daemon's socket dir, mode 0600; the
 daemon starts on demand. Paths, lazy start, permissions and the version
 handoff: `docs/serve.md`. **Whoever can connect can act as the user** on
-every sandbox, like `docker.sock`; there is no other access control. A
-`devsandbox api --stdio` relay for clients that can only spawn a process is
-planned (step 9).
+every sandbox, like `docker.sock`; there is no other access control.
+Clients that can only spawn a process use the relay instead (*Relay*
+below); the npm package does.
 
 ## Framing
 
@@ -304,6 +305,59 @@ A connected client keeps the daemon alive (`docs/serve.md`, *Idle exit*);
 hang up when done. So does every forward, ad-hoc or configured, whether or
 not its client is still connected: stop ad-hoc ones with `forwards.rm`. A CLI command holding a relay (`bridges.ensure`) stays
 connected for its whole run for that reason.
+
+## Relay: `devsandbox api --stdio`
+
+For clients that can only spawn a process (editor extensions, Electron
+apps) and shouldn't deal with socket paths or start races. Unix only, like
+`serve`. `devsandbox api --stdio [--client <name>]`:
+
+1. connects with a hello of its own (lazy start, version handoff: the
+   relay is a devsandbox binary like any CLI command), as `--client`
+   (default `api`; it shows in `serve.log`),
+2. opens a **fresh** connection and relays it: stdin bytes to the socket,
+   socket bytes to stdout, flushed per read. It parses nothing, so the
+   relayed connection starts with no hello: the client sends its own as its
+   first line, and checks `protocol` itself. stdout carries protocol lines
+   only; diagnostics (a failed start) go to stderr.
+
+Exit status:
+
+| | |
+|---|---|
+| 0 | stdin hit EOF: the relay shuts its write half, so the daemon answers what's in flight and hangs up; waited for up to 5 s. Also when stdout is gone |
+| 75 | the daemon closed the connection first (it exited: idle, handoff, killed); run the relay again, which starts a new one |
+| 1 | it couldn't connect (the daemon didn't start within 5 s; see `serve.log`) |
+
+The relay is a client like any other: it holds the daemon while it runs,
+so hang up (close its stdin) when done.
+
+```
+$ devsandbox api --stdio
+{"id":0,"method":"hello","params":{"version":"0.0.0","client":"api:my-ext"}}
+{"id":0,"result":{"build":1767225600,"protocol":1,"version":"0.6.0"}}
+```
+
+A client that isn't a devsandbox binary can send `"version": "0.0.0"`: the
+relay's own hello already handed off an older daemon.
+
+## The npm client
+
+`npm/devsandboxes` (`connect()` in `index.js`, typed in `index.d.ts`)
+spawns `devsandbox api --stdio --client npm:<name>`, sends the hello
+(`client: "npm:<name>"`, version `0.0.0`) and rejects unless `protocol` is
+`1`. `api.call(method, params)` resolves with `result` or rejects with a
+`DevsandboxApiError` carrying the daemon's `code`; the client adds its own
+codes: `closed` (the relay exited: every pending call rejects, `close` is
+emitted with the exit code), `protocol`, and `unsupported` (Windows, no
+daemon). Notifications are events (`api.on('inbox.changed', …)`, plus
+`notification` for every one), after `api.subscribe(topics)`. Typed
+namespaces: `api.inbox.*`, `api.instances.list(dir)`, `api.forwards.*`;
+relative `dir`s are resolved against the Node process's cwd. No reconnect:
+on `close` (75 after a `closing`), `connect()` again. The interfaces in
+`index.d.ts` mirror the serde structs; `src/serve/dts.rs` fails the Rust
+tests when a wire struct (or a notification's params) and its interface
+disagree.
 
 ## The dashboard as a client
 

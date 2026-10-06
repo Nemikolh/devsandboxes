@@ -98,7 +98,7 @@ describe('parseDts', () => {
   it('parses the published typings', () => {
     const src = readFileSync(new URL('../../../npm/devsandboxes/index.d.ts', import.meta.url), 'utf8');
     const titles = parseDts(src).map((g) => g.title);
-    expect(titles).toEqual([null, 'Payloads', 'Options & results', 'API']);
+    expect(titles).toEqual([null, 'Payloads', 'Options & results', 'API', 'Daemon API']);
   });
 });
 

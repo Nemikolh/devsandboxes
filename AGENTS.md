@@ -66,6 +66,9 @@ git worktrees so working trees are never shared.
   `state.toml`; `forwards.*` talk to it over a request/reply channel).
   `daemon.rs` also owns `subscribe`: a `serve-watch` thread flags changes on
   each connection's `Outbox`, a per-connection notifier writes them.
+  `relay.rs` is `devsandbox api --stdio` (byte relay stdin/stdout ↔ socket,
+  what the npm `connect()` spawns); `dts.rs` (test-only) checks the wire
+  structs against the hand-written `npm/devsandboxes/index.d.ts`.
 - `src/runtime/` — backend abstraction over docker/podman/Apple container.
 - `devsbd/` — static in-container helper (workspace member), built by
   `scripts/build-devsbd.sh` and embedded by `build.rs`; `src/devsbd.rs` holds

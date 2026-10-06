@@ -6,7 +6,7 @@ keeps working with the dashboard closed. Design and roadmap:
 `docs/inbox-redesign.md`, "Host daemon". Unix only; the command doesn't
 exist on Windows.
 
-This page covers what exists today (steps 4-8 of that plan): the socket,
+This page covers what exists today (steps 4-9 of that plan): the socket,
 start, handoff, idle exit, the bridges (the ssh-agent relay included), the
 port forwards and the startup autostart pass. The
 API on the socket has its own page, `docs/api.md`. Marked below is what
@@ -14,7 +14,8 @@ later steps add.
 
 Code: `src/serve/` (`endpoint.rs` paths + bind/connect/accept, `daemon.rs`,
 `host.rs` bridges + autostart, `forwards.rs` port forwards, `api.rs`
-methods, `client.rs`, `idle.rs`, `proto.rs`).
+methods, `client.rs`, `relay.rs` the `api --stdio` relay, `idle.rs`,
+`proto.rs`).
 
 ## Paths and permissions
 
@@ -57,9 +58,10 @@ their container is up (best effort: a failure is one `warning:` line on
 stderr, the command still succeeds; they hang up right away), and every
 command that relays the ssh-agent into a relay-mode instance (`exec`,
 `start`'s `postStartCommand`, `run`'s lifecycle chain) for its bridge (see
-*Bridges*). `inbox` follows in step 19 (the foreground `port` command
-doesn't use the daemon); `devsandbox api
---stdio` in step 9.
+*Bridges*), and `devsandbox api --stdio` (the relay external clients and
+the npm package spawn; it stays connected while it runs, see `docs/api.md`,
+*Relay*). `inbox` follows in step 19 (the foreground `port` command
+doesn't use the daemon).
 
 The daemon inherits the environment of the process that started it: the
 runtime choice (`DEVSANDBOX_RUNTIME`), `SSH_AUTH_SOCK` (the agent its bridges
@@ -164,7 +166,8 @@ the close.
 
 The daemon exits 10 minutes after its last *holder* left; a new holder
 cancels the countdown. Holders today: connected clients (an open
-dashboard, a running `exec` that relays the agent), running instances that declare `dispatcher` (as of the last
+dashboard, a running `exec` that relays the agent, an `api --stdio`
+relay), running instances that declare `dispatcher` (as of the last
 poll; `inbox = true` joins in step 11), in-flight control requests, every
 live port forward (ad-hoc or configured, whatever its state), and the
 startup autostart pass while it runs. So with a dispatcher running the

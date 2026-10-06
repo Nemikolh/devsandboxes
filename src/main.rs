@@ -248,6 +248,20 @@ enum Command {
         #[arg(long, hide = true, value_name = "DIR")]
         socket_dir: Option<PathBuf>,
     },
+    /// Relay the daemon's API (docs/api.md) over stdin/stdout, for clients
+    /// that can only spawn a process
+    ///
+    /// Starts the daemon if needed. The client sends the `hello` itself.
+    /// Exits 0 when stdin closes, 75 when the daemon hangs up first.
+    #[cfg(unix)]
+    Api {
+        /// Relay over stdin/stdout (the only transport)
+        #[arg(long, required = true)]
+        stdio: bool,
+        /// Who's relaying (`api:<name>`, `npm:<name>`), for serve.log
+        #[arg(long, default_value = "api")]
+        client: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -358,6 +372,8 @@ fn main() -> Result<()> {
         }
         #[cfg(unix)]
         Command::Serve { keep_alive, socket_dir } => serve::daemon::serve(socket_dir, keep_alive),
+        #[cfg(unix)]
+        Command::Api { stdio: _, client } => std::process::exit(serve::relay::stdio(&client)?),
     }
 }
 

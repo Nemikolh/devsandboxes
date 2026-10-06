@@ -17,6 +17,7 @@
 //! - `host`: the live host side: the bridge poll and the autostart pass
 //! - `forwards`: the port forwards (ad-hoc and configured), on their own thread
 //! - `client`: connect-or-lazy-start for commands
+//! - `relay`: `devsandbox api --stdio`, stdin/stdout ↔ the socket (step 9)
 
 pub mod api;
 pub mod client;
@@ -26,3 +27,6 @@ pub mod forwards;
 mod host;
 pub mod idle;
 pub mod proto;
+pub mod relay;
+#[cfg(test)]
+pub(crate) mod dts;
