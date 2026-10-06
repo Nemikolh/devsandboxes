@@ -14,8 +14,8 @@
 //!
 //! The list is one row per thread, newest change first, filtered by a
 //! [`View`] (docs/inbox-threads.md, *Inbox UI* and *Inbox layout v2*). The
-//! thread pane beside it always shows the selected thread: its feed, or a
-//! notify thread's earlier records. Keys go to one of three [`InboxFocus`]
+//! thread pane beside it always shows the selected thread: a pinned header
+//! ([`pane_header`]) over its feed, newest first ([`pane_feed`]). Keys go to one of three [`InboxFocus`]
 //! zones; the thread and its input shadow the dashboard keys.
 //!
 //! Read semantics: a thread is read when it becomes the selected one (it's on
@@ -224,6 +224,9 @@ pub struct ChildInfo {
     pub name: Option<String>,
     /// The container's run state from the latest snapshot.
     pub status: Option<String>,
+    /// The container exists in the snapshot but isn't up (exited or gone),
+    /// so the header says `(stopped)`; false while its state is unknown.
+    pub stopped: bool,
 }
 
 /// How a pane segment is drawn; the renderer maps these to styles, so the
@@ -254,8 +257,7 @@ fn line(tone: Tone, text: impl Into<String>) -> PaneLine {
 }
 
 /// A `fields` block as `label  value` rows, labels padded to the widest one
-/// (display columns, so wide glyphs line up). Minimal until the pane's v3
-/// layout (step 14) restyles it.
+/// (display columns, so wide glyphs line up), dim labels over plain values.
 fn field_rows(items: &[feed::Field]) -> Vec<PaneLine> {
     let cols = |s: &str| ratatui::text::Span::raw(s).width();
     let width = items.iter().map(|f| cols(&f.label)).max().unwrap_or(0);
@@ -326,21 +328,28 @@ fn marker_text(m: &Marker) -> String {
     }
 }
 
-/// An owner thread's feed as pane lines, oldest first. A message or a reply
-/// is a dim stamp row (author, and a message's `(edited)`/`(withdrawn)`
-/// tag) over its full markdown, set off by blank lines; a withdrawn message
-/// keeps only its row. Actions and markers are one row each, run together.
-/// Step 14 rewrites this (newest first, pinned header).
+/// Blank lines between feed entries: around a block (a message, a reply, a
+/// notify record), not between one-row entries (actions, markers).
+fn push_entry(out: &mut Vec<PaneLine>, after_block: &mut bool, block: bool, lines: Vec<PaneLine>) {
+    if !out.is_empty() && (block || *after_block) {
+        out.push(Vec::new());
+    }
+    *after_block = block;
+    out.extend(lines);
+}
+
+/// An owner thread's feed as pane lines, **newest first** (scroll 0 is the
+/// latest thing). A message or a reply is a dim stamp row (author, and a
+/// message's `(edited)`/`(withdrawn)` tag) over its full markdown, set off by
+/// blank lines; a withdrawn message keeps only its row. Actions and markers
+/// are one row each, run together.
 fn feed_lines(t: &Thread, utc_offset: i64) -> Vec<PaneLine> {
     let mut out = Vec::new();
     let mut after_block = false;
-    for item in &t.feed {
+    for item in t.feed.iter().rev() {
         let at = stamp(item.at, utc_offset);
         let block = matches!(item.kind, ItemKind::Message { .. } | ItemKind::Reply { .. });
-        if !out.is_empty() && (block || after_block) {
-            out.push(Vec::new());
-        }
-        after_block = block;
+        let mut lines = Vec::new();
         match &item.kind {
             ItemKind::Message { blocks, edited, withdrawn, .. } => {
                 let tag = match (edited, withdrawn) {
@@ -348,25 +357,42 @@ fn feed_lines(t: &Thread, utc_offset: i64) -> Vec<PaneLine> {
                     (true, false) => "  (edited)",
                     _ => "",
                 };
-                out.push(line(Tone::Dim, format!("{at}  {}{tag}", t.owner_name)));
+                lines.push(line(Tone::Dim, format!("{at}  {}{tag}", t.owner_name)));
                 if !withdrawn {
                     for block in blocks {
                         match block {
-                            feed::Block::Markdown { text } => out.push(line(Tone::Markdown, text.clone())),
-                            feed::Block::Fields { items } => out.extend(field_rows(items)),
+                            feed::Block::Markdown { text } => lines.push(line(Tone::Markdown, text.clone())),
+                            feed::Block::Fields { items } => lines.extend(field_rows(items)),
                         }
                     }
                 }
             }
             ItemKind::Reply { text, .. } => {
-                out.push(line(Tone::Dim, format!("{at}  you")));
-                out.push(line(Tone::Markdown, text.clone()));
+                lines.push(line(Tone::Dim, format!("{at}  you")));
+                lines.push(line(Tone::Markdown, text.clone()));
             }
             ItemKind::Action { label, .. } => {
-                out.push(vec![(Tone::Dim, format!("{at}  ")), (Tone::Text, format!("you: {label}"))]);
+                lines.push(vec![(Tone::Dim, format!("{at}  ")), (Tone::Text, format!("you: {label}"))]);
             }
-            ItemKind::Marker(m) => out.push(line(Tone::Dim, format!("{at}  · {}", marker_text(m)))),
+            ItemKind::Marker(m) => lines.push(line(Tone::Dim, format!("{at}  · {}", marker_text(m)))),
         }
+        push_entry(&mut out, &mut after_block, block, lines);
+    }
+    out
+}
+
+/// A notify thread's records as pane lines, newest (the head) first: each a
+/// dim stamp row with its level over its full markdown.
+fn note_lines(t: &Thread, utc_offset: i64) -> Vec<PaneLine> {
+    let mut out = Vec::new();
+    let mut after_block = false;
+    for n in &t.notes {
+        let r = &n.record;
+        let lines = vec![
+            vec![(Tone::Dim, format!("{}  ", stamp(r.at, utc_offset))), (Tone::Level(r.level), r.level.as_str().to_string())],
+            line(Tone::Markdown, r.msg.as_str()),
+        ];
+        push_entry(&mut out, &mut after_block, true, lines);
     }
     out
 }
@@ -380,97 +406,106 @@ fn pending_line(t: &Thread) -> Option<String> {
     }
 }
 
-/// Everything the thread pane shows for `t` above its input: the header
-/// fields, an owner thread's feed ([`feed_lines`]) or a notify thread's
-/// message and earlier records (oldest first), then the numbered actions.
-/// Pure, so what the pane says is unit-testable.
-pub fn pane_lines(t: &Thread, child: Option<&ChildInfo>, utc_offset: i64) -> Vec<PaneLine> {
-    let mut out = vec![line(Tone::Title, title_of(t))];
+/// One row of the thread pane's pinned header ([`pane_header`]). Width-free:
+/// the renderer cuts and packs it to the pane.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HeaderRow {
+    /// One screen row: `left` cut with `…` to the width, `right` (dim)
+    /// right-aligned while there's room for both.
+    Line { left: PaneLine, right: Option<String> },
+    /// Buttons (`[1] Retry`, `[o] VS Code`), packed into as many rows as the
+    /// width needs, wrapped only between buttons.
+    Buttons(Vec<PaneLine>),
+}
+
+/// The thread-target keys ([`App::on_inbox_thread_key`]) the action row
+/// offers next to the owner's actions, with their button labels.
+const TARGET_KEYS: [(char, &str); 4] = [('o', "VS Code"), ('t', "Terminal"), ('l', "Logs"), ('p', "Port")];
+
+/// The thread pane's pinned header for `t`: the title (`↗` with a link), the
+/// chip and stamp with `owner · key` on the right, the child (with
+/// `(stopped)`), `(archived: instance removed)`, then the action row: the
+/// numbered owner actions (`⌂` runs on the host, `✓` marks done; the rest is
+/// an event for the owner, which the status line says on press) and the
+/// target keys. Those are offered on a live dispatcher thread whose target
+/// resolves (not on an unresolved child); a notify thread's header is its
+/// title and level chip. Pure, so what the header says is unit-testable.
+pub fn pane_header(t: &Thread, child: Option<&ChildInfo>, utc_offset: i64) -> Vec<HeaderRow> {
+    let mut title = line(Tone::Title, title_of(t));
+    if t.link.is_some() || t.head().is_some_and(|r| r.link.is_some()) {
+        title.push((Tone::Link, " ↗".into()));
+    }
+    let mut rows = vec![HeaderRow::Line { left: title, right: None }];
     let mut head = chip(t);
     head.push((Tone::Dim, format!("  ·  {}", stamp(t.changed_at(), utc_offset))));
-    out.push(head);
-    let mut from = vec![(Tone::Dim, "from   ".to_string()), (Tone::Plain, t.owner_name.clone())];
-    if t.archived {
-        from.push((Tone::Dim, "  (archived: instance removed)".into()));
-    }
-    out.push(from);
-    let link = t.link.as_ref().or_else(|| t.head().and_then(|r| r.link.as_ref()));
-    if let Some(link) = link {
-        out.push(vec![(Tone::Dim, "link   ".into()), (Tone::Link, link.clone()), (Tone::Dim, "  (enter)".into())]);
-    }
+    let from = match &t.key {
+        Some(key) => format!("{} · {key}", t.owner_name),
+        None => t.owner_name.clone(),
+    };
+    rows.push(HeaderRow::Line { left: head, right: Some(from) });
     if let Some(c) = child {
-        let mut row = vec![(Tone::Dim, "child  ".to_string())];
+        let mut row = vec![(Tone::Dim, "child ".to_string())];
         match &c.name {
             Some(name) => {
                 row.push((Tone::Plain, name.clone()));
-                row.push((Tone::Dim, format!("  {}", c.status.as_deref().unwrap_or("not in snapshot"))));
+                let status = match c.status.as_deref() {
+                    _ if c.stopped => "(stopped)",
+                    Some(status) => status,
+                    None => "not in snapshot",
+                };
+                row.push((Tone::Dim, format!("  {status}")));
             }
             None => row.push((Tone::Dim, format!("{} (no such child)", c.key))),
         }
-        out.push(row);
+        rows.push(HeaderRow::Line { left: row, right: None });
     }
-    match t.kind {
-        Kind::Thread => {
-            let feed = feed_lines(t, utc_offset);
-            if !feed.is_empty() {
-                out.push(Vec::new());
-                out.extend(feed);
-            }
-        }
-        Kind::Notify => {
-            if let Some(r) = t.head() {
-                out.push(Vec::new());
-                out.push(line(Tone::Markdown, r.msg.as_str()));
-            }
-            // The head is the message above; the rest is what came before.
-            let earlier: Vec<PaneLine> = t
-                .notes
-                .iter()
-                .skip(1)
-                .rev()
-                .map(|n| {
-                    let r = &n.record;
-                    vec![
-                        (Tone::Dim, format!("{}  ", stamp(r.at, utc_offset))),
-                        (Tone::Level(r.level), format!("{:7} ", r.level.as_str())),
-                        (Tone::Text, one_line(&r.msg)),
-                    ]
-                })
-                .collect();
-            if !earlier.is_empty() {
-                out.push(Vec::new());
-                out.push(line(Tone::Dim, "earlier"));
-                out.extend(earlier);
-            }
-        }
+    if t.archived {
+        rows.push(HeaderRow::Line { left: line(Tone::Dim, "(archived: instance removed)"), right: None });
     }
-
-    if let Some(pending) = pending_line(t) {
-        out.push(Vec::new());
-        out.push(line(Tone::Dim, pending));
-    }
-
-    if !t.actions.is_empty() {
-        out.push(Vec::new());
-        for (i, a) in t.actions.iter().enumerate() {
-            // Host actions run in the dashboard; the rest (and a host
-            // action's `notify`/`done` half) go to the owner as an event.
-            let mut row = vec![(Tone::Bold, format!("[{}] ", i + 1)), (Tone::Plain, a.label.clone())];
+    let mut buttons: Vec<PaneLine> = t
+        .actions
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            let mut b = vec![(Tone::Bold, format!("[{}] ", i + 1)), (Tone::Plain, a.label.clone())];
             if a.host.is_some() {
-                row.push((Tone::Dim, "  ⌂ host".into()));
-            }
-            if a.enqueues_event() {
-                row.push((Tone::Dim, format!("  → {}", t.owner_name)));
+                b.push((Tone::Dim, " ⌂".into()));
             }
             if a.done {
-                row.push((Tone::Dim, "  ✓ done".into()));
+                b.push((Tone::Dim, " ✓".into()));
             }
-            out.push(row);
-        }
+            b
+        })
+        .collect();
+    let target = t.kind == Kind::Thread && !t.archived && child.is_none_or(|c| c.name.is_some());
+    if target {
+        buttons.extend(TARGET_KEYS.iter().map(|(k, label)| vec![(Tone::Bold, format!("[{k}] ")), (Tone::Plain, label.to_string())]));
     }
-    // No reply hint here: the pane's input box (or its no-replies line) says it.
+    if !buttons.is_empty() {
+        rows.push(HeaderRow::Buttons(buttons));
+    }
+    rows
+}
+
+/// The thread pane's scrolling feed for `t`, under the header: the pending
+/// events line first (state, not history), then an owner thread's feed
+/// ([`feed_lines`]) or a notify thread's records ([`note_lines`]), newest
+/// first. Pure, so what the feed says is unit-testable.
+pub fn pane_feed(t: &Thread, utc_offset: i64) -> Vec<PaneLine> {
+    let mut out = Vec::new();
+    if let Some(pending) = pending_line(t) {
+        out.push(line(Tone::Dim, pending));
+        out.push(Vec::new());
+    }
+    out.extend(match t.kind {
+        Kind::Thread => feed_lines(t, utc_offset),
+        Kind::Notify => note_lines(t, utc_offset),
+    });
+    // No reply hint here: the pane's composer (or its no-replies line) says it.
     out
 }
+
+
 
 impl App {
     /// Install Inbox content loaded from the store (startup and every reload),
@@ -662,12 +697,15 @@ impl App {
     pub fn thread_child(&self, t: &Thread) -> Option<ChildInfo> {
         let key = t.child.clone()?;
         let name = self.thread_children.get(&t.owner).and_then(|keys| keys.get(&key)).cloned();
-        let status = name.as_ref().and_then(|name| {
+        let row = name.as_ref().and_then(|name| {
             let snapshot = self.snapshot.as_ref()?;
-            let row = snapshot.instances.iter().find(|r| &r.name == name)?;
-            Some(row.status.label().to_string())
+            snapshot.instances.iter().find(|r| &r.name == name)
         });
-        Some(ChildInfo { key, name, status })
+        let status = row.map(|r| r.status.label().to_string());
+        let stopped = row.is_some_and(|r| {
+            matches!(r.status, crate::snapshot::ContainerStatus::Exited(_) | crate::snapshot::ContainerStatus::Missing)
+        });
+        Some(ChildInfo { key, name, status, stopped })
     }
 
     /// Keys while the thread pane or its input has focus. They shadow the
@@ -1019,6 +1057,7 @@ mod tests {
     use super::*;
     use crate::devsbd::notify::Record;
     use crate::inbox::{Action, Compose, ThreadPut};
+    use crate::snapshot::ContainerStatus;
 
     #[test]
     fn fields_render_as_aligned_rows() {
@@ -1508,10 +1547,27 @@ mod tests {
         assert_eq!(app.take_pending_inbox(), []);
     }
 
-    #[test]
-    fn pane_lines_show_child_timeline_actions_and_reply() {
-        let mut app = new_app();
-        let actions = vec![
+    /// Pane lines as their text, one string per line.
+    fn texts(lines: &[PaneLine]) -> Vec<String> {
+        lines.iter().map(|l| l.iter().map(|(_, s)| s.as_str()).collect()).collect()
+    }
+
+    /// Header rows as text: a line's left, then ` | right`; buttons joined
+    /// by two spaces, prefixed `buttons: `.
+    fn header_texts(rows: &[HeaderRow]) -> Vec<String> {
+        rows.iter()
+            .map(|r| match r {
+                HeaderRow::Line { left, right: None } => texts(std::slice::from_ref(left)).remove(0),
+                HeaderRow::Line { left, right: Some(right) } => {
+                    format!("{} | {right}", texts(std::slice::from_ref(left)).remove(0))
+                }
+                HeaderRow::Buttons(b) => format!("buttons: {}", texts(b).join("  ")),
+            })
+            .collect()
+    }
+
+    fn header_actions() -> Vec<Action> {
+        vec![
             Action {
                 id: "open".into(),
                 label: "Open draft".into(),
@@ -1520,14 +1576,19 @@ mod tests {
             },
             Action { id: "post".into(), label: "Post replies".into(), ..Action::default() },
             Action { id: "done".into(), label: "Done".into(), done: true, ..Action::default() },
-        ];
+        ]
+    }
+
+    #[test]
+    fn pane_header_with_a_child_link_and_actions() {
+        let mut app = new_app();
         let full = ThreadPut {
             link: Some("https://x/pr/1".into()),
             status: Some("review".into()),
             child: Some("pr-1".into()),
             // v2 put compat, removed in step 13b: the header message.
             message: Some("drafts ready".into()),
-            actions,
+            actions: header_actions(),
             compose: Some(Compose { placeholder: Some("next run".into()), hint: Some("starts a run".into()) }),
             ..body("asks", State::NeedsYou)
         };
@@ -1537,42 +1598,86 @@ mod tests {
 
         let t = thread(&app, "asks").clone();
         let child = app.thread_child(&t).unwrap();
-        assert_eq!(child.name.as_deref(), Some("inst0"));
-        assert_eq!(child.status.as_deref(), Some("running"));
-        let text: Vec<String> = pane_lines(&t, Some(&child), 0)
-            .iter()
-            .map(|l| l.iter().map(|(_, s)| s.as_str()).collect())
-            .collect();
-        let has = |want: &str| text.iter().any(|l| l.contains(want));
-        assert!(has("child  inst0  running"), "{text:#?}");
-        assert!(has("https://x/pr/1"));
-        assert!(has("drafts ready"));
-        assert!(has(&format!("{}  d", stamp(10, 0))), "the message's stamp row names its author: {text:#?}");
-        assert!(has("[1] Open draft  ⌂ host"), "{text:#?}");
-        assert!(has("[2] Post replies  → d") && !has("[2] Post replies  ⌂"));
-        // Every action is runnable now: bold number, plain label.
-        let lines = pane_lines(&t, Some(&child), 0);
-        let row = |n: &str| lines.iter().find(|l| l.first().is_some_and(|(_, s)| s == n)).unwrap();
-        for n in ["[1] ", "[2] "] {
-            assert_eq!(row(n)[..2].iter().map(|(t, _)| *t).collect::<Vec<_>>(), [Tone::Bold, Tone::Plain]);
+        assert_eq!((child.name.as_deref(), child.status.as_deref(), child.stopped), (Some("inst0"), Some("running"), false));
+        let rows = pane_header(&t, Some(&child), 0);
+        assert_eq!(header_texts(&rows), [
+            "asks ↗".to_string(),
+            format!("● review  ·  {} | d · asks", stamp(10, 0)),
+            "child inst0  running".into(),
+            "buttons: [1] Open draft ⌂  [2] Post replies  [3] Done ✓  [o] VS Code  [t] Terminal  [l] Logs  [p] Port"
+                .into(),
+        ]);
+        let HeaderRow::Line { left: title, .. } = &rows[0] else { panic!() };
+        assert_eq!(title[..], [(Tone::Title, "asks".into()), (Tone::Link, " ↗".into())]);
+        // Bold key, plain label.
+        let HeaderRow::Buttons(buttons) = &rows[3] else { panic!() };
+        for b in [&buttons[0], &buttons[4]] {
+            assert_eq!(b[..2].iter().map(|(t, _)| *t).collect::<Vec<_>>(), [Tone::Bold, Tone::Plain]);
         }
-        assert!(has("[3] Done  → d  ✓ done"), "{text:#?}");
-        assert!(!has("next run"), "the input shows the placeholder, not the content");
-        assert!(!has("starts a run"), "the hint waits for step 14");
-        assert!(!has("waiting for"), "no events yet");
+        // The message, compose text and events are the feed's and composer's.
+        let all = header_texts(&rows).join("\n");
+        for gone in ["drafts ready", "next run", "starts a run", "waiting for", "https://x"] {
+            assert!(!all.contains(gone), "{gone} in {all}");
+        }
 
-        // A child key the owner doesn't have stays visible, unresolved.
+        // Stopped: the container is in the snapshot but not up.
+        app.set_snapshot(snapshot_with_status(1, ContainerStatus::Exited("Exited (0)".into())));
+        let child = app.thread_child(&t).unwrap();
+        assert!(child.stopped);
+        assert_eq!(header_texts(&pane_header(&t, Some(&child), 0))[2], "child inst0  (stopped)");
+
+        // A child key the owner doesn't have stays visible, unresolved, and
+        // the target keys go: they'd only say "not found".
         app.thread_children.clear();
         let child = app.thread_child(&t).unwrap();
         assert_eq!(child.name, None);
-        assert!(pane_lines(&t, Some(&child), 0).iter().any(|l| l.iter().any(|(_, s)| s.contains("no such child"))));
+        let text = header_texts(&pane_header(&t, Some(&child), 0));
+        assert_eq!(text[2], "child pr-1 (no such child)");
+        assert_eq!(text[3], "buttons: [1] Open draft ⌂  [2] Post replies  [3] Done ✓");
     }
 
-    /// The feed in first-insert order: messages under their author's stamp
-    /// row with an `(edited)`/`(withdrawn)` tag, the user's items as `you`,
-    /// markers as one dim `·` row each.
     #[test]
-    fn pane_lines_render_the_feed() {
+    fn pane_header_without_a_child_archived_and_bare() {
+        let mut app = new_app();
+        put(&mut app, "d", 10, body("asks", State::Active));
+        let t = thread(&app, "asks").clone();
+        // No child row; the target keys aim at the owner.
+        assert_eq!(header_texts(&pane_header(&t, None, 0)), [
+            "asks".to_string(),
+            format!("○ active  ·  {} | d · asks", stamp(10, 0)),
+            "buttons: [o] VS Code  [t] Terminal  [l] Logs  [p] Port".into(),
+        ]);
+        // Archived: said in the header, and no keys (every one is refused).
+        let mut inbox = app.inbox.content.clone();
+        inbox.archive_owner("d-id");
+        app.set_inbox(inbox);
+        let t = thread(&app, "asks").clone();
+        assert_eq!(header_texts(&pane_header(&t, None, 0)), [
+            "asks".to_string(),
+            format!("○ active  ·  {} | d · asks", stamp(10, 0)),
+            "(archived: instance removed)".into(),
+        ]);
+    }
+
+    #[test]
+    fn pane_header_of_a_notify_thread_is_title_and_level() {
+        let mut app = new_app();
+        push(&mut app, "a", Record { level: Level::Warn, at: 5, ..rec("disk low\nmore", Some("k"), Some("https://x")) });
+        let t = thread(&app, "disk low").clone();
+        assert_eq!(header_texts(&pane_header(&t, None, 0)), [
+            "disk low ↗".to_string(),
+            format!("▲ warn  ·  {} | a · k", stamp(5, 0)),
+        ]);
+        push(&mut app, "a", rec("unkeyed", None, None));
+        let t = thread(&app, "unkeyed").clone();
+        assert_eq!(header_texts(&pane_header(&t, None, 0))[1], format!("· info  ·  {} | a", stamp(0, 0)));
+    }
+
+    /// The feed newest first: messages under their author's stamp row with
+    /// an `(edited)`/`(withdrawn)` tag, fields as aligned rows, the user's
+    /// items as `you`, markers as one dim `·` row each.
+    #[test]
+    fn pane_feed_is_newest_first() {
         let mut app = new_app();
         let v2 = |message: Option<&str>, state: State, status: &str| ThreadPut {
             status: Some(status.into()),
@@ -1588,53 +1693,71 @@ mod tests {
         inbox.apply(&Op::MarkDone(id), 20, "tui");
         inbox.apply(&Op::Reopen(id), 20, "tui");
         inbox.put("d-id", "d", 30, v2(Some("two"), State::NeedsYou, "review"));
+        inbox.apply(&Op::Reply { thread: id, text: "ok".into() }, 40, "tui");
+        // A fields message, straight into the feed (no put field makes one yet).
+        let fields = vec![feed::Block::Fields { items: vec![feed::Field { label: "CI".into(), value: "green".into() }] }];
+        let t = inbox.threads.iter_mut().find(|t| t.id == id).unwrap();
+        let seq = t.feed.iter().map(|i| i.seq).max().unwrap_or(0) + 1;
+        t.feed.push(feed::FeedItem {
+            seq,
+            at: 50,
+            kind: ItemKind::Message { id: "f".into(), blocks: fields, edited: false, withdrawn: false },
+        });
         app.set_inbox(inbox);
-        let text: Vec<String> = pane_lines(thread(&app, "asks"), None, 0)
-            .iter()
-            .map(|l| l.iter().map(|(_, s)| s.as_str()).collect())
-            .collect();
-        let (s10, s20, s30) = (stamp(10, 0), stamp(20, 0), stamp(30, 0));
-        let start = text.iter().position(|l| l.starts_with(&s10)).unwrap();
-        assert_eq!(text[start..start + 8], [
+        let (s10, s20, s30, s40, s50) = (stamp(10, 0), stamp(20, 0), stamp(30, 0), stamp(40, 0), stamp(50, 0));
+        let lines = pane_feed(thread(&app, "asks"), 0);
+        let text = texts(&lines);
+        // The reply's event first (state, not history), then the feed.
+        assert_eq!(text, [
+            "4 events waiting for d".to_string(),
+            String::new(),
+            format!("{s50}  d"),
+            "CI  green".into(),
+            String::new(),
+            format!("{s40}  you"),
+            "ok".into(),
+            String::new(),
+            format!("{s30}  · status: running → review"),
+            format!("{s30}  · active → needs you"),
+            format!("{s20}  · reopened"),
+            format!("{s20}  · done"),
+            format!("{s20}  you: Post replies"),
+            String::new(),
             format!("{s10}  d  (edited)"),
             "two".into(),
-            String::new(),
-            format!("{s20}  you: Post replies"),
-            format!("{s20}  · done"),
-            format!("{s20}  · reopened"),
-            format!("{s30}  · active → needs you"),
-            format!("{s30}  · status: running → review"),
         ], "{text:#?}");
         // Markers are dim; the message is a markdown document.
-        let lines = pane_lines(thread(&app, "asks"), None, 0);
-        assert_eq!(lines[start + 1], [(Tone::Markdown, "two".to_string())]);
-        assert_eq!(lines[start + 4], [(Tone::Dim, format!("{s20}  · done"))]);
+        assert_eq!(lines[15], [(Tone::Markdown, "two".to_string())]);
+        assert_eq!(lines[11], [(Tone::Dim, format!("{s20}  · done"))]);
 
         // Withdrawn: its row stays, tagged, without the text.
         let mut inbox = app.inbox.content.clone();
-        inbox.put("d-id", "d", 40, v2(None, State::NeedsYou, "review"));
+        inbox.put("d-id", "d", 60, v2(None, State::NeedsYou, "review"));
         app.set_inbox(inbox);
-        let text: Vec<String> = pane_lines(thread(&app, "asks"), None, 0)
-            .iter()
-            .map(|l| l.iter().map(|(_, s)| s.as_str()).collect())
-            .collect();
-        assert!(text.contains(&format!("{s10}  d  (withdrawn)")), "{text:#?}");
+        let text = texts(&pane_feed(thread(&app, "asks"), 0));
+        assert_eq!(text.last(), Some(&format!("{s10}  d  (withdrawn)")), "{text:#?}");
         assert!(!text.iter().any(|l| l == "two"), "{text:#?}");
     }
 
     #[test]
-    fn notify_pane_shows_earlier_records() {
+    fn notify_feed_is_the_records_newest_first() {
         let mut app = new_app();
-        push(&mut app, "a", rec("v1", Some("k"), None));
-        push(&mut app, "a", rec("v2", Some("k"), None));
-        push(&mut app, "a", rec("v3", Some("k"), None));
-        let t = thread(&app, "v3").clone();
-        let text: Vec<String> =
-            pane_lines(&t, None, 0).iter().map(|l| l.iter().map(|(_, s)| s.as_str()).collect()).collect();
-        let at = |want: &str| text.iter().position(|l| l.ends_with(want)).unwrap();
-        // The head is the message; history is oldest first under "earlier".
-        assert!(at("earlier") < at("v1") && at("v1") < at("v2"), "{text:#?}");
-        assert_eq!(text.iter().filter(|l| l.ends_with("v3")).count(), 2, "title and message");
+        push(&mut app, "a", Record { at: 1, ..rec("v1", Some("k"), None) });
+        push(&mut app, "a", Record { at: 2, level: Level::Error, ..rec("v2", Some("k"), None) });
+        push(&mut app, "a", Record { at: 3, ..rec("v3\n\n- body", Some("k"), None) });
+        let lines = pane_feed(thread(&app, "v3"), 0);
+        assert_eq!(texts(&lines), [
+            format!("{}  info", stamp(3, 0)),
+            "v3\n\n- body".into(),
+            String::new(),
+            format!("{}  error", stamp(2, 0)),
+            "v2".into(),
+            String::new(),
+            format!("{}  info", stamp(1, 0)),
+            "v1".into(),
+        ]);
+        assert_eq!(lines[3][1], (Tone::Level(Level::Error), "error".into()));
+        assert_eq!(lines[1], [(Tone::Markdown, "v3\n\n- body".to_string())]);
     }
 
     /// What the event loop does with the queued ops: apply them to the store
@@ -1695,10 +1818,7 @@ mod tests {
         assert_eq!(app.inbox.focus, InboxFocus::Thread);
         app.on_key(key(KeyCode::Char('i')));
         assert_eq!(app.inbox.focus, InboxFocus::Input, "`i` focuses it too");
-        let text: Vec<String> = pane_lines(thread(&app, "asks"), None, 0)
-            .iter()
-            .map(|l| l.iter().map(|(_, s)| s.as_str()).collect())
-            .collect();
+        let text = texts(&pane_feed(thread(&app, "asks"), 0));
         assert!(text.windows(2).any(|w| w[0].ends_with("  you") && w[1] == ">do q1"), "{text:#?}");
         assert!(text.contains(&"1 event waiting for d".to_string()), "{text:#?}");
     }
@@ -1710,7 +1830,10 @@ mod tests {
         put(&mut app, "d", 10, body("idle", State::Active));
         put(&mut app, "d", 10, ThreadPut { status: Some("merged".into()), ..body("fin", State::Done) });
         push(&mut app, "a", Record { level: Level::Error, ..rec("boom", None, None) });
-        let head = |title: &str| pane_lines(thread(&app, title), None, 0).swap_remove(1);
+        let head = |title: &str| match pane_header(thread(&app, title), None, 0).swap_remove(1) {
+            HeaderRow::Line { left, .. } => left,
+            row => panic!("{row:?}"),
+        };
         let at10 = (Tone::Dim, format!("  ·  {}", stamp(10, 0)));
         assert_eq!(head("asks"), [
             (Tone::State(State::NeedsYou), "● ".into()),
@@ -1735,7 +1858,7 @@ mod tests {
         let mut inbox = app.inbox.content.clone();
         inbox.apply(&Op::Reply { thread: id, text: "first line\n\n- a\n- b".into() }, 20, "tui");
         app.set_inbox(inbox);
-        let lines = pane_lines(thread(&app, "asks"), None, 0);
+        let lines = pane_feed(thread(&app, "asks"), 0);
         let at = lines.iter().position(|l| l.len() == 1 && l[0].0 == Tone::Dim && l[0].1.ends_with("  you")).unwrap();
         assert_eq!(lines[at][0].1, format!("{}  you", stamp(20, 0)));
         assert_eq!(lines[at + 1], [(Tone::Markdown, "first line\n\n- a\n- b".to_string())]);
@@ -1835,8 +1958,7 @@ mod tests {
         let t = thread(&app, "asks");
         assert_eq!(t.state, Some(State::Active));
         assert_eq!(t.events.len(), 2);
-        let text: Vec<String> =
-            pane_lines(t, None, 0).iter().map(|l| l.iter().map(|(_, s)| s.as_str()).collect()).collect();
+        let text = texts(&pane_feed(t, 0));
         assert!(text.contains(&format!("{}  · done", stamp(20, 0))), "{text:#?}");
         assert!(text.contains(&format!("{}  · reopened", stamp(30, 0))), "{text:#?}");
         assert!(text.contains(&"2 events waiting for d".to_string()), "{text:#?}");

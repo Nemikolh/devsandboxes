@@ -59,14 +59,16 @@ Inbox list
   o t l p     VS Code / terminal / logs / forward prompt on the thread's
               child (or its sender when it has none)
 Inbox thread (shadows the dashboard keys while focused)
-  ↑/k ↓/j     scroll    pgup/pgdn  page   g / G  top / bottom
-  enter       open the thread's link
-  1-9         run an action: host verbs run now; the rest (→ owner) is
-              an event the dispatcher pulls with `devsbd events`
+  The header (title, state, child, action row) stays put; the feed
+  under it is newest first and scrolls on its own.
+  ↑/k ↓/j     scroll    pgup/pgdn  page   g / G  newest / oldest
+  enter       open the thread's link (↗)
+  1-9         run an action: host verbs (⌂) run now; the rest is an
+              event the dispatcher pulls with `devsbd events` (✓ = done)
   r / i       focus the reply input
   d / u       mark done / reopen (each also an event for the dispatcher;
               also marks / clears the thread's child done)
-  o t l p     as in the list
+  o t l p     as in the list (the [o] [t] [l] [p] buttons)
   m           markdown: rendered / raw source (every thread, this session)
   esc         back to the list     q quit   : prompt   ? help
 Inbox reply input

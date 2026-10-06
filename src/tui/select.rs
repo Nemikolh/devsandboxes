@@ -27,6 +27,9 @@ pub enum RegionId {
     ServiceDetail,
     PortsTable,
     InboxList,
+    /// The thread pane's pinned header (screen cells: it never scrolls).
+    InboxHeader,
+    /// The thread pane's scrolling feed.
     InboxThread,
     Terminal,
     ConfigLeft,

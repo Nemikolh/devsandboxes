@@ -325,8 +325,8 @@ mod tests {
         let mut app = inbox_app();
         // From the pane's first content row (col 41 would grab the divider)
         // to past its bottom-right corner: clamped to the content area.
-        ev(&mut app, DOWN, 42, 2);
-        ev(&mut app, DRAG, 45, 4);
+        ev(&mut app, DOWN, 42, PANE_TOP);
+        ev(&mut app, DRAG, 45, PANE_TOP + 2);
         ev(&mut app, DRAG, 99, 39);
         assert!(app.selection.unwrap().dragging);
         ev(&mut app, UP, 99, 39);
@@ -337,7 +337,8 @@ mod tests {
             assert!(!text.contains(border), "{border} in {text:?}");
         }
         assert!(text.lines().all(|l| !l.ends_with(' ')), "{text:?}");
-        assert!(buf[(42, 2)].modifier.contains(Modifier::REVERSED), "highlighted");
+        assert!(buf[(42, PANE_TOP)].modifier.contains(Modifier::REVERSED), "highlighted");
+        assert!(!buf[(42, PANE_TOP - 2)].modifier.contains(Modifier::REVERSED), "the header isn't the feed");
         assert!(buf[(98, 37)].modifier.contains(Modifier::REVERSED), "to the end");
         assert!(!buf[(40, 2)].modifier.contains(Modifier::REVERSED), "border untouched");
         // Asked once: the next frame copies nothing again.
@@ -347,10 +348,28 @@ mod tests {
     }
 
     #[test]
+    fn the_pinned_header_selects_on_its_own() {
+        let mut app = inbox_app();
+        ev(&mut app, DOWN, 41, PANE_TOP - 3);
+        ev(&mut app, DRAG, 98, PANE_TOP - 2);
+        ev(&mut app, DRAG, 98, 30); // into the feed: clamped to the header
+        ev(&mut app, UP, 98, 30);
+        assert_eq!(app.selection.map(|s| s.region), Some(RegionId::InboxHeader));
+        draw(&app);
+        let text = app.take_clipboard().expect("copied");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "{text:?}");
+        assert_eq!(lines[0], "first message");
+        assert!(lines[1].starts_with("· info  ·  ") && lines[1].ends_with(" builder"), "{text:?}");
+    }
+
+    #[test]
     fn a_partial_drag_copies_the_cells_under_it() {
         let mut app = inbox_app();
         let screen = rows(&draw(&app));
-        let y = screen.iter().position(|r| r[r.char_indices().nth(41).unwrap().0..].contains("first message")).unwrap() as u16;
+        // In the feed (the header repeats it as the title).
+        let in_feed = |r: &String| r[r.char_indices().nth(41).unwrap().0..].contains("first message");
+        let y = PANE_TOP + screen[PANE_TOP as usize..].iter().position(in_feed).unwrap() as u16;
         let x = 41 + screen[y as usize].chars().skip(41).collect::<String>().find("first message").unwrap() as u16;
         // Backwards: from the end of "message" to the start of "first".
         ev(&mut app, DOWN, x + 12, y);
@@ -359,7 +378,7 @@ mod tests {
         draw(&app);
         assert_eq!(app.take_clipboard().as_deref(), Some("first message"));
         let sel = app.selection.unwrap();
-        assert_eq!(sel.range(), (Pos { row: (y - 2) as usize, col: x - 41 }, Pos { row: (y - 2) as usize, col: x + 12 - 41 }));
+        assert_eq!(sel.range(), (Pos { row: (y - PANE_TOP) as usize, col: x - 41 }, Pos { row: (y - PANE_TOP) as usize, col: x + 12 - 41 }));
     }
 
     #[test]
@@ -504,8 +523,9 @@ mod tests {
         assert!(app.selection.is_some());
     }
 
-    // The thread pane's content area at FRAME size: columns 41-98, rows 2-37.
-    const PANE_TOP: u16 = 2;
+    // The thread pane's feed at FRAME size for a notify thread: columns
+    // 41-98, rows 5-37 (rows 2-3 are its pinned header, 4 the separator).
+    const PANE_TOP: u16 = 5;
     const PANE_BOTTOM: u16 = 37;
 
     /// Drag from the thread pane's first cell to past its bottom until it
@@ -634,7 +654,7 @@ fn main() { println!(\"hi\"); }
         ev(&mut app, DOWN, 98, PANE_BOTTOM);
         ev(&mut app, DRAG, 60, 10);
         for _ in 0..200 {
-            ev(&mut app, DRAG, 60, PANE_TOP - 1); // the pane's border row
+            ev(&mut app, DRAG, 60, PANE_TOP - 1); // the separator row
         }
         assert_eq!(app.inbox.scroll, 0);
         ev(&mut app, UP, 60, PANE_TOP - 1);

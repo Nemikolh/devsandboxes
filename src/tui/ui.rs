@@ -10,8 +10,8 @@ use ratatui::widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table, 
 use tui_term::widget::{Cursor, PseudoTerminal};
 
 use super::app::{
-    chip, pane_lines, short_age, title_of, App, ConfigView, Extract, Focus, HelpModal, InboxFocus, Modal, PaneLine,
-    Pane, PortRow, Side, Tab, TextModal, Thread, Tone, View,
+    chip, pane_feed, pane_header, short_age, title_of, App, ConfigView, Extract, Focus, HeaderRow, HelpModal, InboxFocus,
+    Modal, PaneLine, Pane, PortRow, Side, Tab, TextModal, Thread, Tone, View,
 };
 use super::settings::SETTINGS;
 use super::data::{
@@ -974,23 +974,119 @@ fn focused_reply(app: &App) -> Option<&TextArea> {
     app.inbox.reply.as_ref().filter(|_| app.inbox.focus == InboxFocus::Input).map(|r| &r.line)
 }
 
-/// Rows the thread pane keeps under its content, `width` the pane's inner
-/// width: the reply input (a thread taking replies), its border plus 1 to
-/// [`textarea::MAX_ROWS`] rows of wrapped `reply`; a one-line hint (a
-/// dispatcher thread that doesn't); or none (a notify thread, which can't be
-/// replied to).
+/// A thread's `compose.hint`, when it says anything: one dim row under the
+/// input box.
+fn compose_hint(t: &Thread) -> Option<&str> {
+    t.compose.as_ref()?.hint.as_deref().filter(|h| !h.trim().is_empty())
+}
+
+/// Rows the thread pane keeps under its feed, `width` the pane's inner
+/// width: the composer (a thread taking replies), i.e. the input box's border
+/// plus 1 to [`textarea::MAX_ROWS`] rows of wrapped `reply`, and a row for
+/// `compose.hint` when there is one; a one-line hint (a dispatcher thread that
+/// takes no replies); or none (a notify thread, which can't be replied to).
 fn pane_bottom_rows(t: &Thread, reply: Option<&TextArea>, width: u16) -> u16 {
     match (t.kind, &t.compose) {
-        (_, Some(_)) => 2 + reply.map_or(1, |r| r.height(width.saturating_sub(2))),
+        (_, Some(_)) => {
+            2 + reply.map_or(1, |r| r.height(width.saturating_sub(2))) + u16::from(compose_hint(t).is_some())
+        }
         (Kind::Thread, None) => 1,
         (Kind::Notify, None) => 0,
     }
 }
 
-/// The thread pane's `(content, bottom)` split of its block's inner area.
-fn pane_areas(inner: Rect, bottom: u16) -> (Rect, Rect) {
-    let [content, bottom_area] = Layout::vertical([Constraint::Min(0), Constraint::Length(bottom)]).areas(inner);
-    (content, bottom_area)
+/// The thread pane's areas inside its block, top to bottom: the pinned
+/// header, the separator row under it, the scrolling feed and the composer
+/// (or the no-replies line). Room goes to the composer first, then the
+/// header, the separator, and the feed gets the rest, so a short pane keeps
+/// what the keys act on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PaneAreas {
+    header: Rect,
+    sep: Rect,
+    feed: Rect,
+    bottom: Rect,
+}
+
+fn pane_areas(inner: Rect, header: u16, bottom: u16) -> PaneAreas {
+    let bottom = bottom.min(inner.height);
+    let header = header.min(inner.height - bottom);
+    let sep = 1.min(inner.height - bottom - header);
+    let feed = inner.height - bottom - header - sep;
+    let row = |y: u16, height: u16| Rect { y, height, ..inner };
+    PaneAreas {
+        header: row(inner.y, header),
+        sep: row(inner.y + header, sep),
+        feed: row(inner.y + header + sep, feed),
+        bottom: row(inner.y + header + sep + feed, bottom),
+    }
+}
+
+/// The thread pane's pinned header for `t` as the rows drawn at the pane's
+/// inner `width`, and its areas: shared by drawing and hit-testing, so a
+/// click lands where things are.
+fn thread_pane_layout(app: &App, t: &Thread, inner: Rect) -> (Vec<Line<'static>>, PaneAreas) {
+    let child = app.thread_child(t);
+    let header = header_lines(&pane_header(t, child.as_ref(), app.utc_offset), inner.width, app.inbox.raw);
+    let rows = header.len().min(u16::MAX as usize) as u16;
+    let areas = pane_areas(inner, rows, pane_bottom_rows(t, focused_reply(app), inner.width));
+    (header, areas)
+}
+
+/// `spans` cut to `width` columns, ending in `…` when cut, styles kept.
+fn cut_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
+    let parts: Vec<(String, Style)> = spans.into_iter().map(|s| (s.content.into_owned(), s.style)).collect();
+    let plain: String = parts.iter().map(|(s, _)| s.as_str()).collect();
+    restyle(&parts, &truncate(&plain, width))
+}
+
+/// The header's rows at `width` columns ([`HeaderRow`]): a line is one row,
+/// cut with `…`, its right text right-aligned when both fit ([`fit`]); the
+/// buttons are packed two spaces apart and wrap between buttons, a button
+/// wider than the pane cut on its own row.
+fn header_lines(rows: &[HeaderRow], width: u16, raw: bool) -> Vec<Line<'static>> {
+    let width = width as usize;
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let mut out = Vec::new();
+    for row in rows {
+        match row {
+            HeaderRow::Line { left, right } => {
+                let parts: Vec<(String, Style)> =
+                    pane_spans(left, raw).into_iter().map(|s| (s.content.into_owned(), s.style)).collect();
+                let plain: String = parts.iter().map(|(s, _)| s.as_str()).collect();
+                let right = right.as_deref().map(crate::inbox::sanitize).unwrap_or_default();
+                let (l, r) = fit(&plain, &right, width);
+                let mut spans = restyle(&parts, &l);
+                if !r.is_empty() {
+                    spans.push(Span::raw(" ".repeat(width.saturating_sub(cols(&l) + cols(&r)))));
+                    spans.push(Span::styled(r, dim));
+                }
+                out.push(Line::from(spans));
+            }
+            HeaderRow::Buttons(buttons) => {
+                let mut cur: Vec<Span<'static>> = Vec::new();
+                let mut used = 0;
+                for b in buttons {
+                    let spans = pane_spans(b, raw);
+                    let w: usize = spans.iter().map(Span::width).sum();
+                    if used > 0 && used + 2 + w > width {
+                        out.push(Line::from(std::mem::take(&mut cur)));
+                        used = 0;
+                    }
+                    if used > 0 {
+                        cur.push(Span::raw("  "));
+                        used += 2;
+                    }
+                    used += w.min(width);
+                    cur.extend(cut_spans(spans, width));
+                }
+                if !cur.is_empty() {
+                    out.push(Line::from(cur));
+                }
+            }
+        }
+    }
+    out
 }
 
 /// What a click on the Inbox tab lands on.
@@ -1001,9 +1097,10 @@ pub(crate) enum InboxHit {
     Card(usize),
     /// The list block off any card: a spacer, a border, blank rows.
     ListBlank,
-    /// The thread pane above its input or hint (borders included).
+    /// The thread pane above its composer or hint: header, separator,
+    /// feed (borders included).
     Thread,
-    /// The reply input box.
+    /// The composer: the reply input box and its `compose.hint` row.
     Input,
     /// The "takes no replies" hint row.
     Hint,
@@ -1036,8 +1133,10 @@ pub(crate) fn inbox_hit(app: &App, frame: Rect, col: u16, row: u16) -> Option<In
         return Some(InboxHit::Thread);
     };
     let inner = Block::bordered().inner(thread);
-    let (_, bottom) = pane_areas(inner, pane_bottom_rows(t, focused_reply(app), inner.width));
-    if !bottom.contains(at) {
+    let (_, areas) = thread_pane_layout(app, t, inner);
+    // The header, separator and feed are all the thread; the composer's
+    // hint row is part of it, so a click there doesn't drop a typed reply.
+    if !areas.bottom.contains(at) {
         Some(InboxHit::Thread)
     } else if t.compose.is_some() {
         Some(InboxHit::Input)
@@ -1135,6 +1234,11 @@ fn pane_rows(line: &PaneLine, width: u16, raw: bool) -> Vec<(Line<'static>, sele
     if let [(Tone::Markdown, md)] = line.as_slice() {
         return if raw { markdown::raw_rows(md, width) } else { markdown::render_rows(md, width) };
     }
+    markdown::wrap_rows(&pane_spans(line, raw), width as usize, &[], &[], false)
+}
+
+/// One non-document pane line as styled spans, unwrapped (see [`pane_rows`]).
+fn pane_spans(line: &PaneLine, raw: bool) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     for (tone, text) in line {
         let base = tone_style(*tone);
@@ -1149,19 +1253,23 @@ fn pane_rows(line: &PaneLine, width: u16, raw: bool) -> Vec<(Line<'static>, sele
             _ => spans.push(Span::styled(crate::inbox::sanitize(text), base)),
         }
     }
-    markdown::wrap_rows(&spans, width as usize, &[], &[], false)
+    spans
 }
 
-/// The thread pane: the selected thread's content, then its input (a thread
-/// taking replies), a one-line hint (one that doesn't) or nothing (a notify
-/// thread, which can't be replied to). Records the content's scroll bound for
-/// the scroll keys (`InboxView::set_pane_max`), since only here are the size
-/// and wrapping known.
+/// The thread pane (layout v3, docs/inbox-redesign.md *TUI Inbox*): the
+/// pinned header ([`pane_header`]: title, chip, child, action row), a
+/// separator joined to the border, the feed newest first ([`pane_feed`]),
+/// scrolling on its own, then the composer (the input box and its
+/// `compose.hint`), a one-line no-replies hint, or nothing (a notify thread).
+/// Records the feed's scroll bound for the scroll keys
+/// (`InboxView::set_pane_max`), since only here are the size and wrapping
+/// known. Step 16's open forms go between the separator and the feed.
 fn draw_inbox_pane(frame: &mut Frame, app: &App, area: Rect) {
+    let border = zone_border_style(app, InboxFocus::Thread);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(zone_border_style(app, InboxFocus::Thread))
+        .border_style(border)
         .title(if app.inbox.raw { " Thread · raw " } else { " Thread " });
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -1171,29 +1279,45 @@ fn draw_inbox_pane(frame: &mut Frame, app: &App, area: Rect) {
         frame.render_widget(Paragraph::new(text), inner);
         return;
     };
-    let bottom = pane_bottom_rows(t, focused_reply(app), inner.width);
-    let (content, bottom_area) = pane_areas(inner, bottom);
-    let child = app.thread_child(t);
-    let (lines, texts): (Vec<Line>, Vec<select::RowText>) = pane_lines(t, child.as_ref(), app.utc_offset)
+    let (header, areas) = thread_pane_layout(app, t, inner);
+    // Screen cells: the header never scrolls, so what's drawn is the text.
+    app.add_region(RegionId::InboxHeader, areas.header);
+    frame.render_widget(Paragraph::new(header), areas.header);
+    if areas.sep.height > 0 && area.width >= 2 {
+        let rule = format!("├{}┤", "─".repeat(area.width as usize - 2));
+        let row = Rect { x: area.x, width: area.width, ..areas.sep };
+        frame.render_widget(Paragraph::new(Span::styled(rule, border)), row);
+    }
+    let feed = areas.feed;
+    let (lines, texts): (Vec<Line>, Vec<select::RowText>) = pane_feed(t, app.utc_offset)
         .iter()
-        .flat_map(|l| pane_rows(l, content.width, app.inbox.raw))
+        .flat_map(|l| pane_rows(l, feed.width, app.inbox.raw))
         .map(|(line, meta)| {
             let text = select::RowText::new(&line, meta);
             (line, text)
         })
         .unzip();
     let rows = lines.len().min(u16::MAX as usize) as u16;
-    let max = rows.saturating_sub(content.height);
+    let max = rows.saturating_sub(feed.height);
     app.inbox.set_pane_max(max);
     let scroll = app.inbox.scroll.min(max);
-    // The content only: the input / hint below it is not message text.
-    app.add_rows_region(RegionId::InboxThread, content, scroll as usize, texts);
-    frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), content);
+    // The feed only: the header and the composer are not message text.
+    app.add_rows_region(RegionId::InboxThread, feed, scroll as usize, texts);
+    frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), feed);
+    let bottom = areas.bottom;
     match &t.compose {
-        // `compose.hint` is drawn from step 14 on (pane layout v3).
-        Some(compose) => draw_reply_input(frame, app, compose.placeholder.as_deref(), bottom_area),
-        None if bottom > 0 => {
-            frame.render_widget(Paragraph::new(Span::styled("this thread takes no replies", dim)), bottom_area);
+        Some(compose) => {
+            let hint = compose_hint(t).filter(|_| bottom.height > 0);
+            let input = Rect { height: bottom.height - u16::from(hint.is_some()), ..bottom };
+            draw_reply_input(frame, app, compose.placeholder.as_deref(), input);
+            if let Some(hint) = hint {
+                let text = truncate(&crate::inbox::sanitize(hint), bottom.width as usize);
+                let row = Rect { y: bottom.bottom() - 1, height: 1, ..bottom };
+                frame.render_widget(Paragraph::new(Span::styled(text, dim)), row);
+            }
+        }
+        None if bottom.height > 0 => {
+            frame.render_widget(Paragraph::new(Span::styled("this thread takes no replies", dim)), bottom);
         }
         None => {}
     }
@@ -2420,8 +2544,7 @@ mod tests {
             note("m", Level::Warn, 0),
         ] {
             let card: String = card_chip(&t).into_iter().map(|(s, _)| s).collect();
-            let head = &pane_lines(&t, None, 0)[1];
-            let (pane, _) = &pane_rows(head, 200, false)[0];
+            let pane = &header_lines(&pane_header(&t, None, 0), 200, false)[1];
             assert!(row_text(pane).starts_with(&format!("{card}  ·  ")), "{card:?} vs {:?}", row_text(pane));
         }
     }
@@ -2877,6 +3000,152 @@ See [PR 6900](https://github.com/o/r/pull/6900).";
         let scroll = app.inbox.scroll;
         app.on_key(KeyEvent::from(KeyCode::Down));
         assert_eq!(app.inbox.scroll, scroll);
+    }
+
+    /// One thread of `n` messages (`message 1` oldest), a link, a key, two
+    /// actions and `compose`, its pane focused.
+    fn feed_app(n: u64, compose: Option<crate::inbox::Compose>) -> App {
+        let mut t = dthread("#6900 feat/agent-run-cost-event", State::NeedsYou, Some("review drafts"));
+        t.id = 1;
+        t.owner = "bab-disp-id".into();
+        t.key = Some("pr-6900".into());
+        t.link = Some("https://x/pr/6900".into());
+        t.actions = vec![
+            crate::inbox::Action { id: "retry".into(), label: "Retry".into(), ..Default::default() },
+            crate::inbox::Action { id: "done".into(), label: "Done".into(), done: true, ..Default::default() },
+        ];
+        t.feed = (1..=n)
+            .map(|i| crate::inbox::FeedItem::markdown(i, i * 60, &format!("m{i}"), &format!("message {i}")))
+            .collect();
+        t.compose = compose;
+        let mut inbox = Inbox::default();
+        inbox.threads = vec![t];
+        let mut app = App::new(PathBuf::from("/tmp"));
+        app.set_inbox(inbox);
+        app.on_key(KeyEvent::from(KeyCode::Char('4')));
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        app
+    }
+
+    /// The thread pane's columns of a 100-wide frame's row (list 40%).
+    fn pane_part(row: &str) -> String {
+        row.chars().skip(40).collect()
+    }
+
+    // At 100x24: the pane's inner area is columns 41-98, rows 2-21.
+    #[test]
+    fn the_header_stays_put_while_the_feed_scrolls_newest_first() {
+        let mut app = feed_app(20, None);
+        let rows = rows_of(&draw_buffer(&app, 100, 24));
+        if std::env::var_os("SHOW_INBOX").is_some() {
+            println!("{}", rows.join("\n"));
+        }
+        let pane: Vec<String> = rows.iter().map(|r| pane_part(r)).collect();
+        assert!(pane[2].starts_with("│#6900 feat/agent-run-cost-event ↗ "), "{}", pane.join("\n"));
+        assert!(pane[3].starts_with("│● review drafts  ·  ") && pane[3].ends_with(" bab-disp · pr-6900│"), "{:?}", pane[3]);
+        // The action row wraps between buttons: 58 columns hold five.
+        assert_eq!(pane[4], format!("│{:58}│", "[1] Retry  [2] Done ✓  [o] VS Code  [t] Terminal  [l] Logs"));
+        assert_eq!(pane[5], format!("│{:58}│", "[p] Port"));
+        assert_eq!(pane[6], format!("├{}┤", "─".repeat(58)), "separator joined to the border");
+        // Newest first: scroll 0 shows the latest message right under it.
+        assert!(pane[7].trim_end_matches('│').trim_end().ends_with("  bab-disp"), "{:?}", pane[7]);
+        assert!(pane[8].contains("message 20"), "{:?}", pane[8]);
+        let header: Vec<String> = pane[1..=6].to_vec();
+
+        // Scrolled to the end: the oldest message is in view, the header the same.
+        app.on_key(KeyEvent::from(KeyCode::Char('G')));
+        assert!(app.inbox.scroll > 0);
+        let pane: Vec<String> = rows_of(&draw_buffer(&app, 100, 24)).iter().map(|r| pane_part(r)).collect();
+        assert_eq!(pane[1..=6], header[..], "pinned");
+        assert!(!pane.iter().any(|r| r.contains("message 20")));
+        // The last feed row sits right above the no-replies hint.
+        assert!(pane[20].contains("message 1 "), "{}", pane.join("\n"));
+        assert!(pane[21].contains("this thread takes no replies"));
+
+        // Header rows and the separator hit the thread, not the input.
+        let frame = Rect::new(0, 0, 100, 24);
+        for row in 2..=7 {
+            assert_eq!(inbox_hit(&app, frame, 60, row), Some(InboxHit::Thread), "row {row}");
+        }
+        assert_eq!(inbox_hit(&app, frame, 60, 21), Some(InboxHit::Hint));
+        // The wheel over the header scrolls the feed like over the feed.
+        let max = app.inbox.scroll;
+        let wheel = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::ScrollUp,
+            column: 60,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.on_mouse(&wheel, frame);
+        assert_eq!(app.inbox.scroll, max - 3);
+    }
+
+    #[test]
+    fn the_composer_draws_its_hint_under_the_box_and_hits_agree() {
+        let hint = "Starts an agent with your message, then waits for it to finish and posts the result";
+        let compose = crate::inbox::Compose {
+            placeholder: Some("Instructions for this PR…".into()),
+            hint: Some(hint.into()),
+        };
+        let mut app = feed_app(3, Some(compose));
+        let frame = Rect::new(0, 0, 100, 24);
+        let check = |app: &App, box_rows: u16| {
+            let pane: Vec<String> = rows_of(&draw_buffer(app, 100, 24)).iter().map(|r| pane_part(r)).collect();
+            // The hint is the last inner row, cut to the width with `…`.
+            assert_eq!(pane[21], format!("│{}│", truncate(hint, 58)), "{}", pane.join("\n"));
+            assert!(pane[21].contains('…'));
+            // The box right above it: border + rows + border.
+            let top = 21 - box_rows - 2;
+            assert!(pane[top as usize].starts_with("│╭"), "{}", pane.join("\n"));
+            assert!(pane[20].starts_with("│╰"), "{}", pane.join("\n"));
+            for row in top..=21 {
+                assert_eq!(inbox_hit(app, frame, 60, row), Some(InboxHit::Input), "row {row}");
+            }
+            assert_eq!(inbox_hit(app, frame, 60, top - 1), Some(InboxHit::Thread));
+            assert_eq!(inbox_hit(app, frame, 60, 3), Some(InboxHit::Thread), "header");
+            pane
+        };
+        let pane = check(&app, 1);
+        assert!(pane[19].contains("Instructions for this PR…"), "{}", pane.join("\n"));
+
+        // Typing grows the box; the hint stays under it, hits follow.
+        app.on_key(KeyEvent::from(KeyCode::Char('r')));
+        let typed = "y".repeat(56 * 2 + 5);
+        typed.chars().for_each(|c| app.on_key(KeyEvent::from(KeyCode::Char(c))));
+        check(&app, 3);
+        // A click on the hint row keeps the typed line (it's the composer).
+        app.on_mouse(
+            &crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column: 60,
+                row: 21,
+                modifiers: KeyModifiers::NONE,
+            },
+            frame,
+        );
+        assert_eq!(app.inbox.focus, InboxFocus::Input);
+        assert_eq!(app.inbox.reply.as_ref().unwrap().line.input(), typed);
+    }
+
+    #[test]
+    fn header_lines_cut_align_and_wrap() {
+        let line = |left: &str, right: Option<&str>| HeaderRow::Line {
+            left: vec![(Tone::Title, left.to_string())],
+            right: right.map(str::to_string),
+        };
+        let texts = |rows: &[HeaderRow], w: u16| header_lines(rows, w, false).iter().map(text).collect::<Vec<_>>();
+        // Right-aligned when both fit; the left cut first, then the right dropped.
+        assert_eq!(texts(&[line("chip", Some("owner · key"))], 20), ["chip     owner · key"]);
+        assert_eq!(texts(&[line("a long chip line", Some("owner"))], 20), ["a long chip l… owner"]);
+        assert_eq!(texts(&[line("a long chip line", Some("owner"))], 10), ["a long ch…"]);
+        // Titles are one row, inline markdown rendered before cutting.
+        assert_eq!(texts(&[line("fix `parse_port` everywhere", None)], 16), ["fix parse_port …"]);
+        let b = |s: &str| vec![(Tone::Plain, s.to_string())];
+        let buttons = HeaderRow::Buttons(vec![b("[1] Retry"), b("[2] Done"), b("[o] VS Code")]);
+        assert_eq!(texts(std::slice::from_ref(&buttons), 40), ["[1] Retry  [2] Done  [o] VS Code"]);
+        assert_eq!(texts(std::slice::from_ref(&buttons), 20), ["[1] Retry  [2] Done", "[o] VS Code"]);
+        // A button wider than the pane: cut on its own row.
+        assert_eq!(texts(std::slice::from_ref(&buttons), 6), ["[1] R…", "[2] D…", "[o] V…"]);
     }
 
     #[test]

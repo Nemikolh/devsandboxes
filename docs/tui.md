@@ -214,9 +214,11 @@ is connected, else applied through `inbox::ops::apply` by the event loop
   `ui::inbox_hit` from the draw path's own layout fns and last list offset):
   a card selects its thread and focuses the list (the spacer row hits
   nothing), a view name in the strip switches to it (`‹`/`›` step), the pane
-  focuses the thread, the input box the input (left like `esc` by a click on
-  the pane), the hint row the thread. The wheel moves the selection one card
-  over the list and scrolls the pane over it. A click on a tab title (any
+  (header, separator or feed) focuses the thread, the composer (the input
+  box and its `compose.hint` row) the input (left like `esc` by a click on
+  the rest of the pane), the no-replies row the thread. The wheel moves the
+  selection one card over the list and scrolls the feed over the pane
+  (header included). A click on a tab title (any
   tab, `ui::tab_hit` over `ui::tab_spans`, which the tab bar is drawn from)
   switches tabs like `1`–`4`. None of it under a modal or the prompt; a
   click outside the terminal panel still unfocuses a terminal.
@@ -257,14 +259,38 @@ the thread; `esc` steps back one zone at a time (input → thread → list). The
 focused zone's border is highlighted. While the thread or its input has
 focus it shadows the dashboard keys (a tier in `App::on_key` after the
 terminal, like a modal): the `1`–`4` tab keys and the rest act on the
-thread, not on rows the user can't see. `q`, `:` and `?` stay reachable. The
-pane shows the title; the card's chip and the time; `from` (sender,
-`(archived: instance removed)`); `link`; `child` (resolved among the
-sender's own children, with its run state, or `(no such child)`); the
-message; the timeline (put changes, actions, replies, done/reopen; for a
-notify thread, its earlier records); `N events waiting for <sender>` until
-the dispatcher acks them; the numbered actions (`⌂ host` runs in the
-dashboard, `→ <sender>` sends an event, `✓ done`).
+thread, not on rows the user can't see. `q`, `:` and `?` stay reachable.
+
+**Pane layout** (v3, `docs/inbox-redesign.md` *TUI Inbox*;
+`draw_inbox_pane`, `thread_pane_layout`/`pane_areas` in `src/tui/ui.rs`,
+shared with `inbox_hit`). Top to bottom:
+
+- **Header, pinned** (never scrolls; `app::inbox::pane_header`, laid out by
+  `ui::header_lines`, its height computed): the title, one row cut with `…`
+  (`↗` with a link, `enter` opens it); the card's chip (same `chip()`) and
+  the time, with `<sender> · <key>` right-aligned while it fits; `child
+  <name>` with its run state, `(stopped)` when its container exists but isn't
+  up, or `<key> (no such child)`; `(archived: instance removed)`; then the
+  **action row**: `[1] Label` per owner action (`⌂` = a host verb, run in
+  the dashboard; `✓` = also marks done; the rest is an event for the sender,
+  which the status line says on press) and `[o] VS Code  [t] Terminal  [l]
+  Logs  [p] Port`, the target keys, on a live dispatcher thread whose target
+  resolves. The row wraps between buttons. A notify thread's header is its
+  title and level chip.
+- A **separator** joined to the pane's border (`├─┤`).
+- **Feed, newest first** (`app::inbox::pane_feed`), scrolling on its own
+  (scroll 0 = the newest item at the top, `g`/`G` newest/oldest): `N events
+  waiting for <sender>` first while the dispatcher hasn't acked them (state,
+  not history), then messages (stamp + author, `(edited)`/`(withdrawn)`,
+  markdown and fields blocks), replies (`you`), actions (`you: <label>`) and
+  markers (`· done`, `· active → needs you`, status changes); for a notify
+  thread, its records, the head first, each a stamp + level row over its
+  markdown.
+- The **composer** (below).
+
+Mouse selection: the feed is `RegionId::InboxThread` (a rows document, so a
+selection outlives a scroll); the header is `RegionId::InboxHeader`, plain
+screen cells (it doesn't scroll). The composer isn't selectable.
 
 **Markdown.** Dispatcher text is often LLM output, so the pane renders it
 (`src/tui/markdown.rs`, `pulldown-cmark`): the message and notify bodies as
@@ -296,8 +322,9 @@ Container text has its control characters stripped when stored
 
 **The reply input** sits at the bottom of the thread pane and is only drawn
 when the thread sets `reply` (`draw_inbox_pane`/`draw_reply_input`,
-`src/tui/ui.rs`); a thread without one gets a one-line dim hint in its place,
-a notify thread gets nothing. It wraps what's typed by display width
+`src/tui/ui.rs`), with the thread's `compose.hint` as one dim row under the
+box (cut to the width with `…`); a thread without one gets a one-line dim
+no-replies hint in its place, a notify thread gets nothing. It wraps what's typed by display width
 (`src/tui/textarea.rs`) and grows from one to six rows, then scrolls to keep
 the cursor in view. `enter` sends a non-empty reply (the same `Op::Reply`)
 and keeps the input focused and empty for the next message; `alt-enter` (or

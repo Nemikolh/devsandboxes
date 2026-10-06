@@ -81,7 +81,7 @@ OSC 52 has no reply.
   RegionId, rect: Rect, source: Source }`. `rect` is the **inner** text area, so
   borders and titles are outside by construction. `RegionId` is an enum naming
   the pane (`InstancesTree`, `Detail`, `ServicesTable`, `ServiceDetail`,
-  `PortsTable`, `InboxList`, `InboxThread`, `Terminal`, `ConfigLeft`,
+  `PortsTable`, `InboxList`, `InboxHeader`, `InboxThread`, `Terminal`, `ConfigLeft`,
   `ConfigRight`, `TextModal`). The registry lives on `App` behind a `RefCell`,
   cleared at the start of `ui::draw`. This is the same interior-mutability
   pattern as `InboxView::set_pane_max` / `set_list_offset`
