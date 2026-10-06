@@ -11,7 +11,9 @@
 //! And it relays control requests (`devsbd ensure|ls|stop|rm`, `ctl.rs`)
 //! arriving on the API socket to the newest bridge whose host serves
 //! `CONTROL`, each on its own client thread, answering `NoHost` itself when
-//! there's none.
+//! there's none. `events-follow` (`devsbd events --follow`) is relayed as a
+//! stream instead of one reply: bytes pass through as they arrive, for as
+//! long as the host keeps the stream open (`control_follow`).
 //!
 //! One daemon per container, per build: the pidfile records the owner's build
 //! hash, and a daemon of a different build (the host rewrote the binary, e.g.
@@ -25,7 +27,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::control::{self, Response, Status};
@@ -48,8 +50,19 @@ pub const API_SOCK: &str = "/run/devsandbox/api.sock";
 pub const API_POKE: u8 = b'n';
 /// A control request: the encoded `control::Request` follows, then the client
 /// shuts its write side; the daemon answers one encoded `control::Response`
-/// and closes.
+/// and closes. For `events-follow`, the host's held-open response streams
+/// through until either end closes.
 pub const API_CONTROL: u8 = b'c';
+
+/// The daemon's answer when no bridge's host serves `CONTROL`.
+const NO_HOST: &str = "no host connected; open the devsandbox dashboard";
+
+/// Chunks an `events-follow` relay queues for a client that reads slowly.
+/// Past that the follower is dropped (the client exits 75 and reconnects,
+/// getting everything unacked again) rather than letting the host's bytes
+/// back up into the mux, whose frame reader writes legacy streams inline
+/// and would stall every stream on the bridge.
+const FOLLOW_QUEUE: usize = 64;
 
 /// How long an API client may take to send its first byte.
 const API_READ_TIMEOUT: Duration = Duration::from_secs(1);
@@ -477,9 +490,82 @@ fn serve_control_client(mut conn: UnixStream, bridges: &Bridges, ids: &AtomicU32
         Ok(_) if request.len() > control::MAX_REQUEST => {
             encoded(Status::Usage, format!("request longer than {} bytes", control::MAX_REQUEST))
         }
+        Ok(_) if is_follow(&request) => return control_follow(bridges, ids, &request, conn),
         Ok(_) => control_exchange(bridges, ids, &request, CONTROL_REPLY_TIMEOUT),
     };
     let _ = conn.write_all(&reply);
+}
+
+/// Whether an encoded request is `events-follow`. Anything that doesn't
+/// decode takes the one-reply path, and the host answers its `Usage`.
+fn is_follow(request: &[u8]) -> bool {
+    std::str::from_utf8(request)
+        .ok()
+        .and_then(|t| control::decode_request(t).ok())
+        .is_some_and(|r| r.op == control::Op::Subscribe)
+}
+
+/// Relay an `events-follow` request like [`control_exchange`], but stream the
+/// host's response to `conn` as it arrives, with no reply timeout or size
+/// cap: the host's ping lines keep it alive, and [`control::FOLLOW_SILENCE`]
+/// without a byte ends it. Without a route the answer is `NoHost`; any other
+/// end (the bridge died, the host closed, the client left) just closes both
+/// sides, and the client tells a finished stream from a cut one itself.
+fn control_follow(bridges: &Bridges, ids: &AtomicU32, request: &[u8], conn: UnixStream) {
+    let Some(mux) = bridges.route(caps::CONTROL, Duration::ZERO) else {
+        let _ = (&conn).write_all(&encoded(Status::NoHost, NO_HOST));
+        return;
+    };
+    let stream = next_stream_id(ids);
+    let Ok((ours, theirs)) = UnixStream::pair() else { return };
+    let sent = mux.attach(stream, theirs, Some(channel::CONTROL)).and_then(|()| {
+        mux.send(&Frame::Data { stream, bytes: request.to_vec() })?;
+        mux.send(&Frame::Eof { stream })
+    });
+    if sent.is_err() {
+        return;
+    }
+    let _ = ours.set_read_timeout(Some(control::FOLLOW_SILENCE));
+    let _ = conn.set_write_timeout(Some(control::FOLLOW_SILENCE));
+    relay(ours, conn);
+}
+
+/// Copy `from` (the mux stream) to `to` (the client) until either ends. The
+/// reading side never blocks on the client: chunks go through a queue of
+/// [`FOLLOW_QUEUE`] drained by a writer thread, and a full queue ends the
+/// relay. Whichever side ends first, both close: shutting `from` sends the
+/// host a `Close`, so its next write fails; dropping `to` is the client's EOF.
+fn relay(mut from: UnixStream, mut to: UnixStream) {
+    let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(FOLLOW_QUEUE);
+    let wake = from.try_clone().ok();
+    let writer = std::thread::spawn(move || {
+        for chunk in rx {
+            if to.write_all(&chunk).is_err() {
+                break;
+            }
+        }
+        // The client left: unblock the reader so the stream closes now.
+        if let Some(from) = wake {
+            let _ = from.shutdown(std::net::Shutdown::Both);
+        }
+    });
+    let mut buf = [0u8; 4096];
+    loop {
+        match from.read(&mut buf) {
+            Ok(0) => break,
+            // Full (a stalled client) or disconnected (the writer quit).
+            Ok(n) => {
+                if tx.try_send(buf[..n].to_vec()).is_err() {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+    let _ = from.shutdown(std::net::Shutdown::Both);
+    drop(tx);
+    let _ = writer.join();
 }
 
 fn encoded(status: Status, body: impl Into<String>) -> Vec<u8> {
@@ -495,7 +581,7 @@ fn encoded(status: Status, body: impl Into<String>) -> Vec<u8> {
 /// the request as one `Data`, `Eof`, the reply read through a socket pair.
 fn control_exchange(bridges: &Bridges, ids: &AtomicU32, request: &[u8], timeout: Duration) -> Vec<u8> {
     let Some(mux) = bridges.route(caps::CONTROL, Duration::ZERO) else {
-        return encoded(Status::NoHost, "no host connected; open the devsandbox dashboard");
+        return encoded(Status::NoHost, NO_HOST);
     };
     let disconnected = || encoded(Status::Failed, "host disconnected");
     let stream = next_stream_id(ids);
@@ -934,6 +1020,8 @@ mod tests {
         Hangup,
         /// Hold the stream open silently.
         Silent,
+        /// Write these chunks 50 ms apart, then hold the stream open.
+        Stream(&'static [&'static [u8]]),
     }
 
     /// A bridge attached to `bridges` whose far end is a host-side mux sending
@@ -966,6 +1054,15 @@ mod tests {
                         }
                         Host::Hangup => {}
                         Host::Silent => std::thread::sleep(Duration::from_secs(5)),
+                        Host::Stream(chunks) => {
+                            for chunk in chunks {
+                                if handler.write_all(chunk).is_err() {
+                                    return;
+                                }
+                                std::thread::sleep(Duration::from_millis(50));
+                            }
+                            std::thread::sleep(Duration::from_secs(5));
+                        }
                     }
                 });
                 Some(ours.into())
@@ -1038,6 +1135,101 @@ mod tests {
         let resp = decoded(&pending.join().unwrap());
         assert_eq!((resp.status, resp.body.as_str()), (Status::Failed, "host disconnected"));
         assert!(t.elapsed() < Duration::from_secs(3));
+    }
+
+    const FOLLOW: &[u8] = b"op events-follow\n";
+
+    /// `control_follow` on its own thread, as `serve_control_client` runs it;
+    /// the client end comes back.
+    fn follow_client(bridges: &Arc<Bridges>) -> UnixStream {
+        let (client, conn) = UnixStream::pair().unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let b = Arc::clone(bridges);
+        std::thread::spawn(move || control_follow(&b, &AtomicU32::new(1), FOLLOW, conn));
+        client
+    }
+
+    fn read_some(client: &mut UnixStream) -> Vec<u8> {
+        let mut buf = [0u8; 256];
+        let n = client.read(&mut buf).unwrap();
+        buf[..n].to_vec()
+    }
+
+    #[test]
+    fn only_events_follow_takes_the_stream_path() {
+        assert!(is_follow(FOLLOW));
+        assert!(is_follow(b"op events-follow\nkey pr-1\n"));
+        assert!(!is_follow(b"op events\n"));
+        assert!(!is_follow(b"op nope\n"));
+        assert!(!is_follow(b"\xff"));
+    }
+
+    /// A held-open response passes through as it arrives, not at EOF; the
+    /// bridge dying ends the client's stream at once.
+    #[test]
+    fn follow_streams_through_until_the_bridge_dies() {
+        let bridges = Arc::new(Bridges::default());
+        let chunks: &[&[u8]] = &[b"status ok\nbody \n", b"{\"id\":\"e-1\"}\n", b"{\"kind\":\"ping\"}\n"];
+        let (got, _host) = control_host(&bridges, caps::CONTROL, Host::Stream(chunks));
+        wait_routable(&bridges, caps::CONTROL);
+        let mut client = follow_client(&bridges);
+        let mut seen = Vec::new();
+        while seen.len() < chunks.concat().len() {
+            seen.extend(read_some(&mut client));
+        }
+        assert_eq!(seen, chunks.concat(), "streamed while the host still holds the stream");
+        assert_eq!(got.recv_timeout(Duration::from_secs(5)).unwrap(), FOLLOW);
+
+        let t = Instant::now();
+        bridges.route(caps::CONTROL, Duration::ZERO).unwrap().close_all();
+        assert_eq!(read_some(&mut client), b"", "EOF");
+        assert!(t.elapsed() < Duration::from_secs(3));
+    }
+
+    /// The client leaving closes the host's stream, so its next write fails.
+    #[test]
+    fn follow_client_leaving_closes_the_host_stream() {
+        let bridges = Arc::new(Bridges::default());
+        let (tx, wrote) = std::sync::mpsc::channel();
+        let (d_r, h_w) = std::io::pipe().unwrap();
+        let (h_r, d_w) = std::io::pipe().unwrap();
+        let daemon = Mux::new(d_w);
+        let host = Mux::new(h_w);
+        Bridges::attach(&bridges, &daemon, caps::TCP_FORWARD);
+        std::thread::spawn(move || daemon.serve_with(d_r, |_, _| None, |_, _, _, _reply| {}));
+        let h = Arc::clone(&host);
+        std::thread::spawn(move || {
+            h.serve(h_r, move |_, _| {
+                let (ours, mut handler) = UnixStream::pair().unwrap();
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    handler.read_to_end(&mut Vec::new()).unwrap();
+                    // Ping until a write fails.
+                    loop {
+                        if handler.write_all(b"{\"kind\":\"ping\"}\n").is_err() {
+                            let _ = tx.send(());
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                });
+                Some(ours.into())
+            })
+        });
+        host.send(&Frame::Caps(caps::CONTROL)).unwrap();
+        wait_routable(&bridges, caps::CONTROL);
+        let mut client = follow_client(&bridges);
+        assert!(!read_some(&mut client).is_empty());
+        drop(client);
+        assert!(wrote.recv_timeout(Duration::from_secs(5)).is_ok(), "the host's write failed");
+    }
+
+    #[test]
+    fn follow_without_a_host_is_no_host() {
+        let mut client = follow_client(&Arc::new(Bridges::default()));
+        let mut reply = Vec::new();
+        client.read_to_end(&mut reply).unwrap();
+        assert_eq!(decoded(&reply).status, Status::NoHost);
     }
 
     /// End to end through the flusher thread: a record queued while no bridge

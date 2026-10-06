@@ -354,6 +354,7 @@ What the user does on a thread comes back as an event, held by the host until yo
 
 ```
 devsbd events [--wait SECS] [--thread KEY]   # JSON lines, oldest first
+devsbd events --follow [--thread KEY]        # the same lines, pushed until the stream ends
 devsbd events ack <id>...
 ```
 
@@ -381,6 +382,46 @@ devsbd events ack <id>...
 - Events are a control command: they need the host daemon (exit 75 otherwise). An event only exists because someone clicked in a dashboard, so there's nothing to miss meanwhile; they wait in `inbox.toml`.
 - Each thread keeps at most 100 unacked events (the oldest is dropped beyond that), and one `events` answer stops at about 512 KiB: ack what you got and call again for the rest.
 - You only ever see and ack events of your own threads.
+
+### Following events (`--follow`)
+
+`devsbd events --follow` keeps one stream open to the host instead of polling: it prints every pending event first, then each new one the moment it's enqueued, as JSON lines on stdout, until the stream ends. Each event comes at most once per stream; acks still go through `devsbd events ack`, so a follower that restarts gets everything unacked again (at least once, as above). `--thread KEY` filters as for `events`; `--follow` with `--wait` is a usage error (exit 2).
+
+Besides events, the stream carries two lines of its own:
+
+- `{"kind":"ping"}` after 30 s without a line. Ignore it; it keeps the stream warm and lets both ends notice a dead one (90 s without a byte ends it).
+- `{"kind":"replaced"}` when another `--follow` from the same instance starts: only the newest follower gets events, so two copies of a dispatcher can't both act on one click. It's the last line, and the old follower exits 0. Stop that copy; don't restart it.
+
+Exit codes: 0 after `replaced`; 75 when the stream ends otherwise (no host daemon, the bridge dropped, the daemon in the container died or restarted): reconnect, with a backoff; 2 for a usage error, or a host too old to know `--follow` (fall back to `events --wait`); 77 without `inbox = true`. `devsbd features` lists `events-follow` on helpers that have it. A follower counts as a host daemon client, so it keeps the daemon from idling out.
+
+The recommended loop: follow, apply each event, save, ack; restart on 75 with a backoff; fall back to `--wait` on 2; stop on `replaced`. POSIX sh can't read the exit code of a pipeline's first command, so the stream goes through a FIFO:
+
+```sh
+handle() {  # one event line on stdin: apply it, save, then ack
+  ev=$(cat)
+  # ... apply $ev to your own state and save it ...
+  devsbd events ack "$(printf '%s' "$ev" | jq -r .id)" >/dev/null
+}
+
+fifo=$(mktemp -u); mkfifo "$fifo"
+backoff=1
+while :; do
+  devsbd events --follow >"$fifo" & pid=$!
+  while IFS= read -r ev; do
+    case $(printf '%s' "$ev" | jq -r .kind) in
+      ping|replaced) ;;
+      *) printf '%s' "$ev" | handle; backoff=1 ;;
+    esac
+  done <"$fifo"
+  wait "$pid"; rc=$?
+  case $rc in
+    0)  exit 0 ;;                                 # replaced: a newer copy runs
+    2)  exec ./poll-loop.sh ;;                    # old host: use `events --wait`
+    75) sleep "$backoff"; [ "$backoff" -lt 60 ] && backoff=$((backoff * 2)) ;;
+    *)  sleep 60 ;;
+  esac
+done
+```
 
 ### Sample: a thread loop
 

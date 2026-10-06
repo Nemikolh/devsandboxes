@@ -35,6 +35,8 @@
 //! shared Inbox store (`crate::inbox::store`) for the requester's own
 //! `instance_id` only: another instance never sees or acks them. `events`
 //! may long-poll up to [`MAX_WAIT`] on the bridge handler thread.
+//! `events-follow` streams them instead, for the stream's life ([`follow`],
+//! `follow.rs`): the one op that doesn't answer a single [`Response`].
 //!
 //! Children are ordinary instances named `<sandbox>-<key>`. Operations run as
 //! `devsandbox -C <config root> run|start|rebuild|stop|rm …` subprocesses, not
@@ -52,7 +54,7 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 
 use crate::commands::run::{instance_at, parse_worktree_list};
-use crate::config::{Config, SandboxProperties};
+use crate::config::{Config, Dispatcher, SandboxProperties};
 use crate::devsbd::control::{self, Op, Request, Response, Status};
 use crate::inbox::{ops as inbox_ops, store, Event};
 use crate::runtime::{backend, bounded};
@@ -66,6 +68,9 @@ pub use crate::devsbd::control::{valid_key, MAX_KEY};
 /// also holds a `docker exec`). Lives in `control` so the helper caps
 /// `events --wait` with the same number.
 pub use crate::devsbd::control::MAX_WAIT;
+
+mod follow;
+pub(crate) use follow::{follow_events, Followers};
 
 /// How often a waiting `events` request re-checks the store's stamp. Writes
 /// made in this process (the daemon's notify sink and acks) wake it at once
@@ -140,22 +145,67 @@ pub trait Executor {
 /// (`devsbd::bridge`), which is unix-only.
 #[cfg_attr(not(unix), allow(dead_code))]
 pub fn handle(dispatcher_key: &str, req: &Request) -> Response {
-    let state = match State::load() {
-        Ok(state) => state,
-        Err(e) => return Response::new(Status::Failed, format!("{e:#}")),
-    };
-    let config_dir = match state.instances.get(dispatcher_key) {
-        None => return denied(format!("`{dispatcher_key}` is not an instance")),
+    match load(dispatcher_key) {
+        Ok((state, config)) => handle_with(&state, &config, dispatcher_key, req, &mut Subprocess),
+        Err(resp) => resp,
+    }
+}
+
+/// State, and the config root recorded on instance `key`, as [`handle`] and
+/// [`follow`] need them.
+fn load(key: &str) -> Result<(State, Config), Response> {
+    let state = State::load().map_err(|e| failed(format!("{e:#}")))?;
+    let config_dir = match state.instances.get(key) {
+        None => return Err(denied(format!("`{key}` is not an instance"))),
         Some(owner) => match &owner.config_dir {
             Some(dir) => dir.clone(),
-            None => return no_config_dir(dispatcher_key),
+            None => return Err(no_config_dir(key)),
         },
     };
-    let config = match Config::load(&config_dir) {
-        Ok(config) => config,
-        Err(e) => return Response::new(Status::Failed, format!("{e:#}")),
+    let config = Config::load(&config_dir).map_err(|e| failed(format!("{e:#}")))?;
+    Ok((state, config))
+}
+
+/// Serve an `events-follow` request from instance `key` on `out` (the
+/// bridge's control stream) until the stream ends or a newer follower for
+/// the same owner replaces it: authorized like every inbox op, then
+/// [`follow_events`] against the process-wide [`Followers`]. A refusal is
+/// one encoded [`Response`], as for any op. Blocking; reads only, so it
+/// never takes the bridge's control lock.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub fn follow(key: &str, req: &Request, out: &mut dyn Write) {
+    static FOLLOWERS: Followers = Followers::new();
+    let resp = match load(key) {
+        Ok((state, config)) => {
+            match follow_with(&state, &config, key, req, &Subprocess, out, &FOLLOWERS, control::FOLLOW_PING) {
+                Ok(()) => return,
+                Err(resp) => resp,
+            }
+        }
+        Err(resp) => resp,
     };
-    handle_with(&state, &config, dispatcher_key, req, &mut Subprocess)
+    let _ = out.write_all(control::encode_response(&resp).as_bytes());
+}
+
+/// The testable core of [`follow`]: `Err` is the refusal to answer instead
+/// of a stream (nothing written yet); `Ok` once the stream ended.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn follow_with(
+    state: &State,
+    config: &Config,
+    key: &str,
+    req: &Request,
+    exec: &dyn Executor,
+    out: &mut dyn Write,
+    followers: &Followers,
+    ping: Duration,
+) -> Result<(), Response> {
+    if req.op != Op::Subscribe {
+        return Err(usage(format!("`{}` doesn't stream", req.op.as_str())));
+    }
+    let (owner, _, _) = authorize(state, config, key, req)?;
+    let path = exec.inbox_path().map_err(failed)?;
+    follow_events(&path, &owner.instance_id, req.key.as_deref(), out, followers, ping)
 }
 
 /// Whether `key` is an instance whose sandbox declares `dispatcher`. Lets the
@@ -199,7 +249,7 @@ pub(crate) fn current_sandbox(key: &str) -> Option<(Instance, SandboxProperties)
 /// The control ops on the requester's own Inbox threads, gated on
 /// `inbox = true` rather than `dispatcher` (docs/inbox-redesign.md, _Ownership_).
 fn is_inbox_op(op: Op) -> bool {
-    matches!(op, Op::Events | Op::EventsAck | Op::ThreadLs)
+    matches!(op, Op::Events | Op::EventsAck | Op::Subscribe | Op::ThreadLs)
 }
 
 fn denied(msg: impl Into<String>) -> Response {
@@ -221,6 +271,53 @@ fn no_config_dir(key: &str) -> Response {
     ))
 }
 
+/// The checks every request passes before its op runs: the requester exists
+/// with a recorded config root, declares what the op needs (`inbox = true`
+/// for inbox ops, `dispatcher` for child ops), and sent well-formed fields.
+/// The requester, its config root, and its `dispatcher` declaration (`None`
+/// only for inbox ops).
+fn authorize<'a>(
+    state: &'a State,
+    config: &Config,
+    dispatcher_key: &str,
+    req: &Request,
+) -> Result<(&'a Instance, &'a Path, Option<Dispatcher>), Response> {
+    let Some(owner) = state.instances.get(dispatcher_key) else {
+        return Err(denied(format!("`{dispatcher_key}` is not an instance")));
+    };
+    let Some(config_dir) = owner.config_dir.as_deref() else {
+        return Err(no_config_dir(dispatcher_key));
+    };
+    let props = match config.resolve_sandbox(&owner.sandbox) {
+        Ok(sandbox) => sandbox.properties,
+        Err(e) => return Err(denied(format!("{e:#}"))),
+    };
+    // Inbox ops need `inbox = true` (a child may own threads too); child ops
+    // need `dispatcher`. `decl` is only `None` for inbox ops.
+    let decl = if is_inbox_op(req.op) {
+        if !is_inbox_owner(&props) {
+            return Err(denied(format!("`{dispatcher_key}` doesn't declare inbox = true")));
+        }
+        None
+    } else {
+        // Only state from before children of dispatcher sandboxes were refused.
+        if owner.dispatcher.is_some() {
+            return Err(denied(format!(
+                "`{dispatcher_key}` is a dispatcher's child; children can't be dispatchers"
+            )));
+        }
+        let Some(decl) = props.dispatcher else {
+            return Err(denied(format!("sandbox `{}` does not declare `dispatcher`", owner.sandbox)));
+        };
+        Some(decl)
+    };
+    check_fields(req).map_err(usage)?;
+    if let Some((k, _)) = req.env.iter().find(|(k, _)| control::denied_env(k)) {
+        return Err(denied(format!("env `{k}` may not be set by a dispatcher")));
+    }
+    Ok((owner, config_dir, decl))
+}
+
 /// The pure core of [`handle`], over already-loaded `state` and `config`
 /// (the config root recorded on the dispatcher instance).
 pub(crate) fn handle_with(
@@ -230,39 +327,10 @@ pub(crate) fn handle_with(
     req: &Request,
     exec: &mut dyn Executor,
 ) -> Response {
-    let Some(owner) = state.instances.get(dispatcher_key) else {
-        return denied(format!("`{dispatcher_key}` is not an instance"));
+    let (owner, config_dir, decl) = match authorize(state, config, dispatcher_key, req) {
+        Ok(gate) => gate,
+        Err(resp) => return resp,
     };
-    let Some(config_dir) = owner.config_dir.as_deref() else {
-        return no_config_dir(dispatcher_key);
-    };
-    let props = match config.resolve_sandbox(&owner.sandbox) {
-        Ok(sandbox) => sandbox.properties,
-        Err(e) => return denied(format!("{e:#}")),
-    };
-    // Inbox ops need `inbox = true` (a child may own threads too); child ops
-    // need `dispatcher`. `decl` is only `None` for inbox ops.
-    let decl = if is_inbox_op(req.op) {
-        if !is_inbox_owner(&props) {
-            return denied(format!("`{dispatcher_key}` doesn't declare inbox = true"));
-        }
-        None
-    } else {
-        // Only state from before children of dispatcher sandboxes were refused.
-        if owner.dispatcher.is_some() {
-            return denied(format!("`{dispatcher_key}` is a dispatcher's child; children can't be dispatchers"));
-        }
-        let Some(decl) = props.dispatcher else {
-            return denied(format!("sandbox `{}` does not declare `dispatcher`", owner.sandbox));
-        };
-        Some(decl)
-    };
-    if let Err(msg) = check_fields(req) {
-        return usage(msg);
-    }
-    if let Some((k, _)) = req.env.iter().find(|(k, _)| control::denied_env(k)) {
-        return denied(format!("env `{k}` may not be set by a dispatcher"));
-    }
     let owner_id = owner.instance_id.as_str();
 
     match req.op {
@@ -382,6 +450,8 @@ pub(crate) fn handle_with(
             };
             branches(state, owner_id, &base, req.ahead, exec)
         }
+        // Served by `follow` on the bridge; never answered as one response.
+        Op::Subscribe => usage("`events-follow` streams; send it on its own control stream"),
         Op::Events | Op::EventsAck | Op::ThreadLs => {
             let path = match exec.inbox_path() {
                 Ok(path) => path,
@@ -433,19 +503,7 @@ struct EventLine<'a> {
 fn events_body(pending: &[(String, Event)]) -> String {
     let mut body = String::new();
     for (thread, e) in pending {
-        let line = EventLine {
-            id: &e.id,
-            thread,
-            key: thread,
-            kind: e.kind.as_str(),
-            action: e.action.as_deref(),
-            text: e.text.as_deref(),
-            message: e.message.as_deref(),
-            form: e.form.as_deref(),
-            answers: e.answers.as_ref(),
-            at: crate::inbox::rfc3339(e.at),
-        };
-        let Ok(json) = serde_json::to_string(&line) else { continue };
+        let Some(json) = event_json(thread, e) else { continue };
         if !body.is_empty() && body.len() + json.len() + 1 > EVENTS_BODY_CAP {
             break;
         }
@@ -455,6 +513,24 @@ fn events_body(pending: &[(String, Event)]) -> String {
         body.push_str(&json);
     }
     body
+}
+
+/// Event `e` on `thread` as one `events` line (no newline); `None` only if
+/// it doesn't serialize.
+fn event_json(thread: &str, e: &Event) -> Option<String> {
+    let line = EventLine {
+        id: &e.id,
+        thread,
+        key: thread,
+        kind: e.kind.as_str(),
+        action: e.action.as_deref(),
+        text: e.text.as_deref(),
+        message: e.message.as_deref(),
+        form: e.form.as_deref(),
+        answers: e.answers.as_ref(),
+        at: crate::inbox::rfc3339(e.at),
+    };
+    serde_json::to_string(&line).ok()
 }
 
 /// `pending` narrowed to `thread`'s events, if one is given. An unknown
@@ -600,7 +676,7 @@ fn check_fields(req: &Request) -> Result<(), String> {
         Op::Branches => (Some(true), Some(false)),
         // Always the requester's own: nothing to name. `events` takes `key`
         // as its optional thread filter (`devsbd events --thread`).
-        Op::Events => (Some(false), None),
+        Op::Events | Op::Subscribe => (Some(false), None),
         Op::EventsAck | Op::ThreadLs => (Some(false), Some(false)),
         _ => (None, Some(true)),
     };
@@ -682,7 +758,8 @@ fn helper_argv(req: &Request) -> Vec<String> {
                 argv.extend([s("--keep"), keep.to_string()]);
             }
         }
-        Op::Ensure | Op::Ls | Op::Stop | Op::Rm | Op::Done | Op::Branches | Op::Events | Op::EventsAck | Op::ThreadLs => {
+        Op::Ensure | Op::Ls | Op::Stop | Op::Rm | Op::Done | Op::Branches | Op::Events | Op::EventsAck
+        | Op::Subscribe | Op::ThreadLs => {
             unreachable!("not a run op")
         }
     }
@@ -2312,6 +2389,46 @@ folder = "."
         // No store: a failure, not a panic.
         let resp = call(&s, "d", &Request::new(Op::Events), &mut Fake::new());
         assert_eq!(resp, Response::new(Status::Failed, "no inbox in this test"));
+    }
+
+    /// `events-follow` is authorized like the other inbox ops and takes
+    /// only the thread filter; a refusal comes back instead of a stream.
+    /// Never answered by `handle_with`.
+    #[test]
+    fn follow_needs_inbox_and_takes_only_a_thread() {
+        struct Closed;
+        impl Write for Closed {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let s = state();
+        let config = Config::parse(CONFIG).unwrap();
+        let (_path, fake) = inbox_fake("follow-auth");
+        let followers = Followers::new();
+        let follow = |who: &str, r: &Request| {
+            follow_with(&s, &config, who, r, &fake, &mut Closed, &followers, Duration::from_secs(30))
+        };
+        let sub = Request::new(Op::Subscribe);
+        // Authorized: the stream starts (and ends at once on the closed writer).
+        assert_eq!(follow("d", &sub), Ok(()));
+        assert_eq!(follow("d", &Request { key: Some("pr-1".into()), ..sub.clone() }), Ok(()));
+        let err = |who: &str, r: &Request| follow(who, r).unwrap_err();
+        assert_eq!(err("p", &sub).status, Status::Denied);
+        assert_eq!(err("ghost", &sub).status, Status::Denied);
+        let resp = err("d", &Request { timeout: Some(5), ..sub.clone() });
+        assert_eq!((resp.status, resp.body.as_str()), (Status::Usage, "`events-follow` takes no `timeout`"));
+        assert!(err("d", &Request { sandbox: Some("web".into()), ..sub.clone() }).body.contains("takes no `sandbox`"));
+        assert!(err("d", &Request { key: Some("PR 1".into()), ..sub.clone() }).body.contains("bad key"));
+        assert_eq!(err("d", &Request::new(Op::Events)).status, Status::Usage, "only events-follow streams");
+        let no_store = follow_with(&s, &config, "d", &sub, &Fake::new(), &mut Closed, &followers, Duration::from_secs(30));
+        assert_eq!(no_store, Err(Response::new(Status::Failed, "no inbox in this test")));
+
+        let resp = call(&s, "d", &sub, &mut Fake::new());
+        assert_eq!(resp.status, Status::Usage, "{resp:?}");
     }
 
     #[test]

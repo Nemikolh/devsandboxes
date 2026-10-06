@@ -116,6 +116,7 @@ devsbd rm <key> [--sandbox S]
 devsbd done <key> [--sandbox S]             # mark a child done; `ensure` reusing it clears it
 devsbd exec <key> [--sandbox S] [--detach] -- <cmd>...   # a run; see _Runs_
 devsbd events [--wait SECS] [--thread KEY]  # pending Inbox events (JSON lines); see _Inbox threads_
+devsbd events --follow [--thread KEY]       # the same, pushed over one held-open stream
 devsbd events ack <id>...
 devsbd thread ls                            # this instance's live threads (JSON; needs inbox = true)
 ```
@@ -189,12 +190,33 @@ Threads are keyed by `(owner instance_id, key)` and kind (a notify key and a thr
 
 - `events`: the requester's pending events, oldest first across threads, one JSON object per line (`id`, `thread`, `key`, `kind` = action|reply|done|reopen|submit, `action?`, `text?`, `message?`, `form?`, `answers?`, `at` RFC 3339 UTC). `key` is the deprecated v2 name of `thread`, same value, removed with the other v2 compat (step 13b of `docs/inbox-redesign.md`). All of them until acked: delivery is at least once. With a `key` filter, only that thread's events are answered and waited for; an unknown thread answers none (a dispatcher may filter before its first put lands). With a `timeout` and nothing pending, the handler thread waits, re-reading the store only when its stamp moves (every 500 ms). It holds no lock beyond the store's shared one and skips the host control lock, so a waiting `events` never delays a click being written or another dispatcher's `ensure`. The body stops at about half of `MAX_RESPONSE`; the rest follows after an ack.
 - `events-ack`: drops the requester's events with those ids, answers the count; unknown ids are skipped.
+- `events-follow` (`devsbd events --follow`, `Op::Subscribe`): the requester's events pushed over a held-open response; see _Following events_ below.
 - `thread-ls`: the requester's live (non-archived) threads as a JSON array in `thread put` shape.
 - `done`: sets `done = <unix secs>` on an owned child in `state.toml` (through an `Executor` method, so tests stay fake), under the host control lock like `ensure`/`stop`/`rm`. `ensure` reusing a done child clears it before its subprocess runs.
 
+### Following events
+
+`events-follow` is the one control op whose response isn't one `status`/`body` pair. **Framing:** the host answers the usual encoded response first; only when it's `status ok` (empty body) the stream stays open and carries raw JSON lines after it, not escaped, one per line, until either end closes:
+
+```text
+status ok
+body 
+{"id":"e-1790900001-3f2a","thread":"pr-6900","key":"pr-6900","kind":"reply","text":"…","at":"…"}
+{"kind":"ping"}
+{"kind":"replaced"}
+```
+
+Any other status (`denied`, `usage`, `failed`, the daemon's own `no-host`) is the whole answer, as for every op. That's the smallest additive change: the request is an ordinary one with a new op name, so an older host fails to decode it (`bad op`) and answers `usage`, which the client reports as exit 2 (the dispatcher falls back to `events --wait`); an older helper has no `--follow` flag (also exit 2). No frame-protocol `VERSION` bump: it's an ordinary `CONTROL` stream that simply stays open, and mux streams already carry data in both directions for as long as they live.
+
+- **Lines.** Every pending event of the requester (only `key`'s thread with a filter; `timeout` is a usage error), then each new one as it's enqueued, each at most once per stream: the handler keeps the ids it sent (forgetting acked ones), so a re-read of the store doesn't repeat them. Acks still go through `events-ack`, so a new stream starts with everything unacked again: at least once across reconnects. `{"kind":"ping"}` after `control::FOLLOW_PING` (30 s) without a line.
+- **One follower per owner.** A process-wide registry maps owner `instance_id` → the current follower's generation (`dispatch::Followers`); a new follower bumps it, and an older one that sees the bump writes `{"kind":"replaced"}` and closes (the client exits 0). So two copies of a dispatcher can't both act on one event.
+- **Host side.** Served on the bridge's control handler thread (`bridge::handle_control` hands a decoded `Subscribe` to the bridge's follow handler, `dispatch::follow`), holding one of the bridge's `MAX_HANDLERS` slots for its life; counted in `CONTROL_IN_FLIGHT` like a waiting `events`, so a follower is a daemon holder (`docs/serve.md`). It reads only: no host control lock. It wakes on in-process store writes (`inbox::ops::wait_changed`), in slices of at most 500 ms with the stamp check for other processes' writes, and on the ping timer. `CONTROL_READ_TIMEOUT` only bounds reading the request; writes time out after 60 s (`FOLLOW_WRITE_TIMEOUT`, twice the ping), so an idle but healthy stream is never cut. A write to a closed stream ends it: a follower whose client left is gone by the next ping.
+- **Helper daemon.** `daemon::control_follow` relays the stream to the API-socket client as bytes arrive: no reply timeout, no `MAX_RESPONSE` cap, no buffering to EOF. Reads from the mux stream go through a 64-chunk queue drained by a writer thread, so a client that stops reading can't back bytes up into the mux (whose frame reader writes these legacy streams inline); a full queue drops the follower instead (it reconnects). Either end closing closes the other. `control::FOLLOW_SILENCE` (90 s, three pings) without a byte ends it too.
+- **Client.** `devsbd events --follow` prints each complete line as it arrives and flushes; after `replaced` it exits 0. The stream ending any other way (the bridge dropped, so the daemon's mux closed the stream; the daemon died; 90 s of silence; a line cut short) exits 75.
+
 ### Authorization
 
-Only instances whose sandbox declares `inbox = true` put threads or read events (`declares_inbox` on every message, the same check in `dispatch::handle_with` on every `events`/`events-ack`/`thread-ls` request, against the config as it is now). `dispatcher` grants only the child ops; a dispatcher's child may declare `inbox = true` and own threads of its own. Everything is scoped to the requester's `instance_id`: another instance never sees, acks or changes an owner's threads, and host actions on a thread target only its `child` (resolved among the owner's own children) or the owner itself. Ids survive stop/restart/rebuild and are never reused, so `devsandbox rm` **archives** the removed instance's threads (notify ones too) instead of deleting them: read-only, shown only in **All**, dropped by retention. A put from a live owner un-archives (only `rm` archives).
+Only instances whose sandbox declares `inbox = true` put threads or read events (`declares_inbox` on every message, the same check in `dispatch::handle_with` on every `events`/`events-ack`/`events-follow`/`thread-ls` request, against the config as it is now). `dispatcher` grants only the child ops; a dispatcher's child may declare `inbox = true` and own threads of its own. Everything is scoped to the requester's `instance_id`: another instance never sees, acks or changes an owner's threads, and host actions on a thread target only its `child` (resolved among the owner's own children) or the owner itself. Ids survive stop/restart/rebuild and are never reused, so `devsandbox rm` **archives** the removed instance's threads (notify ones too) instead of deleting them: read-only, shown only in **All**, dropped by retention. A put from a live owner un-archives (only `rm` archives).
 
 ### Helper self-heal
 

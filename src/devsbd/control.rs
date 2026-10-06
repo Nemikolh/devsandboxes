@@ -9,9 +9,9 @@
 //!
 //! ```text
 //! op ensure             required, once: ensure|ls|stop|rm|done|exec|run-ls|run-logs|run-wait|run-rm|run-prune|
-//!                       branches|events|events-ack|thread-ls
+//!                       branches|events|events-ack|events-follow|thread-ls
 //! sandbox web           optional, at most once
-//! key pr-123            optional, at most once: a child key, or `events`' thread filter
+//! key pr-123            optional, at most once: a child key, or `events`/`events-follow`'s thread filter
 //! branch feat/x         optional, at most once
 //! env FOO=bar           optional, repeatable, each `K=V` (see `parse_env`)
 //! arg zidane            optional, repeatable: `exec`'s command, one line per argv word
@@ -58,6 +58,24 @@
 //! edited, withdrawn}`, plus `form: {id, state, answers?}` on one that has
 //! carried a form.
 //!
+//! `events-follow` (`devsbd events --follow`) is the one op whose response
+//! stays open: the host answers a normal response, and only when its status
+//! is `ok` (body empty) it keeps the stream and writes raw JSON lines after
+//! it, unescaped, one per line, until either side closes: every pending event
+//! (each at most once per stream), each new one as it's enqueued, a
+//! [`FOLLOW_PING_LINE`] after [`FOLLOW_PING`] without a line, and
+//! [`FOLLOW_REPLACED_LINE`] (then close) when a newer follower for the same
+//! owner starts. Any other status is the whole answer, as for every op. An
+//! older host fails to decode the op and answers `usage` (exit 2).
+//!
+//! ```text
+//! status ok
+//! body 
+//! {"id":"e-1790900001-3f2a","thread":"pr-6900","key":"pr-6900","kind":"reply","text":"…","at":"…"}
+//! {"kind":"ping"}
+//! {"kind":"replaced"}
+//! ```
+//!
 //! Unknown keys, repeats of a non-repeatable key, a missing required key, or
 //! a bad escape are decode errors.
 
@@ -84,6 +102,17 @@ pub const MAX_RESPONSE: usize = 1024 * 1024;
 /// wait`), and the daemon gives up on a reply after 30 minutes anyway. Here so
 /// the helper caps `events --wait` with the host's own number.
 pub const MAX_WAIT: u64 = 300;
+
+/// `events-follow`: the host writes [`FOLLOW_PING_LINE`] after this long
+/// without writing a line, so a dead stream is noticed at both ends.
+pub const FOLLOW_PING: std::time::Duration = std::time::Duration::from_secs(30);
+/// `events-follow`: silence (three missed pings) after which the daemon's
+/// relay and the client give up on the stream (the client exits 75).
+pub const FOLLOW_SILENCE: std::time::Duration = std::time::Duration::from_secs(90);
+/// The keepalive line of an `events-follow` stream.
+pub const FOLLOW_PING_LINE: &str = r#"{"kind":"ping"}"#;
+/// The last line of an `events-follow` stream a newer follower took over.
+pub const FOLLOW_REPLACED_LINE: &str = r#"{"kind":"replaced"}"#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
@@ -112,12 +141,14 @@ pub enum Op {
     Events,
     /// Drop the `ack`ed events; body = how many.
     EventsAck,
+    /// Follow the requester's events: a held-open response (module doc).
+    Subscribe,
     /// The requester's live Inbox threads, in put shape.
     ThreadLs,
 }
 
 impl Op {
-    pub const ALL: [Op; 15] = [
+    pub const ALL: [Op; 16] = [
         Op::Ensure,
         Op::Ls,
         Op::Stop,
@@ -132,6 +163,7 @@ impl Op {
         Op::Branches,
         Op::Events,
         Op::EventsAck,
+        Op::Subscribe,
         Op::ThreadLs,
     ];
 
@@ -155,6 +187,7 @@ impl Op {
             Op::Branches => "branches",
             Op::Events => "events",
             Op::EventsAck => "events-ack",
+            Op::Subscribe => "events-follow",
             Op::ThreadLs => "thread-ls",
         }
     }
@@ -624,6 +657,9 @@ timeout 5\n";
         };
         assert_eq!(encode_request(&ack), ACK_REQUEST);
         assert_eq!(decode_request(ACK_REQUEST), Ok(ack));
+        let follow = Request { key: Some("pr-1".into()), ..Request::new(Op::Subscribe) };
+        assert_eq!(encode_request(&follow), "op events-follow\nkey pr-1\n");
+        assert_eq!(decode_request("op events-follow\nkey pr-1\n"), Ok(follow));
         let wait = Request { timeout: Some(300), ..Request::new(Op::Events) };
         assert_eq!(encode_request(&wait), "op events\ntimeout 300\n");
         assert_eq!(decode_request("op events\ntimeout 300\n"), Ok(wait));

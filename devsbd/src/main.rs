@@ -48,7 +48,7 @@ fn build_hash() -> String {
 /// which reads as "none of these". Append-only; separate from `version`,
 /// whose one-line output is the host's install check, and from the frame
 /// protocol's `caps`, which describe the host link, not the CLI.
-const FEATURES: &[&str] = &["thread-send", "thread-withdraw", "thread-ls-feed"];
+const FEATURES: &[&str] = &["thread-send", "thread-withdraw", "thread-ls-feed", "events-follow"];
 
 fn main() {
     let mut args = std::env::args().skip(1);

@@ -1,5 +1,5 @@
 //! `devsbd ensure|ls|branches|stop|rm|done|exec`, `devsbd run ls|logs|wait|rm|prune <key> …`,
-//! `devsbd events [--wait SECS] [--thread KEY]`, `devsbd events ack <id>...` and `devsbd
+//! `devsbd events [--wait SECS | --follow] [--thread KEY]`, `devsbd events ack <id>...` and `devsbd
 //! thread ls`: the control commands (child ops need `dispatcher`, the thread
 //! and event ops `inbox = true`) (docs/automations.md, "Control
 //! API", "Runs"; docs/inbox-threads.md, *Events*). Each request is one encoded [`control::Request`] sent to the
@@ -8,9 +8,11 @@
 //! response's [`control::Status::exit_code`]. `exec` without `--detach`,
 //! `run logs --follow`, and `run wait` loop over short requests (the host
 //! answers each from the child's `devsbd run logs|wait`, `runs.rs`) instead of
-//! holding one stream open for a run's whole life.
+//! holding one stream open for a run's whole life. `events --follow` is the
+//! exception: one held-open `events-follow` stream, its lines copied to
+//! stdout until it ends ([`subscribe`]).
 
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
@@ -31,6 +33,7 @@ const USAGE: &str = "usage: devsbd ensure <sandbox> --key <key> [--branch B] [--
        devsbd run rm <key> <id> [--sandbox S] [--force]\n\
        devsbd run prune <key> [--sandbox S] [--keep N]\n\
        devsbd events [--wait SECS] [--thread KEY]\n\
+       devsbd events --follow [--thread KEY]\n\
        devsbd events ack <id>...\n\
        devsbd thread ls [--feed]";
 
@@ -57,8 +60,11 @@ pub fn run(verb: &str, args: &[String]) -> i32 {
             return control::EXIT_USAGE;
         }
     };
-    let mut send = |req: &Request| request(daemon::API_SOCK, req);
     let mut stdout = io::stdout();
+    if cmd.req.op == Op::Subscribe {
+        return subscribe(daemon::API_SOCK, &cmd.req, &mut stdout);
+    }
+    let mut send = |req: &Request| request(daemon::API_SOCK, req);
     match execute(&cmd, &mut send, &mut stdout, WAIT_STEP) {
         Ok(code) => code,
         Err(resp) => report(&resp),
@@ -95,7 +101,8 @@ struct Cmd {
     req: Request,
     /// `exec --detach`: print the run id and return.
     detach: bool,
-    /// `run logs --follow`: stream until the run ends.
+    /// `run logs --follow`: stream until the run ends. (`events --follow`
+    /// becomes the `events-follow` op instead.)
     follow: bool,
     /// `run wait --timeout`: overall seconds (none = until the run ends).
     deadline: Option<u64>,
@@ -124,9 +131,11 @@ fn parse_args(verb: &str, args: &[String]) -> Result<Cmd, String> {
         let allowed = match (op, flag) {
             (Op::Ensure, "--key" | "--branch" | "--env") => true,
             (Op::Branches, "--ahead") => true,
-            (Op::Events, "--wait" | "--thread") => true,
+            (Op::Events, "--wait" | "--thread" | "--follow") => true,
             (Op::ThreadLs, "--feed") => true,
-            (Op::Ls | Op::Ensure | Op::Branches | Op::Events | Op::EventsAck | Op::ThreadLs, _) => false,
+            (Op::Ls | Op::Ensure | Op::Branches | Op::Events | Op::EventsAck | Op::Subscribe | Op::ThreadLs, _) => {
+                false
+            }
             (_, "--sandbox") => true,
             (Op::Exec, "--detach" | "--") => true,
             (Op::RunLogs, "--follow") => true,
@@ -195,7 +204,7 @@ fn parse_args(verb: &str, args: &[String]) -> Result<Cmd, String> {
         return Ok(cmd);
     }
     let (wanted, what) = match op {
-        Op::Ls | Op::Events | Op::ThreadLs | Op::EventsAck => (0, "no arguments"),
+        Op::Ls | Op::Events | Op::ThreadLs | Op::EventsAck | Op::Subscribe => (0, "no arguments"),
         Op::Ensure | Op::Branches => (1, "exactly one <sandbox>"),
         Op::Stop | Op::Rm | Op::Done | Op::Exec | Op::RunLs | Op::RunPrune => (1, "exactly one <key>"),
         Op::RunLogs | Op::RunWait | Op::RunRm => (2, "<key> <id>"),
@@ -212,7 +221,7 @@ fn parse_args(verb: &str, args: &[String]) -> Result<Cmd, String> {
             }
         }
         Op::Branches => req.sandbox = positional.next(),
-        Op::Ls | Op::Events | Op::EventsAck | Op::ThreadLs => {}
+        Op::Ls | Op::Events | Op::EventsAck | Op::Subscribe | Op::ThreadLs => {}
         _ => req.key = positional.next(),
     }
     if let Some(id) = positional.next() {
@@ -223,6 +232,13 @@ fn parse_args(verb: &str, args: &[String]) -> Result<Cmd, String> {
     }
     if op == Op::Exec && (!dashdash || req.argv.is_empty()) {
         return Err("missing `-- <cmd>...`".into());
+    }
+    if op == Op::Events && cmd.follow {
+        if req.timeout.is_some() {
+            return Err("--follow and --wait are mutually exclusive".into());
+        }
+        req.op = Op::Subscribe;
+        cmd.follow = false;
     }
     Ok(cmd)
 }
@@ -368,6 +384,63 @@ fn exit_code_of(state: &str) -> i32 {
         _ => {
             eprintln!("devsbd: run {state}");
             control::EXIT_FAILED
+        }
+    }
+}
+
+/// `events --follow`: send the `events-follow` request over the API socket
+/// at `sock` and copy the held-open response's lines to `out`; the exit code.
+fn subscribe(sock: &str, req: &Request, out: &mut dyn Write) -> i32 {
+    let Ok(mut conn) = UnixStream::connect(sock) else {
+        return report(&Response::new(Status::NoHost, "no host connected (devsbd daemon not running)"));
+    };
+    let mut msg = vec![daemon::API_CONTROL];
+    msg.extend_from_slice(control::encode_request(req).as_bytes());
+    if conn.write_all(&msg).and_then(|()| conn.shutdown(Shutdown::Write)).is_err() {
+        return lost();
+    }
+    // The host pings, so this much silence is a dead stream.
+    let _ = conn.set_read_timeout(Some(control::FOLLOW_SILENCE));
+    relay_follow(BufReader::new(conn), out)
+}
+
+/// The follower's stream ended without a `replaced`: the bridge dropped, the
+/// daemon died, or the stream went silent. Exit 75: reconnect.
+fn lost() -> i32 {
+    eprintln!("devsbd: host disconnected");
+    control::EXIT_NO_HOST
+}
+
+/// Read an `events-follow` response from `from` (`control`'s module doc):
+/// a non-`ok` header is reported like any failed op (an older host's `usage`
+/// is exit 2); after `ok`, every complete line goes to `out` as it arrives
+/// until `replaced` (exit 0) or the stream ends (exit 75, [`lost`]).
+fn relay_follow(mut from: impl BufRead, out: &mut dyn Write) -> i32 {
+    let mut header = String::new();
+    for _ in 0..2 {
+        match from.read_line(&mut header) {
+            Ok(n) if n > 0 && header.ends_with('\n') => {}
+            _ => return lost(),
+        }
+    }
+    match control::decode_response(&header) {
+        Ok(resp) if resp.status == Status::Ok => {}
+        Ok(resp) => return report(&resp),
+        Err(e) => return report(&Response::new(Status::Failed, format!("bad response: {e}"))),
+    }
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match from.read_line(&mut line) {
+            // A line cut short by the end is never printed.
+            Ok(n) if n > 0 && line.ends_with('\n') => {}
+            _ => return lost(),
+        }
+        if out.write_all(line.as_bytes()).and_then(|()| out.flush()).is_err() {
+            return control::EXIT_FAILED;
+        }
+        if line.trim_end() == control::FOLLOW_REPLACED_LINE {
+            return control::EXIT_OK;
         }
     }
 }
@@ -567,6 +640,51 @@ mod tests {
         assert!(out.is_empty());
         let resp = request("/nonexistent/devsbd-api.sock", &Request::new(Op::Events));
         assert_eq!(resp.status.exit_code(), control::EXIT_NO_HOST);
+    }
+
+    #[test]
+    fn parses_events_follow() {
+        let follow = Request::new(Op::Subscribe);
+        assert_eq!(parse("events", &["--follow"]).unwrap(), follow);
+        let c = parse_cmd("events", &["--thread", "pr-1", "--follow"]).unwrap();
+        assert!(!c.follow, "the op carries it, not the run-logs flag");
+        assert_eq!(c.req, Request { key: Some("pr-1".into()), ..Request::new(Op::Subscribe) });
+        assert_eq!(control::decode_request(&control::encode_request(&c.req)), Ok(c.req.clone()));
+        assert_eq!(control::encode_request(&c.req), "op events-follow\nkey pr-1\n");
+        let exclusive = "--follow and --wait are mutually exclusive";
+        assert_eq!(parse("events", &["--follow", "--wait", "5"]).unwrap_err(), exclusive);
+        assert_eq!(parse("events", &["--wait=5", "--follow"]).unwrap_err(), exclusive);
+        assert_eq!(parse("events", &["--follow=1"]).unwrap_err(), "--follow takes no value");
+        assert_eq!(parse("events", &["--follow", "x"]).unwrap_err(), "takes no arguments");
+        assert_eq!(parse("events-ack", &["--follow"]).unwrap_err(), "unknown option `--follow`");
+        assert_eq!(parse("thread-ls", &["--follow"]).unwrap_err(), "unknown option `--follow`");
+    }
+
+    fn follow_from(stream: &str) -> (i32, String) {
+        let mut out = Vec::new();
+        let code = relay_follow(stream.as_bytes(), &mut out);
+        (code, String::from_utf8(out).unwrap())
+    }
+
+    /// Lines pass through; `replaced` is the last and exits 0; any other end
+    /// is 75; a non-ok header is that status's code (an older host's usage).
+    #[test]
+    fn follow_relays_lines_until_replaced_or_lost() {
+        let ev = "{\"id\":\"e-1\"}\n";
+        let ping = format!("{}\n", control::FOLLOW_PING_LINE);
+        let replaced = format!("{}\n", control::FOLLOW_REPLACED_LINE);
+        let ok = "status ok\nbody \n";
+        assert_eq!(follow_from(&format!("{ok}{ev}{ping}{replaced}{ev}")), (0, format!("{ev}{ping}{replaced}")));
+        assert_eq!(follow_from(&format!("{ok}{ev}")), (control::EXIT_NO_HOST, ev.to_string()));
+        assert_eq!(follow_from(&format!("{ok}{ev}{{\"id\"")), (control::EXIT_NO_HOST, ev.to_string()), "cut line dropped");
+        assert_eq!(follow_from(""), (control::EXIT_NO_HOST, String::new()));
+        assert_eq!(follow_from("status ok\n"), (control::EXIT_NO_HOST, String::new()));
+        assert_eq!(follow_from("status usage\nbody line 1: bad op `events-follow`\n").0, control::EXIT_USAGE);
+        assert_eq!(follow_from("status no-host\nbody no host connected\n").0, control::EXIT_NO_HOST);
+        assert_eq!(follow_from("status denied\nbody no\n").0, control::EXIT_DENIED);
+        assert_eq!(follow_from("garbage\nmore\n").0, control::EXIT_FAILED);
+        let code = subscribe("/nonexistent/devsbd-api.sock", &Request::new(Op::Subscribe), &mut Vec::new());
+        assert_eq!(code, control::EXIT_NO_HOST);
     }
 
     #[test]

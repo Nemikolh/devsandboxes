@@ -211,6 +211,11 @@ pub type Sink = Arc<dyn Fn(Notification) -> Result<(), String> + Send + Sync>;
 /// bridge. Blocking; called on the stream's handler thread.
 pub type ControlHandler = Arc<dyn Fn(&str, &Request) -> Response + Send + Sync>;
 
+/// Serves one `events-follow` request from instance `key` (state key) by
+/// writing its held-open response to the stream until it ends (`control`'s
+/// module doc). Blocking; called on the stream's handler thread.
+pub type FollowHandler = Arc<dyn Fn(&str, &Request, &mut dyn Write) + Send + Sync>;
+
 /// What a long-lived (daemon) bridge serves beyond the agent: notify into its
 /// sink, control through its handler, both tagged with the instance it serves.
 #[derive(Clone)]
@@ -219,13 +224,16 @@ struct Services {
     instance_id: String,
     sink: Sink,
     control: ControlHandler,
+    /// `events-follow` streams ([`dispatch_follow`] outside tests).
+    follow: FollowHandler,
     // Live notify/control handler threads of this bridge (see `HandlerSlot`).
     handlers: Arc<AtomicUsize>,
 }
 
 impl Services {
     fn new(instance: String, instance_id: String, sink: Sink, control: ControlHandler) -> Services {
-        Services { instance, instance_id, sink, control, handlers: Arc::default() }
+        let follow: FollowHandler = Arc::new(dispatch_follow);
+        Services { instance, instance_id, sink, control, follow, handlers: Arc::default() }
     }
 }
 
@@ -268,8 +276,15 @@ fn own_caps(has_agent: bool, has_sink: bool) -> u32 {
 }
 
 /// A control stream whose request doesn't end (no `Eof`) within this is
-/// dropped. The daemon sends the whole request at once.
+/// dropped. The daemon sends the whole request at once. Only the request:
+/// an `events-follow` stream reads nothing after it.
 const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// An `events-follow` line the mux doesn't take within this ends the
+/// follower (a wedged bridge; the keepalive kills it soon anyway). Well over
+/// [`control::FOLLOW_PING`], which is the longest a healthy follower is idle
+/// between writes, so an idle stream is never cut by it.
+const FOLLOW_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The production [`ControlHandler`]: `dispatch::handle`, serialized host-wide.
 /// Each op is a `devsandbox` subprocess that loads and saves `state.toml`;
@@ -290,8 +305,17 @@ fn dispatch_control(key: &str, req: &Request) -> Response {
     dispatch::handle(key, req)
 }
 
+/// The production [`FollowHandler`]: `dispatch::follow`, counted in
+/// [`CONTROL_IN_FLIGHT`] for its whole life (a follower keeps the daemon
+/// from idling out), never under the control lock (it only reads).
+fn dispatch_follow(key: &str, req: &Request, out: &mut dyn Write) {
+    let _in_flight = InFlight::enter();
+    crate::commands::dispatch::follow(key, req, out)
+}
+
 /// Control requests being handled by [`dispatch_control`] right now, waiting
-/// ones (`events --wait`, `run wait`) included: a daemon holder row.
+/// ones (`events --wait`, `run wait`) and `events-follow` streams
+/// ([`dispatch_follow`]) included: a daemon holder row.
 static CONTROL_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 
 /// How many control requests this process is serving (see
@@ -367,7 +391,9 @@ fn open_stream(
 /// half-closes our side), decode, run it through the handler, write the
 /// encoded response, close. Oversized or undecodable → a `Usage` response;
 /// timed out → close with no reply (the daemon reports the host
-/// disconnected). Silent: the TUI owns the terminal.
+/// disconnected). Silent: the TUI owns the terminal. An `events-follow`
+/// request goes to the follow handler instead, which holds the stream (and
+/// this handler's slot) until it ends.
 fn handle_control(mut conn: UnixStream, to: &Services) {
     let _ = conn.set_read_timeout(Some(CONTROL_READ_TIMEOUT));
     let mut buf = Vec::new();
@@ -378,6 +404,10 @@ fn handle_control(mut conn: UnixStream, to: &Services) {
         Response::new(Status::Usage, format!("request longer than {} bytes", control::MAX_REQUEST))
     } else {
         match std::str::from_utf8(&buf).map_err(|e| e.to_string()).and_then(control::decode_request) {
+            Ok(req) if req.op == control::Op::Subscribe => {
+                let _ = conn.set_write_timeout(Some(FOLLOW_WRITE_TIMEOUT));
+                return (to.follow)(&to.instance, &req, &mut conn);
+            }
             Ok(req) => (to.control)(&to.instance, &req),
             Err(e) => Response::new(Status::Usage, format!("bad request: {e}")),
         }
@@ -1858,6 +1888,176 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(100));
             }
             assert_eq!(code, Some(control::EXIT_NO_HOST), "after the bridge ended");
+            Ok(())
+        })
+    }
+
+    /// An `events-follow` stream goes to the follow handler (never the control
+    /// handler), which writes the held-open response itself.
+    #[test]
+    fn follow_stream_runs_the_follow_handler() {
+        let (d_r, h_w) = std::io::pipe().unwrap();
+        let (h_r, d_w) = std::io::pipe().unwrap();
+        let daemon = Mux::new(d_w);
+        let host = Mux::new(h_w);
+        let (mut to, _rx) = services("web-1", no_control());
+        to.follow = Arc::new(|key: &str, req: &Request, out: &mut dyn Write| {
+            let _ = write!(out, "status ok\nbody \n{key} {}\n", req.key.as_deref().unwrap_or("-"));
+        });
+        let d = Arc::clone(&daemon);
+        std::thread::spawn(move || d.serve(d_r, |_, _| None));
+        std::thread::spawn(move || {
+            let none: Option<fn() -> Option<PathBuf>> = None;
+            host.serve(h_r, move |_, ch| open_stream(ch, none.as_ref(), Some(&to)))
+        });
+        let reply = send_on(&daemon, 1, proto::channel::CONTROL, b"op events-follow\nkey pr-1\n");
+        assert_eq!(reply, b"status ok\nbody \nweb-1 pr-1\n");
+    }
+
+    /// The user replies `text` on `owner`'s thread `pr-1` in the store at
+    /// `path`, putting the thread first: an event enqueued from the host.
+    fn host_reply(path: &Path, owner: &str, text: &str) {
+        use crate::inbox::{store, Compose, State as TState, ThreadPut};
+        store::update_at(path, |i| {
+            let find = |i: &crate::inbox::Inbox| i.threads.iter().find(|t| t.owner == owner).map(|t| t.id);
+            if find(i).is_none() {
+                let put = ThreadPut {
+                    key: "pr-1".into(),
+                    title: "PR 1".into(),
+                    state: TState::NeedsYou,
+                    compose: Some(Compose::default()),
+                    ..ThreadPut::default()
+                };
+                i.put(owner, owner, 1, put);
+            }
+            let id = find(i).unwrap();
+            i.apply(&crate::inbox::Op::Reply { thread: id, text: text.into() }, 2, "tui");
+        })
+        .unwrap();
+    }
+
+    /// A `devsbd events --follow` running in container `name`: its stdout
+    /// lines arrive on the receiver; the child is returned for its exit code.
+    fn follower(name: &str) -> (std::process::Child, mpsc::Receiver<String>) {
+        use std::io::BufRead;
+        let mut child = Command::new("docker")
+            .args(["exec", name, BIN, "events", "--follow"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
+                let _ = tx.send(line);
+            }
+        });
+        (child, rx)
+    }
+
+    /// The next line on `rx` that isn't a ping (`None` on timeout).
+    fn next_event(rx: &mpsc::Receiver<String>) -> Option<String> {
+        loop {
+            let line = rx.recv_timeout(Duration::from_secs(15)).ok()?;
+            if line != control::FOLLOW_PING_LINE {
+                return Some(line);
+            }
+        }
+    }
+
+    /// `child`'s exit code, waiting up to `secs`.
+    fn exit_within(child: &mut std::process::Child, secs: u64) -> Option<i32> {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        while Instant::now() < deadline {
+            if let Some(status) = child.try_wait().unwrap() {
+                return status.code();
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let _ = child.kill();
+        None
+    }
+
+    /// Docker-gated end to end: `devsbd events --follow` in a container gets
+    /// the pending event, then one enqueued on the host as it lands, and
+    /// pings; a second follower replaces the first (`replaced`, exit 0); the
+    /// bridge ending, or the daemon dying, makes the follower exit 75.
+    #[test_utils::docker_test(helper)]
+    fn follows_events_with_docker() -> Result<(), &'static str> {
+        use crate::commands::dispatch::{follow_events, Followers};
+        const OWNER: &str = "follow-owner";
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let name = format!("devsandbox-follow-test-{stamp}");
+        let dir = std::env::temp_dir().join(format!("devsandbox-follow-docker-{stamp}"));
+        let path = dir.join("inbox.json");
+        let cleanup = || {
+            let _ = Command::new("docker").args(["rm", "-f", &name]).output();
+            let _ = std::fs::remove_dir_all(&dir);
+        };
+        crate::test_support::with_cleanup(cleanup, || {
+            assert!(ok(Command::new("docker").args(["run", "-d", "--name", &name, "alpine:3.20", "sleep", "300"])));
+            let arch = install(&name, None).unwrap();
+            start_daemon(&name);
+            host_reply(&path, OWNER, "before");
+
+            let followers = Arc::new(Followers::new());
+            let bridge_for = || {
+                let control: ControlHandler = Arc::new(|_: &str, _: &Request| Response::new(Status::Ok, "[]"));
+                let (mut to, _notes) = services("follow-test", control);
+                let (path, followers) = (path.clone(), Arc::clone(&followers));
+                to.follow = Arc::new(move |_: &str, req: &Request, out: &mut dyn Write| {
+                    let ping = Duration::from_secs(1);
+                    if let Err(resp) = follow_events(&path, OWNER, req.key.as_deref(), out, &followers, ping) {
+                        let _ = out.write_all(control::encode_response(&resp).as_bytes());
+                    }
+                });
+                let none: Option<fn() -> Option<PathBuf>> = None;
+                let bridge = spawn_with(&name, hash(arch).unwrap(), none, Some(to)).unwrap();
+                assert_eq!(bridge.outcome(Duration::from_secs(10)), Some(Ok(())), "bridge handshake");
+                // The host's `Caps` lands just after the handshake: wait for a
+                // routable control op before following.
+                let ls = || Command::new("docker").args(["exec", &name, BIN, "ls"]).output().unwrap().status.code();
+                let mut code = ls();
+                for _ in 0..50 {
+                    if code == Some(0) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                    code = ls();
+                }
+                assert_eq!(code, Some(0), "control routable");
+                bridge
+            };
+            let text = |line: &str| -> String {
+                let v: serde_json::Value = serde_json::from_str(line).unwrap();
+                v["text"].as_str().unwrap_or_default().to_string()
+            };
+
+            let bridge = bridge_for();
+            let (mut first, first_rx) = follower(&name);
+            assert_eq!(next_event(&first_rx).map(|l| text(&l)).as_deref(), Some("before"), "pending first");
+            host_reply(&path, OWNER, "after");
+            assert_eq!(next_event(&first_rx).map(|l| text(&l)).as_deref(), Some("after"), "enqueued on the host");
+            let ping = first_rx.recv_timeout(Duration::from_secs(5)).expect("a ping");
+            assert_eq!(ping, control::FOLLOW_PING_LINE);
+
+            let (mut second, second_rx) = follower(&name);
+            assert_eq!(next_event(&first_rx).as_deref(), Some(control::FOLLOW_REPLACED_LINE));
+            assert_eq!(exit_within(&mut first, 10), Some(0), "replaced exits 0");
+            // Nothing acked: the new stream gets both again.
+            assert_eq!(next_event(&second_rx).map(|l| text(&l)).as_deref(), Some("before"));
+            assert_eq!(next_event(&second_rx).map(|l| text(&l)).as_deref(), Some("after"));
+
+            drop(bridge);
+            assert_eq!(exit_within(&mut second, 20), Some(control::EXIT_NO_HOST), "bridge gone");
+
+            let _bridge = bridge_for();
+            let (mut third, third_rx) = follower(&name);
+            assert_eq!(next_event(&third_rx).map(|l| text(&l)).as_deref(), Some("before"));
+            let kill = "kill $(cut -d' ' -f1 /run/devsandbox/devsbd.pid)";
+            assert!(ok(Command::new("docker").args(["exec", &name, "sh", "-c", kill])));
+            assert_eq!(exit_within(&mut third, 20), Some(control::EXIT_NO_HOST), "daemon killed");
             Ok(())
         })
     }
