@@ -50,10 +50,12 @@ pub fn wait_changed(seen: u64, timeout: std::time::Duration) -> u64 {
 
 /// Apply a batch of user [`Op`]s in one write, all stamped with one `now`
 /// minted under the lock (event ids and times are never minted by a client).
-pub fn apply(path: &Path, ops: &[Op]) -> Result<()> {
+/// `client` (`tui`, `cli`, `api:<name>`) is recorded on the feed items the
+/// ops add, for the user's audit; owners never see it.
+pub fn apply(path: &Path, ops: &[Op], client: &str) -> Result<()> {
     store::update_at(path, |inbox| {
         let now = now();
-        ops.iter().for_each(|op| inbox.apply(op, now));
+        ops.iter().for_each(|op| inbox.apply(op, now, client));
     })
 }
 
@@ -61,11 +63,15 @@ pub fn apply(path: &Path, ops: &[Op]) -> Result<()> {
 /// `decide` sees the Inbox under the lock and returns the ops to apply, or
 /// why not. What an API client needs, since [`Inbox::apply`] treats a stale
 /// id or action as a silent no-op and the client must hear `not-found`.
-pub fn apply_if<E>(path: &Path, decide: impl FnOnce(&Inbox) -> Result<Vec<Op>, E>) -> Result<Result<(), E>> {
+pub fn apply_if<E>(
+    path: &Path,
+    client: &str,
+    decide: impl FnOnce(&Inbox) -> Result<Vec<Op>, E>,
+) -> Result<Result<(), E>> {
     store::update_at(path, |inbox| {
         let ops = decide(inbox)?;
         let now = now();
-        ops.iter().for_each(|op| inbox.apply(op, now));
+        ops.iter().for_each(|op| inbox.apply(op, now, client));
         Ok(())
     })
 }
@@ -96,7 +102,7 @@ pub fn ack(path: &Path, owner: &str, ids: &[String]) -> Result<usize> {
     store::update_at(path, |inbox| inbox.ack(owner, ids))
 }
 
-/// `owner`'s live dispatcher threads.
+/// `owner`'s live owner threads.
 pub fn threads(path: &Path, owner: &str) -> Result<Vec<Thread>> {
     Ok(store::load_at(path)?.threads_for(owner).into_iter().cloned().collect())
 }
@@ -118,13 +124,13 @@ mod tests {
 
     use super::*;
     use crate::devsbd::notify::{Level, Record};
-    use crate::inbox::{Reply, State, ThreadPut, RETENTION};
+    use crate::inbox::{Compose, ItemKind, State, ThreadPut, RETENTION};
 
     /// A fresh store path in a unique empty directory under the temp dir.
     fn store_path(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("devsandbox-inbox-ops-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        dir.join("inbox.toml")
+        dir.join("inbox.json")
     }
 
     /// A reply-taking dispatcher thread `key`, put by `owner` at time `at`.
@@ -133,7 +139,7 @@ mod tests {
             key: key.into(),
             title: key.into(),
             state: State::NeedsYou,
-            reply: Some(Reply::default()),
+            compose: Some(Compose::default()),
             ..ThreadPut::default()
         };
         store::update_at(path, |i| i.put(owner, owner, at, put)).unwrap();
@@ -150,7 +156,7 @@ mod tests {
         let thread = id(&path, "d", "pr-1");
         let before = now();
         let batch = [Op::MarkRead(thread), Op::Reply { thread, text: "hi".into() }, Op::MarkDone(thread)];
-        apply(&path, &batch).unwrap();
+        apply(&path, &batch, "cli").unwrap();
         let after = now();
 
         let events = events(&path, "d").unwrap();
@@ -165,6 +171,8 @@ mod tests {
         let inbox = load(&path).unwrap();
         assert!(!inbox.threads[0].unread);
         assert_eq!(inbox.threads[0].state, Some(State::Done));
+        // The client is on the feed items, not the events.
+        assert!(matches!(&inbox.threads[0].feed[0].kind, ItemKind::Reply { client, .. } if client == "cli"));
     }
 
     #[test]
@@ -173,7 +181,7 @@ mod tests {
         put(&path, "d", "pr-1", 1);
         put(&path, "a", "pr-1", 1);
         let (d, a) = (id(&path, "d", "pr-1"), id(&path, "a", "pr-1"));
-        apply(&path, &[Op::Reply { thread: d, text: "x".into() }, Op::Reply { thread: a, text: "y".into() }])
+        apply(&path, &[Op::Reply { thread: d, text: "x".into() }, Op::Reply { thread: a, text: "y".into() }], "tui")
             .unwrap();
         let d_ids: Vec<String> = events(&path, "d").unwrap().into_iter().map(|(_, e)| e.id).collect();
         let a_ids: Vec<String> = events(&path, "a").unwrap().into_iter().map(|(_, e)| e.id).collect();

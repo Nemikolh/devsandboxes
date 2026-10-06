@@ -2084,17 +2084,17 @@ folder = "."
     /// for each of dispatchers `d` and `a` (owner id = state key here), and
     /// a Fake pointing at it.
     fn inbox_fake(name: &str) -> (PathBuf, Fake) {
-        use crate::inbox::{Reply, State as TState, ThreadPut};
+        use crate::inbox::{Compose, State as TState, ThreadPut};
         let dir = std::env::temp_dir().join(format!("devsandbox-dispatch-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let path = dir.join("inbox.toml");
+        let path = dir.join("inbox.json");
         store::update_at(&path, |i| {
             for owner in ["d", "a"] {
                 let put = ThreadPut {
                     key: "pr-1".into(),
                     title: "PR 1".into(),
                     state: TState::NeedsYou,
-                    reply: Some(Reply::default()),
+                    compose: Some(Compose::default()),
                     ..ThreadPut::default()
                 };
                 i.put(owner, owner, 1, put);
@@ -2109,7 +2109,7 @@ folder = "."
     fn reply(path: &Path, owner: &str, text: &str, at: u64) {
         store::update_at(path, |i| {
             let id = i.threads.iter().find(|t| t.owner == owner).unwrap().id;
-            i.apply(&crate::inbox::Op::Reply { thread: id, text: text.into() }, at);
+            i.apply(&crate::inbox::Op::Reply { thread: id, text: text.into() }, at, "api:some-gui");
         })
         .unwrap();
     }
@@ -2135,6 +2135,8 @@ folder = "."
         assert_eq!(got[0]["text"], "first \"one\"");
         assert_eq!(got[0]["at"], "2026-10-02T00:13:21Z");
         assert!(got[0].get("action").is_none(), "absent fields are left out");
+        // Which client the user replied from is the user's: never the owner's.
+        assert!(!resp.body.contains("client") && !resp.body.contains("some-gui"), "{}", resp.body);
         assert!(control::valid_event_id(got[0]["id"].as_str().unwrap()));
         assert_eq!(got[1]["text"], "second", "oldest first");
         // Survives the response encoding.
@@ -2260,7 +2262,7 @@ folder = "."
 
         // Prepare the next store beside it (this bumps the generation now,
         // before the wait starts), then swap it in without a bump.
-        let next = path.with_file_name("next.toml");
+        let next = path.with_file_name("next.json");
         std::fs::copy(&path, &next).unwrap();
         reply(&next, "d", "slow", 11);
         let writer = {
@@ -2286,6 +2288,8 @@ folder = "."
         let got: Vec<crate::inbox::ThreadPut> = serde_json::from_str(&resp.body).unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!((got[0].key.as_str(), got[0].title.as_str()), ("pr-1", "PR 1"));
+        assert!(got[0].compose.is_some());
+        // v2 put compat, removed in step 13: `reply` mirrors `compose`.
         assert!(got[0].reply.is_some());
         // Archived (the owner was removed) is history, not listed.
         store::update_at(&path, |i| i.archive_owner("d")).unwrap();

@@ -440,7 +440,7 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
             // Stamped by `ops::apply`, under the store lock, not in `App`:
             // event ids and times are minted where every dashboard's writes
             // serialize.
-            if let Err(e) = inbox::store::path().and_then(|p| inbox::ops::apply(&p, &ops)) {
+            if let Err(e) = inbox::store::path().and_then(|p| inbox::ops::apply(&p, &ops, "tui")) {
                 app.status = Some(format!("inbox not saved: {e:#}"));
             }
             reload_inbox = true;

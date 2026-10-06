@@ -44,9 +44,11 @@ git worktrees so working trees are never shared.
   dispatcher control API: authorization against current config, child naming
   (`<sandbox>-<key>`), ops as logged `devsandbox` subprocesses, run ops exec'd
   in the child's helper (executor injectable for tests).
-- `src/inbox/` — the shared Inbox store (`inbox.toml`, next to `state.toml`):
+- `src/inbox/` — the shared Inbox store (`inbox.json` v3, next to `state.toml`):
   `mod.rs` is the pure model (threads keyed by `(owner instance_id, key)`,
-  per-owner cap, `Op` mutations, v1→v2 migration), `store.rs` the locked
+  per-owner cap, `Op` mutations, v2 `inbox.toml` notify import), `feed.rs`
+  an owner thread's feed (messages, replies, actions, markers; collapse and
+  cap as pure fns), `store.rs` the locked
   read-modify-write every dashboard and the bridge's notify sink go through,
   `ops.rs` every read/mutation as a fn over a store path, `view.rs` the
   Inbox views' membership (shared by the TUI and the API).

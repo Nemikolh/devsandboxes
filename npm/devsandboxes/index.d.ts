@@ -354,13 +354,11 @@ export interface ThreadDetail extends ThreadSummary {
   link: string | null;
   /** Key of the dispatcher child it's about. */
   child: string | null;
-  /** The dispatcher's message. */
-  message: string | null;
   /** Set when the thread takes replies (`inbox.reply()`). */
-  reply: ThreadReply | null;
+  compose: ThreadCompose | null;
   actions: ThreadAction[];
-  /** A thread's timeline, oldest first. */
-  entries: ThreadEntry[];
+  /** An owner thread's feed, oldest first (first-insert order). */
+  feed: FeedItem[];
   /** A notification's records, newest first. */
   notes: ThreadNote[];
   /** Events the owner hasn't acked yet. */
@@ -368,8 +366,10 @@ export interface ThreadDetail extends ThreadSummary {
 }
 
 /** How a thread takes free-text replies. */
-export interface ThreadReply {
+export interface ThreadCompose {
   placeholder: string | null;
+  /** What sending does now, shown under the box. */
+  hint: string | null;
 }
 
 /** A dispatcher action button (`inbox.act()`). */
@@ -384,13 +384,60 @@ export interface ThreadAction {
   sends_event: boolean;
 }
 
-/** One timeline entry of a thread. */
-export interface ThreadEntry {
+/** One item of a thread's feed, by `type`. */
+export type FeedItem = FeedMessage | FeedReply | FeedAction | FeedMarker;
+
+/** What every feed item carries. */
+export interface FeedItemBase {
   /** Arrival order across the whole Inbox. */
   seq: number;
-  /** Unix seconds. */
+  /** Unix seconds of first insert. */
   at: number;
-  kind: 'message' | 'state' | 'status' | 'action' | 'reply' | 'done' | 'reopen';
+}
+
+/** A message from the thread's owner. */
+export interface FeedMessage extends FeedItemBase {
+  type: 'message';
+  /** The owner's id for it, unique in the thread. */
+  id: string;
+  blocks: MessageBlock[];
+  /** Replaced in place since it was first sent. */
+  edited: boolean;
+  /** The owner took it back. */
+  withdrawn: boolean;
+}
+
+/** The user's reply (`inbox.reply()`). */
+export interface FeedReply extends FeedItemBase {
+  type: 'reply';
+  text: string;
+}
+
+/** The user pressed an action (`inbox.act()`). */
+export interface FeedAction extends FeedItemBase {
+  type: 'action';
+  /** The action's id. */
+  action: string;
+  /** Its label when pressed. */
+  label: string;
+}
+
+/** A one-line marker: the user's done/reopen, the owner's state or status change. */
+export interface FeedMarker extends FeedItemBase {
+  type: 'marker';
+  marker: 'done' | 'reopen' | 'state' | 'status';
+  /** `state`/`status`: the value before; `null` otherwise (or no status). */
+  from: string | null;
+  /** `state`/`status`: the value after; `null` otherwise (or no status). */
+  to: string | null;
+}
+
+/** One block of a message, by `type`. */
+export type MessageBlock = MarkdownBlock;
+
+/** Markdown text. */
+export interface MarkdownBlock {
+  type: 'markdown';
   text: string;
 }
 

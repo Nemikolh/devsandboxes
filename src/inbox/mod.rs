@@ -1,33 +1,35 @@
 //! The Inbox model: container notifications (`devsbd notify`,
-//! docs/automations.md) as threads, newest first. This is the persisted half,
-//! out of `src/tui/` because the bridge writes records here while any number
-//! of dashboards read them (see [`store`]); the TUI keeps only view state
+//! docs/automations.md) and owner threads (`devsbd thread put`,
+//! docs/inbox-redesign.md), newest first. This is the persisted half, out of
+//! `src/tui/` because the bridge writes here while any number of dashboards
+//! and API clients read it (see [`store`]); the TUI keeps only view state
 //! (view, selection, the open thread).
 //!
 //! Two kinds of thread share the store:
 //!
 //! - **notify** ([`Kind::Notify`]): records sharing an `(owner, key)`, newest
 //!   first, the newest being the head and the rest its history.
-//! - **thread** ([`Kind::Thread`]): one dispatcher-owned item with a state, a
-//!   status and actions (`devsbd thread put`, docs/inbox-threads.md). It has
-//!   no notes at all; its history is the [`Entry`] timeline the host keeps.
+//! - **thread** ([`Kind::Thread`]): an owner's conversation. A small header
+//!   the owner re-asserts with each put (title, state, status, actions,
+//!   `compose`), and a [`feed`]: its messages, the user's replies and
+//!   actions, and markers for done/reopen and state/status changes.
 //!
 //! `owner` is the sending instance's `instance_id`, not its name, so a rename
 //! or rebuild keeps the thread (`owner_name` is only what to show). Instance
 //! ids are never reused, so `devsandbox rm` can archive a gone instance's
 //! threads instead of deleting them.
 //!
-//! A dispatcher thread also holds its pending **events** ([`Event`],
-//! docs/inbox-threads.md, *Events: pull, not push*): what the user did in a
-//! dashboard (a dispatcher action, a reply, done, reopen), held here until the
-//! owner pulls and acks them (`devsbd events`, `commands::dispatch`). They
-//! are delivery state, not history: the per-owner cap counts them but never
-//! evicts them (each thread keeps at most [`MAX_EVENTS`], oldest dropped), and
-//! no put touches them.
+//! An owner thread also holds its pending **events** ([`Event`]): what the
+//! user did in a client (an action, a reply, done, reopen), held here until
+//! the owner pulls and acks them (`devsbd events`, `commands::dispatch`).
+//! They are delivery state, not history: each thread keeps at most
+//! [`MAX_EVENTS`], oldest dropped, and no put touches them. Events never say
+//! which client made them; the feed records that for the user alone.
 //!
-//! Everything here is plain state: threading, cap, unread, retention, the put
+//! Everything here is plain state: threading, caps, unread, retention, the put
 //! transition and the bridge's decision stay unit-testable without a store.
 
+pub mod feed;
 pub mod ops;
 pub mod sanitize;
 pub mod store;
@@ -40,20 +42,26 @@ use serde::{Deserialize, Serialize};
 
 use crate::devsbd::notify::{Level, Message, Record};
 
+pub use feed::{Block, FeedItem, ItemKind, Marker, MAX_FEED};
 pub use sanitize::sanitize;
-pub use thread::{Action, Reply, State, ThreadPut};
+pub use thread::{Action, Compose, Reply, State, ThreadPut};
 pub use view::View;
 
-/// Records kept per owner, thread history included; the owner's oldest record
-/// drops off beyond this. Per owner only, so a noisy container never evicts
-/// another's.
-pub const INBOX_INSTANCE_CAP: usize = 200;
+/// Threads kept per owner; the least valuable goes beyond this
+/// ([`Inbox::enforce_cap`]). Per owner only, so a noisy container never
+/// evicts another's.
+pub const THREADS_PER_OWNER: usize = 200;
 
-/// `inbox.toml` schema version written by this build. v1 (no `version` key)
-/// identified threads by instance *name*; see [`Inbox::from_toml`]. Thread
-/// records (v2.1) only add defaulted fields, so a v2 file still loads as is
-/// and the version stays put.
-pub const VERSION: u32 = 2;
+/// Records kept per notify thread (newest first; the oldest drops off).
+pub const MAX_NOTES: usize = MAX_FEED;
+
+/// `inbox.json` schema version written and read by this build. Older stores
+/// were `inbox.toml` (v1, v2), of which only notify records are carried over
+/// ([`Inbox::import_v2`]).
+pub const VERSION: u32 = 3;
+
+/// The last `inbox.toml` version: its thread records keep their ids.
+const V2: u32 = 2;
 
 /// How long an archived or `done` thread is kept after its last change.
 pub const RETENTION: u64 = 14 * 86_400;
@@ -63,8 +71,7 @@ pub const RETENTION: u64 = 14 * 86_400;
 /// clicking a hundred times ahead of one is not a case worth keeping.
 pub const MAX_EVENTS: usize = 100;
 
-/// Longest reply kept, in chars; the rest is cut. The reply box is one line,
-/// so this only bounds a paste.
+/// Longest reply kept, in chars; the rest is cut. Only bounds a paste.
 pub const MAX_REPLY: usize = 2000;
 
 /// Whether `link` is an `http(s)://` URL. The link comes from inside the
@@ -98,36 +105,13 @@ pub enum Kind {
     /// `devsbd notify` records: a log with a head and history.
     #[default]
     Notify,
-    /// `devsbd thread put`: one item with state, actions and a timeline.
+    /// `devsbd thread put`: a header and a feed.
     Thread,
-}
-
-impl Kind {
-    fn is_notify(&self) -> bool {
-        matches!(self, Kind::Notify)
-    }
 }
 
 /// Owner prefix for a v1 thread whose instance name no longer resolves. Such
 /// a thread has no live sender, so it loads archived.
 const UNRESOLVED_OWNER: &str = "name:";
-
-/// One timeline entry on a thread-kind thread: what a put changed, or what
-/// the user did (the last four, each with the event it enqueued).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum EntryKind {
-    Message,
-    State,
-    Status,
-    /// A dispatcher action; text = its label.
-    Action,
-    /// text = the reply.
-    Reply,
-    /// Marked done (`d`, or a `done: true` action: text = its label).
-    Done,
-    Reopen,
-}
 
 /// What an [`Event`] tells the owner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -156,15 +140,16 @@ impl EventKind {
     }
 }
 
-/// One pending event for a thread's owner. Field order is load-bearing for
-/// TOML only in that every field is a scalar.
+/// One pending event for a thread's owner. No client: an owner must not be
+/// able to tell where an event came from (docs/inbox-redesign.md,
+/// *Principles*).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Event {
     /// `e-<unix secs:010>-<4 hex>` (`control::valid_event_id`), unique across
     /// the store: what the owner acks, and what stops two dispatchers' reads
     /// (or two dashboards) handling one click twice.
     pub id: String,
-    /// Arrival order across the inbox, like [`Entry::seq`]: orders events
+    /// Arrival order across the inbox, like [`FeedItem::seq`]: orders events
     /// across threads within one second. Never sent to the owner.
     pub seq: u64,
     pub kind: EventKind,
@@ -175,18 +160,8 @@ pub struct Event {
     pub at: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Entry {
-    /// Arrival order across the whole inbox, like [`Note::id`], so the cap can
-    /// compare an entry with a note.
-    pub seq: u64,
-    pub at: u64,
-    pub kind: EntryKind,
-    pub text: String,
-}
-
-/// A keyed record's history, or a single unkeyed record, or one dispatcher
-/// thread. Thread-kind threads carry no notes, so nothing may index `notes`
+/// A keyed record's history, or a single unkeyed record, or one owner
+/// thread. Owner threads carry no notes, so nothing may index `notes`
 /// without checking.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Thread {
@@ -206,28 +181,28 @@ pub struct Thread {
     pub archived: bool,
     /// Only the head counts as unread; history is a trace, not news.
     pub unread: bool,
-    /// Newest first; empty on a thread-kind thread.
+    /// Newest first; empty on an owner thread.
     pub notes: Vec<Note>,
-    // Thread-kind fields, replaced wholesale by each put.
+    // The header, replaced wholesale by each put.
     pub title: String,
     pub link: Option<String>,
     pub state: Option<State>,
     pub status: Option<String>,
     pub child: Option<String>,
-    pub message: Option<String>,
     pub actions: Vec<Action>,
-    pub reply: Option<Reply>,
+    /// Present when the thread takes replies.
+    pub compose: Option<Compose>,
     /// Unix seconds of the last put; 0 on a notify thread, which dates itself
     /// from its head record.
     pub updated_at: u64,
-    /// Oldest first, so appending is the common case.
-    pub entries: Vec<Entry>,
+    /// First-insert order (oldest first); empty on a notify thread.
+    pub feed: Vec<FeedItem>,
     /// Unacked events for the owner, oldest first.
     pub events: Vec<Event>,
 }
 
 impl Thread {
-    /// The newest record, or `None` on a thread-kind thread (which has none).
+    /// The newest record, or `None` on an owner thread (which has none).
     pub fn head(&self) -> Option<&Record> {
         self.notes.first().map(|n| &n.record)
     }
@@ -238,10 +213,10 @@ impl Thread {
     }
 
     /// Whether the thread is waiting on the user: what the **Needs you** view
-    /// and both badges count. A dispatcher thread earns it by saying so
+    /// and both badges count. An owner thread earns it by saying so
     /// (`needs-you`); a plain notify record by being unread, so a
-    /// non-dispatcher's `notify` still surfaces (docs/inbox-threads.md,
-    /// *Decisions*). An archived thread has no live owner, so it never counts.
+    /// non-owner's `notify` still surfaces. An archived thread has no live
+    /// owner, so it never counts.
     pub fn needs_you(&self) -> bool {
         !self.archived
             && match self.kind {
@@ -249,9 +224,27 @@ impl Thread {
                 Kind::Thread => self.state == Some(State::NeedsYou),
             }
     }
+
+    /// The thread as its owner last put it (`devsbd thread ls`): the put
+    /// shape, so a dispatcher can feed it straight back.
+    pub fn to_put(&self) -> ThreadPut {
+        ThreadPut {
+            key: self.key.clone().unwrap_or_default(),
+            title: self.title.clone(),
+            link: self.link.clone(),
+            state: self.state.unwrap_or_default(),
+            status: self.status.clone(),
+            child: self.child.clone(),
+            actions: self.actions.clone(),
+            compose: self.compose.clone(),
+            // v2 put compat, removed in step 13: what a v2 dispatcher put.
+            message: feed::header_message(&self.feed),
+            reply: self.compose.as_ref().map(|c| Reply { placeholder: c.placeholder.clone() }),
+        }
+    }
 }
 
-/// A mutation a dashboard asks the store to apply. Row indices can't cross the
+/// A mutation a client asks the store to apply. Row indices can't cross the
 /// process boundary (another dashboard may have changed the list), so every
 /// variant names what it touches by a stable id.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -260,16 +253,16 @@ pub enum Op {
     /// not everything the tab happened to show.
     MarkRead(u64),
     /// Mark every notify record read: they were on screen when the user left
-    /// the Inbox. Dispatcher threads are only read by opening them, since
-    /// their state, not their unread flag, is what asks for attention.
+    /// the Inbox. Owner threads are only read by opening them, since their
+    /// state, not their unread flag, is what asks for attention.
     MarkNotifyRead,
     /// Dismiss a whole thread (its history with it).
     RemoveThread(u64),
-    /// Dismiss every notify record. Dispatcher threads are state a dispatcher
+    /// Dismiss every notify record. Owner threads are state an owner
     /// re-asserts, so clearing them would only make them come back.
     ClearNotify,
-    // The user ops below each add a timeline entry and enqueue an event for
-    // the owner. Their ids and times are minted under the store lock
+    // The user ops below each add feed items and enqueue an event for the
+    // owner. Their ids and times are minted under the store lock
     // ([`Inbox::apply`]), so a dashboard never applies them to its own copy.
     /// `1`-`9` on a dispatcher action (the dispatcher half of a button; the
     /// host half runs in the dashboard). A `done: true` action also sets the
@@ -311,8 +304,8 @@ impl Inbox {
     pub fn push(&mut self, owner: String, owner_name: String, record: Record, unread: bool) {
         let note = Note { id: self.next_id(), record };
         let key = note.record.key.clone();
-        // A dispatcher thread with the same key is a different object; a
-        // notify record never joins it.
+        // An owner thread with the same key is a different object; a notify
+        // record never joins it.
         let existing = key.as_ref().and_then(|key| {
             self.threads
                 .iter()
@@ -322,6 +315,7 @@ impl Inbox {
             Some(pos) => {
                 let mut t = self.threads.remove(pos);
                 t.notes.insert(0, note);
+                t.notes.truncate(MAX_NOTES);
                 t.unread = unread;
                 // A rename shows up on the next record; the thread is kept.
                 t.owner_name = owner_name;
@@ -341,18 +335,22 @@ impl Inbox {
                 }
             }
         };
+        let id = thread.id;
         self.threads.insert(0, thread);
-        self.enforce_cap(&owner);
+        self.enforce_cap(&owner, id);
     }
 
     /// Apply one `devsbd thread put` from `owner`, at container time `at`.
     /// Pure: the store decides what to write from the outcome.
     ///
-    /// A put that changes nothing returns [`PutOutcome::Unchanged`] without
-    /// touching a field, so the store's content comparison skips the write and
-    /// the file's mtime doesn't move. That idempotence is the point: a
-    /// dispatcher is meant to re-assert every thread on every pass.
+    /// A put only touches the header. State and status changes leave a
+    /// marker in the feed (status changes collapse, [`feed::push`]); nothing
+    /// else does. A put that changes nothing returns [`PutOutcome::Unchanged`]
+    /// without touching a field, so the store's content comparison skips the
+    /// write and the file's mtime doesn't move. That idempotence is the
+    /// point: a dispatcher is meant to re-assert every thread on every pass.
     pub fn put(&mut self, owner: &str, owner_name: &str, at: u64, put: ThreadPut) -> PutOutcome {
+        let compose = put.compose();
         let pos = self.threads.iter().position(|t| {
             t.owner == owner && t.kind == Kind::Thread && t.key.as_deref() == Some(put.key.as_str())
         });
@@ -368,19 +366,20 @@ impl Inbox {
                 updated_at: at,
                 ..Thread::default()
             };
-            // Seed the timeline with what the thread already says, so one
-            // created mid-conversation doesn't open blank.
-            let seeds = changed_entries(&put, true, true, true);
-            apply_put(&mut thread, put);
-            self.append_entries(&mut thread, at, seeds);
+            // No markers: nothing changed yet, the header says it all.
+            // v2 put compat, removed in step 13.
+            let header = feed::header_change(&thread.feed, put.message.as_deref());
+            self.apply_header(&mut thread, header, at);
+            apply_put(&mut thread, put, compose);
             let entered = thread.state == Some(State::NeedsYou);
             self.threads.insert(0, thread);
-            self.enforce_cap(owner);
+            self.enforce_cap(owner, id);
             return PutOutcome::Applied { created: true, entered_needs_you: entered };
         };
 
         let old = &self.threads[pos];
-        let message = old.message != put.message;
+        // v2 put compat, removed in step 13.
+        let header = feed::header_change(&old.feed, put.message.as_deref());
         let state = old.state != Some(put.state);
         let status = old.status != put.status;
         let cosmetic = old.owner_name != owner_name
@@ -388,26 +387,50 @@ impl Inbox {
             || old.link != put.link
             || old.child != put.child
             || old.actions != put.actions
-            || old.reply != put.reply
+            || old.compose != compose
             || old.archived;
-        if !(message || state || status || cosmetic) {
+        if !(state || status || cosmetic || header != feed::HeaderChange::Unchanged) {
             return PutOutcome::Unchanged;
         }
         let entered = state && put.state == State::NeedsYou;
-        let seeds = changed_entries(&put, message, state, status);
+        // A new message is news; an edit or a withdrawal isn't, nor is a
+        // cosmetic change (a new label, a rename).
+        let news = state || status || matches!(header, feed::HeaderChange::Insert(_));
+        let mut markers = Vec::new();
+        if state {
+            markers.push(Marker::State { from: old.state.unwrap_or_default(), to: put.state });
+        }
+        if status {
+            markers.push(Marker::Status { from: old.status.clone(), to: put.status.clone() });
+        }
         let mut thread = self.threads.remove(pos);
         thread.owner_name = owner_name.to_string();
         // A put from a live container means the owner is back; only `rm`
         // archives, and ids are never reused.
         thread.archived = false;
-        // Cosmetic changes (a new label, a rename) are not news.
-        thread.unread = thread.unread || message || state || status;
+        thread.unread = thread.unread || news;
         thread.updated_at = at;
-        apply_put(&mut thread, put);
-        self.append_entries(&mut thread, at, seeds);
+        self.apply_header(&mut thread, header, at);
+        for marker in markers {
+            let seq = self.next_id();
+            feed::push(&mut thread.feed, FeedItem { seq, at, kind: ItemKind::Marker(marker) });
+        }
+        feed::cap(&mut thread.feed, MAX_FEED);
+        apply_put(&mut thread, put, compose);
+        let id = thread.id;
         self.threads.insert(0, thread);
-        self.enforce_cap(owner);
+        self.enforce_cap(owner, id);
         PutOutcome::Applied { created: false, entered_needs_you: entered }
+    }
+
+    /// v2 put compat, removed in step 13: apply what a put's `message` does
+    /// to the `header-message` feed item.
+    fn apply_header(&mut self, thread: &mut Thread, change: feed::HeaderChange, at: u64) {
+        let seq = match change {
+            feed::HeaderChange::Insert(_) => self.next_id(),
+            _ => 0,
+        };
+        feed::apply_header_change(&mut thread.feed, change, seq, at);
     }
 
     /// `devsbd thread rm <key>`: drop `owner`'s thread with that key.
@@ -478,13 +501,15 @@ impl Inbox {
                     Some(status) => format!("{owner_name}: {} — {status}", put.title),
                     None => format!("{owner_name}: {}", put.title),
                 };
+                // v2 put compat, removed in step 13: the popup quotes the
+                // put's message.
                 let body = match &put.message {
                     Some(message) => format!("{}\n{message}", put.title),
                     None => put.title.clone(),
                 };
                 match self.put(owner, owner_name, at, put) {
-                    // No entry, no unread, no write, and nothing on the status
-                    // line: a re-asserted thread is invisible.
+                    // No marker, no unread, no write, and nothing on the
+                    // status line: a re-asserted thread is invisible.
                     PutOutcome::Unchanged => None,
                     PutOutcome::Applied { entered_needs_you, .. } => Some(Shown {
                         line,
@@ -499,18 +524,11 @@ impl Inbox {
         }
     }
 
-    /// Append `(kind, text)` pairs as timeline entries stamped `at`, each with
-    /// its own arrival id so the cap can order them against notes.
-    fn append_entries(&mut self, thread: &mut Thread, at: u64, seeds: Vec<(EntryKind, String)>) {
-        for (kind, text) in seeds {
-            let seq = self.next_id();
-            thread.entries.push(Entry { seq, at, kind, text });
-        }
-    }
-
-    /// Apply one dashboard-requested [`Op`] at unix time `now` (the stamp of
-    /// any entry and event it adds).
-    pub fn apply(&mut self, op: &Op, now: u64) {
+    /// Apply one client-requested [`Op`] at unix time `now` (the stamp of any
+    /// feed item and event it adds). `client` (`tui`, `cli`, `api:<name>`)
+    /// is recorded on the user's feed items, for the user's audit only.
+    pub fn apply(&mut self, op: &Op, now: u64, client: &str) {
+        let client = client.to_string();
         match op {
             Op::Act { thread, action } => self.user_op(*thread, now, |t| {
                 let a = t.actions.iter().find(|a| &a.id == action)?;
@@ -519,36 +537,46 @@ impl Inbox {
                 if !a.enqueues_event() {
                     return None;
                 }
+                let pressed = ItemKind::Action { action: a.id.clone(), label: a.label.clone(), client: client.clone() };
                 Some(match a.done {
-                    true => UserOp::done(Some(a.id.clone()), a.label.clone()),
+                    // What was pressed, then what it did.
+                    true => UserOp {
+                        state: Some(State::Done),
+                        items: vec![pressed, ItemKind::Marker(Marker::Done { client })],
+                        event: (EventKind::Done, Some(a.id.clone()), None),
+                    },
                     false => UserOp {
                         state: None,
-                        entry: (EntryKind::Action, a.label.clone()),
+                        items: vec![pressed],
                         event: (EventKind::Action, Some(a.id.clone()), None),
                     },
                 })
             }),
             Op::Reply { thread, text } => self.user_op(*thread, now, |t| {
                 let text = text.trim();
-                if t.reply.is_none() || text.is_empty() {
+                if t.compose.is_none() || text.is_empty() {
                     return None;
                 }
                 let text: String = text.chars().take(MAX_REPLY).collect();
                 Some(UserOp {
                     state: None,
-                    entry: (EntryKind::Reply, text.clone()),
+                    items: vec![ItemKind::Reply { text: text.clone(), client }],
                     event: (EventKind::Reply, None, Some(text)),
                 })
             }),
             // Only a real transition counts: a second `d` (or `u` on a live
             // thread) would hand the owner an event for nothing.
             Op::MarkDone(thread) => self.user_op(*thread, now, |t| {
-                (t.state != Some(State::Done)).then(|| UserOp::done(None, "marked done".into()))
+                (t.state != Some(State::Done)).then(|| UserOp {
+                    state: Some(State::Done),
+                    items: vec![ItemKind::Marker(Marker::Done { client })],
+                    event: (EventKind::Done, None, None),
+                })
             }),
             Op::Reopen(thread) => self.user_op(*thread, now, |t| {
                 (t.state == Some(State::Done)).then(|| UserOp {
                     state: Some(State::Active),
-                    entry: (EntryKind::Reopen, "reopened".into()),
+                    items: vec![ItemKind::Marker(Marker::Reopen { client })],
                     event: (EventKind::Reopen, None, None),
                 })
             }),
@@ -567,7 +595,7 @@ impl Inbox {
         }
     }
 
-    /// Apply a user op to thread-kind thread `id`: `decide` says what it does
+    /// Apply a user op to owner thread `id`: `decide` says what it does
     /// (`None`: nothing, e.g. a stale action id). An archived thread's owner
     /// is gone, so it takes no new events; a notify thread has no owner to
     /// answer it.
@@ -579,7 +607,8 @@ impl Inbox {
         }
         let Some(op) = decide(t) else { return };
         let event_id = self.mint_event_id(now);
-        let (entry_seq, event_seq) = (self.next_id(), self.next_id());
+        let seqs: Vec<u64> = op.items.iter().map(|_| self.next_id()).collect();
+        let event_seq = self.next_id();
         let t = &mut self.threads[pos];
         if let Some(state) = op.state {
             // A `done` thread's child is marked done too, but that flag lives
@@ -587,16 +616,16 @@ impl Inbox {
             t.state = Some(state);
         }
         t.updated_at = t.updated_at.max(now);
-        let (kind, text) = op.entry;
-        t.entries.push(Entry { seq: entry_seq, at: now, kind, text });
+        for (seq, kind) in seqs.into_iter().zip(op.items) {
+            feed::push(&mut t.feed, FeedItem { seq, at: now, kind });
+        }
+        feed::cap(&mut t.feed, MAX_FEED);
         let (kind, action, text) = op.event;
         t.events.push(Event { id: event_id, seq: event_seq, kind, action, text, at: now });
         if t.events.len() > MAX_EVENTS {
             let extra = t.events.len() - MAX_EVENTS;
             t.events.drain(..extra);
         }
-        let owner = t.owner.clone();
-        self.enforce_cap(&owner);
     }
 
     /// A fresh event id for time `now`, unique in the store. The 4 hex digits
@@ -644,7 +673,7 @@ impl Inbox {
         dropped
     }
 
-    /// `owner`'s live dispatcher threads, for `devsbd thread ls`: what a
+    /// `owner`'s live owner threads, for `devsbd thread ls`: what a
     /// dispatcher that lost its own state can read back. Archived ones are
     /// history it can no longer change.
     pub fn threads_for(&self, owner: &str) -> Vec<&Thread> {
@@ -654,79 +683,33 @@ impl Inbox {
             .collect()
     }
 
-    /// Keep `owner` within the cap: archived threads go first, then `done`
-    /// ones, and only then does a live thread lose its oldest record or
-    /// timeline entry. Retired threads are the cheapest thing to lose, so a
-    /// busy dispatcher doesn't shed the history of what it's working on now.
-    /// Events count but are never dropped here: a done thread still holding
-    /// unacked events is kept whole (an archived one goes: its owner can never
-    /// pull them).
-    fn enforce_cap(&mut self, owner: &str) {
-        while self.weight_for(owner) > INBOX_INSTANCE_CAP {
-            let retired = self.oldest_thread(owner, |t| t.archived).or_else(|| {
-                self.oldest_thread(owner, |t| t.state == Some(State::Done) && t.events.is_empty())
-            });
-            if let Some(pos) = retired {
-                self.threads.remove(pos);
-                continue;
-            }
-            if !self.drop_oldest_item(owner) {
-                return;
-            }
-        }
-    }
-
-    /// What `owner` holds against the cap: records, timeline entries and
-    /// pending events alike.
-    fn weight_for(&self, owner: &str) -> usize {
-        self.threads
-            .iter()
-            .filter(|t| t.owner == owner)
-            .map(|t| t.notes.len() + t.entries.len() + t.events.len())
-            .sum()
-    }
-
-    /// Index of `owner`'s least recently changed thread matching `pick`.
-    fn oldest_thread(&self, owner: &str, pick: impl Fn(&Thread) -> bool) -> Option<usize> {
-        self.threads
-            .iter()
-            .enumerate()
-            .filter(|(_, t)| t.owner == owner && pick(t))
-            .min_by_key(|(_, t)| t.changed_at())
-            .map(|(i, _)| i)
-    }
-
-    /// Drop `owner`'s single oldest record or timeline entry; `false` when
-    /// there is nothing left to drop, so [`enforce_cap`](Self::enforce_cap)
-    /// stops instead of spinning.
-    fn drop_oldest_item(&mut self, owner: &str) -> bool {
-        let Some(pos) = self
-            .threads
-            .iter()
-            .enumerate()
-            .filter(|(_, t)| t.owner == owner)
-            .filter_map(|(i, t)| oldest_item(t).map(|seq| (i, seq)))
-            .min_by_key(|&(_, seq)| seq)
-            .map(|(i, _)| i)
-        else {
-            return false;
-        };
-        let thread = &mut self.threads[pos];
-        // Notes are newest first, entries oldest first.
-        let note = thread.notes.last().map(|n| n.id);
-        let entry = thread.entries.first().map(|e| e.seq);
-        match (note, entry) {
-            (Some(n), Some(e)) if e < n => drop(thread.entries.remove(0)),
-            (Some(_), _) => drop(thread.notes.pop()),
-            (None, Some(_)) => drop(thread.entries.remove(0)),
-            (None, None) => return false,
-        }
-        // A notify thread with no records left has nothing to show; a thread
-        // one still carries its state.
-        if thread.kind == Kind::Notify && thread.notes.is_empty() {
+    /// Keep `owner` within [`THREADS_PER_OWNER`], never evicting `keep` (the
+    /// thread just written). Retired threads are the cheapest to lose:
+    /// archived first, then `done` ones, then the least recently changed
+    /// with no pending events. A thread holding unacked events is never
+    /// evicted (they're the user's answers, not yet pulled), so the cap goes
+    /// soft rather than lose one; an archived thread goes regardless, since
+    /// its owner can never pull them.
+    fn enforce_cap(&mut self, owner: &str, keep: u64) {
+        while self.threads.iter().filter(|t| t.owner == owner).count() > THREADS_PER_OWNER {
+            let mine = |t: &Thread| t.owner == owner && t.id != keep;
+            let pos = self
+                .oldest_thread(|t| mine(t) && t.archived)
+                .or_else(|| self.oldest_thread(|t| mine(t) && t.state == Some(State::Done) && t.events.is_empty()))
+                .or_else(|| self.oldest_thread(|t| mine(t) && t.events.is_empty()));
+            let Some(pos) = pos else { return };
             self.threads.remove(pos);
         }
-        true
+    }
+
+    /// Index of the least recently changed thread matching `pick`.
+    fn oldest_thread(&self, pick: impl Fn(&Thread) -> bool) -> Option<usize> {
+        self.threads
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| pick(t))
+            .min_by_key(|(_, t)| t.changed_at())
+            .map(|(i, _)| i)
     }
 
     /// Threads waiting on the user ([`Thread::needs_you`]): the tab-title count.
@@ -741,10 +724,11 @@ impl Inbox {
         self.threads.iter().filter(|t| t.needs_you() && t.owner == owner).count()
     }
 
-    /// The `inbox.toml` contents (always v2).
-    pub fn to_toml(&self) -> Result<String, String> {
+    /// The `inbox.json` contents (always v3).
+    pub fn to_json(&self) -> Result<String, String> {
         let saved = SavedInbox {
             version: VERSION,
+            next_id: self.next_id,
             threads: self
                 .threads
                 .iter()
@@ -753,7 +737,6 @@ impl Inbox {
                     owner: t.owner.clone(),
                     owner_name: t.owner_name.clone(),
                     key: t.key.clone(),
-                    instance: None,
                     kind: t.kind,
                     archived: t.archived,
                     unread: t.unread,
@@ -762,11 +745,10 @@ impl Inbox {
                     state: t.state,
                     status: t.status.clone(),
                     child: t.child.clone(),
-                    message: t.message.clone(),
-                    updated_at: t.updated_at,
-                    reply: t.reply.clone(),
                     actions: t.actions.clone(),
-                    entries: t.entries.clone(),
+                    compose: t.compose.clone(),
+                    updated_at: t.updated_at,
+                    feed: t.feed.clone(),
                     events: t.events.clone(),
                     notes: t
                         .notes
@@ -775,7 +757,6 @@ impl Inbox {
                             seq: n.id,
                             level: n.record.level.as_str().to_string(),
                             at: n.record.at,
-                            key: None,
                             link: n.record.link.clone(),
                             msg: n.record.msg.clone(),
                         })
@@ -783,35 +764,88 @@ impl Inbox {
                 })
                 .collect(),
         };
-        toml::to_string_pretty(&saved).map_err(|e| e.to_string())
+        serde_json::to_string_pretty(&saved).map(|mut s| {
+            s.push('\n');
+            s
+        }).map_err(|e| e.to_string())
     }
 
-    /// Parse `inbox.toml` contents. `names` maps instance names (state keys)
-    /// to `instance_id`s, and is only used by a v1 file, which identified
-    /// threads by name: a name that no longer resolves keeps its thread under
-    /// the placeholder owner `name:<instance>` (step 3 archives those).
-    pub fn from_toml(text: &str, names: &BTreeMap<String, String>) -> Result<Inbox, String> {
-        let saved: SavedInbox = toml::from_str(text).map_err(|e| e.to_string())?;
+    /// Parse `inbox.json` contents. Any version but [`VERSION`] is an error:
+    /// a store written by a newer build is not this one's to rewrite.
+    pub fn from_json(text: &str) -> Result<Inbox, String> {
+        #[derive(Deserialize)]
+        struct Probe {
+            version: Option<u32>,
+        }
+        let probe: Probe = serde_json::from_str(text).map_err(|e| e.to_string())?;
+        match probe.version {
+            Some(VERSION) => {}
+            Some(v) => return Err(format!("store version {v}, this build reads version {VERSION}")),
+            None => return Err("no `version`".into()),
+        }
+        let saved: SavedInbox = serde_json::from_str(text).map_err(|e| e.to_string())?;
         let mut inbox = Inbox::default();
         for t in saved.threads {
-            // v1 repeated the key on every note; it belongs to the thread.
-            let v1_key = t.notes.first().and_then(|n| n.key.clone());
             let notes = t
                 .notes
                 .into_iter()
                 .map(|n| {
                     let level = Level::parse(&n.level).ok_or_else(|| format!("bad level `{}`", n.level))?;
-                    Ok(Note {
-                        id: n.seq,
-                        record: Record { level, key: None, link: n.link, msg: n.msg, at: n.at },
-                    })
+                    let record = Record { level, key: t.key.clone(), link: n.link, msg: n.msg, at: n.at };
+                    Ok(Note { id: n.seq, record })
                 })
                 .collect::<Result<Vec<_>, String>>()?;
-            // A notify thread with no records is nothing; a dispatcher thread
-            // carries its state with no records at all.
-            if notes.is_empty() && t.kind == Kind::Notify {
+            inbox.threads.push(Thread {
+                id: t.id,
+                owner: t.owner,
+                owner_name: t.owner_name,
+                key: t.key,
+                kind: t.kind,
+                archived: t.archived,
+                unread: t.unread,
+                notes,
+                title: t.title,
+                link: t.link,
+                state: t.state,
+                status: t.status,
+                child: t.child,
+                actions: t.actions,
+                compose: t.compose,
+                updated_at: t.updated_at,
+                feed: t.feed,
+                events: t.events,
+            });
+        }
+        inbox.next_id = saved.next_id.max(inbox.max_id().map_or(0, |m| m + 1));
+        Ok(inbox)
+    }
+
+    /// Carry a v1/v2 `inbox.toml` over: its **notify** threads (notes,
+    /// unread, archived) and nothing else. Owner threads are dropped: they
+    /// are projections a dispatcher re-puts every pass, and their v2 shape
+    /// (a header `message`, per-field timeline entries) has no v3 meaning.
+    /// `names` maps instance names (state keys) to `instance_id`s, and is
+    /// only used by a v1 file, which identified threads by name: a name that
+    /// no longer resolves keeps its thread, archived, under the placeholder
+    /// owner `name:<instance>`.
+    pub fn import_v2(text: &str, names: &BTreeMap<String, String>) -> Result<Inbox, String> {
+        let saved: V2Inbox = toml::from_str(text).map_err(|e| e.to_string())?;
+        let mut inbox = Inbox::default();
+        for t in saved.threads.into_iter().filter(|t| t.kind == Kind::Notify) {
+            // v1 repeated the key on every note; it belongs to the thread.
+            let v1_key = t.notes.first().and_then(|n| n.key.clone());
+            let mut notes = t
+                .notes
+                .into_iter()
+                .map(|n| {
+                    let level = Level::parse(&n.level).ok_or_else(|| format!("bad level `{}`", n.level))?;
+                    Ok(Note { id: n.seq, record: Record { level, key: None, link: n.link, msg: n.msg, at: n.at } })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            if notes.is_empty() {
                 continue;
             }
+            notes.truncate(MAX_NOTES);
             // v1: `instance` is a name; v2 carries the id and the key.
             let (owner, owner_name, key) = match t.instance {
                 Some(name) => {
@@ -821,7 +855,7 @@ impl Inbox {
                 }
                 None => (t.owner, t.owner_name, t.key),
             };
-            let id = if saved.version >= VERSION { t.id } else { inbox.next_id() };
+            let id = if saved.version >= V2 { t.id } else { inbox.next_id() };
             let notes = notes
                 .into_iter()
                 .map(|n| Note { record: Record { key: key.clone(), ..n.record }, ..n })
@@ -834,51 +868,36 @@ impl Inbox {
                 owner,
                 owner_name,
                 key,
-                kind: t.kind,
                 unread: t.unread,
                 notes,
-                title: t.title,
-                link: t.link,
-                state: t.state,
-                status: t.status,
-                child: t.child,
-                message: t.message,
-                actions: t.actions,
-                reply: t.reply,
-                updated_at: t.updated_at,
-                entries: t.entries,
-                events: t.events,
+                ..Thread::default()
             });
         }
-        // Ids keep growing past everything loaded, so arrival order (which the
-        // cap reads) and thread identity stay unique.
-        inbox.next_id = inbox
-            .threads
+        inbox.next_id = inbox.next_id.max(inbox.max_id().map_or(0, |m| m + 1));
+        Ok(inbox)
+    }
+
+    /// The largest id or seq anything holds, so the counter can keep growing
+    /// past everything loaded: arrival order and thread identity stay unique.
+    fn max_id(&self) -> Option<u64> {
+        self.threads
             .iter()
             .flat_map(|t| {
                 std::iter::once(t.id)
                     .chain(t.notes.iter().map(|n| n.id))
-                    .chain(t.entries.iter().map(|e| e.seq))
+                    .chain(t.feed.iter().map(|i| i.seq))
                     .chain(t.events.iter().map(|e| e.seq))
             })
             .max()
-            .map_or(0, |m| m + 1);
-        Ok(inbox)
     }
 }
 
-/// What one user op does to a thread: an optional state change, the timeline
-/// entry, and the event `(kind, action, text)` for the owner.
+/// What one user op does to a thread: an optional state change, the feed
+/// items, and the event `(kind, action, text)` for the owner.
 struct UserOp {
     state: Option<State>,
-    entry: (EntryKind, String),
+    items: Vec<ItemKind>,
     event: (EventKind, Option<String>, Option<String>),
-}
-
-impl UserOp {
-    fn done(action: Option<String>, label: String) -> UserOp {
-        UserOp { state: Some(State::Done), entry: (EntryKind::Done, label), event: (EventKind::Done, action, None) }
-    }
 }
 
 /// `2026-10-02T12:00:01Z` for unix time `at`: the `at` of an event as the
@@ -902,24 +921,6 @@ pub fn rfc3339(at: u64) -> String {
     )
 }
 
-impl Thread {
-    /// The thread as its owner last put it (`devsbd thread ls`): the put
-    /// shape, so a dispatcher can feed it straight back.
-    pub fn to_put(&self) -> ThreadPut {
-        ThreadPut {
-            key: self.key.clone().unwrap_or_default(),
-            title: self.title.clone(),
-            link: self.link.clone(),
-            state: self.state.unwrap_or_default(),
-            status: self.status.clone(),
-            child: self.child.clone(),
-            message: self.message.clone(),
-            actions: self.actions.clone(),
-            reply: self.reply.clone(),
-        }
-    }
-}
-
 /// What [`Inbox::put`] did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PutOutcome {
@@ -933,44 +934,16 @@ pub enum PutOutcome {
     },
 }
 
-/// Copy a put's fields onto a thread. Actions and reply are replaced
-/// wholesale: the put is the dispatcher's whole current view of the thread.
-fn apply_put(thread: &mut Thread, put: ThreadPut) {
+/// Copy a put's header onto a thread. Actions and compose are replaced
+/// wholesale: the put is the owner's whole current view of the header.
+fn apply_put(thread: &mut Thread, put: ThreadPut, compose: Option<Compose>) {
     thread.title = put.title;
     thread.link = put.link;
     thread.state = Some(put.state);
     thread.status = put.status;
     thread.child = put.child;
-    thread.message = put.message;
     thread.actions = put.actions;
-    thread.reply = put.reply;
-}
-
-/// Timeline entries for the fields a put changed, in reading order. Only the
-/// three fields that carry news get one; a new label or link is not history.
-fn changed_entries(put: &ThreadPut, message: bool, state: bool, status: bool) -> Vec<(EntryKind, String)> {
-    let mut out = Vec::new();
-    if let (true, Some(text)) = (message, &put.message) {
-        out.push((EntryKind::Message, text.clone()));
-    }
-    if state {
-        out.push((EntryKind::State, put.state.as_str().to_string()));
-    }
-    if let (true, Some(text)) = (status, &put.status) {
-        out.push((EntryKind::Status, text.clone()));
-    }
-    out
-}
-
-/// The oldest arrival id a thread still holds (its last note or first entry),
-/// or `None` when it holds neither.
-fn oldest_item(thread: &Thread) -> Option<u64> {
-    let note = thread.notes.last().map(|n| n.id);
-    let entry = thread.entries.first().map(|e| e.seq);
-    match (note, entry) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (a, b) => a.or(b),
-    }
+    thread.compose = compose;
 }
 
 /// What the bridge's notify sink does with one decoded message. Split out of
@@ -1047,8 +1020,10 @@ fn sanitize_action(action: SinkAction) -> SinkAction {
                 link: opt(put.link),
                 status: opt(put.status),
                 child: opt(put.child),
-                message: opt(put.message),
                 actions,
+                compose: put.compose.map(|c| Compose { placeholder: opt(c.placeholder), hint: opt(c.hint) }),
+                // v2 put compat, removed in step 13.
+                message: opt(put.message),
                 reply: put.reply.map(|r| Reply { placeholder: opt(r.placeholder) }),
                 ..put
             };
@@ -1083,36 +1058,28 @@ pub struct ShownPopup {
     pub body: String,
 }
 
-/// `inbox.toml` schema: threads newest first, each with its notes newest
-/// first. One struct serves both versions, since a v1 file is just a v2 one
-/// with `instance` instead of `owner`/`owner_name` and the key on the notes.
+/// `inbox.json` schema: threads newest first, each with its notes newest
+/// first and its feed oldest first. Separate from the model because a note
+/// is stored flat (the model wraps a [`Record`], which carries its thread's
+/// key again); feed items, actions and events are stored as they are.
 #[derive(Serialize, Deserialize)]
 struct SavedInbox {
-    /// Absent in v1 files, which this build migrates on load.
-    #[serde(default)]
     version: u32,
-    #[serde(default, rename = "thread", skip_serializing_if = "Vec::is_empty")]
+    /// The id counter, so ids stay unique even past dropped threads.
+    #[serde(default)]
+    next_id: u64,
+    #[serde(default)]
     threads: Vec<SavedThread>,
 }
 
-/// Field order is load-bearing: TOML wants every scalar before the tables
-/// (`reply`) and arrays of tables (`action`, `entry`, `note`). Everything
-/// added for thread records defaults and is skipped when empty, so a v2 file
-/// written before them loads and round-trips unchanged.
 #[derive(Serialize, Deserialize)]
 struct SavedThread {
-    #[serde(default)]
     id: u64,
-    #[serde(default)]
     owner: String,
-    #[serde(default)]
     owner_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     key: Option<String>,
-    /// v1 only: the owner's state key. Never written back.
-    #[serde(default, skip_serializing)]
-    instance: Option<String>,
-    #[serde(default, skip_serializing_if = "Kind::is_notify")]
+    #[serde(default)]
     kind: Kind,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     archived: bool,
@@ -1128,20 +1095,17 @@ struct SavedThread {
     status: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     child: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    actions: Vec<Action>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    message: Option<String>,
+    compose: Option<Compose>,
     #[serde(default, skip_serializing_if = "is_zero")]
     updated_at: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    reply: Option<Reply>,
-    #[serde(default, rename = "action", skip_serializing_if = "Vec::is_empty")]
-    actions: Vec<Action>,
-    #[serde(default, rename = "entry", skip_serializing_if = "Vec::is_empty")]
-    entries: Vec<Entry>,
-    /// Pending events (`[[thread.event]]`); defaulted, so no version bump.
-    #[serde(default, rename = "event", skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    feed: Vec<FeedItem>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     events: Vec<Event>,
-    #[serde(default, rename = "note", skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     notes: Vec<SavedNote>,
 }
 
@@ -1151,14 +1115,61 @@ fn is_zero(n: &u64) -> bool {
 
 #[derive(Serialize, Deserialize)]
 struct SavedNote {
-    /// Arrival order across the inbox (the cap drops the lowest first).
+    /// Arrival order across the inbox.
     seq: u64,
     level: String,
     at: u64,
-    /// v1 only on read: the key now lives on the thread.
-    #[serde(default, skip_serializing)]
-    key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    link: Option<String>,
+    msg: String,
+}
+
+/// The part of a v1/v2 `inbox.toml` [`Inbox::import_v2`] reads: notify
+/// threads. Everything an owner thread carried (`message`, `[[thread.entry]]`,
+/// `[[thread.action]]`, …) is ignored, as are unknown keys. A v1 file is a
+/// v2 one with `instance` instead of `owner`/`owner_name` and the key on the
+/// notes.
+#[derive(Deserialize)]
+struct V2Inbox {
+    /// Absent in v1 files.
+    #[serde(default)]
+    version: u32,
+    #[serde(default, rename = "thread")]
+    threads: Vec<V2Thread>,
+}
+
+#[derive(Deserialize)]
+struct V2Thread {
+    #[serde(default)]
+    id: u64,
+    #[serde(default)]
+    owner: String,
+    #[serde(default)]
+    owner_name: String,
+    #[serde(default)]
+    key: Option<String>,
+    /// v1 only: the owner's state key.
+    #[serde(default)]
+    instance: Option<String>,
+    #[serde(default)]
+    kind: Kind,
+    #[serde(default)]
+    archived: bool,
+    #[serde(default)]
+    unread: bool,
+    #[serde(default, rename = "note")]
+    notes: Vec<V2Note>,
+}
+
+#[derive(Deserialize)]
+struct V2Note {
+    seq: u64,
+    level: String,
+    at: u64,
+    /// v1 only: the key now lives on the thread.
+    #[serde(default)]
+    key: Option<String>,
+    #[serde(default)]
     link: Option<String>,
     msg: String,
 }
@@ -1201,26 +1212,31 @@ mod tests {
             title: "PR 1".into(),
             state: State::Active,
             status: Some("running ci".into()),
-            message: Some("ci started".into()),
             ..ThreadPut::default()
         }
     }
 
-    /// A thread's timeline as `(kind, text)`, oldest first.
-    fn timeline(t: &Thread) -> Vec<(&str, &str)> {
-        t.entries
+    /// A thread's feed as short strings, oldest first.
+    fn feed(t: &Thread) -> Vec<String> {
+        t.feed
             .iter()
-            .map(|e| {
-                let kind = match e.kind {
-                    EntryKind::Message => "message",
-                    EntryKind::State => "state",
-                    EntryKind::Status => "status",
-                    EntryKind::Action => "action",
-                    EntryKind::Reply => "reply",
-                    EntryKind::Done => "done",
-                    EntryKind::Reopen => "reopen",
-                };
-                (kind, e.text.as_str())
+            .map(|i| match &i.kind {
+                ItemKind::Message { id, blocks, edited, withdrawn } => {
+                    let tags = match (edited, withdrawn) {
+                        (_, true) => " (withdrawn)",
+                        (true, false) => " (edited)",
+                        _ => "",
+                    };
+                    format!("message {id}: {}{tags}", feed::markdown_of(blocks))
+                }
+                ItemKind::Reply { text, client } => format!("reply {text} [{client}]"),
+                ItemKind::Action { action, label, client } => format!("action {action} {label} [{client}]"),
+                ItemKind::Marker(Marker::Done { client }) => format!("done [{client}]"),
+                ItemKind::Marker(Marker::Reopen { client }) => format!("reopen [{client}]"),
+                ItemKind::Marker(Marker::State { from, to }) => format!("state {} -> {}", from.as_str(), to.as_str()),
+                ItemKind::Marker(Marker::Status { from, to }) => {
+                    format!("status {} -> {}", from.as_deref().unwrap_or("-"), to.as_deref().unwrap_or("-"))
+                }
             })
             .collect()
     }
@@ -1229,20 +1245,22 @@ mod tests {
         inbox.threads.iter().find(|t| t.key.as_deref() == Some(key))
     }
 
+    fn owned(inbox: &Inbox, owner: &str) -> usize {
+        inbox.threads.iter().filter(|t| t.owner == owner).count()
+    }
+
     #[test]
-    fn put_creates_a_thread_with_its_opening_timeline() {
+    fn put_creates_a_thread_with_an_empty_feed() {
         let mut inbox = Inbox::default();
         let out = inbox.put("web-id", "web", 100, put_body("pr-1"));
         assert_eq!(out, PutOutcome::Applied { created: true, entered_needs_you: false });
         let t = &inbox.threads[0];
         assert_eq!((t.kind, t.unread, t.archived), (Kind::Thread, true, false));
-        assert!(t.notes.is_empty(), "a dispatcher thread has no records");
+        assert!(t.notes.is_empty(), "an owner thread has no records");
         assert_eq!(t.changed_at(), 100);
         assert_eq!(t.state, Some(State::Active));
-        assert_eq!(
-            timeline(t),
-            [("message", "ci started"), ("state", "active"), ("status", "running ci")]
-        );
+        assert_eq!(t.status.as_deref(), Some("running ci"));
+        assert!(t.feed.is_empty(), "the header says it all: no markers on creation");
     }
 
     /// The main clutter fix: a dispatcher re-asserting a thread every pass
@@ -1251,50 +1269,89 @@ mod tests {
     #[test]
     fn an_identical_put_changes_nothing() {
         let mut inbox = Inbox::default();
-        inbox.put("web-id", "web", 100, put_body("pr-1"));
+        let full = ThreadPut { message: Some("ci started".into()), compose: Some(Compose::default()), ..put_body("pr-1") };
+        inbox.put("web-id", "web", 100, full.clone());
         let before = inbox.clone();
-        assert_eq!(inbox.put("web-id", "web", 200, put_body("pr-1")), PutOutcome::Unchanged);
+        assert_eq!(inbox.put("web-id", "web", 200, full), PutOutcome::Unchanged);
         assert_eq!(inbox, before);
     }
 
     #[test]
-    fn put_logs_one_entry_per_changed_field_and_only_news_is_unread() {
+    fn a_put_leaves_markers_for_state_and_status_only() {
         let mut inbox = Inbox::default();
         inbox.put("web-id", "web", 100, put_body("pr-1"));
-        inbox.put("web-id", "web", 100, ThreadPut { key: "other".into(), ..put_body("other") });
+        inbox.put("web-id", "web", 100, put_body("other"));
         inbox.threads.iter_mut().for_each(|t| t.unread = false);
 
-        // Status and message change; title/link/actions don't.
-        let changed = ThreadPut {
-            status: Some("merged".into()),
-            message: Some("ci green".into()),
-            ..put_body("pr-1")
-        };
-        let out = inbox.put("web-id", "web", 300, changed);
-        assert_eq!(out, PutOutcome::Applied { created: false, entered_needs_you: false });
+        // State and status change; title/link/actions/compose don't.
+        let changed = ThreadPut { state: State::NeedsYou, status: Some("review".into()), ..put_body("pr-1") };
+        let out = inbox.put("web-id", "web", 300, changed.clone());
+        assert_eq!(out, PutOutcome::Applied { created: false, entered_needs_you: true });
         let t = &inbox.threads[0];
         assert_eq!(t.key.as_deref(), Some("pr-1"), "a changed thread moves to the top");
         assert!(t.unread);
         assert_eq!(t.updated_at, 300);
-        assert_eq!(
-            timeline(t)[3..],
-            [("message", "ci green"), ("status", "merged")],
-            "one entry per changed field, no `state` entry"
-        );
+        assert_eq!(feed(t), ["state active -> needs-you", "status running ci -> review"]);
 
-        // A cosmetic change is applied but is not news.
+        // Header-only changes are applied but leave nothing and aren't news.
         inbox.threads[0].unread = false;
-        let renamed = ThreadPut {
+        let cosmetic = ThreadPut {
             title: "PR 1 (renamed)".into(),
-            status: Some("merged".into()),
-            message: Some("ci green".into()),
+            link: Some("https://x/1".into()),
+            actions: vec![Action { id: "go".into(), label: "Go".into(), ..Action::default() }],
+            compose: Some(Compose { placeholder: Some("p".into()), hint: Some("h".into()) }),
+            ..changed.clone()
+        };
+        assert!(matches!(inbox.put("web-id", "web", 400, cosmetic), PutOutcome::Applied { .. }));
+        let t = &inbox.threads[0];
+        assert_eq!((t.title.as_str(), t.compose.as_ref().unwrap().hint.as_deref()), ("PR 1 (renamed)", Some("h")));
+        assert!(!t.unread, "a new title is not news");
+        assert_eq!(t.feed.len(), 2, "and leaves no marker");
+
+        // Status-only changes in a row collapse into the last status marker.
+        for status in ["posting", "posted"] {
+            inbox.put("web-id", "web", 500, ThreadPut { status: Some(status.into()), ..changed.clone() });
+        }
+        let t = find(&inbox, "pr-1").unwrap();
+        assert_eq!(feed(t), ["state active -> needs-you", "status running ci -> posted"]);
+        assert_eq!(t.feed[1].at, 500);
+        // ... and one that lands back where it started leaves none.
+        inbox.put("web-id", "web", 600, ThreadPut { status: Some("running ci".into()), ..changed });
+        assert_eq!(feed(find(&inbox, "pr-1").unwrap()), ["state active -> needs-you"]);
+    }
+
+    /// v2 put compat, removed in step 13: `message` is the `header-message`
+    /// feed item, `reply` is `compose`.
+    #[test]
+    fn a_v2_message_is_one_feed_item_replaced_in_place() {
+        let mut inbox = Inbox::default();
+        let v2 = |message: Option<&str>| ThreadPut {
+            message: message.map(str::to_string),
+            reply: Some(Reply { placeholder: Some("next run".into()) }),
             ..put_body("pr-1")
         };
-        assert!(matches!(inbox.put("web-id", "web", 400, renamed), PutOutcome::Applied { .. }));
+        inbox.put("web-id", "web", 1, v2(Some("ci started")));
         let t = &inbox.threads[0];
-        assert_eq!(t.title, "PR 1 (renamed)");
-        assert!(!t.unread, "a new title is not news");
-        assert_eq!(timeline(t).len(), 5, "and leaves no timeline entry");
+        assert_eq!(feed(t), ["message header-message: ci started"]);
+        assert_eq!(t.compose, Some(Compose { placeholder: Some("next run".into()), hint: None }), "reply is compose");
+        assert_eq!(inbox.put("web-id", "web", 2, v2(Some("ci started"))), PutOutcome::Unchanged);
+
+        // Changed: replaced in place, `edited`, not news.
+        inbox.threads[0].unread = false;
+        assert!(matches!(inbox.put("web-id", "web", 3, v2(Some("ci green"))), PutOutcome::Applied { .. }));
+        let t = &inbox.threads[0];
+        assert_eq!(feed(t), ["message header-message: ci green (edited)"]);
+        assert_eq!(t.feed[0].at, 1, "first-insert time");
+        assert!(!t.unread, "an edit is not news");
+
+        // A status change in between: the message stays where it was.
+        inbox.put("web-id", "web", 4, ThreadPut { status: Some("merged".into()), ..v2(Some("ci green")) });
+        // Omitted: withdrawn, kept; an empty one counts as omitted.
+        inbox.put("web-id", "web", 5, ThreadPut { status: Some("merged".into()), ..v2(None) });
+        let t = &inbox.threads[0];
+        assert_eq!(feed(t), ["message header-message: ci green (withdrawn)", "status running ci -> merged"]);
+        assert_eq!(t.to_put().message, None);
+        assert_eq!(inbox.put("web-id", "web", 6, ThreadPut { status: Some("merged".into()), ..v2(Some(" ")) }), PutOutcome::Unchanged);
     }
 
     #[test]
@@ -1326,7 +1383,7 @@ mod tests {
         push(&mut inbox, "web", rec("note", Some("pr-1"), None), true);
         inbox.put("web-id", "web", 10, put_body("pr-1"));
         inbox.put("other-id", "other", 10, put_body("pr-1"));
-        assert_eq!(inbox.threads.len(), 3, "a notify record never joins a dispatcher thread");
+        assert_eq!(inbox.threads.len(), 3, "a notify record never joins an owner thread");
         // rm touches one owner's thread only, and leaves the notify record.
         assert!(inbox.thread_rm("web-id", "pr-1"));
         assert!(!inbox.thread_rm("web-id", "pr-1"), "already gone");
@@ -1368,43 +1425,72 @@ mod tests {
         assert!(!find(&inbox, "revived").unwrap().archived);
     }
 
+    /// The per-owner cap counts threads: archived ones go first, then done
+    /// ones, then the least recently changed without pending events, and the
+    /// thread just written never.
     #[test]
-    fn cap_evicts_archived_then_done_then_the_oldest() {
+    fn the_thread_cap_evicts_archived_then_done_then_the_oldest() {
         let mut inbox = Inbox::default();
-        // One entry each (no message, no status), so the arithmetic is plain.
-        let bare = |key: &str, state: State| ThreadPut {
-            key: key.into(),
-            title: "t".into(),
-            state,
-            ..ThreadPut::default()
-        };
+        let bare = |key: &str, state: State| ThreadPut { key: key.into(), title: "t".into(), state, ..ThreadPut::default() };
         inbox.put("w-id", "w", 1, bare("archived", State::Active));
         inbox.archive_owner("w-id");
         inbox.put("w-id", "w", 2, bare("done", State::Done));
-        inbox.put("w-id", "w", 3, bare("live", State::Active));
-        assert_eq!(inbox.weight_for("w-id"), 3, "entries count toward the cap");
+        inbox.put("w-id", "w", 3, ThreadPut { compose: Some(Compose::default()), ..bare("pending", State::Active) });
+        let pending = find(&inbox, "pending").unwrap().id;
+        inbox.apply(&Op::Reply { thread: pending, text: "hi".into() }, 3, "tui");
+        inbox.put("w-id", "w", 4, bare("live", State::Active));
+        // Another owner's threads are never the price.
+        inbox.put("x-id", "x", 0, bare("theirs", State::Done));
 
         let mut next = 0;
         let mut fill = |inbox: &mut Inbox, n: usize| {
             for _ in 0..n {
-                push(inbox, "w", rec(&format!("n{next}"), None, None), true);
+                push(inbox, "w", Record { at: 10 + next, ..rec(&format!("n{next}"), None, None) }, true);
                 next += 1;
             }
         };
-        fill(&mut inbox, INBOX_INSTANCE_CAP - 2);
+        fill(&mut inbox, THREADS_PER_OWNER - 4);
+        assert_eq!(owned(&inbox, "w-id"), THREADS_PER_OWNER);
+        assert!(find(&inbox, "archived").is_some(), "within the cap: nothing goes");
+        fill(&mut inbox, 1);
         assert!(find(&inbox, "archived").is_none(), "archived goes first");
-        assert!(find(&inbox, "done").is_some() && find(&inbox, "live").is_some());
         fill(&mut inbox, 1);
         assert!(find(&inbox, "done").is_none(), "then done");
         fill(&mut inbox, 1);
-        // Then the owner's single oldest item: the live thread's one entry,
-        // queued before every record.
-        assert!(find(&inbox, "live").is_some_and(|t| t.entries.is_empty()));
+        assert!(find(&inbox, "live").is_none(), "then the oldest without events");
+        assert!(find(&inbox, "pending").is_some(), "the one holding an event outlasts it");
         fill(&mut inbox, 1);
-        let notes: Vec<&str> =
-            inbox.threads.iter().filter_map(|t| t.head()).map(|r| r.msg.as_str()).collect();
-        assert!(!notes.contains(&"n0"), "and then its oldest record");
-        assert_eq!(inbox.weight_for("w-id"), INBOX_INSTANCE_CAP);
+        assert!(!inbox.threads.iter().filter_map(|t| t.head()).any(|r| r.msg == "n0"), "then the oldest record");
+        assert_eq!(owned(&inbox, "w-id"), THREADS_PER_OWNER);
+        assert!(find(&inbox, "theirs").is_some());
+        // Many more: `pending` still holds its unpulled event, so it stays.
+        fill(&mut inbox, THREADS_PER_OWNER);
+        assert!(find(&inbox, "pending").is_some(), "a thread holding events is never evicted");
+    }
+
+    #[test]
+    fn a_feed_keeps_its_newest_300_and_a_notify_thread_its_newest_records() {
+        let mut inbox = Inbox::default();
+        let put = ThreadPut { compose: Some(Compose::default()), ..put_body("pr-1") };
+        inbox.put("web-id", "web", 1, put.clone());
+        inbox.put("web-id", "web", 2, ThreadPut { state: State::NeedsYou, ..put });
+        let id = find(&inbox, "pr-1").unwrap().id;
+        for i in 0..MAX_FEED {
+            inbox.apply(&Op::Reply { thread: id, text: format!("r{i}") }, 10, "tui");
+        }
+        let t = find(&inbox, "pr-1").unwrap();
+        assert_eq!(t.feed.len(), MAX_FEED);
+        assert_eq!(feed(t)[0], "reply r0 [tui]", "the state marker went first");
+        inbox.apply(&Op::Reply { thread: id, text: "last".into() }, 10, "tui");
+        let t = find(&inbox, "pr-1").unwrap();
+        assert_eq!((t.feed.len(), feed(t)[0].as_str()), (MAX_FEED, "reply r1 [tui]"));
+
+        for i in 0..MAX_NOTES + 2 {
+            push(&mut inbox, "web", rec(&format!("n{i}"), Some("k"), None), true);
+        }
+        let n = find(&inbox, "k").unwrap();
+        assert_eq!(n.notes.len(), MAX_NOTES);
+        assert_eq!(n.notes.last().unwrap().record.msg, "n2", "the oldest two went");
     }
 
     #[test]
@@ -1415,7 +1501,6 @@ mod tests {
         // record from the same instance, keyed by the thread.
         let SinkAction::Push(r) = decide("web", false, put.clone()) else { panic!("not refused") };
         assert_eq!((r.level, r.key.as_deref(), r.at), (Level::Error, Some("thread:pr-1"), 7));
-        assert!(r.msg.contains("thread put denied"), "{}", r.msg);
         assert_eq!(
             r.msg,
             "thread put denied: `web` doesn't declare inbox = true (add it to the sandbox in devsandboxes.toml)"
@@ -1445,7 +1530,7 @@ mod tests {
     fn the_sink_surfaces_only_what_is_new() {
         let mut inbox = Inbox::default();
         let action = |state: &str, status: &str, at: u64| {
-            let body = format!(r#"{{"key":"pr-1","title":"PR 1","state":"{state}","status":"{status}"}}"#);
+            let body = format!(r#"{{"key":"pr-1","title":"PR 1","state":"{state}","status":"{status}","message":"look"}}"#);
             decide("web", true, Message::ThreadPut { at, key: "pr-1".into(), body })
         };
         // Created active: a status line, no popup.
@@ -1454,11 +1539,12 @@ mod tests {
         assert!(shown.popup.is_none());
         // Re-asserted: nothing at all, not even a status line.
         assert!(inbox.apply_sink("web-id", "web", 1000, action("active", "ci", 11)).is_none());
-        // Into needs-you: a popup, coalescable per thread.
+        // Into needs-you: a popup, coalescable per thread, quoting the v2
+        // message.
         let shown = inbox.apply_sink("web-id", "web", 1000, action("needs-you", "ci", 12)).unwrap();
         let popup = shown.popup.unwrap();
         assert_eq!((popup.key.as_deref(), popup.level), (Some("thread:pr-1"), Level::Warn));
-        assert!(popup.body.starts_with("PR 1"));
+        assert_eq!(popup.body, "PR 1\nlook");
         // Still needs-you, new status: shown, but no second popup.
         let shown = inbox.apply_sink("web-id", "web", 1000, action("needs-you", "merged", 13)).unwrap();
         assert!(shown.popup.is_none());
@@ -1492,16 +1578,21 @@ mod tests {
             status: Some("s\x07".into()),
             message: Some("a\tb\r\nc\u{85}".into()),
             actions: vec![Action { id: "go".into(), label: "Go\x1b".into(), ..Action::default() }],
-            reply: Some(Reply { placeholder: Some("p\x1b".into()) }),
+            compose: Some(Compose { placeholder: Some("p\x1b".into()), hint: Some("h\x07".into()) }),
             ..put_body("pr-1")
         };
         inbox.apply_sink("web-id", "web", 1000, SinkAction::Put { at: 5, put });
         let t = find(&inbox, "pr-1").unwrap();
         assert_eq!(t.title, "t[1m");
         assert_eq!(t.status.as_deref(), Some("s"));
-        assert_eq!(t.message.as_deref(), Some("a   b\nc"));
+        assert_eq!(feed::header_message(&t.feed).as_deref(), Some("a   b\nc"));
         assert_eq!(t.actions[0].label, "Go");
-        assert_eq!(t.reply.as_ref().unwrap().placeholder.as_deref(), Some("p"));
+        let compose = t.compose.as_ref().unwrap();
+        assert_eq!((compose.placeholder.as_deref(), compose.hint.as_deref()), (Some("p"), Some("h")));
+        // The v2 `reply` goes through too.
+        let put = ThreadPut { reply: Some(Reply { placeholder: Some("r\x1b".into()) }), ..put_body("pr-2") };
+        inbox.apply_sink("web-id", "web", 1000, SinkAction::Put { at: 5, put });
+        assert_eq!(find(&inbox, "pr-2").unwrap().compose.as_ref().unwrap().placeholder.as_deref(), Some("r"));
     }
 
     #[test]
@@ -1542,31 +1633,6 @@ mod tests {
     }
 
     #[test]
-    fn cap_counts_history_and_drops_that_owners_oldest() {
-        let mut inbox = Inbox::default();
-        push(&mut inbox, "quiet", rec("q0", None, None), true);
-        push(&mut inbox, "noisy", rec("k0", Some("k"), None), true);
-        for i in 1..INBOX_INSTANCE_CAP {
-            push(&mut inbox, "noisy", rec(&i.to_string(), None, None), true);
-        }
-        assert_eq!(inbox.weight_for("noisy-id"), INBOX_INSTANCE_CAP);
-        // A new record in the keyed thread: noisy's oldest record is the
-        // thread's own first one ("k0"), dropped from its history.
-        push(&mut inbox, "noisy", rec("k1", Some("k"), None), true);
-        assert_eq!(inbox.weight_for("noisy-id"), INBOX_INSTANCE_CAP);
-        assert_eq!(
-            inbox.threads[0].notes.iter().map(|n| n.record.msg.as_str()).collect::<Vec<_>>(),
-            ["k1"]
-        );
-        // Next: the oldest unkeyed one ("1") goes, its thread with it.
-        push(&mut inbox, "noisy", rec("new", None, None), true);
-        assert_eq!(inbox.weight_for("noisy-id"), INBOX_INSTANCE_CAP);
-        assert!(!msgs(&inbox).contains(&("noisy", "1")));
-        assert!(msgs(&inbox).contains(&("noisy", "2")));
-        assert_eq!(inbox.weight_for("quiet-id"), 1);
-    }
-
-    #[test]
     fn ops_remove_by_identity() {
         let mut inbox = Inbox::default();
         push(&mut inbox, "a", rec("v1", Some("k"), None), true);
@@ -1575,20 +1641,20 @@ mod tests {
         push(&mut inbox, "b", rec("b1", None, None), true);
 
         let thread_id = inbox.threads.iter().find(|t| t.key.is_some()).unwrap().id;
-        inbox.apply(&Op::RemoveThread(thread_id), 0);
+        inbox.apply(&Op::RemoveThread(thread_id), 0, "tui");
         assert_eq!(msgs(&inbox), [("b", "b1"), ("a", "solo")]);
         // Unknown ids are no-ops, not panics.
-        inbox.apply(&Op::RemoveThread(thread_id), 0);
-        inbox.apply(&Op::MarkRead(thread_id), 0);
+        inbox.apply(&Op::RemoveThread(thread_id), 0, "tui");
+        inbox.apply(&Op::MarkRead(thread_id), 0, "tui");
         assert_eq!(msgs(&inbox), [("b", "b1"), ("a", "solo")]);
 
         // Leaving the Inbox reads every notify record, and only those.
         inbox.put("a-id", "a", 10, put_body("pr-1"));
-        inbox.apply(&Op::MarkNotifyRead, 0);
+        inbox.apply(&Op::MarkNotifyRead, 0, "tui");
         let unread: Vec<Kind> = inbox.threads.iter().filter(|t| t.unread).map(|t| t.kind).collect();
         assert_eq!(unread, [Kind::Thread]);
-        inbox.apply(&Op::ClearNotify, 0);
-        assert_eq!(inbox.threads.len(), 1, "the dispatcher thread stays");
+        inbox.apply(&Op::ClearNotify, 0, "tui");
+        assert_eq!(inbox.threads.len(), 1, "the owner thread stays");
     }
 
     /// What the Needs-you view and both badges count, and the two ops the
@@ -1609,61 +1675,57 @@ mod tests {
         // Marking the unread record read drops only its own count; an unknown
         // id is a no-op, and a needs-you thread is not an unread flag.
         let note = inbox.threads.iter().find(|t| t.key.is_none()).unwrap().id;
-        inbox.apply(&Op::MarkRead(note), 0);
-        inbox.apply(&Op::MarkRead(u64::MAX), 0);
+        inbox.apply(&Op::MarkRead(note), 0, "tui");
+        inbox.apply(&Op::MarkRead(u64::MAX), 0, "tui");
         assert_eq!(inbox.needs_you(), 1);
         let asks = find(&inbox, "asks").unwrap().id;
-        inbox.apply(&Op::MarkRead(asks), 0);
+        inbox.apply(&Op::MarkRead(asks), 0, "tui");
         assert_eq!(inbox.needs_you(), 1);
 
         // An archived thread is history: it never asks for anything.
         inbox.archive_owner("a-id");
         assert_eq!(inbox.needs_you(), 0);
 
-        // `D` clears notify records and leaves the dispatcher's threads.
-        inbox.apply(&Op::ClearNotify, 0);
+        // `D` clears notify records and leaves the owners' threads.
+        inbox.apply(&Op::ClearNotify, 0, "tui");
         assert_eq!(inbox.threads.len(), 3);
         assert!(inbox.threads.iter().all(|t| t.kind == Kind::Thread));
     }
 
     #[test]
-    fn toml_roundtrip() {
+    fn json_roundtrip() {
         let mut inbox = Inbox::default();
         push(&mut inbox, "a", rec("v1", Some("k"), Some("https://x/1")), true);
         push(&mut inbox, "b", rec("multi\nline \"q\"", None, None), true);
         push(&mut inbox, "a", Record { level: Level::Warn, at: 7, ..rec("v2", Some("k"), None) }, true);
         push(&mut inbox, "b", rec("read", None, None), false);
 
-        let text = inbox.to_toml().unwrap();
-        assert!(text.contains("version = 2"), "{text}");
-        let loaded = Inbox::from_toml(&text, &BTreeMap::new()).unwrap();
+        let text = inbox.to_json().unwrap();
+        assert!(text.contains("\"version\": 3"), "{text}");
+        let loaded = Inbox::from_json(&text).unwrap();
         // Thread ids survive, so selection and the open pane follow a reload.
         assert_eq!(loaded, inbox);
-        // Notify-only threads write exactly what they did before threads
-        // existed, so a v2 file from either build reads the same.
-        for added in ["kind =", "archived =", "title =", "updated_at =", "[[thread.entry]]"] {
-            assert!(!text.contains(added), "{added} in a notify-only file:\n{text}");
-        }
+        assert_eq!(loaded.to_json().unwrap(), text, "byte for byte, so an unchanged store isn't rewritten");
 
-        // Ids keep growing past the saved ones, so the cap's order holds.
+        // Ids keep growing past the saved ones.
         let mut loaded = loaded;
         let max_saved = inbox.threads.iter().flat_map(|t| &t.notes).map(|n| n.id).max().unwrap();
         push(&mut loaded, "a", rec("later", None, None), true);
         assert!(loaded.threads[0].notes[0].id > max_saved);
 
-        assert!(Inbox::from_toml("", &BTreeMap::new()).unwrap().threads.is_empty());
-        assert!(Inbox::from_toml(
-            "version = 2\n[[thread]]\nowner = \"a\"\n[[thread.note]]\nseq = 0\nlevel = \"loud\"\nat = 0\nmsg = \"x\"\n",
-            &BTreeMap::new()
-        )
-        .is_err());
+        // Another version, or none, is not this build's to read.
+        let v4 = text.replace("\"version\": 3", "\"version\": 4");
+        assert!(Inbox::from_json(&v4).unwrap_err().contains("version 4"));
+        assert!(Inbox::from_json("{}").is_err());
+        assert!(Inbox::from_json("").is_err());
+        let bad_level = r#"{"version":3,"threads":[{"id":1,"owner":"a","owner_name":"a","notes":[{"seq":0,"level":"loud","at":0,"msg":"x"}]}]}"#;
+        assert!(Inbox::from_json(bad_level).is_err());
     }
 
-    /// Thread records survive a save/load with every field, including the
-    /// nested host verb and the timeline (TOML wants tables after scalars, so
-    /// field order in `SavedThread` is load-bearing).
+    /// Owner threads survive a save/load with every field: the nested host
+    /// verb, compose, every feed item kind with its client, the events.
     #[test]
-    fn toml_roundtrip_with_threads() {
+    fn json_roundtrip_with_threads() {
         let mut inbox = Inbox::default();
         push(&mut inbox, "a", rec("a note", None, None), true);
         let full = ThreadPut {
@@ -1673,7 +1735,6 @@ mod tests {
             state: State::NeedsYou,
             status: Some("review".into()),
             child: Some("pr-1".into()),
-            message: Some("multi\nline \"q\"".into()),
             actions: vec![
                 Action {
                     id: "open".into(),
@@ -1686,24 +1747,132 @@ mod tests {
                     ..Action::default()
                 },
                 Action { id: "post".into(), label: "Post".into(), notify: true, ..Action::default() },
+                Action { id: "fin".into(), label: "Finish".into(), done: true, ..Action::default() },
             ],
-            reply: Some(Reply { placeholder: Some("next run".into()) }),
+            compose: Some(Compose { placeholder: Some("next run".into()), hint: Some("starts a run".into()) }),
+            message: Some("multi\nline \"q\"".into()),
+            reply: None,
         };
-        inbox.put("a-id", "a", 7, full);
+        inbox.put("a-id", "a", 7, full.clone());
         let id = find(&inbox, "pr-1").unwrap().id;
-        inbox.apply(&Op::Act { thread: id, action: "post".into() }, 8);
-        inbox.apply(&Op::Reply { thread: id, text: "multi \"q\" \\ x".into() }, 8);
-        inbox.put("a-id", "a", 9, ThreadPut { status: Some("merged".into()), ..put_body("pr-2") });
+        inbox.apply(&Op::Act { thread: id, action: "post".into() }, 8, "api:x");
+        inbox.apply(&Op::Reply { thread: id, text: "multi \"q\" \\ x".into() }, 8, "cli");
+        inbox.apply(&Op::Act { thread: id, action: "fin".into() }, 8, "tui");
+        inbox.apply(&Op::Reopen(id), 8, "tui");
+        inbox.put("a-id", "a", 9, ThreadPut { status: Some("merged".into()), message: None, ..full });
         inbox.archive_owner("a-id");
 
-        let text = inbox.to_toml().unwrap();
-        assert!(text.contains("[[thread.event]]"), "{text}");
-        let loaded = Inbox::from_toml(&text, &BTreeMap::new()).unwrap();
+        let text = inbox.to_json().unwrap();
+        assert!(text.contains("\"events\""), "{text}");
+        let loaded = Inbox::from_json(&text).unwrap();
         assert_eq!(loaded, inbox, "{text}");
-        // Event seqs count toward the id counter, so nothing minted later
+        assert_eq!(
+            feed(find(&loaded, "pr-1").unwrap()),
+            [
+                "message header-message: multi\nline \"q\" (withdrawn)",
+                "action post Post [api:x]",
+                "reply multi \"q\" \\ x [cli]",
+                "action fin Finish [tui]",
+                "done [tui]",
+                "reopen [tui]",
+                "state active -> needs-you",
+                "status review -> merged",
+            ]
+        );
+        // Every seq counts toward the id counter, so nothing minted later
         // reuses one.
-        let max = inbox.threads.iter().flat_map(|t| &t.events).map(|e| e.seq).max().unwrap();
+        let max = inbox.max_id().unwrap();
         assert!(loaded.next_id > max);
+    }
+
+    /// A v2 `inbox.toml`: notify threads come over with their notes, unread
+    /// and archived flags and ids; owner threads are dropped whole.
+    #[test]
+    fn imports_v2_notify_threads_and_drops_owner_threads() {
+        let v2 = r#"version = 2
+
+[[thread]]
+id = 4
+owner = "web-id"
+owner_name = "web"
+key = "pr-1"
+unread = true
+
+[[thread.note]]
+seq = 9
+level = "warn"
+at = 7
+link = "https://x/1"
+msg = "v2"
+
+[[thread.note]]
+seq = 3
+level = "info"
+at = 1
+msg = "v1"
+
+[[thread]]
+id = 5
+owner = "web-id"
+owner_name = "web"
+key = "pr-1"
+kind = "thread"
+unread = true
+title = "PR 1"
+state = "needs-you"
+message = "look"
+updated_at = 10
+
+[thread.reply]
+placeholder = "p"
+
+[[thread.action]]
+id = "go"
+label = "Go"
+
+[[thread.entry]]
+seq = 20
+at = 10
+kind = "message"
+text = "look"
+
+[[thread.event]]
+id = "e-0000000010-abcd"
+seq = 21
+kind = "reply"
+text = "hi"
+at = 10
+
+[[thread]]
+id = 6
+owner = "gone-id"
+owner_name = "gone"
+archived = true
+unread = false
+
+[[thread.note]]
+seq = 2
+level = "error"
+at = 0
+msg = "old"
+"#;
+        let mut inbox = Inbox::import_v2(v2, &BTreeMap::new()).unwrap();
+        assert_eq!(inbox.threads.len(), 2, "the owner thread is dropped");
+        let web = &inbox.threads[0];
+        assert_eq!((web.id, web.kind, web.owner.as_str(), web.key.as_deref()), (4, Kind::Notify, "web-id", Some("pr-1")));
+        assert_eq!(web.notes.iter().map(|n| n.id).collect::<Vec<_>>(), [9, 3]);
+        assert_eq!(web.head().unwrap().key.as_deref(), Some("pr-1"));
+        assert_eq!((web.head().unwrap().level, web.head().unwrap().link.as_deref()), (Level::Warn, Some("https://x/1")));
+        assert!(web.unread && !web.archived);
+        let gone = &inbox.threads[1];
+        assert!(gone.archived && !gone.unread);
+        assert!(inbox.events_for("web-id").is_empty(), "its events went with it");
+        // Ids keep growing past the imported ones; the result saves as v3.
+        push(&mut inbox, "web", rec("new", None, None), true);
+        assert!(inbox.threads[0].notes[0].id > 9 && inbox.threads[0].id > 6);
+        assert_eq!(Inbox::from_json(&inbox.to_json().unwrap()).unwrap(), inbox);
+        assert!(Inbox::import_v2("version = 2\n[[thread]]\nowner = \"a\"\n[[thread.note]]\nseq = 0\nlevel = \"loud\"\nat = 0\nmsg = \"x\"\n", &BTreeMap::new()).is_err());
+        assert!(Inbox::import_v2("", &BTreeMap::new()).unwrap().threads.is_empty());
     }
 
     /// The thread pr-1 from `web-id`, with a reply box and three buttons: a
@@ -1721,7 +1890,7 @@ mod tests {
                 },
                 Action { id: "fin".into(), label: "Finish".into(), done: true, ..Action::default() },
             ],
-            reply: Some(Reply { placeholder: None }),
+            compose: Some(Compose::default()),
             ..put_body("pr-1")
         };
         inbox.put("web-id", "web", 100, put);
@@ -1734,44 +1903,61 @@ mod tests {
     }
 
     #[test]
-    fn user_ops_add_an_entry_and_an_event() {
+    fn user_ops_add_feed_items_with_their_client_and_an_event() {
         let mut inbox = Inbox::default();
         let id = asking(&mut inbox);
-        let before = timeline(find(&inbox, "pr-1").unwrap()).len();
 
-        inbox.apply(&Op::Act { thread: id, action: "post".into() }, 200);
-        inbox.apply(&Op::Reply { thread: id, text: "  rename it  ".into() }, 201);
+        inbox.apply(&Op::Act { thread: id, action: "post".into() }, 200, "tui");
+        inbox.apply(&Op::Reply { thread: id, text: "  rename it  ".into() }, 201, "api:my-ext");
         let t = find(&inbox, "pr-1").unwrap();
         assert_eq!(t.state, Some(State::NeedsYou), "a plain action leaves the state to the dispatcher");
         assert_eq!(t.updated_at, 201);
-        assert_eq!(timeline(t)[before..], [("action", "Post replies"), ("reply", "rename it")]);
+        assert_eq!(feed(t), ["action post Post replies [tui]", "reply rename it [api:my-ext]"]);
         assert_eq!(events(&inbox), [
             (EventKind::Action, Some("post"), None),
             (EventKind::Reply, None, Some("rename it")),
         ]);
 
-        // `done: true`: the thread is done, and one `done` event names the button.
-        inbox.apply(&Op::Act { thread: id, action: "fin".into() }, 202);
+        // `done: true`: what was pressed, then the done marker; one `done`
+        // event names the button.
+        inbox.apply(&Op::Act { thread: id, action: "fin".into() }, 202, "cli");
         assert_eq!(find(&inbox, "pr-1").unwrap().state, Some(State::Done));
         assert_eq!(events(&inbox)[2], (EventKind::Done, Some("fin"), None));
         // Already done: `d` is no transition, so nothing at all.
         let snapshot = inbox.clone();
-        inbox.apply(&Op::MarkDone(id), 203);
+        inbox.apply(&Op::MarkDone(id), 203, "tui");
         assert_eq!(inbox, snapshot);
         // `u` reopens (active), and only a done thread.
-        inbox.apply(&Op::Reopen(id), 204);
-        inbox.apply(&Op::Reopen(id), 205);
+        inbox.apply(&Op::Reopen(id), 204, "tui");
+        inbox.apply(&Op::Reopen(id), 205, "tui");
         assert_eq!(find(&inbox, "pr-1").unwrap().state, Some(State::Active));
         // `d` on a live thread.
-        inbox.apply(&Op::MarkDone(id), 206);
+        inbox.apply(&Op::MarkDone(id), 206, "tui");
         let t = find(&inbox, "pr-1").unwrap();
         assert_eq!(t.state, Some(State::Done));
-        assert_eq!(
-            timeline(t)[before + 2..],
-            [("done", "Finish"), ("reopen", "reopened"), ("done", "marked done")]
-        );
+        assert_eq!(feed(t)[2..], ["action fin Finish [cli]", "done [cli]", "reopen [tui]", "done [tui]"]);
         assert_eq!(events(&inbox)[3..], [(EventKind::Reopen, None, None), (EventKind::Done, None, None)]);
         assert_eq!(t.events.iter().map(|e| e.at).collect::<Vec<_>>(), [200, 201, 202, 204, 206]);
+    }
+
+    /// The client is the user's audit: no event an owner can read carries it.
+    #[test]
+    fn the_client_never_reaches_the_owner() {
+        let mut inbox = Inbox::default();
+        let id = asking(&mut inbox);
+        inbox.apply(&Op::Act { thread: id, action: "post".into() }, 1, "api:secret-gui");
+        inbox.apply(&Op::Reply { thread: id, text: "hi".into() }, 2, "api:secret-gui");
+        inbox.apply(&Op::Act { thread: id, action: "fin".into() }, 3, "api:secret-gui");
+        inbox.apply(&Op::Reopen(id), 4, "api:secret-gui");
+        let events = inbox.events_for("web-id");
+        assert_eq!(events.len(), 4);
+        let json = serde_json::to_string(&events).unwrap();
+        assert!(!json.contains("client") && !json.contains("secret-gui"), "{json}");
+        // The thread ls shape doesn't carry it either.
+        let ls = serde_json::to_string(&inbox.threads_for("web-id")[0].to_put()).unwrap();
+        assert!(!ls.contains("secret-gui"), "{ls}");
+        // It is in the store, for the user.
+        assert!(inbox.to_json().unwrap().contains("api:secret-gui"));
     }
 
     #[test]
@@ -1787,28 +1973,27 @@ mod tests {
             Op::Reopen(id),
             Op::MarkDone(u64::MAX),
         ] {
-            inbox.apply(&op, 300);
+            inbox.apply(&op, 300, "tui");
         }
         assert_eq!(inbox, snapshot);
 
-        // No reply box: no reply.
-        let plain = put_body("plain");
-        inbox.put("web-id", "web", 100, plain);
+        // No compose: no reply.
+        inbox.put("web-id", "web", 100, put_body("plain"));
         let plain = find(&inbox, "plain").unwrap().id;
-        inbox.apply(&Op::Reply { thread: plain, text: "hi".into() }, 300);
+        inbox.apply(&Op::Reply { thread: plain, text: "hi".into() }, 300, "tui");
         assert!(find(&inbox, "plain").unwrap().events.is_empty());
 
         // A notify thread has nobody to answer it.
         push(&mut inbox, "web", rec("note", None, None), true);
         let note = inbox.threads.iter().find(|t| t.kind == Kind::Notify).unwrap().id;
-        inbox.apply(&Op::MarkDone(note), 300);
+        inbox.apply(&Op::MarkDone(note), 300, "tui");
         assert!(inbox.threads.iter().all(|t| t.events.is_empty() || t.key.as_deref() == Some("pr-1")));
 
         // Archived: read-only, no new events.
         inbox.archive_owner("web-id");
         let snapshot = inbox.clone();
-        inbox.apply(&Op::Act { thread: id, action: "post".into() }, 300);
-        inbox.apply(&Op::MarkDone(id), 300);
+        inbox.apply(&Op::Act { thread: id, action: "post".into() }, 300, "tui");
+        inbox.apply(&Op::MarkDone(id), 300, "tui");
         assert_eq!(inbox, snapshot);
     }
 
@@ -1816,7 +2001,7 @@ mod tests {
     fn a_long_reply_is_cut() {
         let mut inbox = Inbox::default();
         let id = asking(&mut inbox);
-        inbox.apply(&Op::Reply { thread: id, text: "é".repeat(MAX_REPLY + 5) }, 1);
+        inbox.apply(&Op::Reply { thread: id, text: "é".repeat(MAX_REPLY + 5) }, 1, "tui");
         assert_eq!(events(&inbox)[0].2.unwrap().chars().count(), MAX_REPLY);
     }
 
@@ -1826,7 +2011,7 @@ mod tests {
         let id = asking(&mut inbox);
         // Same second, many events: ids never repeat.
         for _ in 0..MAX_EVENTS {
-            inbox.apply(&Op::Act { thread: id, action: "post".into() }, 1_790_900_001);
+            inbox.apply(&Op::Act { thread: id, action: "post".into() }, 1_790_900_001, "tui");
         }
         let t = find(&inbox, "pr-1").unwrap();
         let mut ids: Vec<&str> = t.events.iter().map(|e| e.id.as_str()).collect();
@@ -1836,7 +2021,7 @@ mod tests {
         ids.dedup();
         assert_eq!(ids.len(), MAX_EVENTS);
         // Small times are zero-padded to the same shape.
-        inbox.apply(&Op::Reply { thread: id, text: "x".into() }, 5);
+        inbox.apply(&Op::Reply { thread: id, text: "x".into() }, 5, "tui");
         let last = &find(&inbox, "pr-1").unwrap().events.last().unwrap().id;
         assert!(last.starts_with("e-0000000005-"), "{last}");
     }
@@ -1846,7 +2031,7 @@ mod tests {
         let mut inbox = Inbox::default();
         let id = asking(&mut inbox);
         for i in 0..MAX_EVENTS + 3 {
-            inbox.apply(&Op::Reply { thread: id, text: format!("r{i}") }, i as u64);
+            inbox.apply(&Op::Reply { thread: id, text: format!("r{i}") }, i as u64, "tui");
         }
         let t = find(&inbox, "pr-1").unwrap();
         assert_eq!(t.events.len(), MAX_EVENTS);
@@ -1857,11 +2042,11 @@ mod tests {
     fn ack_is_idempotent_and_scoped_to_the_owner() {
         let mut inbox = Inbox::default();
         let id = asking(&mut inbox);
-        inbox.put("other-id", "other", 100, ThreadPut { reply: Some(Reply::default()), ..put_body("o") });
+        inbox.put("other-id", "other", 100, ThreadPut { compose: Some(Compose::default()), ..put_body("o") });
         let other = find(&inbox, "o").unwrap().id;
-        inbox.apply(&Op::Reply { thread: other, text: "theirs".into() }, 10);
-        inbox.apply(&Op::Reply { thread: id, text: "one".into() }, 11);
-        inbox.apply(&Op::Act { thread: id, action: "post".into() }, 11);
+        inbox.apply(&Op::Reply { thread: other, text: "theirs".into() }, 10, "tui");
+        inbox.apply(&Op::Reply { thread: id, text: "one".into() }, 11, "tui");
+        inbox.apply(&Op::Act { thread: id, action: "post".into() }, 11, "tui");
 
         let mine = inbox.events_for("web-id");
         assert_eq!(mine.iter().map(|(k, e)| (k.as_str(), e.kind)).collect::<Vec<_>>(), [
@@ -1881,51 +2066,46 @@ mod tests {
     }
 
     /// Events are delivery state: a dispatcher's re-put (even one that
-    /// changes the state back) leaves them and the timeline alone.
+    /// changes the state back) leaves them and the feed alone.
     #[test]
     fn events_survive_a_put() {
         let mut inbox = Inbox::default();
         let id = asking(&mut inbox);
-        inbox.apply(&Op::Act { thread: id, action: "fin".into() }, 200);
-        let entries = find(&inbox, "pr-1").unwrap().entries.len();
+        inbox.apply(&Op::Act { thread: id, action: "fin".into() }, 200, "tui");
+        let items = find(&inbox, "pr-1").unwrap().feed.len();
         let again = ThreadPut { status: Some("posting".into()), ..find(&inbox, "pr-1").unwrap().to_put() };
         let again = ThreadPut { state: State::NeedsYou, ..again };
         inbox.put("web-id", "web", 300, again);
         let t = find(&inbox, "pr-1").unwrap();
         assert_eq!(t.state, Some(State::NeedsYou), "the dispatcher owns the meaning");
         assert_eq!(t.events.len(), 1);
-        assert_eq!(t.entries.len(), entries + 2, "state + status entries appended, none lost");
-    }
-
-    /// Unacked events count toward the cap but are never what it evicts:
-    /// a done thread still holding events is kept whole.
-    #[test]
-    fn the_cap_keeps_pending_events() {
-        let mut inbox = Inbox::default();
-        let id = asking(&mut inbox);
-        inbox.apply(&Op::Act { thread: id, action: "fin".into() }, 200);
-        let weight = inbox.weight_for("web-id");
-        for i in 0..INBOX_INSTANCE_CAP {
-            push(&mut inbox, "web", rec(&format!("n{i}"), None, None), true);
-        }
-        assert_eq!(inbox.weight_for("web-id"), INBOX_INSTANCE_CAP);
-        let t = find(&inbox, "pr-1").expect("the done thread with an event stays");
-        assert_eq!(t.events.len(), 1);
-        assert!(t.entries.is_empty(), "its history went first ({weight} before)");
+        assert_eq!(t.feed.len(), items + 2, "state + status markers appended, none lost");
+        assert_eq!(feed(t)[items..], ["state done -> needs-you", "status running ci -> posting"]);
     }
 
     #[test]
     fn thread_ls_shape_round_trips_the_put() {
         let mut inbox = Inbox::default();
         asking(&mut inbox);
-        inbox.put("web-id", "web", 100, put_body("gone"));
+        inbox.put("web-id", "web", 100, ThreadPut { message: Some("hello".into()), ..put_body("gone") });
         inbox.put("other-id", "other", 100, put_body("theirs"));
         push(&mut inbox, "web", rec("note", Some("pr-1"), None), true);
         let mine: Vec<ThreadPut> = inbox.threads_for("web-id").iter().map(|t| t.to_put()).collect();
-        assert_eq!(mine.len(), 2, "dispatcher threads only, the owner's only");
+        assert_eq!(mine.len(), 2, "owner threads only, the owner's only");
+        for put in &mine {
+            let json = serde_json::to_string(put).unwrap();
+            assert_eq!(thread::parse(&json).as_ref(), Ok(put), "{json}");
+            assert!(!json.contains("null"), "absent fields are left out: {json}");
+        }
+        // v2 put compat: the header message and `reply` come back too.
+        let json = serde_json::to_string(&mine[0]).unwrap();
+        assert!(json.contains(r#""message":"hello""#), "{json}");
         let json = serde_json::to_string(&mine[1]).unwrap();
-        assert_eq!(thread::parse(&json).as_ref(), Ok(&mine[1]), "{json}");
-        assert!(!json.contains("null"), "absent fields are left out: {json}");
+        assert!(json.contains(r#""compose":{}"#) && json.contains(r#""reply":{}"#), "{json}");
+        // Re-putting what `ls` returned changes nothing.
+        for put in mine {
+            assert_eq!(inbox.put("web-id", "web", 999, put), PutOutcome::Unchanged);
+        }
         inbox.archive_owner("web-id");
         assert!(inbox.threads_for("web-id").is_empty());
     }
@@ -1940,9 +2120,9 @@ mod tests {
     }
 
     /// A v1 file (no `version`, threads keyed by instance name, the key on the
-    /// notes) loads with owners resolved through the state's names.
+    /// notes) imports with owners resolved through the state's names.
     #[test]
-    fn migrates_v1() {
+    fn imports_v1() {
         let v1 = "\
 [[thread]]
 instance = \"web\"
@@ -1969,7 +2149,7 @@ level = \"info\"
 at = 0
 msg = \"orphan\"
 ";
-        let mut inbox = Inbox::from_toml(v1, &names(&[("web", "web-abc1")])).unwrap();
+        let mut inbox = Inbox::import_v2(v1, &names(&[("web", "web-abc1")])).unwrap();
         assert_eq!(inbox.threads.len(), 2);
         let web = &inbox.threads[0];
         assert_eq!((web.owner.as_str(), web.owner_name.as_str()), ("web-abc1", "web"));
@@ -1989,8 +2169,7 @@ msg = \"orphan\"
         assert_ne!(web.id, gone.id);
         push(&mut inbox, "web", rec("new", None, None), true);
         assert!(inbox.threads[0].notes[0].id > 5);
-        // Re-reading what v1 became is a plain v2 load.
-        let text = inbox.to_toml().unwrap();
-        assert_eq!(Inbox::from_toml(&text, &BTreeMap::new()).unwrap(), inbox);
+        // What v1 became is a plain v3 store.
+        assert_eq!(Inbox::from_json(&inbox.to_json().unwrap()).unwrap(), inbox);
     }
 }

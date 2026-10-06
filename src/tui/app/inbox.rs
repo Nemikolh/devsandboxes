@@ -1,5 +1,5 @@
 //! Inbox tab: this dashboard's view of the shared store (`crate::inbox`,
-//! `inbox.toml`). The content comes from the store — loaded at startup,
+//! `inbox.json`). The content comes from the store — loaded at startup,
 //! reloaded whenever the file changes, since any dashboard or CLI may write
 //! it — and everything here is view state: the current view, the selection,
 //! the focused zone, all unit-testable without touching the file.
@@ -14,7 +14,7 @@
 //!
 //! The list is one row per thread, newest change first, filtered by a
 //! [`View`] (docs/inbox-threads.md, *Inbox UI* and *Inbox layout v2*). The
-//! thread pane beside it always shows the selected thread: its timeline, or a
+//! thread pane beside it always shows the selected thread: its feed, or a
 //! notify thread's earlier records. Keys go to one of three [`InboxFocus`]
 //! zones; the thread and its input shadow the dashboard keys.
 //!
@@ -34,7 +34,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use ratatui::layout::Rect;
 
 use crate::devsbd::notify::Level;
-use crate::inbox::{is_url, EntryKind, Inbox, Kind, Op, State, Thread};
+use crate::inbox::{feed, is_url, Inbox, ItemKind, Kind, Marker, Op, State, Thread};
 use crate::tui::textarea::TextArea;
 
 use super::view::{divider_pct, point_in};
@@ -287,16 +287,68 @@ fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn entry_label(kind: EntryKind) -> &'static str {
-    match kind {
-        EntryKind::Message => "message",
-        EntryKind::State => "state",
-        EntryKind::Status => "status",
-        EntryKind::Action => "action",
-        EntryKind::Reply => "reply",
-        EntryKind::Done => "done",
-        EntryKind::Reopen => "reopen",
+/// A state as the chip names it.
+fn state_name(state: State) -> &'static str {
+    match state {
+        State::NeedsYou => "needs you",
+        State::Active => "active",
+        State::Done => "done",
     }
+}
+
+/// A marker's one line, after its `·`.
+fn marker_text(m: &Marker) -> String {
+    match m {
+        Marker::Done { .. } => "done".into(),
+        Marker::Reopen { .. } => "reopened".into(),
+        Marker::State { from, to } => format!("{} → {}", state_name(*from), state_name(*to)),
+        Marker::Status { from: None, to: Some(to) } => format!("status: {}", one_line(to)),
+        Marker::Status { from, to } => format!(
+            "status: {} → {}",
+            from.as_deref().map_or("–".into(), one_line),
+            to.as_deref().map_or("–".into(), one_line)
+        ),
+    }
+}
+
+/// An owner thread's feed as pane lines, oldest first. A message or a reply
+/// is a dim stamp row (author, and a message's `(edited)`/`(withdrawn)`
+/// tag) over its full markdown, set off by blank lines; a withdrawn message
+/// keeps only its row. Actions and markers are one row each, run together.
+/// Step 14 rewrites this (newest first, pinned header).
+fn feed_lines(t: &Thread, utc_offset: i64) -> Vec<PaneLine> {
+    let mut out = Vec::new();
+    let mut after_block = false;
+    for item in &t.feed {
+        let at = stamp(item.at, utc_offset);
+        let block = matches!(item.kind, ItemKind::Message { .. } | ItemKind::Reply { .. });
+        if !out.is_empty() && (block || after_block) {
+            out.push(Vec::new());
+        }
+        after_block = block;
+        match &item.kind {
+            ItemKind::Message { blocks, edited, withdrawn, .. } => {
+                let tag = match (edited, withdrawn) {
+                    (_, true) => "  (withdrawn)",
+                    (true, false) => "  (edited)",
+                    _ => "",
+                };
+                out.push(line(Tone::Dim, format!("{at}  {}{tag}", t.owner_name)));
+                if !withdrawn {
+                    out.push(line(Tone::Markdown, feed::markdown_of(blocks)));
+                }
+            }
+            ItemKind::Reply { text, .. } => {
+                out.push(line(Tone::Dim, format!("{at}  you")));
+                out.push(line(Tone::Markdown, text.clone()));
+            }
+            ItemKind::Action { label, .. } => {
+                out.push(vec![(Tone::Dim, format!("{at}  ")), (Tone::Text, format!("you: {label}"))]);
+            }
+            ItemKind::Marker(m) => out.push(line(Tone::Dim, format!("{at}  · {}", marker_text(m)))),
+        }
+    }
+    out
 }
 
 /// "2 events waiting for web": what the owner hasn't pulled yet.
@@ -309,9 +361,9 @@ fn pending_line(t: &Thread) -> Option<String> {
 }
 
 /// Everything the thread pane shows for `t` above its input: the header
-/// fields, the message, the timeline (a notify thread's records, oldest first
-/// like a dispatcher's entries), then the numbered actions. Pure, so what the
-/// pane says is unit-testable.
+/// fields, an owner thread's feed ([`feed_lines`]) or a notify thread's
+/// message and earlier records (oldest first), then the numbered actions.
+/// Pure, so what the pane says is unit-testable.
 pub fn pane_lines(t: &Thread, child: Option<&ChildInfo>, utc_offset: i64) -> Vec<PaneLine> {
     let mut out = vec![line(Tone::Title, title_of(t))];
     let mut head = chip(t);
@@ -337,52 +389,40 @@ pub fn pane_lines(t: &Thread, child: Option<&ChildInfo>, utc_offset: i64) -> Vec
         }
         out.push(row);
     }
-    let message = match t.kind {
-        Kind::Thread => t.message.as_deref(),
-        Kind::Notify => t.head().map(|r| r.msg.as_str()),
-    };
-    if let Some(message) = message {
-        out.push(Vec::new());
-        out.push(line(Tone::Markdown, message));
-    }
-
-    let timeline: Vec<PaneLine> = match t.kind {
-        // A reply is the user's own words, possibly several lines: its stamp
-        // row, then the full text as a document. The rest stay one row.
-        Kind::Thread => t
-            .entries
-            .iter()
-            .flat_map(|e| {
-                let label = format!("{}  {:7} ", stamp(e.at, utc_offset), entry_label(e.kind));
-                match e.kind {
-                    EntryKind::Reply => vec![line(Tone::Dim, label.trim_end()), line(Tone::Markdown, e.text.clone())],
-                    _ => vec![vec![(Tone::Dim, label), (Tone::Text, one_line(&e.text))]],
-                }
-            })
-            .collect(),
-        // The head is the message above; the timeline is what came before.
-        Kind::Notify => t
-            .notes
-            .iter()
-            .skip(1)
-            .rev()
-            .map(|n| {
-                let r = &n.record;
-                vec![
-                    (Tone::Dim, format!("{}  ", stamp(r.at, utc_offset))),
-                    (Tone::Level(r.level), format!("{:7} ", r.level.as_str())),
-                    (Tone::Text, one_line(&r.msg)),
-                ]
-            })
-            .collect(),
-    };
-    if !timeline.is_empty() {
-        out.push(Vec::new());
-        out.push(line(Tone::Dim, match t.kind {
-            Kind::Thread => "timeline",
-            Kind::Notify => "earlier",
-        }));
-        out.extend(timeline);
+    match t.kind {
+        Kind::Thread => {
+            let feed = feed_lines(t, utc_offset);
+            if !feed.is_empty() {
+                out.push(Vec::new());
+                out.extend(feed);
+            }
+        }
+        Kind::Notify => {
+            if let Some(r) = t.head() {
+                out.push(Vec::new());
+                out.push(line(Tone::Markdown, r.msg.as_str()));
+            }
+            // The head is the message above; the rest is what came before.
+            let earlier: Vec<PaneLine> = t
+                .notes
+                .iter()
+                .skip(1)
+                .rev()
+                .map(|n| {
+                    let r = &n.record;
+                    vec![
+                        (Tone::Dim, format!("{}  ", stamp(r.at, utc_offset))),
+                        (Tone::Level(r.level), format!("{:7} ", r.level.as_str())),
+                        (Tone::Text, one_line(&r.msg)),
+                    ]
+                })
+                .collect();
+            if !earlier.is_empty() {
+                out.push(Vec::new());
+                out.push(line(Tone::Dim, "earlier"));
+                out.extend(earlier);
+            }
+        }
     }
 
     if let Some(pending) = pending_line(t) {
@@ -439,7 +479,7 @@ impl App {
         let selected = self.selected_inbox_id();
         // An event-enqueuing op is the store's to stamp (see the module doc).
         if !op.enqueues_event() {
-            self.inbox.content.apply(&op, 0);
+            self.inbox.content.apply(&op, 0, "tui");
         }
         self.pending_inbox.push(op);
         self.reselect_inbox(selected);
@@ -713,7 +753,7 @@ impl App {
         if self.refuse_user_op(t) {
             return;
         }
-        if t.reply.is_none() {
+        if t.compose.is_none() {
             self.status = Some("this thread takes no replies".into());
             return;
         }
@@ -958,7 +998,7 @@ mod tests {
     use super::super::test_support::*;
     use super::*;
     use crate::devsbd::notify::Record;
-    use crate::inbox::{Action, Reply, ThreadPut};
+    use crate::inbox::{Action, Compose, ThreadPut};
 
     fn rec(msg: &str, key: Option<&str>, link: Option<&str>) -> Record {
         Record {
@@ -1015,7 +1055,7 @@ mod tests {
         push(app, "a", Record { at: 50, ..rec("read note", None, None) });
         let id = thread(app, "read note").id;
         let mut inbox = app.inbox.content.clone();
-        inbox.apply(&Op::MarkRead(id), 0);
+        inbox.apply(&Op::MarkRead(id), 0, "tui");
         app.set_inbox(inbox);
     }
 
@@ -1125,7 +1165,7 @@ mod tests {
         let mut inbox = app.inbox.content.clone();
         let ids: Vec<u64> = inbox.threads.iter().map(|t| t.id).collect();
         for id in &ids[1..] {
-            inbox.apply(&Op::RemoveThread(*id), 0);
+            inbox.apply(&Op::RemoveThread(*id), 0, "tui");
         }
         app.set_inbox(inbox);
         assert_eq!(app.selected(), 0);
@@ -1137,7 +1177,7 @@ mod tests {
     #[test]
     fn a_focused_thread_keeps_the_cursor_through_new_arrivals() {
         let mut app = new_app();
-        put(&mut app, "d", 10, ThreadPut { reply: Some(Reply::default()), ..body("asks", State::NeedsYou) });
+        put(&mut app, "d", 10, ThreadPut { compose: Some(Compose::default()), ..body("asks", State::NeedsYou) });
         inbox_tab(&mut app);
         app.on_key(key(KeyCode::Char('r')));
         typed(&mut app, "half");
@@ -1175,7 +1215,7 @@ mod tests {
         app.on_key(key(KeyCode::Right)); // Active
         app.on_key(key(KeyCode::Right)); // Done
         let mut inbox = app.inbox.content.clone();
-        inbox.apply(&Op::RemoveThread(thread(&app, "over").id), 0);
+        inbox.apply(&Op::RemoveThread(thread(&app, "over").id), 0, "tui");
         app.set_inbox(inbox);
         assert_eq!(selected(&app), None);
         app.on_key(key(KeyCode::Enter));
@@ -1306,7 +1346,7 @@ mod tests {
         // The selected thread removed elsewhere: the next one is read.
         app.on_key(key(KeyCode::Enter));
         let mut inbox = app.inbox.content.clone();
-        inbox.apply(&Op::RemoveThread(asks), 0);
+        inbox.apply(&Op::RemoveThread(asks), 0, "tui");
         app.set_inbox(inbox);
         assert_eq!(selected(&app).as_deref(), Some("other"));
         assert_eq!(app.take_pending_inbox(), [Op::MarkRead(other)]);
@@ -1363,7 +1403,7 @@ mod tests {
     #[test]
     fn leaving_the_tab_resets_focus_and_drops_the_reply_box() {
         let mut app = new_app();
-        open_asks(&mut app, Some(Reply::default()));
+        open_asks(&mut app, Some(Compose::default()));
         app.on_key(key(KeyCode::Char('r')));
         typed(&mut app, "half");
         app.set_tab(Tab::Instances);
@@ -1455,9 +1495,10 @@ mod tests {
             link: Some("https://x/pr/1".into()),
             status: Some("review".into()),
             child: Some("pr-1".into()),
+            // v2 put compat, removed in step 13: the header message.
             message: Some("drafts ready".into()),
             actions,
-            reply: Some(Reply { placeholder: Some("next run".into()) }),
+            compose: Some(Compose { placeholder: Some("next run".into()), hint: Some("starts a run".into()) }),
             ..body("asks", State::NeedsYou)
         };
         put(&mut app, "d", 10, full);
@@ -1476,7 +1517,7 @@ mod tests {
         assert!(has("child  inst0  running"), "{text:#?}");
         assert!(has("https://x/pr/1"));
         assert!(has("drafts ready"));
-        assert!(has("timeline"));
+        assert!(has(&format!("{}  d", stamp(10, 0))), "the message's stamp row names its author: {text:#?}");
         assert!(has("[1] Open draft  ⌂ host"), "{text:#?}");
         assert!(has("[2] Post replies  → d") && !has("[2] Post replies  ⌂"));
         // Every action is runnable now: bold number, plain label.
@@ -1487,6 +1528,7 @@ mod tests {
         }
         assert!(has("[3] Done  → d  ✓ done"), "{text:#?}");
         assert!(!has("next run"), "the input shows the placeholder, not the content");
+        assert!(!has("starts a run"), "the hint waits for step 14");
         assert!(!has("waiting for"), "no events yet");
 
         // A child key the owner doesn't have stays visible, unresolved.
@@ -1494,6 +1536,60 @@ mod tests {
         let child = app.thread_child(&t).unwrap();
         assert_eq!(child.name, None);
         assert!(pane_lines(&t, Some(&child), 0).iter().any(|l| l.iter().any(|(_, s)| s.contains("no such child"))));
+    }
+
+    /// The feed in first-insert order: messages under their author's stamp
+    /// row with an `(edited)`/`(withdrawn)` tag, the user's items as `you`,
+    /// markers as one dim `·` row each.
+    #[test]
+    fn pane_lines_render_the_feed() {
+        let mut app = new_app();
+        let v2 = |message: Option<&str>, state: State, status: &str| ThreadPut {
+            status: Some(status.into()),
+            message: message.map(str::to_string),
+            compose: Some(Compose::default()),
+            actions: vec![Action { id: "post".into(), label: "Post replies".into(), ..Action::default() }],
+            ..body("asks", state)
+        };
+        put(&mut app, "d", 10, v2(Some("one"), State::Active, "running"));
+        let id = thread(&app, "asks").id;
+        let mut inbox = app.inbox.content.clone();
+        inbox.apply(&Op::Act { thread: id, action: "post".into() }, 20, "tui");
+        inbox.apply(&Op::MarkDone(id), 20, "tui");
+        inbox.apply(&Op::Reopen(id), 20, "tui");
+        inbox.put("d-id", "d", 30, v2(Some("two"), State::NeedsYou, "review"));
+        app.set_inbox(inbox);
+        let text: Vec<String> = pane_lines(thread(&app, "asks"), None, 0)
+            .iter()
+            .map(|l| l.iter().map(|(_, s)| s.as_str()).collect())
+            .collect();
+        let (s10, s20, s30) = (stamp(10, 0), stamp(20, 0), stamp(30, 0));
+        let start = text.iter().position(|l| l.starts_with(&s10)).unwrap();
+        assert_eq!(text[start..start + 8], [
+            format!("{s10}  d  (edited)"),
+            "two".into(),
+            String::new(),
+            format!("{s20}  you: Post replies"),
+            format!("{s20}  · done"),
+            format!("{s20}  · reopened"),
+            format!("{s30}  · active → needs you"),
+            format!("{s30}  · status: running → review"),
+        ], "{text:#?}");
+        // Markers are dim; the message is a markdown document.
+        let lines = pane_lines(thread(&app, "asks"), None, 0);
+        assert_eq!(lines[start + 1], [(Tone::Markdown, "two".to_string())]);
+        assert_eq!(lines[start + 4], [(Tone::Dim, format!("{s20}  · done"))]);
+
+        // Withdrawn: its row stays, tagged, without the text.
+        let mut inbox = app.inbox.content.clone();
+        inbox.put("d-id", "d", 40, v2(None, State::NeedsYou, "review"));
+        app.set_inbox(inbox);
+        let text: Vec<String> = pane_lines(thread(&app, "asks"), None, 0)
+            .iter()
+            .map(|l| l.iter().map(|(_, s)| s.as_str()).collect())
+            .collect();
+        assert!(text.contains(&format!("{s10}  d  (withdrawn)")), "{text:#?}");
+        assert!(!text.iter().any(|l| l == "two"), "{text:#?}");
     }
 
     #[test]
@@ -1516,7 +1612,7 @@ mod tests {
     fn flush(app: &mut App, now: u64) -> Vec<Op> {
         let ops = app.take_pending_inbox();
         let mut inbox = app.inbox.content.clone();
-        ops.iter().for_each(|op| inbox.apply(op, now));
+        ops.iter().for_each(|op| inbox.apply(op, now, "tui"));
         app.set_inbox(inbox);
         ops
     }
@@ -1529,8 +1625,8 @@ mod tests {
 
     /// `asks` from `d`, taking replies, its thread focused, its read mark
     /// flushed.
-    fn open_asks(app: &mut App, reply: Option<Reply>) -> u64 {
-        put(app, "d", 10, ThreadPut { reply, ..body("asks", State::NeedsYou) });
+    fn open_asks(app: &mut App, compose: Option<Compose>) -> u64 {
+        put(app, "d", 10, ThreadPut { compose, ..body("asks", State::NeedsYou) });
         inbox_tab(app);
         app.on_key(key(KeyCode::Enter));
         flush(app, 10);
@@ -1540,7 +1636,7 @@ mod tests {
     #[test]
     fn r_focuses_the_input_which_sends_replies_and_stays() {
         let mut app = new_app();
-        let id = open_asks(&mut app, Some(Reply { placeholder: Some("next run".into()) }));
+        let id = open_asks(&mut app, Some(Compose { placeholder: Some("next run".into()), hint: None }));
         app.on_key(key(KeyCode::Char('r')));
         assert_eq!(app.inbox.focus, InboxFocus::Input);
         let rb = app.inbox.reply.as_ref().expect("reply box open");
@@ -1573,7 +1669,7 @@ mod tests {
             .iter()
             .map(|l| l.iter().map(|(_, s)| s.as_str()).collect())
             .collect();
-        assert!(text.windows(2).any(|w| w[0].ends_with("reply") && w[1] == ">do q1"), "{text:#?}");
+        assert!(text.windows(2).any(|w| w[0].ends_with("  you") && w[1] == ">do q1"), "{text:#?}");
         assert!(text.contains(&"1 event waiting for d".to_string()), "{text:#?}");
     }
 
@@ -1605,20 +1701,20 @@ mod tests {
     #[test]
     fn a_multi_line_reply_keeps_its_lines_as_markdown() {
         let mut app = new_app();
-        let id = open_asks(&mut app, Some(Reply::default()));
+        let id = open_asks(&mut app, Some(Compose::default()));
         let mut inbox = app.inbox.content.clone();
-        inbox.apply(&Op::Reply { thread: id, text: "first line\n\n- a\n- b".into() }, 20);
+        inbox.apply(&Op::Reply { thread: id, text: "first line\n\n- a\n- b".into() }, 20, "tui");
         app.set_inbox(inbox);
         let lines = pane_lines(thread(&app, "asks"), None, 0);
-        let at = lines.iter().position(|l| l.len() == 1 && l[0].0 == Tone::Dim && l[0].1.ends_with("reply")).unwrap();
-        assert_eq!(lines[at][0].1, format!("{}  reply", stamp(20, 0)));
+        let at = lines.iter().position(|l| l.len() == 1 && l[0].0 == Tone::Dim && l[0].1.ends_with("  you")).unwrap();
+        assert_eq!(lines[at][0].1, format!("{}  you", stamp(20, 0)));
         assert_eq!(lines[at + 1], [(Tone::Markdown, "first line\n\n- a\n- b".to_string())]);
     }
 
     #[test]
     fn the_reply_box_cancels_and_ignores_empty() {
         let mut app = new_app();
-        open_asks(&mut app, Some(Reply::default()));
+        open_asks(&mut app, Some(Compose::default()));
         app.on_key(key(KeyCode::Char('r')));
         // Empty (or blank) enter: nothing sent, the box stays.
         typed(&mut app, "  ");
@@ -1639,13 +1735,13 @@ mod tests {
     #[test]
     fn a_selection_change_drops_the_reply_box() {
         let mut app = new_app();
-        open_asks(&mut app, Some(Reply::default()));
+        open_asks(&mut app, Some(Compose::default()));
         put(&mut app, "d", 20, body("other", State::NeedsYou));
         app.on_key(key(KeyCode::Char('r')));
         typed(&mut app, "half");
         // The thread is removed under the input: the pane moves on.
         let mut inbox = app.inbox.content.clone();
-        inbox.apply(&Op::RemoveThread(thread(&app, "asks").id), 0);
+        inbox.apply(&Op::RemoveThread(thread(&app, "asks").id), 0, "tui");
         app.set_inbox(inbox);
         assert_eq!(selected(&app).as_deref(), Some("other"));
         assert!(app.inbox.reply.is_none());
@@ -1655,7 +1751,7 @@ mod tests {
     #[test]
     fn m_in_the_thread_toggles_raw_for_every_thread() {
         let mut app = new_app();
-        open_asks(&mut app, Some(Reply::default()));
+        open_asks(&mut app, Some(Compose::default()));
         put(&mut app, "d", 20, body("other", State::NeedsYou));
         app.on_key(key(KeyCode::Char('m')));
         assert!(app.inbox.raw);
@@ -1711,15 +1807,15 @@ mod tests {
         assert_eq!(t.events.len(), 2);
         let text: Vec<String> =
             pane_lines(t, None, 0).iter().map(|l| l.iter().map(|(_, s)| s.as_str()).collect()).collect();
-        assert!(text.iter().any(|l| l.contains("done") && l.ends_with("marked done")), "{text:#?}");
-        assert!(text.iter().any(|l| l.contains("reopen") && l.ends_with("reopened")), "{text:#?}");
+        assert!(text.contains(&format!("{}  · done", stamp(20, 0))), "{text:#?}");
+        assert!(text.contains(&format!("{}  · reopened", stamp(30, 0))), "{text:#?}");
         assert!(text.contains(&"2 events waiting for d".to_string()), "{text:#?}");
     }
 
     #[test]
     fn archived_threads_take_no_user_ops() {
         let mut app = new_app();
-        put(&mut app, "d", 10, ThreadPut { reply: Some(Reply::default()), ..body("asks", State::NeedsYou) });
+        put(&mut app, "d", 10, ThreadPut { compose: Some(Compose::default()), ..body("asks", State::NeedsYou) });
         let mut inbox = app.inbox.content.clone();
         inbox.archive_owner("d-id");
         app.set_inbox(inbox);
@@ -1925,7 +2021,7 @@ mod tests {
     #[test]
     fn click_pane_and_input_focus_them() {
         let mut app = new_app();
-        put(&mut app, "d", 10, ThreadPut { reply: Some(Reply::default()), ..body("asks", State::NeedsYou) });
+        put(&mut app, "d", 10, ThreadPut { compose: Some(Compose::default()), ..body("asks", State::NeedsYou) });
         inbox_tab(&mut app);
         click(&mut app, 60, 10);
         assert_eq!(app.inbox.focus, InboxFocus::Thread);

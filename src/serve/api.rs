@@ -2,8 +2,9 @@
 //! handler per method, each a call into `inbox::ops`, `snapshot`, or the
 //! daemon's bridges and forwards (behind [`Bridging`] / [`Forwarding`]). Params
 //! parse through serde structs; results are explicit wire views
-//! ([`ThreadSummary`], [`ThreadDetail`]), never the store model, whose TOML
-//! shape is internal and is replaced at store v3.
+//! ([`ThreadSummary`], [`ThreadDetail`]), never the store model, whose JSON
+//! shape is internal (and carries what the wire must not, e.g. the client
+//! behind each user item).
 //!
 //! No sockets here: [`call`] is a function of the method, its params and a
 //! [`Ctx`] (the store path), so every handler is tested against a temp store.
@@ -25,12 +26,15 @@ use serde_json::{Value, json};
 
 use super::forwards::{AddRequest, Added, ForwardRow, Removed};
 use crate::inbox::thread::HostVerb;
-use crate::inbox::{EntryKind, Inbox, Kind, Op, Thread, View, ops};
+use crate::inbox::{Block, FeedItem, Inbox, ItemKind, Kind, Marker, Op, Thread, View, ops};
 
 /// What a handler needs from the daemon. The store path is injectable so
 /// tests (and a test daemon) use their own file.
 pub struct Ctx<'a> {
     pub inbox: &'a Path,
+    /// Who's calling, as the store records it on the user's feed items
+    /// ([`audit_client`] of the hello's `client`). Never shown to owners.
+    pub client: &'a str,
     /// The bridges `bridges.ensure` acts on; `None` on a daemon that runs no
     /// host side (tests).
     pub bridges: Option<&'a dyn Bridging>,
@@ -186,6 +190,18 @@ pub fn topics(params: Value) -> Result<Vec<Topic>, ApiError> {
         .collect()
 }
 
+/// The client name the store records for a connection whose hello said
+/// `hello`: the dashboard (`tui`) and the CLI (`cli`) as themselves, every
+/// other client as `api:<name>` (an `api:` prefix isn't doubled).
+pub fn audit_client(hello: &str) -> String {
+    match hello {
+        "tui" | "cli" => hello.to_string(),
+        "" => "api".to_string(),
+        name if name.starts_with("api:") => name.to_string(),
+        name => format!("api:{name}"),
+    }
+}
+
 // ---- wire views -----------------------------------------------------------
 
 /// One row of `inbox.threads.list`, and the head of `inbox.thread.get`.
@@ -227,12 +243,11 @@ pub struct ThreadDetail {
     pub link: Option<String>,
     /// Key of the dispatcher child the thread is about.
     pub child: Option<String>,
-    pub message: Option<String>,
     /// Present when the thread takes free-text replies.
-    pub reply: Option<ReplyView>,
+    pub compose: Option<ComposeView>,
     pub actions: Vec<ActionView>,
-    /// A dispatcher thread's timeline, oldest first.
-    pub entries: Vec<EntryView>,
+    /// An owner thread's feed, oldest first (first-insert order).
+    pub feed: Vec<FeedItemView>,
     /// A notify thread's records, newest first (the first is the head).
     pub notes: Vec<NoteView>,
     /// Events the owner hasn't acked yet.
@@ -240,8 +255,10 @@ pub struct ThreadDetail {
 }
 
 #[derive(Debug, Serialize)]
-pub struct ReplyView {
+pub struct ComposeView {
     pub placeholder: Option<String>,
+    /// What sending does now, one line under the box.
+    pub hint: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -258,14 +275,60 @@ pub struct ActionView {
     pub sends_event: bool,
 }
 
+/// One feed item, tagged by `type`. `seq` is the arrival order across the
+/// whole Inbox, `at` unix seconds of first insert. The client that made a
+/// user item is the store's, not the wire's.
 #[derive(Debug, Serialize)]
-pub struct EntryView {
-    /// Arrival order across the whole Inbox.
-    pub seq: u64,
-    pub at: u64,
-    /// `message` | `state` | `status` | `action` | `reply` | `done` | `reopen`.
-    pub kind: &'static str,
-    pub text: String,
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum FeedItemView {
+    /// From the owner.
+    Message { seq: u64, at: u64, id: String, blocks: Vec<BlockView>, edited: bool, withdrawn: bool },
+    Reply { seq: u64, at: u64, text: String },
+    Action { seq: u64, at: u64, action: String, label: String },
+    /// `marker`: `done` | `reopen` (the user's; no `from`/`to`), `state` |
+    /// `status` (the owner's change, `from` -> `to`).
+    Marker { seq: u64, at: u64, marker: &'static str, from: Option<String>, to: Option<String> },
+}
+
+/// One block of a message, tagged by `type`.
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum BlockView {
+    Markdown { text: String },
+}
+
+impl FeedItemView {
+    pub fn of(item: &FeedItem) -> Self {
+        let (seq, at) = (item.seq, item.at);
+        match &item.kind {
+            ItemKind::Message { id, blocks, edited, withdrawn } => FeedItemView::Message {
+                seq,
+                at,
+                id: id.clone(),
+                blocks: blocks
+                    .iter()
+                    .map(|b| match b {
+                        Block::Markdown { text } => BlockView::Markdown { text: text.clone() },
+                    })
+                    .collect(),
+                edited: *edited,
+                withdrawn: *withdrawn,
+            },
+            ItemKind::Reply { text, .. } => FeedItemView::Reply { seq, at, text: text.clone() },
+            ItemKind::Action { action, label, .. } => {
+                FeedItemView::Action { seq, at, action: action.clone(), label: label.clone() }
+            }
+            ItemKind::Marker(m) => {
+                let (marker, from, to) = match m {
+                    Marker::Done { .. } => ("done", None, None),
+                    Marker::Reopen { .. } => ("reopen", None, None),
+                    Marker::State { from, to } => ("state", Some(from.as_str().to_string()), Some(to.as_str().to_string())),
+                    Marker::Status { from, to } => ("status", from.clone(), to.clone()),
+                };
+                FeedItemView::Marker { seq, at, marker, from, to }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -291,18 +354,6 @@ fn kind_str(kind: Kind) -> &'static str {
     match kind {
         Kind::Notify => "notify",
         Kind::Thread => "thread",
-    }
-}
-
-fn entry_kind_str(kind: EntryKind) -> &'static str {
-    match kind {
-        EntryKind::Message => "message",
-        EntryKind::State => "state",
-        EntryKind::Status => "status",
-        EntryKind::Action => "action",
-        EntryKind::Reply => "reply",
-        EntryKind::Done => "done",
-        EntryKind::Reopen => "reopen",
     }
 }
 
@@ -347,8 +398,10 @@ impl ThreadDetail {
             summary: ThreadSummary::of(t),
             link: t.link.clone().or_else(|| t.head().and_then(|r| r.link.clone())),
             child: t.child.clone(),
-            message: t.message.clone(),
-            reply: t.reply.as_ref().map(|r| ReplyView { placeholder: r.placeholder.clone() }),
+            compose: t
+                .compose
+                .as_ref()
+                .map(|c| ComposeView { placeholder: c.placeholder.clone(), hint: c.hint.clone() }),
             actions: t
                 .actions
                 .iter()
@@ -360,11 +413,7 @@ impl ThreadDetail {
                     sends_event: a.enqueues_event(),
                 })
                 .collect(),
-            entries: t
-                .entries
-                .iter()
-                .map(|e| EntryView { seq: e.seq, at: e.at, kind: entry_kind_str(e.kind), text: e.text.clone() })
-                .collect(),
+            feed: t.feed.iter().map(FeedItemView::of).collect(),
             notes: t
                 .notes
                 .iter()
@@ -448,7 +497,7 @@ fn ok() -> Answer {
 
 /// Check and apply in one store write; see the module doc.
 fn mutate(ctx: &Ctx, decide: impl FnOnce(&Inbox) -> Result<Vec<Op>, ApiError>) -> Answer {
-    ops::apply_if(ctx.inbox, decide).map_err(ApiError::internal)??;
+    ops::apply_if(ctx.inbox, ctx.client, decide).map_err(ApiError::internal)??;
     ok()
 }
 
@@ -526,7 +575,7 @@ fn reply(p: ReplyParams, ctx: &Ctx) -> Answer {
     }
     mutate(ctx, |inbox| {
         let t = user_target(inbox, &p.addr)?;
-        if t.reply.is_none() {
+        if t.compose.is_none() {
             return Err(ApiError::denied(format!("thread {} takes no replies", t.id)));
         }
         Ok(vec![Op::Reply { thread: t.id, text: p.text }])
@@ -716,12 +765,12 @@ fn forwards_rm(p: ForwardsRmParams, ctx: &Ctx) -> Answer {
 mod tests {
     use super::*;
     use crate::devsbd::notify::{Level, Record};
-    use crate::inbox::{store, Action, Reply, State, ThreadPut};
+    use crate::inbox::{store, Action, Compose, State, ThreadPut};
 
     fn store_path(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("devsandbox-api-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        dir.join("inbox.toml")
+        dir.join("inbox.json")
     }
 
     fn action(id: &str) -> Action {
@@ -733,7 +782,7 @@ mod tests {
             key: key.into(),
             title: format!("{key} title"),
             state,
-            reply: Some(Reply::default()),
+            compose: Some(Compose::default()),
             actions: vec![action("go")],
             ..ThreadPut::default()
         };
@@ -746,7 +795,7 @@ mod tests {
     }
 
     fn run(path: &Path, method: &str, params: Value) -> Answer {
-        call(method, params, &Ctx { inbox: path, bridges: None, forwards: None })
+        call(method, params, &Ctx { inbox: path, client: "api:test", bridges: None, forwards: None })
     }
 
     /// Records what `bridges.ensure` asked for; knows instance `web` only.
@@ -786,7 +835,7 @@ mod tests {
         let path = store_path("ensure-wait");
         let not = Readiness { ready: false, error: Some("helper in devsandbox-web is outdated".into()) };
         let fake = FakeBridges { readiness: Some(not), ..FakeBridges::default() };
-        let ensure = |params: Value| call("bridges.ensure", params, &Ctx { inbox: &path, bridges: Some(&fake), forwards: None });
+        let ensure = |params: Value| call("bridges.ensure", params, &Ctx { inbox: &path, client: "api:test", bridges: Some(&fake), forwards: None });
 
         assert_eq!(ensure(json!({"instance": "web"})).unwrap(), json!({"ok": true}), "no wait: unchanged");
         assert!(fake.waits.borrow().is_empty());
@@ -806,7 +855,7 @@ mod tests {
         assert_eq!(fake.woken.borrow().len(), 4, "a bad wait wakes nothing");
 
         let ready = FakeBridges { readiness: Some(Readiness { ready: true, error: None }), ..FakeBridges::default() };
-        let r = call("bridges.ensure", json!({"instance": "web", "wait": 10}), &Ctx { inbox: &path, bridges: Some(&ready), forwards: None });
+        let r = call("bridges.ensure", json!({"instance": "web", "wait": 10}), &Ctx { inbox: &path, client: "api:test", bridges: Some(&ready), forwards: None });
         assert_eq!(r.unwrap(), json!({"ok": true, "ready": true, "error": null}));
     }
 
@@ -814,7 +863,7 @@ mod tests {
     fn bridges_ensure_records_the_agent_and_reconciles_the_instance() {
         let path = store_path("ensure");
         let fake = FakeBridges::default();
-        let ensure = |params: Value| call("bridges.ensure", params, &Ctx { inbox: &path, bridges: Some(&fake), forwards: None });
+        let ensure = |params: Value| call("bridges.ensure", params, &Ctx { inbox: &path, client: "api:test", bridges: Some(&fake), forwards: None });
 
         assert_eq!(ensure(json!({"instance": "web", "agent": "/tmp/ssh-x/agent.1"})).unwrap(), json!({"ok": true}));
         assert_eq!(ensure(json!({"instance": "web", "agent": null})).unwrap(), json!({"ok": true}));
@@ -906,8 +955,8 @@ mod tests {
         assert_eq!(by_id["actions"][0]["id"], "go");
         assert_eq!(by_id["actions"][0]["sends_event"], true);
         assert_eq!(by_id["actions"][0]["host"], Value::Null);
-        assert_eq!(by_id["reply"], json!({"placeholder": null}));
-        assert_eq!(by_id["entries"][0]["kind"], "state");
+        assert_eq!(by_id["compose"], json!({"placeholder": null, "hint": null}));
+        assert_eq!(by_id["feed"], json!([]), "a new thread's feed is empty");
         assert_eq!(by_id["events_pending"], 0);
         assert_eq!(by_id["notes"], json!([]));
 
@@ -922,6 +971,67 @@ mod tests {
         assert_eq!(code(run(&path, "inbox.thread.get", json!({"thread": id, "owner":"d","key":"pr-1"}))), "invalid");
         assert_eq!(code(run(&path, "inbox.thread.get", json!({}))), "invalid");
         assert_eq!(code(run(&path, "inbox.thread.get", json!({"thread": "x"}))), "invalid");
+    }
+
+    /// The detail's feed on the wire: every item kind, tagged by `type`,
+    /// and never the client that made a user item.
+    #[test]
+    fn detail_feed_wire_shape() {
+        let path = store_path("feed");
+        let v2 = |message: Option<&str>, state: State, status: &str| ThreadPut {
+            key: "pr-1".into(),
+            title: "t".into(),
+            state,
+            status: Some(status.into()),
+            message: message.map(str::to_string),
+            compose: Some(Compose { placeholder: Some("p".into()), hint: Some("h".into()) }),
+            actions: vec![action("go"), Action { done: true, ..action("fin") }],
+            ..ThreadPut::default()
+        };
+        store::update_at(&path, |i| i.put("d-id", "d", 10, v2(Some("hello"), State::Active, "a"))).unwrap();
+        let id = id_of(&path, "d-id", "pr-1");
+        run(&path, "inbox.thread.act", json!({"thread": id, "action": "go"})).unwrap();
+        run(&path, "inbox.thread.reply", json!({"thread": id, "text": "hi"})).unwrap();
+        run(&path, "inbox.thread.done", json!({"thread": id})).unwrap();
+        run(&path, "inbox.thread.reopen", json!({"thread": id})).unwrap();
+        store::update_at(&path, |i| i.put("d-id", "d", 20, v2(Some("hello again"), State::NeedsYou, "b"))).unwrap();
+
+        let t = run(&path, "inbox.thread.get", json!({"thread": id})).unwrap();
+        assert_eq!(t["compose"], json!({"placeholder": "p", "hint": "h"}));
+        let mut feed = t["feed"].clone();
+        for item in feed.as_array_mut().unwrap() {
+            assert!(item["seq"].is_u64(), "{item}");
+            assert!(item["at"].is_u64(), "{item}");
+            let item = item.as_object_mut().unwrap();
+            item.remove("seq");
+            item.remove("at");
+        }
+        assert_eq!(
+            feed,
+            json!([
+                {"type": "message", "id": "header-message", "blocks": [{"type": "markdown", "text": "hello again"}], "edited": true, "withdrawn": false},
+                {"type": "action", "action": "go", "label": "GO"},
+                {"type": "reply", "text": "hi"},
+                {"type": "marker", "marker": "done", "from": null, "to": null},
+                {"type": "marker", "marker": "reopen", "from": null, "to": null},
+                {"type": "marker", "marker": "state", "from": "active", "to": "needs-you"},
+                {"type": "marker", "marker": "status", "from": "a", "to": "b"},
+            ])
+        );
+        let wire = t.to_string();
+        assert!(!wire.contains("client") && !wire.contains("api:test"), "{wire}");
+        // The store does know who did it.
+        let stored = ops::load(&path).unwrap().to_json().unwrap();
+        assert!(stored.contains("api:test"));
+    }
+
+    #[test]
+    fn audit_client_names() {
+        assert_eq!(audit_client("tui"), "tui");
+        assert_eq!(audit_client("cli"), "cli");
+        assert_eq!(audit_client("npm:my-ext"), "api:npm:my-ext");
+        assert_eq!(audit_client("api:x"), "api:x");
+        assert_eq!(audit_client(""), "api");
     }
 
     #[test]
@@ -1112,7 +1222,7 @@ mod tests {
         use crate::devsbd::forward::HostPort;
         let path = store_path("forwards");
         let fake = FakeForwards::default();
-        let fwd = |method: &str, params: Value| call(method, params, &Ctx { inbox: &path, bridges: None, forwards: Some(&fake) });
+        let fwd = |method: &str, params: Value| call(method, params, &Ctx { inbox: &path, client: "api:test", bridges: None, forwards: Some(&fake) });
 
         let rows = fwd("forwards.list", json!({"dir": "/cfg"})).unwrap();
         assert_eq!(rows[0]["id"], 1);
@@ -1177,7 +1287,7 @@ mod tests {
     /// value of each shows every key.
     #[test]
     fn npm_typings_match_the_wire_structs() {
-        use crate::serve::dts::assert_matches;
+        use crate::serve::dts::{assert_matches, assert_variant, union_members};
         use crate::serve::proto::{ErrorBody, HelloParams, HelloResult};
         fn v(x: &impl Serialize) -> Value {
             serde_json::to_value(x).unwrap()
@@ -1201,15 +1311,13 @@ mod tests {
             summary: summary(),
             link: None,
             child: None,
-            message: None,
-            reply: Some(ReplyView { placeholder: None }),
+            compose: Some(ComposeView { placeholder: None, hint: None }),
             actions: vec![],
-            entries: vec![],
+            feed: vec![],
             notes: vec![],
             events_pending: 0,
         };
         let action = ActionView { id: "go".into(), label: "Go".into(), done: false, host: None, sends_event: true };
-        let entry = EntryView { seq: 1, at: 1, kind: "message", text: "t".into() };
         let note = NoteView { id: 1, level: "info", msg: "m".into(), link: None, at: 1 };
         let row = ForwardRow {
             id: 1,
@@ -1227,12 +1335,11 @@ mod tests {
         let hello_result = HelloResult { version: "0.6.0".into(), build: 1, protocol: 1, handoff: true };
         let error = ErrorBody { code: "invalid".into(), message: "m".into() };
 
-        let cases: [(&str, Value); 13] = [
+        let cases: [(&str, Value); 12] = [
             ("ThreadSummary", v(&summary())),
             ("ThreadDetail", v(&detail)),
-            ("ThreadReply", v(&ReplyView { placeholder: None })),
+            ("ThreadCompose", v(&ComposeView { placeholder: None, hint: None })),
             ("ThreadAction", v(&action)),
-            ("ThreadEntry", v(&entry)),
             ("ThreadNote", v(&note)),
             ("ForwardRow", v(&row)),
             ("ForwardAdded", v(&added)),
@@ -1245,5 +1352,24 @@ mod tests {
         for (iface, value) in &cases {
             assert_matches(iface, value);
         }
+        // Tagged unions: one interface per variant, its `type` (and a
+        // marker's `marker`) a literal the d.ts union is built from.
+        let blocks = vec![BlockView::Markdown { text: "t".into() }];
+        let variants: [(&str, Value); 5] = [
+            ("FeedMessage", v(&FeedItemView::Message { seq: 1, at: 1, id: "m".into(), blocks, edited: false, withdrawn: false })),
+            ("FeedReply", v(&FeedItemView::Reply { seq: 1, at: 1, text: "t".into() })),
+            ("FeedAction", v(&FeedItemView::Action { seq: 1, at: 1, action: "go".into(), label: "Go".into() })),
+            ("FeedMarker", v(&FeedItemView::Marker { seq: 1, at: 1, marker: "done", from: None, to: None })),
+            ("MarkdownBlock", v(&BlockView::Markdown { text: "t".into() })),
+        ];
+        for (iface, value) in &variants {
+            assert_variant(iface, value);
+        }
+        assert_eq!(union_members("FeedItem"), ["FeedMessage", "FeedReply", "FeedAction", "FeedMarker"]);
+        assert_eq!(union_members("MessageBlock"), ["MarkdownBlock"]);
+        assert_eq!(
+            crate::serve::dts::prop_type("FeedMarker", "marker").as_deref(),
+            Some("'done' | 'reopen' | 'state' | 'status'")
+        );
     }
 }

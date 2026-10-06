@@ -53,6 +53,28 @@ pub fn assert_matches(iface: &str, value: &Value) {
     );
 }
 
+/// One variant of a `type`-tagged union: `value` matches `interface <iface>`
+/// exactly, and the interface types `type` as the literal the value carries
+/// (`type: 'reply';` for `{"type":"reply",…}`).
+pub fn assert_variant(iface: &str, value: &Value) {
+    assert_matches(iface, value);
+    let tag = value["type"].as_str().unwrap_or_else(|| panic!("{iface}: no string `type` in {value}"));
+    assert_eq!(
+        prop_type(iface, "type").as_deref(),
+        Some(format!("'{tag}'").as_str()),
+        "npm/devsandboxes/index.d.ts `interface {iface}`: `type` must be '{tag}'"
+    );
+}
+
+/// The members of `export type <name> = A | B | …;`, in order. Panics when
+/// there's no such alias.
+pub fn union_members(name: &str) -> Vec<String> {
+    let needle = format!("export type {name} =");
+    let at = DTS.find(&needle).unwrap_or_else(|| panic!("index.d.ts has no `export type {name}`")) + needle.len();
+    let end = DTS[at..].find(';').map_or(DTS.len(), |e| at + e);
+    DTS[at..end].split('|').map(|m| m.trim().to_string()).filter(|m| !m.is_empty()).collect()
+}
+
 /// `(header, body)` of `interface <name>`: the text between the name and the
 /// `{`, and the block's contents.
 fn block(name: &str) -> Option<(&'static str, &'static str)> {

@@ -34,7 +34,7 @@ pub const LAUNCHD_LABEL: &str = "dev.devsandbox.serve";
 /// non-empty. systemd and launchd start services with a minimal `PATH`, so
 /// without it the runtime CLIs (docker, podman, OrbStack's) wouldn't
 /// resolve. The XDG data/state dirs keep the managed daemon on the same
-/// `state.toml`, `inbox.toml` and `serve.log` as the shell's clients.
+/// `state.toml`, `inbox.json` and `serve.log` as the shell's clients.
 /// Not `SSH_AUTH_SOCK`: it rotates, and clients report theirs through
 /// `bridges.ensure`.
 const CAPTURED_ENV: &[&str] = &[

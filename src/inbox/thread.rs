@@ -28,6 +28,7 @@ const MAX_LINK: usize = 2000;
 const MAX_LABEL: usize = 60;
 const MAX_PATH: usize = 400;
 const MAX_PLACEHOLDER: usize = 100;
+const MAX_HINT: usize = 100;
 
 /// A fixed set: it drives the Inbox views and the unread badge.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,8 +50,9 @@ impl State {
     }
 }
 
-/// One `devsbd thread put` body. Also serialized (as JSON) by `devsbd thread
-/// ls`, which hands a dispatcher back exactly what it put.
+/// One `devsbd thread put` body: the thread's header. Also serialized (as
+/// JSON) by `devsbd thread ls`, which hands a dispatcher back exactly what it
+/// put.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ThreadPut {
@@ -65,12 +67,27 @@ pub struct ThreadPut {
     /// thread is about, and what its host actions target.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub child: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub actions: Vec<Action>,
+    /// Present when the thread takes replies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compose: Option<Compose>,
+    // v2 put compat, removed in step 13: `message` becomes the feed's
+    // `header-message` item, `reply` is `compose` without a hint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply: Option<Reply>,
+}
+
+impl ThreadPut {
+    /// The composer this put asks for: `compose`, else (v2 put compat,
+    /// removed in step 13) the old `reply`.
+    pub fn compose(&self) -> Option<Compose> {
+        self.compose
+            .clone()
+            .or_else(|| self.reply.as_ref().map(|r| Compose { placeholder: r.placeholder.clone(), hint: None }))
+    }
 }
 
 /// A button on the thread. Field order is load-bearing for TOML: `host` is a
@@ -146,11 +163,23 @@ pub struct Open {
     pub url: String,
 }
 
+/// v2 put compat, removed in step 13: the old name of [`Compose`].
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Reply {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placeholder: Option<String>,
+}
+
+/// The reply box: its placeholder, and `hint`, one dim line under it saying
+/// what sending does now ("Starts a comments run with your message").
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Compose {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placeholder: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
 }
 
 /// Parse and check one put body. `Err` is a single line naming the field to
@@ -188,6 +217,14 @@ fn validate(put: &ThreadPut) -> Result<(), String> {
         check_action(action)?;
         if !seen.insert(action.id.as_str()) {
             return Err(format!("duplicate action id `{}`", action.id));
+        }
+    }
+    if let Some(compose) = &put.compose {
+        if let Some(placeholder) = &compose.placeholder {
+            check_text("compose.placeholder", placeholder, MAX_PLACEHOLDER)?;
+        }
+        if let Some(hint) = &compose.hint {
+            check_text("compose.hint", hint, MAX_HINT)?;
         }
     }
     if let Some(placeholder) = put.reply.as_ref().and_then(|r| r.placeholder.as_ref()) {
@@ -326,7 +363,20 @@ mod tests {
         );
         assert_eq!(put.actions[1].host, None, "no `host` = a dispatcher action");
         assert!(put.actions[2].done);
-        assert_eq!(put.reply.unwrap().placeholder.as_deref(), Some("Instructions for the next run"));
+        // v2 put compat: `reply` is `compose` without a hint.
+        let compose = put.compose().unwrap();
+        assert_eq!(compose.placeholder.as_deref(), Some("Instructions for the next run"));
+        assert_eq!(compose.hint, None);
+    }
+
+    #[test]
+    fn compose_takes_a_placeholder_and_a_hint_and_wins_over_reply() {
+        let body = r#"{"key":"k","title":"t","state":"active","compose":{"placeholder":"p","hint":"Starts a run"},"reply":{"placeholder":"old"}}"#;
+        let put = parse(body).unwrap();
+        assert_eq!(put.compose(), Some(Compose { placeholder: Some("p".into()), hint: Some("Starts a run".into()) }));
+        let none = parse(r#"{"key":"k","title":"t","state":"active"}"#).unwrap();
+        assert_eq!(none.compose(), None);
+        assert!(parse(r#"{"key":"k","title":"t","state":"active","compose":{"nope":1}}"#).is_err());
     }
 
     #[test]
@@ -384,6 +434,9 @@ mod tests {
             (put(r#","link":"ftp://x""#), "`link` is not an http(s) URL"),
             (put(r#","link":"/etc/passwd""#), "`link` is not an http(s) URL"),
             (put(r#","reply":{"placeholder":"PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP"}"#), "`reply.placeholder` is longer"),
+            (put(&format!(r#","compose":{{"placeholder":"{}"}}"#, "p".repeat(MAX_PLACEHOLDER + 1))), "`compose.placeholder` is longer"),
+            (put(&format!(r#","compose":{{"hint":"{}"}}"#, "h".repeat(MAX_HINT + 1))), "`compose.hint` is longer"),
+            (put(r#","compose":{"hint":"a\u0007b"}"#), "control character"),
             (put(r#","actions":[{"id":"a","label":"A"},{"id":"a","label":"B"}]"#), "duplicate action id"),
             (put(r#","actions":[{"id":"Bad","label":"A"}]"#), "bad action id"),
             (put(r#","actions":[{"id":"","label":"A"}]"#), "bad action id"),

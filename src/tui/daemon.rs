@@ -522,7 +522,7 @@ impl Worker<'_> {
             }
         }
         if !local.is_empty() {
-            if let Err(e) = inbox::store::path().and_then(|p| inbox::ops::apply(&p, &local)) {
+            if let Err(e) = inbox::store::path().and_then(|p| inbox::ops::apply(&p, &local, "tui")) {
                 self.send(DaemonUpdate::Status(format!("inbox not saved: {e:#}")));
             }
         }
@@ -556,7 +556,7 @@ mod tests {
     #[test]
     fn mapped_calls_match_the_local_path() {
         use crate::devsbd::notify::{Level, Record};
-        use crate::inbox::{Action, Reply, State, ThreadPut, store};
+        use crate::inbox::{Action, Compose, State, ThreadPut, store};
         use crate::serve::api::{self, Ctx};
 
         let seed = |path: &std::path::Path| {
@@ -564,7 +564,7 @@ mod tests {
                 key: "k".into(),
                 title: "t".into(),
                 state: State::NeedsYou,
-                reply: Some(Reply::default()),
+                compose: Some(Compose::default()),
                 actions: vec![Action { id: "go".into(), label: "Go".into(), ..Action::default() }],
                 ..ThreadPut::default()
             };
@@ -574,7 +574,7 @@ mod tests {
         };
         let dir = std::env::temp_dir().join(format!("devsandbox-tui-daemon-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let (via_api, via_ops) = (dir.join("api.toml"), dir.join("ops.toml"));
+        let (via_api, via_ops) = (dir.join("api.json"), dir.join("ops.json"));
         seed(&via_api);
         seed(&via_ops);
         let inbox = inbox::ops::load(&via_api).unwrap();
@@ -592,14 +592,14 @@ mod tests {
         ];
         for op in &ops {
             let (method, params) = op_call(op);
-            api::call(method, params, &Ctx { inbox: &via_api, bridges: None, forwards: None }).unwrap_or_else(|e| panic!("{op:?}: {e:?}"));
-            inbox::ops::apply(&via_ops, std::slice::from_ref(op)).unwrap();
+            api::call(method, params, &Ctx { inbox: &via_api, client: "tui", bridges: None, forwards: None }).unwrap_or_else(|e| panic!("{op:?}: {e:?}"));
+            inbox::ops::apply(&via_ops, std::slice::from_ref(op), "tui").unwrap();
         }
         // Ids and times aside (minted at apply time): threads, then events.
         let strip = |path: &std::path::Path| -> String {
             let i = inbox::ops::load(path).unwrap();
             let events = inbox::ops::events(path, "d-id").unwrap();
-            let t: Vec<_> = i.threads.iter().map(|t| (t.id, t.kind, t.state, t.unread, t.entries.len())).collect();
+            let t: Vec<_> = i.threads.iter().map(|t| (t.id, t.kind, t.state, t.unread, t.feed.iter().map(|f| f.kind.clone()).collect::<Vec<_>>())).collect();
             let e: Vec<_> = events.into_iter().map(|(_, e)| (e.kind.as_str().to_string(), e.action, e.text)).collect();
             format!("{t:?} {e:?}")
         };
@@ -641,9 +641,9 @@ mod tests {
                 unreachable!("the dashboard never waits")
             }
         }
-        let path = std::env::temp_dir().join(format!("devsandbox-tui-ensure-{}", std::process::id())).join("inbox.toml");
+        let path = std::env::temp_dir().join(format!("devsandbox-tui-ensure-{}", std::process::id())).join("inbox.json");
         let (method, params) = ensure_call("web", Some(std::path::Path::new("/a")));
-        assert_eq!(api::call(method, params, &Ctx { inbox: &path, bridges: Some(&Knows), forwards: None }), Ok(json!({"ok": true})));
+        assert_eq!(api::call(method, params, &Ctx { inbox: &path, client: "tui", bridges: Some(&Knows), forwards: None }), Ok(json!({"ok": true})));
     }
 
     fn port_req(instance: &str, service: Option<&str>) -> PortRequest {
@@ -704,8 +704,8 @@ mod tests {
                 Ok(Removed { local: "127.0.0.1:8080".into(), configured: true })
             }
         }
-        let path = std::env::temp_dir().join(format!("devsandbox-tui-fwd-{}", std::process::id())).join("inbox.toml");
-        let ctx = Ctx { inbox: &path, bridges: None, forwards: Some(&Fake) };
+        let path = std::env::temp_dir().join(format!("devsandbox-tui-fwd-{}", std::process::id())).join("inbox.json");
+        let ctx = Ctx { inbox: &path, client: "tui", bridges: None, forwards: Some(&Fake) };
         let dir = Path::new("/cfg");
 
         let (method, params) = list_call(dir);

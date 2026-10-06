@@ -569,6 +569,9 @@ struct ConnState {
     id: u64,
     /// The hello's `client` (`tui`, `cli`, `api:<name>`), for the log.
     client: String,
+    /// What the store records as the client of this connection's user ops
+    /// (`api::audit_client` of `client`).
+    audit: String,
     out: Arc<Outbox>,
     notifier: Option<JoinHandle<()>>,
 }
@@ -584,7 +587,7 @@ impl ConnState {
 
 /// One connection: a request per line, a response per request, until EOF.
 fn serve_conn(id: u64, stream: Stream, shared: &Shared, out: Arc<Outbox>) {
-    let mut conn = ConnState { id, client: String::new(), out, notifier: None };
+    let mut conn = ConnState { id, client: String::new(), audit: api::audit_client(""), out, notifier: None };
     let mut reader = BufReader::new(stream);
     loop {
         let mut line = Vec::new();
@@ -630,7 +633,7 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Response {
         method => {
             let bridges = shared.bridges.get().map(|w| w as &dyn api::Bridging);
             let forwards = shared.forwards.get().map(|h| h as &dyn api::Forwarding);
-            api::call(method, req.params, &api::Ctx { inbox: &shared.inbox, bridges, forwards })
+            api::call(method, req.params, &api::Ctx { inbox: &shared.inbox, client: &conn.audit, bridges, forwards })
         }
     };
     match answer {
@@ -684,6 +687,7 @@ fn hello(id: Option<u64>, params: Value, shared: &Shared, conn: &mut ConnState) 
         Err(e) => return Response::err(id, "invalid", format!("bad hello params: {e}")),
     };
     conn.client.clone_from(&params.client);
+    conn.audit = api::audit_client(&params.client);
     let client = Version { semver: params.version, build: params.build };
     let handoff = client.is_newer_than(&shared.version);
     if handoff {
@@ -725,7 +729,7 @@ pub(crate) mod tests {
             keep_alive: false,
             idle_timeout: Duration::from_millis(idle_ms),
             host: false,
-            inbox: Some(std::env::temp_dir().join(format!("dsv-inbox-{}", std::process::id())).join("inbox.toml")),
+            inbox: Some(std::env::temp_dir().join(format!("dsv-inbox-{}", std::process::id())).join("inbox.json")),
         }
     }
 
@@ -846,7 +850,7 @@ pub(crate) mod tests {
     #[test]
     fn subscribers_hear_inbox_changes_between_responses() {
         let dir = scratch("notify");
-        let store = scratch("notify-store").join("inbox.toml");
+        let store = scratch("notify-store").join("inbox.json");
         let daemon = spawn_daemon(&dir, Options { inbox: Some(store.clone()), ..opts(1, 200) });
         let mut conn = connect(&dir);
         assert_eq!(conn.daemon.protocol, proto::PROTOCOL);
@@ -904,7 +908,7 @@ pub(crate) mod tests {
     #[test]
     fn two_dashboards_hear_one_write() {
         let dir = scratch("two");
-        let store = scratch("two-store").join("inbox.toml");
+        let store = scratch("two-store").join("inbox.json");
         let daemon = spawn_daemon(&dir, Options { inbox: Some(store.clone()), ..opts(1, 200) });
         let (mut a, mut b) = (connect(&dir), connect(&dir));
         for conn in [&mut a, &mut b] {
@@ -928,7 +932,7 @@ pub(crate) mod tests {
     #[test]
     fn shown_lines_reach_inbox_subscribers_latest_first() {
         use std::os::unix::net::UnixStream;
-        let shared = Arc::new(Shared::new(v(1), scratch("shown-store").join("inbox.toml")));
+        let shared = Arc::new(Shared::new(v(1), scratch("shown-store").join("inbox.json")));
         let mut clients = Vec::new();
         for (id, topics) in [(1, json!(["inbox"])), (2, json!(["inbox"])), (3, json!(["instances"]))] {
             let (server, client) = UnixStream::pair().unwrap();
@@ -984,7 +988,7 @@ pub(crate) mod tests {
 
     #[test]
     fn forwards_subscribers_hear_changes_and_status_lines() {
-        let shared = Arc::new(Shared::new(v(1), scratch("fwd-store").join("inbox.toml")));
+        let shared = Arc::new(Shared::new(v(1), scratch("fwd-store").join("inbox.json")));
         let mut fwd = subscribed(&shared, 1, json!(["forwards"]));
         let mut other = subscribed(&shared, 2, json!(["inbox", "instances"]));
         shared.publish_forwards(forwards::Event::Changed);
@@ -1006,7 +1010,7 @@ pub(crate) mod tests {
 
     #[test]
     fn active_forwards_are_holders() {
-        let shared = Shared::new(v(1), scratch("fwd-hold").join("inbox.toml"));
+        let shared = Shared::new(v(1), scratch("fwd-hold").join("inbox.json"));
         let registry = Registry::spawn(|_| {}, scratch("fwd-hold-store").join("forwards.toml"), Box::new(|_| {}));
         assert_eq!(shared.holders(None, Some(&registry)), Holders::default());
         let dir = scratch("fwd-hold-root");

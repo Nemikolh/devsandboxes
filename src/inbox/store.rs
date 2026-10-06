@@ -1,5 +1,5 @@
-//! `inbox.toml`, next to `state.toml`: the one host-wide Inbox, shared by
-//! every dashboard (and, later, the CLI). It holds the history across
+//! `inbox.json`, next to `state.toml`: the one host-wide Inbox, shared by
+//! every dashboard, the daemon and the CLI. It holds the history across
 //! dashboard sessions — the container outbox forgets a record once a bridge
 //! took it — so an in-memory copy per dashboard would mean last writer wins,
 //! bringing back records another one dismissed.
@@ -7,7 +7,9 @@
 //! Every change is a read-modify-write under an exclusive lock on the sibling
 //! `inbox.lock` ([`update_at`]), written to a temp file and renamed, so a crash
 //! mid-write can't leave a truncated file and a reader never sees a partial
-//! one. Readers ([`load_at`]) take a shared lock and are best-effort about it:
+//! one. A store that doesn't exist yet but has an older `inbox.toml` beside it
+//! starts from that file's notify records ([`Inbox::import_v2`]); the first
+//! write then creates `inbox.json`. The old file is left where it is. Readers ([`load_at`]) take a shared lock and are best-effort about it:
 //! the atomic rename already makes an unlocked read safe. [`stamp_at`] is the
 //! cheap "did it change" check dashboards run each tick. Callers outside
 //! tests go through [`super::ops`], which names each read and mutation.
@@ -26,16 +28,23 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
 
-use super::{Inbox, VERSION};
+use super::Inbox;
 use crate::state::State;
 
-/// The store path: `inbox.toml` beside the state file.
+/// The store path: `inbox.json` beside the state file.
 pub fn path() -> Result<PathBuf> {
-    Ok(State::path()?.with_file_name("inbox.toml"))
+    Ok(State::path()?.with_file_name("inbox.json"))
 }
 
-/// The lock beside a store file. Separate from `inbox.toml` itself, which the
+/// The v1/v2 store beside a store file, imported when the store is missing.
+fn legacy_path(path: &Path) -> PathBuf {
+    path.with_file_name("inbox.toml")
+}
+
+/// The lock beside a store file. Separate from the store itself, which the
 /// atomic write replaces (locking a file that gets renamed away locks nothing).
+/// The same name the v2 store used, so an older build writing `inbox.toml`
+/// and this one importing it can't interleave.
 fn lock_path(path: &Path) -> PathBuf {
     path.with_file_name("inbox.lock")
 }
@@ -47,26 +56,40 @@ pub fn load_at(path: &Path) -> Result<Inbox> {
 }
 
 /// Read and parse without locking (the caller holds one, or doesn't need it).
-/// The flag is set for a pre-v2 file, which [`update_at`] then rewrites so
-/// the migration (and its fresh thread ids) happens once, not on every read.
+/// The flag is set when the content was imported from `inbox.toml`, which
+/// [`update_at`] then writes out as `inbox.json` so the import (and a v1
+/// file's fresh thread ids) happens once, not on every read.
 fn read(path: &Path) -> Result<(Inbox, bool)> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Inbox::default(), false)),
-        Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
-    };
-    // Only a v1 file needs the name -> instance_id map, so the state file is
-    // read on migration, not on every load.
-    let old = version(&text) < VERSION;
-    let names = if old { names_from_state() } else { BTreeMap::new() };
-    let inbox = Inbox::from_toml(&text, &names)
-        .map_err(|e| anyhow::anyhow!("invalid {}: {e}", path.display()))?;
-    Ok((inbox, old))
+    match read_text(path)? {
+        Some(text) => {
+            let inbox = Inbox::from_json(&text).map_err(|e| anyhow::anyhow!("invalid {}: {e}", path.display()))?;
+            Ok((inbox, false))
+        }
+        None => {
+            let legacy = legacy_path(path);
+            let Some(text) = read_text(&legacy)? else { return Ok((Inbox::default(), false)) };
+            // Only a v1 file needs the name -> instance_id map, so the state
+            // file is read for that, not on every import.
+            let names = if toml_version(&text) < 2 { names_from_state() } else { BTreeMap::new() };
+            let inbox = Inbox::import_v2(&text, &names)
+                .map_err(|e| anyhow::anyhow!("invalid {}: {e}", legacy.display()))?;
+            Ok((inbox, true))
+        }
+    }
 }
 
-/// The file's `version`, 0 (i.e. v1) when absent or unparsable; a real parse
-/// error is reported by [`Inbox::from_toml`] right after.
-fn version(text: &str) -> u32 {
+/// A file's contents, `None` when it doesn't exist.
+fn read_text(path: &Path) -> Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("cannot read {}", path.display())),
+    }
+}
+
+/// An `inbox.toml`'s `version`, 0 (i.e. v1) when absent or unparsable; a real
+/// parse error is reported by [`Inbox::import_v2`] right after.
+fn toml_version(text: &str) -> u32 {
     #[derive(serde::Deserialize)]
     struct Probe {
         #[serde(default)]
@@ -75,7 +98,7 @@ fn version(text: &str) -> u32 {
     toml::from_str::<Probe>(text).map_or(0, |p| p.version)
 }
 
-/// Instance name (state key) -> `instance_id`, for migrating a v1 file. A
+/// Instance name (state key) -> `instance_id`, for importing a v1 file. A
 /// state that won't load leaves every thread unresolved rather than failing
 /// the Inbox.
 fn names_from_state() -> BTreeMap<String, String> {
@@ -137,7 +160,7 @@ pub fn wait_changed(seen: u64, timeout: Duration) -> u64 {
 }
 
 fn serialize(inbox: &Inbox) -> Result<String> {
-    inbox.to_toml().map_err(|e| anyhow::anyhow!("cannot serialize inbox: {e}"))
+    inbox.to_json().map_err(|e| anyhow::anyhow!("cannot serialize inbox: {e}"))
 }
 
 /// Hold the store lock until the returned file is dropped. A shared lock that
@@ -155,10 +178,12 @@ fn lock(path: &Path, exclusive: bool) -> Result<File> {
 }
 
 /// Write `text` through a temp file + rename, so readers only ever see a
-/// complete file. The temp name carries the pid: the lock already serializes
-/// writers, but a stale temp from a killed process must not be reused.
+/// complete file. The temp name (`.inbox.json.<pid>.tmp`) carries the pid:
+/// the lock already serializes writers, but a stale temp from a killed
+/// process must not be reused.
 fn write_atomic(path: &Path, text: &str) -> Result<()> {
-    let tmp = path.with_file_name(format!(".inbox.toml.{}.tmp", std::process::id()));
+    let name = path.file_name().map_or("inbox.json".into(), |n| n.to_string_lossy());
+    let tmp = path.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
     std::fs::write(&tmp, text).with_context(|| format!("cannot write {}", tmp.display()))?;
     std::fs::rename(&tmp, path).with_context(|| format!("cannot write {}", path.display()))
 }
@@ -190,7 +215,7 @@ mod tests {
 
     #[test]
     fn a_write_wakes_a_waiter_and_a_quiet_store_times_out() {
-        let path = tmpdir("notify").join("inbox.toml");
+        let path = tmpdir("notify").join("inbox.json");
         let seen = generation();
         let writer = {
             let path = path.clone();
@@ -219,7 +244,7 @@ mod tests {
 
     #[test]
     fn missing_file_loads_empty_and_update_creates_it() {
-        let path = tmpdir("create").join("inbox.toml");
+        let path = tmpdir("create").join("inbox.json");
         assert!(load_at(&path).unwrap().threads.is_empty());
         assert_eq!(stamp_at(&path), None);
         update_at(&path, |i| i.push("a-id".into(), "a".into(), rec("one"), true)).unwrap();
@@ -231,17 +256,17 @@ mod tests {
 
     #[test]
     fn save_only_when_the_content_changed() {
-        let path = tmpdir("unchanged").join("inbox.toml");
+        let path = tmpdir("unchanged").join("inbox.json");
         update_at(&path, |i| i.push("a-id".into(), "a".into(), rec("one"), true)).unwrap();
         let before = stamp_at(&path).unwrap();
         // Far enough apart that a coarse mtime would still move.
         std::thread::sleep(std::time::Duration::from_millis(1100));
         // A no-op closure, and an op that matches nothing.
         update_at(&path, |_| {}).unwrap();
-        update_at(&path, |i| i.apply(&Op::RemoveThread(9999), 0)).unwrap();
+        update_at(&path, |i| i.apply(&Op::RemoveThread(9999), 0, "tui")).unwrap();
         assert_eq!(stamp_at(&path).unwrap(), before, "no write, no mtime bump");
         let out = update_at(&path, |i| {
-            i.apply(&Op::MarkNotifyRead, 0);
+            i.apply(&Op::MarkNotifyRead, 0, "tui");
             42
         })
         .unwrap();
@@ -253,7 +278,7 @@ mod tests {
     /// land, instead of one process's copy overwriting the other's.
     #[test]
     fn concurrent_updates_lose_nothing() {
-        let path = tmpdir("concurrent").join("inbox.toml");
+        let path = tmpdir("concurrent").join("inbox.json");
         std::thread::scope(|s| {
             for who in ["a", "b"] {
                 let path = path.clone();
@@ -269,8 +294,8 @@ mod tests {
         });
         let inbox = load_at(&path).unwrap();
         assert_eq!(inbox.threads.len(), 100);
-        assert_eq!(inbox.weight_for("a-id"), 50);
-        assert_eq!(inbox.weight_for("b-id"), 50);
+        assert_eq!(inbox.threads.iter().filter(|t| t.owner == "a-id").count(), 50);
+        assert_eq!(inbox.threads.iter().filter(|t| t.owner == "b-id").count(), 50);
         let mut msgs: Vec<&str> = inbox.threads.iter().map(|t| t.head().unwrap().msg.as_str()).collect();
         msgs.sort_unstable();
         msgs.dedup();
@@ -288,7 +313,7 @@ mod tests {
     #[test]
     fn an_identical_put_does_not_touch_the_file() {
         use crate::inbox::{State, ThreadPut};
-        let path = tmpdir("idempotent-put").join("inbox.toml");
+        let path = tmpdir("idempotent-put").join("inbox.json");
         let put = || ThreadPut {
             key: "pr-1".into(),
             title: "PR 1".into(),
@@ -311,22 +336,44 @@ mod tests {
         assert_ne!(stamp_at(&path).unwrap(), before);
     }
 
-    /// A v1 file on disk is migrated on load and rewritten as v2 by the next
-    /// update, even one that changes nothing, so it migrates once.
+    /// No `inbox.json` yet but a v2 `inbox.toml` beside it: its notify
+    /// records load (owner threads dropped), and the next update writes them
+    /// out as `inbox.json`, even one that changes nothing, so the import
+    /// happens once. The old file is left untouched.
     #[test]
-    fn loads_and_upgrades_a_v1_file() {
-        let path = tmpdir("v1").join("inbox.toml");
+    fn imports_a_v2_store_once_and_leaves_it_alone() {
+        let dir = tmpdir("v2");
+        let (path, legacy) = (dir.join("inbox.json"), dir.join("inbox.toml"));
+        let v2 = "version = 2\n\n[[thread]]\nid = 1\nowner = \"web-id\"\nowner_name = \"web\"\nunread = true\n\n[[thread.note]]\nseq = 3\nlevel = \"info\"\nat = 0\nmsg = \"hi\"\n\n[[thread]]\nid = 2\nowner = \"web-id\"\nowner_name = \"web\"\nkind = \"thread\"\nkey = \"pr-1\"\ntitle = \"PR 1\"\nstate = \"active\"\n";
+        std::fs::write(&legacy, v2).unwrap();
+        let inbox = load_at(&path).unwrap();
+        assert_eq!(inbox.threads.len(), 1, "the owner thread is dropped");
+        assert_eq!(inbox.threads[0].head().unwrap().msg, "hi");
+        assert_eq!(stamp_at(&path), None, "a read writes nothing");
+        update_at(&path, |_| {}).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"version\": 3"), "{text}");
+        assert_eq!(std::fs::read_to_string(&legacy).unwrap(), v2, "inbox.toml is left as it was");
+        // From now on `inbox.json` is the store: the old file is not read.
+        update_at(&path, |i| i.apply(&Op::ClearNotify, 0, "tui")).unwrap();
+        assert!(load_at(&path).unwrap().threads.is_empty());
+        // A v1 file imports the same way.
+        let dir = tmpdir("v1");
         std::fs::write(
-            &path,
+            dir.join("inbox.toml"),
             "[[thread]]\ninstance = \"web\"\nunread = true\n[[thread.note]]\nseq = 3\nlevel = \"info\"\nat = 0\nmsg = \"hi\"\n",
         )
         .unwrap();
-        let inbox = load_at(&path).unwrap();
-        assert_eq!(inbox.threads[0].owner_name, "web");
-        assert_eq!(inbox.threads[0].head().unwrap().msg, "hi");
-        update_at(&path, |_| {}).unwrap();
-        let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("version = 2"), "{text}");
-        assert!(!text.contains("instance ="), "{text}");
+        assert_eq!(load_at(&dir.join("inbox.json")).unwrap().threads[0].owner_name, "web");
+    }
+
+    #[test]
+    fn a_store_of_another_version_is_an_error() {
+        let path = tmpdir("v4").join("inbox.json");
+        std::fs::write(&path, r#"{"version":4,"threads":[]}"#).unwrap();
+        let err = format!("{:#}", load_at(&path).unwrap_err());
+        assert!(err.contains("version 4"), "{err}");
+        assert!(update_at(&path, |_| {}).is_err(), "and is never overwritten");
+        assert!(std::fs::read_to_string(&path).unwrap().contains("\"version\":4"));
     }
 }

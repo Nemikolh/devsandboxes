@@ -980,7 +980,7 @@ fn focused_reply(app: &App) -> Option<&TextArea> {
 /// dispatcher thread that doesn't); or none (a notify thread, which can't be
 /// replied to).
 fn pane_bottom_rows(t: &Thread, reply: Option<&TextArea>, width: u16) -> u16 {
-    match (t.kind, &t.reply) {
+    match (t.kind, &t.compose) {
         (_, Some(_)) => 2 + reply.map_or(1, |r| r.height(width.saturating_sub(2))),
         (Kind::Thread, None) => 1,
         (Kind::Notify, None) => 0,
@@ -1039,7 +1039,7 @@ pub(crate) fn inbox_hit(app: &App, frame: Rect, col: u16, row: u16) -> Option<In
     let (_, bottom) = pane_areas(inner, pane_bottom_rows(t, focused_reply(app), inner.width));
     if !bottom.contains(at) {
         Some(InboxHit::Thread)
-    } else if t.reply.is_some() {
+    } else if t.compose.is_some() {
         Some(InboxHit::Input)
     } else {
         Some(InboxHit::Hint)
@@ -1189,8 +1189,9 @@ fn draw_inbox_pane(frame: &mut Frame, app: &App, area: Rect) {
     // The content only: the input / hint below it is not message text.
     app.add_rows_region(RegionId::InboxThread, content, scroll as usize, texts);
     frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), content);
-    match &t.reply {
-        Some(reply) => draw_reply_input(frame, app, reply.placeholder.as_deref(), bottom_area),
+    match &t.compose {
+        // `compose.hint` is drawn from step 14 on (pane layout v3).
+        Some(compose) => draw_reply_input(frame, app, compose.placeholder.as_deref(), bottom_area),
         None if bottom > 0 => {
             frame.render_widget(Paragraph::new(Span::styled("this thread takes no replies", dim)), bottom_area);
         }
@@ -2626,7 +2627,7 @@ mod tests {
         let sel = app.inbox.rows()[app.selected()];
         let mut inbox = Inbox::default();
         inbox.threads = threads;
-        inbox.threads[sel].reply = Some(Default::default());
+        inbox.threads[sel].compose = Some(Default::default());
         app.set_inbox(inbox);
         let screen: Vec<String> = render(&app, 120, 30).lines().map(str::to_string).collect();
         let top = screen.iter().position(|l| l.contains("╭ r reply")).unwrap() as u16;
@@ -2645,7 +2646,7 @@ mod tests {
         let sel = app.inbox.rows()[app.selected()];
         let mut inbox = Inbox::default();
         inbox.threads = app.inbox.threads().to_vec();
-        inbox.threads[sel].reply = Some(Default::default());
+        inbox.threads[sel].compose = Some(Default::default());
         app.set_inbox(inbox);
         app.on_key(KeyEvent::from(KeyCode::Char('r')));
         assert_eq!(app.inbox.focus, InboxFocus::Input);
@@ -2756,7 +2757,7 @@ See [PR 6900](https://github.com/o/r/pull/6900).";
         let mut t = dthread("#6900 fix `parse_port`", State::NeedsYou, Some("review **drafts**"));
         t.id = 1;
         t.owner = "bab-disp-id".into();
-        t.message = Some(message.into());
+        t.feed = vec![crate::inbox::FeedItem::markdown(1, 0, "m", message)];
         let mut inbox = Inbox::default();
         inbox.threads = vec![t];
         let mut app = App::new(PathBuf::from("/tmp"));

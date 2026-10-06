@@ -50,7 +50,7 @@ Send it first:
 |---|---|
 | `version` | the client's devsandbox semver; external clients send the version they were built against |
 | `build` | optional; the devsandbox binary's mtime (unix secs), for dev builds |
-| `client` | who's calling: `tui`, `cli`, `api:<name>` (logged; recorded for audit later) |
+| `client` | who's calling: `tui`, `cli`, `api:<name>`. Logged, and recorded in the store on the user's feed items (`tui` and `cli` as is, any other name as `api:<name>`) for the user's audit; never shown to owners |
 
 Result: the daemon's `version` and `build`, the API `protocol` number, and
 `"handoff": true` when the client's version is newer than the daemon's: the
@@ -135,14 +135,29 @@ Params: a thread address. Result: the summary's fields plus
 |---|---|
 | `link` | `http(s)` link, or `null` |
 | `child` | key of the dispatcher child it's about, or `null` |
-| `message` | the dispatcher's message, or `null` |
-| `reply` | `{"placeholder": …}` when it takes replies, else `null` |
+| `compose` | `{"placeholder": …, "hint": …}` when it takes replies, else `null`; `hint` is one line saying what sending does now |
 | `actions` | `[{"id","label","done","host","sends_event"}]`: `host` is the host verb (`vscode`, `terminal`, `logs`, `forward`, `open`, `rm`) or `null`; `sends_event: false` means host-only |
-| `entries` | a thread's timeline, oldest first: `[{"seq","at","kind","text"}]`, `kind` one of `message` `state` `status` `action` `reply` `done` `reopen` |
+| `feed` | an owner thread's feed, oldest first (first-insert order); see *Feed items* |
 | `notes` | a notification's records, newest first: `[{"id","level","msg","link","at"}]` |
 | `events_pending` | events the owner hasn't acked yet |
 
 Errors: `invalid`, `not-found`.
+
+#### Feed items
+
+Each item has `type`, `seq` (arrival order across the whole Inbox) and `at`
+(unix secs of first insert), plus:
+
+| `type` | fields | |
+|---|---|---|
+| `message` | `id`, `blocks`, `edited`, `withdrawn` | from the owner; `blocks` is `[{"type":"markdown","text"}]`. `edited`: replaced in place since first sent; `withdrawn`: the owner took it back |
+| `reply` | `text` | the user's reply |
+| `action` | `action`, `label` | the user pressed an action (its id, its label then) |
+| `marker` | `marker`, `from`, `to` | one line: `done` / `reopen` by the user (`from`/`to` `null`), or the owner's `state` / `status` change (`from` → `to`, a status may be `null`). Consecutive status changes collapse into one marker |
+
+A put that changes only other header fields (title, link, actions,
+`compose`) adds nothing to the feed. The store also records which client
+made each user item; the API and owners' events never carry it.
 
 ### Mutations
 
