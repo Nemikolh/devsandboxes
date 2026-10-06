@@ -313,3 +313,21 @@ at start (socket, pid, version, keep-alive), at a handoff or shutdown request, w
 runtime stops or starts answering, at each forwards status line
 (`forwards: …`), and at exit; plus the autostart pass's own notes
 (untimestamped). It's appended to, never rotated.
+
+## Future work
+
+Accepted trade-offs of the current design, to revisit:
+
+- **The dashboard collects its own instance snapshot.** It runs
+  `snapshot::collect` at its own cadence rather than reading
+  `instances.list`, so two dashboards (and the daemon's 5 s poll) each query
+  the runtime. Moving the snapshot into the daemon would need per-root
+  polling there and procs/stats at the dashboard's cadence.
+- **Forwards hold the daemon indefinitely.** Every live forward is a holder,
+  so a running instance with `forwardPorts`, or any saved ad-hoc forward
+  (`forwards.toml`, restored at every start), keeps the daemon from ever
+  idling out. Narrowing the rule (e.g. only forwards with a connection, or a
+  configurable grace) is open.
+- **Forwards use their own bridge.** Each forward spawns a self-healing
+  bridge of its own instead of riding the instance's daemon bridge mux, so a
+  forwarded instance has two bridge `exec`s.
