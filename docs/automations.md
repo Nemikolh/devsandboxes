@@ -28,7 +28,7 @@ Non-goals: launchd/systemd units or any always-on host daemon; credential isolat
 | `devsbd notify` | every sandbox, no opt-in | tell the human something (TUI + desktop) |
 | `dispatcher` control API | only sandboxes declaring `dispatcher` | ensure/stop/rm/done/exec child instances |
 | runs | dispatchers (via `exec --detach`) | tracked, logged agent invocations |
-| Inbox threads + events | only sandboxes declaring `dispatcher` | open items the user can act on; their clicks and replies come back as events (_Inbox threads_, `docs/inbox-threads.md`) |
+| Inbox threads + events | only sandboxes declaring `inbox = true` (a dispatcher wanting threads declares both) | open items the user can act on; their clicks and replies come back as events (_Inbox threads_, `docs/inbox-threads.md`) |
 
 ## `autostart`
 
@@ -117,7 +117,7 @@ devsbd done <key> [--sandbox S]             # mark a child done; `ensure` reusin
 devsbd exec <key> [--sandbox S] [--detach] -- <cmd>...   # a run; see _Runs_
 devsbd events [--wait SECS]                 # pending Inbox events (JSON lines); see _Inbox threads_
 devsbd events ack <id>...
-devsbd thread ls                            # this dispatcher's live threads (JSON)
+devsbd thread ls                            # this instance's live threads (JSON; needs inbox = true)
 ```
 
 Exit codes: 0 ok, 1 failed, 2 usage (or a key shared by two sandboxes without `--sandbox`), 75 no host connected, 77 denied.
@@ -148,7 +148,7 @@ The TUI serves control requests for every running dispatcher. Two TUIs don't bot
 
 ## Inbox threads
 
-Design and rationale: `docs/inbox-threads.md`; user reference: `docs/automations-guide.md`. A dispatcher puts **threads** (one item each: state, status, message, actions, reply box) into the Inbox and pulls **events** (what the user clicked or typed) back.
+Design and rationale: `docs/inbox-threads.md`; user reference: `docs/automations-guide.md`. A sandbox declaring `inbox = true` (typically a dispatcher) puts **threads** (one item each: state, status, message, actions, reply box) into the Inbox and pulls **events** (what the user clicked or typed) back.
 
 ### Outbox records
 
@@ -165,7 +165,7 @@ The helper checks JSON syntax with a std-only validator (`devsbd/src/json.rs`, n
 The bridge's notify handler applies a record to the store *before* replying `ok` (`bridge::handle_notify` → `apply_message` → `inbox::ops::sink`). A store failure sends no reply, the daemon keeps the file and resends it, so a dashboard dying mid-delivery loses nothing. `inbox::decide` turns each message into one store action:
 
 - notify → push the record;
-- thread message from an instance whose sandbox doesn't declare `dispatcher` (`dispatch::declares_dispatcher`, evaluated only for thread messages) → an `error` notify record from that instance, key `thread:<key>`, `thread put|rm denied: …`;
+- thread message from an instance whose sandbox doesn't declare `inbox = true` (`dispatch::declares_inbox`, evaluated only for thread messages) → an `error` notify record from that instance, key `thread:<key>`, `thread put|rm denied: …`;
 - put whose body fails the schema, or whose body `key` differs from the record's → the same, `thread put rejected: <why>`;
 - valid put → `Inbox::put`; rm → drop the thread.
 
@@ -188,7 +188,7 @@ Threads are keyed by `(owner instance_id, key)` and kind (a notify key and a thr
 
 ### Authorization
 
-Only dispatchers put threads or read events (`declares_dispatcher` on every message and request, against the config as it is now). Everything is scoped to the requester's `instance_id`: another instance never sees, acks or changes a dispatcher's threads, and host actions on a thread target only its `child` (resolved among the owner's own children) or the owner itself. Ids survive stop/restart/rebuild and are never reused, so `devsandbox rm` **archives** the removed instance's threads (notify ones too) instead of deleting them: read-only, shown only in **All**, dropped by retention. A put from a live owner un-archives (only `rm` archives).
+Only instances whose sandbox declares `inbox = true` put threads or read events (`declares_inbox` on every message, the same check in `dispatch::handle_with` on every `events`/`events-ack`/`thread-ls` request, against the config as it is now). `dispatcher` grants only the child ops; a dispatcher's child may declare `inbox = true` and own threads of its own. Everything is scoped to the requester's `instance_id`: another instance never sees, acks or changes an owner's threads, and host actions on a thread target only its `child` (resolved among the owner's own children) or the owner itself. Ids survive stop/restart/rebuild and are never reused, so `devsandbox rm` **archives** the removed instance's threads (notify ones too) instead of deleting them: read-only, shown only in **All**, dropped by retention. A put from a live owner un-archives (only `rm` archives).
 
 ### Helper self-heal
 

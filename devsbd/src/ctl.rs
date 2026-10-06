@@ -1,6 +1,7 @@
 //! `devsbd ensure|ls|branches|stop|rm|done|exec`, `devsbd run ls|logs|wait|rm|prune <key> …`,
 //! `devsbd events [--wait SECS]`, `devsbd events ack <id>...` and `devsbd
-//! thread ls`: a dispatcher's control commands (docs/automations.md, "Control
+//! thread ls`: the control commands (child ops need `dispatcher`, the thread
+//! and event ops `inbox = true`) (docs/automations.md, "Control
 //! API", "Runs"; docs/inbox-threads.md, *Events*). Each request is one encoded [`control::Request`] sent to the
 //! daemon over `daemon::API_SOCK`, which relays it to a host serving
 //! `CONTROL` (or answers `NoHost` itself); the command exits with the

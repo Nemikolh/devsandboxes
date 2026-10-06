@@ -986,21 +986,21 @@ pub enum SinkAction {
 }
 
 /// Decide what to do with `message` from `instance` (its state key).
-/// `declares_dispatcher` is `commands::dispatch::declares_dispatcher`, which
-/// the caller only evaluates for thread messages (it loads state).
+/// `declares_inbox` is `commands::dispatch::declares_inbox`, which the
+/// caller only evaluates for thread messages (it loads state).
 ///
 /// A refusal is never silent: it becomes an `error` record from the same
-/// instance, keyed by the thread, so the dispatcher's author sees the reason
+/// instance, keyed by the thread, so the owner's author sees the reason
 /// in the Inbox instead of a message that quietly never appears.
-pub fn decide(instance: &str, declares_dispatcher: bool, message: Message) -> SinkAction {
+pub fn decide(instance: &str, declares_inbox: bool, message: Message) -> SinkAction {
     let (at, key, body) = match message {
         Message::Notify(record) => return SinkAction::Push(record),
         Message::ThreadPut { at, key, body } => (at, key, Some(body)),
         Message::ThreadRm { at, key } => (at, key, None),
     };
     let verb = if body.is_some() { "put" } else { "rm" };
-    if !declares_dispatcher {
-        let why = format!("`{instance}` doesn't declare a dispatcher");
+    if !declares_inbox {
+        let why = format!("`{instance}` doesn't declare inbox = true (add it to the sandbox in devsandboxes.toml)");
         return refused(at, &key, &format!("thread {verb} denied: {why}"));
     }
     let Some(body) = body else { return SinkAction::Rm { key } };
@@ -1411,13 +1411,16 @@ mod tests {
     fn the_sink_denies_rejects_and_applies() {
         let body = r#"{"key":"pr-1","title":"t","state":"active"}"#;
         let put = Message::ThreadPut { at: 7, key: "pr-1".into(), body: body.into() };
-        // Not a dispatcher: refused, with the reason delivered as an error
+        // No `inbox = true`: refused, with the reason delivered as an error
         // record from the same instance, keyed by the thread.
         let SinkAction::Push(r) = decide("web", false, put.clone()) else { panic!("not refused") };
         assert_eq!((r.level, r.key.as_deref(), r.at), (Level::Error, Some("thread:pr-1"), 7));
         assert!(r.msg.contains("thread put denied"), "{}", r.msg);
-        assert!(r.msg.contains("`web` doesn't declare a dispatcher"), "{}", r.msg);
-        // A dispatcher's valid put is applied.
+        assert_eq!(
+            r.msg,
+            "thread put denied: `web` doesn't declare inbox = true (add it to the sandbox in devsandboxes.toml)"
+        );
+        // An owner's valid put is applied.
         assert!(matches!(decide("web", true, put), SinkAction::Put { at: 7, .. }));
         // A schema reject carries its one-line reason back the same way.
         let bad = Message::ThreadPut { at: 8, key: "pr-1".into(), body: r#"{"key":"pr-1"}"#.into() };
@@ -1433,7 +1436,7 @@ mod tests {
         assert_eq!(decide("web", true, rm.clone()), SinkAction::Rm { key: "pr-1".into() });
         let SinkAction::Push(r) = decide("web", false, rm) else { panic!("not refused") };
         assert!(r.msg.contains("thread rm denied"), "{}", r.msg);
-        // A plain notify never needs a dispatcher.
+        // A plain notify never needs `inbox = true`.
         let note = rec("hi", None, None);
         assert_eq!(decide("web", false, Message::Notify(note.clone())), SinkAction::Push(note));
     }

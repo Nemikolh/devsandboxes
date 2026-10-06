@@ -52,7 +52,7 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 
 use crate::commands::run::{instance_at, parse_worktree_list};
-use crate::config::Config;
+use crate::config::{Config, SandboxProperties};
 use crate::devsbd::control::{self, Op, Request, Response, Status};
 use crate::inbox::{ops as inbox_ops, store, Event};
 use crate::runtime::{backend, bounded};
@@ -165,15 +165,41 @@ pub fn handle(dispatcher_key: &str, req: &Request) -> Response {
 /// [`handle_with`]), even if its sandbox declares `dispatcher`.
 #[cfg_attr(not(unix), allow(dead_code))]
 pub fn declares_dispatcher(key: &str) -> bool {
-    let Ok(state) = State::load() else { return false };
-    let Some(info) = state.instances.get(key) else { return false };
-    if info.dispatcher.is_some() {
-        return false;
-    }
-    let Some(dir) = info.config_dir.as_deref() else { return false };
-    Config::load(dir)
-        .and_then(|c| c.resolve_sandbox(&info.sandbox))
-        .is_ok_and(|s| s.properties.dispatcher.is_some())
+    current_sandbox(key).is_some_and(|(info, props)| is_dispatcher(&info, &props))
+}
+
+/// Whether `key` is an instance whose sandbox declares `inbox = true`: the
+/// right to own Inbox threads (`thread put|rm|ls`, `events`). Unlike
+/// [`declares_dispatcher`], a dispatcher's child may: it owns its own threads.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub fn declares_inbox(key: &str) -> bool {
+    current_sandbox(key).is_some_and(|(_, props)| is_inbox_owner(&props))
+}
+
+/// [`declares_dispatcher`] over a loaded instance and its sandbox.
+pub(crate) fn is_dispatcher(info: &Instance, props: &SandboxProperties) -> bool {
+    info.dispatcher.is_none() && props.dispatcher.is_some()
+}
+
+/// [`declares_inbox`] over a loaded sandbox.
+pub(crate) fn is_inbox_owner(props: &SandboxProperties) -> bool {
+    props.inbox == Some(true)
+}
+
+/// Instance `key` and its sandbox as its recorded config root resolves it now;
+/// `None` when any of that is missing or fails to load.
+pub(crate) fn current_sandbox(key: &str) -> Option<(Instance, SandboxProperties)> {
+    let mut state = State::load().ok()?;
+    let info = state.instances.remove(key)?;
+    let dir = info.config_dir.as_deref()?;
+    let props = Config::load(dir).and_then(|c| c.resolve_sandbox(&info.sandbox)).ok()?.properties;
+    Some((info, props))
+}
+
+/// The control ops on the requester's own Inbox threads, gated on
+/// `inbox = true` rather than `dispatcher` (docs/inbox-redesign.md, _Ownership_).
+fn is_inbox_op(op: Op) -> bool {
+    matches!(op, Op::Events | Op::EventsAck | Op::ThreadLs)
 }
 
 fn denied(msg: impl Into<String>) -> Response {
@@ -210,16 +236,26 @@ pub(crate) fn handle_with(
     let Some(config_dir) = owner.config_dir.as_deref() else {
         return no_config_dir(dispatcher_key);
     };
-    // Only state from before children of dispatcher sandboxes were refused.
-    if owner.dispatcher.is_some() {
-        return denied(format!("`{dispatcher_key}` is a dispatcher's child; children can't be dispatchers"));
-    }
-    let decl = match config.resolve_sandbox(&owner.sandbox) {
-        Ok(sandbox) => sandbox.properties.dispatcher,
+    let props = match config.resolve_sandbox(&owner.sandbox) {
+        Ok(sandbox) => sandbox.properties,
         Err(e) => return denied(format!("{e:#}")),
     };
-    let Some(decl) = decl else {
-        return denied(format!("sandbox `{}` does not declare `dispatcher`", owner.sandbox));
+    // Inbox ops need `inbox = true` (a child may own threads too); child ops
+    // need `dispatcher`. `decl` is only `None` for inbox ops.
+    let decl = if is_inbox_op(req.op) {
+        if !is_inbox_owner(&props) {
+            return denied(format!("`{dispatcher_key}` doesn't declare inbox = true"));
+        }
+        None
+    } else {
+        // Only state from before children of dispatcher sandboxes were refused.
+        if owner.dispatcher.is_some() {
+            return denied(format!("`{dispatcher_key}` is a dispatcher's child; children can't be dispatchers"));
+        }
+        let Some(decl) = props.dispatcher else {
+            return denied(format!("sandbox `{}` does not declare `dispatcher`", owner.sandbox));
+        };
+        Some(decl)
     };
     if let Err(msg) = check_fields(req) {
         return usage(msg);
@@ -232,6 +268,7 @@ pub(crate) fn handle_with(
     match req.op {
         Op::Ls => ls(state, owner_id, exec),
         Op::Ensure => {
+            let decl = decl.expect("child op");
             let sandbox = req.sandbox.as_deref().expect("checked by check_fields");
             let key = req.key.as_deref().expect("checked by check_fields");
             if !decl.may_spawn(sandbox) {
@@ -321,6 +358,7 @@ pub(crate) fn handle_with(
             run_op(&name, &state.instances[&name], req, exec)
         }
         Op::Branches => {
+            let decl = decl.expect("child op");
             let sandbox = req.sandbox.as_deref().expect("checked by check_fields");
             if !decl.may_spawn(sandbox) {
                 return denied(format!(
@@ -1075,10 +1113,16 @@ mod tests {
 [sandbox.disp]
 folder = "."
 dispatcher = { spawn = ["web", "any"], max-instances = 2 }
+inbox = true
 
 [sandbox.any]
 folder = "."
 dispatcher = { spawn = ["*"] }
+inbox = true
+
+[sandbox.owner]
+folder = "."
+inbox = true
 
 [sandbox.plain]
 folder = "."
@@ -2115,16 +2159,29 @@ folder = "."
     }
 
     #[test]
-    fn event_ops_need_a_dispatcher_and_well_formed_fields() {
-        let s = state();
+    fn event_ops_need_inbox_and_well_formed_fields() {
+        let mut s = state();
+        // `o`: inbox only; `owner-one`: a child of `d` whose sandbox declares inbox.
+        s.instances.insert("o".into(), inst("owner", "o", None));
+        s.instances.insert("owner-one".into(), inst("owner", "owner-one", Some("d")));
         let (_path, mut fake) = inbox_fake("auth");
         let id = "e-1790900001-3f2a";
         let ack = |ids: &[&str]| Request { ack: ids.iter().map(|s| s.to_string()).collect(), ..Request::new(Op::EventsAck) };
+        let no_inbox = "doesn't declare inbox = true";
         let cases: &[(&str, Request, Status, &str)] = &[
-            ("p", Request::new(Op::Events), Status::Denied, "does not declare `dispatcher`"),
-            ("p", ack(&[id]), Status::Denied, "does not declare"),
-            ("p", Request::new(Op::ThreadLs), Status::Denied, "does not declare"),
-            ("web-one", Request::new(Op::Events), Status::Denied, "children can't be dispatchers"),
+            ("p", Request::new(Op::Events), Status::Denied, "`p` doesn't declare inbox = true"),
+            ("p", ack(&[id]), Status::Denied, no_inbox),
+            ("p", Request::new(Op::ThreadLs), Status::Denied, no_inbox),
+            ("web-one", Request::new(Op::Events), Status::Denied, no_inbox),
+            // Inbox without dispatcher: thread/event ops only.
+            ("o", Request::new(Op::Events), Status::Ok, ""),
+            ("o", ack(&[id]), Status::Ok, "0"),
+            ("o", Request::new(Op::ThreadLs), Status::Ok, "[]"),
+            ("o", req(Op::Ls, None, None), Status::Denied, "does not declare `dispatcher`"),
+            ("o", req(Op::Ensure, Some("web"), Some("x")), Status::Denied, "does not declare `dispatcher`"),
+            // A child may own threads, but never runs child ops.
+            ("owner-one", Request::new(Op::ThreadLs), Status::Ok, "[]"),
+            ("owner-one", req(Op::Ls, None, None), Status::Denied, "children can't be dispatchers"),
             ("ghost", Request::new(Op::ThreadLs), Status::Denied, "not an instance"),
             ("d", Request::new(Op::EventsAck), Status::Usage, "`events-ack` needs `ack`"),
             ("d", ack(&["e-1"]), Status::Usage, "bad event id `e-1`"),

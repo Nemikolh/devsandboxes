@@ -1218,7 +1218,7 @@ fn draw_reply_input(frame: &mut Frame, app: &App, placeholder: Option<&str>, are
             v.lines.iter().map(|l| Line::from(l.clone())).collect()
         }
         _ => {
-            let hint = placeholder.unwrap_or("reply to the dispatcher");
+            let hint = placeholder.unwrap_or("reply to the owner");
             vec![Line::from(Span::styled(hint.to_string(), Style::default().add_modifier(Modifier::DIM)))]
         }
     };
@@ -2672,7 +2672,7 @@ mod tests {
         // Empty: one row, the placeholder.
         let (_, _, _, rows, _) = draw(&app);
         assert_eq!(rows.len(), 1);
-        assert!(rows[0].starts_with("reply to the dispatcher"), "{rows:?}");
+        assert!(rows[0].starts_with("reply to the owner"), "{rows:?}");
 
         // Longer than a row: wrapped, nothing lost, caret after the last char.
         let (_, _, x0, rows, _) = draw(&app);

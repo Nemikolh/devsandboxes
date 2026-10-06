@@ -6,7 +6,13 @@ Dispatchers can now keep one Inbox thread per item, with a state, buttons and a 
 
 ### Added
 
-- **Inbox threads for dispatchers.** `devsbd thread put` puts one thread per item in the Inbox: a title, a link, a state (`needs-you`, `active` or `done`), a status, a message, up to 9 buttons and an optional reply box. A put that changes nothing is ignored (no unread mark, no popup), so a dispatcher can simply re-send all its threads on every pass; a desktop popup only fires when a thread enters `needs-you`. Puts are queued like `notify`, so they work with no dashboard open, and a newer put for the same thread replaces the queued one. `devsbd thread rm` drops a thread, `devsbd thread ls` lists yours back. Only sandboxes that declare `dispatcher` may send threads; a rejected one shows up as an error notification from your instance, with the reason. Full reference: `docs/automations-guide.md`.
+- **Inbox threads for dispatchers.** `devsbd thread put` puts one thread per item in the Inbox: a title, a link, a state (`needs-you`, `active` or `done`), a status, a message, up to 9 buttons and an optional reply box. A put that changes nothing is ignored (no unread mark, no popup), so a dispatcher can simply re-send all its threads on every pass; a desktop popup only fires when a thread enters `needs-you`. Puts are queued like `notify`, so they work with no dashboard open, and a newer put for the same thread replaces the queued one. `devsbd thread rm` drops a thread, `devsbd thread ls` lists yours back. Only sandboxes that declare `inbox = true` may send threads and read their events; `dispatcher` alone only grants the child commands, so a dispatcher that wants threads declares both. A rejected one shows up as an error notification from your instance, with the reason. Full reference: `docs/automations-guide.md`.
+
+```toml
+[sandbox.pr-dispatcher]
+dispatcher = { spawn = ["web"] }
+inbox = true
+```
 
 ```bash
 devsbd thread put --json '{"key":"pr-123","title":"#123 fix login","state":"needs-you","status":"review replies","child":"pr-123","actions":[{"id":"post","label":"Post replies"},{"id":"done","label":"Done","done":true}],"reply":{}}'

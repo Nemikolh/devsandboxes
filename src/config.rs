@@ -138,6 +138,11 @@ pub struct SandboxProperties {
     /// config on every request and baked into nothing, so it's excluded from
     /// `config_hash` like `autostart`.
     pub dispatcher: Option<Dispatcher>,
+    /// `inbox = true` lets this sandbox's instances own Inbox threads
+    /// (`devsbd thread put|rm|ls`, `devsbd events`; docs/inbox-redesign.md,
+    /// _Ownership_). Separate from `dispatcher`, which only grants child ops.
+    /// Checked on every request, so excluded from `config_hash`.
+    pub inbox: Option<bool>,
 
     // --- implemented devcontainer properties ---
     pub image: Option<String>,
@@ -1008,12 +1013,13 @@ fn config_hash(table: &Table) -> String {
 }
 
 /// [`config_hash`] of a merged sandbox table minus the keys that apply without
-/// recreating the container (`autostart`, `dispatcher`, the host-side
+/// recreating the container (`autostart`, `dispatcher`, `inbox`, the host-side
 /// `forwardPorts`), so changing them isn't drift.
 fn sandbox_hash(table: &Table) -> String {
     let mut table = table.clone();
     table.remove("autostart");
     table.remove("dispatcher");
+    table.remove("inbox");
     table.remove("forwardPorts");
     if let Some(toml::Value::Table(folders)) = table.get_mut("folders") {
         normalize_folders(folders);
@@ -1368,6 +1374,26 @@ folders = { "/workspaces/docs" = "../docs", "/workspaces/lib" = { path = "../lib
         let hash = plain.resolve_sandbox("app").unwrap().config_hash;
         assert_eq!(hash, with.resolve_sandbox("app").unwrap().config_hash);
         assert_eq!(with.resolved_table("app").unwrap().1, hash);
+    }
+
+    #[test]
+    fn inbox_parses_merges_and_is_not_drift() {
+        let config = Config::parse(
+            "[template.owner]\ninbox = true\n\
+             [sandbox.a]\nfolder = \".\"\nextends = [\"owner\"]\n\
+             [sandbox.b]\nfolder = \".\"\nextends = [\"owner\"]\ninbox = false\n\
+             [sandbox.c]\nfolder = \".\"\n",
+        )
+        .unwrap();
+        assert_eq!(config.resolve_sandbox("a").unwrap().properties.inbox, Some(true));
+        assert_eq!(config.resolve_sandbox("b").unwrap().properties.inbox, Some(false));
+        assert_eq!(config.resolve_sandbox("c").unwrap().properties.inbox, None);
+        // Toggling it is not drift.
+        let hash = |s| config.resolve_sandbox(s).unwrap().config_hash;
+        assert_eq!(hash("a"), hash("c"));
+        assert_eq!(hash("b"), hash("c"));
+        let bad = Config::parse("[sandbox.a]\ninbox = \"yes\"\n").unwrap();
+        assert!(bad.resolve_sandbox("a").is_err());
     }
 
     #[test]

@@ -251,7 +251,8 @@ impl Request {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
     Ok,
-    /// Not authorized: no `dispatcher` declaration, sandbox not in `spawn`,
+    /// Not authorized: no `dispatcher` (child ops) or `inbox = true` (thread
+    /// and event ops) declaration, sandbox not in `spawn`,
     /// not the child's owner, cap reached, name taken by a foreign instance.
     Denied,
     /// The operation ran and failed (or its target doesn't exist).

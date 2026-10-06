@@ -33,14 +33,14 @@ devsbd notify [--level info|warn|error] [--link URL] [--key K] [--] <msg>...
 ```
 
 - Queued first: each call writes a record to a durable outbox in the container (`/var/lib/devsandbox/outbox/`, survives container restarts) and succeeds even with no host attached.
-- Delivered while the **host daemon** (`devsandbox serve`) runs: it shows up in the Inbox tab (`4`) and as a desktop notification (`notify-send` on Linux, `osascript` on macOS; skipped silently when missing). The dashboard, `run` and `start` start the daemon; it keeps running while a dispatcher does, and otherwise exits 10 minutes after the last dashboard closed. Without it the queue waits. A record is acknowledged to the container only after it is saved, so a host that dies mid-delivery loses nothing: the record is resent.
+- Delivered while the **host daemon** (`devsandbox serve`) runs: it shows up in the Inbox tab (`4`) and as a desktop notification (`notify-send` on Linux, `osascript` on macOS; skipped silently when missing). The dashboard, `run` and `start` start the daemon; it keeps running while a dispatcher or an `inbox = true` instance does, and otherwise exits 10 minutes after the last dashboard closed. Without it the queue waits. A record is acknowledged to the container only after it is saved, so a host that dies mid-delivery loses nothing: the record is resent.
 - An unread notification counts in the Inbox title (`Inbox (N)`) and the yellow `✉N` on its instance row, and sits in the **Needs you** view. It is marked read when you open it, or when you leave the Inbox after it was on screen (in Needs you or All).
 - `--key` threads per instance: a newer notification with the same key becomes the head of that row, and the older ones are listed under *earlier* in the thread pane beside it, so a script re-reporting "PR 123 conflicted" every poll doesn't spam.
 - `--link` (http(s) only) opens with `enter` once the thread has focus. `d` dismisses a notification row with its history; `D` clears every notification (dispatcher threads stay). History is saved in `inbox.toml` next to `state.toml`, shared by every open dashboard and kept across restarts; a dismissal in one dashboard is gone from all of them.
 - Limits: desktop popups are rate-limited per instance (a burst of 3, then one per 10 s) and a keyed notification repeating one popped in the last minute doesn't pop again; the Inbox still gets every one. The Inbox keeps 200 items per instance (notifications, thread timelines and pending events together), so a noisy instance drops its own oldest, not others'.
 - Flags are recognized anywhere before `--`; everything after `--` is message.
 
-`notify` is for one-off news from any sandbox: a run finished, a check failed. For an item that stays open until someone deals with it, and that the user may act on from the dashboard, a dispatcher uses a thread (below).
+`notify` is for one-off news from any sandbox: a run finished, a check failed. For an item that stays open until someone deals with it, and that the user may act on from the dashboard, a sandbox declaring `inbox = true` uses a thread (below).
 
 ## Dispatchers
 
@@ -87,7 +87,7 @@ devsbd events ack <id>...
 devsbd thread ls
 ```
 
-`events`, `events ack` and `thread ls` are covered under [Inbox threads](#inbox-threads).
+`events`, `events ack` and `thread ls` need `inbox = true` rather than `dispatcher`; they're covered under [Inbox threads](#inbox-threads).
 
 - `ensure` is idempotent: creates `<sandbox>-<key>` if missing, starts it if stopped, recreates it if its container is gone, and prints the instance name. `--branch` applies only at creation (ignored for an existing child). `--env` values are recorded and kept when the child is rebuilt or its container recreated; on an existing child, `--env` replaces the recorded set with exactly the given one (a variable left out is dropped; no `--env` keeps it). Every command devsandbox runs in the child uses the recorded values from then on (`devsandbox exec`, the dashboard's terminals, `devsbd exec` runs, lifecycle commands), overriding a `remoteEnv` entry of the same name. The container's own environment is only set when it's created, so processes already running, PID 1, and a hand-run `docker exec` keep the old values until `devsandbox rebuild`. `--branch` names the branch of the child's worktree: an existing local branch is checked out as is, one only on `origin` (e.g. a PR head) is fetched and checked out as a local branch tracking `origin/<branch>` (so a plain `git push` updates the PR), anything else is created from the repo's default base. A branch already checked out elsewhere (the base checkout, another instance) is an error naming where. `rm` only offers to delete a branch the child created. The name is taken literally (no `${…}` substitution, unlike the sandbox's `worktree-branch` pattern) and must be 1–200 chars of `[A-Za-z0-9._/-]`, not start with `-`, `/` or `.`, not end with `/` or `.`, and contain no `..`, `//`, component starting with `.` or ending in `.lock`; anything else is a usage error (exit 2). Without `--branch` the child's branch comes from `worktree-branch` (default `sandbox/${instance}`). `--env` may not set variables that steer what runs (denied, exit 77): `PATH`, `HOME`, `SHELL`, `USER`, `ENV`, `BASH_ENV`, `IFS`, `CDPATH`, `PS4`, `PROMPT_COMMAND`, `SSH_AUTH_SOCK`, `TMPDIR`, `GCONV_PATH`, `NODE_OPTIONS`, `RUBYOPT`, and anything starting with `LD_`, `DYLD_`, `GIT_`, `PYTHON` or `PERL5` (matched case-insensitively).
 - `ls` prints a JSON array of this dispatcher's children: `name`, `sandbox`, `key`, `state` (`running` | `stopped` | `missing`), `branch`, `done`.
@@ -140,9 +140,17 @@ A child marked **done** is kept as is (container, worktree, runs), shown dimmed 
 
 ## Inbox threads
 
-A dispatcher can put **threads** in the Inbox: one row per item it tracks (a PR, an email to answer), with a state, a status, a message, buttons and an optional reply box. The dispatcher owns what they mean; devsandbox stores them, shows them, runs the built-in buttons and hands everything else back as **events** the dispatcher pulls. Its own state stays the source of truth: threads are a projection of it, so losing the Inbox loses nothing.
+A sandbox that declares `inbox = true` (typically a dispatcher) can put **threads** in the Inbox: one row per item it tracks (a PR, an email to answer), with a state, a status, a message, buttons and an optional reply box. The owner decides what they mean; devsandbox stores them, shows them, runs the built-in buttons and hands everything else back as **events** the owner pulls. Its own state stays the source of truth: threads are a projection of it, so losing the Inbox loses nothing.
 
-Use `notify` for one-off news, from any sandbox. Use a thread for anything still open that the user may act on: it stays in one row, changes state instead of piling up messages, and leaves **Needs you** once it's resolved. Only instances whose sandbox declares `dispatcher` may put threads.
+Use `notify` for one-off news, from any sandbox. Use a thread for anything still open that the user may act on: it stays in one row, changes state instead of piling up messages, and leaves **Needs you** once it's resolved. Only instances whose sandbox declares `inbox = true` may put, remove or list threads and read their events:
+
+```toml
+[sandbox.pr-dispatcher]
+dispatcher = { spawn = ["web"] }   # child ops: ensure, exec, rm, …
+inbox = true                        # threads and events
+```
+
+`dispatcher` only grants the child ops; a dispatcher that wants threads declares both. Any other sandbox, a dispatcher's child included, may declare `inbox = true` to own threads of its own. Like `dispatcher`, it's re-read on every message and request and never marks instances drifted.
 
 ### `devsbd thread put`
 
@@ -153,7 +161,7 @@ devsbd thread rm <key>
 devsbd thread ls
 ```
 
-`put` queues the whole thread in the same durable outbox as `notify`, so it works with no dashboard open and is delivered later, in order. The helper only checks JSON syntax, that `key` is a valid key and that the record fits in 64 KiB (exit 2 otherwise); the dashboard checks the rest when it applies the put. A rejected put (or any thread message from a sandbox that doesn't declare `dispatcher`) becomes an `error` notification from your own instance in the Inbox, keyed `thread:<key>`, reading `thread put rejected: <why>` or `thread put denied: <why>`: watch for those while writing a dispatcher.
+`put` queues the whole thread in the same durable outbox as `notify`, so it works with no dashboard open and is delivered later, in order. The helper only checks JSON syntax, that `key` is a valid key and that the record fits in 64 KiB (exit 2 otherwise); the dashboard checks the rest when it applies the put. A rejected put (or any thread message from a sandbox that doesn't declare `inbox = true`) becomes an `error` notification from your own instance in the Inbox, keyed `thread:<key>`, reading `thread put rejected: <why>` or `thread put denied: <why>`: watch for those while writing a dispatcher.
 
 ```json
 {
@@ -222,7 +230,7 @@ Your put always wins: if the user marked a thread done and your next pass puts i
 
 While no host daemon runs, a queued `put` or `rm` for a key replaces any older queued `put`/`rm` for the same key (notifications are never coalesced), so a dispatcher re-asserting every few minutes overnight doesn't pile up files.
 
-`thread rm <key>` drops one of your threads, its pending events with it. `thread ls` prints a JSON array of your live threads in `put` shape (the `state` reflects the user's done/reopen too), for a dispatcher that lost its own state; it needs the host daemon (exit 75 otherwise). Threads are tied to your instance's id, not its name: they survive stop, restart and rebuild. `devsandbox rm` of the dispatcher archives them (read-only, shown only in **All**). Done and archived threads are dropped 14 days after their last change, unless a done thread still has events you haven't acked; past the 200-per-instance cap, archived threads go first, then done ones.
+`thread rm <key>` drops one of your threads, its pending events with it. `thread ls` prints a JSON array of your live threads in `put` shape (the `state` reflects the user's done/reopen too), for an owner that lost its own state; it needs the host daemon (exit 75 otherwise). Threads are tied to your instance's id, not its name: they survive stop, restart and rebuild. `devsandbox rm` of the owner archives them (read-only, shown only in **All**). Done and archived threads are dropped 14 days after their last change, unless a done thread still has events you haven't acked; past the 200-per-instance cap, archived threads go first, then done ones.
 
 ### Events
 
@@ -257,7 +265,7 @@ devsbd events ack <id>...
 
 ### Sample: a thread loop
 
-One file per item in `.items/` holds its state; the loop re-puts every thread, then waits for clicks. POSIX sh, with `jq`.
+For a sandbox with `inbox = true`. One file per item in `.items/` holds its state; the loop re-puts every thread, then waits for clicks. POSIX sh, with `jq`.
 
 ```sh
 #!/bin/sh

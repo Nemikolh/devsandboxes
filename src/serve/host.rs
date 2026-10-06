@@ -237,10 +237,17 @@ fn running_containers() -> anyhow::Result<Vec<String>> {
     Ok(rows.into_iter().filter(|r| r.state == "running").map(|r| r.name).collect())
 }
 
-/// Whether instance `key` expects a live host while it runs: it declares
-/// `dispatcher` (children never do). `inbox = true` (step 11) joins here.
+/// Whether instance `key` expects a live host while it runs (see
+/// [`holds_host`]). One state + config load for both rules.
 fn expects_host(key: &str) -> bool {
-    crate::commands::dispatch::declares_dispatcher(key)
+    crate::commands::dispatch::current_sandbox(key).is_some_and(|(info, props)| holds_host(&info, &props))
+}
+
+/// The holder rule: the instance declares `dispatcher` (children never count
+/// as one) or `inbox = true` (its threads' events need a live host).
+fn holds_host(info: &crate::state::Instance, props: &crate::config::SandboxProperties) -> bool {
+    use crate::commands::dispatch::{is_dispatcher, is_inbox_owner};
+    is_dispatcher(info, props) || is_inbox_owner(props)
 }
 
 /// The live-instance holder count: instances in `state` whose container is
@@ -311,6 +318,25 @@ mod tests {
         workspace = "/workspaces/web"
         created_unix = 0
     "#;
+
+    #[test]
+    fn holders_declare_dispatcher_or_inbox() {
+        let s = state(STATE);
+        let props = |toml: &str| {
+            let config = crate::config::Config::parse(&format!("[sandbox.x]\n{toml}")).unwrap();
+            config.resolve_sandbox("x").unwrap().properties
+        };
+        let (top, child) = (&s.instances["disp"], &s.instances["disp-pr-1"]);
+        let dispatcher = props("dispatcher = { spawn = [] }\n");
+        let inbox = props("inbox = true\n");
+        assert!(holds_host(top, &dispatcher));
+        assert!(holds_host(top, &inbox));
+        assert!(!holds_host(top, &props("inbox = false\n")));
+        assert!(!holds_host(top, &props("")));
+        // A child is never a dispatcher, but may own threads.
+        assert!(!holds_host(child, &dispatcher));
+        assert!(holds_host(child, &inbox));
+    }
 
     #[test]
     fn live_instances_are_running_ones_that_expect_a_host() {

@@ -184,11 +184,11 @@ the close.
 The daemon exits 10 minutes after its last *holder* left; a new holder
 cancels the countdown. Holders today: connected clients (an open
 dashboard, a running `exec` that relays the agent, an `api --stdio`
-relay), running instances that declare `dispatcher` (as of the last
-poll; `inbox = true` joins in step 11), in-flight control requests, every
+relay), running instances that declare `dispatcher` or `inbox = true` (as
+of the last poll), in-flight control requests, every
 live port forward (ad-hoc or configured, whatever its state), and the
-startup autostart pass while it runs. So with a dispatcher running the
-daemon never idles, and by design neither does it while an instance with
+startup autostart pass while it runs. So with a dispatcher or a thread
+owner running the daemon never idles, and by design neither does it while an instance with
 `forwardPorts` runs, or an ad-hoc forward exists (stop it in the Ports tab
 with `d`). A later step adds `--follow` subscribers (step 18).
 

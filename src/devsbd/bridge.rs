@@ -977,12 +977,12 @@ pub type OnShown = Box<dyn Fn(&str, String) + Send + Sync>;
 /// out of the sink closure so the store write (the thing the daemon's `ok`
 /// acknowledges) and the display decision are one read-modify-write.
 ///
-/// Authorization is only evaluated for thread messages: `declares_dispatcher`
+/// Authorization is only evaluated for thread messages: `declares_inbox`
 /// loads `state.toml` and the config, which a plain notify must not pay for.
 fn apply_message(n: Notification) -> Result<Option<(String, crate::inbox::Shown)>, String> {
     use crate::commands::dispatch;
     let threaded = !matches!(n.message, notify::Message::Notify(_));
-    let declares = threaded && dispatch::declares_dispatcher(&n.instance);
+    let declares = threaded && dispatch::declares_inbox(&n.instance);
     let action = crate::inbox::decide(&n.instance, declares, n.message);
     let shown = crate::inbox::store::path()
         .and_then(|path| crate::inbox::ops::sink(&path, &n.instance_id, &n.instance, action))

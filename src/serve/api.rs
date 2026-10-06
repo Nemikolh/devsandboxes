@@ -432,7 +432,7 @@ fn resolve<'a>(inbox: &'a Inbox, addr: &Addr) -> Result<&'a Thread, ApiError> {
 fn user_target<'a>(inbox: &'a Inbox, addr: &Addr) -> Result<&'a Thread, ApiError> {
     let t = resolve(inbox, addr)?;
     if t.kind != Kind::Thread {
-        return Err(ApiError::invalid(format!("thread {} is a notification, not a dispatcher thread", t.id)));
+        return Err(ApiError::invalid(format!("thread {} is a notification, not an owner thread", t.id)));
     }
     if t.archived {
         return Err(ApiError::denied(format!("thread {} is archived: its owner was removed", t.id)));
@@ -552,7 +552,7 @@ fn dismiss(p: DismissParams, ctx: &Ctx) -> Answer {
     mutate(ctx, |inbox| {
         let t = resolve(inbox, &p.addr)?;
         if t.kind != Kind::Notify {
-            return Err(ApiError::invalid(format!("thread {} is a dispatcher thread; only notifications are dismissed", t.id)));
+            return Err(ApiError::invalid(format!("thread {} is an owner thread; only notifications are dismissed", t.id)));
         }
         Ok(vec![Op::RemoveThread(t.id)])
     })
@@ -569,7 +569,7 @@ fn notify_mark_read(p: DismissParams, ctx: &Ctx) -> Answer {
     mutate(ctx, |inbox| {
         let t = resolve(inbox, &p.addr)?;
         if t.kind != Kind::Notify {
-            return Err(ApiError::invalid(format!("thread {} is a dispatcher thread, not a notification", t.id)));
+            return Err(ApiError::invalid(format!("thread {} is an owner thread, not a notification", t.id)));
         }
         Ok(vec![Op::MarkRead(t.id)])
     })
