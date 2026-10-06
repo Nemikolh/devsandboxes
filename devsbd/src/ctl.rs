@@ -1,5 +1,5 @@
 //! `devsbd ensure|ls|branches|stop|rm|done|exec`, `devsbd run ls|logs|wait|rm|prune <key> …`,
-//! `devsbd events [--wait SECS]`, `devsbd events ack <id>...` and `devsbd
+//! `devsbd events [--wait SECS] [--thread KEY]`, `devsbd events ack <id>...` and `devsbd
 //! thread ls`: the control commands (child ops need `dispatcher`, the thread
 //! and event ops `inbox = true`) (docs/automations.md, "Control
 //! API", "Runs"; docs/inbox-threads.md, *Events*). Each request is one encoded [`control::Request`] sent to the
@@ -30,7 +30,7 @@ const USAGE: &str = "usage: devsbd ensure <sandbox> --key <key> [--branch B] [--
        devsbd run wait <key> <id> [--sandbox S] [--timeout SECS]\n\
        devsbd run rm <key> <id> [--sandbox S] [--force]\n\
        devsbd run prune <key> [--sandbox S] [--keep N]\n\
-       devsbd events [--wait SECS]\n\
+       devsbd events [--wait SECS] [--thread KEY]\n\
        devsbd events ack <id>...\n\
        devsbd thread ls [--feed]";
 
@@ -124,7 +124,7 @@ fn parse_args(verb: &str, args: &[String]) -> Result<Cmd, String> {
         let allowed = match (op, flag) {
             (Op::Ensure, "--key" | "--branch" | "--env") => true,
             (Op::Branches, "--ahead") => true,
-            (Op::Events, "--wait") => true,
+            (Op::Events, "--wait" | "--thread") => true,
             (Op::ThreadLs, "--feed") => true,
             (Op::Ls | Op::Ensure | Op::Branches | Op::Events | Op::EventsAck | Op::ThreadLs, _) => false,
             (_, "--sandbox") => true,
@@ -170,6 +170,8 @@ fn parse_args(verb: &str, args: &[String]) -> Result<Cmd, String> {
                 set_once(&mut req.timeout, secs.min(control::MAX_WAIT), flag)?;
             }
             "--key" => set_once(&mut req.key, value()?, flag)?,
+            // The request's `key` is `events`' thread filter.
+            "--thread" => set_once(&mut req.key, value()?, flag)?,
             "--branch" => {
                 let b = value()?;
                 if !control::valid_branch(&b) {
@@ -514,6 +516,20 @@ mod tests {
         assert_eq!(ack, Request { ack: vec![e1.into(), e2.into()], ..Request::new(Op::EventsAck) });
         assert_eq!(control::decode_request(&control::encode_request(&ack)), Ok(ack));
         assert_eq!(parse("thread-ls", &[]).unwrap(), Request::new(Op::ThreadLs));
+        // `--thread` filters (the request's `key`), alone or with `--wait`.
+        let on = |k: &str| Request { key: Some(k.into()), ..Request::new(Op::Events) };
+        assert_eq!(parse("events", &["--thread", "pr-1"]).unwrap(), on("pr-1"));
+        assert_eq!(parse("events", &["--thread=pr-1"]).unwrap(), on("pr-1"));
+        let both = parse("events", &["--thread", "pr-1", "--wait=30"]).unwrap();
+        assert_eq!(both, Request { timeout: Some(30), ..on("pr-1") });
+        assert_eq!(control::decode_request(&control::encode_request(&both)), Ok(both));
+        assert_eq!(parse("events", &["--thread"]).unwrap_err(), "--thread needs a value");
+        assert_eq!(parse("events", &["--thread="]).unwrap_err(), "--thread needs a value");
+        assert_eq!(parse("events", &["--thread", "a", "--thread", "b"]).unwrap_err(), "--thread given twice");
+        assert_eq!(parse("events", &["--key", "pr-1"]).unwrap_err(), "unknown option `--key`");
+        assert_eq!(parse("events-ack", &[e1, "--thread", "pr-1"]).unwrap_err(), "unknown option `--thread`");
+        assert_eq!(parse("thread-ls", &["--thread", "pr-1"]).unwrap_err(), "unknown option `--thread`");
+        assert_eq!(parse("ls", &["--thread", "pr-1"]).unwrap_err(), "unknown option `--thread`");
 
         assert!(parse("events", &["--wait", "x"]).unwrap_err().contains("bad number"));
         assert_eq!(parse("events", &["--wait"]).unwrap_err(), "--wait needs a value");

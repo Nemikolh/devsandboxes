@@ -115,7 +115,7 @@ devsbd stop <key> [--sandbox S]
 devsbd rm <key> [--sandbox S]
 devsbd done <key> [--sandbox S]             # mark a child done; `ensure` reusing it clears it
 devsbd exec <key> [--sandbox S] [--detach] -- <cmd>...   # a run; see _Runs_
-devsbd events [--wait SECS]                 # pending Inbox events (JSON lines); see _Inbox threads_
+devsbd events [--wait SECS] [--thread KEY]  # pending Inbox events (JSON lines); see _Inbox threads_
 devsbd events ack <id>...
 devsbd thread ls                            # this instance's live threads (JSON; needs inbox = true)
 ```
@@ -185,9 +185,9 @@ Threads are keyed by `(owner instance_id, key)` and kind (a notify key and a thr
 
 ### Control ops
 
-`events`, `events-ack`, `thread-ls` and `done` join the control codec (`src/devsbd/control.rs`, whose module doc has the line format and the `events` JSON). `events` takes `timeout` (capped at `MAX_WAIT`, 300 s, by the helper and the host), `events-ack` a repeatable `ack <id>` field; neither takes `sandbox` or `key`, since they always address the requester's own threads.
+`events`, `events-ack`, `thread-ls` and `done` join the control codec (`src/devsbd/control.rs`, whose module doc has the line format and the `events` JSON). `events` takes `timeout` (capped at `MAX_WAIT`, 300 s, by the helper and the host), `events-ack` a repeatable `ack <id>` field; neither takes `sandbox`, since they always address the requester's own threads. `events` takes an optional `key`: the thread filter (`devsbd events --thread`), reusing the codec's existing field rather than adding one, since a thread key has the child key's charset (`valid_key`); `events-ack` and `thread-ls` take no `key`.
 
-- `events`: the requester's pending events, oldest first across threads, one JSON object per line (`id`, `key`, `kind` = action|reply|done|reopen, `action?`, `text?`, `at` RFC 3339 UTC). All of them until acked: delivery is at least once. With a `timeout` and nothing pending, the handler thread waits, re-reading the store only when its stamp moves (every 500 ms). It holds no lock beyond the store's shared one and skips the host control lock, so a waiting `events` never delays a click being written or another dispatcher's `ensure`. The body stops at about half of `MAX_RESPONSE`; the rest follows after an ack.
+- `events`: the requester's pending events, oldest first across threads, one JSON object per line (`id`, `thread`, `key`, `kind` = action|reply|done|reopen|submit, `action?`, `text?`, `message?`, `form?`, `answers?`, `at` RFC 3339 UTC). `key` is the deprecated v2 name of `thread`, same value, removed with the other v2 compat (step 13b of `docs/inbox-redesign.md`). All of them until acked: delivery is at least once. With a `key` filter, only that thread's events are answered and waited for; an unknown thread answers none (a dispatcher may filter before its first put lands). With a `timeout` and nothing pending, the handler thread waits, re-reading the store only when its stamp moves (every 500 ms). It holds no lock beyond the store's shared one and skips the host control lock, so a waiting `events` never delays a click being written or another dispatcher's `ensure`. The body stops at about half of `MAX_RESPONSE`; the rest follows after an ack.
 - `events-ack`: drops the requester's events with those ids, answers the count; unknown ids are skipped.
 - `thread-ls`: the requester's live (non-archived) threads as a JSON array in `thread put` shape.
 - `done`: sets `done = <unix secs>` on an owned child in `state.toml` (through an `Executor` method, so tests stay fake), under the host control lock like `ensure`/`stop`/`rm`. `ensure` reusing a done child clears it before its subprocess runs.

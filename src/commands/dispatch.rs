@@ -388,7 +388,10 @@ pub(crate) fn handle_with(
                 Err(e) => return failed(e),
             };
             match req.op {
-                Op::Events => events(&path, owner_id, req.timeout.unwrap_or(0).min(MAX_WAIT)),
+                Op::Events => {
+                    let timeout = req.timeout.unwrap_or(0).min(MAX_WAIT);
+                    events(&path, owner_id, req.key.as_deref(), timeout)
+                }
                 Op::EventsAck => match inbox_ops::ack(&path, owner_id, &req.ack) {
                     Ok(n) => Response::new(Status::Ok, n.to_string()),
                     Err(e) => failed(format!("{e:#}")),
@@ -407,6 +410,8 @@ const EVENTS_BODY_CAP: usize = control::MAX_RESPONSE / 2 - 1024;
 #[derive(Serialize)]
 struct EventLine<'a> {
     id: &'a str,
+    thread: &'a str,
+    // v2 event compat (key), removed in step 13b: `thread` under its old name.
     key: &'a str,
     kind: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -427,10 +432,11 @@ struct EventLine<'a> {
 /// call, once the owner acked these.
 fn events_body(pending: &[(String, Event)]) -> String {
     let mut body = String::new();
-    for (key, e) in pending {
+    for (thread, e) in pending {
         let line = EventLine {
             id: &e.id,
-            key,
+            thread,
+            key: thread,
             kind: e.kind.as_str(),
             action: e.action.as_deref(),
             text: e.text.as_deref(),
@@ -451,13 +457,23 @@ fn events_body(pending: &[(String, Event)]) -> String {
     body
 }
 
-/// `events`: `owner_id`'s pending events in the store at `path`. With
+/// `pending` narrowed to `thread`'s events, if one is given. An unknown
+/// thread is just none: a dispatcher may filter before its first put lands.
+fn on_thread(mut pending: Vec<(String, Event)>, thread: Option<&str>) -> Vec<(String, Event)> {
+    if let Some(thread) = thread {
+        pending.retain(|(t, _)| t == thread);
+    }
+    pending
+}
+
+/// `events`: `owner_id`'s pending events in the store at `path`, only
+/// `thread`'s if given (so a wait ends on an event there, not on any). With
 /// nothing pending and a `timeout`, wait on the handler thread, re-reading
 /// the store only when this process wrote it or its stamp moved (checked
 /// every [`EVENTS_POLL`]); an empty body on timeout. Reads only: no lock
 /// beyond the store's own shared one, so a waiting `events` never holds up
 /// a click being written.
-fn events(path: &Path, owner_id: &str, timeout: u64) -> Response {
+fn events(path: &Path, owner_id: &str, thread: Option<&str>, timeout: u64) -> Response {
     let deadline = Instant::now() + Duration::from_secs(timeout);
     let mut seen = None;
     loop {
@@ -468,7 +484,7 @@ fn events(path: &Path, owner_id: &str, timeout: u64) -> Response {
         if stamp != seen {
             seen = stamp;
             let pending = match inbox_ops::events(path, owner_id) {
-                Ok(pending) => pending,
+                Ok(pending) => on_thread(pending, thread),
                 Err(e) => return failed(format!("{e:#}")),
             };
             if !pending.is_empty() {
@@ -582,8 +598,10 @@ fn check_fields(req: &Request) -> Result<(), String> {
         Op::Ls => (Some(false), Some(false)),
         Op::Ensure => (Some(true), Some(true)),
         Op::Branches => (Some(true), Some(false)),
-        // Always the requester's own: nothing to name.
-        Op::Events | Op::EventsAck | Op::ThreadLs => (Some(false), Some(false)),
+        // Always the requester's own: nothing to name. `events` takes `key`
+        // as its optional thread filter (`devsbd events --thread`).
+        Op::Events => (Some(false), None),
+        Op::EventsAck | Op::ThreadLs => (Some(false), Some(false)),
         _ => (None, Some(true)),
     };
     let only = |ops: &[Op], optional: bool| match (ops.contains(&req.op), optional) {
@@ -2216,6 +2234,8 @@ folder = "."
         assert_eq!(resp.status, Status::Ok, "{resp:?}");
         let got = lines(&resp);
         assert_eq!(got.len(), 2, "{}", resp.body);
+        assert_eq!(got[0]["thread"], "pr-1");
+        // v2 event compat (key), removed in step 13b.
         assert_eq!(got[0]["key"], "pr-1");
         assert_eq!(got[0]["kind"], "reply");
         assert_eq!(got[0]["text"], "first \"one\"");
@@ -2275,7 +2295,11 @@ folder = "."
             ("d", ack(&["e-1"]), Status::Usage, "bad event id `e-1`"),
             ("d", Request { ack: vec![id.into()], ..Request::new(Op::Events) }, Status::Usage, "`events` takes no `ack`"),
             ("d", Request { timeout: Some(1), ..Request::new(Op::ThreadLs) }, Status::Usage, "`thread-ls` takes no `timeout`"),
-            ("d", Request { key: Some("pr-1".into()), ..Request::new(Op::Events) }, Status::Usage, "`events` takes no `key`"),
+            // `key` is `events`' thread filter only: no other inbox op takes it.
+            ("d", Request { key: Some("pr-1".into()), ..Request::new(Op::EventsAck) }, Status::Usage, "`events-ack` takes no `key`"),
+            ("d", Request { key: Some("pr-1".into()), ..Request::new(Op::ThreadLs) }, Status::Usage, "`thread-ls` takes no `key`"),
+            ("d", Request { key: Some("PR 1".into()), ..Request::new(Op::Events) }, Status::Usage, "bad key `PR 1`"),
+            ("d", Request { key: Some("pr-1".into()), sandbox: Some("web".into()), ..Request::new(Op::Events) }, Status::Usage, "`events` takes no `sandbox`"),
             ("d", Request { sandbox: Some("web".into()), ..Request::new(Op::ThreadLs) }, Status::Usage, "takes no `sandbox`"),
             ("d", Request { timeout: Some(1), ..run_req(Op::RunLs, "one") }, Status::Usage, "`run-ls` takes no `timeout`"),
             ("d", Request { ack: vec![id.into()], ..run_req(Op::RunLs, "one") }, Status::Usage, "takes no `ack`"),
@@ -2363,6 +2387,93 @@ folder = "."
         writer.join().unwrap();
         assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
         assert_eq!(lines(&resp)[0]["text"], "slow");
+    }
+
+    /// The user replies `text` on `owner`'s thread `key`, putting it first
+    /// (reply-taking) if it doesn't exist yet.
+    fn reply_on(path: &Path, owner: &str, key: &str, text: &str, at: u64) {
+        use crate::inbox::{Compose, State as TState, ThreadPut};
+        store::update_at(path, |i| {
+            let find = |i: &crate::inbox::Inbox| {
+                i.threads.iter().find(|t| t.owner == owner && t.key.as_deref() == Some(key)).map(|t| t.id)
+            };
+            if find(i).is_none() {
+                let put = ThreadPut {
+                    key: key.into(),
+                    title: key.into(),
+                    state: TState::NeedsYou,
+                    compose: Some(Compose::default()),
+                    ..ThreadPut::default()
+                };
+                i.put(owner, owner, 1, put);
+            }
+            let id = find(i).unwrap();
+            i.apply(&crate::inbox::Op::Reply { thread: id, text: text.into() }, at, "tui");
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn events_thread_filter_selects_one_thread() {
+        let s = state();
+        let (path, mut fake) = inbox_fake("filter");
+        reply(&path, "d", "one", 1);
+        reply_on(&path, "d", "pr-2", "two", 2);
+        reply_on(&path, "d", "pr-1", "three", 4);
+        reply(&path, "a", "theirs", 3);
+        let on = |t: &str| Request { key: Some(t.into()), ..Request::new(Op::Events) };
+        let texts = |resp: &Response| -> Vec<String> {
+            lines(resp).iter().map(|e| e["text"].as_str().unwrap().to_string()).collect()
+        };
+        assert_eq!(texts(&call(&s, "d", &Request::new(Op::Events), &mut fake)), ["one", "two", "three"]);
+        let resp = call(&s, "d", &on("pr-2"), &mut fake);
+        assert_eq!(texts(&resp), ["two"]);
+        assert_eq!((lines(&resp)[0]["thread"].as_str(), lines(&resp)[0]["key"].as_str()), (Some("pr-2"), Some("pr-2")));
+        assert_eq!(texts(&call(&s, "d", &on("pr-1"), &mut fake)), ["one", "three"]);
+        // Unknown (not put yet) or another owner's: nothing, not an error.
+        assert_eq!(call(&s, "d", &on("pr-9"), &mut fake), Response::new(Status::Ok, ""));
+        assert_eq!(texts(&call(&s, "a", &on("pr-2"), &mut fake)), Vec::<String>::new());
+    }
+
+    /// A filtered wait isn't ended by the owner's event on another thread:
+    /// it keeps waiting for one on its own.
+    #[test]
+    fn events_wait_with_a_thread_filter_waits_for_that_thread() {
+        let s = state();
+        let (path, mut fake) = inbox_fake("filter-wait");
+        reply_on(&path, "d", "pr-2", "seed", 1);
+        let pending = lines(&call(&s, "d", &Request::new(Op::Events), &mut fake));
+        let ack = Request { ack: vec![pending[0]["id"].as_str().unwrap().into()], ..Request::new(Op::EventsAck) };
+        assert_eq!(call(&s, "d", &ack, &mut fake).body, "1");
+
+        let writer = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(200));
+                reply_on(&path, "d", "pr-1", "other thread", 10);
+                std::thread::sleep(Duration::from_millis(600));
+                reply_on(&path, "d", "pr-2", "ours", 11);
+            })
+        };
+        let started = Instant::now();
+        let req = Request { key: Some("pr-2".into()), timeout: Some(30), ..Request::new(Op::Events) };
+        let resp = call(&s, "d", &req, &mut fake);
+        writer.join().unwrap();
+        let elapsed = started.elapsed();
+        assert!(elapsed >= Duration::from_millis(700) && elapsed < Duration::from_secs(10), "{elapsed:?}");
+        let got = lines(&resp);
+        assert_eq!(got.len(), 1, "{resp:?}");
+        assert_eq!((got[0]["thread"].as_str(), got[0]["text"].as_str()), (Some("pr-2"), Some("ours")));
+
+        // Only another thread's event pending: the filtered wait times out empty.
+        let started = Instant::now();
+        let req = Request { key: Some("pr-2".into()), timeout: Some(1), ..Request::new(Op::Events) };
+        let ours = lines(&call(&s, "d", &Request { key: Some("pr-2".into()), ..Request::new(Op::Events) }, &mut fake));
+        let ack = Request { ack: vec![ours[0]["id"].as_str().unwrap().into()], ..Request::new(Op::EventsAck) };
+        assert_eq!(call(&s, "d", &ack, &mut fake).body, "1");
+        assert_eq!(call(&s, "d", &req, &mut fake), Response::new(Status::Ok, ""));
+        assert!(started.elapsed() >= Duration::from_secs(1));
+        assert_eq!(lines(&call(&s, "d", &Request::new(Op::Events), &mut fake)).len(), 1, "the other is still pending");
     }
 
     #[test]
@@ -2458,7 +2569,8 @@ folder = "."
         got[0].as_object_mut().unwrap().remove("id");
         assert_eq!(
             got[0],
-            serde_json::json!({"key": "pr-1", "kind": "submit", "message": "run-1", "form": "f1",
+            // v2 event compat (key), removed in step 13b: `key` mirrors `thread`.
+            serde_json::json!({"thread": "pr-1", "key": "pr-1", "kind": "submit", "message": "run-1", "form": "f1",
                 "answers": {"ok": true, "why": "", "pick": null}, "at": "2026-10-02T00:13:21Z"})
         );
         assert!(!resp.body.contains("client") && !resp.body.contains("some-gui"), "{}", resp.body);

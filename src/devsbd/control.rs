@@ -11,7 +11,7 @@
 //! op ensure             required, once: ensure|ls|stop|rm|done|exec|run-ls|run-logs|run-wait|run-rm|run-prune|
 //!                       branches|events|events-ack|thread-ls
 //! sandbox web           optional, at most once
-//! key pr-123            optional, at most once
+//! key pr-123            optional, at most once: a child key, or `events`' thread filter
 //! branch feat/x         optional, at most once
 //! env FOO=bar           optional, repeatable, each `K=V` (see `parse_env`)
 //! arg zidane            optional, repeatable: `exec`'s command, one line per argv word
@@ -41,11 +41,13 @@
 //! JSON object per line, all of them until acked (delivery is at least once):
 //!
 //! ```text
-//! {"id":"e-1790900001-3f2a","key":"pr-6900","kind":"action","action":"post","at":"2026-10-02T12:00:01Z"}
-//! {"id":"e-1790900042-77c1","key":"pr-6900","kind":"reply","text":"…","at":"2026-10-02T12:00:42Z"}
+//! {"id":"e-1790900001-3f2a","thread":"pr-6900","key":"pr-6900","kind":"action","action":"post","at":"2026-10-02T12:00:01Z"}
+//! {"id":"e-1790900042-77c1","thread":"pr-6900","key":"pr-6900","kind":"reply","text":"…","at":"2026-10-02T12:00:42Z"}
 //! ```
 //!
-//! `kind` is action|reply|done|reopen|submit; `action` (the button's id: an
+//! `thread` is the thread's key; `key` is its deprecated alias (v2 event
+//! compat, removed in step 13b). With a `key`, only that thread's events are
+//! answered (and waited for); an unknown thread answers none. `kind` is action|reply|done|reopen|submit; `action` (the button's id: an
 //! `action`, or a `done` from a `done: true` button), `text` (a `reply`) and
 //! `message`, `form`, `answers` (a `submit`: every question's answer, by
 //! question id) are left out when absent; `at` is RFC 3339 UTC. With a

@@ -82,7 +82,7 @@ devsbd run logs <key> <id> [--sandbox S] [--follow]
 devsbd run wait <key> <id> [--sandbox S] [--timeout SECS]
 devsbd run rm <key> <id> [--sandbox S] [--force]
 devsbd run prune <key> [--sandbox S] [--keep N]
-devsbd events [--wait SECS]
+devsbd events [--wait SECS] [--thread KEY]
 devsbd events ack <id>...
 devsbd thread ls
 ```
@@ -353,15 +353,15 @@ API clients answer forms with `inbox.form.saveDraft` and `inbox.form.submit` (do
 What the user does on a thread comes back as an event, held by the host until you ack it:
 
 ```
-devsbd events [--wait SECS]     # JSON lines, oldest first
+devsbd events [--wait SECS] [--thread KEY]   # JSON lines, oldest first
 devsbd events ack <id>...
 ```
 
 ```json
-{"id":"e-1790900001-3f2a","key":"pr-6900","kind":"action","action":"post","at":"2026-10-02T12:00:01Z"}
-{"id":"e-1790900042-77c1","key":"pr-6900","kind":"reply","text":"Also rename the event to agent_run.cost","at":"2026-10-02T12:00:42Z"}
-{"id":"e-1790900050-0b9e","key":"pr-6900","kind":"done","action":"done","at":"2026-10-02T12:00:50Z"}
-{"id":"e-1790900061-5d10","key":"pr-6900","kind":"submit","message":"run-1791277117","form":"drafts","answers":{"c-3726888733":"post","c-3726888733-text":"Already batched…","notes":""},"at":"2026-10-02T12:01:01Z"}
+{"id":"e-1790900001-3f2a","thread":"pr-6900","key":"pr-6900","kind":"action","action":"post","at":"2026-10-02T12:00:01Z"}
+{"id":"e-1790900042-77c1","thread":"pr-6900","key":"pr-6900","kind":"reply","text":"Also rename the event to agent_run.cost","at":"2026-10-02T12:00:42Z"}
+{"id":"e-1790900050-0b9e","thread":"pr-6900","key":"pr-6900","kind":"done","action":"done","at":"2026-10-02T12:00:50Z"}
+{"id":"e-1790900061-5d10","thread":"pr-6900","key":"pr-6900","kind":"submit","message":"run-1791277117","form":"drafts","answers":{"c-3726888733":"post","c-3726888733-text":"Already batched…","notes":""},"at":"2026-10-02T12:01:01Z"}
 ```
 
 | `kind` | sent when | extra field |
@@ -372,11 +372,12 @@ devsbd events ack <id>...
 | `reopen` | `u` in the pane on a done thread (it goes back to `active`) | |
 | `submit` | a form was submitted ([Forms](#forms)) | `message`, `form`: the message's and the form's ids; `answers`: every question's answer |
 
-`at` is RFC 3339 UTC, by the host's clock. `d` and `u` only send an event when they change something (`d` on a done thread, `u` on a live one, do nothing). Each event also adds a timeline entry, and the pane shows how many are still waiting for you. Archived threads take no events.
+`thread` is the key of the thread it happened on (the `key` you put it with). `key` carries the same value under the old name: it's deprecated and will be removed, so read `thread`. `at` is RFC 3339 UTC, by the host's clock. `d` and `u` only send an event when they change something (`d` on a done thread, `u` on a live one, do nothing). Each event also adds a timeline entry, and the pane shows how many are still waiting for you. Archived threads take no events.
 
 - **At least once.** `events` prints every pending event, not just new ones, until they're acked. Ack after you've saved what the event changed in your own state, and make handlers idempotent: a crash between the two replays the event. The `id` tells two deliveries of one event apart.
 - `events ack` prints how many it dropped; an id that's unknown, already acked or another instance's is ignored, so a retried ack is harmless. A malformed id is a usage error (exit 2).
 - `--wait SECS` (at most 300) returns as soon as anything is pending, or prints nothing after `SECS`. Use it in place of your loop's sleep and a click gets handled within seconds. Without `--wait`, `events` answers at once.
+- `--thread KEY` answers only that thread's events, and with `--wait` waits for one there (an event on another of your threads doesn't end the wait). A thread you haven't put (yet) just has none: an empty answer, not an error. The others stay pending for an unfiltered `events`.
 - Events are a control command: they need the host daemon (exit 75 otherwise). An event only exists because someone clicked in a dashboard, so there's nothing to miss meanwhile; they wait in `inbox.toml`.
 - Each thread keeps at most 100 unacked events (the oldest is dropped beyond that), and one `events` answer stops at about 512 KiB: ack what you got and call again for the rest.
 - You only ever see and ack events of your own threads.
@@ -417,7 +418,7 @@ while :; do
   if [ "$rc" -eq 75 ]; then sleep 60; continue; fi   # no host daemon
   [ "$rc" -eq 0 ] && [ -n "$out" ] || continue
   printf '%s\n' "$out" | while IFS= read -r ev; do
-    key=$(printf '%s' "$ev" | jq -r .key)
+    key=$(printf '%s' "$ev" | jq -r .thread)
     case $(printf '%s' "$ev" | jq -r '.kind + ":" + (.action // "")') in
       action:send) echo send >>"$TODO/$key"; echo active >"$ITEMS/$key" ;;
       reply:)      printf '%s' "$ev" | jq -r .text >>"$TODO/$key" ;;
