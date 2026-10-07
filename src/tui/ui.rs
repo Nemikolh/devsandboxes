@@ -2134,7 +2134,7 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
             // `r` and `s` mirror what the key would do to the selection:
             // run vs rename, stop vs start.
             Tab::Instances => format!(
-                "q quit · tab switch · ↑↓ select · ←→ fold · enter config · r {} · o vscode · s {} · d/u done · l logs · p forward · t term · : cmd · ? help",
+                "q quit · tab switch · ↑↓ select · ←→ fold · enter config · r {} · o vscode · s {} · d rm · l logs · p forward · t term · : cmd · ? help",
                 app.run_rename_hint(),
                 app.stop_start_hint()
             ),

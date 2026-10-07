@@ -59,7 +59,8 @@ devsbd events --follow
 devsbd events ack e-1790900001-3f2a
 ```
 
-- **Done instances.** An instance marked done keeps its container, worktree and runs, and shows dimmed with a `✓` in the dashboard and `(done)` in `ps`, until you remove it. Mark it with `devsandbox done <instance>`, `d` on its row, a thread's Done, or a dispatcher's `devsbd done <key>`; clear it with `devsandbox undone`, `u`, or a dispatcher's `ensure` reusing it. `devsbd ls`, `ps --json` and `status --json` report `done`. npm: `done(name)` / `undone(name)`, and `done` on instance rows.
+- **Done instances.** An instance marked done keeps its container, worktree and runs, and shows dimmed with a `✓` in the dashboard and `(done)` in `ps`, until you remove it. Mark it with `devsandbox done <instance>`, a thread's Done, or a dispatcher's `devsbd done <key>`; clear it with `devsandbox undone`, `u` on the thread, or a dispatcher's `ensure` reusing it. `devsbd ls`, `ps --json` and `status --json` report `done`. npm: `done(name)` / `undone(name)`, and `done` on instance rows.
+- **`d` removes the selected instance in the dashboard.** Like `s`, it acts right away with no prompt: it runs `rm`, which still refuses a dirty worktree and asks before deleting the branch.
 
 ```bash
 devsandbox done web-pr-123

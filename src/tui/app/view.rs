@@ -36,8 +36,8 @@ Tables (Instances / Services)
                :start runs services + postStartCommand too; a drifted
                exited instance is rebuilt instead)
   p           forward a port (instance / service selection prefills the prompt)
-  d / u       mark the instance done / not done (Instances; dimmed, kept
-              until removed)
+  d           remove the instance now, no prompt (Instances; like :rm,
+              so a dirty worktree still refuses)
 
 Ports tab
   ↑/k ↓/j     move selection

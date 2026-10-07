@@ -135,7 +135,7 @@ Control is served by the host daemon (`devsandbox serve`), which the dashboard, 
 
 A child marked **done** is kept as is (container, worktree, runs), shown dimmed with a `✓` in the dashboard and as `Up … (done)` in `devsandbox ps`, and removed whenever someone decides to. It's how a user says "I've looked at it, carry on" without removing anything.
 
-- Set by `devsbd done <key>` (e.g. the PR merged), a thread's `done` (below), `d` on the instance row, or `devsandbox done <instance>`. Cleared by `devsandbox undone`, `u` on the row or on the thread, or an `ensure` that reuses the child.
+- Set by `devsbd done <key>` (e.g. the PR merged), a thread's `done` (below), or `devsandbox done <instance>`. Cleared by `devsandbox undone`, `u` on the thread, or an `ensure` that reuses the child.
 - `devsbd ls` reports `"done": true`. A done child is still a real container: it counts toward `max-instances`. Whether to evict done children to make room is the dispatcher's call; devsandbox never removes them.
 - `start` and the boot pass leave the mark alone.
 

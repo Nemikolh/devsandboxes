@@ -1,4 +1,4 @@
-//! One-key instance actions (stop/start, done/undone, open in VS Code, stop
+//! One-key instance actions (stop/start, remove, open in VS Code, stop
 //! forward) and the pending-request queue `tui::mod` drains onto background
 //! threads.
 
@@ -22,23 +22,18 @@ pub struct PendingDone {
 }
 
 impl App {
-    /// `d` / `u` (Instances tab): mark the instance under the cursor done, or
-    /// clear it. A no-op off an instance (process rows are filtered by the
-    /// caller); an instance already in the wanted state only gets a status.
-    pub(super) fn set_selected_done(&mut self, done: bool) {
+    /// `d` (Instances tab): remove the instance under the cursor right away,
+    /// no prompt, via the same suspend path `:rm` takes (non-forced, so `rm`'s
+    /// own dirty-worktree refusal and branch-delete question still guard it).
+    /// A no-op off an instance (process rows are filtered by the caller).
+    pub(super) fn remove_instance(&mut self) {
         let Some(i) = self.selected_instance_index() else {
             return;
         };
         let Some(row) = self.snapshot.as_ref().and_then(|s| s.instances.get(i)) else {
             return;
         };
-        let name = row.name.clone();
-        if row.done == done {
-            self.status = Some(if done { format!("`{name}` is already done") } else { format!("`{name}` is not done") });
-            return;
-        }
-        self.status = Some(format!("marking {name} {}…", if done { "done" } else { "not done" }));
-        self.pending_done.push(PendingDone { instance: name, done, report: true });
+        self.pending_action = Some(PromptAction::Rm { instance: row.name.clone(), force: false });
     }
 
     /// Queue a done-flag write for `instance` on behalf of an Inbox thread
@@ -206,32 +201,17 @@ mod tests {
     }
 
     #[test]
-    fn d_and_u_on_an_instance_queue_the_done_flag() {
+    fn d_on_an_instance_queues_rm_without_a_prompt() {
         let mut app = new_app();
         app.set_snapshot(snapshot_with(1));
         app.on_key(key(KeyCode::Down)); // onto inst0
         app.on_key(key(KeyCode::Char('d')));
         assert_eq!(
-            app.take_pending_done(),
-            [PendingDone { instance: "inst0".into(), done: true, report: true }]
+            app.take_pending_action(),
+            Some(PromptAction::Rm { instance: "inst0".into(), force: false })
         );
-        assert_eq!(app.status.as_deref(), Some("marking inst0 done…"));
-        // Not done yet: `u` only says so.
-        app.on_key(key(KeyCode::Char('u')));
+        assert!(app.prompt.is_none());
         assert_eq!(app.take_pending_done(), []);
-        assert_eq!(app.status.as_deref(), Some("`inst0` is not done"));
-
-        let mut snap = snapshot_with(1);
-        snap.instances[0].done = true;
-        app.set_snapshot(snap);
-        app.on_key(key(KeyCode::Char('u')));
-        assert_eq!(
-            app.take_pending_done(),
-            [PendingDone { instance: "inst0".into(), done: false, report: true }]
-        );
-        app.on_key(key(KeyCode::Char('d')));
-        assert_eq!(app.take_pending_done(), []);
-        assert_eq!(app.status.as_deref(), Some("`inst0` is already done"));
     }
 
     #[test]
@@ -240,17 +220,29 @@ mod tests {
         let mut app = app_on_proc_row(&["10"]);
         app.on_key(key(KeyCode::Char('d')));
         app.on_key(key(KeyCode::Char('u')));
-        assert_eq!(app.take_pending_done(), []);
+        assert_eq!(app.take_pending_action(), None);
         // The sandbox node.
         let mut app = new_app();
         app.set_snapshot(snapshot_with(1));
         app.on_key(key(KeyCode::Char('d')));
-        assert_eq!(app.take_pending_done(), []);
+        assert_eq!(app.take_pending_action(), None);
         // Another tab.
         app.on_key(key(KeyCode::Down));
         app.tab = Tab::Services;
         app.on_key(key(KeyCode::Char('d')));
+        assert_eq!(app.take_pending_action(), None);
+    }
+
+    #[test]
+    fn u_on_an_instance_does_nothing() {
+        let mut app = new_app();
+        let mut snap = snapshot_with(1);
+        snap.instances[0].done = true;
+        app.set_snapshot(snap);
+        app.on_key(key(KeyCode::Down)); // onto inst0
+        app.on_key(key(KeyCode::Char('u')));
         assert_eq!(app.take_pending_done(), []);
+        assert_eq!(app.take_pending_action(), None);
     }
 
     #[test]

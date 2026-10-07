@@ -527,8 +527,7 @@ impl App {
             KeyCode::Char('s') if self.tab == Tab::Instances && !on_proc => {
                 self.stop_or_start_instance()
             }
-            KeyCode::Char('d') if self.tab == Tab::Instances && !on_proc => self.set_selected_done(true),
-            KeyCode::Char('u') if self.tab == Tab::Instances && !on_proc => self.set_selected_done(false),
+            KeyCode::Char('d') if self.tab == Tab::Instances && !on_proc => self.remove_instance(),
             KeyCode::Char('l') if !on_proc => self.open_logs(),
             // Forwarding: `p` opens the `port` prompt prefilled from the selected
             // instance (Instances, not a process row) or service (Services); `d`
