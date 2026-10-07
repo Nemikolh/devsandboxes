@@ -91,8 +91,14 @@ fn answered(a: Option<&Answer>) -> bool {
     }
 }
 
-fn missing(q: &Question, record: &FormRecord) -> bool {
-    q.required && !answered(value_of(q, record).as_ref())
+/// Whether `q` is asked now: a follow-up with `when` only while its parent's
+/// current answer picks that option (`form::applies`).
+pub fn shown(form: &Form, q: &Question, record: &FormRecord) -> bool {
+    form::applies(form, q, |p| value_of(p, record))
+}
+
+fn missing(form: &Form, q: &Question, record: &FormRecord) -> bool {
+    q.required && shown(form, q, record) && !answered(value_of(q, record).as_ref())
 }
 
 /// The confirm step's outcome over the stored draft.
@@ -113,7 +119,7 @@ pub fn confirm(form: &Form, record: &FormRecord) -> Confirm {
         Err(FormError::Closed(_)) => Confirm::Closed,
         Err(FormError::Invalid(why)) => {
             let labels: Vec<String> =
-                form.questions.iter().filter(|q| missing(q, record)).map(|q| q.label.clone()).collect();
+                form.questions.iter().filter(|q| missing(form, q, record)).map(|q| q.label.clone()).collect();
             if labels.is_empty() { Confirm::Invalid(why) } else { Confirm::Missing(labels) }
         }
     }
@@ -205,22 +211,30 @@ pub fn answer_text(q: &Question, a: Option<&Answer>) -> String {
 
 /// A submitted form's answers, read-only, as `label: value` rows; a
 /// multi-line text question's answer is its own markdown line under the
-/// label.
+/// label. A follow-up is marked `↳` under its parent; one that didn't apply
+/// (its option wasn't picked) isn't listed.
 pub fn answer_rows(form: &Form, answers: &BTreeMap<String, Answer>) -> Vec<PaneLine> {
     let mut out = Vec::new();
     for q in &form.questions {
+        if !form::applies(form, q, |p| answers.get(&p.id).cloned()) {
+            continue;
+        }
         let a = answers.get(&q.id);
         let multiline = matches!(q.kind, QuestionKind::Text { multiline: true, .. });
+        let mut head = vec![(Tone::Text, q.label.clone())];
+        if q.under.is_some() {
+            head.insert(0, (Tone::Dim, "↳ ".into()));
+        }
         match a {
             Some(Answer::Text(t)) if multiline && !t.trim().is_empty() => {
-                out.push(vec![(Tone::Text, q.label.clone()), (Tone::Dim, ":".into())]);
+                head.push((Tone::Dim, ":".into()));
+                out.push(head);
                 out.push(vec![(Tone::Markdown, t.clone())]);
             }
-            _ => out.push(vec![
-                (Tone::Text, q.label.clone()),
-                (Tone::Dim, ": ".into()),
-                (Tone::Plain, answer_text(q, a)),
-            ]),
+            _ => {
+                head.extend([(Tone::Dim, ": ".into()), (Tone::Plain, answer_text(q, a))]);
+                out.push(head);
+            }
         }
     }
     out
@@ -245,9 +259,14 @@ pub struct FormLines {
 /// Text answers show at most this many lines in the box.
 const TEXT_LINES: usize = 3;
 const INDENT: &str = "    ";
+/// A follow-up's extra indent.
+const SUB: &str = "  ";
 
 /// A pinned form as lines `width` columns wide (text answers are cut to it;
-/// the rest is wrapped by the renderer). Per question: `› i/N label`, a `*`
+/// the rest is wrapped by the renderer). Per question: `› i/N label` (`N`
+/// counts top-level questions; a follow-up is an unnumbered `↳ label`,
+/// its rows indented under its parent's, and only while it applies: a
+/// hidden one's range is empty), a `*`
 /// while it's required and unanswered, the focused question's `context`
 /// (only the focused one's: the box stays short, and the context is what
 /// the user reads while answering), then its widget: `(•) A   ( ) B` (one
@@ -258,18 +277,27 @@ const INDENT: &str = "    ";
 pub fn form_lines(form: &Form, record: &FormRecord, cursor: Option<&FormCursor>, width: usize) -> FormLines {
     let mut lines: Vec<PaneLine> = Vec::new();
     let mut questions = Vec::new();
-    let n = form.questions.len();
-    let room = width.saturating_sub(INDENT.len());
+    let n = form.questions.iter().filter(|q| q.under.is_none()).count();
+    let mut number = 0;
     for (i, q) in form.questions.iter().enumerate() {
         let start = lines.len();
+        let sub = q.under.is_some();
+        if !sub {
+            number += 1;
+        }
+        if !shown(form, q, record) {
+            questions.push(start..start);
+            continue;
+        }
+        let room = width.saturating_sub(INDENT.len() + if sub { SUB.len() } else { 0 });
         let at = cursor.filter(|c| c.question == i);
         let value = value_of(q, record);
         let mut head = vec![
             if at.is_some() { (Tone::Bold, "› ".to_string()) } else { (Tone::Plain, "  ".to_string()) },
-            (Tone::Dim, format!("{}/{n} ", i + 1)),
+            (Tone::Dim, if sub { format!("{SUB}↳ ") } else { format!("{number}/{n} ") }),
             (Tone::Text, q.label.clone()),
         ];
-        if missing(q, record) {
+        if missing(form, q, record) {
             head.push((Tone::State(State::NeedsYou), " *".into()));
         }
         lines.push(head);
@@ -328,6 +356,13 @@ pub fn form_lines(form: &Form, record: &FormRecord, cursor: Option<&FormCursor>,
                 }
             }
         }
+        if sub {
+            // Under the parent's widget, not level with it. Markdown (the
+            // context) is left whole: it is rendered as a block.
+            for l in lines[start + 1..].iter_mut().filter(|l| !l.iter().any(|(t, _)| *t == Tone::Markdown)) {
+                l.insert(0, (Tone::Plain, SUB.to_string()));
+            }
+        }
         questions.push(start..lines.len());
     }
     let hint = match cursor {
@@ -377,21 +412,58 @@ fn widget(labels: &[(bool, &str)], cursor: Option<usize>, mark: impl Fn(bool) ->
 }
 
 /// A message's form in the feed: an open one is pinned above (one dim
-/// line here), a submitted one shows its answers read-only, a withdrawn one
-/// a dim `form withdrawn`.
-pub fn feed_form_lines(f: &Form, record: Option<&FormRecord>, utc_offset: i64) -> Vec<PaneLine> {
+/// line here), a submitted one points up at its submission when that's in
+/// the feed (`answered_above`: the answers show there, newer, where the user
+/// reads the outcome), else shows its answers read-only; a withdrawn one a
+/// dim `form withdrawn`.
+pub fn feed_form_lines(f: &Form, record: Option<&FormRecord>, answered_above: bool, utc_offset: i64) -> Vec<PaneLine> {
     let title = f.title.as_deref().unwrap_or("Form");
     match record.map(|r| &r.state) {
         None | Some(crate::inbox::FormState::Open) => {
             vec![vec![(Tone::Dim, format!("form: {title} · open, pinned above"))]]
         }
         Some(crate::inbox::FormState::Submitted { at, answers, .. }) => {
-            let mut out = vec![vec![(Tone::Dim, format!("form: {title} · submitted {}", super::inbox::stamp(*at, utc_offset)))]];
+            let when = super::inbox::stamp(*at, utc_offset);
+            if answered_above {
+                return vec![vec![(Tone::Dim, format!("form: {title} · submitted {when}, answers above"))]];
+            }
+            let mut out = vec![vec![(Tone::Dim, format!("form: {title} · submitted {when}"))]];
             out.extend(answer_rows(f, answers));
             out
         }
         Some(crate::inbox::FormState::Withdrawn) => vec![vec![(Tone::Dim, "form withdrawn".to_string())]],
     }
+}
+
+/// A submission in the feed: a dim `<at>  you answered "<title>" (N
+/// questions)` row over its answers, as [`answer_rows`] shows them. `form`
+/// is its message's form; with the message gone (the feed cap drops
+/// messages before submissions) the answers show by question id.
+pub fn submission_lines(form: Option<&Form>, answers: &BTreeMap<String, Answer>, at: &str) -> Vec<PaneLine> {
+    let n = answer_count(answers);
+    let s = if n == 1 { "" } else { "s" };
+    let title = form.map_or("Form", form_title);
+    let mut out = vec![vec![(Tone::Dim, format!("{at}  you answered \"{title}\" ({n} question{s})"))]];
+    match form {
+        Some(f) => out.extend(answer_rows(f, answers)),
+        None => out.extend(answers.iter().flat_map(|(id, a)| {
+            if let Answer::Text(t) = a {
+                if t.contains('\n') {
+                    return vec![vec![(Tone::Text, id.clone()), (Tone::Dim, ":".into())], vec![(Tone::Markdown, t.clone())]];
+                }
+            }
+            let value = match a {
+                Answer::Choice(o) => o.clone(),
+                Answer::Choices(os) if os.is_empty() => "none".into(),
+                Answer::Choices(os) => os.join(", "),
+                Answer::Text(t) if t.trim().is_empty() => "–".into(),
+                Answer::Text(t) => t.clone(),
+                Answer::Confirm(b) => if *b { "yes" } else { "no" }.into(),
+            };
+            vec![vec![(Tone::Text, id.clone()), (Tone::Dim, ": ".into()), (Tone::Plain, value)]]
+        })),
+    }
+    out
 }
 
 impl App {
@@ -609,11 +681,21 @@ impl App {
     /// newest form first, wrapping.
     fn step_question(&mut self, t: &Thread, step: isize) {
         let pinned = pinned_forms(t);
-        let all: Vec<(usize, usize)> =
-            pinned.iter().enumerate().flat_map(|(f, p)| (0..p.form.questions.len()).map(move |q| (f, q))).collect();
         let Some(e) = self.inbox.form.as_ref() else { return };
         let Some(fi) = pinned.iter().position(|p| p.message == e.message) else { return };
-        let Some(pos) = all.iter().position(|&x| x == (fi, e.question)) else { return };
+        let here = (fi, e.question);
+        // The shown questions (a follow-up whose option isn't picked is
+        // skipped), plus the cursor's own: it may have just been hidden.
+        let all: Vec<(usize, usize)> = pinned
+            .iter()
+            .enumerate()
+            .flat_map(|(f, p)| {
+                p.form.questions.iter().enumerate().filter_map(move |(q, question)| {
+                    (shown(p.form, question, p.record) || (f, q) == here).then_some((f, q))
+                })
+            })
+            .collect();
+        let Some(pos) = all.iter().position(|&x| x == here) else { return };
         let (f, q) = all[(pos as isize + step).rem_euclid(all.len() as isize) as usize];
         self.set_form_cursor(t, f, q);
     }
@@ -711,7 +793,7 @@ mod tests {
     }
 
     fn q(id: &str, label: &str, required: bool, kind: QuestionKind) -> Question {
-        Question { id: id.into(), label: label.into(), context: None, required, kind }
+        Question { id: id.into(), label: label.into(), context: None, required, under: None, when: None, kind }
     }
 
     fn opt(id: &str, label: &str) -> ChoiceOption {
@@ -726,8 +808,9 @@ mod tests {
         QuestionKind::Text { placeholder: Some("Reply to post".into()), default: default.map(str::to_string), multiline, max: 20 }
     }
 
-    /// The plan's example, plus a confirm: 1 choice (default post), 2 text
-    /// (default, multiline), 3 optional text, 4 required confirm, no default.
+    /// The plan's example, plus a confirm: 1 choice (default post), 2 its
+    /// follow-up text for `post` (default, multiline), 3 optional text, 4
+    /// required confirm, no default.
     fn drafts() -> Form {
         let mut first = q("c-1", "greptile on `src/cost.ts:42`", true, choice(false, Some(ChoiceDefault::One("post".into()))));
         first.context = Some("> Consider batching these writes.".into());
@@ -737,7 +820,7 @@ mod tests {
             submit: "Post replies".into(),
             questions: vec![
                 first,
-                q("c-1-text", "Reply", false, text(Some("Already batched"), true)),
+                Question { under: Some("c-1".into()), when: Some("post".into()), ..q("c-1-text", "Reply", false, text(Some("Already batched"), true)) },
                 q("notes", "Anything else?", false, text(None, true)),
                 q("merge", "Merge after?", true, QuestionKind::Confirm { yes: Some("Merge".into()), no: None, default: None }),
             ],
@@ -758,13 +841,13 @@ mod tests {
         let record = FormRecord::open("drafts");
         let out = form_lines(&form, &record, None, 40);
         assert_eq!(texts(&out.lines), [
-            "  1/4 greptile on `src/cost.ts:42`",
+            "  1/3 greptile on `src/cost.ts:42`",
             "    (•) Post the reply   ( ) Don't reply",
-            "  2/4 Reply",
-            "    Already batched",
-            "  3/4 Anything else?",
+            "    ↳ Reply",
+            "      Already batched",
+            "  2/3 Anything else?",
             "    Reply to post",
-            "  4/4 Merge after? *",
+            "  3/3 Merge after? *",
             "    ( ) Merge   ( ) No",
             "[Tab] next  [Space] pick  [e] edit  [Enter] Confirm",
         ]);
@@ -774,7 +857,8 @@ mod tests {
         assert_eq!(out.lines[6][3], (Tone::State(State::NeedsYou), " *".into()));
         assert_eq!(out.lines[0][2].0, Tone::Text);
 
-        // Several picks: checkboxes; a draft answer beats the default.
+        // Several picks: checkboxes; a draft answer beats the default. With
+        // `post` not picked, its follow-up is hidden: an empty range.
         let mut multi = drafts();
         multi.questions[0].kind = choice(true, None);
         let mut record = FormRecord::open("drafts");
@@ -782,8 +866,10 @@ mod tests {
         record.draft.insert("merge".into(), Answer::Confirm(false));
         let out = form_lines(&multi, &record, None, 40);
         assert_eq!(texts(&out.lines)[1], "    [ ] Post the reply   [x] Don't reply");
-        assert_eq!(texts(&out.lines)[6], "  4/4 Merge after?", "answered: no marker");
-        assert_eq!(texts(&out.lines)[7], "    ( ) Merge   (•) No");
+        assert_eq!(texts(&out.lines)[2], "  2/3 Anything else?");
+        assert_eq!(out.questions, [0..2, 2..2, 2..4, 4..6]);
+        assert_eq!(texts(&out.lines)[4], "  3/3 Merge after?", "answered: no marker");
+        assert_eq!(texts(&out.lines)[5], "    ( ) Merge   (•) No");
     }
 
     #[test]
@@ -792,7 +878,7 @@ mod tests {
         let record = FormRecord::open("drafts");
         let out = form_lines(&form, &record, Some(&cursor(0, 1)), 40);
         let t = texts(&out.lines);
-        assert_eq!(t[0], "› 1/4 greptile on `src/cost.ts:42`");
+        assert_eq!(t[0], "› 1/3 greptile on `src/cost.ts:42`");
         assert_eq!(out.lines[1], [(Tone::Markdown, "> Consider batching these writes.".to_string())]);
         assert_eq!(t[2], "    (•) Post the reply   ( ) Don't reply");
         assert_eq!(out.lines[2].last(), Some(&(Tone::Cursor, "( ) Don't reply".to_string())));
@@ -809,12 +895,12 @@ mod tests {
         record.draft.insert("c-1-text".into(), Answer::Text("a much longer reply than fits here".into()));
         record.draft.insert("notes".into(), Answer::Text("1\n2\n3\n4\n5".into()));
         let t = texts(&form_lines(&form, &record, None, 20).lines);
-        assert_eq!(t[3], "    a much longer r…");
+        assert_eq!(t[3], "      a much longer…", "a follow-up: indented, cut to what's left");
         assert_eq!(t[5..9], ["    1", "    2", "    3", "    … 2 more lines"]);
         // Being edited: the live text, marked.
         let c = FormCursor { editing: Some("typed"), ..cursor(1, 0) };
         let t = texts(&form_lines(&form, &record, Some(&c), 20).lines);
-        assert_eq!(t[3], "    ✎ typed");
+        assert_eq!(t[3], "      ✎ typed");
         assert_eq!(t.last().unwrap(), "[Enter] keep  [Esc] keep  [Alt-Enter] newline");
     }
 
@@ -837,7 +923,7 @@ mod tests {
     fn submitted_answers_render_read_only() {
         let form = drafts();
         let answers: BTreeMap<String, Answer> = [
-            ("c-1".to_string(), Answer::Choice("skip".into())),
+            ("c-1".to_string(), Answer::Choice("post".into())),
             ("c-1-text".to_string(), Answer::Text("line one\n\nline two".into())),
             ("notes".to_string(), Answer::Text(String::new())),
             ("merge".to_string(), Answer::Confirm(true)),
@@ -845,18 +931,38 @@ mod tests {
         .into();
         let rows = answer_rows(&form, &answers);
         assert_eq!(texts(&rows), [
-            "greptile on `src/cost.ts:42`: Don't reply",
-            "Reply:",
+            "greptile on `src/cost.ts:42`: Post the reply",
+            "↳ Reply:",
             "line one\n\nline two",
             "Anything else?: –",
             "Merge after?: Merge",
         ]);
         assert_eq!(rows[2], [(Tone::Markdown, "line one\n\nline two".to_string())]);
+        // `skip`: the follow-up for `post` didn't apply, so isn't listed.
+        let mut skipped = answers.clone();
+        skipped.insert("c-1".into(), Answer::Choice("skip".into()));
+        skipped.remove("c-1-text");
+        let rows = texts(&answer_rows(&form, &skipped));
+        assert_eq!(rows, ["greptile on `src/cost.ts:42`: Don't reply", "Anything else?: –", "Merge after?: Merge"]);
         let mut multi = q("m", "Which", true, choice(true, None));
         assert_eq!(answer_text(&multi, Some(&Answer::Choices(vec!["post".into(), "skip".into()]))), "Post the reply, Don't reply");
         assert_eq!(answer_text(&multi, Some(&Answer::Choices(vec![]))), "none");
         multi.kind = QuestionKind::Confirm { yes: None, no: None, default: None };
         assert_eq!(answer_text(&multi, Some(&Answer::Confirm(false))), "No");
+    }
+
+    #[test]
+    fn a_submission_shows_its_answers_even_without_its_message() {
+        let answers: BTreeMap<String, Answer> =
+            [("c-1".to_string(), Answer::Choice("post".into())), ("merge".to_string(), Answer::Confirm(true))].into();
+        let rows = texts(&submission_lines(Some(&drafts()), &answers, "10:52"));
+        assert_eq!(rows[0], r#"10:52  you answered "Replies to post" (2 questions)"#);
+        assert_eq!(rows[1], "greptile on `src/cost.ts:42`: Post the reply");
+        // The message capped away: by question id.
+        let mut bare = answers.clone();
+        bare.insert("notes".into(), Answer::Text("a\nb".into()));
+        let rows = texts(&submission_lines(None, &bare, "10:52"));
+        assert_eq!(rows, [r#"10:52  you answered "Form" (3 questions)"#, "c-1: post", "merge: yes", "notes:", "a\nb"]);
     }
 
     #[test]
@@ -1007,8 +1113,9 @@ mod tests {
         // Re-picking the same is no change.
         app.on_key(key(KeyCode::Char(' ')));
         assert_eq!(flush(&mut app), []);
-        // Confirm: `no` with a custom-label yes.
-        for _ in 0..3 {
+        // Confirm: `no` with a custom-label yes. `skip` hid the reply under
+        // `post`, so tab skips it: two tabs, not three.
+        for _ in 0..2 {
             app.on_key(key(KeyCode::Tab));
         }
         app.on_key(key(KeyCode::Right));
@@ -1145,16 +1252,19 @@ mod tests {
         assert_eq!(app.inbox.focus, InboxFocus::Thread);
         assert_eq!(app.status.as_deref(), Some("submitted to d"));
         // The store applies it: the form leaves the pins, the feed shows the
-        // answers under the message and a folded submission.
+        // answers under the submission, and the message points up at them.
         let mut inbox = app.inbox.content_clone();
         ops.iter().for_each(|op| inbox.apply(op, 60, "tui"));
         app.set_inbox(inbox);
         let t = app.selected_inbox_thread().unwrap();
         assert_eq!(pinned_forms(t).len(), 1);
         let feed: Vec<String> = texts(&super::super::pane_feed(t, 0));
-        assert!(feed.iter().any(|l| l.ends_with("  you answered 3 questions")), "{feed:#?}");
-        assert!(feed.iter().any(|l| l == "Merge after?: Merge"), "{feed:#?}");
-        assert!(feed.iter().any(|l| l.starts_with("form: Replies to post · submitted ")), "{feed:#?}");
+        let head = feed.iter().position(|l| l.ends_with(r#"  you answered "Replies to post" (3 questions)"#)).expect("submission");
+        assert_eq!(feed[head + 1..head + 5], ["greptile on `src/cost.ts:42`: Post the reply", "↳ Reply:", "Already batched", "Anything else?: –"]);
+        assert_eq!(feed[head + 5], "Merge after?: Merge");
+        let form_row = feed.iter().position(|l| l.starts_with("form: Replies to post · submitted ")).unwrap();
+        assert!(form_row > head && feed[form_row].ends_with(", answers above"), "{feed:#?}");
+        assert_eq!(feed.iter().filter(|l| *l == "Merge after?: Merge").count(), 1, "answers once, under the submission");
         assert!(feed.iter().any(|l| l == "form: Form · open, pinned above"), "{feed:#?}");
     }
 

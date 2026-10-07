@@ -300,6 +300,8 @@ A `form` block asks the user questions they answer and submit once; you get one 
     {
       "id": "c-3726888733-text",
       "label": "Reply",
+      "under": "c-3726888733",
+      "when": "post",
       "type": "text",
       "multiline": true,
       "default": "Already batched in `flush()` (src/cost.ts:88), so this would double-buffer.",
@@ -324,7 +326,7 @@ A `form` block asks the user questions they answer and submit once; you get one 
 | `submit` | the submit button's label, default `Submit` | one line, 40 bytes |
 | `questions` | what to ask, in order | 1–30 |
 
-Every question has an `id` (unique in the form, same rule as the form's), a `label` (inline markdown, one line, 200 bytes), an optional `context` (markdown shown above the input, 4 KiB) and `required` (default `true` for `choice` and `confirm`, `false` for `text`). By `type`:
+Every question has an `id` (unique in the form, same rule as the form's), a `label` (inline markdown, one line, 200 bytes), an optional `context` (markdown shown above the input, 4 KiB), `required` (default `true` for `choice` and `confirm`, `false` for `text`) and, for a follow-up, `under` / `when` (below). By `type`:
 
 | type | fields | answer |
 |---|---|---|
@@ -334,6 +336,17 @@ Every question has an `id` (unique in the form, same rule as the form's), a `lab
 
 One form per message. Defaults must be valid answers (known option ids, an array exactly when `multiple`, text within `max`, no newline in a single-line default). Unknown fields and question types are rejected like any other bad send.
 
+**Follow-ups.** Every question is its own numbered item unless you say otherwise, so a text that only matters for one option of the choice above it reads as a second, unrelated question ("should I do X, when X is already picked?"). Tie it to its question instead:
+
+| field | meaning | rule |
+|---|---|---|
+| `under` | the id of the question this one follows up: shown indented under it, unnumbered (`↳ Reply`) | an earlier, top-level question (one level only); the follow-up comes right after it or after its other follow-ups |
+| `when` | with `under` a `choice`: the option this follow-up is for | one of that choice's option ids; needs `under` |
+
+A follow-up with `when` **applies only while that option is picked** (for a `multiple` choice: is among the picks), going by the parent's current answer (given, else draft, else default). While it doesn't apply it is hidden, never required, and submitted as `null`, whatever its draft or `default` says; its draft is kept, so picking the option again brings the text back. A follow-up without `when` always applies; `under` only groups it. In the example, `Reply` is asked only while `Post the reply` is picked; `skip` submits `"c-3726888733-text": null`.
+
+Use a follow-up whenever a question only makes sense given another answer (the reply of a "post or skip", the reason for a "reject" option). When there is nothing to pick, ask one question: a single `text` whose empty answer means "don't" needs no choice above it.
+
 **Lifecycle**, kept by the host:
 
 - A form is **open** from the send that brings it. A message bringing a form into the feed (a new message, or a re-send adding one) marks the thread unread and pops up when the thread is `needs-you`.
@@ -341,7 +354,7 @@ One form per message. Defaults must be valid answers (known option ids, an array
 - **Submitted** once, it is **frozen**: re-sending its message can still change the other blocks (tagged "edited"), but the form block you send is ignored and the stored form keeps the user's answers. Re-sending your original message stays a no-op, so a re-asserting dispatcher changes nothing. A form can't be submitted twice: send a new message for another round.
 - Like the rest of the feed, the 300-items-per-thread cap never drops a message whose form is still open.
 
-The submission arrives as one event (below), `answers` keyed by question id with **every** question present and defaults filled in: you never merge defaults yourself. An optional text left empty is `""`, an optional `multiple` choice with no pick `[]`, an optional choice or confirm left unanswered `null`.
+The submission arrives as one event (below), `answers` keyed by question id with **every** question present and defaults filled in: you never merge defaults yourself. An optional text left empty is `""`, an optional `multiple` choice with no pick `[]`, an optional choice or confirm left unanswered `null`, and a follow-up that doesn't apply (its `when` option not picked) `null`.
 
 `thread ls --feed` gives each message that has carried a form a `"form": { "id", "state", "answers"? }`: `state` is `open`, `submitted` or `withdrawn`, and `answers` (only when submitted) is what the `submit` event carried, so a dispatcher that lost its state, or acked nothing yet, can recover the answers.
 

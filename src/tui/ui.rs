@@ -3282,6 +3282,8 @@ See [PR 6900](https://github.com/o/r/pull/6900).";
             label: "greptile on `src/cost.ts:42`".into(),
             context: Some("> Consider batching these writes.".into()),
             required: true,
+            under: None,
+            when: None,
             kind: QuestionKind::Choice {
                 options: vec![
                     ChoiceOption { id: "post".into(), label: "Post the reply".into(), description: None },
@@ -3296,6 +3298,8 @@ See [PR 6900](https://github.com/o/r/pull/6900).";
             label: format!("Question {i}?"),
             context: None,
             required: false,
+            under: None,
+            when: None,
             kind: QuestionKind::Confirm { yes: None, no: None, default: None },
         }));
         let form = Form { id: "drafts".into(), title: Some("Replies to post".into()), submit: "Post".into(), questions };

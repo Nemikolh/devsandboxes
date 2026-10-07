@@ -296,8 +296,13 @@ fn render_block(out: &mut String, b: &BlockView, thread: u64, message: &str) {
 }
 
 fn render_question(out: &mut String, q: &QuestionView, draft: &Value, answers: Option<&Value>) {
+    let (under, when) = match q {
+        QuestionView::Choice { under, when, .. } | QuestionView::Text { under, when, .. } | QuestionView::Confirm { under, when, .. } => {
+            (under, when)
+        }
+    };
     let (id, label, context, required, default, detail) = match q {
-        QuestionView::Choice { id, label, context, required, options, multiple, default } => {
+        QuestionView::Choice { id, label, context, required, options, multiple, default, .. } => {
             let opts: Vec<String> = options.iter().map(|o| format!("{} = {}", o.id, o.label)).collect();
             let which = if *multiple { "any of" } else { "one of" };
             (id, label, context, *required, default.clone(), Some(format!("{which}: {}", opts.join(", "))))
@@ -305,7 +310,7 @@ fn render_question(out: &mut String, q: &QuestionView, draft: &Value, answers: O
         QuestionView::Text { id, label, context, required, default, .. } => {
             (id, label, context, *required, default.clone().map(Value::String), None)
         }
-        QuestionView::Confirm { id, label, context, required, yes, no, default } => {
+        QuestionView::Confirm { id, label, context, required, yes, no, default, .. } => {
             let detail = match (yes, no) {
                 (None, None) => "true | false".to_string(),
                 (yes, no) => format!("true = {}, false = {}", yes.as_deref().unwrap_or("yes"), no.as_deref().unwrap_or("no")),
@@ -314,7 +319,13 @@ fn render_question(out: &mut String, q: &QuestionView, draft: &Value, answers: O
         }
     };
     let req = if required { " (required)" } else { "" };
-    indent(out, &format!("{id}: {label}{req}"), 6);
+    // A follow-up says what it follows: `when` is the only time it's asked.
+    let of = match (under, when) {
+        (Some(p), Some(o)) => format!(" · only if {p} = {o}"),
+        (Some(p), None) => format!(" · under {p}"),
+        _ => String::new(),
+    };
+    indent(out, &format!("{id}: {label}{req}{of}"), 6);
     if let Some(context) = context {
         indent(out, &format!("> {}", context.replace('\n', "\n> ")), 8);
     }
@@ -704,6 +715,14 @@ mod tests {
         assert_eq!(json["data"][0]["key"], "pr-1", "newest change first");
         assert_eq!(json["data"][0]["state"], "needs-you");
         assert_eq!(json["data"][1]["kind"], "notify");
+    }
+
+    #[test]
+    fn a_follow_up_names_what_it_follows() {
+        let f = form::tests::example();
+        let mut out = String::new();
+        render_question(&mut out, &QuestionView::of(&f.questions[1]), &json!({}), None);
+        assert!(out.starts_with("      c-3726888733-text: Reply · only if c-3726888733 = post\n"), "{out}");
     }
 
     #[test]

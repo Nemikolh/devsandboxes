@@ -154,7 +154,7 @@ Each item has `type`, `seq` (arrival order across the whole Inbox) and `at`
 |---|---|---|
 | `message` | `id`, `blocks`, `edited`, `withdrawn` | from the owner (`devsbd thread send`); `blocks`, by `type`: `{"type":"markdown","text"}`, or `{"type":"fields","items":[{"label","value"}]}` (a key/value list, in order; clients show aligned `label  value` rows), or `{"type":"form",…}` (see *Forms*). `edited`: replaced in place since first sent; `withdrawn`: the owner took it back |
 | `reply` | `text` | the user's reply |
-| `submission` | `message`, `form`, `answers` | the user submitted form `form` of message `message`: every question's answer (see *Forms*) |
+| `submission` | `message`, `form`, `answers` | the user submitted form `form` of message `message`: every question's answer (see *Forms*). Clients show the answers here, with the outcome that follows, not only under the older message |
 | `action` | `action`, `label` | the user pressed an action (its id, its label then) |
 | `marker` | `marker`, `from`, `to` | one line: `done` / `reopen` by the user (`from`/`to` `null`), or the owner's `state` / `status` change (`from` → `to`, a status may be `null`). Consecutive status changes collapse into one marker |
 
@@ -189,7 +189,7 @@ A message block `{"type":"form", …}` (docs/automations-guide.md, *Forms*):
 | `id` | the form's id |
 | `title` | or `null` |
 | `submit` | the submit button's label |
-| `questions` | by `type`, each with `id`, `label` (inline markdown), `context` (markdown or `null`), `required`: `{"type":"choice","options":[{"id","label","description"}],"multiple","default"}` (`default`: an option id, ids when `multiple`, or `null`), `{"type":"text","placeholder","default","multiline","max"}` (`max` in bytes), `{"type":"confirm","yes","no","default"}` (`yes`/`no`: labels or `null`) |
+| `questions` | by `type`, each with `id`, `label` (inline markdown), `context` (markdown or `null`), `required`, `under` and `when` (a follow-up, below; `null` otherwise): `{"type":"choice","options":[{"id","label","description"}],"multiple","default"}` (`default`: an option id, ids when `multiple`, or `null`), `{"type":"text","placeholder","default","multiline","max"}` (`max` in bytes), `{"type":"confirm","yes","no","default"}` (`yes`/`no`: labels or `null`) |
 | `state` | `open` \| `submitted` \| `withdrawn` (the owner withdrew the message, or re-sent it without the form) |
 | `draft` | an open form's saved answers (`inbox.form.saveDraft`), `{}` otherwise |
 | `answers` | once submitted, every question's answer; `null` before |
@@ -202,6 +202,13 @@ unanswered `multiple` choice `[]`, an unanswered optional choice or
 confirm `null`. A required question needs an answer (text: not blank;
 `multiple`: at least one id). A form is submitted once; a submitted form
 is frozen, whatever its owner re-sends.
+
+A question with `under` follows up that (earlier, top-level) question:
+show it under its parent, unnumbered. With `when` too (the parent is a
+choice) it applies only while the parent's answer (given, else draft, else
+default) picks that option: otherwise hide it; it is never required then,
+and the submission has it `null` whatever was given or drafted for it
+(`saveDraft` still keeps its draft). Without `when` it always applies.
 
 Host verbs (`vscode`, `terminal`, …) run in the client that shows the
 button; the API doesn't run them, and refuses a host-only action. An action

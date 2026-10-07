@@ -429,7 +429,7 @@ export interface FeedSubmission extends FeedItemBase {
   message: string;
   /** The form's id. */
   form: string;
-  /** Every question's answer; `null` for an optional one left unanswered. */
+  /** Every question's answer; `null` for an optional one left unanswered, or a follow-up that doesn't apply. */
   answers: Record<string, FormAnswer | null>;
 }
 
@@ -479,7 +479,7 @@ export interface FormBlock {
   state: 'open' | 'submitted' | 'withdrawn';
   /** Saved partial answers (`inbox.form.saveDraft`) of an open form; `{}` otherwise. */
   draft: Record<string, FormAnswer>;
-  /** Once submitted, every question's answer (`null`: optional, unanswered); `null` before. */
+  /** Once submitted, every question's answer (`null`: optional and unanswered, or a follow-up that doesn't apply); `null` before. */
   answers: Record<string, FormAnswer | null> | null;
 }
 
@@ -499,6 +499,13 @@ export interface QuestionBase {
   context: string | null;
   /** Must be answered to submit (text: not blank; `multiple`: one pick at least). */
   required: boolean;
+  /** A follow-up of this earlier question, shown under it; `null`: top-level. */
+  under: string | null;
+  /**
+   * With `under` a choice: the option this follow-up is for. It applies only
+   * while that option is picked (else hidden, never required, answered `null`).
+   */
+  when: string | null;
 }
 
 /** Pick one option, or several when `multiple`. */

@@ -186,6 +186,10 @@ pub enum QuestionView {
         label: String,
         context: Option<String>,
         required: bool,
+        /// The question this one follows up (`null`: top-level).
+        under: Option<String>,
+        /// The `under` choice's option it's for (`null`: always applies).
+        when: Option<String>,
         options: Vec<OptionView>,
         multiple: bool,
         default: Option<Value>,
@@ -195,6 +199,8 @@ pub enum QuestionView {
         label: String,
         context: Option<String>,
         required: bool,
+        under: Option<String>,
+        when: Option<String>,
         placeholder: Option<String>,
         default: Option<String>,
         multiline: bool,
@@ -206,6 +212,8 @@ pub enum QuestionView {
         label: String,
         context: Option<String>,
         required: bool,
+        under: Option<String>,
+        when: Option<String>,
         yes: Option<String>,
         no: Option<String>,
         default: Option<bool>,
@@ -253,12 +261,15 @@ impl BlockView {
 impl QuestionView {
     pub(crate) fn of(q: &form::Question) -> Self {
         let (id, label, context, required) = (q.id.clone(), q.label.clone(), q.context.clone(), q.required);
+        let (under, when) = (q.under.clone(), q.when.clone());
         match &q.kind {
             QuestionKind::Choice { options, multiple, default } => QuestionView::Choice {
                 id,
                 label,
                 context,
                 required,
+                under,
+                when,
                 options: options
                     .iter()
                     .map(|o| OptionView { id: o.id.clone(), label: o.label.clone(), description: o.description.clone() })
@@ -274,13 +285,15 @@ impl QuestionView {
                 label,
                 context,
                 required,
+                under,
+                when,
                 placeholder: placeholder.clone(),
                 default: default.clone(),
                 multiline: *multiline,
                 max: *max,
             },
             QuestionKind::Confirm { yes, no, default } => {
-                QuestionView::Confirm { id, label, context, required, yes: yes.clone(), no: no.clone(), default: *default }
+                QuestionView::Confirm { id, label, context, required, under, when, yes: yes.clone(), no: no.clone(), default: *default }
             }
         }
     }

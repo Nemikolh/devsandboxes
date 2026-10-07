@@ -293,12 +293,17 @@ shared with `inbox_hit`). Top to bottom:
   waiting for <sender>` first while the owner hasn't acked them (state,
   not history), then messages (stamp + author, `(edited)`/`(withdrawn)`,
   markdown and fields blocks; a form block is one dim `form: <title> · open,
-  pinned above` line while open, `form: <title> · submitted <time>` over
-  its answers read-only (`label: value`: option and yes/no labels, the text,
-  a multi-line text as markdown under its label) once submitted, `form
-  withdrawn` once withdrawn), replies (`you`), actions (`you: <label>`),
-  submissions folded to one dim `you answered N questions` row (not
-  expandable: the answers are always under the message) and markers (`· done`, `· active → needs you`, status changes); for a notify
+  pinned above` line while open, one dim `form: <title> · submitted <time>,
+  answers above` line once submitted (the answers are on the submission,
+  newer, so above it; only with the submission gone from the feed do they
+  show here instead), `form withdrawn` once withdrawn), replies (`you`),
+  actions (`you: <label>`), submissions (a dim `you answered "<title>" (N
+  questions)` stamp row over the answers, read-only: `label: value` with
+  option and yes/no labels and the text, a multi-line text as markdown under
+  its label, a follow-up as `↳ label: value`, one that didn't apply left
+  out; by question id if the form's message was capped away; set off by
+  blank lines like a message, so the answers sit next to the outcome the
+  owner reports after them) and markers (`· done`, `· active → needs you`, status changes); for a notify
   thread, its records, the head first, each a stamp + level row over its
   markdown.
 - The **composer** (below).
@@ -350,7 +355,10 @@ back to the thread. Its editing keys are the `:` prompt's, with `↑`/`↓` and
 sideways once the line outgrows the bar.
 
 **Forms** (`docs/inbox-redesign.md` *Forms*; `src/tui/app/forms.rs`, drawn
-by `ui::form_rows`). Per question: `i/N` and the label (inline markdown), a
+by `ui::form_rows`). Per question: `i/N` and the label (inline markdown;
+`N` counts top-level questions: a follow-up (`under`) is an unnumbered
+`↳ label`, its rows indented under its parent's, and one whose `when` option
+isn't picked is hidden, skipped by `tab`, and never required), a
 yellow `*` while it's required and unanswered, the `context` (markdown) of
 the focused question only (the box stays short; the context is what you read
 while answering), then the widget: `(•) A   ( ) B` (one pick), `[x] A   [ ]

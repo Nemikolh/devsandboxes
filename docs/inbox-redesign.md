@@ -172,6 +172,8 @@ babysitter's own wording (posting replies on GitHub), not devsandbox terms.
     {
       "id": "c-3726888733-text",
       "label": "Reply",
+      "under": "c-3726888733",
+      "when": "post",
       "type": "text",
       "multiline": true,
       "default": "Already batched in `flush()` (src/cost.ts:88), so this would double-buffer.",
@@ -198,8 +200,13 @@ babysitter's own wording (posting replies on GitHub), not devsandbox terms.
 - Common: `id` (`[a-z0-9-]{1,60}`, unique in the form), `label` (inline
   markdown, ≤200 B), `context` (markdown shown above the input, ≤4 KiB),
   `required` (default true for `choice`/`confirm`, false for `text`).
-- ≤30 questions per form, one form per message. No conditional questions in
-  v1: owners split into two messages instead.
+- Follow-ups: `under` (an earlier top-level question: shown indented under
+  it, unnumbered) and `when` (an option of that choice: the follow-up applies
+  only while it's picked; otherwise hidden, not required, answered `null`).
+  One level only. Without them every question reads as its own item, so a
+  choice + text pair looked like two unrelated questions
+  (docs/automations-guide.md, *Forms*).
+- ≤30 questions per form, one form per message.
 - **Lifecycle, kept by the host:** `open` → `submitted` (the submission is
   stored with the message, the form renders read-only with the answers) or
   `withdrawn` (the owner replaced or withdrew the message). A submitted form
@@ -221,7 +228,7 @@ What the pane shows under the header, **newest first**:
 | message | owner | full markdown blocks; forms inline (open ones pinned, see layout) |
 | reply | user | the text, full, as markdown (no more `one_line`) |
 | action | user | `you: Retry` |
-| submission | user | folded summary (`you answered 4 questions`), expandable |
+| submission | user | `you answered "<title>" (4 questions)` over the answers (`label: value`); the message's form then only says `answers above` |
 | done / reopen marker | user | one dim line |
 | state / status marker | owner | one dim line; consecutive status-only changes collapse (`running comments → review drafts`) |
 | message withdrawn / edited | owner | dim tag on the message |

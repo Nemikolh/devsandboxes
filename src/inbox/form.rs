@@ -67,6 +67,15 @@ pub struct Question {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<String>,
     pub required: bool,
+    /// A follow-up of this earlier, top-level question: shown indented
+    /// under it, unnumbered ([`check`] keeps it right after its parent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub under: Option<String>,
+    /// With `under` a choice: the option of the parent this question is
+    /// for. It only applies while that option is picked ([`applies`]);
+    /// otherwise it is hidden, never required, and answered `null`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<String>,
     #[serde(flatten)]
     pub kind: QuestionKind,
 }
@@ -262,6 +271,19 @@ fn question<'a>(form: &'a Form, id: &str) -> Option<&'a Question> {
     form.questions.iter().find(|q| q.id == id)
 }
 
+/// Whether `q` applies, its parent answered `value` (the answer the user
+/// sees: given, else draft, else default): always without `when`, else
+/// only while the parent's answer picks the `when` option.
+pub fn applies(form: &Form, q: &Question, value: impl Fn(&Question) -> Option<Answer>) -> bool {
+    let Some(when) = &q.when else { return true };
+    let Some(parent) = q.under.as_deref().and_then(|p| question(form, p)) else { return true };
+    match value(parent) {
+        Some(Answer::Choice(o)) => &o == when,
+        Some(Answer::Choices(os)) => os.contains(when),
+        _ => false,
+    }
+}
+
 // ---- schema ---------------------------------------------------------------
 
 /// The wire shape of a form block, minus `type` (`message.rs` dispatches on
@@ -287,6 +309,10 @@ enum WireQuestion {
         context: Option<String>,
         #[serde(default)]
         required: Option<bool>,
+        #[serde(default)]
+        under: Option<String>,
+        #[serde(default)]
+        when: Option<String>,
         options: Vec<WireOption>,
         #[serde(default)]
         multiple: bool,
@@ -300,6 +326,10 @@ enum WireQuestion {
         context: Option<String>,
         #[serde(default)]
         required: Option<bool>,
+        #[serde(default)]
+        under: Option<String>,
+        #[serde(default)]
+        when: Option<String>,
         #[serde(default)]
         placeholder: Option<String>,
         #[serde(default)]
@@ -316,6 +346,10 @@ enum WireQuestion {
         context: Option<String>,
         #[serde(default)]
         required: Option<bool>,
+        #[serde(default)]
+        under: Option<String>,
+        #[serde(default)]
+        when: Option<String>,
         #[serde(default)]
         yes: Option<String>,
         #[serde(default)]
@@ -375,7 +409,7 @@ pub(super) fn check(n: usize, wire: WireForm) -> Result<Form, String> {
         return Err(format!("block {n}: {} questions, at most {MAX_QUESTIONS} allowed", wire.questions.len()));
     }
     let mut seen = BTreeSet::new();
-    let questions = wire
+    let questions: Vec<Question> = wire
         .questions
         .into_iter()
         .map(|q| {
@@ -386,22 +420,65 @@ pub(super) fn check(n: usize, wire: WireForm) -> Result<Form, String> {
             Ok(q)
         })
         .collect::<Result<_, String>>()?;
+    for (i, q) in questions.iter().enumerate() {
+        check_under(n, &questions[..i], q)?;
+    }
     Ok(Form { id: wire.id, title: wire.title, submit, questions })
 }
 
+/// `q`'s `under`/`when` against the questions before it: the parent is an
+/// earlier top-level question (one level only), `q` follows it with only
+/// its other follow-ups in between (so every client can render the group
+/// in order), and `when` names one of a choice parent's options.
+fn check_under(n: usize, before: &[Question], q: &Question) -> Result<(), String> {
+    let id = &q.id;
+    let Some(under) = &q.under else {
+        return match q.when {
+            Some(_) => Err(format!("block {n}: `{id}` sets `when` without `under`")),
+            None => Ok(()),
+        };
+    };
+    let Some(at) = before.iter().position(|p| &p.id == under) else {
+        return Err(format!("block {n}: `{id}` is under `{under}`, which isn't an earlier question"));
+    };
+    let parent = &before[at];
+    if parent.under.is_some() {
+        return Err(format!("block {n}: `{id}` is under `{under}`, itself under another question: one level only"));
+    }
+    if before[at + 1..].iter().any(|b| b.under.as_ref() != Some(under)) {
+        return Err(format!("block {n}: `{id}` must follow `{under}` (or another question under it)"));
+    }
+    if let Some(when) = &q.when {
+        let QuestionKind::Choice { options, .. } = &parent.kind else {
+            return Err(format!("block {n}: `{id}` sets `when`, but `{under}` isn't a choice question"));
+        };
+        if !options.iter().any(|o| &o.id == when) {
+            return Err(format!("block {n}: `{id}` `when` names no option of `{under}`: `{when}`"));
+        }
+    }
+    Ok(())
+}
+
 fn question_of(n: usize, q: WireQuestion) -> Result<Question, String> {
-    let (id, label, context, required, kind) = match q {
-        WireQuestion::Choice { id, label, context, required, options, multiple, default } => {
-            (id, label, context, required.unwrap_or(true), WireKind::Choice { options, multiple, default })
+    let (id, label, context, required, under, when, kind) = match q {
+        WireQuestion::Choice { id, label, context, required, under, when, options, multiple, default } => {
+            (id, label, context, required.unwrap_or(true), under, when, WireKind::Choice { options, multiple, default })
         }
-        WireQuestion::Text { id, label, context, required, placeholder, default, multiline, max } => {
-            (id, label, context, required.unwrap_or(false), WireKind::Text { placeholder, default, multiline, max })
+        WireQuestion::Text { id, label, context, required, under, when, placeholder, default, multiline, max } => {
+            let kind = WireKind::Text { placeholder, default, multiline, max };
+            (id, label, context, required.unwrap_or(false), under, when, kind)
         }
-        WireQuestion::Confirm { id, label, context, required, yes, no, default } => {
-            (id, label, context, required.unwrap_or(true), WireKind::Confirm { yes, no, default })
+        WireQuestion::Confirm { id, label, context, required, under, when, yes, no, default } => {
+            (id, label, context, required.unwrap_or(true), under, when, WireKind::Confirm { yes, no, default })
         }
     };
     id_rule(&format!("blocks[{n}] question id"), &id)?;
+    if let Some(under) = &under {
+        id_rule(&format!("blocks[{n}] `{id}` under"), under)?;
+    }
+    if let Some(when) = &when {
+        id_rule(&format!("blocks[{n}] `{id}` when"), when)?;
+    }
     let at = |field: &str| format!("blocks[{n}] `{id}` {field}");
     one_line(&at("label"), &label, MAX_LABEL)?;
     if let Some(context) = &context {
@@ -479,7 +556,7 @@ fn question_of(n: usize, q: WireQuestion) -> Result<Question, String> {
             QuestionKind::Confirm { yes, no, default }
         }
     };
-    Ok(Question { id, label, context, required, kind })
+    Ok(Question { id, label, context, required, under, when, kind })
 }
 
 /// [`WireQuestion`]'s type-specific half.
@@ -514,7 +591,15 @@ pub fn sanitized(form: Form) -> Form {
                 }
                 QuestionKind::Confirm { yes, no, default } => QuestionKind::Confirm { yes: opt(yes), no: opt(no), default },
             };
-            Question { id: sanitize(&q.id), label: sanitize(&q.label), context: opt(q.context), required: q.required, kind }
+            Question {
+                id: sanitize(&q.id),
+                label: sanitize(&q.label),
+                context: opt(q.context),
+                required: q.required,
+                under: opt(q.under),
+                when: opt(q.when),
+                kind,
+            }
         })
         .collect();
     Form { id: sanitize(&form.id), title: opt(form.title), submit: sanitize(&form.submit), questions }
@@ -615,7 +700,8 @@ pub fn validate_draft(
 /// question takes the given answer, else the draft's, else its default.
 /// Unanswered optional text is `""` and an unanswered `multiple` choice
 /// `[]`; an unanswered optional single choice or confirm stays absent
-/// ([`answers_json`] shows it as `null`). Required questions must be
+/// ([`answers_json`] shows it as `null`), as does a follow-up that doesn't
+/// [`apply`](applies) (whatever was given for it). Required questions must be
 /// answered (text: not blank; multiple: at least one); `Invalid` lists the
 /// ones that aren't. The form must be open.
 pub fn resolve_submission(
@@ -625,10 +711,16 @@ pub fn resolve_submission(
 ) -> Result<BTreeMap<String, Answer>, FormError> {
     require_open(form, record)?;
     let given = checked(form, answers)?;
+    let current = |q: &Question| given.get(&q.id).or_else(|| record.draft.get(&q.id)).cloned().or_else(|| default_of(q));
     let mut out = BTreeMap::new();
     let mut missing = Vec::new();
     for q in &form.questions {
-        let answer = given.get(&q.id).or_else(|| record.draft.get(&q.id)).cloned().or_else(|| default_of(q));
+        // A follow-up for an option not picked: its answer (even a draft's
+        // or a default) isn't one.
+        if !applies(form, q, current) {
+            continue;
+        }
+        let answer = current(q);
         // A draft from before a re-send was pruned against this form, but
         // check again: the store is the boundary.
         if let Some(a) = &answer {
@@ -741,6 +833,8 @@ pub(crate) mod tests {
             {
                 "id": "c-3726888733-text",
                 "label": "Reply",
+                "under": "c-3726888733",
+                "when": "post",
                 "type": "text",
                 "multiline": true,
                 "default": "Already batched in `flush()` (src/cost.ts:88), so this would double-buffer.",
@@ -783,6 +877,8 @@ pub(crate) mod tests {
         assert!(choice.required, "choice: required by default");
         assert!(matches!(&choice.kind, QuestionKind::Choice { multiple: false, default: Some(ChoiceDefault::One(d)), options } if d == "post" && options.len() == 2));
         assert!(!reply.required, "text: optional by default");
+        assert_eq!((reply.under.as_deref(), reply.when.as_deref()), (Some("c-3726888733"), Some("post")));
+        assert_eq!((choice.under.as_ref(), notes.under.as_ref()), (None, None));
         assert!(matches!(&reply.kind, QuestionKind::Text { multiline: true, max: DEFAULT_TEXT_MAX, default: Some(_), .. }));
         assert!(!notes.required);
         // `submit` defaults; confirm is required by default.
@@ -939,6 +1035,77 @@ pub(crate) mod tests {
         let got = resolve_submission(&f, &open, &answers(&[("notes", text("given"))])).unwrap();
         assert_eq!(got["c-3726888733"], Answer::Choice("skip".into()));
         assert_eq!(got["notes"], text("given"));
+        // `skip` picked: the reply (under `post`) doesn't apply, its default
+        // and anything given for it dropped: `null` to the owner.
+        let got = resolve_submission(&f, &open, &answers(&[("c-3726888733-text", text("typed"))])).unwrap();
+        assert!(!got.contains_key("c-3726888733-text"));
+        assert_eq!(answers_json(&f, &got)["c-3726888733-text"], Value::Null);
+    }
+
+    #[test]
+    fn a_follow_up_applies_only_while_its_option_is_picked() {
+        let f = form(&qs(r#"
+            {"id":"pick","label":"P","type":"choice","options":[{"id":"a","label":"A"},{"id":"b","label":"B"}]},
+            {"id":"why","label":"Why?","type":"text","required":true,"under":"pick","when":"b"},
+            {"id":"more","label":"More","type":"text","under":"pick"},
+            {"id":"tags","label":"T","type":"choice","multiple":true,"required":false,"options":[{"id":"x","label":"X"}]},
+            {"id":"x-note","label":"N","type":"confirm","under":"tags","when":"x"}
+        "#))
+        .unwrap();
+        let open = FormRecord::open("f");
+        let resolve = |a: &[(&str, Answer)]| resolve_submission(&f, &open, &answers(a));
+        // `a`: `why` isn't asked, so not required; `more` (no `when`) always is.
+        let got = resolve(&[("pick", Answer::Choice("a".into())), ("why", text("stale"))]).unwrap();
+        assert_eq!(got, answers(&[("pick", Answer::Choice("a".into())), ("more", text("")), ("tags", Answer::Choices(vec![]))]));
+        // `b`: required now.
+        assert_eq!(
+            resolve(&[("pick", Answer::Choice("b".into()))]),
+            Err(FormError::Invalid("required questions unanswered: why".into()))
+        );
+        // Under a multiple choice: applies while its option is among the picks.
+        assert_eq!(
+            resolve(&[("pick", Answer::Choice("b".into())), ("why", text("y")), ("tags", Answer::Choices(vec!["x".into()]))]),
+            Err(FormError::Invalid("required questions unanswered: x-note".into()))
+        );
+        // The parent's answer comes from the draft too.
+        let mut drafted = FormRecord::open("f");
+        drafted.draft = answers(&[("pick", Answer::Choice("b".into()))]);
+        assert!(resolve_submission(&f, &drafted, &BTreeMap::new()).is_err());
+    }
+
+    #[test]
+    fn under_and_when_are_checked() {
+        let err = |q: &str| form(&qs(q)).unwrap_err();
+        let pick = r#"{"id":"pick","label":"P","type":"choice","options":[{"id":"a","label":"A"}]}"#;
+        let t = |rest: &str| format!(r#"{{"id":"t","label":"T","type":"text",{rest}}}"#);
+        let other = r#"{"id":"o","label":"O","type":"confirm"}"#;
+        assert_eq!(err(&format!("{pick},{}", t(r#""when":"a""#))), "block 1: `t` sets `when` without `under`");
+        assert_eq!(
+            err(&format!("{},{pick}", t(r#""under":"pick""#))),
+            "block 1: `t` is under `pick`, which isn't an earlier question"
+        );
+        assert_eq!(err(&t(r#""under":"t""#)), "block 1: `t` is under `t`, which isn't an earlier question");
+        assert_eq!(
+            err(&format!("{pick},{other},{}", t(r#""under":"pick""#))),
+            "block 1: `t` must follow `pick` (or another question under it)"
+        );
+        assert_eq!(
+            err(&format!("{pick},{},{}", t(r#""under":"pick""#).replace(r#""id":"t""#, r#""id":"s""#), t(r#""under":"s""#))),
+            "block 1: `t` is under `s`, itself under another question: one level only"
+        );
+        assert_eq!(
+            err(&format!("{pick},{}", t(r#""under":"pick","when":"z""#))),
+            "block 1: `t` `when` names no option of `pick`: `z`"
+        );
+        assert_eq!(
+            err(&format!("{other},{}", t(r#""under":"o","when":"yes""#))),
+            "block 1: `t` sets `when`, but `o` isn't a choice question"
+        );
+        assert!(err(&format!("{pick},{}", t(r#""under":"Pick""#))).starts_with("bad `blocks[1] `t` under`"));
+        // Siblings may stack; `under` alone (no `when`) works under any type.
+        let s = t(r#""under":"pick","when":"a""#).replace(r#""id":"t""#, r#""id":"s""#);
+        assert!(form(&qs(&format!("{pick},{s},{}", t(r#""under":"pick""#)))).is_ok());
+        assert!(form(&qs(&format!("{other},{}", t(r#""under":"o""#)))).is_ok());
     }
 
     #[test]

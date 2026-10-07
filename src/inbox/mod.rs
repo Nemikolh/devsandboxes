@@ -1985,12 +1985,12 @@ mod tests {
         let given = [("c-3726888733".to_string(), Answer::Choice("skip".into()))].into();
         inbox.apply(&Op::Submit { thread: id, message: "run-1".into(), answers: given }, 70, "api:x");
         let t = find(&inbox, "pr-1").unwrap();
-        let reply = "Already batched in `flush()` (src/cost.ts:88), so this would double-buffer.";
-        let answers = serde_json::json!({"c-3726888733": "skip", "c-3726888733-text": reply, "notes": "from the draft"});
+        // `skip`: the reply under `post` doesn't apply, `null` despite its default.
+        let answers = serde_json::json!({"c-3726888733": "skip", "c-3726888733-text": null, "notes": "from the draft"});
         let [e] = &t.events[..] else { panic!("{:?}", t.events) };
         assert_eq!(e.kind, EventKind::Submit);
         assert_eq!((e.message.as_deref(), e.form.as_deref(), e.answers.as_ref(), e.at), (Some("run-1"), Some("drafts"), Some(&answers), 70));
-        assert_eq!(feed(t).last().unwrap(), "submission run-1/drafts: 3 answers [api:x]");
+        assert_eq!(feed(t).last().unwrap(), "submission run-1/drafts: 2 answers [api:x]");
         let r = form_state(&inbox, "pr-1", "run-1").unwrap();
         let FormState::Submitted { at: 70, client, answers: stored } = &r.state else { panic!("{r:?}") };
         assert_eq!(client, "api:x");

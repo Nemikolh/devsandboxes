@@ -382,17 +382,19 @@ fn push_entry(out: &mut Vec<PaneLine>, after_block: &mut bool, block: bool, line
 /// An owner thread's feed as pane lines, **newest first** (scroll 0 is the
 /// latest thing). A message or a reply is a dim stamp row (author, and a
 /// message's `(edited)`/`(withdrawn)` tag) over its full markdown, set off by
-/// blank lines; a withdrawn message keeps only its row. Actions and markers
-/// are one row each, run together.
+/// blank lines; a withdrawn message keeps only its row. A submission is a
+/// block too: what the user answered, where they read the outcome (newest
+/// first, the form's message is further down); the message's form then
+/// only points up at it. Actions and markers are one row each, run together.
 fn feed_lines(t: &Thread, utc_offset: i64) -> Vec<PaneLine> {
     let mut out = Vec::new();
     let mut after_block = false;
     for item in t.feed.iter().rev() {
         let at = stamp(item.at, utc_offset);
-        let block = matches!(item.kind, ItemKind::Message { .. } | ItemKind::Reply { .. });
+        let block = matches!(item.kind, ItemKind::Message { .. } | ItemKind::Reply { .. } | ItemKind::Submission { .. });
         let mut lines = Vec::new();
         match &item.kind {
-            ItemKind::Message { blocks, edited, withdrawn, form, .. } => {
+            ItemKind::Message { id, blocks, edited, withdrawn, form } => {
                 let tag = match (edited, withdrawn) {
                     (_, true) => "  (withdrawn)",
                     (true, false) => "  (edited)",
@@ -404,7 +406,12 @@ fn feed_lines(t: &Thread, utc_offset: i64) -> Vec<PaneLine> {
                         match block {
                             feed::Block::Markdown { text } => lines.push(line(Tone::Markdown, text.clone())),
                             feed::Block::Fields { items } => lines.extend(field_rows(items)),
-                            feed::Block::Form(f) => lines.extend(forms::feed_form_lines(f, form.as_ref(), utc_offset)),
+                            feed::Block::Form(f) => {
+                                let answered_above = t.feed.iter().any(
+                                    |i| matches!(&i.kind, ItemKind::Submission { message, .. } if message == id),
+                                );
+                                lines.extend(forms::feed_form_lines(f, form.as_ref(), answered_above, utc_offset))
+                            }
                         }
                     }
                     // A re-send that dropped the form withdrew it.
@@ -421,11 +428,8 @@ fn feed_lines(t: &Thread, utc_offset: i64) -> Vec<PaneLine> {
             ItemKind::Action { label, .. } => {
                 lines.push(vec![(Tone::Dim, format!("{at}  ")), (Tone::Text, format!("you: {label}"))]);
             }
-            // Folded: the answers show under the message's form.
-            ItemKind::Submission { answers, .. } => {
-                let n = forms::answer_count(answers);
-                let s = if n == 1 { "" } else { "s" };
-                lines.push(line(Tone::Dim, format!("{at}  you answered {n} question{s}")));
+            ItemKind::Submission { message, answers, .. } => {
+                lines.extend(forms::submission_lines(feed::form_of(&t.feed, message).map(|(f, _)| f), answers, &at));
             }
             ItemKind::Marker(m) => lines.push(line(Tone::Dim, format!("{at}  · {}", marker_text(m)))),
         }

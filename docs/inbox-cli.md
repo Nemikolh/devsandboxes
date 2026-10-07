@@ -34,8 +34,11 @@ they work without the daemon and never start it.
 - `show`: the header (title, state · status, owner/key and id, child, link,
   actions with their ids, how to reply), then the feed newest first:
   messages as their markdown source, fields as `label: value`, forms with
-  each question, its options and its answer / draft / default, then
-  replies, actions, submissions and markers one line each.
+  each question (a follow-up's line ends `· only if <question> = <option>`,
+  or `· under <question>`), its options and its answer / draft / default,
+  then replies, actions and markers one line each, and submissions as a
+  `you · submitted form <form> of message <message>` line over every answer
+  as `<question id>: <value>` (`-` for `null`).
 
 `--json` prints the API's views (docs/api.md) in the `{"schema":1,"data":…}`
 envelope: `ls` a list of `ThreadSummary`, `show` one `ThreadDetail`.
@@ -62,8 +65,10 @@ non-zero with the API's message and code, e.g. `no thread 5 (not-found)`,
 - `submit` answers are a JSON object of question id to answer: an option id
   (a list of ids for a multiple choice), a string, or a bool. Any subset:
   the saved draft and the defaults fill in the rest, and missing required
-  answers are an error naming them. Without `--json` the object is read
-  from stdin; blank input submits no answers of its own.
+  answers are an error naming them. A follow-up whose `only if` option
+  isn't picked is neither required nor sent (`null`), whatever you give
+  it. Without `--json` the object is read from stdin; blank input submits
+  no answers of its own.
 
 ```bash
 devsandbox inbox ls --view needs-you
