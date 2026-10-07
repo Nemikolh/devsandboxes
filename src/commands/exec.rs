@@ -105,14 +105,23 @@ impl AgentRelay {
     /// until the command is over.
     pub(crate) fn ready(key: &str, container: &str) -> Option<crate::serve::client::Conn> {
         let agent = crate::devsbd::bridge::own_agent();
-        let (conn, note) = match crate::serve::client::ensure_bridge(key, agent.as_deref(), Some(LIFECYCLE_RELAY_WAIT)) {
-            Ok((conn, ready)) => (Some(conn), relay_note(ready)),
-            Err(e) => (None, Some(format!("{e:#}"))),
-        };
+        let (conn, note) = Self::wait(key, agent.as_deref());
         if let Some(why) = note {
             eprintln!("note: ssh-agent relay unavailable in `{container}`: {why}");
         }
         conn
+    }
+
+    /// [`ready`](Self::ready)'s wait, reporting `agent`, without the
+    /// printing: the connection, and why the relay isn't usable if it isn't.
+    pub(crate) fn wait(
+        key: &str,
+        agent: Option<&std::path::Path>,
+    ) -> (Option<crate::serve::client::Conn>, Option<String>) {
+        match crate::serve::client::ensure_bridge(key, agent, Some(LIFECYCLE_RELAY_WAIT)) {
+            Ok((conn, ready)) => (Some(conn), relay_note(ready)),
+            Err(e) => (None, Some(format!("{e:#}"))),
+        }
     }
 
     /// The command is over: wait for the request if it's still out, report

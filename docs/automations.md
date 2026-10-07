@@ -108,6 +108,7 @@ devsbd ensure <sandbox> --key <key> [--branch B] [--env K=V]...
     # idempotent: creates <sandbox>-<key> if missing, starts it if stopped,
     # rebuilds it if its container is gone; answers
     # {"name","key","sandbox","state":"running","created","started"}.
+    # Once up, ssh-agent relay included (waited up to 12 s, else a "note").
     # --branch/--env apply at creation only.
 devsbd ls                                   # this dispatcher's children + state (JSON)
 devsbd branches <sandbox> [--ahead]         # who holds each branch of <sandbox>'s repo (JSON);
@@ -125,7 +126,7 @@ devsbd thread ls [--feed]                   # this instance's live threads (JSON
 
 Exit codes: 0 ok, 1 failed, 2 usage (or a key shared by two sandboxes without `--sandbox`), 75 no host connected (no host daemon reachable), 77 denied.
 
-The child-management ops answer JSON on stdout, so a dispatcher never parses prose: `ensure`/`stop`/`rm`/`done` one compact object line (above; `created` = the child didn't exist, `started` = it existed but wasn't up, both false = already running), `ls`/`branches` an array. Errors answer no JSON: a non-zero exit and the message on stderr.
+The child-management ops answer JSON on stdout, so a dispatcher never parses prose: `ensure`/`stop`/`rm`/`done` one compact object line (above; `created` = the child didn't exist, `started` = it existed but wasn't up, both false = already running; `ensure` adds `note` when the child came up but its ssh-agent relay didn't within 12 s), `ls`/`branches` an array. Errors answer no JSON: a non-zero exit and the message on stderr.
 
 - Children are named `<sandbox>-<key>` (e.g. `web-pr-123`): predictable, so a human can `devsandbox vscode web-pr-123`.
 

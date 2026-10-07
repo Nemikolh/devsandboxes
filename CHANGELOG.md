@@ -94,6 +94,8 @@ devsandbox vscode web-2 --goto src/main.rs:42:7
 
 ### Fixed
 
+- **SSH works in a dispatcher's child as soon as `devsbd ensure` returns.** A child that `ensure` had just started had no working ssh-agent for about a second, so a `devsbd exec` right after it (`git fetch`, `git push`) failed with `Permission denied (publickey)`. `ensure` now waits (up to 12 s) for the agent relay of a child it created or started; if it isn't ready by then, its answer carries a `note` saying why.
+
 - **Long commands in the `:` prompt stay visible.** Text past the prompt's width was hidden though it was still run; the prompt now scrolls sideways to keep the cursor in view.
 
 - **A press in the Inbox thread pane no longer grabs the divider.** A press on the pane's first text column started resizing the list/thread split; now only the borders do.

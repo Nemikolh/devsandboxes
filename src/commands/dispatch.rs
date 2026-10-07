@@ -122,6 +122,11 @@ pub trait Executor {
     /// workspace, `Instance::exec_env`), stdin null, output captured; `Err` only when it
     /// couldn't run at all.
     fn exec_in(&mut self, child: &Instance, command: &[String]) -> Result<ExecOutput, String>;
+    /// After `ensure` created or (re)started child `name`: wait (bounded) for
+    /// its ssh-agent bridge when an exec there gets `SSH_AUTH_SOCK` (relay
+    /// mode with a host agent), so the dispatcher's next `exec` can use ssh.
+    /// Why the relay isn't usable, if it isn't; never fails the op.
+    fn wait_bridge(&mut self, name: &str) -> Option<String>;
     /// Replace state entry `name`'s `extra_env` with `env` and save. Called
     /// under the bridge's host-wide control lock, before the op's subprocess
     /// (which then loads the updated entry).
@@ -377,7 +382,7 @@ pub(crate) fn handle_with(
                     }
                 }
             }
-            let ensured = |action: &Ensure| {
+            let ensured = |action: &Ensure, note: Option<String>| {
                 answer(&Ensured {
                     name: &name,
                     key,
@@ -385,15 +390,20 @@ pub(crate) fn handle_with(
                     state: ChildState::Running,
                     created: *action == Ensure::Run,
                     started: matches!(action, Ensure::Start | Ensure::Rebuild),
+                    note: note.map(|why| format!("ssh-agent relay unavailable: {why}")),
                 })
             };
             match action {
                 Err(resp) => resp,
-                Ok(Ensure::Nothing) => ensured(&Ensure::Nothing),
+                Ok(Ensure::Nothing) => ensured(&Ensure::Nothing, None),
                 Ok(action) => {
                     let args = ensure_args(&action, sandbox, &name, req, owner_id);
                     match exec.devsandbox(config_dir, &args) {
-                        Ok(()) => ensured(&action),
+                        // `start` without a `postStartCommand` never waits
+                        // for the bridge, and the daemon's poll may not have
+                        // bridged the fresh container yet: wait here, so
+                        // "ensured" means ssh works in the next `exec`.
+                        Ok(()) => ensured(&action, exec.wait_bridge(&name)),
                         Err(e) => failed(e),
                     }
                 }
@@ -994,7 +1004,9 @@ fn answer(body: &impl Serialize) -> Response {
 
 /// The `ensure` answer. `created`: the child didn't exist (`run`);
 /// `started`: it existed but wasn't up (`start`, or `rebuild` without a
-/// container). Both false: it was already running.
+/// container). Both false: it was already running. `note`: the child is up
+/// but its ssh-agent relay isn't ([`Executor::wait_bridge`]); omitted when
+/// fine.
 #[derive(Serialize)]
 struct Ensured<'a> {
     name: &'a str,
@@ -1003,6 +1015,8 @@ struct Ensured<'a> {
     state: ChildState,
     created: bool,
     started: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
 }
 
 /// The `stop` answer.
@@ -1278,6 +1292,32 @@ impl Executor for Subprocess {
         })
     }
 
+    fn wait_bridge(&mut self, name: &str) -> Option<String> {
+        #[cfg(unix)]
+        {
+            // Reloaded: `run` just created the entry, `start` recorded the helper.
+            let state = match State::load() {
+                Ok(state) => state,
+                Err(e) => return Some(format!("{e:#}")),
+            };
+            let child = state.instances.get(name)?;
+            // The gate `exec_in`'s `SSH_AUTH_SOCK` injection uses.
+            if !(crate::devsbd::relay_mode(child) && crate::commands::exec::has_host_agent()) {
+                return None;
+            }
+            // This runs in the daemon, which this reaches over its own
+            // socket. No agent to report: its own `$SSH_AUTH_SOCK` is already
+            // its last candidate, and reporting it would rank it above the
+            // clients' fresher ones.
+            crate::commands::exec::AgentRelay::wait(name, None).1
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = name;
+            None
+        }
+    }
+
     fn save_env(&mut self, name: &str, env: &BTreeMap<String, String>) -> Result<(), String> {
         let mut state = State::load().map_err(|e| format!("{e:#}"))?;
         let info = state
@@ -1435,6 +1475,10 @@ folder = "."
         gits: Vec<(PathBuf, Vec<String>)>,
         /// The Inbox store the event ops use; `None` = the ops fail.
         inbox: Option<PathBuf>,
+        /// `wait_bridge` calls, by child name.
+        bridge_waits: Vec<String>,
+        /// What `wait_bridge` answers.
+        bridge_note: Option<String>,
     }
 
     impl Fake {
@@ -1458,6 +1502,10 @@ folder = "."
         fn exec_in(&mut self, child: &Instance, command: &[String]) -> Result<ExecOutput, String> {
             self.execs.push((child.container.clone(), command.to_vec()));
             if self.fail { Err("no docker".into()) } else { Ok(self.helper.clone()) }
+        }
+        fn wait_bridge(&mut self, name: &str) -> Option<String> {
+            self.bridge_waits.push(name.to_string());
+            self.bridge_note.clone()
         }
         fn save_env(&mut self, name: &str, env: &BTreeMap<String, String>) -> Result<(), String> {
             self.saved.push((name.to_string(), env.clone()));
@@ -1639,6 +1687,45 @@ folder = "."
         let mut fake = Fake { fail: true, ..Fake::new() };
         let resp = call(&s, "d", &r_with(Op::Ensure, "two"), &mut fake);
         assert_eq!(resp, Response::new(Status::Failed, "boom"));
+        assert!(fake.bridge_waits.is_empty(), "no child came up: no bridge wait");
+    }
+
+    /// An `ensure` that brought a child up answers only once its ssh-agent
+    /// bridge was waited for, so an `exec` right after can use ssh; a relay
+    /// that isn't ready is a `note`, not a failure. An already running child
+    /// waits for nothing.
+    #[test]
+    fn ensure_waits_for_the_bridge_of_a_child_it_brought_up() {
+        let mut s = state();
+        s.instances.remove("web-two");
+        let mut fake = Fake::new();
+        let resp = call(&s, "d", &req(Op::Ensure, Some("web"), Some("pr-1")), &mut fake);
+        assert_eq!(resp, ensured("web", "pr-1", true, false));
+        assert_eq!(fake.bridge_waits, vec!["web-pr-1".to_string()], "created");
+
+        let s = state();
+        for running in [Some(false), None] {
+            let mut fake = Fake::new();
+            match running {
+                Some(r) => fake.running.insert("devsandbox-web-two".into(), r),
+                None => fake.running.remove("devsandbox-web-two"),
+            };
+            let resp = call(&s, "d", &r_with(Op::Ensure, "two"), &mut fake);
+            assert_eq!(resp, ensured("web", "two", false, true), "{running:?}");
+            assert_eq!(fake.bridge_waits, vec!["web-two".to_string()], "{running:?}");
+        }
+
+        let mut fake = Fake::new();
+        call(&s, "d", &req(Op::Ensure, Some("web"), Some("one")), &mut fake);
+        assert!(fake.bridge_waits.is_empty(), "already running");
+
+        let mut fake = Fake { bridge_note: Some("helper in c is outdated".into()), ..Fake::new() };
+        let resp = call(&s, "d", &r_with(Op::Ensure, "two"), &mut fake);
+        assert_eq!(resp.status, Status::Ok, "{resp:?}");
+        assert!(
+            resp.body.ends_with(r#","started":true,"note":"ssh-agent relay unavailable: helper in c is outdated"}"#),
+            "{resp:?}"
+        );
     }
 
     /// `--env` on an existing child replaces its saved env (not merged), before
