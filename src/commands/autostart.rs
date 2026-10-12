@@ -16,7 +16,7 @@ pub fn autostart(dir: &Path) {
     let Ok(config) = Config::load(dir) else { return };
     let Some(boot) = boot_id() else { return };
     let Ok(project) = services::project_id(dir) else { return };
-    let mut state = match State::load() {
+    let state = match State::load() {
         Ok(state) => state,
         Err(e) => {
             eprintln!("warning: autostart: {e:#}");
@@ -54,11 +54,22 @@ pub fn autostart(dir: &Path) {
         return;
     }
 
-    state.autostart_boot.insert(project.clone(), boot);
-    if let Err(e) = state.save() {
-        // Acting without the record would repeat on every invocation.
-        eprintln!("warning: autostart skipped: {e:#}");
-        return;
+    // Claimed under the state lock, so of two racing passes only one acts.
+    let claimed = State::update(|fresh| {
+        let due = due(fresh.autostart_boot.get(&project).map(String::as_str), &boot);
+        if due {
+            fresh.autostart_boot.insert(project.clone(), boot);
+        }
+        Ok(due)
+    });
+    match claimed {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(e) => {
+            // Acting without the record would repeat on every invocation.
+            eprintln!("warning: autostart skipped: {e:#}");
+            return;
+        }
     }
 
     let rows: Vec<Row> = state

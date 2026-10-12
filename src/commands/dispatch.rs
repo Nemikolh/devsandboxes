@@ -1319,23 +1319,21 @@ impl Executor for Subprocess {
     }
 
     fn save_env(&mut self, name: &str, env: &BTreeMap<String, String>) -> Result<(), String> {
-        let mut state = State::load().map_err(|e| format!("{e:#}"))?;
-        let info = state
-            .instances
-            .get_mut(name)
-            .ok_or_else(|| format!("`{name}` vanished from state"))?;
-        info.extra_env = env.clone();
-        state.save().map_err(|e| format!("{e:#}"))
+        State::update(|state| {
+            let info = state.instances.get_mut(name).ok_or_else(|| anyhow::anyhow!("`{name}` vanished from state"))?;
+            info.extra_env = env.clone();
+            Ok(())
+        })
+        .map_err(|e| format!("{e:#}"))
     }
 
     fn set_done(&mut self, name: &str, done: Option<u64>) -> Result<(), String> {
-        let mut state = State::load().map_err(|e| format!("{e:#}"))?;
-        let info = state
-            .instances
-            .get_mut(name)
-            .ok_or_else(|| format!("`{name}` vanished from state"))?;
-        info.done = done;
-        state.save().map_err(|e| format!("{e:#}"))
+        State::update(|state| {
+            let info = state.instances.get_mut(name).ok_or_else(|| anyhow::anyhow!("`{name}` vanished from state"))?;
+            info.done = done;
+            Ok(())
+        })
+        .map_err(|e| format!("{e:#}"))
     }
 
     fn git(&mut self, repo: &Path, args: &[String]) -> Result<String, String> {

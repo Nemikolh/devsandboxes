@@ -144,10 +144,21 @@ pub fn run(
     let instance_id = unique_instance_id(&state, &instance);
     let container_name = format!("{NAME_PREFIX}{instance_id}");
     if backend().is_running(&container_name)?.is_some() {
-        bail!(
-            "container `{container_name}` already exists but is not in state; \
-             remove it or pick another --name"
+        let labeled = backend().label(&container_name, DISPATCHER_LABEL)?;
+        let leftovers: Vec<PathBuf> = [
+            config_dir.join(".worktrees").join(&instance_id),
+            config_dir.join(".worktrees").join(format!("{instance_id}.folders")),
+        ]
+        .into_iter()
+        .filter(|p| p.exists())
+        .collect();
+        orphan_check(&container_name, extras.dispatcher.as_deref(), labeled.as_deref(), &leftovers)?;
+        eprintln!(
+            "warning: removing orphaned container `{container_name}`: a child of this dispatcher \
+             no longer in state, with no worktree left"
         );
+        let project = services::project_id(&config_dir)?;
+        super::rm::remove_container(&container_name, &project, &instance_id);
     }
 
     let var_ctx = MountContext {
@@ -203,6 +214,37 @@ pub fn run(
     )?;
 
     Ok(Some(instance))
+}
+
+/// Whether `run` may replace `container`, which exists but has no state
+/// entry. Only for a dispatcher's run, when the container carries that
+/// dispatcher's label (`labeled`): its children have deterministic names, so
+/// without this an orphaned child blocks its key's `ensure` for good, and
+/// the dispatcher can't reach the host to clear it. And only with no
+/// worktree left (`leftovers`), so nothing `rm`'s dirty-worktree check
+/// protects is lost; the work of a devcontainer lives in its worktree, not
+/// in the container. Everything else is refused, with what to do on the host.
+fn orphan_check(
+    container: &str,
+    dispatcher: Option<&str>,
+    labeled: Option<&str>,
+    leftovers: &[PathBuf],
+) -> Result<()> {
+    let Some(dispatcher) = dispatcher.filter(|d| labeled == Some(*d)) else {
+        bail!(
+            "container `{container}` already exists but is not in state; \
+             remove it or pick another --name"
+        );
+    };
+    if let Some(path) = leftovers.first() {
+        bail!(
+            "container `{container}` (a child of dispatcher `{dispatcher}`) already exists but is \
+             not in state, and its worktree `{}` is still on disk; check it for work, then remove \
+             both on the host (`git worktree remove`, then the container)",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 /// `run --json` payload: where the new instance lives, so a programmatic
@@ -557,36 +599,39 @@ pub(crate) fn materialize(
         state.instances.get(instance).map(|i| i.volumes.as_slice()).unwrap_or_default(),
         instance_volumes,
     );
-    state.instances.insert(
-        instance.to_string(),
-        Instance {
-            sandbox: sandbox_name.to_string(),
-            instance_id: instance_id.to_string(),
-            project,
-            container: container.clone(),
-            folder: source.to_path_buf(),
-            base_folder: folder.to_path_buf(),
-            worktree,
-            branch,
-            branch_created,
-            folders: folders::merge_folder_mounts(&prior_folders, folder_mounts),
-            shell_history,
-            workspace: workspace.clone(),
-            workspace_file,
-            remote_env: props.remote_env.clone().unwrap_or_default(),
-            remote_user: props.remote_user.clone(),
-            ssh_auth_sock,
-            devsbd_arch,
-            volumes,
-            dispatcher,
-            config_dir: Some(prior_config_dir.unwrap_or(config_dir)),
-            extra_env: run_env,
-            forwarded_ports,
-            done,
-            created_unix: Instance::now(),
-        },
-    );
-    state.save()?;
+    let record = Instance {
+        sandbox: sandbox_name.to_string(),
+        instance_id: instance_id.to_string(),
+        project,
+        container: container.clone(),
+        folder: source.to_path_buf(),
+        base_folder: folder.to_path_buf(),
+        worktree,
+        branch,
+        branch_created,
+        folders: folders::merge_folder_mounts(&prior_folders, folder_mounts),
+        shell_history,
+        workspace: workspace.clone(),
+        workspace_file,
+        remote_env: props.remote_env.clone().unwrap_or_default(),
+        remote_user: props.remote_user.clone(),
+        ssh_auth_sock,
+        devsbd_arch,
+        volumes,
+        dispatcher,
+        config_dir: Some(prior_config_dir.unwrap_or(config_dir)),
+        extra_env: run_env,
+        forwarded_ports,
+        done,
+        created_unix: Instance::now(),
+    };
+    // Into the current file, not `state` (loaded before the build): saving that
+    // snapshot would drop instances other commands recorded meanwhile.
+    State::update(|fresh| {
+        fresh.instances.insert(instance.to_string(), record.clone());
+        Ok(())
+    })?;
+    state.instances.insert(instance.to_string(), record);
 
     let extensions = props.vscode_extensions().unwrap_or(&[]);
     if !extensions.is_empty() || props.remote_user.is_some() {
@@ -940,6 +985,23 @@ mod tests {
             done: None,
             created_unix: 0,
         }
+    }
+
+    /// Only this dispatcher's own orphaned child, with no worktree left, is
+    /// replaced; anything else keeps the "not in state" refusal.
+    #[test]
+    fn orphan_check_reclaims_only_a_bare_child_of_this_dispatcher() {
+        let c = "devsandbox-web-pr-1";
+        let err = |d, l, left: &[PathBuf]| orphan_check(c, d, l, left).unwrap_err().to_string();
+        orphan_check(c, Some("disp"), Some("disp"), &[]).unwrap();
+        // A user's run, or a container with no or another dispatcher's label.
+        assert!(err(None, Some("disp"), &[]).contains("not in state; remove it or pick another --name"));
+        assert!(err(Some("disp"), None, &[]).contains("pick another --name"));
+        assert!(err(Some("disp"), Some("other"), &[]).contains("pick another --name"));
+        // Its worktree is still there: may hold work, so the host decides.
+        let wt = PathBuf::from("/cfg/.worktrees/web-pr-1");
+        let msg = err(Some("disp"), Some("disp"), &[wt]);
+        assert!(msg.contains("worktree `/cfg/.worktrees/web-pr-1` is still on disk"), "{msg}");
     }
 
     /// The `run --json` document: schema-1 envelope, host paths as strings,

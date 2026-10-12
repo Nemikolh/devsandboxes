@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::fs::File;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -185,9 +186,15 @@ impl State {
         Ok(base.join("devsandbox/state.toml"))
     }
 
+    /// The saved state; a missing file is an empty one. Unlocked: writes are
+    /// atomic, so a read always sees a complete file. A snapshot is only for
+    /// reading; changes go through [`State::update`].
     pub fn load() -> Result<Self> {
-        let path = Self::path()?;
-        match std::fs::read_to_string(&path) {
+        Self::load_at(&Self::path()?)
+    }
+
+    fn load_at(path: &Path) -> Result<Self> {
+        match std::fs::read_to_string(path) {
             Ok(contents) => {
                 let mut state: Self = toml::from_str(&contents)
                     .with_context(|| format!("invalid state file {}", path.display()))?;
@@ -206,14 +213,42 @@ impl State {
         }
     }
 
-    pub fn save(&self) -> Result<()> {
-        let path = Self::path()?;
-        let dir = path.parent().unwrap();
-        std::fs::create_dir_all(dir)
-            .with_context(|| format!("cannot create {}", dir.display()))?;
-        let contents = toml::to_string_pretty(self).context("cannot serialize state")?;
-        std::fs::write(&path, contents)
-            .with_context(|| format!("cannot write {}", path.display()))
+    /// Read-modify-write under an exclusive lock: re-read the file, apply `f`,
+    /// and write it back (atomically, only if it changed). The only way to
+    /// change state: saving a snapshot loaded earlier wrote back everything
+    /// as of that load, so a long `run`/`rm` racing another command dropped
+    /// the instance that command had recorded meanwhile, leaving its
+    /// container and worktree with no state entry. `f` must apply only its
+    /// own change, and must not call back into `update` (the lock isn't
+    /// reentrant). An `Err` from `f` writes nothing.
+    pub fn update<T>(f: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
+        Self::update_at(&Self::path()?, f)
+    }
+
+    fn update_at<T>(path: &Path, f: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
+        let dir = path.parent().context("state path has no parent")?;
+        std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+        // Separate from the state file, which the atomic write replaces.
+        let lock_path = path.with_file_name("state.lock");
+        let _lock = File::options()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .and_then(|file| file.lock().map(|()| file))
+            .with_context(|| format!("cannot lock {}", lock_path.display()))?;
+        let mut state = Self::load_at(path)?;
+        let before = toml::to_string_pretty(&state).context("cannot serialize state")?;
+        let out = f(&mut state)?;
+        let after = toml::to_string_pretty(&state).context("cannot serialize state")?;
+        if after != before {
+            // Pid in the temp name: a stale temp from a killed writer is never reused.
+            let tmp = path.with_file_name(format!(".state.toml.{}.tmp", std::process::id()));
+            std::fs::write(&tmp, after).with_context(|| format!("cannot write {}", tmp.display()))?;
+            std::fs::rename(&tmp, path).with_context(|| format!("cannot write {}", path.display()))?;
+        }
+        Ok(out)
     }
 }
 
@@ -325,6 +360,56 @@ mod tests {
                 ("C".into(), "c".into()),
             ])
         );
+    }
+
+    /// The orphaned-child bug: two writers holding snapshots from before each
+    /// other's change must both land, which a snapshot `save` didn't do.
+    #[test]
+    fn updates_apply_to_the_current_file_not_a_snapshot() {
+        let dir = std::env::temp_dir().join(format!("devsandbox-state-update-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("state.toml");
+        let entry = |name: &str| -> Instance {
+            toml::from_str(&format!(
+                "sandbox = \"web\"\ninstance_id = \"{name}\"\ncontainer = \"devsandbox-{name}\"\nfolder = \"/f\"\nworkspace = \"/w\"\ncreated_unix = 0\n"
+            ))
+            .unwrap()
+        };
+        State::update_at(&path, |s| {
+            s.instances.insert("a".into(), entry("a"));
+            Ok(())
+        })
+        .unwrap();
+        // A long command loaded state now, before the child below exists.
+        let stale = State::load_at(&path).unwrap();
+        State::update_at(&path, |s| {
+            s.instances.insert("child".into(), entry("child"));
+            Ok(())
+        })
+        .unwrap();
+        // Then it records its own change: the child must survive.
+        assert!(!stale.instances.contains_key("child"));
+        State::update_at(&path, |s| {
+            s.instances.remove("a");
+            Ok(())
+        })
+        .unwrap();
+        let now = State::load_at(&path).unwrap();
+        assert_eq!(now.instances.keys().collect::<Vec<_>>(), ["child"]);
+
+        // A failed update writes nothing; an unchanged one doesn't rewrite.
+        let mtime = || std::fs::metadata(&path).unwrap().modified().unwrap();
+        let before = mtime();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let err = State::update_at(&path, |s| -> Result<()> {
+            s.instances.clear();
+            anyhow::bail!("boom")
+        });
+        assert!(err.is_err());
+        State::update_at(&path, |_| Ok(())).unwrap();
+        assert_eq!(mtime(), before);
+        assert!(State::load_at(&path).unwrap().instances.contains_key("child"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

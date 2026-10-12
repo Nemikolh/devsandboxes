@@ -15,15 +15,9 @@ pub fn done(name: &str, done: bool) -> Result<()> {
 
 /// Set or clear `key`'s flag in the saved state and return a one-line
 /// status; prints nothing, so the TUI (which owns the terminal) shares it
-/// with the CLI. `key` is an exact state key. Reloads state right before
-/// the write to keep the window for racing another writer small.
+/// with the CLI. `key` is an exact state key.
 pub fn set_saved(key: &str, done: bool) -> Result<String> {
-    let mut state = State::load()?;
-    let (changed, msg) = set(&mut state, key, done, Instance::now())?;
-    if changed {
-        state.save()?;
-    }
-    Ok(msg)
+    State::update(|state| set(state, key, done, Instance::now()).map(|(_, msg)| msg))
 }
 
 /// The pure core: set (`since` = `now`) or clear `key`'s flag in `state`.

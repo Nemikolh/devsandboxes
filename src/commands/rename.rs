@@ -20,13 +20,12 @@ pub fn rename(name: &str, new_name: &str) -> Result<()> {
 /// was at creation; all ops go through the stored `container` field. Returns
 /// the trimmed new name.
 pub fn rename_exact(name: &str, new_name: &str) -> Result<String> {
-    let mut state = State::load()?;
-    if !state.instances.contains_key(name) {
-        bail!("no instance named `{name}` (see `devsandbox ps -a`)");
-    }
-    let new_name = rename_in_state(&mut state, name, new_name)?;
-    state.save()?;
-    Ok(new_name)
+    State::update(|state| {
+        if !state.instances.contains_key(name) {
+            bail!("no instance named `{name}` (see `devsandbox ps -a`)");
+        }
+        rename_in_state(state, name, new_name)
+    })
 }
 
 /// Move `key`'s entry to `new_name` in `state`, returning the trimmed name.

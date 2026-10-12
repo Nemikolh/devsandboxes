@@ -302,8 +302,8 @@ pub fn ensure(container: &str, recorded: Option<Arch>, quiet: bool) -> Option<Ar
 }
 
 /// `ensure` for an existing instance, persisting `devsbd_arch` under `key`
-/// when it changed. State is reloaded so the save can't clobber writes made
-/// since the caller loaded it. Returns the resulting arch so callers can act
+/// when it changed (a [`State::update`], so writes made since the caller
+/// loaded its `info` survive). Returns the resulting arch so callers can act
 /// on the fresh value rather than the pre-ensure `info` (e.g. `start`'s relay
 /// decision, whose `info` snapshot may carry a stale `devsbd_arch`).
 pub fn ensure_recorded(key: &str, info: &Instance, quiet: bool) -> Option<Arch> {
@@ -311,12 +311,11 @@ pub fn ensure_recorded(key: &str, info: &Instance, quiet: bool) -> Option<Arch> 
     if arch == info.devsbd_arch {
         return arch;
     }
-    let saved = State::load().and_then(|mut state| match state.instances.get_mut(key) {
-        Some(entry) => {
+    let saved = State::update(|state| {
+        if let Some(entry) = state.instances.get_mut(key) {
             entry.devsbd_arch = arch;
-            state.save()
         }
-        None => Ok(()),
+        Ok(())
     });
     if let (Err(e), false) = (saved, quiet) {
         eprintln!("note: couldn't record devsbd arch: {e:#}");

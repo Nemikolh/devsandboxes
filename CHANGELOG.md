@@ -94,6 +94,8 @@ devsandbox vscode web-2 --goto src/main.rs:42:7
 
 ### Fixed
 
+- **Instances no longer vanish from state while their container stays.** Commands saved the whole state as they had loaded it, so a slow `run`, `rebuild` or `rm` running alongside another command could drop the instance that command had just recorded, leaving its container and worktree behind with no entry. A dispatcher child lost this way blocked its key for good: every `devsbd ensure` failed with `container … already exists but is not in state`. State changes are now applied under a lock to the current file, written atomically. A dispatcher's `ensure` also replaces such a leftover container when it carries that dispatcher's label and its worktree is gone; if the worktree is still on disk, `ensure` refuses and names the worktree, so you can check it for work before removing it on the host.
+
 - **SSH works in a dispatcher's child as soon as `devsbd ensure` returns.** A child that `ensure` had just started had no working ssh-agent for about a second, so a `devsbd exec` right after it (`git fetch`, `git push`) failed with `Permission denied (publickey)`. `ensure` now waits (up to 12 s) for the agent relay of a child it created or started; if it isn't ready by then, its answer carries a `note` saying why.
 
 - **Long commands in the `:` prompt stay visible.** Text past the prompt's width was hidden though it was still run; the prompt now scrolls sideways to keep the cursor in view.

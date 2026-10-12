@@ -668,13 +668,15 @@ impl Root {
         if !dirty {
             return;
         }
-        // Re-read before writing so a `run`/`rm` since the load isn't undone.
-        let Ok(mut fresh) = State::load() else { return };
-        let mut changed = prune_saved(&mut fresh, &config, &project);
-        for (c, port) in &chosen {
-            changed |= save_port(&mut fresh, &project, c, *port);
-        }
-        if changed && let Err(e) = fresh.save() {
+        // Applied to the current file so a `run`/`rm` since the load isn't undone.
+        let saved = State::update(|fresh| {
+            prune_saved(fresh, &config, &project);
+            for (c, port) in &chosen {
+                save_port(fresh, &project, c, *port);
+            }
+            Ok(())
+        });
+        if let Err(e) = saved {
             notes.push(format!("forwardPorts: {e:#}"));
         }
     }

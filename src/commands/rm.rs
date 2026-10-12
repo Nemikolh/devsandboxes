@@ -16,7 +16,7 @@ use crate::state::{FolderMount, State};
 /// warning, so the instance always leaves state. `host_git`'s repo checks
 /// still apply: a refused repo keeps its worktree on disk, with a warning.
 pub fn rm(name: &str, delete_branch: Option<bool>, force: bool) -> Result<()> {
-    let mut state = State::load()?;
+    let state = State::load()?;
 
     let key = resolve_instance(&state, name)?;
 
@@ -52,8 +52,7 @@ pub fn rm(name: &str, delete_branch: Option<bool>, force: bool) -> Result<()> {
         branch_action(delete_branch, remote_state(&base_folder, &p.branch))
     });
 
-    // Remove the container; ignore failure (it may already be gone).
-    let _ = backend().remove_force(&container);
+    remove_container(&container, &project, &instance_id);
 
     // Per-instance volumes (e.g. docker-in-docker's /var/lib/docker) die with
     // the instance; `rebuild` never comes through here, so they survive it.
@@ -69,20 +68,6 @@ pub fn rm(name: &str, delete_branch: Option<bool>, force: bool) -> Result<()> {
 
     // The managed shell-history dir is deliberately kept: `run` re-provisions
     // the same per-instance path, so history survives an rm + run rebuild.
-
-    // Reap this instance's isolated services and its per-instance network,
-    // addressed by the persistent id (their names/labels carry the id, not the
-    // possibly-renamed key). Global services are shared and left to `gc`.
-    // Empty `project` = pre-upgrade state.
-    if !project.is_empty() {
-        for svc in super::stop::service_containers(&project, &instance_id) {
-            let _ = backend().remove_force(&svc);
-        }
-        let network = crate::commands::services::instance_network(&project, &instance_id);
-        if backend().network_exists(&network).unwrap_or(false) {
-            let _ = backend().run_inherit(&["network", "rm", &network]);
-        }
-    }
 
     // Drop this instance's ssh-agent link: it is worthless without its
     // instance, and `run` recreates it. Best-effort — a missing link is a
@@ -121,11 +106,34 @@ pub fn rm(name: &str, delete_branch: Option<bool>, force: bool) -> Result<()> {
         }
     }
 
-    state.instances.remove(&key);
-    state.save()?;
+    // By id, on the current file: a rename since the load moved the key, and
+    // saving the snapshot would drop whatever other commands recorded since.
+    State::update(|fresh| {
+        fresh.instances.retain(|_, i| i.instance_id != instance_id);
+        Ok(())
+    })?;
     archive_inbox(&key, &instance_id);
     println!("removed {key}");
     Ok(())
+}
+
+/// Remove an instance's container, then its isolated services and its
+/// per-instance network, addressed by the persistent id (their names/labels
+/// carry the id, not the possibly-renamed key). Global services are shared
+/// and left to `gc`. Empty `project` = pre-upgrade state. Best-effort: the
+/// container may already be gone. Shared with `run`, which reclaims an
+/// orphaned dispatcher child this way.
+pub(crate) fn remove_container(container: &str, project: &str, instance_id: &str) {
+    let _ = backend().remove_force(container);
+    if !project.is_empty() {
+        for svc in super::stop::service_containers(project, instance_id) {
+            let _ = backend().remove_force(&svc);
+        }
+        let network = crate::commands::services::instance_network(project, instance_id);
+        if backend().network_exists(&network).unwrap_or(false) {
+            let _ = backend().run_inherit(&["network", "rm", &network]);
+        }
+    }
 }
 
 /// Mark the removed instance's Inbox threads read-only, after its state entry
