@@ -82,9 +82,9 @@ pub(super) fn feature_container_opts(
         {
             continue; // `= false`: disabled.
         }
-        let parsed = features::FeatureRef::parse(reference)?;
-        let feature =
-            features::fetch(&parsed).with_context(|| format!("fetching feature `{reference}`"))?;
+        let source = features::FeatureSource::parse(reference)?;
+        let feature = features::resolve(&source, Path::new(ctx.config_dir))
+            .with_context(|| format!("fetching feature `{reference}`"))?;
         if feature.metadata.privileged == Some(true) {
             opts.privileged_by.push(reference.clone());
         }
@@ -122,7 +122,9 @@ pub(super) fn image_for(dir: &Path, sandbox: &ResolvedSandbox) -> Result<String>
     let base = base_image_for(dir, sandbox)?;
     let props = &sandbox.properties;
     match &props.features {
-        Some(features) if !features.is_empty() => build_features_image(sandbox, &base, features),
+        Some(features) if !features.is_empty() => {
+            build_features_image(dir, sandbox, &base, features)
+        }
         _ => Ok(base),
     }
 }
@@ -176,8 +178,10 @@ struct FeatureBuild {
 }
 
 /// Fetch + order the sandbox's features, assemble a build context under the
-/// features cache, and build the derived image. Returns its tag.
+/// features cache, and build the derived image. Returns its tag. `dir` is the
+/// config dir local feature folders resolve against.
 fn build_features_image(
+    dir: &Path,
     sandbox: &ResolvedSandbox,
     base: &str,
     features: &BTreeMap<String, FeatureOptions>,
@@ -194,10 +198,10 @@ fn build_features_image(
         else {
             continue; // `= false`: skip entirely.
         };
-        let parsed = features::FeatureRef::parse(reference)?;
-        let feature =
-            features::fetch(&parsed).with_context(|| format!("fetching feature `{reference}`"))?;
-        options_by_key.insert(feature.reference.full(), values);
+        let source = features::FeatureSource::parse(reference)?;
+        let feature = features::resolve(&source, dir)
+            .with_context(|| format!("fetching feature `{reference}`"))?;
+        options_by_key.insert(feature.key(), values);
         resolved.push(feature);
     }
     if resolved.is_empty() {
@@ -217,30 +221,25 @@ fn build_features_image(
     )
     .with_context(|| format!("cannot write builtin env in {}", context.display()))?;
 
-    // Per feature: copy its cached dir in under `<idx>-<id>`, write the env-file
-    // and install wrapper, and collect what the Dockerfile generator needs.
+    // Per feature: copy its dir (cache or local folder, as-is) in under
+    // `<idx>-<id>`, write the env-file and install wrapper, and collect what
+    // the Dockerfile generator needs.
     let mut builds = Vec::with_capacity(ordered.len());
     for (idx, feature) in ordered.iter().enumerate() {
-        let id = feature
-            .metadata
-            .id
-            .clone()
-            .unwrap_or_else(|| feature.reference.id.clone());
+        let key = feature.key();
+        let id = feature.metadata.id.clone().unwrap_or_else(|| feature.id());
         let dir_name = format!("{idx}-{id}");
         let dest = context.join(&dir_name);
-        copy_dir(&feature.dir, &dest).with_context(|| {
-            format!("copying feature `{}` into build context", feature.reference.full())
-        })?;
+        copy_dir(&feature.dir, &dest)
+            .with_context(|| format!("copying feature `{key}` into build context"))?;
 
-        let values = options_by_key.remove(&feature.reference.full()).unwrap_or_default();
+        let values = options_by_key.remove(&key).unwrap_or_default();
         let env_file = feature_env_file(&feature.metadata, &values);
         std::fs::write(dest.join("devcontainer-features.env"), &env_file)
-            .with_context(|| format!("cannot write env file for `{}`", feature.reference.full()))?;
-        let wrapper =
-            install_wrapper(&feature.metadata, &feature.reference.without_tag(), &env_file);
-        std::fs::write(dest.join("devcontainer-features-install.sh"), wrapper).with_context(
-            || format!("cannot write install wrapper for `{}`", feature.reference.full()),
-        )?;
+            .with_context(|| format!("cannot write env file for `{key}`"))?;
+        let wrapper = install_wrapper(&feature.metadata, &feature.without_tag(), &env_file);
+        std::fs::write(dest.join("devcontainer-features-install.sh"), wrapper)
+            .with_context(|| format!("cannot write install wrapper for `{key}`"))?;
 
         builds.push(FeatureBuild {
             dir_name,
@@ -271,7 +270,7 @@ fn build_features_image(
         .iter()
         .filter_map(|f| {
             let entrypoint = f.metadata.entrypoint.as_deref()?.trim();
-            (!entrypoint.is_empty()).then(|| (f.reference.without_tag(), entrypoint.to_string()))
+            (!entrypoint.is_empty()).then(|| (f.without_tag(), entrypoint.to_string()))
         })
         .collect();
     if !entrypoints.is_empty() {
@@ -881,6 +880,76 @@ chmod +x ./devcontainer-features-install.sh && \
         cleanup(&ctx, &tag);
         assert!(ok, "docker run failed: {}", String::from_utf8_lossy(&run.stderr));
         assert_eq!(stdout.trim(), "myopt=chosen remote=root env=from-env", "marker: {stdout}");
+        Ok(())
+    }
+
+    /// Docker-gated: the real derived-image build with a local-folder feature
+    /// (`./features/marker` in a temp config dir, not the cwd): resolved in
+    /// place, copied into the context as-is (a nested helper file included),
+    /// option override and metadata default both land.
+    #[test_utils::docker_test]
+    fn derived_image_builds_with_local_feature() -> Result<(), &'static str> {
+        use std::process::Command;
+
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let config_dir = std::env::temp_dir().join(format!("devsandbox-local-feat-build-{stamp}"));
+        let feat = config_dir.join("features/marker");
+        std::fs::create_dir_all(feat.join("lib")).unwrap();
+        std::fs::write(
+            feat.join("devcontainer-feature.json"),
+            r#"{"id": "marker", "name": "Marker", "options": {
+                "myopt": {"type": "string", "default": "fallback"},
+                "other": {"type": "string", "default": "dflt"}
+            }}"#,
+        )
+        .unwrap();
+        std::fs::write(feat.join("lib/value.txt"), "nested").unwrap();
+        std::fs::write(
+            feat.join("install.sh"),
+            "#!/bin/sh\nset -e\nmkdir -p /opt\n\
+             echo \"myopt=$MYOPT other=$OTHER lib=$(cat lib/value.txt)\" > /opt/marker\n",
+        )
+        .unwrap();
+
+        let name = format!("localfeat-test-{stamp}");
+        let sandbox = ResolvedSandbox {
+            name: name.clone(),
+            properties: SandboxProperties {
+                image: Some("alpine:3.20".into()),
+                ..Default::default()
+            },
+            config_hash: "h".into(),
+        };
+        let features = BTreeMap::from([(
+            "./features/marker".to_string(),
+            FeatureOptions::Options(BTreeMap::from([(
+                "myopt".to_string(),
+                toml::Value::String("chosen".into()),
+            )])),
+        )]);
+
+        let result = build_features_image(&config_dir, &sandbox, "alpine:3.20", &features)
+            .map_err(|e| format!("{e:#}"))
+            .and_then(|tag| {
+                let run = Command::new("docker")
+                    .args(["run", "--rm", &tag, "cat", "/opt/marker"])
+                    .output()
+                    .unwrap();
+                let _ = Command::new("docker").args(["rmi", "-f", &tag]).output();
+                if !run.status.success() {
+                    return Err(String::from_utf8_lossy(&run.stderr).into_owned());
+                }
+                Ok(String::from_utf8_lossy(&run.stdout).trim().to_string())
+            });
+        let _ = std::fs::remove_dir_all(&config_dir);
+        if let Ok(context) = features::build_context_dir(&name) {
+            let _ = std::fs::remove_dir_all(context);
+        }
+        let marker = result.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(marker, "myopt=chosen other=dflt lib=nested");
         Ok(())
     }
 

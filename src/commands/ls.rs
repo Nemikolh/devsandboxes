@@ -39,6 +39,11 @@ pub fn ls(dir: &Path, json: bool) -> Result<()> {
     let mut colored: Vec<[String; 5]> = Vec::with_capacity(sandboxes.len());
 
     for sandbox in &sandboxes {
+        // Feature problems a build would hit (a missing local feature folder),
+        // surfaced here rather than only at `run`.
+        for issue in crate::features::feature_issues(dir, sandbox.properties.features.as_ref()) {
+            eprintln!("warning: sandbox `{}`: {issue}", sandbox.name);
+        }
         let source = sandbox.source();
         let folder = sandbox.folder();
         let services = sandbox

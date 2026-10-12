@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 
 use super::{container_drifted, resolve_instance, run, services};
-use crate::config::{build_hash, Config, ResolvedSandbox};
+use crate::config::{sandbox_build_hash, Config, ResolvedSandbox};
 use crate::runtime::backend;
 use crate::state::{Instance, State};
 
@@ -75,7 +75,7 @@ fn needs_rebuild(dir: &Path, container: &str, sandbox: &ResolvedSandbox) -> Resu
     if backend().label(container, "devsandbox.config_hash")?.is_none() {
         return Ok(true);
     }
-    let build = build_hash(dir, sandbox.properties.build.as_ref());
+    let build = sandbox_build_hash(dir, &sandbox.properties);
     container_drifted(container, &sandbox.config_hash, &build)
 }
 

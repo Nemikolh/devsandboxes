@@ -980,8 +980,13 @@ impl Config {
 
 /// Stable FNV-1a hash of arbitrary text, rendered as 16 hex chars.
 pub fn short_hash(text: &str) -> String {
+    fnv_hex(text.as_bytes())
+}
+
+/// [`short_hash`] over raw bytes (feature folders may hold binaries).
+fn fnv_hex(bytes: &[u8]) -> String {
     let mut h: u64 = 0xcbf29ce484222325;
-    for b in text.bytes() {
+    for &b in bytes {
         h ^= b as u64;
         h = h.wrapping_mul(0x100000001b3);
     }
@@ -994,8 +999,8 @@ pub fn short_hash(text: &str) -> String {
 /// Hashing the bytes (not the path in the merged config, which `config_hash`
 /// already covers) is what lets a dockerfile edit register as drift: the path
 /// is unchanged, only the contents moved. Limitation: only the dockerfile file
-/// itself is hashed — the build context and devcontainer features are not, so
-/// edits to those go undetected.
+/// itself is hashed — the build context is not, so edits to it go undetected.
+/// Sandboxes also fold in local feature folders: [`sandbox_build_hash`].
 pub fn build_hash(dir: &Path, build: Option<&Build>) -> String {
     let Some(dockerfile) = build.and_then(|b| b.dockerfile.as_deref()) else {
         return String::new();
@@ -1003,6 +1008,22 @@ pub fn build_hash(dir: &Path, build: Option<&Build>) -> String {
     match std::fs::read(dir.join(dockerfile)) {
         Ok(bytes) => short_hash(&String::from_utf8_lossy(&bytes)),
         Err(_) => String::new(),
+    }
+}
+
+/// A sandbox's `build_hash` label: [`build_hash`] plus the contents of its
+/// enabled local-folder features, so editing a local feature's `install.sh`
+/// registers as drift. Without local features it equals [`build_hash`], so
+/// existing containers don't drift on upgrade. OCI feature contents are not
+/// hashed (their refs are in the config hash; tags are cached).
+pub fn sandbox_build_hash(dir: &Path, props: &SandboxProperties) -> String {
+    let build = build_hash(dir, props.build.as_ref());
+    match crate::features::local_features_fingerprint(dir, props.features.as_ref()) {
+        None => build,
+        Some(mut bytes) => {
+            bytes.extend_from_slice(build.as_bytes());
+            fnv_hex(&bytes)
+        }
     }
 }
 
@@ -1487,6 +1508,44 @@ forwardPorts = [true]
         // A content change moves the hash even though the path is unchanged.
         std::fs::write(&path, "FROM alpine\nRUN echo hi\n").unwrap();
         assert_ne!(first, build_hash(&dir, Some(&build)));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn sandbox_build_hash_tracks_local_features_only() {
+        let dir = std::env::temp_dir().join(format!("devsandbox-sbh-{}", std::process::id()));
+        let feature = dir.join("features/toolkit");
+        std::fs::create_dir_all(&feature).unwrap();
+        std::fs::write(feature.join("devcontainer-feature.json"), r#"{"id": "toolkit"}"#).unwrap();
+        std::fs::write(feature.join("install.sh"), "#!/bin/sh\n").unwrap();
+        let hash = |body: &str| {
+            let sandbox = Config::parse(body).unwrap().resolve_sandbox("app").unwrap();
+            sandbox_build_hash(&dir, &sandbox.properties)
+        };
+        let local = r#"
+            [template.base.features."./features/toolkit"]
+            ripgrep = true
+            [sandbox.app]
+            extends = "base"
+            image = "alpine"
+            folder = "app"
+        "#;
+        let first = hash(local);
+        assert!(!first.is_empty());
+        // Unrelated config edits (and option values) leave it alone.
+        assert_eq!(first, hash(&local.replace("folder = \"app\"", "folder = \"other\"\nremoteUser = \"x\"")));
+        assert_eq!(first, hash(&local.replace("ripgrep = true", "ripgrep = false")));
+        // Editing the feature folder moves it.
+        std::fs::write(feature.join("install.sh"), "#!/bin/sh\napk add ripgrep\n").unwrap();
+        assert_ne!(first, hash(local));
+        // OCI-only sandboxes keep the plain `build_hash` ("" for an image).
+        let oci = r#"
+            [sandbox.app]
+            image = "alpine"
+            [sandbox.app.features."ghcr.io/devcontainers/features/node:1"]
+        "#;
+        assert_eq!(hash(oci), "");
 
         std::fs::remove_dir_all(&dir).ok();
     }

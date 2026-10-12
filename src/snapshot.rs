@@ -13,7 +13,7 @@ use serde::Serialize;
 use crate::commands::drift_decision;
 use crate::commands::services::{isolated_service_container, project_id, service_container};
 use crate::config::{
-    build_hash, parse_shorthand, Config, Mount, MountContext, ResolvedSandbox, ServiceScope,
+    build_hash, parse_shorthand, sandbox_build_hash, Config, Mount, MountContext, ResolvedSandbox, ServiceScope,
     INSTANCE_VARS,
 };
 use crate::runtime::{backend, ContainerRow, NAME_PREFIX};
@@ -391,6 +391,9 @@ fn classify(container: &str, ps: &[ContainerRow]) -> ContainerStatus {
 ///   `${sharedVolumes}` or templated on the instance id: those are expected to
 ///   be absent until an instance has run, and the instance path is only a guess
 ///   here anyway.
+/// - **features**: refs must parse, and local-folder ones must exist relative
+///   to the config dir with a readable `devcontainer-feature.json`
+///   ([`crate::features::feature_issues`]).
 ///
 /// Returns one message per problem, in check order; empty means it validates.
 fn validate_sandbox(dir: &Path, sb: &ResolvedSandbox) -> Vec<String> {
@@ -460,6 +463,8 @@ fn validate_sandbox(dir: &Path, sb: &ResolvedSandbox) -> Vec<String> {
         }
     }
 
+    issues.extend(crate::features::feature_issues(dir, sb.properties.features.as_ref()));
+
     issues
 }
 
@@ -493,7 +498,7 @@ pub fn sandbox_rows(dir: &Path, config: &Config) -> (Vec<SandboxRow>, Vec<String
             Ok(rs) => {
                 let services = rs.properties.services.clone().unwrap_or_default();
                 let issues = validate_sandbox(dir, &rs);
-                let build_hash = build_hash(dir, rs.properties.build.as_ref());
+                let build_hash = sandbox_build_hash(dir, &rs.properties);
                 rows.push(SandboxRow {
                     name: name.clone(),
                     source: rs.source(),
@@ -1074,6 +1079,22 @@ extends = "does-not-exist"
             ]),
         );
         assert!(validate_sandbox(&root, &auto).is_empty(), "{:?}", validate_sandbox(&root, &auto));
+
+        // A local feature folder missing under the config dir is flagged.
+        let mut feat = mk(Some("repo"), None);
+        feat.properties.features = Some(BTreeMap::from([(
+            "./features/toolkit".to_string(),
+            crate::config::FeatureOptions::Enabled(true),
+        )]));
+        let issues = validate_sandbox(&root, &feat);
+        assert_eq!(issues.len(), 1, "got: {issues:?}");
+        assert!(issues[0].contains("feature `./features/toolkit`: folder"), "got: {issues:?}");
+        // Folder present but no metadata.
+        std::fs::create_dir_all(root.join("features/toolkit")).unwrap();
+        let issues = validate_sandbox(&root, &feat);
+        assert!(issues[0].contains("no devcontainer-feature.json"), "got: {issues:?}");
+        std::fs::write(root.join("features/toolkit/devcontainer-feature.json"), "{}").unwrap();
+        assert!(validate_sandbox(&root, &feat).is_empty());
 
         let _ = std::fs::remove_dir_all(&root);
     }

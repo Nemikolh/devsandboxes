@@ -7,6 +7,10 @@
 //! crates), caches the extraction per user, reads the metadata, and computes an
 //! install order from `installsAfter`. Building the derived image lives in the
 //! `run` command (step 3); this module stops at a [`ResolvedFeature`].
+//!
+//! A ref starting with `./`, `../` or `/` is instead a local folder with the
+//! same layout ([`FeatureSource::Local`]), resolved against the config dir and
+//! read in place: no download, no cache.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -45,8 +49,9 @@ pub struct FeatureRef {
 }
 
 impl FeatureRef {
-    /// Parse an OCI feature ref. Rejects local paths, refs without a registry
-    /// host, and https tarball URLs with a clear error.
+    /// Parse an OCI feature ref. Rejects local paths (see
+    /// [`FeatureSource::parse`]), refs without a registry host, and https
+    /// tarball URLs with a clear error.
     pub fn parse(input: &str) -> Result<Self> {
         let input = input.trim();
         if input.is_empty() {
@@ -57,10 +62,8 @@ impl FeatureRef {
                 "feature `{input}`: tarball/URL features are not supported; use an OCI ref like `ghcr.io/devcontainers/features/node:1`"
             );
         }
-        if input.starts_with('.') || input.starts_with('/') {
-            bail!(
-                "feature `{input}`: local-path features are not supported; use an OCI ref like `ghcr.io/devcontainers/features/node:1`"
-            );
+        if is_local(input) || input.starts_with('.') {
+            bail!("feature `{input}`: not an OCI reference (local folders start with `./`, `../` or `/`)");
         }
 
         // The tag is after the last `:` only when that `:` sits after the last
@@ -117,6 +120,146 @@ impl FeatureRef {
     pub fn full(&self) -> String {
         format!("{}/{}:{}", self.registry, self.path, self.tag)
     }
+}
+
+/// Whether a ref names a local folder: `./`, `../` or an absolute path, the
+/// same forms `folder` accepts.
+fn is_local(input: &str) -> bool {
+    input.starts_with("./") || input.starts_with("../") || input.starts_with('/')
+}
+
+/// Where a feature comes from: an OCI artifact, or a local folder holding
+/// `devcontainer-feature.json` + `install.sh`. `Local` keeps the path as
+/// written; [`FeatureSource::local_dir`] resolves it against the config dir.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FeatureSource {
+    Oci(FeatureRef),
+    Local(PathBuf),
+}
+
+impl FeatureSource {
+    /// Parse a config feature key: a local folder ref, else an OCI ref.
+    pub fn parse(input: &str) -> Result<Self> {
+        let input = input.trim();
+        if is_local(input) {
+            return Ok(FeatureSource::Local(PathBuf::from(input)));
+        }
+        FeatureRef::parse(input).map(FeatureSource::Oci)
+    }
+
+    /// A local feature's folder, resolved against `config_dir` (an absolute
+    /// ref stays as-is). `None` for OCI features.
+    pub fn local_dir(&self, config_dir: &Path) -> Option<PathBuf> {
+        match self {
+            // Drop `.` components so messages read `<dir>/features/x`.
+            FeatureSource::Local(path) => Some(
+                path.components()
+                    .filter(|c| *c != std::path::Component::CurDir)
+                    .fold(config_dir.to_path_buf(), |dir, c| dir.join(c)),
+            ),
+            FeatureSource::Oci(_) => None,
+        }
+    }
+
+    /// Stable identity: the full OCI ref, or a local ref as written. Keys the
+    /// option map and orders ties in [`install_order`]; written form (not the
+    /// resolved path) so it doesn't depend on the cwd or `-C`.
+    pub fn key(&self) -> String {
+        match self {
+            FeatureSource::Oci(r) => r.full(),
+            FeatureSource::Local(path) => path.display().to_string(),
+        }
+    }
+
+    /// What `installsAfter` entries match: the OCI ref sans tag, or a local
+    /// ref as written. Also the `Id` in the install banner.
+    pub fn without_tag(&self) -> String {
+        match self {
+            FeatureSource::Oci(r) => r.without_tag(),
+            FeatureSource::Local(path) => path.display().to_string(),
+        }
+    }
+}
+
+/// Problems with the sandbox's enabled features that can be found without a
+/// network or runtime: unparseable refs, and local folders that are missing or
+/// lack a readable `devcontainer-feature.json`. One message per problem, for
+/// config validation (`ls`, the dashboard) ahead of a build.
+pub fn feature_issues(
+    config_dir: &Path,
+    features: Option<&BTreeMap<String, crate::config::FeatureOptions>>,
+) -> Vec<String> {
+    let mut issues = Vec::new();
+    for (reference, options) in features.into_iter().flatten() {
+        if matches!(options, crate::config::FeatureOptions::Enabled(false)) {
+            continue;
+        }
+        let result = FeatureSource::parse(reference).and_then(|source| match &source {
+            FeatureSource::Local(_) => resolve(&source, config_dir).map(drop),
+            FeatureSource::Oci(_) => Ok(()),
+        });
+        if let Err(e) = result {
+            issues.push(format!("{e:#}"));
+        }
+    }
+    issues
+}
+
+/// The bytes that fingerprint the sandbox's enabled local features: per
+/// feature (sorted by ref), the ref, then each file's relative path and
+/// contents in sorted path order. `None` when there are no local features, so
+/// OCI-only sandboxes keep their prior `build_hash`. A missing folder
+/// contributes a marker instead of failing (validation reports it).
+pub fn local_features_fingerprint(
+    config_dir: &Path,
+    features: Option<&BTreeMap<String, crate::config::FeatureOptions>>,
+) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut any = false;
+    for (reference, options) in features.into_iter().flatten() {
+        if matches!(options, crate::config::FeatureOptions::Enabled(false)) {
+            continue;
+        }
+        let Ok(source) = FeatureSource::parse(reference) else { continue };
+        let Some(dir) = source.local_dir(config_dir) else { continue };
+        any = true;
+        out.extend_from_slice(source.key().as_bytes());
+        out.push(0);
+        let mut files = Vec::new();
+        if collect_files(&dir, Path::new(""), &mut files).is_err() {
+            out.extend_from_slice(b"<unreadable>\0");
+            continue;
+        }
+        files.sort();
+        for rel in files {
+            out.extend_from_slice(rel.to_string_lossy().as_bytes());
+            out.push(0);
+            match std::fs::read(dir.join(&rel)) {
+                Ok(bytes) => {
+                    out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+                    out.extend_from_slice(&bytes);
+                }
+                Err(_) => out.extend_from_slice(b"<unreadable>"),
+            }
+            out.push(0);
+        }
+    }
+    any.then_some(out)
+}
+
+/// Relative paths of every non-directory entry under `root/rel`, walked the
+/// way the build-context copy walks it (directories recursed, the rest read).
+fn collect_files(root: &Path, rel: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(root.join(rel))? {
+        let entry = entry?;
+        let child = rel.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            collect_files(root, &child, out)?;
+        } else {
+            out.push(child);
+        }
+    }
+    Ok(())
 }
 
 /// Base cache dir (`$XDG_CACHE_HOME/devsandbox/features`, falling back to
@@ -199,13 +342,61 @@ impl FeatureMetadata {
     }
 }
 
-/// A fetched feature: its ref, the cache dir holding the extracted contents, and
-/// the parsed metadata.
+/// A fetched feature: its source, the dir holding its contents (the cache dir
+/// for OCI, the folder itself for local), and the parsed metadata.
 #[derive(Debug, Clone)]
 pub struct ResolvedFeature {
-    pub reference: FeatureRef,
+    pub source: FeatureSource,
     pub dir: PathBuf,
     pub metadata: FeatureMetadata,
+}
+
+impl ResolvedFeature {
+    /// See [`FeatureSource::key`].
+    pub fn key(&self) -> String {
+        self.source.key()
+    }
+
+    /// See [`FeatureSource::without_tag`].
+    pub fn without_tag(&self) -> String {
+        self.source.without_tag()
+    }
+
+    /// Bare id for loose `installsAfter` matching and the build-context dir
+    /// name: the OCI ref's last segment; for a local feature its metadata
+    /// `id`, else the folder name.
+    pub fn id(&self) -> String {
+        match &self.source {
+            FeatureSource::Oci(r) => r.id.clone(),
+            FeatureSource::Local(path) => self.metadata.id.clone().unwrap_or_else(|| {
+                path.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "feature".to_string())
+            }),
+        }
+    }
+}
+
+/// Resolve a feature: an OCI one is fetched into the per-user cache, a local
+/// one is read in place from its folder under `config_dir`.
+pub fn resolve(source: &FeatureSource, config_dir: &Path) -> Result<ResolvedFeature> {
+    match source {
+        FeatureSource::Oci(reference) => fetch(reference),
+        FeatureSource::Local(path) => {
+            let dir = source.local_dir(config_dir).expect("local source");
+            let shown = path.display();
+            if !dir.is_dir() {
+                bail!("feature `{shown}`: folder {} not found", dir.display());
+            }
+            let metadata_path = dir.join("devcontainer-feature.json");
+            if !metadata_path.is_file() {
+                bail!("feature `{shown}`: no devcontainer-feature.json in {}", dir.display());
+            }
+            let metadata = FeatureMetadata::read(&metadata_path)
+                .with_context(|| format!("feature `{shown}`"))?;
+            Ok(ResolvedFeature { source: source.clone(), dir, metadata })
+        }
+    }
 }
 
 /// Fetch a feature into the default per-user cache and read its metadata.
@@ -231,7 +422,7 @@ pub fn fetch_into(reference: &FeatureRef, cache_root: &Path) -> Result<ResolvedF
 
     let metadata = FeatureMetadata::read(&metadata_path)?;
     Ok(ResolvedFeature {
-        reference: reference.clone(),
+        source: FeatureSource::Oci(reference.clone()),
         dir,
         metadata,
     })
@@ -567,15 +758,15 @@ impl StripPrefixCi for &str {
 /// candidate's ref-sans-tag first, then its bare id (the official CLI matches
 /// loosely).
 pub fn install_order(features: Vec<ResolvedFeature>) -> Result<Vec<ResolvedFeature>> {
-    let keys: Vec<String> = features.iter().map(|f| f.reference.full()).collect();
+    let keys: Vec<String> = features.iter().map(ResolvedFeature::key).collect();
 
     // Map each dependency selector (ref-sans-tag or bare id) to the feature
     // key(s) it resolves to, so `installsAfter` can be matched loosely.
     let mut by_sans_tag: BTreeMap<String, String> = BTreeMap::new();
     let mut by_id: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for f in &features {
-        by_sans_tag.insert(f.reference.without_tag(), f.reference.full());
-        by_id.entry(f.reference.id.clone()).or_default().push(f.reference.full());
+        by_sans_tag.insert(f.without_tag(), f.key());
+        by_id.entry(f.id()).or_default().push(f.key());
     }
 
     // Edges: `dep -> feature` (dep installs before feature).
@@ -584,7 +775,7 @@ pub fn install_order(features: Vec<ResolvedFeature>) -> Result<Vec<ResolvedFeatu
         .map(|k| (k.clone(), BTreeSet::new()))
         .collect();
     for f in &features {
-        let key = f.reference.full();
+        let key = f.key();
         for entry in &f.metadata.installs_after {
             let entry = entry.trim();
             // Match sans-tag first; fall back to bare id.
@@ -604,7 +795,7 @@ pub fn install_order(features: Vec<ResolvedFeature>) -> Result<Vec<ResolvedFeatu
     }
 
     let mut features_by_key: BTreeMap<String, ResolvedFeature> =
-        features.into_iter().map(|f| (f.reference.full(), f)).collect();
+        features.into_iter().map(|f| (f.key(), f)).collect();
 
     let mut ordered = Vec::with_capacity(keys.len());
     let mut placed: BTreeSet<String> = BTreeSet::new();
@@ -634,12 +825,14 @@ mod tests {
     use super::*;
 
     fn feature(reference: &str, installs_after: &[&str]) -> ResolvedFeature {
-        let reference = FeatureRef::parse(reference).unwrap();
+        let source = FeatureSource::parse(reference).unwrap();
         let mut metadata = FeatureMetadata::default();
-        metadata.id = Some(reference.id.clone());
+        if let FeatureSource::Oci(r) = &source {
+            metadata.id = Some(r.id.clone());
+        }
         metadata.installs_after = installs_after.iter().map(|s| s.to_string()).collect();
         ResolvedFeature {
-            reference,
+            source,
             dir: PathBuf::new(),
             metadata,
         }
@@ -682,11 +875,157 @@ mod tests {
     }
 
     #[test]
-    fn parse_rejects_local_paths() {
+    fn oci_parse_rejects_local_paths() {
         for input in ["./x", "../x", "/abs/x"] {
             let err = FeatureRef::parse(input).unwrap_err().to_string();
-            assert!(err.contains("local-path"), "{input}: {err}");
+            assert!(err.contains("not an OCI reference"), "{input}: {err}");
         }
+    }
+
+    #[test]
+    fn source_parse_local_forms() {
+        for input in ["./x", "../x/y", "/abs/x"] {
+            assert_eq!(
+                FeatureSource::parse(input).unwrap(),
+                FeatureSource::Local(PathBuf::from(input)),
+                "{input}"
+            );
+        }
+        let local = FeatureSource::parse("./features/toolkit").unwrap();
+        assert_eq!(local.key(), "./features/toolkit");
+        assert_eq!(local.without_tag(), "./features/toolkit");
+    }
+
+    #[test]
+    fn source_parse_oci_unchanged_and_urls_error() {
+        let source = FeatureSource::parse("ghcr.io/devcontainers/features/node:1").unwrap();
+        assert_eq!(
+            source,
+            FeatureSource::Oci(FeatureRef::parse("ghcr.io/devcontainers/features/node:1").unwrap())
+        );
+        assert_eq!(source.key(), "ghcr.io/devcontainers/features/node:1");
+        assert_eq!(source.local_dir(Path::new("/cfg")), None);
+        let err = FeatureSource::parse("https://example.com/f.tgz").unwrap_err().to_string();
+        assert!(err.contains("tarball"), "{err}");
+        // A dotfile-ish name is neither a local folder nor an OCI ref.
+        assert!(FeatureSource::parse(".x").is_err());
+    }
+
+    /// A fresh temp dir per test (removed by the caller).
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "devsandbox-local-feat-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_feature(dir: &Path, json: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("devcontainer-feature.json"), json).unwrap();
+        std::fs::write(dir.join("install.sh"), "#!/bin/sh\necho hi\n").unwrap();
+    }
+
+    #[test]
+    fn local_resolves_against_config_dir_not_cwd() {
+        let root = temp_dir("resolve");
+        let config_dir = root.join("cfg");
+        write_feature(&config_dir.join("features/toolkit"), r#"{"id": "toolkit", "installsAfter": ["common-utils"]}"#);
+        // A sibling folder reached with `../`.
+        write_feature(&root.join("shared/extra"), r#"{"name": "Extra"}"#);
+
+        let toolkit = FeatureSource::parse("./features/toolkit").unwrap();
+        // The cwd (the crate root under `cargo test`) has no such folder.
+        assert!(!Path::new("./features/toolkit").exists());
+        let resolved = resolve(&toolkit, &config_dir).unwrap();
+        assert_eq!(resolved.dir, config_dir.join("./features/toolkit"));
+        assert_eq!(resolved.metadata.id.as_deref(), Some("toolkit"));
+        assert_eq!(resolved.id(), "toolkit");
+        assert_eq!(resolved.key(), "./features/toolkit");
+
+        // No metadata id: the folder name stands in.
+        let extra = resolve(&FeatureSource::parse("../shared/extra").unwrap(), &config_dir).unwrap();
+        assert_eq!(extra.id(), "extra");
+
+        // Absolute refs ignore the config dir.
+        let abs = format!("{}", root.join("shared/extra").display());
+        let abs = resolve(&FeatureSource::parse(&abs).unwrap(), Path::new("/elsewhere")).unwrap();
+        assert_eq!(abs.metadata.name.as_deref(), Some("Extra"));
+
+        // Takes part in ordering: its `installsAfter` names an OCI feature.
+        let ordered = install_order(vec![
+            resolved,
+            feature("ghcr.io/devcontainers/features/common-utils:2", &[]),
+        ])
+        .unwrap();
+        let ids: Vec<_> = ordered.iter().map(ResolvedFeature::id).collect();
+        assert_eq!(ids, ["common-utils", "toolkit"]);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn feature_issues_flag_missing_folder_and_metadata() {
+        use crate::config::FeatureOptions;
+        let root = temp_dir("issues");
+        std::fs::create_dir_all(root.join("features/empty")).unwrap();
+        write_feature(&root.join("features/ok"), r#"{"id": "ok"}"#);
+        let features = BTreeMap::from([
+            ("./features/ok".to_string(), FeatureOptions::Enabled(true)),
+            ("./features/nope".to_string(), FeatureOptions::Enabled(true)),
+            ("./features/empty".to_string(), FeatureOptions::Enabled(true)),
+            // Disabled: not checked.
+            ("./features/off".to_string(), FeatureOptions::Enabled(false)),
+            ("ghcr.io/devcontainers/features/node:1".to_string(), FeatureOptions::Enabled(true)),
+        ]);
+        let issues = feature_issues(&root, Some(&features));
+        assert_eq!(issues.len(), 2, "{issues:?}");
+        assert!(issues[0].contains("`./features/empty`: no devcontainer-feature.json"), "{issues:?}");
+        assert!(issues[1].contains("`./features/nope`: folder") && issues[1].contains("not found"), "{issues:?}");
+        assert!(feature_issues(&root, None).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn local_fingerprint_tracks_folder_contents_only() {
+        use crate::config::FeatureOptions;
+        let root = temp_dir("hash");
+        write_feature(&root.join("features/toolkit"), r#"{"id": "toolkit"}"#);
+        let mut features = BTreeMap::from([(
+            "./features/toolkit".to_string(),
+            FeatureOptions::Enabled(true),
+        )]);
+        let first = local_features_fingerprint(&root, Some(&features)).unwrap();
+        assert_eq!(Some(&first), local_features_fingerprint(&root, Some(&features)).as_ref());
+
+        // Option values and OCI features live in the config hash, not here.
+        features.insert("./features/toolkit".into(), FeatureOptions::Version("2".into()));
+        features.insert("ghcr.io/devcontainers/features/node:1".into(), FeatureOptions::Enabled(true));
+        assert_eq!(Some(&first), local_features_fingerprint(&root, Some(&features)).as_ref());
+        // Unrelated files in the config dir don't count.
+        std::fs::write(root.join("devsandboxes.toml"), "x").unwrap();
+        assert_eq!(Some(&first), local_features_fingerprint(&root, Some(&features)).as_ref());
+
+        // Editing install.sh, or adding a nested file, does.
+        std::fs::write(root.join("features/toolkit/install.sh"), "#!/bin/sh\necho changed\n").unwrap();
+        let edited = local_features_fingerprint(&root, Some(&features)).unwrap();
+        assert_ne!(first, edited);
+        std::fs::create_dir_all(root.join("features/toolkit/lib")).unwrap();
+        std::fs::write(root.join("features/toolkit/lib/x.sh"), "").unwrap();
+        assert_ne!(edited, local_features_fingerprint(&root, Some(&features)).unwrap());
+
+        // No local features: no fingerprint (OCI-only sandboxes keep their hash).
+        let oci = BTreeMap::from([(
+            "ghcr.io/devcontainers/features/node:1".to_string(),
+            FeatureOptions::Enabled(true),
+        )]);
+        assert_eq!(local_features_fingerprint(&root, Some(&oci)), None);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -724,7 +1063,7 @@ mod tests {
             feature("ghcr.io/devcontainers/features/common-utils:2", &[]),
         ];
         let ordered = install_order(feats).unwrap();
-        let ids: Vec<_> = ordered.iter().map(|f| f.reference.id.as_str()).collect();
+        let ids: Vec<_> = ordered.iter().map(ResolvedFeature::id).collect();
         assert_eq!(ids, ["common-utils", "node"]);
     }
 
@@ -736,7 +1075,7 @@ mod tests {
             feature("ghcr.io/devcontainers/features/common-utils:2", &[]),
         ];
         let ordered = install_order(feats).unwrap();
-        let ids: Vec<_> = ordered.iter().map(|f| f.reference.id.as_str()).collect();
+        let ids: Vec<_> = ordered.iter().map(ResolvedFeature::id).collect();
         assert_eq!(ids, ["common-utils", "node"]);
     }
 
@@ -749,7 +1088,7 @@ mod tests {
             feature("ghcr.io/devcontainers/features/git:1", &[]),
         ];
         let ordered = install_order(feats).unwrap();
-        let ids: Vec<_> = ordered.iter().map(|f| f.reference.id.as_str()).collect();
+        let ids: Vec<_> = ordered.iter().map(ResolvedFeature::id).collect();
         assert_eq!(ids, ["git", "node", "zsh"]);
     }
 
@@ -762,7 +1101,7 @@ mod tests {
         )];
         let ordered = install_order(feats).unwrap();
         assert_eq!(ordered.len(), 1);
-        assert_eq!(ordered[0].reference.id, "node");
+        assert_eq!(ordered[0].id(), "node");
     }
 
     #[test]

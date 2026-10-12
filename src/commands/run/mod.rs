@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
-use crate::config::{build_hash, short_hash, substitute, Config, MountContext, ResolvedSandbox, CONFIG_FILE};
+use crate::config::{sandbox_build_hash, short_hash, substitute, Config, MountContext, ResolvedSandbox, CONFIG_FILE};
 use crate::runtime::{backend, ServiceEndpoint, NAME_PREFIX};
 use crate::state::{Instance, State};
 
@@ -799,7 +799,7 @@ fn unique_instance_id(state: &State, name: &str) -> String {
 /// the freshly resolved one (the shared [`container_drifted`] rule, so a
 /// dockerfile edit warns too). Containers without the labels (None) — skip.
 pub(crate) fn warn_on_drift(dir: &Path, container: &str, sandbox: &ResolvedSandbox) -> Result<()> {
-    let build = build_hash(dir, sandbox.properties.build.as_ref());
+    let build = sandbox_build_hash(dir, &sandbox.properties);
     if container_drifted(container, &sandbox.config_hash, &build)? {
         // Suggest a copy-pasteable command: strip the container prefix to the
         // instance name, falling back to the container name if it is unprefixed.
@@ -837,7 +837,7 @@ fn run_container(
     let hash_label = format!("devsandbox.config_hash={}", sandbox.config_hash);
     let build_hash_label = format!(
         "devsandbox.build_hash={}",
-        build_hash(dir, sandbox.properties.build.as_ref())
+        sandbox_build_hash(dir, &sandbox.properties)
     );
     let base_label = format!("devsandbox.base_folder={}", base_folder.display());
     let boot_hook_label = format!("{BOOT_HOOK_LABEL}=1");
