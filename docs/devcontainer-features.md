@@ -70,7 +70,16 @@ containing `devcontainer-feature.json` + `install.sh`. Support pipeline:
 
 ### v1 scope cuts (documented, not silent)
 
-- OCI refs only; local-path / https-tarball features error clearly.
+- OCI refs and local folders; https-tarball features error clearly. A ref
+  starting with `./`, `../` or `/` is a folder holding
+  `devcontainer-feature.json` + `install.sh` (the OCI tarball's layout),
+  resolved against the config dir, read in place (no cache) and copied into
+  the build context as-is. Its ref as written keys its options and is what
+  other features' `installsAfter` match (plus its metadata `id`, else the
+  folder name, for the loose bare-id match). Its folder contents are hashed
+  into the sandbox's `build_hash` (`config::sandbox_build_hash`), so editing
+  `install.sh` is drift; a missing folder or `devcontainer-feature.json` is a
+  validation issue in `ls` and the dashboard.
 - Feature metadata `capAdd`, `init` ignored (the runner uses
   `sleep infinity`; the four target features need none of these).
   `containerEnv`, options, `mounts`, `privileged` and `entrypoint` are honored

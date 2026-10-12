@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Local-folder features.** A `features` key starting with `./`, `../` or `/` is a feature folder (`devcontainer-feature.json` + `install.sh`) resolved against the config dir, so a config can ship its own feature without publishing it to a registry. Options, `containerEnv`, `installsAfter`, `mounts`, `privileged` and `entrypoint` work as for OCI features. Editing a file in the folder marks the sandbox's instances as drifted, so `devsandbox rebuild` picks the change up, and `devsandbox ls` warns when the folder or its `devcontainer-feature.json` is missing.
+
+```toml
+[template.base.features."./features/toolkit"]
+ripgrep = true
+```
+
 ## 0.7.0
 
 A per-user host daemon now keeps notifications, dispatchers and port forwards working with the dashboard closed, and serves an API that editors, GUIs and the new npm `connect()` client can drive. Sandboxes can keep one Inbox thread per item: a header with a state and buttons, and a conversation of messages, forms and your replies, answered from the dashboard, the new `devsandbox inbox` command or any API client, with events streamed back as they happen. The Inbox becomes a list of what's waiting on you rather than a log, and instances can be marked done instead of removed. VS Code can open straight at a file and line.
