@@ -112,6 +112,86 @@ devsandbox vscode web-2 --goto src/main.rs:42:7
 
 - **`rm` asks about the right branch.** It used to name the branch `run` created, even after the worktree had switched to or renamed another branch. Now it reads the worktree's current branch before removing it. For instances from before branches were recorded that have since been renamed, the old fallback guessed the branch name from the new name; it now uses the instance's original name.
 
+<details><summary>Commits</summary>
+
+- b0f96a0 fix(state): apply state changes under a lock to the current file
+- b006504 feat(inbox): show a submission's answers where the user reads the outcome, and let a form question follow up another (under/when) so a reply for one option no longer reads as a separate question
+- b89fb10 fix(dispatch): ensure waits for a child's ssh-agent relay after bringing it up, so an exec right after can use ssh instead of failing with publickey
+- 3e997c7 feat(tui): d removes the selected instance instead of marking it done
+- cdea7cd feat(inbox): drop the v2 put and event compat so old-shape puts are rejected with a pointer to thread send and compose, and events name only their thread
+- 4d10d56 fix(serve): retry a restored forward's saved port for a second before moving it, since a draining predecessor or a forked child can hold it for a moment
+- b48e4a9 docs: describe the daemon, owner threads, messages, forms, follow and the inbox cli as they now work, and mark the old threads design superseded
+- 4858573 feat(tui): start a stopped child before running its vscode, terminal or forward action and answer dispatcher child ops with json, so thread buttons work on parked children and scripts never parse prose
+- ca97a65 feat(inbox): add devsandbox inbox ls|show|reply|act|submit|done|reopen so scripts and terminals can read and answer threads without the dashboard
+- 24bd49e feat(inbox): stream owner events with devsbd events --follow, one live follower per owner, so a dispatcher reacts at once instead of long-polling the store
+- b6e421e fix(api): report stdin's eof before half-closing the relay's socket, since a fast daemon hang-up was read as the daemon leaving and exited 75
+- 1f3a563 feat(inbox): name the event's thread field thread and let devsbd events filter by --thread, keeping key as an alias until the dispatcher moves over
+- 619e8b0 test(serve): give the relay test's daemon a 1 s idle timeout since 200 ms flaked under a loaded parallel run
+- 07e75b5 feat(tui): pin open forms under the thread header with choice, text and confirm widgets, a draft saved on every change and an enter-to-confirm submit
+- e77f363 feat(inbox): add forms to messages with host-kept drafts, a one-shot submission and a submit event with defaults filled, so structured input is data instead of files in the child
+- 4866133 feat(tui): pin the thread header and action row, show the feed newest first and the compose hint under the box, so the newest thing is read first and sending says what it does
+- 0cb96ec feat(inbox): add devsbd thread send and withdraw for idempotent owner messages with markdown and fields blocks, so explanations live in the feed instead of an overwritten header
+- 24e07eb feat(inbox): store threads as a v3 json feed of messages, replies, actions and collapsing markers, since the overwritten message and per-field timeline made threads read backwards
+- 1874d60 feat(config): gate inbox threads and events on a new inbox = true sandbox setting so owning threads is its own capability and dispatcher only grants child ops
+- a7f45f8 docs(inbox): name feed items by direction (message, reply, action, submission) and make enter confirm a form, since post was ambiguous next to submissions
+- 6058656 test(serve): run serve install under the real systemd and launchd
+- e16f8fd fix(serve): keep a literal $ in the systemd unit's executable path
+- 55e133c docs(serve): record the snapshot, forward-holder and forward-bridge trade-offs as future work so they're revisited deliberately
+- 05e4252 feat(serve): persist ad-hoc forwards in the data dir so a restarted or upgraded daemon brings them back on the same host ports
+- b044237 feat(serve): start and hand off through the installed unit, repointing it at the newer binary, so an upgrade no longer leaves the managed daemon stopped
+- ff8167b feat(serve): read keep-alive from a per-user daemon.config.toml in the data dir so the daemon setting needs no flag
+- c36ded7 docs(inbox): record the post-step-10 follow-ups agreed after the daemon review so they're implemented before the content model
+- 666641d feat(serve): add serve install|uninstall for a keep-alive systemd user unit or launchagent so runtime-restarted dispatchers find a live host at login
+- 685c0e6 feat(api): add the api --stdio relay and a typed npm client so editor extensions and guis can drive the inbox, instances and forwards without socket handling
+- 1902817 feat(serve): own port forwards in the daemon and serve them over the api so configured and ad-hoc forwards outlive the dashboard
+- 5cc83cc feat(serve): relay ssh-agent through the daemon's one bridge per container and pick the newest live agent a client reports, since per-command bridges duplicated relays and the daemon's inherited agent could be stale
+- 29323e7 feat(tui): talk to the daemon through one reconnecting worker so inbox writes, change pokes and container status lines flow through the api and survive a handoff
+- e17d1d8 feat(serve): serve a json-lines api for the inbox and instances with change subscriptions so every client acts through one path
+- 19ccee0 feat(serve): run bridges, the notify drain, popups and autostart in the daemon so dispatchers keep a live host when no dashboard is open
+- f681248 feat(serve): add the devsandbox serve daemon skeleton (socket, start lock, lazy start, version handoff, idle exit) so bridges and the inbox can outlive the dashboard
+- 582a8bc refactor(inbox): route every inbox read and write through inbox::ops so the coming daemon api, cli and tui share one code path and produce identical events
+- 8299e8d fix(tui): build the inbox chip in one place and show replies in full, since the card hid the status the pane showed and multi-line replies were folded onto one row
+- 203b06a fix(tui): wrap and grow the inbox reply box and scroll the : prompt sideways, since text past the box width was invisible though it was still sent
+- dc19ab7 docs(inbox): plan the inbox redesign so each step can be implemented and reviewed on its own
+- 9c74eba fix(rm): decide on the worktree's current branch and delete merged or pushed ones without asking, since the prompt named the stale recorded branch and merged prs left branches behind
+- 69a6cbb feat(tui): copy on select by default again and name ctrl-c as the copy key in terminals that keep ctrl-shift-c, since alacritty and most linux terminals never pass it on
+- 99f2025 docs(tui): document dashboard settings, copy keys, terminal clipboard relay and hover, and changelog the mouse fixes found along the way
+- 7d5e1dd feat(tui): forward hover to integrated-terminal apps that track all motion, since they got no pointer movement without a button held
+- c4c80de feat(tui): add dashboard settings to the ? screen and make copy on select an option, off by default, since copying every selection clobbers the clipboard
+- 46954fb fix(tui): relay osc 52 copies from apps in the integrated terminal to the outer clipboard, since the emulator dropped them and copying in zidane did nothing
+- c5a8484 docs(tui): plan selection follow-ups (terminal app clipboard, settings, hover), from first use feedback
+- c342d45 docs(tui): document mouse selection and let ctrl-shift-c copy it again, since most terminals keep that key for their own (now empty) selection
+- ca77669 feat(tui): forward mouse presses, drags and releases to terminal apps that track the mouse and select locally otherwise, since apps in the integrated terminal never saw a drag
+- a802bf1 feat(tui): copy whole rendered markdown from a thread, rejoining wrapped lines and autoscrolling past the pane edge, so a long llm message pastes as it was written
+- bd1d29d docs(tui): plan mouse text selection, since mouse capture leaves the dashboard with no way to copy text
+- abd2a63 chore: more simplifications
+- 680db64 chore: simplified README.md
+- 5473290 feat(tui): lay out markdown tables in threads as aligned columns when they fit, since llm summaries lean on them
+- 4fd02eb feat(tui): render thread and notification markdown with word wrap and a raw toggle, and strip control characters from container text, since dispatcher text is mostly llm markdown
+- 9bdbbb4 docs(inbox): plan markdown rendering in threads, since dispatcher text is mostly llm markdown
+- 268c006 feat(tui): make the tab bar, inbox cards, view strip and thread pane clickable, like the terminal panel already was
+- 44a37c9 perf(mux): shrink per-stream thread stacks to 128 KiB
+- a9b93b2 docs(tui): describe the side-by-side inbox, cards, focus zones and reply box
+- 16217a6 feat(tui): let the inbox list/thread divider be dragged, so long titles or long threads get the room they need
+- 37e8a80 feat(tui): render inbox items as compact two-line cards with a view strip, so the list reads at a glance instead of as a log table
+- a572f71 feat(tui): show the inbox list and the selected thread side by side with a reply box in the thread, so reading and answering need no pane switching
+- 510ca74 docs(inbox): plan the side-by-side inbox layout with cards and an inline reply box, from first-build feedback
+- caeb4a8 test(devsbd): retry the refused-dial check on a fresh port, since a freed ephemeral port can be taken by a parallel test
+- 010a60e docs(inbox): document threads, events, done instances and vscode --goto for dispatcher authors and dashboard users
+- 0bdab8f feat(vscode): add --goto and use it for the thread vscode action, so a thread can open the draft at the line that needs a decision
+- 69462cd feat(devsbd): add vscode-goto, which finds the attached window's extension host and runs its own remote cli as its owner, so the host can open a file at a line
+- 069e639 feat(done): let users and dispatchers mark an instance done, so 'I've looked, carry on' no longer means removing the child
+- 7fa8d35 feat(inbox): queue user actions and replies as events a dispatcher pulls with devsbd events, so users can answer from the inbox
+- 4351ba9 feat(tui): run a thread's host actions on its child or sender from the pane, so looking at the work needs no dispatcher round trip
+- fd255fc feat(tui): show the inbox as threads in needs-you/active/done views with a focused thread pane, so the badge counts what waits on the user, not noise
+- 7c8d623 feat(inbox): let dispatchers put and remove stateful threads through the outbox, applied idempotently so re-asserting every pass adds no clutter
+- d1ae90b feat(inbox): share one locked inbox store across dashboards and ack records only once stored, so dismissed records stay gone and a dying dashboard can't lose one
+- 25d2a4d docs(inbox): give archiving on rm a step, it had none
+- c05ee41 fix(tui): reinstall a stale helper before spawning a bridge so running dispatchers get new devsbd verbs without a restart
+- e0472aa docs(inbox): plan inbox threads so dispatchers can show state, offer actions and take answers instead of re-sending notifications
+
+</details>
+
 ## 0.6.0
 
 The config file is now `devsandboxes.toml`, and it can be written in YAML too; an existing `config.toml` is renamed for you. Extra `folders` get their own worktree when someone else owns the checkout, `rm --force` clears out stuck instances, dispatchers can see which branches are in use, and the dashboard opens instantly and keeps its Inbox across restarts while putting far less load on dockerd.
