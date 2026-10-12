@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.7.0
 
 A per-user host daemon now keeps notifications, dispatchers and port forwards working with the dashboard closed, and serves an API that editors, GUIs and the new npm `connect()` client can drive. Sandboxes can keep one Inbox thread per item: a header with a state and buttons, and a conversation of messages, forms and your replies, answered from the dashboard, the new `devsandbox inbox` command or any API client, with events streamed back as they happen. The Inbox becomes a list of what's waiting on you rather than a log, and instances can be marked done instead of removed. VS Code can open straight at a file and line.
 
