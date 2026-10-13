@@ -32,8 +32,8 @@ use mounts::{
     resolve_shell_rc, shell_rc_wiring, sort_parents_first, write_workspace_file, ResolvedMounts,
 };
 use ssh_agent::ssh_agent_forward;
-use worktree::{copy_worktree_includes, create_worktree, git_companion_mount, link_shared_files};
-pub(crate) use worktree::{instance_at, parse_worktree_list};
+use worktree::{copy_worktree_includes, create_worktree, git_companion_mount, link_shared_files, lock_worktree};
+pub(crate) use worktree::{instance_at, lock_instance_worktrees, parse_worktree_list, unlock_worktree};
 
 /// Branch pattern for worktree instances when neither `--branch` nor the
 /// sandbox's `worktree-branch` is set. Also the TUI prompt's completion base
@@ -456,6 +456,16 @@ pub(crate) fn materialize(
         &prior_folders,
         &extra_folders,
     )?;
+    // Before the container exists, so nothing in it can prune them; a rebuild
+    // of an instance from before locking gets locked here.
+    if let Some(wt) = &worktree {
+        lock_worktree(folder, wt);
+    }
+    for fm in &folder_mounts {
+        if let Some(wt) = &fm.worktree {
+            lock_worktree(&fm.base, wt);
+        }
+    }
 
     // Bring up the sandbox's services (global shared + this instance's isolated)
     // and their networks; the instance container joins them to reach services by
@@ -889,6 +899,11 @@ fn run_container(
         args.push("-e".into());
         args.push(format!("{key}={value}"));
     }
+    let set = props.container_env.iter().flatten().chain(extra_env.iter().map(|(k, v)| (k, v)));
+    for (key, value) in gc_keeps_worktrees_env(set) {
+        args.push("-e".into());
+        args.push(format!("{key}={value}"));
+    }
     args.push(image);
     args.extend(container_command());
 
@@ -898,6 +913,33 @@ fn run_container(
     backend().connect_networks(container, networks)?;
     backend().wire_service_dns(container, endpoints)?;
     Ok(())
+}
+
+/// `gc.worktreePruneExpire=never` for git in the container, via git's
+/// `GIT_CONFIG_COUNT`/`_KEY_<n>`/`_VALUE_<n>` env. The container sees the
+/// repo's worktree records but not the other checkouts, so a `git gc` there
+/// would prune them as missing. [`worktree::lock_worktree`] guards explicit
+/// prunes too, but only devsandbox's own worktrees; this covers the rest
+/// against gc. Extends a count the given env (`-e` order, last wins) already
+/// sets; an unparsable one is left alone, git rejects it anyway.
+fn gc_keeps_worktrees_env<'a>(
+    env: impl IntoIterator<Item = (&'a String, &'a String)>,
+) -> Vec<(String, String)> {
+    let count = env
+        .into_iter()
+        .filter(|(k, _)| *k == "GIT_CONFIG_COUNT")
+        .last()
+        .map(|(_, v)| v.trim().parse::<usize>());
+    let n = match count {
+        None => 0,
+        Some(Ok(n)) => n,
+        Some(Err(_)) => return Vec::new(),
+    };
+    vec![
+        (format!("GIT_CONFIG_KEY_{n}"), "gc.worktreePruneExpire".into()),
+        (format!("GIT_CONFIG_VALUE_{n}"), "never".into()),
+        ("GIT_CONFIG_COUNT".into(), (n + 1).to_string()),
+    ]
 }
 
 /// Label marking containers whose command runs the boot hook
@@ -1273,5 +1315,26 @@ mod tests {
             assert_eq!(in_container("test -e /run/devsandbox/boot && echo present"), None);
         });
         Ok(())
+    }
+
+    #[test]
+    fn gc_keeps_worktrees_env_extends_a_given_count() {
+        let env = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        };
+        let guard = |given: &[(String, String)]| gc_keeps_worktrees_env(given.iter().map(|(k, v)| (k, v)));
+        assert_eq!(
+            guard(&env(&[("FOO", "1")])),
+            env(&[
+                ("GIT_CONFIG_KEY_0", "gc.worktreePruneExpire"),
+                ("GIT_CONFIG_VALUE_0", "never"),
+                ("GIT_CONFIG_COUNT", "1"),
+            ])
+        );
+        // The last value wins, as with repeated `-e`.
+        let given = env(&[("GIT_CONFIG_COUNT", "1"), ("GIT_CONFIG_COUNT", "2")]);
+        assert_eq!(guard(&given)[0].0, "GIT_CONFIG_KEY_2");
+        assert_eq!(guard(&given)[2], ("GIT_CONFIG_COUNT".to_string(), "3".to_string()));
+        assert!(guard(&env(&[("GIT_CONFIG_COUNT", "x")])).is_empty());
     }
 }

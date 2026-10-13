@@ -113,6 +113,7 @@ pub(super) fn create_worktree(
         );
     }
     ensure_populated(worktree)?;
+    lock_worktree(base, worktree);
     Ok(false)
 }
 
@@ -163,7 +164,9 @@ fn create_new_branch_worktree(
     if !status.success() {
         bail!("git worktree add failed for `{}`", worktree.display());
     }
-    ensure_populated(worktree)
+    ensure_populated(worktree)?;
+    lock_worktree(base, worktree);
+    Ok(())
 }
 
 /// Worktree of `base` for a `folders` entry: detached at the base checkout's
@@ -196,7 +199,9 @@ pub(super) fn create_detached_worktree(base: &Path, worktree: &Path) -> Result<(
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    ensure_populated(worktree)
+    ensure_populated(worktree)?;
+    lock_worktree(base, worktree);
+    Ok(())
 }
 
 /// A real worktree always has a `.git` entry pointing back at the base repo;
@@ -209,6 +214,83 @@ fn ensure_populated(worktree: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+const LOCK_REASON: &str = "devsandbox: checked out on the host; a container that mounts this repo's \
+                           .git sees it as missing, never prune it from there";
+
+/// Lock a worktree devsandbox owns, so `git worktree prune` (and `gc`) keep
+/// its record. A container gets the base's whole `.git` but none of the other
+/// instances' checkouts: from inside, every other worktree looks missing, and
+/// an unlocked prune there deletes their admin dirs, breaking git in each.
+/// Called on create and again on every `start`/`run`/`rebuild` (no-op once
+/// locked), so instances from before locking get it lazily. Best effort: a
+/// missing lock must not stop a sandbox from starting.
+pub(crate) fn lock_worktree(base: &Path, worktree: &Path) {
+    // Not a linked worktree (yet): nothing git could prune.
+    let Some(admin) = admin_dir(worktree) else {
+        return;
+    };
+    if !admin.is_dir() {
+        eprintln!(
+            "warning: git's record of worktree `{}` is gone ({} was pruned); git won't work in it \
+             until the record is restored",
+            worktree.display(),
+            admin.display()
+        );
+        return;
+    }
+    if admin.join("locked").exists() {
+        return;
+    }
+    let out = host_git(base).and_then(|mut git| {
+        git.args(["worktree", "lock", "--reason", LOCK_REASON])
+            .arg(worktree)
+            .output()
+            .context("failed to run git (is it installed?)")
+    });
+    let why = match out {
+        Ok(out) if out.status.success() => return,
+        Ok(out) => String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        Err(e) => format!("{e:#}"),
+    };
+    eprintln!("warning: cannot lock worktree `{}`: {why}", worktree.display());
+}
+
+/// [`lock_worktree`] for every worktree `info` records: the primary and its
+/// `folders` ones.
+pub(crate) fn lock_instance_worktrees(info: &crate::state::Instance) {
+    if let Some(wt) = &info.worktree {
+        lock_worktree(&info.base_folder, wt);
+    }
+    for fm in &info.folders {
+        if let Some(wt) = &fm.worktree {
+            lock_worktree(&fm.base, wt);
+        }
+    }
+}
+
+/// Undo [`lock_worktree`] before removing or re-adding a worktree: `worktree
+/// remove` refuses a locked one (short of a double `--force`), `prune` skips
+/// its record, and `add` won't reuse a locked missing path. With the checkout
+/// gone its `.git` pointer can't be read, so git is asked anyway; "not
+/// locked" and "not a worktree" failures are expected and ignored.
+pub(crate) fn unlock_worktree(base: &Path, worktree: &Path) {
+    if admin_dir(worktree).is_some_and(|admin| !admin.join("locked").exists()) {
+        return;
+    }
+    if let Ok(mut git) = host_git(base) {
+        let _ = git.args(["worktree", "unlock"]).arg(worktree).output();
+    }
+}
+
+/// The admin dir a linked worktree's `.git` file points at (relative pointers
+/// resolve against the worktree, as git does); `None` when there is no such
+/// file.
+fn admin_dir(worktree: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(worktree.join(".git")).ok()?;
+    let gitdir = text.trim().strip_prefix("gitdir:")?.trim();
+    Some(worktree.join(gitdir))
 }
 
 /// Best-effort, quiet fetch of one branch into `origin/<branch>`. The explicit
@@ -1254,6 +1336,47 @@ mod tests {
         assert!(create_worktree(&base, &wt4, "feat/new", None, true, &Default::default()).unwrap());
         assert_eq!(head_branch(&wt4), "feat/new");
         assert_eq!(upstream_of(&wt4, "feat/new"), None);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn worktrees_are_locked_so_prune_keeps_them() {
+        let root = std::env::temp_dir().join(format!("devsandbox-wtlock-{}", std::process::id()));
+        let base = repo(&root, "");
+        let (wt, detached) = (root.join("wt"), root.join("detached"));
+        create_worktree(&base, &wt, "sandbox/k", None, false, &Default::default()).unwrap();
+        create_detached_worktree(&base, &detached).unwrap();
+        // Seen from a container: the checkouts are missing, and prune runs.
+        let hidden = root.join("hidden");
+        std::fs::create_dir_all(&hidden).unwrap();
+        for p in [&wt, &detached] {
+            std::fs::rename(p, hidden.join(p.file_name().unwrap())).unwrap();
+        }
+        git(&base, &["worktree", "prune"]);
+        for p in [&wt, &detached] {
+            std::fs::rename(hidden.join(p.file_name().unwrap()), p).unwrap();
+            assert!(git(p, &["status", "--porcelain"]).is_empty(), "{} lost its record", p.display());
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn lock_is_lazy_and_idempotent_and_unlock_undoes_it() {
+        let root = std::env::temp_dir().join(format!("devsandbox-wtlazy-{}", std::process::id()));
+        let base = repo(&root, "");
+        let wt = root.join("wt");
+        // Made before locking existed.
+        git(&base, &["worktree", "add", "-q", &wt.to_string_lossy(), "-b", "old"]);
+        let locked = || admin_dir(&wt).unwrap().join("locked").exists();
+        assert!(!locked());
+        lock_worktree(&base, &wt);
+        assert!(locked());
+        lock_worktree(&base, &wt);
+        assert!(locked());
+        unlock_worktree(&base, &wt);
+        assert!(!locked());
+        // Not locked: a no-op.
+        unlock_worktree(&base, &wt);
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

@@ -11,6 +11,10 @@
 ripgrep = true
 ```
 
+### Fixed
+
+- **`git worktree prune` inside a sandbox no longer breaks the other instances' worktrees.** A container sees the repo's worktree records but not the other checkouts, so a prune (or `git gc`) there deleted their records and left each one with `fatal: not a git repository`. devsandbox now locks the worktrees it creates, so prune and gc skip them; existing instances get locked on their next `start`. Containers also get `gc.worktreePruneExpire=never` (after a rebuild for existing ones), so `git gc` leaves worktrees you made yourself alone too. Details: `docs/worktree-locking.md`.
+
 ## 0.7.0
 
 A per-user host daemon now keeps notifications, dispatchers and port forwards working with the dashboard closed, and serves an API that editors, GUIs and the new npm `connect()` client can drive. Sandboxes can keep one Inbox thread per item: a header with a state and buttons, and a conversation of messages, forms and your replies, answered from the dashboard, the new `devsandbox inbox` command or any API client, with events streamed back as they happen. The Inbox becomes a list of what's waiting on you rather than a log, and instances can be marked done instead of removed. VS Code can open straight at a file and line.

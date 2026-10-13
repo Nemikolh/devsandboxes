@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 
 use super::{confirm, resolve_instance};
-use crate::commands::run::host_git;
+use crate::commands::run::{host_git, unlock_worktree};
 use crate::runtime::backend;
 use crate::state::{FolderMount, State};
 
@@ -378,6 +378,8 @@ fn remove_folder_worktrees(folders: &[FolderMount], force: bool) -> Result<()> {
 /// record is gone, which would make every retry of rm fail; `prune` drops a
 /// leftover record and is a no-op otherwise.
 fn remove_or_prune(base: &Path, worktree: &Path, force: bool) -> Result<()> {
+    // devsandbox locks its worktrees; both `remove` and `prune` skip locked ones.
+    unlock_worktree(base, worktree);
     if worktree.exists() {
         remove_worktree(base, worktree, force)
     } else {
@@ -629,6 +631,21 @@ mod tests {
         remove_or_prune(&base, &wt2, false).unwrap();
         let list = git(&base, &["worktree", "list", "--porcelain"]);
         assert!(!String::from_utf8_lossy(&list.stdout).contains("wt2"));
+
+        // Locked, as `run` leaves them: removed, present or deleted by hand.
+        for (name, delete) in [("wt3", false), ("wt4", true)] {
+            let wt = root.join(name);
+            let add = git(&base, &["worktree", "add", "-q", "--detach", &wt.to_string_lossy()]);
+            assert!(add.status.success());
+            assert!(git(&base, &["worktree", "lock", &wt.to_string_lossy()]).status.success());
+            if delete {
+                std::fs::remove_dir_all(&wt).unwrap();
+            }
+            remove_or_prune(&base, &wt, false).unwrap();
+            assert!(!wt.exists());
+            let list = git(&base, &["worktree", "list", "--porcelain"]);
+            assert!(!String::from_utf8_lossy(&list.stdout).contains(name), "{name} still recorded");
+        }
         std::fs::remove_dir_all(&root).unwrap();
     }
 

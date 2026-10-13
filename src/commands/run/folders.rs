@@ -11,7 +11,7 @@ use crate::config::{short_hash, Config, FolderWorktree};
 use crate::state::{FolderMount, State};
 
 use super::mounts::ResolvedFolder;
-use super::worktree::create_detached_worktree;
+use super::worktree::{create_detached_worktree, unlock_worktree};
 
 /// The [`FolderMount`] for each current `folders` entry of `instance`, creating
 /// detached worktrees where [`needs_worktree`] says so. A `prior` record with
@@ -41,6 +41,8 @@ pub(super) fn mount_folders(
             if let Some(wt) = fm.worktree.as_deref().filter(|wt| !wt.exists()) {
                 eprintln!("warning: worktree `{}` is missing; recreating it", wt.display());
                 super::check_repo(host).with_context(context)?;
+                // Its record is locked: `add` won't take the path otherwise.
+                unlock_worktree(host, wt);
                 create_detached_worktree(host, wt).with_context(context)?;
             }
             out.push(fm.clone());
