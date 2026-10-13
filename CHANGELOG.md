@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+**Critical fix: upgrade if you run more than one instance of the same repo.** A `git worktree prune` or `git gc` inside one sandbox could delete git's records of every other instance's worktree, leaving them with `fatal: not a git repository`. devsandbox now locks the worktrees it creates. After upgrading, run `devsandbox start` once on each existing instance to lock its worktree (safe on a running one), and `devsandbox rebuild` it to also get the `git gc` guard. This release also adds local-folder features and fixes a few host-daemon start and shutdown issues.
+
+```bash
+devsandbox start <instance>
+```
+
 ### Added
 
 - **Local-folder features.** A `features` key starting with `./`, `../` or `/` is a feature folder (`devcontainer-feature.json` + `install.sh`) resolved against the config dir, so a config can ship its own feature without publishing it to a registry. Options, `containerEnv`, `installsAfter`, `mounts`, `privileged` and `entrypoint` work as for OCI features. Editing a file in the folder marks the sandbox's instances as drifted, so `devsandbox rebuild` picks the change up, and `devsandbox ls` warns when the folder or its `devcontainer-feature.json` is missing.
@@ -13,10 +19,26 @@ ripgrep = true
 
 ### Fixed
 
-- **`git worktree prune` inside a sandbox no longer breaks the other instances' worktrees.** A container sees the repo's worktree records but not the other checkouts, so a prune (or `git gc`) there deleted their records and left each one with `fatal: not a git repository`. devsandbox now locks the worktrees it creates, so prune and gc skip them; existing instances get locked on their next `start`. Containers also get `gc.worktreePruneExpire=never` (after a rebuild for existing ones), so `git gc` leaves worktrees you made yourself alone too. Details: `docs/worktree-locking.md`.
+- **Critical: `git worktree prune` inside a sandbox no longer breaks the other instances' worktrees.** A container sees the repo's worktree records but not the other checkouts, so a prune (or `git gc`) there deleted their records and left each one with `fatal: not a git repository`. devsandbox now locks the worktrees it creates, so prune and gc skip them; existing instances get locked on their next `start`. An instance whose record was already pruned gets a warning on `start` instead; git won't work in it until the record is restored. Containers also get `gc.worktreePruneExpire=never` (after a rebuild for existing ones), so `git gc` leaves worktrees you made yourself alone too. Details: `docs/worktree-locking.md`.
 - **`devsandbox rebuild` starts the host daemon, like `run` and `start`.** A rebuilt dispatcher or `inbox = true` instance with no dashboard open and no daemon running had no host, so its `devsbd` control commands exited `75` until some other command started one.
 - **An upgrade or `devsandbox serve shutdown` no longer brings back the old daemon.** A dispatcher's child op still running while the daemon shut down could start a fresh daemon from the old binary, which then kept running instead of the new one (or undid the shutdown).
 - **The "no host connected" error says how to get one.** Control commands that exit `75` now suggest running any `devsandbox` command (or `devsandbox serve install`) instead of opening the dashboard, which no longer serves them.
+
+<details><summary>Commits</summary>
+
+- 6a9f65a chore(site): add pnpm shot to screenshot built pages
+- 029b3ac fix(site): tidy the architecture diagrams' joins and index list
+- 23ba27b docs(changelog): note the serve drain race and no-host hint fixes
+- 5f1d597 docs(changelog): note that rebuild now starts the host daemon
+- 8c2b83e docs(devsbd): point the no-host hint at the daemon, not the dashboard
+- 2977de1 fix(serve): never lazy-start a daemon from a dispatcher child op
+- 138d46b fix(rebuild): start the host daemon after a rebuild
+- 7ae7921 fix(worktree): lock sandbox worktrees so a prune inside a container can't break the others
+- 454e99e docs(site): add unlinked /architecture pages for contributors
+- 002dda3 docs(features): document local-folder features
+- fc97df0 feat(features): support local-folder features
+
+</details>
 
 ## 0.7.0
 
