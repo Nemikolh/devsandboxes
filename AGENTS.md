@@ -126,6 +126,10 @@ git worktrees so working trees are never shared.
   to `state.toml`, one `SETTINGS` entry per toggle, shown in the `?` modal).
 - `site/` — Astro + MDX docs site (standalone pnpm project, not in the Cargo
   workspace; see `site/README.md`). Checks: `cd site && pnpm check && pnpm build`.
+  To look at a page after `pnpm build`: `pnpm shot /docs/x [--width 1440,420]`
+  (`scripts/shot.ts`, headless Chromium) writes PNGs of its `<figure>`s (or
+  the full page) to `/tmp/site-shots/`; read them back to check diagrams and
+  layout. One-time setup: `pnpm exec playwright install --with-deps chromium`.
 
 ## Conventions & checks
 

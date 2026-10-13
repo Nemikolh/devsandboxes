@@ -10,6 +10,9 @@ pnpm build      # static output in dist/, then the internal link check
 pnpm preview    # serve dist/
 pnpm check      # astro check (types + .astro diagnostics)
 pnpm test       # vitest over the pure helpers in src/lib/
+pnpm shot /docs/x  # scripts/shot.ts: PNGs of a built page's figures (or the
+                  # whole page) per --width into /tmp/site-shots/; options in
+                  # the script header. Once: pnpm exec playwright install chromium
 pnpm check:links  # scripts/check-links.mjs alone: every href="/…" / "#…" in
                   # dist/ must hit a built page and an existing id
 ```
