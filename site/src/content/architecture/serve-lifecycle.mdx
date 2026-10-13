@@ -127,10 +127,10 @@ daemon gets the manager's environment plus what `install` captured (`PATH`, the 
 | client | how | starts one | holds it |
 |---|---|---|---|
 | dashboard | `connect` at launch, reconnect with backoff | yes | while open |
-| `run`, `start` | `ensure_running` after the autostart pass | yes | no, hangs up (a dispatcher / inbox instance holds it) |
-| `run`'s, `start`'s lifecycle commands | `bridges.ensure` with `wait: 12` | yes | for the chain |
+| `run`, `start`, `rebuild` | `ensure_running` after the autostart pass | yes | no, hangs up (a dispatcher / inbox instance holds it) |
+| `run`'s, `start`'s, `rebuild`'s lifecycle commands | `bridges.ensure` with `wait: 12` | yes | for the chain |
 | `exec` | `bridges.ensure` on a thread, no wait | yes | while the command runs |
-| a dispatcher's child op | the daemon itself, over its own socket: `bridges.ensure`, waited, no agent reported | yes | for the op |
+| a dispatcher's child op | the daemon itself, over its own socket: `connect_running`, then `bridges.ensure`, waited, no agent reported | no (a draining daemon must not start another) | for the op |
 | `api --stdio` | byte relay to `serve.sock` | yes | while it runs |
 | `inbox` mutations | `connect_running`, else the same op locally | no | for the call |
 | `serve install` | `connect_running`, then `shutdown` | no | no |

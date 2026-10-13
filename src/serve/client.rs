@@ -166,6 +166,33 @@ pub fn ensure_bridge(
     wait: Option<Duration>,
 ) -> Result<(Conn, Option<crate::devsbd::bridge::Readiness>)> {
     let mut conn = connect(&endpoint::socket_dir()?, "cli")?;
+    let ready = request_bridge(&mut conn, instance, agent, wait)?;
+    Ok((conn, ready))
+}
+
+/// [`ensure_bridge`] without the lazy start (`None` when no daemon answers),
+/// for code running in the daemon itself (a dispatcher's child op), which
+/// reaches it over its own socket. While it drains nothing answers, and a
+/// lazy start would spawn this binary (maybe outdated) to race the
+/// successor for `serve.lock`, or undo a `shutdown`.
+pub(crate) fn ensure_bridge_running(
+    dir: &Path,
+    instance: &str,
+    agent: Option<&Path>,
+    wait: Option<Duration>,
+) -> Result<Option<(Conn, Option<crate::devsbd::bridge::Readiness>)>> {
+    let Some(mut conn) = connect_running(dir, "cli", &Version::current(), START_TIMEOUT)? else { return Ok(None) };
+    let ready = request_bridge(&mut conn, instance, agent, wait)?;
+    Ok(Some((conn, ready)))
+}
+
+/// Send `bridges.ensure` on `conn`; the readiness as [`ensure_bridge`]'s.
+fn request_bridge(
+    conn: &mut Conn,
+    instance: &str,
+    agent: Option<&Path>,
+    wait: Option<Duration>,
+) -> Result<Option<crate::devsbd::bridge::Readiness>> {
     // A non-UTF-8 path can't go on the wire: the daemon falls back to its own.
     let agent = agent.and_then(Path::to_str);
     let mut params = serde_json::json!({ "instance": instance, "agent": agent });
@@ -176,8 +203,7 @@ pub fn ensure_bridge(
     if let Some(e) = r.error {
         bail!("devsandbox serve: {} ({})", e.message, e.code);
     }
-    let ready = readiness(&r.result.unwrap_or(Value::Null));
-    Ok((conn, ready))
+    Ok(readiness(&r.result.unwrap_or(Value::Null)))
 }
 
 /// A waited `bridges.ensure` result's readiness; `None` without `ready` (a
@@ -410,6 +436,16 @@ mod tests {
             readiness(&serde_json::json!({"ok": true, "ready": false, "error": "outdated"})),
             Some(Readiness { ready: false, error: Some("outdated".into()) })
         );
+    }
+
+    #[test]
+    fn in_daemon_bridge_request_never_starts_a_daemon() {
+        // Nothing answering is what a draining daemon looks like from inside.
+        let dir = scratch("bridge-running");
+        let r = ensure_bridge_running(&dir, "web", None, Some(Duration::from_secs(1))).unwrap();
+        assert!(r.is_none());
+        assert!(endpoint::connect(&dir).is_err(), "a daemon was started");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -124,6 +124,24 @@ impl AgentRelay {
         }
     }
 
+    /// [`wait`](Self::wait) from inside the daemon (a dispatcher's child op):
+    /// reports no agent (its own `$SSH_AUTH_SOCK` is already its last
+    /// candidate, and reporting it would rank it above the clients' fresher
+    /// ones) and never starts a daemon
+    /// ([`ensure_bridge_running`](crate::serve::client::ensure_bridge_running)).
+    /// Why the relay isn't usable, if it isn't.
+    pub(crate) fn wait_in_daemon(key: &str) -> Option<String> {
+        let dir = match crate::serve::endpoint::socket_dir() {
+            Ok(dir) => dir,
+            Err(e) => return Some(format!("{e:#}")),
+        };
+        match crate::serve::client::ensure_bridge_running(&dir, key, None, Some(LIFECYCLE_RELAY_WAIT)) {
+            Ok(Some((_conn, ready))) => relay_note(ready),
+            Ok(None) => Some("devsandbox serve is exiting".into()),
+            Err(e) => Some(format!("{e:#}")),
+        }
+    }
+
     /// The command is over: wait for the request if it's still out, report
     /// a failure (on stderr, after the command so it can't interleave with
     /// its output; stdout stays clean for `run --json`) and hang up.

@@ -1305,11 +1305,8 @@ impl Executor for Subprocess {
             if !(crate::devsbd::relay_mode(child) && crate::commands::exec::has_host_agent()) {
                 return None;
             }
-            // This runs in the daemon, which this reaches over its own
-            // socket. No agent to report: its own `$SSH_AUTH_SOCK` is already
-            // its last candidate, and reporting it would rank it above the
-            // clients' fresher ones.
-            crate::commands::exec::AgentRelay::wait(name, None).1
+            // This runs in the daemon, which this reaches over its own socket.
+            crate::commands::exec::AgentRelay::wait_in_daemon(name)
         }
         #[cfg(not(unix))]
         {

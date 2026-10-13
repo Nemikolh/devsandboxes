@@ -215,7 +215,8 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
     // sink bridges on one container would split its notify/control streams).
     drop(host);
     // Likewise the forwards: their listeners close here, so a successor can
-    // bind the configured ones' saved host ports again. Ad-hoc ones are lost.
+    // bind the configured ones' saved host ports again. Ad-hoc ones are
+    // closed too; the next daemon restores them from `forwards.toml`.
     drop(registry);
     Ok(exit)
 }
