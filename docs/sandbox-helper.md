@@ -213,8 +213,8 @@ ssh (in container) ──unix──▶ devsbd daemon ◀──frames over exec s
   on a control socket `/run/devsandbox/devsbd.ctl` (0600) for bridges, and on
   `/run/devsandbox/api.sock` (0666) for in-container clients (`notify`'s poke,
   control requests; `docs/automations.md`). If
-  the agent path is taken (the bind mount), it logs and serves only the
-  control socket.
+  the agent path is taken (the bind mount), it logs and serves no agent
+  streams (the control and API sockets still serve).
 
 - **Version mismatch / takeover.** A CLI upgrade while a container runs
   leaves the old binary and old daemon in it. Outcomes:

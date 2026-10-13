@@ -55,7 +55,7 @@ pub const API_POKE: u8 = b'n';
 pub const API_CONTROL: u8 = b'c';
 
 /// The daemon's answer when no bridge's host serves `CONTROL`.
-const NO_HOST: &str = "no host connected; open the devsandbox dashboard";
+const NO_HOST: &str = "no host connected; run any devsandbox command (or devsandbox serve install)";
 
 /// Chunks an `events-follow` relay queues for a client that reads slowly.
 /// Past that the follower is dropped (the client exits 75 and reconnects,
