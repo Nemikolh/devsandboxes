@@ -1,0 +1,964 @@
+/* ------------------------------------------------ Architecture diagrams */
+
+/*
+ * `components/architecture/*`. The landing diagrams' palette
+ * (`babysit-diagram.css`): purple the host daemon, cyan the container side,
+ * lime you and the CLI, green the ssh-agent, yellow notify. Each tone sets
+ * `--c` (lines) and `--label` (text) so one rule per tone covers lanes,
+ * arrows and chips.
+ */
+[data-tone] {
+  --c: #4f6a6d;
+  --label: var(--text-muted);
+}
+
+[data-tone='cli'],
+[data-tone='client'] {
+  --c: #5d8a45;
+  --label: var(--lime-soft);
+}
+
+[data-tone='serve'] {
+  --c: #7f65c4;
+  --label: #af87ff;
+}
+
+[data-tone='runtime'] {
+  --c: #56706f;
+  --label: var(--text-muted);
+}
+
+[data-tone='helper'] {
+  --c: #3f8e92;
+  --label: var(--cyan);
+}
+
+[data-tone='agent'] {
+  --c: #4f7d3d;
+  --label: #8fcf6a;
+}
+
+[data-tone='notify'] {
+  --c: #7d6b3a;
+  --label: #e8c66f;
+}
+
+[data-tone='fail'] {
+  --c: #9a4f4f;
+  --label: #f08f8f;
+}
+
+.arc-caption {
+  margin-top: 10px;
+  font: 10.5px / 1.3 var(--font-mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  text-align: center;
+}
+
+/* ------------------------------------------------------------ Arrows */
+
+/* A CSS arrow: `::before` the line, `::after` the head (`.arc-link--both`
+   adds a tail head on `> i`). Same construction as `.bsd-link`. */
+.arc-link {
+  position: relative;
+  min-width: 0;
+  font: 10px / 1.3 var(--font-mono);
+  color: var(--label);
+}
+
+.arc-link::before,
+.arc-link::after {
+  content: '';
+  position: absolute;
+}
+
+.arc-link::after {
+  width: 6px;
+  height: 6px;
+  border: solid var(--c);
+  border-width: 1.5px 1.5px 0 0;
+}
+
+.arc-link--down::before {
+  left: 50%;
+  top: 0;
+  bottom: 0;
+  border-left: 1.5px solid var(--c);
+}
+
+.arc-link--down::after {
+  left: calc(50% + 0.5px);
+  bottom: 1px;
+  translate: -3px 0;
+  rotate: 135deg;
+}
+
+.arc-link--down > span {
+  position: absolute;
+  top: 50%;
+  left: calc(50% + 9px);
+  translate: 0 -50%;
+  white-space: nowrap;
+}
+
+.arc-link--right::before,
+.arc-link--left::before {
+  top: 50%;
+  left: 1px;
+  right: 1px;
+  border-top: 1.5px solid var(--c);
+}
+
+.arc-link--right::after {
+  top: calc(50% + 1px);
+  right: 1px;
+  translate: 0 -3.5px;
+  rotate: 45deg;
+}
+
+.arc-link--left::after {
+  top: calc(50% + 1px);
+  left: 1px;
+  translate: 0 -3.5px;
+  rotate: -135deg;
+}
+
+/* Two-way: a second head at the start, drawn by the label's `::before`
+   (the link's own pseudo-elements are taken). */
+.arc-link--both > span::before {
+  content: '';
+  position: absolute;
+  left: -3px;
+  bottom: -11px;
+  width: 6px;
+  height: 6px;
+  border: solid var(--c);
+  border-width: 1.5px 1.5px 0 0;
+  rotate: -135deg;
+}
+
+.arc-link--right > span,
+.arc-link--left > span {
+  position: absolute;
+  left: 4px;
+  right: 4px;
+  bottom: calc(50% + 6px);
+  text-align: center;
+}
+
+.arc-link--both > span {
+  left: 1px;
+}
+
+.arc-link--right > small,
+.arc-link--left > small {
+  position: absolute;
+  left: 4px;
+  right: 4px;
+  top: calc(50% + 6px);
+  text-align: center;
+  font: 9.5px / 1.2 var(--font-mono);
+  color: var(--text-faint);
+}
+
+/* -------------------------------------------------------- Shared nodes */
+
+.arc-zone {
+  border: 1px dashed #2f474b;
+  border-radius: 14px;
+  background:
+    linear-gradient(#b3ffff06 1px, transparent 1px) 0 0 / 32px 32px,
+    linear-gradient(90deg, #b3ffff06 1px, transparent 1px) 0 0 / 32px 32px,
+    linear-gradient(180deg, #121d20cc, #0e1618aa);
+}
+
+.arc-zone--box {
+  border-color: #2d4a4e;
+  background:
+    linear-gradient(#91e6e806 1px, transparent 1px) 0 0 / 24px 24px,
+    linear-gradient(90deg, #91e6e806 1px, transparent 1px) 0 0 / 24px 24px,
+    linear-gradient(180deg, #11202299, #0d171988);
+}
+
+.arc-zone-label {
+  align-self: center;
+  font: 9.5px / 1 var(--font-mono);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+
+.arc-zone-label span {
+  color: var(--lime);
+  border-left: 2px solid var(--lime);
+  padding-left: 8px;
+  margin-right: 6px;
+}
+
+.arc-zone-label--box span {
+  color: var(--cyan);
+  border-color: var(--cyan);
+}
+
+.arc-card {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  min-width: 0;
+  box-sizing: border-box;
+  padding: 11px;
+  border: 1px solid #2e4346;
+  border-radius: 10px;
+  background: linear-gradient(180deg, #162326, #111a1d);
+  box-shadow: 0 14px 30px #0007;
+}
+
+.arc-card--serve {
+  border-color: #4c4384;
+  background: linear-gradient(180deg, #1b1a30, #151827);
+  box-shadow:
+    0 14px 34px #0008,
+    0 0 36px #af87ff1c;
+}
+
+.arc-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.arc-icon {
+  flex-shrink: 0;
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border: 1px solid #2d4a4e;
+  border-radius: 6px;
+  background: #172b2e;
+  color: var(--cyan);
+}
+
+.arc-card--serve .arc-icon {
+  border-color: #4c4384;
+  background: #262147;
+  color: #c4b1ff;
+}
+
+.arc-icon svg {
+  width: 13px;
+  height: 13px;
+}
+
+.arc-name {
+  min-width: 0;
+  font: 500 12.5px / 1.15 var(--font-mono);
+  color: var(--text-bright);
+}
+
+.arc-sub {
+  font: 9.5px / 1.2 var(--font-mono);
+  color: var(--text-faint);
+  padding-left: 2px;
+}
+
+.arc-card--serve .arc-sub {
+  color: #948bbd;
+}
+
+/* `.arc-card` twice: beats `.prose ul` / `.prose li`. */
+.arc-card .arc-tags,
+.arc-card .arc-sockets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin: auto 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.arc-card .arc-tags li,
+.arc-card .arc-sockets li {
+  margin: 0;
+  padding: 3px 7px;
+  border: 1px solid #3a3466;
+  border-radius: 4px;
+  background: #1d1a36;
+  color: #c4b1ff;
+  font: 10px / 1.2 var(--font-mono);
+  white-space: nowrap;
+}
+
+.arc-card .arc-sockets {
+  flex-direction: column;
+  flex-wrap: nowrap;
+}
+
+.arc-card .arc-sockets li {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  border-color: #2f4448;
+  background: #13211f;
+  color: #a2b8b8;
+}
+
+.arc-sockets i {
+  font-style: normal;
+  color: var(--text-faint);
+}
+
+.arc-chip,
+.arc-client,
+.arc-you {
+  position: relative;
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  box-sizing: border-box;
+  font: 500 11px / 1.15 var(--font-mono);
+}
+
+.arc-chip svg,
+.arc-client svg,
+.arc-you svg {
+  flex-shrink: 0;
+  width: 13px;
+  height: 13px;
+}
+
+.arc-chip small,
+.arc-client small {
+  display: block;
+  margin-top: 3px;
+  font: 9.5px / 1.1 var(--font-mono);
+  color: var(--text-faint);
+}
+
+.arc-you {
+  align-self: center;
+  justify-self: start;
+  height: 34px;
+  padding: 0 14px 0 11px;
+  border: 1px solid #4b7453;
+  border-radius: 999px;
+  background: #13211a;
+  color: var(--lime-soft);
+  box-shadow: 0 0 24px #a9f36d22;
+  white-space: nowrap;
+}
+
+.arc-chip {
+  align-self: center;
+  justify-self: start;
+  padding: 6px 10px;
+  border: 1px solid #2f4448;
+  border-radius: 6px;
+  background: #13211f;
+  color: #a2b8b8;
+}
+
+.arc-chip small {
+  display: inline;
+  margin: 0 0 0 6px;
+}
+
+.arc-client {
+  align-self: center;
+  padding: 7px 9px;
+  border: 1px solid #25373a;
+  border-radius: 7px;
+  background: #0d1517;
+  color: var(--text);
+}
+
+.arc-client svg {
+  color: var(--cyan);
+}
+
+/* ------------------------------------------------ Host ↔ helper overview */
+
+.arc-helper {
+  --row: 70px;
+
+  container-type: inline-size;
+  margin: 30px 0 34px;
+}
+
+.arc-helper-grid {
+  display: grid;
+  grid-template-columns:
+    12px minmax(0, 1.15fr) 12px 116px 12px minmax(0, 1fr) 70px minmax(0, 1fr)
+    84px minmax(0, 1fr) 12px;
+  grid-template-rows: 38px 52px 40px var(--row) var(--row) var(--row) 40px auto 14px;
+}
+
+.arc-zone--host {
+  grid-area: 1 / 1 / 10 / 4;
+}
+
+.arc-zone--box {
+  grid-area: 1 / 5 / 8 / 12;
+}
+
+.arc-zone-label--host {
+  grid-area: 1 / 2 / 2 / 3;
+}
+
+.arc-zone-label--box {
+  grid-area: 1 / 6 / 2 / 11;
+}
+
+.arc-helper .arc-you {
+  grid-area: 2 / 2 / 3 / 3;
+}
+
+.arc-h-install {
+  grid-area: 2 / 3 / 3 / 6;
+}
+
+.arc-h-binary {
+  grid-area: 2 / 6 / 3 / 11;
+}
+
+.arc-h-sock {
+  grid-area: 3 / 2 / 4 / 3;
+}
+
+.arc-h-serve {
+  grid-area: 4 / 2 / 7 / 3;
+}
+
+.arc-h-pipe {
+  grid-area: 4 / 3 / 5 / 6;
+}
+
+.arc-h-bridge {
+  grid-area: 4 / 6 / 5 / 7;
+}
+
+.arc-h-ctl {
+  grid-area: 4 / 7 / 5 / 8;
+}
+
+.arc-h-daemon {
+  grid-area: 4 / 8 / 7 / 9;
+}
+
+.arc-h-l-agent {
+  grid-area: 4 / 9 / 5 / 10;
+}
+
+.arc-h-c-agent {
+  grid-area: 4 / 10 / 5 / 11;
+}
+
+.arc-h-l-api {
+  grid-area: 5 / 9 / 6 / 10;
+}
+
+.arc-h-c-api {
+  grid-area: 5 / 10 / 6 / 11;
+}
+
+.arc-h-l-tcp {
+  grid-area: 6 / 9 / 7 / 10;
+}
+
+.arc-h-c-tcp {
+  grid-area: 6 / 10 / 7 / 11;
+}
+
+.arc-h-ends {
+  grid-area: 7 / 2 / 8 / 3;
+}
+
+.arc-helper .arc-h-endlist {
+  grid-area: 8 / 2 / 9 / 3;
+}
+
+.arc-h-bridge,
+.arc-h-c-agent,
+.arc-h-c-api,
+.arc-h-c-tcp {
+  align-self: center;
+}
+
+.arc-h-bridge {
+  margin: 4px 0;
+}
+
+.arc-h-daemon,
+.arc-h-serve {
+  margin: 4px 0;
+}
+
+.arc-helper .arc-ends {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.arc-helper .arc-ends li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  padding: 5px 8px;
+  border: 1px solid var(--c);
+  border-radius: 6px;
+  background: #0d1517;
+  color: var(--label);
+  font: 10.5px / 1.1 var(--font-mono);
+  white-space: nowrap;
+}
+
+.arc-helper .arc-ends svg {
+  flex-shrink: 0;
+  width: 12px;
+  height: 12px;
+}
+
+/* Narrow (the figure, not the viewport: the sidebar takes its share up to
+   700px): one column, top to bottom; horizontal arrows turn vertical
+   (towards the daemon: up from its clients, down along the chain). */
+@container (max-width: 880px) {
+  .arc-helper-grid {
+    grid-template-columns: 12px minmax(0, 1fr) 12px;
+    grid-template-rows: none;
+    grid-auto-rows: auto;
+    max-width: 560px;
+    margin: 0 auto;
+  }
+
+  .arc-zone-label--host {
+    margin-bottom: 10px;
+  }
+
+  .arc-helper-grid > * {
+    grid-column: 2 !important;
+    grid-row: auto !important;
+  }
+
+  .arc-zone {
+    display: none;
+  }
+
+  .arc-helper-grid > .arc-link {
+    min-height: 44px;
+  }
+
+  .arc-helper-grid > .arc-link::before {
+    left: 24px;
+    right: auto;
+    top: 0;
+    bottom: 0;
+    border-top: 0;
+    border-left: 1.5px solid var(--c);
+  }
+
+  .arc-helper-grid > .arc-link::after {
+    left: 24.5px;
+    right: auto;
+    top: auto;
+    bottom: 1px;
+    translate: -3px 0;
+    rotate: 135deg;
+  }
+
+  .arc-helper-grid > .arc-link--left::after {
+    top: 1px;
+    bottom: auto;
+    rotate: -45deg;
+  }
+
+  .arc-helper-grid > .arc-link > span,
+  .arc-helper-grid > .arc-link > small {
+    top: 50%;
+    bottom: auto;
+    left: 34px;
+    right: auto;
+    translate: 0 -50%;
+    text-align: left;
+    white-space: nowrap;
+  }
+
+  .arc-helper-grid > .arc-link > small {
+    translate: 0 40%;
+  }
+
+  .arc-helper-grid > .arc-link--both > span::before {
+    display: none;
+  }
+
+  .arc-helper-grid > .arc-link:has(small) > span {
+    translate: 0 -110%;
+  }
+
+  /* Host first, then the container, then back on the host where the
+     streams end. The install row is the prose's job here. */
+  .arc-h-install,
+  .arc-h-binary {
+    display: none !important;
+  }
+
+  .arc-zone-label--host { order: 1; }
+  .arc-helper .arc-you { order: 2; }
+  .arc-h-sock { order: 3; }
+  .arc-h-serve { order: 4; }
+  .arc-h-pipe { order: 5; }
+  .arc-zone-label--box { order: 6; }
+  .arc-h-bridge { order: 7; }
+  .arc-h-ctl { order: 8; }
+  .arc-h-daemon { order: 9; }
+  .arc-h-l-agent { order: 10; }
+  .arc-h-c-agent { order: 11; }
+  .arc-h-l-api { order: 12; }
+  .arc-h-c-api { order: 13; }
+  .arc-h-l-tcp { order: 14; }
+  .arc-h-c-tcp { order: 15; }
+  .arc-h-ends { order: 16; }
+  .arc-helper .arc-h-endlist { order: 17; }
+
+  .arc-zone-label--box {
+    margin: 4px 0 10px;
+  }
+
+  .arc-card,
+  .arc-chip,
+  .arc-client {
+    justify-self: stretch;
+  }
+}
+
+/* --------------------------------------------------- Sequence diagrams */
+
+.arc-seq {
+  margin: 28px 0 34px;
+}
+
+.arc-scroll {
+  overflow-x: auto;
+  padding: 14px 4px 4px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background:
+    linear-gradient(#b3ffff05 1px, transparent 1px) 0 0 / 32px 32px,
+    linear-gradient(90deg, #b3ffff05 1px, transparent 1px) 0 0 / 32px 32px,
+    linear-gradient(180deg, #121d20cc, #0e1618aa);
+}
+
+.arc-seq-grid {
+  position: relative;
+  display: grid;
+  grid-template-columns: repeat(var(--lanes), minmax(0, 1fr));
+  min-width: calc(var(--lanes) * 150px);
+}
+
+.arc-lifelines {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: subgrid;
+}
+
+.arc-lifelines span {
+  justify-self: center;
+  width: 0;
+  border-left: 1.5px dashed var(--c);
+  opacity: 0.55;
+}
+
+.arc-lane {
+  position: relative;
+  z-index: 1;
+  grid-row: 1;
+  justify-self: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  max-width: calc(100% - 12px);
+  box-sizing: border-box;
+  margin-bottom: 6px;
+  padding: 8px 12px;
+  border: 1px solid var(--c);
+  border-radius: 9px;
+  background: #121b1e;
+  box-shadow: 0 10px 24px #0007;
+  text-align: center;
+}
+
+.arc-lane strong {
+  font: 500 12px / 1.1 var(--font-mono);
+  color: var(--label);
+}
+
+.arc-lane span {
+  font: 9.5px / 1.2 var(--font-mono);
+  color: var(--text-faint);
+}
+
+.arc-msg {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  margin: 0 calc(50% / var(--span));
+  padding: 9px 0 7px;
+  min-width: 0;
+}
+
+.arc-msg-label {
+  padding: 0 6px;
+  font: 10.5px / 1.25 var(--font-mono);
+  color: var(--label);
+  text-align: center;
+}
+
+.arc-msg-line {
+  position: relative;
+  align-self: stretch;
+  height: 0;
+  border-top: 1.5px solid var(--c);
+}
+
+.arc-msg.is-dashed .arc-msg-line {
+  border-top-style: dashed;
+}
+
+.arc-msg-line::after,
+.arc-msg.is-both .arc-msg-line::before {
+  content: '';
+  position: absolute;
+  top: -4.5px;
+  width: 6px;
+  height: 6px;
+  border: solid var(--c);
+  border-width: 1.5px 1.5px 0 0;
+}
+
+.arc-msg-line::after {
+  right: 0;
+  rotate: 45deg;
+}
+
+.arc-msg.is-left .arc-msg-line::after {
+  right: auto;
+  left: 0;
+  rotate: -135deg;
+}
+
+.arc-msg.is-both .arc-msg-line::before {
+  left: 0;
+  rotate: -135deg;
+}
+
+.arc-msg-sub {
+  padding: 0 6px;
+  font: 9.5px / 1.25 var(--font-mono);
+  color: var(--text-faint);
+  text-align: center;
+}
+
+.arc-act {
+  position: relative;
+  z-index: 1;
+  justify-self: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  max-width: calc(100% - 12px);
+  box-sizing: border-box;
+  margin: 6px 0;
+  padding: 6px 10px;
+  border: 1px solid var(--c);
+  border-radius: 6px;
+  background: #0f181a;
+  text-align: center;
+}
+
+.arc-act span {
+  font: 10.5px / 1.25 var(--font-mono);
+  color: var(--label);
+}
+
+.arc-act small {
+  font: 9.5px / 1.25 var(--font-mono);
+  color: var(--text-faint);
+}
+
+.arc-phase {
+  position: relative;
+  z-index: 1;
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 10px 8px 4px;
+  font: 9.5px / 1 var(--font-mono);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-subtle);
+}
+
+.arc-phase::before,
+.arc-phase::after {
+  content: '';
+  flex: 1;
+  border-top: 1px solid var(--border-strong);
+}
+
+.arc-phase span {
+  padding: 3px 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: var(--bg);
+}
+
+/* ------------------------------------------------------- State machine */
+
+.arc-states {
+  margin: 28px 0 34px;
+}
+
+.arc-states .arc-state-list {
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.arc-states .arc-state-list > li {
+  margin: 0;
+  padding: 0;
+}
+
+.arc-state {
+  display: grid;
+  grid-template-columns: minmax(0, 220px) minmax(0, 1fr);
+  gap: 18px;
+  align-items: start;
+}
+
+.arc-state-card {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 10px 12px;
+  border: 1px solid var(--c);
+  border-radius: 10px;
+  background: linear-gradient(180deg, #162326, #111a1d);
+  box-shadow: 0 12px 26px #0007;
+}
+
+.arc-state-card strong {
+  font: 500 12.5px / 1.1 var(--font-mono);
+  color: var(--label);
+}
+
+.arc-state-card span {
+  font: 9.5px / 1.25 var(--font-mono);
+  color: var(--text-faint);
+}
+
+.arc-states .arc-state-notes {
+  margin: 0;
+  padding: 2px 0 0;
+  list-style: none;
+}
+
+.arc-states .arc-state-notes li {
+  margin: 0 0 4px;
+  padding-left: 14px;
+  position: relative;
+  font: 12.5px / 1.45 var(--font-body);
+  color: var(--text-body);
+}
+
+.arc-states .arc-state-notes code {
+  font-size: 0.86em;
+}
+
+.arc-states .arc-state-notes li::before {
+  content: '';
+  position: absolute;
+  left: 2px;
+  top: 0.62em;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--c);
+}
+
+/* The transition to the next state: a down arrow under the card column. */
+.arc-step {
+  display: grid;
+  grid-template-columns: minmax(0, 220px) minmax(0, 1fr);
+  gap: 18px;
+}
+
+.arc-step .arc-link {
+  min-height: 46px;
+}
+
+.arc-step .arc-link > span {
+  left: calc(50% + 10px);
+  right: auto;
+  white-space: normal;
+  width: max-content;
+  max-width: 340px;
+}
+
+.arc-state-side {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.arc-state-side span {
+  padding: 3px 8px;
+  border: 1px solid var(--c);
+  border-radius: 999px;
+  font: 9.5px / 1.2 var(--font-mono);
+  color: var(--label);
+}
+
+@media (max-width: 700px) {
+  .arc-state,
+  .arc-step {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 8px;
+  }
+
+  .arc-step .arc-link::before,
+  .arc-step .arc-link::after {
+    left: 24px;
+  }
+
+  .arc-step .arc-link::after {
+    left: 24.5px;
+  }
+
+  .arc-step .arc-link > span {
+    left: 36px;
+    max-width: calc(100% - 40px);
+  }
+}

@@ -20,7 +20,8 @@ const deps = configDeps(fileURLToPath(import.meta.url));
 
 export default defineConfig({
   site: 'https://devsandboxes.com',
-  integrations: [mdx(), sitemap(), pagefind(), watchConfigDeps(deps)],
+  // `/architecture` is for contributors, reached by URL only: kept out of the sitemap.
+  integrations: [mdx(), sitemap({ filter: (page) => !new URL(page).pathname.startsWith('/architecture') }), pagefind(), watchConfigDeps(deps)],
   markdown: {
     processor: satteri({ hastPlugins: [dropSourceTitle(), headingAnchors(), tableKeyWeight(), tableScroll()] }),
     shikiConfig: {

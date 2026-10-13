@@ -1,0 +1,134 @@
+---
+title: Daemon and bridge
+description: How a host process attaches to the in-container devsbd daemon through a devsbd bridge, the frames they speak, and how streams are routed.
+eyebrow: ARCHITECTURE · 02
+order: 2
+---
+
+import Sequence from '../../components/architecture/Sequence.astro';
+
+export const attachLanes = [
+  { id: 'serve', label: 'devsandbox serve', sub: 'host · Bridges worker', tone: 'serve' },
+  { id: 'bridge', label: 'devsbd bridge', sub: 'container · exec -i', tone: 'helper' },
+  { id: 'daemon', label: 'devsbd daemon', sub: 'container · root', tone: 'helper' },
+  { id: 'client', label: 'ssh · devsbd notify', sub: 'container · any uid', tone: 'client' },
+];
+
+export const attachSteps = [
+  { kind: 'phase', label: 'attach' },
+  { from: 'serve', to: 'bridge', label: 'exec -i -u root <c> devsbd bridge', sub: 'after reinstalling a stale helper', tone: 'runtime' },
+  { from: 'bridge', to: 'daemon', label: 'connect devsbd.ctl', sub: 'retries 2 s; nothing listening → starts devsbd daemon once' },
+  { from: 'bridge', to: 'daemon', both: true, label: 'Hello ⇄ Hello', sub: 'version · build hash · daemon caps TCP_FORWARD' },
+  { from: 'bridge', to: 'serve', both: true, label: 'Hello ⇄ Hello', sub: 'caps = bridge ∧ daemon · host gives up after 10 s' },
+  { from: 'serve', to: 'daemon', label: 'Caps', sub: 'SSH_AGENT · NOTIFY · CONTROL, through the bridge verbatim', tone: 'serve' },
+  { kind: 'act', at: 'bridge', label: 'copies bytes both ways', sub: 'never parses another frame' },
+  { kind: 'phase', label: 'streams' },
+  { from: 'client', to: 'daemon', label: 'connect ssh-agent.sock', tone: 'agent' },
+  { from: 'daemon', to: 'serve', label: 'Open(ssh-agent) · Data …', sub: 'id < 2³¹ · newest agent-capable bridge', tone: 'agent' },
+  { from: 'serve', to: 'daemon', label: 'Data … · Close', sub: 'host dials the first live $SSH_AUTH_SOCK', tone: 'agent' },
+  { from: 'client', to: 'daemon', label: 'devsbd notify → outbox, poke api.sock', tone: 'notify' },
+  { from: 'daemon', to: 'serve', label: 'Open(notify) · Data · Eof', sub: 'one record; resent until the host answers ok', tone: 'notify' },
+  { from: 'serve', to: 'daemon', label: 'Connect(host, port) · Window · Eof', sub: 'forward bridges · id ≥ 2³¹ · daemon dials TCP' },
+  { kind: 'phase', label: 'liveness' },
+  { from: 'serve', to: 'daemon', both: true, label: 'Ping ⇄ Pong', sub: 'every 15 s, from both ends', tone: 'runtime' },
+  { kind: 'act', at: 'daemon', label: '45 s silent → drop the bridge', sub: 'routing falls back to the next newest', tone: 'fail' },
+  { kind: 'act', at: 'serve', label: '45 s silent → kill the exec', sub: 'reconcile respawns, 10 s gap', tone: 'fail' },
+];
+
+export const takeoverLanes = [
+  { id: 'serve', label: 'devsandbox serve', sub: 'host', tone: 'serve' },
+  { id: 'start', label: 'devsandbox start', sub: 'host · newer build', tone: 'cli' },
+  { id: 'new', label: 'devsbd daemon', sub: 'new build', tone: 'helper' },
+  { id: 'old', label: 'devsbd daemon', sub: 'old build', tone: 'runtime' },
+];
+
+export const takeoverSteps = [
+  { from: 'start', to: 'new', label: 'write the binary · exec -d devsbd daemon', sub: 'the container was already running' },
+  { kind: 'act', at: 'new', label: 'devsbd.pid is locked', sub: 'by another build hash' },
+  { from: 'new', to: 'old', label: 'Quit', sub: 'first frame on devsbd.ctl; frozen, so every build understands it' },
+  { kind: 'act', at: 'old', label: 'exits', sub: 'its bridges and streams end', tone: 'fail' },
+  { kind: 'act', at: 'new', label: 'takes the lock, rebinds', sub: 'waits up to 3 s' },
+  { from: 'serve', to: 'new', label: 'next poll: exec -i devsbd bridge', sub: 'the bridge is the new build too', tone: 'serve' },
+];
+
+Each host process that wants to reach a container runs its own `devsbd bridge` there. The bridge is a pipe fitter:
+it does a handshake on each side, then copies bytes until either end closes. All the logic is in the shared
+`Mux` (`src/devsbd/mux.rs`), which runs in the daemon and on the host, so only those two ends parse frames.
+
+<Sequence title="A host daemon's bridge, from attach to keepalive" lanes={attachLanes} steps={attachSteps} />
+
+## Two handshakes
+
+The bridge sends `Hello` to the daemon first, then to the host. So a daemon of another protocol version fails the
+bridge (exit `3`, `proto::MISMATCH_EXIT`) before the host sees a frame, and the host never sends frames the
+daemon can't parse. Only `VERSION` must match. The build hash in `Hello` is informational: a bridge and daemon of
+the same old build work with a newer host as long as the protocol is the same.
+
+The caps don't pass through on their own, since each side only sees its own handshake:
+
+- the daemon's `Hello` advertises what it serves (`TCP_FORWARD`),
+- the bridge tells the host `OWN_CAPS ∧ daemon caps`, so a forward isn't attempted against a daemon that can't
+  serve it,
+- the host then sends `Caps` with what *it* serves, and the bridge passes it through unchanged. `SSH_AGENT` only
+  when it has a live agent, `NOTIFY` and `CONTROL` only from the host daemon's instance bridge (the one with a
+  sink).
+
+A host whose `Hello` mismatches (either side) retries that container every 5 minutes instead of every 10 s: only
+a helper rewrite fixes it.
+
+## Frames
+
+One byte stream each way, little-endian, each frame written with a single `write_all` so writers can share it:
+
+```text title="src/devsbd/proto.rs"
+u32 stream_id | u8 kind | u32 len | payload[len]      (len ≤ 1 MiB)
+```
+
+| kind | name | stream | payload |
+|---|---|---|---|
+| 0 | `Hello` | 0 | `u32 version`, `u8` + build hash, `u32 caps` |
+| 1 | `Open` | daemon id | `u8 channel`: 1 ssh-agent, 2 http-proxy (reserved), 3 notify, 4 control |
+| 2 | `Data` | any | bytes |
+| 3 | `Close` | any | optional reason (`connection refused`, …) |
+| 4 / 5 | `Ping` / `Pong` | 0 | echoed |
+| 6 | `Quit` | 0 | none: the daemon takeover |
+| 7 | `Connect` | host id | `u16 port`, `u8` + host |
+| 8 | `Window` | any | `u32 credit` (flow control on `Connect` streams) |
+| 9 | `Eof` | any | none: half-close |
+| 10 | `Caps` | 0 | `u32` host caps |
+
+The header, `Hello`'s leading `version` and `Quit` are frozen forever, so any two builds can at least report a
+mismatch and evict each other. Unknown kinds are skipped (payload consumed). That's how 7–10 landed without a
+`VERSION` bump.
+
+**Stream ids.** The daemon allocates ids with the high bit clear (agent, notify and control streams it opens),
+the host with it set (`Connect`). Each side refuses the other's id space, a live id, or too many streams: 64
+daemon streams per bridge on the host, 256 `Connect` streams in the daemon.
+
+## Routing in the daemon
+
+The daemon keeps every attached bridge, newest last, and routes each kind of stream on its own:
+
+| stream | goes to | when there's none |
+|---|---|---|
+| ssh-agent | newest bridge whose host advertised `SSH_AGENT` | held up to 1 s for one, then closed ("agent refused") |
+| notify | newest bridge with `NOTIFY` | stays in `/var/lib/devsandbox/outbox/`, retried every 30 s and on attach |
+| control | newest bridge with `CONTROL` | answered `NoHost` (the CLI exits 75) |
+| `Connect` | n/a: opened by the host | |
+
+A bridge whose `Caps` hasn't arrived yet counts as not capable, unless its `Hello` caps were 0 (a host from
+before caps). So an agent-less `devsandbox port` that attaches last can't take ssh away from the host daemon's
+bridge.
+
+## Takeover
+
+`start` on a running container after a CLI upgrade rewrites the binary and starts a daemon of the new build. The
+last start wins, upgrade or downgrade:
+
+<Sequence title="A new build's daemon taking over a running container" lanes={takeoverLanes} steps={takeoverSteps} />
+
+Same build hash → the second daemon exits 0. No hash in the pidfile yet (its owner is still starting) counts as
+the same build, so two concurrent starts never evict each other.
+
+Design notes: `docs/sandbox-helper.md` (protocol, takeover, self-heal), `docs/port-forwarding.md` (`Connect`, flow
+control), `docs/automations.md` (control and notify streams).

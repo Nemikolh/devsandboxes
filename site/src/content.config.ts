@@ -42,4 +42,18 @@ const examples = defineCollection({
   }),
 });
 
-export const collections = { docs, spec, examples };
+// How devsandbox is put together, for contributors: `/architecture/<id>`,
+// listed by `pages/architecture/index.astro`. Deliberately outside the docs'
+// sidebar, reading order, search index and sitemap.
+const architecture = defineCollection({
+  loader: glob({ base: './src/content/architecture', pattern: '*.mdx' }),
+  schema: z.object({
+    title: z.string(),
+    description: z.string(),
+    eyebrow: z.string(),
+    /** Order in the architecture sidebar and index (lower first). */
+    order: z.number(),
+  }),
+});
+
+export const collections = { docs, spec, examples, architecture };

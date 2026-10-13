@@ -1,0 +1,135 @@
+---
+/**
+ * The `/architecture` pages: the docs shell (`docs.css`) with their own
+ * sidebar and prev/next, since they're outside the docs' reading order
+ * (`nav.ts`), and a wider main column for the diagrams. No
+ * `data-pagefind-body`, so search doesn't index them; the sitemap filters
+ * them out (`astro.config.mjs`).
+ */
+import { getCollection } from 'astro:content';
+import { ArrowLeft, ArrowRight, ArrowUpRight, ChevronRight } from '@lucide/astro';
+import { normalizePath, sourceUrl } from '../lib/nav';
+import '../styles/docs.css';
+import Base from './Base.astro';
+
+interface Props {
+  title: string;
+  description: string;
+  eyebrow: string;
+  /** Repo-relative source file, for the "Edit this page" link. */
+  source: string;
+}
+
+const { title, description, eyebrow, source } = Astro.props;
+const pages = (await getCollection('architecture'))
+  .sort((a, b) => a.data.order - b.data.order)
+  .map((e) => ({ href: `/architecture/${e.id}`, title: e.data.title, description: e.data.description }));
+const links = [{ href: '/architecture', title: 'Overview', description: 'The map of the architecture pages.' }, ...pages];
+const current = normalizePath(Astro.url.pathname);
+const i = links.findIndex((l) => l.href === current);
+const prev = links[i - 1];
+const next = links[i + 1];
+---
+
+<Base title={title} description={description}>
+  <div class="docs-shell arc-shell">
+    <aside class="docs-sidebar">
+      <nav class="sidebar-nav" aria-label="Architecture">
+        <div class="sidebar-heading" aria-hidden="true">
+          <span>ARCHITECTURE</span>
+          <span class="sidebar-number">01 — {String(links.length).padStart(2, '0')}</span>
+        </div>
+        <div class="nav-group">
+          <p class="nav-group-label">HOW IT FITS</p>
+          <ul>
+            {
+              links.map((link) => (
+                <li>
+                  <a class="side-link" href={link.href} aria-current={current === link.href ? 'page' : undefined}>
+                    {link.title}
+                    <ChevronRight size={14} aria-hidden="true" />
+                  </a>
+                </li>
+              ))
+            }
+          </ul>
+        </div>
+      </nav>
+    </aside>
+    <main id="main-content" class="docs-main arc-main" tabindex="-1">
+      <nav class="breadcrumb" aria-label="Breadcrumb">
+        <ol>
+          <li><a href="/">Home</a><ChevronRight size={13} aria-hidden="true" /></li>
+          {i > 0 && <li><a href="/architecture">Architecture</a><ChevronRight size={13} aria-hidden="true" /></li>}
+          <li><span aria-current="page">{title}</span></li>
+        </ol>
+      </nav>
+      <div class="article-topline">
+        <span class="eyebrow"><span class="eyebrow-line" aria-hidden="true"></span>{eyebrow}</span>
+      </div>
+      <h1>{title}<span class="title-period" aria-hidden="true">.</span></h1>
+      <p class="article-lead">{description}</p>
+      <hr class="article-divider" />
+      <article class="prose">
+        <slot />
+        <p class="article-source">
+          <span>Source: <code>{source}</code></span>
+          <a href={sourceUrl(source, 'edit')} target="_blank" rel="noopener noreferrer">
+            Edit this page on GitHub
+            <ArrowUpRight size={13} aria-hidden="true" /><span class="visually-hidden">(opens in a new tab)</span>
+          </a>
+        </p>
+      </article>
+      <div class="article-bottom">
+        {
+          (prev || next) && (
+            <nav class="pager" aria-label="Previous and next page">
+              {prev && (
+                <a class="next-page pager-prev" href={prev.href} rel="prev">
+                  <span>
+                    <ArrowLeft size={13} aria-hidden="true" /> PREVIOUS
+                  </span>
+                  <strong>{prev.title}</strong>
+                  <small>{prev.description}</small>
+                </a>
+              )}
+              {next && (
+                <a class="next-page pager-next" href={next.href} rel="next">
+                  <span>
+                    UP NEXT <ArrowRight size={13} aria-hidden="true" />
+                  </span>
+                  <strong>{next.title}</strong>
+                  <small>{next.description}</small>
+                </a>
+              )}
+            </nav>
+          )
+        }
+      </div>
+    </main>
+  </div>
+</Base>
+
+<style>
+  /* Wider than a docs page: no TOC column, and the diagrams want the room.
+     Mirrors docs.css's sidebar widths at each breakpoint. */
+  .arc-shell {
+    grid-template-columns: 260px minmax(0, 1fr);
+  }
+
+  .arc-main {
+    max-width: 1270px;
+  }
+
+  @media (max-width: 1180px) {
+    .arc-shell {
+      grid-template-columns: 220px minmax(0, 1fr);
+    }
+  }
+
+  @media (max-width: 980px) {
+    .arc-shell {
+      grid-template-columns: 210px minmax(0, 1fr);
+    }
+  }
+</style>

@@ -1,0 +1,162 @@
+---
+title: Host daemon lifecycle
+description: When devsandbox serve starts, who keeps it alive, how a newer build takes over, and how it shuts down without leaving a bridge behind.
+eyebrow: ARCHITECTURE · 03
+order: 3
+---
+
+import Sequence from '../../components/architecture/Sequence.astro';
+import States from '../../components/architecture/States.astro';
+
+export const states = [
+  {
+    name: 'no daemon',
+    sub: 'nothing answers on serve.sock',
+    tone: 'runtime',
+    notes: [
+      '`serve.sock` lives in `$XDG_RUNTIME_DIR/devsandbox/` (else the state dir), 0600 in a 0700 dir: one daemon per user.',
+      'A client that needs one starts it (lazy start); `devsandbox inbox` and `serve install` only use one already running.',
+    ],
+    next: 'lazy start: setsid devsandbox serve --socket-dir <dir>, or the installed unit through systemd / launchd',
+  },
+  {
+    name: 'starting',
+    sub: 'devsandbox serve',
+    tone: 'serve',
+    notes: [
+      'Takes the exclusive lock on `serve.lock`. Held and the socket answers: another daemon won, exit 0.',
+      'Held and silent: a predecessor is still starting or draining; wait for it, up to 10 s.',
+      'Binds `serve.sock` (a stale one from a crash is replaced), then starts the forwards registry (restoring `forwards.toml`) and the host poll.',
+    ],
+    side: ['lock held + socket answers → exit 0'],
+    next: 'listening (one line in serve.log)',
+  },
+  {
+    name: 'serving',
+    sub: 'accept loop',
+    tone: 'serve',
+    notes: [
+      'Every 5 s: list the running containers, reconcile one bridge per instance and the configured `forwardPorts`.',
+      'Once at start: the autostart pass for every config root in `state.toml`.',
+      'Each tick counts holders: connections, running `dispatcher` / `inbox = true` instances, in-flight control requests, live forwards, the autostart pass.',
+    ],
+    side: ['newer client hello → handoff', 'shutdown request', '10 min with no holder → idle (off with --keep-alive)'],
+    next: 'any of the three: stop accepting, remove serve.sock',
+  },
+  {
+    name: 'draining',
+    sub: 'up to 5 s',
+    tone: 'notify',
+    notes: [
+      'Sends `closing` (reason `handoff`, `shutdown` or `idle`) to subscribed connections.',
+      'Lets in-flight requests finish, closes the rest.',
+      'Kills every bridge and closes every forward, still holding the lock: a successor\u2019s bridges and saved host ports never overlap.',
+    ],
+    next: 'release serve.lock, exit 0',
+  },
+  {
+    name: 'exited',
+    sub: 'lock free',
+    tone: 'runtime',
+    notes: [
+      'A successor waiting on the lock takes it now.',
+      'Under a unit, `Restart=on-failure`: a clean exit (handoff included) stays down, so the stale binary never respawns against the newer daemon.',
+    ],
+  },
+];
+
+export const startLanes = [
+  { id: 'cmd', label: 'devsandbox exec', sub: 'your shell', tone: 'cli' },
+  { id: 'serve', label: 'devsandbox serve', sub: 'setsid child', tone: 'serve' },
+  { id: 'box', label: 'devsbd bridge', sub: 'container', tone: 'helper' },
+];
+
+export const startSteps = [
+  { kind: 'act', at: 'cmd', label: 'connect serve.sock: refused', sub: 'starts at most one daemon per attempt' },
+  { from: 'cmd', to: 'serve', label: 'spawn: setsid, cwd /, stdin /dev/null', sub: 'stdout + stderr appended to serve.log', tone: 'runtime' },
+  { kind: 'act', at: 'serve', label: 'lock · bind · poll', sub: 'inherits DEVSANDBOX_RUNTIME, SSH_AUTH_SOCK, DISPLAY' },
+  { from: 'cmd', to: 'serve', label: 'hello {version, build, client}', sub: 'polled for up to 5 s' },
+  { from: 'serve', to: 'cmd', label: '{protocol: 1}', tone: 'serve' },
+  { from: 'cmd', to: 'serve', label: 'bridges.ensure {instance, agent}', sub: 'agent goes first in the candidates; poll woken' },
+  { from: 'serve', to: 'box', label: 'exec -i devsbd bridge', sub: 'see Daemon and bridge', tone: 'serve' },
+  { kind: 'act', at: 'cmd', label: 'docker exec … (the command)', sub: 'connection held: a holder' },
+  { kind: 'act', at: 'cmd', label: 'exit → hang up', sub: 'idle countdown restarts if it was the last holder' },
+];
+
+export const handoffLanes = [
+  { id: 'cli', label: 'devsandbox', sub: 'newer build', tone: 'cli' },
+  { id: 'old', label: 'serve', sub: 'older build', tone: 'runtime' },
+  { id: 'new', label: 'serve', sub: 'newer build', tone: 'serve' },
+  { id: 'tui', label: 'dashboard', sub: 'subscribed', tone: 'client' },
+];
+
+export const handoffSteps = [
+  { from: 'cli', to: 'old', label: 'hello {version, build}', sub: 'compared as (major, minor, patch, build mtime)' },
+  { kind: 'act', at: 'old', label: 'stop accepting, remove serve.sock' },
+  { from: 'old', to: 'cli', label: '{handoff: true}', tone: 'runtime' },
+  { from: 'old', to: 'tui', label: 'closing {reason: handoff}', tone: 'notify' },
+  { from: 'cli', to: 'new', label: 'spawn: setsid, or rewrite the unit + restart', tone: 'runtime' },
+  { kind: 'act', at: 'new', label: 'serve.lock held, socket silent', sub: 'waits, up to 10 s' },
+  { kind: 'act', at: 'old', label: 'drain · kill bridges · close forwards', sub: 'up to 5 s, then exit 0', tone: 'notify' },
+  { kind: 'act', at: 'new', label: 'lock · bind · restore forwards · poll' },
+  { from: 'cli', to: 'new', label: 'hello', sub: 'its 5 s poll, from the first attempt', tone: 'cli' },
+  { from: 'tui', to: 'new', label: 'reconnect · hello', sub: 'with backoff; older or equal, so no handoff', tone: 'client' },
+];
+
+`devsandbox serve` is the per-user host process that owns the live host side: the bridges, the Inbox sink, the
+port forwards and the API. Nobody is expected to run it by hand. Commands start it on demand, it exits once
+nothing needs it, and a newer binary replaces it on first contact. Unix only.
+
+<States title="devsandbox serve, from start to exit" states={states} />
+
+## Lazy start
+
+`serve::client::connect` sends a `hello` and, if nothing answers, starts a daemon and polls for 5 s. Here's an
+`exec` into a relay-mode instance with an ssh-agent in the shell:
+
+<Sequence title="exec, with no daemon running" lanes={startLanes} steps={startSteps} />
+
+Without a unit, the child is `devsandbox serve --socket-dir <dir>` in its own session (`setsid`), so the
+terminal's hangup and Ctrl-C don't reach it. A thread in the client reaps it if it exits while the client lives on
+(the dashboard). With a unit installed (`serve install`), the start goes through the service manager, and the
+daemon gets the manager's environment plus what `install` captured (`PATH`, the runtime, `XDG_*`; never
+`SSH_AUTH_SOCK`, which clients report per request).
+
+## Who talks to the daemon
+
+| client | how | starts one | holds it |
+|---|---|---|---|
+| dashboard | `connect` at launch, reconnect with backoff | yes | while open |
+| `run`, `start` | `ensure_running` after the autostart pass | yes | no, hangs up (a dispatcher / inbox instance holds it) |
+| `run`'s, `start`'s lifecycle commands | `bridges.ensure` with `wait: 12` | yes | for the chain |
+| `exec` | `bridges.ensure` on a thread, no wait | yes | while the command runs |
+| a dispatcher's child op | the daemon itself, over its own socket: `bridges.ensure`, waited, no agent reported | yes | for the op |
+| `api --stdio` | byte relay to `serve.sock` | yes | while it runs |
+| `inbox` mutations | `connect_running`, else the same op locally | no | for the call |
+| `serve install` | `connect_running`, then `shutdown` | no | no |
+| `devsandbox port` | none: forwards in its own process | no | no |
+
+The `bridges.ensure` rows only happen for relay-mode instances when the caller's shell has a live ssh-agent;
+otherwise those commands never contact the daemon.
+
+## Handoff
+
+A client whose `hello` is newer than the daemon's (`build` is the binary's mtime, so a rebuilt dev binary
+counts) makes the old one step aside:
+
+<Sequence title="A newer build taking over" lanes={handoffLanes} steps={handoffSteps} />
+
+With a unit installed, the client rewrites it from its own binary and environment and restarts it, so the managed
+daemon follows upgrades. If the unit's binary is gone (a Homebrew `Cellar` path, an npm reinstall), the next
+start repairs it. Known gap (`client.rs`): if an older client's daemon wins the lock race, the newer client gives
+up after its 5 s and hands off again on its next call.
+
+## Exit
+
+Idle, handoff and `shutdown` all leave the same way: the listener goes first (so a successor waits for the lock
+instead of seeing a live daemon), then `closing`, the 5 s drain, the bridges and the forwards, and the lock last.
+`serve uninstall` is the exception: the manager signals the daemon, so clients see the socket drop with no
+`closing` and reconnect by starting one on demand.
+
+Design notes: `docs/serve.md` (start, handoff, idle exit, boot start), `docs/api.md` (the methods, the dashboard
+as a client), `docs/inbox-redesign.md` (why a daemon).

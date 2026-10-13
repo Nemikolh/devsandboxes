@@ -1,0 +1,74 @@
+---
+title: Host and helper
+description: How the host reaches into every container through devsbd, the static helper it writes there, and which process owns each end.
+eyebrow: ARCHITECTURE · 01
+order: 1
+---
+
+import HelperDiagram from '../../components/architecture/HelperDiagram.astro';
+
+Nothing in a sandbox talks to the host directly: there is no mounted socket and no TCP port back. Instead, the
+host runs `exec -i … devsbd bridge` in the container and keeps the pipe open. Everything that crosses the boundary
+(ssh-agent requests, `devsbd notify`, a dispatcher's `devsbd ensure`, a forwarded port) is a stream in that one
+pipe. Since it's plain `exec` stdio, it works the same on docker, podman and Apple `container`.
+
+<HelperDiagram />
+
+## The helper binary
+
+`devsbd` is a static musl binary (x86_64 and aarch64) embedded zstd-compressed in `devsandbox` (`build.rs`,
+`src/devsbd.rs`). The host writes it with `exec -i -u root <c> sh -c 'cat > …'` to `/run/devsandbox/bin/devsbd`
+(no `docker cp`, no file binds), unless `devsbd version` there already reports one of the two embedded build
+hashes. That check runs in:
+
+- `run` after create, and `start` after the container starts,
+- the host daemon before every bridge (re)spawn, so a newer daemon upgrades a running helper.
+
+The arch that ran is saved on the instance (`devsbd_arch`): host arch first, the other on failure (emulated images).
+`None` means the helper is unavailable (no `/bin/sh`, read-only `/run`, a build with no embedded helper). Then the
+instance falls back to a bind-mounted agent socket, if there is one.
+
+## One daemon per container
+
+`devsbd daemon` runs as root and owns the in-container ends:
+
+| socket | mode | who connects |
+|---|---|---|
+| `/run/devsandbox/ssh-agent.sock` | 0666 | `ssh`, `git` (`SSH_AUTH_SOCK` points here in relay mode) |
+| `/run/devsandbox/api.sock` | 0666 | `devsbd notify`'s poke, the control verbs (`ensure`, `events`, `run`, …) |
+| `/run/devsandbox/devsbd.ctl` | 0600 | `devsbd bridge` only |
+
+It also holds an exclusive lock on `/run/devsandbox/devsbd.pid` (`<pid> <build hash>`) for its lifetime. A daemon
+of another build takes over by sending `Quit` on `devsbd.ctl` (see [Daemon and bridge](/architecture/bridge#takeover)).
+Three things start a daemon, and the lock makes any race between them harmless:
+
+- the host, `exec -d -u root <c> devsbd daemon`, after each successful install,
+- `devsbd boot`, the container command's start hook, which then runs `postStartCommand`,
+- a bridge that finds nothing listening on `devsbd.ctl` (a container the runtime restarted on its own).
+
+## Who holds a bridge
+
+Each host process owns its bridges; they're never shared. The daemon keeps every attached bridge and routes each
+kind of stream to the newest one whose host serves it, so several bridges per container are normal:
+
+| host process | bridge | serves |
+|---|---|---|
+| `devsandbox serve` | one per running instance, reconciled every 5 s | ssh-agent, notify, control |
+| a Ports-tab forward (inside `serve`) | one per forward | its `Connect` streams, ssh-agent |
+| `devsandbox port` (foreground) | its own | its `Connect` streams, ssh-agent when its shell has one |
+
+A forward's bridge advertises ssh-agent too (same agent candidates), so whichever bridge attached last carries
+the container's agent streams. Notify and control only ever go to the instance bridge: no other bridge has a sink.
+
+Commands that need the relay (`exec`, `run`'s and `start`'s lifecycle commands, a dashboard terminal) don't bridge
+themselves: they ask the daemon with `bridges.ensure`, passing their own `$SSH_AUTH_SOCK`
+([Host daemon lifecycle](/architecture/serve-lifecycle#who-talks-to-the-daemon)).
+
+## Where the streams end
+
+On the host, the daemon's bridge connects each agent stream to the first live agent it knows (up to 8 that clients
+reported, newest first, then its own `$SSH_AUTH_SOCK`). It stores notify records in `inbox.json` and shows
+popups, and it serves control requests itself (`src/commands/dispatch.rs`). A forward's bridge goes the other way:
+the host opens `Connect` streams, and the daemon dials the TCP target from inside the container.
+
+Design notes: `docs/sandbox-helper.md`, `docs/ssh-agent.md`, `docs/port-forwarding.md`, `docs/automations.md`.

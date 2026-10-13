@@ -1,0 +1,26 @@
+---
+import type { GetStaticPaths } from 'astro';
+import { getCollection, render, type CollectionEntry } from 'astro:content';
+import Architecture from '../../layouts/Architecture.astro';
+
+export const getStaticPaths = (async () => {
+  const pages = await getCollection('architecture');
+  return pages.map((entry) => ({ params: { slug: entry.id }, props: { entry } }));
+}) satisfies GetStaticPaths;
+
+interface Props {
+  entry: CollectionEntry<'architecture'>;
+}
+
+const { entry } = Astro.props;
+const { Content } = await render(entry);
+---
+
+<Architecture
+  title={entry.data.title}
+  description={entry.data.description}
+  eyebrow={entry.data.eyebrow}
+  source={`site/${entry.filePath}`}
+>
+  <Content />
+</Architecture>

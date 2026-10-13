@@ -1,0 +1,119 @@
+---
+/**
+ * Host ↔ helper overview: the host daemon reaches every running instance
+ * through one `exec -i … devsbd bridge` pipe, the bridge attaches to the
+ * in-container `devsbd daemon` over `devsbd.ctl`, and the daemon owns the
+ * sockets in-container tools use. In the landing diagrams' language
+ * (`BabysitDiagram.astro`): purple the host daemon, cyan the container side,
+ * lime you, green the ssh-agent, yellow notify. Desktop is one grid with
+ * fixed rows (`--row`) so the arrows meet the cards; narrow screens stack it
+ * and turn the arrows vertical.
+ */
+import { Bell, Binary, Cable, Container, KeyRound, Network, Server, Terminal, UserRound } from '@lucide/astro';
+import '../../styles/architecture.css';
+
+const sockets = [
+  { name: 'ssh-agent.sock', mode: '0666' },
+  { name: 'api.sock', mode: '0666' },
+  { name: 'devsbd.ctl', mode: '0600' },
+];
+
+const serveParts = ['Bridges · 5 s poll', 'Forwards', 'API', 'Inbox sink'];
+const hostEnds = [
+  { icon: KeyRound, label: '$SSH_AUTH_SOCK', tone: 'agent' },
+  { icon: Bell, label: 'inbox.json · popup', tone: 'notify' },
+  { icon: Network, label: 'localhost:<port>', tone: 'helper' },
+];
+---
+
+<figure class="arc-helper" data-pagefind-ignore>
+  <p class="visually-hidden">
+    Diagram. On the host, you run devsandbox commands or the dashboard, which talk JSON lines to the host daemon,
+    devsandbox serve, over serve.sock. run and start also write the devsbd binary into the container at
+    /run/devsandbox/bin/devsbd through exec stdin. The host daemon runs exec -i devsbd bridge in each running
+    container; the bridge speaks length-prefixed frames on its stdio and attaches to the devsbd daemon over the
+    devsbd.ctl socket. The daemon, running as root, owns ssh-agent.sock for ssh and git, api.sock for devsbd notify,
+    ensure and events, and dials TCP inside the container for port forwards. The host daemon ends those streams at your
+    ssh-agent, the Inbox store and desktop popups, and forward listeners on localhost.
+  </p>
+
+  <div class="arc-helper-grid" aria-hidden="true" inert>
+    <div class="arc-zone arc-zone--host"></div>
+    <div class="arc-zone arc-zone--box"></div>
+    <div class="arc-zone-label arc-zone-label--host"><span>HOST</span> your machine</div>
+    <div class="arc-zone-label arc-zone-label--box"><span>CONTAINER</span> devsandbox-web</div>
+
+    <div class="arc-you"><UserRound /> CLI · dashboard</div>
+    <div class="arc-link arc-link--right arc-h-install" data-tone="cli">
+      <span>install</span>
+      <small>exec -i · stdin</small>
+    </div>
+    <div class="arc-chip arc-h-binary">
+      <Binary />/run/devsandbox/bin/devsbd
+      <small>static musl · hash-checked</small>
+    </div>
+
+    <div class="arc-link arc-link--down arc-h-sock" data-tone="serve"><span>serve.sock · JSON lines</span></div>
+
+    <div class="arc-card arc-card--serve arc-h-serve">
+      <div class="arc-head">
+        <span class="arc-icon"><Server /></span>
+        <span class="arc-name">devsandbox serve</span>
+      </div>
+      <div class="arc-sub">setsid · one per user</div>
+      <ul class="arc-tags">{serveParts.map((p) => <li>{p}</li>)}</ul>
+    </div>
+
+    <div class="arc-link arc-link--right arc-link--both arc-h-pipe" data-tone="serve">
+      <span>exec -i -u root devsbd bridge</span>
+      <small>frames on stdin/stdout</small>
+    </div>
+
+    <div class="arc-card arc-h-bridge">
+      <div class="arc-head">
+        <span class="arc-icon"><Cable /></span>
+        <span class="arc-name">devsbd bridge</span>
+      </div>
+      <div class="arc-sub">per host process · copies bytes</div>
+    </div>
+
+    <div class="arc-link arc-link--right arc-link--both arc-h-ctl" data-tone="helper"><span>devsbd.ctl</span></div>
+
+    <div class="arc-card arc-card--daemon arc-h-daemon">
+      <div class="arc-head">
+        <span class="arc-icon"><Container /></span>
+        <span class="arc-name">devsbd daemon</span>
+      </div>
+      <div class="arc-sub">root · one per container, per build</div>
+      <ul class="arc-sockets">
+        {
+          sockets.map((s) => (
+            <li>
+              {s.name}
+              <i>{s.mode}</i>
+            </li>
+          ))
+        }
+      </ul>
+    </div>
+
+    <div class="arc-link arc-link--left arc-h-l-agent" data-tone="agent"><span>ssh-agent.sock</span></div>
+    <div class="arc-client arc-h-c-agent"><Terminal /><span>ssh · git push<small>SSH_AUTH_SOCK</small></span></div>
+    <div class="arc-link arc-link--left arc-h-l-api" data-tone="notify"><span>api.sock</span></div>
+    <div class="arc-client arc-h-c-api"><Bell /><span>devsbd notify · ensure<small>outbox · control</small></span></div>
+    <div class="arc-link arc-link--right arc-h-l-tcp" data-tone="helper"><span>TCP dial</span></div>
+    <div class="arc-client arc-h-c-tcp"><Network /><span>web:3000 · postgres<small>Connect streams</small></span></div>
+
+    <div class="arc-link arc-link--down arc-h-ends" data-tone="serve"><span>streams end at</span></div>
+    <ul class="arc-ends arc-h-endlist">
+      {
+        hostEnds.map((e) => (
+          <li data-tone={e.tone}>
+            <e.icon />
+            {e.label}
+          </li>
+        ))
+      }
+    </ul>
+  </div>
+</figure>

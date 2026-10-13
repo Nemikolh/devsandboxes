@@ -1,0 +1,121 @@
+---
+/**
+ * A sequence diagram: one column per process (`lanes`), time running down,
+ * each step a message between two lanes, an action on one, or a phase
+ * divider. Data-driven so a page states *what* happens and this file owns how
+ * it's drawn; the visually-hidden ordered list is generated from the same
+ * steps, so the text alternative can't drift from the picture.
+ *
+ * Lanes have equal widths, so an arrow from lane a to lane b spans the
+ * columns a..b and is inset by half a column on each end (`--span`).
+ * Narrow screens scroll it sideways rather than restack: the order of the
+ * columns is the point.
+ */
+import '../../styles/architecture.css';
+
+export type Tone = 'cli' | 'serve' | 'runtime' | 'helper' | 'client' | 'notify' | 'agent' | 'fail';
+
+export interface Lane {
+  id: string;
+  label: string;
+  sub?: string;
+  tone: Tone;
+}
+
+export type Step =
+  | { kind?: 'msg'; from: string; to: string; label: string; sub?: string; tone?: Tone; both?: boolean; dashed?: boolean }
+  | { kind: 'act'; at: string; label: string; sub?: string; tone?: Tone }
+  | { kind: 'phase'; label: string };
+
+interface Props {
+  title: string;
+  lanes: Lane[];
+  steps: Step[];
+}
+
+const { title, lanes, steps } = Astro.props;
+const col = (id: string) => {
+  const i = lanes.findIndex((l) => l.id === id);
+  if (i < 0) throw new Error(`Sequence "${title}": unknown lane ${id}`);
+  return i;
+};
+const name = (id: string) => lanes[col(id)].label;
+
+const rows = steps.map((s) => {
+  if (s.kind === 'phase') return { kind: 'phase' as const, label: s.label };
+  if (s.kind === 'act') return { kind: 'act' as const, at: col(s.at), label: s.label, sub: s.sub, tone: s.tone ?? lanes[col(s.at)].tone };
+  const a = col(s.from);
+  const b = col(s.to);
+  if (a === b) throw new Error(`Sequence "${title}": ${s.from} → itself, use kind: 'act'`);
+  return {
+    kind: 'msg' as const,
+    lo: Math.min(a, b),
+    hi: Math.max(a, b),
+    // Two-way arrows have both heads already; `is-left` would stack them.
+    left: b < a && !s.both,
+    both: s.both ?? false,
+    dashed: s.dashed ?? false,
+    label: s.label,
+    sub: s.sub,
+    tone: s.tone ?? lanes[a].tone,
+  };
+});
+
+const alt = steps.map((s) => {
+  if (s.kind === 'phase') return `Then: ${s.label}.`;
+  if (s.kind === 'act') return `${name(s.at)}: ${s.label}${s.sub ? ` (${s.sub})` : ''}.`;
+  return `${name(s.from)} ${s.both ? '↔' : '→'} ${name(s.to)}: ${s.label}${s.sub ? ` (${s.sub})` : ''}.`;
+});
+---
+
+<figure class="arc-seq" data-pagefind-ignore style={`--lanes: ${lanes.length}`}>
+  <div class="visually-hidden">
+    <p>Sequence diagram, {title}, between {lanes.map((l) => l.label).join(', ')}:</p>
+    <ol>{alt.map((line) => <li>{line}</li>)}</ol>
+  </div>
+  <div class="arc-scroll" aria-hidden="true">
+    <div class="arc-seq-grid" style={`grid-template-rows: auto repeat(${rows.length}, auto) 18px`}>
+      <div class="arc-lifelines" style={`grid-row: 2 / ${rows.length + 3}`}>
+        {lanes.map((l) => <span data-tone={l.tone} />)}
+      </div>
+      {
+        lanes.map((l, i) => (
+          <div class="arc-lane" data-tone={l.tone} style={`grid-column: ${i + 1}`}>
+            <strong>{l.label}</strong>
+            {l.sub && <span>{l.sub}</span>}
+          </div>
+        ))
+      }
+      {
+        rows.map((r, i) => {
+          const row = i + 2;
+          if (r.kind === 'phase')
+            return (
+              <div class="arc-phase" style={`grid-row: ${row}`}>
+                <span>{r.label}</span>
+              </div>
+            );
+          if (r.kind === 'act')
+            return (
+              <div class="arc-act" data-tone={r.tone} style={`grid-row: ${row}; grid-column: ${r.at + 1}`}>
+                <span>{r.label}</span>
+                {r.sub && <small>{r.sub}</small>}
+              </div>
+            );
+          return (
+            <div
+              class:list={['arc-msg', { 'is-left': r.left, 'is-both': r.both, 'is-dashed': r.dashed }]}
+              data-tone={r.tone}
+              style={`grid-row: ${row}; grid-column: ${r.lo + 1} / ${r.hi + 2}; --span: ${r.hi - r.lo + 1}`}
+            >
+              <span class="arc-msg-label">{r.label}</span>
+              <span class="arc-msg-line" />
+              {r.sub && <small class="arc-msg-sub">{r.sub}</small>}
+            </div>
+          );
+        })
+      }
+    </div>
+  </div>
+  <figcaption class="arc-caption">{title}</figcaption>
+</figure>

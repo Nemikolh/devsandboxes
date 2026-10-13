@@ -66,5 +66,13 @@ from files elsewhere in the repo, so edit those, not the site:
 - `/docs/node-api` — generated from `../npm/devsandboxes/index.d.ts` with the
   TypeScript compiler API.
 
+Contributor architecture pages are the `architecture` collection
+(`src/content/architecture/<slug>.mdx` → `/architecture/<slug>`, index in
+`src/pages/architecture/index.astro`, layout `layouts/Architecture.astro`).
+Reached by URL only: nothing links to them, and they're outside `nav.ts`, the
+search index and the sitemap. Their diagrams are data-driven components in
+`src/components/architecture/` (`Sequence`, `States`, `HelperDiagram`); keep
+them in step with the code they describe.
+
 Every config snippet on the site must be valid: write it to a temp dir as
 `devsandboxes.toml` and run `cargo run -q -- -C <dir> ls` from the repo root.

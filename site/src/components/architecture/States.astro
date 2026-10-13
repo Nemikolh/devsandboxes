@@ -1,0 +1,73 @@
+---
+/**
+ * A vertical state machine: each state a card (left) with what holds in it
+ * (right), the arrow between two states labeled with what moves it on, and
+ * `side` exits (a transition that leaves the main path) as chips under the
+ * notes. Data-driven like `Sequence.astro`, and real text rather than a
+ * picture: the list reads in order without the drawing.
+ */
+import type { Tone } from './Sequence.astro';
+import '../../styles/architecture.css';
+
+export interface State {
+  name: string;
+  sub?: string;
+  tone: Tone;
+  notes: string[];
+  /** Exits off the main path, e.g. `lock held, socket answers → exit 0`. */
+  side?: string[];
+  /** The transition to the next state. */
+  next?: string;
+}
+
+interface Props {
+  title: string;
+  states: State[];
+}
+
+const { title, states } = Astro.props;
+// Notes are plain strings; `backticked` parts render as code.
+const parts = (note: string) => note.split('`').map((text, i) => ({ text, code: i % 2 === 1 }));
+---
+
+<figure class="arc-states" data-pagefind-ignore>
+  <ol class="arc-state-list">
+    {
+      states.map((s) => (
+        <li>
+          <div class="arc-state">
+            <div class="arc-state-card" data-tone={s.tone}>
+              <strong>{s.name}</strong>
+              {s.sub && <span>{s.sub}</span>}
+            </div>
+            <div data-tone={s.tone}>
+              <ul class="arc-state-notes">
+                {s.notes.map((n) => (
+                  <li>{parts(n).map((p) => (p.code ? <code>{p.text}</code> : p.text))}</li>
+                ))}
+              </ul>
+              {s.side && (
+                <div class="arc-state-side">
+                  {s.side.map((x) => (
+                    <span>{x}</span>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+          {s.next && (
+            <div class="arc-step">
+              <div class="arc-link arc-link--down" data-tone={s.tone}>
+                <span>
+                  <span class="visually-hidden">then, </span>
+                  {s.next}
+                </span>
+              </div>
+            </div>
+          )}
+        </li>
+      ))
+    }
+  </ol>
+  <figcaption class="arc-caption">{title}</figcaption>
+</figure>

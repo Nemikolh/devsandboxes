@@ -1,0 +1,125 @@
+---
+import { getCollection } from 'astro:content';
+import { ArrowRight } from '@lucide/astro';
+import Architecture from '../../layouts/Architecture.astro';
+
+const pages = (await getCollection('architecture')).sort((a, b) => a.data.order - b.data.order);
+
+// Every long-lived process, where it runs and what owns it: the map the
+// subpages zoom into.
+const processes = [
+  { name: 'devsandbox <cmd>', where: 'host', lives: 'one command', code: 'src/commands/' },
+  { name: 'devsandbox (dashboard)', where: 'host', lives: 'while open', code: 'src/tui/' },
+  { name: 'devsandbox serve', where: 'host, setsid', lives: 'until idle, handoff or shutdown', code: 'src/serve/' },
+  { name: 'devsbd bridge', where: 'container, exec -i', lives: 'its host process', code: 'devsbd/src/bridge.rs' },
+  { name: 'devsbd daemon', where: 'container, root', lives: 'the container, per build', code: 'devsbd/src/daemon.rs' },
+];
+---
+
+<Architecture
+  title="Architecture"
+  description="How the devsandbox CLI, its host daemon and the in-container helper fit together, one diagram per page."
+  eyebrow="CONTRIBUTORS"
+  source="site/src/pages/architecture/index.astro"
+>
+  <p>
+    devsandbox is one binary on the host and one static helper, <code>devsbd</code>, that it writes into every
+    container. Five kinds of process carry everything between them:
+  </p>
+
+  <div class="table-scroll" tabindex="0" role="region" aria-label="Table">
+    <table>
+      <thead>
+        <tr><th>process</th><th>runs</th><th>lives for</th><th>code</th></tr>
+      </thead>
+      <tbody>
+        {
+          processes.map((p) => (
+            <tr>
+              <td><code>{p.name}</code></td>
+              <td>{p.where}</td>
+              <td>{p.lives}</td>
+              <td><code>{p.code}</code></td>
+            </tr>
+          ))
+        }
+      </tbody>
+    </table>
+  </div>
+
+  <p>
+    The pages below each take one seam. They describe the code as it is; design history and the reasons behind it are
+    in <code>docs/</code> at the repo root, linked from each page.
+  </p>
+
+  <ul class="arc-index">
+    {
+      pages.map((p, i) => (
+        <li>
+          <a href={`/architecture/${p.id}`}>
+            <span class="arc-index-n">{String(i + 1).padStart(2, '0')}</span>
+            <span class="arc-index-copy">
+              <strong>{p.data.title}</strong>
+              <small>{p.data.description}</small>
+            </span>
+            <ArrowRight size={15} aria-hidden="true" />
+          </a>
+        </li>
+      ))
+    }
+  </ul>
+</Architecture>
+
+<style>
+  .prose .arc-index {
+    display: grid;
+    gap: 10px;
+    margin: 26px 0 8px;
+    padding: 0;
+    list-style: none;
+  }
+
+  .prose .arc-index li {
+    margin: 0;
+    padding: 0;
+  }
+
+  .arc-index a {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 14px 16px;
+    border: 1px solid var(--border-card);
+    border-radius: var(--radius-lg);
+    background: var(--surface);
+    color: var(--text);
+    text-decoration: none;
+  }
+
+  .arc-index a:hover {
+    border-color: var(--border-strong);
+    background: var(--surface-hover);
+  }
+
+  .arc-index-n {
+    font: 11px / 1 var(--font-mono);
+    color: var(--lime);
+  }
+
+  .arc-index-copy {
+    display: flex;
+    flex: 1;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .arc-index-copy strong {
+    font: 600 15px / 1.2 var(--font-heading);
+    color: var(--text-bright);
+  }
+
+  .arc-index-copy small {
+    font-size: 13px;
+    color: var(--text-subtle);
+  }
+</style>
