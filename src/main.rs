@@ -412,7 +412,15 @@ fn main() -> Result<()> {
             }
         }
         Command::Rebuild { name, all, force } => {
-            commands::rebuild::rebuild(&cli.dir, name, all, force)
+            let result = commands::rebuild::rebuild(&cli.dir, name, all, force);
+            // Like `start`: the rebuilt container is up, and a dispatcher /
+            // inbox instance needs a host even with no dashboard open.
+            commands::autostart::autostart(&cli.dir);
+            #[cfg(unix)]
+            if result.is_ok() {
+                serve::client::ensure_running("cli");
+            }
+            result
         }
         Command::Rename { name, new_name } => commands::rename::rename(&name, &new_name),
         Command::Rm { name, delete_branch, keep_branch, force } => {

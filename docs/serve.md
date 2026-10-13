@@ -54,7 +54,7 @@ plumbing: commands start it themselves (*lazy start*):
 Who starts it today: the dashboard (at launch, on a background thread; it
 keeps the connection open for its whole life and reconnects, starting a
 new daemon if needed, after a handoff or the daemon's death; see
-`docs/api.md`, *The dashboard as a client*), and `run` / `start` once
+`docs/api.md`, *The dashboard as a client*), and `run` / `start` / `rebuild` once
 their container is up (best effort: a failure is one `warning:` line on
 stderr, the command still succeeds; they hang up right away), and every
 command that relays the ssh-agent into a relay-mode instance (`exec`,
