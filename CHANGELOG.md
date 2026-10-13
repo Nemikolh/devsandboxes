@@ -14,6 +14,7 @@ ripgrep = true
 ### Fixed
 
 - **`git worktree prune` inside a sandbox no longer breaks the other instances' worktrees.** A container sees the repo's worktree records but not the other checkouts, so a prune (or `git gc`) there deleted their records and left each one with `fatal: not a git repository`. devsandbox now locks the worktrees it creates, so prune and gc skip them; existing instances get locked on their next `start`. Containers also get `gc.worktreePruneExpire=never` (after a rebuild for existing ones), so `git gc` leaves worktrees you made yourself alone too. Details: `docs/worktree-locking.md`.
+- **`devsandbox rebuild` starts the host daemon, like `run` and `start`.** A rebuilt dispatcher or `inbox = true` instance with no dashboard open and no daemon running had no host, so its `devsbd` control commands exited `75` until some other command started one.
 
 ## 0.7.0
 
