@@ -71,7 +71,7 @@ const processes = [
 </Architecture>
 
 <style>
-  .prose .arc-index {
+  :global(.prose) .arc-index {
     display: grid;
     gap: 10px;
     margin: 26px 0 8px;
@@ -79,7 +79,8 @@ const processes = [
     list-style: none;
   }
 
-  .prose .arc-index li {
+  :global(.prose) .arc-index li {
+    display: block;
     margin: 0;
     padding: 0;
   }

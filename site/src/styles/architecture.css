@@ -419,10 +419,25 @@
 
 .arc-helper .arc-you {
   grid-area: 2 / 2 / 3 / 3;
+  justify-self: center;
 }
 
+/* From the host column's centre, so the line starts under the centred
+   pill (opaque, above it); the labels stay in the gap between the zones
+   (cols 3-5: 12 + 116 + 12px). */
 .arc-h-install {
-  grid-area: 2 / 3 / 3 / 6;
+  grid-area: 2 / 2 / 3 / 6;
+}
+
+.arc-h-install::before {
+  left: calc((100% - 140px) / 2);
+}
+
+.arc-helper .arc-h-install > span,
+.arc-helper .arc-h-install > small {
+  left: auto;
+  right: 0;
+  width: 140px;
 }
 
 .arc-h-binary {
@@ -544,6 +559,11 @@
 
   .arc-zone-label--host {
     margin-bottom: 10px;
+  }
+
+  /* On the rail with the arrows, not centred. */
+  .arc-helper .arc-you {
+    justify-self: start;
   }
 
   .arc-helper-grid > * {
@@ -855,6 +875,22 @@
   align-items: start;
 }
 
+.arc-state-left {
+  align-self: stretch;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Left edge at 50%, like the arrow's `::before` below it (centring the
+   0-width box would put the border half a stroke to the left). */
+.arc-state-tail {
+  flex: 1;
+  align-self: flex-start;
+  margin-left: 50%;
+  width: 0;
+  border-left: 1.5px solid var(--c);
+}
+
 .arc-state-card {
   position: relative;
   z-index: 1;
@@ -960,5 +996,11 @@
   .arc-step .arc-link > span {
     left: 36px;
     max-width: calc(100% - 40px);
+  }
+
+  /* Stacked, the notes sit between the card and the arrow: the tail would
+     cut through them. */
+  .arc-state-tail {
+    display: none;
   }
 }

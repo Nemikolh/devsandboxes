@@ -36,9 +36,13 @@ const parts = (note: string) => note.split('`').map((text, i) => ({ text, code: 
       states.map((s) => (
         <li>
           <div class="arc-state">
-            <div class="arc-state-card" data-tone={s.tone}>
-              <strong>{s.name}</strong>
-              {s.sub && <span>{s.sub}</span>}
+            {/* The tail runs the next arrow's line up to the card, however tall the notes beside it are. */}
+            <div class="arc-state-left" data-tone={s.tone}>
+              <div class="arc-state-card">
+                <strong>{s.name}</strong>
+                {s.sub && <span>{s.sub}</span>}
+              </div>
+              {s.next && <span class="arc-state-tail" />}
             </div>
             <div data-tone={s.tone}>
               <ul class="arc-state-notes">
