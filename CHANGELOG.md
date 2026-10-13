@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.7.1
 
 **Critical fix: upgrade if you run more than one instance of the same repo.** A `git worktree prune` or `git gc` inside one sandbox could delete git's records of every other instance's worktree, leaving them with `fatal: not a git repository`. devsandbox now locks the worktrees it creates. After upgrading, run `devsandbox start` once on each existing instance to lock its worktree (safe on a running one), and `devsandbox rebuild` it to also get the `git gc` guard. This release also adds local-folder features and fixes a few host-daemon start and shutdown issues.
 
