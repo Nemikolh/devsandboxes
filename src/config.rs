@@ -74,6 +74,29 @@ pub struct Config {
     pub sandboxes: BTreeMap<String, Table>,
 }
 
+/// A sandbox's config as text ([`Config::sandbox_text`]): what the
+/// dashboard's config view shows, and the daemon's `sandboxes.get` answer.
+#[cfg_attr(not(unix), allow(dead_code))] // only the dashboard and daemon (unix) use it
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
+pub struct SandboxText {
+    /// `[sandbox.<name>]` as written, `extends` included.
+    pub original: String,
+    /// The merged table (`extends` resolved and dropped), or why it doesn't merge.
+    pub resolved: String,
+    /// The merged table's config hash; empty when it doesn't merge.
+    pub hash: String,
+}
+
+/// A table as TOML text for display; a table that won't serialize shows
+/// the error instead, so the view still renders something.
+#[cfg_attr(not(unix), allow(dead_code))] // only the dashboard and daemon (unix) use it
+pub fn table_text(table: &Table) -> String {
+    match toml::to_string_pretty(table) {
+        Ok(s) => s,
+        Err(e) => format!("cannot serialize config: {e}"),
+    }
+}
+
 /// The exact set of properties a sandbox accepts: the devcontainer.json
 /// schema plus the devsandbox extras (`extends`, `folder`, `services`,
 /// `caches`, `persist-shell-history`). Unknown keys are a hard error (`deny_unknown_fields`);
@@ -904,6 +927,30 @@ impl Config {
         properties.remove("extends");
         let hash = sandbox_hash(&properties);
         Ok((properties, hash))
+    }
+
+    /// Sandbox `name` as the config explorer shows it (`sandboxes.get`): its
+    /// own table and the merged one as TOML text, plus the merged one's hash.
+    /// A side that fails carries its error as the text (and no hash), so the
+    /// view still shows why.
+    #[cfg_attr(not(unix), allow(dead_code))] // only the dashboard and daemon (unix) use it
+    pub fn sandbox_text(&self, name: &str) -> SandboxText {
+        let original = match self.sandbox_table(name) {
+            Ok(t) => table_text(t),
+            Err(e) => format!("{e:#}"),
+        };
+        let (resolved, hash) = match self.resolved_table(name) {
+            Ok((t, hash)) => (table_text(&t), hash),
+            Err(e) => (format!("{e:#}"), String::new()),
+        };
+        SandboxText { original, resolved, hash }
+    }
+
+    /// The raw `[services.<name>]` table as TOML text (`services.get`; services
+    /// don't `extends`, so it's also the resolved one), `None` for an unknown one.
+    #[cfg_attr(not(unix), allow(dead_code))] // only the dashboard and daemon (unix) use it
+    pub fn service_text(&self, name: &str) -> Option<String> {
+        self.services.get(name).map(table_text)
     }
 
     /// Resolve a table's `extends` into a fully-merged table: referenced

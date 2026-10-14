@@ -656,6 +656,68 @@ export interface SandboxEntry {
   name: string;
 }
 
+/** One process of an instance, as `ps` printed it. */
+export interface ProcessRow {
+  pid: string;
+  ppid: string;
+  args: string;
+}
+
+/** One tracked run of an instance's helper (`devsbd run ls`). */
+export interface RunRow {
+  id: string;
+  /** `running`, `lost`, or with its code: `exited 4`, `killed 9`. */
+  state: string;
+  /** RFC 3339. */
+  started: string;
+  /** The command, space-joined. */
+  argv: string;
+}
+
+/** A running instance's processes and runs (`instances.procs`). */
+export interface ProcsListing {
+  processes: ProcessRow[];
+  /** The pids are the container's own, so the process can be signalled; false for the runtime's host-side `top` fallback. */
+  signalable: boolean;
+  /** Oldest first; `[]` without a helper that tracks runs. */
+  runs: RunRow[];
+}
+
+/** Why an instance has no listing: no such instance, not running, or the listing failed. */
+export interface ProcsError {
+  error: string;
+}
+
+/** One instance's `instances.procs` entry. */
+export type InstanceProcs = ProcsListing | ProcsError;
+
+/** `instances.buildLog`'s answer: the end of the instance's build log. */
+export interface BuildLogTail {
+  text: string;
+  /** Earlier lines were left out. */
+  cut: boolean;
+}
+
+/** `containers.logs`'s answer: the container's last output lines. */
+export interface ContainerLogs {
+  text: string;
+}
+
+/** `sandboxes.get`'s answer: the sandbox's config as TOML text. */
+export interface SandboxConfig {
+  /** The table as written, `extends` included. */
+  original: string;
+  /** Merged with what it `extends`, or why it doesn't merge. */
+  resolved: string;
+  /** The merged table's config hash; empty when it doesn't merge. */
+  hash: string;
+}
+
+/** `services.get`'s answer: the service's table as TOML text (services don't `extends`). */
+export interface ServiceConfig {
+  original: string;
+}
+
 /** What `forwards.rm()` stopped. */
 export interface ForwardRemoved {
   ok: true;
@@ -831,8 +893,19 @@ export interface ApiMethods {
   'instances.resolve': { params: { name: string }; result: InstancesResolved };
   /** SIGINT an in-flight `run`/`rebuild` (it rolls back or records failed); `invalid` when not in flight. */
   'instances.cancel': { params: { instance: string }; result: InstanceCancelled };
+  /** Per named instance (exact names), its processes and runs or an `error`; a per-instance failure never fails the call. */
+  'instances.procs': { params: { instances: string[] }; result: Record<string, InstanceProcs> };
+  /** `instance`: exact name or instance id; `lines` default 500, at most 10000. `null`: no build log yet. */
+  'instances.buildLog': { params: { instance: string; lines?: number }; result: BuildLogTail | null };
+  /** `devsandbox-…` containers only; `lines` default 50, at most 10000. */
+  'containers.logs': { params: { container: string; lines?: number }; result: ContainerLogs };
+  /** `devsandbox-…` containers only: the runtime's inspect JSON (docker's: an array of one object). */
+  'containers.inspect': { params: { container: string }; result: unknown };
   /** The config root's sandboxes, sorted; `[]` without a config file. */
   'sandboxes.list': { params: { root: string }; result: SandboxEntry[] };
+  /** `not-found` for an unknown sandbox; one that doesn't merge answers why in `resolved`. */
+  'sandboxes.get': { params: { root: string; name: string }; result: SandboxConfig };
+  'services.get': { params: { root: string; name: string }; result: ServiceConfig };
   'forwards.list': { params: { dir?: string }; result: ForwardRow[] };
   'forwards.add': { params: ForwardAddParams; result: ForwardAdded };
   'forwards.rm': { params: { id: number }; result: ForwardRemoved };

@@ -49,7 +49,8 @@ use crate::inbox;
 
 use app::{App, PendingSignal};
 use data::Snapshot;
-use procs::{parse_top, build_forest, ProcState};
+use crate::runtime::procs::{parse_top, run_ls};
+use procs::{build_forest, ProcState};
 use prompt::PromptAction;
 
 /// How long each `event::poll` blocks before we redraw when no terminal is open.
@@ -996,24 +997,6 @@ fn spawn_signal(sig: PendingSignal) -> Receiver<OpDone> {
         let _ = tx.send(OpDone { status, failed: false });
     });
     rx
-}
-
-/// Stdout kept from a child's `devsbd run ls` before it's given up on.
-const RUN_LS_CAP: usize = 64 * 1024;
-
-/// How long a child's `devsbd run ls` may take before it's killed.
-const RUN_LS_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// `devsbd run ls` in `container`, bounded in size and time (its output is
-/// container-controlled). `None` on any failure — no helper, one predating
-/// runs, a timeout, or output past [`RUN_LS_CAP`] (dropped whole rather than
-/// parsed cut off): the Procs view then just shows no runs.
-fn run_ls(container: &str) -> Option<String> {
-    let backend = crate::runtime::backend();
-    let mut cmd = std::process::Command::new(backend.bin());
-    cmd.args(["exec", container, crate::devsbd::BIN, "run", "ls"]).stdin(std::process::Stdio::null());
-    let out = crate::runtime::bounded::run(&mut cmd, RUN_LS_CAP, RUN_LS_TIMEOUT).ok()?;
-    (out.status.success() && !out.truncated).then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 /// Spawn one detached thread that runs the runtime's `proc_list` for each target

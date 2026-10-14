@@ -1,7 +1,8 @@
 //! Process layer for the Instances tree: the third level, showing an instance's
-//! running processes as a `ps -ef --forest`-style tree. Parsing and forest
-//! building live here as pure functions so they unit-test without docker; the
-//! fetch itself (the runtime's `proc_list`) is driven by the event loop.
+//! running processes as a `ps -ef --forest`-style tree. Forest building and
+//! row formatting live here as pure functions so they unit-test without
+//! docker; the listing's parse is `runtime::procs` (shared with the daemon's
+//! `instances.procs`), the fetch itself is driven by the event loop.
 
 /// One rendered process row, forest-ordered. `depth` drives the `\_ ` indent at
 /// render time; `pid` sits in the TREE gutter and `args` spans the rest.
@@ -62,40 +63,6 @@ pub fn is_agent(args: &str) -> bool {
             let base = tok.rsplit(['/', '\\']).next().unwrap_or(tok);
             AGENT_NAMES.iter().any(|name| base.eq_ignore_ascii_case(name))
         })
-}
-
-/// Parse `ps -eo pid,ppid,args` output into
-/// `(pid, ppid, args)` triples. The first line is a header and is skipped; each
-/// remaining line splits into pid, ppid, and the remainder as args. Lines with
-/// fewer than three whitespace-separated fields are skipped.
-pub fn parse_top(out: &str) -> Vec<(String, String, String)> {
-    out.lines()
-        .skip(1)
-        .filter_map(|line| {
-            let mut it = line.split_whitespace();
-            let pid = it.next()?;
-            let ppid = it.next()?;
-            // args = the remainder of the line after pid and ppid. Recover it
-            // from the original line so internal spacing in the command is kept.
-            let args = remainder_after(line, pid, ppid)?;
-            Some((pid.to_string(), ppid.to_string(), args.to_string()))
-        })
-        .collect()
-}
-
-/// The slice of `line` following the `pid` and `ppid` tokens, trimmed of the
-/// leading whitespace. `None` when the line doesn't actually contain both
-/// tokens in order (defensive; the caller already split them off).
-fn remainder_after<'a>(line: &'a str, pid: &str, ppid: &str) -> Option<&'a str> {
-    let after_pid = line.trim_start().strip_prefix(pid)?;
-    let after_ppid = after_pid.trim_start().strip_prefix(ppid)?;
-    let args = after_ppid.trim_start();
-    // A line with pid+ppid but no args (fewer than three fields) is skipped.
-    if args.is_empty() {
-        None
-    } else {
-        Some(args)
-    }
 }
 
 /// Build the process forest from parsed `(pid, ppid, args)` rows.
@@ -174,25 +141,21 @@ pub const RUN_PID: &str = "run";
 pub const MAX_RUN_ROWS: usize = 5;
 
 /// Rows for the last [`MAX_RUN_ROWS`] runs in `devsbd run ls` output
-/// (`<id> <state> <started> <argv…>`, oldest first), after the process
-/// forest: `run` in the gutter, the line minus its start time as args.
+/// (oldest first, `runtime::procs::parse_runs`), after the process forest:
+/// `run` in the gutter, the run minus its start time as args.
 pub fn run_rows(ls: &str) -> Vec<ProcRow> {
-    let lines: Vec<&str> = ls.lines().filter(|l| !l.trim().is_empty()).collect();
-    lines[lines.len().saturating_sub(MAX_RUN_ROWS)..]
-        .iter()
-        .map(|line| {
-            let words: Vec<&str> = line.split(' ').collect();
-            // `exited N` / `killed N` are two words, `running` / `lost` one.
-            let state_len = match words.get(1) {
-                Some(&"exited" | &"killed") => 2,
-                _ => 1,
-            };
-            let head = words.iter().take(1 + state_len);
-            let argv = words.iter().skip(2 + state_len);
-            let args: Vec<&str> = head.chain(argv).copied().collect();
-            ProcRow { pid: RUN_PID.to_string(), depth: 0, args: args.join(" ") }
-        })
-        .collect()
+    let runs = crate::runtime::procs::parse_runs(ls);
+    runs[runs.len().saturating_sub(MAX_RUN_ROWS)..].iter().map(run_row).collect()
+}
+
+/// `<id> <state> <argv…>`: the line as the helper printed it, start time left out.
+fn run_row(run: &crate::runtime::procs::Run) -> ProcRow {
+    let mut args = [run.id.as_str(), run.state.as_str()].iter().filter(|s| !s.is_empty()).copied().collect::<Vec<_>>().join(" ");
+    if !run.argv.is_empty() {
+        args.push(' ');
+        args.push_str(&run.argv);
+    }
+    ProcRow { pid: RUN_PID.to_string(), depth: 0, args }
 }
 
 #[cfg(test)]
@@ -220,30 +183,6 @@ mod tests {
         assert_eq!(rows.len(), MAX_RUN_ROWS);
         assert!(rows[0].args.starts_with("1790000003-0000"), "{:?}", rows[0]);
         assert!(run_rows("").is_empty());
-    }
-
-    #[test]
-    fn parse_top_skips_header_and_keeps_arg_spacing() {
-        let out = concat!(
-            "PID   PPID  COMMAND\n",
-            "1     0     /sbin/init\n",
-            "42    1     node   server.js  --port 3000\n",
-        );
-        let rows = parse_top(out);
-        assert_eq!(
-            rows,
-            vec![
-                ("1".into(), "0".into(), "/sbin/init".into()),
-                ("42".into(), "1".into(), "node   server.js  --port 3000".into()),
-            ],
-        );
-    }
-
-    #[test]
-    fn parse_top_skips_short_lines() {
-        let out = "PID PPID ARGS\n1 0\n2 0 sh\n";
-        let rows = parse_top(out);
-        assert_eq!(rows, vec![("2".into(), "0".into(), "sh".into())]);
     }
 
     fn row(pid: &str, ppid: &str, args: &str) -> (String, String, String) {

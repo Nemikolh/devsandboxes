@@ -768,17 +768,8 @@ impl App {
         };
         match Config::load(dir) {
             Ok(cfg) => {
-                view.original = match cfg.sandbox_table(name) {
-                    Ok(t) => to_toml(t),
-                    Err(e) => format!("{e:#}"),
-                };
-                match cfg.resolved_table(name) {
-                    Ok((t, hash)) => {
-                        view.resolved = to_toml(&t);
-                        view.hash = hash;
-                    }
-                    Err(e) => view.resolved = format!("{e:#}"),
-                }
+                let text = cfg.sandbox_text(name);
+                (view.original, view.resolved, view.hash) = (text.original, text.resolved, text.hash);
             }
             Err(e) => {
                 let msg = format!("{e:#}");
@@ -793,10 +784,7 @@ impl App {
     /// Original and resolved are identical (services do not `extends`).
     fn build_service_view(dir: &PathBuf, name: &str) -> ConfigView {
         let body = match Config::load(dir) {
-            Ok(cfg) => match cfg.services.get(name) {
-                Some(t) => to_toml(t),
-                None => format!("unknown service `{name}`"),
-            },
+            Ok(cfg) => cfg.service_text(name).unwrap_or_else(|| format!("unknown service `{name}`")),
             Err(e) => format!("{e:#}"),
         };
         ConfigView {
@@ -860,15 +848,6 @@ fn set_inspect(view: &mut ConfigView, target: Option<String>, placeholder: &str)
         Ok(out) => crate::commands::inspect::pretty_inspect(&out),
         Err(e) => format!("{e:#}"),
     };
-}
-
-/// Serialize a table for display, preferring the pretty formatter and falling
-/// back to its error text so a malformed table still renders something.
-fn to_toml(table: &toml::Table) -> String {
-    match toml::to_string_pretty(table) {
-        Ok(s) => s,
-        Err(e) => format!("cannot serialize config: {e}"),
-    }
 }
 
 #[cfg(test)]

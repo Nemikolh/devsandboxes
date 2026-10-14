@@ -74,8 +74,9 @@ pub fn remove(instance_id: &str) {
 /// on the dashboard's thread.
 const TAIL_BYTES: u64 = 256 * 1024;
 
-/// The end of a build log, for the dashboard's build-log modal.
-#[derive(Debug, PartialEq, Eq)]
+/// The end of a build log, for the dashboard's build-log modal (and the
+/// daemon's `instances.buildLog` answer).
+#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Tail {
     pub text: String,
     /// Earlier lines were left out.
@@ -85,7 +86,18 @@ pub struct Tail {
 /// The last `lines` lines of `instance_id`'s build log; `None` when it has
 /// none (an instance from before build logs, or one never built since).
 pub fn tail(instance_id: &str, lines: usize) -> Result<Option<Tail>> {
-    let path = path(instance_id)?;
+    tail_at(&path(instance_id)?, lines)
+}
+
+/// [`tail`] of the log under data dir `data` (the dir holding `state.toml`):
+/// the daemon reads an injected state path, so its tests never touch the
+/// user's logs.
+#[cfg_attr(not(unix), allow(dead_code))] // only the daemon (unix) uses it
+pub fn tail_in(data: &Path, instance_id: &str, lines: usize) -> Result<Option<Tail>> {
+    tail_at(&dir_in(data, instance_id).join(FILE), lines)
+}
+
+fn tail_at(path: &Path, lines: usize) -> Result<Option<Tail>> {
     let mut file = match File::open(&path) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),

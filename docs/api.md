@@ -74,7 +74,7 @@ absent otherwise (`confirm` included).
 
 | code | |
 |---|---|
-| `not-found` | the thread, action, directory, instance or forward named doesn't exist |
+| `not-found` | the thread, action, directory, instance, sandbox, service or forward named doesn't exist |
 | `invalid` | bad params (missing, wrong type, unknown value), or an op that makes no sense for its target |
 | `unknown-method` | no such method on this daemon |
 | `denied` | the target refuses it (an archived thread is read-only; a thread that takes no replies) |
@@ -270,6 +270,74 @@ its own request answers once it has.
 Errors: `not-found` (no such instance), `invalid` (not building any more:
 ready, failed, or its process is gone), `internal` (the signal failed).
 
+### `instances.procs`
+
+Params: `{"instances": ["web", "api-2"]}`, exact instance names. Result:
+an object keyed by each name, its container (from `state.toml`) listed
+then:
+
+```json
+{
+  "web": {
+    "processes": [{"pid": "1", "ppid": "0", "args": "sleep infinity"}],
+    "signalable": true,
+    "runs": [{"id": "1790000000-a1b2", "state": "exited 4", "started": "2026-09-21T14:13:20Z", "argv": "sh -c make"}]
+  },
+  "api-2": {"error": "not running"}
+}
+```
+
+`processes` is `ps -eo pid,ppid,args` in the container, strings as printed.
+`signalable`: the pids are the container's own; `false` when the image has
+no `ps` and the runtime's host-side `top` listed it instead (host pids,
+which can't be signalled from inside). `runs` are the helper's tracked runs
+(`devsbd run ls`, docs/automations.md), oldest first: `state` is `running`,
+`lost`, `exited <code>` or `killed <signal>`; `[]` without a helper that
+tracks runs. An instance that isn't in `state.toml`, isn't running, or
+whose listing failed is an `{"error": "…"}` entry, never a failed call.
+One `exec` per instance (two with runs): seconds on a busy machine.
+
+Errors: `invalid` (no `instances`), `internal` (`state.toml` doesn't
+read).
+
+### `instances.buildLog`
+
+Params: `{"instance": "<name or id>", "lines": 500}`: an exact instance
+name or `instance_id`; `lines` optional (500, at most 10000). Result: the
+end of its build log (`devsandbox logs --build`, docs/instance-phase.md),
+`{"text": "…", "cut": false}`, `cut` when earlier lines were left out;
+`null` when it has none yet. A cancelled `run` drops its record, so its
+log is then `not-found`.
+
+Errors: `not-found` (no such instance), `invalid` (no `instance`, a
+negative `lines`), `internal` (the log or `state.toml` doesn't read).
+
+## Containers
+
+Only devsandbox's own containers (names starting `devsandbox-`, instances
+and services alike): the API is no generic runtime proxy. A runtime error
+is `internal` with the runtime's message, a missing container included:
+the runtimes' messages don't tell it apart from a runtime that's down
+reliably enough for `not-found`.
+
+### `containers.logs`
+
+Params: `{"container": "devsandbox-web", "lines": 50}`, `lines` optional
+(50, at most 10000). Result: `{"text": "…"}`, its last lines of stdout
+and stderr.
+
+Errors: `invalid` (no `container`, not a `devsandbox-` one, a negative
+`lines`), `internal` (the runtime failed).
+
+### `containers.inspect`
+
+Params: `{"container": "devsandbox-web"}`. Result: the runtime's inspect
+JSON, parsed (docker and podman: an array of one object; Apple's
+`container`: its own shape).
+
+Errors: `invalid` (as `containers.logs`), `internal` (the runtime failed,
+or its output isn't JSON).
+
 ## Sandboxes
 
 ### `sandboxes.list`
@@ -280,6 +348,33 @@ be added). A root without a config file has none: `[]`.
 
 Errors: `invalid` (missing or relative `root`, or a config that doesn't
 load: the message says why), `not-found` (no such directory).
+
+### `sandboxes.get`
+
+Params: `{"root": "/abs/path/to/config-root", "name": "web"}`. Result:
+the sandbox's config as TOML text, what the dashboard's config view shows:
+
+```json
+{"original": "extends = [\"base\"]\n…", "resolved": "image = \"alpine\"\n…", "hash": "…"}
+```
+
+`original` is `[sandbox.<name>]` as written, `extends` included;
+`resolved` the table merged with what it `extends` (the drift check's
+input) and `hash` its config hash. A sandbox that doesn't merge (an
+`extends` naming no template, a cycle) still answers: `resolved` says why,
+`hash` is `""`.
+
+Errors: `invalid` (as `sandboxes.list`, or no `name`), `not-found` (no
+such directory, or no such sandbox: a root without a config file has
+none).
+
+### `services.get`
+
+Params: `{"root": "/abs/path/to/config-root", "name": "db"}`. Result:
+`{"original": "…"}`, `[services.<name>]` as TOML text (services don't
+`extends`, so it's also what runs).
+
+Errors: as `sandboxes.get`, `not-found` for no such service.
 
 ## Bridges
 

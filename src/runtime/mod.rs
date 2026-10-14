@@ -9,6 +9,9 @@
 mod apple;
 pub mod bounded;
 mod dockerlike;
+// Only the daemon and the dashboard list processes (both unix-only).
+#[cfg(unix)]
+pub mod procs;
 
 #[cfg(test)]
 pub use apple::AppleContainer;

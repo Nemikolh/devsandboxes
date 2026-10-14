@@ -108,7 +108,17 @@ pub fn call(method: &str, params: Value, ctx: &Ctx) -> Answer {
         "instances.cancel" => {
             instances_cancel(parse(params)?, &state_path()?, crate::commands::run::cancel::interrupt)
         }
+        "instances.procs" => instances_procs(parse(params)?, &state_path()?, fetch_procs),
+        "instances.buildLog" => instances_build_log(parse(params)?, &state_path()?),
+        "containers.logs" => {
+            containers_logs(parse(params)?, |c, n| crate::runtime::backend().logs_tail(c, n).map_err(ApiError::internal))
+        }
+        "containers.inspect" => {
+            containers_inspect(parse(params)?, |c| crate::runtime::backend().inspect_json(c).map_err(ApiError::internal))
+        }
         "sandboxes.list" => sandboxes_list(parse(params)?),
+        "sandboxes.get" => sandboxes_get(parse(params)?),
+        "services.get" => services_get(parse(params)?),
         "bridges.ensure" => bridges_ensure(parse(params)?, ctx),
         "forwards.list" => forwards_list(parse(params)?, ctx),
         "forwards.add" => forwards_add(parse(params)?, ctx),
@@ -451,22 +461,220 @@ struct SandboxesParams {
 /// sandboxes (the CLI then offers the example config); one that doesn't
 /// load is `invalid`, with why.
 fn sandboxes_list(p: SandboxesParams) -> Answer {
-    if !p.root.is_absolute() {
-        return Err(ApiError::invalid(format!("`root` must be absolute, got `{}`", p.root.display())));
-    }
-    if !p.root.is_dir() {
-        return Err(ApiError::not_found(format!("no directory {}", p.root.display())));
-    }
-    let rows: Vec<SandboxEntry> = match crate::config::find(&p.root) {
-        Ok(None) => Vec::new(),
-        Ok(Some(_)) => {
-            let config = crate::config::Config::load(&p.root).map_err(|e| ApiError::invalid(format!("{e:#}")))?;
-            // A BTreeMap: already sorted.
-            config.sandboxes.into_keys().map(|name| SandboxEntry { name }).collect()
-        }
-        Err(e) => return Err(ApiError::invalid(format!("{e:#}"))),
+    let rows: Vec<SandboxEntry> = match config_at(&p.root)? {
+        None => Vec::new(),
+        // A BTreeMap: already sorted.
+        Some(config) => config.sandboxes.into_keys().map(|name| SandboxEntry { name }).collect(),
     };
     serde_json::to_value(rows).map_err(|e| ApiError::internal(e.into()))
+}
+
+/// Config root `root`'s config, `None` when it has no config file. Errors:
+/// `invalid` (relative root, a config that doesn't load), `not-found` (no
+/// such directory).
+fn config_at(root: &Path) -> Result<Option<crate::config::Config>, ApiError> {
+    if !root.is_absolute() {
+        return Err(ApiError::invalid(format!("`root` must be absolute, got `{}`", root.display())));
+    }
+    if !root.is_dir() {
+        return Err(ApiError::not_found(format!("no directory {}", root.display())));
+    }
+    match crate::config::find(root) {
+        Ok(None) => Ok(None),
+        Ok(Some(_)) => crate::config::Config::load(root).map(Some).map_err(|e| ApiError::invalid(format!("{e:#}"))),
+        Err(e) => Err(ApiError::invalid(format!("{e:#}"))),
+    }
+}
+
+#[derive(Deserialize)]
+struct ConfigEntryParams {
+    root: PathBuf,
+    name: String,
+}
+
+/// Sandbox `name` of config root `root` as TOML text: as written, merged,
+/// and the merged table's hash. One that doesn't merge (a bad `extends`)
+/// still answers, with why in `resolved` and no hash, as the view shows it.
+/// The answer is a [`SandboxText`](crate::config::SandboxText).
+fn sandboxes_get(p: ConfigEntryParams) -> Answer {
+    let config = config_at(&p.root)?.unwrap_or_default();
+    if !config.sandboxes.contains_key(&p.name) {
+        return Err(ApiError::not_found(format!("no sandbox `{}` in {}", p.name, p.root.display())));
+    }
+    serde_json::to_value(config.sandbox_text(&p.name)).map_err(|e| ApiError::internal(e.into()))
+}
+
+/// `services.get`'s answer. Services don't `extends`: as written is resolved.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ServiceConfig {
+    pub original: String,
+}
+
+fn services_get(p: ConfigEntryParams) -> Answer {
+    let config = config_at(&p.root)?.unwrap_or_default();
+    let original = config
+        .service_text(&p.name)
+        .ok_or_else(|| ApiError::not_found(format!("no service `{}` in {}", p.name, p.root.display())))?;
+    serde_json::to_value(ServiceConfig { original }).map_err(|e| ApiError::internal(e.into()))
+}
+
+/// Most lines `containers.logs` / `instances.buildLog` answer; more is capped.
+pub const MAX_LINES: usize = 10_000;
+
+/// Lines answered when a request names none: what the dashboard's modals show.
+const DEFAULT_LOG_LINES: usize = 50;
+const DEFAULT_BUILD_LOG_LINES: usize = 500;
+
+#[derive(Deserialize)]
+struct ProcsParams {
+    instances: Vec<String>,
+}
+
+/// One process of an `instances.procs` listing. Strings as `ps` printed
+/// them: the runtime's `top` fallback isn't guaranteed numeric.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Process {
+    pub pid: String,
+    pub ppid: String,
+    pub args: String,
+}
+
+/// A running instance's processes and its helper's runs.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcsListing {
+    pub processes: Vec<Process>,
+    /// The pids are container-namespace (`exec ps`), so `instances.signal`
+    /// can target them; false for the runtime's host-side `top` fallback.
+    pub signalable: bool,
+    /// Oldest first; none when the helper is missing or predates runs.
+    pub runs: Vec<crate::runtime::procs::Run>,
+}
+
+/// One instance's entry in `instances.procs`: its listing, or why there's
+/// none (no such instance, not running, the listing failed).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum InstanceProcs {
+    Listed(ProcsListing),
+    Failed { error: String },
+}
+
+/// `instances.procs`'s answer, keyed by instance name.
+pub type ProcsAnswer = std::collections::BTreeMap<String, InstanceProcs>;
+
+/// Each named instance's processes, one entry per name: a per-instance
+/// failure is its entry's `error`, never the call's, so one stopped
+/// instance doesn't hide the others. Containers from `state` (injected for
+/// the tests, as is `fetch`, the per-container listing).
+fn instances_procs(
+    p: ProcsParams,
+    state: &Path,
+    fetch: impl Fn(&str) -> Result<ProcsListing, String>,
+) -> Answer {
+    let state = load_state(state)?;
+    let answer: ProcsAnswer = p
+        .instances
+        .into_iter()
+        .map(|name| {
+            let entry = match state.instances.get(&name) {
+                None => Err(format!("no instance `{name}`")),
+                Some(instance) => fetch(&instance.container),
+            };
+            let entry = entry.map_or_else(|error| InstanceProcs::Failed { error }, InstanceProcs::Listed);
+            (name, entry)
+        })
+        .collect();
+    serde_json::to_value(answer).map_err(|e| ApiError::internal(e.into()))
+}
+
+/// `container`'s listing from the runtime: `ps` in it (or `top` outside),
+/// then its helper's runs. A stopped container says so rather than
+/// quoting the runtime's exec error.
+fn fetch_procs(container: &str) -> Result<ProcsListing, String> {
+    use crate::runtime::procs::{parse_runs, parse_top, run_ls};
+    let backend = crate::runtime::backend();
+    if let Ok(Some(false)) = backend.is_running(container) {
+        return Err("not running".to_string());
+    }
+    let list = backend.proc_list(container).map_err(|e| format!("{e:#}"))?;
+    let processes =
+        parse_top(&list.text).into_iter().map(|(pid, ppid, args)| Process { pid, ppid, args }).collect();
+    let runs = run_ls(container).map(|text| parse_runs(&text)).unwrap_or_default();
+    Ok(ProcsListing { processes, signalable: list.container_pids, runs })
+}
+
+#[derive(Deserialize)]
+struct BuildLogParams {
+    instance: String,
+    #[serde(default)]
+    lines: Option<usize>,
+}
+
+/// The end of an instance's build log (`build_log::tail`): `{text, cut}`,
+/// or `null` when it has none yet. `instance` is an exact name or
+/// instance id in `state` (injected for the tests; the logs live next to
+/// it); a cancelled `run` drops its record, and its log is `not-found` then.
+fn instances_build_log(p: BuildLogParams, state: &Path) -> Answer {
+    let s = load_state(state)?;
+    let id = match s.instances.get(&p.instance) {
+        Some(instance) => &instance.instance_id,
+        None => s
+            .instances
+            .values()
+            .map(|i| &i.instance_id)
+            .find(|id| **id == p.instance)
+            .ok_or_else(|| ApiError::not_found(format!("no instance `{}`", p.instance)))?,
+    };
+    let lines = p.lines.unwrap_or(DEFAULT_BUILD_LOG_LINES).min(MAX_LINES);
+    let data = state.parent().unwrap_or(Path::new("."));
+    let tail = crate::build_log::tail_in(data, id, lines).map_err(ApiError::internal)?;
+    serde_json::to_value(tail).map_err(|e| ApiError::internal(e.into()))
+}
+
+#[derive(Deserialize)]
+struct ContainerParams {
+    container: String,
+    #[serde(default)]
+    lines: Option<usize>,
+}
+
+/// `containers.*` act on devsandbox's own containers only, so the API is
+/// no generic runtime proxy.
+fn own_container(container: &str) -> Result<(), ApiError> {
+    if container.starts_with(crate::runtime::NAME_PREFIX) {
+        Ok(())
+    } else {
+        let prefix = crate::runtime::NAME_PREFIX;
+        Err(ApiError::invalid(format!("`{container}` is not a devsandbox container (`{prefix}…`)")))
+    }
+}
+
+/// `containers.logs`'s answer.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ContainerLogs {
+    pub text: String,
+}
+
+/// The last `lines` lines of a container's output. `logs` is the runtime
+/// (injected for the tests); its errors are `internal` with the runtime's
+/// message, a missing container included: the runtimes don't tell "no
+/// such container" apart from a runtime that's down reliably enough to
+/// answer `not-found`.
+fn containers_logs(p: ContainerParams, logs: impl FnOnce(&str, usize) -> Result<String, ApiError>) -> Answer {
+    own_container(&p.container)?;
+    let lines = p.lines.unwrap_or(DEFAULT_LOG_LINES).min(MAX_LINES);
+    let text = logs(&p.container, lines)?;
+    serde_json::to_value(ContainerLogs { text }).map_err(|e| ApiError::internal(e.into()))
+}
+
+/// The runtime's inspect JSON for a container, parsed (docker's is an
+/// array of one object; Apple's `container` its own shape). Output that
+/// isn't JSON is `internal`; runtime errors as [`containers_logs`].
+fn containers_inspect(p: ContainerParams, inspect: impl FnOnce(&str) -> Result<String, ApiError>) -> Answer {
+    own_container(&p.container)?;
+    let raw = inspect(&p.container)?;
+    serde_json::from_str(&raw)
+        .map_err(|e| ApiError::internal(anyhow::anyhow!("`{}`'s inspect output isn't JSON: {e}", p.container)))
 }
 
 #[derive(Deserialize)]
@@ -1201,10 +1409,192 @@ mod tests {
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 
+    fn listing(pid: &str) -> ProcsListing {
+        ProcsListing {
+            processes: vec![Process { pid: pid.into(), ppid: "0".into(), args: "sleep 9".into() }],
+            signalable: true,
+            runs: vec![crate::runtime::procs::Run {
+                id: "1790000000-a1b2".into(),
+                state: "exited 4".into(),
+                started: "2026-09-21T14:13:20Z".into(),
+                argv: "sh -c x".into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn instances_procs_answers_every_instance_failures_included() {
+        let state = state_file("procs", &[instance("web", "web", ""), instance("off", "web", "")].concat());
+        let fetch = |container: &str| match container {
+            "devsandbox-web" => Ok(listing("1")),
+            _ => Err("not running".to_string()),
+        };
+        let procs = |params: Value| instances_procs(parse(params)?, &state, fetch);
+        let r = procs(json!({"instances": ["web", "off", "nope", "web"]})).unwrap();
+        assert_eq!(
+            r,
+            json!({
+                "web": {
+                    "processes": [{"pid": "1", "ppid": "0", "args": "sleep 9"}],
+                    "signalable": true,
+                    "runs": [{"id": "1790000000-a1b2", "state": "exited 4", "started": "2026-09-21T14:13:20Z", "argv": "sh -c x"}],
+                },
+                "off": {"error": "not running"},
+                "nope": {"error": "no instance `nope`"},
+            })
+        );
+        // What the dashboard will parse it back into.
+        let back: ProcsAnswer = serde_json::from_value(r).unwrap();
+        assert_eq!(back["web"], InstanceProcs::Listed(listing("1")));
+        assert_eq!(back["off"], InstanceProcs::Failed { error: "not running".into() });
+        assert_eq!(procs(json!({"instances": []})).unwrap(), json!({}));
+        assert_eq!(code(procs(json!({}))), "invalid");
+        // An unreadable state fails the call: no entry could be right.
+        std::fs::write(&state, "not = [toml").unwrap();
+        assert_eq!(code(procs(json!({"instances": ["web"]}))), "internal");
+    }
+
+    #[test]
+    fn instances_build_log_reads_by_name_or_id_next_to_the_state() {
+        let state = state_file(
+            "buildlog",
+            &[instance("web", "web", "instance_id = \"web-id\"\n"), instance("new", "web", "instance_id = \"new-id\"\n")].concat(),
+        );
+        let log = state.with_file_name("logs").join("web-id");
+        std::fs::create_dir_all(&log).unwrap();
+        std::fs::write(log.join(crate::build_log::FILE), "one\ntwo\nthree\n").unwrap();
+        let read = |params: Value| instances_build_log(parse(params)?, &state);
+        assert_eq!(read(json!({"instance": "web"})).unwrap(), json!({"text": "one\ntwo\nthree", "cut": false}));
+        assert_eq!(read(json!({"instance": "web-id", "lines": 2})).unwrap(), json!({"text": "two\nthree", "cut": true}));
+        assert_eq!(read(json!({"instance": "new"})).unwrap(), Value::Null, "no log yet");
+        assert_eq!(code(read(json!({"instance": "gone"}))), "not-found");
+        assert_eq!(code(read(json!({"instance": "web", "lines": -1}))), "invalid");
+        assert_eq!(code(read(json!({}))), "invalid");
+    }
+
+    #[test]
+    fn containers_methods_take_only_devsandbox_containers() {
+        let asked = std::cell::RefCell::new(Vec::new());
+        let logs = |params: Value| {
+            containers_logs(parse(params)?, |c, n| {
+                asked.borrow_mut().push((c.to_string(), n));
+                Ok("hello\n".to_string())
+            })
+        };
+        assert_eq!(logs(json!({"container": "devsandbox-web"})).unwrap(), json!({"text": "hello\n"}));
+        logs(json!({"container": "devsandbox-web", "lines": 5})).unwrap();
+        logs(json!({"container": "devsandbox-web", "lines": 1_000_000})).unwrap();
+        assert_eq!(
+            *asked.borrow(),
+            [("devsandbox-web".to_string(), 50), ("devsandbox-web".to_string(), 5), ("devsandbox-web".to_string(), MAX_LINES)]
+        );
+        for bad in [json!({"container": "postgres"}), json!({"container": "x-devsandbox-web"}), json!({}), json!({"container": "devsandbox-web", "lines": "all"})] {
+            assert_eq!(code(logs(bad.clone())), "invalid", "{bad}");
+        }
+        assert_eq!(asked.borrow().len(), 3, "refused before the runtime");
+        let failing = containers_logs(parse(json!({"container": "devsandbox-x"})).unwrap(), |_, _| {
+            Err(ApiError::internal(anyhow::anyhow!("No such container: devsandbox-x")))
+        });
+        assert_eq!(failing.unwrap_err().message, "No such container: devsandbox-x");
+
+        let inspect = |container: &str, out: &'static str| {
+            containers_inspect(parse(json!({"container": container}))?, |_| Ok(out.to_string()))
+        };
+        assert_eq!(inspect("devsandbox-web", r#"[{"Id": "abc"}]"#).unwrap(), json!([{"Id": "abc"}]));
+        assert_eq!(code(inspect("devsandbox-web", "not json")), "internal");
+        assert_eq!(code(inspect("web", "[]")), "invalid");
+    }
+
+    #[test]
+    fn sandboxes_get_and_services_get_answer_the_config_text() {
+        let root = store_path("config-get").with_file_name("cfg");
+        std::fs::create_dir_all(&root).unwrap();
+        let get = |method: &str, name: &str| run(&root.join("x"), method, json!({"root": root, "name": name}));
+        assert_eq!(code(get("sandboxes.get", "web")), "not-found", "no config file: no sandbox");
+        assert_eq!(code(get("services.get", "db")), "not-found");
+        std::fs::write(
+            root.join(crate::config::CONFIG_FILE),
+            "[template.base]\nimage = \"alpine\"\n[sandbox.web]\nextends = [\"base\"]\nfolder = \"/w\"\n\
+             [sandbox.broken]\nextends = [\"missing\"]\n[services.db]\nimage = \"postgres\"\n",
+        )
+        .unwrap();
+        let web = get("sandboxes.get", "web").unwrap();
+        assert_eq!(web["original"], "extends = [\"base\"]\nfolder = \"/w\"\n");
+        assert_eq!(web["resolved"], "folder = \"/w\"\nimage = \"alpine\"\n");
+        let cfg = crate::config::Config::load(&root).unwrap();
+        assert_eq!(web["hash"], cfg.resolved_table("web").unwrap().1);
+        let back: crate::config::SandboxText = serde_json::from_value(web).unwrap();
+        assert_eq!(back, cfg.sandbox_text("web"));
+        // One that doesn't merge still answers, with why.
+        let broken = get("sandboxes.get", "broken").unwrap();
+        assert!(broken["resolved"].as_str().unwrap().contains("missing"), "{broken}");
+        assert_eq!(broken["hash"], "");
+        assert_eq!(code(get("sandboxes.get", "nope")), "not-found");
+        assert_eq!(get("services.get", "db").unwrap(), json!({"original": "image = \"postgres\"\n"}));
+        assert_eq!(code(get("services.get", "web")), "not-found", "a sandbox isn't a service");
+        // Root checks as `sandboxes.list`.
+        assert_eq!(code(run(&root, "sandboxes.get", json!({"root": "rel", "name": "web"}))), "invalid");
+        assert_eq!(code(run(&root, "services.get", json!({"root": "/nonexistent/devsandbox-api", "name": "db"}))), "not-found");
+        assert_eq!(code(run(&root, "sandboxes.get", json!({"root": root}))), "invalid");
+        std::fs::write(root.join(crate::config::CONFIG_FILE), "[sandbox.web\n").unwrap();
+        assert_eq!(code(get("sandboxes.get", "web")), "invalid");
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    /// Against a real throwaway container: its logs, its inspect JSON, and
+    /// its processes through the production fetch (no helper: no runs).
+    #[test_utils::docker_test]
+    fn containers_and_procs_against_docker() -> Result<(), &'static str> {
+        use std::process::Command;
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let name = format!("devsandbox-api-test-{stamp}");
+        let cleanup = || {
+            let _ = Command::new("docker").args(["rm", "-f", &name]).output();
+        };
+        crate::test_support::with_cleanup(cleanup, || {
+            let up = Command::new("docker")
+                .args(["run", "-d", "--name", &name, "alpine:3.20", "sh", "-c", "echo hello-api; exec sleep 300"])
+                .output();
+            if !matches!(up, Ok(o) if o.status.success()) {
+                return Err("docker run alpine:3.20 failed");
+            }
+            let backend = crate::runtime::backend();
+            let mut text = String::new();
+            for _ in 0..50 {
+                let r = containers_logs(parse(json!({"container": name})).unwrap(), |c, n| {
+                    backend.logs_tail(c, n).map_err(ApiError::internal)
+                })
+                .unwrap();
+                text = r["text"].as_str().unwrap().to_string();
+                if text.contains("hello-api") {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            assert!(text.contains("hello-api"), "{text:?}");
+            let inspected = containers_inspect(parse(json!({"container": name})).unwrap(), |c| {
+                backend.inspect_json(c).map_err(ApiError::internal)
+            })
+            .unwrap();
+            assert_eq!(inspected[0]["Name"], format!("/{name}"));
+            let listing = fetch_procs(&name).unwrap();
+            assert!(listing.signalable);
+            assert!(listing.processes.iter().any(|p| p.args == "sleep 300"), "{listing:?}");
+            assert!(listing.runs.is_empty());
+            let missing = containers_inspect(parse(json!({"container": format!("{name}-gone")})).unwrap(), |c| {
+                backend.inspect_json(c).map_err(ApiError::internal)
+            });
+            assert_eq!(code(missing), "internal");
+            Command::new("docker").args(["stop", "-t", "0", &name]).output().map_err(|_| "docker stop failed")?;
+            assert_eq!(fetch_procs(&name).unwrap_err(), "not running");
+            Ok(())
+        })
+    }
+
     /// The resolve / cancel / sandboxes answers match `index.d.ts`.
     #[test]
     fn npm_typings_match_the_instance_and_sandbox_answers() {
-        use crate::serve::dts::{assert_matches, prop_type};
+        use crate::serve::dts::{assert_matches, prop_type, union_members};
         fn v(x: &impl Serialize) -> Value {
             serde_json::to_value(x).unwrap()
         }
@@ -1216,11 +1606,27 @@ mod tests {
         let cfg = crate::config::Config::parse("[sandbox.web]\nimage = \"alpine\"\n").unwrap();
         let (rows, _) = crate::snapshot::sandbox_rows(&std::env::temp_dir(), &cfg);
         assert_matches("SandboxRow", &v(&rows[0]));
+        let listed = listing("1");
+        assert_matches("ProcsListing", &v(&listed));
+        assert_matches("ProcessRow", &v(&listed.processes[0]));
+        assert_matches("RunRow", &v(&listed.runs[0]));
+        assert_matches("ProcsError", &v(&InstanceProcs::Failed { error: "not running".into() }));
+        assert_eq!(union_members("InstanceProcs"), ["ProcsListing", "ProcsError"]);
+        assert_matches("BuildLogTail", &v(&crate::build_log::Tail { text: "t".into(), cut: false }));
+        assert_matches("ContainerLogs", &v(&ContainerLogs { text: "t".into() }));
+        assert_matches("SandboxConfig", &v(&cfg.sandbox_text("web")));
+        assert_matches("ServiceConfig", &v(&ServiceConfig { original: "t".into() }));
         for (method, result) in [
             ("instances.list", "InstancesList"),
             ("instances.resolve", "InstancesResolved"),
             ("instances.cancel", "InstanceCancelled"),
+            ("instances.procs", "Record<string, InstanceProcs>"),
+            ("instances.buildLog", "BuildLogTail | null"),
+            ("containers.logs", "ContainerLogs"),
+            ("containers.inspect", "unknown"),
             ("sandboxes.list", "SandboxEntry[]"),
+            ("sandboxes.get", "SandboxConfig"),
+            ("services.get", "ServiceConfig"),
         ] {
             let ty = prop_type("ApiMethods", method).unwrap_or_else(|| panic!("ApiMethods lacks `{method}`"));
             assert!(ty.contains(&format!("result: {result} ")), "{method}: {ty}");
