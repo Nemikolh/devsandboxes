@@ -170,8 +170,9 @@ fn in_process(verb: &CliVerb, why: String) -> Done {
 
 /// The request env: this process's whole env (`${localEnv:…}`,
 /// `SSH_AUTH_SOCK`, `PATH`, … must be the caller's, never the daemon's).
-/// A non-UTF-8 var can't go on the wire and is left out.
-fn caller_env(vars: impl IntoIterator<Item = (OsString, OsString)>) -> BTreeMap<String, String> {
+/// A non-UTF-8 var can't go on the wire and is left out. The dashboard sends
+/// its own the same way.
+pub(crate) fn caller_env(vars: impl IntoIterator<Item = (OsString, OsString)>) -> BTreeMap<String, String> {
     vars.into_iter().filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?))).collect()
 }
 

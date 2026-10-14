@@ -154,9 +154,10 @@ and error in Detail, and offers retry (`s` rebuilds it) and remove (`d`).
 `d` on an in-flight row asks to cancel its build instead. The status column
 is the only progress UI.
 
-Until verbs are requests, the dashboard runs `run`, `rebuild` and `start`
-as detached `devsandbox` processes (own session, stdio null), so they
-outlive it, with a one-line status when one starts and when it ends.
+The dashboard sends `run`, `rebuild` and `start` to the daemon as detached
+verb requests (`docs/api.md`, *The dashboard as a client*), so they outlive
+it, with a one-line status when one is registered; `d` cancels through the
+daemon (`instances.cancel`).
 
 ## Failure
 
@@ -167,7 +168,7 @@ outlive it, with a one-line status when one starts and when it ends.
   row and build log with it.
 - **Cancel is the only rollback** (Ctrl-C or SIGTERM in-process; later
   hang-up or `cancel`, the daemon sending SIGINT to the verb's process
-  group, as the dashboard's `d` does now). A cancelled `run` undoes
+  group; the dashboard's `d` is `instances.cancel`). A cancelled `run` undoes
   everything recorded: container, per-instance services/network, volumes,
   `folders` worktrees, the worktree, the branch if it created it and it has
   no commits beyond its start point, then the record and its build log. A

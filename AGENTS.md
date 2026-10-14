@@ -131,7 +131,9 @@ git worktrees so working trees are never shared.
   `inbox.changed`/`instances.changed`/`inbox.shown`, sends Inbox `Op`s as
   API calls while connected (else the loop applies them locally), and is
   the Ports tab's client (`forwards.list` on `forwards.changed`,
-  `forwards.add`/`rm`; the daemon owns the forwards).
+  `forwards.add`/`rm`; the daemon owns the forwards), and sends `d`'s
+  `instances.cancel`. The dashboard's `run`/`rebuild`/`start` are detached
+  verb requests on their own connections (`spawn_verb` in `tui/mod.rs`).
   Mouse selection (`docs/tui-selection.md`): `select.rs` is the pure model
   (extraction, highlight), `app/selection.rs` its routing, `clipboard.rs` the
   OSC 52 writer; `settings.rs` the dashboard settings (`dashboard.toml` next

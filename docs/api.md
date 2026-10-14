@@ -432,7 +432,9 @@ the answer; the client may hang up or send more requests.
 
 **Hang-up = cancel**: a client that hangs up before the answer gets its
 verb SIGINTed, process group included; `run` and `rebuild` then roll back
-or record the instance failed (`docs/instance-phase.md`). A client that
+or record the instance failed (`docs/instance-phase.md`). Not a `detach`
+request: its verb runs on whenever the client leaves (cancel it with
+`instances.cancel` once it's registered). A client that
 stops reading for 5 s is disconnected as usual, but its verb runs on (a
 paused pager isn't a cancel). So does a daemon exit (idle, handoff,
 `shutdown`): the connection closes without an answer, the verb runs on.
@@ -555,7 +557,14 @@ relay-mode instance sends `bridges.ensure` with the dashboard's
 after every reconnect; `p` / `:port` is `forwards.add`, `d` is
 `forwards.rm`, `forwards.status` its status line. While disconnected the
 tab is empty and an add says the daemon is needed. Two dashboards share one
-daemon, and the same forwards.
+daemon, and the same forwards. Its `run`, `rebuild` and `start` are verb
+requests (*Verbs*), always `detach`, with its absolute config root and its
+own env, each on a connection of its own (it's held until the answer);
+their `output` is dropped (the build log has it), the answer is its status
+line, and the row's phase shows the rest. `d` on an in-flight row is
+`instances.cancel` on the long-lived connection. Without a daemon neither
+has a fallback: the status line says it's needed. `rm` and `stop` still
+run in its own process, suspended.
 
 ## The CLI as a client
 

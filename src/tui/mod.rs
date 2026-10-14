@@ -241,8 +241,8 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
     // Background done-flag writes (`d`/`u`, a thread's child); the `bool` is
     // `PendingDone::report`.
     let mut dones: Vec<(bool, Receiver<OpDone>)> = Vec::new();
-    // Detached `run`/`rebuild`/`start` children (waited on by a thread each,
-    // which reports the exit) and build cancels: report and resnapshot.
+    // `run`/`rebuild`/`start` requests to the daemon, a thread each until
+    // the detached answer (`spawn_verb`): report and resnapshot.
     let mut builds: Vec<Receiver<OpDone>> = Vec::new();
     let mut last_tick = Instant::now();
     // At most one process fetch in flight; `Some` while one is running.
@@ -332,21 +332,17 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
         }
 
         // A prompt command is ready: suspend the TUI (or, for `code`, launch
-        // it in the background; for `run`/`rebuild`/`start`, spawn it
-        // detached), then force a redraw + immediate refresh on return.
+        // it in the background; for `run`/`rebuild`/`start`, send it to the
+        // daemon), then force a redraw + immediate refresh on return.
         if let Some(action) = app.take_pending_action() {
             match action {
-                // The build outlives the dashboard and logs itself; its row
-                // shows the phase as soon as it's recorded.
+                // devsandbox serve runs the build (it outlives the dashboard
+                // and logs itself); its row shows the phase as soon as it's
+                // recorded. Off unix there's no daemon: suspended, below.
+                #[cfg(unix)]
                 action @ (PromptAction::Run { .. } | PromptAction::Rebuild { .. } | PromptAction::Start { .. }) => {
-                    let label = detached_label(&action);
-                    match spawn_detached(&dir, &action) {
-                        Ok(rx) => {
-                            app.status = Some(format!("{label}: started"));
-                            builds.push(rx);
-                        }
-                        Err(e) => app.status = Some(format!("{label}: {e:#}")),
-                    }
+                    app.status = Some(format!("{}…", verb_label(&action)));
+                    builds.push(spawn_verb(&dir, action));
                     last_tick = Instant::now();
                     followup.schedule(last_tick);
                     if pending.is_none() {
@@ -395,9 +391,18 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
         for req in app.take_pending_done() {
             dones.push((req.report, spawn_done(req.instance, req.done)));
         }
-        // `d` on an in-flight row, confirmed: SIGINT its build off-thread.
+        // `d` on an in-flight row, confirmed: the daemon SIGINTs its build
+        // (`instances.cancel`, whoever started it). Off unix nothing can.
         if let Some(instance) = app.take_pending_cancel() {
-            builds.push(spawn_cancel(instance));
+            #[cfg(unix)]
+            {
+                daemon.cancel(instance);
+                followup.schedule(Instant::now());
+            }
+            #[cfg(not(unix))]
+            {
+                app.status = Some(format!("cancel {instance}: not supported on this platform"));
+            }
         }
         // An open build log wants (re)reading: a local file tail, cheap
         // enough for the loop, kept out of `App`.
@@ -566,8 +571,8 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
             Err(TryRecvError::Disconnected) => false,
         });
 
-        // Drain finished detached builds and cancels: report, and resnapshot
-        // so the row shows how it ended.
+        // Drain answered verb requests: report, and resnapshot so the row
+        // shows the build's phase.
         builds.retain_mut(|rx| match rx.try_recv() {
             Ok(done) => {
                 app.status = Some(done.status);
@@ -663,15 +668,34 @@ fn run_suspended(terminal: &mut Term, dir: &Path, action: PromptAction) -> Resul
         PromptAction::Rm { instance, force } => commands::rm::rm(instance, None, *force, false),
         PromptAction::Stop { instance } => commands::stop::stop(Some(instance.clone()), false),
         PromptAction::ServiceRebuild { name } => commands::services::rebuild(dir, name),
-        // `code`/`rename` never suspend, nor do `run`/`rebuild`/`start`
-        // (detached): the caller handles them. `port` never reaches here —
-        // `App` routes it to `pending_port` (step 10), not `pending_action`.
-        PromptAction::Code { .. }
-        | PromptAction::Rename { .. }
-        | PromptAction::Port { .. }
-        | PromptAction::Run { .. }
-        | PromptAction::Rebuild { .. }
-        | PromptAction::Start { .. } => Ok(()),
+        // Off unix there's no daemon to send them to (`spawn_verb`): run
+        // here, as the CLI's in-process path does (autostart after).
+        #[cfg(not(unix))]
+        PromptAction::Run { sandbox, name, branch, base } => {
+            let extras = commands::run::RunExtras::default();
+            let result = commands::run::run(dir, Some(sandbox.clone()), name.clone(), branch.clone(), base.clone(), extras);
+            commands::autostart::autostart(dir);
+            result.map(|_| ())
+        }
+        #[cfg(not(unix))]
+        PromptAction::Rebuild { instance, force } => {
+            let result = commands::rebuild::rebuild(dir, Some(instance.clone()), false, *force);
+            commands::autostart::autostart(dir);
+            result
+        }
+        #[cfg(not(unix))]
+        PromptAction::Start { instance } => {
+            let result = commands::start::start(dir, Some(instance.clone()), false);
+            commands::autostart::autostart(dir);
+            result
+        }
+        // On unix `run`/`rebuild`/`start` go to the daemon: the caller
+        // handles them.
+        #[cfg(unix)]
+        PromptAction::Run { .. } | PromptAction::Rebuild { .. } | PromptAction::Start { .. } => Ok(()),
+        // `code`/`rename` never suspend. `port` never reaches here — `App`
+        // routes it to `pending_port` (step 10), not `pending_action`.
+        PromptAction::Code { .. } | PromptAction::Rename { .. } | PromptAction::Port { .. } => Ok(()),
     };
     if let Err(e) = result {
         match log_error(&action, &e) {
@@ -704,14 +728,13 @@ fn log_error(action: &PromptAction, err: &anyhow::Error) -> Option<PathBuf> {
         PromptAction::Rm { .. } => "rm",
         PromptAction::Stop { .. } => "stop",
         PromptAction::ServiceRebuild { .. } => "service rebuild",
-        // Never suspended (`run_suspended`): nothing to log here. A detached
-        // build writes its own build log.
-        PromptAction::Code { .. }
-        | PromptAction::Rename { .. }
-        | PromptAction::Port { .. }
-        | PromptAction::Run { .. }
-        | PromptAction::Rebuild { .. }
-        | PromptAction::Start { .. } => return None,
+        // Suspended only off unix (on unix the daemon runs them, and the
+        // build log has their output).
+        PromptAction::Run { .. } => "run",
+        PromptAction::Rebuild { .. } => "rebuild",
+        PromptAction::Start { .. } => "start",
+        // Never suspended (`run_suspended`): nothing to log here.
+        PromptAction::Code { .. } | PromptAction::Rename { .. } | PromptAction::Port { .. } => return None,
     };
     let dir = crate::state::State::path().ok()?.parent()?.join("logs");
     std::fs::create_dir_all(&dir).ok()?;
@@ -761,43 +784,10 @@ fn spawn_code(dir: PathBuf, instance: String, goto: Option<Goto>, note: Option<S
     rx
 }
 
-/// The `devsandbox` arguments (after `-C <dir>`) a detached
-/// [`PromptAction::Run`]/`Rebuild`/`Start` runs with; `None` for the other
-/// actions. The sandbox / instance always goes in, so no pick prompt can
-/// come up; `--opt=value` and `--` keep a value starting with `-` a value.
-fn detached_args(action: &PromptAction) -> Option<Vec<String>> {
-    let mut args = Vec::new();
-    let target = match action {
-        PromptAction::Run { sandbox, name, branch, base } => {
-            args.push("run".to_string());
-            for (flag, value) in [("name", name), ("branch", branch), ("base", base)] {
-                if let Some(value) = value {
-                    args.push(format!("--{flag}={value}"));
-                }
-            }
-            sandbox
-        }
-        PromptAction::Rebuild { instance, force } => {
-            args.push("rebuild".to_string());
-            if *force {
-                args.push("--force".to_string());
-            }
-            instance
-        }
-        PromptAction::Start { instance } => {
-            args.push("start".to_string());
-            instance
-        }
-        _ => return None,
-    };
-    args.push("--".to_string());
-    args.push(target.clone());
-    Some(args)
-}
-
 /// `run web` / `rebuild web-2` / `start web-2`: how the status line names a
-/// detached build.
-fn detached_label(action: &PromptAction) -> String {
+/// dashboard verb request.
+#[cfg(unix)]
+fn verb_label(action: &PromptAction) -> String {
     match action {
         PromptAction::Run { sandbox, name: Some(name), .. } => format!("run {sandbox} --name {name}"),
         PromptAction::Run { sandbox, .. } => format!("run {sandbox}"),
@@ -807,123 +797,114 @@ fn detached_label(action: &PromptAction) -> String {
     }
 }
 
-/// The status line for a detached build's exit: `None` (exit 0) says it's
-/// done; a failure quotes the child's last stderr line (`error`, when there
-/// is one: the only trace of a failure before the instance was recorded,
-/// and how a cancel reads as one) and points at the instance's build log
-/// (`b`). A `run` without `--name` doesn't know its instance's name (the
-/// child picks it), but its failed row shows up under the sandbox.
-fn detached_outcome(action: &PromptAction, code: Option<Option<i32>>, error: Option<&str>) -> String {
-    let label = detached_label(action);
-    let how = match (code, error) {
-        (None, _) => return format!("{label}: done"),
-        (_, Some(error)) => error.to_string(),
-        (Some(Some(code)), None) => format!("exit {code}"),
-        (Some(None), None) => "killed".to_string(),
-    };
-    let instance = match action {
+/// The instance a verb action names before it runs: `rebuild`/`start`'s,
+/// `run --name`'s (a plain `run`'s is picked by the verb).
+#[cfg(unix)]
+fn verb_instance(action: &PromptAction) -> Option<&str> {
+    match action {
         PromptAction::Run { name, .. } => name.as_deref(),
-        PromptAction::Rebuild { instance, .. } | PromptAction::Start { instance } => Some(instance.as_str()),
+        PromptAction::Rebuild { instance, .. } | PromptAction::Start { instance } => Some(instance),
         _ => None,
-    };
-    match instance {
-        Some(instance) => format!("{label} failed: {how} (b on {instance} opens its build log)"),
-        None => format!("{label} failed: {how} (b on its row opens the build log)"),
     }
 }
 
-/// Start `action` as `devsandbox -C <dir> <args…>` (`detached_args`),
-/// detached so the build outlives the dashboard: its own session (`setsid`,
-/// as `serve::client::spawn_detached`: no hangup when the terminal goes, no
-/// Ctrl-C from it, and its pid leads the process group `d` cancels), stdio
-/// null (it writes its own build log; prompts take their non-TTY default)
-/// and, as the dispatcher's subprocesses, no git credential prompt and this
-/// process's runtime. Stderr goes to a scratch file instead of null, read
-/// back for the exit's status line ([`last_error_line`]) and then removed:
-/// a file, not a pipe, so the child never writes into a closed pipe once
-/// the dashboard quits. A thread reaps it and reports the exit; quitting
-/// the dashboard just drops that thread.
-fn spawn_detached(dir: &Path, action: &PromptAction) -> Result<Receiver<OpDone>> {
-    use std::process::{Command, Stdio};
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let args = detached_args(action).context("not a detached verb")?;
-    let logs = crate::state::State::path()?.parent().context("no data dir")?.join("logs");
-    std::fs::create_dir_all(&logs).with_context(|| format!("cannot create {}", logs.display()))?;
-    let scratch = logs.join(format!(
-        "detached-{}-{}-{}.stderr",
-        std::process::id(),
-        crate::state::Instance::now(),
-        SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
-    let stderr = std::fs::File::create(&scratch).with_context(|| format!("cannot create {}", scratch.display()))?;
-    let exe = std::env::current_exe().context("cannot locate the devsandbox binary")?;
-    // Absolute, so the child is pinned to the same root whatever its cwd.
-    let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
-    let mut cmd = Command::new(exe);
-    cmd.arg("-C")
-        .arg(&dir)
-        .args(&args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(stderr)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env(crate::runtime::RUNTIME_ENV, crate::runtime::backend().name());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // SAFETY: setsid is async-signal-safe; nothing else runs between fork and exec.
-        unsafe {
-            cmd.pre_exec(|| if libc::setsid() == -1 { Err(io::Error::last_os_error()) } else { Ok(()) });
+/// The verb request (method, params) for a dashboard `run`/`rebuild`/
+/// `start` in config root `root` (absolute) with the dashboard's `env`;
+/// `None` for the other actions. Always `detach`: the dashboard only waits
+/// for the instance to be registered, its row shows the rest. The target
+/// always goes in, so nothing can need a pick.
+#[cfg(unix)]
+fn verb_call(
+    action: &PromptAction,
+    root: &Path,
+    env: BTreeMap<String, String>,
+) -> Option<(&'static str, serde_json::Value)> {
+    use crate::serve::verbs::{RebuildParams, RunParams, StartParams};
+    let root = root.to_path_buf();
+    let (method, params) = match action.clone() {
+        PromptAction::Run { sandbox, name, branch, base } => {
+            ("run", serde_json::to_value(RunParams { root, env, sandbox, name, branch, base, json: false, detach: true }))
+        }
+        PromptAction::Rebuild { instance, force } => (
+            "rebuild",
+            serde_json::to_value(RebuildParams { root, env, instance: Some(instance), all: false, force, detach: true }),
+        ),
+        PromptAction::Start { instance } => {
+            ("start", serde_json::to_value(StartParams { root, env, instance: Some(instance), all: false, detach: true }))
+        }
+        _ => return None,
+    };
+    Some((method, params.expect("verb params serialize")))
+}
+
+/// The status line (and whether it's a failure) for a verb request's end:
+/// the detached answer names the instance and where its build log is; a
+/// `failed` verb quotes its error and points at the build log (`b`) of its
+/// instance, which a plain `run` only knows from the answer (else "its
+/// row": the failed row shows up under the sandbox). Other errors (bad
+/// params, no such instance) ran nothing, so no build log. `Err` is the
+/// daemon unreachable: no fallback (the dashboard never builds in its own
+/// process, which would die with it).
+#[cfg(unix)]
+fn verb_status(action: &PromptAction, sent: Result<crate::serve::client::Streamed>) -> (String, bool) {
+    use crate::serve::client::Streamed;
+    let label = verb_label(action);
+    let r = match sent {
+        Ok(Streamed::Answer(r)) => r,
+        // The daemon exited before answering (a handoff, a crash): the
+        // verb runs on, its row shows it.
+        Ok(Streamed::Lost) => return (format!("{label}: devsandbox serve went away; it keeps running"), false),
+        // Never asked for (`spawn_verb` doesn't hang up); a hang-up cancels.
+        Ok(Streamed::HungUp) => return (format!("{label}: cancelled"), true),
+        Err(e) => return (format!("{label}: needs devsandbox serve ({e:#})"), true),
+    };
+    let named = verb_instance(action);
+    match r.error {
+        Some(e) if e.code == "failed" => {
+            let instance = e.data.as_ref().and_then(|d| d["instance"].as_str()).or(named);
+            let hint = match instance {
+                Some(instance) => format!("b on {instance} opens its build log"),
+                None => "b on its row opens the build log".to_string(),
+            };
+            (format!("{label} failed: {} ({hint})", e.message), true)
+        }
+        Some(e) => (format!("{label} failed: {}", e.message), true),
+        None => {
+            let result = r.result.unwrap_or_default();
+            if result["detached"] != true {
+                // It ended before it was registered (`start` with nothing
+                // to build): the normal result.
+                return (format!("{label}: done"), false);
+            }
+            let status = match result["instance"].as_str() {
+                Some(instance) if Some(instance) != named => format!("{label}: {instance} started"),
+                _ => format!("{label}: started"),
+            };
+            (format!("{status} (b opens its build log)"), false)
         }
     }
-    let mut child = match cmd.spawn() {
-        Ok(child) => child,
-        Err(e) => {
-            let _ = std::fs::remove_file(&scratch);
-            return Err(e).context("cannot start devsandbox");
-        }
-    };
+}
+
+/// Send `action` (`run`/`rebuild`/`start`) to devsandbox serve on a thread
+/// of its own: a connection of its own too (lazy start, as the daemon
+/// worker's), since a verb request holds its connection until answered.
+/// `output`/`progress` are dropped (the build log has them, and nothing may
+/// reach the terminal); the detached answer comes once the instance is
+/// registered, and dropping the connection then leaves the build running.
+/// Quitting the dashboard before that hangs up, which cancels it.
+#[cfg(unix)]
+fn spawn_verb(dir: &Path, action: PromptAction) -> Receiver<OpDone> {
     let (tx, rx) = mpsc::channel();
-    let action = action.clone();
+    let root = daemon::root_dir(dir.to_path_buf());
     std::thread::spawn(move || {
-        let waited = child.wait();
-        let error = std::fs::read_to_string(&scratch).ok().and_then(|t| last_error_line(&t));
-        let _ = std::fs::remove_file(&scratch);
-        let (status, failed) = match waited {
-            Ok(s) if s.success() => (detached_outcome(&action, None, None), false),
-            Ok(s) => (detached_outcome(&action, Some(s.code()), error.as_deref()), true),
-            Err(e) => (format!("{}: {e}", detached_label(&action)), true),
-        };
+        use crate::serve::{client, endpoint, verbs_client};
+        let env = verbs_client::caller_env(std::env::vars_os());
+        let sent = verb_call(&action, &root, env).context("not a verb").and_then(|(method, params)| {
+            let mut conn = endpoint::socket_dir().and_then(|socket| client::connect(&socket, "tui"))?;
+            conn.call_streaming(method, params, Duration::from_secs(1), &mut |_| true)
+        });
+        let (status, failed) = verb_status(&action, sent);
         let _ = tx.send(OpDone { status, failed });
-    });
-    Ok(rx)
-}
-
-/// The last non-empty line of a detached child's stderr, without the
-/// `error: ` prefix `main` puts on a failed command's error (warnings and
-/// notes before it don't matter once it failed).
-fn last_error_line(stderr: &str) -> Option<String> {
-    let line = stderr.lines().map(str::trim).rfind(|l| !l.is_empty())?;
-    Some(line.strip_prefix("error: ").unwrap_or(line).to_string())
-}
-
-/// Spawn a thread that cancels `instance`'s build (`cancel_instance` on a
-/// fresh state read, so a pid recycled since the snapshot isn't signalled).
-fn spawn_cancel(instance: String) -> Receiver<OpDone> {
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        use crate::commands::run::cancel::{NotCancelled, cancel_instance, interrupt};
-        let status = match crate::state::State::load() {
-            Ok(state) => match cancel_instance(&state, &instance, interrupt) {
-                Ok(pid) => format!("cancelling {instance} (SIGINT to pid {pid})"),
-                Err(NotCancelled::Done) => format!("cancel {instance}: not building any more"),
-                Err(NotCancelled::Unknown) => format!("cancel {instance}: unknown instance"),
-                Err(NotCancelled::Signal(e)) => format!("cancel {instance}: {e}"),
-            },
-            Err(e) => format!("cancel {instance}: {e:#}"),
-        };
-        let _ = tx.send(OpDone { status, failed: false });
     });
     rx
 }
@@ -1173,82 +1154,103 @@ mod tests {
         assert_eq!(c.depth(t0 + STATS_INTERVAL + TICK_INTERVAL), data::Depth::Listing);
     }
 
-    fn strings(args: &[&str]) -> Option<Vec<String>> {
-        Some(args.iter().map(|s| s.to_string()).collect())
-    }
-
-    #[test]
-    fn detached_args_map_each_verb_to_its_cli_flags() {
-        let run = |name: Option<&str>, branch: Option<&str>, base: Option<&str>| PromptAction::Run {
+    #[cfg(unix)]
+    fn run_action(name: Option<&str>, branch: Option<&str>, base: Option<&str>) -> PromptAction {
+        PromptAction::Run {
             sandbox: "web".into(),
-            name: name.map(Into::into),
-            branch: branch.map(Into::into),
-            base: base.map(Into::into),
-        };
-        assert_eq!(detached_args(&run(None, None, None)), strings(&["run", "--", "web"]));
-        assert_eq!(
-            detached_args(&run(Some("w2"), Some("feat/x"), Some("-odd"))),
-            strings(&["run", "--name=w2", "--branch=feat/x", "--base=-odd", "--", "web"])
-        );
-        let rebuild = |force| PromptAction::Rebuild { instance: "web-2".into(), force };
-        assert_eq!(detached_args(&rebuild(false)), strings(&["rebuild", "--", "web-2"]));
-        assert_eq!(detached_args(&rebuild(true)), strings(&["rebuild", "--force", "--", "web-2"]));
-        assert_eq!(
-            detached_args(&PromptAction::Start { instance: "web-2".into() }),
-            strings(&["start", "--", "web-2"])
-        );
-        // The rest stay suspended (or in-process).
-        assert_eq!(detached_args(&PromptAction::Stop { instance: "web-2".into() }), None);
-        assert_eq!(detached_args(&PromptAction::Rm { instance: "web-2".into(), force: false }), None);
+            name: name.map(String::from),
+            branch: branch.map(String::from),
+            base: base.map(String::from),
+        }
     }
 
-    /// The argv parses as the CLI's own verb, so a flag rename can't drift.
+    /// Each verb action's request is detached, carries the root and env,
+    /// and is what the daemon's `serve::verbs::parse` accepts.
+    #[cfg(unix)]
     #[test]
-    fn detached_args_parse_as_the_cli() {
-        use clap::CommandFactory;
-        let parse = |args: Vec<String>| {
-            let cmd = crate::Cli::command();
-            let argv = ["devsandbox", "-C", "/cfg"].into_iter().map(String::from).chain(args);
-            cmd.try_get_matches_from(argv).map(|m| m.subcommand_name().map(String::from))
+    fn verb_calls_are_detached_requests_the_daemon_accepts() {
+        use crate::serve::verbs::{self, Target, Verb};
+        let root = std::env::temp_dir().canonicalize().unwrap();
+        let env: BTreeMap<String, String> = [("HOME".to_string(), "/home/me".to_string())].into();
+        let parse = |action: &PromptAction| {
+            let (method, params) = verb_call(action, &root, env.clone()).unwrap();
+            let req = verbs::parse(method, params).unwrap();
+            assert!(req.detach, "{action:?}");
+            assert_eq!((req.root.as_path(), &req.env), (root.as_path(), &env));
+            req.verb
         };
-        let action = PromptAction::Run {
-            sandbox: "web".into(),
-            name: Some("w2".into()),
-            branch: Some("b".into()),
-            base: Some("origin/main".into()),
-        };
-        assert_eq!(parse(detached_args(&action).unwrap()).unwrap().as_deref(), Some("run"));
-        let action = PromptAction::Rebuild { instance: "-x".into(), force: true };
-        assert_eq!(parse(detached_args(&action).unwrap()).unwrap().as_deref(), Some("rebuild"));
-        let action = PromptAction::Start { instance: "w".into() };
-        assert_eq!(parse(detached_args(&action).unwrap()).unwrap().as_deref(), Some("start"));
+        assert_eq!(
+            parse(&run_action(Some("w2"), Some("feat/x"), Some("-odd"))),
+            Verb::Run {
+                sandbox: "web".into(),
+                name: Some("w2".into()),
+                branch: Some("feat/x".into()),
+                base: Some("-odd".into()),
+                json: false
+            }
+        );
+        assert_eq!(
+            parse(&PromptAction::Rebuild { instance: "web-2".into(), force: true }),
+            Verb::Rebuild { target: Target::One("web-2".into()), force: true }
+        );
+        assert_eq!(parse(&PromptAction::Start { instance: "web-2".into() }), Verb::Start { target: Target::One("web-2".into()) });
+        assert_eq!(verb_call(&PromptAction::Stop { instance: "web-2".into() }, &root, env.clone()), None);
+        assert_eq!(verb_call(&PromptAction::Rm { instance: "web-2".into(), force: false }, &root, env), None);
     }
 
+    #[cfg(unix)]
     #[test]
-    fn detached_outcome_points_a_failure_at_the_build_log() {
+    fn verb_status_reads_each_answer() {
+        use crate::serve::client::Streamed;
+        use crate::serve::proto::{ErrorBody, Response};
+        use serde_json::{Value, json};
+        let ok = |v: Value| Ok(Streamed::Answer(Response { id: Some(1), result: Some(v), error: None }));
+        let err = |code: &str, message: &str, data: Option<Value>| {
+            let error = ErrorBody { code: code.into(), message: message.into(), data };
+            Ok(Streamed::Answer(Response { id: Some(1), result: None, error: Some(error) }))
+        };
         let rebuild = PromptAction::Rebuild { instance: "web-2".into(), force: false };
-        assert_eq!(detached_outcome(&rebuild, None, None), "rebuild web-2: done");
-        assert_eq!(
-            detached_outcome(&rebuild, Some(Some(1)), None),
-            "rebuild web-2 failed: exit 1 (b on web-2 opens its build log)"
-        );
-        let run = PromptAction::Run { sandbox: "web".into(), name: None, branch: None, base: None };
-        assert_eq!(
-            detached_outcome(&run, Some(None), None),
-            "run web failed: killed (b on its row opens the build log)"
-        );
-        // The child's own error wins over the bare exit code.
-        assert_eq!(
-            detached_outcome(&run, Some(Some(1)), Some("instance `web` already exists")),
-            "run web failed: instance `web` already exists (b on its row opens the build log)"
-        );
-    }
+        let status = |action: &PromptAction, sent| verb_status(action, sent).0;
 
-    #[test]
-    fn last_error_line_is_the_final_error_without_its_prefix() {
-        assert_eq!(last_error_line("warning: x\nerror: `web` cancelled: rolled back\n\n").as_deref(), Some("`web` cancelled: rolled back"));
-        assert_eq!(last_error_line("plain\n").as_deref(), Some("plain"));
-        assert_eq!(last_error_line(" \n"), None);
+        // Detached: a plain run learns its instance from the answer.
+        assert_eq!(
+            status(&run_action(None, None, None), ok(json!({"instance": "web-2", "detached": true}))),
+            "run web: web-2 started (b opens its build log)"
+        );
+        assert_eq!(
+            status(&run_action(Some("w2"), None, None), ok(json!({"instance": "w2", "detached": true}))),
+            "run web --name w2: started (b opens its build log)"
+        );
+        assert_eq!(
+            status(&rebuild, ok(json!({"instance": "web-2", "detached": true}))),
+            "rebuild web-2: started (b opens its build log)"
+        );
+        // Ended before it was registered.
+        let start = PromptAction::Start { instance: "web-2".into() };
+        assert_eq!(verb_status(&start, ok(json!({"instance": "web-2", "exit": 0}))), ("start web-2: done".into(), false));
+
+        // `failed`: the verb's error, pointing at the build log.
+        assert_eq!(
+            verb_status(&rebuild, err("failed", "boom", Some(json!({"exit": 1, "instance": null})))),
+            ("rebuild web-2 failed: boom (b on web-2 opens its build log)".into(), true)
+        );
+        assert_eq!(
+            status(&run_action(None, None, None), err("failed", "no sandbox `web`", Some(json!({"exit": 1, "instance": null})))),
+            "run web failed: no sandbox `web` (b on its row opens the build log)"
+        );
+        assert_eq!(
+            status(&run_action(None, None, None), err("failed", "boom", Some(json!({"exit": 1, "instance": "web-3"})))),
+            "run web failed: boom (b on web-3 opens its build log)"
+        );
+        // Other errors ran nothing: no build log to point at.
+        assert_eq!(status(&rebuild, err("not-found", "no instance `web-2`", None)), "rebuild web-2 failed: no instance `web-2`");
+
+        // No daemon (F8, no fallback), or one that went away.
+        assert_eq!(
+            verb_status(&run_action(None, None, None), Err(anyhow::anyhow!("cannot start devsandbox serve"))),
+            ("run web: needs devsandbox serve (cannot start devsandbox serve)".into(), true)
+        );
+        assert_eq!(status(&rebuild, Ok(Streamed::Lost)), "rebuild web-2: devsandbox serve went away; it keeps running");
     }
 
     #[test]

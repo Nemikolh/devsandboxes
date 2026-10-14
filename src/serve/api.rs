@@ -119,7 +119,7 @@ pub fn call(method: &str, params: Value, ctx: &Ctx) -> Answer {
 
 /// Params into `T`; absent params count as `{}`. Unknown fields are
 /// ignored, so a newer client's additive fields don't break an older daemon.
-pub(super) fn parse<T: DeserializeOwned>(params: Value) -> Result<T, ApiError> {
+pub(crate) fn parse<T: DeserializeOwned>(params: Value) -> Result<T, ApiError> {
     let params = if params.is_null() { Value::Object(Default::default()) } else { params };
     serde_json::from_value(params).map_err(|e| ApiError::invalid(format!("bad params: {e}")))
 }
@@ -376,9 +376,10 @@ fn instances_resolve(p: NameParams, state: &Path) -> Answer {
     serde_json::to_value(Resolved { matches }).map_err(|e| ApiError::internal(e.into()))
 }
 
+/// `pub(crate)` for the dashboard's test that its call parses.
 #[derive(Deserialize)]
-struct CancelParams {
-    instance: String,
+pub(crate) struct CancelParams {
+    pub(crate) instance: String,
 }
 
 /// SIGINT an instance's in-flight `run`/`rebuild` by its recorded pid

@@ -171,8 +171,9 @@ pub struct App {
     /// A `kill` the event loop should spawn on a background thread (the
     /// SIGTERM/SIGKILL shortcuts on a process row). Runs without suspending.
     pub pending_signal: Option<PendingSignal>,
-    /// Instance whose `run`/`rebuild`/`start` the event loop should SIGINT
-    /// (`d` on an in-flight row, confirmed): its recorded pid's group.
+    /// Instance whose `run`/`rebuild`/`start` the event loop should cancel
+    /// (`d` on an in-flight row, confirmed): `instances.cancel` through the
+    /// daemon, which SIGINTs its recorded pid's group.
     pub pending_cancel: Option<String>,
     /// Instance id whose build log the event loop should read into the open
     /// [`BuildLogModal`].

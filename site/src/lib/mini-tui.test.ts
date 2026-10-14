@@ -415,7 +415,7 @@ describe(': prompt', () => {
     expect(s.prompt).toBeNull();
     // No suspended screen: the dashboard stays, a status line says it started.
     expect(s.suspended).toBeNull();
-    expect(s.message).toBe('run web: started');
+    expect(s.message).toBe('run web: web-4 started (b opens its build log)');
     expect(names(s)).toEqual(['web', 'web-2', 'web-3', 'web-4']);
     expect(inst(s, 'web-4')).toEqual({ name: 'web-4', status: 'building', worktree: true, uptime: '0s', run: 'run web' });
     expect(instanceCells(s, inst(s, 'web-4')!).map(text)[1]).toBe('building');
@@ -450,7 +450,7 @@ describe(': prompt', () => {
   it('run names like the real one: --name, the sandbox name when free, errors', () => {
     const named = command(STATIC, 'run web --name api');
     expect(names(named)).toContain('api');
-    expect(named.message).toBe('run web --name api: started');
+    expect(named.message).toBe('run web --name api: started (b opens its build log)');
     const taken = command(STATIC, 'run web --name web-2');
     expect(taken.message).toBe(
       'run web --name web-2 failed: instance `web-2` already exists; `devsandbox start web-2` restarts it, `devsandbox rm web-2` frees the name (b on web-2 opens its build log)',

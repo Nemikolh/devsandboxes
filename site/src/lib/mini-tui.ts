@@ -97,7 +97,7 @@ export interface Inst {
   worktree: boolean;
   /** The UPTIME column (`humanize_secs` of the time since `run`). */
   uptime: string;
-  /** While `building`: the status-line label of the detached `run` (`detached_label`). */
+  /** While `building`: the status-line label of the `run` request (`verb_label`). */
   run?: string;
 }
 
@@ -482,15 +482,15 @@ const stillBuilding = (name: string) => `\`${name}\` is still building`;
 const suspend = (s: State, lines: string[]): State => ({ ...s, suspended: { lines, confirm: null } });
 
 /**
- * A detached build's failure on the status line (`detached_outcome` in
- * `src/tui/mod.rs`): the child's error, and where its build log is.
+ * A verb request's failure on the status line (`verb_status` in
+ * `src/tui/mod.rs`): the verb's error, and where its build log is.
  */
 const buildFailed = (label: string, name: string | null | undefined, e: string): string =>
   `${label} failed: ${e} (${name ? `b on ${name} opens its` : 'b on its row opens the'} build log)`;
 
 /**
- * `run <sandbox>`: spawned in the background (`spawn_detached`), so the
- * dashboard stays up. The new row shows `building` until `built`; a
+ * `run <sandbox>`: sent to devsandbox serve, detached (`spawn_verb`), so
+ * the dashboard stays up. The new row shows `building` until `built`; a
  * worktree when the base checkout is taken.
  */
 function runInstance(s: State, a: Extract<Action, { cmd: 'run' }>): State {
@@ -509,7 +509,8 @@ function runInstance(s: State, a: Extract<Action, { cmd: 'run' }>): State {
   }
   const worktree = s.instances.some((i) => !i.worktree);
   const next = withInstances(s, [...s.instances, { name, status: 'building', worktree, uptime: '0s', run: label }]);
-  return { ...next, message: `${label}: started` };
+  const started = a.name ? `${label}: started` : `${label}: ${name} started`;
+  return { ...next, message: `${started} (b opens its build log)` };
 }
 
 /** A background `run` finished: the row is a running instance, its status line says so. */
@@ -633,7 +634,7 @@ function runAction(s: State, a: Action): State {
       return suspend(setRunState(s, inst.name, 'exited'), [`stopped ${inst.name}`]);
     }
     case 'start': {
-      // Detached like `run`; a start is quick, so here it's done at once.
+      // Sent like `run`; a start is quick, so here it's done at once.
       const inst = findInst(s, a.instance);
       const label = `start ${a.instance}`;
       if (!inst) return { ...s, message: buildFailed(label, a.instance, noMatch(a.instance)) };

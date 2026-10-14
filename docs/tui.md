@@ -428,13 +428,18 @@ it. Any event the button also queues for the sender is sent on the click.
 
 `run`, `rebuild` and `start` (from `:`, or `s` when it rebuilds a drifted,
 missing or failed instance) never take over the screen
-(docs/instance-phase.md, step 6). The loop spawns `devsandbox -C <dir>
-<verb> … -- <target>` detached (`spawn_detached` in `src/tui/mod.rs`): its
-own session, stdio null, `GIT_TERMINAL_PROMPT=0`, the runtime pinned. The
-work outlives the dashboard; quitting just drops the thread that waits on
-it. The help bar says `run web: started`, the snapshot refreshes at once
-(and again on exit), and the row's status column shows the phase. A
-non-zero exit leaves a help-bar line pointing at the build-log key.
+(docs/instance-phase.md, step 6). The dashboard sends them to devsandbox
+serve as verb requests (docs/api.md, *Verbs*; `spawn_verb` in
+`src/tui/mod.rs`), detached, with its absolute config root and its own
+env: a thread per request, on a connection of its own (lazy start), that
+drops the verb's output (the build log has it) and reports the answer,
+which comes once the instance is registered. The daemon runs the build, so
+it outlives the dashboard. The help bar says `run web: web-2 started (b
+opens its build log)`, the snapshot refreshes at once, and the row's
+status column shows the phase, how it ends included. A verb that fails
+before that (`failed`) leaves a help-bar line with its error pointing at
+the build-log key. No daemon, no fallback: `run web: needs devsandbox
+serve (<why>)`. Off unix (no daemon) they run suspended, in-process.
 
 - `b` on an instance row opens its build log (`<data>/devsandbox/logs/
   <instance_id>/build.log`, the last 500 lines) in a modal titled with the
@@ -443,9 +448,13 @@ non-zero exit leaves a help-bar line pointing at the build-log key.
   after. The modal follows the bottom until you scroll up; `G` (or
   scrolling back down) follows again.
 - `d` on an in-flight row asks `cancel <name>'s build?` (`y`/`enter`,
-  `n`/`esc`). Yes SIGINTs the recorded pid's process group (the pid alone
-  when it leads none), read fresh from state; a cancelled `run` rolls back
-  (its row and log go), a `rebuild`/`start` records `failed`. Unix only.
+  `n`/`esc`). Yes sends `instances.cancel` on the daemon worker's
+  connection (`src/tui/daemon.rs`): the daemon SIGINTs the recorded pid's
+  process group (the pid alone when it leads none), read fresh from state,
+  whoever started the build; a cancelled `run` rolls back (its row and log
+  go), a `rebuild`/`start` records `failed`. The status line is the answer
+  (`cancelling web-2 (SIGINT to pid N)`, or why not); while disconnected,
+  `cancel web-2: needs devsandbox serve`. Unix only.
 
 ## Mouse selection
 

@@ -266,7 +266,7 @@ pub struct ConfirmModal {
 
 /// What a [`ConfirmModal`]'s yes does.
 enum Confirmed {
-    /// SIGINT the instance's `run`/`rebuild`/`start` (`App::pending_cancel`).
+    /// Cancel the instance's `run`/`rebuild`/`start` (`App::pending_cancel`).
     CancelBuild(String),
 }
 
@@ -528,7 +528,7 @@ impl App {
         });
     }
 
-    /// Take the instance whose build the event loop should SIGINT.
+    /// Take the instance whose build the event loop should cancel.
     pub fn take_pending_cancel(&mut self) -> Option<String> {
         self.pending_cancel.take()
     }

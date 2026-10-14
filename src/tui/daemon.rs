@@ -31,6 +31,11 @@
 //! `forwards.rm` ([`Cmd::ForwardAdd`], [`Cmd::ForwardRm`]). Disconnected, the
 //! tab has no rows and an add says the daemon is needed.
 //!
+//! Builds: `d` on an in-flight row is `instances.cancel` ([`Cmd::Cancel`]),
+//! whoever started the build; the answer is a status line. The verbs
+//! themselves don't go through here: each holds its own connection until
+//! it's answered (`tui::spawn_verb`).
+//!
 //! A command channel plus a short-joining `Drop`; nothing is ever written to
 //! stderr, failures are [`DaemonUpdate::Status`] lines.
 
@@ -49,7 +54,7 @@ use crate::inbox::{self, Op};
 use crate::serve::client::{self, Conn};
 use crate::serve::forwards::{Added, ForwardRow};
 use crate::serve::endpoint;
-use crate::serve::proto::Version;
+use crate::serve::proto::{Response, Version};
 
 /// How long one wait for a notification blocks while connected: the
 /// latency of an inbox write queued meanwhile, and of the worker noticing
@@ -86,6 +91,8 @@ enum Cmd {
     ForwardAdd(PortRequest),
     /// `forwards.rm`.
     ForwardRm(u64),
+    /// `instances.cancel` for `instance` (a state key).
+    Cancel(String),
 }
 
 /// Handle to the daemon worker. Never blocks the UI thread; dropping it
@@ -138,6 +145,12 @@ impl DaemonWorker {
     /// Ask the daemon to stop forward `id`. Never blocks.
     pub fn forward_rm(&self, id: u64) {
         self.send(Cmd::ForwardRm(id));
+    }
+
+    /// Ask the daemon to cancel `instance`'s build. Never blocks; the
+    /// outcome is a status line.
+    pub fn cancel(&self, instance: String) {
+        self.send(Cmd::Cancel(instance));
     }
 
     fn send(&self, cmd: Cmd) {
@@ -227,8 +240,25 @@ fn ensure_call(instance: &str, agent: Option<&std::path::Path>) -> (&'static str
 
 /// The config root as the daemon keys it: canonical (what `run` records),
 /// else at least absolute (the API refuses relative dirs).
-fn root_dir(dir: PathBuf) -> PathBuf {
+pub(super) fn root_dir(dir: PathBuf) -> PathBuf {
     dir.canonicalize().or_else(|_| std::path::absolute(&dir)).unwrap_or(dir)
+}
+
+/// The API call for [`Cmd::Cancel`].
+fn cancel_call(instance: &str) -> (&'static str, Value) {
+    ("instances.cancel", json!({ "instance": instance }))
+}
+
+/// The status line for an `instances.cancel` answer: the pid it SIGINTed,
+/// or why not (not building any more, no such instance).
+fn cancel_status(instance: &str, r: Response) -> String {
+    match (r.result, r.error) {
+        (_, Some(e)) => format!("cancel {instance}: {}", e.message),
+        (result, None) => match result.as_ref().and_then(|v| v.get("pid")).and_then(Value::as_u64) {
+            Some(pid) => format!("cancelling {instance} (SIGINT to pid {pid})"),
+            None => format!("cancelling {instance}"),
+        },
+    }
 }
 
 /// The API call for `forwards.list` of config root `dir`.
@@ -355,6 +385,7 @@ fn run(dir: &Path, rx: Receiver<Cmd>, utx: Sender<DaemonUpdate>, connected: &Ato
             Ok(Cmd::EnsureBridge { instance, agent }) => w.ensure_bridge(&instance, agent.as_deref()),
             Ok(Cmd::ForwardAdd(req)) => w.forward_add(&req),
             Ok(Cmd::ForwardRm(id)) => w.forward_rm(id),
+            Ok(Cmd::Cancel(instance)) => w.cancel(&instance),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return,
         }
@@ -498,6 +529,26 @@ impl Worker<'_> {
                 (result, None) => self.send(DaemonUpdate::Status(removed_status(&result.unwrap_or_default()))),
             },
             Err(_) => self.lost(false),
+        }
+    }
+
+    /// `instances.cancel`; the answer (or why there's none) is a status
+    /// line. No local fallback (F8): the daemon runs the dashboard's builds.
+    fn cancel(&mut self, instance: &str) {
+        let Some(conn) = self.conn.as_mut() else {
+            let line = match &self.down {
+                Some(why) => format!("cancel {instance}: needs devsandbox serve ({why})"),
+                None => format!("cancel {instance}: needs devsandbox serve"),
+            };
+            return self.send(DaemonUpdate::Status(line));
+        };
+        let (method, params) = cancel_call(instance);
+        match conn.call(method, params) {
+            Ok(r) => self.send(DaemonUpdate::Status(cancel_status(instance, r))),
+            Err(e) => {
+                self.lost(false);
+                self.send(DaemonUpdate::Status(format!("cancel {instance}: needs devsandbox serve ({e:#})")));
+            }
         }
     }
 
@@ -753,6 +804,38 @@ mod tests {
             "stopped 127.0.0.1:8080 (forwardPorts: back when its instance restarts)"
         );
         assert_eq!(removed_status(&json!({"ok": true, "local": "127.0.0.1:1", "configured": false})), "stopped 127.0.0.1:1");
+    }
+
+    /// `d`'s cancel queues as its command, its call is what the API's
+    /// `instances.cancel` parses (not run: that would read the user's
+    /// state), and each answer kind reads as a status line.
+    #[test]
+    fn cancel_queues_maps_to_the_api_and_answers_render() {
+        use crate::serve::api::{self, CancelParams};
+        use crate::serve::proto::ErrorBody;
+        let (tx, rx) = mpsc::channel();
+        let (_utx, updates) = mpsc::channel();
+        let worker = DaemonWorker { tx: Some(tx), updates, connected: Arc::default(), handle: None };
+        worker.cancel("web-2".into());
+        assert_eq!(rx.try_recv().unwrap(), Cmd::Cancel("web-2".into()));
+
+        let (method, params) = cancel_call("web-2");
+        assert_eq!((method, &params), ("instances.cancel", &json!({"instance": "web-2"})));
+        let parsed: CancelParams = api::parse(params).unwrap();
+        assert_eq!(parsed.instance, "web-2");
+
+        let ok = |v: Value| Response { id: Some(1), result: Some(v), error: None };
+        let err = |code: &str, message: &str| Response {
+            id: Some(1),
+            result: None,
+            error: Some(ErrorBody { code: code.into(), message: message.into(), data: None }),
+        };
+        assert_eq!(cancel_status("web-2", ok(json!({"ok": true, "pid": 42}))), "cancelling web-2 (SIGINT to pid 42)");
+        assert_eq!(
+            cancel_status("web-2", err("invalid", "`web-2` is not building any more")),
+            "cancel web-2: `web-2` is not building any more"
+        );
+        assert_eq!(cancel_status("x", err("not-found", "no instance `x`")), "cancel x: no instance `x`");
     }
 
     #[test]

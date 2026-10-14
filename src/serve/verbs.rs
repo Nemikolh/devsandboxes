@@ -464,7 +464,7 @@ pub fn serve(
     let mut next_poll = Instant::now();
     let status = loop {
         if let Err(e) = running.pump(request, peer) {
-            return running.gone(peer, cancels(&e), Arc::clone(table), label, log);
+            return running.gone(peer, Left::after_write(&e, req.detach), Arc::clone(table), label, log);
         }
         match running.child.try_wait() {
             Ok(Some(status)) => break Ok(status),
@@ -476,7 +476,7 @@ pub fn serve(
             if let Ok(state) = State::load_at(&runner.state) {
                 for (instance, phase) in tracker.observe(&state, Progress::current_view) {
                     if let Err(e) = peer.notify("progress", progress_params(request, &instance, &phase)) {
-                        return running.gone(peer, cancels(&e), Arc::clone(table), label, log);
+                        return running.gone(peer, Left::after_write(&e, req.detach), Arc::clone(table), label, log);
                     }
                 }
                 if let (DetachAt::Registered, Some(key)) = (detach, tracker.instance.clone()) {
@@ -492,7 +492,8 @@ pub fn serve(
             }
         }
         if peer.hung_up(TICK) {
-            return running.gone(peer, true, Arc::clone(table), label, log);
+            let left = if req.detach { Left::Detached } else { Left::HungUp };
+            return running.gone(peer, left, Arc::clone(table), label, log);
         }
     };
 
@@ -611,13 +612,16 @@ impl Running {
     }
 
     /// The client is gone (hung up, or its writes fail): SIGINT the group
-    /// (the verb rolls back) when `cancel`, unless the daemon is draining;
-    /// otherwise the verb runs on. Either way it's reaped off this thread.
-    fn gone(self, peer: &dyn Peer, cancel: bool, table: Arc<InFlight>, label: String, log: fn(&str)) -> Outcome {
+    /// (the verb rolls back) on a plain hang-up, unless the daemon is
+    /// draining; otherwise the verb runs on. Either way it's reaped off this
+    /// thread.
+    fn gone(self, peer: &dyn Peer, left: Left, table: Arc<InFlight>, label: String, log: fn(&str)) -> Outcome {
         if peer.draining() {
             log(&format!("{label}: the daemon is exiting, left running"));
-        } else if !cancel {
+        } else if left == Left::Slow {
             log(&format!("{label}: client stopped reading, connection cut, left running"));
+        } else if left == Left::Detached {
+            log(&format!("{label}: detached client left before the answer, left running"));
         } else {
             // The child leads its own group and isn't reaped yet, so its
             // pid can't have been reused.
@@ -779,12 +783,29 @@ impl Tracker {
     }
 }
 
-/// Whether a failed write to the client means it hung up (cancel), not that
-/// it stopped reading for the write timeout: a paused `devsandbox run | less`
-/// mustn't roll a build back. Its connection is cut either way (a timed-out
-/// write may have left half a line).
-fn cancels(e: &io::Error) -> bool {
-    !matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)
+/// How the client left before the answer; only [`Left::HungUp`] cancels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Left {
+    HungUp,
+    /// It stopped reading for the write timeout: a paused `devsandbox run |
+    /// less` mustn't roll a build back. Its connection is cut anyway (a
+    /// timed-out write may have left half a line).
+    Slow,
+    /// A `detach` request: hang-up = cancel unless detached
+    /// (docs/client-server.md, *Requests*), so a dashboard quit right after
+    /// `r` doesn't roll its build back.
+    Detached,
+}
+
+impl Left {
+    /// After a failed write to the client.
+    fn after_write(e: &io::Error, detach: bool) -> Left {
+        match e.kind() {
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => Left::Slow,
+            _ if detach => Left::Detached,
+            _ => Left::HungUp,
+        }
+    }
 }
 
 /// The `exit` of a `failed`: the code, or 128 + the signal, as shells say.
@@ -1248,12 +1269,27 @@ pub(crate) mod tests {
     fn only_a_hang_up_write_error_cancels() {
         use io::ErrorKind::*;
         for kind in [BrokenPipe, ConnectionReset, NotConnected] {
-            assert!(cancels(&kind.into()), "{kind:?}");
+            assert_eq!(Left::after_write(&kind.into(), false), Left::HungUp, "{kind:?}");
+            assert_eq!(Left::after_write(&kind.into(), true), Left::Detached, "{kind:?}");
         }
         // The write timeout: a client that stopped reading (a paused pager).
         for kind in [WouldBlock, TimedOut] {
-            assert!(!cancels(&kind.into()), "{kind:?}");
+            assert_eq!(Left::after_write(&kind.into(), false), Left::Slow, "{kind:?}");
         }
+    }
+
+    #[test]
+    fn a_detached_request_survives_a_hang_up_before_its_answer() {
+        let (runner, dir) = script_runner("detach-hangup", TRAPPED);
+        let table = Arc::new(InFlight::default());
+        let peer = FakePeer::default();
+        *peer.hang_up_at.lock().unwrap() = Some(Instant::now() + Duration::from_millis(300));
+        // `rebuild <one>` detaches only once registered, which the script never does.
+        let out = serve(&req(Verb::Rebuild { target: one("w"), force: false }, true), None, &runner, &table, &peer, "test", |_| {});
+        assert!(matches!(out, Outcome::Gone));
+        wait_for("the verb", || dir.join("done").exists());
+        assert!(!dir.join("int").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     impl Outcome {
