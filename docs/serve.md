@@ -180,6 +180,19 @@ the managed daemon follows upgrades. Older and equal clients just proceed. Conne
 notifications get a `closing` notification (`"reason":"handoff"`) before
 the close.
 
+Verbs in flight (`run`, `rebuild`, `start`, `stop`, `rm`; `docs/api.md`,
+*Verbs*) don't hold the drain and aren't cancelled: each is a subprocess
+that runs on, its output in its spool files
+(`<data-dir>/devsandbox/logs/verbs/<pid>.out|.err`). A client streaming
+one sees its connection end without an answer; the CLI says so and, for a
+build with a known instance, follows its build log until it's done
+(`docs/api.md`, *The CLI as a client*). The successor, holding the lock,
+sweeps the spool dir at start: a live pid's verb is *adopted* (a holder
+until it exits, then its files go), a dead one's files are removed. The
+same goes for an idle exit, a `shutdown` or a crash. An adopted verb can
+still be cancelled (`instances.cancel` signals the instance's recorded
+pid), but its output is no longer streamed to anyone.
+
 ## Idle exit
 
 The daemon exits 10 minutes after its last *holder* left; a new holder
@@ -187,7 +200,8 @@ cancels the countdown. Holders today: connected clients (an open
 dashboard, a running `exec` that relays the agent, an `api --stdio`
 relay), running instances that declare `dispatcher` or `inbox = true` (as
 of the last poll), in-flight control requests (`devsbd events --follow`
-streams included, for as long as each is open), every
+streams included, for as long as each is open), verbs in flight (detached
+ones and those adopted from a predecessor included, *Version handoff*), every
 live port forward (ad-hoc or configured, whatever its state), and the
 startup autostart pass while it runs. So with a dispatcher or a thread
 owner running the daemon never idles, and by design neither does it while an instance with

@@ -442,7 +442,9 @@ paused pager isn't a cancel). So does a daemon exit (idle, handoff,
 The verb's stdout and stderr are spooled in
 `<data-dir>/devsandbox/logs/verbs/<pid>.out|.err` while it runs (removed
 once it's reaped); `run`, `rebuild` and `start` also write the instance's
-build log, as from the CLI.
+build log, as from the CLI. A verb a daemon left running at its exit is
+adopted by the next daemon through those files (`docs/serve.md`, *Version
+handoff*): it holds that daemon until it exits, unstreamed.
 
 ## Notifications
 
@@ -485,7 +487,8 @@ A connected client keeps the daemon alive (`docs/serve.md`, *Idle exit*);
 hang up when done. So does every forward, ad-hoc or configured, whether or
 not its client is still connected: stop ad-hoc ones with `forwards.rm`. A CLI command holding a relay (`bridges.ensure`) stays
 connected for its whole run for that reason. Every verb holds it until
-its subprocess is reaped, a detached one too.
+its subprocess is reaped, a detached one too, and one a previous daemon
+left running until it exits.
 
 ## Relay: `devsandbox api --stdio`
 

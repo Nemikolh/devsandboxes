@@ -86,7 +86,9 @@ git worktrees so working trees are never shared.
   (docs/verbs-as-requests.md): typed params → a pure `argv`, each verb a
   `devsandbox --in-process` subprocess (request env only, own process
   group, stdout/stderr spooled in `logs/verbs/<pid>.out|.err`) streamed as
-  `output`/`progress`; hang-up = SIGINT, a drain isn't one. The program,
+  `output`/`progress`; hang-up = SIGINT, a drain isn't one (the verb runs
+  on; the next daemon's start sweep of the spool adopts live pids as
+  holders, `InFlight::adopt`, and drops dead ones' files). The program,
   spool and state path are injectable (`Runner`), so tests run `sh`.
   `verbs_client.rs` is the CLI side: prompts first (`sandboxes.list`,
   `instances.resolve`, rm's `confirm` round), then streams the request;

@@ -30,7 +30,8 @@
 //! verb's answer, writing `output`/`progress` through the same writer lock
 //! and watching the socket for a hang-up ([`ConnPeer`]). The drain's
 //! read-side shutdown ends it too, but sets `draining` first, so the verb
-//! is left running rather than cancelled, and doesn't hold the drain.
+//! is left running rather than cancelled, and doesn't hold the drain; the
+//! successor adopts it by its spool files and holds until it exits.
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs::{File, TryLockError};
@@ -163,6 +164,11 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
         Some(runner) => runner.clone(),
         None => verbs::Runner::new()?,
     });
+    // Under the start lock, so a predecessor's verbs are orphans by now:
+    // they hold this daemon until they exit.
+    if let Some(runner) = shared.runner.get() {
+        shared.verbs.adopt(&runner.spool, log);
+    }
     let registry = if opts.host {
         let shared = Arc::clone(&shared);
         let store = super::forward_store::path()?;
@@ -195,6 +201,9 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
     let exit = loop {
         if let Some(exit) = *shared.stop.lock().unwrap() {
             break exit;
+        }
+        if let Some(runner) = shared.runner.get() {
+            shared.verbs.check_adopted(&runner.spool, log);
         }
         let now = Instant::now();
         let holders = shared.holders(host.as_ref(), registry.as_ref());
@@ -297,7 +306,8 @@ struct Shared {
     forwards: OnceLock<forwards::Handle>,
     /// How verbs run; unset only in tests that build a bare `Shared`.
     runner: OnceLock<verbs::Runner>,
-    /// The verbs not reaped yet: the `verbs` holder count.
+    /// The verbs not reaped yet, a predecessor's adopted ones included: the
+    /// `verbs` holder count.
     verbs: Arc<verbs::InFlight>,
     /// Set when the drain starts: its read-side shutdown is not a client
     /// hanging up, so a verb's connection must not cancel on it.
@@ -1352,6 +1362,36 @@ pub(crate) mod tests {
         assert!(!rest.contains("\"id\":1"), "answered: {rest}");
         assert!(wait_file(&root.join("done"), Duration::from_secs(4)), "the verb didn't finish");
         assert!(!root.join("int").exists(), "the drain cancelled it");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_predecessors_live_verb_is_adopted_and_holds_until_it_exits() {
+        let tag = "verb-adopt";
+        let dir = scratch(tag);
+        let (runner, root) = verbs::tests::script_runner(tag, "exit 0");
+        let spool = runner.spool.clone();
+        std::fs::create_dir_all(&spool).unwrap();
+        let mut live = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let mut dead = std::process::Command::new("true").spawn().unwrap();
+        dead.wait().unwrap();
+        let files = |pid: u32| [spool.join(format!("{pid}.out")), spool.join(format!("{pid}.err"))];
+        for path in files(live.id()).iter().chain(&files(dead.id())) {
+            std::fs::write(path, "x").unwrap();
+        }
+        let daemon = spawn_daemon(&dir, Options { verbs: Some(runner), ..opts(1, 150) });
+        // Seen through the socket: the sweep ran before the listener answers.
+        let _ = hello_at(&dir, &v(1));
+        assert!(files(dead.id()).iter().all(|p| !p.exists()), "a dead verb's files were kept");
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(!daemon.is_finished(), "idled out with an adopted verb running");
+        assert!(files(live.id()).iter().all(|p| p.exists()));
+        // Reaped here (a zombie is still alive to `kill(0)`).
+        live.kill().unwrap();
+        live.wait().unwrap();
+        assert_eq!(daemon.join().unwrap().unwrap(), Exit::Idle);
+        assert!(files(live.id()).iter().all(|p| !p.exists()), "an adopted verb's files were kept");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&root);
     }

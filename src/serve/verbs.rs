@@ -12,7 +12,8 @@
 //! to spool files, `<data-dir>/devsandbox/logs/verbs/<pid>.out|.err`, not
 //! pipes: a daemon exiting mid-verb (handoff, crash) would EPIPE a pipe, and
 //! `stop`/`rm` have no build-log tee to fall back on. The files are removed
-//! once the exit is reported; a successor finds live verbs by them.
+//! once the exit is reported; a successor finds live verbs by them and holds
+//! itself open until they exit ([`InFlight::adopt`]).
 //!
 //! One loop on the connection's thread per request ([`serve`]): copy new
 //! spool bytes into `output` notifications, re-read `state.toml` for
@@ -373,23 +374,114 @@ impl Runner {
     }
 }
 
-/// The daemon's verb subprocesses not reaped yet, by pid, detached ones
-/// included: the `verbs` holder count.
+/// The verbs in flight: the `verbs` holder count. Our own subprocesses not
+/// reaped yet, by pid, detached ones included; and the *adopted* ones, verbs
+/// a previous daemon left running at its exit (handoff, idle, crash), found
+/// by their spool files at start ([`InFlight::adopt`]). Those aren't our
+/// children: they're polled with `pid_alive`, never waited on.
 #[derive(Debug, Default)]
-pub struct InFlight(Mutex<BTreeMap<u32, &'static str>>);
+pub struct InFlight {
+    own: Mutex<BTreeMap<u32, &'static str>>,
+    adopted: Mutex<BTreeSet<u32>>,
+}
 
 impl InFlight {
     pub fn len(&self) -> usize {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).len()
+        self.own.lock().unwrap_or_else(|e| e.into_inner()).len()
+            + self.adopted.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     fn insert(&self, pid: u32, verb: &'static str) {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).insert(pid, verb);
+        self.own.lock().unwrap_or_else(|e| e.into_inner()).insert(pid, verb);
     }
 
     fn remove(&self, pid: u32) {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).remove(&pid);
+        self.own.lock().unwrap_or_else(|e| e.into_inner()).remove(&pid);
     }
+
+    /// The start sweep of `spool`: a live verb's files make it adopted (it
+    /// holds the daemon until it exits), a dead one's are removed, and so
+    /// are temp files whose daemon is gone (it died between create and
+    /// rename). Only for a daemon holding the start lock: no predecessor is
+    /// still draining, so every file is a leftover or a live orphan.
+    pub fn adopt(&self, spool: &Path, log: fn(&str)) {
+        let adopted = sweep(spool, &crate::state::pid_alive, log);
+        for pid in &adopted {
+            log(&format!("adopted verb (pid {pid}): left running by a previous daemon"));
+        }
+        self.adopted.lock().unwrap_or_else(|e| e.into_inner()).extend(adopted);
+    }
+
+    /// Drop the adopted verbs that have exited and remove their spool files.
+    /// Cheap (a `kill(0)` each), so the accept loop calls it every tick.
+    pub fn check_adopted(&self, spool: &Path, log: fn(&str)) {
+        let mut adopted = self.adopted.lock().unwrap_or_else(|e| e.into_inner());
+        adopted.retain(|&pid| {
+            if crate::state::pid_alive(pid) {
+                return true;
+            }
+            remove_spool(spool, pid);
+            log(&format!("adopted verb (pid {pid}) exited"));
+            false
+        });
+    }
+}
+
+/// A file in the spool dir, by its name (the rest isn't ours to touch).
+#[derive(Debug, PartialEq, Eq)]
+enum SpoolName {
+    /// `<pid>.out|.err`: a verb's.
+    Verb(u32),
+    /// `.<daemon-pid>-<seq>.out.tmp|.err.tmp`: before the rename.
+    Temp(u32),
+}
+
+fn spool_name(name: &str) -> Option<SpoolName> {
+    fn pid(s: &str) -> Option<u32> {
+        (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())).then(|| s.parse().ok()).flatten()
+    }
+    if let Some(temp) = name.strip_prefix('.').and_then(|n| n.strip_suffix(".tmp")) {
+        let stem = temp.strip_suffix(".out").or_else(|| temp.strip_suffix(".err"))?;
+        let (daemon, seq) = stem.split_once('-')?;
+        pid(seq)?;
+        return pid(daemon).map(SpoolName::Temp);
+    }
+    let stem = name.strip_suffix(".out").or_else(|| name.strip_suffix(".err"))?;
+    pid(stem).map(SpoolName::Verb)
+}
+
+/// Remove the dead verbs' and dead daemons' files in `spool`; the live
+/// verbs' pids. A missing dir has nothing in it.
+fn sweep(spool: &Path, alive: &dyn Fn(u32) -> bool, log: fn(&str)) -> BTreeSet<u32> {
+    let mut live = BTreeSet::new();
+    let Ok(entries) = std::fs::read_dir(spool) else { return live };
+    let mut dead = BTreeSet::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(kind) = name.to_str().and_then(spool_name) else { continue };
+        match kind {
+            SpoolName::Verb(pid) if alive(pid) => {
+                live.insert(pid);
+            }
+            SpoolName::Verb(pid) => {
+                dead.insert(pid);
+            }
+            SpoolName::Temp(daemon) if alive(daemon) => {}
+            SpoolName::Temp(_) => {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    for pid in dead {
+        remove_spool(spool, pid);
+        log(&format!("removed the spool files of a finished verb (pid {pid})"));
+    }
+    live
+}
+
+fn remove_spool(spool: &Path, pid: u32) {
+    let _ = std::fs::remove_file(spool.join(format!("{pid}.out")));
+    let _ = std::fs::remove_file(spool.join(format!("{pid}.err")));
 }
 
 /// The requesting connection, as the loop sees it.
@@ -1094,6 +1186,35 @@ pub(crate) mod tests {
             state: dir.join("state.toml"),
         };
         (runner, dir)
+    }
+
+    #[test]
+    fn spool_names_are_verbs_temps_or_not_ours() {
+        assert_eq!(spool_name("123.out"), Some(SpoolName::Verb(123)));
+        assert_eq!(spool_name("123.err"), Some(SpoolName::Verb(123)));
+        assert_eq!(spool_name(".77-0.out.tmp"), Some(SpoolName::Temp(77)));
+        assert_eq!(spool_name(".77-12.err.tmp"), Some(SpoolName::Temp(77)));
+        for other in ["123.log", "x.out", ".out", "+1.out", "123.out.tmp", ".77.out.tmp", ".77-x.out.tmp", "notes"] {
+            assert_eq!(spool_name(other), None, "{other}");
+        }
+    }
+
+    #[test]
+    fn the_sweep_keeps_live_verbs_and_drops_the_dead() {
+        let dir = scratch("verbs-sweep");
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["10.out", "10.err", "20.out", "20.err", ".30-0.out.tmp", ".40-1.err.tmp", "notes"] {
+            std::fs::write(dir.join(name), "").unwrap();
+        }
+        let live = sweep(&dir, &|pid| pid == 10 || pid == 30, |_| {});
+        assert_eq!(live, BTreeSet::from([10]));
+        let mut left: Vec<_> =
+            std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        left.sort();
+        assert_eq!(left, [".30-0.out.tmp", "10.err", "10.out", "notes"]);
+        // A missing dir: nothing to adopt.
+        assert!(sweep(&dir.join("nope"), &|_| true, |_| {}).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn wait_for(what: &str, f: impl Fn() -> bool) {
