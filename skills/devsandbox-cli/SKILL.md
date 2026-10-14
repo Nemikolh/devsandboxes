@@ -132,6 +132,14 @@ listed when stdin is not a TTY.
    prefix), so service containers work: `devsandbox logs devsandbox-svc-<proj>-database`.
    First stop when a lifecycle command or service misbehaves.
 
+   **`logs --build <name> [-f|--follow]`** prints the instance's build log
+   instead: everything its last `run`/`rebuild`/`start` printed (image build,
+   lifecycle commands, git, the final error), from
+   `<data>/devsandbox/logs/<instance_id>/build.log` (the one before is
+   `build.1.log`; `rm` deletes both, as does a rolled-back `run`). `--follow`
+   keeps printing while the instance is still being built and exits once it's
+   up, failed, or gone. Runs from the dashboard have no build log yet.
+
 4. **`inspect <name>`** — pretty-printed runtime `inspect` JSON (config, mounts,
    networks, env, exit code). Same name resolution as `logs`, service containers
    included. Keys are colour-highlighted on a TTY only; piped output is plain
@@ -201,6 +209,7 @@ Container name for an instance is `devsandbox-<instance>`; service containers ar
 
 ```bash
 devsandbox ps -a                  # what exists, what's stopped
+devsandbox logs --build web       # what the last run/rebuild/start printed
 devsandbox logs web               # lifecycle / container output (-n 200 for more)
 devsandbox logs devsandbox-svc-<proj>-database   # a service's output
 devsandbox inspect web            # mounts, networks, env, exit code

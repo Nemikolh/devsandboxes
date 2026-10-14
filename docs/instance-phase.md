@@ -174,6 +174,14 @@ leaves a `Failed` record.
 - Docs: the `logs` section of the user docs (find where `logs` is
   documented under `site/` and `docs/`) and the CLI help.
 
+Build log, as built (`src/build_log.rs`): the tee is opt-in
+(`build_log::enable()` from `main` for the three verbs), since the dashboard
+and `serve` call them in-process; until step 6 dashboard runs have no log.
+Two pipes and two copier threads: the terminal gets bytes as they come, the
+log whole lines. The command's error is appended as a last `error:` line.
+A rolled-back `run` removes the log dir with the record, like `rm`. What
+`main` prints after the command (the instance name, autostart) isn't logged.
+
 ## Step 5: phase in `ps` and the snapshot
 
 - `src/snapshot.rs` `InstanceRow` (`:53`): add `phase: Option<PhaseRow>`

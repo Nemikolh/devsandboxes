@@ -1,3 +1,4 @@
+mod build_log;
 mod commands;
 mod config;
 mod daemon_config;
@@ -149,14 +150,23 @@ enum Command {
         #[command(subcommand)]
         cmd: InboxCommand,
     },
-    /// Show the last lines of a container's logs
+    /// Show the last lines of a container's logs, or an instance's build log
     Logs {
         /// Instance name, sandbox config name, repository folder name, or
         /// devsandbox container name (service containers included)
         name: String,
-        /// Number of log lines to show
+        /// Number of log lines to show (container logs only)
         #[arg(short = 'n', long, default_value_t = 50)]
         lines: usize,
+        /// Show the instance's build log instead: the whole output of its
+        /// last `run`/`rebuild`/`start` (the one before is `build.1.log`
+        /// next to it)
+        #[arg(long)]
+        build: bool,
+        /// With --build: keep printing while the instance is still being
+        /// built, until it's done or failed
+        #[arg(short, long, requires = "build")]
+        follow: bool,
     },
     /// Pretty-print the runtime's inspect JSON for a container
     Inspect {
@@ -391,6 +401,9 @@ fn main() -> Result<()> {
             // Taken before any work so every child process (and autostart
             // below) writes to stderr; only the final document hits stdout.
             let json_out = json.then(json_stdout::JsonStdout::capture).transpose()?;
+            // A CLI process: the build log may tee fds 1/2 (on top of
+            // `--json`'s redirect). Autostart's runs below get their own.
+            build_log::enable();
             let extras = commands::run::RunExtras { env, dispatcher };
             let result = commands::run::run(&cli.dir, sandbox, name, branch, base, extras);
             if let (None, Ok(Some(key))) = (&json_out, &result) {
@@ -412,6 +425,7 @@ fn main() -> Result<()> {
             }
         }
         Command::Rebuild { name, all, force } => {
+            build_log::enable();
             let result = commands::rebuild::rebuild(&cli.dir, name, all, force);
             // Like `start`: the rebuilt container is up, and a dispatcher /
             // inbox instance needs a host even with no dashboard open.
@@ -428,6 +442,7 @@ fn main() -> Result<()> {
         }
         Command::Stop { name, all } => commands::stop::stop(name, all),
         Command::Start { name, all } => {
+            build_log::enable();
             let result = commands::start::start(&cli.dir, name, all);
             commands::autostart::autostart(&cli.dir);
             #[cfg(unix)]
@@ -456,7 +471,13 @@ fn main() -> Result<()> {
                 InboxCommand::Reopen { thread } => inbox::mutate(&thread, Mutation::Reopen),
             }
         }
-        Command::Logs { name, lines } => commands::logs::logs(&name, lines),
+        Command::Logs { name, lines, build, follow } => {
+            if build {
+                commands::logs::build_log(&name, follow)
+            } else {
+                commands::logs::logs(&name, lines)
+            }
+        }
         Command::Inspect { name, json } => commands::inspect::inspect(&name, json),
         Command::Vscode { name, goto } => commands::vscode::vscode(&cli.dir, &name, goto.as_ref()),
         Command::Done { name } => commands::done::done(&name, true),

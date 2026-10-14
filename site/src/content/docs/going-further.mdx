@@ -20,10 +20,12 @@ devsandbox exec web pnpm test
 
 `run` builds the image (Features included), starts the `database` service, creates the container `devsandbox-web` with `../web` mounted as the workspace, runs `postCreateCommand`, and returns once it's up. The instance runs in the background.
 
+What `run`, `rebuild` and `start` print, image build and lifecycle commands included, also goes to the instance's build log. `devsandbox logs --build web` prints it, and `--follow` keeps printing until the instance is up or has failed. The previous one is kept next to it as `build.1.log`.
+
 `exec` runs in the workspace directory as the configured `remoteUser`, exits with the command's own status, and takes `-i` / `-t` only for interactive shells. Any command that takes a name accepts an instance name, a sandbox name or the repo folder's basename.
 
 <Callout variant="note" title="When a lifecycle command fails">
-  A failing `postCreateCommand` aborts `run` but keeps the container, so `devsandbox logs web` and `devsandbox exec web …` can show you why.
+  A failing `postCreateCommand` aborts `run` but keeps the container, so `devsandbox logs --build web`, `devsandbox logs web` and `devsandbox exec web …` can show you why.
 </Callout>
 
 ## A second instance
@@ -60,7 +62,7 @@ devsandbox rm web-2     # container, worktree and state entry gone
 devsandbox gc           # reap services nothing references
 ```
 
-`rm` also removes the instance's isolated services and network, and on a terminal asks before deleting the branch it created. Managed shell history is kept. Global services such as `database` outlive every `rm` until `gc` finds nothing referencing them.
+`rm` also removes the instance's isolated services, network and build log, and on a terminal asks before deleting the branch it created. Managed shell history is kept. Global services such as `database` outlive every `rm` until `gc` finds nothing referencing them.
 
 ## Next steps
 

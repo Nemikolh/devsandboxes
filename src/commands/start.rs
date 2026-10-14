@@ -47,7 +47,15 @@ pub fn start(dir: &Path, name: Option<String>, all: bool) -> Result<()> {
     start_instance(dir, &key, info)
 }
 
+/// Start one instance, its output going to its build log too (one log per
+/// instance under `--all`, and for autostart's starts when the CLI runs it).
 pub(crate) fn start_instance(dir: &Path, key: &str, info: &Instance) -> Result<()> {
+    let log = crate::build_log::open(&info.instance_id);
+    log.outcome(start_logged(dir, key, info))
+}
+
+/// [`start_instance`]'s work, inside the build log.
+fn start_logged(dir: &Path, key: &str, info: &Instance) -> Result<()> {
     // Re-point the agent symlink before either start path so a restart after
     // host agent rotation re-captures the live socket (docs/ssh-agent.md).
     run::ssh_agent_refresh(info);

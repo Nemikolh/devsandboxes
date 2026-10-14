@@ -101,8 +101,22 @@ fn needs_rebuild(dir: &Path, container: &str, sandbox: &ResolvedSandbox) -> Resu
 }
 
 /// Remove `key`'s container and re-materialize it from `config`, reusing the
-/// stored source/worktree/branch so the working tree survives.
+/// stored source/worktree/branch so the working tree survives. Its output
+/// goes to the instance's build log too (one log per instance under `--all`).
 fn rebuild_instance(
+    dir: &Path,
+    config: &Config,
+    sandbox: &ResolvedSandbox,
+    key: &str,
+    state: &mut State,
+) -> Result<()> {
+    let instance_id = state.instances.get(key).expect("key came from state").instance_id.clone();
+    let log = crate::build_log::open(&instance_id);
+    log.outcome(recreate(dir, config, sandbox, key, state))
+}
+
+/// [`rebuild_instance`]'s work, inside the build log.
+fn recreate(
     dir: &Path,
     config: &Config,
     sandbox: &ResolvedSandbox,

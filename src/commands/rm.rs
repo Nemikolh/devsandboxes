@@ -118,6 +118,8 @@ pub fn rm(name: &str, delete_branch: Option<bool>, force: bool) -> Result<()> {
         fresh.instances.retain(|_, i| i.instance_id != instance_id);
         Ok(())
     })?;
+    // The build log goes with the record.
+    crate::build_log::remove(&instance_id);
     archive_inbox(&key, &instance_id);
     println!("removed {key}");
     Ok(())

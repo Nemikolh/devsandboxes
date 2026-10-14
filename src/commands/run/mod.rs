@@ -225,6 +225,9 @@ pub fn run(
         fresh.instances.insert(instance.clone(), provisional);
         Ok(())
     })?;
+    // From here everything printed (children's output included) also goes
+    // to the instance's build log, the rollback's included.
+    let log = crate::build_log::open(&instance_id);
 
     let mut branch_start = None;
     let result = (|| {
@@ -256,7 +259,7 @@ pub fn run(
             &mut tracker,
         )
     })();
-    if let Err(e) = result {
+    let result = result.map_err(|e| {
         let outcome = tracker.on_failure(true);
         match outcome {
             OnFailure::RollBack => progress::rollback(&instance_id, branch_start.as_deref()),
@@ -265,15 +268,14 @@ pub fn run(
         // Not the step's own error: a child killed by the same Ctrl-C
         // reports some failure of its own.
         if cancel::requested() {
-            bail!("`{instance}` {}: rolled back", cancel::CANCELLED);
+            return anyhow::anyhow!("`{instance}` {}: rolled back", cancel::CANCELLED);
         }
-        return Err(match outcome {
+        match outcome {
             OnFailure::RollBack => e,
             OnFailure::KeepFailed => anyhow::anyhow!("{e:#}; {}", kept_hint(&instance)),
-        });
-    }
-
-    Ok(Some(instance))
+        }
+    });
+    log.outcome(result).map(|()| Some(instance))
 }
 
 /// `run`'s name check, against the current state: the name must be free (a

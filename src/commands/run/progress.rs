@@ -177,8 +177,11 @@ pub(crate) fn rollback(instance_id: &str, branch_start: Option<&str>) {
         fresh.instances.retain(|_, i| i.instance_id != instance_id);
         Ok(())
     });
-    if let Err(e) = removed {
-        warn("state record", e);
+    match removed {
+        // The build log goes with the record, as on `rm` (a `logs --build
+        // --follow` reading it still gets the rest: it holds the file open).
+        Ok(()) => crate::build_log::remove(instance_id),
+        Err(e) => warn("state record", e),
     }
 }
 
