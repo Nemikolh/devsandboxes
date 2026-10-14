@@ -22,6 +22,13 @@ devsandbox exec web pnpm test
 
 What `run`, `rebuild` and `start` print, image build and lifecycle commands included, also goes to the instance's build log. `devsandbox logs --build web` prints it, and `--follow` keeps printing until the instance is up or has failed. The previous one is kept next to it as `build.1.log`.
 
+`run`, `rebuild`, `start`, `stop` and `rm` do their work in the [host daemon](/docs/host-daemon), with your shell's environment, and print it as it goes: closing the terminal doesn't stop a build, and Ctrl-C still cancels it (a cancelled `run` is undone). Pass `-d` (`--detach`) to `run`, `rebuild` or `start` to get the instance name back as soon as it's registered and leave the build running:
+
+```bash
+devsandbox rebuild -d --force web   # prints: web, the build goes on
+devsandbox logs --build web --follow
+```
+
 `exec` runs in the workspace directory as the configured `remoteUser`, exits with the command's own status, and takes `-i` / `-t` only for interactive shells. Any command that takes a name accepts an instance name, a sandbox name or the repo folder's basename.
 
 <Callout variant="note" title="When a lifecycle command fails">

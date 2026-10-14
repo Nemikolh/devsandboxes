@@ -32,9 +32,9 @@ devsandbox              # the dashboard
 | ------------------------------------------ | ------------------------------------------------------------------------- |
 | `devsandbox`                               | TUI dashboard on a TTY; help otherwise                                    |
 | `ls` / `ps [-a]`                           | Sandbox configs / instances                                               |
-| `run [sandbox] [--name] [--branch]`        | Create a fresh instance (picker without args)                             |
-| `start` / `stop <name>\|--all`             | Start / Stop an instance                                                  |
-| `rebuild <name>\|--all [--force]`          | Recreate from current config when drifted; worktree and state kept        |
+| `run [sandbox] [--name] [--branch] [-d]`   | Create a fresh instance (picker without args)                             |
+| `start [-d]` / `stop <name>\|--all`        | Start / Stop an instance                                                  |
+| `rebuild <name>\|--all [--force] [-d]`     | Recreate from current config when drifted; worktree and state kept        |
 | `rm <name>`                                | Remove sandbox: container, worktree, and state entry are removed          |
 | `exec [-i] [-t] <name> [cmd…]`             | Exec honoring `remoteEnv` / `remoteUser`; no `cmd`: login shell           |
 | `vscode <name> [--goto PATH[:LINE[:COL]]]` | Open VS Code attached to the instance, optionally at a file and line      |
@@ -45,6 +45,8 @@ devsandbox              # the dashboard
 | `service ls` / `service rebuild`           | List services / recreate one and rewire running sandboxes in place        |
 | `gc [--force]`                             | Reap unreferenced services, orphaned history files and agent links        |
 | `status --json`                            | Full snapshot for scripts; `ps`/`ls`/`stats`/`inspect`/`run`/`inbox` take `--json` |
+
+`run`, `rebuild`, `start`, `stop` and `rm` run in the host daemon (`devsandbox serve`, started on demand; Linux and macOS) with your shell's environment, and stream their output back: closing the terminal doesn't stop them, Ctrl-C still cancels. `-d` / `--detach` returns once the instance is registered and prints its name; `devsandbox logs --build <name> --follow` follows the rest.
 
 `devsandbox port` makes a port inside a running instance or service reachable on the host:
 

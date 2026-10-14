@@ -8,7 +8,8 @@ description: |
 # devsandbox CLI
 
 `devsandbox` manages devcontainer-style sandboxes directly on a container runtime
-(docker / podman / Apple `container`) — no devcontainer CLI, no daemon. One
+(docker / podman / Apple `container`) — no devcontainer CLI, no daemon to set
+up (its own host daemon starts on demand, see below). One
 `devsandboxes.toml` that lives outside of any project, unique per user.
 
 It defines templates, sandboxes, and shared services; the CLI derives containers, networks,
@@ -35,6 +36,15 @@ falls back to the default.
 
 `-C <dir>` (global flag) points any command at a different config root; default is
 the current directory.
+
+`run`, `rebuild`, `start`, `stop` and `rm` do their work in the per-user host
+daemon (`devsandbox serve`, started on demand; Linux and macOS) with the
+calling shell's environment, and stream their output and exit code back as if
+they ran in place. Killing the terminal doesn't stop them; Ctrl-C still
+cancels (exit 130). With no daemon reachable they print one `warning:` line and
+run in-process. `-d` / `--detach` on `run`, `rebuild` and `start` returns once
+the instance is registered, printing only its name (`run -d --json`: the run
+record); follow the rest with `logs --build <name> --follow`.
 
 ## devsandboxes.toml
 
@@ -99,7 +109,7 @@ listed when stdin is not a TTY.
    devsandbox exec web          # interactive login shell on a TTY
    ```
 
-2. **`run [sandbox] [--name <n>]`** — create/start an instance in the **background**.
+2. **`run [sandbox] [--name <n>] [-d]`** — create/start an instance in the **background**.
    Prints the instance name on stdout, but child output (image builds,
    `docker run`, git, hooks) may precede it and an autostart pass may follow
    it with its own lines. **`--json`** sends all of
@@ -138,7 +148,7 @@ listed when stdin is not a TTY.
    `<data>/devsandbox/logs/<instance_id>/build.log` (the one before is
    `build.1.log`; `rm` deletes both, as does a rolled-back `run`). `--follow`
    keeps printing while the instance is still being built and exits once it's
-   up, failed, or gone. Runs from the dashboard have no build log yet.
+   up, failed, or gone. Only the daemon's own autostart pass writes no build log.
 
 4. **`inspect <name>`** — pretty-printed runtime `inspect` JSON (config, mounts,
    networks, env, exit code). Same name resolution as `logs`, service containers
@@ -159,7 +169,7 @@ listed when stdin is not a TTY.
    containers. Idempotent (already-stopped/missing is fine). State survives; a
    later `run` restarts it.
 
-9. **`rebuild <name>`** / **`rebuild --all`** (alias `recreate`) — recreate the
+9. **`rebuild <name>`** / **`rebuild --all`** (alias `recreate`; `-d` as for `run`) — recreate the
    instance's container from the current config when it has drifted; the
    worktree, branch, instance name, and per-instance state (shell history,
    `${instance}` mounts) are kept and the lifecycle commands re-run. No drift →

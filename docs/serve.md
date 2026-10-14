@@ -1,8 +1,9 @@
 # `devsandbox serve`: the host daemon
 
 A per-user, per-host background process that owns the live host side of
-devsandbox (bridges, popups, control ops, port forwards, the API) so it
-keeps working with the dashboard closed. Design and roadmap:
+devsandbox (bridges, popups, control ops, port forwards, the API) and runs
+`run`, `rebuild`, `start`, `stop` and `rm` for their callers, so all of it
+keeps working with the dashboard or the terminal closed. Design and roadmap:
 `docs/inbox-redesign.md`, "Host daemon". Unix only; the command doesn't
 exist on Windows.
 
@@ -13,7 +14,8 @@ page, `docs/api.md`.
 
 Code: `src/serve/` (`endpoint.rs` paths + bind/connect/accept, `daemon.rs`,
 `host.rs` bridges + autostart, `forwards.rs` port forwards, `api.rs`
-methods, `client.rs`, `relay.rs` the `api --stdio` relay, `install.rs`
+methods, `verbs.rs` / `verbs_client.rs` the verbs' daemon and CLI sides,
+`client.rs`, `relay.rs` the `api --stdio` relay, `install.rs`
 `serve install|uninstall`, `idle.rs`, `proto.rs`).
 
 ## Paths and permissions
@@ -54,16 +56,22 @@ plumbing: commands start it themselves (*lazy start*):
 Who starts it today: the dashboard (at launch, on a background thread; it
 keeps the connection open for its whole life and reconnects, starting a
 new daemon if needed, after a handoff or the daemon's death; see
-`docs/api.md`, *The dashboard as a client*), and `run` / `start` / `rebuild` once
-their container is up (best effort: a failure is one `warning:` line on
-stderr, the command still succeeds; they hang up right away), and every
-command that relays the ssh-agent into a relay-mode instance (`exec`,
-`start`'s `postStartCommand`, `run`'s lifecycle chain) for its bridge (see
-*Bridges*), and `devsandbox api --stdio` (the relay external clients and
-the npm package spawn; it stays connected while it runs, see `docs/api.md`,
-*Relay*). `devsandbox inbox`'s mutations use a daemon that's already
+`docs/api.md`, *The dashboard as a client*), every `run` / `rebuild` /
+`start` / `stop` / `rm`, before any work, since the daemon runs them (a
+daemon that doesn't start is one `warning:` line, and the verb runs in the
+CLI's process; `docs/api.md`, *The CLI as a client*), every command that
+relays the ssh-agent into a relay-mode instance (`exec`) for its bridge
+(see *Bridges*), and `devsandbox api --stdio` (the relay external clients
+and the npm package spawn; it stays connected while it runs, see
+`docs/api.md`, *Relay*). A verb running as `--in-process` (the daemon's
+own subprocesses, the CLI's fallback, the dispatcher's child ops) never
+starts one: its bridge requests only reach a daemon that's already
+running. `devsandbox inbox`'s mutations use a daemon that's already
 running but never start one (`docs/inbox-cli.md`); the foreground `port`
 command doesn't use the daemon.
+
+A verb's work runs with the caller's environment, sent with the request
+(`docs/api.md`, *Verbs*), not the daemon's.
 
 The daemon inherits the environment of the process that started it: the
 runtime choice (`DEVSANDBOX_RUNTIME`), `SSH_AUTH_SOCK` (the agent its bridges
@@ -146,8 +154,8 @@ own process, without the daemon.
 At start the daemon runs the `autostart = true` pass
 (`docs/automations-guide.md`) once for every config root recorded in
 `state.toml`, on a background thread; its notes go to `serve.log`. The pass
-is once per boot per root, so the dashboard, `run` and `start` still calling
-it is harmless.
+is once per boot per root, so the dashboard, and `run`, `rebuild` and `start`
+(in the verb's process, after it), also calling it is harmless.
 
 ## Wire
 
@@ -342,7 +350,7 @@ runtime stops or starts answering, at each forwards status line
 
 ## Future work
 
-The verbs moving into the daemon, the dashboard as a pure client, and
+The other verbs moving into the daemon, the dashboard as a pure client, and
 remote machines: `docs/client-server.md` (Windows: `docs/windows-support.md`).
 
 Accepted trade-offs of the current design, to revisit:

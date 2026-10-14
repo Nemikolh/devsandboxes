@@ -1,10 +1,54 @@
 # Verbs as requests: `run`, `rebuild`, `start`, `stop`, `rm` through the daemon
 
-Status: plan. Rollout step 3 of `docs/client-server.md` (read its
-*Requests*, *Execution, internally*, *Failure* and *Handoff* first). Steps
-1–2 are built in-process: `docs/instance-phase.md`. `services *` and the
-other verbs, the dashboard as a pure client (rm/stop included) and machines
-come after, in their own plans.
+Status: done (steps 1–6). Rollout step 3 of `docs/client-server.md` (read
+its *Requests*, *Execution, internally*, *Failure* and *Handoff* first).
+Steps 1–2 are built in-process: `docs/instance-phase.md`. `services *` and
+the other verbs, the dashboard as a pure client (rm/stop included) and
+machines come after, in their own plans. The reference is `docs/api.md`,
+*Verbs* and *The CLI as a client*.
+
+As built, where it differs from the steps below (the *Decisions* and F1–F10
+are current otherwise; the steps are kept as the record):
+
+- Autostart runs in the daemon's subprocess, after the verb, with the
+  caller's env (`--in-process` takes `main`'s in-process arm whole), not in
+  the client.
+- `-d` and rm's `ask` round hold the verb's output back: `-d` prints only
+  the name (replaying the output if the verb fails before it's
+  registered), and the `confirm` round's `Error:` line isn't shown before
+  the prompt.
+- A detached request is never cancelled by its client hanging up, before
+  its answer included (the Decisions said "unless `detach` and already
+  answered").
+- A client that stops reading for 5 s is disconnected, but its verb runs
+  on: a slow reader isn't a hang-up.
+- `sandboxes.list` entries are `SandboxEntry` (`{name}`), not the
+  snapshot's `SandboxRow`.
+- The cancel the dashboard and `instances.cancel` share is
+  `commands::run::cancel` (`cancel_instance`), not a new module.
+- `run -d --json`'s record is the `run --json` record; it has no phase
+  field.
+
+Known limitations:
+
+- A CLI that loses its daemon mid-verb follows the build log from the
+  start, so lines it already streamed show again.
+- `-d`'s Ctrl-C before the instance is registered hangs up, and a detached
+  request survives that: the build runs on. Once its row shows, only the
+  dashboard's `d` or `instances.cancel` stop it (the CLI has no cancel
+  verb).
+- The dashboard's `rm`/`stop` still run in its own process, suspended
+  (rollout step 4).
+- The daemon's startup autostart pass (`src/serve/host.rs`) still runs
+  in-process, in the daemon, and its runs get no build log.
+- An adopted verb is tracked by pid only: a pid reused by an unrelated
+  process holds the daemon until that process exits.
+- The npm client has no typed helpers for the verbs: `api.call('run', …)`
+  is typed through `ApiMethods`, and `output`/`progress` are typed events,
+  but there's no `api.run(…)`. A verb holds the `connect()` connection
+  until it answers (other calls on it wait), and `api.close()` hangs up,
+  cancelling a non-detached one. The package's `run()`/`start()`/… spawn
+  the CLI, which goes through the daemon itself.
 
 ## Problem
 

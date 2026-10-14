@@ -15,7 +15,7 @@ import { REPO_URL, VERSION } from '../../lib/nav';
 
 ## Prerequisites
 
-devsandboxes drives a container runtime directly: no devcontainer CLI, no daemon of its own. You need:
+devsandboxes drives a container runtime directly: no devcontainer CLI, no daemon to set up (its own starts on demand). You need:
 
 - A running **docker**, **podman** or Apple **`container`** (macOS). The default is `container` on macOS and `docker` elsewhere; pick another with `DEVSANDBOX_RUNTIME=docker|podman|container`.
 - **`git`**, for the worktrees extra instances get.

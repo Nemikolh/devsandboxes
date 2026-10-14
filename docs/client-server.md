@@ -1,14 +1,16 @@
 # Client/server: the CLI as a client of `devsandbox serve`
 
-Status: design. Rollout steps 1–2 (instance phase, build log, a TUI that
-doesn't suspend) are done, in-process: `docs/instance-phase.md`. The rest is
-not implemented.
+Status: design, rollout steps 1–3 done. Steps 1–2 (instance phase, build
+log, a TUI that doesn't suspend) in-process: `docs/instance-phase.md`. Step
+3 (verbs as requests) for `run`, `rebuild`, `start`, `stop` and `rm`:
+`docs/verbs-as-requests.md`. The rest is not implemented.
 
-Today every verb (`run`, `start`, `rebuild`, `rm`, …) does its work in the
-process you started, and the daemon (`docs/serve.md`) only owns the live
-host side: bridges, forwards, the API. This doc moves the verbs' work into
-the daemon, the way `docker` hands everything to `dockerd`. The CLI and the
-TUI become clients, and the client can be on another machine.
+The daemon (`docs/serve.md`) owns the live host side: bridges, forwards,
+the API, and now the five verbs above. Every other verb (`services *`,
+`rename`, `done`, `gc`, …) still does its work in the process you started.
+This doc moves the verbs' work into the daemon, the way `docker` hands
+everything to `dockerd`. The CLI and the TUI become clients, and the client
+can be on another machine.
 
 ## Goals
 
@@ -47,7 +49,10 @@ existing protocol (`docs/api.md`): `devsandbox run foo --branch x` sends a
   client canonicalizes `-C` (the only thing cwd matters for today,
   `src/main.rs:28`). For a machine, it's one of the machine's roots
   (*Config roots*). The client never sends a cwd.
-- **`env`**: the caller's environment, filtered. In-process, the verbs read
+- **`env`**: the caller's whole environment (non-UTF-8 variables left out),
+  required: the verb runs with it and `GIT_TERMINAL_PROMPT=0`, never with
+  the daemon's. Not an allowlist of the config's `${localEnv:…}` names:
+  that would need the config parsed first. In-process, the verbs read
   the calling shell's env today. A daemon only has the env of whoever
   started it (`docs/serve.md`, *Start*): an old shell, or systemd. Things
   that would quietly break without this field:
@@ -72,27 +77,49 @@ existing protocol (`docs/api.md`): `devsandbox run foo --branch x` sends a
   `${localEnv}` resolves for VS Code Remote-SSH + devcontainers. The one
   value that comes from the caller is the ssh-agent, through `ssh -A`
   (*Machines*).
-- **Streaming**: the request stays open until the verb ends. `progress`
-  (phase changes) and `output` (the verb's stdout/stderr) arrive as
-  notifications, and the CLI prints them the way it does today. `run --json`
-  prints the `result`.
-- **Hang-up = cancel** unless `detach`. Ctrl-C closes the connection (or
-  sends `cancel`), and the daemon cancels and the verb rolls back
-  (*Failure*).
-- **`-d` / `detach: true`**: the response comes as soon as the instance is
-  registered (phase `building`). The TUI always detaches.
-- **Prompts**: the verbs' interactive prompts (`rm`'s delete-branch
-  `confirm`, ambiguous-name `pick`) move to the client. Ambiguity is
-  resolved before the request is sent (a `resolve` method), and a
-  confirmation is a flag on the request. Daemon-side verbs never prompt
-  (same rule as `dispatch.rs`'s null stdin + `GIT_TERMINAL_PROMPT=0`).
+- **Streaming**: one connection per verb request, held until the verb
+  ends; nothing else is read from it meanwhile. `progress` (phase changes)
+  and `output` (the verb's stdout/stderr) arrive as notifications on it,
+  and the CLI prints them the way it does in-process. `run --json`'s
+  document arrives as `stdout` output.
+- **Hang-up = cancel**, unless `detach`: the daemon SIGINTs the verb's
+  process group and it rolls back (*Failure*). A detached request is never
+  cancelled by its client leaving, answered yet or not. A client that
+  stops reading for 5 s is disconnected, but its verb runs on (a paused
+  pager isn't a cancel), and so does a daemon exit (*Handoff*). The CLI's
+  first Ctrl-C sends `instances.cancel` on a second connection and keeps
+  streaming the rollback, then exits 130; the second hangs up.
+- **`-d` / `detach: true`** (`run`, `rebuild`, `start`): the response
+  comes as soon as the instance is registered. The CLI holds the verb's
+  output back and prints only the name (`run -d --json`: the run record),
+  or replays the output if the verb fails first. The TUI always detaches.
+- **Prompts** happen on the client, before the request: a `run` without a
+  sandbox picks from `sandboxes.list` (an empty config: the CLI offers the
+  example config itself, it writes into the user's dir), an ambiguous name
+  picks from `instances.resolve`'s matches. `rm`'s delete-branch question
+  is a round trip: the client sends `ask: true`, the verb stops before
+  removing anything and the daemon answers the error `confirm` with the
+  question; the client asks and resends with `deleteBranch`. Daemon-side
+  verbs never prompt (same rule as `dispatch.rs`'s null stdin +
+  `GIT_TERMINAL_PROMPT=0`).
+- **No daemon**: off unix, or when no daemon answers, the CLI prints one
+  `warning:` line and runs the verb in its own process (`-d` is an error
+  there). The dashboard has no fallback: its status line says the daemon
+  is needed.
 
 ### Execution, internally
 
-The daemon runs each verb as a `devsandbox -C <root> <verb> …` subprocess,
-like `src/commands/dispatch.rs`'s `Subprocess` executor: own process group,
-null stdin, env from the request, stdout/stderr teed to the instance's
-build log and the requester. Why a subprocess and not a thread:
+The daemon runs each verb as a `devsandbox --in-process -C <root> <verb> …`
+subprocess (`src/serve/verbs.rs`), like `src/commands/dispatch.rs`'s
+`Subprocess` executor: own process group, null stdin, env from the request.
+`--in-process` (hidden) runs the verb in that process and never starts a
+daemon, so a draining daemon's verb can't lazy-start a racing successor;
+it's also what the CLI's fallback runs as. The verb writes its own build
+log, as in-process, and runs the autostart pass after it with the caller's
+env. Its stdout and stderr go to spool files,
+`<data>/devsandbox/logs/verbs/<pid>.out|.err`, which the daemon tails to
+the requester: with pipes, a daemon exiting mid-verb would break the verb's
+writes. Why a subprocess and not a thread:
 
 - a verb that panics or hangs takes down one request, not the daemon;
 - the version handoff doesn't have to wait for a 10-minute build (*Handoff*);
@@ -100,8 +127,10 @@ build log and the requester. Why a subprocess and not a thread:
 
 The daemon keeps an in-memory table of what's in flight (pid, request,
 instance). That's the internal *task*. The word never appears in the CLI,
-the TUI or the API. What persists is the instance's phase (next section),
-not a separate tasks file.
+the TUI or the API. What persists is the instance's phase (next section)
+and the spool files, not a separate tasks file. Every verb in flight,
+detached or adopted (*Handoff*), is an idle-exit holder: a detached `run`
+keeps the daemon alive until it ends.
 
 ## Instance phase
 
@@ -139,9 +168,10 @@ the whole output of its last `run`, `rebuild` or `start`, which rotate the
 previous one to `build.1.log`. `rm` (and a cancelled `run`) remove the
 directory. It's what the TUI's `b` opens and what `devsandbox logs --build
 <instance>` prints (`--follow` until the instance is no longer in flight).
-`instances.build_log` will serve it once verbs are requests. In-process it's
-an fd-level tee in the CLI (`src/build_log.rs`, unix only), opt-in from
-`main` for those three verbs. It replaced the TUI's suspended run and its
+An `instances.build_log` method would serve it to remote clients (not
+built). It's an fd-level tee in the verb's process (`src/build_log.rs`,
+unix only), opt-in from `main` for those three verbs: the daemon's
+subprocess, or the CLI in-process. It replaced the TUI's suspended run and its
 `logs/<verb>-<unix>.log` error files for those verbs.
 
 ### In the TUI
@@ -166,9 +196,10 @@ daemon (`instances.cancel`).
   error) with everything it made, and says how to retry or remove it. A run
   started from the dashboard runs unwatched, and a rollback would take its
   row and build log with it.
-- **Cancel is the only rollback** (Ctrl-C or SIGTERM in-process; later
-  hang-up or `cancel`, the daemon sending SIGINT to the verb's process
-  group; the dashboard's `d` is `instances.cancel`). A cancelled `run` undoes
+- **Cancel is the only rollback** (Ctrl-C or SIGTERM in-process; through
+  the daemon a hang-up or `instances.cancel`, which SIGINT the verb's
+  process group; the CLI's Ctrl-C and the dashboard's `d` are
+  `instances.cancel`). A cancelled `run` undoes
   everything recorded: container, per-instance services/network, volumes,
   `folders` worktrees, the worktree, the branch if it created it and it has
   no commits beyond its start point, then the record and its build log. A
@@ -188,13 +219,16 @@ daemon (`instances.cancel`).
 ## Handoff
 
 A newer client still triggers the version handoff (`docs/serve.md`). The
-verbs in flight are subprocesses with their output going to the build log,
-so the old daemon doesn't wait for them. It leaves them running and exits.
-The new daemon finds them through the `pid` + `phase` on their instances,
-follows their logs, and detects their exit by the pid. A client streaming
-a request across a handoff reconnects and resumes following the instance
-by name (`instances.follow`). Its request id is gone, and the instance is
-what it follows.
+verbs in flight are subprocesses with their output going to spool files,
+so the old daemon doesn't wait for them. It leaves them running and exits
+(as on an idle exit, `shutdown` or a crash). The new daemon sweeps the
+spool dir at start: a live pid's verb is adopted, a holder until the pid
+dies, unstreamed but still cancellable (`instances.cancel` signals the
+instance's recorded pid); a dead one's files are removed. A CLI whose
+connection ends before the answer says so and, for a build with a known
+instance, follows its build log locally (`logs --build --follow`) and
+exits by the instance's phase. Following over the protocol
+(`instances.follow`) is for remote clients, later.
 
 ## Config roots
 
@@ -314,9 +348,10 @@ helper. Needs a spike. Low priority, and nothing above depends on it.
 2. Done (`docs/instance-phase.md`): per-instance build log, phase in the
    TUI status column, `b` for the log, `run`/`rebuild`/`start` detached
    instead of suspended.
-3. Verbs as requests: `run`, `rebuild`, `start`, `stop`, `rm`, with
-   streaming, cancel, `-d`, env, prompts moved to the client. `services *`
-   and the rest follow.
+3. Done (`docs/verbs-as-requests.md`) for `run`, `rebuild`, `start`,
+   `stop`, `rm`: streaming, cancel, `-d`, env, prompts on the client.
+   `services *`, `rename`/`done`/`gc` and the rest are still in-process,
+   and so are the dashboard's `rm`/`stop` (step 4).
 4. Dashboard as a pure client (`instances.list`, `sandboxes.list`,
    procs/stats methods).
 5. `machine add|ls|rm`, the ssh transport, federation, `ssh -t` exec.
@@ -325,10 +360,5 @@ helper. Needs a spike. Low priority, and nothing above depends on it.
 
 ## Open questions
 
-- **Env filter**: the whole env, or an allowlist plus the `${localEnv:…}`
-  names the config references? The second is tighter but needs the config
-  parsed first.
-- **Idle exit**: a verb in flight is a holder. A detached `run` keeps the
-  daemon alive until it ends, which is the point.
 - **Machine-to-local fallback**: when no local daemon can run (Windows),
   does a configured default machine make `--machine` implicit?
