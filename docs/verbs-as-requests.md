@@ -231,9 +231,10 @@ drain does not; holders count it. No docker.
   to the matching stream as it arrives, exit per the result (F9). Connect
   failure → `warning:` + the in-process path (the fallback). Today's
   in-process branch (build log enable, autostart, `ensure_running`) is what
-  `--in-process` runs; keep `autostart` running in-process in the client
-  after a successful verb, as now (it's a once-per-boot pass; flag in the
-  summary if that turns out wrong).
+  `--in-process` runs. As built: the daemon's subprocess runs `autostart`
+  (with the caller's env) after the verb, so the client doesn't. `-d` and
+  rm's `ask` round hold their output back (stdout stays the name alone; the
+  `confirm` round's `Error:` line isn't shown before the prompt).
 - Prompts before sending: a missing `run` sandbox → `sandboxes.list` + `pick`
   on a TTY (F6, empty config → `offer_example_config`); an instance name →
   `instances.resolve`, `pick` on a TTY when several, else today's

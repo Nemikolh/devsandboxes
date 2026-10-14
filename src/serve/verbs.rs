@@ -887,22 +887,25 @@ pub(crate) mod tests {
             json: true,
         };
         match parse(run) {
-            Command::Run { sandbox, name, branch, base, env, dispatcher, json } => {
+            Command::Run { sandbox, name, branch, base, env, dispatcher, json, detach } => {
                 assert_eq!(sandbox.as_deref(), Some("-web"));
                 assert_eq!((name.as_deref(), branch.as_deref(), base.as_deref()), (Some("w2"), Some("-b"), Some("origin/main")));
-                assert!(json && env.is_empty() && dispatcher.is_none());
+                // The daemon detaches by itself: the subprocess never gets `-d`.
+                assert!(json && env.is_empty() && dispatcher.is_none() && !detach);
             }
             _ => panic!("not run"),
         }
         let run = Verb::Run { sandbox: "web".into(), name: None, branch: None, base: None, json: false };
         assert!(matches!(parse(run), Command::Run { name: None, branch: None, base: None, json: false, .. }));
         match parse(Verb::Rebuild { target: one("-x"), force: true }) {
-            Command::Rebuild { name, all, force } => assert_eq!((name.as_deref(), all, force), (Some("-x"), false, true)),
+            Command::Rebuild { name, all, force, detach: false } => {
+                assert_eq!((name.as_deref(), all, force), (Some("-x"), false, true))
+            }
             _ => panic!("not rebuild"),
         }
-        assert!(matches!(parse(Verb::Rebuild { target: Target::All, force: false }), Command::Rebuild { name: None, all: true, force: false }));
-        assert!(matches!(parse(Verb::Start { target: one("w") }), Command::Start { name: Some(n), all: false } if n == "w"));
-        assert!(matches!(parse(Verb::Start { target: Target::All }), Command::Start { name: None, all: true }));
+        assert!(matches!(parse(Verb::Rebuild { target: Target::All, force: false }), Command::Rebuild { name: None, all: true, force: false, detach: false }));
+        assert!(matches!(parse(Verb::Start { target: one("w") }), Command::Start { name: Some(n), all: false, detach: false } if n == "w"));
+        assert!(matches!(parse(Verb::Start { target: Target::All }), Command::Start { name: None, all: true, detach: false }));
         assert!(matches!(parse(Verb::Stop { target: one("w") }), Command::Stop { name: Some(n), all: false } if n == "w"));
         assert!(matches!(parse(Verb::Stop { target: Target::All }), Command::Stop { name: None, all: true }));
         for (delete_branch, flags) in [(None, (false, false)), (Some(true), (true, false)), (Some(false), (false, true))] {

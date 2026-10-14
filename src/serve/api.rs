@@ -371,7 +371,7 @@ struct NameParams {
 fn instances_resolve(p: NameParams, state: &Path) -> Answer {
     let matches = crate::commands::instance_matches(&load_state(state)?, &p.name);
     if matches.is_empty() {
-        return Err(ApiError::not_found(format!("no sandbox instance matches `{}`", p.name)));
+        return Err(ApiError::not_found(crate::commands::no_instance_matches(&p.name)));
     }
     serde_json::to_value(Resolved { matches }).map_err(|e| ApiError::internal(e.into()))
 }

@@ -88,6 +88,10 @@ git worktrees so working trees are never shared.
   group, stdout/stderr spooled in `logs/verbs/<pid>.out|.err`) streamed as
   `output`/`progress`; hang-up = SIGINT, a drain isn't one. The program,
   spool and state path are injectable (`Runner`), so tests run `sh`.
+  `verbs_client.rs` is the CLI side: prompts first (`sandboxes.list`,
+  `instances.resolve`, rm's `confirm` round), then streams the request;
+  Ctrl-C = `instances.cancel` on a second connection; no daemon → the
+  in-process fallback.
   `--in-process` (hidden, global) never lazy-starts a daemon
   (`client::set_in_process`); the dispatcher's subprocesses pass it too.
 - `src/runtime/` — backend abstraction over docker/podman/Apple container.

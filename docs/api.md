@@ -556,3 +556,25 @@ after every reconnect; `p` / `:port` is `forwards.add`, `d` is
 `forwards.rm`, `forwards.status` its status line. While disconnected the
 tab is empty and an add says the daemon is needed. Two dashboards share one
 daemon, and the same forwards.
+
+## The CLI as a client
+
+`devsandbox run`, `rebuild`, `start`, `stop` and `rm` are verb requests
+(*Verbs*; `src/serve/verbs_client.rs`), sent with the absolute `-C` and the
+shell's whole env (non-UTF-8 variables left out). Prompts come first, on
+the CLI's TTY: `run` lists `sandboxes.list` to pick a sandbox (none: it
+offers the example config itself, it writes into the user's dir), a
+`<name>` goes through `instances.resolve` (a pick among several), and `rm`
+without `--delete-branch`/`--keep-branch` sends `ask` and resends once
+after a `confirm`. Off a TTY: today's errors and defaults. `output` goes to
+its stream as it comes; the exit is 0, `failed`'s `data.exit` (nothing more
+printed), or 1 with another error's message. The first Ctrl-C sends
+`instances.cancel` on a second connection and keeps streaming the
+rollback, or hangs up when no instance is named yet (or the cancel is
+refused); a second kills the CLI (a hang-up); then it exits 130. `-d` is
+`detach`: it prints the instance (`run -d --json`: the record in the
+`run --json` envelope). A connection that ends before the answer leaves the
+verb running: the CLI says so and, for a build with a known instance,
+follows its build log and exits by its phase. No daemon reachable, or one
+answering `unknown-method`: one `warning:` line and the verb runs in the
+CLI's process, as `--in-process` (where `-d` is an error).

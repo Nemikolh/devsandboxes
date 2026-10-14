@@ -1111,7 +1111,9 @@ fn container_command() -> Vec<String> {
     vec!["sh".into(), "-c".into(), format!("[ -x {bin} ] && {bin} boot & exec sleep infinity")]
 }
 
-fn offer_example_config(dir: &Path) -> Result<()> {
+/// Shared with the verb client (`serve::verbs_client`): it writes into the
+/// user's dir, so it runs on the client, never in the daemon.
+pub(crate) fn offer_example_config(dir: &Path) -> Result<()> {
     let existing = crate::config::find(dir)?;
     let path = existing.clone().unwrap_or_else(|| dir.join(CONFIG_FILE));
     eprintln!("No sandboxes defined in {}.", path.display());

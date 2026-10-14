@@ -23,6 +23,8 @@
 //!   (step 10)
 //! - `verbs`: `run`/`rebuild`/`start`/`stop`/`rm` as requests, each a
 //!   `devsandbox --in-process` subprocess streamed back to its client
+//! - `verbs_client`: the CLI's side of those five: prompts, streaming,
+//!   Ctrl-C, exit codes, the in-process fallback
 
 pub mod api;
 pub mod client;
@@ -36,5 +38,6 @@ pub mod install;
 pub mod proto;
 pub mod relay;
 pub mod verbs;
+pub mod verbs_client;
 #[cfg(test)]
 pub(crate) mod dts;

@@ -103,16 +103,32 @@ pub(crate) fn resolve_instance_noninteractive(state: &State, name: &str) -> Resu
 fn resolve_instance_with(state: &State, name: &str, interactive: bool) -> Result<String> {
     let mut matches = instance_matches(state, name);
     match matches.len() {
-        0 => bail!("no sandbox instance matches `{name}` (see `devsandbox ps -a`)"),
+        0 => bail!("{}", no_instance_matches(name)),
         1 => Ok(matches.remove(0)),
         _ => {
             if !interactive {
-                bail!("`{name}` is ambiguous: {}", matches.join(", "));
+                bail!("{}", ambiguous_instance(name, &matches));
             }
             let refs: Vec<&str> = matches.iter().map(String::as_str).collect();
-            Ok(matches.remove(pick(&format!("`{name}` matches multiple instances"), &refs)?))
+            Ok(matches.remove(pick(&ambiguous_prompt(name), &refs)?))
         }
     }
+}
+
+/// The no-match error, shared with the daemon's `instances.resolve` so a
+/// client prints what the in-process CLI would.
+pub(crate) fn no_instance_matches(name: &str) -> String {
+    format!("no sandbox instance matches `{name}` (see `devsandbox ps -a`)")
+}
+
+/// The off-a-TTY ambiguity error, shared with the verb client.
+pub(crate) fn ambiguous_instance(name: &str, matches: &[String]) -> String {
+    format!("`{name}` is ambiguous: {}", matches.join(", "))
+}
+
+/// The TTY prompt among several matches, shared with the verb client.
+pub(crate) fn ambiguous_prompt(name: &str) -> String {
+    format!("`{name}` matches multiple instances")
 }
 
 /// Every instance key `name` could mean, sorted, in [`resolve_instance`]'s

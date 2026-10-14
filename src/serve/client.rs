@@ -42,6 +42,20 @@ pub struct Conn {
 enum Incoming {
     Response(Response),
     Notification(Notification),
+    /// The daemon closed the connection (a line cut short included).
+    Closed,
+}
+
+/// How [`Conn::call_streaming`] ended.
+#[derive(Debug)]
+pub enum Streamed {
+    /// The request's response.
+    Answer(Response),
+    /// The callback asked to hang up; the caller drops the connection.
+    HungUp,
+    /// The connection ended before the response: the daemon exited (a
+    /// handoff, a crash) or reset it.
+    Lost,
 }
 
 impl Conn {
@@ -64,7 +78,49 @@ impl Conn {
                 Some(Incoming::Notification(n)) => self.notes.push_back(n),
                 Some(Incoming::Response(r)) if r.id == Some(id) => return Ok(r),
                 Some(Incoming::Response(r)) => bail!("devsandbox serve answered request {:?}, expected {id}", r.id),
+                Some(Incoming::Closed) => bail!("devsandbox serve closed the connection"),
                 None => bail!("timed out reading from devsandbox serve"),
+            }
+        }
+    }
+
+    /// One request whose response may take long (a verb), with its
+    /// notifications handed to `on` as they come. `on` also runs with `None`
+    /// every `tick` without a line, so it can poll a flag (Ctrl-C); it
+    /// returns `false` to hang up, which is how a client cancels.
+    pub fn call_streaming(
+        &mut self,
+        method: &str,
+        params: Value,
+        tick: Duration,
+        on: &mut dyn FnMut(Option<&Notification>) -> bool,
+    ) -> Result<Streamed> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let mut line = serde_json::to_vec(&Request { id: Some(id), method: method.into(), params })?;
+        line.push(b'\n');
+        self.writer.write_all(&line).context("cannot write to devsandbox serve")?;
+        self.reader.get_ref().set_read_timeout(Some(tick)).context("cannot set a read timeout")?;
+        while let Some(n) = self.notes.pop_front() {
+            if !on(Some(&n)) {
+                return Ok(Streamed::HungUp);
+            }
+        }
+        loop {
+            let incoming = match self.read() {
+                Ok(incoming) => incoming,
+                // A reset, or a line that won't parse: the answer isn't coming.
+                Err(_) => return Ok(Streamed::Lost),
+            };
+            let go_on = match incoming {
+                Some(Incoming::Response(r)) if r.id == Some(id) => return Ok(Streamed::Answer(r)),
+                Some(Incoming::Response(r)) => bail!("devsandbox serve answered request {:?}, expected {id}", r.id),
+                Some(Incoming::Closed) => return Ok(Streamed::Lost),
+                Some(Incoming::Notification(n)) => on(Some(&n)),
+                None => on(None),
+            };
+            if !go_on {
+                return Ok(Streamed::HungUp);
             }
         }
     }
@@ -85,13 +141,15 @@ impl Conn {
             match self.read()? {
                 Some(Incoming::Notification(n)) => return Ok(Some(n)),
                 Some(Incoming::Response(r)) => bail!("devsandbox serve sent a response {:?} nobody asked for", r.id),
+                Some(Incoming::Closed) => bail!("devsandbox serve closed the connection"),
                 None => {}
             }
         }
     }
 
     /// One line, `None` on a read timeout (a partial line is kept for the
-    /// next call). A line with a `method` is a notification.
+    /// next call), [`Incoming::Closed`] at the end. A line with a `method` is
+    /// a notification.
     fn read(&mut self) -> Result<Option<Incoming>> {
         let limit = proto::MAX_LINE.saturating_sub(self.partial.len() as u64);
         match (&mut self.reader).take(limit).read_until(b'\n', &mut self.partial) {
@@ -103,7 +161,7 @@ impl Conn {
             if self.partial.len() as u64 >= proto::MAX_LINE {
                 bail!("devsandbox serve sent a line over {} bytes", proto::MAX_LINE);
             }
-            bail!("devsandbox serve closed the connection");
+            return Ok(Some(Incoming::Closed));
         }
         let line = std::mem::take(&mut self.partial);
         let value: Value = serde_json::from_slice(&line).context("bad message from devsandbox serve")?;

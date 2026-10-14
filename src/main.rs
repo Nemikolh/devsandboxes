@@ -83,6 +83,8 @@ enum Command {
         /// (builds, hooks) goes to stderr so stdout stays parseable
         #[arg(long)]
         json: bool,
+        #[arg(short, long, help = DETACH_HELP)]
+        detach: bool,
     },
     /// Recreate an instance's container from the current config (keeps the
     /// worktree, branch, and per-instance state); no-op when there is no drift
@@ -98,6 +100,8 @@ enum Command {
         /// behavior changes the drift hashes cannot see)
         #[arg(long)]
         force: bool,
+        #[arg(short, long, help = DETACH_HELP)]
+        detach: bool,
     },
     /// Rename an instance (state only; the container keeps its old name)
     Rename {
@@ -144,6 +148,8 @@ enum Command {
         /// Start every stopped instance
         #[arg(long, conflicts_with = "name")]
         all: bool,
+        #[arg(short, long, help = DETACH_HELP)]
+        detach: bool,
     },
     /// Remove shared services no live instance references and orphaned
     /// shell-history files
@@ -295,6 +301,10 @@ enum Command {
     },
 }
 
+/// `-d` on `run`, `rebuild`, `start`: one text, one behaviour.
+const DETACH_HELP: &str = "Return once the instance is registered (its name is printed); the build \
+     goes on in devsandbox serve. `devsandbox logs --build <name> --follow` follows it";
+
 #[cfg(unix)]
 #[derive(Subcommand)]
 enum ServeCommand {
@@ -410,10 +420,34 @@ fn main() -> Result<()> {
         std::process::exit(2);
     };
 
+    // The five verbs go to the daemon (docs/verbs-as-requests.md); it runs
+    // them as `--in-process` subprocesses, which take the arms below. With
+    // no daemon to reach, `fallback` says why and they run here instead.
+    #[cfg(unix)]
+    let fallback = match serve::verbs_client::from_command(&command).filter(|_| !cli.in_process) {
+        Some(verb) => match serve::verbs_client::run(&cli.dir, verb)? {
+            serve::verbs_client::Done::Exit(code) => std::process::exit(code),
+            serve::verbs_client::Done::InProcess(why) => {
+                // As the daemon's subprocesses do: a fallback never lazy
+                // starts a daemon (nothing answered just now).
+                serve::client::set_in_process();
+                Some(why)
+            }
+        },
+        None => None,
+    };
+    #[cfg(not(unix))]
+    let fallback: Option<String> = None;
+    let in_process = cli.in_process || fallback.is_some();
+    let detach_refused = || detach_needs_daemon(cli.in_process, fallback.as_deref());
+
     match command {
         Command::Ls { json } => commands::ls::ls(&cli.dir, json),
         Command::Ps { all, json } => commands::ps::ps(all, json),
-        Command::Run { sandbox, name, branch, base, env, dispatcher, json } => {
+        Command::Run { sandbox, name, branch, base, env, dispatcher, json, detach } => {
+            if detach {
+                return Err(detach_refused());
+            }
             // Taken before any work so every child process (and autostart
             // below) writes to stderr; only the final document hits stdout.
             let json_out = json.then(json_stdout::JsonStdout::capture).transpose()?;
@@ -430,7 +464,7 @@ fn main() -> Result<()> {
             commands::autostart::autostart(&cli.dir);
             // After autostart, so the daemon's own pass finds this boot done.
             #[cfg(unix)]
-            if matches!(result, Ok(Some(_))) && !cli.in_process {
+            if matches!(result, Ok(Some(_))) && !in_process {
                 serve::client::ensure_running("cli");
             }
             match (result?, json_out) {
@@ -440,14 +474,17 @@ fn main() -> Result<()> {
                 (_, None) => Ok(()),
             }
         }
-        Command::Rebuild { name, all, force } => {
+        Command::Rebuild { name, all, force, detach } => {
+            if detach {
+                return Err(detach_refused());
+            }
             build_log::enable();
             let result = commands::rebuild::rebuild(&cli.dir, name, all, force);
             // Like `start`: the rebuilt container is up, and a dispatcher /
             // inbox instance needs a host even with no dashboard open.
             commands::autostart::autostart(&cli.dir);
             #[cfg(unix)]
-            if result.is_ok() && !cli.in_process {
+            if result.is_ok() && !in_process {
                 serve::client::ensure_running("cli");
             }
             result
@@ -466,12 +503,15 @@ fn main() -> Result<()> {
             }
         }
         Command::Stop { name, all } => commands::stop::stop(name, all),
-        Command::Start { name, all } => {
+        Command::Start { name, all, detach } => {
+            if detach {
+                return Err(detach_refused());
+            }
             build_log::enable();
             let result = commands::start::start(&cli.dir, name, all);
             commands::autostart::autostart(&cli.dir);
             #[cfg(unix)]
-            if result.is_ok() && !cli.in_process {
+            if result.is_ok() && !in_process {
                 serve::client::ensure_running("cli");
             }
             result
@@ -531,6 +571,17 @@ fn main() -> Result<()> {
         },
         #[cfg(unix)]
         Command::Api { stdio: _, client } => std::process::exit(serve::relay::stdio(&client)?),
+    }
+}
+
+/// Why an in-process verb can't take `-d`: nothing would carry the build on
+/// once this process returns. `fallback` is why the daemon wasn't reached.
+fn detach_needs_daemon(in_process_flag: bool, fallback: Option<&str>) -> anyhow::Error {
+    match fallback {
+        Some(why) => anyhow::anyhow!("`-d` needs devsandbox serve: {why}"),
+        None if cfg!(unix) && in_process_flag => anyhow::anyhow!("`-d` needs devsandbox serve, not --in-process"),
+        None if cfg!(unix) => anyhow::anyhow!("`-d` needs devsandbox serve"),
+        None => anyhow::anyhow!("`-d` needs devsandbox serve, which is unix-only for now"),
     }
 }
 

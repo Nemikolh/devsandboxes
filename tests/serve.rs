@@ -90,3 +90,54 @@ fn serve_binds_privately_refuses_a_second_copy_and_hands_off() {
     assert!(!sock.exists());
     let _ = std::fs::remove_dir_all(&runtime);
 }
+
+/// The CLI as a client of a scratch daemon, no docker: `rm` of a missing
+/// instance is the daemon's `not-found`, printed as the CLI's error (exit
+/// 1), and `stop --all` with an empty state runs in the daemon (exit 0, its
+/// output streamed back). Neither falls back to running in-process.
+#[test]
+fn cli_verbs_go_through_the_daemon() {
+    let runtime: PathBuf = std::env::temp_dir().join(format!("dsv-e2e-verbs-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&runtime);
+    let root = runtime.join("cfg");
+    std::fs::create_dir_all(&root).unwrap();
+    let home = runtime.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    let _daemon = Daemon(serve(&runtime).env("HOME", &home).spawn().unwrap());
+    // Answering before any CLI runs: none of them may lazy start one.
+    let reply = hello(&connect(&runtime.join("devsandbox/serve.sock")), env!("CARGO_PKG_VERSION"));
+    assert_eq!(reply["id"], 0, "{reply}");
+
+    // The same isolated dirs as the daemon: the request's env is the verb's.
+    let cli = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_devsandbox"))
+            .arg("-C")
+            .arg(&root)
+            .args(args)
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env("XDG_STATE_HOME", runtime.join("state"))
+            .env("XDG_DATA_HOME", runtime.join("data"))
+            .env("HOME", &home)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    };
+
+    let rm = cli(&["rm", "nope"]);
+    let stderr = String::from_utf8_lossy(&rm.stderr);
+    assert_eq!(rm.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("no sandbox instance matches `nope` (see `devsandbox ps -a`)"), "{stderr}");
+    assert!(!stderr.contains("in-process"), "fell back: {stderr}");
+
+    let stop = cli(&["stop", "--all"]);
+    let stderr = String::from_utf8_lossy(&stop.stderr);
+    assert_eq!(stop.status.code(), Some(0), "{stderr}");
+    assert_eq!(String::from_utf8_lossy(&stop.stdout), "nothing to stop\n");
+    assert!(!stderr.contains("in-process"), "fell back: {stderr}");
+
+    // `-d` where it doesn't apply is clap's error, before any request.
+    assert_eq!(cli(&["stop", "-d", "--all"]).status.code(), Some(2));
+    drop(_daemon);
+    let _ = std::fs::remove_dir_all(&runtime);
+}
