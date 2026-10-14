@@ -328,6 +328,9 @@ runtime stops or starts answering, at each forwards status line
 
 ## Future work
 
+The verbs moving into the daemon, the dashboard as a pure client, and
+remote machines: `docs/client-server.md` (Windows: `docs/windows-support.md`).
+
 Accepted trade-offs of the current design, to revisit:
 
 - **The dashboard collects its own instance snapshot.** It runs

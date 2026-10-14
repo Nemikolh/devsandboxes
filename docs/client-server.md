@@ -1,0 +1,310 @@
+# Client/server: the CLI as a client of `devsandbox serve`
+
+Status: design, not implemented.
+
+Today every verb (`run`, `start`, `rebuild`, `rm`, …) does its work in the
+process you started, and the daemon (`docs/serve.md`) only owns the live
+host side: bridges, forwards, the API. This doc moves the verbs' work into
+the daemon, the way `docker` hands everything to `dockerd`. The CLI and the
+TUI become clients, and the client can be on another machine.
+
+## Goals
+
+- **Work outlives its caller.** A `run` from the TUI, or `run -d`, finishes
+  without anyone watching, and its log is kept.
+- **No half-built sandboxes.** Cancelling rolls back cleanly. A run cut short
+  by a crash, OOM or a reboot is visible and can be resumed or removed.
+- **Status where the sandbox is.** The TUI shows a building instance under
+  its sandbox with its current step, and has a shortcut to its build log.
+  There's no separate list of operations.
+- **Remote machines.** `devsandbox machine add ssh://me@host --name my-server`,
+  then `run foo --machine my-server`. The local daemon knows about the
+  machine, and the dashboard shows its sandboxes next to the local ones
+  without knowing they're remote. This is the VS Code SSH Remote +
+  devcontainers model, built into the CLI.
+
+Non-goals: scheduling or placement across machines (no Swarm), daemons
+talking to each other except through the local one, and a TCP listener.
+
+## Requests
+
+There's no "job" or "command" object. A verb is an RPC method on the
+existing protocol (`docs/api.md`): `devsandbox run foo --branch x` sends a
+`run` request carrying the same arguments. That's all of it.
+
+```
+→ {"id":1,"method":"run","params":{"root":"/home/me/.devsandboxes","sandbox":"foo","args":{…},"env":{…},"detach":false}}
+← {"method":"progress","params":{"request":1,"instance":"foo-2","phase":"building"}}
+← {"method":"output","params":{"request":1,"stream":"stderr","data":"…"}}
+← {"id":1,"result":{"instance":"foo-2", …}}
+```
+
+- **Params** follow the verb's flags. Clap stays the parser, and the client
+  sends what it parsed.
+- **`root`**: an absolute config root the server can resolve. Locally the
+  client canonicalizes `-C` (the only thing cwd matters for today,
+  `src/main.rs:28`). For a machine, it's one of the machine's roots
+  (*Config roots*). The client never sends a cwd.
+- **`env`**: the caller's environment, filtered. In-process, the verbs read
+  the calling shell's env today. A daemon only has the env of whoever
+  started it (`docs/serve.md`, *Start*): an old shell, or systemd. Things
+  that would quietly break without this field:
+  - `${localEnv:VAR}` in the config (`skills/config-toml-spec`) would
+    expand to the daemon's value.
+  - `SSH_AUTH_SOCK`, recorded on the instance (`state::Instance::ssh_auth_sock`)
+    and used to clone over ssh during the lifecycle chain.
+  - `DEVSANDBOX_RUNTIME`, `GIT_*`.
+
+  The bridges already work around this by taking the agent from a client
+  ("until a client reports one"). This field makes the same thing
+  per-request and explicit.
+
+  **Whose env**: the env of the user's session on the machine that runs
+  the containers, never the daemon's. Locally that's the calling shell.
+  For a machine it's the ssh login session of the user the machine was
+  added with: the `api --stdio` relay runs in that session and attaches
+  its env to every request it relays. The laptop's env is not sent to a
+  remote. `${localEnv:…}` mostly builds host paths for mounts
+  (`${localEnv:HOME}/…`, `${localEnv:XDG_RUNTIME_DIR}/docker.sock`), which
+  only make sense on the machine running docker. This is also how
+  `${localEnv}` resolves for VS Code Remote-SSH + devcontainers. The one
+  value that comes from the caller is the ssh-agent, through `ssh -A`
+  (*Machines*).
+- **Streaming**: the request stays open until the verb ends. `progress`
+  (phase changes) and `output` (the verb's stdout/stderr) arrive as
+  notifications, and the CLI prints them the way it does today. `run --json`
+  prints the `result`.
+- **Hang-up = cancel** unless `detach`. Ctrl-C closes the connection (or
+  sends `cancel`), and the daemon cancels and rolls back (*Failure*).
+- **`-d` / `detach: true`**: the response comes as soon as the instance is
+  registered (phase `building`). The TUI always detaches.
+- **Prompts**: the verbs' interactive prompts (`rm`'s delete-branch
+  `confirm`, ambiguous-name `pick`) move to the client. Ambiguity is
+  resolved before the request is sent (a `resolve` method), and a
+  confirmation is a flag on the request. Daemon-side verbs never prompt
+  (same rule as `dispatch.rs`'s null stdin + `GIT_TERMINAL_PROMPT=0`).
+
+### Execution, internally
+
+The daemon runs each verb as a `devsandbox -C <root> <verb> …` subprocess,
+like `src/commands/dispatch.rs`'s `Subprocess` executor: own process group,
+null stdin, env from the request, stdout/stderr teed to the instance's
+build log and the requester. Why a subprocess and not a thread:
+
+- a verb that panics or hangs takes down one request, not the daemon;
+- the version handoff doesn't have to wait for a 10-minute build (*Handoff*);
+- the verbs' code doesn't change.
+
+The daemon keeps an in-memory table of what's in flight (pid, request,
+instance). That's the internal *task*. The word never appears in the CLI,
+the TUI or the API. What persists is the instance's phase (next section),
+not a separate tasks file.
+
+## Instance phase
+
+Today the instance record is written to `state.toml` only after the
+container exists (`src/commands/run/mod.rs:640`). By then the worktree,
+branch and image are already made. A run killed before that line leaves
+them with nothing pointing at them, and that's the half-built sandbox.
+
+New: `run` records the instance **first**, before the worktree, with a
+`phase`, and updates it as it goes:
+
+| phase | |
+|---|---|
+| `preparing` | name chosen, worktree/branch/folders |
+| `building` | feature image / Dockerfile build |
+| `creating` | services, networks, container |
+| `onCreateCommand` … `postAttachCommand` | the lifecycle step running |
+| `failed` | stopped partway: error + the step it was at |
+| *(none)* | done. Status comes from the runtime as today |
+
+Plus `pid` (the verb's process, for detecting crashes) and enough of what
+was created (worktree path, branch, image tag, volumes) for `rm` to undo a
+partial run. Most of those fields already exist on `Instance`. The rule is
+that they get filled in as each one is created, not at the end.
+
+`rebuild` and `start` set the phases that apply to them. `stop`/`start`
+otherwise behave as today.
+
+### Build log
+
+One log per instance, `<data>/devsandbox/logs/<instance_id>/build.log`,
+replaced by the next `run`/`rebuild` of that instance (the previous one is
+kept as `build.1.log`), removed with the instance. It's what the TUI's
+shortcut opens, what `devsandbox logs --build <instance>` prints
+(`--follow` while it's running), and what `instances.build_log` serves. It
+replaces the TUI's suspend-to-fullscreen + "press any key" path
+(`src/tui/mod.rs:651`) and its `logs/<verb>-<unix>.log` error files.
+
+### In the TUI
+
+A building instance is listed under its sandbox config like any other.
+Its status column shows the phase (`building`, `postCreateCommand`, …), and
+the build-log shortcut works in any phase, including after it's `running`
+or `failed`. `failed` has the obvious actions: retry (`run` resume) and
+remove (`rm`). The status column is the only progress UI.
+
+## Failure
+
+- **Cancel** (Ctrl-C, hang-up, `cancel`): the daemon sends SIGINT to the
+  verb's process group. The verb rolls back what it recorded: container,
+  per-instance services/network, worktree, the branch if it created it,
+  then the record. That's cleaner than today, where a SIGKILL'd `run` can't
+  clean up at all. A rollback that itself fails leaves `failed`.
+- **Crash / OOM / reboot**: the verb's process is gone and `phase` is still
+  in flight. The daemon checks at start and on each poll: a recorded `pid`
+  that isn't alive (or a boot id that changed) → `failed`, with "interrupted"
+  as the error.
+- **Resume**: `run <instance>` on a `failed` instance continues from what
+  exists. Every step is already idempotent or close to it (worktree reuse,
+  image cache, `docker create` on an existing name). The remaining work is
+  checking each step's "already done" case.
+- **Remove**: `rm` on a partial instance undoes only what was recorded.
+
+## Handoff
+
+A newer client still triggers the version handoff (`docs/serve.md`). The
+verbs in flight are subprocesses with their output going to the build log,
+so the old daemon doesn't wait for them. It leaves them running and exits.
+The new daemon finds them through the `pid` + `phase` on their instances,
+follows their logs, and detects their exit by the pid. A client streaming
+a request across a handoff reconnects and resumes following the instance
+by name (`instances.follow`). Its request id is gone, and the instance is
+what it follows.
+
+## Config roots
+
+Requests name a root the server can resolve, so roots become a server-side
+notion:
+
+- **Local**: any directory the client canonicalizes. The daemon already
+  works per root (one forward registry per root, `Instance::config_dir`).
+- **Machine**: `machine add` saves the remote root(s) on the machine
+  entry, from `--config <remote path>` (repeatable) or picked during the add
+  (*Adding a machine*). `run foo --machine my-server` resolves `foo` against
+  those roots. With `--machine`, `-C` is a path on the remote. A sandbox name
+  found in several roots is an error that lists them.
+- The dashboard asks for sandboxes grouped by root (`sandboxes.list`) and
+  never reads a config file itself.
+
+## The dashboard as a pure client
+
+The dashboard stops reading `state.toml`, config files and the runtime
+directly (today it runs `snapshot::collect`, see `docs/serve.md`, *Future
+work*). It reads `instances.list` / `sandboxes.list`, follows
+`instances.changed`, and sends every action as a request. Procs and stats
+move behind methods polled at the dashboard's cadence. This is the
+prerequisite for machines: once the dashboard only talks to its daemon, a
+remote instance is just another row.
+
+## Exec and terminal
+
+`exec -it` and the TUI's terminal tabs run `docker exec -it` locally. That
+works as long as the runtime is local.
+
+- **Remote, first cut**: the client runs `ssh -t <machine> devsandbox exec
+  <instance> …`. The local daemon resolves the instance to its machine and
+  hands back the ssh target. Same PTY path as today.
+- **Later**: PTY attach over the protocol (an `exec` stream with resize),
+  for clients that can't spawn ssh.
+
+## Machines
+
+```
+devsandbox machine add ssh://me@my-server.com --name my-server [--config ~/sandboxes]…
+devsandbox machine ls | rm <name>
+devsandbox run foo --machine my-server
+```
+
+### Adding a machine
+
+Two API calls, so the CLI and a GUI (over `api --stdio`) go through the
+same steps, and the daemon still never prompts (*Requests*):
+
+1. **`machines.probe {target}`**: the local daemon connects (*Transport*)
+   and sends a hello. That checks ssh, that devsandbox is on the remote
+   and that the versions are compatible, so a bad host fails at `add`
+   instead of at the first `run`. It returns the remote's candidate roots,
+   each with its sandboxes:
+   - every distinct `config_dir` in the remote's `state.toml`,
+   - `~/.devsandboxes` if it exists,
+   - nothing from scanning the disk.
+2. **`machines.add {target, name, roots}`**: saves the entry. A root that
+   wasn't among the candidates (typed in by hand) is checked on the remote
+   first: it exists and its config parses.
+
+Without `--config`, the CLI:
+- on a TTY, shows a multi-select of the probed roots, each with its
+  sandboxes, plus an "other path…" entry;
+- with no TTY, uses the root automatically if there's exactly one. Zero or
+  several is an error that lists the candidates and points at `--config`.
+
+A GUI calls probe, shows its own picker, then calls add.
+
+- **Registry**: on the local daemon, in `machines.toml` next to
+  `state.toml`. The TUI doesn't know machines exist beyond a column.
+- **Transport**: `ssh <target> devsandbox api --stdio` (`src/serve/relay.rs`),
+  the same way docker's `ssh://` hosts use `docker system dial-stdio`. ssh
+  does all the auth, the remote daemon starts lazily as usual, and there's
+  no new listener. One connection per machine, held open by the local
+  daemon and reconnected with backoff. A machine that's down shows its
+  instances as `unreachable` rather than dropping them.
+- **Federation**: the local daemon merges each machine's `instances.list`
+  and `sandboxes.list` into its own, and forwards requests for remote
+  instances. Each machine keeps its own `state.toml`, config and runtime.
+- **Names**: instance names are unique per machine, not globally. Merged
+  rows carry `machine`. On the CLI a remote instance is `my-server/foo-2`,
+  and an unqualified name that matches only one machine is accepted.
+- **Forwards**: a forward to a remote instance binds on the local host and
+  tunnels over the machine connection to the remote daemon's forwarder.
+  `forwardPorts` of remote instances are opt-in per machine, so a remote
+  box doesn't grab local ports by surprise.
+- **ssh-agent**: `ssh -A` on the machine connection. The remote daemon's
+  existing relay picks the forwarded agent up as a client-reported
+  `SSH_AUTH_SOCK`.
+- **Env**: requests to a machine carry the env of that machine's ssh
+  login session, attached by the relay, not the laptop's (*Requests*,
+  `env`). A non-interactive `ssh host cmd` gets a thinner env than an
+  interactive login (no `.profile` on some shells), so the relay may
+  need to capture a login shell's env once per connection.
+- **Access**: a machine's socket gives full control of its containers, like
+  `docker.sock`. Adding a machine means trusting ssh access to it. Write
+  that down in `machine add --help`.
+
+### VS Code on a remote machine (later)
+
+`code` today attaches VS Code to a local container. For a remote one, the
+candidates are Remote-SSH to the machine plus attach-to-container through
+its docker context, or Remote-SSH straight into the container through the
+helper. Needs a spike. Low priority, and nothing above depends on it.
+
+## Windows
+
+`serve` is unix-only, so on Windows the CLI is a remote-only client. Plan:
+`docs/windows-support.md`.
+
+## Rollout
+
+1. Instance `phase` recorded first + rollback/resume, still in-process.
+   This fixes half-built sandboxes on its own.
+2. Per-instance build log + TUI status column and shortcut. Remove the
+   suspend path.
+3. Verbs as requests: `run`, `rebuild`, `start`, `stop`, `rm`, with
+   streaming, cancel, `-d`, env, prompts moved to the client. `services *`
+   and the rest follow.
+4. Dashboard as a pure client (`instances.list`, `sandboxes.list`,
+   procs/stats methods).
+5. `machine add|ls|rm`, the ssh transport, federation, `ssh -t` exec.
+6. Remote forwards.
+7. VS Code remote spike.
+
+## Open questions
+
+- **Env filter**: the whole env, or an allowlist plus the `${localEnv:…}`
+  names the config references? The second is tighter but needs the config
+  parsed first.
+- **Idle exit**: a verb in flight is a holder. A detached `run` keeps the
+  daemon alive until it ends, which is the point.
+- **Machine-to-local fallback**: when no local daemon can run (Windows),
+  does a configured default machine make `--machine` implicit?
