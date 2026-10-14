@@ -7,6 +7,8 @@
  * drive it with `setState` / `dispatch`.
  */
 import {
+  buildLogFor,
+  buildLogTitle,
   CTRL_BRACKET,
   INITIAL,
   TABS,
@@ -51,6 +53,8 @@ import {
 const FLASH_MS = 320;
 /** How long an `o` / `t` result stays in the status line. */
 const MESSAGE_MS = 2600;
+/** How long a background `run` takes here before its row is `running`. */
+const BUILD_MS = 2400;
 
 export interface MiniTuiOptions {
   /**
@@ -180,11 +184,16 @@ export function mountMiniTui(root: HTMLElement, opts: MiniTuiOptions = {}): Mini
   // Logs and the config explorer: the visible slice after `scroll`, like a ratatui Paragraph.
   function renderViews(s: State) {
     const m = s.modal;
-    if (logsView) logsView.hidden = m?.kind !== 'logs';
+    if (logsView) logsView.hidden = m?.kind !== 'logs' && m?.kind !== 'build';
     if (configView) configView.hidden = m?.kind !== 'config';
     if (m?.kind === 'logs' && logsView) {
       setText(logsView, '[data-tui-logs-title]', ` ${logsTitle(m.name)} `);
       fill(logsView, '[data-tui-logs-body]', logsFor(m.name).slice(m.scroll).map((t) => [{ text: t }]));
+    }
+    // The build log is the same text modal; it re-renders as the build lands.
+    if (m?.kind === 'build' && logsView) {
+      setText(logsView, '[data-tui-logs-title]', ` ${buildLogTitle(s, m.name)} `);
+      fill(logsView, '[data-tui-logs-body]', buildLogFor(s, m.name).slice(m.scroll).map((t) => [{ text: t }]));
     }
     if (m?.kind === 'config' && configView) {
       setText(configView, '[data-tui-config-title]', ` ${configTitle(m)} `);
@@ -294,6 +303,12 @@ export function mountMiniTui(root: HTMLElement, opts: MiniTuiOptions = {}): Mini
     state = next;
     render(state);
     for (const fn of listeners) fn(state, prev);
+    // A background `run` just started: it finishes on its own, like the real one.
+    for (const i of state.instances) {
+      if (i.status === 'building' && !prev.instances.some((p) => p.name === i.name && p.status === 'building')) {
+        window.setTimeout(() => dispatch({ type: 'built', name: i.name }, false), BUILD_MS);
+      }
+    }
     if (state.message && state.message !== prev.message) {
       window.clearTimeout(messageTimer);
       messageTimer = window.setTimeout(() => {

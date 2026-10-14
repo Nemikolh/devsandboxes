@@ -69,6 +69,7 @@ const dashHints: {
   { caps: [cap('o', 'o')], text: 'vscode', tabs: 'instances' },
   { caps: [cap('s', 's')], text: 'stop', tabs: 'instances', verb: 's' },
   { caps: [cap('l', 'l')], text: 'logs', tabs: 'instances', wide: true },
+  { caps: [cap('b', 'b')], text: 'build log', tabs: 'instances', wide: true },
   { caps: [cap('p', 'p')], text: 'forward', tabs: 'instances', wide: true },
   { caps: [cap('p', 'p')], text: 'forward', tabs: 'services' },
   { caps: [cap('d', 'd')], text: 'stop forward', tabs: 'ports' },
@@ -94,7 +95,7 @@ const dashHints: {
     interactive && (
       <p class="visually-hidden" id={keysId}>
         Arrow keys or j and k select an instance, o opens it in VS Code, Escape closes VS Code, t opens a terminal on it,
-        s stops or starts it, l shows its logs, p forwards a port, Enter opens the config explorer, colon opens the
+        s stops or starts it, l shows its logs, b its build log, p forwards a port, Enter opens the config explorer, colon opens the
         command prompt where Tab completes and Escape cancels, left and right arrows or 1 to 4 switch tabs, question
         mark shows help. In a terminal, keys go to the shell and Escape returns to the dashboard; square brackets switch
         terminals and x closes one. Tab leaves the preview.
@@ -225,7 +226,7 @@ const dashHints: {
         <div class="tui-term-screen" data-tui-term-screen></div>
       </div>
 
-      {/* `l`: the logs modal (`Modal::Logs`, drawn by `draw_text_modal`). */}
+      {/* `l`: the logs modal (`Modal::Logs`, drawn by `draw_text_modal`); `b`'s build log uses it too. */}
       <div class="tui-view" data-tui-view="logs" data-tui-region="logs" hidden>
         <div class="tui-box tui-pane" data-focused>
           <span class="tui-box-title" data-tui-logs-title></span>
@@ -257,6 +258,7 @@ const dashHints: {
           <dt>o</dt><dd>open in VS Code</dd>
           <dt>s</dt><dd>stop / start</dd>
           <dt>l</dt><dd>logs (Instances)</dd>
+          <dt>b</dt><dd>build log (Instances)</dd>
           <dt>p</dt><dd>forward a port</dd>
           <dt>d</dt><dd>stop forward (Ports)</dd>
           <dt>t</dt><dd>open terminal</dd>

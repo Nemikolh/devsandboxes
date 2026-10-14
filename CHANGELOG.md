@@ -1,5 +1,53 @@
 # Changelog
 
+## Unreleased
+
+No more half-built sandboxes: an instance is recorded from the moment `run` starts, a failure leaves it listed as `failed` with its error, and Ctrl-C undoes the whole run. Every `run`, `rebuild` and `start` keeps a build log, and the dashboard runs them in the background instead of handing them the screen.
+
+**Behaviour change: a failed `run` now leaves an instance to `rm`.** Before, only a failing lifecycle command (`postCreateCommand`, …) kept its container, and a run that failed earlier (worktree, image build, container create) left its worktree, branch and services behind with no instance pointing at them. Now every failure keeps a `failed` instance; `devsandbox rm <name>` removes all of it, or `devsandbox rebuild <name>` retries.
+
+```bash
+devsandbox rebuild web-4   # retry a failed run
+devsandbox rm web-4        # or remove everything it made
+```
+
+### Added
+
+- **Build logs.** `run`, `rebuild` and `start` write their whole output, the containers' build and lifecycle commands included, to a log per instance (`~/.local/share/devsandbox/logs/<instance id>/build.log`; the one before is kept as `build.1.log`, and `rm` deletes both). `devsandbox logs --build <name>` prints it; `--follow` keeps printing until the instance is done building. The command's error, if it failed, is the last line.
+
+```bash
+devsandbox logs --build web-4 --follow
+```
+
+- **`ps`, `status --json` and the dashboard show where an instance is.** While it's being made, an instance's status is its step (`preparing`, `building`, `creating`, then the lifecycle command running, like `postCreateCommand`), and `failed` when it stopped partway; the dashboard's Detail panel shows the failed step and error. `status --json` rows carry it as `phase` (`{"state": "in-flight", "step": "building"}` or `{"state": "failed", "step": …, "error": …}`), absent once the instance is ready; `ps --json` rows of instances with a container too. Details: `docs/json-output.md`.
+
+### Changed
+
+- **The dashboard runs `run`, `rebuild` and `start` in the background.** It no longer steps aside for the build and waits for a key: the command keeps going even if you quit the dashboard, a status line says when it started and how it ended, and the instance's row shows its step as it goes. `b` on an instance opens its build log, following it while it builds. `d` on a row still building asks to cancel it; on a failed row it removes the instance, and `s` rebuilds it.
+
+- **Ctrl-C rolls a `run` back.** Cancelling a `run` (Ctrl-C or SIGTERM) removes everything it had made: container, services and network, volumes, worktrees, the branch it created if it has no new commits, and the instance itself. A second Ctrl-C quits at once without cleaning up. A cancelled `rebuild` leaves the instance `failed`.
+
+- **Commands leave an instance alone while it's being made.** `start`, `stop`, `rename`, `rebuild` and `rm` (even with `--force`) refuse an instance whose `run` or `rebuild` is still going and say what it's doing; `start` also refuses a failed one and points at `rebuild` and `rm`. `rebuild --all` and autostart skip both. `exec` works once the container exists, so you can shell into one whose `postCreateCommand` failed. A dispatcher's `devsbd ensure` of such a child fails with a message naming its step instead of starting or recreating it.
+
+### Fixed
+
+- **A run killed outright shows as failed.** A `run` or `rebuild` killed by SIGKILL, the OOM killer or a reboot used to leave its instance looking half-made or not at all; it now shows as `failed` with `interrupted`, ready to `rebuild` or `rm`.
+
+- **Two `run`s started at once no longer share an instance name.** Both could pick the same default name and build over each other; now the second stops with an error before making anything.
+
+<details><summary>Commits</summary>
+
+- 26ae476 feat(tui): run, rebuild and start in the background with a build-log view
+- 19a9d5a feat(tui): show a building or failed instance's phase as its status
+- b65237f fix(run): keep a run that fails before its container as failed
+- d06e9bd feat(logs): keep a per-instance build log and show it with logs --build
+- 2dd4d72 feat(run): roll back a cancelled run and guard verbs against unfinished instances
+- 1cfaaa2 fix(run): record the instance first and roll back a run that fails before its container
+- ef5f9e6 feat(state): record an instance's in-flight progress
+- e9a4ab1 docs(serve): design moving the verbs into the daemon, remote machines and the instance-phase plan
+
+</details>
+
 ## 0.7.1
 
 **Critical fix: upgrade if you run more than one instance of the same repo.** A `git worktree prune` or `git gc` inside one sandbox could delete git's records of every other instance's worktree, leaving them with `fatal: not a git repository`. devsandbox now locks the worktrees it creates. After upgrading, run `devsandbox start` once on each existing instance to lock its worktree (safe on a running one), and `devsandbox rebuild` it to also get the `git gc` guard. This release also adds local-folder features and fixes a few host-daemon start and shutdown issues.

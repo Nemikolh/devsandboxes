@@ -17,9 +17,11 @@
  *   fake shell either, for the same leave-the-widget reason.
  * - The sandbox row (`▾ web`) is selected by clicking it; ↑ stops at the first
  *   instance. `r` there prefills `run web `, like the real one.
- * - Background work (`s`, forwards) lands at once, with the message the real
- *   one shows when it finishes; commands that suspend the real dashboard
- *   (`run`, `rm`, `stop`, `start`, `exec`) show their output in a "suspended"
+ * - Background work (`s`, `:start`, forwards) lands at once, with the message
+ *   the real one shows when it finishes. `:run` runs in the background like
+ *   the real one: its row shows `building` until a `built` event (the driver
+ *   sends it after a pause) makes it `running`. Commands that suspend the
+ *   real dashboard (`rm`, `stop`, `exec`) show their output in a "suspended"
  *   overlay until a key is pressed, as the real one waits for one.
  *
  * No DOM here: `reduce` is a plain function over plain data (unit-tested).
@@ -27,6 +29,7 @@
 
 import {
   CONFIG_HASH,
+  buildLogLines,
   instanceInspect,
   logLines,
   SANDBOX,
@@ -79,8 +82,12 @@ export const TAB_LABEL: Record<Tab, string> = {
 /** Who sends the one notification the Inbox can hold (an agent's `devsbd notify`). */
 export const NOTIFY_FROM: Instance = 'web-3';
 
-/** Container status, labelled like `ContainerStatus::label` (`src/snapshot.rs`). */
-export type RunState = 'running' | 'exited';
+/**
+ * Container status, labelled like `ContainerStatus::label` (`src/snapshot.rs`),
+ * or `building` for an instance whose `run` is still going (its phase, which
+ * the real STATUS column shows instead while set).
+ */
+export type RunState = 'running' | 'exited' | 'building';
 
 /** One Instances-tab row. */
 export interface Inst {
@@ -90,6 +97,8 @@ export interface Inst {
   worktree: boolean;
   /** The UPTIME column (`humanize_secs` of the time since `run`). */
   uptime: string;
+  /** While `building`: the status-line label of the detached `run` (`detached_label`). */
+  run?: string;
 }
 
 export const BASE_INSTANCES: readonly Inst[] = [
@@ -140,9 +149,11 @@ export interface Forward {
   instance: Instance;
 }
 
-/** The two full-body views (`Modal::Logs` / `Modal::Config`); help stays its own flag. */
+/** The full-body views (`Modal::Logs`, the build log, `Modal::Config`); help stays its own flag. */
 export type Modal =
   | { kind: 'logs'; name: Instance; scroll: number }
+  /** `b`: the instance's build log, shown in the logs pane. */
+  | { kind: 'build'; name: Instance; scroll: number }
   | {
       kind: 'config';
       /** The sandbox's config (Instances tab) or the service's (Services tab). */
@@ -214,6 +225,8 @@ export type Event =
   | { type: 'tab'; tab: Tab }
   | { type: 'agent'; name: Instance; status: AgentStatus }
   | { type: 'notify' }
+  /** A background `run` of `name` finished. */
+  | { type: 'built'; name: Instance }
   /** A click on the terminal pane (optionally a tab in its title) or away from it. */
   | { type: 'focus'; focus: Focus; term?: number }
   | { type: 'tick' };
@@ -266,7 +279,7 @@ export const TIMELINE: readonly { after: number; event: Event }[] = [
   { after: 800, event: { type: 'agent', name: 'web', status: 'testing' } },
 ];
 
-const DASHBOARD_KEYS = /^(Arrow(Up|Down|Left|Right)|[jkotqx?1-4[\]:prlsde]|Enter|Escape|F12)$/;
+const DASHBOARD_KEYS = /^(Arrow(Up|Down|Left|Right)|[jkotqx?1-4[\]:prlsdeb]|Enter|Escape|F12)$/;
 const VIEW_KEYS = /^(Arrow(Up|Down)|Page(Up|Down)|[jkgGtq?]|Escape)$/;
 
 /**
@@ -291,7 +304,7 @@ export function keycapFor(key: string): string | null {
   if (key === 'ArrowDown' || key === 'j') return 'ArrowDown';
   if (key === 'ArrowLeft' || key === 'ArrowRight' || key === 'Tab') return 'Tab';
   if (key === 'Escape' || key === 'F12' || key === CTRL_BRACKET) return 'Escape';
-  if ('otx[]?:srlpdegG'.includes(key) && key.length === 1) return key;
+  if ('otx[]?:srlpdegGb'.includes(key) && key.length === 1) return key;
   return null;
 }
 
@@ -357,6 +370,8 @@ function openTerm(s: State): State {
   const inst = selectedInst(s);
   // `term_target` in `src/tui/app/terminal.rs`.
   if (!inst) return { ...s, message: 'terminal: select an instance' };
+  // `no_container_yet` in `src/commands/mod.rs`.
+  if (inst.status === 'building') return { ...s, message: `\`${inst.name}\` is still building: no container yet` };
   if (inst.status !== 'running') return { ...s, message: `terminal: \`${inst.name}\` is not running` };
   const name = inst.name;
   // Like `TermTabs::find`: an exited tab doesn't count, `t` opens a fresh one.
@@ -461,28 +476,52 @@ const errorLines = (verb: string, e: string): string[] => [
 
 const noMatch = (name: string) => `no sandbox instance matches \`${name}\` (see \`devsandbox ps -a\`)`;
 
+/** `not_ready` in `src/commands/mod.rs`, for a row whose `run` is still going. */
+const stillBuilding = (name: string) => `\`${name}\` is still building`;
+
 const suspend = (s: State, lines: string[]): State => ({ ...s, suspended: { lines, confirm: null } });
 
-/** `run <sandbox>`: a new instance; a worktree when the base checkout is taken. */
+/**
+ * A detached build's failure on the status line (`detached_outcome` in
+ * `src/tui/mod.rs`): the child's error, and where its build log is.
+ */
+const buildFailed = (label: string, name: string | null | undefined, e: string): string =>
+  `${label} failed: ${e} (${name ? `b on ${name} opens its` : 'b on its row opens the'} build log)`;
+
+/**
+ * `run <sandbox>`: spawned in the background (`spawn_detached`), so the
+ * dashboard stays up. The new row shows `building` until `built`; a
+ * worktree when the base checkout is taken.
+ */
 function runInstance(s: State, a: Extract<Action, { cmd: 'run' }>): State {
-  if (a.sandbox !== SANDBOX) return suspend(s, errorLines('run', `unknown sandbox \`${a.sandbox}\``));
+  const label = a.name ? `run ${a.sandbox} --name ${a.name}` : `run ${a.sandbox}`;
+  if (a.sandbox !== SANDBOX) return { ...s, message: buildFailed(label, a.name, `unknown sandbox \`${a.sandbox}\``) };
   const name = a.name ?? defaultInstanceName(s, a.sandbox);
   if (findInst(s, name)) {
-    return suspend(
-      s,
-      errorLines(
-        'run',
+    return {
+      ...s,
+      message: buildFailed(
+        label,
+        a.name,
         `instance \`${name}\` already exists; \`devsandbox start ${name}\` restarts it, \`devsandbox rm ${name}\` frees the name`,
       ),
-    );
+    };
   }
   const worktree = s.instances.some((i) => !i.worktree);
-  const branch = a.branch?.replaceAll('${instance}', name) ?? `sandbox/${name}`;
-  const lines = worktree
-    ? [`Preparing worktree (new branch '${branch}')`, 'HEAD is now at 3f9c21a feat: users api', name]
-    : [name];
-  const next = withInstances(s, [...s.instances, { name, status: 'running', worktree, uptime: '0s' }]);
-  return suspend({ ...next, agents: { ...s.agents, [name]: 'idle' } }, lines);
+  const next = withInstances(s, [...s.instances, { name, status: 'building', worktree, uptime: '0s', run: label }]);
+  return { ...next, message: `${label}: started` };
+}
+
+/** A background `run` finished: the row is a running instance, its status line says so. */
+function built(s: State, name: Instance): State {
+  const inst = findInst(s, name);
+  if (!inst || inst.status !== 'building') return s;
+  const { run, ...done } = inst;
+  const next = withInstances(
+    s,
+    s.instances.map((i) => (i.name === name ? { ...done, status: 'running' as const } : i)),
+  );
+  return { ...next, agents: { ...s.agents, [name]: 'idle' }, message: `${run ?? `run ${SANDBOX}`}: done` };
 }
 
 /** `rm`: a worktree instance asks about its branch first (`rm` in `src/commands/rm.rs`). */
@@ -587,12 +626,19 @@ function runAction(s: State, a: Action): State {
       return runInstance(s, a);
     case 'rm':
       return rmInstance(s, a.instance);
-    case 'stop':
-    case 'start': {
+    case 'stop': {
       const inst = findInst(s, a.instance);
       if (!inst) return suspend(s, errorLines(a.cmd, noMatch(a.instance)));
-      const next = setRunState(s, inst.name, a.cmd === 'stop' ? 'exited' : 'running');
-      return suspend(next, [`${a.cmd === 'stop' ? 'stopped' : 'started'} ${inst.name}`]);
+      if (inst.status === 'building') return suspend(s, errorLines('stop', stillBuilding(inst.name)));
+      return suspend(setRunState(s, inst.name, 'exited'), [`stopped ${inst.name}`]);
+    }
+    case 'start': {
+      // Detached like `run`; a start is quick, so here it's done at once.
+      const inst = findInst(s, a.instance);
+      const label = `start ${a.instance}`;
+      if (!inst) return { ...s, message: buildFailed(label, a.instance, noMatch(a.instance)) };
+      if (inst.status === 'building') return { ...s, message: buildFailed(label, a.instance, stillBuilding(inst.name)) };
+      return { ...setRunState(s, inst.name, 'running'), message: `${label}: done` };
     }
     case 'code':
       // `code` never suspends: a status line (`launch_code`).
@@ -664,7 +710,7 @@ export function inspectLines(s: State, m: Extract<Modal, { kind: 'config' }>): r
   if (!m.container) return ['(no running instance)'];
   if (m.target === 'service') return serviceInspect();
   const name = m.container.replace(/^devsandbox-/, '');
-  return instanceInspect(name, findInst(s, name)?.status !== 'exited');
+  return instanceInspect(name, findInst(s, name)?.status === 'running');
 }
 
 /** `" config: web — original (t: resolved) — <hash> "`, as `draw_config_modal` titles it. */
@@ -683,7 +729,21 @@ export const logsTitle = (name: Instance): string => `logs — devsandbox-${name
 
 export const logsFor = (name: Instance): readonly string[] => logLines(name);
 
-const viewLines = (m: Modal): readonly string[] => (m.kind === 'logs' ? logsFor(m.name) : configLines(m));
+/** `build_log_title` in `src/tui/app/view.rs`: the phase while in flight. */
+export const buildLogTitle = (s: State, name: Instance): string =>
+  `build log — ${name}${findInst(s, name)?.status === 'building' ? ' (building)' : ''}`;
+
+/** The build log so far: up to the image build while building, all of it once done. */
+export const buildLogFor = (s: State, name: Instance): readonly string[] => {
+  const inst = findInst(s, name);
+  return buildLogLines(name, inst?.worktree ?? true, inst?.status === 'building');
+};
+
+function viewLines(s: State, m: Modal): readonly string[] {
+  if (m.kind === 'logs') return logsFor(m.name);
+  if (m.kind === 'build') return buildLogFor(s, m.name);
+  return configLines(m);
+}
 
 /** `scroll_key` in `src/tui/app/view.rs`: clamped to `[0, lines - 1]`. */
 function scrolled(scroll: number, lines: number, key: string): number | null {
@@ -716,7 +776,7 @@ function modalKey(s: State, key: string): State {
     const next = { ...m, side: m.side === 'original' ? ('resolved' as const) : ('original' as const) };
     return { ...s, modal: { ...next, scroll: Math.min(next.scroll, Math.max(0, configLines(next).length - 1)) } };
   }
-  const scroll = scrolled(m.scroll, viewLines(m).length, key);
+  const scroll = scrolled(m.scroll, viewLines(s, m).length, key);
   return scroll === null || scroll === m.scroll ? s : { ...s, modal: { ...m, scroll } };
 }
 
@@ -782,11 +842,15 @@ export function pressKey(s: State, key: string): State {
       // `stop_or_start_instance`: the real one runs in the background and
       // reports `stopped web-2` when done; here it's done at once.
       if (!onInstances || !inst) return s;
+      // An in-flight row offers nothing that would race the build.
+      if (inst.status === 'building') return { ...s, message: stillBuilding(inst.name) };
       return inst.status === 'running'
         ? { ...setRunState(s, inst.name, 'exited'), message: `stopped ${inst.name}` }
         : { ...setRunState(s, inst.name, 'running'), message: `started ${inst.name}` };
     case 'l':
       return onInstances && inst ? { ...s, modal: { kind: 'logs', name: inst.name, scroll: 0 }, message: null } : s;
+    case 'b':
+      return onInstances && inst ? { ...s, modal: { kind: 'build', name: inst.name, scroll: 0 }, message: null } : s;
     case 'p':
       if (onInstances) return inst ? openPrompt(s, `port ${inst.name} `) : s;
       // `open_port_prompt_service`: the first instance using it fills the slot.
@@ -829,6 +893,8 @@ function apply(s: State, e: Event): State {
       return { ...s, agents: { ...s.agents, [e.name]: e.status } };
     case 'notify':
       return s.notified ? s : { ...s, notified: true, unread: s.tab === 'inbox' ? 0 : s.unread + 1 };
+    case 'built':
+      return built(s, e.name);
     case 'tick':
       return s;
   }
@@ -843,7 +909,7 @@ export function reduce(s: State, e: Event): State {
     const step = TIMELINE[s.step];
     return step ? { ...apply(s, step.event), step: s.step + 1 } : s;
   }
-  const user = e.type !== 'agent' && e.type !== 'notify';
+  const user = e.type !== 'agent' && e.type !== 'notify' && e.type !== 'built';
   const next = apply(s, e);
   return user && s.step !== -1 ? { ...next, step: -1 } : next;
 }
@@ -869,7 +935,8 @@ export type HelpMode = 'dashboard' | 'terminal' | 'exited' | 'prompt' | 'help' |
 export function helpMode(s: State): HelpMode {
   if (s.prompt) return 'prompt';
   if (s.help) return 'help';
-  if (s.modal) return s.modal.kind;
+  // The build log is a text modal like logs, with the same keys.
+  if (s.modal) return s.modal.kind === 'build' ? 'logs' : s.modal.kind;
   const term = activeTerm(s);
   return s.focus === 'terminal' && term ? (term.exited ? 'exited' : 'terminal') : 'dashboard';
 }
@@ -889,7 +956,8 @@ export type Line = Span[];
 
 const sp = (text: string, cls?: string): Span => (cls ? { text, cls } : { text });
 
-const statusCls = (st: RunState) => (st === 'running' ? 'tui-green' : 'tui-red');
+/** `instance_status_style`: in flight yellow, else running green, exited red. */
+const statusCls = (st: RunState) => (st === 'running' ? 'tui-green' : st === 'building' ? 'tui-yellow' : 'tui-red');
 
 /** An Instances-table row's four cells (`instance_tree_row` in `src/tui/ui.rs`, trimmed). */
 export function instanceCells(s: State, i: Inst): Line[] {
@@ -1019,6 +1087,7 @@ export function describe(prev: State, next: State): string | null {
   if (next.modal?.kind !== prev.modal?.kind) {
     const m = next.modal;
     if (!m) return 'Closed';
+    if (m.kind === 'build') return `${buildLogTitle(next, m.name)}. Escape closes.`;
     return m.kind === 'logs'
       ? `${logsTitle(m.name)}. Escape closes.`
       : `Config explorer for ${m.target === 'service' ? SERVICE : SANDBOX}, ${m.side}. t toggles, Escape closes.`;

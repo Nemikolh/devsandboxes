@@ -1,6 +1,8 @@
 # Client/server: the CLI as a client of `devsandbox serve`
 
-Status: design, not implemented.
+Status: design. Rollout steps 1–2 (instance phase, build log, a TUI that
+doesn't suspend) are done, in-process: `docs/instance-phase.md`. The rest is
+not implemented.
 
 Today every verb (`run`, `start`, `rebuild`, `rm`, …) does its work in the
 process you started, and the daemon (`docs/serve.md`) only owns the live
@@ -75,7 +77,8 @@ existing protocol (`docs/api.md`): `devsandbox run foo --branch x` sends a
   notifications, and the CLI prints them the way it does today. `run --json`
   prints the `result`.
 - **Hang-up = cancel** unless `detach`. Ctrl-C closes the connection (or
-  sends `cancel`), and the daemon cancels and rolls back (*Failure*).
+  sends `cancel`), and the daemon cancels and the verb rolls back
+  (*Failure*).
 - **`-d` / `detach: true`**: the response comes as soon as the instance is
   registered (phase `building`). The TUI always detaches.
 - **Prompts**: the verbs' interactive prompts (`rm`'s delete-branch
@@ -102,65 +105,84 @@ not a separate tasks file.
 
 ## Instance phase
 
-Today the instance record is written to `state.toml` only after the
-container exists (`src/commands/run/mod.rs:640`). By then the worktree,
-branch and image are already made. A run killed before that line leaves
-them with nothing pointing at them, and that's the half-built sandbox.
-
-New: `run` records the instance **first**, before the worktree, with a
-`phase`, and updates it as it goes:
+Built (`docs/instance-phase.md`). `run` records the instance **first**,
+before the worktree, with an in-flight `progress`, and updates it as it
+goes:
 
 | phase | |
 |---|---|
-| `preparing` | name chosen, worktree/branch/folders |
+| `preparing` | name chosen, worktree/branch/folders/services |
 | `building` | feature image / Dockerfile build |
-| `creating` | services, networks, container |
-| `onCreateCommand` … `postAttachCommand` | the lifecycle step running |
+| `creating` | the container |
+| `onCreateCommand` … `postAttachCommand` | the lifecycle step running (plus `shell-rc`) |
 | `failed` | stopped partway: error + the step it was at |
-| *(none)* | done. Status comes from the runtime as today |
+| *(none)* | done. Status comes from the runtime |
 
-Plus `pid` (the verb's process, for detecting crashes) and enough of what
-was created (worktree path, branch, image tag, volumes) for `rm` to undo a
-partial run. Most of those fields already exist on `Instance`. The rule is
-that they get filled in as each one is created, not at the end.
+`progress` also keeps the verb's `pid` and the boot id, and each created
+resource (worktree, branch, `folders` worktrees, volumes) is recorded on
+the instance as it's made, not at the end, so a cancel or `rm` can undo a
+partial run. `rebuild` starts at `building` on the existing record. `ps`,
+`status --json` (`phase`, docs/json-output.md) and the dashboard show the
+phase as the status.
 
-`rebuild` and `start` set the phases that apply to them. `stop`/`start`
-otherwise behave as today.
+Unfinished instances are guarded: `stop`, `rename`, `rebuild <name>` and
+`rm` (even `--force`) refuse a live in-flight one; `start` also refuses a
+failed one and points at `rebuild`/`rm`; `rebuild --all` and autostart skip
+both; the dispatcher's `ensure` fails naming the phase instead of acting
+(docs/automations.md). `exec` refuses until the container exists, then
+reaches it during a lifecycle step, failed included, for debugging.
 
 ### Build log
 
-One log per instance, `<data>/devsandbox/logs/<instance_id>/build.log`,
-replaced by the next `run`/`rebuild` of that instance (the previous one is
-kept as `build.1.log`), removed with the instance. It's what the TUI's
-shortcut opens, what `devsandbox logs --build <instance>` prints
-(`--follow` while it's running), and what `instances.build_log` serves. It
-replaces the TUI's suspend-to-fullscreen + "press any key" path
-(`src/tui/mod.rs:651`) and its `logs/<verb>-<unix>.log` error files.
+One log per instance, `<data>/devsandbox/logs/<instance_id>/build.log`:
+the whole output of its last `run`, `rebuild` or `start`, which rotate the
+previous one to `build.1.log`. `rm` (and a cancelled `run`) remove the
+directory. It's what the TUI's `b` opens and what `devsandbox logs --build
+<instance>` prints (`--follow` until the instance is no longer in flight).
+`instances.build_log` will serve it once verbs are requests. In-process it's
+an fd-level tee in the CLI (`src/build_log.rs`, unix only), opt-in from
+`main` for those three verbs. It replaced the TUI's suspended run and its
+`logs/<verb>-<unix>.log` error files for those verbs.
 
 ### In the TUI
 
 A building instance is listed under its sandbox config like any other.
 Its status column shows the phase (`building`, `postCreateCommand`, …), and
-the build-log shortcut works in any phase, including after it's `running`
-or `failed`. `failed` has the obvious actions: retry (`run` resume) and
-remove (`rm`). The status column is the only progress UI.
+`b` opens its build log in any phase (following it while in flight),
+including after it's `running` or `failed`. A `failed` row shows the step
+and error in Detail, and offers retry (`s` rebuilds it) and remove (`d`).
+`d` on an in-flight row asks to cancel its build instead. The status column
+is the only progress UI.
+
+Until verbs are requests, the dashboard runs `run`, `rebuild` and `start`
+as detached `devsandbox` processes (own session, stdio null), so they
+outlive it, with a one-line status when one starts and when it ends.
 
 ## Failure
 
-- **Cancel** (Ctrl-C, hang-up, `cancel`): the daemon sends SIGINT to the
-  verb's process group. The verb rolls back what it recorded: container,
-  per-instance services/network, worktree, the branch if it created it,
-  then the record. That's cleaner than today, where a SIGKILL'd `run` can't
-  clean up at all. A rollback that itself fails leaves `failed`.
-- **Crash / OOM / reboot**: the verb's process is gone and `phase` is still
-  in flight. The daemon checks at start and on each poll: a recorded `pid`
-  that isn't alive (or a boot id that changed) → `failed`, with "interrupted"
-  as the error.
-- **Resume**: `run <instance>` on a `failed` instance continues from what
-  exists. Every step is already idempotent or close to it (worktree reuse,
-  image cache, `docker create` on an existing name). The remaining work is
-  checking each step's "already done" case.
-- **Remove**: `rm` on a partial instance undoes only what was recorded.
+- **Any error → `failed`, kept.** A `run` that fails at any step, before
+  the container exists included, keeps the instance as `failed` (step +
+  error) with everything it made, and says how to retry or remove it. A run
+  started from the dashboard runs unwatched, and a rollback would take its
+  row and build log with it.
+- **Cancel is the only rollback** (Ctrl-C or SIGTERM in-process; later
+  hang-up or `cancel`, the daemon sending SIGINT to the verb's process
+  group, as the dashboard's `d` does now). A cancelled `run` undoes
+  everything recorded: container, per-instance services/network, volumes,
+  `folders` worktrees, the worktree, the branch if it created it and it has
+  no commits beyond its start point, then the record and its build log. A
+  second signal kills at once. A cancelled `rebuild` leaves `failed` (the
+  instance existed before).
+- **Crash / OOM / reboot**: the verb's process is gone and the phase is
+  still in flight. Every reader derives it at read time: a recorded `pid`
+  that isn't alive, or a boot id that changed, shows as `failed` with
+  "interrupted" as the error. Nothing rewrites the record, so no daemon is
+  needed for it.
+- **Retry**: `rebuild <instance>` on a `failed` instance re-materializes
+  from the recorded worktree and branch. (`run` never resumes: a name in
+  use is an error.)
+- **Remove**: `rm` on a partial instance undoes only what was recorded, and
+  copes with a container that never existed.
 
 ## Handoff
 
@@ -286,10 +308,11 @@ helper. Needs a spike. Low priority, and nothing above depends on it.
 
 ## Rollout
 
-1. Instance `phase` recorded first + rollback/resume, still in-process.
-   This fixes half-built sandboxes on its own.
-2. Per-instance build log + TUI status column and shortcut. Remove the
-   suspend path.
+1. Done (`docs/instance-phase.md`): instance phase recorded first,
+   failures kept as `failed`, cancel rolls back, still in-process.
+2. Done (`docs/instance-phase.md`): per-instance build log, phase in the
+   TUI status column, `b` for the log, `run`/`rebuild`/`start` detached
+   instead of suspended.
 3. Verbs as requests: `run`, `rebuild`, `start`, `stop`, `rm`, with
    streaming, cancel, `-d`, env, prompts moved to the client. `services *`
    and the rest follow.

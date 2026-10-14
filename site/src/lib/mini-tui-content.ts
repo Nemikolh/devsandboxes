@@ -1,5 +1,6 @@
 /**
  * Canned bodies for the mini dashboard's text views: container logs (`l`),
+ * build logs (`b`),
  * the config explorer's TOML (`enter`) and its `docker inspect` pane. The
  * config is the landing page's hero config (`pages/index.astro`), serialized
  * the way the real explorer does it (`toml::to_string_pretty`: keys sorted,
@@ -62,6 +63,33 @@ export function logLines(name: string): string[] {
     'web-3': ['2:27:15 PM [vite] hmr update /src/api/orders.ts', '2:31:58 PM [vite] page reload src/api/orders.ts'],
   };
   return [...start, ...(edits[name] ?? [])];
+}
+
+/**
+ * An instance's build log (`b`): what its `run` printed, the worktree (for a
+ * repeat instance), the image build, then `postCreateCommand`. While still
+ * `building`, it stops in the image build.
+ */
+export function buildLogLines(name: string, worktree: boolean, building: boolean): string[] {
+  const prepare = worktree
+    ? [`Preparing worktree (new branch 'sandbox/${name}')`, 'HEAD is now at 3f9c21a feat: users api']
+    : [];
+  const image = [
+    '#1 [internal] load build definition from Dockerfile',
+    '#2 [internal] load metadata for docker.io/library/node:22',
+    '#3 [1/2] FROM docker.io/library/node:22',
+    '#4 [2/2] RUN corepack enable',
+  ];
+  if (building) return [...prepare, ...image];
+  return [
+    ...prepare,
+    ...image,
+    '#5 exporting to image',
+    'running postCreateCommand: pnpm install',
+    'Packages: +214',
+    'Done in 4.2s',
+    name,
+  ];
 }
 
 /** `docker inspect` of an instance container, pretty-printed and key-sorted. */

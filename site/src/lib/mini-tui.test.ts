@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
   activeTerm,
+  buildLogFor,
+  buildLogTitle,
   CTRL_BRACKET,
   describe as announce,
   type Event,
@@ -408,47 +410,74 @@ describe(': prompt', () => {
     expect(keys(STATIC, ':', 'Enter').prompt?.error).toBe('empty command');
   });
 
-  it('run web adds web-4 on a worktree, behind the suspended screen', () => {
+  it('run web adds web-4 on a worktree in the background, building until built', () => {
     const s = command(STATIC, 'run web');
     expect(s.prompt).toBeNull();
+    // No suspended screen: the dashboard stays, a status line says it started.
+    expect(s.suspended).toBeNull();
+    expect(s.message).toBe('run web: started');
     expect(names(s)).toEqual(['web', 'web-2', 'web-3', 'web-4']);
-    expect(inst(s, 'web-4')).toEqual({ name: 'web-4', status: 'running', worktree: true, uptime: '0s' });
-    expect(s.agents['web-4']).toBe('idle');
-    expect(s.suspended?.lines).toEqual([
-      "Preparing worktree (new branch 'sandbox/web-4')",
-      'HEAD is now at 3f9c21a feat: users api',
-      'web-4',
-    ]);
-    // Any key returns (the real one waits for one too), the new row stays.
-    expect(back(s).suspended).toBeNull();
-    expect(names(back(s))).toHaveLength(4);
-    expect(names(back(command(back(s), 'run web')))).toContain('web-5');
+    expect(inst(s, 'web-4')).toEqual({ name: 'web-4', status: 'building', worktree: true, uptime: '0s', run: 'run web' });
+    expect(instanceCells(s, inst(s, 'web-4')!).map(text)[1]).toBe('building');
+    expect(instanceCells(s, inst(s, 'web-4')!)[1][0].cls).toBe('tui-yellow');
+    const done = run(s, { type: 'built', name: 'web-4' });
+    expect(inst(done, 'web-4')).toEqual({ name: 'web-4', status: 'running', worktree: true, uptime: '0s' });
+    expect(done.agents['web-4']).toBe('idle');
+    expect(done.message).toBe('run web: done');
+    // A second `built` (or one for a gone row) changes nothing.
+    expect(run(done, { type: 'built', name: 'web-4' })).toBe(done);
+    expect(names(command(done, 'run web'))).toContain('web-5');
+  });
+
+  it('built is not user input: it keeps the autoplay going', () => {
+    const s = { ...command(STATIC, 'run web'), step: 2 };
+    expect(run(s, { type: 'built', name: 'web-4' }).step).toBe(2);
+  });
+
+  it('a building row offers nothing that would race the build', () => {
+    const s = keys(command(STATIC, 'run web'), 'j', 'j', 'j');
+    expect(selectedName(s)).toBe('web-4');
+    const pressed = keys(s, 's');
+    expect(pressed.message).toBe('`web-4` is still building');
+    expect(inst(pressed, 'web-4')?.status).toBe('building');
+    expect(keys(s, 't').message).toBe('`web-4` is still building: no container yet');
+    expect(command(s, 'start web-4').message).toBe(
+      'start web-4 failed: `web-4` is still building (b on web-4 opens its build log)',
+    );
+    expect(command(s, 'stop web-4').suspended?.lines[0]).toBe('error: `web-4` is still building');
   });
 
   it('run names like the real one: --name, the sandbox name when free, errors', () => {
-    expect(names(command(STATIC, 'run web --name api'))).toContain('api');
+    const named = command(STATIC, 'run web --name api');
+    expect(names(named)).toContain('api');
+    expect(named.message).toBe('run web --name api: started');
     const taken = command(STATIC, 'run web --name web-2');
-    expect(taken.suspended?.lines[0]).toBe(
-      'error: instance `web-2` already exists; `devsandbox start web-2` restarts it, `devsandbox rm web-2` frees the name',
+    expect(taken.message).toBe(
+      'run web --name web-2 failed: instance `web-2` already exists; `devsandbox start web-2` restarts it, `devsandbox rm web-2` frees the name (b on web-2 opens its build log)',
     );
-    expect(command(STATIC, 'run api').suspended?.lines[0]).toBe('error: unknown sandbox `api`');
+    expect(command(STATIC, 'run api').message).toBe(
+      'run api failed: unknown sandbox `api` (b on its row opens the build log)',
+    );
     // With `web` removed the base checkout is free again: `run web` takes it back.
     const freed = back(command(STATIC, 'rm web'));
     const again = command(freed, 'run web');
-    expect(inst(again, 'web')).toMatchObject({ worktree: false });
-    expect(again.suspended?.lines).toEqual(['web']);
+    expect(inst(again, 'web')).toMatchObject({ worktree: false, status: 'building' });
   });
 
-  it('stop / start act on the named instance', () => {
+  it('stop suspends, start runs in the background', () => {
     const stopped = command(STATIC, 'stop web-2');
     expect(stopped.suspended?.lines).toEqual(['stopped web-2']);
     expect(inst(stopped, 'web-2')?.status).toBe('exited');
     expect(stopped.agents['web-2']).toBe('stopped');
     const started = command(back(stopped), 'start web-2');
-    expect(started.suspended?.lines).toEqual(['started web-2']);
+    expect(started.suspended).toBeNull();
+    expect(started.message).toBe('start web-2: done');
     expect(inst(started, 'web-2')?.status).toBe('running');
     expect(command(STATIC, 'stop nope').suspended?.lines[0]).toBe(
       'error: no sandbox instance matches `nope` (see `devsandbox ps -a`)',
+    );
+    expect(command(STATIC, 'start nope').message).toBe(
+      'start nope failed: no sandbox instance matches `nope` (see `devsandbox ps -a`) (b on nope opens its build log)',
     );
   });
 
@@ -616,6 +645,37 @@ describe('logs (l)', () => {
   it('is Instances-only and needs an instance', () => {
     expect(keys(STATIC, '2', 'l').modal).toBeNull();
     expect(run(STATIC, { type: 'selectSandbox' }, { type: 'key', key: 'l' }).modal).toBeNull();
+  });
+});
+
+describe('build log (b)', () => {
+  it('opens for the selected instance in the logs view, following a build', () => {
+    const s = keys(STATIC, 'j', 'b');
+    expect(s.modal).toEqual({ kind: 'build', name: 'web-2', scroll: 0 });
+    expect(helpMode(s)).toBe('logs');
+    expect(buildLogTitle(s, 'web-2')).toBe('build log — web-2');
+    expect(buildLogFor(s, 'web-2').at(-1)).toBe('web-2');
+    expect(buildLogFor(s, 'web')[0]).toMatch(/^#1 /);
+    expect(keys(s, 'G').modal).toMatchObject({ scroll: buildLogFor(s, 'web-2').length - 1 });
+    expect(keys(s, 'Escape').modal).toBeNull();
+    expect(announce(STATIC, keys(STATIC, 'b'))).toBe('build log — web. Escape closes.');
+  });
+
+  it('shows the build so far while building, all of it once built', () => {
+    const building = keys(command(STATIC, 'run web'), 'j', 'j', 'j', 'b');
+    expect(buildLogTitle(building, 'web-4')).toBe('build log — web-4 (building)');
+    const partial = buildLogFor(building, 'web-4');
+    expect(partial[0]).toBe("Preparing worktree (new branch 'sandbox/web-4')");
+    expect(partial).not.toContain('web-4');
+    const done = run(building, { type: 'built', name: 'web-4' });
+    expect(done.modal).toEqual(building.modal);
+    expect(buildLogTitle(done, 'web-4')).toBe('build log — web-4');
+    expect(buildLogFor(done, 'web-4').at(-1)).toBe('web-4');
+  });
+
+  it('is Instances-only and needs an instance', () => {
+    expect(keys(STATIC, '2', 'b').modal).toBeNull();
+    expect(run(STATIC, { type: 'selectSandbox' }, { type: 'key', key: 'b' }).modal).toBeNull();
   });
 });
 

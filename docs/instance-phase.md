@@ -1,8 +1,23 @@
 # Instance phase: no half-built sandboxes, build logs, a TUI that doesn't suspend
 
-Status: plan, in progress. Rollout steps 1–2 of `docs/client-server.md`,
+Status: done (steps 1–7). Rollout steps 1–2 of `docs/client-server.md`,
 all in-process (no daemon changes). The verbs-as-requests work, the
 dashboard as a pure client and machines get their own plans.
+
+As built, where it differs from the steps below (the *Decisions* are
+current; the steps are kept as the record):
+
+- Step 2's rollback of a run failing before its container is gone: every
+  failure keeps the instance as `failed`, and cancel is the only rollback
+  (fix after step 4). Its error points at `devsandbox rebuild <name>` and
+  `devsandbox rm <name>`.
+- The build log tee is opt-in from `main` (see *Build log, as built* under
+  step 4); dashboard runs got one in step 6, by running as subprocesses.
+- `exec` (and the dashboard terminal) refuse only until the container
+  exists: a running or failed lifecycle step's container stays reachable,
+  for debugging.
+- The dashboard's `d` on an in-flight row asks to cancel its build (SIGINT
+  to its process group); on a failed one it removes, and `s` rebuilds.
 
 ## Problem
 
