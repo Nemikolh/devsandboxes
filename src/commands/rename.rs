@@ -1,6 +1,29 @@
-use anyhow::{bail, Result};
+use std::path::Path;
+
+use anyhow::Result;
 
 use crate::state::State;
+
+/// Why a rename changed nothing (I/O errors aside), typed so the daemon's
+/// `instances.rename` can answer `not-found` vs `invalid`; the message is
+/// the CLI's error either way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refused {
+    /// No instance by that exact name.
+    Unknown(String),
+    /// A bad or taken new name, or the instance is mid-`run`/`rebuild`.
+    Invalid(String),
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Refused::Unknown(m) | Refused::Invalid(m) => f.write_str(m),
+        }
+    }
+}
+
+impl std::error::Error for Refused {}
 
 /// Rename an instance: move its state entry to a new key and persist. Unlike
 /// other verbs, `name` must be the exact instance key — a rename changes
@@ -20,35 +43,42 @@ pub fn rename(name: &str, new_name: &str) -> Result<()> {
 /// was at creation; all ops go through the stored `container` field. Returns
 /// the trimmed new name.
 pub fn rename_exact(name: &str, new_name: &str) -> Result<String> {
-    State::update(|state| {
+    rename_exact_at(&State::path()?, name, new_name)
+}
+
+/// [`rename_exact`] on the state file at `state`, for the daemon (its tests
+/// use a scratch file). A refusal is a [`Refused`] (downcast it).
+pub fn rename_exact_at(state: &Path, name: &str, new_name: &str) -> Result<String> {
+    State::update_at(state, |state| {
         let Some(info) = state.instances.get(name) else {
-            bail!("no instance named `{name}` (see `devsandbox ps -a`)");
+            return Err(Refused::Unknown(format!("no instance named `{name}` (see `devsandbox ps -a`)")).into());
         };
         // A `run` mid-flight saves its full record under the original key,
         // which would bring the old name back next to the new one.
         if let Some(why) = crate::commands::in_flight(name, info.progress.as_ref(), info.phase_view().as_ref()) {
-            bail!("{why}");
+            return Err(Refused::Invalid(why).into());
         }
-        rename_in_state(state, name, new_name)
+        Ok(rename_in_state(state, name, new_name)?)
     })
 }
 
 /// Move `key`'s entry to `new_name` in `state`, returning the trimmed name.
 /// Split out so validation (empty / whitespace / collision) is testable without
 /// touching disk.
-fn rename_in_state(state: &mut State, key: &str, new_name: &str) -> Result<String> {
+fn rename_in_state(state: &mut State, key: &str, new_name: &str) -> Result<String, Refused> {
     let new_name = new_name.trim();
+    let invalid = |m: String| Err(Refused::Invalid(m));
     if new_name.is_empty() {
-        bail!("new instance name is empty");
+        return invalid("new instance name is empty".into());
     }
     if new_name.chars().any(char::is_whitespace) {
-        bail!("new instance name `{new_name}` must not contain spaces");
+        return invalid(format!("new instance name `{new_name}` must not contain spaces"));
     }
     if new_name == key {
-        bail!("instance is already named `{new_name}`");
+        return invalid(format!("instance is already named `{new_name}`"));
     }
     if state.instances.contains_key(new_name) {
-        bail!("an instance named `{new_name}` already exists");
+        return invalid(format!("an instance named `{new_name}` already exists"));
     }
     let info = state.instances.remove(key).expect("key came from state");
     state.instances.insert(new_name.to_string(), info);

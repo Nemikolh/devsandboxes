@@ -136,7 +136,7 @@ Mine, flagged for review (say so if any is wrong):
   `{"instance", "done"}` (`done::set_saved`). The TUI words the status line.
 - **F13 `services.rebuild` verb**: params `root`, `env`, `name`; no
   `detach`; same subprocess path as the five verbs (`--in-process -C <root>
-  services rebuild -- <name>`). The CLI's `services rebuild` goes through
+  service rebuild -- <name>`, the CLI spells it singular). The CLI's `service rebuild` goes through
   `verbs_client` too (in-process fallback as the others), so "a verb
   request" means the same thing everywhere.
 - **F14 detached `start` reports little**: it answers right after the
@@ -247,7 +247,7 @@ Mine, flagged for review (say so if any is wrong):
   { name }`, params struct, `argv` (+ the parse-with-the-real-`Cli` test,
   `:985`), `detach_at` → `Never`, `is_verb`. CLI: `CliVerb` in
   `src/serve/verbs_client.rs:53`–`:95` and the `from_command` mapping, so
-  `devsandbox services rebuild` streams through the daemon.
+  `devsandbox service rebuild` streams through the daemon.
 - `index.d.ts` + `docs/api.md` (*Verbs* table, *The CLI as a client*).
 
 ## Step 5: the dashboard reads the snapshot and procs from the daemon

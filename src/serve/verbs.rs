@@ -1,6 +1,7 @@
 //! Verbs as requests (docs/api.md, *Verbs*; docs/verbs-as-requests.md):
-//! `run`, `rebuild`, `start`, `stop` and `rm` as API methods. The daemon runs
-//! each as a `devsandbox --in-process -C <root> <verb> …` subprocess built
+//! `run`, `rebuild`, `start`, `stop` and `rm` as API methods, and
+//! `services.rebuild` (no instance verb: `service rebuild <name>`). The
+//! daemon runs each as a `devsandbox --in-process -C <root> <verb> …` subprocess built
 //! from the request's typed params ([`argv`]), so a verb that panics or hangs
 //! takes down one request, not the daemon, and a handoff doesn't wait for a
 //! build (docs/client-server.md, *Execution, internally*).
@@ -50,7 +51,7 @@ const CHUNK: usize = 64 * 1024;
 const ERR_TAIL: usize = 16 * 1024;
 
 pub fn is_verb(method: &str) -> bool {
-    matches!(method, "run" | "rebuild" | "start" | "stop" | "rm")
+    matches!(method, "run" | "rebuild" | "start" | "stop" | "rm" | "services.rebuild")
 }
 
 // ---- params ---------------------------------------------------------------
@@ -132,6 +133,16 @@ pub struct RmParams {
     pub ask: bool,
 }
 
+/// `services.rebuild` params: a service of the config root, by name. No
+/// `detach`: it's no instance verb, nothing would show it running on.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServicesRebuildParams {
+    pub root: PathBuf,
+    pub env: BTreeMap<String, String>,
+    pub name: String,
+}
+
 /// What a verb acts on: an instance as the CLI's `<name>` takes it, or `--all`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Target {
@@ -146,9 +157,13 @@ pub enum Verb {
     Start { target: Target },
     Stop { target: Target },
     Rm { instance: String, delete_branch: Option<bool>, force: bool, ask: bool },
+    /// A service, not an instance: answers `instance: null`.
+    ServicesRebuild { name: String },
 }
 
 impl Verb {
+    /// The CLI's words for it: the subprocess's subcommand (split on the
+    /// space) and what log lines and `failed` messages call it.
     pub fn name(&self) -> &'static str {
         match self {
             Verb::Run { .. } => "run",
@@ -156,13 +171,14 @@ impl Verb {
             Verb::Start { .. } => "start",
             Verb::Stop { .. } => "stop",
             Verb::Rm { .. } => "rm",
+            Verb::ServicesRebuild { .. } => "service rebuild",
         }
     }
 
     fn target(&self) -> Option<&Target> {
         match self {
             Verb::Rebuild { target, .. } | Verb::Start { target } | Verb::Stop { target } => Some(target),
-            Verb::Run { .. } | Verb::Rm { .. } => None,
+            Verb::Run { .. } | Verb::Rm { .. } | Verb::ServicesRebuild { .. } => None,
         }
     }
 
@@ -216,6 +232,10 @@ pub fn parse(method: &str, params: Value) -> Result<VerbRequest, ApiError> {
             let verb = Verb::Rm { instance: p.instance, delete_branch: p.delete_branch, force: p.force, ask: p.ask };
             (p.root, p.env, verb, false)
         }
+        "services.rebuild" => {
+            let p: ServicesRebuildParams = api::parse(params)?;
+            (p.root, p.env, Verb::ServicesRebuild { name: p.name }, false)
+        }
         other => return Err(ApiError::unknown_method(other)),
     };
     if !root.is_absolute() {
@@ -246,7 +266,7 @@ fn target(instance: Option<String>, all: bool) -> Result<Target, ApiError> {
 /// value; the target always goes in, so no pick prompt can come up.
 pub fn argv(req: &VerbRequest) -> Vec<String> {
     let mut args = vec!["--in-process".to_string(), "-C".into(), req.root.to_string_lossy().into_owned()];
-    args.push(req.verb.name().into());
+    args.extend(req.verb.name().split(' ').map(String::from));
     let flag = |args: &mut Vec<String>, name: &str, value: &Option<String>| {
         if let Some(value) = value {
             args.push(format!("--{name}={value}"));
@@ -283,6 +303,7 @@ pub fn argv(req: &VerbRequest) -> Vec<String> {
             }
             Some(instance)
         }
+        Verb::ServicesRebuild { name } => Some(name),
     };
     if let Some(target) = target {
         args.push("--".into());
@@ -320,7 +341,7 @@ fn detach_at(req: &VerbRequest) -> DetachAt {
     match &req.verb {
         Verb::Run { .. } | Verb::Rebuild { target: Target::One(_), .. } => DetachAt::Registered,
         Verb::Rebuild { .. } | Verb::Start { .. } => DetachAt::Spawn,
-        Verb::Stop { .. } | Verb::Rm { .. } => DetachAt::Never,
+        Verb::Stop { .. } | Verb::Rm { .. } | Verb::ServicesRebuild { .. } => DetachAt::Never,
     }
 }
 
@@ -977,6 +998,8 @@ pub(crate) mod tests {
         assert_eq!(argv(&req(rm(Some(true), true, false), false)), with(&["rm", "--delete-branch", "--force", "--", "w"]));
         assert_eq!(argv(&req(rm(Some(false), false, false), false)), with(&["rm", "--keep-branch", "--", "w"]));
         assert_eq!(argv(&req(rm(None, false, true), false)), with(&["rm", "--fail-on-ask", "--", "w"]));
+        let svc = Verb::ServicesRebuild { name: "-db".into() };
+        assert_eq!(argv(&req(svc, false)), with(&["service", "rebuild", "--", "-db"]));
     }
 
     /// The argv parses as the CLI's own verb with the request's values, so a
@@ -1032,6 +1055,10 @@ pub(crate) mod tests {
                 }
             }
         }
+        match parse(Verb::ServicesRebuild { name: "-db".into() }) {
+            Command::Service { cmd: crate::ServiceCommand::Rebuild { name } } => assert_eq!(name, "-db"),
+            _ => panic!("not service rebuild"),
+        }
     }
 
     #[test]
@@ -1058,6 +1085,12 @@ pub(crate) mod tests {
         assert_eq!(p.verb, Verb::Rm { instance: "w".into(), delete_branch: None, force: false, ask: true });
         let p = parse("start", json!({"root": r, "env": {"X": "1"}, "instance": "w", "detach": true})).unwrap();
         assert!(p.detach && p.env["X"] == "1");
+        assert!(is_verb("services.rebuild"));
+        let p = parse("services.rebuild", json!({"root": r, "env": {}, "name": "db", "detach": true})).unwrap();
+        // No `detach` for it: an unknown field, ignored.
+        assert_eq!((p.verb, p.detach), (Verb::ServicesRebuild { name: "db".into() }, false));
+        assert_eq!(code("services.rebuild", json!({"root": r, "env": {}})), Err("invalid"));
+        assert_eq!(code("services.rebuild", json!({"root": r, "name": "db"})), Err("invalid"));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1069,6 +1102,7 @@ pub(crate) mod tests {
         assert_eq!(detach_at(&req(Verb::Rebuild { target: one("w"), force: false }, true)), DetachAt::Registered);
         assert_eq!(detach_at(&req(Verb::Rebuild { target: Target::All, force: false }, true)), DetachAt::Spawn);
         assert_eq!(detach_at(&req(Verb::Start { target: one("w") }, true)), DetachAt::Spawn);
+        assert_eq!(detach_at(&req(Verb::ServicesRebuild { name: "db".into() }, true)), DetachAt::Never);
     }
 
     #[test]
@@ -1243,6 +1277,22 @@ pub(crate) mod tests {
         assert_eq!(table.len(), 0);
         // Spool files are gone once the exit is reported.
         assert_eq!(std::fs::read_dir(&runner.spool).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No instance verb: even an instance named like the service isn't
+    /// what the answer names, on success or failure.
+    #[test]
+    fn services_rebuild_answers_no_instance() {
+        let (runner, dir) = script_runner("svc", r#"echo "args: $*"; [ "$7" = db ] || { echo 'Error: no service' >&2; exit 2; }"#);
+        std::fs::write(&runner.state, instance_toml("db", "")).unwrap();
+        let svc = |name: &str| req(Verb::ServicesRebuild { name: name.into() }, false);
+        let peer = FakePeer::default();
+        let out = serve(&svc("db"), Some(1), &runner, &Arc::default(), &peer, "test", |_| {});
+        assert_eq!(out.answer().unwrap(), json!({"instance": null, "exit": 0}));
+        assert_eq!(peer.output("stdout"), "args: --in-process -C /cfg service rebuild -- db\n");
+        let f = serve(&svc("nope"), Some(2), &runner, &Arc::default(), &peer, "test", |_| {}).answer().unwrap_err();
+        assert_eq!((f.code, f.message.as_str(), f.data), ("failed", "no service", Some(json!({"exit": 2, "instance": null}))));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1442,13 +1492,15 @@ pub(crate) mod tests {
             RebuildParams { root: root.clone(), env: e.clone(), instance: None, all: true, force: false, detach: false };
         let start = StartParams { root: root.clone(), env: e.clone(), instance: None, all: true, detach: false };
         let stop = StopParams { root: root.clone(), env: e.clone(), instance: None, all: true };
-        let rm = RmParams { root, env: e, instance: "w".into(), delete_branch: None, force: false, ask: true };
+        let rm = RmParams { root: root.clone(), env: e.clone(), instance: "w".into(), delete_branch: None, force: false, ask: true };
+        let services_rebuild = ServicesRebuildParams { root, env: e, name: "db".into() };
         for (iface, value) in [
             ("RunParams", v(&run)),
             ("RebuildParams", v(&rebuild)),
             ("StartParams", v(&start)),
             ("StopParams", v(&stop)),
             ("RmParams", v(&rm)),
+            ("ServicesRebuildParams", v(&services_rebuild)),
             ("VerbResult", done_result(Some("w"))),
             ("VerbDetached", detached_result(Some("w"), Some(json!({})))),
             ("VerbFailedData", failed_data(1, None)),
@@ -1458,6 +1510,7 @@ pub(crate) mod tests {
             assert_matches(iface, &value);
         }
         assert_eq!(prop_type("VerbDetached", "record").as_deref(), Some("RunRecord"));
+        assert!(prop_type("ApiMethods", "services.rebuild").is_some_and(|t| t.contains("result: VerbResult ")));
         for method in ["run", "rebuild", "start", "stop", "rm"] {
             assert!(prop_type("ApiMethods", method).is_some(), "ApiMethods lacks `{method}`");
         }

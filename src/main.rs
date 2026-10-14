@@ -425,7 +425,8 @@ fn main() -> Result<()> {
         std::process::exit(2);
     };
 
-    // The five verbs go to the daemon (docs/verbs-as-requests.md); it runs
+    // The five verbs and `service rebuild` go to the daemon
+    // (docs/verbs-as-requests.md, docs/api.md *Verbs*); it runs
     // them as `--in-process` subprocesses, which take the arms below. With
     // no daemon to reach, `fallback` says why and they run here instead.
     #[cfg(unix)]

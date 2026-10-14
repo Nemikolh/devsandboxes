@@ -651,6 +651,17 @@ export interface InstanceCancelled {
   pid: number;
 }
 
+/** `instances.rename`'s answer: the new (trimmed) name. */
+export interface InstanceRenamed {
+  instance: string;
+}
+
+/** `instances.done`'s answer: the instance's done flag as it now is. */
+export interface InstanceDone {
+  instance: string;
+  done: boolean;
+}
+
 /** One `sandboxes.list` entry (not the snapshot's {@link SandboxRow}). */
 export interface SandboxEntry {
   name: string;
@@ -745,7 +756,7 @@ export interface ForwardsStatus {
 }
 
 /**
- * What every verb (`run`, `rebuild`, `start`, `stop`, `rm`) takes: the config
+ * What every verb (`run`, `rebuild`, `start`, `stop`, `rm`, `services.rebuild`) takes: the config
  * root and the env the verb runs with (the caller's whole env, never the
  * daemon's).
  */
@@ -796,6 +807,11 @@ export interface RmParams extends VerbParams {
   force?: boolean;
   /** Where the branch question would come up, answer `confirm` (the question as its `message`) having removed nothing; resend with `deleteBranch`. */
   ask?: boolean;
+}
+
+/** `services.rebuild` params: the service's name in the config root. */
+export interface ServicesRebuildParams extends VerbParams {
+  name: string;
 }
 
 /** A verb's answer once it exited 0. */
@@ -897,6 +913,12 @@ export interface ApiMethods {
   'instances.procs': { params: { instances: string[] }; result: Record<string, InstanceProcs> };
   /** `instance`: exact name or instance id; `lines` default 500, at most 10000. `null`: no build log yet. */
   'instances.buildLog': { params: { instance: string; lines?: number }; result: BuildLogTail | null };
+  /** Signal a process in the instance's container (exact name; `pid` from `instances.procs`, digits). */
+  'instances.signal': { params: { instance: string; pid: string; signal: 'TERM' | 'KILL' }; result: OkResult };
+  /** Exact name; `invalid` for a bad or taken name, or an instance mid-build. */
+  'instances.rename': { params: { instance: string; newName: string }; result: InstanceRenamed };
+  /** Set or clear the done flag (exact name); idempotent. */
+  'instances.done': { params: { instance: string; done: boolean }; result: InstanceDone };
   /** `devsandbox-…` containers only; `lines` default 50, at most 10000. */
   'containers.logs': { params: { container: string; lines?: number }; result: ContainerLogs };
   /** `devsandbox-…` containers only: the runtime's inspect JSON (docker's: an array of one object). */
@@ -915,6 +937,8 @@ export interface ApiMethods {
   start: { params: StartParams; result: VerbResult | VerbDetached };
   stop: { params: StopParams; result: VerbResult };
   rm: { params: RmParams; result: VerbResult };
+  /** No instance verb: `instance` is always `null`, no `detach`. */
+  'services.rebuild': { params: ServicesRebuildParams; result: VerbResult };
   subscribe: { params: { topics: ApiTopic[] }; result: OkResult };
   unsubscribe: { params: { topics: ApiTopic[] }; result: OkResult };
   /** Stop the daemon (it drains, then exits); `devsandbox serve install` sends it. */

@@ -1,5 +1,5 @@
 //! The CLI side of verbs as requests (docs/verbs-as-requests.md, step 3):
-//! `run`, `rebuild`, `start`, `stop` and `rm` sent to the daemon
+//! `run`, `rebuild`, `start`, `stop`, `rm` and `service rebuild` sent to the daemon
 //! ([`super::verbs`] runs them) instead of run in this process, so a build
 //! survives its terminal and runs with this shell's env either way.
 //!
@@ -25,7 +25,7 @@ use serde_json::{Value, json};
 use super::client::{self, Conn, Streamed};
 use super::endpoint;
 use super::proto::{Notification, Response, Version};
-use super::verbs::{RebuildParams, RmParams, RunParams, StartParams, StopParams};
+use super::verbs::{RebuildParams, RmParams, RunParams, ServicesRebuildParams, StartParams, StopParams};
 use crate::Command;
 use crate::commands::run::cancel;
 use crate::state::PhaseView;
@@ -45,16 +45,21 @@ pub(crate) enum CliVerb {
     Start { target: Option<String>, detach: bool },
     Stop { target: Option<String> },
     Rm { name: String, delete_branch: Option<bool>, force: bool },
+    /// `service rebuild <name>`: names a service, so no prompt, no cancel by
+    /// name (the first Ctrl-C hangs up, as `stop --all`'s).
+    ServicesRebuild { name: String },
 }
 
 impl CliVerb {
-    fn method(&self) -> &'static str {
+    /// The command as the user typed it, for messages.
+    fn command(&self) -> &'static str {
         match self {
             CliVerb::Run { .. } => "run",
             CliVerb::Rebuild { .. } => "rebuild",
             CliVerb::Start { .. } => "start",
             CliVerb::Stop { .. } => "stop",
             CliVerb::Rm { .. } => "rm",
+            CliVerb::ServicesRebuild { .. } => "service rebuild",
         }
     }
 
@@ -97,6 +102,7 @@ pub(crate) fn from_command(command: &Command) -> Option<CliVerb> {
             delete_branch: crate::rm_branch_flag(*delete_branch, *keep_branch),
             force: *force,
         },
+        Command::Service { cmd: crate::ServiceCommand::Rebuild { name } } => CliVerb::ServicesRebuild { name: name.clone() },
         _ => return None,
     })
 }
@@ -294,6 +300,10 @@ fn prepare(verb: &CliVerb, root: &Path, env: BTreeMap<String, String>, call: &mu
             let ask = ui.tty && delete_branch.is_none();
             let p = RmParams { root, env, instance: instance.clone(), delete_branch, force, ask };
             ("rm", serde_json::to_value(p)?, Some(instance))
+        }
+        CliVerb::ServicesRebuild { name } => {
+            let p = ServicesRebuildParams { root, env, name };
+            ("services.rebuild", serde_json::to_value(p)?, None)
         }
     };
     Ok(Prep::Send(Prepared { method, params, instance }))
@@ -534,7 +544,7 @@ fn print_detached(verb: &CliVerb, result: &Value) -> Result<()> {
 /// runs on, orphaned. A build with a known instance is followed through its
 /// build log, then exits by its phase; anything else can't be watched.
 fn lost(verb: &CliVerb, instance: Option<&str>) -> Result<i32> {
-    eprintln!("devsandbox serve went away; `devsandbox {}` keeps running in the background", verb.method());
+    eprintln!("devsandbox serve went away; `devsandbox {}` keeps running in the background", verb.command());
     let Some(instance) = instance.filter(|_| verb.builds()) else { return Ok(1) };
     // `run --json`'s stdout is for the document: follow quietly.
     if !matches!(verb, CliVerb::Run { json: true, .. })
@@ -603,7 +613,9 @@ mod tests {
             verb(&["rm", "-f", "--keep-branch", "w"]),
             Some(CliVerb::Rm { name: "w".into(), delete_branch: Some(false), force: true })
         );
+        assert_eq!(verb(&["service", "rebuild", "db"]), Some(CliVerb::ServicesRebuild { name: "db".into() }));
         // `-d` is only for the verbs that build.
+        assert!(Cli::try_parse_from(["devsandbox", "service", "rebuild", "-d", "db"]).is_err());
         assert!(Cli::try_parse_from(["devsandbox", "stop", "-d", "w"]).is_err());
         assert!(Cli::try_parse_from(["devsandbox", "rm", "-d", "w"]).is_err());
     }
@@ -618,6 +630,8 @@ mod tests {
         assert_eq!(verb(&["rm", "--fail-on-ask", "w"]), None);
         assert_eq!(verb(&["ps"]), None);
         assert_eq!(verb(&["logs", "w"]), None);
+        assert_eq!(verb(&["service", "ls"]), None);
+        assert_eq!(verb(&["gc"]), None);
         let cli = Cli::try_parse_from(["devsandbox", "--in-process", "stop", "w"]).unwrap();
         assert!(cli.in_process);
     }
@@ -753,6 +767,15 @@ mod tests {
         let p = sent(p);
         assert_eq!(p.instance, None);
         assert_eq!((&p.params["all"], &p.params["force"], &p.params["detach"]), (&json!(true), &json!(true), &json!(true)));
+    }
+
+    #[test]
+    fn service_rebuild_sends_the_name_unresolved() {
+        let (p, calls, _) = prep(&CliVerb::ServicesRebuild { name: "db".into() }, true, &[], 0);
+        assert!(calls.is_empty(), "no prompt, no resolve");
+        let p = sent(p);
+        assert_eq!((p.method, p.instance), ("services.rebuild", None));
+        assert_eq!(p.params, json!({"root": "/cfg", "env": {"A": "1"}, "name": "db"}));
     }
 
     #[test]

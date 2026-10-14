@@ -312,6 +312,40 @@ log is then `not-found`.
 Errors: `not-found` (no such instance), `invalid` (no `instance`, a
 negative `lines`), `internal` (the log or `state.toml` doesn't read).
 
+### `instances.signal`
+
+Params: `{"instance": "<name>", "pid": "42", "signal": "TERM"}`: an exact
+instance name, a pid of its container (from `instances.procs`, when
+`signalable`) as a string of digits, `signal` `TERM` or `KILL`. Runs the
+runtime's `kill` in the instance's container (from `state.toml`). Result:
+`{"ok": true}` once `kill` succeeded, not once the process is gone.
+
+Errors: `invalid` (another signal, a pid that isn't a positive number, a
+missing param), `not-found` (no such instance), `internal` (the runtime's
+`kill` failed: no such process, the container isn't running).
+
+### `instances.rename`
+
+Params: `{"instance": "<name>", "newName": "<name>"}`, an exact instance
+name. Moves its `state.toml` key, as `devsandbox rename`: the container,
+worktree and instance id keep theirs. Result: `{"instance": "<new name>"}`,
+trimmed.
+
+Errors: `not-found` (no such instance), `invalid` (an empty new name, one
+with spaces, the same name, one already taken, or the instance is still
+being built by a `run`/`rebuild`), each with the CLI's message;
+`internal` (`state.toml` doesn't read or write).
+
+### `instances.done`
+
+Params: `{"instance": "<name>", "done": true}`, an exact instance name.
+Sets (`true`) or clears its done flag, as `devsandbox done|undone`;
+idempotent (an instance already done keeps its original time). Result:
+`{"instance": "<name>", "done": true}`, the flag as it now is.
+
+Errors: `not-found` (no such instance), `invalid` (a missing param),
+`internal` (`state.toml` doesn't read or write).
+
 ## Containers
 
 Only devsandbox's own containers (names starting `devsandbox-`, instances
@@ -506,6 +540,11 @@ and `HOME` are the caller's, never the daemon's.
 | `start` | `instance` \| `all: true`, `detach?` |
 | `stop` | `instance` \| `all: true` |
 | `rm` | `instance`, `deleteBranch?` (`true` deletes, `false` keeps, absent: merged or gone branches go, local work stays), `force?`, `ask?` |
+| `services.rebuild` | `name` (a service of the config root) |
+
+`services.rebuild` runs `devsandbox service rebuild <name>`: no instance
+verb, so its answer's (and `failed`'s) `instance` is always `null`, no
+`progress` comes, and `ask`/`detach` don't apply.
 
 `root` is the absolute config root (`-C`); `env` an object of strings,
 required. `instance` is resolved as the CLI's `<name>` is, but an
@@ -681,8 +720,8 @@ run in its own process, suspended.
 
 ## The CLI as a client
 
-`devsandbox run`, `rebuild`, `start`, `stop` and `rm` are verb requests
-(*Verbs*; `src/serve/verbs_client.rs`), sent with the absolute `-C` and the
+`devsandbox run`, `rebuild`, `start`, `stop`, `rm` and `service rebuild`
+are verb requests (*Verbs*; `src/serve/verbs_client.rs`), sent with the absolute `-C` and the
 shell's whole env (non-UTF-8 variables left out). Prompts come first, on
 the CLI's TTY: `run` lists `sandboxes.list` to pick a sandbox (none: it
 offers the example config itself, it writes into the user's dir), a
@@ -692,8 +731,8 @@ after a `confirm`. Off a TTY: today's errors and defaults. `output` goes to
 its stream as it comes; the exit is 0, `failed`'s `data.exit` (nothing more
 printed), or 1 with another error's message. The first Ctrl-C sends
 `instances.cancel` on a second connection and keeps streaming the
-rollback, or hangs up when no instance is named yet (or the cancel is
-refused); a second kills the CLI (a hang-up); then it exits 130. `-d` is
+rollback, or hangs up when no instance is named yet (`service rebuild`
+names none, nor does `--all`) or the cancel is refused; a second kills the CLI (a hang-up); then it exits 130. `-d` is
 `detach`: it prints the instance (`run -d --json`: the record in the
 `run --json` envelope). A connection that ends before the answer leaves the
 verb running: the CLI says so and, for a build with a known instance,

@@ -109,6 +109,11 @@ pub fn call(method: &str, params: Value, ctx: &Ctx) -> Answer {
             instances_cancel(parse(params)?, &state_path()?, crate::commands::run::cancel::interrupt)
         }
         "instances.procs" => instances_procs(parse(params)?, &state_path()?, fetch_procs),
+        "instances.signal" => instances_signal(parse(params)?, &state_path()?, |c, pid, n| {
+            crate::runtime::backend().signal_proc(c, pid, n)
+        }),
+        "instances.rename" => instances_rename(parse(params)?, &state_path()?),
+        "instances.done" => instances_done(parse(params)?, &state_path()?),
         "instances.buildLog" => instances_build_log(parse(params)?, &state_path()?),
         "containers.logs" => {
             containers_logs(parse(params)?, |c, n| crate::runtime::backend().logs_tail(c, n).map_err(ApiError::internal))
@@ -450,6 +455,97 @@ fn instances_cancel(p: CancelParams, state: &Path, signal: fn(u32) -> Result<(),
         NotCancelled::Signal(e) => ApiError::internal(anyhow::anyhow!(e)),
     })?;
     serde_json::to_value(Cancelled { ok: true, pid }).map_err(|e| ApiError::internal(e.into()))
+}
+
+#[derive(Deserialize)]
+struct SignalParams {
+    instance: String,
+    pid: String,
+    signal: String,
+}
+
+/// The signals `instances.signal` sends, by wire name: the dashboard's kill
+/// keys. Numbers, as the runtime's `kill -<n>` in the container takes them.
+fn signal_number(name: &str) -> Option<i32> {
+    match name {
+        "TERM" => Some(15),
+        "KILL" => Some(9),
+        _ => None,
+    }
+}
+
+/// Signal process `pid` inside an instance's container (`instances.procs`
+/// pids, when `signalable`). The pid goes into the runtime's `kill` argv,
+/// so it must be a plain positive number: no `-1`, no `0` (the exec's own
+/// group). `state` and `send` (the runtime's `signal_proc`) are injected
+/// for the tests.
+fn instances_signal(
+    p: SignalParams,
+    state: &Path,
+    send: impl FnOnce(&str, &str, i32) -> anyhow::Result<()>,
+) -> Answer {
+    let num = signal_number(&p.signal)
+        .ok_or_else(|| ApiError::invalid(format!("unknown signal `{}` (TERM, KILL)", p.signal)))?;
+    if p.pid.is_empty() || !p.pid.bytes().all(|b| b.is_ascii_digit()) || p.pid.bytes().all(|b| b == b'0') {
+        return Err(ApiError::invalid(format!("`pid` must be a process id, got `{}`", p.pid)));
+    }
+    let s = load_state(state)?;
+    let instance =
+        s.instances.get(&p.instance).ok_or_else(|| ApiError::not_found(format!("no instance `{}`", p.instance)))?;
+    send(&instance.container, &p.pid, num).map_err(ApiError::internal)?;
+    ok()
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RenameParams {
+    instance: String,
+    new_name: String,
+}
+
+/// `instances.rename`'s answer: the new (trimmed) name.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Renamed {
+    pub instance: String,
+}
+
+/// Rename an instance by its exact name (`rename::rename_exact`: only the
+/// state key moves). Refusals keep their CLI wording: `not-found` for no
+/// such instance, `invalid` for an empty / spaced / unchanged / taken name
+/// or an instance mid-`run`/`rebuild`. `state` is injected for the tests.
+fn instances_rename(p: RenameParams, state: &Path) -> Answer {
+    use crate::commands::rename::{Refused, rename_exact_at};
+    let instance = rename_exact_at(state, &p.instance, &p.new_name).map_err(|e| match e.downcast::<Refused>() {
+        Ok(Refused::Unknown(m)) => ApiError::not_found(m),
+        Ok(Refused::Invalid(m)) => ApiError::invalid(m),
+        Err(e) => ApiError::internal(e),
+    })?;
+    serde_json::to_value(Renamed { instance }).map_err(|e| ApiError::internal(e.into()))
+}
+
+#[derive(Deserialize)]
+struct DoneParams {
+    instance: String,
+    done: bool,
+}
+
+/// `instances.done`'s answer: the instance's flag as it now is.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DoneSet {
+    pub instance: String,
+    pub done: bool,
+}
+
+/// Set or clear an instance's done flag (`done::set_saved`) by its exact
+/// name; idempotent, as the CLI's. The answer is data: the client words the
+/// status line. `state` is injected for the tests.
+fn instances_done(p: DoneParams, state: &Path) -> Answer {
+    use crate::commands::done::{UnknownInstance, set_saved_at};
+    set_saved_at(state, &p.instance, p.done).map_err(|e| match e.downcast::<UnknownInstance>() {
+        Ok(unknown) => ApiError::not_found(unknown.to_string()),
+        Err(e) => ApiError::internal(e),
+    })?;
+    serde_json::to_value(DoneSet { instance: p.instance, done: p.done }).map_err(|e| ApiError::internal(e.into()))
 }
 
 #[derive(Deserialize)]
@@ -1393,6 +1489,81 @@ mod tests {
     }
 
     #[test]
+    fn instances_signal_checks_before_reaching_the_runtime() {
+        let state = state_file("signal", &instance("web", "web", ""));
+        let sent = std::cell::RefCell::new(Vec::new());
+        let signal = |params: Value| {
+            instances_signal(parse(params)?, &state, |c, pid, n| {
+                sent.borrow_mut().push((c.to_string(), pid.to_string(), n));
+                Ok(())
+            })
+        };
+        assert_eq!(signal(json!({"instance": "web", "pid": "42", "signal": "TERM"})).unwrap(), json!({"ok": true}));
+        signal(json!({"instance": "web", "pid": "7", "signal": "KILL"})).unwrap();
+        assert_eq!(*sent.borrow(), [("devsandbox-web".to_string(), "42".to_string(), 15), ("devsandbox-web".to_string(), "7".to_string(), 9)]);
+        for bad in [
+            json!({"instance": "web", "pid": "42", "signal": "INT"}),
+            json!({"instance": "web", "pid": "42", "signal": "SIGTERM"}),
+            json!({"instance": "web", "pid": "-1", "signal": "TERM"}),
+            json!({"instance": "web", "pid": "0", "signal": "TERM"}),
+            json!({"instance": "web", "pid": "", "signal": "TERM"}),
+            json!({"instance": "web", "pid": "4 2", "signal": "TERM"}),
+            json!({"instance": "web", "pid": 42, "signal": "TERM"}),
+            json!({"instance": "web", "signal": "TERM"}),
+        ] {
+            assert_eq!(code(signal(bad.clone())), "invalid", "{bad}");
+        }
+        assert_eq!(code(signal(json!({"instance": "nope", "pid": "42", "signal": "TERM"}))), "not-found");
+        assert_eq!(sent.borrow().len(), 2, "refused before the runtime");
+        let failing = instances_signal(parse(json!({"instance": "web", "pid": "42", "signal": "TERM"})).unwrap(), &state, |_, _, _| {
+            anyhow::bail!("No such container: devsandbox-web")
+        });
+        assert_eq!(code(failing), "internal");
+    }
+
+    #[test]
+    fn instances_rename_moves_the_key_and_maps_refusals() {
+        let me = std::process::id();
+        let building = format!("[instance.b.progress]\nphase = \"building\"\npid = {me}\n");
+        let state = state_file("rename", &[instance("web", "web", ""), instance("api", "web", ""), instance("b", "web", &building)].concat());
+        let rename = |params: Value| instances_rename(parse(params)?, &state);
+        assert_eq!(rename(json!({"instance": "web", "newName": " web-x "})).unwrap(), json!({"instance": "web-x"}));
+        let s = crate::state::State::load_at(&state).unwrap();
+        assert!(!s.instances.contains_key("web"));
+        assert_eq!(s.instances["web-x"].container, "devsandbox-web", "only the key moves");
+        let taken = rename(json!({"instance": "web-x", "newName": "api"})).unwrap_err();
+        assert_eq!((taken.code, taken.message.as_str()), ("invalid", "an instance named `api` already exists"));
+        for new in ["", "a b", "web-x"] {
+            assert_eq!(code(rename(json!({"instance": "web-x", "newName": new}))), "invalid", "{new:?}");
+        }
+        assert_eq!(code(rename(json!({"instance": "b", "newName": "b2"}))), "invalid", "in flight");
+        assert_eq!(code(rename(json!({"instance": "web", "newName": "w"}))), "not-found");
+        assert_eq!(code(rename(json!({"instance": "api", "new_name": "w"}))), "invalid", "camelCase");
+        // Refusals wrote nothing.
+        let after = crate::state::State::load_at(&state).unwrap();
+        assert_eq!(after.instances.keys().collect::<Vec<_>>(), ["api", "b", "web-x"]);
+        std::fs::write(&state, "not = [toml").unwrap();
+        assert_eq!(code(rename(json!({"instance": "api", "newName": "w"}))), "internal");
+    }
+
+    #[test]
+    fn instances_done_sets_and_clears_the_flag() {
+        let state = state_file("done", &instance("web", "web", ""));
+        let done = |params: Value| instances_done(parse(params)?, &state);
+        let flag = || crate::state::State::load_at(&state).unwrap().instances["web"].done;
+        assert_eq!(done(json!({"instance": "web", "done": true})).unwrap(), json!({"instance": "web", "done": true}));
+        let since = flag().expect("marked done");
+        // Idempotent: the original since is kept.
+        done(json!({"instance": "web", "done": true})).unwrap();
+        assert_eq!(flag(), Some(since));
+        assert_eq!(done(json!({"instance": "web", "done": false})).unwrap(), json!({"instance": "web", "done": false}));
+        assert_eq!(flag(), None);
+        let unknown = done(json!({"instance": "nope", "done": true})).unwrap_err();
+        assert_eq!((unknown.code, unknown.message.as_str()), ("not-found", "no instance `nope`"));
+        assert_eq!(code(done(json!({"instance": "web"}))), "invalid");
+    }
+
+    #[test]
     fn sandboxes_list_names_the_configs_sandboxes() {
         let root = store_path("sandboxes").with_file_name("cfg");
         std::fs::create_dir_all(&root).unwrap();
@@ -1616,12 +1787,17 @@ mod tests {
         assert_matches("ContainerLogs", &v(&ContainerLogs { text: "t".into() }));
         assert_matches("SandboxConfig", &v(&cfg.sandbox_text("web")));
         assert_matches("ServiceConfig", &v(&ServiceConfig { original: "t".into() }));
+        assert_matches("InstanceRenamed", &v(&Renamed { instance: "w".into() }));
+        assert_matches("InstanceDone", &v(&DoneSet { instance: "w".into(), done: true }));
         for (method, result) in [
             ("instances.list", "InstancesList"),
             ("instances.resolve", "InstancesResolved"),
             ("instances.cancel", "InstanceCancelled"),
             ("instances.procs", "Record<string, InstanceProcs>"),
             ("instances.buildLog", "BuildLogTail | null"),
+            ("instances.signal", "OkResult"),
+            ("instances.rename", "InstanceRenamed"),
+            ("instances.done", "InstanceDone"),
             ("containers.logs", "ContainerLogs"),
             ("containers.inspect", "unknown"),
             ("sandboxes.list", "SandboxEntry[]"),

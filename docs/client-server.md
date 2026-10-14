@@ -6,8 +6,9 @@ log, a TUI that doesn't suspend) in-process: `docs/instance-phase.md`. Step
 `docs/verbs-as-requests.md`. The rest is not implemented.
 
 The daemon (`docs/serve.md`) owns the live host side: bridges, forwards,
-the API, and now the five verbs above. Every other verb (`services *`,
-`rename`, `done`, `gc`, …) still does its work in the process you started.
+the API, and now the five verbs above plus `service rebuild`. Every other
+verb (`service ls`, `rename`, `done`, `gc`, …) still does its work in the
+process you started.
 This doc moves the verbs' work into the daemon, the way `docker` hands
 everything to `dockerd`. The CLI and the TUI become clients, and the client
 can be on another machine.
@@ -350,8 +351,9 @@ helper. Needs a spike. Low priority, and nothing above depends on it.
    instead of suspended.
 3. Done (`docs/verbs-as-requests.md`) for `run`, `rebuild`, `start`,
    `stop`, `rm`: streaming, cancel, `-d`, env, prompts on the client.
-   `services *`, `rename`/`done`/`gc` and the rest are still in-process,
-   and so are the dashboard's `rm`/`stop` (step 4).
+   `service ls`, `rename`/`done`/`gc` and the rest are still in-process
+   (`service rebuild` became a verb request in step 4), and so are the
+   dashboard's `rm`/`stop` (step 4).
 4. Dashboard as a pure client (`instances.list`, `sandboxes.list`,
    procs/stats methods).
 5. `machine add|ls|rm`, the ssh transport, federation, `ssh -t` exec.

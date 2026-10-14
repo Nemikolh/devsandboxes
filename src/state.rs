@@ -398,7 +398,10 @@ impl State {
         Self::update_at(&Self::path()?, f)
     }
 
-    fn update_at<T>(path: &Path, f: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
+    /// [`State::update`] of the file at `path`: the daemon's instance
+    /// mutations take an injected path, so their tests never touch the
+    /// user's state.
+    pub(crate) fn update_at<T>(path: &Path, f: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
         let dir = path.parent().context("state path has no parent")?;
         std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
         // Separate from the state file, which the atomic write replaces.

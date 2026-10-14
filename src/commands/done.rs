@@ -1,7 +1,22 @@
-use anyhow::{Context, Result};
+use std::path::Path;
+
+use anyhow::Result;
 
 use super::resolve_instance;
 use crate::state::{Instance, State};
+
+/// No instance by that exact key: typed so the daemon's `instances.done`
+/// answers `not-found` (downcast it); the message is the CLI's error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownInstance(pub String);
+
+impl std::fmt::Display for UnknownInstance {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "no instance `{}`", self.0)
+    }
+}
+
+impl std::error::Error for UnknownInstance {}
 
 /// `devsandbox done|undone <instance>`: set or clear the instance's done flag
 /// (docs/inbox-threads.md, "Done instances"). Nothing else changes: the
@@ -17,14 +32,20 @@ pub fn done(name: &str, done: bool) -> Result<()> {
 /// status; prints nothing, so the TUI (which owns the terminal) shares it
 /// with the CLI. `key` is an exact state key.
 pub fn set_saved(key: &str, done: bool) -> Result<String> {
-    State::update(|state| set(state, key, done, Instance::now()).map(|(_, msg)| msg))
+    set_saved_at(&State::path()?, key, done)
+}
+
+/// [`set_saved`] on the state file at `state`, for the daemon (its tests use
+/// a scratch file). An unknown `key` is an [`UnknownInstance`].
+pub fn set_saved_at(state: &Path, key: &str, done: bool) -> Result<String> {
+    State::update_at(state, |state| Ok(set(state, key, done, Instance::now()).map(|(_, msg)| msg)?))
 }
 
 /// The pure core: set (`since` = `now`) or clear `key`'s flag in `state`.
 /// Idempotent: marking a done instance done keeps its original since.
 /// Returns whether `state` changed, and the status line.
-fn set(state: &mut State, key: &str, done: bool, now: u64) -> Result<(bool, String)> {
-    let info = state.instances.get_mut(key).with_context(|| format!("no instance `{key}`"))?;
+fn set(state: &mut State, key: &str, done: bool, now: u64) -> Result<(bool, String), UnknownInstance> {
+    let info = state.instances.get_mut(key).ok_or_else(|| UnknownInstance(key.to_string()))?;
     Ok(match (done, info.done.is_some()) {
         (true, true) => (false, format!("`{key}` is already done")),
         (false, false) => (false, format!("`{key}` is not done")),
