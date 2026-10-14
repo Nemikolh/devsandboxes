@@ -130,7 +130,7 @@ pub fn rm(name: &str, delete_branch: Option<bool>, force: bool) -> Result<()> {
 /// carry the id, not the possibly-renamed key). Global services are shared
 /// and left to `gc`. Empty `project` = pre-upgrade state. Best-effort: the
 /// container may already be gone. Shared with `run`, which reclaims an
-/// orphaned dispatcher child this way, and rolls back a failed one.
+/// orphaned dispatcher child this way, and rolls back a cancelled one.
 pub(crate) fn remove_container(container: &str, project: &str, instance_id: &str) {
     let _ = backend().remove_force(container);
     if !project.is_empty() {

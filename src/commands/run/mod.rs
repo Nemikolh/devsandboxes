@@ -713,7 +713,6 @@ pub(crate) fn materialize(
         restart,
         dispatcher.as_deref(),
     )?;
-    tracker.container_created();
     let container = container_name.clone();
     backend().connect_networks(&container, &networks)?;
     backend().wire_service_dns(&container, &endpoints)?;
@@ -1536,10 +1535,10 @@ mod tests {
     }
 
     /// A `run` failing before the container (in `initializeCommand`, after
-    /// its worktree and branch were made) leaves nothing: no record, no
-    /// worktree, no branch.
+    /// its worktree and branch were made) is kept as failed, with everything
+    /// on its record, so `rm` then leaves nothing: no worktree, no branch.
     #[test_utils::docker_test]
-    fn run_failing_before_the_container_rolls_back_with_docker() -> Result<(), String> {
+    fn run_failing_before_the_container_is_kept_until_rm_with_docker() -> Result<(), String> {
         isolated("rollback_child")
     }
 
@@ -1559,7 +1558,15 @@ mod tests {
 
         let err = run(&cfg, Some("t".into()), Some("rb".into()), None, None, RunExtras::default()).unwrap_err();
         assert!(format!("{err:#}").contains("initializeCommand failed"), "{err:#}");
+        assert!(format!("{err:#}").contains("`devsandbox rm rb` removes it"), "{err:#}");
 
+        let state = State::load().unwrap();
+        let info = state.instances.get("rb").expect("failed instance kept");
+        let progress = info.progress.as_ref().expect("progress kept");
+        assert_eq!(progress.phase, Phase::Failed { at: "preparing".into() });
+        assert_eq!(info.worktree.as_deref(), Some(cfg.join(".worktrees/rb").as_path()));
+
+        crate::commands::rm::rm("rb", Some(true), false).unwrap();
         let state = State::load().unwrap();
         assert_eq!(state.instances.keys().collect::<Vec<_>>(), ["holder"]);
         assert!(!cfg.join(".worktrees/rb").exists(), "worktree left behind");

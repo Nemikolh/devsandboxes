@@ -23,18 +23,16 @@ trace of the output once you press a key.
   `building` (image), `creating` (container), then the lifecycle step
   running (`onCreateCommand` … `postAttachCommand`, plus `shell-rc` for the
   rc wiring). Plus `failed`, carrying the step it was at and the error.
-- **Failure before the container exists → automatic rollback.** Nothing
-  is worth inspecting yet, and that's what users expect today. Undo what
-  was recorded (services/network, `folders` worktrees, the worktree, a
-  branch this run created that has no commits beyond its start point), then
-  remove the record. *(Orchestrator's call, not discussed with the user
-  yet: the design doc said every failure becomes `failed`.)*
-- **Failure from the container on → `failed`, kept.** This is today's
-  "container kept" behaviour, now visible. Resume = `rebuild <instance>`,
-  which already re-materializes from the recorded worktree/branch. Remove =
-  `rm`.
-- **Cancel** (SIGINT/SIGTERM during `run`): roll back everything, the
-  container included, even after the container exists. A second signal
+- **Any failure → `failed`, kept**, before the container exists included
+  (decided after step 4: a run started from the dashboard runs unwatched,
+  and a rollback would take its row and build log with it). Resume =
+  `rebuild <instance>`, which re-materializes from the recorded
+  worktree/branch. Remove = `rm`. Steps 2–4 first shipped a rollback for
+  pre-container failures; the fix commit after step 4 replaced it.
+- **Cancel** (SIGINT/SIGTERM during `run`): the only rollback. Undo
+  everything recorded (container, services/network, volumes, `folders`
+  worktrees, the worktree, a branch this run created that has no commits
+  beyond its start point), then the record and its build log. A second signal
   exits immediately (default disposition restored after the first).
   Cancelling a `rebuild` leaves `failed` (the instance existed before).
 - **Interrupted** (SIGKILL, OOM, reboot): `progress` keeps a `pid` and the
@@ -221,8 +219,8 @@ A rolled-back `run` removes the log dir with the record, like `rm`. What
 ## Step 7: docs and changelog
 
 - `docs/client-server.md`: mark rollout 1–2 done, and fold in the
-  decisions that differ (pre-container failure rolls back, resume =
-  `rebuild`, interrupted derived at read time).
+  decisions that differ (only cancel rolls back, resume = `rebuild`,
+  interrupted derived at read time).
 - `CHANGELOG.md` `## Unreleased`: user-facing entries (no half-built
   sandboxes, cancel rolls back, `failed` status, build logs + `logs
   --build`, TUI runs in the background).

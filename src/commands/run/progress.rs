@@ -1,8 +1,8 @@
 //! An instance's `progress` while `run`/`rebuild` materialize it, and what a
-//! failure leaves behind (docs/instance-phase.md): before the container
-//! exists a `run` rolls back everything it recorded, from the container on
-//! the instance is kept as `failed`. A cancelled `run` rolls back whatever
-//! exists (`cancel`).
+//! failure leaves behind (docs/instance-phase.md): a failed instance is kept
+//! as `failed`, its build log with it, so a run nobody watched (the
+//! dashboard's) still leaves a trace; only a cancelled `run` rolls back
+//! whatever it made (`cancel`).
 
 use std::path::Path;
 
@@ -21,8 +21,6 @@ pub(crate) struct Tracker {
     instance_id: String,
     phase: Phase,
     boot: Option<String>,
-    /// The runtime created the container: a failure from here on keeps it.
-    container: bool,
 }
 
 impl Tracker {
@@ -33,7 +31,6 @@ impl Tracker {
             instance_id: instance_id.to_string(),
             phase,
             boot: crate::commands::autostart::boot_id(),
-            container: false,
         }
     }
 
@@ -56,10 +53,6 @@ impl Tracker {
     pub(crate) fn start(&self) -> Result<()> {
         let progress = self.progress();
         self.record(|i| i.progress = Some(progress))
-    }
-
-    pub(crate) fn container_created(&mut self) {
-        self.container = true;
     }
 
     /// Done: the instance is ready. Unless cancelled meanwhile: a Ctrl-C'd
@@ -95,7 +88,7 @@ impl Tracker {
     }
 
     pub(crate) fn on_failure(&self, fresh: bool) -> OnFailure {
-        on_failure(fresh, self.container, super::cancel::requested())
+        on_failure(fresh, super::cancel::requested())
     }
 }
 
@@ -109,12 +102,12 @@ pub(crate) enum OnFailure {
 }
 
 /// `fresh`: the record was made by this command (`run`), not a `rebuild` of an
-/// instance that existed before, which is never rolled back. Before the
-/// container exists there's nothing worth inspecting, so a fresh one goes.
-/// `cancelled`: the user stopped it (SIGINT/SIGTERM), and asked for nothing
-/// to be left, so a fresh one goes even with its container.
-pub(crate) fn on_failure(fresh: bool, container: bool, cancelled: bool) -> OnFailure {
-    if fresh && (!container || cancelled) { OnFailure::RollBack } else { OnFailure::KeepFailed }
+/// instance that existed before, which is never rolled back. `cancelled`: the
+/// user stopped it (SIGINT/SIGTERM) and asked for nothing to be left. Any
+/// other failure, before the container exists included, is kept with its
+/// build log: `rebuild` retries, `rm` removes.
+pub(crate) fn on_failure(fresh: bool, cancelled: bool) -> OnFailure {
+    if fresh && cancelled { OnFailure::RollBack } else { OnFailure::KeepFailed }
 }
 
 /// Whether the rollback deletes the worktree's branch: only one this run
@@ -190,21 +183,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_a_fresh_run_without_a_container_rolls_back() {
-        assert_eq!(on_failure(true, false, false), OnFailure::RollBack);
-        assert_eq!(on_failure(true, true, false), OnFailure::KeepFailed);
+    fn only_a_cancelled_run_rolls_back() {
+        assert_eq!(on_failure(true, true), OnFailure::RollBack);
+        assert_eq!(on_failure(true, false), OnFailure::KeepFailed);
         // `rebuild`: the instance existed before, never rolled back.
-        assert_eq!(on_failure(false, false, false), OnFailure::KeepFailed);
-        assert_eq!(on_failure(false, true, false), OnFailure::KeepFailed);
-    }
-
-    #[test]
-    fn a_cancelled_run_rolls_back_even_with_its_container() {
-        assert_eq!(on_failure(true, false, true), OnFailure::RollBack);
-        assert_eq!(on_failure(true, true, true), OnFailure::RollBack);
-        // A cancelled `rebuild` still keeps the instance, as `failed`.
-        assert_eq!(on_failure(false, false, true), OnFailure::KeepFailed);
-        assert_eq!(on_failure(false, true, true), OnFailure::KeepFailed);
+        assert_eq!(on_failure(false, true), OnFailure::KeepFailed);
+        assert_eq!(on_failure(false, false), OnFailure::KeepFailed);
     }
 
     #[test]
