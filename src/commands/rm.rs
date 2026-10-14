@@ -122,7 +122,7 @@ pub fn rm(name: &str, delete_branch: Option<bool>, force: bool) -> Result<()> {
 /// carry the id, not the possibly-renamed key). Global services are shared
 /// and left to `gc`. Empty `project` = pre-upgrade state. Best-effort: the
 /// container may already be gone. Shared with `run`, which reclaims an
-/// orphaned dispatcher child this way.
+/// orphaned dispatcher child this way, and rolls back a failed one.
 pub(crate) fn remove_container(container: &str, project: &str, instance_id: &str) {
     let _ = backend().remove_force(container);
     if !project.is_empty() {
@@ -268,7 +268,7 @@ fn fetch_prune(base: &Path) {
 }
 
 /// `-D`: unmerged commits go too; [`branch_action`] already decided they may.
-fn delete_branch_ref(base: &Path, branch: &str) {
+pub(crate) fn delete_branch_ref(base: &Path, branch: &str) {
     let out = host_git(base).and_then(|mut git| {
         git.args(["branch", "-D", branch]).output().context("failed to run git (is it installed?)")
     });
@@ -354,7 +354,7 @@ fn check_folder_worktrees(folders: &[FolderMount]) -> Result<()> {
 /// Remove the detached `folders` worktrees (no branches to offer), then
 /// their `<id>.folders/` parent dirs once empty. `force` discards changes and
 /// moves on past a failed entry, warning.
-fn remove_folder_worktrees(folders: &[FolderMount], force: bool) -> Result<()> {
+pub(crate) fn remove_folder_worktrees(folders: &[FolderMount], force: bool) -> Result<()> {
     let worktrees = folder_worktrees(folders);
     for (f, wt) in &worktrees {
         let result = remove_or_prune(&f.base, wt, force)
@@ -377,7 +377,7 @@ fn remove_folder_worktrees(folders: &[FolderMount], force: bool) -> Result<()> {
 /// instance from state, or it was deleted by hand): `remove` fails once git's
 /// record is gone, which would make every retry of rm fail; `prune` drops a
 /// leftover record and is a no-op otherwise.
-fn remove_or_prune(base: &Path, worktree: &Path, force: bool) -> Result<()> {
+pub(crate) fn remove_or_prune(base: &Path, worktree: &Path, force: bool) -> Result<()> {
     // devsandbox locks its worktrees; both `remove` and `prune` skip locked ones.
     unlock_worktree(base, worktree);
     if worktree.exists() {

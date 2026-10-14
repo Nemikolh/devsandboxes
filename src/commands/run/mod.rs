@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 
 use crate::config::{sandbox_build_hash, short_hash, substitute, Config, MountContext, ResolvedSandbox, CONFIG_FILE};
-use crate::runtime::{backend, ServiceEndpoint, NAME_PREFIX};
-use crate::state::{Instance, State};
+use crate::runtime::{backend, NAME_PREFIX};
+use crate::state::{Instance, Phase, State};
 
 use super::{container_drifted, pick, services};
 
@@ -16,6 +16,7 @@ mod git;
 mod image;
 mod lifecycle;
 mod mounts;
+mod progress;
 mod ssh_agent;
 mod worktree;
 
@@ -31,6 +32,7 @@ use mounts::{
     merge_volumes, provision_shell_history, resolve_caches, resolve_folders, resolve_mounts,
     resolve_shell_rc, shell_rc_wiring, sort_parents_first, write_workspace_file, ResolvedMounts,
 };
+pub(crate) use progress::{OnFailure, Tracker};
 use ssh_agent::ssh_agent_forward;
 use worktree::{copy_worktree_includes, create_worktree, git_companion_mount, link_shared_files, lock_worktree};
 pub(crate) use worktree::{instance_at, lock_instance_worktrees, parse_worktree_list, unlock_worktree};
@@ -171,7 +173,128 @@ pub fn run(
 
     // A dispatcher's child always gets a worktree, even as the folder's first
     // instance: an unattended agent must never work in the user's checkout.
-    let (source, worktree, branch, branch_created) = if base_in_use(&state, &folder) || extras.dispatcher.is_some() {
+    let use_worktree = base_in_use(&state, &folder) || extras.dispatcher.is_some();
+    // Keyed by id: a renamed instance keeps its worktree dir, so a new
+    // instance reusing the freed name must not collide with it.
+    let planned_worktree = config_dir.join(".worktrees").join(&instance_id);
+
+    // Record first (docs/instance-phase.md): whatever is made from here on is
+    // on the record, so a failure can roll it back and an interrupted run
+    // leaves something `rm` finds. `state` stays the snapshot *without* it:
+    // `materialize` reads its absence as "not a rebuild" (no prior entry to
+    // keep folders, ports or env from), and the worktree/`folders` decisions
+    // below must see the other instances only, as before.
+    let project = services::project_id(dir)?;
+    let provisional = Instance {
+        sandbox: sandbox_name.clone(),
+        instance_id: instance_id.clone(),
+        project,
+        container: container_name.clone(),
+        folder: if use_worktree { planned_worktree.clone() } else { folder.clone() },
+        base_folder: folder.clone(),
+        worktree: None,
+        branch: None,
+        branch_created: true,
+        folders: Vec::new(),
+        shell_history: None,
+        // Not known before `materialize`; nothing reads it until the final save.
+        workspace: String::new(),
+        workspace_file: None,
+        remote_env: Default::default(),
+        remote_user: None,
+        ssh_auth_sock: None,
+        devsbd_arch: None,
+        volumes: Vec::new(),
+        dispatcher: extras.dispatcher.clone(),
+        config_dir: Some(config_dir.clone()),
+        extra_env: effective_extra_env(&extras.env, None),
+        forwarded_ports: Default::default(),
+        done: None,
+        progress: None,
+        created_unix: Instance::now(),
+    };
+    let mut tracker = Tracker::new(&instance_id, Phase::Preparing);
+    let provisional = Instance { progress: Some(tracker.progress()), ..provisional };
+    // Re-checked under the lock: the snapshot may be stale, and two `run`s
+    // picking one default name must not both get it.
+    State::update(|fresh| {
+        claim_name(fresh, &instance, &instance_id)?;
+        fresh.instances.insert(instance.clone(), provisional);
+        Ok(())
+    })?;
+
+    let mut branch_start = None;
+    let result = (|| {
+        let (source, worktree, branch, branch_created) =
+            prepare_worktree(&folder, use_worktree, &planned_worktree, branch_override, base_override, &extras, props, &var_ctx, &state)?;
+        if branch_created && worktree.is_some() {
+            branch_start = worktree.as_deref().and_then(|wt| progress::commit_of(wt, "HEAD"));
+        }
+        tracker.record(|i| {
+            i.folder = source.clone();
+            i.worktree = worktree.clone();
+            i.branch = branch.clone();
+            i.branch_created = branch_created;
+        })?;
+        materialize(
+            dir,
+            &config,
+            &sandbox_name,
+            &sandbox,
+            &instance,
+            &instance_id,
+            &source,
+            &folder,
+            worktree,
+            branch,
+            branch_created,
+            &extras,
+            &mut state,
+            &mut tracker,
+        )
+    })();
+    if let Err(e) = result {
+        match tracker.on_failure(true) {
+            OnFailure::RollBack => progress::rollback(&instance_id, branch_start.as_deref()),
+            OnFailure::KeepFailed => tracker.fail(&e),
+        }
+        return Err(e);
+    }
+
+    Ok(Some(instance))
+}
+
+/// `run`'s name check, against the current state: the name must be free (a
+/// stopped instance keeps it), and so must the id allocated for it.
+fn claim_name(state: &State, instance: &str, instance_id: &str) -> Result<()> {
+    if state.instances.contains_key(instance) {
+        bail!(
+            "instance `{instance}` already exists; `devsandbox start {instance}` restarts it, \
+             `devsandbox rm {instance}` frees the name"
+        );
+    }
+    if state.instances.values().any(|i| i.instance_id == instance_id) {
+        bail!("instance id `{instance_id}` was just taken by another `run`; retry");
+    }
+    Ok(())
+}
+
+/// The working tree a new instance mounts: a fresh worktree at `planned` when
+/// `use_worktree`, else the base `folder` itself. Returns `(source, worktree,
+/// branch, branch_created)`.
+#[allow(clippy::too_many_arguments)]
+fn prepare_worktree(
+    folder: &Path,
+    use_worktree: bool,
+    planned: &Path,
+    branch_override: Option<String>,
+    base_override: Option<String>,
+    extras: &RunExtras,
+    props: &crate::config::SandboxProperties,
+    var_ctx: &MountContext,
+    state: &State,
+) -> Result<(PathBuf, Option<PathBuf>, Option<String>, bool)> {
+    Ok(if use_worktree {
         // Only a named branch can already exist on the remote; generated
         // pattern names are new by construction (see `create_worktree`).
         let explicit_branch = branch_override.is_some();
@@ -179,41 +302,20 @@ pub fn run(
             branch_override,
             extras.dispatcher.is_some(),
             props.worktree_branch.as_deref(),
-            &var_ctx,
+            var_ctx,
         );
         // Must be absolute: `create_worktree` runs `git -C <base>`, so a
         // `dir`-relative path would resolve under the base repo instead of here,
         // and the mount/state would point at a different (empty) directory.
-        // Keyed by id: a renamed instance keeps its worktree dir, so a new
-        // instance reusing the freed name must not collide with it.
-        let wt = config_dir.join(".worktrees").join(&instance_id);
+        let wt = planned.to_path_buf();
         // Start point: `--base`, else the sandbox's `worktree-base`, else
         // detected from the remote (see `worktree_start_point`).
         let base_ref = base_override.or_else(|| props.worktree_base.clone());
-        let created =
-            create_worktree(&folder, &wt, &branch, base_ref.as_deref(), explicit_branch, &state)?;
+        let created = create_worktree(folder, &wt, &branch, base_ref.as_deref(), explicit_branch, state)?;
         (wt.clone(), Some(wt), Some(branch), created)
     } else {
-        (folder.clone(), None, None, true)
-    };
-
-    materialize(
-        dir,
-        &config,
-        &sandbox_name,
-        &sandbox,
-        &instance,
-        &instance_id,
-        &source,
-        &folder,
-        worktree,
-        branch,
-        branch_created,
-        &extras,
-        &mut state,
-    )?;
-
-    Ok(Some(instance))
+        (folder.to_path_buf(), None, None, true)
+    })
 }
 
 /// Whether `run` may replace `container`, which exists but has no state
@@ -353,6 +455,11 @@ fn effective_extra_env(
 /// `extras.dispatcher` falls back to the entry being replaced, as do the
 /// recorded `config_dir` and extra env (`effective_extra_env`), so a
 /// `rebuild` keeps all three.
+///
+/// `tracker` records each phase on the instance's record as it's entered, so
+/// on an error the caller reads where it stopped (and whether the container
+/// exists yet) off it. The record saved after the container is created stays
+/// in flight; only a lifecycle chain that ran through clears `progress`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn materialize(
     dir: &Path,
@@ -368,6 +475,7 @@ pub(crate) fn materialize(
     branch_created: bool,
     extras: &RunExtras,
     state: &mut State,
+    tracker: &mut Tracker,
 ) -> Result<()> {
     let props = &sandbox.properties;
     let prior = state.instances.get(instance);
@@ -456,6 +564,8 @@ pub(crate) fn materialize(
         &prior_folders,
         &extra_folders,
     )?;
+    let recorded_folders = folders::merge_folder_mounts(&prior_folders, folder_mounts.clone());
+    tracker.record(|i| i.folders = recorded_folders.clone())?;
     // Before the container exists, so nothing in it can prune them; a rebuild
     // of an instance from before locking gets locked here.
     if let Some(wt) = &worktree {
@@ -546,6 +656,13 @@ pub(crate) fn materialize(
     let feature = feature_container_opts(props, &var_ctx, &mounts, &workspace)?;
     mounts.extend(feature.mounts);
     instance_volumes.extend(feature.volumes);
+    // Keep volumes a previous run recorded: a rebuild keeps them on disk even
+    // when the config no longer mounts them, and `rm` must still find them.
+    let volumes = merge_volumes(
+        state.instances.get(instance).map(|i| i.volumes.as_slice()).unwrap_or_default(),
+        instance_volumes,
+    );
+    tracker.record(|i| i.volumes = volumes.clone())?;
     sort_parents_first(&mut mounts);
     let (privileged, warnings) = privileged_decision(
         props.privileged == Some(true),
@@ -563,9 +680,13 @@ pub(crate) fn materialize(
     for warning in warnings {
         eprintln!("warning: {warning}");
     }
+    tracker.enter(Phase::Building)?;
+    let image = image_for(dir, sandbox)?;
+    tracker.enter(Phase::Creating)?;
     run_container(
         dir,
         sandbox,
+        image,
         &container_name,
         source,
         folder,
@@ -574,12 +695,15 @@ pub(crate) fn materialize(
         &mounts,
         &extra_env,
         &networks,
-        &endpoints,
         privileged,
         restart,
         dispatcher.as_deref(),
     )?;
+    tracker.container_created();
     let container = container_name.clone();
+    let kept = || kept_hint(instance);
+    backend().connect_networks(&container, &networks).with_context(kept)?;
+    backend().wire_service_dns(&container, &endpoints).with_context(kept)?;
     // Before lifecycle commands, so they could already rely on the helper. In
     // relay-first mode a failure means no ssh-agent forwarding at all (no mount
     // fallback), so word the note that way; otherwise the plain install note.
@@ -603,12 +727,6 @@ pub(crate) fn materialize(
     );
 
     let persist_history = shell_history.is_some();
-    // Keep volumes a previous run recorded: a rebuild keeps them on disk even
-    // when the config no longer mounts them, and `rm` must still find them.
-    let volumes = merge_volumes(
-        state.instances.get(instance).map(|i| i.volumes.as_slice()).unwrap_or_default(),
-        instance_volumes,
-    );
     let record = Instance {
         sandbox: sandbox_name.to_string(),
         instance_id: instance_id.to_string(),
@@ -619,7 +737,7 @@ pub(crate) fn materialize(
         worktree,
         branch,
         branch_created,
-        folders: folders::merge_folder_mounts(&prior_folders, folder_mounts),
+        folders: recorded_folders,
         shell_history,
         workspace: workspace.clone(),
         workspace_file,
@@ -633,7 +751,8 @@ pub(crate) fn materialize(
         extra_env: run_env,
         forwarded_ports,
         done,
-        progress: None,
+        // Still in flight: the lifecycle chain runs after this save.
+        progress: Some(tracker.progress()),
         created_unix: Instance::now(),
     };
     // Into the current file, not `state` (loaded before the build): saving that
@@ -646,7 +765,8 @@ pub(crate) fn materialize(
 
     let extensions = props.vscode_extensions().unwrap_or(&[]);
     if !extensions.is_empty() || props.remote_user.is_some() {
-        write_vscode_name_config(&container, Some(extensions), props.remote_user.as_deref())?;
+        write_vscode_name_config(&container, Some(extensions), props.remote_user.as_deref())
+            .with_context(kept)?;
     }
 
     // ssh-agent for the lifecycle chain. The instance was just saved, so read
@@ -692,6 +812,7 @@ pub(crate) fn materialize(
     let _ = lifecycle;
 
     if !shell_rc.is_empty() || persist_history {
+        tracker.enter(Phase::Lifecycle("shell-rc".into()))?;
         let paths: Vec<&str> = shell_rc.iter().map(|(_, path)| path.as_str()).collect();
         exec_lifecycle(
             &container,
@@ -701,7 +822,7 @@ pub(crate) fn materialize(
             ssh_auth_sock,
             &shell_rc_wiring(&paths, persist_history),
         )
-        .with_context(|| format!("shell-rc wiring failed (container `{container}` kept)"))?;
+        .with_context(|| format!("shell-rc wiring failed; {}", kept()))?;
     }
 
     for (name, cmd) in [
@@ -712,6 +833,7 @@ pub(crate) fn materialize(
         ("postAttachCommand", &props.post_attach_command),
     ] {
         if let Some(cmd) = cmd {
+            tracker.enter(Phase::Lifecycle(name.into()))?;
             exec_lifecycle(
                 &container,
                 &workspace,
@@ -720,11 +842,23 @@ pub(crate) fn materialize(
                 ssh_auth_sock,
                 cmd,
             )
-            .with_context(|| format!("{name} failed (container `{container}` kept)"))?;
+            .with_context(|| format!("{name} failed; {}", kept()))?;
         }
     }
 
+    tracker.finish()?;
+    if let Some(i) = state.instances.get_mut(instance) {
+        i.progress = None;
+    }
     Ok(())
+}
+
+/// What a failure from the container on says: everything stays, as `failed`.
+fn kept_hint(instance: &str) -> String {
+    format!(
+        "instance `{instance}` kept as failed: `devsandbox rebuild {instance}` retries, \
+         `devsandbox rm {instance}` removes it"
+    )
 }
 
 /// The boot file a container should carry: the `postStartCommand` when the
@@ -823,9 +957,14 @@ pub(crate) fn warn_on_drift(dir: &Path, container: &str, sandbox: &ResolvedSandb
     Ok(())
 }
 
+/// `docker run` the instance container from `image` (built by the caller, so
+/// the phase can tell building from creating). Network attachment beyond the
+/// first and service DNS are the caller's too: they run once the container
+/// exists, when a failure keeps it.
 fn run_container(
     dir: &Path,
     sandbox: &ResolvedSandbox,
+    image: String,
     container: &str,
     source: &Path,
     base_folder: &Path,
@@ -834,13 +973,11 @@ fn run_container(
     mounts: &[String],
     extra_env: &[(String, String)],
     networks: &[String],
-    endpoints: &[ServiceEndpoint],
     privileged: bool,
     restart: Option<&str>,
     dispatcher: Option<&str>,
 ) -> Result<()> {
     let props = &sandbox.properties;
-    let image = image_for(dir, sandbox)?;
     let mount = format!("{}:{workspace}", source.display());
     let sandbox_label = format!("devsandbox.sandbox={}", sandbox.name);
     let instance = container.strip_prefix(NAME_PREFIX).unwrap_or(container);
@@ -910,9 +1047,6 @@ fn run_container(
 
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     backend().run_checked(&arg_refs)?;
-
-    backend().connect_networks(container, networks)?;
-    backend().wire_service_dns(container, endpoints)?;
     Ok(())
 }
 
@@ -1317,6 +1451,153 @@ mod tests {
             assert_eq!(in_container("test -e /run/devsandbox/boot && echo present"), None);
         });
         Ok(())
+    }
+
+    /// Env var naming the child test [`isolated`] re-runs, and the root it
+    /// gets (its data and runtime dirs live there).
+    const ISOLATED_TEST: &str = "DEVSANDBOX_ISOLATED_TEST";
+    const ISOLATED_ROOT: &str = "DEVSANDBOX_ISOLATED_ROOT";
+
+    /// Re-run `child` (a test of this module) in a child process of this test
+    /// binary with its own `XDG_DATA_HOME`/`XDG_RUNTIME_DIR` and no ssh agent:
+    /// `run` reads and writes `state.toml` and may reach the serve daemon,
+    /// and neither may be the user's. Env is process-wide, hence the child.
+    fn isolated(child: &str) -> Result<(), String> {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("devsandbox-phase-{child}-{stamp}"));
+        std::fs::create_dir_all(&root).unwrap();
+        // libtest names drop the crate segment of `module_path!`.
+        let module = module_path!().split_once("::").map_or(module_path!(), |(_, rest)| rest);
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &format!("{module}::{child}"), "--nocapture", "--test-threads=1"])
+            .env(ISOLATED_TEST, child)
+            .env(ISOLATED_ROOT, &root)
+            .env("XDG_DATA_HOME", root.join("data"))
+            .env("XDG_RUNTIME_DIR", root.join("runtime"))
+            .env_remove("SSH_AUTH_SOCK")
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success(), "child `{child}` failed:\n{text}");
+        assert!(text.contains("1 passed"), "child `{child}` did not run:\n{text}");
+        Ok(())
+    }
+
+    /// The child's root when this process is [`isolated`]'s child for `test`.
+    fn isolated_root(test: &str) -> Option<PathBuf> {
+        (std::env::var(ISOLATED_TEST).ok()? == test).then(|| std::env::var_os(ISOLATED_ROOT).map(PathBuf::from))?
+    }
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// `root/repo` (one commit) and `root/cfg/devsandboxes.toml` with sandbox
+    /// `t` on it, `extra` appended to its table. Returns (cfg, canonical repo).
+    fn phase_fixture(root: &Path, extra: &str) -> (PathBuf, PathBuf) {
+        let (repo, cfg) = (root.join("repo"), root.join("cfg"));
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&cfg).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        std::fs::write(
+            cfg.join(CONFIG_FILE),
+            format!("[sandbox.t]\nfolder = \"../repo\"\nimage = \"alpine:3.20\"\n{extra}\n"),
+        )
+        .unwrap();
+        (cfg, repo.canonicalize().unwrap())
+    }
+
+    /// A `run` failing before the container (in `initializeCommand`, after
+    /// its worktree and branch were made) leaves nothing: no record, no
+    /// worktree, no branch.
+    #[test_utils::docker_test]
+    fn run_failing_before_the_container_rolls_back_with_docker() -> Result<(), String> {
+        isolated("rollback_child")
+    }
+
+    #[test]
+    fn rollback_child() {
+        let Some(root) = isolated_root("rollback_child") else { return };
+        let (cfg, repo) = phase_fixture(&root, "initializeCommand = \"false\"");
+        // Another instance mounts the repo directly, so this run gets a worktree.
+        let mut holder = instance("holder");
+        holder.folder = repo.clone();
+        holder.base_folder = repo.clone();
+        State::update(|s| {
+            s.instances.insert("holder".into(), holder);
+            Ok(())
+        })
+        .unwrap();
+
+        let err = run(&cfg, Some("t".into()), Some("rb".into()), None, None, RunExtras::default()).unwrap_err();
+        assert!(format!("{err:#}").contains("initializeCommand failed"), "{err:#}");
+
+        let state = State::load().unwrap();
+        assert_eq!(state.instances.keys().collect::<Vec<_>>(), ["holder"]);
+        assert!(!cfg.join(".worktrees/rb").exists(), "worktree left behind");
+        assert!(!git(&repo, &["worktree", "list", "--porcelain"]).contains(".worktrees/rb"));
+        assert_eq!(git(&repo, &["branch", "--list", "sandbox/rb"]), "", "branch left behind");
+    }
+
+    /// A `run` failing from the container on (in `postCreateCommand`) keeps
+    /// the instance, recorded as failed at that step.
+    #[test_utils::docker_test]
+    fn run_failing_in_the_lifecycle_keeps_a_failed_record_with_docker() -> Result<(), String> {
+        isolated("failed_child")
+    }
+
+    #[test]
+    fn failed_child() {
+        let Some(root) = isolated_root("failed_child") else { return };
+        let (cfg, _repo) = phase_fixture(&root, "postCreateCommand = \"false\"");
+        // Unique per run: the container name is global to the runtime.
+        let name = format!("phase-{}", std::process::id());
+        let project = services::project_id(&cfg).unwrap();
+        let container = format!("{NAME_PREFIX}{name}");
+        let cleanup = || crate::commands::rm::remove_container(&container, &project, &name);
+        crate::test_support::with_cleanup(cleanup, || {
+            let err = run(&cfg, Some("t".into()), Some(name.clone()), None, None, RunExtras::default())
+                .unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(msg.contains("postCreateCommand failed"), "{msg}");
+            assert!(msg.contains(&format!("`devsandbox rebuild {name}` retries")), "{msg}");
+
+            let state = State::load().unwrap();
+            let info = state.instances.get(&name).expect("failed instance kept");
+            let progress = info.progress.as_ref().expect("progress kept");
+            assert_eq!(progress.phase, Phase::Failed { at: "postCreateCommand".into() });
+            assert!(progress.error.as_deref().is_some_and(|e| e.contains("postCreateCommand failed")));
+            assert_eq!(progress.pid, std::process::id());
+            assert_eq!(info.workspace, "/workspaces/repo");
+            assert!(backend().is_running(&container).unwrap().is_some(), "container kept");
+        });
+    }
+
+    #[test]
+    fn claim_name_rechecks_name_and_id() {
+        let mut state = State::default();
+        claim_name(&state, "repo", "repo").unwrap();
+        state.instances.insert("repo".into(), instance("repo"));
+        let err = claim_name(&state, "repo", "repo-1").unwrap_err().to_string();
+        assert!(err.starts_with("instance `repo` already exists"), "{err}");
+        // Renamed away, id still held: the freed name can't reuse that id.
+        let mut renamed = State::default();
+        renamed.instances.insert("other".into(), instance("repo"));
+        assert!(claim_name(&renamed, "repo", "repo").is_err());
+        claim_name(&renamed, "repo", "repo-1").unwrap();
     }
 
     #[test]

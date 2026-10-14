@@ -5,7 +5,7 @@ use anyhow::{bail, Context, Result};
 use super::{container_drifted, resolve_instance, run, services};
 use crate::config::{sandbox_build_hash, Config, ResolvedSandbox};
 use crate::runtime::backend;
-use crate::state::{Instance, State};
+use crate::state::{Instance, Phase, State};
 
 /// Recreate an instance's container from the *current* config, preserving the
 /// worktree, branch, instance identity (name *and* persistent id, so shell
@@ -104,10 +104,16 @@ fn rebuild_instance(
     // Remove the old container; ignore failure (it may already be gone).
     let _ = backend().remove_force(&container);
 
+    // In flight from here (docs/instance-phase.md). The instance existed
+    // before, so a failure is never rolled back: it stays as `failed`, the
+    // worktree and branch with it, for another rebuild or an `rm`.
+    let mut tracker = run::Tracker::new(&instance_id, Phase::Building);
+    tracker.start()?;
+
     // materialize replaces the state entry (insert overwrites) and refreshes
     // config-derived fields (workspace, remote_env, remote_user, workspace_file)
     // — intended: the point of rebuild is to re-apply the current config.
-    run::materialize(
+    let result = run::materialize(
         dir,
         config,
         &sandbox_name,
@@ -123,7 +129,13 @@ fn rebuild_instance(
         // aren't recorded, so they are dropped.
         &run::RunExtras::default(),
         state,
-    )?;
+        &mut tracker,
+    );
+    if let Err(e) = result {
+        debug_assert_eq!(tracker.on_failure(false), run::OnFailure::KeepFailed);
+        tracker.fail(&e);
+        return Err(e);
+    }
 
     println!("rebuilt {key}");
     Ok(())
