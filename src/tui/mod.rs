@@ -13,6 +13,7 @@ mod daemon;
 mod data;
 mod kitty;
 mod markdown;
+mod poll;
 mod procs;
 mod prompt;
 mod select;
@@ -48,9 +49,7 @@ use crate::commands::vscode::Goto;
 use crate::inbox;
 
 use app::{App, PendingSignal};
-use data::Snapshot;
-use crate::runtime::procs::{parse_top, run_ls};
-use procs::{build_forest, ProcState};
+use poll::{PollUpdate, PollWorker};
 use prompt::PromptAction;
 
 /// How long each `event::poll` blocks before we redraw when no terminal is open.
@@ -101,6 +100,26 @@ impl FollowUp {
     }
 }
 
+/// Ask for a refresh snapshot, with stats only when `clock` says they're due,
+/// unless one is outstanding (`busy`): docker calls can't pile up.
+fn refresh(poll: &PollWorker, busy: &mut bool, clock: &mut StatsClock) {
+    if !*busy {
+        poll.request_snapshot(clock.depth(Instant::now()));
+        *busy = true;
+    }
+}
+
+/// [`refresh`] for something that just changed what the snapshot shows
+/// (a rename, a suspended command): one already outstanding may predate the
+/// change, so a follow-up asks again once it's in.
+fn refresh_after_change(poll: &PollWorker, busy: &mut bool, clock: &mut StatsClock, followup: &mut FollowUp) {
+    if *busy {
+        followup.schedule(Instant::now());
+    } else {
+        refresh(poll, busy, clock);
+    }
+}
+
 /// Picks each collection's depth so stats run at most every `STATS_INTERVAL`.
 /// Kept separate from the event loop so the timing is testable without a
 /// runtime.
@@ -137,8 +156,7 @@ static KITTY_PUSHED: AtomicBool = AtomicBool::new(false);
 /// path (normal, error, or panic).
 pub fn dashboard(dir: &Path) -> Result<()> {
     install_panic_hook();
-    // Before the alternate screen, so `run`/`start` output stays readable.
-    crate::commands::autostart::autostart(dir);
+    // No autostart pass of our own: the daemon runs it (docs/dashboard-client.md, F16).
     let mut terminal = setup().context("failed to set up terminal")?;
 
     let result = run(&mut terminal, App::new(dir.to_path_buf()));
@@ -220,11 +238,14 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
     // once when something here poked it.
     let mut inbox_stamp = inbox::store::path().ok().and_then(|p| inbox::ops::stamp(&p));
     let mut reload_inbox = false;
-    // At most one collection thread in flight; `Some` while one is running.
+    // The daemon collects the snapshot and the processes (`poll.rs`), at
+    // most one request of each outstanding (`pending` / `proc_pending`).
     // Startup walks the `Depth`s cheapest first, so the tree renders straight
     // from disk and statuses, then cpu/mem, fill in as the runtime answers;
-    // `deeper` holds the collections still to chain (popped from the back).
-    let mut pending: Option<Receiver<Collected>> = Some(spawn_collect_with(&dir, data::Depth::Disk));
+    // `deeper` holds the depths still to chain (popped from the back).
+    let poller = PollWorker::spawn(dir.clone());
+    poller.request_snapshot(data::Depth::Disk);
+    let mut pending = true;
     let mut deeper = vec![data::Depth::Full, data::Depth::Listing];
     let mut stats_clock = StatsClock::default();
     // Background `s` stops/starts, each reporting completion over its own
@@ -246,8 +267,11 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
     // the detached answer (`spawn_verb`): report and resnapshot.
     let mut builds: Vec<Receiver<OpDone>> = Vec::new();
     let mut last_tick = Instant::now();
-    // At most one process fetch in flight; `Some` while one is running.
-    let mut proc_pending: Option<Receiver<BTreeMap<String, ProcState>>> = None;
+    let mut proc_pending = false;
+    // Set while a procs failure the daemon answered is shown, so it's one
+    // status line per streak. A daemon that can't be reached isn't one:
+    // `daemon.rs` already says so.
+    let mut procs_failing = false;
     let mut last_proc_tick = Instant::now();
     let mut followup = FollowUp::default();
     // Set while the follow-up's collection runs: proc targets come from the
@@ -344,9 +368,7 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
                     builds.push(spawn_verb(&dir, action));
                     last_tick = Instant::now();
                     followup.schedule(last_tick);
-                    if pending.is_none() {
-                        pending = Some(spawn_collect(&dir, &mut stats_clock));
-                    }
+                    refresh(&poller, &mut pending, &mut stats_clock);
                 }
                 PromptAction::Code { instance, goto } => {
                     app.status = Some("opening VS Code…".into());
@@ -362,7 +384,7 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
                         Err(e) => format!("rename failed: {e:#}"),
                     });
                     last_tick = Instant::now();
-                    pending = Some(spawn_collect(&dir, &mut stats_clock));
+                    refresh_after_change(&poller, &mut pending, &mut stats_clock, &mut followup);
                 }
                 other => {
                     run_suspended(terminal, &dir, other)?;
@@ -370,7 +392,7 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
                     terminal.clear()?;
                     // Refresh data now rather than waiting for the next tick.
                     last_tick = Instant::now();
-                    pending = Some(spawn_collect(&dir, &mut stats_clock));
+                    refresh_after_change(&poller, &mut pending, &mut stats_clock, &mut followup);
                 }
             }
         }
@@ -477,9 +499,7 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
                 app.status = Some(done.status);
                 last_tick = Instant::now();
                 followup.schedule(last_tick);
-                if pending.is_none() {
-                    pending = Some(spawn_collect(&dir, &mut stats_clock));
-                }
+                refresh(&poller, &mut pending, &mut stats_clock);
                 false
             }
             Err(TryRecvError::Empty) => true,
@@ -495,9 +515,7 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
                 app.start_finished(instance, Some(done.status), done.failed);
                 last_tick = Instant::now();
                 followup.schedule(last_tick);
-                if pending.is_none() {
-                    pending = Some(spawn_collect(&dir, &mut stats_clock));
-                }
+                refresh(&poller, &mut pending, &mut stats_clock);
                 false
             }
             Err(TryRecvError::Empty) => true,
@@ -536,9 +554,7 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
                 }
                 last_tick = Instant::now();
                 followup.schedule(last_tick);
-                if pending.is_none() {
-                    pending = Some(spawn_collect(&dir, &mut stats_clock));
-                }
+                refresh(&poller, &mut pending, &mut stats_clock);
                 false
             }
             Err(TryRecvError::Empty) => true,
@@ -552,62 +568,68 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
                 app.status = Some(done.status);
                 last_tick = Instant::now();
                 followup.schedule(last_tick);
-                if pending.is_none() {
-                    pending = Some(spawn_collect(&dir, &mut stats_clock));
-                }
+                refresh(&poller, &mut pending, &mut stats_clock);
                 false
             }
             Err(TryRecvError::Empty) => true,
             Err(TryRecvError::Disconnected) => false,
         });
 
-        // Drain a finished collection into the app, freeing the in-flight slot.
-        if let Some(rx) = &pending {
-            match rx.try_recv() {
-                Ok((snapshot, children)) => {
-                    app.thread_children = children;
-                    app.set_snapshot(snapshot);
-                    pending = deeper.pop().map(|depth| {
-                        if depth == data::Depth::Full {
-                            stats_clock.last = Some(Instant::now());
+        // Drain the daemon's answers into the app, freeing their slots.
+        while let Some(update) = poller.try_recv() {
+            match update {
+                PollUpdate::Snapshot(answer) => {
+                    pending = false;
+                    match answer {
+                        Ok(list) => {
+                            app.snapshot_error = None;
+                            app.thread_children = list.thread_children;
+                            app.set_snapshot(list.snapshot);
+                            if let Some(depth) = deeper.pop() {
+                                if depth == data::Depth::Full {
+                                    stats_clock.last = Some(Instant::now());
+                                }
+                                poller.request_snapshot(depth);
+                                pending = true;
+                            }
+                            if procs_after_snapshot {
+                                procs_after_snapshot = false;
+                                app.needs_proc_fetch = true;
+                            }
                         }
-                        spawn_collect_with(&dir, depth)
-                    });
-                    if procs_after_snapshot {
-                        procs_after_snapshot = false;
-                        app.needs_proc_fetch = true;
+                        // The last snapshot stays, marked stale with why
+                        // (none yet: the tree says it); the next tick retries.
+                        Err(e) => app.snapshot_error = Some(e),
                     }
                 }
-                Err(TryRecvError::Empty) => {}
-                // Thread died without sending; drop the slot so the next tick retries.
-                Err(TryRecvError::Disconnected) => pending = None,
+                PollUpdate::Procs(answer) => {
+                    proc_pending = false;
+                    match answer {
+                        Ok(procs) => {
+                            procs_failing = false;
+                            app.apply_proc_fetch(procs);
+                        }
+                        // The last rows stay.
+                        Err(e) => {
+                            if !e.unreachable && !procs_failing {
+                                app.status = Some(format!("processes: {}", e.reason));
+                            }
+                            procs_failing = !e.unreachable;
+                        }
+                    }
+                }
             }
         }
 
-        if followup.take_due(Instant::now(), pending.is_some()) {
+        if followup.take_due(Instant::now(), pending) {
             last_tick = Instant::now();
-            pending = Some(spawn_collect(&dir, &mut stats_clock));
+            refresh(&poller, &mut pending, &mut stats_clock);
             procs_after_snapshot = true;
         }
 
         if last_tick.elapsed() >= TICK_INTERVAL {
             last_tick = Instant::now();
-            // Skip if a collection is still running so docker calls can't pile up.
-            if pending.is_none() {
-                pending = Some(spawn_collect(&dir, &mut stats_clock));
-            }
-        }
-
-        // Drain a finished process fetch into the app, freeing the in-flight slot.
-        if let Some(rx) = &proc_pending {
-            match rx.try_recv() {
-                Ok(procs) => {
-                    app.apply_proc_fetch(procs);
-                    proc_pending = None;
-                }
-                Err(TryRecvError::Empty) => {}
-                Err(TryRecvError::Disconnected) => proc_pending = None,
-            }
+            refresh(&poller, &mut pending, &mut stats_clock);
         }
 
         // Process refresh: fetch now on expand / cursor move, else every
@@ -616,13 +638,14 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
         // count); an empty set means there is nothing to fetch.
         let want_now = app.take_needs_proc_fetch();
         let tick_due = last_proc_tick.elapsed() >= PROC_TICK;
-        if (want_now || tick_due) && proc_pending.is_none() {
+        if (want_now || tick_due) && !proc_pending {
             last_proc_tick = Instant::now();
             // Non-running expanded instances get their `(not running)` row here;
             // running ones (and the selection) come back as fetch targets.
             let targets = app.proc_fetch_targets();
             if !targets.is_empty() {
-                proc_pending = Some(spawn_proc_fetch(targets));
+                poller.request_procs(targets);
+                proc_pending = true;
             }
         }
     }
@@ -995,63 +1018,6 @@ fn spawn_signal(sig: PendingSignal) -> Receiver<OpDone> {
             Err(e) => format!("{}: {e:#}", sig.signal.name()),
         };
         let _ = tx.send(OpDone { status, failed: false });
-    });
-    rx
-}
-
-/// Spawn one detached thread that runs the runtime's `proc_list` for each target
-/// `(instance name, container)` and sends back a name→[`ProcState`] map. Docker
-/// calls go through the screen-safe quiet path; a per-container error becomes a
-/// `(processes unavailable: …)` message row rather than failing the batch.
-fn spawn_proc_fetch(targets: Vec<(String, String)>) -> Receiver<BTreeMap<String, ProcState>> {
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let mut out: BTreeMap<String, ProcState> = BTreeMap::new();
-        for (instance, container) in targets {
-            let state = match crate::runtime::backend().proc_list(&container) {
-                Ok(list) => {
-                    let mut rows = build_forest(parse_top(&list.text));
-                    // A child's runs next to its processes (docs/automations.md,
-                    // "Runs"). No helper, or one predating runs: no rows.
-                    if let Some(text) = run_ls(&container) {
-                        rows.extend(procs::run_rows(&text));
-                    }
-                    ProcState::Rows { rows, signalable: list.container_pids }
-                }
-                Err(e) => ProcState::Message(format!("(processes unavailable: {e:#})")),
-            };
-            out.insert(instance, state);
-        }
-        // Receiver may be gone if the UI quit mid-fetch; ignore send errors.
-        let _ = tx.send(out);
-    });
-    rx
-}
-
-/// One collection: the snapshot, plus every dispatcher's children by key
-/// (`dispatch::thread_children`) for the Inbox thread pane. Read from
-/// `state.toml` on the collector thread, with the snapshot, so the pane never
-/// touches the file per frame; an unreadable state resolves no child.
-type Collected = (Snapshot, BTreeMap<String, BTreeMap<String, String>>);
-
-/// Spawn a detached thread that collects one [`Snapshot`] and sends it back.
-/// The receiver is polled from the event loop, keeping [`App`] I/O-free.
-/// A refresh collection, with stats only when `clock` says they're due.
-fn spawn_collect(dir: &Path, clock: &mut StatsClock) -> Receiver<Collected> {
-    spawn_collect_with(dir, clock.depth(Instant::now()))
-}
-
-/// A collection down to `depth` (`data::collect_with`).
-fn spawn_collect_with(dir: &Path, depth: data::Depth) -> Receiver<Collected> {
-    let (tx, rx) = mpsc::channel();
-    let dir: PathBuf = dir.to_path_buf();
-    std::thread::spawn(move || {
-        let snapshot = data::collect_with(&dir, depth);
-        let children = crate::state::State::load()
-            .map(|s| crate::commands::dispatch::thread_children(&s))
-            .unwrap_or_default();
-        // Receiver may be gone if the UI quit mid-collection; ignore send errors.
-        let _ = tx.send((snapshot, children));
     });
     rx
 }

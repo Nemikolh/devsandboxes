@@ -204,6 +204,10 @@ pub struct App {
     /// (`dispatch::thread_children`), refreshed by the event loop with each
     /// snapshot so the thread pane resolves a `child` without reading state.
     pub thread_children: BTreeMap<String, BTreeMap<String, String>>,
+    /// Why the last `instances.list` failed, until one succeeds: the header
+    /// marks the kept snapshot stale with it, or with none yet the tree says
+    /// it in place of the rows.
+    pub snapshot_error: Option<crate::tui::data::FetchError>,
     /// Seconds east of UTC for Inbox timestamps; the event loop sets it once
     /// at startup (0 = UTC when unknown).
     pub utc_offset: i64,
@@ -292,6 +296,7 @@ impl App {
             pending_open: None,
             pending_bridges: Vec::new(),
             thread_children: BTreeMap::new(),
+            snapshot_error: None,
             utc_offset: 0,
             status: None,
             dragging_divider: false,

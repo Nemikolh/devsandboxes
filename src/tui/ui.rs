@@ -110,7 +110,7 @@ fn tab_bar_areas(app: &App, area: Rect) -> (Rect, Rect, Option<String>) {
     let totals = app
         .snapshot
         .as_ref()
-        .map(|s| totals_line(s, s.collected_at.elapsed()));
+        .map(|s| totals_line(s, s.collected_at.elapsed(), app.snapshot_error.as_ref()));
     let totals_w = totals.as_deref().map_or(0, |t| t.chars().count() as u16);
     // Leave a gap before the totals; drop them entirely when the row is too narrow.
     let reserve = if totals_w > 0 && area.width > totals_w + 4 {
@@ -1625,14 +1625,14 @@ fn draw_instances(frame: &mut Frame, app: &App, area: Rect) {
     let panel_focused = app.focus == Focus::Terminal;
 
     if nodes.is_empty() {
-        // No snapshot yet means the first collection is still running, not
-        // that the config is empty.
-        let message = if snapshot.is_some() {
-            "no sandboxes defined — check devsandboxes.toml"
-        } else {
-            "loading…"
+        // No snapshot yet means the first one is still on its way (or the
+        // daemon can't be reached: say why), not that the config is empty.
+        let message = match (snapshot, &app.snapshot_error) {
+            (Some(_), _) => "no sandboxes defined — check devsandboxes.toml".to_string(),
+            (None, Some(e)) => e.line(),
+            (None, None) => "loading…".to_string(),
         };
-        draw_empty(frame, table_area, panel_focused, message);
+        draw_empty(frame, table_area, panel_focused, &message);
         draw_detail(frame, snapshot, None, None, detail_area, panel_focused);
         selectable(app, RegionId::InstancesTree, table_area);
         selectable(app, RegionId::Detail, detail_area);

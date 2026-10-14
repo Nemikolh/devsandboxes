@@ -1,8 +1,8 @@
 //! Process layer for the Instances tree: the third level, showing an instance's
 //! running processes as a `ps -ef --forest`-style tree. Forest building and
 //! row formatting live here as pure functions so they unit-test without
-//! docker; the listing's parse is `runtime::procs` (shared with the daemon's
-//! `instances.procs`), the fetch itself is driven by the event loop.
+//! docker; the listing and its parse are the daemon's (`instances.procs`,
+//! `runtime::procs`), asked for by `tui::poll` on the event loop's schedule.
 
 /// One rendered process row, forest-ordered. `depth` drives the `\_ ` indent at
 /// render time; `pid` sits in the TREE gutter and `args` spans the rest.
@@ -140,12 +140,27 @@ pub const RUN_PID: &str = "run";
 /// Runs shown under an instance's processes, newest kept.
 pub const MAX_RUN_ROWS: usize = 5;
 
-/// Rows for the last [`MAX_RUN_ROWS`] runs in `devsbd run ls` output
-/// (oldest first, `runtime::procs::parse_runs`), after the process forest:
-/// `run` in the gutter, the run minus its start time as args.
-pub fn run_rows(ls: &str) -> Vec<ProcRow> {
-    let runs = crate::runtime::procs::parse_runs(ls);
+/// Rows for the last [`MAX_RUN_ROWS`] of `runs` (oldest first, as
+/// `instances.procs` answers them), after the process forest: `run` in the
+/// gutter, the run minus its start time as args.
+pub fn run_rows(runs: &[crate::runtime::procs::Run]) -> Vec<ProcRow> {
     runs[runs.len().saturating_sub(MAX_RUN_ROWS)..].iter().map(run_row).collect()
+}
+
+/// One instance's `instances.procs` entry as the tree shows it: the process
+/// forest then its runs (docs/automations.md, "Runs"), or why there's none
+/// as a placeholder row.
+pub fn proc_state(entry: crate::serve::api::InstanceProcs) -> ProcState {
+    use crate::serve::api::InstanceProcs;
+    match entry {
+        InstanceProcs::Listed(listing) => {
+            let triples = listing.processes.into_iter().map(|p| (p.pid, p.ppid, p.args)).collect();
+            let mut rows = build_forest(triples);
+            rows.extend(run_rows(&listing.runs));
+            ProcState::Rows { rows, signalable: listing.signalable }
+        }
+        InstanceProcs::Failed { error } => ProcState::Message(format!("(processes unavailable: {error})")),
+    }
 }
 
 /// `<id> <state> <argv…>`: the line as the helper printed it, start time left out.
@@ -162,12 +177,16 @@ fn run_row(run: &crate::runtime::procs::Run) -> ProcRow {
 mod tests {
     use super::*;
 
+    fn runs(ls: &str) -> Vec<crate::runtime::procs::Run> {
+        crate::runtime::procs::parse_runs(ls)
+    }
+
     #[test]
     fn run_rows_keep_the_newest_runs_without_start_times() {
         let ls = "1790000000-a1b2 exited 4 2026-09-21T14:13:20Z sh -c echo hi\n\
 1790000001-0000 running 2026-09-21T14:13:21Z zidane -p fix it\n\
 1790000002-ffff lost 2026-09-21T14:13:22Z sleep 9\n";
-        let rows = run_rows(ls);
+        let rows = run_rows(&runs(ls));
         let args: Vec<&str> = rows.iter().map(|r| r.args.as_str()).collect();
         assert_eq!(
             args,
@@ -179,10 +198,40 @@ mod tests {
         );
         assert!(rows.iter().all(|r| r.pid == RUN_PID && r.depth == 0));
         let many: String = (0..8).map(|i| format!("17900000{i:02}-0000 lost x y\n")).collect();
-        let rows = run_rows(&many);
+        let rows = run_rows(&runs(&many));
         assert_eq!(rows.len(), MAX_RUN_ROWS);
         assert!(rows[0].args.starts_with("1790000003-0000"), "{:?}", rows[0]);
-        assert!(run_rows("").is_empty());
+        assert!(run_rows(&[]).is_empty());
+    }
+
+    /// A wire entry becomes the forest plus its run rows, or the error as the
+    /// placeholder the tree showed before the daemon fetched them.
+    #[test]
+    fn wire_entries_become_proc_states() {
+        use crate::serve::api::{InstanceProcs, Process, ProcsListing};
+        let p = |pid: &str, ppid: &str, args: &str| Process { pid: pid.into(), ppid: ppid.into(), args: args.into() };
+        let listing = ProcsListing {
+            processes: vec![p("1", "0", "init"), p("7", "1", "claude")],
+            signalable: true,
+            runs: runs("1790000000-a1b2 running 2026-09-21T14:13:20Z sleep 9"),
+        };
+        assert_eq!(
+            proc_state(InstanceProcs::Listed(listing)),
+            ProcState::Rows {
+                rows: vec![
+                    ProcRow { pid: "1".into(), depth: 0, args: "init".into() },
+                    ProcRow { pid: "7".into(), depth: 1, args: "claude".into() },
+                    ProcRow { pid: RUN_PID.into(), depth: 0, args: "1790000000-a1b2 running sleep 9".into() },
+                ],
+                signalable: true,
+            }
+        );
+        let top = ProcsListing { processes: vec![p("660011", "1", "x")], signalable: false, runs: Vec::new() };
+        assert!(matches!(proc_state(InstanceProcs::Listed(top)), ProcState::Rows { signalable: false, .. }));
+        assert_eq!(
+            proc_state(InstanceProcs::Failed { error: "not running".into() }),
+            ProcState::Message("(processes unavailable: not running)".into())
+        );
     }
 
     fn row(pid: &str, ppid: &str, args: &str) -> (String, String, String) {

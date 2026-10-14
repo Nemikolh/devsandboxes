@@ -136,7 +136,10 @@ git worktrees so working trees are never shared.
   API calls while connected (else the loop applies them locally), and is
   the Ports tab's client (`forwards.list` on `forwards.changed`,
   `forwards.add`/`rm`; the daemon owns the forwards), and sends `d`'s
-  `instances.cancel`. The dashboard's `run`/`rebuild`/`start` are detached
+  `instances.cancel`. `poll.rs` is the dashboard's reads: `instances.list`
+  (the snapshot, at the depth the loop's schedule picks) and
+  `instances.procs`, a thread and a connection each, never starting a
+  daemon (`daemon.rs` does). The dashboard's `run`/`rebuild`/`start` are detached
   verb requests on their own connections (`spawn_verb` in `tui/mod.rs`).
   Mouse selection (`docs/tui-selection.md`): `select.rs` is the pure model
   (extraction, highlight), `app/selection.rs` its routing, `clipboard.rs` the

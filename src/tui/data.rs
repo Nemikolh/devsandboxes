@@ -8,7 +8,41 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::procs::{ProcState, MESSAGE_ROW};
 
-pub use crate::snapshot::{collect_with, ContainerStatus, Depth, InstanceRow, SandboxRow, ServiceRow, Snapshot};
+pub use crate::snapshot::{ContainerStatus, Depth, InstanceRow, SandboxRow, ServiceRow, Snapshot};
+
+/// Why a request to the daemon got no answer (`tui::poll`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FetchError {
+    /// No daemon answered, or the connection broke: the dashboard needs one.
+    /// Otherwise the daemon answered with an error.
+    pub unreachable: bool,
+    pub reason: String,
+}
+
+impl FetchError {
+    /// The full line, for where there's room (the empty tree).
+    pub fn line(&self) -> String {
+        if self.unreachable {
+            format!("needs devsandbox serve: {}", self.reason)
+        } else {
+            self.reason.clone()
+        }
+    }
+
+    /// A few words for the header's stale marker, which shares its row with
+    /// the tabs: the connect error's full text is the daemon worker's
+    /// status line.
+    fn short(&self) -> String {
+        if self.unreachable {
+            return "needs devsandbox serve".into();
+        }
+        const MAX: usize = 40;
+        match self.reason.char_indices().nth(MAX) {
+            Some((cut, _)) => format!("{}…", &self.reason[..cut]),
+            None => self.reason.clone(),
+        }
+    }
+}
 
 /// The literal sandbox name of the synthetic group holding instances whose
 /// sandbox is not in config. Keyed by this string in the collapsed set.
@@ -162,9 +196,10 @@ pub const STALE_AFTER_SECS: u64 = 10;
 /// Right-aligned totals summary for the header, e.g.
 /// `3 sandboxes · 1 running / 2 stopped · 2 service containers · docker 24.0.7`.
 /// A trailing ` (stale Ns)` is appended when `collected_at` is older than
-/// [`STALE_AFTER_SECS`]. Pure over the snapshot so it is unit-testable; `age` is
-/// passed in rather than read from the clock.
-pub fn totals_line(snapshot: &Snapshot, age: std::time::Duration) -> String {
+/// [`STALE_AFTER_SECS`], or ` (stale Ns: why)` as soon as the last refresh
+/// failed (`error`, e.g. the daemon is down). Pure over the snapshot so it is
+/// unit-testable; `age` is passed in rather than read from the clock.
+pub fn totals_line(snapshot: &Snapshot, age: std::time::Duration, error: Option<&FetchError>) -> String {
     let running = snapshot
         .instances
         .iter()
@@ -192,8 +227,10 @@ pub fn totals_line(snapshot: &Snapshot, age: std::time::Duration) -> String {
         plural(service_containers, "container", "containers"),
         snapshot.runtime_name,
     );
-    if age.as_secs() >= STALE_AFTER_SECS {
-        line.push_str(&format!(" (stale {}s)", age.as_secs()));
+    match error {
+        Some(e) => line.push_str(&format!(" (stale {}s: {})", age.as_secs(), e.short())),
+        None if age.as_secs() >= STALE_AFTER_SECS => line.push_str(&format!(" (stale {}s)", age.as_secs())),
+        None => {}
     }
     line
 }
@@ -297,7 +334,7 @@ mod tests {
             Some("24.0.7"),
         );
         assert_eq!(
-            totals_line(&s, std::time::Duration::from_secs(0)),
+            totals_line(&s, std::time::Duration::from_secs(0), None),
             "3 sandboxes · 1 running / 2 stopped · 1 service container · docker 24.0.7",
         );
     }
@@ -312,7 +349,7 @@ mod tests {
             None,
         );
         assert_eq!(
-            totals_line(&s, std::time::Duration::from_secs(0)),
+            totals_line(&s, std::time::Duration::from_secs(0), None),
             "1 sandbox · 0 running / 0 stopped · 0 service containers · docker ?",
         );
     }
@@ -321,7 +358,7 @@ mod tests {
     fn totals_line_pluralizes_and_marks_missing_version() {
         let s = snap(vec![inst("a", ContainerStatus::Running("Up".into()))], Vec::new(), 1, None);
         assert_eq!(
-            totals_line(&s, std::time::Duration::from_secs(0)),
+            totals_line(&s, std::time::Duration::from_secs(0), None),
             "1 sandbox · 1 running / 0 stopped · 0 service containers · docker ?",
         );
     }
@@ -329,11 +366,30 @@ mod tests {
     #[test]
     fn totals_line_flags_stale_data() {
         let s = snap(Vec::new(), Vec::new(), 0, Some("24.0.7"));
-        let out = totals_line(&s, std::time::Duration::from_secs(STALE_AFTER_SECS + 2));
+        let out = totals_line(&s, std::time::Duration::from_secs(STALE_AFTER_SECS + 2), None);
         assert!(out.ends_with(" (stale 12s)"), "got: {out}");
         // Fresh data has no staleness suffix.
-        let fresh = totals_line(&s, std::time::Duration::from_secs(1));
+        let fresh = totals_line(&s, std::time::Duration::from_secs(1), None);
         assert!(!fresh.contains("stale"), "got: {fresh}");
+    }
+
+    /// A failed refresh marks the kept snapshot at once, with why: the
+    /// daemon being gone in a few words, its error cut short.
+    #[test]
+    fn totals_line_says_why_a_refresh_failed() {
+        let s = snap(Vec::new(), Vec::new(), 0, Some("24.0.7"));
+        let down = FetchError { unreachable: true, reason: "devsandbox serve did not answer on /run/x within 5s".into() };
+        let out = totals_line(&s, std::time::Duration::from_secs(3), Some(&down));
+        assert!(out.ends_with(" (stale 3s: needs devsandbox serve)"), "got: {out}");
+        assert_eq!(down.line(), "needs devsandbox serve: devsandbox serve did not answer on /run/x within 5s");
+
+        let refused = FetchError { unreachable: false, reason: "no directory /gone".into() };
+        let out = totals_line(&s, std::time::Duration::from_secs(12), Some(&refused));
+        assert!(out.ends_with(" (stale 12s: no directory /gone)"), "got: {out}");
+        assert_eq!(refused.line(), "no directory /gone");
+        let long = FetchError { unreachable: false, reason: "é".repeat(50) };
+        let out = totals_line(&s, std::time::Duration::from_secs(12), Some(&long));
+        assert!(out.ends_with(&format!(": {}…)", "é".repeat(40))), "got: {out}");
     }
 
     fn sb(name: &str) -> SandboxRow {

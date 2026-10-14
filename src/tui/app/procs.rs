@@ -120,16 +120,15 @@ impl App {
         }
     }
 
-    /// The selected instance as a `(name, container)` fetch target, but only when
-    /// its container is running. Drives the on-demand proc fetch that backs the
+    /// The selected instance's name as a fetch target, but only when its
+    /// container is running. Drives the on-demand proc fetch that backs the
     /// Detail agent count for instances that aren't expanded. `None` on non-
     /// instance nodes or a non-running selection.
-    fn selected_running_instance(&self) -> Option<(String, String)> {
+    fn selected_running_instance(&self) -> Option<String> {
         let snapshot = self.snapshot.as_ref()?;
         let idx = self.selected_instance_index()?;
         let row = snapshot.instances.get(idx)?;
-        matches!(row.status, ContainerStatus::Running(_))
-            .then(|| (row.name.clone(), row.container.clone()))
+        matches!(row.status, ContainerStatus::Running(_)).then(|| row.name.clone())
     }
 
     /// Consume the "fetch now" signal set on expand.
@@ -137,7 +136,7 @@ impl App {
         std::mem::take(&mut self.needs_proc_fetch)
     }
 
-    /// The process-list fetch targets: `(instance name, container)` for every
+    /// The process-list fetch targets (`instances.procs` names): every
     /// expanded instance whose container is running. Expanded instances that are
     /// not running (or absent from the snapshot) get a `(not running)` message
     /// row stored directly here — no fetch — and are omitted from the returned
@@ -146,7 +145,7 @@ impl App {
     /// has a fresh forest even when its process layer isn't expanded. Empty off
     /// the Instances tab: nothing there shows processes, and each target costs
     /// two `docker exec`s.
-    pub fn proc_fetch_targets(&mut self) -> Vec<(String, String)> {
+    pub fn proc_fetch_targets(&mut self) -> Vec<String> {
         if self.tab != Tab::Instances {
             return Vec::new();
         }
@@ -158,7 +157,7 @@ impl App {
         for name in &self.expanded_procs {
             match snapshot.instances.iter().find(|r| &r.name == name) {
                 Some(row) if matches!(row.status, ContainerStatus::Running(_)) => {
-                    targets.push((row.name.clone(), row.container.clone()));
+                    targets.push(row.name.clone());
                 }
                 _ => not_running.push(name.clone()),
             }
@@ -170,9 +169,9 @@ impl App {
         // The selected running instance is fetched too (for the Detail agent
         // count), even when its process layer isn't expanded. Deduped against the
         // expanded targets so it's never fetched twice in one batch.
-        if let Some((name, container)) = self.selected_running_instance() {
-            if !targets.iter().any(|(n, _)| n == &name) {
-                targets.push((name, container));
+        if let Some(name) = self.selected_running_instance() {
+            if !targets.contains(&name) {
+                targets.push(name);
             }
         }
         targets
@@ -381,7 +380,7 @@ mod tests {
         app.expanded_procs.insert("down".into());
 
         let targets = app.proc_fetch_targets();
-        assert_eq!(targets, vec![("up".to_string(), "devsandbox-up".to_string())]);
+        assert_eq!(targets, vec!["up".to_string()]);
         // Non-running instance got a (not running) message row, no fetch.
         assert_eq!(
             app.procs.get("down"),
@@ -478,10 +477,7 @@ mod tests {
         // Move onto the running instance: it becomes a fetch target for the
         // Detail agent count, without being expanded.
         app.on_key(key(KeyCode::Down));
-        assert_eq!(
-            app.proc_fetch_targets(),
-            vec![("up".to_string(), "devsandbox-up".to_string())],
-        );
+        assert_eq!(app.proc_fetch_targets(), vec!["up".to_string()]);
         assert!(app.expanded_procs.is_empty());
     }
 }

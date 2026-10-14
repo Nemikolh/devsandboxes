@@ -1,6 +1,5 @@
 //! Fixtures shared by the `app` submodules' tests.
 
-use crate::config::Config;
 use crate::tui::data::{ContainerStatus, ServiceRow};
 use crate::tui::term::TermSession;
 
@@ -227,13 +226,6 @@ pub(super) const MODAL_AREA: Rect = Rect { x: 0, y: 0, width: 100, height: 40 };
 
 pub(super) fn toks(line: &str) -> Vec<String> {
     line.split_whitespace().map(str::to_string).collect()
-}
-
-pub(super) fn cfg() -> Config {
-    Config::parse(
-        "[sandbox.web]\nfolder = \"code\"\nworktree-branch = \"wt/${instance}\"\n\n[sandbox.api]\nfolder = \"code\"\n",
-    )
-    .unwrap()
 }
 
 /// A snapshot whose single service `svc` has `containers`.
