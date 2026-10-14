@@ -14,6 +14,8 @@ mod snapshot;
 mod state;
 #[cfg(test)]
 mod test_support;
+// The dashboard is a client of devsandbox serve, which is unix-only.
+#[cfg(unix)]
 mod tui;
 
 use std::io::IsTerminal;
@@ -414,7 +416,10 @@ fn main() -> Result<()> {
 
     let Some(command) = cli.command else {
         if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+            #[cfg(unix)]
             return tui::dashboard(&cli.dir);
+            #[cfg(not(unix))]
+            anyhow::bail!("the dashboard needs devsandbox serve (unix only for now)");
         }
         Cli::command().print_help()?;
         std::process::exit(2);

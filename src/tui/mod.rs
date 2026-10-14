@@ -3,10 +3,12 @@
 //! This module owns all terminal I/O: raw mode, the alternate screen, the
 //! panic hook that restores them, and the crossterm event loop. The state
 //! machine ([`app::App`]) and rendering ([`ui::draw`]) stay I/O-free.
+//!
+//! Unix-only (`main.rs`): the dashboard is a client of devsandbox serve,
+//! which is; off unix it only says so.
 
 mod app;
 mod clipboard;
-#[cfg(unix)]
 mod daemon;
 mod data;
 mod kitty;
@@ -46,8 +48,6 @@ use crate::commands::vscode::Goto;
 use crate::inbox;
 
 use app::{App, PendingSignal};
-// `devsandbox inbox` dates its rows like the dashboard's cards.
-pub(crate) use app::short_age;
 use data::Snapshot;
 use procs::{parse_top, build_forest, ProcState};
 use prompt::PromptAction;
@@ -201,7 +201,7 @@ fn install_panic_hook() {
 
 fn run(terminal: &mut Term, mut app: App) -> Result<()> {
     let dir = app.dir.clone();
-    app.utc_offset = local_utc_offset();
+    app.utc_offset = inbox::clock::local_utc_offset();
     app.kitty = KITTY.load(Ordering::Relaxed);
     app.copy_key_intercepted = app::copy_key_intercepted(|var| std::env::var(var).ok());
     // Before the inbox, whose error would otherwise hide this one: an
@@ -260,7 +260,6 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
     // store alone, minus the live features. The daemon also owns the
     // Ports tab's forwards (they outlive the dashboard); the worker relays
     // adds/stops and this root's rows.
-    #[cfg(unix)]
     let daemon = daemon::DaemonWorker::spawn(dir.clone());
 
     while !app.should_quit {
@@ -338,8 +337,7 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
             match action {
                 // devsandbox serve runs the build (it outlives the dashboard
                 // and logs itself); its row shows the phase as soon as it's
-                // recorded. Off unix there's no daemon: suspended, below.
-                #[cfg(unix)]
+                // recorded.
                 action @ (PromptAction::Run { .. } | PromptAction::Rebuild { .. } | PromptAction::Start { .. }) => {
                     app.status = Some(format!("{}…", verb_label(&action)));
                     builds.push(spawn_verb(&dir, action));
@@ -392,17 +390,10 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
             dones.push((req.report, spawn_done(req.instance, req.done)));
         }
         // `d` on an in-flight row, confirmed: the daemon SIGINTs its build
-        // (`instances.cancel`, whoever started it). Off unix nothing can.
+        // (`instances.cancel`, whoever started it).
         if let Some(instance) = app.take_pending_cancel() {
-            #[cfg(unix)]
-            {
-                daemon.cancel(instance);
-                followup.schedule(Instant::now());
-            }
-            #[cfg(not(unix))]
-            {
-                app.status = Some(format!("cancel {instance}: not supported on this platform"));
-            }
+            daemon.cancel(instance);
+            followup.schedule(Instant::now());
         }
         // An open build log wants (re)reading: a local file tail, cheap
         // enough for the loop, kept out of `App`.
@@ -418,36 +409,22 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
         }
 
         // Ports tab: hand add/remove requests to the daemon worker (the daemon
-        // owns the forwards) and drain its updates into the app. Off unix the
-        // mux (and thus forwarding) doesn't exist.
-        #[cfg(unix)]
-        {
-            if let Some(req) = app.take_pending_port() {
-                daemon.forward_add(req);
-            }
-            if let Some(id) = app.take_pending_unport() {
-                daemon.forward_rm(id);
-            }
-            while let Some(update) = daemon.try_recv() {
-                match update {
-                    daemon::DaemonUpdate::InboxChanged => reload_inbox = true,
-                    daemon::DaemonUpdate::Ports(rows) => app.set_ports(rows),
-                    // The daemon's 5 s poll saw containers come or go:
-                    // resnapshot soon rather than on the next tick.
-                    daemon::DaemonUpdate::InstancesChanged => followup.schedule(Instant::now()),
-                    daemon::DaemonUpdate::Shown(line) | daemon::DaemonUpdate::Status(line) => {
-                        app.status = Some(line)
-                    }
-                }
-            }
+        // owns the forwards) and drain its updates into the app.
+        if let Some(req) = app.take_pending_port() {
+            daemon.forward_add(req);
         }
-        #[cfg(not(unix))]
-        {
-            if app.take_pending_port().is_some() {
-                app.status = Some("port forwarding is unix-only for now".into());
+        if let Some(id) = app.take_pending_unport() {
+            daemon.forward_rm(id);
+        }
+        while let Some(update) = daemon.try_recv() {
+            match update {
+                daemon::DaemonUpdate::InboxChanged => reload_inbox = true,
+                daemon::DaemonUpdate::Ports(rows) => app.set_ports(rows),
+                // The daemon's 5 s poll saw containers come or go:
+                // resnapshot soon rather than on the next tick.
+                daemon::DaemonUpdate::InstancesChanged => followup.schedule(Instant::now()),
+                daemon::DaemonUpdate::Shown(line) | daemon::DaemonUpdate::Status(line) => app.status = Some(line),
             }
-            // No forwards exist off unix, so a stale unport is just dropped.
-            let _ = app.take_pending_unport();
         }
         // The Inbox lives in one shared file (`crate::inbox::store`), so any
         // dashboard's change must reach this one: push what the keys asked
@@ -455,16 +432,12 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
         // Terminals just opened on relay-mode instances: the daemon's bridge
         // relays this dashboard's agent. Disconnected: skipped (no fallback).
         let bridges = app.take_pending_bridges();
-        #[cfg(unix)]
         if daemon.connected() {
             for instance in bridges {
                 daemon.ensure_bridge(instance, crate::devsbd::bridge::own_agent());
             }
         }
-        #[cfg(not(unix))]
-        drop(bridges);
         let ops = app.take_pending_inbox();
-        #[cfg(unix)]
         let ops = if !ops.is_empty() && daemon.connected() {
             // Through the API; the worker says when they landed. No reload
             // before then: it would undo `App`'s optimistic copy.
@@ -668,30 +641,8 @@ fn run_suspended(terminal: &mut Term, dir: &Path, action: PromptAction) -> Resul
         PromptAction::Rm { instance, force } => commands::rm::rm(instance, None, *force, false),
         PromptAction::Stop { instance } => commands::stop::stop(Some(instance.clone()), false),
         PromptAction::ServiceRebuild { name } => commands::services::rebuild(dir, name),
-        // Off unix there's no daemon to send them to (`spawn_verb`): run
-        // here, as the CLI's in-process path does (autostart after).
-        #[cfg(not(unix))]
-        PromptAction::Run { sandbox, name, branch, base } => {
-            let extras = commands::run::RunExtras::default();
-            let result = commands::run::run(dir, Some(sandbox.clone()), name.clone(), branch.clone(), base.clone(), extras);
-            commands::autostart::autostart(dir);
-            result.map(|_| ())
-        }
-        #[cfg(not(unix))]
-        PromptAction::Rebuild { instance, force } => {
-            let result = commands::rebuild::rebuild(dir, Some(instance.clone()), false, *force);
-            commands::autostart::autostart(dir);
-            result
-        }
-        #[cfg(not(unix))]
-        PromptAction::Start { instance } => {
-            let result = commands::start::start(dir, Some(instance.clone()), false);
-            commands::autostart::autostart(dir);
-            result
-        }
-        // On unix `run`/`rebuild`/`start` go to the daemon: the caller
-        // handles them.
-        #[cfg(unix)]
+        // `run`/`rebuild`/`start` go to the daemon (`spawn_verb`): the
+        // caller handles them.
         PromptAction::Run { .. } | PromptAction::Rebuild { .. } | PromptAction::Start { .. } => Ok(()),
         // `code`/`rename` never suspend. `port` never reaches here — `App`
         // routes it to `pending_port` (step 10), not `pending_action`.
@@ -728,13 +679,15 @@ fn log_error(action: &PromptAction, err: &anyhow::Error) -> Option<PathBuf> {
         PromptAction::Rm { .. } => "rm",
         PromptAction::Stop { .. } => "stop",
         PromptAction::ServiceRebuild { .. } => "service rebuild",
-        // Suspended only off unix (on unix the daemon runs them, and the
-        // build log has their output).
-        PromptAction::Run { .. } => "run",
-        PromptAction::Rebuild { .. } => "rebuild",
-        PromptAction::Start { .. } => "start",
-        // Never suspended (`run_suspended`): nothing to log here.
-        PromptAction::Code { .. } | PromptAction::Rename { .. } | PromptAction::Port { .. } => return None,
+        // Never suspended (`run_suspended`; the daemon runs `run`/
+        // `rebuild`/`start`, their build log has the output): nothing to
+        // log here.
+        PromptAction::Run { .. }
+        | PromptAction::Rebuild { .. }
+        | PromptAction::Start { .. }
+        | PromptAction::Code { .. }
+        | PromptAction::Rename { .. }
+        | PromptAction::Port { .. } => return None,
     };
     let dir = crate::state::State::path().ok()?.parent()?.join("logs");
     std::fs::create_dir_all(&dir).ok()?;
@@ -786,7 +739,6 @@ fn spawn_code(dir: PathBuf, instance: String, goto: Option<Goto>, note: Option<S
 
 /// `run web` / `rebuild web-2` / `start web-2`: how the status line names a
 /// dashboard verb request.
-#[cfg(unix)]
 fn verb_label(action: &PromptAction) -> String {
     match action {
         PromptAction::Run { sandbox, name: Some(name), .. } => format!("run {sandbox} --name {name}"),
@@ -799,7 +751,6 @@ fn verb_label(action: &PromptAction) -> String {
 
 /// The instance a verb action names before it runs: `rebuild`/`start`'s,
 /// `run --name`'s (a plain `run`'s is picked by the verb).
-#[cfg(unix)]
 fn verb_instance(action: &PromptAction) -> Option<&str> {
     match action {
         PromptAction::Run { name, .. } => name.as_deref(),
@@ -813,7 +764,6 @@ fn verb_instance(action: &PromptAction) -> Option<&str> {
 /// `None` for the other actions. Always `detach`: the dashboard only waits
 /// for the instance to be registered, its row shows the rest. The target
 /// always goes in, so nothing can need a pick.
-#[cfg(unix)]
 fn verb_call(
     action: &PromptAction,
     root: &Path,
@@ -845,7 +795,6 @@ fn verb_call(
 /// params, no such instance) ran nothing, so no build log. `Err` is the
 /// daemon unreachable: no fallback (the dashboard never builds in its own
 /// process, which would die with it).
-#[cfg(unix)]
 fn verb_status(action: &PromptAction, sent: Result<crate::serve::client::Streamed>) -> (String, bool) {
     use crate::serve::client::Streamed;
     let label = verb_label(action);
@@ -892,7 +841,6 @@ fn verb_status(action: &PromptAction, sent: Result<crate::serve::client::Streame
 /// reach the terminal); the detached answer comes once the instance is
 /// registered, and dropping the connection then leaves the build running.
 /// Quitting the dashboard before that hangs up, which cancels it.
-#[cfg(unix)]
 fn spawn_verb(dir: &Path, action: PromptAction) -> Receiver<OpDone> {
     let (tx, rx) = mpsc::channel();
     let root = daemon::root_dir(dir.to_path_buf());
@@ -926,20 +874,6 @@ fn open_link(link: &str) -> std::result::Result<(), String> {
         let _ = child.wait();
     });
     Ok(())
-}
-
-/// Seconds east of UTC for the Inbox clock, from `date +%z` (std has no
-/// timezone support and no tz crate is in the tree). 0 (UTC) when `date` is
-/// missing or odd; read once, so a DST switch mid-session isn't picked up.
-pub(crate) fn local_utc_offset() -> i64 {
-    std::process::Command::new("date")
-        .arg("+%z")
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()
-        .and_then(|o| app::parse_utc_offset(&String::from_utf8_lossy(&o.stdout)))
-        .unwrap_or(0)
 }
 
 /// Result of a background `s` stop/start, drained by the event loop.
@@ -1154,7 +1088,6 @@ mod tests {
         assert_eq!(c.depth(t0 + STATS_INTERVAL + TICK_INTERVAL), data::Depth::Listing);
     }
 
-    #[cfg(unix)]
     fn run_action(name: Option<&str>, branch: Option<&str>, base: Option<&str>) -> PromptAction {
         PromptAction::Run {
             sandbox: "web".into(),
@@ -1166,7 +1099,6 @@ mod tests {
 
     /// Each verb action's request is detached, carries the root and env,
     /// and is what the daemon's `serve::verbs::parse` accepts.
-    #[cfg(unix)]
     #[test]
     fn verb_calls_are_detached_requests_the_daemon_accepts() {
         use crate::serve::verbs::{self, Target, Verb};
@@ -1198,7 +1130,6 @@ mod tests {
         assert_eq!(verb_call(&PromptAction::Rm { instance: "web-2".into(), force: false }, &root, env), None);
     }
 
-    #[cfg(unix)]
     #[test]
     fn verb_status_reads_each_answer() {
         use crate::serve::client::Streamed;

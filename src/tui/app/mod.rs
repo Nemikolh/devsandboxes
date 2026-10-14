@@ -32,7 +32,7 @@ mod view;
 
 pub use crate::inbox::Thread;
 pub use inbox::{
-    chip, pane_feed, pane_header, parse_utc_offset, short_age, title_of, HeaderRow, InboxFocus, InboxView, PaneLine, Tone,
+    chip, pane_feed, pane_header, short_age, title_of, HeaderRow, InboxFocus, InboxView, PaneLine, Tone,
     View,
 };
 pub use forms::{form_lines, form_title, forms_offset, pinned_forms, FormSpot};
@@ -82,8 +82,8 @@ pub enum Focus {
 }
 
 /// One row of the Ports tab: a live forward, projected from the forwarder's
-/// `ForwardStatus` by the event loop (step 10). Plain data with no dependency on
-/// the unix-only forward module, so [`App`] compiles on every platform.
+/// `ForwardStatus` by the event loop (step 10). Plain data, so [`App`] stays
+/// free of the forward module.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PortRow {
     /// Stable forward id, used to target a `d` (stop) at the right forward.
@@ -336,7 +336,6 @@ impl App {
 
     /// Install the forwarder's latest rows and re-clamp the Ports selection in
     /// case it shrank. I/O-free: the event loop (step 10) does the collecting.
-    #[cfg_attr(not(unix), allow(dead_code))] // fed by the unix-only forward worker
     pub fn set_ports(&mut self, ports: Vec<PortRow>) {
         self.ports = ports;
         self.clamp_selection();

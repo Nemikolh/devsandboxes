@@ -18,7 +18,10 @@ box, WSL or a VM, that runs the daemon and the containers.
   federating it.
 - **A default machine**, so `--machine` isn't needed on every command (see
   the open question in `docs/client-server.md`).
-- **The TUI**: ratatui/crossterm already support Windows consoles. The
+- **The TUI**: today it isn't built off unix: the dashboard is a client of
+  `devsandbox serve` (`docs/dashboard-client.md`), so on Windows it only
+  says it needs devsandbox serve. Once it can reach a machine it comes
+  back: ratatui/crossterm already support Windows consoles, and the
   terminal tabs need `ssh -t` (*Exec and terminal* in the client-server
   doc) instead of a local `docker exec -it` PTY.
 - **`exec`**: `ssh -t <machine> devsandbox exec …`.

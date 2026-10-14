@@ -87,7 +87,7 @@ pub fn ls(view: &str, json: bool) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&Envelope::new(rows)).context("serialize inbox ls")?);
         return Ok(());
     }
-    print!("{}", ls_table(&rows, now(), crate::tui::local_utc_offset()));
+    print!("{}", ls_table(&rows, now(), crate::inbox::clock::local_utc_offset()));
     Ok(())
 }
 
@@ -100,7 +100,7 @@ pub fn show(arg: &ThreadArg, json: bool) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&Envelope::new(detail)).context("serialize inbox show")?);
         return Ok(());
     }
-    print!("{}", render_detail(&detail, now(), crate::tui::local_utc_offset()));
+    print!("{}", render_detail(&detail, now(), crate::inbox::clock::local_utc_offset()));
     Ok(())
 }
 
@@ -142,7 +142,7 @@ fn ls_table(rows: &[ThreadSummary], now: u64, utc_offset: i64) -> String {
                 t.owner_name.clone(),
                 t.key.clone().unwrap_or_else(|| "-".into()),
                 truncate(&t.title, TITLE_WIDTH),
-                crate::tui::short_age(t.changed_at, now, utc_offset),
+                crate::inbox::clock::short_age(t.changed_at, now, utc_offset),
             ]
         })
         .collect();
@@ -202,7 +202,7 @@ fn render_detail(d: &ThreadDetail, now: u64, utc_offset: i64) -> String {
             None => format!("reply: {how}"),
         });
     }
-    let age = |at: u64| crate::tui::short_age(at, now, utc_offset);
+    let age = |at: u64| crate::inbox::clock::short_age(at, now, utc_offset);
     for n in &d.notes {
         out.push('\n');
         line(&mut out, &format!("{}  {}", age(n.at), n.level));

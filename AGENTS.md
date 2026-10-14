@@ -7,7 +7,8 @@ git worktrees so working trees are never shared.
 
 ## Module map
 
-- `src/main.rs` — clap CLI; no subcommand on a TTY opens the TUI dashboard.
+- `src/main.rs` — clap CLI; no subcommand on a TTY opens the TUI dashboard
+  (`mod tui` is unix-only, like `serve`; off unix it says it needs the daemon).
   `src/json_stdout.rs` points stdout at stderr for `run --json` so child
   output can't corrupt the one JSON document.
 - `src/commands/*.rs` — one file per verb (`run`, `start`, `stop`, `rebuild`,
@@ -57,7 +58,8 @@ git worktrees so working trees are never shared.
   Inbox views' membership (shared by the TUI and the API), `wire.rs` the
   API's wire views (`ThreadSummary`/`ThreadDetail`), addressing and the user
   ops' `decide_*` checks (platform-neutral: `serve::api` serves them, the
-  CLI's local fallback runs them).
+  CLI's local fallback runs them), `clock.rs` how Inbox times read (card
+  age, stamp, UTC offset; the dashboard's and `devsandbox inbox`'s).
 - `src/serve/` — the per-user host daemon `devsandbox serve` (unix-only, see
   `docs/serve.md`): `endpoint.rs` (socket dir/paths, bind/connect: the
   `local_endpoint` seam), `daemon.rs` (start lock, accept loop, version
