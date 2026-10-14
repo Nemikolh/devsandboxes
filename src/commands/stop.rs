@@ -9,11 +9,18 @@ use crate::state::State;
 /// restarts a stopped instance); networks and global services are left alone.
 /// `--all` stops every running instance in state. Forgiving by design
 /// (idempotent): an already-stopped or missing container is not an error.
+/// One a live `run`/`rebuild` is materializing (docs/instance-phase.md) is
+/// refused (skipped by `--all`): stopping its container would only fail the
+/// step in progress; Ctrl-C on that command cancels it properly.
 pub fn stop(name: Option<String>, all: bool) -> Result<()> {
     let state = State::load()?;
     if all {
         let mut stopped = 0;
         for (key, info) in &state.instances {
+            if let Some(why) = super::in_flight(key, info.progress.as_ref(), info.phase_view().as_ref()) {
+                eprintln!("skipping: {why}");
+                continue;
+            }
             if backend().is_running(&info.container)? != Some(true) {
                 continue;
             }
@@ -31,6 +38,9 @@ pub fn stop(name: Option<String>, all: bool) -> Result<()> {
     let name = name.expect("clap requires a name without --all");
     let key = resolve_instance(&state, &name)?;
     let info = state.instances.get(&key).expect("key came from state");
+    if let Some(why) = super::in_flight(&key, info.progress.as_ref(), info.phase_view().as_ref()) {
+        anyhow::bail!("{why}");
+    }
 
     let services = service_containers(&info.project, &info.instance_id);
     stop_containers(&info.container, &services, false);

@@ -80,6 +80,7 @@ pub fn autostart(dir: &Path) {
             sandbox: &info.sandbox,
             project: &info.project,
             child: info.dispatcher.is_some(),
+            not_ready: info.progress.is_some(),
         })
         .collect();
     let actions = actions(&project, &sandboxes, &rows, |key| {
@@ -112,6 +113,12 @@ pub fn autostart(dir: &Path) {
                     Err(e) => eprintln!("warning: autostart: cannot run `{sandbox}`: {e:#}"),
                 }
             }
+            Action::SkipNotReady(key) => {
+                let view = state.instances[&key].phase_view();
+                if let Some(why) = super::not_ready(&key, view.as_ref()) {
+                    eprintln!("note: autostart: skipping {why}");
+                }
+            }
             Action::SkipMissing(key) => {
                 eprintln!(
                     "note: autostart: `{key}` has no container; `devsandbox run` recreates it"
@@ -128,6 +135,9 @@ struct Row<'a> {
     project: &'a str,
     /// Dispatcher-owned (`Instance.dispatcher` set).
     child: bool,
+    /// Being materialized, or failed (`Instance.progress` set,
+    /// docs/instance-phase.md).
+    not_ready: bool,
 }
 
 /// Container state of an instance. `Unknown` (the runtime query failed) is
@@ -149,6 +159,9 @@ enum Action {
     Run(String),
     /// The instance's container is gone; tell the user instead of recreating.
     SkipMissing(String),
+    /// In flight or failed: its `run`/`rebuild` owns it, or the user decides
+    /// (`rebuild` retries, `rm` removes); noted, never started.
+    SkipNotReady(String),
 }
 
 /// Whether this boot still needs an autostart pass for the project.
@@ -161,6 +174,9 @@ fn due(recorded: Option<&str>, boot: &str) -> bool {
 /// noted when containerless; a sandbox with none gets a `Run`. Instances of
 /// other config roots are ignored. `liveness` is only queried for relevant
 /// instances, so unrelated containers cost no runtime call.
+///
+/// In-flight and failed instances are noted, never started (nor queried);
+/// they still count as existing, so they get no duplicate `Run`.
 ///
 /// Dispatcher children are never started or noted (and not queried): their
 /// dispatcher `ensure`s them when it needs them. They still count as existing
@@ -179,6 +195,10 @@ fn actions(
         for row in rows.iter().filter(|r| r.sandbox == sandbox && r.project == project) {
             any = true;
             if row.child {
+                continue;
+            }
+            if row.not_ready {
+                out.push(Action::SkipNotReady(row.key.to_string()));
                 continue;
             }
             match liveness(row.key) {
@@ -322,11 +342,11 @@ mod tests {
     use super::*;
 
     fn row<'a>(key: &'a str, sandbox: &'a str, project: &'a str) -> Row<'a> {
-        Row { key, sandbox, project, child: false }
+        Row { key, sandbox, project, child: false, not_ready: false }
     }
 
     fn child<'a>(key: &'a str, sandbox: &'a str, project: &'a str) -> Row<'a> {
-        Row { key, sandbox, project, child: true }
+        Row { key, sandbox, project, child: true, not_ready: false }
     }
 
     fn names(list: &[&str]) -> Vec<String> {
@@ -398,6 +418,13 @@ mod tests {
             Liveness::Stopped
         });
         assert_eq!(got, [Action::Start("web".into())]);
+    }
+
+    #[test]
+    fn in_flight_or_failed_noted_not_queried_and_no_duplicate_run() {
+        let rows = [Row { not_ready: true, ..row("web", "web", "p") }];
+        let got = actions("p", &names(&["web"]), &rows, |_| panic!("not queried"));
+        assert_eq!(got, [Action::SkipNotReady("web".into())]);
     }
 
     #[test]

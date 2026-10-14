@@ -10,6 +10,7 @@ use crate::state::{Instance, Phase, State};
 
 use super::{container_drifted, pick, services};
 
+pub(crate) mod cancel;
 mod editor;
 mod folders;
 mod git;
@@ -215,6 +216,8 @@ pub fn run(
     };
     let mut tracker = Tracker::new(&instance_id, Phase::Preparing);
     let provisional = Instance { progress: Some(tracker.progress()), ..provisional };
+    // From the record on, Ctrl-C/SIGTERM cancels: roll back, then exit.
+    let _cancel = cancel::catch();
     // Re-checked under the lock: the snapshot may be stale, and two `run`s
     // picking one default name must not both get it.
     State::update(|fresh| {
@@ -254,11 +257,20 @@ pub fn run(
         )
     })();
     if let Err(e) = result {
-        match tracker.on_failure(true) {
+        let outcome = tracker.on_failure(true);
+        match outcome {
             OnFailure::RollBack => progress::rollback(&instance_id, branch_start.as_deref()),
             OnFailure::KeepFailed => tracker.fail(&e),
         }
-        return Err(e);
+        // Not the step's own error: a child killed by the same Ctrl-C
+        // reports some failure of its own.
+        if cancel::requested() {
+            bail!("`{instance}` {}: rolled back", cancel::CANCELLED);
+        }
+        return Err(match outcome {
+            OnFailure::RollBack => e,
+            OnFailure::KeepFailed => anyhow::anyhow!("{e:#}; {}", kept_hint(&instance)),
+        });
     }
 
     Ok(Some(instance))
@@ -701,9 +713,8 @@ pub(crate) fn materialize(
     )?;
     tracker.container_created();
     let container = container_name.clone();
-    let kept = || kept_hint(instance);
-    backend().connect_networks(&container, &networks).with_context(kept)?;
-    backend().wire_service_dns(&container, &endpoints).with_context(kept)?;
+    backend().connect_networks(&container, &networks)?;
+    backend().wire_service_dns(&container, &endpoints)?;
     // Before lifecycle commands, so they could already rely on the helper. In
     // relay-first mode a failure means no ssh-agent forwarding at all (no mount
     // fallback), so word the note that way; otherwise the plain install note.
@@ -765,8 +776,7 @@ pub(crate) fn materialize(
 
     let extensions = props.vscode_extensions().unwrap_or(&[]);
     if !extensions.is_empty() || props.remote_user.is_some() {
-        write_vscode_name_config(&container, Some(extensions), props.remote_user.as_deref())
-            .with_context(kept)?;
+        write_vscode_name_config(&container, Some(extensions), props.remote_user.as_deref())?;
     }
 
     // ssh-agent for the lifecycle chain. The instance was just saved, so read
@@ -822,7 +832,7 @@ pub(crate) fn materialize(
             ssh_auth_sock,
             &shell_rc_wiring(&paths, persist_history),
         )
-        .with_context(|| format!("shell-rc wiring failed; {}", kept()))?;
+        .context("shell-rc wiring failed")?;
     }
 
     for (name, cmd) in [
@@ -842,7 +852,7 @@ pub(crate) fn materialize(
                 ssh_auth_sock,
                 cmd,
             )
-            .with_context(|| format!("{name} failed; {}", kept()))?;
+            .with_context(|| format!("{name} failed"))?;
         }
     }
 
@@ -853,8 +863,11 @@ pub(crate) fn materialize(
     Ok(())
 }
 
-/// What a failure from the container on says: everything stays, as `failed`.
-fn kept_hint(instance: &str) -> String {
+/// What a failure from the container on adds to its error: everything
+/// stays, as `failed`. Added by the caller (`run`, `rebuild`) rather than
+/// inside `materialize`, so the error recorded on the instance is just what
+/// failed (readers add their own hint: `commands::not_ready`).
+pub(crate) fn kept_hint(instance: &str) -> String {
     format!(
         "instance `{instance}` kept as failed: `devsandbox rebuild {instance}` retries, \
          `devsandbox rm {instance}` removes it"

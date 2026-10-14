@@ -21,8 +21,13 @@ pub fn rename(name: &str, new_name: &str) -> Result<()> {
 /// the trimmed new name.
 pub fn rename_exact(name: &str, new_name: &str) -> Result<String> {
     State::update(|state| {
-        if !state.instances.contains_key(name) {
+        let Some(info) = state.instances.get(name) else {
             bail!("no instance named `{name}` (see `devsandbox ps -a`)");
+        };
+        // A `run` mid-flight saves its full record under the original key,
+        // which would bring the old name back next to the new one.
+        if let Some(why) = crate::commands::in_flight(name, info.progress.as_ref(), info.phase_view().as_ref()) {
+            bail!("{why}");
         }
         rename_in_state(state, name, new_name)
     })

@@ -24,7 +24,57 @@ use std::io::{IsTerminal, Write};
 use anyhow::{bail, Context, Result};
 
 use crate::runtime::{backend, NAME_PREFIX};
-use crate::state::{Instance, State};
+use crate::state::{Instance, PhaseView, Progress, State};
+
+/// Why `key` isn't a ready instance (docs/instance-phase.md), for verbs that
+/// need one (`start`; `rebuild --all` and autostart skip with it):
+/// still being materialized, or failed (an interrupted one included). `None`
+/// = ready. `view` is [`Instance::phase_view`].
+pub(crate) fn not_ready(key: &str, view: Option<&PhaseView>) -> Option<String> {
+    match view? {
+        PhaseView::InFlight(label) => Some(format!("`{key}` is still {}", doing(label))),
+        PhaseView::Failed { at, error } => Some(format!(
+            "`{key}` failed at {at}: {error}; `devsandbox rebuild {key}` retries, \
+             `devsandbox rm {key}` removes it"
+        )),
+    }
+}
+
+/// Why `exec` (and the dashboard's terminal) can't reach `key`'s container:
+/// it doesn't exist yet, or a failure came before it did. A failed or
+/// still-running lifecycle step passes: shelling in is how a failed
+/// `postCreateCommand` gets debugged, or a slow one watched. `None` = go.
+pub(crate) fn no_container_yet(key: &str, view: Option<&PhaseView>) -> Option<String> {
+    let pre = |label: &str| matches!(label, "preparing" | "building" | "creating");
+    match view? {
+        PhaseView::InFlight(label) if pre(label) => Some(format!("`{key}` is still {label}: no container yet")),
+        PhaseView::Failed { at, .. } if pre(at) => not_ready(key, view),
+        _ => None,
+    }
+}
+
+/// Why `key` can't be touched at all right now: a live process is
+/// materializing it (`rm`, even forced, `rename`, `rebuild`). Failed and
+/// interrupted ones pass. `None` = not in flight.
+pub(crate) fn in_flight(key: &str, progress: Option<&Progress>, view: Option<&PhaseView>) -> Option<String> {
+    match (progress, view) {
+        (Some(p), Some(PhaseView::InFlight(label))) => Some(format!(
+            "`{key}` is still {} (pid {}): wait for it, or Ctrl-C it",
+            doing(label),
+            p.pid
+        )),
+        _ => None,
+    }
+}
+
+/// A phase label as "what it's doing": the named phases read as verbs
+/// (`building`), a lifecycle step is a noun (`running postCreateCommand`).
+pub(crate) fn doing(label: &str) -> String {
+    match label {
+        "preparing" | "building" | "creating" => label.to_string(),
+        step => format!("running {step}"),
+    }
+}
 
 /// Resolve a user-supplied `name` to a single instance key. `name` may be an
 /// instance name, its persistent id (they diverge after a rename — the id is
@@ -188,7 +238,50 @@ mod tests {
 
     use crate::state::{Instance, State};
 
-    use super::{drift_decision, resolve_instance, resolve_instance_with};
+    use super::{drift_decision, in_flight, no_container_yet, not_ready, resolve_instance, resolve_instance_with};
+    use crate::state::{Phase, PhaseView, Progress};
+
+    #[test]
+    fn not_ready_says_what_the_instance_is_doing_or_how_it_failed() {
+        assert_eq!(not_ready("web", None), None);
+        let building = PhaseView::InFlight("building".into());
+        assert_eq!(not_ready("web", Some(&building)).unwrap(), "`web` is still building");
+        let step = PhaseView::InFlight("postCreateCommand".into());
+        assert_eq!(not_ready("web", Some(&step)).unwrap(), "`web` is still running postCreateCommand");
+        let failed = PhaseView::Failed { at: "creating".into(), error: "interrupted".into() };
+        let why = not_ready("web", Some(&failed)).unwrap();
+        assert!(why.starts_with("`web` failed at creating: interrupted;"), "{why}");
+        assert!(why.contains("`devsandbox rebuild web` retries"), "{why}");
+        assert!(why.contains("`devsandbox rm web` removes it"), "{why}");
+    }
+
+    #[test]
+    fn exec_waits_only_for_the_container() {
+        assert_eq!(no_container_yet("web", None), None);
+        let building = PhaseView::InFlight("building".into());
+        assert_eq!(no_container_yet("web", Some(&building)).unwrap(), "`web` is still building: no container yet");
+        let pre = PhaseView::Failed { at: "creating".into(), error: "boom".into() };
+        assert!(no_container_yet("web", Some(&pre)).unwrap().starts_with("`web` failed at creating"));
+        // A lifecycle step, running or failed: the container is there to debug.
+        let step = PhaseView::InFlight("postCreateCommand".into());
+        assert_eq!(no_container_yet("web", Some(&step)), None);
+        let failed = PhaseView::Failed { at: "postCreateCommand".into(), error: "exit 1".into() };
+        assert_eq!(no_container_yet("web", Some(&failed)), None);
+    }
+
+    #[test]
+    fn only_a_live_in_flight_instance_is_untouchable() {
+        let p = Progress { phase: Phase::Building, pid: 4242, boot: None, error: None };
+        let live = PhaseView::InFlight("building".into());
+        assert_eq!(
+            in_flight("web", Some(&p), Some(&live)).unwrap(),
+            "`web` is still building (pid 4242): wait for it, or Ctrl-C it"
+        );
+        // Interrupted (dead pid) or failed: removable, renamable, rebuildable.
+        let dead = PhaseView::Failed { at: "building".into(), error: "interrupted".into() };
+        assert_eq!(in_flight("web", Some(&p), Some(&dead)), None);
+        assert_eq!(in_flight("web", None, None), None);
+    }
 
     #[test]
     fn drift_rule_covers_label_presence_and_expected_emptiness() {

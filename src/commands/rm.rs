@@ -21,6 +21,12 @@ pub fn rm(name: &str, delete_branch: Option<bool>, force: bool) -> Result<()> {
     let key = resolve_instance(&state, name)?;
 
     let info = state.instances.get(&key).expect("key came from state");
+    // Even forced: the live `run`/`rebuild` would keep creating what this
+    // tears down. Interrupted and failed ones go as usual (a record whose
+    // container or worktree never existed included: each step tolerates it).
+    if let Some(why) = super::in_flight(&key, info.progress.as_ref(), info.phase_view().as_ref()) {
+        bail!("{why}");
+    }
     let instance_id = info.instance_id.clone();
     let container = info.container.clone();
     let worktree = info.worktree.clone();

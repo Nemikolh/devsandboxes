@@ -323,6 +323,12 @@ impl Instance {
         env.extend(self.extra_env.iter().map(|(k, v)| (k.clone(), v.clone())));
         env
     }
+
+    /// Where this instance's materialization stands on this host
+    /// ([`Progress::current_view`]); `None` = ready.
+    pub fn phase_view(&self) -> Option<PhaseView> {
+        self.progress.as_ref().map(Progress::current_view)
+    }
 }
 
 /// Host-side runtime state, stored in the user data dir. No daemon: docker is

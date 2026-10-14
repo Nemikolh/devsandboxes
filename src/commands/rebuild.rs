@@ -5,7 +5,7 @@ use anyhow::{bail, Context, Result};
 use super::{container_drifted, resolve_instance, run, services};
 use crate::config::{sandbox_build_hash, Config, ResolvedSandbox};
 use crate::runtime::backend;
-use crate::state::{Instance, Phase, State};
+use crate::state::{Instance, Phase, PhaseView, State};
 
 /// Recreate an instance's container from the *current* config, preserving the
 /// worktree, branch, instance identity (name *and* persistent id, so shell
@@ -20,7 +20,13 @@ use crate::state::{Instance, Phase, State};
 /// Unlike `start`, which falls back to a bare container start when the config
 /// no longer resolves, `rebuild` bails: re-materializing against a config that
 /// doesn't match the instance would silently rebuild it wrong.
+///
+/// A `failed` instance (docs/instance-phase.md) is always rebuilt when named:
+/// that's how it's retried. One still being materialized is refused, and
+/// `--all` skips both.
 pub fn rebuild(dir: &Path, name: Option<String>, all: bool, force: bool) -> Result<()> {
+    // Ctrl-C/SIGTERM mid-rebuild leaves the instance `failed` ("cancelled").
+    let _cancel = run::cancel::catch();
     let mut state = State::load()?;
     let config = Config::load(dir).context("cannot load config to rebuild against")?;
     let project = services::project_id(dir)?;
@@ -30,7 +36,12 @@ pub fn rebuild(dir: &Path, name: Option<String>, all: bool, force: bool) -> Resu
         // Keys first: `rebuild_instance` needs `&mut state` (materialize
         // replaces the entry), so we can't hold an iterator over it.
         for key in state.instances.keys().cloned().collect::<Vec<_>>() {
+            run::cancel::check()?;
             let info = state.instances.get(&key).expect("key came from state");
+            if let Some(why) = super::not_ready(&key, info.phase_view().as_ref()) {
+                eprintln!("skipping: {why}");
+                continue;
+            }
             // A batch shouldn't die on the first foreign instance; note and go on.
             let sandbox = match resolve(&config, info, &project, &key) {
                 Ok(sandbox) => sandbox,
@@ -54,9 +65,19 @@ pub fn rebuild(dir: &Path, name: Option<String>, all: bool, force: bool) -> Resu
     let name = name.expect("clap requires a name without --all");
     let key = resolve_instance(&state, &name)?;
     let info = state.instances.get(&key).expect("key came from state");
+    let view = info.phase_view();
+    if let Some(why) = super::in_flight(&key, info.progress.as_ref(), view.as_ref()) {
+        bail!("{why}");
+    }
+    let failed = matches!(view, Some(PhaseView::Failed { .. }));
+    if failed {
+        resumable(&key, info)?;
+    }
     let sandbox = resolve(&config, info, &project, &key)?;
 
-    if !force && !needs_rebuild(dir, &info.container, &sandbox)? {
+    // A failed one may have its container with no drift (it failed in a
+    // lifecycle step): retrying is the point, so it's always rebuilt.
+    if !force && !failed && !needs_rebuild(dir, &info.container, &sandbox)? {
         println!("no config drift for `{key}`; nothing to do (--force overrides)");
         return Ok(());
     }
@@ -133,11 +154,28 @@ fn rebuild_instance(
     );
     if let Err(e) = result {
         debug_assert_eq!(tracker.on_failure(false), run::OnFailure::KeepFailed);
+        if run::cancel::requested() {
+            tracker.fail(&anyhow::anyhow!(run::cancel::CANCELLED));
+            bail!("rebuild of `{key}` {}; {}", run::cancel::CANCELLED, run::kept_hint(key));
+        }
         tracker.fail(&e);
-        return Err(e);
+        bail!("{e:#}; {}", run::kept_hint(key));
     }
 
     println!("rebuilt {key}");
+    Ok(())
+}
+
+/// Whether a failed `info` can be retried by a rebuild: `materialize` mounts
+/// the recorded working tree, which a `run` interrupted in `preparing` may
+/// never have made (its record still names the planned worktree path).
+fn resumable(key: &str, info: &Instance) -> Result<()> {
+    if info.worktree.is_none() && info.folder != info.base_folder {
+        bail!(
+            "`{key}` was interrupted before its worktree was made; nothing to retry: \
+             `devsandbox rm {key}` removes it, then `devsandbox run` again"
+        );
+    }
     Ok(())
 }
 
@@ -234,6 +272,21 @@ mod tests {
         let err = resolve(&cfg, &info, "proj1234", "web").unwrap_err().to_string();
         assert!(err.contains("different config root"), "{err}");
         assert!(err.contains("-C <root>"), "{err}");
+    }
+
+    #[test]
+    fn resumable_needs_the_recorded_working_tree() {
+        // Base-folder instance: always resumable.
+        assert!(resumable("web", &instance("p")).is_ok());
+        // A worktree instance with its worktree recorded.
+        let mut info = instance("p");
+        info.folder = "/cfg/.worktrees/web".into();
+        info.worktree = Some("/cfg/.worktrees/web".into());
+        assert!(resumable("web", &info).is_ok());
+        // Interrupted before `create_worktree` recorded it.
+        info.worktree = None;
+        let err = resumable("web", &info).unwrap_err().to_string();
+        assert!(err.contains("devsandbox rm web"), "{err}");
     }
 
     #[test]

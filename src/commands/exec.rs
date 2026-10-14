@@ -31,6 +31,9 @@ pub fn exec_status(name: &str, interactive: bool, tty: bool, command: &[String])
     let state = State::load()?;
     let key = resolve_instance(&state, name)?;
     let instance = state.instances.get(&key).expect("key came from state");
+    if let Some(why) = super::no_container_yet(&key, instance.phase_view().as_ref()) {
+        anyhow::bail!("{why}");
+    }
 
     let shell: Vec<String>;
     let (command, interactive, tty) = if command.is_empty() {

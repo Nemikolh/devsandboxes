@@ -128,6 +128,8 @@ Exit codes: 0 ok, 1 failed, 2 usage (or a key shared by two sandboxes without `-
 
 The child-management ops answer JSON on stdout, so a dispatcher never parses prose: `ensure`/`stop`/`rm`/`done` one compact object line (above; `created` = the child didn't exist, `started` = it existed but wasn't up, both false = already running; `ensure` adds `note` when the child came up but its ssh-agent relay didn't within 12 s), `ls`/`branches` an array. Errors answer no JSON: a non-zero exit and the message on stderr.
 
+- `ensure` of a child whose `run`/`rebuild` is still in progress, or that failed (or was interrupted) materializing (docs/instance-phase.md), neither starts nor recreates it and leaves its saved env alone: exit 1 (`failed`), with a message naming the phase ("`web-pr-1` is still building; `ensure` it again once it's done", or "`web-pr-1` failed at postCreateCommand: …; `rm` it, then `ensure` recreates it"). Not a new status: an in-flight child isn't a missing host (75), and `failed` is what an `ensure` whose `run` failed already answers, so a dispatcher needs no new case. An in-flight child clears by waiting; a failed one stays failed until `rm` (or a user's `devsandbox rebuild`).
+
 - Children are named `<sandbox>-<key>` (e.g. `web-pr-123`): predictable, so a human can `devsandbox vscode web-pr-123`.
 
 - Children are labelled `devsandbox.dispatcher=<dispatcher instance_id>`, and recorded as such in `state.toml`. `ls`/`stop`/`rm`/`done`/`exec` only reach owned children.

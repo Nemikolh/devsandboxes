@@ -58,7 +58,7 @@ use crate::config::{Config, Dispatcher, SandboxProperties};
 use crate::devsbd::control::{self, Op, Request, Response, Status};
 use crate::inbox::{ops as inbox_ops, store, Event};
 use crate::runtime::{backend, bounded};
-use crate::state::{Instance, State};
+use crate::state::{Instance, PhaseView, State};
 
 // The key rule lives in `control`, which the helper compiles too: `devsbd
 // thread put|rm` checks its key before queuing, and both sides must agree.
@@ -894,6 +894,10 @@ enum Ensure {
 /// on, the container's own env (PID 1, running processes) only changes on
 /// `rebuild` — which the containerless case does, from the saved env.
 /// `liveness` is only consulted for an owned child.
+///
+/// A child being materialized (its `run`/`rebuild` live) or failed
+/// (docs/instance-phase.md) is neither started nor recreated: `failed`, with
+/// the phase, so the dispatcher retries later or `rm`s it.
 fn ensure_action(
     name: &str,
     child: Option<&Instance>,
@@ -919,6 +923,18 @@ fn ensure_action(
             "that name is taken by this dispatcher's child of sandbox `{}`",
             child.sandbox
         )));
+    }
+    match child.phase_view() {
+        Some(PhaseView::InFlight(label)) => {
+            let doing = super::doing(&label);
+            return Err(failed(format!("`{name}` is still {doing}; `ensure` it again once it's done")));
+        }
+        Some(PhaseView::Failed { at, error }) => {
+            return Err(failed(format!(
+                "`{name}` failed at {at}: {error}; `rm` it, then `ensure` recreates it"
+            )));
+        }
+        None => {}
     }
     match liveness(&child.container) {
         Ok(Some(true)) => Ok(Ensure::Nothing),
@@ -1684,6 +1700,38 @@ folder = "."
         let resp = call(&s, "d", &r_with(Op::Ensure, "two"), &mut fake);
         assert_eq!(resp, Response::new(Status::Failed, "boom"));
         assert!(fake.bridge_waits.is_empty(), "no child came up: no bridge wait");
+    }
+
+    /// A child mid-`run` (this live process) or failed is reported, never
+    /// started or rebuilt, and its saved env is left alone.
+    #[test]
+    fn ensure_reports_an_in_flight_or_failed_child() {
+        use crate::state::{Phase, Progress};
+        let live = Progress {
+            phase: Phase::Lifecycle("postCreateCommand".into()),
+            pid: std::process::id(),
+            boot: crate::commands::autostart::boot_id(),
+            error: None,
+        };
+        let failed = Progress {
+            phase: Phase::Failed { at: "building".into() },
+            error: Some("image build failed".into()),
+            ..live.clone()
+        };
+        for (progress, want) in [
+            (live, "`web-two` is still running postCreateCommand; `ensure` it again once it's done"),
+            (failed, "`web-two` failed at building: image build failed; `rm` it, then `ensure` recreates it"),
+        ] {
+            let mut s = state();
+            s.instances.get_mut("web-two").unwrap().progress = Some(progress);
+            let mut fake = Fake::new();
+            let mut r = r_with(Op::Ensure, "two");
+            r.env = vec![("A".into(), "2".into())];
+            let resp = call(&s, "d", &r, &mut fake);
+            assert_eq!(resp, Response::new(Status::Failed, want));
+            assert!(fake.calls.is_empty(), "{:?}", fake.calls);
+            assert!(fake.saved.is_empty());
+        }
     }
 
     /// An `ensure` that brought a child up answers only once its ssh-agent

@@ -8,7 +8,7 @@ use crate::commands::status::Envelope;
 use crate::config::{build_hash, short_hash, Build, Config, ResolvedService, ServiceScope};
 use crate::render::{bold_cyan, dim, green, magenta, yellow};
 use crate::runtime::{backend, Backend, ServiceEndpoint, NAME_PREFIX};
-use crate::state::State;
+use crate::state::{PhaseView, State};
 
 /// Short, stable id for a config root, scoping its networks and services so two
 /// projects never collide.
@@ -458,10 +458,14 @@ pub fn gc(dir: &Path, force: bool) -> Result<()> {
     let state = State::load()?;
 
     // What live instances of this config root still reference, split by scope.
+    // One a live `run` is materializing counts as live: its services come up
+    // before its container does (docs/instance-phase.md).
     let running: BTreeSet<String> = state
         .instances
         .iter()
-        .filter(|(_, i)| container_running(&i.container))
+        .filter(|(_, i)| {
+            container_running(&i.container) || matches!(i.phase_view(), Some(PhaseView::InFlight(_)))
+        })
         .map(|(name, _)| name.clone())
         .collect();
     let ServiceRefs { global: global_refs, isolated: isolated_refs, live_instances } =

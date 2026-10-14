@@ -410,6 +410,11 @@ impl App {
                 self.status = Some(format!("terminal: `{title}` not in state"));
                 return;
             };
+            // As the CLI's `exec`: only once there's a container.
+            if let Some(why) = crate::commands::no_container_yet(&title, instance.phase_view().as_ref()) {
+                self.status = Some(format!("terminal: {why}"));
+                return;
+            }
             let host_agent = crate::devsbd::relay_mode(instance) && crate::commands::exec::has_host_agent();
             if host_agent {
                 relay = Some(title.clone());

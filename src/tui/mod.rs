@@ -780,6 +780,12 @@ fn spawn_stop(instance: &str) -> Receiver<OpDone> {
     std::thread::spawn(move || {
         let status = match crate::state::State::load() {
             Ok(state) => match state.instances.get(&instance) {
+                // As the CLI's `stop`: a live run/rebuild owns the container.
+                Some(info) if let Some(why) =
+                    commands::in_flight(&instance, info.progress.as_ref(), info.phase_view().as_ref()) =>
+                {
+                    format!("stop: {why}")
+                }
                 Some(info) => {
                     let services =
                         commands::stop::service_containers(&info.project, &info.instance_id);
@@ -807,6 +813,10 @@ fn spawn_start(instance: &str) -> Receiver<OpDone> {
     std::thread::spawn(move || {
         let (status, failed) = match crate::state::State::load() {
             Ok(state) => match state.instances.get(&instance) {
+                // As the CLI's `start`: not while in flight, not once failed.
+                Some(info) if let Some(why) = commands::not_ready(&instance, info.phase_view().as_ref()) => {
+                    (format!("start: {why}"), true)
+                }
                 Some(info) => {
                     // Bare start bypasses `start_instance`, so re-point the agent
                     // symlink here too, so a restart after host agent rotation

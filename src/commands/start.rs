@@ -13,12 +13,17 @@ use crate::state::{Instance, State};
 /// and refresh how the container resolves them, then run `postStartCommand`.
 /// Otherwise (orphan, or another config root) its containers are simply
 /// started. `--all` starts every instance whose container exists and is
-/// stopped.
+/// stopped. One still being materialized or failed (docs/instance-phase.md)
+/// is refused, and skipped with a note by `--all`.
 pub fn start(dir: &Path, name: Option<String>, all: bool) -> Result<()> {
     let state = State::load()?;
     if all {
         let mut started = 0;
         for (key, info) in &state.instances {
+            if let Some(why) = super::not_ready(key, info.phase_view().as_ref()) {
+                eprintln!("skipping: {why}");
+                continue;
+            }
             if backend().is_running(&info.container)? == Some(false) {
                 start_instance(dir, key, info)?;
                 started += 1;
@@ -33,6 +38,9 @@ pub fn start(dir: &Path, name: Option<String>, all: bool) -> Result<()> {
     let name = name.expect("clap requires a name without --all");
     let key = resolve_instance(&state, &name)?;
     let info = state.instances.get(&key).expect("key came from state");
+    if let Some(why) = super::not_ready(&key, info.phase_view().as_ref()) {
+        bail!("{why}");
+    }
     if backend().is_running(&info.container)?.is_none() {
         bail!("`{key}` has no container (see `devsandbox ps -a`); `devsandbox run` recreates it");
     }
