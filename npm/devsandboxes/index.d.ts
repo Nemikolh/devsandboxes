@@ -15,6 +15,16 @@ export type ContainerStatus =
   | { state: 'exited'; text: string }
   | { state: 'missing' };
 
+/**
+ * Where an instance's creation stands while it isn't ready. `step` is
+ * `preparing`, `building`, `creating` or a lifecycle step's name
+ * (`postCreateCommand`, …); a failed one is kept until `rebuild` retries it
+ * or `rm` removes it (`error` is `interrupted` when its process died).
+ */
+export type PhaseRow =
+  | { state: 'in-flight'; step: string }
+  | { state: 'failed'; step: string; error: string };
+
 /** One instance (`status().instances`). */
 export interface InstanceRow {
   name: string;
@@ -35,6 +45,8 @@ export interface InstanceRow {
   drift: boolean;
   /** Marked done (`done()`); kept as is until removed. */
   done: boolean;
+  /** Still being created, or failed; absent once ready. Shown instead of `status` while set. */
+  phase?: PhaseRow;
 }
 
 /** One `[sandbox.*]` from devsandboxes.toml (`ls()`, `status().sandboxes`). */
@@ -115,6 +127,8 @@ export interface ContainerRow {
   host_ports: string[];
   /** The container's instance is marked done (`false` for service containers). */
   done: boolean;
+  /** The container's instance is still being created, or failed; absent once ready. */
+  phase?: PhaseRow;
 }
 
 /** Resource usage of one running container (`stats()`), pre-rendered. */

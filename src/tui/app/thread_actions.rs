@@ -18,7 +18,7 @@
 use crate::commands::vscode::Goto;
 use crate::inbox::thread::HostVerb;
 use crate::inbox::{Op, Thread};
-use crate::snapshot::ContainerStatus;
+use crate::snapshot::{ContainerStatus, PhaseRow};
 use crate::tui::prompt::PromptAction;
 
 use super::{App, PortRequest};
@@ -44,15 +44,17 @@ impl App {
     /// Whether `t`'s target resolves to an instance whose container exists
     /// in the snapshot but isn't up (exited or gone): the header marks the
     /// actions that would start it `(stopped)`.
+    /// One with a phase (in flight, failed) isn't: nothing starts it.
     pub fn thread_target_stopped(&self, t: &Thread) -> bool {
         self.thread_target(t).is_ok_and(|name| {
-            self.instance_status(&name).is_some_and(|s| matches!(s, ContainerStatus::Exited(_) | ContainerStatus::Missing))
+            self.instance_row(&name).is_some_and(|r| {
+                r.phase.is_none() && matches!(r.status, ContainerStatus::Exited(_) | ContainerStatus::Missing)
+            })
         })
     }
 
-    fn instance_status(&self, name: &str) -> Option<&ContainerStatus> {
-        let snapshot = self.snapshot.as_ref()?;
-        snapshot.instances.iter().find(|r| r.name == name).map(|r| &r.status)
+    fn instance_row(&self, name: &str) -> Option<&crate::snapshot::InstanceRow> {
+        self.snapshot.as_ref()?.instances.iter().find(|r| r.name == name)
     }
 
     /// Run `verb` on instance `name` now if it's up (or its state is
@@ -60,9 +62,26 @@ impl App {
     /// for [`Self::start_finished`]. Either way a pending one is replaced:
     /// the latest click is what the user wants. A container that's gone
     /// needs a rebuild, which isn't this dashboard's to run unasked.
+    /// Nor is starting one with a phase: a live run owns it, a failed one
+    /// needs its rebuild; with its container up the verb just runs.
     fn when_up(&mut self, name: String, verb: Deferred) {
         self.after_start = None;
-        match self.instance_status(&name) {
+        if let Some(r) = self.instance_row(&name)
+            && !matches!(r.status, ContainerStatus::Running(_))
+        {
+            match &r.phase {
+                Some(PhaseRow::InFlight { step }) => {
+                    self.status = Some(format!("`{name}` is still {}", crate::commands::doing(step)));
+                    return;
+                }
+                Some(PhaseRow::Failed { step, .. }) => {
+                    self.status = Some(format!("`{name}` failed at {step}: rebuild it first (`s` on its row)"));
+                    return;
+                }
+                None => {}
+            }
+        }
+        match self.instance_row(&name).map(|r| &r.status) {
             Some(ContainerStatus::Exited(_)) => {
                 self.status = Some(format!("starting {name}…"));
                 // Already starting (`s`, or an earlier click): just wait on it.

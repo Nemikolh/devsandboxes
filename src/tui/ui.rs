@@ -27,6 +27,7 @@ use super::select::{self, RegionId};
 use crate::devsbd::notify::Level;
 use crate::inbox::{Kind, State};
 use crate::render::JsonLine;
+use crate::snapshot::PhaseRow;
 
 pub(super) const ACCENT: Color = Color::Rgb(175, 135, 255);
 const SELECTION: Color = Color::Rgb(0, 215, 135);
@@ -1686,9 +1687,11 @@ fn draw_tree(
     // TYPE only earns its width when some sandbox is a dispatcher.
     let show_type = snapshot.sandboxes.iter().any(|s| s.dispatcher);
     let mut titles = vec!["TREE", "STATUS", "UPTIME", "CPU", "MEM", "FOLDER", "SERVICES"];
+    // STATUS widens only while a phase (`postCreateCommand`, …) needs it.
+    let status = snapshot.instances.iter().map(|r| r.status_label().chars().count()).max().unwrap_or(0).max(9);
     let mut widths = vec![
         Constraint::Min(20),
-        Constraint::Length(9),
+        Constraint::Length(status as u16),
         Constraint::Length(7),
         Constraint::Length(7),
         Constraint::Length(16),
@@ -1848,10 +1851,7 @@ fn instance_tree_row(
     owner: Option<String>,
     kind: Option<&'static str>,
 ) -> Row<'static> {
-    let status = Cell::from(Span::styled(
-        r.status.label().to_string(),
-        status_style(&r.status),
-    ));
+    let status = Cell::from(Span::styled(r.status_label().to_string(), instance_status_style(r)));
     let folder = if r.worktree {
         format!("⎇ {}", r.folder)
     } else {
@@ -1936,6 +1936,17 @@ fn proc_tree_row<'a>(app: &App, snapshot: &'a Snapshot, instance: usize, row: us
         _ => "(loading…)".to_string(),
     };
     Row::new(vec![Cell::from(Span::styled(format!("      {msg}"), dim))])
+}
+
+/// An instance's STATUS style: its phase's while set (yellow in flight, bold
+/// red failed, apart from an exited container's plain red), else the
+/// container's.
+fn instance_status_style(r: &InstanceRow) -> Style {
+    match &r.phase {
+        Some(PhaseRow::InFlight { .. }) => Style::default().fg(Color::Yellow),
+        Some(PhaseRow::Failed { .. }) => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        None => status_style(&r.status),
+    }
 }
 
 fn status_style(status: &ContainerStatus) -> Style {
@@ -2025,13 +2036,22 @@ fn sandbox_detail<'a>(snapshot: &Snapshot, sb: &'a SandboxRow) -> Vec<Line<'a>> 
 }
 
 fn instance_detail(r: &InstanceRow, agent_count: Option<usize>) -> Vec<Line<'_>> {
-    let mut lines: Vec<Line> = vec![
+    let mut lines: Vec<Line> = Vec::new();
+    // First, so the panel's few rows never clip it: what failed and why.
+    if let Some(PhaseRow::Failed { step, error }) = &r.phase {
+        lines.push(Line::from(Span::styled(
+            // A child's stderr folded into the error may carry newlines.
+            format!("failed at {step}: {}", error.replace('\n', " ")),
+            Style::default().fg(Color::Red),
+        )));
+    }
+    lines.extend([
         kv("container", &r.container),
         kv("workspace", &r.workspace),
         kv("remoteUser", r.remote_user.as_deref().unwrap_or("-")),
         kv("remoteEnv", &r.remote_env_len.to_string()),
         agents_line(r, agent_count),
-    ];
+    ]);
     if r.worktree {
         lines.push(kv2("base", &r.base_folder, "worktree", &r.folder));
     } else {
@@ -2758,6 +2778,87 @@ mod tests {
             .map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// Sandbox `s` with one instance per `(name, status, phase)`.
+    fn phase_app(rows: Vec<(&str, ContainerStatus, Option<PhaseRow>)>) -> App {
+        let instances = rows
+            .into_iter()
+            .map(|(name, status, phase)| InstanceRow {
+                name: name.into(),
+                sandbox: "s".into(),
+                container: format!("devsandbox-{name}"),
+                status,
+                uptime_secs: 0,
+                cpu: None,
+                mem: None,
+                folder: "/f".into(),
+                worktree: false,
+                services: Vec::new(),
+                workspace: "/w".into(),
+                remote_user: None,
+                remote_env_len: 0,
+                base_folder: "/f".into(),
+                drift: false,
+                instance_id: name.into(),
+                dispatcher: None,
+                done: false,
+                phase,
+            })
+            .collect();
+        let sandbox = SandboxRow {
+            name: "s".into(),
+            source: "image x".into(),
+            folder: None,
+            services: Vec::new(),
+            extends: Vec::new(),
+            config_hash: "hash".into(),
+            build_hash: String::new(),
+            issues: Vec::new(),
+            dispatcher: false,
+        };
+        let mut app = App::new(PathBuf::from("/tmp"));
+        app.set_snapshot(Snapshot {
+            instances,
+            sandboxes: vec![sandbox],
+            services: Vec::new(),
+            sandbox_count: 1,
+            runtime_name: "docker",
+            runtime_version: None,
+            collected_at: std::time::Instant::now(),
+            stats: true,
+            error: None,
+        });
+        app
+    }
+
+    /// STATUS shows the phase (widening for a lifecycle step's name) in its
+    /// own colors, and a failed row's Detail says where and why.
+    #[test]
+    fn instance_rows_show_their_phase() {
+        let failed = PhaseRow::Failed { step: "postCreateCommand".into(), error: "exit status 1".into() };
+        let mut app = phase_app(vec![
+            ("bad", running(), Some(failed)),
+            ("busy", ContainerStatus::Missing, Some(PhaseRow::InFlight { step: "postCreateCommand".into() })),
+            ("ok", running(), None),
+        ]);
+        app.on_key(KeyEvent::from(KeyCode::Down)); // onto `bad`
+        let screen = render(&app, 140, 30);
+        let line = |name: &str| screen.lines().find(|l| l.contains(&format!("  {name} "))).unwrap().to_string();
+        assert!(line("bad").contains(" failed "), "{screen}");
+        assert!(line("busy").contains(" postCreateCommand "), "unclipped: {screen}");
+        assert!(line("ok").contains(" running "), "{screen}");
+        assert!(screen.contains("failed at postCreateCommand: exit status 1"), "{screen}");
+        assert!(screen.contains("s rebuild"), "help bar offers the retry: {screen}");
+
+        let style = |i: usize| instance_status_style(&app.snapshot.as_ref().unwrap().instances[i]);
+        assert_eq!(style(0), Style::default().fg(Color::Red).add_modifier(Modifier::BOLD));
+        assert_eq!(style(1), Style::default().fg(Color::Yellow));
+        assert_eq!(style(2), Style::default().fg(Color::Green));
+    }
+
+    fn running() -> ContainerStatus {
+        ContainerStatus::Running("Up".into())
     }
 
     fn inbox_app() -> App {

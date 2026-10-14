@@ -264,7 +264,8 @@ pub struct ChildInfo {
     /// The container's run state from the latest snapshot.
     pub status: Option<String>,
     /// The container exists in the snapshot but isn't up (exited or gone),
-    /// so the header says `(stopped)`; false while its state is unknown.
+    /// so the header says `(stopped)`; false while its state is unknown or
+    /// a phase is set (`status` names it).
     pub stopped: bool,
 }
 
@@ -779,9 +780,11 @@ impl App {
             let snapshot = self.snapshot.as_ref()?;
             snapshot.instances.iter().find(|r| &r.name == name)
         });
-        let status = row.map(|r| r.status.label().to_string());
+        let status = row.map(|r| r.status_label().to_string());
+        // A phase (in flight, failed) says more than `(stopped)`.
         let stopped = row.is_some_and(|r| {
-            matches!(r.status, crate::snapshot::ContainerStatus::Exited(_) | crate::snapshot::ContainerStatus::Missing)
+            r.phase.is_none()
+                && matches!(r.status, crate::snapshot::ContainerStatus::Exited(_) | crate::snapshot::ContainerStatus::Missing)
         });
         Some(ChildInfo { key, name, status, stopped })
     }
@@ -1753,6 +1756,24 @@ mod tests {
             "buttons: [1] Open draft (stopped) ⌂  [2] Post replies  [3] Done ✓  [o] VS Code (stopped)  \
              [t] Terminal (stopped)  [l] Logs  [p] Port (stopped)"
         );
+
+        // A phase names itself instead, and nothing claims to start it.
+        for (phase, label) in [(in_flight("building"), "building"), (failed("postCreateCommand"), "failed")] {
+            app.set_snapshot(snapshot_with_phase(1, ContainerStatus::Missing, phase));
+            let child = app.thread_child(&t).unwrap();
+            assert!(!child.stopped && !app.thread_target_stopped(&t));
+            let text = header_texts(&pane_header(&t, Some(&child), false, 0));
+            assert_eq!(text[2], format!("child inst0  {label}"));
+        }
+        // `t` on it doesn't start it: the status says why.
+        app.set_snapshot(snapshot_with_phase(1, ContainerStatus::Missing, in_flight("building")));
+        app.thread_terminal(&t);
+        assert_eq!(app.status.as_deref(), Some("`inst0` is still building"));
+        assert_eq!(app.take_pending_start(), None);
+        app.set_snapshot(snapshot_with_phase(1, ContainerStatus::Exited("Exited (1)".into()), failed("postStartCommand")));
+        app.thread_terminal(&t);
+        assert_eq!(app.status.as_deref(), Some("`inst0` failed at postStartCommand: rebuild it first (`s` on its row)"));
+        assert_eq!(app.take_pending_start(), None);
 
         // A child key the owner doesn't have stays visible, unresolved, and
         // the target keys go: they'd only say "not found".

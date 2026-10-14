@@ -1028,6 +1028,7 @@ mod tests {
             instance_id: String::new(),
             dispatcher: None,
             done: false,
+            phase: None,
         };
         let rows = vec![
             mk("a", "s", ContainerStatus::Exited("x".into())),

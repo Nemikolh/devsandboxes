@@ -17,7 +17,7 @@ use crate::config::{
     INSTANCE_VARS,
 };
 use crate::runtime::{backend, ContainerRow, NAME_PREFIX};
-use crate::state::{Instance, State};
+use crate::state::{Instance, PhaseView, State};
 
 /// Container liveness, joined from `docker ps` against the state's instance list.
 /// Serializes as an internally-tagged object so JSON consumers switch on
@@ -44,6 +44,40 @@ impl ContainerStatus {
             ContainerStatus::Exited(_) => "exited",
             ContainerStatus::Missing => "missing",
             ContainerStatus::Unknown => "…",
+        }
+    }
+}
+
+/// Where an instance's materialization stands (docs/instance-phase.md),
+/// `Instance::phase_view` as data. Internally tagged on `state`, with
+/// `step` in both variants so a consumer reads it the same way:
+/// `{"state":"in-flight","step":"building"}`,
+/// `{"state":"failed","step":"postCreateCommand","error":"…"}`. `step`
+/// is `preparing`, `building`, `creating` or a lifecycle step's name.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "kebab-case")]
+pub enum PhaseRow {
+    /// A live `run`/`rebuild` is at `step`.
+    InFlight { step: String },
+    /// Failed (or interrupted: `error` is "interrupted") at `step`.
+    Failed { step: String, error: String },
+}
+
+impl PhaseRow {
+    /// Short label for a STATUS column: the step in flight, else `failed`.
+    pub fn label(&self) -> &str {
+        match self {
+            PhaseRow::InFlight { step } => step,
+            PhaseRow::Failed { .. } => "failed",
+        }
+    }
+}
+
+impl From<PhaseView> for PhaseRow {
+    fn from(view: PhaseView) -> Self {
+        match view {
+            PhaseView::InFlight(step) => PhaseRow::InFlight { step },
+            PhaseView::Failed { at, error } => PhaseRow::Failed { step: at, error },
         }
     }
 }
@@ -76,6 +110,20 @@ pub struct InstanceRow {
     pub dispatcher: Option<String>,
     /// Marked done (`state::Instance::done`): shown dimmed until removed.
     pub done: bool,
+    /// Still being materialized, or failed; absent once ready. Takes over
+    /// the STATUS column from `status` while set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<PhaseRow>,
+}
+
+impl InstanceRow {
+    /// STATUS column text: the phase while set, else the container's.
+    pub fn status_label(&self) -> &str {
+        match &self.phase {
+            Some(phase) => phase.label(),
+            None => self.status.label(),
+        }
+    }
 }
 
 /// One sandbox row from `devsandboxes.toml`, everything the Instances tree needs to
@@ -635,7 +683,8 @@ pub fn collect_with(dir: &Path, depth: Depth) -> Snapshot {
 
     let mut instances = Vec::with_capacity(state.instances.len());
     for (name, inst) in &state.instances {
-        instances.push(instance_row(name, inst, &ps, &stats, &resolved, now_unix));
+        let phase = inst.phase_view().map(PhaseRow::from);
+        instances.push(instance_row(name, inst, phase, &ps, &stats, &resolved, now_unix));
     }
 
     // Services view: (instance name, persistent id, service list of its
@@ -694,14 +743,13 @@ pub fn collect_with(dir: &Path, depth: Depth) -> Snapshot {
     }
 }
 
-/// The runtime's server version, cached for the process once it answers (a
-/// failure is retried next collection, so a runtime that starts late still
-/// shows up).
-/// Join one state entry with the runtime listing, stats and its resolved
-/// sandbox (`resolved`: name → (services, config hash, build hash)).
+/// Join one state entry with its phase (`Instance::phase_view`, passed in so
+/// the join stays free of pid/boot probes), the runtime listing, stats and its
+/// resolved sandbox (`resolved`: name → (services, config hash, build hash)).
 fn instance_row(
     name: &str,
     inst: &crate::state::Instance,
+    phase: Option<PhaseRow>,
     ps: &[ContainerRow],
     stats: &BTreeMap<String, (String, String)>,
     resolved: &BTreeMap<String, (Vec<String>, String, String)>,
@@ -735,9 +783,13 @@ fn instance_row(
         instance_id: inst.instance_id.clone(),
         dispatcher: inst.dispatcher.clone(),
         done: inst.done.is_some(),
+        phase,
     }
 }
 
+/// The runtime's server version, cached for the process once it answers (a
+/// failure is retried next collection, so a runtime that starts late still
+/// shows up).
 fn runtime_version(rt: &dyn crate::runtime::Backend) -> Option<String> {
     static CACHED: Mutex<Option<String>> = Mutex::new(None);
     let mut cached = CACHED.lock().unwrap_or_else(|e| e.into_inner());
@@ -797,13 +849,47 @@ extends = "does-not-exist"
         )
         .unwrap();
         let (ps, stats, resolved) = (Vec::new(), BTreeMap::new(), BTreeMap::new());
-        let row = instance_row("a", &state.instances["a"], &ps, &stats, &resolved, 0);
+        let row = instance_row("a", &state.instances["a"], None, &ps, &stats, &resolved, 0);
         assert!(!row.done);
         assert_eq!(serde_json::to_value(&row).unwrap()["done"], false);
         state.instances.get_mut("a").unwrap().done = Some(5);
-        let row = instance_row("a", &state.instances["a"], &ps, &stats, &resolved, 0);
+        let row = instance_row("a", &state.instances["a"], None, &ps, &stats, &resolved, 0);
         assert!(row.done);
         assert_eq!(serde_json::to_value(&row).unwrap()["done"], true);
+    }
+
+    /// The phase rides along as given, takes over the STATUS label, and is
+    /// serialized only while set.
+    #[test]
+    fn instance_row_carries_the_phase() {
+        let state: crate::state::State = toml::from_str(
+            "[instance.a]\nsandbox = \"web\"\ncontainer = \"c\"\nfolder = \"/f\"\nworkspace = \"/w\"\ncreated_unix = 0\n",
+        )
+        .unwrap();
+        let inst = &state.instances["a"];
+        let ps = vec![ps_line("c", "Up 1s", "running")];
+        let (stats, resolved) = (BTreeMap::new(), BTreeMap::new());
+
+        let ready = instance_row("a", inst, None, &ps, &stats, &resolved, 0);
+        assert_eq!(ready.status_label(), "running");
+        assert!(serde_json::to_value(&ready).unwrap().get("phase").is_none());
+
+        let building = PhaseView::InFlight("postCreateCommand".into()).into();
+        let row = instance_row("a", inst, Some(building), &ps, &stats, &resolved, 0);
+        assert_eq!(row.status_label(), "postCreateCommand");
+        assert_eq!(row.status, ContainerStatus::Running("Up 1s".into()), "container status kept");
+        assert_eq!(
+            serde_json::to_value(&row).unwrap()["phase"],
+            serde_json::json!({"state": "in-flight", "step": "postCreateCommand"})
+        );
+
+        let failed = PhaseView::Failed { at: "building".into(), error: "interrupted".into() }.into();
+        let row = instance_row("a", inst, Some(failed), &[], &stats, &resolved, 0);
+        assert_eq!(row.status_label(), "failed");
+        assert_eq!(
+            serde_json::to_value(&row).unwrap()["phase"],
+            serde_json::json!({"state": "failed", "step": "building", "error": "interrupted"})
+        );
     }
 
     #[test]

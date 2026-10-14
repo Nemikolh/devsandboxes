@@ -2,10 +2,23 @@
 //! forward) and the pending-request queue `tui::mod` drains onto background
 //! threads.
 
+use crate::snapshot::{InstanceRow, PhaseRow};
 use crate::tui::data::ContainerStatus;
 use crate::tui::prompt::PromptAction;
 
 use super::{App, PortRequest};
+
+/// Why `row` is off-limits to the one-key actions: a live `run`/`rebuild`
+/// is materializing it, and anything else would race it (the CLI guards
+/// refuse too, but the dashboard shouldn't offer it). `None` = go.
+fn busy(row: &InstanceRow) -> Option<String> {
+    match &row.phase {
+        Some(PhaseRow::InFlight { step }) => {
+            Some(format!("`{}` is still {}", row.name, crate::commands::doing(step)))
+        }
+        _ => None,
+    }
+}
 
 /// A done-flag write for the event loop (`commands::done::set_saved`, off the
 /// UI thread).
@@ -25,7 +38,8 @@ impl App {
     /// `d` (Instances tab): remove the instance under the cursor right away,
     /// no prompt, via the same suspend path `:rm` takes (non-forced, so `rm`'s
     /// own dirty-worktree refusal and branch-delete question still guard it).
-    /// A no-op off an instance (process rows are filtered by the caller).
+    /// A no-op off an instance (process rows are filtered by the caller),
+    /// and refused while it's in flight; a failed one is removable.
     pub(super) fn remove_instance(&mut self) {
         let Some(i) = self.selected_instance_index() else {
             return;
@@ -33,6 +47,10 @@ impl App {
         let Some(row) = self.snapshot.as_ref().and_then(|s| s.instances.get(i)) else {
             return;
         };
+        if let Some(why) = busy(row) {
+            self.status = Some(why);
+            return;
+        }
         self.pending_action = Some(PromptAction::Rm { instance: row.name.clone(), force: false });
     }
 
@@ -100,6 +118,10 @@ impl App {
     /// the taken name, `rm` destroys the worktree). Rebuild is modal, so it
     /// needs no `starting` in-flight guard — the guard is only for the
     /// background stop/start ops.
+    ///
+    /// The phase comes first: an in-flight instance gets nothing (a status
+    /// line says what it's doing), and a failed one is rebuilt, the retry
+    /// (`rebuild` re-materializes it whatever its container's state).
     pub(super) fn stop_or_start_instance(&mut self) {
         let Some(i) = self.selected_instance_index() else {
             return;
@@ -112,6 +134,14 @@ impl App {
         };
         let name = row.name.clone();
         if self.stopping.contains(&name) || self.starting.contains(&name) {
+            return;
+        }
+        if let Some(why) = busy(row) {
+            self.status = Some(why);
+            return;
+        }
+        if let Some(PhaseRow::Failed { .. }) = row.phase {
+            self.pending_action = Some(PromptAction::Rebuild { instance: name, force: false });
             return;
         }
         match row.status {
@@ -158,19 +188,17 @@ impl App {
 
     /// Help-bar verb for the `s` key, matching what
     /// [`Self::stop_or_start_instance`] would actually do to the instance under
-    /// the cursor: `start` when it is exited or missing (drifted/missing ones
-    /// rebuild, which is still a start from the user's seat), `stop` otherwise.
+    /// the cursor: `wait` while it's in flight, `rebuild` once failed, `start`
+    /// when it is exited or missing (drifted/missing ones rebuild, which is
+    /// still a start from the user's seat), `stop` otherwise.
     pub fn stop_start_hint(&self) -> &'static str {
-        let startable = self
-            .selected_instance_index()
-            .and_then(|i| self.snapshot.as_ref()?.instances.get(i))
-            .is_some_and(|row| {
-                matches!(
-                    row.status,
-                    ContainerStatus::Exited(_) | ContainerStatus::Missing
-                )
-            });
-        if startable { "start" } else { "stop" }
+        let row = self.selected_instance_index().and_then(|i| self.snapshot.as_ref()?.instances.get(i));
+        match row {
+            Some(InstanceRow { phase: Some(PhaseRow::InFlight { .. }), .. }) => "wait",
+            Some(InstanceRow { phase: Some(PhaseRow::Failed { .. }), .. }) => "rebuild",
+            Some(row) if matches!(row.status, ContainerStatus::Exited(_) | ContainerStatus::Missing) => "start",
+            _ => "stop",
+        }
     }
 
     /// Take the pending background stop for the event loop to spawn, if any.
@@ -464,6 +492,46 @@ mod tests {
         assert_eq!(app.stop_start_hint(), "stop");
         app.set_snapshot(snapshot_with_status(1, ContainerStatus::Missing));
         assert_eq!(app.stop_start_hint(), "start");
+    }
+
+    /// An in-flight row offers nothing that would race the build: `s` and
+    /// `d` only say what it's doing, whatever its container does.
+    #[test]
+    fn s_and_d_on_an_in_flight_instance_queue_nothing() {
+        for status in [ContainerStatus::Missing, running(), ContainerStatus::Exited("Exited (1)".into())] {
+            let mut app = new_app();
+            app.set_snapshot(snapshot_with_phase(1, status, in_flight("postCreateCommand")));
+            app.on_key(key(KeyCode::Down)); // onto inst0
+            assert_eq!(app.stop_start_hint(), "wait");
+            app.on_key(key(KeyCode::Char('s')));
+            assert_eq!(app.status.as_deref(), Some("`inst0` is still running postCreateCommand"));
+            app.on_key(key(KeyCode::Char('d')));
+            assert_eq!(app.status.as_deref(), Some("`inst0` is still running postCreateCommand"));
+            assert_eq!(app.take_pending_action(), None);
+            assert_eq!(app.take_pending_stop(), None);
+            assert_eq!(app.take_pending_start(), None);
+        }
+    }
+
+    /// A failed row retries with `s` (a rebuild, even over a running or
+    /// exited container) and removes with `d`.
+    #[test]
+    fn s_rebuilds_and_d_removes_a_failed_instance() {
+        for status in [ContainerStatus::Missing, running(), ContainerStatus::Exited("Exited (1)".into())] {
+            let mut app = new_app();
+            app.set_snapshot(snapshot_with_phase(1, status, failed("postCreateCommand")));
+            app.on_key(key(KeyCode::Down)); // onto inst0
+            assert_eq!(app.stop_start_hint(), "rebuild");
+            app.on_key(key(KeyCode::Char('s')));
+            assert_eq!(
+                app.take_pending_action(),
+                Some(PromptAction::Rebuild { instance: "inst0".into(), force: false })
+            );
+            assert_eq!(app.take_pending_stop(), None);
+            assert_eq!(app.take_pending_start(), None);
+            app.on_key(key(KeyCode::Char('d')));
+            assert_eq!(app.take_pending_action(), Some(PromptAction::Rm { instance: "inst0".into(), force: false }));
+        }
     }
 
     #[test]

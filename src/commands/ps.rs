@@ -6,17 +6,21 @@ use serde::Serialize;
 use crate::commands::status::Envelope;
 use crate::render::table;
 use crate::runtime::{backend, ContainerRow, NAME_PREFIX};
-use crate::state::State;
+use crate::snapshot::PhaseRow;
+use crate::state::{Instance, PhaseView, State};
 
 const HEADERS: [&str; 3] = ["NAME", "IMAGE", "STATUS"];
 
-/// One `ps --json` row: the runtime's listing plus the one state fact `ps`
-/// shows, whether the container's instance is done.
+/// One `ps --json` row: the runtime's listing plus the state facts `ps`
+/// shows: whether the container's instance is done, and its phase while it
+/// is being materialized or failed (`snapshot::PhaseRow`, absent when ready).
 #[derive(Debug, Serialize)]
 struct PsRow {
     #[serde(flatten)]
     row: ContainerRow,
     done: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase: Option<PhaseRow>,
 }
 
 pub fn ps(all: bool, json: bool) -> Result<()> {
@@ -24,7 +28,7 @@ pub fn ps(all: bool, json: bool) -> Result<()> {
     rows.sort_by(|a, b| a.name.cmp(&b.name));
     // Best-effort: `ps` is a runtime listing, so an unreadable state file
     // only loses the done marks.
-    let rows = join_done(rows, &State::load().unwrap_or_default());
+    let rows = join_state(rows, &State::load().unwrap_or_default(), Instance::phase_view);
     if json {
         let out = serde_json::to_string_pretty(&Envelope::new(rows)).context("serialize ps")?;
         println!("{out}");
@@ -35,17 +39,32 @@ pub fn ps(all: bool, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// Mark the rows whose container is a done instance's, by container name
-/// (service containers are never in state, so never done).
-fn join_done(rows: Vec<ContainerRow>, state: &State) -> Vec<PsRow> {
+/// Join the rows with their instance by container name: done marks and the
+/// phase (`phase` is `Instance::phase_view`, injected so tests don't probe
+/// pids). Service containers are never in state, so neither applies to them.
+/// A listing, so an instance without a container (yet) has no row.
+fn join_state(rows: Vec<ContainerRow>, state: &State, phase: impl Fn(&Instance) -> Option<PhaseView>) -> Vec<PsRow> {
     let done: BTreeSet<&str> =
         state.instances.values().filter(|i| i.done.is_some()).map(|i| i.container.as_str()).collect();
-    rows.into_iter().map(|row| PsRow { done: done.contains(row.name.as_str()), row }).collect()
+    rows.into_iter()
+        .map(|row| {
+            let inst = state.instances.values().find(|i| i.container == row.name);
+            let phase = inst.and_then(&phase).map(PhaseRow::from);
+            PsRow { done: done.contains(row.name.as_str()), phase, row }
+        })
+        .collect()
 }
 
-/// Table cells; a done instance's STATUS gets a `(done)` suffix.
+/// Table cells. STATUS is the phase while set (the step in flight, or
+/// `failed (<step>)`) instead of the runtime's text; a done instance's gets
+/// a `(done)` suffix.
 fn cells(r: PsRow) -> [String; 3] {
-    let status = if r.done { format!("{} (done)", r.row.status) } else { r.row.status };
+    let status = match r.phase {
+        Some(PhaseRow::InFlight { step }) => step,
+        Some(PhaseRow::Failed { step, .. }) => format!("failed ({step})"),
+        None => r.row.status,
+    };
+    let status = if r.done { format!("{status} (done)") } else { status };
     [r.row.name, r.row.image, status]
 }
 
@@ -65,7 +84,7 @@ mod tests {
         )
         .unwrap();
         state.instances.get_mut("a").unwrap().done = Some(1);
-        let rows = join_done(vec![row("devsandbox-a"), row("devsandbox-b"), row("devsandbox-svc-redis")], &state);
+        let rows = join_state(vec![row("devsandbox-a"), row("devsandbox-b"), row("devsandbox-svc-redis")], &state, |_| None);
         let done: Vec<bool> = rows.iter().map(|r| r.done).collect();
         assert_eq!(done, [true, false, false]);
         let json = serde_json::to_value(&rows[0]).unwrap();
@@ -74,5 +93,26 @@ mod tests {
         let table: Vec<[String; 3]> = rows.into_iter().map(cells).collect();
         assert_eq!(table[0][2], "Up 1 hour (done)");
         assert_eq!(table[1][2], "Up 1 hour");
+    }
+
+    #[test]
+    fn the_phase_replaces_the_runtime_status() {
+        let state: State = toml::from_str(
+            "[instance.a]\nsandbox = \"web\"\ncontainer = \"devsandbox-a\"\nfolder = \"/f\"\nworkspace = \"/w\"\ncreated_unix = 0\n\
+             [instance.b]\nsandbox = \"web\"\ncontainer = \"devsandbox-b\"\nfolder = \"/f\"\nworkspace = \"/w\"\ncreated_unix = 0\n",
+        )
+        .unwrap();
+        let phase = |i: &Instance| match i.container.as_str() {
+            "devsandbox-a" => Some(PhaseView::InFlight("postCreateCommand".into())),
+            _ => Some(PhaseView::Failed { at: "postStartCommand".into(), error: "exit status 1".into() }),
+        };
+        let rows = join_state(vec![row("devsandbox-a"), row("devsandbox-b"), row("devsandbox-svc-redis")], &state, phase);
+        let json = serde_json::to_value(&rows[1]).unwrap();
+        assert_eq!(json["phase"], serde_json::json!({"state": "failed", "step": "postStartCommand", "error": "exit status 1"}));
+        assert!(serde_json::to_value(&rows[2]).unwrap().get("phase").is_none(), "service: no phase");
+        let table: Vec<[String; 3]> = rows.into_iter().map(cells).collect();
+        assert_eq!(table[0][2], "postCreateCommand");
+        assert_eq!(table[1][2], "failed (postStartCommand)");
+        assert_eq!(table[2][2], "Up 1 hour");
     }
 }

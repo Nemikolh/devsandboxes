@@ -120,6 +120,22 @@ PTY, so two gaps closed after the read verbs:
   uses (`SHELL_FALLBACK_CMD`), defaulting to `-i` plus `-t` when stdin is a TTY (explicit flags win),
   and the npm package's `execArgv()` returns `{file, args}` to spawn directly.
 
+## Added after: instance phase
+
+An instance that's still being created, or failed (docs/instance-phase.md),
+carries a `phase` on its `status --json` `InstanceRow` and on its
+container's `ps --json` row; absent once ready:
+
+```json
+"phase": {"state": "in-flight", "step": "building"}
+"phase": {"state": "failed", "step": "postCreateCommand", "error": "…"}
+```
+
+`step` is `preparing`, `building`, `creating` or a lifecycle step's name;
+`error` is `interrupted` when the process creating it died. Additive, so
+`schema` stays 1. `ps` is a runtime listing: an instance with no container
+yet has no `ps` row (its `status --json` row has the phase).
+
 ## Added after: `inbox ls` / `inbox show`
 
 `devsandbox inbox ls --json` and `inbox show <thread> --json` print the

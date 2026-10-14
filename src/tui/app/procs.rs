@@ -349,6 +349,7 @@ mod tests {
             instance_id: String::new(),
             dispatcher: None,
             done: false,
+            phase: None,
         };
         let snap = Snapshot {
             instances: vec![
@@ -445,6 +446,7 @@ mod tests {
             instance_id: String::new(),
             dispatcher: None,
             done: false,
+            phase: None,
         };
         app.set_snapshot(Snapshot {
             instances: vec![row],

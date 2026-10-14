@@ -239,6 +239,7 @@ mod tests {
             instance_id: String::new(),
             dispatcher: None,
             done: false,
+            phase: None,
         }
     }
 

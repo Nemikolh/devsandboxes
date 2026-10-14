@@ -54,6 +54,7 @@ pub(super) fn snapshot_with(n: usize) -> Snapshot {
             instance_id: String::new(),
             dispatcher: None,
             done: false,
+            phase: None,
         })
         .collect();
     let sandboxes = vec![SandboxRow {
@@ -130,6 +131,7 @@ pub(super) fn orphan_snapshot() -> Snapshot {
         instance_id: String::new(),
         dispatcher: None,
         done: false,
+        phase: None,
     }];
     Snapshot {
         instances,
@@ -159,6 +161,23 @@ pub(super) fn snapshot_with_status(n: usize, status: ContainerStatus) -> Snapsho
 
 pub(super) fn running() -> ContainerStatus {
     ContainerStatus::Running("Up".into())
+}
+
+/// `snapshot_with(n)` with every instance at `phase` over a `status` container.
+pub(super) fn snapshot_with_phase(n: usize, status: ContainerStatus, phase: crate::snapshot::PhaseRow) -> Snapshot {
+    let mut snap = snapshot_with_status(n, status);
+    for row in &mut snap.instances {
+        row.phase = Some(phase.clone());
+    }
+    snap
+}
+
+pub(super) fn in_flight(step: &str) -> crate::snapshot::PhaseRow {
+    crate::snapshot::PhaseRow::InFlight { step: step.into() }
+}
+
+pub(super) fn failed(step: &str) -> crate::snapshot::PhaseRow {
+    crate::snapshot::PhaseRow::Failed { step: step.into(), error: "exit status 1".into() }
 }
 
 /// Seed the proc cache + expansion for an instance so proc rows are visible
