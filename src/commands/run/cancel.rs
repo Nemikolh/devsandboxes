@@ -54,6 +54,56 @@ pub(crate) fn check() -> Result<()> {
     Ok(())
 }
 
+/// Why [`cancel_instance`] signalled nothing.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum NotCancelled {
+    /// No such instance in the state.
+    Unknown,
+    /// Not in flight (ready, failed, or its pid is gone): nothing to cancel.
+    Done,
+    /// The signal itself failed.
+    Signal(String),
+}
+
+/// Cancel `instance`'s in-flight `run`/`rebuild` from outside it: `signal`
+/// (production: [`interrupt`]) its recorded pid, returned. Only while
+/// `state` (read fresh by the caller) says it's in flight, so a pid recycled
+/// since the build ended isn't signalled. The command then rolls back
+/// (`run`) or records failed. Shared by the dashboard's `d` and the daemon's
+/// `instances.cancel`; `signal` is injected so tests signal nothing real.
+pub(crate) fn cancel_instance(
+    state: &crate::state::State,
+    instance: &str,
+    signal: impl FnOnce(u32) -> std::result::Result<(), String>,
+) -> std::result::Result<u32, NotCancelled> {
+    let info = state.instances.get(instance).ok_or(NotCancelled::Unknown)?;
+    match (&info.progress, info.phase_view()) {
+        (Some(p), Some(crate::state::PhaseView::InFlight(_))) => {
+            signal(p.pid).map(|()| p.pid).map_err(NotCancelled::Signal)
+        }
+        _ => Err(NotCancelled::Done),
+    }
+}
+
+/// SIGINT `pid`'s process group (a detached or daemon-run verb leads its
+/// own, so docker and git under it get it too), else `pid` alone (a CLI run
+/// started from a shell pipeline isn't a group leader).
+#[cfg(unix)]
+pub(crate) fn interrupt(pid: u32) -> std::result::Result<(), String> {
+    // 0 and 1 would be our own group and init.
+    let pid = libc::pid_t::try_from(pid).ok().filter(|&p| p > 1).ok_or(format!("bad pid {pid}"))?;
+    // SAFETY: plain syscalls on integers.
+    if unsafe { libc::kill(-pid, libc::SIGINT) } == 0 || unsafe { libc::kill(pid, libc::SIGINT) } == 0 {
+        return Ok(());
+    }
+    Err(format!("SIGINT to pid {pid}: {}", std::io::Error::last_os_error()))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn interrupt(_pid: u32) -> std::result::Result<(), String> {
+    Err("not supported on this platform".into())
+}
+
 #[cfg(unix)]
 mod imp {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -220,5 +270,34 @@ mod imp {
 
             restore(sig, &original);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state(phase: &str, pid: u32) -> crate::state::State {
+        toml::from_str(&format!(
+            "[instance.w]\nsandbox = \"web\"\ncontainer = \"devsandbox-w\"\nfolder = \"/w\"\nworkspace = \"/w\"\n\
+             created_unix = 1\n[instance.w.progress]\nphase = \"{phase}\"\npid = {pid}\n"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn cancel_signals_only_an_in_flight_instance() {
+        // Our own pid reads as alive; the fake signal sends nothing.
+        let me = std::process::id();
+        let mut sent = Vec::new();
+        assert_eq!(cancel_instance(&state("building", me), "w", |p| Ok(sent.push(p))), Ok(me));
+        assert_eq!(sent, [me]);
+        let refuse = |_| -> std::result::Result<(), String> { panic!("signalled") };
+        assert_eq!(cancel_instance(&state("building", me), "nope", refuse), Err(NotCancelled::Unknown));
+        assert_eq!(cancel_instance(&state("failed", me), "w", refuse), Err(NotCancelled::Done));
+        // A dead pid (beyond any pid_max) is interrupted, not in flight.
+        assert_eq!(cancel_instance(&state("building", 999_999_999), "w", refuse), Err(NotCancelled::Done));
+        let failing = |_| Err("EPERM".to_string());
+        assert_eq!(cancel_instance(&state("creating", me), "w", failing), Err(NotCancelled::Signal("EPERM".into())));
     }
 }

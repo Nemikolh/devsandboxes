@@ -15,7 +15,12 @@ use crate::state::{FolderMount, State};
 /// (`git worktree remove --force`) and turns a failed teardown step into a
 /// warning, so the instance always leaves state. `host_git`'s repo checks
 /// still apply: a refused repo keeps its worktree on disk, with a warning.
-pub fn rm(name: &str, delete_branch: Option<bool>, force: bool) -> Result<()> {
+///
+/// `fail_on_ask` (`rm --fail-on-ask`, the daemon's `ask: true`): where the
+/// branch question would come up, fail with [`NeedsAnswer`] instead, before
+/// anything is torn down, so the client can ask on its own TTY and resend
+/// with an answer.
+pub fn rm(name: &str, delete_branch: Option<bool>, force: bool, fail_on_ask: bool) -> Result<()> {
     let state = State::load()?;
 
     let key = resolve_instance(&state, name)?;
@@ -57,6 +62,9 @@ pub fn rm(name: &str, delete_branch: Option<bool>, force: bool) -> Result<()> {
         }
         branch_action(delete_branch, remote_state(&base_folder, &p.branch))
     });
+    if let (Some(plan), Some(action)) = (&plan, &action) {
+        check_ask(action, plan, fail_on_ask)?;
+    }
 
     remove_container(&container, &project, &instance_id);
 
@@ -95,14 +103,7 @@ pub fn rm(name: &str, delete_branch: Option<bool>, force: bool) -> Result<()> {
             let delete = match action {
                 BranchAction::Delete => true,
                 BranchAction::Keep => false,
-                BranchAction::Ask => {
-                    let also = plan.also.as_ref().map(|s| format!(" (and `{s}`, merged into it)"));
-                    confirm(&format!(
-                        "delete branch `{}`{}? it has commits not on its remote",
-                        plan.branch,
-                        also.unwrap_or_default()
-                    ))?
-                }
+                BranchAction::Ask => confirm(&question(&plan))?,
             };
             if delete {
                 for branch in std::iter::once(&plan.branch).chain(&plan.also) {
@@ -261,6 +262,38 @@ fn branch_action(flag: Option<bool>, remote: RemoteState) -> BranchAction {
         (None, RemoteState::InSync | RemoteState::Gone) => BranchAction::Delete,
         (None, RemoteState::Unsynced) => BranchAction::Ask,
     }
+}
+
+/// The exit code of `rm --fail-on-ask` that hit the branch question: the
+/// daemon tells it from any other failure (`confirm`, not `failed`).
+pub const NEEDS_ANSWER_EXIT: i32 = 3;
+
+/// `rm --fail-on-ask` reached the branch question; the message is the
+/// question. `main` exits [`NEEDS_ANSWER_EXIT`] on it.
+#[derive(Debug)]
+pub struct NeedsAnswer(pub String);
+
+impl std::fmt::Display for NeedsAnswer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NeedsAnswer {}
+
+/// The branch question, shared by the prompt and [`NeedsAnswer`] so the
+/// client asks exactly what `rm` would have.
+fn question(plan: &BranchPlan) -> String {
+    let also = plan.also.as_ref().map(|s| format!(" (and `{s}`, merged into it)"));
+    format!("delete branch `{}`{}? it has commits not on its remote", plan.branch, also.unwrap_or_default())
+}
+
+/// Whether `rm` must stop for an answer it may not prompt for.
+fn check_ask(action: &BranchAction, plan: &BranchPlan, fail_on_ask: bool) -> Result<()> {
+    if fail_on_ask && *action == BranchAction::Ask {
+        return Err(NeedsAnswer(question(plan)).into());
+    }
+    Ok(())
 }
 
 /// Refresh `origin` and drop remote-tracking refs of deleted branches, so a
@@ -464,6 +497,21 @@ mod tests {
         assert_eq!(branch_action(None, InSync), Delete);
         assert_eq!(branch_action(None, Gone), Delete);
         assert_eq!(branch_action(None, Unsynced), Ask);
+    }
+
+    #[test]
+    fn fail_on_ask_fails_with_the_question_only_where_rm_would_ask() {
+        let plan = BranchPlan { branch: "sandbox/w".into(), also: Some("feat/x".into()) };
+        let q = "delete branch `sandbox/w` (and `feat/x`, merged into it)? it has commits not on its remote";
+        assert_eq!(question(&plan), q);
+        let err = check_ask(&BranchAction::Ask, &plan, true).unwrap_err();
+        assert_eq!(err.downcast_ref::<NeedsAnswer>().map(|n| n.0.as_str()), Some(q));
+        assert_eq!(err.to_string(), q);
+        assert!(check_ask(&BranchAction::Ask, &plan, false).is_ok(), "no flag: the prompt");
+        assert!(check_ask(&BranchAction::Delete, &plan, true).is_ok());
+        assert!(check_ask(&BranchAction::Keep, &plan, true).is_ok());
+        let plain = BranchPlan { branch: "b".into(), also: None };
+        assert_eq!(question(&plain), "delete branch `b`? it has commits not on its remote");
     }
 
     /// Base clone of a bare remote, with a worktree on `sandbox/r` as `run`

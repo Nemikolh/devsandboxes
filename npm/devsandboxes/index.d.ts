@@ -622,6 +622,22 @@ export interface ForwardAdded {
   target: string;
 }
 
+/** `instances.resolve`'s answer: every instance the name could mean, sorted (several: the caller picks). */
+export interface InstancesResolved {
+  matches: string[];
+}
+
+/** `instances.cancel`'s answer: the in-flight verb's pid was SIGINTed. */
+export interface InstanceCancelled {
+  ok: true;
+  pid: number;
+}
+
+/** One `sandboxes.list` entry (not the snapshot's {@link SandboxRow}). */
+export interface SandboxEntry {
+  name: string;
+}
+
 /** What `forwards.rm()` stopped. */
 export interface ForwardRemoved {
   ok: true;
@@ -698,6 +714,8 @@ export interface RmParams extends VerbParams {
   /** `true` deletes the branch, `false` keeps it; absent: merged or gone branches go, local work stays. */
   deleteBranch?: boolean | null;
   force?: boolean;
+  /** Where the branch question would come up, answer `confirm` (the question as its `message`) having removed nothing; resend with `deleteBranch`. */
+  ask?: boolean;
 }
 
 /** A verb's answer once it exited 0. */
@@ -790,6 +808,12 @@ export interface ApiMethods {
   'inbox.notify.dismiss': { params: NotifyTarget; result: OkResult };
   'inbox.notify.markRead': { params: NotifyTarget; result: OkResult };
   'instances.list': { params: { dir: string }; result: Snapshot };
+  /** `not-found` when nothing matches. */
+  'instances.resolve': { params: { name: string }; result: InstancesResolved };
+  /** SIGINT an in-flight `run`/`rebuild` (it rolls back or records failed); `invalid` when not in flight. */
+  'instances.cancel': { params: { instance: string }; result: InstanceCancelled };
+  /** The config root's sandboxes, sorted; `[]` without a config file. */
+  'sandboxes.list': { params: { root: string }; result: SandboxEntry[] };
   'forwards.list': { params: { dir?: string }; result: ForwardRow[] };
   'forwards.add': { params: ForwardAddParams; result: ForwardAdded };
   'forwards.rm': { params: { id: number }; result: ForwardRemoved };
@@ -888,4 +912,6 @@ export declare class DevsandboxApiError extends Error {
   readonly code: string;
   /** The method called; `hello` for a failed connect. */
   readonly method: string;
+  /** The error body's `data`, when its code carries some ({@link VerbFailedData} for `failed`). */
+  readonly data?: unknown;
 }

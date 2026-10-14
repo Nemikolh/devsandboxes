@@ -70,7 +70,7 @@ know. A breaking change bumps `protocol`; check it after the hello.
 
 `{"id":n,"error":{"code":"…","message":"…"}}`. `message` is for humans;
 match on `code`. Some codes add a `data` object (`failed`: *Verbs*); it's
-absent otherwise.
+absent otherwise (`confirm` included).
 
 | code | |
 |---|---|
@@ -82,6 +82,7 @@ absent otherwise.
 | `conflict` | reserved |
 | `bind-failed` | a forward's host port couldn't be bound (in use, privileged, an address not on this host) |
 | `failed` | a verb exited non-zero; `data`: `{"exit": n, "instance": name \| null}` (*Verbs*) |
+| `confirm` | an `rm` sent with `ask: true` needs an answer; `message` is the question, nothing was removed (*Verbs*) |
 | `internal` | the daemon failed (store unreadable, …); logged in `serve.log` |
 
 ## Threads
@@ -231,6 +232,40 @@ can take a moment.
 Errors: `invalid` (missing or relative `dir`), `not-found` (no such
 directory).
 
+### `instances.resolve`
+
+Params: `{"name": "<name>"}`, as the CLI's `<name>` takes it. Result:
+`{"matches": ["web", "web-2"]}`, sorted: an exact instance name or id if
+any matches, else every instance of that sandbox or folder basename. Two or
+more is the caller's to pick from (the CLI prompts on its TTY), not an
+error; then it sends the chosen name to a verb.
+
+Errors: `not-found` (nothing matches), `invalid` (no `name`).
+
+### `instances.cancel`
+
+Params: `{"instance": "<name>"}`, an exact instance name (resolve first).
+SIGINTs the process recorded as building it (its process group, else the
+pid alone), whoever started it; `run` then rolls back, `rebuild` records the
+instance failed (`docs/instance-phase.md`). Read fresh from `state.toml`,
+and only while the instance is in flight, so a recycled pid isn't
+signalled. Result: `{"ok": true, "pid": n}`, before the verb has stopped:
+its own request answers once it has.
+
+Errors: `not-found` (no such instance), `invalid` (not building any more:
+ready, failed, or its process is gone), `internal` (the signal failed).
+
+## Sandboxes
+
+### `sandboxes.list`
+
+Params: `{"root": "/abs/path/to/config-root"}`. Result: the config's
+sandboxes, sorted by name: `[{"name": "web"}, …]` (objects, so fields can
+be added). A root without a config file has none: `[]`.
+
+Errors: `invalid` (missing or relative `root`, or a config that doesn't
+load: the message says why), `not-found` (no such directory).
+
 ## Bridges
 
 ### `bridges.ensure`
@@ -360,7 +395,7 @@ and `HOME` are the caller's, never the daemon's.
 | `rebuild` | `instance` \| `all: true`, `force?`, `detach?` |
 | `start` | `instance` \| `all: true`, `detach?` |
 | `stop` | `instance` \| `all: true` |
-| `rm` | `instance`, `deleteBranch?` (`true` deletes, `false` keeps, absent: merged or gone branches go, local work stays), `force?` |
+| `rm` | `instance`, `deleteBranch?` (`true` deletes, `false` keeps, absent: merged or gone branches go, local work stays), `force?`, `ask?` |
 
 `root` is the absolute config root (`-C`); `env` an object of strings,
 required. `instance` is resolved as the CLI's `<name>` is, but an
@@ -380,6 +415,12 @@ verb recorded its progress on, else the one the request named (`null` for
 `all`, or a name that doesn't resolve). A non-zero exit is the error
 `failed`, its `message` the verb's last `Error:` line (causes joined with
 `: `), `data.exit` the exit code (128 + the signal when killed).
+
+**`rm`'s question**: without `deleteBranch`, `rm` asks before deleting a
+branch with commits not on its remote, and off a TTY (as here) keeps it.
+With `"ask": true` it answers the error `confirm` instead, `message` the
+question, having removed nothing; the client asks its user and resends with
+`deleteBranch` set. Without `ask`, the non-TTY default applies.
 
 **Detach** (`run`, `rebuild`, `start`): `"detach": true` answers early,
 `{"instance": name | null, "detached": true}`, while the verb runs on:

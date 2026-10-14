@@ -121,6 +121,11 @@ enum Command {
         /// or when a teardown step fails (warned, then skipped)
         #[arg(short, long)]
         force: bool,
+        /// Where the branch question would come up, fail (exit 3, the
+        /// question as the error) before removing anything: the daemon's
+        /// `rm` with `ask`, so the client asks on its own TTY
+        #[arg(long, hide = true)]
+        fail_on_ask: bool,
     },
     /// Stop a sandbox instance (docker stop; `start` restarts it)
     Stop {
@@ -448,8 +453,17 @@ fn main() -> Result<()> {
             result
         }
         Command::Rename { name, new_name } => commands::rename::rename(&name, &new_name),
-        Command::Rm { name, delete_branch, keep_branch, force } => {
-            commands::rm::rm(&name, rm_branch_flag(delete_branch, keep_branch), force)
+        Command::Rm { name, delete_branch, keep_branch, force, fail_on_ask } => {
+            let result = commands::rm::rm(&name, rm_branch_flag(delete_branch, keep_branch), force, fail_on_ask);
+            match result {
+                // Printed as `main`'s own `Err` would be (`serve::verbs`
+                // parses that line), with its own exit code.
+                Err(e) if e.is::<commands::rm::NeedsAnswer>() => {
+                    eprintln!("Error: {e:?}");
+                    std::process::exit(commands::rm::NEEDS_ANSWER_EXIT);
+                }
+                result => result,
+            }
         }
         Command::Stop { name, all } => commands::stop::stop(name, all),
         Command::Start { name, all } => {

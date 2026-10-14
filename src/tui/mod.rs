@@ -660,7 +660,7 @@ fn run_suspended(terminal: &mut Term, dir: &Path, action: PromptAction) -> Resul
         PromptAction::Exec { instance, argv } => {
             commands::exec::exec_status(instance, true, true, argv).map(|_| ())
         }
-        PromptAction::Rm { instance, force } => commands::rm::rm(instance, None, *force),
+        PromptAction::Rm { instance, force } => commands::rm::rm(instance, None, *force, false),
         PromptAction::Stop { instance } => commands::stop::stop(Some(instance.clone()), false),
         PromptAction::ServiceRebuild { name } => commands::services::rebuild(dir, name),
         // `code`/`rename` never suspend, nor do `run`/`rebuild`/`start`
@@ -908,47 +908,24 @@ fn last_error_line(stderr: &str) -> Option<String> {
     Some(line.strip_prefix("error: ").unwrap_or(line).to_string())
 }
 
-/// Spawn a thread that cancels `instance`'s build: SIGINT to its recorded
-/// pid's process group (a detached build leads its own, so docker and git
-/// under it get it too), else to the pid alone (one started from a shell
-/// pipeline). The command then rolls back (`run`) or records failed. Read
-/// fresh from state, and only while still in flight, so a pid recycled
-/// since the snapshot isn't signalled.
+/// Spawn a thread that cancels `instance`'s build (`cancel_instance` on a
+/// fresh state read, so a pid recycled since the snapshot isn't signalled).
 fn spawn_cancel(instance: String) -> Receiver<OpDone> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
+        use crate::commands::run::cancel::{NotCancelled, cancel_instance, interrupt};
         let status = match crate::state::State::load() {
-            Ok(state) => match state.instances.get(&instance) {
-                Some(info) => match (&info.progress, info.phase_view()) {
-                    (Some(p), Some(crate::state::PhaseView::InFlight(_))) => interrupt(p.pid)
-                        .map(|()| format!("cancelling {instance} (SIGINT to pid {})", p.pid))
-                        .unwrap_or_else(|e| format!("cancel {instance}: {e}")),
-                    _ => format!("cancel {instance}: not building any more"),
-                },
-                None => format!("cancel {instance}: unknown instance"),
+            Ok(state) => match cancel_instance(&state, &instance, interrupt) {
+                Ok(pid) => format!("cancelling {instance} (SIGINT to pid {pid})"),
+                Err(NotCancelled::Done) => format!("cancel {instance}: not building any more"),
+                Err(NotCancelled::Unknown) => format!("cancel {instance}: unknown instance"),
+                Err(NotCancelled::Signal(e)) => format!("cancel {instance}: {e}"),
             },
             Err(e) => format!("cancel {instance}: {e:#}"),
         };
         let _ = tx.send(OpDone { status, failed: false });
     });
     rx
-}
-
-/// SIGINT `pid`'s process group, else `pid`.
-#[cfg(unix)]
-fn interrupt(pid: u32) -> std::result::Result<(), String> {
-    // 0 and 1 would be our own group and init.
-    let pid = libc::pid_t::try_from(pid).ok().filter(|&p| p > 1).ok_or(format!("bad pid {pid}"))?;
-    // SAFETY: plain syscalls on integers.
-    if unsafe { libc::kill(-pid, libc::SIGINT) } == 0 || unsafe { libc::kill(pid, libc::SIGINT) } == 0 {
-        return Ok(());
-    }
-    Err(format!("SIGINT to pid {pid}: {}", io::Error::last_os_error()))
-}
-
-#[cfg(not(unix))]
-fn interrupt(_pid: u32) -> std::result::Result<(), String> {
-    Err("not supported on this platform".into())
 }
 
 /// Hand `link` to the desktop opener (`open` on macOS, `xdg-open` elsewhere),

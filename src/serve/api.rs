@@ -104,6 +104,11 @@ pub fn call(method: &str, params: Value, ctx: &Ctx) -> Answer {
         "inbox.notify.dismiss" => dismiss(parse(params)?, ctx),
         "inbox.notify.markRead" => notify_mark_read(parse(params)?, ctx),
         "instances.list" => instances_list(parse(params)?),
+        "instances.resolve" => instances_resolve(parse(params)?, &state_path()?),
+        "instances.cancel" => {
+            instances_cancel(parse(params)?, &state_path()?, crate::commands::run::cancel::interrupt)
+        }
+        "sandboxes.list" => sandboxes_list(parse(params)?),
         "bridges.ensure" => bridges_ensure(parse(params)?, ctx),
         "forwards.list" => forwards_list(parse(params)?, ctx),
         "forwards.add" => forwards_add(parse(params)?, ctx),
@@ -178,8 +183,26 @@ pub struct ForwardRemoved {
     pub configured: bool,
 }
 
+/// `instances.resolve`'s answer.
+#[derive(Debug, Serialize)]
+pub struct Resolved {
+    /// Every instance the name could mean, sorted: one, or the choices.
+    pub matches: Vec<String>,
+}
 
+/// `instances.cancel`'s answer.
+#[derive(Debug, Serialize)]
+pub struct Cancelled {
+    pub ok: bool,
+    /// The pid SIGINTed.
+    pub pid: u32,
+}
 
+/// One `sandboxes.list` entry. An object, not a name, so fields can be added.
+#[derive(Debug, Serialize)]
+pub struct SandboxEntry {
+    pub name: String,
+}
 
 // ---- handlers -------------------------------------------------------------
 
@@ -326,6 +349,77 @@ fn instances_list(p: InstancesParams) -> Answer {
         return Err(ApiError::not_found(format!("no directory {}", p.dir.display())));
     }
     serde_json::to_value(crate::snapshot::collect(&p.dir)).map_err(|e| ApiError::internal(e.into()))
+}
+
+/// The user's `state.toml`, as the instance methods read it.
+fn state_path() -> Result<PathBuf, ApiError> {
+    crate::state::State::path().map_err(ApiError::internal)
+}
+
+fn load_state(path: &Path) -> Result<crate::state::State, ApiError> {
+    crate::state::State::load_at(path).map_err(ApiError::internal)
+}
+
+#[derive(Deserialize)]
+struct NameParams {
+    name: String,
+}
+
+/// The instances `name` could mean, in the CLI's tiers
+/// (`commands::instance_matches`): a client picks among several itself, so
+/// ambiguity isn't an error here. `state` is injected for the tests.
+fn instances_resolve(p: NameParams, state: &Path) -> Answer {
+    let matches = crate::commands::instance_matches(&load_state(state)?, &p.name);
+    if matches.is_empty() {
+        return Err(ApiError::not_found(format!("no sandbox instance matches `{}`", p.name)));
+    }
+    serde_json::to_value(Resolved { matches }).map_err(|e| ApiError::internal(e.into()))
+}
+
+#[derive(Deserialize)]
+struct CancelParams {
+    instance: String,
+}
+
+/// SIGINT an instance's in-flight `run`/`rebuild` by its recorded pid
+/// (`cancel::cancel_instance`), whoever started it: the CLI's Ctrl-C on a
+/// second connection, the dashboard, a verb another daemon left running.
+/// `state` and `signal` are injected for the tests.
+fn instances_cancel(p: CancelParams, state: &Path, signal: fn(u32) -> Result<(), String>) -> Answer {
+    use crate::commands::run::cancel::{NotCancelled, cancel_instance};
+    let pid = cancel_instance(&load_state(state)?, &p.instance, signal).map_err(|e| match e {
+        NotCancelled::Unknown => ApiError::not_found(format!("no instance `{}`", p.instance)),
+        NotCancelled::Done => ApiError::invalid(format!("`{}` is not building any more", p.instance)),
+        NotCancelled::Signal(e) => ApiError::internal(anyhow::anyhow!(e)),
+    })?;
+    serde_json::to_value(Cancelled { ok: true, pid }).map_err(|e| ApiError::internal(e.into()))
+}
+
+#[derive(Deserialize)]
+struct SandboxesParams {
+    root: PathBuf,
+}
+
+/// The sandbox names of config root `root`, sorted. No config file is no
+/// sandboxes (the CLI then offers the example config); one that doesn't
+/// load is `invalid`, with why.
+fn sandboxes_list(p: SandboxesParams) -> Answer {
+    if !p.root.is_absolute() {
+        return Err(ApiError::invalid(format!("`root` must be absolute, got `{}`", p.root.display())));
+    }
+    if !p.root.is_dir() {
+        return Err(ApiError::not_found(format!("no directory {}", p.root.display())));
+    }
+    let rows: Vec<SandboxEntry> = match crate::config::find(&p.root) {
+        Ok(None) => Vec::new(),
+        Ok(Some(_)) => {
+            let config = crate::config::Config::load(&p.root).map_err(|e| ApiError::invalid(format!("{e:#}")))?;
+            // A BTreeMap: already sorted.
+            config.sandboxes.into_keys().map(|name| SandboxEntry { name }).collect()
+        }
+        Err(e) => return Err(ApiError::invalid(format!("{e:#}"))),
+    };
+    serde_json::to_value(rows).map_err(|e| ApiError::internal(e.into()))
 }
 
 #[derive(Deserialize)]
@@ -943,6 +1037,95 @@ mod tests {
         assert_eq!(code(run(&path, "instances.list", json!({"dir": "rel/dir"}))), "invalid");
         assert_eq!(code(run(&path, "instances.list", json!({"dir": "/nonexistent/devsandbox-api"}))), "not-found");
         assert_eq!(code(run(&path, "inbox.poll.vote", json!({}))), "unknown-method");
+    }
+
+    fn state_file(name: &str, toml: &str) -> PathBuf {
+        let path = store_path(name).with_file_name("state.toml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, toml).unwrap();
+        path
+    }
+
+    fn instance(key: &str, sandbox: &str, progress: &str) -> String {
+        format!(
+            "[instance.{key}]\nsandbox = \"{sandbox}\"\ncontainer = \"devsandbox-{key}\"\nfolder = \"/w\"\n\
+             workspace = \"/w\"\ncreated_unix = 1\n{progress}"
+        )
+    }
+
+    #[test]
+    fn instances_resolve_returns_every_match_of_the_winning_tier() {
+        let state = state_file("resolve", &[instance("web", "web", ""), instance("web-2", "web", ""), instance("x", "web", "")].concat());
+        let resolve = |params: Value| instances_resolve(parse(params)?, &state);
+        assert_eq!(resolve(json!({"name": "web"})).unwrap(), json!({"matches": ["web"]}), "exact wins");
+        assert_eq!(resolve(json!({"name": "w"})).unwrap(), json!({"matches": ["web", "web-2", "x"]}), "folder basename");
+        assert_eq!(code(resolve(json!({"name": "nope"}))), "not-found");
+        assert_eq!(code(resolve(json!({}))), "invalid");
+        // A missing state file is no instances.
+        let none = instances_resolve(NameParams { name: "web".into() }, &state.with_file_name("absent.toml"));
+        assert_eq!(code(none), "not-found");
+    }
+
+    #[test]
+    fn instances_cancel_signals_only_while_in_flight() {
+        // Our own pid reads as alive; the signal fns send nothing.
+        let me = std::process::id();
+        let progress = |key: &str, phase: &str| format!("[instance.{key}.progress]\nphase = \"{phase}\"\npid = {me}\n");
+        let state = state_file(
+            "cancel",
+            &[instance("w", "web", &progress("w", "building")), instance("f", "web", &progress("f", "failed")), instance("r", "web", "")].concat(),
+        );
+        fn sent(_: u32) -> Result<(), String> {
+            Ok(())
+        }
+        fn refused(_: u32) -> Result<(), String> {
+            Err("EPERM".into())
+        }
+        let cancel = |params: Value, signal| instances_cancel(parse(params)?, &state, signal);
+        assert_eq!(cancel(json!({"instance": "w"}), sent).unwrap(), json!({"ok": true, "pid": me}));
+        let done = cancel(json!({"instance": "f"}), sent).unwrap_err();
+        assert_eq!((done.code, done.message.as_str()), ("invalid", "`f` is not building any more"));
+        assert_eq!(code(cancel(json!({"instance": "r"}), sent)), "invalid", "ready");
+        assert_eq!(code(cancel(json!({"instance": "nope"}), sent)), "not-found");
+        assert_eq!(code(cancel(json!({"instance": "w"}), refused)), "internal");
+        assert_eq!(code(cancel(json!({}), sent)), "invalid");
+    }
+
+    #[test]
+    fn sandboxes_list_names_the_configs_sandboxes() {
+        let root = store_path("sandboxes").with_file_name("cfg");
+        std::fs::create_dir_all(&root).unwrap();
+        let list = |root: &Path| run(&store_path("sandboxes-x"), "sandboxes.list", json!({"root": root}));
+        assert_eq!(list(&root).unwrap(), json!([]), "no config: none");
+        std::fs::write(root.join(crate::config::CONFIG_FILE), "[sandbox.web]\nimage = \"alpine\"\n[sandbox.api]\nimage = \"alpine\"\n").unwrap();
+        assert_eq!(list(&root).unwrap(), json!([{"name": "api"}, {"name": "web"}]));
+        std::fs::write(root.join(crate::config::CONFIG_FILE), "[sandbox.web\n").unwrap();
+        let bad = list(&root).unwrap_err();
+        assert!(bad.code == "invalid" && bad.message.contains("devsandboxes.toml"), "{bad:?}");
+        assert_eq!(code(list(Path::new("rel"))), "invalid");
+        assert_eq!(code(list(Path::new("/nonexistent/devsandbox-api"))), "not-found");
+        assert_eq!(code(run(&root, "sandboxes.list", json!({}))), "invalid");
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    /// The resolve / cancel / sandboxes answers match `index.d.ts`.
+    #[test]
+    fn npm_typings_match_the_instance_and_sandbox_answers() {
+        use crate::serve::dts::{assert_matches, prop_type};
+        fn v(x: &impl Serialize) -> Value {
+            serde_json::to_value(x).unwrap()
+        }
+        assert_matches("InstancesResolved", &v(&Resolved { matches: vec!["web".into()] }));
+        assert_matches("InstanceCancelled", &v(&Cancelled { ok: true, pid: 1 }));
+        assert_matches("SandboxEntry", &v(&SandboxEntry { name: "web".into() }));
+        for (method, result) in [
+            ("instances.resolve", "InstancesResolved"),
+            ("instances.cancel", "InstanceCancelled"),
+            ("sandboxes.list", "SandboxEntry[]"),
+        ] {
+            let ty = prop_type("ApiMethods", method).unwrap_or_else(|| panic!("ApiMethods lacks `{method}`"));
+            assert!(ty.contains(&format!("result: {result} ")), "{method}: {ty}");
+        }
     }
 
     #[test]

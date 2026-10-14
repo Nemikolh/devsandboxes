@@ -1566,7 +1566,7 @@ mod tests {
         assert_eq!(progress.phase, Phase::Failed { at: "preparing".into() });
         assert_eq!(info.worktree.as_deref(), Some(cfg.join(".worktrees/rb").as_path()));
 
-        crate::commands::rm::rm("rb", Some(true), false).unwrap();
+        crate::commands::rm::rm("rb", Some(true), false, false).unwrap();
         let state = State::load().unwrap();
         assert_eq!(state.instances.keys().collect::<Vec<_>>(), ["holder"]);
         assert!(!cfg.join(".worktrees/rb").exists(), "worktree left behind");

@@ -124,6 +124,11 @@ pub struct RmParams {
     pub delete_branch: Option<bool>,
     #[serde(default)]
     pub force: bool,
+    /// Answer `confirm` (the branch question) instead of deciding off a TTY,
+    /// having removed nothing: the client asks and resends with
+    /// `deleteBranch`.
+    #[serde(default)]
+    pub ask: bool,
 }
 
 /// What a verb acts on: an instance as the CLI's `<name>` takes it, or `--all`.
@@ -139,7 +144,7 @@ pub enum Verb {
     Rebuild { target: Target, force: bool },
     Start { target: Target },
     Stop { target: Target },
-    Rm { instance: String, delete_branch: Option<bool>, force: bool },
+    Rm { instance: String, delete_branch: Option<bool>, force: bool, ask: bool },
 }
 
 impl Verb {
@@ -207,7 +212,8 @@ pub fn parse(method: &str, params: Value) -> Result<VerbRequest, ApiError> {
         }
         "rm" => {
             let p: RmParams = api::parse(params)?;
-            (p.root, p.env, Verb::Rm { instance: p.instance, delete_branch: p.delete_branch, force: p.force }, false)
+            let verb = Verb::Rm { instance: p.instance, delete_branch: p.delete_branch, force: p.force, ask: p.ask };
+            (p.root, p.env, verb, false)
         }
         other => return Err(ApiError::unknown_method(other)),
     };
@@ -262,7 +268,7 @@ pub fn argv(req: &VerbRequest) -> Vec<String> {
             one_or_all(&mut args, target)
         }
         Verb::Start { target } | Verb::Stop { target } => one_or_all(&mut args, target),
-        Verb::Rm { instance, delete_branch, force } => {
+        Verb::Rm { instance, delete_branch, force, ask } => {
             match delete_branch {
                 Some(true) => args.push("--delete-branch".into()),
                 Some(false) => args.push("--keep-branch".into()),
@@ -270,6 +276,9 @@ pub fn argv(req: &VerbRequest) -> Vec<String> {
             }
             if *force {
                 args.push("--force".into());
+            }
+            if *ask {
+                args.push("--fail-on-ask".into());
             }
             Some(instance)
         }
@@ -509,9 +518,15 @@ pub fn serve(
     if exit == 0 {
         return Outcome::Answer(Ok(done_result(instance.as_deref())));
     }
+    let message = error_message(&stderr);
+    if matches!(req.verb, Verb::Rm { ask: true, .. }) && exit == crate::commands::rm::NEEDS_ANSWER_EXIT {
+        if let Some(question) = message {
+            return Outcome::Answer(Err(Failure { code: "confirm", message: question, data: None }));
+        }
+    }
     Outcome::Answer(Err(Failure {
         code: "failed",
-        message: error_message(&stderr).unwrap_or_else(|| format!("`devsandbox {verb}` exited with {exit}")),
+        message: message.unwrap_or_else(|| format!("`devsandbox {verb}` exited with {exit}")),
         data: Some(failed_data(exit, instance.as_deref())),
     }))
 }
@@ -604,7 +619,9 @@ impl Running {
         } else if !cancel {
             log(&format!("{label}: client stopped reading, connection cut, left running"));
         } else {
-            match interrupt(self.pid) {
+            // The child leads its own group and isn't reaped yet, so its
+            // pid can't have been reused.
+            match crate::commands::run::cancel::interrupt(self.pid) {
                 Ok(()) => log(&format!("{label}: client hung up, SIGINT sent")),
                 Err(e) => log(&format!("{label}: client hung up, {e}")),
             }
@@ -802,18 +819,6 @@ fn error_message(stderr: &str) -> Option<String> {
     Some(message)
 }
 
-/// SIGINT `pid`'s process group (a verb leads its own).
-fn interrupt(pid: u32) -> Result<(), String> {
-    // 0 and 1 would be our own group and init.
-    let pid = libc::pid_t::try_from(pid).ok().filter(|&p| p > 1).ok_or(format!("bad pid {pid}"))?;
-    // SAFETY: a plain syscall on integers; the child isn't reaped yet, so
-    // its pid (the group id) can't have been reused.
-    if unsafe { libc::kill(-pid, libc::SIGINT) } == 0 {
-        return Ok(());
-    }
-    Err(format!("SIGINT to group {pid}: {}", io::Error::last_os_error()))
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -854,10 +859,11 @@ pub(crate) mod tests {
         assert_eq!(argv(&req(Verb::Rebuild { target: Target::All, force: false }, false)), with(&["rebuild", "--all"]));
         assert_eq!(argv(&req(Verb::Start { target: Target::All }, false)), with(&["start", "--all"]));
         assert_eq!(argv(&req(Verb::Stop { target: one("w") }, false)), with(&["stop", "--", "w"]));
-        let rm = |delete_branch, force| Verb::Rm { instance: "w".into(), delete_branch, force };
-        assert_eq!(argv(&req(rm(None, false), false)), with(&["rm", "--", "w"]));
-        assert_eq!(argv(&req(rm(Some(true), true), false)), with(&["rm", "--delete-branch", "--force", "--", "w"]));
-        assert_eq!(argv(&req(rm(Some(false), false), false)), with(&["rm", "--keep-branch", "--", "w"]));
+        let rm = |delete_branch, force, ask| Verb::Rm { instance: "w".into(), delete_branch, force, ask };
+        assert_eq!(argv(&req(rm(None, false, false), false)), with(&["rm", "--", "w"]));
+        assert_eq!(argv(&req(rm(Some(true), true, false), false)), with(&["rm", "--delete-branch", "--force", "--", "w"]));
+        assert_eq!(argv(&req(rm(Some(false), false, false), false)), with(&["rm", "--keep-branch", "--", "w"]));
+        assert_eq!(argv(&req(rm(None, false, true), false)), with(&["rm", "--fail-on-ask", "--", "w"]));
     }
 
     /// The argv parses as the CLI's own verb with the request's values, so a
@@ -900,11 +906,14 @@ pub(crate) mod tests {
         assert!(matches!(parse(Verb::Stop { target: one("w") }), Command::Stop { name: Some(n), all: false } if n == "w"));
         assert!(matches!(parse(Verb::Stop { target: Target::All }), Command::Stop { name: None, all: true }));
         for (delete_branch, flags) in [(None, (false, false)), (Some(true), (true, false)), (Some(false), (false, true))] {
-            match parse(Verb::Rm { instance: "w".into(), delete_branch, force: true }) {
-                Command::Rm { name, delete_branch, keep_branch, force } => {
-                    assert_eq!((name.as_str(), (delete_branch, keep_branch), force), ("w", flags, true))
+            for ask in [false, true] {
+                match parse(Verb::Rm { instance: "w".into(), delete_branch, force: true, ask }) {
+                    Command::Rm { name, delete_branch, keep_branch, force, fail_on_ask } => assert_eq!(
+                        (name.as_str(), (delete_branch, keep_branch), force, fail_on_ask),
+                        ("w", flags, true, ask)
+                    ),
+                    _ => panic!("not rm"),
                 }
-                _ => panic!("not rm"),
             }
         }
     }
@@ -928,7 +937,9 @@ pub(crate) mod tests {
         assert_eq!(code("run", json!({"root": r, "env": {}})), Err("invalid"));
         assert_eq!(code("rm", json!({"root": r, "env": {}})), Err("invalid"));
         let p = parse("rm", json!({"root": r, "env": {}, "instance": "w", "deleteBranch": false})).unwrap();
-        assert_eq!(p.verb, Verb::Rm { instance: "w".into(), delete_branch: Some(false), force: false });
+        assert_eq!(p.verb, Verb::Rm { instance: "w".into(), delete_branch: Some(false), force: false, ask: false });
+        let p = parse("rm", json!({"root": r, "env": {}, "instance": "w", "ask": true})).unwrap();
+        assert_eq!(p.verb, Verb::Rm { instance: "w".into(), delete_branch: None, force: false, ask: true });
         let p = parse("start", json!({"root": r, "env": {"X": "1"}, "instance": "w", "detach": true})).unwrap();
         assert!(p.detach && p.env["X"] == "1");
         let _ = std::fs::remove_dir_all(&root);
@@ -1123,7 +1134,25 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir2);
     }
 
-    /// `$$` is the child's pid: the script records itself as the verb does.
+    #[test]
+    fn an_rm_that_must_ask_answers_confirm_with_the_question() {
+        let q = "delete branch `b`? it has commits not on its remote";
+        let (runner, dir) = script_runner("confirm", &format!("echo 'Error: {q}' >&2; exit 3"));
+        let rm = |ask| req(Verb::Rm { instance: "w".into(), delete_branch: None, force: false, ask }, false);
+        let peer = FakePeer::default();
+        let f = serve(&rm(true), None, &runner, &Arc::default(), &peer, "test", |_| {}).answer().unwrap_err();
+        assert_eq!((f.code, f.message.as_str(), f.data), ("confirm", q, None));
+        // Not asked for: exit 3 is any failure.
+        let f = serve(&rm(false), None, &runner, &Arc::default(), &peer, "test", |_| {}).answer().unwrap_err();
+        assert_eq!((f.code, f.data), ("failed", Some(json!({"exit": 3, "instance": null}))));
+        let (runner, dir2) = script_runner("confirm-other", "echo 'Error: boom' >&2; exit 1");
+        let f = serve(&rm(true), None, &runner, &Arc::default(), &peer, "test", |_| {}).answer().unwrap_err();
+        assert_eq!((f.code, f.message.as_str()), ("failed", "boom"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    /// `$` is the child's pid: the script records itself as the verb does.
     fn phase_script(steps: &[&str]) -> String {
         let mut script = String::new();
         for phase in steps {
@@ -1253,7 +1282,7 @@ pub(crate) mod tests {
             RebuildParams { root: root.clone(), env: e.clone(), instance: None, all: true, force: false, detach: false };
         let start = StartParams { root: root.clone(), env: e.clone(), instance: None, all: true, detach: false };
         let stop = StopParams { root: root.clone(), env: e.clone(), instance: None, all: true };
-        let rm = RmParams { root, env: e, instance: "w".into(), delete_branch: None, force: false };
+        let rm = RmParams { root, env: e, instance: "w".into(), delete_branch: None, force: false, ask: true };
         for (iface, value) in [
             ("RunParams", v(&run)),
             ("RebuildParams", v(&rebuild)),

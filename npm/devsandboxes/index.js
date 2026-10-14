@@ -169,11 +169,12 @@ const EXIT_DAEMON_GONE = 75;
 const STDERR_TAIL = 4096;
 
 class DevsandboxApiError extends Error {
-  constructor(message, { code, method }) {
+  constructor(message, { code, method, data }) {
     super(message);
     this.name = 'DevsandboxApiError';
     this.code = code;
     this.method = method;
+    this.data = data;
   }
 }
 
@@ -274,8 +275,8 @@ class Api extends EventEmitter {
     if (!call) return;
     this._pending.delete(msg.id);
     if (msg.error) {
-      const { code = 'internal', message = 'unknown error' } = msg.error;
-      call.reject(new DevsandboxApiError(`devsandbox ${call.method}: ${message}`, { code, method: call.method }));
+      const { code = 'internal', message = 'unknown error', data } = msg.error;
+      call.reject(new DevsandboxApiError(`devsandbox ${call.method}: ${message}`, { code, method: call.method, data }));
     } else {
       call.resolve(msg.result);
     }

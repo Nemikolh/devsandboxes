@@ -101,6 +101,25 @@ pub(crate) fn resolve_instance_noninteractive(state: &State, name: &str) -> Resu
 }
 
 fn resolve_instance_with(state: &State, name: &str, interactive: bool) -> Result<String> {
+    let mut matches = instance_matches(state, name);
+    match matches.len() {
+        0 => bail!("no sandbox instance matches `{name}` (see `devsandbox ps -a`)"),
+        1 => Ok(matches.remove(0)),
+        _ => {
+            if !interactive {
+                bail!("`{name}` is ambiguous: {}", matches.join(", "));
+            }
+            let refs: Vec<&str> = matches.iter().map(String::as_str).collect();
+            Ok(matches.remove(pick(&format!("`{name}` matches multiple instances"), &refs)?))
+        }
+    }
+}
+
+/// Every instance key `name` could mean, sorted, in [`resolve_instance`]'s
+/// tiers: the exact ones if any, else the sandbox / folder ones. Shared with
+/// the daemon's `instances.resolve`, so a client picking among them (on its
+/// own TTY) sees what the CLI would have offered.
+pub(crate) fn instance_matches(state: &State, name: &str) -> Vec<String> {
     let keys = |pred: &dyn Fn(&str, &Instance) -> bool| -> Vec<String> {
         let mut keys: Vec<String> = state
             .instances
@@ -113,24 +132,11 @@ fn resolve_instance_with(state: &State, name: &str, interactive: bool) -> Result
     };
     // The exact tier can still hold two entries (a renamed instance's id equal
     // to another's name); that stays ambiguous rather than guessing.
-    let mut matches = keys(&|instance, info| instance == name || info.instance_id == name);
-    if matches.is_empty() {
-        matches = keys(&|_, info| {
-            info.sandbox == name || info.folder.file_name().is_some_and(|f| f == name)
-        });
+    let matches = keys(&|instance, info| instance == name || info.instance_id == name);
+    if !matches.is_empty() {
+        return matches;
     }
-
-    match matches.len() {
-        0 => bail!("no sandbox instance matches `{name}` (see `devsandbox ps -a`)"),
-        1 => Ok(matches.remove(0)),
-        _ => {
-            if !interactive {
-                bail!("`{name}` is ambiguous: {}", matches.join(", "));
-            }
-            let refs: Vec<&str> = matches.iter().map(String::as_str).collect();
-            Ok(matches.remove(pick(&format!("`{name}` matches multiple instances"), &refs)?))
-        }
-    }
+    keys(&|_, info| info.sandbox == name || info.folder.file_name().is_some_and(|f| f == name))
 }
 
 /// Resolve `name` to a container: an instance (same rules as
@@ -238,7 +244,7 @@ mod tests {
 
     use crate::state::{Instance, State};
 
-    use super::{drift_decision, in_flight, no_container_yet, not_ready, resolve_instance, resolve_instance_with};
+    use super::{drift_decision, in_flight, no_container_yet, not_ready, instance_matches, resolve_instance, resolve_instance_with};
     use crate::state::{Phase, PhaseView, Progress};
 
     #[test]
@@ -463,5 +469,14 @@ mod tests {
         s.instances.insert("renamed".into(), a);
         let err = resolve_instance_with(&s, "web-bbbb", false).unwrap_err().to_string();
         assert!(err.contains("is ambiguous: renamed, web-bbbb"), "{err}");
+    }
+
+    /// The matches `instances.resolve` returns: one tier, sorted.
+    #[test]
+    fn instance_matches_lists_the_winning_tier_sorted() {
+        let s = state();
+        assert_eq!(instance_matches(&s, "web"), ["web-aaaa", "web-bbbb"]);
+        assert_eq!(instance_matches(&s, "web-bbbb"), ["web-bbbb"]);
+        assert!(instance_matches(&s, "nope").is_empty());
     }
 }
