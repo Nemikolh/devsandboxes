@@ -114,7 +114,7 @@ pub fn call(method: &str, params: Value, ctx: &Ctx) -> Answer {
 
 /// Params into `T`; absent params count as `{}`. Unknown fields are
 /// ignored, so a newer client's additive fields don't break an older daemon.
-fn parse<T: DeserializeOwned>(params: Value) -> Result<T, ApiError> {
+pub(super) fn parse<T: DeserializeOwned>(params: Value) -> Result<T, ApiError> {
     let params = if params.is_null() { Value::Object(Default::default()) } else { params };
     serde_json::from_value(params).map_err(|e| ApiError::invalid(format!("bad params: {e}")))
 }
@@ -1108,7 +1108,7 @@ mod tests {
         let removed = ForwardRemoved { ok: true, local: "127.0.0.1:3000".into(), configured: false };
         let hello = HelloParams { version: "0.6.0".into(), build: 1, client: "api:x".into() };
         let hello_result = HelloResult { version: "0.6.0".into(), build: 1, protocol: 1, handoff: true };
-        let error = ErrorBody { code: "invalid".into(), message: "m".into() };
+        let error = ErrorBody { code: "failed".into(), message: "m".into(), data: Some(json!({"exit": 1})) };
 
         let cases: [(&str, Value); 12] = [
             ("ThreadSummary", v(&summary())),

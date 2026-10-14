@@ -29,6 +29,13 @@ struct Cli {
     #[arg(short = 'C', long, global = true, default_value = ".")]
     dir: PathBuf,
 
+    /// Run the verb in this process and never start the daemon: what the
+    /// daemon's verb subprocesses (`serve::verbs`) and the dispatcher's run
+    /// with. A flag, not an env var, so a `devsandbox` a hook calls doesn't
+    /// inherit it.
+    #[arg(long, global = true, hide = true)]
+    in_process: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -376,6 +383,10 @@ enum ServiceCommand {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    #[cfg(unix)]
+    if cli.in_process {
+        serve::client::set_in_process();
+    }
 
     // Here rather than in `Config::load`: that also runs on TUI threads, where
     // a notice would garble the screen. A failure leaves the legacy file read
@@ -414,7 +425,7 @@ fn main() -> Result<()> {
             commands::autostart::autostart(&cli.dir);
             // After autostart, so the daemon's own pass finds this boot done.
             #[cfg(unix)]
-            if matches!(result, Ok(Some(_))) {
+            if matches!(result, Ok(Some(_))) && !cli.in_process {
                 serve::client::ensure_running("cli");
             }
             match (result?, json_out) {
@@ -431,7 +442,7 @@ fn main() -> Result<()> {
             // inbox instance needs a host even with no dashboard open.
             commands::autostart::autostart(&cli.dir);
             #[cfg(unix)]
-            if result.is_ok() {
+            if result.is_ok() && !cli.in_process {
                 serve::client::ensure_running("cli");
             }
             result
@@ -446,7 +457,7 @@ fn main() -> Result<()> {
             let result = commands::start::start(&cli.dir, name, all);
             commands::autostart::autostart(&cli.dir);
             #[cfg(unix)]
-            if result.is_ok() {
+            if result.is_ok() && !cli.in_process {
                 serve::client::ensure_running("cli");
             }
             result

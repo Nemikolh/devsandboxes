@@ -69,7 +69,8 @@ know. A breaking change bumps `protocol`; check it after the hello.
 ## Errors
 
 `{"id":n,"error":{"code":"…","message":"…"}}`. `message` is for humans;
-match on `code`:
+match on `code`. Some codes add a `data` object (`failed`: *Verbs*); it's
+absent otherwise.
 
 | code | |
 |---|---|
@@ -80,6 +81,7 @@ match on `code`:
 | `closed-form` | the form was already submitted, or withdrawn by its owner |
 | `conflict` | reserved |
 | `bind-failed` | a forward's host port couldn't be bound (in use, privileged, an address not on this host) |
+| `failed` | a verb exited non-zero; `data`: `{"exit": n, "instance": name \| null}` (*Verbs*) |
 | `internal` | the daemon failed (store unreadable, …); logged in `serve.log` |
 
 ## Threads
@@ -335,6 +337,70 @@ running instance that declares it).
 
 Errors: `not-found` (no forward `id`; another client may have stopped it).
 
+## Verbs
+
+`run`, `rebuild`, `start`, `stop` and `rm` are methods taking the CLI
+verb's flags as params. The daemon runs each as a `devsandbox --in-process
+-C <root> <verb> …` subprocess (`src/serve/verbs.rs`): its own process
+group, stdin null (every prompt takes its non-TTY default), and the
+request's `env` as its whole environment, plus `GIT_TERMINAL_PROMPT=0`:
+`${localEnv:…}`, `SSH_AUTH_SOCK`, `GIT_*`, `DEVSANDBOX_RUNTIME`, `PATH`
+and `HOME` are the caller's, never the daemon's.
+
+```
+→ {"id":1,"method":"run","params":{"root":"/home/me/.devsandboxes","sandbox":"web","branch":"x","env":{…}}}
+← {"method":"progress","params":{"request":1,"instance":"web-2","phase":"preparing"}}
+← {"method":"output","params":{"request":1,"stream":"stderr","data":"…"}}
+← {"id":1,"result":{"instance":"web-2","exit":0}}
+```
+
+| method | params (besides `root`, `env`) |
+|---|---|
+| `run` | `sandbox`, `name?`, `branch?`, `base?`, `json?`, `detach?` |
+| `rebuild` | `instance` \| `all: true`, `force?`, `detach?` |
+| `start` | `instance` \| `all: true`, `detach?` |
+| `stop` | `instance` \| `all: true` |
+| `rm` | `instance`, `deleteBranch?` (`true` deletes, `false` keeps, absent: merged or gone branches go, local work stays), `force?` |
+
+`root` is the absolute config root (`-C`); `env` an object of strings,
+required. `instance` is resolved as the CLI's `<name>` is, but an
+ambiguous one fails (nothing prompts).
+
+The request holds its connection until the verb exits; nothing else is
+read from it meanwhile (a pipelined request waits its turn). Meanwhile, on
+that connection only (no `subscribe`):
+
+| notification | params | when |
+|---|---|---|
+| `output` | `{"request": id, "stream": "stdout" \| "stderr", "data": "…"}` | the verb wrote; `data` is UTF-8 (lossy), chunked as read, in order per stream. `run` with `json` writes its document on `stdout` |
+| `progress` | `{"request": id, "instance": "<name>", "phase": "…"}` | an instance the verb is materializing changed phase (`state.toml`, read every 0.25 s): `preparing`, `building`, `creating`, a lifecycle step, or `failed` |
+
+Result: `{"instance": name | null, "exit": 0}`. `instance` is the one the
+verb recorded its progress on, else the one the request named (`null` for
+`all`, or a name that doesn't resolve). A non-zero exit is the error
+`failed`, its `message` the verb's last `Error:` line (causes joined with
+`: `), `data.exit` the exit code (128 + the signal when killed).
+
+**Detach** (`run`, `rebuild`, `start`): `"detach": true` answers early,
+`{"instance": name | null, "detached": true}`, while the verb runs on:
+for `run` and a single `rebuild` once an instance records the verb's
+process as its builder (plus `"record"`, the `run --json` record without
+its envelope, for `run` with `json`), for `start` and `all` right after
+the spawn. A verb that exits first answers as usual. No notifications follow
+the answer; the client may hang up or send more requests.
+
+**Hang-up = cancel**: a client that hangs up before the answer gets its
+verb SIGINTed, process group included; `run` and `rebuild` then roll back
+or record the instance failed (`docs/instance-phase.md`). A client that
+stops reading for 5 s is disconnected as usual, but its verb runs on (a
+paused pager isn't a cancel). So does a daemon exit (idle, handoff,
+`shutdown`): the connection closes without an answer, the verb runs on.
+
+The verb's stdout and stderr are spooled in
+`<data-dir>/devsandbox/logs/verbs/<pid>.out|.err` while it runs (removed
+once it's reaped); `run`, `rebuild` and `start` also write the instance's
+build log, as from the CLI.
+
 ## Notifications
 
 ### `subscribe` / `unsubscribe`
@@ -375,7 +441,8 @@ install` sends it so the service manager's daemon can take over
 A connected client keeps the daemon alive (`docs/serve.md`, *Idle exit*);
 hang up when done. So does every forward, ad-hoc or configured, whether or
 not its client is still connected: stop ad-hoc ones with `forwards.rm`. A CLI command holding a relay (`bridges.ensure`) stays
-connected for its whole run for that reason.
+connected for its whole run for that reason. Every verb holds it until
+its subprocess is reaped, a detached one too.
 
 ## Relay: `devsandbox api --stdio`
 

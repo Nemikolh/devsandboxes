@@ -25,6 +25,12 @@
 //! queue is bounded by construction; every write to a connection, response
 //! or notification, goes through its one writer lock, and a client that
 //! doesn't drain its socket for [`WRITE_TIMEOUT`] is disconnected.
+//!
+//! A verb request (`verbs.rs`) runs on its connection's thread until the
+//! verb's answer, writing `output`/`progress` through the same writer lock
+//! and watching the socket for a hang-up ([`ConnPeer`]). The drain's
+//! read-side shutdown ends it too, but sets `draining` first, so the verb
+//! is left running rather than cancelled, and doesn't hold the drain.
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs::{File, TryLockError};
@@ -45,6 +51,7 @@ use super::forwards::{self, Registry};
 use super::host::{Host, Waker};
 use super::idle::{self, Decision, Holders};
 use super::proto::{self, HelloParams, HelloResult, Notification, Request, Response, Version};
+use super::verbs;
 use crate::inbox::ops;
 
 /// How often the accept loop wakes without a connection.
@@ -76,11 +83,21 @@ pub struct Options {
     /// The Inbox store the API serves; `None` is the default
     /// (`inbox::store::path`). Tests point it at their own file.
     pub inbox: Option<PathBuf>,
+    /// How verbs run; `None` is the default ([`verbs::Runner::new`]: this
+    /// binary, the user's state). Tests run scripts on scratch files.
+    pub verbs: Option<verbs::Runner>,
 }
 
 impl Options {
     pub fn new(keep_alive: bool) -> Self {
-        Self { version: Version::current(), keep_alive, idle_timeout: idle::IDLE_TIMEOUT, host: true, inbox: None }
+        Self {
+            version: Version::current(),
+            keep_alive,
+            idle_timeout: idle::IDLE_TIMEOUT,
+            host: true,
+            inbox: None,
+            verbs: None,
+        }
     }
 }
 
@@ -142,6 +159,10 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
     ));
 
     let shared = Arc::new(Shared::new(opts.version.clone(), inbox));
+    let _ = shared.runner.set(match &opts.verbs {
+        Some(runner) => runner.clone(),
+        None => verbs::Runner::new()?,
+    });
     let registry = if opts.host {
         let shared = Arc::clone(&shared);
         let store = super::forward_store::path()?;
@@ -274,6 +295,13 @@ struct Shared {
     bridges: OnceLock<Waker>,
     /// The forward registry, for `forwards.*`; unset without a host side.
     forwards: OnceLock<forwards::Handle>,
+    /// How verbs run; unset only in tests that build a bare `Shared`.
+    runner: OnceLock<verbs::Runner>,
+    /// The verbs not reaped yet: the `verbs` holder count.
+    verbs: Arc<verbs::InFlight>,
+    /// Set when the drain starts: its read-side shutdown is not a client
+    /// hanging up, so a verb's connection must not cancel on it.
+    draining: AtomicBool,
 }
 
 impl Shared {
@@ -288,16 +316,21 @@ impl Shared {
             closed: (Mutex::new(false), Condvar::new()),
             bridges: OnceLock::new(),
             forwards: OnceLock::new(),
+            runner: OnceLock::new(),
+            verbs: Arc::default(),
+            draining: AtomicBool::new(false),
         }
     }
 
     fn holders(&self, host: Option<&Host>, registry: Option<&Registry>) -> Holders {
         let clients = self.conns.lock().unwrap().len();
         let forwards = registry.map_or(0, Registry::active);
-        let Some(host) = host else { return Holders { clients, forwards, ..Default::default() } };
+        let verbs = self.verbs.len();
+        let Some(host) = host else { return Holders { clients, forwards, verbs, ..Default::default() } };
         Holders {
             clients,
             forwards,
+            verbs,
             live_instances: host.live_instances(),
             control: host.control(),
             autostart: host.autostarting(),
@@ -384,7 +417,10 @@ impl Shared {
         }
     }
 
+    /// A verb's connection ends here too, leaving its verb running (the
+    /// [`draining`](Self::draining) flag), so verbs never hold the drain.
     fn drain(&self, timeout: Duration) {
+        self.draining.store(true, Ordering::SeqCst);
         for conn in self.conns.lock().unwrap().values() {
             let _ = conn.stream.shutdown(Shutdown::Read);
         }
@@ -602,7 +638,11 @@ fn serve_conn(id: u64, stream: Stream, shared: &Shared, out: Arc<Outbox>) {
         } else if line.trim_ascii().is_empty() {
             continue;
         } else {
-            handle(&line, shared, &mut conn)
+            match handle(&line, shared, &mut conn) {
+                Some(response) => response,
+                // A verb's client hung up (or the daemon drains): no answer.
+                None => break,
+            }
         };
         if conn.out.send(&response).is_err() || too_long {
             break;
@@ -617,13 +657,14 @@ fn serve_conn(id: u64, stream: Stream, shared: &Shared, out: Arc<Outbox>) {
     }
 }
 
-fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Response {
+fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response> {
     let req: Request = match serde_json::from_slice(line) {
         Ok(req) => req,
-        Err(e) => return Response::err(None, "invalid", format!("not a request: {e}")),
+        Err(e) => return Some(Response::err(None, "invalid", format!("not a request: {e}"))),
     };
     let answer = match req.method.as_str() {
-        "hello" => return hello(req.id, req.params, shared, conn),
+        "hello" => return Some(hello(req.id, req.params, shared, conn)),
+        method if verbs::is_verb(method) => return verb(req.id, method, req.params, shared, conn),
         "subscribe" => subscribe(req.params, conn, true),
         "unsubscribe" => subscribe(req.params, conn, false),
         "shutdown" => {
@@ -637,13 +678,86 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Response {
             api::call(method, req.params, &api::Ctx { inbox: &shared.inbox, client: &conn.audit, bridges, forwards })
         }
     };
-    match answer {
+    Some(match answer {
         Ok(result) => Response::ok(req.id, result),
         Err(e) => {
             if e.code == "internal" {
                 log(&format!("{}: {}: {}", conn.label(), req.method, e.message));
             }
             Response::err(req.id, e.code, e.message)
+        }
+    })
+}
+
+/// A verb request (`serve::verbs`): held on this connection until the verb
+/// ends (or a `detach` answer), streaming its output. `None`: the client
+/// hung up, or the daemon drains; nothing is answered.
+fn verb(id: Option<u64>, method: &str, params: Value, shared: &Shared, conn: &ConnState) -> Option<Response> {
+    let Some(runner) = shared.runner.get() else {
+        return Some(Response::err(id, "internal", "this daemon runs no verbs"));
+    };
+    let req = match verbs::parse(method, params) {
+        Ok(req) => req,
+        Err(e) => return Some(Response::err(id, e.code, e.message)),
+    };
+    let peer = ConnPeer { out: &conn.out, shared };
+    match verbs::serve(&req, id, runner, &shared.verbs, &peer, &conn.label(), log) {
+        verbs::Outcome::Answer(Ok(result)) => Some(Response::ok(id, result)),
+        verbs::Outcome::Answer(Err(f)) => {
+            if f.code == "internal" {
+                log(&format!("{}: {method}: {}", conn.label(), f.message));
+            }
+            Some(Response::err_with(id, f.code, f.message, f.data))
+        }
+        verbs::Outcome::Gone => None,
+    }
+}
+
+/// A verb's view of its connection.
+struct ConnPeer<'a> {
+    out: &'a Outbox,
+    shared: &'a Shared,
+}
+
+impl verbs::Peer for ConnPeer<'_> {
+    fn notify(&self, method: &str, params: Value) -> std::io::Result<()> {
+        self.out.send(&Notification { method: method.into(), params })
+    }
+
+    fn hung_up(&self, tick: Duration) -> bool {
+        hung_up(&self.out.ctl, tick)
+    }
+
+    fn draining(&self) -> bool {
+        self.shared.draining.load(Ordering::SeqCst)
+    }
+}
+
+/// Wait up to `tick` for `stream`'s peer to hang up, without reading:
+/// readable and a peeked 0 bytes is EOF. Pending data (a request pipelined
+/// behind the verb) is left for the reader, and waited out by sleeping
+/// rather than polling again, which would return at once and spin.
+fn hung_up(stream: &Stream, tick: Duration) -> bool {
+    use std::os::fd::AsRawFd;
+    let fd = stream.as_raw_fd();
+    let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+    let ms = libc::c_int::try_from(tick.as_millis()).unwrap_or(libc::c_int::MAX);
+    // SAFETY: one valid pollfd, alive for the call.
+    if unsafe { libc::poll(&mut pfd, 1, ms) } <= 0 {
+        return false;
+    }
+    let mut byte = 0u8;
+    // SAFETY: a one-byte buffer we own; MSG_PEEK leaves the data queued.
+    let n = unsafe { libc::recv(fd, (&raw mut byte).cast(), 1, libc::MSG_PEEK | libc::MSG_DONTWAIT) };
+    match n {
+        0 => true,
+        1.. => {
+            std::thread::sleep(tick);
+            false
+        }
+        _ => {
+            let e = std::io::Error::last_os_error();
+            !matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted)
         }
     }
 }
@@ -731,6 +845,13 @@ pub(crate) mod tests {
             idle_timeout: Duration::from_millis(idle_ms),
             host: false,
             inbox: Some(std::env::temp_dir().join(format!("dsv-inbox-{}", std::process::id())).join("inbox.json")),
+            // Never this binary on the user's state: a verb sent to a test
+            // daemon that doesn't set its own fails fast.
+            verbs: Some(verbs::Runner {
+                program: vec!["false".into()],
+                spool: std::env::temp_dir().join(format!("dsv-verbs-{}", std::process::id())),
+                state: std::env::temp_dir().join(format!("dsv-verbs-{}", std::process::id())).join("state.toml"),
+            }),
         }
     }
 
@@ -1107,6 +1228,132 @@ pub(crate) mod tests {
                 dts::assert_matches(&ty, &n.params);
             }
         }
+    }
+
+    /// A daemon whose verbs are one script: `$*` (the argv) picks the case.
+    fn verb_daemon(tag: &str, idle_ms: u64, script: &str) -> (PathBuf, PathBuf, JoinHandle<Result<Exit>>) {
+        let dir = scratch(tag);
+        let (runner, root) = verbs::tests::script_runner(tag, script);
+        let daemon = spawn_daemon(&dir, Options { verbs: Some(runner), ..opts(1, idle_ms) });
+        (dir, root, daemon)
+    }
+
+    fn verb_line(id: u64, method: &str, root: &Path, extra: Value) -> String {
+        let mut params = json!({"root": root, "env": {"PATH": std::env::var("PATH").unwrap_or_default()}});
+        params.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        format!("{}\n", json!({"id": id, "method": method, "params": params}))
+    }
+
+    fn wait_file(path: &Path, within: Duration) -> bool {
+        let deadline = Instant::now() + within;
+        while !path.exists() {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        true
+    }
+
+    const VERB_SCRIPT: &str = r#"case "$*" in
+        *slow*) trap 'echo int > "$DIR/int"; exit 130' INT; echo ready; sleep 2; touch "$DIR/done" ;;
+        *start*) sleep 1; touch "$DIR/started" ;;
+        *) echo "hi $*"; echo 'Error: nope' >&2; exit 2 ;;
+    esac"#;
+
+    #[test]
+    fn verbs_stream_over_the_socket_and_a_hang_up_cancels() {
+        let (dir, root, daemon) = verb_daemon("verb-sock", 200, VERB_SCRIPT);
+        let (stream, _) = hello_at(&dir, &v(1));
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut writer = stream;
+        // A request pipelined behind the verb is neither a hang-up nor lost.
+        let lines = verb_line(1, "stop", &root, json!({"instance": "fast"})) + r#"{"id":2,"method":"nope"}"# + "\n";
+        writer.write_all(lines.as_bytes()).unwrap();
+        let mut seen = Vec::new();
+        let answer = loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let msg: Value = serde_json::from_str(&line).unwrap();
+            if msg.get("id").is_some() {
+                break msg;
+            }
+            seen.push(msg);
+        };
+        assert_eq!(answer["id"], 1);
+        assert_eq!(answer["error"], json!({"code": "failed", "message": "nope", "data": {"exit": 2, "instance": null}}));
+        let out: String = seen
+            .iter()
+            .filter(|n| n["method"] == "output" && n["params"]["stream"] == "stdout")
+            .map(|n| n["params"]["data"].as_str().unwrap())
+            .collect();
+        assert!(out.starts_with("hi --in-process -C "), "{out}");
+        assert!(seen.iter().all(|n| n["params"]["request"] == 1), "{seen:?}");
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&line).unwrap()["error"]["code"], "unknown-method");
+
+        // Hang up mid-verb: SIGINT to its group.
+        writer.write_all(verb_line(3, "stop", &root, json!({"instance": "slow"})).as_bytes()).unwrap();
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line.contains("ready") {
+                break;
+            }
+        }
+        drop((reader, writer));
+        assert!(wait_file(&root.join("int"), Duration::from_secs(3)), "no SIGINT");
+        assert!(!root.join("done").exists());
+        assert_eq!(daemon.join().unwrap().unwrap(), Exit::Idle);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_detached_verb_holds_the_daemon_until_reaped() {
+        let (dir, root, daemon) = verb_daemon("verb-hold", 150, VERB_SCRIPT);
+        let mut conn = connect(&dir);
+        let env = json!({"PATH": std::env::var("PATH").unwrap_or_default()});
+        let r = conn.call("start", json!({"root": root, "env": env, "all": true, "detach": true})).unwrap();
+        assert_eq!(r.result, Some(json!({"instance": null, "detached": true})), "{r:?}");
+        drop(conn);
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(!daemon.is_finished(), "idled out with a verb in flight");
+        assert!(!root.join("started").exists());
+        assert_eq!(daemon.join().unwrap().unwrap(), Exit::Idle);
+        assert!(root.join("started").exists(), "exited before the verb did");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_drain_leaves_a_verb_running() {
+        let (dir, root, daemon) = verb_daemon("verb-drain", 60_000, VERB_SCRIPT);
+        let (stream, _) = hello_at(&dir, &v(1));
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut writer = stream;
+        writer.write_all(verb_line(1, "stop", &root, json!({"instance": "slow"})).as_bytes()).unwrap();
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line.contains("ready") {
+                break;
+            }
+        }
+        let started = Instant::now();
+        let r = connect(&dir).call("shutdown", json!({})).unwrap();
+        assert!(r.error.is_none(), "{r:?}");
+        assert_eq!(daemon.join().unwrap().unwrap(), Exit::Shutdown);
+        // The drain didn't wait the verb out, and didn't cancel it.
+        assert!(started.elapsed() < Duration::from_millis(1500), "{:?}", started.elapsed());
+        let mut rest = String::new();
+        let _ = reader.read_to_string(&mut rest);
+        assert!(!rest.contains("\"id\":1"), "answered: {rest}");
+        assert!(wait_file(&root.join("done"), Duration::from_secs(4)), "the verb didn't finish");
+        assert!(!root.join("int").exists(), "the drain cancelled it");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

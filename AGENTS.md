@@ -82,6 +82,14 @@ git worktrees so working trees are never shared.
   `install.rs` is `serve install|uninstall` (systemd user unit / LaunchAgent:
   pure render fns, manager calls through an injected runner; `shutdown`
   stops a running daemon first).
+  `verbs.rs` is `run`/`rebuild`/`start`/`stop`/`rm` as API methods
+  (docs/verbs-as-requests.md): typed params → a pure `argv`, each verb a
+  `devsandbox --in-process` subprocess (request env only, own process
+  group, stdout/stderr spooled in `logs/verbs/<pid>.out|.err`) streamed as
+  `output`/`progress`; hang-up = SIGINT, a drain isn't one. The program,
+  spool and state path are injectable (`Runner`), so tests run `sh`.
+  `--in-process` (hidden, global) never lazy-starts a daemon
+  (`client::set_in_process`); the dispatcher's subprocesses pass it too.
 - `src/runtime/` — backend abstraction over docker/podman/Apple container.
 - `devsbd/` — static in-container helper (workspace member), built by
   `scripts/build-devsbd.sh` and embedded by `build.rs`; `src/devsbd.rs` holds

@@ -45,6 +45,14 @@ pub struct ErrorBody {
     /// Stable machine code: `unknown-method`, `invalid`, …
     pub code: String,
     pub message: String,
+    /// Machine-readable details some codes carry (`failed`: the verb's exit
+    /// and instance). Additive: absent unless a code documents it.
+    #[serde(default, skip_serializing_if = "no_data")]
+    pub data: Option<Value>,
+}
+
+fn no_data(data: &Option<Value>) -> bool {
+    matches!(data, None | Some(Value::Null))
 }
 
 impl Response {
@@ -53,7 +61,11 @@ impl Response {
     }
 
     pub fn err(id: Option<u64>, code: &str, message: impl Into<String>) -> Self {
-        Self { id, result: None, error: Some(ErrorBody { code: code.into(), message: message.into() }) }
+        Self::err_with(id, code, message, None)
+    }
+
+    pub fn err_with(id: Option<u64>, code: &str, message: impl Into<String>, data: Option<Value>) -> Self {
+        Self { id, result: None, error: Some(ErrorBody { code: code.into(), message: message.into(), data }) }
     }
 }
 
@@ -184,6 +196,13 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&err).unwrap(),
             r#"{"id":3,"error":{"code":"unknown-method","message":"nope"}}"#
+        );
+        let null = Response::err_with(Some(3), "x", "m", Some(Value::Null));
+        assert_eq!(serde_json::to_string(&null).unwrap(), r#"{"id":3,"error":{"code":"x","message":"m"}}"#);
+        let failed = Response::err_with(Some(4), "failed", "boom", Some(serde_json::json!({"exit": 1})));
+        assert_eq!(
+            serde_json::to_string(&failed).unwrap(),
+            r#"{"id":4,"error":{"code":"failed","message":"boom","data":{"exit":1}}}"#
         );
     }
 }

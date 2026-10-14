@@ -364,7 +364,9 @@ impl State {
         Self::load_at(&Self::path()?)
     }
 
-    fn load_at(path: &Path) -> Result<Self> {
+    /// [`State::load`] from `path`: the daemon's verb tracking reads an
+    /// injected path, so its tests never touch the user's state.
+    pub(crate) fn load_at(path: &Path) -> Result<Self> {
         match std::fs::read_to_string(path) {
             Ok(contents) => {
                 let mut state: Self = toml::from_str(&contents)

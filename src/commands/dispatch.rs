@@ -1237,7 +1237,7 @@ impl Executor for Subprocess {
             .append(true)
             .open(&path)
             .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
-        let _ = writeln!(log, "$ devsandbox -C {} {}", config_dir.display(), args.join(" "));
+        let _ = writeln!(log, "$ devsandbox --in-process -C {} {}", config_dir.display(), args.join(" "));
         let err = log.try_clone().map_err(|e| e.to_string())?;
         let mut timeout_log = log.try_clone().map_err(|e| e.to_string())?;
         let mut cmd = Command::new(exe);
@@ -1245,6 +1245,8 @@ impl Executor for Subprocess {
         #[cfg(unix)]
         std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
         let mut child = cmd
+            // It runs for the daemon: never lazy-start one (see `Cli::in_process`).
+            .arg("--in-process")
             .arg("-C")
             .arg(config_dir)
             .args(args)

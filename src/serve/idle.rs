@@ -25,12 +25,15 @@ pub struct Holders {
     /// 1 while the startup `autostart = true` pass runs (it may be creating
     /// an instance; an idle exit would cut it off).
     pub autostart: usize,
+    /// Verb subprocesses (`run`, `rebuild`, …; `serve::verbs`) not reaped
+    /// yet, detached ones included: their client may be gone.
+    pub verbs: usize,
 }
 
 impl Holders {
     pub fn any(&self) -> bool {
-        let Holders { clients, forwards, live_instances, control, followers, autostart } = *self;
-        clients + forwards + live_instances + control + followers + autostart > 0
+        let Holders { clients, forwards, live_instances, control, followers, autostart, verbs } = *self;
+        clients + forwards + live_instances + control + followers + autostart + verbs > 0
     }
 }
 
@@ -86,6 +89,7 @@ mod tests {
             Holders { control: 1, ..Default::default() },
             Holders { followers: 1, ..Default::default() },
             Holders { autostart: 1, ..Default::default() },
+            Holders { verbs: 1, ..Default::default() },
         ];
         for h in rows {
             assert_eq!(decide(&h, start, late, false, T), Decision::Hold, "{h:?}");

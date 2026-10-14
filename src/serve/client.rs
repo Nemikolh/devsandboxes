@@ -160,14 +160,36 @@ pub fn ensure_running(client: &str) {
 /// with the [`Readiness`](crate::devsbd::bridge::Readiness) (`None` from a
 /// daemon too old to wait). Hold the returned connection while the command
 /// that needs the relay runs: it makes the command a holder.
+///
+/// Under [`set_in_process`] it never starts one: no daemon answering is an
+/// error (the caller's `note:`), as in [`ensure_bridge_running`].
 pub fn ensure_bridge(
     instance: &str,
     agent: Option<&Path>,
     wait: Option<Duration>,
 ) -> Result<(Conn, Option<crate::devsbd::bridge::Readiness>)> {
-    let mut conn = connect(&endpoint::socket_dir()?, "cli")?;
+    let dir = endpoint::socket_dir()?;
+    let mut conn = if IN_PROCESS.load(std::sync::atomic::Ordering::Relaxed) {
+        connect_running(&dir, "cli", &Version::current(), START_TIMEOUT)?
+            .context("devsandbox serve isn't running (not starting it from an --in-process verb)")?
+    } else {
+        connect(&dir, "cli")?
+    };
     let ready = request_bridge(&mut conn, instance, agent, wait)?;
     Ok((conn, ready))
+}
+
+/// Set once by `main` for `--in-process`: this process is a verb run by the
+/// daemon (or the dispatcher, or a client's fallback), so it must never lazy
+/// start a daemon. A subprocess of a draining daemon would race the
+/// successor for `serve.lock` (why [`ensure_bridge_running`] exists), and in
+/// the fallback nothing answers anyway, at 5 s per start. A process-wide flag
+/// rather than a parameter: the bridge waits sit deep in `run`/`start`, and
+/// the mode is fixed for the process's life.
+static IN_PROCESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_in_process() {
+    IN_PROCESS.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// [`ensure_bridge`] without the lazy start (`None` when no daemon answers),

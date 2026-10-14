@@ -317,6 +317,8 @@ export interface HelloResult {
 export interface ApiErrorBody {
   code: string;
   message: string;
+  /** Details some codes carry: {@link VerbFailedData} for `failed`. */
+  data?: unknown;
 }
 
 /** What a mutation answers. */
@@ -646,6 +648,96 @@ export interface ForwardsStatus {
   line: string;
 }
 
+/**
+ * What every verb (`run`, `rebuild`, `start`, `stop`, `rm`) takes: the config
+ * root and the env the verb runs with (the caller's whole env, never the
+ * daemon's).
+ */
+export interface VerbParams {
+  /** Absolute config root (the CLI's `-C`). */
+  root: string;
+  env: Record<string, string>;
+}
+
+/** `run` params: the CLI's flags. */
+export interface RunParams extends VerbParams {
+  sandbox: string;
+  name?: string | null;
+  branch?: string | null;
+  base?: string | null;
+  /** The run record arrives on `stdout` (and in a detached answer's `record`). */
+  json?: boolean;
+  /** Answer once the instance is registered. */
+  detach?: boolean;
+}
+
+/** `rebuild` params: `instance` or `all: true`. */
+export interface RebuildParams extends VerbParams {
+  instance?: string | null;
+  all?: boolean;
+  force?: boolean;
+  detach?: boolean;
+}
+
+/** `start` params: `instance` or `all: true`. */
+export interface StartParams extends VerbParams {
+  instance?: string | null;
+  all?: boolean;
+  detach?: boolean;
+}
+
+/** `stop` params: `instance` or `all: true`. */
+export interface StopParams extends VerbParams {
+  instance?: string | null;
+  all?: boolean;
+}
+
+/** `rm` params. */
+export interface RmParams extends VerbParams {
+  instance: string;
+  /** `true` deletes the branch, `false` keeps it; absent: merged or gone branches go, local work stays. */
+  deleteBranch?: boolean | null;
+  force?: boolean;
+}
+
+/** A verb's answer once it exited 0. */
+export interface VerbResult {
+  /** The instance it acted on; `null` for `all` or when unknown. */
+  instance: string | null;
+  exit: 0;
+}
+
+/** A `detach` verb's early answer; the verb runs on. */
+export interface VerbDetached {
+  instance: string | null;
+  detached: true;
+  /** `run` with `json`: the in-flight instance's record. */
+  record?: RunRecord;
+}
+
+/** `data` of a `failed` error: the verb exited non-zero. */
+export interface VerbFailedData {
+  exit: number;
+  instance: string | null;
+}
+
+/** `output` params: a chunk of a verb's stdout or stderr. */
+export interface VerbOutput {
+  /** The verb request's id. */
+  request: number;
+  stream: 'stdout' | 'stderr';
+  /** UTF-8 (lossy), as read. */
+  data: string;
+}
+
+/** `progress` params: a verb's instance changed phase. */
+export interface VerbProgress {
+  request: number;
+  instance: string;
+  /** `preparing`, `building`, `creating`, a lifecycle step, or `failed`. */
+  phase: string;
+}
+
 /** `closing` params: the daemon is exiting; connect again (which starts a new one). */
 export interface Closing {
   reason: 'handoff' | 'idle' | 'shutdown';
@@ -671,6 +763,10 @@ export interface ApiEvents {
   'instances.changed': {};
   'forwards.changed': {};
   'forwards.status': ForwardsStatus;
+  /** A verb request's output; sent to its connection, no `subscribe` needed. */
+  output: VerbOutput;
+  /** A verb request's phase change; sent to its connection, no `subscribe` needed. */
+  progress: VerbProgress;
   closing: Closing;
   /** Every notification, including ones this package doesn't know yet. */
   notification: ApiNotification;
@@ -697,6 +793,12 @@ export interface ApiMethods {
   'forwards.list': { params: { dir?: string }; result: ForwardRow[] };
   'forwards.add': { params: ForwardAddParams; result: ForwardAdded };
   'forwards.rm': { params: { id: number }; result: ForwardRemoved };
+  /** Verbs hold the connection until they exit (or a `detach` answer); hanging up cancels. */
+  run: { params: RunParams; result: VerbResult | VerbDetached };
+  rebuild: { params: RebuildParams; result: VerbResult | VerbDetached };
+  start: { params: StartParams; result: VerbResult | VerbDetached };
+  stop: { params: StopParams; result: VerbResult };
+  rm: { params: RmParams; result: VerbResult };
   subscribe: { params: { topics: ApiTopic[] }; result: OkResult };
   unsubscribe: { params: { topics: ApiTopic[] }; result: OkResult };
   /** Stop the daemon (it drains, then exits); `devsandbox serve install` sends it. */
@@ -778,7 +880,7 @@ export declare function connect(opts?: ConnectOptions): Promise<Api>;
 
 /**
  * Rejection of an API call. `code` is the daemon's (`not-found`, `invalid`,
- * `denied`, `closed-form`, `bind-failed`, `unknown-method`, `internal`, …) or the client's
+ * `denied`, `closed-form`, `bind-failed`, `failed`, `unknown-method`, `internal`, …) or the client's
  * own: `closed` (the connection ended), `protocol`, `unsupported`.
  */
 export declare class DevsandboxApiError extends Error {

@@ -21,6 +21,8 @@
 //! - `relay`: `devsandbox api --stdio`, stdin/stdout ↔ the socket (step 9)
 //! - `install`: `serve install|uninstall`, the systemd user unit / LaunchAgent
 //!   (step 10)
+//! - `verbs`: `run`/`rebuild`/`start`/`stop`/`rm` as requests, each a
+//!   `devsandbox --in-process` subprocess streamed back to its client
 
 pub mod api;
 pub mod client;
@@ -33,5 +35,6 @@ pub mod idle;
 pub mod install;
 pub mod proto;
 pub mod relay;
+pub mod verbs;
 #[cfg(test)]
 pub(crate) mod dts;
