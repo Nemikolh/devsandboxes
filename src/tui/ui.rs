@@ -426,7 +426,7 @@ fn service_row(r: &ServiceRow) -> Row<'_> {
     };
     Row::new(vec![
         name,
-        Cell::from(Span::styled(r.scope.to_string(), scope_style(r.scope))),
+        Cell::from(Span::styled(r.scope.clone(), scope_style(&r.scope))),
         Cell::from(Span::styled(r.source.clone(), source_style(&r.source))),
         Cell::from(ports),
         service_status_cell(r),
@@ -2858,6 +2858,7 @@ mod tests {
             build_hash: String::new(),
             issues: Vec::new(),
             dispatcher: false,
+            worktree_branch: None,
         };
         let mut app = App::new(PathBuf::from("/tmp"));
         app.set_snapshot(Snapshot {
@@ -2865,7 +2866,7 @@ mod tests {
             sandboxes: vec![sandbox],
             services: Vec::new(),
             sandbox_count: 1,
-            runtime_name: "docker",
+            runtime_name: "docker".into(),
             runtime_version: None,
             collected_at: std::time::Instant::now(),
             stats: true,

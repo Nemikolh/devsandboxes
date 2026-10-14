@@ -103,7 +103,7 @@ pub fn call(method: &str, params: Value, ctx: &Ctx) -> Answer {
         "inbox.form.submit" => form_submit(parse(params)?, ctx),
         "inbox.notify.dismiss" => dismiss(parse(params)?, ctx),
         "inbox.notify.markRead" => notify_mark_read(parse(params)?, ctx),
-        "instances.list" => instances_list(parse(params)?),
+        "instances.list" => instances_list(parse(params)?, &state_path()?),
         "instances.resolve" => instances_resolve(parse(params)?, &state_path()?),
         "instances.cancel" => {
             instances_cancel(parse(params)?, &state_path()?, crate::commands::run::cancel::interrupt)
@@ -129,7 +129,8 @@ pub(crate) fn parse<T: DeserializeOwned>(params: Value) -> Result<T, ApiError> {
 pub enum Topic {
     /// `inbox.changed`: the store changed, re-fetch.
     Inbox,
-    /// `instances.changed`: the running containers changed, re-fetch.
+    /// `instances.changed`: the running containers or `state.toml` changed,
+    /// re-fetch.
     Instances,
     /// `forwards.changed`: the forwards' rows changed, re-fetch; and
     /// `forwards.status` lines.
@@ -336,19 +337,64 @@ fn notify_mark_read(p: DismissParams, ctx: &Ctx) -> Answer {
 #[derive(Deserialize)]
 struct InstancesParams {
     dir: PathBuf,
+    /// `disk` | `listing` | `full`; absent is `full`.
+    #[serde(default)]
+    depth: Option<String>,
+}
+
+/// `instances.list`'s `depth` as a [`Depth`](crate::snapshot::Depth):
+/// how much of the runtime to ask (absent: everything, stats included).
+fn depth(name: Option<&str>) -> Result<crate::snapshot::Depth, ApiError> {
+    use crate::snapshot::Depth;
+    match name {
+        None | Some("full") => Ok(Depth::Full),
+        Some("listing") => Ok(Depth::Listing),
+        Some("disk") => Ok(Depth::Disk),
+        Some(other) => Err(ApiError::invalid(format!("unknown depth `{other}` (disk, listing, full)"))),
+    }
+}
+
+/// `instances.list`'s answer: the snapshot's fields at top level, plus the
+/// dispatcher children the Inbox thread pane links to (owner `instance_id`
+/// → key → child instance name, `dispatch::thread_children`). Not part of
+/// `status --json`.
+#[derive(Serialize)]
+pub struct InstancesList {
+    #[serde(flatten)]
+    pub snapshot: crate::snapshot::Snapshot,
+    pub thread_children: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
 }
 
 /// The `status --json` snapshot (without its envelope: the API versions
-/// itself through `hello`) for config root `dir`. Absolute only: the
+/// itself through `hello`) for config root `dir`, down to `depth`, plus
+/// `thread_children` from `state` (injected for the tests; the snapshot
+/// itself reads the user's state, as `status` does). Absolute only: the
 /// daemon's cwd is `/`, not the client's.
-fn instances_list(p: InstancesParams) -> Answer {
+fn instances_list(p: InstancesParams, state: &Path) -> Answer {
+    instances_list_with(p, state, crate::snapshot::collect_with)
+}
+
+/// [`instances_list`] with the collection injected, so the tests never ask
+/// the runtime or read the user's state.
+fn instances_list_with(
+    p: InstancesParams,
+    state: &Path,
+    collect: impl FnOnce(&Path, crate::snapshot::Depth) -> crate::snapshot::Snapshot,
+) -> Answer {
     if !p.dir.is_absolute() {
         return Err(ApiError::invalid(format!("`dir` must be absolute, got `{}`", p.dir.display())));
     }
+    let depth = depth(p.depth.as_deref())?;
     if !p.dir.is_dir() {
         return Err(ApiError::not_found(format!("no directory {}", p.dir.display())));
     }
-    serde_json::to_value(crate::snapshot::collect(&p.dir)).map_err(|e| ApiError::internal(e.into()))
+    let snapshot = collect(&p.dir, depth);
+    // An unreadable state resolves no child, like the dashboard's own
+    // collection; the snapshot's `error` already says why.
+    let thread_children = crate::state::State::load_at(state)
+        .map(|s| crate::commands::dispatch::thread_children(&s))
+        .unwrap_or_default();
+    serde_json::to_value(InstancesList { snapshot, thread_children }).map_err(|e| ApiError::internal(e.into()))
 }
 
 /// The user's `state.toml`, as the instance methods read it.
@@ -1054,6 +1100,52 @@ mod tests {
         )
     }
 
+    fn empty_snapshot() -> crate::snapshot::Snapshot {
+        crate::snapshot::Snapshot {
+            instances: Vec::new(),
+            sandboxes: Vec::new(),
+            services: Vec::new(),
+            sandbox_count: 0,
+            runtime_name: "docker".into(),
+            runtime_version: None,
+            collected_at: std::time::Instant::now(),
+            stats: false,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn instances_list_maps_depth_and_adds_thread_children() {
+        use crate::snapshot::Depth;
+        let state = state_file(
+            "list",
+            &[instance("d", "disp", ""), instance("web-one", "web", "dispatcher = \"d\"\n"), instance("p", "web", "")].concat(),
+        );
+        let dir = state.parent().unwrap().to_path_buf();
+        let list = |params: Value| {
+            let mut asked = None;
+            let r = instances_list_with(parse(params)?, &state, |_: &Path, d| {
+                asked = Some(d);
+                empty_snapshot()
+            });
+            r.map(|v| (v, asked))
+        };
+        for (depth, want) in [(json!(null), Depth::Full), (json!("full"), Depth::Full), (json!("listing"), Depth::Listing), (json!("disk"), Depth::Disk)] {
+            let (_, asked) = list(json!({"dir": dir, "depth": depth})).unwrap();
+            assert_eq!(asked, Some(want), "{depth}");
+        }
+        let (v, _) = list(json!({"dir": dir})).unwrap();
+        assert_eq!(v["thread_children"], json!({"d": {"one": "web-one"}}));
+        // The snapshot's fields stay at top level, as in `status --json`.
+        assert_eq!(v["runtime_name"], "docker");
+        assert_eq!(v["instances"], json!([]));
+        let bad = list(json!({"dir": dir, "depth": "deep"})).unwrap_err();
+        assert_eq!((bad.code, bad.message.as_str()), ("invalid", "unknown depth `deep` (disk, listing, full)"));
+        // An unreadable state resolves no child; the snapshot still answers.
+        let none = instances_list_with(parse(json!({"dir": dir})).unwrap(), &state.with_file_name("absent.toml"), |_: &Path, _| empty_snapshot());
+        assert_eq!(none.unwrap()["thread_children"], json!({}));
+    }
+
     #[test]
     fn instances_resolve_returns_every_match_of_the_winning_tier() {
         let state = state_file("resolve", &[instance("web", "web", ""), instance("web-2", "web", ""), instance("x", "web", "")].concat());
@@ -1119,7 +1211,13 @@ mod tests {
         assert_matches("InstancesResolved", &v(&Resolved { matches: vec!["web".into()] }));
         assert_matches("InstanceCancelled", &v(&Cancelled { ok: true, pid: 1 }));
         assert_matches("SandboxEntry", &v(&SandboxEntry { name: "web".into() }));
+        let list = InstancesList { snapshot: empty_snapshot(), thread_children: Default::default() };
+        assert_matches("InstancesList", &v(&list));
+        let cfg = crate::config::Config::parse("[sandbox.web]\nimage = \"alpine\"\n").unwrap();
+        let (rows, _) = crate::snapshot::sandbox_rows(&std::env::temp_dir(), &cfg);
+        assert_matches("SandboxRow", &v(&rows[0]));
         for (method, result) in [
+            ("instances.list", "InstancesList"),
             ("instances.resolve", "InstancesResolved"),
             ("instances.cancel", "InstanceCancelled"),
             ("sandboxes.list", "SandboxEntry[]"),

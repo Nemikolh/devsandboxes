@@ -223,14 +223,29 @@ its child instance done.
 
 ### `instances.list`
 
-Params: `{"dir": "/abs/path/to/config-root"}`, the directory `-C` would
-take. Absolute: the daemon's cwd is `/`. Result: the `status --json`
-snapshot's `data` (`docs/json-output.md`), without the envelope: the API
-versions itself through `protocol`. It queries the container runtime, so it
-can take a moment.
+Params: `{"dir": "/abs/path/to/config-root", "depth": "full"}`, `dir`
+the directory `-C` would take. Absolute: the daemon's cwd is `/`. Result:
+the `status --json` snapshot's `data` (`docs/json-output.md`), without the
+envelope: the API versions itself through `protocol`; plus a top-level
+`thread_children`.
 
-Errors: `invalid` (missing or relative `dir`), `not-found` (no such
-directory).
+`depth` (optional) is how much of the container runtime it asks, cheapest
+first:
+
+| `depth` | adds | cost |
+|---|---|---|
+| `disk` | state + config only; every container status is `{"state": "unknown"}`, no drift, cpu/mem or `runtime_version` | no runtime call |
+| `listing` | container statuses, drift, `runtime_version` | tens of ms |
+| `full` (absent) | `cpu`/`mem` | about 1.5 s on docker (a stats sample) |
+
+`thread_children` maps each dispatcher's `instance_id` to its children by
+thread key, `{"<owner id>": {"<key>": "<instance name>"}}`: the child a
+thread's `child` key names, as the control ops resolve it (a key ambiguous
+across sandboxes is left out). `{}` when there are none or the state
+doesn't read (the snapshot's `error` says why). Not in `status --json`.
+
+Errors: `invalid` (missing or relative `dir`, unknown `depth`), `not-found`
+(no such directory).
 
 ### `instances.resolve`
 
@@ -459,7 +474,7 @@ between.
 |---|---|---|---|
 | `inbox.changed` | `inbox` | `{"generation": n}` | the store changed: through the daemon at once, through other processes (the dashboard, `devsandbox rm`) within 0.5 s. `n` grows per change the daemon saw; compare within one connection only |
 | `inbox.shown` | `inbox` | `{"instance": "<name>", "line": "<name>: <text>"}` | a container message the daemon stored is worth a status line (a `devsbd notify`, a thread put that changed something); `line` is the dashboard's status-line text. Latest only: lines that arrive faster than the client reads are dropped |
-| `instances.changed` | `instances` | `{}` | the running containers changed (the daemon polls every 5 s) |
+| `instances.changed` | `instances` | `{}` | the running containers changed (the daemon polls every 5 s), or `state.toml` did (checked every 0.5 s): a phase moved (a `run`/`rebuild` step, a failure), an instance was created, removed or renamed, marked done or undone |
 | `forwards.changed` | `forwards` | `{}` | any forward's row changed (added, stopped, state, process, connections; checked every 0.5 s), in any config root |
 | `forwards.status` | `forwards` | `{"line": "…"}` | a one-line status: a configured forward started (`forwarding 127.0.0.1:3000 -> api:3000`) or failed, a connection note (`3000: connection refused`). Latest only, like `inbox.shown` |
 | `closing` | any | `{"reason": "handoff" \| "idle" \| "shutdown"}` | the daemon is exiting; reconnect (which starts a new one) |

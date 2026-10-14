@@ -246,7 +246,7 @@ mod tests {
     fn svc_row(containers: Vec<ContainerStatus>) -> ServiceRow {
         ServiceRow {
             name: "db".into(),
-            scope: "global",
+            scope: "global".into(),
             source: "image x".into(),
             ports: Vec::new(),
             containers: containers
@@ -273,7 +273,7 @@ mod tests {
             sandboxes: Vec::new(),
             services,
             sandbox_count,
-            runtime_name: "docker",
+            runtime_name: "docker".into(),
             runtime_version: runtime_version.map(str::to_string),
             collected_at: Instant::now(),
             stats: true,
@@ -347,6 +347,7 @@ mod tests {
             build_hash: String::new(),
             issues: Vec::new(),
             dispatcher: false,
+            worktree_branch: None,
         }
     }
 

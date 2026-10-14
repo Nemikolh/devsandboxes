@@ -15,7 +15,8 @@
 //!
 //! Notifications (docs/api.md): one daemon-wide `serve-watch` thread notices
 //! changes (store writes by this process at once, by others within [`WATCH`]
-//! via the file stamp; the host's container poll) and only *flags* them on
+//! via the file stamp; `state.toml` by its stamp; the host's container poll)
+//! and only *flags* them on
 //! each subscribed connection's [`Outbox`]; it never does I/O, so a slow
 //! client can't hold up the others. A connection's first `subscribe` starts
 //! its `serve-notify-<n>` thread, which writes the flagged notifications.
@@ -87,6 +88,9 @@ pub struct Options {
     /// How verbs run; `None` is the default ([`verbs::Runner::new`]: this
     /// binary, the user's state). Tests run scripts on scratch files.
     pub verbs: Option<verbs::Runner>,
+    /// The `state.toml` the watcher stamps for `instances.changed`; `None`
+    /// is the default (`State::path`). Tests point it at their own file.
+    pub state: Option<PathBuf>,
 }
 
 impl Options {
@@ -98,6 +102,7 @@ impl Options {
             host: true,
             inbox: None,
             verbs: None,
+            state: None,
         }
     }
 }
@@ -149,6 +154,10 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
         Some(path) => path.clone(),
         None => crate::inbox::store::path()?,
     };
+    let state = match &opts.state {
+        Some(path) => path.clone(),
+        None => crate::state::State::path()?,
+    };
     let listener = Listener::bind(dir)?;
     log(&format!(
         "listening on {} (pid {}, version {} build {}{})",
@@ -159,7 +168,7 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
         if opts.keep_alive { ", keep-alive" } else { "" },
     ));
 
-    let shared = Arc::new(Shared::new(opts.version.clone(), inbox));
+    let shared = Arc::new(Shared::new(opts.version.clone(), inbox, state));
     let _ = shared.runner.set(match &opts.verbs {
         Some(runner) => runner.clone(),
         None => verbs::Runner::new()?,
@@ -288,6 +297,8 @@ struct Shared {
     version: Version,
     /// The Inbox store the API serves.
     inbox: PathBuf,
+    /// The `state.toml` whose changes are `instances.changed`.
+    state: PathBuf,
     /// Live connections. Its size is the `clients` holder count.
     conns: Mutex<HashMap<u64, ConnEntry>>,
     /// Inbox changes this daemon has seen: the `generation` of
@@ -315,10 +326,11 @@ struct Shared {
 }
 
 impl Shared {
-    fn new(version: Version, inbox: PathBuf) -> Self {
+    fn new(version: Version, inbox: PathBuf, state: PathBuf) -> Self {
         Self {
             version,
             inbox,
+            state,
             conns: Mutex::new(HashMap::new()),
             inbox_generation: AtomicU64::new(0),
             idle_since: Mutex::new(Instant::now()),
@@ -590,9 +602,14 @@ impl Drop for Watcher {
     }
 }
 
+/// `instances.changed` covers both the host's container poll (`instances`)
+/// and `state.toml` writes (phases, new/removed/renamed instances, done
+/// flags), stamped like the store each tick, so a build's phase reaches a
+/// subscriber within [`WATCH`].
 fn watch(shared: &Shared, instances: Option<Arc<AtomicU64>>, stop: &AtomicBool) {
     let mut seen = ops::generation();
     let mut stamp = ops::stamp(&shared.inbox);
+    let mut state_stamp = crate::inbox::store::stamp_at(&shared.state);
     let instances_now = || instances.as_ref().map_or(0, |c| c.load(Ordering::Acquire));
     let mut instances_seen = instances_now();
     while !stop.load(Ordering::SeqCst) {
@@ -604,8 +621,9 @@ fn watch(shared: &Shared, instances: Option<Arc<AtomicU64>>, stop: &AtomicBool) 
             shared.publish(Topic::Inbox, |p| p.inbox = Some(g));
         }
         let n = instances_now();
-        if n != instances_seen {
-            instances_seen = n;
+        let state_now = crate::inbox::store::stamp_at(&shared.state);
+        if n != instances_seen || state_now != state_stamp {
+            (instances_seen, state_stamp) = (n, state_now);
             shared.publish(Topic::Instances, |p| p.instances = true);
         }
     }
@@ -862,6 +880,9 @@ pub(crate) mod tests {
                 spool: std::env::temp_dir().join(format!("dsv-verbs-{}", std::process::id())),
                 state: std::env::temp_dir().join(format!("dsv-verbs-{}", std::process::id())).join("state.toml"),
             }),
+            // Never the user's: the watcher only stamps it, but a test that
+            // listens for `instances.changed` sets its own.
+            state: Some(std::env::temp_dir().join(format!("dsv-state-{}", std::process::id())).join("state.toml")),
         }
     }
 
@@ -1024,6 +1045,31 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(store.parent().unwrap());
     }
 
+    /// A `state.toml` write (a phase, a new instance, a rename) is an
+    /// `instances.changed`, with no host side polling containers.
+    #[test]
+    fn subscribers_hear_state_changes() {
+        let dir = scratch("state-watch");
+        let state = scratch("state-watch-file").join("state.toml");
+        std::fs::create_dir_all(state.parent().unwrap()).unwrap();
+        let daemon = spawn_daemon(&dir, Options { state: Some(state.clone()), ..opts(1, 200) });
+        let mut conn = connect(&dir);
+        let r = conn.call("subscribe", json!({"topics": ["instances"]})).unwrap();
+        assert!(r.error.is_none(), "{r:?}");
+        assert!(conn.next_notification(Duration::from_millis(700)).unwrap().is_none(), "nothing moved yet");
+
+        std::fs::write(&state, "[instance.a]\n").unwrap();
+        wait_for(&mut conn, "instances.changed");
+        // A second write (longer: the size moves even within mtime's grain).
+        std::fs::write(&state, "[instance.a]\n[instance.b]\n").unwrap();
+        wait_for(&mut conn, "instances.changed");
+
+        drop(conn);
+        assert_eq!(daemon.join().unwrap().unwrap(), Exit::Idle);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(state.parent().unwrap());
+    }
+
     /// The next notification named `method`, skipping others (stray
     /// `inbox.changed` from other tests' writes).
     fn wait_for(conn: &mut client::Conn, method: &str) -> Notification {
@@ -1064,7 +1110,7 @@ pub(crate) mod tests {
     #[test]
     fn shown_lines_reach_inbox_subscribers_latest_first() {
         use std::os::unix::net::UnixStream;
-        let shared = Arc::new(Shared::new(v(1), scratch("shown-store").join("inbox.json")));
+        let shared = Arc::new(Shared::new(v(1), scratch("shown-store").join("inbox.json"), scratch("shown-store").join("state.toml")));
         let mut clients = Vec::new();
         for (id, topics) in [(1, json!(["inbox"])), (2, json!(["inbox"])), (3, json!(["instances"]))] {
             let (server, client) = UnixStream::pair().unwrap();
@@ -1120,7 +1166,7 @@ pub(crate) mod tests {
 
     #[test]
     fn forwards_subscribers_hear_changes_and_status_lines() {
-        let shared = Arc::new(Shared::new(v(1), scratch("fwd-store").join("inbox.json")));
+        let shared = Arc::new(Shared::new(v(1), scratch("fwd-store").join("inbox.json"), scratch("fwd-store").join("state.toml")));
         let mut fwd = subscribed(&shared, 1, json!(["forwards"]));
         let mut other = subscribed(&shared, 2, json!(["inbox", "instances"]));
         shared.publish_forwards(forwards::Event::Changed);
@@ -1142,7 +1188,7 @@ pub(crate) mod tests {
 
     #[test]
     fn active_forwards_are_holders() {
-        let shared = Shared::new(v(1), scratch("fwd-hold").join("inbox.json"));
+        let shared = Shared::new(v(1), scratch("fwd-hold").join("inbox.json"), scratch("fwd-hold").join("state.toml"));
         let registry = Registry::spawn(|_| {}, scratch("fwd-hold-store").join("forwards.toml"), Box::new(|_| {}));
         assert_eq!(shared.holders(None, Some(&registry)), Holders::default());
         let dir = scratch("fwd-hold-root");

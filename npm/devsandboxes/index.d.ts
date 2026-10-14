@@ -9,11 +9,16 @@ export declare const SCHEMA: 1;
 // ---------------------------------------------------------------------------
 // Payloads
 
-/** Container liveness; `text` is the runtime's raw status (e.g. "Up 3 minutes"). */
+/**
+ * Container liveness; `text` is the runtime's raw status (e.g. "Up 3 minutes").
+ * `unknown`: the runtime wasn't asked (`instances.list` with `depth: 'disk'`);
+ * never in `status()`.
+ */
 export type ContainerStatus =
   | { state: 'running'; text: string }
   | { state: 'exited'; text: string }
-  | { state: 'missing' };
+  | { state: 'missing' }
+  | { state: 'unknown' };
 
 /**
  * Where an instance's creation stands while it isn't ready. `step` is
@@ -62,6 +67,10 @@ export interface SandboxRow {
   build_hash: string;
   /** Config-validation problems (folder / mount resolution). */
   issues: string[];
+  /** Has a `dispatcher` table (docs/automations.md). */
+  dispatcher: boolean;
+  /** The resolved `worktree-branch`; `null` when unset or unresolved. */
+  worktree_branch: string | null;
 }
 
 /** One `[services.*]` from devsandboxes.toml (`service.ls()`, `status().services`). */
@@ -90,6 +99,15 @@ export interface Snapshot {
   runtime_version: string | null;
   /** Collection problem (e.g. runtime down); rows still come from local state. */
   error: string | null;
+}
+
+/** How much of the runtime `instances.list` asks: `full` (the default) adds cpu/mem. */
+export type SnapshotDepth = 'disk' | 'listing' | 'full';
+
+/** `instances.list`: the {@link Snapshot} plus the dispatchers' children. */
+export interface InstancesList extends Snapshot {
+  /** Dispatcher `instance_id` → thread key → child instance name. */
+  thread_children: Record<string, Record<string, string>>;
 }
 
 /**
@@ -807,7 +825,8 @@ export interface ApiMethods {
   'inbox.form.submit': { params: FormParams; result: OkResult };
   'inbox.notify.dismiss': { params: NotifyTarget; result: OkResult };
   'inbox.notify.markRead': { params: NotifyTarget; result: OkResult };
-  'instances.list': { params: { dir: string }; result: Snapshot };
+  /** `depth`: `disk` (state + config, statuses `unknown`), `listing` (+ statuses, drift), `full` (+ cpu/mem; the default). */
+  'instances.list': { params: { dir: string; depth?: SnapshotDepth }; result: InstancesList };
   /** `not-found` when nothing matches. */
   'instances.resolve': { params: { name: string }; result: InstancesResolved };
   /** SIGINT an in-flight `run`/`rebuild` (it rolls back or records failed); `invalid` when not in flight. */
@@ -849,8 +868,8 @@ export interface ApiInbox {
 
 /** `instances.*` methods. */
 export interface ApiInstances {
-  /** The {@link status} snapshot of config root `dir` (resolved against `process.cwd()`). */
-  list: (dir: string) => Promise<Snapshot>;
+  /** The {@link status} snapshot of config root `dir` (resolved against `process.cwd()`), full depth. */
+  list: (dir: string) => Promise<InstancesList>;
 }
 
 /** `forwards.*` methods. Ad-hoc forwards outlive the connection until `rm`. */

@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::Instant;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::commands::drift_decision;
 use crate::commands::services::{isolated_service_container, project_id, service_container};
@@ -22,7 +22,8 @@ use crate::state::{Instance, PhaseView, State};
 /// Container liveness, joined from `docker ps` against the state's instance list.
 /// Serializes as an internally-tagged object so JSON consumers switch on
 /// `state` and read the runtime text from `text` (absent for `missing`).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+/// Deserializes too: the dashboard reads it back from `instances.list`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", content = "text", rename_all = "lowercase")]
 pub enum ContainerStatus {
     /// Container exists and is up. Carries docker's raw `Status` text (e.g.
@@ -54,7 +55,7 @@ impl ContainerStatus {
 /// `{"state":"in-flight","step":"building"}`,
 /// `{"state":"failed","step":"postCreateCommand","error":"…"}`. `step`
 /// is `preparing`, `building`, `creating` or a lifecycle step's name.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "kebab-case")]
 pub enum PhaseRow {
     /// A live `run`/`rebuild` is at `step`.
@@ -83,7 +84,7 @@ impl From<PhaseView> for PhaseRow {
 }
 
 /// One instance row, everything the Instances view needs pre-joined.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InstanceRow {
     pub name: String,
     pub sandbox: String,
@@ -106,13 +107,13 @@ pub struct InstanceRow {
     /// `instance_id` of the dispatcher that created this instance
     /// (docs/automations.md), `None` for user-created ones. May name an
     /// instance that no longer exists (an orphaned child).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatcher: Option<String>,
     /// Marked done (`state::Instance::done`): shown dimmed until removed.
     pub done: bool,
     /// Still being materialized, or failed; absent once ready. Takes over
     /// the STATUS column from `status` while set.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase: Option<PhaseRow>,
 }
 
@@ -129,7 +130,7 @@ impl InstanceRow {
 /// One sandbox row from `devsandboxes.toml`, everything the Instances tree needs to
 /// render a sandbox node. Every configured sandbox gets one, even with zero
 /// instances; a sandbox that fails to resolve still gets a row with source `?`.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SandboxRow {
     pub name: String,
     /// Like `ResolvedSandbox::source`: `image X` / `dockerfile Y`, or `?` when
@@ -150,16 +151,18 @@ pub struct SandboxRow {
     /// resolve at all (the resolve error is reported separately).
     pub issues: Vec<String>,
     /// Whether the sandbox has a `dispatcher` table (the TUI's TYPE column).
-    #[serde(skip)]
     pub dispatcher: bool,
+    /// The resolved `worktree-branch`, for `run --branch` completion; `None`
+    /// when unset or the sandbox failed to resolve.
+    pub worktree_branch: Option<String>,
 }
 
 /// One service row, everything the Services view needs pre-joined.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ServiceRow {
     pub name: String,
     /// `"global"` or `"isolated"`.
-    pub scope: &'static str,
+    pub scope: String,
     /// Like `ResolvedSandbox::source`: `image X` / `dockerfile Y`, or `?` when
     /// the service failed to resolve.
     pub source: String,
@@ -184,7 +187,10 @@ pub struct ServiceRow {
 
 /// A point-in-time view of instances plus any collection error (docker/config
 /// unavailable). Rows are always present from state even when docker is down.
-#[derive(Clone, Debug, Serialize)]
+/// Deserializes too (the dashboard reads `instances.list`): the skipped
+/// fields then say when it arrived and no stats, which the reader corrects
+/// from the depth it asked for.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Snapshot {
     pub instances: Vec<InstanceRow>,
     /// Sandboxes from `devsandboxes.toml`, in config order. Empty when config is
@@ -195,14 +201,14 @@ pub struct Snapshot {
     /// unreadable). Feeds the header totals line.
     pub sandbox_count: usize,
     /// Runtime name for the header (`docker`, `podman`, `container`).
-    pub runtime_name: &'static str,
+    pub runtime_name: String,
     /// Runtime server version (e.g. `24.0.7`), or `None` when it is down or
     /// the version probe failed. Feeds the header totals line.
     pub runtime_version: Option<String>,
     /// When collection finished. Drives the staleness indicator in the header.
     /// Skipped in JSON: it is a monotonic `Instant` with no wall-clock meaning
     /// off-process; a JSON consumer prints at collection time itself.
-    #[serde(skip)]
+    #[serde(skip, default = "Instant::now")]
     pub collected_at: Instant,
     /// Whether cpu/mem were collected ([`Depth::Full`]). The TUI collects them
     /// on a slower cadence and carries the last values over otherwise.
@@ -376,7 +382,8 @@ fn build_service_rows(
                 scope: match scope {
                     ServiceScope::Global => "global",
                     ServiceScope::Isolated => "isolated",
-                },
+                }
+                .to_string(),
                 source,
                 ports,
                 containers,
@@ -557,6 +564,7 @@ pub fn sandbox_rows(dir: &Path, config: &Config) -> (Vec<SandboxRow>, Vec<String
                     build_hash,
                     issues,
                     dispatcher: rs.properties.dispatcher.is_some(),
+                    worktree_branch: rs.properties.worktree_branch.clone(),
                 });
             }
             Err(e) => {
@@ -571,6 +579,7 @@ pub fn sandbox_rows(dir: &Path, config: &Config) -> (Vec<SandboxRow>, Vec<String
                     build_hash: String::new(),
                     issues: Vec::new(),
                     dispatcher: false,
+                    worktree_branch: None,
                 });
             }
         }
@@ -615,7 +624,7 @@ pub fn collect_with(dir: &Path, depth: Depth) -> Snapshot {
                 sandboxes: Vec::new(),
                 services: Vec::new(),
                 sandbox_count: 0,
-                runtime_name: backend().name(),
+                runtime_name: backend().name().to_string(),
                 runtime_version: None,
                 collected_at,
                 stats: false,
@@ -735,7 +744,7 @@ pub fn collect_with(dir: &Path, depth: Depth) -> Snapshot {
         sandboxes,
         services,
         sandbox_count,
-        runtime_name: rt.name(),
+        runtime_name: rt.name().to_string(),
         runtime_version,
         collected_at,
         stats: depth == Depth::Full,
@@ -890,6 +899,63 @@ extends = "does-not-exist"
             serde_json::to_value(&row).unwrap()["phase"],
             serde_json::json!({"state": "failed", "step": "building", "error": "interrupted"})
         );
+    }
+
+    /// What `instances.list` sends reads back as the same JSON, every
+    /// status and phase variant included (`missing`/`unknown` carry no
+    /// `text`); the skipped fields come back as now and no stats.
+    #[test]
+    fn snapshot_round_trips_through_json() {
+        let state: crate::state::State = toml::from_str(
+            "[instance.a]\nsandbox = \"web\"\ncontainer = \"c\"\nfolder = \"/f\"\nworkspace = \"/w\"\ncreated_unix = 0\n\
+             dispatcher = \"d\"\ndone = 5\n\
+             [instance.b]\nsandbox = \"web\"\ncontainer = \"c2\"\nfolder = \"/f\"\nworkspace = \"/w\"\ncreated_unix = 0\n",
+        )
+        .unwrap();
+        let ps = vec![ps_line("c", "Up 1s", "running")];
+        let stats = BTreeMap::from([("c".to_string(), ("1%".to_string(), "2MiB".to_string()))]);
+        let resolved = BTreeMap::from([("web".to_string(), (vec!["db".to_string()], "h".to_string(), String::new()))]);
+        let building = Some(PhaseRow::InFlight { step: "building".into() });
+        let failed = Some(PhaseRow::Failed { step: "postCreateCommand".into(), error: "exit 1".into() });
+        let cfg = Config::parse(
+            "[sandbox.web]\nimage = \"node:22\"\nworktree-branch = \"agent/${instance}\"\n[sandbox.broken]\nextends = \"nope\"\n",
+        )
+        .unwrap();
+        let (sandboxes, _) = sandbox_rows(std::env::temp_dir().as_path(), &cfg);
+        let mut services = build_service_rows(
+            "proj",
+            &[ServiceInput { name: "db".into(), resolved: Some(resolved_input()) }, ServiceInput { name: "x".into(), resolved: None }],
+            &[("a".into(), "a".into(), vec!["db".into(), "x".into()])],
+            &[ps_line("devsandbox-svc-proj-db", "Exited (0) 1s ago", "exited")],
+        );
+        services[0].containers.push(("gone".into(), ContainerStatus::Missing));
+        services[0].containers.push(("asked-not".into(), ContainerStatus::Unknown));
+        let snapshot = Snapshot {
+            instances: vec![
+                instance_row("a", &state.instances["a"], building, &ps, &stats, &resolved, 0),
+                instance_row("b", &state.instances["b"], failed, &ps, &stats, &resolved, 0),
+            ],
+            sandbox_count: sandboxes.len(),
+            sandboxes,
+            services,
+            runtime_name: "docker".into(),
+            runtime_version: Some("24.0.7".into()),
+            collected_at: Instant::now(),
+            stats: true,
+            error: Some("e".into()),
+        };
+        let json = serde_json::to_value(&snapshot).unwrap();
+        let back: Snapshot = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&back).unwrap(), json);
+        assert!(!back.stats, "set by the reader from the depth it asked");
+        assert_eq!(json["sandboxes"][1]["worktree_branch"], "agent/${instance}");
+        assert_eq!(json["sandboxes"][0]["worktree_branch"], serde_json::Value::Null, "unresolved");
+        assert_eq!(json["sandboxes"][1]["dispatcher"], false);
+        assert_eq!(json["services"][0]["containers"][2][1], serde_json::json!({"state": "unknown"}));
+    }
+
+    fn resolved_input() -> ResolvedServiceInput {
+        resolved(ServiceScope::Global, "image postgres:16", &["5432"])
     }
 
     #[test]

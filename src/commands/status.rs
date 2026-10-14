@@ -77,7 +77,7 @@ mod tests {
             sandboxes: Vec::new(),
             services: Vec::new(),
             sandbox_count: 0,
-            runtime_name: "docker",
+            runtime_name: "docker".into(),
             runtime_version: None,
             collected_at: Instant::now(),
             stats: true,

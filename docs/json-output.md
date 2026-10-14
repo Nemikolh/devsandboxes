@@ -143,6 +143,21 @@ API's own views (`ThreadSummary` list, one `ThreadDetail`; docs/api.md) in
 the same envelope, read from the store without the daemon. The mutating
 `inbox` verbs print nothing on stdout. See docs/inbox-cli.md.
 
+## Added after: sandbox rows for the dashboard client
+
+`SandboxRow` (`status --json` `sandboxes`, `ls --json`) gained two fields
+for the dashboard reading its snapshot from the daemon
+(docs/dashboard-client.md):
+
+```json
+"dispatcher": false,
+"worktree_branch": "agent/${instance}"
+```
+
+`dispatcher`: the sandbox has a `dispatcher` table. `worktree_branch`: the
+resolved `worktree-branch`, `null` when unset or the sandbox didn't resolve.
+Additive, so `schema` stays 1.
+
 ## Commit per step (conventional commits, lowercase)
 
 1. `refactor(snapshot): extract snapshot collection from tui`

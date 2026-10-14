@@ -75,7 +75,7 @@ await api.close();
 | ------------------------------------------------ | ----------- |
 | `inbox.list(view?)` / `inbox.get(thread)`        | `ThreadSummary[]` / `ThreadDetail` |
 | `inbox.markRead` / `act` / `reply` / `done` / `reopen(thread, …)`, `inbox.dismiss` / `markNotifyRead(target)` | `void` |
-| `instances.list(dir)`                            | `Snapshot`, like `status()` |
+| `instances.list(dir)`                            | `InstancesList`: `status()`'s `Snapshot` + `thread_children` |
 | `forwards.list(dir?)` / `add(params)` / `rm(id)` | `ForwardRow[]` / `ForwardAdded` / `ForwardRemoved` |
 | `call(method, params)`                           | any method's raw `result` |
 | `subscribe(topics)` / `close()`                  | `void` |
