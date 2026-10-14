@@ -34,21 +34,26 @@ Known limitations:
 - A CLI that loses its daemon mid-verb follows the build log from the
   start, so lines it already streamed show again.
 - `-d`'s Ctrl-C before the instance is registered hangs up, and a detached
-  request survives that: the build runs on. Once its row shows, only the
-  dashboard's `d` or `instances.cancel` stop it (the CLI has no cancel
-  verb).
+  request survives that: the build runs on. Intended (docker's `run -d`
+  model; registration comes right after naming, so the window is short).
+  Once its row shows, only the dashboard's `d` or `instances.cancel` stop
+  it (the CLI has no cancel verb).
 - The dashboard's `rm`/`stop` still run in its own process, suspended
   (rollout step 4).
 - The daemon's startup autostart pass (`src/serve/host.rs`) still runs
-  in-process, in the daemon, and its runs get no build log.
+  in-process, in the daemon, and its runs get no build log. Deferred to a
+  later phase (user's call).
 - An adopted verb is tracked by pid only: a pid reused by an unrelated
-  process holds the daemon until that process exits.
+  process holds the daemon until that process exits. Importance unknown;
+  noted, not planned. A fix would also check the pid still leads its own
+  process group (`getpgid`, careful: EPERM across sessions on macOS) or
+  record the process start time beside the spool files.
 - The npm client has no typed helpers for the verbs: `api.call('run', …)`
   is typed through `ApiMethods`, and `output`/`progress` are typed events,
   but there's no `api.run(…)`. A verb holds the `connect()` connection
   until it answers (other calls on it wait), and `api.close()` hangs up,
   cancelling a non-detached one. The package's `run()`/`start()`/… spawn
-  the CLI, which goes through the daemon itself.
+  the CLI, which goes through the daemon itself. Fine as is (user's call).
 
 ## Problem
 
