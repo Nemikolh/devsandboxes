@@ -272,8 +272,9 @@ pub(crate) fn apply_restart_policy(container: &str, instance: &str, mode: Option
 }
 
 /// The host's current boot id, or `None` when it can't be read (or the OS has
-/// no supported source).
-fn boot_id() -> Option<String> {
+/// no supported source). Also stamped on an instance's `progress`, so a
+/// reader can tell a phase recorded before a reboot (`state::Progress::view`).
+pub(crate) fn boot_id() -> Option<String> {
     #[cfg(target_os = "linux")]
     {
         let text = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;

@@ -183,6 +183,7 @@ mod tests {
             extra_env: Default::default(),
             forwarded_ports: Default::default(),
             done: None,
+            progress: None,
             created_unix: 0,
         }
     }

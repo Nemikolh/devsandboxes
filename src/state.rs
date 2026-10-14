@@ -114,7 +114,172 @@ pub struct Instance {
     /// read it; `start`/autostart leave it set. `None` = not done.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub done: Option<u64>,
+    /// Set while a `run`/`rebuild` is materializing this instance, and kept
+    /// when one fails from the container on (docs/instance-phase.md). It's
+    /// what lets `run` record the instance before any of its resources
+    /// exist, so a failed or killed run leaves a record `rm` can find
+    /// instead of an orphaned worktree, branch and services. `None` = ready.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<Progress>,
     pub created_unix: u64,
+}
+
+/// Where an in-flight (or failed) materialization is, and who's doing it.
+/// Serialized flat (see [`ProgressToml`]) so it reads as one small table:
+///
+/// ```toml
+/// [instance.web.progress]
+/// phase = "lifecycle"
+/// step = "postCreateCommand"
+/// pid = 4242
+/// boot = "3f2c…"
+/// ```
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(into = "ProgressToml", try_from = "ProgressToml")]
+pub struct Progress {
+    pub phase: Phase,
+    /// The process doing the work: when it's gone the phase can't advance,
+    /// so readers show it as interrupted (SIGKILL, OOM) without anyone
+    /// rewriting the record.
+    pub pid: u32,
+    /// Host boot id when the phase was recorded: after a reboot `pid` may
+    /// name an unrelated process, so a changed boot id means interrupted too.
+    pub boot: Option<String>,
+    /// The error a `Failed` phase failed with.
+    pub error: Option<String>,
+}
+
+/// The materialization phases, in order (`Failed` aside).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Phase {
+    /// Worktree, branch, `folders`, links, services.
+    Preparing,
+    /// The image.
+    Building,
+    /// The container.
+    Creating,
+    /// A lifecycle step (`onCreateCommand` … `postAttachCommand`, or
+    /// `shell-rc` for the rc wiring), by name.
+    Lifecycle(String),
+    /// Failed at `at` (an in-flight phase's [`Phase::label`]); the error is
+    /// [`Progress::error`].
+    Failed { at: String },
+}
+
+impl Phase {
+    /// What readers show for this phase; a lifecycle step shows as its name.
+    pub fn label(&self) -> &str {
+        match self {
+            Phase::Preparing => "preparing",
+            Phase::Building => "building",
+            Phase::Creating => "creating",
+            Phase::Lifecycle(step) => step,
+            Phase::Failed { .. } => "failed",
+        }
+    }
+}
+
+/// What a reader shows for a [`Progress`], liveness and boot id applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PhaseView {
+    /// Still being worked on: the phase's [`Phase::label`].
+    InFlight(String),
+    /// Failed (or interrupted) at `at`.
+    Failed { at: String, error: String },
+}
+
+impl Progress {
+    /// An in-flight phase whose process is dead, or that was recorded in an
+    /// earlier boot, is interrupted: derived here at read time rather than
+    /// written back, so no daemon (or later command) has to clean it up.
+    /// `alive` and `boot` are injected to keep this pure.
+    pub fn view(&self, alive: impl Fn(u32) -> bool, boot: Option<&str>) -> PhaseView {
+        if let Phase::Failed { at } = &self.phase {
+            return PhaseView::Failed {
+                at: at.clone(),
+                error: self.error.clone().unwrap_or_else(|| "failed".into()),
+            };
+        }
+        let rebooted = matches!((self.boot.as_deref(), boot), (Some(then), Some(now)) if then != now);
+        if rebooted || !alive(self.pid) {
+            return PhaseView::Failed { at: self.phase.label().into(), error: "interrupted".into() };
+        }
+        PhaseView::InFlight(self.phase.label().into())
+    }
+
+    /// [`Progress::view`] against this host: real pid liveness, current boot.
+    pub fn current_view(&self) -> PhaseView {
+        self.view(pid_alive, crate::commands::autostart::boot_id().as_deref())
+    }
+}
+
+/// Whether process `pid` exists. EPERM means it exists under another user.
+/// Non-unix has no cheap probe, so it's assumed alive (never a false
+/// "interrupted").
+pub fn pid_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // 0 would probe our own process group, not a process.
+        let Ok(pid @ 1..) = libc::pid_t::try_from(pid) else { return false };
+        // SAFETY: signal 0 only checks for existence and permission.
+        let ok = unsafe { libc::kill(pid, 0) } == 0;
+        ok || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
+/// [`Progress`] as stored: `phase` names the variant, `step` carries a
+/// lifecycle step's name or the label a `failed` phase failed at. Flat
+/// scalars, so it's plain TOML whatever the variant (an externally tagged
+/// enum would mix a string and tables under one key).
+#[derive(Serialize, Deserialize)]
+struct ProgressToml {
+    phase: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    step: Option<String>,
+    pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    boot: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+impl From<Progress> for ProgressToml {
+    fn from(p: Progress) -> Self {
+        let (phase, step) = match p.phase {
+            Phase::Preparing => ("preparing", None),
+            Phase::Building => ("building", None),
+            Phase::Creating => ("creating", None),
+            Phase::Lifecycle(step) => ("lifecycle", Some(step)),
+            Phase::Failed { at } => ("failed", Some(at)),
+        };
+        ProgressToml { phase: phase.into(), step, pid: p.pid, boot: p.boot, error: p.error }
+    }
+}
+
+impl TryFrom<ProgressToml> for Progress {
+    type Error = String;
+
+    /// Lenient on purpose: a bad `progress` would otherwise fail loading the
+    /// whole `state.toml`, so a phase a newer binary added (or a missing
+    /// `step`) reads as an in-flight step named after it, which the pid and
+    /// boot checks in [`Progress::view`] still resolve.
+    fn try_from(t: ProgressToml) -> Result<Self, String> {
+        let step = |phase: &str| t.step.clone().unwrap_or_else(|| phase.to_string());
+        let phase = match t.phase.as_str() {
+            "preparing" => Phase::Preparing,
+            "building" => Phase::Building,
+            "creating" => Phase::Creating,
+            "lifecycle" => Phase::Lifecycle(step("lifecycle")),
+            "failed" => Phase::Failed { at: step("failed") },
+            other => Phase::Lifecycle(other.to_string()),
+        };
+        Ok(Progress { phase, pid: t.pid, boot: t.boot, error: t.error })
+    }
 }
 
 /// One `folders` entry of an instance: where it's mounted, the host folder it
@@ -285,6 +450,7 @@ mod tests {
                 extra_env: BTreeMap::from([("PR_NUMBER".into(), "42".into())]),
                 forwarded_ports: BTreeMap::from([("8080:3000".into(), 8081)]),
                 done: Some(1_790_900_000),
+                progress: None,
                 created_unix: Instance::now(),
             },
         );
@@ -410,6 +576,133 @@ mod tests {
         assert_eq!(mtime(), before);
         assert!(State::load_at(&path).unwrap().instances.contains_key("child"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn progress(phase: Phase) -> Progress {
+        Progress { phase, pid: 4242, boot: Some("boot-a".into()), error: None }
+    }
+
+    #[test]
+    fn progress_roundtrips_every_phase() {
+        let phases = [
+            Phase::Preparing,
+            Phase::Building,
+            Phase::Creating,
+            Phase::Lifecycle("postCreateCommand".into()),
+            Phase::Lifecycle("shell-rc".into()),
+            Phase::Failed { at: "building".into() },
+        ];
+        for phase in phases {
+            let mut state: State = toml::from_str(
+                "[instance.a]\nsandbox = \"web\"\ncontainer = \"c\"\nfolder = \"/f\"\nworkspace = \"/w\"\ncreated_unix = 0\n",
+            )
+            .unwrap();
+            let mut p = progress(phase);
+            if matches!(p.phase, Phase::Failed { .. }) {
+                p.error = Some("docker build exited 1".into());
+            }
+            state.instances.get_mut("a").unwrap().progress = Some(p.clone());
+            let text = toml::to_string_pretty(&state).unwrap();
+            let back: State = toml::from_str(&text).unwrap();
+            assert_eq!(back.instances["a"].progress, Some(p), "{text}");
+        }
+    }
+
+    #[test]
+    fn progress_toml_shape() {
+        let mut state: State = toml::from_str(
+            "[instance.a]\nsandbox = \"web\"\ncontainer = \"c\"\nfolder = \"/f\"\nworkspace = \"/w\"\ncreated_unix = 0\n",
+        )
+        .unwrap();
+        state.instances.get_mut("a").unwrap().progress = Some(progress(Phase::Lifecycle("postCreateCommand".into())));
+        let text = toml::to_string_pretty(&state).unwrap();
+        let back: toml::Table = toml::from_str(&text).unwrap();
+        let p = back["instance"]["a"]["progress"].as_table().unwrap();
+        assert_eq!(p["phase"].as_str(), Some("lifecycle"), "{text}");
+        assert_eq!(p["step"].as_str(), Some("postCreateCommand"), "{text}");
+        assert_eq!(p["pid"].as_integer(), Some(4242), "{text}");
+        assert_eq!(p["boot"].as_str(), Some("boot-a"), "{text}");
+        assert!(!p.contains_key("error"), "{text}");
+    }
+
+    #[test]
+    fn no_progress_loads_and_is_omitted() {
+        let state: State = toml::from_str(
+            "[instance.a]\nsandbox = \"web\"\ncontainer = \"c\"\nfolder = \"/f\"\nworkspace = \"/w\"\ncreated_unix = 0\n",
+        )
+        .unwrap();
+        assert_eq!(state.instances["a"].progress, None);
+        let text = toml::to_string_pretty(&state).unwrap();
+        assert!(!text.contains("progress"), "{text}");
+    }
+
+    #[test]
+    fn odd_progress_still_loads() {
+        let base = "[instance.a]\nsandbox = \"web\"\ncontainer = \"c\"\nfolder = \"/f\"\nworkspace = \"/w\"\ncreated_unix = 0\n";
+        for (progress, phase) in [
+            ("phase = \"lifecycle\"\npid = 1\n", Phase::Lifecycle("lifecycle".into())),
+            ("phase = \"failed\"\npid = 1\n", Phase::Failed { at: "failed".into() }),
+            ("phase = \"teleporting\"\npid = 1\n", Phase::Lifecycle("teleporting".into())),
+        ] {
+            let text = format!("{base}[instance.a.progress]\n{progress}");
+            let state: State = toml::from_str(&text).unwrap();
+            assert_eq!(state.instances["a"].progress.as_ref().unwrap().phase, phase, "{text}");
+        }
+    }
+
+    #[test]
+    fn view_in_flight_when_alive_and_same_boot() {
+        let alive = |_| true;
+        assert_eq!(progress(Phase::Preparing).view(alive, Some("boot-a")), PhaseView::InFlight("preparing".into()));
+        assert_eq!(progress(Phase::Building).view(alive, Some("boot-a")), PhaseView::InFlight("building".into()));
+        assert_eq!(progress(Phase::Creating).view(alive, Some("boot-a")), PhaseView::InFlight("creating".into()));
+        assert_eq!(
+            progress(Phase::Lifecycle("postCreateCommand".into())).view(alive, Some("boot-a")),
+            PhaseView::InFlight("postCreateCommand".into())
+        );
+        // An unknown boot on either side can't prove a reboot.
+        assert_eq!(progress(Phase::Building).view(alive, None), PhaseView::InFlight("building".into()));
+        let mut unbooted = progress(Phase::Building);
+        unbooted.boot = None;
+        assert_eq!(unbooted.view(alive, Some("boot-b")), PhaseView::InFlight("building".into()));
+    }
+
+    #[test]
+    fn view_interrupted_when_dead_or_rebooted() {
+        let interrupted = |at: &str| PhaseView::Failed { at: at.into(), error: "interrupted".into() };
+        let p = progress(Phase::Lifecycle("shell-rc".into()));
+        assert_eq!(p.view(|pid| pid != 4242, Some("boot-a")), interrupted("shell-rc"));
+        assert_eq!(p.view(|_| true, Some("boot-b")), interrupted("shell-rc"));
+        assert_eq!(progress(Phase::Creating).view(|_| false, None), interrupted("creating"));
+    }
+
+    #[test]
+    fn view_failed_stays_failed() {
+        let mut p = progress(Phase::Failed { at: "postCreateCommand".into() });
+        p.error = Some("exit status 1".into());
+        let failed = PhaseView::Failed { at: "postCreateCommand".into(), error: "exit status 1".into() };
+        // Liveness and boot don't matter once it's recorded failed.
+        assert_eq!(p.view(|_| true, Some("boot-a")), failed);
+        assert_eq!(p.view(|_| false, Some("boot-b")), failed);
+        p.error = None;
+        assert_eq!(
+            p.view(|_| true, Some("boot-a")),
+            PhaseView::Failed { at: "postCreateCommand".into(), error: "failed".into() }
+        );
+    }
+
+    #[test]
+    fn pid_alive_probes_real_processes() {
+        assert!(pid_alive(std::process::id()));
+        #[cfg(unix)]
+        {
+            // Above any pid_max, and not representable as a pid_t at all.
+            assert!(!pid_alive(i32::MAX as u32));
+            assert!(!pid_alive(u32::MAX));
+            assert!(!pid_alive(0));
+            // pid 1 exists; as non-root that's EPERM, still alive.
+            assert!(pid_alive(1));
+        }
     }
 
     #[test]

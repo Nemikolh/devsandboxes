@@ -247,6 +247,7 @@ mod tests {
             extra_env: Default::default(),
             forwarded_ports: Default::default(),
             done: None,
+            progress: None,
             created_unix: 0,
         };
         state.instances.insert("web-aaaa".into(), mk("web", "/home/u/site"));
@@ -290,6 +291,7 @@ mod tests {
                 extra_env: Default::default(),
                 forwarded_ports: Default::default(),
                 done: None,
+                progress: None,
                 created_unix: 0,
             },
         );

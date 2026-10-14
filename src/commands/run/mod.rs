@@ -633,6 +633,7 @@ pub(crate) fn materialize(
         extra_env: run_env,
         forwarded_ports,
         done,
+        progress: None,
         created_unix: Instance::now(),
     };
     // Into the current file, not `state` (loaded before the build): saving that
@@ -1025,6 +1026,7 @@ mod tests {
             extra_env: Default::default(),
             forwarded_ports: Default::default(),
             done: None,
+            progress: None,
             created_unix: 0,
         }
     }
