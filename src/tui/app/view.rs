@@ -1,13 +1,16 @@
 //! Full-screen modals: the config/inspect explorer (`ConfigView`), help and
 //! log text modals, and the split-pane scroll/resize geometry they share.
 
+use std::cell::Cell;
 use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
+use crate::build_log::Tail;
 use crate::config::Config;
 use crate::runtime::backend;
+use crate::snapshot::PhaseRow;
 use crate::tui::data::{ContainerStatus, InstanceRow, Node};
 use crate::tui::settings::{SETTINGS, Settings};
 
@@ -34,10 +37,15 @@ Tables (Instances / Services)
   s           stop / start     l   logs (Instances tab)
               (stops running / starts exited; s-start is a bare start —
                :start runs services + postStartCommand too; a drifted
-               exited instance is rebuilt instead)
+               exited or a failed instance is rebuilt instead)
+  b           build log of the instance (follows a build in flight;
+              G sticks to the bottom again)
   p           forward a port (instance / service selection prefills the prompt)
   d           remove the instance now, no prompt (Instances; like :rm,
-              so a dirty worktree still refuses)
+              so a dirty worktree still refuses); on an instance still
+              building: cancel it, after a y/n (a cancelled run is undone)
+  run, rebuild and start (s, :run, :rebuild, :start) run in the background
+  and outlive the dashboard: the row shows their phase, b their output
 
 Ports tab
   ↑/k ↓/j     move selection
@@ -180,6 +188,86 @@ pub struct HelpModal {
     pub text: TextModal,
     /// Index into `SETTINGS` of the row `space`/`enter` toggles.
     pub cursor: usize,
+}
+
+/// Lines of a build log the modal shows: the end is what matters (where it
+/// failed, what it's doing), `logs --build` has the rest.
+pub const BUILD_LOG_LINES: usize = 500;
+
+/// An instance's build log (`b`), re-read on each snapshot while the
+/// instance is in flight. The event loop does the reading
+/// ([`App::take_build_log_read`] / [`App::set_build_log`]), so this stays
+/// I/O-free. Sticks to the bottom, following the build, until the user
+/// scrolls up; scrolling back to the bottom sticks again.
+pub struct BuildLogModal {
+    /// The instance's row name (for the title and the hint).
+    pub instance: String,
+    /// Its id: the row it follows and the log's directory.
+    pub instance_id: String,
+    pub text: TextModal,
+    /// Following the end: the shown top is [`bottom_top`], not `text.scroll`.
+    pub stick: bool,
+    /// In flight at the last snapshot: the next one re-reads (once more
+    /// after it ends, for the last lines).
+    live: bool,
+    /// Body rows the last draw had, written by `ui` (only it knows them).
+    pub height: Cell<u16>,
+}
+
+/// The top line that puts the last of `lines` at the bottom of `height`
+/// rows.
+pub(super) fn bottom_top(lines: u16, height: u16) -> u16 {
+    lines.saturating_sub(height)
+}
+
+impl BuildLogModal {
+    /// The first line shown.
+    pub fn top(&self) -> u16 {
+        if self.stick { bottom_top(line_count(&self.text.body), self.height.get()) } else { self.text.scroll }
+    }
+
+    /// Move from where it is shown, then stick when that's the bottom.
+    fn scroll_with(&mut self, f: impl FnOnce(&mut TextModal)) -> u16 {
+        self.text.scroll = self.top();
+        f(&mut self.text);
+        self.stick = self.text.scroll >= bottom_top(line_count(&self.text.body), self.height.get());
+        self.top()
+    }
+
+    fn on_scroll_key(&mut self, key: KeyEvent) {
+        self.scroll_with(|t| {
+            t.on_scroll_key(key);
+        });
+    }
+
+    /// [`TextModal::scroll_by`], from where it is shown.
+    pub(super) fn scroll_by(&mut self, delta: i16) -> u16 {
+        self.scroll_with(|t| {
+            t.scroll_by(delta);
+        })
+    }
+}
+
+/// The build-log modal's title: whose, and how it's going.
+fn build_log_title(instance: &str, phase: Option<&PhaseRow>) -> String {
+    match phase {
+        Some(PhaseRow::InFlight { step }) => format!(" build log — {instance} ({}) ", crate::commands::doing(step)),
+        Some(PhaseRow::Failed { step, .. }) => format!(" build log — {instance} (failed at {step}) "),
+        None => format!(" build log — {instance} "),
+    }
+}
+
+/// A yes/no question over the dashboard (`d` on an in-flight row): `y` or
+/// `enter` goes ahead, `n`/`esc`/`q` doesn't.
+pub struct ConfirmModal {
+    pub question: String,
+    action: Confirmed,
+}
+
+/// What a [`ConfirmModal`]'s yes does.
+enum Confirmed {
+    /// SIGINT the instance's `run`/`rebuild`/`start` (`App::pending_cancel`).
+    CancelBuild(String),
 }
 
 /// Line count of `body`, clamped to `u16`, for scroll bounds.
@@ -352,6 +440,9 @@ pub enum Modal {
     Help(HelpModal),
     /// Container log tail (`l` on the Instances tab).
     Logs(TextModal),
+    /// An instance's build log (`b` on the Instances tab).
+    BuildLog(BuildLogModal),
+    Confirm(ConfirmModal),
 }
 
 impl App {
@@ -409,6 +500,124 @@ impl App {
                     view.on_scroll_key(key);
                 }
             }
+            Modal::BuildLog(view) => {
+                if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+                    self.modal = Modal::None;
+                } else {
+                    view.on_scroll_key(key);
+                }
+            }
+            Modal::Confirm(view) => match key.code {
+                KeyCode::Char('y') | KeyCode::Enter => {
+                    let Confirmed::CancelBuild(instance) = &view.action;
+                    self.status = Some(format!("cancelling {instance}…"));
+                    self.pending_cancel = Some(instance.clone());
+                    self.modal = Modal::None;
+                }
+                KeyCode::Char('n') | KeyCode::Esc | KeyCode::Char('q') => self.modal = Modal::None,
+                _ => {}
+            },
+        }
+    }
+
+    /// Ask before cancelling `instance`'s build (`d` on an in-flight row).
+    pub(super) fn confirm_cancel_build(&mut self, instance: String) {
+        self.modal = Modal::Confirm(ConfirmModal {
+            question: format!("cancel {instance}'s build?"),
+            action: Confirmed::CancelBuild(instance),
+        });
+    }
+
+    /// Take the instance whose build the event loop should SIGINT.
+    pub fn take_pending_cancel(&mut self) -> Option<String> {
+        self.pending_cancel.take()
+    }
+
+    /// `b` (Instances tab): the selected instance's build log, read by the
+    /// event loop (see [`BuildLogModal`]). No-op off an instance row; an
+    /// unrecorded one (no id) has no log to read.
+    pub(super) fn open_build_log(&mut self) {
+        if self.tab != Tab::Instances {
+            return;
+        }
+        let Some(i) = self.selected_instance_index() else {
+            return;
+        };
+        let Some(row) = self.snapshot.as_ref().and_then(|s| s.instances.get(i)) else {
+            return;
+        };
+        let title = build_log_title(&row.name, row.phase.as_ref());
+        let (body, read) = if row.instance_id.is_empty() {
+            (format!("(no build log: `{}` is not a recorded instance)", row.name), None)
+        } else {
+            ("(loading…)".to_string(), Some(row.instance_id.clone()))
+        };
+        self.pending_build_log = read;
+        self.modal = Modal::BuildLog(BuildLogModal {
+            instance: row.name.clone(),
+            instance_id: row.instance_id.clone(),
+            text: TextModal::new(title, body),
+            stick: true,
+            live: matches!(row.phase, Some(PhaseRow::InFlight { .. })),
+            height: Cell::new(0),
+        });
+    }
+
+    /// The build log the event loop should read now, by instance id: just
+    /// opened, or a snapshot landed while it's being written.
+    pub fn take_build_log_read(&mut self) -> Option<String> {
+        self.pending_build_log.take()
+    }
+
+    /// Install what the event loop read for `instance_id` (`Err`: why it
+    /// couldn't), if its modal is still the open one. Keeps the user's
+    /// scroll position unless following the bottom.
+    pub fn set_build_log(&mut self, instance_id: &str, read: Result<Option<Tail>, String>) {
+        let Modal::BuildLog(view) = &mut self.modal else {
+            return;
+        };
+        if view.instance_id != instance_id {
+            return;
+        }
+        view.text.body = match read {
+            Ok(Some(tail)) if tail.cut => format!(
+                "… (earlier lines: devsandbox logs --build {})\n{}",
+                view.instance, tail.text
+            ),
+            Ok(Some(tail)) if tail.text.is_empty() => "(empty build log)".to_string(),
+            Ok(Some(tail)) => tail.text,
+            Ok(None) => format!(
+                "(no build log for `{}` yet: run, rebuild and start write one)",
+                view.instance
+            ),
+            Err(e) => e,
+        };
+        let max = line_count(&view.text.body).saturating_sub(1);
+        view.text.scroll = view.text.scroll.min(max);
+    }
+
+    /// After a snapshot: retitle an open build log with its instance's
+    /// phase, and re-read it while that instance is in flight (plus once
+    /// after, for the lines the build ended with).
+    pub(super) fn refresh_build_log(&mut self) {
+        let Modal::BuildLog(view) = &mut self.modal else {
+            return;
+        };
+        let row = self
+            .snapshot
+            .as_ref()
+            .and_then(|s| s.instances.iter().find(|r| !view.instance_id.is_empty() && r.instance_id == view.instance_id));
+        let Some(row) = row else {
+            // Removed (a cancelled `run` takes its record and log along):
+            // what was read stays up, nothing more to follow.
+            view.live = false;
+            return;
+        };
+        view.instance.clone_from(&row.name);
+        view.text.title = build_log_title(&row.name, row.phase.as_ref());
+        let was = std::mem::replace(&mut view.live, matches!(row.phase, Some(PhaseRow::InFlight { .. })));
+        if was || view.live {
+            self.pending_build_log = Some(view.instance_id.clone());
         }
     }
 
@@ -865,6 +1074,132 @@ mod tests {
         }
         app.on_key(key(KeyCode::Char('q')));
         assert!(matches!(app.modal, Modal::None));
+    }
+
+    fn build_log(app: &App) -> &BuildLogModal {
+        match &app.modal {
+            Modal::BuildLog(v) => v,
+            _ => panic!("build log not open"),
+        }
+    }
+
+    fn tail(lines: std::ops::Range<usize>) -> Result<Option<Tail>, String> {
+        let text = lines.map(|i| format!("l{i}")).collect::<Vec<_>>().join("\n");
+        Ok(Some(Tail { text, cut: false }))
+    }
+
+    /// A snapshot with inst0 recorded (id `id0`) at `phase`.
+    fn recorded(phase: Option<PhaseRow>) -> crate::tui::data::Snapshot {
+        let mut snap = snapshot_with(1);
+        snap.instances[0].instance_id = "id0".into();
+        snap.instances[0].phase = phase;
+        snap
+    }
+
+    #[test]
+    fn b_opens_the_build_log_for_the_loop_to_read() {
+        let mut app = new_app();
+        app.set_snapshot(recorded(Some(in_flight("building"))));
+        app.on_key(key(KeyCode::Char('b'))); // the sandbox row: nothing
+        assert!(matches!(app.modal, Modal::None));
+        app.on_key(key(KeyCode::Down)); // onto inst0
+        app.on_key(key(KeyCode::Char('b')));
+        assert_eq!(build_log(&app).text.title, " build log — inst0 (building) ");
+        assert_eq!(app.take_build_log_read(), Some("id0".into()));
+        assert_eq!(app.take_build_log_read(), None, "once");
+        app.set_build_log("id0", tail(0..3));
+        assert_eq!(build_log(&app).text.body, "l0\nl1\nl2");
+        // Not for another instance's modal.
+        app.set_build_log("other", tail(0..1));
+        assert_eq!(build_log(&app).text.body, "l0\nl1\nl2");
+        app.on_key(key(KeyCode::Char('q')));
+        assert!(matches!(app.modal, Modal::None));
+        app.set_build_log("id0", tail(0..1)); // closed: dropped
+        assert!(matches!(app.modal, Modal::None));
+    }
+
+    #[test]
+    fn the_build_log_says_when_there_is_none() {
+        let mut app = new_app();
+        app.set_snapshot(recorded(None));
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Char('b')));
+        assert_eq!(build_log(&app).text.title, " build log — inst0 ");
+        app.set_build_log("id0", Ok(None));
+        assert!(build_log(&app).text.body.starts_with("(no build log for `inst0` yet"), "{}", build_log(&app).text.body);
+        app.set_build_log("id0", Ok(Some(Tail { text: "x".into(), cut: true })));
+        assert_eq!(build_log(&app).text.body, "… (earlier lines: devsandbox logs --build inst0)\nx");
+        app.set_build_log("id0", Err("cannot read".into()));
+        assert_eq!(build_log(&app).text.body, "cannot read");
+        // An unrecorded row has nothing to read.
+        let mut app = new_app();
+        app.set_snapshot(snapshot_with(1)); // no instance id
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Char('b')));
+        assert_eq!(app.take_build_log_read(), None);
+        assert!(build_log(&app).text.body.contains("not a recorded instance"));
+    }
+
+    #[test]
+    fn the_build_log_rereads_while_in_flight_and_once_after() {
+        let mut app = new_app();
+        app.set_snapshot(recorded(Some(in_flight("building"))));
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Char('b')));
+        app.take_build_log_read();
+        app.set_snapshot(recorded(Some(in_flight("postCreateCommand"))));
+        assert_eq!(app.take_build_log_read(), Some("id0".into()));
+        assert_eq!(build_log(&app).text.title, " build log — inst0 (running postCreateCommand) ");
+        // It ended: one last read, then no more.
+        app.set_snapshot(recorded(Some(failed("postCreateCommand"))));
+        assert_eq!(app.take_build_log_read(), Some("id0".into()));
+        assert_eq!(build_log(&app).text.title, " build log — inst0 (failed at postCreateCommand) ");
+        app.set_snapshot(recorded(Some(failed("postCreateCommand"))));
+        assert_eq!(app.take_build_log_read(), None);
+        // A finished build's log is read once, on open.
+        let mut app = new_app();
+        app.set_snapshot(recorded(None));
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Char('b')));
+        assert_eq!(app.take_build_log_read(), Some("id0".into()));
+        app.set_snapshot(recorded(None));
+        assert_eq!(app.take_build_log_read(), None);
+    }
+
+    #[test]
+    fn the_build_log_sticks_to_the_bottom_until_scrolled_up() {
+        let mut app = new_app();
+        app.set_snapshot(recorded(Some(in_flight("building"))));
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Char('b')));
+        build_log(&app).height.set(10); // as `ui` would
+        app.set_build_log("id0", tail(0..30));
+        assert!(build_log(&app).stick);
+        assert_eq!(build_log(&app).top(), 20, "the last line at the bottom");
+        app.set_build_log("id0", tail(0..40));
+        assert_eq!(build_log(&app).top(), 30, "follows new lines");
+        // Up unsticks, from where it was shown; new lines keep the spot.
+        app.on_key(key(KeyCode::Up));
+        assert!(!build_log(&app).stick);
+        assert_eq!(build_log(&app).top(), 29);
+        app.set_build_log("id0", tail(0..50));
+        assert_eq!(build_log(&app).top(), 29);
+        // Back down to the bottom sticks again; so does `G`.
+        app.on_key(key(KeyCode::PageDown));
+        assert!(build_log(&app).stick);
+        assert_eq!(build_log(&app).top(), 40);
+        app.on_key(key(KeyCode::Char('g')));
+        assert_eq!(build_log(&app).top(), 0);
+        app.on_key(key(KeyCode::Char('G')));
+        assert!(build_log(&app).stick);
+        app.set_build_log("id0", tail(0..60));
+        assert_eq!(build_log(&app).top(), 50);
+        // A shorter body (rotated by a new build) clamps a kept spot.
+        app.on_key(key(KeyCode::Char('g')));
+        app.on_key(key(KeyCode::PageDown));
+        assert_eq!(build_log(&app).top(), 20);
+        app.set_build_log("id0", tail(0..5));
+        assert_eq!(build_log(&app).top(), 4);
     }
 
     #[test]

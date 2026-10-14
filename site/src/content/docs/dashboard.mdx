@@ -47,7 +47,7 @@ Tab `2` lists the service containers your sandboxes use: shared by every instanc
 
 ## Run, stop, start
 
-`r` on a sandbox row prefills `:run web`: Enter starts a new instance, on its own worktree. The dashboard steps aside while the command prints; any key brings it back. `s` stops the selected instance, or starts it again. On an instance row, `r` renames it.
+`r` on a sandbox row prefills `:run web`: Enter starts a new instance, on its own worktree. `run`, `rebuild` and `start` run in the background and keep going if you quit the dashboard: the new row's status shows the step it's at (`building`, `postCreateCommand`, …), and `b` opens its build log, following along. `d` on a row still building offers to cancel it (a cancelled `run` is undone). `s` stops the selected instance, or starts it again. On an instance row, `r` renames it.
 
 <Try>`enter` to run `web-4`, any key to come back, then `↓` to an instance and `s`.</Try>
 
@@ -153,9 +153,10 @@ The real dashboard's keys, also in its `?` screen. The Preview column says what 
 | `r`               | Run (sandbox row) / rename (instance row)        | run only                 |
 | `s`               | Stop / start                                     | yes                      |
 | `l`               | Logs (Instances)                                 | yes                      |
+| `b`               | Build log (Instances): follows a build in flight | no                       |
 | `p`               | Forward a port (instance or service)             | yes                      |
 | `o`               | Open in VS Code (Instances)                      | yes                      |
-| `d`               | Remove the instance now, no prompt (Instances)   | no                       |
+| `d`               | Remove the instance now, no prompt; cancel it, after a `y`/`n`, while it's building (Instances) | no |
 | `t` / `K`         | SIGTERM / SIGKILL (process row)                  | no                       |
 
 ### Ports and Inbox list

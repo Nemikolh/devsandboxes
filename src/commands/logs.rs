@@ -37,7 +37,8 @@ pub fn build_log(name: &str, follow: bool) -> Result<()> {
     let mut file = match std::fs::File::open(&path) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // The dashboard runs verbs in-process, without a build log.
+            // An instance not built since build logs, or one only ever
+            // started by autostart (in-process, unlogged).
             bail!("`{key}` has no build log (no {})", path.display())
         }
         Err(e) => return Err(e).with_context(|| format!("cannot open {}", path.display())),

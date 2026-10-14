@@ -11,19 +11,20 @@
 //!
 //! The tee is process-wide fd surgery, so it only happens when the CLI asked
 //! for it ([`enable`], from `main` for the `run`/`rebuild`/`start` verbs):
-//! the dashboard and `devsandbox serve` call these commands in-process, where
-//! fds 1/2 belong to the terminal UI or `serve.log` and other threads write
-//! there too.
+//! `devsandbox serve` and the dashboard's autostart pass call these commands
+//! in-process, where fds 1/2 belong to `serve.log` or the terminal and other
+//! threads write there too. The dashboard's own `run`/`rebuild`/`start` are
+//! `devsandbox` subprocesses, so they log.
 //!
 //! Unix only: elsewhere [`open`] returns an inert log and nothing is written.
 
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::state::{Instance, State};
 
@@ -66,6 +67,55 @@ pub fn remove(instance_id: &str) {
     if let Ok(dir) = dir(instance_id) {
         let _ = std::fs::remove_dir_all(dir);
     }
+}
+
+/// Bytes [`tail`] reads off the end of a log: plenty for its line count
+/// unless lines are very long, without reading a big build's whole output
+/// on the dashboard's thread.
+const TAIL_BYTES: u64 = 256 * 1024;
+
+/// The end of a build log, for the dashboard's build-log modal.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Tail {
+    pub text: String,
+    /// Earlier lines were left out.
+    pub cut: bool,
+}
+
+/// The last `lines` lines of `instance_id`'s build log; `None` when it has
+/// none (an instance from before build logs, or one never built since).
+pub fn tail(instance_id: &str, lines: usize) -> Result<Option<Tail>> {
+    let path = path(instance_id)?;
+    let mut file = match File::open(&path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("cannot open {}", path.display())),
+    };
+    let read = |file: &mut File| -> std::io::Result<(Vec<u8>, bool)> {
+        let start = file.metadata()?.len().saturating_sub(TAIL_BYTES);
+        file.seek(SeekFrom::Start(start))?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok((bytes, start > 0))
+    };
+    let (bytes, partial) = read(&mut file).with_context(|| format!("cannot read {}", path.display()))?;
+    Ok(Some(last_lines(&String::from_utf8_lossy(&bytes), lines, partial)))
+}
+
+/// The last `n` lines of `text`, each as a terminal would leave it (after
+/// its last `\r`: a child's progress redraws). `partial`: `text` starts
+/// mid-file, so its first line may be cut short and is dropped.
+fn last_lines(text: &str, n: usize, partial: bool) -> Tail {
+    let mut lines: Vec<&str> = text
+        .lines()
+        .map(|l| l.trim_end_matches('\r').rsplit('\r').next().unwrap_or(""))
+        .collect();
+    if partial && !lines.is_empty() {
+        lines.remove(0);
+    }
+    let cut = partial || lines.len() > n;
+    let skip = lines.len().saturating_sub(n);
+    Tail { text: lines[skip..].join("\n"), cut }
 }
 
 /// Make `dir`, move an existing `build.log` to `build.1.log` (replacing the
@@ -342,6 +392,21 @@ mod tests {
     #[test]
     fn dir_is_per_instance_under_logs() {
         assert_eq!(dir_in(Path::new("/d/devsandbox"), "web-2"), PathBuf::from("/d/devsandbox/logs/web-2"));
+    }
+
+    #[test]
+    fn last_lines_keeps_the_end_as_a_terminal_shows_it() {
+        let t = last_lines("a\nb\nc\n", 2, false);
+        assert_eq!(t, Tail { text: "b\nc".into(), cut: true });
+        let t = last_lines("a\nb\n", 5, false);
+        assert_eq!(t, Tail { text: "a\nb".into(), cut: false });
+        // A read from mid-file drops its first, possibly partial, line.
+        let t = last_lines("tial\nb\n", 5, true);
+        assert_eq!(t, Tail { text: "b".into(), cut: true });
+        // Progress redraws keep their last state.
+        let t = last_lines("step 1/3\rstep 3/3\r\ndone\n", 5, false);
+        assert_eq!(t.text, "step 3/3\ndone");
+        assert_eq!(last_lines("", 5, false), Tail { text: String::new(), cut: false });
     }
 
     #[test]

@@ -11,7 +11,7 @@ use tui_term::widget::{Cursor, PseudoTerminal};
 
 use super::app::{
     chip, form_lines, form_title, forms_offset, pane_feed, pane_header, pinned_forms, short_age, title_of, App,
-    ConfigView, Extract, Focus, FormSpot, HeaderRow, HelpModal, InboxFocus, Modal, PaneLine, Pane, PortRow, Side, Tab,
+    BuildLogModal, ConfigView, ConfirmModal, Extract, Focus, FormSpot, HeaderRow, HelpModal, InboxFocus, Modal, PaneLine, Pane, PortRow, Side, Tab,
     TextModal, Thread, Tone, View,
 };
 use super::settings::SETTINGS;
@@ -62,6 +62,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Modal::Config(view) => draw_config_modal(frame, app, view),
         Modal::Help(view) => draw_help_modal(frame, app, view),
         Modal::Logs(view) => draw_text_modal(frame, app, view),
+        Modal::BuildLog(view) => draw_build_log_modal(frame, app, view),
+        Modal::Confirm(view) => draw_confirm_modal(frame, view),
     }
 
     // Last, so nothing drawn hides it; and the copy (or the count a release
@@ -2139,6 +2141,8 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
                 .to_string()
         }
         Modal::Logs(_) => "↑↓ scroll · pgup/pgdn · g/G · esc close".to_string(),
+        Modal::BuildLog(_) => "↑↓ scroll · pgup/pgdn · g/G (G follows) · esc close".to_string(),
+        Modal::Confirm(_) => "y/enter yes · n/esc no".to_string(),
         Modal::None => match app.tab {
             // A process row acts only on itself: signals, nothing forwarded to
             // the parent instance. Signals need container-namespace pids, so a
@@ -2151,12 +2155,13 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
                     "q quit · tab switch · ↑↓ select · ← parent · : cmd · ? help".to_string()
                 }
             }
-            // `r` and `s` mirror what the key would do to the selection:
-            // run vs rename, stop vs start.
+            // `r`, `s` and `d` mirror what the key would do to the
+            // selection: run vs rename, stop vs start, rm vs cancel.
             Tab::Instances => format!(
-                "q quit · tab switch · ↑↓ select · ←→ fold · enter config · r {} · o vscode · s {} · d rm · l logs · p forward · t term · : cmd · ? help",
+                "q quit · tab switch · ↑↓ select · ←→ fold · enter config · r {} · o vscode · s {} · d {} · l logs · b build log · p forward · t term · : cmd · ? help",
                 app.run_rename_hint(),
-                app.stop_start_hint()
+                app.stop_start_hint(),
+                app.remove_hint()
             ),
             Tab::Services => {
                 "q quit · tab switch · ↑↓ select · enter config · t term · p forward · : cmd · ? help"
@@ -2345,6 +2350,43 @@ fn draw_text_modal(frame: &mut Frame, app: &App, view: &TextModal) {
     frame.render_widget(ratatui::widgets::Clear, area);
     frame.render_widget(paragraph, area);
     selectable_lines(app, RegionId::TextModal, area, view.scroll, &view.body);
+}
+
+/// [`draw_text_modal`] for the build log, shown from [`BuildLogModal::top`]
+/// (the bottom while following), with the body height recorded for `App`'s
+/// stick-to-bottom math.
+fn draw_build_log_modal(frame: &mut Frame, app: &App, view: &BuildLogModal) {
+    let area = frame.area();
+    view.height.set(Block::bordered().inner(area).height);
+    let top = view.top();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ACCENT))
+        .title(view.text.title.clone());
+    let paragraph = Paragraph::new(view.text.body.clone()).block(block).scroll((top, 0));
+    frame.render_widget(ratatui::widgets::Clear, area);
+    frame.render_widget(paragraph, area);
+    selectable_lines(app, RegionId::TextModal, area, top, &view.text.body);
+}
+
+/// A small centered yes/no box over the dashboard.
+fn draw_confirm_modal(frame: &mut Frame, view: &ConfirmModal) {
+    let full = frame.area();
+    let width = (view.question.chars().count() as u16 + 6).max(24).min(full.width);
+    let height = 4.min(full.height);
+    let area = Rect {
+        x: full.x + (full.width - width) / 2,
+        y: full.y + (full.height - height) / 2,
+        width,
+        height,
+    };
+    let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(ACCENT));
+    let lines = vec![
+        Line::from(view.question.clone()),
+        Line::from("[y] yes  [n] no").style(Style::default().add_modifier(Modifier::DIM)),
+    ];
+    frame.render_widget(ratatui::widgets::Clear, area);
+    frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center).block(block), area);
 }
 
 /// The `?` modal's `(settings, help body)` areas inside its border over the

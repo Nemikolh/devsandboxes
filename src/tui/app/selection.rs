@@ -120,6 +120,7 @@ impl App {
             (RegionId::TextModal, Modal::Help(HelpModal { text: view, .. }) | Modal::Logs(view)) => {
                 view.scroll_by(delta) as usize
             }
+            (RegionId::TextModal, Modal::BuildLog(view)) => view.scroll_by(delta) as usize,
             // Up is older output, a larger scrollback offset; vt100 clamps
             // it (the alternate screen has none: it stays put).
             (RegionId::Terminal, _) => self.scroll_terminal_selection(-delta)?,

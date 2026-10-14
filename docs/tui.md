@@ -83,8 +83,9 @@ which live instances reference it. Same table/detail-panel pattern as step 3.
     TUI suspend); its outcome shows as a one-line status in the help bar.
   - `rm <instance>`.
 - Execution suspends the TUI (leave alt screen + raw mode), runs the existing command fns
-  (`commands::run::run`, `commands::exec::exec`, …) with inherited stdio, waits for a
-  keypress, re-enters the TUI and forces a data refresh.
+  (`commands::exec::exec`, `commands::rm::rm`, …) with inherited stdio, waits for a
+  keypress, re-enters the TUI and forces a data refresh. `run`, `rebuild` and `start`
+  no longer suspend: see *Background builds* below.
 - `tab` completion: first token from the command list; argument token from sandbox names
   (`run`) or instance names (`exec`, `code`, `rm`). Cycle on repeated tab.
 - History: `↑↓` in the prompt; persisted to `<data dir>/devsandbox/prompt_history`
@@ -422,6 +423,29 @@ it. Any event the button also queues for the sender is sent on the click.
   <path>:<line>`, or `opened VS Code; --goto dropped (<reason>)`). The
   thread `vscode` action passes its `path`/`line`/`col` the same way; `o`
   opens no file.
+
+## Background builds
+
+`run`, `rebuild` and `start` (from `:`, or `s` when it rebuilds a drifted,
+missing or failed instance) never take over the screen
+(docs/instance-phase.md, step 6). The loop spawns `devsandbox -C <dir>
+<verb> … -- <target>` detached (`spawn_detached` in `src/tui/mod.rs`): its
+own session, stdio null, `GIT_TERMINAL_PROMPT=0`, the runtime pinned. The
+work outlives the dashboard; quitting just drops the thread that waits on
+it. The help bar says `run web: started`, the snapshot refreshes at once
+(and again on exit), and the row's status column shows the phase. A
+non-zero exit leaves a help-bar line pointing at the build-log key.
+
+- `b` on an instance row opens its build log (`<data>/devsandbox/logs/
+  <instance_id>/build.log`, the last 500 lines) in a modal titled with the
+  phase. The event loop reads the file (`build_log::tail`), not `App`; it
+  re-reads on each snapshot while the instance is in flight, and once more
+  after. The modal follows the bottom until you scroll up; `G` (or
+  scrolling back down) follows again.
+- `d` on an in-flight row asks `cancel <name>'s build?` (`y`/`enter`,
+  `n`/`esc`). Yes SIGINTs the recorded pid's process group (the pid alone
+  when it leads none), read fresh from state; a cancelled `run` rolls back
+  (its row and log go), a `rebuild`/`start` records `failed`. Unix only.
 
 ## Mouse selection
 

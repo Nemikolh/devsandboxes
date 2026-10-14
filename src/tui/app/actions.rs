@@ -38,8 +38,10 @@ impl App {
     /// `d` (Instances tab): remove the instance under the cursor right away,
     /// no prompt, via the same suspend path `:rm` takes (non-forced, so `rm`'s
     /// own dirty-worktree refusal and branch-delete question still guard it).
-    /// A no-op off an instance (process rows are filtered by the caller),
-    /// and refused while it's in flight; a failed one is removable.
+    /// A no-op off an instance (process rows are filtered by the caller). An
+    /// in-flight one can't be removed: `d` asks to cancel its build instead
+    /// (a cancelled `run` rolls back, so that's its removal); a failed one is
+    /// removable.
     pub(super) fn remove_instance(&mut self) {
         let Some(i) = self.selected_instance_index() else {
             return;
@@ -47,8 +49,9 @@ impl App {
         let Some(row) = self.snapshot.as_ref().and_then(|s| s.instances.get(i)) else {
             return;
         };
-        if let Some(why) = busy(row) {
-            self.status = Some(why);
+        if busy(row).is_some() {
+            let name = row.name.clone();
+            self.confirm_cancel_build(name);
             return;
         }
         self.pending_action = Some(PromptAction::Rm { instance: row.name.clone(), force: false });
@@ -110,14 +113,14 @@ impl App {
     /// stop/start for the same instance is in flight.
     ///
     /// Two cases can't be served by a bare `docker start` and are *rebuilt*
-    /// instead, by queuing a [`PromptAction::Rebuild`] through the same suspend
-    /// path the `:` prompt uses (the loop restores the terminal, runs `rebuild`
-    /// with inherited stdio, then re-enters): an exited instance whose
-    /// container drifted from the current config, and a missing container —
-    /// `rebuild` is the worktree-preserving way to recreate it (`run` refuses
-    /// the taken name, `rm` destroys the worktree). Rebuild is modal, so it
-    /// needs no `starting` in-flight guard — the guard is only for the
-    /// background stop/start ops.
+    /// instead, by queuing a [`PromptAction::Rebuild`] like the `:` prompt's
+    /// (the loop runs it as a detached `devsandbox rebuild`): an exited
+    /// instance whose container drifted from the current config, and a
+    /// missing container — `rebuild` is the worktree-preserving way to
+    /// recreate it (`run` refuses the taken name, `rm` destroys the
+    /// worktree). It needs no `starting` guard: once the rebuild records its
+    /// phase the row is in flight, which `busy` refuses, and `rebuild`
+    /// itself refuses an in-flight instance.
     ///
     /// The phase comes first: an in-flight instance gets nothing (a status
     /// line says what it's doing), and a failed one is rebuilt, the retry
@@ -151,9 +154,8 @@ impl App {
                 self.pending_stop = Some(name);
             }
             ContainerStatus::Exited(_) if row.drift => {
-                // Config drifted: recreate the container (worktree preserved) via
-                // the modal suspend path instead of a bare start. No `starting`
-                // guard — that's for background ops; the suspend is modal.
+                // Config drifted: recreate the container (worktree preserved)
+                // with a detached rebuild instead of a bare start.
                 self.pending_action =
                     Some(PromptAction::Rebuild { instance: name, force: false });
             }
@@ -166,9 +168,9 @@ impl App {
                 self.status = Some(format!("{name}: status still loading"));
             }
             ContainerStatus::Missing => {
-                // No container to start: recreate it via the CLI rebuild on the
-                // suspend path (its "config label gone → rebuild anyway" rule
-                // covers exactly this).
+                // No container to start: recreate it via the CLI rebuild (its
+                // "config label gone → rebuild anyway" rule covers exactly
+                // this).
                 self.pending_action =
                     Some(PromptAction::Rebuild { instance: name, force: false });
             }
@@ -198,6 +200,16 @@ impl App {
             Some(InstanceRow { phase: Some(PhaseRow::Failed { .. }), .. }) => "rebuild",
             Some(row) if matches!(row.status, ContainerStatus::Exited(_) | ContainerStatus::Missing) => "start",
             _ => "stop",
+        }
+    }
+
+    /// Help-bar verb for the `d` key, matching [`Self::remove_instance`]:
+    /// `cancel` on an in-flight instance, else `rm`.
+    pub fn remove_hint(&self) -> &'static str {
+        let row = self.selected_instance_index().and_then(|i| self.snapshot.as_ref()?.instances.get(i));
+        match row {
+            Some(row) if busy(row).is_some() => "cancel",
+            _ => "rm",
         }
     }
 
@@ -494,8 +506,9 @@ mod tests {
         assert_eq!(app.stop_start_hint(), "start");
     }
 
-    /// An in-flight row offers nothing that would race the build: `s` and
-    /// `d` only say what it's doing, whatever its container does.
+    /// An in-flight row offers nothing that would race the build: `s` only
+    /// says what it's doing, whatever its container does, and `d` asks to
+    /// cancel it rather than remove it.
     #[test]
     fn s_and_d_on_an_in_flight_instance_queue_nothing() {
         for status in [ContainerStatus::Missing, running(), ContainerStatus::Exited("Exited (1)".into())] {
@@ -506,11 +519,43 @@ mod tests {
             app.on_key(key(KeyCode::Char('s')));
             assert_eq!(app.status.as_deref(), Some("`inst0` is still running postCreateCommand"));
             app.on_key(key(KeyCode::Char('d')));
-            assert_eq!(app.status.as_deref(), Some("`inst0` is still running postCreateCommand"));
+            assert!(matches!(app.modal, Modal::Confirm(_)));
+            app.on_key(key(KeyCode::Esc));
             assert_eq!(app.take_pending_action(), None);
             assert_eq!(app.take_pending_stop(), None);
             assert_eq!(app.take_pending_start(), None);
+            assert_eq!(app.take_pending_cancel(), None);
         }
+    }
+
+    /// `d` on an in-flight row: confirm, then the loop SIGINTs its build;
+    /// any answer but yes queues nothing.
+    #[test]
+    fn d_on_an_in_flight_instance_confirms_a_cancel() {
+        let mut app = new_app();
+        app.set_snapshot(snapshot_with_phase(1, ContainerStatus::Missing, in_flight("building")));
+        app.on_key(key(KeyCode::Down)); // onto inst0
+        app.on_key(key(KeyCode::Char('d')));
+        match &app.modal {
+            Modal::Confirm(c) => assert_eq!(c.question, "cancel inst0's build?"),
+            _ => panic!("no confirm"),
+        }
+        // Other keys neither answer nor reach the dashboard.
+        app.on_key(key(KeyCode::Char('s')));
+        assert!(matches!(app.modal, Modal::Confirm(_)));
+        app.on_key(key(KeyCode::Char('n')));
+        assert!(matches!(app.modal, Modal::None));
+        assert_eq!(app.take_pending_cancel(), None);
+        app.on_key(key(KeyCode::Char('d')));
+        app.on_key(key(KeyCode::Char('y')));
+        assert!(matches!(app.modal, Modal::None));
+        assert_eq!(app.take_pending_cancel(), Some("inst0".into()));
+        assert_eq!(app.status.as_deref(), Some("cancelling inst0…"));
+        assert_eq!(app.take_pending_action(), None);
+        // `enter` is yes too.
+        app.on_key(key(KeyCode::Char('d')));
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.take_pending_cancel(), Some("inst0".into()));
     }
 
     /// A failed row retries with `s` (a rebuild, even over a running or

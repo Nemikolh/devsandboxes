@@ -39,7 +39,7 @@ pub use forms::{form_lines, form_title, forms_offset, pinned_forms, FormSpot};
 pub use actions::PendingDone;
 pub use procs::{PendingSignal, Signal};
 pub use selection::{copy_key_intercepted, Extract};
-pub use view::{ConfigView, HelpModal, Modal, Pane, Side, TextModal};
+pub use view::{BuildLogModal, ConfigView, ConfirmModal, HelpModal, Modal, Pane, Side, TextModal, BUILD_LOG_LINES};
 use view::{col_near, divider_pct};
 
 /// The four top-level views.
@@ -171,6 +171,12 @@ pub struct App {
     /// A `kill` the event loop should spawn on a background thread (the
     /// SIGTERM/SIGKILL shortcuts on a process row). Runs without suspending.
     pub pending_signal: Option<PendingSignal>,
+    /// Instance whose `run`/`rebuild`/`start` the event loop should SIGINT
+    /// (`d` on an in-flight row, confirmed): its recorded pid's group.
+    pub pending_cancel: Option<String>,
+    /// Instance id whose build log the event loop should read into the open
+    /// [`BuildLogModal`].
+    pub pending_build_log: Option<String>,
     /// Live forwards shown on the Ports tab, fed by the forwarder worker (step
     /// 10). Empty until the worker reports; set via [`Self::set_ports`].
     pub ports: Vec<PortRow>,
@@ -274,6 +280,8 @@ impl App {
             starting: BTreeSet::new(),
             after_start: None,
             pending_signal: None,
+            pending_cancel: None,
+            pending_build_log: None,
             pending_done: Vec::new(),
             ports: Vec::new(),
             pending_port: None,
@@ -322,6 +330,7 @@ impl App {
         }
         self.snapshot = Some(snapshot);
         self.clamp_selection();
+        self.refresh_build_log();
     }
 
     /// Install the forwarder's latest rows and re-clamp the Ports selection in
@@ -529,6 +538,7 @@ impl App {
             }
             KeyCode::Char('d') if self.tab == Tab::Instances && !on_proc => self.remove_instance(),
             KeyCode::Char('l') if !on_proc => self.open_logs(),
+            KeyCode::Char('b') if self.tab == Tab::Instances && !on_proc => self.open_build_log(),
             // Forwarding: `p` opens the `port` prompt prefilled from the selected
             // instance (Instances, not a process row) or service (Services); `d`
             // stops the selected forward on the Ports tab.

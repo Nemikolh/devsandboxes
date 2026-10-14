@@ -241,6 +241,9 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
     // Background done-flag writes (`d`/`u`, a thread's child); the `bool` is
     // `PendingDone::report`.
     let mut dones: Vec<(bool, Receiver<OpDone>)> = Vec::new();
+    // Detached `run`/`rebuild`/`start` children (waited on by a thread each,
+    // which reports the exit) and build cancels: report and resnapshot.
+    let mut builds: Vec<Receiver<OpDone>> = Vec::new();
     let mut last_tick = Instant::now();
     // At most one process fetch in flight; `Some` while one is running.
     let mut proc_pending: Option<Receiver<BTreeMap<String, ProcState>>> = None;
@@ -329,10 +332,27 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
         }
 
         // A prompt command is ready: suspend the TUI (or, for `code`, launch
-        // it in the background), then force a redraw + immediate refresh on
-        // return.
+        // it in the background; for `run`/`rebuild`/`start`, spawn it
+        // detached), then force a redraw + immediate refresh on return.
         if let Some(action) = app.take_pending_action() {
             match action {
+                // The build outlives the dashboard and logs itself; its row
+                // shows the phase as soon as it's recorded.
+                action @ (PromptAction::Run { .. } | PromptAction::Rebuild { .. } | PromptAction::Start { .. }) => {
+                    let label = detached_label(&action);
+                    match spawn_detached(&dir, &action) {
+                        Ok(rx) => {
+                            app.status = Some(format!("{label}: started"));
+                            builds.push(rx);
+                        }
+                        Err(e) => app.status = Some(format!("{label}: {e:#}")),
+                    }
+                    last_tick = Instant::now();
+                    followup.schedule(last_tick);
+                    if pending.is_none() {
+                        pending = Some(spawn_collect(&dir, &mut stats_clock));
+                    }
+                }
                 PromptAction::Code { instance, goto } => {
                     app.status = Some("opening VS Code…".into());
                     codes.push(spawn_code(dir.clone(), instance, goto, app.code_note.take()));
@@ -374,6 +394,16 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
         }
         for req in app.take_pending_done() {
             dones.push((req.report, spawn_done(req.instance, req.done)));
+        }
+        // `d` on an in-flight row, confirmed: SIGINT its build off-thread.
+        if let Some(instance) = app.take_pending_cancel() {
+            builds.push(spawn_cancel(instance));
+        }
+        // An open build log wants (re)reading: a local file tail, cheap
+        // enough for the loop, kept out of `App`.
+        if let Some(id) = app.take_build_log_read() {
+            let read = crate::build_log::tail(&id, app::BUILD_LOG_LINES).map_err(|e| format!("{e:#}"));
+            app.set_build_log(&id, read);
         }
         // An Inbox link: hand it to the desktop opener.
         if let Some(link) = app.take_pending_open() {
@@ -536,6 +566,22 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
             Err(TryRecvError::Disconnected) => false,
         });
 
+        // Drain finished detached builds and cancels: report, and resnapshot
+        // so the row shows how it ended.
+        builds.retain_mut(|rx| match rx.try_recv() {
+            Ok(done) => {
+                app.status = Some(done.status);
+                last_tick = Instant::now();
+                followup.schedule(last_tick);
+                if pending.is_none() {
+                    pending = Some(spawn_collect(&dir, &mut stats_clock));
+                }
+                false
+            }
+            Err(TryRecvError::Empty) => true,
+            Err(TryRecvError::Disconnected) => false,
+        });
+
         // Drain a finished collection into the app, freeing the in-flight slot.
         if let Some(rx) = &pending {
             match rx.try_recv() {
@@ -606,40 +652,26 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
 
 /// Leave the TUI, run a prompt command with inherited stdio, wait for one
 /// keypress, then re-enter the TUI. Command errors are printed (not propagated)
-/// so a failed `run`/`exec`/`rm` returns the user to the dashboard.
+/// so a failed `exec`/`rm` returns the user to the dashboard.
 fn run_suspended(terminal: &mut Term, dir: &Path, action: PromptAction) -> Result<()> {
     restore();
 
     let result = match &action {
-        PromptAction::Run { sandbox, name, branch, base } => {
-            commands::run::run(
-                dir,
-                Some(sandbox.clone()),
-                name.clone(),
-                branch.clone(),
-                base.clone(),
-                Default::default(),
-            )
-            .map(|key| key.into_iter().for_each(|key| println!("{key}")))
-        }
         PromptAction::Exec { instance, argv } => {
             commands::exec::exec_status(instance, true, true, argv).map(|_| ())
         }
         PromptAction::Rm { instance, force } => commands::rm::rm(instance, None, *force),
         PromptAction::Stop { instance } => commands::stop::stop(Some(instance.clone()), false),
-        PromptAction::Start { instance } => {
-            commands::start::start(dir, Some(instance.clone()), false)
-        }
-        PromptAction::Rebuild { instance, force } => {
-            commands::rebuild::rebuild(dir, Some(instance.clone()), false, *force)
-        }
         PromptAction::ServiceRebuild { name } => commands::services::rebuild(dir, name),
-        // `code`/`rename` never suspend (handled by the caller); `port` never
-        // reaches here — `App` routes it to `pending_port` (step 10), not
-        // `pending_action`.
-        PromptAction::Code { .. } | PromptAction::Rename { .. } | PromptAction::Port { .. } => {
-            Ok(())
-        }
+        // `code`/`rename` never suspend, nor do `run`/`rebuild`/`start`
+        // (detached): the caller handles them. `port` never reaches here —
+        // `App` routes it to `pending_port` (step 10), not `pending_action`.
+        PromptAction::Code { .. }
+        | PromptAction::Rename { .. }
+        | PromptAction::Port { .. }
+        | PromptAction::Run { .. }
+        | PromptAction::Rebuild { .. }
+        | PromptAction::Start { .. } => Ok(()),
     };
     if let Err(e) = result {
         match log_error(&action, &e) {
@@ -668,16 +700,18 @@ fn run_suspended(terminal: &mut Term, dir: &Path, action: PromptAction) -> Resul
 /// `None` on any I/O failure, so the caller falls back to a plain stderr print.
 fn log_error(action: &PromptAction, err: &anyhow::Error) -> Option<PathBuf> {
     let verb = match action {
-        PromptAction::Run { .. } => "run",
         PromptAction::Exec { .. } => "exec",
         PromptAction::Rm { .. } => "rm",
         PromptAction::Stop { .. } => "stop",
-        PromptAction::Start { .. } => "start",
-        PromptAction::Rebuild { .. } => "rebuild",
         PromptAction::ServiceRebuild { .. } => "service rebuild",
-        PromptAction::Code { .. } => "code",
-        PromptAction::Rename { .. } => "rename",
-        PromptAction::Port { .. } => "port",
+        // Never suspended (`run_suspended`): nothing to log here. A detached
+        // build writes its own build log.
+        PromptAction::Code { .. }
+        | PromptAction::Rename { .. }
+        | PromptAction::Port { .. }
+        | PromptAction::Run { .. }
+        | PromptAction::Rebuild { .. }
+        | PromptAction::Start { .. } => return None,
     };
     let dir = crate::state::State::path().ok()?.parent()?.join("logs");
     std::fs::create_dir_all(&dir).ok()?;
@@ -725,6 +759,196 @@ fn spawn_code(dir: PathBuf, instance: String, goto: Option<Goto>, note: Option<S
         let _ = tx.send(OpDone { status, failed: false });
     });
     rx
+}
+
+/// The `devsandbox` arguments (after `-C <dir>`) a detached
+/// [`PromptAction::Run`]/`Rebuild`/`Start` runs with; `None` for the other
+/// actions. The sandbox / instance always goes in, so no pick prompt can
+/// come up; `--opt=value` and `--` keep a value starting with `-` a value.
+fn detached_args(action: &PromptAction) -> Option<Vec<String>> {
+    let mut args = Vec::new();
+    let target = match action {
+        PromptAction::Run { sandbox, name, branch, base } => {
+            args.push("run".to_string());
+            for (flag, value) in [("name", name), ("branch", branch), ("base", base)] {
+                if let Some(value) = value {
+                    args.push(format!("--{flag}={value}"));
+                }
+            }
+            sandbox
+        }
+        PromptAction::Rebuild { instance, force } => {
+            args.push("rebuild".to_string());
+            if *force {
+                args.push("--force".to_string());
+            }
+            instance
+        }
+        PromptAction::Start { instance } => {
+            args.push("start".to_string());
+            instance
+        }
+        _ => return None,
+    };
+    args.push("--".to_string());
+    args.push(target.clone());
+    Some(args)
+}
+
+/// `run web` / `rebuild web-2` / `start web-2`: how the status line names a
+/// detached build.
+fn detached_label(action: &PromptAction) -> String {
+    match action {
+        PromptAction::Run { sandbox, name: Some(name), .. } => format!("run {sandbox} --name {name}"),
+        PromptAction::Run { sandbox, .. } => format!("run {sandbox}"),
+        PromptAction::Rebuild { instance, .. } => format!("rebuild {instance}"),
+        PromptAction::Start { instance } => format!("start {instance}"),
+        _ => String::new(),
+    }
+}
+
+/// The status line for a detached build's exit: `None` (exit 0) says it's
+/// done; a failure quotes the child's last stderr line (`error`, when there
+/// is one: the only trace of a failure before the instance was recorded,
+/// and how a cancel reads as one) and points at the instance's build log
+/// (`b`). A `run` without `--name` doesn't know its instance's name (the
+/// child picks it), but its failed row shows up under the sandbox.
+fn detached_outcome(action: &PromptAction, code: Option<Option<i32>>, error: Option<&str>) -> String {
+    let label = detached_label(action);
+    let how = match (code, error) {
+        (None, _) => return format!("{label}: done"),
+        (_, Some(error)) => error.to_string(),
+        (Some(Some(code)), None) => format!("exit {code}"),
+        (Some(None), None) => "killed".to_string(),
+    };
+    let instance = match action {
+        PromptAction::Run { name, .. } => name.as_deref(),
+        PromptAction::Rebuild { instance, .. } | PromptAction::Start { instance } => Some(instance.as_str()),
+        _ => None,
+    };
+    match instance {
+        Some(instance) => format!("{label} failed: {how} (b on {instance} opens its build log)"),
+        None => format!("{label} failed: {how} (b on its row opens the build log)"),
+    }
+}
+
+/// Start `action` as `devsandbox -C <dir> <args…>` (`detached_args`),
+/// detached so the build outlives the dashboard: its own session (`setsid`,
+/// as `serve::client::spawn_detached`: no hangup when the terminal goes, no
+/// Ctrl-C from it, and its pid leads the process group `d` cancels), stdio
+/// null (it writes its own build log; prompts take their non-TTY default)
+/// and, as the dispatcher's subprocesses, no git credential prompt and this
+/// process's runtime. Stderr goes to a scratch file instead of null, read
+/// back for the exit's status line ([`last_error_line`]) and then removed:
+/// a file, not a pipe, so the child never writes into a closed pipe once
+/// the dashboard quits. A thread reaps it and reports the exit; quitting
+/// the dashboard just drops that thread.
+fn spawn_detached(dir: &Path, action: &PromptAction) -> Result<Receiver<OpDone>> {
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let args = detached_args(action).context("not a detached verb")?;
+    let logs = crate::state::State::path()?.parent().context("no data dir")?.join("logs");
+    std::fs::create_dir_all(&logs).with_context(|| format!("cannot create {}", logs.display()))?;
+    let scratch = logs.join(format!(
+        "detached-{}-{}-{}.stderr",
+        std::process::id(),
+        crate::state::Instance::now(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let stderr = std::fs::File::create(&scratch).with_context(|| format!("cannot create {}", scratch.display()))?;
+    let exe = std::env::current_exe().context("cannot locate the devsandbox binary")?;
+    // Absolute, so the child is pinned to the same root whatever its cwd.
+    let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let mut cmd = Command::new(exe);
+    cmd.arg("-C")
+        .arg(&dir)
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(stderr)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env(crate::runtime::RUNTIME_ENV, crate::runtime::backend().name());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: setsid is async-signal-safe; nothing else runs between fork and exec.
+        unsafe {
+            cmd.pre_exec(|| if libc::setsid() == -1 { Err(io::Error::last_os_error()) } else { Ok(()) });
+        }
+    }
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            let _ = std::fs::remove_file(&scratch);
+            return Err(e).context("cannot start devsandbox");
+        }
+    };
+    let (tx, rx) = mpsc::channel();
+    let action = action.clone();
+    std::thread::spawn(move || {
+        let waited = child.wait();
+        let error = std::fs::read_to_string(&scratch).ok().and_then(|t| last_error_line(&t));
+        let _ = std::fs::remove_file(&scratch);
+        let (status, failed) = match waited {
+            Ok(s) if s.success() => (detached_outcome(&action, None, None), false),
+            Ok(s) => (detached_outcome(&action, Some(s.code()), error.as_deref()), true),
+            Err(e) => (format!("{}: {e}", detached_label(&action)), true),
+        };
+        let _ = tx.send(OpDone { status, failed });
+    });
+    Ok(rx)
+}
+
+/// The last non-empty line of a detached child's stderr, without the
+/// `error: ` prefix `main` puts on a failed command's error (warnings and
+/// notes before it don't matter once it failed).
+fn last_error_line(stderr: &str) -> Option<String> {
+    let line = stderr.lines().map(str::trim).rfind(|l| !l.is_empty())?;
+    Some(line.strip_prefix("error: ").unwrap_or(line).to_string())
+}
+
+/// Spawn a thread that cancels `instance`'s build: SIGINT to its recorded
+/// pid's process group (a detached build leads its own, so docker and git
+/// under it get it too), else to the pid alone (one started from a shell
+/// pipeline). The command then rolls back (`run`) or records failed. Read
+/// fresh from state, and only while still in flight, so a pid recycled
+/// since the snapshot isn't signalled.
+fn spawn_cancel(instance: String) -> Receiver<OpDone> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let status = match crate::state::State::load() {
+            Ok(state) => match state.instances.get(&instance) {
+                Some(info) => match (&info.progress, info.phase_view()) {
+                    (Some(p), Some(crate::state::PhaseView::InFlight(_))) => interrupt(p.pid)
+                        .map(|()| format!("cancelling {instance} (SIGINT to pid {})", p.pid))
+                        .unwrap_or_else(|e| format!("cancel {instance}: {e}")),
+                    _ => format!("cancel {instance}: not building any more"),
+                },
+                None => format!("cancel {instance}: unknown instance"),
+            },
+            Err(e) => format!("cancel {instance}: {e:#}"),
+        };
+        let _ = tx.send(OpDone { status, failed: false });
+    });
+    rx
+}
+
+/// SIGINT `pid`'s process group, else `pid`.
+#[cfg(unix)]
+fn interrupt(pid: u32) -> std::result::Result<(), String> {
+    // 0 and 1 would be our own group and init.
+    let pid = libc::pid_t::try_from(pid).ok().filter(|&p| p > 1).ok_or(format!("bad pid {pid}"))?;
+    // SAFETY: plain syscalls on integers.
+    if unsafe { libc::kill(-pid, libc::SIGINT) } == 0 || unsafe { libc::kill(pid, libc::SIGINT) } == 0 {
+        return Ok(());
+    }
+    Err(format!("SIGINT to pid {pid}: {}", io::Error::last_os_error()))
+}
+
+#[cfg(not(unix))]
+fn interrupt(_pid: u32) -> std::result::Result<(), String> {
+    Err("not supported on this platform".into())
 }
 
 /// Hand `link` to the desktop opener (`open` on macOS, `xdg-open` elsewhere),
@@ -970,6 +1194,84 @@ mod tests {
         assert_eq!(c.depth(t0 + STATS_INTERVAL - Duration::from_millis(1)), data::Depth::Listing);
         assert_eq!(c.depth(t0 + STATS_INTERVAL), data::Depth::Full);
         assert_eq!(c.depth(t0 + STATS_INTERVAL + TICK_INTERVAL), data::Depth::Listing);
+    }
+
+    fn strings(args: &[&str]) -> Option<Vec<String>> {
+        Some(args.iter().map(|s| s.to_string()).collect())
+    }
+
+    #[test]
+    fn detached_args_map_each_verb_to_its_cli_flags() {
+        let run = |name: Option<&str>, branch: Option<&str>, base: Option<&str>| PromptAction::Run {
+            sandbox: "web".into(),
+            name: name.map(Into::into),
+            branch: branch.map(Into::into),
+            base: base.map(Into::into),
+        };
+        assert_eq!(detached_args(&run(None, None, None)), strings(&["run", "--", "web"]));
+        assert_eq!(
+            detached_args(&run(Some("w2"), Some("feat/x"), Some("-odd"))),
+            strings(&["run", "--name=w2", "--branch=feat/x", "--base=-odd", "--", "web"])
+        );
+        let rebuild = |force| PromptAction::Rebuild { instance: "web-2".into(), force };
+        assert_eq!(detached_args(&rebuild(false)), strings(&["rebuild", "--", "web-2"]));
+        assert_eq!(detached_args(&rebuild(true)), strings(&["rebuild", "--force", "--", "web-2"]));
+        assert_eq!(
+            detached_args(&PromptAction::Start { instance: "web-2".into() }),
+            strings(&["start", "--", "web-2"])
+        );
+        // The rest stay suspended (or in-process).
+        assert_eq!(detached_args(&PromptAction::Stop { instance: "web-2".into() }), None);
+        assert_eq!(detached_args(&PromptAction::Rm { instance: "web-2".into(), force: false }), None);
+    }
+
+    /// The argv parses as the CLI's own verb, so a flag rename can't drift.
+    #[test]
+    fn detached_args_parse_as_the_cli() {
+        use clap::CommandFactory;
+        let parse = |args: Vec<String>| {
+            let cmd = crate::Cli::command();
+            let argv = ["devsandbox", "-C", "/cfg"].into_iter().map(String::from).chain(args);
+            cmd.try_get_matches_from(argv).map(|m| m.subcommand_name().map(String::from))
+        };
+        let action = PromptAction::Run {
+            sandbox: "web".into(),
+            name: Some("w2".into()),
+            branch: Some("b".into()),
+            base: Some("origin/main".into()),
+        };
+        assert_eq!(parse(detached_args(&action).unwrap()).unwrap().as_deref(), Some("run"));
+        let action = PromptAction::Rebuild { instance: "-x".into(), force: true };
+        assert_eq!(parse(detached_args(&action).unwrap()).unwrap().as_deref(), Some("rebuild"));
+        let action = PromptAction::Start { instance: "w".into() };
+        assert_eq!(parse(detached_args(&action).unwrap()).unwrap().as_deref(), Some("start"));
+    }
+
+    #[test]
+    fn detached_outcome_points_a_failure_at_the_build_log() {
+        let rebuild = PromptAction::Rebuild { instance: "web-2".into(), force: false };
+        assert_eq!(detached_outcome(&rebuild, None, None), "rebuild web-2: done");
+        assert_eq!(
+            detached_outcome(&rebuild, Some(Some(1)), None),
+            "rebuild web-2 failed: exit 1 (b on web-2 opens its build log)"
+        );
+        let run = PromptAction::Run { sandbox: "web".into(), name: None, branch: None, base: None };
+        assert_eq!(
+            detached_outcome(&run, Some(None), None),
+            "run web failed: killed (b on its row opens the build log)"
+        );
+        // The child's own error wins over the bare exit code.
+        assert_eq!(
+            detached_outcome(&run, Some(Some(1)), Some("instance `web` already exists")),
+            "run web failed: instance `web` already exists (b on its row opens the build log)"
+        );
+    }
+
+    #[test]
+    fn last_error_line_is_the_final_error_without_its_prefix() {
+        assert_eq!(last_error_line("warning: x\nerror: `web` cancelled: rolled back\n\n").as_deref(), Some("`web` cancelled: rolled back"));
+        assert_eq!(last_error_line("plain\n").as_deref(), Some("plain"));
+        assert_eq!(last_error_line(" \n"), None);
     }
 
     #[test]
