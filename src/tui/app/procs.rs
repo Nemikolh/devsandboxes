@@ -17,12 +17,12 @@ pub enum Signal {
 }
 
 impl Signal {
-    /// The numeric signal passed to `kill -<n>` (portable across busybox and
-    /// coreutils, unlike some name spellings).
-    pub fn num(self) -> i32 {
+    /// The name `instances.signal` takes (the daemon maps it to the number
+    /// `kill -<n>` gets).
+    pub fn wire(self) -> &'static str {
         match self {
-            Signal::Term => 15,
-            Signal::Kill => 9,
+            Signal::Term => "TERM",
+            Signal::Kill => "KILL",
         }
     }
 
@@ -35,17 +35,19 @@ impl Signal {
     }
 }
 
-/// A pending `kill` the event loop should run on a background thread: signal
-/// `pid` inside `container`. Set by the SIGTERM/SIGKILL process-row shortcuts.
+/// A pending `kill` the event loop should send as `instances.signal`: signal
+/// `pid` inside `instance`'s container (the daemon resolves it). Set by the
+/// SIGTERM/SIGKILL process-row shortcuts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingSignal {
-    pub container: String,
+    /// State key (a snapshot row name).
+    pub instance: String,
     pub pid: String,
     pub signal: Signal,
 }
 
 impl App {
-    /// The selected process row as `(container, pid)`, when the cursor is on a
+    /// The selected process row as `(instance, pid)`, when the cursor is on a
     /// real process (not a `(message)` placeholder) with a numeric pid. Backs the
     /// SIGTERM/SIGKILL shortcuts; `None` on every other selection.
     fn selected_proc(&self) -> Option<(String, String)> {
@@ -69,24 +71,24 @@ impl App {
         // Defensive: `parse_top` only yields numeric pids, but never hand a
         // non-numeric token to `kill`.
         proc.pid.parse::<u32>().ok()?;
-        Some((inst.container.clone(), proc.pid.clone()))
+        Some((inst.name.clone(), proc.pid.clone()))
     }
 
-    /// Queue `signal` for the selected process, for the event loop to send on a
-    /// background thread. No-op when the cursor is not on a signalable process.
+    /// Queue `signal` for the selected process, for the event loop to send to
+    /// the daemon. No-op when the cursor is not on a signalable process.
     pub(super) fn signal_selected_proc(&mut self, signal: Signal) {
-        let Some((container, pid)) = self.selected_proc() else {
+        let Some((instance, pid)) = self.selected_proc() else {
             return;
         };
         self.status = Some(format!("sending {} to pid {pid}…", signal.name()));
         self.pending_signal = Some(PendingSignal {
-            container,
+            instance,
             pid,
             signal,
         });
     }
 
-    /// Take the pending process signal for the event loop to spawn, if any.
+    /// Take the pending process signal for the event loop to send, if any.
     pub fn take_pending_signal(&mut self) -> Option<PendingSignal> {
         self.pending_signal.take()
     }
@@ -257,7 +259,7 @@ mod tests {
         assert_eq!(
             app.take_pending_signal(),
             Some(PendingSignal {
-                container: "devsandbox-inst0".into(),
+                instance: "inst0".into(),
                 pid: "10".into(),
                 signal: Signal::Term,
             }),
@@ -266,7 +268,7 @@ mod tests {
         assert_eq!(
             app.take_pending_signal(),
             Some(PendingSignal {
-                container: "devsandbox-inst0".into(),
+                instance: "inst0".into(),
                 pid: "10".into(),
                 signal: Signal::Kill,
             }),

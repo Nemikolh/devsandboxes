@@ -39,7 +39,10 @@ pub use forms::{form_lines, form_title, forms_offset, pinned_forms, FormSpot};
 pub use actions::PendingDone;
 pub use procs::{PendingSignal, Signal};
 pub use selection::{copy_key_intercepted, Extract};
-pub use view::{BuildLogModal, ConfigView, ConfirmModal, HelpModal, Modal, Pane, Side, TextModal, BUILD_LOG_LINES};
+pub use view::{
+    BuildLogModal, ConfigKind, ConfigView, ConfirmModal, Fetch, HelpModal, Modal, Pane, Side, TextModal, BUILD_LOG_LINES,
+    LOG_LINES,
+};
 use view::{col_near, divider_pct};
 
 /// The four top-level views.
@@ -178,6 +181,14 @@ pub struct App {
     /// Instance id whose build log the event loop should read into the open
     /// [`BuildLogModal`].
     pub pending_build_log: Option<String>,
+    /// A build-log read was handed to the event loop and isn't answered yet
+    /// ([`App::take_build_log_read`]).
+    build_log_in_flight: bool,
+    /// Daemon reads the open modals wait on, for the event loop to send.
+    pending_fetch: Vec<Fetch>,
+    /// The container the logs modal shows, so a late answer for another
+    /// one is dropped ([`App::set_logs`]).
+    logs_container: Option<String>,
     /// Live forwards shown on the Ports tab, fed by the forwarder worker (step
     /// 10). Empty until the worker reports; set via [`Self::set_ports`].
     pub ports: Vec<PortRow>,
@@ -287,6 +298,9 @@ impl App {
             pending_signal: None,
             pending_cancel: None,
             pending_build_log: None,
+            build_log_in_flight: false,
+            pending_fetch: Vec::new(),
+            logs_container: None,
             pending_done: Vec::new(),
             ports: Vec::new(),
             pending_port: None,

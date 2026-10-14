@@ -85,6 +85,7 @@ pub(super) fn snapshot_with(n: usize) -> Snapshot {
 pub(super) fn open_modal(app: &mut App) {
     app.modal = Modal::Config(ConfigView {
         title: "s".into(),
+        kind: ConfigKind::Sandbox,
         original: "[sandbox.s]\nimage = \"a\"\n".into(),
         // Ten lines so scroll has room to move.
         resolved: (0..10).map(|i| format!("line{i}\n")).collect(),

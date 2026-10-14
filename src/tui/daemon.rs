@@ -36,6 +36,15 @@
 //! themselves don't go through here: each holds its own connection until
 //! it's answered (`tui::spawn_verb`).
 //!
+//! One-shot reads and writes: the logs modal (`containers.logs`), the config
+//! view (`sandboxes.get`/`services.get`, `containers.inspect`), the build
+//! log (`instances.buildLog`), process signals (`instances.signal`),
+//! `:rename` (`instances.rename`) and done/undone (`instances.done`) are
+//! quick, so they share this connection ([`Cmd::Fetch`], [`Cmd::Signal`],
+//! [`Cmd::Rename`], [`Cmd::Done`]). Each is answered by one
+//! [`DaemonUpdate`] naming its target; disconnected, that answer says the
+//! dashboard needs devsandbox serve ([`needs_serve`]), as `cancel`'s does.
+//!
 //! A command channel plus a short-joining `Drop`; nothing is ever written to
 //! stderr, failures are [`DaemonUpdate::Status`] lines.
 
@@ -49,7 +58,9 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use serde_json::{Value, json};
 
-use super::app::{PortRequest, PortRow};
+use super::app::{ConfigKind, Fetch, PendingDone, PendingSignal, PortRequest, PortRow};
+use crate::build_log::Tail;
+use crate::config::SandboxText;
 use crate::inbox::{self, Op};
 use crate::serve::client::{self, Conn};
 use crate::serve::forwards::{Added, ForwardRow};
@@ -78,6 +89,21 @@ pub enum DaemonUpdate {
     Ports(Vec<PortRow>),
     /// A one-line status: the daemon is unavailable, a write failed.
     Status(String),
+    /// [`Fetch::Logs`]'s answer: the modal body.
+    Logs { container: String, body: String },
+    /// [`Fetch::Config`]'s answer (`Err`: the message both bodies show).
+    Config { kind: ConfigKind, name: String, text: Result<SandboxText, String> },
+    /// [`Fetch::Inspect`]'s answer: the inspect pane's body.
+    Inspect { container: String, body: String },
+    /// [`Cmd::BuildLog`]'s answer, for `App::set_build_log`.
+    BuildLog { instance: String, read: Result<Option<Tail>, String> },
+    /// A process signal's status line; the process rows are stale.
+    Signalled(String),
+    /// A rename's status line; the snapshot is stale.
+    Renamed(String),
+    /// A done-flag write's status line, `failed` or not, and the request's
+    /// `report` (`PendingDone`).
+    Done { status: String, failed: bool, report: bool },
 }
 
 /// From the event loop to the worker.
@@ -93,6 +119,16 @@ enum Cmd {
     ForwardRm(u64),
     /// `instances.cancel` for `instance` (a state key).
     Cancel(String),
+    /// A modal's read.
+    Fetch(Fetch),
+    /// `instances.buildLog` for an instance id.
+    BuildLog(String),
+    /// `instances.signal`.
+    Signal(PendingSignal),
+    /// `instances.rename`.
+    Rename { instance: String, new_name: String },
+    /// `instances.done`.
+    Done(PendingDone),
 }
 
 /// Handle to the daemon worker. Never blocks the UI thread; dropping it
@@ -151,6 +187,35 @@ impl DaemonWorker {
     /// outcome is a status line.
     pub fn cancel(&self, instance: String) {
         self.send(Cmd::Cancel(instance));
+    }
+
+    /// Ask for a modal's read. Never blocks; answered by its update.
+    pub fn fetch(&self, fetch: Fetch) {
+        self.send(Cmd::Fetch(fetch));
+    }
+
+    /// Ask for instance `id`'s build log. Never blocks; answered by
+    /// [`DaemonUpdate::BuildLog`].
+    pub fn build_log(&self, id: String) {
+        self.send(Cmd::BuildLog(id));
+    }
+
+    /// Send a process signal. Never blocks; answered by
+    /// [`DaemonUpdate::Signalled`].
+    pub fn signal(&self, sig: PendingSignal) {
+        self.send(Cmd::Signal(sig));
+    }
+
+    /// Rename an instance. Never blocks; answered by
+    /// [`DaemonUpdate::Renamed`].
+    pub fn rename(&self, instance: String, new_name: String) {
+        self.send(Cmd::Rename { instance, new_name });
+    }
+
+    /// Set or clear a done flag. Never blocks; answered by
+    /// [`DaemonUpdate::Done`].
+    pub fn set_done(&self, req: PendingDone) {
+        self.send(Cmd::Done(req));
     }
 
     fn send(&self, cmd: Cmd) {
@@ -258,6 +323,153 @@ fn cancel_status(instance: &str, r: Response) -> String {
             Some(pid) => format!("cancelling {instance} (SIGINT to pid {pid})"),
             None => format!("cancelling {instance}"),
         },
+    }
+}
+
+/// What a one-shot call came back with.
+#[derive(Debug, PartialEq)]
+enum Answer {
+    /// The result (`null` when the response had none).
+    Ok(Value),
+    /// The daemon's error message.
+    Refused(String),
+    /// The daemon couldn't be asked: the whole line ([`needs_serve`]).
+    Unreachable(String),
+}
+
+impl Answer {
+    fn from_response(r: Response) -> Answer {
+        match (r.result, r.error) {
+            (_, Some(e)) => Answer::Refused(e.message),
+            (result, None) => Answer::Ok(result.unwrap_or(Value::Null)),
+        }
+    }
+
+    /// The result as `T`, else the line to show (an answer that doesn't
+    /// parse is a newer or broken daemon: say so under `what`).
+    fn parse<T: serde::de::DeserializeOwned>(self, what: &str) -> Result<T, String> {
+        match self {
+            Answer::Ok(v) => serde_json::from_value(v).map_err(|e| format!("{what}: unexpected answer: {e}")),
+            Answer::Refused(msg) | Answer::Unreachable(msg) => Err(msg),
+        }
+    }
+}
+
+/// The line for a request the daemon couldn't be asked (`why`: the last
+/// connect error, when known), as `cancel`'s.
+fn needs_serve(what: &str, why: Option<&str>) -> String {
+    match why {
+        Some(why) => format!("{what}: needs devsandbox serve ({why})"),
+        None => format!("{what}: needs devsandbox serve"),
+    }
+}
+
+/// The API call for a modal's read in config root `root`, and what its
+/// failures are called.
+fn fetch_call(root: &Path, fetch: &Fetch) -> (&'static str, (&'static str, Value)) {
+    match fetch {
+        Fetch::Logs { container } => {
+            ("logs", ("containers.logs", json!({ "container": container, "lines": super::app::LOG_LINES })))
+        }
+        Fetch::Inspect { container } => ("inspect", ("containers.inspect", json!({ "container": container }))),
+        Fetch::Config { kind, name } => {
+            let method = match kind {
+                ConfigKind::Sandbox => "sandboxes.get",
+                ConfigKind::Service => "services.get",
+            };
+            ("config", (method, json!({ "root": root.to_string_lossy(), "name": name })))
+        }
+    }
+}
+
+/// A modal read's answer as the update that fills it.
+fn fetch_update(fetch: Fetch, answer: Answer) -> DaemonUpdate {
+    let body = |answer: Answer, f: fn(Value) -> String| match answer {
+        Answer::Ok(v) => f(v),
+        Answer::Refused(msg) | Answer::Unreachable(msg) => msg,
+    };
+    match fetch {
+        Fetch::Logs { container } => DaemonUpdate::Logs { container, body: body(answer, logs_body) },
+        Fetch::Inspect { container } => DaemonUpdate::Inspect { container, body: body(answer, inspect_body) },
+        Fetch::Config { kind: ConfigKind::Sandbox, name } => {
+            DaemonUpdate::Config { kind: ConfigKind::Sandbox, name, text: answer.parse("config") }
+        }
+        Fetch::Config { kind: ConfigKind::Service, name } => {
+            let text = answer.parse::<crate::serve::api::ServiceConfig>("config").map(|s| SandboxText {
+                resolved: s.original.clone(),
+                original: s.original,
+                hash: String::new(),
+            });
+            DaemonUpdate::Config { kind: ConfigKind::Service, name, text }
+        }
+    }
+}
+
+/// `containers.logs`' `{text}` as the modal body.
+fn logs_body(result: Value) -> String {
+    let text = result.get("text").and_then(Value::as_str).unwrap_or_default();
+    if text.trim().is_empty() { "(no log output)".to_string() } else { text.to_string() }
+}
+
+/// `containers.inspect`'s JSON, pretty-printed as `devsandbox inspect`
+/// prints it (`pretty_inspect`, minus the parse the daemon did).
+fn inspect_body(result: Value) -> String {
+    serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("cannot format inspect JSON: {e}"))
+}
+
+/// The API call for [`Cmd::BuildLog`].
+fn build_log_call(instance: &str) -> (&'static str, Value) {
+    ("instances.buildLog", json!({ "instance": instance, "lines": super::app::BUILD_LOG_LINES }))
+}
+
+/// The API call for [`Cmd::Signal`].
+fn signal_call(sig: &PendingSignal) -> (&'static str, Value) {
+    ("instances.signal", json!({ "instance": sig.instance, "pid": sig.pid, "signal": sig.signal.wire() }))
+}
+
+/// The status line for an `instances.signal` answer.
+fn signal_status(sig: &PendingSignal, answer: Answer) -> String {
+    match answer {
+        Answer::Ok(_) => format!("sent {} to pid {}", sig.signal.name(), sig.pid),
+        Answer::Refused(msg) => format!("{}: {msg}", sig.signal.name()),
+        Answer::Unreachable(line) => line,
+    }
+}
+
+/// The API call for [`Cmd::Rename`].
+fn rename_call(instance: &str, new_name: &str) -> (&'static str, Value) {
+    ("instances.rename", json!({ "instance": instance, "newName": new_name }))
+}
+
+/// The status line for an `instances.rename` answer: the name the daemon
+/// settled on (trimmed), or why not.
+fn rename_status(instance: &str, new_name: &str, answer: Answer) -> String {
+    match answer {
+        Answer::Ok(v) => {
+            let renamed = v.get("instance").and_then(Value::as_str).unwrap_or(new_name);
+            format!("renamed {instance} -> {renamed}")
+        }
+        Answer::Refused(msg) => format!("rename failed: {msg}"),
+        Answer::Unreachable(line) => line,
+    }
+}
+
+/// The API call for [`Cmd::Done`].
+fn done_call(req: &PendingDone) -> (&'static str, Value) {
+    ("instances.done", json!({ "instance": req.instance, "done": req.done }))
+}
+
+/// The status line for an `instances.done` answer, worded as `devsandbox
+/// done|undone` words a change, and whether it failed. The answer doesn't
+/// say whether the flag was already so (the CLI's "is already done"): the
+/// dashboard only asks for a change.
+fn done_status(req: &PendingDone, answer: Answer) -> (String, bool) {
+    let verb = if req.done { "done" } else { "undone" };
+    match answer {
+        Answer::Ok(_) if req.done => (format!("marked {} done", req.instance), false),
+        Answer::Ok(_) => (format!("marked {} not done", req.instance), false),
+        Answer::Refused(msg) => (format!("{verb}: {msg}"), true),
+        Answer::Unreachable(line) => (line, true),
     }
 }
 
@@ -386,6 +598,11 @@ fn run(dir: &Path, rx: Receiver<Cmd>, utx: Sender<DaemonUpdate>, connected: &Ato
             Ok(Cmd::ForwardAdd(req)) => w.forward_add(&req),
             Ok(Cmd::ForwardRm(id)) => w.forward_rm(id),
             Ok(Cmd::Cancel(instance)) => w.cancel(&instance),
+            Ok(Cmd::Fetch(fetch)) => w.fetch(fetch),
+            Ok(Cmd::BuildLog(id)) => w.build_log(id),
+            Ok(Cmd::Signal(sig)) => w.signal(sig),
+            Ok(Cmd::Rename { instance, new_name }) => w.rename(&instance, &new_name),
+            Ok(Cmd::Done(req)) => w.set_done(req),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return,
         }
@@ -550,6 +767,49 @@ impl Worker<'_> {
                 self.send(DaemonUpdate::Status(format!("cancel {instance}: needs devsandbox serve ({e:#})")));
             }
         }
+    }
+
+    /// One call while connected; disconnected (or the call breaking the
+    /// connection) it's [`Answer::Unreachable`] with `what`'s line.
+    fn one_shot(&mut self, what: &str, (method, params): (&str, Value)) -> Answer {
+        let Some(conn) = self.conn.as_mut() else {
+            return Answer::Unreachable(needs_serve(what, self.down.as_deref()));
+        };
+        match conn.call(method, params) {
+            Ok(r) => Answer::from_response(r),
+            Err(e) => {
+                self.lost(false);
+                Answer::Unreachable(needs_serve(what, Some(&format!("{e:#}"))))
+            }
+        }
+    }
+
+    fn fetch(&mut self, fetch: Fetch) {
+        let (what, call) = fetch_call(self.dir, &fetch);
+        let answer = self.one_shot(what, call);
+        self.send(fetch_update(fetch, answer));
+    }
+
+    fn build_log(&mut self, instance: String) {
+        let read = self.one_shot("build log", build_log_call(&instance)).parse("build log");
+        self.send(DaemonUpdate::BuildLog { instance, read });
+    }
+
+    fn signal(&mut self, sig: PendingSignal) {
+        let answer = self.one_shot(sig.signal.name(), signal_call(&sig));
+        self.send(DaemonUpdate::Signalled(signal_status(&sig, answer)));
+    }
+
+    fn rename(&mut self, instance: &str, new_name: &str) {
+        let answer = self.one_shot("rename", rename_call(instance, new_name));
+        self.send(DaemonUpdate::Renamed(rename_status(instance, new_name, answer)));
+    }
+
+    fn set_done(&mut self, req: PendingDone) {
+        let what = if req.done { "done" } else { "undone" };
+        let answer = self.one_shot(what, done_call(&req));
+        let (status, failed) = done_status(&req, answer);
+        self.send(DaemonUpdate::Done { status, failed, report: req.report });
     }
 
     /// One batch of ops, in order: through the daemon while connected, the
@@ -836,6 +1096,177 @@ mod tests {
             "cancel web-2: `web-2` is not building any more"
         );
         assert_eq!(cancel_status("x", err("not-found", "no instance `x`")), "cancel x: no instance `x`");
+    }
+
+    fn sig(pid: &str) -> PendingSignal {
+        PendingSignal { instance: "web-2".into(), pid: pid.into(), signal: super::super::app::Signal::Term }
+    }
+
+    fn response(result: Option<Value>, error: Option<(&str, &str)>) -> Response {
+        use crate::serve::proto::ErrorBody;
+        let error = error.map(|(code, message)| ErrorBody { code: code.into(), message: message.into(), data: None });
+        Response { id: Some(1), result, error }
+    }
+
+    /// The one-shot requests queue as their commands, in order.
+    #[test]
+    fn one_shot_requests_queue_as_their_commands() {
+        let (tx, rx) = mpsc::channel();
+        let (_utx, updates) = mpsc::channel();
+        let worker = DaemonWorker { tx: Some(tx), updates, connected: Arc::default(), handle: None };
+        let logs = Fetch::Logs { container: "devsandbox-web".into() };
+        let done = PendingDone { instance: "web".into(), done: true, report: false };
+        worker.fetch(logs.clone());
+        worker.build_log("id0".into());
+        worker.signal(sig("42"));
+        worker.rename("a".into(), "b".into());
+        worker.set_done(done.clone());
+        assert_eq!(rx.try_recv().unwrap(), Cmd::Fetch(logs));
+        assert_eq!(rx.try_recv().unwrap(), Cmd::BuildLog("id0".into()));
+        assert_eq!(rx.try_recv().unwrap(), Cmd::Signal(sig("42")));
+        assert_eq!(rx.try_recv().unwrap(), Cmd::Rename { instance: "a".into(), new_name: "b".into() });
+        assert_eq!(rx.try_recv().unwrap(), Cmd::Done(done));
+    }
+
+    #[test]
+    fn one_shot_calls_name_their_methods_and_params() {
+        let root = Path::new("/cfg");
+        let fetch = |f: Fetch| fetch_call(root, &f);
+        assert_eq!(
+            fetch(Fetch::Logs { container: "devsandbox-web".into() }),
+            ("logs", ("containers.logs", json!({"container": "devsandbox-web", "lines": 50})))
+        );
+        assert_eq!(
+            fetch(Fetch::Inspect { container: "devsandbox-web".into() }),
+            ("inspect", ("containers.inspect", json!({"container": "devsandbox-web"})))
+        );
+        assert_eq!(
+            fetch(Fetch::Config { kind: ConfigKind::Sandbox, name: "web".into() }),
+            ("config", ("sandboxes.get", json!({"root": "/cfg", "name": "web"})))
+        );
+        assert_eq!(
+            fetch(Fetch::Config { kind: ConfigKind::Service, name: "db".into() }),
+            ("config", ("services.get", json!({"root": "/cfg", "name": "db"})))
+        );
+        assert_eq!(build_log_call("id0"), ("instances.buildLog", json!({"instance": "id0", "lines": 500})));
+        assert_eq!(
+            signal_call(&PendingSignal { signal: super::super::app::Signal::Kill, ..sig("42") }),
+            ("instances.signal", json!({"instance": "web-2", "pid": "42", "signal": "KILL"}))
+        );
+        assert_eq!(rename_call("a", "b"), ("instances.rename", json!({"instance": "a", "newName": "b"})));
+        assert_eq!(
+            done_call(&PendingDone { instance: "a".into(), done: false, report: true }),
+            ("instances.done", json!({"instance": "a", "done": false}))
+        );
+    }
+
+    /// The calls the API can run here without docker or the user's state:
+    /// the config reads end to end, the rest as far as their param checks.
+    #[test]
+    fn one_shot_calls_are_accepted_by_the_api() {
+        use crate::serve::api::{self, Ctx};
+        let dir = std::env::temp_dir().join(format!("devsandbox-tui-oneshot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(crate::config::CONFIG_FILE),
+            "[sandbox.web]\nimage = \"alpine\"\n[services.db]\nimage = \"postgres\"\n",
+        )
+        .unwrap();
+        let inbox = dir.join("inbox.json");
+        let ctx = Ctx { inbox: &inbox, client: "tui", bridges: None, forwards: None };
+        let ask = |(method, params): (&str, Value)| match api::call(method, params, &ctx) {
+            Ok(v) => Answer::Ok(v),
+            Err(e) => Answer::Refused(e.message),
+        };
+
+        let (_, call) = fetch_call(&dir, &Fetch::Config { kind: ConfigKind::Sandbox, name: "web".into() });
+        let update = fetch_update(Fetch::Config { kind: ConfigKind::Sandbox, name: "web".into() }, ask(call));
+        let DaemonUpdate::Config { kind: ConfigKind::Sandbox, name, text: Ok(text) } = update else { panic!("{update:?}") };
+        assert_eq!((name.as_str(), text.original.as_str()), ("web", "image = \"alpine\"\n"));
+        assert!(!text.hash.is_empty());
+        let service = Fetch::Config { kind: ConfigKind::Service, name: "db".into() };
+        let (_, call) = fetch_call(&dir, &service);
+        assert_eq!(
+            fetch_update(service, ask(call)),
+            DaemonUpdate::Config {
+                kind: ConfigKind::Service,
+                name: "db".into(),
+                text: Ok(SandboxText {
+                    original: "image = \"postgres\"\n".into(),
+                    resolved: "image = \"postgres\"\n".into(),
+                    hash: String::new()
+                }),
+            }
+        );
+        let unknown = Fetch::Config { kind: ConfigKind::Sandbox, name: "nope".into() };
+        let (_, call) = fetch_call(&dir, &unknown);
+        let DaemonUpdate::Config { text: Err(msg), .. } = fetch_update(unknown, ask(call)) else { panic!() };
+        assert!(msg.contains("no sandbox `nope`"), "{msg}");
+        // Parsed and checked before any state or runtime is touched.
+        let not_ours = Fetch::Logs { container: "web".into() };
+        let (_, call) = fetch_call(&dir, &not_ours);
+        let DaemonUpdate::Logs { body, .. } = fetch_update(not_ours, ask(call)) else { panic!() };
+        assert!(body.contains("not a devsandbox container"), "{body}");
+        let (_, call) = fetch_call(&dir, &Fetch::Inspect { container: "web".into() });
+        assert!(matches!(ask(call), Answer::Refused(m) if m.contains("not a devsandbox container")));
+        assert!(matches!(ask(signal_call(&sig("0"))), Answer::Refused(m) if m.contains("`pid` must be a process id")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn one_shot_answers_render() {
+        // Responses: a result (none is `null`), or the daemon's message.
+        assert_eq!(Answer::from_response(response(Some(json!({"ok": true})), None)), Answer::Ok(json!({"ok": true})));
+        assert_eq!(Answer::from_response(response(None, None)), Answer::Ok(Value::Null));
+        assert_eq!(Answer::from_response(response(None, Some(("not-found", "no instance `x`")))), Answer::Refused("no instance `x`".into()));
+        assert_eq!(needs_serve("logs", Some("refused")), "logs: needs devsandbox serve (refused)");
+        assert_eq!(needs_serve("logs", None), "logs: needs devsandbox serve");
+        let down = || Answer::Unreachable(needs_serve("x", Some("down")));
+
+        // Logs and inspect: the body, empty output said, errors as is.
+        let logs = |a| match fetch_update(Fetch::Logs { container: "devsandbox-a".into() }, a) {
+            DaemonUpdate::Logs { container, body } if container == "devsandbox-a" => body,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(logs(Answer::Ok(json!({"text": "l1\nl2\n"}))), "l1\nl2\n");
+        assert_eq!(logs(Answer::Ok(json!({"text": " \n"}))), "(no log output)");
+        assert_eq!(logs(Answer::Refused("No such container".into())), "No such container");
+        assert_eq!(logs(down()), "x: needs devsandbox serve (down)");
+        let inspect = |a| match fetch_update(Fetch::Inspect { container: "devsandbox-a".into() }, a) {
+            DaemonUpdate::Inspect { body, .. } => body,
+            other => panic!("{other:?}"),
+        };
+        // As `devsandbox inspect` prints it.
+        let raw = r#"[{"Id":"abc","State":{"Running":true}}]"#;
+        assert_eq!(inspect(Answer::Ok(serde_json::from_str(raw).unwrap())), crate::commands::inspect::pretty_inspect(raw));
+        assert_eq!(inspect(down()), "x: needs devsandbox serve (down)");
+        let config = |a| match fetch_update(Fetch::Config { kind: ConfigKind::Sandbox, name: "web".into() }, a) {
+            DaemonUpdate::Config { text, .. } => text,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(config(down()), Err("x: needs devsandbox serve (down)".into()));
+        assert!(config(Answer::Ok(json!({"surprise": 1}))).unwrap_err().starts_with("config: unexpected answer"));
+
+        // The build log: `null` is none yet.
+        let read = |a: Answer| a.parse::<Option<Tail>>("build log");
+        assert_eq!(read(Answer::Ok(Value::Null)), Ok(None));
+        assert_eq!(read(Answer::Ok(json!({"text": "x", "cut": true}))), Ok(Some(Tail { text: "x".into(), cut: true })));
+        assert_eq!(read(Answer::Refused("no instance `id0`".into())), Err("no instance `id0`".into()));
+
+        // Status lines, as the in-process paths worded them.
+        assert_eq!(signal_status(&sig("42"), Answer::Ok(json!({"ok": true}))), "sent SIGTERM to pid 42");
+        assert_eq!(signal_status(&sig("42"), Answer::Refused("no instance `web-2`".into())), "SIGTERM: no instance `web-2`");
+        assert_eq!(signal_status(&sig("42"), down()), "x: needs devsandbox serve (down)");
+        assert_eq!(rename_status("a", " b ", Answer::Ok(json!({"instance": "b"}))), "renamed a -> b");
+        assert_eq!(rename_status("a", "b", Answer::Refused("`b` is taken".into())), "rename failed: `b` is taken");
+        assert_eq!(rename_status("a", "b", down()), "x: needs devsandbox serve (down)");
+        let done = |done| PendingDone { instance: "a".into(), done, report: true };
+        let ok = || Answer::Ok(json!({"instance": "a", "done": true}));
+        assert_eq!(done_status(&done(true), ok()), ("marked a done".into(), false));
+        assert_eq!(done_status(&done(false), ok()), ("marked a not done".into(), false));
+        assert_eq!(done_status(&done(false), Answer::Refused("no instance `a`".into())), ("undone: no instance `a`".into(), true));
+        assert_eq!(done_status(&done(true), down()), ("x: needs devsandbox serve (down)".into(), true));
     }
 
     #[test]

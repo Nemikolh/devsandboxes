@@ -707,7 +707,7 @@ struct BuildLogParams {
     lines: Option<usize>,
 }
 
-/// The end of an instance's build log (`build_log::tail`): `{text, cut}`,
+/// The end of an instance's build log (`build_log::tail_in`): `{text, cut}`,
 /// or `null` when it has none yet. `instance` is an exact name or
 /// instance id in `state` (injected for the tests; the logs live next to
 /// it); a cancelled `run` drops its record, and its log is `not-found` then.

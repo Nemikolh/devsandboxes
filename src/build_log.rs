@@ -69,9 +69,9 @@ pub fn remove(instance_id: &str) {
     }
 }
 
-/// Bytes [`tail`] reads off the end of a log: plenty for its line count
+/// Bytes [`tail_in`] reads off the end of a log: plenty for its line count
 /// unless lines are very long, without reading a big build's whole output
-/// on the dashboard's thread.
+/// on the daemon's thread.
 const TAIL_BYTES: u64 = 256 * 1024;
 
 /// The end of a build log, for the dashboard's build-log modal (and the
@@ -83,15 +83,10 @@ pub struct Tail {
     pub cut: bool,
 }
 
-/// The last `lines` lines of `instance_id`'s build log; `None` when it has
-/// none (an instance from before build logs, or one never built since).
-pub fn tail(instance_id: &str, lines: usize) -> Result<Option<Tail>> {
-    tail_at(&path(instance_id)?, lines)
-}
-
-/// [`tail`] of the log under data dir `data` (the dir holding `state.toml`):
-/// the daemon reads an injected state path, so its tests never touch the
-/// user's logs.
+/// The last `lines` lines of `instance_id`'s build log under data dir
+/// `data` (the dir holding `state.toml`); `None` when it has none (an
+/// instance from before build logs, or one never built since). The daemon
+/// reads an injected state path, so its tests never touch the user's logs.
 #[cfg_attr(not(unix), allow(dead_code))] // only the daemon (unix) uses it
 pub fn tail_in(data: &Path, instance_id: &str, lines: usize) -> Result<Option<Tail>> {
     tail_at(&dir_in(data, instance_id).join(FILE), lines)

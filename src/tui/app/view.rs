@@ -2,14 +2,12 @@
 //! log text modals, and the split-pane scroll/resize geometry they share.
 
 use std::cell::Cell;
-use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
 use crate::build_log::Tail;
-use crate::config::Config;
-use crate::runtime::backend;
+use crate::config::SandboxText;
 use crate::snapshot::PhaseRow;
 use crate::tui::data::{ContainerStatus, InstanceRow, Node};
 use crate::tui::settings::{SETTINGS, Settings};
@@ -194,6 +192,35 @@ pub struct HelpModal {
 /// failed, what it's doing), `logs --build` has the rest.
 pub const BUILD_LOG_LINES: usize = 500;
 
+/// Lines of container output the logs modal (`l`) shows.
+pub const LOG_LINES: usize = 50;
+
+/// What a modal's body waits on: a read the event loop asks the daemon for
+/// ([`App::take_pending_fetch`]), answered through the matching setter
+/// ([`App::set_logs`], [`App::set_config`], [`App::set_inspect`]). The
+/// answer names its target, so one for a modal since closed or retargeted
+/// is dropped.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Fetch {
+    /// `containers.logs`: the last [`LOG_LINES`] lines.
+    Logs { container: String },
+    /// `sandboxes.get` / `services.get` in the dashboard's config root.
+    Config { kind: ConfigKind, name: String },
+    /// `containers.inspect` for the config view's inspect pane.
+    Inspect { container: String },
+}
+
+/// What a [`ConfigView`] shows: a sandbox or a service (their names may
+/// collide).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfigKind {
+    Sandbox,
+    Service,
+}
+
+/// A modal body whose answer hasn't come yet.
+const LOADING: &str = "(loading…)";
+
 /// An instance's build log (`b`), re-read on each snapshot while the
 /// instance is in flight. The event loop does the reading
 /// ([`App::take_build_log_read`] / [`App::set_build_log`]), so this stays
@@ -311,12 +338,15 @@ const SPLIT_MIN: u16 = 20;
 
 const SPLIT_MAX: u16 = 80;
 
-/// Full-screen config explorer state. Built once at open time (fs + config +
-/// `docker inspect` are read then, not during rendering); on error the bodies
-/// carry the error text so the modal still renders.
+/// Full-screen config explorer state. Opens with "(loading…)" bodies the
+/// daemon's answers fill (`sandboxes.get`/`services.get`, `containers.inspect`);
+/// on error the bodies carry the error text so the modal still renders.
 pub struct ConfigView {
     /// Sandbox (or service) name, shown in the title.
     pub title: String,
+    /// Whether `title` names a sandbox or a service: with it, the key of the
+    /// config answer this view takes.
+    pub kind: ConfigKind,
     /// Raw table TOML as written (plus `extends` for sandboxes).
     pub original: String,
     /// Merged table TOML. Equal to `original` for services.
@@ -326,7 +356,7 @@ pub struct ConfigView {
     /// Short config hash of the resolved table, empty when unavailable.
     pub hash: String,
     /// Pretty-printed `docker inspect` (or explanatory text) for the target
-    /// container, fetched at open time.
+    /// container, asked for at open time.
     pub inspect: String,
     pub inspect_scroll: u16,
     /// Container the inspect pane is showing, for the pane title. Empty when
@@ -438,7 +468,8 @@ pub enum Modal {
     Config(ConfigView),
     /// Settings & keybinding reference (`?`).
     Help(HelpModal),
-    /// Container log tail (`l` on the Instances tab).
+    /// Container log tail (`l` on the Instances tab); whose is
+    /// [`App::logs_container`].
     Logs(TextModal),
     /// An instance's build log (`b` on the Instances tab).
     BuildLog(BuildLogModal),
@@ -563,16 +594,25 @@ impl App {
         });
     }
 
-    /// The build log the event loop should read now, by instance id: just
-    /// opened, or a snapshot landed while it's being written.
+    /// The build log the event loop should ask the daemon for now, by
+    /// instance id: just opened, or a snapshot landed while it's being
+    /// written. `None` while an earlier read is unanswered, so a snapshot
+    /// every 2 s can't pile reads up: the queued one goes after the answer.
     pub fn take_build_log_read(&mut self) -> Option<String> {
-        self.pending_build_log.take()
+        if self.build_log_in_flight {
+            return None;
+        }
+        let read = self.pending_build_log.take();
+        self.build_log_in_flight = read.is_some();
+        read
     }
 
-    /// Install what the event loop read for `instance_id` (`Err`: why it
+    /// Install what the daemon answered for `instance_id` (`Err`: why it
     /// couldn't), if its modal is still the open one. Keeps the user's
-    /// scroll position unless following the bottom.
+    /// scroll position unless following the bottom. Any answer frees the
+    /// read slot (one is outstanding at a time, whichever modal asked).
     pub fn set_build_log(&mut self, instance_id: &str, read: Result<Option<Tail>, String>) {
+        self.build_log_in_flight = false;
         let Modal::BuildLog(view) = &mut self.modal else {
             return;
         };
@@ -658,10 +698,10 @@ impl App {
         }
     }
 
-    /// Open a full-screen log tail for the selected instance's container.
-    /// Fetches the last 50 log lines (stdout+stderr merged) at open time; a
-    /// missing container or runtime error renders as the body. Instances tab only;
-    /// no-op with no selectable row.
+    /// Open a full-screen log tail for the selected instance's container:
+    /// the last [`LOG_LINES`] lines (stdout+stderr merged), asked of the
+    /// daemon at open time; a missing container or runtime error renders as
+    /// the body. Instances tab only; no-op with no selectable row.
     pub(super) fn open_logs(&mut self) {
         if self.tab != Tab::Instances {
             return;
@@ -684,13 +724,60 @@ impl App {
     /// The log tail modal for `container`, whatever is selected: the Inbox
     /// thread pane targets a thread's child, not a table row.
     pub(super) fn open_logs_for(&mut self, container: &str) {
-        let body = match backend().logs_tail(container, 50) {
-            Ok(out) if out.trim().is_empty() => "(no log output)".to_string(),
-            Ok(out) => out,
-            Err(e) => format!("{e:#}"),
+        let title = format!(" logs — {container} (last {LOG_LINES}) ");
+        self.modal = Modal::Logs(TextModal::new(title, LOADING.to_string()));
+        self.logs_container = Some(container.to_string());
+        self.pending_fetch.push(Fetch::Logs { container: container.to_string() });
+    }
+
+    /// The reads the event loop should ask the daemon for, in order.
+    pub fn take_pending_fetch(&mut self) -> Vec<Fetch> {
+        std::mem::take(&mut self.pending_fetch)
+    }
+
+    /// Install `container`'s log tail (or why there's none) if its logs
+    /// modal is still the open one.
+    pub fn set_logs(&mut self, container: &str, body: String) {
+        let Modal::Logs(view) = &mut self.modal else {
+            return;
         };
-        let title = format!(" logs — {container} (last 50) ");
-        self.modal = Modal::Logs(TextModal::new(title, body));
+        if self.logs_container.as_deref() != Some(container) {
+            return;
+        }
+        view.body = body;
+        view.scroll = view.scroll.min(line_count(&view.body).saturating_sub(1));
+    }
+
+    /// Install a config answer (`Err`: its message, in both bodies) if the
+    /// open config view is `kind` `name`'s.
+    pub fn set_config(&mut self, kind: ConfigKind, name: &str, text: Result<SandboxText, String>) {
+        let Modal::Config(view) = &mut self.modal else {
+            return;
+        };
+        if view.kind != kind || view.title != name {
+            return;
+        }
+        match text {
+            Ok(text) => (view.original, view.resolved, view.hash) = (text.original, text.resolved, text.hash),
+            Err(msg) => {
+                view.original = msg.clone();
+                view.resolved = msg;
+            }
+        }
+        view.clamp_scroll();
+    }
+
+    /// Install `container`'s pretty-printed inspect (or why there's none) if
+    /// the open config view's inspect pane shows it.
+    pub fn set_inspect(&mut self, container: &str, body: String) {
+        let Modal::Config(view) = &mut self.modal else {
+            return;
+        };
+        if view.inspect_container.is_empty() || view.inspect_container != container {
+            return;
+        }
+        view.inspect = body;
+        view.inspect_scroll = view.inspect_scroll.min(line_count(&view.inspect).saturating_sub(1));
     }
 
     /// Open the config explorer for the current selection. On the Instances tab
@@ -702,7 +789,7 @@ impl App {
         let Some(snapshot) = &self.snapshot else {
             return;
         };
-        let (mut view, target) = match self.tab {
+        let (kind, name, target) = match self.tab {
             Tab::Instances => {
                 let (name, target) = match self.selected_node() {
                     Some(Node::Sandbox(i)) | Some(Node::Empty(i)) => {
@@ -728,14 +815,14 @@ impl App {
                 let Some(name) = name else {
                     return;
                 };
-                (Self::build_sandbox_view(&self.dir, &name), target)
+                (ConfigKind::Sandbox, name, target)
             }
             Tab::Services => {
                 let Some(row) = snapshot.services.get(self.selected()) else {
                     return;
                 };
                 let target = service_inspect_target(&row.containers);
-                (Self::build_service_view(&self.dir, &row.name), target)
+                (ConfigKind::Service, row.name.clone(), target)
             }
             // The Ports and Inbox tabs have no config to explore; `e` is a
             // no-op (`enter` on the Inbox focuses the thread instead).
@@ -746,60 +833,30 @@ impl App {
             Tab::Services => "(no containers)",
             Tab::Ports | Tab::Inbox => "",
         };
-        set_inspect(&mut view, target, placeholder);
-        self.modal = Modal::Config(view);
-    }
-
-    /// Build a sandbox [`ConfigView`]: original = raw table, resolved = merged
-    /// table. On any config/serialization error, both bodies carry the message.
-    fn build_sandbox_view(dir: &PathBuf, name: &str) -> ConfigView {
-        let mut view = ConfigView {
-            title: name.to_string(),
-            original: String::new(),
-            resolved: String::new(),
+        // Sandbox: original = raw table, resolved = merged; a service's two
+        // are the same (services don't `extends`). The daemon fills both.
+        self.pending_fetch.push(Fetch::Config { kind, name: name.clone() });
+        let (inspect, inspect_container) = match target {
+            Some(container) => {
+                self.pending_fetch.push(Fetch::Inspect { container: container.clone() });
+                (LOADING.to_string(), container)
+            }
+            None => (placeholder.to_string(), String::new()),
+        };
+        self.modal = Modal::Config(ConfigView {
+            title: name,
+            kind,
+            original: LOADING.to_string(),
+            resolved: LOADING.to_string(),
             showing: Side::Original,
             scroll: 0,
             hash: String::new(),
-            inspect: String::new(),
+            inspect,
             inspect_scroll: 0,
-            inspect_container: String::new(),
+            inspect_container,
             focus: Pane::Config,
             split_pct: 50,
-        };
-        match Config::load(dir) {
-            Ok(cfg) => {
-                let text = cfg.sandbox_text(name);
-                (view.original, view.resolved, view.hash) = (text.original, text.resolved, text.hash);
-            }
-            Err(e) => {
-                let msg = format!("{e:#}");
-                view.original = msg.clone();
-                view.resolved = msg;
-            }
-        }
-        view
-    }
-
-    /// Build a service [`ConfigView`]: the raw `[services.<name>]` table.
-    /// Original and resolved are identical (services do not `extends`).
-    fn build_service_view(dir: &PathBuf, name: &str) -> ConfigView {
-        let body = match Config::load(dir) {
-            Ok(cfg) => cfg.service_text(name).unwrap_or_else(|| format!("unknown service `{name}`")),
-            Err(e) => format!("{e:#}"),
-        };
-        ConfigView {
-            title: name.to_string(),
-            original: body.clone(),
-            resolved: body,
-            showing: Side::Original,
-            scroll: 0,
-            hash: String::new(),
-            inspect: String::new(),
-            inspect_scroll: 0,
-            inspect_container: String::new(),
-            focus: Pane::Config,
-            split_pct: 50,
-        }
+        });
     }
 }
 
@@ -832,22 +889,6 @@ fn service_inspect_target(containers: &[(String, ContainerStatus)]) -> Option<St
         .find(|(_, s)| matches!(s, ContainerStatus::Running(_)))
         .or_else(|| containers.first())
         .map(|(name, _)| name.clone())
-}
-
-/// Fill `view`'s inspect pane: fetch + pretty-print `docker inspect <container>`
-/// when there is a target, else store the given placeholder text. On docker
-/// error the error text is the body; on JSON parse failure the raw output is
-/// kept with the parse error as the first line.
-fn set_inspect(view: &mut ConfigView, target: Option<String>, placeholder: &str) {
-    let Some(container) = target else {
-        view.inspect = placeholder.to_string();
-        return;
-    };
-    view.inspect_container = container.clone();
-    view.inspect = match backend().inspect_json(&container) {
-        Ok(out) => crate::commands::inspect::pretty_inspect(&out),
-        Err(e) => format!("{e:#}"),
-    };
 }
 
 #[cfg(test)]
@@ -1035,24 +1076,149 @@ mod tests {
         assert!(!m.on_scroll_key(key(KeyCode::Char('x'))));
     }
 
+    fn logs(app: &App) -> &TextModal {
+        match &app.modal {
+            Modal::Logs(v) => v,
+            _ => panic!("logs modal not open"),
+        }
+    }
+
     #[test]
     fn logs_modal_opens_on_selected_instance() {
-        // Instances tab with a row and no docker: open_logs still opens the modal
-        // with the docker error as the body (never panics).
+        // Instances tab with a row: the modal opens at once, loading, and
+        // queues the daemon read.
         let mut app = new_app();
         app.set_snapshot(snapshot_with(1));
         // Cursor starts on the sandbox node; move down to the instance.
         app.on_key(key(KeyCode::Down));
         app.on_key(key(KeyCode::Char('l')));
-        match &app.modal {
-            Modal::Logs(v) => {
-                assert!(v.title.contains("devsandbox-inst0"));
-                assert!(!v.body.is_empty());
-            }
-            _ => panic!("logs modal not open"),
-        }
+        assert!(logs(&app).title.contains("devsandbox-inst0"));
+        assert_eq!(logs(&app).body, "(loading…)");
+        assert_eq!(app.take_pending_fetch(), [Fetch::Logs { container: "devsandbox-inst0".into() }]);
+        assert_eq!(app.take_pending_fetch(), [], "once");
         app.on_key(key(KeyCode::Char('q')));
         assert!(matches!(app.modal, Modal::None));
+    }
+
+    #[test]
+    fn the_logs_answer_fills_its_own_modal_only() {
+        let mut app = new_app();
+        app.open_logs_for("devsandbox-a");
+        // Another container's (a modal since retargeted): dropped.
+        app.set_logs("devsandbox-b", "b's".into());
+        assert_eq!(logs(&app).body, "(loading…)");
+        app.set_logs("devsandbox-a", "l1\nl2".into());
+        assert_eq!(logs(&app).body, "l1\nl2");
+        // Reopened on b: a's late answer doesn't land there.
+        app.on_key(key(KeyCode::Esc));
+        app.open_logs_for("devsandbox-b");
+        app.set_logs("devsandbox-a", "late".into());
+        assert_eq!(logs(&app).body, "(loading…)");
+        // Closed: dropped, nothing opens.
+        app.on_key(key(KeyCode::Esc));
+        app.set_logs("devsandbox-b", "late".into());
+        assert!(matches!(app.modal, Modal::None));
+        // Nor into another modal.
+        app.open_help();
+        app.set_logs("devsandbox-b", "late".into());
+        assert!(!help(&app).text.body.contains("late"));
+    }
+
+    #[test]
+    fn the_config_view_loads_then_fills_from_its_answers() {
+        let mut app = new_app();
+        let mut snap = snapshot_with(1);
+        snap.instances[0].status = ContainerStatus::Running("Up".into());
+        app.set_snapshot(snap);
+        app.on_key(key(KeyCode::Down)); // inst0
+        app.on_key(key(KeyCode::Char('e')));
+        assert_eq!((view(&app).original.as_str(), view(&app).resolved.as_str()), ("(loading…)", "(loading…)"));
+        assert_eq!((view(&app).inspect.as_str(), view(&app).inspect_container.as_str()), ("(loading…)", "devsandbox-inst0"));
+        let sandbox = view(&app).title.clone();
+        assert_eq!(
+            app.take_pending_fetch(),
+            [
+                Fetch::Config { kind: ConfigKind::Sandbox, name: sandbox.clone() },
+                Fetch::Inspect { container: "devsandbox-inst0".into() },
+            ]
+        );
+        // A service of the same name, another sandbox, another container: dropped.
+        let text = |o: &str| SandboxText { original: o.into(), resolved: format!("{o}+"), hash: "abc".into() };
+        app.set_config(ConfigKind::Service, &sandbox, Ok(text("svc")));
+        app.set_config(ConfigKind::Sandbox, "other", Ok(text("other")));
+        app.set_inspect("devsandbox-x", "x's".into());
+        assert_eq!((view(&app).original.as_str(), view(&app).inspect.as_str()), ("(loading…)", "(loading…)"));
+        app.set_config(ConfigKind::Sandbox, &sandbox, Ok(text("mine")));
+        app.set_inspect("devsandbox-inst0", "[\n  {}\n]".into());
+        let v = view(&app);
+        assert_eq!((v.original.as_str(), v.resolved.as_str(), v.hash.as_str()), ("mine", "mine+", "abc"));
+        assert_eq!(v.inspect, "[\n  {}\n]");
+        // An error fills both sides.
+        app.set_config(ConfigKind::Sandbox, &sandbox, Err("config: needs devsandbox serve".into()));
+        assert_eq!((view(&app).original.as_str(), view(&app).resolved.as_str()), ("config: needs devsandbox serve", "config: needs devsandbox serve"));
+        // Closed: dropped.
+        app.on_key(key(KeyCode::Esc));
+        app.set_config(ConfigKind::Sandbox, &sandbox, Ok(text("late")));
+        app.set_inspect("devsandbox-inst0", "late".into());
+        assert!(matches!(app.modal, Modal::None));
+    }
+
+    #[test]
+    fn the_config_view_keeps_its_placeholder_without_a_target() {
+        // A sandbox with no running instance: no inspect read, the placeholder.
+        let mut app = new_app();
+        app.set_snapshot(snapshot_with(1)); // inst0 not running
+        app.on_key(key(KeyCode::Char('e'))); // the sandbox row
+        assert_eq!(view(&app).inspect, "(no running instance)");
+        assert_eq!(view(&app).kind, ConfigKind::Sandbox);
+        let fetches = app.take_pending_fetch();
+        assert!(matches!(fetches.as_slice(), [Fetch::Config { kind: ConfigKind::Sandbox, .. }]), "{fetches:?}");
+        // Nothing in the pane takes an inspect answer then.
+        app.set_inspect("", "x".into());
+        assert_eq!(view(&app).inspect, "(no running instance)");
+        // A service with no containers: a service read, its placeholder.
+        let mut app = new_app();
+        app.set_snapshot(service_snapshot(Vec::new()));
+        app.tab = Tab::Services;
+        app.on_key(key(KeyCode::Char('e')));
+        assert_eq!(view(&app).inspect, "(no containers)");
+        assert_eq!(app.take_pending_fetch(), [Fetch::Config { kind: ConfigKind::Service, name: "svc".into() }]);
+        // With one, an inspect read too, keyed by the service's kind.
+        let mut app = new_app();
+        app.set_snapshot(service_snapshot(vec![("devsandbox-svc-1".into(), ContainerStatus::Running("Up".into()))]));
+        app.tab = Tab::Services;
+        app.on_key(key(KeyCode::Char('e')));
+        assert_eq!(view(&app).kind, ConfigKind::Service);
+        assert_eq!(
+            app.take_pending_fetch(),
+            [
+                Fetch::Config { kind: ConfigKind::Service, name: "svc".into() },
+                Fetch::Inspect { container: "devsandbox-svc-1".into() },
+            ]
+        );
+        app.set_config(ConfigKind::Service, "svc", Ok(SandboxText { original: "o".into(), resolved: "o".into(), hash: String::new() }));
+        assert_eq!(view(&app).resolved, "o");
+    }
+
+    #[test]
+    fn one_build_log_read_is_outstanding_at_a_time() {
+        let mut app = new_app();
+        app.set_snapshot(recorded(Some(in_flight("building"))));
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Char('b')));
+        assert_eq!(app.take_build_log_read(), Some("id0".into()));
+        // Snapshots land while it's unanswered: one read waits, none is sent.
+        app.set_snapshot(recorded(Some(in_flight("building"))));
+        app.set_snapshot(recorded(Some(in_flight("building"))));
+        assert_eq!(app.take_build_log_read(), None);
+        app.set_build_log("id0", tail(0..1));
+        assert_eq!(app.take_build_log_read(), Some("id0".into()), "the waiting one, after the answer");
+        assert_eq!(app.take_build_log_read(), None);
+        // An answer for a closed modal still frees the slot.
+        app.on_key(key(KeyCode::Esc));
+        app.set_build_log("id0", tail(0..1));
+        app.on_key(key(KeyCode::Char('b')));
+        assert_eq!(app.take_build_log_read(), Some("id0".into()));
     }
 
     fn build_log(app: &App) -> &BuildLogModal {
@@ -1126,12 +1292,15 @@ mod tests {
         app.on_key(key(KeyCode::Down));
         app.on_key(key(KeyCode::Char('b')));
         app.take_build_log_read();
+        app.set_build_log("id0", tail(0..1));
         app.set_snapshot(recorded(Some(in_flight("postCreateCommand"))));
         assert_eq!(app.take_build_log_read(), Some("id0".into()));
         assert_eq!(build_log(&app).text.title, " build log — inst0 (running postCreateCommand) ");
+        app.set_build_log("id0", tail(0..2));
         // It ended: one last read, then no more.
         app.set_snapshot(recorded(Some(failed("postCreateCommand"))));
         assert_eq!(app.take_build_log_read(), Some("id0".into()));
+        app.set_build_log("id0", tail(0..3));
         assert_eq!(build_log(&app).text.title, " build log — inst0 (failed at postCreateCommand) ");
         app.set_snapshot(recorded(Some(failed("postCreateCommand"))));
         assert_eq!(app.take_build_log_read(), None);

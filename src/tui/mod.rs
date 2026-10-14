@@ -48,7 +48,7 @@ use crate::commands;
 use crate::commands::vscode::Goto;
 use crate::inbox;
 
-use app::{App, PendingSignal};
+use app::App;
 use poll::{PollUpdate, PollWorker};
 use prompt::PromptAction;
 
@@ -253,16 +253,10 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
     // thread dies.
     let mut stops: Vec<(String, Receiver<OpDone>)> = Vec::new();
     let mut starts: Vec<(String, Receiver<OpDone>)> = Vec::new();
-    // Background process signals (SIGTERM/SIGKILL from a process row); no guard
-    // needed since each keypress targets a concrete pid.
-    let mut signals: Vec<Receiver<OpDone>> = Vec::new();
     // Background VS Code launches (`o`, `:code`, a thread's `vscode`): a
     // `--goto` waits up to 30 s for the window. No guard: a second launch
     // just focuses the same window.
     let mut codes: Vec<Receiver<OpDone>> = Vec::new();
-    // Background done-flag writes (`d`/`u`, a thread's child); the `bool` is
-    // `PendingDone::report`.
-    let mut dones: Vec<(bool, Receiver<OpDone>)> = Vec::new();
     // `run`/`rebuild`/`start` requests to the daemon, a thread each until
     // the detached answer (`spawn_verb`): report and resnapshot.
     let mut builds: Vec<Receiver<OpDone>> = Vec::new();
@@ -374,18 +368,10 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
                     app.status = Some("opening VS Code…".into());
                     codes.push(spawn_code(dir.clone(), instance, goto, app.code_note.take()));
                 }
-                // Rename is pure state I/O (`rename_exact`: no stdout, no
-                // prompts — plain `rename` would scribble on the alternate
-                // screen): run it in place (no suspend) and force an immediate
-                // resnapshot so the renamed row shows now.
-                PromptAction::Rename { instance, new_name } => {
-                    app.status = Some(match commands::rename::rename_exact(&instance, &new_name) {
-                        Ok(new_name) => format!("renamed {instance} -> {new_name}"),
-                        Err(e) => format!("rename failed: {e:#}"),
-                    });
-                    last_tick = Instant::now();
-                    refresh_after_change(&poller, &mut pending, &mut stats_clock, &mut followup);
-                }
+                // `instances.rename`, no suspend; the answer (a status line,
+                // `DaemonUpdate::Renamed`) resnapshots so the renamed row
+                // shows then.
+                PromptAction::Rename { instance, new_name } => daemon.rename(instance, new_name),
                 other => {
                     run_suspended(terminal, &dir, other)?;
                     // Redraw from scratch: the child scribbled over the screen.
@@ -405,12 +391,16 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
         if let Some(instance) = app.take_pending_start() {
             starts.push((instance.clone(), spawn_start(&instance)));
         }
-        // A process-row SIGTERM/SIGKILL was requested: send it off-thread.
+        // Process-row SIGTERM/SIGKILL, done flags, modal reads: one-shot
+        // requests on the daemon worker's connection, answered below.
         if let Some(sig) = app.take_pending_signal() {
-            signals.push(spawn_signal(sig));
+            daemon.signal(sig);
         }
         for req in app.take_pending_done() {
-            dones.push((req.report, spawn_done(req.instance, req.done)));
+            daemon.set_done(req);
+        }
+        for fetch in app.take_pending_fetch() {
+            daemon.fetch(fetch);
         }
         // `d` on an in-flight row, confirmed: the daemon SIGINTs its build
         // (`instances.cancel`, whoever started it).
@@ -418,11 +408,10 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
             daemon.cancel(instance);
             followup.schedule(Instant::now());
         }
-        // An open build log wants (re)reading: a local file tail, cheap
-        // enough for the loop, kept out of `App`.
+        // An open build log wants (re)reading (one read outstanding at a
+        // time: `take_build_log_read`).
         if let Some(id) = app.take_build_log_read() {
-            let read = crate::build_log::tail(&id, app::BUILD_LOG_LINES).map_err(|e| format!("{e:#}"));
-            app.set_build_log(&id, read);
+            daemon.build_log(id);
         }
         // An Inbox link: hand it to the desktop opener.
         if let Some(link) = app.take_pending_open() {
@@ -447,6 +436,31 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
                 // resnapshot soon rather than on the next tick.
                 daemon::DaemonUpdate::InstancesChanged => followup.schedule(Instant::now()),
                 daemon::DaemonUpdate::Shown(line) | daemon::DaemonUpdate::Status(line) => app.status = Some(line),
+                daemon::DaemonUpdate::Logs { container, body } => app.set_logs(&container, body),
+                daemon::DaemonUpdate::Config { kind, name, text } => app.set_config(kind, &name, text),
+                daemon::DaemonUpdate::Inspect { container, body } => app.set_inspect(&container, body),
+                daemon::DaemonUpdate::BuildLog { instance, read } => app.set_build_log(&instance, read),
+                // Refresh the processes now so a killed one drops off the
+                // forest without waiting for the next tick.
+                daemon::DaemonUpdate::Signalled(line) => {
+                    app.status = Some(line);
+                    app.needs_proc_fetch = true;
+                }
+                daemon::DaemonUpdate::Renamed(line) => {
+                    app.status = Some(line);
+                    last_tick = Instant::now();
+                    refresh_after_change(&poller, &mut pending, &mut stats_clock, &mut followup);
+                }
+                // A thread's child reports only on failure; resnapshot so the
+                // row dims or brightens now.
+                daemon::DaemonUpdate::Done { status, failed, report } => {
+                    if report || failed {
+                        app.status = Some(status);
+                    }
+                    last_tick = Instant::now();
+                    followup.schedule(last_tick);
+                    refresh(&poller, &mut pending, &mut stats_clock);
+                }
             }
         }
         // The Inbox lives in one shared file (`crate::inbox::store`), so any
@@ -525,36 +539,9 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
                 false
             }
         });
-        // Drain finished signals: show the outcome and force a proc refresh so a
-        // killed process drops off the forest without waiting for the next tick.
-        signals.retain_mut(|rx| match rx.try_recv() {
-            Ok(done) => {
-                app.status = Some(done.status);
-                app.needs_proc_fetch = true;
-                false
-            }
-            Err(TryRecvError::Empty) => true,
-            Err(TryRecvError::Disconnected) => false,
-        });
         codes.retain_mut(|rx| match rx.try_recv() {
             Ok(done) => {
                 app.status = Some(done.status);
-                false
-            }
-            Err(TryRecvError::Empty) => true,
-            Err(TryRecvError::Disconnected) => false,
-        });
-
-        // Drain finished done-flag writes: report (a thread's child only on
-        // failure) and resnapshot so the row dims or brightens now.
-        dones.retain_mut(|(report, rx)| match rx.try_recv() {
-            Ok(done) => {
-                if *report || done.failed {
-                    app.status = Some(done.status);
-                }
-                last_tick = Instant::now();
-                followup.schedule(last_tick);
-                refresh(&poller, &mut pending, &mut stats_clock);
                 false
             }
             Err(TryRecvError::Empty) => true,
@@ -904,8 +891,7 @@ fn open_link(link: &str) -> std::result::Result<(), String> {
 struct OpDone {
     /// One-line outcome for the help-bar status.
     status: String,
-    /// The op failed. Read for `spawn_done` (a thread's child write reports
-    /// failures alone) and `spawn_start` (a thread action waiting on the
+    /// The op failed. Read for `spawn_start` (a thread action waiting on the
     /// start is dropped).
     failed: bool,
 }
@@ -987,40 +973,6 @@ fn spawn_start(instance: &str) -> Receiver<OpDone> {
     rx
 }
 
-/// Spawn a detached thread that sets or clears `instance`'s done flag in
-/// state (`commands::done::set_saved`: no stdout/stderr, the TUI owns the
-/// terminal) and reports a one-line status back. `instance` is a state key.
-fn spawn_done(instance: String, done: bool) -> Receiver<OpDone> {
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let verb = if done { "done" } else { "undone" };
-        let (status, failed) = match commands::done::set_saved(&instance, done) {
-            Ok(status) => (status, false),
-            Err(e) => (format!("{verb}: {e:#}"), true),
-        };
-        let _ = tx.send(OpDone { status, failed });
-    });
-    rx
-}
-
-/// Spawn a detached thread that sends `sig.signal` to a pid inside a container
-/// (`kill -<n>` via the runtime's screen-safe exec) and reports a one-line
-/// status back.
-fn spawn_signal(sig: PendingSignal) -> Receiver<OpDone> {
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let status = match crate::runtime::backend().signal_proc(
-            &sig.container,
-            &sig.pid,
-            sig.signal.num(),
-        ) {
-            Ok(()) => format!("sent {} to pid {}", sig.signal.name(), sig.pid),
-            Err(e) => format!("{}: {e:#}", sig.signal.name()),
-        };
-        let _ = tx.send(OpDone { status, failed: false });
-    });
-    rx
-}
 
 #[cfg(test)]
 mod tests {

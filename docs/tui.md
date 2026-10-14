@@ -412,7 +412,7 @@ it. Any event the button also queues for the sender is sent on the click.
 
 - An instance marked done (`state::Instance::done`) stays in the tree,
   dimmed, with a `✓` after its name. `d` / `u` on an Instances row mark it
-  done / clear it, written off the UI thread (`commands::done::set_saved`);
+  done / clear it, sent as `instances.done` to the daemon;
   the same flag is set by `devsandbox done|undone`, `devsbd done`, and a
   thread's done/reopen on its child.
 - `:code <instance> [--goto path[:line[:col]]]` opens VS Code and then the
@@ -443,9 +443,9 @@ serve (<why>)`. Off unix (no daemon) they run suspended, in-process.
 
 - `b` on an instance row opens its build log (`<data>/devsandbox/logs/
   <instance_id>/build.log`, the last 500 lines) in a modal titled with the
-  phase. The event loop reads the file (`build_log::tail`), not `App`; it
-  re-reads on each snapshot while the instance is in flight, and once more
-  after. The modal follows the bottom until you scroll up; `G` (or
+  phase. The daemon reads the file (`instances.buildLog`, asked by the
+  event loop, not `App`, one read outstanding at a time); it re-reads on
+  each snapshot while the instance is in flight, and once more after. The modal follows the bottom until you scroll up; `G` (or
   scrolling back down) follows again.
 - `d` on an in-flight row asks `cancel <name>'s build?` (`y`/`enter`,
   `n`/`esc`). Yes sends `instances.cancel` on the daemon worker's

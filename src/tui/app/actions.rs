@@ -20,8 +20,7 @@ fn busy(row: &InstanceRow) -> Option<String> {
     }
 }
 
-/// A done-flag write for the event loop (`commands::done::set_saved`, off the
-/// UI thread).
+/// A done-flag write for the event loop to send (`instances.done`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingDone {
     /// State key (a snapshot row name).
