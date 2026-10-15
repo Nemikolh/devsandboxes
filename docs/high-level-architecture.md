@@ -112,7 +112,7 @@ VS Code attach (`o` in the dashboard) uses the Remote-Containers extension. On A
 
 ### ssh-agent forwarding
 
-Relay-first. When the build embeds the `devsbd` helper (npm package, local builds after `scripts/build-devsbd.sh`), nothing is mounted: the in-container `devsbd` daemon listens on `/run/devsandbox/ssh-agent.sock`, and the host runs `exec -i <c> devsbd bridge` to carry each agent connection over exec stdio to the host `$SSH_AUTH_SOCK` (re-read per connection, so agent rotation needs no restart). The bridge lives for a CLI `exec`, for lifecycle hooks during `run`/`start`, and per running instance while the TUI is open. Needing only `exec`, it works on every runtime, including Apple `container`.
+Relay-first. When the build embeds the `devsbd` helper (npm package, local builds after `scripts/build-devsbd.sh`), nothing is mounted: the in-container `devsbd` daemon listens on `/run/devsandbox/ssh-agent.sock`, and the host runs `exec -i <c> devsbd bridge` to carry each agent connection over exec stdio to the host `$SSH_AUTH_SOCK` (re-read per connection, so agent rotation needs no restart). The bridge lives for a CLI `exec`, for lifecycle hooks during `run`/`start`, and per running instance in the host daemon (`devsandbox serve`, `docs/serve.md`), whose container poll keeps one bridge per running helper instance. Needing only `exec`, it works on every runtime, including Apple `container`.
 
 Builds without the helper (`cargo install`) fall back to bind-mounting the host `$SSH_AUTH_SOCK` through a per-instance symlink, which needs file binds (docker/podman). An instance keeps the mode it was created with until it's recreated (`devsbd::relay_mode`).
 
@@ -133,14 +133,15 @@ Running `devsandbox` with no subcommand opens a ratatui dashboard:
 
 Config entries are validated in place, and broken sandboxes are flagged.
 
-The dashboard (unix only) is a client of the host daemon: it reads the tree, processes, logs and configs through the API and sends every verb as a request, so `s`, `:start`, `stop` and `rm` run in the daemon without leaving the dashboard (`s` on a stopped row is a full `start`). See `docs/dashboard-client.md`, `docs/tui.md`.
+The dashboard (unix only) is a client of the host daemon: it watches its config root and draws the snapshots the daemon pushes (one shared poll however many dashboards are open), reads processes, logs and configs through the API, and sends every verb as a request, so `s`, `:start`, `stop` and `rm` run in the daemon without leaving the dashboard (`s` on a stopped row is a full `start`) and keep running if it quits. Builds run on a pty, so the build log (`b`) shows docker's progress in colour. See `docs/dashboard-client.md`, `docs/before-machines.md`, `docs/tui.md`.
 
 ## Automations
 
-Sandboxes that start themselves and manage their own child instances, with the logic in a user script (`docs/automations.md`, user guide `docs/automations-guide.md`). Still no host daemon: everything host-side runs inside a devsandbox process.
+Sandboxes that start themselves and manage their own child instances, with the logic in a user script (`docs/automations.md`, user guide `docs/automations-guide.md`). The host side (bridges, notifications, control requests, the autostart pass) runs in the host daemon, `devsandbox serve` (`docs/serve.md`), which starts on demand.
 
 - **`autostart`**: once per host boot per config root (boot id recorded in
-  state), the dashboard load or the user's own `run`/`start` starts the
+  state), the daemon's startup pass (every config root recorded in state)
+  or the user's own `run`/`start` starts the
   sandbox's stopped instances, or `run`s one (`commands::autostart`).
   `"runtime"` also creates the container with `--restart unless-stopped`
   (docker/podman; Apple `container` falls back), applied in place since
@@ -153,11 +154,12 @@ Sandboxes that start themselves and manage their own child instances, with the l
   records in an outbox; `devsbd ensure|ls|stop|rm|exec|run …` send requests to
   the daemon's `/run/devsandbox/api.sock`. The daemon relays both over the
   existing frame channel (`channel::NOTIFY`, `channel::CONTROL`) to the newest
-  bridge whose host advertises the cap. Only the dashboard's bridges do (one
+  bridge whose host advertises the cap. Only the daemon's bridges do (one
   per running helper instance), so notifications queue and control fails with
-  exit 75 while it's closed. The host re-checks `dispatcher` on every request
+  exit 75 while no daemon runs (a `dispatcher` or `inbox = true` instance
+  keeps it running). The host re-checks `dispatcher` on every request
   and denies everyone else.
-- **Dispatch as subprocesses**: the control handler runs on the dashboard's
+- **Dispatch as subprocesses**: the control handler runs on the daemon's
   bridge worker, so each child operation is a `devsandbox -C <config root>
   run|start|rebuild|stop|rm` subprocess logging to
   `<data-dir>/devsandbox/logs/dispatch-*.log`, never the alternate screen;

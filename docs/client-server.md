@@ -256,15 +256,19 @@ notion:
 
 Built (`docs/dashboard-client.md`; connections in `docs/api.md`, *The
 dashboard as a client*). The dashboard no longer reads config files or
-asks the runtime. It polls `instances.list` (with a `depth`: listing every
-2 s, stats at most every 7 s) and `instances.procs` for expanded
-instances, and refreshes early on `instances.changed`, which also fires
-when `state.toml` changes. The config view, logs, inspect and build log
-are `sandboxes.get` / `services.get`, `containers.*` and
-`instances.buildLog`; signals, rename and done are `instances.signal`,
+asks the runtime. It watches its root (`instances.watch`,
+`docs/before-machines.md`): the daemon's one container poll collects every
+watched root every 2 s (stats at most every 7 s) and pushes
+`instances.snapshot`, so any number of dashboards cost one collection;
+a `state.toml` change re-collects within ~0.5 s. It polls
+`instances.procs` for expanded instances. The config view, logs, inspect
+and build log are `sandboxes.get` / `services.get`, `containers.*` and
+`instances.buildLog` (with `ansi`: builds run on a pty, so the log keeps
+its colours); signals, rename and done are `instances.signal`,
 `instances.rename`, `instances.done`. Every verb is a request: `run`,
 `rebuild`, `start` (and `s` on a stopped row) detached, `stop`, `rm` and
-`services.rebuild` held. Instance terminals run `devsandbox exec`. With
+`services.rebuild` held but sent with `detach`, so quitting the dashboard
+never cancels one. Instance terminals run `devsandbox exec`. With
 the daemon down it shows the last tree, marked stale, and refuses actions;
 it has no in-process fallback, so off unix there is no dashboard for now.
 
@@ -380,7 +384,10 @@ helper. Needs a spike. Low priority, and nothing above depends on it.
    (`service rebuild` became a verb request in step 4).
 4. Done (`docs/dashboard-client.md`): dashboard as a pure client
    (`instances.list` with `depth`, procs, logs, config and edit methods,
-   `stop`/`rm`/`services.rebuild` as held verb requests).
+   `stop`/`rm`/`services.rebuild` as held verb requests). Then, before
+   step 5 (`docs/before-machines.md`): the shared, pushed snapshot
+   (`instances.watch`), builds on a pty, held verbs that survive a quit,
+   spawns that survive an upgrade.
 5. `machine add|ls|rm`, the ssh transport, federation, `ssh -t` exec.
 6. Remote forwards.
 7. VS Code remote spike.
