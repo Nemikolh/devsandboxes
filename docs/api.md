@@ -538,13 +538,13 @@ and `HOME` are the caller's, never the daemon's.
 | `run` | `sandbox`, `name?`, `branch?`, `base?`, `json?`, `detach?` |
 | `rebuild` | `instance` \| `all: true`, `force?`, `detach?` |
 | `start` | `instance` \| `all: true`, `detach?` |
-| `stop` | `instance` \| `all: true` |
-| `rm` | `instance`, `deleteBranch?` (`true` deletes, `false` keeps, absent: merged or gone branches go, local work stays), `force?`, `ask?` |
-| `services.rebuild` | `name` (a service of the config root) |
+| `stop` | `instance` \| `all: true`, `detach?` |
+| `rm` | `instance`, `deleteBranch?` (`true` deletes, `false` keeps, absent: merged or gone branches go, local work stays), `force?`, `ask?`, `detach?` |
+| `services.rebuild` | `name` (a service of the config root), `detach?` |
 
 `services.rebuild` runs `devsandbox service rebuild <name>`: no instance
 verb, so its answer's (and `failed`'s) `instance` is always `null`, no
-`progress` comes, and `ask`/`detach` don't apply.
+`progress` comes, and `ask` doesn't apply.
 
 `root` is the absolute config root (`-C`); `env` an object of strings,
 required. `instance` is resolved as the CLI's `<name>` is, but an
@@ -578,6 +578,13 @@ process as its builder (plus `"record"`, the `run --json` record without
 its envelope, for `run` with `json`), for `start` and `all` right after
 the spawn. A verb that exits first answers as usual. No notifications follow
 the answer; the client may hang up or send more requests.
+
+The held verbs (`stop`, `rm`, `services.rebuild`) take `detach` too, but
+never answer early: the answer (`confirm` included) still comes at the
+exit. For them `"detach": true` only means a hang-up before the answer
+leaves the verb running instead of cancelling it. The dashboard sends it
+on every verb, so quitting it never interrupts a `stop` or `rm`; the CLI
+never does (Ctrl-C cancels).
 
 **Hang-up = cancel**: a client that hangs up before the answer gets its
 verb SIGINTed, process group included; `run` and `rebuild` then roll back

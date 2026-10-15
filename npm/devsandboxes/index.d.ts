@@ -797,6 +797,8 @@ export interface StartParams extends VerbParams {
 export interface StopParams extends VerbParams {
   instance?: string | null;
   all?: boolean;
+  /** A hang-up before the answer leaves it running instead of cancelling it; the answer still comes at the exit. */
+  detach?: boolean;
 }
 
 /** `rm` params. */
@@ -807,11 +809,15 @@ export interface RmParams extends VerbParams {
   force?: boolean;
   /** Where the branch question would come up, answer `confirm` (the question as its `message`) having removed nothing; resend with `deleteBranch`. */
   ask?: boolean;
+  /** A hang-up before the answer leaves it running instead of cancelling it; the answer still comes at the exit. */
+  detach?: boolean;
 }
 
 /** `services.rebuild` params: the service's name in the config root. */
 export interface ServicesRebuildParams extends VerbParams {
   name: string;
+  /** A hang-up before the answer leaves it running instead of cancelling it; the answer still comes at the exit. */
+  detach?: boolean;
 }
 
 /** A verb's answer once it exited 0. */

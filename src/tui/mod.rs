@@ -257,7 +257,8 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
     let mut codes: Vec<Receiver<OpDone>> = Vec::new();
     // Verb requests to the daemon, a thread each until answered
     // (`spawn_verb`): `run`/`rebuild`/`start` detached, `stop`/`rm`/
-    // `services.rebuild` held. Paired with their action so the answer
+    // `services.rebuild` held, all sent with `detach` (a quit cancels
+    // none). Paired with their action so the answer
     // reaches `App` (guards, rm's question) even if the thread dies.
     let mut verbs: Vec<(PromptAction, Receiver<VerbEnd>)> = Vec::new();
     let mut last_tick = Instant::now();
@@ -727,7 +728,8 @@ fn verb_instance(action: &PromptAction) -> Option<&str> {
 }
 
 /// The held verbs: they end with the work (seconds), the request waits for
-/// it, and they write no build log.
+/// it, and they write no build log. Sent with `detach` all the same, which
+/// for them only means a quit leaves them running.
 fn verb_held(action: &PromptAction) -> bool {
     matches!(action, PromptAction::Stop { .. } | PromptAction::Rm { .. } | PromptAction::ServiceRebuild { .. })
 }
@@ -736,8 +738,9 @@ fn verb_held(action: &PromptAction) -> bool {
 /// root `root` (absolute) with the dashboard's `env`; `None` for the other
 /// actions. `run`/`rebuild`/`start` always `detach`: the dashboard only
 /// waits for the instance to be registered, its row shows the rest.
-/// `stop`/`rm`/`services.rebuild` are held (they can't detach). An
-/// unanswered `rm` asks (its branch question comes back as `confirm`); an
+/// `stop`/`rm`/`services.rebuild` are held (answered when done) and
+/// `detach` too, which for them only means a hang-up (a dashboard quit)
+/// doesn't cancel them. An unanswered `rm` asks (its branch question comes back as `confirm`); an
 /// answered one carries `deleteBranch`. The target always goes in, so
 /// nothing can need a pick.
 fn verb_call(
@@ -759,14 +762,22 @@ fn verb_call(
             ("start", serde_json::to_value(StartParams { root, env, instance: Some(instance), all: false, detach: true }))
         }
         PromptAction::Stop { instance } => {
-            ("stop", serde_json::to_value(StopParams { root, env, instance: Some(instance), all: false }))
+            ("stop", serde_json::to_value(StopParams { root, env, instance: Some(instance), all: false, detach: true }))
         }
         PromptAction::Rm { instance, force, delete_branch } => (
             "rm",
-            serde_json::to_value(RmParams { root, env, instance, delete_branch, force, ask: delete_branch.is_none() }),
+            serde_json::to_value(RmParams {
+                root,
+                env,
+                instance,
+                delete_branch,
+                force,
+                ask: delete_branch.is_none(),
+                detach: true,
+            }),
         ),
         PromptAction::ServiceRebuild { name } => {
-            ("services.rebuild", serde_json::to_value(ServicesRebuildParams { root, env, name }))
+            ("services.rebuild", serde_json::to_value(ServicesRebuildParams { root, env, name, detach: true }))
         }
         _ => return None,
     };
@@ -849,7 +860,8 @@ fn verb_status(action: &PromptAction, sent: Result<crate::serve::client::Streame
 /// terminal). A detached verb answers once the instance is registered, and
 /// dropping the connection then leaves the build running; a held one
 /// (`stop`, `rm`, `services.rebuild`) answers when done. Quitting the
-/// dashboard before the answer hangs up, which cancels it (SIGINT).
+/// dashboard before the answer hangs up, which cancels nothing: every
+/// dashboard verb is sent with `detach`, so the daemon leaves it running.
 fn spawn_verb(dir: &Path, action: PromptAction) -> Receiver<VerbEnd> {
     let (tx, rx) = mpsc::channel();
     let root = daemon::root_dir(dir.to_path_buf());
@@ -916,8 +928,8 @@ mod tests {
     }
 
     /// Each verb action's request carries the root and env and is what the
-    /// daemon's `serve::verbs::parse` accepts; only `run`/`rebuild`/`start`
-    /// detach.
+    /// daemon's `serve::verbs::parse` accepts; every one is `detach` (the
+    /// held ones too: a quit mustn't cancel them).
     #[test]
     fn verb_calls_are_requests_the_daemon_accepts() {
         use crate::serve::verbs::{self, Target, Verb};
@@ -945,23 +957,23 @@ mod tests {
             Verb::Rebuild { target: Target::One("web-2".into()), force: true }
         );
         assert_eq!(parse(&PromptAction::Start { instance: "web-2".into() }, true), Verb::Start { target: Target::One("web-2".into()) });
-        assert_eq!(parse(&PromptAction::Stop { instance: "web-2".into() }, false), Verb::Stop { target: Target::One("web-2".into()) });
+        assert_eq!(parse(&PromptAction::Stop { instance: "web-2".into() }, true), Verb::Stop { target: Target::One("web-2".into()) });
         // An unanswered rm asks; the modal's answer goes back as
         // `deleteBranch`, same `force`, no `ask`.
         let rm = |force, delete_branch| PromptAction::Rm { instance: "web-2".into(), force, delete_branch };
         assert_eq!(
-            parse(&rm(true, None), false),
+            parse(&rm(true, None), true),
             Verb::Rm { instance: "web-2".into(), delete_branch: None, force: true, ask: true }
         );
         assert_eq!(
-            parse(&rm(true, Some(false)), false),
+            parse(&rm(true, Some(false)), true),
             Verb::Rm { instance: "web-2".into(), delete_branch: Some(false), force: true, ask: false }
         );
         assert_eq!(
-            parse(&rm(false, Some(true)), false),
+            parse(&rm(false, Some(true)), true),
             Verb::Rm { instance: "web-2".into(), delete_branch: Some(true), force: false, ask: false }
         );
-        assert_eq!(parse(&PromptAction::ServiceRebuild { name: "cache".into() }, false), Verb::ServicesRebuild { name: "cache".into() });
+        assert_eq!(parse(&PromptAction::ServiceRebuild { name: "cache".into() }, true), Verb::ServicesRebuild { name: "cache".into() });
         assert_eq!(verb_call(&PromptAction::Exec { instance: "web-2".into(), argv: Vec::new() }, &root, env), None);
     }
 

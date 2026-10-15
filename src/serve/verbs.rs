@@ -19,8 +19,9 @@
 //! One loop on the connection's thread per request ([`serve`]): copy new
 //! spool bytes into `output` notifications, re-read `state.toml` for
 //! `progress`, reap the child, and watch the socket ([`Peer`]): a hang-up
-//! SIGINTs the group (the verb rolls back), unless the daemon is draining,
-//! whose read-side shutdown looks the same and must not cancel anything.
+//! SIGINTs the group (the verb rolls back), unless the request is `detach`
+//! or the daemon is draining, whose read-side shutdown looks the same and
+//! must not cancel anything.
 //! Socket-free, so the loop is tested with a fake [`Peer`] and `sh` scripts.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -103,6 +104,11 @@ pub struct StartParams {
     pub detach: bool,
 }
 
+/// `stop` params. `detach`, as on `rm` and `services.rebuild` (held verbs),
+/// only means "not cancelled when the client leaves": the answer still comes
+/// at the exit, and a hang-up before it leaves the verb running. The
+/// dashboard always sends it (a quit mustn't interrupt its `stop`); the CLI
+/// never does (Ctrl-C = hang-up = cancel).
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StopParams {
@@ -112,6 +118,8 @@ pub struct StopParams {
     pub instance: Option<String>,
     #[serde(default)]
     pub all: bool,
+    #[serde(default)]
+    pub detach: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -131,16 +139,23 @@ pub struct RmParams {
     /// `deleteBranch`.
     #[serde(default)]
     pub ask: bool,
+    /// Not cancelled by a hang-up; still answered at the exit (see
+    /// [`StopParams`]).
+    #[serde(default)]
+    pub detach: bool,
 }
 
-/// `services.rebuild` params: a service of the config root, by name. No
-/// `detach`: it's no instance verb, nothing would show it running on.
+/// `services.rebuild` params: a service of the config root, by name.
+/// `detach` never answers early (no instance would show it running on): it
+/// only keeps a hang-up from cancelling it (see [`StopParams`]).
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServicesRebuildParams {
     pub root: PathBuf,
     pub env: BTreeMap<String, String>,
     pub name: String,
+    #[serde(default)]
+    pub detach: bool,
 }
 
 /// What a verb acts on: an instance as the CLI's `<name>` takes it, or `--all`.
@@ -225,16 +240,16 @@ pub fn parse(method: &str, params: Value) -> Result<VerbRequest, ApiError> {
         }
         "stop" => {
             let p: StopParams = api::parse(params)?;
-            (p.root, p.env, Verb::Stop { target: target(p.instance, p.all)? }, false)
+            (p.root, p.env, Verb::Stop { target: target(p.instance, p.all)? }, p.detach)
         }
         "rm" => {
             let p: RmParams = api::parse(params)?;
             let verb = Verb::Rm { instance: p.instance, delete_branch: p.delete_branch, force: p.force, ask: p.ask };
-            (p.root, p.env, verb, false)
+            (p.root, p.env, verb, p.detach)
         }
         "services.rebuild" => {
             let p: ServicesRebuildParams = api::parse(params)?;
-            (p.root, p.env, Verb::ServicesRebuild { name: p.name }, false)
+            (p.root, p.env, Verb::ServicesRebuild { name: p.name }, p.detach)
         }
         other => return Err(ApiError::unknown_method(other)),
     };
@@ -322,7 +337,9 @@ fn one_or_all<'a>(args: &mut Vec<String>, target: &'a Target) -> Option<&'a Stri
     }
 }
 
-/// When a `detach` request is answered (docs/api.md, *Verbs*).
+/// When a `detach` request is answered (docs/api.md, *Verbs*). Held verbs
+/// (`stop`, `rm`, `services.rebuild`) answer at the exit, detached or not:
+/// for them `detach` only means a hang-up leaves them running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DetachAt {
     /// Not detached: at the exit.
@@ -913,7 +930,7 @@ enum Left {
     Slow,
     /// A `detach` request: hang-up = cancel unless detached
     /// (docs/client-server.md, *Requests*), so a dashboard quit right after
-    /// `r` doesn't roll its build back.
+    /// `r` doesn't roll its build back, nor interrupt its `stop`/`rm`.
     Detached,
 }
 
@@ -1094,8 +1111,13 @@ pub(crate) mod tests {
         assert!(p.detach && p.env["X"] == "1");
         assert!(is_verb("services.rebuild"));
         let p = parse("services.rebuild", json!({"root": r, "env": {}, "name": "db", "detach": true})).unwrap();
-        // No `detach` for it: an unknown field, ignored.
-        assert_eq!((p.verb, p.detach), (Verb::ServicesRebuild { name: "db".into() }, false));
+        assert_eq!((p.verb, p.detach), (Verb::ServicesRebuild { name: "db".into() }, true));
+        let p = parse("services.rebuild", json!({"root": r, "env": {}, "name": "db"})).unwrap();
+        assert!(!p.detach);
+        let p = parse("stop", json!({"root": r, "env": {}, "instance": "w", "detach": true})).unwrap();
+        assert_eq!((p.verb, p.detach), (Verb::Stop { target: one("w") }, true));
+        let p = parse("rm", json!({"root": r, "env": {}, "instance": "w", "ask": true, "detach": true})).unwrap();
+        assert!(p.detach && matches!(p.verb, Verb::Rm { ask: true, .. }));
         assert_eq!(code("services.rebuild", json!({"root": r, "env": {}})), Err("invalid"));
         assert_eq!(code("services.rebuild", json!({"root": r, "name": "db"})), Err("invalid"));
         let _ = std::fs::remove_dir_all(&root);
@@ -1109,7 +1131,12 @@ pub(crate) mod tests {
         assert_eq!(detach_at(&req(Verb::Rebuild { target: one("w"), force: false }, true)), DetachAt::Registered);
         assert_eq!(detach_at(&req(Verb::Rebuild { target: Target::All, force: false }, true)), DetachAt::Spawn);
         assert_eq!(detach_at(&req(Verb::Start { target: one("w") }, true)), DetachAt::Spawn);
+        // Held verbs: `detach` only spares them a hang-up's cancel.
         assert_eq!(detach_at(&req(Verb::ServicesRebuild { name: "db".into() }, true)), DetachAt::Never);
+        assert_eq!(detach_at(&req(Verb::Stop { target: one("w") }, true)), DetachAt::Never);
+        assert_eq!(detach_at(&req(Verb::Stop { target: Target::All }, true)), DetachAt::Never);
+        let rm = Verb::Rm { instance: "w".into(), delete_branch: None, force: false, ask: true };
+        assert_eq!(detach_at(&req(rm, true)), DetachAt::Never);
     }
 
     #[test]
@@ -1498,9 +1525,17 @@ pub(crate) mod tests {
         let rebuild =
             RebuildParams { root: root.clone(), env: e.clone(), instance: None, all: true, force: false, detach: false };
         let start = StartParams { root: root.clone(), env: e.clone(), instance: None, all: true, detach: false };
-        let stop = StopParams { root: root.clone(), env: e.clone(), instance: None, all: true };
-        let rm = RmParams { root: root.clone(), env: e.clone(), instance: "w".into(), delete_branch: None, force: false, ask: true };
-        let services_rebuild = ServicesRebuildParams { root, env: e, name: "db".into() };
+        let stop = StopParams { root: root.clone(), env: e.clone(), instance: None, all: true, detach: true };
+        let rm = RmParams {
+            root: root.clone(),
+            env: e.clone(),
+            instance: "w".into(),
+            delete_branch: None,
+            force: false,
+            ask: true,
+            detach: true,
+        };
+        let services_rebuild = ServicesRebuildParams { root, env: e, name: "db".into(), detach: true };
         for (iface, value) in [
             ("RunParams", v(&run)),
             ("RebuildParams", v(&rebuild)),

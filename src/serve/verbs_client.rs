@@ -291,18 +291,19 @@ fn prepare(verb: &CliVerb, root: &Path, env: BTreeMap<String, String>, call: &mu
                 Some(name) => Some(resolved!(&name)),
                 None => None,
             };
-            let p = StopParams { root, env, instance: instance.clone(), all: instance.is_none() };
+            // Never `detach`: Ctrl-C (the hang-up) cancels a held verb.
+            let p = StopParams { root, env, instance: instance.clone(), all: instance.is_none(), detach: false };
             ("stop", serde_json::to_value(p)?, instance)
         }
         CliVerb::Rm { name, delete_branch, force } => {
             let instance = resolved!(&name);
             // Off a TTY nothing could answer: the non-TTY default, as today.
             let ask = ui.tty && delete_branch.is_none();
-            let p = RmParams { root, env, instance: instance.clone(), delete_branch, force, ask };
+            let p = RmParams { root, env, instance: instance.clone(), delete_branch, force, ask, detach: false };
             ("rm", serde_json::to_value(p)?, Some(instance))
         }
         CliVerb::ServicesRebuild { name } => {
-            let p = ServicesRebuildParams { root, env, name };
+            let p = ServicesRebuildParams { root, env, name, detach: false };
             ("services.rebuild", serde_json::to_value(p)?, None)
         }
     };
@@ -747,7 +748,7 @@ mod tests {
         let p = sent(p);
         assert_eq!(calls, [r#"instances.resolve {"name":"web"}"#]);
         assert_eq!((p.method, p.instance.as_deref()), ("stop", Some("web-2")));
-        assert_eq!(p.params, json!({"root": "/cfg", "env": {"A": "1"}, "instance": "web-2", "all": false}));
+        assert_eq!(p.params, json!({"root": "/cfg", "env": {"A": "1"}, "instance": "web-2", "all": false, "detach": false}));
 
         let two = [("instances.resolve", ok(json!({"matches": ["web", "web-2"]})))];
         let e = prep(&stop, false, &two, 0).0.unwrap_err();
@@ -775,7 +776,7 @@ mod tests {
         assert!(calls.is_empty(), "no prompt, no resolve");
         let p = sent(p);
         assert_eq!((p.method, p.instance), ("services.rebuild", None));
-        assert_eq!(p.params, json!({"root": "/cfg", "env": {"A": "1"}, "name": "db"}));
+        assert_eq!(p.params, json!({"root": "/cfg", "env": {"A": "1"}, "name": "db", "detach": false}));
     }
 
     #[test]

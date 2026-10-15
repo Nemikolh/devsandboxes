@@ -41,8 +41,9 @@ Known limitations:
   in its build log (`b`) and the row's status; its waiting thread action
   never fires.
 - Quitting the dashboard during a held `stop`, `rm` or `services.rebuild`
-  hangs up, which SIGINTs it. Easier to hit than "rare": a `stop` with
-  services takes ≈20 s on alpine (SIGKILL after the stop timeout).
+  used to hang up = SIGINT it (a `stop` with services takes ≈20 s on
+  alpine). Fixed (`docs/before-machines.md`, step 2): the dashboard sends
+  them with `detach`, so a quit leaves them running.
 - Two dashboards each poll the daemon, which runs the runtime calls per
   request: no shared cache (`docs/serve.md`, *Future work*).
 - The Inbox is still read from the local store file (and written to it
@@ -110,8 +111,9 @@ New for this step:
   `docker start`). A thread action waiting on the start runs when a
   snapshot shows the row running.
 - **`stop`, `rm` (and `services rebuild`) are held requests** on their own
-  connection; quitting the dashboard mid-op hangs up = SIGINT (rare,
-  seconds-long). The answer or error (rm refusing a dirty worktree) is the
+  connection; quitting the dashboard mid-op hangs up, which leaves them
+  running: they're sent with `detach`, which for a held verb only waives
+  the hang-up's cancel (`docs/before-machines.md`, step 2). The answer or error (rm refusing a dirty worktree) is the
   status line.
 - **`rm`**: sent with `ask: true`; a `confirm` answer opens the existing
   Confirm modal with rm's question: `y` resends with `deleteBranch: true`,

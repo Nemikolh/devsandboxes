@@ -1366,6 +1366,31 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The dashboard's held verbs (`stop`, `rm`, `services.rebuild`) carry
+    /// `detach`: a quit mid-verb leaves it running to its exit.
+    #[test]
+    fn a_detached_held_verb_survives_a_hang_up() {
+        let (dir, root, daemon) = verb_daemon("verb-held-detach", 150, VERB_SCRIPT);
+        let (stream, _) = hello_at(&dir, &v(1));
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut writer = stream;
+        writer.write_all(verb_line(1, "stop", &root, json!({"instance": "slow", "detach": true})).as_bytes()).unwrap();
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert!(!line.contains(r#""id":1"#), "answered early: {line}");
+            if line.contains("ready") {
+                break;
+            }
+        }
+        drop((reader, writer));
+        assert!(wait_file(&root.join("done"), Duration::from_secs(5)), "the verb didn't finish");
+        assert!(!root.join("int").exists(), "SIGINTed");
+        assert_eq!(daemon.join().unwrap().unwrap(), Exit::Idle);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn a_detached_verb_holds_the_daemon_until_reaped() {
         let (dir, root, daemon) = verb_daemon("verb-hold", 150, VERB_SCRIPT);
