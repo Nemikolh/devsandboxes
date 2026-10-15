@@ -69,7 +69,12 @@ git worktrees so working trees are never shared.
   start + hello; `ensure_running` for `run`/`start`; `Conn` sets
   notifications aside), `idle.rs` (pure idle countdown over `Holders`),
   `proto.rs` (JSON-lines wire, `PROTOCOL`), `api.rs` (the API's method table
-  and wire views over `inbox::ops`/`snapshot`, socket-free; `docs/api.md`),
+  and wire views, socket-free, state path and runtime calls injectable;
+  `docs/api.md`): the Inbox over `inbox::ops`, and what the dashboard
+  reads and edits: `instances.list` (snapshot at a `depth` +
+  `thread_children`), `instances.procs`/`signal`/`buildLog`/`rename`/`done`,
+  `containers.logs`/`inspect` (`devsandbox-` names only),
+  `sandboxes.get`/`services.get`,
   `forwards.rs` (the `serve-forwards` thread owning every Ports-tab `Forward`,
   one registry per config root, daemon-wide ids; reconciles sandboxes'
   `forwardPorts` against `host.rs`'s running poll, with host ports saved in
@@ -84,7 +89,7 @@ git worktrees so working trees are never shared.
   `install.rs` is `serve install|uninstall` (systemd user unit / LaunchAgent:
   pure render fns, manager calls through an injected runner; `shutdown`
   stops a running daemon first).
-  `verbs.rs` is `run`/`rebuild`/`start`/`stop`/`rm` as API methods
+  `verbs.rs` is `run`/`rebuild`/`start`/`stop`/`rm`/`services.rebuild` as API methods
   (docs/verbs-as-requests.md): typed params → a pure `argv`, each verb a
   `devsandbox --in-process` subprocess (request env only, own process
   group, stdout/stderr spooled in `logs/verbs/<pid>.out|.err`) streamed as
@@ -99,6 +104,8 @@ git worktrees so working trees are never shared.
   `--in-process` (hidden, global) never lazy-starts a daemon
   (`client::set_in_process`); the dispatcher's subprocesses pass it too.
 - `src/runtime/` — backend abstraction over docker/podman/Apple container.
+  `procs.rs` parses a container's `ps` listing and its helper's `devsbd run
+  ls` (pure; what `instances.procs` answers).
 - `devsbd/` — static in-container helper (workspace member), built by
   `scripts/build-devsbd.sh` and embedded by `build.rs`; `src/devsbd.rs` holds
   the embedded blobs + install, `src/devsbd/proto.rs` the frame protocol
@@ -123,12 +130,15 @@ git worktrees so working trees are never shared.
   completion), `terminal.rs`, `actions.rs` (one-key actions + pending queue),
   `procs.rs`, `inbox.rs` (Inbox tab: `devsbd notify` history, key dedupe,
   unread badges), `forms.rs` (pinned open forms: rendering, form zone keys); shared test fixtures in `test_support.rs`. `tui/mod.rs` owns the terminal + event loop and runs
-  docker work on background threads; `prompt.rs` is the `:` command line
+  daemon requests on background threads (the dashboard reads no config
+  and calls no runtime; still local: the Inbox store, `dashboard.toml`,
+  prompt history, VS Code's `state.toml` read); `procs.rs` builds the
+  process forest and rows from `instances.procs`' answer; `prompt.rs` is the `:` command line
   (`spec.rs` is its declarative grammar table — parsing _and_ tab completion
   derive from `SPECS`, so a new flag is one table entry);
   `term.rs` holds the integrated terminal's PTY sessions + tab strip
   (`TermSession`/`TermTabs`, a shell rendered via vt100: `devsandbox exec`
-  for an instance, `docker exec -it` for a service);
+  for an instance, `<runtime> exec -it` for a service);
   `kitty.rs` emulates the kitty keyboard protocol for those sessions (vt100
   callbacks + key encoding; see `docs/tui-terminal.md`);
   `daemon.rs` is the host-daemon worker thread (unix): owns the `serve`
@@ -136,12 +146,15 @@ git worktrees so working trees are never shared.
   `inbox.changed`/`instances.changed`/`inbox.shown`, sends Inbox `Op`s as
   API calls while connected (else the loop applies them locally), and is
   the Ports tab's client (`forwards.list` on `forwards.changed`,
-  `forwards.add`/`rm`; the daemon owns the forwards), and sends `d`'s
-  `instances.cancel`. `poll.rs` is the dashboard's reads: `instances.list`
+  `forwards.add`/`rm`; the daemon owns the forwards), sends `d`'s
+  `instances.cancel`, and carries the one-shot calls (`Cmd::Fetch`: logs,
+  inspect, config, build log; `Signal`, `Rename`, `Done`), each answered
+  by one `DaemonUpdate`. `poll.rs` is the dashboard's reads: `instances.list`
   (the snapshot, at the depth the loop's schedule picks) and
   `instances.procs`, a thread and a connection each, never starting a
   daemon (`daemon.rs` does). The dashboard's `run`/`rebuild`/`start` are detached
-  verb requests on their own connections (`spawn_verb` in `tui/mod.rs`).
+  verb requests, `stop`/`rm`/`services.rebuild` held ones, each on its own
+  connection (`spawn_verb` in `tui/mod.rs`).
   Mouse selection (`docs/tui-selection.md`): `select.rs` is the pure model
   (extraction, highlight), `app/selection.rs` its routing, `clipboard.rs` the
   OSC 52 writer; `settings.rs` the dashboard settings (`dashboard.toml` next

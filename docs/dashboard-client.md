@@ -1,9 +1,66 @@
 # The dashboard as a pure client
 
-Status: plan. Rollout step 4 of `docs/client-server.md` (read its *The
-dashboard as a pure client*, *Config roots*, *Machines* and *Rollout*
-first). Steps 1–3 are built: `docs/instance-phase.md`,
-`docs/verbs-as-requests.md`. The reference is `docs/api.md`.
+Status: done (steps 1–9). Rollout step 4 of `docs/client-server.md` (read
+its *The dashboard as a pure client*, *Config roots*, *Machines* and
+*Rollout* first). Rollout steps 1–3 are built: `docs/instance-phase.md`,
+`docs/verbs-as-requests.md`. The reference is `docs/api.md`, *The
+dashboard as a client*.
+
+As built, where it differs from the steps below (the *Decisions* and
+F1–F16 are current otherwise; the steps are kept as the record):
+
+- Off unix, `mod tui` is gated in `src/main.rs` (`#[cfg(unix)]`), not with
+  cfgs inside `src/tui/mod.rs`; the Inbox clock helpers `devsandbox inbox`
+  shares (`short_age`, `local_utc_offset`, …) moved to
+  `src/inbox/clock.rs`.
+- The CLI subcommand is `service rebuild` (singular); the method is
+  `services.rebuild`.
+- `sandboxes.get` answers `config::SandboxText`, `instances.buildLog`
+  `build_log::Tail`; the dashboard keeps them as received.
+- The poll worker (`src/tui/poll.rs`) never lazy-starts a daemon: it waits
+  up to 5 s for one, and `src/tui/daemon.rs` is the one that starts it
+  (and waits for a handoff's successor). A failed poll shows only in the
+  header's stale marker; `daemon.rs` owns the disconnected status line.
+- `PendingSignal` carries the instance name, not the container.
+- `s`'s `stopping`/`starting` guards clear on the verb's answer.
+- `after_start` runs on a snapshot showing the instance running with no
+  phase (`App::run_after_start`).
+- An instance terminal's argv is `<exe> -C <root> exec -i -t --
+  <instance> [cmd…]`; the exe is `current_exe()` taken at dashboard start
+  (`App::exec_cli`).
+- `open_started_terminal` (step 7) and `log_error` (step 8) were removed:
+  nothing used them once the verbs and `:exec` stopped running in the
+  dashboard's process.
+
+Known limitations:
+
+- **F16**: the dashboard no longer runs an autostart pass, so opening it
+  doesn't autostart a config root with no recorded instances (the daemon's
+  startup pass only knows recorded roots).
+- **F14**: a detached `s` start that fails after it's registered only shows
+  in its build log (`b`) and the row's status; its waiting thread action
+  never fires.
+- Quitting the dashboard during a held `stop`, `rm` or `services.rebuild`
+  hangs up, which SIGINTs it. Easier to hit than "rare": a `stop` with
+  services takes ≈20 s on alpine (SIGKILL after the stop timeout).
+- Two dashboards each poll the daemon, which runs the runtime calls per
+  request: no shared cache (`docs/serve.md`, *Future work*).
+- The Inbox is still read from the local store file (and written to it
+  while disconnected) until federation (rollout step 5); VS Code (`o`,
+  `:code`, a thread's `vscode`) reads `state.toml` (rollout step 7).
+- `current_exe()` is captured at dashboard start, so replacing the binary
+  while it runs (an upgrade) makes new terminal tabs fail until restart
+  (on Linux the path gains " (deleted)").
+- A header shows `(stale Ns: …)` right after one failed request, even
+  under the 10 s `STALE_AFTER_SECS`.
+- `d` ignores modifiers, so Ctrl-D on an instance removes it without a
+  prompt (pre-existing, not fixed).
+- A lazily started daemon appears to keep the starter's inherited non-stdio
+  fds open (seen as a smoke-test pipeline that didn't end until the daemon
+  was killed). Pre-existing, unverified.
+- Service terminals still run a direct `<runtime> exec -it`; one terminal
+  path for instances and services is for later (user's note).
+- `services.rebuild` sends no `progress` (it has no instance phase).
 
 ## Problem
 

@@ -154,8 +154,10 @@ own process, without the daemon.
 At start the daemon runs the `autostart = true` pass
 (`docs/automations-guide.md`) once for every config root recorded in
 `state.toml`, on a background thread; its notes go to `serve.log`. The pass
-is once per boot per root, so the dashboard, and `run`, `rebuild` and `start`
-(in the verb's process, after it), also calling it is harmless.
+is once per boot per root, so `run`, `rebuild` and `start` (in the verb's
+process, after it) also calling it is harmless. The dashboard no longer
+runs one of its own: a root with no recorded instance isn't autostarted by
+opening it.
 
 ## Wire
 
@@ -350,16 +352,15 @@ runtime stops or starts answering, at each forwards status line
 
 ## Future work
 
-The other verbs moving into the daemon, the dashboard as a pure client, and
-remote machines: `docs/client-server.md` (Windows: `docs/windows-support.md`).
+The other verbs moving into the daemon and remote machines:
+`docs/client-server.md` (Windows: `docs/windows-support.md`).
 
 Accepted trade-offs of the current design, to revisit:
 
-- **The dashboard collects its own instance snapshot.** It runs
-  `snapshot::collect` at its own cadence rather than reading
-  `instances.list`, so two dashboards (and the daemon's 5 s poll) each query
-  the runtime. Moving the snapshot into the daemon would need per-root
-  polling there and procs/stats at the dashboard's cadence.
+- **No shared snapshot.** Each dashboard polls `instances.list` and
+  `instances.procs` at its own cadence, and the daemon runs the runtime
+  calls per request, so two dashboards (and the daemon's own 5 s poll)
+  each query the runtime. A per-root cache in the daemon would fix it.
 - **Forwards hold the daemon indefinitely.** Every live forward is a holder,
   so a running instance with `forwardPorts`, or any saved ad-hoc forward
   (`forwards.toml`, restored at every start), keeps the daemon from ever

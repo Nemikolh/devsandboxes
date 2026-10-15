@@ -180,8 +180,8 @@ The main crate must build for every release target (incl. macOS, Windows) while 
 
 - **When:** in `run` after create (next to lifecycle commands) and in
   `start_instance` (`src/commands/start.rs:42`, both the resolved and bare
-  branches) after the container starts, plus the TUI's bare `s` start
-  (`spawn_start`, silently), and in the host daemon (`devsandbox serve`)
+  branches) after the container starts (the dashboard's `s` start is a
+  `start` verb request too), and in the host daemon (`devsandbox serve`)
   before every bridge (re)spawn (`Bridges::reconcile`, on the bridge
   worker), so a newer daemon upgrades a running instance's helper and the
   in-container daemon of the new build takes over. On docker `/run` is in the container's writable

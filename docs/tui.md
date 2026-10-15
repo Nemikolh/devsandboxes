@@ -2,6 +2,12 @@
 
 **Status: implemented through step 7 (all steps done).**
 
+Since `docs/dashboard-client.md` the dashboard (unix only) is a client of
+`devsandbox serve`: the data the steps below collect (state, config,
+docker) is the daemon's `instances.list` / `instances.procs`, and every
+action is a request (`docs/api.md`, *The dashboard as a client*). The steps
+are kept as the record.
+
 Repo: `devsandbox` (Rust, clap CLI managing devcontainer sandboxes).
 Key modules: `src/config.rs` (TOML config, templates/`extends`, `resolve_sandbox`),
 `src/state.rs` (instances in `~/.local/share/devsandbox/state.toml`),
@@ -82,8 +88,8 @@ which live instances reference it. Same table/detail-panel pattern as step 3.
     bytes (see `hex_encode` in `src/tui/mod.rs`). `code` is spawned detached (no
     TUI suspend); its outcome shows as a one-line status in the help bar.
   - `rm <instance>`.
-- `exec` suspends the TUI (leave alt screen + raw mode), runs `commands::exec::exec`
-  with inherited stdio, waits for a keypress, re-enters the TUI and forces a data
+- `exec` suspends the TUI (leave alt screen + raw mode), runs `devsandbox exec` as a
+  child with inherited stdio, waits for a keypress, re-enters the TUI and forces a data
   refresh. The verbs (`run`, `rebuild`, `start`, `stop`, `rm`, a service's `rebuild`)
   never suspend: see *Background builds* below.
 - `tab` completion: first token from the command list; argument token from sandbox names
@@ -410,10 +416,10 @@ it. Any event the button also queues for the sender is sent on the click.
 ## Phase 5 — done instances, VS Code at a line
 
 - An instance marked done (`state::Instance::done`) stays in the tree,
-  dimmed, with a `✓` after its name. `d` / `u` on an Instances row mark it
-  done / clear it, sent as `instances.done` to the daemon;
-  the same flag is set by `devsandbox done|undone`, `devsbd done`, and a
-  thread's done/reopen on its child.
+  dimmed, with a `✓` after its name. The flag is set by `devsandbox
+  done|undone`, `devsbd done`, and a thread's done/reopen on its child
+  (the dashboard sends that as `instances.done`). On an Instances row `d`
+  removes the instance and `u` does nothing.
 - `:code <instance> [--goto path[:line[:col]]]` opens VS Code and then the
   file (relative to the instance's workspace folder) at the line, via
   `devsbd vscode-goto` in the container (`docs/sandbox-helper.md`). It runs
@@ -438,7 +444,7 @@ opens its build log)`, the snapshot refreshes at once, and the row's
 status column shows the phase, how it ends included. A verb that fails
 before that (`failed`) leaves a help-bar line with its error pointing at
 the build-log key. No daemon, no fallback: `run web: needs devsandbox
-serve (<why>)`. Off unix (no daemon) they run suspended, in-process.
+serve (<why>)`.
 
 `s` is a `stop` request on a running row, a detached `start` on an exited
 one (so it runs services, `postStartCommand` and the autostart pass like
@@ -465,7 +471,7 @@ true`, `n` with `false`, `esc`/`q` removes nothing.
   whoever started the build; a cancelled `run` rolls back (its row and log
   go), a `rebuild`/`start` records `failed`. The status line is the answer
   (`cancelling web-2 (SIGINT to pid N)`, or why not); while disconnected,
-  `cancel web-2: needs devsandbox serve`. Unix only.
+  `cancel web-2: needs devsandbox serve`.
 
 ## Mouse selection
 

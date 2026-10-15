@@ -8,11 +8,11 @@ order: 4
 import Callout from '../../components/Callout.astro';
 import ResourceLink from '../../components/ResourceLink.astro';
 
-`devsandbox serve` is a small background process, one per user, that holds the live side of devsandbox on your machine: the `run`, `rebuild`, `start`, `stop` and `rm` you start, the connection to each running sandbox's helper, the ssh-agent relay, port forwards, desktop notifications, the control commands dispatchers use, and the API other tools talk to. Because it lives outside the dashboard and your terminal, all of that keeps working when you close them.
+`devsandbox serve` is a small background process, one per user, that holds the live side of devsandbox on your machine: the `run`, `rebuild`, `start`, `stop`, `rm` and `service rebuild` you start, everything the dashboard shows, the connection to each running sandbox's helper, the ssh-agent relay, port forwards, desktop notifications, the control commands dispatchers use, and the API other tools talk to. Because it lives outside the dashboard and your terminal, all of that keeps working when you close them.
 
 ## You don't start it
 
-The dashboard, `run`, `rebuild`, `start`, `stop`, `rm` and the commands that relay your ssh-agent start it when it isn't running, and a newer devsandbox takes over from an older one by itself. It exits 10 minutes after its last user left: no dashboard, no build or other command still running, no port forward, no running dispatcher or `inbox = true` sandbox. Files stay the source of truth (`state.toml`, the Inbox), so stopping it loses nothing, and read-only commands such as `ps` or `devsandbox inbox ls` don't need it.
+The dashboard, `run`, `rebuild`, `start`, `stop`, `rm`, `service rebuild` and the commands that relay your ssh-agent start it when it isn't running, and a newer devsandbox takes over from an older one by itself. It exits 10 minutes after its last user left: no dashboard, no build or other command still running, no port forward, no running dispatcher or `inbox = true` sandbox. Files stay the source of truth (`state.toml`, the Inbox), so stopping it loses nothing, and read-only commands such as `ps` or `devsandbox inbox ls` don't need it.
 
 What it keeps across restarts:
 

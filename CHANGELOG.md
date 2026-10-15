@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-No more half-built sandboxes: an instance is recorded from the moment `run` starts, a failure leaves it listed as `failed` with its error, and Ctrl-C undoes the whole run. Every `run`, `rebuild` and `start` keeps a build log, and the dashboard runs them in the background instead of handing them the screen. `run`, `rebuild`, `start`, `stop` and `rm` now run in the host daemon, so a build outlives the terminal that started it, and `-d` leaves it running.
+No more half-built sandboxes: an instance is recorded from the moment `run` starts, a failure leaves it listed as `failed` with its error, and Ctrl-C undoes the whole run. Every `run`, `rebuild` and `start` keeps a build log, and the dashboard runs them in the background instead of handing them the screen. `run`, `rebuild`, `start`, `stop`, `rm` and `service rebuild` now run in the host daemon, so a build outlives the terminal that started it, and `-d` leaves it running. The dashboard gets everything it shows from the daemon too.
 
 **Behaviour change: a failed `run` now leaves an instance to `rm`.** Before, only a failing lifecycle command (`postCreateCommand`, …) kept its container, and a run that failed earlier (worktree, image build, container create) left its worktree, branch and services behind with no instance pointing at them. Now every failure keeps a `failed` instance; `devsandbox rm <name>` removes all of it, or `devsandbox rebuild <name>` retries.
 
@@ -19,7 +19,11 @@ devsandbox rm web-4        # or remove everything it made
 devsandbox run -d web --branch fix/login
 ```
 
-- **API: the verbs as methods.** `run`, `rebuild`, `start`, `stop` and `rm` stream their output and phase over the API, plus `instances.resolve`, `instances.cancel` and `sandboxes.list`. Details: `docs/api.md`, *Verbs*.
+- **API: the verbs as methods.** `run`, `rebuild`, `start`, `stop`, `rm` and `services.rebuild` stream their output and phase over the API, plus `instances.resolve`, `instances.cancel` and `sandboxes.list`. Details: `docs/api.md`, *Verbs*.
+
+- **API: everything the dashboard shows.** `instances.list` takes a `depth` (`disk`, `listing` or `full`, to skip the runtime or just its stats) and also answers `thread_children`. New: `instances.procs` and `instances.signal` (an instance's processes and tracked runs; SIGTERM/SIGKILL one), `instances.buildLog`, `instances.rename`, `instances.done`, `containers.logs` and `containers.inspect` (devsandbox containers only), `sandboxes.get` and `services.get` (a config as written and resolved). `instances.changed` now also fires when an instance is created, removed, renamed, marked done or changes step. Details: `docs/api.md`.
+
+- **`status --json` and `ls --json` sandbox rows gain `dispatcher` and `worktree_branch`**: whether the sandbox is a dispatcher, and its resolved `worktree-branch`. Details: `docs/json-output.md`.
 
 - **Build logs.** `run`, `rebuild` and `start` write their whole output, the containers' build and lifecycle commands included, to a log per instance (`~/.local/share/devsandbox/logs/<instance id>/build.log`; the one before is kept as `build.1.log`, and `rm` deletes both). `devsandbox logs --build <name>` prints it; `--follow` keeps printing until the instance is done building. The command's error, if it failed, is the last line.
 
@@ -31,11 +35,17 @@ devsandbox logs --build web-4 --follow
 
 ### Changed
 
-- **`run`, `rebuild`, `start`, `stop` and `rm` run in the host daemon.** The command starts `devsandbox serve` if needed, hands it the work and prints its output as it comes, exiting as before. Closing the terminal, or losing the ssh session, no longer stops a build; Ctrl-C still cancels it (the rollback's output shows, exit 130), and a second one stops it at once. Prompts (the sandbox picker, an ambiguous name, `rm`'s branch question) still happen in your terminal. If no daemon answers, one `warning:` line and the command runs in your terminal as before (on Windows it always does, with no daemon).
+- **`run`, `rebuild`, `start`, `stop`, `rm` and `service rebuild` run in the host daemon.** The command starts `devsandbox serve` if needed, hands it the work and prints its output as it comes, exiting as before. Closing the terminal, or losing the ssh session, no longer stops a build; Ctrl-C still cancels it (the rollback's output shows, exit 130), and a second one stops it at once. Prompts (the sandbox picker, an ambiguous name, `rm`'s branch question) still happen in your terminal. If no daemon answers, one `warning:` line and the command runs in your terminal as before (on Windows it always does, with no daemon).
+
+- **The dashboard is a client of the host daemon.** Everything it shows comes from `devsandbox serve` and every action goes to it, so it needs the daemon (it starts one when it opens, as before). If the daemon goes away, the last tree stays on screen marked stale with the reason, and actions say the daemon is needed. On Windows, which has no daemon, the dashboard isn't available for now. It no longer runs an autostart pass of its own when it opens; the daemon's covers every config root that has instances.
+
+- **The dashboard no longer takes over the screen for `stop`, `rm` or a service's `rebuild`.** They run in the daemon, and the status line says how they ended, or why not (e.g. `rm` refusing a dirty worktree). `rm`'s question about deleting the branch is a `y`/`n` popup; `esc` removes nothing. Quitting the dashboard while one of them is still going interrupts it.
+
+- **`s` on a stopped instance starts it like `devsandbox start`.** It used to be a bare container start; it now also runs the services, `postStartCommand` and the autostart pass, in the background, with a build log under `b`.
 
 - **Each command runs with your shell's environment.** The daemon runs every request with the caller's whole environment, never its own: `${localEnv:…}` in the config, `SSH_AUTH_SOCK`, `GIT_*`, `DEVSANDBOX_RUNTIME` and `PATH` are those of the shell you typed the command in, even when the daemon was started long ago or by systemd.
 
-- **The dashboard runs `run`, `rebuild` and `start` in the background, through the host daemon.** It no longer steps aside for the build and waits for a key: the command keeps going even if you quit the dashboard, a status line says when it started, and the instance's row shows its step as it goes, `failed` included. When it can't reach the daemon, the status line says one is needed instead. `rm` and `stop` still take over the screen. `b` on an instance opens its build log, following it while it builds. `d` on a row still building asks to cancel it; on a failed row it removes the instance, and `s` rebuilds it.
+- **The dashboard runs `run`, `rebuild` and `start` in the background, through the host daemon.** It no longer steps aside for the build and waits for a key: the command keeps going even if you quit the dashboard, a status line says when it started, and the instance's row shows its step as it goes, `failed` included. When it can't reach the daemon, the status line says one is needed instead. `b` on an instance opens its build log, following it while it builds. `d` on a row still building asks to cancel it; on a failed row it removes the instance, and `s` rebuilds it.
 
 - **Ctrl-C rolls a `run` back.** Cancelling a `run` (Ctrl-C or SIGTERM) removes everything it had made: container, services and network, volumes, worktrees, the branch it created if it has no new commits, and the instance itself. A second Ctrl-C quits at once without cleaning up. A cancelled `rebuild` leaves the instance `failed`.
 

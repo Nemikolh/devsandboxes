@@ -694,29 +694,56 @@ disagree.
 
 ## The dashboard as a client
 
-The dashboard holds one connection for its life (`src/tui/daemon.rs`),
-subscribed to `inbox`, `instances` and `forwards`, and reconnects after `closing` or a
-lost connection (at once, then 1 s, 2 s, … up to 30 s apart; after a
-handoff it waits up to 5 s for the successor before starting a daemon).
-Its Inbox writes go through the `inbox.*` mutations while connected, and
-straight to the store (the same code) while not. It reads the store file
-itself, reloading on `inbox.changed`, and keeps its own instance snapshot
-(with processes and stats), refreshed early on `instances.changed`.
-`inbox.shown` is its status line. An instance's integrated terminal runs
-`devsandbox exec`, which sends `bridges.ensure` itself. Its Ports tab is
-`forwards.list` for its config root, re-fetched on `forwards.changed` and
-after every reconnect; `p` / `:port` is `forwards.add`, `d` is
-`forwards.rm`, `forwards.status` its status line. While disconnected the
-tab is empty and an add says the daemon is needed. Two dashboards share one
-daemon, and the same forwards. Its `run`, `rebuild` and `start` are verb
-requests (*Verbs*), always `detach`, with its absolute config root and its
-own env, each on a connection of its own (it's held until the answer);
-their `output` is dropped (the build log has it), the answer is its status
-line, and the row's phase shows the rest. `d` on an in-flight row is
-`instances.cancel` on the long-lived connection. Without a daemon neither
-has a fallback: the status line says it's needed. `stop`, `rm` and
-`services.rebuild` are held verb requests the same way (rm with `ask`, its
-`confirm` question a modal whose answer resends it with `deleteBranch`).
+The dashboard (unix only) reads nothing of the daemon's side itself: no
+config file, no runtime call. Its connections:
+
+- **The long-lived one** (`src/tui/daemon.rs`), the only one that starts
+  a daemon at launch: subscribed to `inbox`, `instances` and `forwards`,
+  reconnecting after `closing` or a lost connection (at once, then 1 s,
+  2 s, … up to 30 s apart; after a handoff it waits up to 5 s for the
+  successor before starting a daemon). It carries the quick calls: the
+  logs modal (`containers.logs`), the config view (`sandboxes.get` /
+  `services.get`, `containers.inspect`), `b` (`instances.buildLog`,
+  re-read while the instance is in flight), the process keys
+  (`instances.signal`), `:rename` (`instances.rename`), a thread's
+  done/reopen on its child (`instances.done`), `d` on an in-flight row
+  (`instances.cancel`), the Inbox mutations (`inbox.*`) and the Ports tab
+  (`forwards.list` for its config root, re-fetched on `forwards.changed`
+  and after every reconnect; `p` / `:port` is `forwards.add`, `d` is
+  `forwards.rm`). `inbox.shown` and `forwards.status` are status lines.
+- **Two poll connections** (`src/tui/poll.rs`), one for `instances.list`
+  and one for `instances.procs`, so a slow `docker stats` never holds up a
+  procs fetch or the other way round. They never start a daemon (they wait
+  up to 5 s for one), and keep at most one request each in flight. The
+  tree is `instances.list` at `depth: "listing"` every 2 s, `"full"` (with
+  stats) at most every 7 s, and right after an `instances.changed`;
+  `thread_children` maps an Inbox thread to its child. Expanded instances'
+  processes are `instances.procs`, every 5 s.
+- **One per verb** (`spawn_verb` in `src/tui/mod.rs`): `run`, `rebuild`
+  and `start` (`s` on a stopped row too) are verb requests (*Verbs*),
+  always `detach`; `stop` (`s` on a running row), `rm` (`d`, `:rm`) and
+  `services.rebuild` are held until the verb ends. Each carries the
+  absolute config root and the dashboard's env; its `output` is dropped
+  (the build log has a build's), the answer is the status line, and the
+  row's phase shows the rest. `rm` goes with `ask`: its `confirm` question
+  is a y/n modal whose answer resends it with `deleteBranch`. Quitting the
+  dashboard hangs up a held verb, which cancels it (SIGINT).
+
+An instance's terminal tab runs `devsandbox -C <root> exec -i -t --
+<instance>`, which sends `bridges.ensure` itself; a service's is a direct
+`<runtime> exec -it`.
+
+Disconnected: the last tree stays, its header marked stale with the reason
+(never connected: an empty tree that says devsandbox serve is needed), the
+Ports tab is empty, and every request answers with a status line saying
+the daemon is needed. There is no in-process fallback.
+
+The Inbox is still read from the store file (reloaded on `inbox.changed`
+or when the file moves), and written straight to it (the same ops code)
+while disconnected. VS Code (`o`, `:code`) reads `state.toml`. Two
+dashboards share one daemon and the same forwards; each polls on its own,
+and the daemon answers each request with fresh runtime calls (no shared
+cache).
 
 ## The CLI as a client
 

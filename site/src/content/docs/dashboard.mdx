@@ -9,7 +9,7 @@ import DashboardTour from '../../components/DashboardTour.astro';
 import TourStep from '../../components/TourStep.astro';
 import Try from '../../components/Try.astro';
 
-Run `devsandbox` with no arguments on a terminal and the dashboard opens. The preview next to the text follows along as you scroll: it shows what each section talks about. Click it and press the keys each section suggests; everything in it is fake, nothing runs.
+Run `devsandbox` with no arguments on a terminal and the dashboard opens (Linux and macOS: it works through the [host daemon](/docs/host-daemon), which it starts). The preview next to the text follows along as you scroll: it shows what each section talks about. Click it and press the keys each section suggests; everything in it is fake, nothing runs.
 
 <DashboardTour>
 
@@ -47,7 +47,7 @@ Tab `2` lists the service containers your sandboxes use: shared by every instanc
 
 ## Run, stop, start
 
-`r` on a sandbox row prefills `:run web`: Enter starts a new instance, on its own worktree. `run`, `rebuild` and `start` run in the background, in the [host daemon](/docs/host-daemon), and keep going if you quit the dashboard: the new row's status shows the step it's at (`building`, `postCreateCommand`, …), and `b` opens its build log, following along. `d` on a row still building offers to cancel it (a cancelled `run` is undone). `s` stops the selected instance, or starts it again. On an instance row, `r` renames it.
+`r` on a sandbox row prefills `:run web`: Enter starts a new instance, on its own worktree. `run`, `rebuild` and `start` run in the background, in the [host daemon](/docs/host-daemon), and keep going if you quit the dashboard: the new row's status shows the step it's at (`building`, `postCreateCommand`, …), and `b` opens its build log, following along. `d` on a row still building offers to cancel it (a cancelled `run` is undone). `s` stops the selected instance, or starts it again the way `devsandbox start` does, `postStartCommand` included. `stop` and `rm` run in the daemon too; the status line says when they're done. On an instance row, `r` renames it.
 
 <Try>`enter` to run `web-4` and watch its row go from `building` to `running`, then `↓` to it and `b` for its build log, or `s` on any instance.</Try>
 

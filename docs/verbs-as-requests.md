@@ -39,7 +39,7 @@ Known limitations:
   Once its row shows, only the dashboard's `d` or `instances.cancel` stop
   it (the CLI has no cancel verb).
 - The dashboard's `rm`/`stop` still run in its own process, suspended
-  (rollout step 4).
+  (rollout step 4). Fixed there: `docs/dashboard-client.md`.
 - The daemon's startup autostart pass (`src/serve/host.rs`) still runs
   in-process, in the daemon, and its runs get no build log. Deferred to a
   later phase (user's call).

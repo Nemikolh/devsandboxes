@@ -27,10 +27,13 @@ you code.
 ## Project specifics (devsandbox)
 
 - `anyhow::Result` + `Context`, 2024 edition.
-- TUI code never inherits stderr: docker calls via `docker::output_quiet` /
-  `output_merged` only; blocking work goes on background threads drained by
-  the event loop (see `spawn_collect` in `src/tui/mod.rs`).
-- `App` (src/tui/app.rs) stays free of terminal I/O so it's testable.
+- TUI code never writes to the terminal (stderr included). The dashboard is
+  a client of `devsandbox serve`: no runtime calls or config loads of its
+  own; blocking work (daemon requests) goes on background threads drained
+  by the event loop (see `src/tui/poll.rs`, or `spawn_verb` in
+  `src/tui/mod.rs`).
+- `App` (`src/tui/app/`) stays free of I/O so it's testable: it queues
+  requests (`take_pending_*`) and gets answers through setters.
 
 ## Before reporting done
 

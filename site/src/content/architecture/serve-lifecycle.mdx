@@ -126,7 +126,7 @@ daemon gets the manager's environment plus what `install` captured (`PATH`, the 
 
 | client | how | starts one | holds it |
 |---|---|---|---|
-| dashboard | `connect` at launch, reconnect with backoff | yes | while open |
+| dashboard | `connect` at launch, reconnect with backoff; plus two poll connections and one per verb request | yes (the poll ones don't) | while open |
 | `run`, `start`, `rebuild` | `ensure_running` after the autostart pass | yes | no, hangs up (a dispatcher / inbox instance holds it) |
 | `run`'s, `start`'s, `rebuild`'s lifecycle commands | `bridges.ensure` with `wait: 12` | yes | for the chain |
 | `exec` | `bridges.ensure` on a thread, no wait | yes | while the command runs |

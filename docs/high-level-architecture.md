@@ -133,8 +133,7 @@ Running `devsandbox` with no subcommand opens a ratatui dashboard:
 
 Config entries are validated in place, and broken sandboxes are flagged.
 
-One deliberate asymmetry: `s` starts or stops an instance on a background thread without leaving the dashboard. Its start is a quiet bare start (just
-`docker start` of the instance and its isolated services). It skips service recreation, DNS rewiring, and `postStartCommand`, because their output would corrupt the alternate screen. For the full path, use `:start <instance>`, which suspends the TUI. See `docs/tui.md`.
+The dashboard (unix only) is a client of the host daemon: it reads the tree, processes, logs and configs through the API and sends every verb as a request, so `s`, `:start`, `stop` and `rm` run in the daemon without leaving the dashboard (`s` on a stopped row is a full `start`). See `docs/dashboard-client.md`, `docs/tui.md`.
 
 ## Automations
 

@@ -1,14 +1,16 @@
 # Client/server: the CLI as a client of `devsandbox serve`
 
-Status: design, rollout steps 1–3 done. Steps 1–2 (instance phase, build
+Status: design, rollout steps 1–4 done. Steps 1–2 (instance phase, build
 log, a TUI that doesn't suspend) in-process: `docs/instance-phase.md`. Step
 3 (verbs as requests) for `run`, `rebuild`, `start`, `stop` and `rm`:
-`docs/verbs-as-requests.md`. The rest is not implemented.
+`docs/verbs-as-requests.md`. Step 4 (the dashboard as a pure client):
+`docs/dashboard-client.md`. The rest is not implemented.
 
 The daemon (`docs/serve.md`) owns the live host side: bridges, forwards,
-the API, and now the five verbs above plus `service rebuild`. Every other
-verb (`service ls`, `rename`, `done`, `gc`, …) still does its work in the
-process you started.
+the API, and now the five verbs above plus `service rebuild`. Other CLI
+verbs (`service ls`, `rename`, `done`, `gc`, …) still do their work in the
+process you started; the dashboard's `rename` and done/undone are API
+methods.
 This doc moves the verbs' work into the daemon, the way `docker` hands
 everything to `dockerd`. The CLI and the TUI become clients, and the client
 can be on another machine.
@@ -169,8 +171,9 @@ the whole output of its last `run`, `rebuild` or `start`, which rotate the
 previous one to `build.1.log`. `rm` (and a cancelled `run`) remove the
 directory. It's what the TUI's `b` opens and what `devsandbox logs --build
 <instance>` prints (`--follow` until the instance is no longer in flight).
-An `instances.build_log` method would serve it to remote clients (not
-built). It's an fd-level tee in the verb's process (`src/build_log.rs`,
+The daemon serves its tail as `instances.buildLog`, which is how the
+dashboard's `b` reads it (following it remotely is `instances.follow`,
+later). It's an fd-level tee in the verb's process (`src/build_log.rs`,
 unix only), opt-in from `main` for those three verbs: the daemon's
 subprocess, or the CLI in-process. It replaced the TUI's suspended run and its
 `logs/<verb>-<unix>.log` error files for those verbs.
@@ -248,17 +251,36 @@ notion:
 
 ## The dashboard as a pure client
 
-The dashboard stops reading `state.toml`, config files and the runtime
-directly (today it runs `snapshot::collect`, see `docs/serve.md`, *Future
-work*). It reads `instances.list` / `sandboxes.list`, follows
-`instances.changed`, and sends every action as a request. Procs and stats
-move behind methods polled at the dashboard's cadence. This is the
-prerequisite for machines: once the dashboard only talks to its daemon, a
-remote instance is just another row.
+Built (`docs/dashboard-client.md`; connections in `docs/api.md`, *The
+dashboard as a client*). The dashboard no longer reads config files or
+asks the runtime. It polls `instances.list` (with a `depth`: listing every
+2 s, stats at most every 7 s) and `instances.procs` for expanded
+instances, and refreshes early on `instances.changed`, which also fires
+when `state.toml` changes. The config view, logs, inspect and build log
+are `sandboxes.get` / `services.get`, `containers.*` and
+`instances.buildLog`; signals, rename and done are `instances.signal`,
+`instances.rename`, `instances.done`. Every verb is a request: `run`,
+`rebuild`, `start` (and `s` on a stopped row) detached, `stop`, `rm` and
+`services.rebuild` held. Instance terminals run `devsandbox exec`. With
+the daemon down it shows the last tree, marked stale, and refuses actions;
+it has no in-process fallback, so off unix there is no dashboard for now.
+
+Still local, for now:
+
+- **The Inbox.** It reads the store file and, while disconnected, writes
+  it through the same ops code the API runs. A remote machine's threads
+  are a federation question (step 5).
+- **VS Code** (`o`, `:code`, a thread's `vscode` action) reads
+  `state.toml` for the container and workspace; remote VS Code is step 7.
+- Its own files: `dashboard.toml` settings and the prompt history.
+
+This is the prerequisite for machines: once the dashboard only talks to
+its daemon, a remote instance is just another row.
 
 ## Exec and terminal
 
-`exec -it` and the TUI's terminal tabs run `docker exec -it` locally. That
+`exec -it` runs `docker exec -it` locally, and so do the TUI's terminal
+tabs: an instance's through `devsandbox exec`, a service's directly. That
 works as long as the runtime is local.
 
 - **Remote, first cut**: the client runs `ssh -t <machine> devsandbox exec
@@ -352,10 +374,10 @@ helper. Needs a spike. Low priority, and nothing above depends on it.
 3. Done (`docs/verbs-as-requests.md`) for `run`, `rebuild`, `start`,
    `stop`, `rm`: streaming, cancel, `-d`, env, prompts on the client.
    `service ls`, `rename`/`done`/`gc` and the rest are still in-process
-   (`service rebuild` became a verb request in step 4), and so are the
-   dashboard's `rm`/`stop` (step 4).
-4. Dashboard as a pure client (`instances.list`, `sandboxes.list`,
-   procs/stats methods).
+   (`service rebuild` became a verb request in step 4).
+4. Done (`docs/dashboard-client.md`): dashboard as a pure client
+   (`instances.list` with `depth`, procs, logs, config and edit methods,
+   `stop`/`rm`/`services.rebuild` as held verb requests).
 5. `machine add|ls|rm`, the ssh transport, federation, `ssh -t` exec.
 6. Remote forwards.
 7. VS Code remote spike.
