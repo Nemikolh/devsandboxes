@@ -25,7 +25,7 @@ use serde_json::{Value, json};
 use super::client::{self, Conn, Streamed};
 use super::endpoint;
 use super::proto::{Notification, Response, Version};
-use super::verbs::{RebuildParams, RmParams, RunParams, ServicesRebuildParams, StartParams, StopParams};
+use super::verbs::{RebuildParams, RmParams, RunParams, ServicesRebuildParams, StartParams, StopParams, TtySize};
 use crate::Command;
 use crate::commands::run::cancel;
 use crate::state::PhaseView;
@@ -128,8 +128,12 @@ pub(crate) fn run(dir: &Path, verb: CliVerb) -> Result<Done> {
         Err(e) => return Ok(in_process(&verb, format!("{e:#}"))),
     };
     let tty = std::io::stdin().is_terminal();
+    // As the in-process tee decides (`build_log`): stderr too, or the pty
+    // would merge the errors into stdout.
+    let term = crate::build_log::terminal_size(1).filter(|_| std::io::stderr().is_terminal());
     let mut ui = Ui {
         tty,
+        term,
         pick: &mut |prompt, options| {
             let refs: Vec<&str> = options.iter().map(String::as_str).collect();
             crate::commands::pick(prompt, &refs)
@@ -188,6 +192,11 @@ pub(crate) fn caller_env(vars: impl IntoIterator<Item = (OsString, OsString)>) -
 struct Ui<'a> {
     /// stdin is a TTY: prompts may ask.
     tty: bool,
+    /// The terminal's size when stdout and stderr are one: the build verbs
+    /// run on a pty that size, so their output streams back as a terminal
+    /// would show it (colour, docker build's progress). Not for `run
+    /// --json`, whose stdout is the record.
+    term: Option<TtySize>,
     /// A numbered pick among `options`; the chosen index.
     pick: &'a mut dyn FnMut(&str, &[String]) -> Result<usize>,
     /// `run` on a config without sandboxes (`offer_example_config`).
@@ -266,7 +275,8 @@ fn prepare(verb: &CliVerb, root: &Path, env: BTreeMap<String, String>, call: &mu
                 None if !ui.tty => bail!("no sandbox specified; available: {}", names.join(", ")),
                 None => names[(ui.pick)("Select a sandbox", &names)?].clone(),
             };
-            let p = RunParams { root, env, sandbox, name, branch, base, json, detach };
+            let tty = if json { None } else { ui.term };
+            let p = RunParams { root, env, sandbox, name, branch, base, json, detach, tty };
             ("run", serde_json::to_value(p)?, None)
         }
         CliVerb::Rebuild { target, force, detach } => {
@@ -275,7 +285,7 @@ fn prepare(verb: &CliVerb, root: &Path, env: BTreeMap<String, String>, call: &mu
                 None => None,
             };
             let all = instance.is_none();
-            let p = RebuildParams { root, env, instance: instance.clone(), all, force, detach };
+            let p = RebuildParams { root, env, instance: instance.clone(), all, force, detach, tty: ui.term };
             ("rebuild", serde_json::to_value(p)?, instance)
         }
         CliVerb::Start { target, detach } => {
@@ -283,7 +293,8 @@ fn prepare(verb: &CliVerb, root: &Path, env: BTreeMap<String, String>, call: &mu
                 Some(name) => Some(resolved!(&name)),
                 None => None,
             };
-            let p = StartParams { root, env, instance: instance.clone(), all: instance.is_none(), detach };
+            let all = instance.is_none();
+            let p = StartParams { root, env, instance: instance.clone(), all, detach, tty: ui.term };
             ("start", serde_json::to_value(p)?, instance)
         }
         CliVerb::Stop { target } => {
@@ -710,6 +721,18 @@ mod tests {
 
     /// A fake daemon for [`prepare`]: canned answers by method, calls logged.
     fn prep(verb: &CliVerb, tty: bool, answers: &[(&str, Response)], pick: usize) -> (Result<Prep>, Vec<String>, bool) {
+        prep_on(verb, tty, Some(TERM), answers, pick)
+    }
+
+    const TERM: TtySize = TtySize { cols: 100, rows: 30 };
+
+    fn prep_on(
+        verb: &CliVerb,
+        tty: bool,
+        term: Option<TtySize>,
+        answers: &[(&str, Response)],
+        pick: usize,
+    ) -> (Result<Prep>, Vec<String>, bool) {
         let calls = RefCell::new(Vec::new());
         let mut call = |method: &str, params: Value| {
             calls.borrow_mut().push(format!("{method} {params}"));
@@ -719,6 +742,7 @@ mod tests {
         let offered = RefCell::new(false);
         let mut ui = Ui {
             tty,
+            term,
             pick: &mut |_, options| {
                 assert!(options.len() > 1);
                 Ok(pick)
@@ -818,6 +842,23 @@ mod tests {
 
         let bad = [("sandboxes.list", err("invalid", "bad config: x", None))];
         assert_eq!(prep(&run(None, false), true, &bad, 0).0.unwrap_err().to_string(), "bad config: x");
+    }
+
+    /// The build verbs carry the terminal's size, but not `run --json`
+    /// (its stdout is the record) and not off a terminal.
+    #[test]
+    fn build_verbs_send_the_terminal_size() {
+        let run = |json| CliVerb::Run { sandbox: Some("web".into()), name: None, branch: None, base: None, json, detach: false };
+        let rebuild = CliVerb::Rebuild { target: None, force: false, detach: false };
+        let start = CliVerb::Start { target: None, detach: true };
+        let list = [("sandboxes.list", ok(json!([{"name": "web"}])))];
+        let size = json!({"cols": 100, "rows": 30});
+        for (verb, tty) in [(run(false), &size), (run(true), &Value::Null), (rebuild.clone(), &size), (start.clone(), &size)] {
+            let p = sent(prep(&verb, true, &list, 0).0);
+            assert_eq!(&p.params["tty"], tty, "{verb:?}");
+            let p = sent(prep_on(&verb, true, None, &list, 0).0);
+            assert_eq!(p.params["tty"], Value::Null, "{verb:?} off a terminal");
+        }
     }
 
     #[test]

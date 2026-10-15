@@ -175,7 +175,10 @@ The daemon serves its tail as `instances.buildLog`, which is how the
 dashboard's `b` reads it (following it remotely is `instances.follow`,
 later). It's an fd-level tee in the verb's process (`src/build_log.rs`,
 unix only), opt-in from `main` for those three verbs: the daemon's
-subprocess, or the CLI in-process. It replaced the TUI's suspended run and its
+subprocess, or the CLI in-process. On a terminal (or for a verb request
+with `tty`) it tees through a pty of its own, so the build keeps its
+colour and TTY progress; the log's header then records the pty size
+(`# tty <cols>x<rows>`) for readers to replay it at. It replaced the TUI's suspended run and its
 `logs/<verb>-<unix>.log` error files for those verbs.
 
 ### In the TUI

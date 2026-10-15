@@ -16,6 +16,16 @@
 //! threads write there too. The dashboard's own `run`/`rebuild`/`start` are
 //! `devsandbox` subprocesses, so they log.
 //!
+//! On a terminal the tee is a pty (docs/instance-phase.md, *Build logs*):
+//! when fds 1 and 2 are both terminals, or when [`TTY_ENV`] gives a size
+//! (the daemon sets it for a verb request's `tty`), fds 1/2 point at a pty's
+//! slave sized like the terminal, so docker build and every other child see a
+//! TTY and keep their colour and progress display. The pty is this process's
+//! own, never the daemon's: a daemon exit (handoff, drain) must not hang it up
+//! under a running verb. Its log says so in the header (`# tty <cols>x<rows>`),
+//! the size a reader replays it at. Otherwise (a pipe, a file) the tee is a
+//! pipe per fd and children see no terminal.
+//!
 //! Unix only: elsewhere [`open`] returns an inert log and nothing is written.
 
 use std::fs::File;
@@ -38,6 +48,76 @@ pub const PREVIOUS: &str = "build.1.log";
 const MAX_PENDING: usize = 64 * 1024;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// `<cols>x<rows>`: the pty size a verb process's build log tees through,
+/// when its own fds 1/2 aren't terminals (a daemon's verb subprocess).
+pub const TTY_ENV: &str = "DEVSANDBOX_TTY";
+
+/// A terminal's size in cells: a build log's pty, and a verb request's
+/// `tty` (docs/api.md), passed to the verb as [`TTY_ENV`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TtySize {
+    pub cols: u16,
+    pub rows: u16,
+}
+
+impl TtySize {
+    /// The largest side taken: well past any real terminal, small enough
+    /// that a reader replaying the log at this size stays cheap.
+    pub const MAX: u16 = 1000;
+
+    /// Both sides in `1..=MAX`.
+    pub fn valid(self) -> bool {
+        (1..=Self::MAX).contains(&self.cols) && (1..=Self::MAX).contains(&self.rows)
+    }
+
+    /// A terminal's reported size made usable: a side it doesn't report
+    /// (0, some serial consoles) as 80x24 has it, a huge one capped.
+    pub fn sane(cols: u16, rows: u16) -> TtySize {
+        let side = |n: u16, default| if n == 0 { default } else { n.min(Self::MAX) };
+        TtySize { cols: side(cols, 80), rows: side(rows, 24) }
+    }
+
+    /// `<cols>x<rows>`, as [`TTY_ENV`] and the header write it; `None` when
+    /// malformed or not [`valid`](Self::valid).
+    pub fn parse(s: &str) -> Option<TtySize> {
+        let (cols, rows) = s.trim().split_once('x')?;
+        let size = TtySize { cols: cols.parse().ok()?, rows: rows.parse().ok()? };
+        size.valid().then_some(size)
+    }
+}
+
+impl std::fmt::Display for TtySize {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}x{}", self.cols, self.rows)
+    }
+}
+
+/// `fd`'s terminal size (`TIOCGWINSZ`, [`TtySize::sane`]); `None` when it
+/// isn't a terminal.
+#[cfg(unix)]
+pub fn terminal_size(fd: i32) -> Option<TtySize> {
+    // SAFETY: an all-zero winsize is valid; TIOCGWINSZ fills it in.
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    // SAFETY: TIOCGWINSZ writes one winsize through the pointer.
+    if unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) } < 0 {
+        return None;
+    }
+    Some(TtySize::sane(ws.ws_col, ws.ws_row))
+}
+
+/// The pty a build log tees through, if any: the terminal's size when
+/// stdout is one and stderr too (a CLI verb in a terminal), else
+/// [`TTY_ENV`]'s. A stdout terminal with stderr redirected keeps the pipes:
+/// merging the two onto one pty would send the errors to stdout.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn pty_size(stdout: Option<TtySize>, stderr_is_terminal: bool, env: Option<&str>) -> Option<TtySize> {
+    match stdout {
+        Some(size) if stderr_is_terminal => Some(size),
+        _ => env.and_then(TtySize::parse),
+    }
+}
 
 /// Let [`open`] tee fds 1/2 for the rest of the process. Only for a CLI
 /// process running one verb (see the module doc).
@@ -138,9 +218,14 @@ fn create(dir: &Path, header: &str) -> std::io::Result<File> {
     Ok(file)
 }
 
-/// `$ devsandbox <args…>` (like the dispatch logs), then when.
-fn header(args: &[String], now: u64) -> String {
-    format!("$ devsandbox {}\n# {}\n", args.join(" "), crate::inbox::rfc3339(now))
+/// `$ devsandbox <args…>` (like the dispatch logs), then when, then the
+/// pty's size when the output went through one (`# tty <cols>x<rows>`).
+fn header(args: &[String], now: u64, tty: Option<TtySize>) -> String {
+    let mut header = format!("$ devsandbox {}\n# {}\n", args.join(" "), crate::inbox::rfc3339(now));
+    if let Some(size) = tty {
+        header.push_str(&format!("# tty {size}\n"));
+    }
+    header
 }
 
 /// An instance's build log while it's open: fds 1/2 are teed into it until
@@ -156,16 +241,35 @@ pub struct BuildLog {
 /// name resolution) isn't in it. One log at a time: a `--all` loop finishes
 /// one instance's before opening the next.
 pub fn open(instance_id: &str) -> BuildLog {
-    let inert = BuildLog {
-        #[cfg(unix)]
-        tee: None,
-        file: None,
-    };
     if !cfg!(unix) || !ENABLED.load(Ordering::SeqCst) {
-        return inert;
+        return BuildLog::inert();
     }
+    match dir(instance_id) {
+        Ok(dir) => open_in(&dir, instance_id),
+        Err(e) => {
+            eprintln!("warning: no build log for `{instance_id}`: {e:#}");
+            BuildLog::inert()
+        }
+    }
+}
+
+/// [`open`] in log dir `dir`.
+fn open_in(dir: &Path, instance_id: &str) -> BuildLog {
+    let inert = BuildLog::inert();
+    #[cfg(unix)]
+    let pty = imp::pty_size().and_then(|size| match imp::Pty::open(size) {
+        Ok(pty) => Some(pty),
+        Err(e) => {
+            eprintln!("warning: build log of `{instance_id}`: no pty ({e}), so no terminal for its commands");
+            None
+        }
+    });
+    #[cfg(unix)]
+    let tty = pty.as_ref().map(|p| p.size);
+    #[cfg(not(unix))]
+    let tty = None;
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let file = match dir(instance_id).and_then(|d| Ok(create(&d, &header(&args, Instance::now()))?)) {
+    let file = match create(dir, &header(&args, Instance::now(), tty)) {
         Ok(file) => Arc::new(Mutex::new(file)),
         Err(e) => {
             eprintln!("warning: no build log for `{instance_id}`: {e:#}");
@@ -174,7 +278,7 @@ pub fn open(instance_id: &str) -> BuildLog {
     };
     #[cfg(unix)]
     {
-        match imp::Tee::start(file.clone()) {
+        match imp::Tee::start(file.clone(), pty) {
             Ok(tee) => BuildLog { tee: Some(tee), file: Some(file) },
             Err(e) => {
                 eprintln!("warning: no build log for `{instance_id}`: cannot tee output: {e}");
@@ -190,6 +294,14 @@ pub fn open(instance_id: &str) -> BuildLog {
 }
 
 impl BuildLog {
+    fn inert() -> BuildLog {
+        BuildLog {
+            #[cfg(unix)]
+            tee: None,
+            file: None,
+        }
+    }
+
     /// Close the log with the command's result: an error goes in as the last
     /// line (to the log only: the caller still reports it), so a log read
     /// later says how it ended, whoever printed the error.
@@ -251,20 +363,18 @@ mod imp {
     use std::sync::{Arc, Mutex};
     use std::thread::JoinHandle;
 
-    /// How often a pipe reader checks whether it was told to stop.
+    use super::TtySize;
+
+    /// How often a reader checks whether it was told to stop.
     const POLL_MS: i32 = 100;
 
-    /// fds 1/2 pointed at pipes, one copier thread each.
+    /// fds 1/2 pointed at pipes (one copier thread each) or at one pty's
+    /// slave (one copier on its master).
     pub(super) struct Tee {
-        streams: Vec<Stream>,
+        /// Each switched fd and what it pointed at before, put back on drop.
+        saved: Vec<(RawFd, OwnedFd)>,
+        threads: Vec<JoinHandle<()>>,
         stop: Arc<AtomicBool>,
-    }
-
-    struct Stream {
-        fd: RawFd,
-        /// What `fd` pointed at before, put back on drop.
-        saved: OwnedFd,
-        thread: Option<JoinHandle<()>>,
     }
 
     fn check(ret: i32) -> std::io::Result<i32> {
@@ -278,16 +388,19 @@ mod imp {
         Ok(unsafe { OwnedFd::from_raw_fd(new) })
     }
 
+    fn set_cloexec(fd: &OwnedFd) -> std::io::Result<()> {
+        // SAFETY: fcntl on an owned, open fd.
+        check(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) }).map(drop)
+    }
+
     fn pipe_cloexec() -> std::io::Result<(OwnedFd, OwnedFd)> {
         let mut fds = [0; 2];
         // SAFETY: `fds` is a valid 2-element array for pipe(2).
         check(unsafe { libc::pipe(fds.as_mut_ptr()) })?;
         // SAFETY: both fds were just created and are owned here.
         let (r, w) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
-        for fd in [&r, &w] {
-            // SAFETY: fcntl on an owned, open fd.
-            check(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) })?;
-        }
+        set_cloexec(&r)?;
+        set_cloexec(&w)?;
         Ok((r, w))
     }
 
@@ -296,92 +409,169 @@ mod imp {
         let _ = std::io::stderr().flush();
     }
 
+    /// The pty to tee through, if any (see [`super::pty_size`]).
+    pub(super) fn pty_size() -> Option<TtySize> {
+        // SAFETY: isatty on a standard fd.
+        let stderr_is_terminal = unsafe { libc::isatty(2) } == 1;
+        let env = std::env::var(super::TTY_ENV).ok();
+        super::pty_size(super::terminal_size(1), stderr_is_terminal, env.as_deref())
+    }
+
+    /// A fresh pty, both ends close-on-exec (the slave reaches children
+    /// only as their fds 1/2). The termios is the default, `ONLCR` included:
+    /// the master's bytes are what a terminal shows (`\r\n`), so they read
+    /// right on the CLI's terminal and replay right in a terminal emulator.
+    pub(super) struct Pty {
+        pub(super) master: OwnedFd,
+        pub(super) slave: OwnedFd,
+        pub(super) size: TtySize,
+    }
+
+    impl Pty {
+        pub(super) fn open(size: TtySize) -> std::io::Result<Pty> {
+            let (mut master, mut slave) = (0, 0);
+            let mut ws = libc::winsize { ws_row: size.rows, ws_col: size.cols, ws_xpixel: 0, ws_ypixel: 0 };
+            // SAFETY: out-pointers to two ints; no name buffer, default
+            // termios, `ws` read for the size.
+            check(unsafe {
+                libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null_mut(), &mut ws)
+            })?;
+            // SAFETY: both fds were just opened and are owned here.
+            let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+            set_cloexec(&master)?;
+            set_cloexec(&slave)?;
+            Ok(Pty { master, slave, size })
+        }
+    }
+
     impl Tee {
-        pub(super) fn start(log: Arc<Mutex<File>>) -> std::io::Result<Tee> {
+        /// Tee fds 1/2 into `log`: through `pty` when given, else pipes.
+        pub(super) fn start(log: Arc<Mutex<File>>, pty: Option<Pty>) -> std::io::Result<Tee> {
             flush_std();
-            let stop = Arc::new(AtomicBool::new(false));
             // Built up one fd at a time: on an error, dropping what's there
             // puts the fds already switched back.
-            let mut tee = Tee { streams: Vec::new(), stop: stop.clone() };
-            for fd in [1, 2] {
-                let saved = dup_cloexec(fd)?;
-                let term = File::from(saved.try_clone()?);
-                let (r, w) = pipe_cloexec()?;
-                // SAFETY: dup2 onto a standard stream; `saved` keeps the
-                // original open. `w` closes below, leaving `fd` the only
-                // write end (EOF once it's restored).
-                check(unsafe { libc::dup2(w.as_raw_fd(), fd) })?;
-                drop(w);
-                let src = StopRead { file: File::from(r), stop: stop.clone() };
-                let log = log.clone();
-                let thread = std::thread::Builder::new()
-                    .name(format!("build-log-{fd}"))
-                    .spawn(move || super::copy(src, term, &log));
-                let thread = match thread {
-                    Ok(t) => Some(t),
-                    Err(e) => {
-                        // SAFETY: as above, back to the original.
-                        unsafe { libc::dup2(saved.as_raw_fd(), fd) };
-                        return Err(e);
+            let mut tee = Tee { saved: Vec::new(), threads: Vec::new(), stop: Arc::new(AtomicBool::new(false)) };
+            match pty {
+                None => {
+                    for fd in [1, 2] {
+                        let term = File::from(dup_cloexec(fd)?);
+                        let (r, w) = pipe_cloexec()?;
+                        // `w` closes below, leaving `fd` the only write end
+                        // (EOF once it's restored).
+                        tee.switch(fd, &w)?;
+                        drop(w);
+                        tee.copier(&format!("build-log-{fd}"), r, term, &log)?;
                     }
-                };
-                tee.streams.push(Stream { fd, saved, thread });
+                }
+                Some(pty) => {
+                    // Both streams to the original stdout, as a terminal
+                    // merges them.
+                    let term = File::from(dup_cloexec(1)?);
+                    for fd in [1, 2] {
+                        tee.switch(fd, &pty.slave)?;
+                    }
+                    // fds 1/2 are the slave's only refs now: restoring them
+                    // hangs it up, which ends the copier's reads.
+                    drop(pty.slave);
+                    tee.copier("build-log-pty", pty.master, term, &log)?;
+                }
             }
             Ok(tee)
+        }
+
+        /// Point `fd` at `to`, saving what it pointed at.
+        fn switch(&mut self, fd: RawFd, to: &OwnedFd) -> std::io::Result<()> {
+            let saved = dup_cloexec(fd)?;
+            // SAFETY: dup2 onto a standard stream; `saved` keeps the
+            // original open.
+            check(unsafe { libc::dup2(to.as_raw_fd(), fd) })?;
+            self.saved.push((fd, saved));
+            Ok(())
+        }
+
+        fn copier(&mut self, name: &str, src: OwnedFd, term: File, log: &Arc<Mutex<File>>) -> std::io::Result<()> {
+            let src = StopRead { file: File::from(src), stop: self.stop.clone() };
+            let log = log.clone();
+            let thread = std::thread::Builder::new().name(name.into()).spawn(move || super::copy(src, term, &log))?;
+            self.threads.push(thread);
+            Ok(())
         }
     }
 
     impl Drop for Tee {
-        /// fds back first (closing the pipes' last write ends, so the copiers
-        /// drain to EOF and flush), then join. A child that outlives the
-        /// command holding a write end (nothing should; the daemon gets its
-        /// own stdio) would block EOF forever: the stop flag ends the wait
-        /// once the pipe stays empty for a poll interval.
+        /// fds back first (closing the pipes' last write ends, or the pty
+        /// slave's last refs, so the copiers drain to EOF and flush), then
+        /// join. A child that outlives the command holding a write end or
+        /// the slave (nothing should; the daemon gets its own stdio) would
+        /// block EOF forever: the stop flag ends the wait once the source
+        /// stays empty for a poll interval.
         fn drop(&mut self) {
             flush_std();
-            for s in &self.streams {
-                // SAFETY: `saved` is an open fd owned by `s`.
-                unsafe { libc::dup2(s.saved.as_raw_fd(), s.fd) };
+            for (fd, saved) in &self.saved {
+                // SAFETY: `saved` is an open fd owned here.
+                unsafe { libc::dup2(saved.as_raw_fd(), *fd) };
             }
             self.stop.store(true, Ordering::SeqCst);
-            for s in &mut self.streams {
-                if let Some(t) = s.thread.take() {
-                    let _ = t.join();
-                }
+            for t in self.threads.drain(..) {
+                let _ = t.join();
             }
         }
     }
 
-    /// A pipe's read end that reports EOF once `stop` is set and nothing is
-    /// left to read. EINTR (a Ctrl-C caught by the cancel guard) is retried:
-    /// the rollback's output must still come through.
-    struct StopRead {
-        file: File,
-        stop: Arc<AtomicBool>,
+    /// A pipe's read end, or a pty's master, that reports EOF once `stop` is
+    /// set and nothing is left to read. EINTR (a Ctrl-C caught by the cancel
+    /// guard) is retried: the rollback's output must still come through. A
+    /// master whose slave is closed everywhere reads `EIO` on Linux (not 0):
+    /// that's its EOF.
+    pub(super) struct StopRead {
+        pub(super) file: File,
+        pub(super) stop: Arc<AtomicBool>,
     }
 
     impl Read for StopRead {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
             loop {
-                let mut p = libc::pollfd { fd: self.file.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-                // SAFETY: one valid pollfd.
-                let ready = unsafe { libc::poll(&mut p, 1, POLL_MS) };
-                if ready < 0 {
-                    let e = std::io::Error::last_os_error();
-                    if e.kind() == std::io::ErrorKind::Interrupted {
-                        continue;
-                    }
-                    return Err(e);
+                match readable(self.file.as_raw_fd(), POLL_MS) {
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e),
+                    Ok(false) if self.stop.load(Ordering::SeqCst) => return Ok(0),
+                    Ok(false) => continue,
+                    // Readable, or hung up (read returns what's left, then
+                    // 0 or EIO).
+                    Ok(true) => {}
                 }
-                if ready == 0 {
-                    if self.stop.load(Ordering::SeqCst) {
-                        return Ok(0);
-                    }
-                    continue;
-                }
-                // Readable, or hung up (read returns what's left, then 0).
-                return self.file.read(buf);
+                return match self.file.read(buf) {
+                    Err(e) if e.raw_os_error() == Some(libc::EIO) => Ok(0),
+                    r => r,
+                };
             }
+        }
+    }
+
+    /// Wait up to `ms` for `fd` to be readable (or hung up).
+    #[cfg(not(target_os = "macos"))]
+    fn readable(fd: RawFd, ms: i32) -> std::io::Result<bool> {
+        let mut p = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+        // SAFETY: one valid pollfd.
+        Ok(check(unsafe { libc::poll(&mut p, 1, ms) })? > 0)
+    }
+
+    /// macOS's poll(2) doesn't support devices, a pty master included:
+    /// select(2) does.
+    #[cfg(target_os = "macos")]
+    fn readable(fd: RawFd, ms: i32) -> std::io::Result<bool> {
+        if fd as usize >= libc::FD_SETSIZE as usize {
+            return Ok(true); // can't wait on it: a plain blocking read
+        }
+        // SAFETY: a zeroed fd_set is empty; FD_SET with an fd below
+        // FD_SETSIZE; select over that one set.
+        unsafe {
+            let mut set: libc::fd_set = std::mem::zeroed();
+            libc::FD_ZERO(&mut set);
+            libc::FD_SET(fd, &mut set);
+            let mut tv = libc::timeval { tv_sec: 0, tv_usec: (ms * 1000) as _ };
+            let n = libc::select(fd + 1, &mut set, std::ptr::null_mut(), std::ptr::null_mut(), &mut tv);
+            Ok(check(n)? > 0)
         }
     }
 }
@@ -438,7 +628,108 @@ mod tests {
     #[test]
     fn header_names_the_command_and_time() {
         let args = ["rebuild".to_string(), "--all".to_string()];
-        assert_eq!(header(&args, 0), "$ devsandbox rebuild --all\n# 1970-01-01T00:00:00Z\n");
+        assert_eq!(header(&args, 0, None), "$ devsandbox rebuild --all\n# 1970-01-01T00:00:00Z\n");
+        let tty = Some(TtySize { cols: 120, rows: 40 });
+        assert_eq!(header(&args, 0, tty), "$ devsandbox rebuild --all\n# 1970-01-01T00:00:00Z\n# tty 120x40\n");
+    }
+
+    #[test]
+    fn tty_sizes_parse_and_print_as_colsxrows() {
+        let size = TtySize { cols: 100, rows: 30 };
+        assert_eq!(TtySize::parse("100x30"), Some(size));
+        assert_eq!(size.to_string(), "100x30");
+        for bad in ["", "100", "x30", "100x", "0x30", "100x0", "1001x30", "-1x30", "100X30", "axb"] {
+            assert_eq!(TtySize::parse(bad), None, "{bad}");
+        }
+        assert_eq!(TtySize::sane(0, 0), TtySize { cols: 80, rows: 24 });
+        assert_eq!(TtySize::sane(5000, 50), TtySize { cols: TtySize::MAX, rows: 50 });
+    }
+
+    #[test]
+    fn a_pty_needs_both_terminals_or_the_env() {
+        let term = Some(TtySize { cols: 200, rows: 50 });
+        let env = Some("100x30");
+        assert_eq!(pty_size(term, true, env), term, "the terminal's own size first");
+        assert_eq!(pty_size(term, false, None), None, "stderr redirected: pipes");
+        assert_eq!(pty_size(term, false, env), TtySize::parse("100x30"));
+        assert_eq!(pty_size(None, true, env), TtySize::parse("100x30"));
+        assert_eq!(pty_size(None, false, Some("junk")), None);
+        assert_eq!(pty_size(None, false, None), None);
+    }
+
+    /// A child on the pty's slave sees a terminal of the pty's size; the
+    /// master reads its output (ONLCR's `\r\n`) up to the hang-up (Linux's
+    /// `EIO`) as EOF, without the stop flag.
+    #[cfg(unix)]
+    #[test]
+    fn a_pty_child_sees_a_terminal_and_the_master_reads_to_eof() {
+        use std::process::{Command, Stdio};
+        let pty = imp::Pty::open(TtySize { cols: 100, rows: 30 }).unwrap();
+        let script = "test -t 1 && echo tty; test -t 2 && echo err-tty >&2; stty size <&1";
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(pty.slave.try_clone().unwrap()))
+            .stderr(Stdio::from(pty.slave.try_clone().unwrap()))
+            .spawn()
+            .unwrap();
+        drop(pty.slave);
+        let stop = Arc::new(AtomicBool::new(false));
+        let src = imp::StopRead { file: File::from(pty.master), stop };
+        let mut term = Vec::new();
+        let log = Mutex::new(Vec::new());
+        copy(src, &mut term, &log);
+        assert!(child.wait().unwrap().success());
+        assert_eq!(String::from_utf8_lossy(&term), "tty\r\nerr-tty\r\n30 100\r\n");
+        assert_eq!(log.into_inner().unwrap(), term);
+    }
+
+    const CHILD_ENV: &str = "DEVSANDBOX_TEST_BUILD_LOG_DIR";
+
+    /// The whole tee on this process's real fds 1/2, so only in a process
+    /// of its own: [`the_tee_runs_commands_on_a_pty_from_the_env`] runs this
+    /// test binary for it. A no-op otherwise.
+    #[cfg(unix)]
+    #[test]
+    fn pty_tee_child() {
+        let Some(dir) = std::env::var_os(CHILD_ENV) else { return };
+        let log = open_in(Path::new(&dir), "t");
+        let script = "test -t 1 && echo out-tty; test -t 2 && echo err-tty >&2; stty size <&1";
+        let status = std::process::Command::new("/bin/sh").args(["-c", script]).status();
+        log.outcome(Ok(())).unwrap();
+        assert!(status.unwrap().success());
+        // fds back: straight to the file, no ONLCR.
+        println!("after");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_tee_runs_commands_on_a_pty_from_the_env() {
+        let dir = temp_dir("pty-tee");
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = File::create(dir.join("stdout")).unwrap();
+        let err = File::create(dir.join("stderr")).unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["build_log::tests::pty_tee_child", "--exact", "--nocapture", "--test-threads=1"])
+            .env(CHILD_ENV, dir.join("logs"))
+            .env(TTY_ENV, "100x30")
+            .stdin(std::process::Stdio::null())
+            .stdout(out)
+            .stderr(err)
+            .status()
+            .unwrap();
+        let read = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap();
+        let (stdout, stderr) = (read("stdout"), read("stderr"));
+        assert!(status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+        // Both streams through the pty onto the original stdout.
+        let teed = "out-tty\r\nerr-tty\r\n30 100\r\n";
+        assert!(stdout.contains(&format!("{teed}after\n")), "{stdout:?}");
+        assert!(!stderr.contains("err-tty"), "{stderr:?}");
+        let log = read("logs/build.log");
+        let (head, body) = log.split_once("# tty 100x30\n").unwrap_or_else(|| panic!("{log:?}"));
+        assert!(head.starts_with("$ devsandbox ") && head.lines().count() == 2, "{log:?}");
+        assert_eq!(body, teed);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Hands out its input in fixed-size pieces, like a pipe would.

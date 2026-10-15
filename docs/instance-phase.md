@@ -195,6 +195,17 @@ log whole lines. The command's error is appended as a last `error:` line.
 A rolled-back `run` removes the log dir with the record, like `rm`. What
 `main` prints after the command (the instance name, autostart) isn't logged.
 
+Since `docs/before-machines.md` step 4 the tee is a pty when fds 1 and 2
+are both terminals (their size) or `DEVSANDBOX_TTY=<cols>x<rows>` is set
+(the daemon sets it from a verb request's `tty`): the slave goes on fds 1
+and 2, one copier reads the master into the original fd 1 and the log, so
+children see a TTY (docker build's progress, colour). The termios is the
+default (`ONLCR` on), so the log holds `\r\n` line ends and terminal
+escapes, exactly what a terminal got; its header says so with a third line,
+`# tty <cols>x<rows>`, the size to replay it at. Restoring fds 1/2 hangs up
+the slave and the copier reads to `EIO`/EOF (the stop flag still bounds a
+grandchild holding it). Pipes otherwise, as before.
+
 ## Step 5: phase in `ps` and the snapshot
 
 - `src/snapshot.rs` `InstanceRow` (`:53`): add `phase: Option<PhaseRow>`

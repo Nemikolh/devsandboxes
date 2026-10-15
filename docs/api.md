@@ -535,9 +535,9 @@ and `HOME` are the caller's, never the daemon's.
 
 | method | params (besides `root`, `env`) |
 |---|---|
-| `run` | `sandbox`, `name?`, `branch?`, `base?`, `json?`, `detach?` |
-| `rebuild` | `instance` \| `all: true`, `force?`, `detach?` |
-| `start` | `instance` \| `all: true`, `detach?` |
+| `run` | `sandbox`, `name?`, `branch?`, `base?`, `json?`, `detach?`, `tty?` |
+| `rebuild` | `instance` \| `all: true`, `force?`, `detach?`, `tty?` |
+| `start` | `instance` \| `all: true`, `detach?`, `tty?` |
 | `stop` | `instance` \| `all: true`, `detach?` |
 | `rm` | `instance`, `deleteBranch?` (`true` deletes, `false` keeps, absent: merged or gone branches go, local work stays), `force?`, `ask?`, `detach?` |
 | `services.rebuild` | `name` (a service of the config root), `detach?` |
@@ -585,6 +585,20 @@ exit. For them `"detach": true` only means a hang-up before the answer
 leaves the verb running instead of cancelling it. The dashboard sends it
 on every verb, so quitting it never interrupts a `stop` or `rm`; the CLI
 never does (Ctrl-C cancels).
+
+**`tty`** (`run`, `rebuild`, `start`): `{"cols": n, "rows": n}`, each
+side 1 to 1000 (else `invalid`), runs the verb's commands on a pty of that
+size, as on a terminal: coloured output, docker build's TTY progress. The
+pty is the verb process's own (its build log's tee, `src/build_log.rs`),
+passed to it as `DEVSANDBOX_TTY=<cols>x<rows>` (an `env` entry of that
+name is dropped either way), so a daemon exit doesn't hang it up. Both
+streams then come as `stdout`, as a terminal shows them (`\r\n` line ends,
+escapes); `stderr` carries only what the verb writes outside its build log
+(before the log opens, after it closes: `main`'s `Error:`). The
+build log records the size (`# tty <cols>x<rows>`). The dashboard sends
+its terminal's width (rows capped at 40); the CLI its terminal's size when
+stdout and stderr are one, never for `run --json`. Absent: pipes, plain
+output.
 
 **Hang-up = cancel**: a client that hangs up before the answer gets its
 verb SIGINTed, process group included; `run` and `rebuild` then roll back

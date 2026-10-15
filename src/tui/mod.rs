@@ -365,7 +365,7 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
                 | PromptAction::Rm { .. }
                 | PromptAction::ServiceRebuild { .. }) => {
                     app.status = Some(verb_pending(&action));
-                    verbs.push((action.clone(), spawn_verb(&dir, action)));
+                    verbs.push((action.clone(), spawn_verb(&dir, action, verb_tty(size.width, size.height))));
                     last_tick = Instant::now();
                     followup.schedule(last_tick);
                     refresh(&poller, &mut pending, &mut stats_clock);
@@ -734,10 +734,23 @@ fn verb_held(action: &PromptAction) -> bool {
     matches!(action, PromptAction::Stop { .. } | PromptAction::Rm { .. } | PromptAction::ServiceRebuild { .. })
 }
 
+/// Most rows a dashboard verb's pty gets: the build log modal shows a
+/// window of the log, not the whole screen's worth a tall terminal would let
+/// buildkit redraw.
+const VERB_TTY_ROWS: u16 = 40;
+
+/// The pty size of the dashboard's build verbs: the terminal's width, its
+/// height up to [`VERB_TTY_ROWS`].
+fn verb_tty(width: u16, height: u16) -> crate::serve::verbs::TtySize {
+    crate::serve::verbs::TtySize::sane(width, height.min(VERB_TTY_ROWS))
+}
+
 /// The verb request (method, params) for a dashboard verb action in config
 /// root `root` (absolute) with the dashboard's `env`; `None` for the other
 /// actions. `run`/`rebuild`/`start` always `detach`: the dashboard only
-/// waits for the instance to be registered, its row shows the rest.
+/// waits for the instance to be registered, its row shows the rest. They
+/// run on a pty of size `tty` (colour and docker build's progress in their
+/// build log).
 /// `stop`/`rm`/`services.rebuild` are held (answered when done) and
 /// `detach` too, which for them only means a hang-up (a dashboard quit)
 /// doesn't cancel them. An unanswered `rm` asks (its branch question comes back as `confirm`); an
@@ -747,20 +760,24 @@ fn verb_call(
     action: &PromptAction,
     root: &Path,
     env: BTreeMap<String, String>,
+    tty: crate::serve::verbs::TtySize,
 ) -> Option<(&'static str, serde_json::Value)> {
     use crate::serve::verbs::{RebuildParams, RmParams, RunParams, ServicesRebuildParams, StartParams, StopParams};
     let root = root.to_path_buf();
+    let tty = Some(tty);
     let (method, params) = match action.clone() {
-        PromptAction::Run { sandbox, name, branch, base } => {
-            ("run", serde_json::to_value(RunParams { root, env, sandbox, name, branch, base, json: false, detach: true }))
-        }
+        PromptAction::Run { sandbox, name, branch, base } => (
+            "run",
+            serde_json::to_value(RunParams { root, env, sandbox, name, branch, base, json: false, detach: true, tty }),
+        ),
         PromptAction::Rebuild { instance, force } => (
             "rebuild",
-            serde_json::to_value(RebuildParams { root, env, instance: Some(instance), all: false, force, detach: true }),
+            serde_json::to_value(RebuildParams { root, env, instance: Some(instance), all: false, force, detach: true, tty }),
         ),
-        PromptAction::Start { instance } => {
-            ("start", serde_json::to_value(StartParams { root, env, instance: Some(instance), all: false, detach: true }))
-        }
+        PromptAction::Start { instance } => (
+            "start",
+            serde_json::to_value(StartParams { root, env, instance: Some(instance), all: false, detach: true, tty }),
+        ),
         PromptAction::Stop { instance } => {
             ("stop", serde_json::to_value(StopParams { root, env, instance: Some(instance), all: false, detach: true }))
         }
@@ -862,13 +879,13 @@ fn verb_status(action: &PromptAction, sent: Result<crate::serve::client::Streame
 /// (`stop`, `rm`, `services.rebuild`) answers when done. Quitting the
 /// dashboard before the answer hangs up, which cancels nothing: every
 /// dashboard verb is sent with `detach`, so the daemon leaves it running.
-fn spawn_verb(dir: &Path, action: PromptAction) -> Receiver<VerbEnd> {
+fn spawn_verb(dir: &Path, action: PromptAction, tty: crate::serve::verbs::TtySize) -> Receiver<VerbEnd> {
     let (tx, rx) = mpsc::channel();
     let root = daemon::root_dir(dir.to_path_buf());
     std::thread::spawn(move || {
         use crate::serve::{client, endpoint, verbs_client};
         let env = verbs_client::caller_env(std::env::vars_os());
-        let sent = verb_call(&action, &root, env).context("not a verb").and_then(|(method, params)| {
+        let sent = verb_call(&action, &root, env, tty).context("not a verb").and_then(|(method, params)| {
             let mut conn = endpoint::socket_dir().and_then(|socket| client::connect(&socket, "tui"))?;
             conn.call_streaming(method, params, Duration::from_secs(1), &mut |_| true)
         });
@@ -935,11 +952,16 @@ mod tests {
         use crate::serve::verbs::{self, Target, Verb};
         let root = std::env::temp_dir().canonicalize().unwrap();
         let env: BTreeMap<String, String> = [("HOME".to_string(), "/home/me".to_string())].into();
+        let tty = verb_tty(100, 300);
+        assert_eq!(tty, verbs::TtySize { cols: 100, rows: VERB_TTY_ROWS }, "rows capped");
         let parse = |action: &PromptAction, detach: bool| {
-            let (method, params) = verb_call(action, &root, env.clone()).unwrap();
+            let (method, params) = verb_call(action, &root, env.clone(), tty).unwrap();
             let req = verbs::parse(method, params).unwrap();
             assert_eq!(req.detach, detach, "{action:?}");
             assert_eq!((req.root.as_path(), &req.env), (root.as_path(), &env));
+            // A pty for the build verbs only (the held ones log nothing).
+            let builds = matches!(action, PromptAction::Run { .. } | PromptAction::Rebuild { .. } | PromptAction::Start { .. });
+            assert_eq!(req.tty, builds.then_some(tty), "{action:?}");
             req.verb
         };
         assert_eq!(
@@ -974,7 +996,7 @@ mod tests {
             Verb::Rm { instance: "web-2".into(), delete_branch: Some(true), force: false, ask: false }
         );
         assert_eq!(parse(&PromptAction::ServiceRebuild { name: "cache".into() }, true), Verb::ServicesRebuild { name: "cache".into() });
-        assert_eq!(verb_call(&PromptAction::Exec { instance: "web-2".into(), argv: Vec::new() }, &root, env), None);
+        assert_eq!(verb_call(&PromptAction::Exec { instance: "web-2".into(), argv: Vec::new() }, &root, env, tty), None);
     }
 
     #[test]

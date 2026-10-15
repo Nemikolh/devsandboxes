@@ -766,6 +766,12 @@ export interface VerbParams {
   env: Record<string, string>;
 }
 
+/** A terminal's size in cells. */
+export interface TtySize {
+  cols: number;
+  rows: number;
+}
+
 /** `run` params: the CLI's flags. */
 export interface RunParams extends VerbParams {
   sandbox: string;
@@ -776,6 +782,13 @@ export interface RunParams extends VerbParams {
   json?: boolean;
   /** Answer once the instance is registered. */
   detach?: boolean;
+  /**
+   * Run the verb's commands on a pty of this size (each side 1 to 1000), so
+   * output is coloured and `docker build` shows its TTY progress, as on a
+   * terminal; `stdout` then carries both streams, with `\r\n` line ends and
+   * terminal escapes. The build log records the size. Absent: pipes, plain output.
+   */
+  tty?: TtySize | null;
 }
 
 /** `rebuild` params: `instance` or `all: true`. */
@@ -784,6 +797,8 @@ export interface RebuildParams extends VerbParams {
   all?: boolean;
   force?: boolean;
   detach?: boolean;
+  /** As {@link RunParams.tty}. */
+  tty?: TtySize | null;
 }
 
 /** `start` params: `instance` or `all: true`. */
@@ -791,6 +806,8 @@ export interface StartParams extends VerbParams {
   instance?: string | null;
   all?: boolean;
   detach?: boolean;
+  /** As {@link RunParams.tty}. */
+  tty?: TtySize | null;
 }
 
 /** `stop` params: `instance` or `all: true`. */

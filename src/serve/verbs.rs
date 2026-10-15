@@ -57,6 +57,8 @@ pub fn is_verb(method: &str) -> bool {
 
 // ---- params ---------------------------------------------------------------
 
+pub use crate::build_log::TtySize;
+
 /// `run` params. `env` is required on every verb: never the daemon's own.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -74,6 +76,11 @@ pub struct RunParams {
     pub json: bool,
     #[serde(default)]
     pub detach: bool,
+    /// Run its commands on a pty of this size (the build log's tee, as
+    /// [`crate::build_log::TTY_ENV`]): coloured output and docker build's
+    /// TTY progress, as on the caller's terminal. Absent: pipes.
+    #[serde(default)]
+    pub tty: Option<TtySize>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -89,6 +96,9 @@ pub struct RebuildParams {
     pub force: bool,
     #[serde(default)]
     pub detach: bool,
+    /// As [`RunParams::tty`].
+    #[serde(default)]
+    pub tty: Option<TtySize>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -102,6 +112,9 @@ pub struct StartParams {
     pub all: bool,
     #[serde(default)]
     pub detach: bool,
+    /// As [`RunParams::tty`].
+    #[serde(default)]
+    pub tty: Option<TtySize>,
 }
 
 /// `stop` params. `detach`, as on `rm` and `services.rebuild` (held verbs),
@@ -218,41 +231,49 @@ pub struct VerbRequest {
     pub env: BTreeMap<String, String>,
     pub verb: Verb,
     pub detach: bool,
+    /// The pty size its build log tees through (`run`/`rebuild`/`start`).
+    pub tty: Option<TtySize>,
 }
 
 /// Params of verb `method` into a [`VerbRequest`]: `invalid` for bad params
 /// (a relative `root`, a missing `env`, `instance` and `all` both or
-/// neither), `not-found` for a `root` that isn't a directory.
+/// neither, a `tty` side 0 or over [`TtySize::MAX`]), `not-found` for a
+/// `root` that isn't a directory.
 pub fn parse(method: &str, params: Value) -> Result<VerbRequest, ApiError> {
-    let (root, env, verb, detach) = match method {
+    let (root, env, verb, detach, tty) = match method {
         "run" => {
             let p: RunParams = api::parse(params)?;
             let verb = Verb::Run { sandbox: p.sandbox, name: p.name, branch: p.branch, base: p.base, json: p.json };
-            (p.root, p.env, verb, p.detach)
+            (p.root, p.env, verb, p.detach, p.tty)
         }
         "rebuild" => {
             let p: RebuildParams = api::parse(params)?;
-            (p.root, p.env, Verb::Rebuild { target: target(p.instance, p.all)?, force: p.force }, p.detach)
+            (p.root, p.env, Verb::Rebuild { target: target(p.instance, p.all)?, force: p.force }, p.detach, p.tty)
         }
         "start" => {
             let p: StartParams = api::parse(params)?;
-            (p.root, p.env, Verb::Start { target: target(p.instance, p.all)? }, p.detach)
+            (p.root, p.env, Verb::Start { target: target(p.instance, p.all)? }, p.detach, p.tty)
         }
         "stop" => {
             let p: StopParams = api::parse(params)?;
-            (p.root, p.env, Verb::Stop { target: target(p.instance, p.all)? }, p.detach)
+            (p.root, p.env, Verb::Stop { target: target(p.instance, p.all)? }, p.detach, None)
         }
         "rm" => {
             let p: RmParams = api::parse(params)?;
             let verb = Verb::Rm { instance: p.instance, delete_branch: p.delete_branch, force: p.force, ask: p.ask };
-            (p.root, p.env, verb, p.detach)
+            (p.root, p.env, verb, p.detach, None)
         }
         "services.rebuild" => {
             let p: ServicesRebuildParams = api::parse(params)?;
-            (p.root, p.env, Verb::ServicesRebuild { name: p.name }, p.detach)
+            (p.root, p.env, Verb::ServicesRebuild { name: p.name }, p.detach, None)
         }
         other => return Err(ApiError::unknown_method(other)),
     };
+    if let Some(size) = tty
+        && !size.valid()
+    {
+        return Err(ApiError::invalid(format!("`tty` sides must be 1 to {}, got {size}", TtySize::MAX)));
+    }
     if !root.is_absolute() {
         return Err(ApiError::invalid(format!("`root` must be absolute, got `{}`", root.display())));
     }
@@ -264,7 +285,7 @@ pub fn parse(method: &str, params: Value) -> Result<VerbRequest, ApiError> {
             return Err(ApiError::invalid(format!("bad `env` entry `{key}`")));
         }
     }
-    Ok(VerbRequest { root, env, verb, detach })
+    Ok(VerbRequest { root, env, verb, detach, tty })
 }
 
 fn target(instance: Option<String>, all: bool) -> Result<Target, ApiError> {
@@ -713,6 +734,11 @@ impl Running {
             .env_clear()
             .envs(&req.env)
             .env("GIT_TERMINAL_PROMPT", "0");
+        // The request's size, never one the caller's env happened to carry.
+        match req.tty {
+            Some(size) => cmd.env(crate::build_log::TTY_ENV, size.to_string()),
+            None => cmd.env_remove(crate::build_log::TTY_ENV),
+        };
         // Own process group: a cancel's SIGINT reaches docker and git under
         // it, and nothing aimed at the daemon's group reaches it.
         std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
@@ -988,7 +1014,7 @@ pub(crate) mod tests {
     }
 
     fn req(verb: Verb, detach: bool) -> VerbRequest {
-        VerbRequest { root: "/cfg".into(), env: env(), verb, detach }
+        VerbRequest { root: "/cfg".into(), env: env(), verb, detach, tty: None }
     }
 
     fn one(name: &str) -> Target {
@@ -1120,6 +1146,21 @@ pub(crate) mod tests {
         assert!(p.detach && matches!(p.verb, Verb::Rm { ask: true, .. }));
         assert_eq!(code("services.rebuild", json!({"root": r, "env": {}})), Err("invalid"));
         assert_eq!(code("services.rebuild", json!({"root": r, "name": "db"})), Err("invalid"));
+        // `tty`: the build verbs', checked.
+        let size = TtySize { cols: 100, rows: 30 };
+        let tty = |method: &str, extra: Value| {
+            let mut params = json!({"root": r, "env": {}, "instance": "w", "sandbox": "web"});
+            params.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            parse(method, params).map(|p| p.tty).map_err(|e| e.code)
+        };
+        for method in ["run", "rebuild", "start"] {
+            assert_eq!(tty(method, json!({"tty": {"cols": 100, "rows": 30}})), Ok(Some(size)), "{method}");
+            assert_eq!(tty(method, json!({})), Ok(None), "{method}");
+            assert_eq!(tty(method, json!({"tty": null})), Ok(None), "{method}");
+            for bad in [json!({"cols": 0, "rows": 30}), json!({"cols": 100, "rows": 1001}), json!({"cols": 100}), json!("100x30")] {
+                assert_eq!(tty(method, json!({ "tty": bad })), Err("invalid"), "{method} {bad}");
+            }
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1311,6 +1352,26 @@ pub(crate) mod tests {
         assert_eq!(table.len(), 0);
         // Spool files are gone once the exit is reported.
         assert_eq!(std::fs::read_dir(&runner.spool).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The request's `tty` reaches the verb as `DEVSANDBOX_TTY`, and only
+    /// the request's: none, and the caller's env can't slip one in.
+    #[test]
+    fn a_tty_request_runs_its_verb_with_the_size_in_the_env() {
+        let (runner, dir) = script_runner("tty", r#"echo "tty=${DEVSANDBOX_TTY-unset}""#);
+        let table = Arc::new(InFlight::default());
+        let rebuild = Verb::Rebuild { target: one("web"), force: false };
+        let mut sized = req(rebuild.clone(), false);
+        sized.tty = Some(TtySize { cols: 100, rows: 30 });
+        let mut plain = req(rebuild, false);
+        plain.env.insert(crate::build_log::TTY_ENV.into(), "9x9".into());
+        for (request, seen) in [(sized, "tty=100x30\n"), (plain, "tty=unset\n")] {
+            let peer = FakePeer::default();
+            let out = serve(&request, None, &runner, &table, &peer, "test", |_| {});
+            assert_eq!(out.answer().unwrap()["exit"], 0);
+            assert_eq!(peer.output("stdout"), seen);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1521,10 +1582,18 @@ pub(crate) mod tests {
             base: None,
             json: true,
             detach: true,
+            tty: Some(TtySize { cols: 100, rows: 30 }),
         };
-        let rebuild =
-            RebuildParams { root: root.clone(), env: e.clone(), instance: None, all: true, force: false, detach: false };
-        let start = StartParams { root: root.clone(), env: e.clone(), instance: None, all: true, detach: false };
+        let rebuild = RebuildParams {
+            root: root.clone(),
+            env: e.clone(),
+            instance: None,
+            all: true,
+            force: false,
+            detach: false,
+            tty: None,
+        };
+        let start = StartParams { root: root.clone(), env: e.clone(), instance: None, all: true, detach: false, tty: None };
         let stop = StopParams { root: root.clone(), env: e.clone(), instance: None, all: true, detach: true };
         let rm = RmParams {
             root: root.clone(),
@@ -1543,6 +1612,7 @@ pub(crate) mod tests {
             ("StopParams", v(&stop)),
             ("RmParams", v(&rm)),
             ("ServicesRebuildParams", v(&services_rebuild)),
+            ("TtySize", v(&TtySize { cols: 100, rows: 30 })),
             ("VerbResult", done_result(Some("w"))),
             ("VerbDetached", detached_result(Some("w"), Some(json!({})))),
             ("VerbFailedData", failed_data(1, None)),
@@ -1552,6 +1622,9 @@ pub(crate) mod tests {
             assert_matches(iface, &value);
         }
         assert_eq!(prop_type("VerbDetached", "record").as_deref(), Some("RunRecord"));
+        for iface in ["RunParams", "RebuildParams", "StartParams"] {
+            assert_eq!(prop_type(iface, "tty").as_deref(), Some("TtySize | null"), "{iface}");
+        }
         assert!(prop_type("ApiMethods", "services.rebuild").is_some_and(|t| t.contains("result: VerbResult ")));
         for method in ["run", "rebuild", "start", "stop", "rm"] {
             assert!(prop_type("ApiMethods", method).is_some(), "ApiMethods lacks `{method}`");
