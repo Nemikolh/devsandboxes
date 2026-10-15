@@ -629,10 +629,12 @@ fn verb_held(action: &PromptAction) -> bool {
 /// buildkit redraw.
 const VERB_TTY_ROWS: u16 = 40;
 
-/// The pty size of the dashboard's build verbs: the terminal's width, its
+/// The pty size of the dashboard's build verbs: the build log modal's inside
+/// (the terminal less its border, so a full-width line isn't clipped), its
 /// height up to [`VERB_TTY_ROWS`].
 fn verb_tty(width: u16, height: u16) -> crate::serve::verbs::TtySize {
-    crate::serve::verbs::TtySize::sane(width, height.min(VERB_TTY_ROWS))
+    let inner = ratatui::widgets::Block::bordered().inner(Rect::new(0, 0, width, height));
+    crate::serve::verbs::TtySize::sane(inner.width, inner.height.min(VERB_TTY_ROWS))
 }
 
 /// The verb request (method, params) for a dashboard verb action in config
@@ -832,7 +834,8 @@ mod tests {
         let root = std::env::temp_dir().canonicalize().unwrap();
         let env: BTreeMap<String, String> = [("HOME".to_string(), "/home/me".to_string())].into();
         let tty = verb_tty(100, 300);
-        assert_eq!(tty, verbs::TtySize { cols: 100, rows: VERB_TTY_ROWS }, "rows capped");
+        assert_eq!(tty, verbs::TtySize { cols: 98, rows: VERB_TTY_ROWS }, "inside the border, rows capped");
+        assert_eq!(verb_tty(160, 30), verbs::TtySize { cols: 158, rows: 28 }, "the modal's inside");
         let parse = |action: &PromptAction, detach: bool| {
             let (method, params) = verb_call(action, &root, env.clone(), tty).unwrap();
             let req = verbs::parse(method, params).unwrap();
