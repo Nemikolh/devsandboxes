@@ -2142,7 +2142,7 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
         }
         Modal::Logs(_) => "↑↓ scroll · pgup/pgdn · g/G · esc close".to_string(),
         Modal::BuildLog(_) => "↑↓ scroll · pgup/pgdn · g/G (G follows) · esc close".to_string(),
-        Modal::Confirm(_) => "y/enter yes · n/esc no".to_string(),
+        Modal::Confirm(ref view) => view.keys_hint().to_string(),
         Modal::None => match app.tab {
             // A process row acts only on itself: signals, nothing forwarded to
             // the parent instance. Signals need container-namespace pids, so a

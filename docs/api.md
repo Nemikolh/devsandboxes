@@ -715,8 +715,9 @@ own env, each on a connection of its own (it's held until the answer);
 their `output` is dropped (the build log has it), the answer is its status
 line, and the row's phase shows the rest. `d` on an in-flight row is
 `instances.cancel` on the long-lived connection. Without a daemon neither
-has a fallback: the status line says it's needed. `rm` and `stop` still
-run in its own process, suspended.
+has a fallback: the status line says it's needed. `stop`, `rm` and
+`services.rebuild` are held verb requests the same way (rm with `ask`, its
+`confirm` question a modal whose answer resends it with `deleteBranch`).
 
 ## The CLI as a client
 

@@ -1712,11 +1712,11 @@ mod tests {
         app.set_snapshot(snapshot_with_phase(1, ContainerStatus::Missing, in_flight("building")));
         app.thread_terminal(&t);
         assert_eq!(app.status.as_deref(), Some("`inst0` is still building"));
-        assert_eq!(app.take_pending_start(), None);
+        assert_eq!(app.take_pending_action(), None);
         app.set_snapshot(snapshot_with_phase(1, ContainerStatus::Exited("Exited (1)".into()), failed("postStartCommand")));
         app.thread_terminal(&t);
         assert_eq!(app.status.as_deref(), Some("`inst0` failed at postStartCommand: rebuild it first (`s` on its row)"));
-        assert_eq!(app.take_pending_start(), None);
+        assert_eq!(app.take_pending_action(), None);
 
         // A child key the owner doesn't have stays visible, unresolved, and
         // the target keys go: they'd only say "not found".

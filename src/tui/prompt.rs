@@ -25,7 +25,8 @@ pub fn commands() -> impl Iterator<Item = &'static str> {
 const HISTORY_CAP: usize = 200;
 
 /// A parsed prompt line, handed up to the event loop to execute. Parsing lives
-/// in [`Prompt::parse`]; the loop owns the terminal suspend + command call.
+/// in [`Prompt::parse`]; the loop sends the verb request (or suspends for
+/// `exec`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PromptAction {
     Run { sandbox: String, name: Option<String>, branch: Option<String>, base: Option<String> },
@@ -34,7 +35,9 @@ pub enum PromptAction {
     /// `vscode` action's path/line/col).
     Code { instance: String, goto: Option<Goto> },
     Rename { instance: String, new_name: String },
-    Rm { instance: String, force: bool },
+    /// `delete_branch`: `None` sends rm with `ask` (its branch question comes
+    /// back as a Confirm modal); `Some` is that modal's answer, resent.
+    Rm { instance: String, force: bool, delete_branch: Option<bool> },
     Stop { instance: String },
     Start { instance: String },
     Rebuild { instance: String, force: bool },
@@ -406,6 +409,7 @@ fn parse_line(line: &str) -> Result<PromptAction, String> {
         "rm" => Ok(PromptAction::Rm {
             instance: args.positionals.remove(0),
             force: args.flag("--force"),
+            delete_branch: None,
         }),
         "rename" => {
             let mut pos = args.positionals.into_iter();
@@ -674,10 +678,10 @@ mod tests {
             })
         );
         assert!(parse_line("code box --goto ../x").is_err());
-        assert_eq!(parse_line("rm box"), Ok(PromptAction::Rm { instance: "box".into(), force: false }));
+        assert_eq!(parse_line("rm box"), Ok(PromptAction::Rm { instance: "box".into(), force: false, delete_branch: None }));
         assert_eq!(
             parse_line("rm --force box"),
-            Ok(PromptAction::Rm { instance: "box".into(), force: true })
+            Ok(PromptAction::Rm { instance: "box".into(), force: true, delete_branch: None })
         );
         assert!(parse_line("code").is_err());
         assert!(parse_line("code a b").is_err());

@@ -20,6 +20,15 @@ fn busy(row: &InstanceRow) -> Option<String> {
     }
 }
 
+/// How a verb request the event loop sent for a [`PromptAction`] ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VerbEnd {
+    /// Its status line, and whether it failed.
+    Done { status: String, failed: bool },
+    /// rm's `confirm`: its branch question, nothing removed yet.
+    Confirm(String),
+}
+
 /// A done-flag write for the event loop to send (`instances.done`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingDone {
@@ -35,8 +44,9 @@ pub struct PendingDone {
 
 impl App {
     /// `d` (Instances tab): remove the instance under the cursor right away,
-    /// no prompt, via the same suspend path `:rm` takes (non-forced, so `rm`'s
-    /// own dirty-worktree refusal and branch-delete question still guard it).
+    /// no prompt, as the same `rm` request `:rm` sends (non-forced, so `rm`'s
+    /// own dirty-worktree refusal and branch-delete question, a Confirm modal
+    /// via [`Self::verb_answered`], still guard it).
     /// A no-op off an instance (process rows are filtered by the caller). An
     /// in-flight one can't be removed: `d` asks to cancel its build instead
     /// (a cancelled `run` rolls back, so that's its removal); a failed one is
@@ -53,7 +63,7 @@ impl App {
             self.confirm_cancel_build(name);
             return;
         }
-        self.pending_action = Some(PromptAction::Rm { instance: row.name.clone(), force: false });
+        self.pending_action = Some(PromptAction::Rm { instance: row.name.clone(), force: false, delete_branch: None });
     }
 
     /// Queue a done-flag write for `instance` on behalf of an Inbox thread
@@ -105,14 +115,13 @@ impl App {
     }
 
     /// `s` (Instances tab): stop the running instance under the cursor, or
-    /// start it when its container is exited, on a background thread (the event
-    /// loop owns the docker work, keeping [`App`] I/O-free). Works for
+    /// start it when its container is exited, as a `stop` / detached `start`
+    /// verb request the event loop sends (keeping [`App`] I/O-free). Works for
     /// orphan-group instance children and process rows (routing to the parent
     /// instance); a no-op on sandbox / empty / orphan-group nodes and while a
     /// stop/start for the same instance is in flight.
     ///
-    /// Two cases can't be served by a bare `docker start` and are *rebuilt*
-    /// instead, by queuing a [`PromptAction::Rebuild`] like the `:` prompt's
+    /// Two cases can't be served by a `start` and are *rebuilt* instead, by queuing a [`PromptAction::Rebuild`] like the `:` prompt's
     /// (the loop runs it as a detached `devsandbox rebuild`): an exited
     /// instance whose container drifted from the current config, and a
     /// missing container — `rebuild` is the worktree-preserving way to
@@ -150,18 +159,18 @@ impl App {
             ContainerStatus::Running(_) => {
                 self.status = Some(format!("stopping {name}…"));
                 self.stopping.insert(name.clone());
-                self.pending_stop = Some(name);
+                self.pending_action = Some(PromptAction::Stop { instance: name });
             }
             ContainerStatus::Exited(_) if row.drift => {
                 // Config drifted: recreate the container (worktree preserved)
-                // with a detached rebuild instead of a bare start.
+                // with a detached rebuild instead of a start.
                 self.pending_action =
                     Some(PromptAction::Rebuild { instance: name, force: false });
             }
             ContainerStatus::Exited(_) => {
                 self.status = Some(format!("starting {name}…"));
                 self.starting.insert(name.clone());
-                self.pending_start = Some(name);
+                self.pending_action = Some(PromptAction::Start { instance: name });
             }
             ContainerStatus::Unknown => {
                 self.status = Some(format!("{name}: status still loading"));
@@ -212,14 +221,30 @@ impl App {
         }
     }
 
-    /// Take the pending background stop for the event loop to spawn, if any.
-    pub fn take_pending_stop(&mut self) -> Option<String> {
-        self.pending_stop.take()
-    }
-
-    /// Take the pending background start for the event loop to spawn, if any.
-    pub fn take_pending_start(&mut self) -> Option<String> {
-        self.pending_start.take()
+    /// The event loop's report that the verb request for `action` ended:
+    /// show its status, clear `s`'s in-flight guard (a detached start
+    /// answers once spawned, F14: a thread action waiting on it runs when a
+    /// snapshot shows the instance up, [`Self::set_snapshot`]), and turn rm's
+    /// branch question into a Confirm modal whose answer resends it.
+    pub fn verb_answered(&mut self, action: &PromptAction, end: VerbEnd) {
+        match (action, end) {
+            (PromptAction::Rm { instance, force, .. }, VerbEnd::Confirm(question)) => {
+                self.status = None;
+                self.confirm_rm_branch(instance.clone(), *force, question);
+            }
+            // Only rm asks.
+            (_, VerbEnd::Confirm(question)) => self.status = Some(question),
+            (action, VerbEnd::Done { status, failed }) => {
+                self.status = Some(status);
+                match action {
+                    PromptAction::Stop { instance } => {
+                        self.stopping.remove(instance);
+                    }
+                    PromptAction::Start { instance } => self.start_answered(instance, failed),
+                    _ => {}
+                }
+            }
+        }
     }
 }
 
@@ -247,7 +272,7 @@ mod tests {
         app.on_key(key(KeyCode::Char('d')));
         assert_eq!(
             app.take_pending_action(),
-            Some(PromptAction::Rm { instance: "inst0".into(), force: false })
+            Some(PromptAction::Rm { instance: "inst0".into(), force: false, delete_branch: None })
         );
         assert!(app.prompt.is_none());
         assert_eq!(app.take_pending_done(), []);
@@ -334,8 +359,8 @@ mod tests {
         app.on_key(key(KeyCode::Char('s')));
         assert!(app.stopping.contains("inst0"));
         assert_eq!(app.status.as_deref(), Some("stopping inst0…"));
-        assert_eq!(app.take_pending_stop(), Some("inst0".into()));
-        assert_eq!(app.take_pending_start(), None);
+        assert_eq!(app.take_pending_action(), Some(PromptAction::Stop { instance: "inst0".into() }));
+        assert_eq!(app.take_pending_action(), None);
     }
 
     #[test]
@@ -347,8 +372,8 @@ mod tests {
         app.on_key(key(KeyCode::Char('s')));
         assert!(app.starting.contains("inst0"));
         assert_eq!(app.status.as_deref(), Some("starting inst0…"));
-        assert_eq!(app.take_pending_start(), Some("inst0".into()));
-        assert_eq!(app.take_pending_stop(), None);
+        assert_eq!(app.take_pending_action(), Some(PromptAction::Start { instance: "inst0".into() }));
+        assert_eq!(app.take_pending_action(), None);
     }
 
     /// Before the runtime is listed, `s` can't know whether to stop or start.
@@ -359,8 +384,6 @@ mod tests {
         app.on_key(key(KeyCode::Down)); // onto inst0
         app.on_key(key(KeyCode::Char('s')));
         assert_eq!(app.status.as_deref(), Some("inst0: status still loading"));
-        assert_eq!(app.take_pending_stop(), None);
-        assert_eq!(app.take_pending_start(), None);
         assert_eq!(app.take_pending_action(), None);
     }
 
@@ -377,14 +400,14 @@ mod tests {
             app.take_pending_action(),
             Some(PromptAction::Rebuild { instance: "inst0".into(), force: false })
         );
-        // Drift takes the suspend path, not the background start guard.
-        assert_eq!(app.take_pending_start(), None);
+        // Drift rebuilds: no start guard.
+        assert_eq!(app.take_pending_action(), None);
         assert!(app.starting.is_empty());
-        assert_eq!(app.take_pending_stop(), None);
+        assert_eq!(app.take_pending_action(), None);
     }
 
     #[test]
-    fn s_on_exited_undrifted_instance_still_bare_starts() {
+    fn s_on_exited_undrifted_instance_still_starts() {
         let mut app = new_app();
         let status = ContainerStatus::Exited("Exited (0)".into());
         let snap = snapshot_with_status(1, status); // drift: false
@@ -392,7 +415,7 @@ mod tests {
         app.on_key(key(KeyCode::Down)); // onto inst0
         app.on_key(key(KeyCode::Char('s')));
         assert!(app.starting.contains("inst0"));
-        assert_eq!(app.take_pending_start(), Some("inst0".into()));
+        assert_eq!(app.take_pending_action(), Some(PromptAction::Start { instance: "inst0".into() }));
         assert_eq!(app.take_pending_action(), None);
     }
 
@@ -405,15 +428,14 @@ mod tests {
         app.on_key(key(KeyCode::Down)); // onto inst0
         app.on_key(key(KeyCode::Char('s')));
         assert!(app.stopping.contains("inst0"));
-        assert_eq!(app.take_pending_stop(), Some("inst0".into()));
+        assert_eq!(app.take_pending_action(), Some(PromptAction::Stop { instance: "inst0".into() }));
         assert_eq!(app.take_pending_action(), None);
-        assert_eq!(app.take_pending_start(), None);
     }
 
     #[test]
     fn s_on_missing_container_queues_rebuild() {
-        // A missing container can't be bare-started; `s` recreates it via the
-        // modal CLI rebuild (worktree preserved), like the drifted-exited case.
+        // A missing container can't be started; `s` recreates it via a
+        // detached rebuild (worktree preserved), like the drifted-exited case.
         let mut app = new_app();
         app.set_snapshot(snapshot_with(1)); // status Missing
         app.on_key(key(KeyCode::Down)); // onto inst0
@@ -422,8 +444,7 @@ mod tests {
             app.take_pending_action(),
             Some(PromptAction::Rebuild { instance: "inst0".into(), force: false })
         );
-        assert_eq!(app.take_pending_stop(), None);
-        assert_eq!(app.take_pending_start(), None);
+        assert_eq!(app.take_pending_action(), None);
         assert!(app.stopping.is_empty());
         assert!(app.starting.is_empty());
     }
@@ -437,7 +458,7 @@ mod tests {
         app.on_key(key(KeyCode::Down)); // onto orphan0
         assert_eq!(app.selected_node(), Some(Node::Instance(0)));
         app.on_key(key(KeyCode::Char('s')));
-        assert_eq!(app.take_pending_stop(), Some("orphan0".into()));
+        assert_eq!(app.take_pending_action(), Some(PromptAction::Stop { instance: "orphan0".into() }));
     }
 
     #[test]
@@ -445,7 +466,7 @@ mod tests {
         let mut app = new_app();
         app.set_snapshot(snapshot_with(1)); // cursor on Sandbox(0)
         app.on_key(key(KeyCode::Char('s')));
-        assert_eq!(app.take_pending_stop(), None);
+        assert_eq!(app.take_pending_action(), None);
         assert!(app.stopping.is_empty());
     }
 
@@ -455,11 +476,11 @@ mod tests {
         app.set_snapshot(snapshot_with_status(1, running()));
         app.on_key(key(KeyCode::Down)); // onto inst0
         app.on_key(key(KeyCode::Char('s')));
-        assert_eq!(app.take_pending_stop(), Some("inst0".into()));
+        assert_eq!(app.take_pending_action(), Some(PromptAction::Stop { instance: "inst0".into() }));
         // Still in flight (loop hasn't cleared `stopping`): a second `s` is a no-op.
         app.on_key(key(KeyCode::Down)); // keep cursor on inst0
         app.on_key(key(KeyCode::Char('s')));
-        assert_eq!(app.take_pending_stop(), None);
+        assert_eq!(app.take_pending_action(), None);
     }
 
     #[test]
@@ -469,11 +490,72 @@ mod tests {
         app.set_snapshot(snapshot_with_status(1, status));
         app.on_key(key(KeyCode::Down)); // onto inst0
         app.on_key(key(KeyCode::Char('s')));
-        assert_eq!(app.take_pending_start(), Some("inst0".into()));
+        assert_eq!(app.take_pending_action(), Some(PromptAction::Start { instance: "inst0".into() }));
         // Still in flight (loop hasn't cleared `starting`): a second `s` is a no-op.
         app.on_key(key(KeyCode::Down)); // keep cursor on inst0
         app.on_key(key(KeyCode::Char('s')));
-        assert_eq!(app.take_pending_start(), None);
+        assert_eq!(app.take_pending_action(), None);
+    }
+
+    /// The answer to `s`'s request clears its guard (failed or not), so `s`
+    /// works again; the status line is the answer's.
+    #[test]
+    fn s_guards_clear_when_the_answer_arrives() {
+        let mut app = new_app();
+        app.set_snapshot(snapshot_with_status(1, running()));
+        app.on_key(key(KeyCode::Down)); // onto inst0
+        app.on_key(key(KeyCode::Char('s')));
+        let stop = app.take_pending_action().unwrap();
+        app.verb_answered(&stop, VerbEnd::Done { status: "stopped inst0".into(), failed: false });
+        assert!(app.stopping.is_empty());
+        assert_eq!(app.status.as_deref(), Some("stopped inst0"));
+
+        app.set_snapshot(snapshot_with_status(1, ContainerStatus::Exited("Exited (0)".into())));
+        app.on_key(key(KeyCode::Char('s')));
+        let start = app.take_pending_action().unwrap();
+        assert_eq!(start, PromptAction::Start { instance: "inst0".into() });
+        app.verb_answered(&start, VerbEnd::Done { status: "start inst0 failed: boom".into(), failed: true });
+        assert!(app.starting.is_empty());
+        app.on_key(key(KeyCode::Char('s')));
+        assert_eq!(app.take_pending_action(), Some(start));
+    }
+
+    /// rm's branch question opens the Confirm modal as rm words it: `y`/
+    /// `enter` resend with `deleteBranch: true`, `n` with `false` (same
+    /// `force`), `esc`/`q` send nothing.
+    #[test]
+    fn rms_question_is_a_three_way_confirm() {
+        let q = "delete branch `b`? it has commits not on its remote";
+        let ask = |app: &mut App, force| {
+            let rm = PromptAction::Rm { instance: "inst0".into(), force, delete_branch: None };
+            app.verb_answered(&rm, VerbEnd::Confirm(q.into()));
+            match &app.modal {
+                Modal::Confirm(c) => {
+                    assert_eq!(c.question, q);
+                    assert_eq!(c.keys_hint(), "y/enter yes · n no · esc cancel");
+                }
+                _ => panic!("no confirm"),
+            }
+        };
+        let resent = |force, delete| Some(PromptAction::Rm { instance: "inst0".into(), force, delete_branch: Some(delete) });
+        let mut app = new_app();
+        for (code, force, want) in [
+            (KeyCode::Char('y'), false, resent(false, true)),
+            (KeyCode::Enter, true, resent(true, true)),
+            (KeyCode::Char('n'), true, resent(true, false)),
+            (KeyCode::Esc, false, None),
+            (KeyCode::Char('q'), false, None),
+        ] {
+            ask(&mut app, force);
+            // Other keys neither answer nor reach the dashboard.
+            app.on_key(key(KeyCode::Char('s')));
+            assert!(matches!(app.modal, Modal::Confirm(_)));
+            app.on_key(key(code));
+            assert!(matches!(app.modal, Modal::None), "{code:?}");
+            assert_eq!(app.take_pending_action(), want, "{code:?}");
+            assert_eq!(app.take_pending_cancel(), None);
+        }
+        assert_eq!(app.status.as_deref(), Some("rm inst0: cancelled"));
     }
 
     #[test]
@@ -482,7 +564,7 @@ mod tests {
         app.set_snapshot(snapshot_with(1));
         app.tab = Tab::Services;
         app.on_key(key(KeyCode::Char('s')));
-        assert_eq!(app.take_pending_stop(), None);
+        assert_eq!(app.take_pending_action(), None);
     }
 
     #[test]
@@ -521,8 +603,6 @@ mod tests {
             assert!(matches!(app.modal, Modal::Confirm(_)));
             app.on_key(key(KeyCode::Esc));
             assert_eq!(app.take_pending_action(), None);
-            assert_eq!(app.take_pending_stop(), None);
-            assert_eq!(app.take_pending_start(), None);
             assert_eq!(app.take_pending_cancel(), None);
         }
     }
@@ -571,10 +651,9 @@ mod tests {
                 app.take_pending_action(),
                 Some(PromptAction::Rebuild { instance: "inst0".into(), force: false })
             );
-            assert_eq!(app.take_pending_stop(), None);
-            assert_eq!(app.take_pending_start(), None);
+            assert_eq!(app.take_pending_action(), None);
             app.on_key(key(KeyCode::Char('d')));
-            assert_eq!(app.take_pending_action(), Some(PromptAction::Rm { instance: "inst0".into(), force: false }));
+            assert_eq!(app.take_pending_action(), Some(PromptAction::Rm { instance: "inst0".into(), force: false, delete_branch: None }));
         }
     }
 

@@ -82,10 +82,10 @@ which live instances reference it. Same table/detail-panel pattern as step 3.
     bytes (see `hex_encode` in `src/tui/mod.rs`). `code` is spawned detached (no
     TUI suspend); its outcome shows as a one-line status in the help bar.
   - `rm <instance>`.
-- Execution suspends the TUI (leave alt screen + raw mode), runs the existing command fns
-  (`commands::exec::exec`, `commands::rm::rm`, …) with inherited stdio, waits for a
-  keypress, re-enters the TUI and forces a data refresh. `run`, `rebuild` and `start`
-  no longer suspend: see *Background builds* below.
+- `exec` suspends the TUI (leave alt screen + raw mode), runs `commands::exec::exec`
+  with inherited stdio, waits for a keypress, re-enters the TUI and forces a data
+  refresh. The verbs (`run`, `rebuild`, `start`, `stop`, `rm`, a service's `rebuild`)
+  never suspend: see *Background builds* below.
 - `tab` completion: first token from the command list; argument token from sandbox names
   (`run`) or instance names (`exec`, `code`, `rm`). Cycle on repeated tab.
 - History: `↑↓` in the prompt; persisted to `<data dir>/devsandbox/prompt_history`
@@ -391,18 +391,17 @@ ops.
 
 Archived threads refuse actions, replies, `d` and `u` with a status line. A
 host action whose child isn't found is refused rather than run on the sender,
-and sends no event. The `rm` verb goes through the `:rm` path (the CLI's own
-confirm on the suspended screen).
+and sends no event. The `rm` verb goes through the `:rm` path (rm's branch
+question as a Confirm modal).
 
 On a stopped target (the child, or the sender with none), `vscode`,
 `terminal`, `forward` and `o`/`t`/`p` start it first: the status line says
-`starting <name>…`, the background start of `s` runs, and the verb is kept
-in `App::after_start` (`thread_actions::Deferred`). The event loop reports
-the start's end to `App::start_finished`: on success the verb runs (a
-terminal opens without waiting for the snapshot to say running, the start
-having checked the container is up); on failure (`spawn_start` checks
-`is_running`, since `start_containers` ignores exit codes) the status line
-shows why and the verb is dropped. A newer such action replaces a waiting
+`starting <name>…`, the same `start` request as `s` is sent, and the verb
+is kept in `App::after_start` (`thread_actions::Deferred`). A detached
+start answers right after spawning, so the verb runs when a snapshot shows
+the target running with no phase (`App::run_after_start`); a start request
+that fails drops it, its status line says why. A start that fails later
+leaves it waiting, for the next action to replace. A newer such action replaces a waiting
 one; a second click on the same target doesn't start it twice. `logs` never
 starts it (a stopped container's logs say why it stopped), nor do `open` and
 `rm`. A target whose container is gone is refused with a hint to rebuild
@@ -440,6 +439,18 @@ status column shows the phase, how it ends included. A verb that fails
 before that (`failed`) leaves a help-bar line with its error pointing at
 the build-log key. No daemon, no fallback: `run web: needs devsandbox
 serve (<why>)`. Off unix (no daemon) they run suspended, in-process.
+
+`s` is a `stop` request on a running row, a detached `start` on an exited
+one (so it runs services, `postStartCommand` and the autostart pass like
+CLI `start`); a status line (`stopping web-2…`) shows until the answer.
+`stop`, `rm` (`d`, `:rm`) and a service's `rebuild` (`:rebuild` on the
+Services tab, `services.rebuild`) are held requests on their own
+connection: the answer is the status line (`stopped web-2`, `removed
+web-2`, `rebuilt service cache`, or the verb's error, e.g. rm refusing a
+dirty worktree); quitting the dashboard meanwhile hangs up, which cancels
+them. `rm` goes with `ask`: when it would ask about the branch, its
+question opens a Confirm modal, `y`/`enter` resends with `deleteBranch:
+true`, `n` with `false`, `esc`/`q` removes nothing.
 
 - `b` on an instance row opens its build log (`<data>/devsandbox/logs/
   <instance_id>/build.log`, the last 500 lines) in a modal titled with the

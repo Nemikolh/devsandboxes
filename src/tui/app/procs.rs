@@ -244,7 +244,6 @@ mod tests {
             app.on_key(key(code));
         }
         assert!(app.stopping.is_empty());
-        assert!(app.take_pending_stop().is_none());
         assert!(app.take_pending_action().is_none());
         assert!(app.take_pending_signal().is_none());
         assert!(matches!(app.modal, Modal::None));

@@ -48,7 +48,7 @@ use crate::commands;
 use crate::commands::vscode::Goto;
 use crate::inbox;
 
-use app::App;
+use app::{App, VerbEnd};
 use poll::{PollUpdate, PollWorker};
 use prompt::PromptAction;
 
@@ -248,18 +248,15 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
     let mut pending = true;
     let mut deeper = vec![data::Depth::Full, data::Depth::Listing];
     let mut stats_clock = StatsClock::default();
-    // Background `s` stops/starts, each reporting completion over its own
-    // channel; paired with the instance name so the guard clears even if the
-    // thread dies.
-    let mut stops: Vec<(String, Receiver<OpDone>)> = Vec::new();
-    let mut starts: Vec<(String, Receiver<OpDone>)> = Vec::new();
     // Background VS Code launches (`o`, `:code`, a thread's `vscode`): a
     // `--goto` waits up to 30 s for the window. No guard: a second launch
     // just focuses the same window.
     let mut codes: Vec<Receiver<OpDone>> = Vec::new();
-    // `run`/`rebuild`/`start` requests to the daemon, a thread each until
-    // the detached answer (`spawn_verb`): report and resnapshot.
-    let mut builds: Vec<Receiver<OpDone>> = Vec::new();
+    // Verb requests to the daemon, a thread each until answered
+    // (`spawn_verb`): `run`/`rebuild`/`start` detached, `stop`/`rm`/
+    // `services.rebuild` held. Paired with their action so the answer
+    // reaches `App` (guards, rm's question) even if the thread dies.
+    let mut verbs: Vec<(PromptAction, Receiver<VerbEnd>)> = Vec::new();
     let mut last_tick = Instant::now();
     let mut proc_pending = false;
     // Set while a procs failure the daemon answered is shown, so it's one
@@ -349,17 +346,22 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
             }
         }
 
-        // A prompt command is ready: suspend the TUI (or, for `code`, launch
-        // it in the background; for `run`/`rebuild`/`start`, send it to the
-        // daemon), then force a redraw + immediate refresh on return.
+        // A prompt command or key action is ready: send a verb to the
+        // daemon, launch `code` in the background, or suspend the TUI for
+        // `exec` (then force a redraw + immediate refresh on return).
         if let Some(action) = app.take_pending_action() {
             match action {
-                // devsandbox serve runs the build (it outlives the dashboard
-                // and logs itself); its row shows the phase as soon as it's
-                // recorded.
-                action @ (PromptAction::Run { .. } | PromptAction::Rebuild { .. } | PromptAction::Start { .. }) => {
-                    app.status = Some(format!("{}…", verb_label(&action)));
-                    builds.push(spawn_verb(&dir, action));
+                // devsandbox serve runs the verb (a build outlives the
+                // dashboard and logs itself); a build's row shows the phase
+                // as soon as it's recorded.
+                action @ (PromptAction::Run { .. }
+                | PromptAction::Rebuild { .. }
+                | PromptAction::Start { .. }
+                | PromptAction::Stop { .. }
+                | PromptAction::Rm { .. }
+                | PromptAction::ServiceRebuild { .. }) => {
+                    app.status = Some(verb_pending(&action));
+                    verbs.push((action.clone(), spawn_verb(&dir, action)));
                     last_tick = Instant::now();
                     followup.schedule(last_tick);
                     refresh(&poller, &mut pending, &mut stats_clock);
@@ -373,7 +375,7 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
                 // shows then.
                 PromptAction::Rename { instance, new_name } => daemon.rename(instance, new_name),
                 other => {
-                    run_suspended(terminal, &dir, other)?;
+                    run_suspended(terminal, other)?;
                     // Redraw from scratch: the child scribbled over the screen.
                     terminal.clear()?;
                     // Refresh data now rather than waiting for the next tick.
@@ -383,14 +385,6 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
             }
         }
 
-        // A background stop/start was requested by `s`: spawn it without
-        // suspending.
-        if let Some(instance) = app.take_pending_stop() {
-            stops.push((instance.clone(), spawn_stop(&instance)));
-        }
-        if let Some(instance) = app.take_pending_start() {
-            starts.push((instance.clone(), spawn_start(&instance)));
-        }
         // Process-row SIGTERM/SIGKILL, done flags, modal reads: one-shot
         // requests on the daemon worker's connection, answered below.
         if let Some(sig) = app.take_pending_signal() {
@@ -504,41 +498,6 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
             }
         }
 
-        // Drain any finished background stops/starts: update the status line,
-        // clear the in-flight guard, and force an immediate snapshot refresh so
-        // the row's new status shows without waiting for the next tick.
-        stops.retain_mut(|(instance, rx)| match rx.try_recv() {
-            Ok(done) => {
-                app.stopping.remove(instance);
-                app.status = Some(done.status);
-                last_tick = Instant::now();
-                followup.schedule(last_tick);
-                refresh(&poller, &mut pending, &mut stats_clock);
-                false
-            }
-            Err(TryRecvError::Empty) => true,
-            // Thread died without sending; clear the guard so `s` works again.
-            Err(TryRecvError::Disconnected) => {
-                app.stopping.remove(instance);
-                false
-            }
-        });
-        starts.retain_mut(|(instance, rx)| match rx.try_recv() {
-            Ok(done) => {
-                // Also runs a thread action that was waiting on this start.
-                app.start_finished(instance, Some(done.status), done.failed);
-                last_tick = Instant::now();
-                followup.schedule(last_tick);
-                refresh(&poller, &mut pending, &mut stats_clock);
-                false
-            }
-            Err(TryRecvError::Empty) => true,
-            // Thread died without sending; clear the guard so `s` works again.
-            Err(TryRecvError::Disconnected) => {
-                app.start_finished(instance, None, true);
-                false
-            }
-        });
         codes.retain_mut(|rx| match rx.try_recv() {
             Ok(done) => {
                 app.status = Some(done.status);
@@ -548,18 +507,23 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
             Err(TryRecvError::Disconnected) => false,
         });
 
-        // Drain answered verb requests: report, and resnapshot so the row
-        // shows the build's phase.
-        builds.retain_mut(|rx| match rx.try_recv() {
-            Ok(done) => {
-                app.status = Some(done.status);
-                last_tick = Instant::now();
-                followup.schedule(last_tick);
-                refresh(&poller, &mut pending, &mut stats_clock);
-                false
-            }
-            Err(TryRecvError::Empty) => true,
-            Err(TryRecvError::Disconnected) => false,
+        // Drain answered verb requests: hand the answer to `App`, and
+        // resnapshot so the row shows the build's phase, the stop, the
+        // removal.
+        verbs.retain_mut(|(action, rx)| {
+            let end = match rx.try_recv() {
+                Ok(end) => end,
+                Err(TryRecvError::Empty) => return true,
+                // Thread died without sending: clear the guards all the same.
+                Err(TryRecvError::Disconnected) => {
+                    VerbEnd::Done { status: format!("{}: no answer", verb_label(action)), failed: true }
+                }
+            };
+            app.verb_answered(action, end);
+            last_tick = Instant::now();
+            followup.schedule(last_tick);
+            refresh(&poller, &mut pending, &mut stats_clock);
+            false
         });
 
         // Drain the daemon's answers into the app, freeing their slots.
@@ -641,23 +605,26 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
 
 /// Leave the TUI, run a prompt command with inherited stdio, wait for one
 /// keypress, then re-enter the TUI. Command errors are printed (not propagated)
-/// so a failed `exec`/`rm` returns the user to the dashboard.
-fn run_suspended(terminal: &mut Term, dir: &Path, action: PromptAction) -> Result<()> {
+/// so a failed `exec` returns the user to the dashboard.
+fn run_suspended(terminal: &mut Term, action: PromptAction) -> Result<()> {
     restore();
 
     let result = match &action {
         PromptAction::Exec { instance, argv } => {
             commands::exec::exec_status(instance, true, true, argv).map(|_| ())
         }
-        PromptAction::Rm { instance, force } => commands::rm::rm(instance, None, *force, false),
-        PromptAction::Stop { instance } => commands::stop::stop(Some(instance.clone()), false),
-        PromptAction::ServiceRebuild { name } => commands::services::rebuild(dir, name),
-        // `run`/`rebuild`/`start` go to the daemon (`spawn_verb`): the
-        // caller handles them.
-        PromptAction::Run { .. } | PromptAction::Rebuild { .. } | PromptAction::Start { .. } => Ok(()),
-        // `code`/`rename` never suspend. `port` never reaches here — `App`
-        // routes it to `pending_port` (step 10), not `pending_action`.
-        PromptAction::Code { .. } | PromptAction::Rename { .. } | PromptAction::Port { .. } => Ok(()),
+        // The verbs go to the daemon (`spawn_verb`), `code`/`rename` never
+        // suspend: the caller handles them. `port` never reaches here —
+        // `App` routes it to `pending_port`, not `pending_action`.
+        PromptAction::Run { .. }
+        | PromptAction::Rebuild { .. }
+        | PromptAction::Start { .. }
+        | PromptAction::Stop { .. }
+        | PromptAction::Rm { .. }
+        | PromptAction::ServiceRebuild { .. }
+        | PromptAction::Code { .. }
+        | PromptAction::Rename { .. }
+        | PromptAction::Port { .. } => Ok(()),
     };
     if let Err(e) = result {
         match log_error(&action, &e) {
@@ -687,18 +654,9 @@ fn run_suspended(terminal: &mut Term, dir: &Path, action: PromptAction) -> Resul
 fn log_error(action: &PromptAction, err: &anyhow::Error) -> Option<PathBuf> {
     let verb = match action {
         PromptAction::Exec { .. } => "exec",
-        PromptAction::Rm { .. } => "rm",
-        PromptAction::Stop { .. } => "stop",
-        PromptAction::ServiceRebuild { .. } => "service rebuild",
-        // Never suspended (`run_suspended`; the daemon runs `run`/
-        // `rebuild`/`start`, their build log has the output): nothing to
-        // log here.
-        PromptAction::Run { .. }
-        | PromptAction::Rebuild { .. }
-        | PromptAction::Start { .. }
-        | PromptAction::Code { .. }
-        | PromptAction::Rename { .. }
-        | PromptAction::Port { .. } => return None,
+        // Never suspended (`run_suspended`): the daemon runs the verbs and
+        // their status line (or build log) has the error.
+        _ => return None,
     };
     let dir = crate::state::State::path().ok()?.parent()?.join("logs");
     std::fs::create_dir_all(&dir).ok()?;
@@ -743,44 +701,70 @@ fn spawn_code(dir: PathBuf, instance: String, goto: Option<Goto>, note: Option<S
             Some(note) => format!("{outcome} · {note}"),
             None => outcome,
         };
-        let _ = tx.send(OpDone { status, failed: false });
+        let _ = tx.send(OpDone { status });
     });
     rx
 }
 
-/// `run web` / `rebuild web-2` / `start web-2`: how the status line names a
-/// dashboard verb request.
+/// `run web` / `rebuild web-2` / `start web-2` / `rm web-2` / `service
+/// rebuild cache`: how the status line names a dashboard verb request.
 fn verb_label(action: &PromptAction) -> String {
     match action {
         PromptAction::Run { sandbox, name: Some(name), .. } => format!("run {sandbox} --name {name}"),
         PromptAction::Run { sandbox, .. } => format!("run {sandbox}"),
         PromptAction::Rebuild { instance, .. } => format!("rebuild {instance}"),
         PromptAction::Start { instance } => format!("start {instance}"),
+        PromptAction::Stop { instance } => format!("stop {instance}"),
+        PromptAction::Rm { instance, .. } => format!("rm {instance}"),
+        PromptAction::ServiceRebuild { name } => format!("service rebuild {name}"),
         _ => String::new(),
     }
 }
 
-/// The instance a verb action names before it runs: `rebuild`/`start`'s,
-/// `run --name`'s (a plain `run`'s is picked by the verb).
+/// The status line while a verb request is out: `s`'s "stopping x…" /
+/// "starting x…" (as `App` words them), else the label.
+fn verb_pending(action: &PromptAction) -> String {
+    match action {
+        PromptAction::Stop { instance } => format!("stopping {instance}…"),
+        PromptAction::Start { instance } => format!("starting {instance}…"),
+        PromptAction::Rm { instance, .. } => format!("removing {instance}…"),
+        _ => format!("{}…", verb_label(action)),
+    }
+}
+
+/// The instance a verb action names before it runs: `rebuild`/`start`/
+/// `stop`/`rm`'s, `run --name`'s (a plain `run`'s is picked by the verb).
 fn verb_instance(action: &PromptAction) -> Option<&str> {
     match action {
         PromptAction::Run { name, .. } => name.as_deref(),
-        PromptAction::Rebuild { instance, .. } | PromptAction::Start { instance } => Some(instance),
+        PromptAction::Rebuild { instance, .. }
+        | PromptAction::Start { instance }
+        | PromptAction::Stop { instance }
+        | PromptAction::Rm { instance, .. } => Some(instance),
         _ => None,
     }
 }
 
-/// The verb request (method, params) for a dashboard `run`/`rebuild`/
-/// `start` in config root `root` (absolute) with the dashboard's `env`;
-/// `None` for the other actions. Always `detach`: the dashboard only waits
-/// for the instance to be registered, its row shows the rest. The target
-/// always goes in, so nothing can need a pick.
+/// The held verbs: they end with the work (seconds), the request waits for
+/// it, and they write no build log.
+fn verb_held(action: &PromptAction) -> bool {
+    matches!(action, PromptAction::Stop { .. } | PromptAction::Rm { .. } | PromptAction::ServiceRebuild { .. })
+}
+
+/// The verb request (method, params) for a dashboard verb action in config
+/// root `root` (absolute) with the dashboard's `env`; `None` for the other
+/// actions. `run`/`rebuild`/`start` always `detach`: the dashboard only
+/// waits for the instance to be registered, its row shows the rest.
+/// `stop`/`rm`/`services.rebuild` are held (they can't detach). An
+/// unanswered `rm` asks (its branch question comes back as `confirm`); an
+/// answered one carries `deleteBranch`. The target always goes in, so
+/// nothing can need a pick.
 fn verb_call(
     action: &PromptAction,
     root: &Path,
     env: BTreeMap<String, String>,
 ) -> Option<(&'static str, serde_json::Value)> {
-    use crate::serve::verbs::{RebuildParams, RunParams, StartParams};
+    use crate::serve::verbs::{RebuildParams, RmParams, RunParams, ServicesRebuildParams, StartParams, StopParams};
     let root = root.to_path_buf();
     let (method, params) = match action.clone() {
         PromptAction::Run { sandbox, name, branch, base } => {
@@ -793,19 +777,45 @@ fn verb_call(
         PromptAction::Start { instance } => {
             ("start", serde_json::to_value(StartParams { root, env, instance: Some(instance), all: false, detach: true }))
         }
+        PromptAction::Stop { instance } => {
+            ("stop", serde_json::to_value(StopParams { root, env, instance: Some(instance), all: false }))
+        }
+        PromptAction::Rm { instance, force, delete_branch } => (
+            "rm",
+            serde_json::to_value(RmParams { root, env, instance, delete_branch, force, ask: delete_branch.is_none() }),
+        ),
+        PromptAction::ServiceRebuild { name } => {
+            ("services.rebuild", serde_json::to_value(ServicesRebuildParams { root, env, name }))
+        }
         _ => return None,
     };
     Some((method, params.expect("verb params serialize")))
 }
 
+/// How a verb request ended, for [`App::verb_answered`]: rm's `confirm` (its
+/// branch question, to a modal) for an rm that asked, else
+/// [`verb_status`]'s line.
+fn verb_end(action: &PromptAction, sent: Result<crate::serve::client::Streamed>) -> VerbEnd {
+    use crate::serve::client::Streamed;
+    if let (PromptAction::Rm { delete_branch: None, .. }, Ok(Streamed::Answer(r))) = (action, &sent)
+        && let Some(e) = &r.error
+        && e.code == "confirm"
+    {
+        return VerbEnd::Confirm(e.message.clone());
+    }
+    let (status, failed) = verb_status(action, sent);
+    VerbEnd::Done { status, failed }
+}
+
 /// The status line (and whether it's a failure) for a verb request's end:
 /// the detached answer names the instance and where its build log is; a
-/// `failed` verb quotes its error and points at the build log (`b`) of its
-/// instance, which a plain `run` only knows from the answer (else "its
-/// row": the failed row shows up under the sandbox). Other errors (bad
-/// params, no such instance) ran nothing, so no build log. `Err` is the
-/// daemon unreachable: no fallback (the dashboard never builds in its own
-/// process, which would die with it).
+/// held verb's says what it did. A `failed` verb quotes its error; a build
+/// verb's points at the build log (`b`) of its instance, which a plain
+/// `run` only knows from the answer (else "its row": the failed row shows
+/// up under the sandbox). Other errors (bad params, no such instance) ran
+/// nothing, so no build log. `Err` is the daemon unreachable: no fallback
+/// (the dashboard never builds in its own process, which would die with
+/// it).
 fn verb_status(action: &PromptAction, sent: Result<crate::serve::client::Streamed>) -> (String, bool) {
     use crate::serve::client::Streamed;
     let label = verb_label(action);
@@ -820,7 +830,7 @@ fn verb_status(action: &PromptAction, sent: Result<crate::serve::client::Streame
     };
     let named = verb_instance(action);
     match r.error {
-        Some(e) if e.code == "failed" => {
+        Some(e) if e.code == "failed" && !verb_held(action) => {
             let instance = e.data.as_ref().and_then(|d| d["instance"].as_str()).or(named);
             let hint = match instance {
                 Some(instance) => format!("b on {instance} opens its build log"),
@@ -832,9 +842,15 @@ fn verb_status(action: &PromptAction, sent: Result<crate::serve::client::Streame
         None => {
             let result = r.result.unwrap_or_default();
             if result["detached"] != true {
-                // It ended before it was registered (`start` with nothing
-                // to build): the normal result.
-                return (format!("{label}: done"), false);
+                // Held verbs end with the work; `start` with nothing to
+                // build ends before it's registered: the normal result.
+                let done = match action {
+                    PromptAction::Stop { instance } => format!("stopped {instance}"),
+                    PromptAction::Rm { instance, .. } => format!("removed {instance}"),
+                    PromptAction::ServiceRebuild { name } => format!("rebuilt service {name}"),
+                    _ => format!("{label}: done"),
+                };
+                return (done, false);
             }
             let status = match result["instance"].as_str() {
                 Some(instance) if Some(instance) != named => format!("{label}: {instance} started"),
@@ -845,14 +861,15 @@ fn verb_status(action: &PromptAction, sent: Result<crate::serve::client::Streame
     }
 }
 
-/// Send `action` (`run`/`rebuild`/`start`) to devsandbox serve on a thread
-/// of its own: a connection of its own too (lazy start, as the daemon
-/// worker's), since a verb request holds its connection until answered.
-/// `output`/`progress` are dropped (the build log has them, and nothing may
-/// reach the terminal); the detached answer comes once the instance is
-/// registered, and dropping the connection then leaves the build running.
-/// Quitting the dashboard before that hangs up, which cancels it.
-fn spawn_verb(dir: &Path, action: PromptAction) -> Receiver<OpDone> {
+/// Send verb `action` to devsandbox serve on a thread of its own: a
+/// connection of its own too (lazy start, as the daemon worker's), since a
+/// verb request holds its connection until answered. `output`/`progress`
+/// are dropped (the build log has a build's, and nothing may reach the
+/// terminal). A detached verb answers once the instance is registered, and
+/// dropping the connection then leaves the build running; a held one
+/// (`stop`, `rm`, `services.rebuild`) answers when done. Quitting the
+/// dashboard before the answer hangs up, which cancels it (SIGINT).
+fn spawn_verb(dir: &Path, action: PromptAction) -> Receiver<VerbEnd> {
     let (tx, rx) = mpsc::channel();
     let root = daemon::root_dir(dir.to_path_buf());
     std::thread::spawn(move || {
@@ -862,8 +879,7 @@ fn spawn_verb(dir: &Path, action: PromptAction) -> Receiver<OpDone> {
             let mut conn = endpoint::socket_dir().and_then(|socket| client::connect(&socket, "tui"))?;
             conn.call_streaming(method, params, Duration::from_secs(1), &mut |_| true)
         });
-        let (status, failed) = verb_status(&action, sent);
-        let _ = tx.send(OpDone { status, failed });
+        let _ = tx.send(verb_end(&action, sent));
     });
     rx
 }
@@ -887,90 +903,10 @@ fn open_link(link: &str) -> std::result::Result<(), String> {
     Ok(())
 }
 
-/// Result of a background `s` stop/start, drained by the event loop.
+/// Result of a background VS Code launch, drained by the event loop.
 struct OpDone {
     /// One-line outcome for the help-bar status.
     status: String,
-    /// The op failed. Read for `spawn_start` (a thread action waiting on the
-    /// start is dropped).
-    failed: bool,
-}
-
-/// Spawn a detached thread that stops `instance` (docker stop can block ~10s on
-/// the SIGTERM timeout) and reports a one-line status back. Docker calls go
-/// through the screen-safe quiet path so stderr can't corrupt the TUI. `instance`
-/// is a snapshot row name, which equals the state instance key.
-fn spawn_stop(instance: &str) -> Receiver<OpDone> {
-    let (tx, rx) = mpsc::channel();
-    let instance = instance.to_string();
-    std::thread::spawn(move || {
-        let status = match crate::state::State::load() {
-            Ok(state) => match state.instances.get(&instance) {
-                // As the CLI's `stop`: a live run/rebuild owns the container.
-                Some(info) if let Some(why) =
-                    commands::in_flight(&instance, info.progress.as_ref(), info.phase_view().as_ref()) =>
-                {
-                    format!("stop: {why}")
-                }
-                Some(info) => {
-                    let services =
-                        commands::stop::service_containers(&info.project, &info.instance_id);
-                    commands::stop::stop_containers(&info.container, &services, true);
-                    format!("stopped {instance}")
-                }
-                None => format!("stop: unknown instance `{instance}`"),
-            },
-            Err(e) => format!("stop: {e:#}"),
-        };
-        let _ = tx.send(OpDone { status, failed: false });
-    });
-    rx
-}
-
-/// Spawn a detached thread that starts `instance`'s containers (isolated
-/// services first, then the instance) and reports a one-line status back. The
-/// bare-start path is used — no service recreation or lifecycle commands — so
-/// nothing can write to the alternate screen; docker calls go through the
-/// screen-safe quiet path. `instance` is a snapshot row name, which equals the
-/// state instance key.
-fn spawn_start(instance: &str) -> Receiver<OpDone> {
-    let (tx, rx) = mpsc::channel();
-    let instance = instance.to_string();
-    std::thread::spawn(move || {
-        let (status, failed) = match crate::state::State::load() {
-            Ok(state) => match state.instances.get(&instance) {
-                // As the CLI's `start`: not while in flight, not once failed.
-                Some(info) if let Some(why) = commands::not_ready(&instance, info.phase_view().as_ref()) => {
-                    (format!("start: {why}"), true)
-                }
-                Some(info) => {
-                    // Bare start bypasses `start_instance`, so re-point the agent
-                    // symlink here too, so a restart after host agent rotation
-                    // re-captures the live socket (docs/ssh-agent.md).
-                    commands::run::ssh_agent_refresh(info);
-                    let services =
-                        commands::stop::service_containers(&info.project, &info.instance_id);
-                    commands::start::start_containers(&info.container, &services, true);
-                    // `start_containers` ignores exit codes; whether the
-                    // instance is up decides if a waiting thread action runs.
-                    match crate::runtime::backend().is_running(&info.container) {
-                        Ok(Some(true)) => {
-                            // Reinstall the helper (no-op when current): covers CLI
-                            // upgrades and images that mount a tmpfs at `/run`.
-                            crate::devsbd::ensure_recorded(&instance, info, true);
-                            (format!("started {instance}"), false)
-                        }
-                        Ok(_) => (format!("start: {instance} did not come up (see its logs)"), true),
-                        Err(e) => (format!("start: {e:#}"), true),
-                    }
-                }
-                None => (format!("start: unknown instance `{instance}`"), true),
-            },
-            Err(e) => (format!("start: {e:#}"), true),
-        };
-        let _ = tx.send(OpDone { status, failed });
-    });
-    rx
 }
 
 
@@ -998,22 +934,23 @@ mod tests {
         }
     }
 
-    /// Each verb action's request is detached, carries the root and env,
-    /// and is what the daemon's `serve::verbs::parse` accepts.
+    /// Each verb action's request carries the root and env and is what the
+    /// daemon's `serve::verbs::parse` accepts; only `run`/`rebuild`/`start`
+    /// detach.
     #[test]
-    fn verb_calls_are_detached_requests_the_daemon_accepts() {
+    fn verb_calls_are_requests_the_daemon_accepts() {
         use crate::serve::verbs::{self, Target, Verb};
         let root = std::env::temp_dir().canonicalize().unwrap();
         let env: BTreeMap<String, String> = [("HOME".to_string(), "/home/me".to_string())].into();
-        let parse = |action: &PromptAction| {
+        let parse = |action: &PromptAction, detach: bool| {
             let (method, params) = verb_call(action, &root, env.clone()).unwrap();
             let req = verbs::parse(method, params).unwrap();
-            assert!(req.detach, "{action:?}");
+            assert_eq!(req.detach, detach, "{action:?}");
             assert_eq!((req.root.as_path(), &req.env), (root.as_path(), &env));
             req.verb
         };
         assert_eq!(
-            parse(&run_action(Some("w2"), Some("feat/x"), Some("-odd"))),
+            parse(&run_action(Some("w2"), Some("feat/x"), Some("-odd")), true),
             Verb::Run {
                 sandbox: "web".into(),
                 name: Some("w2".into()),
@@ -1023,12 +960,28 @@ mod tests {
             }
         );
         assert_eq!(
-            parse(&PromptAction::Rebuild { instance: "web-2".into(), force: true }),
+            parse(&PromptAction::Rebuild { instance: "web-2".into(), force: true }, true),
             Verb::Rebuild { target: Target::One("web-2".into()), force: true }
         );
-        assert_eq!(parse(&PromptAction::Start { instance: "web-2".into() }), Verb::Start { target: Target::One("web-2".into()) });
-        assert_eq!(verb_call(&PromptAction::Stop { instance: "web-2".into() }, &root, env.clone()), None);
-        assert_eq!(verb_call(&PromptAction::Rm { instance: "web-2".into(), force: false }, &root, env), None);
+        assert_eq!(parse(&PromptAction::Start { instance: "web-2".into() }, true), Verb::Start { target: Target::One("web-2".into()) });
+        assert_eq!(parse(&PromptAction::Stop { instance: "web-2".into() }, false), Verb::Stop { target: Target::One("web-2".into()) });
+        // An unanswered rm asks; the modal's answer goes back as
+        // `deleteBranch`, same `force`, no `ask`.
+        let rm = |force, delete_branch| PromptAction::Rm { instance: "web-2".into(), force, delete_branch };
+        assert_eq!(
+            parse(&rm(true, None), false),
+            Verb::Rm { instance: "web-2".into(), delete_branch: None, force: true, ask: true }
+        );
+        assert_eq!(
+            parse(&rm(true, Some(false)), false),
+            Verb::Rm { instance: "web-2".into(), delete_branch: Some(false), force: true, ask: false }
+        );
+        assert_eq!(
+            parse(&rm(false, Some(true)), false),
+            Verb::Rm { instance: "web-2".into(), delete_branch: Some(true), force: false, ask: false }
+        );
+        assert_eq!(parse(&PromptAction::ServiceRebuild { name: "cache".into() }, false), Verb::ServicesRebuild { name: "cache".into() });
+        assert_eq!(verb_call(&PromptAction::Exec { instance: "web-2".into(), argv: Vec::new() }, &root, env), None);
     }
 
     #[test]
@@ -1083,6 +1036,48 @@ mod tests {
             ("run web: needs devsandbox serve (cannot start devsandbox serve)".into(), true)
         );
         assert_eq!(status(&rebuild, Ok(Streamed::Lost)), "rebuild web-2: devsandbox serve went away; it keeps running");
+
+        // Held verbs: what they did; a failure quotes the verb, no build log.
+        let stop = PromptAction::Stop { instance: "web-2".into() };
+        let rm = PromptAction::Rm { instance: "web-2".into(), force: false, delete_branch: None };
+        let service = PromptAction::ServiceRebuild { name: "cache".into() };
+        let done = json!({"instance": null, "exit": 0});
+        assert_eq!(verb_status(&stop, ok(json!({"instance": "web-2", "exit": 0}))), ("stopped web-2".into(), false));
+        assert_eq!(verb_status(&rm, ok(json!({"instance": "web-2", "exit": 0}))), ("removed web-2".into(), false));
+        assert_eq!(verb_status(&service, ok(done.clone())), ("rebuilt service cache".into(), false));
+        let refused = "`web-2` has uncommitted changes; use --force";
+        assert_eq!(
+            verb_status(&rm, err("failed", refused, Some(json!({"exit": 1, "instance": "web-2"})))),
+            (format!("rm web-2 failed: {refused}"), true)
+        );
+        assert_eq!(
+            status(&service, err("failed", "no service `cache`", Some(json!({"exit": 1, "instance": null})))),
+            "service rebuild cache failed: no service `cache`"
+        );
+        assert_eq!(status(&stop, err("failed", "boom", None)), "stop web-2 failed: boom");
+    }
+
+    /// rm's `confirm` is its question for the modal, as rm words it; only an
+    /// rm that asked gets one, the rest are status lines.
+    #[test]
+    fn verb_end_turns_rms_confirm_into_its_question() {
+        use crate::serve::client::Streamed;
+        use crate::serve::proto::{ErrorBody, Response};
+        use serde_json::json;
+        let answer = |code: &str, message: &str| {
+            let error = ErrorBody { code: code.into(), message: message.into(), data: None };
+            Ok(Streamed::Answer(Response { id: Some(1), result: None, error: Some(error) }))
+        };
+        let q = "delete branch `b`? it has commits not on its remote";
+        let rm = |delete_branch| PromptAction::Rm { instance: "web-2".into(), force: false, delete_branch };
+        assert_eq!(verb_end(&rm(None), answer("confirm", q)), VerbEnd::Confirm(q.into()));
+        // Asked again after an answer: a failure, never a second modal.
+        assert_eq!(
+            verb_end(&rm(Some(true)), answer("confirm", q)),
+            VerbEnd::Done { status: format!("rm web-2 failed: {q}"), failed: true }
+        );
+        let ok = Ok(Streamed::Answer(Response { id: Some(1), result: Some(json!({"instance": "web-2", "exit": 0})), error: None }));
+        assert_eq!(verb_end(&rm(None), ok), VerbEnd::Done { status: "removed web-2".into(), failed: false });
     }
 
     #[test]

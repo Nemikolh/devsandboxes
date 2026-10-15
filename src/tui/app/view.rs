@@ -11,6 +11,7 @@ use crate::config::SandboxText;
 use crate::snapshot::PhaseRow;
 use crate::tui::data::{ContainerStatus, InstanceRow, Node};
 use crate::tui::settings::{SETTINGS, Settings};
+use crate::tui::prompt::PromptAction;
 
 use super::{App, Tab};
 
@@ -33,9 +34,9 @@ Tables (Instances / Services)
   r           run (sandbox) /   o   open in VS Code (Instances)
               rename (instance)
   s           stop / start     l   logs (Instances tab)
-              (stops running / starts exited; s-start is a bare start —
-               :start runs services + postStartCommand too; a drifted
-               exited or a failed instance is rebuilt instead)
+              (stops running / starts exited, with services and
+               postStartCommand like :start; a drifted exited or a
+               failed instance is rebuilt instead)
   b           build log of the instance (follows a build in flight;
               G sticks to the bottom again)
   p           forward a port (instance / service selection prefills the prompt)
@@ -284,17 +285,32 @@ fn build_log_title(instance: &str, phase: Option<&PhaseRow>) -> String {
     }
 }
 
-/// A yes/no question over the dashboard (`d` on an in-flight row): `y` or
-/// `enter` goes ahead, `n`/`esc`/`q` doesn't.
+/// A yes/no question over the dashboard (`d` on an in-flight row, rm's
+/// branch question): `y` or `enter` goes ahead, `n`/`esc`/`q` doesn't. For
+/// rm, `n` is an answer too (keep the branch) and only `esc`/`q` abort.
 pub struct ConfirmModal {
     pub question: String,
     action: Confirmed,
 }
 
-/// What a [`ConfirmModal`]'s yes does.
+impl ConfirmModal {
+    /// The help bar's keys for this question.
+    pub fn keys_hint(&self) -> &'static str {
+        match self.action {
+            Confirmed::CancelBuild(_) => "y/enter yes · n/esc no",
+            Confirmed::RmBranch { .. } => "y/enter yes · n no · esc cancel",
+        }
+    }
+}
+
+/// What a [`ConfirmModal`]'s answer does.
+#[derive(Clone)]
 enum Confirmed {
     /// Cancel the instance's `run`/`rebuild`/`start` (`App::pending_cancel`).
     CancelBuild(String),
+    /// Resend rm with the answer as `deleteBranch` (the CLI's
+    /// `verbs_client::with_confirm`), same `force`, no `ask`.
+    RmBranch { instance: String, force: bool },
 }
 
 /// Line count of `body`, clamped to `u16`, for scroll bounds.
@@ -538,17 +554,36 @@ impl App {
                     view.on_scroll_key(key);
                 }
             }
-            Modal::Confirm(view) => match key.code {
-                KeyCode::Char('y') | KeyCode::Enter => {
-                    let Confirmed::CancelBuild(instance) = &view.action;
-                    self.status = Some(format!("cancelling {instance}…"));
-                    self.pending_cancel = Some(instance.clone());
-                    self.modal = Modal::None;
+            Modal::Confirm(view) => {
+                let yes = match key.code {
+                    KeyCode::Char('y') | KeyCode::Enter => Some(true),
+                    KeyCode::Char('n') => Some(false),
+                    KeyCode::Esc | KeyCode::Char('q') => None,
+                    _ => return,
+                };
+                let action = view.action.clone();
+                self.modal = Modal::None;
+                match (action, yes) {
+                    (Confirmed::CancelBuild(instance), Some(true)) => {
+                        self.status = Some(format!("cancelling {instance}…"));
+                        self.pending_cancel = Some(instance);
+                    }
+                    (Confirmed::CancelBuild(_), _) => {}
+                    (Confirmed::RmBranch { instance, force }, Some(delete)) => {
+                        self.pending_action = Some(PromptAction::Rm { instance, force, delete_branch: Some(delete) });
+                    }
+                    (Confirmed::RmBranch { instance, .. }, None) => {
+                        self.status = Some(format!("rm {instance}: cancelled"));
+                    }
                 }
-                KeyCode::Char('n') | KeyCode::Esc | KeyCode::Char('q') => self.modal = Modal::None,
-                _ => {}
-            },
+            }
         }
+    }
+
+    /// rm's branch `question` for `instance` (its `confirm` answer), shown
+    /// as rm words it.
+    pub(super) fn confirm_rm_branch(&mut self, instance: String, force: bool, question: String) {
+        self.modal = Modal::Confirm(ConfirmModal { question, action: Confirmed::RmBranch { instance, force } });
     }
 
     /// Ask before cancelling `instance`'s build (`d` on an in-flight row).

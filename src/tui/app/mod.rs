@@ -36,7 +36,7 @@ pub use inbox::{
     View,
 };
 pub use forms::{form_lines, form_title, forms_offset, pinned_forms, FormSpot};
-pub use actions::PendingDone;
+pub use actions::{PendingDone, VerbEnd};
 pub use procs::{PendingSignal, Signal};
 pub use selection::{copy_key_intercepted, Extract};
 pub use view::{
@@ -143,29 +143,25 @@ pub struct App {
     pub modal: Modal,
     /// Command prompt, when open (`:`). Occupies the bottom bar and swallows keys.
     pub prompt: Option<Prompt>,
-    /// Action awaiting execution by the event loop (it owns the terminal
-    /// suspend + command call, keeping [`App`] I/O-free).
+    /// Action awaiting execution by the event loop (it sends the verb
+    /// request, or suspends for `exec`, keeping [`App`] I/O-free).
     pub pending_action: Option<PromptAction>,
     /// Appended to the status line the event loop writes after launching a
     /// [`PromptAction::Code`]: an Inbox `vscode` action's caveats (a goto it
     /// couldn't honor, the event and child done queued), which would
     /// otherwise be overwritten by the launch outcome.
     pub code_note: Option<String>,
-    /// Instance name whose stop the event loop should spawn on a background
-    /// thread (the `s` shortcut on a running instance; runs without suspending
-    /// the TUI).
-    pub pending_stop: Option<String>,
-    /// Instances with a stop in flight, so repeated `s` presses don't spawn a
-    /// second stop for the same instance. Cleared by the loop on completion.
+    /// Instances with an `s` stop request in flight, so repeated `s` presses
+    /// don't send a second one. Cleared when its answer arrives
+    /// ([`App::verb_answered`]).
     pub stopping: BTreeSet<String>,
-    /// Instance name whose start the event loop should spawn on a background
-    /// thread (the `s` shortcut on an exited instance).
-    pub pending_start: Option<String>,
-    /// Instances with a start in flight (same dedup rule as `stopping`).
+    /// Instances with a start request in flight (same dedup rule as
+    /// `stopping`).
     pub starting: BTreeSet<String>,
     /// A thread host action waiting on the start of its stopped target
-    /// (`thread_actions.rs`): run by [`App::start_finished`] once that
-    /// start succeeds, dropped if it fails. A newer such action replaces it.
+    /// (`thread_actions.rs`): run once a snapshot shows the target up
+    /// ([`App::set_snapshot`]), dropped if the start request fails. A newer
+    /// such action replaces it.
     after_start: Option<(String, thread_actions::Deferred)>,
     /// Done-flag changes the event loop should write to state on a
     /// background thread (`d`/`u` on an instance row, and a thread's child
@@ -290,9 +286,7 @@ impl App {
             prompt: None,
             pending_action: None,
             code_note: None,
-            pending_stop: None,
             stopping: BTreeSet::new(),
-            pending_start: None,
             starting: BTreeSet::new(),
             after_start: None,
             pending_signal: None,
@@ -351,6 +345,7 @@ impl App {
         self.snapshot = Some(snapshot);
         self.clamp_selection();
         self.refresh_build_log();
+        self.run_after_start();
     }
 
     /// Install the forwarder's latest rows and re-clamp the Ports selection in
