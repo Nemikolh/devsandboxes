@@ -29,6 +29,7 @@ import {
   playing,
   portCells,
   reduce,
+  removeHint,
   runRenameHint,
   sandboxCells,
   selectedName,
@@ -124,7 +125,10 @@ export function mountMiniTui(root: HTMLElement, opts: MiniTuiOptions = {}): Mini
   const promptHint = one('[data-tui-prompt-hint]');
   const suspended = one('[data-tui-suspended]');
   const suspendedOut = one('[data-tui-suspended-lines]');
-  const suspendedReturn = one('[data-tui-suspended-return]');
+  const confirm = one('[data-tui-confirm]');
+  const confirmQuestion = one('[data-tui-confirm-question]');
+  /** Pending `built` timers per building row, dropped when the row goes first (a cancelled `run`). */
+  const builds = new Map<string, number>();
 
   // Writes only (the row lists are rebuilt: a handful of nodes); the one
   // layout read, keeping the selected row in view, waits for a frame.
@@ -161,6 +165,7 @@ export function mountMiniTui(root: HTMLElement, opts: MiniTuiOptions = {}): Mini
     renderPorts(s);
     if (helpOverlay) helpOverlay.hidden = !s.help;
     renderViews(s);
+    renderConfirm(s);
     renderTerms(s);
     renderBars(s);
     renderHint(s);
@@ -203,6 +208,13 @@ export function mountMiniTui(root: HTMLElement, opts: MiniTuiOptions = {}): Mini
     }
   }
 
+  /** The Confirm question, over the dashboard like the help overlay. */
+  function renderConfirm(s: State) {
+    const m = s.modal;
+    if (confirm) confirm.hidden = m?.kind !== 'confirm';
+    if (m?.kind === 'confirm' && confirmQuestion) confirmQuestion.textContent = m.question;
+  }
+
   /** The hint bar for the mode (or the prompt in its place), and the suspended screen. */
   function renderBars(s: State) {
     const mode = helpMode(s);
@@ -211,6 +223,7 @@ export function mountMiniTui(root: HTMLElement, opts: MiniTuiOptions = {}): Mini
     for (const el of all('[data-tui-terms-hint]')) el.hidden = s.terms.length === 0;
     for (const el of all('[data-tui-verb="s"]')) el.textContent = stopStartHint(s);
     for (const el of all('[data-tui-verb="r"]')) el.textContent = runRenameHint(s);
+    for (const el of all('[data-tui-verb="d"]')) el.textContent = removeHint(s);
     const p = s.prompt;
     if (p && promptInput && promptHint) {
       promptInput.textContent = p.input;
@@ -228,12 +241,7 @@ export function mountMiniTui(root: HTMLElement, opts: MiniTuiOptions = {}): Mini
       }
     }
     if (suspended) suspended.hidden = !s.suspended;
-    if (s.suspended && suspendedOut && suspendedReturn) {
-      const lines = suspendedLines(s.suspended).map(div);
-      if (s.suspended.confirm) lines.at(-1)?.append(span('tui-cursor', ''));
-      suspendedOut.replaceChildren(...lines);
-      suspendedReturn.hidden = Boolean(s.suspended.confirm);
-    }
+    if (s.suspended && suspendedOut) suspendedOut.replaceChildren(...suspendedLines(s.suspended).map(div));
   }
 
   function setText(scope: HTMLElement, sel: string, text: string) {
@@ -305,8 +313,20 @@ export function mountMiniTui(root: HTMLElement, opts: MiniTuiOptions = {}): Mini
     for (const fn of listeners) fn(state, prev);
     // A background `run` just started: it finishes on its own, like the real one.
     for (const i of state.instances) {
-      if (i.status === 'building' && !prev.instances.some((p) => p.name === i.name && p.status === 'building')) {
-        window.setTimeout(() => dispatch({ type: 'built', name: i.name }, false), BUILD_MS);
+      if (i.status === 'building' && !builds.has(i.name)) {
+        const timer = window.setTimeout(() => {
+          builds.delete(i.name);
+          dispatch({ type: 'built', name: i.name }, false);
+        }, BUILD_MS);
+        builds.set(i.name, timer);
+      }
+    }
+    // One that stopped building early (cancelled, or a host's `setState`):
+    // its timer must not finish a later row of the same name.
+    for (const [name, timer] of builds) {
+      if (!state.instances.some((i) => i.name === name && i.status === 'building')) {
+        window.clearTimeout(timer);
+        builds.delete(name);
       }
     }
     if (state.message && state.message !== prev.message) {
@@ -400,7 +420,7 @@ export function mountMiniTui(root: HTMLElement, opts: MiniTuiOptions = {}): Mini
       root.focus({ preventScroll: true });
       // Like the real mouse routing: a click on the pane focuses it (a tab title
       // also activates that tab), a click elsewhere hands focus back. On the
-      // suspended screen a click is "any key" (the rm question wants y or n).
+      // suspended screen a click is "any key".
       if (state.suspended) dispatch({ type: 'key', key: ' ' }, true);
       else if (inTerm) dispatch({ type: 'focus', focus: 'terminal', term: termTab === undefined ? undefined : Number(termTab) }, true);
       else if (key) {

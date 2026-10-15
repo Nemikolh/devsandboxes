@@ -24,6 +24,7 @@ export const REGIONS = [
   'help',
   'logs',
   'config',
+  'confirm',
   'suspended',
   'status',
 ] as const;

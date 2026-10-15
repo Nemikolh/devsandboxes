@@ -30,10 +30,10 @@ import {
   instanceCells,
   logsTitle,
   portCells,
+  removeHint,
   runRenameHint,
   SANDBOX_ROW,
   stopStartHint,
-  suspendedLines,
   totalsLine,
   usedBy,
 } from './mini-tui';
@@ -444,7 +444,44 @@ describe(': prompt', () => {
     expect(command(s, 'start web-4').message).toBe(
       'start web-4 failed: `web-4` is still building (b on web-4 opens its build log)',
     );
-    expect(command(s, 'stop web-4').suspended?.lines[0]).toBe('error: `web-4` is still building');
+    expect(command(s, 'stop web-4').message).toBe(
+      'stop web-4 failed: `web-4` is still building (pid 48213): wait for it, or Ctrl-C it',
+    );
+    expect(command(s, 'rm web-4').message).toBe(
+      'rm web-4 failed: `web-4` is still building (pid 48213): wait for it, or Ctrl-C it',
+    );
+    expect(names(command(s, 'rm web-4'))).toContain('web-4');
+  });
+
+  it('d on a building row asks to cancel it; y rolls the run back', () => {
+    const s = keys(command(STATIC, 'run web'), 'j', 'j', 'j');
+    expect(removeHint(s)).toBe('cancel');
+    const asking = keys(s, 'd');
+    expect(asking.modal).toEqual({
+      kind: 'confirm',
+      question: "cancel web-4's build?",
+      action: { type: 'cancelBuild', instance: 'web-4' },
+    });
+    expect(helpMode(asking)).toBe('confirm-cancel');
+    expect(hintFor(asking, true).text).toBe('Y OR N ANSWERS');
+    for (const k of ['y', 'n', 'q', 'Enter', 'Escape']) expect(isHandledKey(asking, k)).toBe(true);
+    for (const k of ['Tab', 'j', 's', ' ']) expect(isHandledKey(asking, k)).toBe(false);
+    // Other keys neither answer nor reach the dashboard.
+    expect(keys(asking, 'j', 's', 'x')).toEqual(asking);
+    const yes = keys(asking, 'y');
+    expect(yes.modal).toBeNull();
+    expect(yes.message).toBe('cancelling web-4…');
+    expect(names(yes)).toEqual(['web', 'web-2', 'web-3']);
+    expect(names(keys(asking, 'Enter'))).toEqual(['web', 'web-2', 'web-3']);
+    // A late `built` for the rolled-back row changes nothing.
+    expect(run(yes, { type: 'built', name: 'web-4' })).toBe(yes);
+    for (const k of ['n', 'Escape', 'q']) {
+      const no = keys(asking, k);
+      expect(no.modal, k).toBeNull();
+      expect(inst(no, 'web-4')?.status, k).toBe('building');
+    }
+    expect(announce(s, asking)).toBe("cancel web-4's build? y or Enter yes, n or Escape no.");
+    expect(announce(asking, yes)).toBe('cancelling web-4…');
   });
 
   it('run names like the real one: --name, the sandbox name when free, errors', () => {
@@ -459,56 +496,88 @@ describe(': prompt', () => {
       'run api failed: unknown sandbox `api` (b on its row opens the build log)',
     );
     // With `web` removed the base checkout is free again: `run web` takes it back.
-    const freed = back(command(STATIC, 'rm web'));
+    const freed = command(STATIC, 'rm web');
     const again = command(freed, 'run web');
     expect(inst(again, 'web')).toMatchObject({ worktree: false, status: 'building' });
   });
 
-  it('stop suspends, start runs in the background', () => {
+  it('stop and start run in the background, the dashboard stays', () => {
     const stopped = command(STATIC, 'stop web-2');
-    expect(stopped.suspended?.lines).toEqual(['stopped web-2']);
+    expect(stopped.suspended).toBeNull();
+    expect(stopped.message).toBe('stopped web-2');
     expect(inst(stopped, 'web-2')?.status).toBe('exited');
     expect(stopped.agents['web-2']).toBe('stopped');
-    const started = command(back(stopped), 'start web-2');
+    const started = command(stopped, 'start web-2');
     expect(started.suspended).toBeNull();
     expect(started.message).toBe('start web-2: done');
     expect(inst(started, 'web-2')?.status).toBe('running');
-    expect(command(STATIC, 'stop nope').suspended?.lines[0]).toBe(
-      'error: no sandbox instance matches `nope` (see `devsandbox ps -a`)',
+    // A held verb's failure has no build log to point at.
+    expect(command(STATIC, 'stop nope').message).toBe(
+      'stop nope failed: no sandbox instance matches `nope` (see `devsandbox ps -a`)',
     );
     expect(command(STATIC, 'start nope').message).toBe(
       'start nope failed: no sandbox instance matches `nope` (see `devsandbox ps -a`) (b on nope opens its build log)',
     );
   });
 
-  it('rm asks about a worktree branch first, y / n / Enter answer', () => {
+  it('rm asks about a worktree branch in a Confirm modal; y / Enter / n answer, esc / q cancel', () => {
     const asking = command(STATIC, 'rm web-2');
     expect(names(asking)).toContain('web-2');
-    expect(suspendedLines(asking.suspended!)).toEqual(['delete branch `sandbox/web-2`? [y/N] ']);
+    expect(asking.suspended).toBeNull();
+    expect(asking.modal).toEqual({
+      kind: 'confirm',
+      question: 'delete branch `sandbox/web-2`? it has commits not on its remote',
+      action: { type: 'rmBranch', instance: 'web-2' },
+    });
+    expect(helpMode(asking)).toBe('confirm-rm');
     expect(isHandledKey(asking, 'y')).toBe(true);
-    expect(keys(asking, 'x', 'q')).toEqual(asking);
-    const yes = keys(asking, 'y');
-    expect(yes.suspended?.lines).toEqual([
-      'delete branch `sandbox/web-2`? [y/N] y',
-      'Deleted branch sandbox/web-2 (was 3f9c21a).',
-      'removed web-2',
-    ]);
-    expect(names(yes)).toEqual(['web', 'web-3']);
-    expect(keys(asking, 'Enter').suspended?.lines).toEqual(['delete branch `sandbox/web-2`? [y/N] ', 'removed web-2']);
-    expect(back(yes).suspended).toBeNull();
+    expect(keys(asking, 'x', 's', 'j')).toEqual(asking);
+    for (const k of ['y', 'Enter', 'n']) {
+      const answered = keys(asking, k);
+      expect(answered.modal, k).toBeNull();
+      expect(answered.message, k).toBe('removed web-2');
+      expect(names(answered), k).toEqual(['web', 'web-3']);
+    }
+    for (const k of ['Escape', 'q']) {
+      const cancelled = keys(asking, k);
+      expect(cancelled.modal, k).toBeNull();
+      expect(cancelled.message, k).toBe('rm web-2: cancelled');
+      expect(names(cancelled), k).toEqual(['web', 'web-2', 'web-3']);
+    }
+    expect(announce(STATIC, asking)).toBe(
+      'delete branch `sandbox/web-2`? it has commits not on its remote y or Enter yes, n no, Escape cancels.',
+    );
+    expect(announce(asking, keys(asking, 'y'))).toBe('removed web-2');
     // The base checkout has no branch of its own to offer.
-    expect(command(STATIC, 'rm web').suspended?.lines).toEqual(['removed web']);
+    const base = command(STATIC, 'rm web');
+    expect(base.modal).toBeNull();
+    expect(base.message).toBe('removed web');
+    expect(names(base)).toEqual(['web-2', 'web-3']);
+    expect(command(STATIC, 'rm nope').message).toBe(
+      'rm nope failed: no sandbox instance matches `nope` (see `devsandbox ps -a`)',
+    );
+  });
+
+  it('d on an instance row is rm, no prompt', () => {
+    expect(removeHint(STATIC)).toBe('rm');
+    expect(keys(STATIC, 'd').message).toBe('removed web');
+    expect(keys(STATIC, 'j', 'd').modal).toMatchObject({ kind: 'confirm', action: { type: 'rmBranch', instance: 'web-2' } });
+    expect(names(keys(STATIC, 'j', 'd', 'n'))).toEqual(['web', 'web-3']);
+    // Nothing on the sandbox row, or off the Instances / Ports tabs.
+    const row = run(STATIC, { type: 'selectSandbox' });
+    expect(keys(row, 'd')).toBe(row);
+    expect(keys(STATIC, '2', 'd').instances).toBe(STATIC.instances);
   });
 
   it('rm keeps the cursor on its row, drops VS Code, terminals and forwards on it', () => {
-    const setup = back(command(keys(STATIC, 'j', 'o', 't', 'Escape'), 'port web-2 3000'));
+    const setup = command(keys(STATIC, 'j', 'o', 't', 'Escape'), 'port web-2 3000');
     const gone = keys(command(setup, 'rm web-2'), 'n');
     expect(gone.vscode).toBeNull();
     expect(gone.ports).toEqual([]);
     expect(gone.terms.map((t) => t.exited)).toEqual([true]);
     expect(selectedName(gone)).toBe('web-3');
-    const last = back(keys(command(back(command(STATIC, 'rm web')), 'rm web-2'), 'n'));
-    const empty = back(keys(command(last, 'rm web-3'), 'n'));
+    const last = keys(command(command(STATIC, 'rm web'), 'rm web-2'), 'n');
+    const empty = keys(command(last, 'rm web-3'), 'n');
     expect(empty.instances).toEqual([]);
     expect(empty.selected).toBe(SANDBOX_ROW);
   });
@@ -520,6 +589,7 @@ describe(': prompt', () => {
     expect(command(STATIC, 'code nope').message).toBe('code: unknown instance `nope`');
     expect(command(STATIC, 'exec web-2 git status').suspended?.lines[0]).toBe('On branch sandbox/web-2');
     expect(command(STATIC, 'exec web pwd').suspended?.lines).toEqual(['/workspaces/web']);
+    expect(back(command(STATIC, 'exec web pwd')).suspended).toBeNull();
     expect(command(STATIC, 'rename web-2 api').message).toBe('rename is not in this preview');
     expect(command(STATIC, 'rebuild web').message).toBe('rebuild is not in this preview');
   });
@@ -579,13 +649,13 @@ describe('stop / start (s)', () => {
     expect(stopStartHint(stopped)).toBe('start');
     const started = keys(stopped, 's');
     expect(inst(started, 'web-2')?.status).toBe('running');
-    expect(started.message).toBe('started web-2');
+    expect(started.message).toBe('start web-2: done');
     expect(started.agents['web-2']).toBe('idle');
     expect(stopStartHint(started)).toBe('stop');
   });
 
   it('a stopped instance shows it: status, agents, terminal, forwards', () => {
-    const setup = back(command(keys(STATIC, 'j', 't', 'Escape'), 'port web-2 3000'));
+    const setup = command(keys(STATIC, 'j', 't', 'Escape'), 'port web-2 3000');
     const stopped = keys(setup, '1', 's');
     expect(instanceCells(stopped, inst(stopped, 'web-2')!).map(text)).toEqual([
       '  web-2',
@@ -704,7 +774,7 @@ describe('config explorer (enter)', () => {
     expect(inspectLines(s, s.modal)).toContain('    "Name": "/devsandbox-web",');
     const row = keys(run(keys(STATIC, 's'), { type: 'selectSandbox' }), 'Enter');
     expect(row.modal).toMatchObject({ container: 'devsandbox-web-2' });
-    const none = back(command(back(command(back(command(STATIC, 'stop web')), 'stop web-2')), 'stop web-3'));
+    const none = command(command(command(STATIC, 'stop web'), 'stop web-2'), 'stop web-3');
     const empty = keys(run(none, { type: 'selectSandbox' }), 'Enter');
     if (empty.modal?.kind !== 'config') throw new Error('config');
     expect(inspectLines(empty, empty.modal)).toEqual(['(no running instance)']);
@@ -721,8 +791,8 @@ describe('config explorer (enter)', () => {
 });
 
 describe('step 3 plumbing', () => {
-  it('clicks do nothing under a prompt, a view or the suspended screen', () => {
-    for (const s of [keys(STATIC, ':'), keys(STATIC, 'l'), command(STATIC, 'stop web')]) {
+  it('clicks do nothing under a prompt, a view, a question or the suspended screen', () => {
+    for (const s of [keys(STATIC, ':'), keys(STATIC, 'l'), keys(STATIC, 'j', 'd'), command(STATIC, 'exec web pwd')]) {
       expect(run(s, { type: 'select', name: 'web-3' })).toBe(s);
       expect(run(s, { type: 'tab', tab: 'ports' })).toBe(s);
       expect(run(s, { type: 'selectSandbox' })).toBe(s);
@@ -733,7 +803,7 @@ describe('step 3 plumbing', () => {
     const logs = keys(STATIC, 'l');
     for (const k of ['j', 'k', 'g', 'G', 'q', 'Escape', 't']) expect(isHandledKey(logs, k)).toBe(true);
     expect(isHandledKey(logs, 'Tab')).toBe(false);
-    const sus = command(STATIC, 'stop web');
+    const sus = command(STATIC, 'exec web pwd');
     expect(isHandledKey(sus, 'x')).toBe(true);
     expect(isHandledKey(sus, 'Tab')).toBe(false);
   });
@@ -744,8 +814,10 @@ describe('step 3 plumbing', () => {
     expect(helpMode(keys(STATIC, 'Enter'))).toBe('config');
     expect(helpMode(keys(STATIC, '?'))).toBe('help');
     expect(hintFor(keys(STATIC, ':'), true).text).toBe('TAB COMPLETES · ESC CANCELS');
-    expect(hintFor(command(STATIC, 'stop web'), true).text).toBe('ANY KEY RETURNS');
+    expect(helpMode(command(STATIC, 'rm web-2'))).toBe('confirm-rm');
+    expect(hintFor(command(STATIC, 'exec web pwd'), true).text).toBe('ANY KEY RETURNS');
     expect(hintFor(command(STATIC, 'rm web-2'), true).text).toBe('Y OR N ANSWERS');
+    expect(hintFor(command(STATIC, 'stop web'), true)).toEqual({ kind: 'message', text: 'stopped web' });
     expect(hintFor(keys(STATIC, 'l'), true).text).toBe('ESC CLOSES · TAB LEAVES');
   });
 
@@ -761,7 +833,8 @@ describe('step 3 plumbing', () => {
     const open = keys(STATIC, ':', 'r', 'u');
     expect(announce(open, keys(open, 'Tab'))).toBe('run');
     expect(announce(open, keys(open, 'Enter'))).toMatch(/^unknown command `ru`/);
-    expect(announce(STATIC, command(STATIC, 'stop web'))).toBe('stopped web. Press any key to return.');
+    expect(announce(STATIC, command(STATIC, 'exec web pwd'))).toBe('/workspaces/web. Press any key to return.');
+    expect(announce(STATIC, command(STATIC, 'stop web'))).toBe('stopped web');
     expect(announce(STATIC, keys(STATIC, 'l'))).toBe('logs — devsandbox-web (last 50). Escape closes.');
     const cfg = keys(STATIC, 'Enter');
     expect(announce(cfg, keys(cfg, 't'))).toBe('Showing resolved');

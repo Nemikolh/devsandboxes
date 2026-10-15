@@ -163,6 +163,17 @@
   line-height: 1.5;
 }
 
+/* `draw_confirm_modal`: a small centred box, the question over `[y] yes  [n] no`. */
+.tui-confirm {
+  inset: 50% auto auto 50%;
+  transform: translate(-50%, -50%);
+  width: max-content;
+  max-width: calc(100% - 4ch);
+  padding: 10px 3ch 8px;
+  text-align: center;
+  white-space: pre-wrap;
+}
+
 .tui-inbox-empty {
   display: block;
   padding: 0 0.5ch;

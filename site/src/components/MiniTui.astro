@@ -7,7 +7,7 @@
  * which drives the `data-tui-*` hooks and reports state changes to the host
  * (the landing diagram, a docs tutorial). Every part a host may point at
  * carries `data-tui-region` (tabs, instances, detail, services, ports, inbox,
- * terminal, prompt, hints, help, logs, config, suspended, status).
+ * terminal, prompt, hints, help, logs, config, confirm, suspended, status).
  */
 import { SquareTerminal } from '@lucide/astro';
 import {
@@ -71,6 +71,7 @@ const dashHints: {
   { caps: [cap('l', 'l')], text: 'logs', tabs: 'instances', wide: true },
   { caps: [cap('b', 'b')], text: 'build log', tabs: 'instances', wide: true },
   { caps: [cap('p', 'p')], text: 'forward', tabs: 'instances', wide: true },
+  { caps: [cap('d', 'd')], text: 'rm', tabs: 'instances', verb: 'd', wide: true },
   { caps: [cap('p', 'p')], text: 'forward', tabs: 'services' },
   { caps: [cap('d', 'd')], text: 'stop forward', tabs: 'ports' },
   { caps: [cap('t', 't')], text: 'term', tabs: 'instances' },
@@ -95,7 +96,8 @@ const dashHints: {
     interactive && (
       <p class="visually-hidden" id={keysId}>
         Arrow keys or j and k select an instance, o opens it in VS Code, Escape closes VS Code, t opens a terminal on it,
-        s stops or starts it, l shows its logs, b its build log, p forwards a port, Enter opens the config explorer, colon opens the
+        s stops or starts it, d removes it (or cancels its build), l shows its logs, b its build log, p forwards a port, Enter
+        opens the config explorer, colon opens the
         command prompt where Tab completes and Escape cancels, left and right arrows or 1 to 4 switch tabs, question
         mark shows help. In a terminal, keys go to the shell and Escape returns to the dashboard; square brackets switch
         terminals and x closes one. Tab leaves the preview.
@@ -260,6 +262,7 @@ const dashHints: {
           <dt>l</dt><dd>logs (Instances)</dd>
           <dt>b</dt><dd>build log (Instances)</dd>
           <dt>p</dt><dd>forward a port</dd>
+          <dt>d</dt><dd>rm / cancel build (Instances)</dd>
           <dt>d</dt><dd>stop forward (Ports)</dd>
           <dt>t</dt><dd>open terminal</dd>
           <dt>[ / ]</dt><dd>prev / next terminal</dd>
@@ -273,6 +276,12 @@ const dashHints: {
           <span class="tui-accent">t</span> toggles original / resolved.
         </p>
         <p class="tui-dim">esc or ? to close</p>
+      </div>
+
+      {/* A yes/no question over the dashboard (`draw_confirm_modal`): rm's branch question, cancelling a build. */}
+      <div class="tui-modal tui-confirm" data-tui-confirm data-tui-region="confirm" role="alertdialog" hidden>
+        <div data-tui-confirm-question></div>
+        <div class="tui-dim">{'[y] yes  [n] no'}</div>
       </div>
     </div>
 
@@ -339,6 +348,23 @@ const dashHints: {
       </span>
       <span class="tui-hint"><button type="button" tabindex="-1" class="tui-key" data-key="Escape">esc</button> close</span>
     </div>
+    {/* `ConfirmModal::keys_hint`: rm's question (n keeps the branch, esc aborts), then a build's cancel. */}
+    <div class="tui-help" data-tui-help="confirm-rm" data-tui-region="hints" hidden>
+      <span class="tui-hint"><button type="button" tabindex="-1" class="tui-key" data-key="y">y</button>/enter yes</span>
+      <span class="tui-hint"><button type="button" tabindex="-1" class="tui-key" data-key="n">n</button> no</span>
+      <span class="tui-hint"><button type="button" tabindex="-1" class="tui-key" data-key="Escape">esc</button> cancel</span>
+    </div>
+    <div class="tui-help" data-tui-help="confirm-cancel" data-tui-region="hints" hidden>
+      <span class="tui-hint"><button type="button" tabindex="-1" class="tui-key" data-key="y">y</button>/enter yes</span>
+      <span class="tui-hint">
+        <button type="button" tabindex="-1" class="tui-key" data-key="n">n</button>/<button
+          type="button"
+          tabindex="-1"
+          class="tui-key"
+          data-key="Escape">esc</button
+        > no
+      </span>
+    </div>
     <div class="tui-help" data-tui-help="help" data-tui-region="hints" hidden>
       <span class="tui-hint">
         <button type="button" tabindex="-1" class="tui-key" data-key="Escape">esc</button> / ? close
@@ -350,7 +376,7 @@ const dashHints: {
       <div class="tui-prompt-hint" data-tui-prompt-hint></div>
     </div>
 
-    {/* A suspending command (`run_suspended` in `src/tui/mod.rs`): the dashboard is gone until a key. */}
+    {/* `exec`, the one suspending command (`run_suspended` in `src/tui/mod.rs`): the dashboard is gone until a key. */}
     <div class="tui-suspended" data-tui-suspended data-tui-region="suspended" hidden>
       <div class="tui-dim">you@laptop:~/sandboxes$ devsandbox</div>
       <div data-tui-suspended-lines></div>

@@ -17,12 +17,14 @@
  *   fake shell either, for the same leave-the-widget reason.
  * - The sandbox row (`▾ web`) is selected by clicking it; ↑ stops at the first
  *   instance. `r` there prefills `run web `, like the real one.
- * - Background work (`s`, `:start`, forwards) lands at once, with the message
- *   the real one shows when it finishes. `:run` runs in the background like
- *   the real one: its row shows `building` until a `built` event (the driver
- *   sends it after a pause) makes it `running`. Commands that suspend the
- *   real dashboard (`rm`, `stop`, `exec`) show their output in a "suspended"
- *   overlay until a key is pressed, as the real one waits for one.
+ * - Background work (`s`, `:start`, `:stop`, `:rm`, `d`, forwards) lands at
+ *   once, with the message the real one shows when it finishes. `:run` runs
+ *   in the background like the real one: its row shows `building` until a
+ *   `built` event (the driver sends it after a pause) makes it `running`.
+ *   Questions (rm's branch, cancelling a build) are a Confirm modal over the
+ *   dashboard, like the real one's. `exec`, the one command that suspends the
+ *   real dashboard, shows its output in a "suspended" overlay until a key is
+ *   pressed, as the real one waits for one.
  *
  * No DOM here: `reduce` is a plain function over plain data (unit-tested).
  */
@@ -149,8 +151,21 @@ export interface Forward {
   instance: Instance;
 }
 
-/** The full-body views (`Modal::Logs`, the build log, `Modal::Config`); help stays its own flag. */
+/** What a Confirm modal's answer does (`Confirmed` in `src/tui/app/view.rs`). */
+export type Confirmed =
+  /** `d` on an in-flight row: cancel its `run`. */
+  | { type: 'cancelBuild'; instance: Instance }
+  /** rm's branch question: resend with the answer. */
+  | { type: 'rmBranch'; instance: Instance };
+
+/**
+ * The full-body views (`Modal::Logs`, the build log, `Modal::Config`) and the
+ * small Confirm question drawn over the dashboard (`Modal::Confirm`); help
+ * stays its own flag.
+ */
 export type Modal =
+  /** A yes/no question (`ConfirmModal`, drawn by `draw_confirm_modal`). */
+  | { kind: 'confirm'; question: string; action: Confirmed }
   | { kind: 'logs'; name: Instance; scroll: number }
   /** `b`: the instance's build log, shown in the logs pane. */
   | { kind: 'build'; name: Instance; scroll: number }
@@ -165,13 +180,12 @@ export type Modal =
     };
 
 /**
- * A command that suspends the real dashboard: it leaves the alternate screen,
- * the command prints, then "press any key to return" (`run_suspended` in
- * `src/tui/mod.rs`). `confirm` is `rm`'s branch question, answered first.
+ * `exec`, the command that suspends the real dashboard: it leaves the
+ * alternate screen, the command prints, then "press any key to return"
+ * (`run_suspended` in `src/tui/mod.rs`).
  */
 export interface Suspended {
   lines: readonly string[];
-  confirm: { instance: Instance; branch: string } | null;
 }
 
 /** What each agent has touched (web-3's agent is done and committed). */
@@ -281,18 +295,21 @@ export const TIMELINE: readonly { after: number; event: Event }[] = [
 
 const DASHBOARD_KEYS = /^(Arrow(Up|Down|Left|Right)|[jkotqx?1-4[\]:prlsdeb]|Enter|Escape|F12)$/;
 const VIEW_KEYS = /^(Arrow(Up|Down)|Page(Up|Down)|[jkgGtq?]|Escape)$/;
+/** The Confirm modal's answers; it swallows the rest, here they stay the page's. */
+const CONFIRM_KEYS = /^([ynq]|Enter|Escape)$/;
 
 /**
  * Keys `reduce` knows in state `s` (the DOM layer only forwards and swallows
  * these). A focused terminal takes every key but Tab, so typing never scrolls
  * the page or triggers the dashboard; the open prompt takes every key,
  * Tab included (it completes; Esc closes the prompt first); a suspended
- * command takes any key but Tab. Modified keys are filtered by the DOM layer
- * before this (apart from ctrl-]).
+ * command takes any key but Tab; a Confirm question only its answers.
+ * Modified keys are filtered by the DOM layer before this (apart from ctrl-]).
  */
 export function isHandledKey(s: State, key: string): boolean {
   if (s.suspended) return key !== 'Tab';
   if (s.prompt) return true;
+  if (s.modal?.kind === 'confirm') return CONFIRM_KEYS.test(key);
   if (s.help || s.modal) return VIEW_KEYS.test(key);
   if (s.focus === 'terminal') return key !== 'Tab';
   return DASHBOARD_KEYS.test(key) || key === CTRL_BRACKET;
@@ -304,7 +321,7 @@ export function keycapFor(key: string): string | null {
   if (key === 'ArrowDown' || key === 'j') return 'ArrowDown';
   if (key === 'ArrowLeft' || key === 'ArrowRight' || key === 'Tab') return 'Tab';
   if (key === 'Escape' || key === 'F12' || key === CTRL_BRACKET) return 'Escape';
-  if ('otx[]?:srlpdegGb'.includes(key) && key.length === 1) return key;
+  if ('otx[]?:srlpdegGbyn'.includes(key) && key.length === 1) return key;
   return null;
 }
 
@@ -468,7 +485,7 @@ function removeInstance(s: State, name: Instance): State {
   };
 }
 
-/** Where the real one logs a failed suspended command (`log_error`). */
+/** Where the real one logs a failed `exec` (`log_error`, after `run_suspended`). */
 const errorLines = (verb: string, e: string): string[] => [
   `error: ${e}`,
   `logged to /home/you/.local/share/devsandbox/logs/${verb}-1790690400.log`,
@@ -479,7 +496,13 @@ const noMatch = (name: string) => `no sandbox instance matches \`${name}\` (see 
 /** `not_ready` in `src/commands/mod.rs`, for a row whose `run` is still going. */
 const stillBuilding = (name: string) => `\`${name}\` is still building`;
 
-const suspend = (s: State, lines: string[]): State => ({ ...s, suspended: { lines, confirm: null } });
+/** The pid of an in-flight `run` here (the real one names its verb subprocess). */
+const RUN_PID = 48213;
+
+/** `in_flight` in `src/commands/mod.rs`: why `stop` / `rm` refuse a row whose `run` is still going. */
+const inFlight = (name: string) => `\`${name}\` is still building (pid ${RUN_PID}): wait for it, or Ctrl-C it`;
+
+const suspend = (s: State, lines: string[]): State => ({ ...s, suspended: { lines } });
 
 /**
  * A verb request's failure on the status line (`verb_status` in
@@ -487,6 +510,9 @@ const suspend = (s: State, lines: string[]): State => ({ ...s, suspended: { line
  */
 const buildFailed = (label: string, name: string | null | undefined, e: string): string =>
   `${label} failed: ${e} (${name ? `b on ${name} opens its` : 'b on its row opens the'} build log)`;
+
+/** A held verb's (`stop`, `rm`) failure, `verb_status` again: no build log to point at. */
+const heldFailed = (label: string, e: string): string => `${label} failed: ${e}`;
 
 /**
  * `run <sandbox>`: sent to devsandbox serve, detached (`spawn_verb`), so
@@ -525,32 +551,64 @@ function built(s: State, name: Instance): State {
   return { ...next, agents: { ...s.agents, [name]: 'idle' }, message: `${run ?? `run ${SANDBOX}`}: done` };
 }
 
-/** `rm`: a worktree instance asks about its branch first (`rm` in `src/commands/rm.rs`). */
+/** `question` in `src/commands/rm.rs`: what rm asks before deleting a branch with local-only work. */
+export const rmBranchQuestion = (branch: string): string =>
+  `delete branch \`${branch}\`? it has commits not on its remote`;
+
+/** `confirm_cancel_build` in `src/tui/app/view.rs`. */
+export const cancelQuestion = (name: Instance): string => `cancel ${name}'s build?`;
+
+/**
+ * `rm` (`:rm`, `d`): a verb request sent with `ask`, the dashboard stays up
+ * (`verb_call` in `src/tui/mod.rs`). The real rm deletes a branch whose
+ * commits are all on its remote (or whose remote is gone) without asking
+ * and only asks about local-only work (`branch_action` in
+ * `src/commands/rm.rs`); the demo's `sandbox/<name>` branches were never
+ * pushed, so every worktree instance asks, as a Confirm modal (rm's
+ * `confirm` answer, `verb_end`). The base checkout has no branch of its own.
+ */
 function rmInstance(s: State, name: Instance): State {
+  const label = `rm ${name}`;
   const inst = findInst(s, name);
-  if (!inst) return suspend(s, errorLines('rm', noMatch(name)));
-  if (inst.worktree) return { ...s, suspended: { lines: [], confirm: { instance: name, branch: branchOf(inst) } } };
-  return suspend(removeInstance(s, name), [`removed ${name}`]);
+  if (!inst) return { ...s, message: heldFailed(label, noMatch(name)) };
+  if (inst.status === 'building') return { ...s, message: heldFailed(label, inFlight(name)) };
+  if (inst.worktree) {
+    // `verb_answered` clears the pending status for the question.
+    const question = rmBranchQuestion(branchOf(inst));
+    return { ...s, modal: { kind: 'confirm', question, action: { type: 'rmBranch', instance: name } }, message: null };
+  }
+  return { ...removeInstance(s, name), message: `removed ${name}` };
 }
 
-export const confirmQuestion = (branch: string): string => `delete branch \`${branch}\`? [y/N] `;
+/**
+ * `y` on `cancel x's build?`: the real one sends `instances.cancel` and the
+ * `run` rolls back, so the row goes (here at once). A cancelled `rebuild`
+ * would leave the row `failed`, but `rebuild` isn't in this preview, so an
+ * in-flight row here is always a `run`.
+ */
+function cancelBuild(s: State, name: Instance): State {
+  return { ...removeInstance(s, name), message: `cancelling ${name}…` };
+}
 
-/** A key on the suspended screen: `rm`'s y/N first, then any key returns. */
-function suspendedKey(s: State, key: string): State {
-  const sus = s.suspended;
-  if (!sus) return s;
-  if (!sus.confirm) return { ...s, suspended: null };
-  const { instance, branch } = sus.confirm;
-  const yes = key === 'y' || key === 'Y';
-  if (!yes && key !== 'n' && key !== 'N' && key !== 'Enter') return s;
-  const answer = key === 'Enter' ? '' : key;
-  const lines = [
-    ...sus.lines,
-    confirmQuestion(branch) + answer,
-    ...(yes ? [`Deleted branch ${branch} (was 3f9c21a).`] : []),
-    `removed ${instance}`,
-  ];
-  return { ...removeInstance(s, instance), suspended: { lines, confirm: null } };
+/**
+ * A Confirm modal's keys (`Modal::Confirm` in `on_key_modal`): `y`/`enter`
+ * yes, `n` no, `esc`/`q` abort; for rm, `n` is an answer too (keep the
+ * branch) and only an abort leaves the instance. Other keys do nothing.
+ */
+function confirmKey(s: State, m: Extract<Modal, { kind: 'confirm' }>, key: string): State {
+  const yes = key === 'y' || key === 'Enter' ? true : key === 'n' ? false : null;
+  if (yes === null && key !== 'Escape' && key !== 'q') return s;
+  const closed = { ...s, modal: null };
+  const { type, instance } = m.action;
+  if (type === 'cancelBuild') return yes ? cancelBuild(closed, instance) : closed;
+  // The resend carries `deleteBranch`; either answer removes the instance.
+  if (yes === null) return { ...closed, message: `rm ${instance}: cancelled` };
+  return { ...removeInstance(closed, instance), message: `removed ${instance}` };
+}
+
+/** A key on the suspended screen: any key returns. */
+function suspendedKey(s: State): State {
+  return s.suspended ? { ...s, suspended: null } : s;
 }
 
 // ---- Ports.
@@ -628,10 +686,13 @@ function runAction(s: State, a: Action): State {
     case 'rm':
       return rmInstance(s, a.instance);
     case 'stop': {
+      // A held verb request (`verb_held`): the dashboard stays, the status
+      // line says `stopping x…` until `verb_status`'s answer (here at once).
       const inst = findInst(s, a.instance);
-      if (!inst) return suspend(s, errorLines(a.cmd, noMatch(a.instance)));
-      if (inst.status === 'building') return suspend(s, errorLines('stop', stillBuilding(inst.name)));
-      return suspend(setRunState(s, inst.name, 'exited'), [`stopped ${inst.name}`]);
+      const label = `stop ${a.instance}`;
+      if (!inst) return { ...s, message: heldFailed(label, noMatch(a.instance)) };
+      if (inst.status === 'building') return { ...s, message: heldFailed(label, inFlight(inst.name)) };
+      return { ...setRunState(s, inst.name, 'exited'), message: `stopped ${inst.name}` };
     }
     case 'start': {
       // Sent like `run`; a start is quick, so here it's done at once.
@@ -642,11 +703,12 @@ function runAction(s: State, a: Action): State {
       return { ...setRunState(s, inst.name, 'running'), message: `${label}: done` };
     }
     case 'code':
-      // `code` never suspends: a status line (`launch_code`).
+      // `code` doesn't suspend either: a status line (`launch_code`).
       return findInst(s, a.instance)
         ? { ...s, vscode: a.instance, message: `VS Code opened on ${a.instance}` }
         : { ...s, message: `code: unknown instance \`${a.instance}\`` };
     case 'exec': {
+      // The one command that still suspends the real dashboard (`run_suspended`).
       const inst = findInst(s, a.instance);
       if (!inst) return suspend(s, errorLines('exec', `no sandbox instance matches \`${a.instance}\` (see \`devsandbox ps\`)`));
       if (inst.status !== 'running') {
@@ -740,7 +802,7 @@ export const buildLogFor = (s: State, name: Instance): readonly string[] => {
   return buildLogLines(name, inst?.worktree ?? true, inst?.status === 'building');
 };
 
-function viewLines(s: State, m: Modal): readonly string[] {
+function viewLines(s: State, m: Exclude<Modal, { kind: 'confirm' }>): readonly string[] {
   if (m.kind === 'logs') return logsFor(m.name);
   if (m.kind === 'build') return buildLogFor(s, m.name);
   return configLines(m);
@@ -768,10 +830,11 @@ function scrolled(scroll: number, lines: number, key: string): number | null {
   return null;
 }
 
-/** Keys while logs or the config explorer is up (`on_key_modal`). */
+/** Keys while logs, the config explorer or a Confirm question is up (`on_key_modal`). */
 function modalKey(s: State, key: string): State {
   const m = s.modal;
   if (!m) return s;
+  if (m.kind === 'confirm') return confirmKey(s, m, key);
   if (key === 'Escape' || key === 'q') return { ...s, modal: null };
   if (m.kind === 'config' && key === 't') {
     const next = { ...m, side: m.side === 'original' ? ('resolved' as const) : ('original' as const) };
@@ -786,7 +849,7 @@ function modalKey(s: State, key: string): State {
 export function pressKey(s: State, key: string): State {
   // Precedence like `on_key`: a suspended command owns the screen, then the
   // prompt, a modal, a focused terminal, the dashboard.
-  if (s.suspended) return suspendedKey(s, key);
+  if (s.suspended) return suspendedKey(s);
   if (s.prompt) return promptKey(s, key);
   if (s.help) {
     // The help modal swallows everything but its close keys (`esc`/`q`/`?`).
@@ -840,14 +903,16 @@ export function pressKey(s: State, key: string): State {
       if (!onInstances) return s;
       return openPrompt(s, inst ? `rename ${inst.name} ` : `run ${SANDBOX} `);
     case 's':
-      // `stop_or_start_instance`: the real one runs in the background and
-      // reports `stopped web-2` when done; here it's done at once.
+      // `stop_or_start_instance`: the real one says `stopping web-2…` /
+      // `starting web-2…`, sends a background `stop` / detached `start` and
+      // reports `stopped web-2` / `start web-2: done` (`verb_status`); here
+      // it's done at once.
       if (!onInstances || !inst) return s;
       // An in-flight row offers nothing that would race the build.
       if (inst.status === 'building') return { ...s, message: stillBuilding(inst.name) };
       return inst.status === 'running'
         ? { ...setRunState(s, inst.name, 'exited'), message: `stopped ${inst.name}` }
-        : { ...setRunState(s, inst.name, 'running'), message: `started ${inst.name}` };
+        : { ...setRunState(s, inst.name, 'running'), message: `start ${inst.name}: done` };
     case 'l':
       return onInstances && inst ? { ...s, modal: { kind: 'logs', name: inst.name, scroll: 0 }, message: null } : s;
     case 'b':
@@ -858,7 +923,14 @@ export function pressKey(s: State, key: string): State {
       if (s.tab === 'services') return openPrompt(s, `port ${s.instances[0]?.name ?? ''} --service ${SERVICE} `);
       return s;
     case 'd':
-      return s.tab === 'ports' ? stopForward(s) : s;
+      if (s.tab === 'ports') return stopForward(s);
+      if (!onInstances || !inst) return s;
+      // `remove_instance`: rm right away, or on an in-flight row ask to cancel its build.
+      if (inst.status === 'building') {
+        const action: Confirmed = { type: 'cancelBuild', instance: inst.name };
+        return { ...s, modal: { kind: 'confirm', question: cancelQuestion(inst.name), action }, message: null };
+      }
+      return rmInstance(s, inst.name);
     case 'Escape':
       return s.vscode ? { ...s, vscode: null, message: 'VS Code closed' } : s;
     case '?':
@@ -931,11 +1003,24 @@ export function settled(): State {
  * Which hint bar shows (`data-tui-help`): the dashboard's, a live shell's, an
  * exited one's, or a view's own (`draw_help`); the prompt takes the bar's place.
  */
-export type HelpMode = 'dashboard' | 'terminal' | 'exited' | 'prompt' | 'help' | 'logs' | 'config';
+export type HelpMode =
+  | 'dashboard'
+  | 'terminal'
+  | 'exited'
+  | 'prompt'
+  | 'help'
+  | 'logs'
+  | 'config'
+  /** rm's branch question: `y/enter yes · n no · esc cancel`. */
+  | 'confirm-rm'
+  /** Cancelling a build: `y/enter yes · n/esc no`. */
+  | 'confirm-cancel';
 
 export function helpMode(s: State): HelpMode {
   if (s.prompt) return 'prompt';
   if (s.help) return 'help';
+  // A question's keys, like `ConfirmModal::keys_hint`.
+  if (s.modal?.kind === 'confirm') return s.modal.action.type === 'rmBranch' ? 'confirm-rm' : 'confirm-cancel';
   // The build log is a text modal like logs, with the same keys.
   if (s.modal) return s.modal.kind === 'build' ? 'logs' : s.modal.kind;
   const term = activeTerm(s);
@@ -1048,9 +1133,12 @@ export const stopStartHint = (s: State): 'stop' | 'start' => (selectedInst(s)?.s
 /** `r`'s verb in the hint bar (`run_rename_hint`). */
 export const runRenameHint = (s: State): 'run' | 'rename' => (selectedInst(s) ? 'rename' : 'run');
 
-/** The suspended screen's lines, the pending `rm` question last. */
+/** `d`'s verb in the hint bar (`remove_hint`): cancel an in-flight row's build, else rm. */
+export const removeHint = (s: State): 'rm' | 'cancel' => (selectedInst(s)?.status === 'building' ? 'cancel' : 'rm');
+
+/** The suspended screen's lines (`exec`'s output). */
 export function suspendedLines(sus: Suspended): string[] {
-  return sus.confirm ? [...sus.lines, confirmQuestion(sus.confirm.branch)] : [...sus.lines];
+  return [...sus.lines];
 }
 
 /**
@@ -1060,8 +1148,9 @@ export function suspendedLines(sus: Suspended): string[] {
 export function hintFor(s: State, pageFocus: boolean): { kind: 'message' | 'hint'; text: string } {
   if (s.message && !s.prompt && !s.suspended) return { kind: 'message', text: s.message };
   let keys = '? FOR KEYS · TAB LEAVES';
-  if (s.suspended) keys = s.suspended.confirm ? 'Y OR N ANSWERS' : 'ANY KEY RETURNS';
+  if (s.suspended) keys = 'ANY KEY RETURNS';
   else if (s.prompt) keys = 'TAB COMPLETES · ESC CANCELS';
+  else if (s.modal?.kind === 'confirm') keys = 'Y OR N ANSWERS';
   else if (s.help || s.modal) keys = 'ESC CLOSES · TAB LEAVES';
   else if (s.focus === 'terminal') keys = 'ESC TO DASHBOARD · TAB LEAVES';
   return { kind: 'hint', text: pageFocus ? keys : 'CLICK TO TRY IT' };
@@ -1072,8 +1161,7 @@ export function describe(prev: State, next: State): string | null {
   if (next.help !== prev.help) return next.help ? 'Help open. Escape or ? closes it.' : 'Help closed';
   if (next.suspended !== prev.suspended) {
     if (!next.suspended) return 'Back to the dashboard';
-    const lines = suspendedLines(next.suspended).join('. ');
-    return next.suspended.confirm ? lines : `${lines}. Press any key to return.`;
+    return `${suspendedLines(next.suspended).join('. ')}. Press any key to return.`;
   }
   if (next.prompt !== prev.prompt) {
     const p = next.prompt;
@@ -1087,7 +1175,13 @@ export function describe(prev: State, next: State): string | null {
   }
   if (next.modal?.kind !== prev.modal?.kind) {
     const m = next.modal;
-    if (!m) return 'Closed';
+    // A Confirm answer says what it did (`removed web-2`, `cancelling web-4…`).
+    if (!m) return next.message ?? 'Closed';
+    if (m.kind === 'confirm') {
+      const answers =
+        m.action.type === 'rmBranch' ? 'y or Enter yes, n no, Escape cancels.' : 'y or Enter yes, n or Escape no.';
+      return `${m.question} ${answers}`;
+    }
     if (m.kind === 'build') return `${buildLogTitle(next, m.name)}. Escape closes.`;
     return m.kind === 'logs'
       ? `${logsTitle(m.name)}. Escape closes.`
