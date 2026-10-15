@@ -23,9 +23,11 @@ devsandbox run -d web --branch fix/login
 
 - **API: everything the dashboard shows.** `instances.list` takes a `depth` (`disk`, `listing` or `full`, to skip the runtime or just its stats) and also answers `thread_children`. New: `instances.procs` and `instances.signal` (an instance's processes and tracked runs; SIGTERM/SIGKILL one), `instances.buildLog`, `instances.rename`, `instances.done`, `containers.logs` and `containers.inspect` (devsandbox containers only), `sandboxes.get` and `services.get` (a config as written and resolved). `instances.changed` now also fires when an instance is created, removed, renamed, marked done or changes step. Details: `docs/api.md`.
 
+- **API: `instances.watch`.** A client watching a config root gets its snapshot pushed as `instances.snapshot` every 2 s (cpu/mem every 7 s), from one poll shared by every watcher; the dashboard uses it, so two dashboards cost the runtime no more than one. `stop`, `rm` and `services.rebuild` take `detach` (a hang-up leaves them running), `run`, `rebuild` and `start` take `tty` (run on a pty of that size), and `instances.buildLog` takes `ansi` (keep the colours). Details: `docs/api.md`.
+
 - **`status --json` and `ls --json` sandbox rows gain `dispatcher` and `worktree_branch`**: whether the sandbox is a dispatcher, and its resolved `worktree-branch`. Details: `docs/json-output.md`.
 
-- **Build logs.** `run`, `rebuild` and `start` write their whole output, the containers' build and lifecycle commands included, to a log per instance (`~/.local/share/devsandbox/logs/<instance id>/build.log`; the one before is kept as `build.1.log`, and `rm` deletes both). `devsandbox logs --build <name>` prints it; `--follow` keeps printing until the instance is done building. The command's error, if it failed, is the last line.
+- **Build logs.** `run`, `rebuild` and `start` write their whole output, the containers' build and lifecycle commands included, to a log per instance (`~/.local/share/devsandbox/logs/<instance id>/build.log`; the one before is kept as `build.1.log`, and `rm` deletes both). `devsandbox logs --build <name>` prints it; `--follow` keeps printing until the instance is done building. The command's error, if it failed, is the last line. Builds run on a terminal of their own when you're on one (or start them from the dashboard), so docker's progress display and colours show as they used to, live and in the dashboard's build log (`b`), which also scrolls with the mouse wheel. Piped, `logs --build` prints plain text.
 
 ```bash
 devsandbox logs --build web-4 --follow
@@ -39,7 +41,7 @@ devsandbox logs --build web-4 --follow
 
 - **The dashboard is a client of the host daemon.** Everything it shows comes from `devsandbox serve` and every action goes to it, so it needs the daemon (it starts one when it opens, as before). If the daemon goes away, the last tree stays on screen marked stale with the reason, and actions say the daemon is needed. On Windows, which has no daemon, the dashboard isn't available for now. It no longer runs an autostart pass of its own when it opens; the daemon's covers every config root that has instances.
 
-- **The dashboard no longer takes over the screen for `stop`, `rm` or a service's `rebuild`.** They run in the daemon, and the status line says how they ended, or why not (e.g. `rm` refusing a dirty worktree). `rm`'s question about deleting the branch is a `y`/`n` popup; `esc` removes nothing. Quitting the dashboard while one of them is still going interrupts it.
+- **The dashboard no longer takes over the screen for `stop`, `rm` or a service's `rebuild`.** They run in the daemon, and the status line says how they ended, or why not (e.g. `rm` refusing a dirty worktree). `rm`'s question about deleting the branch is a `y`/`n` popup; `esc` removes nothing. Quitting the dashboard while one of them is still going leaves it running.
 
 - **`s` on a stopped instance starts it like `devsandbox start`.** It used to be a bare container start; it now also runs the services, `postStartCommand` and the autostart pass, in the background, with a build log under `b`.
 
@@ -52,6 +54,8 @@ devsandbox logs --build web-4 --follow
 - **Commands leave an instance alone while it's being made.** `start`, `stop`, `rename`, `rebuild` and `rm` (even with `--force`) refuse an instance whose `run` or `rebuild` is still going and say what it's doing; `start` also refuses a failed one and points at `rebuild` and `rm`. `rebuild --all` and autostart skip both. `exec` works once the container exists, so you can shell into one whose `postCreateCommand` failed. A dispatcher's `devsbd ensure` of such a child fails with a message naming its step instead of starting or recreating it.
 
 ### Fixed
+
+- **Upgrading devsandbox under a running dashboard or daemon no longer breaks it.** Once the binary was replaced, new terminal tabs, builds and other spawned commands failed until a restart; they now run the new one.
 
 - **A run killed outright shows as failed.** A `run` or `rebuild` killed by SIGKILL, the OOM killer or a reboot used to leave its instance looking half-made or not at all; it now shows as `failed` with `interrupted`, ready to `rebuild` or `rm`.
 
