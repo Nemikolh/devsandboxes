@@ -27,6 +27,13 @@
 //! or notification, goes through its one writer lock, and a client that
 //! doesn't drain its socket for [`WRITE_TIMEOUT`] is disconnected.
 //!
+//! `instances.watch` adds a config root to the connection's `Pending`; the
+//! host poll reads every connection's watched roots each pass and posts
+//! each root's `instances.snapshot` there, latest wins per root
+//! (`snapshots.rs`). A hang-up drops the connection's entry, and its
+//! watches with it. A `state.toml` change wakes the poll while anything is
+//! watched.
+//!
 //! A verb request (`verbs.rs`) runs on its connection's thread until the
 //! verb's answer, writing `output`/`progress` through the same writer lock
 //! and watching the socket for a hang-up ([`ConnPeer`]). The drain's
@@ -34,7 +41,7 @@
 //! is left running rather than cancelled, and doesn't hold the drain; the
 //! successor adopts it by its spool files and holds until it exits.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{File, TryLockError};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::Shutdown;
@@ -50,9 +57,10 @@ use serde_json::{Value, json};
 use super::api::{self, Topic};
 use super::endpoint::{self, Listener, Stream};
 use super::forwards::{self, Registry};
-use super::host::{Host, Waker};
+use super::host::{Host, Observers, Waker};
 use super::idle::{self, Decision, Holders};
 use super::proto::{self, HelloParams, HelloResult, Notification, Request, Response, Version};
+use super::snapshots::{self, Join, Snapshots};
 use super::verbs;
 use crate::inbox::ops;
 
@@ -91,6 +99,10 @@ pub struct Options {
     /// The `state.toml` the watcher stamps for `instances.changed`; `None`
     /// is the default (`State::path`). Tests point it at their own file.
     pub state: Option<PathBuf>,
+    /// How a watched root's snapshot is joined; `None` is the default
+    /// (`snapshot::collect_from` + `thread_children` from `state`). Tests
+    /// inject one that reads neither the user's state nor a runtime.
+    pub join: Option<Join>,
 }
 
 impl Options {
@@ -103,8 +115,15 @@ impl Options {
             inbox: None,
             verbs: None,
             state: None,
+            join: None,
         }
     }
+}
+
+/// The production [`Join`]: the snapshot of a root from the poll's runtime
+/// pass, `thread_children` from `state`.
+fn default_join(state: PathBuf) -> Join {
+    Arc::new(move |dir, view| api::InstancesList::of(crate::snapshot::collect_from(dir, view), &state))
 }
 
 /// Why [`run`] returned.
@@ -168,7 +187,8 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
         if opts.keep_alive { ", keep-alive" } else { "" },
     ));
 
-    let shared = Arc::new(Shared::new(opts.version.clone(), inbox, state));
+    let join = opts.join.clone().unwrap_or_else(|| default_join(state.clone()));
+    let shared = Arc::new(Shared::new(opts.version.clone(), inbox, state, join));
     let _ = shared.runner.set(match &opts.verbs {
         Some(runner) => runner.clone(),
         None => verbs::Runner::new()?,
@@ -192,6 +212,15 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
         let shared = Arc::clone(&shared);
         // Configured `forwardPorts` follow the running containers.
         let sync = registry.as_ref().map(Registry::handle);
+        let observers = {
+            let (watching, publishing) = (Arc::clone(&shared), Arc::clone(&shared));
+            Observers {
+                watched: Box::new(move || watching.watched_roots()),
+                cache: Arc::clone(&shared.snapshots),
+                join: Arc::clone(&shared.join),
+                on_snapshot: Box::new(move |dir, params| publishing.publish_snapshot(dir, params)),
+            }
+        };
         Host::start(
             log,
             Box::new(move |instance: &str, line: String| shared.publish_shown(instance, line)),
@@ -200,6 +229,7 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
                     sync.sync(running.to_vec());
                 }
             }),
+            observers,
         )
     });
     if let Some(host) = &host {
@@ -323,10 +353,15 @@ struct Shared {
     /// Set when the drain starts: its read-side shutdown is not a client
     /// hanging up, so a verb's connection must not cancel on it.
     draining: AtomicBool,
+    /// The watched roots' last snapshots (the host poll fills it).
+    snapshots: Arc<Snapshots>,
+    /// How a root's snapshot is joined: the poll's, and a new watch's first
+    /// (disk-only) one.
+    join: Join,
 }
 
 impl Shared {
-    fn new(version: Version, inbox: PathBuf, state: PathBuf) -> Self {
+    fn new(version: Version, inbox: PathBuf, state: PathBuf, join: Join) -> Self {
         Self {
             version,
             inbox,
@@ -341,6 +376,8 @@ impl Shared {
             runner: OnceLock::new(),
             verbs: Arc::default(),
             draining: AtomicBool::new(false),
+            snapshots: Arc::default(),
+            join,
         }
     }
 
@@ -416,6 +453,33 @@ impl Shared {
         self.publish(Topic::Inbox, |p| p.shown = Some((instance.to_string(), line.clone())));
     }
 
+    /// `instances.snapshot` of root `dir`, to the connections watching it.
+    /// Latest wins per root: under backpressure older snapshots are dropped.
+    fn publish_snapshot(&self, dir: &Path, params: Arc<Value>) {
+        for conn in self.conns.lock().unwrap().values() {
+            conn.out.post(|p| {
+                let watching = p.watched.contains(dir);
+                if watching {
+                    p.snapshots.insert(dir.to_path_buf(), Arc::clone(&params));
+                }
+                watching
+            });
+        }
+    }
+
+    /// Every root some live connection watches: what the host poll collects.
+    /// A connection that hung up is gone from `conns`, its watches with it.
+    fn watched_roots(&self) -> BTreeSet<PathBuf> {
+        let mut roots = BTreeSet::new();
+        for conn in self.conns.lock().unwrap().values() {
+            conn.out.post(|p| {
+                roots.extend(p.watched.iter().cloned());
+                false
+            });
+        }
+        roots
+    }
+
     /// The registry's events, to `forwards` subscribers: `forwards.changed`,
     /// and `forwards.status` lines, latest wins like `inbox.shown`.
     fn publish_forwards(&self, event: forwards::Event) {
@@ -482,6 +546,11 @@ struct Pending {
     /// `inbox.shown` with `(instance, line)`, the latest only.
     shown: Option<(String, String)>,
     instances: bool,
+    /// The roots this connection watches (`instances.watch`); only while
+    /// subscribed to `instances`.
+    watched: BTreeSet<PathBuf>,
+    /// `instances.snapshot` per root, the latest only.
+    snapshots: BTreeMap<PathBuf, Arc<Value>>,
     /// `forwards.changed`.
     forwards: bool,
     /// `forwards.status` with this line, the latest only.
@@ -497,6 +566,7 @@ impl Pending {
         self.inbox.is_some()
             || self.shown.is_some()
             || self.instances
+            || !self.snapshots.is_empty()
             || self.forwards
             || self.forwards_status.is_some()
             || self.closing.is_some()
@@ -512,6 +582,9 @@ impl Pending {
         }
         if std::mem::take(&mut self.instances) {
             out.push(Notification { method: "instances.changed".into(), params: json!({}) });
+        }
+        for params in std::mem::take(&mut self.snapshots).into_values() {
+            out.push(Notification { method: "instances.snapshot".into(), params: Arc::unwrap_or_clone(params) });
         }
         if std::mem::take(&mut self.forwards) {
             out.push(Notification { method: "forwards.changed".into(), params: json!({}) });
@@ -623,6 +696,14 @@ fn watch(shared: &Shared, instances: Option<Arc<AtomicU64>>, stop: &AtomicBool) 
         let n = instances_now();
         let state_now = crate::inbox::store::stamp_at(&shared.state);
         if n != instances_seen || state_now != state_stamp {
+            // A phase moved, an instance came or went: the watched roots'
+            // snapshots follow now, not on the poll's next tick.
+            if state_now != state_stamp
+                && let Some(poll) = shared.bridges.get()
+                && !shared.watched_roots().is_empty()
+            {
+                poll.refresh();
+            }
             (instances_seen, state_stamp) = (n, state_now);
             shared.publish(Topic::Instances, |p| p.instances = true);
         }
@@ -695,6 +776,8 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
         method if verbs::is_verb(method) => return verb(req.id, method, req.params, shared, conn),
         "subscribe" => subscribe(req.params, conn, true),
         "unsubscribe" => subscribe(req.params, conn, false),
+        "instances.watch" => watch_root(req.params, shared, conn),
+        "instances.unwatch" => unwatch_root(req.params, conn),
         "shutdown" => {
             log(&format!("{}: shutdown requested", conn.label()));
             shared.begin_stop(Exit::Shutdown);
@@ -811,7 +894,11 @@ fn subscribe(params: Value, conn: &mut ConnState, on: bool) -> Result<Value, api
                         p.inbox = None;
                         p.shown = None;
                     }
-                    Topic::Instances => p.instances = false,
+                    Topic::Instances => {
+                        p.instances = false;
+                        p.watched.clear();
+                        p.snapshots.clear();
+                    }
                     Topic::Forwards => {
                         p.forwards = false;
                         p.forwards_status = None;
@@ -819,6 +906,60 @@ fn subscribe(params: Value, conn: &mut ConnState, on: bool) -> Result<Value, api
                 }
             }
         }
+        false
+    });
+    Ok(json!({ "ok": true }))
+}
+
+/// `instances.watch {dir}`: push `instances.snapshot` for root `dir` to
+/// this connection while it's connected and subscribed to `instances` (a
+/// watch needs that subscription first: the pushes are notifications). The
+/// first one goes out at once: the cached snapshot when another watcher
+/// keeps it fresh, else one from disk (no runtime call) while the poll is
+/// woken for the listing and stats.
+fn watch_root(params: Value, shared: &Shared, conn: &ConnState) -> Result<Value, api::ApiError> {
+    let dir = api::watch_dir(params, true)?;
+    let mut subscribed = false;
+    conn.out.post(|p| {
+        subscribed = p.topics.contains(&Topic::Instances);
+        false
+    });
+    if !subscribed {
+        return Err(api::ApiError::invalid(
+            "subscribe to `instances` before `instances.watch`: snapshots are notifications",
+        ));
+    }
+    let cached = shared.snapshots.cached(&dir);
+    let first = match &cached {
+        Some(params) => Some(Arc::clone(params)),
+        None => snapshots::params(&dir, &(shared.join)(&dir, &crate::snapshot::RuntimeView::disk())),
+    };
+    conn.out.post(|p| {
+        p.watched.insert(dir.clone());
+        // A poll's snapshot already pending (a re-watch) is newer.
+        match first {
+            Some(first) if !p.snapshots.contains_key(&dir) => {
+                p.snapshots.insert(dir, first);
+                true
+            }
+            _ => false,
+        }
+    });
+    if cached.is_none()
+        && let Some(poll) = shared.bridges.get()
+    {
+        poll.refresh();
+    }
+    Ok(json!({ "ok": true }))
+}
+
+/// `instances.unwatch {dir}`: stop pushing root `dir` here (a pending one is
+/// dropped). Not watching it is fine.
+fn unwatch_root(params: Value, conn: &ConnState) -> Result<Value, api::ApiError> {
+    let dir = api::watch_dir(params, false)?;
+    conn.out.post(|p| {
+        p.watched.remove(&dir);
+        p.snapshots.remove(&dir);
         false
     });
     Ok(json!({ "ok": true }))
@@ -883,7 +1024,21 @@ pub(crate) mod tests {
             // Never the user's: the watcher only stamps it, but a test that
             // listens for `instances.changed` sets its own.
             state: Some(std::env::temp_dir().join(format!("dsv-state-{}", std::process::id())).join("state.toml")),
+            join: Some(fake_join()),
         }
+    }
+
+    /// A [`Join`] that reads nothing: no rows, the view's depth as the
+    /// runtime's name (`Disk` for a new watch's first snapshot).
+    pub(crate) fn fake_join() -> Join {
+        Arc::new(|_, view| api::InstancesList {
+            snapshot: {
+                let mut s = crate::serve::snapshots::tests::snapshot(Vec::new(), view.depth == crate::snapshot::Depth::Full);
+                s.runtime_name = format!("{:?}", view.depth);
+                s
+            },
+            thread_children: Default::default(),
+        })
     }
 
     pub(crate) fn spawn_daemon(dir: &Path, opts: Options) -> std::thread::JoinHandle<Result<Exit>> {
@@ -1110,7 +1265,7 @@ pub(crate) mod tests {
     #[test]
     fn shown_lines_reach_inbox_subscribers_latest_first() {
         use std::os::unix::net::UnixStream;
-        let shared = Arc::new(Shared::new(v(1), scratch("shown-store").join("inbox.json"), scratch("shown-store").join("state.toml")));
+        let shared = Arc::new(Shared::new(v(1), scratch("shown-store").join("inbox.json"), scratch("shown-store").join("state.toml"), fake_join()));
         let mut clients = Vec::new();
         for (id, topics) in [(1, json!(["inbox"])), (2, json!(["inbox"])), (3, json!(["instances"]))] {
             let (server, client) = UnixStream::pair().unwrap();
@@ -1164,9 +1319,174 @@ pub(crate) mod tests {
         reader
     }
 
+    /// Send `method` on a [`subscribed`] connection; its answer, and the
+    /// notifications that came before it.
+    fn ask(reader: &mut BufReader<std::os::unix::net::UnixStream>, method: &str, params: Value) -> (Value, Vec<Value>) {
+        writeln!(reader.get_ref(), "{}", json!({"id": 9, "method": method, "params": params})).unwrap();
+        let mut notes = Vec::new();
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let msg: Value = serde_json::from_str(&line).unwrap();
+            if msg.get("id").is_some() {
+                return (msg, notes);
+            }
+            notes.push(msg);
+        }
+    }
+
+    /// The next `instances.snapshot` (from `notes` first), or `None` within
+    /// `wait`.
+    fn next_snapshot(reader: &mut BufReader<std::os::unix::net::UnixStream>, notes: &mut Vec<Value>, wait: Duration) -> Option<Value> {
+        if let Some(i) = notes.iter().position(|n| n["method"] == "instances.snapshot") {
+            return Some(notes.remove(i)["params"].clone());
+        }
+        reader.get_ref().set_read_timeout(Some(wait)).unwrap();
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).is_err() || line.is_empty() {
+                return None;
+            }
+            let n: Value = serde_json::from_str(&line).unwrap();
+            if n["method"] == "instances.snapshot" {
+                return Some(n["params"].clone());
+            }
+        }
+    }
+
+    fn bare_shared(tag: &str) -> Arc<Shared> {
+        let store = scratch(tag);
+        Arc::new(Shared::new(v(1), store.join("inbox.json"), store.join("state.toml"), fake_join()))
+    }
+
+    /// A root dir that exists, for `instances.watch`.
+    fn root(tag: &str) -> PathBuf {
+        let dir = scratch(tag);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_new_watch_gets_a_disk_snapshot_then_only_its_roots() {
+        let shared = bare_shared("snap-store");
+        let (a, b) = (root("snap-a"), root("snap-b"));
+        let mut on_a = subscribed(&shared, 1, json!(["instances"]));
+        let mut on_b = subscribed(&shared, 2, json!(["instances"]));
+        let mut idle = subscribed(&shared, 3, json!(["instances"]));
+
+        let (r, mut notes) = ask(&mut on_a, "instances.watch", json!({"dir": a}));
+        assert_eq!(r["result"], json!({"ok": true}), "{r}");
+        let first = next_snapshot(&mut on_a, &mut notes, Duration::from_secs(3)).expect("no first snapshot");
+        assert_eq!(first["dir"], a.to_str().unwrap());
+        assert_eq!(first["runtime_name"], "Disk", "nothing cached: from disk");
+        let (_, mut notes_b) = ask(&mut on_b, "instances.watch", json!({"dir": b}));
+        next_snapshot(&mut on_b, &mut notes_b, Duration::from_secs(3)).expect("no first snapshot");
+        assert_eq!(shared.watched_roots(), [a.clone(), b.clone()].into());
+
+        // Two pushes before the notifier writes: the latest, or both in
+        // order; never the older last. Only `a`'s watcher hears them.
+        let push = |dir: &Path, n: u64| {
+            let mut p = (*snapshots::params(dir, &fake_join()(dir, &crate::snapshot::RuntimeView::disk())).unwrap()).clone();
+            p["sandbox_count"] = json!(n);
+            shared.publish_snapshot(dir, Arc::new(p));
+        };
+        push(&a, 1);
+        push(&a, 2);
+        let mut none = Vec::new();
+        let last = loop {
+            let s = next_snapshot(&mut on_a, &mut none, Duration::from_secs(3)).expect("no push");
+            if s["sandbox_count"] == 2 {
+                break s;
+            }
+            assert_eq!(s["sandbox_count"], 1);
+        };
+        assert_eq!(last["dir"], a.to_str().unwrap());
+        assert!(next_snapshot(&mut on_b, &mut none, Duration::from_millis(300)).is_none(), "b doesn't watch a");
+        assert!(next_snapshot(&mut idle, &mut none, Duration::from_millis(100)).is_none(), "watches nothing");
+
+        // Unwatch: nothing more.
+        let (r, _) = ask(&mut on_a, "instances.unwatch", json!({"dir": a}));
+        assert_eq!(r["result"], json!({"ok": true}));
+        push(&a, 3);
+        assert!(next_snapshot(&mut on_a, &mut none, Duration::from_millis(300)).is_none());
+        assert_eq!(shared.watched_roots(), [b.clone()].into());
+
+        // Unsubscribing from `instances` lets go of the watches too.
+        let (r, _) = ask(&mut on_b, "unsubscribe", json!({"topics": ["instances"]}));
+        assert!(r.get("error").is_none(), "{r}");
+        assert!(shared.watched_roots().is_empty());
+        let _ = std::fs::remove_dir_all(&a);
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    #[test]
+    fn a_watch_of_a_cached_root_gets_the_cached_snapshot() {
+        let shared = bare_shared("snap-cache-store");
+        let a = root("snap-cache");
+        let view = |depth| crate::snapshot::RuntimeView { depth, ..crate::snapshot::RuntimeView::disk() };
+        // What the poll left for another watcher.
+        shared.snapshots.collect(&view(crate::snapshot::Depth::Full), &[a.clone()].into(), &*fake_join());
+        let mut conn = subscribed(&shared, 1, json!(["instances"]));
+        let (_, mut notes) = ask(&mut conn, "instances.watch", json!({"dir": a}));
+        let first = next_snapshot(&mut conn, &mut notes, Duration::from_secs(3)).expect("no cached snapshot");
+        assert_eq!(first["runtime_name"], "Full");
+        let _ = std::fs::remove_dir_all(&a);
+    }
+
+    #[test]
+    fn watches_need_instances_and_end_with_the_connection() {
+        let dir = scratch("watch");
+        let a = root("watch-root");
+        let daemon = spawn_daemon(&dir, opts(1, 200));
+        let mut conn = connect(&dir);
+        let code = |r: proto::Response| r.error.map(|e| e.code);
+        let r = conn.call("instances.watch", json!({"dir": a})).unwrap();
+        let e = r.error.clone().unwrap();
+        assert_eq!(e.code, "invalid");
+        assert!(e.message.contains("subscribe to `instances`"), "{}", e.message);
+        conn.call("subscribe", json!({"topics": ["instances"]})).unwrap();
+        assert_eq!(code(conn.call("instances.watch", json!({"dir": "rel"})).unwrap()).as_deref(), Some("invalid"));
+        let gone = a.join("gone");
+        assert_eq!(code(conn.call("instances.watch", json!({"dir": gone})).unwrap()).as_deref(), Some("not-found"));
+        assert_eq!(code(conn.call("instances.unwatch", json!({"dir": gone})).unwrap()), None);
+
+        // No host side: the watch still answers, with its disk snapshot.
+        assert_eq!(conn.call("instances.watch", json!({"dir": a})).unwrap().result, Some(json!({"ok": true})));
+        let n = wait_for(&mut conn, "instances.snapshot");
+        assert_eq!(n.params["dir"], a.to_str().unwrap());
+        dts_check(&n);
+
+        // A hang-up lets go of the watch (and the daemon idles out).
+        drop(conn);
+        assert_eq!(daemon.join().unwrap().unwrap(), Exit::Idle);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&a);
+    }
+
+    fn dts_check(n: &Notification) {
+        let ty = crate::serve::dts::prop_type("ApiEvents", &n.method).unwrap();
+        crate::serve::dts::assert_matches(&ty, &n.params);
+    }
+
+    #[test]
+    fn a_hang_up_releases_the_watch() {
+        let shared = bare_shared("watch-hangup-store");
+        let a = root("watch-hangup");
+        let mut conn = subscribed(&shared, 1, json!(["instances"]));
+        ask(&mut conn, "instances.watch", json!({"dir": a}));
+        assert_eq!(shared.watched_roots(), [a.clone()].into());
+        drop(conn);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !shared.watched_roots().is_empty() {
+            assert!(Instant::now() < deadline, "still watched after the hang-up");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = std::fs::remove_dir_all(&a);
+    }
+
     #[test]
     fn forwards_subscribers_hear_changes_and_status_lines() {
-        let shared = Arc::new(Shared::new(v(1), scratch("fwd-store").join("inbox.json"), scratch("fwd-store").join("state.toml")));
+        let shared = Arc::new(Shared::new(v(1), scratch("fwd-store").join("inbox.json"), scratch("fwd-store").join("state.toml"), fake_join()));
         let mut fwd = subscribed(&shared, 1, json!(["forwards"]));
         let mut other = subscribed(&shared, 2, json!(["inbox", "instances"]));
         shared.publish_forwards(forwards::Event::Changed);
@@ -1188,7 +1508,7 @@ pub(crate) mod tests {
 
     #[test]
     fn active_forwards_are_holders() {
-        let shared = Shared::new(v(1), scratch("fwd-hold").join("inbox.json"), scratch("fwd-hold").join("state.toml"));
+        let shared = Shared::new(v(1), scratch("fwd-hold").join("inbox.json"), scratch("fwd-hold").join("state.toml"), fake_join());
         let registry = Registry::spawn(|_| {}, scratch("fwd-hold-store").join("forwards.toml"), Box::new(|_| {}));
         assert_eq!(shared.holders(None, Some(&registry)), Holders::default());
         let dir = scratch("fwd-hold-root");
@@ -1273,8 +1593,11 @@ pub(crate) mod tests {
             closing: Some("idle"),
             ..Pending::default()
         };
+        let dir = PathBuf::from("/cfg");
+        let list = fake_join()(&dir, &crate::snapshot::RuntimeView::disk());
+        p.snapshots.insert(dir.clone(), snapshots::params(&dir, &list).unwrap());
         let notes = p.take();
-        assert_eq!(notes.len(), 6, "a Pending flag isn't covered here");
+        assert_eq!(notes.len(), 7, "a Pending flag isn't covered here");
         for n in notes {
             let ty = dts::prop_type("ApiEvents", &n.method)
                 .unwrap_or_else(|| panic!("index.d.ts `ApiEvents` lacks `'{}'`", n.method));

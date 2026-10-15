@@ -4,26 +4,40 @@
 //! control ops answer with the dashboard closed; plus the once-per-boot
 //! `autostart = true` pass at start.
 //!
-//! Threading: a `serve-poll` thread lists the runtime's running containers
-//! every [`POLL`], counts the live-instance holders and hands the list to the
-//! bridge worker (`Bridges::spawn_worker`, its own thread, which owns every
-//! bridge), and bumps [`Host::changes`] when the list moved (the API's
-//! `instances.changed`), and hands the list to the forward registry too
-//! (`forwards.rs`: configured `forwardPorts` follow it). A [`Waker`] (the API's `bridges.ensure`) cuts the
-//! poll's sleep short and marks its container urgent, so a CLI command or a
-//! dashboard terminal gets its bridge now rather than within [`POLL`]. A
-//! `serve-autostart` thread runs the autostart pass once per config
-//! root recorded in `state.toml`. Dropping [`Host`] stops the poll, drops the
-//! worker (killing every bridge's `exec`) and joins both threads.
+//! Threading: a `serve-poll` thread is the daemon's one container poll. Each
+//! tick it lists every devsandbox container once; from the running ones it
+//! counts the live-instance holders, hands the list to the bridge worker
+//! (`Bridges::spawn_worker`, its own thread, which owns every bridge), bumps
+//! [`Host::changes`] when the list moved (the API's `instances.changed`),
+//! and hands the list to the forward registry too (`forwards.rs`: configured
+//! `forwardPorts` follow it). Then, while a dashboard watches a config root
+//! ([`Observers`], `instances.watch`), it asks for stats when due and joins
+//! every watched root against that one listing (`snapshots.rs`), each
+//! snapshot handed to the daemon to push. The tick is
+//! [`snapshots::LISTING_INTERVAL`] while anything is watched, [`POLL`]
+//! otherwise. A [`Waker`] (the API's `bridges.ensure`) cuts the poll's sleep
+//! short and marks its container urgent, so a CLI command or a dashboard
+//! terminal gets its bridge now rather than within [`POLL`]; the bridges are
+//! handed their list before any stats or snapshot work.
+//! [`Waker::refresh`] cuts it short for the snapshots alone (a `state.toml`
+//! write, a new watch). A `serve-autostart` thread runs the autostart pass
+//! once per config root recorded in `state.toml`. Dropping [`Host`] stops
+//! the poll, drops the worker (killing every bridge's `exec`) and joins both
+//! threads.
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use serde_json::Value;
+
+use super::snapshots::{self, Join, Snapshots};
 use crate::devsbd::bridge::{self, BridgeBoard, Bridges, OnShown, Readiness};
+use crate::runtime::{ContainerRow, NAME_PREFIX};
+use crate::snapshot::RuntimeView;
 use crate::state::State;
 
 /// How often the daemon re-lists the running containers. A new instance gets
@@ -34,13 +48,25 @@ pub const POLL: Duration = Duration::from_secs(5);
 /// Called with each successful poll's running container names.
 pub type OnRunning = Box<dyn Fn(&[String]) + Send>;
 
-/// What the poll thread sleeps on: stop, or containers a client asked a
-/// bridge for.
+/// The watched roots' side of the poll, from the daemon.
+pub struct Observers {
+    /// The config roots some connection watches now.
+    pub watched: Box<dyn Fn() -> BTreeSet<PathBuf> + Send>,
+    pub cache: Arc<Snapshots>,
+    pub join: Join,
+    /// Each watched root's snapshot (`instances.snapshot` params), every
+    /// tick; it must not block.
+    pub on_snapshot: Box<dyn Fn(&Path, Arc<Value>) + Send>,
+}
+
+/// What the poll thread sleeps on: stop, containers a client asked a
+/// bridge for, or a snapshot refresh.
 #[derive(Default)]
 struct Signal {
     stop: bool,
     /// `(container, ticket)`: see `bridge::BridgeBoard`.
     urgent: Vec<(String, u64)>,
+    refresh: bool,
 }
 
 type Shared = Arc<(Mutex<Signal>, Condvar)>;
@@ -61,6 +87,14 @@ impl Waker {
         lock.lock().unwrap_or_else(|e| e.into_inner()).urgent.push((container, ticket));
         cvar.notify_all();
         ticket
+    }
+
+    /// Poll now for the watched roots' snapshots (no container urgent): a
+    /// `state.toml` write, a new watch.
+    pub fn refresh(&self) {
+        let (lock, cvar) = &*self.0;
+        lock.lock().unwrap_or_else(|e| e.into_inner()).refresh = true;
+        cvar.notify_all();
     }
 }
 
@@ -96,8 +130,9 @@ impl Host {
     /// Start the poll (bridges) and autostart threads. `log` writes one
     /// `serve.log` line; `on_shown` gets each stored container message's
     /// status line (the API's `inbox.shown`); `on_running` gets each poll's
-    /// running containers (the forward registry's sync; it must not block).
-    pub fn start(log: fn(&str), on_shown: OnShown, on_running: OnRunning) -> Host {
+    /// running containers (the forward registry's sync; it must not block);
+    /// `observers` the watched roots the poll collects snapshots for.
+    pub fn start(log: fn(&str), on_shown: OnShown, on_running: OnRunning, observers: Observers) -> Host {
         let stop: Shared = Arc::default();
         let board = BridgeBoard::default();
         let live = Arc::new(AtomicUsize::new(0));
@@ -109,7 +144,7 @@ impl Host {
             let (stop, live, changes, board) = (Arc::clone(&stop), Arc::clone(&live), Arc::clone(&changes), board.clone());
             std::thread::Builder::new()
                 .name("serve-poll".into())
-                .spawn(move || poll(&stop, &live, &changes, log, on_shown, on_running, board))
+                .spawn(move || poll(&stop, &live, &changes, log, on_shown, on_running, &observers, board))
         };
         match spawned {
             Ok(t) => threads.push(t),
@@ -173,10 +208,13 @@ impl Drop for Host {
     }
 }
 
-/// The poll loop: list, count, reconcile, sleep (until [`POLL`] passes or a
-/// [`Waker`] fires), until stopped. With the runtime unreachable the last list
-/// stands (bridges and the holder count are kept, not torn down on a blip);
-/// the outage is logged once, and urgent containers wait for the next list.
+/// The poll loop: list, count, reconcile, collect the watched roots'
+/// snapshots, sleep (until [`tick`] passes or a [`Waker`] fires), until
+/// stopped. With the runtime unreachable the last list stands (bridges and
+/// the holder count are kept, not torn down on a blip); the outage is logged
+/// once, and urgent containers wait for the next list. Watched roots still
+/// get a snapshot then, saying the runtime is down.
+#[allow(clippy::too_many_arguments)]
 fn poll(
     stop: &(Mutex<Signal>, Condvar),
     live: &AtomicUsize,
@@ -184,14 +222,18 @@ fn poll(
     log: fn(&str),
     on_shown: OnShown,
     on_running: OnRunning,
+    observers: &Observers,
     board: BridgeBoard,
 ) {
     let worker = Bridges::spawn_worker(Some(Some(on_shown)), board);
+    let rt = crate::runtime::backend();
     let mut down = false;
     let mut last: Vec<String> = Vec::new();
     let mut urgent: Vec<(String, u64)> = Vec::new();
     loop {
-        match running_containers() {
+        // Quiet: the backend captures stderr.
+        let listing = rt.list(true, NAME_PREFIX);
+        match listing.as_ref().map(|rows| running(rows)) {
             Ok(mut running) => {
                 running.sort();
                 if running != last {
@@ -217,24 +259,47 @@ fn poll(
                 }
             }
         }
+        // After the bridges' hand-off: an urgent bridge never waits on stats.
+        let watched = (observers.watched)();
+        observers.cache.prune(&watched);
+        if !watched.is_empty() {
+            let publish = |pushed: Vec<(PathBuf, Arc<Value>)>| {
+                for (dir, params) in pushed {
+                    (observers.on_snapshot)(&dir, params);
+                }
+            };
+            let due = listing.is_ok() && observers.cache.stats_due(&watched, Instant::now());
+            let mut view = RuntimeView::from_parts(rt, Some(listing), None);
+            if due {
+                // A new watch's root shows its statuses before the stats
+                // pass (~1.5 s on docker): Disk, Listing, then Full.
+                publish(observers.cache.collect(&view, &observers.cache.uncached(&watched), &*observers.join));
+                view.add_stats(rt.stats());
+            }
+            publish(observers.cache.collect(&view, &watched, &*observers.join));
+        }
         let (lock, cvar) = stop;
         let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
         let (mut guard, _) = cvar
-            .wait_timeout_while(guard, POLL, |s| !s.stop && s.urgent.is_empty())
+            .wait_timeout_while(guard, tick(!watched.is_empty()), |s| !s.stop && s.urgent.is_empty() && !s.refresh)
             .unwrap_or_else(|e| e.into_inner());
         if guard.stop {
             break;
         }
+        guard.refresh = false;
         urgent.append(&mut guard.urgent);
     }
     // `worker` drops here: closes its channel and joins, killing every bridge.
 }
 
-/// The runtime's running devsandbox containers. Quiet: the backend captures
-/// stderr.
-fn running_containers() -> anyhow::Result<Vec<String>> {
-    let rows = crate::runtime::backend().list(false, crate::runtime::NAME_PREFIX)?;
-    Ok(rows.into_iter().filter(|r| r.state == "running").map(|r| r.name).collect())
+/// The poll's sleep: the dashboards' cadence while a root is watched.
+fn tick(watched: bool) -> Duration {
+    if watched { snapshots::LISTING_INTERVAL } else { POLL }
+}
+
+/// The running containers of a listing.
+fn running(rows: &[ContainerRow]) -> Vec<String> {
+    rows.iter().filter(|r| r.is_running()).map(|r| r.name.clone()).collect()
 }
 
 /// Whether instance `key` expects a live host while it runs (see
@@ -350,6 +415,15 @@ mod tests {
         assert_eq!(live_instances(&running(&["devsandbox-disp-pr-1", "devsandbox-old"]), &s, dispatchers), 0);
         // A running container no state entry knows: not a holder.
         assert_eq!(live_instances(&running(&["devsandbox-stray"]), &s, |_| true), 0);
+    }
+
+    #[test]
+    fn one_listing_feeds_the_running_list_and_the_tick_follows_watches() {
+        let row = |name: &str, state: &str| ContainerRow { name: name.into(), state: state.into(), ..Default::default() };
+        let rows = [row("devsandbox-a", "running"), row("devsandbox-b", "exited"), row("devsandbox-c", "running")];
+        assert_eq!(running(&rows), ["devsandbox-a", "devsandbox-c"]);
+        assert_eq!(tick(true), snapshots::LISTING_INTERVAL);
+        assert_eq!(tick(false), POLL);
     }
 
     #[test]

@@ -84,7 +84,7 @@ instead (see *Boot start*).
 
 The daemon keeps one bridge per running instance with a helper
 (`devsbd::bridge::Bridges`): it lists the runtime's running containers
-every 5 s and reconciles. Each bridge relays the host ssh-agent (when there
+every 5 s (2 s while a root is watched, *Snapshots*) and reconciles. Each bridge relays the host ssh-agent (when there
 is one), drains the container's outbox (`devsbd notify`, `devsbd thread
 put|send|withdraw|rm`) into `inbox.json`, shows desktop popups
 (rate-limited per instance), and serves the in-container control ops: a
@@ -123,13 +123,38 @@ answering, `devsandbox rm`).
 Each message the sink stores that earns a status line also goes to `inbox`
 subscribers as `inbox.shown`: that's the dashboard's status line.
 
+## Snapshots
+
+The container poll is the daemon's only one (`serve/host.rs`): each pass
+lists every devsandbox container once, and the bridges, the configured
+forwards, the live-instance holders and `instances.changed` all read that
+one listing. The bridges get it first, so a `bridges.ensure` never waits on
+the snapshot work below.
+
+A client that shows a config root continuously watches it
+(`instances.watch`, `docs/api.md`). While at least one connection watches
+anything, the poll runs every 2 s, asks for stats (`docker stats
+--no-stream`, the expensive call) at most every 7 s and at once for a
+newly watched root, joins each watched root against that pass, and pushes
+the result as `instances.snapshot` to that root's watchers, every pass. So
+N dashboards on M roots cost one listing per pass and one stats call per
+7 s. Between stats passes each running container's last cpu/mem is carried
+over, so every snapshot pushed is complete. The per-root cache
+(`serve/snapshots.rs`) holds the last snapshot of every watched root, so a
+new watcher gets one at once; a root nobody watches is dropped from it. A
+new watch of an uncached root gets a disk-only snapshot at once and wakes
+the poll; a `state.toml` change (seen by the notification watcher within
+0.5 s) wakes it too, so a verb's phase shows without waiting for the tick.
+With nothing watched, the poll is back to 5 s and collects no snapshot.
+`instances.list` stays per request, uncached, for the CLI and scripts.
+
 ## Forwards
 
 The daemon owns every Ports-tab forward (`docs/port-forwarding.md`), on its
 own `serve-forwards` thread: ad-hoc ones added through `forwards.add` (the
 dashboard's `p` / `:port`), and every running instance's configured
 `forwardPorts`, for every config root recorded in `state.toml`. The
-configured ones follow the 5 s container poll: started on the host port
+configured ones follow the container poll (*Snapshots*): started on the host port
 saved in `state.toml` when their instance runs, stopped when it stops, so
 they work with no dashboard open. Each forward keeps its own bridge (an
 `exec -i … devsbd bridge` of its own, self-healing), separate from the
@@ -357,10 +382,11 @@ The other verbs moving into the daemon and remote machines:
 
 Accepted trade-offs of the current design, to revisit:
 
-- **No shared snapshot.** Each dashboard polls `instances.list` and
-  `instances.procs` at its own cadence, and the daemon runs the runtime
-  calls per request, so two dashboards (and the daemon's own 5 s poll)
-  each query the runtime. A per-root cache in the daemon would fix it.
+- **The dashboard doesn't watch yet.** The daemon side of the shared poll
+  is there (*Snapshots*), but the dashboard still polls `instances.list`
+  itself, so two dashboards each query the runtime. `instances.procs`
+  stays per request and per dashboard by design: it's per expanded
+  instance.
 - **Forwards hold the daemon indefinitely.** Every live forward is a holder,
   so a running instance with `forwardPorts`, or any saved ad-hoc forward
   (`forwards.toml`, restored at every start), keeps the daemon from ever

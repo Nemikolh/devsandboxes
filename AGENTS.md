@@ -65,9 +65,13 @@ git worktrees so working trees are never shared.
 - `src/serve/` — the per-user host daemon `devsandbox serve` (unix-only, see
   `docs/serve.md`): `endpoint.rs` (socket dir/paths, bind/connect: the
   `local_endpoint` seam), `daemon.rs` (start lock, accept loop, version
-  handoff, drain), `host.rs` (the bridges, polled every 5 s, and the startup
-  autostart pass; the TUI no longer bridges; the sink's status lines go out
-  as `inbox.shown`), `client.rs` (`connect`: lazy
+  handoff, drain), `host.rs` (the one container poll: each pass lists every
+  devsandbox container once and feeds the bridges, the forwards and the
+  watched roots' snapshots; every 5 s, 2 s while a root is watched; plus
+  the startup autostart pass; the TUI no longer bridges; the sink's status
+  lines go out as `inbox.shown`), `snapshots.rs` (the shared poll's per-root
+  cache and cadence: stats at most every 7 s, cpu/mem carried over; pure
+  over `Instant`s, the join injectable), `client.rs` (`connect`: lazy
   start + hello; `ensure_running` for `run`/`start`; `Conn` sets
   notifications aside), `idle.rs` (pure idle countdown over `Holders`),
   `proto.rs` (JSON-lines wire, `PROTOCOL`), `api.rs` (the API's method table
@@ -84,7 +88,9 @@ git worktrees so working trees are never shared.
   `forward_store.rs` (`forwards.toml`: the ad-hoc forwards, with their bound
   host ports, that a starting registry restores; locked atomic writes).
   `daemon.rs` also owns `subscribe`: a `serve-watch` thread flags changes on
-  each connection's `Outbox`, a per-connection notifier writes them.
+  each connection's `Outbox`, a per-connection notifier writes them; and
+  `instances.watch`/`unwatch` (per-connection watched roots in `Pending`,
+  pushed `instances.snapshot`, latest wins per root).
   `relay.rs` is `devsandbox api --stdio` (byte relay stdin/stdout ↔ socket,
   what the npm `connect()` spawns); `dts.rs` (test-only) checks the wire
   structs against the hand-written `npm/devsandboxes/index.d.ts`.

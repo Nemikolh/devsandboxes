@@ -247,6 +247,37 @@ doesn't read (the snapshot's `error` says why). Not in `status --json`.
 Errors: `invalid` (missing or relative `dir`, unknown `depth`), `not-found`
 (no such directory).
 
+Each call collects anew (uncached): it's for the CLI and scripts. A client
+that shows a root continuously watches it instead (`instances.watch`), so
+any number of dashboards cost the runtime one poll.
+
+### `instances.watch` / `instances.unwatch`
+
+Params: `{"dir": "/abs/path/to/config-root"}`. Result: `{"ok": true}`.
+Connection-level, like `subscribe`: while this connection is open and
+watches `dir`, the daemon pushes `instances.snapshot` for it (see
+*Notifications*). Watching needs a `subscribe` to `instances` first, since
+the pushes are notifications; unsubscribing from `instances` drops every
+watch, and so does hanging up. A client re-watches after a reconnect.
+
+While at least one connection watches a root, the daemon's container poll
+runs every 2 s (5 s otherwise) and joins every watched root against its
+one listing; stats (`cpu`/`mem`) are asked at most every 7 s, and at once
+for a root that hasn't had them yet. A snapshot between stats passes
+carries each running container's last `cpu`/`mem` over, so every pushed
+snapshot is complete. With nothing watched, nothing is collected.
+
+The first snapshot comes at once: the cached one when another watcher
+keeps the root fresh, else one at `disk` depth (no runtime call), then a
+`listing` one on the poll's next pass and a `full` one after its stats. A
+`state.toml` change (a phase, a new instance) re-polls within 0.5 s.
+Watching a root twice is one watch; `instances.unwatch` of a root not
+watched is fine.
+
+Errors: `invalid` (missing or relative `dir`; watch without the
+`instances` subscription), `not-found` (watch of a missing directory;
+unwatch only needs `dir` absolute).
+
 ### `instances.resolve`
 
 Params: `{"name": "<name>"}`, as the CLI's `<name>` takes it. Result:
@@ -638,7 +669,8 @@ between.
 |---|---|---|---|
 | `inbox.changed` | `inbox` | `{"generation": n}` | the store changed: through the daemon at once, through other processes (the dashboard, `devsandbox rm`) within 0.5 s. `n` grows per change the daemon saw; compare within one connection only |
 | `inbox.shown` | `inbox` | `{"instance": "<name>", "line": "<name>: <text>"}` | a container message the daemon stored is worth a status line (a `devsbd notify`, a thread put that changed something); `line` is the dashboard's status-line text. Latest only: lines that arrive faster than the client reads are dropped |
-| `instances.changed` | `instances` | `{}` | the running containers changed (the daemon polls every 5 s), or `state.toml` did (checked every 0.5 s): a phase moved (a `run`/`rebuild` step, a failure), an instance was created, removed or renamed, marked done or undone |
+| `instances.changed` | `instances` | `{}` | the running containers changed (the daemon polls every 5 s, 2 s while a root is watched), or `state.toml` did (checked every 0.5 s): a phase moved (a `run`/`rebuild` step, a failure), an instance was created, removed or renamed, marked done or undone |
+| `instances.snapshot` | `instances` | `{"dir": "<abs>", …}`: `instances.list`'s result plus the root | a root this connection watches (`instances.watch`) was collected: every poll pass (about every 2 s), changed or not, so its arrival says how fresh it is. Latest only per root |
 | `forwards.changed` | `forwards` | `{}` | any forward's row changed (added, stopped, state, process, connections; checked every 0.5 s), in any config root |
 | `forwards.status` | `forwards` | `{"line": "…"}` | a one-line status: a configured forward started (`forwarding 127.0.0.1:3000 -> api:3000`) or failed, a connection note (`3000: connection refused`). Latest only, like `inbox.shown` |
 | `closing` | any | `{"reason": "handoff" \| "idle" \| "shutdown"}` | the daemon is exiting; reconnect (which starts a new one) |

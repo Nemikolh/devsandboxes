@@ -111,6 +111,16 @@ export interface InstancesList extends Snapshot {
 }
 
 /**
+ * `instances.snapshot`: a watched root's {@link InstancesList}, pushed on every
+ * poll (about every 2 s; cpu/mem refreshed at most every 7 s and carried over
+ * in between), so its arrival says how fresh it is.
+ */
+export interface InstancesSnapshot extends InstancesList {
+  /** The config root, as `instances.watch` named it. */
+  dir: string;
+}
+
+/**
  * The instance `run()` just created (`run --json`). Fields match
  * {@link InstanceRow} where they overlap, except `worktree`, which is the path.
  */
@@ -898,6 +908,8 @@ export interface ApiEvents {
   'inbox.changed': InboxChanged;
   'inbox.shown': InboxShown;
   'instances.changed': {};
+  /** A root this connection watches (`instances.watch`); needs the `instances` topic. */
+  'instances.snapshot': InstancesSnapshot;
   'forwards.changed': {};
   'forwards.status': ForwardsStatus;
   /** A verb request's output; sent to its connection, no `subscribe` needed. */
@@ -928,6 +940,13 @@ export interface ApiMethods {
   'inbox.notify.markRead': { params: NotifyTarget; result: OkResult };
   /** `depth`: `disk` (state + config, statuses `unknown`), `listing` (+ statuses, drift), `full` (+ cpu/mem; the default). */
   'instances.list': { params: { dir: string; depth?: SnapshotDepth }; result: InstancesList };
+  /**
+   * Push `instances.snapshot` for config root `dir` (absolute) while connected; subscribe to
+   * `instances` first (else `invalid`). The first one comes at once (cached, or from disk).
+   */
+  'instances.watch': { params: { dir: string }; result: OkResult };
+  /** Stop `instances.watch`ing `dir`; not watching it is fine. */
+  'instances.unwatch': { params: { dir: string }; result: OkResult };
   /** `not-found` when nothing matches. */
   'instances.resolve': { params: { name: string }; result: InstancesResolved };
   /** SIGINT an in-flight `run`/`rebuild` (it rolls back or records failed); `invalid` when not in flight. */

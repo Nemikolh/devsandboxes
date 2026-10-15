@@ -14,7 +14,9 @@
 //! - `proto`: the JSON-lines wire bits (`hello`, ids, errors)
 //! - `idle`: the pure idle countdown over a holder snapshot
 //! - `daemon`: the accept loop, lock, handoff and idle exit
-//! - `host`: the live host side: the bridge poll and the autostart pass
+//! - `host`: the live host side: the one container poll (bridges, forwards,
+//!   watched roots' snapshots) and the autostart pass
+//! - `snapshots`: the watched roots' snapshot cache and the poll's cadence
 //! - `forwards`: the port forwards (ad-hoc and configured), on their own thread
 //! - `forward_store`: `forwards.toml`, the ad-hoc forwards a successor restores
 //! - `client`: connect-or-lazy-start for commands
@@ -37,6 +39,7 @@ pub mod idle;
 pub mod install;
 pub mod proto;
 pub mod relay;
+pub mod snapshots;
 pub mod verbs;
 pub mod verbs_client;
 #[cfg(test)]

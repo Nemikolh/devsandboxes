@@ -8,8 +8,9 @@
 //!
 //! No sockets here: [`call`] is a function of the method, its params and a
 //! [`Ctx`] (the store path), so every handler is tested against a temp store.
-//! Connection-level methods (`hello`, `subscribe`, `unsubscribe`) live in
-//! `daemon.rs`, which owns the connection; [`topics`] parses theirs.
+//! Connection-level methods (`hello`, `subscribe`, `unsubscribe`,
+//! `instances.watch`, `instances.unwatch`) live in `daemon.rs`, which owns
+//! the connection; [`topics`] and [`watch_dir`] parse theirs.
 //!
 //! Mutations check and apply in one locked write (`ops::apply_if`), so a
 //! thread removed between the check and the write can't turn `not-found`
@@ -175,6 +176,26 @@ pub fn topics(params: Value) -> Result<Vec<Topic>, ApiError> {
         .iter()
         .map(|t| Topic::parse(t).ok_or_else(|| ApiError::invalid(format!("unknown topic `{t}` (inbox, instances, forwards)"))))
         .collect()
+}
+
+#[derive(Deserialize)]
+struct WatchParams {
+    dir: PathBuf,
+}
+
+/// `instances.watch` / `instances.unwatch` params: `{"dir": …}`, checked
+/// like `instances.list`'s (absolute, an existing directory). Unwatching
+/// (`!exists`) only needs it absolute: a root deleted meanwhile can still be
+/// let go.
+pub fn watch_dir(params: Value, exists: bool) -> Result<PathBuf, ApiError> {
+    let p: WatchParams = parse(params)?;
+    if !p.dir.is_absolute() {
+        return Err(ApiError::invalid(format!("`dir` must be absolute, got `{}`", p.dir.display())));
+    }
+    if exists && !p.dir.is_dir() {
+        return Err(ApiError::not_found(format!("no directory {}", p.dir.display())));
+    }
+    Ok(p.dir)
 }
 
 /// The client name the store records for a connection whose hello said
@@ -404,13 +425,21 @@ fn instances_list_with(
     if !p.dir.is_dir() {
         return Err(ApiError::not_found(format!("no directory {}", p.dir.display())));
     }
-    let snapshot = collect(&p.dir, depth);
-    // An unreadable state resolves no child, like the dashboard's own
-    // collection; the snapshot's `error` already says why.
-    let thread_children = crate::state::State::load_at(state)
-        .map(|s| crate::commands::dispatch::thread_children(&s))
-        .unwrap_or_default();
-    serde_json::to_value(InstancesList { snapshot, thread_children }).map_err(|e| ApiError::internal(e.into()))
+    let list = InstancesList::of(collect(&p.dir, depth), state);
+    serde_json::to_value(list).map_err(|e| ApiError::internal(e.into()))
+}
+
+impl InstancesList {
+    /// `snapshot` plus `thread_children` from `state`: what `instances.list`
+    /// answers and `instances.snapshot` pushes.
+    pub(crate) fn of(snapshot: crate::snapshot::Snapshot, state: &Path) -> Self {
+        // An unreadable state resolves no child, like the dashboard's own
+        // collection; the snapshot's `error` already says why.
+        let thread_children = crate::state::State::load_at(state)
+            .map(|s| crate::commands::dispatch::thread_children(&s))
+            .unwrap_or_default();
+        InstancesList { snapshot, thread_children }
+    }
 }
 
 /// The user's `state.toml`, as the instance methods read it.
@@ -1804,6 +1833,8 @@ mod tests {
         assert_matches("InstanceDone", &v(&DoneSet { instance: "w".into(), done: true }));
         for (method, result) in [
             ("instances.list", "InstancesList"),
+            ("instances.watch", "OkResult"),
+            ("instances.unwatch", "OkResult"),
             ("instances.resolve", "InstancesResolved"),
             ("instances.cancel", "InstanceCancelled"),
             ("instances.procs", "Record<string, InstanceProcs>"),
@@ -1820,6 +1851,19 @@ mod tests {
             let ty = prop_type("ApiMethods", method).unwrap_or_else(|| panic!("ApiMethods lacks `{method}`"));
             assert!(ty.contains(&format!("result: {result} ")), "{method}: {ty}");
         }
+    }
+
+    #[test]
+    fn watch_dirs_are_absolute_and_exist_to_watch() {
+        let tmp = std::env::temp_dir();
+        assert_eq!(watch_dir(json!({"dir": tmp}), true).unwrap(), tmp);
+        assert_eq!(watch_dir(json!({"dir": "rel"}), true).unwrap_err().code, "invalid");
+        assert_eq!(watch_dir(json!({"dir": "rel"}), false).unwrap_err().code, "invalid");
+        assert_eq!(watch_dir(json!({}), true).unwrap_err().code, "invalid");
+        let gone = tmp.join(format!("dsv-gone-{}", std::process::id()));
+        assert_eq!(watch_dir(json!({"dir": gone}), true).unwrap_err().code, "not-found");
+        // Letting go of a root deleted meanwhile is fine.
+        assert_eq!(watch_dir(json!({"dir": gone}), false).unwrap(), gone);
     }
 
     #[test]

@@ -611,12 +611,115 @@ pub enum Depth {
     Full,
 }
 
-/// [`collect`] down to `depth` (see [`Depth`]).
+/// What one pass over the runtime saw: the half of a collection that doesn't
+/// depend on the config root, so the daemon's poll asks the runtime once per
+/// tick and joins every watched root against it ([`collect_from`]).
+#[derive(Clone, Debug)]
+pub struct RuntimeView {
+    /// [`Depth::Disk`]: nothing asked; `Listing`: `ps` (+ version); `Full`:
+    /// stats too.
+    pub depth: Depth,
+    /// Every devsandbox container (`list(true, NAME_PREFIX)`); empty when
+    /// not listed or the listing failed.
+    pub ps: Vec<ContainerRow>,
+    /// Container name → (cpu, mem); empty below [`Depth::Full`].
+    pub stats: BTreeMap<String, (String, String)>,
+    pub runtime_name: String,
+    pub runtime_version: Option<String>,
+    /// The runtime's failures, as the snapshot's `error` reports them.
+    pub errors: Vec<String>,
+    /// When the runtime was asked: the snapshots' `collected_at`.
+    pub at: Instant,
+}
+
+impl RuntimeView {
+    /// No runtime call ([`Depth::Disk`]).
+    pub fn disk() -> Self {
+        Self::from_parts(backend(), None, None)
+    }
+
+    /// Ask the runtime down to `depth`: one listing, one stats call.
+    pub fn gather(depth: Depth) -> Self {
+        let rt = backend();
+        let listing = (depth != Depth::Disk).then(|| rt.list(true, NAME_PREFIX));
+        let stats = (depth == Depth::Full).then(|| rt.stats());
+        Self::from_parts(rt, listing, stats)
+    }
+
+    /// A view from answers already in hand (`None`: not asked). The depth
+    /// is what was asked; stats without a listing count as a listing's
+    /// absence (Disk). The version is asked here, once per process.
+    pub fn from_parts(
+        rt: &dyn crate::runtime::Backend,
+        listing: Option<anyhow::Result<Vec<ContainerRow>>>,
+        stats: Option<anyhow::Result<Vec<crate::runtime::StatsRow>>>,
+    ) -> Self {
+        let at = Instant::now();
+        let mut errors: Vec<String> = Vec::new();
+        let listed = listing.is_some();
+        let ps = match listing {
+            None => Vec::new(),
+            Some(Ok(rows)) => rows,
+            Some(Err(e)) => {
+                errors.push(format!("{} unavailable: {e:#}", rt.name()));
+                Vec::new()
+            }
+        };
+        // Runtime version for the header; best-effort (None when down). Kept off
+        // the UI thread like every other runtime call here, and asked once per
+        // process: the TUI would otherwise spend a docker call per tick on it.
+        let runtime_version = if listed { runtime_version(rt) } else { None };
+        let depth = if listed { Depth::Listing } else { Depth::Disk };
+        let mut view =
+            Self { depth, ps, stats: BTreeMap::new(), runtime_name: rt.name().to_string(), runtime_version, errors, at };
+        if let Some(stats) = stats {
+            view.add_stats(stats);
+        }
+        view
+    }
+
+    /// Stats on top of a listing ([`Depth::Full`]); ignored on a view that
+    /// didn't list (Disk).
+    pub fn add_stats(&mut self, stats: anyhow::Result<Vec<crate::runtime::StatsRow>>) {
+        if self.depth == Depth::Disk {
+            return;
+        }
+        self.depth = Depth::Full;
+        match stats {
+            Ok(rows) => self.stats = rows.into_iter().map(|s| (s.name, (s.cpu, s.mem))).collect(),
+            // Only report a stats error if the listing succeeded; otherwise that
+            // error already covers "runtime is down".
+            Err(e) => {
+                if self.errors.is_empty() {
+                    self.errors.push(format!("{} stats: {e:#}", self.runtime_name));
+                }
+            }
+        }
+    }
+}
+
+/// [`collect`] down to `depth` (see [`Depth`]): [`RuntimeView::gather`] +
+/// [`collect_from`]. A state that won't load answers before the runtime is
+/// asked.
 pub fn collect_with(dir: &Path, depth: Depth) -> Snapshot {
-    let collected_at = Instant::now();
+    match State::load() {
+        Ok(state) => join(dir, Ok(state), &RuntimeView::gather(depth)),
+        Err(e) => join(dir, Err(e), &RuntimeView::disk()),
+    }
+}
+
+/// Config root `dir`'s snapshot from a runtime pass already made: the state
+/// and config are read here, the runtime isn't asked. Every root the daemon
+/// polls for shares one `view`.
+pub fn collect_from(dir: &Path, view: &RuntimeView) -> Snapshot {
+    join(dir, State::load(), view)
+}
+
+fn join(dir: &Path, state: anyhow::Result<State>, view: &RuntimeView) -> Snapshot {
+    let collected_at = view.at;
     let now_unix = Instance::now();
 
-    let state = match State::load() {
+    let state = match state {
         Ok(s) => s,
         Err(e) => {
             return Snapshot {
@@ -624,7 +727,7 @@ pub fn collect_with(dir: &Path, depth: Depth) -> Snapshot {
                 sandboxes: Vec::new(),
                 services: Vec::new(),
                 sandbox_count: 0,
-                runtime_name: backend().name().to_string(),
+                runtime_name: view.runtime_name.clone(),
                 runtime_version: None,
                 collected_at,
                 stats: false,
@@ -633,37 +736,9 @@ pub fn collect_with(dir: &Path, depth: Depth) -> Snapshot {
         }
     };
 
-    let mut errors: Vec<String> = Vec::new();
-
-    // One listing and one stats call for the whole snapshot.
-    let rt = backend();
-    let listed = depth != Depth::Disk;
-    let ps = match listed.then(|| rt.list(true, NAME_PREFIX)) {
-        None => Vec::new(),
-        Some(Ok(rows)) => rows,
-        Some(Err(e)) => {
-            errors.push(format!("{} unavailable: {e:#}", rt.name()));
-            Vec::new()
-        }
-    };
-
-    let stats: BTreeMap<String, (String, String)> = match (depth == Depth::Full).then(|| rt.stats()) {
-        None => BTreeMap::new(),
-        Some(Ok(rows)) => rows.into_iter().map(|s| (s.name, (s.cpu, s.mem))).collect(),
-        // Only report a stats error if the listing succeeded; otherwise that
-        // error already covers "runtime is down".
-        Some(Err(e)) => {
-            if errors.is_empty() {
-                errors.push(format!("{} stats: {e:#}", rt.name()));
-            }
-            BTreeMap::new()
-        }
-    };
-
-    // Runtime version for the header; best-effort (None when down). Kept off
-    // the UI thread like every other runtime call here, and asked once per
-    // process: the TUI would otherwise spend a docker call per tick on it.
-    let runtime_version = if listed { runtime_version(rt) } else { None };
+    let mut errors: Vec<String> = view.errors.clone();
+    let (ps, stats) = (&view.ps, &view.stats);
+    let listed = view.depth != Depth::Disk;
 
     // Load config once; resolve every sandbox for the tree, services + drift
     // hash. `resolved` maps sandbox name → (services, hash) for the instance join.
@@ -693,7 +768,7 @@ pub fn collect_with(dir: &Path, depth: Depth) -> Snapshot {
     let mut instances = Vec::with_capacity(state.instances.len());
     for (name, inst) in &state.instances {
         let phase = inst.phase_view().map(PhaseRow::from);
-        instances.push(instance_row(name, inst, phase, &ps, &stats, &resolved, now_unix));
+        instances.push(instance_row(name, inst, phase, ps, stats, &resolved, now_unix));
     }
 
     // Services view: (instance name, persistent id, service list of its
@@ -714,7 +789,7 @@ pub fn collect_with(dir: &Path, depth: Depth) -> Snapshot {
 
     let mut services = match (&config, project_id(dir)) {
         (Ok(cfg), Ok(project)) => {
-            let (rows, mut svc_errors) = service_rows(dir, &project, cfg, &instance_services, &ps);
+            let (rows, mut svc_errors) = service_rows(dir, &project, cfg, &instance_services, ps);
             errors.append(&mut svc_errors);
             rows
         }
@@ -744,10 +819,10 @@ pub fn collect_with(dir: &Path, depth: Depth) -> Snapshot {
         sandboxes,
         services,
         sandbox_count,
-        runtime_name: rt.name().to_string(),
-        runtime_version,
+        runtime_name: view.runtime_name.clone(),
+        runtime_version: view.runtime_version.clone(),
         collected_at,
-        stats: depth == Depth::Full,
+        stats: view.depth == Depth::Full,
         error: if errors.is_empty() { None } else { Some(errors.join("; ")) },
     }
 }
@@ -1249,5 +1324,57 @@ extends = "does-not-exist"
         assert!(validate_sandbox(&root, &feat).is_empty());
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// One runtime pass joined per root: the view's depth decides statuses,
+    /// cpu/mem and the `stats` flag; its errors reach the snapshot.
+    #[test]
+    fn join_reads_the_runtime_only_through_the_view() {
+        const STATE: &str = r#"
+            [instance.web]
+            sandbox = "web"
+            container = "devsandbox-web"
+            folder = "/w/web"
+            workspace = "/workspaces/web"
+            created_unix = 0
+        "#;
+        let dir = std::env::temp_dir().join(format!("dsv-join-{}", std::process::id()));
+        let view = |depth: Depth| RuntimeView {
+            depth,
+            ps: if depth == Depth::Disk { Vec::new() } else { vec![ps_line("devsandbox-web", "Up 1s", "running")] },
+            stats: if depth == Depth::Full {
+                BTreeMap::from([("devsandbox-web".to_string(), ("1%".to_string(), "2MiB".to_string()))])
+            } else {
+                BTreeMap::new()
+            },
+            runtime_name: "docker".into(),
+            runtime_version: (depth != Depth::Disk).then(|| "27.0".to_string()),
+            errors: Vec::new(),
+            at: Instant::now(),
+        };
+        let load = || toml::from_str::<State>(STATE).unwrap();
+
+        let disk = join(&dir, Ok(load()), &view(Depth::Disk));
+        assert_eq!(disk.instances[0].status, ContainerStatus::Unknown);
+        assert!(!disk.stats && disk.runtime_version.is_none());
+
+        let listing = join(&dir, Ok(load()), &view(Depth::Listing));
+        assert_eq!(listing.instances[0].status, ContainerStatus::Running("Up 1s".into()));
+        assert_eq!((listing.instances[0].cpu.as_deref(), listing.stats), (None, false));
+        assert_eq!(listing.runtime_version.as_deref(), Some("27.0"));
+
+        let full = join(&dir, Ok(load()), &view(Depth::Full));
+        assert_eq!((full.instances[0].cpu.as_deref(), full.instances[0].mem.as_deref()), (Some("1%"), Some("2MiB")));
+        assert!(full.stats);
+
+        let mut down = view(Depth::Listing);
+        down.ps.clear();
+        down.errors.push("docker unavailable: no".into());
+        let down = join(&dir, Ok(load()), &down);
+        assert_eq!(down.instances[0].status, ContainerStatus::Missing);
+        assert!(down.error.as_deref().unwrap().starts_with("docker unavailable: no"), "{:?}", down.error);
+
+        let broken = join(&dir, Err(anyhow::anyhow!("bad")), &view(Depth::Full));
+        assert_eq!((broken.instances.len(), broken.error.as_deref()), (0, Some("state: bad")));
     }
 }
