@@ -382,11 +382,6 @@ The other verbs moving into the daemon and remote machines:
 
 Accepted trade-offs of the current design, to revisit:
 
-- **The dashboard doesn't watch yet.** The daemon side of the shared poll
-  is there (*Snapshots*), but the dashboard still polls `instances.list`
-  itself, so two dashboards each query the runtime. `instances.procs`
-  stays per request and per dashboard by design: it's per expanded
-  instance.
 - **Forwards hold the daemon indefinitely.** Every live forward is a holder,
   so a running instance with `forwardPorts`, or any saved ad-hoc forward
   (`forwards.toml`, restored at every start), keeps the daemon from ever

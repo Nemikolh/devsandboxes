@@ -393,7 +393,8 @@ fn depth(name: Option<&str>) -> Result<crate::snapshot::Depth, ApiError> {
 /// `instances.list`'s answer: the snapshot's fields at top level, plus the
 /// dispatcher children the Inbox thread pane links to (owner `instance_id`
 /// → key → child instance name, `dispatch::thread_children`). Not part of
-/// `status --json`. Read back by the dashboard (`tui::poll`).
+/// `status --json`. Also an `instances.snapshot`'s params (plus `dir`),
+/// read back by the dashboard (`tui::daemon`).
 #[derive(Debug, Serialize, Deserialize)]
 pub struct InstancesList {
     #[serde(flatten)]

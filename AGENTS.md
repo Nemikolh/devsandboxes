@@ -150,17 +150,18 @@ git worktrees so working trees are never shared.
   `kitty.rs` emulates the kitty keyboard protocol for those sessions (vt100
   callbacks + key encoding; see `docs/tui-terminal.md`);
   `daemon.rs` is the host-daemon worker thread (unix): owns the `serve`
-  connection (the dashboard as a holder; reconnect with backoff), relays
-  `inbox.changed`/`instances.changed`/`inbox.shown`, sends Inbox `Op`s as
+  connection (the dashboard as a holder; reconnect with backoff), watches
+  the dashboard's root on every (re)connect (`instances.watch`) and relays
+  its `instances.snapshot` pushes (the tree; a lost connection marks it
+  stale), `inbox.changed`/`instances.changed`/`inbox.shown`, sends Inbox `Op`s as
   API calls while connected (else the loop applies them locally), and is
   the Ports tab's client (`forwards.list` on `forwards.changed`,
   `forwards.add`/`rm`; the daemon owns the forwards), sends `d`'s
   `instances.cancel`, and carries the one-shot calls (`Cmd::Fetch`: logs,
   inspect, config, build log; `Signal`, `Rename`, `Done`), each answered
-  by one `DaemonUpdate`. `poll.rs` is the dashboard's reads: `instances.list`
-  (the snapshot, at the depth the loop's schedule picks) and
-  `instances.procs`, a thread and a connection each, never starting a
-  daemon (`daemon.rs` does). The dashboard's `run`/`rebuild`/`start` are detached
+  by one `DaemonUpdate`. `poll.rs` is the dashboard's per-request read:
+  `instances.procs`, on a thread and connection of its own, never starting
+  a daemon (`daemon.rs` does). The dashboard's `run`/`rebuild`/`start` are detached
   verb requests, `stop`/`rm`/`services.rebuild` held ones, each on its own
   connection (`spawn_verb` in `tui/mod.rs`).
   Mouse selection (`docs/tui-selection.md`): `select.rs` is the pure model

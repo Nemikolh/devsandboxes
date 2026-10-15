@@ -22,7 +22,7 @@ use crate::state::{Instance, PhaseView, State};
 /// Container liveness, joined from `docker ps` against the state's instance list.
 /// Serializes as an internally-tagged object so JSON consumers switch on
 /// `state` and read the runtime text from `text` (absent for `missing`).
-/// Deserializes too: the dashboard reads it back from `instances.list`.
+/// Deserializes too: the dashboard reads it back from `instances.snapshot`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", content = "text", rename_all = "lowercase")]
 pub enum ContainerStatus {
@@ -187,9 +187,9 @@ pub struct ServiceRow {
 
 /// A point-in-time view of instances plus any collection error (docker/config
 /// unavailable). Rows are always present from state even when docker is down.
-/// Deserializes too (the dashboard reads `instances.list`): the skipped
-/// fields then say when it arrived and no stats, which the reader corrects
-/// from the depth it asked for.
+/// Deserializes too (the dashboard reads `instances.snapshot` pushes): the
+/// skipped fields then say when it arrived and no stats; the daemon already
+/// carried cpu/mem over, so the reader installs it as is.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Snapshot {
     pub instances: Vec<InstanceRow>,

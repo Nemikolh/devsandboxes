@@ -8,9 +8,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::procs::{ProcState, MESSAGE_ROW};
 
-pub use crate::snapshot::{ContainerStatus, Depth, InstanceRow, SandboxRow, ServiceRow, Snapshot};
+pub use crate::snapshot::{ContainerStatus, InstanceRow, SandboxRow, ServiceRow, Snapshot};
 
-/// Why a request to the daemon got no answer (`tui::poll`).
+/// Why a request to the daemon got no answer (`tui::poll`), or why the
+/// tree's snapshot is stale (`tui::daemon`'s connection is down).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FetchError {
     /// No daemon answered, or the connection broke: the dashboard needs one.
@@ -188,9 +189,10 @@ pub fn humanize_secs(secs: u64) -> String {
     }
 }
 
-/// How stale a snapshot may be before the header flags it, in seconds. Normal
-/// refresh cadence is 2s (see `mod::TICK_INTERVAL`); 10s means collection is
-/// slow or failing.
+/// How stale a snapshot may be before the header flags it, in seconds. The
+/// daemon pushes every collection, changed or not, every 2s
+/// (`serve::snapshots`), and the age counts from arrival; 10s means
+/// collection is slow or failing.
 pub const STALE_AFTER_SECS: u64 = 10;
 
 /// Right-aligned totals summary for the header, e.g.

@@ -60,85 +60,8 @@ const POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// becomes visible on the next draw — a 250ms cadence makes shell echo feel
 /// laggy, so we redraw ~33×/s to keep echo snappy while terminals exist.
 const TERM_POLL_INTERVAL: Duration = Duration::from_millis(30);
-/// Data-refresh cadence: how often a background collection is kicked off.
-const TICK_INTERVAL: Duration = Duration::from_secs(2);
-/// Cpu/mem cadence: at most one stats collection per interval, the ticks in
-/// between are listing-only (`StatsClock`). `stats --no-stream` samples every
-/// running container twice, the bulk of the TUI's dockerd load.
-const STATS_INTERVAL: Duration = Duration::from_secs(7);
-/// Process-refresh cadence for expanded instances (separate from the snapshot).
+/// Process-refresh cadence for expanded instances (the snapshot is pushed).
 const PROC_TICK: Duration = Duration::from_secs(5);
-/// Delay of the second refresh after a start/stop finishes. The immediate one
-/// can be skipped (a stale collection already in flight) or land before the
-/// containers settle (`health: starting`), so re-poll shortly after.
-const FOLLOWUP_DELAY: Duration = Duration::from_millis(500);
-
-/// One-shot delayed refresh armed when a start/stop finishes. Kept separate
-/// from the event loop so the timing is testable without a runtime.
-#[derive(Default)]
-struct FollowUp {
-    due: Option<Instant>,
-}
-
-impl FollowUp {
-    /// (Re)arm for `now + FOLLOWUP_DELAY`; a later op pushes the deadline out so
-    /// back-to-back ops collapse into one follow-up after the last.
-    fn schedule(&mut self, now: Instant) {
-        self.due = Some(now + FOLLOWUP_DELAY);
-    }
-
-    /// True once due and no collection is in flight (`busy`), disarming it. A
-    /// due follow-up stays armed while busy, so it runs as soon as the slot
-    /// frees instead of being dropped like a plain tick.
-    fn take_due(&mut self, now: Instant, busy: bool) -> bool {
-        match self.due {
-            Some(due) if now >= due && !busy => {
-                self.due = None;
-                true
-            }
-            _ => false,
-        }
-    }
-}
-
-/// Ask for a refresh snapshot, with stats only when `clock` says they're due,
-/// unless one is outstanding (`busy`): docker calls can't pile up.
-fn refresh(poll: &PollWorker, busy: &mut bool, clock: &mut StatsClock) {
-    if !*busy {
-        poll.request_snapshot(clock.depth(Instant::now()));
-        *busy = true;
-    }
-}
-
-/// [`refresh`] for something that just changed what the snapshot shows
-/// (a rename, a suspended command): one already outstanding may predate the
-/// change, so a follow-up asks again once it's in.
-fn refresh_after_change(poll: &PollWorker, busy: &mut bool, clock: &mut StatsClock, followup: &mut FollowUp) {
-    if *busy {
-        followup.schedule(Instant::now());
-    } else {
-        refresh(poll, busy, clock);
-    }
-}
-
-/// Picks each collection's depth so stats run at most every `STATS_INTERVAL`.
-/// Kept separate from the event loop so the timing is testable without a
-/// runtime.
-#[derive(Default)]
-struct StatsClock {
-    last: Option<Instant>,
-}
-
-impl StatsClock {
-    /// `Full` (recording `now`) when stats are due, else `Listing`.
-    fn depth(&mut self, now: Instant) -> data::Depth {
-        if self.last.is_some_and(|last| now < last + STATS_INTERVAL) {
-            return data::Depth::Listing;
-        }
-        self.last = Some(now);
-        data::Depth::Full
-    }
-}
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
@@ -242,16 +165,13 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
     // once when something here poked it.
     let mut inbox_stamp = inbox::store::path().ok().and_then(|p| inbox::ops::stamp(&p));
     let mut reload_inbox = false;
-    // The daemon collects the snapshot and the processes (`poll.rs`), at
-    // most one request of each outstanding (`pending` / `proc_pending`).
-    // Startup walks the `Depth`s cheapest first, so the tree renders straight
-    // from disk and statuses, then cpu/mem, fill in as the runtime answers;
-    // `deeper` holds the depths still to chain (popped from the back).
-    let poller = PollWorker::spawn(dir.clone());
-    poller.request_snapshot(data::Depth::Disk);
-    let mut pending = true;
-    let mut deeper = vec![data::Depth::Full, data::Depth::Listing];
-    let mut stats_clock = StatsClock::default();
+    // The snapshot is the daemon's: its one poll pushes it to the watch the
+    // daemon worker holds (`DaemonUpdate::Snapshot`, every ~2 s, its Disk →
+    // Listing → Full walk first, so the tree renders straight from disk and
+    // statuses, then cpu/mem, fill in). Until the first push the tree says
+    // `loading…`. The processes are asked for per request (`poll.rs`), at
+    // most one outstanding (`proc_pending`).
+    let poller = PollWorker::spawn();
     // Background VS Code launches (`o`, `:code`, a thread's `vscode`): a
     // `--goto` waits up to 30 s for the window. No guard: a second launch
     // just focuses the same window.
@@ -262,16 +182,15 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
     // none). Paired with their action so the answer
     // reaches `App` (guards, rm's question) even if the thread dies.
     let mut verbs: Vec<(PromptAction, Receiver<VerbEnd>)> = Vec::new();
-    let mut last_tick = Instant::now();
     let mut proc_pending = false;
     // Set while a procs failure the daemon answered is shown, so it's one
     // status line per streak. A daemon that can't be reached isn't one:
     // `daemon.rs` already says so.
     let mut procs_failing = false;
     let mut last_proc_tick = Instant::now();
-    let mut followup = FollowUp::default();
-    // Set while the follow-up's collection runs: proc targets come from the
-    // snapshot, so the proc refresh must wait for it to land.
+    // Set when something changed what runs (a verb, a rename, a done flag,
+    // `instances.changed`): proc targets come from the snapshot, so the proc
+    // refresh waits for the next push to land.
     let mut procs_after_snapshot = false;
     // The host daemon (docs/serve.md) owns the bridges: ssh-agent relays,
     // the notify drain, popups and control ops. Its worker thread
@@ -353,7 +272,8 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
 
         // A prompt command or key action is ready: send a verb to the
         // daemon, launch `code` in the background, or suspend the TUI for
-        // `exec` (then force a redraw + immediate refresh on return).
+        // `exec` (then force a redraw on return; the processes refetch
+        // after the next push).
         if let Some(action) = app.take_pending_action() {
             match action {
                 // devsandbox serve runs the verb (a build outlives the
@@ -367,25 +287,20 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
                 | PromptAction::ServiceRebuild { .. }) => {
                     app.status = Some(verb_pending(&action));
                     verbs.push((action.clone(), spawn_verb(&dir, action, verb_tty(size.width, size.height))));
-                    last_tick = Instant::now();
-                    followup.schedule(last_tick);
-                    refresh(&poller, &mut pending, &mut stats_clock);
+                    procs_after_snapshot = true;
                 }
                 PromptAction::Code { instance, goto } => {
                     app.status = Some("opening VS Code…".into());
                     codes.push(spawn_code(dir.clone(), instance, goto, app.code_note.take()));
                 }
-                // `instances.rename`, no suspend; the answer (a status line,
-                // `DaemonUpdate::Renamed`) resnapshots so the renamed row
-                // shows then.
+                // `instances.rename`, no suspend; the answer is a status line
+                // (`DaemonUpdate::Renamed`), the renamed row comes with a push.
                 PromptAction::Rename { instance, new_name } => daemon.rename(instance, new_name),
                 other => {
                     run_suspended(terminal, &app.exec_cli, other)?;
                     // Redraw from scratch: the child scribbled over the screen.
                     terminal.clear()?;
-                    // Refresh data now rather than waiting for the next tick.
-                    last_tick = Instant::now();
-                    refresh_after_change(&poller, &mut pending, &mut stats_clock, &mut followup);
+                    procs_after_snapshot = true;
                 }
             }
         }
@@ -405,7 +320,7 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
         // (`instances.cancel`, whoever started it).
         if let Some(instance) = app.take_pending_cancel() {
             daemon.cancel(instance);
-            followup.schedule(Instant::now());
+            procs_after_snapshot = true;
         }
         // An open build log wants (re)reading (one read outstanding at a
         // time: `take_build_log_read`).
@@ -431,9 +346,22 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
             match update {
                 daemon::DaemonUpdate::InboxChanged => reload_inbox = true,
                 daemon::DaemonUpdate::Ports(rows) => app.set_ports(rows),
-                // The daemon's 5 s poll saw containers come or go:
-                // resnapshot soon rather than on the next tick.
-                daemon::DaemonUpdate::InstancesChanged => followup.schedule(Instant::now()),
+                daemon::DaemonUpdate::Snapshot(list) => {
+                    app.snapshot_error = None;
+                    app.thread_children = list.thread_children;
+                    app.set_snapshot(list.snapshot);
+                    if std::mem::take(&mut procs_after_snapshot) {
+                        app.needs_proc_fetch = true;
+                    }
+                }
+                // The last snapshot stays, marked stale with why (none yet:
+                // the tree says it); the next push clears it.
+                daemon::DaemonUpdate::Down(reason) => {
+                    app.snapshot_error = Some(data::FetchError { unreachable: true, reason });
+                }
+                // Containers came or went: the next push shows it, and the
+                // processes are refetched after it.
+                daemon::DaemonUpdate::InstancesChanged => procs_after_snapshot = true,
                 daemon::DaemonUpdate::Shown(line) | daemon::DaemonUpdate::Status(line) => app.status = Some(line),
                 daemon::DaemonUpdate::Logs { container, body } => app.set_logs(&container, body),
                 daemon::DaemonUpdate::Config { kind, name, text } => app.set_config(kind, &name, text),
@@ -445,20 +373,18 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
                     app.status = Some(line);
                     app.needs_proc_fetch = true;
                 }
+                // The row renames, dims or brightens with the next push (a
+                // `state.toml` write: within ~0.5 s).
                 daemon::DaemonUpdate::Renamed(line) => {
                     app.status = Some(line);
-                    last_tick = Instant::now();
-                    refresh_after_change(&poller, &mut pending, &mut stats_clock, &mut followup);
+                    procs_after_snapshot = true;
                 }
-                // A thread's child reports only on failure; resnapshot so the
-                // row dims or brightens now.
+                // A thread's child reports only on failure.
                 daemon::DaemonUpdate::Done { status, failed, report } => {
                     if report || failed {
                         app.status = Some(status);
                     }
-                    last_tick = Instant::now();
-                    followup.schedule(last_tick);
-                    refresh(&poller, &mut pending, &mut stats_clock);
+                    procs_after_snapshot = true;
                 }
             }
         }
@@ -504,9 +430,9 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
             Err(TryRecvError::Disconnected) => false,
         });
 
-        // Drain answered verb requests: hand the answer to `App`, and
-        // resnapshot so the row shows the build's phase, the stop, the
-        // removal.
+        // Drain answered verb requests: hand the answer to `App`. The row's
+        // phase, stop or removal comes with the pushes; the processes are
+        // refetched after the next one.
         verbs.retain_mut(|(action, rx)| {
             let end = match rx.try_recv() {
                 Ok(end) => end,
@@ -517,39 +443,13 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
                 }
             };
             app.verb_answered(action, end);
-            last_tick = Instant::now();
-            followup.schedule(last_tick);
-            refresh(&poller, &mut pending, &mut stats_clock);
+            procs_after_snapshot = true;
             false
         });
 
-        // Drain the daemon's answers into the app, freeing their slots.
+        // Drain the daemon's procs answers into the app, freeing the slot.
         while let Some(update) = poller.try_recv() {
             match update {
-                PollUpdate::Snapshot(answer) => {
-                    pending = false;
-                    match answer {
-                        Ok(list) => {
-                            app.snapshot_error = None;
-                            app.thread_children = list.thread_children;
-                            app.set_snapshot(list.snapshot);
-                            if let Some(depth) = deeper.pop() {
-                                if depth == data::Depth::Full {
-                                    stats_clock.last = Some(Instant::now());
-                                }
-                                poller.request_snapshot(depth);
-                                pending = true;
-                            }
-                            if procs_after_snapshot {
-                                procs_after_snapshot = false;
-                                app.needs_proc_fetch = true;
-                            }
-                        }
-                        // The last snapshot stays, marked stale with why
-                        // (none yet: the tree says it); the next tick retries.
-                        Err(e) => app.snapshot_error = Some(e),
-                    }
-                }
                 PollUpdate::Procs(answer) => {
                     proc_pending = false;
                     match answer {
@@ -567,17 +467,6 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
                     }
                 }
             }
-        }
-
-        if followup.take_due(Instant::now(), pending) {
-            last_tick = Instant::now();
-            refresh(&poller, &mut pending, &mut stats_clock);
-            procs_after_snapshot = true;
-        }
-
-        if last_tick.elapsed() >= TICK_INTERVAL {
-            last_tick = Instant::now();
-            refresh(&poller, &mut pending, &mut stats_clock);
         }
 
         // Process refresh: fetch now on expand / cursor move, else every
@@ -925,17 +814,6 @@ struct OpDone {
 mod tests {
     use super::*;
 
-    #[test]
-    fn stats_clock_runs_stats_at_most_once_per_interval() {
-        let t0 = Instant::now();
-        let mut c = StatsClock::default();
-        assert_eq!(c.depth(t0), data::Depth::Full, "first refresh has stats");
-        assert_eq!(c.depth(t0 + TICK_INTERVAL), data::Depth::Listing);
-        assert_eq!(c.depth(t0 + STATS_INTERVAL - Duration::from_millis(1)), data::Depth::Listing);
-        assert_eq!(c.depth(t0 + STATS_INTERVAL), data::Depth::Full);
-        assert_eq!(c.depth(t0 + STATS_INTERVAL + TICK_INTERVAL), data::Depth::Listing);
-    }
-
     fn run_action(name: Option<&str>, branch: Option<&str>, base: Option<&str>) -> PromptAction {
         PromptAction::Run {
             sandbox: "web".into(),
@@ -1094,36 +972,5 @@ mod tests {
         );
         let ok = Ok(Streamed::Answer(Response { id: Some(1), result: Some(json!({"instance": "web-2", "exit": 0})), error: None }));
         assert_eq!(verb_end(&rm(None), ok), VerbEnd::Done { status: "removed web-2".into(), failed: false });
-    }
-
-    #[test]
-    fn followup_fires_once_after_delay() {
-        let t0 = Instant::now();
-        let mut f = FollowUp::default();
-        assert!(!f.take_due(t0, false), "unarmed never fires");
-        f.schedule(t0);
-        assert!(!f.take_due(t0 + Duration::from_millis(499), false));
-        assert!(f.take_due(t0 + FOLLOWUP_DELAY, false));
-        assert!(!f.take_due(t0 + Duration::from_secs(5), false), "one-shot");
-    }
-
-    #[test]
-    fn followup_waits_for_in_flight_collection() {
-        let t0 = Instant::now();
-        let mut f = FollowUp::default();
-        f.schedule(t0);
-        let late = t0 + Duration::from_secs(1);
-        assert!(!f.take_due(late, true), "held while busy");
-        assert!(f.take_due(late, false), "runs once the slot frees");
-    }
-
-    #[test]
-    fn followup_reschedule_pushes_deadline() {
-        let t0 = Instant::now();
-        let mut f = FollowUp::default();
-        f.schedule(t0);
-        f.schedule(t0 + Duration::from_millis(300));
-        assert!(!f.take_due(t0 + FOLLOWUP_DELAY, false));
-        assert!(f.take_due(t0 + Duration::from_millis(800), false));
     }
 }

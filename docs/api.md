@@ -761,9 +761,14 @@ config file, no runtime call. Its connections:
 
 - **The long-lived one** (`src/tui/daemon.rs`), the only one that starts
   a daemon at launch: subscribed to `inbox`, `instances` and `forwards`,
-  reconnecting after `closing` or a lost connection (at once, then 1 s,
-  2 s, … up to 30 s apart; after a handoff it waits up to 5 s for the
-  successor before starting a daemon). It carries the quick calls: the
+  then `instances.watch` on its config root, again on every reconnect
+  (after `closing` or a lost connection: at once, then 1 s, 2 s, … up to
+  30 s apart; after a handoff it waits up to 5 s for the successor before
+  starting a daemon). The tree is the `instances.snapshot` pushes: the
+  daemon's Disk → Listing → Full walk at the watch, then every collection
+  (~2 s, stats at most every 7 s, cpu/mem carried over by the daemon);
+  `thread_children` maps an Inbox thread to its child. It carries the
+  quick calls: the
   logs modal (`containers.logs`), the config view (`sandboxes.get` /
   `services.get`, `containers.inspect`), `b` (`instances.buildLog`,
   re-read while the instance is in flight), the process keys
@@ -773,14 +778,12 @@ config file, no runtime call. Its connections:
   (`forwards.list` for its config root, re-fetched on `forwards.changed`
   and after every reconnect; `p` / `:port` is `forwards.add`, `d` is
   `forwards.rm`). `inbox.shown` and `forwards.status` are status lines.
-- **Two poll connections** (`src/tui/poll.rs`), one for `instances.list`
-  and one for `instances.procs`, so a slow `docker stats` never holds up a
-  procs fetch or the other way round. They never start a daemon (they wait
-  up to 5 s for one), and keep at most one request each in flight. The
-  tree is `instances.list` at `depth: "listing"` every 2 s, `"full"` (with
-  stats) at most every 7 s, and right after an `instances.changed`;
-  `thread_children` maps an Inbox thread to its child. Expanded instances'
-  processes are `instances.procs`, every 5 s.
+- **A procs connection** (`src/tui/poll.rs`) for `instances.procs`, so a
+  procs fetch (a `docker exec` per instance) never holds up the
+  notifications. It never starts a daemon (it waits up to 5 s for one) and
+  keeps at most one request in flight. Expanded instances' processes are
+  fetched every 5 s, on an expand, and after the first push that follows a
+  change (a verb, a rename, a done flag, `instances.changed`).
 - **One per verb** (`spawn_verb` in `src/tui/mod.rs`): `run`, `rebuild`
   and `start` (`s` on a stopped row too) are verb requests (*Verbs*),
   always `detach`; `stop` (`s` on a running row), `rm` (`d`, `:rm`) and
@@ -796,16 +799,16 @@ An instance's terminal tab runs `devsandbox -C <root> exec -i -t --
 `<runtime> exec -it`.
 
 Disconnected: the last tree stays, its header marked stale with the reason
-(never connected: an empty tree that says devsandbox serve is needed), the
+until the next push (never connected: an empty tree that says devsandbox
+serve is needed), the
 Ports tab is empty, and every request answers with a status line saying
 the daemon is needed. There is no in-process fallback.
 
 The Inbox is still read from the store file (reloaded on `inbox.changed`
 or when the file moves), and written straight to it (the same ops code)
 while disconnected. VS Code (`o`, `:code`) reads `state.toml`. Two
-dashboards share one daemon and the same forwards; each polls on its own,
-and the daemon answers each request with fresh runtime calls (no shared
-cache).
+dashboards share one daemon, the same forwards and the same poll: the
+daemon collects a watched root once per tick, whoever watches it.
 
 ## The CLI as a client
 

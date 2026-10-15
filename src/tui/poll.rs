@@ -1,13 +1,14 @@
-//! The dashboard's reads from the host daemon (docs/dashboard-client.md, F2):
-//! the snapshot (`instances.list`) and the expanded instances' processes
-//! (`instances.procs`). The event loop decides when (its 2 s tick, the
-//! `StatsClock`, `PROC_TICK`, follow-ups) and keeps at most one request of
-//! each kind outstanding; this worker only asks and answers.
+//! The dashboard's per-request read from the host daemon
+//! (docs/dashboard-client.md, F2): the expanded instances' processes
+//! (`instances.procs`), per dashboard since each expands its own. The event
+//! loop decides when (`PROC_TICK`, an expand, a snapshot after a change) and
+//! keeps at most one request outstanding; this worker only asks and answers.
+//! The snapshot isn't read here: the daemon pushes it to `tui::daemon`'s
+//! watch (`instances.snapshot`).
 //!
-//! Two threads, one connection each, so a 1.5 s `docker stats` never holds
-//! up a procs fetch (a `docker exec` per instance) or the other way round,
-//! and neither waits behind `tui::daemon`'s long-lived connection. No
-//! subscribe: `tui::daemon` relays `instances.changed`.
+//! One thread with its own connection, so a procs fetch (a `docker exec` per
+//! instance) never waits behind `tui::daemon`'s long-lived connection, nor
+//! holds up its notifications. No subscribe.
 //!
 //! Connecting never starts a daemon: it waits up to `START_TIMEOUT` for one
 //! to answer. Starting one is `tui::daemon`'s job (it lazy-starts at once
@@ -18,11 +19,10 @@
 //! answering is an error answer, so the event loop never blocks and the
 //! next request tries again.
 //!
-//! A command channel per thread plus a short-joining `Drop`; nothing is
+//! A command channel plus a short-joining `Drop`; nothing is
 //! ever written to stderr, failures are [`FetchError`]s.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::JoinHandle;
@@ -31,9 +31,9 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use serde_json::{Value, json};
 
-use super::data::{Depth, FetchError};
+use super::data::FetchError;
 use super::procs::{self, ProcState};
-use crate::serve::api::{InstancesList, ProcsAnswer};
+use crate::serve::api::ProcsAnswer;
 use crate::serve::client::{self, Conn};
 use crate::serve::endpoint;
 use crate::serve::proto::{Response, Version};
@@ -42,46 +42,33 @@ use crate::serve::proto::{Response, Version};
 /// be mid-call): the terminal restore mustn't hang on the daemon.
 const JOIN_TIMEOUT: Duration = Duration::from_millis(300);
 
-/// From the worker to the event loop: one per request, in order per kind.
+/// From the worker to the event loop: one per request, in order.
 #[derive(Debug)]
 pub enum PollUpdate {
-    /// `instances.list`'s answer, `stats` set from the depth asked for.
-    Snapshot(Result<InstancesList, FetchError>),
     /// `instances.procs`'s answer as the tree's states, by instance name.
     Procs(Result<BTreeMap<String, ProcState>, FetchError>),
 }
 
-/// How a thread gets its connection: [`connect`], or a test daemon's.
+/// How the thread gets its connection: [`connect`], or a test daemon's.
 type Connector = Arc<dyn Fn() -> Result<Conn> + Send + Sync>;
 
 /// Handle to the poll worker. Never blocks the UI thread.
 pub struct PollWorker {
-    snapshots: Option<Sender<Depth>>,
     procs: Option<Sender<Vec<String>>>,
     updates: Receiver<PollUpdate>,
     handles: Vec<JoinHandle<()>>,
 }
 
 impl PollWorker {
-    /// Spawn the worker for the dashboard of config root `dir`.
-    pub fn spawn(dir: PathBuf) -> PollWorker {
-        Self::spawn_with(super::daemon::root_dir(dir), Arc::new(connect))
+    /// Spawn the worker.
+    pub fn spawn() -> PollWorker {
+        Self::spawn_with(Arc::new(connect))
     }
 
-    fn spawn_with(dir: PathBuf, connector: Connector) -> PollWorker {
+    fn spawn_with(connector: Connector) -> PollWorker {
         let (utx, updates) = mpsc::channel();
-        let (stx, srx) = mpsc::channel::<Depth>();
         let (ptx, prx) = mpsc::channel::<Vec<String>>();
         let mut handles = Vec::new();
-        let (c, u) = (Arc::clone(&connector), utx.clone());
-        let spawned = std::thread::Builder::new().name("tui-poll-list".into()).spawn(move || {
-            lane(&*c, srx, |conn, depth| {
-                let (method, params) = list_call(&dir, depth);
-                let answer = call(conn, method, params).and_then(|r| list_answer(r, depth));
-                (answer.is_ok_or_api(), PollUpdate::Snapshot(answer.into_result()))
-            }, |e| PollUpdate::Snapshot(Err(e)), &u)
-        });
-        handles.extend(spawned.ok());
         let spawned = std::thread::Builder::new().name("tui-poll-procs".into()).spawn(move || {
             lane(&*connector, prx, |conn, names| {
                 let (method, params) = procs_call(&names);
@@ -90,15 +77,7 @@ impl PollWorker {
             }, |e| PollUpdate::Procs(Err(e)), &utx)
         });
         handles.extend(spawned.ok());
-        PollWorker { snapshots: Some(stx), procs: Some(ptx), updates, handles }
-    }
-
-    /// Ask for a snapshot down to `depth`. Never blocks; the answer is a
-    /// [`PollUpdate::Snapshot`].
-    pub fn request_snapshot(&self, depth: Depth) {
-        if let Some(tx) = &self.snapshots {
-            let _ = tx.send(depth);
-        }
+        PollWorker { procs: Some(ptx), updates, handles }
     }
 
     /// Ask for `names`' processes. Never blocks; the answer is a
@@ -117,9 +96,8 @@ impl PollWorker {
 
 impl Drop for PollWorker {
     fn drop(&mut self) {
-        // Closing the channels ends idle threads at once; one mid-call is
+        // Closing the channel ends an idle thread at once; one mid-call is
         // left to die with the process, which closes its socket.
-        self.snapshots.take();
         self.procs.take();
         let deadline = Instant::now() + JOIN_TIMEOUT;
         while !self.handles.iter().all(JoinHandle::is_finished) && Instant::now() < deadline {
@@ -171,7 +149,7 @@ impl<T> Answer<T> {
     }
 }
 
-/// One thread's loop: per request, (re)connect if needed, then `ask`, which
+/// The thread's loop: per request, (re)connect if needed, then `ask`, which
 /// says whether the connection survived. A failed connect answers
 /// `failed(why)`; the next request tries again.
 fn lane<R>(
@@ -213,33 +191,6 @@ fn call(conn: &mut Conn, method: &str, params: Value) -> Answer<Value> {
     }
 }
 
-/// The wire name of a [`Depth`] (`instances.list`'s `depth`, F1).
-fn depth_name(depth: Depth) -> &'static str {
-    match depth {
-        Depth::Disk => "disk",
-        Depth::Listing => "listing",
-        Depth::Full => "full",
-    }
-}
-
-/// The API call for a snapshot of config root `dir` down to `depth`.
-fn list_call(dir: &Path, depth: Depth) -> (&'static str, Value) {
-    ("instances.list", json!({ "dir": dir.to_string_lossy(), "depth": depth_name(depth) }))
-}
-
-/// `instances.list`'s result as the dashboard's snapshot. The wire doesn't
-/// carry `stats` (it says whether cpu/mem were sampled, so `set_snapshot`
-/// knows to carry the last ones over): it's the depth asked for.
-fn list_answer(result: Value, depth: Depth) -> Answer<InstancesList> {
-    match serde_json::from_value::<InstancesList>(result) {
-        Ok(mut list) => {
-            list.snapshot.stats = depth == Depth::Full;
-            Answer::Ok(list)
-        }
-        Err(e) => Answer::Api(format!("bad instances.list answer: {e}")),
-    }
-}
-
 /// The API call for `names`' processes.
 fn procs_call(names: &[String]) -> (&'static str, Value) {
     ("instances.procs", json!({ "instances": names }))
@@ -259,39 +210,7 @@ mod tests {
 
     #[test]
     fn calls_are_what_the_api_parses() {
-        assert_eq!(
-            list_call(Path::new("/cfg"), Depth::Disk),
-            ("instances.list", json!({"dir": "/cfg", "depth": "disk"}))
-        );
-        assert_eq!(list_call(Path::new("/cfg"), Depth::Listing).1["depth"], "listing");
-        assert_eq!(list_call(Path::new("/cfg"), Depth::Full).1["depth"], "full");
         assert_eq!(procs_call(&["a".into(), "b".into()]), ("instances.procs", json!({"instances": ["a", "b"]})));
-    }
-
-    /// The depth asked for decides `stats`, whatever the wire says; the
-    /// rest is the snapshot as serialized, `thread_children` included.
-    #[test]
-    fn list_answers_take_stats_from_the_depth() {
-        let snapshot = crate::snapshot::Snapshot {
-            instances: Vec::new(),
-            sandboxes: Vec::new(),
-            services: Vec::new(),
-            sandbox_count: 2,
-            runtime_name: "docker".into(),
-            runtime_version: Some("24".into()),
-            collected_at: Instant::now(),
-            stats: true,
-            error: None,
-        };
-        let children = [("d-id".to_string(), [("k".to_string(), "web-k".to_string())].into())].into();
-        let wire = serde_json::to_value(InstancesList { snapshot, thread_children: children }).unwrap();
-        let Answer::Ok(listing) = list_answer(wire.clone(), Depth::Listing) else { panic!("not parsed") };
-        assert!(!listing.snapshot.stats);
-        assert_eq!(listing.snapshot.sandbox_count, 2);
-        assert_eq!(listing.thread_children["d-id"]["k"], "web-k");
-        let Answer::Ok(full) = list_answer(wire, Depth::Full) else { panic!("not parsed") };
-        assert!(full.snapshot.stats);
-        assert!(matches!(list_answer(json!([1]), Depth::Full), Answer::Api(_)));
     }
 
     #[test]
@@ -316,22 +235,20 @@ mod tests {
         }
     }
 
-    /// No daemon: each request answers why at once (no start, no hang), on
-    /// both lanes.
+    /// No daemon: a request answers why at once (no start, no hang).
     #[test]
     fn unreachable_daemon_answers_errors() {
-        let worker = PollWorker::spawn_with(PathBuf::from("/cfg"), Arc::new(|| anyhow::bail!("nothing answers")));
-        worker.request_snapshot(Depth::Disk);
-        let PollUpdate::Snapshot(Err(e)) = wait_update(&worker) else { panic!("expected a snapshot error") };
-        assert_eq!(e, FetchError { unreachable: true, reason: "nothing answers".into() });
+        let worker = PollWorker::spawn_with(Arc::new(|| anyhow::bail!("nothing answers")));
         worker.request_procs(vec!["a".into()]);
         let PollUpdate::Procs(Err(e)) = wait_update(&worker) else { panic!("expected a procs error") };
-        assert!(e.unreachable);
+        assert_eq!(e, FetchError { unreachable: true, reason: "nothing answers".into() });
     }
 
     /// Against a real (test) daemon: the call goes out, the daemon's error
-    /// comes back as such, and the connection is kept for the next one. A
-    /// missing dir is refused before any state or runtime is touched.
+    /// comes back as such, and the connection is kept for the next one.
+    /// `instances.procs` can't be refused without reading state, so the
+    /// lane runs a call that can: a missing dir, refused before any state
+    /// or runtime is touched.
     #[test]
     fn a_daemon_error_is_an_api_error_and_keeps_the_connection() {
         use crate::serve::daemon::tests::{opts, scratch, spawn_daemon};
@@ -341,21 +258,26 @@ mod tests {
         let daemon = spawn_daemon(&sock, o);
         let connects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counted = Arc::clone(&connects);
-        let worker = PollWorker::spawn_with(
-            std::env::temp_dir().join(format!("dsv-tui-poll-absent-{}", std::process::id())),
-            Arc::new(move || {
-                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                client::connect_with(&sock, "tui", &version, Duration::from_secs(5), &|_, _| Ok(()))
-            }),
-        );
+        let connector = move || {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            client::connect_with(&sock, "tui", &version, Duration::from_secs(5), &|_, _| Ok(()))
+        };
+        let absent = std::env::temp_dir().join(format!("dsv-tui-poll-absent-{}", std::process::id()));
+        let (tx, rx) = mpsc::channel();
+        let (utx, updates) = mpsc::channel();
+        tx.send(()).unwrap();
+        tx.send(()).unwrap();
+        drop(tx);
+        lane(&connector, rx, |conn, ()| {
+            let answer = call(conn, "instances.list", json!({ "dir": absent.to_string_lossy() }));
+            (answer.is_ok_or_api(), PollUpdate::Procs(answer.and_then(|_| Answer::Ok(BTreeMap::new())).into_result()))
+        }, |e| PollUpdate::Procs(Err(e)), &utx);
         for _ in 0..2 {
-            worker.request_snapshot(Depth::Disk);
-            let PollUpdate::Snapshot(Err(e)) = wait_update(&worker) else { panic!("expected an error") };
+            let PollUpdate::Procs(Err(e)) = updates.try_recv().unwrap() else { panic!("expected an error") };
             assert!(!e.unreachable, "{e:?}");
             assert!(e.reason.starts_with("no directory"), "{e:?}");
         }
         assert_eq!(connects.load(std::sync::atomic::Ordering::SeqCst), 1);
-        drop(worker);
         let _ = daemon.join();
     }
 }

@@ -208,9 +208,10 @@ mod tests {
         assert_eq!(app.proc_fetch_targets().len(), 1);
     }
 
-    /// A stats-less snapshot keeps the last cpu/mem of still-running containers.
+    /// A pushed snapshot is installed as is: the daemon carries cpu/mem over,
+    /// so a row it left without them isn't filled from the last one.
     #[test]
-    fn stats_less_snapshot_carries_cpu_mem_while_running() {
+    fn snapshots_are_installed_without_carrying_cpu_mem() {
         let mut app = new_app();
         let mut full = snapshot_with_status(2, running());
         for row in &mut full.instances {
@@ -218,13 +219,14 @@ mod tests {
             row.mem = Some("1MiB".into());
         }
         app.set_snapshot(full);
-        let mut listing = snapshot_with_status(2, running());
-        listing.stats = false;
-        listing.instances[1].status = ContainerStatus::Exited("Exited (0)".into());
-        app.set_snapshot(listing);
+        let mut next = snapshot_with_status(2, running());
+        next.stats = false;
+        next.instances[0].cpu = Some("2%".into());
+        next.instances[1].status = ContainerStatus::Exited("Exited (0)".into());
+        app.set_snapshot(next);
         let rows = &app.snapshot.as_ref().unwrap().instances;
-        assert_eq!(rows[0].cpu.as_deref(), Some("1%"));
-        assert_eq!(rows[0].mem.as_deref(), Some("1MiB"));
+        assert_eq!(rows[0].cpu.as_deref(), Some("2%"));
+        assert_eq!(rows[0].mem, None, "not filled from the last snapshot");
         assert_eq!(rows[1].cpu, None, "stopped: no stale cpu");
     }
 

@@ -10,7 +10,9 @@ use std::sync::{Mutex, Weak};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
-use super::data::{visible_nodes, ContainerStatus, Node, Snapshot};
+use super::data::{visible_nodes, Node, Snapshot};
+#[cfg(test)]
+use super::data::ContainerStatus;
 use super::procs::ProcState;
 use super::prompt::{Prompt, PromptAction};
 use super::select::{Candidate, Region, RegionId, Selection};
@@ -208,9 +210,9 @@ pub struct App {
     /// (`dispatch::thread_children`), refreshed by the event loop with each
     /// snapshot so the thread pane resolves a `child` without reading state.
     pub thread_children: BTreeMap<String, BTreeMap<String, String>>,
-    /// Why the last `instances.list` failed, until one succeeds: the header
-    /// marks the kept snapshot stale with it, or with none yet the tree says
-    /// it in place of the rows.
+    /// Why the snapshot is stale (the daemon connection is down), until the
+    /// next push: the header marks the kept snapshot stale with it, or with
+    /// none yet the tree says it in place of the rows.
     pub snapshot_error: Option<crate::tui::data::FetchError>,
     /// Seconds east of UTC for Inbox timestamps; the event loop sets it once
     /// at startup (0 = UTC when unknown).
@@ -328,21 +330,10 @@ impl App {
     }
 
     /// Install a freshly collected snapshot and re-clamp the Instances selection
-    /// in case rows shrank. I/O-free: the caller does the collecting. A snapshot
-    /// collected without stats keeps the previous cpu/mem of containers that
-    /// are still running, so the columns don't blank between stats rounds.
-    pub fn set_snapshot(&mut self, mut snapshot: Snapshot) {
-        if let (false, Some(prev)) = (snapshot.stats, &self.snapshot) {
-            for row in &mut snapshot.instances {
-                if !matches!(row.status, ContainerStatus::Running(_)) {
-                    continue;
-                }
-                if let Some(old) = prev.instances.iter().find(|o| o.container == row.container) {
-                    row.cpu.clone_from(&old.cpu);
-                    row.mem.clone_from(&old.mem);
-                }
-            }
-        }
+    /// in case rows shrank. I/O-free: the caller does the collecting. Installed
+    /// as is: the daemon carries cpu/mem over between its stats rounds, and a
+    /// row it left without them (a stopped container) stays so.
+    pub fn set_snapshot(&mut self, snapshot: Snapshot) {
         self.snapshot = Some(snapshot);
         self.clamp_selection();
         self.refresh_build_log();

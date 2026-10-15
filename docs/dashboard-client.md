@@ -17,10 +17,12 @@ F1–F16 are current otherwise; the steps are kept as the record):
   `services.rebuild`.
 - `sandboxes.get` answers `config::SandboxText`, `instances.buildLog`
   `build_log::Tail`; the dashboard keeps them as received.
-- The poll worker (`src/tui/poll.rs`) never lazy-starts a daemon: it waits
+- The poll worker (`src/tui/poll.rs`, procs only since
+  `docs/before-machines.md` step 7) never lazy-starts a daemon: it waits
   up to 5 s for one, and `src/tui/daemon.rs` is the one that starts it
-  (and waits for a handoff's successor). A failed poll shows only in the
-  header's stale marker; `daemon.rs` owns the disconnected status line.
+  (and waits for a handoff's successor). `daemon.rs` also holds the
+  snapshot watch: a lost connection marks the header stale and owns the
+  disconnected status line.
 - `PendingSignal` carries the instance name, not the container.
 - `s`'s `stopping`/`starting` guards clear on the verb's answer.
 - `after_start` runs on a snapshot showing the instance running with no
@@ -44,16 +46,18 @@ Known limitations:
   used to hang up = SIGINT it (a `stop` with services takes ≈20 s on
   alpine). Fixed (`docs/before-machines.md`, step 2): the dashboard sends
   them with `detach`, so a quit leaves them running.
-- Two dashboards each poll the daemon, which runs the runtime calls per
-  request: no shared cache (`docs/serve.md`, *Future work*).
+- Two dashboards each polled the daemon, which ran the runtime calls per
+  request. Fixed (`docs/before-machines.md`, steps 6–7): the dashboard
+  watches its root and the daemon's one poll pushes the snapshot to every
+  watcher; only `instances.procs` stays per dashboard.
 - The Inbox is still read from the local store file (and written to it
   while disconnected) until federation (rollout step 5); VS Code (`o`,
   `:code`, a thread's `vscode`) reads `state.toml` (rollout step 7).
 - `current_exe()` is captured at dashboard start, so replacing the binary
   while it runs (an upgrade) makes new terminal tabs fail until restart
   (on Linux the path gains " (deleted)").
-- A header shows `(stale Ns: …)` right after one failed request, even
-  under the 10 s `STALE_AFTER_SECS`.
+- A header shows `(stale Ns: …)` as soon as the daemon connection drops,
+  even under the 10 s `STALE_AFTER_SECS`.
 - `d` ignores modifiers, so Ctrl-D on an instance removes it without a
   prompt (pre-existing, not fixed).
 - A lazily started daemon appears to keep the starter's inherited non-stdio

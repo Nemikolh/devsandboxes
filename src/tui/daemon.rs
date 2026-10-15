@@ -2,12 +2,20 @@
 //! worker thread that owns the [`Conn`], so the UI thread never waits on the
 //! socket or on a lazy start (up to 5 s).
 //!
-//! It connects lazily, subscribes to `inbox` and `instances`, and forwards
-//! what the daemon says as [`DaemonUpdate`]s the event loop drains. Holding
-//! the connection makes the dashboard a holder, so the worker reconnects
-//! after a `closing`, an EOF or an error, on the [`Backoff`] schedule; after
-//! a version handoff it first waits for the successor without starting one
-//! (see [`open`]).
+//! It connects lazily, subscribes to `inbox`, `instances` and `forwards`,
+//! and forwards what the daemon says as [`DaemonUpdate`]s the event loop
+//! drains. Holding the connection makes the dashboard a holder, so the worker
+//! reconnects after a `closing`, an EOF or an error, on the [`Backoff`]
+//! schedule; after a version handoff it first waits for the successor
+//! without starting one (see [`open`]).
+//!
+//! The tree: the dashboard is an observer of the daemon's one poll. Every
+//! (re)connect watches the dashboard's config root (`instances.watch`, a
+//! watch doesn't survive the connection), and each `instances.snapshot`
+//! push (every collection, ~2 s, the daemon's Disk → Listing → Full walk
+//! first) is a [`DaemonUpdate::Snapshot`]. A lost connection, or one that
+//! can't be made, is a [`DaemonUpdate::Down`]: the tree keeps its last
+//! snapshot, marked stale with why, until the next push.
 //!
 //! Inbox writes: the event loop hands the worker its `Op`s while
 //! [`DaemonWorker::connected`]; each goes out as its API method
@@ -56,6 +64,7 @@ use super::app::{ConfigKind, Fetch, PendingDone, PendingSignal, PortRequest, Por
 use crate::build_log::Tail;
 use crate::config::SandboxText;
 use crate::inbox::{self, Op};
+use crate::serve::api::InstancesList;
 use crate::serve::client::{self, Conn};
 use crate::serve::forwards::{Added, ForwardRow};
 use crate::serve::endpoint;
@@ -70,12 +79,18 @@ const POLL: Duration = Duration::from_millis(100);
 const JOIN_TIMEOUT: Duration = Duration::from_millis(300);
 
 /// From the worker to the event loop.
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 pub enum DaemonUpdate {
     /// The store changed (`inbox.changed`, or ops the worker applied): reload.
     InboxChanged,
-    /// The running containers changed (`instances.changed`): snapshot early.
+    /// The running containers changed (`instances.changed`): the pushes that
+    /// follow show it; the processes want a refetch after the next one.
     InstancesChanged,
+    /// The watched root's latest snapshot (`instances.snapshot`).
+    Snapshot(InstancesList),
+    /// No connection (lost, or the connect failed): why. The snapshot is
+    /// stale until the next [`Snapshot`](Self::Snapshot).
+    Down(String),
     /// A container message's status line (`inbox.shown`).
     Shown(String),
     /// The Ports tab's rows: this config root's forwards, or none while
@@ -93,7 +108,7 @@ pub enum DaemonUpdate {
     BuildLog { instance: String, read: Result<Option<Tail>, String> },
     /// A process signal's status line; the process rows are stale.
     Signalled(String),
-    /// A rename's status line; the snapshot is stale.
+    /// A rename's status line; the renamed row arrives with a push.
     Renamed(String),
     /// A done-flag write's status line, `failed` or not, and the request's
     /// `report` (`PendingDone`).
@@ -142,7 +157,7 @@ impl DaemonWorker {
         let flag = Arc::clone(&connected);
         let handle = std::thread::Builder::new()
             .name("tui-daemon".into())
-            .spawn(move || run(&root_dir(dir), rx, utx, &flag))
+            .spawn(move || run(&root_dir(dir), &connect, rx, utx, &flag))
             .ok();
         DaemonWorker { tx: Some(tx), updates, connected, handle }
     }
@@ -517,29 +532,58 @@ fn reports(op: &Op, code: &str) -> bool {
     !(code == "not-found" && !op.enqueues_event())
 }
 
-/// Connect (lazy start) and subscribe. After a handoff, wait for the
-/// successor the newer client is starting rather than race it with a daemon
-/// of our own (which, older, would win the lock and stall that client);
-/// start one only if none shows up.
-fn open(after_handoff: bool) -> Result<Conn> {
+/// How the worker gets a connection (`after_handoff` or not): [`connect`],
+/// or a test daemon's.
+type Connector = dyn Fn(bool) -> Result<Conn>;
+
+/// Connect (lazy start). After a handoff, wait for the successor the newer
+/// client is starting rather than race it with a daemon of our own (which,
+/// older, would win the lock and stall that client); start one only if none
+/// shows up.
+fn connect(after_handoff: bool) -> Result<Conn> {
     let dir = endpoint::socket_dir()?;
     let waited = after_handoff
         .then(|| client::connect_with(&dir, "tui", &Version::current(), client::START_TIMEOUT, &|_, _| Ok(())).ok())
         .flatten();
-    let mut conn = match waited {
-        Some(conn) => conn,
-        None => client::connect(&dir, "tui")?,
-    };
+    match waited {
+        Some(conn) => Ok(conn),
+        None => client::connect(&dir, "tui"),
+    }
+}
+
+/// The API call that watches config root `dir` (its snapshots pushed).
+fn watch_call(dir: &Path) -> (&'static str, Value) {
+    ("instances.watch", json!({ "dir": dir.to_string_lossy() }))
+}
+
+/// Connect, subscribe, and watch config root `dir`: a refused subscribe or
+/// watch fails the connect, as a dashboard without its pushes isn't one.
+fn open(connect: &Connector, dir: &Path, after_handoff: bool) -> Result<Conn> {
+    let mut conn = connect(after_handoff)?;
     let r = conn.call("subscribe", json!({ "topics": ["inbox", "instances", "forwards"] }))?;
     if let Some(e) = r.error {
         anyhow::bail!("subscribe: {} ({})", e.message, e.code);
     }
+    let (method, params) = watch_call(dir);
+    let r = conn.call(method, params)?;
+    if let Some(e) = r.error {
+        anyhow::bail!("{method}: {} ({})", e.message, e.code);
+    }
     Ok(conn)
+}
+
+/// An `instances.snapshot`'s params as the tree's snapshot (`dir` aside).
+fn snapshot_update(params: Value) -> DaemonUpdate {
+    match serde_json::from_value::<InstancesList>(params) {
+        Ok(list) => DaemonUpdate::Snapshot(list),
+        Err(e) => DaemonUpdate::Status(format!("bad instances.snapshot: {e}")),
+    }
 }
 
 struct Worker<'a> {
     /// The dashboard's config root, as [`root_dir`] made it.
     dir: &'a Path,
+    connector: &'a Connector,
     utx: Sender<DaemonUpdate>,
     connected: &'a AtomicBool,
     conn: Option<Conn>,
@@ -552,9 +596,10 @@ struct Worker<'a> {
     down: Option<String>,
 }
 
-fn run(dir: &Path, rx: Receiver<Cmd>, utx: Sender<DaemonUpdate>, connected: &AtomicBool) {
+fn run(dir: &Path, connector: &Connector, rx: Receiver<Cmd>, utx: Sender<DaemonUpdate>, connected: &AtomicBool) {
     let mut w = Worker {
         dir,
+        connector,
         utx,
         connected,
         conn: None,
@@ -595,7 +640,7 @@ impl Worker<'_> {
     }
 
     fn connect(&mut self) {
-        match open(std::mem::take(&mut self.after_handoff)) {
+        match open(self.connector, self.dir, std::mem::take(&mut self.after_handoff)) {
             Ok(conn) => {
                 self.conn = Some(conn);
                 self.connected.store(true, Ordering::Release);
@@ -609,6 +654,7 @@ impl Worker<'_> {
             }
             Err(e) => {
                 self.down = Some(format!("{e:#}"));
+                self.send(DaemonUpdate::Down(format!("{e:#}")));
                 let msg = format!("host daemon unavailable: {e:#}");
                 if self.last_error.as_ref() != Some(&msg) {
                     self.send(DaemonUpdate::Status(msg.clone()));
@@ -630,6 +676,7 @@ impl Worker<'_> {
         self.connected.store(false, Ordering::Release);
         // No live rows without the daemon that holds them.
         self.send(DaemonUpdate::Ports(Vec::new()));
+        self.send(DaemonUpdate::Down("connection lost".into()));
         self.after_handoff = after_handoff;
         self.next_attempt = Instant::now() + self.backoff.next();
     }
@@ -644,6 +691,7 @@ impl Worker<'_> {
         };
         match note.method.as_str() {
             "inbox.changed" => self.send(DaemonUpdate::InboxChanged),
+            "instances.snapshot" => self.send(snapshot_update(note.params)),
             "instances.changed" => self.send(DaemonUpdate::InstancesChanged),
             "forwards.changed" => self.fetch_ports(),
             "forwards.status" => {
@@ -1128,17 +1176,15 @@ mod tests {
         assert!(!text.hash.is_empty());
         let service = Fetch::Config { kind: ConfigKind::Service, name: "db".into() };
         let (_, call) = fetch_call(&dir, &service);
+        let DaemonUpdate::Config { kind: ConfigKind::Service, name, text } = fetch_update(service, ask(call)) else { panic!() };
+        assert_eq!(name, "db");
         assert_eq!(
-            fetch_update(service, ask(call)),
-            DaemonUpdate::Config {
-                kind: ConfigKind::Service,
-                name: "db".into(),
-                text: Ok(SandboxText {
-                    original: "image = \"postgres\"\n".into(),
-                    resolved: "image = \"postgres\"\n".into(),
-                    hash: String::new()
-                }),
-            }
+            text,
+            Ok(SandboxText {
+                original: "image = \"postgres\"\n".into(),
+                resolved: "image = \"postgres\"\n".into(),
+                hash: String::new()
+            })
         );
         let unknown = Fetch::Config { kind: ConfigKind::Sandbox, name: "nope".into() };
         let (_, call) = fetch_call(&dir, &unknown);
@@ -1219,6 +1265,70 @@ mod tests {
         assert!(reports(&Op::Act { thread: 1, action: "a".into() }, "not-found"));
         assert!(reports(&Op::MarkRead(1), "internal"));
         assert!(reports(&Op::Reply { thread: 1, text: "x".into() }, "denied"));
+    }
+
+    /// Against a test daemon (no host: a watch's one push is its Disk
+    /// snapshot): the worker watches its root and relays the push; a lost
+    /// daemon is a `Down`, and the next daemon is watched again.
+    #[test]
+    fn the_worker_watches_its_root_and_again_after_a_reconnect() {
+        use crate::serve::daemon::tests::{opts, scratch, spawn_daemon};
+        let sock = scratch("tui-watch");
+        let root = scratch("tui-watch-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let o = opts(1, 2000);
+        let version = o.version.clone();
+        let daemon = spawn_daemon(&sock, o);
+        let (tx, rx) = mpsc::channel();
+        let (utx, updates) = mpsc::channel();
+        let (s, r) = (sock.clone(), root.clone());
+        let ver = version.clone();
+        let worker = std::thread::spawn(move || {
+            let connector = move |_| client::connect_with(&s, "tui", &ver, Duration::from_secs(5), &|_, _| Ok(()));
+            run(&r, &connector, rx, utx, &AtomicBool::new(false));
+        });
+        let next = |want: fn(&DaemonUpdate) -> bool| -> DaemonUpdate {
+            loop {
+                let u = updates.recv_timeout(Duration::from_secs(10)).expect("no update");
+                if want(&u) {
+                    return u;
+                }
+            }
+        };
+        let is_snapshot = |u: &DaemonUpdate| matches!(u, DaemonUpdate::Snapshot(_));
+        let DaemonUpdate::Snapshot(first) = next(is_snapshot) else { unreachable!() };
+        assert_eq!(first.snapshot.runtime_name, "Disk", "a new watch's first push");
+
+        let mut other = client::connect_with(&sock, "test", &version, Duration::from_secs(5), &|_, _| Ok(())).unwrap();
+        assert!(other.call("shutdown", json!({})).unwrap().error.is_none());
+        drop(other);
+        let _ = daemon.join();
+        let DaemonUpdate::Down(_) = next(|u| matches!(u, DaemonUpdate::Down(_))) else { unreachable!() };
+
+        let daemon = spawn_daemon(&sock, opts(1, 2000));
+        let DaemonUpdate::Snapshot(again) = next(is_snapshot) else { unreachable!() };
+        assert_eq!(again.snapshot.runtime_name, "Disk", "watched again");
+        drop(tx);
+        worker.join().unwrap();
+        let _ = daemon.join();
+        let _ = std::fs::remove_dir_all(&sock);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn snapshot_pushes_parse_or_say_why() {
+        let wire = json!({
+            "dir": "/cfg", "instances": [], "sandboxes": [], "services": [], "sandbox_count": 2,
+            "runtime_name": "docker", "runtime_version": "24", "error": null,
+            "thread_children": {"d-id": {"k": "web-k"}},
+        });
+        let DaemonUpdate::Snapshot(list) = snapshot_update(wire) else { panic!("not parsed") };
+        assert_eq!(list.snapshot.sandbox_count, 2);
+        assert!(!list.snapshot.stats);
+        assert_eq!(list.thread_children["d-id"]["k"], "web-k");
+        let DaemonUpdate::Status(line) = snapshot_update(json!([1])) else { panic!("parsed") };
+        assert!(line.starts_with("bad instances.snapshot"), "{line}");
+        assert_eq!(watch_call(Path::new("/cfg")), ("instances.watch", json!({"dir": "/cfg"})));
     }
 
     #[test]
