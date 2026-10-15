@@ -96,7 +96,7 @@ only a forward has a bridge of its own (*Forwards*).
 
 **ssh-agent through the daemon.** A command that injects `SSH_AUTH_SOCK`
 into a relay-mode instance (`exec`, `start`'s `postStartCommand`, `run`'s
-lifecycle chain, a dashboard terminal) sends `bridges.ensure` (`docs/api.md`)
+lifecycle chain; a dashboard terminal is an `exec`) sends `bridges.ensure` (`docs/api.md`)
 with its own `$SSH_AUTH_SOCK`. The daemon puts that agent first in its
 candidates (up to 8 reported agents, newest first, then its inherited
 `$SSH_AUTH_SOCK`), wakes the poll for that container (a dead bridge there is

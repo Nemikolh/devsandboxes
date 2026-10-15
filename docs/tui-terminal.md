@@ -1,8 +1,8 @@
 # Plan: integrated terminal for the TUI
 
 Add an integrated-terminal section to the dashboard: shortcuts open a real
-shell (PTY + `docker exec -it`) into the selected instance **or service
-container**, rendered inside the TUI so the dashboard stays usable, with a
+shell (a PTY running `devsandbox exec` for an instance, `docker exec -it`
+for a service) into the selected instance **or service container**, rendered inside the TUI so the dashboard stays usable, with a
 tab per terminal shared across both top-level tabs.
 
 ## Dependencies (new)
@@ -167,12 +167,18 @@ query.
 
 - Shell: `SHELL_FALLBACK_CMD` (`commands/exec.rs`, shared with a command-less
   `devsandbox exec <name>`) probes zsh, then bash, then POSIX `sh`, all as
-  login shells (service images are often minimal). `TERM=xterm-256color` is
-  set on the runtime client only; `exec` doesn't forward it, so the
-  container shell gets the runtime's default (`xterm` on docker) unless the
-  image or `remoteEnv` sets one. Instances reuse the exact `exec` argv the CLI
-  builds (workspace, remoteUser, remoteEnv); services get a plain
-  `exec -it <container>`.
+  login shells (service images are often minimal). An instance's tab runs
+  `<this exe> -C <root> exec -i -t -- <instance>` (`ExecCli`,
+  `src/tui/app/terminal.rs`): the CLI builds the runtime argv (workspace,
+  remoteUser, remoteEnv), refuses an instance with no container yet (the
+  message stays readable in the `(exited)` tab) and holds the daemon's
+  ssh-agent bridge (`bridges.ensure`) for the shell's life, with the
+  dashboard's env (`SSH_AUTH_SOCK` included), so the dashboard reads no
+  state for it. Services get a plain `<runtime> exec -it <container>`, the
+  runtime named by the snapshot's `runtime_name`. `TERM=xterm-256color` is
+  set on the host-side child only; the runtime's `exec` doesn't forward it,
+  so the container shell gets the runtime's default (`xterm` on docker)
+  unless the image or `remoteEnv` sets one.
 - Child exit (shell `exit`, container stop) → tab marked `(exited)`, screen
   stays readable, `x` closes.
 - Quitting the dashboard kills every terminal child (kill + wait on drop).
@@ -207,7 +213,8 @@ resize divergent ones. Mouse routing for the panel.
 
 `src/commands/exec.rs`: factor the argv construction out of `exec_status`
 into `exec_argv(&state::Instance, tty, command) -> Vec<String>` so the TUI
-and CLI can't drift.
+and CLI can't drift. (Since docs/dashboard-client.md step 8 the instance
+tabs run `devsandbox exec` itself instead.)
 
 ## Code landmarks
 

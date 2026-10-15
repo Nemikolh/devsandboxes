@@ -343,8 +343,8 @@ ssh (in container) ──unix──▶ devsbd daemon ◀──frames over exec s
     (docs/api.md) wakes the poll at once and marks its container urgent: a dead
     bridge there is respawned without waiting out either gap. On daemon exit `BridgeWorker`'s `Drop` closes the channel and joins the
     worker, so every bridge is killed before the daemon releases its lock.
-  - CLI `exec` (including the TUI's suspended `:exec`, which goes through
-    `exec_status`), `start`'s `postStartCommand` and `run`'s lifecycle chain:
+  - CLI `exec` (including the TUI's suspended `:exec`, which runs
+    `devsandbox exec` as a child), `start`'s `postStartCommand` and `run`'s lifecycle chain:
     no bridge of their own. They connect to the host daemon (lazy start) and
     send `bridges.ensure` with their `$SSH_AUTH_SOCK`, holding the connection
     until the command ends (so the daemon doesn't idle out under it). `exec`
@@ -359,9 +359,8 @@ ssh (in container) ──unix──▶ devsbd daemon ◀──frames over exec s
     commands often clone over ssh at once; not ready → a `note:` with the
     reason (the handshake error, a version mismatch included) before the
     chain, which runs anyway.
-  - Dashboard integrated terminals: opening one on a relay-mode instance has
-    the dashboard's daemon connection send the same `bridges.ensure`
-    (skipped while disconnected).
+  - Dashboard integrated terminals: an instance's tab runs `devsandbox
+    exec` (with the dashboard's env), so it's the `exec` case above.
   - Bridges run for instances in relay mode (`devsbd::relay_mode`: helper
     installed, no bind mount) when the host has a live agent. A mounted
     instance stays on the mount (the mount occupies the daemon's socket path).

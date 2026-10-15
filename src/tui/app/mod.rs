@@ -39,6 +39,7 @@ pub use forms::{form_lines, form_title, forms_offset, pinned_forms, FormSpot};
 pub use actions::{PendingDone, VerbEnd};
 pub use procs::{PendingSignal, Signal};
 pub use selection::{copy_key_intercepted, Extract};
+pub use terminal::ExecCli;
 pub use view::{
     BuildLogModal, ConfigKind, ConfigView, ConfirmModal, Fetch, HelpModal, Modal, Pane, Side, TextModal, BUILD_LOG_LINES,
     LOG_LINES,
@@ -203,10 +204,6 @@ pub struct App {
     /// A notification link the event loop should hand to the desktop opener
     /// (`enter` in the Inbox thread pane).
     pub pending_open: Option<String>,
-    /// Instances (state keys) whose daemon bridge the event loop should ask
-    /// for (`bridges.ensure`): a terminal just opened on them, relaying the
-    /// ssh-agent.
-    pub pending_bridges: Vec<String>,
     /// Every dispatcher's children by key, owner id → key → instance name
     /// (`dispatch::thread_children`), refreshed by the event loop with each
     /// snapshot so the thread pane resolves a `child` without reading state.
@@ -230,6 +227,10 @@ pub struct App {
     /// Whether the outer terminal speaks the kitty keyboard protocol, so new
     /// terminals offer it to their child. Set once by the event loop.
     pub kitty: bool,
+    /// The `devsandbox exec` an instance's terminal tab runs. Set once by
+    /// the event loop (finding the executable is I/O); `Err` is why a tab
+    /// can't open.
+    pub exec_cli: Result<ExecCli, String>,
     /// The mouse text selection, shown until a press elsewhere, `esc`, a tab
     /// switch or a modal opening/closing clears it (`selection.rs`).
     selection: Option<Selection>,
@@ -302,7 +303,6 @@ impl App {
             inbox: InboxView::default(),
             pending_inbox: Vec::new(),
             pending_open: None,
-            pending_bridges: Vec::new(),
             thread_children: BTreeMap::new(),
             snapshot_error: None,
             utc_offset: 0,
@@ -311,6 +311,7 @@ impl App {
             focus: Focus::Dashboard,
             terms: TermTabs::default(),
             kitty: false,
+            exec_cli: Err("the devsandbox executable isn't known yet".into()),
             selection: None,
             candidate: None,
             regions: RefCell::new(Vec::new()),

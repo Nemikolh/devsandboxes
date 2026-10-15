@@ -65,7 +65,7 @@ pub struct TermSession {
 }
 
 impl TermSession {
-    /// Spawn `argv` (the *full* runtime command, e.g. `docker exec -it …`) on a
+    /// Spawn `argv` (the *full* command: `devsandbox exec …`, `docker exec -it …`) on a
     /// fresh PTY sized `rows`×`cols`, wire a reader thread that pumps output
     /// into the vt100 parser, and return the live session. `kitty`: whether
     /// the outer terminal speaks the kitty keyboard protocol, i.e. whether to
@@ -88,10 +88,10 @@ impl TermSession {
             .context("failed to open pty")?;
 
         let mut cmd = CommandBuilder::from_argv(argv.into_iter().map(Into::into).collect());
-        // This TERM only reaches the runtime client (`docker exec …`) on the
-        // host: `exec` doesn't forward the caller's environment, so the shell in
-        // the container gets the runtime's default (`xterm` on docker) or
-        // whatever the image / `remoteEnv` sets.
+        // This TERM only reaches the host-side child (`devsandbox exec`, the
+        // runtime client): the runtime's `exec` doesn't forward the caller's
+        // environment, so the shell in the container gets the runtime's
+        // default (`xterm` on docker) or whatever the image / `remoteEnv` sets.
         cmd.env("TERM", "xterm-256color");
         let child = pair
             .slave

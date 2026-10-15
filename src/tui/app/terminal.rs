@@ -1,13 +1,14 @@
 //! Integrated terminal panel: opening/targeting sessions, focus, and
 //! key/mouse routing into the active PTY.
 
+use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 use ratatui::widgets::Block;
 
-use crate::runtime::{backend, NAME_PREFIX};
+use crate::runtime::NAME_PREFIX;
 use crate::tui::data::{ContainerStatus, InstanceRow};
 use crate::tui::kitty;
 use crate::commands::exec::SHELL_FALLBACK_CMD;
@@ -19,6 +20,39 @@ use super::{App, Focus, Tab};
 
 /// Lines one wheel notch scrolls, as scrollback or as arrow keys.
 const WHEEL_LINES: i16 = 3;
+
+/// The `devsandbox exec` an instance's terminal tab and `:exec` run: this
+/// executable, against the dashboard's config root. The CLI's `exec` owns
+/// the runtime argv, the in-flight guard and the ssh-agent relay
+/// (`bridges.ensure`, held for the command's life), so the dashboard reads
+/// no state for it, and a remote instance only needs a prefix (step 5).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExecCli {
+    pub exe: PathBuf,
+    /// Absolute: a PTY child starts in `$HOME`, not the dashboard's cwd.
+    pub root: PathBuf,
+}
+
+impl ExecCli {
+    /// `devsandbox -C <root> exec -i -t -- <instance> [command…]`. Always
+    /// `-i -t`: both callers host it on a terminal, and with a command the
+    /// CLI takes the flags as given (without one it would pick the same).
+    /// `--` so an instance name can't read as a flag.
+    pub fn argv(&self, instance: &str, command: &[String]) -> Vec<String> {
+        let mut argv = vec![
+            self.exe.to_string_lossy().into_owned(),
+            "-C".into(),
+            self.root.to_string_lossy().into_owned(),
+            "exec".into(),
+            "-i".into(),
+            "-t".into(),
+            "--".into(),
+            instance.into(),
+        ];
+        argv.extend(command.iter().cloned());
+        argv
+    }
+}
 
 impl App {
     /// The OSC 52 copy (tab title, base64) the event loop should relay from
@@ -290,7 +324,7 @@ impl App {
     /// Resolve the current selection to a terminal target: `(title, container,
     /// is_instance)`, or an `Err(status message)` explaining why one can't open.
     /// Pure over the snapshot so it is unit-testable; [`Self::open_terminal`]
-    /// does the state load + PTY spawn around it.
+    /// does the PTY spawn around it.
     ///
     /// Instances tab: the instance under the cursor (or a process row's parent),
     /// which must be running. Services tab: the selected service's first running
@@ -340,7 +374,7 @@ impl App {
     /// dedups against a live terminal for the same container; `T`
     /// (`force_new`) always spawns a fresh one.
     ///
-    /// This does I/O inline — a state load plus a PTY spawn — same precedent as
+    /// This does I/O inline — a PTY spawn — same precedent as
     /// [`Self::open_logs`] / [`Self::open_config`] doing user-triggered work
     /// without going through the event loop. Failures land in `self.status`.
     pub(super) fn open_terminal(&mut self, force_new: bool) {
@@ -380,43 +414,13 @@ impl App {
             }
         }
 
-        // Build the runtime argv. Instances reuse the exact `exec` flags the CLI
-        // emits (workspace, remoteUser, remoteEnv) so the two can't drift;
-        // services get a plain interactive `exec`.
-        let shell: Vec<String> = SHELL_FALLBACK_CMD.iter().map(|s| s.to_string()).collect();
-        // The instance to ask the daemon's bridge for, on the same probe that
-        // decides the `SSH_AUTH_SOCK` injection (the CLI's `exec` gate).
-        let mut relay = None;
-        let mut argv = if is_instance {
-            let state = match crate::state::State::load() {
-                Ok(s) => s,
-                Err(e) => {
-                    self.status = Some(format!("terminal: {e:#}"));
-                    return;
-                }
-            };
-            let Some(instance) = state.instances.get(&title) else {
-                self.status = Some(format!("terminal: `{title}` not in state"));
-                return;
-            };
-            // As the CLI's `exec`: only once there's a container.
-            if let Some(why) = crate::commands::no_container_yet(&title, instance.phase_view().as_ref()) {
-                self.status = Some(format!("terminal: {why}"));
+        let argv = match self.term_argv(&title, &container, is_instance) {
+            Ok(argv) => argv,
+            Err(msg) => {
+                self.status = Some(msg);
                 return;
             }
-            let host_agent = crate::devsbd::relay_mode(instance) && crate::commands::exec::has_host_agent();
-            if host_agent {
-                relay = Some(title.clone());
-            }
-            crate::commands::exec::exec_argv_with(instance, true, true, &shell, host_agent)
-        } else {
-            let mut a = vec!["exec".to_string(), "-i".to_string(), "-t".to_string()];
-            a.push(container.clone());
-            a.extend(shell);
-            a
         };
-        // Prepend the runtime binary: `exec_argv` and the service path both omit it.
-        argv.insert(0, backend().bin().to_string());
 
         // Size doesn't matter yet: the event loop's pre-draw resize corrects the
         // first frame. Reuse the active session's size when there is one, else a
@@ -431,16 +435,26 @@ impl App {
                 self.terms.open(session);
                 self.focus = Focus::Terminal;
                 self.status = None;
-                self.pending_bridges.extend(relay);
             }
             Err(e) => self.status = Some(format!("terminal: {e:#}")),
         }
     }
 
-    /// Take the instances whose daemon bridge the event loop owes a
-    /// `bridges.ensure` (see `pending_bridges`).
-    pub fn take_pending_bridges(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.pending_bridges)
+    /// What a terminal tab runs. An instance: `devsandbox exec` (the CLI's
+    /// login shell, [`SHELL_FALLBACK_CMD`]); its errors (no container yet,
+    /// not in state) print in the tab, which stays open as `(exited)`. A
+    /// service: a plain interactive runtime `exec` of the same shell, the
+    /// binary named by the snapshot (`runtime_name` is the backend's `bin`
+    /// for docker, podman and Apple's `container` alike).
+    fn term_argv(&self, title: &str, container: &str, is_instance: bool) -> Result<Vec<String>, String> {
+        if is_instance {
+            let cli = self.exec_cli.as_ref().map_err(|e| format!("terminal: {e}"))?;
+            return Ok(cli.argv(title, &[]));
+        }
+        let snapshot = self.snapshot.as_ref().ok_or_else(|| "terminal: no data yet".to_string())?;
+        let mut argv = vec![snapshot.runtime_name.clone(), "exec".into(), "-i".into(), "-t".into(), container.into()];
+        argv.extend(SHELL_FALLBACK_CMD.iter().map(|s| s.to_string()));
+        Ok(argv)
     }
 }
 
@@ -975,6 +989,44 @@ mod tests {
             app.term_target(),
             Ok(("svc-api-2".into(), "devsandbox-svc-api-2".into(), false))
         );
+    }
+
+    fn cli() -> ExecCli {
+        ExecCli { exe: "/opt/bin/devsandbox".into(), root: "/home/u/cfg".into() }
+    }
+
+    #[test]
+    fn exec_cli_argv_puts_the_instance_after_the_separator() {
+        let base = ["/opt/bin/devsandbox", "-C", "/home/u/cfg", "exec", "-i", "-t", "--", "-web"];
+        assert_eq!(cli().argv("-web", &[]), base);
+        let cmd = ["ls".to_string(), "-la".to_string()];
+        assert_eq!(cli().argv("-web", &cmd), [&base[..], &["ls", "-la"]].concat());
+    }
+
+    #[test]
+    fn instance_terminal_runs_devsandbox_exec() {
+        let mut app = new_app();
+        app.set_snapshot(snapshot_with_status(1, running()));
+        // No executable yet: the tab doesn't open, the status says why.
+        assert_eq!(
+            app.term_argv("inst0", "devsandbox-inst0", true),
+            Err("terminal: the devsandbox executable isn't known yet".into())
+        );
+        app.exec_cli = Ok(cli());
+        assert_eq!(app.term_argv("inst0", "devsandbox-inst0", true), Ok(cli().argv("inst0", &[])));
+    }
+
+    #[test]
+    fn service_terminal_runs_the_snapshots_runtime() {
+        let mut app = new_app();
+        let mut snap = service_snapshot(vec![("devsandbox-svc-api-2".into(), running())]);
+        snap.runtime_name = "podman".into();
+        app.set_snapshot(snap);
+        let argv = app.term_argv("svc-api-2", "devsandbox-svc-api-2", false).unwrap();
+        assert_eq!(argv[..5], ["podman", "exec", "-i", "-t", "devsandbox-svc-api-2"]);
+        assert_eq!(argv[5..], SHELL_FALLBACK_CMD);
+        // The exec CLI isn't needed for a service.
+        assert!(app.exec_cli.is_err());
     }
 
     #[test]

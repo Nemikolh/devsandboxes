@@ -48,7 +48,7 @@ use crate::commands;
 use crate::commands::vscode::Goto;
 use crate::inbox;
 
-use app::{App, VerbEnd};
+use app::{App, ExecCli, VerbEnd};
 use poll::{PollUpdate, PollWorker};
 use prompt::PromptAction;
 
@@ -222,6 +222,9 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
     let dir = app.dir.clone();
     app.utc_offset = inbox::clock::local_utc_offset();
     app.kitty = KITTY.load(Ordering::Relaxed);
+    app.exec_cli = std::env::current_exe()
+        .map(|exe| ExecCli { exe, root: daemon::root_dir(dir.clone()) })
+        .map_err(|e| format!("can't find the devsandbox executable: {e}"));
     app.copy_key_intercepted = app::copy_key_intercepted(|var| std::env::var(var).ok());
     // Before the inbox, whose error would otherwise hide this one: an
     // invalid file runs on the defaults, and the first toggle overwrites it.
@@ -375,7 +378,7 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
                 // shows then.
                 PromptAction::Rename { instance, new_name } => daemon.rename(instance, new_name),
                 other => {
-                    run_suspended(terminal, other)?;
+                    run_suspended(terminal, &app.exec_cli, other)?;
                     // Redraw from scratch: the child scribbled over the screen.
                     terminal.clear()?;
                     // Refresh data now rather than waiting for the next tick.
@@ -460,14 +463,6 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
         // The Inbox lives in one shared file (`crate::inbox::store`), so any
         // dashboard's change must reach this one: push what the keys asked
         // for, then reload when the store moved (ours or someone else's).
-        // Terminals just opened on relay-mode instances: the daemon's bridge
-        // relays this dashboard's agent. Disconnected: skipped (no fallback).
-        let bridges = app.take_pending_bridges();
-        if daemon.connected() {
-            for instance in bridges {
-                daemon.ensure_bridge(instance, crate::devsbd::bridge::own_agent());
-            }
-        }
         let ops = app.take_pending_inbox();
         let ops = if !ops.is_empty() && daemon.connected() {
             // Through the API; the worker says when they landed. No reload
@@ -604,15 +599,22 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
 }
 
 /// Leave the TUI, run a prompt command with inherited stdio, wait for one
-/// keypress, then re-enter the TUI. Command errors are printed (not propagated)
-/// so a failed `exec` returns the user to the dashboard.
-fn run_suspended(terminal: &mut Term, action: PromptAction) -> Result<()> {
+/// keypress, then re-enter the TUI. `exec` is `devsandbox exec` as a child
+/// (`cli`), so the dashboard reads no state for it: the CLI prints its own
+/// errors above the prompt, and only a child that can't start is ours to
+/// print. Never propagated, so a failed `exec` returns to the dashboard.
+fn run_suspended(terminal: &mut Term, cli: &Result<ExecCli, String>, action: PromptAction) -> Result<()> {
     restore();
 
     let result = match &action {
-        PromptAction::Exec { instance, argv } => {
-            commands::exec::exec_status(instance, true, true, argv).map(|_| ())
-        }
+        PromptAction::Exec { instance, argv } => cli.as_ref().map_err(|e| anyhow::anyhow!("{e}")).and_then(|cli| {
+            let argv = cli.argv(instance, argv);
+            std::process::Command::new(&argv[0])
+                .args(&argv[1..])
+                .status()
+                .map(|_| ())
+                .with_context(|| format!("failed to run {}", argv[0]))
+        }),
         // The verbs go to the daemon (`spawn_verb`), `code`/`rename` never
         // suspend: the caller handles them. `port` never reaches here —
         // `App` routes it to `pending_port`, not `pending_action`.
@@ -627,10 +629,7 @@ fn run_suspended(terminal: &mut Term, action: PromptAction) -> Result<()> {
         | PromptAction::Port { .. } => Ok(()),
     };
     if let Err(e) = result {
-        match log_error(&action, &e) {
-            Some(path) => eprintln!("error: {e:#}\nlogged to {}", path.display()),
-            None => eprintln!("error: {e:#}"),
-        }
+        eprintln!("error: {e:#}");
     }
 
     print!("\r\n\x1b[2mpress any key to return\x1b[0m");
@@ -645,24 +644,6 @@ fn run_suspended(terminal: &mut Term, action: PromptAction) -> Result<()> {
     enter()?;
     terminal.hide_cursor()?;
     Ok(())
-}
-
-/// Write a failed suspended command's error to a timestamped log file under the
-/// data dir (`<data>/devsandbox/logs/<verb>-<unix>.log`, alongside `state.toml`)
-/// and return its path so the caller can point the user at it. Best-effort:
-/// `None` on any I/O failure, so the caller falls back to a plain stderr print.
-fn log_error(action: &PromptAction, err: &anyhow::Error) -> Option<PathBuf> {
-    let verb = match action {
-        PromptAction::Exec { .. } => "exec",
-        // Never suspended (`run_suspended`): the daemon runs the verbs and
-        // their status line (or build log) has the error.
-        _ => return None,
-    };
-    let dir = crate::state::State::path().ok()?.parent()?.join("logs");
-    std::fs::create_dir_all(&dir).ok()?;
-    let path = dir.join(format!("{verb}-{}.log", crate::state::Instance::now()));
-    std::fs::write(&path, format!("{verb} failed: {err:#}\n")).ok()?;
-    Some(path)
 }
 
 /// Block until the next key press (consuming it), ignoring release/repeat.

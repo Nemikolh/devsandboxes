@@ -702,9 +702,8 @@ Its Inbox writes go through the `inbox.*` mutations while connected, and
 straight to the store (the same code) while not. It reads the store file
 itself, reloading on `inbox.changed`, and keeps its own instance snapshot
 (with processes and stats), refreshed early on `instances.changed`.
-`inbox.shown` is its status line. Opening an integrated terminal on a
-relay-mode instance sends `bridges.ensure` with the dashboard's
-`$SSH_AUTH_SOCK` (skipped while disconnected). Its Ports tab is
+`inbox.shown` is its status line. An instance's integrated terminal runs
+`devsandbox exec`, which sends `bridges.ensure` itself. Its Ports tab is
 `forwards.list` for its config root, re-fetched on `forwards.changed` and
 after every reconnect; `p` / `:port` is `forwards.add`, `d` is
 `forwards.rm`, `forwards.status` its status line. While disconnected the

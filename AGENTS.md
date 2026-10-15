@@ -127,7 +127,8 @@ git worktrees so working trees are never shared.
   (`spec.rs` is its declarative grammar table — parsing _and_ tab completion
   derive from `SPECS`, so a new flag is one table entry);
   `term.rs` holds the integrated terminal's PTY sessions + tab strip
-  (`TermSession`/`TermTabs`, `docker exec -it` shell rendered via vt100);
+  (`TermSession`/`TermTabs`, a shell rendered via vt100: `devsandbox exec`
+  for an instance, `docker exec -it` for a service);
   `kitty.rs` emulates the kitty keyboard protocol for those sessions (vt100
   callbacks + key encoding; see `docs/tui-terminal.md`);
   `daemon.rs` is the host-daemon worker thread (unix): owns the `serve`
