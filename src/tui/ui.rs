@@ -2354,16 +2354,24 @@ fn draw_text_modal(frame: &mut Frame, app: &App, view: &TextModal) {
 
 /// [`draw_text_modal`] for the build log, shown from [`BuildLogModal::top`]
 /// (the bottom while following), with the body height recorded for `App`'s
-/// stick-to-bottom math.
+/// stick-to-bottom math. A read log is drawn from its styled lines (the
+/// shown ones only), which line up with the plain body's.
 fn draw_build_log_modal(frame: &mut Frame, app: &App, view: &BuildLogModal) {
     let area = frame.area();
-    view.height.set(Block::bordered().inner(area).height);
+    let height = Block::bordered().inner(area).height;
+    view.height.set(height);
     let top = view.top();
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(ACCENT))
         .title(view.text.title.clone());
-    let paragraph = Paragraph::new(view.text.body.clone()).block(block).scroll((top, 0));
+    let paragraph = if view.styled.is_empty() {
+        Paragraph::new(view.text.body.clone()).scroll((top, 0))
+    } else {
+        let shown = view.styled.iter().skip(usize::from(top)).take(usize::from(height)).cloned();
+        Paragraph::new(shown.collect::<Vec<_>>())
+    };
+    let paragraph = paragraph.block(block);
     frame.render_widget(ratatui::widgets::Clear, area);
     frame.render_widget(paragraph, area);
     selectable_lines(app, RegionId::TextModal, area, top, &view.text.body);

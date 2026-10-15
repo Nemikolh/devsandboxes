@@ -159,7 +159,8 @@ git worktrees so working trees are never shared.
   connection (`spawn_verb` in `tui/mod.rs`).
   Mouse selection (`docs/tui-selection.md`): `select.rs` is the pure model
   (extraction, highlight), `app/selection.rs` its routing, `clipboard.rs` the
-  OSC 52 writer; `settings.rs` the dashboard settings (`dashboard.toml` next
+  OSC 52 writer; `ansi.rs` turns the build log's SGR lines into styled
+  spans; `settings.rs` the dashboard settings (`dashboard.toml` next
   to `state.toml`, one `SETTINGS` entry per toggle, shown in the `?` modal).
 - `site/` — Astro + MDX docs site (standalone pnpm project, not in the Cargo
   workspace; see `site/README.md`). Checks: `cd site && pnpm check && pnpm build`.

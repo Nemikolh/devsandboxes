@@ -167,26 +167,375 @@ pub struct Tail {
 /// `data` (the dir holding `state.toml`); `None` when it has none (an
 /// instance from before build logs, or one never built since). The daemon
 /// reads an injected state path, so its tests never touch the user's logs.
+/// A pty log (`# tty` header) is replayed ([`Replay`]): `ansi` keeps its
+/// colours as SGR escapes, else the lines are plain text. A pipe log reads
+/// the same either way.
 #[cfg_attr(not(unix), allow(dead_code))] // only the daemon (unix) uses it
-pub fn tail_in(data: &Path, instance_id: &str, lines: usize) -> Result<Option<Tail>> {
-    tail_at(&dir_in(data, instance_id).join(FILE), lines)
+pub fn tail_in(data: &Path, instance_id: &str, lines: usize, ansi: bool) -> Result<Option<Tail>> {
+    tail_at(&dir_in(data, instance_id).join(FILE), lines, ansi)
 }
 
-fn tail_at(path: &Path, lines: usize) -> Result<Option<Tail>> {
+/// Bytes read off a log's start for its header: the command line can be
+/// long, the rest is short.
+const HEAD_BYTES: usize = 4096;
+
+/// The pty size a build log was written at and its header's length, from
+/// the log's first bytes; `None` for a pipe log or an older one.
+pub fn tty_header(head: &[u8]) -> Option<(TtySize, usize)> {
+    let mut lines = head.split_inclusive(|&b| b == b'\n').filter(|l| l.ends_with(b"\n"));
+    let (cmd, when, tty) = (lines.next()?, lines.next()?, lines.next()?);
+    if !cmd.starts_with(b"$ ") || !when.starts_with(b"# ") {
+        return None;
+    }
+    let size = TtySize::parse(std::str::from_utf8(tty.strip_prefix(b"# tty ")?).ok()?)?;
+    Some((size, cmd.len() + when.len() + tty.len()))
+}
+
+/// The first [`HEAD_BYTES`] of `file` (from its current position).
+pub fn read_head(file: &mut File) -> std::io::Result<Vec<u8>> {
+    let mut head = Vec::new();
+    Read::by_ref(file).take(HEAD_BYTES as u64).read_to_end(&mut head)?;
+    Ok(head)
+}
+
+fn tail_at(path: &Path, lines: usize, ansi: bool) -> Result<Option<Tail>> {
     let mut file = match File::open(&path) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e).with_context(|| format!("cannot open {}", path.display())),
     };
-    let read = |file: &mut File| -> std::io::Result<(Vec<u8>, bool)> {
-        let start = file.metadata()?.len().saturating_sub(TAIL_BYTES);
+    let read = |file: &mut File| -> std::io::Result<(Option<(TtySize, usize)>, Vec<u8>, u64)> {
+        let tty = tty_header(&read_head(file)?);
+        let mut start = file.metadata()?.len().saturating_sub(TAIL_BYTES);
+        if tty.is_some_and(|(_, header)| start < header as u64) {
+            start = 0; // the header comes whole or not at all
+        }
         file.seek(SeekFrom::Start(start))?;
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
-        Ok((bytes, start > 0))
+        Ok((tty, bytes, start))
     };
-    let (bytes, partial) = read(&mut file).with_context(|| format!("cannot read {}", path.display()))?;
-    Ok(Some(last_lines(&String::from_utf8_lossy(&bytes), lines, partial)))
+    let (tty, bytes, start) = read(&mut file).with_context(|| format!("cannot read {}", path.display()))?;
+    let Some((size, header)) = tty else {
+        return Ok(Some(last_lines(&String::from_utf8_lossy(&bytes), lines, start > 0)));
+    };
+    Ok(Some(replay_tail(&bytes, size, header, start > 0, lines, ansi)))
+}
+
+/// [`Tail`] of a pty log read from mid-file (`partial`) or from its start,
+/// where its first `header` bytes are the header (kept as they are).
+fn replay_tail(bytes: &[u8], size: TtySize, header: usize, partial: bool, n: usize, ansi: bool) -> Tail {
+    let mut kept = std::collections::VecDeque::with_capacity(n.min(1024));
+    let mut total = 0usize;
+    let mut keep = |line: String| {
+        total += 1;
+        if kept.len() == n {
+            kept.pop_front();
+        }
+        if n > 0 {
+            kept.push_back(line);
+        }
+    };
+    let body = if partial {
+        // Its first line may be cut short (or start mid-escape): dropped,
+        // like a plain log's.
+        bytes.iter().position(|&b| b == b'\n').map_or(&[][..], |i| &bytes[i + 1..])
+    } else {
+        let header = header.min(bytes.len());
+        String::from_utf8_lossy(&bytes[..header]).lines().for_each(|l| keep(l.to_string()));
+        &bytes[header..]
+    };
+    let mut replay = Replay::new(size, ansi);
+    replay.feed(body, &mut keep);
+    replay.finish(&mut keep);
+    let cut = partial || total > kept.len();
+    Tail { text: Vec::from(kept).join("\n"), cut }
+}
+
+/// Bytes [`Replay`] hands vt100 at a time; after each, the rows that
+/// scrolled off the screen go out. Small enough that a chunk's rows (one
+/// per `\r\n` at most, short of explicit scrolls) stay cheap to hold.
+const REPLAY_CHUNK: usize = 8 * 1024;
+
+/// A pty log's body played through a terminal emulator (`vt100`) the size
+/// it was written at, so progress displays that redraw in place (docker
+/// buildkit's cursor-up block) come out as their final state, not as every
+/// frame. Rows go out as they become final: once scrolled off the screen,
+/// then the screen's own at [`finish`](Self::finish). Trailing blank rows
+/// never go out. Each row is one line (a wrapped line stays split as the
+/// terminal showed it), trailing spaces trimmed; with `ansi` it carries
+/// SGR escapes only (built from the cells' attributes, no cursor moves),
+/// and stripping them gives the plain row.
+///
+/// vt100 can't drop scrollback, so after each chunk the parser is swapped
+/// for a fresh one fed the old screen's state (`state_formatted`): memory
+/// stays bounded by a chunk whatever the log's length. What that state
+/// lacks (a scroll region, a saved cursor) is lost at the swap; chunks end
+/// at a line end when they can, so a swap rarely splits an escape.
+pub struct Replay {
+    parser: vt100::Parser,
+    size: TtySize,
+    ansi: bool,
+    /// Normalized input not yet played.
+    pending: Vec<u8>,
+    /// The last byte fed was `\r`.
+    cr: bool,
+    /// Blank rows held back until a non-blank one follows.
+    blanks: usize,
+}
+
+impl Replay {
+    pub fn new(size: TtySize, ansi: bool) -> Replay {
+        Replay { parser: Replay::parser(size), size, ansi, pending: Vec::new(), cr: false, blanks: 0 }
+    }
+
+    fn parser(size: TtySize) -> vt100::Parser {
+        // Room for every row one chunk can scroll off (a row takes `\r\n`).
+        vt100::Parser::new(size.rows, size.cols, REPLAY_CHUNK)
+    }
+
+    /// Play `bytes`, handing finished rows to `out`. A bare `\n` becomes
+    /// `\r\n`: the pty's own output has ONLCR's, but what's written to
+    /// the log after the tee (`error: …` at the end) has none.
+    pub fn feed(&mut self, bytes: &[u8], out: &mut impl FnMut(String)) {
+        for &b in bytes {
+            if b == b'\n' && !self.cr {
+                self.pending.push(b'\r');
+            }
+            self.pending.push(b);
+            self.cr = b == b'\r';
+        }
+        while self.pending.len() >= REPLAY_CHUNK {
+            let window = &self.pending[..REPLAY_CHUNK];
+            let end = window.iter().rposition(|&b| b == b'\n').map_or(REPLAY_CHUNK, |i| i + 1);
+            let chunk: Vec<u8> = self.pending.drain(..end).collect();
+            self.play(&chunk, out);
+        }
+    }
+
+    /// Play what's left and hand out the screen's rows.
+    pub fn finish(mut self, out: &mut impl FnMut(String)) {
+        let rest = std::mem::take(&mut self.pending);
+        self.play(&rest, out);
+        let rows = self.size.rows;
+        for r in 0..rows {
+            let line = row_text(self.parser.screen(), r, self.ansi);
+            self.emit(line, out);
+        }
+    }
+
+    fn play(&mut self, chunk: &[u8], out: &mut impl FnMut(String)) {
+        self.parser.process(chunk);
+        let screen = self.parser.screen_mut();
+        screen.set_scrollback(usize::MAX);
+        let scrolled = screen.scrollback();
+        if scrolled == 0 {
+            return;
+        }
+        let rows = usize::from(self.size.rows);
+        let mut lines = Vec::with_capacity(scrolled);
+        // The view shows `rows` rows from scrollback row `top` on.
+        for top in (0..scrolled).step_by(rows) {
+            screen.set_scrollback(scrolled - top);
+            for r in 0..rows.min(scrolled - top) {
+                lines.push(row_text(screen, r as u16, self.ansi));
+            }
+        }
+        screen.set_scrollback(0);
+        let state = screen.state_formatted();
+        self.parser = Replay::parser(self.size);
+        self.parser.process(&state);
+        for line in lines {
+            self.emit(line, out);
+        }
+    }
+
+    fn emit(&mut self, line: String, out: &mut impl FnMut(String)) {
+        if line.is_empty() {
+            self.blanks += 1;
+            return;
+        }
+        for _ in 0..std::mem::take(&mut self.blanks) {
+            out(String::new());
+        }
+        out(line);
+    }
+}
+
+/// Visible row `r` of `screen` as text, trailing blanks trimmed; with
+/// `ansi`, SGR escapes where the attributes change (and a reset at the end
+/// when any are on).
+fn row_text(screen: &vt100::Screen, r: u16, ansi: bool) -> String {
+    let (_, cols) = screen.size();
+    let mut cells: Vec<(&str, Sgr)> = Vec::with_capacity(usize::from(cols));
+    for c in 0..cols {
+        let Some(cell) = screen.cell(r, c) else { break };
+        if cell.is_wide_continuation() {
+            continue;
+        }
+        let text = if cell.has_contents() { cell.contents() } else { " " };
+        cells.push((text, Sgr::of(cell)));
+    }
+    while cells.last().is_some_and(|(text, _)| text.trim().is_empty()) {
+        cells.pop();
+    }
+    let mut line = String::new();
+    let mut on = Sgr::default();
+    for (text, sgr) in cells {
+        if ansi && sgr != on {
+            sgr.write(&mut line);
+            on = sgr;
+        }
+        line.push_str(text);
+    }
+    if ansi && on != Sgr::default() {
+        line.push_str("\x1b[0m");
+    }
+    line
+}
+
+/// A cell's drawing attributes, as SGR writes them.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct Sgr {
+    fg: vt100::Color,
+    bg: vt100::Color,
+    bold: bool,
+    dim: bool,
+    italic: bool,
+    underline: bool,
+    inverse: bool,
+}
+
+impl Sgr {
+    fn of(cell: &vt100::Cell) -> Sgr {
+        Sgr {
+            fg: cell.fgcolor(),
+            bg: cell.bgcolor(),
+            bold: cell.bold(),
+            dim: cell.dim(),
+            italic: cell.italic(),
+            underline: cell.underline(),
+            inverse: cell.inverse(),
+        }
+    }
+
+    /// `ESC[0;…m`: from a reset, so it never depends on what was on.
+    fn write(&self, out: &mut String) {
+        use std::fmt::Write as _;
+        out.push_str("\x1b[0");
+        for (on, code) in [(self.bold, 1), (self.dim, 2), (self.italic, 3), (self.underline, 4), (self.inverse, 7)] {
+            if on {
+                let _ = write!(out, ";{code}");
+            }
+        }
+        for (color, base) in [(self.fg, 30u8), (self.bg, 40)] {
+            let _ = match color {
+                vt100::Color::Default => Ok(()),
+                vt100::Color::Idx(n) if n < 8 => write!(out, ";{}", base + n),
+                vt100::Color::Idx(n) if n < 16 => write!(out, ";{}", base + 60 + n - 8),
+                vt100::Color::Idx(n) => write!(out, ";{};5;{n}", base + 8),
+                vt100::Color::Rgb(r, g, b) => write!(out, ";{};2;{r};{g};{b}", base + 8),
+            };
+        }
+        out.push('m');
+    }
+}
+
+/// Every line of a pty log's body (after its `header` bytes) replayed
+/// plain ([`Replay`]) to `out`, the whole file in [`REPLAY_CHUNK`]s
+/// (`logs --build` off a terminal). The header's lines go out as they are.
+pub fn replay_file(file: &mut File, size: TtySize, header: usize, out: &mut impl Write) -> std::io::Result<()> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut head = vec![0; header];
+    file.read_exact(&mut head)?;
+    out.write_all(&head)?;
+    let mut result = Ok(());
+    let mut put = |line: String| {
+        if result.is_ok() {
+            result = writeln!(out, "{line}");
+        }
+    };
+    let mut replay = Replay::new(size, false);
+    let mut buf = vec![0; REPLAY_CHUNK];
+    loop {
+        let n = match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        replay.feed(&buf[..n], &mut put);
+    }
+    replay.finish(&mut put);
+    result
+}
+
+/// Escape sequences dropped from a stream as it comes (`logs --build
+/// --follow` off a terminal, where a pty log can't be replayed before it
+/// ends): CSI, OSC and other string sequences, two- and three-byte `ESC`
+/// ones. `\r\n` becomes `\n`; a lone `\r` (a redraw) a line break, so
+/// redrawn lines repeat. Other C0 controls but `\t` go too.
+#[derive(Default)]
+pub struct Strip {
+    state: StripState,
+    cr: bool,
+}
+
+#[derive(Default, Clone, Copy)]
+enum StripState {
+    #[default]
+    Ground,
+    Esc,
+    Csi,
+    /// OSC, DCS, SOS, PM, APC: up to BEL or `ESC \`.
+    Str,
+    StrEsc,
+}
+
+impl Strip {
+    pub fn feed(&mut self, bytes: &[u8]) -> Vec<u8> {
+        use StripState::*;
+        let mut out = Vec::with_capacity(bytes.len());
+        for &b in bytes {
+            self.state = match self.state {
+                Ground => {
+                    if std::mem::take(&mut self.cr) && b != b'\n' {
+                        out.push(b'\n');
+                    }
+                    match b {
+                        0x1b => Esc,
+                        b'\r' => {
+                            self.cr = true;
+                            Ground
+                        }
+                        b'\n' | b'\t' => {
+                            out.push(b);
+                            Ground
+                        }
+                        0..=0x1f | 0x7f => Ground,
+                        _ => {
+                            out.push(b);
+                            Ground
+                        }
+                    }
+                }
+                Esc => match b {
+                    b'[' => Csi,
+                    b']' | b'P' | b'X' | b'^' | b'_' => Str,
+                    0x20..=0x2f => Esc, // an intermediate: one more byte
+                    _ => Ground,
+                },
+                Csi => if (0x40..=0x7e).contains(&b) { Ground } else { Csi },
+                Str => match b {
+                    0x07 => Ground,
+                    0x1b => StrEsc,
+                    _ => Str,
+                },
+                StrEsc => if b == b'\\' { Ground } else { Str },
+            };
+        }
+        out
+    }
 }
 
 /// The last `n` lines of `text`, each as a terminal would leave it (after
@@ -604,6 +953,169 @@ mod tests {
         let t = last_lines("step 1/3\rstep 3/3\r\ndone\n", 5, false);
         assert_eq!(t.text, "step 3/3\ndone");
         assert_eq!(last_lines("", 5, false), Tail { text: String::new(), cut: false });
+    }
+
+    const SIZE: TtySize = TtySize { cols: 40, rows: 5 };
+
+    /// Every line [`Replay`] hands out for `bytes` fed in one go.
+    fn replay(bytes: &[u8], ansi: bool) -> Vec<String> {
+        let mut lines = Vec::new();
+        let mut put = |l: String| lines.push(l);
+        let mut r = Replay::new(SIZE, ansi);
+        r.feed(bytes, &mut put);
+        r.finish(&mut put);
+        lines
+    }
+
+    #[test]
+    fn tty_header_reads_the_size_off_the_third_line() {
+        let head = b"$ devsandbox run\n# 2026-10-15T19:38:53Z\n# tty 120x30\nbody\r\n";
+        assert_eq!(tty_header(head), Some((TtySize { cols: 120, rows: 30 }, head.len() - 6)));
+        assert_eq!(tty_header(b"$ devsandbox run\n# 2026-10-15T19:38:53Z\nbody\n"), None, "a pipe log");
+        assert_eq!(tty_header(b"$ devsandbox run\n# 2026\n# tty 120x30"), None, "unfinished");
+        assert_eq!(tty_header(b"x\n# 2026\n# tty 120x30\n"), None);
+        assert_eq!(tty_header(b""), None);
+    }
+
+    #[test]
+    fn a_redraw_collapses_to_its_final_state() {
+        // Buildkit-style: a block drawn, then the cursor moved up over it and
+        // the block drawn again, longer.
+        let mut log = b"Preparing worktree\r\n".to_vec();
+        log.extend_from_slice(b"\x1b[?25l[+] Building 0.0s (0/2)\r\n => step a 0.0s\r\n\x1b[?25h");
+        log.extend_from_slice(b"\x1b[2A\x1b[0G\x1b[?25l[+] Building 1.2s (2/2) FINISHED\r\n => step a 0.1s\r\n => step b 1.0s\r\n");
+        assert_eq!(
+            replay(&log, false),
+            ["Preparing worktree", "[+] Building 1.2s (2/2) FINISHED", " => step a 0.1s", " => step b 1.0s"]
+        );
+        // `\r` progress on one line keeps its last state too.
+        assert_eq!(replay(b"step 1/3\rstep 3/3\r\ndone\r\n", false), ["step 3/3", "done"]);
+    }
+
+    #[test]
+    fn replay_keeps_colours_as_sgr_only_with_ansi() {
+        let log = b"\x1b[34m => blue\x1b[0m plain \x1b[1;38;5;200mpink\x1b[0m\r\n\x1b[48;2;1;2;3mrgb\x1b[m\r\n";
+        assert_eq!(replay(log, false), [" => blue plain pink", "rgb"]);
+        let ansi = replay(log, true);
+        assert_eq!(ansi, ["\x1b[0;34m => blue\x1b[0m plain \x1b[0;1;38;5;200mpink\x1b[0m", "\x1b[0;48;2;1;2;3mrgb\x1b[0m"]);
+        let bright = replay(b"\x1b[91;104mx\r\n", true);
+        assert_eq!(bright, ["\x1b[0;91;104mx\x1b[0m"]);
+    }
+
+    #[test]
+    fn replay_drops_trailing_blank_rows_and_scrolls_rows_out_in_order() {
+        // More rows than the screen: the first ones scroll off and still come
+        // out, in order; blank rows between lines stay, trailing ones go.
+        let log: String = (0..12).map(|i| if i == 3 { "\r\n".to_string() } else { format!("l{i}\r\n") }).collect();
+        let want: Vec<String> = (0..12).map(|i| if i == 3 { String::new() } else { format!("l{i}") }).collect();
+        assert_eq!(replay(format!("{log}\r\n\r\n").as_bytes(), false), want);
+        // A bare `\n` (the error line written after the tee) starts a line.
+        assert_eq!(replay(b"a\r\nerror: boom\nnext\n", false), ["a", "error: boom", "next"]);
+    }
+
+    #[test]
+    fn replay_survives_many_chunks() {
+        // Far more than one chunk, fed in odd pieces: every line, in order,
+        // and colours still on after a parser swap mid-colour.
+        let mut log = b"\x1b[32m".to_vec();
+        for i in 0..5000 {
+            log.extend_from_slice(format!("line {i}\r\n").as_bytes());
+        }
+        log.extend_from_slice(b"\x1b[0mend\r\n");
+        let mut lines = Vec::new();
+        let mut put = |l: String| lines.push(l);
+        let mut r = Replay::new(SIZE, true);
+        for piece in log.chunks(777) {
+            r.feed(piece, &mut put);
+        }
+        r.finish(&mut put);
+        assert_eq!(lines.len(), 5001);
+        assert_eq!(lines[0], "\x1b[0;32mline 0\x1b[0m");
+        assert_eq!(lines[4999], "\x1b[0;32mline 4999\x1b[0m");
+        assert_eq!(lines[5000], "end");
+    }
+
+    fn tty_log(dir: &Path, body: &[u8]) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join(FILE);
+        let mut bytes = header(&["run".into()], 0, Some(SIZE)).into_bytes();
+        bytes.extend_from_slice(body);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn tail_replays_a_pty_log_and_reads_a_pipe_log_as_lines() {
+        let dir = temp_dir("tail");
+        let path = tty_log(&dir, b"\x1b[31mred\x1b[0m\r\n50%\r100%\r\n");
+        let head = "$ devsandbox run\n# 1970-01-01T00:00:00Z\n# tty 40x5";
+        let plain = tail_at(&path, 10, false).unwrap().unwrap();
+        assert_eq!(plain, Tail { text: format!("{head}\nred\n100%"), cut: false });
+        let ansi = tail_at(&path, 10, true).unwrap().unwrap();
+        assert_eq!(ansi.text, format!("{head}\n\x1b[0;31mred\x1b[0m\n100%"));
+        assert_eq!(tail_at(&path, 2, false).unwrap().unwrap(), Tail { text: "red\n100%".into(), cut: true });
+        // Without the tty line: lines as before, escapes and all, either way.
+        let pipe = "$ devsandbox run\n# 1970-01-01T00:00:00Z\n\x1b[31mred\x1b[0m\n50%\r100%\n";
+        std::fs::write(&path, pipe).unwrap();
+        let want = Tail { text: "$ devsandbox run\n# 1970-01-01T00:00:00Z\n\x1b[31mred\x1b[0m\n100%".into(), cut: false };
+        assert_eq!(tail_at(&path, 10, false).unwrap().unwrap(), want);
+        assert_eq!(tail_at(&path, 10, true).unwrap().unwrap(), want);
+        assert_eq!(tail_at(&dir.join("none"), 10, true).unwrap(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_long_pty_log_is_replayed_from_mid_file_even_mid_escape() {
+        let dir = temp_dir("tail-long");
+        // Each line coloured, so the tail's cut lands inside some escape.
+        let mut body = Vec::new();
+        for i in 0..40_000 {
+            body.extend_from_slice(format!("\x1b[38;2;10;20;30mline {i}\x1b[0m\r\n").as_bytes());
+        }
+        let path = tty_log(&dir, &body);
+        let tail = tail_at(&path, 3, false).unwrap().unwrap();
+        assert_eq!(tail, Tail { text: "line 39997\nline 39998\nline 39999".into(), cut: true });
+        // Its first (partial) line is dropped, as for a plain log.
+        let tail = tail_at(&path, 100_000, false).unwrap().unwrap();
+        let first = tail.text.lines().next().unwrap();
+        let n: usize = first.strip_prefix("line ").unwrap().parse().unwrap();
+        assert_eq!(tail.text.lines().count(), 40_000 - n, "{first}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replay_file_prints_the_whole_log_plain() {
+        let dir = temp_dir("replay-file");
+        let mut body = Vec::new();
+        for i in 0..3000 {
+            body.extend_from_slice(format!("\x1b[1mline {i}\x1b[0m\r\n").as_bytes());
+        }
+        body.extend_from_slice(b"\x1b[1A\x1b[0Glast\x1b[K\r\n");
+        let path = tty_log(&dir, &body);
+        let mut file = File::open(&path).unwrap();
+        let (size, header_len) = tty_header(&read_head(&mut file).unwrap()).unwrap();
+        let mut out = Vec::new();
+        replay_file(&mut file, size, header_len, &mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[..3], ["$ devsandbox run", "# 1970-01-01T00:00:00Z", "# tty 40x5"]);
+        assert_eq!(lines[3], "line 0");
+        assert_eq!(lines[3 + 2998], "line 2998");
+        assert_eq!(lines[3 + 2999], "last", "the redraw over line 2999");
+        assert_eq!(lines.len(), 3 + 3000);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strip_drops_escapes_as_they_come() {
+        let mut s = Strip::default();
+        let mut out = Vec::new();
+        // Split mid-escape and between `\r` and `\n`.
+        for piece in [&b"\x1b[34m => a\x1b"[..], b"[0m\r", b"\n\x1b[1A\x1b[0G\x1b[?25lb\x1b]0;title\x07c\x1b]8;;u\x1b\\d\x1b(Be\r", b"f\r\n"] {
+            out.extend(s.feed(piece));
+        }
+        assert_eq!(String::from_utf8(out).unwrap(), " => a\nbcde\nf\n");
+        assert_eq!(Strip::default().feed(b"tab\there\x07\x08!"), b"tab\there!");
     }
 
     #[test]

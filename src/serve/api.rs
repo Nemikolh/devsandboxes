@@ -705,6 +705,9 @@ struct BuildLogParams {
     instance: String,
     #[serde(default)]
     lines: Option<usize>,
+    /// A pty log's lines with SGR escapes (colours, bold…), else plain.
+    #[serde(default)]
+    ansi: bool,
 }
 
 /// The end of an instance's build log (`build_log::tail_in`): `{text, cut}`,
@@ -724,7 +727,7 @@ fn instances_build_log(p: BuildLogParams, state: &Path) -> Answer {
     };
     let lines = p.lines.unwrap_or(DEFAULT_BUILD_LOG_LINES).min(MAX_LINES);
     let data = state.parent().unwrap_or(Path::new("."));
-    let tail = crate::build_log::tail_in(data, id, lines).map_err(ApiError::internal)?;
+    let tail = crate::build_log::tail_in(data, id, lines, p.ansi).map_err(ApiError::internal)?;
     serde_json::to_value(tail).map_err(|e| ApiError::internal(e.into()))
 }
 
@@ -1641,7 +1644,16 @@ mod tests {
         assert_eq!(read(json!({"instance": "new"})).unwrap(), Value::Null, "no log yet");
         assert_eq!(code(read(json!({"instance": "gone"}))), "not-found");
         assert_eq!(code(read(json!({"instance": "web", "lines": -1}))), "invalid");
+        assert_eq!(code(read(json!({"instance": "web", "ansi": "yes"}))), "invalid");
         assert_eq!(code(read(json!({}))), "invalid");
+        // A plain log reads the same with `ansi`.
+        assert_eq!(read(json!({"instance": "web", "ansi": true})).unwrap(), json!({"text": "one\ntwo\nthree", "cut": false}));
+        // A pty log is replayed: SGR with `ansi`, plain without.
+        let pty = "$ devsandbox run\n# 1970-01-01T00:00:00Z\n# tty 80x24\n\x1b[32mok\x1b[0m\r\n";
+        std::fs::write(log.join(crate::build_log::FILE), pty).unwrap();
+        let ask = |ansi: bool| read(json!({"instance": "web", "lines": 1, "ansi": ansi})).unwrap();
+        assert_eq!(ask(false), json!({"text": "ok", "cut": true}));
+        assert_eq!(ask(true), json!({"text": "\u{1b}[0;32mok\u{1b}[0m", "cut": true}));
     }
 
     #[test]

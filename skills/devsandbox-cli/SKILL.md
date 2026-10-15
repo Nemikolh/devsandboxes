@@ -149,6 +149,10 @@ listed when stdin is not a TTY.
    `build.1.log`; `rm` deletes both, as does a rolled-back `run`). `--follow`
    keeps printing while the instance is still being built and exits once it's
    up, failed, or gone. Only the daemon's own autostart pass writes no build log.
+   A build that ran on a terminal logged one's output (colours, docker's
+   redrawn progress): a terminal gets it as is; piped, it's plain text, the
+   redraws collapsed to their final state (with `--follow`, escapes stripped
+   as they come, so redrawn lines repeat).
 
 4. **`inspect <name>`** — pretty-printed runtime `inspect` JSON (config, mounts,
    networks, env, exit code). Same name resolution as `logs`, service containers

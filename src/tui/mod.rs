@@ -7,6 +7,7 @@
 //! Unix-only (`main.rs`): the dashboard is a client of devsandbox serve,
 //! which is; off unix it only says so.
 
+mod ansi;
 mod app;
 mod clipboard;
 mod daemon;

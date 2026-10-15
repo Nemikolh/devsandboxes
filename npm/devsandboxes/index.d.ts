@@ -934,8 +934,11 @@ export interface ApiMethods {
   'instances.cancel': { params: { instance: string }; result: InstanceCancelled };
   /** Per named instance (exact names), its processes and runs or an `error`; a per-instance failure never fails the call. */
   'instances.procs': { params: { instances: string[] }; result: Record<string, InstanceProcs> };
-  /** `instance`: exact name or instance id; `lines` default 500, at most 10000. `null`: no build log yet. */
-  'instances.buildLog': { params: { instance: string; lines?: number }; result: BuildLogTail | null };
+  /**
+   * `instance`: exact name or instance id; `lines` default 500, at most 10000. `null`: no build log yet.
+   * A pty log is replayed: plain lines, or with `ansi` lines carrying SGR escapes only.
+   */
+  'instances.buildLog': { params: { instance: string; lines?: number; ansi?: boolean }; result: BuildLogTail | null };
   /** Signal a process in the instance's container (exact name; `pid` from `instances.procs`, digits). */
   'instances.signal': { params: { instance: string; pid: string; signal: 'TERM' | 'KILL' }; result: OkResult };
   /** Exact name; `invalid` for a bad or taken name, or an instance mid-build. */

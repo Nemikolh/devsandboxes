@@ -206,6 +206,17 @@ escapes, exactly what a terminal got; its header says so with a third line,
 the slave and the copier reads to `EIO`/EOF (the stop flag still bounds a
 grandchild holding it). Pipes otherwise, as before.
 
+Readers (`docs/before-machines.md` step 5): a log with the `# tty` line is
+replayed through `vt100` at that size (`build_log::Replay`), so buildkit's
+cursor-up redraws come out as their final state. Rows go out once they
+scroll off the screen, then the last screen's; the parser is swapped for a
+fresh one fed the old screen's state every 8 KiB, so memory stays bounded
+whatever the log's length. `instances.buildLog` replays the 256 KiB tail
+(plain, or SGR-only lines with `ansi`, which the dashboard's modal colours);
+`logs --build` prints the raw bytes to a terminal, else the whole file
+replayed plain, or with `--follow` its escapes stripped as they come
+(`build_log::Strip`). Pipe logs read as lines, as before.
+
 ## Step 5: phase in `ps` and the snapshot
 
 - `src/snapshot.rs` `InstanceRow` (`:53`): add `phase: Option<PhaseRow>`

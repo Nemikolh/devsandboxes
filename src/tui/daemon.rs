@@ -397,9 +397,9 @@ fn inspect_body(result: Value) -> String {
     serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("cannot format inspect JSON: {e}"))
 }
 
-/// The API call for [`Cmd::BuildLog`].
+/// The API call for [`Cmd::BuildLog`]: `ansi`, so the modal can colour it.
 fn build_log_call(instance: &str) -> (&'static str, Value) {
-    ("instances.buildLog", json!({ "instance": instance, "lines": super::app::BUILD_LOG_LINES }))
+    ("instances.buildLog", json!({ "instance": instance, "lines": super::app::BUILD_LOG_LINES, "ansi": true }))
 }
 
 /// The API call for [`Cmd::Signal`].
@@ -1089,7 +1089,7 @@ mod tests {
             fetch(Fetch::Config { kind: ConfigKind::Service, name: "db".into() }),
             ("config", ("services.get", json!({"root": "/cfg", "name": "db"})))
         );
-        assert_eq!(build_log_call("id0"), ("instances.buildLog", json!({"instance": "id0", "lines": 500})));
+        assert_eq!(build_log_call("id0"), ("instances.buildLog", json!({"instance": "id0", "lines": 500, "ansi": true})));
         assert_eq!(
             signal_call(&PendingSignal { signal: super::super::app::Signal::Kill, ..sig("42") }),
             ("instances.signal", json!({"instance": "web-2", "pid": "42", "signal": "KILL"}))

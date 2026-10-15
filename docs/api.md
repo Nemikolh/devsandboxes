@@ -302,15 +302,24 @@ read).
 
 ### `instances.buildLog`
 
-Params: `{"instance": "<name or id>", "lines": 500}`: an exact instance
-name or `instance_id`; `lines` optional (500, at most 10000). Result: the
-end of its build log (`devsandbox logs --build`, docs/instance-phase.md),
+Params: `{"instance": "<name or id>", "lines": 500, "ansi": false}`: an
+exact instance name or `instance_id`; `lines` optional (500, at most
+10000); `ansi` optional (false). Result: the end of its build log
+(`devsandbox logs --build`, docs/instance-phase.md),
 `{"text": "…", "cut": false}`, `cut` when earlier lines were left out;
 `null` when it has none yet. A cancelled `run` drops its record, so its
 log is then `not-found`.
 
+A log written through a pty (its header's `# tty <cols>x<rows>` line, see
+*Verbs* `tty`) is replayed through a terminal emulator at that size, so
+progress displays that redraw in place come out as their final state. Its
+lines are plain text, or with `ansi` carry SGR escapes (`ESC[…m`: colours,
+bold, …) and no other escapes. A log written through pipes is its lines as
+they are (a `\r` redraw keeps its last state), whatever `ansi` says.
+
 Errors: `not-found` (no such instance), `invalid` (no `instance`, a
-negative `lines`), `internal` (the log or `state.toml` doesn't read).
+negative `lines`, a non-boolean `ansi`), `internal` (the log or
+`state.toml` doesn't read).
 
 ### `instances.signal`
 
@@ -743,12 +752,12 @@ config file, no runtime call. Its connections:
 - **One per verb** (`spawn_verb` in `src/tui/mod.rs`): `run`, `rebuild`
   and `start` (`s` on a stopped row too) are verb requests (*Verbs*),
   always `detach`; `stop` (`s` on a running row), `rm` (`d`, `:rm`) and
-  `services.rebuild` are held until the verb ends. Each carries the
+  `services.rebuild` are held until the verb ends, also sent with
+  `detach`, so quitting the dashboard leaves them running. Each carries the
   absolute config root and the dashboard's env; its `output` is dropped
   (the build log has a build's), the answer is the status line, and the
   row's phase shows the rest. `rm` goes with `ask`: its `confirm` question
-  is a y/n modal whose answer resends it with `deleteBranch`. Quitting the
-  dashboard hangs up a held verb, which cancels it (SIGINT).
+  is a y/n modal whose answer resends it with `deleteBranch`.
 
 An instance's terminal tab runs `devsandbox -C <root> exec -i -t --
 <instance>`, which sends `bridges.ensure` itself; a service's is a direct

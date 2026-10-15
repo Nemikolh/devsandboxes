@@ -5,6 +5,7 @@ use std::cell::Cell;
 
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
+use ratatui::text::Line;
 
 use crate::build_log::Tail;
 use crate::config::SandboxText;
@@ -233,7 +234,11 @@ pub struct BuildLogModal {
     pub instance: String,
     /// Its id: the row it follows and the log's directory.
     pub instance_id: String,
+    /// `text.body` is the plain text (selection, scroll bounds, [`slid_by`]).
     pub text: TextModal,
+    /// A read log's lines styled from its SGR escapes, one per `text.body`
+    /// line; empty for a placeholder or an error (drawn plain).
+    pub styled: Vec<Line<'static>>,
     /// Following the end: the shown top is [`bottom_top`], not `text.scroll`.
     pub stick: bool,
     /// The body is a read log tail (not a placeholder or an error), and
@@ -317,14 +322,21 @@ enum Confirmed {
     RmBranch { instance: String, force: bool },
 }
 
-/// How many lines dropped off the top of an append-only log's window
-/// between two reads, `old` then `new`: the smallest `k` where `old[k..]`,
-/// less its last line (it may have been partial then), starts `new`. At
-/// least one line must overlap; `None` when none does (rewritten, or more
-/// than a window appended).
+/// How many lines dropped off the top of a log's window between two reads,
+/// `old` then `new`: the smallest `k` where `old[k..]`, less its last line
+/// (it may have been partial then), starts `new`. A replayed pty log isn't
+/// append-only: its last screenful can be redrawn between reads, so when
+/// no `k` fits whole, the `k` whose `old[k..]` shares the longest prefix
+/// with `new` (the smallest on a tie). At least one line must overlap;
+/// `None` when none does (rewritten, or more than a window appended).
 fn slid_by(old: &[&str], new: &[&str]) -> Option<usize> {
     let whole = old.len().checked_sub(1)?;
-    (0..whole).find(|&k| new.starts_with(&old[k..whole]))
+    if let Some(k) = (0..whole).find(|&k| new.starts_with(&old[k..whole])) {
+        return Some(k);
+    }
+    let shared = |k: usize| old[k..whole].iter().zip(new).take_while(|(a, b)| a == b).count();
+    let (k, n) = (0..whole).map(|k| (k, shared(k))).fold((0, 0), |best, (k, n)| if n > best.1 { (k, n) } else { best });
+    (n > 0).then_some(k)
 }
 
 /// Line count of `body`, clamped to `u16`, for scroll bounds.
@@ -637,6 +649,7 @@ impl App {
             instance: row.name.clone(),
             instance_id: row.instance_id.clone(),
             text: TextModal::new(title, body),
+            styled: Vec::new(),
             stick: true,
             cut: None,
             live: matches!(row.phase, Some(PhaseRow::InFlight { .. })),
@@ -672,18 +685,25 @@ impl App {
         if view.instance_id != instance_id {
             return;
         }
-        let (body, cut) = match read {
-            Ok(Some(tail)) if tail.cut => (
-                format!("… (earlier lines: devsandbox logs --build {})\n{}", view.instance, tail.text),
-                Some(true),
-            ),
-            Ok(Some(tail)) if tail.text.is_empty() => ("(empty build log)".to_string(), None),
-            Ok(Some(tail)) => (tail.text, Some(false)),
+        let (body, styled, cut) = match read {
+            Ok(Some(tail)) if tail.text.is_empty() && !tail.cut => ("(empty build log)".to_string(), Vec::new(), None),
+            Ok(Some(tail)) => {
+                let note = tail.cut.then(|| format!("… (earlier lines: devsandbox logs --build {})", view.instance));
+                let (plain, mut styled): (Vec<String>, Vec<Line<'static>>) =
+                    tail.text.lines().map(crate::tui::ansi::parse_line).unzip();
+                let mut body = plain.join("\n");
+                if let Some(note) = note {
+                    body = format!("{note}\n{body}");
+                    styled.insert(0, Line::from(note));
+                }
+                (body, styled, Some(tail.cut))
+            }
             Ok(None) => (
                 format!("(no build log for `{}` yet: run, rebuild and start write one)", view.instance),
+                Vec::new(),
                 None,
             ),
-            Err(e) => (e, None),
+            Err(e) => (e, Vec::new(), None),
         };
         // Lines only drop off the top of a cut window. Off the note line
         // (scroll 0 on a cut body), the shown log line moves with them; one
@@ -700,6 +720,7 @@ impl App {
             }
         }
         view.text.body = body;
+        view.styled = styled;
         view.cut = cut;
         let max = line_count(&view.text.body).saturating_sub(1);
         view.text.scroll = view.text.scroll.min(max);
@@ -1473,6 +1494,54 @@ mod tests {
     }
 
     #[test]
+    fn the_build_log_keeps_plain_text_and_styled_lines_side_by_side() {
+        use ratatui::style::{Color, Style};
+        let mut app = new_app();
+        app.set_snapshot(recorded(None));
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Char('b')));
+        let text = "plain\n\x1b[0;32mgreen\x1b[0m tail\x1b[1A".to_string();
+        app.set_build_log("id0", Ok(Some(Tail { text, cut: true })));
+        let view = build_log(&app);
+        assert_eq!(view.text.body, "… (earlier lines: devsandbox logs --build inst0)\nplain\ngreen tail");
+        assert_eq!(view.styled.len(), 3, "one per body line");
+        assert_eq!(view.styled[0], Line::from("… (earlier lines: devsandbox logs --build inst0)"));
+        let green: Vec<_> = view.styled[2].spans.iter().map(|s| (s.content.to_string(), s.style)).collect();
+        assert_eq!(green, [("green".to_string(), Style::default().fg(Color::Green)), (" tail".to_string(), Style::default())]);
+        // Placeholders and errors are plain.
+        app.set_build_log("id0", Err("cannot read".into()));
+        assert!(build_log(&app).styled.is_empty());
+        app.set_build_log("id0", Ok(None));
+        assert!(build_log(&app).styled.is_empty());
+    }
+
+    #[test]
+    fn a_sliding_replayed_window_keeps_the_shown_lines_while_its_screen_redraws() {
+        // A replayed pty log: lines that scrolled off stay put, the last
+        // screenful (here 5 rows) is redrawn between reads.
+        let window = |from: usize, step: usize| -> Result<Option<Tail>, String> {
+            let mut lines: Vec<String> = (from..from + 495).map(|i| format!("l{i}")).collect();
+            lines.extend((0..5).map(|r| format!("[+] Building {step} row {r}")));
+            Ok(Some(Tail { text: lines.join("\n"), cut: true }))
+        };
+        let mut app = new_app();
+        app.set_snapshot(recorded(Some(in_flight("building"))));
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Char('b')));
+        build_log(&app).height.set(10);
+        app.set_build_log("id0", window(0, 0));
+        app.on_key(key(KeyCode::Char('g')));
+        for _ in 0..10 {
+            app.on_key(key(KeyCode::PageDown));
+        }
+        assert_eq!(shown(&app), "l199");
+        app.set_build_log("id0", window(30, 1));
+        assert_eq!(shown(&app), "l199", "slid by 30 though the screen rows changed");
+        app.set_build_log("id0", window(31, 2));
+        assert_eq!(shown(&app), "l199");
+    }
+
+    #[test]
     fn slid_by_matches_the_overlap() {
         let old = ["a", "b", "c", "d"];
         assert_eq!(slid_by(&old, &["a", "b", "c", "d", "e"]), Some(0));
@@ -1483,6 +1552,9 @@ mod tests {
         assert_eq!(slid_by(&["x", "x", "x", "y"], &["x", "x", "y", "z"]), Some(1));
         assert_eq!(slid_by(&old, &["e", "f"]), None);
         assert_eq!(slid_by(&["a"], &["a"]), None, "nothing to overlap");
+        // Its end redrawn (a replayed screen): the longest shared prefix.
+        assert_eq!(slid_by(&old, &["b", "c", "x", "y"]), Some(1));
+        assert_eq!(slid_by(&["a", "b", "c", "d", "e"], &["c", "x", "y"]), Some(2));
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::io::{IsTerminal, Read, Seek, Write};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -29,6 +29,12 @@ pub fn logs(name: &str, lines: usize) -> Result<()> {
 /// `follow` keeps printing what's appended while the instance is in flight,
 /// and stops once it isn't (done, failed, interrupted) or its record is gone
 /// (rolled back, removed), after printing what's left.
+///
+/// A pty log (`# tty` header) goes to a terminal as it is, colours and
+/// redraws and all. Anywhere else it's plain text: replayed
+/// (`build_log::replay_file`, the whole file, redraws collapsed), or, when
+/// following, with its escapes stripped as they come (`build_log::Strip`;
+/// redrawn lines repeat).
 pub fn build_log(name: &str, follow: bool) -> Result<()> {
     let state = State::load()?;
     let key = resolve_instance(&state, name)?;
@@ -44,10 +50,31 @@ pub fn build_log(name: &str, follow: bool) -> Result<()> {
         Err(e) => return Err(e).with_context(|| format!("cannot open {}", path.display())),
     };
     let mut out = std::io::stdout().lock();
+    let tty = if out.is_terminal() {
+        None
+    } else {
+        let head = crate::build_log::read_head(&mut file).with_context(|| format!("cannot read {}", path.display()))?;
+        crate::build_log::tty_header(&head)
+    };
+    if let (Some((size, header)), false) = (tty, follow) {
+        crate::build_log::replay_file(&mut file, size, header, &mut out).context("cannot print the build log")?;
+        return Ok(out.flush()?);
+    }
+    file.rewind().with_context(|| format!("cannot read {}", path.display()))?;
+    let mut strip = tty.map(|_| crate::build_log::Strip::default());
     // Kept open while following: a rotation or `rm` moves or unlinks the
     // path, not the file this reads.
     let mut drain = |file: &mut std::fs::File| -> Result<()> {
-        std::io::copy(file, &mut out).context("cannot print the build log")?;
+        match &mut strip {
+            None => {
+                std::io::copy(file, &mut out).context("cannot print the build log")?;
+            }
+            Some(strip) => {
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes).context("cannot read the build log")?;
+                out.write_all(&strip.feed(&bytes)).context("cannot print the build log")?;
+            }
+        }
         out.flush()?;
         Ok(())
     };
