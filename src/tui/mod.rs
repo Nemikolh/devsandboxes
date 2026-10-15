@@ -222,9 +222,9 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
     let dir = app.dir.clone();
     app.utc_offset = inbox::clock::local_utc_offset();
     app.kitty = KITTY.load(Ordering::Relaxed);
-    app.exec_cli = std::env::current_exe()
-        .map(|exe| ExecCli { exe, root: daemon::root_dir(dir.clone()) })
-        .map_err(|e| format!("can't find the devsandbox executable: {e}"));
+    // The executable resolves per spawn, not here: an upgrade under a running
+    // dashboard must not leave it pointing at the old, deleted file.
+    app.exec_cli = Ok(ExecCli { exe: None, root: daemon::root_dir(dir.clone()) });
     app.copy_key_intercepted = app::copy_key_intercepted(|var| std::env::var(var).ok());
     // Before the inbox, whose error would otherwise hide this one: an
     // invalid file runs on the defaults, and the first toggle overwrites it.
@@ -608,7 +608,7 @@ fn run_suspended(terminal: &mut Term, cli: &Result<ExecCli, String>, action: Pro
 
     let result = match &action {
         PromptAction::Exec { instance, argv } => cli.as_ref().map_err(|e| anyhow::anyhow!("{e}")).and_then(|cli| {
-            let argv = cli.argv(instance, argv);
+            let argv = cli.argv(instance, argv).map_err(|e| anyhow::anyhow!("{e}"))?;
             std::process::Command::new(&argv[0])
                 .args(&argv[1..])
                 .status()

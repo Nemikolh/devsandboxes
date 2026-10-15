@@ -1229,7 +1229,7 @@ impl Executor for Subprocess {
     }
 
     fn devsandbox(&mut self, config_dir: &Path, args: &[String]) -> Result<(), String> {
-        let exe = std::env::current_exe().map_err(|e| format!("cannot find devsandbox: {e}"))?;
+        let exe = crate::exe::devsandbox().map_err(|e| format!("cannot find devsandbox: {e}"))?;
         let op = args.first().map(String::as_str).unwrap_or("?");
         let path = log_path(op).ok_or("cannot create the dispatch log")?;
         let mut log = std::fs::OpenOptions::new()

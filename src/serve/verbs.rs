@@ -377,8 +377,9 @@ fn failed_data(exit: i32, instance: Option<&str>) -> Value {
 /// against scratch files instead of devsandbox against the user's state.
 #[derive(Debug, Clone)]
 pub struct Runner {
-    /// The program and its leading args ([`argv`] follows):
-    /// `[current_exe]` in production.
+    /// The program and its leading args ([`argv`] follows). Empty in
+    /// production: the devsandbox binary, re-resolved per spawn
+    /// ([`crate::exe::devsandbox`]) so verbs run the upgraded binary.
     pub program: Vec<OsString>,
     /// The spool dir: `<data-dir>/devsandbox/logs/verbs`.
     pub spool: PathBuf,
@@ -388,10 +389,9 @@ pub struct Runner {
 
 impl Runner {
     pub fn new() -> anyhow::Result<Self> {
-        let exe = std::env::current_exe().context("cannot locate the devsandbox binary")?;
         let state = State::path()?;
         let spool = state.parent().context("no data dir")?.join("logs").join("verbs");
-        Ok(Self { program: vec![exe.into()], spool, state })
+        Ok(Self { program: Vec::new(), spool, state })
     }
 }
 
@@ -667,6 +667,14 @@ struct Spool {
 impl Running {
     fn spawn(runner: &Runner, req: &VerbRequest) -> anyhow::Result<Running> {
         static SEQ: AtomicU64 = AtomicU64::new(0);
+        // Before the spool files, so a failure leaves none behind.
+        let (program, lead) = match runner.program.split_first() {
+            Some((program, lead)) => (program.clone(), lead),
+            None => {
+                let exe = crate::exe::devsandbox().context("cannot locate the devsandbox binary")?;
+                (exe.into_os_string(), &[][..])
+            }
+        };
         std::fs::create_dir_all(&runner.spool).with_context(|| format!("cannot create {}", runner.spool.display()))?;
         // Temp names until the pid is known; the daemon's pid keeps two
         // daemons' (a draining one and its successor) apart.
@@ -679,8 +687,7 @@ impl Running {
                 return Err(e);
             }
         };
-        let (program, lead) = runner.program.split_first().context("no verb program")?;
-        let mut cmd = Command::new(program);
+        let mut cmd = Command::new(&program);
         cmd.args(lead)
             .args(argv(req))
             .stdin(Stdio::null())
@@ -697,7 +704,7 @@ impl Running {
             Err(e) => {
                 let _ = std::fs::remove_file(&out.path);
                 let _ = std::fs::remove_file(&err.path);
-                return Err(e).with_context(|| format!("cannot run {}", Path::new(program).display()));
+                return Err(e).with_context(|| format!("cannot run {}", Path::new(&program).display()));
             }
         };
         let pid = child.id();

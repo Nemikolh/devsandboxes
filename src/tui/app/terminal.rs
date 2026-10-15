@@ -28,7 +28,10 @@ const WHEEL_LINES: i16 = 3;
 /// no state for it, and a remote instance only needs a prefix (step 5).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecCli {
-    pub exe: PathBuf,
+    /// `None` in production: the devsandbox binary, re-resolved per spawn
+    /// ([`crate::exe::devsandbox`]) so tabs opened after an upgrade run the
+    /// new one. Tests pin a path.
+    pub exe: Option<PathBuf>,
     /// Absolute: a PTY child starts in `$HOME`, not the dashboard's cwd.
     pub root: PathBuf,
 }
@@ -38,9 +41,13 @@ impl ExecCli {
     /// `-i -t`: both callers host it on a terminal, and with a command the
     /// CLI takes the flags as given (without one it would pick the same).
     /// `--` so an instance name can't read as a flag.
-    pub fn argv(&self, instance: &str, command: &[String]) -> Vec<String> {
+    pub fn argv(&self, instance: &str, command: &[String]) -> Result<Vec<String>, String> {
+        let exe = match &self.exe {
+            Some(exe) => exe.clone(),
+            None => crate::exe::devsandbox().map_err(|e| format!("can't find the devsandbox executable: {e}"))?,
+        };
         let mut argv = vec![
-            self.exe.to_string_lossy().into_owned(),
+            exe.to_string_lossy().into_owned(),
             "-C".into(),
             self.root.to_string_lossy().into_owned(),
             "exec".into(),
@@ -50,7 +57,7 @@ impl ExecCli {
             instance.into(),
         ];
         argv.extend(command.iter().cloned());
-        argv
+        Ok(argv)
     }
 }
 
@@ -449,7 +456,7 @@ impl App {
     fn term_argv(&self, title: &str, container: &str, is_instance: bool) -> Result<Vec<String>, String> {
         if is_instance {
             let cli = self.exec_cli.as_ref().map_err(|e| format!("terminal: {e}"))?;
-            return Ok(cli.argv(title, &[]));
+            return cli.argv(title, &[]).map_err(|e| format!("terminal: {e}"));
         }
         let snapshot = self.snapshot.as_ref().ok_or_else(|| "terminal: no data yet".to_string())?;
         let mut argv = vec![snapshot.runtime_name.clone(), "exec".into(), "-i".into(), "-t".into(), container.into()];
@@ -992,15 +999,15 @@ mod tests {
     }
 
     fn cli() -> ExecCli {
-        ExecCli { exe: "/opt/bin/devsandbox".into(), root: "/home/u/cfg".into() }
+        ExecCli { exe: Some("/opt/bin/devsandbox".into()), root: "/home/u/cfg".into() }
     }
 
     #[test]
     fn exec_cli_argv_puts_the_instance_after_the_separator() {
         let base = ["/opt/bin/devsandbox", "-C", "/home/u/cfg", "exec", "-i", "-t", "--", "-web"];
-        assert_eq!(cli().argv("-web", &[]), base);
+        assert_eq!(cli().argv("-web", &[]).unwrap(), base);
         let cmd = ["ls".to_string(), "-la".to_string()];
-        assert_eq!(cli().argv("-web", &cmd), [&base[..], &["ls", "-la"]].concat());
+        assert_eq!(cli().argv("-web", &cmd).unwrap(), [&base[..], &["ls", "-la"]].concat());
     }
 
     #[test]
@@ -1013,7 +1020,7 @@ mod tests {
             Err("terminal: the devsandbox executable isn't known yet".into())
         );
         app.exec_cli = Ok(cli());
-        assert_eq!(app.term_argv("inst0", "devsandbox-inst0", true), Ok(cli().argv("inst0", &[])));
+        assert_eq!(app.term_argv("inst0", "devsandbox-inst0", true), cli().argv("inst0", &[]));
     }
 
     #[test]

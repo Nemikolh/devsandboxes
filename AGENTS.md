@@ -11,6 +11,8 @@ git worktrees so working trees are never shared.
   (`mod tui` is unix-only, like `serve`; off unix it says it needs the daemon).
   `src/json_stdout.rs` points stdout at stderr for `run --json` so child
   output can't corrupt the one JSON document.
+- `src/exe.rs` — `devsandbox()`, the binary to spawn (re-resolved per spawn,
+  survives an upgrade), and `own_build_stamp()`, this process's own mtime.
 - `src/commands/*.rs` — one file per verb (`run`, `start`, `stop`, `rebuild`,
   `rm`, `ps`, `ls`, `exec`, `done`, `inbox`, `logs`, `inspect`, `stats`, `port`, `services::{gc,ls,rebuild}`). Shared name
   resolution in `commands/mod.rs` (`resolve_instance`: exact instance name/id

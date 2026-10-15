@@ -110,10 +110,11 @@ pub struct Version {
 }
 
 impl Version {
-    /// This binary: `CARGO_PKG_VERSION` + the mtime (unix seconds) of
-    /// `current_exe`, 0 when unknown.
+    /// This binary: `CARGO_PKG_VERSION` + the mtime (unix seconds) of the
+    /// binary this process runs ([`crate::exe::own_build_stamp`], not the
+    /// file now at its path), 0 when unknown.
     pub fn current() -> Self {
-        Self { semver: env!("CARGO_PKG_VERSION").into(), build: exe_mtime().unwrap_or(0) }
+        Self { semver: env!("CARGO_PKG_VERSION").into(), build: crate::exe::own_build_stamp().unwrap_or(0) }
     }
 
     /// Ordering key: `(major, minor, patch, build)`, compared lexicographically.
@@ -125,11 +126,6 @@ impl Version {
     pub fn is_newer_than(&self, other: &Version) -> bool {
         self.key() > other.key()
     }
-}
-
-fn exe_mtime() -> Option<u64> {
-    let modified = std::fs::metadata(std::env::current_exe().ok()?).ok()?.modified().ok()?;
-    Some(modified.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs())
 }
 
 /// `"1.2.3"` → `(1, 2, 3)`. Each component's leading digits count (so

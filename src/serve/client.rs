@@ -390,7 +390,7 @@ pub(crate) fn hello(stream: &mut Stream, version: &Version, client: &str) -> Res
 /// (pins no directory), stdin from /dev/null, stdout+stderr appended to
 /// `serve.log`.
 pub(super) fn spawn_detached(dir: &Path) -> Result<()> {
-    let exe = std::env::current_exe().context("cannot locate the devsandbox binary")?;
+    let exe = crate::exe::devsandbox().context("cannot locate the devsandbox binary")?;
     let log_path = endpoint::log_path()?;
     if let Some(parent) = log_path.parent() {
         endpoint::ensure_private_dir(parent)?;

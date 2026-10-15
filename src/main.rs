@@ -3,6 +3,7 @@ mod commands;
 mod config;
 mod daemon_config;
 mod devsbd;
+mod exe;
 mod features;
 mod inbox;
 mod json_stdout;
@@ -399,6 +400,9 @@ enum ServiceCommand {
 }
 
 fn main() -> Result<()> {
+    // First thing: the stamp must be this binary's, read before an upgrade
+    // can replace the file.
+    exe::own_build_stamp();
     let cli = Cli::parse();
     #[cfg(unix)]
     if cli.in_process {
