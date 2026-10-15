@@ -590,8 +590,29 @@ impl App {
         }
     }
 
-    /// [`Self::on_mouse`] for everything but text selection.
+    /// [`Self::on_mouse`] for everything but text selection. A text modal
+    /// (logs, build log, help) takes the wheel, 3 lines a notch like the
+    /// config view; nothing under it sees it.
     fn route_mouse(&mut self, ev: &MouseEvent, area: Rect) {
+        let wheel = match ev.kind {
+            MouseEventKind::ScrollUp => Some(-3),
+            MouseEventKind::ScrollDown => Some(3),
+            _ => None,
+        };
+        if let Some(delta) = wheel {
+            match &mut self.modal {
+                Modal::Logs(view) | Modal::Help(HelpModal { text: view, .. }) => {
+                    view.scroll_by(delta);
+                    return;
+                }
+                // Its own, so scrolling to the bottom follows the build again.
+                Modal::BuildLog(view) => {
+                    view.scroll_by(delta);
+                    return;
+                }
+                _ => {}
+            }
+        }
         let Modal::Config(view) = &mut self.modal else {
             self.dragging_divider = false;
             self.help_mouse(ev, area);

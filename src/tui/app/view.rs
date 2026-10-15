@@ -113,11 +113,12 @@ Config modal
   tab         switch pane (config ⇄ inspect)
   < / >       resize the divider (drag it too)
   ↑/k ↓/j     scroll focused pane   pgup/pgdn  page
+  wheel       scroll the pane under the pointer
   g / G       top / bottom
   esc, q      close
 
-Logs modal
-  ↑/k ↓/j     scroll    pgup/pgdn  page
+Logs, build log and this help
+  ↑/k ↓/j     scroll    pgup/pgdn  page   wheel  scroll
   g / G       top / bottom
   esc, q      close
 
@@ -235,6 +236,9 @@ pub struct BuildLogModal {
     pub text: TextModal,
     /// Following the end: the shown top is [`bottom_top`], not `text.scroll`.
     pub stick: bool,
+    /// The body is a read log tail (not a placeholder or an error), and
+    /// whether it was cut (its first line is the "earlier lines" note).
+    cut: Option<bool>,
     /// In flight at the last snapshot: the next one re-reads (once more
     /// after it ends, for the last lines).
     live: bool,
@@ -311,6 +315,16 @@ enum Confirmed {
     /// Resend rm with the answer as `deleteBranch` (the CLI's
     /// `verbs_client::with_confirm`), same `force`, no `ask`.
     RmBranch { instance: String, force: bool },
+}
+
+/// How many lines dropped off the top of an append-only log's window
+/// between two reads, `old` then `new`: the smallest `k` where `old[k..]`,
+/// less its last line (it may have been partial then), starts `new`. At
+/// least one line must overlap; `None` when none does (rewritten, or more
+/// than a window appended).
+fn slid_by(old: &[&str], new: &[&str]) -> Option<usize> {
+    let whole = old.len().checked_sub(1)?;
+    (0..whole).find(|&k| new.starts_with(&old[k..whole]))
 }
 
 /// Line count of `body`, clamped to `u16`, for scroll bounds.
@@ -624,6 +638,7 @@ impl App {
             instance_id: row.instance_id.clone(),
             text: TextModal::new(title, body),
             stick: true,
+            cut: None,
             live: matches!(row.phase, Some(PhaseRow::InFlight { .. })),
             height: Cell::new(0),
         });
@@ -644,8 +659,11 @@ impl App {
 
     /// Install what the daemon answered for `instance_id` (`Err`: why it
     /// couldn't), if its modal is still the open one. Keeps the user's
-    /// scroll position unless following the bottom. Any answer frees the
-    /// read slot (one is outstanding at a time, whichever modal asked).
+    /// place unless following the bottom: once the log outgrew
+    /// [`BUILD_LOG_LINES`], each read's window slides, so the scroll moves
+    /// up by the lines that dropped off ([`slid_by`]) to keep the same
+    /// lines shown. Any answer frees the read slot (one is outstanding at a
+    /// time, whichever modal asked).
     pub fn set_build_log(&mut self, instance_id: &str, read: Result<Option<Tail>, String>) {
         self.build_log_in_flight = false;
         let Modal::BuildLog(view) = &mut self.modal else {
@@ -654,19 +672,35 @@ impl App {
         if view.instance_id != instance_id {
             return;
         }
-        view.text.body = match read {
-            Ok(Some(tail)) if tail.cut => format!(
-                "… (earlier lines: devsandbox logs --build {})\n{}",
-                view.instance, tail.text
+        let (body, cut) = match read {
+            Ok(Some(tail)) if tail.cut => (
+                format!("… (earlier lines: devsandbox logs --build {})\n{}", view.instance, tail.text),
+                Some(true),
             ),
-            Ok(Some(tail)) if tail.text.is_empty() => "(empty build log)".to_string(),
-            Ok(Some(tail)) => tail.text,
-            Ok(None) => format!(
-                "(no build log for `{}` yet: run, rebuild and start write one)",
-                view.instance
+            Ok(Some(tail)) if tail.text.is_empty() => ("(empty build log)".to_string(), None),
+            Ok(Some(tail)) => (tail.text, Some(false)),
+            Ok(None) => (
+                format!("(no build log for `{}` yet: run, rebuild and start write one)", view.instance),
+                None,
             ),
-            Err(e) => e,
+            Err(e) => (e, None),
         };
+        // Lines only drop off the top of a cut window. Off the note line
+        // (scroll 0 on a cut body), the shown log line moves with them; one
+        // that dropped off leaves the note on top.
+        if let (false, Some(old_cut), Some(true)) = (view.stick, view.cut, cut) {
+            let skip = usize::from(old_cut);
+            let old: Vec<&str> = view.text.body.lines().skip(skip).collect();
+            let new: Vec<&str> = body.lines().skip(1).collect();
+            let shown = usize::from(view.text.scroll);
+            if let (Some(k), true) = (slid_by(&old, &new), shown >= skip) {
+                let line = shown - skip;
+                let scroll = if line >= k { 1 + line - k } else { 0 };
+                view.text.scroll = scroll.min(u16::MAX as usize) as u16;
+            }
+        }
+        view.text.body = body;
+        view.cut = cut;
         let max = line_count(&view.text.body).saturating_sub(1);
         view.text.scroll = view.text.scroll.min(max);
     }
@@ -1383,6 +1417,123 @@ mod tests {
         assert_eq!(build_log(&app).top(), 20);
         app.set_build_log("id0", tail(0..5));
         assert_eq!(build_log(&app).top(), 4);
+    }
+
+    fn cut_tail(lines: std::ops::Range<usize>) -> Result<Option<Tail>, String> {
+        let text = lines.map(|i| format!("l{i}")).collect::<Vec<_>>().join("\n");
+        Ok(Some(Tail { text, cut: true }))
+    }
+
+    /// The build log's first shown line.
+    fn shown(app: &App) -> &str {
+        let view = build_log(app);
+        view.text.body.lines().nth(usize::from(view.top())).unwrap_or("")
+    }
+
+    #[test]
+    fn a_sliding_build_log_window_keeps_the_shown_lines() {
+        let mut app = new_app();
+        app.set_snapshot(recorded(Some(in_flight("building"))));
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Char('b')));
+        build_log(&app).height.set(10);
+        // Under the cap: appends never move a scrolled-up view.
+        app.set_build_log("id0", tail(0..400));
+        app.on_key(key(KeyCode::Char('g')));
+        for _ in 0..5 {
+            app.on_key(key(KeyCode::PageDown));
+        }
+        assert_eq!(shown(&app), "l100");
+        // Past it (the note line comes in on top): 50 lines dropped off.
+        app.set_build_log("id0", cut_tail(50..550));
+        assert_eq!(shown(&app), "l100");
+        assert_eq!(build_log(&app).top(), 51);
+        // The window keeps sliding: still the same line.
+        app.set_build_log("id0", cut_tail(53..553));
+        assert_eq!(shown(&app), "l100");
+        // An unchanged read moves nothing.
+        app.set_build_log("id0", cut_tail(53..553));
+        assert_eq!(shown(&app), "l100");
+        // Its line dropped off: the note on top.
+        app.set_build_log("id0", cut_tail(120..620));
+        assert_eq!(build_log(&app).top(), 0);
+        app.set_build_log("id0", cut_tail(130..630));
+        assert_eq!(build_log(&app).top(), 0, "the note stays");
+        // A rewritten log (a new build) shares nothing: the index stays.
+        app.on_key(key(KeyCode::PageDown));
+        let top = build_log(&app).top();
+        let fresh = (0..500).map(|i| format!("m{i}")).collect::<Vec<_>>().join("\n");
+        app.set_build_log("id0", Ok(Some(Tail { text: fresh, cut: true })));
+        assert_eq!(build_log(&app).top(), top);
+        // Following the bottom, it just follows.
+        app.on_key(key(KeyCode::Char('G')));
+        app.set_build_log("id0", cut_tail(140..640));
+        assert!(build_log(&app).stick);
+        assert_eq!(shown(&app), "l630");
+    }
+
+    #[test]
+    fn slid_by_matches_the_overlap() {
+        let old = ["a", "b", "c", "d"];
+        assert_eq!(slid_by(&old, &["a", "b", "c", "d", "e"]), Some(0));
+        assert_eq!(slid_by(&old, &["c", "d", "e", "f"]), Some(2));
+        // The old last line may have been partial: it isn't compared.
+        assert_eq!(slid_by(&old, &["b", "c", "dd", "e"]), Some(1));
+        // Repeated lines: the smallest slide that fits.
+        assert_eq!(slid_by(&["x", "x", "x", "y"], &["x", "x", "y", "z"]), Some(1));
+        assert_eq!(slid_by(&old, &["e", "f"]), None);
+        assert_eq!(slid_by(&["a"], &["a"]), None, "nothing to overlap");
+    }
+
+    #[test]
+    fn the_wheel_scrolls_the_text_modals() {
+        // Over the terminal panel's body, where the wheel scrolls it back.
+        let panel = crate::tui::ui::terminal_panel_rect(FRAME, false);
+        let wheel = |app: &mut App, kind| app.on_mouse(&mouse_at(kind, panel.x + 2, panel.y + 2), FRAME);
+        // Logs, with a terminal under it that must not scroll back.
+        let mut app = new_app();
+        app.terms.open(term_sess("web-1", "devsandbox-web-1"));
+        {
+            let session = app.terms.active_session().unwrap();
+            let mut parser = session.parser().lock().unwrap();
+            for i in 0..60 {
+                parser.process(format!("line {i}\r\n").as_bytes());
+            }
+        }
+        let body = (0..30).map(|i| format!("l{i}")).collect::<Vec<_>>().join("\n");
+        app.modal = Modal::Logs(TextModal::new(" logs ".into(), body));
+        wheel(&mut app, MouseEventKind::ScrollDown);
+        wheel(&mut app, MouseEventKind::ScrollDown);
+        let Modal::Logs(view) = &app.modal else { panic!("logs closed") };
+        assert_eq!(view.scroll, 6);
+        wheel(&mut app, MouseEventKind::ScrollUp);
+        let Modal::Logs(view) = &app.modal else { panic!("logs closed") };
+        assert_eq!(view.scroll, 3);
+        let scrollback = app.terms.active_session().unwrap().parser().lock().unwrap().screen().scrollback();
+        assert_eq!(scrollback, 0, "the terminal under the modal didn't see it");
+        // Help's key reference.
+        let mut app = new_app();
+        app.on_key(key(KeyCode::Char('?')));
+        wheel(&mut app, MouseEventKind::ScrollDown);
+        let Modal::Help(view) = &app.modal else { panic!("help closed") };
+        assert_eq!(view.text.scroll, 3);
+        wheel(&mut app, MouseEventKind::ScrollUp);
+        wheel(&mut app, MouseEventKind::ScrollUp);
+        let Modal::Help(view) = &app.modal else { panic!("help closed") };
+        assert_eq!(view.text.scroll, 0, "clamped");
+        // The build log: up unsticks from where it's shown, back down sticks.
+        let mut app = new_app();
+        app.set_snapshot(recorded(Some(in_flight("building"))));
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Char('b')));
+        build_log(&app).height.set(10);
+        app.set_build_log("id0", tail(0..30));
+        wheel(&mut app, MouseEventKind::ScrollUp);
+        assert!(!build_log(&app).stick);
+        assert_eq!(build_log(&app).top(), 17);
+        wheel(&mut app, MouseEventKind::ScrollDown);
+        assert!(build_log(&app).stick);
+        assert_eq!(build_log(&app).top(), 20);
     }
 
     #[test]
