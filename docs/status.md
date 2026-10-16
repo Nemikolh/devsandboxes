@@ -19,7 +19,8 @@ limitation means editing this file in the same commit.
 - **helper**: host → in-container daemon requests (an `RPC` channel),
   daemon-owned runs with a restart policy, worktree stand-ins.
   → [plan](plans/active/helper-rpc.md)
-- **machines**: VS Code on remote rows (spike),
+- **machines**: a noisy login shell no longer breaking the link, agent
+  forwarding opt-in per machine and switchable live, VS Code on remote rows (spike),
   remote Inbox threads, nameless commands across every machine.
   → [plan](plans/active/machines-next.md)
 - **daemon**: Windows as a remote-only client of a machine.
