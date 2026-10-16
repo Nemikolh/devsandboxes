@@ -112,6 +112,22 @@ impl Bridge {
         }
         forward.mux.connect(conn, host, port, on_close)
     }
+
+    /// Ask the daemon which processes listen on TCP `port` in the container
+    /// (`proto::Frame::PortQuery`), waiting up to `timeout`: `(pid, comm)` in
+    /// pid order, empty when nothing listens. Errors like `connect`: before
+    /// the handshake, on a dead bridge, `Unsupported` when the daemon doesn't
+    /// advertise `PORT_INFO` (an older helper: the caller falls back to
+    /// `lsof`), and `TimedOut` when no answer came.
+    pub fn listening(&self, port: u16, timeout: Duration) -> std::io::Result<Vec<(u32, String)>> {
+        let Some(forward) = self.forward.get().filter(|_| !self.is_done()) else {
+            return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "bridge is not running"));
+        };
+        if forward.peer_caps & caps::PORT_INFO == 0 {
+            return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "helper has no port lookup"));
+        }
+        forward.mux.port_query(port, timeout)
+    }
 }
 
 impl Drop for Bridge {
@@ -2090,7 +2106,11 @@ mod tests {
             let none: Option<fn() -> Option<PathBuf>> = None;
             let bridge = spawn_with(&name, hash(arch).unwrap(), none, None).unwrap();
             assert_eq!(bridge.outcome(Duration::from_secs(10)), Some(Ok(())), "bridge handshake");
-            assert_eq!(bridge.peer_caps(), Some(caps::TCP_FORWARD), "daemon advertises TCP_FORWARD");
+            assert_eq!(
+                bridge.peer_caps(),
+                Some(caps::TCP_FORWARD | caps::PORT_INFO),
+                "daemon advertises TCP_FORWARD and PORT_INFO"
+            );
 
             // Round-trip through the loopback echo server. Retry the connect a
             // few times: `nc -lk` may not have bound its listener the instant
@@ -2121,6 +2141,12 @@ mod tests {
                 }
             }
             assert!(round_tripped, "loopback echo did not round-trip through the forward");
+
+            // The daemon names the listener (no lsof in alpine); a closed port
+            // has none.
+            let procs = bridge.listening(8080, Duration::from_secs(2)).unwrap();
+            assert!(!procs.is_empty() && procs.iter().all(|(pid, comm)| *pid > 0 && !comm.is_empty()), "{procs:?}");
+            assert_eq!(bridge.listening(9, Duration::from_secs(2)).unwrap(), []);
 
             // A Connect to a closed port comes back refused.
             let (_ours, theirs) = UnixStream::pair().unwrap();

@@ -24,6 +24,7 @@ use std::collections::BTreeSet;
 use anyhow::Result;
 
 use crate::config::{Config, ServiceScope};
+use crate::devsbd::format_procs;
 #[cfg(unix)]
 use crate::devsbd::forward::HostPort;
 use crate::state::State;
@@ -161,18 +162,11 @@ fn parse_lsof_f(out: &str) -> Vec<(u32, String)> {
     procs
 }
 
-/// Render listening processes for the UI: `node (pid 412)`, several joined with
-/// `, `. Empty → `None` (nothing to show).
-fn format_procs(procs: &[(u32, String)]) -> Option<String> {
-    if procs.is_empty() {
-        return None;
-    }
-    Some(procs.iter().map(|(pid, cmd)| format!("{cmd} (pid {pid})")).collect::<Vec<_>>().join(", "))
-}
-
 /// Look up the process listening on `port` inside `container`, quietly (never
 /// stderr — the daemon's forwards call it), via a plain root `exec` (no devsbd
-/// needed). `-F` output is machine-parseable; any failure at all — `lsof`
+/// needed). The forward engine's fallback when the bridge's helper can't
+/// answer (`Bridge::listening`): via-instance routes and older helpers.
+/// `-F` output is machine-parseable; any failure at all — `lsof`
 /// missing (exit 127), no match (exit 1), or the container gone — yields
 /// `None`, never an error (docs/architecture/daemon/forwards.md, _Routes_).
 pub(crate) fn listening_procs(container: &str, port: u16) -> Option<String> {

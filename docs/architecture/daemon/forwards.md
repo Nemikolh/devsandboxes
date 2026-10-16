@@ -52,8 +52,17 @@ call and tries them in order:
   the service container and dial `127.0.0.1:<port>` there (needs `/bin/sh`,
   root `exec`, writable `/run`).
 
-`listening_procs` shows which process listens (`node (pid 412)`) via a
-quiet `lsof -F` `exec`; any failure shows nothing. Probed at most every
+The engine shows which process listens (`node (pid 412)`, `format_procs`
+in `src/devsbd.rs`). When the port lives in the dialed container (instance
+and injection routes) it asks the forward's own bridge: `Bridge::listening`,
+a `PortQuery` the helper answers from `/proc`
+([protocol.md](../helper/protocol.md#port-queries)), waited at most
+`LOOKUP_TIMEOUT` (2 s). A via-instance route (the instance's helper can't
+see the service container) and a helper without `PORT_INFO` fall back to
+`ForwardSpec.probe`, which is `listening_procs`: a quiet `lsof -F` `exec`
+in the route's `process_container`. Any failure shows nothing; a helper
+that doesn't answer in time is not retried through `lsof`
+(`helper_answer`). Probed on the supervisor thread at most every
 `PROBE_REFRESH` (10 s) while the forward is `Active`.
 
 ## Host ports

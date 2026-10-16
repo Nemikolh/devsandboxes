@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use super::bridge::{self, Bridge};
 use super::hash;
-use crate::devsbd::Arch;
+use crate::devsbd::{format_procs, Arch};
 
 /// Where a connection should be dialed, resolved fresh for each (re)spawn of
 /// the bridge. `container` is the instance whose helper carries the tunnel;
@@ -28,10 +28,10 @@ use crate::devsbd::Arch;
 /// `None` when unknown (a pre-embedding instance) — only the Hello's
 /// informational hash uses it. `label` is what the UI shows, e.g. `api:3000`
 /// or `postgres:5432 (via instance api)`. `process_container` is where the
-/// forwarded port actually lives — for the listening-process lookup (`lsof`):
-/// the dialed `container` for an instance/injection forward, but the *service*
-/// container for a via-instance route (the instance can't see the service's
-/// processes).
+/// forwarded port actually lives — for the listening-process lookup: the
+/// dialed `container` for an instance/injection forward (the bridge's helper
+/// answers), but the *service* container for a via-instance route (the
+/// instance can't see the service's processes, so `ForwardSpec.probe` runs).
 pub struct Route {
     pub container: String,
     pub arch: Option<Arch>,
@@ -61,11 +61,13 @@ pub struct ForwardSpec {
     pub bind: IpAddr,
     pub host_port: HostPort,
     pub resolve: Box<dyn Fn() -> Result<Route, String> + Send + Sync>,
-    /// Listening-process lookup for the forwarded port, run in the route's
-    /// `process_container` (docs/architecture/daemon/forwards.md).
-    /// Called only on the forward's own (supervisor) thread, never the caller's;
-    /// any failure yields `None`. Passed in so `forward.rs` stays runtime- and
-    /// `commands`-generic and the pure lifecycle tests can inject a stub.
+    /// Fallback listening-process lookup for the forwarded port, run in the
+    /// route's `process_container` when the bridge's helper can't answer
+    /// (`Bridge::listening`: a via-instance route, an older helper; docs/
+    /// architecture/daemon/forwards.md). Called only on the forward's own
+    /// (supervisor) thread, never the caller's; any failure yields `None`.
+    /// Passed in so `forward.rs` stays runtime- and `commands`-generic and the
+    /// pure lifecycle tests can inject a stub.
     pub probe: Box<dyn Fn(&str, u16) -> Option<String> + Send + Sync>,
 }
 
@@ -85,11 +87,16 @@ const HANDSHAKE_WAIT: Duration = Duration::from_secs(10);
 /// promptly without `accept` blocking forever on a quiet listener.
 const ACCEPT_POLL: Duration = Duration::from_millis(50);
 
-/// Minimum gap between listening-process (`lsof`) probes while a forward is
-/// Active. Runs on the supervisor thread, folded into its bridge-liveness poll;
-/// an exec is ~100ms, so this keeps the poll's overhead negligible while still
+/// Minimum gap between listening-process probes while a forward is Active.
+/// Runs on the supervisor thread, folded into its bridge-liveness poll; a
+/// helper query is a round trip on the bridge and the `lsof` fallback an exec
+/// of ~100ms, so this keeps the poll's overhead negligible while still
 /// catching a dev server that restarts under a new pid within ~10s.
 const PROBE_REFRESH: Duration = Duration::from_secs(10);
+
+/// How long a probe waits for the helper's answer. Short: the supervisor's
+/// liveness poll waits behind it, so a wedged helper costs at most this.
+const LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The forwarder's coarse state, for the UI. `Connecting` = no live bridge yet
 /// (initial spawn or a retry in flight); `Active` = a bridge handshook and is
@@ -112,7 +119,7 @@ pub struct ForwardStatus {
     // CLI doesn't surface it.
     pub open_conns: usize,
     /// The process listening on the forwarded port, e.g. `node (pid 412)`, or
-    /// `None` when unknown (no `lsof`, no match, or not yet probed). Refreshed
+    /// `None` when unknown (no match, no answer, or not yet probed). Refreshed
     /// on the forward's own thread; cleared whenever the bridge isn't Active.
     pub process: Option<String>,
 }
@@ -145,11 +152,12 @@ struct Shared {
     /// Where the daemon should dial for this bridge (`host`, `port`), set by
     /// the supervisor on each (re)spawn and read by `handle_conn`.
     dial: Mutex<(String, u16)>,
-    /// Listening-process lookup; run only on the supervisor thread.
+    /// Fallback listening-process lookup; run only on the supervisor thread.
     probe: Box<dyn Fn(&str, u16) -> Option<String> + Send + Sync>,
-    /// Where to probe for the listening process (`process_container`, port), set
-    /// by the supervisor on each (re)spawn.
-    probe_target: Mutex<(String, u16)>,
+    /// Where to probe for the listening process (`process_container`, port,
+    /// and whether that's the dialed container, i.e. the bridge's helper can
+    /// see it), set by the supervisor on each (re)spawn.
+    probe_target: Mutex<(String, u16, bool)>,
     /// The last known listening process, refreshed on the supervisor thread and
     /// read by `status`. `None` whenever the forward isn't Active.
     process: Mutex<Option<String>>,
@@ -210,7 +218,7 @@ impl Forward {
             route_label: Mutex::new(String::new()),
             dial: Mutex::new((String::new(), 0)),
             probe,
-            probe_target: Mutex::new((String::new(), 0)),
+            probe_target: Mutex::new((String::new(), 0, false)),
             process: Mutex::new(None),
             handlers: Mutex::new(Vec::new()),
         });
@@ -381,7 +389,7 @@ fn supervise(resolve: Box<dyn Fn() -> Result<Route, String> + Send + Sync>, shar
                 // Just became Active: probe the listening process once now, then
                 // periodically inside `wait_until_dead` (docs, _Listening
                 // process_). On the supervisor thread, never the caller's.
-                refresh_process(&shared);
+                refresh_process(&shared, &bridge);
                 wait_until_dead(&bridge, &shared, &stop);
                 if stop.load(Ordering::Relaxed) {
                     return;
@@ -431,7 +439,8 @@ fn try_spawn(resolve: &(dyn Fn() -> Result<Route, String> + Send + Sync), shared
     };
     *shared.route_label.lock().unwrap() = route.label.clone();
     *shared.dial.lock().unwrap() = (route.host.clone(), route.port);
-    *shared.probe_target.lock().unwrap() = (route.process_container.clone(), route.port);
+    *shared.probe_target.lock().unwrap() =
+        (route.process_container.clone(), route.port, route.process_container == route.container);
 
     let hash = route.arch.and_then(hash).unwrap_or_default();
     let Some(bridge) = bridge::spawn_for(&route.container, hash, true) else {
@@ -519,24 +528,44 @@ fn set_error(shared: &Arc<Shared>, reason: String) {
     shared.notes.lock().unwrap().push(reason);
 }
 
-/// Run the listening-process probe in the route's `process_container` and store
-/// the result. Only ever called on the supervisor thread; any failure (no
-/// `lsof`, no match, container gone) leaves `None` (the probe returns `None`).
-fn refresh_process(shared: &Arc<Shared>) {
-    let (container, port) = shared.probe_target.lock().unwrap().clone();
-    let found = (shared.probe)(&container, port);
+/// Find the listening process and store it: asked of the bridge's helper when
+/// it can see the port (`helper_answer`), else the `probe` fallback in the
+/// route's `process_container`. Only ever called on the supervisor thread;
+/// any failure (no match, no answer, container gone) leaves `None`. The
+/// bridge's lock is held for the query, at most `LOOKUP_TIMEOUT`.
+fn refresh_process(shared: &Arc<Shared>, bridge: &Arc<Mutex<Bridge>>) {
+    let (container, port, dialed) = shared.probe_target.lock().unwrap().clone();
+    let found = helper_answer(dialed, || bridge.lock().unwrap().listening(port, LOOKUP_TIMEOUT))
+        .unwrap_or_else(|| (shared.probe)(&container, port));
     *shared.process.lock().unwrap() = found;
+}
+
+/// The helper's say on the listening process: `Some(found)` when it settled
+/// it (an answer, or a failure that leaves it unknown), `None` when the
+/// fallback probe should run instead — the port isn't in the dialed container
+/// (`dialed` false: `ask` isn't called) or the helper predates `PORT_INFO`
+/// (`Unsupported`). A timeout doesn't fall back: a wedged helper's container
+/// wouldn't serve an `exec` much better.
+fn helper_answer(dialed: bool, ask: impl FnOnce() -> io::Result<Vec<(u32, String)>>) -> Option<Option<String>> {
+    if !dialed {
+        return None;
+    }
+    match ask() {
+        Ok(procs) => Some(format_procs(&procs)),
+        Err(e) if e.kind() == io::ErrorKind::Unsupported => None,
+        Err(_) => Some(None),
+    }
 }
 
 /// Poll the bridge until it reports done or `stop` is set, so the supervisor
 /// can respawn promptly without a keepalive of its own. Folds in the periodic
 /// listening-process refresh (at most every `PROBE_REFRESH`) so it stays on
-/// this thread — an exec of ~100ms every 10s is a negligible add to the poll.
+/// this thread — a probe every 10s is a negligible add to the poll.
 fn wait_until_dead(bridge: &Arc<Mutex<Bridge>>, shared: &Arc<Shared>, stop: &Arc<AtomicBool>) {
     let mut next_probe = Instant::now() + PROBE_REFRESH;
     while !stop.load(Ordering::Relaxed) && !bridge.lock().unwrap().is_done() {
         if Instant::now() >= next_probe {
-            refresh_process(shared);
+            refresh_process(shared, bridge);
             next_probe = Instant::now() + PROBE_REFRESH;
         }
         std::thread::sleep(ACCEPT_POLL);
@@ -570,6 +599,23 @@ mod tests {
         assert_eq!(retry_gap(false), RETRY);
         assert_eq!(retry_gap(true), MISMATCH_RETRY);
         assert!(MISMATCH_RETRY > RETRY);
+    }
+
+    // ---- pure: who answers the listening-process probe ----
+
+    #[test]
+    fn helper_answer_table() {
+        let err = |kind| move || Err(io::Error::new(kind, "x"));
+        // Answered: formatted like the lsof path; empty = nothing listens.
+        assert_eq!(helper_answer(true, || Ok(vec![(412, "node".into())])), Some(Some("node (pid 412)".into())));
+        assert_eq!(helper_answer(true, || Ok(Vec::new())), Some(None));
+        // Older helper: fall back to the probe.
+        assert_eq!(helper_answer(true, err(io::ErrorKind::Unsupported)), None);
+        // No answer / dead bridge: unknown, no fallback exec.
+        assert_eq!(helper_answer(true, err(io::ErrorKind::TimedOut)), Some(None));
+        assert_eq!(helper_answer(true, err(io::ErrorKind::BrokenPipe)), Some(None));
+        // Port lives elsewhere (via-instance): the helper isn't even asked.
+        assert_eq!(helper_answer(false, || -> io::Result<Vec<(u32, String)>> { panic!("asked") }), None);
     }
 
     // ---- pure: note dedup ----
@@ -823,6 +869,79 @@ mod tests {
                 h.join().unwrap();
             }
             drop(forward);
+            Ok(())
+        })
+    }
+
+    /// Docker-gated: the listening process comes from the bridge's helper in an
+    /// image where the `lsof` path finds nothing (alpine's `lsof` is busybox's,
+    /// which ignores `-F`), while a route whose port lives in another container
+    /// (a via-instance route) still uses the fallback probe.
+    #[test_utils::docker_test(helper)]
+    fn listening_process_comes_from_the_helper_with_docker() -> Result<(), &'static str> {
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let name = format!("devsandbox-fwd-procs-{stamp}");
+        let serve = "busybox nc -lk -s 127.0.0.1 -p 8080 -e cat";
+        let cleanup = || {
+            let _ = Command::new("docker").args(["rm", "-f", &name]).output();
+        };
+        crate::test_support::with_cleanup(cleanup, || {
+            assert!(ok(Command::new("docker").args(["run", "-d", "--name", &name, "alpine:3.20", "sh", "-c", serve])));
+            let arch = install(&name, None).unwrap();
+            let fallback = || -> Box<dyn Fn(&str, u16) -> Option<String> + Send + Sync> {
+                Box::new(|container, _| Some(format!("fallback in {container}")))
+            };
+            let process_of = |forward: &Forward| {
+                // `nc` may not have bound yet on the first probe; the next
+                // comes `PROBE_REFRESH` later.
+                let deadline = Instant::now() + PROBE_REFRESH + Duration::from_secs(5);
+                loop {
+                    if let Some(p) = forward.status().process {
+                        return Some(p);
+                    }
+                    if Instant::now() >= deadline {
+                        return None;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            };
+
+            let direct = Forward::start(ForwardSpec {
+                bind: LOOPBACK,
+                host_port: HostPort::Prefer(0),
+                resolve: loopback_route(name.clone(), arch, 8080),
+                probe: fallback(),
+            })
+            .unwrap();
+            assert!(wait_active(&direct), "forward never became Active: {:?}", direct.status().state);
+            let found = process_of(&direct).ok_or("listening process never found")?;
+            assert!(found.contains(" (pid ") && !found.contains("fallback"), "{found}");
+            assert_eq!(crate::commands::port::listening_procs(&name, 8080), None, "lsof path can't tell");
+            drop(direct);
+
+            let elsewhere = {
+                let name = name.clone();
+                Box::new(move || {
+                    Ok(Route {
+                        container: name.clone(),
+                        arch: Some(arch),
+                        host: "127.0.0.1".into(),
+                        port: 8080,
+                        label: "test:8080 (via)".into(),
+                        process_container: "svc-container".into(),
+                    })
+                })
+            };
+            let via = Forward::start(ForwardSpec {
+                bind: LOOPBACK,
+                host_port: HostPort::Prefer(0),
+                resolve: elsewhere,
+                probe: fallback(),
+            })
+            .unwrap();
+            assert!(wait_active(&via), "forward never became Active: {:?}", via.status().state);
+            assert_eq!(process_of(&via).as_deref(), Some("fallback in svc-container"));
+            drop(via);
             Ok(())
         })
     }

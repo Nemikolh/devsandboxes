@@ -6,6 +6,7 @@ mod bridge;
 mod ctl;
 mod daemon;
 mod json;
+mod listeners;
 mod outbox;
 mod runs;
 mod vscode;

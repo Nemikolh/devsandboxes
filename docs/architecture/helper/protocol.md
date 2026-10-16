@@ -8,6 +8,7 @@ changing either side of the link; both sides compile the same source files.
 Code: `src/devsbd/proto.rs` (`Frame`, `VERSION`, `caps`, `channel`,
 `handshake`), `src/devsbd/mux.rs` (`Mux`, `Conn`), `devsbd/src/bridge.rs`,
 `devsbd/src/daemon.rs` (`serve_bridge`, `Bridges::route`),
+`devsbd/src/listeners.rs` (`lookup`),
 `src/devsbd/{bootfile,notify,control,escape}.rs`, `devsbd/src/json.rs`.
 All shared files are included by the helper via `#[path]`; they are std-only
 because `devsbd` has no dependencies.
@@ -27,8 +28,8 @@ host owner ──exec -i -u root <c> /run/devsandbox/bin/devsbd bridge──▶ 
   restarted outside devsandbox), does `Hello` with the daemon, then with the
   host, then copies bytes verbatim both ways. The daemon parses the frames;
   the bridge never does after the handshake.
-- The bridge advertises to the host `TCP_FORWARD & <daemon's caps>`, so the
-  host sees what the whole path can serve.
+- The bridge advertises to the host `(TCP_FORWARD | PORT_INFO) & <daemon's
+  caps>`, so the host sees what the whole path can serve.
 - The daemon routes each new stream to the **newest** attached bridge whose
   host serves that channel; older bridges stay as fallbacks.
 
@@ -52,6 +53,8 @@ error, not a huge allocation). Stream 0 carries control frames.
 | 8 | `Window` | `u32` credit grant on a flow-controlled stream |
 | 9 | `Eof` | half-close |
 | 10 | `Caps` | `u32` host capabilities, sent once right after the handshake |
+| 11 | `PortQuery` | `u32 id \| u16 port`; host asks who listens on a TCP port in the container |
+| 12 | `PortInfo` | `u32 id`, then per process `u32 pid \| u8 comm_len \| comm`; the daemon's answer |
 
 **Frozen across versions:** the header, `Hello`'s leading `u32` version, and
 `Quit`. Unknown kinds are skipped, so frames are added without bumping
@@ -67,7 +70,8 @@ advertised the matching cap.
 ### Caps
 
 Bitset, unknown bits ignored: `TCP_FORWARD` (daemon serves `Connect`),
-`SSH_AGENT`, `NOTIFY`, `CONTROL` (host serves those channels). The host sends
+`PORT_INFO` (daemon answers `PortQuery`), `SSH_AGENT`, `NOTIFY`, `CONTROL`
+(host serves those channels). The host sends
 `Caps` after the handshake (`SSH_AGENT` only when it has a live agent;
 `NOTIFY | CONTROL` only on the serve daemon's bridges). Until a bridge's
 `Caps` arrives the daemon treats it as capable of nothing, except a bridge
@@ -82,6 +86,30 @@ bridge's `Hello` anyway so the bridge can report it. A bridge whose daemon
 mismatches prints a direction-aware line and exits `MISMATCH_EXIT` (3); the
 host classifies that by exit code, not text. The host kills a bridge whose
 handshake takes over 10 s (`HANDSHAKE_TIMEOUT`).
+
+### Port queries
+
+The forward engine's listening-process lookup
+([forwards.md](../daemon/forwards.md#routes)). A request/answer pair on
+stream 0 rather than a stream: no local socket on either end, one small
+answer. The host sends `PortQuery` only to a daemon advertising
+`PORT_INFO` (older helpers lack the bit and never see the frame), with an
+id of its choosing, and waits for the `PortInfo` carrying that id
+(`Mux::port_query`, bounded by the caller's timeout; queued through the
+control writer, so a wedged pipe can't block the caller past it). The
+daemon runs each lookup on its own thread (`Mux::on_port_query`, at most
+`MAX_PORT_LOOKUPS` = 4 at once per bridge; past that a query goes
+unanswered) and answers `(pid, comm)` per process in pid order, at most
+`MAX_PORT_PROCS` (64), an empty list when nothing listens. A late answer
+finds no waiter and is dropped; the connection ending fails every waiting
+query at once.
+
+`listeners::lookup` reads `/proc`, no `lsof`: LISTEN (`0A`) rows on the
+port in `/proc/net/tcp` and `tcp6` (any local address) give socket inodes,
+`/proc/<pid>/fd` links `socket:[<inode>]` give the pids (at most
+`MAX_PIDS`, 4096, scanned), `/proc/<pid>/comm` the names. A process that
+vanishes mid-scan is skipped. The daemon's network namespace is the
+container's, so this sees what the forward dials.
 
 ### Keepalive
 

@@ -19,13 +19,18 @@
 //!   (`Window`), a per-stream write queue drained by its own thread so the
 //!   reader never blocks, and half-close (`Eof`). One slow local reader can't
 //!   stall the other streams or starve the keepalive.
+//!
+//! Besides streams, one request/answer on stream 0: the host's `PortQuery`
+//! (who listens on a port), answered with `PortInfo` by a daemon that
+//! registered a lookup (`on_port_query`); the host waits for it in
+//! `port_query`.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use super::proto::{self, Frame, INITIAL_WINDOW};
@@ -71,6 +76,15 @@ const MAX_HOST_STREAMS: usize = 256;
 /// `Open` whose id has this bit set, the daemon a `Connect` whose id doesn't
 /// (docs/architecture/helper/protocol.md, _Frames_).
 const HOST_ID_BIT: u32 = 1 << 31;
+
+/// Port lookups the daemon runs at once per connection; a `PortQuery` past
+/// this goes unanswered (the host's wait times out). The host asks one at a
+/// time per forward, so this only bounds a misbehaving peer.
+const MAX_PORT_LOOKUPS: usize = 4;
+
+/// The daemon's answer to a `PortQuery`: the `(pid, comm)` listening on a TCP
+/// port (see `Mux::on_port_query`).
+pub type PortLookup = Arc<dyn Fn(u16) -> Vec<(u32, String)> + Send + Sync>;
 
 /// Reason sent with the `Close` for a peer that overran its credit.
 const FLOW_VIOLATION: &str = "flow control violation";
@@ -378,6 +392,15 @@ pub struct Mux {
     /// daemon can wake agent clients held while no agent-capable bridge existed
     /// (a bridge becomes capable only after it advertises `SSH_AGENT`).
     on_caps: Mutex<Option<Box<dyn FnMut(u32) + Send>>>,
+    /// Answers inbound `PortQuery`s (the daemon's); `None` leaves them
+    /// unanswered.
+    port_lookup: Mutex<Option<PortLookup>>,
+    /// Lookups running now, capped at `MAX_PORT_LOOKUPS`.
+    port_lookups: AtomicUsize,
+    /// Our outstanding `PortQuery`s by id, each waiting in `port_query` for
+    /// its `PortInfo`. Cleared when `serve` returns, which wakes the waiters.
+    queries: Mutex<HashMap<u32, mpsc::SyncSender<Vec<(u32, String)>>>>,
+    next_query: AtomicU32,
 }
 
 impl Mux {
@@ -392,7 +415,69 @@ impl Mux {
             ended: AtomicBool::new(false),
             peer_caps: Mutex::new(None),
             on_caps: Mutex::new(None),
+            port_lookup: Mutex::new(None),
+            port_lookups: AtomicUsize::new(0),
+            queries: Mutex::new(HashMap::new()),
+            next_query: AtomicU32::new(1),
         })
+    }
+
+    /// Register how this side answers the peer's `PortQuery` (the daemon's
+    /// `/proc` lookup). Each lookup runs on its own thread, so a slow one never
+    /// holds the frame reader.
+    #[allow(dead_code)] // used by the daemon (devsbd crate) only
+    pub fn on_port_query(&self, lookup: PortLookup) {
+        *self.port_lookup.lock().unwrap() = Some(lookup);
+    }
+
+    /// Ask the peer (a daemon advertising `caps::PORT_INFO`) who listens on TCP
+    /// `port` in the container, waiting up to `timeout`. Queued through
+    /// `send_ctl`, so a wedged pipe can't block the caller past `timeout`
+    /// either. `TimedOut` when no answer came, `BrokenPipe` when the
+    /// connection ended first.
+    #[allow(dead_code)] // host forwarder (docs/architecture/daemon/forwards.md)
+    pub fn port_query(self: &Arc<Self>, port: u16, timeout: Duration) -> io::Result<Vec<(u32, String)>> {
+        let (tx, rx) = mpsc::sync_channel(1);
+        let id = self.next_query.fetch_add(1, Ordering::Relaxed);
+        self.queries.lock().unwrap().insert(id, tx);
+        // After the insert: `serve` sets `ended` before clearing `queries`, so
+        // either the clear drops our sender or we see `ended` here.
+        let got = if self.ended.load(Ordering::Relaxed) {
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        } else {
+            self.send_ctl(Frame::PortQuery { id, port });
+            rx.recv_timeout(timeout)
+        };
+        self.queries.lock().unwrap().remove(&id);
+        match got {
+            Ok(procs) => Ok(procs),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                Err(io::Error::new(io::ErrorKind::TimedOut, "no answer to the port query"))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "bridge closed"))
+            }
+        }
+    }
+
+    /// An inbound `PortQuery`: run the registered lookup on its own thread
+    /// (it reads `/proc`) and send the `PortInfo` back, or drop the query when
+    /// there's no lookup or `MAX_PORT_LOOKUPS` already run.
+    fn answer_port_query(self: &Arc<Self>, id: u32, port: u16) {
+        let Some(lookup) = self.port_lookup.lock().unwrap().clone() else { return };
+        let admitted = self
+            .port_lookups
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < MAX_PORT_LOOKUPS).then_some(n + 1))
+            .is_ok();
+        if !admitted {
+            return;
+        }
+        let mux = Arc::clone(self);
+        spawn_stream_thread(move || {
+            let procs = lookup(port);
+            mux.port_lookups.fetch_sub(1, Ordering::AcqRel);
+            mux.send_ctl(Frame::PortInfo { id, procs });
+        });
     }
 
     /// The peer's advertised capabilities, or `None` if it never sent `Caps`
@@ -904,10 +989,19 @@ impl Mux {
                 }
                 // `Quit` only means something as a control socket's first
                 // frame, which the daemon reads before handing over to `serve`.
+                Frame::PortQuery { id, port } => self.answer_port_query(id, port),
+                // A late answer (its query timed out) finds no waiter: dropped.
+                Frame::PortInfo { id, procs } => {
+                    if let Some(tx) = self.queries.lock().unwrap().remove(&id) {
+                        let _ = tx.try_send(procs);
+                    }
+                }
                 Frame::Hello { .. } | Frame::Pong(_) | Frame::Quit => {}
             }
         }
         self.ended.store(true, Ordering::Relaxed);
+        // Wakes every `port_query` waiter (its sender is dropped).
+        self.queries.lock().unwrap().clear();
         // Taking the lock orders this after a writer's `ended` check, so its
         // wait can't miss the wake-up.
         drop(self.ctl.lock().unwrap());
@@ -1724,5 +1818,72 @@ mod tests {
         // Up to MAX_HOST_STREAMS accepted (well past MAX_STREAMS), then refused.
         let ids: Vec<u32> = (1..=MAX_HOST_STREAMS as u32 + 2).map(h).collect();
         assert_eq!(refused_connects(&ids), [h(MAX_HOST_STREAMS as u32 + 1), h(MAX_HOST_STREAMS as u32 + 2)]);
+    }
+
+    /// A host and a daemon mux over pipes; the daemon answers `PortQuery`s
+    /// with `lookup` when given one. Returns the host side.
+    fn port_pair(lookup: Option<PortLookup>) -> Arc<Mux> {
+        let (d_r, h_w) = std::io::pipe().unwrap();
+        let (h_r, d_w) = std::io::pipe().unwrap();
+        let daemon = Mux::new(d_w);
+        if let Some(lookup) = lookup {
+            daemon.on_port_query(lookup);
+        }
+        let host = Mux::new(h_w);
+        std::thread::spawn(move || daemon.serve(d_r, |_, _| None));
+        let h = Arc::clone(&host);
+        std::thread::spawn(move || h.serve(h_r, |_, _| None));
+        host
+    }
+
+    #[test]
+    fn port_query_round_trips_concurrently() {
+        let host = port_pair(Some(Arc::new(|port| vec![(u32::from(port), format!("p{port}"))])));
+        let handles: Vec<_> = (1..=4u16)
+            .map(|port| {
+                let host = Arc::clone(&host);
+                std::thread::spawn(move || (port, host.port_query(port, Duration::from_secs(5)).unwrap()))
+            })
+            .collect();
+        for h in handles {
+            let (port, procs) = h.join().unwrap();
+            assert_eq!(procs, [(u32::from(port), format!("p{port}"))]);
+        }
+        assert!(host.queries.lock().unwrap().is_empty(), "answered queries are unregistered");
+    }
+
+    /// A daemon without a lookup leaves the query unanswered: the host's wait
+    /// is bounded by its timeout, and the connection stays usable.
+    #[test]
+    fn unanswered_port_query_times_out() {
+        let host = port_pair(None);
+        let start = Instant::now();
+        let err = host.port_query(80, Duration::from_millis(200)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(host.queries.lock().unwrap().is_empty());
+    }
+
+    /// The connection ending wakes a waiting query at once (`BrokenPipe`), and
+    /// a query after the end fails without waiting.
+    #[test]
+    fn port_query_fails_fast_when_the_connection_ends() {
+        let (h_r, d_w) = std::io::pipe().unwrap();
+        let (_d_r, h_w) = std::io::pipe().unwrap();
+        let host = Mux::new(h_w);
+        let h = Arc::clone(&host);
+        let served = std::thread::spawn(move || h.serve(h_r, |_, _| None));
+        let waiter = {
+            let host = Arc::clone(&host);
+            std::thread::spawn(move || host.port_query(80, Duration::from_secs(30)))
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        drop(d_w); // peer gone: `serve` returns
+        served.join().unwrap();
+        let start = Instant::now();
+        assert_eq!(waiter.join().unwrap().unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+        let err = host.port_query(80, Duration::from_secs(30)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+        assert!(start.elapsed() < Duration::from_secs(5));
     }
 }

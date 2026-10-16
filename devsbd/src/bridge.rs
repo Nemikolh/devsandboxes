@@ -10,10 +10,11 @@ use std::process::{Command, Stdio};
 use crate::daemon::CTL;
 use crate::proto::{self, caps};
 
-/// What this bridge itself can serve. The daemon dials `Connect` streams (the
-/// bridge just relays bytes), so the bridge advertises `TCP_FORWARD` to the
-/// host — gated below by what the daemon also supports.
-const OWN_CAPS: u32 = caps::TCP_FORWARD;
+/// What this bridge itself can serve. The daemon dials `Connect` streams and
+/// answers `PortQuery` (the bridge just relays bytes), so the bridge
+/// advertises `TCP_FORWARD | PORT_INFO` to the host — gated below by what the
+/// daemon also supports.
+const OWN_CAPS: u32 = caps::TCP_FORWARD | caps::PORT_INFO;
 
 pub fn run(hash: &str) -> io::Result<()> {
     // Daemon first, so a missing or mismatched daemon surfaces to the host as

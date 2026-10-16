@@ -111,6 +111,17 @@ pub fn relay_mode(info: &Instance) -> bool {
     cfg!(unix) && info.devsbd_arch.is_some() && info.ssh_auth_sock.is_none()
 }
 
+/// Render a forward's listening processes for the UI: `node (pid 412)`,
+/// several joined with `, `. Empty → `None` (nothing to show). Shared by both
+/// lookups (the helper's `PortInfo`, the `lsof` fallback in `commands::port`)
+/// so they read the same.
+pub fn format_procs(procs: &[(u32, String)]) -> Option<String> {
+    if procs.is_empty() {
+        return None;
+    }
+    Some(procs.iter().map(|(pid, cmd)| format!("{cmd} (pid {pid})")).collect::<Vec<_>>().join(", "))
+}
+
 fn decompress(zst: &[u8]) -> Option<Vec<u8>> {
     if zst.is_empty() {
         return None;

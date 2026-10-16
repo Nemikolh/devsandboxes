@@ -347,10 +347,14 @@ fn serve_bridge(mut conn: UnixStream, bridges: Arc<Bridges>, hash: &str) {
     let hello_caps = match proto::read_frame(&mut conn) {
         Ok(Some(Frame::Quit)) => std::process::exit(0),
         Ok(Some(Frame::Hello { version, caps: bridge_caps, .. })) => {
-            // Advertise that we serve `Connect` streams, so the bridge can pass
-            // the host `own & daemon` caps and a forward is only attempted when
-            // this daemon can serve it.
-            let ours = Frame::Hello { version: proto::VERSION, hash: hash.to_string(), caps: caps::TCP_FORWARD };
+            // Advertise that we serve `Connect` streams and answer `PortQuery`,
+            // so the bridge can pass the host `own & daemon` caps and a forward
+            // only uses what this daemon can serve.
+            let ours = Frame::Hello {
+                version: proto::VERSION,
+                hash: hash.to_string(),
+                caps: caps::TCP_FORWARD | caps::PORT_INFO,
+            };
             if proto::write_frame(&mut conn, &ours).is_err() || version != proto::VERSION {
                 return;
             }
@@ -360,6 +364,7 @@ fn serve_bridge(mut conn: UnixStream, bridges: Arc<Bridges>, hash: &str) {
     };
     let Ok(out) = conn.try_clone() else { return };
     let mux = Mux::new(out);
+    mux.on_port_query(Arc::new(crate::listeners::lookup));
     Bridges::attach(&bridges, &mux, hello_caps);
     // Keepalive: a wedged bridge (stopped reading, so it also stops sending)
     // is caught by inbound silence; `on_dead` shuts the control connection,

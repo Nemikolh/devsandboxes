@@ -5,13 +5,13 @@
 //!
 //! Wire format, little-endian, one byte stream per direction:
 //! `u32 stream | u8 kind | u32 len | payload[len]`. Control frames (`Hello`,
-//! `Ping`, `Pong`, `Caps`) use stream 0; the daemon allocates stream ids from 1
-//! for the connections it accepts.
+//! `Ping`, `Pong`, `Caps`, `PortQuery`, `PortInfo`) use stream 0; the daemon
+//! allocates stream ids from 1 for the connections it accepts.
 //!
 //! Kinds: 0 `Hello` · 1 `Open` · 2 `Data` · 3 `Close` · 4 `Ping` · 5 `Pong` ·
-//! 6 `Quit` · 7 `Connect` · 8 `Window` · 9 `Eof` · 10 `Caps`. 7–10 are the
-//! additive port-forwarding frames (see docs/architecture/daemon/forwards.md); older peers
-//! skip them as unknown kinds.
+//! 6 `Quit` · 7 `Connect` · 8 `Window` · 9 `Eof` · 10 `Caps` · 11 `PortQuery` ·
+//! 12 `PortInfo`. 7–12 are the additive port-forwarding frames (see
+//! docs/architecture/daemon/forwards.md); older peers skip them as unknown kinds.
 //!
 //! **Frozen across versions:** the header layout, `Hello`'s leading `u32`
 //! version, and `Quit`. An outdated daemon must still understand the `Quit` a
@@ -68,6 +68,8 @@ const KIND_CONNECT: u8 = 7;
 const KIND_WINDOW: u8 = 8;
 const KIND_EOF: u8 = 9;
 const KIND_CAPS: u8 = 10;
+const KIND_PORT_QUERY: u8 = 11;
+const KIND_PORT_INFO: u8 = 12;
 
 const HEADER_LEN: usize = 9;
 
@@ -83,7 +85,13 @@ pub mod caps {
     pub const NOTIFY: u32 = 1 << 2;
     /// Host serves control streams (`channel::CONTROL`) for this bridge.
     pub const CONTROL: u32 = 1 << 3;
+    /// Daemon answers `PortQuery` with `PortInfo` (who listens on a port).
+    pub const PORT_INFO: u32 = 1 << 4;
 }
+
+/// Upper bound on the processes one `PortInfo` lists; the helper stops
+/// collecting there, the decoder rejects more.
+pub const MAX_PORT_PROCS: usize = 64;
 
 /// Starting per-direction credit for a flow-controlled stream: a sender may
 /// have this many bytes outstanding before a `Window` grants more. Sized so a
@@ -120,6 +128,14 @@ pub enum Frame {
     /// the daemon route by what this host supports; passes through the bridge
     /// verbatim. An old daemon skips this unknown kind.
     Caps(u32),
+    /// Host asks the daemon which processes listen on TCP `port` in the
+    /// container; `id` (host-chosen) pairs it with the answer. Only sent to a
+    /// daemon that advertised `caps::PORT_INFO`. Wire: `u32 id | u16 port`.
+    PortQuery { id: u32, port: u16 },
+    /// The daemon's answer to `PortQuery { id }`: `(pid, comm)` per listening
+    /// process, deduped, in pid order, at most `MAX_PORT_PROCS`. Wire: `u32 id`
+    /// then per process `u32 pid | u8 comm_len | comm`.
+    PortInfo { id: u32, procs: Vec<(u32, String)> },
     /// Liveness check; the peer answers `Pong` with the same payload.
     Ping(Vec<u8>),
     Pong(Vec<u8>),
@@ -153,6 +169,21 @@ impl Frame {
             Frame::Window { stream, credit } => (*stream, KIND_WINDOW, credit.to_le_bytes().to_vec()),
             Frame::Eof { stream } => (*stream, KIND_EOF, Vec::new()),
             Frame::Caps(c) => (0, KIND_CAPS, c.to_le_bytes().to_vec()),
+            Frame::PortQuery { id, port } => {
+                let mut p = id.to_le_bytes().to_vec();
+                p.extend_from_slice(&port.to_le_bytes());
+                (0, KIND_PORT_QUERY, p)
+            }
+            Frame::PortInfo { id, procs } => {
+                let mut p = id.to_le_bytes().to_vec();
+                for (pid, comm) in procs.iter().take(MAX_PORT_PROCS) {
+                    let comm = truncate_utf8(comm, u8::MAX as usize);
+                    p.extend_from_slice(&pid.to_le_bytes());
+                    p.push(comm.len() as u8);
+                    p.extend_from_slice(comm.as_bytes());
+                }
+                (0, KIND_PORT_INFO, p)
+            }
             Frame::Ping(p) => (0, KIND_PING, p.clone()),
             Frame::Pong(p) => (0, KIND_PONG, p.clone()),
             Frame::Quit => (0, KIND_QUIT, Vec::new()),
@@ -234,12 +265,53 @@ impl Frame {
                 Ok(b) => Frame::Caps(u32::from_le_bytes(b)),
                 Err(_) => return Err(invalid("Caps payload must be four bytes")),
             },
+            KIND_PORT_QUERY => match payload[..] {
+                [a, b, c, d, p0, p1] => Frame::PortQuery {
+                    id: u32::from_le_bytes([a, b, c, d]),
+                    port: u16::from_le_bytes([p0, p1]),
+                },
+                _ => return Err(invalid("PortQuery payload must be six bytes")),
+            },
+            KIND_PORT_INFO => {
+                let Some((id, mut rest)) = payload.split_first_chunk::<4>() else {
+                    return Err(invalid("short PortInfo"));
+                };
+                let mut procs = Vec::new();
+                while !rest.is_empty() {
+                    let Some((pid, after)) = rest.split_first_chunk::<4>() else {
+                        return Err(invalid("truncated PortInfo"));
+                    };
+                    let Some((&len, after)) = after.split_first() else {
+                        return Err(invalid("truncated PortInfo"));
+                    };
+                    let Some((comm, after)) = after.split_at_checked(len as usize) else {
+                        return Err(invalid("truncated PortInfo"));
+                    };
+                    if procs.len() == MAX_PORT_PROCS {
+                        return Err(invalid("PortInfo lists too many processes"));
+                    }
+                    // Lossy: a process name is the process's own choice of bytes.
+                    procs.push((u32::from_le_bytes(*pid), String::from_utf8_lossy(comm).into_owned()));
+                    rest = after;
+                }
+                Frame::PortInfo { id: u32::from_le_bytes(*id), procs }
+            }
             KIND_PING => Frame::Ping(payload),
             KIND_PONG => Frame::Pong(payload),
             KIND_QUIT => Frame::Quit,
             _ => return Ok(None),
         }))
     }
+}
+
+/// `s` cut to at most `max` bytes on a char boundary (a `PortInfo` comm
+/// length is one byte).
+fn truncate_utf8(s: &str, max: usize) -> &str {
+    let mut end = s.len().min(max);
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 fn invalid(msg: &str) -> io::Error {
@@ -348,7 +420,10 @@ mod tests {
             Frame::Connect { stream: 0x8000_0001, host: "postgres".into(), port: 5432 },
             Frame::Window { stream: 7, credit: INITIAL_WINDOW },
             Frame::Eof { stream: 7 },
-            Frame::Caps(caps::TCP_FORWARD | caps::SSH_AGENT | caps::NOTIFY | caps::CONTROL),
+            Frame::Caps(caps::TCP_FORWARD | caps::SSH_AGENT | caps::NOTIFY | caps::CONTROL | caps::PORT_INFO),
+            Frame::PortQuery { id: 1, port: 8080 },
+            Frame::PortInfo { id: 1, procs: Vec::new() },
+            Frame::PortInfo { id: u32::MAX, procs: vec![(412, "node".into()), (7, "nginx: worker".into())] },
             Frame::Ping(b"t".to_vec()),
             Frame::Pong(Vec::new()),
             Frame::Quit,
@@ -403,6 +478,66 @@ mod tests {
                 b'd', b'b',
             ]
         );
+    }
+
+    #[test]
+    fn port_query_and_info_byte_layout() {
+        let q = Frame::PortQuery { id: 2, port: 8080 }.encode();
+        assert_eq!(q, [0, 0, 0, 0, KIND_PORT_QUERY, 6, 0, 0, 0, 2, 0, 0, 0, 0x90, 0x1f]);
+        let info = Frame::PortInfo { id: 2, procs: vec![(412, "nc".into())] }.encode();
+        #[rustfmt::skip]
+        let want = [
+            0, 0, 0, 0, KIND_PORT_INFO,
+            11, 0, 0, 0,       // payload len
+            2, 0, 0, 0,        // id
+            0x9c, 0x01, 0, 0,  // pid 412
+            2, b'n', b'c',     // comm
+        ];
+        assert_eq!(info, want);
+    }
+
+    /// A comm past 255 bytes is cut on a char boundary rather than producing a
+    /// length byte that wraps; a non-utf-8 comm on the wire decodes lossily.
+    #[test]
+    fn port_info_comm_is_bounded_and_lossy() {
+        let long = "é".repeat(200); // 400 bytes
+        let wire = Frame::PortInfo { id: 1, procs: vec![(1, long)] }.encode();
+        let Some(Frame::PortInfo { procs, .. }) = read_frame(&mut Cursor::new(wire)).unwrap() else {
+            panic!("want PortInfo")
+        };
+        assert_eq!(procs[0].1, "é".repeat(127));
+
+        let wire = vec![0, 0, 0, 0, KIND_PORT_INFO, 10, 0, 0, 0, 1, 0, 0, 0, 5, 0, 0, 0, 1, 0xff];
+        assert_eq!(
+            read_frame(&mut Cursor::new(wire)).unwrap(),
+            Some(Frame::PortInfo { id: 1, procs: vec![(5, "\u{fffd}".into())] })
+        );
+    }
+
+    #[test]
+    fn malformed_port_frames_rejected() {
+        let mut short_query = Frame::PortQuery { id: 1, port: 1 }.encode();
+        short_query[5] = 5;
+        short_query.truncate(HEADER_LEN + 5);
+        let short_info = vec![0, 0, 0, 0, KIND_PORT_INFO, 3, 0, 0, 0, 1, 0, 0];
+        // A comm length past the payload's end.
+        let truncated = vec![0, 0, 0, 0, KIND_PORT_INFO, 9, 0, 0, 0, 1, 0, 0, 0, 5, 0, 0, 0, 9];
+        let too_many = {
+            let procs = vec![(1u32, String::new()); MAX_PORT_PROCS + 1];
+            let mut p = 1u32.to_le_bytes().to_vec();
+            for (pid, _) in &procs {
+                p.extend_from_slice(&pid.to_le_bytes());
+                p.push(0);
+            }
+            let mut w = vec![0, 0, 0, 0, KIND_PORT_INFO];
+            w.extend_from_slice(&(p.len() as u32).to_le_bytes());
+            w.extend_from_slice(&p);
+            w
+        };
+        for wire in [short_query, short_info, truncated, too_many] {
+            let err = read_frame(&mut Cursor::new(wire)).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        }
     }
 
     #[test]
