@@ -20,6 +20,25 @@ What it keeps across restarts:
 - **Port forwards.** Ports-tab forwards survive closing the dashboard and come back on the same host port when the daemon restarts; a sandbox's `forwardPorts` follow its instance.
 - **Dispatchers.** `devsbd ensure`, `exec`, `events` and the rest are served whether or not a dashboard is open. A control command exits `75` only when no daemon is reachable; scripts retry.
 
+## Other machines
+
+The daemon can also manage sandboxes on other hosts you reach over ssh, where devsandbox is installed too. Register one, and its sandboxes and instances show in your dashboard next to yours, and the CLI finds its names:
+
+```bash
+devsandbox machine add me@my-server   # pick its config roots; or --config '~/sandboxes'
+devsandbox run api                    # `api` is only defined there
+devsandbox exec test                  # an instance there: ssh -t … devsandbox exec test
+devsandbox stop my-server/test        # qualified, when the name exists here too
+devsandbox ps --machine my-server     # a command without a name, run there
+devsandbox machine ls                 # each machine's state: connected, unreachable, …
+```
+
+Your daemon connects to each machine's own daemon only while something needs it (an open dashboard, a command), through the login shell there, so a build on a machine runs with that machine's environment; only your ssh-agent is forwarded. ssh never prompts: use a key from your agent. A machine that's down keeps its last rows, marked `unreachable`. Port forwards and VS Code on a machine aren't supported yet.
+
+<Callout variant="note" title="Adding a machine means trusting it">
+  Your ssh-agent is forwarded to it, and whoever controls it can act as you in its sandboxes.
+</Callout>
+
 ## Start it at login
 
 A sandbox the container runtime restarts on boot (`autostart = "runtime"`) can't start a host process itself, so until your first `devsandbox` command its control commands wait. Hand the daemon to your service manager to close that gap:
@@ -47,5 +66,6 @@ Editors and GUIs reach the same Inbox, instances and forwards as the dashboard t
 <div class="resource-grid">
   <ResourceLink href="/docs/node-api" label="Node API" description="connect(): the Inbox, instances and port forwards, typed" />
   <ResourceLink href="https://github.com/Nemikolh/devsandboxes/blob/main/docs/serve.md" label="docs/serve.md" description="Start, handoff, idle exit, boot start, logs" />
+  <ResourceLink href="https://github.com/Nemikolh/devsandboxes/blob/main/docs/machines.md" label="docs/machines.md" description="Machines: the ssh transport, names, limitations" />
   <ResourceLink href="https://github.com/Nemikolh/devsandboxes/blob/main/docs/api.md" label="docs/api.md" description="Every API method, notification and error code" />
 </div>

@@ -7,7 +7,8 @@ and external clients (editor extensions, GUIs). Design and roadmap:
 user ops' checks, shared with `devsandbox inbox`: docs/inbox-cli.md), `src/serve/daemon.rs` (connections,
 `subscribe`), `src/serve/proto.rs` (envelope), `src/serve/forwards.rs`
 (the forwards behind `forwards.*`), `src/serve/relay.rs` (`api --stdio`),
-`npm/devsandboxes/index.js` (the Node client).
+`src/serve/machines/` (`machines.*`, requests forwarded to a machine;
+docs/machines.md), `npm/devsandboxes/index.js` (the Node client).
 
 ## Transport
 
@@ -74,14 +75,14 @@ absent otherwise (`confirm` included).
 
 | code | |
 |---|---|
-| `not-found` | the thread, action, directory, instance, sandbox, service or forward named doesn't exist |
-| `invalid` | bad params (missing, wrong type, unknown value), or an op that makes no sense for its target |
+| `not-found` | the thread, action, directory, instance, sandbox, service, forward or machine named doesn't exist |
+| `invalid` | bad params (missing, wrong type, unknown value), an op that makes no sense for its target, or a `machine` on a method that doesn't take one |
 | `unknown-method` | no such method on this daemon |
 | `denied` | the target refuses it (an archived thread is read-only; a thread that takes no replies) |
 | `closed-form` | the form was already submitted, or withdrawn by its owner |
 | `conflict` | reserved |
 | `bind-failed` | a forward's host port couldn't be bound (in use, privileged, an address not on this host) |
-| `failed` | a verb exited non-zero; `data`: `{"exit": n, "instance": name \| null}` (*Verbs*) |
+| `failed` | a verb exited non-zero; `data`: `{"exit": n, "instance": name \| null}` (*Verbs*). Also a machine that couldn't be reached: ssh failed, the hello failed or the protocols differ, the link is `unreachable` (*Machines*) |
 | `confirm` | an `rm` sent with `ask: true` needs an answer; `message` is the question, nothing was removed (*Verbs*) |
 | `internal` | the daemon failed (store unreadable, …); logged in `serve.log` |
 
@@ -274,6 +275,11 @@ keeps the root fresh, else one at `disk` depth (no runtime call), then a
 Watching a root twice is one watch; `instances.unwatch` of a root not
 watched is fine.
 
+With `"machines": true` every push for `dir` is federated: merged with
+every registered machine's rows, plus a top-level `machines`, and the
+machine links stay up while such a watch lasts (*Machines*, *Federated
+snapshots*). Re-watching with another `machines` switches the variant.
+
 Errors: `invalid` (missing or relative `dir`; watch without the
 `instances` subscription), `not-found` (watch of a missing directory;
 unwatch only needs `dir` absolute).
@@ -281,10 +287,18 @@ unwatch only needs `dir` absolute).
 ### `instances.resolve`
 
 Params: `{"name": "<name>"}`, as the CLI's `<name>` takes it. Result:
-`{"matches": ["web", "web-2"]}`, sorted: an exact instance name or id if
-any matches, else every instance of that sandbox or folder basename. Two or
-more is the caller's to pick from (the CLI prompts on its TTY), not an
-error; then it sends the chosen name to a verb.
+`{"matches": ["web", "web-2"], "found": [{"name": "web", "machine":
+null, "root": "/home/me/.devsandboxes"}, …]}`, sorted: an exact instance
+name or id if any matches, else every instance of that sandbox or folder
+basename. Two or more is the caller's to pick from (the CLI prompts on its
+TTY), not an error; then it sends the chosen name to a verb. `found` is
+`matches` again, in order, with where each lives: the unqualified name,
+its machine (`null`: this host) and its config root there (`null` for
+instances older than that record). An older daemon's answer has no
+`found`.
+
+`"machines": true` asks this host and every registered machine (*Machines*,
+*Federated calls*).
 
 Errors: `not-found` (nothing matches), `invalid` (no `name`).
 
@@ -417,8 +431,10 @@ or its output isn't JSON).
 ### `sandboxes.list`
 
 Params: `{"root": "/abs/path/to/config-root"}`. Result: the config's
-sandboxes, sorted by name: `[{"name": "web"}, …]` (objects, so fields can
-be added). A root without a config file has none: `[]`.
+sandboxes, sorted by name: `[{"name": "web", "root": "/abs/…"}, …]`
+(objects, so fields can be added; `root` is the canonical root). A root
+without a config file has none: `[]`. `"machines": true` adds every
+machine's (*Machines*, *Federated calls*).
 
 Errors: `invalid` (missing or relative `root`, or a config that doesn't
 load: the message says why), `not-found` (no such directory).
@@ -656,6 +672,167 @@ build log, as from the CLI. A verb a daemon left running at its exit is
 adopted by the next daemon through those files (`docs/serve.md`, *Version
 handoff*): it holds that daemon until it exits, unstreamed.
 
+## Machines
+
+Remote hosts whose daemons this one talks to over ssh (docs/machines.md).
+The registry is `<data-dir>/devsandbox/machines.toml`, next to
+`state.toml`, written only by `machines.add` / `machines.rm`:
+
+```toml
+[machine.my-server]
+target = "me@my-server"            # what ssh takes, or ssh://[user@]host[:port]
+roots = ["/home/me/.devsandboxes"] # config roots there, canonical
+command = "~/bin/devsandbox"       # optional: the remote devsandbox, shell text
+```
+
+A machine name is `[A-Za-z0-9._-]+`, not starting with `.` or `-` (never
+`/` or `@`, so the CLI's `my-server/web-2` and `@/web-2` are unambiguous).
+The API never parses a qualified name: requests carry `machine`.
+
+**Transport.** Every connection to a machine is `ssh -T -A -o
+BatchMode=yes [-p N] -- <host> 'exec "$SHELL" -lc "exec <command> api
+--stdio --client machine:<this host> --session-env"'`: the remote's relay
+(*Relay*), in the user's login shell there, lazy-starting the remote
+daemon. `BatchMode`: the daemon has no TTY, so ssh fails instead of
+prompting. `-A` forwards the daemon's preferred host agent (*Bridges*), or a
+verb's requester's `SSH_AUTH_SOCK`. The hello says version `0.0.0`, so it
+never hands off the remote daemon; the remote's `protocol` must equal
+ours, a different semver is allowed.
+
+**Links.** One `serve-machine-<name>` thread per registered machine holds a
+connection to it only while wanted: while some connection watches with
+`machines: true`, or a forwarded quick call is queued, and 60 s after.
+Connected, it subscribes to `instances` and, while a watcher wants
+machines, watches each of the machine's roots. A failed connect or a lost
+link is retried 1 s, 2 s, … 30 s apart while wanted; the rows stay. A
+link's `state`:
+
+| `state` | |
+|---|---|
+| `idle` | not wanted, so not connected |
+| `connecting` | dialing ssh and saying hello |
+| `connected` | up; `error` may still name a registered root the machine refused |
+| `unreachable` | the last attempt failed or the link was lost; `error` says why (ssh's last stderr, a protocol mismatch, `its devsandbox serve is exiting`) |
+
+### `roots.list`
+
+On every daemon: this host's candidate config roots, what `machines.probe`
+asks a machine. Params: `{}`, or `{"paths": ["~/sandboxes", "/srv/x"]}`.
+Result: `[{"root": "/abs", "sandboxes": [{"name": "web"}, …], "error":
+null}]`. Without `paths`: every distinct `config_dir` in `state.toml` plus
+`~/.devsandboxes` if it exists, canonicalized (a root that's gone stays as
+recorded), sorted; no disk scan. With `paths`: exactly those, in order,
+`~` / `~/…` expanded with this host's home, then canonicalized. A root that
+doesn't exist, isn't absolute or whose config doesn't load has `error` set
+and `sandboxes: []`; the call itself doesn't fail.
+
+### `machines.*`
+
+| method | params | result | errors |
+|---|---|---|---|
+| `machines.probe` | `{"target"}` | `{"version", "protocol", "roots": […]}`: the machine's devsandbox and its `roots.list` | `invalid` (bad target), `failed` (ssh, the hello or the protocol) |
+| `machines.add` | `{"target", "name"?, "roots": […]}` | `{"name", "roots", "version", "warning"}`: `roots` as saved (the machine's canonical paths, deduplicated), `warning` set when its semver differs from ours | `invalid` (bad target or name, a name taken, no `roots`, a root the machine refuses: each one's reason), `failed` (as `probe`, or a remote too old to check roots) |
+| `machines.list` | `{}` | `[{"name", "target", "roots", "command", "state", "error", "version"}]`, by name; `version` from the last hello | `internal` (`machines.toml` doesn't parse) |
+| `machines.get` | `{"name"}` | `{"name", "target", "command", "roots"}`: what an ssh command to it needs (no argv on the wire: build it from `target` and `command`) | `not-found` |
+| `machines.rm` | `{"name"}` | `{"ok": true}`; its link stops and its rows go. Nothing on the machine changes | `not-found` |
+
+`probe` and `add` open a connection of their own (a 20 s hello), checking
+ssh, the remote devsandbox and the protocol before anything is saved.
+`add` checks every root with `roots.list {paths}` on the machine: a quoted
+`~` is the machine's home. `name` defaults to the target's host
+(`me@my-server.com` → `my-server.com`). `add` and `rm` reach the links at
+once. Adding a machine means trusting it: its socket is as powerful as
+`docker.sock`, and your agent is forwarded there.
+
+### The `machine` param
+
+A request with `"machine": "<name>"` runs on that machine: the daemon drops
+`machine` (and `machines`) from the params, forwards the rest, and answers
+with the machine's result or error, code and `data` kept, under the
+request's own `id`. `dir`, `root` and instance and container names are the
+machine's. Quick calls go over the machine's link, one in flight per
+machine, each with 15 s to answer:
+
+`instances.list`, `instances.resolve`, `instances.cancel`,
+`instances.procs`, `instances.signal`, `instances.rename`,
+`instances.done`, `instances.buildLog`, `containers.logs`,
+`containers.inspect`, `sandboxes.list`, `sandboxes.get`, `services.get`,
+and every verb (*Verbs on a machine*).
+
+Any other method with `machine` is `invalid` ("can't take a machine
+yet"), so a client never takes a local answer for a remote one. Errors
+added by the forwarding: `not-found` (no such machine), `failed`
+(`<machine>: unreachable: <why>`, answered at once while the link is down),
+`internal` (`<machine>: timed out`: the link is dropped and reconnects;
+`the link is stopping`). A method the machine lacks is its
+`unknown-method`.
+
+### Federated calls
+
+`instances.resolve {name, machines: true}` and `sandboxes.list {root,
+machines: true}` ask this host and every registered machine in parallel,
+each machine given 5 s over its link (connecting it if needed, so the link
+is then up for the next 60 s):
+
+- `instances.resolve`: the union, sorted. A machine's matches are
+  qualified in `matches` (`my-server/web-2`), a local one isn't; `found`
+  gives each one's unqualified `name`, `machine` and `root`. A machine
+  answering `not-found` adds nothing; one that doesn't answer (or fails)
+  adds nothing either, and if nothing matched anywhere the `not-found`
+  message ends `; unreachable: <machine> (<why>), …`.
+- `sandboxes.list`: this root's entries, then each machine's registered
+  roots' in registry order, tagged `machine` and `root` (the remote root).
+  A machine or root that doesn't answer adds nothing; read `machines.list`
+  to say why.
+
+With `machine` instead, only that machine is asked, as above.
+
+### Federated snapshots
+
+A watch with `machines: true` (`instances.watch`) gets every
+`instances.snapshot` for its root merged: the local rows as they are, then
+each machine's instances, sandboxes and services tagged `"machine":
+"<name>"` (sandboxes and services also `root`, the remote root they were
+read from; an instance keeps its own `root`). Each remote instance appears
+once: from its own root's snapshot when that root is registered, else from
+the machine's first root's. `sandbox_count` counts every machine's too;
+remote `thread_children` aren't merged. Plus, top-level:
+
+| field | |
+|---|---|
+| `machines` | every registered machine, by name: `{"name", "target", "command", "state", "error", "version", "runtime"}`; `command` the remote devsandbox (`null`: `devsandbox`), `runtime` its `runtime_name` once a snapshot came |
+
+A machine's rows are last known: they stay while its link is down (in
+memory only, so a fresh daemon has none until it connects), and a client
+shows them as unreachable while its `state` isn't `connected`. A
+reconnect's first remote push, which has no runtime pass yet, keeps the
+rows' last status, cpu and mem. A machine's push or state change
+re-publishes every federated watcher's root. A watch without `machines`
+gets exactly what it got before machines.
+
+### Verbs on a machine
+
+A verb with `machine` (`root` then a path on the machine) goes over an ssh
+connection of its own, dialled for that request, so a long build never
+holds up the link's quick calls. The request minus `machine` is sent after
+the hello; the remote relay replaces its `env` with the remote login
+shell's (*Relay*, `--session-env`), so only `env.SSH_AUTH_SOCK` matters
+here: it's the agent ssh forwards. The machine's `output` and `progress`
+are relayed with `request` rewritten to the local id, and its answer
+(`failed`'s `data`, `confirm`, `detached` included) passed through.
+
+- **Hang-up**: the local client leaving closes the ssh, which the remote
+  daemon sees as its client hanging up: cancelled there unless `detach`.
+- **Drain**: a local daemon exit (idle, handoff, `shutdown`) closes it the
+  same way, so a non-`detach` remote verb is cancelled, unlike a local verb
+  (no spool here to adopt it by). A `detach` verb runs on.
+- **Errors**: the dial or hello failing is `failed` with `data:
+  {"exit": null, "instance": null}` and ssh's reason; the ssh ending before
+  the answer is `failed` (`connection lost; the verb may still be running
+  there`).
+
+A forwarded verb holds this daemon while its ssh runs (*Holders*).
+
 ## Notifications
 
 ### `subscribe` / `unsubscribe`
@@ -699,7 +876,9 @@ hang up when done. So does every forward, ad-hoc or configured, whether or
 not its client is still connected: stop ad-hoc ones with `forwards.rm`. A CLI command holding a relay (`bridges.ensure`) stays
 connected for its whole run for that reason. Every verb holds it until
 its subprocess is reaped, a detached one too, and one a previous daemon
-left running until it exits.
+left running until it exits. A verb forwarded to a machine holds it while
+its ssh runs. A machine link doesn't: the clients that want it do (a
+federated watcher, the connection waiting on a forwarded call).
 
 ## Relay: `devsandbox api --stdio`
 
@@ -735,6 +914,13 @@ $ devsandbox api --stdio
 
 A client that isn't a devsandbox binary can send `"version": "0.0.0"`: the
 relay's own hello already handed off an older daemon.
+
+`--session-env` (hidden) is for a machine link's relay (*Machines*): the
+upstream copy then goes line by line, and a request whose `method` is a
+verb gets its `params.env` replaced by the relay's own environment (the
+remote login shell's), since the requester's is another host's. Every
+other line, and everything downstream, passes as is; the 1 MiB line limit
+still applies.
 
 ## The npm client
 
@@ -810,6 +996,21 @@ while disconnected. VS Code (`o`, `:code`) reads `state.toml`. Two
 dashboards share one daemon, the same forwards and the same poll: the
 daemon collects a watched root once per tick, whoever watches it.
 
+**Machines.** The watch always sends `machines: true`, so the tree is
+federated (*Federated snapshots*): a MACHINE column appears once any
+machine is registered (blank for local rows), sandboxes group per
+(machine, sandbox), a machine that isn't `connected` shows its rows
+`unreachable` (Detail says why), and one without rows yet is a header
+note (`box: connecting`, `box: unreachable: <why>`). Every request about a
+remote row carries its `machine` and its remote `root`: the quick calls
+above, procs (one `instances.procs` per machine), and the verbs. A remote
+instance's terminal tab runs `ssh -t <target> devsandbox -C <root> exec -i
+-t -- <instance>`, a remote service's `ssh -t <target> <runtime> exec -it
+…`, both built from the snapshot's `machines` entry. `:` commands take
+qualified names (`box/web-2`, completed). `o`/`:code` and `p`/`:port` on
+a remote row are a "not yet" status line; the Services tab has no machine
+column.
+
 ## The CLI as a client
 
 `devsandbox run`, `rebuild`, `start`, `stop`, `rm` and `service rebuild`
@@ -831,3 +1032,24 @@ verb running: the CLI says so and, for a build with a known instance,
 follows its build log and exits by its phase. No daemon reachable, or one
 answering `unknown-method`: one `warning:` line and the verb runs in the
 CLI's process, as `--in-process` (where `-d` is an error).
+
+**Machines.** With none registered (the CLI reads `machines.toml` itself
+to know, the one file of the daemon's it reads), every command behaves as
+above and nothing extra contacts a daemon. With some, a bare `<name>` goes
+through `instances.resolve {machines: true}` (a verb's, and `run`'s sandbox
+through `sandboxes.list {machines: true}`), `my-server/<name>` through
+`instances.resolve {machine}`, `@/<name>` this host's only; several
+matches are a TTY pick among qualified names (`@/web`, `box/web`), else
+an error listing them. The chosen match's `machine` and `root` go on the
+verb and on Ctrl-C's `instances.cancel`; a remote `run` prints its name
+qualified; a lost connection to a remote verb can't follow its build log
+locally, so it says so and exits 1. `logs`, `inspect`, `exec`, `done`,
+`undone` and `rename` on a remote match re-run over ssh (`machines.get`,
+then an `exec` of `ssh -t|-T -A <target> devsandbox -C <root> <args>`, the
+name unqualified). `--machine m` is for commands without a name: `ps` and
+`stats` re-run once, `ls`, `status`, `gc` and `service ls` once per root
+of `m` (`==> m:<root>` on stderr first; `--json` with several roots is an
+error), `stop`/`start --all` as one verb on `m`, `rebuild --all` and
+`service rebuild` one per root. A machine needs the daemon: with none
+answering, a qualified name or `--machine` is an error; `--in-process`
+never fans out.

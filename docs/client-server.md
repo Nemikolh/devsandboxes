@@ -1,10 +1,11 @@
 # Client/server: the CLI as a client of `devsandbox serve`
 
-Status: design, rollout steps 1–4 done. Steps 1–2 (instance phase, build
+Status: design, rollout steps 1–5 done. Steps 1–2 (instance phase, build
 log, a TUI that doesn't suspend) in-process: `docs/instance-phase.md`. Step
 3 (verbs as requests) for `run`, `rebuild`, `start`, `stop` and `rm`:
 `docs/verbs-as-requests.md`. Step 4 (the dashboard as a pure client):
-`docs/dashboard-client.md`. The rest is not implemented.
+`docs/dashboard-client.md`. Step 5 (machines): `docs/machines.md`. Steps
+6–7 (remote forwards, remote VS Code) are not implemented.
 
 The daemon (`docs/serve.md`) owns the live host side: bridges, forwards,
 the API, and now the five verbs above plus `service rebuild`. Other CLI
@@ -25,9 +26,9 @@ can be on another machine.
   its sandbox with its current step, and has a shortcut to its build log.
   There's no separate list of operations.
 - **Remote machines.** `devsandbox machine add ssh://me@host --name my-server`,
-  then `run foo --machine my-server`. The local daemon knows about the
-  machine, and the dashboard shows its sandboxes next to the local ones
-  without knowing they're remote. This is the VS Code SSH Remote +
+  then `run foo` (or `run my-server/foo` when `foo` is defined on both).
+  The local daemon knows about the machine, and the dashboard shows its
+  sandboxes next to the local ones, with a machine column. This is the VS Code SSH Remote +
   devcontainers model, built into the CLI.
 
 Non-goals: scheduling or placement across machines (no Swarm), daemons
@@ -246,9 +247,11 @@ notion:
   works per root (one forward registry per root, `Instance::config_dir`).
 - **Machine**: `machine add` saves the remote root(s) on the machine
   entry, from `--config <remote path>` (repeatable) or picked during the add
-  (*Adding a machine*). `run foo --machine my-server` resolves `foo` against
-  those roots. With `--machine`, `-C` is a path on the remote. A sandbox name
-  found in several roots is an error that lists them.
+  (*Adding a machine*). A machine's roots are only the registered ones:
+  `run foo` (or `run my-server/foo`) resolves `foo` against the local root
+  and every machine's roots, one match runs where it is, several are a pick
+  on a TTY or an error listing them qualified. `-C` stays a local path,
+  never forwarded: a command re-run on a machine gets `-C <its root there>`.
 - The dashboard asks for sandboxes grouped by root (`sandboxes.list`) and
   never reads a config file itself.
 
@@ -276,7 +279,7 @@ Still local, for now:
 
 - **The Inbox.** It reads the store file and, while disconnected, writes
   it through the same ops code the API runs. A remote machine's threads
-  are a federation question (step 5).
+  aren't shown yet (step 5 federates instances, not the Inbox).
 - **VS Code** (`o`, `:code`, a thread's `vscode` action) reads
   `state.toml` for the container and workspace; remote VS Code is step 7.
 - Its own files: `dashboard.toml` settings and the prompt history.
@@ -290,18 +293,34 @@ its daemon, a remote instance is just another row.
 tabs: an instance's through `devsandbox exec`, a service's directly. That
 works as long as the runtime is local.
 
-- **Remote, first cut**: the client runs `ssh -t <machine> devsandbox exec
-  <instance> …`. The local daemon resolves the instance to its machine and
-  hands back the ssh target. Same PTY path as today.
+- **Remote, first cut** (built, `docs/machines.md`): the client runs `ssh
+  -t <target> devsandbox -C <root> exec <instance> …` through the user's
+  login shell (`-T` off a terminal). The local daemon resolves the instance
+  to its machine (`instances.resolve {machines: true}`) and hands back the
+  target (`machines.get`). Same PTY path as today. The dashboard's terminal
+  tabs do the same for a remote instance, and `ssh -t <target> <runtime>
+  exec -it …` for a remote service. `logs`, `inspect`, `done`, `undone` and
+  `rename` on a remote name re-run the same way.
 - **Later**: PTY attach over the protocol (an `exec` stream with resize),
   for clients that can't spawn ssh.
 
 ## Machines
 
+Built (`docs/machines.md`, which has the details and the known
+limitations). Where it differs from the sketch below: named commands take
+`my-server/foo` (or a bare name found on one machine) instead of
+`--machine`, which is only for commands without a name (`ps`, `ls`,
+`stop --all`, …); the env is the remote login shell's, swapped in by the
+remote relay (`api --stdio --session-env`) on each verb request; verbs go
+over an ssh of their own each, quick calls over the held link, which is up
+only while wanted (a dashboard watching, a call, 60 s after); forwards
+from a machine are not built.
+
 ```
-devsandbox machine add ssh://me@my-server.com --name my-server [--config ~/sandboxes]…
+devsandbox machine add ssh://me@my-server.com --name my-server [--config '~/sandboxes']…
 devsandbox machine ls | rm <name>
-devsandbox run foo --machine my-server
+devsandbox run foo                # foo only defined on my-server; else my-server/foo
+devsandbox ps --machine my-server
 ```
 
 ### Adding a machine
@@ -388,11 +407,17 @@ helper. Needs a spike. Low priority, and nothing above depends on it.
    step 5 (`docs/before-machines.md`): the shared, pushed snapshot
    (`instances.watch`), builds on a pty, held verbs that survive a quit,
    spawns that survive an upgrade.
-5. `machine add|ls|rm`, the ssh transport, federation, `ssh -t` exec.
+5. Done (`docs/machines.md`): `machine add|ls|rm`, the ssh transport,
+   federation, forwarded requests, names across machines, `ssh -t` exec
+   and terminals.
 6. Remote forwards.
 7. VS Code remote spike.
 
 ## Open questions
 
 - **Machine-to-local fallback**: when no local daemon can run (Windows),
-  does a configured default machine make `--machine` implicit?
+  does a configured default machine make `--machine` implicit? Still open.
+- **Keeping machines on one version**: auto-update a machine's devsandbox
+  to the newest one linked to it (the user's idea; a sketch and its open
+  questions in `docs/machines.md`, *Later*). Today a protocol mismatch
+  marks the machine unreachable and a semver difference is a warning.

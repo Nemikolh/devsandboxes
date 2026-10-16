@@ -1,5 +1,9 @@
 # Machines: remote hosts over ssh
 
+Status: built. Steps 1–6 in commits e897bf2..5647d09, step 7 (these docs)
+after; what the code ended up doing differently is noted in place, and
+what it doesn't do yet is under *Known limitations*.
+
 Rollout step 5 of `docs/client-server.md` (*Machines*, *Exec and terminal*,
 *Config roots*). Steps 1–4 and the pre-tasks (`docs/before-machines.md`) are
 done. This doc covers `machine add|ls|rm`, the ssh transport, federation
@@ -34,9 +38,10 @@ devsandbox ps --machine my-server        # a command without a name: over ssh
   pass through unchanged.
 - **Plain ssh**, no ControlMaster of our own: the user's `~/.ssh/config`
   decides (a user who wants sharing sets `ControlMaster auto` there).
-- **Env: the login shell.** The remote side runs as `ssh -A -T <target>
-  'exec "$SHELL" -lc "exec devsandbox api --stdio …"'`, and the
-  relay replaces each relayed verb request's `env` with its own.
+- **Env: the login shell.** The remote side runs as `ssh -T -A -o
+  BatchMode=yes [-p N] -- <host> 'exec "$SHELL" -lc "exec devsandbox api
+  --stdio --client machine:<local host> --session-env"'`, and the relay
+  replaces each relayed verb request's `env` with its own.
 - **Version skew: protocol.** A machine connection says hello as version
   `0.0.0`, so it never hands off the remote daemon, and requires an equal
   `protocol`. A mismatch fails `machine add` with both versions and, on a
@@ -66,7 +71,9 @@ devsandbox ps --machine my-server        # a command without a name: over ssh
   as instance tabs.
 - **A machine that's down**: its last rows stay, in memory only, marked
   `unreachable`. A machine not reached since the daemon started shows as one
-  `unreachable: <why>` line.
+  `unreachable: <why>` line. Built: a note in the dashboard's header,
+  `box: connecting` or `box: unreachable: <why>`, for each machine without
+  rows.
 - **Not now**: a default machine (an open question for the Windows plan),
   remote Inbox threads (after step 5, with the Inbox behind the daemon),
   remote forwards (step 6), remote VS Code (step 7).
@@ -89,10 +96,12 @@ devsandbox ps --machine my-server        # a command without a name: over ssh
   `[A-Za-z0-9._-]+` (never `@`, never `/`), so `my-server/web-2` splits at
   the first `/` and `@/web-2` is local.
 - **F3 ssh argv** (`ssh.rs`, one fn used by the daemon, the CLI and the
-  TUI): `ssh -T -A -o BatchMode=yes [-p N] <target> <remote>` for the API
+  TUI): `ssh -T -A -o BatchMode=yes [-p N] -- <host> <remote>` for the API
   (`-t` instead of `-T`, and no `BatchMode`, for terminals and interactive
-  CLI commands). `<remote>` is `exec "$SHELL" -lc '<cmd>'`, with
-  `<cmd>` shell-quoted. `BatchMode`: the daemon has no TTY, so ssh must fail
+  CLI commands; a CLI re-exec off a terminal keeps `-T`). `<remote>` is
+  `exec "$SHELL" -lc '<cmd>'`, with `<cmd>` `exec <command> '<arg>'…`, each
+  arg quoted for the login shell and `<cmd>` again for the outer one;
+  `command` is shell text, never quoted (`~/bin/devsandbox` expands). `BatchMode`: the daemon has no TTY, so ssh must fail
   instead of prompting. `SSH_AUTH_SOCK` for `-A` is the requester's (a verb
   request's `env`). For the held link it's the daemon's preferred agent,
   the one the bridges already track (`bridges.ensure`'s `agent`).
@@ -107,7 +116,10 @@ devsandbox ps --machine my-server        # a command without a name: over ssh
   `~/.devsandboxes` if it exists, sorted, with no disk scan. This is what
   `machines.probe` asks a remote. Local methods: `machines.probe {target}`,
   `machines.add {target, name, roots}`, `machines.list`, `machines.rm
-  {name}`.
+  {name}`. Built: `roots.list {paths}` checks exactly those paths instead
+  (`~` expanded with that host's home, canonicalized, config loaded), which
+  is how `machines.add` checks *every* given root on the machine, picked or
+  typed.
 - **F6 Routing param**: methods that name an instance, root or container
   take an optional `machine`. The local daemon strips it and forwards the
   request. The API never parses `my-server/web-2`: the CLI does, and the
@@ -120,7 +132,11 @@ devsandbox ps --machine my-server        # a command without a name: over ssh
   adds a top-level `machines: [{"name", "target", "state":
   "connected"|"connecting"|"unreachable", "error", "version"}]`, one per
   registered machine. A row of a machine that isn't `connected` is
-  `unreachable` to the TUI.
+  `unreachable` to the TUI. Built: `state` also has `idle` (not wanted, so
+  not connected), entries add `command` and `runtime` (the remote's
+  `runtime_name`), and `sandbox_count` counts every machine's sandboxes
+  too. A remote instance row keeps the `root` its machine gave it; remote
+  sandbox and service rows get the remote root they were read from.
 - **F8 Dedup**: `snapshot::join` lists every instance in `state.toml`,
   whatever its root (the local "(not in config)" orphans). For a machine,
   each instance is taken once: from the root it was made in (`root`), else
@@ -133,9 +149,12 @@ devsandbox ps --machine my-server        # a command without a name: over ssh
   daemon: it's the clients that want it that hold. On the remote end it is
   a client like any other.
 - **F10 Quick calls on the link** are serialized, one in flight per
-  machine, with a 15 s timeout (the link stays up; the call answers
-  `internal: <machine>: timed out`). `instances.procs` (a `docker exec` per
-  instance) uses the link too: the TUI asks for one machine per request.
+  machine, with a 15 s timeout (the call answers `internal: <machine>:
+  timed out`). Built: a timeout drops the link (its late answer would be
+  read as the next call's) and it reconnects; a call queued while the
+  machine is unreachable answers `failed` at once. `instances.procs` (a
+  `docker exec` per instance) uses the link too: the TUI asks for one
+  machine per request.
 - **F11 Federated resolve**: `instances.resolve {name, machines: true}`
   asks this host and every registered machine in parallel. Each machine
   gets 5 s over its link, so a link already up costs nothing, and links
@@ -230,7 +249,10 @@ The pieces a remote needs, plus the dialer. No registry yet.
     the probe's candidates on the remote (`sandboxes.list {root}`: it
     exists and its config parses), then saves the entry. A name already
     taken is `invalid`. Answers `{"name", "warning": null | "…"}`, where
-    the warning is a semver differing from ours.
+    the warning is a semver differing from ours. Built: every root is
+    checked with `roots.list {paths}` (F5) and saved as the machine
+    canonicalized it; `name` is optional (the default name), `roots` must
+    not be empty, and the answer also has `roots` and `version`.
   - `machines.list`: `[{"name", "target", "roots", "state", "error",
     "version"}]`. `state` is `idle` until step 3 adds links.
   - `machines.rm {name}`: `not-found` if absent.
@@ -259,6 +281,10 @@ The pieces a remote needs, plus the dialer. No registry yet.
   `Machines` service the daemon starts with the host side
   (`daemon.rs:211`). It connects when wanted (F9), then `subscribe
   {instances}` and `instances.watch {dir}` for each of the entry's roots.
+  Built: the threads and the service are `service.rs` (`link.rs` is the
+  hello), and the roots are watched only while a local watcher wants
+  machines, not for a link a call opened (the remote polls its runtime for
+  a watch).
   Each pushed `instances.snapshot` is stored under (machine, root). State
   (`connecting`, `connected`, `unreachable` + why) goes into
   `machines.list`. Reconnect follows F9. A registry change (`add`/`rm`)
@@ -318,6 +344,11 @@ The pieces a remote needs, plus the dialer. No registry yet.
   (F11), and `machines.get {name}` → `{"target", "command", "roots",
   "ssh": [argv prefix]}` (for the CLI's re-exec and for the TUI). Also
   `ssh` in each `machines` snapshot entry, so the TUI needs no call.
+  Built: no argv on the wire. `machines.get` answers `{"name", "target",
+  "command", "roots"}` and snapshot entries carry `target` and `command`;
+  Rust callers build the argv with `ssh::tty_argv` / `cli_argv`, other
+  clients from those two fields. The drain question above: a local daemon
+  exit cancels a held non-`detach` remote verb (*Known limitations*).
 - `index.d.ts`: `machine` on the params, `found`. Tests (test daemon as
   remote): a forwarded quick call and its error code, a streamed verb with
   ids rewritten, a hang-up that cancels the remote verb (a `sh` `Runner`
@@ -405,6 +436,38 @@ The pieces a remote needs, plus the dialer. No registry yet.
   module map (`serve/machines/`, `commands/machine.rs`), `CHANGELOG.md`
   `## Unreleased`.
 - Checks: `cd site && pnpm check && pnpm build && pnpm test`.
+
+## Known limitations
+
+- **A local daemon exit cancels a held remote verb.** A drain (handoff,
+  idle, `shutdown`) cuts the verb's ssh like a hang-up, so a non-`detach`
+  verb on a machine (every CLI verb) is cancelled there, unlike a local
+  verb, which runs on and is adopted. `detach` verbs (the dashboard's, `-d`)
+  run on.
+- **A hang-up during the dial isn't noticed.** The dial and hello take up to
+  20 s; a client that leaves meanwhile has its verb started, then cancelled
+  at the first check.
+- **The remote login shell must keep stdout clean.** A `.profile` or rc file
+  that prints to stdout breaks the hello (the error names ssh's stderr when
+  there is any).
+- **One ssh handshake per verb**, and `BatchMode` on every daemon-side ssh:
+  a key that needs a passphrase prompt fails. Use an agent, or a
+  `ControlMaster auto` in `~/.ssh/config` to share one connection.
+- **No `--command` on `machine add`.** A remote devsandbox that isn't on the
+  login shell's `PATH` is set by hand: `command = "~/bin/devsandbox"` under
+  `[machine.<name>]` in `machines.toml`.
+- **Remote rows are memory only.** A fresh daemon shows a machine without
+  rows (`box: connecting`) until its link connects.
+- **Dashboard**: the Services tab has no machine column; two of a machine's
+  roots defining one sandbox name show it from the first root; `o`/`:code`
+  and `p`/`:port` on a remote row are "not yet" status lines.
+- **CLI messages**: a failed remote build's hint names the bare instance
+  (`rebuild web-4`, not `box/web-4`); `stop box/x` matching nothing
+  doesn't name the machine; a remote `run`'s stdout comes one line late (so
+  its printed name can be qualified).
+- **Nameless commands without `--machine` are local only** (*Later*).
+- **Not there yet**: remote Inbox threads, remote forwards and `port`
+  (rollout step 6), remote VS Code and `vscode` (step 7), a default machine.
 
 ## Later (noted, not in step 5)
 

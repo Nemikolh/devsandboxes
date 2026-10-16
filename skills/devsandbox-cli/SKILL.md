@@ -90,7 +90,8 @@ customizations.vscode.extensions = ["dbaeumer.vscode-eslint"]
 `<name>` accepts an **instance name**, a **sandbox config name**, or a **repository folder basename**. An exact
 instance name (or instance id) always wins: with instances `web` and `web-2`, `web` is the instance `web`. Only when
 nothing matches exactly do sandbox/folder names count, and ambiguity there errors on a non-TTY (prompts on a TTY). Most commands are non-interactive-safe; anything needing a choice bails with the options
-listed when stdin is not a TTY.
+listed when stdin is not a TTY. With [machines](#machines) registered, a bare `<name>` is also looked up on every
+machine; `<machine>/<name>` and `@/<name>` (this host) qualify it.
 
 1. **`exec [-i] [-t] <name> [cmd…]`** — run a command inside the instance. Runs in
    the workspace dir and honors the recorded `remoteEnv` / `remoteUser`. Exits
@@ -208,9 +209,46 @@ listed when stdin is not a TTY.
 All commands colour output only when stdout is a TTY and `NO_COLOR` is unset;
 piped/captured output is always plain text.
 
+## Machines
+
+Sandboxes on other hosts, over ssh (Linux and macOS; the remote needs
+devsandbox on its login shell's `PATH`). The local host daemon keeps the list
+and talks to each machine's daemon; nothing else changes on the machine.
+
+```bash
+devsandbox machine add me@my-server            # probe its config roots; pick on a TTY
+devsandbox machine add ssh://me@box:2200 --name box --config '~/sandboxes'
+devsandbox machine ls [--json]                 # NAME TARGET ROOTS STATE VERSION
+devsandbox machine rm box                      # unregister only
+```
+
+- `add` without `--config` offers the machine's known config roots (a
+  numbered multi-select on a TTY); off a TTY it takes the only one, and zero
+  or several is an error listing them: pass `--config <path on the machine>`
+  (repeatable). Quote a `~` so your local shell doesn't expand it. The name
+  defaults to the target's host. Adding a machine means trusting it: your
+  ssh-agent is forwarded there. ssh runs with `BatchMode=yes`: use a key in
+  your agent (or a `ControlMaster` in `~/.ssh/config`).
+- **Names resolve across machines.** `devsandbox run api` runs `api` where
+  it's defined; `exec test`, `logs test`, `stop test` find the instance
+  wherever it is. Ambiguous: a pick on a TTY, otherwise an error listing
+  `@/test` and `box/test`; rerun with the qualified name. A remote `run`
+  prints the instance qualified (`box/api`). Container names in `logs` /
+  `inspect` stay local unless qualified.
+- **`--machine <m>`** is only for commands without a name: `ps`, `stats`
+  (once), `ls`, `status --json`, `gc`, `service ls` (once per root of `m`,
+  each after a `==> m:<root>` line on stderr; `--json` with several roots is
+  refused), `stop --all`, `start --all`, `rebuild --all`, `service rebuild
+  <svc>`. Without it these are local only.
+- Not on machines yet: `vscode`, `port`, the Inbox. A machine needs the
+  daemon: with none answering, a qualified name or `--machine` is an error.
+  With no machine registered, nothing of this costs anything.
+
 ## State
 
 - Instances: `~/.local/share/devsandbox/state.toml` (`$XDG_DATA_HOME` honored).
+- Machines: `machines.toml` next to it (`[machine.<name>]`: `target`, `roots`,
+  optional `command`, the remote devsandbox path, set by hand).
 - Persistent per-config-root data (caches, shell history, `${sharedVolumes}`):
   `<config dir>/shared-volumes/`.
 - Networks/containers are namespaced by a short hash of the config-root path, so

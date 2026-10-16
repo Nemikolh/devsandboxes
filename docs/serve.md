@@ -3,20 +3,22 @@
 A per-user, per-host background process that owns the live host side of
 devsandbox (bridges, popups, control ops, port forwards, the API) and runs
 `run`, `rebuild`, `start`, `stop` and `rm` for their callers, so all of it
-keeps working with the dashboard or the terminal closed. Design and roadmap:
+keeps working with the dashboard or the terminal closed. It's also the one
+that talks to remote machines over ssh (*Machines*). Design and roadmap:
 `docs/inbox-redesign.md`, "Host daemon". Unix only; the command doesn't
 exist on Windows.
 
 This page covers the socket, start, handoff, idle exit, the bridges (the
 ssh-agent relay and the control ops included), the port forwards, the
-startup autostart pass and boot start. The API on the socket has its own
-page, `docs/api.md`.
+machine links, the startup autostart pass and boot start. The API on the
+socket has its own page, `docs/api.md`.
 
 Code: `src/serve/` (`endpoint.rs` paths + bind/connect/accept, `daemon.rs`,
 `host.rs` bridges + autostart, `forwards.rs` port forwards, `api.rs`
 methods, `verbs.rs` / `verbs_client.rs` the verbs' daemon and CLI sides,
 `client.rs`, `relay.rs` the `api --stdio` relay, `install.rs`
-`serve install|uninstall`, `idle.rs`, `proto.rs`).
+`serve install|uninstall`, `idle.rs`, `proto.rs`, `machines/` the
+machines: registry, ssh, links, forwarded requests).
 
 ## Paths and permissions
 
@@ -68,7 +70,9 @@ own subprocesses, the CLI's fallback, the dispatcher's child ops) never
 starts one: its bridge requests only reach a daemon that's already
 running. `devsandbox inbox`'s mutations use a daemon that's already
 running but never start one (`docs/inbox-cli.md`); the foreground `port`
-command doesn't use the daemon.
+command doesn't use the daemon. `devsandbox machine …` and any command
+naming a machine's instance (or given `--machine`) start the local one;
+a machine link starts the machine's own, through the relay it runs there.
 
 A verb's work runs with the caller's environment, sent with the request
 (`docs/api.md`, *Verbs*), not the daemon's.
@@ -174,6 +178,40 @@ read-modify-writes). Configured forwards aren't in this file: their ports
 are in `state.toml`. The foreground `devsandbox port` command still forwards in its
 own process, without the daemon.
 
+## Machines
+
+Remote hosts registered with `devsandbox machine add` (docs/machines.md;
+the API: `docs/api.md`, *Machines*). The registry is
+`<data-dir>/devsandbox/machines.toml`, next to `state.toml`: only the
+daemon writes it (`machines.add` / `machines.rm`), as a read-modify-write
+under an exclusive lock on the sibling `machines.lock` and an atomic
+rename, since two daemons overlap briefly during a handoff. A file that
+doesn't parse is logged and changes nothing. The CLI reads it only to know
+whether any machine exists.
+
+The daemon starts a `Machines` service with the host side: one
+`serve-machine-<name>` thread per registered machine, started, stopped or
+restarted at once when `add` or `rm` changes the registry. A thread holds
+an ssh connection to the machine's daemon (`ssh -T -A -o BatchMode=yes …
+devsandbox api --stdio --session-env`, the remote relay in the user's
+login shell) only while wanted: while a local connection watches with
+`machines: true` (every dashboard), or a forwarded quick call is queued,
+and for 60 s after. Connected, it watches the machine's roots while a
+watcher wants them and keeps each root's last pushed snapshot, in memory
+only, kept while the link is down. A failed connect or a lost link (ssh
+exiting, the remote daemon's `closing`, a call timing out) is
+`unreachable` with the reason, logged, and retried 1 s, 2 s, … 30 s apart
+while wanted.
+
+A link is not an idle holder of this daemon: the clients that want it
+are. On the machine it's a client like any other, so it holds the remote
+daemon while connected. Each verb forwarded to a machine runs over an ssh
+of its own for the request's life and is a holder here while it runs.
+
+The link's hello says version `0.0.0`, so it never hands off the remote
+daemon (only that host's own clients upgrade it); the protocols must
+match.
+
 ## Autostart
 
 At start the daemon runs the `autostart = true` pass
@@ -226,7 +264,10 @@ sweeps the spool dir at start: a live pid's verb is *adopted* (a holder
 until it exits, then its files go), a dead one's files are removed. The
 same goes for an idle exit, a `shutdown` or a crash. An adopted verb can
 still be cancelled (`instances.cancel` signals the instance's recorded
-pid), but its output is no longer streamed to anyone.
+pid), but its output is no longer streamed to anyone. A verb forwarded to
+a machine has no spool here: the drain closes its ssh, which cancels it on
+the machine unless it was sent `detach` (docs/machines.md, *Known
+limitations*).
 
 ## Idle exit
 
@@ -236,7 +277,9 @@ dashboard, a running `exec` that relays the agent, an `api --stdio`
 relay), running instances that declare `dispatcher` or `inbox = true` (as
 of the last poll), in-flight control requests (`devsbd events --follow`
 streams included, for as long as each is open), verbs in flight (detached
-ones and those adopted from a predecessor included, *Version handoff*), every
+ones and those adopted from a predecessor included, *Version handoff*),
+verbs forwarded to a machine while their ssh runs (a machine link isn't
+one, *Machines*), every
 live port forward (ad-hoc or configured, whatever its state), and the
 startup autostart pass while it runs. So with a dispatcher or a thread
 owner running the daemon never idles, and by design neither does it while an instance with
@@ -247,7 +290,11 @@ Exiting (idle or handoff) kills every bridge and closes every forward
 before the start lock is released, so a successor's bridges never overlap
 and it can bind the configured forwards' saved host ports again; it
 restarts the configured ones on its first poll and the ad-hoc ones at
-start (*Forwards*). A running autostart pass is waited for.
+start (*Forwards*). A running autostart pass is waited for. The order:
+the listener and `serve.sock` go, `closing` is sent, the connections
+drain (up to 5 s), then the machine links stop (their ssh killed, after
+the connections whose forwarded calls they may still answer), then the
+bridges, then the forwards, and the lock last.
 
 `--keep-alive` disables the idle exit; so does the per-user global config
 `<data-dir>/devsandbox/daemon.config.toml` (next to `state.toml`;
@@ -377,8 +424,9 @@ runtime stops or starts answering, at each forwards status line
 
 ## Future work
 
-The other verbs moving into the daemon and remote machines:
-`docs/client-server.md` (Windows: `docs/windows-support.md`).
+The other verbs moving into the daemon: `docs/client-server.md`; remote
+machines' forwards, VS Code and Inbox: `docs/machines.md` (Windows:
+`docs/windows-support.md`).
 
 Accepted trade-offs of the current design, to revisit:
 

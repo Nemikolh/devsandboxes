@@ -5,9 +5,13 @@ Topic docs in `docs/` go deeper on single features.
 
 ## Principles
 
-- **No daemon.** The runtime is the source of truth for liveness. Host-side
-  state is a single TOML file. Everything devsandbox creates is prefixed
-  `devsandbox-`, so it shows up in plain `docker ps`.
+- **Files are the truth, the daemon is replaceable.** The runtime is the
+  source of truth for liveness; host-side state is files (`state.toml`,
+  the Inbox store). A per-user host daemon, `devsandbox serve`, starts on
+  demand and runs the verbs and the live host side (bridges, forwards, the
+  API, the links to other machines), but stopping it loses nothing.
+  Everything devsandbox creates is prefixed `devsandbox-`, so it shows up
+  in plain `docker ps`.
 
 - **Config is the security boundary.** Mount sources only come from the config
   layer: caches, shell history, and declared `mounts` with a fixed variable
@@ -112,7 +116,7 @@ VS Code attach (`o` in the dashboard) uses the Remote-Containers extension. On A
 
 ### ssh-agent forwarding
 
-Relay-first. When the build embeds the `devsbd` helper (npm package, local builds after `scripts/build-devsbd.sh`), nothing is mounted: the in-container `devsbd` daemon listens on `/run/devsandbox/ssh-agent.sock`, and the host runs `exec -i <c> devsbd bridge` to carry each agent connection over exec stdio to the host `$SSH_AUTH_SOCK` (re-read per connection, so agent rotation needs no restart). The bridge lives for a CLI `exec`, for lifecycle hooks during `run`/`start`, and per running instance in the host daemon (`devsandbox serve`, `docs/serve.md`), whose container poll keeps one bridge per running helper instance. Needing only `exec`, it works on every runtime, including Apple `container`.
+Relay-first. When the build embeds the `devsbd` helper (npm package, local builds after `scripts/build-devsbd.sh`), nothing is mounted: the in-container `devsbd` daemon listens on `/run/devsandbox/ssh-agent.sock`, and the host runs `exec -i <c> devsbd bridge` to carry each agent connection over exec stdio to the host `$SSH_AUTH_SOCK` (re-read per connection, so agent rotation needs no restart). The bridges live in the host daemon (`devsandbox serve`, `docs/serve.md`), whose container poll keeps one per running helper instance; `exec` and `run`'s and `start`'s lifecycle commands don't bridge themselves, they report their shell's agent to it (`bridges.ensure`), and a port forward has a bridge of its own. Needing only `exec`, it works on every runtime, including Apple `container`.
 
 Builds without the helper (`cargo install`) fall back to bind-mounting the host `$SSH_AUTH_SOCK` through a per-instance symlink, which needs file binds (docker/podman). An instance keeps the mode it was created with until it's recreated (`devsbd::relay_mode`).
 
@@ -133,7 +137,11 @@ Running `devsandbox` with no subcommand opens a ratatui dashboard:
 
 Config entries are validated in place, and broken sandboxes are flagged.
 
-The dashboard (unix only) is a client of the host daemon: it watches its config root and draws the snapshots the daemon pushes (one shared poll however many dashboards are open), reads processes, logs and configs through the API, and sends every verb as a request, so `s`, `:start`, `stop` and `rm` run in the daemon without leaving the dashboard (`s` on a stopped row is a full `start`) and keep running if it quits. Builds run on a pty, so the build log (`b`) shows docker's progress in colour. See `docs/dashboard-client.md`, `docs/before-machines.md`, `docs/tui.md`.
+The dashboard (unix only) is a client of the host daemon: it watches its config root and draws the snapshots the daemon pushes (one shared poll however many dashboards are open), reads processes, logs and configs through the API, and sends every verb as a request, so `s`, `:start`, `stop` and `rm` run in the daemon without leaving the dashboard (`s` on a stopped row is a full `start`) and keep running if it quits. Builds run on a pty, so the build log (`b`) shows docker's progress in colour. With machines registered, the tree also has every machine's sandboxes and instances, in a MACHINE column, and every action and terminal works on them (see _Machines_). See `docs/dashboard-client.md`, `docs/before-machines.md`, `docs/tui.md`.
+
+## Machines
+
+Other hosts running devsandbox, registered with `devsandbox machine add <ssh target>` (`docs/machines.md`). The local daemon holds the registry (`machines.toml`) and talks to each machine's daemon over `ssh <target> devsandbox api --stdio` in the user's login shell there, while something wants it: a dashboard watching (its rows are merged into the pushed snapshot, kept as `unreachable` when the machine is down), or a call. Each machine keeps its own `state.toml`, config and runtime; the env a remote verb runs with is that login shell's, only the ssh-agent crosses (`ssh -A`). On the CLI a name resolves across machines (`box/web-2` qualifies, `@/web-2` is local); verbs are forwarded by the local daemon, one ssh each, and `exec`, `logs`, `inspect`, `done`, `rename` on a remote instance re-run as `ssh -t <target> devsandbox …`. `--machine <m>` runs a nameless command (`ps`, `ls`, `stop --all`, …) there. Remote forwards and VS Code aren't built yet.
 
 ## Automations
 
@@ -160,8 +168,9 @@ Sandboxes that start themselves and manage their own child instances, with the l
   keeps it running). The host re-checks `dispatcher` on every request
   and denies everyone else.
 - **Dispatch as subprocesses**: the control handler runs on the daemon's
-  bridge worker, so each child operation is a `devsandbox -C <config root>
-  run|start|rebuild|stop|rm` subprocess logging to
+  bridge worker, so each child operation is a `devsandbox --in-process -C
+  <config root> run|start|rebuild|stop|rm` subprocess (never starting a
+  daemon of its own) logging to
   `<data-dir>/devsandbox/logs/dispatch-*.log`, never the alternate screen;
   state-writing ops are serialized host-wide. Runs are `devsbd run start|ls|logs|wait` exec'd in
   the child, which stores them under `/var/lib/devsandbox/runs/`.
@@ -193,6 +202,10 @@ Everything except `inspect` is wrapped as `{ "schema": 1, "data": … }`, and `s
   (`src/state.rs`); `autostart_boot` maps each config root's project id to
   the boot id its autostart pass last ran for.
 
+- **Machines:** `<data-dir>/devsandbox/machines.toml`, next to `state.toml`:
+  each machine's ssh target, its config roots there and optionally its
+  devsandbox path. Written by the daemon only.
+
 - **Dispatch logs:** `<data-dir>/devsandbox/logs/dispatch-<unix>-<op>.log`.
 
 - **ssh-agent links** (bind-mount fallback only): `<data-dir>/devsandbox/agent/<instance>.sock`.
@@ -210,9 +223,10 @@ src/
   main.rs             CLI (clap) and dispatch; bare TTY invocation → TUI
   config.rs           devsandboxes.toml model, extends deep-merge, mounts, validation
   features.rs         devcontainer features: OCI fetch, metadata, install order
-  state.rs            host-side instance store (no daemon)
+  state.rs            host-side instance store (a file; no daemon needed to read it)
   snapshot.rs         serializable rows shared by JSON output and the TUI
   commands/           one file per verb; shared name resolution in mod.rs
+  serve/              the host daemon: socket, API, verbs, forwards; machines/ (ssh, links)
   runtime/            Backend trait; dockerlike (docker/podman) and Apple container
   tui/                ratatui dashboard: app state machine, data, prompt, terminal, ui
 docs/                 design notes and findings, one per topic

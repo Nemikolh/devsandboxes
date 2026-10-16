@@ -14,7 +14,7 @@ git worktrees so working trees are never shared.
 - `src/exe.rs` — `devsandbox()`, the binary to spawn (re-resolved per spawn,
   survives an upgrade), and `own_build_stamp()`, this process's own mtime.
 - `src/commands/*.rs` — one file per verb (`run`, `start`, `stop`, `rebuild`,
-  `rm`, `ps`, `ls`, `exec`, `done`, `inbox`, `logs`, `inspect`, `stats`, `port`, `services::{gc,ls,rebuild}`). Shared name
+  `rm`, `ps`, `ls`, `exec`, `done`, `inbox`, `logs`, `inspect`, `stats`, `port`, `machine`, `services::{gc,ls,rebuild}`). Shared name
   resolution in `commands/mod.rs` (`resolve_instance`: exact instance name/id
   first, then sandbox | folder basename). `exec.rs` also owns
   `SHELL_FALLBACK_CMD`, the login shell a command-less `exec` and the TUI
@@ -22,7 +22,10 @@ git worktrees so working trees are never shared.
   running instance | injection fallback) and hosts the foreground `port` CLI.
   `inbox.rs` is `devsandbox inbox …` (docs/inbox-cli.md): reads from the
   store, mutations via a running daemon's API, else the same `wire::decide_*`
-  ops locally.
+  ops locally. `machine.rs` is `devsandbox machine add|ls|rm`
+  (docs/machines.md): a client of `machines.*` only (never in-process);
+  `add`'s TTY multi-select of probed roots and the off-TTY one-candidate
+  rule.
   `run/` is split by concern: `mod.rs` (`run`/`materialize`, naming,
   `run_container`), `worktree.rs`, `git.rs` (`host_git`: the only way the
   host runs git — hooks/fsmonitor off, repo config allowlist-checked),
@@ -110,7 +113,26 @@ git worktrees so working trees are never shared.
   Ctrl-C = `instances.cancel` on a second connection; no daemon → the
   in-process fallback.
   `--in-process` (hidden, global) never lazy-starts a daemon
-  (`client::set_in_process`); the dispatcher's subprocesses pass it too.
+  (`client::set_in_process`) and never fans out to machines; the
+  dispatcher's subprocesses pass it too.
+  `machines/` is remote hosts over ssh (docs/machines.md; registry
+  `machines.toml` next to `state.toml`, written by the daemon only, read by
+  the CLI only to know if any exist):
+  `mod.rs` (the registry: `Entry`, locked atomic `update`, name rules,
+  `parse_name` → `Where` for `m/x` | `@/x` | bare, `default_name`),
+  `ssh.rs` (the one argv builder: `api_argv`, `tty_argv`, `cli_argv`,
+  login-shell quoting; the injectable `Dial` → `Duplex`, ssh's stderr tail),
+  `link.rs` (the hello as version 0.0.0, protocol must match, `LinkError`),
+  `service.rs` (`Machines`: one `serve-machine-<name>` thread per machine,
+  connected only while wanted + 60 s linger, backoff, state into
+  `snapshots::Remotes`, forwarded quick calls one at a time),
+  `api.rs` (`machines.probe|add|list|get|rm`, connection-free, dial
+  injectable), `forward.rs` (requests with `machine`: the quick-call list,
+  verbs over an ssh each with ids rewritten, the federated `instances.resolve`
+  / `sandboxes.list` joins as pure fns), `cli.rs` (the CLI side: `plan` where
+  a command's name points, `--machine` uses, the ssh re-exec argv; pure, with
+  `route` doing the I/O). `snapshots.rs`'s `merge` builds the federated
+  snapshot (`instances.watch {machines: true}`).
 - `src/runtime/` — backend abstraction over docker/podman/Apple container.
   `procs.rs` parses a container's `ps` listing and its helper's `devsbd run
   ls` (pure; what `instances.procs` answers).
@@ -149,6 +171,10 @@ git worktrees so working trees are never shared.
   for an instance, `<runtime> exec -it` for a service);
   `kitty.rs` emulates the kitty keyboard protocol for those sessions (vt100
   callbacks + key encoding; see `docs/tui-terminal.md`);
+  `remote.rs` is machines in the dashboard (pure): the `machine/name` key
+  everything keys rows by, a row's route (`machine` + remote `root`), the
+  unreachable rule, the header's `box: connecting` note, and the ssh argv of
+  remote terminal tabs.
   `daemon.rs` is the host-daemon worker thread (unix): owns the `serve`
   connection (the dashboard as a holder; reconnect with backoff), watches
   the dashboard's root on every (re)connect (`instances.watch`) and relays

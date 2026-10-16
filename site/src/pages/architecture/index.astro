@@ -11,6 +11,7 @@ const processes = [
   { name: 'devsandbox <cmd>', where: 'host', lives: 'one command', code: 'src/commands/' },
   { name: 'devsandbox (dashboard)', where: 'host', lives: 'while open', code: 'src/tui/' },
   { name: 'devsandbox serve', where: 'host, setsid', lives: 'until idle, handoff or shutdown', code: 'src/serve/' },
+  { name: 'ssh … devsandbox api --stdio', where: 'host → a machine', lives: 'while the machine is wanted, or one remote verb', code: 'src/serve/machines/' },
   { name: 'devsbd bridge', where: 'container, exec -i', lives: 'its host process', code: 'devsbd/src/bridge.rs' },
   { name: 'devsbd daemon', where: 'container, root', lives: 'the container, per build', code: 'devsbd/src/daemon.rs' },
 ];
@@ -24,7 +25,7 @@ const processes = [
 >
   <p>
     devsandbox is one binary on the host and one static helper, <code>devsbd</code>, that it writes into every
-    container. Five kinds of process carry everything between them:
+    container. Six kinds of process carry everything between them:
   </p>
 
   <div class="table-scroll" tabindex="0" role="region" aria-label="Table">

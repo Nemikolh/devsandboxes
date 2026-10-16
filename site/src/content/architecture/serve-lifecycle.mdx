@@ -135,6 +135,8 @@ daemon gets the manager's environment plus what `install` captured (`PATH`, the 
 | `inbox` mutations | `connect_running`, else the same op locally | no | for the call |
 | `serve install` | `connect_running`, then `shutdown` | no | no |
 | `devsandbox port` | none: forwards in its own process | no | no |
+| `machine add\|ls\|rm`, a command naming a machine's instance or given `--machine` | `connect`, then `machines.*` / `instances.resolve`; a remote match is an `exec` of `ssh` | yes | for the lookup |
+| another host's daemon (a machine link) | `ssh … devsandbox api --stdio --session-env` here, hello as `0.0.0` (never a handoff) | yes, through the relay | while that host wants this machine (a watch, a call, 60 s after); a remote verb's ssh for the verb |
 
 The `bridges.ensure` rows only happen for relay-mode instances when the caller's shell has a live ssh-agent;
 otherwise those commands never contact the daemon.
@@ -154,9 +156,10 @@ up after its 5 s and hands off again on its next call.
 ## Exit
 
 Idle, handoff and `shutdown` all leave the same way: the listener goes first (so a successor waits for the lock
-instead of seeing a live daemon), then `closing`, the 5 s drain, the bridges and the forwards, and the lock last.
+instead of seeing a live daemon), then `closing`, the 5 s drain, the machine links (their ssh killed: a remote verb
+not sent `detach` is cancelled there), the bridges and the forwards, and the lock last.
 `serve uninstall` is the exception: the manager signals the daemon, so clients see the socket drop with no
 `closing` and reconnect by starting one on demand.
 
 Design notes: `docs/serve.md` (start, handoff, idle exit, boot start), `docs/api.md` (the methods, the dashboard
-as a client), `docs/inbox-redesign.md` (why a daemon).
+as a client), `docs/machines.md` (machine links), `docs/inbox-redesign.md` (why a daemon).

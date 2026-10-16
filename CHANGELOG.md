@@ -13,6 +13,17 @@ devsandbox rm web-4        # or remove everything it made
 
 ### Added
 
+- **Machines: sandboxes on other hosts, over ssh.** `devsandbox machine add <ssh target>` registers a host running devsandbox (its config roots are offered to pick from, or pass `--config '<path there>'`); `machine ls` shows each one's state, `machine rm` forgets it. Their sandboxes and instances then show in the dashboard next to yours, in a MACHINE column, and every key works on them, terminals included. On the CLI a name is looked up on every machine: one match is used wherever it is, `my-server/test` or `@/test` (this host) picks when it's ambiguous. Verbs run on the machine with its login shell's environment, only your ssh-agent is forwarded; `exec`, `logs`, `inspect`, `done` and `rename` run there over `ssh`. `--machine <name>` runs a command without a name there (`ps`, `ls`, `stop --all`, …). A machine that's down keeps its last rows, marked `unreachable`. Not yet on machines: port forwards, VS Code, the Inbox. Adding a machine means trusting it. Details: `docs/machines.md`.
+
+```bash
+devsandbox machine add me@my-server
+devsandbox run api              # `api` is only defined on my-server
+devsandbox exec test            # an instance there: over ssh
+devsandbox stop my-server/test  # qualified, when `test` exists here too
+```
+
+- **API: machines.** `machines.probe|add|list|get|rm`, `roots.list`, a `machine` param that runs a quick call or a verb on a machine, `machines: true` on `instances.watch` (rows tagged `machine`, plus each machine's link state), `instances.resolve` and `sandboxes.list` (every machine's matches), and `found` on `instances.resolve`'s answer. Details: `docs/api.md`, *Machines*.
+
 - **`-d` / `--detach` on `run`, `rebuild` and `start`.** Returns as soon as the instance is registered and prints its name (`run -d --json`: the run record); the build goes on in the host daemon. Follow it with `devsandbox logs --build <name> --follow`, or watch its row in the dashboard.
 
 ```bash
