@@ -208,7 +208,6 @@ pub type TunnelArgv = Box<dyn Fn() -> Result<Vec<OsString>, String> + Send + Syn
 /// answers the listening-process lookup when the header says the port lives
 /// in its container, else it stays unknown (the engine's probe fallback is
 /// the caller's: `None` for remote).
-#[cfg_attr(not(test), allow(dead_code))] // `devsandbox port` / the daemon wire it next
 pub fn remote_opener(machine: String, argv: TunnelArgv) -> Opener {
     Box::new(move |stop| open_remote(&machine, &argv()?, stop))
 }
@@ -270,7 +269,7 @@ fn open_remote(machine: &str, argv: &[OsString], stop: &AtomicBool) -> Result<(O
         Ok(Header::Route { label, host, port, hash, helper }) => {
             let label = format!("{machine}/{label}");
             let stderr = TailReader { tail, rest: None };
-            let bridge = bridge::attach(child, stdin, stdout, stderr, hash.as_deref().unwrap_or_default(), &label);
+            let bridge = bridge::attach(child, stdin, stdout, stderr, hash.as_deref().unwrap_or_default(), &label, Some(machine));
             let lookup = if helper { ProcessLookup::Helper { container: String::new() } } else { ProcessLookup::None };
             Ok((Opened { label, host, port, lookup }, bridge))
         }

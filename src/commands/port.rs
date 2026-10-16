@@ -457,7 +457,7 @@ fn state_change_line(
 /// leading positional that parses as a port spec is a port, not an instance
 /// (instance names that are bare port numbers aren't worth the ambiguity).
 #[cfg(unix)]
-fn split_target(name: Option<String>, has_service: bool, mut ports: Vec<String>) -> (Option<String>, Vec<String>) {
+pub(crate) fn split_target(name: Option<String>, has_service: bool, mut ports: Vec<String>) -> (Option<String>, Vec<String>) {
     match name {
         Some(n) if has_service && parse_port_spec(&n).is_ok() => {
             ports.insert(0, n);
@@ -479,26 +479,10 @@ pub fn port(
     address: std::net::IpAddr,
     ports: Vec<String>,
 ) -> Result<()> {
-    use std::time::{Duration, Instant};
-
-    use anyhow::{bail, Context};
-
-    use crate::devsbd::forward::{local_opener, Forward, ForwardSpec, ForwardState};
+    use crate::devsbd::forward::local_opener;
 
     let (name, ports) = split_target(name, service.is_some(), ports);
-    if name.is_none() && service.is_none() {
-        bail!("name an instance or a service: `devsandbox port <instance> <port>` or `devsandbox port --service <svc> <port>`");
-    }
-    if ports.is_empty() {
-        bail!("give at least one port to forward, e.g. `devsandbox port <instance> 3000`");
-    }
-
-    // Parse every spec up front so a typo fails before we bind or touch docker.
-    let specs: Vec<(HostPort, u16)> = ports
-        .iter()
-        .map(|s| parse_port_spec(s))
-        .collect::<Result<_, _>>()
-        .map_err(|e| anyhow::anyhow!(e))?;
+    let specs = parse_specs(name.is_some(), service.is_some(), &ports)?;
 
     // Resolve the user-supplied name once, on this (TTY) thread — the resolver
     // closure runs on the forwarder's worker thread and must never prompt.
@@ -510,10 +494,95 @@ pub fn port(
         None => None,
     };
 
+    forward_until_interrupted(
+        address,
+        &specs,
+        |container_port| local_opener(resolver(dir.clone(), instance_key.clone(), service.clone(), container_port)),
+        || Box::new(listening_procs),
+    )
+}
+
+/// `devsandbox port` on a machine's instance or global service
+/// (docs/architecture/daemon/machines.md, *The CLI*): [`port`]'s flow, each
+/// forward's bridge an ssh running `devsandbox tunnel` on `entry`
+/// (`tunnel::remote_opener`). `root` is the config root there, `name` the
+/// instance as that machine knows it (already resolved, and already split
+/// from the ports by the caller: `split_target` is not applied again). No
+/// probe fallback: the far helper is the only listening-process lookup.
+#[cfg(unix)]
+pub fn port_remote(
+    entry: crate::serve::machines::Entry,
+    root: std::path::PathBuf,
+    name: Option<String>,
+    service: Option<String>,
+    address: std::net::IpAddr,
+    ports: Vec<String>,
+) -> Result<()> {
+    use std::sync::Arc;
+
+    use crate::serve::machines::ssh;
+
+    let specs = parse_specs(name.is_some(), service.is_some(), &ports)?;
+    let target = Arc::new((entry, root, name, service));
+    forward_until_interrupted(
+        address,
+        &specs,
+        |container_port| {
+            let target = Arc::clone(&target);
+            let machine = target.0.name.clone();
+            // A person is at the terminal: no `BatchMode`.
+            super::tunnel::remote_opener(
+                machine,
+                Box::new(move || {
+                    let (entry, root, name, service) = &*target;
+                    ssh::tunnel_argv(entry, false, root, name.as_deref(), service.as_deref(), container_port)
+                        .map_err(|e| format!("{e:#}"))
+                }),
+            )
+        },
+        || Box::new(|_: &str, _: u16| None),
+    )
+}
+
+/// The port specs of a `devsandbox port`, every one parsed up front so a typo
+/// fails before anything binds or touches docker or ssh.
+#[cfg(unix)]
+fn parse_specs(has_name: bool, has_service: bool, ports: &[String]) -> Result<Vec<(HostPort, u16)>> {
+    use anyhow::bail;
+
+    if !has_name && !has_service {
+        bail!("name an instance or a service: `devsandbox port <instance> <port>` or `devsandbox port --service <svc> <port>`");
+    }
+    if ports.is_empty() {
+        bail!("give at least one port to forward, e.g. `devsandbox port <instance> 3000`");
+    }
+    ports.iter().map(|s| parse_port_spec(s)).collect::<Result<_, _>>().map_err(|e| anyhow::anyhow!(e))
+}
+
+/// A forward's fallback listening-process lookup (`ForwardSpec::probe`).
+#[cfg(unix)]
+type Probe = Box<dyn Fn(&str, u16) -> Option<String> + Send + Sync>;
+
+/// The foreground flow shared by [`port`] and [`port_remote`]: one forward per
+/// spec, its opener from `open(container_port)`, then wait for every first
+/// outcome, print the mappings and report changes until SIGINT.
+#[cfg(unix)]
+fn forward_until_interrupted(
+    address: std::net::IpAddr,
+    specs: &[(HostPort, u16)],
+    open: impl Fn(u16) -> crate::devsbd::forward::Opener,
+    probe: impl Fn() -> Probe,
+) -> Result<()> {
+    use std::time::{Duration, Instant};
+
+    use anyhow::{bail, Context};
+
+    use crate::devsbd::forward::{Forward, ForwardSpec, ForwardState};
+
     let mut forwards: Vec<Forward> = Vec::with_capacity(specs.len());
-    for (host_port, container_port) in &specs {
-        let open = local_opener(resolver(dir.clone(), instance_key.clone(), service.clone(), *container_port));
-        let probe = Box::new(listening_procs);
+    for (host_port, container_port) in specs {
+        let open = open(*container_port);
+        let probe = probe();
         let forward = Forward::start(ForwardSpec { bind: address, host_port: *host_port, open, probe })
             .with_context(|| match host_port {
                 HostPort::Fixed(p) => format!("host port {p} is in use"),
@@ -550,7 +619,7 @@ pub fn port(
     // lands ~100ms later), so the suffix is re-printed by the loop below.
     let mut prev_states: Vec<ForwardState> = Vec::with_capacity(forwards.len());
     let mut prev_procs: Vec<Option<String>> = Vec::with_capacity(forwards.len());
-    for (forward, (host_port, _)) in forwards.iter().zip(&specs) {
+    for (forward, (host_port, _)) in forwards.iter().zip(specs) {
         let status = forward.status();
         println!("{}", mapping_line(&status, *host_port));
         prev_states.push(status.state.clone());
@@ -565,7 +634,7 @@ pub fn port(
         std::thread::sleep(Duration::from_millis(250));
         for ((forward, (host_port, _)), (prev, prev_proc)) in forwards
             .iter()
-            .zip(&specs)
+            .zip(specs)
             .zip(prev_states.iter_mut().zip(prev_procs.iter_mut()))
         {
             let status = forward.status();
@@ -662,6 +731,22 @@ image = "node"
 "#;
 
     const PROJECT: &str = "proj1234";
+
+    /// Shared by the local and remote `port`: a target and a port are
+    /// required, and every spec parses before anything starts.
+    #[cfg(unix)]
+    #[test]
+    fn specs_parse_up_front() {
+        let ports = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            parse_specs(true, false, &ports(&["3000", "8000:80"])).unwrap(),
+            vec![(HostPort::Prefer(3000), 3000), (HostPort::Fixed(8000), 80)]
+        );
+        assert!(parse_specs(false, true, &ports(&["6379"])).is_ok());
+        assert!(parse_specs(false, false, &ports(&["3000"])).unwrap_err().to_string().starts_with("name an instance or a service"));
+        assert!(parse_specs(true, false, &[]).unwrap_err().to_string().starts_with("give at least one port"));
+        assert!(parse_specs(true, false, &ports(&["3000", "nope"])).is_err());
+    }
 
     fn config() -> Config {
         Config::parse(CONFIG).unwrap()

@@ -40,7 +40,8 @@ struct Cli {
     in_process: bool,
 
     /// Run a command without a name (`ps`, `stats`, `ls`, `status`, `gc`,
-    /// `service ls|rebuild`, `stop|start|rebuild --all`) on this machine
+    /// `service ls|rebuild`, `stop|start|rebuild --all`, `port --service
+    /// <global-svc>`) on this machine
     /// (`devsandbox machine ls`); a named one takes `<machine>/<name>` instead
     #[arg(long, global = true, value_name = "MACHINE")]
     machine: Option<String>,
@@ -262,10 +263,13 @@ enum Command {
     ///     devsandbox port api 3000
     ///     devsandbox port api --service postgres 5432
     ///     devsandbox port --service redis 6379
+    ///     devsandbox port box/api 3000
+    ///     devsandbox port --machine box --service redis 6379
     Port {
         /// Instance name, sandbox config name, or repository folder name
-        /// (`@/<name>`: this host's; machines aren't supported yet); omit
-        /// only with `--service <global-svc>`
+        /// (`<machine>/<name>`: a machine's, forwarded here over ssh;
+        /// `@/<name>`: this host's); omit only with `--service <global-svc>`
+        /// (`--machine <m>`: that machine's)
         name: Option<String>,
         /// Forward a service's port instead of the instance's own; a global
         /// service needs no instance name, an isolated one does
@@ -527,6 +531,9 @@ fn main() -> Result<()> {
     let command = match serve::machines::cli::route(cli.machine.as_deref(), cli.in_process, &machines, command)? {
         serve::machines::cli::Routed::Here(command) => command,
         serve::machines::cli::Routed::Exit(code) => std::process::exit(code),
+        serve::machines::cli::Routed::Port { entry, root, name, service, address, ports } => {
+            return commands::port::port_remote(entry, root, name, service, address, ports);
+        }
     };
     #[cfg(not(unix))]
     if cli.machine.is_some() {

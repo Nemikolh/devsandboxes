@@ -160,7 +160,6 @@ pub fn tty_argv_with(entry: &Entry, program: &str, remote_args: &[impl AsRef<str
 /// -C <root> tunnel [--instance=<key>] [--service=<svc>] --port <n>>`. No
 /// `-A`: a forward's bridge serves no agent. `batch` when whoever runs it has
 /// no TTY (the daemon). The `=` forms keep a name starting with `-` a value.
-#[cfg_attr(not(test), allow(dead_code))] // `devsandbox port` / the daemon wire it next
 pub fn tunnel_argv(
     entry: &Entry,
     batch: bool,

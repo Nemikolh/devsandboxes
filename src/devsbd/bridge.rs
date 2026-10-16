@@ -546,7 +546,7 @@ fn spawn_observed(
     let stdin = child.stdin.take()?;
     let stdout = child.stdout.take()?;
     let stderr = child.stderr.take()?;
-    Some(attach_with(child, stdin, stdout, stderr, hash, container, agent, notify, observe))
+    Some(attach_with(child, stdin, stdout, stderr, hash, container, None, agent, notify, observe))
 }
 
 /// `<runtime> exec -i -u root <container> devsbd bridge`: the in-container end
@@ -564,8 +564,10 @@ pub fn bridge_command(container: &str) -> Command {
 /// services, no observer: what a forward over a non-`exec` transport needs.
 /// `stdout` may already be partly read (a header before the bridge's bytes);
 /// the handshake starts at whatever it yields next. `label` names the far
-/// end in messages (`helper in <label> is outdated …`). Dropping the
-/// `Bridge` kills `child`.
+/// end in messages (`helper in <label> is outdated …`); `machine`, when the
+/// far end is a machine's, is what an outdated helper's fix names (its
+/// devsandbox, not the instance, embeds that helper). Dropping the `Bridge`
+/// kills `child`.
 pub fn attach(
     child: Child,
     stdin: impl Write + Send + 'static,
@@ -573,9 +575,10 @@ pub fn attach(
     stderr: impl Read + Send + 'static,
     hash: &str,
     label: &str,
+    machine: Option<&str>,
 ) -> Bridge {
     let none: Option<fn() -> Option<PathBuf>> = None;
-    attach_with(child, stdin, stdout, stderr, hash, label, none, None, None)
+    attach_with(child, stdin, stdout, stderr, hash, label, machine, none, None, None)
 }
 
 /// [`attach`] with the full set of options [`spawn_observed`] takes.
@@ -587,6 +590,7 @@ fn attach_with(
     mut stderr: impl Read + Send + 'static,
     hash: &str,
     label: &str,
+    machine: Option<&str>,
     agent: Option<impl Fn() -> Option<PathBuf> + Send + 'static>,
     notify: Option<Services>,
     observe: Option<Observer>,
@@ -602,6 +606,7 @@ fn attach_with(
     let (tx, handshake) = mpsc::channel();
     let hash = hash.to_string();
     let label = label.to_string();
+    let machine = machine.map(str::to_string);
     let finished = Arc::clone(&done);
     let hs_mismatch = Arc::clone(&mismatch);
     let forward = Arc::new(OnceLock::new());
@@ -645,7 +650,7 @@ fn attach_with(
             // already printed its own direction-aware line, so prefer stderr.
             if let Some(vm) = proto::version_mismatch(&e) {
                 hs_mismatch.store(true, Ordering::Relaxed);
-                return mismatch_message(&label, vm);
+                return mismatch_message(&label, machine.as_deref(), vm);
             }
             let mut msg = String::new();
             // `BrokenPipe`: the child exited before our `Hello` went out (a
@@ -717,17 +722,18 @@ fn attach_with(
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A host-side, direction-aware message for a helper/host protocol mismatch.
-/// Peer (the helper) older → tell the user to restart the instance so the
-/// binary is rewritten; peer newer → this `devsandbox` is the stale side.
-/// `label` is the bridge's (the container for an `exec` bridge); the instance
-/// key isn't on hand here, so the fix hint stays generic ("restart the
-/// instance").
-fn mismatch_message(label: &str, vm: &proto::VersionMismatch) -> String {
+/// Peer (the helper) older → a local one is fixed by restarting the instance
+/// (the binary is rewritten), a `machine`'s by updating devsandbox there (it
+/// embeds the helper it installs); peer newer → this `devsandbox` is the
+/// stale side. `label` is the bridge's (the container for an `exec` bridge);
+/// the instance key isn't on hand here, so the local hint stays generic.
+fn mismatch_message(label: &str, machine: Option<&str>, vm: &proto::VersionMismatch) -> String {
     if vm.peer < vm.ours {
-        format!(
-            "helper in {label} is outdated (protocol {}, need {}): restart the instance",
-            vm.peer, vm.ours
-        )
+        let fix = match machine {
+            Some(m) => format!("update devsandbox on {m} (and restart the instance there)"),
+            None => "restart the instance".to_string(),
+        };
+        format!("helper in {label} is outdated (protocol {}, need {}): {fix}", vm.peer, vm.ours)
     } else {
         format!(
             "this devsandbox is older than the helper in {label} (protocol {}, need {})",
@@ -1147,7 +1153,7 @@ mod tests {
                 .unwrap();
             let (stdin, stdout, stderr) =
                 (child.stdin.take().unwrap(), child.stdout.take().unwrap(), child.stderr.take().unwrap());
-            attach(child, stdin, stdout, stderr, "", "box/web")
+            attach(child, stdin, stdout, stderr, "", "box/web", Some("box"))
         };
         let bridge = attached(1);
         assert_eq!(bridge.outcome(Duration::from_secs(5)), Some(Err("no daemon here".into())));
@@ -1157,6 +1163,26 @@ mod tests {
         let bridge = attached(proto::MISMATCH_EXIT);
         assert!(bridge.outcome(Duration::from_secs(5)).unwrap().is_err());
         assert!(bridge.is_mismatch());
+    }
+
+    /// An outdated helper's fix: a local one is a restart, a machine's an
+    /// update of devsandbox there; a newer one blames this side either way.
+    #[test]
+    fn mismatch_messages_name_the_fix() {
+        let older = proto::VersionMismatch { peer: 1, ours: 2 };
+        assert_eq!(
+            mismatch_message("devsandbox-web", None, &older),
+            "helper in devsandbox-web is outdated (protocol 1, need 2): restart the instance"
+        );
+        assert_eq!(
+            mismatch_message("box/web", Some("box"), &older),
+            "helper in box/web is outdated (protocol 1, need 2): update devsandbox on box (and restart the instance there)"
+        );
+        let newer = proto::VersionMismatch { peer: 3, ours: 2 };
+        assert_eq!(
+            mismatch_message("box/web", Some("box"), &newer),
+            "this devsandbox is older than the helper in box/web (protocol 3, need 2)"
+        );
     }
 
     #[test]

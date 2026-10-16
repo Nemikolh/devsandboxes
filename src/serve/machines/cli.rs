@@ -38,6 +38,9 @@ pub(crate) enum MachineUse {
     /// A daemon verb (`stop/start/rebuild --all`, `service rebuild`):
     /// `verbs_client` forwards it.
     Verb,
+    /// `port --service <global-svc>` with no instance name: forwarded here
+    /// from the machine's first root ([`Routed::Port`]).
+    Port,
     /// A command taking a `<name>`: qualify the name instead.
     Named,
     /// Not for machines (yet): what to call the command.
@@ -82,7 +85,8 @@ pub(crate) fn machine_use(command: Option<&Command>) -> MachineUse {
         | Command::Exec { .. } => MachineUse::Named,
         Command::Inbox { .. } => MachineUse::Refused("inbox"),
         Command::Vscode { .. } => MachineUse::Refused("vscode"),
-        Command::Port { .. } => MachineUse::Refused("port"),
+        Command::Port { .. } if port_nameless(command) => MachineUse::Port,
+        Command::Port { .. } => MachineUse::Named,
         Command::Serve { .. } => MachineUse::Refused("serve"),
         Command::Api { .. } => MachineUse::Refused("api"),
         Command::Tunnel { .. } => MachineUse::Refused("tunnel"),
@@ -129,6 +133,16 @@ fn name_of(command: &Command) -> Option<&str> {
     }
 }
 
+/// `port` naming no instance: no name, or (`--service`) a leading positional
+/// that is a port, which clap put in `name` (port.rs's `split_target`).
+fn port_nameless(command: &Command) -> bool {
+    match command {
+        Command::Port { name: None, .. } => true,
+        Command::Port { name: Some(n), service: Some(_), .. } => crate::commands::port::parse_port_spec(n).is_ok(),
+        _ => false,
+    }
+}
+
 /// The verbs `verbs_client` sends, which resolve their names there.
 fn is_verb(command: &Command) -> bool {
     matches!(command, Command::Run { .. } | Command::Rebuild { .. } | Command::Stop { .. } | Command::Start { .. } | Command::Rm { .. })
@@ -160,7 +174,7 @@ pub(crate) fn plan(command: &Command, machine: Option<&str>, in_process: bool, m
     }
     if let Some(m) = machine {
         check_name(m)?;
-        let named = name_of(command).is_some() || matches!(command, Command::Port { .. });
+        let named = name_of(command).is_some();
         let usage = machine_use(Some(command));
         match &usage {
             MachineUse::Named => bail!("--machine is for commands without a name; qualify the name instead: {m}/<name>"),
@@ -179,11 +193,7 @@ pub(crate) fn plan(command: &Command, machine: Option<&str>, in_process: bool, m
         });
     }
     let Some(arg) = name_of(command) else { return Ok(Plan::Here) };
-    // `port --service redis 6379`: the port lands in `name` (port.rs's
-    // `split_target`).
-    if let Command::Port { service: Some(_), .. } = command
-        && crate::commands::port::parse_port_spec(arg).is_ok()
-    {
+    if port_nameless(command) {
         return Ok(Plan::Here);
     }
     let (wherever, name) = parse_name(arg)?;
@@ -386,6 +396,29 @@ pub(crate) enum Routed {
     Here(Command),
     /// It ran elsewhere: exit with this code.
     Exit(i32),
+    /// `devsandbox port` into a machine's instance (`name`, as the machine
+    /// knows it) or global service: forwarded from here over ssh
+    /// (`commands::port::port_remote`), `root` the config root there. The
+    /// ports are already split from the name.
+    Port {
+        entry: Entry,
+        root: PathBuf,
+        name: Option<String>,
+        service: Option<String>,
+        address: std::net::IpAddr,
+        ports: Vec<String>,
+    },
+}
+
+/// [`Routed::Port`] for `command` (a `Port`) on `entry` at `root`.
+fn routed_port(command: Command, entry: Entry, root: PathBuf, name: Option<String>) -> Result<Routed> {
+    let Command::Port { name: typed, service, address, ports } = command else { bail!("not a port command") };
+    let ports = match name {
+        // The instance resolved: the typed name was it, the ports are as given.
+        Some(_) => ports,
+        None => crate::commands::port::split_target(typed, service.is_some(), ports).1,
+    };
+    Ok(Routed::Port { entry, root, name, service, address, ports })
 }
 
 fn on_terminal() -> bool {
@@ -420,6 +453,10 @@ pub(crate) fn route(machine: Option<&str>, in_process: bool, machines: &[String]
                         }
                     }
                     Ok(Routed::Exit(code))
+                }
+                MachineUse::Port => {
+                    let root = entry.roots.first().cloned().with_context(|| format!("machine `{m}` has no config roots (devsandbox machine ls)"))?;
+                    routed_port(command, entry, root, None)
                 }
                 MachineUse::Verb | MachineUse::Named | MachineUse::Refused(_) => unreachable!("plan never routes these"),
             }
@@ -471,14 +508,16 @@ fn resolve_and_route(command: Command, wherever: Where, name: String) -> Result<
         (Some(m), _) | (None, Where::Machine(m)) => m.clone(),
         (None, _) => return Ok(Routed::Here(renamed(command, chosen.name))),
     };
-    if matches!(command, Command::Vscode { .. } | Command::Port { .. }) {
-        bail!("`{m}/{}` is on a machine: `devsandbox {}` is not supported on machines yet", chosen.name, match command {
-            Command::Vscode { .. } => "vscode",
-            _ => "port",
-        });
+    if matches!(command, Command::Vscode { .. }) {
+        bail!("`{m}/{}` is on a machine: `devsandbox vscode` is not supported on machines yet", chosen.name);
     }
     let entry = machine_info(&mut |method, params| conn.call(method, params), &m)?;
     drop(conn);
+    if matches!(command, Command::Port { .. }) {
+        let root = chosen.root.clone().or_else(|| entry.roots.first().cloned());
+        let root = root.with_context(|| format!("machine `{m}` has no config roots (devsandbox machine ls)"))?;
+        return routed_port(command, entry, root, Some(chosen.name));
+    }
     let root = chosen.root.as_deref().or(entry.roots.first().map(PathBuf::as_path));
     let args = remote_args(&command, &chosen.name, root).context("this command doesn't run on a machine")?;
     Err(exec_ssh(&ssh::cli_argv(&entry, on_terminal(), &args)?))
@@ -568,6 +607,15 @@ mod tests {
         assert_eq!(plan_of(&["vscode", "web"], None, m).unwrap(), Plan::Resolve(Where::Any, "web".into()));
         assert_eq!(plan_of(&["ps"], None, m).unwrap(), Plan::Here);
         assert_eq!(plan_of(&["port", "--service", "db", "5432"], None, m).unwrap(), Plan::Here);
+        // `port` on a machine's instance resolves like the rest, then
+        // forwards from here (`Routed::Port`).
+        assert_eq!(plan_of(&["port", "box/web", "3000"], None, m).unwrap(), Plan::Resolve(Where::Machine("box".into()), "web".into()));
+        assert_eq!(
+            plan_of(&["port", "box/web", "--service", "db", "5432"], None, m).unwrap(),
+            Plan::Resolve(Where::Machine("box".into()), "web".into())
+        );
+        assert_eq!(plan_of(&["port", "web", "3000"], None, m).unwrap(), Plan::Resolve(Where::Any, "web".into()));
+        assert_eq!(plan_of(&["port", "@/web", "3000"], None, m).unwrap(), Plan::HereAs("web".into()));
     }
 
     #[test]
@@ -593,9 +641,21 @@ mod tests {
             let e = plan_of(args, Some("box"), m).unwrap_err().to_string();
             assert_eq!(e, format!("--machine isn't for `devsandbox {what}`"));
         }
-        let e = plan_of(&["port", "web", "3000"], Some("box"), m).unwrap_err().to_string();
-        assert!(e.contains("`port` doesn't run on machines yet"), "{e}");
-        assert!(plan_of(&["vscode", "web"], Some("box"), m).is_err());
+        // A nameless `port` (a global service) runs on the machine; a named
+        // one qualifies the name.
+        assert_eq!(plan_of(&["port", "--service", "redis", "6379"], Some("box"), m).unwrap(), Plan::Machine("box".into(), MachineUse::Port));
+        assert_eq!(
+            plan_of(&["port", "--service", "redis", "1:6379", "6380"], Some("box"), m).unwrap(),
+            Plan::Machine("box".into(), MachineUse::Port)
+        );
+        let e = plan_of(&["port", "--service", "redis", "6379"], Some("nope"), m).unwrap_err().to_string();
+        assert_eq!(e, "no machine named `nope` (devsandbox machine ls)");
+        for args in [&["port", "web", "3000"][..], &["port", "web", "--service", "db", "5432"], &["port", "3000"]] {
+            let e = plan_of(args, Some("box"), m).unwrap_err().to_string();
+            assert!(e.ends_with("qualify the name instead: box/<name>"), "{args:?}: {e}");
+        }
+        let e = plan_of(&["vscode", "web"], Some("box"), m).unwrap_err().to_string();
+        assert!(e.contains("`vscode` doesn't run on machines yet"), "{e}");
         assert_eq!(machine_use(None), MachineUse::Refused("the dashboard"));
         assert!(plan_of(&["ps"], Some("a/b"), m).is_err(), "a bad machine name");
     }
@@ -610,6 +670,32 @@ mod tests {
         assert_eq!(once(&["gc", "--force"]), MachineUse::PerRoot { args: ms(&["gc", "--force"]), json: false });
         assert_eq!(once(&["rebuild", "--all"]), MachineUse::Verb);
         assert_eq!(once(&["start", "--all", "-d"]), MachineUse::Verb);
+        assert_eq!(once(&["port", "--service", "redis", "6379"]), MachineUse::Port);
+        assert_eq!(once(&["port", "--service", "redis"]), MachineUse::Port);
+        assert_eq!(once(&["port", "web", "3000"]), MachineUse::Named);
+        assert_eq!(once(&["port", "web", "--service", "db", "5432"]), MachineUse::Named);
+    }
+
+    fn entry() -> Entry {
+        Entry { name: "box".into(), target: "me@box".into(), roots: vec![PathBuf::from("/r")], command: None }
+    }
+
+    /// What `main` gets for a port: a nameless one's port comes out of
+    /// `name`, a resolved instance keeps the ports as given.
+    #[test]
+    fn port_routes_carry_the_split_ports() {
+        let Routed::Port { root, name, service, ports, .. } =
+            routed_port(command(&["port", "--service", "redis", "6379", "7000:6380"]), entry(), "/r".into(), None).unwrap()
+        else {
+            panic!("not a port route")
+        };
+        assert_eq!((root, name, service, ports), (PathBuf::from("/r"), None, Some("redis".into()), ms(&["6379", "7000:6380"])));
+        let Routed::Port { name, service, ports, entry: e, .. } =
+            routed_port(command(&["port", "box/web", "--service", "db", "5432"]), entry(), "/r".into(), Some("web-2".into())).unwrap()
+        else {
+            panic!("not a port route")
+        };
+        assert_eq!((name, service, ports, e.name), (Some("web-2".into()), Some("db".into()), ms(&["5432"]), "box".to_string()));
     }
 
     #[test]

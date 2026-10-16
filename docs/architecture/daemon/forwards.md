@@ -105,7 +105,10 @@ handshake and mux on the rest of the ssh's stdout, labelled
 `<machine>/<label>` (the route label shown too). ssh's stderr goes from the
 start into a bounded `ssh::Tail`, so a chatty ssh can't stall on a full
 pipe; `attach` reads it through `TailReader`, which yields the tail once
-stderr ends. The lookup is `ProcessLookup::Helper` when the header says
+stderr ends. `attach` also gets the machine, so a far helper older than
+this devsandbox's protocol reads "update devsandbox on <machine> (and
+restart the instance there)" (`mismatch_message`) rather than the local
+"restart the instance". The lookup is `ProcessLookup::Helper` when the header says
 `helper` (the far helper answers `Bridge::listening` over the same
 stream), else `None`; a remote forward's `ForwardSpec.probe` finds nothing.
 
@@ -175,5 +178,13 @@ is excluded from `config_hash`: editing it is never drift.
 it waits up to 20 s in total for every forward's first outcome, exits
 non-zero on any error or timeout, else prints the mappings and blocks until Ctrl-C. Its forwards
 are invisible to the daemon, the Ports tab and API clients.
+
+The instance may be a machine's (`box/api`, or a bare name that resolves
+there), as may a global service (`--machine box --service redis`):
+`machines::cli::route` hands it to `port::port_remote`, the same flow
+(`forward_until_interrupted`, shared with `port::port`) with
+[remote bridges](#remote-bridges) opened by `ssh::tunnel_argv` without
+`BatchMode` (a person is at the terminal) and no probe fallback. Only the
+bind is local; the name resolves on the machine.
 
 Limitations: [status.md](../../status.md#daemon)

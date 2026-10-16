@@ -239,8 +239,12 @@ devsandbox machine rm box                      # unregister only
   (once), `ls`, `status --json`, `gc`, `service ls` (once per root of `m`,
   each after a `==> m:<root>` line on stderr; `--json` with several roots is
   refused), `stop --all`, `start --all`, `rebuild --all`, `service rebuild
-  <svc>`. Without it these are local only.
-- Not on machines yet: `vscode`, `port`, the Inbox. A machine needs the
+  <svc>`, `port --service <global-svc> <port>` (from `m`'s first root).
+  Without it these are local only.
+- `port box/api 3000` forwards a machine's instance port to this host (one
+  ssh per port, until Ctrl-C), same specs and output as a local `port`.
+  The dashboard's `p` on a machine's row doesn't yet.
+- Not on machines yet: `vscode`, the Inbox. A machine needs the
   daemon: with none answering, a qualified name or `--machine` is an error.
   With no machine registered, nothing of this costs anything.
 

@@ -136,15 +136,22 @@ watchers' roots from the last local params. Details:
 - **Other named commands** (`exec`, `logs`, `inspect`, `done`, `undone`,
   `rename`, …) are resolved through the daemon; one on a machine is re-run
   as `ssh [-t] <target> devsandbox <args>` (`exec` of ssh). `logs` /
-  `inspect` with a bare `devsandbox-…` container name stay local. `vscode`
-  and `port` on a machine's instance are refused.
+  `inspect` with a bare `devsandbox-…` container name stay local. `port`
+  on a machine's instance runs here: `route` returns `Routed::Port` (the
+  machine's `Entry`, the match's root or else the machine's first, the
+  instance as the machine names it) and `commands::port::port_remote`
+  forwards over one ssh per port (`ssh::tunnel_argv` without `BatchMode`,
+  `tunnel::remote_opener`; [forwards](forwards.md)). `vscode` on a
+  machine's instance is refused.
 - **`--machine m`** is for nameless commands (`machine_use`): `ps`,
   `stats` run once over ssh; root-bound ones (`ls`, `status`, `gc`,
   `service ls`) run once per registered root with `-C <root>` and a
   `==> m:<root>` line (`--json` with several roots is an error); `stop
-  --all`, `rebuild --all`, `start --all`, `service rebuild` go as verbs.
+  --all`, `rebuild --all`, `start --all`, `service rebuild` go as verbs;
+  `port --service <svc>` naming no instance (`MachineUse::Port`) forwards
+  the machine's global service from its first registered root, as above.
   On a named command it's an error (qualify the name instead); refused for
-  `inbox`, `vscode`, `port`, `serve`, `api`, `machine`, the dashboard.
+  `inbox`, `vscode`, `serve`, `api`, `machine`, the dashboard.
 - Without a local daemon, a qualified remote name and `--machine` fail
   ("needs devsandbox serve"); a bare name resolves locally.
 
