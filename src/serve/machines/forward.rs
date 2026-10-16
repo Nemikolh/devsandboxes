@@ -11,6 +11,8 @@
 //! - Federated `instances.resolve` and `sandboxes.list` (`machines: true`):
 //!   this host and every machine in parallel, each machine given
 //!   [`FANOUT_WAIT`] to answer; the joins are pure fns over the answers.
+//! - [`HERE`] (`forwards.add`): not forwarded at all; the daemon serves it
+//!   with `machine` kept, binding the forward on this host.
 
 use std::net::Shutdown;
 use std::path::{Path, PathBuf};
@@ -50,6 +52,16 @@ pub const QUICK: &[&str] = &[
 
 pub fn is_quick(method: &str) -> bool {
     QUICK.contains(&method)
+}
+
+/// The methods whose `machine` names where the work is aimed, not where it
+/// runs: the daemon answers them itself. `forwards.add` binds its listener
+/// here (a forward into a machine's instance is owned by this side,
+/// `docs/architecture/daemon/forwards.md`, *Remote bridges*).
+pub const HERE: &[&str] = &["forwards.add"];
+
+pub fn is_here(method: &str) -> bool {
+    HERE.contains(&method)
 }
 
 /// How long a federated call waits for each machine: a link already
@@ -570,6 +582,11 @@ mod tests {
         assert_eq!(code_message(&r).0, "invalid");
         let r = c.call("inbox.threads.list", json!({"machine": "box"})).unwrap();
         assert_eq!(code_message(&r), ("invalid", "`inbox.threads.list` can't take a machine yet"));
+        // Served here, `machine` and all: the local API answers (a test
+        // daemon has no host side), not the machine and not the refusal.
+        let add = json!({"dir": pair.remote_root, "instance": "web-r", "spec": "3000", "machine": "box"});
+        let r = c.call("forwards.add", add).unwrap();
+        assert_eq!(code_message(&r), ("internal", "this daemon runs no forwards"));
         // The link to `down` can't connect: `failed`, why.
         let r = c.call("instances.list", json!({"dir": "/x", "machine": "down"})).unwrap();
         assert_eq!(code_message(&r), ("failed", "down: unreachable: down: ssh: Could not resolve hostname down"));

@@ -6,8 +6,9 @@
 //! registry's sync.
 //!
 //! Only the daemon writes it: `forwards.add` appends, `forwards.rm` removes,
-//! the restore at registry start drops entries of removed instances and
-//! records fallback ports. A daemon exiting doesn't touch it — dropping its
+//! the restore at registry start drops entries of removed instances (and of
+//! machines no longer registered) and records fallback ports; the registry's
+//! sync drops a removed machine's entries too. A daemon exiting doesn't touch it — dropping its
 //! forwards is not a removal. Two daemons can briefly overlap during a
 //! handoff, so every write is a read-modify-write under an exclusive lock on
 //! the sibling `forwards.lock`, written to a temp file and renamed (the
@@ -27,9 +28,11 @@ pub const VERSION: u32 = 1;
 /// actually bound (also when the request let the port be chosen).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
-    /// Canonical config root.
+    /// Canonical config root; with `machine`, the root on that machine as
+    /// sent (never canonicalized here).
     pub dir: PathBuf,
-    /// Instance state key; `None` for a service-only forward.
+    /// Instance state key; `None` for a service-only forward. With
+    /// `machine`, the instance's name there (its `tunnel` resolves it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instance: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -39,6 +42,10 @@ pub struct Entry {
     pub address: Option<IpAddr>,
     pub container_port: u16,
     pub host_port: u16,
+    /// The registered machine the forward reaches into (an ssh per bridge);
+    /// `None` for this host's instances and services.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
 }
 
 impl Entry {
@@ -152,6 +159,7 @@ mod tests {
             address: None,
             container_port: 3000,
             host_port,
+            machine: None,
         }
     }
 
@@ -174,9 +182,12 @@ mod tests {
                 container_port: 5432,
                 ..entry(None, 15432)
             },
+            Entry { machine: Some("box".into()), ..entry(Some("web"), 3001) },
         ];
         let text = serialize(&entries).unwrap();
         assert!(text.starts_with("version = 1\n"), "{text}");
+        // Additive: only the remote entry has the key.
+        assert_eq!(text.matches("machine = \"box\"").count(), 1, "{text}");
         assert_eq!(parse(&text).unwrap(), entries);
         assert_eq!(parse("version = 1\n").unwrap(), vec![]);
         assert!(parse("version = 2\n").is_err());

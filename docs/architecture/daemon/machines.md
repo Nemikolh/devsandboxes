@@ -92,7 +92,7 @@ the clients that want it are. On the machine it's a client like any other.
 ## Forwarded requests
 
 A request carrying `machine` (not registered: `not-found`) has it stripped
-and goes to that machine:
+and goes to that machine, but for the ones served here:
 
 - **Quick calls** (`forward::QUICK`: `instances.list|cancel|procs|signal|
   rename|done|buildLog|resolve`, `containers.logs|inspect`,
@@ -112,6 +112,10 @@ and goes to that machine:
   `FANOUT_WAIT` (5 s). Remote matches come back qualified (`box/web-2`)
   with an additive `found: [{name, machine, root}]`; a machine that doesn't
   answer adds nothing, and an empty result names the unreachable ones.
+- **Served here** (`forward::HERE`: `forwards.add`): `machine` names where
+  the forward reaches, not where it runs. The daemon keeps the param and
+  answers itself, binding the forward on this host with one ssh per bridge
+  ([forwards.md](forwards.md#ad-hoc-forwards-and-forwardstoml)).
 
 ## Federated snapshots
 

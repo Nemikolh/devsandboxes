@@ -62,9 +62,11 @@ pub struct HostPaths<'a> {
 /// (`forwards::Handle` in production), so the handlers are tested with a
 /// fake. Params are validated before these are called.
 pub trait Forwarding {
-    /// Every forward, or those of config root `dir` (absolute).
-    fn list(&self, dir: Option<PathBuf>) -> Result<Vec<ForwardRow>, ApiError>;
-    /// Start an ad-hoc forward: `not-found` (instance, dir), `bind-failed`.
+    /// This host's forwards, or those of config root `dir` (absolute); with
+    /// `machines`, every forward into a machine as well, whatever `dir`.
+    fn list(&self, dir: Option<PathBuf>, machines: bool) -> Result<Vec<ForwardRow>, ApiError>;
+    /// Start an ad-hoc forward: `not-found` (instance, dir, machine),
+    /// `bind-failed`.
     fn add(&self, req: AddRequest) -> Result<Added, ApiError>;
     /// Stop forward `id`: `not-found`.
     fn rm(&self, id: u64) -> Result<Removed, ApiError>;
@@ -1042,6 +1044,9 @@ fn absolute_dir(dir: &Path) -> Result<(), ApiError> {
 struct ForwardsListParams {
     #[serde(default)]
     dir: Option<PathBuf>,
+    /// Also the forwards into machines.
+    #[serde(default)]
+    machines: bool,
 }
 
 fn forwards_list(p: ForwardsListParams, ctx: &Ctx) -> Answer {
@@ -1049,7 +1054,7 @@ fn forwards_list(p: ForwardsListParams, ctx: &Ctx) -> Answer {
     if let Some(dir) = &p.dir {
         absolute_dir(dir)?;
     }
-    serde_json::to_value(forwards.list(p.dir)?).map_err(|e| ApiError::internal(e.into()))
+    serde_json::to_value(forwards.list(p.dir, p.machines)?).map_err(|e| ApiError::internal(e.into()))
 }
 
 #[derive(Deserialize)]
@@ -1062,10 +1067,13 @@ struct ForwardsAddParams {
     #[serde(default)]
     address: Option<String>,
     spec: String,
+    /// A machine's instance or service: the forward still binds here.
+    #[serde(default)]
+    machine: Option<String>,
 }
 
 /// `forwards.add`'s params, checked: everything that needs no state or
-/// socket. Empty `instance` / `service` count as absent.
+/// socket. Empty `instance` / `service` / `machine` count as absent.
 fn add_request(p: ForwardsAddParams) -> Result<AddRequest, ApiError> {
     absolute_dir(&p.dir)?;
     let instance = p.instance.filter(|s| !s.is_empty());
@@ -1078,7 +1086,8 @@ fn add_request(p: ForwardsAddParams) -> Result<AddRequest, ApiError> {
         Some(a) => a.parse().map_err(|_| ApiError::invalid(format!("bad address `{a}`")))?,
         None => std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
     };
-    Ok(AddRequest { dir: p.dir, instance, service, bind, host_port, container_port })
+    let machine = p.machine.filter(|s| !s.is_empty());
+    Ok(AddRequest { dir: p.dir, instance, service, bind, host_port, container_port, machine })
 }
 
 fn forwards_add(p: ForwardsAddParams, ctx: &Ctx) -> Answer {
@@ -2166,12 +2175,12 @@ mod tests {
     #[derive(Default)]
     struct FakeForwards {
         adds: std::cell::RefCell<Vec<AddRequest>>,
-        lists: std::cell::RefCell<Vec<Option<PathBuf>>>,
+        lists: std::cell::RefCell<Vec<(Option<PathBuf>, bool)>>,
     }
 
     impl Forwarding for FakeForwards {
-        fn list(&self, dir: Option<PathBuf>) -> Result<Vec<ForwardRow>, ApiError> {
-            self.lists.borrow_mut().push(dir);
+        fn list(&self, dir: Option<PathBuf>, machines: bool) -> Result<Vec<ForwardRow>, ApiError> {
+            self.lists.borrow_mut().push((dir, machines));
             Ok(vec![ForwardRow {
                 id: 1,
                 dir: "/cfg".into(),
@@ -2181,6 +2190,7 @@ mod tests {
                 state: "active".into(),
                 conns: 0,
                 configured: true,
+                machine: None,
             }])
         }
         fn add(&self, req: AddRequest) -> Result<Added, ApiError> {
@@ -2209,13 +2219,16 @@ mod tests {
         assert_eq!(rows[0]["id"], 1);
         assert_eq!(rows[0]["configured"], true);
         fwd("forwards.list", Value::Null).unwrap();
-        assert_eq!(*fake.lists.borrow(), [Some(PathBuf::from("/cfg")), None]);
+        fwd("forwards.list", json!({"machines": true})).unwrap();
+        assert_eq!(*fake.lists.borrow(), [(Some(PathBuf::from("/cfg")), false), (None, false), (None, true)]);
+        assert_eq!(code(fwd("forwards.list", json!({"machines": "yes"}))), "invalid");
         assert_eq!(code(fwd("forwards.list", json!({"dir": "rel"}))), "invalid");
 
         let added = fwd("forwards.add", json!({"dir": "/cfg", "instance": "web", "spec": "8080:3000"})).unwrap();
         assert_eq!(added, json!({"id": 2, "local": "127.0.0.1:3001", "target": "web:3000"}));
-        fwd("forwards.add", json!({"dir": "/cfg", "instance": "", "service": "db", "address": "0.0.0.0", "spec": "5432"}))
+        fwd("forwards.add", json!({"dir": "/cfg", "instance": "", "service": "db", "address": "0.0.0.0", "spec": "5432", "machine": ""}))
             .unwrap();
+        fwd("forwards.add", json!({"dir": "/far/cfg", "instance": "web", "spec": "3000", "machine": "box"})).unwrap();
         let adds = fake.adds.borrow().clone();
         assert_eq!(
             adds,
@@ -2227,6 +2240,7 @@ mod tests {
                     bind: "127.0.0.1".parse().unwrap(),
                     host_port: HostPort::Fixed(8080),
                     container_port: 3000,
+                    machine: None,
                 },
                 AddRequest {
                     dir: "/cfg".into(),
@@ -2235,6 +2249,17 @@ mod tests {
                     bind: "0.0.0.0".parse().unwrap(),
                     host_port: HostPort::Prefer(5432),
                     container_port: 5432,
+                    machine: None,
+                },
+                // The machine's root and instance name, passed through as sent.
+                AddRequest {
+                    dir: "/far/cfg".into(),
+                    instance: Some("web".into()),
+                    service: None,
+                    bind: "127.0.0.1".parse().unwrap(),
+                    host_port: HostPort::Prefer(3000),
+                    container_port: 3000,
+                    machine: Some("box".into()),
                 },
             ]
         );
@@ -2246,10 +2271,11 @@ mod tests {
             json!({"dir": "/cfg", "instance": "web", "spec": "a:b"}),
             json!({"dir": "/cfg", "instance": "web", "spec": "3000", "address": "localhost"}),
             json!({"dir": "/cfg", "instance": "web"}),
+            json!({"dir": "rel", "instance": "web", "spec": "3000", "machine": "box"}),
         ] {
             assert_eq!(code(fwd("forwards.add", bad.clone())), "invalid", "{bad}");
         }
-        assert_eq!(fake.adds.borrow().len(), 2);
+        assert_eq!(fake.adds.borrow().len(), 3);
         assert_eq!(code(fwd("forwards.add", json!({"dir": "/cfg", "instance": "nope", "spec": "3000"}))), "not-found");
 
         assert_eq!(
@@ -2309,6 +2335,7 @@ mod tests {
             state: "active".into(),
             conns: 0,
             configured: false,
+            machine: Some("box".into()),
         };
         let added = Added { id: 1, local: "127.0.0.1:3000".into(), target: "web:3000".into() };
         let removed = ForwardRemoved { ok: true, local: "127.0.0.1:3000".into(), configured: false };

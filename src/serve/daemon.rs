@@ -237,6 +237,7 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
         }
     };
     let links = service::Machines::spawn(registry_path.clone(), dial.clone(), opts.machine_timing, hooks, log);
+    let forwards_machines = registry_path.clone();
     shared.machines = Some(machines::api::Ctx {
         registry: registry_path,
         dial,
@@ -257,7 +258,7 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
     let registry = if opts.host {
         let shared = Arc::clone(&shared);
         let store = super::forward_store::path()?;
-        Some(Registry::spawn(log, store, Box::new(move |event| shared.publish_forwards(event))))
+        Some(Registry::spawn(log, store, forwards_machines, Box::new(move |event| shared.publish_forwards(event))))
     } else {
         None
     };
@@ -914,6 +915,7 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
         Ok(Some(machine)) if fwd::is_quick(&req.method) => {
             return Some(forward(req.id, &req.method, req.params, &machine, shared));
         }
+        Ok(Some(_)) if fwd::is_here(&req.method) => {}
         Ok(Some(_)) => {
             return Some(Response::err(req.id, "invalid", format!("`{}` can't take a machine yet", req.method)));
         }
@@ -1738,7 +1740,12 @@ pub(crate) mod tests {
     #[test]
     fn active_forwards_are_holders() {
         let shared = Shared::new(v(1), scratch("fwd-hold").join("inbox.json"), scratch("fwd-hold").join("state.toml"), fake_join());
-        let registry = Registry::spawn(|_| {}, scratch("fwd-hold-store").join("forwards.toml"), Box::new(|_| {}));
+        let registry = Registry::spawn(
+            |_| {},
+            scratch("fwd-hold-store").join("forwards.toml"),
+            scratch("fwd-hold-store").join("machines.toml"),
+            Box::new(|_| {}),
+        );
         assert_eq!(shared.holders(None, Some(&registry)), Holders::default());
         let dir = scratch("fwd-hold-root");
         std::fs::create_dir_all(&dir).unwrap();
@@ -1749,16 +1756,17 @@ pub(crate) mod tests {
             bind: std::net::Ipv4Addr::LOCALHOST.into(),
             host_port: crate::devsbd::forward::HostPort::Prefer(0),
             container_port: 5432,
+            machine: None,
         };
         let h = registry.handle();
         let added = api::Forwarding::add(&h, req).unwrap();
         // A request behind the post-command poll: the count is current.
-        api::Forwarding::list(&h, None).unwrap();
+        api::Forwarding::list(&h, None, false).unwrap();
         let holders = shared.holders(None, Some(&registry));
         assert_eq!(holders, Holders { forwards: 1, ..Default::default() });
         assert!(holders.any());
         api::Forwarding::rm(&h, added.id).unwrap();
-        api::Forwarding::list(&h, None).unwrap();
+        api::Forwarding::list(&h, None, false).unwrap();
         assert!(!shared.holders(None, Some(&registry)).any());
         drop(registry);
         let _ = std::fs::remove_dir_all(&dir);

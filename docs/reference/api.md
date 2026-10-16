@@ -541,7 +541,9 @@ the daemon starts and stops itself for every config root recorded in
 that added them and keep the daemon alive (*Holders*).
 A daemon exit (idle or handoff) closes them all; the successor restarts the
 configured ones on their saved host ports (`state.toml`) and the ad-hoc ones
-on theirs (`<data-dir>/devsandbox/forwards.toml`, new ids). The
+on theirs (`<data-dir>/devsandbox/forwards.toml`, new ids). A forward into
+a machine's instance or service (`forwards.add` with `machine`) is bound
+here too, ad-hoc only: a machine's `forwardPorts` are never mirrored. The
 foreground `devsandbox port` command doesn't use the daemon, and its
 forwards aren't listed here.
 
@@ -550,18 +552,21 @@ forwards aren't listed here.
 | field | |
 |---|---|
 | `id` | daemon-wide id (u64), what `forwards.rm` takes; not reused within a daemon's life |
-| `dir` | the canonical config root |
+| `dir` | the canonical config root; with `machine`, the config root on that machine |
 | `local` | the bound host address, e.g. `127.0.0.1:3000` |
-| `target` | route label, e.g. `api:3000` or `db:5432 (via instance api)`; empty until the route first resolves |
+| `target` | route label, e.g. `api:3000` or `db:5432 (via instance api)`; empty until the route first resolves. A remote forward's is `<machine>/<label>` (`box/web:3000`), the request's own `<machine>/<instance or service>:<port>` until the machine first answers |
 | `process` | the listening process (`node (pid 412)`), or `null` |
 | `state` | `active`, `connecting`, or `error: <reason>` |
 | `conns` | open connections |
 | `configured` | from a sandbox's `forwardPorts`, not `forwards.add` |
+| `machine` | the machine whose instance or service it reaches; absent for this host's |
 
 ### `forwards.list`
 
-Params: `{"dir": "/abs/config-root"}`, optional. Result: the rows of that
-config root (canonicalized), or of every root without `dir`, by `id`.
+Params: `{"dir": "/abs/config-root", "machines": true}`, both optional.
+Result: this host's rows of that config root (canonicalized), or of every
+root without `dir`, plus with `machines` every forward into a machine
+(whatever `dir`), by `id`.
 
 Errors: `invalid` (relative `dir`).
 
@@ -575,6 +580,14 @@ but never prompting: a name that matches several instances is
 instead), or both; `address` defaults to `127.0.0.1`. `spec` `3000` binds
 host port 3000 or the next free one up; `8080:3000` exactly 8080.
 
+With `"machine": "<name>"` (a registered machine; empty is none) the
+forward reaches that machine's instance or service but still binds here:
+the daemon serves the call itself (*The `machine` param*). `dir` is then
+the config root on the machine (absolute, taken as is) and `instance` the
+name there (the client's `instances.resolve` answer); each bridge is an ssh
+running `devsandbox tunnel` on the machine, which resolves both
+([forwards.md](../architecture/daemon/forwards.md), *Remote bridges*).
+
 Result: `{"id": 4, "local": "127.0.0.1:3000", "target": "api:3000"}` once
 the listener is bound; the route resolves on (re)connect, so a missing
 container shows up later as the row's `state`. `target` this early is
@@ -585,8 +598,10 @@ port it bound (an automatic one too), so later daemons recreate it on that
 port (on a free one near it if it's taken by then) until `forwards.rm`.
 
 Errors: `invalid` (relative `dir`, neither `instance` nor `service`, a bad
-`spec` or `address`), `not-found` (no such directory or instance),
-`bind-failed` (`"port 8080: address in use"`).
+`spec` or `address`), `not-found` (no such directory or instance; with
+`machine`: ``no machine named `box` (devsandbox machine ls)``; a remote
+instance that doesn't resolve is the row's `state` instead), `bind-failed`
+(`"port 8080: address in use"`).
 
 ### `forwards.rm`
 
@@ -794,6 +809,9 @@ machine, each with 15 s to answer:
 `instances.done`, `instances.buildLog`, `containers.logs`,
 `containers.inspect`, `sandboxes.list`, `sandboxes.get`, `services.get`,
 and every verb (*Verbs on a machine*).
+
+`forwards.add` with `machine` isn't forwarded: the daemon serves it, binding
+the forward on this host (*Forwards*).
 
 Any other method with `machine` is `invalid` ("can't take a machine
 yet"), so a client never takes a local answer for a remote one. Errors

@@ -26,10 +26,17 @@
 //! their saved host ports, so they survive a handoff or restart. Stopping
 //! the thread leaves the file alone: dropping forwards on exit isn't removal.
 //!
+//! Forwards into a machine's instance or service ([`Remote`], `forwards.add`
+//! with `machine`) are ad-hoc only and live apart from the [`Root`]s (which
+//! load local config): bound here, each bridge an ssh running `devsandbox
+//! tunnel` on the machine (`tunnel::remote_opener`). They persist like local
+//! ones; a sync drops those of a machine gone from `machines.toml`.
+//!
 //! Each forward keeps its own self-healing bridge (`Forward::start`); riding
 //! the instance's daemon bridge mux instead is a later optimization.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -42,7 +49,8 @@ use serde::{Deserialize, Serialize};
 
 use super::api::ApiError;
 use super::forward_store::{self, Entry};
-use crate::commands::{port, services};
+use super::machines;
+use crate::commands::{port, services, tunnel};
 use crate::config::{Config, ForwardPort, ServiceScope};
 use crate::devsbd::forward::{local_opener, Forward, ForwardSpec, ForwardState, ForwardStatus, HostPort, PREFER_SPAN};
 use crate::state::State;
@@ -64,12 +72,14 @@ const RESTORE_PORT_WAIT: Duration = Duration::from_secs(1);
 pub struct ForwardRow {
     /// Daemon-wide id, what `forwards.rm` takes.
     pub id: u64,
-    /// Canonical config root.
+    /// Canonical config root; with `machine`, the root on that machine.
     pub dir: PathBuf,
     /// Host side, e.g. `"127.0.0.1:3000"`.
     pub local: String,
     /// Route label, e.g. `"api:3000"` or `"postgres:5432 (via instance api)"`;
-    /// empty until the first route resolve.
+    /// empty until the first route resolve. A remote forward's is
+    /// `<machine>/<label>`, best effort from the request until the far side
+    /// first answers.
     pub target: String,
     /// Listening process (`node (pid 412)`), when known.
     pub process: Option<String>,
@@ -79,19 +89,27 @@ pub struct ForwardRow {
     pub conns: usize,
     /// Started from a sandbox's `forwardPorts`, not by `forwards.add`.
     pub configured: bool,
+    /// The machine whose instance or service it reaches; absent for this
+    /// host's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
 }
 
 /// A validated `forwards.add` (the API handler parses and checks the params).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AddRequest {
-    /// Absolute config root; canonicalized by the registry.
+    /// Absolute config root; canonicalized by the registry. With `machine`,
+    /// the root on that machine, taken as is.
     pub dir: PathBuf,
     /// Instance name as the user typed it; `None` for a service-only forward.
+    /// With `machine`, its name there (resolved by the far `tunnel`).
     pub instance: Option<String>,
     pub service: Option<String>,
     pub bind: IpAddr,
     pub host_port: HostPort,
     pub container_port: u16,
+    /// A registered machine: the forward still binds here.
+    pub machine: Option<String>,
 }
 
 /// `forwards.add`'s answer.
@@ -123,8 +141,23 @@ pub enum Event {
 
 pub type OnEvent = Box<dyn Fn(Event) + Send>;
 
+/// Builds a remote forward's argv from its machine's registry entry, root,
+/// instance, service and port: [`batch_tunnel_argv`] outside tests.
+type TunnelArgvFn = fn(&machines::Entry, &Path, Option<&str>, Option<&str>, u16) -> anyhow::Result<Vec<OsString>>;
+
+/// `ssh::tunnel_argv` with `BatchMode`: the daemon has no TTY to prompt on.
+fn batch_tunnel_argv(
+    entry: &machines::Entry,
+    root: &Path,
+    instance: Option<&str>,
+    service: Option<&str>,
+    port: u16,
+) -> anyhow::Result<Vec<OsString>> {
+    machines::ssh::tunnel_argv(entry, true, root, instance, service, port)
+}
+
 enum Cmd {
-    List { dir: Option<PathBuf>, reply: Sender<Vec<ForwardRow>> },
+    List { dir: Option<PathBuf>, machines: bool, reply: Sender<Vec<ForwardRow>> },
     Add { req: AddRequest, reply: Sender<Result<Added, ApiError>> },
     Remove { id: u64, reply: Sender<Result<Removed, ApiError>> },
     /// The runtime's running containers, from the host poll.
@@ -150,15 +183,27 @@ pub struct Handle {
 impl Registry {
     /// Start the registry thread. `log` writes one `serve.log` line; `store`
     /// is the ad-hoc forwards' file ([`forward_store::path`] outside tests),
-    /// restored before any request is served; `on_event` gets every [`Event`]
-    /// (called on the registry thread: it must not block).
-    pub fn spawn(log: fn(&str), store: PathBuf, on_event: OnEvent) -> Registry {
+    /// restored before any request is served; `machines` is `machines.toml`,
+    /// read for remote forwards (each add, each bridge spawn, each sync);
+    /// `on_event` gets every [`Event`] (called on the registry thread: it must
+    /// not block).
+    pub fn spawn(log: fn(&str), store: PathBuf, machines: PathBuf, on_event: OnEvent) -> Registry {
+        Self::spawn_with(log, store, machines, batch_tunnel_argv, on_event)
+    }
+
+    fn spawn_with(
+        log: fn(&str),
+        store: PathBuf,
+        machines: PathBuf,
+        tunnel_argv: TunnelArgvFn,
+        on_event: OnEvent,
+    ) -> Registry {
         let (tx, rx) = mpsc::channel();
         let active = Arc::new(AtomicUsize::new(0));
         let thread = {
             let active = Arc::clone(&active);
             std::thread::Builder::new().name("serve-forwards".into()).spawn(move || {
-                let mut daemon = Daemon::new(log, store, on_event, active);
+                let mut daemon = Daemon::new(log, store, machines, tunnel_argv, on_event, active);
                 daemon.restore();
                 daemon.poll();
                 daemon.run(&rx);
@@ -172,7 +217,8 @@ impl Registry {
         Handle { tx: self.tx.clone() }
     }
 
-    /// Live forwards, ad-hoc and configured: the `forwards` holder count.
+    /// Live forwards, ad-hoc, configured and remote: the `forwards` holder
+    /// count.
     pub fn active(&self) -> usize {
         self.active.load(Ordering::Acquire)
     }
@@ -210,8 +256,8 @@ fn stopped() -> ApiError {
 }
 
 impl super::api::Forwarding for Handle {
-    fn list(&self, dir: Option<PathBuf>) -> Result<Vec<ForwardRow>, ApiError> {
-        self.ask(|reply| Cmd::List { dir, reply })
+    fn list(&self, dir: Option<PathBuf>, machines: bool) -> Result<Vec<ForwardRow>, ApiError> {
+        self.ask(|reply| Cmd::List { dir, machines, reply })
     }
 
     fn add(&self, req: AddRequest) -> Result<Added, ApiError> {
@@ -228,9 +274,14 @@ struct Daemon {
     log: fn(&str),
     /// `forwards.toml`.
     store: PathBuf,
+    /// `machines.toml`.
+    machines: PathBuf,
+    tunnel_argv: TunnelArgvFn,
     on_event: OnEvent,
     active: Arc<AtomicUsize>,
     roots: BTreeMap<PathBuf, Root>,
+    /// Forwards into machines, by id.
+    remote: BTreeMap<u64, Remote>,
     next_id: u64,
     /// Last rows seen, so an unchanged poll sends no [`Event::Changed`].
     last_rows: Vec<ForwardRow>,
@@ -239,13 +290,23 @@ struct Daemon {
 }
 
 impl Daemon {
-    fn new(log: fn(&str), store: PathBuf, on_event: OnEvent, active: Arc<AtomicUsize>) -> Self {
+    fn new(
+        log: fn(&str),
+        store: PathBuf,
+        machines: PathBuf,
+        tunnel_argv: TunnelArgvFn,
+        on_event: OnEvent,
+        active: Arc<AtomicUsize>,
+    ) -> Self {
         Self {
             log,
             store,
+            machines,
+            tunnel_argv,
             on_event,
             active,
             roots: BTreeMap::new(),
+            remote: BTreeMap::new(),
             next_id: 1,
             last_rows: Vec::new(),
             last_status: None,
@@ -255,8 +316,8 @@ impl Daemon {
     fn run(&mut self, rx: &Receiver<Cmd>) {
         loop {
             match rx.recv_timeout(POLL) {
-                Ok(Cmd::List { dir, reply }) => {
-                    let _ = reply.send(self.rows(dir.as_deref()));
+                Ok(Cmd::List { dir, machines, reply }) => {
+                    let _ = reply.send(self.rows(dir.as_deref(), machines));
                 }
                 Ok(Cmd::Add { req, reply }) => {
                     let _ = reply.send(self.add(req));
@@ -273,6 +334,7 @@ impl Daemon {
         // Every Forward drops here: listeners close, bridges die. The store
         // keeps them, for the successor.
         self.roots.clear();
+        self.remote.clear();
         self.active.store(0, Ordering::Release);
     }
 
@@ -281,9 +343,10 @@ impl Daemon {
         (self.on_event)(Event::Status(line));
     }
 
-    /// Rows of every root, or of `dir` (canonicalized; a dir that doesn't
-    /// resolve has none), by id.
-    fn rows(&self, dir: Option<&Path>) -> Vec<ForwardRow> {
+    /// Rows of every local root, or of `dir` (canonicalized; a dir that
+    /// doesn't resolve has none), plus with `machines` every remote forward
+    /// (whatever `dir`), by id.
+    fn rows(&self, dir: Option<&Path>, machines: bool) -> Vec<ForwardRow> {
         let dir = dir.map(|d| d.canonicalize().unwrap_or_else(|_| d.to_path_buf()));
         let mut rows: Vec<ForwardRow> = self
             .roots
@@ -291,6 +354,9 @@ impl Daemon {
             .filter(|r| dir.as_ref().is_none_or(|d| *d == r.dir))
             .flat_map(Root::rows)
             .collect();
+        if machines {
+            rows.extend(self.remote.iter().map(|(&id, r)| r.row(id)));
+        }
         rows.sort_by_key(|r| r.id);
         rows
     }
@@ -300,6 +366,9 @@ impl Daemon {
     }
 
     fn add(&mut self, req: AddRequest) -> Result<Added, ApiError> {
+        if let Some(machine) = req.machine.clone() {
+            return self.add_remote(machine, &req);
+        }
         let dir = req
             .dir
             .canonicalize()
@@ -312,8 +381,99 @@ impl Daemon {
         Ok(added)
     }
 
+    /// `forwards.add` into `machine`: it must be registered; the far side
+    /// resolves the rest, on the forward's own thread.
+    fn add_remote(&mut self, machine: String, req: &AddRequest) -> Result<Added, ApiError> {
+        let known = machines::load(&self.machines).map_err(ApiError::internal)?;
+        if !known.iter().any(|m| m.name == machine) {
+            return Err(ApiError::not_found(machines::no_machine(&machine).to_string()));
+        }
+        let entry = Entry {
+            dir: req.dir.clone(),
+            instance: req.instance.clone(),
+            service: req.service.clone(),
+            address: Entry::address_of(req.bind),
+            container_port: req.container_port,
+            host_port: 0,
+            machine: Some(machine),
+        };
+        let (id, entry) = self.start_remote(entry, req.host_port).map_err(|e| bind_failed(req.host_port, &e))?;
+        let forward = &self.remote[&id].forward;
+        let added = Added { id, local: forward.status().local_addr.to_string(), target: route_label_or(forward, req) };
+        self.persist(|entries| entries.push(entry));
+        Ok(added)
+    }
+
+    /// Bind `entry`'s remote forward (its `machine` set) on `host_port` and
+    /// register it. Returns its id and the entry with the bound host port.
+    fn start_remote(&mut self, mut entry: Entry, host_port: HostPort) -> std::io::Result<(u64, Entry)> {
+        let machine = entry.machine.clone().unwrap_or_default();
+        let registry = self.machines.clone();
+        let build = self.tunnel_argv;
+        let (name, root, instance, service, port) =
+            (machine.clone(), entry.dir.clone(), entry.instance.clone(), entry.service.clone(), entry.container_port);
+        // Re-read on every spawn: a changed target heals, a removed machine
+        // is the bridge's error until the next sync drops the forward.
+        let argv: tunnel::TunnelArgv = Box::new(move || {
+            let entry = machines::load(&registry)
+                .map_err(|e| format!("{e:#}"))?
+                .into_iter()
+                .find(|m| m.name == name)
+                .ok_or_else(|| machines::no_machine(&name).to_string())?;
+            build(&entry, &root, instance.as_deref(), service.as_deref(), port).map_err(|e| format!("{e:#}"))
+        });
+        let open = tunnel::remote_opener(machine, argv);
+        // No probe fallback: the far helper is the only listening-process lookup.
+        let probe = Box::new(|_: &str, _: u16| None);
+        let forward = Forward::start(ForwardSpec { bind: entry.bind(), host_port, open, probe })?;
+        entry.host_port = forward.status().local_addr.port();
+        let id = self.next_id;
+        self.next_id += 1;
+        self.remote.insert(id, Remote { forward, entry: entry.clone() });
+        Ok((id, entry))
+    }
+
+    /// The registered machines' names.
+    fn registered(&self) -> anyhow::Result<BTreeSet<String>> {
+        Ok(machines::load(&self.machines)?.into_iter().map(|m| m.name).collect())
+    }
+
+    /// Drop the remote forwards, and their store entries, of machines no
+    /// longer in `machines.toml` (`machine rm`). A registry that doesn't load
+    /// drops nothing; with no remote forwards it isn't read.
+    fn drop_unregistered(&mut self) {
+        if self.remote.is_empty() {
+            return;
+        }
+        let Ok(names) = self.registered() else { return };
+        let gone: Vec<u64> =
+            self.remote.iter().filter(|(_, r)| !names.contains(r.machine())).map(|(&id, _)| id).collect();
+        if gone.is_empty() {
+            return;
+        }
+        let mut entries = Vec::new();
+        for id in gone {
+            let Some(r) = self.remote.remove(&id) else { continue };
+            (self.log)(&format!(
+                "forwards: dropping {}: machine `{}` is no longer registered",
+                describe(&r.entry),
+                r.machine()
+            ));
+            entries.push(r.entry);
+        }
+        self.persist(|saved| {
+            for entry in &entries {
+                forward_store::remove(saved, entry);
+            }
+        });
+    }
+
     fn remove(&mut self, id: u64) -> Result<Removed, ApiError> {
-        let found = self.roots.values_mut().find_map(|root| root.remove(id));
+        let found = self.roots.values_mut().find_map(|root| root.remove(id)).or_else(|| {
+            let r = self.remote.remove(&id)?;
+            let local = r.forward.status().local_addr.to_string();
+            Some((Removed { local, configured: false }, Some(r.entry)))
+        });
         let Some((removed, entry)) = found else {
             return Err(ApiError::not_found(format!("no forward {id}")));
         };
@@ -334,9 +494,11 @@ impl Daemon {
 
     /// Recreate the saved ad-hoc forwards: each on its saved host port, else
     /// (taken now) on an automatic one near it, which the store then records.
-    /// Entries of instances gone from state are dropped from the store; a
-    /// stopped instance's forward is restored anyway (it heals when the
-    /// instance runs). Other failures are logged and the entry kept.
+    /// Entries of instances gone from state, and remote ones of machines no
+    /// longer registered, are dropped from the store; a stopped instance's
+    /// forward is restored anyway (it heals when the instance runs). Other
+    /// failures (a `machines.toml` that doesn't load included) are logged and
+    /// the entry kept.
     fn restore(&mut self) {
         let saved = match forward_store::load(&self.store) {
             Ok(saved) if saved.is_empty() => return,
@@ -359,7 +521,26 @@ impl Daemon {
             ));
             changes.push((entry, None));
         }
+        let registered = match keep.iter().any(|e| e.machine.is_some()).then(|| self.registered()) {
+            Some(Err(e)) => {
+                (self.log)(&format!("forwards: cannot restore remote forwards: {e:#}"));
+                None
+            }
+            Some(Ok(names)) => Some(names),
+            None => None,
+        };
         for entry in keep {
+            if let Some(machine) = &entry.machine {
+                let Some(names) = &registered else { continue };
+                if !names.contains(machine) {
+                    (self.log)(&format!(
+                        "forwards: dropping saved {}: machine `{machine}` is no longer registered",
+                        describe(&entry)
+                    ));
+                    changes.push((entry, None));
+                    continue;
+                }
+            }
             if let Some(now) = self.restore_one(&entry)
                 && now != entry
             {
@@ -385,30 +566,34 @@ impl Daemon {
     /// couldn't start (logged).
     fn restore_one(&mut self, entry: &Entry) -> Option<Entry> {
         let log = self.log;
-        let Ok(dir) = entry.dir.canonicalize() else {
-            log(&format!("forwards: cannot restore {}: no directory {}", describe(entry), entry.dir.display()));
-            return None;
+        // A machine's root is a path there: nothing to resolve here.
+        let dir = match &entry.machine {
+            Some(_) => entry.dir.clone(),
+            None => match entry.dir.canonicalize() {
+                Ok(dir) => dir,
+                Err(_) => {
+                    log(&format!("forwards: cannot restore {}: no directory {}", describe(entry), entry.dir.display()));
+                    return None;
+                }
+            },
         };
-        let mut next_id = self.next_id;
-        let root = self.root(&dir);
         // Retried briefly before falling back: right after a handoff, or while
         // some process's fork briefly holds the old listener, the saved port
         // frees within moments, and moving the forward would surprise.
         let deadline = std::time::Instant::now() + RESTORE_PORT_WAIT;
-        let mut first = root.start_adhoc(entry.clone(), HostPort::Fixed(entry.host_port), &mut next_id);
+        let mut first = self.start_saved(&dir, entry, HostPort::Fixed(entry.host_port));
         while matches!(&first, Err(e) if e.kind() == std::io::ErrorKind::AddrInUse)
             && std::time::Instant::now() < deadline
         {
             std::thread::sleep(Duration::from_millis(50));
-            first = root.start_adhoc(entry.clone(), HostPort::Fixed(entry.host_port), &mut next_id);
+            first = self.start_saved(&dir, entry, HostPort::Fixed(entry.host_port));
         }
         let started = match first {
-            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => root
-                .start_adhoc(entry.clone(), HostPort::Prefer(entry.host_port), &mut next_id)
-                .map(|(_, now)| (now, true)),
-            started => started.map(|(_, now)| (now, false)),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                self.start_saved(&dir, entry, HostPort::Prefer(entry.host_port)).map(|now| (now, true))
+            }
+            started => started.map(|now| (now, false)),
         };
-        self.next_id = next_id;
         match started {
             Ok((now, fell_back)) => {
                 if fell_back {
@@ -430,10 +615,24 @@ impl Daemon {
         }
     }
 
-    /// Reconcile configured forwards for every config root recorded in state
+    /// Start one saved forward (local in root `dir`, or remote) on
+    /// `host_port`; the entry as it now runs.
+    fn start_saved(&mut self, dir: &Path, entry: &Entry, host_port: HostPort) -> std::io::Result<Entry> {
+        if entry.machine.is_some() {
+            return self.start_remote(entry.clone(), host_port).map(|(_, now)| now);
+        }
+        let mut next_id = self.next_id;
+        let started = self.root(dir).start_adhoc(entry.clone(), host_port, &mut next_id);
+        self.next_id = next_id;
+        started.map(|(_, now)| now)
+    }
+
+    /// Drop the remote forwards of machines gone from `machines.toml`, then
+    /// reconcile configured forwards for every config root recorded in state
     /// (plus roots that only have ad-hoc forwards, whose configured ones then
     /// stop if their instances went away).
     fn sync(&mut self, running: &[String]) {
+        self.drop_unregistered();
         let Ok(state) = State::load() else { return };
         for dir in super::host::config_roots(&state) {
             self.root(&dir);
@@ -454,7 +653,7 @@ impl Daemon {
     /// then drain each forward's notes and send the newest as a deduped
     /// [`Event::Status`].
     fn poll(&mut self) {
-        let rows = self.rows(None);
+        let rows = self.rows(None, true);
         self.active.store(rows.len(), Ordering::Release);
         if rows != self.last_rows {
             self.last_rows = rows;
@@ -463,7 +662,8 @@ impl Daemon {
         // The newest note per forward, prefixed with the local port, is the one
         // worth showing; dedup so a retry loop doesn't repeat the same line.
         let mut newest: Option<String> = None;
-        for f in self.roots.values().flat_map(|r| r.live.values()) {
+        let local = self.roots.values().flat_map(|r| r.live.values());
+        for f in local.chain(self.remote.values().map(|r| &r.forward)) {
             let local_port = f.status().local_addr.port();
             for note in f.drain_notes() {
                 newest = Some(format!("{local_port}: {note}"));
@@ -508,6 +708,32 @@ enum Owner {
 struct Configured {
     owner: Owner,
     entry: String,
+}
+
+/// One forward into a machine's instance or service: ad-hoc only (a
+/// machine's `forwardPorts` are never mirrored here), bound here, its bridge
+/// an ssh running `devsandbox tunnel` there.
+struct Remote {
+    forward: Forward,
+    /// Its store entry (`machine` set): what `forwards.rm` removes.
+    entry: Entry,
+}
+
+impl Remote {
+    fn machine(&self) -> &str {
+        self.entry.machine.as_deref().unwrap_or_default()
+    }
+
+    fn row(&self, id: u64) -> ForwardRow {
+        let mut row = status_to_row(id, &self.entry.dir, &self.forward.status(), false);
+        if row.target.is_empty() {
+            let e = &self.entry;
+            row.target =
+                format!("{}/{}", self.machine(), target_label(e.service.as_deref(), e.instance.as_deref(), e.container_port));
+        }
+        row.machine = Some(self.machine().to_string());
+        row
+    }
 }
 
 /// One config root's forwards.
@@ -580,14 +806,9 @@ impl Root {
             address: Entry::address_of(req.bind),
             container_port: req.container_port,
             host_port: 0,
+            machine: None,
         };
-        let (id, entry) = self.start_adhoc(entry, req.host_port, next_id).map_err(|e| {
-            // Bind errors are the immediate, precise ones worth naming a port for.
-            let port = match req.host_port {
-                HostPort::Fixed(p) | HostPort::Prefer(p) => p,
-            };
-            ApiError::bind_failed(format!("port {port}: {}", bind_reason(&e)))
-        })?;
+        let (id, entry) = self.start_adhoc(entry, req.host_port, next_id).map_err(|e| bind_failed(req.host_port, &e))?;
         let forward = &self.live[&id];
         let local = forward.status().local_addr.to_string();
         let target = route_label_or(forward, req);
@@ -733,6 +954,7 @@ fn status_to_row(id: u64, dir: &Path, status: &ForwardStatus, configured: bool) 
         state: state_string(&status.state),
         conns: status.open_conns,
         configured,
+        machine: None,
     }
 }
 
@@ -871,6 +1093,15 @@ fn state_string(state: &ForwardState) -> String {
     }
 }
 
+/// `forwards.add`'s error for a failed bind: the immediate, precise one worth
+/// naming a port for.
+fn bind_failed(host_port: HostPort, e: &std::io::Error) -> ApiError {
+    let port = match host_port {
+        HostPort::Fixed(p) | HostPort::Prefer(p) => p,
+    };
+    ApiError::bind_failed(format!("port {port}: {}", bind_reason(e)))
+}
+
 /// A short reason for a bind failure. `AddrInUse` is the common one and worth its
 /// own phrasing (`address in use`); anything else falls back to the OS message.
 fn bind_reason(e: &std::io::Error) -> String {
@@ -882,34 +1113,47 @@ fn bind_reason(e: &std::io::Error) -> String {
 }
 
 /// Split saved entries into those to restore and those whose instance is
-/// gone from state (a service-only entry always stays). Pure over `state`.
+/// gone from state (a service-only entry always stays, a remote one too: its
+/// instance is in the machine's state, not this one's). Pure over `state`.
 fn restorable(entries: Vec<Entry>, state: &State) -> (Vec<Entry>, Vec<Entry>) {
-    entries.into_iter().partition(|e| e.instance.as_ref().is_none_or(|key| state.instances.contains_key(key)))
+    entries.into_iter().partition(|e| {
+        e.machine.is_some() || e.instance.as_ref().is_none_or(|key| state.instances.contains_key(key))
+    })
 }
 
-/// A saved forward for `serve.log`: `db:5432 on 127.0.0.1:15432`.
+/// A forward's best-effort `target:port` before its route resolves.
+fn target_label(service: Option<&str>, instance: Option<&str>, port: u16) -> String {
+    match (service, instance) {
+        (Some(svc), _) => format!("{svc}:{port}"),
+        (None, Some(instance)) => format!("{instance}:{port}"),
+        (None, None) => port.to_string(),
+    }
+}
+
+/// A saved forward for `serve.log`: `db:5432 on 127.0.0.1:15432`,
+/// `box/web:3000 on 127.0.0.1:3000`.
 fn describe(entry: &Entry) -> String {
-    let target = match (&entry.service, &entry.instance) {
-        (Some(svc), _) => format!("{svc}:{}", entry.container_port),
-        (None, Some(instance)) => format!("{instance}:{}", entry.container_port),
-        (None, None) => entry.container_port.to_string(),
+    let target = target_label(entry.service.as_deref(), entry.instance.as_deref(), entry.container_port);
+    let target = match &entry.machine {
+        Some(machine) => format!("{machine}/{target}"),
+        None => target,
     };
     format!("{target} on {}", std::net::SocketAddr::new(entry.bind(), entry.host_port))
 }
 
 /// The route label for `forwards.add`'s answer: the resolved label once the
 /// supervisor has published one, else a best-effort `target:port` from the
-/// request (the resolve runs on the forward's thread, so it's usually empty
-/// this early).
+/// request, `<machine>/target:port` for a remote one (the resolve runs on
+/// the forward's thread, so it's usually empty this early).
 fn route_label_or(forward: &Forward, req: &AddRequest) -> String {
     let label = forward.status().route_label;
     if !label.is_empty() {
         return label;
     }
-    match (&req.service, &req.instance) {
-        (Some(svc), _) => format!("{svc}:{}", req.container_port),
-        (None, Some(instance)) => format!("{instance}:{}", req.container_port),
-        (None, None) => req.container_port.to_string(),
+    let target = target_label(req.service.as_deref(), req.instance.as_deref(), req.container_port);
+    match &req.machine {
+        Some(machine) => format!("{machine}/{target}"),
+        None => target,
     }
 }
 
@@ -1127,11 +1371,23 @@ forwardPorts = ["redis:6379"]
         registry_at(&tmp(&format!("store-{n}")).join("forwards.toml"))
     }
 
+    /// `machines.toml` is the store's sibling; remote bridges run [`no_ssh`].
     fn registry_at(store: &Path) -> (Registry, Arc<Mutex<Vec<Event>>>) {
         let events = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&events);
-        let reg = Registry::spawn(quiet, store.to_path_buf(), Box::new(move |e| sink.lock().unwrap().push(e)));
+        let reg = Registry::spawn_with(
+            quiet,
+            store.to_path_buf(),
+            store.with_file_name("machines.toml"),
+            no_ssh,
+            Box::new(move |e| sink.lock().unwrap().push(e)),
+        );
         (reg, events)
+    }
+
+    /// A remote bridge that dies at once: no ssh to anything.
+    fn no_ssh(_: &machines::Entry, _: &Path, _: Option<&str>, _: Option<&str>, _: u16) -> anyhow::Result<Vec<OsString>> {
+        Ok(vec!["false".into()])
     }
 
     /// A fresh empty dir under the test tmp dir.
@@ -1150,6 +1406,7 @@ forwardPorts = ["redis:6379"]
             bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
             host_port: HostPort::Prefer(0),
             container_port: 5432,
+            machine: None,
         }
     }
 
@@ -1168,7 +1425,7 @@ forwardPorts = ["redis:6379"]
         assert_eq!(h.rm(42).unwrap_err().code, "not-found");
         drop(reg);
         // Stopped: requests fail instead of hanging.
-        assert_eq!(h.list(None).unwrap_err().code, "internal");
+        assert_eq!(h.list(None, false).unwrap_err().code, "internal");
     }
 
     /// A service-only forward on a root without a config binds (the route
@@ -1186,26 +1443,26 @@ forwardPorts = ["redis:6379"]
         let added = h.add(request(&dir, None, Some("db"))).unwrap();
         assert_eq!(added.target, "db:5432");
         assert!(added.local.starts_with("127.0.0.1:"), "{added:?}");
-        let rows = h.list(Some(dir.clone())).unwrap();
+        let rows = h.list(Some(dir.clone()), false).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!((rows[0].id, &rows[0].dir, rows[0].configured), (added.id, &canonical, false));
         // Ids only: the row's state moves on its own (the resolver fails here,
         // no config) between the two lists.
         let ids = |rows: &[ForwardRow]| rows.iter().map(|r| r.id).collect::<Vec<_>>();
-        assert_eq!(ids(&h.list(None).unwrap()), ids(&rows));
-        assert!(h.list(Some(PathBuf::from("/nonexistent/other"))).unwrap().is_empty());
+        assert_eq!(ids(&h.list(None, false).unwrap()), ids(&rows));
+        assert!(h.list(Some(PathBuf::from("/nonexistent/other")), false).unwrap().is_empty());
         // A second add gets the next daemon-wide id.
         let second = h.add(request(&dir, None, Some("db"))).unwrap();
         assert_eq!(second.id, added.id + 1);
         // The poll after each command counts them; a request behind it waits.
-        h.list(None).unwrap();
+        h.list(None, false).unwrap();
         assert_eq!(reg.active(), 2);
         assert!(events.lock().unwrap().contains(&Event::Changed));
 
         events.lock().unwrap().clear();
         assert_eq!(h.rm(added.id).unwrap(), Removed { local: added.local.clone(), configured: false });
         assert_eq!(h.rm(added.id).unwrap_err().code, "not-found");
-        assert_eq!(h.list(None).unwrap().len(), 1);
+        assert_eq!(h.list(None, false).unwrap().len(), 1);
         assert_eq!(reg.active(), 1);
         assert!(events.lock().unwrap().contains(&Event::Changed));
         drop(reg);
@@ -1222,7 +1479,7 @@ forwardPorts = ["redis:6379"]
         let req = AddRequest { host_port: HostPort::Fixed(port), ..request(&std::env::temp_dir(), None, Some("db")) };
         let e = reg.handle().add(req).unwrap_err();
         assert_eq!((e.code, e.message), ("bind-failed", format!("port {port}: address in use")));
-        assert!(reg.handle().list(None).unwrap().is_empty());
+        assert!(reg.handle().list(None, false).unwrap().is_empty());
         assert_eq!(reg.active(), 0);
     }
 
@@ -1236,6 +1493,7 @@ forwardPorts = ["redis:6379"]
             address: None,
             container_port: 5432,
             host_port,
+            machine: None,
         }
     }
 
@@ -1253,6 +1511,123 @@ forwardPorts = ["redis:6379"]
         assert_eq!(keep, vec![saved(dir, Some("api"), 1), saved(dir, None, 3)]);
         assert_eq!(dropped, vec![saved(dir, Some("gone"), 2)]);
         assert_eq!(describe(&saved(dir, None, 3)), "db:5432 on 127.0.0.1:3");
+        // A machine's instance isn't in this host's state.
+        let far = Entry { machine: Some("box".into()), service: None, ..saved(dir, Some("gone"), 4) };
+        assert_eq!(restorable(vec![far.clone()], &state), (vec![far.clone()], vec![]));
+        assert_eq!(describe(&far), "box/gone:5432 on 127.0.0.1:4");
+    }
+
+    // ---- remote forwards (machines.toml) ----
+
+    const MACHINES: &str = "[machine.box]\ntarget = \"me@box.invalid\"\nroots = [\"/far/cfg\"]\n";
+
+    /// A forward into `box`'s `web` (a root that doesn't exist here: it's
+    /// never resolved locally).
+    fn remote_request() -> AddRequest {
+        AddRequest { machine: Some("box".into()), ..request(Path::new("/far/cfg"), Some("web"), None) }
+    }
+
+    fn remote_saved(host_port: u16) -> Entry {
+        Entry { machine: Some("box".into()), service: None, ..saved(Path::new("/far/cfg"), Some("web"), host_port) }
+    }
+
+    #[test]
+    fn a_remote_add_needs_a_registered_machine() {
+        let store = tmp("remote-unknown").join("forwards.toml");
+        let (reg, _) = registry_at(&store);
+        let e = reg.handle().add(remote_request()).unwrap_err();
+        assert_eq!((e.code, e.message.as_str()), ("not-found", "no machine named `box` (devsandbox machine ls)"));
+        assert!(reg.handle().list(None, true).unwrap().is_empty());
+        assert_eq!(forward_store::load(&store).unwrap(), vec![]);
+    }
+
+    /// A remote forward binds here, lists only with `machines` (whatever
+    /// `dir`), counts as a holder, persists with its machine, comes back on
+    /// its port in a successor, and goes away on `rm`.
+    #[test]
+    fn remote_forwards_list_persist_restore_and_rm() {
+        let store = tmp("remote").join("forwards.toml");
+        std::fs::write(store.with_file_name("machines.toml"), MACHINES).unwrap();
+        let (reg, _) = registry_at(&store);
+        let h = reg.handle();
+        let added = h.add(remote_request()).unwrap();
+        // The bridge never answers (no header): the best effort stays.
+        assert_eq!(added.target, "box/web:5432");
+        assert!(h.list(None, false).unwrap().is_empty(), "local only by default");
+        let rows = h.list(Some(std::env::temp_dir()), true).unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let row = &rows[0];
+        assert_eq!(
+            (row.id, row.dir.as_path(), row.local.as_str(), row.target.as_str(), row.machine.as_deref(), row.configured),
+            (added.id, Path::new("/far/cfg"), added.local.as_str(), "box/web:5432", Some("box"), false)
+        );
+        assert_eq!(reg.active(), 1);
+        let port = port_of(&added.local);
+        assert_eq!(forward_store::load(&store).unwrap(), vec![remote_saved(port)]);
+        drop(reg);
+
+        let (successor, _) = registry_at(&store);
+        let h = successor.handle();
+        let rows = h.list(None, true).unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!((rows[0].local.as_str(), rows[0].machine.as_deref()), (added.local.as_str(), Some("box")));
+        assert_eq!(forward_store::load(&store).unwrap(), vec![remote_saved(port)], "restored as saved");
+        assert_eq!(h.rm(rows[0].id).unwrap(), Removed { local: added.local.clone(), configured: false });
+        assert!(h.list(None, true).unwrap().is_empty());
+        assert_eq!(successor.active(), 0);
+        assert_eq!(forward_store::load(&store).unwrap(), vec![]);
+    }
+
+    /// A saved remote forward of a machine no longer registered isn't
+    /// restored and leaves the store.
+    #[test]
+    fn restore_drops_forwards_of_unregistered_machines() {
+        let store = tmp("remote-restore").join("forwards.toml");
+        forward_store::update(&store, |e| e.push(remote_saved(1))).unwrap();
+        let (reg, _) = registry_at(&store);
+        assert!(reg.handle().list(None, true).unwrap().is_empty());
+        assert_eq!(forward_store::load(&store).unwrap(), vec![]);
+    }
+
+    /// `machine rm`: what each sync runs first drops the machine's forwards
+    /// and their store entries, and only theirs. Called on a [`Daemon`]
+    /// directly: a whole sync also reconciles this host's real state.
+    #[test]
+    fn a_removed_machines_forwards_are_dropped() {
+        let store = tmp("remote-drop").join("forwards.toml");
+        let machines_toml = store.with_file_name("machines.toml");
+        let two = format!("{MACHINES}[machine.other]\ntarget = \"other.invalid\"\n");
+        std::fs::write(&machines_toml, &two).unwrap();
+        let changed = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&changed);
+        let on_event: OnEvent = Box::new(move |e| {
+            if e == Event::Changed {
+                seen.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        let mut d = Daemon::new(quiet, store.clone(), machines_toml.clone(), no_ssh, on_event, Arc::default());
+        let a = d.add(remote_request()).unwrap();
+        let b = d.add(AddRequest { machine: Some("other".into()), ..remote_request() }).unwrap();
+        d.poll();
+        assert_eq!(d.rows(None, true).len(), 2);
+
+        d.drop_unregistered();
+        assert_eq!(d.rows(None, true).len(), 2, "both still registered");
+        std::fs::write(&machines_toml, two.replace(MACHINES, "")).unwrap();
+        let before = changed.load(Ordering::Relaxed);
+        d.drop_unregistered();
+        d.poll();
+        let rows = d.rows(None, true);
+        assert_eq!(rows.iter().map(|r| r.id).collect::<Vec<_>>(), [b.id]);
+        assert_ne!(rows[0].id, a.id);
+        assert_eq!(changed.load(Ordering::Relaxed), before + 1);
+        let left = forward_store::load(&store).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].machine.as_deref(), Some("other"));
+        // A registry that doesn't load drops nothing.
+        std::fs::write(&machines_toml, "not toml [").unwrap();
+        d.drop_unregistered();
+        assert_eq!(d.rows(None, true).len(), 1);
     }
 
     /// An add saves the bound port (an automatic one here), an rm removes only
@@ -1279,7 +1654,7 @@ forwardPorts = ["redis:6379"]
         assert_eq!(std::fs::read_to_string(&store).unwrap(), text, "stopping is not a removal");
 
         let (successor, _) = registry_at(&store);
-        let rows = successor.handle().list(None).unwrap();
+        let rows = successor.handle().list(None, false).unwrap();
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!((rows[0].local.as_str(), &rows[0].dir, rows[0].configured), (b.local.as_str(), &canonical, false));
         assert_eq!(std::fs::read_to_string(&store).unwrap(), text, "restored as saved: no rewrite");
@@ -1303,7 +1678,7 @@ forwardPorts = ["redis:6379"]
         forward_store::update(&store, |e| e.extend([saved(&root, None, port), ghost])).unwrap();
 
         let (reg, _) = registry_at(&store);
-        let rows = reg.handle().list(None).unwrap();
+        let rows = reg.handle().list(None, false).unwrap();
         assert_eq!(rows.len(), 1, "{rows:?}");
         let now = port_of(&rows[0].local);
         assert_ne!(now, port);

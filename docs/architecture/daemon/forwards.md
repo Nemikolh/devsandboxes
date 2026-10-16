@@ -83,7 +83,10 @@ mux over one ssh per bridge. `commands::tunnel::remote_opener(machine,
 argv)` spawns `argv()`, rebuilt on every spawn (an `ssh::tunnel_argv`, so a
 changed registry entry heals at the next respawn), which runs the hidden
 `devsandbox -C <root> tunnel [--instance=<name>] [--service=<svc>] --port
-<n>` on the machine.
+<n>` on the machine. The ssh gets `SSH_AUTH_SOCK` from
+`bridge::host_agent()` when there is one (`open_remote`): the daemon's own
+inherited one may be long stale, and a CLI's `host_agent()` falls back to
+its own `$SSH_AUTH_SOCK`.
 
 The far side resolves everything on its own host: `tunnel` resolves the
 name (`resolve_instance_noninteractive`) and runs `port::resolver` there
@@ -133,7 +136,9 @@ dashboard. It blocks on a command channel with a `POLL` (500 ms) timeout:
 `REPLY_TIMEOUT`, 10 s), the host poll's running containers, and the
 periodic status poll. All config/state work and binding happens on this
 thread, never a connection's. Forwards are grouped per canonical config
-root (`Root`); ids are daemon-wide. Changes go out as `forwards.changed`,
+root (`Root`), forwards into machines kept apart (`Remote`, by id: no local
+config behind them); ids are daemon-wide. `forwards.list` shows the remote
+ones only with `machines`. Changes go out as `forwards.changed`,
 status lines as `forwards.status` and to `serve.log`. Every live forward is
 an idle holder ([role.md](role.md#holders-and-idle-exit)). Dropping the
 registry closes every listener and kills every bridge.
@@ -150,6 +155,21 @@ start the registry restores each entry first thing: on its saved port
 when it runs. Writes are read-modify-writes under an exclusive lock on
 `forwards.lock`, temp file + rename, since two daemons overlap during a
 handoff.
+
+`forwards.add` with `machine` (`Daemon::add_remote`) checks the machine is
+in `machines.toml` (the path `Registry::spawn` gets), then binds a
+`Forward` whose opener is `tunnel::remote_opener` over
+`ssh::tunnel_argv` with `BatchMode` (no TTY to prompt on); the argv closure
+re-reads `machines.toml` on every spawn, so a changed target heals and a
+removed machine is the bridge's error. No probe fallback. Its entry carries
+`machine`, `dir` the root there as sent (never canonicalized here) and
+`instance` the name there. `restorable` keeps such entries without the
+local state check; restore drops the ones of machines no longer registered
+(logged) and starts the rest on their saved ports like local ones. Each
+sync (host poll) first runs `drop_unregistered`: after `devsandbox machine
+rm`, that machine's forwards stop and leave the store (logged; the rows'
+change goes out as `forwards.changed`). `serve.log` names them
+`box/web:3000 on 127.0.0.1:3000` (`describe`).
 
 ### Configured forwards (`forwardPorts`)
 

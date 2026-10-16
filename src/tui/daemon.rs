@@ -1045,7 +1045,7 @@ mod tests {
         use crate::serve::forwards::{AddRequest, Removed};
         struct Fake;
         impl Forwarding for Fake {
-            fn list(&self, dir: Option<PathBuf>) -> Result<Vec<ForwardRow>, ApiError> {
+            fn list(&self, dir: Option<PathBuf>, _machines: bool) -> Result<Vec<ForwardRow>, ApiError> {
                 assert_eq!(dir.as_deref(), Some(Path::new("/cfg")));
                 Ok(vec![ForwardRow {
                     id: 3,
@@ -1056,6 +1056,7 @@ mod tests {
                     state: "active".into(),
                     conns: 2,
                     configured: true,
+                    machine: None,
                 }])
             }
             fn add(&self, req: AddRequest) -> Result<Added, ApiError> {

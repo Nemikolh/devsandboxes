@@ -649,11 +649,11 @@ export type NotifyTarget = { thread: number } | { all: true };
 export interface ForwardRow {
   /** Daemon-wide id: what `forwards.rm()` takes. */
   id: number;
-  /** The canonical config root. */
+  /** The canonical config root; with `machine`, the root on that machine. */
   dir: string;
   /** The bound host address, e.g. `127.0.0.1:3000`. */
   local: string;
-  /** Route label, e.g. `api:3000`; empty until the route first resolves. */
+  /** Route label, e.g. `api:3000`; empty until the route first resolves. A remote forward's is `<machine>/<label>`, best effort until the machine first answers. */
   target: string;
   /** The listening process (`node (pid 412)`). */
   process: string | null;
@@ -663,11 +663,13 @@ export interface ForwardRow {
   conns: number;
   /** From a sandbox's `forwardPorts`, not `forwards.add()`. */
   configured: boolean;
+  /** The machine whose instance or service it reaches (`forwards.add()` with `machine`); absent for this host's. */
+  machine?: string;
 }
 
 /** `forwards.add()` params; `instance`, `service`, or both. */
 export interface ForwardAddParams {
-  /** Config root (the CLI's `-C`); resolved against `process.cwd()`. */
+  /** Config root (the CLI's `-C`); resolved against `process.cwd()`. With `machine`, the absolute root on that machine. */
   dir: string;
   /** Instance name, as the CLI takes it (never prompts). */
   instance?: string;
@@ -677,6 +679,8 @@ export interface ForwardAddParams {
   address?: string;
   /** `port` (that host port or the next free one up) or `host:port` (exactly). */
   spec: string;
+  /** A registered machine's instance or service (then `dir` is its config root there and `instance` its name there); the forward still binds on this host. */
+  machine?: string;
 }
 
 /** A forward `forwards.add()` bound. */
@@ -1112,7 +1116,7 @@ export interface ApiMethods {
   /** `not-found` for an unknown sandbox; one that doesn't merge answers why in `resolved`. */
   'sandboxes.get': { params: { root: string; name: string; machine?: string }; result: SandboxConfig };
   'services.get': { params: { root: string; name: string; machine?: string }; result: ServiceConfig };
-  'forwards.list': { params: { dir?: string }; result: ForwardRow[] };
+  'forwards.list': { params: { dir?: string; machines?: boolean }; result: ForwardRow[] };
   'forwards.add': { params: ForwardAddParams; result: ForwardAdded };
   'forwards.rm': { params: { id: number }; result: ForwardRemoved };
   /** Verbs hold the connection until they exit (or a `detach` answer); hanging up cancels. */

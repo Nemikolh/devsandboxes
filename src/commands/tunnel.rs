@@ -214,7 +214,14 @@ pub fn remote_opener(machine: String, argv: TunnelArgv) -> Opener {
 
 fn open_remote(machine: &str, argv: &[OsString], stop: &AtomicBool) -> Result<(Opened, Bridge), String> {
     let (program, args) = argv.split_first().ok_or("empty tunnel argv")?;
-    let mut child = Command::new(program)
+    let mut cmd = Command::new(program);
+    // The preferred live agent, as the daemon's machine links get it (its own
+    // inherited `$SSH_AUTH_SOCK` may be long stale); a CLI's falls back to
+    // its own `$SSH_AUTH_SOCK`, so there it changes nothing.
+    if let Some(agent) = bridge::host_agent() {
+        cmd.env("SSH_AUTH_SOCK", agent);
+    }
+    let mut child = cmd
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
