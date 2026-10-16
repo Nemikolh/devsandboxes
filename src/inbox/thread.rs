@@ -1,5 +1,5 @@
 //! The `devsbd thread put` body: the schema the host checks, and nothing the
-//! helper knows about (docs/inbox-threads.md, *Decisions*: the helper only
+//! helper knows about (docs/decisions/0022-helper-has-no-dependencies.md: the helper only
 //! checks JSON syntax, so everything here runs on the host).
 //!
 //! The body comes from inside a container and ends up driving dashboard
@@ -100,7 +100,7 @@ impl Action {
     }
 }
 
-/// The fixed host-action table (docs/inbox-threads.md, *Actions*). Externally
+/// The fixed host-action table (docs/architecture/inbox/threads-and-feed.md, *`thread put`*). Externally
 /// tagged, so the body is exactly one verb object — two keys don't deserialize.
 /// There is no arbitrary host command, ever.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -314,7 +314,7 @@ fn check_workspace_path(path: &str) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    /// The plan's example body (docs/inbox-threads.md, *Threads*).
+    /// The plan's example body (docs/architecture/inbox/threads-and-feed.md, *`thread put`*).
     const EXAMPLE: &str = r##"{
       "key": "pr-6900",
       "title": "#6900 feat/agent-run-cost-event",

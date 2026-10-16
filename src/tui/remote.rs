@@ -1,4 +1,4 @@
-//! Machines in the dashboard (docs/machines.md, step 6): the tree merges
+//! Machines in the dashboard (docs/architecture/daemon/machines.md, *Dashboard*): the tree merges
 //! every registered machine's rows (`instances.watch {machines: true}`), so
 //! an instance is (machine, name), not a name.
 //!

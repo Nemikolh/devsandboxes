@@ -1,6 +1,6 @@
 //! Markdown for the Inbox: dispatcher text is often LLM output, so the
 //! thread pane renders it instead of showing `**`, backticks and `#` raw
-//! (docs/inbox-threads.md, *Markdown in threads*). Pure: text and a width in,
+//! (docs/architecture/dashboard/inbox-tab.md, *Thread pane*). Pure: text and a width in,
 //! styled [`Line`]s out, so every rule is unit-testable.
 //!
 //! Two modes. [`render`] (a thread's `message`, a notify body) renders
@@ -19,7 +19,7 @@
 //!
 //! The `*_rows` variants also say, per row, how it continues the logical
 //! line before it ([`RowMeta`]), so a mouse selection copies a wrapped
-//! paragraph back as one line (docs/tui-selection.md, step 2); the plain
+//! paragraph back as one line (docs/architecture/dashboard/selection.md, *Regions*); the plain
 //! ones drop that.
 
 use pulldown_cmark::{Alignment, Event, Options, Parser, Tag, TagEnd};

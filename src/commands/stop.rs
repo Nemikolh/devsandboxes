@@ -9,9 +9,10 @@ use crate::state::State;
 /// restarts a stopped instance); networks and global services are left alone.
 /// `--all` stops every running instance in state. Forgiving by design
 /// (idempotent): an already-stopped or missing container is not an error.
-/// One a live `run`/`rebuild` is materializing (docs/instance-phase.md) is
-/// refused (skipped by `--all`): stopping its container would only fail the
-/// step in progress; Ctrl-C on that command cancels it properly.
+/// One a live `run`/`rebuild` is materializing
+/// (docs/architecture/instances/lifecycle.md) is refused (skipped by
+/// `--all`): stopping its container would only fail the step in progress;
+/// Ctrl-C on that command cancels it properly.
 pub fn stop(name: Option<String>, all: bool) -> Result<()> {
     let state = State::load()?;
     if all {

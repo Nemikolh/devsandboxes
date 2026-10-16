@@ -7,5 +7,5 @@ license = "MIT"
 publish = false
 
 # No dependencies: size is the product, and no C deps keeps the rust-lld
-# cross-build working (see docs/sandbox-helper.md).
+# cross-build working (see docs/architecture/helper/overview.md).
 [dependencies]

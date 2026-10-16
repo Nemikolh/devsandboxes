@@ -13,8 +13,9 @@ use crate::state::{Instance, State};
 /// and refresh how the container resolves them, then run `postStartCommand`.
 /// Otherwise (orphan, or another config root) its containers are simply
 /// started. `--all` starts every instance whose container exists and is
-/// stopped. One still being materialized or failed (docs/instance-phase.md)
-/// is refused, and skipped with a note by `--all`.
+/// stopped. One still being materialized or failed
+/// (docs/architecture/instances/lifecycle.md) is refused, and skipped with a
+/// note by `--all`.
 pub fn start(dir: &Path, name: Option<String>, all: bool) -> Result<()> {
     let state = State::load()?;
     if all {
@@ -57,7 +58,8 @@ pub(crate) fn start_instance(dir: &Path, key: &str, info: &Instance) -> Result<(
 /// [`start_instance`]'s work, inside the build log.
 fn start_logged(dir: &Path, key: &str, info: &Instance) -> Result<()> {
     // Re-point the agent symlink before either start path so a restart after
-    // host agent rotation re-captures the live socket (docs/ssh-agent.md).
+    // host agent rotation re-captures the live socket
+    // (docs/architecture/helper/ssh-agent.md).
     run::ssh_agent_refresh(info);
     // Instances from before worktree locking get locked on their next start.
     run::lock_instance_worktrees(info);

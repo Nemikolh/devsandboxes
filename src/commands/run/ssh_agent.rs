@@ -1,5 +1,6 @@
 //! ssh-agent forwarding: the per-instance stable socket symlink the container
-//! mounts, and its refresh on start (see docs/ssh-agent.md).
+//! mounts, and its refresh on start (see
+//! docs/architecture/helper/ssh-agent.md).
 
 use std::path::{Path, PathBuf};
 
@@ -10,13 +11,13 @@ use crate::state::{Instance, State};
 
 /// Fixed container path the forwarded ssh-agent socket is mounted at, so Linux
 /// and macOS converge on one target regardless of the host source (see
-/// docs/ssh-agent.md).
+/// docs/architecture/helper/ssh-agent.md).
 pub(crate) const SSH_AGENT_TARGET: &str = "/run/devsandbox/ssh-agent.sock";
 
 /// Docker Desktop / OrbStack's synthesized agent socket. The Mac's launchd
 /// socket can't cross into the runtime VM, so these runtimes forward the host
 /// agent through this path instead; it exists only inside the VM, never on
-/// the host (docs/ssh-agent.md, _macOS + docker_).
+/// the host (docs/architecture/helper/ssh-agent.md, _What works where_).
 const MAGIC_SSH_AUTH_SOCK: &str = "/run/host-services/ssh-auth.sock";
 
 /// Whether the agent mount binds [`MAGIC_SSH_AUTH_SOCK`] rather than a
@@ -33,7 +34,7 @@ fn host_magic_socket() -> bool {
 
 /// `<data-dir>/agent`, the dir holding per-instance agent symlinks. `None` when
 /// the state path can't be resolved. One recipe so `run`, `rm`, and `gc` don't
-/// each re-derive it (docs/ssh-agent.md).
+/// each re-derive it (docs/architecture/helper/ssh-agent.md).
 pub(crate) fn ssh_agent_dir() -> Option<PathBuf> {
     Some(State::path().ok()?.parent()?.join("agent"))
 }
@@ -48,7 +49,7 @@ pub(crate) fn ssh_agent_link_path(instance_id: &str) -> Option<PathBuf> {
 /// Create or re-point `agent_dir/<instance_id>.sock` at the host agent
 /// socket. A symlink (not the raw path) because bind sources are
 /// re-resolved at every container start, so `start` can re-point it after
-/// the host agent rotates (docs/ssh-agent.md).
+/// the host agent rotates (docs/architecture/helper/ssh-agent.md).
 pub(crate) fn ssh_agent_link(agent_dir: &Path, instance_id: &str, sock: &Path) -> Result<PathBuf> {
     std::fs::create_dir_all(agent_dir)
         .with_context(|| format!("cannot create {}", agent_dir.display()))?;
@@ -70,7 +71,8 @@ fn symlink(src: &Path, dst: &Path) -> std::io::Result<()> {
 
 /// Never reached: `ssh_agent_forward`/`ssh_agent_refresh` bail out first on
 /// non-unix hosts, whose agent is a named pipe no runtime can bind
-/// (docs/ssh-agent.md, _Windows_). Exists only so the crate compiles.
+/// (docs/architecture/helper/ssh-agent.md, _What works where_). Exists only
+/// so the crate compiles.
 #[cfg(not(unix))]
 fn symlink(_src: &Path, _dst: &Path) -> std::io::Result<()> {
     Err(std::io::Error::new(
@@ -87,7 +89,7 @@ fn symlink(_src: &Path, _dst: &Path) -> std::io::Result<()> {
 /// socket instead, bound directly: it isn't on the host so the existence probe
 /// can't apply, and its path is stable so there's no link to re-point. On a
 /// link error, warn and skip: forwarding is best-effort and must not fail
-/// container creation (docs/ssh-agent.md).
+/// container creation (docs/architecture/helper/ssh-agent.md).
 pub(super) fn ssh_agent_forward(instance_id: &str) -> Result<Option<(String, String)>> {
     if !cfg!(unix) || !backend().supports_file_binds() {
         return Ok(None);
@@ -121,9 +123,10 @@ pub(super) fn ssh_agent_forward(instance_id: &str) -> Result<Option<(String, Str
 /// Re-point `info`'s agent symlink at the current host agent before its
 /// container starts, so a restart after agent rotation (reboot, re-login)
 /// re-captures the live socket — bind sources re-resolve at every container
-/// start (docs/ssh-agent.md). Gate mirrors `ssh_agent_forward`: forwarding was
-/// on for this instance, `$SSH_AUTH_SOCK` is set, and its socket exists. A
-/// no-op on macOS + docker, whose magic-socket mount has no link.
+/// start (docs/architecture/helper/ssh-agent.md). Gate mirrors
+/// `ssh_agent_forward`: forwarding was on for this instance, `$SSH_AUTH_SOCK`
+/// is set, and its socket exists. A no-op on macOS + docker, whose
+/// magic-socket mount has no link.
 /// Fully silent — every gate miss and error is a no-op (the link stays as-is
 /// and forwarding is degraded for this run only): callers include the TUI
 /// background thread that owns the alternate screen, where a stray warning

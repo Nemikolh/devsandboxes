@@ -1,8 +1,8 @@
 # Automations: user guide
 
-Sandboxes that come up on their own after a boot, tell you when they need you, and spawn their own child instances to do work. devsandbox provides the plumbing only; what to watch and when to act lives in a script you write. Design and internals: [`docs/automations.md`](automations.md), [`docs/inbox-redesign.md`](inbox-redesign.md) and [`docs/serve.md`](serve.md) (the host daemon).
+Sandboxes that come up on their own after a boot, tell you when they need you, and spawn their own child instances to do work. devsandbox provides the plumbing only; what to watch and when to act lives in a script you write. Design and internals: [`docs/architecture/automations/autostart.md`](architecture/automations/autostart.md), [`docs/architecture/automations/dispatchers.md`](architecture/automations/dispatchers.md), [`docs/architecture/inbox/model.md`](architecture/inbox/model.md) and [`docs/architecture/daemon/role.md`](architecture/daemon/role.md) (the host daemon).
 
-Everything here except `autostart = true` needs the embedded `devsbd` helper (release archives, npm package, local builds after `scripts/build-devsbd.sh`; not `cargo install`). Inside a sandbox it is on `PATH` as `devsbd` (a best-effort `/usr/local/bin/devsbd` symlink; the binary is `/run/devsandbox/bin/devsbd`). The host daemon (`devsandbox serve`, docs/serve.md) updates the helper of every running instance it bridges, so a running dispatcher gets new `devsbd` verbs without a restart once a newer devsandbox's daemon runs (the first command of the new version that reaches the daemon, a dashboard, `run` or `start`, hands it over).
+Everything here except `autostart = true` needs the embedded `devsbd` helper (release archives, npm package, local builds after `scripts/build-devsbd.sh`; not `cargo install`). Inside a sandbox it is on `PATH` as `devsbd` (a best-effort `/usr/local/bin/devsbd` symlink; the binary is `/run/devsandbox/bin/devsbd`). The host daemon (`devsandbox serve`, docs/architecture/daemon/role.md) updates the helper of every running instance it bridges, so a running dispatcher gets new `devsbd` verbs without a restart once a newer devsandbox's daemon runs (the first command of the new version that reaches the daemon, a dashboard, `run` or `start`, hands it over).
 
 ## `autostart`
 
@@ -20,7 +20,7 @@ autostart = true         # devsandbox starts it once per boot
 - podman: only with `podman-restart.service` enabled (`systemctl --user enable podman-restart.service`); devsandbox never installs units and warns at `run`.
 - Apple `container`: no restart policy; warns and behaves as `true`.
 
-The runtime restarts only the container command, so new containers carry a boot hook: on every container start it brings back the `devsbd` daemon and re-runs `postStartCommand` (as `remoteUser`, in `workspaceFolder`, with `remoteEnv`), appending its output to `/run/devsandbox/boot.log`. For these instances `devsandbox start` no longer runs `postStartCommand` from the host (`run` still does, at create). Containers created before the hook existed warn on `start`: recreate them with `devsandbox rebuild --force <instance>`. Host-side things (ssh-agent relay, port forwards, notify delivery, the control API) resume once the host daemon runs: the first `devsandbox` command that needs it starts it, or, with `devsandbox serve install`, the user's service manager does at login (docs/serve.md, *Boot start*).
+The runtime restarts only the container command, so new containers carry a boot hook: on every container start it brings back the `devsbd` daemon and re-runs `postStartCommand` (as `remoteUser`, in `workspaceFolder`, with `remoteEnv`), appending its output to `/run/devsandbox/boot.log`. For these instances `devsandbox start` no longer runs `postStartCommand` from the host (`run` still does, at create). Containers created before the hook existed warn on `start`: recreate them with `devsandbox rebuild --force <instance>`. Host-side things (ssh-agent relay, port forwards, notify delivery, the control API) resume once the host daemon runs: the first `devsandbox` command that needs it starts it, or, with `devsandbox serve install`, the user's service manager does at login (docs/architecture/daemon/role.md, *Boot start*).
 
 Flipping `autostart` is not drift: `start` updates the restart policy of an existing container in place (a podman too old for `update --restart` warns to `rebuild --force`).
 
@@ -358,7 +358,7 @@ The submission arrives as one event (below), `answers` keyed by question id with
 
 `thread ls --feed` gives each message that has carried a form a `"form": { "id", "state", "answers"? }`: `state` is `open`, `submitted` or `withdrawn`, and `answers` (only when submitted) is what the `submit` event carried, so a dispatcher that lost its state, or acked nothing yet, can recover the answers.
 
-The dashboard pins open forms under the thread's header and answers them in place (docs/tui.md, *Forms*); `devsandbox inbox submit` answers from a shell (docs/inbox-cli.md), API clients with `inbox.form.saveDraft` and `inbox.form.submit` (docs/api.md).
+The dashboard pins open forms under the thread's header and answers them in place (docs/architecture/dashboard/inbox-tab.md, *Replies and forms*); `devsandbox inbox submit` answers from a shell (docs/reference/inbox-cli.md), API clients with `inbox.form.saveDraft` and `inbox.form.submit` (docs/reference/api.md).
 
 ### Events
 
@@ -385,7 +385,7 @@ devsbd events ack <id>...
 | `reopen` | `u` in the pane on a done thread (it goes back to `active`) | |
 | `submit` | a form was submitted ([Forms](#forms)) | `message`, `form`: the message's and the form's ids; `answers`: every question's answer |
 
-The keys are the dashboard's; `devsandbox inbox reply|act|submit|done|reopen` (docs/inbox-cli.md) and API clients (docs/api.md) produce the same events, and you can't tell which one the user used.
+The keys are the dashboard's; `devsandbox inbox reply|act|submit|done|reopen` (docs/reference/inbox-cli.md) and API clients (docs/reference/api.md) produce the same events, and you can't tell which one the user used.
 
 `thread` is the key of the thread it happened on (the `key` you put it with). `at` is RFC 3339 UTC, by the host's clock. `d` and `u` only send an event when they change something (`d` on a done thread, `u` on a live one, do nothing). Each event also shows in the feed (the reply, the action, the folded submission, a done/reopen marker), and the pane shows how many are still waiting for you. Archived threads take no events.
 

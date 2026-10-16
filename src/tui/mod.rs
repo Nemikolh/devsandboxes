@@ -81,7 +81,7 @@ static KITTY_PUSHED: AtomicBool = AtomicBool::new(false);
 /// path (normal, error, or panic).
 pub fn dashboard(dir: &Path) -> Result<()> {
     install_panic_hook();
-    // No autostart pass of our own: the daemon runs it (docs/dashboard-client.md, F16).
+    // No autostart pass of our own: the daemon runs it (docs/architecture/daemon/host-poll.md, *Autostart*).
     let mut terminal = setup().context("failed to set up terminal")?;
 
     let result = run(&mut terminal, App::new(dir.to_path_buf()));
@@ -193,7 +193,7 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
     // `instances.changed`): proc targets come from the snapshot, so the proc
     // refresh waits for the next push to land.
     let mut procs_after_snapshot = false;
-    // The host daemon (docs/serve.md) owns the bridges: ssh-agent relays,
+    // The host daemon (docs/architecture/daemon/role.md) owns the bridges: ssh-agent relays,
     // the notify drain, popups and control ops. Its worker thread
     // (`daemon.rs`) holds the connection for the dashboard's life (so the
     // dashboard is a holder), reconnecting after a handoff or a death, and
@@ -737,7 +737,7 @@ fn unqualified(action: &PromptAction) -> PromptAction {
 
 /// The verb request for `action` on `route`: [`verb_call`] in this host's
 /// `root`, or, for a machine's row, in its root there with `machine` set
-/// (the local daemon forwards it, docs/machines.md F6). `Err`: a machine's
+/// (the local daemon forwards it, docs/architecture/daemon/machines.md *Forwarded requests*). `Err`: a machine's
 /// row with no root known.
 fn routed_verb_call(
     action: &PromptAction,

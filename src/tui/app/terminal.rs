@@ -461,7 +461,7 @@ impl App {
     ///
     /// On a machine (a `box/…` key) either goes over ssh: the machine's
     /// `devsandbox -C <its root> exec`, or its runtime's `exec`
-    /// (docs/machines.md, *Service tabs*).
+    /// (docs/architecture/daemon/machines.md, *Dashboard*).
     fn term_argv(&self, title: &str, container: &str, is_instance: bool) -> Result<Vec<String>, String> {
         if is_instance {
             return self.exec_argv(title, &[]).map_err(|e| format!("terminal: {e}"));

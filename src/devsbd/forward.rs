@@ -1,4 +1,4 @@
-//! Host forwarder engine (docs/port-forwarding.md, step 5): binds a host TCP
+//! Host forwarder engine (docs/architecture/daemon/forwards.md, *The engine: `Forward`*): binds a host TCP
 //! listener and tunnels each accepted connection into an instance through a
 //! `devsbd bridge`, whose daemon dials the target inside the container. Owns
 //! one bridge per forward, respawned on death; the route is re-resolved on
@@ -62,7 +62,7 @@ pub struct ForwardSpec {
     pub host_port: HostPort,
     pub resolve: Box<dyn Fn() -> Result<Route, String> + Send + Sync>,
     /// Listening-process lookup for the forwarded port, run in the route's
-    /// `process_container` (docs/port-forwarding.md, _Listening process_).
+    /// `process_container` (docs/architecture/daemon/forwards.md).
     /// Called only on the forward's own (supervisor) thread, never the caller's;
     /// any failure yields `None`. Passed in so `forward.rs` stays runtime- and
     /// `commands`-generic and the pure lifecycle tests can inject a stub.
@@ -108,7 +108,7 @@ pub struct ForwardStatus {
     pub local_addr: SocketAddr,
     pub route_label: String,
     pub state: ForwardState,
-    // Read by the TUI Ports tab worker (docs/port-forwarding.md, step 10); the
+    // Read by the TUI Ports tab worker (docs/architecture/daemon/forwards.md); the
     // CLI doesn't surface it.
     pub open_conns: usize,
     /// The process listening on the forwarded port, e.g. `node (pid 412)`, or

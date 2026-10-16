@@ -133,7 +133,7 @@ pub fn build_forest(rows: Vec<(String, String, String)>) -> Vec<ProcRow> {
     out
 }
 
-/// The gutter label of a run row (docs/automations.md, "Runs"): not a pid,
+/// The gutter label of a run row (docs/architecture/dashboard/tabs-and-actions.md, "Process layer"): not a pid,
 /// so the signal shortcuts and the agent count skip it.
 pub const RUN_PID: &str = "run";
 
@@ -148,7 +148,7 @@ pub fn run_rows(runs: &[crate::runtime::procs::Run]) -> Vec<ProcRow> {
 }
 
 /// One instance's `instances.procs` entry as the tree shows it: the process
-/// forest then its runs (docs/automations.md, "Runs"), or why there's none
+/// forest then its runs (docs/architecture/dashboard/tabs-and-actions.md, "Process layer"), or why there's none
 /// as a placeholder row.
 pub fn proc_state(entry: crate::serve::api::InstanceProcs) -> ProcState {
     use crate::serve::api::InstanceProcs;

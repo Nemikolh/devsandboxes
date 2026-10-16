@@ -1,16 +1,17 @@
 //! `devsandbox serve install|uninstall`: boot start through the user's
-//! service manager (docs/serve.md, *Boot start*): a systemd user unit on
-//! Linux, a LaunchAgent on macOS, running `devsandbox serve --keep-alive`.
+//! service manager (docs/architecture/daemon/role.md, *Boot start: `serve
+//! install` / `uninstall`*): a systemd user unit on Linux, a LaunchAgent on
+//! macOS, running `devsandbox serve --keep-alive`.
 //!
 //! The unit text is rendered by pure functions ([`render_systemd`],
 //! [`render_launchd`]); [`install`] / [`uninstall`] take every path, the uid
 //! and the command runner as a [`Setup`], so tests never touch the real
 //! service manager or `~/.config/systemd` / `~/Library/LaunchAgents`.
 //!
-//! Also the manager-aware side of the lazy start ([`lazy_start`], docs/serve.md,
-//! *Start*): with a unit installed, clients start (and after a handoff,
-//! repoint and restart) it through the manager instead of spawning an
-//! unmanaged daemon.
+//! Also the manager-aware side of the lazy start ([`lazy_start`],
+//! docs/architecture/daemon/role.md, *Lazy start*): with a unit installed,
+//! clients start (and after a handoff, repoint and restart) it through the
+//! manager instead of spawning an unmanaged daemon.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};

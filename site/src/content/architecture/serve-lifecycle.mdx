@@ -161,5 +161,7 @@ not sent `detach` is cancelled there), the bridges and the forwards, and the loc
 `serve uninstall` is the exception: the manager signals the daemon, so clients see the socket drop with no
 `closing` and reconnect by starting one on demand.
 
-Design notes: `docs/serve.md` (start, handoff, idle exit, boot start), `docs/api.md` (the methods, the dashboard
-as a client), `docs/machines.md` (machine links), `docs/inbox-redesign.md` (why a daemon).
+Design notes: `docs/architecture/daemon/role.md` (start, handoff, idle exit, boot start), `docs/reference/api.md`
+(the methods), `docs/architecture/daemon/client-server.md` (the dashboard as a client),
+`docs/architecture/daemon/machines.md` (machine links), `docs/decisions/0014-one-unix-socket-daemon-per-user.md`
+(why a daemon).

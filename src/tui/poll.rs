@@ -1,5 +1,5 @@
 //! The dashboard's per-request read from the host daemon
-//! (docs/dashboard-client.md, F2): the expanded instances' processes
+//! (docs/architecture/dashboard/overview.md, *Threads*): the expanded instances' processes
 //! (`instances.procs`), per dashboard since each expands its own. The event
 //! loop decides when (`PROC_TICK`, an expand, a snapshot after a change) and
 //! keeps at most one request outstanding; this worker only asks and answers.
@@ -203,7 +203,7 @@ fn procs_call(names: &[&str], machine: Option<&str>) -> (&'static str, Value) {
     ("instances.procs", params)
 }
 
-/// `keys`' processes, one `ask` per machine in turn (docs/machines.md, F10:
+/// `keys`' processes, one `ask` per machine in turn (docs/architecture/daemon/machines.md, *Forwarded requests*:
 /// a machine's link takes one request per machine), keyed back by key.
 /// Only this host's (or a single machine's) keys: that one answer as is.
 /// Several: a machine whose call the daemon refused gets that reason as

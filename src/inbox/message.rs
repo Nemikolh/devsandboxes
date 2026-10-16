@@ -1,4 +1,4 @@
-//! The `devsbd thread send` body (docs/inbox-redesign.md, *Messages*): the
+//! The `devsbd thread send` body (docs/architecture/inbox/threads-and-feed.md, *`thread send`*): the
 //! schema the host checks. The helper only checks JSON syntax and pulls out
 //! `thread` and `id` (`devsbd/src/json.rs`), so everything here runs on the
 //! host, like the put schema in `thread.rs`.

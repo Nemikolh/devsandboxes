@@ -1,8 +1,8 @@
-//! Host side of the dispatcher control API (docs/automations.md,
-//! "Dispatchers"): authorize and carry out one decoded [`Request`] from a
-//! dispatcher instance, answering a [`Response`]. The transport (a `CONTROL`
-//! stream on the dispatcher's bridge) only decodes, calls [`handle`], and
-//! encodes.
+//! Host side of the dispatcher control API
+//! (docs/architecture/automations/dispatchers.md): authorize and carry out
+//! one decoded [`Request`] from a dispatcher instance, answering a
+//! [`Response`]. The transport (a `CONTROL` stream on the dispatcher's
+//! bridge) only decodes, calls [`handle`], and encodes.
 //!
 //! Every request is checked against the config as it is *now*: the
 //! dispatcher's sandbox (resolved from the config root recorded on its
@@ -16,9 +16,9 @@
 //! on the control::denied_env list are denied. `ensure --env` on an existing
 //! child replaces its saved env (`Instance::extra_env`) before (re)starting
 //! it, so every later devsandbox exec there sees the new values. `done`
-//! marks a child done (docs/inbox-threads.md, "Done instances"); an `ensure`
-//! that reuses a done child clears the flag, since the dispatcher is putting
-//! it back to work.
+//! marks a child done (docs/architecture/automations/dispatchers.md, "Done
+//! children"); an `ensure` that reuses a done child clears the flag, since
+//! the dispatcher is putting it back to work.
 //!
 //! Runs (`exec`, `run-ls|logs|wait`) live in the child: the host execs the
 //! child's own helper (`devsbd run start|ls|logs|wait`, `devsbd/src/runs.rs`)
@@ -31,10 +31,11 @@
 //! its holder (this dispatcher's child, another instance, the base checkout,
 //! or a worktree devsandbox doesn't know), never a host path.
 //!
-//! `events`, `events-ack` and `thread-ls` (docs/inbox-threads.md) read the
-//! shared Inbox store (`crate::inbox::store`) for the requester's own
-//! `instance_id` only: another instance never sees or acks them. `events`
-//! may long-poll up to [`MAX_WAIT`] on the bridge handler thread.
+//! `events`, `events-ack` and `thread-ls`
+//! (docs/architecture/inbox/threads-and-feed.md) read the shared Inbox store
+//! (`crate::inbox::store`) for the requester's own `instance_id` only:
+//! another instance never sees or acks them. `events` may long-poll up to
+//! [`MAX_WAIT`] on the bridge handler thread.
 //! `events-follow` streams them instead, for the stream's life ([`follow`],
 //! `follow.rs`): the one op that doesn't answer a single [`Response`].
 //!
@@ -252,7 +253,8 @@ pub(crate) fn current_sandbox(key: &str) -> Option<(Instance, SandboxProperties)
 }
 
 /// The control ops on the requester's own Inbox threads, gated on
-/// `inbox = true` rather than `dispatcher` (docs/inbox-redesign.md, _Ownership_).
+/// `inbox = true` rather than `dispatcher`
+/// (docs/architecture/inbox/threads-and-feed.md, _Ownership_).
 fn is_inbox_op(op: Op) -> bool {
     matches!(op, Op::Events | Op::EventsAck | Op::Subscribe | Op::ThreadLs)
 }
@@ -896,8 +898,9 @@ enum Ensure {
 /// `liveness` is only consulted for an owned child.
 ///
 /// A child being materialized (its `run`/`rebuild` live) or failed
-/// (docs/instance-phase.md) is neither started nor recreated: `failed`, with
-/// the phase, so the dispatcher retries later or `rm`s it.
+/// (docs/architecture/instances/lifecycle.md) is neither started nor
+/// recreated: `failed`, with the phase, so the dispatcher retries later or
+/// `rm`s it.
 fn ensure_action(
     name: &str,
     child: Option<&Instance>,
@@ -1010,7 +1013,7 @@ fn find_child(
 }
 
 /// A child op's answer as one compact JSON line, so a dispatcher never
-/// parses prose (docs/automations.md, *Control API*).
+/// parses prose (docs/architecture/automations/dispatchers.md, *Ops*).
 fn answer(body: &impl Serialize) -> Response {
     match serde_json::to_string(body) {
         Ok(json) => Response::new(Status::Ok, json),

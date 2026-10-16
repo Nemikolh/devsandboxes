@@ -28,10 +28,10 @@ use anyhow::{bail, Context, Result};
 use crate::runtime::{backend, NAME_PREFIX};
 use crate::state::{Instance, PhaseView, Progress, State};
 
-/// Why `key` isn't a ready instance (docs/instance-phase.md), for verbs that
-/// need one (`start`; `rebuild --all` and autostart skip with it):
-/// still being materialized, or failed (an interrupted one included). `None`
-/// = ready. `view` is [`Instance::phase_view`].
+/// Why `key` isn't a ready instance (docs/architecture/instances/lifecycle.md),
+/// for verbs that need one (`start`; `rebuild --all` and autostart skip with
+/// it): still being materialized, or failed (an interrupted one included).
+/// `None` = ready. `view` is [`Instance::phase_view`].
 pub(crate) fn not_ready(key: &str, view: Option<&PhaseView>) -> Option<String> {
     match view? {
         PhaseView::InFlight(label) => Some(format!("`{key}` is still {}", doing(label))),

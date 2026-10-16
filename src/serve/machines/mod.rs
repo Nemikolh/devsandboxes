@@ -1,5 +1,6 @@
 //! Machines: remote hosts whose daemons this one talks to over
-//! `ssh <target> devsandbox api --stdio` (docs/machines.md).
+//! `ssh <target> devsandbox api --stdio`
+//! (docs/architecture/daemon/machines.md).
 //!
 //! - this module: the registry, `machines.toml` next to `state.toml`
 //! - `ssh`: the ssh argv and quoting, and the injectable [`ssh::Dial`] that
@@ -34,7 +35,8 @@ pub mod service;
 pub mod ssh;
 
 /// One registered machine, as `machines.toml` holds it under
-/// `[machine.<name>]` (docs/machines.md, F2).
+/// `[machine.<name>]` (docs/architecture/daemon/machines.md, *Registry:
+/// `machines.toml`*).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
     /// The table key, so not a field of its own in the file.
@@ -155,7 +157,8 @@ pub fn check_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Where a CLI `<name>` points (docs/machines.md, *Decisions*).
+/// Where a CLI `<name>` points (docs/architecture/daemon/machines.md,
+/// *Registry: `machines.toml`*).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Where {
     /// `@/<name>`: this host only.

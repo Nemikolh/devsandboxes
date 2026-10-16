@@ -1,5 +1,5 @@
-//! The shared poll's snapshots (docs/api.md `instances.watch`): dashboards
-//! watch a config root, and while at least one does, the host poll
+//! The shared poll's snapshots (docs/reference/api.md `instances.watch`):
+//! dashboards watch a config root, and while at least one does, the host poll
 //! (`host.rs`) asks the runtime once per tick, joins every watched root
 //! against that one pass, and the daemon pushes each root's snapshot as
 //! `instances.snapshot`. With nothing watched, nothing is collected.
@@ -12,11 +12,11 @@
 //! runtime or read the user's state.
 //!
 //! The cache is keyed by config root only: this host's rows. Machines
-//! (docs/machines.md, step 3) are the second dimension, [`Remotes`]: each
-//! registered machine's link state and its last snapshot per remote root,
-//! kept while its link is down. A watcher with `machines: true` gets
-//! [`merge`] of a local root's params and every machine's rows; any other
-//! watcher gets the local params untouched.
+//! (docs/architecture/daemon/machines.md, *Federated snapshots*) are the
+//! second dimension, [`Remotes`]: each registered machine's link state and
+//! its last snapshot per remote root, kept while its link is down. A watcher
+//! with `machines: true` gets [`merge`] of a local root's params and every
+//! machine's rows; any other watcher gets the local params untouched.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -154,7 +154,8 @@ pub fn stats_due(last: Option<Instant>, now: Instant, fresh: bool) -> bool {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LinkState {
-    /// Not wanted, so not connected (docs/machines.md, F9).
+    /// Not wanted, so not connected (docs/architecture/daemon/machines.md,
+    /// *Held links: `Machines`*).
     #[default]
     Idle,
     Connecting,

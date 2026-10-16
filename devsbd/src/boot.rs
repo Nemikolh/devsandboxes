@@ -1,4 +1,4 @@
-//! `devsbd boot`: the container command's start hook (docs/automations.md).
+//! `devsbd boot`: the container command's start hook (docs/architecture/helper/in-container.md).
 //! The runtime restarting a container brings back only its command, not what
 //! the host ran via `exec`; this puts back the daemon and, when the host left
 //! a boot file (`bootfile::PATH`), the `postStartCommand` it records.

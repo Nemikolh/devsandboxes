@@ -1,6 +1,7 @@
-//! The held link per machine (docs/machines.md, step 3): one
-//! `serve-machine-<name>` thread per registered machine, owned by the
-//! [`Machines`] service the daemon runs for its whole life.
+//! The held link per machine (docs/architecture/daemon/machines.md, *Held
+//! links: `Machines`*): one `serve-machine-<name>` thread per registered
+//! machine, owned by the [`Machines`] service the daemon runs for its whole
+//! life.
 //!
 //! A link connects only while wanted (F9): while some local connection
 //! watches with `machines: true` ([`Hooks::watching`]), or a forwarded call

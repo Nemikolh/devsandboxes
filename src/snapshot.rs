@@ -49,7 +49,7 @@ impl ContainerStatus {
     }
 }
 
-/// Where an instance's materialization stands (docs/instance-phase.md),
+/// Where an instance's materialization stands (docs/architecture/instances/lifecycle.md),
 /// `Instance::phase_view` as data. Internally tagged on `state`, with
 /// `step` in both variants so a consumer reads it the same way:
 /// `{"state":"in-flight","step":"building"}`,
@@ -105,7 +105,7 @@ pub struct InstanceRow {
     /// refers to.
     pub instance_id: String,
     /// `instance_id` of the dispatcher that created this instance
-    /// (docs/automations.md), `None` for user-created ones. May name an
+    /// (docs/architecture/automations/dispatchers.md), `None` for user-created ones. May name an
     /// instance that no longer exists (an orphaned child).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatcher: Option<String>,
@@ -117,7 +117,7 @@ pub struct InstanceRow {
     pub phase: Option<PhaseRow>,
     /// The config root it was made from (`state::Instance::config_dir`);
     /// `None` for instances older than that record. A machine's rows are
-    /// de-duplicated by it (docs/machines.md, F8).
+    /// de-duplicated by it (docs/architecture/daemon/machines.md, *Federated snapshots*).
     #[serde(default)]
     pub root: Option<String>,
     /// The machine it's on: set only in a federated snapshot

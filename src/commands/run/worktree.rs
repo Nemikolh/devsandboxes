@@ -366,12 +366,12 @@ pub(crate) fn instance_at(state: &crate::state::State, path: &Path) -> Option<St
 }
 
 /// Seed a fresh worktree with the base repo's gitignored files listed in its
-/// `.worktreeinclude` (docs/worktreeinclude.md): a checkout has no untracked
-/// files, so `.env` and friends would otherwise be missing. Git does the
-/// matching (include patterns, then gitignore), so semantics equal the other
-/// tools reading the same file. `patterns` (the sandbox's `worktree-include`)
-/// apply after the file, so they can negate it. Best effort: problems warn,
-/// never fail `run`.
+/// `.worktreeinclude` (docs/architecture/instances/worktrees.md): a checkout
+/// has no untracked files, so `.env` and friends would otherwise be missing.
+/// Git does the matching (include patterns, then gitignore), so semantics
+/// equal the other tools reading the same file. `patterns` (the sandbox's
+/// `worktree-include`) apply after the file, so they can negate it. Best
+/// effort: problems warn, never fail `run`.
 pub(super) fn copy_worktree_includes(base: &Path, worktree: &Path, patterns: &[String]) {
     let include = base.join(".worktreeinclude");
     let include = include.is_file().then_some(include);
@@ -465,12 +465,13 @@ fn copy_entry(src: &Path, dst: &Path) -> Result<()> {
 }
 
 /// Share `entries` (repo-relative, gitignored paths) live across every
-/// instance of a sandbox (docs/worktreeinclude.md): the real file lives in
-/// `store`, each of `trees` (base repo first, then the worktree if any) gets
-/// an absolute symlink to it, and the caller mounts `store` at its host path
-/// so the links resolve in the container. Idempotent (runs on every `run` and
-/// `rebuild`). A bad entry is a config error; anything on disk that doesn't
-/// fit (tracked path, conflicting file) only warns and is left untouched.
+/// instance of a sandbox (docs/architecture/instances/worktrees.md): the real
+/// file lives in `store`, each of `trees` (base repo first, then the worktree
+/// if any) gets an absolute symlink to it, and the caller mounts `store` at
+/// its host path so the links resolve in the container. Idempotent (runs on
+/// every `run` and `rebuild`). A bad entry is a config error; anything on
+/// disk that doesn't fit (tracked path, conflicting file) only warns and is
+/// left untouched.
 ///
 /// `store` sits in a directory of stores (`shared-files/`); a link into a
 /// sibling store is left over from the old one-store-per-sandbox layout. It is

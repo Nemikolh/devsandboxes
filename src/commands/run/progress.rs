@@ -1,8 +1,8 @@
 //! An instance's `progress` while `run`/`rebuild` materialize it, and what a
-//! failure leaves behind (docs/instance-phase.md): a failed instance is kept
-//! as `failed`, its build log with it, so a run nobody watched (the
-//! dashboard's) still leaves a trace; only a cancelled `run` rolls back
-//! whatever it made (`cancel`).
+//! failure leaves behind (docs/architecture/instances/lifecycle.md): a failed
+//! instance is kept as `failed`, its build log with it, so a run nobody
+//! watched (the dashboard's) still leaves a trace; only a cancelled `run`
+//! rolls back whatever it made (`cancel`).
 
 use std::path::Path;
 

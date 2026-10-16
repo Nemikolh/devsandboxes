@@ -1,4 +1,4 @@
-//! Actions on an Inbox thread (docs/inbox-threads.md, *Actions*): the `1`-`9`
+//! Actions on an Inbox thread (docs/architecture/dashboard/inbox-tab.md, *Thread actions*): the `1`-`9`
 //! buttons and the fixed `o`/`t`/`l`/`p` keys (Inbox list or thread). A host
 //! verb maps onto the plumbing the dashboard already has for a selected instance
 //! (`PromptAction::Code`, the terminal panel, the logs modal, `pending_port`,
@@ -242,7 +242,7 @@ impl App {
     }
 
     /// Queue `act`'s event; a `done: true` action also marks the thread's
-    /// child done (docs/inbox-threads.md, *Actions*). The child's status note,
+    /// child done (docs/architecture/automations/dispatchers.md, *Done children*). The child's status note,
     /// if any.
     fn send_act(&mut self, t: &Thread, act: Op, done: bool) -> Option<String> {
         self.request_inbox(act);

@@ -1,6 +1,7 @@
-//! `events-follow` (`devsbd events --follow`, docs/automations.md, *Following
-//! events*): the requester's events pushed down one held-open control stream
-//! instead of pulled by `events --wait`.
+//! `events-follow` (`devsbd events --follow`,
+//! docs/architecture/inbox/threads-and-feed.md, *Events*): the requester's
+//! events pushed down one held-open control stream instead of pulled by
+//! `events --wait`.
 //!
 //! The stream is the response header (`status ok`, empty body) followed by
 //! JSON lines (`control`'s module doc): every pending event first, then each

@@ -1,7 +1,8 @@
 //! Whether a `folders` entry gets its own detached worktree or the live host
-//! dir (docs/folders-worktrees.md). Each host folder has one owner of its
-//! direct checkout; everyone else gets a worktree so no two instances write
-//! to one working tree. Pure over config + state so it's testable without git.
+//! dir (docs/architecture/instances/worktrees.md). Each host folder has one
+//! owner of its direct checkout; everyone else gets a worktree so no two
+//! instances write to one working tree. Pure over config + state so it's
+//! testable without git.
 
 use std::path::{Path, PathBuf};
 

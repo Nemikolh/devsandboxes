@@ -1,7 +1,8 @@
-//! The CLI side of machines (docs/machines.md, step 5): where a command's
-//! `<name>` points, and the commands that don't go through the daemon
-//! (`logs`, `exec`, `inspect`, `done`, `rename`, …) re-run over ssh when it
-//! points at a machine, as do the nameless ones given `--machine`.
+//! The CLI side of machines (docs/architecture/daemon/machines.md, *The CLI:
+//! `cli.rs`*): where a command's `<name>` points, and the commands that don't
+//! go through the daemon (`logs`, `exec`, `inspect`, `done`, `rename`, …)
+//! re-run over ssh when it points at a machine, as do the nameless ones given
+//! `--machine`.
 //!
 //! The verbs (`run`, `rebuild`, …) resolve in `verbs_client` instead, from
 //! the same pieces ([`resolve_params`], [`found_of`], [`choose`]); [`route`]

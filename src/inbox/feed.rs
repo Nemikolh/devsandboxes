@@ -1,4 +1,4 @@
-//! A thread's feed (docs/inbox-redesign.md, *Feed*): what happened on an
+//! A thread's feed (docs/architecture/inbox/threads-and-feed.md, *Feed*): what happened on an
 //! owner thread, in first-insert order. The owner's **messages**, the user's
 //! **replies** and **actions**, and host-recorded **markers** (done/reopen by
 //! the user, state/status changes by the owner). The header (`thread put`)
@@ -63,7 +63,7 @@ pub enum ItemKind {
     Marker(Marker),
 }
 
-/// A message block (docs/inbox-redesign.md, *Messages*). Serialized in the
+/// A message block (docs/architecture/inbox/threads-and-feed.md, *`thread send`*). Serialized in the
 /// same shape `thread send` takes, so `thread ls --feed` hands an owner back
 /// what it sent.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -161,8 +161,8 @@ pub enum Sent {
     Inserted,
 }
 
-/// Apply owner message `id` with `blocks` (docs/inbox-redesign.md,
-/// *Messages*): the id is the owner's idempotency key, so the same content is
+/// Apply owner message `id` with `blocks` (docs/architecture/inbox/threads-and-feed.md,
+/// *`thread send`*): the id is the owner's idempotency key, so the same content is
 /// a no-op, other content replaces the message in place (its `seq`, `at` and
 /// feed position stay: order is first-insert order) and tags it `edited`.
 /// A withdrawn message sent again comes back, replaced and `edited` even with

@@ -1,8 +1,8 @@
-//! The live host side the daemon runs (docs/serve.md "Bridges"): one bridge
-//! per running instance with a helper (`devsbd::bridge::Bridges`, with the
-//! notify sink and the control handler), so outboxes drain, popups fire and
-//! control ops answer with the dashboard closed; plus the once-per-boot
-//! `autostart = true` pass at start.
+//! The live host side the daemon runs (docs/architecture/daemon/host-poll.md
+//! "Bridges"): one bridge per running instance with a helper
+//! (`devsbd::bridge::Bridges`, with the notify sink and the control handler),
+//! so outboxes drain, popups fire and control ops answer with the dashboard
+//! closed; plus the once-per-boot `autostart = true` pass at start.
 //!
 //! Threading: a `serve-poll` thread is the daemon's one container poll. Each
 //! tick it lists every devsandbox container once; from the running ones it

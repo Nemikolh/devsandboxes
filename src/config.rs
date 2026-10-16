@@ -137,7 +137,7 @@ pub struct SandboxProperties {
     /// Repo-relative gitignored paths shared live by every instance: kept in
     /// `shared-files/<repo>-<hash>/` (one per base folder, shared by every
     /// sandbox on it) and symlinked into each working tree, the
-    /// store mounted at its host path (docs/worktreeinclude.md).
+    /// store mounted at its host path (docs/architecture/instances/worktrees.md).
     #[serde(rename = "worktree-link")]
     pub worktree_link: Option<Vec<String>>,
     /// Host shell snippets (relative to the config dir, `${…}` variables as in
@@ -151,18 +151,18 @@ pub struct SandboxProperties {
     /// Extra VS Code workspace roots: container path -> host folder (relative
     /// to the config dir). Each entry is bind-mounted at its key and listed in
     /// the generated `.code-workspace` file after `workspaceFolder`. A value is
-    /// the host dir, or a table adding its `worktree` mode (docs/folders-worktrees.md).
+    /// the host dir, or a table adding its `worktree` mode (docs/architecture/instances/worktrees.md).
     pub folders: Option<BTreeMap<String, FolderEntry>>,
-    /// Bring this sandbox's instances up once per host boot (docs/automations.md).
+    /// Bring this sandbox's instances up once per host boot (docs/architecture/automations/autostart.md).
     /// Excluded from `config_hash` so toggling it never marks instances drifted.
     pub autostart: Option<Autostart>,
     /// Makes this sandbox a dispatcher: its instances may create and manage
-    /// child instances over the control API (docs/automations.md). Read from
+    /// child instances over the control API (docs/architecture/automations/dispatchers.md). Read from
     /// config on every request and baked into nothing, so it's excluded from
     /// `config_hash` like `autostart`.
     pub dispatcher: Option<Dispatcher>,
     /// `inbox = true` lets this sandbox's instances own Inbox threads
-    /// (`devsbd thread put|rm|ls`, `devsbd events`; docs/inbox-redesign.md,
+    /// (`devsbd thread put|rm|ls`, `devsbd events`; docs/architecture/inbox/threads-and-feed.md,
     /// _Ownership_). Separate from `dispatcher`, which only grants child ops.
     /// Checked on every request, so excluded from `config_hash`.
     pub inbox: Option<bool>,
@@ -188,7 +188,7 @@ pub struct SandboxProperties {
     /// feature that needs it.
     pub privileged: Option<bool>,
     /// Ports the TUI forwards to the host while it's open
-    /// (docs/port-forwarding.md, _Configured forwards_). Host-side only, so
+    /// (docs/architecture/daemon/forwards.md, _Configured forwards (`forwardPorts`)_). Host-side only, so
     /// excluded from `config_hash`.
     pub forward_ports: Option<Vec<ForwardPort>>,
 
@@ -286,7 +286,7 @@ pub struct FolderTable {
     pub worktree: Option<FolderWorktree>,
 }
 
-/// When a `folders` entry gets its own git worktree (docs/folders-worktrees.md).
+/// When a `folders` entry gets its own git worktree (docs/architecture/instances/worktrees.md).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum FolderWorktree {

@@ -5,6 +5,9 @@ podman / Apple container. Each sandbox config can spawn many _instances_
 (containers named `devsandbox-<instance>`); repeat instances of one repo get
 git worktrees so working trees are never shared.
 
+Start with `docs/README.md` (reading order and map) and
+`docs/architecture/overview.md`; `docs/status.md` has what doesn't work yet.
+
 ## Module map
 
 - `src/main.rs` — clap CLI; no subcommand on a TTY opens the TUI dashboard
@@ -20,10 +23,10 @@ git worktrees so working trees are never shared.
   `SHELL_FALLBACK_CMD`, the login shell a command-less `exec` and the TUI
   terminal open. `port.rs` resolves a forward route (instance | service via a
   running instance | injection fallback) and hosts the foreground `port` CLI.
-  `inbox.rs` is `devsandbox inbox …` (docs/inbox-cli.md): reads from the
+  `inbox.rs` is `devsandbox inbox …` (docs/reference/inbox-cli.md): reads from the
   store, mutations via a running daemon's API, else the same `wire::decide_*`
   ops locally. `machine.rs` is `devsandbox machine add|ls|rm`
-  (docs/machines.md): a client of `machines.*` only (never in-process);
+  (docs/architecture/daemon/machines.md): a client of `machines.*` only (never in-process);
   `add`'s TTY multi-select of probed roots and the off-TTY one-candidate
   rule.
   `run/` is split by concern: `mod.rs` (`run`/`materialize`, naming,
@@ -46,7 +49,7 @@ git worktrees so working trees are never shared.
 "global"`: one shared container per config root. `gc` reaps unreferenced ones;
   `rebuild` recreates a service's containers and rewires running sandboxes in
   place (no restart, on any runtime).
-- Automations (`docs/automations.md` design + steps, `docs/automations-guide.md`
+- Automations (`docs/architecture/automations/`, `docs/automations-guide.md`
   user guide): `src/commands/autostart.rs` — once-per-boot `autostart` pass
   (boot id per config root in `State.autostart_boot`) and the `"runtime"`
   restart-policy decisions; `src/commands/dispatch.rs` — host side of the
@@ -66,7 +69,7 @@ git worktrees so working trees are never shared.
   CLI's local fallback runs them), `clock.rs` how Inbox times read (card
   age, stamp, UTC offset; the dashboard's and `devsandbox inbox`'s).
 - `src/serve/` — the per-user host daemon `devsandbox serve` (unix-only, see
-  `docs/serve.md`): `endpoint.rs` (socket dir/paths, bind/connect: the
+  `docs/architecture/daemon/`): `endpoint.rs` (socket dir/paths, bind/connect: the
   `local_endpoint` seam), `daemon.rs` (start lock, accept loop, version
   handoff, drain), `host.rs` (the one container poll: each pass lists every
   devsandbox container once and feeds the bridges, the forwards and the
@@ -79,7 +82,7 @@ git worktrees so working trees are never shared.
   notifications aside), `idle.rs` (pure idle countdown over `Holders`),
   `proto.rs` (JSON-lines wire, `PROTOCOL`), `api.rs` (the API's method table
   and wire views, socket-free, state path and runtime calls injectable;
-  `docs/api.md`): the Inbox over `inbox::ops`, and what the dashboard
+  `docs/reference/api.md`): the Inbox over `inbox::ops`, and what the dashboard
   reads and edits: `instances.list` (snapshot at a `depth` +
   `thread_children`), `instances.procs`/`signal`/`buildLog`/`rename`/`done`,
   `containers.logs`/`inspect` (`devsandbox-` names only),
@@ -101,7 +104,7 @@ git worktrees so working trees are never shared.
   pure render fns, manager calls through an injected runner; `shutdown`
   stops a running daemon first).
   `verbs.rs` is `run`/`rebuild`/`start`/`stop`/`rm`/`services.rebuild` as API methods
-  (docs/verbs-as-requests.md): typed params → a pure `argv`, each verb a
+  (docs/architecture/daemon/verbs.md): typed params → a pure `argv`, each verb a
   `devsandbox --in-process` subprocess (request env only, own process
   group, stdout/stderr spooled in `logs/verbs/<pid>.out|.err`) streamed as
   `output`/`progress`; hang-up = SIGINT, a drain isn't one (the verb runs
@@ -115,7 +118,7 @@ git worktrees so working trees are never shared.
   `--in-process` (hidden, global) never lazy-starts a daemon
   (`client::set_in_process`) and never fans out to machines; the
   dispatcher's subprocesses pass it too.
-  `machines/` is remote hosts over ssh (docs/machines.md; registry
+  `machines/` is remote hosts over ssh (docs/architecture/daemon/machines.md; registry
   `machines.toml` next to `state.toml`, written by the daemon only, read by
   the CLI only to know if any exist):
   `mod.rs` (the registry: `Entry`, locked atomic `update`, name rules,
@@ -139,10 +142,10 @@ git worktrees so working trees are never shared.
 - `devsbd/` — static in-container helper (workspace member), built by
   `scripts/build-devsbd.sh` and embedded by `build.rs`; `src/devsbd.rs` holds
   the embedded blobs + install, `src/devsbd/proto.rs` the frame protocol
-  shared with the helper via `#[path]`. See `docs/sandbox-helper.md`.
+  shared with the helper via `#[path]`. See `docs/architecture/helper/`.
   `src/devsbd/forward.rs` is the host forwarder engine (unix-only): binds a
   local listener and tunnels each connection through a self-healing bridge, over
-  the mux's flow-controlled `Connect` streams. See `docs/port-forwarding.md`.
+  the mux's flow-controlled `Connect` streams. See `docs/architecture/daemon/forwards.md`.
   Also shared via `#[path]` (line-based, the helper has no serde):
   `bootfile.rs` (boot file for the in-container `postStartCommand` hook),
   `notify.rs` (notification record), `control.rs` (control request/response
@@ -170,7 +173,7 @@ git worktrees so working trees are never shared.
   (`TermSession`/`TermTabs`, a shell rendered via vt100: `devsandbox exec`
   for an instance, `<runtime> exec -it` for a service);
   `kitty.rs` emulates the kitty keyboard protocol for those sessions (vt100
-  callbacks + key encoding; see `docs/tui-terminal.md`);
+  callbacks + key encoding; see `docs/architecture/dashboard/terminal.md`);
   `remote.rs` is machines in the dashboard (pure): the `machine/name` key
   everything keys rows by, a row's route (`machine` + remote `root`), the
   unreachable rule, the header's `box: connecting` note, and the ssh argv of
@@ -190,7 +193,7 @@ git worktrees so working trees are never shared.
   a daemon (`daemon.rs` does). The dashboard's `run`/`rebuild`/`start` are detached
   verb requests, `stop`/`rm`/`services.rebuild` held ones, each on its own
   connection (`spawn_verb` in `tui/mod.rs`).
-  Mouse selection (`docs/tui-selection.md`): `select.rs` is the pure model
+  Mouse selection (`docs/architecture/dashboard/selection.md`): `select.rs` is the pure model
   (extraction, highlight), `app/selection.rs` its routing, `clipboard.rs` the
   OSC 52 writer; `ansi.rs` turns the build log's SGR lines into styled
   spans; `settings.rs` the dashboard settings (`dashboard.toml` next
@@ -204,8 +207,19 @@ git worktrees so working trees are never shared.
 
 ## Conventions & checks
 
-- Docs in `docs/` are named after their topic, no `plan-` prefix or `-plan`
-  suffix (e.g. `docs/rebuild.md`, not `docs/plan-rebuild.md`).
+- Docs (`docs/README.md` has the layout): `architecture/` and `reference/`
+  describe the code as it is, present tense, no status lines, no
+  limitations sections, code cited by path + symbol (never line numbers).
+  A change to behavior updates the area's doc in the same commit, and
+  `docs/status.md` (the only place for in progress / planned / parked /
+  known limitations) when it adds, fixes or parks something. Decisions
+  that still hold are ADRs in `decisions/` (a new one supersedes, old ones
+  aren't rewritten). Plans live in `plans/active/<topic>.md`; once shipped,
+  their content moves into the living docs and the plan goes to
+  `plans/archive/` (banner on top), deleted once outdated. Skip
+  `plans/archive/` unless asked about history. Names are topics, no
+  `plan-` prefix or `-plan` suffix. `docs_links` (`tests/docs_links.rs`)
+  checks every `docs/…` path cited in code and every relative link in docs.
 - Doc comments explain _why_; keep them current when moving logic.
 - Tests live in `#[cfg(test)]` modules per file; most logic is factored to be
   testable without a container runtime.

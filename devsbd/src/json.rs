@@ -1,7 +1,7 @@
 //! A JSON syntax checker (RFC 8259) that also pulls top-level string fields
 //! out: `key` for `devsbd thread put`, `thread` + `id` for `devsbd thread
-//! send` (docs/inbox-threads.md, *Decisions*: "Helper: syntax check only";
-//! docs/inbox-redesign.md, *Threads and messages*). The helper has no
+//! send` (docs/decisions/0022-helper-has-no-dependencies.md;
+//! docs/architecture/inbox/threads-and-feed.md). The helper has no
 //! dependencies on purpose, and the schema belongs to the host, so this
 //! validates the document and extracts the fields the outbox and the wire
 //! record need — nothing else is decoded or kept.

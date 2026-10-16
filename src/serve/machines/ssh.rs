@@ -1,6 +1,6 @@
-//! The ssh transport to a machine (docs/machines.md, F3, F14): the argv the
-//! daemon, the CLI and the TUI all build through, and the dial that spawns
-//! it.
+//! The ssh transport to a machine (docs/architecture/daemon/machines.md,
+//! *ssh*): the argv the daemon, the CLI and the TUI all build through, and
+//! the dial that spawns it.
 //!
 //! Plain ssh: no ControlMaster of our own, the user's `~/.ssh/config`
 //! decides. The remote command goes through the login shell
@@ -138,17 +138,19 @@ pub fn tty_argv(entry: &Entry, remote_args: &[impl AsRef<str>]) -> Result<Vec<Os
     cli_argv(entry, true, remote_args)
 }
 
-/// The argv of a CLI command re-run on `entry` (docs/machines.md, *CLI:
-/// ssh for the rest*): [`tty_argv`]'s, but `-T` when this process isn't on
-/// a terminal (`devsandbox exec m/x -- cat f > out` must get the bytes, not
-/// a pty's CRLFs). No `BatchMode`: a person is there.
+/// The argv of a CLI command re-run on `entry`
+/// (docs/architecture/daemon/machines.md, *The CLI: `cli.rs`*):
+/// [`tty_argv`]'s, but `-T` when this process isn't on a terminal
+/// (`devsandbox exec m/x -- cat f > out` must get the bytes, not a pty's
+/// CRLFs). No `BatchMode`: a person is there.
 pub fn cli_argv(entry: &Entry, tty: bool, remote_args: &[impl AsRef<str>]) -> Result<Vec<OsString>> {
     argv(entry, &[if tty { "-t" } else { "-T" }, "-A"], remote_args)
 }
 
 /// [`tty_argv`] running `program` on `entry` instead of its devsandbox: a
-/// dashboard service tab's `<runtime> exec -it …` (docs/machines.md,
-/// *Service tabs*). `program` is shell text, like `entry`'s `command`.
+/// dashboard service tab's `<runtime> exec -it …`
+/// (docs/architecture/daemon/machines.md, *ssh*). `program` is shell text,
+/// like `entry`'s `command`.
 pub fn tty_argv_with(entry: &Entry, program: &str, remote_args: &[impl AsRef<str>]) -> Result<Vec<OsString>> {
     argv_with(entry, &["-t", "-A"], program, remote_args)
 }

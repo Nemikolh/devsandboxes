@@ -1,4 +1,4 @@
-//! Embedded devsbd helper binaries (see docs/sandbox-helper.md and build.rs).
+//! Embedded devsbd helper binaries (see docs/architecture/helper/overview.md and build.rs).
 //! Both Linux arches are always embedded: the non-host one is the fallback
 //! for emulated images. An empty blob means the helper wasn't built, and
 //! callers fall back to the bind-mount path.
@@ -26,7 +26,7 @@ mod escape;
 #[allow(dead_code)]
 pub mod notify;
 // The forwarder engine (step 5); the CLI (`devsandbox port`) drives its full
-// public surface, the TUI Ports tab reuses it (docs/port-forwarding.md).
+// public surface, the TUI Ports tab reuses it (docs/architecture/daemon/forwards.md).
 #[cfg(unix)]
 pub mod forward;
 #[cfg(unix)]
@@ -227,7 +227,7 @@ fn parse_version(out: &str) -> Option<&str> {
 /// straight to the right blob), else the host's, then the other. No
 /// `uname`/inspect probe: local runtimes run host-arch containers except
 /// emulated images, which the blind second try covers. Real probing is
-/// deferred to remote-container support (docs/sandbox-helper.md).
+/// deferred to remote-container support (docs/architecture/helper/overview.md).
 fn candidates(recorded: Option<Arch>) -> [Arch; 2] {
     let first = recorded.unwrap_or_else(Arch::host);
     [first, first.other()]

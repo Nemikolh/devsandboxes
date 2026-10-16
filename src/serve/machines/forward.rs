@@ -1,4 +1,5 @@
-//! Requests forwarded to a machine (docs/machines.md, step 4).
+//! Requests forwarded to a machine (docs/architecture/daemon/machines.md,
+//! *Forwarded requests*).
 //!
 //! - Quick calls with `machine` (F6, [`QUICK`]): the daemon strips it and
 //!   sends the rest over the machine's held link (`service::Handle::forward`);

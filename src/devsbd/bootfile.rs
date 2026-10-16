@@ -1,5 +1,5 @@
 //! The boot file: what `devsbd boot` runs when the container (re)starts
-//! (docs/automations.md, "`\"runtime\"` — the runtime restarts it"). Written by
+//! (docs/architecture/automations/autostart.md, "`\"runtime\"`: boot hook"). Written by
 //! the host, read by the helper; one file shared by both crates (devsbd
 //! includes it via `#[path]`) so the two sides can't drift. std-only and
 //! hand-parsed: the helper has no dependencies.

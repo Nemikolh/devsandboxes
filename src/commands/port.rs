@@ -1,7 +1,7 @@
-//! Port forwarding route resolution (docs/port-forwarding.md, step 6). Turns a
-//! `(instance?, service?, port)` request into a concrete dial target for the
-//! host forwarder (`src/devsbd/forward.rs`): which container carries the tunnel
-//! and what its daemon dials there.
+//! Port forwarding route resolution (docs/architecture/daemon/forwards.md,
+//! *Routes*). Turns a `(instance?, service?, port)` request into a concrete
+//! dial target for the host forwarder (`src/devsbd/forward.rs`): which
+//! container carries the tunnel and what its daemon dials there.
 //!
 //! Split into a pure planner and an impure edge:
 //!
@@ -58,7 +58,7 @@ pub enum Planned {
 /// prompts on a TTY and this runs on the forwarder's worker thread). `project`
 /// scopes service container names.
 ///
-/// Rules (docs/port-forwarding.md, _Routes_):
+/// Rules (docs/architecture/daemon/forwards.md, _Routes_):
 ///
 /// - No service → **instance forward**: the instance must exist and be running.
 /// - Isolated service → needs a named instance that references it (the owner);
@@ -132,7 +132,7 @@ pub fn plan(
 }
 
 /// Parse `lsof -F` (field) output into the listening `(pid, command)` pairs
-/// (docs/port-forwarding.md, _Listening process_). `-F` emits one field per
+/// (docs/architecture/daemon/forwards.md, _Routes_). `-F` emits one field per
 /// line: a `p<pid>` line opens a process set, a `c<command>` line names its
 /// command; other field lines (file descriptors, addresses) are ignored. A
 /// `c` line with no preceding `p` is dropped. Duplicates — the same process
@@ -174,7 +174,7 @@ fn format_procs(procs: &[(u32, String)]) -> Option<String> {
 /// stderr — the TUI owns the screen), via a plain root `exec` (no devsbd
 /// needed). `-F` output is machine-parseable; any failure at all — `lsof`
 /// missing (exit 127), no match (exit 1), or the container gone — yields
-/// `None`, never an error (docs/port-forwarding.md, _Listening process_).
+/// `None`, never an error (docs/architecture/daemon/forwards.md, _Routes_).
 pub(crate) fn listening_procs(container: &str, port: u16) -> Option<String> {
     let out = crate::runtime::backend()
         .output_quiet(&[
@@ -424,7 +424,7 @@ pub fn validate_port_spec(spec: &str) -> Result<(Option<u16>, u16), String> {
 /// Parse a CLI port spec into `(host binding, container port)`.
 ///
 /// - `<port>` → `(Prefer(port), port)`: same host port, or the next free one
-///   up if taken (docs/port-forwarding.md, _Binding_).
+///   up if taken (docs/architecture/daemon/forwards.md, _Host ports_).
 /// - `<host>:<port>` → `(Fixed(host), port)`: explicit host port, fail if taken.
 ///
 /// Shape validation is shared with the TUI via [`validate_port_spec`].
@@ -475,7 +475,8 @@ fn split_target(name: Option<String>, has_service: bool, mut ports: Vec<String>)
 
 /// CLI entry point for `devsandbox port`. Starts one forward per spec, waits for
 /// each to reach its first outcome, prints the mapping, then blocks until SIGINT
-/// (unix-only). See docs/port-forwarding.md, step 7.
+/// (unix-only). See docs/architecture/daemon/forwards.md, *Foreground
+/// `devsandbox port`*.
 #[cfg(unix)]
 pub fn port(
     dir: std::path::PathBuf,

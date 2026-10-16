@@ -1,5 +1,5 @@
 //! An instance's processes and runs as the daemon's `instances.procs`
-//! answers them (docs/api.md): the parse of a container's `ps -eo
+//! answers them (docs/reference/api.md): the parse of a container's `ps -eo
 //! pid,ppid,args` listing and of its helper's `devsbd run ls`, pure so they
 //! unit-test without docker, plus the bounded `devsbd run ls` probe itself.
 //! The dashboard's forest and row formatting stay in `tui::procs`.
@@ -42,7 +42,7 @@ fn remainder_after<'a>(line: &'a str, pid: &str, ppid: &str) -> Option<&'a str> 
     }
 }
 
-/// One tracked run of a container's helper (docs/automations.md, "Runs"),
+/// One tracked run of a container's helper (docs/architecture/helper/in-container.md),
 /// as a `devsbd run ls` line `<id> <state> <started> <argv…>` says it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Run {

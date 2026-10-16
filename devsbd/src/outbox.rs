@@ -1,5 +1,6 @@
 //! `devsbd notify` / `devsbd thread put|send|withdraw|rm` and the outbox they
-//! write (docs/automations.md, "`devsbd notify`", *Inbox threads*). A message
+//! write (docs/architecture/helper/in-container.md, *Outbox: `devsbd notify`,
+//! `devsbd thread put|send|withdraw|rm`*). A message
 //! is queued as one file per record in `notify::OUTBOX`, so it survives a
 //! missing host and container restarts; the daemon's flusher (`daemon.rs`)
 //! sends and deletes them. Files are named `<secs:010>-<nanos:09>-<pid>` so a
@@ -51,8 +52,7 @@ enum ThreadVerb {
     Rm(String),
 }
 
-/// `devsbd thread put|send|withdraw|rm` (docs/inbox-threads.md,
-/// docs/inbox-redesign.md): queue a thread message in the same durable outbox
+/// `devsbd thread put|send|withdraw|rm` (docs/architecture/inbox/threads-and-feed.md): queue a thread message in the same durable outbox
 /// `notify` uses, so it lands even with no dashboard open.
 pub fn thread(args: &[String]) -> io::Result<()> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
@@ -124,7 +124,7 @@ fn parse_thread_args(args: &[String]) -> Result<ThreadVerb, String> {
 }
 
 /// The record to queue for `verb`. The body is only syntax-checked here and
-/// travels opaque (docs/inbox-threads.md, *Decisions*); the key (and a
+/// travels opaque (docs/decisions/0022-helper-has-no-dependencies.md); the key (and a
 /// message's thread and id) are pulled out so the outbox can coalesce and the
 /// host can report a rejected body against the right thread.
 fn thread_message(verb: ThreadVerb, at: u64) -> Result<Message, String> {

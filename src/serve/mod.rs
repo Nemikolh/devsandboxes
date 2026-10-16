@@ -1,11 +1,11 @@
-//! `devsandbox serve`: the per-user host daemon (docs/serve.md,
-//! docs/inbox-redesign.md "Host daemon"). Unix-only for now; `main.rs` gates
-//! the whole module.
+//! `devsandbox serve`: the per-user host daemon
+//! (docs/architecture/daemon/role.md). Unix-only for now; `main.rs` gates the
+//! whole module.
 //!
 //! The socket and its permissions, the start lock, lazy start from clients,
 //! version handoff and the idle exit (step 4); the bridges, with the outbox
 //! drain, popups and control ops, and the startup autostart pass (step 5).
-//! The API (step 6, docs/api.md): `api` methods over the same wire,
+//! The API (step 6, docs/reference/api.md): `api` methods over the same wire,
 //! `subscribe` notifications.
 //!
 //! - `api`: the method table and handlers (thin calls into `inbox::ops`,
@@ -20,9 +20,9 @@
 //! - `forwards`: the port forwards (ad-hoc and configured), on their own thread
 //! - `forward_store`: `forwards.toml`, the ad-hoc forwards a successor restores
 //! - `client`: connect-or-lazy-start for commands
-//! - `machines`: remote hosts over ssh (docs/machines.md): the registry
-//!   (`machines.toml`), the ssh argv and dial, the link handshake, the
-//!   `machines.*` methods
+//! - `machines`: remote hosts over ssh (docs/architecture/daemon/machines.md):
+//!   the registry (`machines.toml`), the ssh argv and dial, the link
+//!   handshake, the `machines.*` methods
 //! - `relay`: `devsandbox api --stdio`, stdin/stdout ↔ the socket (step 9)
 //! - `install`: `serve install|uninstall`, the systemd user unit / LaunchAgent
 //!   (step 10)

@@ -172,7 +172,7 @@ enum Command {
         #[command(subcommand)]
         cmd: ServiceCommand,
     },
-    /// Read and answer Inbox threads (docs/inbox-cli.md)
+    /// Read and answer Inbox threads (docs/reference/inbox-cli.md)
     Inbox {
         #[command(subcommand)]
         cmd: InboxCommand,
@@ -277,7 +277,7 @@ enum Command {
         /// Ports to forward, each `<port>` or `<host>:<port>` (at least one)
         ports: Vec<String>,
     },
-    /// Run the per-user host daemon in the foreground (docs/serve.md)
+    /// Run the per-user host daemon in the foreground (docs/architecture/daemon/role.md)
     ///
     /// Plumbing: commands start it on demand, detached, and it exits after
     /// 10 minutes without clients. Exits at once (status 0) when one is
@@ -294,7 +294,7 @@ enum Command {
         #[arg(long, hide = true, value_name = "DIR")]
         socket_dir: Option<PathBuf>,
     },
-    /// Relay the daemon's API (docs/api.md) over stdin/stdout, for clients
+    /// Relay the daemon's API (docs/reference/api.md) over stdin/stdout, for clients
     /// that can only spawn a process
     ///
     /// Starts the daemon if needed. The client sends the `hello` itself.
@@ -308,12 +308,12 @@ enum Command {
         #[arg(long, default_value = "api")]
         client: String,
         /// Give relayed verb requests this process's env (a machine link's
-        /// relay over ssh: docs/machines.md)
+        /// relay over ssh: docs/architecture/daemon/machines.md)
         #[arg(long, hide = true)]
         session_env: bool,
     },
     /// Register remote hosts (over ssh) whose sandboxes this one manages
-    /// (docs/machines.md)
+    /// (docs/architecture/daemon/machines.md)
     #[cfg(unix)]
     Machine {
         #[command(subcommand)]
@@ -496,11 +496,11 @@ fn main() -> Result<()> {
     };
 
     // The five verbs and `service rebuild` go to the daemon
-    // (docs/verbs-as-requests.md, docs/api.md *Verbs*); it runs
+    // (docs/architecture/daemon/verbs.md, docs/reference/api.md *Verbs*); it runs
     // them as `--in-process` subprocesses, which take the arms below. With
     // no daemon to reach, `fallback` says why and they run here instead.
     //
-    // Before that, machines (docs/machines.md): a name may be a machine's,
+    // Before that, machines (docs/architecture/daemon/machines.md): a name may be a machine's,
     // and `--machine` runs a nameless command there. A command that ran on a
     // machine over ssh ends here; the rest come back with their name as this
     // host knows it. The registry is read from the file (F15), never under

@@ -5,8 +5,8 @@
 //! `Close` shuts the local socket down without echoing one back.
 //!
 //! Local ends are a [`Conn`]: a unix socket (ssh-agent streams) or a TCP
-//! socket (forwarded ports, docs/port-forwarding.md). Unix-only: the Windows
-//! host will need a named-pipe stream here (docs/sandbox-helper.md).
+//! socket (forwarded ports, docs/architecture/daemon/forwards.md). Unix-only: the Windows
+//! host will need a named-pipe stream here (docs/plans/active/windows-support.md).
 //!
 //! Two kinds of stream share the connection:
 //! - **Legacy** (`Open`, ssh-agent, notify): `Data` is written straight into the
@@ -69,7 +69,7 @@ const MAX_HOST_STREAMS: usize = 256;
 /// Stream-id spaces: the daemon allocates ids with the high bit clear
 /// (1..2^31), the host with it set (`Mux::connect`). The host refuses a peer
 /// `Open` whose id has this bit set, the daemon a `Connect` whose id doesn't
-/// (docs/sandbox-helper.md, _Frame protocol_).
+/// (docs/architecture/helper/protocol.md, _Frames_).
 const HOST_ID_BIT: u32 = 1 << 31;
 
 /// Reason sent with the `Close` for a peer that overran its credit.
@@ -549,7 +549,7 @@ impl Mux {
     /// daemon dials it inside the container) and relay `conn` over it. Returns
     /// the allocated host id. `on_close` runs once when the stream ends, with
     /// the reason (see [`OnClose`]); it isn't called when this returns `Err`.
-    #[allow(dead_code)] // host forwarder (docs/port-forwarding.md, steps 4-5)
+    #[allow(dead_code)] // host forwarder (docs/architecture/daemon/forwards.md)
     pub fn connect(
         self: &Arc<Self>,
         conn: impl Into<Conn>,
@@ -893,7 +893,7 @@ impl Mux {
                         None => self.send_ctl(Frame::Close { stream, reason: "stream refused".into() }),
                     }
                 }
-                // The peer's capabilities (docs/port-forwarding.md): record them
+                // The peer's capabilities (docs/architecture/helper/protocol.md): record them
                 // and wake anything waiting on them (the daemon's held agent
                 // clients). Arrives once on stream 0 right after the handshake.
                 Frame::Caps(c) => {

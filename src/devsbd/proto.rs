@@ -1,5 +1,5 @@
 //! Frame protocol between the host (`devsandbox`) and the in-container helper
-//! (`devsbd bridge`), over `exec -i` stdio (docs/sandbox-helper.md). One file
+//! (`devsbd bridge`), over `exec -i` stdio (docs/architecture/helper/protocol.md). One file
 //! shared by both crates (devsbd includes it via `#[path]`) so the two sides
 //! can't drift; std-only because devsbd has no dependencies.
 //!
@@ -10,7 +10,7 @@
 //!
 //! Kinds: 0 `Hello` · 1 `Open` · 2 `Data` · 3 `Close` · 4 `Ping` · 5 `Pong` ·
 //! 6 `Quit` · 7 `Connect` · 8 `Window` · 9 `Eof` · 10 `Caps`. 7–10 are the
-//! additive port-forwarding frames (see docs/port-forwarding.md); older peers
+//! additive port-forwarding frames (see docs/architecture/daemon/forwards.md); older peers
 //! skip them as unknown kinds.
 //!
 //! **Frozen across versions:** the header layout, `Hello`'s leading `u32`
@@ -45,7 +45,7 @@ pub const MAX_PAYLOAD: u32 = 1 << 20;
 /// channel, not a protocol change.
 pub mod channel {
     pub const SSH_AGENT: u8 = 1;
-    #[allow(dead_code)] // reserved for API proxying (docs/sandbox-helper.md)
+    #[allow(dead_code)] // reserved for API proxying (docs/architecture/helper/protocol.md)
     pub const HTTP_PROXY: u8 = 2;
     /// A notification record from the outbox (`notify.rs`): the daemon sends
     /// the record then `Eof`; the host replies `notify::REPLY_OK`. Only opened
@@ -108,7 +108,7 @@ pub enum Frame {
     Close { stream: u32, reason: String },
     /// Host asks the daemon to open a TCP stream to `host:port` from inside the
     /// container. `stream` carries the host id (high bit set). Flow-controlled
-    /// end to end; see docs/port-forwarding.md.
+    /// end to end; see docs/architecture/daemon/forwards.md.
     Connect { stream: u32, host: String, port: u16 },
     /// Flow control: the receiver grants `credit` more bytes it's ready to
     /// accept on `stream`. Batched (one per half-window), not one per chunk.

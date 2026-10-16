@@ -12,8 +12,7 @@ limitation means editing this file in the same commit.
 
 ## In progress
 
-- **docs**: restructure into architecture / reference / decisions / plans.
-  → [plan](plans/active/docs-restructure.md)
+(none)
 
 ## Planned
 

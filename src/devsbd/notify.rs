@@ -1,6 +1,6 @@
 //! A notification record: what `devsbd notify` queues in the container's
 //! outbox and the daemon sends, one per `Open(NOTIFY)` stream, to a host that
-//! advertises `caps::NOTIFY` (docs/automations.md, "`devsbd notify`"). One
+//! advertises `caps::NOTIFY` (docs/architecture/helper/protocol.md, "`notify`"). One
 //! file shared by both crates (devsbd includes it via `#[path]`) so the writer
 //! and the reader can't drift; std-only and hand-parsed, like `bootfile.rs`.
 //!
@@ -22,7 +22,7 @@
 //! msg PR 123\nneeds you    notify only, required
 //! body {"key":"pr-123",…}  thread-put|thread-send only, required: the JSON
 //!                          body. The helper only syntax-checks it
-//!                          (docs/inbox-threads.md, "Decisions"); the host
+//!                          (docs/decisions/0022-helper-has-no-dependencies.md); the host
 //!                          owns the schema.
 //! ```
 //!
@@ -46,7 +46,7 @@ pub const OUTBOX: &str = "/var/lib/devsandbox/outbox";
 /// (well under `proto::MAX_PAYLOAD`).
 pub const MAX_RECORD: usize = 64 * 1024;
 
-/// Cap on a `thread send` body (docs/inbox-redesign.md, *Messages*): leaves
+/// Cap on a `thread send` body (docs/architecture/inbox/threads-and-feed.md, *`thread send`*): leaves
 /// room under [`MAX_RECORD`] for the directives and the escaping. Checked by
 /// the helper before queuing and by the host's schema.
 pub const MAX_SEND_BODY: usize = 48 * 1024;
@@ -92,7 +92,7 @@ pub struct Record {
 }
 
 /// What one outbox file holds: the original `devsbd notify` record, or one of
-/// the `devsbd thread` verbs (docs/inbox-threads.md). They share the queue,
+/// the `devsbd thread` verbs (docs/architecture/inbox/threads-and-feed.md). They share the queue,
 /// the transport and the `ok` handshake; only the directives differ.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
@@ -133,7 +133,8 @@ impl Message {
     }
 
     /// Whether queuing `self` makes the still-queued `older` pointless, so
-    /// the outbox can drop it (docs/automations.md, *Inbox threads*):
+    /// the outbox can drop it (docs/architecture/helper/in-container.md, *Outbox: `devsbd notify`,
+    /// `devsbd thread put|send|withdraw|rm`*):
     ///
     /// - a put replaces a queued put for its thread (the newest header wins);
     /// - an rm replaces a queued put or rm for its thread, and every queued

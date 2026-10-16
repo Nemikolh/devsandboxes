@@ -21,9 +21,9 @@ use crate::state::{Instance, Phase, PhaseView, State};
 /// no longer resolves, `rebuild` bails: re-materializing against a config that
 /// doesn't match the instance would silently rebuild it wrong.
 ///
-/// A `failed` instance (docs/instance-phase.md) is always rebuilt when named:
-/// that's how it's retried. One still being materialized is refused, and
-/// `--all` skips both.
+/// A `failed` instance (docs/architecture/instances/lifecycle.md) is always
+/// rebuilt when named: that's how it's retried. One still being materialized
+/// is refused, and `--all` skips both.
 pub fn rebuild(dir: &Path, name: Option<String>, all: bool, force: bool) -> Result<()> {
     // Ctrl-C/SIGTERM mid-rebuild leaves the instance `failed` ("cancelled").
     let _cancel = run::cancel::catch();
@@ -139,9 +139,10 @@ fn recreate(
     // Remove the old container; ignore failure (it may already be gone).
     let _ = backend().remove_force(&container);
 
-    // In flight from here (docs/instance-phase.md). The instance existed
-    // before, so a failure is never rolled back: it stays as `failed`, the
-    // worktree and branch with it, for another rebuild or an `rm`.
+    // In flight from here (docs/architecture/instances/lifecycle.md). The
+    // instance existed before, so a failure is never rolled back: it stays as
+    // `failed`, the worktree and branch with it, for another rebuild or an
+    // `rm`.
     let mut tracker = run::Tracker::new(&instance_id, Phase::Building);
     tracker.start()?;
 

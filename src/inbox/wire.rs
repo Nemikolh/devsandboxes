@@ -16,7 +16,7 @@ use super::form::{self, ChoiceDefault, FormError, QuestionKind};
 use super::thread::HostVerb;
 use super::{Block, FeedItem, FormRecord, Inbox, ItemKind, Kind, Marker, Op, Thread, feed, ops};
 
-/// An error answer: a stable machine `code` (docs/api.md, *Errors*) and a
+/// An error answer: a stable machine `code` (docs/reference/api.md, *Errors*) and a
 /// human message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiError {

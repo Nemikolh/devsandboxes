@@ -1,5 +1,5 @@
-//! Which threads a list shows: the Inbox views (docs/inbox-threads.md,
-//! *Inbox UI*). Pure, and here rather than in the TUI because every client
+//! Which threads a list shows: the Inbox views (docs/architecture/inbox/views-and-wire.md,
+//! *Views*). Pure, and here rather than in the TUI because every client
 //! filters with it: the dashboard's view strip and the daemon API's
 //! `inbox.threads.list` (src/serve/api.rs) must never disagree on what
 //! "Needs you" holds. The dashboard adds its own display bits (titles,

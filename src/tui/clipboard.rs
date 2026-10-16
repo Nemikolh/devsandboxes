@@ -1,5 +1,5 @@
 //! Copy to the system clipboard through the outer terminal: OSC 52
-//! (docs/tui-selection.md, *Clipboard*). It needs no host clipboard, so it
+//! (docs/architecture/dashboard/selection.md, *OSC 52*). It needs no host clipboard, so it
 //! reaches the user's machine over SSH and from inside a container. Pure: the
 //! event loop writes the bytes, since `App` stays I/O-free.
 

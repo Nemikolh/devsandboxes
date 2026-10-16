@@ -6,9 +6,10 @@ use crate::runtime::backend;
 use crate::state::State;
 
 /// Bring up every `autostart` sandbox of the config root in `dir`, once per
-/// host boot (docs/automations.md). Called after `run`/`start` and on TUI
-/// load; never fails the caller — problems are warnings on stderr. No
-/// loadable config or no readable boot id is a silent no-op.
+/// host boot (docs/architecture/automations/autostart.md). Called after
+/// `run`/`start` and on TUI load; never fails the caller — problems are
+/// warnings on stderr. No loadable config or no readable boot id is a silent
+/// no-op.
 ///
 /// The boot is recorded (and saved) *before* acting, so a start that keeps
 /// failing can't retrigger on every invocation; the next boot retries.
@@ -136,7 +137,7 @@ struct Row<'a> {
     /// Dispatcher-owned (`Instance.dispatcher` set).
     child: bool,
     /// Being materialized, or failed (`Instance.progress` set,
-    /// docs/instance-phase.md).
+    /// docs/architecture/instances/lifecycle.md).
     not_ready: bool,
 }
 
@@ -258,8 +259,8 @@ fn runtime_label(backend: &str) -> &str {
 
 /// Whether the runtime itself restarts the container (`"runtime"` on a backend
 /// with restart policies). Then the in-container boot hook, not the host, owns
-/// `postStartCommand` on `start` (docs/automations.md); elsewhere `"runtime"`
-/// behaves as `true` (see [`restart_decision`]).
+/// `postStartCommand` on `start` (docs/architecture/automations/autostart.md);
+/// elsewhere `"runtime"` behaves as `true` (see [`restart_decision`]).
 pub(crate) fn runtime_restarts(mode: Option<Autostart>, supported: bool) -> bool {
     mode == Some(Autostart::Runtime) && supported
 }

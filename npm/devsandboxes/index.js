@@ -159,7 +159,7 @@ const service = {
   rebuild: (name, opts) => cli(['service', 'rebuild', name], opts).then(unit),
 };
 
-// ---- Daemon API (docs/api.md) over `devsandbox api --stdio`.
+// ---- Daemon API (docs/reference/api.md) over `devsandbox api --stdio`.
 
 /** The API protocol this client speaks (`serve::proto::PROTOCOL`). */
 const PROTOCOL = 1;

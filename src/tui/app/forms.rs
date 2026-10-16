@@ -1,4 +1,4 @@
-//! Inbox forms (docs/inbox-redesign.md, *Forms* and *TUI Inbox*): the open
+//! Inbox forms (docs/architecture/inbox/forms.md and docs/architecture/dashboard/inbox-tab.md, *Replies and forms*): the open
 //! forms pinned under the thread pane's header, their focus zone
 //! ([`InboxFocus::Form`]) and keys, and the read-only answers of a submitted
 //! one in the feed.
@@ -587,8 +587,8 @@ impl App {
         Ok(())
     }
 
-    /// Keys while the form zone has focus (docs/inbox-redesign.md, *Form
-    /// editing*): `tab`/`S-tab` step through every pinned form's questions,
+    /// Keys while the form zone has focus (docs/architecture/dashboard/inbox-tab.md,
+    /// *Replies and forms*): `tab`/`S-tab` step through every pinned form's questions,
     /// `↑`/`↓` (and `←`/`→`) the options, `space` picks (a text question:
     /// edits), `e` edits a text question in the composer box, `enter` is
     /// Confirm then submit, `esc` cancels Confirm or goes back to the

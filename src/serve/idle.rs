@@ -1,6 +1,7 @@
-//! The idle exit (docs/inbox-redesign.md "Idle exit"): the daemon exits after
-//! [`IDLE_TIMEOUT`] with no holder; a new holder cancels the countdown. Pure,
-//! so the daemon loop only snapshots [`Holders`] and acts on the [`Decision`].
+//! The idle exit (docs/architecture/daemon/role.md "Holders and idle exit"):
+//! the daemon exits after [`IDLE_TIMEOUT`] with no holder; a new holder
+//! cancels the countdown. Pure, so the daemon loop only snapshots [`Holders`]
+//! and acts on the [`Decision`].
 
 use std::time::{Duration, Instant};
 

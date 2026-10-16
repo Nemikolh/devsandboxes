@@ -21,12 +21,12 @@ fn busy(row: &InstanceRow) -> Option<String> {
     }
 }
 
-/// VS Code on a machine's instance: not yet (docs/machines.md, step 7).
+/// VS Code on a machine's instance: not yet (docs/plans/active/machines-next.md, *2. VS Code on a remote machine (rollout step 7, spike)*).
 pub fn not_yet_code(machine: &str, name: &str) -> String {
     format!("code {machine}/{name}: VS Code on a machine isn't supported yet")
 }
 
-/// Forwards from a machine: not yet (docs/machines.md, *Not now*).
+/// Forwards from a machine: not yet (docs/plans/active/machines-next.md, *1. Remote forwards (rollout step 6)*).
 pub fn not_yet_port(machine: &str, name: &str) -> String {
     format!("port {machine}/{name}: forwarding from a machine isn't supported yet")
 }

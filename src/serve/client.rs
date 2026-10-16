@@ -241,8 +241,8 @@ pub fn ensure_running(client: &str) {
 }
 
 /// Ask the daemon (lazy start, as `cli`) for instance `instance`'s bridge
-/// (`bridges.ensure`, docs/api.md), reporting `agent`, the caller's own
-/// `SSH_AUTH_SOCK`. Without `wait` it returns once the daemon took the
+/// (`bridges.ensure`, docs/reference/api.md), reporting `agent`, the caller's
+/// own `SSH_AUTH_SOCK`. Without `wait` it returns once the daemon took the
 /// request; with it, once the bridge's handshake is decided or `wait` ran out,
 /// with the [`Readiness`](crate::devsbd::bridge::Readiness) (`None` from a
 /// daemon too old to wait). Hold the returned connection while the command

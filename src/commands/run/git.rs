@@ -145,7 +145,8 @@ impl Entry {
 }
 
 /// Why `e` makes the repo unsafe for host git, or `None` when it is on the
-/// allowlist (docs/automations.md step 17). Anything unknown is refused.
+/// allowlist (docs/decisions/0003-host-git-never-runs-repo-controlled-code.md).
+/// Anything unknown is refused.
 fn refusal(e: &Entry) -> Option<String> {
     let key = e.key.as_str();
     let value = e.value.as_deref().unwrap_or("").trim_start();

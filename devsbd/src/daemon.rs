@@ -40,7 +40,7 @@ pub const DIR: &str = "/run/devsandbox";
 pub const CTL: &str = "/run/devsandbox/devsbd.ctl";
 const PIDFILE: &str = "/run/devsandbox/devsbd.pid";
 /// Same path the bind-mount design uses, so `SSH_AUTH_SOCK` is identical in
-/// both modes (docs/sandbox-helper.md).
+/// both modes (docs/architecture/helper/ssh-agent.md).
 const AGENT_SOCK: &str = "/run/devsandbox/ssh-agent.sock";
 /// Client socket for in-container tools (mode 0666, like the agent socket).
 /// Each connection's first byte selects the request: [`API_POKE`] or
@@ -116,7 +116,7 @@ const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 /// Accepted gap: an older CLI exec'ing a newer helper sends no `Caps` behind a
 /// capable bridge, so that bridge is never used for agent routing (the daemon
 /// falls back to others). Mixed CLI builds already evict each other on
-/// takeover (docs/sandbox-helper.md), so it's rare.
+/// takeover (docs/architecture/helper/protocol.md), so it's rare.
 fn known_host_caps(bridge_caps: u32, host_caps: Option<u32>) -> Option<u32> {
     match host_caps {
         Some(c) => Some(c),

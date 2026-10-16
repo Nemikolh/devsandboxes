@@ -1,4 +1,4 @@
-//! `devsandbox inbox …`: the Inbox from a shell (docs/inbox-cli.md).
+//! `devsandbox inbox …`: the Inbox from a shell (docs/reference/inbox-cli.md).
 //!
 //! Reads (`ls`, `show`) go straight to the store, so they work without the
 //! daemon and never start it. Mutations go to a daemon already running

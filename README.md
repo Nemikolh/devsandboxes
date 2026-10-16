@@ -40,8 +40,8 @@ devsandbox              # the dashboard
 | `vscode <name> [--goto PATH[:LINE[:COL]]]` | Open VS Code attached to the instance, optionally at a file and line      |
 | `done` / `undone <name>`                   | Mark an instance done (kept as is, shown dimmed) / clear the mark         |
 | `port <name> [--service s] <port…>`        | Forward a container/service port to the host until exited                 |
-| `inbox ls\|show\|reply\|act\|submit\|done\|reopen` | Read and answer Inbox threads (docs/inbox-cli.md)                   |
-| `serve install` / `serve uninstall`        | Run the host daemon from login (it otherwise starts on demand; docs/serve.md) |
+| `inbox ls\|show\|reply\|act\|submit\|done\|reopen` | Read and answer Inbox threads (docs/reference/inbox-cli.md)         |
+| `serve install` / `serve uninstall`        | Run the host daemon from login (it otherwise starts on demand; docs/architecture/daemon/role.md) |
 | `service ls` / `service rebuild`           | List services / recreate one and rewire running sandboxes in place        |
 | `gc [--force]`                             | Reap unreferenced services, orphaned history files and agent links        |
 | `status --json`                            | Full snapshot for scripts; `ps`/`ls`/`stats`/`inspect`/`run`/`inbox` take `--json` |
@@ -79,4 +79,4 @@ Inside a sandbox, `devsbd notify "PR 123 needs you"` reaches the dashboard's Inb
 | ssh-agent forwarding        | ✅                    | ✅ (relay only)                           | ⚠️ relay only, untested on Mac | ❌ use WSL2 |
 | TUI dashboard + terminal    | ✅                    | ✅                                        | ✅                        | ⚠️ untested      |
 
-Windows builds ship from the release workflow, but only the Linux build (e.g. inside WSL2) is exercised. Details: [`docs/runtimes.md`](docs/runtimes.md), [`docs/ssh-agent.md`](docs/ssh-agent.md).
+Windows builds ship from the release workflow, but only the Linux build (e.g. inside WSL2) is exercised. Details: [`docs/architecture/runtimes.md`](docs/architecture/runtimes.md), [`docs/architecture/helper/ssh-agent.md`](docs/architecture/helper/ssh-agent.md).

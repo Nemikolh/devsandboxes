@@ -48,7 +48,7 @@ pub struct Instance {
     #[serde(default = "yes", skip_serializing_if = "is_true")]
     pub branch_created: bool,
     /// Every `folders` entry as mounted (direct binds included), recorded so
-    /// the ownership rule (docs/folders-worktrees.md) sees other instances'
+    /// the ownership rule (docs/architecture/instances/worktrees.md) sees other instances'
     /// direct extra mounts and `rm` removes exactly the extra worktrees `run`
     /// created. Empty for pre-upgrade instances until they're rebuilt.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -72,12 +72,12 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_user: Option<String>,
     /// Container path of the forwarded ssh-agent socket, set when `run`
-    /// mounted the host agent (see docs/ssh-agent.md); `exec_argv` uses it
+    /// mounted the host agent (see docs/architecture/helper/ssh-agent.md); `exec_argv` uses it
     /// to inject `SSH_AUTH_SOCK` per exec.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh_auth_sock: Option<String>,
     /// Arch of the devsbd helper that ran in this container (see
-    /// docs/sandbox-helper.md); `None` = helper unavailable. Tried first on
+    /// docs/architecture/helper/overview.md); `None` = helper unavailable. Tried first on
     /// the next install so emulated images skip the host-arch attempt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub devsbd_arch: Option<crate::devsbd::Arch>,
@@ -88,7 +88,7 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub volumes: Vec<String>,
     /// `instance_id` of the dispatcher that created this instance through the
-    /// control API (docs/automations.md); also the container's
+    /// control API (docs/architecture/automations/dispatchers.md); also the container's
     /// `devsandbox.dispatcher` label. `None` for user-created instances.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatcher: Option<String>,
@@ -108,14 +108,14 @@ pub struct Instance {
     /// ports every time and no other instance takes them while it's stopped.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub forwarded_ports: BTreeMap<String, u16>,
-    /// Unix secs since the instance was marked done (docs/inbox-threads.md
-    /// "Done instances"): the user (or its dispatcher) is finished with it,
+    /// Unix secs since the instance was marked done (docs/architecture/automations/dispatchers.md
+    /// "Done children"): the user (or its dispatcher) is finished with it,
     /// but it's kept as is until removed. Only display and dispatcher policy
     /// read it; `start`/autostart leave it set. `None` = not done.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub done: Option<u64>,
     /// Set while a `run`/`rebuild` is materializing this instance, and kept
-    /// when one fails from the container on (docs/instance-phase.md). It's
+    /// when one fails from the container on (docs/architecture/instances/lifecycle.md). It's
     /// what lets `run` record the instance before any of its resources
     /// exist, so a failed or killed run leaves a record `rm` can find
     /// instead of an orphaned worktree, branch and services. `None` = ready.

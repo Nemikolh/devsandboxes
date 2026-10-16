@@ -176,10 +176,11 @@ pub fn vscode(dir: &Path, name: &str, goto: Option<&Goto>) -> Result<()> {
 
 /// Launch VS Code attached to `info`'s container, detached. Writes the
 /// extensions name-config (best-effort), then spawns `code`. With `goto`,
-/// then has the helper open the file in that window (docs/inbox-threads.md,
-/// *VS Code at a line*): the host `code` always runs first, since it opens or
-/// focuses the window the in-container CLI needs. Blocks up to
-/// [`GOTO_TIMEOUT`] then. Returns a one-line status. Shared with the TUI's
+/// then has the helper open the file in that window
+/// (docs/architecture/helper/in-container.md, *`devsbd vscode-goto
+/// <abs>[:line[:col]] [--wait SECS]`*): the host `code` always runs first,
+/// since it opens or focuses the window the in-container CLI needs. Blocks up
+/// to [`GOTO_TIMEOUT`] then. Returns a one-line status. Shared with the TUI's
 /// `o` so both open identically.
 pub fn launch(dir: &Path, instance: &str, info: &Instance, goto: Option<&Goto>) -> Result<String> {
     // Extensions and remoteUser come from the resolved sandbox, read from the

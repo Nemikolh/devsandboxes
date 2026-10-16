@@ -71,7 +71,7 @@ export interface SandboxRow {
   build_hash: string;
   /** Config-validation problems (folder / mount resolution). */
   issues: string[];
-  /** Has a `dispatcher` table (docs/automations.md). */
+  /** Has a `dispatcher` table (docs/architecture/automations/dispatchers.md). */
   dispatcher: boolean;
   /** The resolved `worktree-branch`; `null` when unset or unresolved. */
   worktree_branch: string | null;
@@ -350,7 +350,7 @@ export declare const service: {
 // ---------------------------------------------------------------------------
 // Daemon API
 
-// The host daemon's JSON-lines API (docs/api.md), over `devsandbox api
+// The host daemon's JSON-lines API (docs/reference/api.md), over `devsandbox api
 // --stdio`. Mirrors the serde structs in src/serve/{api,proto,forwards}.rs;
 // a Rust test (src/serve/dts.rs) fails when a wire struct and its interface
 // here disagree.

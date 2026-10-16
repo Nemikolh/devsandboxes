@@ -1,8 +1,9 @@
 //! `forwards.toml`, next to `state.toml`: the daemon's ad-hoc forwards
 //! (`forwards.add`), so a successor daemon (handoff, restart, boot) recreates
-//! them on the host ports they had (`docs/serve.md`, *Forwards*). Configured
-//! forwards aren't stored here: their ports live in `state.toml` and they come
-//! back through the registry's sync.
+//! them on the host ports they had (`docs/architecture/daemon/forwards.md`,
+//! *Ad-hoc forwards and `forwards.toml`*). Configured forwards aren't stored
+//! here: their ports live in `state.toml` and they come back through the
+//! registry's sync.
 //!
 //! Only the daemon writes it: `forwards.add` appends, `forwards.rm` removes,
 //! the restore at registry start drops entries of removed instances and

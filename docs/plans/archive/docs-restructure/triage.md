@@ -1,3 +1,6 @@
+> Archived 2026-10-16. Historical, may be wrong; do not use as a reference.
+> Current: [README.md](../../../README.md)
+
 # Triage lead (step 2d): verdicts for the old flat docs
 
 Read-only pass over the 40 old `docs/*.md` (skipped: docs-site, landing-how-it-works,

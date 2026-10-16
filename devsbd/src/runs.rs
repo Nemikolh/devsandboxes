@@ -1,5 +1,5 @@
 //! `devsbd run start|supervise|ls|logs|wait|rm|prune`: tracked runs inside one
-//! container (docs/automations.md, "Runs"). A dispatcher reaches a child's
+//! container (docs/architecture/helper/in-container.md). A dispatcher reaches a child's
 //! runs through the host (`devsbd exec` / `devsbd run … <key>`, `ctl.rs`),
 //! which execs these commands in the child; they work by hand in the child
 //! too.

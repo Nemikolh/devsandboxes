@@ -197,7 +197,7 @@ pub struct App {
     /// Id of a forward the event loop should stop (the `d` shortcut on the Ports
     /// tab). Consumed by step 10.
     pub pending_unport: Option<u64>,
-    /// Container notifications shown on the Inbox tab (docs/automations.md),
+    /// Container notifications shown on the Inbox tab (docs/architecture/dashboard/inbox-tab.md),
     /// as last loaded from the shared store (`crate::inbox::store`).
     pub inbox: InboxView,
     /// Changes the event loop owes the store (`d`, `D`, mark-read); already
@@ -215,7 +215,7 @@ pub struct App {
     /// none yet the tree says it in place of the rows.
     pub snapshot_error: Option<crate::tui::data::FetchError>,
     /// The registered machines' link states, from the last snapshot
-    /// (docs/machines.md, step 6). Empty without any: the tree is exactly
+    /// (docs/architecture/daemon/machines.md, *Dashboard*). Empty without any: the tree is exactly
     /// as before machines (no machine column).
     pub machines: Vec<crate::serve::snapshots::SnapshotMachine>,
     /// Seconds east of UTC for Inbox timestamps; the event loop sets it once

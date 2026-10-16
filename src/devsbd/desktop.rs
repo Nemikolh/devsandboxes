@@ -1,5 +1,5 @@
-//! Desktop delivery of a container notification (docs/automations.md,
-//! "`devsbd notify`"): `notify-send` on Linux, `osascript` on macOS. Best
+//! Desktop delivery of a container notification (docs/architecture/helper/bridges.md,
+//! "Notifications (`NOTIFY`)"): `notify-send` on Linux, `osascript` on macOS. Best
 //! effort and fully quiet: a missing notifier (no `notify-send`, headless
 //! host) is skipped silently, and nothing inherits the TUI's terminal.
 
@@ -15,7 +15,7 @@ use crate::inbox::ShownPopup;
 /// notifier. Pure, so the quoting is testable.
 ///
 /// It takes the already-rendered popup rather than a notify record: a thread
-/// entering `needs-you` pops up too, and it has no record (docs/inbox-threads.md).
+/// entering `needs-you` pops up too, and it has no record (docs/architecture/inbox/model.md).
 ///
 /// Linux urgency: info and warn map to `normal`, error to `critical`. Not
 /// `low` for info: GNOME (and others) don't pop up low-urgency notifications,

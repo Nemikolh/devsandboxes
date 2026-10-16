@@ -48,7 +48,7 @@ pub fn exec_status(name: &str, interactive: bool, tty: bool, command: &[String])
     let host_agent = crate::devsbd::relay_mode(instance) && has_host_agent();
     // The daemon's bridge for the command's lifetime, asked for alongside it:
     // the in-container daemon holds an agent client until the bridge attaches
-    // (docs/sandbox-helper.md).
+    // (docs/architecture/helper/in-container.md).
     #[cfg(unix)]
     let relay = host_agent.then(|| AgentRelay::start(&key));
     let args = exec_argv_with(instance, interactive, tty, command, host_agent);
@@ -64,13 +64,13 @@ pub fn exec_status(name: &str, interactive: bool, tty: bool, command: &[String])
 /// The ssh-agent relay a CLI command holds while it runs in a container
 /// (`exec`, `start`'s postStartCommand, `run`'s lifecycle chain): a
 /// `bridges.ensure` to the daemon, which owns the one bridge per container
-/// (docs/ssh-agent.md). Two shapes: [`start`](Self::start) (`exec`) asks on a
-/// background thread and never waits, since the poll normally bridged a
-/// running instance already; [`ready`](Self::ready) (lifecycle commands,
-/// which may `git clone` over ssh at once) waits for the bridge before the
-/// command starts. Either way the connection stays open while the command
-/// runs, which makes it a daemon holder, and nothing fails the command: a
-/// relay that isn't there is one `note:`.
+/// (docs/architecture/helper/ssh-agent.md). Two shapes: [`start`](Self::start)
+/// (`exec`) asks on a background thread and never waits, since the poll
+/// normally bridged a running instance already; [`ready`](Self::ready)
+/// (lifecycle commands, which may `git clone` over ssh at once) waits for the
+/// bridge before the command starts. Either way the connection stays open
+/// while the command runs, which makes it a daemon holder, and nothing fails
+/// the command: a relay that isn't there is one `note:`.
 #[cfg(unix)]
 pub(crate) struct AgentRelay(std::thread::JoinHandle<Result<crate::serve::client::Conn>>);
 
@@ -246,7 +246,7 @@ pub(crate) fn exec_argv_with(
         args.push(format!("{key}={value}"));
     }
     // agent forwarding: the activating env var rides every exec, same as
-    // remote_env, via the shared rule (docs/sandbox-helper.md).
+    // remote_env, via the shared rule (docs/architecture/helper/ssh-agent.md).
     if let Some(sock) = ssh_auth_sock_env(instance, host_agent) {
         args.push("-e".into());
         args.push(format!("SSH_AUTH_SOCK={sock}"));

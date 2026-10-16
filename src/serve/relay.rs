@@ -1,16 +1,18 @@
 //! `devsandbox api --stdio`: a stateless relay between stdin/stdout and the
 //! daemon's socket, for clients that can only spawn a process (editor
-//! extensions, Electron apps, the npm package). docs/api.md, *Relay*.
+//! extensions, Electron apps, the npm package). docs/reference/api.md, *Relay:
+//! `devsandbox api --stdio`*.
 //!
 //! It parses nothing: bytes from stdin go to the socket, bytes from the socket
 //! go to stdout (flushed per read), so the JSON-lines framing, the `hello` and
 //! the protocol check all stay with the client. Only protocol bytes reach
 //! stdout; diagnostics go to stderr.
 //!
-//! The one exception is `--session-env` (docs/machines.md, F4), for a relay a
-//! machine link runs over ssh: there the upstream copy goes line by line and
-//! a verb request's `params.env` becomes the relay's own, the remote login
-//! shell's env, since the requester's (another host's) means nothing here.
+//! The one exception is `--session-env` (docs/architecture/daemon/machines.md,
+//! *ssh*), for a relay a machine link runs over ssh: there the upstream copy
+//! goes line by line and a verb request's `params.env` becomes the relay's
+//! own, the remote login shell's env, since the requester's (another host's)
+//! means nothing here.
 //! Every other line, and every byte downstream, still passes as is.
 //!
 //! Exit: 0 once stdin hits EOF (after the daemon has answered what was in

@@ -1,7 +1,8 @@
-//! The CLI side of verbs as requests (docs/verbs-as-requests.md, step 3):
-//! `run`, `rebuild`, `start`, `stop`, `rm` and `service rebuild` sent to the daemon
-//! ([`super::verbs`] runs them) instead of run in this process, so a build
-//! survives its terminal and runs with this shell's env either way.
+//! The CLI side of verbs as requests (docs/architecture/daemon/verbs.md, *The
+//! CLI side*): `run`, `rebuild`, `start`, `stop`, `rm` and `service rebuild`
+//! sent to the daemon ([`super::verbs`] runs them) instead of run in this
+//! process, so a build survives its terminal and runs with this shell's env
+//! either way.
 //!
 //! Every prompt happens here, on the user's TTY, before the verb is sent
 //! (the daemon's subprocess has no stdin): the sandbox pick and the example
@@ -13,9 +14,10 @@
 //! to name yet, or the cancel is refused, it hangs up, which the daemon
 //! takes as a cancel. A second Ctrl-C kills this process: a hang-up too.
 //!
-//! With machines registered ([`Fed`], docs/machines.md step 5) a name is
-//! looked up on every machine too, and the request carries the match's
-//! `machine` and its root there; without any, every request is as before.
+//! With machines registered ([`Fed`], docs/architecture/daemon/machines.md
+//! *The CLI: `cli.rs`*) a name is looked up on every machine too, and the
+//! request carries the match's `machine` and its root there; without any,
+//! every request is as before.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -114,7 +116,8 @@ pub(crate) fn from_command(command: &Command) -> Option<CliVerb> {
     })
 }
 
-/// What machines change for a verb (docs/machines.md, step 5).
+/// What machines change for a verb (docs/architecture/daemon/machines.md,
+/// *The CLI: `cli.rs`*).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Fed {
     /// Some machine is registered: names resolve across machines. Without

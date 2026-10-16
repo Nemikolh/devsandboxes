@@ -1,4 +1,5 @@
-//! A connection to a machine's daemon (docs/machines.md): the handshake.
+//! A connection to a machine's daemon (docs/architecture/daemon/machines.md):
+//! the handshake.
 //! `machines.probe`/`add` use one briefly; `service` holds one per machine.
 //!
 //! The hello says version `0.0.0`, build 0: older than any daemon, so a

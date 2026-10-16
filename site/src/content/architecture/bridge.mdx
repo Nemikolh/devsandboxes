@@ -130,5 +130,5 @@ last start wins, upgrade or downgrade:
 Same build hash → the second daemon exits 0. No hash in the pidfile yet (its owner is still starting) counts as
 the same build, so two concurrent starts never evict each other.
 
-Design notes: `docs/sandbox-helper.md` (protocol, takeover, self-heal), `docs/port-forwarding.md` (`Connect`, flow
-control), `docs/automations.md` (control and notify streams).
+Design notes: `docs/architecture/helper/protocol.md` (frames, `Connect` flow control, takeover, self-heal),
+`docs/architecture/helper/bridges.md` (control and notify streams).

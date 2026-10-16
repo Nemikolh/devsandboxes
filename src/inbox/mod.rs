@@ -1,6 +1,6 @@
 //! The Inbox model: container notifications (`devsbd notify`,
-//! docs/automations.md) and owner threads (`devsbd thread put`,
-//! docs/inbox-redesign.md), newest first. This is the persisted half, out of
+//! docs/architecture/inbox/model.md) and owner threads (`devsbd thread put`,
+//! docs/architecture/inbox/threads-and-feed.md), newest first. This is the persisted half, out of
 //! `src/tui/` because the bridge writes here while any number of dashboards
 //! and API clients read it (see [`store`]); the TUI keeps only view state
 //! (view, selection, the open thread).
@@ -151,8 +151,8 @@ impl EventKind {
 }
 
 /// One pending event for a thread's owner. No client: an owner must not be
-/// able to tell where an event came from (docs/inbox-redesign.md,
-/// *Principles*).
+/// able to tell where an event came from (docs/architecture/inbox/model.md,
+/// *Events*).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Event {
     /// `e-<unix secs:010>-<4 hex>` (`control::valid_event_id`), unique across

@@ -1,10 +1,11 @@
-//! Verbs as requests (docs/api.md, *Verbs*; docs/verbs-as-requests.md):
-//! `run`, `rebuild`, `start`, `stop` and `rm` as API methods, and
-//! `services.rebuild` (no instance verb: `service rebuild <name>`). The
-//! daemon runs each as a `devsandbox --in-process -C <root> <verb> …` subprocess built
-//! from the request's typed params ([`argv`]), so a verb that panics or hangs
-//! takes down one request, not the daemon, and a handoff doesn't wait for a
-//! build (docs/client-server.md, *Execution, internally*).
+//! Verbs as requests (docs/reference/api.md, *Verbs*;
+//! docs/architecture/daemon/verbs.md): `run`, `rebuild`, `start`, `stop` and
+//! `rm` as API methods, and `services.rebuild` (no instance verb: `service
+//! rebuild <name>`). The daemon runs each as a `devsandbox --in-process -C
+//! <root> <verb> …` subprocess built from the request's typed params
+//! ([`argv`]), so a verb that panics or hangs takes down one request, not the
+//! daemon, and a handoff doesn't wait for a build
+//! (docs/architecture/daemon/verbs.md, *Why a subprocess*).
 //!
 //! The subprocess gets the request's env and nothing of the daemon's
 //! (`${localEnv:…}`, `SSH_AUTH_SOCK`, `GIT_*` must be the caller's), its own
@@ -358,9 +359,9 @@ fn one_or_all<'a>(args: &mut Vec<String>, target: &'a Target) -> Option<&'a Stri
     }
 }
 
-/// When a `detach` request is answered (docs/api.md, *Verbs*). Held verbs
-/// (`stop`, `rm`, `services.rebuild`) answer at the exit, detached or not:
-/// for them `detach` only means a hang-up leaves them running.
+/// When a `detach` request is answered (docs/reference/api.md, *Verbs*).
+/// Held verbs (`stop`, `rm`, `services.rebuild`) answer at the exit, detached
+/// or not: for them `detach` only means a hang-up leaves them running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DetachAt {
     /// Not detached: at the exit.
@@ -955,8 +956,9 @@ enum Left {
     /// timed-out write may have left half a line).
     Slow,
     /// A `detach` request: hang-up = cancel unless detached
-    /// (docs/client-server.md, *Requests*), so a dashboard quit right after
-    /// `r` doesn't roll its build back, nor interrupt its `stop`/`rm`.
+    /// (docs/architecture/daemon/verbs.md, *Detach and hang-up*), so a
+    /// dashboard quit right after `r` doesn't roll its build back, nor
+    /// interrupt its `stop`/`rm`.
     Detached,
 }
 

@@ -13,7 +13,7 @@
 //! requested the same way (`pending_open`).
 //!
 //! The list is one row per thread, newest change first, filtered by a
-//! [`View`] (docs/inbox-threads.md, *Inbox UI* and *Inbox layout v2*). The
+//! [`View`] (docs/architecture/dashboard/inbox-tab.md, *List and views* and *Thread pane*). The
 //! thread pane beside it always shows the selected thread: a pinned header
 //! ([`pane_header`]), the thread's open forms pinned under it (`forms.rs`),
 //! then its feed, newest first ([`pane_feed`]). Keys go to one of four
@@ -754,7 +754,7 @@ impl App {
 
     /// The thread keys both zones share, on the selected thread: `o`/`t`/
     /// `l`/`p` aimed at the thread's target rather than a table row
-    /// (docs/inbox-threads.md, *Decisions*), `d`/`u` done and reopen.
+    /// (docs/architecture/dashboard/inbox-tab.md, *Thread actions*), `d`/`u` done and reopen.
     /// Whether `key` was one of them.
     pub(super) fn on_inbox_thread_key(&mut self, key: KeyCode) -> bool {
         if !matches!(key, KeyCode::Char('o' | 't' | 'l' | 'p' | 'd' | 'u')) {

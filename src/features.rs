@@ -304,7 +304,7 @@ pub struct FeatureMetadata {
     pub installs_after: Vec<String>,
     /// A command to run at every container start (e.g. docker-in-docker's
     /// `dockerd` launcher). Chained ahead of the image's own ENTRYPOINT in the
-    /// derived image; see `docs/entrypoint.md`.
+    /// derived image; see `docs/architecture/instances/images-and-features.md`.
     #[serde(default)]
     pub entrypoint: Option<String>,
     /// Mounts the feature asks the container to carry (e.g.

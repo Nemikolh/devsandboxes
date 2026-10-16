@@ -1,10 +1,10 @@
-//! Host half of the ssh-agent relay (docs/sandbox-helper.md): runs
+//! Host half of the ssh-agent relay (docs/architecture/helper/bridges.md): runs
 //! `exec -i <c> devsbd bridge` and serves the streams it carries, connecting
 //! each `Open` to the host agent. Owners: `devsandbox serve` (one per running
-//! instance, docs/serve.md; CLI commands ask it through `bridges.ensure`) and
+//! instance, docs/architecture/daemon/host-poll.md; CLI commands ask it through `bridges.ensure`) and
 //! the forwarder engine (`spawn_for`).
 //! The daemon's bridges also take the container's `devsbd notify` records and
-//! serve its `devsbd ensure|ls|stop|rm` control requests (docs/automations.md).
+//! serve its `devsbd ensure|ls|stop|rm` control requests (docs/architecture/automations/dispatchers.md).
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -71,7 +71,7 @@ impl Bridge {
 
     /// The daemon's advertised capabilities, available once the handshake has
     /// succeeded; `None` while it's pending or after it failed.
-    #[allow(dead_code)] // host forwarder engine (docs/port-forwarding.md, step 5)
+    #[allow(dead_code)] // host forwarder engine (docs/architecture/daemon/forwards.md, *The engine: `Forward`*)
     pub fn peer_caps(&self) -> Option<u32> {
         self.forward.get().map(|f| f.peer_caps)
     }
@@ -83,7 +83,7 @@ impl Bridge {
     /// Errors before the handshake is done, when the bridge is dead, or when the
     /// daemon doesn't advertise `TCP_FORWARD` (an outdated helper) — the last as
     /// `Unsupported`, so callers can phrase the restart hint.
-    #[allow(dead_code)] // host forwarder engine (docs/port-forwarding.md, step 5)
+    #[allow(dead_code)] // host forwarder engine (docs/architecture/daemon/forwards.md, *The engine: `Forward`*)
     pub fn connect(
         &self,
         conn: impl Into<Conn>,
@@ -125,7 +125,7 @@ impl Drop for Bridge {
 const MAX_AGENTS: usize = 8;
 
 /// The host agent sockets this process knows of, most recent first: what
-/// clients reported through `bridges.ensure` (docs/api.md). Only the daemon
+/// clients reported through `bridges.ensure` (docs/reference/api.md). Only the daemon
 /// gets reports; everywhere else the list stays empty and the own
 /// `$SSH_AUTH_SOCK`, the last fallback of [`pick`](Self::pick), is all there
 /// is. This is what keeps the daemon's relay working when the agent it
@@ -475,8 +475,8 @@ fn spawn_managed(
 /// host ssh-agent. `with_agent` = true wires the real `host_agent` provider (a
 /// forward bridge serves ssh-agent when the host has one, advertising
 /// `SSH_AGENT` honestly); false makes an agent-less bridge that the daemon
-/// won't route agent clients to. The forwarder (docs/port-forwarding.md, step
-/// 5) uses this so `spawn_with`'s generic agent type stays private.
+/// won't route agent clients to. The forwarder (docs/architecture/daemon/forwards.md)
+/// uses this so `spawn_with`'s generic agent type stays private.
 pub fn spawn_for(container: &str, hash: &str, with_agent: bool) -> Option<Bridge> {
     if with_agent {
         spawn_with(container, hash, Some(host_agent), None)
@@ -1588,7 +1588,7 @@ mod tests {
     /// Docker-gated: an agent-less bridge (a `devsandbox port` forward) spawned
     /// *after* an agent bridge must not steal agent routing — `ssh-add -l` still
     /// lists the key via the older agent bridge. Regression for the routing fix
-    /// in docs/port-forwarding.md (a shell with no agent starting a forward
+    /// in docs/architecture/helper/ssh-agent.md (a shell with no agent starting a forward
     /// would otherwise become the newest bridge and break ssh in the container).
     #[test_utils::docker_test(helper)]
     fn agent_less_bridge_does_not_steal_agent_routing_with_docker() -> Result<(), &'static str> {

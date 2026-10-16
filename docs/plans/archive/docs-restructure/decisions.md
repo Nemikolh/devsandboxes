@@ -1,3 +1,6 @@
+> Archived 2026-10-16. Historical, may be wrong; do not use as a reference.
+> Current: [README.md](../../../README.md)
+
 # Decisions lead (step 2b)
 
 Child spawns all failed (3/3 slots held by other leads), so the clusters

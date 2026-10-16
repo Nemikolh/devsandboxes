@@ -1,4 +1,4 @@
-//! Per-instance build logs (docs/instance-phase.md):
+//! Per-instance build logs (docs/architecture/instances/images-and-features.md):
 //! `<data>/devsandbox/logs/<instance_id>/build.log`, next to `state.toml`.
 //! While `run`, `rebuild` or `start` works on an instance, everything written
 //! to fds 1 and 2 (our own prints and every child inheriting stdio: docker
@@ -16,7 +16,7 @@
 //! threads write there too. The dashboard's own `run`/`rebuild`/`start` are
 //! `devsandbox` subprocesses, so they log.
 //!
-//! On a terminal the tee is a pty (docs/instance-phase.md, *Build logs*):
+//! On a terminal the tee is a pty (docs/architecture/instances/images-and-features.md, *Drift and logs*):
 //! when fds 1 and 2 are both terminals, or when [`TTY_ENV`] gives a size
 //! (the daemon sets it for a verb request's `tty`), fds 1/2 point at a pty's
 //! slave sized like the terminal, so docker build and every other child see a
@@ -54,7 +54,7 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 pub const TTY_ENV: &str = "DEVSANDBOX_TTY";
 
 /// A terminal's size in cells: a build log's pty, and a verb request's
-/// `tty` (docs/api.md), passed to the verb as [`TTY_ENV`].
+/// `tty` (docs/reference/api.md), passed to the verb as [`TTY_ENV`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TtySize {

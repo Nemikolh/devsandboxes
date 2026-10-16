@@ -1,7 +1,8 @@
-//! The `machines.*` methods (docs/machines.md, step 2): `probe`, `add`,
-//! `list`, `rm`. Connection-free like `serve::api`: a function of the
-//! method, its params and a [`Ctx`] (the registry path and the [`Dial`]), so
-//! tests run them against a second test daemon standing in as the machine.
+//! The `machines.*` methods (docs/architecture/daemon/machines.md,
+//! *`devsandbox machine add|ls|rm`*): `probe`, `add`, `list`, `rm`.
+//! Connection-free like `serve::api`: a function of the method, its params
+//! and a [`Ctx`] (the registry path and the [`Dial`]), so tests run them
+//! against a second test daemon standing in as the machine.
 //!
 //! `probe` and `add` open a fresh connection each (ssh, the hello, one or
 //! two calls) and drop it; the held link per machine is `service`'s, which

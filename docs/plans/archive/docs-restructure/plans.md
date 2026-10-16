@@ -1,3 +1,6 @@
+> Archived 2026-10-16. Historical, may be wrong; do not use as a reference.
+> Current: [README.md](../../../README.md)
+
 # Plans lead fragment
 
 ## Plans written

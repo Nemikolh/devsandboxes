@@ -71,4 +71,5 @@ reported, newest first, then its own `$SSH_AUTH_SOCK`). It stores notify records
 popups, and it serves control requests itself (`src/commands/dispatch.rs`). A forward's bridge goes the other way:
 the host opens `Connect` streams, and the daemon dials the TCP target from inside the container.
 
-Design notes: `docs/sandbox-helper.md`, `docs/ssh-agent.md`, `docs/port-forwarding.md`, `docs/automations.md`.
+Design notes: `docs/architecture/helper/overview.md`, `docs/architecture/helper/bridges.md`,
+`docs/architecture/helper/ssh-agent.md`, `docs/architecture/daemon/forwards.md`.

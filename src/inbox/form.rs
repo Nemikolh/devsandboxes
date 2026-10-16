@@ -1,4 +1,4 @@
-//! Forms (docs/inbox-redesign.md, *Forms*): a `form` block in an owner's
+//! Forms (docs/architecture/inbox/forms.md): a `form` block in an owner's
 //! message is a list of questions the user answers and submits once.
 //!
 //! Three halves, all pure:

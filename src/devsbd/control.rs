@@ -1,6 +1,6 @@
 //! Control requests and responses: what `devsbd ensure|ls|stop|rm|done|exec|run|branches|events|thread ls`
 //! sends from a dispatcher's container to the host, and what comes back
-//! (docs/automations.md, "Dispatchers"). One file shared by both crates
+//! (docs/architecture/automations/dispatchers.md, "Ops"). One file shared by both crates
 //! (devsbd includes it via `#[path]`) so both ends can't drift; std-only and
 //! hand-parsed, like `notify.rs`.
 //!
@@ -120,7 +120,7 @@ pub enum Op {
     Ls,
     Stop,
     Rm,
-    /// Mark a child done (docs/inbox-threads.md, "Done instances"); an
+    /// Mark a child done (docs/architecture/automations/dispatchers.md, "Done children"); an
     /// `ensure` that reuses it clears the flag again.
     Done,
     /// Start a run in a child (`devsbd run start` there); body = run id.
@@ -231,7 +231,7 @@ pub fn valid_key(key: &str) -> bool {
 pub const MAX_MESSAGE_ID: usize = 60;
 
 /// `[a-z0-9-]{1,60}`: a message's id, the owner's idempotency key in its
-/// thread (docs/inbox-redesign.md, *Messages*). Only ever a JSON value and a
+/// thread (docs/architecture/inbox/threads-and-feed.md, *`thread send`*). Only ever a JSON value and a
 /// store field, never a name or a path, so a leading `-` is harmless. Checked
 /// by the helper before queuing and by the host's schema.
 pub fn valid_message_id(id: &str) -> bool {

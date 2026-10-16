@@ -1,4 +1,4 @@
-//! The dashboard's link to the host daemon (docs/serve.md, docs/api.md): one
+//! The dashboard's link to the host daemon (docs/architecture/daemon/client-server.md, docs/reference/api.md): one
 //! worker thread that owns the [`Conn`], so the UI thread never waits on the
 //! socket or on a lazy start (up to 5 s).
 //!
@@ -308,7 +308,7 @@ pub(super) fn root_dir(dir: PathBuf) -> PathBuf {
     dir.canonicalize().or_else(|_| std::path::absolute(&dir)).unwrap_or(dir)
 }
 
-/// `call` sent to `machine` (docs/machines.md, F6): its `machine` param,
+/// `call` sent to `machine` (docs/architecture/daemon/machines.md, *Forwarded requests*): its `machine` param,
 /// only for a remote target, so a local call is what it was.
 fn on_machine((method, mut params): (&'static str, Value), machine: Option<&str>) -> (&'static str, Value) {
     if let (Some(m), Some(obj)) = (machine, params.as_object_mut()) {
@@ -584,7 +584,7 @@ fn connect(after_handoff: bool) -> Result<Conn> {
 }
 
 /// The API call that watches config root `dir` (its snapshots pushed),
-/// with every registered machine's rows (docs/machines.md, step 6).
+/// with every registered machine's rows (docs/architecture/daemon/machines.md, *Federated snapshots*).
 fn watch_call(dir: &Path) -> (&'static str, Value) {
     ("instances.watch", json!({ "dir": dir.to_string_lossy(), "machines": true }))
 }

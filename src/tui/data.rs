@@ -73,7 +73,7 @@ pub enum Node {
 }
 
 /// The sandbox row instance `inst` groups under: the same machine's sandbox
-/// of its name (docs/machines.md: a group per (machine, sandbox)), the one
+/// of its name (docs/architecture/daemon/machines.md: a group per (machine, sandbox)), the one
 /// from its own root when a machine has two roots defining it. `None`: an
 /// orphan.
 pub fn group_of(sandboxes: &[SandboxRow], inst: &InstanceRow) -> Option<usize> {
@@ -184,7 +184,7 @@ fn push_proc_nodes(
 }
 
 /// The dim suffix marking a dispatcher's child in the Instances tree
-/// (docs/automations.md): `⇠ <dispatcher instance name>`, or `⇠ <id> (orphan)`
+/// (docs/architecture/automations/dispatchers.md): `⇠ <dispatcher instance name>`, or `⇠ <id> (orphan)`
 /// when no instance in `instances` has the recorded owner id any more. `None`
 /// for user-created instances. Children stay under their own sandbox group
 /// (the tree groups by sandbox) rather than being nested under the dispatcher.

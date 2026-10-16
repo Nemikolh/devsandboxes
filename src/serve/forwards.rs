@@ -1,7 +1,8 @@
-//! The daemon's port forwards (docs/port-forwarding.md, docs/api.md
-//! *Forwards*): every live [`Forward`], ad-hoc (`forwards.add`) and
-//! configured (the sandboxes' `forwardPorts`), owned by one `serve-forwards`
-//! thread so they outlive any dashboard and count as idle holders.
+//! The daemon's port forwards (docs/architecture/daemon/forwards.md,
+//! docs/reference/api.md *Forwards*): every live [`Forward`], ad-hoc
+//! (`forwards.add`) and configured (the sandboxes' `forwardPorts`), owned by
+//! one `serve-forwards` thread so they outlive any dashboard and count as
+//! idle holders.
 //!
 //! Threading: the [`Registry`] thread blocks on its command channel with a
 //! [`POLL`] timeout, so it wakes both for requests ([`Handle`]: the API's
@@ -15,10 +16,11 @@
 //! Forwards are grouped per config root ([`Root`], keyed by the canonical
 //! `dir`); ids are unique daemon-wide. Configured forwards are reconciled for
 //! every config root recorded in `state.toml` against the host's poll of the
-//! running containers (`docs/port-forwarding.md`, _Configured forwards_),
-//! reusing the host port saved in state. What a dashboard used to see as
-//! status lines goes out through [`Event`]s (the API's `forwards.changed` /
-//! `forwards.status`) and `serve.log`; nothing else is printed.
+//! running containers (`docs/architecture/daemon/forwards.md`, _Configured
+//! forwards (`forwardPorts`)_), reusing the host port saved in state. What a
+//! dashboard used to see as status lines goes out through [`Event`]s (the
+//! API's `forwards.changed` / `forwards.status`) and `serve.log`; nothing
+//! else is printed.
 //!
 //! Ad-hoc forwards persist in `forwards.toml` ([`forward_store`]): an add
 //! appends, an rm removes, and the thread restores them first thing, on

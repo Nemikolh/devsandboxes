@@ -1,4 +1,4 @@
-//! Mouse text selection routing (docs/tui-selection.md, *Routing*). The
+//! Mouse text selection routing (docs/architecture/dashboard/selection.md, *Routing*). The
 //! regions come from the last draw (`ui` registers them through the hooks
 //! here), so a press is hit-tested against what is on screen; the selected
 //! text is read off the next frame by `ui::draw` and sent by the event loop.

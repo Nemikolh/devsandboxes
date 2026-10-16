@@ -19,8 +19,9 @@ impl std::fmt::Display for UnknownInstance {
 impl std::error::Error for UnknownInstance {}
 
 /// `devsandbox done|undone <instance>`: set or clear the instance's done flag
-/// (docs/inbox-threads.md, "Done instances"). Nothing else changes: the
-/// container, worktree and runs stay until the user removes them.
+/// (docs/architecture/instances/lifecycle.md, "rename and done"). Nothing
+/// else changes: the container, worktree and runs stay until the user
+/// removes them.
 pub fn done(name: &str, done: bool) -> Result<()> {
     let state = State::load()?;
     let key = resolve_instance(&state, name)?;

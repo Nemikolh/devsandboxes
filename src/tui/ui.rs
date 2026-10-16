@@ -1367,7 +1367,7 @@ fn pane_spans(line: &PaneLine, raw: bool) -> Vec<Span<'static>> {
     spans
 }
 
-/// The thread pane (layout v3, docs/inbox-redesign.md *TUI Inbox*): the
+/// The thread pane (layout v3, docs/architecture/dashboard/inbox-tab.md *Thread pane*): the
 /// pinned header ([`pane_header`]: title, chip, child, action row), a
 /// separator joined to the border, the feed newest first ([`pane_feed`]),
 /// scrolling on its own, then the composer (the input box and its
@@ -1731,7 +1731,7 @@ fn draw_tree(
         titles.extend(["TYPE", ""]);
         widths.extend([Constraint::Length(10), Constraint::Min(0)]);
     }
-    // MACHINE only once a machine is registered (docs/machines.md): without
+    // MACHINE only once a machine is registered (docs/architecture/daemon/machines.md): without
     // one the tree is exactly as before.
     let show_machine = !app.machines.is_empty();
     if show_machine {
@@ -1948,7 +1948,7 @@ fn instance_tree_row(
     (cells, style)
 }
 
-/// The STATUS of a row whose machine isn't connected (docs/machines.md):
+/// The STATUS of a row whose machine isn't connected (docs/architecture/daemon/machines.md):
 /// its last known row, styled like `missing`.
 const UNREACHABLE: &str = "unreachable";
 

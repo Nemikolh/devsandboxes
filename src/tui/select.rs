@@ -1,4 +1,4 @@
-//! Mouse text selection (docs/tui-selection.md): the regions each frame makes
+//! Mouse text selection (docs/architecture/dashboard/selection.md): the regions each frame makes
 //! selectable, the drag state, and reading and highlighting the selected
 //! cells. Pure: a frame buffer in, text out; `App` routes the mouse, `ui`
 //! registers the regions and patches the highlight into the frame it drew.

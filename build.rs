@@ -1,4 +1,4 @@
-//! Embeds prebuilt devsbd helpers (docs/sandbox-helper.md). Never invokes
+//! Embeds prebuilt devsbd helpers (docs/architecture/helper/overview.md). Never invokes
 //! cargo itself: helpers come from `DEVSANDBOX_DEVSBD_DIR`
 //! (`<arch>/devsbd`), built separately by `scripts/build-devsbd.sh` or CI.
 //! A missing helper yields an empty blob so plain `cargo build`/`cargo

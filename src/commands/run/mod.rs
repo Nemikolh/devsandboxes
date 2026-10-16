@@ -179,12 +179,13 @@ pub fn run(
     // instance reusing the freed name must not collide with it.
     let planned_worktree = config_dir.join(".worktrees").join(&instance_id);
 
-    // Record first (docs/instance-phase.md): whatever is made from here on is
-    // on the record, so a failure can roll it back and an interrupted run
-    // leaves something `rm` finds. `state` stays the snapshot *without* it:
-    // `materialize` reads its absence as "not a rebuild" (no prior entry to
-    // keep folders, ports or env from), and the worktree/`folders` decisions
-    // below must see the other instances only, as before.
+    // Record first (docs/architecture/instances/lifecycle.md): whatever is
+    // made from here on is on the record, so a failure can roll it back and an
+    // interrupted run leaves something `rm` finds. `state` stays the snapshot
+    // *without* it: `materialize` reads its absence as "not a rebuild" (no
+    // prior entry to keep folders, ports or env from), and the
+    // worktree/`folders` decisions below must see the other instances only,
+    // as before.
     let project = services::project_id(dir)?;
     let provisional = Instance {
         sandbox: sandbox_name.clone(),
@@ -498,7 +499,8 @@ pub(crate) fn materialize(
         .clone()
         .or_else(|| prior.and_then(|i| i.dispatcher.clone()));
     let prior_config_dir = prior.and_then(|i| i.config_dir.clone());
-    // A rebuild keeps the instance's host ports (docs/port-forwarding.md).
+    // A rebuild keeps the instance's host ports
+    // (docs/architecture/daemon/forwards.md).
     let forwarded_ports = prior.map(|i| i.forwarded_ports.clone()).unwrap_or_default();
     // A rebuild keeps the done flag: recreating the container doesn't mean
     // the user is back on it (only `undone`/`ensure` clear it).
@@ -622,9 +624,10 @@ pub(crate) fn materialize(
     }
     // ssh-agent: relay-first. On unix with an embedded helper we never mount
     // the socket — the in-container `devsbd` daemon serves it over exec stdio
-    // (docs/sandbox-helper.md), which also fixes rotation-while-running and
-    // works on runtimes that can't bind files. Only builds without a helper
-    // (`cargo install`) and non-unix hosts fall back to the bind mount.
+    // (docs/architecture/helper/ssh-agent.md), which also fixes
+    // rotation-while-running and works on runtimes that can't bind files.
+    // Only builds without a helper (`cargo install`) and non-unix hosts fall
+    // back to the bind mount.
     let relay_first = cfg!(unix) && crate::devsbd::embedded();
     let ssh_auth_sock = if relay_first {
         None
@@ -1103,9 +1106,9 @@ pub(crate) const DISPATCHER_LABEL: &str = "devsandbox.dispatcher";
 /// alive, work happens via exec. Before the keep-alive, in the background,
 /// `devsbd boot` brings back what the host set up via exec (the daemon, and
 /// `postStartCommand` in runtime mode) when the runtime restarts the container
-/// by itself (docs/automations.md). On first create the helper isn't installed
-/// yet, so the `-x` test makes the hook a no-op. It reaches a feature
-/// entrypoint chain as its `"$@"` like any command.
+/// by itself (docs/architecture/helper/in-container.md). On first create the
+/// helper isn't installed yet, so the `-x` test makes the hook a no-op. It
+/// reaches a feature entrypoint chain as its `"$@"` like any command.
 fn container_command() -> Vec<String> {
     let bin = crate::devsbd::BIN;
     vec!["sh".into(), "-c".into(), format!("[ -x {bin} ] && {bin} boot & exec sleep infinity")]

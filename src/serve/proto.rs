@@ -1,5 +1,6 @@
 //! The daemon's wire format: JSON lines, one request, response or
-//! notification per line (docs/api.md; the methods are in `api.rs`).
+//! notification per line (docs/reference/api.md; the methods are in
+//! `api.rs`).
 //!
 //! ```text
 //! → {"id":1,"method":"hello","params":{"version":"0.6.0","build":1767225600,"client":"tui"}}

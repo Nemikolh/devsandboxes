@@ -2,7 +2,7 @@
 //! a line in the VS Code window attached to this container, by running the
 //! server's own remote CLI (`code -g`) against the window's IPC socket.
 //!
-//! Which socket (docs/inbox-threads.md, *VS Code at a line*): every
+//! Which socket (docs/architecture/helper/in-container.md): every
 //! `/tmp/vscode-ipc-*.sock` accepts connections, but server-main owns one per
 //! integrated terminal and the agent host owns one too; only the socket held
 //! by a `--type=extensionHost` process is the window's. With several, the

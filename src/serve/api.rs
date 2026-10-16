@@ -1,5 +1,5 @@
-//! The daemon's API methods (docs/api.md): the method table and one thin
-//! handler per method, each a call into `inbox::ops`, `snapshot`, or the
+//! The daemon's API methods (docs/reference/api.md): the method table and one
+//! thin handler per method, each a call into `inbox::ops`, `snapshot`, or the
 //! daemon's bridges and forwards (behind [`Bridging`] / [`Forwarding`]). Params
 //! parse through serde structs; results are explicit wire views
 //! ([`ThreadSummary`], [`ThreadDetail`]), never the store model, whose JSON
@@ -228,7 +228,8 @@ struct WatchFlags {
 }
 
 /// `instances.watch`'s `machines` flag (absent: `false`): federated
-/// snapshots, this root plus every machine's (docs/machines.md).
+/// snapshots, this root plus every machine's
+/// (docs/architecture/daemon/machines.md).
 pub fn watch_machines(params: &Value) -> Result<bool, ApiError> {
     Ok(parse::<WatchFlags>(params.clone())?.machines)
 }
@@ -262,8 +263,8 @@ pub struct Resolved {
     /// A federated resolve qualifies a machine's as `<machine>/<name>`.
     pub matches: Vec<String>,
     /// `matches` again, in order, with where each one lives: what a client
-    /// needs to route a verb (docs/machines.md, F11). Additive: an older
-    /// daemon's answer has none.
+    /// needs to route a verb (docs/architecture/daemon/machines.md,
+    /// *Forwarded requests*). Additive: an older daemon's answer has none.
     #[serde(default)]
     pub found: Vec<Found>,
 }
@@ -697,11 +698,12 @@ fn sandboxes_list(p: SandboxesParams) -> Answer {
     serde_json::to_value(rows).map_err(|e| ApiError::internal(e.into()))
 }
 
-/// This host's candidate config roots (docs/machines.md, F5; what `machine
-/// add` offers): every distinct `config_dir` in `state` plus `~/.devsandboxes`
-/// when `home` has one, canonicalized (a root that's gone stays as recorded),
-/// sorted. Known roots only, no disk scan. A root that no longer exists or
-/// whose config doesn't load answers with its `error`.
+/// This host's candidate config roots (docs/architecture/daemon/machines.md,
+/// *`devsandbox machine add|ls|rm`*; what `machine add` offers): every
+/// distinct `config_dir` in `state` plus `~/.devsandboxes` when `home` has
+/// one, canonicalized (a root that's gone stays as recorded), sorted. Known
+/// roots only, no disk scan. A root that no longer exists or whose config
+/// doesn't load answers with its `error`.
 fn roots_list(state: &Path, home: Option<&Path>) -> Answer {
     let state = load_state(state)?;
     let recorded = state.instances.into_values().filter_map(|i| i.config_dir);
@@ -991,10 +993,10 @@ struct EnsureParams {
 /// Record the caller's agent (if any), then have the daemon reconcile the
 /// instance's bridge now. Without `wait` it doesn't wait for the bridge: the
 /// in-container daemon holds agent clients briefly until one attaches
-/// (docs/sandbox-helper.md). With it (lifecycle commands, which may `git
-/// clone` over ssh at once), it answers once the bridge's handshake is
-/// decided or the wait ran out: `ready`, and `error` saying why not. The
-/// params are checked first, so a bad request records nothing.
+/// (docs/architecture/helper/in-container.md). With it (lifecycle commands,
+/// which may `git clone` over ssh at once), it answers once the bridge's
+/// handshake is decided or the wait ran out: `ready`, and `error` saying why
+/// not. The params are checked first, so a bad request records nothing.
 fn bridges_ensure(p: EnsureParams, ctx: &Ctx) -> Answer {
     let Some(bridges) = ctx.bridges else {
         return Err(ApiError::internal(anyhow::anyhow!("this daemon runs no bridges")));

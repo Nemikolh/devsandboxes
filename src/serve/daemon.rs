@@ -1,5 +1,5 @@
 //! The daemon side of `devsandbox serve`: start lock, accept loop, version
-//! handoff and idle exit (docs/serve.md).
+//! handoff and idle exit (docs/architecture/daemon/role.md).
 //!
 //! Threading: the calling thread runs the accept loop, waking every [`TICK`]
 //! to re-check the idle countdown and the stop request (handoff, `shutdown`);
@@ -14,13 +14,13 @@
 //! (`machines::service`), killing their ssh. The start lock is released
 //! last, so a successor never binds (or bridges) while this one drains.
 //!
-//! Notifications (docs/api.md): one daemon-wide `serve-watch` thread notices
-//! changes (store writes by this process at once, by others within [`WATCH`]
-//! via the file stamp; `state.toml` by its stamp; the host's container poll)
-//! and only *flags* them on
-//! each subscribed connection's [`Outbox`]; it never does I/O, so a slow
-//! client can't hold up the others. A connection's first `subscribe` starts
-//! its `serve-notify-<n>` thread, which writes the flagged notifications.
+//! Notifications (docs/reference/api.md): one daemon-wide `serve-watch` thread
+//! notices changes (store writes by this process at once, by others within
+//! [`WATCH`] via the file stamp; `state.toml` by its stamp; the host's
+//! container poll) and only *flags* them on each subscribed connection's
+//! [`Outbox`]; it never does I/O, so a slow client can't hold up the others.
+//! A connection's first `subscribe` starts its `serve-notify-<n>` thread,
+//! which writes the flagged notifications.
 //! Flags coalesce (one pending `inbox.changed` however many writes; the
 //! host's sink posts `inbox.shown` the same way, latest line only, and the
 //! forward registry `forwards.changed` / `forwards.status`), so the
@@ -597,7 +597,8 @@ impl Shared {
     }
 
     /// Whether a live connection watches some root with `machines: true`:
-    /// the machine links' want (docs/machines.md, F9).
+    /// the machine links' want (docs/architecture/daemon/machines.md, *Held
+    /// links: `Machines`*).
     fn watching_machines(&self) -> bool {
         let mut any = false;
         for conn in self.conns.lock().unwrap().values() {
@@ -906,7 +907,8 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
         method if verbs::is_verb(method) => return verb(req.id, method, req.params, shared, conn),
         _ => {}
     }
-    // On a machine: the remote's answer as is (docs/machines.md, F6).
+    // On a machine: the remote's answer as is
+    // (docs/architecture/daemon/machines.md, *Forwarded requests*).
     match fwd::machine_of(&req.params) {
         Err(e) => return Some(Response::err(req.id, e.code, e.message)),
         Ok(Some(machine)) if fwd::is_quick(&req.method) => {
@@ -962,8 +964,9 @@ fn local_call(method: &str, params: Value, shared: &Shared, conn: &ConnState) ->
 }
 
 /// A quick call with `machine`: the rest of its params to that machine's
-/// daemon over its link (docs/machines.md, F6), answered with the remote's
-/// result or error, code and data kept, under this request's id.
+/// daemon over its link (docs/architecture/daemon/machines.md, *Forwarded
+/// requests*), answered with the remote's result or error, code and data
+/// kept, under this request's id.
 fn forward(id: Option<u64>, method: &str, params: Value, machine: &str, shared: &Shared) -> Response {
     let answer = match shared.links() {
         Some(links) => links.forward(machine, method, fwd::strip(params)),

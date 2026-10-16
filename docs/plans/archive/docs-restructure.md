@@ -1,3 +1,6 @@
+> Archived 2026-10-16. Historical, may be wrong; do not use as a reference.
+> Current: [README.md](../../README.md)
+
 # Docs restructure
 
 Turn the flat `docs/` (43 files mixing plans and reference, status lines
@@ -158,6 +161,47 @@ verdict's true content landed somewhere. Move `archive` docs to
 confirm (nothing deleted without confirmation).
 
 ## Step 4: links + guard
+
+### Old → new map (for the sweep)
+
+Pick the new doc by the TOPIC of the referencing comment, not just the old
+file name; open the target and use its real heading names for any
+section reference (`*Section*`). Never point at `plans/archive/` from
+code or living docs.
+
+| old `docs/…` | new home (by topic) |
+|---|---|
+| api.md | reference/api.md |
+| serve.md | architecture/daemon/role.md; forwards → daemon/forwards.md; poll → daemon/host-poll.md; install/idle/handoff → daemon/role.md |
+| client-server.md | architecture/daemon/client-server.md; machines bits → daemon/machines.md |
+| verbs-as-requests.md | architecture/daemon/verbs.md |
+| before-machines.md | daemon/host-poll.md (shared poll), daemon/verbs.md (held verbs), daemon/role.md (upgrades), instances/images-and-features.md (build log) |
+| instance-phase.md | architecture/instances/lifecycle.md; build log → instances/images-and-features.md |
+| machines.md | architecture/daemon/machines.md |
+| port-forwarding.md | architecture/daemon/forwards.md |
+| windows-support.md | plans/active/windows-support.md (future) or daemon/platform-support.md (today) |
+| sandbox-helper.md | architecture/helper/{overview,protocol,bridges,in-container}.md by topic |
+| ssh-agent.md | architecture/helper/ssh-agent.md |
+| helper-rpc.md | plans/active/helper-rpc.md |
+| inbox-redesign.md, inbox-threads.md | architecture/inbox/{model,threads-and-feed,forms,views-and-wire}.md by topic |
+| inbox-cli.md | reference/inbox-cli.md |
+| automations.md, dispatcher-branch-holders.md | architecture/automations/{autostart,dispatchers}.md; boot hook → helper/in-container.md |
+| automations-guide.md | unchanged (stays at docs/automations-guide.md) |
+| cli-proxy.md | plans/active/cli-proxy.md |
+| ideas-agents-skills.md | plans/active/agents-skills.md |
+| tui.md, dashboard-client.md, processes-stop-colors.md | architecture/dashboard/{overview,tabs-and-actions}.md |
+| tui-terminal.md | architecture/dashboard/terminal.md |
+| tui-selection.md | architecture/dashboard/selection.md |
+| tui-prompt-spec.md | architecture/dashboard/command-line.md |
+| json-output.md | architecture/dashboard/snapshot-and-json.md |
+| run-command.md, devsandboxes.md | architecture/instances/lifecycle.md (mounts → mounts-and-state.md, services → services.md) |
+| rebuild.md, service-rebuild.md | architecture/instances/rebuild-and-drift.md |
+| folders-worktrees.md, worktreeinclude.md, worktree-locking.md | architecture/instances/worktrees.md |
+| entrypoint.md, devcontainer-features.md | architecture/instances/images-and-features.md |
+| vscode-workspaces-and-persistent-state.md | architecture/instances/mounts-and-state.md |
+| config-toml-findings.md | architecture/config.md |
+| high-level-architecture.md | architecture/overview.md |
+| runtimes.md | architecture/runtimes.md |
 
 - Rewrite every `docs/<old>.md` reference (about 262 in `src/`,
   `AGENTS.md`, `skills/`, `npm/devsandboxes/`) to its new home.

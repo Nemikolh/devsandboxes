@@ -459,7 +459,7 @@ pub fn gc(dir: &Path, force: bool) -> Result<()> {
 
     // What live instances of this config root still reference, split by scope.
     // One a live `run` is materializing counts as live: its services come up
-    // before its container does (docs/instance-phase.md).
+    // before its container does (docs/architecture/instances/lifecycle.md).
     let running: BTreeSet<String> = state
         .instances
         .iter()
@@ -849,7 +849,7 @@ fn gc_shell_history(dir: &Path, state: &State, force: bool) -> Result<()> {
 /// state holds. Links leak when an `rm` crashed mid-way or predate this feature;
 /// matched on the persistent id (like `gc_shell_history`, since ids are global
 /// across config roots). No confirm prompt: unlike history, a dangling symlink
-/// carries no data (docs/ssh-agent.md).
+/// carries no data (docs/architecture/helper/ssh-agent.md).
 fn gc_agent_links(state: &State) -> Result<()> {
     let Some(agent_dir) = crate::commands::run::ssh_agent_dir() else {
         return Ok(()); // no data dir → nothing to sweep

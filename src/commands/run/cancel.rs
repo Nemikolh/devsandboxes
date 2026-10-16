@@ -1,12 +1,13 @@
-//! Cancelling a `run`/`rebuild` (docs/instance-phase.md): SIGINT/SIGTERM
-//! while one materializes set a flag instead of killing the process, so the
-//! command can roll back (`run`) or record `failed` (`rebuild`) before it
-//! exits. The terminal's Ctrl-C also reaches the children in the foreground
-//! process group, which die, so the step in progress errors out; a SIGTERM to
-//! us alone leaves them running, which is why [`check`] runs at every phase
-//! boundary too. The first signal restores the default disposition, so a
-//! second one kills as before (a rollback that hangs can still be escaped).
-//! A SIGTERM still ends the process once the cleanup is done.
+//! Cancelling a `run`/`rebuild` (docs/architecture/instances/lifecycle.md):
+//! SIGINT/SIGTERM while one materializes set a flag instead of killing the
+//! process, so the command can roll back (`run`) or record `failed`
+//! (`rebuild`) before it exits. The terminal's Ctrl-C also reaches the
+//! children in the foreground process group, which die, so the step in
+//! progress errors out; a SIGTERM to us alone leaves them running, which is
+//! why [`check`] runs at every phase boundary too. The first signal restores
+//! the default disposition, so a second one kills as before (a rollback that
+//! hangs can still be escaped). A SIGTERM still ends the process once the
+//! cleanup is done.
 
 use anyhow::{bail, Result};
 

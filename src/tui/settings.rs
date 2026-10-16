@@ -1,4 +1,4 @@
-//! Dashboard settings (docs/tui-selection.md, step 6): per-user toggles
+//! Dashboard settings (docs/architecture/dashboard/overview.md, *Settings*): per-user toggles
 //! persisted at `<data>/devsandbox/dashboard.toml`, shown and flipped in the
 //! `?` Settings & help modal. The modal's rows derive from [`SETTINGS`], so
 //! a new setting is a field here plus one table entry.
