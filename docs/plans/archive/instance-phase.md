@@ -1,3 +1,6 @@
+> Archived 2026-10-16. Historical, may be wrong; do not use as a reference.
+> Current: [architecture/instances/lifecycle.md](../../architecture/instances/lifecycle.md)
+
 # Instance phase: no half-built sandboxes, build logs, a TUI that doesn't suspend
 
 Status: done (steps 1–7). Rollout steps 1–2 of `docs/client-server.md`,

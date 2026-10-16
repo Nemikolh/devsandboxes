@@ -1,3 +1,6 @@
+> Archived 2026-10-16. Historical, may be wrong; do not use as a reference.
+> Current: [architecture/automations/dispatchers.md](../../architecture/automations/dispatchers.md)
+
 # Automations: sandboxes that start themselves and spawn their own work
 
 ## Goal

@@ -1,3 +1,6 @@
+> Archived 2026-10-16. Historical, may be wrong; do not use as a reference.
+> Current: [architecture/daemon/forwards.md](../../architecture/daemon/forwards.md)
+
 # Port forwarding: on-demand host ports for instances and services
 
 ## Goal

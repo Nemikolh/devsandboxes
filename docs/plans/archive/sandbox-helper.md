@@ -1,3 +1,6 @@
+> Archived 2026-10-16. Historical, may be wrong; do not use as a reference.
+> Current: [architecture/helper/overview.md](../../architecture/helper/overview.md)
+
 # sandbox-helper: an in-container binary shipped inside devsandbox
 
 ## Goal

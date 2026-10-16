@@ -1,3 +1,6 @@
+> Archived 2026-10-16. Historical, may be wrong; do not use as a reference.
+> Current: [architecture/daemon/machines.md](../../architecture/daemon/machines.md)
+
 # Machines: remote hosts over ssh
 
 Status: built. Steps 1–6 in commits e897bf2..5647d09, step 7 (these docs)

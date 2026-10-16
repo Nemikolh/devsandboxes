@@ -1,3 +1,6 @@
+> Archived 2026-10-16. Historical, may be wrong; do not use as a reference.
+> Current: [architecture/inbox/model.md](../../architecture/inbox/model.md)
+
 # Inbox redesign: conversations, forms, any client
 
 Status: implemented through step 20 and 13b (2026-10-06). Supersedes

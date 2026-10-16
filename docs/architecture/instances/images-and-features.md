@@ -82,6 +82,13 @@ baked into any image; `materialize` installs it by `exec` after the
 container is created ([helper](../helper/)). The image's entrypoint must
 `exec "$@"` or `sleep infinity` never runs.
 
+Differences from the devcontainers CLI, which builds the chain at run time
+(`docker run --entrypoint /bin/sh -c '<script>'`): the image's own
+`ENTRYPOINT` always runs after the feature entrypoints (the CLI drops it
+unless `overrideCommand: false`; devsandbox ignores `overrideCommand`), and
+a failing feature entrypoint logs a warning instead of continuing silently.
+Order (install order) and the lack of arguments are the same.
+
 ## What features ask of the container
 
 `feature_container_opts`, at `run`/`rebuild`:

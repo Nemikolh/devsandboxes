@@ -1,3 +1,6 @@
+> Archived 2026-10-16. Historical, may be wrong; do not use as a reference.
+> Current: [architecture/daemon/verbs.md](../../architecture/daemon/verbs.md)
+
 # Verbs as requests: `run`, `rebuild`, `start`, `stop`, `rm` through the daemon
 
 Status: done (steps 1–6). Rollout step 3 of `docs/client-server.md` (read

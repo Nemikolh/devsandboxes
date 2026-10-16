@@ -1,3 +1,6 @@
+> Archived 2026-10-16. Historical, may be wrong; do not use as a reference.
+> Current: [architecture/daemon/client-server.md](../../architecture/daemon/client-server.md)
+
 # Client/server: the CLI as a client of `devsandbox serve`
 
 Status: design, rollout steps 1–5 done. Steps 1–2 (instance phase, build

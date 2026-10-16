@@ -1,3 +1,6 @@
+> Archived 2026-10-16. Historical, may be wrong; do not use as a reference.
+> Current: [architecture/dashboard/selection.md](../../architecture/dashboard/selection.md)
+
 # Mouse text selection in the dashboard
 
 **Status: steps 1-8 implemented.** User-facing behaviour: `docs/tui.md`,

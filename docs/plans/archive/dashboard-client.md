@@ -1,3 +1,6 @@
+> Archived 2026-10-16. Historical, may be wrong; do not use as a reference.
+> Current: [architecture/dashboard/overview.md](../../architecture/dashboard/overview.md)
+
 # The dashboard as a pure client
 
 Status: done (steps 1–9). Rollout step 4 of `docs/client-server.md` (read
