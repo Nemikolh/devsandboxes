@@ -2,7 +2,7 @@
 //! `exec -i <c> devsbd bridge` and serves the streams it carries, connecting
 //! each `Open` to the host agent. Owners: `devsandbox serve` (one per running
 //! instance, docs/architecture/daemon/host-poll.md; CLI commands ask it through `bridges.ensure`) and
-//! the forwarder engine (`spawn_for`).
+//! the forwarder engine (`spawn_for`, or `attach` to a child it spawned).
 //! The daemon's bridges also take the container's `devsbd notify` records and
 //! serve its control requests (`devsbd ensure|ls|stop|rm|…`: children, their
 //! runs, branches, events, threads; `control::Op::ALL`) (docs/architecture/automations/dispatchers.md).
@@ -43,8 +43,10 @@ pub struct Bridge {
     // open forward streams on) and the daemon's advertised caps. Absent while
     // the handshake is pending or after it failed.
     forward: Arc<OnceLock<Forward>>,
-    // The instance's container, for the "outdated helper" message.
-    container: String,
+    // What the far end is called in messages ("helper in <label> is
+    // outdated"): the container for an `exec` bridge, whatever the caller of
+    // `attach` names it otherwise.
+    label: String,
 }
 
 /// The forwarding side of a healthy bridge: the mux carrying its streams and
@@ -107,7 +109,7 @@ impl Bridge {
         if forward.peer_caps & caps::TCP_FORWARD == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
-                format!("helper in {} is outdated (no port forwarding): restart the instance", self.container),
+                format!("helper in {} is outdated (no port forwarding): restart the instance", self.label),
             ));
         }
         forward.mux.connect(conn, host, port, on_close)
@@ -525,7 +527,9 @@ fn spawn_with(
 /// then `Failed` again when a healthy bridge ends. Must return at once.
 type Observer = Box<dyn Fn(BridgeStatus) + Send>;
 
-/// [`spawn_with`], plus an [`Observer`] (the daemon's [`BridgeBoard`]).
+/// [`spawn_with`], plus an [`Observer`] (the daemon's [`BridgeBoard`]):
+/// spawns `<runtime> exec -i -u root <container> devsbd bridge` and
+/// [`attach_with`]es to it, labelled by the container.
 fn spawn_observed(
     container: &str,
     hash: &str,
@@ -533,11 +537,6 @@ fn spawn_observed(
     notify: Option<Services>,
     observe: Option<Observer>,
 ) -> Option<Bridge> {
-    let observe = move |s: BridgeStatus| {
-        if let Some(o) = &observe {
-            o(s)
-        }
-    };
     let mut child = Command::new(backend().bin())
         .args(["exec", "-i", "-u", "root", container, BIN, "bridge"])
         .stdin(Stdio::piped())
@@ -545,22 +544,64 @@ fn spawn_observed(
         .stderr(Stdio::piped())
         .spawn()
         .ok()?;
-    let mut stdin = child.stdin.take()?;
-    let mut stdout = child.stdout.take()?;
-    let mut stderr = child.stderr.take()?;
+    let stdin = child.stdin.take()?;
+    let stdout = child.stdout.take()?;
+    let stderr = child.stderr.take()?;
+    Some(attach_with(child, stdin, stdout, stderr, hash, container, agent, notify, observe))
+}
+
+/// Run a bridge over an already-spawned child whose stdio carries an
+/// in-container `devsbd bridge` (directly, or behind a transport such as
+/// ssh): the handshake, then the mux. Agent-less, no notify/control
+/// services, no observer: what a forward over a non-`exec` transport needs.
+/// `stdout` may already be partly read (a header before the bridge's bytes);
+/// the handshake starts at whatever it yields next. `label` names the far
+/// end in messages (`helper in <label> is outdated …`). Dropping the
+/// `Bridge` kills `child`.
+#[cfg_attr(not(test), allow(dead_code))] // for the remote forward opener, not wired yet
+pub fn attach(
+    child: Child,
+    stdin: impl Write + Send + 'static,
+    stdout: impl Read + Send + 'static,
+    stderr: impl Read + Send + 'static,
+    hash: &str,
+    label: &str,
+) -> Bridge {
+    let none: Option<fn() -> Option<PathBuf>> = None;
+    attach_with(child, stdin, stdout, stderr, hash, label, none, None, None)
+}
+
+/// [`attach`] with the full set of options [`spawn_observed`] takes.
+#[allow(clippy::too_many_arguments)]
+fn attach_with(
+    child: Child,
+    mut stdin: impl Write + Send + 'static,
+    mut stdout: impl Read + Send + 'static,
+    mut stderr: impl Read + Send + 'static,
+    hash: &str,
+    label: &str,
+    agent: Option<impl Fn() -> Option<PathBuf> + Send + 'static>,
+    notify: Option<Services>,
+    observe: Option<Observer>,
+) -> Bridge {
+    let observe = move |s: BridgeStatus| {
+        if let Some(o) = &observe {
+            o(s)
+        }
+    };
     let child = Arc::new(Mutex::new(child));
     let done = Arc::new(AtomicBool::new(false));
     let mismatch = Arc::new(AtomicBool::new(false));
     let (tx, handshake) = mpsc::channel();
     let hash = hash.to_string();
-    let container = container.to_string();
+    let label = label.to_string();
     let finished = Arc::clone(&done);
     let hs_mismatch = Arc::clone(&mismatch);
     let forward = Arc::new(OnceLock::new());
     let hs_forward = Arc::clone(&forward);
-    // The handshake thread moves `container` (for `mismatch_message`); keep a
+    // The handshake thread moves `label` (for `mismatch_message`); keep a
     // copy for the `Bridge`'s own `connect` error message.
-    let bridge_container = container.clone();
+    let bridge_label = label.clone();
     // Watchdog: if the handshake hasn't produced a result within the timeout,
     // kill the child, which unblocks the blocking `handshake` read below. The
     // handshake thread then sees the read fail and, because `timed_out` is set,
@@ -591,16 +632,18 @@ fn spawn_observed(
                 return "helper handshake timed out".to_string();
             }
             // A version mismatch is a typed error carrying both versions, so we
-            // phrase it with the right direction and container. Otherwise the
+            // phrase it with the right direction and label. Otherwise the
             // bridge died before `Hello` (no daemon, no binary) and its stderr
             // says why — but when the *daemon* is the mismatch, the bridge
             // already printed its own direction-aware line, so prefer stderr.
             if let Some(vm) = proto::version_mismatch(&e) {
                 hs_mismatch.store(true, Ordering::Relaxed);
-                return mismatch_message(&container, vm);
+                return mismatch_message(&label, vm);
             }
             let mut msg = String::new();
-            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+            // `BrokenPipe`: the child exited before our `Hello` went out (a
+            // fast failure), the same death seen from the write side.
+            if matches!(e.kind(), std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::BrokenPipe) {
                 let _ = std::io::Read::read_to_string(&mut stderr, &mut msg);
                 // The bridge exits `MISMATCH_EXIT` when *its* handshake with the
                 // daemon failed on a version mismatch (it printed the line we
@@ -657,7 +700,7 @@ fn spawn_observed(
         finished.store(true, Ordering::Relaxed);
         observe(BridgeStatus::Failed("the bridge ended (container stopped or helper gone)".into()));
     });
-    Some(Bridge { child, done, mismatch, handshake, forward, container: bridge_container })
+    Bridge { child, done, mismatch, handshake, forward, label: bridge_label }
 }
 
 /// How long the host waits for the daemon handshake before killing the child
@@ -669,17 +712,18 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// A host-side, direction-aware message for a helper/host protocol mismatch.
 /// Peer (the helper) older → tell the user to restart the instance so the
 /// binary is rewritten; peer newer → this `devsandbox` is the stale side.
-/// The instance key isn't on hand here (only the container), so the fix hint
-/// stays generic ("restart the instance").
-fn mismatch_message(container: &str, vm: &proto::VersionMismatch) -> String {
+/// `label` is the bridge's (the container for an `exec` bridge); the instance
+/// key isn't on hand here, so the fix hint stays generic ("restart the
+/// instance").
+fn mismatch_message(label: &str, vm: &proto::VersionMismatch) -> String {
     if vm.peer < vm.ours {
         format!(
-            "helper in {container} is outdated (protocol {}, need {}): restart the instance",
+            "helper in {label} is outdated (protocol {}, need {}): restart the instance",
             vm.peer, vm.ours
         )
     } else {
         format!(
-            "this devsandbox is older than the helper in {container} (protocol {}, need {})",
+            "this devsandbox is older than the helper in {label} (protocol {}, need {})",
             vm.peer, vm.ours
         )
     }
@@ -1077,6 +1121,35 @@ mod tests {
 
     fn ok(cmd: &mut Command) -> bool {
         matches!(cmd.output(), Ok(o) if o.status.success())
+    }
+
+    /// `attach` runs the handshake on a caller-spawned child: one that dies
+    /// before `Hello` fails with its stderr (the `devsbd: ` prefix dropped),
+    /// and the bridge is done.
+    #[test]
+    fn attach_reports_a_child_that_dies_before_the_handshake() {
+        let attached = |code: i32| {
+            let mut child = Command::new("sh")
+                // Read the Hello first: a child gone before the host's write
+                // fails it with `BrokenPipe`, which skips the stderr read.
+                .args(["-c", &format!("head -c 1 >/dev/null; echo 'devsbd: no daemon here' >&2; exit {code}")])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let (stdin, stdout, stderr) =
+                (child.stdin.take().unwrap(), child.stdout.take().unwrap(), child.stderr.take().unwrap());
+            attach(child, stdin, stdout, stderr, "", "box/web")
+        };
+        let bridge = attached(1);
+        assert_eq!(bridge.outcome(Duration::from_secs(5)), Some(Err("no daemon here".into())));
+        assert!(bridge.is_done());
+        assert!(!bridge.is_mismatch());
+        // The in-container bridge's mismatch exit is classified as one.
+        let bridge = attached(proto::MISMATCH_EXIT);
+        assert!(bridge.outcome(Duration::from_secs(5)).unwrap().is_err());
+        assert!(bridge.is_mismatch());
     }
 
     #[test]

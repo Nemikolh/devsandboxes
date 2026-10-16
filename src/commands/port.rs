@@ -483,7 +483,7 @@ pub fn port(
 
     use anyhow::{bail, Context};
 
-    use crate::devsbd::forward::{Forward, ForwardSpec, ForwardState};
+    use crate::devsbd::forward::{local_opener, Forward, ForwardSpec, ForwardState};
 
     let (name, ports) = split_target(name, service.is_some(), ports);
     if name.is_none() && service.is_none() {
@@ -512,9 +512,9 @@ pub fn port(
 
     let mut forwards: Vec<Forward> = Vec::with_capacity(specs.len());
     for (host_port, container_port) in &specs {
-        let resolve = resolver(dir.clone(), instance_key.clone(), service.clone(), *container_port);
+        let open = local_opener(resolver(dir.clone(), instance_key.clone(), service.clone(), *container_port));
         let probe = Box::new(listening_procs);
-        let forward = Forward::start(ForwardSpec { bind: address, host_port: *host_port, resolve, probe })
+        let forward = Forward::start(ForwardSpec { bind: address, host_port: *host_port, open, probe })
             .with_context(|| match host_port {
                 HostPort::Fixed(p) => format!("host port {p} is in use"),
                 HostPort::Prefer(p) => format!("binding host port {p}"),

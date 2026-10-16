@@ -1,9 +1,10 @@
 //! Host forwarder engine (docs/architecture/daemon/forwards.md, *The engine: `Forward`*): binds a host TCP
 //! listener and tunnels each accepted connection into an instance through a
 //! `devsbd bridge`, whose daemon dials the target inside the container. Owns
-//! one bridge per forward, respawned on death; the route is re-resolved on
-//! every (re)spawn so a container restart or a service rebuild heals without
-//! restarting the forward. Unix-only, like `bridge.rs`.
+//! one bridge per forward, respawned on death; the forward's opener runs on
+//! every (re)spawn (re-resolving the route, for `local_opener`) so a container
+//! restart or a service rebuild heals without restarting the forward.
+//! Unix-only, like `bridge.rs`.
 //!
 //! Everything but the initial bind runs on background threads (a supervisor
 //! that keeps the bridge alive, an accept loop, and a per-connection relay via
@@ -22,7 +23,7 @@ use super::hash;
 use crate::devsbd::{format_procs, Arch};
 
 /// Where a connection should be dialed, resolved fresh for each (re)spawn of
-/// the bridge. `container` is the instance whose helper carries the tunnel;
+/// a [`local_opener`]'s bridge. `container` is the instance whose helper carries the tunnel;
 /// the daemon there dials `host:port` (loopback for an instance forward, a
 /// service alias otherwise). `arch` is the instance's recorded helper arch, or
 /// `None` when unknown (a pre-embedding instance) — only the Hello's
@@ -54,15 +55,72 @@ pub enum HostPort {
 /// How many ports `HostPort::Prefer` tries, its preferred one included.
 pub const PREFER_SPAN: u16 = 100;
 
-/// Everything `Forward::start` needs. `resolve` is called on the supervisor
-/// thread for each bridge (re)spawn, so it may touch config/state/docker; it
-/// must not be called on the caller's thread.
+/// What an [`Opener`] tells the engine about the bridge it just opened:
+/// the route label the UI shows, where the far daemon dials (`host`, `port`),
+/// and where the listening process is looked up.
+pub struct Opened {
+    pub label: String,
+    pub host: String,
+    pub port: u16,
+    pub lookup: ProcessLookup,
+}
+
+/// Where the listening process on the forwarded port is found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProcessLookup {
+    /// The port lives where the bridge's helper runs: ask it
+    /// (`Bridge::listening`), falling back to `ForwardSpec.probe` in
+    /// `container` only when the helper predates the lookup.
+    Helper { container: String },
+    /// The port lives in `container`, which the helper can't see (a
+    /// via-instance route): straight to `ForwardSpec.probe`.
+    Probe { container: String },
+    /// Nowhere this side can look: the process stays unknown.
+    None,
+}
+
+/// Opens one bridge for a forward: called on the supervisor thread for each
+/// (re)spawn, so it may touch config/state/docker (never on the caller's
+/// thread). Returns as soon as the bridge is spawned; the engine waits for
+/// its handshake. `stop` is set when the `Forward` is dropped: an opener that
+/// blocks before it has a bridge must poll it and bail with an `Err`
+/// (not shown: the forward is going away) so the drop stays prompt.
+pub type Opener = Box<dyn Fn(&AtomicBool) -> Result<(Opened, Bridge), String> + Send + Sync>;
+
+/// The opener for a forward into a local instance: `resolve` the route, then
+/// `exec` a bridge into its container (`bridge::spawn_for`, serving the host
+/// ssh-agent when there is one). The helper answers the listening-process
+/// lookup when the port lives in the dialed container.
+pub fn local_opener(resolve: Box<dyn Fn() -> Result<Route, String> + Send + Sync>) -> Opener {
+    Box::new(move |_stop| {
+        let route = resolve()?;
+        let hash = route.arch.and_then(hash).unwrap_or_default();
+        let bridge = bridge::spawn_for(&route.container, hash, true)
+            .ok_or_else(|| format!("could not exec into {}", route.container))?;
+        let lookup = lookup_for(&route);
+        Ok((Opened { label: route.label, host: route.host, port: route.port, lookup }, bridge))
+    })
+}
+
+/// Where a local route's listening process is found: the bridge's helper when
+/// the port lives in the dialed container, else the probe in the container it
+/// does live in (a via-instance route).
+fn lookup_for(route: &Route) -> ProcessLookup {
+    let container = route.process_container.clone();
+    if route.process_container == route.container {
+        ProcessLookup::Helper { container }
+    } else {
+        ProcessLookup::Probe { container }
+    }
+}
+
+/// Everything `Forward::start` needs.
 pub struct ForwardSpec {
     pub bind: IpAddr,
     pub host_port: HostPort,
-    pub resolve: Box<dyn Fn() -> Result<Route, String> + Send + Sync>,
+    pub open: Opener,
     /// Fallback listening-process lookup for the forwarded port, run in the
-    /// route's `process_container` when the bridge's helper can't answer
+    /// opener's `ProcessLookup` container when the bridge's helper can't answer
     /// (`Bridge::listening`: a via-instance route, an older helper; docs/
     /// architecture/daemon/forwards.md). Called only on the forward's own
     /// (supervisor) thread, never the caller's; any failure yields `None`.
@@ -154,10 +212,9 @@ struct Shared {
     dial: Mutex<(String, u16)>,
     /// Fallback listening-process lookup; run only on the supervisor thread.
     probe: Box<dyn Fn(&str, u16) -> Option<String> + Send + Sync>,
-    /// Where to probe for the listening process (`process_container`, port,
-    /// and whether that's the dialed container, i.e. the bridge's helper can
-    /// see it), set by the supervisor on each (re)spawn.
-    probe_target: Mutex<(String, u16, bool)>,
+    /// Where to look for the listening process and on which port, from the
+    /// opener, set by the supervisor on each (re)spawn.
+    probe_target: Mutex<(ProcessLookup, u16)>,
     /// The last known listening process, refreshed on the supervisor thread and
     /// read by `status`. `None` whenever the forward isn't Active.
     process: Mutex<Option<String>>,
@@ -202,11 +259,11 @@ impl Notes {
 
 impl Forward {
     /// Bind the listener (errors here are immediate and precise), then start
-    /// the accept loop and the bridge supervisor. The bridge is resolved and
-    /// spawned eagerly, so a bad route or a dead daemon shows up in `status`
+    /// the accept loop and the bridge supervisor. The bridge is opened
+    /// eagerly, so a bad route or a dead daemon shows up in `status`
     /// without waiting for a first client.
     pub fn start(spec: ForwardSpec) -> io::Result<Forward> {
-        let ForwardSpec { bind, host_port, resolve, probe } = spec;
+        let ForwardSpec { bind, host_port, open, probe } = spec;
         let listener = bind_listener(bind, host_port)?;
         listener.set_nonblocking(true)?;
         let local_addr = listener.local_addr()?;
@@ -218,7 +275,7 @@ impl Forward {
             route_label: Mutex::new(String::new()),
             dial: Mutex::new((String::new(), 0)),
             probe,
-            probe_target: Mutex::new((String::new(), 0, false)),
+            probe_target: Mutex::new((ProcessLookup::None, 0)),
             process: Mutex::new(None),
             handlers: Mutex::new(Vec::new()),
         });
@@ -227,7 +284,7 @@ impl Forward {
         let supervisor = {
             let shared = Arc::clone(&shared);
             let stop = Arc::clone(&stop);
-            std::thread::spawn(move || supervise(resolve, shared, stop))
+            std::thread::spawn(move || supervise(open, shared, stop))
         };
         let accept = {
             let shared = Arc::clone(&shared);
@@ -258,7 +315,8 @@ impl Forward {
 
 impl Drop for Forward {
     fn drop(&mut self) {
-        // Stop accepting and end the supervisor's retry sleeps.
+        // Stop accepting and end the supervisor's retry sleeps (and a
+        // blocking opener, which polls it).
         self.stop.store(true, Ordering::Relaxed);
         // Drop the bridge: ends its mux, so every open connection's local
         // socket is shut and its relay threads finish.
@@ -379,12 +437,12 @@ fn handle_conn(sock: TcpStream, shared: &Arc<Shared>, stop: &Arc<AtomicBool>) {
     }
 }
 
-/// Keep a bridge alive for the forward. Resolve + spawn eagerly; when the
-/// bridge dies, wait a retry gap (longer for a version mismatch), re-resolve
-/// (so route changes heal), and spawn again. Never re-exec per connection.
-fn supervise(resolve: Box<dyn Fn() -> Result<Route, String> + Send + Sync>, shared: Arc<Shared>, stop: Arc<AtomicBool>) {
+/// Keep a bridge alive for the forward. Open one eagerly; when the bridge
+/// dies, wait a retry gap (longer for a version mismatch) and open again (the
+/// opener re-resolves, so route changes heal). Never re-exec per connection.
+fn supervise(open: Opener, shared: Arc<Shared>, stop: Arc<AtomicBool>) {
     while !stop.load(Ordering::Relaxed) {
-        let gap = match try_spawn(&resolve, &shared, &stop) {
+        let gap = match try_spawn(&open, &shared, &stop) {
             SpawnOutcome::Serving(bridge) => {
                 // Just became Active: probe the listening process once now, then
                 // periodically inside `wait_until_dead` (docs, _Listening
@@ -415,7 +473,7 @@ fn supervise(resolve: Box<dyn Fn() -> Result<Route, String> + Send + Sync>, shar
 enum SpawnOutcome {
     /// A live, handshook bridge is now serving.
     Serving(Arc<Mutex<Bridge>>),
-    /// Resolve or the handshake failed; `mismatch` picks the retry gap.
+    /// The opener or the handshake failed; `mismatch` picks the retry gap.
     Failed { mismatch: bool },
 }
 
@@ -426,27 +484,22 @@ fn retry_gap(mismatch: bool) -> Duration {
     if mismatch { MISMATCH_RETRY } else { RETRY }
 }
 
-/// Resolve the route and spawn one bridge, waiting for its handshake. Publishes
-/// the result into `shared` (state + label + bridge). On any failure records a
-/// note and leaves the forward in `Error`.
-fn try_spawn(resolve: &(dyn Fn() -> Result<Route, String> + Send + Sync), shared: &Arc<Shared>, stop: &Arc<AtomicBool>) -> SpawnOutcome {
-    let route = match resolve() {
-        Ok(route) => route,
+/// Open one bridge, waiting for its handshake. Publishes the result into
+/// `shared` (state + label + bridge). On any failure records a note and leaves
+/// the forward in `Error`; an opener that bailed because `stop` was set
+/// records nothing.
+fn try_spawn(open: &Opener, shared: &Arc<Shared>, stop: &Arc<AtomicBool>) -> SpawnOutcome {
+    let (opened, bridge) = match open(stop) {
+        Ok(opened) => opened,
+        Err(_) if stop.load(Ordering::Relaxed) => return SpawnOutcome::Failed { mismatch: false },
         Err(reason) => {
             set_error(shared, reason);
             return SpawnOutcome::Failed { mismatch: false };
         }
     };
-    *shared.route_label.lock().unwrap() = route.label.clone();
-    *shared.dial.lock().unwrap() = (route.host.clone(), route.port);
-    *shared.probe_target.lock().unwrap() =
-        (route.process_container.clone(), route.port, route.process_container == route.container);
-
-    let hash = route.arch.and_then(hash).unwrap_or_default();
-    let Some(bridge) = bridge::spawn_for(&route.container, hash, true) else {
-        set_error(shared, format!("could not exec into {}", route.container));
-        return SpawnOutcome::Failed { mismatch: false };
-    };
+    *shared.route_label.lock().unwrap() = opened.label;
+    *shared.dial.lock().unwrap() = (opened.host, opened.port);
+    *shared.probe_target.lock().unwrap() = (opened.lookup, opened.port);
     // The handshake channel is consumed here (still sole owner), before the
     // bridge is wrapped for sharing across accept threads. Wait in short slices
     // so a `Drop` mid-handshake bails within a slice instead of blocking up to
@@ -528,28 +581,31 @@ fn set_error(shared: &Arc<Shared>, reason: String) {
     shared.notes.lock().unwrap().push(reason);
 }
 
-/// Find the listening process and store it: asked of the bridge's helper when
-/// it can see the port (`helper_answer`), else the `probe` fallback in the
-/// route's `process_container`. Only ever called on the supervisor thread;
-/// any failure (no match, no answer, container gone) leaves `None`. The
-/// bridge's lock is held for the query, at most `LOOKUP_TIMEOUT`.
+/// Find the listening process and store it, per the opener's
+/// [`ProcessLookup`]: asked of the bridge's helper when it can see the port
+/// (`helper_answer`), else the `probe` fallback in the lookup's container.
+/// Only ever called on the supervisor thread; any failure (no match, no
+/// answer, container gone) leaves `None`. The bridge's lock is held for the
+/// query, at most `LOOKUP_TIMEOUT`.
 fn refresh_process(shared: &Arc<Shared>, bridge: &Arc<Mutex<Bridge>>) {
-    let (container, port, dialed) = shared.probe_target.lock().unwrap().clone();
-    let found = helper_answer(dialed, || bridge.lock().unwrap().listening(port, LOOKUP_TIMEOUT))
-        .unwrap_or_else(|| (shared.probe)(&container, port));
+    let (lookup, port) = shared.probe_target.lock().unwrap().clone();
+    let found = match lookup {
+        ProcessLookup::Helper { container } => {
+            helper_answer(|| bridge.lock().unwrap().listening(port, LOOKUP_TIMEOUT))
+                .unwrap_or_else(|| (shared.probe)(&container, port))
+        }
+        ProcessLookup::Probe { container } => (shared.probe)(&container, port),
+        ProcessLookup::None => None,
+    };
     *shared.process.lock().unwrap() = found;
 }
 
 /// The helper's say on the listening process: `Some(found)` when it settled
 /// it (an answer, or a failure that leaves it unknown), `None` when the
-/// fallback probe should run instead — the port isn't in the dialed container
-/// (`dialed` false: `ask` isn't called) or the helper predates `PORT_INFO`
+/// fallback probe should run instead — the helper predates `PORT_INFO`
 /// (`Unsupported`). A timeout doesn't fall back: a wedged helper's container
 /// wouldn't serve an `exec` much better.
-fn helper_answer(dialed: bool, ask: impl FnOnce() -> io::Result<Vec<(u32, String)>>) -> Option<Option<String>> {
-    if !dialed {
-        return None;
-    }
+fn helper_answer(ask: impl FnOnce() -> io::Result<Vec<(u32, String)>>) -> Option<Option<String>> {
     match ask() {
         Ok(procs) => Some(format_procs(&procs)),
         Err(e) if e.kind() == io::ErrorKind::Unsupported => None,
@@ -607,15 +663,33 @@ mod tests {
     fn helper_answer_table() {
         let err = |kind| move || Err(io::Error::new(kind, "x"));
         // Answered: formatted like the lsof path; empty = nothing listens.
-        assert_eq!(helper_answer(true, || Ok(vec![(412, "node".into())])), Some(Some("node (pid 412)".into())));
-        assert_eq!(helper_answer(true, || Ok(Vec::new())), Some(None));
+        assert_eq!(helper_answer(|| Ok(vec![(412, "node".into())])), Some(Some("node (pid 412)".into())));
+        assert_eq!(helper_answer(|| Ok(Vec::new())), Some(None));
         // Older helper: fall back to the probe.
-        assert_eq!(helper_answer(true, err(io::ErrorKind::Unsupported)), None);
+        assert_eq!(helper_answer(err(io::ErrorKind::Unsupported)), None);
         // No answer / dead bridge: unknown, no fallback exec.
-        assert_eq!(helper_answer(true, err(io::ErrorKind::TimedOut)), Some(None));
-        assert_eq!(helper_answer(true, err(io::ErrorKind::BrokenPipe)), Some(None));
-        // Port lives elsewhere (via-instance): the helper isn't even asked.
-        assert_eq!(helper_answer(false, || -> io::Result<Vec<(u32, String)>> { panic!("asked") }), None);
+        assert_eq!(helper_answer(err(io::ErrorKind::TimedOut)), Some(None));
+        assert_eq!(helper_answer(err(io::ErrorKind::BrokenPipe)), Some(None));
+    }
+
+    /// Which lookup `local_opener` picks: the helper when the port lives in
+    /// the dialed container, the probe otherwise (via-instance). The
+    /// "helper isn't even asked" case is `ProcessLookup::Probe`'s arm.
+    #[test]
+    fn local_opener_lookup_follows_the_process_container() {
+        let route = |process_container: &str| Route {
+            container: "c".into(),
+            arch: None,
+            host: "127.0.0.1".into(),
+            port: 80,
+            label: "x:80".into(),
+            process_container: process_container.into(),
+        };
+        assert_eq!(lookup_for(&route("c")), ProcessLookup::Helper { container: "c".into() });
+        assert_eq!(lookup_for(&route("svc")), ProcessLookup::Probe { container: "svc".into() });
+        // Resolve fails: no exec, the reason comes through as is.
+        let open = local_opener(Box::new(|| Err("no running container".into())));
+        assert_eq!(open(&AtomicBool::new(false)).err().as_deref(), Some("no running container"));
     }
 
     // ---- pure: note dedup ----
@@ -693,7 +767,7 @@ mod tests {
         let forward = Forward::start(ForwardSpec {
             bind: LOOPBACK,
             host_port: HostPort::Prefer(0),
-            resolve: Box::new(|| Err("no running container for service redis".into())),
+            open: local_opener(Box::new(|| Err("no running container for service redis".into()))),
             probe: no_probe(),
         })
         .unwrap();
@@ -729,6 +803,66 @@ mod tests {
         drop(forward); // joins without deadlock
     }
 
+    /// An opener of any kind that fails (not just a failing resolve) lands the
+    /// forward in `Error` with its reason as a note, and is retried; `Drop`
+    /// stays prompt.
+    #[test]
+    fn failing_opener_surfaces_error_and_drops_promptly() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let open: Opener = {
+            let calls = Arc::clone(&calls);
+            Box::new(move |_| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Err("ssh: connect to host box: Connection refused".into())
+            })
+        };
+        let forward =
+            Forward::start(ForwardSpec { bind: LOOPBACK, host_port: HostPort::Prefer(0), open, probe: no_probe() }).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !matches!(forward.status().state, ForwardState::Error(_)) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(forward.status().state, ForwardState::Error("ssh: connect to host box: Connection refused".into()));
+        assert_eq!(forward.drain_notes(), ["ssh: connect to host box: Connection refused"]);
+        assert_eq!(forward.status().process, None);
+        // Dropped inside the retry gap: no second open, and no waiting it out.
+        let started = Instant::now();
+        drop(forward);
+        assert!(started.elapsed() < Duration::from_secs(1), "drop took {:?}", started.elapsed());
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    /// A blocking opener (the remote one waits on ssh) sees `stop` once the
+    /// `Forward` is dropped, so the drop returns as soon as it bails; its
+    /// `Err` then is no note or `Error`, the forward is just going away.
+    #[test]
+    fn drop_stops_a_blocking_opener() {
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (stopped_tx, stopped) = std::sync::mpsc::channel();
+        let open: Opener = {
+            let (entered_tx, stopped_tx) = (Mutex::new(entered_tx), Mutex::new(stopped_tx));
+            Box::new(move |stop| {
+                let _ = entered_tx.lock().unwrap().send(());
+                while !stop.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let _ = stopped_tx.lock().unwrap().send(());
+                Err("stopped".into())
+            })
+        };
+        let forward =
+            Forward::start(ForwardSpec { bind: LOOPBACK, host_port: HostPort::Prefer(0), open, probe: no_probe() }).unwrap();
+        entered.recv_timeout(Duration::from_secs(5)).expect("opener called");
+        assert_eq!(forward.status().state, ForwardState::Connecting);
+        let shared = Arc::clone(&forward.shared);
+        let started = Instant::now();
+        drop(forward);
+        assert!(started.elapsed() < Duration::from_secs(1), "drop took {:?}", started.elapsed());
+        stopped.try_recv().expect("the opener saw stop before drop returned");
+        assert!(shared.notes.lock().unwrap().pending.is_empty(), "no note for a stopped open");
+        assert_eq!(shared.inner.lock().unwrap().state, ForwardState::Connecting);
+    }
+
     // ---- docker-gated end-to-end ----
 
     use crate::devsbd::{install, Arch};
@@ -738,10 +872,10 @@ mod tests {
         matches!(cmd.output(), Ok(o) if o.status.success())
     }
 
-    /// A `Route` closure targeting `container`'s loopback `port` (`port.rs`
-    /// does the real resolution; here a fixed route is enough).
-    fn loopback_route(container: String, arch: Arch, port: u16) -> Box<dyn Fn() -> Result<Route, String> + Send + Sync> {
-        Box::new(move || {
+    /// A local opener whose route targets `container`'s loopback `port`
+    /// (`port.rs` does the real resolution; here a fixed route is enough).
+    fn loopback_route(container: String, arch: Arch, port: u16) -> Opener {
+        local_opener(Box::new(move || {
             Ok(Route {
                 container: container.clone(),
                 arch: Some(arch),
@@ -750,7 +884,7 @@ mod tests {
                 label: format!("test:{port}"),
                 process_container: container.clone(),
             })
-        })
+        }))
     }
 
     /// A probe stub that never finds a process — the lifecycle/docker echo
@@ -791,7 +925,7 @@ mod tests {
             let forward = Forward::start(ForwardSpec {
                 bind: LOOPBACK,
                 host_port: HostPort::Prefer(0),
-                resolve: loopback_route(name.clone(), arch, 8080),
+                open: loopback_route(name.clone(), arch, 8080),
                 probe: no_probe(),
             })
             .unwrap();
@@ -909,7 +1043,7 @@ mod tests {
             let direct = Forward::start(ForwardSpec {
                 bind: LOOPBACK,
                 host_port: HostPort::Prefer(0),
-                resolve: loopback_route(name.clone(), arch, 8080),
+                open: loopback_route(name.clone(), arch, 8080),
                 probe: fallback(),
             })
             .unwrap();
@@ -935,7 +1069,7 @@ mod tests {
             let via = Forward::start(ForwardSpec {
                 bind: LOOPBACK,
                 host_port: HostPort::Prefer(0),
-                resolve: elsewhere,
+                open: local_opener(elsewhere),
                 probe: fallback(),
             })
             .unwrap();
@@ -962,7 +1096,7 @@ mod tests {
             let forward = Forward::start(ForwardSpec {
                 bind: LOOPBACK,
                 host_port: HostPort::Prefer(0),
-                resolve: loopback_route(name.clone(), arch, 9),
+                open: loopback_route(name.clone(), arch, 9),
                 probe: no_probe(),
             })
             .unwrap();
@@ -1022,7 +1156,7 @@ mod tests {
             let forward = Forward::start(ForwardSpec {
                 bind: LOOPBACK,
                 host_port: HostPort::Prefer(0),
-                resolve: loopback_route(name.clone(), arch, 8080),
+                open: loopback_route(name.clone(), arch, 8080),
                 probe: no_probe(),
             })
             .unwrap();

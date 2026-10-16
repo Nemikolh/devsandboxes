@@ -6,8 +6,9 @@ share one engine: the daemon (Ports-tab ad-hoc forwards and configured
 `forwardPorts`) and the foreground `devsandbox port` command. Read this
 before touching forwards, their ports or their persistence.
 
-Code: `src/devsbd/forward.rs` (`Forward`, `ForwardSpec`, `HostPort`,
-`PREFER_SPAN`, `ForwardState`, `bind_listener`), `src/commands/port.rs`
+Code: `src/devsbd/forward.rs` (`Forward`, `ForwardSpec`, `Opener`,
+`Opened`, `ProcessLookup`, `local_opener`, `HostPort`, `PREFER_SPAN`,
+`ForwardState`, `bind_listener`), `src/commands/port.rs`
 (`plan`, `Planned`, `resolver`, `parse_port_spec`, `listening_procs`,
 `port`), `src/serve/forwards.rs` (`Registry`, `Handle`, `Root`, `Owner`,
 `Configured`, `AddRequest`, `Event`, `restore`, `candidates`),
@@ -25,8 +26,16 @@ everything else on background threads: a supervisor keeping one
 accept loop, and a relay per connection. Each accepted connection becomes
 a host-initiated `Connect` stream over the bridge's mux (flow-controlled,
 half-close aware; frames: [protocol.md](../helper/protocol.md)); the helper inside dials the
-target. The route is re-resolved on every bridge (re)spawn, so a container
-restart or a `service rebuild` heals without restarting the forward.
+target. Where the bridge comes from is the forward's `ForwardSpec.open`, an
+`Opener` the supervisor calls on every (re)spawn: it returns the spawned
+`Bridge` plus an `Opened` (route label, dial host and port, and the
+`ProcessLookup` saying where the listening process is found), and the
+engine waits for the handshake itself. `local_opener` resolves the route
+and `exec`s a bridge into its container (`bridge::spawn_for`); since it
+re-resolves each time, a container restart or a `service rebuild` heals
+without restarting the forward. An opener gets the forward's `stop` flag:
+one that blocks must bail once it's set, so dropping a `Forward` stays
+prompt.
 Nothing goes to stderr: state is `ForwardState` (`Connecting`, `Active`,
 `Error`) plus notes. Unix-only, like the mux.
 
@@ -53,14 +62,15 @@ call and tries them in order:
   root `exec`, writable `/run`).
 
 The engine shows which process listens (`node (pid 412)`, `format_procs`
-in `src/devsbd.rs`). When the port lives in the dialed container (instance
-and injection routes) it asks the forward's own bridge: `Bridge::listening`,
+in `src/devsbd.rs`), per the opener's `ProcessLookup`. When the port lives
+in the dialed container (instance and injection routes: `Helper`) it asks
+the forward's own bridge: `Bridge::listening`,
 a `PortQuery` the helper answers from `/proc`
 ([protocol.md](../helper/protocol.md#port-queries)), waited at most
 `LOOKUP_TIMEOUT` (2 s). A via-instance route (the instance's helper can't
-see the service container) and a helper without `PORT_INFO` fall back to
-`ForwardSpec.probe`, which is `listening_procs`: a quiet `lsof -F` `exec`
-in the route's `process_container`. Any failure shows nothing; a helper
+see the service container: `Probe`) and a helper without `PORT_INFO` fall
+back to `ForwardSpec.probe`, which is `listening_procs`: a quiet `lsof -F`
+`exec` in the route's `process_container`. Any failure shows nothing; a helper
 that doesn't answer in time is not retried through `lsof`
 (`helper_answer`). Probed on the supervisor thread at most every
 `PROBE_REFRESH` (10 s) while the forward is `Active`.

@@ -44,7 +44,7 @@ use super::api::ApiError;
 use super::forward_store::{self, Entry};
 use crate::commands::{port, services};
 use crate::config::{Config, ForwardPort, ServiceScope};
-use crate::devsbd::forward::{Forward, ForwardSpec, ForwardState, ForwardStatus, HostPort, PREFER_SPAN};
+use crate::devsbd::forward::{local_opener, Forward, ForwardSpec, ForwardState, ForwardStatus, HostPort, PREFER_SPAN};
 use crate::state::State;
 
 /// How often the registry re-polls every forward's `status()` while idle, so
@@ -599,9 +599,9 @@ impl Root {
     /// the bound host port.
     fn start_adhoc(&mut self, mut entry: Entry, host_port: HostPort, next_id: &mut u64) -> std::io::Result<(u64, Entry)> {
         entry.dir = self.dir.clone();
-        let resolve = port::resolver(self.dir.clone(), entry.instance.clone(), entry.service.clone(), entry.container_port);
+        let open = local_opener(port::resolver(self.dir.clone(), entry.instance.clone(), entry.service.clone(), entry.container_port));
         let probe = Box::new(port::listening_procs);
-        let forward = Forward::start(ForwardSpec { bind: entry.bind(), host_port, resolve, probe })?;
+        let forward = Forward::start(ForwardSpec { bind: entry.bind(), host_port, open, probe })?;
         entry.host_port = forward.status().local_addr.port();
         let id = self.insert(forward, next_id);
         self.adhoc.insert(id, entry.clone());
@@ -701,7 +701,7 @@ impl Root {
             let spec = ForwardSpec {
                 bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
                 host_port: HostPort::Fixed(port),
-                resolve: port::resolver(self.dir.clone(), instance.clone(), fp.service.clone(), fp.port),
+                open: local_opener(port::resolver(self.dir.clone(), instance.clone(), fp.service.clone(), fp.port)),
                 probe: Box::new(port::listening_procs),
             };
             match Forward::start(spec) {

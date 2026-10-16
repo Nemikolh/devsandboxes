@@ -8,7 +8,7 @@ when touching who spawns bridges, their lifecycle, or what a container
 request turns into on the host.
 
 Code: `src/devsbd/bridge.rs` (`Bridge`, `Bridges`, `BridgeWorker`,
-`BridgeBoard`, `spawn_observed`, `spawn_for`, `open_stream`,
+`BridgeBoard`, `spawn_observed`, `spawn_for`, `attach`, `open_stream`,
 `handle_notify`, `handle_control`, `dispatch_control`, `apply_message`,
 `AgentCandidates`), `src/serve/host.rs` (`poll`, `Waker`), `src/serve/api.rs`
 (`bridges_ensure`), `src/serve/client.rs` (`ensure_bridge`,
@@ -23,7 +23,10 @@ Code: `src/devsbd/bridge.rs` (`Bridge`, `Bridges`, `BridgeWorker`,
   owns every bridge and coalesces bursts into one `reconcile`. The CLI and the
   dashboard never keep their own agent/notify bridges.
 - **The forward engine**: `spawn_for` makes a short-lived bridge per forward
-  route, without notify/control services. See
+  route, without notify/control services. `attach` runs the same handshake
+  and mux over a child the caller spawned (and may have read a header
+  from), agent-less; `spawn_observed` is the `exec` spawn in front of it.
+  See
   [../daemon/forwards.md](../daemon/forwards.md).
 
 ## Reconcile
