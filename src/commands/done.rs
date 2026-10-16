@@ -30,8 +30,8 @@ pub fn done(name: &str, done: bool) -> Result<()> {
 }
 
 /// Set or clear `key`'s flag in the saved state and return a one-line
-/// status; prints nothing, so the TUI (which owns the terminal) shares it
-/// with the CLI. `key` is an exact state key.
+/// status; prints nothing, so the daemon's `instances.done` shares it with
+/// the CLI. `key` is an exact state key.
 pub fn set_saved(key: &str, done: bool) -> Result<String> {
     set_saved_at(&State::path()?, key, done)
 }

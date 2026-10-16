@@ -9,7 +9,7 @@
 //! config (`sandboxes.list`), the instance pick (`instances.resolve`), rm's
 //! branch question (`ask` → `confirm` → resend). Then the request streams:
 //! `output` goes to our stdout/stderr as it comes, and the answer decides the
-//! exit code (F9). Ctrl-C cancels through a second connection
+//! exit code. Ctrl-C cancels through a second connection
 //! (`instances.cancel`) so the rollback still streams; when there's nothing
 //! to name yet, or the cancel is refused, it hangs up, which the daemon
 //! takes as a cancel. A second Ctrl-C kills this process: a hang-up too.
@@ -79,7 +79,7 @@ impl CliVerb {
         )
     }
 
-    /// Whether it writes a build log a lost request can be followed by (F10).
+    /// Whether it writes a build log a lost request can be followed by.
     fn builds(&self) -> bool {
         matches!(self, CliVerb::Run { .. } | CliVerb::Rebuild { .. } | CliVerb::Start { .. })
     }
@@ -121,7 +121,7 @@ pub(crate) fn from_command(command: &Command) -> Option<CliVerb> {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Fed {
     /// Some machine is registered: names resolve across machines. Without
-    /// one (F15) every request is what it was before machines.
+    /// one every request stays on this host.
     pub machines: bool,
     /// `--machine`: an `--all` verb or `service rebuild` sent there.
     pub machine: Option<String>,
@@ -180,7 +180,7 @@ pub(crate) fn run(dir: &Path, verb: CliVerb, fed: &Fed) -> Result<Done> {
         Prep::Exit(code) => return Ok(Done::Exit(code)),
         Prep::Old(why) => return in_process(&verb, fed, why),
     };
-    // Several requests: a machine's roots, one after the other (F16). The
+    // Several requests: a machine's roots, one after the other. The
     // first failure's exit is the exit; a Ctrl-C or a lost daemon stops.
     let mut code = 0;
     for prepared in list {
@@ -234,8 +234,7 @@ fn send(conn: &mut Conn, verb: &CliVerb, prepared: Prepared) -> Result<(Done, bo
 }
 
 /// The fallback, announced unless `-d` (which refuses it with `why`). A
-/// verb on a machine has none: the registry and the links are the daemon's
-/// (F13).
+/// verb on a machine has none: the registry and the links are the daemon's.
 fn in_process(verb: &CliVerb, fed: &Fed, why: String) -> Result<Done> {
     if let Some(m) = &fed.machine {
         bail!("--machine {m} needs devsandbox serve: {why}");
@@ -465,7 +464,7 @@ fn prepare(
     Ok(Prep::Send(prepared))
 }
 
-/// `params` sent to `machine`, when there is one (F6).
+/// `params` sent to `machine`, when there is one.
 fn routed(mut params: Value, machine: Option<&str>) -> Value {
     if let Some(m) = machine {
         params["machine"] = json!(m);
@@ -480,7 +479,7 @@ fn on_machine(method: &'static str, params: Value, m: &str, banner: String) -> P
 
 /// Where a verb acts: the name on its host, the machine (`None`: here) and
 /// the config root the request carries (here: `-C`, as before machines;
-/// there: the instance's or sandbox's root on the machine, F12).
+/// there: the instance's or sandbox's root on the machine).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Target {
     name: String,
@@ -490,7 +489,7 @@ struct Target {
 
 /// `name` as one instance (`instances.resolve`), picking on a TTY among
 /// several as the in-process CLI does; `Err(why)` from an older daemon.
-/// With machines (F11) a bare name is looked up everywhere, a qualified one
+/// With machines a bare name is looked up everywhere, a qualified one
 /// on its machine, `@/` here only.
 fn target_of(name: &str, root: &Path, fed: &Fed, call: &mut Call, ui: &mut Ui) -> Result<Result<Target, String>> {
     let (wherever, name) = if fed.machines { parse_name(name)? } else { (Where::Local, name.to_string()) };
@@ -531,7 +530,7 @@ fn run_target(
     json: bool,
 ) -> Result<Option<Result<Target, String>>> {
     // Always listed, not only for the pick: an empty config is the
-    // example offer, which writes into the user's dir (F6).
+    // example offer, which writes into the user's dir.
     let params = if fed.machines { json!({ "root": root, "machines": true }) } else { json!({ "root": root }) };
     let rows: Vec<SandboxEntry> = match reply(call("sandboxes.list", params)?) {
         Reply::Ok(rows) => serde_json::from_value(rows).context("bad sandboxes.list result from devsandbox serve")?,
@@ -588,7 +587,7 @@ fn run_target(
     Ok(Some(Ok(target)))
 }
 
-/// What `run` does with a sandbox name and the sandboxes listed (F12).
+/// What `run` does with a sandbox name and the sandboxes listed.
 #[derive(Debug, PartialEq)]
 enum SandboxChoice {
     /// Nothing defined here, nothing matched elsewhere: the example config.
@@ -710,7 +709,7 @@ enum Answer {
     Old(String),
     /// We hung up (Ctrl-C before anything could be cancelled by name).
     HungUp,
-    /// The connection ended first: the verb runs on without us (F10).
+    /// The connection ended first: the verb runs on without us.
     Lost,
 }
 
@@ -735,7 +734,7 @@ impl Answer {
     }
 }
 
-/// rm's question loop (F5): an `ask` that comes back `confirm` is put to the
+/// rm's question loop: an `ask` that comes back `confirm` is put to the
 /// user (`confirm`), then resent once with the answer as `deleteBranch`.
 /// Any other answer, of either send, is the result.
 fn with_confirm(
@@ -910,12 +909,12 @@ enum Ending {
     Exit(i32),
     /// A `detached` answer: print the instance (or `run --json`'s record).
     Detached(Value),
-    /// The daemon went away mid-verb (F10).
+    /// The daemon went away mid-verb.
     Lost,
     Old(String),
 }
 
-/// The exit code rules (F9): success 0, `failed` its exit, 130 after a
+/// The exit code rules: success 0, `failed` its exit, 130 after a
 /// Ctrl-C whatever the verb then answered, other errors ours (exit 1).
 fn ending(answer: Answer, cancelled: bool) -> Result<Ending> {
     Ok(match answer {

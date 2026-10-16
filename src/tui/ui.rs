@@ -211,7 +211,7 @@ fn draw_content(frame: &mut Frame, app: &App, area: Rect) {
 /// carved *inside* `top` by the caller, never here. That keeps the bottom
 /// geometry — and therefore [`term_pane_size`] — a pure function of the frame
 /// size and whether any terminal exists, so the event loop's PTY-resize math
-/// (step 4) can't drift from what the draw path actually laid out.
+/// can't drift from what the draw path actually laid out.
 ///
 /// Returns `(top, detail, Some(terms))` when `!app.terms.is_empty()`: the bottom
 /// section is 50% of the content area, split `[Detail 30%, terminal Min(0)]`.
@@ -243,8 +243,8 @@ fn open_bottom_split(area: Rect) -> (Rect, Rect, Rect) {
 /// `(rows, cols)` of the active terminal's *inner* screen — the terminal panel
 /// Rect minus its one-cell block border on each side. Derived from the same
 /// layout functions the draw path uses ([`draw`] for the bottom-bar height,
-/// [`content_areas`] for the panel), so step 4 can size the PTY to exactly what
-/// gets rendered. Returns `None` when no terminal panel is laid out.
+/// [`content_areas`] for the panel), so the event loop can size the PTY to
+/// exactly what gets rendered. Returns `None` when no terminal panel is laid out.
 pub fn term_pane_size(frame: Rect, prompt_open: bool) -> Option<(u16, u16)> {
     let panel = terminal_panel_rect(frame, prompt_open);
     // Inner screen = panel minus the block border (1 cell each side).

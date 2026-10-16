@@ -1,15 +1,15 @@
 //! Requests forwarded to a machine (docs/architecture/daemon/machines.md,
 //! *Forwarded requests*).
 //!
-//! - Quick calls with `machine` (F6, [`QUICK`]): the daemon strips it and
+//! - Quick calls with `machine` ([`QUICK`]): the daemon strips it and
 //!   sends the rest over the machine's held link (`service::Handle::forward`);
 //!   the remote's answer is the answer, its error code and data kept.
 //! - Verbs with `machine` ([`verb`]): one fresh connection per request, like
 //!   a local verb's one connection, so a long build never holds up the link's
 //!   quick calls. The remote's `output`/`progress` are relayed with `request`
 //!   rewritten to the local id, its answer passed through.
-//! - Federated `instances.resolve` and `sandboxes.list` (`machines: true`,
-//!   F11): this host and every machine in parallel, each machine given
+//! - Federated `instances.resolve` and `sandboxes.list` (`machines: true`):
+//!   this host and every machine in parallel, each machine given
 //!   [`FANOUT_WAIT`] to answer; the joins are pure fns over the answers.
 
 use std::net::Shutdown;
@@ -29,7 +29,7 @@ use crate::serve::client::Streamed;
 use crate::serve::proto::{Notification, Response};
 use crate::serve::verbs;
 
-/// The non-verb methods that take a `machine` (F6): the ones naming an
+/// The non-verb methods that take a `machine`: the ones naming an
 /// instance, a container or a config root. Any other with `machine` is
 /// refused, so a client never gets a local answer it took for a remote one.
 pub const QUICK: &[&str] = &[
@@ -52,7 +52,7 @@ pub fn is_quick(method: &str) -> bool {
     QUICK.contains(&method)
 }
 
-/// How long a federated call waits for each machine (F11): a link already
+/// How long a federated call waits for each machine: a link already
 /// up answers well within it; one that isn't connecting costs the caller
 /// this much at most, not `service`'s longer bound.
 pub const FANOUT_WAIT: Duration = Duration::from_secs(5);
@@ -277,7 +277,7 @@ impl Drop for Holding<'_> {
 /// Verb `method` on machine `machine` (its `params` still carrying
 /// `machine`): a fresh dial and hello, then the request minus `machine`,
 /// its notifications relayed to `peer` under local request id `id`. The
-/// remote relay swaps `env` for its login env (F4), so only the agent is
+/// remote relay swaps `env` for its login env, so only the agent is
 /// taken from it here, for `ssh -A`.
 ///
 /// `None`: the local client hung up, or this daemon drains. Either way the
@@ -342,7 +342,7 @@ pub fn verb(id: Option<u64>, method: &str, params: Value, machine: &str, ctx: &V
 /// What a forwarded verb checks itself: `env` an object, `root` an absolute
 /// path (a path on the machine: whether it exists only the machine can
 /// tell, so `verbs::parse` isn't run here). The env's `SSH_AUTH_SOCK`, when
-/// it's an absolute path, is the agent for `-A` (F3).
+/// it's an absolute path, is the agent for `-A`.
 fn check_verb_params(params: &Value) -> Result<Option<PathBuf>, ApiError> {
     let Some(env) = params.get("env").and_then(Value::as_object) else {
         return Err(ApiError::invalid("bad params: `env` must be an object"));

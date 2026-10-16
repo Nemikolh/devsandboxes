@@ -181,8 +181,8 @@ impl App {
                     };
                     let line = prompt.input().to_string();
                     crate::tui::prompt::append_history(&line);
-                    // `port` is not a suspending action: it goes to the forwarder
-                    // worker (step 10) via `pending_port`, and the TUI stays up on
+                    // `port` is not a suspending action: it goes to the daemon
+                    // worker via `pending_port`, and the TUI stays up on
                     // the Ports tab. Handled before the generic `pending_action`
                     // path so the loop never suspends the screen for it.
                     if let PromptAction::Port { instance, service, address, spec } = action {
@@ -885,6 +885,4 @@ mod tests {
                 .is_empty()
         );
     }
-
-    // --- integrated-terminal state (step 2) -----------------------------------
 }

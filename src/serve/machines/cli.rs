@@ -27,7 +27,7 @@ use crate::serve::client::{self, Conn};
 use crate::serve::endpoint;
 use crate::{Command, ServiceCommand};
 
-/// What `--machine` does with a command (F16).
+/// What `--machine` does with a command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum MachineUse {
     /// Over ssh once, with these args (`ps`, `stats`).
@@ -142,12 +142,12 @@ pub(crate) enum Plan {
     HereAs(String),
     /// `--machine m` with an ssh use ([`MachineUse::Once`] / `PerRoot`).
     Machine(String, MachineUse),
-    /// Look the name up through the daemon (F11), then run it where it is.
+    /// Look the name up through the daemon, then run it where it is.
     Resolve(Where, String),
 }
 
 /// The routing decision, pure. `machines`: the registered machine names
-/// (from the file, F15). Without any, and always under `--in-process` (the
+/// (from the file). Without any, and always under `--in-process` (the
 /// daemon's verb subprocesses and the dispatcher, whose names are resolved
 /// already, on a host that may have machines of its own), nothing fans out.
 pub(crate) fn plan(command: &Command, machine: Option<&str>, in_process: bool, machines: &[String]) -> Result<Plan> {
@@ -204,7 +204,7 @@ pub(crate) fn plan(command: &Command, machine: Option<&str>, in_process: bool, m
     if is_verb(command) {
         return Ok(Plan::Here);
     }
-    // A container name stays local unless qualified (F17).
+    // A container name stays local unless qualified.
     if matches!(command, Command::Logs { .. } | Command::Inspect { .. })
         && wherever == Where::Any
         && name.starts_with(crate::runtime::NAME_PREFIX)
@@ -223,7 +223,7 @@ pub(crate) fn renamed(mut command: Command, name: String) -> Command {
 }
 
 /// For the in-process fallback of a verb: `@/x` is `x`; anything naming a
-/// machine needs the daemon (F13).
+/// machine needs the daemon.
 pub(crate) fn localize(command: Command) -> Result<Command> {
     let Some(arg) = name_of(&command) else { return Ok(command) };
     match parse_name(arg)? {
@@ -235,7 +235,7 @@ pub(crate) fn localize(command: Command) -> Result<Command> {
 
 // ---- resolving a name --------------------------------------------------------
 
-/// `instances.resolve`'s params for a name (F11): a bare name everywhere,
+/// `instances.resolve`'s params for a name: a bare name everywhere,
 /// a qualified one on its machine, `@/` this host only.
 pub(crate) fn resolve_params(wherever: &Where, name: &str) -> Value {
     match wherever {
@@ -353,7 +353,7 @@ pub(crate) fn remote_args(command: &Command, name: &str, root: Option<&Path>) ->
     Some(out)
 }
 
-/// `--machine m` on a root-bound command (F16): one run per registered root,
+/// `--machine m` on a root-bound command: one run per registered root,
 /// `-C <root>` first, each with its `==> m:<root>` banner. `--json` with
 /// several roots is an error: concatenated documents don't parse.
 pub(crate) fn per_root(m: &str, roots: &[PathBuf], args: &[String], json: bool) -> Result<Vec<(String, Vec<String>)>> {
@@ -429,7 +429,7 @@ pub(crate) fn route(machine: Option<&str>, in_process: bool, machines: &[String]
 
 /// [`Plan::Resolve`]: the daemon says where `name` is. A bare name it can't
 /// look up (no daemon, too old, nothing anywhere for a container name) runs
-/// here as today, so the local error or container lookup applies (F13).
+/// here, so the local error or container lookup applies.
 fn resolve_and_route(command: Command, wherever: Where, name: String) -> Result<Routed> {
     let qualified = matches!(wherever, Where::Machine(_));
     let containers = matches!(command, Command::Logs { .. } | Command::Inspect { .. });
@@ -461,7 +461,7 @@ fn resolve_and_route(command: Command, wherever: Where, name: String) -> Result<
         crate::commands::pick(prompt, &refs)
     })? {
         Some(found) => found,
-        // A machine's container (F17): as typed, at its first root.
+        // A machine's container: as typed, at its first root.
         None if qualified && containers => Found { name: name.clone(), machine: None, root: None },
         None if !qualified => return Ok(Routed::Here(command)),
         None => bail!("{}", crate::commands::no_instance_matches(name_of(&command).unwrap_or_default())),
@@ -519,7 +519,7 @@ mod tests {
         plan(&command(args), machine, false, &ms(machines))
     }
 
-    /// F15: without machines nothing resolves through the daemon; a bare
+    /// Without machines nothing resolves through the daemon; a bare
     /// name runs as typed, `@/` drops, a qualified one or `--machine` fails.
     #[test]
     fn without_machines_everything_stays_here() {
@@ -558,7 +558,7 @@ mod tests {
         assert_eq!(plan_of(&["run", "@/web"], None, m).unwrap(), Plan::Here);
         assert_eq!(plan_of(&["rm", "@/web"], None, m).unwrap(), Plan::Here);
         assert!(plan_of(&["rm", "nope/web"], None, m).is_err());
-        // F17: a container name stays local unless qualified.
+        // A container name stays local unless qualified.
         assert_eq!(plan_of(&["logs", "devsandbox-web"], None, m).unwrap(), Plan::Here);
         assert_eq!(
             plan_of(&["inspect", "box/devsandbox-web"], None, m).unwrap(),

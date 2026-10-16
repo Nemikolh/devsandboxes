@@ -161,7 +161,7 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
         Ok(inbox) => app.set_inbox(inbox),
         Err(e) => app.status = Some(format!("inbox not loaded: {e:#}")),
     }
-    // The store is shared with every other dashboard and the bridge worker:
+    // The store is shared with every other dashboard and the daemon's sink:
     // reload whenever its mtime/size moved (a cheap stat each tick), or at
     // once when something here poked it.
     let mut inbox_stamp = inbox::store::path().ok().and_then(|p| inbox::ops::stamp(&p));
@@ -1051,7 +1051,7 @@ mod tests {
         // Other errors ran nothing: no build log to point at.
         assert_eq!(status(&rebuild, err("not-found", "no instance `web-2`", None)), "rebuild web-2 failed: no instance `web-2`");
 
-        // No daemon (F8, no fallback), or one that went away.
+        // No daemon (no fallback), or one that went away.
         assert_eq!(
             verb_status(&run_action(None, None, None), Err(anyhow::anyhow!("cannot start devsandbox serve"))),
             ("run web: needs devsandbox serve (cannot start devsandbox serve)".into(), true)

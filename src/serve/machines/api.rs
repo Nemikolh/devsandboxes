@@ -236,7 +236,7 @@ fn taken(name: &str) -> ApiError {
 }
 
 /// Dial `entry` and say hello: `failed` with ssh's or the hello's reason.
-/// The daemon's preferred host agent for `-A`, as the held links use (F3).
+/// The daemon's preferred host agent for `-A`, as the held links use.
 fn connect(entry: &Entry, ctx: &Ctx) -> Result<Link, ApiError> {
     let agent = crate::devsbd::bridge::host_agent();
     let duplex = (ctx.dial)(entry, agent.as_deref()).map_err(|e| ApiError::failed(format!("{}: {e:#}", entry.name)))?;
@@ -300,7 +300,7 @@ mod tests {
     }
 
     /// This host's test daemon on `base/local`, its registry in `base`,
-    /// dialing the machine's socket in `remote` (F14).
+    /// dialing the machine's socket in `remote`.
     fn local_opts(base: &Path, remote: Option<PathBuf>) -> Options {
         let mut o = opts(1, 1500);
         o.machines = Some(base.join("machines.toml"));
@@ -423,7 +423,7 @@ mod tests {
         let r = ok(&mut pair.local, "machines.add", json!({"target": "ssh://box:2200", "name": "box2", "roots": ["~/.devsandboxes"]}));
         assert_eq!(r["name"], "box2");
 
-        // Listed sorted by name, idle until step 3's links; then removed.
+        // Listed sorted by name, idle (no link wanted); then removed.
         let rows = ok(&mut pair.local, "machines.list", Value::Null);
         assert_eq!(
             rows,

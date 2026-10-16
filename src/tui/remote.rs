@@ -71,7 +71,7 @@ pub struct Route {
 }
 
 /// The first root `machine` showed rows from: what an instance without a
-/// recorded root is taken under (F8).
+/// recorded root is taken under.
 pub fn machine_root(s: &Snapshot, machine: &str) -> Option<String> {
     let on = |m: &Option<String>| m.as_deref() == Some(machine);
     let sandboxes = s.sandboxes.iter().filter(|r| on(&r.machine)).map(|r| &r.root);

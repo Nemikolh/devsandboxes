@@ -8,8 +8,8 @@
 //! Everything but the initial bind runs on background threads (a supervisor
 //! that keeps the bridge alive, an accept loop, and a per-connection relay via
 //! the mux): `start` never blocks the caller on docker. Nothing is written to
-//! stderr — the TUI owns the screen — so errors surface through `status` and
-//! `drain_notes`.
+//! stderr — the owner (the daemon, `devsandbox port`) reports — so errors
+//! surface through `status` and `drain_notes`.
 
 use std::io;
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
@@ -102,13 +102,13 @@ pub enum ForwardState {
     Error(String),
 }
 
-/// A snapshot of a forward, cheap to poll from the CLI loop or the TUI worker.
+/// A snapshot of a forward, cheap to poll from the CLI loop or the daemon's registry.
 #[derive(Debug, Clone)]
 pub struct ForwardStatus {
     pub local_addr: SocketAddr,
     pub route_label: String,
     pub state: ForwardState,
-    // Read by the TUI Ports tab worker (docs/architecture/daemon/forwards.md); the
+    // Read by the daemon's registry for the Ports tab (docs/architecture/daemon/forwards.md); the
     // CLI doesn't surface it.
     pub open_conns: usize,
     /// The process listening on the forwarded port, e.g. `node (pid 412)`, or
@@ -692,8 +692,8 @@ mod tests {
         matches!(cmd.output(), Ok(o) if o.status.success())
     }
 
-    /// A `Route` closure targeting `container`'s loopback `port` (step 6 does
-    /// the real resolution; here a fixed route is enough).
+    /// A `Route` closure targeting `container`'s loopback `port` (`port.rs`
+    /// does the real resolution; here a fixed route is enough).
     fn loopback_route(container: String, arch: Arch, port: u16) -> Box<dyn Fn() -> Result<Route, String> + Send + Sync> {
         Box::new(move || {
             Ok(Route {

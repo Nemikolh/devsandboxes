@@ -25,8 +25,9 @@ mod escape;
 // (`bridge`'s notify handler). Partly helper-only (`OUTBOX`, `encode`).
 #[allow(dead_code)]
 pub mod notify;
-// The forwarder engine (step 5); the CLI (`devsandbox port`) drives its full
-// public surface, the TUI Ports tab reuses it (docs/architecture/daemon/forwards.md).
+// The forwarder engine; the CLI (`devsandbox port`) drives its full public
+// surface, the daemon's forwards registry (`serve::forwards`, behind the
+// Ports tab) reuses it (docs/architecture/daemon/forwards.md).
 #[cfg(unix)]
 pub mod forward;
 #[cfg(unix)]
@@ -286,8 +287,8 @@ pub fn ensure_or_reason(container: &str, recorded: Option<Arch>) -> Result<Arch,
     Ok(arch)
 }
 
-/// `ensure_or_reason`, printing the plain note on failure unless `quiet` (the
-/// TUI owns the screen). The common path; relay-first `run` calls
+/// `ensure_or_reason`, printing the plain note on failure unless `quiet` (a
+/// forward's resolver, which may run in the daemon). The common path; relay-first `run` calls
 /// `ensure_or_reason` directly to reword the note.
 pub fn ensure(container: &str, recorded: Option<Arch>, quiet: bool) -> Option<Arch> {
     match ensure_or_reason(container, recorded) {

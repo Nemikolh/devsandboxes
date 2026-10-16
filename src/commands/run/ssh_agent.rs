@@ -128,9 +128,7 @@ pub(super) fn ssh_agent_forward(instance_id: &str) -> Result<Option<(String, Str
 /// is set, and its socket exists. A no-op on macOS + docker, whose
 /// magic-socket mount has no link.
 /// Fully silent — every gate miss and error is a no-op (the link stays as-is
-/// and forwarding is degraded for this run only): callers include the TUI
-/// background thread that owns the alternate screen, where a stray warning
-/// would corrupt the display, so screen safety wins over a lost warning.
+/// and forwarding is degraded for this run only).
 pub(crate) fn ssh_agent_refresh(info: &Instance) {
     if !cfg!(unix) || info.ssh_auth_sock.is_none() || host_magic_socket() {
         return;

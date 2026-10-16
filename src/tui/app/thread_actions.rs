@@ -123,8 +123,9 @@ impl App {
 
     /// Run the action waiting on a start once the snapshot shows its target
     /// running with no phase (a live build or a failure would still own
-    /// it). A start that fails after its answer never gets here (F14): the
-    /// next action replaces the waiting one.
+    /// it). A start that fails after its answer never gets here (a known
+    /// limitation, docs/status.md "dashboard"): the next action replaces the
+    /// waiting one.
     pub(super) fn run_after_start(&mut self) {
         let Some((name, _)) = &self.after_start else {
             return;
@@ -576,7 +577,7 @@ mod tests {
         assert_eq!(app.pending_action, None);
 
         // The detached start's answer clears the guard, but says nothing
-        // about the container (F14): the verb keeps waiting.
+        // about the container: the verb keeps waiting.
         answer_start(&mut app, "inst1", false);
         assert!(!app.starting.contains("inst1"));
         assert_eq!(app.pending_action, None);

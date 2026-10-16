@@ -207,7 +207,7 @@ pub fn parse_args(spec: &CommandSpec, tokens: &[&str]) -> Result<ParsedArgs, Str
 mod tests {
     use super::*;
 
-    /// Parse `line` through the spec table, like `parse_line` will in step 2.
+    /// Parse `line` through the spec table, like `parse_line` does.
     fn parse(line: &str) -> Result<ParsedArgs, String> {
         let tokens: Vec<&str> = line.split_whitespace().collect();
         let (cmd, rest) = tokens.split_first().expect("test lines have a command");

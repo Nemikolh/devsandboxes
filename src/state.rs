@@ -103,7 +103,7 @@ pub struct Instance {
     /// values ([`Instance::exec_env`]), so they take effect before a rebuild.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra_env: BTreeMap<String, String>,
-    /// Host ports the TUI picked for this instance's `forwardPorts`, keyed by
+    /// Host ports the daemon picked for this instance's `forwardPorts`, keyed by
     /// `ForwardPort::key` (`"8080:3000"` = 8081), so the instance gets the same
     /// ports every time and no other instance takes them while it's stopped.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -331,8 +331,9 @@ impl Instance {
     }
 }
 
-/// Host-side runtime state, stored in the user data dir. No daemon: docker is
-/// the source of truth for liveness, this only maps names to containers.
+/// Host-side runtime state, stored in the user data dir. This file, not the
+/// daemon, is the truth (docs/decisions/0001-*): docker is the source of
+/// truth for liveness, this only maps names to containers.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct State {
     #[serde(default, rename = "instance")]

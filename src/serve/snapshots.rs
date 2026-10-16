@@ -183,7 +183,7 @@ pub struct Machine {
     /// The registry's `command` (the remote devsandbox), for an ssh argv.
     pub command: Option<String>,
     /// The registered roots, in order: the first one shows the instances
-    /// whose root isn't registered (F8).
+    /// whose root isn't registered.
     pub roots: Vec<PathBuf>,
     pub state: LinkState,
     pub error: Option<String>,
@@ -258,7 +258,7 @@ pub struct SnapshotMachine {
 /// root they were read from), plus a top-level `machines` with every
 /// machine's link state.
 ///
-/// Each remote instance appears once per machine (F8): every remote root's
+/// Each remote instance appears once per machine: every remote root's
 /// snapshot lists all of that host's instances, so an instance is taken
 /// from the snapshot of its own `root` when that root is registered, else
 /// from the machine's first root's. Remote `thread_children` aren't merged:

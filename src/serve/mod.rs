@@ -3,9 +3,9 @@
 //! whole module.
 //!
 //! The socket and its permissions, the start lock, lazy start from clients,
-//! version handoff and the idle exit (step 4); the bridges, with the outbox
-//! drain, popups and control ops, and the startup autostart pass (step 5).
-//! The API (step 6, docs/reference/api.md): `api` methods over the same wire,
+//! version handoff and the idle exit; the bridges, with the outbox drain,
+//! popups and control ops, and the startup autostart pass. The API
+//! (docs/reference/api.md): `api` methods over the same wire,
 //! `subscribe` notifications.
 //!
 //! - `api`: the method table and handlers (thin calls into `inbox::ops`,
@@ -23,12 +23,12 @@
 //! - `machines`: remote hosts over ssh (docs/architecture/daemon/machines.md):
 //!   the registry (`machines.toml`), the ssh argv and dial, the link
 //!   handshake, the `machines.*` methods
-//! - `relay`: `devsandbox api --stdio`, stdin/stdout ↔ the socket (step 9)
+//! - `relay`: `devsandbox api --stdio`, stdin/stdout ↔ the socket
 //! - `install`: `serve install|uninstall`, the systemd user unit / LaunchAgent
-//!   (step 10)
-//! - `verbs`: `run`/`rebuild`/`start`/`stop`/`rm` as requests, each a
-//!   `devsandbox --in-process` subprocess streamed back to its client
-//! - `verbs_client`: the CLI's side of those five: prompts, streaming,
+//! - `verbs`: `run`/`rebuild`/`start`/`stop`/`rm`/`services.rebuild` as
+//!   requests, each a `devsandbox --in-process` subprocess streamed back to
+//!   its client
+//! - `verbs_client`: the CLI's side of those six: prompts, streaming,
 //!   Ctrl-C, exit codes, the in-process fallback
 
 pub mod api;

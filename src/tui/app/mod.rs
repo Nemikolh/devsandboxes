@@ -87,9 +87,9 @@ pub enum Focus {
     Terminal,
 }
 
-/// One row of the Ports tab: a live forward, projected from the forwarder's
-/// `ForwardStatus` by the event loop (step 10). Plain data, so [`App`] stays
-/// free of the forward module.
+/// One row of the Ports tab: a live forward, projected from the daemon's
+/// `forwards.list` rows by the daemon worker (`tui/daemon.rs`). Plain data,
+/// so [`App`] stays free of the forward module.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PortRow {
     /// Stable forward id, used to target a `d` (stop) at the right forward.
@@ -109,8 +109,8 @@ pub struct PortRow {
     pub configured: bool,
 }
 
-/// A forward the user asked for, for the event loop (step 10) to start on its
-/// worker thread. Mirrors the CLI's `(instance, service, address, spec)` inputs;
+/// A forward the user asked for, for the event loop to send as `forwards.add`
+/// through the daemon worker. Mirrors the CLI's `(instance, service, address, spec)` inputs;
 /// `spec` is a validated `[host:]port` string.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PortRequest {
@@ -166,11 +166,10 @@ pub struct App {
     /// ([`App::set_snapshot`]), dropped if the start request fails. A newer
     /// such action replaces it.
     after_start: Option<(String, thread_actions::Deferred)>,
-    /// Done-flag changes the event loop should write to state on a
-    /// background thread (`d`/`u` on an instance row, and a thread's child
-    /// on the Inbox thread `done`/reopen).
+    /// Done-flag changes the event loop should send as `instances.done`
+    /// requests (a thread's child on the Inbox thread `done`/reopen).
     pub pending_done: Vec<PendingDone>,
-    /// A `kill` the event loop should spawn on a background thread (the
+    /// An `instances.signal` request the event loop should send (the
     /// SIGTERM/SIGKILL shortcuts on a process row). Runs without suspending.
     pub pending_signal: Option<PendingSignal>,
     /// Instance whose `run`/`rebuild`/`start` the event loop should cancel
@@ -188,14 +187,15 @@ pub struct App {
     /// The container the logs modal shows, so a late answer for another
     /// one is dropped ([`App::set_logs`]).
     logs_container: Option<String>,
-    /// Live forwards shown on the Ports tab, fed by the forwarder worker (step
-    /// 10). Empty until the worker reports; set via [`Self::set_ports`].
+    /// Live forwards shown on the Ports tab, fed by the daemon worker
+    /// (`forwards.list`). Empty until the worker reports; set via
+    /// [`Self::set_ports`].
     pub ports: Vec<PortRow>,
-    /// A forward the event loop should start on its worker thread (the `p`
-    /// shortcut / `port` prompt). Consumed by step 10; sits here until then.
+    /// A forward the event loop should start through the daemon worker (the
+    /// `p` shortcut / `port` prompt).
     pub pending_port: Option<PortRequest>,
     /// Id of a forward the event loop should stop (the `d` shortcut on the Ports
-    /// tab). Consumed by step 10.
+    /// tab), through the daemon worker.
     pub pending_unport: Option<u64>,
     /// Container notifications shown on the Inbox tab (docs/architecture/dashboard/inbox-tab.md),
     /// as last loaded from the shared store (`crate::inbox::store`).
@@ -345,8 +345,9 @@ impl App {
         self.run_after_start();
     }
 
-    /// Install the forwarder's latest rows and re-clamp the Ports selection in
-    /// case it shrank. I/O-free: the event loop (step 10) does the collecting.
+    /// Install the daemon's latest forward rows and re-clamp the Ports
+    /// selection in case it shrank. I/O-free: the daemon worker does the
+    /// collecting.
     pub fn set_ports(&mut self, ports: Vec<PortRow>) {
         self.ports = ports;
         self.clamp_selection();
@@ -423,8 +424,8 @@ impl App {
         self.set_tab(Tab::ALL[(i + Tab::ALL.len() - 1) % Tab::ALL.len()]);
     }
 
-    /// Apply a key event to the state. No terminal I/O here (the modal open path
-    /// reads config/fs, which is local and user-triggered — see [`Self::open_config`]).
+    /// Apply a key event to the state. No terminal I/O here (the modal open path queues
+    /// daemon `Fetch`es for the event loop — see [`Self::open_config`]).
     pub fn on_key(&mut self, key: KeyEvent) {
         let modal = std::mem::discriminant(&self.modal);
         let term = (self.terms.active(), self.terms.sessions().len());

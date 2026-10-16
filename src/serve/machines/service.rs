@@ -3,7 +3,7 @@
 //! machine, owned by the [`Machines`] service the daemon runs for its whole
 //! life.
 //!
-//! A link connects only while wanted (F9): while some local connection
+//! A link connects only while wanted: while some local connection
 //! watches with `machines: true` ([`Hooks::watching`]), or a forwarded call
 //! is queued, and for [`Timing::linger`] after. Connected, it subscribes to
 //! `instances`, watches each of the machine's roots while a local watcher
@@ -12,7 +12,7 @@
 //! connect or a lost link is `unreachable` with the reason, rows kept, and
 //! retried with a doubling backoff while wanted.
 //!
-//! Forwarded calls (F10) reach the thread over its channel, one in flight
+//! Forwarded calls reach the thread over its channel, one in flight
 //! per machine, each with [`Timing::call`] to answer. A timed-out call drops
 //! the link: its answer would come out of turn for the next call.
 //!
@@ -43,12 +43,12 @@ use crate::serve::snapshots::{self, LinkState, Remotes};
 /// The link's clocks; [`Timing::default`] in production, short in tests.
 #[derive(Debug, Clone, Copy)]
 pub struct Timing {
-    /// How long a link stays up after the last want (F9).
+    /// How long a link stays up after the last want.
     pub linger: Duration,
     /// The first retry's delay; each failure doubles it, up to `backoff_cap`.
     pub backoff: Duration,
     pub backoff_cap: Duration,
-    /// A forwarded call's wait for its answer (F10).
+    /// A forwarded call's wait for its answer.
     pub call: Duration,
     /// The hello's wait: ssh's connect and auth, the remote login shell and a
     /// lazy start of the remote daemon.
@@ -421,7 +421,7 @@ impl<'a> LinkLoop<'a> {
     }
 
     /// Dial and say hello. The daemon's preferred host agent goes along for
-    /// `ssh -A` (F3). The socket is held for [`Ctl::cut`] before the hello.
+    /// `ssh -A`. The socket is held for [`Ctl::cut`] before the hello.
     fn connect(&self) -> Result<Link, String> {
         let agent = crate::devsbd::bridge::host_agent();
         let duplex = (self.inner.dial)(&self.entry, agent.as_deref()).map_err(|e| format!("{}: {e:#}", self.entry.name))?;
@@ -733,7 +733,7 @@ mod tests {
         Duplex::socket(ours)
     }
 
-    /// F10: a call the machine doesn't answer in time answers `internal`
+    /// A call the machine doesn't answer in time answers `internal`
     /// and drops the link (a late answer would desync the ids); the next
     /// call dials again. An unregistered machine is `not-found`.
     #[test]

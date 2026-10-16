@@ -125,7 +125,7 @@ pub fn remote_command(command: &str, args: &[impl AsRef<str>]) -> String {
 /// -- <host> <devsandbox api --stdio --client <client> --session-env>`.
 /// `BatchMode`: whoever runs it (the daemon) has no TTY, so ssh fails rather
 /// than prompting. `--session-env`: the remote relay swaps each verb's
-/// `env` for its own login env (F4).
+/// `env` for its own login env.
 pub fn api_argv(entry: &Entry, client: &str) -> Result<Vec<OsString>> {
     let args = ["api", "--stdio", "--client", client, "--session-env"];
     argv(entry, &["-T", "-A", "-o", "BatchMode=yes"], &args)
@@ -171,7 +171,7 @@ fn argv_with(entry: &Entry, opts: &[&str], program: &str, remote_args: &[impl As
     Ok(argv)
 }
 
-/// Opens a connection to a machine's daemon (F14): production spawns ssh
+/// Opens a connection to a machine's daemon: production spawns ssh
 /// ([`ssh_dial`]), tests connect to a test daemon's socket. `agent` is the
 /// `SSH_AUTH_SOCK` for `-A`: a verb's requester's, or the daemon's
 /// preferred one for its held link; `None` leaves ssh this process's.
@@ -191,7 +191,7 @@ pub struct Duplex {
 }
 
 impl Duplex {
-    /// A plain socket to a daemon (tests, F14).
+    /// A plain socket to a daemon (tests).
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn socket(stream: Stream) -> Self {
         Self { stream, peer: Peer::default() }

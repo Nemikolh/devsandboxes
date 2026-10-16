@@ -171,7 +171,7 @@ fn format_procs(procs: &[(u32, String)]) -> Option<String> {
 }
 
 /// Look up the process listening on `port` inside `container`, quietly (never
-/// stderr — the TUI owns the screen), via a plain root `exec` (no devsbd
+/// stderr — the daemon's forwards call it), via a plain root `exec` (no devsbd
 /// needed). `-F` output is machine-parseable; any failure at all — `lsof`
 /// missing (exit 127), no match (exit 1), or the container gone — yields
 /// `None`, never an error (docs/architecture/daemon/forwards.md, _Routes_).
@@ -289,8 +289,8 @@ fn references(config: &Config, sandbox: &str, service: &str) -> bool {
 /// plans the candidates and tries them in order: instance / via-instance
 /// candidates run `devsbd::ensure_recorded` (persisting the arch); the injection
 /// fallback runs `devsbd::ensure` with the arch cached in memory for the
-/// forward's lifetime. Always quiet — nothing is written to stderr (the TUI owns
-/// the screen); failures surface as the returned `Err` string.
+/// forward's lifetime. Always quiet — nothing is written to stderr (it runs on
+/// a forwarder's worker); failures surface as the returned `Err` string.
 #[cfg(unix)]
 pub fn resolver(
     dir: std::path::PathBuf,

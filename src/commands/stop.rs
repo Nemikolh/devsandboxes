@@ -54,7 +54,7 @@ pub fn stop(name: Option<String>, all: bool) -> Result<()> {
 /// project+instance labels (same rule as `rm`); `instance_id` is the persistent
 /// id the labels carry, not the display name. Empty when `project` is empty
 /// (pre-upgrade state) or on any runtime error. Listing always captures
-/// stderr, so this is safe from callers that own the screen (the TUI).
+/// stderr.
 pub(crate) fn service_containers(project: &str, instance_id: &str) -> Vec<String> {
     if project.is_empty() {
         return Vec::new();
@@ -75,7 +75,8 @@ pub(crate) fn service_containers(project: &str, instance_id: &str) -> Vec<String
 /// Stop the main `container` then each service container. Exit codes are
 /// ignored throughout (already-stopped / missing containers must not fail the
 /// stop). `quiet` routes through the screen-safe `output_quiet` so stderr
-/// can't corrupt the TUI's alternate screen; otherwise stdio is inherited.
+/// stays off the terminal (every caller passes `false`); otherwise stdio is
+/// inherited.
 pub(crate) fn stop_containers(container: &str, services: &[String], quiet: bool) {
     let mut targets: Vec<&str> = Vec::with_capacity(services.len() + 1);
     targets.push(container);

@@ -23,7 +23,7 @@ pub const PROTOCOL: u32 = 1;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Request {
-    /// Echoed back on the response. Absent on notifications (step 6).
+    /// Echoed back on the response. Absent on notifications.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<u64>,
     pub method: String,

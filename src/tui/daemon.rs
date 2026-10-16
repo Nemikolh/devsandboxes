@@ -805,7 +805,7 @@ impl Worker<'_> {
     }
 
     /// `instances.cancel`; the answer (or why there's none) is a status
-    /// line. No local fallback (F8): the daemon runs the dashboard's builds.
+    /// line. No local fallback: the daemon runs the dashboard's builds.
     fn cancel(&mut self, instance: &str) {
         let Some(conn) = self.conn.as_mut() else {
             let line = match &self.down {

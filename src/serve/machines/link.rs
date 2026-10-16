@@ -151,7 +151,7 @@ mod tests {
                 Err(_) => std::thread::sleep(Duration::from_millis(20)),
             }
         };
-        // The dial as tests inject it (F14).
+        // The dial as tests inject it.
         let dial: ssh::Dial = Arc::new(move |_, _| Ok(Duplex::socket(stream.try_clone()?)));
         let entry = super::super::Entry { name: "m".into(), target: "m".into(), roots: vec![], command: None };
         let mut link = handshake("m", dial(&entry, None).unwrap(), Duration::from_secs(5)).unwrap();

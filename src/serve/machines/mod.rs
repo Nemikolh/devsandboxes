@@ -14,7 +14,7 @@
 //!   ssh re-run of commands that don't go through the daemon
 //!
 //! Only the daemon writes the registry (`machines.add` / `machines.rm`);
-//! the CLI reads it later to know whether any machine exists (F15). Two
+//! the CLI reads it later to know whether any machine exists. Two
 //! daemons can briefly overlap during a handoff, so every write is a
 //! read-modify-write under an exclusive lock on the sibling `machines.lock`,
 //! written to a temp file and renamed, as `forward_store` does.
@@ -143,7 +143,7 @@ fn write_atomic(path: &Path, text: &str) -> Result<()> {
 
 /// A machine name is `[A-Za-z0-9._-]+`, not starting with `.` or `-`. Never
 /// `/` or `@`: `my-server/web-2` splits at the first `/`, and `@/web-2` is
-/// this host (F2). No leading `-`, so it can't read as a flag either.
+/// this host. No leading `-`, so it can't read as a flag either.
 pub fn check_name(name: &str) -> Result<()> {
     if name.is_empty() {
         bail!("empty machine name");
@@ -171,7 +171,7 @@ pub enum Where {
 
 /// Split a CLI `<name>` into where it points and the name there. Docker
 /// container names can't hold `/` or `@`, so neither can a working instance
-/// or sandbox name: any `/` qualifies, at the first one (F2), and a machine
+/// or sandbox name: any `/` qualifies, at the first one, and a machine
 /// part that isn't a valid machine name is an error rather than a bare name
 /// that could never match.
 pub fn parse_name(arg: &str) -> Result<(Where, String)> {
@@ -186,7 +186,7 @@ pub fn parse_name(arg: &str) -> Result<(Where, String)> {
     Ok((Where::Machine(machine.to_string()), name.to_string()))
 }
 
-/// The registered machines' names, from the file (F15): the one place the
+/// The registered machines' names, from the file: the one place the
 /// CLI reads the daemon's registry itself, so that without machines no
 /// command contacts a daemon it didn't before. Missing, empty or unreadable
 /// is none.

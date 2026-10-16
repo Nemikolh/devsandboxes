@@ -17,19 +17,17 @@
 //! `dir`); ids are unique daemon-wide. Configured forwards are reconciled for
 //! every config root recorded in `state.toml` against the host's poll of the
 //! running containers (`docs/architecture/daemon/forwards.md`, _Configured
-//! forwards (`forwardPorts`)_), reusing the host port saved in state. What a
-//! dashboard used to see as status lines goes out through [`Event`]s (the
-//! API's `forwards.changed` / `forwards.status`) and `serve.log`; nothing
-//! else is printed.
+//! forwards (`forwardPorts`)_), reusing the host port saved in state. Status
+//! goes out through [`Event`]s (the API's `forwards.changed` /
+//! `forwards.status`) and `serve.log`; nothing else is printed.
 //!
 //! Ad-hoc forwards persist in `forwards.toml` ([`forward_store`]): an add
 //! appends, an rm removes, and the thread restores them first thing, on
 //! their saved host ports, so they survive a handoff or restart. Stopping
 //! the thread leaves the file alone: dropping forwards on exit isn't removal.
 //!
-//! Each forward keeps its own self-healing bridge (`Forward::start`), as in
-//! the dashboard; riding the instance's daemon bridge mux instead is a later
-//! optimization.
+//! Each forward keeps its own self-healing bridge (`Forward::start`); riding
+//! the instance's daemon bridge mux instead is a later optimization.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr};

@@ -185,8 +185,8 @@ fn resolved_sandbox(dir: &Path, info: &Instance) -> Option<(Config, ResolvedSand
 /// Start each service container then the main `container` (services first so
 /// they are reachable when the instance comes up). Exit codes are ignored
 /// throughout (already-running / missing containers must not fail the start).
-/// `quiet` routes through the screen-safe `output_quiet` so stderr can't
-/// corrupt the TUI's alternate screen; otherwise stdio is inherited.
+/// `quiet` routes through the screen-safe `output_quiet` so stderr stays off
+/// the terminal (every caller passes `false`); otherwise stdio is inherited.
 pub(crate) fn start_containers(container: &str, services: &[String], quiet: bool) {
     let mut targets: Vec<&str> = services.iter().map(String::as_str).collect();
     targets.push(container);

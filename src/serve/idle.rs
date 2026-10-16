@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// What keeps the daemon alive, one field per row of the holder table (plus
-/// `autostart`). `followers` stays 0 until step 18 fills it.
+/// `autostart`). `followers` is never set: a follow stream is an in-flight
+/// control request, so it counts under `control`.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Holders {
     /// Connected clients: TUI, `api --stdio`, an `inbox` command, an `exec`
@@ -16,12 +17,12 @@ pub struct Holders {
     pub clients: usize,
     /// Live port forwards, ad-hoc and configured (`forwards::Registry`).
     pub forwards: usize,
-    /// Running instances declaring `dispatcher` (`inbox = true` joins in
-    /// step 11), as of the daemon's last container poll.
+    /// Running instances declaring `dispatcher` or `inbox = true`, as of the
+    /// daemon's last container poll.
     pub live_instances: usize,
     /// In-flight control requests.
     pub control: usize,
-    /// `--follow` subscribers (step 18).
+    /// `--follow` subscribers; unused, they count under `control`.
     pub followers: usize,
     /// 1 while the startup `autostart = true` pass runs (it may be creating
     /// an instance; an idle exit would cut it off).

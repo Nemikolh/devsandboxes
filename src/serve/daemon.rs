@@ -924,7 +924,7 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
         "unsubscribe" => subscribe(req.params, conn, false),
         "instances.watch" => watch_root(req.params, shared, conn),
         "instances.unwatch" => unwatch_root(req.params, conn),
-        // This host and every machine (F11).
+        // This host and every machine.
         "instances.resolve" if fwd::federated(&req.params) => {
             let local = local_call(&req.method, req.params.clone(), shared, conn);
             fwd::resolve_everywhere(&req.params, local, shared.links())

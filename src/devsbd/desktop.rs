@@ -1,7 +1,7 @@
 //! Desktop delivery of a container notification (docs/architecture/helper/bridges.md,
 //! "Notifications (`NOTIFY`)"): `notify-send` on Linux, `osascript` on macOS. Best
 //! effort and fully quiet: a missing notifier (no `notify-send`, headless
-//! host) is skipped silently, and nothing inherits the TUI's terminal.
+//! host) is skipped silently, and nothing inherits the caller's stdio.
 
 use std::collections::HashMap;
 use std::process::{Command, Stdio};

@@ -11,9 +11,9 @@
 //!
 //! The tee is process-wide fd surgery, so it only happens when the CLI asked
 //! for it ([`enable`], from `main` for the `run`/`rebuild`/`start` verbs):
-//! `devsandbox serve` and the dashboard's autostart pass call these commands
-//! in-process, where fds 1/2 belong to `serve.log` or the terminal and other
-//! threads write there too. The dashboard's own `run`/`rebuild`/`start` are
+//! `devsandbox serve`'s autostart pass calls these commands in-process, where
+//! fds 1/2 belong to `serve.log` and other threads write there too. The
+//! dashboard's `run`/`rebuild`/`start` are verb requests the daemon runs as
 //! `devsandbox` subprocesses, so they log.
 //!
 //! On a terminal the tee is a pty (docs/architecture/instances/images-and-features.md, *Drift and logs*):

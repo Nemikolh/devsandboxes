@@ -116,8 +116,8 @@ pub struct Region {
 }
 
 /// A cell in region coordinates. `row` first, so the derived order is
-/// reading order; `usize` because a content row (step 2/3 sources) can lie
-/// far past the visible rows.
+/// reading order; `usize` because a content row ([`Source::Rows`], the
+/// terminal's scrollback) can lie far past the visible rows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Pos {
     pub row: usize,

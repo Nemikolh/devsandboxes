@@ -187,12 +187,13 @@ pub struct SandboxProperties {
     /// `privileged` (as the official CLI does), so `false` cannot veto a
     /// feature that needs it.
     pub privileged: Option<bool>,
-    /// Ports the TUI forwards to the host while it's open
+    /// Ports the daemon forwards to the host while their owner runs
     /// (docs/architecture/daemon/forwards.md, _Configured forwards (`forwardPorts`)_). Host-side only, so
     /// excluded from `config_hash`.
     pub forward_ports: Option<Vec<ForwardPort>>,
 
-    // --- valid devcontainer properties, not implemented yet ---
+    // --- more devcontainer properties; all but `mounts`, `containerUser`,
+    // `remoteUser` and `init` are not implemented yet ([`Self::ignored`]) ---
     pub name: Option<Value>,
     pub app_port: Option<Value>,
     pub ports_attributes: Option<Value>,

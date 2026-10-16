@@ -1,6 +1,6 @@
 //! Every Inbox read and mutation, as a function over a store path: the one
 //! layer the TUI, the bridge's notify sink, `devsandbox rm` and the control
-//! handler go through, and what the daemon's API handlers will be thin calls
+//! handler go through, and what the daemon's API handlers are thin calls
 //! into (docs/architecture/inbox/model.md, *`ops`*). One code
 //! path per verb is what makes every client produce identical events.
 //!

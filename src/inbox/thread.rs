@@ -161,7 +161,7 @@ pub struct Compose {
 /// rejects them anyway, but serde's "unknown field" doesn't say where they
 /// went.
 const REMOVED: &[(&str, &str)] = &[
-    ("message", "`message` was removed: send explanations with `devsbd thread send` (docs/automations-guide.md, Messages)"),
+    ("message", "`message` was removed: send explanations with `devsbd thread send` (docs/automations-guide.md, Messages (`devsbd thread send`))"),
     ("reply", "`reply` was renamed `compose`"),
 ];
 
@@ -452,7 +452,7 @@ mod tests {
         let message = parse(r#"{"key":"k","title":"t","state":"active","message":"hi"}"#).unwrap_err();
         assert_eq!(
             message,
-            "`message` was removed: send explanations with `devsbd thread send` (docs/automations-guide.md, Messages)"
+            "`message` was removed: send explanations with `devsbd thread send` (docs/automations-guide.md, Messages (`devsbd thread send`))"
         );
         let reply = parse(r#"{"key":"k","title":"t","state":"active","reply":{"placeholder":"p"}}"#).unwrap_err();
         assert_eq!(reply, "`reply` was renamed `compose`");

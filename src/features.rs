@@ -6,7 +6,7 @@
 //! `curl` (mirroring the project's shell-out-to-docker/git philosophy; no new
 //! crates), caches the extraction per user, reads the metadata, and computes an
 //! install order from `installsAfter`. Building the derived image lives in the
-//! `run` command (step 3); this module stops at a [`ResolvedFeature`].
+//! `run` command (`commands/run/image.rs`); this module stops at a [`ResolvedFeature`].
 //!
 //! A ref starting with `./`, `../` or `/` is instead a local folder with the
 //! same layout ([`FeatureSource::Local`]), resolved against the config dir and

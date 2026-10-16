@@ -333,7 +333,7 @@ mod tests {
         );
     }
 
-    /// `goto_in` against step 8's fake window (`devsbd::fake_vscode_window`):
+    /// `goto_in` against the fake window (`devsbd::fake_vscode_window`):
     /// the helper ends up running the window's CLI with the joined path.
     #[test_utils::docker_test(helper)]
     fn goto_in_opens_the_joined_path_in_the_window_with_docker() -> Result<(), &'static str> {

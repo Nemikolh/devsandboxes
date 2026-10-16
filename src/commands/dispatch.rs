@@ -41,9 +41,10 @@
 //!
 //! Children are ordinary instances named `<sandbox>-<key>`. Operations run as
 //! `devsandbox -C <config root> run|start|rebuild|stop|rm …` subprocesses, not
-//! in-process: the handler runs on the TUI's bridge worker and those commands
-//! print (and stream docker/git output) to inherited stdio, which would land
-//! on the alternate screen. Their output goes to
+//! in-process: the handler runs on the host daemon's bridges
+//! (`devsbd::bridge::dispatch_control`, from `serve/host.rs`) and those
+//! commands print (and stream docker/git output) to inherited stdio, which
+//! would land in the daemon's own log. Their output goes to
 //! `<data>/devsandbox/logs/dispatch-<unix>-<op>.log`.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -841,9 +842,9 @@ fn children<'a>(
 }
 
 /// `owner_id`'s children by the key they were ensured with, for callers that
-/// need to name a child without being a control op. Pure over state: the
-/// dashboard refreshes this when its snapshot moves, so the Inbox thread pane
-/// can resolve a thread's `child` without reading `state.toml` every frame.
+/// need to name a child without being a control op. Pure over state: feeds
+/// [`thread_children`], so the Inbox thread pane can resolve a thread's
+/// `child` without reading `state.toml` every frame.
 /// A child renamed away from `<sandbox>-<key>` has no key left and is skipped.
 pub fn child_names(state: &State, owner_id: &str) -> BTreeMap<String, String> {
     children(state, owner_id)
@@ -854,14 +855,14 @@ pub fn child_names(state: &State, owner_id: &str) -> BTreeMap<String, String> {
 /// The instance `owner_id`'s thread `child` key names, by the same rule as
 /// the `stop`/`rm` control ops ([`find_child`]): never another dispatcher's
 /// child, and `None` when the key is ambiguous across sandboxes, since the
-/// pane would otherwise show (and step 5 act on) a guess.
+/// pane would otherwise show (and act on) a guess.
 pub fn resolve_child(state: &State, owner_id: &str, key: &str) -> Option<String> {
     find_child(state, owner_id, key, None).ok()
 }
 
 /// Every dispatcher's resolvable children, owner id → key → instance name.
-/// The dashboard computes this off the UI thread with each snapshot, so the
-/// thread pane resolves a `child` from memory.
+/// The daemon sends this with each `instances.list` snapshot, so the
+/// dashboard's thread pane resolves a `child` from memory.
 pub fn thread_children(state: &State) -> BTreeMap<String, BTreeMap<String, String>> {
     let owners: std::collections::BTreeSet<&str> =
         state.instances.values().filter_map(|i| i.dispatcher.as_deref()).collect();
@@ -1255,8 +1256,8 @@ impl Executor for Subprocess {
             .args(args)
             // Null stdin: every prompt (`rm`'s delete-branch `confirm`,
             // ambiguous-name `pick`) takes its non-TTY default. Git would
-            // still ask for credentials on the controlling terminal — the
-            // TUI's — so forbid that too.
+            // still ask for credentials on the controlling terminal — a
+            // foreground daemon's — so forbid that too.
             .stdin(Stdio::null())
             .stdout(log)
             .stderr(err)
@@ -1294,7 +1295,7 @@ impl Executor for Subprocess {
     fn exec_in(&mut self, child: &Instance, command: &[String]) -> Result<ExecOutput, String> {
         let args = crate::commands::exec::exec_argv(child, false, false, command);
         let bin = backend().bin();
-        // Captured, never inherited: this runs on the TUI's bridge worker.
+        // Captured, never inherited: this runs on the daemon's bridges.
         // Bounded: the child's helper (container-controlled) picks the size
         // and duration of its output.
         let cap = control::MAX_RESPONSE;
@@ -1356,7 +1357,7 @@ impl Executor for Subprocess {
 
     fn git(&mut self, repo: &Path, args: &[String]) -> Result<String, String> {
         let mut cmd = crate::commands::run::host_git(repo).map_err(|e| format!("{e:#}"))?;
-        // Captured, never inherited: this runs on the TUI's bridge worker.
+        // Captured, never inherited: this runs on the daemon's bridges.
         // Bounded like `exec_in`: a wedged git must not pin the handler.
         let cap = control::MAX_RESPONSE;
         let out = bounded::run(cmd.args(args).stdin(Stdio::null()), cap, GIT_TIMEOUT).map_err(|e| match e {
@@ -1381,7 +1382,7 @@ impl Executor for Subprocess {
 }
 
 /// `<data>/devsandbox/logs/dispatch-<unix>-<op>.log` (next to `state.toml`,
-/// like the TUI's failed-command logs), its dir created.
+/// like the verbs' spool files), its dir created.
 fn log_path(op: &str) -> Option<PathBuf> {
     let dir = State::path().ok()?.parent()?.join("logs");
     std::fs::create_dir_all(&dir).ok()?;

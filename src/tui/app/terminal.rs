@@ -26,7 +26,8 @@ const WHEEL_LINES: i16 = 3;
 /// executable, against the dashboard's config root. The CLI's `exec` owns
 /// the runtime argv, the in-flight guard and the ssh-agent relay
 /// (`bridges.ensure`, held for the command's life), so the dashboard reads
-/// no state for it, and a remote instance only needs a prefix (step 5).
+/// no state for it, and a remote instance only needs an ssh prefix
+/// (`tui/remote.rs`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecCli {
     /// `None` in production: the devsandbox binary, re-resolved per spawn

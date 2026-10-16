@@ -35,8 +35,9 @@ pub fn rename(name: &str, new_name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Silent core shared with the TUI, which runs it in place on the alternate
-/// screen — so it must never touch stdout/stderr or prompt on stdin. Purely
+/// Silent core shared with the daemon's `instances.rename` (via
+/// [`rename_exact_at`]) — so it must never touch stdout/stderr or prompt on
+/// stdin. Purely
 /// cosmetic: only the state key moves. `instance_id` — and with it the
 /// container name, `${instance}`-anchored mounts, worktree, shell history, and
 /// isolated services, on this run *and* every later `rebuild` — stays what it

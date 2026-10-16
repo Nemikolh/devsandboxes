@@ -8,7 +8,7 @@
 //! woken by `devsbd notify`'s poke on the API socket, by bridges attaching or
 //! their host caps arriving, and by a periodic retry.
 //!
-//! And it relays control requests (`devsbd ensure|ls|stop|rm`, `ctl.rs`)
+//! And it relays control requests (`devsbd ensure|ls|stop|rm|…`, `ctl.rs`)
 //! arriving on the API socket to the newest bridge whose host serves
 //! `CONTROL`, each on its own client thread, answering `NoHost` itself when
 //! there's none. `events-follow` (`devsbd events --follow`) is relayed as a
@@ -169,8 +169,8 @@ struct Attached {
 
 /// Connected bridges, oldest first. A stream on a channel is routed to the
 /// newest bridge whose host serves it; keeping the rest means a short-lived
-/// bridge (a CLI `exec`) ending falls back to a long-lived one (the TUI's)
-/// instead of leaving no route.
+/// bridge (a `devsandbox port` forward's) ending falls back to a long-lived
+/// one (the serve daemon's) instead of leaving no route.
 #[derive(Default)]
 struct Bridges {
     list: Mutex<Vec<Attached>>,
@@ -1085,7 +1085,7 @@ mod tests {
         let resp = decoded(&control_exchange(&Bridges::default(), &ids, REQUEST, Duration::from_secs(5)));
         assert_eq!(resp.status, Status::NoHost);
         assert!(resp.body.contains("no host connected"), "{}", resp.body);
-        // A notify-only host (a sink-less or older TUI) doesn't count.
+        // A notify-only host (a sink-less or older one) doesn't count.
         let bridges = Arc::new(Bridges::default());
         let (got, _host) = control_host(&bridges, caps::NOTIFY | caps::SSH_AGENT, Host::Reply(b"x"));
         wait_routable(&bridges, caps::NOTIFY);

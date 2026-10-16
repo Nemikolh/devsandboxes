@@ -1,7 +1,7 @@
 //! UI-independent snapshot collection: joins docker/state/config into a
-//! [`Snapshot`] that the TUI and any machine-readable consumer share verbatim.
-//! Plain blocking I/O (run off the UI thread by the TUI); parsing lives in free
-//! functions to stay unit-testable without docker.
+//! [`Snapshot`] that the dashboard and any machine-readable consumer share
+//! verbatim. Plain blocking I/O (the daemon's poll, `status`); parsing lives in
+//! free functions to stay unit-testable without docker.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -232,8 +232,9 @@ pub struct Snapshot {
     /// off-process; a JSON consumer prints at collection time itself.
     #[serde(skip, default = "Instant::now")]
     pub collected_at: Instant,
-    /// Whether cpu/mem were collected ([`Depth::Full`]). The TUI collects them
-    /// on a slower cadence and carries the last values over otherwise.
+    /// Whether cpu/mem were collected ([`Depth::Full`]). The daemon's poll
+    /// collects them on a slower cadence and carries the last values over
+    /// otherwise.
     #[serde(skip)]
     pub stats: bool,
     pub error: Option<String>,
@@ -635,9 +636,10 @@ pub fn collect(dir: &Path) -> Snapshot {
     collect_with(dir, Depth::Full)
 }
 
-/// How much of the runtime a [`collect_with`] asks, cheapest first. The TUI
-/// walks all three on startup so the tree renders from disk at once and the
-/// runtime data fills in as it arrives.
+/// How much of the runtime a [`collect_with`] asks, cheapest first. The daemon
+/// walks all three for a newly watched root (a disk snapshot at once, then its
+/// poll's passes) so the tree renders at once and the runtime data fills in
+/// as it arrives.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Depth {
     /// State + config only, no runtime calls: every container status is
@@ -704,9 +706,9 @@ impl RuntimeView {
                 Vec::new()
             }
         };
-        // Runtime version for the header; best-effort (None when down). Kept off
-        // the UI thread like every other runtime call here, and asked once per
-        // process: the TUI would otherwise spend a docker call per tick on it.
+        // Runtime version for the header; best-effort (None when down). Asked
+        // once per process: the daemon's poll would otherwise spend a docker
+        // call per tick on it.
         let runtime_version = if listed { runtime_version(rt) } else { None };
         let depth = if listed { Depth::Listing } else { Depth::Disk };
         let mut view =

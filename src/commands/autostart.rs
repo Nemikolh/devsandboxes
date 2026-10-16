@@ -7,7 +7,8 @@ use crate::state::State;
 
 /// Bring up every `autostart` sandbox of the config root in `dir`, once per
 /// host boot (docs/architecture/automations/autostart.md). Called after
-/// `run`/`start` and on TUI load; never fails the caller — problems are
+/// `run`/`start`/`rebuild` and by the daemon's startup pass
+/// (`serve/host.rs`); never fails the caller — problems are
 /// warnings on stderr. No loadable config or no readable boot id is a silent
 /// no-op.
 ///

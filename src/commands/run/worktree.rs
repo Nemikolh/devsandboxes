@@ -779,8 +779,7 @@ fn fetch_origin(base: &Path) -> Result<()> {
 /// `fetch` only moves `refs/remotes/origin/*` and adds objects — the base
 /// checkout's HEAD, index and files are untouched, so it is safe while
 /// another agent works there. It is skipped when one ran in the last two
-/// minutes (see [`fetch_origin`]). Its output is captured (the TUI calls this
-/// off-screen); a failed fetch (offline, auth) only warns and falls back to
+/// minutes (see [`fetch_origin`]). Its output is captured; a failed fetch (offline, auth) only warns and falls back to
 /// the last-fetched refs.
 ///
 /// Resolution: `explicit` (`--base`/`worktree-base`) → `origin/HEAD` →

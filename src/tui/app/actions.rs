@@ -83,13 +83,13 @@ impl App {
         self.pending_done.push(PendingDone { instance, done, report: false });
     }
 
-    /// Take the pending done-flag writes for the event loop to spawn.
+    /// Take the pending done-flag writes for the event loop to send.
     pub fn take_pending_done(&mut self) -> Vec<PendingDone> {
         std::mem::take(&mut self.pending_done)
     }
 
     /// `d` (Ports tab): stop the selected forward, queuing its id for the event
-    /// loop (step 10) to remove on its worker thread. No-op with no row selected.
+    /// loop to remove through the daemon worker. No-op with no row selected.
     pub(super) fn stop_selected_forward(&mut self) {
         let Some(row) = self.ports.get(self.selected()) else {
             return;
@@ -238,7 +238,7 @@ impl App {
 
     /// The event loop's report that the verb request for `action` ended:
     /// show its status, clear `s`'s in-flight guard (a detached start
-    /// answers once spawned, F14: a thread action waiting on it runs when a
+    /// answers once spawned: a thread action waiting on it runs when a
     /// snapshot shows the instance up, [`Self::set_snapshot`]), and turn rm's
     /// branch question into a Confirm modal whose answer resends it.
     pub fn verb_answered(&mut self, action: &PromptAction, end: VerbEnd) {

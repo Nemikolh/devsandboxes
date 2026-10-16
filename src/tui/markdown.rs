@@ -379,8 +379,8 @@ impl Blocks {
     }
 
     /// A finished table: aligned columns when [`layout_columns`] finds room
-    /// under the current prefix, else its source lines (as step 15 showed
-    /// every table), which wrap but stay readable.
+    /// under the current prefix, else its source lines, which wrap but stay
+    /// readable.
     fn table_block(&mut self, table: Table) {
         let Table { aligns, rows, source, .. } = table;
         let avail = self.width.saturating_sub(width_of(&self.prefix(false)));

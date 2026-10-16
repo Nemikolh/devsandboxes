@@ -1121,7 +1121,7 @@ export interface ApiMethods {
   start: { params: StartParams; result: VerbResult | VerbDetached };
   stop: { params: StopParams; result: VerbResult };
   rm: { params: RmParams; result: VerbResult };
-  /** No instance verb: `instance` is always `null`, no `detach`. */
+  /** No instance verb: `instance` is always `null`; `detach` only keeps it running past a hang-up, the answer comes at its exit. */
   'services.rebuild': { params: ServicesRebuildParams; result: VerbResult };
   subscribe: { params: { topics: ApiTopic[] }; result: OkResult };
   unsubscribe: { params: { topics: ApiTopic[] }; result: OkResult };

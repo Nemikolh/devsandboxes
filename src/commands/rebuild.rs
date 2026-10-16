@@ -161,8 +161,8 @@ fn recreate(
         worktree,
         branch,
         branch_created,
-        // No extras: `materialize` keeps the recorded dispatcher; `--env`s
-        // aren't recorded, so they are dropped.
+        // No extras: `materialize` keeps the recorded dispatcher and the
+        // recorded `--env`s (`Instance::extra_env`, `effective_extra_env`).
         &run::RunExtras::default(),
         state,
         &mut tracker,

@@ -4,7 +4,8 @@
 //! instance, docs/architecture/daemon/host-poll.md; CLI commands ask it through `bridges.ensure`) and
 //! the forwarder engine (`spawn_for`).
 //! The daemon's bridges also take the container's `devsbd notify` records and
-//! serve its `devsbd ensure|ls|stop|rm` control requests (docs/architecture/automations/dispatchers.md).
+//! serve its control requests (`devsbd ensure|ls|stop|rm|…`: children, their
+//! runs, branches, events, threads; `control::Op::ALL`) (docs/architecture/automations/dispatchers.md).
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -33,8 +34,9 @@ pub struct Bridge {
     // Set by the handshake thread when the failure is a protocol version
     // mismatch — either detected host-side (`proto::version_mismatch`) or by the
     // bridge exiting `proto::MISMATCH_EXIT` (daemon mismatch). A mismatched
-    // bridge is not retried while its container stays running: only a restart,
-    // which rewrites the helper, can fix it.
+    // bridge is retried only after the long `MISMATCH_RETRY` (or at once on a
+    // restart or a `bridges.ensure`, see `retry_decision`): only a helper
+    // rewrite can fix it.
     mismatch: Arc<AtomicBool>,
     handshake: mpsc::Receiver<Result<(), String>>,
     // Published by the handshake thread once `Hello` succeeds: the live mux (to
@@ -71,7 +73,7 @@ impl Bridge {
 
     /// The daemon's advertised capabilities, available once the handshake has
     /// succeeded; `None` while it's pending or after it failed.
-    #[allow(dead_code)] // host forwarder engine (docs/architecture/daemon/forwards.md, *The engine: `Forward`*)
+    #[allow(dead_code)] // tests only: the forwarder learns caps through `connect`'s `Unsupported`
     pub fn peer_caps(&self) -> Option<u32> {
         self.forward.get().map(|f| f.peer_caps)
     }
@@ -83,7 +85,7 @@ impl Bridge {
     /// Errors before the handshake is done, when the bridge is dead, or when the
     /// daemon doesn't advertise `TCP_FORWARD` (an outdated helper) — the last as
     /// `Unsupported`, so callers can phrase the restart hint.
-    #[allow(dead_code)] // host forwarder engine (docs/architecture/daemon/forwards.md, *The engine: `Forward`*)
+    #[allow(dead_code)] // called by the host forwarder engine (`forward.rs`)
     pub fn connect(
         &self,
         conn: impl Into<Conn>,
@@ -391,7 +393,7 @@ fn open_stream(
 /// half-closes our side), decode, run it through the handler, write the
 /// encoded response, close. Oversized or undecodable → a `Usage` response;
 /// timed out → close with no reply (the daemon reports the host
-/// disconnected). Silent: the TUI owns the terminal. An `events-follow`
+/// disconnected). Silent: the bridge's owner does any reporting. An `events-follow`
 /// request goes to the follow handler instead, which holds the stream (and
 /// this handler's slot) until it ends.
 fn handle_control(mut conn: UnixStream, to: &Services) {
@@ -421,7 +423,7 @@ fn handle_control(mut conn: UnixStream, to: &Services) {
 /// two (or a store that won't take the record) leaves the record in the
 /// container's outbox, and the daemon resends it. Oversized or timed-out →
 /// close with no reply; undecodable → `NOTIFY_REPLY_BAD`. Silent throughout:
-/// the TUI owns the terminal.
+/// the bridge's owner does any reporting.
 fn handle_notify(mut conn: UnixStream, to: &Services) {
     let _ = conn.set_read_timeout(Some(NOTIFY_READ_TIMEOUT));
     let limit = notify::MAX_RECORD + NOTIFY_SLACK;
@@ -487,7 +489,7 @@ pub fn spawn_for(container: &str, hash: &str, with_agent: bool) -> Option<Bridge
 }
 
 /// Start a bridge without waiting for its handshake (see `outcome`). Fully
-/// quiet (stderr captured), since the TUI owns the screen; `None` only when
+/// quiet (stderr captured), since its owner does the reporting; `None` only when
 /// the `exec` can't even be spawned. `agent` is the host ssh-agent socket
 /// provider, or `None` for an agent-less bridge (a `devsandbox port` forward): it advertises no
 /// `SSH_AGENT` cap and refuses agent `Open`s, so the daemon won't route agent

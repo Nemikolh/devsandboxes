@@ -398,7 +398,7 @@ impl Mux {
     /// The peer's advertised capabilities, or `None` if it never sent `Caps`
     /// (an older peer). The host reads the daemon's caps here after the
     /// handshake to decide whether a forward is possible.
-    #[allow(dead_code)] // daemon routing (devsbd); host reads via Bridge (step 5)
+    #[allow(dead_code)] // daemon routing (devsbd); the host reads `Bridge::peer_caps`
     pub fn peer_caps(&self) -> Option<u32> {
         *self.peer_caps.lock().unwrap()
     }

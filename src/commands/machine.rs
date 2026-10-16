@@ -1,7 +1,6 @@
 //! `devsandbox machine add|ls|rm` (docs/architecture/daemon/machines.md,
 //! *`devsandbox machine add|ls|rm`*): a client of the daemon's `machines.*`,
-//! never in-process, since the registry and (from step 3) the links are the
-//! daemon's.
+//! never in-process, since the registry and the links are the daemon's.
 //!
 //! `add` without `--config` probes the machine for its candidate roots and
 //! lets the user pick (a TTY) or takes the only usable one (no TTY). The

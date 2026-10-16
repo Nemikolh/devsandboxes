@@ -472,8 +472,8 @@ fn main() -> Result<()> {
         serve::client::set_in_process();
     }
 
-    // Here rather than in `Config::load`: that also runs on TUI threads, where
-    // a notice would garble the screen. A failure leaves the legacy file read
+    // Here rather than in `Config::load`: that also runs on daemon threads,
+    // where a notice would land in `serve.log` with no one to read it. A failure leaves the legacy file read
     // in place, so it only warns.
     match config::migrate_legacy(&cli.dir) {
         Ok(Some(new)) => eprintln!("devsandbox: renamed config.toml to {}", new.display()),
@@ -503,8 +503,8 @@ fn main() -> Result<()> {
     // Before that, machines (docs/architecture/daemon/machines.md): a name may be a machine's,
     // and `--machine` runs a nameless command there. A command that ran on a
     // machine over ssh ends here; the rest come back with their name as this
-    // host knows it. The registry is read from the file (F15), never under
-    // `--in-process`.
+    // host knows it. The registry is read from the file (no daemon round
+    // trip), never under `--in-process`.
     #[cfg(unix)]
     let machines = if cli.in_process { Vec::new() } else { serve::machines::registered_names() };
     #[cfg(unix)]
@@ -526,7 +526,7 @@ fn main() -> Result<()> {
                 // As the daemon's subprocesses do: a fallback never lazy
                 // starts a daemon (nothing answered just now).
                 serve::client::set_in_process();
-                // `@/x` is `x` here; a machine's name refused (F13).
+                // `@/x` is `x` here; a machine's name refused.
                 (serve::machines::cli::localize(command)?, Some(why))
             }
         },

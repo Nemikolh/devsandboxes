@@ -179,10 +179,10 @@ pub(crate) fn resolve_container(state: &State, name: &str) -> Result<String> {
         .ok_or(instance_err)
 }
 
-/// The single drift rule shared by every comparison site (`rebuild`, `run`
-/// reuse, `services`, and the TUI snapshot) so they can't diverge. A container
-/// has drifted when either recorded label is present *and* differs from what
-/// the current config produces:
+/// The single drift rule shared by every comparison site (`rebuild`, `start`'s
+/// `warn_on_drift`, `services`, and the instance snapshot) so they can't
+/// diverge. A container has drifted when either recorded label is present
+/// *and* differs from what the current config produces:
 ///
 /// - config: label `Some(h)` and `h != expected_config`.
 /// - build:  label `Some(h)` and `expected_build` non-empty and `h != expected_build`.
