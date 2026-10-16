@@ -942,7 +942,7 @@ mod tests {
         ];
         for op in &ops {
             let (method, params) = op_call(op);
-            api::call(method, params, &Ctx { inbox: &via_api, client: "tui", bridges: None, forwards: None }).unwrap_or_else(|e| panic!("{op:?}: {e:?}"));
+            api::call(method, params, &Ctx { inbox: &via_api, client: "tui", bridges: None, forwards: None, host: None }).unwrap_or_else(|e| panic!("{op:?}: {e:?}"));
             inbox::ops::apply(&via_ops, std::slice::from_ref(op), "tui").unwrap();
         }
         // Ids and times aside (minted at apply time): threads, then events.
@@ -1028,7 +1028,7 @@ mod tests {
             }
         }
         let path = std::env::temp_dir().join(format!("devsandbox-tui-fwd-{}", std::process::id())).join("inbox.json");
-        let ctx = Ctx { inbox: &path, client: "tui", bridges: None, forwards: Some(&Fake) };
+        let ctx = Ctx { inbox: &path, client: "tui", bridges: None, forwards: Some(&Fake), host: None };
         let dir = Path::new("/cfg");
 
         let (method, params) = list_call(dir);
@@ -1163,7 +1163,7 @@ mod tests {
         )
         .unwrap();
         let inbox = dir.join("inbox.json");
-        let ctx = Ctx { inbox: &inbox, client: "tui", bridges: None, forwards: None };
+        let ctx = Ctx { inbox: &inbox, client: "tui", bridges: None, forwards: None, host: None };
         let ask = |(method, params): (&str, Value)| match api::call(method, params, &ctx) {
             Ok(v) => Answer::Ok(v),
             Err(e) => Answer::Refused(e.message),

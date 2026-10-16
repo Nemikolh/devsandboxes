@@ -59,6 +59,7 @@ use super::endpoint::{self, Listener, Stream};
 use super::forwards::{self, Registry};
 use super::host::{Host, Observers, Waker};
 use super::idle::{self, Decision, Holders};
+use super::machines::{self, link, ssh::{self, Dial}};
 use super::proto::{self, HelloParams, HelloResult, Notification, Request, Response, Version};
 use super::snapshots::{self, Join, Snapshots};
 use super::verbs;
@@ -103,6 +104,15 @@ pub struct Options {
     /// (`snapshot::collect_from` + `thread_children` from `state`). Tests
     /// inject one that reads neither the user's state nor a runtime.
     pub join: Option<Join>,
+    /// The home `roots.list` expands `~` with and finds `~/.devsandboxes`
+    /// in; `None` is `$HOME`. Tests point it at a scratch dir.
+    pub home: Option<PathBuf>,
+    /// `machines.toml`; `None` is the default ([`machines::path`]). Tests
+    /// point it at their own file.
+    pub machines: Option<PathBuf>,
+    /// How `machines.*` reach a machine; `None` is ssh
+    /// ([`ssh::ssh_dial`]). Tests dial another test daemon's socket.
+    pub dial: Option<Dial>,
 }
 
 impl Options {
@@ -116,6 +126,9 @@ impl Options {
             verbs: None,
             state: None,
             join: None,
+            home: None,
+            machines: None,
+            dial: None,
         }
     }
 }
@@ -188,7 +201,17 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
     ));
 
     let join = opts.join.clone().unwrap_or_else(|| default_join(state.clone()));
-    let shared = Arc::new(Shared::new(opts.version.clone(), inbox, state, join));
+    let mut shared = Shared::new(opts.version.clone(), inbox, state, join);
+    shared.home = opts.home.clone().or_else(|| std::env::var_os("HOME").map(PathBuf::from));
+    shared.machines = Some(machines::api::Ctx {
+        registry: match &opts.machines {
+            Some(path) => path.clone(),
+            None => machines::path()?,
+        },
+        dial: opts.dial.clone().unwrap_or_else(|| ssh::ssh_dial(link::client_name())),
+        version: opts.version.semver.clone(),
+    });
+    let shared = Arc::new(shared);
     let _ = shared.runner.set(match &opts.verbs {
         Some(runner) => runner.clone(),
         None => verbs::Runner::new()?,
@@ -358,6 +381,11 @@ struct Shared {
     /// How a root's snapshot is joined: the poll's, and a new watch's first
     /// (disk-only) one.
     join: Join,
+    /// What `roots.list` reads `~` as.
+    home: Option<PathBuf>,
+    /// The `machines.*` methods' registry and dial; unset only in tests
+    /// that build a bare `Shared` (the methods are then unknown).
+    machines: Option<machines::api::Ctx>,
 }
 
 impl Shared {
@@ -378,6 +406,8 @@ impl Shared {
             draining: AtomicBool::new(false),
             snapshots: Arc::default(),
             join,
+            home: None,
+            machines: None,
         }
     }
 
@@ -783,10 +813,15 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
             shared.begin_stop(Exit::Shutdown);
             Ok(json!({ "ok": true }))
         }
+        method if method.starts_with("machines.") && shared.machines.is_some() => {
+            let ctx = shared.machines.as_ref().expect("checked");
+            machines::api::call(method, req.params, ctx).unwrap_or_else(|| Err(api::ApiError::unknown_method(method)))
+        }
         method => {
             let bridges = shared.bridges.get().map(|w| w as &dyn api::Bridging);
             let forwards = shared.forwards.get().map(|h| h as &dyn api::Forwarding);
-            api::call(method, req.params, &api::Ctx { inbox: &shared.inbox, client: &conn.audit, bridges, forwards })
+            let host = Some(api::HostPaths { state: &shared.state, home: shared.home.as_deref() });
+            api::call(method, req.params, &api::Ctx { inbox: &shared.inbox, client: &conn.audit, bridges, forwards, host })
         }
     };
     Some(match answer {
@@ -1025,6 +1060,12 @@ pub(crate) mod tests {
             // listens for `instances.changed` sets its own.
             state: Some(std::env::temp_dir().join(format!("dsv-state-{}", std::process::id())).join("state.toml")),
             join: Some(fake_join()),
+            // Never the user's home, registry or ssh.
+            home: Some(std::env::temp_dir().join(format!("dsv-home-{}", std::process::id()))),
+            machines: Some(std::env::temp_dir().join(format!("dsv-machines-{}", std::process::id())).join("machines.toml")),
+            dial: Some(Arc::new(|e: &machines::Entry, _: Option<&Path>| {
+                anyhow::bail!("a test daemon has no dial (machine {}): set Options.dial", e.name)
+            })),
         }
     }
 

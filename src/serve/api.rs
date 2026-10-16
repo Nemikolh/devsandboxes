@@ -44,6 +44,18 @@ pub struct Ctx<'a> {
     pub bridges: Option<&'a dyn Bridging>,
     /// The port forwards `forwards.*` act on; `None` like `bridges`.
     pub forwards: Option<&'a dyn Forwarding>,
+    /// Where `roots.list` looks; `None` is the user's (`State::path`,
+    /// `$HOME`). A daemon passes its own, so a test daemon standing in as a
+    /// machine never reads the user's.
+    pub host: Option<HostPaths<'a>>,
+}
+
+/// This host's `state.toml` and home, as `roots.list` reads them.
+#[derive(Clone, Copy)]
+pub struct HostPaths<'a> {
+    pub state: &'a Path,
+    /// What `~` is; `None`: no `~/.devsandboxes` candidate, no `~` paths.
+    pub home: Option<&'a Path>,
 }
 
 /// The daemon's forward registry as `forwards.*` sees it
@@ -123,7 +135,17 @@ pub fn call(method: &str, params: Value, ctx: &Ctx) -> Answer {
             containers_inspect(parse(params)?, |c| crate::runtime::backend().inspect_json(c).map_err(ApiError::internal))
         }
         "sandboxes.list" => sandboxes_list(parse(params)?),
-        "roots.list" => roots_list(&state_path()?, std::env::var_os("HOME").map(PathBuf::from).as_deref()),
+        "roots.list" => {
+            let p: RootsParams = parse(params)?;
+            let (state, home) = match ctx.host {
+                Some(host) => (host.state.to_path_buf(), host.home.map(Path::to_path_buf)),
+                None => (state_path()?, std::env::var_os("HOME").map(PathBuf::from)),
+            };
+            match p.paths {
+                Some(paths) => roots_check(&paths, home.as_deref()),
+                None => roots_list(&state, home.as_deref()),
+            }
+        }
         "sandboxes.get" => sandboxes_get(parse(params)?),
         "services.get" => services_get(parse(params)?),
         "bridges.ensure" => bridges_ensure(parse(params)?, ctx),
@@ -631,6 +653,50 @@ fn roots_list(state: &Path, home: Option<&Path>) -> Answer {
     serde_json::to_value(rows).map_err(|e| ApiError::internal(e.into()))
 }
 
+#[derive(Deserialize)]
+struct RootsParams {
+    /// Check exactly these instead of answering the candidates.
+    #[serde(default)]
+    paths: Option<Vec<String>>,
+}
+
+/// `roots.list {paths}`: each of `paths` as a [`RootCandidate`], in order.
+/// This is how `machines.add` checks the roots a user typed on the machine
+/// they're on: `~` / `~/…` expand with *this* host's `home` (the user's
+/// local shell left a quoted `~` alone, and must have), then the path is
+/// canonicalized. A relative path, a missing directory or a config that
+/// doesn't load is that entry's `error`, with `root` as given (expanded).
+fn roots_check(paths: &[String], home: Option<&Path>) -> Answer {
+    let rows: Vec<RootCandidate> = paths
+        .iter()
+        .map(|given| {
+            let failed = |root: PathBuf, error: String| RootCandidate { root, sandboxes: Vec::new(), error: Some(error) };
+            let rest = if given == "~" { Some("") } else { given.strip_prefix("~/") };
+            let root = match (rest, home) {
+                (Some(rest), Some(home)) => home.join(rest),
+                (Some(_), None) => return failed(given.into(), "no home directory to expand `~` with".into()),
+                (None, _) => PathBuf::from(given),
+            };
+            if !root.is_absolute() {
+                return failed(root, "not absolute".into());
+            }
+            let root = match std::fs::canonicalize(&root) {
+                Ok(canon) if canon.is_dir() => canon,
+                Ok(_) => return failed(root, "not a directory".into()),
+                Err(_) => return failed(root.clone(), format!("no directory {}", root.display())),
+            };
+            match config_at(&root) {
+                Ok(config) => {
+                    let names = config.map(|c| c.sandboxes.into_keys().collect()).unwrap_or_else(Vec::new);
+                    RootCandidate { root, sandboxes: names.into_iter().map(|name| SandboxEntry { name }).collect(), error: None }
+                }
+                Err(e) => failed(root, e.message),
+            }
+        })
+        .collect();
+    serde_json::to_value(rows).map_err(|e| ApiError::internal(e.into()))
+}
+
 /// Config root `root`'s config, `None` when it has no config file. Errors:
 /// `invalid` (relative root, a config that doesn't load), `not-found` (no
 /// such directory).
@@ -999,7 +1065,7 @@ mod tests {
     }
 
     fn run(path: &Path, method: &str, params: Value) -> Answer {
-        call(method, params, &Ctx { inbox: path, client: "api:test", bridges: None, forwards: None })
+        call(method, params, &Ctx { inbox: path, client: "api:test", bridges: None, forwards: None, host: None })
     }
 
     /// Records what `bridges.ensure` asked for; knows instance `web` only.
@@ -1039,7 +1105,7 @@ mod tests {
         let path = store_path("ensure-wait");
         let not = Readiness { ready: false, error: Some("helper in devsandbox-web is outdated".into()) };
         let fake = FakeBridges { readiness: Some(not), ..FakeBridges::default() };
-        let ensure = |params: Value| call("bridges.ensure", params, &Ctx { inbox: &path, client: "api:test", bridges: Some(&fake), forwards: None });
+        let ensure = |params: Value| call("bridges.ensure", params, &Ctx { inbox: &path, client: "api:test", bridges: Some(&fake), forwards: None, host: None });
 
         assert_eq!(ensure(json!({"instance": "web"})).unwrap(), json!({"ok": true}), "no wait: unchanged");
         assert!(fake.waits.borrow().is_empty());
@@ -1059,7 +1125,7 @@ mod tests {
         assert_eq!(fake.woken.borrow().len(), 4, "a bad wait wakes nothing");
 
         let ready = FakeBridges { readiness: Some(Readiness { ready: true, error: None }), ..FakeBridges::default() };
-        let r = call("bridges.ensure", json!({"instance": "web", "wait": 10}), &Ctx { inbox: &path, client: "api:test", bridges: Some(&ready), forwards: None });
+        let r = call("bridges.ensure", json!({"instance": "web", "wait": 10}), &Ctx { inbox: &path, client: "api:test", bridges: Some(&ready), forwards: None, host: None });
         assert_eq!(r.unwrap(), json!({"ok": true, "ready": true, "error": null}));
     }
 
@@ -1067,7 +1133,7 @@ mod tests {
     fn bridges_ensure_records_the_agent_and_reconciles_the_instance() {
         let path = store_path("ensure");
         let fake = FakeBridges::default();
-        let ensure = |params: Value| call("bridges.ensure", params, &Ctx { inbox: &path, client: "api:test", bridges: Some(&fake), forwards: None });
+        let ensure = |params: Value| call("bridges.ensure", params, &Ctx { inbox: &path, client: "api:test", bridges: Some(&fake), forwards: None, host: None });
 
         assert_eq!(ensure(json!({"instance": "web", "agent": "/tmp/ssh-x/agent.1"})).unwrap(), json!({"ok": true}));
         assert_eq!(ensure(json!({"instance": "web", "agent": null})).unwrap(), json!({"ok": true}));
@@ -1697,6 +1763,51 @@ mod tests {
         let _ = std::fs::remove_dir_all(base.parent().unwrap());
     }
 
+    #[test]
+    fn roots_list_with_paths_checks_exactly_those() {
+        let base = store_path("roots-paths").with_file_name("roots-paths");
+        let _ = std::fs::remove_dir_all(&base);
+        let (home, bad, file) = (base.join("home"), base.join("bad"), base.join("file"));
+        for d in [&home.join("sb"), &bad] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(home.join("sb").join(crate::config::CONFIG_FILE), "[sandbox.web]\nimage = \"a\"\n").unwrap();
+        std::fs::write(bad.join(crate::config::CONFIG_FILE), "[sandbox.web\n").unwrap();
+        std::fs::write(&file, "").unwrap();
+        let canon = |p: &Path| std::fs::canonicalize(p).unwrap();
+        let via_dotdot = format!("{}/../home/sb", home.display());
+        let paths: Vec<String> = ["~/sb", &via_dotdot, "~", "rel/x", "~/gone", bad.to_str().unwrap(), file.to_str().unwrap(), "~other/x"]
+            .map(String::from)
+            .into();
+        let got = roots_check(&paths, Some(&home)).unwrap();
+        let rows = got.as_array().unwrap();
+        assert_eq!(rows.len(), paths.len());
+        let web = json!([{"name": "web"}]);
+        assert_eq!(rows[0], json!({"root": canon(&home.join("sb")), "sandboxes": web, "error": null}));
+        assert_eq!(rows[1], rows[0], "canonicalized");
+        assert_eq!(rows[2], json!({"root": canon(&home), "sandboxes": [], "error": null}), "no config file: no sandboxes, no error");
+        assert_eq!(rows[3], json!({"root": "rel/x", "sandboxes": [], "error": "not absolute"}));
+        let gone = home.join("gone");
+        assert_eq!(rows[4], json!({"root": gone, "sandboxes": [], "error": format!("no directory {}", gone.display())}));
+        assert_eq!(rows[5]["root"], json!(canon(&bad)));
+        assert!(rows[5]["error"].as_str().unwrap().contains("devsandboxes.toml"), "{}", rows[5]);
+        assert_eq!(rows[6]["error"], "not a directory");
+        assert_eq!(rows[7]["error"], "not absolute", "`~user` isn't expanded");
+        // No home: `~` can't expand.
+        let none = roots_check(&["~/sb".into()], None).unwrap();
+        assert_eq!(none[0]["error"], "no home directory to expand `~` with");
+
+        // Through `call`, with the ctx's home rather than `$HOME`.
+        let state = base.join("state.toml");
+        let host = HostPaths { state: &state, home: Some(&home) };
+        let ctx = Ctx { inbox: &base.join("inbox.json"), client: "api:test", bridges: None, forwards: None, host: Some(host) };
+        let r = call("roots.list", json!({"paths": ["~/sb"]}), &ctx).unwrap();
+        assert_eq!(r[0]["sandboxes"], web);
+        let candidates = call("roots.list", Value::Null, &ctx).unwrap();
+        assert_eq!(candidates, json!([]), "no state, no ~/.devsandboxes");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     fn listing(pid: &str) -> ProcsListing {
         ProcsListing {
             processes: vec![Process { pid: pid.into(), ppid: "0".into(), args: "sleep 9".into() }],
@@ -2003,7 +2114,7 @@ mod tests {
         use crate::devsbd::forward::HostPort;
         let path = store_path("forwards");
         let fake = FakeForwards::default();
-        let fwd = |method: &str, params: Value| call(method, params, &Ctx { inbox: &path, client: "api:test", bridges: None, forwards: Some(&fake) });
+        let fwd = |method: &str, params: Value| call(method, params, &Ctx { inbox: &path, client: "api:test", bridges: None, forwards: Some(&fake), host: None });
 
         let rows = fwd("forwards.list", json!({"dir": "/cfg"})).unwrap();
         assert_eq!(rows[0]["id"], 1);

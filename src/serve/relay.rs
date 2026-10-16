@@ -434,6 +434,10 @@ mod tests {
         (&daemon).write_all(down).unwrap();
         assert_eq!(line(&mut BufReader::new(stdout_r)).as_bytes(), down);
         stdin.shutdown(Shutdown::Write).unwrap();
+        // The relay's EOF on the daemon side comes after it reported stdin's,
+        // so the hang-up below can't be read as the daemon leaving first.
+        let mut rest = Vec::new();
+        from_relay.read_to_end(&mut rest).unwrap();
         drop((daemon, from_relay));
         assert_eq!(relay.join().unwrap().unwrap(), End::Stdin);
     }

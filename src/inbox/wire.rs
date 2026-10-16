@@ -53,6 +53,12 @@ impl ApiError {
         Self::new("bind-failed", message)
     }
 
+    /// Something outside the daemon failed: a machine's ssh, or its hello.
+    #[cfg_attr(not(unix), allow(dead_code))] // only the daemon (unix) uses it
+    pub fn failed(message: impl Into<String>) -> Self {
+        Self::new("failed", message)
+    }
+
     #[cfg_attr(not(unix), allow(dead_code))] // only the daemon (unix) uses it
     pub fn internal(e: anyhow::Error) -> Self {
         Self::new("internal", format!("{e:#}"))

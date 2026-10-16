@@ -134,6 +134,7 @@ pub fn api_argv(entry: &Entry, client: &str) -> Result<Vec<OsString>> {
 /// The argv of an interactive command on `entry` (a terminal tab, a CLI
 /// re-exec): `ssh -t -A [-p N] -- <host> <devsandbox remote_args…>`. No
 /// `BatchMode`: a person is there to answer ssh's prompts.
+#[allow(dead_code)] // built ahead of its callers: steps 5 and 6 of docs/machines.md
 pub fn tty_argv(entry: &Entry, remote_args: &[impl AsRef<str>]) -> Result<Vec<OsString>> {
     argv(entry, &["-t", "-A"], remote_args)
 }
@@ -171,6 +172,7 @@ pub struct Duplex {
 
 impl Duplex {
     /// A plain socket to a daemon (tests, F14).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn socket(stream: Stream) -> Self {
         Self { stream, peer: Peer::default() }
     }

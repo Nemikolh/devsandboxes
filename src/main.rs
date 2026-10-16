@@ -306,6 +306,13 @@ enum Command {
         #[arg(long, hide = true)]
         session_env: bool,
     },
+    /// Register remote hosts (over ssh) whose sandboxes this one manages
+    /// (docs/machines.md)
+    #[cfg(unix)]
+    Machine {
+        #[command(subcommand)]
+        cmd: MachineCommand,
+    },
 }
 
 /// `-d` on `run`, `rebuild`, `start`: one text, one behaviour.
@@ -320,6 +327,43 @@ enum ServeCommand {
     Install,
     /// Stop the daemon `serve install` manages and remove its unit
     Uninstall,
+}
+
+#[cfg(unix)]
+#[derive(Subcommand)]
+enum MachineCommand {
+    /// Register a machine: an ssh target running devsandbox
+    ///
+    /// Adding a machine means trusting it: whoever controls it can act as
+    /// you in its containers (your ssh agent is forwarded there), and its
+    /// devsandbox socket is as powerful as docker.sock.
+    ///
+    /// Without --config, its known config roots are offered to pick from
+    /// (on a TTY; otherwise the only one is taken). --config is a path on
+    /// the machine: quote a `~` (`--config '~/sandboxes'`), or your local
+    /// shell expands it to your local home.
+    ///
+    ///     devsandbox machine add me@my-server
+    ///
+    ///     devsandbox machine add ssh://me@box:2200 --name box --config '~/sandboxes'
+    Add {
+        /// What ssh takes (`me@host`, an ssh-config alias) or `ssh://[user@]host[:port]`
+        target: String,
+        /// The machine's name (default: the target's host)
+        #[arg(long)]
+        name: Option<String>,
+        /// A config root on the machine (repeatable)
+        #[arg(long = "config", value_name = "PATH")]
+        configs: Vec<String>,
+    },
+    /// List the registered machines
+    Ls {
+        /// Output JSON instead of a table
+        #[arg(long)]
+        json: bool,
+    },
+    /// Unregister a machine (nothing on it changes)
+    Rm { name: String },
 }
 
 /// `<thread>`: `<owner>/<key>` (owner: instance name or id) or the id `inbox ls` shows.
@@ -587,6 +631,12 @@ fn main() -> Result<()> {
         Command::Api { stdio: _, client, session_env } => {
             std::process::exit(serve::relay::stdio(&client, session_env)?)
         }
+        #[cfg(unix)]
+        Command::Machine { cmd } => match cmd {
+            MachineCommand::Add { target, name, configs } => commands::machine::add(&target, name.as_deref(), &configs),
+            MachineCommand::Ls { json } => commands::machine::ls(json),
+            MachineCommand::Rm { name } => commands::machine::rm(&name),
+        },
     }
 }
 

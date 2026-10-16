@@ -6,6 +6,8 @@ pub mod inbox;
 pub mod inspect;
 pub mod logs;
 pub mod ls;
+#[cfg(unix)]
+pub mod machine;
 pub mod port;
 pub mod ps;
 pub mod rebuild;

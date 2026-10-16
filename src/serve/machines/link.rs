@@ -21,6 +21,7 @@ const STDERR_WAIT: Duration = Duration::from_secs(2);
 /// hello reply. Dropping it closes the socket, then kills the ssh.
 pub struct Link {
     pub conn: Conn,
+    #[allow(dead_code)] // held for its drop (kills the ssh); step 3 reads its stderr
     pub peer: Peer,
 }
 

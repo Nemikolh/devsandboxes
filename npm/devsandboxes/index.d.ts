@@ -687,6 +687,40 @@ export interface RootCandidate {
   error: string | null;
 }
 
+/** `machines.probe`'s answer: the machine's devsandbox and its candidate roots. */
+export interface MachineProbe {
+  version: string;
+  protocol: number;
+  roots: RootCandidate[];
+}
+
+/** `machines.add`'s answer. */
+export interface MachineAdded {
+  name: string;
+  /** As saved: the machine's canonical paths, deduplicated. */
+  roots: string[];
+  /** The machine's devsandbox semver. */
+  version: string;
+  /** Set when that semver differs from this daemon's. */
+  warning: string | null;
+}
+
+/** One registered machine (`machines.list`). */
+export interface MachineRow {
+  name: string;
+  /** What ssh takes, or an `ssh://` URL. */
+  target: string;
+  /** Config roots on the machine. */
+  roots: string[];
+  /** The remote devsandbox as shell text; `null` is `devsandbox` on its `PATH`. */
+  command: string | null;
+  /** `idle` for now. */
+  state: string;
+  error: string | null;
+  /** The machine's devsandbox semver, once reached. */
+  version: string | null;
+}
+
 /** One process of an instance, as `ps` printed it. */
 export interface ProcessRow {
   pid: string;
@@ -980,8 +1014,17 @@ export interface ApiMethods {
   'containers.inspect': { params: { container: string }; result: unknown };
   /** The config root's sandboxes, sorted; `[]` without a config file. */
   'sandboxes.list': { params: { root: string }; result: SandboxEntry[] };
-  /** This host's config roots: every one its instances were made from, plus `~/.devsandboxes`; sorted. */
-  'roots.list': { params: {}; result: RootCandidate[] };
+  /**
+   * This host's config roots: every one its instances were made from, plus `~/.devsandboxes`; sorted.
+   * With `paths`: exactly those, in order (`~` expanded here, canonicalized; a bad one has its `error`).
+   */
+  'roots.list': { params: { paths?: string[] }; result: RootCandidate[] };
+  /** Dial a target over ssh and list its candidate roots; `failed` when ssh or the hello fails. */
+  'machines.probe': { params: { target: string }; result: MachineProbe };
+  /** Check `roots` on the machine (a quoted `~` is its home) and register it; `invalid` for a taken name or a bad root. */
+  'machines.add': { params: { target: string; name?: string; roots: string[] }; result: MachineAdded };
+  'machines.list': { params: {}; result: MachineRow[] };
+  'machines.rm': { params: { name: string }; result: OkResult };
   /** `not-found` for an unknown sandbox; one that doesn't merge answers why in `resolved`. */
   'sandboxes.get': { params: { root: string; name: string }; result: SandboxConfig };
   'services.get': { params: { root: string; name: string }; result: ServiceConfig };
