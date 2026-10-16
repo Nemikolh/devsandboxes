@@ -35,9 +35,6 @@ its magic); the API link should too.
   bounded (64 KiB, like `tunnel::HEADER_LIMIT`), then does the usual
   `client::hello` on the rest. Factor the line skipping out of
   `tunnel::read_header` and share it.
-- An older remote prints no sentinel: a line that parses as the hello
-  reply is accepted as is too, so mixed versions keep working. Drop that
-  once the protocol is next bumped.
 - The noise itself is dropped, except into `serve.log` (first line,
   truncated) so a broken profile can be found.
 - `docs/status.md`'s *A remote login shell that prints to stdout breaks
@@ -87,12 +84,10 @@ our own infra, where the local daemon decides per stream.
   from the remote daemon's relay, i.e. this one.
 - Open: several laptops linked to one machine (one socket each; whose
   agent a sandbox gets: the newest, as `AgentCandidates` does today);
-  `ssh-add -c`-style confirmation is the agent's business, not ours; a
-  machine whose devsandbox predates `agent-relay` (agent unavailable,
-  said once in `machine ls`).
+  `ssh-add -c`-style confirmation is the agent's business, not ours.
 - Docs: machines.md (*ssh*, a new *Agent* section), the helper's
   ssh-agent.md for the remote leg, api.md (`machines.set`), the CLI
-  reference/skill, CHANGELOG (behavior change: agent off by default).
+  reference/skill.
 
 ## 3. VS Code on a remote machine (rollout step 7, spike)
 
