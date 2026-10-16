@@ -164,6 +164,23 @@ limitation means editing this file in the same commit.
   the dashboard's `o` on a remote row answers "not supported yet" (its
   `p` and the CLI's `port` work); nameless commands are local only; no
   default machine. → [machines](architecture/daemon/machines.md); `machines::cli::route`, `not_yet_code`
+- A forward to a machine's service reached via an instance shows no
+  listening process (the header's `helper: false` gives
+  `ProcessLookup::None`; locally the `lsof` probe covers it).
+  → [forwards](architecture/daemon/forwards.md#remote-bridges); `tunnel::remote_opener`
+- A remote forward needs the machine's embedded helper to speak this
+  devsandbox's frame protocol; a mismatch is the bridge's version-mismatch
+  error ("update devsandbox on <machine>").
+  → [forwards](architecture/daemon/forwards.md#remote-bridges); `bridge::mismatch_message`
+- A remote forward to an unreachable machine re-spawns ssh after every
+  `RETRY` gap (2 s), with no backoff, until it's removed.
+  → [forwards](architecture/daemon/forwards.md#the-engine-forward); `forward::retry_gap`
+- The CLI's remote `port` waits `HEADER_WAIT` (10 s) for the tunnel header,
+  so an interactive ssh prompt (host key, password) that takes longer
+  fails. → [forwards](architecture/daemon/forwards.md#remote-bridges); `tunnel::remote_opener`
+- The npm client's `forwards.list(dir)` can't pass `machines` (the typed
+  `call('forwards.list', {machines: true})` can).
+  → [api](reference/api.md#forwards); `npm/devsandboxes/index.js`
 
 ### helper
 

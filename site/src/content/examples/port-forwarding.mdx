@@ -21,10 +21,12 @@ With an instance `api` running, from a host terminal (no config needed; runs unt
 devsandbox port api 3000                        # http://localhost:3000
 devsandbox port api 8080:3000                   # host :8080 -> api's :3000
 devsandbox port api --service postgres 5432     # a service api uses
+devsandbox port my-server/web 3000              # an instance on another machine
 ```
 
 - `--service`: forward a service's port instead of the instance's.
 - `--address`: the host address to bind (default `127.0.0.1`).
+- `--machine`: a global service on a [machine](/docs/host-daemon#other-machines) (`--machine my-server --service redis 6379`); the port still opens here.
 
 From the dashboard: `p` on an instance or service, type the port; live forwards are on the **Ports** tab (`3`). The [host daemon](/docs/host-daemon) keeps them, so they last after you close the dashboard and come back on the same host port, until `d` stops them; `devsandbox port` forwards only while it runs. To forward a port whenever the instance runs, add `forwardPorts = [3000]` to the sandbox ([`forwardPorts`](/docs/config#implemented-devcontainer-properties)).
 
@@ -33,4 +35,5 @@ From the dashboard: `p` on an instance or service, type the port; live forwards 
 - Each connection is tunnelled through the in-container helper, so a server on the container's `127.0.0.1` is reachable and nothing is published.
 - `--service` goes through a running instance that uses the service ([services](/docs/config#services-servicesname)).
 - A bare port taken on the host falls back to the next free one; the printed line says which.
+- On a machine, the same tunnel runs over one `ssh` per forward, reconnecting if it drops; its own `forwardPorts` aren't copied here.
 - Unix hosts, TCP only.

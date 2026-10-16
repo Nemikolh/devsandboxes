@@ -77,7 +77,7 @@ Tab `2` lists the service containers your sandboxes use: shared by every instanc
 
 ## Port forwards
 
-`p` prefills `:port web`: add a port and Enter, and it's on `127.0.0.1` on your machine. Forwards show in the Ports tab and are kept by the [host daemon](/docs/host-daemon), so they outlive the dashboard and come back on the same host port after a restart, until `d` stops one. A sandbox's `forwardPorts` are forwarded for you while its instance runs. Linux and macOS hosts.
+`p` prefills `:port web`: add a port and Enter, and it's on `127.0.0.1` on your machine. Forwards show in the Ports tab and are kept by the [host daemon](/docs/host-daemon), so they outlive the dashboard and come back on the same host port after a restart, until `d` stops one. A sandbox's `forwardPorts` are forwarded for you while its instance runs. `p` on a [machine](#other-machines)'s row works too: the port opens here, tunnelled over ssh. Linux and macOS hosts.
 
 <Try>`d` to stop it, then `1` `p`, type `8080:3000` and `enter`.</Try>
 
@@ -127,7 +127,7 @@ A script or an agent in a sandbox reaches you with `devsbd notify "tests pass"`.
 
 ## Other machines
 
-With [machines](/docs/host-daemon#other-machines) registered, the dashboard shows their sandboxes and instances too, with a MACHINE column (blank for this host's). Every key works on their rows, terminals included (over `ssh -t`), and `:` commands take `my-server/web-2`. A machine that's down keeps its last rows, shown `unreachable`; one not reached yet is a note in the header. `o` (VS Code) and `p` (port forwards) don't work on a machine's rows yet.
+With [machines](/docs/host-daemon#other-machines) registered, the dashboard shows their sandboxes and instances too, with a MACHINE column (blank for this host's). Every key works on their rows, terminals included (over `ssh -t`), and `:` commands take `my-server/web-2`. A machine that's down keeps its last rows, shown `unreachable`; one not reached yet is a note in the header. `p` forwards a port from a machine's row to this host, listed in the Ports tab with its MACHINE. `o` (VS Code) doesn't work on a machine's rows yet.
 
 ## Every key
 

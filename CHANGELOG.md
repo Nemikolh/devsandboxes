@@ -13,7 +13,7 @@ devsandbox rm web-4        # or remove everything it made
 
 ### Added
 
-- **Machines: sandboxes on other hosts, over ssh.** `devsandbox machine add <ssh target>` registers a host running devsandbox (its config roots are offered to pick from, or pass `--config '<path there>'`); `machine ls` shows each one's state, `machine rm` forgets it. Their sandboxes and instances then show in the dashboard next to yours, in a MACHINE column, and every key works on them, terminals included. On the CLI a name is looked up on every machine: one match is used wherever it is, `my-server/test` or `@/test` (this host) picks when it's ambiguous. Verbs run on the machine with its login shell's environment, only your ssh-agent is forwarded; `exec`, `logs`, `inspect`, `done` and `rename` run there over `ssh`. `--machine <name>` runs a command without a name there (`ps`, `ls`, `stop --all`, …). A machine that's down keeps its last rows, marked `unreachable`. Not yet on machines: port forwards, VS Code, the Inbox. Adding a machine means trusting it. Details: `docs/machines.md`.
+- **Machines: sandboxes on other hosts, over ssh.** `devsandbox machine add <ssh target>` registers a host running devsandbox (its config roots are offered to pick from, or pass `--config '<path there>'`); `machine ls` shows each one's state, `machine rm` forgets it. Their sandboxes and instances then show in the dashboard next to yours, in a MACHINE column, and every key works on them, terminals included. On the CLI a name is looked up on every machine: one match is used wherever it is, `my-server/test` or `@/test` (this host) picks when it's ambiguous. Verbs run on the machine with its login shell's environment, only your ssh-agent is forwarded; `exec`, `logs`, `inspect`, `done` and `rename` run there over `ssh`. `--machine <name>` runs a command without a name there (`ps`, `ls`, `stop --all`, …). A machine that's down keeps its last rows, marked `unreachable`. Not yet on machines: VS Code, the Inbox. Adding a machine means trusting it. Details: `docs/machines.md`.
 
 ```bash
 devsandbox machine add me@my-server
@@ -21,6 +21,17 @@ devsandbox run api              # `api` is only defined on my-server
 devsandbox exec test            # an instance there: over ssh
 devsandbox stop my-server/test  # qualified, when `test` exists here too
 ```
+
+- **Port forwards into a machine's sandboxes.** `devsandbox port my-server/web 3000` opens a port of an instance on a machine on this host, and `port --machine my-server --service redis 6379` one of its global services. In the dashboard, `p` on a machine's row does the same; the Ports tab lists those forwards with a MACHINE column, and like local ones they're kept by the host daemon and come back after it restarts. Each forward is tunnelled over your own `ssh` to the machine, reconnecting if it drops. A machine's `forwardPorts` stay on that machine: forwards into it are only the ones you ask for here. The machine needs this devsandbox version. Details: `docs/architecture/daemon/forwards.md`, *Remote bridges*.
+
+```bash
+devsandbox port my-server/web 3000
+devsandbox port --machine my-server --service redis 6379
+```
+
+- **Forwards show the listening process without `lsof`.** The process listening on a forwarded port (`node (pid 412)`) now comes from the in-container helper, so it shows in images that have no `lsof`, and on a machine's forwards too. Running instances pick up the new helper when restarted.
+
+- **API: forwards into machines.** `forwards.add` takes `machine` (the forward still binds on this host; `dir` is the config root there), `forwards.list` takes `machines: true` to include them, and forward rows carry `machine`. Details: `docs/reference/api.md`, *Forwards*.
 
 - **API: machines.** `machines.probe|add|list|get|rm`, `roots.list`, a `machine` param that runs a quick call or a verb on a machine, `machines: true` on `instances.watch` (rows tagged `machine`, plus each machine's link state), `instances.resolve` and `sandboxes.list` (every machine's matches), and `found` on `instances.resolve`'s answer. Details: `docs/api.md`, *Machines*.
 

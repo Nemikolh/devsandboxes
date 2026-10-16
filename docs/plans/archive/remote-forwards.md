@@ -1,7 +1,11 @@
+> Archived 2026-10-16. Historical, may be wrong; do not use as a reference.
+> Current: [architecture/daemon/forwards.md](../../architecture/daemon/forwards.md#remote-bridges),
+> [architecture/daemon/machines.md](../../architecture/daemon/machines.md)
+
 # Remote forwards
 
-Status: planned
-Item 1 of [machines-next](machines-next.md): `devsandbox port`, the
+Status: shipped
+Item 1 of [machines-next](../active/machines-next.md): `devsandbox port`, the
 dashboard's `p` / `:port` and the Ports tab work on a machine's instances.
 
 Scope: remote forwards are always asked for from this side (CLI or

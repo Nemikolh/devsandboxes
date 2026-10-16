@@ -78,8 +78,13 @@ that doesn't answer in time is not retried through `lsof`
 
 ## Remote bridges
 
-A forward into a machine's instance (machines.md) carries the same bridge
-mux over one ssh per bridge. `commands::tunnel::remote_opener(machine,
+A forward into a machine's instance (machines.md) is always asked for from
+this side (`devsandbox port`, `forwards.add` with `machine`) and owned
+here: a machine's `forwardPorts` are never mirrored locally, since a port
+exposed there doesn't mean it's wanted here. It carries the same bridge
+mux over one ssh per bridge, so a dead ssh is just a dead bridge: the
+supervisor opens a new one after its retry gap, like any other, until the
+forward stops. `commands::tunnel::remote_opener(machine,
 argv)` spawns `argv()`, rebuilt on every spawn (an `ssh::tunnel_argv`, so a
 changed registry entry heals at the next respawn), which runs the hidden
 `devsandbox -C <root> tunnel [--instance=<name>] [--service=<svc>] --port
@@ -174,8 +179,8 @@ change goes out as `forwards.changed`). `serve.log` names them
 ### Configured forwards (`forwardPorts`)
 
 A sandbox's `forwardPorts` entries (`[host:][service:]port`) are owned by
-the registry. Each host-poll pass hands it the running containers; for
-every config root recorded in `state.toml` it loads config and state,
+the registry. Each host-poll pass hands it this host's running containers;
+for every config root recorded in `state.toml` it loads config and state,
 starts missing forwards and stops those whose owner stopped or whose entry
 is gone. `Owner`: an instance entry or an isolated service's belongs to
 the instance; a global service's belongs to the config root (one forward,

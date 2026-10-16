@@ -41,9 +41,9 @@ runtime stays unsupported territory: WSL as a machine covers it.
 ## What doesn't (first cut)
 
 - **Port forwards**: need a local forwarder (`src/devsbd/forward.rs`,
-  unix-only) or `ssh -L` per port. `ssh -L` is the cheap first cut; remote
-  forwards on machines aren't built on unix either
-  ([machines-next](machines-next.md)).
+  unix-only) or `ssh -L` per port. `ssh -L` is the cheap first cut; on
+  unix, forwards into a machine run through that same local forwarder
+  ([forwards](../../architecture/daemon/forwards.md#remote-bridges)).
 - **VS Code `code`**: waits for the remote VS Code spike
   ([machines-next](machines-next.md)).
 - **Desktop notifications** (`src/desktop.rs`): none on Windows.
