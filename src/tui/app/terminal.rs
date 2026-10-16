@@ -11,6 +11,7 @@ use ratatui::widgets::Block;
 use crate::runtime::NAME_PREFIX;
 use crate::tui::data::{ContainerStatus, InstanceRow};
 use crate::tui::kitty;
+use crate::tui::remote::{self, instance_key, qualify, service_key};
 use crate::commands::exec::SHELL_FALLBACK_CMD;
 use crate::tui::select;
 use crate::tui::term::{encode_key, encode_mouse, encode_wheel, TermSession};
@@ -363,13 +364,16 @@ impl App {
                     .find(|(_, status)| matches!(status, ContainerStatus::Running(_)))
                     .map(|(name, _)| name.clone())
                     .ok_or_else(|| {
-                        format!("terminal: no running container for `{}`", row.name)
+                        format!("terminal: no running container for `{}`", service_key(row))
                     })?;
                 let title = container
                     .strip_prefix(NAME_PREFIX)
                     .unwrap_or(&container)
                     .to_string();
-                Ok((title, container, false))
+                // Keyed like instances: `box/…` on a machine (titles and the
+                // tab dedup).
+                let machine = row.machine.as_deref();
+                Ok((qualify(machine, &title), qualify(machine, &container), false))
             }
             // The Ports tab has no terminal target: forwards aren't containers.
             Tab::Ports => Err("terminal: not available on the Ports tab".to_string()),
@@ -389,10 +393,11 @@ impl App {
         self.open_terminal_to(target, force_new);
     }
 
-    /// Open (or focus) a terminal on instance `name`, whatever is selected:
-    /// the Inbox thread pane targets a thread's child, not a table row.
+    /// Open (or focus) a terminal on instance `name` (a key,
+    /// `remote::instance_key`), whatever is selected: the Inbox thread pane
+    /// targets a thread's child, not a table row.
     pub(super) fn open_instance_terminal(&mut self, name: &str) {
-        let target = match self.snapshot.as_ref().map(|s| s.instances.iter().find(|r| r.name == name)) {
+        let target = match self.snapshot.as_ref().map(|s| remote::find_instance(s, name)) {
             None => Err("terminal: no data yet".to_string()),
             Some(None) => Err(format!("terminal: `{name}` not in the snapshot")),
             Some(Some(row)) => instance_term_target(row),
@@ -453,15 +458,40 @@ impl App {
     /// service: a plain interactive runtime `exec` of the same shell, the
     /// binary named by the snapshot (`runtime_name` is the backend's `bin`
     /// for docker, podman and Apple's `container` alike).
+    ///
+    /// On a machine (a `box/…` key) either goes over ssh: the machine's
+    /// `devsandbox -C <its root> exec`, or its runtime's `exec`
+    /// (docs/machines.md, *Service tabs*).
     fn term_argv(&self, title: &str, container: &str, is_instance: bool) -> Result<Vec<String>, String> {
         if is_instance {
-            let cli = self.exec_cli.as_ref().map_err(|e| format!("terminal: {e}"))?;
-            return cli.argv(title, &[]).map_err(|e| format!("terminal: {e}"));
+            return self.exec_argv(title, &[]).map_err(|e| format!("terminal: {e}"));
+        }
+        if let (Some(machine), container) = remote::split(container) {
+            return remote::service_argv(self.machine_entry(machine)?, container).map_err(|e| format!("terminal: {e}"));
         }
         let snapshot = self.snapshot.as_ref().ok_or_else(|| "terminal: no data yet".to_string())?;
         let mut argv = vec![snapshot.runtime_name.clone(), "exec".into(), "-i".into(), "-t".into(), container.into()];
         argv.extend(SHELL_FALLBACK_CMD.iter().map(|s| s.to_string()));
         Ok(argv)
+    }
+
+    /// The `devsandbox exec` of instance `key` (a terminal tab, `:exec`):
+    /// this host's [`ExecCli`], or over ssh on its machine, against the
+    /// instance's root there.
+    pub fn exec_argv(&self, key: &str, command: &[String]) -> Result<Vec<String>, String> {
+        let (machine, name) = remote::split(key);
+        let Some(machine) = machine else {
+            return self.exec_cli.as_ref().map_err(String::clone)?.argv(name, command);
+        };
+        let entry = self.machine_entry(machine)?;
+        let snapshot = self.snapshot.as_ref().ok_or_else(|| "no data yet".to_string())?;
+        let root = remote::instance_route(snapshot, key).root.ok_or_else(|| format!("`{key}`: no root known on `{machine}`"))?;
+        remote::exec_argv(entry, &root, name, command)
+    }
+
+    /// Machine `name`'s snapshot entry (for its ssh argv).
+    fn machine_entry(&self, name: &str) -> Result<&crate::serve::snapshots::SnapshotMachine, String> {
+        remote::machine(&self.machines, name).ok_or_else(|| format!("no machine named `{name}`"))
     }
 }
 
@@ -473,12 +503,14 @@ fn body_cell(body: Rect, ev: &MouseEvent) -> (u16, u16) {
     (col, row)
 }
 
-/// Terminal target for an instance row, which must be running.
+/// Terminal target for an instance row, which must be running: its key
+/// (the title, `box/web-2` on a machine) and its container's.
 fn instance_term_target(row: &InstanceRow) -> Result<(String, String, bool), String> {
+    let key = instance_key(row);
     if !matches!(row.status, ContainerStatus::Running(_)) {
-        return Err(format!("terminal: `{}` is not running", row.name));
+        return Err(format!("terminal: `{key}` is not running"));
     }
-    Ok((row.name.clone(), row.container.clone(), true))
+    Ok((key, qualify(row.machine.as_deref(), &row.container), true))
 }
 
 #[cfg(test)]
@@ -996,6 +1028,41 @@ mod tests {
             app.term_target(),
             Ok(("svc-api-2".into(), "devsandbox-svc-api-2".into(), false))
         );
+    }
+
+    /// A machine's instance or service: keyed (title and dedup) by machine,
+    /// run over ssh: the machine's devsandbox in the instance's root, or
+    /// its runtime's `exec`.
+    #[test]
+    fn a_machines_rows_open_terminals_over_ssh() {
+        let mut app = machine_app();
+        app.exec_cli = Ok(cli());
+        app.selected[Tab::Instances.index()] = 5; // box/inst1
+        let target = app.term_target();
+        assert_eq!(target, Ok(("box/inst1".into(), "box/devsandbox-inst1".into(), true)));
+        let argv = app.term_argv("box/inst1", "box/devsandbox-inst1", true).unwrap();
+        assert_eq!(argv[..5], ["ssh", "-t", "-A", "--", "me@box"]);
+        assert!(argv[5].contains(r"'\''-C'\'' '\''/r/one'\'' '\''exec'\''"), "{}", argv[5]);
+        assert!(argv[5].ends_with(r"'\''--'\'' '\''inst1'\'''"), "{}", argv[5]);
+        // A local instance of the same name: this host's devsandbox.
+        assert_eq!(app.term_argv("inst1", "devsandbox-inst1", true).unwrap()[..4], ["/opt/bin/devsandbox", "-C", "/home/u/cfg", "exec"]);
+        // `:exec` too.
+        let exec = app.exec_argv("box/inst1", &["uname".into()]).unwrap();
+        assert!(exec[5].ends_with(r"'\''inst1'\'' '\''uname'\'''"), "{}", exec[5]);
+        assert_eq!(app.exec_argv("nope/x", &[]), Err("no machine named `nope`".into()));
+
+        // Dedup: box's tab doesn't stand for the local one's.
+        app.terms.open(term_sess("box/inst1", "box/devsandbox-inst1"));
+        assert_eq!(app.terms.find("devsandbox-inst1"), None);
+        assert_eq!(app.terms.find("box/devsandbox-inst1"), Some(0));
+
+        app.tab = Tab::Services;
+        let db = app.snapshot.as_ref().unwrap().services.iter().position(|s| s.name == "db").unwrap();
+        app.selected[Tab::Services.index()] = db;
+        assert_eq!(app.term_target(), Ok(("box/svc-db".into(), "box/devsandbox-svc-db".into(), false)));
+        let argv = app.term_argv("box/svc-db", "box/devsandbox-svc-db", false).unwrap();
+        assert_eq!(argv[..5], ["ssh", "-t", "-A", "--", "me@box"]);
+        assert!(argv[5].starts_with(r#"exec "$SHELL" -lc 'exec docker '\''exec'\'' '\''-i'\'' '\''-t'\'' '\''devsandbox-svc-db'\''"#), "{}", argv[5]);
     }
 
     fn cli() -> ExecCli {

@@ -17,6 +17,7 @@ mod markdown;
 mod poll;
 mod procs;
 mod prompt;
+mod remote;
 mod select;
 mod settings;
 mod spec;
@@ -286,8 +287,13 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
                 | PromptAction::Rm { .. }
                 | PromptAction::ServiceRebuild { .. }) => {
                     app.status = Some(verb_pending(&action));
-                    verbs.push((action.clone(), spawn_verb(&dir, action, verb_tty(size.width, size.height))));
+                    let route = app.snapshot.as_ref().map(|s| verb_route(s, &action)).unwrap_or_default();
+                    verbs.push((action.clone(), spawn_verb(&dir, action, verb_tty(size.width, size.height), route)));
                     procs_after_snapshot = true;
+                }
+                PromptAction::Code { instance, .. } if remote::split(&instance).0.is_some() => {
+                    let (machine, name) = remote::split(&instance);
+                    app.status = Some(app::not_yet_code(machine.unwrap_or_default(), name));
                 }
                 PromptAction::Code { instance, goto } => {
                     app.status = Some("opening VS Code…".into());
@@ -297,7 +303,11 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
                 // (`DaemonUpdate::Renamed`), the renamed row comes with a push.
                 PromptAction::Rename { instance, new_name } => daemon.rename(instance, new_name),
                 other => {
-                    run_suspended(terminal, &app.exec_cli, other)?;
+                    let argv = match &other {
+                        PromptAction::Exec { instance, argv } => app.exec_argv(instance, argv),
+                        _ => Err("not a command to suspend for".into()),
+                    };
+                    run_suspended(terminal, argv)?;
                     // Redraw from scratch: the child scribbled over the screen.
                     terminal.clear()?;
                     procs_after_snapshot = true;
@@ -314,7 +324,8 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
             daemon.set_done(req);
         }
         for fetch in app.take_pending_fetch() {
-            daemon.fetch(fetch);
+            let route = app.snapshot.as_ref().map(|s| fetch_route(s, &fetch)).unwrap_or_default();
+            daemon.fetch(fetch, route);
         }
         // `d` on an in-flight row, confirmed: the daemon SIGINTs its build
         // (`instances.cancel`, whoever started it).
@@ -346,8 +357,9 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
             match update {
                 daemon::DaemonUpdate::InboxChanged => reload_inbox = true,
                 daemon::DaemonUpdate::Ports(rows) => app.set_ports(rows),
-                daemon::DaemonUpdate::Snapshot(list) => {
+                daemon::DaemonUpdate::Snapshot(list, machines) => {
                     app.snapshot_error = None;
+                    app.machines = machines;
                     app.thread_children = list.thread_children;
                     app.set_snapshot(list.snapshot);
                     if std::mem::take(&mut procs_after_snapshot) {
@@ -489,36 +501,25 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
     Ok(())
 }
 
-/// Leave the TUI, run a prompt command with inherited stdio, wait for one
-/// keypress, then re-enter the TUI. `exec` is `devsandbox exec` as a child
-/// (`cli`), so the dashboard reads no state for it: the CLI prints its own
-/// errors above the prompt, and only a child that can't start is ours to
-/// print. Never propagated, so a failed `exec` returns to the dashboard.
-fn run_suspended(terminal: &mut Term, cli: &Result<ExecCli, String>, action: PromptAction) -> Result<()> {
+/// Leave the TUI, run a prompt command (`argv`, `:exec`'s, or why there's
+/// none) with inherited stdio, wait for one keypress, then re-enter the
+/// TUI. `exec` is `devsandbox exec` as a child (`App::exec_argv`: over ssh
+/// for a machine's instance), so the dashboard reads no state for it: the
+/// CLI prints its own errors above the prompt, and only a child that can't
+/// start is ours to print. Never propagated, so a failed `exec` returns to
+/// the dashboard. The verbs go to the daemon (`spawn_verb`), `code`/
+/// `rename` never suspend, and `port` goes to `pending_port`: only `exec`
+/// gets here.
+fn run_suspended(terminal: &mut Term, argv: std::result::Result<Vec<String>, String>) -> Result<()> {
     restore();
 
-    let result = match &action {
-        PromptAction::Exec { instance, argv } => cli.as_ref().map_err(|e| anyhow::anyhow!("{e}")).and_then(|cli| {
-            let argv = cli.argv(instance, argv).map_err(|e| anyhow::anyhow!("{e}"))?;
-            std::process::Command::new(&argv[0])
-                .args(&argv[1..])
-                .status()
-                .map(|_| ())
-                .with_context(|| format!("failed to run {}", argv[0]))
-        }),
-        // The verbs go to the daemon (`spawn_verb`), `code`/`rename` never
-        // suspend: the caller handles them. `port` never reaches here —
-        // `App` routes it to `pending_port`, not `pending_action`.
-        PromptAction::Run { .. }
-        | PromptAction::Rebuild { .. }
-        | PromptAction::Start { .. }
-        | PromptAction::Stop { .. }
-        | PromptAction::Rm { .. }
-        | PromptAction::ServiceRebuild { .. }
-        | PromptAction::Code { .. }
-        | PromptAction::Rename { .. }
-        | PromptAction::Port { .. } => Ok(()),
-    };
+    let result = argv.map_err(|e| anyhow::anyhow!("{e}")).and_then(|argv| {
+        std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .status()
+            .map(|_| ())
+            .with_context(|| format!("failed to run {}", argv[0]))
+    });
     if let Err(e) = result {
         eprintln!("error: {e:#}");
     }
@@ -693,6 +694,69 @@ fn verb_call(
     Some((method, params.expect("verb params serialize")))
 }
 
+/// Where verb `action` goes: its target row's machine and root there
+/// (`remote::Route`; the default for this host's rows).
+fn verb_route(s: &data::Snapshot, action: &PromptAction) -> remote::Route {
+    match action {
+        PromptAction::Run { sandbox, .. } => remote::sandbox_route(s, sandbox),
+        PromptAction::Rebuild { instance, .. }
+        | PromptAction::Start { instance }
+        | PromptAction::Stop { instance }
+        | PromptAction::Rm { instance, .. } => remote::instance_route(s, instance),
+        PromptAction::ServiceRebuild { name } => remote::service_route(s, name),
+        _ => remote::Route::default(),
+    }
+}
+
+/// Where a modal's read goes: a remote config read needs the row's root
+/// there (the rest only their machine, from the target's key).
+fn fetch_route(s: &data::Snapshot, fetch: &app::Fetch) -> remote::Route {
+    match fetch {
+        app::Fetch::Config { kind: app::ConfigKind::Sandbox, name } => remote::sandbox_route(s, name),
+        app::Fetch::Config { kind: app::ConfigKind::Service, name } => remote::service_route(s, name),
+        app::Fetch::Logs { .. } | app::Fetch::Inspect { .. } => remote::Route::default(),
+    }
+}
+
+/// `action` as its machine takes it: the target's key (`box/web-2`) back
+/// to the name there.
+fn unqualified(action: &PromptAction) -> PromptAction {
+    let bare = |key: &str| remote::split(key).1.to_string();
+    match action.clone() {
+        PromptAction::Run { sandbox, name, branch, base } => PromptAction::Run { sandbox: bare(&sandbox), name, branch, base },
+        PromptAction::Rebuild { instance, force } => PromptAction::Rebuild { instance: bare(&instance), force },
+        PromptAction::Start { instance } => PromptAction::Start { instance: bare(&instance) },
+        PromptAction::Stop { instance } => PromptAction::Stop { instance: bare(&instance) },
+        PromptAction::Rm { instance, force, delete_branch } => {
+            PromptAction::Rm { instance: bare(&instance), force, delete_branch }
+        }
+        PromptAction::ServiceRebuild { name } => PromptAction::ServiceRebuild { name: bare(&name) },
+        other => other,
+    }
+}
+
+/// The verb request for `action` on `route`: [`verb_call`] in this host's
+/// `root`, or, for a machine's row, in its root there with `machine` set
+/// (the local daemon forwards it, docs/machines.md F6). `Err`: a machine's
+/// row with no root known.
+fn routed_verb_call(
+    action: &PromptAction,
+    root: &Path,
+    route: &remote::Route,
+    env: BTreeMap<String, String>,
+    tty: crate::serve::verbs::TtySize,
+) -> Result<(&'static str, serde_json::Value)> {
+    let Some(machine) = &route.machine else {
+        return verb_call(action, root, env, tty).context("not a verb");
+    };
+    let Some(remote_root) = &route.root else {
+        anyhow::bail!("no config root known on machine `{machine}`");
+    };
+    let (method, mut params) = verb_call(&unqualified(action), Path::new(remote_root), env, tty).context("not a verb")?;
+    params["machine"] = machine.as_str().into();
+    Ok((method, params))
+}
+
 /// How a verb request ended, for [`App::verb_answered`]: rm's `confirm` (its
 /// branch question, to a modal) for an rm that asked, else
 /// [`verb_status`]'s line.
@@ -771,13 +835,21 @@ fn verb_status(action: &PromptAction, sent: Result<crate::serve::client::Streame
 /// (`stop`, `rm`, `services.rebuild`) answers when done. Quitting the
 /// dashboard before the answer hangs up, which cancels nothing: every
 /// dashboard verb is sent with `detach`, so the daemon leaves it running.
-fn spawn_verb(dir: &Path, action: PromptAction, tty: crate::serve::verbs::TtySize) -> Receiver<VerbEnd> {
+///
+/// `route`: a machine's row goes there (`routed_verb_call`); its status
+/// lines keep the qualified name (`stopped box/web-2`).
+fn spawn_verb(
+    dir: &Path,
+    action: PromptAction,
+    tty: crate::serve::verbs::TtySize,
+    route: remote::Route,
+) -> Receiver<VerbEnd> {
     let (tx, rx) = mpsc::channel();
     let root = daemon::root_dir(dir.to_path_buf());
     std::thread::spawn(move || {
         use crate::serve::{client, endpoint, verbs_client};
         let env = verbs_client::caller_env(std::env::vars_os());
-        let sent = verb_call(&action, &root, env, tty).context("not a verb").and_then(|(method, params)| {
+        let sent = routed_verb_call(&action, &root, &route, env, tty).and_then(|(method, params)| {
             let mut conn = endpoint::socket_dir().and_then(|socket| client::connect(&socket, "tui"))?;
             conn.call_streaming(method, params, Duration::from_secs(1), &mut |_| true)
         });
@@ -823,6 +895,58 @@ mod tests {
             branch: branch.map(String::from),
             base: base.map(String::from),
         }
+    }
+
+    /// A machine's row: the verb goes to it (`machine`) in the row's root
+    /// there, naming the target as the machine knows it; this host's rows
+    /// as before; a machine with no root known can't be asked. Modal reads
+    /// of a machine's sandbox carry its root too.
+    #[test]
+    fn verbs_on_a_machines_rows_carry_machine_and_root() {
+        use crate::serve::snapshots::tests::{row, snapshot};
+        let mut remote = row("web-2", true, None);
+        remote.machine = Some("box".into());
+        remote.root = Some("/r/two".into());
+        let mut orphan = row("old", true, None);
+        orphan.machine = Some("far".into());
+        let mut s = snapshot(vec![row("web-2", true, None), remote, orphan], false);
+        s.sandboxes = vec![serde_json::from_value(serde_json::json!({
+            "name": "web", "source": "image x", "folder": null, "services": [], "extends": [],
+            "config_hash": "", "build_hash": "", "issues": [], "dispatcher": false,
+            "worktree_branch": null, "root": "/r/one", "machine": "box",
+        }))
+        .unwrap()];
+        let root = Path::new("/here");
+        let env = BTreeMap::new();
+        let tty = verb_tty(100, 40);
+        let call = |action: &PromptAction| {
+            let route = verb_route(&s, action);
+            routed_verb_call(action, root, &route, env.clone(), tty).map(|(m, p)| (m, p["root"].clone(), p["machine"].clone(), p))
+        };
+        let (method, root_param, machine, params) = call(&PromptAction::Stop { instance: "box/web-2".into() }).unwrap();
+        assert_eq!((method, root_param, machine), ("stop", "/r/two".into(), "box".into()));
+        assert_eq!(params["instance"], "web-2");
+        let (_, root_param, machine, params) = call(&PromptAction::Stop { instance: "web-2".into() }).unwrap();
+        assert_eq!((root_param, machine, &params["instance"]), ("/here".into(), serde_json::Value::Null, &"web-2".into()));
+        let (method, root_param, machine, params) = call(&run_action(None, None, None)).unwrap();
+        assert_eq!((method, root_param, machine, &params["sandbox"]), ("run", "/here".into(), serde_json::Value::Null, &"web".into()));
+        let remote_run = PromptAction::Run { sandbox: "box/web".into(), name: None, branch: None, base: None };
+        let (_, root_param, machine, params) = call(&remote_run).unwrap();
+        assert_eq!((root_param, machine, &params["sandbox"]), ("/r/one".into(), "box".into(), &"web".into()));
+        // Minus the routing param, the request the machine would get from
+        // its own dashboard.
+        let (method, mut params) = routed_verb_call(&remote_run, root, &verb_route(&s, &remote_run), env.clone(), tty).unwrap();
+        params.as_object_mut().unwrap().remove("machine");
+        assert_eq!((method, params), verb_call(&run_action(None, None, None), Path::new("/r/one"), env.clone(), tty).unwrap());
+        let err = call(&PromptAction::Rm { instance: "far/old".into(), force: false, delete_branch: None }).unwrap_err();
+        assert_eq!(err.to_string(), "no config root known on machine `far`");
+        // Its status lines keep the qualified name.
+        assert_eq!(verb_pending(&PromptAction::Stop { instance: "box/web-2".into() }), "stopping box/web-2…");
+
+        let config = app::Fetch::Config { kind: app::ConfigKind::Sandbox, name: "box/web".into() };
+        assert_eq!(fetch_route(&s, &config), remote::Route { machine: Some("box".into()), root: Some("/r/one".into()) });
+        let logs = app::Fetch::Logs { container: "box/devsandbox-web-2".into() };
+        assert_eq!(fetch_route(&s, &logs), remote::Route::default());
     }
 
     /// Each verb action's request carries the root and env and is what the

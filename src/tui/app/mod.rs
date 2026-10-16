@@ -38,7 +38,7 @@ pub use inbox::{
     View,
 };
 pub use forms::{form_lines, form_title, forms_offset, pinned_forms, FormSpot};
-pub use actions::{PendingDone, VerbEnd};
+pub use actions::{PendingDone, VerbEnd, not_yet_code};
 pub use procs::{PendingSignal, Signal};
 pub use selection::{copy_key_intercepted, Extract};
 pub use terminal::ExecCli;
@@ -214,6 +214,10 @@ pub struct App {
     /// next push: the header marks the kept snapshot stale with it, or with
     /// none yet the tree says it in place of the rows.
     pub snapshot_error: Option<crate::tui::data::FetchError>,
+    /// The registered machines' link states, from the last snapshot
+    /// (docs/machines.md, step 6). Empty without any: the tree is exactly
+    /// as before machines (no machine column).
+    pub machines: Vec<crate::serve::snapshots::SnapshotMachine>,
     /// Seconds east of UTC for Inbox timestamps; the event loop sets it once
     /// at startup (0 = UTC when unknown).
     pub utc_offset: i64,
@@ -307,6 +311,7 @@ impl App {
             pending_open: None,
             thread_children: BTreeMap::new(),
             snapshot_error: None,
+            machines: Vec::new(),
             utc_offset: 0,
             status: None,
             dragging_divider: false,

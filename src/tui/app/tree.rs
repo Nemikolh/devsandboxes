@@ -2,6 +2,7 @@
 //! parent jumps.
 
 use crate::tui::data::{Node, ORPHANS_NAME};
+use crate::tui::remote::{instance_key, sandbox_key};
 
 use super::{App, Tab};
 
@@ -29,7 +30,7 @@ impl App {
     fn collapse_key(&self, node: Node) -> Option<String> {
         let snapshot = self.snapshot.as_ref()?;
         match node {
-            Node::Sandbox(i) => snapshot.sandboxes.get(i).map(|s| s.name.clone()),
+            Node::Sandbox(i) => snapshot.sandboxes.get(i).map(sandbox_key),
             Node::Orphans => Some(ORPHANS_NAME.to_string()),
             Node::Instance(_) | Node::Empty(_) | Node::Proc { .. } => None,
         }
@@ -136,12 +137,13 @@ impl App {
         }
     }
 
-    /// Name of the instance under the cursor, whether the selected node is the
+    /// Key of the instance under the cursor (its name; `box/web-2` on a
+    /// machine, `remote::instance_key`), whether the selected node is the
     /// instance row itself or one of its process rows. `None` otherwise.
     pub(super) fn selected_instance_name(&self) -> Option<String> {
         let snapshot = self.snapshot.as_ref()?;
         let idx = self.selected_instance_index()?;
-        snapshot.instances.get(idx).map(|r| r.name.clone())
+        snapshot.instances.get(idx).map(instance_key)
     }
 
     /// Visible-node position of `Node::Instance(instance)`, for jumping a process
@@ -305,5 +307,35 @@ mod tests {
         // Third Left: instance → parent sandbox.
         app.on_key(key(KeyCode::Left));
         assert_eq!(app.selected_node(), Some(Node::Sandbox(0)));
+    }
+
+    /// The same sandbox and instance names on two machines are two groups,
+    /// the machine's after this host's, folded and expanded on their own.
+    #[test]
+    fn same_names_on_two_machines_are_separate_groups() {
+        let mut app = machine_app();
+        let tree = [Node::Sandbox(0), Node::Instance(0), Node::Instance(1), Node::Sandbox(1), Node::Instance(2), Node::Instance(3)];
+        assert_eq!(app.visible_nodes(), tree);
+        // A machine's sandboxes go after this host's whatever the order.
+        let mut s = app.snapshot.clone().unwrap();
+        s.sandboxes.reverse();
+        s.instances.reverse();
+        app.set_snapshot(s);
+        assert_eq!(app.visible_nodes()[0], Node::Sandbox(1));
+        app.set_snapshot(machine_app().snapshot.unwrap());
+
+        // Fold box's `s`: the local one stays open.
+        app.selected[Tab::Instances.index()] = 3;
+        app.on_key(key(KeyCode::Char(' ')));
+        assert!(app.collapsed.contains("box/s"));
+        assert_eq!(app.visible_nodes(), tree[..4]);
+        app.on_key(key(KeyCode::Char(' ')));
+
+        // box/inst0's processes are its own.
+        app.selected[Tab::Instances.index()] = 4;
+        assert_eq!(app.selected_instance_name().as_deref(), Some("box/inst0"));
+        app.on_key(key(KeyCode::Right));
+        assert!(app.expanded_procs.contains("box/inst0") && !app.expanded_procs.contains("inst0"));
+        assert_eq!(app.visible_nodes()[5], Node::Proc { instance: 2, row: crate::tui::procs::MESSAGE_ROW });
     }
 }

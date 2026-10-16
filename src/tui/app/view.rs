@@ -13,6 +13,7 @@ use crate::snapshot::PhaseRow;
 use crate::tui::data::{ContainerStatus, InstanceRow, Node};
 use crate::tui::settings::{SETTINGS, Settings};
 use crate::tui::prompt::PromptAction;
+use crate::tui::remote::{instance_key, qualify, sandbox_key, service_key};
 
 use super::{App, Tab};
 
@@ -638,16 +639,19 @@ impl App {
         let Some(row) = self.snapshot.as_ref().and_then(|s| s.instances.get(i)) else {
             return;
         };
-        let title = build_log_title(&row.name, row.phase.as_ref());
+        let name = instance_key(row);
+        // Ids are per host: keyed like names (`box/<id>` on a machine).
+        let id = qualify(row.machine.as_deref(), &row.instance_id);
+        let title = build_log_title(&name, row.phase.as_ref());
         let (body, read) = if row.instance_id.is_empty() {
-            (format!("(no build log: `{}` is not a recorded instance)", row.name), None)
+            (format!("(no build log: `{name}` is not a recorded instance)"), None)
         } else {
-            ("(loading…)".to_string(), Some(row.instance_id.clone()))
+            ("(loading…)".to_string(), Some(id.clone()))
         };
         self.pending_build_log = read;
         self.modal = Modal::BuildLog(BuildLogModal {
-            instance: row.name.clone(),
-            instance_id: row.instance_id.clone(),
+            instance: name,
+            instance_id: if row.instance_id.is_empty() { String::new() } else { id },
             text: TextModal::new(title, body),
             styled: Vec::new(),
             stick: true,
@@ -736,15 +740,19 @@ impl App {
         let row = self
             .snapshot
             .as_ref()
-            .and_then(|s| s.instances.iter().find(|r| !view.instance_id.is_empty() && r.instance_id == view.instance_id));
+            .and_then(|s| {
+                s.instances.iter().find(|r| {
+                    !view.instance_id.is_empty() && qualify(r.machine.as_deref(), &r.instance_id) == view.instance_id
+                })
+            });
         let Some(row) = row else {
             // Removed (a cancelled `run` takes its record and log along):
             // what was read stays up, nothing more to follow.
             view.live = false;
             return;
         };
-        view.instance.clone_from(&row.name);
-        view.text.title = build_log_title(&row.name, row.phase.as_ref());
+        view.instance = instance_key(row);
+        view.text.title = build_log_title(&view.instance, row.phase.as_ref());
         let was = std::mem::replace(&mut view.live, matches!(row.phase, Some(PhaseRow::InFlight { .. })));
         if was || view.live {
             self.pending_build_log = Some(view.instance_id.clone());
@@ -807,7 +815,7 @@ impl App {
         let Some(row) = snapshot.instances.get(i) else {
             return;
         };
-        let container = row.container.clone();
+        let container = qualify(row.machine.as_deref(), &row.container);
         self.open_logs_for(&container);
     }
 
@@ -883,19 +891,19 @@ impl App {
             Tab::Instances => {
                 let (name, target) = match self.selected_node() {
                     Some(Node::Sandbox(i)) | Some(Node::Empty(i)) => {
-                        let name = snapshot.sandboxes.get(i).map(|s| s.name.clone());
+                        let name = snapshot.sandboxes.get(i).map(sandbox_key);
                         let target = name
                             .as_deref()
                             .and_then(|n| inspect_target(&snapshot.instances, Target::Sandbox(n)));
                         (name, target)
                     }
                     Some(Node::Instance(i)) => {
-                        let name = snapshot.instances.get(i).map(|r| r.sandbox.clone());
+                        let name = snapshot.instances.get(i).map(|r| qualify(r.machine.as_deref(), &r.sandbox));
                         let target = inspect_target(&snapshot.instances, Target::Instance(i));
                         (name, target)
                     }
                     Some(Node::Proc { instance, .. }) => {
-                        let name = snapshot.instances.get(instance).map(|r| r.sandbox.clone());
+                        let name = snapshot.instances.get(instance).map(|r| qualify(r.machine.as_deref(), &r.sandbox));
                         let target =
                             inspect_target(&snapshot.instances, Target::Instance(instance));
                         (name, target)
@@ -911,8 +919,8 @@ impl App {
                 let Some(row) = snapshot.services.get(self.selected()) else {
                     return;
                 };
-                let target = service_inspect_target(&row.containers);
-                (ConfigKind::Service, row.name.clone(), target)
+                let target = service_inspect_target(&row.containers).map(|c| qualify(row.machine.as_deref(), &c));
+                (ConfigKind::Service, service_key(row), target)
             }
             // The Ports and Inbox tabs have no config to explore; `e` is a
             // no-op (`enter` on the Inbox focuses the thread instead).
@@ -954,20 +962,23 @@ impl App {
 enum Target<'a> {
     /// An instance row by index: inspect its own container.
     Instance(usize),
-    /// A sandbox by name: inspect its first running instance's container.
+    /// A sandbox by key (`remote::sandbox_key`): inspect its first running
+    /// instance's container.
     Sandbox(&'a str),
 }
 
 /// Container to `docker inspect` for an Instances-tab target, or `None` when
 /// there is none (an unknown index, or a sandbox with no running instance).
-/// Pure over the instance rows so the per-node-kind pick is testable.
+/// Pure over the instance rows so the per-node-kind pick is testable. The
+/// container is keyed like an instance (`box/devsandbox-web` on a machine).
 fn inspect_target(instances: &[InstanceRow], target: Target) -> Option<String> {
+    let container = |r: &InstanceRow| qualify(r.machine.as_deref(), &r.container);
     match target {
-        Target::Instance(i) => instances.get(i).map(|r| r.container.clone()),
-        Target::Sandbox(name) => instances
+        Target::Instance(i) => instances.get(i).map(container),
+        Target::Sandbox(key) => instances
             .iter()
-            .find(|r| r.sandbox == name && matches!(r.status, ContainerStatus::Running(_)))
-            .map(|r| r.container.clone()),
+            .find(|r| qualify(r.machine.as_deref(), &r.sandbox) == key && matches!(r.status, ContainerStatus::Running(_)))
+            .map(container),
     }
 }
 

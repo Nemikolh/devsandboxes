@@ -110,7 +110,17 @@ fn tab_bar_areas(app: &App, area: Rect) -> (Rect, Rect, Option<String>) {
     let totals = app
         .snapshot
         .as_ref()
-        .map(|s| totals_line(s, s.collected_at.elapsed(), app.snapshot_error.as_ref()));
+        .map(|s| {
+            let line = totals_line(s, s.collected_at.elapsed(), app.snapshot_error.as_ref());
+            // A machine with no rows yet says why in place of its rows, when
+            // that leaves the tabs their room.
+            let tabs_w = tab_spans(app).last().map_or(0, |(_, _, r)| r.end);
+            let with = |why| super::remote::pending_note(&app.machines, s, why).map(|note| format!("{note} · {line}"));
+            match with(true) {
+                Some(full) if tabs_w + full.chars().count() as u16 + 2 <= area.width => full,
+                _ => with(false).unwrap_or(line),
+            }
+        });
     let totals_w = totals.as_deref().map_or(0, |t| t.chars().count() as u16);
     // Leave a gap before the totals; drop them entirely when the row is too narrow.
     let reserve = if totals_w > 0 && area.width > totals_w + 4 {
@@ -1633,7 +1643,7 @@ fn draw_instances(frame: &mut Frame, app: &App, area: Rect) {
             (None, None) => "loading…".to_string(),
         };
         draw_empty(frame, table_area, panel_focused, &message);
-        draw_detail(frame, snapshot, None, None, detail_area, panel_focused);
+        draw_detail(frame, snapshot, None, None, &app.machines, detail_area, panel_focused);
         selectable(app, RegionId::InstancesTree, table_area);
         selectable(app, RegionId::Detail, detail_area);
     } else {
@@ -1644,7 +1654,7 @@ fn draw_instances(frame: &mut Frame, app: &App, area: Rect) {
         // from the proc cache; `None` until its forest is fetched.
         let agent_count = match selected {
             Some(Node::Instance(i)) | Some(Node::Proc { instance: i, .. }) => {
-                snapshot.instances.get(i).and_then(|r| app.agent_count(&r.name))
+                snapshot.instances.get(i).and_then(|r| app.agent_count(&super::remote::instance_key(r)))
             }
             _ => None,
         };
@@ -1653,6 +1663,7 @@ fn draw_instances(frame: &mut Frame, app: &App, area: Rect) {
             Some(snapshot),
             selected,
             agent_count,
+            &app.machines,
             detail_area,
             panel_focused,
         );
@@ -1690,7 +1701,13 @@ fn draw_tree(
     let show_type = snapshot.sandboxes.iter().any(|s| s.dispatcher);
     let mut titles = vec!["TREE", "STATUS", "UPTIME", "CPU", "MEM", "FOLDER", "SERVICES"];
     // STATUS widens only while a phase (`postCreateCommand`, …) needs it.
-    let status = snapshot.instances.iter().map(|r| r.status_label().chars().count()).max().unwrap_or(0).max(9);
+    let status = snapshot
+        .instances
+        .iter()
+        .map(|r| instance_status_label(app, r).chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(9);
     let mut widths = vec![
         Constraint::Min(20),
         Constraint::Length(status as u16),
@@ -1714,12 +1731,28 @@ fn draw_tree(
         titles.extend(["TYPE", ""]);
         widths.extend([Constraint::Length(10), Constraint::Min(0)]);
     }
+    // MACHINE only once a machine is registered (docs/machines.md): without
+    // one the tree is exactly as before.
+    let show_machine = !app.machines.is_empty();
+    if show_machine {
+        let width = app.machines.iter().map(|m| m.name.chars().count()).max().unwrap_or(0).max("MACHINE".len());
+        titles.insert(1, "MACHINE");
+        widths.insert(1, Constraint::Length(width as u16));
+    }
     let header = Row::new(titles.into_iter().map(Cell::from))
         .style(Style::default().add_modifier(Modifier::DIM));
 
     let table_rows: Vec<Row> = nodes
         .iter()
-        .map(|node| tree_row(app, snapshot, *node, show_type))
+        .map(|node| {
+            let cells = tree_cells(app, snapshot, *node, show_type);
+            let (cells, style) = match cells {
+                Some((cells, style)) => (cells, style),
+                None => return Row::new(vec![Cell::from("")]),
+            };
+            let cells = if show_machine { with_machine_cell(cells, node_machine(snapshot, *node)) } else { cells };
+            Row::new(cells).style(style)
+        })
         .collect();
 
     let block = Block::default()
@@ -1739,51 +1772,69 @@ fn draw_tree(
     frame.render_stateful_widget(table, area, &mut state);
 }
 
-/// Render one tree node into a table row. Sandbox / orphan-group rows carry their
-/// stats in the STATUS column and leave the instance columns blank; instance
-/// rows fill the columns and indent the TREE cell. `show_type`: the TYPE column
-/// is present (some sandbox is a dispatcher).
-fn tree_row<'a>(app: &App, snapshot: &'a Snapshot, node: Node, show_type: bool) -> Row<'a> {
+/// The MACHINE cell's text for `node`: its machine's name, blank for this
+/// host's rows and for rows that span machines (the orphan group).
+fn node_machine(snapshot: &Snapshot, node: Node) -> Option<String> {
     match node {
-        Node::Sandbox(i) => match snapshot.sandboxes.get(i) {
-            Some(sb) => sandbox_tree_row(app, snapshot, sb),
-            None => Row::new(vec![Cell::from("")]),
-        },
-        Node::Instance(i) => match snapshot.instances.get(i) {
-            Some(inst) => instance_tree_row(
+        Node::Sandbox(i) => snapshot.sandboxes.get(i)?.machine.clone(),
+        Node::Instance(i) => snapshot.instances.get(i)?.machine.clone(),
+        Node::Empty(_) | Node::Proc { .. } | Node::Orphans => None,
+    }
+}
+
+/// `cells` with the MACHINE cell after TREE. A one-cell row (a message
+/// spanning the TREE column) stays as is.
+fn with_machine_cell(mut cells: Vec<Cell<'_>>, machine: Option<String>) -> Vec<Cell<'_>> {
+    if cells.len() > 1 {
+        let text = Span::styled(machine.unwrap_or_default(), Style::default().fg(ACCENT));
+        cells.insert(1, Cell::from(text));
+    }
+    cells
+}
+
+/// Render one tree node into a table row's cells and style (`None`: an
+/// index out of range). Sandbox / orphan-group rows carry their stats in the
+/// STATUS column and leave the instance columns blank; instance rows fill the
+/// columns and indent the TREE cell. `show_type`: the TYPE column is present
+/// (some sandbox is a dispatcher).
+fn tree_cells<'a>(app: &App, snapshot: &'a Snapshot, node: Node, show_type: bool) -> Option<(Vec<Cell<'a>>, Style)> {
+    Some(match node {
+        Node::Sandbox(i) => (sandbox_tree_row(app, snapshot, i, snapshot.sandboxes.get(i)?), Style::default()),
+        Node::Instance(i) => {
+            let inst = snapshot.instances.get(i)?;
+            instance_tree_row(
                 inst,
+                instance_status_label(app, inst),
                 app.inbox.needs_you_for(&inst.instance_id),
                 super::data::dispatcher_label(inst, &snapshot.instances),
                 show_type.then(|| {
-                    let dispatcher = snapshot
-                        .sandboxes
-                        .iter()
-                        .any(|s| s.name == inst.sandbox && s.dispatcher);
+                    let group = super::data::group_of(&snapshot.sandboxes, inst);
+                    let dispatcher = group.is_some_and(|g| snapshot.sandboxes[g].dispatcher);
                     if dispatcher { "dispatcher" } else { "-" }
                 }),
-            ),
-            None => Row::new(vec![Cell::from("")]),
-        },
+            )
+        }
         Node::Empty(i) => {
-            let name = snapshot.sandboxes.get(i).map_or("", |s| s.name.as_str());
-            Row::new(vec![Cell::from(Span::styled(
+            let name = snapshot.sandboxes.get(i).map(super::remote::sandbox_key).unwrap_or_default();
+            let cells = vec![Cell::from(Span::styled(
                 format!("    no instances — : run {name}"),
                 Style::default().add_modifier(Modifier::DIM),
-            ))])
+            ))];
+            (cells, Style::default())
         }
-        Node::Proc { instance, row } => proc_tree_row(app, snapshot, instance, row),
+        Node::Proc { instance, row } => (proc_tree_row(app, snapshot, instance, row), Style::default()),
         Node::Orphans => {
             let count = snapshot
                 .instances
                 .iter()
-                .filter(|inst| !snapshot.sandboxes.iter().any(|s| s.name == inst.sandbox))
+                .filter(|inst| super::data::group_of(&snapshot.sandboxes, inst).is_none())
                 .count();
             let marker = if app.is_collapsed_group(super::data::ORPHANS_NAME) {
                 '▸'
             } else {
                 '▾'
             };
-            Row::new(vec![
+            let cells = vec![
                 Cell::from(Span::styled(
                     format!("{marker} (not in config)"),
                     Style::default().add_modifier(Modifier::DIM),
@@ -1792,20 +1843,24 @@ fn tree_row<'a>(app: &App, snapshot: &'a Snapshot, node: Node, show_type: bool) 
                     format!("{count} orphan"),
                     Style::default().add_modifier(Modifier::DIM),
                 )),
-            ])
+            ];
+            (cells, Style::default())
         }
-    }
+    })
 }
 
-fn sandbox_tree_row<'a>(app: &App, snapshot: &Snapshot, sb: &'a SandboxRow) -> Row<'a> {
-    let collapsed = app.is_collapsed_group(&sb.name);
+/// Sandbox row `si`'s (instances, running), over [`super::data::group_of`].
+fn group_counts(snapshot: &Snapshot, si: usize) -> (usize, usize) {
+    let members = snapshot.instances.iter().filter(|r| super::data::group_of(&snapshot.sandboxes, r) == Some(si));
+    members.fold((0, 0), |(total, running), r| {
+        (total + 1, running + usize::from(matches!(r.status, ContainerStatus::Running(_))))
+    })
+}
+
+fn sandbox_tree_row<'a>(app: &App, snapshot: &Snapshot, si: usize, sb: &'a SandboxRow) -> Vec<Cell<'a>> {
+    let collapsed = app.is_collapsed_group(&super::remote::sandbox_key(sb));
     let marker = if collapsed { '▸' } else { '▾' };
-    let total = snapshot.instances.iter().filter(|r| r.sandbox == sb.name).count();
-    let running = snapshot
-        .instances
-        .iter()
-        .filter(|r| r.sandbox == sb.name && matches!(r.status, ContainerStatus::Running(_)))
-        .count();
+    let (total, running) = group_counts(snapshot, si);
     let stats = sandbox_stats(total, running);
     // Green when any running, dim when the sandbox has no instances at all.
     let stats_style = if running > 0 {
@@ -1815,7 +1870,7 @@ fn sandbox_tree_row<'a>(app: &App, snapshot: &Snapshot, sb: &'a SandboxRow) -> R
     } else {
         Style::default()
     };
-    Row::new(vec![
+    vec![
         Cell::from(Span::styled(
             format!("{marker} {}", sb.name),
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
@@ -1826,7 +1881,7 @@ fn sandbox_tree_row<'a>(app: &App, snapshot: &Snapshot, sb: &'a SandboxRow) -> R
         Cell::from(""),
         Cell::from(source_folder_cell(sb)),
         Cell::from(""),
-    ])
+    ]
 }
 
 /// Combined source + folder for the sandbox row's FOLDER column: source colored
@@ -1846,14 +1901,17 @@ fn source_folder_cell(sb: &SandboxRow) -> Line<'static> {
 /// `unread`: the instance's Inbox threads waiting on the user (needs-you
 /// threads + unread notify records), shown as a yellow `✉N` after the name. `owner`: a dispatcher child's dim
 /// `⇠ <dispatcher>` suffix (`data::dispatcher_label`). `kind`: the TYPE cell,
-/// `None` when that column is hidden.
+/// `None` when that column is hidden. `status`: the STATUS text
+/// ([`instance_status_label`]).
 fn instance_tree_row(
     r: &InstanceRow,
+    status: &str,
     unread: usize,
     owner: Option<String>,
     kind: Option<&'static str>,
-) -> Row<'static> {
-    let status = Cell::from(Span::styled(r.status_label().to_string(), instance_status_style(r)));
+) -> (Vec<Cell<'static>>, Style) {
+    let style = if status == UNREACHABLE { status_style(&ContainerStatus::Missing) } else { instance_status_style(r) };
+    let status = Cell::from(Span::styled(status.to_string(), style));
     let folder = if r.worktree {
         format!("⎇ {}", r.folder)
     } else {
@@ -1887,7 +1945,17 @@ fn instance_tree_row(
     cells.extend(kind.map(Cell::from));
     // Done: kept as is until removed, so it stays listed but recedes.
     let style = if r.done { Style::default().add_modifier(Modifier::DIM) } else { Style::default() };
-    Row::new(cells).style(style)
+    (cells, style)
+}
+
+/// The STATUS of a row whose machine isn't connected (docs/machines.md):
+/// its last known row, styled like `missing`.
+const UNREACHABLE: &str = "unreachable";
+
+/// An instance's STATUS text: [`UNREACHABLE`] on a machine that isn't
+/// connected, else its phase or container status.
+fn instance_status_label<'a>(app: &App, r: &'a InstanceRow) -> &'a str {
+    if super::remote::unreachable(&app.machines, r.machine.as_deref()) { UNREACHABLE } else { r.status_label() }
 }
 
 /// Render a process row (or its placeholder) for the instance at `instance`.
@@ -1895,10 +1963,10 @@ fn instance_tree_row(
 /// than the instance row) and the `\_`-indented args in the FOLDER column; the
 /// status/uptime/cpu/mem columns stay empty. A [`ProcState::Message`] (and the
 /// `MESSAGE_ROW` placeholder) renders as one dim message in the TREE column.
-fn proc_tree_row<'a>(app: &App, snapshot: &'a Snapshot, instance: usize, row: usize) -> Row<'a> {
+fn proc_tree_row<'a>(app: &App, snapshot: &'a Snapshot, instance: usize, row: usize) -> Vec<Cell<'a>> {
     let dim = Style::default().add_modifier(Modifier::DIM);
-    let name = snapshot.instances.get(instance).map(|r| r.name.as_str());
-    let state = name.and_then(|n| app.procs.get(n));
+    let key = snapshot.instances.get(instance).map(super::remote::instance_key);
+    let state = key.and_then(|k| app.procs.get(&k));
 
     // A real process row: only when we have a Rows state and a valid index.
     if row != MESSAGE_ROW {
@@ -1919,7 +1987,7 @@ fn proc_tree_row<'a>(app: &App, snapshot: &'a Snapshot, instance: usize, row: us
                 } else {
                     Cell::from(Span::styled(format!("{indent}{}", p.args), dim))
                 };
-                return Row::new(vec![
+                return vec![
                     pid,
                     Cell::from(""),
                     Cell::from(""),
@@ -1927,7 +1995,7 @@ fn proc_tree_row<'a>(app: &App, snapshot: &'a Snapshot, instance: usize, row: us
                     Cell::from(""),
                     args,
                     Cell::from(""),
-                ]);
+                ];
             }
         }
     }
@@ -1937,7 +2005,7 @@ fn proc_tree_row<'a>(app: &App, snapshot: &'a Snapshot, instance: usize, row: us
         Some(ProcState::Message(m)) => m.clone(),
         _ => "(loading…)".to_string(),
     };
-    Row::new(vec![Cell::from(Span::styled(format!("      {msg}"), dim))])
+    vec![Cell::from(Span::styled(format!("      {msg}"), dim))]
 }
 
 /// An instance's STATUS style: its phase's while set (yellow in flight, bold
@@ -1969,6 +2037,7 @@ fn draw_detail(
     snapshot: Option<&Snapshot>,
     node: Option<Node>,
     agent_count: Option<usize>,
+    machines: &[crate::serve::snapshots::SnapshotMachine],
     area: Rect,
     term_focused: bool,
 ) {
@@ -1980,13 +2049,17 @@ fn draw_detail(
     let lines: Vec<Line> = match (snapshot, node) {
         (Some(s), Some(Node::Sandbox(i))) | (Some(s), Some(Node::Empty(i))) => {
             match s.sandboxes.get(i) {
-                Some(sb) => sandbox_detail(s, sb),
+                Some(sb) => sandbox_detail(s, i, sb),
                 None => Vec::new(),
             }
         }
         (Some(s), Some(Node::Instance(i)))
         | (Some(s), Some(Node::Proc { instance: i, .. })) => match s.instances.get(i) {
-            Some(r) => instance_detail(r, agent_count),
+            Some(r) => {
+                let mut lines = machine_detail(machines, r.machine.as_deref());
+                lines.extend(instance_detail(r, agent_count));
+                lines
+            }
             None => Vec::new(),
         },
         (_, Some(Node::Orphans)) => vec![Line::from(Span::styled(
@@ -2001,13 +2074,8 @@ fn draw_detail(
 
 /// Sandbox summary: source, folder, services, extends chain, config hash, and
 /// instance counts.
-fn sandbox_detail<'a>(snapshot: &Snapshot, sb: &'a SandboxRow) -> Vec<Line<'a>> {
-    let total = snapshot.instances.iter().filter(|r| r.sandbox == sb.name).count();
-    let running = snapshot
-        .instances
-        .iter()
-        .filter(|r| r.sandbox == sb.name && matches!(r.status, ContainerStatus::Running(_)))
-        .count();
+fn sandbox_detail<'a>(snapshot: &Snapshot, si: usize, sb: &'a SandboxRow) -> Vec<Line<'a>> {
+    let (total, running) = group_counts(snapshot, si);
     let services = if sb.services.is_empty() {
         "-".to_string()
     } else {
@@ -2035,6 +2103,18 @@ fn sandbox_detail<'a>(snapshot: &Snapshot, sb: &'a SandboxRow) -> Vec<Line<'a>> 
         )));
     }
     lines
+}
+
+/// A machine row's first Detail line while its machine isn't connected:
+/// why (the link's `error`), the row being its last known one.
+fn machine_detail(machines: &[crate::serve::snapshots::SnapshotMachine], machine: Option<&str>) -> Vec<Line<'static>> {
+    let Some(name) = machine.filter(|m| super::remote::unreachable(machines, Some(m))) else { return Vec::new() };
+    let why = super::remote::machine(machines, name).and_then(|m| m.error.as_deref().map(|e| super::remote::why_of(name, e)));
+    let text = match why {
+        Some(why) => format!("{name} unreachable: {why} (last known)"),
+        None => format!("{name} unreachable (last known)"),
+    };
+    vec![Line::from(Span::styled(text, Style::default().fg(Color::Red)))]
 }
 
 fn instance_detail(r: &InstanceRow, agent_count: Option<usize>) -> Vec<Line<'_>> {
@@ -2910,6 +2990,48 @@ mod tests {
         assert_eq!(style(0), Style::default().fg(Color::Red).add_modifier(Modifier::BOLD));
         assert_eq!(style(1), Style::default().fg(Color::Yellow));
         assert_eq!(style(2), Style::default().fg(Color::Green));
+    }
+
+    /// The MACHINE column only with a machine registered; a machine that
+    /// isn't connected shows its rows `unreachable` (Detail: why), and one
+    /// with no rows yet a note before the totals.
+    #[test]
+    fn machine_rows_get_a_column_and_unreachable_status() {
+        use crate::serve::snapshots::LinkState;
+        use crate::tui::remote::tests::sm;
+        let mut app = phase_app(vec![("web", running(), None)]);
+        let alone = render(&app, 200, 30);
+        assert!(!alone.contains("MACHINE"), "{alone}");
+
+        let mut s = app.snapshot.clone().unwrap();
+        let mut remote = s.instances[0].clone();
+        remote.machine = Some("box".into());
+        let mut sandbox = s.sandboxes[0].clone();
+        sandbox.machine = Some("box".into());
+        s.instances.push(remote);
+        s.sandboxes.push(sandbox);
+        let mut boxed = sm("box", LinkState::Unreachable);
+        boxed.error = Some("Connection refused".into());
+        app.machines = vec![boxed, sm("new", LinkState::Connecting)];
+        app.set_snapshot(s);
+        for _ in 0..3 {
+            app.on_key(KeyEvent::from(KeyCode::Down)); // onto box's web
+        }
+        let screen = render(&app, 200, 30);
+        let header = screen.lines().find(|l| l.contains("TREE")).unwrap();
+        assert!(header.contains("TREE") && header.contains(" MACHINE ") && header.contains("STATUS"), "{screen}");
+        let rows: Vec<&str> = screen.lines().filter(|l| l.contains("  web ")).collect();
+        assert_eq!(rows.len(), 2, "{screen}");
+        assert!(rows[0].contains(" running ") && !rows[0].contains("box"), "local first: {screen}");
+        assert!(rows[1].contains(" box ") && rows[1].contains(" unreachable "), "{screen}");
+        assert!(screen.contains("box unreachable: Connection refused (last known)"), "{screen}");
+        assert!(screen.contains("new: connecting · 1 sandbox"), "{screen}");
+
+        // Connected again: its own status.
+        app.machines[0].state = LinkState::Connected;
+        let screen = render(&app, 200, 30);
+        let rows: Vec<&str> = screen.lines().filter(|l| l.contains("  web ")).collect();
+        assert!(rows[1].contains(" running "), "{screen}");
     }
 
     fn running() -> ContainerStatus {

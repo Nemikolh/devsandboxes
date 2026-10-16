@@ -5,6 +5,7 @@
 use crate::snapshot::{InstanceRow, PhaseRow};
 use crate::tui::data::ContainerStatus;
 use crate::tui::prompt::PromptAction;
+use crate::tui::remote::instance_key;
 
 use super::{App, PortRequest};
 
@@ -18,6 +19,16 @@ fn busy(row: &InstanceRow) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// VS Code on a machine's instance: not yet (docs/machines.md, step 7).
+pub fn not_yet_code(machine: &str, name: &str) -> String {
+    format!("code {machine}/{name}: VS Code on a machine isn't supported yet")
+}
+
+/// Forwards from a machine: not yet (docs/machines.md, *Not now*).
+pub fn not_yet_port(machine: &str, name: &str) -> String {
+    format!("port {machine}/{name}: forwarding from a machine isn't supported yet")
 }
 
 /// How a verb request the event loop sent for a [`PromptAction`] ended.
@@ -58,12 +69,12 @@ impl App {
         let Some(row) = self.snapshot.as_ref().and_then(|s| s.instances.get(i)) else {
             return;
         };
+        let key = instance_key(row);
         if busy(row).is_some() {
-            let name = row.name.clone();
-            self.confirm_cancel_build(name);
+            self.confirm_cancel_build(key);
             return;
         }
-        self.pending_action = Some(PromptAction::Rm { instance: row.name.clone(), force: false, delete_branch: None });
+        self.pending_action = Some(PromptAction::Rm { instance: key, force: false, delete_branch: None });
     }
 
     /// Queue a done-flag write for `instance` on behalf of an Inbox thread
@@ -111,6 +122,10 @@ impl App {
         let Some(row) = snapshot.instances.get(i) else {
             return;
         };
+        if let Some(m) = &row.machine {
+            self.status = Some(not_yet_code(m, &row.name));
+            return;
+        }
         self.pending_action = Some(PromptAction::Code { instance: row.name.clone(), goto: None });
     }
 
@@ -143,7 +158,7 @@ impl App {
         let Some(row) = snapshot.instances.get(i) else {
             return;
         };
-        let name = row.name.clone();
+        let name = instance_key(row);
         if self.stopping.contains(&name) || self.starting.contains(&name) {
             return;
         }
@@ -361,6 +376,49 @@ mod tests {
         assert_eq!(app.status.as_deref(), Some("stopping inst0…"));
         assert_eq!(app.take_pending_action(), Some(PromptAction::Stop { instance: "inst0".into() }));
         assert_eq!(app.take_pending_action(), None);
+    }
+
+    /// A machine's row: the actions name it qualified (the event loop
+    /// routes it, `tui::verb_route`), its in-flight guard is its own, and
+    /// VS Code isn't offered yet.
+    #[test]
+    fn actions_on_a_machines_row_queue_its_key() {
+        let mut app = machine_app();
+        app.selected[Tab::Instances.index()] = 5; // box/inst1
+        app.on_key(key(KeyCode::Char('s')));
+        assert_eq!(app.status.as_deref(), Some("stopping box/inst1…"));
+        assert!(app.stopping.contains("box/inst1") && !app.stopping.contains("inst1"));
+        assert_eq!(app.take_pending_action(), Some(PromptAction::Stop { instance: "box/inst1".into() }));
+        // The local `inst1` isn't guarded by box's.
+        app.selected[Tab::Instances.index()] = 2;
+        app.on_key(key(KeyCode::Char('s')));
+        assert_eq!(app.take_pending_action(), Some(PromptAction::Stop { instance: "inst1".into() }));
+
+        app.selected[Tab::Instances.index()] = 4; // box/inst0
+        app.on_key(key(KeyCode::Char('d')));
+        assert_eq!(
+            app.take_pending_action(),
+            Some(PromptAction::Rm { instance: "box/inst0".into(), force: false, delete_branch: None })
+        );
+        app.on_key(key(KeyCode::Char('o')));
+        assert_eq!(app.take_pending_action(), None);
+        assert_eq!(app.status.as_deref(), Some("code box/inst0: VS Code on a machine isn't supported yet"));
+        app.on_key(key(KeyCode::Char('p')));
+        assert!(app.prompt.is_none());
+        assert_eq!(app.status.as_deref(), Some("port box/inst0: forwarding from a machine isn't supported yet"));
+
+        // Reads name the remote target by key; the daemon worker splits it.
+        app.on_key(key(KeyCode::Char('l')));
+        assert_eq!(app.take_pending_fetch(), [Fetch::Logs { container: "box/devsandbox-inst0".into() }]);
+        app.modal = Modal::None;
+        app.on_key(key(KeyCode::Char('e')));
+        assert_eq!(
+            app.take_pending_fetch(),
+            [
+                Fetch::Config { kind: ConfigKind::Sandbox, name: "box/s".into() },
+                Fetch::Inspect { container: "box/devsandbox-inst0".into() },
+            ]
+        );
     }
 
     #[test]

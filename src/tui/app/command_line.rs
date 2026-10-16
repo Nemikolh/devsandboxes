@@ -8,9 +8,41 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::commands::run::DEFAULT_WORKTREE_BRANCH;
 use crate::tui::data::{Node, SandboxRow};
 use crate::tui::prompt::{commands, Prompt, PromptAction};
+use crate::tui::remote;
 use crate::tui::spec;
 
 use super::{App, PortRequest, Tab};
+
+/// `action`'s typed names as row keys (`remote::resolve`): a bare name
+/// unique across machines, `box/web`, `@/web`. `services`: a `rebuild`
+/// names a service (the Services tab). `Err`: the line to show.
+fn resolve_action(s: &crate::snapshot::Snapshot, action: PromptAction, services: bool) -> Result<PromptAction, String> {
+    use remote::{Kind, resolve};
+    let inst = |name: String| resolve(s, &name, Kind::Instance);
+    Ok(match action {
+        PromptAction::Run { sandbox, name, branch, base } => {
+            PromptAction::Run { sandbox: resolve(s, &sandbox, Kind::Sandbox)?, name, branch, base }
+        }
+        PromptAction::Exec { instance, argv } => PromptAction::Exec { instance: inst(instance)?, argv },
+        PromptAction::Code { instance, goto } => PromptAction::Code { instance: inst(instance)?, goto },
+        PromptAction::Rename { instance, new_name } => PromptAction::Rename { instance: inst(instance)?, new_name },
+        PromptAction::Rm { instance, force, delete_branch } => PromptAction::Rm { instance: inst(instance)?, force, delete_branch },
+        PromptAction::Stop { instance } => PromptAction::Stop { instance: inst(instance)? },
+        PromptAction::Start { instance } => PromptAction::Start { instance: inst(instance)? },
+        PromptAction::Rebuild { instance, force } if services => {
+            PromptAction::Rebuild { instance: resolve(s, &instance, Kind::Service)?, force }
+        }
+        PromptAction::Rebuild { instance, force } => PromptAction::Rebuild { instance: inst(instance)?, force },
+        PromptAction::ServiceRebuild { name } => PromptAction::ServiceRebuild { name: resolve(s, &name, Kind::Service)? },
+        // An empty instance is a service-only forward.
+        PromptAction::Port { instance, service, address, spec } if instance.is_empty() => {
+            PromptAction::Port { instance, service, address, spec }
+        }
+        PromptAction::Port { instance, service, address, spec } => {
+            PromptAction::Port { instance: inst(instance)?, service, address, spec }
+        }
+    })
+}
 
 impl App {
     /// Open the command prompt, loading persisted history. Clears any status.
@@ -27,12 +59,12 @@ impl App {
         self.status = None;
         let sandbox = self.snapshot.as_ref().and_then(|snapshot| {
             match self.selected_node() {
-                Some(Node::Sandbox(i)) | Some(Node::Empty(i)) => {
-                    snapshot.sandboxes.get(i).map(|s| s.name.clone())
+                Some(Node::Sandbox(i)) | Some(Node::Empty(i)) => snapshot.sandboxes.get(i).map(remote::sandbox_key),
+                Some(Node::Instance(i)) => {
+                    snapshot.instances.get(i).map(|r| remote::qualify(r.machine.as_deref(), &r.sandbox))
                 }
-                Some(Node::Instance(i)) => snapshot.instances.get(i).map(|r| r.sandbox.clone()),
                 Some(Node::Proc { instance, .. }) => {
-                    snapshot.instances.get(instance).map(|r| r.sandbox.clone())
+                    snapshot.instances.get(instance).map(|r| remote::qualify(r.machine.as_deref(), &r.sandbox))
                 }
                 Some(Node::Orphans) | None => None,
             }
@@ -72,6 +104,10 @@ impl App {
     /// The prompt prefilled `port <name> `, whatever is selected (the Inbox
     /// thread pane's `p` targets the thread's child).
     pub(super) fn open_port_prompt_for(&mut self, name: &str) {
+        if let (Some(machine), name) = remote::split(name) {
+            self.status = Some(super::actions::not_yet_port(machine, name));
+            return;
+        }
         self.status = None;
         let history = crate::tui::prompt::load_history();
         self.prompt = Some(Prompt::with_input(history, format!("port {name} ")));
@@ -90,6 +126,10 @@ impl App {
         else {
             return;
         };
+        if let Some(machine) = &row.machine {
+            self.status = Some(super::actions::not_yet_port(machine, &row.name));
+            return;
+        }
         let instance = row.used_by.first().map(String::as_str).unwrap_or("");
         let svc = row.name.clone();
         self.status = None;
@@ -127,6 +167,18 @@ impl App {
                     return;
                 };
                 if let Some(action) = prompt.parse() {
+                    // Typed names (`web`, `box/web`, `@/web`) as row keys.
+                    let services = self.tab == Tab::Services;
+                    let action = match &self.snapshot {
+                        Some(s) => match resolve_action(s, action, services) {
+                            Ok(action) => action,
+                            Err(why) => {
+                                prompt.error = Some(why);
+                                return;
+                            }
+                        },
+                        None => action,
+                    };
                     let line = prompt.input().to_string();
                     crate::tui::prompt::append_history(&line);
                     // `port` is not a suspending action: it goes to the forwarder
@@ -134,8 +186,12 @@ impl App {
                     // the Ports tab. Handled before the generic `pending_action`
                     // path so the loop never suspends the screen for it.
                     if let PromptAction::Port { instance, service, address, spec } = action {
-                        self.request_port(PortRequest { instance, service, address, spec });
                         self.prompt = None;
+                        if let (Some(machine), name) = remote::split(&instance) {
+                            self.status = Some(super::actions::not_yet_port(machine, name));
+                            return;
+                        }
+                        self.request_port(PortRequest { instance, service, address, spec });
                         return;
                     }
                     // `rebuild`/`recreate` parses tab-agnostically as an instance
@@ -161,7 +217,7 @@ impl App {
                 // for the positional argument, `worktree-branch` for
                 // `--branch` values.
                 let rows = self.snapshot.as_ref().map(|s| s.sandboxes.as_slice()).unwrap_or_default();
-                let sandboxes: Vec<String> = rows.iter().map(|r| r.name.clone()).collect();
+                let sandboxes = self.snapshot.as_ref().map(|s| remote::candidates(s, remote::Kind::Sandbox)).unwrap_or_default();
                 let branches = Self::worktree_branches(rows);
                 if let Some(prompt) = &mut self.prompt {
                     prompt.complete(|idx, tokens| {
@@ -205,7 +261,7 @@ impl App {
     /// Each sandbox's resolved `worktree-branch`, for `--branch` values; a
     /// sandbox without one (or that doesn't resolve) gets the default.
     fn worktree_branches(rows: &[SandboxRow]) -> BTreeMap<String, String> {
-        rows.iter().filter_map(|r| Some((r.name.clone(), r.worktree_branch.clone()?))).collect()
+        rows.iter().filter_map(|r| Some((remote::sandbox_key(r), r.worktree_branch.clone()?))).collect()
     }
 
     /// Candidate list for the token at `idx` of the whitespace-split `tokens`
@@ -318,19 +374,14 @@ impl App {
         out
     }
 
-    /// Instance names from the latest snapshot (empty until one lands).
+    /// Instance names from the latest snapshot (empty until one lands), a
+    /// machine's qualified (`box/web-2`).
     fn instance_names(&self) -> Vec<String> {
-        self.snapshot
-            .as_ref()
-            .map(|s| s.instances.iter().map(|r| r.name.clone()).collect())
-            .unwrap_or_default()
+        self.snapshot.as_ref().map(|s| remote::candidates(s, remote::Kind::Instance)).unwrap_or_default()
     }
 
     fn service_names(&self) -> Vec<String> {
-        self.snapshot
-            .as_ref()
-            .map(|s| s.services.iter().map(|r| r.name.clone()).collect())
-            .unwrap_or_default()
+        self.snapshot.as_ref().map(|s| remote::candidates(s, remote::Kind::Service)).unwrap_or_default()
     }
 
     /// Take the pending action for the event loop to execute, if any.
@@ -368,6 +419,47 @@ mod tests {
         // Submitting a forward switches to the Ports tab with a status line.
         assert_eq!(app.tab, Tab::Ports);
         assert_eq!(app.status.as_deref(), Some("forwarding 3000 …"));
+    }
+
+    /// Typed names resolve across machines: a bare one when unique, `box/`
+    /// and `@/` where they say; an ambiguous one keeps the prompt open with
+    /// the qualified names. Completion offers a machine's rows qualified.
+    #[test]
+    fn prompt_names_resolve_across_machines() {
+        let submit = |app: &mut App, line: &str| {
+            app.on_key(key(KeyCode::Char(':')));
+            for c in line.chars() {
+                app.on_key(key(KeyCode::Char(c)));
+            }
+            app.on_key(key(KeyCode::Enter));
+            app.take_pending_action()
+        };
+        let mut app = machine_app();
+        assert_eq!(submit(&mut app, "stop inst0"), None);
+        assert_eq!(prompt(&app).error.as_deref(), Some("`inst0` is on several machines: @/inst0, box/inst0"));
+        app.prompt = None;
+        assert_eq!(submit(&mut app, "stop box/inst0"), Some(PromptAction::Stop { instance: "box/inst0".into() }));
+        assert_eq!(submit(&mut app, "start @/inst1"), Some(PromptAction::Start { instance: "inst1".into() }));
+        assert_eq!(
+            submit(&mut app, "run box/s"),
+            Some(PromptAction::Run { sandbox: "box/s".into(), name: None, branch: None, base: None })
+        );
+        // Unique across machines: bare is enough.
+        let mut s = app.snapshot.clone().unwrap();
+        s.instances.retain(|r| !(r.machine.is_none() && r.name == "inst1"));
+        app.set_snapshot(s);
+        assert_eq!(submit(&mut app, "rm inst1"), Some(PromptAction::Rm { instance: "box/inst1".into(), force: false, delete_branch: None }));
+        assert_eq!(submit(&mut app, "port box/inst1 3000"), None);
+        assert_eq!(app.take_pending_port(), None);
+        assert_eq!(app.status.as_deref(), Some("port box/inst1: forwarding from a machine isn't supported yet"));
+
+        let app = machine_app();
+        let sandboxes = remote::candidates(app.snapshot.as_ref().unwrap(), remote::Kind::Sandbox);
+        let instances = app.instance_names();
+        assert_eq!(sandboxes, ["s", "box/s"]);
+        assert_eq!(instances, ["inst0", "inst1", "box/inst0", "box/inst1"]);
+        let got = App::candidates_for(Tab::Instances, 1, &toks("stop "), &sandboxes, &instances, &[], &BTreeMap::new());
+        assert_eq!(got, instances);
     }
 
     #[test]

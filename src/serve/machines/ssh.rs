@@ -134,7 +134,6 @@ pub fn api_argv(entry: &Entry, client: &str) -> Result<Vec<OsString>> {
 /// The argv of an interactive command on `entry` (a terminal tab, a CLI
 /// re-exec): `ssh -t -A [-p N] -- <host> <devsandbox remote_args…>`. No
 /// `BatchMode`: a person is there to answer ssh's prompts.
-#[allow(dead_code)] // built ahead of its caller: step 6 of docs/machines.md
 pub fn tty_argv(entry: &Entry, remote_args: &[impl AsRef<str>]) -> Result<Vec<OsString>> {
     cli_argv(entry, true, remote_args)
 }
@@ -147,7 +146,18 @@ pub fn cli_argv(entry: &Entry, tty: bool, remote_args: &[impl AsRef<str>]) -> Re
     argv(entry, &[if tty { "-t" } else { "-T" }, "-A"], remote_args)
 }
 
+/// [`tty_argv`] running `program` on `entry` instead of its devsandbox: a
+/// dashboard service tab's `<runtime> exec -it …` (docs/machines.md,
+/// *Service tabs*). `program` is shell text, like `entry`'s `command`.
+pub fn tty_argv_with(entry: &Entry, program: &str, remote_args: &[impl AsRef<str>]) -> Result<Vec<OsString>> {
+    argv_with(entry, &["-t", "-A"], program, remote_args)
+}
+
 fn argv(entry: &Entry, opts: &[&str], remote_args: &[impl AsRef<str>]) -> Result<Vec<OsString>> {
+    argv_with(entry, opts, entry.command(), remote_args)
+}
+
+fn argv_with(entry: &Entry, opts: &[&str], program: &str, remote_args: &[impl AsRef<str>]) -> Result<Vec<OsString>> {
     let target = parse_target(&entry.target)?;
     let mut argv: Vec<OsString> = ["ssh"].iter().chain(opts).map(OsString::from).collect();
     if let Some(port) = target.port {
@@ -155,7 +165,7 @@ fn argv(entry: &Entry, opts: &[&str], remote_args: &[impl AsRef<str>]) -> Result
     }
     // `--`: the host can't be read as an option (parse_target refuses a
     // leading `-` too).
-    argv.extend(["--".into(), target.host.into(), remote_command(entry.command(), remote_args).into()]);
+    argv.extend(["--".into(), target.host.into(), remote_command(program, remote_args).into()]);
     Ok(argv)
 }
 

@@ -37,7 +37,7 @@ use super::ssh::Dial;
 use crate::serve::api::ApiError;
 use crate::serve::endpoint::Stream;
 use crate::serve::proto::Response;
-use crate::serve::snapshots::{LinkState, Remotes};
+use crate::serve::snapshots::{self, LinkState, Remotes};
 
 /// The link's clocks; [`Timing::default`] in production, short in tests.
 #[derive(Debug, Clone, Copy)]
@@ -530,14 +530,17 @@ impl<'a> LinkLoop<'a> {
     }
 
     /// A pushed snapshot of one of the machine's roots: its rows now.
-    fn store(&self, params: Value) {
+    fn store(&self, mut params: Value) {
         let Some(dir) = params.get("dir").and_then(Value::as_str).map(PathBuf::from) else { return };
         if !self.entry.roots.contains(&dir) {
             return;
         }
-        let params = Arc::new(params);
+        // A reconnect's first push is disk-depth: keep the last statuses.
         self.inner.remotes.update(&self.entry.name, |m| {
-            m.rows.insert(dir, params);
+            if let Some(prev) = m.rows.get(&dir) {
+                snapshots::carry_remote_status(prev, &mut params);
+            }
+            m.rows.insert(dir, Arc::new(params));
         });
         (self.inner.hooks.changed)();
     }

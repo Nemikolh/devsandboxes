@@ -72,14 +72,45 @@ pub enum Node {
     Proc { instance: usize, row: usize },
 }
 
+/// The sandbox row instance `inst` groups under: the same machine's sandbox
+/// of its name (docs/machines.md: a group per (machine, sandbox)), the one
+/// from its own root when a machine has two roots defining it. `None`: an
+/// orphan.
+pub fn group_of(sandboxes: &[SandboxRow], inst: &InstanceRow) -> Option<usize> {
+    let same = |s: &SandboxRow| s.machine == inst.machine && s.name == inst.sandbox;
+    if inst.machine.is_some() && inst.root.is_some() {
+        if let Some(i) = sandboxes.iter().position(|s| same(s) && s.root == inst.root) {
+            return Some(i);
+        }
+    }
+    sandboxes.iter().position(same)
+}
+
+/// The sandbox rows in tree order: this host's in config order, then each
+/// machine's, by machine and name.
+pub fn sandbox_order(sandboxes: &[SandboxRow]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..sandboxes.len()).collect();
+    // Stable: local rows (`None` sorts first) keep their config order.
+    order.sort_by(|&a, &b| {
+        let key = |i: usize| match &sandboxes[i].machine {
+            None => (None, ""),
+            Some(m) => (Some(m.as_str()), sandboxes[i].name.as_str()),
+        };
+        key(a).cmp(&key(b))
+    });
+    order
+}
+
 /// Flatten the tree into the visible node list, in render/selection order.
 ///
-/// Sandboxes appear in config order; an expanded sandbox lists its instances (in
-/// `instances` order) as children, or one [`Node::Empty`] child when it has
-/// none. Instances whose `sandbox` matches no [`SandboxRow`] group under a
-/// trailing [`Node::Orphans`] header (keyed by [`ORPHANS_NAME`] in `collapsed`),
-/// which only appears when such instances exist. A name in `collapsed` hides a
-/// node's children.
+/// Sandboxes appear in [`sandbox_order`]; an expanded sandbox lists its
+/// instances ([`group_of`], in `instances` order) as children, or one
+/// [`Node::Empty`] child when it has none. Instances with no sandbox row group
+/// under a trailing [`Node::Orphans`] header (keyed by [`ORPHANS_NAME`] in
+/// `collapsed`), which only appears when such instances exist: one group for
+/// every machine, this host's first (a machine column says whose). A sandbox's
+/// key (`remote::sandbox_key`) in `collapsed` hides its children; processes
+/// are keyed by `remote::instance_key`.
 pub fn visible_nodes(
     sandboxes: &[SandboxRow],
     instances: &[InstanceRow],
@@ -88,16 +119,16 @@ pub fn visible_nodes(
     procs: &BTreeMap<String, ProcState>,
 ) -> Vec<Node> {
     let mut nodes = Vec::new();
-    let configured: BTreeSet<&str> = sandboxes.iter().map(|s| s.name.as_str()).collect();
+    let groups: Vec<Option<usize>> = instances.iter().map(|inst| group_of(sandboxes, inst)).collect();
 
-    for (si, sb) in sandboxes.iter().enumerate() {
+    for si in sandbox_order(sandboxes) {
         nodes.push(Node::Sandbox(si));
-        if collapsed.contains(&sb.name) {
+        if collapsed.contains(&super::remote::sandbox_key(&sandboxes[si])) {
             continue;
         }
         let mut any = false;
         for (ii, inst) in instances.iter().enumerate() {
-            if inst.sandbox == sb.name {
+            if groups[ii] == Some(si) {
                 nodes.push(Node::Instance(ii));
                 push_proc_nodes(&mut nodes, ii, inst, expanded_procs, procs);
                 any = true;
@@ -108,13 +139,10 @@ pub fn visible_nodes(
         }
     }
 
-    // Orphans: instances whose sandbox is not configured, grouped at the bottom.
-    let orphans: Vec<usize> = instances
-        .iter()
-        .enumerate()
-        .filter(|(_, inst)| !configured.contains(inst.sandbox.as_str()))
-        .map(|(ii, _)| ii)
-        .collect();
+    // Orphans: instances whose sandbox is not configured, grouped at the
+    // bottom; this host's before the machines' (`instances`' order).
+    let mut orphans: Vec<usize> = (0..instances.len()).filter(|&ii| groups[ii].is_none()).collect();
+    orphans.sort_by_key(|&ii| instances[ii].machine.is_some());
     if !orphans.is_empty() {
         nodes.push(Node::Orphans);
         if !collapsed.contains(ORPHANS_NAME) {
@@ -140,10 +168,11 @@ fn push_proc_nodes(
     expanded_procs: &BTreeSet<String>,
     procs: &BTreeMap<String, ProcState>,
 ) {
-    if !expanded_procs.contains(&inst.name) {
+    let key = super::remote::instance_key(inst);
+    if !expanded_procs.contains(&key) {
         return;
     }
-    match procs.get(&inst.name) {
+    match procs.get(&key) {
         Some(ProcState::Rows { rows, .. }) => {
             for row in 0..rows.len() {
                 nodes.push(Node::Proc { instance, row });
@@ -161,7 +190,8 @@ fn push_proc_nodes(
 /// (the tree groups by sandbox) rather than being nested under the dispatcher.
 pub fn dispatcher_label(row: &InstanceRow, instances: &[InstanceRow]) -> Option<String> {
     let id = row.dispatcher.as_deref()?;
-    Some(match instances.iter().find(|i| i.instance_id == id) {
+    // Ids are per host: the owner is on the child's machine.
+    Some(match instances.iter().find(|i| i.instance_id == id && i.machine == row.machine) {
         Some(owner) => format!("⇠ {}", owner.name),
         None => format!("⇠ {id} (orphan)"),
     })

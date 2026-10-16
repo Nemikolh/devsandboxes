@@ -33,6 +33,7 @@ use serde_json::{Value, json};
 
 use super::data::FetchError;
 use super::procs::{self, ProcState};
+use super::remote;
 use crate::serve::api::ProcsAnswer;
 use crate::serve::client::{self, Conn};
 use crate::serve::endpoint;
@@ -71,8 +72,10 @@ impl PollWorker {
         let mut handles = Vec::new();
         let spawned = std::thread::Builder::new().name("tui-poll-procs".into()).spawn(move || {
             lane(&*connector, prx, |conn, names| {
-                let (method, params) = procs_call(&names);
-                let answer = call(conn, method, params).and_then(procs_answer);
+                let answer = procs_by_machine(&names, |machine, names| {
+                    let (method, params) = procs_call(names, machine);
+                    call(conn, method, params).and_then(procs_answer)
+                });
                 (answer.is_ok_or_api(), PollUpdate::Procs(answer.into_result()))
             }, |e| PollUpdate::Procs(Err(e)), &utx)
         });
@@ -80,8 +83,8 @@ impl PollWorker {
         PollWorker { procs: Some(ptx), updates, handles }
     }
 
-    /// Ask for `names`' processes. Never blocks; the answer is a
-    /// [`PollUpdate::Procs`].
+    /// Ask for `names`' processes (instance keys, `remote::qualify`). Never
+    /// blocks; the answer is one [`PollUpdate::Procs`] for them all.
     pub fn request_procs(&self, names: Vec<String>) {
         if let Some(tx) = &self.procs {
             let _ = tx.send(names);
@@ -191,9 +194,44 @@ fn call(conn: &mut Conn, method: &str, params: Value) -> Answer<Value> {
     }
 }
 
-/// The API call for `names`' processes.
-fn procs_call(names: &[String]) -> (&'static str, Value) {
-    ("instances.procs", json!({ "instances": names }))
+/// The API call for `names`' processes on `machine` (`None`: here).
+fn procs_call(names: &[&str], machine: Option<&str>) -> (&'static str, Value) {
+    let mut params = json!({ "instances": names });
+    if let Some(m) = machine {
+        params["machine"] = m.into();
+    }
+    ("instances.procs", params)
+}
+
+/// `keys`' processes, one `ask` per machine in turn (docs/machines.md, F10:
+/// a machine's link takes one request per machine), keyed back by key.
+/// Only this host's (or a single machine's) keys: that one answer as is.
+/// Several: a machine whose call the daemon refused gets that reason as
+/// each of its instances' row, and a lost connection is the whole answer.
+fn procs_by_machine(
+    keys: &[String],
+    mut ask: impl FnMut(Option<&str>, &[&str]) -> Answer<BTreeMap<String, ProcState>>,
+) -> Answer<BTreeMap<String, ProcState>> {
+    let mut groups: BTreeMap<Option<&str>, Vec<&str>> = BTreeMap::new();
+    for key in keys {
+        let (machine, name) = remote::split(key);
+        groups.entry(machine).or_default().push(name);
+    }
+    let single = groups.len() == 1;
+    let mut out = BTreeMap::new();
+    for (machine, names) in groups {
+        match ask(machine, &names) {
+            Answer::Ok(states) => {
+                out.extend(states.into_iter().map(|(name, state)| (remote::qualify(machine, &name), state)));
+            }
+            Answer::Api(why) if !single => {
+                let row = ProcState::Message(format!("(processes unavailable: {why})"));
+                out.extend(names.iter().map(|name| (remote::qualify(machine, name), row.clone())));
+            }
+            other => return other,
+        }
+    }
+    Answer::Ok(out)
 }
 
 /// `instances.procs`'s result as the tree's states.
@@ -210,7 +248,36 @@ mod tests {
 
     #[test]
     fn calls_are_what_the_api_parses() {
-        assert_eq!(procs_call(&["a".into(), "b".into()]), ("instances.procs", json!({"instances": ["a", "b"]})));
+        assert_eq!(procs_call(&["a", "b"], None), ("instances.procs", json!({"instances": ["a", "b"]})));
+        assert_eq!(procs_call(&["a"], Some("box")).1, json!({"instances": ["a"], "machine": "box"}));
+    }
+
+    #[test]
+    fn procs_go_one_request_per_machine_keyed_back() {
+        let keys: Vec<String> = ["web", "box/web", "box/api", "down/x"].map(String::from).to_vec();
+        let mut asked = Vec::new();
+        let answer = procs_by_machine(&keys, |machine, names| {
+            asked.push((machine.map(String::from), names.iter().map(|n| n.to_string()).collect::<Vec<_>>()));
+            match machine {
+                Some("down") => Answer::Api("down: timed out".into()),
+                _ => Answer::Ok(names.iter().map(|n| (n.to_string(), ProcState::Message(format!("{machine:?}")))).collect()),
+            }
+        });
+        assert_eq!(
+            asked,
+            [
+                (None, vec!["web".to_string()]),
+                (Some("box".into()), vec!["web".into(), "api".into()]),
+                (Some("down".into()), vec!["x".into()]),
+            ]
+        );
+        let Answer::Ok(states) = answer else { panic!("not ok") };
+        assert_eq!(states["web"], ProcState::Message("None".into()));
+        assert_eq!(states["box/web"], ProcState::Message("Some(\"box\")".into()));
+        assert_eq!(states["down/x"], ProcState::Message("(processes unavailable: down: timed out)".into()));
+        // Alone, a refusal is the answer, as before machines.
+        let alone = procs_by_machine(&keys[..1], |_, _| Answer::Api("no".into()));
+        assert!(matches!(alone, Answer::Api(why) if why == "no"));
     }
 
     #[test]

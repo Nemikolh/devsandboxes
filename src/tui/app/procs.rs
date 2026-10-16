@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 
 use crate::tui::data::{ContainerStatus, Node};
 use crate::tui::procs::ProcState;
+use crate::tui::remote::{self, instance_key};
 
 use super::{App, Tab};
 
@@ -59,7 +60,7 @@ impl App {
             return None;
         }
         let inst = snapshot.instances.get(instance)?;
-        let ProcState::Rows { rows, signalable } = self.procs.get(&inst.name)? else {
+        let ProcState::Rows { rows, signalable } = self.procs.get(&instance_key(inst))? else {
             return None;
         };
         // A `top` fallback listing has host-namespace pids that `exec kill` can't
@@ -71,7 +72,7 @@ impl App {
         // Defensive: `parse_top` only yields numeric pids, but never hand a
         // non-numeric token to `kill`.
         proc.pid.parse::<u32>().ok()?;
-        Some((inst.name.clone(), proc.pid.clone()))
+        Some((instance_key(inst), proc.pid.clone()))
     }
 
     /// Queue `signal` for the selected process, for the event loop to send to
@@ -130,7 +131,8 @@ impl App {
         let snapshot = self.snapshot.as_ref()?;
         let idx = self.selected_instance_index()?;
         let row = snapshot.instances.get(idx)?;
-        matches!(row.status, ContainerStatus::Running(_)).then(|| row.name.clone())
+        let reachable = !remote::unreachable(&self.machines, row.machine.as_deref());
+        (reachable && matches!(row.status, ContainerStatus::Running(_))).then(|| instance_key(row))
     }
 
     /// Consume the "fetch now" signal set on expand.
@@ -155,18 +157,21 @@ impl App {
             return Vec::new();
         };
         let mut targets = Vec::new();
-        let mut not_running: Vec<String> = Vec::new();
+        let mut not_running: Vec<(String, &str)> = Vec::new();
         for name in &self.expanded_procs {
-            match snapshot.instances.iter().find(|r| &r.name == name) {
-                Some(row) if matches!(row.status, ContainerStatus::Running(_)) => {
-                    targets.push(row.name.clone());
+            match remote::find_instance(snapshot, name) {
+                // A machine that isn't connected can't be asked.
+                Some(row) if remote::unreachable(&self.machines, row.machine.as_deref()) => {
+                    not_running.push((name.clone(), "(machine unreachable)"));
                 }
-                _ => not_running.push(name.clone()),
+                Some(row) if matches!(row.status, ContainerStatus::Running(_)) => {
+                    targets.push(name.clone());
+                }
+                _ => not_running.push((name.clone(), "(not running)")),
             }
         }
-        for name in not_running {
-            self.procs
-                .insert(name, ProcState::Message("(not running)".to_string()));
+        for (name, why) in not_running {
+            self.procs.insert(name, ProcState::Message(why.to_string()));
         }
         // The selected running instance is fetched too (for the Detail agent
         // count), even when its process layer isn't expanded. Deduped against the
@@ -206,6 +211,33 @@ mod tests {
         app.set_tab(Tab::Instances);
         assert!(app.take_needs_proc_fetch());
         assert_eq!(app.proc_fetch_targets().len(), 1);
+    }
+
+    /// Processes are keyed per machine: the fetch targets are keys (the
+    /// poll asks each machine for its own), a machine that isn't connected
+    /// isn't asked, and a signal names its instance's key.
+    #[test]
+    fn procs_are_keyed_per_machine() {
+        use crate::serve::snapshots::LinkState;
+        let mut app = machine_app();
+        app.expanded_procs.extend(["inst0".to_string(), "box/inst0".to_string()]);
+        app.selected[Tab::Instances.index()] = 0;
+        let mut targets = app.proc_fetch_targets();
+        targets.sort();
+        assert_eq!(targets, ["box/inst0", "inst0"]);
+        app.machines[0].state = LinkState::Unreachable;
+        assert_eq!(app.proc_fetch_targets(), ["inst0"]);
+        assert_eq!(app.procs["box/inst0"], ProcState::Message("(machine unreachable)".into()));
+        app.machines[0].state = LinkState::Connected;
+
+        expand_with_rows(&mut app, "box/inst1", &["42"]);
+        let at = app.visible_nodes().iter().position(|n| *n == Node::Proc { instance: 3, row: 0 }).unwrap();
+        app.selected[Tab::Instances.index()] = at;
+        app.signal_selected_proc(Signal::Term);
+        assert_eq!(
+            app.take_pending_signal(),
+            Some(PendingSignal { instance: "box/inst1".into(), pid: "42".into(), signal: Signal::Term })
+        );
     }
 
     /// A pushed snapshot is installed as is: the daemon carries cpu/mem over,

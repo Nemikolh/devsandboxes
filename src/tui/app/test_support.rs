@@ -85,6 +85,38 @@ pub(super) fn snapshot_with(n: usize) -> Snapshot {
     }
 }
 
+/// Machine `box` (connected) and `down` (unreachable, no rows), plus a
+/// snapshot whose sandbox `s` and instances `inst0`/`inst1` exist both here
+/// and on `box` (root `/r/one`), all running. Tree: `[Sandbox(0), inst0,
+/// inst1, Sandbox(1) box, box/inst0, box/inst1]`: instance rows 0, 1 local,
+/// 2, 3 on `box`. Plus a service `db` on `box`.
+pub(super) fn machine_app() -> App {
+    use crate::serve::snapshots::LinkState;
+    let mut s = snapshot_with_status(2, running());
+    let mut remote = snapshot_with_status(2, running());
+    for r in &mut remote.instances {
+        r.machine = Some("box".into());
+        r.root = Some("/r/one".into());
+    }
+    for r in &mut remote.sandboxes {
+        r.machine = Some("box".into());
+        r.root = Some("/r/one".into());
+    }
+    s.instances.extend(remote.instances);
+    s.sandboxes.extend(remote.sandboxes);
+    let mut db = service_snapshot(vec![("devsandbox-svc-db".into(), running())]).services.remove(0);
+    db.name = "db".into();
+    db.machine = Some("box".into());
+    db.root = Some("/r/one".into());
+    s.services.push(db);
+    let mut app = new_app();
+    let mut down = crate::tui::remote::tests::sm("down", LinkState::Unreachable);
+    down.error = Some("Connection refused".into());
+    app.machines = vec![crate::tui::remote::tests::sm("box", LinkState::Connected), down];
+    app.set_snapshot(s);
+    app
+}
+
 /// Install a small config modal directly, bypassing fs/config reads.
 pub(super) fn open_modal(app: &mut App) {
     app.modal = Modal::Config(ConfigView {

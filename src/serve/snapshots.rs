@@ -237,7 +237,7 @@ impl Remotes {
 }
 
 /// One `machines` entry of a federated snapshot.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotMachine {
     pub name: String,
     pub target: String,
@@ -287,6 +287,8 @@ pub fn merge(local: &Value, machines: &[Machine]) -> Value {
         }
     }
     obj.insert("instances".into(), Value::Array(instances));
+    // The header's "N sandboxes" counts the machines' too.
+    obj.insert("sandbox_count".into(), json!(sandboxes.len()));
     obj.insert("sandboxes".into(), Value::Array(sandboxes));
     obj.insert("services".into(), Value::Array(services));
     let entries: Vec<Value> = machines.iter().map(|m| json!(snapshot_machine(m))).collect();
@@ -330,6 +332,33 @@ fn tag(row: &Value, machine: &str, root: Option<&str>) -> Value {
         }
     }
     row
+}
+
+/// A remote root's push carrying no runtime pass yet (every instance's
+/// status `unknown`: the first, disk-depth push after a link's
+/// (re)connect) keeps each container's status, cpu and mem from `prev`,
+/// that root's last push, so remote rows don't flicker to `unknown` on
+/// every reconnect. Any other push is taken as is.
+pub fn carry_remote_status(prev: &Value, next: &mut Value) {
+    let unknown = |row: &Value| row.pointer("/status/state").and_then(Value::as_str) == Some("unknown");
+    let Some(next_rows) = next.get_mut("instances").and_then(Value::as_array_mut) else { return };
+    if next_rows.is_empty() || !next_rows.iter().all(unknown) {
+        return;
+    }
+    let before: BTreeMap<&str, &Value> =
+        rows(prev, "instances").filter_map(|r| Some((r.get("container")?.as_str()?, r))).collect();
+    for row in next_rows {
+        let Some(old) = row.get("container").and_then(Value::as_str).and_then(|c| before.get(c)) else { continue };
+        if unknown(old) {
+            continue;
+        }
+        let Some(obj) = row.as_object_mut() else { continue };
+        for key in ["status", "cpu", "mem"] {
+            if let Some(v) = old.get(key) {
+                obj.insert(key.into(), v.clone());
+            }
+        }
+    }
 }
 
 /// A snapshot without stats keeps the last cpu/mem of containers still
@@ -469,6 +498,7 @@ pub(crate) mod tests {
         // From its own root's snapshot when registered, else the first's.
         assert_eq!(names(&merged, "instances"), ["mine@-", "in-one@a", "orphan@a", "old@a", "in-two@a", "bee@b"]);
         assert_eq!(names(&merged, "sandboxes"), ["s@-", "sb-one@a", "sb-two@a", "sb-b@b"]);
+        assert_eq!(merged["sandbox_count"], 4);
         assert_eq!(names(&merged, "services"), ["svc-one@a", "svc-two@a", "svc-b@b"]);
         // Sandboxes and services say the remote root they came from; an
         // instance keeps its own (null included).
@@ -491,6 +521,7 @@ pub(crate) mod tests {
         let alone = merge(&local, &[]);
         let mut want = local.clone();
         want["machines"] = serde_json::json!([]);
+        want["sandbox_count"] = serde_json::json!(want["sandboxes"].as_array().unwrap().len());
         assert_eq!(alone, want);
     }
 
@@ -524,6 +555,27 @@ pub(crate) mod tests {
         assert_eq!(all.len(), 1);
         assert_eq!((all[0].state, all[0].rows.keys().collect::<Vec<_>>()), (LinkState::Connected, vec![&PathBuf::from("/2")]));
         assert!(remotes.get("b").is_none());
+    }
+
+    #[test]
+    fn a_disk_depth_remote_push_keeps_the_last_statuses() {
+        let unknown = |c: &str| serde_json::json!({"container": c, "status": {"state": "unknown"}, "cpu": null, "mem": null});
+        let prev = serde_json::json!({"instances": [
+            {"container": "a", "status": {"state": "running", "text": "Up"}, "cpu": "1%", "mem": "2MiB"},
+            {"container": "b", "status": {"state": "unknown"}, "cpu": null, "mem": null},
+        ]});
+        let mut next = serde_json::json!({"instances": [unknown("a"), unknown("b"), unknown("new")]});
+        carry_remote_status(&prev, &mut next);
+        assert_eq!(next["instances"][0]["status"], serde_json::json!({"state": "running", "text": "Up"}));
+        assert_eq!((&next["instances"][0]["cpu"], &next["instances"][0]["mem"]), (&"1%".into(), &"2MiB".into()));
+        assert_eq!(next["instances"][1]["status"]["state"], "unknown");
+        assert_eq!(next["instances"][2]["status"]["state"], "unknown");
+
+        // A push with one real status is a runtime pass: taken as is.
+        let mut real = serde_json::json!({"instances": [unknown("a"), {"container": "b", "status": {"state": "missing"}}]});
+        let want = real.clone();
+        carry_remote_status(&prev, &mut real);
+        assert_eq!(real, want);
     }
 
     fn view(depth: Depth) -> RuntimeView {

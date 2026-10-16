@@ -69,6 +69,8 @@ use crate::serve::client::{self, Conn};
 use crate::serve::forwards::{Added, ForwardRow};
 use crate::serve::endpoint;
 use crate::serve::proto::{Response, Version};
+use crate::serve::snapshots::SnapshotMachine;
+use super::remote::{Route, split};
 
 /// How long one wait for a notification blocks while connected: the
 /// latency of an inbox write queued meanwhile, and of the worker noticing
@@ -86,8 +88,9 @@ pub enum DaemonUpdate {
     /// The running containers changed (`instances.changed`): the pushes that
     /// follow show it; the processes want a refetch after the next one.
     InstancesChanged,
-    /// The watched root's latest snapshot (`instances.snapshot`).
-    Snapshot(InstancesList),
+    /// The watched root's latest snapshot (`instances.snapshot`), with every
+    /// registered machine's rows, and the machines' link states.
+    Snapshot(InstancesList, Vec<SnapshotMachine>),
     /// No connection (lost, or the connect failed): why. The snapshot is
     /// stale until the next [`Snapshot`](Self::Snapshot).
     Down(String),
@@ -126,8 +129,8 @@ enum Cmd {
     ForwardRm(u64),
     /// `instances.cancel` for `instance` (a state key).
     Cancel(String),
-    /// A modal's read.
-    Fetch(Fetch),
+    /// A modal's read, and where its target is (a remote sandbox's root).
+    Fetch(Fetch, Route),
     /// `instances.buildLog` for an instance id.
     BuildLog(String),
     /// `instances.signal`.
@@ -190,9 +193,10 @@ impl DaemonWorker {
         self.send(Cmd::Cancel(instance));
     }
 
-    /// Ask for a modal's read. Never blocks; answered by its update.
-    pub fn fetch(&self, fetch: Fetch) {
-        self.send(Cmd::Fetch(fetch));
+    /// Ask for a modal's read (`route`: where a remote target is). Never
+    /// blocks; answered by its update.
+    pub fn fetch(&self, fetch: Fetch, route: Route) {
+        self.send(Cmd::Fetch(fetch, route));
     }
 
     /// Ask for instance `id`'s build log. Never blocks; answered by
@@ -304,9 +308,20 @@ pub(super) fn root_dir(dir: PathBuf) -> PathBuf {
     dir.canonicalize().or_else(|_| std::path::absolute(&dir)).unwrap_or(dir)
 }
 
-/// The API call for [`Cmd::Cancel`].
-fn cancel_call(instance: &str) -> (&'static str, Value) {
-    ("instances.cancel", json!({ "instance": instance }))
+/// `call` sent to `machine` (docs/machines.md, F6): its `machine` param,
+/// only for a remote target, so a local call is what it was.
+fn on_machine((method, mut params): (&'static str, Value), machine: Option<&str>) -> (&'static str, Value) {
+    if let (Some(m), Some(obj)) = (machine, params.as_object_mut()) {
+        obj.insert("machine".into(), m.into());
+    }
+    (method, params)
+}
+
+/// The API call for [`Cmd::Cancel`], by instance key (`box/web-2` on a
+/// machine, `remote::qualify`).
+fn cancel_call(key: &str) -> (&'static str, Value) {
+    let (machine, instance) = split(key);
+    on_machine(("instances.cancel", json!({ "instance": instance })), machine)
 }
 
 /// The status line for an `instances.cancel` answer: the pid it SIGINTed,
@@ -360,19 +375,30 @@ fn needs_serve(what: &str, why: Option<&str>) -> String {
 }
 
 /// The API call for a modal's read in config root `root`, and what its
-/// failures are called.
-fn fetch_call(root: &Path, fetch: &Fetch) -> (&'static str, (&'static str, Value)) {
+/// failures are called. Its target is a key (`remote::qualify`): a remote
+/// one goes to its machine, a remote config read in `route`'s root there.
+fn fetch_call(root: &Path, fetch: &Fetch, route: &Route) -> (&'static str, (&'static str, Value)) {
     match fetch {
         Fetch::Logs { container } => {
-            ("logs", ("containers.logs", json!({ "container": container, "lines": super::app::LOG_LINES })))
+            let (machine, container) = split(container);
+            let call = ("containers.logs", json!({ "container": container, "lines": super::app::LOG_LINES }));
+            ("logs", on_machine(call, machine))
         }
-        Fetch::Inspect { container } => ("inspect", ("containers.inspect", json!({ "container": container }))),
+        Fetch::Inspect { container } => {
+            let (machine, container) = split(container);
+            ("inspect", on_machine(("containers.inspect", json!({ "container": container })), machine))
+        }
         Fetch::Config { kind, name } => {
             let method = match kind {
                 ConfigKind::Sandbox => "sandboxes.get",
                 ConfigKind::Service => "services.get",
             };
-            ("config", (method, json!({ "root": root.to_string_lossy(), "name": name })))
+            let (machine, name) = split(name);
+            let root = match (machine, &route.root) {
+                (Some(_), Some(remote)) => remote.clone(),
+                _ => root.to_string_lossy().into_owned(),
+            };
+            ("config", on_machine((method, json!({ "root": root, "name": name })), machine))
         }
     }
 }
@@ -413,13 +439,17 @@ fn inspect_body(result: Value) -> String {
 }
 
 /// The API call for [`Cmd::BuildLog`]: `ansi`, so the modal can colour it.
-fn build_log_call(instance: &str) -> (&'static str, Value) {
-    ("instances.buildLog", json!({ "instance": instance, "lines": super::app::BUILD_LOG_LINES, "ansi": true }))
+fn build_log_call(key: &str) -> (&'static str, Value) {
+    let (machine, instance) = split(key);
+    let call = ("instances.buildLog", json!({ "instance": instance, "lines": super::app::BUILD_LOG_LINES, "ansi": true }));
+    on_machine(call, machine)
 }
 
 /// The API call for [`Cmd::Signal`].
 fn signal_call(sig: &PendingSignal) -> (&'static str, Value) {
-    ("instances.signal", json!({ "instance": sig.instance, "pid": sig.pid, "signal": sig.signal.wire() }))
+    let (machine, instance) = split(&sig.instance);
+    let call = ("instances.signal", json!({ "instance": instance, "pid": sig.pid, "signal": sig.signal.wire() }));
+    on_machine(call, machine)
 }
 
 /// The status line for an `instances.signal` answer.
@@ -432,8 +462,9 @@ fn signal_status(sig: &PendingSignal, answer: Answer) -> String {
 }
 
 /// The API call for [`Cmd::Rename`].
-fn rename_call(instance: &str, new_name: &str) -> (&'static str, Value) {
-    ("instances.rename", json!({ "instance": instance, "newName": new_name }))
+fn rename_call(key: &str, new_name: &str) -> (&'static str, Value) {
+    let (machine, instance) = split(key);
+    on_machine(("instances.rename", json!({ "instance": instance, "newName": new_name })), machine)
 }
 
 /// The status line for an `instances.rename` answer: the name the daemon
@@ -451,7 +482,8 @@ fn rename_status(instance: &str, new_name: &str, answer: Answer) -> String {
 
 /// The API call for [`Cmd::Done`].
 fn done_call(req: &PendingDone) -> (&'static str, Value) {
-    ("instances.done", json!({ "instance": req.instance, "done": req.done }))
+    let (machine, instance) = split(&req.instance);
+    on_machine(("instances.done", json!({ "instance": instance, "done": req.done })), machine)
 }
 
 /// The status line for an `instances.done` answer, worded as `devsandbox
@@ -551,9 +583,10 @@ fn connect(after_handoff: bool) -> Result<Conn> {
     }
 }
 
-/// The API call that watches config root `dir` (its snapshots pushed).
+/// The API call that watches config root `dir` (its snapshots pushed),
+/// with every registered machine's rows (docs/machines.md, step 6).
 fn watch_call(dir: &Path) -> (&'static str, Value) {
-    ("instances.watch", json!({ "dir": dir.to_string_lossy() }))
+    ("instances.watch", json!({ "dir": dir.to_string_lossy(), "machines": true }))
 }
 
 /// Connect, subscribe, and watch config root `dir`: a refused subscribe or
@@ -572,11 +605,17 @@ fn open(connect: &Connector, dir: &Path, after_handoff: bool) -> Result<Conn> {
     Ok(conn)
 }
 
-/// An `instances.snapshot`'s params as the tree's snapshot (`dir` aside).
-fn snapshot_update(params: Value) -> DaemonUpdate {
-    match serde_json::from_value::<InstancesList>(params) {
-        Ok(list) => DaemonUpdate::Snapshot(list),
-        Err(e) => DaemonUpdate::Status(format!("bad instances.snapshot: {e}")),
+/// An `instances.snapshot`'s params as the tree's snapshot (`dir` aside)
+/// and its `machines` (none without any registered).
+fn snapshot_update(mut params: Value) -> DaemonUpdate {
+    let machines = params.as_object_mut().and_then(|o| o.remove("machines")).unwrap_or(Value::Null);
+    let machines = match machines {
+        Value::Null => Ok(Vec::new()),
+        v => serde_json::from_value::<Vec<SnapshotMachine>>(v),
+    };
+    match (serde_json::from_value::<InstancesList>(params), machines) {
+        (Ok(list), Ok(machines)) => DaemonUpdate::Snapshot(list, machines),
+        (Err(e), _) | (_, Err(e)) => DaemonUpdate::Status(format!("bad instances.snapshot: {e}")),
     }
 }
 
@@ -622,7 +661,7 @@ fn run(dir: &Path, connector: &Connector, rx: Receiver<Cmd>, utx: Sender<DaemonU
             Ok(Cmd::ForwardAdd(req)) => w.forward_add(&req),
             Ok(Cmd::ForwardRm(id)) => w.forward_rm(id),
             Ok(Cmd::Cancel(instance)) => w.cancel(&instance),
-            Ok(Cmd::Fetch(fetch)) => w.fetch(fetch),
+            Ok(Cmd::Fetch(fetch, route)) => w.fetch(fetch, &route),
             Ok(Cmd::BuildLog(id)) => w.build_log(id),
             Ok(Cmd::Signal(sig)) => w.signal(sig),
             Ok(Cmd::Rename { instance, new_name }) => w.rename(&instance, &new_name),
@@ -800,8 +839,8 @@ impl Worker<'_> {
         }
     }
 
-    fn fetch(&mut self, fetch: Fetch) {
-        let (what, call) = fetch_call(self.dir, &fetch);
+    fn fetch(&mut self, fetch: Fetch, route: &Route) {
+        let (what, call) = fetch_call(self.dir, &fetch, route);
         let answer = self.one_shot(what, call);
         self.send(fetch_update(fetch, answer));
     }
@@ -1105,12 +1144,12 @@ mod tests {
         let worker = DaemonWorker { tx: Some(tx), updates, connected: Arc::default(), handle: None };
         let logs = Fetch::Logs { container: "devsandbox-web".into() };
         let done = PendingDone { instance: "web".into(), done: true, report: false };
-        worker.fetch(logs.clone());
+        worker.fetch(logs.clone(), Route::default());
         worker.build_log("id0".into());
         worker.signal(sig("42"));
         worker.rename("a".into(), "b".into());
         worker.set_done(done.clone());
-        assert_eq!(rx.try_recv().unwrap(), Cmd::Fetch(logs));
+        assert_eq!(rx.try_recv().unwrap(), Cmd::Fetch(logs, Route::default()));
         assert_eq!(rx.try_recv().unwrap(), Cmd::BuildLog("id0".into()));
         assert_eq!(rx.try_recv().unwrap(), Cmd::Signal(sig("42")));
         assert_eq!(rx.try_recv().unwrap(), Cmd::Rename { instance: "a".into(), new_name: "b".into() });
@@ -1120,7 +1159,7 @@ mod tests {
     #[test]
     fn one_shot_calls_name_their_methods_and_params() {
         let root = Path::new("/cfg");
-        let fetch = |f: Fetch| fetch_call(root, &f);
+        let fetch = |f: Fetch| fetch_call(root, &f, &Route::default());
         assert_eq!(
             fetch(Fetch::Logs { container: "devsandbox-web".into() }),
             ("logs", ("containers.logs", json!({"container": "devsandbox-web", "lines": 50})))
@@ -1149,6 +1188,38 @@ mod tests {
         );
     }
 
+    /// A remote target's key (`box/…`) goes out as the bare name plus
+    /// `machine`; a remote config read in the row's root there.
+    #[test]
+    fn remote_targets_carry_their_machine() {
+        let root = Path::new("/cfg");
+        let remote = Route { machine: Some("box".into()), root: Some("/r/one".into()) };
+        assert_eq!(
+            fetch_call(root, &Fetch::Config { kind: ConfigKind::Sandbox, name: "box/web".into() }, &remote),
+            ("config", ("sandboxes.get", json!({"root": "/r/one", "name": "web", "machine": "box"})))
+        );
+        assert_eq!(
+            fetch_call(root, &Fetch::Config { kind: ConfigKind::Service, name: "box/db".into() }, &remote).1,
+            ("services.get", json!({"root": "/r/one", "name": "db", "machine": "box"}))
+        );
+        assert_eq!(
+            fetch_call(root, &Fetch::Logs { container: "box/devsandbox-web".into() }, &Route::default()).1,
+            ("containers.logs", json!({"container": "devsandbox-web", "lines": 50, "machine": "box"}))
+        );
+        assert_eq!(
+            fetch_call(root, &Fetch::Inspect { container: "box/devsandbox-web".into() }, &Route::default()).1,
+            ("containers.inspect", json!({"container": "devsandbox-web", "machine": "box"}))
+        );
+        assert_eq!(cancel_call("box/web-2"), ("instances.cancel", json!({"instance": "web-2", "machine": "box"})));
+        assert_eq!(build_log_call("box/id0").1, json!({"instance": "id0", "lines": 500, "ansi": true, "machine": "box"}));
+        assert_eq!(signal_call(&sig("42")).1["machine"], Value::Null, "local");
+        let remote_sig = PendingSignal { instance: "box/web-2".into(), ..sig("42") };
+        assert_eq!(signal_call(&remote_sig).1, json!({"instance": "web-2", "pid": "42", "signal": "TERM", "machine": "box"}));
+        assert_eq!(rename_call("box/a", "b").1, json!({"instance": "a", "newName": "b", "machine": "box"}));
+        let done = PendingDone { instance: "box/a".into(), done: true, report: false };
+        assert_eq!(done_call(&done).1, json!({"instance": "a", "done": true, "machine": "box"}));
+    }
+
     /// The calls the API can run here without docker or the user's state:
     /// the config reads end to end, the rest as far as their param checks.
     #[test]
@@ -1169,13 +1240,13 @@ mod tests {
             Err(e) => Answer::Refused(e.message),
         };
 
-        let (_, call) = fetch_call(&dir, &Fetch::Config { kind: ConfigKind::Sandbox, name: "web".into() });
+        let (_, call) = fetch_call(&dir, &Fetch::Config { kind: ConfigKind::Sandbox, name: "web".into() }, &Route::default());
         let update = fetch_update(Fetch::Config { kind: ConfigKind::Sandbox, name: "web".into() }, ask(call));
         let DaemonUpdate::Config { kind: ConfigKind::Sandbox, name, text: Ok(text) } = update else { panic!("{update:?}") };
         assert_eq!((name.as_str(), text.original.as_str()), ("web", "image = \"alpine\"\n"));
         assert!(!text.hash.is_empty());
         let service = Fetch::Config { kind: ConfigKind::Service, name: "db".into() };
-        let (_, call) = fetch_call(&dir, &service);
+        let (_, call) = fetch_call(&dir, &service, &Route::default());
         let DaemonUpdate::Config { kind: ConfigKind::Service, name, text } = fetch_update(service, ask(call)) else { panic!() };
         assert_eq!(name, "db");
         assert_eq!(
@@ -1187,15 +1258,15 @@ mod tests {
             })
         );
         let unknown = Fetch::Config { kind: ConfigKind::Sandbox, name: "nope".into() };
-        let (_, call) = fetch_call(&dir, &unknown);
+        let (_, call) = fetch_call(&dir, &unknown, &Route::default());
         let DaemonUpdate::Config { text: Err(msg), .. } = fetch_update(unknown, ask(call)) else { panic!() };
         assert!(msg.contains("no sandbox `nope`"), "{msg}");
         // Parsed and checked before any state or runtime is touched.
         let not_ours = Fetch::Logs { container: "web".into() };
-        let (_, call) = fetch_call(&dir, &not_ours);
+        let (_, call) = fetch_call(&dir, &not_ours, &Route::default());
         let DaemonUpdate::Logs { body, .. } = fetch_update(not_ours, ask(call)) else { panic!() };
         assert!(body.contains("not a devsandbox container"), "{body}");
-        let (_, call) = fetch_call(&dir, &Fetch::Inspect { container: "web".into() });
+        let (_, call) = fetch_call(&dir, &Fetch::Inspect { container: "web".into() }, &Route::default());
         assert!(matches!(ask(call), Answer::Refused(m) if m.contains("not a devsandbox container")));
         assert!(matches!(ask(signal_call(&sig("0"))), Answer::Refused(m) if m.contains("`pid` must be a process id")));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1295,9 +1366,10 @@ mod tests {
                 }
             }
         };
-        let is_snapshot = |u: &DaemonUpdate| matches!(u, DaemonUpdate::Snapshot(_));
-        let DaemonUpdate::Snapshot(first) = next(is_snapshot) else { unreachable!() };
+        let is_snapshot = |u: &DaemonUpdate| matches!(u, DaemonUpdate::Snapshot(..));
+        let DaemonUpdate::Snapshot(first, machines) = next(is_snapshot) else { unreachable!() };
         assert_eq!(first.snapshot.runtime_name, "Disk", "a new watch's first push");
+        assert!(machines.is_empty(), "a machines watch, none registered");
 
         let mut other = client::connect_with(&sock, "test", &version, Duration::from_secs(5), &|_, _| Ok(())).unwrap();
         assert!(other.call("shutdown", json!({})).unwrap().error.is_none());
@@ -1306,7 +1378,7 @@ mod tests {
         let DaemonUpdate::Down(_) = next(|u| matches!(u, DaemonUpdate::Down(_))) else { unreachable!() };
 
         let daemon = spawn_daemon(&sock, opts(1, 2000));
-        let DaemonUpdate::Snapshot(again) = next(is_snapshot) else { unreachable!() };
+        let DaemonUpdate::Snapshot(again, _) = next(is_snapshot) else { unreachable!() };
         assert_eq!(again.snapshot.runtime_name, "Disk", "watched again");
         drop(tx);
         worker.join().unwrap();
@@ -1322,13 +1394,22 @@ mod tests {
             "runtime_name": "docker", "runtime_version": "24", "error": null,
             "thread_children": {"d-id": {"k": "web-k"}},
         });
-        let DaemonUpdate::Snapshot(list) = snapshot_update(wire) else { panic!("not parsed") };
+        let DaemonUpdate::Snapshot(list, machines) = snapshot_update(wire) else { panic!("not parsed") };
+        assert!(machines.is_empty());
         assert_eq!(list.snapshot.sandbox_count, 2);
         assert!(!list.snapshot.stats);
         assert_eq!(list.thread_children["d-id"]["k"], "web-k");
         let DaemonUpdate::Status(line) = snapshot_update(json!([1])) else { panic!("parsed") };
         assert!(line.starts_with("bad instances.snapshot"), "{line}");
-        assert_eq!(watch_call(Path::new("/cfg")), ("instances.watch", json!({"dir": "/cfg"})));
+        assert_eq!(watch_call(Path::new("/cfg")), ("instances.watch", json!({"dir": "/cfg", "machines": true})));
+        let federated = json!({
+            "dir": "/cfg", "instances": [], "sandboxes": [], "services": [], "sandbox_count": 0,
+            "runtime_name": "docker", "runtime_version": null, "error": null,
+            "machines": [{"name": "box", "target": "me@box", "state": "unreachable", "error": "refused",
+                "version": null, "runtime": null, "command": null}],
+        });
+        let DaemonUpdate::Snapshot(_, machines) = snapshot_update(federated) else { panic!("not parsed") };
+        assert_eq!((machines[0].name.as_str(), machines[0].error.as_deref()), ("box", Some("refused")));
     }
 
     #[test]
