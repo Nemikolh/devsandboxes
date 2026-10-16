@@ -37,7 +37,12 @@ you code.
 
 ## Before reporting done
 
-- Run `cargo build` and `cargo test`; report REAL outcomes, failures included.
+- Update the docs your change makes untrue, as the plan's step names them:
+  the area doc in `docs/architecture/` / `docs/reference/` (present tense,
+  code cited by path + symbol, no line numbers) and `docs/status.md` for a
+  limitation you add or fix. Doc comments you touch stay current.
+- Run `cargo build` and `cargo test --workspace` (plain `cargo test` skips
+  the `devsbd/` crate); report REAL outcomes, failures included.
 - Report: files changed (with one line each on what/why), check outcomes,
   and every deviation from the brief — deviations are fine, silence about
   them is not.
