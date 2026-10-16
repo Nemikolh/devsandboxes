@@ -85,7 +85,6 @@ impl Bridge {
     /// Errors before the handshake is done, when the bridge is dead, or when the
     /// daemon doesn't advertise `TCP_FORWARD` (an outdated helper) — the last as
     /// `Unsupported`, so callers can phrase the restart hint.
-    #[allow(dead_code)] // called by the host forwarder engine (`forward.rs`)
     pub fn connect(
         &self,
         conn: impl Into<Conn>,

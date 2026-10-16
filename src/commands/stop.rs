@@ -26,7 +26,7 @@ pub fn stop(name: Option<String>, all: bool) -> Result<()> {
                 continue;
             }
             let services = service_containers(&info.project, &info.instance_id);
-            stop_containers(&info.container, &services, false);
+            stop_containers(&info.container, &services);
             println!("stopped {key}");
             stopped += 1;
         }
@@ -44,7 +44,7 @@ pub fn stop(name: Option<String>, all: bool) -> Result<()> {
     }
 
     let services = service_containers(&info.project, &info.instance_id);
-    stop_containers(&info.container, &services, false);
+    stop_containers(&info.container, &services);
 
     println!("stopped {key}");
     Ok(())
@@ -74,18 +74,12 @@ pub(crate) fn service_containers(project: &str, instance_id: &str) -> Vec<String
 
 /// Stop the main `container` then each service container. Exit codes are
 /// ignored throughout (already-stopped / missing containers must not fail the
-/// stop). `quiet` routes through the screen-safe `output_quiet` so stderr
-/// stays off the terminal (every caller passes `false`); otherwise stdio is
-/// inherited.
-pub(crate) fn stop_containers(container: &str, services: &[String], quiet: bool) {
+/// stop). Stdio is inherited.
+pub(crate) fn stop_containers(container: &str, services: &[String]) {
     let mut targets: Vec<&str> = Vec::with_capacity(services.len() + 1);
     targets.push(container);
     targets.extend(services.iter().map(String::as_str));
     for target in targets {
-        if quiet {
-            let _ = backend().output_quiet(&["stop", target]);
-        } else {
-            let _ = backend().run_inherit(&["stop", target]);
-        }
+        let _ = backend().run_inherit(&["stop", target]);
     }
 }

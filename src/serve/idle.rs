@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// What keeps the daemon alive, one field per row of the holder table (plus
-/// `autostart`). `followers` is never set: a follow stream is an in-flight
-/// control request, so it counts under `control`.
+/// `autostart`). A `--follow` stream is an in-flight control request, so it
+/// counts under `control`.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Holders {
     /// Connected clients: TUI, `api --stdio`, an `inbox` command, an `exec`
@@ -22,8 +22,6 @@ pub struct Holders {
     pub live_instances: usize,
     /// In-flight control requests.
     pub control: usize,
-    /// `--follow` subscribers; unused, they count under `control`.
-    pub followers: usize,
     /// 1 while the startup `autostart = true` pass runs (it may be creating
     /// an instance; an idle exit would cut it off).
     pub autostart: usize,
@@ -34,8 +32,8 @@ pub struct Holders {
 
 impl Holders {
     pub fn any(&self) -> bool {
-        let Holders { clients, forwards, live_instances, control, followers, autostart, verbs } = *self;
-        clients + forwards + live_instances + control + followers + autostart + verbs > 0
+        let Holders { clients, forwards, live_instances, control, autostart, verbs } = *self;
+        clients + forwards + live_instances + control + autostart + verbs > 0
     }
 }
 
@@ -89,7 +87,6 @@ mod tests {
             Holders { forwards: 1, ..Default::default() },
             Holders { live_instances: 1, ..Default::default() },
             Holders { control: 1, ..Default::default() },
-            Holders { followers: 1, ..Default::default() },
             Holders { autostart: 1, ..Default::default() },
             Holders { verbs: 1, ..Default::default() },
         ];

@@ -50,7 +50,7 @@ pub fn autostart(dir: &Path) {
     if let Err(e) = backend().list(false, crate::runtime::NAME_PREFIX) {
         eprintln!(
             "warning: autostart: {} is not reachable ({e:#}); retried on the next \
-             `run`/`start` or dashboard load",
+             `run`/`start`/`rebuild` or daemon start",
             runtime_label(backend().name())
         );
         return;

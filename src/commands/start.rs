@@ -137,7 +137,7 @@ fn start_logged(dir: &Path, key: &str, info: &Instance) -> Result<()> {
         }
         None => {
             let services = stop::service_containers(&info.project, &info.instance_id);
-            start_containers(&info.container, &services, false);
+            start_containers(&info.container, &services);
             crate::devsbd::ensure_recorded(key, info, false);
         }
     }
@@ -185,17 +185,12 @@ fn resolved_sandbox(dir: &Path, info: &Instance) -> Option<(Config, ResolvedSand
 /// Start each service container then the main `container` (services first so
 /// they are reachable when the instance comes up). Exit codes are ignored
 /// throughout (already-running / missing containers must not fail the start).
-/// `quiet` routes through the screen-safe `output_quiet` so stderr stays off
-/// the terminal (every caller passes `false`); otherwise stdio is inherited.
-pub(crate) fn start_containers(container: &str, services: &[String], quiet: bool) {
+/// Stdio is inherited.
+pub(crate) fn start_containers(container: &str, services: &[String]) {
     let mut targets: Vec<&str> = services.iter().map(String::as_str).collect();
     targets.push(container);
     for target in targets {
-        if quiet {
-            let _ = backend().output_quiet(&["start", target]);
-        } else {
-            let _ = backend().run_inherit(&["start", target]);
-        }
+        let _ = backend().run_inherit(&["start", target]);
     }
 }
 
