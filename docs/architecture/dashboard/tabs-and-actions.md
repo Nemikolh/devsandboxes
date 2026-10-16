@@ -1,0 +1,123 @@
+# Tabs, modals and actions
+
+What the dashboard shows on each tab and how a key becomes a request to
+the daemon. Not a keymap (the `?` modal and the help bar are that). Read
+this before adding a tab, a modal, or a one-key action.
+
+Code: `src/tui/app/mod.rs` (`Tab`, `App`, `dispatch_key`, `PortRow`,
+`PortRequest`), `src/tui/data.rs` (`Node`, `visible_nodes`, `group_of`,
+`ORPHANS_NAME`, `totals_line`, `STALE_AFTER_SECS`), `src/tui/app/tree.rs`,
+`src/tui/procs.rs` (`ProcState`, `ProcRow`, `build_forest`, `run_rows`,
+`proc_state`, `is_agent`, `AGENT_NAMES`), `src/tui/app/procs.rs`
+(`Signal`, `PendingSignal`, `proc_fetch_targets`, `agent_count`),
+`src/tui/app/actions.rs` (`busy`, `stop_or_start_instance`,
+`remove_instance`, `attach_code`, `verb_answered`, `VerbEnd`,
+`PendingDone`), `src/tui/app/view.rs` (`Modal`, `Fetch`, `ConfigView`,
+`BuildLogModal`, `ConfirmModal`, `open_config`, `open_build_log`,
+`refresh_build_log`), `src/tui/ansi.rs`, `src/tui/mod.rs` (`run`,
+`spawn_verb`, `verb_call`, `verb_status`), `src/tui/daemon.rs` (`Cmd`,
+`DaemonUpdate`), `src/tui/ui.rs`.
+
+## Tabs
+
+`Tab::ALL`: Instances, Services, Ports, Inbox (`1`-`4`, `tab`/`shift-tab`,
+or a click on the title). Each keeps its own selected row.
+
+- **Instances**: a tree. `visible_nodes` flattens sandboxes (config
+  order) → instances → processes into `Node`s: `Sandbox`, `Instance`,
+  `Empty` (a sandbox with no instances), `Orphans` (the `(not in config)`
+  group for instances whose sandbox is gone) and `Proc`. With machines,
+  groups are per (machine, sandbox) (`group_of`). Collapse state and
+  expanded process layers survive snapshot refreshes. The Detail pane
+  shows the selected row. Done instances render dimmed.
+- **Services**: one row per `ServiceRow` with its backing containers.
+- **Ports**: the daemon's forwards for this config root (`PortRow`,
+  `configured` for a sandbox's `forwardPorts`). The worker fetches
+  `forwards.list` on connect and on `forwards.changed`. `p` on an
+  instance or service (a prefilled `port` prompt) adds through
+  `forwards.add` and switches here; `d` stops through `forwards.rm`.
+  Disconnected, the tab is empty
+  ([../daemon/forwards.md](../daemon/forwards.md)).
+- **Inbox**: threads from the shared Inbox store
+  ([inbox-tab.md](inbox-tab.md)).
+
+The header's totals line marks the snapshot stale with why when the daemon
+connection is down, or after `STALE_AFTER_SECS` without a push.
+
+## Process layer
+
+`→`/`space` on an instance expands its processes. `poll.rs` asks the
+daemon (`instances.procs`) for the expanded running instances plus the
+selected one (for the Detail agent count), on expand, after a change, and
+every 5 s (`PROC_TICK`), one request at a time and only on the Instances
+tab. `proc_state` turns each answer into a `ps --forest`-style
+`ProcState::Rows` (then up to 5 tracked `devsbd run` rows, `run` in the
+pid column) or a placeholder `Message`. `is_agent` counts coding-agent
+processes by argv basename (`AGENT_NAMES`) for Detail.
+
+On a process row only navigation and signals apply: `t` SIGTERM, `K`
+SIGKILL, sent as `instances.signal`, and only when the rows are
+container-namespace pids (`signalable`).
+
+## Modals
+
+`Modal`: `Config`, `Help`, `Logs`, `BuildLog`, `Confirm`. A modal takes
+every key and the wheel while up. Their data comes from the daemon as
+`Fetch`es, one-shots on the daemon worker's connection
+([overview.md](overview.md#threads)), answered by a `DaemonUpdate` that
+fills the modal if it is still the one open:
+
+- `enter`/`e` → `Config`: original and resolved config
+  (`sandboxes.get`/`services.get`) beside the container's
+  `containers.inspect`, a draggable divider between them.
+- `l` (Instances) → `Logs`: `containers.logs` tail.
+- `b` → `BuildLog`: `instances.buildLog` with `ansi`, coloured by
+  `ansi::parse_line` (SGR only, other escapes dropped). While the instance
+  is in flight, each snapshot triggers a re-read (one outstanding); it
+  follows the bottom unless scrolled away.
+- `Confirm`: rm's branch question and "cancel the build?".
+- `?` → `Help`: settings toggles, then every key by context.
+
+## One-key actions and the pending queue
+
+`App` never sends anything. A key sets a pending field (`pending_action`,
+`pending_signal`, `pending_done`, `pending_fetch`, `pending_cancel`,
+`pending_port`/`pending_unport`, `pending_inbox`, `pending_open`), and the
+event loop takes each once per pass and hands it to a thread.
+
+- `s`: stop a running instance, start an exited one; an exited drifted
+  one, a missing container or a failed phase gets a `rebuild` instead
+  (worktree kept). `stopping`/`starting` sets drop repeat presses until
+  the answer.
+- `d`: `rm` right away (non-forced, so rm's own refusals and branch
+  question still apply); on an in-flight row it asks to cancel the build
+  (`instances.cancel`) instead.
+- `o`: VS Code (`spawn_code`, reading `state.toml` locally); refused for
+  a machine's row.
+- `r`/`p`/`:`: the prompt ([command-line.md](command-line.md)); `t`:
+  a terminal ([terminal.md](terminal.md)).
+
+`busy` blocks every one-key action on an instance a live `run`/`rebuild`
+is materializing.
+
+## Verbs as requests
+
+`run`/`rebuild`/`start`/`stop`/`rm`/`services.rebuild` go to the daemon
+from `spawn_verb`, each on a thread and connection of its own (lazy
+start), always with `detach: true` and this config root, the caller's env
+and, for build verbs, a pty sized to the build-log modal
+([../daemon/verbs.md](../daemon/verbs.md)). `run`/`rebuild`/`start` are
+answered once the instance is registered and the build runs on; `stop`/
+`rm`/`services.rebuild` are held until done. Quitting cancels none. The
+answer becomes a status line (`verb_status`), or for an unanswered rm a
+`confirm` whose `Confirm` modal resends it with `deleteBranch`. A verb
+for a machine's row carries `machine` and its remote root
+(`routed_verb_call`). No daemon, no verb: the dashboard never builds in
+its own process.
+
+`rename` (`instances.rename`), done flags (`instances.done`, from Inbox
+thread actions), signals, cancel and the modal reads share the daemon
+worker's connection. Rows change with the next snapshot push, after which
+the processes are refetched.
+
+Limitations: [status.md](../../status.md#dashboard)
