@@ -7,11 +7,18 @@
 //! the protocol check all stay with the client. Only protocol bytes reach
 //! stdout; diagnostics go to stderr.
 //!
+//! The one exception is `--session-env` (docs/machines.md, F4), for a relay a
+//! machine link runs over ssh: there the upstream copy goes line by line and
+//! a verb request's `params.env` becomes the relay's own, the remote login
+//! shell's env, since the requester's (another host's) means nothing here.
+//! Every other line, and every byte downstream, still passes as is.
+//!
 //! Exit: 0 once stdin hits EOF (after the daemon has answered what was in
 //! flight, up to [`GRACE`]) or stdout is gone; [`EXIT_NO_HOST`] (75) when the
 //! daemon closes the connection first (it exited: reconnect, which starts a
 //! new one).
 
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::Shutdown;
 use std::path::Path;
@@ -19,9 +26,11 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use serde_json::Value;
 
 use super::client::{self, Conn};
 use super::endpoint::{self, Stream};
+use super::proto;
 use crate::devsbd::control::{EXIT_NO_HOST, EXIT_OK};
 
 /// How long, after stdin's EOF, the relay waits for the daemon to answer the
@@ -52,10 +61,12 @@ impl End {
 /// `devsandbox api --stdio`: lazy-start the daemon, then relay until one side
 /// ends. Returns the exit code. `client` names the relay's own probe hello
 /// (`serve.log`); the client's hello goes through the relay untouched.
-pub fn stdio(client: &str) -> Result<i32> {
+/// `session_env`: verbs get this process's env (see the module doc).
+pub fn stdio(client: &str, session_env: bool) -> Result<i32> {
     let dir = endpoint::socket_dir()?;
     let stream = open(&dir, || client::connect(&dir, client))?;
-    Ok(pump(std::io::stdin(), std::io::stdout(), stream, GRACE)?.code())
+    let env = session_env.then(|| super::verbs_client::caller_env(std::env::vars_os()));
+    Ok(pump(std::io::stdin(), std::io::stdout(), stream, GRACE, env)?.code())
 }
 
 /// A fresh connection for the relay, after `probe` (a hello'd connection: the
@@ -80,7 +91,9 @@ enum Event {
 /// After `input`'s EOF the socket's write half is shut, so the daemon answers
 /// what it has and hangs up; that's waited for up to `grace`. The `input`
 /// thread may stay blocked in a read: the caller exits the process.
-pub fn pump<R, W>(input: R, output: W, daemon: Stream, grace: Duration) -> Result<End>
+/// `session_env`: upstream verb requests get it as their `env`
+/// ([`SessionEnv`]).
+pub fn pump<R, W>(input: R, output: W, daemon: Stream, grace: Duration, session_env: Option<BTreeMap<String, String>>) -> Result<End>
 where
     R: Read + Send + 'static,
     W: Write + Send + 'static,
@@ -91,7 +104,10 @@ where
     std::thread::Builder::new()
         .name("api-relay-up".into())
         .spawn(move || {
-            let r = copy(input, &to_daemon);
+            let r = match session_env {
+                None => copy(input, &to_daemon),
+                Some(env) => copy_rewriting(input, &to_daemon, SessionEnv::new(env)),
+            };
             let eof = r.is_ok();
             // Report before half-closing: once shut, the daemon may answer and
             // hang up before this thread runs again, and a `Down` seen first
@@ -137,6 +153,99 @@ fn copy(mut input: impl Read, mut to: &Stream) -> std::result::Result<(), ()> {
     }
 }
 
+/// [`copy`] through `rewrite`.
+fn copy_rewriting(mut input: impl Read, mut to: &Stream, mut rewrite: SessionEnv) -> std::result::Result<(), ()> {
+    let mut buf = [0u8; 64 * 1024];
+    let mut out = Vec::new();
+    loop {
+        let n = match input.read(&mut buf) {
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => 0,
+        };
+        if n == 0 {
+            rewrite.finish(&mut out);
+            return to.write_all(&out).map_err(|_| ());
+        }
+        rewrite.feed(&buf[..n], &mut out);
+        to.write_all(&out).map_err(|_| ())?;
+        out.clear();
+    }
+}
+
+/// The upstream rewrite of `--session-env`, pure over byte chunks: each
+/// complete line that is a verb request (`verbs::is_verb`) has its
+/// `params.env` replaced by `env` and is re-serialized; every other line
+/// (a non-verb, one that doesn't parse) is passed through byte for byte. A
+/// partial line is held until its newline, or the end, where it goes out as
+/// is. A line over [`proto::MAX_LINE`] isn't held: it goes through as it
+/// comes, unmodified, and the daemon refuses it as it would without the
+/// relay (so a held line never grows past that).
+pub(crate) struct SessionEnv {
+    env: Value,
+    held: Vec<u8>,
+    /// Inside an overlong line: pass bytes through until its newline.
+    passing: bool,
+}
+
+impl SessionEnv {
+    pub(crate) fn new(env: BTreeMap<String, String>) -> Self {
+        Self { env: serde_json::to_value(env).unwrap_or_default(), held: Vec::new(), passing: false }
+    }
+
+    /// `chunk` in, what can go out appended to `out`.
+    pub(crate) fn feed(&mut self, mut chunk: &[u8], out: &mut Vec<u8>) {
+        while !chunk.is_empty() {
+            let newline = chunk.iter().position(|&b| b == b'\n');
+            let (part, rest) = match newline {
+                Some(i) => chunk.split_at(i + 1),
+                None => (chunk, &[][..]),
+            };
+            chunk = rest;
+            if self.passing {
+                out.extend_from_slice(part);
+                self.passing = newline.is_none();
+                continue;
+            }
+            self.held.extend_from_slice(part);
+            if newline.is_some() {
+                let line = std::mem::take(&mut self.held);
+                self.line(line, out);
+            } else if self.held.len() as u64 > proto::MAX_LINE {
+                out.append(&mut self.held);
+                self.passing = true;
+            }
+        }
+    }
+
+    /// The input ended: a held partial line goes out as is.
+    pub(crate) fn finish(&mut self, out: &mut Vec<u8>) {
+        out.append(&mut self.held);
+    }
+
+    fn line(&self, line: Vec<u8>, out: &mut Vec<u8>) {
+        match self.rewritten(&line) {
+            Some(new) => {
+                out.extend_from_slice(&new);
+                out.push(b'\n');
+            }
+            None => out.extend_from_slice(&line),
+        }
+    }
+
+    /// `line` with `params.env` swapped, or `None` to pass it as is.
+    fn rewritten(&self, line: &[u8]) -> Option<Vec<u8>> {
+        let mut request: Value = serde_json::from_slice(line).ok()?;
+        let method = request.get("method")?.as_str()?;
+        if !super::verbs::is_verb(method) {
+            return None;
+        }
+        let params = request.as_object_mut()?.entry("params").or_insert_with(|| Value::Object(Default::default()));
+        params.as_object_mut()?.insert("env".into(), self.env.clone());
+        serde_json::to_vec(&request).ok()
+    }
+}
+
 /// The socket → `output`, flushed per read so a line is never held back.
 /// `Ok` at the socket's EOF (or a read error); `Err` when `output` fails.
 fn copy_down(mut from: &Stream, mut output: impl Write) -> std::result::Result<(), ()> {
@@ -174,7 +283,7 @@ mod tests {
         let (relay_end, daemon_end) = UnixStream::pair().unwrap();
         stdout_r.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         daemon_end.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        let handle = std::thread::spawn(move || pump(stdin_r, stdout_w, relay_end, Duration::from_secs(2)));
+        let handle = std::thread::spawn(move || pump(stdin_r, stdout_w, relay_end, Duration::from_secs(2), None));
         (stdin_w, BufReader::new(stdout_r), daemon_end, handle)
     }
 
@@ -250,6 +359,85 @@ mod tests {
         assert_eq!(relay.join().unwrap().unwrap(), End::Client);
     }
 
+    fn session_env() -> SessionEnv {
+        SessionEnv::new(BTreeMap::from([("PATH".to_string(), "/remote/bin".to_string())]))
+    }
+
+    fn fed(rw: &mut SessionEnv, chunk: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        rw.feed(chunk, &mut out);
+        out
+    }
+
+    #[test]
+    fn session_env_replaces_only_verb_envs() {
+        let mut rw = session_env();
+        let verb = fed(&mut rw, b"{\"id\":3,\"method\":\"stop\",\"params\":{\"instance\":\"w\",\"env\":{\"PATH\":\"/local\",\"X\":\"1\"}}}\n");
+        assert!(verb.ends_with(b"\n"));
+        let v: Value = serde_json::from_slice(&verb).unwrap();
+        assert_eq!(v, json!({"id": 3, "method": "stop", "params": {"instance": "w", "env": {"PATH": "/remote/bin"}}}));
+        // No params at all still gets one (the daemon then says what's missing).
+        let v: Value = serde_json::from_slice(&fed(&mut rw, b"{\"id\":4,\"method\":\"services.rebuild\"}\n")).unwrap();
+        assert_eq!(v["params"], json!({"env": {"PATH": "/remote/bin"}}));
+        // Everything else byte for byte: other methods, odd spacing, junk,
+        // a verb whose params aren't an object, CRLF.
+        for line in [
+            &b"{\"id\":0,\"method\":\"hello\",\"params\":{\"env\":{}}}\n"[..],
+            b"{ \"id\" : 1 , \"method\" : \"instances.list\" }\n",
+            b"not json\n",
+            b"\n",
+            b"{\"id\":5,\"method\":\"run\",\"params\":[1]}\n",
+            b"{\"method\":7}\r\n",
+        ] {
+            assert_eq!(fed(&mut rw, line), line, "{}", String::from_utf8_lossy(line));
+        }
+    }
+
+    #[test]
+    fn session_env_holds_a_partial_line_until_its_newline() {
+        let mut rw = session_env();
+        assert_eq!(fed(&mut rw, b"{\"id\":1}\n{\"id\":2,\"method\":\"r"), b"{\"id\":1}\n");
+        let v: Value = serde_json::from_slice(&fed(&mut rw, b"m\",\"params\":{\"instance\":\"w\"}}\n{\"id\"")).unwrap();
+        assert_eq!(v["params"]["env"]["PATH"], "/remote/bin");
+        let mut out = Vec::new();
+        rw.finish(&mut out);
+        assert_eq!(out, b"{\"id\"", "a partial line at the end goes out as is");
+    }
+
+    #[test]
+    fn session_env_passes_an_overlong_line_through() {
+        let mut rw = session_env();
+        let big = vec![b'x'; proto::MAX_LINE as usize + 1];
+        assert_eq!(fed(&mut rw, b"{\"method\":\"run\",\"p\":\""), b"");
+        let out = fed(&mut rw, &big);
+        assert_eq!(out.len(), big.len() + 21, "flushed once over the limit");
+        assert_eq!(fed(&mut rw, b"more"), b"more");
+        assert_eq!(fed(&mut rw, b"\"}\n{\"id\":1}\n"), b"\"}\n{\"id\":1}\n", "back to lines after its newline");
+    }
+
+    #[test]
+    fn a_session_env_relay_rewrites_upstream_only() {
+        let (mut stdin, stdin_r) = UnixStream::pair().unwrap();
+        let (stdout_w, stdout_r) = UnixStream::pair().unwrap();
+        let (relay_end, daemon) = UnixStream::pair().unwrap();
+        daemon.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        stdout_r.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let env = BTreeMap::from([("HOME".to_string(), "/home/remote".to_string())]);
+        let relay = std::thread::spawn(move || pump(stdin_r, stdout_w, relay_end, Duration::from_secs(2), Some(env)));
+        let mut from_relay = BufReader::new(daemon.try_clone().unwrap());
+        stdin.write_all(b"{\"id\":0,\"method\":\"hello\"}\n{\"id\":1,\"method\":\"rm\",\"params\":{\"env\":{}}}\n").unwrap();
+        assert_eq!(line(&mut from_relay), "{\"id\":0,\"method\":\"hello\"}\n");
+        let v: Value = serde_json::from_str(&line(&mut from_relay)).unwrap();
+        assert_eq!(v["params"]["env"], json!({"HOME": "/home/remote"}));
+        // Downstream: a verb-looking line is not touched.
+        let down = b"{\"method\":\"run\",\"params\":{\"env\":{\"A\":\"b\"}}}\n";
+        (&daemon).write_all(down).unwrap();
+        assert_eq!(line(&mut BufReader::new(stdout_r)).as_bytes(), down);
+        stdin.shutdown(Shutdown::Write).unwrap();
+        drop((daemon, from_relay));
+        assert_eq!(relay.join().unwrap().unwrap(), End::Stdin);
+    }
+
     #[test]
     fn relays_a_real_daemon_without_its_own_hello() {
         let dir = scratch("relay");
@@ -263,7 +451,7 @@ mod tests {
         let (mut stdin, stdin_r) = UnixStream::pair().unwrap();
         let (stdout_w, stdout_r) = UnixStream::pair().unwrap();
         stdout_r.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        let relay = std::thread::spawn(move || pump(stdin_r, stdout_w, stream, GRACE));
+        let relay = std::thread::spawn(move || pump(stdin_r, stdout_w, stream, GRACE, None));
         let mut stdout = BufReader::new(stdout_r);
         let ask = |stdin: &mut UnixStream, stdout: &mut BufReader<UnixStream>, req: Value| {
             stdin.write_all(format!("{req}\n").as_bytes()).unwrap();

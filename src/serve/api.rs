@@ -123,6 +123,7 @@ pub fn call(method: &str, params: Value, ctx: &Ctx) -> Answer {
             containers_inspect(parse(params)?, |c| crate::runtime::backend().inspect_json(c).map_err(ApiError::internal))
         }
         "sandboxes.list" => sandboxes_list(parse(params)?),
+        "roots.list" => roots_list(&state_path()?, std::env::var_os("HOME").map(PathBuf::from).as_deref()),
         "sandboxes.get" => sandboxes_get(parse(params)?),
         "services.get" => services_get(parse(params)?),
         "bridges.ensure" => bridges_ensure(parse(params)?, ctx),
@@ -236,9 +237,18 @@ pub struct Cancelled {
 }
 
 /// One `sandboxes.list` entry. An object, not a name, so fields can be added.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SandboxEntry {
     pub name: String,
+}
+
+/// One `roots.list` entry: a config root this host knows of, with its
+/// sandboxes, or why they can't be read (then `sandboxes` is empty).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RootCandidate {
+    pub root: PathBuf,
+    pub sandboxes: Vec<SandboxEntry>,
+    pub error: Option<String>,
 }
 
 // ---- handlers -------------------------------------------------------------
@@ -593,6 +603,31 @@ fn sandboxes_list(p: SandboxesParams) -> Answer {
         // A BTreeMap: already sorted.
         Some(config) => config.sandboxes.into_keys().map(|name| SandboxEntry { name }).collect(),
     };
+    serde_json::to_value(rows).map_err(|e| ApiError::internal(e.into()))
+}
+
+/// This host's candidate config roots (docs/machines.md, F5; what `machine
+/// add` offers): every distinct `config_dir` in `state` plus `~/.devsandboxes`
+/// when `home` has one, canonicalized (a root that's gone stays as recorded),
+/// sorted. Known roots only, no disk scan. A root that no longer exists or
+/// whose config doesn't load answers with its `error`.
+fn roots_list(state: &Path, home: Option<&Path>) -> Answer {
+    let state = load_state(state)?;
+    let recorded = state.instances.into_values().filter_map(|i| i.config_dir);
+    let home = home.map(|h| h.join(".devsandboxes")).filter(|d| d.is_dir());
+    let roots: std::collections::BTreeSet<PathBuf> =
+        recorded.chain(home).map(|r| std::fs::canonicalize(&r).unwrap_or(r)).collect();
+    let rows: Vec<RootCandidate> = roots
+        .into_iter()
+        .map(|root| match config_at(&root) {
+            Ok(config) => {
+                let names = config.map(|c| c.sandboxes.into_keys().collect()).unwrap_or_else(Vec::new);
+                let sandboxes = names.into_iter().map(|name| SandboxEntry { name }).collect();
+                RootCandidate { root, sandboxes, error: None }
+            }
+            Err(e) => RootCandidate { root, sandboxes: Vec::new(), error: Some(e.message) },
+        })
+        .collect();
     serde_json::to_value(rows).map_err(|e| ApiError::internal(e.into()))
 }
 
@@ -1614,6 +1649,54 @@ mod tests {
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 
+    #[test]
+    fn roots_list_answers_the_recorded_roots_and_home() {
+        let base = store_path("roots").with_file_name("roots");
+        let (shared, bad, gone, home) = (base.join("shared"), base.join("bad"), base.join("gone"), base.join("home"));
+        let with_root = |key: &str, root: &Path| format!("{}config_dir = {:?}\n", instance(key, "web", ""), root.to_str().unwrap());
+        // Two instances share a root (one written through a `..` path), one
+        // predates `config_dir`.
+        let state = state_file(
+            "roots",
+            &[
+                with_root("a", &shared),
+                with_root("b", &shared.join("../shared")),
+                with_root("c", &bad),
+                with_root("d", &gone),
+                instance("old", "web", ""),
+            ]
+            .concat(),
+        );
+        // After `state_file`, which clears the scratch dir.
+        for d in [&shared, &bad, &home.join(".devsandboxes")] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(shared.join(crate::config::CONFIG_FILE), "[sandbox.web]\nimage = \"a\"\n[sandbox.api]\nimage = \"a\"\n").unwrap();
+        std::fs::write(bad.join(crate::config::CONFIG_FILE), "[sandbox.web\n").unwrap();
+        let canon = |p: &Path| std::fs::canonicalize(p).unwrap();
+        let mut want = vec![
+            json!({"root": canon(&shared), "sandboxes": [{"name": "api"}, {"name": "web"}], "error": null}),
+            json!({"root": canon(&bad), "sandboxes": [], "error": ""}),
+            json!({"root": gone, "sandboxes": [], "error": format!("no directory {}", gone.display())}),
+            json!({"root": canon(&home.join(".devsandboxes")), "sandboxes": [], "error": null}),
+        ];
+        want.sort_by(|a, b| a["root"].as_str().cmp(&b["root"].as_str()));
+        let mut got = roots_list(&state, Some(&home)).unwrap();
+        // The parse error's text is the config module's; that there is one is ours.
+        for row in got.as_array_mut().unwrap() {
+            if row["root"] == json!(canon(&bad)) {
+                assert!(row["error"].as_str().unwrap().contains("devsandboxes.toml"), "{row}");
+                row["error"] = json!("");
+            }
+        }
+        assert_eq!(got, Value::Array(want));
+        // No home `.devsandboxes`, no state: nothing.
+        let none = roots_list(&state.with_file_name("absent.toml"), Some(&base)).unwrap();
+        assert_eq!(none, json!([]));
+        assert_eq!(roots_list(&state.with_file_name("absent.toml"), None).unwrap(), json!([]));
+        let _ = std::fs::remove_dir_all(base.parent().unwrap());
+    }
+
     fn listing(pid: &str) -> ProcsListing {
         ProcsListing {
             processes: vec![Process { pid: pid.into(), ppid: "0".into(), args: "sleep 9".into() }],
@@ -1846,6 +1929,7 @@ mod tests {
             ("containers.logs", "ContainerLogs"),
             ("containers.inspect", "unknown"),
             ("sandboxes.list", "SandboxEntry[]"),
+            ("roots.list", "RootCandidate[]"),
             ("sandboxes.get", "SandboxConfig"),
             ("services.get", "ServiceConfig"),
         ] {
@@ -2032,7 +2116,9 @@ mod tests {
         let hello_result = HelloResult { version: "0.6.0".into(), build: 1, protocol: 1, handoff: true };
         let error = ErrorBody { code: "failed".into(), message: "m".into(), data: Some(json!({"exit": 1})) };
 
-        let cases: [(&str, Value); 12] = [
+        let root = RootCandidate { root: "/cfg".into(), sandboxes: vec![SandboxEntry { name: "web".into() }], error: None };
+
+        let cases: [(&str, Value); 13] = [
             ("ThreadSummary", v(&summary())),
             ("ThreadDetail", v(&detail)),
             ("ThreadCompose", v(&ComposeView { placeholder: None, hint: None })),
@@ -2045,6 +2131,7 @@ mod tests {
             ("HelloResult", v(&hello_result)),
             ("ApiErrorBody", v(&error)),
             ("OkResult", ok().unwrap()),
+            ("RootCandidate", v(&root)),
         ];
         for (iface, value) in &cases {
             assert_matches(iface, value);

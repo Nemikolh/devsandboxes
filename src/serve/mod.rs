@@ -20,6 +20,8 @@
 //! - `forwards`: the port forwards (ad-hoc and configured), on their own thread
 //! - `forward_store`: `forwards.toml`, the ad-hoc forwards a successor restores
 //! - `client`: connect-or-lazy-start for commands
+//! - `machines`: remote hosts over ssh (docs/machines.md): the ssh argv and
+//!   dial, the link handshake
 //! - `relay`: `devsandbox api --stdio`, stdin/stdout ↔ the socket (step 9)
 //! - `install`: `serve install|uninstall`, the systemd user unit / LaunchAgent
 //!   (step 10)
@@ -37,6 +39,9 @@ pub mod forwards;
 mod host;
 pub mod idle;
 pub mod install;
+// Built ahead of its callers: used from step 2 of docs/machines.md.
+#[allow(dead_code)]
+pub mod machines;
 pub mod proto;
 pub mod relay;
 pub mod snapshots;

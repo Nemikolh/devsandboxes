@@ -677,6 +677,16 @@ export interface SandboxEntry {
   name: string;
 }
 
+/** One `roots.list` entry: a config root this host knows of. */
+export interface RootCandidate {
+  /** Absolute, canonicalized (a root that's gone: as recorded). */
+  root: string;
+  /** Sorted; `[]` when `error` is set or there's no config file. */
+  sandboxes: SandboxEntry[];
+  /** Why the root's sandboxes can't be read (gone, a config that doesn't load). */
+  error: string | null;
+}
+
 /** One process of an instance, as `ps` printed it. */
 export interface ProcessRow {
   pid: string;
@@ -970,6 +980,8 @@ export interface ApiMethods {
   'containers.inspect': { params: { container: string }; result: unknown };
   /** The config root's sandboxes, sorted; `[]` without a config file. */
   'sandboxes.list': { params: { root: string }; result: SandboxEntry[] };
+  /** This host's config roots: every one its instances were made from, plus `~/.devsandboxes`; sorted. */
+  'roots.list': { params: {}; result: RootCandidate[] };
   /** `not-found` for an unknown sandbox; one that doesn't merge answers why in `resolved`. */
   'sandboxes.get': { params: { root: string; name: string }; result: SandboxConfig };
   'services.get': { params: { root: string; name: string }; result: ServiceConfig };

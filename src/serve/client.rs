@@ -59,7 +59,9 @@ pub enum Streamed {
 }
 
 impl Conn {
-    fn new(stream: Stream, daemon: HelloResult) -> Result<Self> {
+    /// Over `stream`, past its hello (`daemon` is the reply): the local
+    /// daemon's socket, or a machine's `ssh::Duplex`.
+    pub(crate) fn new(stream: Stream, daemon: HelloResult) -> Result<Self> {
         let reader = BufReader::new(stream.try_clone().context("cannot clone the daemon connection")?);
         Ok(Self { reader, writer: stream, next_id: 1, daemon, notes: VecDeque::new(), partial: Vec::new() })
     }

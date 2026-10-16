@@ -301,6 +301,10 @@ enum Command {
         /// Who's relaying (`api:<name>`, `npm:<name>`), for serve.log
         #[arg(long, default_value = "api")]
         client: String,
+        /// Give relayed verb requests this process's env (a machine link's
+        /// relay over ssh: docs/machines.md)
+        #[arg(long, hide = true)]
+        session_env: bool,
     },
 }
 
@@ -580,7 +584,9 @@ fn main() -> Result<()> {
             Some(ServeCommand::Uninstall) => serve::install::uninstall_cli(),
         },
         #[cfg(unix)]
-        Command::Api { stdio: _, client } => std::process::exit(serve::relay::stdio(&client)?),
+        Command::Api { stdio: _, client, session_env } => {
+            std::process::exit(serve::relay::stdio(&client, session_env)?)
+        }
     }
 }
 
