@@ -7,6 +7,8 @@
 //! - `link`: a connection to a machine's daemon (the hello)
 //! - `service`: the held link per machine, its rows and forwarded calls
 //! - `api`: the `machines.*` methods
+//! - `forward`: requests with `machine` (quick calls, verbs) and the
+//!   federated resolve and sandboxes listing
 //!
 //! Only the daemon writes the registry (`machines.add` / `machines.rm`);
 //! the CLI reads it later to know whether any machine exists (F15). Two
@@ -23,6 +25,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 pub mod api;
+pub mod forward;
 pub mod link;
 pub mod service;
 pub mod ssh;

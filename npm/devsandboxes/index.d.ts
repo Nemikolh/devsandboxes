@@ -153,6 +153,8 @@ export interface SnapshotMachine {
   version: string | null;
   /** Its runtime (`runtime_name`), once a snapshot came. */
   runtime: string | null;
+  /** The remote devsandbox as shell text; `null` is `devsandbox` on its `PATH` (for an ssh argv). */
+  command: string | null;
 }
 
 /**
@@ -687,7 +689,20 @@ export interface ForwardAdded {
 
 /** `instances.resolve`'s answer: every instance the name could mean, sorted (several: the caller picks). */
 export interface InstancesResolved {
+  /** With `machines`: a machine's matches qualified, `<machine>/<name>`. */
   matches: string[];
+  /** `matches` in order, with where each lives (absent from older daemons). */
+  found?: ResolvedInstance[];
+}
+
+/** One {@link InstancesResolved} match. */
+export interface ResolvedInstance {
+  /** Its name on its own host (unqualified). */
+  name: string;
+  /** `null`: this host. */
+  machine: string | null;
+  /** Its config root on its host; `null` when not recorded. */
+  root: string | null;
 }
 
 /** `instances.cancel`'s answer: the in-flight verb's pid was SIGINTed. */
@@ -710,6 +725,10 @@ export interface InstanceDone {
 /** One `sandboxes.list` entry (not the snapshot's {@link SandboxRow}). */
 export interface SandboxEntry {
   name: string;
+  /** With `sandboxes.list`'s `machines`: the machine defining it; absent for this host's. */
+  machine?: string;
+  /** The config root defining it: always in `sandboxes.list`, absent in `roots.list`. */
+  root?: string;
 }
 
 /** One `roots.list` entry: a config root this host knows of. */
@@ -738,6 +757,17 @@ export interface MachineAdded {
   version: string;
   /** Set when that semver differs from this daemon's. */
   warning: string | null;
+}
+
+/** `machines.get`'s answer: what an ssh command to the machine needs. */
+export interface MachineInfo {
+  name: string;
+  /** What ssh takes, or an `ssh://` URL. */
+  target: string;
+  /** The remote devsandbox as shell text; `null` is `devsandbox` on its `PATH`. */
+  command: string | null;
+  /** Config roots on the machine. */
+  roots: string[];
 }
 
 /** One registered machine (`machines.list`). */
@@ -850,9 +880,14 @@ export interface ForwardsStatus {
  * daemon's).
  */
 export interface VerbParams {
-  /** Absolute config root (the CLI's `-C`). */
+  /** Absolute config root (the CLI's `-C`); with `machine`, a path on that machine. */
   root: string;
   env: Record<string, string>;
+  /**
+   * Run it on that machine (a fresh ssh); answered as it answers there. A
+   * hang-up cancels it there unless `detach`, and so does this daemon exiting.
+   */
+  machine?: string;
 }
 
 /** A terminal's size in cells. */
@@ -1030,29 +1065,37 @@ export interface ApiMethods {
   'instances.watch': { params: { dir: string; machines?: boolean }; result: OkResult };
   /** Stop `instances.watch`ing `dir`; not watching it is fine. */
   'instances.unwatch': { params: { dir: string }; result: OkResult };
-  /** `not-found` when nothing matches. */
-  'instances.resolve': { params: { name: string }; result: InstancesResolved };
+  /**
+   * `not-found` when nothing matches. `machines`: this host and every machine (5 s each); a
+   * `not-found` then names the machines that didn't answer.
+   * `machine` (here and on every instance, container and config method below): ask that machine,
+   * answered as it answers; `not-found` for a machine that isn't registered.
+   */
+  'instances.resolve': { params: { name: string; machines?: boolean; machine?: string }; result: InstancesResolved };
   /** SIGINT an in-flight `run`/`rebuild` (it rolls back or records failed); `invalid` when not in flight. */
-  'instances.cancel': { params: { instance: string }; result: InstanceCancelled };
+  'instances.cancel': { params: { instance: string; machine?: string }; result: InstanceCancelled };
   /** Per named instance (exact names), its processes and runs or an `error`; a per-instance failure never fails the call. */
-  'instances.procs': { params: { instances: string[] }; result: Record<string, InstanceProcs> };
+  'instances.procs': { params: { instances: string[]; machine?: string }; result: Record<string, InstanceProcs> };
   /**
    * `instance`: exact name or instance id; `lines` default 500, at most 10000. `null`: no build log yet.
    * A pty log is replayed: plain lines, or with `ansi` lines carrying SGR escapes only.
    */
-  'instances.buildLog': { params: { instance: string; lines?: number; ansi?: boolean }; result: BuildLogTail | null };
+  'instances.buildLog': { params: { instance: string; lines?: number; ansi?: boolean; machine?: string }; result: BuildLogTail | null };
   /** Signal a process in the instance's container (exact name; `pid` from `instances.procs`, digits). */
-  'instances.signal': { params: { instance: string; pid: string; signal: 'TERM' | 'KILL' }; result: OkResult };
+  'instances.signal': { params: { instance: string; pid: string; signal: 'TERM' | 'KILL'; machine?: string }; result: OkResult };
   /** Exact name; `invalid` for a bad or taken name, or an instance mid-build. */
-  'instances.rename': { params: { instance: string; newName: string }; result: InstanceRenamed };
+  'instances.rename': { params: { instance: string; newName: string; machine?: string }; result: InstanceRenamed };
   /** Set or clear the done flag (exact name); idempotent. */
-  'instances.done': { params: { instance: string; done: boolean }; result: InstanceDone };
+  'instances.done': { params: { instance: string; done: boolean; machine?: string }; result: InstanceDone };
   /** `devsandbox-…` containers only; `lines` default 50, at most 10000. */
-  'containers.logs': { params: { container: string; lines?: number }; result: ContainerLogs };
+  'containers.logs': { params: { container: string; lines?: number; machine?: string }; result: ContainerLogs };
   /** `devsandbox-…` containers only: the runtime's inspect JSON (docker's: an array of one object). */
-  'containers.inspect': { params: { container: string }; result: unknown };
-  /** The config root's sandboxes, sorted; `[]` without a config file. */
-  'sandboxes.list': { params: { root: string }; result: SandboxEntry[] };
+  'containers.inspect': { params: { container: string; machine?: string }; result: unknown };
+  /**
+   * The config root's sandboxes, sorted; `[]` without a config file. `machines`: then every
+   * machine's registered roots' (5 s; one that doesn't answer adds nothing, see `machines.list`).
+   */
+  'sandboxes.list': { params: { root: string; machines?: boolean; machine?: string }; result: SandboxEntry[] };
   /**
    * This host's config roots: every one its instances were made from, plus `~/.devsandboxes`; sorted.
    * With `paths`: exactly those, in order (`~` expanded here, canonicalized; a bad one has its `error`).
@@ -1064,9 +1107,11 @@ export interface ApiMethods {
   'machines.add': { params: { target: string; name?: string; roots: string[] }; result: MachineAdded };
   'machines.list': { params: {}; result: MachineRow[] };
   'machines.rm': { params: { name: string }; result: OkResult };
+  /** One registered machine, to build an ssh command to it; `not-found` for an unknown name. */
+  'machines.get': { params: { name: string }; result: MachineInfo };
   /** `not-found` for an unknown sandbox; one that doesn't merge answers why in `resolved`. */
-  'sandboxes.get': { params: { root: string; name: string }; result: SandboxConfig };
-  'services.get': { params: { root: string; name: string }; result: ServiceConfig };
+  'sandboxes.get': { params: { root: string; name: string; machine?: string }; result: SandboxConfig };
+  'services.get': { params: { root: string; name: string; machine?: string }; result: ServiceConfig };
   'forwards.list': { params: { dir?: string }; result: ForwardRow[] };
   'forwards.add': { params: ForwardAddParams; result: ForwardAdded };
   'forwards.rm': { params: { id: number }; result: ForwardRemoved };

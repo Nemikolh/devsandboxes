@@ -207,7 +207,7 @@ mod tests {
     fn cand(root: &str, sandboxes: &[&str], error: Option<&str>) -> RootCandidate {
         RootCandidate {
             root: root.into(),
-            sandboxes: sandboxes.iter().map(|s| SandboxEntry { name: s.to_string() }).collect(),
+            sandboxes: sandboxes.iter().map(|s| SandboxEntry::named(s.to_string())).collect(),
             error: error.map(String::from),
         }
     }

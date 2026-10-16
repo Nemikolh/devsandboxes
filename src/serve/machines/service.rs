@@ -252,6 +252,13 @@ impl Handle {
         }
     }
 
+    /// The registered machines as of the last reload, sorted by name: what
+    /// a forwarded verb dials and a federated call fans out to, without a
+    /// registry read per request.
+    pub fn entries(&self) -> Vec<Entry> {
+        self.inner.lock_links().values().map(|l| l.entry.clone()).collect()
+    }
+
     /// The machines' states and rows.
     pub fn remotes(&self) -> &Arc<Remotes> {
         &self.inner.remotes
@@ -651,7 +658,7 @@ mod tests {
         assert_eq!(s["dir"], local_root.to_str().unwrap());
         assert_eq!(
             s["machines"],
-            json!([{"name": "box", "target": "me@box", "state": "connected", "error": null, "version": "0.6.0", "runtime": "Disk"}])
+            json!([{"name": "box", "target": "me@box", "state": "connected", "error": null, "version": "0.6.0", "runtime": "Disk", "command": null}])
         );
         crate::serve::dts::assert_matches("InstancesSnapshot", &s);
         crate::serve::dts::assert_matches("SnapshotMachine", &s["machines"][0]);

@@ -44,13 +44,18 @@
 //! read-side shutdown ends it too, but sets `draining` first, so the verb
 //! is left running rather than cancelled, and doesn't hold the drain; the
 //! successor adopts it by its spool files and holds until it exits.
+//!
+//! A request with `machine` goes to that machine (`machines::forward`): a
+//! quick call over its held link, a verb over an ssh of its own, relayed on
+//! this connection. Such a verb has no spool here, so a drain cuts it like a
+//! hang-up (cancelled there unless `detach`).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{File, TryLockError};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::Shutdown;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -63,7 +68,7 @@ use super::endpoint::{self, Listener, Stream};
 use super::forwards::{self, Registry};
 use super::host::{Host, Observers, Waker};
 use super::idle::{self, Decision, Holders};
-use super::machines::{self, link, service, ssh::{self, Dial}};
+use super::machines::{self, forward as fwd, link, service, ssh::{self, Dial}};
 use super::proto::{self, HelloParams, HelloResult, Notification, Request, Response, Version};
 use super::snapshots::{self, Join, Snapshots};
 use super::verbs;
@@ -404,6 +409,9 @@ struct Shared {
     /// The verbs not reaped yet, a predecessor's adopted ones included: the
     /// `verbs` holder count.
     verbs: Arc<verbs::InFlight>,
+    /// Verbs forwarded to a machine, in flight: counted with `verbs`, so
+    /// the daemon doesn't idle out under a remote verb's ssh.
+    remote_verbs: AtomicUsize,
     /// Set when the drain starts: its read-side shutdown is not a client
     /// hanging up, so a verb's connection must not cancel on it.
     draining: AtomicBool,
@@ -438,6 +446,7 @@ impl Shared {
             forwards: OnceLock::new(),
             runner: OnceLock::new(),
             verbs: Arc::default(),
+            remote_verbs: AtomicUsize::new(0),
             draining: AtomicBool::new(false),
             snapshots: Arc::default(),
             join,
@@ -459,7 +468,7 @@ impl Shared {
     fn holders(&self, host: Option<&Host>, registry: Option<&Registry>) -> Holders {
         let clients = self.conns.lock().unwrap().len();
         let forwards = registry.map_or(0, Registry::active);
-        let verbs = self.verbs.len();
+        let verbs = self.verbs.len() + self.remote_verbs.load(Ordering::SeqCst);
         let Some(host) = host else { return Holders { clients, forwards, verbs, ..Default::default() } };
         Holders {
             clients,
@@ -892,16 +901,35 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
         Ok(req) => req,
         Err(e) => return Some(Response::err(None, "invalid", format!("not a request: {e}"))),
     };
-    let answer = match req.method.as_str() {
+    match req.method.as_str() {
         "hello" => return Some(hello(req.id, req.params, shared, conn)),
         method if verbs::is_verb(method) => return verb(req.id, method, req.params, shared, conn),
+        _ => {}
+    }
+    // On a machine: the remote's answer as is (docs/machines.md, F6).
+    match fwd::machine_of(&req.params) {
+        Err(e) => return Some(Response::err(req.id, e.code, e.message)),
+        Ok(Some(machine)) if fwd::is_quick(&req.method) => {
+            return Some(forward(req.id, &req.method, req.params, &machine, shared));
+        }
+        Ok(Some(_)) => {
+            return Some(Response::err(req.id, "invalid", format!("`{}` can't take a machine yet", req.method)));
+        }
+        Ok(None) => {}
+    }
+    let answer = match req.method.as_str() {
         "subscribe" => subscribe(req.params, conn, true),
         "unsubscribe" => subscribe(req.params, conn, false),
         "instances.watch" => watch_root(req.params, shared, conn),
         "instances.unwatch" => unwatch_root(req.params, conn),
-        // On a machine: the remote's answer as is (step 4 forwards the rest).
-        "instances.list" if req.params.get("machine").is_some_and(|m| !m.is_null()) => {
-            return Some(forward(req.id, &req.method, req.params, shared));
+        // This host and every machine (F11).
+        "instances.resolve" if fwd::federated(&req.params) => {
+            let local = local_call(&req.method, req.params.clone(), shared, conn);
+            fwd::resolve_everywhere(&req.params, local, shared.links())
+        }
+        "sandboxes.list" if fwd::federated(&req.params) => {
+            let local = local_call(&req.method, req.params, shared, conn);
+            fwd::sandboxes_everywhere(local, shared.links())
         }
         "shutdown" => {
             log(&format!("{}: shutdown requested", conn.label()));
@@ -912,12 +940,7 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
             let ctx = shared.machines.as_ref().expect("checked");
             machines::api::call(method, req.params, ctx).unwrap_or_else(|| Err(api::ApiError::unknown_method(method)))
         }
-        method => {
-            let bridges = shared.bridges.get().map(|w| w as &dyn api::Bridging);
-            let forwards = shared.forwards.get().map(|h| h as &dyn api::Forwarding);
-            let host = Some(api::HostPaths { state: &shared.state, home: shared.home.as_deref() });
-            api::call(method, req.params, &api::Ctx { inbox: &shared.inbox, client: &conn.audit, bridges, forwards, host })
-        }
+        method => local_call(method, req.params, shared, conn),
     };
     Some(match answer {
         Ok(result) => Response::ok(req.id, result),
@@ -930,17 +953,20 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
     })
 }
 
-/// A request with `machine`: the rest of its params to that machine's daemon
-/// over its link (docs/machines.md, F6), answered with the remote's result
-/// or error, code and data kept, under this request's id.
-fn forward(id: Option<u64>, method: &str, params: Value, shared: &Shared) -> Response {
-    let mut params = params;
-    let machine = match params.as_object_mut().and_then(|p| p.remove("machine")) {
-        Some(Value::String(m)) => m,
-        _ => return Response::err(id, "invalid", "`machine` must be a machine name"),
-    };
+/// An `api.rs` method, answered by this host.
+fn local_call(method: &str, params: Value, shared: &Shared, conn: &ConnState) -> Result<Value, api::ApiError> {
+    let bridges = shared.bridges.get().map(|w| w as &dyn api::Bridging);
+    let forwards = shared.forwards.get().map(|h| h as &dyn api::Forwarding);
+    let host = Some(api::HostPaths { state: &shared.state, home: shared.home.as_deref() });
+    api::call(method, params, &api::Ctx { inbox: &shared.inbox, client: &conn.audit, bridges, forwards, host })
+}
+
+/// A quick call with `machine`: the rest of its params to that machine's
+/// daemon over its link (docs/machines.md, F6), answered with the remote's
+/// result or error, code and data kept, under this request's id.
+fn forward(id: Option<u64>, method: &str, params: Value, machine: &str, shared: &Shared) -> Response {
     let answer = match shared.links() {
-        Some(links) => links.forward(&machine, method, params),
+        Some(links) => links.forward(machine, method, fwd::strip(params)),
         None => Err(api::ApiError::not_found(format!("no machine named `{machine}`"))),
     };
     match answer {
@@ -953,6 +979,11 @@ fn forward(id: Option<u64>, method: &str, params: Value, shared: &Shared) -> Res
 /// ends (or a `detach` answer), streaming its output. `None`: the client
 /// hung up, or the daemon drains; nothing is answered.
 fn verb(id: Option<u64>, method: &str, params: Value, shared: &Shared, conn: &ConnState) -> Option<Response> {
+    match fwd::machine_of(&params) {
+        Err(e) => return Some(Response::err(id, e.code, e.message)),
+        Ok(Some(machine)) => return remote_verb(id, method, params, &machine, shared, conn),
+        Ok(None) => {}
+    }
     let Some(runner) = shared.runner.get() else {
         return Some(Response::err(id, "internal", "this daemon runs no verbs"));
     };
@@ -971,6 +1002,18 @@ fn verb(id: Option<u64>, method: &str, params: Value, shared: &Shared, conn: &Co
         }
         verbs::Outcome::Gone => None,
     }
+}
+
+/// A verb with `machine`: run there over a connection of its own
+/// (`machines::forward::verb`, which says how a hang-up and a drain end it).
+fn remote_verb(id: Option<u64>, method: &str, params: Value, machine: &str, shared: &Shared, conn: &ConnState) -> Option<Response> {
+    let (Some(ctx), Some(links)) = (shared.machines.as_ref(), shared.links()) else {
+        return Some(Response::err(id, "not-found", format!("no machine named `{machine}`")));
+    };
+    let label = conn.label();
+    let vctx = fwd::VerbCtx { entries: links.entries(), dial: &ctx.dial, held: &shared.remote_verbs, who: &label, log };
+    let peer = ConnPeer { out: &conn.out, shared };
+    fwd::verb(id, method, params, machine, &vctx, &peer)
 }
 
 /// A verb's view of its connection.

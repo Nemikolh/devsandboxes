@@ -47,6 +47,7 @@ pub fn call(method: &str, params: Value, ctx: &Ctx) -> Option<Answer> {
         "machines.probe" => parse(params).and_then(|p| probe(p, ctx)),
         "machines.add" => parse(params).and_then(|p| add(p, ctx)),
         "machines.list" => list(ctx),
+        "machines.get" => parse(params).and_then(|p| get(p, ctx)),
         "machines.rm" => parse(params).and_then(|p| rm(p, ctx)),
         _ => return None,
     };
@@ -186,12 +187,31 @@ fn list(ctx: &Ctx) -> Answer {
     to_value(rows)
 }
 
+/// `machines.get`'s answer: what an ssh command to the machine needs. No
+/// argv on the wire: Rust callers build it (`ssh::tty_argv`), other clients
+/// from `target` and `command`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MachineInfo {
+    pub name: String,
+    pub target: String,
+    pub command: Option<String>,
+    pub roots: Vec<PathBuf>,
+}
+
+fn get(p: NameParams, ctx: &Ctx) -> Answer {
+    let entry = registered(ctx)?
+        .into_iter()
+        .find(|e| e.name == p.name)
+        .ok_or_else(|| ApiError::not_found(format!("no machine named `{}`", p.name)))?;
+    to_value(MachineInfo { name: entry.name, target: entry.target, command: entry.command, roots: entry.roots })
+}
+
 #[derive(Deserialize)]
-struct RmParams {
+struct NameParams {
     name: String,
 }
 
-fn rm(p: RmParams, ctx: &Ctx) -> Answer {
+fn rm(p: NameParams, ctx: &Ctx) -> Answer {
     let removed = super::update(&ctx.registry, |entries| {
         let before = entries.len();
         entries.retain(|e| e.name != p.name);
@@ -215,10 +235,10 @@ fn taken(name: &str) -> ApiError {
 }
 
 /// Dial `entry` and say hello: `failed` with ssh's or the hello's reason.
-/// The daemon's own `SSH_AUTH_SOCK` for `-A` (step 3 picks the preferred
-/// agent).
+/// The daemon's preferred host agent for `-A`, as the held links use (F3).
 fn connect(entry: &Entry, ctx: &Ctx) -> Result<Link, ApiError> {
-    let duplex = (ctx.dial)(entry, None).map_err(|e| ApiError::failed(format!("{}: {e:#}", entry.name)))?;
+    let agent = crate::devsbd::bridge::host_agent();
+    let duplex = (ctx.dial)(entry, agent.as_deref()).map_err(|e| ApiError::failed(format!("{}: {e:#}", entry.name)))?;
     link::handshake(&entry.name, duplex, HANDSHAKE_TIMEOUT).map_err(|e| ApiError::failed(e.to_string()))
 }
 
@@ -411,6 +431,9 @@ mod tests {
                 {"name": "box2", "target": "ssh://box:2200", "roots": [dot], "command": null, "state": "idle", "error": null, "version": null},
             ])
         );
+        let info = ok(&mut pair.local, "machines.get", json!({"name": "box2"}));
+        assert_eq!(info, json!({"name": "box2", "target": "ssh://box:2200", "command": null, "roots": [dot]}));
+        assert_eq!(err(&mut pair.local, "machines.get", json!({"name": "nope"})).0, "not-found");
         assert_eq!(ok(&mut pair.local, "machines.rm", json!({"name": "box"})), json!({"ok": true}));
         let (code, _) = err(&mut pair.local, "machines.rm", json!({"name": "box"}));
         assert_eq!(code, "not-found");
@@ -443,12 +466,15 @@ mod tests {
             version: None,
         };
         assert_matches("MachineRow", &to_value(row).unwrap());
+        let info = MachineInfo { name: "m".into(), target: "m".into(), command: None, roots: vec![] };
+        assert_matches("MachineInfo", &to_value(info).unwrap());
         assert_eq!(union_members("LinkState"), ["'idle'", "'connecting'", "'connected'", "'unreachable'"]);
         for (method, result) in [
             ("machines.probe", "MachineProbe"),
             ("machines.add", "MachineAdded"),
             ("machines.list", "MachineRow[]"),
             ("machines.rm", "OkResult"),
+            ("machines.get", "MachineInfo"),
         ] {
             let ty = prop_type("ApiMethods", method).unwrap_or_else(|| panic!("ApiMethods lacks `{method}`"));
             assert!(ty.contains(&format!("result: {result} ")), "{method}: {ty}");

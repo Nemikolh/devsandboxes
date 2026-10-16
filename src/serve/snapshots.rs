@@ -179,6 +179,8 @@ impl LinkState {
 pub struct Machine {
     pub name: String,
     pub target: String,
+    /// The registry's `command` (the remote devsandbox), for an ssh argv.
+    pub command: Option<String>,
     /// The registered roots, in order: the first one shows the instances
     /// whose root isn't registered (F8).
     pub roots: Vec<PathBuf>,
@@ -207,6 +209,7 @@ impl Remotes {
         for e in entries {
             let m = inner.entry(e.name.clone()).or_insert_with(|| Machine { name: e.name.clone(), ..Machine::default() });
             m.target.clone_from(&e.target);
+            m.command.clone_from(&e.command);
             m.roots.clone_from(&e.roots);
             m.rows.retain(|root, _| e.roots.contains(root));
         }
@@ -243,6 +246,9 @@ pub struct SnapshotMachine {
     pub version: Option<String>,
     /// The remote's runtime (`runtime_name`), once a snapshot came.
     pub runtime: Option<String>,
+    /// The remote devsandbox (`None`: `devsandbox`), so the dashboard builds
+    /// a terminal's ssh argv (`ssh::tty_argv`) with no call.
+    pub command: Option<String>,
 }
 
 /// A `machines: true` watcher's `instances.snapshot`: `local` (a local
@@ -300,6 +306,7 @@ fn snapshot_machine(m: &Machine) -> SnapshotMachine {
         error: m.error.clone(),
         version: m.version.clone(),
         runtime,
+        command: m.command.clone(),
     }
 }
 
@@ -456,6 +463,7 @@ pub(crate) mod tests {
         // Never reached: its state only.
         let mut c = machine("c", &["/c"], LinkState::Unreachable);
         c.error = Some("c: Permission denied".into());
+        c.command = Some("~/bin/devsandbox".into());
 
         let merged = merge(&local, &[a, b, c]);
         // From its own root's snapshot when registered, else the first's.
@@ -474,9 +482,9 @@ pub(crate) mod tests {
         assert_eq!(
             merged["machines"],
             serde_json::json!([
-                {"name": "a", "target": "me@a", "state": "connected", "error": null, "version": "0.6.1", "runtime": "podman"},
-                {"name": "b", "target": "me@b", "state": "unreachable", "error": "b: Connection refused", "version": null, "runtime": "podman"},
-                {"name": "c", "target": "me@c", "state": "unreachable", "error": "c: Permission denied", "version": null, "runtime": null},
+                {"name": "a", "target": "me@a", "state": "connected", "error": null, "version": "0.6.1", "runtime": "podman", "command": null},
+                {"name": "b", "target": "me@b", "state": "unreachable", "error": "b: Connection refused", "version": null, "runtime": "podman", "command": null},
+                {"name": "c", "target": "me@c", "state": "unreachable", "error": "c: Permission denied", "version": null, "runtime": null, "command": "~/bin/devsandbox"},
             ])
         );
         // No machines: the local params plus an empty `machines`.

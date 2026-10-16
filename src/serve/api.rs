@@ -44,9 +44,9 @@ pub struct Ctx<'a> {
     pub bridges: Option<&'a dyn Bridging>,
     /// The port forwards `forwards.*` act on; `None` like `bridges`.
     pub forwards: Option<&'a dyn Forwarding>,
-    /// Where `roots.list` looks; `None` is the user's (`State::path`,
-    /// `$HOME`). A daemon passes its own, so a test daemon standing in as a
-    /// machine never reads the user's.
+    /// Where `roots.list` and the instance methods look; `None` is the
+    /// user's (`State::path`, `$HOME`). A daemon passes its own, so a test
+    /// daemon standing in as a machine never reads the user's.
     pub host: Option<HostPaths<'a>>,
 }
 
@@ -116,18 +116,18 @@ pub fn call(method: &str, params: Value, ctx: &Ctx) -> Answer {
         "inbox.form.submit" => form_submit(parse(params)?, ctx),
         "inbox.notify.dismiss" => dismiss(parse(params)?, ctx),
         "inbox.notify.markRead" => notify_mark_read(parse(params)?, ctx),
-        "instances.list" => instances_list(parse(params)?, &state_path()?),
-        "instances.resolve" => instances_resolve(parse(params)?, &state_path()?),
+        "instances.list" => instances_list(parse(params)?, &host_state(ctx)?),
+        "instances.resolve" => instances_resolve(parse(params)?, &host_state(ctx)?),
         "instances.cancel" => {
-            instances_cancel(parse(params)?, &state_path()?, crate::commands::run::cancel::interrupt)
+            instances_cancel(parse(params)?, &host_state(ctx)?, crate::commands::run::cancel::interrupt)
         }
-        "instances.procs" => instances_procs(parse(params)?, &state_path()?, fetch_procs),
-        "instances.signal" => instances_signal(parse(params)?, &state_path()?, |c, pid, n| {
+        "instances.procs" => instances_procs(parse(params)?, &host_state(ctx)?, fetch_procs),
+        "instances.signal" => instances_signal(parse(params)?, &host_state(ctx)?, |c, pid, n| {
             crate::runtime::backend().signal_proc(c, pid, n)
         }),
-        "instances.rename" => instances_rename(parse(params)?, &state_path()?),
-        "instances.done" => instances_done(parse(params)?, &state_path()?),
-        "instances.buildLog" => instances_build_log(parse(params)?, &state_path()?),
+        "instances.rename" => instances_rename(parse(params)?, &host_state(ctx)?),
+        "instances.done" => instances_done(parse(params)?, &host_state(ctx)?),
+        "instances.buildLog" => instances_build_log(parse(params)?, &host_state(ctx)?),
         "containers.logs" => {
             containers_logs(parse(params)?, |c, n| crate::runtime::backend().logs_tail(c, n).map_err(ApiError::internal))
         }
@@ -256,10 +256,28 @@ pub struct ForwardRemoved {
 }
 
 /// `instances.resolve`'s answer.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Resolved {
     /// Every instance the name could mean, sorted: one, or the choices.
+    /// A federated resolve qualifies a machine's as `<machine>/<name>`.
     pub matches: Vec<String>,
+    /// `matches` again, in order, with where each one lives: what a client
+    /// needs to route a verb (docs/machines.md, F11). Additive: an older
+    /// daemon's answer has none.
+    #[serde(default)]
+    pub found: Vec<Found>,
+}
+
+/// One `instances.resolve` match: its name on its own host (unqualified),
+/// the machine (`None`: this host) and its config root (`None`: an
+/// instance that predates `config_dir`, or an older machine).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Found {
+    pub name: String,
+    #[serde(default)]
+    pub machine: Option<String>,
+    #[serde(default)]
+    pub root: Option<PathBuf>,
 }
 
 /// `instances.cancel`'s answer.
@@ -271,9 +289,24 @@ pub struct Cancelled {
 }
 
 /// One `sandboxes.list` entry. An object, not a name, so fields can be added.
-#[derive(Debug, Serialize, Deserialize)]
+/// `roots.list` uses it bare (its candidate already says the root).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxEntry {
     pub name: String,
+    /// The machine it's defined on, in a federated `sandboxes.list`; absent
+    /// for this host's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
+    /// The config root defining it: always set by `sandboxes.list` (the
+    /// canonical root), absent in `roots.list`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<PathBuf>,
+}
+
+impl SandboxEntry {
+    pub(crate) fn named(name: String) -> Self {
+        Self { name, machine: None, root: None }
+    }
 }
 
 /// One `roots.list` entry: a config root this host knows of, with its
@@ -492,6 +525,15 @@ fn state_path() -> Result<PathBuf, ApiError> {
     crate::state::State::path().map_err(ApiError::internal)
 }
 
+/// The daemon's `state.toml` (its `Options.state`), else the user's: a test
+/// daemon standing in as a machine answers from its own.
+fn host_state(ctx: &Ctx) -> Result<PathBuf, ApiError> {
+    match ctx.host {
+        Some(host) => Ok(host.state.to_path_buf()),
+        None => state_path(),
+    }
+}
+
 fn load_state(path: &Path) -> Result<crate::state::State, ApiError> {
     crate::state::State::load_at(path).map_err(ApiError::internal)
 }
@@ -505,11 +547,20 @@ struct NameParams {
 /// (`commands::instance_matches`): a client picks among several itself, so
 /// ambiguity isn't an error here. `state` is injected for the tests.
 fn instances_resolve(p: NameParams, state: &Path) -> Answer {
-    let matches = crate::commands::instance_matches(&load_state(state)?, &p.name);
+    let state = load_state(state)?;
+    let matches = crate::commands::instance_matches(&state, &p.name);
     if matches.is_empty() {
         return Err(ApiError::not_found(crate::commands::no_instance_matches(&p.name)));
     }
-    serde_json::to_value(Resolved { matches }).map_err(|e| ApiError::internal(e.into()))
+    let found = matches
+        .iter()
+        .map(|name| Found {
+            name: name.clone(),
+            machine: None,
+            root: state.instances.get(name).and_then(|i| i.config_dir.clone()),
+        })
+        .collect();
+    serde_json::to_value(Resolved { matches, found }).map_err(|e| ApiError::internal(e.into()))
 }
 
 /// `pub(crate)` for the dashboard's test that its call parses.
@@ -632,10 +683,16 @@ struct SandboxesParams {
 /// sandboxes (the CLI then offers the example config); one that doesn't
 /// load is `invalid`, with why.
 fn sandboxes_list(p: SandboxesParams) -> Answer {
-    let rows: Vec<SandboxEntry> = match config_at(&p.root)? {
+    let config = config_at(&p.root)?;
+    let root = std::fs::canonicalize(&p.root).unwrap_or(p.root);
+    let rows: Vec<SandboxEntry> = match config {
         None => Vec::new(),
         // A BTreeMap: already sorted.
-        Some(config) => config.sandboxes.into_keys().map(|name| SandboxEntry { name }).collect(),
+        Some(config) => config
+            .sandboxes
+            .into_keys()
+            .map(|name| SandboxEntry { root: Some(root.clone()), ..SandboxEntry::named(name) })
+            .collect(),
     };
     serde_json::to_value(rows).map_err(|e| ApiError::internal(e.into()))
 }
@@ -656,7 +713,7 @@ fn roots_list(state: &Path, home: Option<&Path>) -> Answer {
         .map(|root| match config_at(&root) {
             Ok(config) => {
                 let names = config.map(|c| c.sandboxes.into_keys().collect()).unwrap_or_else(Vec::new);
-                let sandboxes = names.into_iter().map(|name| SandboxEntry { name }).collect();
+                let sandboxes = names.into_iter().map(SandboxEntry::named).collect();
                 RootCandidate { root, sandboxes, error: None }
             }
             Err(e) => RootCandidate { root, sandboxes: Vec::new(), error: Some(e.message) },
@@ -700,7 +757,7 @@ fn roots_check(paths: &[String], home: Option<&Path>) -> Answer {
             match config_at(&root) {
                 Ok(config) => {
                     let names = config.map(|c| c.sandboxes.into_keys().collect()).unwrap_or_else(Vec::new);
-                    RootCandidate { root, sandboxes: names.into_iter().map(|name| SandboxEntry { name }).collect(), error: None }
+                    RootCandidate { root, sandboxes: names.into_iter().map(SandboxEntry::named).collect(), error: None }
                 }
                 Err(e) => failed(root, e.message),
             }
@@ -1599,10 +1656,18 @@ mod tests {
 
     #[test]
     fn instances_resolve_returns_every_match_of_the_winning_tier() {
-        let state = state_file("resolve", &[instance("web", "web", ""), instance("web-2", "web", ""), instance("x", "web", "")].concat());
+        let rooted = format!("{}config_dir = \"/cfg\"\n", instance("web", "web", ""));
+        let state = state_file("resolve", &[rooted, instance("web-2", "web", ""), instance("x", "web", "")].concat());
         let resolve = |params: Value| instances_resolve(parse(params)?, &state);
-        assert_eq!(resolve(json!({"name": "web"})).unwrap(), json!({"matches": ["web"]}), "exact wins");
-        assert_eq!(resolve(json!({"name": "w"})).unwrap(), json!({"matches": ["web", "web-2", "x"]}), "folder basename");
+        let found = |name: &str, root: Option<&str>| json!({"name": name, "machine": null, "root": root});
+        assert_eq!(
+            resolve(json!({"name": "web"})).unwrap(),
+            json!({"matches": ["web"], "found": [found("web", Some("/cfg"))]}),
+            "exact wins"
+        );
+        let all = resolve(json!({"name": "w"})).unwrap();
+        assert_eq!(all["matches"], json!(["web", "web-2", "x"]), "folder basename");
+        assert_eq!(all["found"], json!([found("web", Some("/cfg")), found("web-2", None), found("x", None)]));
         assert_eq!(code(resolve(json!({"name": "nope"}))), "not-found");
         assert_eq!(code(resolve(json!({}))), "invalid");
         // A missing state file is no instances.
@@ -1717,7 +1782,8 @@ mod tests {
         let list = |root: &Path| run(&store_path("sandboxes-x"), "sandboxes.list", json!({"root": root}));
         assert_eq!(list(&root).unwrap(), json!([]), "no config: none");
         std::fs::write(root.join(crate::config::CONFIG_FILE), "[sandbox.web]\nimage = \"alpine\"\n[sandbox.api]\nimage = \"alpine\"\n").unwrap();
-        assert_eq!(list(&root).unwrap(), json!([{"name": "api"}, {"name": "web"}]));
+        let canon = std::fs::canonicalize(&root).unwrap();
+        assert_eq!(list(&root).unwrap(), json!([{"name": "api", "root": canon}, {"name": "web", "root": canon}]));
         std::fs::write(root.join(crate::config::CONFIG_FILE), "[sandbox.web\n").unwrap();
         let bad = list(&root).unwrap_err();
         assert!(bad.code == "invalid" && bad.message.contains("devsandboxes.toml"), "{bad:?}");
@@ -2018,9 +2084,18 @@ mod tests {
         fn v(x: &impl Serialize) -> Value {
             serde_json::to_value(x).unwrap()
         }
-        assert_matches("InstancesResolved", &v(&Resolved { matches: vec!["web".into()] }));
+        let found = |machine: Option<&str>, root: Option<&str>| Found {
+            name: "web".into(),
+            machine: machine.map(Into::into),
+            root: root.map(Into::into),
+        };
+        let resolved = Resolved { matches: vec!["web".into(), "m/web".into()], found: vec![found(None, None), found(Some("m"), Some("/cfg"))] };
+        assert_matches("InstancesResolved", &v(&resolved));
+        assert_matches("ResolvedInstance", &v(&found(None, None)));
         assert_matches("InstanceCancelled", &v(&Cancelled { ok: true, pid: 1 }));
-        assert_matches("SandboxEntry", &v(&SandboxEntry { name: "web".into() }));
+        assert_matches("SandboxEntry", &v(&SandboxEntry::named("web".into())));
+        let listed = SandboxEntry { name: "web".into(), machine: Some("m".into()), root: Some("/cfg".into()) };
+        assert_matches("SandboxEntry", &v(&listed));
         let list = InstancesList { snapshot: empty_snapshot(), thread_children: Default::default() };
         assert_matches("InstancesList", &v(&list));
         let cfg = crate::config::Config::parse("[sandbox.web]\nimage = \"alpine\"\n").unwrap();
@@ -2239,7 +2314,7 @@ mod tests {
         let hello_result = HelloResult { version: "0.6.0".into(), build: 1, protocol: 1, handoff: true };
         let error = ErrorBody { code: "failed".into(), message: "m".into(), data: Some(json!({"exit": 1})) };
 
-        let root = RootCandidate { root: "/cfg".into(), sandboxes: vec![SandboxEntry { name: "web".into() }], error: None };
+        let root = RootCandidate { root: "/cfg".into(), sandboxes: vec![SandboxEntry::named("web".into())], error: None };
 
         let cases: [(&str, Value); 13] = [
             ("ThreadSummary", v(&summary())),
