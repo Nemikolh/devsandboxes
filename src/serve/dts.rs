@@ -16,13 +16,18 @@ pub const DTS: &str = include_str!("../../npm/devsandboxes/index.d.ts");
 /// `interface <name>`'s properties, own first then inherited through
 /// `extends`, as `(name, type text)`. Panics when there's no such interface.
 pub fn interface(name: &str) -> Vec<(String, String)> {
+    fields(name).into_iter().map(|(n, t, _)| (n, t)).collect()
+}
+
+/// [`interface`] with each property's optionality (`name?:`).
+fn fields(name: &str) -> Vec<(String, String, bool)> {
     let (header, body) = block(name).unwrap_or_else(|| panic!("index.d.ts has no `interface {name}`"));
     let mut out = props(body);
     if let Some((_, bases)) = header.split_once("extends") {
         for base in bases.split(',') {
             let base = base.trim().split('<').next().unwrap_or("").trim();
             if !base.is_empty() {
-                out.extend(interface(base));
+                out.extend(fields(base));
             }
         }
     }
@@ -34,7 +39,8 @@ pub fn prop_type(iface: &str, prop: &str) -> Option<String> {
     interface(iface).into_iter().find(|(n, _)| n == prop).map(|(_, t)| t)
 }
 
-/// `value` (a JSON object) has exactly the properties of `interface <iface>`.
+/// `value` (a JSON object) has exactly the properties of `interface <iface>`;
+/// an optional one (`name?:`) may be absent.
 pub fn assert_matches(iface: &str, value: &Value) {
     let keys: BTreeSet<&str> = value
         .as_object()
@@ -42,10 +48,11 @@ pub fn assert_matches(iface: &str, value: &Value) {
         .keys()
         .map(String::as_str)
         .collect();
-    let fields = interface(iface);
-    let fields: BTreeSet<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
-    let missing: Vec<_> = keys.difference(&fields).collect();
-    let stale: Vec<_> = fields.difference(&keys).collect();
+    let all = fields(iface);
+    let names: BTreeSet<&str> = all.iter().map(|(n, _, _)| n.as_str()).collect();
+    let required: BTreeSet<&str> = all.iter().filter(|(_, _, opt)| !opt).map(|(n, _, _)| n.as_str()).collect();
+    let missing: Vec<_> = keys.difference(&names).collect();
+    let stale: Vec<_> = required.difference(&keys).collect();
     assert!(
         missing.is_empty() && stale.is_empty(),
         "npm/devsandboxes/index.d.ts `interface {iface}` drifted from the wire: \
@@ -107,7 +114,7 @@ fn block(name: &str) -> Option<(&'static str, &'static str)> {
 
 /// The block's top-level properties: `name: T;`, `name?: T;`,
 /// `readonly name: T;`, `'quoted.name': T;`. Comment lines are skipped.
-fn props(body: &str) -> Vec<(String, String)> {
+fn props(body: &str) -> Vec<(String, String, bool)> {
     let mut out = Vec::new();
     let mut depth = 0i32;
     for line in body.lines() {
@@ -125,7 +132,7 @@ fn props(body: &str) -> Vec<(String, String)> {
     out
 }
 
-fn prop(line: &str) -> Option<(String, String)> {
+fn prop(line: &str) -> Option<(String, String, bool)> {
     let line = line.strip_prefix("readonly ").unwrap_or(line);
     let (name, rest) = if let Some(q) = line.strip_prefix('\'') {
         let end = q.find('\'')?;
@@ -137,9 +144,10 @@ fn prop(line: &str) -> Option<(String, String)> {
     if name.is_empty() {
         return None;
     }
+    let optional = rest.starts_with('?');
     let rest = rest.strip_prefix('?').unwrap_or(rest);
     let ty = rest.strip_prefix(':')?;
-    Some((name, ty.trim().trim_end_matches(';').trim().to_string()))
+    Some((name, ty.trim().trim_end_matches(';').trim().to_string(), optional))
 }
 
 #[cfg(test)]
@@ -149,9 +157,10 @@ mod tests {
     #[test]
     fn parses_props_extends_and_quoted_names() {
         let body = "\n  /** doc { braces } */\n  id: number;\n  readonly name?: string | null;\n  'inbox.changed': InboxChanged;\n  close: (x: {\n    a: number;\n  }) => void;\n  after: boolean;\n";
-        let names: Vec<_> = props(body).into_iter().map(|(n, _)| n).collect();
+        let names: Vec<_> = props(body).into_iter().map(|(n, _, _)| n).collect();
         assert_eq!(names, ["id", "name", "inbox.changed", "close", "after"]);
         assert_eq!(props(body)[1].1, "string | null");
+        assert_eq!(props(body).iter().map(|p| p.2).collect::<Vec<_>>(), [false, true, false, false, false]);
         // Inherited through `extends`.
         assert!(interface("ThreadDetail").iter().any(|(n, _)| n == "owner_name"));
     }

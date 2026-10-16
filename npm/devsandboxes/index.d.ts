@@ -52,6 +52,10 @@ export interface InstanceRow {
   done: boolean;
   /** Still being created, or failed; absent once ready. Shown instead of `status` while set. */
   phase?: PhaseRow;
+  /** The config root it was made from; `null` for instances older than that record. */
+  root: string | null;
+  /** The machine it's on, in a federated snapshot (`instances.watch` with `machines`); absent for this host's. */
+  machine?: string;
 }
 
 /** One `[sandbox.*]` from devsandboxes.toml (`ls()`, `status().sandboxes`). */
@@ -71,6 +75,10 @@ export interface SandboxRow {
   dispatcher: boolean;
   /** The resolved `worktree-branch`; `null` when unset or unresolved. */
   worktree_branch: string | null;
+  /** The config root it was read from. */
+  root: string | null;
+  /** As {@link InstanceRow.machine}. */
+  machine?: string;
 }
 
 /** One `[services.*]` from devsandboxes.toml (`service.ls()`, `status().services`). */
@@ -87,6 +95,10 @@ export interface ServiceRow {
   command: string | null;
   config_hash: string;
   drift: boolean;
+  /** The config root it was read from. */
+  root: string | null;
+  /** As {@link InstanceRow.machine}. */
+  machine?: string;
 }
 
 /** Full snapshot (`status()`), the same data the TUI renders. */
@@ -118,6 +130,29 @@ export interface InstancesList extends Snapshot {
 export interface InstancesSnapshot extends InstancesList {
   /** The config root, as `instances.watch` named it. */
   dir: string;
+  /**
+   * With `instances.watch`'s `machines`: every registered machine, sorted by
+   * name. The rows then include each machine's (tagged `machine`), last known
+   * while it isn't `connected`.
+   */
+  machines?: SnapshotMachine[];
+}
+
+/** Where a machine's link stands. `idle`: not wanted, so not connected. */
+export type LinkState = 'idle' | 'connecting' | 'connected' | 'unreachable';
+
+/** One machine of a federated {@link InstancesSnapshot}. */
+export interface SnapshotMachine {
+  name: string;
+  /** What ssh takes, or an `ssh://` URL. */
+  target: string;
+  state: LinkState;
+  /** Why it's `unreachable` (or a root it refused). */
+  error: string | null;
+  /** Its devsandbox semver, once reached. */
+  version: string | null;
+  /** Its runtime (`runtime_name`), once a snapshot came. */
+  runtime: string | null;
 }
 
 /**
@@ -714,8 +749,8 @@ export interface MachineRow {
   roots: string[];
   /** The remote devsandbox as shell text; `null` is `devsandbox` on its `PATH`. */
   command: string | null;
-  /** `idle` for now. */
-  state: string;
+  state: LinkState;
+  /** Why it's `unreachable` (or a root it refused). */
   error: string | null;
   /** The machine's devsandbox semver, once reached. */
   version: string | null;
@@ -982,13 +1017,17 @@ export interface ApiMethods {
   'inbox.form.submit': { params: FormParams; result: OkResult };
   'inbox.notify.dismiss': { params: NotifyTarget; result: OkResult };
   'inbox.notify.markRead': { params: NotifyTarget; result: OkResult };
-  /** `depth`: `disk` (state + config, statuses `unknown`), `listing` (+ statuses, drift), `full` (+ cpu/mem; the default). */
-  'instances.list': { params: { dir: string; depth?: SnapshotDepth }; result: InstancesList };
+  /**
+   * `depth`: `disk` (state + config, statuses `unknown`), `listing` (+ statuses, drift), `full` (+ cpu/mem; the default).
+   * `machine`: ask that machine (its `dir`), answered as it answers; `not-found` for a machine that isn't registered.
+   */
+  'instances.list': { params: { dir: string; depth?: SnapshotDepth; machine?: string }; result: InstancesList };
   /**
    * Push `instances.snapshot` for config root `dir` (absolute) while connected; subscribe to
    * `instances` first (else `invalid`). The first one comes at once (cached, or from disk).
+   * `machines`: every push also carries the machines' rows and `machines`.
    */
-  'instances.watch': { params: { dir: string }; result: OkResult };
+  'instances.watch': { params: { dir: string; machines?: boolean }; result: OkResult };
   /** Stop `instances.watch`ing `dir`; not watching it is fine. */
   'instances.unwatch': { params: { dir: string }; result: OkResult };
   /** `not-found` when nothing matches. */

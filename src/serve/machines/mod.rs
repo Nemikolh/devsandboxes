@@ -4,7 +4,8 @@
 //! - this module: the registry, `machines.toml` next to `state.toml`
 //! - `ssh`: the ssh argv and quoting, and the injectable [`ssh::Dial`] that
 //!   opens a [`ssh::Duplex`] to a machine
-//! - `link`: a connection to a machine's daemon (the hello for now)
+//! - `link`: a connection to a machine's daemon (the hello)
+//! - `service`: the held link per machine, its rows and forwarded calls
 //! - `api`: the `machines.*` methods
 //!
 //! Only the daemon writes the registry (`machines.add` / `machines.rm`);
@@ -23,6 +24,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod api;
 pub mod link;
+pub mod service;
 pub mod ssh;
 
 /// One registered machine, as `machines.toml` holds it under

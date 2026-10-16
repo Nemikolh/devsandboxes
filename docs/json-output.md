@@ -158,6 +158,23 @@ for the dashboard reading its snapshot from the daemon
 resolved `worktree-branch`, `null` when unset or the sandbox didn't resolve.
 Additive, so `schema` stays 1.
 
+## Added after: rows say their config root
+
+For machines (docs/machines.md, F7), the instance, sandbox and service rows
+carry the config root they belong to:
+
+```json
+"root": "/home/me/.devsandboxes"
+```
+
+On an `InstanceRow` (`status --json` `instances`) it's the root the instance
+was made from, `null` for instances created before that was recorded. On a
+`SandboxRow` (`status --json` `sandboxes`, `ls --json`) and a `ServiceRow`
+(`status --json` `services`, `service ls --json`) it's the root they were
+read from, canonical when it resolves. Additive, so `schema` stays 1. (A
+federated dashboard snapshot also tags remote rows with `machine`; local
+output never has it.)
+
 ## Commit per step (conventional commits, lowercase)
 
 1. `refactor(snapshot): extract snapshot collection from tui`

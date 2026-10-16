@@ -115,6 +115,15 @@ pub struct InstanceRow {
     /// the STATUS column from `status` while set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase: Option<PhaseRow>,
+    /// The config root it was made from (`state::Instance::config_dir`);
+    /// `None` for instances older than that record. A machine's rows are
+    /// de-duplicated by it (docs/machines.md, F8).
+    #[serde(default)]
+    pub root: Option<String>,
+    /// The machine it's on: set only in a federated snapshot
+    /// (`instances.watch {machines: true}`), absent for this host's rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
 }
 
 impl InstanceRow {
@@ -155,6 +164,13 @@ pub struct SandboxRow {
     /// The resolved `worktree-branch`, for `run --branch` completion; `None`
     /// when unset or the sandbox failed to resolve.
     pub worktree_branch: Option<String>,
+    /// The config root it was read from (canonical when it resolves), so a
+    /// federated snapshot's rows say which of a machine's roots they're in.
+    #[serde(default)]
+    pub root: Option<String>,
+    /// As [`InstanceRow::machine`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
 }
 
 /// One service row, everything the Services view needs pre-joined.
@@ -183,6 +199,12 @@ pub struct ServiceRow {
     /// labels the `ps` listing already carries, so it costs zero extra docker
     /// calls. `service ls --json` serializes it for free.
     pub drift: bool,
+    /// As [`SandboxRow::root`].
+    #[serde(default)]
+    pub root: Option<String>,
+    /// As [`InstanceRow::machine`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
 }
 
 /// A point-in-time view of instances plus any collection error (docker/config
@@ -306,7 +328,17 @@ pub fn service_rows(
             }
         })
         .collect();
-    (build_service_rows(project, &inputs, instance_services, ps), errors)
+    let mut rows = build_service_rows(project, &inputs, instance_services, ps);
+    let root = root_label(dir);
+    for row in &mut rows {
+        row.root = Some(root.clone());
+    }
+    (rows, errors)
+}
+
+/// A row's `root`: `dir` canonical when it resolves, else as given.
+fn root_label(dir: &Path) -> String {
+    dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf()).to_string_lossy().into_owned()
 }
 
 /// Join config services against docker state. Pure: all docker/config I/O is
@@ -392,6 +424,8 @@ fn build_service_rows(
                 command,
                 config_hash,
                 drift,
+                root: None,
+                machine: None,
             }
         })
         .collect()
@@ -542,6 +576,7 @@ fn mount_source_uses_instance(mount: &Mount) -> bool {
 pub fn sandbox_rows(dir: &Path, config: &Config) -> (Vec<SandboxRow>, Vec<String>) {
     let mut rows = Vec::with_capacity(config.sandboxes.len());
     let mut errors = Vec::new();
+    let root = root_label(dir);
     for name in config.sandboxes.keys() {
         let extends = config
             .sandboxes
@@ -565,6 +600,8 @@ pub fn sandbox_rows(dir: &Path, config: &Config) -> (Vec<SandboxRow>, Vec<String
                     issues,
                     dispatcher: rs.properties.dispatcher.is_some(),
                     worktree_branch: rs.properties.worktree_branch.clone(),
+                    root: Some(root.clone()),
+                    machine: None,
                 });
             }
             Err(e) => {
@@ -580,6 +617,8 @@ pub fn sandbox_rows(dir: &Path, config: &Config) -> (Vec<SandboxRow>, Vec<String
                     issues: Vec::new(),
                     dispatcher: false,
                     worktree_branch: None,
+                    root: Some(root.clone()),
+                    machine: None,
                 });
             }
         }
@@ -868,6 +907,8 @@ fn instance_row(
         dispatcher: inst.dispatcher.clone(),
         done: inst.done.is_some(),
         phase,
+        root: inst.config_dir.as_ref().map(|d| d.display().to_string()),
+        machine: None,
     }
 }
 

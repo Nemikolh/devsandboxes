@@ -64,6 +64,8 @@ mod tests {
             dispatcher: None,
             done: false,
             phase: None,
+            root: None,
+            machine: None,
         }
     }
 

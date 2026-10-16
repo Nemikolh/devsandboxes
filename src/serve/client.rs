@@ -86,6 +86,33 @@ impl Conn {
         }
     }
 
+    /// [`call`](Self::call), waiting at most `timeout` for the response:
+    /// `None` when it didn't come. The request is then still answered some
+    /// time, out of turn for the next call, so the caller drops the
+    /// connection (a machine link reconnects).
+    pub fn call_within(&mut self, method: &str, params: Value, timeout: Duration) -> Result<Option<Response>> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let mut line = serde_json::to_vec(&Request { id: Some(id), method: method.into(), params })?;
+        line.push(b'\n');
+        self.writer.write_all(&line).context("cannot write to devsandbox serve")?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Ok(None);
+            }
+            self.reader.get_ref().set_read_timeout(Some(left)).context("cannot set a read timeout")?;
+            match self.read()? {
+                Some(Incoming::Notification(n)) => self.notes.push_back(n),
+                Some(Incoming::Response(r)) if r.id == Some(id) => return Ok(Some(r)),
+                Some(Incoming::Response(r)) => bail!("devsandbox serve answered request {:?}, expected {id}", r.id),
+                Some(Incoming::Closed) => bail!("devsandbox serve closed the connection"),
+                None => {}
+            }
+        }
+    }
+
     /// One request whose response may take long (a verb), with its
     /// notifications handed to `on` as they come. `on` also runs with `None`
     /// every `tick` without a line, so it can poll a flag (Ctrl-C); it
@@ -528,6 +555,33 @@ mod tests {
         assert!(r.is_none());
         assert!(endpoint::connect(&dir).is_err(), "a daemon was started");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn call_within_gives_up_and_keeps_notifications() {
+        use std::os::unix::net::UnixStream;
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let daemon = HelloResult { version: "0.6.0".into(), build: 1, protocol: proto::PROTOCOL, handoff: false };
+        let mut conn = Conn::new(ours, daemon).unwrap();
+        let peer = std::thread::spawn(move || {
+            let mut r = BufReader::new(theirs.try_clone().unwrap());
+            let mut line = String::new();
+            r.read_line(&mut line).unwrap();
+            // A notification, then half a response, never finished.
+            (&theirs).write_all(b"{\"method\":\"instances.changed\",\"params\":{}}\n{\"id\":1,").unwrap();
+            line.clear();
+            r.read_line(&mut line).unwrap();
+            (&theirs).write_all(b"\"result\":1}\n{\"id\":2,\"result\":2}\n").unwrap();
+            theirs
+        });
+        let started = Instant::now();
+        assert!(conn.call_within("a", Value::Null, Duration::from_millis(200)).unwrap().is_none());
+        assert!(started.elapsed() >= Duration::from_millis(200));
+        assert_eq!(conn.next_notification(Duration::ZERO).unwrap().unwrap().method, "instances.changed");
+        // The late answer is out of turn: the caller drops the connection.
+        let err = conn.call_within("b", Value::Null, Duration::from_secs(3)).unwrap_err();
+        assert!(format!("{err:#}").contains("answered request Some(1), expected 2"), "{err:#}");
+        drop(peer.join().unwrap());
     }
 
     #[test]

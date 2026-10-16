@@ -2854,6 +2854,8 @@ mod tests {
                 dispatcher: None,
                 done: false,
                 phase,
+                root: None,
+                machine: None,
             })
             .collect();
         let sandbox = SandboxRow {
@@ -2867,6 +2869,8 @@ mod tests {
             issues: Vec::new(),
             dispatcher: false,
             worktree_branch: None,
+            root: None,
+            machine: None,
         };
         let mut app = App::new(PathBuf::from("/tmp"));
         app.set_snapshot(Snapshot {

@@ -221,6 +221,18 @@ pub fn watch_dir(params: Value, exists: bool) -> Result<PathBuf, ApiError> {
     Ok(p.dir)
 }
 
+#[derive(Deserialize)]
+struct WatchFlags {
+    #[serde(default)]
+    machines: bool,
+}
+
+/// `instances.watch`'s `machines` flag (absent: `false`): federated
+/// snapshots, this root plus every machine's (docs/machines.md).
+pub fn watch_machines(params: &Value) -> Result<bool, ApiError> {
+    Ok(parse::<WatchFlags>(params.clone())?.machines)
+}
+
 /// The client name the store records for a connection whose hello said
 /// `hello`: the dashboard (`tui`) and the CLI (`cli`) as themselves, every
 /// other client as `api:<name>` (an `api:` prefix isn't doubled).

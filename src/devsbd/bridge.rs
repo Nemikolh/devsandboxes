@@ -175,8 +175,8 @@ fn agent_live(path: &Path) -> bool {
 /// The host agent socket, chosen per stream so agent rotation needs no
 /// restart: the first live [`AgentCandidates`] entry, else `$SSH_AUTH_SOCK`
 /// when live. Also gates whether a bridge is worth spawning
-/// (`has_host_agent`).
-fn host_agent() -> Option<PathBuf> {
+/// (`has_host_agent`). The daemon's machine links forward it too (`ssh -A`).
+pub fn host_agent() -> Option<PathBuf> {
     let candidates = AGENTS.lock().unwrap_or_else(|e| e.into_inner()).clone();
     candidates.pick(own_agent(), agent_live)
 }

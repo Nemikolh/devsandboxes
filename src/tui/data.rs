@@ -279,6 +279,8 @@ mod tests {
             dispatcher: None,
             done: false,
             phase: None,
+            root: None,
+            machine: None,
         }
     }
 
@@ -298,6 +300,8 @@ mod tests {
             command: None,
             config_hash: String::new(),
             drift: false,
+            root: None,
+            machine: None,
         }
     }
 
@@ -406,6 +410,8 @@ mod tests {
             issues: Vec::new(),
             dispatcher: false,
             worktree_branch: None,
+            root: None,
+            machine: None,
         }
     }
 

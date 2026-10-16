@@ -352,6 +352,8 @@ mod tests {
             dispatcher: None,
             done: false,
             phase: None,
+            root: None,
+            machine: None,
         };
         let snap = Snapshot {
             instances: vec![
@@ -369,6 +371,8 @@ mod tests {
                 issues: Vec::new(),
                 dispatcher: false,
                 worktree_branch: None,
+                root: None,
+                machine: None,
             }],
             services: Vec::new(),
             sandbox_count: 1,
@@ -450,6 +454,8 @@ mod tests {
             dispatcher: None,
             done: false,
             phase: None,
+            root: None,
+            machine: None,
         };
         app.set_snapshot(Snapshot {
             instances: vec![row],
@@ -464,6 +470,8 @@ mod tests {
                 issues: Vec::new(),
                 dispatcher: false,
                 worktree_branch: None,
+                root: None,
+                machine: None,
             }],
             services: Vec::new(),
             sandbox_count: 1,

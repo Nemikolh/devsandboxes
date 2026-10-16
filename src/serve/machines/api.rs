@@ -4,7 +4,8 @@
 //! tests run them against a second test daemon standing in as the machine.
 //!
 //! `probe` and `add` open a fresh connection each (ssh, the hello, one or
-//! two calls) and drop it; the held link per machine is step 3. `add`
+//! two calls) and drop it; the held link per machine is `service`'s, which
+//! `add` and `rm` tell to reload and `list` reads the live state of. `add`
 //! checks the typed roots *on the machine* (`roots.list {paths}`): only it
 //! can tell whether they exist, expand a quoted `~`, and canonicalize them.
 
@@ -16,9 +17,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::link::{self, Link};
+use super::service::Handle;
 use super::ssh::{self, Dial};
 use super::{Entry, check_name, default_name};
 use crate::serve::api::{ApiError, RootCandidate, parse};
+use crate::serve::snapshots::LinkState;
 
 /// The hello's wait: ssh's connect and auth, the remote login shell, and a
 /// lazy start of the remote daemon.
@@ -33,6 +36,9 @@ pub struct Ctx {
     pub dial: Dial,
     /// This daemon's semver, which `add` warns a differing machine's against.
     pub version: String,
+    /// The links: `add`/`rm` reload them, `list` reports their state. `None`
+    /// only where no service runs (then every machine lists as `idle`).
+    pub links: Option<Handle>,
 }
 
 /// Run `method` if it's a `machines.*` one; `None` otherwise.
@@ -69,16 +75,16 @@ pub struct Added {
     pub warning: Option<String>,
 }
 
-/// One `machines.list` row. `state`, `error` and `version` are fixed
-/// (`idle`, `null`, `null`) until step 3's links make them live; they're
-/// here so the shape doesn't change then.
+/// One `machines.list` row: the registry entry and its link's live state
+/// (`error` the last failure while `unreachable`; `version` from the last
+/// hello).
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MachineRow {
     pub name: String,
     pub target: String,
     pub roots: Vec<PathBuf>,
     pub command: Option<String>,
-    pub state: String,
+    pub state: LinkState,
     pub error: Option<String>,
     pub version: Option<String>,
 }
@@ -153,6 +159,9 @@ fn add(p: AddParams, ctx: &Ctx) -> Answer {
         Ok(())
     });
     saved.map_err(ApiError::internal)??;
+    if let Some(links) = &ctx.links {
+        links.reload();
+    }
     let warning = (version != ctx.version)
         .then(|| format!("{} runs devsandbox {version}, this is {}", entry.name, ctx.version));
     to_value(Added { name: entry.name, roots: entry.roots, version, warning })
@@ -161,14 +170,17 @@ fn add(p: AddParams, ctx: &Ctx) -> Answer {
 fn list(ctx: &Ctx) -> Answer {
     let rows: Vec<MachineRow> = registered(ctx)?
         .into_iter()
-        .map(|e| MachineRow {
-            name: e.name,
-            target: e.target,
-            roots: e.roots,
-            command: e.command,
-            state: "idle".into(),
-            error: None,
-            version: None,
+        .map(|e| {
+            let live = ctx.links.as_ref().and_then(|l| l.remotes().get(&e.name)).unwrap_or_default();
+            MachineRow {
+                name: e.name,
+                target: e.target,
+                roots: e.roots,
+                command: e.command,
+                state: live.state,
+                error: live.error,
+                version: live.version,
+            }
         })
         .collect();
     to_value(rows)
@@ -187,6 +199,9 @@ fn rm(p: RmParams, ctx: &Ctx) -> Answer {
     });
     if !removed.map_err(ApiError::internal)? {
         return Err(ApiError::not_found(format!("no machine named `{}`", p.name)));
+    }
+    if let Some(links) = &ctx.links {
+        links.reload();
     }
     Ok(json!({ "ok": true }))
 }
@@ -413,7 +428,7 @@ mod tests {
 
     #[test]
     fn npm_typings_match() {
-        use crate::serve::dts::{assert_matches, prop_type};
+        use crate::serve::dts::{assert_matches, prop_type, union_members};
         let root = || RootCandidate { root: "/cfg".into(), sandboxes: vec![], error: None };
         assert_matches("MachineProbe", &to_value(Probed { version: "0.6.0".into(), protocol: 1, roots: vec![root()] }).unwrap());
         let added = Added { name: "m".into(), roots: vec!["/cfg".into()], version: "0.6.0".into(), warning: None };
@@ -423,11 +438,12 @@ mod tests {
             target: "m".into(),
             roots: vec![],
             command: None,
-            state: "idle".into(),
+            state: LinkState::Idle,
             error: None,
             version: None,
         };
         assert_matches("MachineRow", &to_value(row).unwrap());
+        assert_eq!(union_members("LinkState"), ["'idle'", "'connecting'", "'connected'", "'unreachable'"]);
         for (method, result) in [
             ("machines.probe", "MachineProbe"),
             ("machines.add", "MachineAdded"),

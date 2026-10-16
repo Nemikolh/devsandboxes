@@ -54,6 +54,8 @@ pub(super) fn snapshot_with(n: usize) -> Snapshot {
             dispatcher: None,
             done: false,
             phase: None,
+            root: None,
+            machine: None,
         })
         .collect();
     let sandboxes = vec![SandboxRow {
@@ -67,6 +69,8 @@ pub(super) fn snapshot_with(n: usize) -> Snapshot {
         issues: Vec::new(),
         dispatcher: false,
         worktree_branch: None,
+        root: None,
+        machine: None,
     }];
     Snapshot {
         instances,
@@ -133,6 +137,8 @@ pub(super) fn orphan_snapshot() -> Snapshot {
         dispatcher: None,
         done: false,
         phase: None,
+        root: None,
+        machine: None,
     }];
     Snapshot {
         instances,
@@ -245,6 +251,8 @@ pub(super) fn service_snapshot(containers: Vec<(String, ContainerStatus)>) -> Sn
             command: None,
             config_hash: "hash".into(),
             drift: false,
+            root: None,
+            machine: None,
         }],
         sandbox_count: 0,
         runtime_name: "docker".into(),

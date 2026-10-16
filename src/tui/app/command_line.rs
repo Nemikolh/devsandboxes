@@ -669,6 +669,8 @@ mod tests {
             issues: Vec::new(),
             dispatcher: false,
             worktree_branch: worktree_branch.map(String::from),
+            root: None,
+            machine: None,
         }
     }
 

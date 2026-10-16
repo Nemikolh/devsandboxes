@@ -10,7 +10,8 @@
 //! request in flight still writes its response, and waits up to
 //! [`DRAIN_TIMEOUT`] for them. Then the live host side ([`Host`]: bridges,
 //! autostart) stops, killing every bridge, and so does the forward
-//! [`Registry`], closing every forward's listener. The start lock is released
+//! [`Registry`], closing every forward's listener, and the machine links
+//! (`machines::service`), killing their ssh. The start lock is released
 //! last, so a successor never binds (or bridges) while this one drains.
 //!
 //! Notifications (docs/api.md): one daemon-wide `serve-watch` thread notices
@@ -32,7 +33,10 @@
 //! each root's `instances.snapshot` there, latest wins per root
 //! (`snapshots.rs`). A hang-up drops the connection's entry, and its
 //! watches with it. A `state.toml` change wakes the poll while anything is
-//! watched.
+//! watched. A watch with `machines: true` gets each push merged with the
+//! machines' rows, and is what keeps their links up; a machine's push or
+//! state change re-publishes those watchers' roots from the last local
+//! params (`Shared::locals`).
 //!
 //! A verb request (`verbs.rs`) runs on its connection's thread until the
 //! verb's answer, writing `output`/`progress` through the same writer lock
@@ -59,7 +63,7 @@ use super::endpoint::{self, Listener, Stream};
 use super::forwards::{self, Registry};
 use super::host::{Host, Observers, Waker};
 use super::idle::{self, Decision, Holders};
-use super::machines::{self, link, ssh::{self, Dial}};
+use super::machines::{self, link, service, ssh::{self, Dial}};
 use super::proto::{self, HelloParams, HelloResult, Notification, Request, Response, Version};
 use super::snapshots::{self, Join, Snapshots};
 use super::verbs;
@@ -110,9 +114,11 @@ pub struct Options {
     /// `machines.toml`; `None` is the default ([`machines::path`]). Tests
     /// point it at their own file.
     pub machines: Option<PathBuf>,
-    /// How `machines.*` reach a machine; `None` is ssh
+    /// How `machines.*` and the machine links reach a machine; `None` is ssh
     /// ([`ssh::ssh_dial`]). Tests dial another test daemon's socket.
     pub dial: Option<Dial>,
+    /// The machine links' linger, backoff and timeouts; short in tests.
+    pub machine_timing: service::Timing,
 }
 
 impl Options {
@@ -129,6 +135,7 @@ impl Options {
             home: None,
             machines: None,
             dial: None,
+            machine_timing: service::Timing::default(),
         }
     }
 }
@@ -203,15 +210,36 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
     let join = opts.join.clone().unwrap_or_else(|| default_join(state.clone()));
     let mut shared = Shared::new(opts.version.clone(), inbox, state, join);
     shared.home = opts.home.clone().or_else(|| std::env::var_os("HOME").map(PathBuf::from));
+    let registry_path = match &opts.machines {
+        Some(path) => path.clone(),
+        None => machines::path()?,
+    };
+    let dial = opts.dial.clone().unwrap_or_else(|| ssh::ssh_dial(link::client_name()));
+    // Whenever the daemon runs, host side or not: a link dials only when
+    // wanted, so with no machine watcher (every test but the links') it's
+    // threads waiting on their channels. The hooks reach `shared` once it
+    // exists; until then nothing watches and there's nobody to tell.
+    let hooked: Arc<OnceLock<std::sync::Weak<Shared>>> = Arc::default();
+    let hooks = {
+        let (a, b) = (Arc::clone(&hooked), Arc::clone(&hooked));
+        service::Hooks {
+            watching: Box::new(move || a.get().and_then(std::sync::Weak::upgrade).is_some_and(|s| s.watching_machines())),
+            changed: Box::new(move || {
+                if let Some(s) = b.get().and_then(std::sync::Weak::upgrade) {
+                    s.publish_machines();
+                }
+            }),
+        }
+    };
+    let links = service::Machines::spawn(registry_path.clone(), dial.clone(), opts.machine_timing, hooks, log);
     shared.machines = Some(machines::api::Ctx {
-        registry: match &opts.machines {
-            Some(path) => path.clone(),
-            None => machines::path()?,
-        },
-        dial: opts.dial.clone().unwrap_or_else(|| ssh::ssh_dial(link::client_name())),
+        registry: registry_path,
+        dial,
         version: opts.version.semver.clone(),
+        links: Some(links.handle()),
     });
     let shared = Arc::new(shared);
+    let _ = hooked.set(Arc::downgrade(&shared));
     let _ = shared.runner.set(match &opts.verbs {
         Some(runner) => runner.clone(),
         None => verbs::Runner::new()?,
@@ -303,6 +331,9 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
     });
     shared.drain(DRAIN_TIMEOUT);
     drop(watcher);
+    // The machine links close (their ssh killed) after the connections whose
+    // forwarded calls they may still answer.
+    drop(links);
     // Before the lock goes: a successor's bridges must not overlap ours (two
     // sink bridges on one container would split its notify/control streams).
     drop(host);
@@ -383,9 +414,13 @@ struct Shared {
     join: Join,
     /// What `roots.list` reads `~` as.
     home: Option<PathBuf>,
-    /// The `machines.*` methods' registry and dial; unset only in tests
-    /// that build a bare `Shared` (the methods are then unknown).
+    /// The `machines.*` methods' registry and dial, and the machine links;
+    /// unset only in tests that build a bare `Shared` (the methods are then
+    /// unknown, and no machine exists).
     machines: Option<machines::api::Ctx>,
+    /// Each watched root's last local `instances.snapshot` params (the poll's,
+    /// or a new watch's disk one): what a machine's push is merged with.
+    locals: Mutex<BTreeMap<PathBuf, Arc<Value>>>,
 }
 
 impl Shared {
@@ -408,7 +443,17 @@ impl Shared {
             join,
             home: None,
             machines: None,
+            locals: Mutex::default(),
         }
+    }
+
+    fn links(&self) -> Option<&service::Handle> {
+        self.machines.as_ref()?.links.as_ref()
+    }
+
+    /// Every machine's state and rows, for a merge.
+    fn remotes(&self) -> Vec<snapshots::Machine> {
+        self.links().map(|l| l.remotes().all()).unwrap_or_default()
     }
 
     fn holders(&self, host: Option<&Host>, registry: Option<&Registry>) -> Holders {
@@ -483,31 +528,76 @@ impl Shared {
         self.publish(Topic::Inbox, |p| p.shown = Some((instance.to_string(), line.clone())));
     }
 
-    /// `instances.snapshot` of root `dir`, to the connections watching it.
-    /// Latest wins per root: under backpressure older snapshots are dropped.
+    /// `instances.snapshot` of root `dir`, to the connections watching it:
+    /// `params` as is, or merged with the machines' rows for a `machines:
+    /// true` watcher (merged once, for all of them). Latest wins per root:
+    /// under backpressure older snapshots are dropped.
     fn publish_snapshot(&self, dir: &Path, params: Arc<Value>) {
+        self.locals.lock().unwrap().insert(dir.to_path_buf(), Arc::clone(&params));
+        let mut merged: Option<Arc<Value>> = None;
+        let mut remotes: Option<Vec<snapshots::Machine>> = None;
         for conn in self.conns.lock().unwrap().values() {
             conn.out.post(|p| {
-                let watching = p.watched.contains(dir);
-                if watching {
-                    p.snapshots.insert(dir.to_path_buf(), Arc::clone(&params));
+                let push = match p.watched.get(dir) {
+                    None => return false,
+                    Some(false) => Arc::clone(&params),
+                    Some(true) => Arc::clone(merged.get_or_insert_with(|| {
+                        Arc::new(snapshots::merge(&params, remotes.get_or_insert_with(|| self.remotes())))
+                    })),
+                };
+                p.snapshots.insert(dir.to_path_buf(), push);
+                true
+            });
+        }
+    }
+
+    /// A machine's rows or state changed: every root watched with `machines:
+    /// true` gets its last local params merged again, to those watchers
+    /// only. A root with no local params yet waits for its first.
+    fn publish_machines(&self) {
+        let locals = self.locals.lock().unwrap().clone();
+        let remotes = self.remotes();
+        let mut merged: BTreeMap<PathBuf, Arc<Value>> = BTreeMap::new();
+        for conn in self.conns.lock().unwrap().values() {
+            conn.out.post(|p| {
+                let mut any = false;
+                for (dir, _) in p.watched.iter().filter(|(_, machines)| **machines) {
+                    let Some(local) = locals.get(dir) else { continue };
+                    let push = merged.entry(dir.clone()).or_insert_with(|| Arc::new(snapshots::merge(local, &remotes)));
+                    p.snapshots.insert(dir.clone(), Arc::clone(push));
+                    any = true;
                 }
-                watching
+                any
             });
         }
     }
 
     /// Every root some live connection watches: what the host poll collects.
-    /// A connection that hung up is gone from `conns`, its watches with it.
+    /// A connection that hung up is gone from `conns`, its watches with it
+    /// (and the root's local params, once nobody watches it).
     fn watched_roots(&self) -> BTreeSet<PathBuf> {
         let mut roots = BTreeSet::new();
         for conn in self.conns.lock().unwrap().values() {
             conn.out.post(|p| {
-                roots.extend(p.watched.iter().cloned());
+                roots.extend(p.watched.keys().cloned());
                 false
             });
         }
+        self.locals.lock().unwrap().retain(|dir, _| roots.contains(dir));
         roots
+    }
+
+    /// Whether a live connection watches some root with `machines: true`:
+    /// the machine links' want (docs/machines.md, F9).
+    fn watching_machines(&self) -> bool {
+        let mut any = false;
+        for conn in self.conns.lock().unwrap().values() {
+            conn.out.post(|p| {
+                any |= p.watched.values().any(|m| *m);
+                false
+            });
+        }
+        any
     }
 
     /// The registry's events, to `forwards` subscribers: `forwards.changed`,
@@ -576,9 +666,10 @@ struct Pending {
     /// `inbox.shown` with `(instance, line)`, the latest only.
     shown: Option<(String, String)>,
     instances: bool,
-    /// The roots this connection watches (`instances.watch`); only while
-    /// subscribed to `instances`.
-    watched: BTreeSet<PathBuf>,
+    /// The roots this connection watches (`instances.watch`), each with its
+    /// `machines` flag (federated snapshots); only while subscribed to
+    /// `instances`.
+    watched: BTreeMap<PathBuf, bool>,
     /// `instances.snapshot` per root, the latest only.
     snapshots: BTreeMap<PathBuf, Arc<Value>>,
     /// `forwards.changed`.
@@ -808,6 +899,10 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
         "unsubscribe" => subscribe(req.params, conn, false),
         "instances.watch" => watch_root(req.params, shared, conn),
         "instances.unwatch" => unwatch_root(req.params, conn),
+        // On a machine: the remote's answer as is (step 4 forwards the rest).
+        "instances.list" if req.params.get("machine").is_some_and(|m| !m.is_null()) => {
+            return Some(forward(req.id, &req.method, req.params, shared));
+        }
         "shutdown" => {
             log(&format!("{}: shutdown requested", conn.label()));
             shared.begin_stop(Exit::Shutdown);
@@ -833,6 +928,25 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
             Response::err(req.id, e.code, e.message)
         }
     })
+}
+
+/// A request with `machine`: the rest of its params to that machine's daemon
+/// over its link (docs/machines.md, F6), answered with the remote's result
+/// or error, code and data kept, under this request's id.
+fn forward(id: Option<u64>, method: &str, params: Value, shared: &Shared) -> Response {
+    let mut params = params;
+    let machine = match params.as_object_mut().and_then(|p| p.remove("machine")) {
+        Some(Value::String(m)) => m,
+        _ => return Response::err(id, "invalid", "`machine` must be a machine name"),
+    };
+    let answer = match shared.links() {
+        Some(links) => links.forward(&machine, method, params),
+        None => Err(api::ApiError::not_found(format!("no machine named `{machine}`"))),
+    };
+    match answer {
+        Ok(r) => Response { id, ..r },
+        Err(e) => Response::err(id, e.code, e.message),
+    }
 }
 
 /// A verb request (`serve::verbs`): held on this connection until the verb
@@ -946,13 +1060,17 @@ fn subscribe(params: Value, conn: &mut ConnState, on: bool) -> Result<Value, api
     Ok(json!({ "ok": true }))
 }
 
-/// `instances.watch {dir}`: push `instances.snapshot` for root `dir` to
-/// this connection while it's connected and subscribed to `instances` (a
-/// watch needs that subscription first: the pushes are notifications). The
-/// first one goes out at once: the cached snapshot when another watcher
-/// keeps it fresh, else one from disk (no runtime call) while the poll is
-/// woken for the listing and stats.
+/// `instances.watch {dir, machines}`: push `instances.snapshot` for root
+/// `dir` to this connection while it's connected and subscribed to
+/// `instances` (a watch needs that subscription first: the pushes are
+/// notifications). The first one goes out at once: the cached snapshot when
+/// another watcher keeps it fresh, else one from disk (no runtime call)
+/// while the poll is woken for the listing and stats. With `machines`, every
+/// push is merged with the machines' rows (the first with what they have
+/// now), and the machine links are wanted while it lasts. A re-watch with
+/// the other flag switches.
 fn watch_root(params: Value, shared: &Shared, conn: &ConnState) -> Result<Value, api::ApiError> {
+    let machines = api::watch_machines(&params)?;
     let dir = api::watch_dir(params, true)?;
     let mut subscribed = false;
     conn.out.post(|p| {
@@ -967,13 +1085,26 @@ fn watch_root(params: Value, shared: &Shared, conn: &ConnState) -> Result<Value,
     let cached = shared.snapshots.cached(&dir);
     let first = match &cached {
         Some(params) => Some(Arc::clone(params)),
-        None => snapshots::params(&dir, &(shared.join)(&dir, &crate::snapshot::RuntimeView::disk())),
+        None => {
+            let first = snapshots::params(&dir, &(shared.join)(&dir, &crate::snapshot::RuntimeView::disk()));
+            // Nothing fresher for a machine's push to merge with (with no
+            // poll, as in tests, the only one).
+            if let Some(first) = &first {
+                shared.locals.lock().unwrap().insert(dir.clone(), Arc::clone(first));
+            }
+            first
+        }
+    };
+    let first = match first {
+        Some(first) if machines => Some(Arc::new(snapshots::merge(&first, &shared.remotes()))),
+        first => first,
     };
     conn.out.post(|p| {
-        p.watched.insert(dir.clone());
-        // A poll's snapshot already pending (a re-watch) is newer.
+        let switched = p.watched.insert(dir.clone(), machines).is_some_and(|was| was != machines);
+        // A poll's snapshot already pending (a re-watch) is newer, unless
+        // it's the other variant.
         match first {
-            Some(first) if !p.snapshots.contains_key(&dir) => {
+            Some(first) if switched || !p.snapshots.contains_key(&dir) => {
                 p.snapshots.insert(dir, first);
                 true
             }
@@ -984,6 +1115,9 @@ fn watch_root(params: Value, shared: &Shared, conn: &ConnState) -> Result<Value,
         && let Some(poll) = shared.bridges.get()
     {
         poll.refresh();
+    }
+    if machines && let Some(links) = shared.links() {
+        links.wake();
     }
     Ok(json!({ "ok": true }))
 }
@@ -1066,6 +1200,14 @@ pub(crate) mod tests {
             dial: Some(Arc::new(|e: &machines::Entry, _: Option<&Path>| {
                 anyhow::bail!("a test daemon has no dial (machine {}): set Options.dial", e.name)
             })),
+            machine_timing: service::Timing {
+                linger: Duration::from_millis(400),
+                backoff: Duration::from_millis(50),
+                backoff_cap: Duration::from_millis(200),
+                call: Duration::from_secs(5),
+                handshake: Duration::from_secs(5),
+                tick: Duration::from_millis(20),
+            },
         }
     }
 
@@ -1648,6 +1790,11 @@ pub(crate) mod tests {
                 dts::assert_matches(&ty, &n.params);
             }
         }
+        // A `machines: true` watcher's variant.
+        let machine = snapshots::Machine { name: "m".into(), target: "me@m".into(), ..Default::default() };
+        let merged = snapshots::merge(&snapshots::params(&dir, &list).unwrap(), &[machine]);
+        dts::assert_matches(&dts::prop_type("ApiEvents", "instances.snapshot").unwrap(), &merged);
+        dts::assert_matches("SnapshotMachine", &merged["machines"][0]);
     }
 
     /// A daemon whose verbs are one script: `$*` (the argv) picks the case.

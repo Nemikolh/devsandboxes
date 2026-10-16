@@ -1,5 +1,5 @@
-//! A connection to a machine's daemon (docs/machines.md). For now the
-//! handshake only; step 3 grows it into the held link per machine.
+//! A connection to a machine's daemon (docs/machines.md): the handshake.
+//! `machines.probe`/`add` use one briefly; `service` holds one per machine.
 //!
 //! The hello says version `0.0.0`, build 0: older than any daemon, so a
 //! machine connection never hands off the remote daemon (only that host's
@@ -21,7 +21,8 @@ const STDERR_WAIT: Duration = Duration::from_secs(2);
 /// hello reply. Dropping it closes the socket, then kills the ssh.
 pub struct Link {
     pub conn: Conn,
-    #[allow(dead_code)] // held for its drop (kills the ssh); step 3 reads its stderr
+    /// Held for its drop (kills the ssh).
+    #[allow(dead_code)] // read by tests
     pub peer: Peer,
 }
 

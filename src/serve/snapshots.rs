@@ -11,18 +11,23 @@
 //! it each tick. The join is injected ([`Join`]), so tests never ask the
 //! runtime or read the user's state.
 //!
-//! Keyed by config root only. Machines (docs/client-server.md *Machines*)
-//! will add a remote machine's rows to a root's entry beside this host's
-//! ([`Root`]), merged when pushed.
+//! The cache is keyed by config root only: this host's rows. Machines
+//! (docs/machines.md, step 3) are the second dimension, [`Remotes`]: each
+//! registered machine's link state and its last snapshot per remote root,
+//! kept while its link is down. A watcher with `machines: true` gets
+//! [`merge`] of a local root's params and every machine's rows; any other
+//! watcher gets the local params untouched.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value, json};
 
 use super::api::InstancesList;
+use super::machines::Entry;
 use crate::snapshot::{ContainerStatus, Depth, RuntimeView, Snapshot};
 
 /// The poll's tick while anything is watched: the dashboard's listing
@@ -144,6 +149,182 @@ pub fn stats_due(last: Option<Instant>, now: Instant, fresh: bool) -> bool {
     fresh || last.is_none_or(|last| now >= last + STATS_INTERVAL)
 }
 
+/// Where a machine's link stands (`machines.list`'s and a federated
+/// snapshot's `state`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LinkState {
+    /// Not wanted, so not connected (docs/machines.md, F9).
+    #[default]
+    Idle,
+    Connecting,
+    Connected,
+    /// The last attempt failed or the link was lost: `error` says why.
+    Unreachable,
+}
+
+impl LinkState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LinkState::Idle => "idle",
+            LinkState::Connecting => "connecting",
+            LinkState::Connected => "connected",
+            LinkState::Unreachable => "unreachable",
+        }
+    }
+}
+
+/// One registered machine as federation sees it.
+#[derive(Debug, Clone, Default)]
+pub struct Machine {
+    pub name: String,
+    pub target: String,
+    /// The registered roots, in order: the first one shows the instances
+    /// whose root isn't registered (F8).
+    pub roots: Vec<PathBuf>,
+    pub state: LinkState,
+    pub error: Option<String>,
+    /// Its devsandbox semver, from the last hello.
+    pub version: Option<String>,
+    /// Remote root → the last `instances.snapshot` params it pushed. Kept
+    /// while the link is down: last known, in memory only.
+    pub rows: BTreeMap<PathBuf, Arc<Value>>,
+}
+
+/// Every registered machine's [`Machine`], by name. The machine links write
+/// it, the daemon reads it to merge; only short in-memory work under its lock.
+#[derive(Default)]
+pub struct Remotes {
+    inner: Mutex<BTreeMap<String, Machine>>,
+}
+
+impl Remotes {
+    /// Follow the registry: new machines start [`LinkState::Idle`], removed
+    /// ones go with their rows, and a root no longer registered loses its.
+    pub fn sync(&self, entries: &[Entry]) {
+        let mut inner = self.lock();
+        inner.retain(|name, _| entries.iter().any(|e| e.name == *name));
+        for e in entries {
+            let m = inner.entry(e.name.clone()).or_insert_with(|| Machine { name: e.name.clone(), ..Machine::default() });
+            m.target.clone_from(&e.target);
+            m.roots.clone_from(&e.roots);
+            m.rows.retain(|root, _| e.roots.contains(root));
+        }
+    }
+
+    /// Change machine `name` (if registered) under the lock.
+    pub fn update(&self, name: &str, f: impl FnOnce(&mut Machine)) {
+        if let Some(m) = self.lock().get_mut(name) {
+            f(m);
+        }
+    }
+
+    pub fn get(&self, name: &str) -> Option<Machine> {
+        self.lock().get(name).cloned()
+    }
+
+    /// Every machine, sorted by name (the rows are `Arc`s: cheap).
+    pub fn all(&self) -> Vec<Machine> {
+        self.lock().values().cloned().collect()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Machine>> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// One `machines` entry of a federated snapshot.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SnapshotMachine {
+    pub name: String,
+    pub target: String,
+    pub state: LinkState,
+    pub error: Option<String>,
+    pub version: Option<String>,
+    /// The remote's runtime (`runtime_name`), once a snapshot came.
+    pub runtime: Option<String>,
+}
+
+/// A `machines: true` watcher's `instances.snapshot`: `local` (a local
+/// root's params) as is, then each machine's instances, sandboxes and
+/// services tagged `machine` (sandboxes and services also `root`, the remote
+/// root they were read from), plus a top-level `machines` with every
+/// machine's link state.
+///
+/// Each remote instance appears once per machine (F8): every remote root's
+/// snapshot lists all of that host's instances, so an instance is taken
+/// from the snapshot of its own `root` when that root is registered, else
+/// from the machine's first root's. Remote `thread_children` aren't merged:
+/// the Inbox is this host's only.
+pub fn merge(local: &Value, machines: &[Machine]) -> Value {
+    let mut out = local.clone();
+    let Some(obj) = out.as_object_mut() else { return out };
+    let mut instances = take_array(obj, "instances");
+    let mut sandboxes = take_array(obj, "sandboxes");
+    let mut services = take_array(obj, "services");
+    for m in machines {
+        for (i, root) in m.roots.iter().enumerate() {
+            let Some(params) = m.rows.get(root) else { continue };
+            let root_text = root.to_string_lossy();
+            for row in rows(params, "instances") {
+                let own = row.get("root").and_then(Value::as_str).map(Path::new);
+                let here = match own {
+                    Some(own) if m.roots.iter().any(|r| r == own) => own == root,
+                    _ => i == 0,
+                };
+                if here {
+                    instances.push(tag(row, &m.name, None));
+                }
+            }
+            sandboxes.extend(rows(params, "sandboxes").map(|row| tag(row, &m.name, Some(&root_text))));
+            services.extend(rows(params, "services").map(|row| tag(row, &m.name, Some(&root_text))));
+        }
+    }
+    obj.insert("instances".into(), Value::Array(instances));
+    obj.insert("sandboxes".into(), Value::Array(sandboxes));
+    obj.insert("services".into(), Value::Array(services));
+    let entries: Vec<Value> = machines.iter().map(|m| json!(snapshot_machine(m))).collect();
+    obj.insert("machines".into(), Value::Array(entries));
+    out
+}
+
+fn snapshot_machine(m: &Machine) -> SnapshotMachine {
+    let runtime = m
+        .roots
+        .iter()
+        .find_map(|r| m.rows.get(r)?.get("runtime_name")?.as_str().map(str::to_string));
+    SnapshotMachine {
+        name: m.name.clone(),
+        target: m.target.clone(),
+        state: m.state,
+        error: m.error.clone(),
+        version: m.version.clone(),
+        runtime,
+    }
+}
+
+fn take_array(obj: &mut Map<String, Value>, key: &str) -> Vec<Value> {
+    match obj.remove(key) {
+        Some(Value::Array(rows)) => rows,
+        _ => Vec::new(),
+    }
+}
+
+fn rows<'a>(params: &'a Value, key: &str) -> impl Iterator<Item = &'a Value> {
+    params.get(key).and_then(Value::as_array).into_iter().flatten()
+}
+
+fn tag(row: &Value, machine: &str, root: Option<&str>) -> Value {
+    let mut row = row.clone();
+    if let Some(obj) = row.as_object_mut() {
+        obj.insert("machine".into(), machine.into());
+        if let Some(root) = root {
+            obj.insert("root".into(), root.into());
+        }
+    }
+    row
+}
+
 /// A snapshot without stats keeps the last cpu/mem of containers still
 /// running, so the columns don't blank between stats passes (what the
 /// dashboard did itself before).
@@ -229,6 +410,112 @@ pub(crate) mod tests {
         let mut fresh = snapshot(vec![row("a", true, None)], true);
         carry_over(&mut fresh, &usage(&full));
         assert_eq!(fresh.instances[0].cpu, None);
+    }
+
+    /// A remote root's pushed params: its instances (name, root), one sandbox
+    /// and one service named after the root's last component.
+    fn remote(dir: &str, instances: &[(&str, Option<&str>)]) -> Arc<Value> {
+        let rows: Vec<Value> = instances.iter().map(|(n, r)| serde_json::json!({"name": n, "root": r})).collect();
+        let tag = Path::new(dir).file_name().unwrap().to_string_lossy().into_owned();
+        Arc::new(serde_json::json!({
+            "dir": dir, "instances": rows, "sandboxes": [{"name": format!("sb-{tag}"), "root": "/elsewhere"}],
+            "services": [{"name": format!("svc-{tag}")}], "runtime_name": "podman", "thread_children": {"x": {}},
+        }))
+    }
+
+    fn machine(name: &str, roots: &[&str], state: LinkState) -> Machine {
+        Machine {
+            name: name.into(),
+            target: format!("me@{name}"),
+            roots: roots.iter().map(PathBuf::from).collect(),
+            state,
+            ..Machine::default()
+        }
+    }
+
+    fn names(v: &Value, key: &str) -> Vec<String> {
+        v[key].as_array().unwrap().iter().map(|r| format!("{}@{}", r["name"].as_str().unwrap(), r["machine"].as_str().unwrap_or("-"))).collect()
+    }
+
+    #[test]
+    fn merge_tags_remote_rows_and_takes_each_instance_once() {
+        let local = serde_json::json!({
+            "dir": "/here", "instances": [{"name": "mine", "root": "/here"}], "sandboxes": [{"name": "s"}],
+            "services": [], "runtime_name": "docker", "thread_children": {"local": {}},
+        });
+        let mut a = machine("a", &["/r/one", "/r/two"], LinkState::Connected);
+        a.version = Some("0.6.1".into());
+        // Every root's snapshot lists all of the machine's instances.
+        let all = [("in-one", Some("/r/one")), ("in-two", Some("/r/two")), ("orphan", Some("/r/gone")), ("old", None)];
+        a.rows.insert("/r/one".into(), remote("/r/one", &all));
+        a.rows.insert("/r/two".into(), remote("/r/two", &all));
+        // Down: its last rows stay, with its state.
+        let mut b = machine("b", &["/b"], LinkState::Unreachable);
+        b.error = Some("b: Connection refused".into());
+        b.rows.insert("/b".into(), remote("/b", &[("bee", Some("/b"))]));
+        // Never reached: its state only.
+        let mut c = machine("c", &["/c"], LinkState::Unreachable);
+        c.error = Some("c: Permission denied".into());
+
+        let merged = merge(&local, &[a, b, c]);
+        // From its own root's snapshot when registered, else the first's.
+        assert_eq!(names(&merged, "instances"), ["mine@-", "in-one@a", "orphan@a", "old@a", "in-two@a", "bee@b"]);
+        assert_eq!(names(&merged, "sandboxes"), ["s@-", "sb-one@a", "sb-two@a", "sb-b@b"]);
+        assert_eq!(names(&merged, "services"), ["svc-one@a", "svc-two@a", "svc-b@b"]);
+        // Sandboxes and services say the remote root they came from; an
+        // instance keeps its own (null included).
+        assert_eq!(merged["sandboxes"][2]["root"], "/r/two");
+        assert_eq!(merged["services"][0]["root"], "/r/one");
+        assert_eq!(merged["instances"][3]["root"], Value::Null);
+        assert!(merged["instances"][0].get("machine").is_none(), "local rows untouched");
+        // The local rest as is: no remote thread_children.
+        assert_eq!((&merged["dir"], &merged["runtime_name"]), (&serde_json::json!("/here"), &serde_json::json!("docker")));
+        assert_eq!(merged["thread_children"], serde_json::json!({"local": {}}));
+        assert_eq!(
+            merged["machines"],
+            serde_json::json!([
+                {"name": "a", "target": "me@a", "state": "connected", "error": null, "version": "0.6.1", "runtime": "podman"},
+                {"name": "b", "target": "me@b", "state": "unreachable", "error": "b: Connection refused", "version": null, "runtime": "podman"},
+                {"name": "c", "target": "me@c", "state": "unreachable", "error": "c: Permission denied", "version": null, "runtime": null},
+            ])
+        );
+        // No machines: the local params plus an empty `machines`.
+        let alone = merge(&local, &[]);
+        let mut want = local.clone();
+        want["machines"] = serde_json::json!([]);
+        assert_eq!(alone, want);
+    }
+
+    #[test]
+    fn the_first_roots_snapshot_missing_drops_its_unregistered_instances_for_now() {
+        let mut a = machine("a", &["/r/one", "/r/two"], LinkState::Connecting);
+        a.rows.insert("/r/two".into(), remote("/r/two", &[("in-one", Some("/r/one")), ("in-two", Some("/r/two")), ("old", None)]));
+        let merged = merge(&serde_json::json!({"instances": [], "sandboxes": [], "services": []}), &[a]);
+        // `in-one` waits for its own root's snapshot; `old` for the first's.
+        assert_eq!(names(&merged, "instances"), ["in-two@a"]);
+    }
+
+    #[test]
+    fn remotes_follow_the_registry() {
+        let remotes = Remotes::default();
+        let entry = |name: &str, roots: &[&str]| Entry {
+            name: name.into(),
+            target: name.into(),
+            roots: roots.iter().map(PathBuf::from).collect(),
+            command: None,
+        };
+        remotes.sync(&[entry("a", &["/1", "/2"]), entry("b", &["/b"])]);
+        remotes.update("a", |m| {
+            m.state = LinkState::Connected;
+            m.rows.insert("/1".into(), Arc::new(Value::Null));
+            m.rows.insert("/2".into(), Arc::new(Value::Null));
+        });
+        remotes.update("nope", |_| panic!("not registered"));
+        remotes.sync(&[entry("a", &["/2"])]);
+        let all = remotes.all();
+        assert_eq!(all.len(), 1);
+        assert_eq!((all[0].state, all[0].rows.keys().collect::<Vec<_>>()), (LinkState::Connected, vec![&PathBuf::from("/2")]));
+        assert!(remotes.get("b").is_none());
     }
 
     fn view(depth: Depth) -> RuntimeView {

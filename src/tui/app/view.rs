@@ -1770,6 +1770,8 @@ mod tests {
             dispatcher: None,
             done: false,
             phase: None,
+            root: None,
+            machine: None,
         };
         let rows = vec![
             mk("a", "s", ContainerStatus::Exited("x".into())),

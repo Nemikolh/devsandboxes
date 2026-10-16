@@ -87,7 +87,7 @@ fn cells(r: MachineRow) -> [String; 5] {
         Some((first, [])) => first.display().to_string(),
         Some((first, rest)) => format!("{} +{}", first.display(), rest.len()),
     };
-    [r.name, r.target, roots, r.state, r.version.unwrap_or_else(|| "-".into())]
+    [r.name, r.target, roots, r.state.as_str().into(), r.version.unwrap_or_else(|| "-".into())]
 }
 
 /// A candidate as the picker shows it: `/home/me/.devsandboxes  (api, web)`.
@@ -255,7 +255,7 @@ mod tests {
             target: "me@m".into(),
             roots: roots.iter().map(Into::into).collect(),
             command: None,
-            state: "idle".into(),
+            state: crate::serve::snapshots::LinkState::Idle,
             error: None,
             version: version.map(String::from),
         };
