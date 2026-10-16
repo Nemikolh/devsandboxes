@@ -34,13 +34,84 @@ fn resolve_action(s: &crate::snapshot::Snapshot, action: PromptAction, services:
         }
         PromptAction::Rebuild { instance, force } => PromptAction::Rebuild { instance: inst(instance)?, force },
         PromptAction::ServiceRebuild { name } => PromptAction::ServiceRebuild { name: resolve(s, &name, Kind::Service)? },
-        // An empty instance is a service-only forward.
-        PromptAction::Port { instance, service, address, spec } if instance.is_empty() => {
+        PromptAction::Port { instance, service, address, spec } => {
+            let (instance, service) = resolve_port(s, &instance, service.as_deref())?;
             PromptAction::Port { instance, service, address, spec }
         }
-        PromptAction::Port { instance, service, address, spec } => {
-            PromptAction::Port { instance: inst(instance)?, service, address, spec }
+    })
+}
+
+/// `port`'s instance and `--service` as keys on one machine. The instance
+/// names the machine (`port box/web --service db`: box's `db`, the CLI's
+/// rule); a qualified `--service box/db` puts a bare instance there too
+/// (`port web --service box/db` is `box/web`), so the Services tab's
+/// prefill for a service nobody uses yet still says where. A service on
+/// another machine than the instance is an error. An empty instance (a
+/// service-only forward) resolves the service like any name.
+fn resolve_port(s: &crate::snapshot::Snapshot, instance: &str, service: Option<&str>) -> Result<(String, Option<String>), String> {
+    use crate::serve::machines::{Where, parse_name};
+    use remote::{Kind, resolve};
+    if instance.is_empty() {
+        return Ok((String::new(), service.map(|v| resolve(s, v, Kind::Service)).transpose()?));
+    }
+    let svc = service.map(parse_name).transpose().map_err(|e| format!("{e:#}"))?;
+    let (place, name) = parse_name(instance).map_err(|e| format!("{e:#}"))?;
+    let typed = match (place, svc.as_ref().map(|(w, _)| w)) {
+        (Where::Any, Some(Where::Machine(m))) => format!("{m}/{name}"),
+        (Where::Any, Some(Where::Local)) => format!("@/{name}"),
+        _ => instance.to_string(),
+    };
+    let key = resolve(s, &typed, Kind::Instance)?;
+    let machine = remote::split(&key).0;
+    let service = match svc {
+        None => None,
+        Some((place, svc_name)) => {
+            let same = match &place {
+                Where::Any => true,
+                Where::Local => machine.is_none(),
+                Where::Machine(m) => machine == Some(m.as_str()),
+            };
+            if !same {
+                let typed = service.unwrap_or_default();
+                return Err(format!("`--service {typed}` isn't on the machine of `{key}`"));
+            }
+            Some(remote::qualify(machine, &svc_name))
         }
+    };
+    Ok((key, service))
+}
+
+/// A resolved `port` (keys from [`resolve_port`]) as the request: bare names
+/// on the machine the keys name, plus that machine's config root (the
+/// instance's, else the service's: `remote::instance_route` /
+/// `service_route`). A machine without a known root (no snapshot rows of
+/// it yet) is the status line to show.
+pub(super) fn port_request(
+    s: Option<&crate::snapshot::Snapshot>,
+    instance: &str,
+    service: Option<&str>,
+    address: Option<String>,
+    spec: String,
+) -> Result<PortRequest, String> {
+    let route = match (s, instance.is_empty(), service) {
+        (Some(s), false, _) => remote::instance_route(s, instance),
+        (Some(s), true, Some(svc)) => remote::service_route(s, svc),
+        _ => {
+            let key = if instance.is_empty() { service.unwrap_or_default() } else { instance };
+            remote::Route { machine: remote::split(key).0.map(String::from), root: None }
+        }
+    };
+    if let (Some(machine), None) = (&route.machine, &route.root) {
+        let what = if instance.is_empty() { service.unwrap_or_default() } else { instance };
+        return Err(format!("port {what}: no config root known on {machine} yet"));
+    }
+    Ok(PortRequest {
+        instance: remote::split(instance).1.to_string(),
+        service: service.map(|s| remote::split(s).1.to_string()),
+        address,
+        spec,
+        machine: route.machine,
+        root: route.root,
     })
 }
 
@@ -102,12 +173,9 @@ impl App {
     }
 
     /// The prompt prefilled `port <name> `, whatever is selected (the Inbox
-    /// thread pane's `p` targets the thread's child).
+    /// thread pane's `p` targets the thread's child). A machine's instance
+    /// is its key (`port box/web `), which the prompt resolves back.
     pub(super) fn open_port_prompt_for(&mut self, name: &str) {
-        if let (Some(machine), name) = remote::split(name) {
-            self.status = Some(super::actions::not_yet_port(machine, name));
-            return;
-        }
         self.status = None;
         let history = crate::tui::prompt::load_history();
         self.prompt = Some(Prompt::with_input(history, format!("port {name} ")));
@@ -118,6 +186,11 @@ impl App {
     /// instance slot (a global service reached via a named instance works because
     /// the resolver falls back to another referencing instance). With no user, the
     /// instance slot is left blank for the user to fill.
+    ///
+    /// A machine's service: `port box/<user> --service <svc> ` (the instance
+    /// key names the machine, as everywhere), or with no user `port  --service
+    /// box/<svc> `, the qualified service putting the instance typed next on
+    /// that machine ([`resolve_port`]).
     pub(super) fn open_port_prompt_service(&mut self) {
         let Some(row) = self
             .snapshot
@@ -126,12 +199,11 @@ impl App {
         else {
             return;
         };
-        if let Some(machine) = &row.machine {
-            self.status = Some(super::actions::not_yet_port(machine, &row.name));
-            return;
-        }
-        let instance = row.used_by.first().map(String::as_str).unwrap_or("");
-        let svc = row.name.clone();
+        let machine = row.machine.as_deref();
+        let (instance, svc) = match row.used_by.first() {
+            Some(user) => (remote::qualify(machine, user), row.name.clone()),
+            None => (String::new(), remote::qualify(machine, &row.name)),
+        };
         self.status = None;
         let history = crate::tui::prompt::load_history();
         self.prompt =
@@ -187,11 +259,10 @@ impl App {
                     // path so the loop never suspends the screen for it.
                     if let PromptAction::Port { instance, service, address, spec } = action {
                         self.prompt = None;
-                        if let (Some(machine), name) = remote::split(&instance) {
-                            self.status = Some(super::actions::not_yet_port(machine, name));
-                            return;
+                        match port_request(self.snapshot.as_ref(), &instance, service.as_deref(), address, spec) {
+                            Ok(req) => self.request_port(req),
+                            Err(why) => self.status = Some(why),
                         }
-                        self.request_port(PortRequest { instance, service, address, spec });
                         return;
                     }
                     // `rebuild`/`recreate` parses tab-agnostically as an instance
@@ -409,12 +480,7 @@ mod tests {
         assert_eq!(app.take_pending_action(), None);
         assert_eq!(
             app.take_pending_port(),
-            Some(PortRequest {
-                instance: "api".into(),
-                service: None,
-                address: None,
-                spec: "3000".into(),
-            })
+            Some(PortRequest { instance: "api".into(), spec: "3000".into(), ..Default::default() })
         );
         // Submitting a forward switches to the Ports tab with a status line.
         assert_eq!(app.tab, Tab::Ports);
@@ -449,9 +515,8 @@ mod tests {
         s.instances.retain(|r| !(r.machine.is_none() && r.name == "inst1"));
         app.set_snapshot(s);
         assert_eq!(submit(&mut app, "rm inst1"), Some(PromptAction::Rm { instance: "box/inst1".into(), force: false, delete_branch: None }));
-        assert_eq!(submit(&mut app, "port box/inst1 3000"), None);
-        assert_eq!(app.take_pending_port(), None);
-        assert_eq!(app.status.as_deref(), Some("port box/inst1: forwarding from a machine isn't supported yet"));
+        assert_eq!(submit(&mut app, "port inst1 3000"), None);
+        assert_eq!(app.take_pending_port().map(|r| r.machine), Some(Some("box".into())));
 
         let app = machine_app();
         let sandboxes = remote::candidates(app.snapshot.as_ref().unwrap(), remote::Kind::Sandbox);
@@ -478,7 +543,115 @@ mod tests {
                 service: Some("pg".into()),
                 address: Some("0.0.0.0".into()),
                 spec: "8080:5432".into(),
+                ..Default::default()
             })
+        );
+    }
+
+    fn type_line(app: &mut App, line: &str) {
+        for c in line.chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+    }
+
+    fn boxed(instance: &str, service: Option<&str>, spec: &str) -> PortRequest {
+        PortRequest {
+            instance: instance.into(),
+            service: service.map(String::from),
+            spec: spec.into(),
+            machine: Some("box".into()),
+            root: Some("/r/one".into()),
+            ..Default::default()
+        }
+    }
+
+    /// A machine's instance forwards like a local one: `p` prefills its key,
+    /// and the request carries the machine, its root there, and the bare
+    /// name on it.
+    #[test]
+    fn port_on_a_machines_instance_carries_its_route() {
+        let mut app = machine_app();
+        app.on_key(key(KeyCode::Char(':')));
+        type_line(&mut app, "port box/inst0 3000");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.take_pending_port(), Some(boxed("inst0", None, "3000")));
+        assert_eq!(app.tab, Tab::Ports);
+
+        // `p` on box's inst0 (the tree: s, inst0, inst1, then box's s, inst0).
+        app.set_tab(Tab::Instances);
+        for _ in 0..4 {
+            app.on_key(key(KeyCode::Down));
+        }
+        assert_eq!(app.selected_instance_name().as_deref(), Some("box/inst0"));
+        app.on_key(key(KeyCode::Char('p')));
+        assert_eq!(prompt(&app).input(), "port box/inst0 ");
+        type_line(&mut app, "--service db 5432");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.take_pending_port(), Some(boxed("inst0", Some("db"), "5432")));
+
+        // A qualified service puts a bare instance on its machine; one on
+        // another machine than the instance is refused inline.
+        app.on_key(key(KeyCode::Char(':')));
+        type_line(&mut app, "port inst1 --service box/db 5432");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.take_pending_port(), Some(boxed("inst1", Some("db"), "5432")));
+        app.on_key(key(KeyCode::Char(':')));
+        type_line(&mut app, "port @/inst1 --service box/db 5432");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.take_pending_port(), None);
+        assert_eq!(prompt(&app).error.as_deref(), Some("`--service box/db` isn't on the machine of `inst1`"));
+    }
+
+    /// The Services tab's `p` on a machine's service: the prefill names the
+    /// machine (through its first user, else the service) and round-trips
+    /// to a request routed there.
+    #[test]
+    fn port_on_a_machines_service_round_trips() {
+        let mut app = machine_app();
+        app.set_tab(Tab::Services);
+        app.on_key(key(KeyCode::Char('p')));
+        assert_eq!(prompt(&app).input(), "port  --service box/db ");
+        // The user fills the instance slot with a bare name: box's.
+        app.on_key(key(KeyCode::Home));
+        for _ in 0..5 {
+            app.on_key(key(KeyCode::Right));
+        }
+        type_line(&mut app, "inst1");
+        app.on_key(key(KeyCode::End));
+        type_line(&mut app, "5432");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.take_pending_port(), Some(boxed("inst1", Some("db"), "5432")));
+
+        let mut s = app.snapshot.clone().unwrap();
+        s.services[0].used_by = vec!["inst0".into()];
+        app.set_snapshot(s);
+        app.set_tab(Tab::Services);
+        app.on_key(key(KeyCode::Char('p')));
+        assert_eq!(prompt(&app).input(), "port box/inst0 --service db ");
+        type_line(&mut app, "5432");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.take_pending_port(), Some(boxed("inst0", Some("db"), "5432")));
+    }
+
+    /// A service-only forward (no instance, from code) on a machine still
+    /// carries the machine and root; a machine with no known root is refused.
+    #[test]
+    fn service_only_port_requests_route_by_the_service() {
+        let app = machine_app();
+        let s = app.snapshot.as_ref().unwrap();
+        let (instance, service) = resolve_port(s, "", Some("db")).unwrap();
+        assert_eq!((instance.as_str(), service.as_deref()), ("", Some("box/db")));
+        assert_eq!(
+            port_request(Some(s), &instance, service.as_deref(), None, "5432".into()),
+            Ok(boxed("", Some("db"), "5432"))
+        );
+        assert_eq!(
+            port_request(None, "box/web", None, None, "3000".into()),
+            Err("port box/web: no config root known on box yet".into())
+        );
+        assert_eq!(
+            port_request(None, "web", None, None, "3000".into()),
+            Ok(PortRequest { instance: "web".into(), spec: "3000".into(), ..Default::default() })
         );
     }
 

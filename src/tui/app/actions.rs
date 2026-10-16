@@ -26,11 +26,6 @@ pub fn not_yet_code(machine: &str, name: &str) -> String {
     format!("code {machine}/{name}: VS Code on a machine isn't supported yet")
 }
 
-/// Forwards from a machine: not yet (docs/plans/active/machines-next.md, *1. Remote forwards (rollout step 6)*).
-pub fn not_yet_port(machine: &str, name: &str) -> String {
-    format!("port {machine}/{name}: forwarding from a machine isn't supported yet")
-}
-
 /// How a verb request the event loop sent for a [`PromptAction`] ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VerbEnd {
@@ -403,9 +398,10 @@ mod tests {
         app.on_key(key(KeyCode::Char('o')));
         assert_eq!(app.take_pending_action(), None);
         assert_eq!(app.status.as_deref(), Some("code box/inst0: VS Code on a machine isn't supported yet"));
+        // `p` prefills the key, which the prompt resolves back to the machine.
         app.on_key(key(KeyCode::Char('p')));
-        assert!(app.prompt.is_none());
-        assert_eq!(app.status.as_deref(), Some("port box/inst0: forwarding from a machine isn't supported yet"));
+        assert_eq!(prompt(&app).input(), "port box/inst0 ");
+        app.prompt = None;
 
         // Reads name the remote target by key; the daemon worker splits it.
         app.on_key(key(KeyCode::Char('l')));

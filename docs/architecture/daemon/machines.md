@@ -174,7 +174,9 @@ expanded with the remote home, canonicalized, config loaded).
 `src/tui/remote.rs`: rows are keyed `machine/name` (bare for local),
 routed back to a request's `machine` + remote `root`; terminal tabs use
 `tty_argv`; a machine without rows shows `box: connecting` or `box:
-unreachable: <why>` in the header. VS Code and port forwarding on a remote
-row answer "isn't supported yet".
+unreachable: <why>` in the header. `p` / `:port` on a remote row sends
+`forwards.add` with `machine` and the row's root (the forward binds here,
+listed with the rest on the Ports tab: `forwards.list {machines: true}`);
+VS Code on a remote row answers "isn't supported yet".
 
 Limitations: [status.md](../../status.md#daemon)

@@ -225,8 +225,12 @@ impl App {
             HostVerb::Terminal(_) => self.when_up(target, Deferred::Terminal),
             HostVerb::Logs(_) => self.logs_on(&target),
             HostVerb::Forward(f) => {
-                let req = PortRequest { instance: target.clone(), service: None, address: None, spec: f.port.to_string() };
-                self.when_up(target, Deferred::Forward(req))
+                // Routed like a typed `port` (the Inbox's owners are this
+                // host's today, so this is a local request).
+                match super::command_line::port_request(self.snapshot.as_ref(), &target, None, None, f.port.to_string()) {
+                    Ok(req) => self.when_up(target, Deferred::Forward(req)),
+                    Err(why) => self.status = Some(why),
+                }
             }
             HostVerb::Open(o) => self.request_open_link(o.url.clone()),
             // The `:rm` path: rm's branch question comes back as a modal.
@@ -481,7 +485,7 @@ mod tests {
         app.on_key(key(KeyCode::Char('1')));
         assert_eq!(
             app.take_pending_port(),
-            Some(PortRequest { instance: "inst0".into(), service: None, address: None, spec: "3000".into() })
+            Some(PortRequest { instance: "inst0".into(), spec: "3000".into(), ..Default::default() })
         );
         // Like the `port` prompt: on to the Ports tab, the pane kept for later.
         assert_eq!(app.tab, Tab::Ports);
@@ -637,7 +641,7 @@ mod tests {
         assert_eq!(app.pending_action, None, "the `o` was replaced");
         assert_eq!(
             app.take_pending_port(),
-            Some(PortRequest { instance: "inst1".into(), service: None, address: None, spec: "3000".into() })
+            Some(PortRequest { instance: "inst1".into(), spec: "3000".into(), ..Default::default() })
         );
     }
 

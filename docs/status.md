@@ -19,7 +19,7 @@ limitation means editing this file in the same commit.
 - **helper**: host → in-container daemon requests (an `RPC` channel),
   daemon-owned runs with a restart policy, worktree stand-ins.
   → [plan](plans/active/helper-rpc.md)
-- **machines**: remote forwards in the dashboard, VS Code on remote rows (spike),
+- **machines**: VS Code on remote rows (spike),
   remote Inbox threads, nameless commands across every machine.
   → [plan](plans/active/machines-next.md)
 - **daemon**: Windows as a remote-only client of a machine.
@@ -161,9 +161,9 @@ limitation means editing this file in the same commit.
 - Remote rows live in memory: a fresh daemon shows a machine without rows
   until its link connects. → [machines](architecture/daemon/machines.md); `snapshots::Remotes`
 - `vscode` and `inbox` are refused for a machine's instances on the CLI;
-  the dashboard's `o` and `p` on a remote row answer "not supported yet"
-  (the CLI's `port` works); nameless commands are local only; no default
-  machine. → [machines](architecture/daemon/machines.md); `machines::cli::route`, `not_yet_port`
+  the dashboard's `o` on a remote row answers "not supported yet" (its
+  `p` and the CLI's `port` work); nameless commands are local only; no
+  default machine. → [machines](architecture/daemon/machines.md); `machines::cli::route`, `not_yet_code`
 
 ### helper
 

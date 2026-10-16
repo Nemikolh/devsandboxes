@@ -500,21 +500,30 @@ fn done_status(req: &PendingDone, answer: Answer) -> (String, bool) {
     }
 }
 
-/// The API call for `forwards.list` of config root `dir`.
+/// The API call for `forwards.list` of config root `dir`, plus every
+/// forward into a machine (they bind here whatever root they reach).
 fn list_call(dir: &Path) -> (&'static str, Value) {
-    ("forwards.list", json!({ "dir": dir.to_string_lossy() }))
+    ("forwards.list", json!({ "dir": dir.to_string_lossy(), "machines": true }))
 }
 
 /// The API call for [`Cmd::ForwardAdd`]. An empty instance (a typed
-/// `port --service …` without one) is a service-only forward.
+/// `port --service …` without one) is a service-only forward. A machine's
+/// forward goes to `dir` = its config root on that machine.
 fn add_call(dir: &Path, req: &PortRequest) -> (&'static str, Value) {
-    let params = json!({
-        "dir": dir.to_string_lossy(),
+    let dir = match (&req.machine, &req.root) {
+        (Some(_), Some(root)) => root.clone(),
+        _ => dir.to_string_lossy().into_owned(),
+    };
+    let mut params = json!({
+        "dir": dir,
         "instance": (!req.instance.is_empty()).then_some(&req.instance),
         "service": req.service,
         "address": req.address,
         "spec": req.spec,
     });
+    if let Some(machine) = &req.machine {
+        params["machine"] = json!(machine);
+    }
     ("forwards.add", params)
 }
 
@@ -536,6 +545,7 @@ fn port_rows(result: Value) -> Result<Vec<PortRow>> {
             state: r.state,
             conns: r.conns,
             configured: r.configured,
+            machine: r.machine,
         })
         .collect())
 }
@@ -1009,7 +1019,11 @@ mod tests {
     }
 
     fn port_req(instance: &str, service: Option<&str>) -> PortRequest {
-        PortRequest { instance: instance.into(), service: service.map(String::from), address: None, spec: "8080:3000".into() }
+        PortRequest { instance: instance.into(), service: service.map(String::from), spec: "8080:3000".into(), ..Default::default() }
+    }
+
+    fn remote_req(instance: &str, service: Option<&str>) -> PortRequest {
+        PortRequest { machine: Some("box".into()), root: Some("/r/one".into()), ..port_req(instance, service) }
     }
 
     #[test]
@@ -1023,7 +1037,7 @@ mod tests {
         assert_eq!(rx.try_recv().unwrap(), Cmd::ForwardRm(4));
 
         let dir = Path::new("/cfg");
-        assert_eq!(list_call(dir), ("forwards.list", json!({"dir": "/cfg"})));
+        assert_eq!(list_call(dir), ("forwards.list", json!({"dir": "/cfg", "machines": true})));
         assert_eq!(rm_call(4), ("forwards.rm", json!({"id": 4})));
         assert_eq!(
             add_call(dir, &port_req("web", None)),
@@ -1034,6 +1048,14 @@ mod tests {
         );
         // No instance typed: a service-only forward.
         assert_eq!(add_call(dir, &port_req("", Some("db"))).1["instance"], Value::Null);
+        // A machine's: its root there as `dir`, and the machine.
+        assert_eq!(
+            add_call(dir, &remote_req("web", Some("db"))),
+            (
+                "forwards.add",
+                json!({"dir": "/r/one", "instance": "web", "service": "db", "address": null, "spec": "8080:3000", "machine": "box"})
+            )
+        );
         assert!(root_dir(PathBuf::from("rel/dir")).is_absolute());
     }
 
@@ -1045,8 +1067,20 @@ mod tests {
         use crate::serve::forwards::{AddRequest, Removed};
         struct Fake;
         impl Forwarding for Fake {
-            fn list(&self, dir: Option<PathBuf>, _machines: bool) -> Result<Vec<ForwardRow>, ApiError> {
+            fn list(&self, dir: Option<PathBuf>, machines: bool) -> Result<Vec<ForwardRow>, ApiError> {
                 assert_eq!(dir.as_deref(), Some(Path::new("/cfg")));
+                assert!(machines);
+                let remote = ForwardRow {
+                    id: 4,
+                    dir: "/r/one".into(),
+                    local: "127.0.0.1:8081".into(),
+                    target: "box/web:3000".into(),
+                    process: None,
+                    state: "connecting".into(),
+                    conns: 0,
+                    configured: false,
+                    machine: Some("box".into()),
+                };
                 Ok(vec![ForwardRow {
                     id: 3,
                     dir: "/cfg".into(),
@@ -1057,10 +1091,14 @@ mod tests {
                     conns: 2,
                     configured: true,
                     machine: None,
-                }])
+                }, remote])
             }
             fn add(&self, req: AddRequest) -> Result<Added, ApiError> {
                 assert_eq!(req.instance.as_deref(), Some("web"));
+                if let Some(m) = &req.machine {
+                    assert_eq!((m.as_str(), req.dir.as_path()), ("box", Path::new("/r/one")));
+                    return Ok(Added { id: 4, local: "127.0.0.1:8081".into(), target: "box/web:3000".into() });
+                }
                 Ok(Added { id: 3, local: "127.0.0.1:8080".into(), target: "web:3000".into() })
             }
             fn rm(&self, _: u64) -> Result<Removed, ApiError> {
@@ -1075,18 +1113,33 @@ mod tests {
         let rows = port_rows(api::call(method, params, &ctx).unwrap()).unwrap();
         assert_eq!(
             rows,
-            [PortRow {
-                id: 3,
-                local: "127.0.0.1:8080".into(),
-                target: "web:3000".into(),
-                process: Some("node (pid 1)".into()),
-                state: "active".into(),
-                conns: 2,
-                configured: true,
-            }]
+            [
+                PortRow {
+                    id: 3,
+                    local: "127.0.0.1:8080".into(),
+                    target: "web:3000".into(),
+                    process: Some("node (pid 1)".into()),
+                    state: "active".into(),
+                    conns: 2,
+                    configured: true,
+                    machine: None,
+                },
+                PortRow {
+                    id: 4,
+                    local: "127.0.0.1:8081".into(),
+                    target: "box/web:3000".into(),
+                    process: None,
+                    state: "connecting".into(),
+                    conns: 0,
+                    configured: false,
+                    machine: Some("box".into()),
+                },
+            ]
         );
         let (method, params) = add_call(dir, &port_req("web", None));
         assert_eq!(added_status(api::call(method, params, &ctx).unwrap()), "forwarding 127.0.0.1:8080 -> web:3000");
+        let (method, params) = add_call(dir, &remote_req("web", None));
+        assert_eq!(added_status(api::call(method, params, &ctx).unwrap()), "forwarding 127.0.0.1:8081 -> box/web:3000");
         let (method, params) = rm_call(3);
         assert_eq!(
             removed_status(&api::call(method, params, &ctx).unwrap()),

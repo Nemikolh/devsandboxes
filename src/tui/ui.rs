@@ -593,22 +593,28 @@ fn draw_ports_table(
     area: Rect,
     term_focused: bool,
 ) {
-    let header = Row::new(
-        ["LOCAL", "TARGET", "PROCESS", "STATE", "CONNS"]
-            .into_iter()
-            .map(Cell::from),
-    )
-    .style(Style::default().add_modifier(Modifier::DIM));
-
-    let table_rows: Vec<Row> = rows.iter().map(port_row).collect();
-
-    let widths = [
+    let mut titles = vec!["LOCAL", "TARGET", "PROCESS", "STATE", "CONNS"];
+    let mut widths = vec![
         Constraint::Length(20),
         Constraint::Min(24),
         Constraint::Length(18),
         Constraint::Length(14),
         Constraint::Length(6),
     ];
+    // MACHINE like the Instances tab's: only once a machine is registered
+    // (or a row reaches one), after the first column.
+    let show_machine = !app.machines.is_empty() || rows.iter().any(|r| r.machine.is_some());
+    if show_machine {
+        let names = app.machines.iter().map(|m| m.name.chars().count());
+        let row_names = rows.iter().filter_map(|r| r.machine.as_ref()).map(|m| m.chars().count());
+        let width = names.chain(row_names).max().unwrap_or(0).max("MACHINE".len());
+        titles.insert(1, "MACHINE");
+        widths.insert(1, Constraint::Length(width as u16));
+    }
+    let header = Row::new(titles.into_iter().map(Cell::from))
+        .style(Style::default().add_modifier(Modifier::DIM));
+
+    let table_rows: Vec<Row> = rows.iter().map(|r| port_row(r, show_machine)).collect();
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -625,19 +631,29 @@ fn draw_ports_table(
     frame.render_stateful_widget(table, area, &mut state);
 }
 
-fn port_row(r: &PortRow) -> Row<'_> {
+/// One forward's cells. With the MACHINE column, a remote target's own
+/// `<machine>/` prefix (the daemon's label) is left to that column.
+fn port_row(r: &PortRow, show_machine: bool) -> Row<'_> {
     let process = r.process.clone().unwrap_or_else(|| "-".to_string());
-    let mut target = vec![Span::raw(r.target.clone())];
+    let label = match &r.machine {
+        Some(m) if show_machine => r.target.strip_prefix(&format!("{m}/")).unwrap_or(&r.target).to_string(),
+        _ => r.target.clone(),
+    };
+    let mut target = vec![Span::raw(label)];
     if r.configured {
         target.push(Span::styled(" (config)", Style::default().add_modifier(Modifier::DIM)));
     }
-    Row::new(vec![
-        Cell::from(r.local.clone()),
+    let mut cells = vec![Cell::from(r.local.clone())];
+    if show_machine {
+        cells.push(Cell::from(Span::styled(r.machine.clone().unwrap_or_default(), Style::default().fg(ACCENT))));
+    }
+    cells.extend([
         Cell::from(Line::from(target)),
         Cell::from(process),
         Cell::from(Span::styled(r.state.clone(), port_state_style(&r.state))),
         Cell::from(r.conns.to_string()),
-    ])
+    ]);
+    Row::new(cells)
 }
 
 /// Color the STATE column like the siblings: active green, connecting yellow,
@@ -3032,6 +3048,37 @@ mod tests {
         let screen = render(&app, 200, 30);
         let rows: Vec<&str> = screen.lines().filter(|l| l.contains("  web ")).collect();
         assert!(rows[1].contains(" running "), "{screen}");
+    }
+
+    /// The Ports tab's MACHINE column: absent with only this host's
+    /// forwards, the machine (and its target without the prefix) on a
+    /// remote one's row, blank on a local one's.
+    #[test]
+    fn remote_forwards_get_a_machine_column() {
+        let row = |id: u64, target: &str, machine: Option<&str>| PortRow {
+            id,
+            local: format!("127.0.0.1:{}", 8080 + id),
+            target: target.into(),
+            process: None,
+            state: "active".into(),
+            conns: 0,
+            configured: false,
+            machine: machine.map(String::from),
+        };
+        let mut app = phase_app(vec![("web", running(), None)]);
+        app.tab = Tab::Ports;
+        app.set_ports(vec![row(0, "web:3000", None)]);
+        let alone = render(&app, 160, 20);
+        assert!(alone.contains("LOCAL") && !alone.contains("MACHINE"), "{alone}");
+
+        app.set_ports(vec![row(0, "web:3000", None), row(1, "box/api:3000", Some("box"))]);
+        let screen = render(&app, 160, 20);
+        let header = screen.lines().find(|l| l.contains("LOCAL")).unwrap();
+        assert!(header.contains(" MACHINE ") && header.contains("TARGET"), "{screen}");
+        let local = screen.lines().find(|l| l.contains("127.0.0.1:8080")).unwrap();
+        assert!(local.contains(" web:3000") && !local.contains("box"), "{screen}");
+        let remote = screen.lines().find(|l| l.contains("127.0.0.1:8081")).unwrap();
+        assert!(remote.contains(" box ") && remote.contains(" api:3000") && !remote.contains("box/"), "{screen}");
     }
 
     fn running() -> ContainerStatus {

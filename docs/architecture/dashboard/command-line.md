@@ -47,6 +47,15 @@ parser pure: `rebuild` on the Services tab becomes
 `pending_port` request (switching to the Ports tab) rather than a
 `pending_action`.
 
+`port`'s names resolve together (`resolve_port`): the instance names the
+machine and a bare `--service` is that machine's (`port box/web --service
+db`), while a qualified `--service box/db` puts a bare instance on its
+machine (`port web --service box/db` is `box/web`); a service on another
+machine than the instance is an inline error. `port_request` turns the
+keys into the `PortRequest`: bare names, plus for a machine its `machine`
+and config root there (`remote::instance_route`, or `service_route` for a
+service-only one); a machine with no known root yet is a status line.
+
 ## Completion
 
 `tab` calls `Prompt::complete` with a closure over `candidates_for`:
@@ -84,12 +93,14 @@ The event loop takes `App::pending_action`
 - `code`: VS Code launch on a background thread (`spawn_code`); refused
   for a machine's instance.
 - `rename`: `instances.rename` on the daemon worker's connection.
-- `port`: `forwards.add` via the daemon worker; refused for a machine's
-  instance.
+- `port`: `forwards.add` via the daemon worker; a machine's instance or
+  service is the same call with `machine` and its root there as `dir`.
 
 One-key shortcuts reuse the prompt: `r` prefills `rename <instance> ` (or
 `run <sandbox> ` off an instance), `p` prefills `port <instance> ` or
-`port <instance> --service <svc> `.
+`port <instance> --service <svc> ` (a machine's row by its key: `port
+box/web `, `port box/web --service db `, or for a service nobody uses yet
+`port  --service box/db `).
 
 ## Adding a command or flag
 

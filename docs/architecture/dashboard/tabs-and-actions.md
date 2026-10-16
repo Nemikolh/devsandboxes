@@ -31,9 +31,11 @@ or a click on the title). Each keeps its own selected row.
   expanded process layers survive snapshot refreshes. The Detail pane
   shows the selected row. Done instances render dimmed.
 - **Services**: one row per `ServiceRow` with its backing containers.
-- **Ports**: the daemon's forwards for this config root (`PortRow`,
-  `configured` for a sandbox's `forwardPorts`). The worker fetches
-  `forwards.list` on connect and on `forwards.changed`. `p` on an
+- **Ports**: the daemon's forwards for this config root plus every
+  forward into a machine (`PortRow`, `configured` for a sandbox's
+  `forwardPorts`, `machine` for a remote one, shown in a MACHINE column
+  like the Instances tab's). The worker fetches `forwards.list {machines:
+  true}` on connect and on `forwards.changed`. `p` on an
   instance or service (a prefilled `port` prompt) adds through
   `forwards.add` and switches here; `d` stops through `forwards.rm`.
   Disconnected, the tab is empty

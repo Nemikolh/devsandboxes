@@ -107,17 +107,25 @@ pub struct PortRow {
     pub conns: usize,
     /// Started from a sandbox's `forwardPorts`, not by hand.
     pub configured: bool,
+    /// The machine whose instance or service it reaches; `None` for this
+    /// host's.
+    pub machine: Option<String>,
 }
 
 /// A forward the user asked for, for the event loop to send as `forwards.add`
 /// through the daemon worker. Mirrors the CLI's `(instance, service, address, spec)` inputs;
-/// `spec` is a validated `[host:]port` string.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// `spec` is a validated `[host:]port` string. `instance` and `service` are
+/// names on `machine` (bare, never [`qualify`](crate::tui::remote::qualify)d keys); a machine's
+/// forward carries the config root there (`root`), which the call sends as
+/// its `dir`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PortRequest {
     pub instance: String,
     pub service: Option<String>,
     pub address: Option<String>,
     pub spec: String,
+    pub machine: Option<String>,
+    pub root: Option<String>,
 }
 
 pub struct App {
