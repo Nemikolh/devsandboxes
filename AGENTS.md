@@ -238,3 +238,8 @@ Start with `docs/README.md` (reading order and map) and
   (`tui`, `rm` or any other command, `docker`, `apple`, `config`, …).
 - Releases: follow the `release` skill (`.agents/skills/release/SKILL.md`).
   `CHANGELOG.md`'s `## Unreleased` section becomes the GitHub release body.
+- Pre-1.0 with very few users: treat everything as unreleased. Break wire
+  protocols, file formats, config and CLI freely; no backwards-compat
+  shims, migration paths, mixed-version fallbacks or "behavior change"
+  changelog notes unless asked. Both ends of a link (helper, daemon,
+  machines) are assumed to run the same version.
