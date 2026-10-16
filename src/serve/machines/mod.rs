@@ -9,6 +9,8 @@
 //! - `api`: the `machines.*` methods
 //! - `forward`: requests with `machine` (quick calls, verbs) and the
 //!   federated resolve and sandboxes listing
+//! - `cli`: the CLI's side: where a `<name>` points, `--machine`, and the
+//!   ssh re-run of commands that don't go through the daemon
 //!
 //! Only the daemon writes the registry (`machines.add` / `machines.rm`);
 //! the CLI reads it later to know whether any machine exists (F15). Two
@@ -25,6 +27,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 pub mod api;
+pub mod cli;
 pub mod forward;
 pub mod link;
 pub mod service;
@@ -152,6 +155,47 @@ pub fn check_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Where a CLI `<name>` points (docs/machines.md, *Decisions*).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Where {
+    /// `@/<name>`: this host only.
+    Local,
+    /// `<machine>/<name>`: that machine only.
+    Machine(String),
+    /// A bare name: this host and every machine.
+    Any,
+}
+
+/// Split a CLI `<name>` into where it points and the name there. Docker
+/// container names can't hold `/` or `@`, so neither can a working instance
+/// or sandbox name: any `/` qualifies, at the first one (F2), and a machine
+/// part that isn't a valid machine name is an error rather than a bare name
+/// that could never match.
+pub fn parse_name(arg: &str) -> Result<(Where, String)> {
+    let Some((machine, name)) = arg.split_once('/') else { return Ok((Where::Any, arg.to_string())) };
+    if name.is_empty() {
+        bail!("`{arg}`: no name after `/`");
+    }
+    if machine == "@" {
+        return Ok((Where::Local, name.to_string()));
+    }
+    check_name(machine).with_context(|| format!("`{arg}` isn't `<machine>/<name>` or `@/<name>`"))?;
+    Ok((Where::Machine(machine.to_string()), name.to_string()))
+}
+
+/// The registered machines' names, from the file (F15): the one place the
+/// CLI reads the daemon's registry itself, so that without machines no
+/// command contacts a daemon it didn't before. Missing, empty or unreadable
+/// is none.
+pub fn registered_names() -> Vec<String> {
+    path().and_then(|p| load(&p)).map(|entries| entries.into_iter().map(|e| e.name).collect()).unwrap_or_default()
+}
+
+/// The error for a machine nobody registered.
+pub fn no_machine(name: &str) -> anyhow::Error {
+    anyhow::anyhow!("no machine named `{name}` (devsandbox machine ls)")
+}
+
 /// The name `machine add` gives a target without `--name`: its host
 /// (`me@my-server.com` → `my-server.com`, `ssh://me@box:2200` → `box`, an
 /// ssh-config alias as is). A host that isn't a valid name (an IPv6
@@ -254,6 +298,21 @@ mod tests {
         for bad in ["", ".hidden", "-x", "a/b", "@", "me@box", "a b", "a:22", "é"] {
             assert!(check_name(bad).is_err(), "{bad:?} passed");
         }
+    }
+
+    #[test]
+    fn names_parse_qualified_local_or_bare() {
+        let p = |s: &str| parse_name(s).unwrap();
+        assert_eq!(p("web-2"), (Where::Any, "web-2".into()));
+        assert_eq!(p("@/web-2"), (Where::Local, "web-2".into()));
+        assert_eq!(p("my-server/web-2"), (Where::Machine("my-server".into()), "web-2".into()));
+        // Split at the first `/`: the rest is the name, whatever it holds.
+        assert_eq!(p("a/b/c"), (Where::Machine("a".into()), "b/c".into()));
+        assert_eq!(p("a/devsandbox-web"), (Where::Machine("a".into()), "devsandbox-web".into()));
+        for bad in ["a/", "@/", "/web", "me@box/web", "a b/web", "-x/web", "@@/web"] {
+            assert!(parse_name(bad).is_err(), "{bad:?} parsed");
+        }
+        assert_eq!(no_machine("m").to_string(), "no machine named `m` (devsandbox machine ls)");
     }
 
     #[test]

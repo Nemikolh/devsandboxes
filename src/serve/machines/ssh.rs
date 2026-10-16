@@ -134,9 +134,17 @@ pub fn api_argv(entry: &Entry, client: &str) -> Result<Vec<OsString>> {
 /// The argv of an interactive command on `entry` (a terminal tab, a CLI
 /// re-exec): `ssh -t -A [-p N] -- <host> <devsandbox remote_args…>`. No
 /// `BatchMode`: a person is there to answer ssh's prompts.
-#[allow(dead_code)] // built ahead of its callers: steps 5 and 6 of docs/machines.md
+#[allow(dead_code)] // built ahead of its caller: step 6 of docs/machines.md
 pub fn tty_argv(entry: &Entry, remote_args: &[impl AsRef<str>]) -> Result<Vec<OsString>> {
-    argv(entry, &["-t", "-A"], remote_args)
+    cli_argv(entry, true, remote_args)
+}
+
+/// The argv of a CLI command re-run on `entry` (docs/machines.md, *CLI:
+/// ssh for the rest*): [`tty_argv`]'s, but `-T` when this process isn't on
+/// a terminal (`devsandbox exec m/x -- cat f > out` must get the bytes, not
+/// a pty's CRLFs). No `BatchMode`: a person is there.
+pub fn cli_argv(entry: &Entry, tty: bool, remote_args: &[impl AsRef<str>]) -> Result<Vec<OsString>> {
+    argv(entry, &[if tty { "-t" } else { "-T" }, "-A"], remote_args)
 }
 
 fn argv(entry: &Entry, opts: &[&str], remote_args: &[impl AsRef<str>]) -> Result<Vec<OsString>> {
@@ -368,6 +376,9 @@ mod tests {
         let remote = remote_command("~/bin/devsandbox", &["exec", "web", "-C", "/srv/it's here"]);
         assert_eq!(strs(&tty), ["ssh", "-t", "-A", "--", "box", remote.as_str()]);
         assert!(remote.contains("~/bin/devsandbox"), "the command is shell text: {remote}");
+        let piped = cli_argv(&entry("ssh://box:22", None), false, &["ps"]).unwrap();
+        let remote = remote_command("devsandbox", &["ps"]);
+        assert_eq!(strs(&piped), ["ssh", "-T", "-A", "-p", "22", "--", "box", remote.as_str()]);
         assert!(api_argv(&entry("-oProxyCommand=x", None), "c").is_err());
     }
 

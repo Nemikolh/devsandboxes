@@ -39,6 +39,12 @@ struct Cli {
     #[arg(long, global = true, hide = true)]
     in_process: bool,
 
+    /// Run a command without a name (`ps`, `stats`, `ls`, `status`, `gc`,
+    /// `service ls|rebuild`, `stop|start|rebuild --all`) on this machine
+    /// (`devsandbox machine ls`); a named one takes `<machine>/<name>` instead
+    #[arg(long, global = true, value_name = "MACHINE")]
+    machine: Option<String>,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -62,7 +68,9 @@ enum Command {
     },
     /// Start a new sandbox instance (in the background)
     Run {
-        /// Sandbox config to start; interactive menu on a TTY when omitted
+        /// Sandbox config to start (`<machine>/<sandbox>` for a machine's,
+        /// `@/<sandbox>` for this host's); interactive menu on a TTY when
+        /// omitted
         sandbox: Option<String>,
         /// Instance name; generated (and printed) when omitted
         #[arg(long)]
@@ -93,8 +101,7 @@ enum Command {
     /// worktree, branch, and per-instance state); no-op when there is no drift
     #[command(visible_alias = "recreate")]
     Rebuild {
-        /// Instance name, sandbox config name, or repository folder name
-        #[arg(required_unless_present = "all")]
+        #[arg(required_unless_present = "all", help = NAME_HELP)]
         name: Option<String>,
         /// Rebuild every instance whose config has drifted
         #[arg(long, conflicts_with = "name")]
@@ -108,14 +115,15 @@ enum Command {
     },
     /// Rename an instance (state only; the container keeps its old name)
     Rename {
-        /// Exact instance name (no sandbox/folder resolution)
+        /// Exact instance name (no sandbox/folder resolution);
+        /// `<machine>/<name>` for a machine's, `@/<name>` for this host's
         name: String,
         /// New instance name
         new_name: String,
     },
     /// Remove a sandbox instance (container, worktree, state entry)
     Rm {
-        /// Instance name, sandbox config name, or repository folder name
+        #[arg(help = NAME_HELP)]
         name: String,
         /// Delete the worktree's branch without asking (`git branch -D`:
         /// unmerged commits go too)
@@ -136,8 +144,7 @@ enum Command {
     },
     /// Stop a sandbox instance (docker stop; `start` restarts it)
     Stop {
-        /// Instance name, sandbox config name, or repository folder name
-        #[arg(required_unless_present = "all")]
+        #[arg(required_unless_present = "all", help = NAME_HELP)]
         name: Option<String>,
         /// Stop every running instance
         #[arg(long, conflicts_with = "name")]
@@ -145,8 +152,7 @@ enum Command {
     },
     /// Start a stopped sandbox instance (services included)
     Start {
-        /// Instance name, sandbox config name, or repository folder name
-        #[arg(required_unless_present = "all")]
+        #[arg(required_unless_present = "all", help = NAME_HELP)]
         name: Option<String>,
         /// Start every stopped instance
         #[arg(long, conflicts_with = "name")]
@@ -173,8 +179,7 @@ enum Command {
     },
     /// Show the last lines of a container's logs, or an instance's build log
     Logs {
-        /// Instance name, sandbox config name, repository folder name, or
-        /// devsandbox container name (service containers included)
+        #[arg(help = CONTAINER_NAME_HELP)]
         name: String,
         /// Number of log lines to show (container logs only)
         #[arg(short = 'n', long, default_value_t = 50)]
@@ -191,8 +196,7 @@ enum Command {
     },
     /// Pretty-print the runtime's inspect JSON for a container
     Inspect {
-        /// Instance name, sandbox config name, repository folder name, or
-        /// devsandbox container name (service containers included)
+        #[arg(help = CONTAINER_NAME_HELP)]
         name: String,
         /// Output JSON instead of a table
         #[arg(long)]
@@ -201,6 +205,7 @@ enum Command {
     /// Open VS Code attached to a sandbox instance (same as `o` in the TUI)
     Vscode {
         /// Instance name, sandbox config name, or repository folder name
+        /// (`@/<name>`: this host's; machines aren't supported yet)
         name: String,
         /// Also open this file (relative to the instance's workspace folder)
         /// at a line and column in the attached window; waits up to 30 s for
@@ -211,12 +216,12 @@ enum Command {
     /// Mark a sandbox instance done: kept as is (container, worktree), shown
     /// dimmed until removed
     Done {
-        /// Instance name, sandbox config name, or repository folder name
+        #[arg(help = NAME_HELP)]
         name: String,
     },
     /// Clear an instance's done mark
     Undone {
-        /// Instance name, sandbox config name, or repository folder name
+        #[arg(help = NAME_HELP)]
         name: String,
     },
     /// Show CPU/memory usage of running devsandbox containers
@@ -240,7 +245,7 @@ enum Command {
         /// Allocate a pseudo-TTY
         #[arg(short)]
         tty: bool,
-        /// Instance name, sandbox config name, or repository folder name
+        #[arg(help = NAME_HELP)]
         name: String,
         /// Command and arguments to run; omitted: a login shell (zsh, bash,
         /// or sh), with `-i`, plus `-t` when stdin is a TTY, unless either
@@ -258,8 +263,9 @@ enum Command {
     ///     devsandbox port api --service postgres 5432
     ///     devsandbox port --service redis 6379
     Port {
-        /// Instance name, sandbox config name, or repository folder name;
-        /// omit only with `--service <global-svc>`
+        /// Instance name, sandbox config name, or repository folder name
+        /// (`@/<name>`: this host's; machines aren't supported yet); omit
+        /// only with `--service <global-svc>`
         name: Option<String>,
         /// Forward a service's port instead of the instance's own; a global
         /// service needs no instance name, an isolated one does
@@ -314,6 +320,15 @@ enum Command {
         cmd: MachineCommand,
     },
 }
+
+/// An instance `<name>`: one text for every command taking one.
+const NAME_HELP: &str = "Instance name, sandbox config name, or repository folder name; \
+     `<machine>/<name>` for a machine's, `@/<name>` for this host's (a bare name is looked up on every machine)";
+
+/// `logs`/`inspect`'s `<name>`, which may also be a container.
+const CONTAINER_NAME_HELP: &str = "Instance name, sandbox config name, repository folder name, or devsandbox \
+     container name (service containers included); `<machine>/<name>` for a machine's, `@/<name>` for this \
+     host's (a bare container name is this host's)";
 
 /// `-d` on `run`, `rebuild`, `start`: one text, one behaviour.
 const DETACH_HELP: &str = "Return once the instance is registered (its name is printed); the build \
@@ -467,6 +482,9 @@ fn main() -> Result<()> {
     }
 
     let Some(command) = cli.command else {
+        if cli.machine.is_some() {
+            anyhow::bail!("--machine isn't for the dashboard");
+        }
         if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
             #[cfg(unix)]
             return tui::dashboard(&cli.dir);
@@ -481,18 +499,38 @@ fn main() -> Result<()> {
     // (docs/verbs-as-requests.md, docs/api.md *Verbs*); it runs
     // them as `--in-process` subprocesses, which take the arms below. With
     // no daemon to reach, `fallback` says why and they run here instead.
+    //
+    // Before that, machines (docs/machines.md): a name may be a machine's,
+    // and `--machine` runs a nameless command there. A command that ran on a
+    // machine over ssh ends here; the rest come back with their name as this
+    // host knows it. The registry is read from the file (F15), never under
+    // `--in-process`.
     #[cfg(unix)]
-    let fallback = match serve::verbs_client::from_command(&command).filter(|_| !cli.in_process) {
-        Some(verb) => match serve::verbs_client::run(&cli.dir, verb)? {
+    let machines = if cli.in_process { Vec::new() } else { serve::machines::registered_names() };
+    #[cfg(unix)]
+    let command = match serve::machines::cli::route(cli.machine.as_deref(), cli.in_process, &machines, command)? {
+        serve::machines::cli::Routed::Here(command) => command,
+        serve::machines::cli::Routed::Exit(code) => std::process::exit(code),
+    };
+    #[cfg(not(unix))]
+    if cli.machine.is_some() {
+        anyhow::bail!("--machine needs devsandbox serve (unix only for now)");
+    }
+    #[cfg(unix)]
+    let fed = serve::verbs_client::Fed { machines: !machines.is_empty(), machine: cli.machine.clone() };
+    #[cfg(unix)]
+    let (command, fallback) = match serve::verbs_client::from_command(&command).filter(|_| !cli.in_process) {
+        Some(verb) => match serve::verbs_client::run(&cli.dir, verb, &fed)? {
             serve::verbs_client::Done::Exit(code) => std::process::exit(code),
             serve::verbs_client::Done::InProcess(why) => {
                 // As the daemon's subprocesses do: a fallback never lazy
                 // starts a daemon (nothing answered just now).
                 serve::client::set_in_process();
-                Some(why)
+                // `@/x` is `x` here; a machine's name refused (F13).
+                (serve::machines::cli::localize(command)?, Some(why))
             }
         },
-        None => None,
+        None => (command, None),
     };
     #[cfg(not(unix))]
     let fallback: Option<String> = None;

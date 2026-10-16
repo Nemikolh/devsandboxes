@@ -290,7 +290,7 @@ pub struct Cancelled {
 
 /// One `sandboxes.list` entry. An object, not a name, so fields can be added.
 /// `roots.list` uses it bare (its candidate already says the root).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SandboxEntry {
     pub name: String,
     /// The machine it's defined on, in a federated `sandboxes.list`; absent
