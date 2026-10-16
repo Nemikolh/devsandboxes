@@ -10,7 +10,8 @@ Code: `src/devsbd/forward.rs` (`Forward`, `ForwardSpec`, `Opener`,
 `Opened`, `ProcessLookup`, `local_opener`, `HostPort`, `PREFER_SPAN`,
 `ForwardState`, `bind_listener`), `src/commands/port.rs`
 (`plan`, `Planned`, `resolver`, `parse_port_spec`, `listening_procs`,
-`port`), `src/serve/forwards.rs` (`Registry`, `Handle`, `Root`, `Owner`,
+`port`), `src/commands/tunnel.rs` (`Header`, `read_header`, `tunnel`,
+`remote_opener`), `src/serve/forwards.rs` (`Registry`, `Handle`, `Root`, `Owner`,
 `Configured`, `AddRequest`, `Event`, `restore`, `candidates`),
 `src/serve/forward_store.rs` (`path`, `load`, `update`, `Entry`),
 `src/serve/api.rs` (`Forwarding`, `forwards_*`), `src/state.rs`
@@ -74,6 +75,45 @@ back to `ForwardSpec.probe`, which is `listening_procs`: a quiet `lsof -F`
 that doesn't answer in time is not retried through `lsof`
 (`helper_answer`). Probed on the supervisor thread at most every
 `PROBE_REFRESH` (10 s) while the forward is `Active`.
+
+## Remote bridges
+
+A forward into a machine's instance (machines.md) carries the same bridge
+mux over one ssh per bridge. `commands::tunnel::remote_opener(machine,
+argv)` spawns `argv()`, rebuilt on every spawn (an `ssh::tunnel_argv`, so a
+changed registry entry heals at the next respawn), which runs the hidden
+`devsandbox -C <root> tunnel [--instance=<name>] [--service=<svc>] --port
+<n>` on the machine.
+
+The far side resolves everything on its own host: `tunnel` resolves the
+name (`resolve_instance_noninteractive`) and runs `port::resolver` there
+(its config, state, runtime, helper install), writes one header line to
+stdout, then `exec`s `bridge::bridge_command` (`<runtime> exec -i -u root
+<container> devsbd bridge`, the argv every local bridge spawns), so the ssh
+stdio is the bridge's from then on. The header (`Header::line`) is
+`devsandbox-tunnel 1 <json>`, the json either `{label, host, port, hash,
+helper}` (`helper`: the port lives in the dialed container) or `{error}`
+(the resolve failed; `tunnel` then also exits 1 with the error on
+stderr). Nothing else goes to stdout.
+
+This side reads the header (`read_header`) on a thread, one byte at a time
+so nothing of the bridge's stream past the newline is taken, skipping
+lines before the magic (a login shell's motd), bounded at 64 KiB. The
+opener waits for it up to `HEADER_WAIT` (10 s), polling `stop`; on stop or
+timeout it kills and reaps the ssh. Then `bridge::attach` runs the usual
+handshake and mux on the rest of the ssh's stdout, labelled
+`<machine>/<label>` (the route label shown too). ssh's stderr goes from the
+start into a bounded `ssh::Tail`, so a chatty ssh can't stall on a full
+pipe; `attach` reads it through `TailReader`, which yields the tail once
+stderr ends. The lookup is `ProcessLookup::Helper` when the header says
+`helper` (the far helper answers `Bridge::listening` over the same
+stream), else `None`; a remote forward's `ForwardSpec.probe` finds nothing.
+
+Opener errors, first that applies: the header's `error`; with no header,
+an older devsandbox there (its stderr refuses the `tunnel` subcommand:
+"devsandbox on <machine> can't forward ports yet: update it"), ssh's
+stderr tail (`Permission denied (publickey).`), else "no answer from
+<machine>" (`no_header`).
 
 ## Host ports
 

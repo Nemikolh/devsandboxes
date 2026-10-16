@@ -312,6 +312,22 @@ enum Command {
         #[arg(long, hide = true)]
         session_env: bool,
     },
+    /// The far end of a remote forward's ssh (docs/architecture/daemon/forwards.md,
+    /// *Remote bridges*): resolve the route here, write its header line to
+    /// stdout, then become the instance's `devsbd bridge`
+    #[cfg(unix)]
+    #[command(hide = true)]
+    Tunnel {
+        /// Instance name, sandbox config name, or repository folder name
+        #[arg(long, required_unless_present = "service")]
+        instance: Option<String>,
+        /// The service whose port to dial
+        #[arg(long)]
+        service: Option<String>,
+        /// The container-side port
+        #[arg(long)]
+        port: u16,
+    },
     /// Register remote hosts (over ssh) whose sandboxes this one manages
     /// (docs/architecture/daemon/machines.md)
     #[cfg(unix)]
@@ -669,6 +685,8 @@ fn main() -> Result<()> {
         Command::Api { stdio: _, client, session_env } => {
             std::process::exit(serve::relay::stdio(&client, session_env)?)
         }
+        #[cfg(unix)]
+        Command::Tunnel { instance, service, port } => commands::tunnel::tunnel(cli.dir, instance, service, port),
         #[cfg(unix)]
         Command::Machine { cmd } => match cmd {
             MachineCommand::Add { target, name, configs } => commands::machine::add(&target, name.as_deref(), &configs),

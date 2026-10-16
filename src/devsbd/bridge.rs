@@ -537,8 +537,7 @@ fn spawn_observed(
     notify: Option<Services>,
     observe: Option<Observer>,
 ) -> Option<Bridge> {
-    let mut child = Command::new(backend().bin())
-        .args(["exec", "-i", "-u", "root", container, BIN, "bridge"])
+    let mut child = bridge_command(container)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -550,6 +549,15 @@ fn spawn_observed(
     Some(attach_with(child, stdin, stdout, stderr, hash, container, agent, notify, observe))
 }
 
+/// `<runtime> exec -i -u root <container> devsbd bridge`: the in-container end
+/// of every bridge, spawned here or `exec`'d by `devsandbox tunnel` on a
+/// machine (`commands::tunnel::tunnel`).
+pub fn bridge_command(container: &str) -> Command {
+    let mut cmd = Command::new(backend().bin());
+    cmd.args(["exec", "-i", "-u", "root", container, BIN, "bridge"]);
+    cmd
+}
+
 /// Run a bridge over an already-spawned child whose stdio carries an
 /// in-container `devsbd bridge` (directly, or behind a transport such as
 /// ssh): the handshake, then the mux. Agent-less, no notify/control
@@ -558,7 +566,6 @@ fn spawn_observed(
 /// the handshake starts at whatever it yields next. `label` names the far
 /// end in messages (`helper in <label> is outdated …`). Dropping the
 /// `Bridge` kills `child`.
-#[cfg_attr(not(test), allow(dead_code))] // for the remote forward opener, not wired yet
 pub fn attach(
     child: Child,
     stdin: impl Write + Send + 'static,

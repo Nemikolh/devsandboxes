@@ -85,6 +85,7 @@ pub(crate) fn machine_use(command: Option<&Command>) -> MachineUse {
         Command::Port { .. } => MachineUse::Refused("port"),
         Command::Serve { .. } => MachineUse::Refused("serve"),
         Command::Api { .. } => MachineUse::Refused("api"),
+        Command::Tunnel { .. } => MachineUse::Refused("tunnel"),
         Command::Machine { .. } => MachineUse::Refused("machine"),
     }
 }
@@ -586,7 +587,9 @@ mod tests {
         assert!(e.ends_with("qualify the name instead: box/<name>"), "{e}");
         let e = plan_of(&["stop", "web"], Some("box"), m).unwrap_err().to_string();
         assert!(e.ends_with("qualify the name instead: box/<name>"), "{e}");
-        for (args, what) in [(&["inbox", "ls"][..], "inbox"), (&["machine", "ls"], "machine"), (&["serve"], "serve"), (&["api", "--stdio"], "api")] {
+        for (args, what) in [(&["inbox", "ls"][..], "inbox"), (&["machine", "ls"], "machine"), (&["serve"], "serve"), (&["api", "--stdio"], "api"),
+            (&["tunnel", "--service", "db", "--port", "5432"], "tunnel")]
+        {
             let e = plan_of(args, Some("box"), m).unwrap_err().to_string();
             assert_eq!(e, format!("--machine isn't for `devsandbox {what}`"));
         }

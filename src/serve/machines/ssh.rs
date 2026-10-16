@@ -155,6 +155,28 @@ pub fn tty_argv_with(entry: &Entry, program: &str, remote_args: &[impl AsRef<str
     argv_with(entry, &["-t", "-A"], program, remote_args)
 }
 
+/// The argv of a remote forward's bridge (docs/architecture/daemon/forwards.md,
+/// *Remote bridges*): `ssh -T [-o BatchMode=yes] [-p N] -- <host> <devsandbox
+/// -C <root> tunnel [--instance=<key>] [--service=<svc>] --port <n>>`. No
+/// `-A`: a forward's bridge serves no agent. `batch` when whoever runs it has
+/// no TTY (the daemon). The `=` forms keep a name starting with `-` a value.
+#[cfg_attr(not(test), allow(dead_code))] // `devsandbox port` / the daemon wire it next
+pub fn tunnel_argv(
+    entry: &Entry,
+    batch: bool,
+    root: &Path,
+    instance: Option<&str>,
+    service: Option<&str>,
+    port: u16,
+) -> Result<Vec<OsString>> {
+    let mut args = vec!["-C".to_string(), root.to_string_lossy().into_owned(), "tunnel".into()];
+    args.extend(instance.map(|i| format!("--instance={i}")));
+    args.extend(service.map(|s| format!("--service={s}")));
+    args.extend(["--port".into(), port.to_string()]);
+    let opts: &[&str] = if batch { &["-T", "-o", "BatchMode=yes"] } else { &["-T"] };
+    argv(entry, opts, &args)
+}
+
 fn argv(entry: &Entry, opts: &[&str], remote_args: &[impl AsRef<str>]) -> Result<Vec<OsString>> {
     argv_with(entry, opts, entry.command(), remote_args)
 }
@@ -231,12 +253,32 @@ impl Drop for Peer {
 
 /// A bounded ring of a stream's last bytes, filled by a thread.
 #[derive(Default)]
-struct Tail {
+pub struct Tail {
     state: Mutex<(VecDeque<u8>, bool)>,
     eof: Condvar,
 }
 
 impl Tail {
+    /// Keep the tail of `stream` (a child's stderr), read to its end on a
+    /// thread named `name`. Fails only when the thread can't start.
+    pub fn collect(mut stream: impl Read + Send + 'static, name: &str) -> std::io::Result<Arc<Tail>> {
+        let tail = Arc::new(Tail::default());
+        let filled = Arc::clone(&tail);
+        std::thread::Builder::new().name(name.into()).spawn(move || {
+            let mut buf = [0u8; 1024];
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => filled.push(&buf[..n]),
+                    Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+            filled.finish();
+        })?;
+        Ok(tail)
+    }
+
     fn push(&self, bytes: &[u8]) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.0.extend(bytes);
@@ -249,7 +291,9 @@ impl Tail {
         self.eof.notify_all();
     }
 
-    fn read(&self, wait: Duration) -> String {
+    /// The tail so far, trimmed, after waiting up to `wait` for the stream's
+    /// EOF.
+    pub fn read(&self, wait: Duration) -> String {
         let deadline = Instant::now() + wait;
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         while !state.1 {
@@ -276,7 +320,7 @@ pub fn spawn(argv: &[OsString], agent: Option<&Path>) -> Result<Duplex> {
     }
     let mut child = cmd.spawn().with_context(|| format!("cannot run {}", program.to_string_lossy()))?;
     let peer_of = |child| Peer { child: Some(child), stderr: None };
-    let (Some(mut stdin), Some(mut stdout), Some(mut stderr)) = (child.stdin.take(), child.stdout.take(), child.stderr.take())
+    let (Some(mut stdin), Some(mut stdout), Some(stderr)) = (child.stdin.take(), child.stdout.take(), child.stderr.take())
     else {
         drop(peer_of(child));
         bail!("ssh's pipes are missing");
@@ -284,8 +328,8 @@ pub fn spawn(argv: &[OsString], agent: Option<&Path>) -> Result<Duplex> {
     let mut peer = peer_of(child);
     let (ours, theirs) = Stream::pair().context("cannot make a socket pair")?;
     let up = theirs.try_clone().context("cannot clone the socket pair")?;
-    let tail = Arc::new(Tail::default());
-    peer.stderr = Some(tail.clone());
+    // A failed spawn drops `peer`: the child is killed.
+    peer.stderr = Some(Tail::collect(stderr, "machine-ssh-stderr").context("cannot start the ssh pumps")?);
     let threads = [
         std::thread::Builder::new().name("machine-ssh-down".into()).spawn(move || {
             pipe(&mut stdout, &mut &theirs);
@@ -294,18 +338,6 @@ pub fn spawn(argv: &[OsString], agent: Option<&Path>) -> Result<Duplex> {
         std::thread::Builder::new().name("machine-ssh-up".into()).spawn(move || {
             pipe(&mut &up, &mut stdin);
             // `stdin` drops here: ssh sees EOF, the remote relay a hang-up.
-        }),
-        std::thread::Builder::new().name("machine-ssh-stderr".into()).spawn(move || {
-            let mut buf = [0u8; 1024];
-            loop {
-                match stderr.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => tail.push(&buf[..n]),
-                    Err(e) if e.kind() == ErrorKind::Interrupted => {}
-                    Err(_) => break,
-                }
-            }
-            tail.finish();
         }),
     ];
     for t in threads {
@@ -392,6 +424,20 @@ mod tests {
         let remote = remote_command("devsandbox", &["ps"]);
         assert_eq!(strs(&piped), ["ssh", "-T", "-A", "-p", "22", "--", "box", remote.as_str()]);
         assert!(api_argv(&entry("-oProxyCommand=x", None), "c").is_err());
+    }
+
+    #[test]
+    fn tunnel_argvs() {
+        let root = Path::new("/srv/it's");
+        let daemon = tunnel_argv(&entry("ssh://me@box:2200", None), true, root, Some("web"), Some("-db"), 5432).unwrap();
+        let remote =
+            remote_command("devsandbox", &["-C", "/srv/it's", "tunnel", "--instance=web", "--service=-db", "--port", "5432"]);
+        assert_eq!(strs(&daemon), ["ssh", "-T", "-o", "BatchMode=yes", "-p", "2200", "--", "me@box", remote.as_str()]);
+        let cli = tunnel_argv(&entry("box", Some("~/bin/devsandbox")), false, root, None, Some("redis"), 6379).unwrap();
+        let remote = remote_command("~/bin/devsandbox", &["-C", "/srv/it's", "tunnel", "--service=redis", "--port", "6379"]);
+        assert_eq!(strs(&cli), ["ssh", "-T", "--", "box", remote.as_str()]);
+        assert!(!strs(&cli).contains(&"-A"), "a forward serves no agent");
+        assert!(tunnel_argv(&entry("-oProxyCommand=x", None), true, root, Some("web"), None, 1).is_err());
     }
 
     /// A script that prints each arg as `[arg]`, at a path with a space and

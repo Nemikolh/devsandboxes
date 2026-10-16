@@ -50,6 +50,14 @@ so the remote `PATH` is the user's.
   interactive re-execs; `tty_argv_with` runs `<runtime> exec -it` for
   service tabs).
 - `cli_argv`: `-t` on a terminal, else `-T` (piped bytes stay clean).
+- `tunnel_argv`: `ssh -T [-o BatchMode=yes] [-p N] -- <host> … -C <root>
+  tunnel [--instance=<name>] [--service=<svc>] --port <n>`, a remote
+  forward's bridge ([forwards.md](forwards.md#remote-bridges)). No `-A`
+  (a forward's bridge serves no agent); `BatchMode` when `batch` (the
+  daemon). The `=` forms keep a name starting with `-` a value.
+
+`Tail` (a bounded ring of a stream's last bytes, `Tail::collect`) keeps
+ssh's stderr for `spawn`'s `Peer` and the remote forward opener alike.
 
 `Dial` (`Fn(&Entry, agent) -> Duplex`) is injectable; a `Duplex` is
 always a unix socket pumped to the ssh child's pipes, so `client::Conn`

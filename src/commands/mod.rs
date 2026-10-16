@@ -19,6 +19,8 @@ pub mod start;
 pub mod stats;
 pub mod status;
 pub mod stop;
+#[cfg(unix)]
+pub mod tunnel;
 pub mod vscode;
 
 use std::io::{IsTerminal, Write};
