@@ -24,6 +24,11 @@ limitation means editing this file in the same commit.
   → [plan](plans/active/machines-next.md)
 - **daemon**: Windows as a remote-only client of a machine.
   → [plan](plans/active/windows-support.md)
+- **helper**: drop the host-side `lsof` fallback for a forward's listening
+  process (`port::listening_procs`, `ForwardSpec.probe`) once the helper
+  can answer for a service reached via an instance and pre-`PORT_INFO`
+  helpers are gone; the helper's `PortQuery` is then the only lookup.
+  → [forwards](architecture/daemon/forwards.md#routes)
 - **helper**: run the ssh-agent relay once on Apple `container` on a Mac
   (built, never tested there).
 
