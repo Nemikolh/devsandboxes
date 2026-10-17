@@ -15,7 +15,7 @@
 //! - `agent`: this end of a machine's agent relay, serving its streams from
 //!   the local ssh-agent (`commands::agent_relay` is the far end)
 //!
-//! Only the daemon writes the registry (`machines.add` / `machines.rm`);
+//! Only the daemon writes the registry (`machines.add` / `set` / `rm`);
 //! the CLI reads it later to know whether any machine exists. Two
 //! daemons can briefly overlap during a handoff, so every write is a
 //! read-modify-write under an exclusive lock on the sibling `machines.lock`,
@@ -57,6 +57,11 @@ pub struct Entry {
     /// `devsandbox` on the login shell's `PATH`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
+    /// This host's ssh-agent is relayed to the machine while its link is
+    /// wanted (docs/architecture/daemon/machines.md, *Agent*); off by
+    /// default, and only written when on.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub agent: bool,
 }
 
 impl Entry {
@@ -222,7 +227,7 @@ mod tests {
     use super::*;
 
     fn entry(name: &str, target: &str) -> Entry {
-        Entry { name: name.into(), target: target.into(), roots: vec!["/srv/a".into()], command: None }
+        Entry { name: name.into(), target: target.into(), roots: vec!["/srv/a".into()], command: None, agent: false }
     }
 
     #[test]
@@ -238,19 +243,21 @@ mod tests {
     fn entries_round_trip_sorted_by_name() {
         let entries = vec![
             Entry { command: Some("~/bin/devsandbox".into()), roots: vec!["/a".into(), "/b".into()], ..entry("b-box", "ssh://me@b:2200") },
-            entry("a.box", "me@a"),
+            Entry { agent: true, ..entry("a.box", "me@a") },
         ];
         let text = serialize(&entries).unwrap();
         assert!(text.contains("[machine.\"a.box\"]") && text.contains("[machine.b-box]"), "{text}");
-        // `command` only when set; the name is the key, not a field.
+        // `command` and `agent` only when set; the name is the key, not a field.
         assert_eq!(text.matches("command").count(), 1, "{text}");
+        assert_eq!(text.matches("agent = true").count(), 1, "{text}");
+        assert!(!text.contains("agent = false"), "{text}");
         assert!(!text.contains("name"), "{text}");
         let mut want = entries.clone();
         want.reverse();
         assert_eq!(parse(&text).unwrap(), want);
         assert_eq!(parse("").unwrap(), vec![]);
         let minimal = parse("[machine.m]\ntarget = \"m\"\n").unwrap();
-        assert_eq!(minimal, vec![Entry { name: "m".into(), target: "m".into(), roots: vec![], command: None }]);
+        assert_eq!(minimal, vec![Entry { name: "m".into(), target: "m".into(), roots: vec![], command: None, agent: false }]);
         assert!(parse("[machine.\"a/b\"]\ntarget = \"m\"\n").is_err(), "a bad name fails the file");
         assert!(parse("[machine.m]\n").is_err(), "no target");
     }

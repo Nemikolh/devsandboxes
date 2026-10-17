@@ -321,7 +321,7 @@ pub(crate) fn machine_info(call: &mut dyn FnMut(&str, Value) -> Result<crate::se
     }
     let info: MachineInfo =
         serde_json::from_value(r.result.unwrap_or(Value::Null)).context("bad machines.get result from devsandbox serve")?;
-    Ok(Entry { name: info.name, target: info.target, roots: info.roots, command: info.command })
+    Ok(Entry { name: info.name, target: info.target, roots: info.roots, command: info.command, agent: info.agent })
 }
 
 // ---- the ssh re-run -----------------------------------------------------------
@@ -678,7 +678,7 @@ mod tests {
     }
 
     fn entry() -> Entry {
-        Entry { name: "box".into(), target: "me@box".into(), roots: vec![PathBuf::from("/r")], command: None }
+        Entry { name: "box".into(), target: "me@box".into(), roots: vec![PathBuf::from("/r")], command: None, agent: false }
     }
 
     /// What `main` gets for a port: a nameless one's port comes out of

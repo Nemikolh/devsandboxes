@@ -182,6 +182,8 @@ pub struct Machine {
     pub target: String,
     /// The registry's `command` (the remote devsandbox), for an ssh argv.
     pub command: Option<String>,
+    /// The registry's `agent`, for the dashboard to show.
+    pub agent: bool,
     /// The registered roots, in order: the first one shows the instances
     /// whose root isn't registered.
     pub roots: Vec<PathBuf>,
@@ -211,6 +213,7 @@ impl Remotes {
             let m = inner.entry(e.name.clone()).or_insert_with(|| Machine { name: e.name.clone(), ..Machine::default() });
             m.target.clone_from(&e.target);
             m.command.clone_from(&e.command);
+            m.agent = e.agent;
             m.roots.clone_from(&e.roots);
             m.rows.retain(|root, _| e.roots.contains(root));
         }
@@ -250,6 +253,8 @@ pub struct SnapshotMachine {
     /// The remote devsandbox (`None`: `devsandbox`), so the dashboard builds
     /// a terminal's ssh argv (`ssh::tty_argv`) with no call.
     pub command: Option<String>,
+    /// The registry's `agent`: this host's ssh-agent is relayed there.
+    pub agent: bool,
 }
 
 /// A `machines: true` watcher's `instances.snapshot`: `local` (a local
@@ -310,6 +315,7 @@ fn snapshot_machine(m: &Machine) -> SnapshotMachine {
         version: m.version.clone(),
         runtime,
         command: m.command.clone(),
+        agent: m.agent,
     }
 }
 
@@ -513,9 +519,9 @@ pub(crate) mod tests {
         assert_eq!(
             merged["machines"],
             serde_json::json!([
-                {"name": "a", "target": "me@a", "state": "connected", "error": null, "version": "0.6.1", "runtime": "podman", "command": null},
-                {"name": "b", "target": "me@b", "state": "unreachable", "error": "b: Connection refused", "version": null, "runtime": "podman", "command": null},
-                {"name": "c", "target": "me@c", "state": "unreachable", "error": "c: Permission denied", "version": null, "runtime": null, "command": "~/bin/devsandbox"},
+                {"name": "a", "target": "me@a", "state": "connected", "error": null, "version": "0.6.1", "runtime": "podman", "command": null, "agent": false},
+                {"name": "b", "target": "me@b", "state": "unreachable", "error": "b: Connection refused", "version": null, "runtime": "podman", "command": null, "agent": false},
+                {"name": "c", "target": "me@c", "state": "unreachable", "error": "c: Permission denied", "version": null, "runtime": null, "command": "~/bin/devsandbox", "agent": false},
             ])
         );
         // No machines: the local params plus an empty `machines`.
@@ -543,6 +549,7 @@ pub(crate) mod tests {
             target: name.into(),
             roots: roots.iter().map(PathBuf::from).collect(),
             command: None,
+            agent: false,
         };
         remotes.sync(&[entry("a", &["/1", "/2"]), entry("b", &["/b"])]);
         remotes.update("a", |m| {

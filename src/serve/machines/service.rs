@@ -624,7 +624,7 @@ mod tests {
         std::fs::create_dir_all(&remote_root).unwrap();
         std::fs::create_dir_all(&local_root).unwrap();
         let registry = base.join("machines.toml");
-        let entry = Entry { name: "box".into(), target: "me@box".into(), roots: vec![remote_root.clone()], command: None };
+        let entry = Entry { name: "box".into(), target: "me@box".into(), roots: vec![remote_root.clone()], command: None, agent: false };
         crate::serve::machines::update(&registry, |e| e.push(entry)).unwrap();
 
         let remote = spawn_daemon(&remote_dir, remote_opts(&base, "web-1", 60_000));
@@ -665,7 +665,7 @@ mod tests {
         assert_eq!(s["dir"], local_root.to_str().unwrap());
         assert_eq!(
             s["machines"],
-            json!([{"name": "box", "target": "me@box", "state": "connected", "error": null, "version": "0.6.0", "runtime": "Disk", "command": null}])
+            json!([{"name": "box", "target": "me@box", "state": "connected", "error": null, "version": "0.6.0", "runtime": "Disk", "command": null, "agent": false}])
         );
         crate::serve::dts::assert_matches("InstancesSnapshot", &s);
         crate::serve::dts::assert_matches("SnapshotMachine", &s["machines"][0]);
@@ -744,7 +744,7 @@ mod tests {
     fn a_timed_out_call_drops_the_link() {
         let base = scratch("link-timeout");
         let registry = base.join("machines.toml");
-        let entry = Entry { name: "m".into(), target: "m".into(), roots: vec![], command: None };
+        let entry = Entry { name: "m".into(), target: "m".into(), roots: vec![], command: None, agent: false };
         crate::serve::machines::update(&registry, |e| e.push(entry)).unwrap();
         let dials = Arc::new(AtomicUsize::new(0));
         let dial: Dial = {

@@ -218,7 +218,9 @@ and talks to each machine's daemon; nothing else changes on the machine.
 ```bash
 devsandbox machine add me@my-server            # probe its config roots; pick on a TTY
 devsandbox machine add ssh://me@box:2200 --name box --config '~/sandboxes'
-devsandbox machine ls [--json]                 # NAME TARGET ROOTS STATE VERSION
+devsandbox machine add me@my-server --agent    # with `agent` on
+devsandbox machine ls [--json]                 # NAME TARGET ROOTS AGENT STATE VERSION
+devsandbox machine set box --agent on|off      # change a machine's `agent`
 devsandbox machine rm box                      # unregister only
 ```
 
@@ -226,8 +228,11 @@ devsandbox machine rm box                      # unregister only
   numbered multi-select on a TTY); off a TTY it takes the only one, and zero
   or several is an error listing them: pass `--config <path on the machine>`
   (repeatable). Quote a `~` so your local shell doesn't expand it. The name
-  defaults to the target's host. Adding a machine means trusting it: your
-  ssh-agent is forwarded there. ssh runs with `BatchMode=yes`: use a key in
+  defaults to the target's host; a name already registered is refused.
+  Adding a machine means trusting it: your ssh-agent is forwarded there.
+  `--agent` / `machine set <name> --agent on|off` record a per-machine
+  `agent` flag (off by default), shown in `machine ls`; for now the agent
+  is forwarded whatever its value. ssh runs with `BatchMode=yes`: use a key in
   your agent (or a `ControlMaster` in `~/.ssh/config`).
 - **Names resolve across machines.** `devsandbox run api` runs `api` where
   it's defined; `exec test`, `logs test`, `stop test` find the instance

@@ -27,7 +27,7 @@ Start with `docs/README.md` (reading order and map) and
   store, mutations via a running daemon's API, else the same `wire::decide_*`
   ops locally. `agent_relay.rs` is the hidden `agent-relay`, a machine's
   end of its agent relay (socket + frame mux over stdio; machines.md
-  *Agent*). `machine.rs` is `devsandbox machine add|ls|rm`
+  *Agent*). `machine.rs` is `devsandbox machine add|ls|set|rm`
   (docs/architecture/daemon/machines.md): a client of `machines.*` only (never in-process);
   `add`'s TTY multi-select of probed roots and the off-TTY one-candidate
   rule.

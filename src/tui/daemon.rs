@@ -1460,7 +1460,7 @@ mod tests {
             "dir": "/cfg", "instances": [], "sandboxes": [], "services": [], "sandbox_count": 0,
             "runtime_name": "docker", "runtime_version": null, "error": null,
             "machines": [{"name": "box", "target": "me@box", "state": "unreachable", "error": "refused",
-                "version": null, "runtime": null, "command": null}],
+                "version": null, "runtime": null, "command": null, "agent": false}],
         });
         let DaemonUpdate::Snapshot(_, machines) = snapshot_update(federated) else { panic!("not parsed") };
         assert_eq!((machines[0].name.as_str(), machines[0].error.as_deref()), ("box", Some("refused")));

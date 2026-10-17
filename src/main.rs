@@ -400,12 +400,24 @@ enum MachineCommand {
         /// A config root on the machine (repeatable)
         #[arg(long = "config", value_name = "PATH")]
         configs: Vec<String>,
+        /// Relay this host's ssh-agent to the machine (off by default; see `machine set`)
+        #[arg(long)]
+        agent: bool,
     },
     /// List the registered machines
     Ls {
         /// Output JSON instead of a table
         #[arg(long)]
         json: bool,
+    },
+    /// Change a registered machine's settings
+    ///
+    ///     devsandbox machine set my-server --agent on
+    Set {
+        name: String,
+        /// Relay this host's ssh-agent to the machine
+        #[arg(long, required = true, action = clap::ArgAction::Set, value_name = "on|off", value_parser = commands::machine::parse_on_off)]
+        agent: bool,
     },
     /// Unregister a machine (nothing on it changes)
     Rm { name: String },
@@ -708,8 +720,11 @@ fn main() -> Result<()> {
         Command::AgentRelay { client } => commands::agent_relay::agent_relay(&client),
         #[cfg(unix)]
         Command::Machine { cmd } => match cmd {
-            MachineCommand::Add { target, name, configs } => commands::machine::add(&target, name.as_deref(), &configs),
+            MachineCommand::Add { target, name, configs, agent } => {
+                commands::machine::add(&target, name.as_deref(), &configs, agent)
+            }
             MachineCommand::Ls { json } => commands::machine::ls(json),
+            MachineCommand::Set { name, agent } => commands::machine::set(&name, agent),
             MachineCommand::Rm { name } => commands::machine::rm(&name),
         },
     }

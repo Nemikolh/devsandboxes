@@ -161,6 +161,9 @@ limitation means editing this file in the same commit.
   → [machines](architecture/daemon/machines.md); `machines::forward::verb`
 - Daemon-side ssh is `BatchMode=yes`, one handshake per forwarded verb:
   passphrase-prompting keys fail. → [machines](architecture/daemon/machines.md); `ssh::api_argv`
+- A machine's `agent` (`machine set <name> --agent on|off`) is stored and
+  shown, but nothing acts on it: every ssh but a forward's tunnel still
+  passes `-A`. → [machines](architecture/daemon/machines.md#agent); `ssh::api_argv`
 - `machine add` has no `--command`; a remote devsandbox off `PATH` is set by
   hand in `machines.toml`. → [machines](architecture/daemon/machines.md)
 - Remote rows live in memory: a fresh daemon shows a machine without rows

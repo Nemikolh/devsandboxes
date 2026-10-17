@@ -118,7 +118,7 @@ pub fn service_route(s: &Snapshot, key: &str) -> Route {
 /// An ssh [`Entry`] from a snapshot's machine entry (its roots aren't
 /// needed for an argv).
 fn entry(m: &SnapshotMachine) -> Entry {
-    Entry { name: m.name.clone(), target: m.target.clone(), roots: Vec::new(), command: m.command.clone() }
+    Entry { name: m.name.clone(), target: m.target.clone(), roots: Vec::new(), command: m.command.clone(), agent: m.agent }
 }
 
 fn lossy(argv: Vec<std::ffi::OsString>) -> Vec<String> {
@@ -144,7 +144,7 @@ pub fn service_argv(m: &SnapshotMachine, container: &str) -> Result<Vec<String>,
 }
 
 /// The machines with no rows in `s` yet, one dim note each: `box:
-/// connecting`, `box: unreachable: <why>`. Joined with ` · `; `None` when
+/// connecting`, `box (agent): unreachable: <why>` ([`label`]). Joined with ` · `; `None` when
 /// every machine has rows (or none is registered). Without `why`, an
 /// unreachable one doesn't say why (the header's short of room).
 pub fn pending_note(machines: &[SnapshotMachine], s: &Snapshot, why: bool) -> Option<String> {
@@ -158,14 +158,20 @@ pub fn pending_note(machines: &[SnapshotMachine], s: &Snapshot, why: bool) -> Op
         .iter()
         .filter(|m| !has_rows(&m.name))
         .filter_map(|m| match (m.state, &m.error) {
-            (LinkState::Unreachable, Some(e)) if why => Some(format!("{}: unreachable: {}", m.name, short(&why_of(&m.name, e)))),
-            (LinkState::Unreachable, _) => Some(format!("{}: unreachable", m.name)),
+            (LinkState::Unreachable, Some(e)) if why => Some(format!("{}: unreachable: {}", label(m), short(&why_of(&m.name, e)))),
+            (LinkState::Unreachable, _) => Some(format!("{}: unreachable", label(m))),
             // Connected with nothing in its roots: nothing to say.
             (LinkState::Connected, _) => None,
-            _ => Some(format!("{}: connecting", m.name)),
+            _ => Some(format!("{}: connecting", label(m))),
         })
         .collect();
     (!notes.is_empty()).then(|| notes.join(" · "))
+}
+
+/// A machine's name as the header says it: `box (agent)` when this host's
+/// ssh-agent is relayed there (its registry `agent`), else `box`.
+fn label(m: &SnapshotMachine) -> String {
+    if m.agent { format!("{} (agent)", m.name) } else { m.name.clone() }
 }
 
 /// A machine's `error` without the `<machine>: ` the daemon's messages
@@ -251,6 +257,7 @@ pub(crate) mod tests {
             version: None,
             runtime: None,
             command: None,
+            agent: false,
         }
     }
 
@@ -357,6 +364,11 @@ pub(crate) mod tests {
         assert_eq!(pending_note(&machines, &s, true).as_deref(), Some("down: unreachable: Permission denied · new: connecting"));
         assert_eq!(pending_note(&machines, &s, false).as_deref(), Some("down: unreachable · new: connecting"));
         assert_eq!(pending_note(&machines[..1], &s, true), None);
+        // `agent` on marks the name; the error's own `<machine>: ` still goes.
+        let mut machines = machines;
+        machines[1].agent = true;
+        machines[1].error = Some("down: Permission denied".into());
+        assert_eq!(pending_note(&machines, &s, true).as_deref(), Some("down (agent): unreachable: Permission denied · new: connecting"));
         assert_eq!(why_of("box", "box: ssh: refused"), "ssh: refused");
         assert_eq!(why_of("box", "boxer: x"), "boxer: x");
         assert_eq!(short(&"é".repeat(50)), format!("{}…", "é".repeat(40)));

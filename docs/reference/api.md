@@ -726,13 +726,15 @@ adopted by the next daemon through those files
 Remote hosts whose daemons this one talks to over ssh
 ([machines.md](../architecture/daemon/machines.md)).
 The registry is `<data-dir>/devsandbox/machines.toml`, next to
-`state.toml`, written only by `machines.add` / `machines.rm`:
+`state.toml`, written only by `machines.add` / `machines.set` /
+`machines.rm`:
 
 ```toml
 [machine.my-server]
 target = "me@my-server"            # what ssh takes, or ssh://[user@]host[:port]
 roots = ["/home/me/.devsandboxes"] # config roots there, canonical
 command = "~/bin/devsandbox"       # optional: the remote devsandbox, shell text
+agent = true                       # optional, default false: this host's ssh-agent is meant for it
 ```
 
 A machine name is `[A-Za-z0-9._-]+`, not starting with `.` or `-` (never
@@ -782,17 +784,19 @@ and `sandboxes: []`; the call itself fails only as `internal`, when
 | method | params | result | errors |
 |---|---|---|---|
 | `machines.probe` | `{"target"}` | `{"version", "protocol", "roots": […]}`: the machine's devsandbox and its `roots.list` | `invalid` (bad target), `failed` (ssh, the hello or the protocol) |
-| `machines.add` | `{"target", "name"?, "roots": […]}` | `{"name", "roots", "version", "warning"}`: `roots` as saved (the machine's canonical paths, deduplicated), `warning` set when its semver differs from ours | `invalid` (bad target or name, a name taken, no `roots`, a root the machine refuses: each one's reason), `failed` (as `probe`, or a remote too old to check roots), `internal` (`machines.toml` doesn't read or write) |
-| `machines.list` | `{}` | `[{"name", "target", "roots", "command", "state", "error", "version"}]`, by name; `version` from the last hello | `internal` (`machines.toml` doesn't parse) |
-| `machines.get` | `{"name"}` | `{"name", "target", "command", "roots"}`: what an ssh command to it needs (no argv on the wire: build it from `target` and `command`) | `not-found`, `internal` (as `list`) |
+| `machines.add` | `{"target", "name"?, "roots": […], "agent"?}` (`agent` default `false`) | `{"name", "roots", "version", "warning"}`: `roots` as saved (the machine's canonical paths, deduplicated), `warning` set when its semver differs from ours | `invalid` (bad target or name, a name taken, no `roots`, a root the machine refuses: each one's reason), `failed` (as `probe`, or a remote too old to check roots), `internal` (`machines.toml` doesn't read or write) |
+| `machines.list` | `{}` | `[{"name", "target", "roots", "command", "agent", "state", "error", "version"}]`, by name; `version` from the last hello | `internal` (`machines.toml` doesn't parse) |
+| `machines.get` | `{"name"}` | `{"name", "target", "command", "roots", "agent"}`: what an ssh command to it needs (no argv on the wire: build it from `target` and `command`) | `not-found`, `internal` (as `list`) |
+| `machines.set` | `{"name", "agent"}` | `{"ok": true}`; saves the machine's `agent`, its link restarts if it changed | `not-found`, `invalid` (no `agent`), `internal` (`machines.toml` doesn't read or write) |
 | `machines.rm` | `{"name"}` | `{"ok": true}`; its link stops and its rows go. Nothing on the machine changes | `not-found`, `internal` (`machines.toml` doesn't read or write) |
 
 `probe` and `add` open a connection of their own (a 20 s hello), checking
 ssh, the remote devsandbox and the protocol before anything is saved.
 `add` checks every root with `roots.list {paths}` on the machine: a quoted
 `~` is the machine's home. `name` defaults to the target's host
-(`me@my-server.com` → `my-server.com`). `add` and `rm` reach the links at
-once. Adding a machine means trusting it: its socket is as powerful as
+(`me@my-server.com` → `my-server.com`). `add`, `set` and `rm` reach the links at
+once. `agent` is stored and listed (also in the federated snapshot's
+`machines`); *Transport* passes `-A` whatever its value. Adding a machine means trusting it: its socket is as powerful as
 `docker.sock`, and your agent is forwarded there.
 
 ### The `machine` param
@@ -855,7 +859,7 @@ remote `thread_children` aren't merged. Plus, top-level:
 
 | field | |
 |---|---|
-| `machines` | every registered machine, by name: `{"name", "target", "command", "state", "error", "version", "runtime"}`; `command` the remote devsandbox (`null`: `devsandbox`), `runtime` its `runtime_name` once a snapshot came |
+| `machines` | every registered machine, by name: `{"name", "target", "command", "state", "error", "version", "runtime", "agent"}`; `command` the remote devsandbox (`null`: `devsandbox`), `runtime` its `runtime_name` once a snapshot came, `agent` the registry's |
 
 A machine's rows are last known: they stay while its link is down (in
 memory only, so a fresh daemon has none until it connects), and a client

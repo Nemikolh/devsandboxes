@@ -1,12 +1,13 @@
 //! The `machines.*` methods (docs/architecture/daemon/machines.md,
-//! *`devsandbox machine add|ls|rm`*): `probe`, `add`, `list`, `rm`.
+//! *`devsandbox machine add|ls|set|rm`*): `probe`, `add`, `list`, `get`,
+//! `set`, `rm`.
 //! Connection-free like `serve::api`: a function of the method, its params
 //! and a [`Ctx`] (the registry path and the [`Dial`]), so tests run them
 //! against a second test daemon standing in as the machine.
 //!
 //! `probe` and `add` open a fresh connection each (ssh, the hello, one or
 //! two calls) and drop it; the held link per machine is `service`'s, which
-//! `add` and `rm` tell to reload and `list` reads the live state of. `add`
+//! `add`, `set` and `rm` tell to reload and `list` reads the live state of. `add`
 //! checks the typed roots *on the machine* (`roots.list {paths}`): only it
 //! can tell whether they exist, expand a quoted `~`, and canonicalize them.
 
@@ -37,7 +38,7 @@ pub struct Ctx {
     pub dial: Dial,
     /// This daemon's semver, which `add` warns a differing machine's against.
     pub version: String,
-    /// The links: `add`/`rm` reload them, `list` reports their state. `None`
+    /// The links: `add`/`set`/`rm` reload them, `list` reports their state. `None`
     /// only where no service runs (then every machine lists as `idle`).
     pub links: Option<Handle>,
 }
@@ -49,6 +50,7 @@ pub fn call(method: &str, params: Value, ctx: &Ctx) -> Option<Answer> {
         "machines.add" => parse(params).and_then(|p| add(p, ctx)),
         "machines.list" => list(ctx),
         "machines.get" => parse(params).and_then(|p| get(p, ctx)),
+        "machines.set" => parse(params).and_then(|p| set(p, ctx)),
         "machines.rm" => parse(params).and_then(|p| rm(p, ctx)),
         _ => return None,
     };
@@ -86,6 +88,7 @@ pub struct MachineRow {
     pub target: String,
     pub roots: Vec<PathBuf>,
     pub command: Option<String>,
+    pub agent: bool,
     pub state: LinkState,
     pub error: Option<String>,
     pub version: Option<String>,
@@ -99,7 +102,7 @@ struct ProbeParams {
 fn probe(p: ProbeParams, ctx: &Ctx) -> Answer {
     ssh::parse_target(&p.target).map_err(|e| ApiError::invalid(format!("{e:#}")))?;
     // No name yet: errors say the target.
-    let entry = Entry { name: p.target.clone(), target: p.target, roots: Vec::new(), command: None };
+    let entry = Entry { name: p.target.clone(), target: p.target, roots: Vec::new(), command: None, agent: false };
     let mut link = connect(&entry, ctx)?;
     let roots: Vec<RootCandidate> = remote_call(&mut link, &entry.name, "roots.list", json!({}))?;
     let remote = link.remote();
@@ -112,6 +115,8 @@ struct AddParams {
     #[serde(default)]
     name: Option<String>,
     roots: Vec<String>,
+    #[serde(default)]
+    agent: bool,
 }
 
 fn add(p: AddParams, ctx: &Ctx) -> Answer {
@@ -130,7 +135,7 @@ fn add(p: AddParams, ctx: &Ctx) -> Answer {
         return Err(taken(&name));
     }
 
-    let mut entry = Entry { name, target: p.target, roots: Vec::new(), command: None };
+    let mut entry = Entry { name, target: p.target, roots: Vec::new(), command: None, agent: p.agent };
     let mut link = connect(&entry, ctx)?;
     let checked: Vec<RootCandidate> = remote_call(&mut link, &entry.name, "roots.list", json!({ "paths": p.roots }))?;
     // A daemon that ignores `paths` answers its candidates instead.
@@ -179,6 +184,7 @@ fn list(ctx: &Ctx) -> Answer {
                 target: e.target,
                 roots: e.roots,
                 command: e.command,
+                agent: e.agent,
                 state: live.state,
                 error: live.error,
                 version: live.version,
@@ -197,6 +203,7 @@ pub struct MachineInfo {
     pub target: String,
     pub command: Option<String>,
     pub roots: Vec<PathBuf>,
+    pub agent: bool,
 }
 
 fn get(p: NameParams, ctx: &Ctx) -> Answer {
@@ -204,7 +211,37 @@ fn get(p: NameParams, ctx: &Ctx) -> Answer {
         .into_iter()
         .find(|e| e.name == p.name)
         .ok_or_else(|| ApiError::not_found(format!("no machine named `{}`", p.name)))?;
-    to_value(MachineInfo { name: entry.name, target: entry.target, command: entry.command, roots: entry.roots })
+    to_value(MachineInfo {
+        name: entry.name,
+        target: entry.target,
+        command: entry.command,
+        roots: entry.roots,
+        agent: entry.agent,
+    })
+}
+
+#[derive(Deserialize)]
+struct SetParams {
+    name: String,
+    agent: bool,
+}
+
+/// Change a registered machine's settings (today only `agent`). The links
+/// reload only when something changed.
+fn set(p: SetParams, ctx: &Ctx) -> Answer {
+    let changed = super::update(&ctx.registry, |entries| {
+        let entry = entries.iter_mut().find(|e| e.name == p.name)?;
+        let changed = entry.agent != p.agent;
+        entry.agent = p.agent;
+        Some(changed)
+    });
+    let Some(changed) = changed.map_err(ApiError::internal)? else {
+        return Err(ApiError::not_found(format!("no machine named `{}`", p.name)));
+    };
+    if changed && let Some(links) = &ctx.links {
+        links.reload();
+    }
+    Ok(json!({ "ok": true }))
 }
 
 #[derive(Deserialize)]
@@ -411,7 +448,7 @@ mod tests {
         let r = ok(&mut pair.local, "machines.add", json!({"target": "me@box", "roots": ["~/.devsandboxes", "~", via]}));
         assert_eq!(r, json!({"name": "box", "roots": [dot, home], "version": "0.6.0", "warning": null}));
         let saved = crate::serve::machines::load(&registry).unwrap();
-        assert_eq!(saved, vec![Entry { name: "box".into(), target: "me@box".into(), roots: vec![dot.clone(), home], command: None }]);
+        assert_eq!(saved, vec![Entry { name: "box".into(), target: "me@box".into(), roots: vec![dot.clone(), home], command: None, agent: false }]);
 
         // Taken: by default name or by `name`; `--name` gets around it.
         let (code, message) = err(&mut pair.local, "machines.add", json!({"target": "ssh://box:2200", "roots": ["~"]}));
@@ -420,26 +457,54 @@ mod tests {
         assert_eq!(code, "invalid");
         let (code, message) = err(&mut pair.local, "machines.add", json!({"target": "me@[::1]", "roots": ["~"]}));
         assert!(code == "invalid" && message.ends_with("pass --name"), "{message}");
-        let r = ok(&mut pair.local, "machines.add", json!({"target": "ssh://box:2200", "name": "box2", "roots": ["~/.devsandboxes"]}));
+        let r = ok(&mut pair.local, "machines.add", json!({"target": "ssh://box:2200", "name": "box2", "roots": ["~/.devsandboxes"], "agent": true}));
         assert_eq!(r["name"], "box2");
+        assert!(crate::serve::machines::load(&registry).unwrap()[1].agent, "`agent` saved");
 
         // Listed sorted by name, idle (no link wanted); then removed.
         let rows = ok(&mut pair.local, "machines.list", Value::Null);
         assert_eq!(
             rows,
             json!([
-                {"name": "box", "target": "me@box", "roots": [dot, std::fs::canonicalize(&pair.home).unwrap()], "command": null, "state": "idle", "error": null, "version": null},
-                {"name": "box2", "target": "ssh://box:2200", "roots": [dot], "command": null, "state": "idle", "error": null, "version": null},
+                {"name": "box", "target": "me@box", "roots": [dot, std::fs::canonicalize(&pair.home).unwrap()], "command": null, "agent": false, "state": "idle", "error": null, "version": null},
+                {"name": "box2", "target": "ssh://box:2200", "roots": [dot], "command": null, "agent": true, "state": "idle", "error": null, "version": null},
             ])
         );
         let info = ok(&mut pair.local, "machines.get", json!({"name": "box2"}));
-        assert_eq!(info, json!({"name": "box2", "target": "ssh://box:2200", "command": null, "roots": [dot]}));
+        assert_eq!(info, json!({"name": "box2", "target": "ssh://box:2200", "command": null, "roots": [dot], "agent": true}));
         assert_eq!(err(&mut pair.local, "machines.get", json!({"name": "nope"})).0, "not-found");
         assert_eq!(ok(&mut pair.local, "machines.rm", json!({"name": "box"})), json!({"ok": true}));
         let (code, _) = err(&mut pair.local, "machines.rm", json!({"name": "box"}));
         assert_eq!(code, "not-found");
         assert_eq!(ok(&mut pair.local, "machines.list", Value::Null).as_array().unwrap().len(), 1);
         pair.finish();
+    }
+
+    #[test]
+    fn set_flips_agent_and_saves_it() {
+        let base = scratch("mach-set");
+        let registry = base.join("machines.toml");
+        let entry = Entry { name: "box".into(), target: "me@box".into(), roots: vec!["/r".into()], command: None, agent: false };
+        crate::serve::machines::update(&registry, |e| e.push(entry.clone())).unwrap();
+        let daemon = spawn_daemon(&base.join("local"), local_opts(&base, None));
+        let mut local = client_at(&base.join("local"));
+        let agent = || crate::serve::machines::load(&registry).unwrap()[0].agent;
+        assert_eq!(ok(&mut local, "machines.set", json!({"name": "box", "agent": true})), json!({"ok": true}));
+        assert!(agent());
+        assert!(std::fs::read_to_string(&registry).unwrap().contains("agent = true"));
+        assert_eq!(ok(&mut local, "machines.get", json!({"name": "box"}))["agent"], true);
+        // Again is a no-op, not an error.
+        assert_eq!(ok(&mut local, "machines.set", json!({"name": "box", "agent": true})), json!({"ok": true}));
+        assert_eq!(ok(&mut local, "machines.set", json!({"name": "box", "agent": false})), json!({"ok": true}));
+        assert!(!agent());
+        assert!(!std::fs::read_to_string(&registry).unwrap().contains("agent"));
+        let (code, message) = err(&mut local, "machines.set", json!({"name": "nope", "agent": true}));
+        assert_eq!((code.as_str(), message.as_str()), ("not-found", "no machine named `nope`"));
+        assert_eq!(err(&mut local, "machines.set", json!({"name": "box"})).0, "invalid");
+        assert_eq!(crate::serve::machines::load(&registry).unwrap(), vec![entry]);
+        drop(local);
+        assert_eq!(daemon.join().unwrap().unwrap(), Exit::Idle);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -462,12 +527,13 @@ mod tests {
             target: "m".into(),
             roots: vec![],
             command: None,
+            agent: false,
             state: LinkState::Idle,
             error: None,
             version: None,
         };
         assert_matches("MachineRow", &to_value(row).unwrap());
-        let info = MachineInfo { name: "m".into(), target: "m".into(), command: None, roots: vec![] };
+        let info = MachineInfo { name: "m".into(), target: "m".into(), command: None, roots: vec![], agent: false };
         assert_matches("MachineInfo", &to_value(info).unwrap());
         assert_eq!(union_members("LinkState"), ["'idle'", "'connecting'", "'connected'", "'unreachable'"]);
         for (method, result) in [
@@ -475,6 +541,7 @@ mod tests {
             ("machines.add", "MachineAdded"),
             ("machines.list", "MachineRow[]"),
             ("machines.rm", "OkResult"),
+            ("machines.set", "OkResult"),
             ("machines.get", "MachineInfo"),
         ] {
             let ty = prop_type("ApiMethods", method).unwrap_or_else(|| panic!("ApiMethods lacks `{method}`"));

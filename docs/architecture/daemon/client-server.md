@@ -55,7 +55,7 @@ running daemon (`connect_running`), else the caller prints a `note:`.
 | `exec` (and lifecycle chains) into a relay-mode instance | `ensure_bridge` with the caller's `SSH_AUTH_SOCK`, held while it runs | `note:` line, no relay |
 | `inbox` mutations | `connect_running` + the method | local `wire::decide_*` ops on the store |
 | `inbox` reads | none: reads `inbox.json` | same |
-| `machine add\|ls\|rm` | `machines.*` via `connect`, never in-process | error |
+| `machine add\|ls\|set\|rm` | `machines.*` via `connect`, never in-process | error |
 | a command naming a machine's instance, `--machine` | routed by `machines::cli::route` ([machines.md](machines.md)) | error |
 | `port` | none: forwards in its own process ([forwards.md](forwards.md)) | same |
 | `ls`, `ps`, `logs`, `inspect`, `stats`, … | none: read `state.toml` and the runtime | same |

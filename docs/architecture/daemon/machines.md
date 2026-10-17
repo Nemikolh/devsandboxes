@@ -24,10 +24,12 @@ federated joins), `cli.rs` (`plan`, `Plan`, `machine_use`, `route`,
 
 `<data-dir>/devsandbox/machines.toml`, `[machine.<name>]` with `target`
 (`me@host`, an ssh-config alias, or `ssh://[user@]host[:port]`), `roots`
-(remote config roots, as the remote canonicalized them) and an optional
+(remote config roots, as the remote canonicalized them), an optional
 `command` (remote devsandbox as shell text, default `devsandbox`; set by
-hand, `machine add` has no flag for it). Only the daemon writes it
-(`machines.add`/`rm`): locked read-modify-write on `machines.lock`, temp
+hand, `machine add` has no flag for it) and `agent` (whether this host's
+ssh-agent is meant for the machine, see [Agent](#agent); off by default,
+written only when on). Only the daemon writes it
+(`machines.add`/`set`/`rm`): locked read-modify-write on `machines.lock`, temp
 file + rename, since two daemons overlap during a handoff. A file that
 doesn't parse is logged and changes nothing. The CLI reads it only to know
 whether any machine exists, so with none every command resolves exactly as
@@ -95,7 +97,8 @@ timeout is `LinkError::Other` with that first line.
 
 The daemon runs a `Machines` service for its whole life: one
 `serve-machine-<name>` thread per registered machine, started, stopped or
-restarted when `add`/`rm` change the registry. A link connects only while
+restarted when `add`/`set`/`rm` change the registry (`Handle::reload`:
+any change to a machine's entry restarts its link). A link connects only while
 wanted (a local connection watching with `machines: true`, or a forwarded
 call queued) and for `Timing::linger` (60 s) after. Connected, it
 subscribes to `instances`, watches each of the machine's roots while a
@@ -141,7 +144,7 @@ and goes to that machine, but for the ones served here:
 gets every push merged with each machine's rows (`snapshots::merge`): rows
 gain `machine` and keep their remote `root`, and a top-level `machines`
 array carries each machine's `name`, `target`, `state`, `error`, `version`,
-`command`, `runtime`. A machine's push or state change re-publishes those
+`command`, `runtime`, `agent`. A machine's push or state change re-publishes those
 watchers' roots from the last local params. Details:
 [host-poll.md](host-poll.md#snapshots).
 
@@ -185,6 +188,13 @@ newest mtime first) after the agents clients reported and before the
 process's own `$SSH_AUTH_SOCK`, so the daemon's bridges and any command
 run there find it, and an exited relay drops out by the liveness check.
 
+Each machine's `agent` flag (`Entry::agent`, off by default) is set by
+`machine add --agent` or `machine set <name> --agent on|off`
+(`machines.add` / `machines.set`), listed by `machines.list` / `get`
+and the federated snapshot's `machines`, and marked `(agent)` in the
+dashboard's header note. Nothing spawns `ssh::agent_argv` from it: the
+links, verbs and CLI re-runs pass `-A` whatever its value ([ssh](#ssh)).
+
 ## The CLI: `cli.rs`
 
 `route` (I/O) runs `plan` (pure) in `main` before a verb goes to
@@ -217,7 +227,7 @@ run there find it, and an exited relay drops out by the liveness check.
 - Without a local daemon, a qualified remote name and `--machine` fail
   ("needs devsandbox serve"); a bare name resolves locally.
 
-## `devsandbox machine add|ls|rm`
+## `devsandbox machine add|ls|set|rm`
 
 A client of `machines.*` only, never in-process (`src/commands/machine.rs`).
 `add` without `--config` calls `machines.probe` (the remote's
@@ -225,14 +235,19 @@ A client of `machines.*` only, never in-process (`src/commands/machine.rs`).
 `~/.devsandboxes`) and lets the user multi-select on a TTY; off a TTY it
 takes the one usable candidate, else errors listing them. `machines.add`
 then checks every given root on the machine (`roots.list {paths}`: `~`
-expanded with the remote home, canonicalized, config loaded).
+expanded with the remote home, canonicalized, config loaded). `add
+--agent` saves the machine with `agent` on; adding a name that exists is
+refused. `set <name> --agent on|off` (`machines.set`; `--agent` is
+required) changes it on a registered machine and prints `<name>: agent
+on|off`. `ls` shows it in an `AGENT` column. `rm` forgets the machine.
 
 ## Dashboard
 
 `src/tui/remote.rs`: rows are keyed `machine/name` (bare for local),
 routed back to a request's `machine` + remote `root`; terminal tabs use
 `tty_argv`; a machine without rows shows `box: connecting` or `box:
-unreachable: <why>` in the header. `p` / `:port` on a remote row sends
+unreachable: <why>` in the header (`pending_note`), the name as `box
+(agent)` when its `agent` is on. `p` / `:port` on a remote row sends
 `forwards.add` with `machine` and the row's root (the forward binds here,
 listed with the rest on the Ports tab: `forwards.list {machines: true}`);
 VS Code on a remote row answers "isn't supported yet".

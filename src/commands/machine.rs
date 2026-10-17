@@ -1,5 +1,5 @@
-//! `devsandbox machine add|ls|rm` (docs/architecture/daemon/machines.md,
-//! *`devsandbox machine add|ls|rm`*): a client of the daemon's `machines.*`,
+//! `devsandbox machine add|ls|set|rm` (docs/architecture/daemon/machines.md,
+//! *`devsandbox machine add|ls|set|rm`*): a client of the daemon's `machines.*`,
 //! never in-process, since the registry and the links are the daemon's.
 //!
 //! `add` without `--config` probes the machine for its candidate roots and
@@ -19,9 +19,9 @@ use crate::serve::client::{self, Conn};
 use crate::serve::endpoint;
 use crate::serve::machines::api::{Added, MachineRow, Probed};
 
-const HEADERS: [&str; 5] = ["NAME", "TARGET", "ROOTS", "STATE", "VERSION"];
+const HEADERS: [&str; 6] = ["NAME", "TARGET", "ROOTS", "AGENT", "STATE", "VERSION"];
 
-pub fn add(target: &str, name: Option<&str>, configs: &[String]) -> Result<()> {
+pub fn add(target: &str, name: Option<&str>, configs: &[String], agent: bool) -> Result<()> {
     let mut conn = connect()?;
     let roots = if configs.is_empty() {
         let probed: Probed = call(&mut conn, "machines.probe", json!({ "target": target }))?;
@@ -33,7 +33,7 @@ pub fn add(target: &str, name: Option<&str>, configs: &[String]) -> Result<()> {
     } else {
         configs.to_vec()
     };
-    let added: Added = call(&mut conn, "machines.add", json!({ "target": target, "name": name, "roots": roots }))?;
+    let added: Added = call(&mut conn, "machines.add", json!({ "target": target, "name": name, "roots": roots, "agent": agent }))?;
     let roots: Vec<String> = added.roots.iter().map(|r| r.display().to_string()).collect();
     println!("added {} ({target}): {}", added.name, roots.join(", "));
     if let Some(warning) = added.warning {
@@ -54,9 +54,29 @@ pub fn ls(json: bool) -> Result<()> {
         println!("no machines; `devsandbox machine add <target>` adds one");
         return Ok(());
     }
-    let cells: Vec<[String; 5]> = rows.into_iter().map(cells).collect();
+    let cells: Vec<[String; 6]> = rows.into_iter().map(cells).collect();
     print!("{}", table(&HEADERS, &cells));
     Ok(())
+}
+
+pub fn set(name: &str, agent: bool) -> Result<()> {
+    let mut conn = connect()?;
+    let _: Value = call(&mut conn, "machines.set", json!({ "name": name, "agent": agent }))?;
+    println!("{name}: agent {}", on_off(agent));
+    Ok(())
+}
+
+/// `--agent`'s value: `on` or `off`.
+pub fn parse_on_off(s: &str) -> Result<bool, String> {
+    match s {
+        "on" => Ok(true),
+        "off" => Ok(false),
+        _ => Err(format!("`{s}` isn't `on` or `off`")),
+    }
+}
+
+fn on_off(b: bool) -> &'static str {
+    if b { "on" } else { "off" }
 }
 
 pub fn rm(name: &str) -> Result<()> {
@@ -81,13 +101,13 @@ fn call<T: DeserializeOwned>(conn: &mut Conn, method: &str, params: Value) -> Re
 }
 
 /// `ls`'s cells: the first root and how many more.
-fn cells(r: MachineRow) -> [String; 5] {
+fn cells(r: MachineRow) -> [String; 6] {
     let roots = match r.roots.split_first() {
         None => "-".to_string(),
         Some((first, [])) => first.display().to_string(),
         Some((first, rest)) => format!("{} +{}", first.display(), rest.len()),
     };
-    [r.name, r.target, roots, r.state.as_str().into(), r.version.unwrap_or_else(|| "-".into())]
+    [r.name, r.target, roots, on_off(r.agent).into(), r.state.as_str().into(), r.version.unwrap_or_else(|| "-".into())]
 }
 
 /// A candidate as the picker shows it: `/home/me/.devsandboxes  (api, web)`.
@@ -249,18 +269,29 @@ mod tests {
     }
 
     #[test]
+    fn agent_takes_on_or_off() {
+        assert_eq!(parse_on_off("on"), Ok(true));
+        assert_eq!(parse_on_off("off"), Ok(false));
+        for bad in ["", "yes", "true", "ON"] {
+            assert!(parse_on_off(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
     fn ls_cells_show_the_first_root() {
         let row = |roots: &[&str], version: Option<&str>| MachineRow {
             name: "m".into(),
             target: "me@m".into(),
             roots: roots.iter().map(Into::into).collect(),
             command: None,
+            agent: false,
             state: crate::serve::snapshots::LinkState::Idle,
             error: None,
             version: version.map(String::from),
         };
-        assert_eq!(cells(row(&["/a"], None)), ["m", "me@m", "/a", "idle", "-"].map(String::from));
-        assert_eq!(cells(row(&["/a", "/b", "/c"], Some("0.7.0")))[2..], ["/a +2", "idle", "0.7.0"].map(String::from));
+        assert_eq!(cells(row(&["/a"], None)), ["m", "me@m", "/a", "off", "idle", "-"].map(String::from));
+        assert_eq!(cells(row(&["/a", "/b", "/c"], Some("0.7.0")))[2..], ["/a +2", "off", "idle", "0.7.0"].map(String::from));
+        assert_eq!(cells(MachineRow { agent: true, ..row(&[], None) })[3], "on");
         assert_eq!(cells(row(&[], None))[2], "-");
     }
 }

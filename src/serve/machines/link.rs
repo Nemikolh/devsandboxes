@@ -278,7 +278,7 @@ mod tests {
         };
         // The dial as tests inject it.
         let dial: ssh::Dial = Arc::new(move |_, _| ssh::test_support::relayed(stream.try_clone()?));
-        let entry = super::super::Entry { name: "m".into(), target: "m".into(), roots: vec![], command: None };
+        let entry = super::super::Entry { name: "m".into(), target: "m".into(), roots: vec![], command: None, agent: false };
         let mut link = handshake("m", dial(&entry, None).unwrap(), Duration::from_secs(5)).unwrap();
         assert_eq!((link.remote().protocol, link.remote().version.as_str(), link.remote().handoff), (proto::PROTOCOL, "0.6.0", false));
         let r = link.conn.call("nope", Value::Null).unwrap();

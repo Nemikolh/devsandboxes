@@ -476,7 +476,7 @@ mod tests {
     use super::*;
 
     fn entry(target: &str, command: Option<&str>) -> Entry {
-        Entry { name: "m".into(), target: target.into(), roots: vec![], command: command.map(Into::into) }
+        Entry { name: "m".into(), target: target.into(), roots: vec![], command: command.map(Into::into), agent: false }
     }
 
     fn strs(argv: &[OsString]) -> Vec<&str> {

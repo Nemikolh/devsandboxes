@@ -155,6 +155,8 @@ export interface SnapshotMachine {
   runtime: string | null;
   /** The remote devsandbox as shell text; `null` is `devsandbox` on its `PATH` (for an ssh argv). */
   command: string | null;
+  /** This host's ssh-agent is relayed to it (`machines.set`). */
+  agent: boolean;
 }
 
 /**
@@ -772,6 +774,8 @@ export interface MachineInfo {
   command: string | null;
   /** Config roots on the machine. */
   roots: string[];
+  /** This host's ssh-agent is relayed to it (`machines.set`). */
+  agent: boolean;
 }
 
 /** One registered machine (`machines.list`). */
@@ -783,6 +787,8 @@ export interface MachineRow {
   roots: string[];
   /** The remote devsandbox as shell text; `null` is `devsandbox` on its `PATH`. */
   command: string | null;
+  /** This host's ssh-agent is relayed to it (`machines.set`). */
+  agent: boolean;
   state: LinkState;
   /** Why it's `unreachable` (or a root it refused). */
   error: string | null;
@@ -1108,8 +1114,10 @@ export interface ApiMethods {
   /** Dial a target over ssh and list its candidate roots; `failed` when ssh or the hello fails. */
   'machines.probe': { params: { target: string }; result: MachineProbe };
   /** Check `roots` on the machine (a quoted `~` is its home) and register it; `invalid` for a taken name or a bad root. */
-  'machines.add': { params: { target: string; name?: string; roots: string[] }; result: MachineAdded };
+  'machines.add': { params: { target: string; name?: string; roots: string[]; agent?: boolean }; result: MachineAdded };
   'machines.list': { params: {}; result: MachineRow[] };
+  /** Change a registered machine's settings; `not-found` for an unknown name. */
+  'machines.set': { params: { name: string; agent: boolean }; result: OkResult };
   'machines.rm': { params: { name: string }; result: OkResult };
   /** One registered machine, to build an ssh command to it; `not-found` for an unknown name. */
   'machines.get': { params: { name: string }; result: MachineInfo };
