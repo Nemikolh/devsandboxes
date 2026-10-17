@@ -36,7 +36,7 @@ export const states = [
     sub: 'accept loop',
     tone: 'serve',
     notes: [
-      'Every 5 s: list the running containers, reconcile one bridge per instance and the configured `forwardPorts`.',
+      'On each container event (`docker events`), else a timer (2 s watched, 60 s idle, 5 s with no event stream): list the running containers, reconcile one bridge per instance and the configured `forwardPorts`.',
       'Once at start: the autostart pass for every config root in `state.toml`.',
       'Each tick counts holders: connections, running `dispatcher` / `inbox = true` instances, in-flight control requests, live forwards, the autostart pass.',
     ],

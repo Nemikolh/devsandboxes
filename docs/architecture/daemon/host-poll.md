@@ -5,13 +5,16 @@ configured forwards, holders, `instances.changed`, and the watched roots'
 `instances.snapshot` pushes. Read this before adding anything that asks
 the runtime periodically: it should ride this poll, not start its own.
 
-Code: `src/serve/host.rs` (`Host`, `poll`, `POLL`, `Waker`, `Observers`,
-`holds_host`, the `serve-autostart` thread), `src/serve/snapshots.rs`
+Code: `src/serve/host.rs` (`Host`, `poll`, `tick`, `POLL`, `QUIET_POLL`,
+`Waker`, `Observers`, `holds_host`, the `serve-autostart` thread),
+`src/serve/events.rs` (`EventWatcher`, `EVENTS_RETRY`),
+`src/runtime/events.rs` (`parse`, `relevant`), `src/serve/snapshots.rs`
 (`Snapshots`, `LISTING_INTERVAL`, `STATS_INTERVAL`, `stats_due`, `Join`,
 `Remotes`, `merge`), `src/serve/daemon.rs` (`Watcher`, `Outbox`, `Pending`,
 `subscribe`, `watch_root`, `unwatch_root`, `Shared::publish_*`),
 `src/serve/api.rs` (`Topic`, `watch_dir`), `src/devsbd/bridge.rs`
-(`Bridges`, `BridgeBoard`, `report_agent`).
+(`Bridges`, `BridgeBoard`, `BridgeBoard::settled`, `BridgeBoard::on_failed`,
+`report_agent`).
 
 ## The poll
 
@@ -28,10 +31,61 @@ A `serve-poll` thread. Each pass lists every devsandbox container once
 5. while any root is watched, collects snapshots (below).
 
 The bridges get the list before any stats or snapshot work, so a
-`bridges.ensure` never waits on them. Cadence: `LISTING_INTERVAL` (2 s)
-while anything is watched, else `POLL` (5 s). A `Waker` cuts the sleep
-short: `wake(container)` for `bridges.ensure`, `refresh()` for a new watch
-or a `state.toml` change while watched.
+`bridges.ensure` never waits on them.
+
+The poll thread also runs the runtime's event stream (`EventWatcher`, a
+`serve-events` thread following `Backend::events_argv`: `docker events` /
+`podman events`, container events only). Each relevant event (a
+`devsandbox-` container created, started, stopped, died, removed, renamed,
+paused; never the bridges' own `exec_*` events) wakes the poll at once, as
+does the stream coming up (events before the subscribe are lost) or going
+down. The sleep between passes is `tick`:
+
+- `LISTING_INTERVAL` (2 s) while anything is watched;
+- else `QUIET_POLL` (60 s) while the event stream is live and the bridges
+  are settled (`BridgeBoard::settled`: none `Pending` or `Failed`);
+- else `POLL` (5 s). A pending handshake and a dead bridge's retry
+  (`retry_decision`, `RETRY` 10 s) are only acted on by a pass, so they
+  keep this cadence. A bridge turning `Failed` during a quiet sleep (its
+  handshake failed, its helper died) wakes the poll
+  (`BridgeBoard::on_failed`), which then sleeps `POLL`. A bridge the
+  worker hasn't spawned yet isn't on the board; it settles to `Ready` with
+  no pass needed, or fails and wakes the poll. A bridge whose `exec`
+  can't even start (`BridgeBoard::set` from `reconcile`) doesn't wake it:
+  with no live entry there's no retry gap, so a wake would loop.
+
+With no stream the poll is the plain `POLL` timer: Apple `container` has
+no `events_argv`, and podman with `events_logger = "none"`, a runtime
+that's down or a child that died all leave the stream not live; the
+watcher respawns it every `EVENTS_RETRY` (10 s), logging the loss and the
+recovery once each in `serve.log`. `QUIET_POLL` is the safety net for what
+no event announces: a missed event, a config edit that makes a running
+instance a holder (`holds_host`), a host agent appearing without a
+`bridges.ensure`.
+
+```
+                       poll thread sleeping
+                              │
+     ┌────────────────────────┼─────────────────────────────┐
+     │ container event        │ client call                 │ nothing
+     │ (docker events)        │ (bridges.ensure, watch)     │
+     ▼                        ▼                             ▼
+ devsandbox run/start/   run/start/exec/TUI           timer expires:
+ stop/rm, docker restart  report agent + wake          5 s  if no stream,
+ at boot, crash (die)                                       or a bridge is
+     │                        │                             Pending/Failed,
+     └──────────► wake NOW ◄──┘                        2 s  if a TUI watches,
+                     │                                 60 s otherwise
+                     ▼                                      │
+          list containers, reconcile bridges,  ◄────────────┘
+          forwards, holders, instances.changed
+```
+
+A `Waker` cuts the sleep short too: `wake(container)` for
+`bridges.ensure` (that container urgent), `refresh()` for a new watch or a
+`state.toml` change while watched; a container event takes the `refresh`
+path. Dropping `Host` stops the poll, which drops the watcher (its child
+killed) and then the bridge worker.
 
 With the runtime unreachable the last list stands (bridges and holder
 count kept, not torn down on a blip); the outage and the recovery are one

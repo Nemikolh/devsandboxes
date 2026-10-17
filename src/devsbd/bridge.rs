@@ -860,6 +860,9 @@ struct Board {
 pub struct BridgeBoard {
     inner: Arc<(Mutex<Board>, Condvar)>,
     tickets: Arc<std::sync::atomic::AtomicU64>,
+    /// Called (outside the lock) when a bridge turns `Failed`; see
+    /// [`BridgeBoard::on_failed`].
+    on_failed: Arc<std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>>,
 }
 
 impl BridgeBoard {
@@ -868,10 +871,25 @@ impl BridgeBoard {
         self.tickets.fetch_add(1, Ordering::AcqRel) + 1
     }
 
+    /// Set once: called each time a spawned bridge turns `Failed` (its
+    /// handshake failed or timed out, a healthy one ended; not `set`). The host
+    /// poll wakes on it: a failed bridge unsettles the board, and its retry
+    /// is only acted on by a poll pass, which may be sleeping `QUIET_POLL`.
+    pub fn on_failed(&self, hook: Box<dyn Fn() + Send + Sync>) {
+        let _ = self.on_failed.set(hook);
+    }
+
     fn update(&self, f: impl FnOnce(&mut Board)) {
         let (lock, cvar) = &*self.inner;
         f(&mut lock.lock().unwrap_or_else(|e| e.into_inner()));
         cvar.notify_all();
+    }
+
+    /// After an update that made an entry `status` (the lock released).
+    fn notify(&self, status_failed: bool) {
+        if status_failed && let Some(hook) = self.on_failed.get() {
+            hook();
+        }
     }
 
     /// `container` gets a fresh bridge: `Pending`, and the [`Observer`] its
@@ -885,14 +903,22 @@ impl BridgeBoard {
         });
         let (board, container) = (self.clone(), container.to_string());
         Box::new(move |status| {
+            let failed = matches!(status, BridgeStatus::Failed(_));
+            let mut applied = false;
             board.update(|b| {
                 if let Some(entry) = b.bridges.get_mut(&container).filter(|(at, _)| *at == id) {
                     entry.1 = status;
+                    applied = true;
                 }
-            })
+            });
+            // A replaced bridge's late news changes nothing: no wake.
+            board.notify(failed && applied);
         })
     }
 
+    /// No [`BridgeBoard::on_failed`] wake: `reconcile` calls this itself when
+    /// the `exec` can't start, leaving no live entry (so no retry gap), and a
+    /// wake would make the next pass retry at once, in a loop.
     fn set(&self, container: &str, status: BridgeStatus) {
         self.update(|b| {
             b.next_id += 1;
@@ -909,6 +935,16 @@ impl BridgeBoard {
     /// The worker reconciled with every ticket up to `ticket`.
     fn handled(&self, ticket: u64) {
         self.update(|b| b.handled = b.handled.max(ticket));
+    }
+
+    /// No bridge is `Pending` or `Failed`: nothing waits on a poll pass (a
+    /// handshake to see through, a dead bridge's retry), so the host poll may
+    /// sleep long (`serve::host::tick`). A bridge the worker hasn't spawned
+    /// yet isn't on the board; should it (or any) fail later,
+    /// [`BridgeBoard::on_failed`] wakes the poll to see it.
+    pub fn settled(&self) -> bool {
+        let b = self.inner.0.lock().unwrap_or_else(|e| e.into_inner());
+        b.bridges.values().all(|(_, s)| *s == BridgeStatus::Ready)
     }
 
     /// Wait up to `timeout` for `container`'s bridge as of ticket `ticket`
@@ -1262,6 +1298,54 @@ mod tests {
         board.handled(t2);
         board.handled(t);
         assert_eq!(board.inner.0.lock().unwrap().handled, t2);
+    }
+
+    #[test]
+    fn board_is_settled_with_every_bridge_ready() {
+        let board = BridgeBoard::default();
+        assert!(board.settled(), "no bridges");
+        let a = board.spawning("a");
+        assert!(!board.settled(), "pending");
+        a(BridgeStatus::Ready);
+        assert!(board.settled());
+        let b = board.spawning("b");
+        b(BridgeStatus::Failed("the bridge ended".into()));
+        assert!(!board.settled(), "failed");
+        board.retain(&["a".into()]);
+        assert!(board.settled(), "the failed one dropped");
+    }
+
+    #[test]
+    fn board_on_failed_fires_on_failed_only() {
+        let board = BridgeBoard::default();
+        let fired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = Arc::clone(&fired);
+        board.on_failed(Box::new(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+        }));
+        let n = || fired.load(Ordering::SeqCst);
+        let a = board.spawning("a");
+        assert_eq!(n(), 0, "pending");
+        a(BridgeStatus::Ready);
+        assert_eq!(n(), 0, "ready");
+        a(BridgeStatus::Failed("the bridge ended".into()));
+        assert_eq!(n(), 1, "failed via the observer");
+        // `reconcile`'s own `set` (the exec couldn't start): no wake, or the
+        // woken pass would retry at once, in a loop.
+        board.set("b", BridgeStatus::Failed("cannot run exec".into()));
+        assert_eq!(n(), 1, "no wake via set");
+        // A replaced bridge's late failure: no wake.
+        let _fresh = board.spawning("a");
+        a(BridgeStatus::Failed("late".into()));
+        assert_eq!(n(), 1);
+        // The hook runs outside the lock: it may read the board.
+        let other = BridgeBoard::default();
+        let seen = Arc::new(Mutex::new(None));
+        let out = Arc::clone(&seen);
+        let inner = other.clone();
+        other.on_failed(Box::new(move || *out.lock().unwrap() = Some(inner.settled())));
+        other.spawning("c")(BridgeStatus::Failed("x".into()));
+        assert_eq!(*seen.lock().unwrap(), Some(false));
     }
 
     #[test]

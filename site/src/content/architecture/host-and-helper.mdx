@@ -53,7 +53,7 @@ kind of stream to the newest one whose host serves it, so several bridges per co
 
 | host process | bridge | serves |
 |---|---|---|
-| `devsandbox serve` | one per running instance, reconciled every 5 s | ssh-agent, notify, control |
+| `devsandbox serve` | one per running instance, reconciled on each container event (5 s timer without one) | ssh-agent, notify, control |
 | a Ports-tab forward (inside `serve`) | one per forward | its `Connect` streams, ssh-agent |
 | `devsandbox port` (foreground) | its own | its `Connect` streams, ssh-agent when its shell has one |
 

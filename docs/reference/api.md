@@ -288,7 +288,8 @@ the pushes are notifications; unsubscribing from `instances` drops every
 watch, and so does hanging up. A client re-watches after a reconnect.
 
 While at least one connection watches a root, the daemon's container poll
-runs every 2 s (5 s otherwise) and joins every watched root against its
+runs every 2 s (otherwise on container events and a timer, see
+`instances.changed`) and joins every watched root against its
 one listing; stats (`cpu`/`mem`) are asked at most every 7 s, and at once
 for a root that hasn't had them yet. A snapshot between stats passes
 carries each running container's last `cpu`/`mem` over, so every pushed
@@ -500,7 +501,7 @@ Params: `{"instance": "<name>", "agent": "/abs/path" | null, "wait": <seconds>}`
 caller's `$SSH_AUTH_SOCK`, optional. The daemon records `agent` as its
 preferred host agent (the most recently reported live one wins; up to 8 are
 kept, the daemon's own `$SSH_AUTH_SOCK` last), then reconciles that
-instance's bridge at once instead of on its next 5 s poll: one is spawned if
+instance's bridge at once instead of on its next poll: one is spawned if
 missing, a dead one is respawned. Whether the instance gets a bridge at all
 is the daemon's usual rule (running, helper installed; relays the agent in
 relay mode). What `exec`, `start`, `run` and the dashboard's terminals send
@@ -537,7 +538,7 @@ host side).
 Port forwards ([forwards.md](../architecture/daemon/forwards.md)) live in the daemon: ad-hoc ones
 added here, and every running instance's configured `forwardPorts`, which
 the daemon starts and stops itself for every config root recorded in
-`state.toml`, following its 5 s container poll. They outlive the client
+`state.toml`, following its container poll. They outlive the client
 that added them and keep the daemon alive (*Holders*).
 A daemon exit (idle or handoff) closes them all; the successor restarts the
 configured ones on their saved host ports (`state.toml`) and the ad-hoc ones
@@ -923,7 +924,7 @@ between.
 |---|---|---|---|
 | `inbox.changed` | `inbox` | `{"generation": n}` | the store changed: through the daemon at once, through other processes (the dashboard, `devsandbox rm`) within 0.5 s. `n` grows per change the daemon saw; compare within one connection only |
 | `inbox.shown` | `inbox` | `{"instance": "<name>", "line": "<name>: <text>"}` | a container message the daemon stored is worth a status line (a `devsbd notify`, a thread put that changed something); `line` is the dashboard's status-line text. Latest only: lines that arrive faster than the client reads are dropped |
-| `instances.changed` | `instances` | `{}` | the running containers changed (the daemon polls every 5 s, 2 s while a root is watched), or `state.toml` did (checked every 0.5 s): a phase moved (a `run`/`rebuild` step, a failure), an instance was created, removed or renamed, marked done or undone |
+| `instances.changed` | `instances` | `{}` | the running containers changed (the daemon re-lists on each container event, else every 2 s while a root is watched, 60 s while the runtime's event stream is up, 5 s without one or while a bridge is pending or failed), or `state.toml` did (checked every 0.5 s): a phase moved (a `run`/`rebuild` step, a failure), an instance was created, removed or renamed, marked done or undone |
 | `instances.snapshot` | `instances` | `{"dir": "<abs>", …}`: `instances.list`'s result plus the root | a root this connection watches (`instances.watch`) was collected: every poll pass (about every 2 s), changed or not, so its arrival says how fresh it is. Latest only per root |
 | `forwards.changed` | `forwards` | `{}` | any forward's row changed (added, stopped, state, process, connections; checked every 0.5 s), in any config root |
 | `forwards.status` | `forwards` | `{"line": "…"}` | a one-line status: a configured forward started (`forwarding 127.0.0.1:3000 -> api:3000`) or failed, a connection note (`3000: connection refused`). Latest only, like `inbox.shown` |

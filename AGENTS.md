@@ -75,7 +75,9 @@ Start with `docs/README.md` (reading order and map) and
   `local_endpoint` seam), `daemon.rs` (start lock, accept loop, version
   handoff, drain), `host.rs` (the one container poll: each pass lists every
   devsandbox container once and feeds the bridges, the forwards and the
-  watched roots' snapshots; every 5 s, 2 s while a root is watched; plus
+  watched roots' snapshots; woken by container events (`events.rs`),
+  else every 2 s while a root is watched, 60 s while events flow and
+  bridges are settled, 5 s otherwise (`tick`); plus
   the startup autostart pass; the TUI no longer bridges; the sink's status
   lines go out as `inbox.shown`), `snapshots.rs` (the shared poll's per-root
   cache and cadence: stats at most every 7 s, cpu/mem carried over; pure

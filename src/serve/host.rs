@@ -13,17 +13,20 @@
 //! `forwardPorts` follow it). Then, while a dashboard watches a config root
 //! ([`Observers`], `instances.watch`), it asks for stats when due and joins
 //! every watched root against that one listing (`snapshots.rs`), each
-//! snapshot handed to the daemon to push. The tick is
-//! [`snapshots::LISTING_INTERVAL`] while anything is watched, [`POLL`]
-//! otherwise. A [`Waker`] (the API's `bridges.ensure`) cuts the poll's sleep
+//! snapshot handed to the daemon to push. The poll also owns the runtime's
+//! event stream ([`EventWatcher`], `events.rs`): each relevant container
+//! event wakes it at once. The sleep is [`tick`]:
+//! [`snapshots::LISTING_INTERVAL`] while anything is watched, else
+//! [`QUIET_POLL`] while the event stream is live and every bridge is settled,
+//! else [`POLL`]. A [`Waker`] (the API's `bridges.ensure`) cuts the poll's sleep
 //! short and marks its container urgent, so a CLI command or a dashboard
 //! terminal gets its bridge now rather than within [`POLL`]; the bridges are
 //! handed their list before any stats or snapshot work.
-//! [`Waker::refresh`] cuts it short for the snapshots alone (a `state.toml`
-//! write, a new watch). A `serve-autostart` thread runs the autostart pass
+//! [`Waker::refresh`] (and a container event) cuts it short with no container
+//! urgent (a `state.toml` write, a new watch). A `serve-autostart` thread runs the autostart pass
 //! once per config root recorded in `state.toml`. Dropping [`Host`] stops
-//! the poll, drops the worker (killing every bridge's `exec`) and joins both
-//! threads.
+//! the poll, which drops the event watcher (killing its child) and the worker
+//! (killing every bridge's `exec`), and joins both threads.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -34,6 +37,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+use super::events::{EVENTS_RETRY, EventWatcher};
 use super::snapshots::{self, Join, Snapshots};
 use crate::devsbd::bridge::{self, BridgeBoard, Bridges, OnShown, Readiness};
 use crate::runtime::{ContainerRow, NAME_PREFIX};
@@ -44,6 +48,13 @@ use crate::state::State;
 /// its bridge (and counts as a holder) within this; bridge deaths are retried
 /// on their own gaps (`bridge::RETRY`), checked on each poll.
 pub const POLL: Duration = Duration::from_secs(5);
+
+/// The poll's sleep while the runtime's event stream is live (nothing
+/// watched, bridges settled): a safety net, since events wake it. It catches
+/// what no event announces: a missed event, a config edit making a running
+/// instance a holder ([`holds_host`]), a host agent appearing without a
+/// `bridges.ensure`.
+pub const QUIET_POLL: Duration = Duration::from_secs(60);
 
 /// Called with each successful poll's running container names.
 pub type OnRunning = Box<dyn Fn(&[String]) + Send>;
@@ -89,13 +100,18 @@ impl Waker {
         ticket
     }
 
-    /// Poll now for the watched roots' snapshots (no container urgent): a
-    /// `state.toml` write, a new watch.
+    /// Poll now, no container urgent: a `state.toml` write, a new watch (the
+    /// watched roots' snapshots); a container event takes the same path.
     pub fn refresh(&self) {
-        let (lock, cvar) = &*self.0;
-        lock.lock().unwrap_or_else(|e| e.into_inner()).refresh = true;
-        cvar.notify_all();
+        refresh(&self.0);
     }
+}
+
+/// Cut the poll's sleep short for a full pass (re-list, reconcile, snapshots).
+fn refresh(shared: &Shared) {
+    let (lock, cvar) = &**shared;
+    lock.lock().unwrap_or_else(|e| e.into_inner()).refresh = true;
+    cvar.notify_all();
 }
 
 /// `bridges.ensure` against the real state and this daemon's bridges.
@@ -135,6 +151,10 @@ impl Host {
     pub fn start(log: fn(&str), on_shown: OnShown, on_running: OnRunning, observers: Observers) -> Host {
         let stop: Shared = Arc::default();
         let board = BridgeBoard::default();
+        // A failed bridge unsettles the board: wake the poll so it drops to
+        // `POLL` and acts on the retry. Holds only the signal, not the poll.
+        let shared = Arc::clone(&stop);
+        board.on_failed(Box::new(move || refresh(&shared)));
         let live = Arc::new(AtomicUsize::new(0));
         // Counted before the thread runs, so the first idle check sees it.
         let autostarting = Arc::new(AtomicUsize::new(1));
@@ -209,14 +229,16 @@ impl Drop for Host {
 }
 
 /// The poll loop: list, count, reconcile, collect the watched roots'
-/// snapshots, sleep (until [`tick`] passes or a [`Waker`] fires), until
-/// stopped. With the runtime unreachable the last list stands (bridges and
+/// snapshots, sleep (until [`tick`] passes, a [`Waker`] fires or a container
+/// event arrives), until stopped. The event watcher lives as long as the
+/// loop: its down transition wakes the loop too, so a `live` read just before
+/// the stream dies never holds the sleep at [`QUIET_POLL`]. With the runtime unreachable the last list stands (bridges and
 /// the holder count are kept, not torn down on a blip); the outage is logged
 /// once, and urgent containers wait for the next list. Watched roots still
 /// get a snapshot then, saying the runtime is down.
 #[allow(clippy::too_many_arguments)]
 fn poll(
-    stop: &(Mutex<Signal>, Condvar),
+    stop: &Shared,
     live: &AtomicUsize,
     changes: &AtomicU64,
     log: fn(&str),
@@ -225,8 +247,14 @@ fn poll(
     observers: &Observers,
     board: BridgeBoard,
 ) {
-    let worker = Bridges::spawn_worker(Some(Some(on_shown)), board);
+    let worker = Bridges::spawn_worker(Some(Some(on_shown)), board.clone());
     let rt = crate::runtime::backend();
+    // Declared after `worker`, so it drops (child killed, thread joined) first.
+    let events = {
+        let argv = rt.events_argv().map(|a| a.into_iter().map(String::from).collect());
+        let shared = Arc::clone(stop);
+        EventWatcher::start(rt.bin(), argv, Box::new(move || refresh(&shared)), log, EVENTS_RETRY)
+    };
     let mut down = false;
     let mut last: Vec<String> = Vec::new();
     let mut urgent: Vec<(String, u64)> = Vec::new();
@@ -278,10 +306,13 @@ fn poll(
             }
             publish(observers.cache.collect(&view, &watched, &*observers.join));
         }
-        let (lock, cvar) = stop;
+        // Read before the lock: a stream lost after this read sets `refresh`,
+        // which the wait sees at once.
+        let sleep = tick(!watched.is_empty(), events.is_live(), board.settled());
+        let (lock, cvar) = &**stop;
         let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
         let (mut guard, _) = cvar
-            .wait_timeout_while(guard, tick(!watched.is_empty()), |s| !s.stop && s.urgent.is_empty() && !s.refresh)
+            .wait_timeout_while(guard, sleep, |s| !s.stop && s.urgent.is_empty() && !s.refresh)
             .unwrap_or_else(|e| e.into_inner());
         if guard.stop {
             break;
@@ -289,12 +320,25 @@ fn poll(
         guard.refresh = false;
         urgent.append(&mut guard.urgent);
     }
-    // `worker` drops here: closes its channel and joins, killing every bridge.
+    // `events` drops here (kills its child, joins), then `worker`: closes its
+    // channel and joins, killing every bridge.
 }
 
-/// The poll's sleep: the dashboards' cadence while a root is watched.
-fn tick(watched: bool) -> Duration {
-    if watched { snapshots::LISTING_INTERVAL } else { POLL }
+/// The poll's sleep: the dashboards' cadence while a root is watched; else
+/// the long [`QUIET_POLL`] while container events wake the poll and the
+/// bridges are settled (`BridgeBoard::settled`), since a pending handshake
+/// and a dead bridge's retry (`bridge::retry_decision`, `bridge::RETRY`) are
+/// only acted on by a poll pass; else [`POLL`]. A bridge failing during a
+/// quiet sleep wakes the poll (`BridgeBoard::on_failed`), so its retry
+/// keeps the `POLL` schedule.
+fn tick(watched: bool, events_live: bool, bridges_settled: bool) -> Duration {
+    if watched {
+        snapshots::LISTING_INTERVAL
+    } else if events_live && bridges_settled {
+        QUIET_POLL
+    } else {
+        POLL
+    }
 }
 
 /// The running containers of a listing.
@@ -422,8 +466,13 @@ mod tests {
         let row = |name: &str, state: &str| ContainerRow { name: name.into(), state: state.into(), ..Default::default() };
         let rows = [row("devsandbox-a", "running"), row("devsandbox-b", "exited"), row("devsandbox-c", "running")];
         assert_eq!(running(&rows), ["devsandbox-a", "devsandbox-c"]);
-        assert_eq!(tick(true), snapshots::LISTING_INTERVAL);
-        assert_eq!(tick(false), POLL);
+        for (live, settled) in [(false, false), (false, true), (true, false), (true, true)] {
+            assert_eq!(tick(true, live, settled), snapshots::LISTING_INTERVAL, "watched wins");
+        }
+        assert_eq!(tick(false, true, true), QUIET_POLL);
+        assert_eq!(tick(false, false, true), POLL, "no event stream");
+        assert_eq!(tick(false, true, false), POLL, "a bridge pending or failed");
+        assert_eq!(tick(false, false, false), POLL);
     }
 
     #[test]

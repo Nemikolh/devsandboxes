@@ -18,8 +18,10 @@ Code: `src/devsbd/bridge.rs` (`Bridge`, `Bridges`, `BridgeWorker`,
 ## Who owns bridges
 
 - **The serve daemon**, always (unix-only, like `serve`). Its `serve-poll`
-  thread lists devsandbox containers every 5 s (`host::POLL`) and hands the
-  running ones to the bridge worker thread (`Bridges::spawn_worker`), which
+  thread lists devsandbox containers on each container event and on a timer
+  (`host::tick`: `host::POLL`, 5 s, while a bridge is pending or failed or
+  there's no event stream; [host poll](../daemon/host-poll.md#the-poll)) and
+  hands the running ones to the bridge worker thread (`Bridges::spawn_worker`), which
   owns every bridge and coalesces bursts into one `reconcile`. The CLI and the
   dashboard never keep their own agent/notify bridges.
 - **The forward engine**: `spawn_for` makes a short-lived bridge per forward
