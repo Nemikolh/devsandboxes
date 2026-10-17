@@ -90,6 +90,7 @@ pub(crate) fn machine_use(command: Option<&Command>) -> MachineUse {
         Command::Serve { .. } => MachineUse::Refused("serve"),
         Command::Api { .. } => MachineUse::Refused("api"),
         Command::Tunnel { .. } => MachineUse::Refused("tunnel"),
+        Command::AgentRelay { .. } => MachineUse::Refused("agent-relay"),
         Command::Machine { .. } => MachineUse::Refused("machine"),
     }
 }

@@ -12,6 +12,8 @@
 //!   federated resolve and sandboxes listing
 //! - `cli`: the CLI's side: where a `<name>` points, `--machine`, and the
 //!   ssh re-run of commands that don't go through the daemon
+//! - `agent`: this end of a machine's agent relay, serving its streams from
+//!   the local ssh-agent (`commands::agent_relay` is the far end)
 //!
 //! Only the daemon writes the registry (`machines.add` / `machines.rm`);
 //! the CLI reads it later to know whether any machine exists. Two
@@ -27,6 +29,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+// Tested end to end with `commands::agent_relay`; `service` doesn't run it yet.
+#[allow(dead_code)]
+pub mod agent;
 pub mod api;
 pub mod cli;
 pub mod forward;

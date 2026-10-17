@@ -179,6 +179,15 @@ pub fn tunnel_argv(
     argv(entry, opts, &args)
 }
 
+/// The argv of `entry`'s agent relay (docs/architecture/daemon/machines.md,
+/// *Agent*): `ssh -T -o BatchMode=yes [-p N] -- <host> <devsandbox
+/// agent-relay --client <client>>`. No `-A`: the agent travels inside the
+/// relay's own streams.
+#[allow(dead_code)] // `service` doesn't run the relay yet
+pub fn agent_argv(entry: &Entry, client: &str) -> Result<Vec<OsString>> {
+    argv(entry, &["-T", "-o", "BatchMode=yes"], &["agent-relay", "--client", client])
+}
+
 fn argv(entry: &Entry, opts: &[&str], remote_args: &[impl AsRef<str>]) -> Result<Vec<OsString>> {
     argv_with(entry, opts, entry.command(), remote_args)
 }
@@ -532,6 +541,15 @@ mod tests {
         assert_eq!(strs(&cli), ["ssh", "-T", "--", "box", remote.as_str()]);
         assert!(!strs(&cli).contains(&"-A"), "a forward serves no agent");
         assert!(tunnel_argv(&entry("-oProxyCommand=x", None), true, root, Some("web"), None, 1).is_err());
+    }
+
+    #[test]
+    fn agent_argvs() {
+        let argv = agent_argv(&entry("ssh://me@box:2200", Some("~/bin/devsandbox")), "machine:lap").unwrap();
+        let remote = remote_command("~/bin/devsandbox", &["agent-relay", "--client", "machine:lap"]);
+        assert_eq!(strs(&argv), ["ssh", "-T", "-o", "BatchMode=yes", "-p", "2200", "--", "me@box", remote.as_str()]);
+        assert!(!strs(&argv).contains(&"-A"), "the relay carries the agent itself");
+        assert!(agent_argv(&entry("-oProxyCommand=x", None), "machine:lap").is_err());
     }
 
     /// A script that prints each arg as `[arg]`, at a path with a space and

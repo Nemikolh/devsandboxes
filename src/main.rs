@@ -332,6 +332,16 @@ enum Command {
         #[arg(long)]
         port: u16,
     },
+    /// The far end of a machine's agent relay (docs/architecture/daemon/machines.md,
+    /// *Agent*): serve the linked laptop's ssh-agent on a socket here, carried
+    /// over stdin/stdout
+    #[cfg(unix)]
+    #[command(hide = true)]
+    AgentRelay {
+        /// Who's linked (`machine:<hostname>`): names the socket
+        #[arg(long)]
+        client: String,
+    },
     /// Register remote hosts (over ssh) whose sandboxes this one manages
     /// (docs/architecture/daemon/machines.md)
     #[cfg(unix)]
@@ -694,6 +704,8 @@ fn main() -> Result<()> {
         }
         #[cfg(unix)]
         Command::Tunnel { instance, service, port } => commands::tunnel::tunnel(cli.dir, instance, service, port),
+        #[cfg(unix)]
+        Command::AgentRelay { client } => commands::agent_relay::agent_relay(&client),
         #[cfg(unix)]
         Command::Machine { cmd } => match cmd {
             MachineCommand::Add { target, name, configs } => commands::machine::add(&target, name.as_deref(), &configs),

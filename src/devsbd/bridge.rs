@@ -145,11 +145,12 @@ const MAX_AGENTS: usize = 8;
 
 /// The host agent sockets this process knows of, most recent first: what
 /// clients reported through `bridges.ensure` (docs/reference/api.md). Only the daemon
-/// gets reports; everywhere else the list stays empty and the own
-/// `$SSH_AUTH_SOCK`, the last fallback of [`pick`](Self::pick), is all there
-/// is. This is what keeps the daemon's relay working when the agent it
-/// inherited is gone or rotated (a new `ssh -A` session): the next client
-/// command brings the live one.
+/// gets reports; everywhere else the list stays empty and [`pick`](Self::pick)
+/// goes on to the machine agent relays' sockets in the socket dir
+/// (docs/architecture/daemon/machines.md, *Agent*), then the own
+/// `$SSH_AUTH_SOCK`. The reports are what keep the daemon's relay working
+/// when the agent it inherited is gone or rotated (a new `ssh -A` session):
+/// the next client command brings the live one.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct AgentCandidates {
     recent: Vec<PathBuf>,
@@ -164,10 +165,17 @@ impl AgentCandidates {
         self.recent.truncate(MAX_AGENTS);
     }
 
-    /// The first candidate `live` accepts, the reported ones (newest first)
-    /// before `fallback` (the process's own `$SSH_AUTH_SOCK`).
-    pub fn pick(&self, fallback: Option<PathBuf>, live: impl Fn(&Path) -> bool) -> Option<PathBuf> {
-        self.recent.iter().cloned().chain(fallback).find(|p| live(p))
+    /// The first candidate `live` accepts: the reported ones (newest first),
+    /// then `relays` (agent relay sockets, newest first:
+    /// `endpoint::agent_sockets`), then `fallback` (the process's own
+    /// `$SSH_AUTH_SOCK`).
+    pub fn pick(
+        &self,
+        relays: Vec<PathBuf>,
+        fallback: Option<PathBuf>,
+        live: impl Fn(&Path) -> bool,
+    ) -> Option<PathBuf> {
+        self.recent.iter().cloned().chain(relays).chain(fallback).find(|p| live(p))
     }
 }
 
@@ -192,19 +200,25 @@ fn agent_live(path: &Path) -> bool {
 }
 
 /// The host agent socket, chosen per stream so agent rotation needs no
-/// restart: the first live [`AgentCandidates`] entry, else `$SSH_AUTH_SOCK`
-/// when live. Also gates whether a bridge is worth spawning
-/// (`has_host_agent`). The daemon's machine links forward it too (`ssh -A`).
+/// restart: the first live reported agent, else the first live agent relay
+/// socket in the socket dir (newest first; a missing or unreadable dir has
+/// none), else `$SSH_AUTH_SOCK` when live (see [`AgentCandidates::pick`]).
+/// Also gates whether a bridge is worth spawning (`has_host_agent`). The
+/// daemon's machine links forward it too (`ssh -A`).
 pub fn host_agent() -> Option<PathBuf> {
     let candidates = AGENTS.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    candidates.pick(own_agent(), agent_live)
+    let relays = crate::serve::endpoint::socket_dir()
+        .map(|dir| crate::serve::endpoint::agent_sockets(&dir))
+        .unwrap_or_default();
+    candidates.pick(relays, own_agent(), agent_live)
 }
 
 /// Whether the host has a usable ssh-agent right now. Gates bridge spawning
 /// (`Bridges::reconcile`, the CLI's `bridges.ensure`) and `SSH_AUTH_SOCK`
 /// injection: with no agent a bridge and the env var only cost an extra
-/// `exec` that can't help. In the daemon it counts client-reported agents, so
-/// a report replaces its agent-less bridges (see `reconcile`).
+/// `exec` that can't help. It counts client-reported agents (in the daemon)
+/// and live machine agent relays, so a report or a relay coming up replaces
+/// the daemon's agent-less bridges (see `reconcile`).
 pub fn has_host_agent() -> bool {
     host_agent().is_some()
 }
@@ -1284,17 +1298,33 @@ mod tests {
         let live = |names: &'static [&'static str]| move |p: &Path| names.iter().any(|n| p == Path::new(n));
         let mut c = AgentCandidates::default();
         // Nothing reported: the own `$SSH_AUTH_SOCK`, when live.
-        assert_eq!(c.pick(Some("/env".into()), live(&["/env"])), Some("/env".into()));
-        assert_eq!(c.pick(Some("/env".into()), live(&[])), None);
-        assert_eq!(c.pick(None, live(&["/env"])), None);
+        assert_eq!(c.pick(vec![], Some("/env".into()), live(&["/env"])), Some("/env".into()));
+        assert_eq!(c.pick(vec![], Some("/env".into()), live(&[])), None);
+        assert_eq!(c.pick(vec![], None, live(&["/env"])), None);
         c.report("/old".into());
         c.report("/new".into());
         // The newest live report wins over older ones and the fallback.
-        assert_eq!(c.pick(Some("/env".into()), live(&["/old", "/new", "/env"])), Some("/new".into()));
+        assert_eq!(c.pick(vec![], Some("/env".into()), live(&["/old", "/new", "/env"])), Some("/new".into()));
         // A dead newest (the `ssh -A` session ended) falls through in order.
-        assert_eq!(c.pick(Some("/env".into()), live(&["/old", "/env"])), Some("/old".into()));
-        assert_eq!(c.pick(Some("/env".into()), live(&["/env"])), Some("/env".into()));
-        assert_eq!(c.pick(Some("/env".into()), live(&[])), None);
+        assert_eq!(c.pick(vec![], Some("/env".into()), live(&["/old", "/env"])), Some("/old".into()));
+        assert_eq!(c.pick(vec![], Some("/env".into()), live(&["/env"])), Some("/env".into()));
+        assert_eq!(c.pick(vec![], Some("/env".into()), live(&[])), None);
+    }
+
+    #[test]
+    fn agent_pick_puts_relays_between_reports_and_the_fallback() {
+        let live = |names: &'static [&'static str]| move |p: &Path| names.iter().any(|n| p == Path::new(n));
+        let relays = || vec![PathBuf::from("/r-new"), PathBuf::from("/r-old")];
+        let mut c = AgentCandidates::default();
+        // No report: the newest live relay, over older ones and the fallback.
+        assert_eq!(c.pick(relays(), Some("/env".into()), live(&["/r-new", "/r-old", "/env"])), Some("/r-new".into()));
+        assert_eq!(c.pick(relays(), Some("/env".into()), live(&["/r-old", "/env"])), Some("/r-old".into()));
+        // An exited relay (its socket refuses) drops out.
+        assert_eq!(c.pick(relays(), Some("/env".into()), live(&["/env"])), Some("/env".into()));
+        // A live report comes first.
+        c.report("/rep".into());
+        assert_eq!(c.pick(relays(), Some("/env".into()), live(&["/rep", "/r-new", "/env"])), Some("/rep".into()));
+        assert_eq!(c.pick(relays(), Some("/env".into()), live(&["/r-new", "/env"])), Some("/r-new".into()));
     }
 
     #[test]

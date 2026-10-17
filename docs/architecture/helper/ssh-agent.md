@@ -69,6 +69,9 @@ container process ─▶ /run/devsandbox/ssh-agent.sock ─▶ devsbd daemon ─
   has a live agent; it is replaced when the agent appears or disappears.
 - Which agent: chosen per stream by `host_agent()`: the newest live socket
   among those clients reported (`AgentCandidates`, up to 8), else the
+  newest live machine agent relay socket in the socket dir
+  (`agent-*.sock`, `endpoint::agent_sockets`;
+  [machines.md](../daemon/machines.md#agent)), else the
   daemon's own `$SSH_AUTH_SOCK`. Every client that asks for a bridge
   (`bridges.ensure`) reports its own `$SSH_AUTH_SOCK`, so agent rotation (a
   new `ssh -A` session, re-login) needs no restart: the next command brings

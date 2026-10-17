@@ -10,11 +10,14 @@ Code: `src/serve/machines/mod.rs` (`Entry`, `path`, `parse`, `update`,
 `check_name`, `Where`, `parse_name`, `default_name`), `ssh.rs`
 (`api_argv`, `tty_argv`, `tty_argv_with`, `cli_argv`, `parse_target`,
 `Dial`, `Duplex`, `ssh_dial`), `link.rs` (`LinkError`, `client_name`),
-`service.rs` (`Machines`, `Handle`, `Timing`, `Hooks`), `api.rs`
+`service.rs` (`Machines`, `Handle`, `Timing`, `Hooks`), `agent.rs`
+(`serve`, `End`, `SENTINEL`), `api.rs`
 (`machines.*`, `Ctx`), `forward.rs` (`QUICK`, `FANOUT_WAIT`, `verb`, the
 federated joins), `cli.rs` (`plan`, `Plan`, `machine_use`, `route`,
 `localize`), `src/serve/snapshots.rs` (`Remotes`, `LinkState`, `merge`),
 `src/serve/relay.rs` (`--session-env`), `src/commands/machine.rs`,
+`src/commands/agent_relay.rs` (`run`, `Socket`),
+`src/serve/endpoint.rs` (`agent_socket`, `agent_sockets`),
 `src/tui/remote.rs`. Params: [api.md](../../reference/api.md#machines).
 
 ## Registry: `machines.toml`
@@ -55,6 +58,8 @@ so the remote `PATH` is the user's.
   forward's bridge ([forwards.md](forwards.md#remote-bridges)). No `-A`
   (a forward's bridge serves no agent); `BatchMode` when `batch` (the
   daemon). The `=` forms keep a name starting with `-` a value.
+- `agent_argv`: `ssh -T -o BatchMode=yes [-p N] -- <host> … agent-relay
+  --client <c>`, a machine's agent relay ([Agent](#agent)). No `-A`.
 
 `Tail` (a bounded ring of a stream's last bytes, `Tail::collect`) keeps
 ssh's stderr for `spawn`'s `Peer` and the remote forward opener alike.
@@ -139,6 +144,46 @@ array carries each machine's `name`, `target`, `state`, `error`, `version`,
 `command`, `runtime`. A machine's push or state change re-publishes those
 watchers' roots from the last local params. Details:
 [host-poll.md](host-poll.md#snapshots).
+
+## Agent
+
+A machine's agent relay carries this host's ssh-agent to the machine over
+its own ssh (`ssh::agent_argv`, no `-A`), on the helper's frame protocol
+([protocol.md](../helper/protocol.md)) with the roles of a container's
+relay ([ssh-agent.md](../helper/ssh-agent.md)) swapped onto the two hosts:
+
+- **The machine's end**, the hidden `devsandbox agent-relay --client <c>`
+  (`commands::agent_relay`), plays the in-container daemon. It binds
+  `endpoint::agent_socket`: `<socket dir>/agent-<client>.sock`, 0600 in
+  the 0700 socket dir, the client cut to `[A-Za-z0-9._-]` and 40 bytes (a
+  longer one ends in a hash of the whole name) so the path stays under
+  macOS's 104 bytes. It binds a temp name and renames it over that path,
+  so the newest relay for a client wins. Then it writes the sentinel line
+  `\n` + `devsandbox-agent 1\n` (`agent::write_sentinel`), exchanges
+  `Hello`s on its stdin/stdout and requires the peer to advertise
+  `caps::SSH_AGENT`. Each connection to its socket becomes one
+  `Open { channel: SSH_AGENT }` stream on the mux over stdout (ids in the
+  daemon's space, below 2^31); `Open`s from the peer are refused. It
+  exits when stdin ends or stdout fails (`Ok`) or when the keepalive
+  (`mux::KEEPALIVE_INTERVAL`/`KEEPALIVE_TIMEOUT`) hears nothing, so a
+  partitioned link can't leave a socket that accepts and hangs. Exiting
+  unlinks the socket only while it is still its own (same device and
+  inode), never a newer relay's.
+- **This end**, `agent::serve` over any byte stream, plays the host
+  bridge: it skips the login shell's output up to the sentinel
+  (`ssh::skip_lines`, as the [link](#link-handshake) does), sends its
+  `Hello` advertising `caps::SSH_AGENT`, and answers each
+  `Open { SSH_AGENT }` with a connection to its `agent()` (production:
+  `bridge::host_agent`) when `allowed()` says yes at that moment, else a
+  `Close`, which the machine's end turns into a closed client socket. It
+  returns an `End`: the handshake failed, the keepalive ran `on_dead`
+  (which must end the stream, e.g. kill the ssh), or the stream closed.
+
+On the machine nothing registers the socket: `bridge::host_agent` tries
+the live `agent-*.sock` files in the socket dir (`endpoint::agent_sockets`,
+newest mtime first) after the agents clients reported and before the
+process's own `$SSH_AUTH_SOCK`, so the daemon's bridges and any command
+run there find it, and an exited relay drops out by the liveness check.
 
 ## The CLI: `cli.rs`
 

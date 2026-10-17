@@ -136,6 +136,11 @@ default per machine, carried over our own frame protocol instead of
   client's connection closes promptly; the local half dropping → the
   remote socket file is gone. `host_agent` ordering with a scratch socket
   dir.
+- As built: `agent-relay` writes its own sentinel (`\ndevsandbox-agent
+  1\n`) before its `Hello` and `agent::serve` skips to it (same login-shell
+  noise problem as step 1); `agent::serve` takes an `on_dead` that must end
+  the transport (step 4: kill the ssh); the remote socket is bound before
+  the `Hello`s, so a finished handshake means the socket exists.
 - Docs: machines.md gains an *Agent* section describing the relay (wired
   in step 4; say here only what exists); ssh-agent.md's *Which agent*
   bullet gains the socket-dir candidates.

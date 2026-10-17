@@ -70,6 +70,51 @@ pub fn lock_path(dir: &Path) -> PathBuf {
     dir.join(LOCK_FILE)
 }
 
+/// How many bytes of a client name an agent relay socket's name keeps
+/// before cutting it and appending a hash of the whole name.
+const AGENT_CLIENT_MAX: usize = 40;
+
+/// A machine agent relay's socket in `dir` (docs/architecture/daemon/machines.md,
+/// *Agent*): `agent-<client>.sock`, one per linked client
+/// (`machine:<hostname>`). The client is cut down to `[A-Za-z0-9._-]` (the
+/// rest become `_`) and to [`AGENT_CLIENT_MAX`] bytes, a long one ending in
+/// a hash of the full name so two long names don't collide: macOS caps
+/// socket paths at 104 bytes.
+pub fn agent_socket(dir: &Path, client: &str) -> PathBuf {
+    dir.join(format!("agent-{}.sock", agent_socket_name(client)))
+}
+
+fn agent_socket_name(client: &str) -> String {
+    let safe: String = client
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '_' })
+        .collect();
+    if safe.len() <= AGENT_CLIENT_MAX {
+        return safe;
+    }
+    let hash = crate::config::short_hash(client);
+    // ASCII only by now, so any byte index is a char boundary.
+    format!("{}-{}", &safe[..AGENT_CLIENT_MAX - 9], &hash[..8])
+}
+
+/// The agent relay sockets (`agent-*.sock`) in `dir`, newest mtime first,
+/// unchecked: whoever uses one tries it (`bridge::host_agent`). Nothing
+/// when `dir` is missing or unreadable.
+pub fn agent_sockets(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut found: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .filter(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("agent-") && name.ends_with(".sock")
+        })
+        .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
+        .collect();
+    found.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    found.into_iter().map(|(_, p)| p).collect()
+}
+
 /// Create `dir` if needed and make it 0700 (also when it already existed:
 /// it's ours, and a looser mode would open the socket to other users).
 pub fn ensure_private_dir(dir: &Path) -> Result<()> {
@@ -111,26 +156,7 @@ impl Listener {
     /// the accept loop can check its idle/drain state between connections
     /// without a busy loop or a listener thread.
     pub fn accept_timeout(&self, timeout: Duration) -> io::Result<Option<Stream>> {
-        let mut fd = libc::pollfd { fd: self.inner.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-        let ms = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
-        // SAFETY: one valid pollfd for the duration of the call.
-        let n = unsafe { libc::poll(&mut fd, 1, ms) };
-        if n < 0 {
-            let e = io::Error::last_os_error();
-            return if e.kind() == io::ErrorKind::Interrupted { Ok(None) } else { Err(e) };
-        }
-        if n == 0 {
-            return Ok(None);
-        }
-        match self.inner.accept() {
-            Ok((stream, _)) => {
-                // macOS hands out accepted sockets with the listener's O_NONBLOCK.
-                stream.set_nonblocking(false)?;
-                Ok(Some(stream))
-            }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
-            Err(e) => Err(e),
-        }
+        accept_timeout(&self.inner, timeout)
     }
 
     /// Remove the socket file. Only the lock holder calls this, right before
@@ -138,6 +164,31 @@ impl Listener {
     pub fn remove(self) {
         drop(self.inner);
         let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// [`Listener::accept_timeout`] on any non-blocking `listener` (an agent
+/// relay's too): wait up to `timeout`, `Ok(None)` when no connection came.
+pub fn accept_timeout(listener: &UnixListener, timeout: Duration) -> io::Result<Option<Stream>> {
+    let mut fd = libc::pollfd { fd: listener.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+    let ms = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
+    // SAFETY: one valid pollfd for the duration of the call.
+    let n = unsafe { libc::poll(&mut fd, 1, ms) };
+    if n < 0 {
+        let e = io::Error::last_os_error();
+        return if e.kind() == io::ErrorKind::Interrupted { Ok(None) } else { Err(e) };
+    }
+    if n == 0 {
+        return Ok(None);
+    }
+    match listener.accept() {
+        Ok((stream, _)) => {
+            // macOS hands out accepted sockets with the listener's O_NONBLOCK.
+            stream.set_nonblocking(false)?;
+            Ok(Some(stream))
+        }
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
+        Err(e) => Err(e),
     }
 }
 
@@ -203,5 +254,35 @@ mod tests {
         assert!(!socket_path(&dir).exists());
         assert!(connect(&dir).is_err());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn agent_socket_names_are_sanitized_and_bounded() {
+        let dir = Path::new("/run/user/1000/devsandbox");
+        assert_eq!(agent_socket(dir, "machine:lap-top.local"), dir.join("agent-machine_lap-top.local.sock"));
+        assert_eq!(agent_socket(dir, "machine:a b/c\u{e9}"), dir.join("agent-machine_a_b_c_.sock"));
+        let long = |host: &str| agent_socket(dir, &format!("machine:{}{host}", "h".repeat(60)));
+        let (a, b) = (long("a"), long("b"));
+        assert_ne!(a, b, "two long names that share a prefix don't collide");
+        assert_eq!(a, long("a"), "stable");
+        let name = a.file_name().unwrap().to_str().unwrap();
+        assert_eq!(name.len(), "agent-".len() + AGENT_CLIENT_MAX + ".sock".len());
+        assert!(name.starts_with("agent-machine_hhh"), "{name}");
+    }
+
+    #[test]
+    fn agent_sockets_are_newest_first() {
+        let dir = std::env::temp_dir().join(format!("dsv-as-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let now = std::time::SystemTime::now();
+        for (name, age) in [("agent-old.sock", 20), ("agent-new.sock", 0), ("agent-mid.sock", 10), ("serve.sock", 0), ("agent-x.tmp", 0)] {
+            let f = std::fs::File::create(dir.join(name)).unwrap();
+            f.set_modified(now - Duration::from_secs(age)).unwrap();
+        }
+        let names: Vec<_> = agent_sockets(&dir).iter().map(|p| p.file_name().unwrap().to_owned()).collect();
+        assert_eq!(names, ["agent-new.sock", "agent-mid.sock", "agent-old.sock"]);
+        assert!(agent_sockets(&dir.join("missing")).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

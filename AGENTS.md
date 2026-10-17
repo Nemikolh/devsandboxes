@@ -25,7 +25,9 @@ Start with `docs/README.md` (reading order and map) and
   running instance | injection fallback) and hosts the foreground `port` CLI.
   `inbox.rs` is `devsandbox inbox …` (docs/reference/inbox-cli.md): reads from the
   store, mutations via a running daemon's API, else the same `wire::decide_*`
-  ops locally. `machine.rs` is `devsandbox machine add|ls|rm`
+  ops locally. `agent_relay.rs` is the hidden `agent-relay`, a machine's
+  end of its agent relay (socket + frame mux over stdio; machines.md
+  *Agent*). `machine.rs` is `devsandbox machine add|ls|rm`
   (docs/architecture/daemon/machines.md): a client of `machines.*` only (never in-process);
   `add`'s TTY multi-select of probed roots and the off-TTY one-candidate
   rule.
@@ -134,7 +136,9 @@ Start with `docs/README.md` (reading order and map) and
   verbs over an ssh each with ids rewritten, the federated `instances.resolve`
   / `sandboxes.list` joins as pure fns), `cli.rs` (the CLI side: `plan` where
   a command's name points, `--machine` uses, the ssh re-exec argv; pure, with
-  `route` doing the I/O). `snapshots.rs`'s `merge` builds the federated
+  `route` doing the I/O), `agent.rs` (this end of a machine's agent relay:
+  `serve` answers its `Open`s from the local agent while `allowed`).
+  `snapshots.rs`'s `merge` builds the federated
   snapshot (`instances.watch {machines: true}`).
 - `src/runtime/` — backend abstraction over docker/podman/Apple container.
   `procs.rs` parses a container's `ps` listing and its helper's `devsbd run

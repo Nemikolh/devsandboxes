@@ -30,8 +30,10 @@ pub mod notify;
 // Ports tab) reuses it (docs/architecture/daemon/forwards.md).
 #[cfg(unix)]
 pub mod forward;
+// Also carries a machine's agent relay (`serve::machines::agent`,
+// `commands::agent_relay`).
 #[cfg(unix)]
-mod mux;
+pub(crate) mod mux;
 // Partly helper-only (e.g. `Frame::encode` callers on the daemon side).
 #[allow(dead_code)]
 pub mod proto;
