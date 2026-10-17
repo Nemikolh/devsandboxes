@@ -2337,7 +2337,7 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
             Tab::Ports => {
                 "q quit · tab switch · ↑↓ select · d stop forward · : port … · ? help".to_string()
             }
-            Tab::Machines => "q quit · tab switch · ↑↓ select · : cmd · ? help".to_string(),
+            Tab::Machines => "q quit · tab switch · ↑↓ select · a agent on/off · : cmd · ? help".to_string(),
             Tab::Inbox => match app.inbox.focus {
                 InboxFocus::List => {
                     "q quit · tab switch · ↑↓ select · ←→ view · enter thread · r reply · d dismiss/done · u reopen · D clear notify · o vscode · t term · l logs · p forward · ? help"

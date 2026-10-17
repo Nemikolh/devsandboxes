@@ -93,6 +93,24 @@ impl App {
         self.pending_unport = Some(row.id);
     }
 
+    /// `a` (Machines tab): flip the selected machine's `agent`, queuing the
+    /// new value for the event loop to set through the daemon worker. The row
+    /// changes with the next snapshot push. No-op with no row selected.
+    pub(super) fn toggle_selected_agent(&mut self) {
+        let Some(m) = self.machines.get(self.selected()) else {
+            return;
+        };
+        let agent = !m.agent;
+        self.status = Some(format!("{}: agent {}…", m.name, if agent { "on" } else { "off" }));
+        self.pending_machine_set = Some((m.name.clone(), agent));
+    }
+
+    /// Take the pending `agent` change (machine name, new value) for the
+    /// event loop to send, if any.
+    pub fn take_pending_machine_set(&mut self) -> Option<(String, bool)> {
+        self.pending_machine_set.take()
+    }
+
     /// Take the pending forward request for the event loop to start, if any.
     pub fn take_pending_port(&mut self) -> Option<PortRequest> {
         self.pending_port.take()
@@ -272,6 +290,39 @@ mod tests {
         app.on_key(key(KeyCode::Char('d')));
         assert_eq!(app.take_pending_unport(), Some(1));
         assert_eq!(app.status.as_deref(), Some("stopping 127.0.0.1:3001"));
+    }
+
+    #[test]
+    fn a_on_machines_queues_the_flipped_agent() {
+        use crate::serve::snapshots::LinkState;
+        use crate::tui::remote::tests::sm;
+        let mut app = new_app();
+        let mut on = sm("b", LinkState::Unreachable);
+        on.agent = true;
+        app.set_machines(vec![sm("a", LinkState::Connected), on]);
+        // Another tab: nothing.
+        app.on_key(key(KeyCode::Char('a')));
+        assert_eq!(app.take_pending_machine_set(), None);
+
+        app.on_key(key(KeyCode::Char('5')));
+        app.on_key(key(KeyCode::Char('a')));
+        assert_eq!(app.take_pending_machine_set(), Some(("a".into(), true)));
+        assert_eq!(app.status.as_deref(), Some("a: agent on…"));
+        // Not applied ahead of the push.
+        assert!(!app.machines[0].agent);
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Char('a')));
+        assert_eq!(app.take_pending_machine_set(), Some(("b".into(), false)));
+        assert_eq!(app.status.as_deref(), Some("b: agent off…"));
+    }
+
+    #[test]
+    fn a_with_no_machine_row_queues_nothing() {
+        let mut app = new_app();
+        app.tab = Tab::Machines;
+        app.on_key(key(KeyCode::Char('a')));
+        assert_eq!(app.take_pending_machine_set(), None);
+        assert_eq!(app.status, None);
     }
 
     #[test]

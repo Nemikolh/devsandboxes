@@ -353,6 +353,10 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
         if let Some(id) = app.take_pending_unport() {
             daemon.forward_rm(id);
         }
+        // Machines tab: `a`'s `machines.set`; the row follows the next push.
+        if let Some((name, agent)) = app.take_pending_machine_set() {
+            daemon.machine_set(name, agent);
+        }
         while let Some(update) = daemon.try_recv() {
             match update {
                 daemon::DaemonUpdate::InboxChanged => reload_inbox = true,

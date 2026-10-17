@@ -209,6 +209,9 @@ pub struct App {
     /// Id of a forward the event loop should stop (the `d` shortcut on the Ports
     /// tab), through the daemon worker.
     pub pending_unport: Option<u64>,
+    /// A machine whose `agent` the event loop should set, and to what (the
+    /// `a` shortcut on the Machines tab), through the daemon worker.
+    pub pending_machine_set: Option<(String, bool)>,
     /// Container notifications shown on the Inbox tab (docs/architecture/dashboard/inbox-tab.md),
     /// as last loaded from the shared store (`crate::inbox::store`).
     pub inbox: InboxView,
@@ -319,6 +322,7 @@ impl App {
             ports: Vec::new(),
             pending_port: None,
             pending_unport: None,
+            pending_machine_set: None,
             inbox: InboxView::default(),
             pending_inbox: Vec::new(),
             pending_open: None,
@@ -594,6 +598,7 @@ impl App {
             }
             KeyCode::Char('p') if self.tab == Tab::Services => self.open_port_prompt_service(),
             KeyCode::Char('d') if self.tab == Tab::Ports => self.stop_selected_forward(),
+            KeyCode::Char('a') if self.tab == Tab::Machines => self.toggle_selected_agent(),
             KeyCode::Char('D') if self.tab == Tab::Inbox => self.clear_notifications(),
             KeyCode::Char('?') => self.open_help(),
             _ => {}

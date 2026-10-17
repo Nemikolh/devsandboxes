@@ -54,6 +54,7 @@ Ports tab
 
 Machines tab (listed while a machine is registered)
   ↑/k ↓/j     move selection
+  a           turn the selected machine's agent on/off
 
 Inbox tab (dispatcher threads + devsbd notify records)
   The list is on the left, the selected thread on the right; selecting a

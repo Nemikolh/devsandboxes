@@ -33,6 +33,11 @@
 //! `forwards.rm` ([`Cmd::ForwardAdd`], [`Cmd::ForwardRm`]). Disconnected, the
 //! tab has no rows and an add says the daemon is needed.
 //!
+//! Machines tab: `a` is `machines.set {name, agent}` ([`Cmd::MachineSet`]),
+//! answered by a status line; the row shows the new `agent` with the next
+//! snapshot push (the daemon's reload re-publishes). Disconnected, the
+//! line says it needs devsandbox serve.
+//!
 //! Builds: `d` on an in-flight row is `instances.cancel` ([`Cmd::Cancel`]),
 //! whoever started the build; the answer is a status line. The verbs
 //! themselves don't go through here: each holds its own connection until
@@ -127,6 +132,8 @@ enum Cmd {
     ForwardAdd(PortRequest),
     /// `forwards.rm`.
     ForwardRm(u64),
+    /// `machines.set`: machine `name`'s `agent`.
+    MachineSet { name: String, agent: bool },
     /// `instances.cancel` for `instance` (a state key).
     Cancel(String),
     /// A modal's read, and where its target is (a remote sandbox's root).
@@ -185,6 +192,12 @@ impl DaemonWorker {
     /// Ask the daemon to stop forward `id`. Never blocks.
     pub fn forward_rm(&self, id: u64) {
         self.send(Cmd::ForwardRm(id));
+    }
+
+    /// Ask the daemon to set machine `name`'s `agent`. Never blocks; the
+    /// outcome is a status line.
+    pub fn machine_set(&self, name: String, agent: bool) {
+        self.send(Cmd::MachineSet { name, agent });
     }
 
     /// Ask the daemon to cancel `instance`'s build. Never blocks; the
@@ -532,6 +545,16 @@ fn rm_call(id: u64) -> (&'static str, Value) {
     ("forwards.rm", json!({ "id": id }))
 }
 
+/// The API call for [`Cmd::MachineSet`].
+fn machine_set_call(name: &str, agent: bool) -> (&'static str, Value) {
+    ("machines.set", json!({ "name": name, "agent": agent }))
+}
+
+/// The status line for a `machines.set` that went through.
+fn machine_set_status(name: &str, agent: bool) -> String {
+    format!("{name}: agent {}", if agent { "on" } else { "off" })
+}
+
 /// `forwards.list`'s rows as the Ports tab's.
 fn port_rows(result: Value) -> Result<Vec<PortRow>> {
     let rows: Vec<ForwardRow> = serde_json::from_value(result)?;
@@ -670,6 +693,7 @@ fn run(dir: &Path, connector: &Connector, rx: Receiver<Cmd>, utx: Sender<DaemonU
             Ok(Cmd::Inbox(ops)) => w.apply(ops),
             Ok(Cmd::ForwardAdd(req)) => w.forward_add(&req),
             Ok(Cmd::ForwardRm(id)) => w.forward_rm(id),
+            Ok(Cmd::MachineSet { name, agent }) => w.machine_set(&name, agent),
             Ok(Cmd::Cancel(instance)) => w.cancel(&instance),
             Ok(Cmd::Fetch(fetch, route)) => w.fetch(fetch, &route),
             Ok(Cmd::BuildLog(id)) => w.build_log(id),
@@ -809,6 +833,23 @@ impl Worker<'_> {
                 (_, Some(e)) if e.code == "not-found" => {}
                 (_, Some(e)) => self.send(DaemonUpdate::Status(e.message)),
                 (result, None) => self.send(DaemonUpdate::Status(removed_status(&result.unwrap_or_default()))),
+            },
+            Err(_) => self.lost(false),
+        }
+    }
+
+    /// `machines.set`; the answer (or why there's none) is a status line.
+    /// No local fallback: the daemon owns the registry.
+    fn machine_set(&mut self, name: &str, agent: bool) {
+        let Some(conn) = self.conn.as_mut() else {
+            let line = needs_serve(&machine_set_status(name, agent), self.down.as_deref());
+            return self.send(DaemonUpdate::Status(line));
+        };
+        let (method, params) = machine_set_call(name, agent);
+        match conn.call(method, params) {
+            Ok(r) => match r.error {
+                Some(e) => self.send(DaemonUpdate::Status(e.message)),
+                None => self.send(DaemonUpdate::Status(machine_set_status(name, agent))),
             },
             Err(_) => self.lost(false),
         }
@@ -1039,6 +1080,16 @@ mod tests {
         let dir = Path::new("/cfg");
         assert_eq!(list_call(dir), ("forwards.list", json!({"dir": "/cfg", "machines": true})));
         assert_eq!(rm_call(4), ("forwards.rm", json!({"id": 4})));
+        worker.machine_set("box".into(), true);
+        assert_eq!(rx.try_recv().unwrap(), Cmd::MachineSet { name: "box".into(), agent: true });
+        assert_eq!(machine_set_call("box", true), ("machines.set", json!({"name": "box", "agent": true})));
+        assert_eq!(machine_set_call("box", false).1["agent"], json!(false));
+        assert_eq!(machine_set_status("box", true), "box: agent on");
+        assert_eq!(machine_set_status("box", false), "box: agent off");
+        assert_eq!(
+            needs_serve(&machine_set_status("box", true), Some("no socket")),
+            "box: agent on: needs devsandbox serve (no socket)"
+        );
         assert_eq!(
             add_call(dir, &port_req("web", None)),
             (

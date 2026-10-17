@@ -222,9 +222,10 @@ process's own `$SSH_AUTH_SOCK`, so the daemon's bridges and any command
 run there find it, and an exited relay drops out by the liveness check.
 
 Each machine's `agent` flag (`Entry::agent`, off by default) is set by
-`machine add --agent` or `machine set <name> --agent on|off`
-(`machines.add` / `machines.set`), listed by `machines.list` / `get`
-and the federated snapshot's `machines`, and marked `(agent)` in the
+`machine add --agent`, `machine set <name> --agent on|off` or `a` on the
+dashboard's Machines tab (`machines.add` / `machines.set`), listed by
+`machines.list` / `get` and the federated snapshot's `machines`, shown
+in the Machines tab's AGENT column, and marked `(agent)` in the
 dashboard's header note.
 
 The local daemon runs the relay: the machine's agent thread
@@ -323,7 +324,10 @@ unreachable: <why>` in the header (`pending_note`), the name as `box
 listed with the rest on the Ports tab: `forwards.list {machines: true}`);
 VS Code on a remote row answers "isn't supported yet". The Machines tab,
 listed while a machine is registered, shows every registered machine from
-the snapshot's `machines` with its link state (and error) and `agent`
+the snapshot's `machines` with its link state (and error) and `agent`;
+`a` flips the selected one's `agent` with `machines.set` (no prompt; a
+down machine's too, it's a registry write), and the row follows with the
+next push, which the reload triggers
 ([tabs-and-actions.md](../dashboard/tabs-and-actions.md) *Tabs*).
 
 Limitations: [status.md](../../status.md#daemon)

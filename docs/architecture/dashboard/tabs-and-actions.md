@@ -45,10 +45,15 @@ for Instances when the last machine goes. Each keeps its own selected row.
   ([../daemon/forwards.md](../daemon/forwards.md)).
 - **Inbox**: threads from the shared Inbox store
   ([inbox-tab.md](inbox-tab.md)).
-- **Machines**: one read-only row per registered machine, in the
-  snapshot's `machines` order (`SnapshotMachine`, `ui.rs`
-  `draw_machines`): NAME, TARGET, STATE (`LinkState::as_str`, with `:
-  <error>` when set), AGENT (`on`/`off`), VERSION (`-` before a link)
+- **Machines**: one row per registered machine, in the snapshot's
+  `machines` order (`SnapshotMachine`, `ui.rs` `draw_machines`): NAME,
+  TARGET, STATE (`LinkState::as_str`, with `: <error>` when set), AGENT
+  (`on`/`off`), VERSION (`-` before a link). `a` flips the selected
+  machine's `agent`: `App::toggle_selected_agent` queues it
+  (`take_pending_machine_set`), the event loop hands it to the daemon
+  worker (`Cmd::MachineSet`, `machines.set {name, agent}`), and the
+  answer is a status line; the row isn't touched, it shows the new value
+  with the next snapshot push
   ([../daemon/machines.md](../daemon/machines.md) *Dashboard*).
 
 The header's totals line marks the snapshot stale with why when the daemon
@@ -92,7 +97,8 @@ fills the modal if it is still the one open:
 
 `App` never sends anything. A key sets a pending field (`pending_action`,
 `pending_signal`, `pending_done`, `pending_fetch`, `pending_cancel`,
-`pending_port`/`pending_unport`, `pending_inbox`, `pending_open`), and the
+`pending_port`/`pending_unport`, `pending_machine_set`, `pending_inbox`,
+`pending_open`), and the
 event loop takes each once per pass and hands it to a thread.
 
 - `s`: stop a running instance, start an exited one; an exited drifted

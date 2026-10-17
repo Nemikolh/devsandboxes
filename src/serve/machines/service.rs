@@ -1073,6 +1073,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// `machines.set` flipping `agent` alone: the reload puts it in
+    /// `Remotes` (what the next federated snapshot carries) and fires
+    /// `changed` (which re-publishes), without restarting the link.
+    #[test]
+    fn an_agent_flip_reaches_remotes_and_fires_changed() {
+        let base = scratch("agent-flip");
+        let registry = base.join("machines.toml");
+        let entry = Entry { name: "m".into(), target: "m".into(), roots: vec![], command: None, agent: false };
+        crate::serve::machines::update(&registry, |e| e.push(entry)).unwrap();
+        let changed = Arc::new(AtomicUsize::new(0));
+        let hooks = {
+            let c = Arc::clone(&changed);
+            Hooks { watching: Box::new(|| false), changed: Box::new(move || _ = c.fetch_add(1, Ordering::SeqCst)) }
+        };
+        let no_dial: Dial = Arc::new(|_| anyhow::bail!("no link here"));
+        let no_agent: Dial = Arc::new(|_| anyhow::bail!("no agent relay here"));
+        let machines = Machines::spawn(registry.clone(), no_dial, no_agent, opts(1, 0).machine_timing, hooks, |_| {});
+        let h = machines.handle();
+        let before = changed.load(Ordering::SeqCst);
+        assert!(!h.remotes().get("m").unwrap().agent);
+        let ctl = Arc::clone(&h.inner.lock_links()["m"].ctl);
+
+        crate::serve::machines::update(&registry, |e| e[0].agent = true).unwrap();
+        h.reload();
+        assert!(h.remotes().get("m").unwrap().agent, "Remotes has the new agent");
+        assert_eq!(changed.load(Ordering::SeqCst), before + 1, "changed fired");
+        assert!(Arc::ptr_eq(&ctl, &h.inner.lock_links()["m"].ctl), "the same link");
+        assert!(ctl.agent_on(), "flipped on the live link");
+
+        crate::serve::machines::update(&registry, |e| e[0].agent = false).unwrap();
+        h.reload();
+        assert!(!h.remotes().get("m").unwrap().agent);
+        assert_eq!(changed.load(Ordering::SeqCst), before + 2);
+        drop(machines);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     // ---- the agent relay -----------------------------------------------------
 
     const CLIENT: &str = "machine:test";
