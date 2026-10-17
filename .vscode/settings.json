@@ -1,0 +1,4 @@
+{
+  // A markdown file under .zidane/ makes find-references hang (rust-lang/rust-analyzer bug).
+  "rust-analyzer.files.exclude": [".zidane"]
+}
