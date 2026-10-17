@@ -191,25 +191,24 @@ pub struct SandboxProperties {
     /// (docs/architecture/daemon/forwards.md, _Configured forwards (`forwardPorts`)_). Host-side only, so
     /// excluded from `config_hash`.
     pub forward_ports: Option<Vec<ForwardPort>>,
+    pub mounts: Option<Vec<Mount>>,
+    pub container_user: Option<String>,
+    pub remote_user: Option<String>,
+    pub init: Option<bool>,
 
-    // --- more devcontainer properties; all but `mounts`, `containerUser`,
-    // `remoteUser` and `init` are not implemented yet ([`Self::ignored`]) ---
+    // --- devcontainer properties not implemented yet ([`Self::ignored`]) ---
     pub name: Option<Value>,
     pub app_port: Option<Value>,
     pub ports_attributes: Option<Value>,
     pub other_ports_attributes: Option<Value>,
     pub run_args: Option<Value>,
-    pub mounts: Option<Vec<Mount>>,
     pub workspace_mount: Option<Value>,
     pub override_feature_install_order: Option<Value>,
-    pub container_user: Option<String>,
-    pub remote_user: Option<String>,
     #[serde(rename = "updateRemoteUserUID")]
     pub update_remote_user_uid: Option<Value>,
     pub user_env_probe: Option<Value>,
     pub override_command: Option<Value>,
     pub shutdown_action: Option<Value>,
-    pub init: Option<bool>,
     pub cap_add: Option<Value>,
     pub security_opt: Option<Value>,
     pub host_requirements: Option<Value>,
