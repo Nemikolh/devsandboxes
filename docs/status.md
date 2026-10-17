@@ -12,9 +12,7 @@ limitation means editing this file in the same commit.
 
 ## In progress
 
-- **daemon**: wake the host poll on `docker events` / `podman events`
-  instead of listing every 5 s while idle.
-  → [plan](plans/active/runtime-events.md)
+(none)
 
 ## Planned
 

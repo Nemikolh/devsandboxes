@@ -1,6 +1,7 @@
-# Runtime events: drive the host poll from `docker events`
+> Archived 2026-10-17. Historical, may be wrong; do not use as a reference.
+> Current: [architecture/daemon/host-poll.md](../../architecture/daemon/host-poll.md)
 
-Status: in progress
+# Runtime events: drive the host poll from `docker events`
 
 ## Problem
 
