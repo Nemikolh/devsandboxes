@@ -273,10 +273,8 @@ fn taken(name: &str) -> ApiError {
 }
 
 /// Dial `entry` and say hello: `failed` with ssh's or the hello's reason.
-/// The daemon's preferred host agent for `-A`, as the held links use.
 fn connect(entry: &Entry, ctx: &Ctx) -> Result<Link, ApiError> {
-    let agent = crate::devsbd::bridge::host_agent();
-    let duplex = (ctx.dial)(entry, agent.as_deref()).map_err(|e| ApiError::failed(format!("{}: {e:#}", entry.name)))?;
+    let duplex = (ctx.dial)(entry).map_err(|e| ApiError::failed(format!("{}: {e:#}", entry.name)))?;
     link::handshake(&entry.name, duplex, HANDSHAKE_TIMEOUT).map_err(|e| ApiError::failed(e.to_string()))
 }
 
@@ -342,8 +340,8 @@ mod tests {
         let mut o = opts(1, 1500);
         o.machines = Some(base.join("machines.toml"));
         o.dial = Some(match remote {
-            Some(remote) => Arc::new(move |_: &Entry, _: Option<&Path>| ssh::test_support::relayed(endpoint::connect(&remote)?)),
-            None => Arc::new(|e: &Entry, _: Option<&Path>| anyhow::bail!("ssh: Could not resolve hostname {}", e.target)),
+            Some(remote) => Arc::new(move |_: &Entry| ssh::test_support::relayed(endpoint::connect(&remote)?)),
+            None => Arc::new(|e: &Entry| anyhow::bail!("ssh: Could not resolve hostname {}", e.target)),
         });
         o
     }

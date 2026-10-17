@@ -71,6 +71,9 @@ pub const FANOUT_WAIT: Duration = Duration::from_secs(5);
 /// A forwarded verb's hello: ssh's connect and auth, the remote login
 /// shell, a lazy start of the remote daemon.
 const HANDSHAKE: Duration = Duration::from_secs(20);
+/// How long a forwarded verb to a machine with `agent` on waits for its
+/// agent relay before going without.
+const AGENT_WAIT: Duration = Duration::from_secs(5);
 /// How often a forwarded verb looks at its local client while the remote
 /// is silent.
 const TICK: Duration = Duration::from_millis(50);
@@ -263,6 +266,8 @@ pub struct VerbCtx<'a> {
     /// The registered machines (the links' entries).
     pub entries: Vec<Entry>,
     pub dial: &'a Dial,
+    /// The links: a verb holds its machine wanted ([`Handle::want`]).
+    pub links: &'a Handle,
     /// The forwarded verbs in flight: an idle holder each, while its ssh runs.
     pub held: &'a AtomicUsize,
     /// The connection, for log lines.
@@ -290,7 +295,13 @@ impl Drop for Holding<'_> {
 /// `machine`): a fresh dial and hello, then the request minus `machine`,
 /// its notifications relayed to `peer` under local request id `id`. The
 /// remote relay swaps `env` for its login env, so only the agent is
-/// taken from it here, for `ssh -A`.
+/// taken from it here: reported to this daemon (`bridge::report_agent`),
+/// whose agent relays serve from `bridge::host_agent`.
+///
+/// The machine is held wanted for the verb's run, so its link and, with
+/// `agent` on, its agent relay are up; with `agent` on the request waits
+/// up to [`AGENT_WAIT`] for the relay (a `run` that clones over ssh
+/// there would race it), and goes anyway, logged, if it isn't up by then.
 ///
 /// `None`: the local client hung up, or this daemon drains. Either way the
 /// connection to the machine is cut, which the remote daemon takes as its
@@ -306,12 +317,19 @@ pub fn verb(id: Option<u64>, method: &str, params: Value, machine: &str, ctx: &V
     let Some(entry) = ctx.entries.iter().find(|e| e.name == machine) else {
         return Some(Response::err(id, "not-found", format!("no machine named `{machine}`")));
     };
-    let agent = match check_verb_params(&params) {
-        Ok(agent) => agent.or_else(crate::devsbd::bridge::host_agent),
+    match check_verb_params(&params) {
+        Ok(Some(agent)) => crate::devsbd::bridge::report_agent(agent),
+        Ok(None) => {}
         Err(e) => return Some(Response::err(id, e.code, e.message)),
-    };
+    }
     let _holding = Holding::new(ctx.held);
-    let duplex = match (ctx.dial)(entry, agent.as_deref()) {
+    let want = ctx.links.want(machine);
+    if entry.agent && let Some(want) = &want {
+        if !want.agent_ready(AGENT_WAIT) {
+            (ctx.log)(&format!("{}: {method} on {machine}: its agent relay isn't up; going without", ctx.who));
+        }
+    }
+    let duplex = match (ctx.dial)(entry) {
         Ok(duplex) => duplex,
         Err(e) => return failed(format!("{machine}: {e:#}")),
     };
@@ -354,7 +372,7 @@ pub fn verb(id: Option<u64>, method: &str, params: Value, machine: &str, ctx: &V
 /// What a forwarded verb checks itself: `env` an object, `root` an absolute
 /// path (a path on the machine: whether it exists only the machine can
 /// tell, so `verbs::parse` isn't run here). The env's `SSH_AUTH_SOCK`, when
-/// it's an absolute path, is the agent for `-A`.
+/// it's an absolute path, is the requester's agent.
 fn check_verb_params(params: &Value) -> Result<Option<PathBuf>, ApiError> {
     let Some(env) = params.get("env").and_then(Value::as_object) else {
         return Err(ApiError::invalid("bad params: `env` must be an object"));
@@ -510,7 +528,7 @@ mod tests {
             local.machines = Some(registry);
             local.dial = Some({
                 let remote_dir = remote_dir.clone();
-                Arc::new(move |e: &Entry, _: Option<&Path>| match e.name.as_str() {
+                Arc::new(move |e: &Entry| match e.name.as_str() {
                     "box" => ssh::test_support::relayed(endpoint::connect(&remote_dir)?),
                     other => anyhow::bail!("ssh: Could not resolve hostname {other}"),
                 })
@@ -725,6 +743,44 @@ mod tests {
         drop((reader, stream));
         assert!(wait_file(&root.join("done-slow-b"), Duration::from_secs(5)), "the verb didn't finish");
         assert!(!root.join("int-slow-b").exists(), "SIGINTed");
+        pair.finish();
+    }
+
+    fn box_state(c: &mut Conn) -> String {
+        let rows = c.call("machines.list", Value::Null).unwrap().result.unwrap();
+        let row = rows.as_array().unwrap().iter().find(|r| r["name"] == "box").unwrap().clone();
+        row["state"].as_str().unwrap().to_string()
+    }
+
+    /// A verb holds its machine wanted while it runs (the link comes up with
+    /// no watcher), and reports the requester's agent to this daemon.
+    #[test]
+    fn a_forwarded_verb_holds_its_machine_and_reports_the_agent() {
+        let mut pair = Pair::new("fwd-want", SCRIPT);
+        let root = pair.verb_dir.clone();
+        assert_eq!(box_state(&mut pair.local), "idle");
+        let agent = std::env::temp_dir().join(format!("dsv-fwd-agent-{}.sock", std::process::id()));
+        let stream = stream_at(&pair.local_dir());
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut params = verb_params(&root, json!({"instance": "slow-w"}));
+        params["env"]["SSH_AUTH_SOCK"] = json!(agent);
+        send(&stream, 1, "stop", params);
+        until_ready(&mut reader);
+        assert!(crate::devsbd::bridge::reported_agents().contains(&agent), "the requester's agent reported");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while box_state(&mut pair.local) != "connected" {
+            assert!(Instant::now() < deadline, "the held machine's link never came up");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let (a, _) = answer(&mut reader, 1);
+        assert!(a["error"].is_null(), "{a}");
+        // Released: idle again after the linger.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while box_state(&mut pair.local) != "idle" {
+            assert!(Instant::now() < deadline, "the link outlived the verb");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        drop((reader, stream));
         pair.finish();
     }
 }

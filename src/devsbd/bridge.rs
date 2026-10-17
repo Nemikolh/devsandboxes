@@ -187,6 +187,12 @@ pub fn report_agent(path: PathBuf) {
     AGENTS.lock().unwrap_or_else(|e| e.into_inner()).report(path);
 }
 
+/// What [`report_agent`] recorded, most recent first.
+#[cfg(test)]
+pub fn reported_agents() -> Vec<PathBuf> {
+    AGENTS.lock().unwrap_or_else(|e| e.into_inner()).recent.clone()
+}
+
 /// This process's own `$SSH_AUTH_SOCK`, unchecked: what a client reports to
 /// the daemon.
 pub fn own_agent() -> Option<PathBuf> {
@@ -204,7 +210,7 @@ fn agent_live(path: &Path) -> bool {
 /// socket in the socket dir (newest first; a missing or unreadable dir has
 /// none), else `$SSH_AUTH_SOCK` when live (see [`AgentCandidates::pick`]).
 /// Also gates whether a bridge is worth spawning (`has_host_agent`). The
-/// daemon's machine links forward it too (`ssh -A`).
+/// daemon's machine agent relays serve it too (`machines::agent::serve`).
 pub fn host_agent() -> Option<PathBuf> {
     let candidates = AGENTS.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let relays = crate::serve::endpoint::socket_dir()

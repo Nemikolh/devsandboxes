@@ -124,14 +124,16 @@ pub fn remote_command(command: &str, args: &[impl AsRef<str>]) -> String {
     format!("exec \"$SHELL\" -lc {}", quote(&cmd))
 }
 
-/// The argv of `entry`'s API connection: `ssh -T -A -o BatchMode=yes [-p N]
+/// The argv of `entry`'s API connection: `ssh -T -o BatchMode=yes [-p N]
 /// -- <host> <devsandbox api --stdio --client <client> --session-env>`.
 /// `BatchMode`: whoever runs it (the daemon) has no TTY, so ssh fails rather
 /// than prompting. `--session-env`: the remote relay swaps each verb's
-/// `env` for its own login env.
+/// `env` for its own login env, with `SSH_AUTH_SOCK` pointed at `client`'s
+/// agent relay socket while one is up. No `-A`: the agent travels over the
+/// agent relay ([`agent_argv`]), only for a machine with `agent` on.
 pub fn api_argv(entry: &Entry, client: &str) -> Result<Vec<OsString>> {
     let args = ["api", "--stdio", "--client", client, "--session-env"];
-    argv(entry, &["-T", "-A", "-o", "BatchMode=yes"], &args)
+    argv(entry, &["-T", "-o", "BatchMode=yes"], &args)
 }
 
 /// The argv of an interactive command on `entry` (a terminal tab, a CLI
@@ -183,7 +185,6 @@ pub fn tunnel_argv(
 /// *Agent*): `ssh -T -o BatchMode=yes [-p N] -- <host> <devsandbox
 /// agent-relay --client <client>>`. No `-A`: the agent travels inside the
 /// relay's own streams.
-#[allow(dead_code)] // `service` doesn't run the relay yet
 pub fn agent_argv(entry: &Entry, client: &str) -> Result<Vec<OsString>> {
     argv(entry, &["-T", "-o", "BatchMode=yes"], &["agent-relay", "--client", client])
 }
@@ -204,16 +205,23 @@ fn argv_with(entry: &Entry, opts: &[&str], program: &str, remote_args: &[impl As
     Ok(argv)
 }
 
-/// Opens a connection to a machine's daemon: production spawns ssh
-/// ([`ssh_dial`]), tests connect to a test daemon's socket. `agent` is the
-/// `SSH_AUTH_SOCK` for `-A`: a verb's requester's, or the daemon's
-/// preferred one for its held link; `None` leaves ssh this process's.
-pub type Dial = Arc<dyn Fn(&Entry, Option<&Path>) -> Result<Duplex> + Send + Sync>;
+/// Opens a connection to a machine: production spawns ssh ([`ssh_dial`] to
+/// its daemon, [`ssh_agent_dial`] for its agent relay), tests connect to a
+/// test daemon's socket or run the relay's far end in-process.
+pub type Dial = Arc<dyn Fn(&Entry) -> Result<Duplex> + Send + Sync>;
 
-/// The production [`Dial`]: [`spawn`] of [`api_argv`], saying `client` to
-/// the remote relay (its `serve.log`).
+/// The production [`Dial`] to a machine's daemon: [`spawn`] of
+/// [`api_argv`], saying `client` to the remote relay (its `serve.log`, and
+/// which agent relay socket its verbs get).
 pub fn ssh_dial(client: String) -> Dial {
-    Arc::new(move |entry: &Entry, agent: Option<&Path>| spawn(&api_argv(entry, &client)?, agent))
+    Arc::new(move |entry: &Entry| spawn(&api_argv(entry, &client)?))
+}
+
+/// The production [`Dial`] of a machine's agent relay: [`spawn`] of
+/// [`agent_argv`], with the same `client` as [`ssh_dial`]'s so the remote
+/// API relay finds this relay's socket.
+pub fn ssh_agent_dial(client: String) -> Dial {
+    Arc::new(move |entry: &Entry| spawn(&agent_argv(entry, &client)?))
 }
 
 /// A connection to a peer daemon: a socket to read and write lines on, and
@@ -319,16 +327,13 @@ impl Tail {
 }
 
 /// Spawn `argv` (an ssh) as a [`Duplex`]: stdin and stdout pumped to a
-/// socket pair, stderr kept in a [`Tail`]. `SSH_AUTH_SOCK` is `agent` when
-/// given. The child's stdout EOF reaches the socket as EOF; the socket's
-/// EOF (the [`Duplex`] dropped or shut) closes the child's stdin.
-pub fn spawn(argv: &[OsString], agent: Option<&Path>) -> Result<Duplex> {
+/// socket pair, stderr kept in a [`Tail`]. The child's stdout EOF reaches
+/// the socket as EOF; the socket's EOF (the [`Duplex`] dropped or shut)
+/// closes the child's stdin.
+pub fn spawn(argv: &[OsString]) -> Result<Duplex> {
     let (program, args) = argv.split_first().context("empty ssh argv")?;
     let mut cmd = Command::new(program);
     cmd.args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    if let Some(agent) = agent {
-        cmd.env("SSH_AUTH_SOCK", agent);
-    }
     let mut child = cmd.spawn().with_context(|| format!("cannot run {}", program.to_string_lossy()))?;
     let peer_of = |child| Peer { child: Some(child), stderr: None };
     let (Some(mut stdin), Some(mut stdout), Some(stderr)) = (child.stdin.take(), child.stdout.take(), child.stderr.take())
@@ -516,7 +521,8 @@ mod tests {
     fn api_and_tty_argvs() {
         let api = api_argv(&entry("ssh://me@box:2200", None), "machine:laptop").unwrap();
         let remote = remote_command("devsandbox", &["api", "--stdio", "--client", "machine:laptop", "--session-env"]);
-        assert_eq!(strs(&api), ["ssh", "-T", "-A", "-o", "BatchMode=yes", "-p", "2200", "--", "me@box", remote.as_str()]);
+        assert_eq!(strs(&api), ["ssh", "-T", "-o", "BatchMode=yes", "-p", "2200", "--", "me@box", remote.as_str()]);
+        assert!(!strs(&api).contains(&"-A"), "the agent goes over the agent relay");
 
         let e = entry("box", Some("~/bin/devsandbox"));
         let tty = tty_argv(&e, &["exec", "web", "-C", "/srv/it's here"]).unwrap();
@@ -591,11 +597,11 @@ mod tests {
 
     #[test]
     fn spawned_pipes_reach_the_socket_and_stderr_is_kept() {
-        let argv: Vec<OsString> = ["sh", "-c", "echo \"agent=$SSH_AUTH_SOCK\" >&2; read l; echo \"got $l\"; exec cat"]
+        let argv: Vec<OsString> = ["sh", "-c", "echo to-stderr >&2; read l; echo \"got $l\"; exec cat"]
             .into_iter()
             .map(Into::into)
             .collect();
-        let mut duplex = spawn(&argv, Some(Path::new("/tmp/agent.sock"))).unwrap();
+        let mut duplex = spawn(&argv).unwrap();
         duplex.stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let mut reader = BufReader::new(duplex.stream.try_clone().unwrap());
         duplex.stream.write_all(b"one\ntwo\n").unwrap();
@@ -609,7 +615,7 @@ mod tests {
         duplex.stream.shutdown(Shutdown::Write).unwrap();
         line.clear();
         assert_eq!(reader.read_line(&mut line).unwrap(), 0);
-        assert_eq!(duplex.peer.stderr_tail(Duration::from_secs(5)), "agent=/tmp/agent.sock");
+        assert_eq!(duplex.peer.stderr_tail(Duration::from_secs(5)), "to-stderr");
         duplex.peer.close();
         duplex.peer.close();
     }
@@ -621,7 +627,7 @@ mod tests {
                 .into_iter()
                 .map(Into::into)
                 .collect();
-        let mut duplex = spawn(&argv, None).unwrap();
+        let mut duplex = spawn(&argv).unwrap();
         let started = Instant::now();
         // Still running: the wait runs out; what's there by then is kept.
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -639,8 +645,8 @@ mod tests {
 
     #[test]
     fn a_missing_program_is_an_error() {
-        let err = spawn(&["/nonexistent/ssh".into()], None).err().unwrap();
+        let err = spawn(&["/nonexistent/ssh".into()]).err().unwrap();
         assert!(format!("{err:#}").contains("cannot run /nonexistent/ssh"), "{err:#}");
-        assert!(spawn(&[], None).is_err());
+        assert!(spawn(&[]).is_err());
     }
 }

@@ -122,6 +122,9 @@ pub struct Options {
     /// How `machines.*` and the machine links reach a machine; `None` is ssh
     /// ([`ssh::ssh_dial`]). Tests dial another test daemon's socket.
     pub dial: Option<Dial>,
+    /// How a machine's agent relay is spawned; `None` is ssh
+    /// ([`ssh::ssh_agent_dial`]). Tests run its far end in-process.
+    pub agent_dial: Option<Dial>,
     /// The machine links' linger, backoff and timeouts; short in tests.
     pub machine_timing: service::Timing,
 }
@@ -140,6 +143,7 @@ impl Options {
             home: None,
             machines: None,
             dial: None,
+            agent_dial: None,
             machine_timing: service::Timing::default(),
         }
     }
@@ -220,6 +224,7 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
         None => machines::path()?,
     };
     let dial = opts.dial.clone().unwrap_or_else(|| ssh::ssh_dial(link::client_name()));
+    let agent_dial = opts.agent_dial.clone().unwrap_or_else(|| ssh::ssh_agent_dial(link::client_name()));
     // Whenever the daemon runs, host side or not: a link dials only when
     // wanted, so with no machine watcher (every test but the links') it's
     // threads waiting on their channels. The hooks reach `shared` once it
@@ -236,7 +241,7 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
             }),
         }
     };
-    let links = service::Machines::spawn(registry_path.clone(), dial.clone(), opts.machine_timing, hooks, log);
+    let links = service::Machines::spawn(registry_path.clone(), dial.clone(), agent_dial, opts.machine_timing, hooks, log);
     let forwards_machines = registry_path.clone();
     shared.machines = Some(machines::api::Ctx {
         registry: registry_path,
@@ -1016,7 +1021,7 @@ fn remote_verb(id: Option<u64>, method: &str, params: Value, machine: &str, shar
         return Some(Response::err(id, "not-found", format!("no machine named `{machine}`")));
     };
     let label = conn.label();
-    let vctx = fwd::VerbCtx { entries: links.entries(), dial: &ctx.dial, held: &shared.remote_verbs, who: &label, log };
+    let vctx = fwd::VerbCtx { entries: links.entries(), dial: &ctx.dial, links, held: &shared.remote_verbs, who: &label, log };
     let peer = ConnPeer { out: &conn.out, shared };
     fwd::verb(id, method, params, machine, &vctx, &peer)
 }
@@ -1245,8 +1250,11 @@ pub(crate) mod tests {
             // Never the user's home, registry or ssh.
             home: Some(std::env::temp_dir().join(format!("dsv-home-{}", std::process::id()))),
             machines: Some(std::env::temp_dir().join(format!("dsv-machines-{}", std::process::id())).join("machines.toml")),
-            dial: Some(Arc::new(|e: &machines::Entry, _: Option<&Path>| {
+            dial: Some(Arc::new(|e: &machines::Entry| {
                 anyhow::bail!("a test daemon has no dial (machine {}): set Options.dial", e.name)
+            })),
+            agent_dial: Some(Arc::new(|e: &machines::Entry| {
+                anyhow::bail!("a test daemon has no agent dial (machine {}): set Options.agent_dial", e.name)
             })),
             machine_timing: service::Timing {
                 linger: Duration::from_millis(400),

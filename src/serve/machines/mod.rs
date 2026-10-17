@@ -29,8 +29,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-// Tested end to end with `commands::agent_relay`; `service` doesn't run it yet.
-#[allow(dead_code)]
 pub mod agent;
 pub mod api;
 pub mod cli;

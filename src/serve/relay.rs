@@ -12,7 +12,9 @@
 //! *ssh*), for a relay a machine link runs over ssh: there the upstream copy
 //! goes line by line and a verb request's `params.env` becomes the relay's
 //! own, the remote login shell's env, since the requester's (another host's)
-//! means nothing here.
+//! means nothing here; its `SSH_AUTH_SOCK` is the linking host's agent
+//! relay socket (`endpoint::agent_socket` for `--client`) when that accepts
+//! a connection at the time of the line.
 //! Every other line, and every byte downstream, still passes as is, after
 //! one line of the relay's own ([`write_sentinel`]) so the link can tell the
 //! relay's bytes from whatever the login shell printed first.
@@ -74,12 +76,19 @@ impl End {
 /// `devsandbox api --stdio`: lazy-start the daemon, then relay until one side
 /// ends. Returns the exit code. `client` names the relay's own probe hello
 /// (`serve.log`); the client's hello goes through the relay untouched.
-/// `session_env`: verbs get this process's env (see the module doc).
+/// `session_env`: verbs get this process's env, with `client`'s agent relay
+/// as their agent while it's up (see the module doc).
 pub fn stdio(client: &str, session_env: bool) -> Result<i32> {
     let dir = endpoint::socket_dir()?;
     let stream = open(&dir, || client::connect(&dir, client))?;
     write_sentinel(&mut std::io::stdout(), session_env).context("cannot write to stdout")?;
-    let env = session_env.then(|| super::verbs_client::caller_env(std::env::vars_os()));
+    let env = session_env.then(|| {
+        let socket = endpoint::agent_socket(&dir, client);
+        let probe = move || {
+            std::os::unix::net::UnixStream::connect(&socket).ok().map(|_| socket.to_string_lossy().into_owned())
+        };
+        SessionEnv::new(super::verbs_client::caller_env(std::env::vars_os()), Box::new(probe))
+    });
     Ok(pump(std::io::stdin(), std::io::stdout(), stream, GRACE, env)?.code())
 }
 
@@ -116,9 +125,8 @@ enum Event {
 /// After `input`'s EOF the socket's write half is shut, so the daemon answers
 /// what it has and hangs up; that's waited for up to `grace`. The `input`
 /// thread may stay blocked in a read: the caller exits the process.
-/// `session_env`: upstream verb requests get it as their `env`
-/// ([`SessionEnv`]).
-pub fn pump<R, W>(input: R, output: W, daemon: Stream, grace: Duration, session_env: Option<BTreeMap<String, String>>) -> Result<End>
+/// `session_env`: upstream verb requests go through it.
+pub fn pump<R, W>(input: R, output: W, daemon: Stream, grace: Duration, session_env: Option<SessionEnv>) -> Result<End>
 where
     R: Read + Send + 'static,
     W: Write + Send + 'static,
@@ -131,7 +139,7 @@ where
         .spawn(move || {
             let r = match session_env {
                 None => copy(input, &to_daemon),
-                Some(env) => copy_rewriting(input, &to_daemon, SessionEnv::new(env)),
+                Some(rewrite) => copy_rewriting(input, &to_daemon, rewrite),
             };
             let eof = r.is_ok();
             // Report before half-closing: once shut, the daemon may answer and
@@ -200,22 +208,25 @@ fn copy_rewriting(mut input: impl Read, mut to: &Stream, mut rewrite: SessionEnv
 
 /// The upstream rewrite of `--session-env`, pure over byte chunks: each
 /// complete line that is a verb request (`verbs::is_verb`) has its
-/// `params.env` replaced by `env` and is re-serialized; every other line
+/// `params.env` replaced by `env` and is re-serialized, `SSH_AUTH_SOCK` set
+/// to what `agent` answers for that line (the agent relay socket when it's
+/// up; `None` leaves `env`'s own); every other line
 /// (a non-verb, one that doesn't parse) is passed through byte for byte. A
 /// partial line is held until its newline, or the end, where it goes out as
 /// is. A line over [`proto::MAX_LINE`] isn't held: it goes through as it
 /// comes, unmodified, and the daemon refuses it as it would without the
 /// relay (so a held line never grows past that).
-pub(crate) struct SessionEnv {
+pub struct SessionEnv {
     env: Value,
+    agent: Box<dyn Fn() -> Option<String> + Send>,
     held: Vec<u8>,
     /// Inside an overlong line: pass bytes through until its newline.
     passing: bool,
 }
 
 impl SessionEnv {
-    pub(crate) fn new(env: BTreeMap<String, String>) -> Self {
-        Self { env: serde_json::to_value(env).unwrap_or_default(), held: Vec::new(), passing: false }
+    pub fn new(env: BTreeMap<String, String>, agent: Box<dyn Fn() -> Option<String> + Send>) -> Self {
+        Self { env: serde_json::to_value(env).unwrap_or_default(), agent, held: Vec::new(), passing: false }
     }
 
     /// `chunk` in, what can go out appended to `out`.
@@ -266,7 +277,12 @@ impl SessionEnv {
             return None;
         }
         let params = request.as_object_mut()?.entry("params").or_insert_with(|| Value::Object(Default::default()));
-        params.as_object_mut()?.insert("env".into(), self.env.clone());
+        let params = params.as_object_mut()?;
+        let mut env = self.env.clone();
+        if let (Some(agent), Some(vars)) = ((self.agent)(), env.as_object_mut()) {
+            vars.insert("SSH_AUTH_SOCK".into(), Value::String(agent));
+        }
+        params.insert("env".into(), env);
         serde_json::to_vec(&request).ok()
     }
 }
@@ -385,7 +401,7 @@ mod tests {
     }
 
     fn session_env() -> SessionEnv {
-        SessionEnv::new(BTreeMap::from([("PATH".to_string(), "/remote/bin".to_string())]))
+        SessionEnv::new(BTreeMap::from([("PATH".to_string(), "/remote/bin".to_string())]), Box::new(|| None))
     }
 
     fn fed(rw: &mut SessionEnv, chunk: &[u8]) -> Vec<u8> {
@@ -418,6 +434,29 @@ mod tests {
         }
     }
 
+    /// The agent relay's socket while it's up, checked per line; else the
+    /// login env's own `SSH_AUTH_SOCK` stays.
+    #[test]
+    fn session_env_points_verbs_at_a_live_agent_relay() {
+        let up = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let probe = {
+            let up = std::sync::Arc::clone(&up);
+            move || up.load(std::sync::atomic::Ordering::SeqCst).then(|| "/run/agent-machine_lap.sock".to_string())
+        };
+        let env = BTreeMap::from([("SSH_AUTH_SOCK".to_string(), "/tmp/own-agent".to_string())]);
+        let mut rw = SessionEnv::new(env, Box::new(probe));
+        let verb = b"{\"id\":1,\"method\":\"run\",\"params\":{\"env\":{\"SSH_AUTH_SOCK\":\"/local/agent\"}}}\n";
+        let v: Value = serde_json::from_slice(&fed(&mut rw, verb)).unwrap();
+        assert_eq!(v["params"]["env"], json!({"SSH_AUTH_SOCK": "/run/agent-machine_lap.sock"}));
+        up.store(false, std::sync::atomic::Ordering::SeqCst);
+        let v: Value = serde_json::from_slice(&fed(&mut rw, verb)).unwrap();
+        assert_eq!(v["params"]["env"], json!({"SSH_AUTH_SOCK": "/tmp/own-agent"}), "the login env's, not removed");
+        // Other lines pass as is.
+        up.store(true, std::sync::atomic::Ordering::SeqCst);
+        let other = b"{\"id\":2,\"method\":\"hello\",\"params\":{\"env\":{}}}\n";
+        assert_eq!(fed(&mut rw, other), other);
+    }
+
     #[test]
     fn session_env_holds_a_partial_line_until_its_newline() {
         let mut rw = session_env();
@@ -447,7 +486,7 @@ mod tests {
         let (relay_end, daemon) = UnixStream::pair().unwrap();
         daemon.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         stdout_r.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        let env = BTreeMap::from([("HOME".to_string(), "/home/remote".to_string())]);
+        let env = SessionEnv::new(BTreeMap::from([("HOME".to_string(), "/home/remote".to_string())]), Box::new(|| None));
         let relay = std::thread::spawn(move || pump(stdin_r, stdout_w, relay_end, Duration::from_secs(2), Some(env)));
         let mut from_relay = BufReader::new(daemon.try_clone().unwrap());
         stdin.write_all(b"{\"id\":0,\"method\":\"hello\"}\n{\"id\":1,\"method\":\"rm\",\"params\":{\"env\":{}}}\n").unwrap();

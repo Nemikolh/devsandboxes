@@ -4,8 +4,9 @@
 //! life.
 //!
 //! A link connects only while wanted: while some local connection
-//! watches with `machines: true` ([`Hooks::watching`]), or a forwarded call
-//! is queued, and for [`Timing::linger`] after. Connected, it subscribes to
+//! watches with `machines: true` ([`Hooks::watching`]), a forwarded call
+//! is queued, or a [`Want`] holds the machine (a forwarded verb), and for
+//! [`Timing::linger`] after. Connected, it subscribes to
 //! `instances`, watches each of the machine's roots while a local watcher
 //! wants machines, and stores every pushed `instances.snapshot` in the
 //! shared [`Remotes`] ([`Hooks::changed`] then re-publishes). A failed
@@ -16,25 +17,34 @@
 //! per machine, each with [`Timing::call`] to answer. A timed-out call drops
 //! the link: its answer would come out of turn for the next call.
 //!
+//! A machine with `agent` on also gets a `serve-machine-<name>-agent`
+//! thread: while the machine is wanted (the same want, linger included) it
+//! runs the agent relay (`ssh::agent_argv` through the agent [`Dial`],
+//! served by `agent::serve`), retried with the link's backoff. `reload`
+//! flips `agent` on the live link (no reconnect); off kills the relay at
+//! once, as does the want ending (within a tick) or a stop.
+//!
 //! Nothing here blocks a connection or the daemon's locks on the network:
 //! the link thread does all the I/O, a caller only waits for its reply. A
-//! stop (`machines.rm`, daemon exit) shuts the link's socket down, so even a
-//! handshake in progress ends at once, and joins the thread.
+//! stop (`machines.rm`, daemon exit) shuts the link's socket and the
+//! relay's down, so even a handshake in progress ends at once, and joins
+//! both threads.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::net::Shutdown;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
 use super::Entry;
+use super::agent;
 use super::link::{self, Link};
-use super::ssh::Dial;
+use super::ssh::{Dial, Duplex, Peer};
 use crate::serve::api::ApiError;
 use crate::serve::endpoint::Stream;
 use crate::serve::proto::Response;
@@ -97,44 +107,143 @@ struct Inner {
     /// `machines.toml`.
     registry: PathBuf,
     dial: Dial,
+    /// Spawns a machine's agent relay (`ssh::ssh_agent_dial` in production).
+    agent_dial: Dial,
     timing: Timing,
     hooks: Hooks,
     log: fn(&str),
     remotes: Arc<Remotes>,
     links: Mutex<BTreeMap<String, LinkThread>>,
+    /// [`Want`]s per machine name. By name, not per link: a hold outlives a
+    /// link restarted by a registry change.
+    holds: Mutex<BTreeMap<String, usize>>,
     stopped: AtomicBool,
 }
 
-/// One machine's thread, as the service holds it.
+/// One machine's threads, as the service holds them.
 struct LinkThread {
     entry: Entry,
     tx: Sender<Cmd>,
     ctl: Arc<Ctl>,
     thread: Option<JoinHandle<()>>,
+    agent: Option<JoinHandle<()>>,
 }
 
-/// How the service stops a link thread wherever it is blocked.
+/// What a machine's link and agent threads share with the service: how it
+/// stops them wherever they are blocked, the live `agent` flag, the want.
 #[derive(Default)]
 struct Ctl {
     stop: AtomicBool,
     /// The connection's socket while one is open, to shut it down.
     stream: Mutex<Option<Stream>>,
+    /// The entry's `agent`, as of the last reload.
+    agent: AtomicBool,
+    /// The last moment the machine was wanted; both threads stamp it
+    /// ([`Inner::wanted`]).
+    last_want: Mutex<Option<Instant>>,
+    relay: Mutex<Relay>,
+    /// Wakes the agent thread and [`Want::agent_ready`] waiters.
+    relay_cv: Condvar,
+}
+
+/// The agent relay while one runs.
+#[derive(Default)]
+struct Relay {
+    /// Its handshake is through: the far end's socket is bound.
+    ready: bool,
+    /// Its socket (to shut down) and ssh (to kill): [`Ctl::kill_relay`].
+    kill: Option<(Stream, Peer)>,
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 impl Ctl {
+    fn new(entry: &Entry) -> Self {
+        let ctl = Ctl::default();
+        ctl.agent.store(entry.agent, Ordering::SeqCst);
+        ctl
+    }
+
     fn stopped(&self) -> bool {
         self.stop.load(Ordering::SeqCst)
     }
 
     fn cut(&self) {
         self.stop.store(true, Ordering::SeqCst);
-        if let Some(s) = self.stream.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        if let Some(s) = lock(&self.stream).as_ref() {
             let _ = s.shutdown(Shutdown::Both);
         }
+        self.kill_relay();
     }
 
     fn hold(&self, stream: Option<Stream>) {
-        *self.stream.lock().unwrap_or_else(|e| e.into_inner()) = stream;
+        *lock(&self.stream) = stream;
+    }
+
+    fn agent_on(&self) -> bool {
+        self.agent.load(Ordering::SeqCst)
+    }
+
+    /// `reload` flipped `agent`: off kills the relay now.
+    fn set_agent(&self, on: bool) {
+        self.agent.store(on, Ordering::SeqCst);
+        if on { self.wake_agent() } else { self.kill_relay() }
+    }
+
+    fn touch(&self) {
+        *lock(&self.last_want) = Some(Instant::now());
+    }
+
+    /// End the running relay, if any: its socket shut (so `agent::serve`
+    /// returns), its ssh killed.
+    fn kill_relay(&self) {
+        let taken = {
+            let mut r = lock(&self.relay);
+            r.ready = false;
+            r.kill.take()
+        };
+        if let Some((stream, mut peer)) = taken {
+            let _ = stream.shutdown(Shutdown::Both);
+            peer.close();
+        }
+        self.relay_cv.notify_all();
+    }
+
+    /// The relay's handshake is through (unless it was killed meanwhile).
+    fn set_ready(&self) {
+        let mut r = lock(&self.relay);
+        r.ready = r.kill.is_some();
+        self.relay_cv.notify_all();
+    }
+
+    fn wake_agent(&self) {
+        let _r = lock(&self.relay);
+        self.relay_cv.notify_all();
+    }
+
+    /// Sleep up to `wait`, or until woken.
+    fn wait_agent(&self, wait: Duration) {
+        let r = lock(&self.relay);
+        let _ = self.relay_cv.wait_timeout(r, wait);
+    }
+
+    /// Wait up to `wait` for the relay's handshake; `false` at once while
+    /// `agent` is off.
+    fn wait_ready(&self, wait: Duration) -> bool {
+        let deadline = Instant::now() + wait;
+        let mut r = lock(&self.relay);
+        loop {
+            if r.ready {
+                return true;
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if !self.agent_on() || self.stopped() || left.is_zero() {
+                return false;
+            }
+            r = self.relay_cv.wait_timeout(r, left).unwrap_or_else(|e| e.into_inner()).0;
+        }
     }
 }
 
@@ -155,16 +264,18 @@ struct Call {
 impl Machines {
     /// Start the service: one link per entry of `registry` (none connects
     /// until wanted). `dial` opens a machine's transport (ssh, or a test
-    /// daemon's socket).
-    pub fn spawn(registry: PathBuf, dial: Dial, timing: Timing, hooks: Hooks, log: fn(&str)) -> Machines {
+    /// daemon's socket), `agent_dial` its agent relay's.
+    pub fn spawn(registry: PathBuf, dial: Dial, agent_dial: Dial, timing: Timing, hooks: Hooks, log: fn(&str)) -> Machines {
         let inner = Arc::new(Inner {
             registry,
             dial,
+            agent_dial,
             timing,
             hooks,
             log,
             remotes: Arc::default(),
             links: Mutex::new(BTreeMap::new()),
+            holds: Mutex::new(BTreeMap::new()),
             stopped: AtomicBool::new(false),
         });
         let machines = Machines { inner };
@@ -192,23 +303,43 @@ fn stop_all(links: Vec<LinkThread>) {
         let _ = l.tx.send(Cmd::Wake);
     }
     for mut l in links {
-        if let Some(t) = l.thread.take() {
+        for t in [l.thread.take(), l.agent.take()].into_iter().flatten() {
             let _ = t.join();
         }
     }
 }
 
 impl Inner {
-    fn lock_links(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, LinkThread>> {
-        self.links.lock().unwrap_or_else(|e| e.into_inner())
+    fn lock_links(&self) -> MutexGuard<'_, BTreeMap<String, LinkThread>> {
+        lock(&self.links)
     }
+
+    /// Whether machine `name` is wanted now (`busy`: the link has calls
+    /// queued; a machines watcher; a [`Want`]) or was within the linger.
+    /// Stamps `ctl`'s last want, which the link and agent threads share.
+    fn wanted(&self, name: &str, ctl: &Ctl, busy: bool) -> bool {
+        let now = Instant::now();
+        let held = lock(&self.holds).get(name).is_some_and(|n| *n > 0);
+        let fresh = busy || held || (self.hooks.watching)();
+        let mut last = lock(&ctl.last_want);
+        if fresh {
+            *last = Some(now);
+        }
+        last.is_some_and(|t| now < t + self.timing.linger)
+    }
+}
+
+/// The same link: everything but `agent`, which flips on the live one.
+fn same_link(a: &Entry, b: &Entry) -> bool {
+    Entry { agent: b.agent, ..a.clone() } == *b
 }
 
 impl Handle {
     /// Re-read the registry: start links for new machines, stop (and drop
-    /// the rows of) removed ones, restart changed ones. `machines.add` and
-    /// `machines.rm` call it; a registry that doesn't load is logged and
-    /// changes nothing.
+    /// the rows of) removed ones, restart changed ones, except for a change
+    /// of `agent` alone, which flips on the live link (off kills its relay
+    /// now). `machines.add`, `.set` and `.rm` call it; a registry that
+    /// doesn't load is logged and changes nothing.
     pub fn reload(&self) {
         let inner = &self.inner;
         let entries = match super::load(&inner.registry) {
@@ -218,8 +349,16 @@ impl Handle {
                 return;
             }
         };
+        let mut flipped = Vec::new();
         let gone: Vec<LinkThread> = {
             let mut links = inner.lock_links();
+            for (name, l) in links.iter_mut() {
+                let Some(e) = entries.iter().find(|e| e.name == *name) else { continue };
+                if e.agent != l.entry.agent && same_link(e, &l.entry) {
+                    l.entry.agent = e.agent;
+                    flipped.push((Arc::clone(&l.ctl), e.agent));
+                }
+            }
             let stale: Vec<String> = links
                 .iter()
                 .filter(|(name, l)| !entries.iter().any(|e| e.name == **name && *e == l.entry))
@@ -227,6 +366,10 @@ impl Handle {
                 .collect();
             stale.iter().filter_map(|name| links.remove(name)).collect()
         };
+        // Outside the lock: killing a relay reaps its ssh.
+        for (ctl, on) in flipped {
+            ctl.set_agent(on);
+        }
         // Joined outside the lock (a forwarded call looks links up), and
         // before a changed entry's new thread starts writing its state.
         stop_all(gone);
@@ -251,6 +394,21 @@ impl Handle {
         for l in self.inner.lock_links().values() {
             let _ = l.tx.send(Cmd::Wake);
         }
+    }
+
+    /// Hold machine `machine` wanted until the guard drops (a forwarded verb
+    /// for its run, a connection for its life); `None` when it isn't
+    /// registered. The link and, with `agent` on, its relay start now.
+    pub fn want(&self, machine: &str) -> Option<Want> {
+        let (tx, ctl) = {
+            let links = self.inner.lock_links();
+            let l = links.get(machine)?;
+            *lock(&self.inner.holds).entry(machine.to_string()).or_default() += 1;
+            (l.tx.clone(), Arc::clone(&l.ctl))
+        };
+        let _ = tx.send(Cmd::Wake);
+        ctl.wake_agent();
+        Some(Want { inner: Arc::clone(&self.inner), machine: machine.to_string() })
     }
 
     /// The registered machines as of the last reload, sorted by name: what
@@ -287,19 +445,171 @@ impl Handle {
     }
 }
 
+/// A hold on a machine ([`Handle::want`]): wanted while it lives, the
+/// linger counted from its drop.
+pub struct Want {
+    inner: Arc<Inner>,
+    machine: String,
+}
+
+impl Want {
+    /// Wait up to `wait` for the machine's agent relay to be up (its
+    /// handshake through, so its socket there exists); `false` at once while
+    /// the machine's `agent` is off.
+    pub fn agent_ready(&self, wait: Duration) -> bool {
+        let ctl = self.inner.lock_links().get(&self.machine).map(|l| Arc::clone(&l.ctl));
+        ctl.is_some_and(|ctl| ctl.wait_ready(wait))
+    }
+}
+
+impl Drop for Want {
+    fn drop(&mut self) {
+        {
+            let mut holds = lock(&self.inner.holds);
+            if let Some(n) = holds.get_mut(&self.machine) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    holds.remove(&self.machine);
+                }
+            }
+        }
+        let link = self.inner.lock_links().get(&self.machine).map(|l| (l.tx.clone(), Arc::clone(&l.ctl)));
+        if let Some((tx, ctl)) = link {
+            ctl.touch();
+            let _ = tx.send(Cmd::Wake);
+            ctl.wake_agent();
+        }
+    }
+}
+
 fn spawn_link(entry: Entry, inner: Arc<Inner>) -> LinkThread {
     let (tx, rx) = mpsc::channel();
-    let ctl = Arc::new(Ctl::default());
+    let ctl = Arc::new(Ctl::new(&entry));
     let log = inner.log;
     let thread = {
-        let (entry, ctl) = (entry.clone(), Arc::clone(&ctl));
+        let (entry, ctl, inner) = (entry.clone(), Arc::clone(&ctl), Arc::clone(&inner));
         std::thread::Builder::new()
             .name(format!("serve-machine-{}", entry.name))
             .spawn(move || LinkLoop::new(entry, &inner, &ctl).run(&rx))
     };
     let thread = thread.map_err(|e| log(&format!("cannot start machine {}'s link: {e}", entry.name))).ok();
-    LinkThread { entry, tx, ctl, thread }
+    let agent = {
+        let (entry, ctl) = (entry.clone(), Arc::clone(&ctl));
+        std::thread::Builder::new()
+            .name(format!("serve-machine-{}-agent", entry.name))
+            .spawn(move || agent_loop(&entry, &inner, &ctl))
+    };
+    let agent = agent.map_err(|e| log(&format!("cannot start machine {}'s agent thread: {e}", entry.name))).ok();
+    LinkThread { entry, tx, ctl, thread, agent }
 }
+
+/// The delay before the next attempt after `failures` failures in a row: 1,
+/// 2, 4 … units, capped; counts this one.
+fn backoff(t: &Timing, failures: &mut u32) -> Duration {
+    let delay = t.backoff.saturating_mul(1u32 << (*failures).min(16)).min(t.backoff_cap);
+    *failures = failures.saturating_add(1);
+    delay
+}
+
+/// A machine's agent thread: runs the relay while `agent` is on and the
+/// machine is wanted, waits (woken by a flip, a want, a stop) otherwise.
+/// A failed relay is logged and retried after the link's backoff; one
+/// ended on purpose (off, unwanted, stopped) isn't.
+fn agent_loop(entry: &Entry, inner: &Inner, ctl: &Arc<Ctl>) {
+    let tick = inner.timing.tick;
+    let mut failures = 0;
+    let mut retry_at: Option<Instant> = None;
+    while !ctl.stopped() {
+        let up = ctl.agent_on() && inner.wanted(&entry.name, ctl, false);
+        if !up || retry_at.is_some_and(|t| Instant::now() < t) {
+            ctl.wait_agent(tick);
+            continue;
+        }
+        retry_at = None;
+        let (handshaken, failed) = run_relay(entry, inner, ctl);
+        if handshaken {
+            failures = 0;
+        }
+        if let Some(why) = failed {
+            (inner.log)(&format!("machine {}: agent relay: {why}", entry.name));
+            retry_at = Some(Instant::now() + backoff(&inner.timing, &mut failures));
+        }
+    }
+}
+
+/// One run of the relay, until it ends or is ended: whether its handshake
+/// went through, and why it failed (`None`: ended on purpose).
+fn run_relay(entry: &Entry, inner: &Inner, ctl: &Arc<Ctl>) -> (bool, Option<String>) {
+    let Duplex { stream, peer } = match (inner.agent_dial)(entry) {
+        Ok(duplex) => duplex,
+        Err(e) => return (false, Some(format!("{e:#}"))),
+    };
+    let (reader, writer) = match stream.try_clone().and_then(|r| Ok((r, stream.try_clone()?))) {
+        Ok(halves) => halves,
+        Err(e) => return (false, Some(format!("cannot clone its socket: {e}"))),
+    };
+    {
+        let mut r = lock(&ctl.relay);
+        r.ready = false;
+        r.kill = Some((stream, peer));
+    }
+    let unwanted = || ctl.stopped() || !ctl.agent_on() || !inner.wanted(&entry.name, ctl, false);
+    let handshaken = AtomicBool::new(false);
+    let ended = std::thread::scope(|s| {
+        let served = std::thread::Builder::new().name(format!("serve-machine-{}-relay", entry.name)).spawn_scoped(s, || {
+            let (allowed, ready, dead) = (Arc::clone(ctl), Arc::clone(ctl), Arc::clone(ctl));
+            let end = agent::serve(
+                reader,
+                writer,
+                move || allowed.agent_on(),
+                crate::devsbd::bridge::host_agent,
+                || {
+                    handshaken.store(true, Ordering::SeqCst);
+                    ready.set_ready();
+                },
+                move || dead.kill_relay(),
+            );
+            ctl.wake_agent();
+            end
+        });
+        let served = match served {
+            Ok(served) => served,
+            Err(e) => return Err(format!("cannot start its thread: {e}")),
+        };
+        // The want ending kills it within a tick; a flip off or a stop
+        // already did.
+        while !served.is_finished() {
+            if unwanted() {
+                ctl.kill_relay();
+                break;
+            }
+            ctl.wait_agent(inner.timing.tick);
+        }
+        served.join().map_err(|_| "its thread panicked".to_string())
+    });
+    let left = {
+        let mut r = lock(&ctl.relay);
+        r.ready = false;
+        r.kill.take()
+    };
+    ctl.relay_cv.notify_all();
+    let handshaken = handshaken.load(Ordering::SeqCst);
+    if unwanted() {
+        return (handshaken, None);
+    }
+    let why = match ended {
+        Ok(agent::End::Handshake(why)) => format!("handshake failed: {why}"),
+        Ok(agent::End::Dead) => format!("silent for {}s", crate::devsbd::mux::KEEPALIVE_TIMEOUT.as_secs()),
+        Ok(agent::End::Closed) => "closed".to_string(),
+        Err(why) => why,
+    };
+    // Still ours: it ended by itself, and ssh's last words may say why.
+    let tail = left.map(|(_, peer)| peer.stderr_tail(STDERR_WAIT)).unwrap_or_default();
+    (handshaken, Some(if tail.is_empty() { why } else { format!("{why}: {tail}") }))
+}
+
+/// How long a failed relay's log line waits for ssh's stderr to end.
+const STDERR_WAIT: Duration = Duration::from_secs(2);
 
 /// Why a connected link ended.
 enum End {
@@ -318,14 +628,12 @@ struct LinkLoop<'a> {
     ctl: &'a Ctl,
     /// Forwarded calls not answered yet, oldest first.
     pending: VecDeque<Call>,
-    /// The last moment the link was wanted.
-    last_want: Option<Instant>,
     failures: u32,
 }
 
 impl<'a> LinkLoop<'a> {
     fn new(entry: Entry, inner: &'a Inner, ctl: &'a Ctl) -> Self {
-        Self { entry, inner, ctl, pending: VecDeque::new(), last_want: None, failures: 0 }
+        Self { entry, inner, ctl, pending: VecDeque::new(), failures: 0 }
     }
 
     fn run(&mut self, rx: &Receiver<Cmd>) {
@@ -384,12 +692,8 @@ impl<'a> LinkLoop<'a> {
         self.ctl.hold(None);
     }
 
-    /// The delay before the next attempt: 1, 2, 4 … units, capped.
     fn backoff(&mut self) -> Duration {
-        let t = &self.inner.timing;
-        let delay = t.backoff.saturating_mul(1u32 << self.failures.min(16)).min(t.backoff_cap);
-        self.failures = self.failures.saturating_add(1);
-        delay
+        backoff(&self.inner.timing, &mut self.failures)
     }
 
     /// Wait up to `wait` for a command; `false` when the channel is gone.
@@ -402,13 +706,10 @@ impl<'a> LinkLoop<'a> {
         true
     }
 
-    /// Wanted now (a machines watcher, a queued call), or within the linger.
-    fn wanted(&mut self) -> bool {
-        let now = Instant::now();
-        if !self.pending.is_empty() || (self.inner.hooks.watching)() {
-            self.last_want = Some(now);
-        }
-        self.last_want.is_some_and(|t| now < t + self.inner.timing.linger)
+    /// Wanted now (a machines watcher, a queued call, a [`Want`]), or within
+    /// the linger.
+    fn wanted(&self) -> bool {
+        self.inner.wanted(&self.entry.name, self.ctl, !self.pending.is_empty())
     }
 
     fn set(&self, state: LinkState, error: Option<String>) {
@@ -423,11 +724,10 @@ impl<'a> LinkLoop<'a> {
         }
     }
 
-    /// Dial and say hello. The daemon's preferred host agent goes along for
-    /// `ssh -A`. The socket is held for [`Ctl::cut`] before the hello.
+    /// Dial and say hello. The socket is held for [`Ctl::cut`] before the
+    /// hello.
     fn connect(&self) -> Result<Link, String> {
-        let agent = crate::devsbd::bridge::host_agent();
-        let duplex = (self.inner.dial)(&self.entry, agent.as_deref()).map_err(|e| format!("{}: {e:#}", self.entry.name))?;
+        let duplex = (self.inner.dial)(&self.entry).map_err(|e| format!("{}: {e:#}", self.entry.name))?;
         self.ctl.hold(duplex.stream.try_clone().ok());
         if self.ctl.stopped() {
             return Err("stopping".into());
@@ -470,7 +770,7 @@ impl<'a> LinkLoop<'a> {
             }
             if let Some(call) = self.pending.pop_front() {
                 let answer = link.conn.call_within(&call.method, call.params, t.call);
-                self.last_want = Some(Instant::now());
+                self.ctl.touch();
                 match answer {
                     Ok(Some(r)) => {
                         let _ = call.reply.send(r);
@@ -634,7 +934,7 @@ mod tests {
         local_opts.machines = Some(registry);
         local_opts.dial = Some({
             let (remote_dir, dials) = (remote_dir.clone(), Arc::clone(&dials));
-            Arc::new(move |_: &Entry, _: Option<&Path>| {
+            Arc::new(move |_: &Entry| {
                 dials.fetch_add(1, Ordering::SeqCst);
                 ssh::test_support::relayed(endpoint::connect(&remote_dir)?)
             })
@@ -749,14 +1049,15 @@ mod tests {
         let dials = Arc::new(AtomicUsize::new(0));
         let dial: Dial = {
             let dials = Arc::clone(&dials);
-            Arc::new(move |_, _| {
+            Arc::new(move |_| {
                 dials.fetch_add(1, Ordering::SeqCst);
                 Ok(mute_peer())
             })
         };
         let timing = Timing { call: Duration::from_millis(200), ..opts(1, 0).machine_timing };
         let hooks = Hooks { watching: Box::new(|| false), changed: Box::new(|| {}) };
-        let machines = Machines::spawn(registry, dial, timing, hooks, |_| {});
+        let no_agent: Dial = Arc::new(|_| anyhow::bail!("no agent relay here"));
+        let machines = Machines::spawn(registry, dial, no_agent, timing, hooks, |_| {});
         let h = machines.handle();
         for round in 1..=2 {
             let r = h.forward("m", "instances.list", json!({"dir": "/x"})).unwrap();
@@ -769,6 +1070,223 @@ mod tests {
         drop(machines);
         assert!(started.elapsed() < Duration::from_secs(2), "the stop waited");
         assert!(h.forward("m", "instances.list", json!({})).is_err(), "stopped");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ---- the agent relay -----------------------------------------------------
+
+    const CLIENT: &str = "machine:test";
+
+    /// A short scratch dir (socket paths stay well under 104 bytes).
+    fn short_scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("dsv-ms-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// An agent dial running the relay's far end (`agent_relay::run`) in a
+    /// thread, its socket in `dir`; counts the spawns. Shutting the
+    /// `Duplex` down ends it, which unlinks the socket.
+    fn in_process_relay(dir: &Path) -> (Dial, Arc<AtomicUsize>) {
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let dial: Dial = {
+            let (dir, spawns) = (dir.to_path_buf(), Arc::clone(&spawns));
+            Arc::new(move |_| {
+                spawns.fetch_add(1, Ordering::SeqCst);
+                let (ours, theirs) = UnixStream::pair()?;
+                let (r, w) = (theirs.try_clone()?, theirs);
+                let dir = dir.clone();
+                std::thread::spawn(move || crate::commands::agent_relay::run(r, w, &dir, CLIENT));
+                Ok(Duplex::socket(ours))
+            })
+        };
+        (dial, spawns)
+    }
+
+    fn wait_for(what: &str, within: Duration, mut cond: impl FnMut() -> bool) {
+        let deadline = Instant::now() + within;
+        while !cond() {
+            assert!(Instant::now() < deadline, "timed out waiting: {what}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    struct Agented {
+        base: PathBuf,
+        registry: PathBuf,
+        machines: Machines,
+        watching: Arc<AtomicBool>,
+        dials: Arc<AtomicUsize>,
+        spawns: Arc<AtomicUsize>,
+        socket: PathBuf,
+        timing: Timing,
+    }
+
+    /// Machine `m` (`agent` as given) whose link is a [`mute_peer`] and
+    /// whose agent relay runs in-process; a watcher flag for the want.
+    fn agented(tag: &str, agent: bool) -> Agented {
+        let base = short_scratch(tag);
+        let registry = base.join("machines.toml");
+        let entry = Entry { name: "m".into(), target: "m".into(), roots: vec![], command: None, agent };
+        crate::serve::machines::update(&registry, |e| e.push(entry)).unwrap();
+        let dials = Arc::new(AtomicUsize::new(0));
+        let dial: Dial = {
+            let dials = Arc::clone(&dials);
+            Arc::new(move |_| {
+                dials.fetch_add(1, Ordering::SeqCst);
+                Ok(mute_peer())
+            })
+        };
+        let (agent_dial, spawns) = in_process_relay(&base);
+        let watching = Arc::new(AtomicBool::new(false));
+        let hooks = {
+            let w = Arc::clone(&watching);
+            Hooks { watching: Box::new(move || w.load(Ordering::SeqCst)), changed: Box::new(|| {}) }
+        };
+        let timing = opts(1, 0).machine_timing;
+        let machines = Machines::spawn(registry.clone(), dial, agent_dial, timing, hooks, |_| {});
+        let socket = endpoint::agent_socket(&base, CLIENT);
+        Agented { base, registry, machines, watching, dials, spawns, socket, timing }
+    }
+
+    impl Agented {
+        fn set_agent(&self, on: bool) {
+            crate::serve::machines::update(&self.registry, |e| e[0].agent = on).unwrap();
+            self.machines.handle().reload();
+        }
+
+        fn state(&self) -> LinkState {
+            self.machines.handle().remotes().get("m").unwrap().state
+        }
+
+        fn finish(self) {
+            let started = Instant::now();
+            drop(self.machines);
+            assert!(started.elapsed() < Duration::from_secs(2), "the stop waited");
+            wait_for("the relay's end after the stop", Duration::from_secs(2), || !self.socket.exists());
+            let _ = std::fs::remove_dir_all(&self.base);
+        }
+    }
+
+    /// With `agent` on the relay runs while the machine is wanted; `set`
+    /// off kills it at once without touching the link, on brings it back;
+    /// the want ending kills it after the linger.
+    #[test]
+    fn the_agent_relay_follows_the_want_and_the_flag() {
+        let a = agented("follow", true);
+        let h = a.machines.handle();
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(a.spawns.load(Ordering::SeqCst), 0, "not wanted: no relay");
+
+        a.watching.store(true, Ordering::SeqCst);
+        h.wake();
+        wait_for("the relay up", Duration::from_secs(5), || a.socket.exists());
+        wait_for("the link up", Duration::from_secs(5), || a.state() == LinkState::Connected);
+        assert_eq!((a.spawns.load(Ordering::SeqCst), a.dials.load(Ordering::SeqCst)), (1, 1));
+
+        // Off: killed promptly, the link left alone.
+        a.set_agent(false);
+        // The far end unlinks on its next accept poll (200 ms).
+        wait_for("the relay killed", Duration::from_secs(1), || !a.socket.exists());
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(a.spawns.load(Ordering::SeqCst), 1, "no respawn while off");
+        assert_eq!((a.dials.load(Ordering::SeqCst), a.state()), (1, LinkState::Connected), "the link wasn't restarted");
+        let want = h.want("m").unwrap();
+        let started = Instant::now();
+        assert!(!want.agent_ready(Duration::from_secs(5)), "off: not ready");
+        assert!(started.elapsed() < Duration::from_millis(100), "off answers at once");
+        drop(want);
+
+        // On again: a new relay, same link.
+        a.set_agent(true);
+        wait_for("the relay back", Duration::from_secs(5), || a.socket.exists());
+        assert_eq!((a.spawns.load(Ordering::SeqCst), a.dials.load(Ordering::SeqCst)), (2, 1));
+
+        // Nobody wants it: gone after the linger, the link idle.
+        a.watching.store(false, Ordering::SeqCst);
+        std::thread::sleep(a.timing.linger / 2);
+        assert!(a.socket.exists(), "killed before the linger");
+        wait_for("the relay gone after the linger", Duration::from_secs(2), || !a.socket.exists());
+        wait_for("the link idle", Duration::from_secs(2), || a.state() == LinkState::Idle);
+        assert_eq!(a.spawns.load(Ordering::SeqCst), 2);
+        a.finish();
+    }
+
+    /// A [`Want`] alone keeps the machine wanted (link and relay), and says
+    /// when the relay is up; its drop starts the linger.
+    #[test]
+    fn a_want_holds_the_machine_and_waits_for_the_relay() {
+        let a = agented("want", true);
+        let h = a.machines.handle();
+        assert!(h.want("nope").is_none(), "not registered");
+        let want = h.want("m").unwrap();
+        assert!(want.agent_ready(Duration::from_secs(5)), "the relay came up");
+        assert!(a.socket.exists(), "ready means its socket is there");
+        wait_for("the link up", Duration::from_secs(5), || a.state() == LinkState::Connected);
+        std::thread::sleep(a.timing.linger * 2);
+        assert!(a.socket.exists() && a.state() == LinkState::Connected, "held past the linger");
+        let second = h.want("m").unwrap();
+        drop(want);
+        std::thread::sleep(a.timing.linger * 2);
+        assert!(a.socket.exists(), "still held by the second");
+        drop(second);
+        wait_for("the relay gone after the linger", Duration::from_secs(2), || !a.socket.exists());
+        wait_for("the link idle", Duration::from_secs(2), || a.state() == LinkState::Idle);
+        assert_eq!(a.spawns.load(Ordering::SeqCst), 1);
+
+        // A stop with the relay up kills it too.
+        let want = h.want("m").unwrap();
+        assert!(want.agent_ready(Duration::from_secs(5)));
+        a.finish();
+        assert!(!want.agent_ready(Duration::ZERO), "stopped");
+    }
+
+    #[test]
+    fn agent_off_never_spawns_a_relay() {
+        let a = agented("off", false);
+        a.watching.store(true, Ordering::SeqCst);
+        a.machines.handle().wake();
+        wait_for("the link up", Duration::from_secs(5), || a.state() == LinkState::Connected);
+        let want = a.machines.handle().want("m").unwrap();
+        assert!(!want.agent_ready(Duration::from_secs(5)));
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(a.spawns.load(Ordering::SeqCst), 0);
+        drop(want);
+        a.finish();
+    }
+
+    static LOGGED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    /// A relay that can't spawn is logged and retried with the backoff,
+    /// not in a tight loop.
+    #[test]
+    fn a_failing_relay_backs_off() {
+        let base = short_scratch("fail");
+        let registry = base.join("machines.toml");
+        let entry = Entry { name: "fails".into(), target: "x".into(), roots: vec![], command: None, agent: true };
+        crate::serve::machines::update(&registry, |e| e.push(entry)).unwrap();
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let agent_dial: Dial = {
+            let spawns = Arc::clone(&spawns);
+            Arc::new(move |_| {
+                spawns.fetch_add(1, Ordering::SeqCst);
+                anyhow::bail!("ssh: Could not resolve hostname x")
+            })
+        };
+        let dial: Dial = Arc::new(|_| Ok(mute_peer()));
+        let hooks = Hooks { watching: Box::new(|| true), changed: Box::new(|| {}) };
+        let timing = opts(1, 0).machine_timing;
+        let machines = Machines::spawn(registry, dial, agent_dial, timing, hooks, |line| LOGGED.lock().unwrap().push(line.into()));
+        std::thread::sleep(Duration::from_millis(600));
+        drop(machines);
+        // 50, 100, 200, 200 … ms apart: a handful in 600 ms, not hundreds.
+        let n = spawns.load(Ordering::SeqCst);
+        assert!((2..=8).contains(&n), "{n} spawns");
+        let logged = LOGGED.lock().unwrap();
+        let ours: Vec<_> = logged.iter().filter(|l| l.starts_with("machine fails: agent relay: ")).collect();
+        assert_eq!(ours.len(), n, "{logged:?}");
+        assert!(ours[0].ends_with("Could not resolve hostname x"), "{}", ours[0]);
         let _ = std::fs::remove_dir_all(&base);
     }
 }

@@ -88,14 +88,16 @@ impl fmt::Display for End {
 /// sentinel, exchange `Hello`s advertising `caps::SSH_AGENT`, then answer
 /// each `Open { SSH_AGENT }` with a connection to `agent()` when `allowed()`
 /// says so at that moment, refusing it otherwise (and every other channel).
-/// Keepalive pings go out every `mux::KEEPALIVE_INTERVAL`; after
-/// `mux::KEEPALIVE_TIMEOUT` without a frame `on_dead` runs once: it must
-/// end `reader` (kill the ssh) so this returns.
+/// `on_ready` runs once the `Hello`s are through (the far end's socket is
+/// bound by then). Keepalive pings go out every `mux::KEEPALIVE_INTERVAL`;
+/// after `mux::KEEPALIVE_TIMEOUT` without a frame `on_dead` runs once: it
+/// must end `reader` (kill the ssh) so this returns.
 pub fn serve(
     mut reader: impl Read,
     mut writer: impl Write + Send + 'static,
     allowed: impl Fn() -> bool,
     agent: impl Fn() -> Option<PathBuf>,
+    on_ready: impl FnOnce(),
     on_dead: impl FnOnce() + Send + 'static,
 ) -> End {
     let mut noise = None;
@@ -117,6 +119,7 @@ pub fn serve(
     if let Err(e) = proto::handshake(&mut reader, &mut writer, HELLO_HASH, caps::SSH_AGENT) {
         return End::Handshake(e.to_string());
     }
+    on_ready();
     let mux = Mux::new(writer);
     let dead = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&dead);
@@ -156,7 +159,7 @@ mod tests {
         assert!(r.is_empty(), "nothing past the sentinel consumed");
         assert_eq!(noise.as_deref(), Some("motd line"));
 
-        let end = serve(&b"just a motd\n"[..], Vec::new(), || true, || None, || {});
+        let end = serve(&b"just a motd\n"[..], Vec::new(), || true, || None, || {}, || {});
         let End::Handshake(why) = end else { panic!("{end:?}") };
         assert!(why.contains("closed before") && why.contains("just a motd"), "{why}");
     }

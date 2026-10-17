@@ -741,19 +741,22 @@ A machine name is `[A-Za-z0-9._-]+`, not starting with `.` or `-` (never
 `/` or `@`, so the CLI's `my-server/web-2` and `@/web-2` are unambiguous).
 The API never parses a qualified name: requests carry `machine`.
 
-**Transport.** Every connection to a machine is `ssh -T -A -o
+**Transport.** Every connection to a machine is `ssh -T -o
 BatchMode=yes [-p N] -- <host> 'exec "$SHELL" -lc "exec <command> api
 --stdio --client machine:<this host> --session-env"'`: the remote's relay
 (*Relay*), in the user's login shell there, lazy-starting the remote
 daemon. `BatchMode`: the daemon has no TTY, so ssh fails instead of
-prompting. `-A` forwards the daemon's preferred host agent (*Bridges*), or a
-verb's requester's `SSH_AUTH_SOCK`. The hello says version `0.0.0`, so it
+prompting. No `-A`: for a machine with `agent` on, the daemon runs an agent
+relay over an ssh of its own while the machine is wanted
+([machines.md](../architecture/daemon/machines.md#agent)), serving the
+daemon's preferred host agent (*Bridges*). The hello says version `0.0.0`, so it
 never hands off the remote daemon; the remote's `protocol` must equal
 ours, a different semver is allowed.
 
 **Links.** One `serve-machine-<name>` thread per registered machine holds a
 connection to it only while wanted: while some connection watches with
-`machines: true`, or a forwarded quick call is queued, and 60 s after.
+`machines: true`, a forwarded quick call is queued or a forwarded verb
+runs, and 60 s after.
 Connected, it subscribes to `instances` and, while a watcher wants
 machines, watches each of the machine's roots. A failed connect or a lost
 link is retried 1 s, 2 s, … 30 s apart while wanted (a forwarded call
@@ -795,9 +798,12 @@ ssh, the remote devsandbox and the protocol before anything is saved.
 `add` checks every root with `roots.list {paths}` on the machine: a quoted
 `~` is the machine's home. `name` defaults to the target's host
 (`me@my-server.com` → `my-server.com`). `add`, `set` and `rm` reach the links at
-once. `agent` is stored and listed (also in the federated snapshot's
-`machines`); *Transport* passes `-A` whatever its value. Adding a machine means trusting it: its socket is as powerful as
-`docker.sock`, and your agent is forwarded there.
+once (`set` flips `agent` on the live link: off kills the agent relay at
+once, without reconnecting). `agent` is listed (also in the federated
+snapshot's `machines`) and decides whether the daemon relays its agent
+there (*Transport*). Adding a machine means trusting it: its socket is as
+powerful as `docker.sock`, and with `agent` on your agent is reachable
+there.
 
 ### The `machine` param
 
@@ -876,7 +882,10 @@ connection of its own, dialled for that request, so a long build never
 holds up the link's quick calls. The request minus `machine` is sent after
 the hello; the remote relay replaces its `env` with the remote login
 shell's (*Relay*, `--session-env`), so only `env.SSH_AUTH_SOCK` matters
-here: it's the agent ssh forwards. The machine's `output` and `progress`
+here: an absolute path is reported to this daemon as an agent, which the
+machine's agent relay serves from. The verb keeps the machine wanted while
+it runs; with the machine's `agent` on it waits up to 5 s for the agent
+relay before it's sent. The machine's `output` and `progress`
 are relayed with `request` rewritten to the local id, and its answer
 (`failed`'s `data`, `confirm`, `detached` included) passed through.
 
@@ -980,7 +989,11 @@ line `devsandbox-api 1` to stdout (`relay::write_sentinel`), so the link can
 skip whatever the remote login shell printed before it. The upstream copy
 then goes line by line, and a request whose `method` is a
 verb gets its `params.env` replaced by the relay's own environment (the
-remote login shell's), since the requester's is another host's. Every
+remote login shell's), since the requester's is another host's, with
+`SSH_AUTH_SOCK` set to the linking host's agent relay socket
+(`<socket dir>/agent-<client>.sock` for the relay's `--client`) when that
+accepts a connection at the time of the line; otherwise the login env's
+own `SSH_AUTH_SOCK` stays. Every
 other line, and everything downstream, passes as is; the 1 MiB line limit
 still applies.
 

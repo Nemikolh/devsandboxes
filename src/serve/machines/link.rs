@@ -277,9 +277,9 @@ mod tests {
             }
         };
         // The dial as tests inject it.
-        let dial: ssh::Dial = Arc::new(move |_, _| ssh::test_support::relayed(stream.try_clone()?));
+        let dial: ssh::Dial = Arc::new(move |_| ssh::test_support::relayed(stream.try_clone()?));
         let entry = super::super::Entry { name: "m".into(), target: "m".into(), roots: vec![], command: None, agent: false };
-        let mut link = handshake("m", dial(&entry, None).unwrap(), Duration::from_secs(5)).unwrap();
+        let mut link = handshake("m", dial(&entry).unwrap(), Duration::from_secs(5)).unwrap();
         assert_eq!((link.remote().protocol, link.remote().version.as_str(), link.remote().handoff), (proto::PROTOCOL, "0.6.0", false));
         let r = link.conn.call("nope", Value::Null).unwrap();
         assert_eq!(r.error.unwrap().code, "unknown-method");
@@ -318,7 +318,7 @@ mod tests {
     fn an_ssh_that_fails_says_why() {
         let argv: Vec<std::ffi::OsString> =
             ["sh", "-c", "echo 'me@box: Permission denied (publickey).' >&2; exit 255"].into_iter().map(Into::into).collect();
-        let err = handshake("box", ssh::spawn(&argv, None).unwrap(), Duration::from_secs(5)).err().unwrap();
+        let err = handshake("box", ssh::spawn(&argv).unwrap(), Duration::from_secs(5)).err().unwrap();
         assert!(matches!(err, LinkError::Closed { .. }), "{err:?}");
         assert_eq!(err.to_string(), "box: me@box: Permission denied (publickey).");
 
@@ -335,7 +335,7 @@ mod tests {
         let script = "echo motd; printf '\\ndevsandbox-api 1\\n'; read l; echo '{\"id\":0,\"result\":{\"version\":\"0.6.0\",\"build\":1,\"protocol\":1}}'; \
                       read l; echo '{\"id\":1,\"result\":[]}'; exec cat >/dev/null";
         let argv: Vec<std::ffi::OsString> = ["sh", "-c", script].into_iter().map(Into::into).collect();
-        let mut link = handshake("box", ssh::spawn(&argv, None).unwrap(), Duration::from_secs(5)).unwrap();
+        let mut link = handshake("box", ssh::spawn(&argv).unwrap(), Duration::from_secs(5)).unwrap();
         assert_eq!(link.noise.as_deref(), Some("motd"));
         let r = link.conn.call("roots.list", Value::Null).unwrap();
         assert_eq!(r.result, Some(json!([])));

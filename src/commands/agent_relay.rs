@@ -247,7 +247,7 @@ mod tests {
         let remote = std::thread::spawn(move || run(r_in, r_out, &dir_owned, &client_owned));
         let (l_in, l_out) = (local_io.try_clone().unwrap(), local_io.try_clone().unwrap());
         let local_end = std::thread::spawn(move || {
-            agent::serve(l_in, l_out, move || allowed.load(Ordering::Relaxed), move || Some(agent.clone()), || {})
+            agent::serve(l_in, l_out, move || allowed.load(Ordering::Relaxed), move || Some(agent.clone()), || {}, || {})
         });
         let socket = endpoint::agent_socket(dir, client);
         wait_for(|| UnixStream::connect(&socket).is_ok(), "the relay socket accepts");

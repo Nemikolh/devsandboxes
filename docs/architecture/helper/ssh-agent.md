@@ -73,7 +73,8 @@ container process ─▶ /run/devsandbox/ssh-agent.sock ─▶ devsbd daemon ─
   (`agent-*.sock`, `endpoint::agent_sockets`;
   [machines.md](../daemon/machines.md#agent)), else the
   daemon's own `$SSH_AUTH_SOCK`. Every client that asks for a bridge
-  (`bridges.ensure`) reports its own `$SSH_AUTH_SOCK`, so agent rotation (a
+  (`bridges.ensure`) reports its own `$SSH_AUTH_SOCK`, as does every verb
+  forwarded to a machine (`machines::forward::verb`), so agent rotation (a
   new `ssh -A` session, re-login) needs no restart: the next command brings
   the live socket. The installed service unit deliberately doesn't capture
   `SSH_AUTH_SOCK` for the same reason.
@@ -97,7 +98,7 @@ container process ─▶ /run/devsandbox/ssh-agent.sock ─▶ devsbd daemon ─
 | macOS, podman | yes | attempted symlink bind; the host socket can't cross into the podman machine VM |
 | Apple `container` | yes | no (`supports_file_binds` false) |
 | Windows native | no (relay is unix-only) | no (`ssh_agent_forward` is unix-only) |
-| remote machine | yes, on the machine: every ssh to it passes `-A`, and verbs forward the caller's `SSH_AUTH_SOCK` | n/a |
+| remote machine | with `agent` on: the local daemon's agent relay serves it there while the machine is wanted, and verbs get its socket as `SSH_AUTH_SOCK` ([machines.md](../daemon/machines.md#agent)); CLI re-runs and terminal tabs still pass `-A` | n/a |
 
 VS Code terminals are not devsandbox's: VS Code forwards its own agent
 through its server, independently of both modes.
