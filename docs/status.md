@@ -161,10 +161,11 @@ limitation means editing this file in the same commit.
   → [machines](architecture/daemon/machines.md); `machines::forward::verb`
 - Daemon-side ssh is `BatchMode=yes`, one handshake per forwarded verb:
   passphrase-prompting keys fail. → [machines](architecture/daemon/machines.md); `ssh::api_argv`
-- CLI re-runs on a machine and the dashboard's remote terminal tabs still
-  pass `ssh -A`, whatever the machine's `agent`; only the daemon's own ssh
-  (links, verbs, the agent relay) go without it.
-  → [machines](architecture/daemon/machines.md#agent); `ssh::cli_argv`, `ssh::tty_argv`, `ssh::tty_argv_with`
+- A CLI re-run's `machines.hold` isn't renewed: if the local daemon exits
+  or hands over while the ssh session runs (`exec -it m/x` left open), the
+  machine's agent relay goes with it for the rest of that session unless
+  something else (a dashboard) wants the machine.
+  → [machines](architecture/daemon/machines.md#the-cli-clirs); `machines::cli::hold`
 - `machine add` has no `--command`; a remote devsandbox off `PATH` is set by
   hand in `machines.toml`. → [machines](architecture/daemon/machines.md)
 - Remote rows live in memory: a fresh daemon shows a machine without rows

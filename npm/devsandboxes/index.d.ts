@@ -778,6 +778,13 @@ export interface MachineInfo {
   agent: boolean;
 }
 
+/** `machines.hold`'s answer. */
+export interface MachineHeld {
+  ok: true;
+  /** The machine's agent relay is up; always `false` for a machine with `agent` off. */
+  agent: boolean;
+}
+
 /** One registered machine (`machines.list`). */
 export interface MachineRow {
   name: string;
@@ -1121,6 +1128,11 @@ export interface ApiMethods {
   'machines.rm': { params: { name: string }; result: OkResult };
   /** One registered machine, to build an ssh command to it; `not-found` for an unknown name. */
   'machines.get': { params: { name: string }; result: MachineInfo };
+  /**
+   * Hold a machine's link (and, with `agent` on, its agent relay) up until this connection closes; `agent` is the
+   * caller's absolute `SSH_AUTH_SOCK`. Waits up to 5 s for the relay; `not-found` for an unknown name.
+   */
+  'machines.hold': { params: { name: string; agent?: string }; result: MachineHeld };
   /** `not-found` for an unknown sandbox; one that doesn't merge answers why in `resolved`. */
   'sandboxes.get': { params: { root: string; name: string; machine?: string }; result: SandboxConfig };
   'services.get': { params: { root: string; name: string; machine?: string }; result: ServiceConfig };

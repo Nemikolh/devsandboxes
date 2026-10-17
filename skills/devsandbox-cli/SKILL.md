@@ -231,10 +231,10 @@ devsandbox machine rm box                      # unregister only
   defaults to the target's host; a name already registered is refused.
   Adding a machine means trusting it. `--agent` / `machine set <name>
   --agent on|off` (off by default, shown in `machine ls`) decide whether
-  the local daemon relays your ssh-agent there for `run`/`start`/… (e.g.
-  git clones over ssh on the machine); off takes effect at once. For now
-  `exec`, `logs` and other commands re-run on the machine over ssh, and
-  dashboard terminals, still forward your agent whatever the flag. The
+  the local daemon relays your ssh-agent there: for `run`/`start`/… (e.g.
+  git clones over ssh on the machine), for `exec`, `logs` and the other
+  commands re-run on the machine over ssh, and for dashboard terminals;
+  off takes effect at once. ssh to a machine never uses `ssh -A`. The
   daemon's ssh runs with `BatchMode=yes`: use a key in
   your agent (or a `ControlMaster` in `~/.ssh/config`).
 - **Names resolve across machines.** `devsandbox run api` runs `api` where

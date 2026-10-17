@@ -47,23 +47,24 @@ collides with an instance name.
 One argv builder for the daemon, the CLI and the dashboard. Plain ssh, no
 ControlMaster of its own: `~/.ssh/config` decides. The remote command runs
 through the login shell (`exec "$SHELL" -lc '…'`, each arg quoted for it),
-so the remote `PATH` is the user's.
+so the remote `PATH` is the user's. No argv passes `-A`: this host's
+ssh-agent reaches a machine only over its [agent relay](#agent), only with
+the machine's `agent` on.
 
 - `api_argv`: `ssh -T -o BatchMode=yes [-p N] -- <host> … api --stdio
   --client <c> --session-env` (the daemon has no TTY: ssh must fail, not
-  prompt). No `-A`: the agent goes over the [agent relay](#agent).
-- `tty_argv` / `tty_argv_with`: `-t -A`, no `BatchMode` (terminal tabs,
-  interactive re-execs; `tty_argv_with` runs `<runtime> exec -it` for
+  prompt).
+- `tty_argv` / `tty_argv_with`: `-t`, no `BatchMode` (terminal tabs,
+  interactive re-runs; `tty_argv_with` runs `<runtime> exec -it` for
   service tabs).
-- `cli_argv`: `-t` on a terminal, else `-T` (piped bytes stay clean), and
-  `-A`.
+- `cli_argv`: `-t` on a terminal, else `-T` (piped bytes stay clean).
 - `tunnel_argv`: `ssh -T [-o BatchMode=yes] [-p N] -- <host> … -C <root>
   tunnel [--instance=<name>] [--service=<svc>] --port <n>`, a remote
-  forward's bridge ([forwards.md](forwards.md#remote-bridges)). No `-A`
-  (a forward's bridge serves no agent); `BatchMode` when `batch` (the
-  daemon). The `=` forms keep a name starting with `-` a value.
+  forward's bridge ([forwards.md](forwards.md#remote-bridges));
+  `BatchMode` when `batch` (the daemon). The `=` forms keep a name
+  starting with `-` a value.
 - `agent_argv`: `ssh -T -o BatchMode=yes [-p N] -- <host> … agent-relay
-  --client <c>`, a machine's agent relay ([Agent](#agent)). No `-A`.
+  --client <c>`, a machine's agent relay ([Agent](#agent)).
 
 `Tail` (a bounded ring of a stream's last bytes, `Tail::collect`) keeps
 ssh's stderr for `spawn`'s `Peer` and the remote forward opener alike.
@@ -111,7 +112,8 @@ A machine is wanted while a local connection watches with `machines:
 true`, a forwarded call is queued, or a `Want` holds it, and for
 `Timing::linger` (60 s) after (both threads share the last want, a
 `Want`'s drop counting as one). `Handle::want` returns a `Want`: a guard
-per holder (a forwarded verb for its run), counted per machine name so a
+per holder (a forwarded verb for its run, a connection's
+`machines.hold` for the connection's life), counted per machine name so a
 hold outlives a restarted link; `Want::agent_ready` waits, bounded, for
 the agent relay's handshake (`false` at once with `agent` off). The link
 connects only while the machine is wanted. Connected, it
@@ -158,6 +160,16 @@ and goes to that machine, but for the ones served here:
   the forward reaches, not where it runs. The daemon keeps the param and
   answers itself, binding the forward on this host with one ssh per bridge
   ([forwards.md](forwards.md#ad-hoc-forwards-and-forwardstoml)).
+
+- **`machines.hold {name, agent?}`** (`machines::api::hold`, answered in
+  `daemon.rs` `hold_machine`) is per connection: the `Want` is kept in the
+  connection's `ConnState` (one per machine; holding again replaces it)
+  and dropped when the connection's thread ends, so a holder that exits
+  or dies releases the machine (then the linger). `agent`, the caller's
+  absolute `SSH_AUTH_SOCK`, is reported like a verb's; with the machine's
+  `agent` on the answer waits up to `forward::AGENT_WAIT` for the relay.
+  It answers `{ok, agent}`, `agent` whether the relay is up. The CLI's
+  re-runs use it ([The CLI](#the-cli-clirs)).
 
 ## Federated snapshots
 
@@ -218,7 +230,10 @@ dashboard's header note.
 The local daemon runs the relay: the machine's agent thread
 (`service.rs` `agent_loop`) spawns `ssh::agent_argv` through the agent
 `Dial` while the flag is on and the machine is wanted
-([Held links](#held-links-machines), linger included), and serves it
+([Held links](#held-links-machines), linger included). What keeps it
+wanted: a dashboard (it always watches with `machines: true`, which
+covers its terminal tabs), a forwarded verb for its run, and a CLI
+command re-run there over ssh, through its `machines.hold`. It serves it
 with `agent::serve`, its `allowed()` reading the live flag. A failed
 relay (ssh, handshake, keepalive) is logged (`machine <name>: agent
 relay: <why>`, with ssh's stderr tail) and retried with the link's
@@ -247,7 +262,8 @@ env's own `SSH_AUTH_SOCK` (the machine's agent, if any) stays.
   and sends the request with the match's `machine` and root.
 - **Other named commands** (`exec`, `logs`, `inspect`, `done`, `undone`,
   `rename`, …) are resolved through the daemon; one on a machine is re-run
-  as `ssh [-t] <target> devsandbox <args>` (`exec` of ssh). `logs` /
+  as `ssh [-t] <target> devsandbox <args>` (`exec` of ssh; with `agent`
+  on, see below). `logs` /
   `inspect` with a bare `devsandbox-…` container name stay local. `port`
   on a machine's instance runs here: `route` returns `Routed::Port` (the
   machine's `Entry`, the match's root or else the machine's first, the
@@ -266,6 +282,20 @@ env's own `SSH_AUTH_SOCK` (the machine's agent, if any) stays.
   `inbox`, `vscode`, `serve`, `api`, `machine`, the dashboard.
 - Without a local daemon, a qualified remote name and `--machine` fail
   ("needs devsandbox serve"); a bare name resolves locally.
+- **`agent` on** (`hold_params` decides from the `machines.get` entry):
+  the command keeps its daemon connection and sends `machines.hold {name,
+  agent}` (`agent`: this process's `SSH_AUTH_SOCK`, if absolute) first,
+  so the relay is up for ssh. `--machine`'s per-root runs, spawned
+  already, keep that connection across all of them. A single re-run's ssh
+  is spawned and waited for instead of `exec`ed (an
+  `exec` would drop the connection, and OpenSSH closes inherited fds), and
+  the command exits with ssh's status (`Routed::Exit`). While it runs this
+  process ignores SIGINT and SIGQUIT (`spawn_ssh_owning_signals`): with
+  `-t` ssh owns the terminal, and with `-T` a Ctrl-C reaches the whole
+  process group; ssh gets the dispositions back as they were before
+  (a `pre_exec`, since an ignored signal survives `exec`). A hold that
+  fails (a daemon without the method, any error) prints a `warning:` and
+  the command runs without the agent. With `agent` off ssh is `exec`ed.
 
 ## `devsandbox machine add|ls|set|rm`
 
@@ -285,7 +315,8 @@ on|off`. `ls` shows it in an `AGENT` column. `rm` forgets the machine.
 
 `src/tui/remote.rs`: rows are keyed `machine/name` (bare for local),
 routed back to a request's `machine` + remote `root`; terminal tabs use
-`tty_argv`; a machine without rows shows `box: connecting` or `box:
+`tty_argv` (no hold of their own: the dashboard's `machines: true` watch
+keeps the machine, and its agent relay, up); a machine without rows shows `box: connecting` or `box:
 unreachable: <why>` in the header (`pending_note`), the name as `box
 (agent)` when its `agent` is on. `p` / `:port` on a remote row sends
 `forwards.add` with `machine` and the row's root (the forward binds here,

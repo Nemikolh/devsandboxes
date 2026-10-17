@@ -755,8 +755,8 @@ ours, a different semver is allowed.
 
 **Links.** One `serve-machine-<name>` thread per registered machine holds a
 connection to it only while wanted: while some connection watches with
-`machines: true`, a forwarded quick call is queued or a forwarded verb
-runs, and 60 s after.
+`machines: true`, a forwarded quick call is queued, a forwarded verb
+runs or a connection holds it (`machines.hold`), and 60 s after.
 Connected, it subscribes to `instances` and, while a watcher wants
 machines, watches each of the machine's roots. A failed connect or a lost
 link is retried 1 s, 2 s, … 30 s apart while wanted (a forwarded call
@@ -792,6 +792,7 @@ and `sandboxes: []`; the call itself fails only as `internal`, when
 | `machines.get` | `{"name"}` | `{"name", "target", "command", "roots", "agent"}`: what an ssh command to it needs (no argv on the wire: build it from `target` and `command`) | `not-found`, `internal` (as `list`) |
 | `machines.set` | `{"name", "agent"}` | `{"ok": true}`; saves the machine's `agent`, its link restarts if it changed | `not-found`, `invalid` (no `agent`), `internal` (`machines.toml` doesn't read or write) |
 | `machines.rm` | `{"name"}` | `{"ok": true}`; its link stops and its rows go. Nothing on the machine changes | `not-found`, `internal` (`machines.toml` doesn't read or write) |
+| `machines.hold` | `{"name", "agent"?}` (`agent`: the caller's `SSH_AUTH_SOCK`) | `{"ok": true, "agent"}`: the machine is wanted (link and, with `agent` on, agent relay up) until this connection closes; `agent` says whether the relay is up | `not-found`, `invalid` (`agent` not absolute) |
 
 `probe` and `add` open a connection of their own (a 20 s hello), checking
 ssh, the remote devsandbox and the protocol before anything is saved.
@@ -801,7 +802,15 @@ ssh, the remote devsandbox and the protocol before anything is saved.
 once (`set` flips `agent` on the live link: off kills the agent relay at
 once, without reconnecting). `agent` is listed (also in the federated
 snapshot's `machines`) and decides whether the daemon relays its agent
-there (*Transport*). Adding a machine means trusting it: its socket is as
+there (*Transport*).
+
+`hold` is per connection, for a client that runs its own ssh to the
+machine (the CLI re-running a command there) and needs the agent relay up
+meanwhile: `agent`, when given, is reported as the client's agent, like a
+verb's `env.SSH_AUTH_SOCK` (*Bridges*); with the machine's `agent` on the
+answer waits up to 5 s for the relay, else comes at once with `agent:
+false`. Holding the same machine again on one connection is allowed and
+still one hold. Closing the connection releases it (then the 60 s). Adding a machine means trusting it: its socket is as
 powerful as `docker.sock`, and with `agent` on your agent is reachable
 there.
 

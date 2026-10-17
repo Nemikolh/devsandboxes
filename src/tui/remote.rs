@@ -338,16 +338,16 @@ pub(crate) mod tests {
         assert_eq!(
             exec_argv(&m, "/r/one", "web-2", &[]).unwrap(),
             [
-                "ssh", "-t", "-A", "-p", "2222", "--", "me@box",
+                "ssh", "-t", "-p", "2222", "--", "me@box",
                 r#"exec "$SHELL" -lc 'exec ~/bin/devsandbox '\''-C'\'' '\''/r/one'\'' '\''exec'\'' '\''-i'\'' '\''-t'\'' '\''--'\'' '\''web-2'\'''"#,
             ]
         );
         m.runtime = Some("podman".into());
         let argv = service_argv(&m, "devsandbox-svc-db").unwrap();
-        assert_eq!(argv[..7], ["ssh", "-t", "-A", "-p", "2222", "--", "me@box"]);
-        assert!(argv[7].starts_with(r#"exec "$SHELL" -lc 'exec podman '\''exec'\'' '\''-i'\'' '\''-t'\'' '\''devsandbox-svc-db'\''"#), "{}", argv[7]);
+        assert_eq!(argv[..6], ["ssh", "-t", "-p", "2222", "--", "me@box"]);
+        assert!(argv[6].starts_with(r#"exec "$SHELL" -lc 'exec podman '\''exec'\'' '\''-i'\'' '\''-t'\'' '\''devsandbox-svc-db'\''"#), "{}", argv[6]);
         m.runtime = None;
-        assert!(service_argv(&m, "c").unwrap()[7].contains("exec docker "));
+        assert!(service_argv(&m, "c").unwrap()[6].contains("exec docker "));
     }
 
     #[test]

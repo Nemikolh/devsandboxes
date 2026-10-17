@@ -3,7 +3,9 @@
 //! `set`, `rm`.
 //! Connection-free like `serve::api`: a function of the method, its params
 //! and a [`Ctx`] (the registry path and the [`Dial`]), so tests run them
-//! against a second test daemon standing in as the machine.
+//! against a second test daemon standing in as the machine. The one
+//! per-connection method, `machines.hold`, is [`hold`]: it returns the
+//! [`Want`] the daemon keeps on the connection.
 //!
 //! `probe` and `add` open a fresh connection each (ssh, the hello, one or
 //! two calls) and drop it; the held link per machine is `service`'s, which
@@ -19,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::link::{self, Link};
-use super::service::Handle;
+use super::service::{Handle, Want};
 use super::ssh::{self, Dial};
 use super::{Entry, check_name, default_name};
 use crate::serve::api::{ApiError, RootCandidate, parse};
@@ -247,6 +249,46 @@ fn set(p: SetParams, ctx: &Ctx) -> Answer {
 #[derive(Deserialize)]
 struct NameParams {
     name: String,
+}
+
+#[derive(Deserialize)]
+struct HoldParams {
+    name: String,
+    #[serde(default)]
+    agent: Option<PathBuf>,
+}
+
+/// `machines.hold`'s answer: `agent`, whether the machine's agent relay is
+/// up (always `false` for a machine with `agent` off).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Held {
+    pub ok: bool,
+    pub agent: bool,
+}
+
+/// `machines.hold {name, agent?}`: hold machine `name` wanted (its link
+/// and, with `agent` on, its agent relay up) for as long as the caller keeps
+/// the returned [`Want`], which the daemon keeps until the connection
+/// closes. `agent` is the caller's `SSH_AUTH_SOCK`, reported to this daemon
+/// (`bridge::report_agent`) like a forwarded verb's, so the relay serves
+/// it. With `agent` on, waits up to [`super::forward::AGENT_WAIT`] for the
+/// relay, as a forwarded verb does (the caller's ssh would race it).
+pub fn hold(params: Value, ctx: &Ctx) -> Result<(Want, Held), ApiError> {
+    let p: HoldParams = parse(params)?;
+    if let Some(agent) = &p.agent
+        && !agent.is_absolute()
+    {
+        return Err(ApiError::invalid(format!("`agent` must be absolute, got `{}`", agent.display())));
+    }
+    let no_machine = || ApiError::not_found(format!("no machine named `{}`", p.name));
+    let links = ctx.links.as_ref().ok_or_else(no_machine)?;
+    let on = links.entries().iter().find(|e| e.name == p.name).ok_or_else(no_machine)?.agent;
+    if let Some(agent) = p.agent {
+        crate::devsbd::bridge::report_agent(agent);
+    }
+    let want = links.want(&p.name).ok_or_else(no_machine)?;
+    let ready = on && want.agent_ready(super::forward::AGENT_WAIT);
+    Ok((want, Held { ok: true, agent: ready }))
 }
 
 fn rm(p: NameParams, ctx: &Ctx) -> Answer {
@@ -533,6 +575,7 @@ mod tests {
         assert_matches("MachineRow", &to_value(row).unwrap());
         let info = MachineInfo { name: "m".into(), target: "m".into(), command: None, roots: vec![], agent: false };
         assert_matches("MachineInfo", &to_value(info).unwrap());
+        assert_matches("MachineHeld", &to_value(Held { ok: true, agent: false }).unwrap());
         assert_eq!(union_members("LinkState"), ["'idle'", "'connecting'", "'connected'", "'unreachable'"]);
         for (method, result) in [
             ("machines.probe", "MachineProbe"),
@@ -541,6 +584,7 @@ mod tests {
             ("machines.rm", "OkResult"),
             ("machines.set", "OkResult"),
             ("machines.get", "MachineInfo"),
+            ("machines.hold", "MachineHeld"),
         ] {
             let ty = prop_type("ApiMethods", method).unwrap_or_else(|| panic!("ApiMethods lacks `{method}`"));
             assert!(ty.contains(&format!("result: {result} ")), "{method}: {ty}");

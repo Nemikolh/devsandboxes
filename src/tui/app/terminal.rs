@@ -1042,14 +1042,14 @@ mod tests {
         let target = app.term_target();
         assert_eq!(target, Ok(("box/inst1".into(), "box/devsandbox-inst1".into(), true)));
         let argv = app.term_argv("box/inst1", "box/devsandbox-inst1", true).unwrap();
-        assert_eq!(argv[..5], ["ssh", "-t", "-A", "--", "me@box"]);
-        assert!(argv[5].contains(r"'\''-C'\'' '\''/r/one'\'' '\''exec'\''"), "{}", argv[5]);
-        assert!(argv[5].ends_with(r"'\''--'\'' '\''inst1'\'''"), "{}", argv[5]);
+        assert_eq!(argv[..4], ["ssh", "-t", "--", "me@box"]);
+        assert!(argv[4].contains(r"'\''-C'\'' '\''/r/one'\'' '\''exec'\''"), "{}", argv[4]);
+        assert!(argv[4].ends_with(r"'\''--'\'' '\''inst1'\'''"), "{}", argv[4]);
         // A local instance of the same name: this host's devsandbox.
         assert_eq!(app.term_argv("inst1", "devsandbox-inst1", true).unwrap()[..4], ["/opt/bin/devsandbox", "-C", "/home/u/cfg", "exec"]);
         // `:exec` too.
         let exec = app.exec_argv("box/inst1", &["uname".into()]).unwrap();
-        assert!(exec[5].ends_with(r"'\''inst1'\'' '\''uname'\'''"), "{}", exec[5]);
+        assert!(exec[4].ends_with(r"'\''inst1'\'' '\''uname'\'''"), "{}", exec[4]);
         assert_eq!(app.exec_argv("nope/x", &[]), Err("no machine named `nope`".into()));
 
         // Dedup: box's tab doesn't stand for the local one's.
@@ -1062,8 +1062,8 @@ mod tests {
         app.selected[Tab::Services.index()] = db;
         assert_eq!(app.term_target(), Ok(("box/svc-db".into(), "box/devsandbox-svc-db".into(), false)));
         let argv = app.term_argv("box/svc-db", "box/devsandbox-svc-db", false).unwrap();
-        assert_eq!(argv[..5], ["ssh", "-t", "-A", "--", "me@box"]);
-        assert!(argv[5].starts_with(r#"exec "$SHELL" -lc 'exec docker '\''exec'\'' '\''-i'\'' '\''-t'\'' '\''devsandbox-svc-db'\''"#), "{}", argv[5]);
+        assert_eq!(argv[..4], ["ssh", "-t", "--", "me@box"]);
+        assert!(argv[4].starts_with(r#"exec "$SHELL" -lc 'exec docker '\''exec'\'' '\''-i'\'' '\''-t'\'' '\''devsandbox-svc-db'\''"#), "{}", argv[4]);
     }
 
     fn cli() -> ExecCli {

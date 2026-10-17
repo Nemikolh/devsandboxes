@@ -98,7 +98,7 @@ container process ─▶ /run/devsandbox/ssh-agent.sock ─▶ devsbd daemon ─
 | macOS, podman | yes | attempted symlink bind; the host socket can't cross into the podman machine VM |
 | Apple `container` | yes | no (`supports_file_binds` false) |
 | Windows native | no (relay is unix-only) | no (`ssh_agent_forward` is unix-only) |
-| remote machine | with `agent` on: the local daemon's agent relay serves it there while the machine is wanted, and verbs get its socket as `SSH_AUTH_SOCK` ([machines.md](../daemon/machines.md#agent)); CLI re-runs and terminal tabs still pass `-A` | n/a |
+| remote machine | with `agent` on: the local daemon's agent relay serves it there while the machine is wanted, and verbs get its socket as `SSH_AUTH_SOCK` ([machines.md](../daemon/machines.md#agent)); no ssh to a machine passes `-A` (CLI re-runs hold the machine, terminal tabs ride the dashboard's watch); with `agent` off nothing of this host's agent reaches it | n/a |
 
 VS Code terminals are not devsandbox's: VS Code forwards its own agent
 through its server, independently of both modes.

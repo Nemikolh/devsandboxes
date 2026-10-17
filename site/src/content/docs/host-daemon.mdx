@@ -33,10 +33,10 @@ devsandbox ps --machine my-server     # a command without a name, run there
 devsandbox machine ls                 # each machine's state: connected, unreachable, …
 ```
 
-Your daemon connects to each machine's own daemon only while something needs it (an open dashboard, a command), through the login shell there, so a build on a machine runs with that machine's environment; only your ssh-agent is forwarded. ssh never prompts: use a key from your agent. A machine that's down keeps its last rows, marked `unreachable`. `devsandbox port my-server/web 3000` opens a machine's port here, over ssh (the machine needs this devsandbox version); a machine's own `forwardPorts` stay on it. VS Code on a machine isn't supported yet.
+Your daemon connects to each machine's own daemon only while something needs it (an open dashboard, a command), through the login shell there, so a build on a machine runs with that machine's environment. Your ssh-agent reaches a machine only if you turn on its `agent` (`devsandbox machine add --agent`, or `devsandbox machine set <name> --agent on`); then it's relayed there while you use the machine, and turning it off takes effect at once. ssh never prompts: use a key from your agent. A machine that's down keeps its last rows, marked `unreachable`. `devsandbox port my-server/web 3000` opens a machine's port here, over ssh (the machine needs this devsandbox version); a machine's own `forwardPorts` stay on it. VS Code on a machine isn't supported yet.
 
 <Callout variant="note" title="Adding a machine means trusting it">
-  Your ssh-agent is forwarded to it, and whoever controls it can act as you in its sandboxes.
+  Whoever controls it can act as you in its sandboxes, and, with its `agent` on, sign with your ssh-agent while you use it.
 </Callout>
 
 ## Start it at login

@@ -380,9 +380,8 @@ enum MachineCommand {
     /// Register a machine: an ssh target running devsandbox
     ///
     /// Adding a machine means trusting it: whoever controls it can act as
-    /// you in its containers (your ssh agent reaches it with --agent, and
-    /// for commands re-run there over ssh), and its
-    /// devsandbox socket is as powerful as docker.sock.
+    /// you in its containers (your ssh agent reaches it only with --agent),
+    /// and its devsandbox socket is as powerful as docker.sock.
     ///
     /// Without --config, its known config roots are offered to pick from
     /// (on a TTY; otherwise the only one is taken). --config is a path on

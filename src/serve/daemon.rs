@@ -36,7 +36,9 @@
 //! watched. A watch with `machines: true` gets each push merged with the
 //! machines' rows, and is what keeps their links up; a machine's push or
 //! state change re-publishes those watchers' roots from the last local
-//! params (`Shared::locals`).
+//! params (`Shared::locals`). `machines.hold` keeps one machine up the same
+//! way: its hold lives in the connection's `ConnState`, dropped when the
+//! connection's thread ends.
 //!
 //! A verb request (`verbs.rs`) runs on its connection's thread until the
 //! verb's answer, writing `output`/`progress` through the same writer lock
@@ -857,6 +859,9 @@ struct ConnState {
     audit: String,
     out: Arc<Outbox>,
     notifier: Option<JoinHandle<()>>,
+    /// `machines.hold`'s holds, one per machine name (a repeat replaces
+    /// it): dropped with the connection, which releases the machines.
+    holds: BTreeMap<String, service::Want>,
 }
 
 impl ConnState {
@@ -870,7 +875,8 @@ impl ConnState {
 
 /// One connection: a request per line, a response per request, until EOF.
 fn serve_conn(id: u64, stream: Stream, shared: &Shared, out: Arc<Outbox>) {
-    let mut conn = ConnState { id, client: String::new(), audit: api::audit_client(""), out, notifier: None };
+    let mut conn =
+        ConnState { id, client: String::new(), audit: api::audit_client(""), out, notifier: None, holds: BTreeMap::new() };
     let mut reader = BufReader::new(stream);
     loop {
         let mut line = Vec::new();
@@ -945,6 +951,7 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
             shared.begin_stop(Exit::Shutdown);
             Ok(json!({ "ok": true }))
         }
+        "machines.hold" => hold_machine(req.params, shared, conn),
         method if method.starts_with("machines.") && shared.machines.is_some() => {
             let ctx = shared.machines.as_ref().expect("checked");
             machines::api::call(method, req.params, ctx).unwrap_or_else(|| Err(api::ApiError::unknown_method(method)))
@@ -1173,6 +1180,21 @@ fn watch_root(params: Value, shared: &Shared, conn: &ConnState) -> Result<Value,
         links.wake();
     }
     Ok(json!({ "ok": true }))
+}
+
+/// `machines.hold {name, agent?}` (`machines::api::hold`): the hold lives on
+/// this connection until it closes. Holding a machine again replaces the
+/// connection's hold on it (the new one taken first, so no gap): one per
+/// machine, however often a client asks.
+fn hold_machine(params: Value, shared: &Shared, conn: &mut ConnState) -> Result<Value, api::ApiError> {
+    let name = params.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
+    let Some(ctx) = shared.machines.as_ref() else {
+        return Err(api::ApiError::not_found(format!("no machine named `{name}`")));
+    };
+    let (want, held) = machines::api::hold(params, ctx)?;
+    log(&format!("{}: holds machine {name}", conn.label()));
+    conn.holds.insert(name, want);
+    serde_json::to_value(held).map_err(|e| api::ApiError::internal(e.into()))
 }
 
 /// `instances.unwatch {dir}`: stop pushing root `dir` here (a pending one is

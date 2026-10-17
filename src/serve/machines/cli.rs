@@ -9,8 +9,11 @@
 //! only checks their names here.
 //!
 //! The decisions are pure ([`plan`], [`machine_use`], [`remote_args`],
-//! [`per_root`]); [`route`] does the I/O: the daemon lookups, then an `exec`
-//! of ssh (or a spawn per root).
+//! [`per_root`], [`hold_params`]); [`route`] does the I/O: the daemon
+//! lookups, then an `exec` of ssh (or a spawn per root). For a machine with
+//! `agent` on, ssh is spawned and waited for instead of `exec`ed: this
+//! process keeps a daemon connection holding the machine (`machines.hold`),
+//! so its agent relay is up while ssh runs, and ssh has no `-A`.
 
 use std::ffi::OsString;
 use std::io::IsTerminal;
@@ -430,8 +433,50 @@ fn connect() -> Result<Conn> {
     endpoint::socket_dir().and_then(|dir| client::connect(&dir, "cli"))
 }
 
+/// `machines.hold`'s params for a re-run on `entry`, `None` when it needs no
+/// hold (`agent` off: nothing to keep up). `own_agent` is this process's
+/// `SSH_AUTH_SOCK`, passed on when absolute, so the relay serves the agent
+/// of the terminal the command runs in.
+pub(crate) fn hold_params(entry: &Entry, own_agent: Option<PathBuf>) -> Option<Value> {
+    if !entry.agent {
+        return None;
+    }
+    let mut params = json!({ "name": entry.name });
+    if let Some(agent) = own_agent.filter(|a| a.is_absolute()) {
+        params["agent"] = json!(agent);
+    }
+    Some(params)
+}
+
+/// Hold `entry` on `conn` for a re-run ([`hold_params`]): `conn` back when
+/// held, to keep until ssh exits. A hold that fails (a daemon without the
+/// method, an error) is a warning: the command runs without the agent.
+fn hold(mut conn: Conn, entry: &Entry) -> Option<Conn> {
+    let params = hold_params(entry, crate::devsbd::bridge::own_agent())?;
+    let failed = match conn.call("machines.hold", params) {
+        Ok(r) => match r.error {
+            None => return Some(conn),
+            Some(e) => e.message,
+        },
+        Err(e) => format!("{e:#}"),
+    };
+    eprintln!("warning: cannot hold machine `{}` for its ssh-agent relay: {failed}", entry.name);
+    None
+}
+
+/// Run `argv` (ssh) on `entry`: with `held` (a [`hold`]ing connection),
+/// spawned and waited for with the connection kept to its end; else
+/// `exec`ed, as without an agent.
+fn run_ssh(argv: &[OsString], held: Option<Conn>) -> Result<Routed> {
+    let Some(conn) = held else { return Err(exec_ssh(argv)) };
+    let code = spawn_ssh_owning_signals(argv);
+    drop(conn);
+    Ok(Routed::Exit(code?))
+}
+
 /// Where `command` runs (module doc): here (maybe with its name resolved),
-/// or on a machine over ssh, which replaces this process. `machine` is
+/// or on a machine over ssh, which replaces this process (or, `agent` on,
+/// runs as its child: [`hold`]). `machine` is
 /// `--machine`, `machines` the registered names ([`super::registered_names`]).
 pub(crate) fn route(machine: Option<&str>, in_process: bool, machines: &[String], command: Command) -> Result<Routed> {
     match plan(&command, machine, in_process, machines)? {
@@ -440,9 +485,15 @@ pub(crate) fn route(machine: Option<&str>, in_process: bool, machines: &[String]
         Plan::Machine(m, usage) => {
             let mut conn = connect().context("--machine needs devsandbox serve")?;
             let entry = machine_info(&mut |method, params| conn.call(method, params), &m)?;
-            drop(conn);
+            let held = match usage {
+                MachineUse::Once(_) | MachineUse::PerRoot { .. } => hold(conn, &entry),
+                _ => {
+                    drop(conn);
+                    None
+                }
+            };
             match usage {
-                MachineUse::Once(args) => Err(exec_ssh(&ssh::cli_argv(&entry, on_terminal(), &args)?)),
+                MachineUse::Once(args) => run_ssh(&ssh::cli_argv(&entry, on_terminal(), &args)?, held),
                 MachineUse::PerRoot { args, json } => {
                     let runs = per_root(&m, &entry.roots, &args, json)?;
                     let mut code = 0;
@@ -453,6 +504,7 @@ pub(crate) fn route(machine: Option<&str>, in_process: bool, machines: &[String]
                             code = status;
                         }
                     }
+                    drop(held);
                     Ok(Routed::Exit(code))
                 }
                 MachineUse::Port => {
@@ -513,15 +565,16 @@ fn resolve_and_route(command: Command, wherever: Where, name: String) -> Result<
         bail!("`{m}/{}` is on a machine: `devsandbox vscode` is not supported on machines yet", chosen.name);
     }
     let entry = machine_info(&mut |method, params| conn.call(method, params), &m)?;
-    drop(conn);
     if matches!(command, Command::Port { .. }) {
+        drop(conn);
         let root = chosen.root.clone().or_else(|| entry.roots.first().cloned());
         let root = root.with_context(|| format!("machine `{m}` has no config roots (devsandbox machine ls)"))?;
         return routed_port(command, entry, root, Some(chosen.name));
     }
     let root = chosen.root.as_deref().or(entry.roots.first().map(PathBuf::as_path));
     let args = remote_args(&command, &chosen.name, root).context("this command doesn't run on a machine")?;
-    Err(exec_ssh(&ssh::cli_argv(&entry, on_terminal(), &args)?))
+    let argv = ssh::cli_argv(&entry, on_terminal(), &args)?;
+    run_ssh(&argv, hold(conn, &entry))
 }
 
 /// Replace this process with `argv` (ssh): its exit is ours, its terminal
@@ -537,7 +590,44 @@ fn spawn_ssh(argv: &[OsString]) -> Result<i32> {
     let (program, args) = argv.split_first().context("empty ssh argv")?;
     let status =
         std::process::Command::new(program).args(args).status().with_context(|| format!("cannot run {}", program.to_string_lossy()))?;
-    Ok(status.code().or_else(|| status.signal().map(|s| 128 + s)).unwrap_or(1))
+    Ok(exit_code(status))
+}
+
+fn exit_code(status: std::process::ExitStatus) -> i32 {
+    status.code().or_else(|| status.signal().map(|s| 128 + s)).unwrap_or(1)
+}
+
+/// [`spawn_ssh`] in place of an `exec`: ssh owns the terminal (`-t`), and a
+/// Ctrl-C with `-T` reaches the whole process group, so this process
+/// ignores SIGINT and SIGQUIT while ssh runs and lives to exit with its
+/// status. ssh gets them back as they were here (SIG_IGN would survive the
+/// exec, and an ssh ignoring Ctrl-C can't be stopped).
+fn spawn_ssh_owning_signals(argv: &[OsString]) -> Result<i32> {
+    const SIGNALS: [libc::c_int; 2] = [libc::SIGINT, libc::SIGQUIT];
+    let (program, args) = argv.split_first().context("empty ssh argv")?;
+    // SAFETY: `signal` swaps a disposition; SIG_IGN is always valid.
+    let prev = SIGNALS.map(|sig| unsafe { libc::signal(sig, libc::SIG_IGN) });
+    // What the child starts with: ignored only if it was here before; a
+    // handler of ours means default after the exec anyway.
+    let child = prev.map(|p| if p == libc::SIG_IGN { libc::SIG_IGN } else { libc::SIG_DFL });
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args);
+    // SAFETY: only `signal`, which is async-signal-safe, between fork and exec.
+    unsafe {
+        cmd.pre_exec(move || {
+            for (sig, disposition) in SIGNALS.into_iter().zip(child) {
+                libc::signal(sig, disposition);
+            }
+            Ok(())
+        });
+    }
+    let status = cmd.status();
+    for (sig, p) in SIGNALS.into_iter().zip(prev) {
+        // SAFETY: `p` is what `signal` returned for `sig`.
+        unsafe { libc::signal(sig, p) };
+    }
+    let status = status.with_context(|| format!("cannot run {}", program.to_string_lossy()))?;
+    Ok(exit_code(status))
 }
 
 #[cfg(test)]
@@ -679,6 +769,17 @@ mod tests {
 
     fn entry() -> Entry {
         Entry { name: "box".into(), target: "me@box".into(), roots: vec![PathBuf::from("/r")], command: None, agent: false }
+    }
+
+    /// A re-run holds its machine only with `agent` on, passing this
+    /// process's agent when it's an absolute path.
+    #[test]
+    fn re_runs_hold_machines_with_the_agent_on() {
+        assert_eq!(hold_params(&entry(), Some("/tmp/agent.sock".into())), None, "agent off: exec as ever");
+        let on = Entry { agent: true, ..entry() };
+        assert_eq!(hold_params(&on, Some("/tmp/agent.sock".into())), Some(json!({"name": "box", "agent": "/tmp/agent.sock"})));
+        assert_eq!(hold_params(&on, Some("rel.sock".into())), Some(json!({"name": "box"})));
+        assert_eq!(hold_params(&on, None), Some(json!({"name": "box"})));
     }
 
     /// What `main` gets for a port: a nameless one's port comes out of

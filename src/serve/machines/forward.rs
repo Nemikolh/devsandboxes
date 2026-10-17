@@ -72,8 +72,8 @@ pub const FANOUT_WAIT: Duration = Duration::from_secs(5);
 /// shell, a lazy start of the remote daemon.
 const HANDSHAKE: Duration = Duration::from_secs(20);
 /// How long a forwarded verb to a machine with `agent` on waits for its
-/// agent relay before going without.
-const AGENT_WAIT: Duration = Duration::from_secs(5);
+/// agent relay before going without (`machines.hold` too).
+pub(super) const AGENT_WAIT: Duration = Duration::from_secs(5);
 /// How often a forwarded verb looks at its local client while the remote
 /// is silent.
 const TICK: Duration = Duration::from_millis(50);
@@ -781,6 +781,43 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         drop((reader, stream));
+        pair.finish();
+    }
+
+    /// `machines.hold` keeps its machine wanted (the link comes up with no
+    /// watcher) until its connection closes; with `agent` off it answers
+    /// at once, `agent: false`.
+    #[test]
+    fn a_hold_keeps_its_machine_up_until_the_connection_closes() {
+        let mut pair = Pair::new("fwd-hold", "exit 0");
+        assert_eq!(box_state(&mut pair.local), "idle");
+        let mut holder = conn_at(&pair.local_dir());
+        let r = holder.call("machines.hold", json!({"name": "nope"})).unwrap();
+        assert_eq!(code_message(&r), ("not-found", "no machine named `nope`"));
+        let r = holder.call("machines.hold", json!({"name": "box", "agent": "rel.sock"})).unwrap();
+        assert_eq!(code_message(&r), ("invalid", "`agent` must be absolute, got `rel.sock`"));
+        assert_eq!(code_message(&holder.call("machines.hold", json!({})).unwrap()).0, "invalid");
+
+        let agent = std::env::temp_dir().join(format!("dsv-hold-agent-{}.sock", std::process::id()));
+        let started = Instant::now();
+        let r = holder.call("machines.hold", json!({"name": "box", "agent": agent})).unwrap();
+        assert_eq!(r.result, Some(json!({"ok": true, "agent": false})), "{r:?}");
+        assert!(started.elapsed() < Duration::from_secs(2), "agent off: no wait for a relay");
+        assert!(crate::devsbd::bridge::reported_agents().contains(&agent), "the caller's agent reported");
+        // Again: fine, still one hold.
+        assert!(holder.call("machines.hold", json!({"name": "box"})).unwrap().error.is_none());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while box_state(&mut pair.local) != "connected" {
+            assert!(Instant::now() < deadline, "the held machine's link never came up");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // Released with the connection: idle again after the linger.
+        drop(holder);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while box_state(&mut pair.local) != "idle" {
+            assert!(Instant::now() < deadline, "the link outlived the holding connection");
+            std::thread::sleep(Duration::from_millis(20));
+        }
         pair.finish();
     }
 }
