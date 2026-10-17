@@ -1,6 +1,10 @@
+> Archived 2026-10-17. Historical, may be wrong; do not use as a reference.
+> Current: [architecture/dashboard/tabs-and-actions.md](../../architecture/dashboard/tabs-and-actions.md#tabs),
+> [architecture/daemon/machines.md](../../architecture/daemon/machines.md#dashboard)
+
 # Machines tab in the dashboard
 
-Status: in progress
+Status: shipped
 
 Each machine has an `agent` flag (`machines.toml`, off by default; see
 [machines](../../architecture/daemon/machines.md) *Agent* and ADR
