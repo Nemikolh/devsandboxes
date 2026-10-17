@@ -48,17 +48,19 @@ pub use view::{
 };
 use view::{col_near, divider_pct};
 
-/// The four top-level views.
+/// The five top-level views. Machines is listed only while a machine is
+/// registered ([`App::tabs`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tab {
     Instances,
     Services,
     Ports,
     Inbox,
+    Machines,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 4] = [Tab::Instances, Tab::Services, Tab::Ports, Tab::Inbox];
+    pub const ALL: [Tab; 5] = [Tab::Instances, Tab::Services, Tab::Ports, Tab::Inbox, Tab::Machines];
 
     pub fn title(self) -> &'static str {
         match self {
@@ -66,6 +68,7 @@ impl Tab {
             Tab::Services => "Services",
             Tab::Ports => "Ports",
             Tab::Inbox => "Inbox",
+            Tab::Machines => "Machines",
         }
     }
 
@@ -75,6 +78,7 @@ impl Tab {
             Tab::Services => 1,
             Tab::Ports => 2,
             Tab::Inbox => 3,
+            Tab::Machines => 4,
         }
     }
 }
@@ -132,7 +136,7 @@ pub struct App {
     pub dir: PathBuf,
     pub tab: Tab,
     /// Selected row per tab, indexed by `Tab::index`.
-    selected: [usize; 4],
+    selected: [usize; 5],
     /// Collapsed tree groups on the Instances tab, keyed by sandbox name (and
     /// [`ORPHANS_NAME`](super::data::ORPHANS_NAME) for the orphan group). Empty
     /// means all expanded; survives snapshot refreshes.
@@ -223,8 +227,9 @@ pub struct App {
     /// none yet the tree says it in place of the rows.
     pub snapshot_error: Option<crate::tui::data::FetchError>,
     /// The registered machines' link states, from the last snapshot
-    /// (docs/architecture/daemon/machines.md, *Dashboard*). Empty without any: the tree is exactly
-    /// as before machines (no machine column).
+    /// (docs/architecture/daemon/machines.md, *Dashboard*), set by [`Self::set_machines`]. Empty
+    /// without any: the tree is exactly as before machines (no machine column) and the Machines
+    /// tab isn't listed.
     pub machines: Vec<crate::serve::snapshots::SnapshotMachine>,
     /// Seconds east of UTC for Inbox timestamps; the event loop sets it once
     /// at startup (0 = UTC when unknown).
@@ -291,7 +296,7 @@ impl App {
         Self {
             dir,
             tab: Tab::Instances,
-            selected: [0; 4],
+            selected: [0; 5],
             collapsed: BTreeSet::new(),
             expanded_procs: BTreeSet::new(),
             procs: BTreeMap::new(),
@@ -361,6 +366,23 @@ impl App {
         self.clamp_selection();
     }
 
+    /// Install the snapshot's registered machines. The last one gone while
+    /// the Machines tab is open leaves it for Instances (the tab is no
+    /// longer listed).
+    pub fn set_machines(&mut self, machines: Vec<crate::serve::snapshots::SnapshotMachine>) {
+        self.machines = machines;
+        if self.machines.is_empty() && self.tab == Tab::Machines {
+            self.set_tab(Tab::Instances);
+        }
+        self.clamp_selection();
+    }
+
+    /// The tabs listed in the bar, in order: [`Tab::ALL`] minus Machines
+    /// while no machine is registered.
+    pub fn tabs(&self) -> Vec<Tab> {
+        Tab::ALL.into_iter().filter(|&t| t != Tab::Machines || !self.machines.is_empty()).collect()
+    }
+
     /// Clamp every tab's selection into `[0, row_count)` (or 0 when empty).
     fn clamp_selection(&mut self) {
         for tab in Tab::ALL {
@@ -390,6 +412,7 @@ impl App {
             Tab::Services => self.snapshot.as_ref().map_or(0, |s| s.services.len()),
             Tab::Ports => self.ports.len(),
             Tab::Inbox => self.inbox.rows().len(),
+            Tab::Machines => self.machines.len(),
         }
     }
 
@@ -422,14 +445,17 @@ impl App {
             .copied()
     }
 
+    /// Cycle over the listed tabs ([`Self::tabs`]), by position in that list.
     pub fn next_tab(&mut self) {
-        let i = self.tab.index();
-        self.set_tab(Tab::ALL[(i + 1) % Tab::ALL.len()]);
+        let tabs = self.tabs();
+        let i = tabs.iter().position(|&t| t == self.tab).unwrap_or(0);
+        self.set_tab(tabs[(i + 1) % tabs.len()]);
     }
 
     pub fn prev_tab(&mut self) {
-        let i = self.tab.index();
-        self.set_tab(Tab::ALL[(i + Tab::ALL.len() - 1) % Tab::ALL.len()]);
+        let tabs = self.tabs();
+        let i = tabs.iter().position(|&t| t == self.tab).unwrap_or(0);
+        self.set_tab(tabs[(i + tabs.len() - 1) % tabs.len()]);
     }
 
     /// Apply a key event to the state. No terminal I/O here (the modal open path queues
@@ -518,6 +544,7 @@ impl App {
             KeyCode::Char('2') => self.set_tab(Tab::Services),
             KeyCode::Char('3') => self.set_tab(Tab::Ports),
             KeyCode::Char('4') => self.set_tab(Tab::Inbox),
+            KeyCode::Char('5') if !self.machines.is_empty() => self.set_tab(Tab::Machines),
             // Enter a terminal: ctrl-] or F12. No-op with a status hint when none
             // are open.
             KeyCode::Char(']') if ctrl => self.enter_terminal(),
@@ -740,6 +767,75 @@ mod tests {
         app.on_key(key(KeyCode::Esc));
         app.on_key(key(KeyCode::Char('?')));
         app.on_mouse(&press(r.start, 0), FRAME);
+        assert_eq!(app.tab, Tab::Instances);
+    }
+
+    /// No machine: Machines isn't listed, `5` is a no-op and cycling skips
+    /// it. One machine, whatever its link state: listed last, reached by
+    /// `5`, `tab`/`S-tab` (wrapping both ways) and a click on its title.
+    #[test]
+    fn machines_tab_listed_only_with_a_machine() {
+        use crate::serve::snapshots::LinkState;
+        use crate::tui::remote::tests::sm;
+        let mut app = new_app();
+        let listed = |app: &App| super::super::ui::tab_spans(app).into_iter().map(|(t, _, _)| t).collect::<Vec<_>>();
+        assert_eq!(app.tabs(), vec![Tab::Instances, Tab::Services, Tab::Ports, Tab::Inbox]);
+        assert_eq!(listed(&app), app.tabs());
+        app.on_key(key(KeyCode::Char('5')));
+        assert_eq!(app.tab, Tab::Instances);
+        app.on_key(key(KeyCode::Char('4')));
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.tab, Tab::Instances, "wraps past the unlisted tab");
+        app.on_key(key(KeyCode::BackTab));
+        assert_eq!(app.tab, Tab::Inbox);
+
+        app.set_machines(vec![sm("box", LinkState::Unreachable)]);
+        assert_eq!(app.tabs(), Tab::ALL.to_vec());
+        assert_eq!(listed(&app), Tab::ALL.to_vec());
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.tab, Tab::Machines);
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.tab, Tab::Instances);
+        app.on_key(key(KeyCode::BackTab));
+        assert_eq!(app.tab, Tab::Machines);
+        app.on_key(key(KeyCode::Char('1')));
+        app.on_key(key(KeyCode::Char('5')));
+        assert_eq!(app.tab, Tab::Machines);
+
+        app.on_key(key(KeyCode::Char('1')));
+        let r = super::super::ui::tab_spans(&app).into_iter().find(|(t, _, _)| *t == Tab::Machines).unwrap().2;
+        app.on_mouse(&mouse_at(MouseEventKind::Down(MouseButton::Left), r.end - 1, 0), FRAME);
+        assert_eq!(app.tab, Tab::Machines);
+    }
+
+    /// The selection clamps as the list shrinks; the last machine gone
+    /// while the tab is open lands on Instances. Keys of other tabs
+    /// (`l`, `e`, `t`, `d`, `p`) do nothing here.
+    #[test]
+    fn set_machines_clamps_and_leaves_an_emptied_tab() {
+        use crate::serve::snapshots::LinkState;
+        use crate::tui::remote::tests::sm;
+        let mut app = new_app();
+        app.set_snapshot(snapshot_with_status(1, running()));
+        app.set_machines(vec![sm("a", LinkState::Connected), sm("b", LinkState::Idle), sm("c", LinkState::Idle)]);
+        app.on_key(key(KeyCode::Char('5')));
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(app.selected(), 2);
+        for c in ['l', 'e', 'd', 'p'] {
+            app.on_key(key(KeyCode::Char(c)));
+            assert!(matches!(app.modal, Modal::None) && app.prompt.is_none(), "{c}");
+        }
+        assert!(app.pending_fetch.is_empty() && app.take_pending_unport().is_none());
+        app.on_key(key(KeyCode::Char('t')));
+        assert!(app.terms.sessions().is_empty());
+        assert_eq!(app.status.as_deref(), Some("terminal: not available on the Machines tab"));
+
+        app.set_machines(vec![sm("a", LinkState::Connected)]);
+        assert_eq!(app.selected(), 0);
+        assert_eq!(app.tab, Tab::Machines);
+        app.set_machines(Vec::new());
         assert_eq!(app.tab, Tab::Instances);
     }
 

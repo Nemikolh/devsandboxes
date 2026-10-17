@@ -20,8 +20,11 @@ Code: `src/tui/app/mod.rs` (`Tab`, `App`, `dispatch_key`, `PortRow`,
 
 ## Tabs
 
-`Tab::ALL`: Instances, Services, Ports, Inbox (`1`-`4`, `tab`/`shift-tab`,
-or a click on the title). Each keeps its own selected row.
+`Tab::ALL`: Instances, Services, Ports, Inbox, Machines (`1`-`5`,
+`tab`/`shift-tab`, or a click on the title). Machines is listed only while
+a machine is registered: `App::tabs` is what the bar (`ui.rs` `tab_spans`,
+`tab_hit`), cycling and `5` follow, and `App::set_machines` leaves the tab
+for Instances when the last machine goes. Each keeps its own selected row.
 
 - **Instances**: a tree. `visible_nodes` flattens sandboxes (config
   order) → instances → processes into `Node`s: `Sandbox`, `Instance`,
@@ -42,6 +45,11 @@ or a click on the title). Each keeps its own selected row.
   ([../daemon/forwards.md](../daemon/forwards.md)).
 - **Inbox**: threads from the shared Inbox store
   ([inbox-tab.md](inbox-tab.md)).
+- **Machines**: one read-only row per registered machine, in the
+  snapshot's `machines` order (`SnapshotMachine`, `ui.rs`
+  `draw_machines`): NAME, TARGET, STATE (`LinkState::as_str`, with `:
+  <error>` when set), AGENT (`on`/`off`), VERSION (`-` before a link)
+  ([../daemon/machines.md](../daemon/machines.md) *Dashboard*).
 
 The header's totals line marks the snapshot stale with why when the daemon
 connection is down, or after `STALE_AFTER_SECS` without a push.

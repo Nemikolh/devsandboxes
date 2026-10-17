@@ -359,7 +359,7 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
                 daemon::DaemonUpdate::Ports(rows) => app.set_ports(rows),
                 daemon::DaemonUpdate::Snapshot(list, machines) => {
                     app.snapshot_error = None;
-                    app.machines = machines;
+                    app.set_machines(machines);
                     app.thread_children = list.thread_children;
                     app.set_snapshot(list.snapshot);
                     if std::mem::take(&mut procs_after_snapshot) {

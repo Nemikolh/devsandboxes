@@ -139,15 +139,16 @@ fn tab_bar_areas(app: &App, area: Rect) -> (Rect, Rect, Option<String>) {
 const TAB_PAD: u16 = 1;
 const TAB_DIVIDER: u16 = 1;
 
-/// Every tab with its title and the columns it covers (title plus its
-/// padding), relative to the tab area's left edge and unclipped. The one
-/// layout both [`draw_tabs`] and [`tab_hit`] read, so a click lands on the
-/// tab drawn there; `Tabs`' internal layout isn't exposed to mirror.
+/// Every listed tab ([`App::tabs`]) with its title and the columns it covers
+/// (title plus its padding), relative to the tab area's left edge and
+/// unclipped. The one layout both [`draw_tabs`] and [`tab_hit`] read, so a
+/// click lands on the tab drawn there; `Tabs`' internal layout isn't exposed
+/// to mirror.
 pub(crate) fn tab_spans(app: &App) -> Vec<(Tab, String, std::ops::Range<u16>)> {
     let mut x = 0;
-    Tab::ALL
-        .iter()
-        .map(|&tab| {
+    app.tabs()
+        .into_iter()
+        .map(|tab| {
             let title = app.tab_title(tab);
             let end = x + TAB_PAD + cols(&title) as u16 + TAB_PAD;
             let span = (tab, title, x..end);
@@ -201,6 +202,7 @@ fn draw_content(frame: &mut Frame, app: &App, area: Rect) {
         Tab::Services => draw_services(frame, app, area),
         Tab::Ports => draw_ports(frame, app, area),
         Tab::Inbox => draw_inbox(frame, app, area),
+        Tab::Machines => draw_machines(frame, app, area),
     }
 }
 
@@ -668,6 +670,75 @@ fn port_state_style(state: &str) -> Style {
     } else {
         Style::default()
     }
+}
+
+/// The registered machines, in the snapshot's order: read-only rows laid
+/// out like the Ports tab (docs/architecture/dashboard/tabs-and-actions.md, *Tabs*).
+fn draw_machines(frame: &mut Frame, app: &App, area: Rect) {
+    let (top, detail_area, terms_area) = content_areas(app, area);
+    let panel_focused = app.focus == Focus::Terminal;
+
+    // Never empty here: `App::set_machines` leaves the tab with the last one.
+    draw_machines_table(frame, app, top, panel_focused);
+    selectable(app, RegionId::MachinesTable, top);
+    // No per-row detail (STATE carries the error); a plain block keeps the
+    // layout aligned with the other tabs.
+    let detail = Block::default()
+        .borders(Borders::ALL)
+        .border_style(dash_border_style(panel_focused))
+        .title("Detail");
+    frame.render_widget(Paragraph::new("").block(detail), detail_area);
+    if let Some(terms_area) = terms_area {
+        draw_terminal_panel(frame, app, terms_area);
+    }
+}
+
+fn draw_machines_table(frame: &mut Frame, app: &App, area: Rect, term_focused: bool) {
+    let name_width = app.machines.iter().map(|m| m.name.chars().count()).max().unwrap_or(0).max("NAME".len());
+    let widths = [
+        Constraint::Length(name_width as u16),
+        Constraint::Length(24),
+        Constraint::Min(14),
+        Constraint::Length(5),
+        Constraint::Length(12),
+    ];
+    let header = Row::new(["NAME", "TARGET", "STATE", "AGENT", "VERSION"].map(Cell::from))
+        .style(Style::default().add_modifier(Modifier::DIM));
+    let rows: Vec<Row> = app.machines.iter().map(machine_row).collect();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(dash_border_style(term_focused))
+        .title(Tab::Machines.title());
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(block)
+        .column_spacing(1)
+        .row_highlight_style(Style::default().fg(SELECTION).add_modifier(Modifier::BOLD));
+    let mut state = TableState::default().with_selected(Some(app.selected()));
+    frame.render_stateful_widget(table, area, &mut state);
+}
+
+/// One machine's cells: STATE is the link state, with `: <error>` when the
+/// last attempt said why.
+fn machine_row(m: &crate::serve::snapshots::SnapshotMachine) -> Row<'_> {
+    use crate::serve::snapshots::LinkState;
+    let state = match &m.error {
+        Some(e) => format!("{}: {e}", m.state.as_str()),
+        None => m.state.as_str().to_string(),
+    };
+    let style = match m.state {
+        LinkState::Connected => Style::default().fg(Color::Green),
+        LinkState::Connecting => Style::default().fg(Color::Yellow),
+        LinkState::Unreachable => Style::default().fg(Color::Red),
+        LinkState::Idle => Style::default(),
+    };
+    Row::new([
+        Cell::from(Span::styled(m.name.clone(), Style::default().fg(ACCENT))),
+        Cell::from(m.target.clone()),
+        Cell::from(Span::styled(state, style)),
+        Cell::from(if m.agent { "on" } else { "off" }),
+        Cell::from(m.version.clone().unwrap_or_else(|| "-".to_string())),
+    ])
 }
 
 fn draw_inbox(frame: &mut Frame, app: &App, area: Rect) {
@@ -2266,6 +2337,7 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
             Tab::Ports => {
                 "q quit · tab switch · ↑↓ select · d stop forward · : port … · ? help".to_string()
             }
+            Tab::Machines => "q quit · tab switch · ↑↓ select · : cmd · ? help".to_string(),
             Tab::Inbox => match app.inbox.focus {
                 InboxFocus::List => {
                     "q quit · tab switch · ↑↓ select · ←→ view · enter thread · r reply · d dismiss/done · u reopen · D clear notify · o vscode · t term · l logs · p forward · ? help"
@@ -3048,6 +3120,33 @@ mod tests {
         let screen = render(&app, 200, 30);
         let rows: Vec<&str> = screen.lines().filter(|l| l.contains("  web ")).collect();
         assert!(rows[1].contains(" running "), "{screen}");
+    }
+
+    /// The Machines tab: a row per registered machine, in order, with its
+    /// target, link state (and why), `agent` on/off and version (`-`).
+    #[test]
+    fn machines_tab_rows() {
+        use crate::serve::snapshots::LinkState;
+        use crate::tui::remote::tests::sm;
+        let mut app = phase_app(vec![("web", running(), None)]);
+        let mut down = sm("down", LinkState::Unreachable);
+        down.error = Some("Connection refused".into());
+        let mut up = sm("box", LinkState::Connected);
+        up.agent = true;
+        up.version = Some("0.9.1".into());
+        app.set_machines(vec![up, down]);
+        app.on_key(KeyEvent::from(KeyCode::Char('5')));
+        let screen = render(&app, 140, 30);
+        let header = screen.lines().find(|l| l.contains("NAME")).unwrap();
+        for col in ["TARGET", "STATE", "AGENT", "VERSION"] {
+            assert!(header.contains(col), "{screen}");
+        }
+        let line = |name: &str| screen.lines().find(|l| l.contains(&format!("│{name} "))).unwrap().to_string();
+        let (up, down) = (line("box"), line("down"));
+        assert!(up.contains("me@box") && up.contains(" connected ") && up.contains(" on ") && up.contains("0.9.1"), "{screen}");
+        assert!(down.contains(" unreachable: Connection refused ") && down.contains(" off ") && down.contains(" - "), "{screen}");
+        assert!(screen.find("│box ").unwrap() < screen.find("│down ").unwrap(), "{screen}");
+        assert!(screen.contains("Machines"), "{screen}");
     }
 
     /// The Ports tab's MACHINE column: absent with only this host's

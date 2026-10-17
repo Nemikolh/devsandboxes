@@ -22,7 +22,7 @@ use super::{App, Tab};
 const HELP_BODY: &str = "\
 Global
   q, ctrl-c   quit
-  tab / S-tab switch tab      1-4  jump to tab
+  tab / S-tab switch tab      1-5  jump to tab (5: Machines, when listed)
   :           command prompt  ?    settings & help
   drag        select (copies on release with \"copy on select\" on, above)
 {copy}
@@ -51,6 +51,9 @@ Tables (Instances / Services)
 Ports tab
   ↑/k ↓/j     move selection
   d           stop the selected forward
+
+Machines tab (listed while a machine is registered)
+  ↑/k ↓/j     move selection
 
 Inbox tab (dispatcher threads + devsbd notify records)
   The list is on the left, the selected thread on the right; selecting a
@@ -922,14 +925,14 @@ impl App {
                 let target = service_inspect_target(&row.containers).map(|c| qualify(row.machine.as_deref(), &c));
                 (ConfigKind::Service, service_key(row), target)
             }
-            // The Ports and Inbox tabs have no config to explore; `e` is a
-            // no-op (`enter` on the Inbox focuses the thread instead).
-            Tab::Ports | Tab::Inbox => return,
+            // The Ports, Inbox and Machines tabs have no config to explore;
+            // `e` is a no-op (`enter` on the Inbox focuses the thread instead).
+            Tab::Ports | Tab::Inbox | Tab::Machines => return,
         };
         let placeholder = match self.tab {
             Tab::Instances => "(no running instance)",
             Tab::Services => "(no containers)",
-            Tab::Ports | Tab::Inbox => "",
+            Tab::Ports | Tab::Inbox | Tab::Machines => "",
         };
         // Sandbox: original = raw table, resolved = merged; a service's two
         // are the same (services don't `extends`). The daemon fills both.

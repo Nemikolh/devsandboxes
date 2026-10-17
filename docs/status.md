@@ -12,7 +12,8 @@ limitation means editing this file in the same commit.
 
 ## In progress
 
-(none)
+- **tui**: a Machines tab to flip a machine's `agent` from the dashboard.
+  → [plan](plans/active/machines-tab.md)
 
 ## Planned
 

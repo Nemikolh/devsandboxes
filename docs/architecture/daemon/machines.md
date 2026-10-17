@@ -321,6 +321,9 @@ unreachable: <why>` in the header (`pending_note`), the name as `box
 (agent)` when its `agent` is on. `p` / `:port` on a remote row sends
 `forwards.add` with `machine` and the row's root (the forward binds here,
 listed with the rest on the Ports tab: `forwards.list {machines: true}`);
-VS Code on a remote row answers "isn't supported yet".
+VS Code on a remote row answers "isn't supported yet". The Machines tab,
+listed while a machine is registered, shows every registered machine from
+the snapshot's `machines` with its link state (and error) and `agent`
+([tabs-and-actions.md](../dashboard/tabs-and-actions.md) *Tabs*).
 
 Limitations: [status.md](../../status.md#daemon)

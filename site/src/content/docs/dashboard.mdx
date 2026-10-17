@@ -127,18 +127,18 @@ A script or an agent in a sandbox reaches you with `devsbd notify "tests pass"`.
 
 ## Other machines
 
-With [machines](/docs/host-daemon#other-machines) registered, the dashboard shows their sandboxes and instances too, with a MACHINE column (blank for this host's). Every key works on their rows, terminals included (over `ssh -t`), and `:` commands take `my-server/web-2`. A machine that's down keeps its last rows, shown `unreachable`; one not reached yet is a note in the header. `p` forwards a port from a machine's row to this host, listed in the Ports tab with its MACHINE. `o` (VS Code) doesn't work on a machine's rows yet.
+With [machines](/docs/host-daemon#other-machines) registered, the dashboard shows their sandboxes and instances too, with a MACHINE column (blank for this host's). Every key works on their rows, terminals included (over `ssh -t`), and `:` commands take `my-server/web-2`. A machine that's down keeps its last rows, shown `unreachable`; one not reached yet is a note in the header. `p` forwards a port from a machine's row to this host, listed in the Ports tab with its MACHINE. `o` (VS Code) doesn't work on a machine's rows yet. A Machines tab (`5`) lists every registered machine: its ssh target, whether it's connected (and why not), whether your ssh agent reaches it, and its devsandbox version.
 
 ## Every key
 
-The real dashboard's keys, also in its `?` screen. The Preview column says what the preview on this page fakes. Clicking a tab title switches to it, like `1`–`4`. Dragging selects text and releasing copies it (*copy on select*, on by default; turn it off in `?` to copy only with `ctrl-shift-c`, or `ctrl-c` in terminals that keep `ctrl-shift-c` for themselves, as the dashboard tells you); an app in the integrated terminal that uses the mouse (vim, tmux) gets the drag and hover instead, and what it copies reaches your clipboard (*terminal clipboard* in `?` turns that off).
+The real dashboard's keys, also in its `?` screen. The Preview column says what the preview on this page fakes. Clicking a tab title switches to it, like `1`–`5`. Dragging selects text and releasing copies it (*copy on select*, on by default; turn it off in `?` to copy only with `ctrl-shift-c`, or `ctrl-c` in terminals that keep `ctrl-shift-c` for themselves, as the dashboard tells you); an app in the integrated terminal that uses the mouse (vim, tmux) gets the drag and hover instead, and what it copies reaches your clipboard (*terminal clipboard* in `?` turns that off).
 
 ### Everywhere
 
 | Key                 | Action               | Preview                          |
 | ------------------- | -------------------- | -------------------------------- |
 | `tab` / `shift-tab` | Next / previous tab  | `←` `→` instead (Tab leaves it) |
-| `1`–`4`             | Jump to a tab        | yes                              |
+| `1`–`5`             | Jump to a tab (`5`: Machines, with a machine registered) | `1`–`4`              |
 | `:`                 | Command prompt       | yes                              |
 | `?`                 | Settings & help: `space` / `enter` / click toggles a setting, `tab` moves between them | help only |
 | `q`, `ctrl-c`       | Quit                 | no                               |

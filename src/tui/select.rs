@@ -26,6 +26,7 @@ pub enum RegionId {
     ServicesTable,
     ServiceDetail,
     PortsTable,
+    MachinesTable,
     InboxList,
     /// The thread pane's pinned header (screen cells: it never scrolls).
     InboxHeader,
