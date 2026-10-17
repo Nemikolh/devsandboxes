@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::devsbd::bridge::{self, Bridge};
 use crate::devsbd::forward::{Opened, Opener, ProcessLookup, Route};
-use crate::serve::machines::ssh::Tail;
+use crate::serve::machines::ssh::{self, SkipError, Tail};
 use crate::state::State;
 
 /// What starts the header line; anything before it (a chatty login shell, a
@@ -121,29 +121,12 @@ impl std::fmt::Display for HeaderError {
 /// skipped; the magic may follow noise on its line (a motd without a final
 /// newline). Bounded by [`HEADER_LIMIT`].
 pub fn read_header(r: &mut impl Read) -> Result<Header, HeaderError> {
-    let mut line = Vec::new();
-    let mut total = 0;
-    let mut byte = [0u8; 1];
-    loop {
-        match r.read(&mut byte) {
-            Ok(0) => return Err(HeaderError::Eof),
-            Ok(_) => {}
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(HeaderError::Io(e)),
-        }
-        total += 1;
-        if total > HEADER_LIMIT {
-            return Err(HeaderError::TooLong);
-        }
-        if byte[0] != b'\n' {
-            line.push(byte[0]);
-            continue;
-        }
-        if let Some(header) = parse_line(&line)? {
-            return Ok(header);
-        }
-        line.clear();
-    }
+    ssh::skip_lines(r, HEADER_LIMIT, &mut None, parse_line).map_err(|e| match e {
+        SkipError::Eof => HeaderError::Eof,
+        SkipError::TooLong => HeaderError::TooLong,
+        SkipError::Io(e) => HeaderError::Io(e),
+        SkipError::Refused(e) => e,
+    })
 }
 
 /// One line: `Ok(None)` when it's noise.

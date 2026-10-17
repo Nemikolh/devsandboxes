@@ -11,7 +11,10 @@
 //! into one end of a socket pair by threads. So `client::Conn` and
 //! `client::hello` work on a machine connection as they do on the local
 //! daemon's, read timeouts included, and tests dial a test daemon's socket
-//! straight.
+//! behind a pump that adds the relay's sentinel (`test_support::relayed`).
+//!
+//! [`skip_lines`] is how a reader finds our first line past what the login
+//! shell printed: the link's sentinel, a remote forward's tunnel header.
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
@@ -361,6 +364,98 @@ fn pipe(from: &mut impl Read, to: &mut impl std::io::Write) {
         if to.write_all(&buf[..n]).and_then(|()| to.flush()).is_err() {
             return;
         }
+    }
+}
+
+/// How much of the first skipped line [`skip_lines`] keeps, in chars.
+const NOISE_CHARS: usize = 200;
+
+/// Why [`skip_lines`] found no line.
+#[derive(Debug)]
+pub enum SkipError<E> {
+    /// The stream ended first.
+    Eof,
+    /// The bound was reached first.
+    TooLong,
+    Io(std::io::Error),
+    /// The matcher refused a line.
+    Refused(E),
+}
+
+/// Read `r` up to the first line `matcher` takes (`Ok(Some)`), skipping the
+/// ones it doesn't (`Ok(None)`): what a login shell or a motd printed before
+/// our own first line. One byte at a time, so nothing past that line's
+/// newline is consumed; at most `limit` bytes, skipped lines included. The
+/// matcher gets a line without its `\n`. `noise` gets the first non-blank
+/// skipped line (or, when nothing was skipped, the partial line the stream
+/// or the bound cut off), lossy and cut at [`NOISE_CHARS`], for diagnostics.
+pub fn skip_lines<T, E>(
+    r: &mut impl Read,
+    limit: usize,
+    noise: &mut Option<String>,
+    mut matcher: impl FnMut(&[u8]) -> Result<Option<T>, E>,
+) -> Result<T, SkipError<E>> {
+    let mut line = Vec::new();
+    let mut total = 0;
+    let mut byte = [0u8; 1];
+    let keep = |noise: &mut Option<String>, line: &[u8]| {
+        let text = String::from_utf8_lossy(line);
+        let text = text.trim();
+        if noise.is_none() && !text.is_empty() {
+            *noise = Some(text.chars().take(NOISE_CHARS).collect());
+        }
+    };
+    loop {
+        match r.read(&mut byte) {
+            Ok(0) => {
+                keep(noise, &line);
+                return Err(SkipError::Eof);
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => {
+                keep(noise, &line);
+                return Err(SkipError::Io(e));
+            }
+        }
+        total += 1;
+        if total > limit {
+            keep(noise, &line);
+            return Err(SkipError::TooLong);
+        }
+        if byte[0] != b'\n' {
+            line.push(byte[0]);
+            continue;
+        }
+        if let Some(found) = matcher(&line).map_err(SkipError::Refused)? {
+            return Ok(found);
+        }
+        keep(noise, &line);
+        line.clear();
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    /// A test daemon's socket as a machine link sees it through the relay:
+    /// the relay's first line (`relay::write_sentinel`), then the daemon's
+    /// bytes, both ways pumped over a socket pair. Either end closing
+    /// reaches the other as EOF.
+    pub fn relayed(daemon: Stream) -> Result<Duplex> {
+        let (ours, theirs) = Stream::pair()?;
+        crate::serve::relay::write_sentinel(&mut &theirs, true)?;
+        let (theirs_up, daemon_down) = (theirs.try_clone()?, daemon.try_clone()?);
+        std::thread::spawn(move || {
+            pipe(&mut &theirs_up, &mut &daemon);
+            let _ = daemon.shutdown(Shutdown::Write);
+        });
+        std::thread::spawn(move || {
+            pipe(&mut &daemon_down, &mut &theirs);
+            let _ = theirs.shutdown(Shutdown::Write);
+        });
+        Ok(Duplex::socket(ours))
     }
 }
 

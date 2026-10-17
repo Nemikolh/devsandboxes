@@ -70,8 +70,21 @@ works on it unchanged and tests dial a second test daemon's socket.
 `link.rs`: the hello says version `0.0.0`, build 0, so a link never hands
 off the remote daemon (only that host's own clients upgrade it). The
 `protocol` must match (`LinkError`); differing semvers within one protocol
-are a warning at add and shown in `machine ls`. A remote login shell that
-prints to stdout breaks the hello (the error carries ssh's stderr tail).
+are a warning at add and shown in `machine ls`.
+
+Before the hello, `handshake` reads up to the relay's sentinel: the relay
+(`--session-env`) writes `\n` + `devsandbox-api 1\n` once it reaches the
+remote daemon (`relay::write_sentinel`), and the link skips every line
+before it (`ssh::skip_lines`, the same byte-at-a-time skipper as a remote
+forward's tunnel header, so nothing past the sentinel is consumed),
+bounded at 64 KiB, with the hello's read timeout. The leading newline ends
+a motd printed without a final one, so the sentinel always starts a line
+and is matched as a whole line (a trailing `\r` tolerated); another version
+is an error naming the older side. The first skipped line (cut at 200
+chars) is kept on `Link::noise`; a held link logs it to `serve.log` once
+per connect (`machine <name>: login shell printed: …`). EOF before the
+sentinel is `LinkError::Closed` with ssh's stderr tail; the bound or a
+timeout is `LinkError::Other` with that first line.
 
 ## Held links: `Machines`
 

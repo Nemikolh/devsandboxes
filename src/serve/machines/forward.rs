@@ -379,7 +379,7 @@ mod tests {
     use crate::serve::daemon::tests::{opts, scratch, spawn_daemon};
     use crate::serve::daemon::Exit;
     use crate::serve::endpoint::{self, Stream};
-    use crate::serve::machines::ssh::Duplex;
+    use crate::serve::machines::ssh;
     use crate::serve::proto::{ErrorBody, Version};
 
     #[test]
@@ -511,7 +511,7 @@ mod tests {
             local.dial = Some({
                 let remote_dir = remote_dir.clone();
                 Arc::new(move |e: &Entry, _: Option<&Path>| match e.name.as_str() {
-                    "box" => Ok(Duplex::socket(endpoint::connect(&remote_dir)?)),
+                    "box" => ssh::test_support::relayed(endpoint::connect(&remote_dir)?),
                     other => anyhow::bail!("ssh: Could not resolve hostname {other}"),
                 })
             });

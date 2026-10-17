@@ -970,8 +970,11 @@ $ devsandbox api --stdio
 A client that isn't a devsandbox binary can send `"version": "0.0.0"`: the
 relay's own hello already handed off an older daemon.
 
-`--session-env` (hidden) is for a machine link's relay (*Machines*): the
-upstream copy then goes line by line, and a request whose `method` is a
+`--session-env` (hidden) is for a machine link's relay (*Machines*): once
+connected to the daemon, the relay first writes a newline and the sentinel
+line `devsandbox-api 1` to stdout (`relay::write_sentinel`), so the link can
+skip whatever the remote login shell printed before it. The upstream copy
+then goes line by line, and a request whose `method` is a
 verb gets its `params.env` replaced by the relay's own environment (the
 remote login shell's), since the requester's is another host's. Every
 other line, and everything downstream, passes as is; the 1 MiB line limit

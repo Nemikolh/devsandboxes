@@ -269,7 +269,7 @@ mod tests {
     use crate::serve::daemon::tests::{opts, scratch, spawn_daemon};
     use crate::serve::daemon::{Exit, Options};
     use crate::serve::endpoint;
-    use crate::serve::machines::ssh::Duplex;
+    use crate::serve::machines::ssh;
     use crate::serve::proto::Version;
 
     /// Connect to the test daemon in `dir` as a client, retrying while it binds.
@@ -305,7 +305,7 @@ mod tests {
         let mut o = opts(1, 1500);
         o.machines = Some(base.join("machines.toml"));
         o.dial = Some(match remote {
-            Some(remote) => Arc::new(move |_: &Entry, _: Option<&Path>| Ok(Duplex::socket(endpoint::connect(&remote)?))),
+            Some(remote) => Arc::new(move |_: &Entry, _: Option<&Path>| ssh::test_support::relayed(endpoint::connect(&remote)?)),
             None => Arc::new(|e: &Entry, _: Option<&Path>| anyhow::bail!("ssh: Could not resolve hostname {}", e.target)),
         });
         o

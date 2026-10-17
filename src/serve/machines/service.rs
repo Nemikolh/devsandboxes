@@ -342,6 +342,9 @@ impl<'a> LinkLoop<'a> {
             let failed = match self.connect() {
                 Ok(mut link) => {
                     self.failures = 0;
+                    if let Some(noise) = &link.noise {
+                        (self.inner.log)(&format!("machine {}: login shell printed: {noise}", self.entry.name));
+                    }
                     let remote = link.remote().version.clone();
                     self.inner.remotes.update(&self.entry.name, |m| m.version = Some(remote));
                     self.set(LinkState::Connected, None);
@@ -559,7 +562,7 @@ mod tests {
     use crate::serve::daemon::tests::{fake_join, opts, scratch, spawn_daemon};
     use crate::serve::daemon::{Exit, Options};
     use crate::serve::endpoint;
-    use crate::serve::machines::ssh::Duplex;
+    use crate::serve::machines::ssh::{self, Duplex};
     use crate::serve::proto::{Notification, Version};
     use crate::serve::snapshots::Join;
 
@@ -633,7 +636,7 @@ mod tests {
             let (remote_dir, dials) = (remote_dir.clone(), Arc::clone(&dials));
             Arc::new(move |_: &Entry, _: Option<&Path>| {
                 dials.fetch_add(1, Ordering::SeqCst);
-                Ok(Duplex::socket(endpoint::connect(&remote_dir)?))
+                ssh::test_support::relayed(endpoint::connect(&remote_dir)?)
             })
         });
         let local = spawn_daemon(&local_dir, local_opts);
@@ -714,6 +717,7 @@ mod tests {
     /// anything else.
     fn mute_peer() -> Duplex {
         let (ours, theirs) = UnixStream::pair().unwrap();
+        crate::serve::relay::write_sentinel(&mut &theirs, true).unwrap();
         std::thread::spawn(move || {
             let mut r = BufReader::new(theirs.try_clone().unwrap());
             let mut line = String::new();

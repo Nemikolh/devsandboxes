@@ -13,7 +13,9 @@
 //! goes line by line and a verb request's `params.env` becomes the relay's
 //! own, the remote login shell's env, since the requester's (another host's)
 //! means nothing here.
-//! Every other line, and every byte downstream, still passes as is.
+//! Every other line, and every byte downstream, still passes as is, after
+//! one line of the relay's own ([`write_sentinel`]) so the link can tell the
+//! relay's bytes from whatever the login shell printed first.
 //!
 //! Exit: 0 once stdin hits EOF (after the daemon has answered what was in
 //! flight, up to [`GRACE`]) or stdout is gone; [`EXIT_NO_HOST`] (75) when the
@@ -38,6 +40,15 @@ use crate::devsbd::control::{EXIT_NO_HOST, EXIT_OK};
 /// How long, after stdin's EOF, the relay waits for the daemon to answer the
 /// requests still in flight and hang up.
 pub const GRACE: Duration = Duration::from_secs(5);
+
+/// The line a `--session-env` relay writes before the daemon's bytes:
+/// `devsandbox-api <SENTINEL_VERSION>`. A machine link (`link::handshake`)
+/// skips everything before it.
+pub const SENTINEL: &str = "devsandbox-api";
+
+/// The sentinel's format version, after the word. Bumped only on an
+/// incompatible change to what follows it; a reader refuses any other.
+pub const SENTINEL_VERSION: u32 = 1;
 
 /// How a relay ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,8 +78,20 @@ impl End {
 pub fn stdio(client: &str, session_env: bool) -> Result<i32> {
     let dir = endpoint::socket_dir()?;
     let stream = open(&dir, || client::connect(&dir, client))?;
+    write_sentinel(&mut std::io::stdout(), session_env).context("cannot write to stdout")?;
     let env = session_env.then(|| super::verbs_client::caller_env(std::env::vars_os()));
     Ok(pump(std::io::stdin(), std::io::stdout(), stream, GRACE, env)?.code())
+}
+
+/// With `session_env` (a machine link's relay), the sentinel line, flushed;
+/// else nothing. Its leading newline ends a motd printed without a final
+/// one, so the sentinel always starts a line.
+pub fn write_sentinel(out: &mut impl Write, session_env: bool) -> std::io::Result<()> {
+    if !session_env {
+        return Ok(());
+    }
+    write!(out, "\n{SENTINEL} {SENTINEL_VERSION}\n")?;
+    out.flush()
 }
 
 /// A fresh connection for the relay, after `probe` (a hello'd connection: the
@@ -442,6 +465,16 @@ mod tests {
         from_relay.read_to_end(&mut rest).unwrap();
         drop((daemon, from_relay));
         assert_eq!(relay.join().unwrap().unwrap(), End::Stdin);
+    }
+
+    #[test]
+    fn only_a_session_env_relay_writes_the_sentinel() {
+        let mut out = Vec::new();
+        write_sentinel(&mut out, true).unwrap();
+        assert_eq!(out, b"\ndevsandbox-api 1\n");
+        let mut out = Vec::new();
+        write_sentinel(&mut out, false).unwrap();
+        assert!(out.is_empty(), "plain --stdio writes only the daemon's bytes");
     }
 
     #[test]
