@@ -1,7 +1,12 @@
+> Archived 2026-10-17. Historical, may be wrong; do not use as a reference.
+> Current: [architecture/daemon/machines.md](../../architecture/daemon/machines.md#agent),
+> [architecture/helper/ssh-agent.md](../../architecture/helper/ssh-agent.md),
+> [decisions/0036](../../decisions/0036-machines-get-the-agent-over-our-relay-never-ssh-a.md)
+
 # Machines: noisy login shells, opt-in agent forwarding
 
-Status: in progress
-Items 1 and 2 of [machines-next](machines-next.md). Items 3–5 there (VS
+Status: shipped
+Items 1 and 2 of [machines-next](../active/machines-next.md). Items 3–5 there (VS
 Code spike, remote Inbox, nameless commands) stay unplanned.
 
 Today ([machines](../../architecture/daemon/machines.md),

@@ -12,9 +12,7 @@ limitation means editing this file in the same commit.
 
 ## In progress
 
-- **machines**: a noisy login shell no longer breaking the link, agent
-  forwarding opt-in per machine and switchable live.
-  → [plan](plans/active/machines-agent.md)
+(none)
 
 ## Planned
 
@@ -166,6 +164,14 @@ limitation means editing this file in the same commit.
   machine's agent relay goes with it for the rest of that session unless
   something else (a dashboard) wants the machine.
   → [machines](architecture/daemon/machines.md#the-cli-clirs); `machines::cli::hold`
+- Every agent check on a machine with a live agent relay (`host_agent`'s
+  liveness connect: each `Bridges::reconcile` of its daemon's poll, each
+  verb line its API relay rewrites) opens and closes a stream through the
+  relay to this host's agent. → [machines](architecture/daemon/machines.md#agent);
+  `bridge::agent_live`
+- Several hosts linking one machine with `agent` on each run a relay;
+  processes there use the newest live socket (mtime), not their caller's.
+  → [machines](architecture/daemon/machines.md#agent); `endpoint::agent_sockets`
 - `machine add` has no `--command`; a remote devsandbox off `PATH` is set by
   hand in `machines.toml`. → [machines](architecture/daemon/machines.md)
 - Remote rows live in memory: a fresh daemon shows a machine without rows
