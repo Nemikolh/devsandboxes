@@ -672,8 +672,9 @@ fn port_state_style(state: &str) -> Style {
     }
 }
 
-/// The registered machines, in the snapshot's order: read-only rows laid
-/// out like the Ports tab (docs/architecture/dashboard/tabs-and-actions.md, *Tabs*).
+/// The registered machines, in the snapshot's order: rows laid out like the
+/// Ports tab; `a` changes `agent` through `machines.set`
+/// (docs/architecture/dashboard/tabs-and-actions.md, *Tabs*).
 fn draw_machines(frame: &mut Frame, app: &App, area: Rect) {
     let (top, detail_area, terms_area) = content_areas(app, area);
     let panel_focused = app.focus == Focus::Terminal;

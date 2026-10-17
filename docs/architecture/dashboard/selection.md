@@ -26,7 +26,7 @@ borders included).
 
 Each draw registers the selectable panes of that frame (`App::regions`, a
 `RefCell` since drawing borrows `App` immutably), one per `RegionId`:
-the instances tree, Detail, services table and detail, ports table, Inbox
+the instances tree, Detail, services table and detail, ports table, machines table, Inbox
 list, thread header and feed, terminal body, config modal panes, text
 modals. A press is hit-tested against what is on screen. A `Region`'s
 `Source` says where its text comes from:

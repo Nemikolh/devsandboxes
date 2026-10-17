@@ -239,7 +239,8 @@ with `agent::serve`, its `allowed()` reading the live flag. A failed
 relay (ssh, handshake, keepalive) is logged (`machine <name>: agent
 relay: <why>`, with ssh's stderr tail) and retried with the link's
 backoff. The relay's socket and ssh are kept where the service reaches
-them (`Ctl::kill_relay`): `machine set <name> --agent off` kills it at
+them (`Ctl::kill_relay`): turning `agent` off (`machine set <name>
+--agent off`, or `a` on the dashboard's Machines tab) kills it at
 once (in-flight agent streams cut, later `Open`s refused) without
 restarting the link; the want ending kills it within a tick; `rm` and
 daemon exit kill it and join the thread.

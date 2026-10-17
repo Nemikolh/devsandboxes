@@ -689,7 +689,7 @@ impl App {
     }
 
     /// A left press on a tab title switches to that tab, through [`Self::set_tab`]
-    /// like the `1`-`4` keys (so leaving the Inbox reads what it showed). Not
+    /// like the `1`-`5` keys (so leaving the Inbox reads what it showed). Not
     /// under a modal or the prompt, which own the input. Unlike the keys it
     /// works while an Inbox thread has focus: the click names its target.
     /// The terminal panel's click-away unfocuses a focused terminal on the
