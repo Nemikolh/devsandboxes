@@ -59,9 +59,11 @@ no `events_argv`, and podman with `events_logger = "none"`, a runtime
 that's down or a child that died all leave the stream not live; the
 watcher respawns it every `EVENTS_RETRY` (10 s), logging the loss and the
 recovery once each in `serve.log`. `QUIET_POLL` is the safety net for what
-no event announces: a missed event, a config edit that makes a running
-instance a holder (`holds_host`), a host agent appearing without a
-`bridges.ensure`.
+no event announces: a missed event, a host agent appearing without a
+`bridges.ensure`. Config edits don't wait for it: `serve-watch` stamps
+every known root's config files and wakes the poll on a change
+([Notifications](#notifications)), and each pass re-reads them
+(`holds_host`, the snapshots).
 
 ```
                        poll thread sleeping
@@ -149,6 +151,13 @@ one `instances.changed`, latest `instances.snapshot` per root,
 goes through its one writer lock; a client that doesn't drain its socket
 for `WRITE_TIMEOUT` (5 s) is disconnected. Exiting, the daemon sends
 `closing {reason}` ([role.md](role.md#drain)).
+
+The same thread stamps the config files of every root `state.toml` records
+plus every watched root (`config_stamps`: each `config::candidates` path,
+present or not, so an edit, a new file and a rename between names all
+count). A stamp that moves under an already-known root wakes the poll
+(`Waker::refresh`); a root that's merely new gets its pass from the
+`state.toml` write or the watch that added it.
 
 Watches live with the connection: a hang-up drops them, and
 `unsubscribe` from `instances` clears them.

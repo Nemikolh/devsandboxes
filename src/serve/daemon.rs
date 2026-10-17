@@ -817,11 +817,15 @@ impl Drop for Watcher {
 /// `instances.changed` covers both the host's container poll (`instances`)
 /// and `state.toml` writes (phases, new/removed/renamed instances, done
 /// flags), stamped like the store each tick, so a build's phase reaches a
-/// subscriber within [`WATCH`].
+/// subscriber within [`WATCH`]. Config files are stamped too
+/// ([`config_stamps`]): an edit wakes the poll, which re-reads them (holders,
+/// snapshots), since no container event announces one.
 fn watch(shared: &Shared, instances: Option<Arc<AtomicU64>>, stop: &AtomicBool) {
     let mut seen = ops::generation();
     let mut stamp = ops::stamp(&shared.inbox);
     let mut state_stamp = crate::inbox::store::stamp_at(&shared.state);
+    let mut recorded = recorded_roots(&shared.state);
+    let mut configs = config_stamps(recorded.iter().chain(&shared.watched_roots()));
     let instances_now = || instances.as_ref().map_or(0, |c| c.load(Ordering::Acquire));
     let mut instances_seen = instances_now();
     while !stop.load(Ordering::SeqCst) {
@@ -843,11 +847,44 @@ fn watch(shared: &Shared, instances: Option<Arc<AtomicU64>>, stop: &AtomicBool) 
             {
                 poll.refresh();
             }
+            if state_now != state_stamp {
+                recorded = recorded_roots(&shared.state);
+            }
             (instances_seen, state_stamp) = (n, state_now);
             shared.publish(Topic::Instances, |p| p.instances = true);
         }
+        let configs_now = config_stamps(recorded.iter().chain(&shared.watched_roots()));
+        if configs_now != configs {
+            // A root merely added (a new instance, a new watch) gets its pass
+            // from the state write or the watch itself; only a stamp that
+            // moved under a root already known is an edit.
+            let edited = configs_now.iter().any(|(root, s)| configs.get(root).is_some_and(|old| old != s));
+            if edited && let Some(poll) = shared.bridges.get() {
+                poll.refresh();
+            }
+            configs = configs_now;
+        }
     }
 }
+
+/// The config roots `state.toml` records (empty if it won't load: the next
+/// write retries).
+fn recorded_roots(state: &Path) -> BTreeSet<PathBuf> {
+    crate::state::State::load_at(state).map(|s| super::host::config_roots(&s).into_iter().collect()).unwrap_or_default()
+}
+
+/// Each root's config candidates' stamps ([`crate::config::candidates`]):
+/// one `stat` per path, cheap enough for every [`WATCH`] tick.
+fn config_stamps<'a>(roots: impl Iterator<Item = &'a PathBuf>) -> ConfigStamps {
+    roots
+        .map(|root| {
+            let stamps = crate::config::candidates(root).map(|p| crate::inbox::store::stamp_at(&p)).collect();
+            (root.clone(), stamps)
+        })
+        .collect()
+}
+
+type ConfigStamps = BTreeMap<PathBuf, Vec<Option<(std::time::SystemTime, u64)>>>;
 
 /// A connection's own state, on its thread.
 struct ConnState {
@@ -1249,6 +1286,26 @@ pub(crate) mod tests {
         let dir = std::env::temp_dir().join(format!("dsv-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
+    }
+
+    #[test]
+    fn config_stamps_move_on_edit_create_and_rename() {
+        let root = scratch("cfg-stamps");
+        std::fs::create_dir_all(&root).unwrap();
+        let roots = [root.clone()];
+        let at = || config_stamps(roots.iter());
+        let empty = at();
+        assert_eq!(empty[&root].len(), 4, "three names plus the legacy one");
+        std::fs::write(root.join("devsandboxes.toml"), "[sandbox.a]\n").unwrap();
+        let created = at();
+        assert_ne!(created, empty);
+        std::fs::write(root.join("devsandboxes.toml"), "[sandbox.a]\ninbox = true\n").unwrap();
+        let edited = at();
+        assert_ne!(edited, created, "the length moved");
+        std::fs::rename(root.join("devsandboxes.toml"), root.join("devsandboxes.yaml")).unwrap();
+        assert_ne!(at(), edited);
+        assert_eq!(at(), at(), "no change, no difference");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     pub(crate) fn opts(build: u64, idle_ms: u64) -> Options {

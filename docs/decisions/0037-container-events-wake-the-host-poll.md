@@ -26,8 +26,9 @@ container changes over `events`.
 - An idle daemon costs one blocked child instead of a CLI spawn every 5 s;
   container changes reach bridges, forwards and `instances.changed` at once
   instead of within 5 s.
-- What no event announces (a config edit making a running instance a
-  holder, a host agent appearing without `bridges.ensure`) waits up to
-  60 s while idle.
+- Config edits announce no container event, so `serve-watch` stamps every
+  known root's config files and wakes the poll on a change.
+- What nothing announces (a host agent appearing without
+  `bridges.ensure`) waits up to 60 s while idle.
 
 Source: the runtime-events plan.

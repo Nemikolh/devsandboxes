@@ -151,9 +151,8 @@ limitation means editing this file in the same commit.
   sandboxes but no instance never autostarts, dashboard open or not.
   → [host poll](architecture/daemon/host-poll.md); `Host::start`, `config_roots`
 - The daemon doesn't enforce `hello`. → [api](reference/api.md); `serve::daemon::handle`
-- With the event stream live and nothing watched, a config edit that makes
-  a running instance a holder and a host agent appearing without a
-  `bridges.ensure` are noticed only within `QUIET_POLL` (60 s).
+- With the event stream live and nothing watched, a host agent appearing
+  without a `bridges.ensure` is noticed only within `QUIET_POLL` (60 s).
   → [host poll](architecture/daemon/host-poll.md#the-poll); `host::tick`
 - Apple `container` has no event stream, so its daemon lists containers
   every `POLL` (5 s) even when idle.

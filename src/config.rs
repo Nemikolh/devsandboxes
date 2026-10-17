@@ -14,6 +14,12 @@ const CONFIG_FILES: [&str; 3] = [CONFIG_FILE, "devsandboxes.yaml", "devsandboxes
 /// [`CONFIG_FILE`] by [`migrate_legacy`].
 const LEGACY_CONFIG_FILE: &str = "config.toml";
 
+/// Every path [`find`] may pick in `dir`, present or not: what a watcher
+/// stamps to notice an edit, a new file or a rename between them.
+pub fn candidates(dir: &Path) -> impl Iterator<Item = PathBuf> + '_ {
+    CONFIG_FILES.iter().chain([&LEGACY_CONFIG_FILE]).map(move |f| dir.join(f))
+}
+
 /// The config file in `dir`: one of [`CONFIG_FILES`], else a legacy
 /// `config.toml` that looks like a devsandbox config, else `None`.
 pub fn find(dir: &Path) -> Result<Option<PathBuf>> {

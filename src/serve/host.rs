@@ -51,9 +51,8 @@ pub const POLL: Duration = Duration::from_secs(5);
 
 /// The poll's sleep while the runtime's event stream is live (nothing
 /// watched, bridges settled): a safety net, since events wake it. It catches
-/// what no event announces: a missed event, a config edit making a running
-/// instance a holder ([`holds_host`]), a host agent appearing without a
-/// `bridges.ensure`.
+/// what nothing announces: a missed event, a host agent appearing without a
+/// `bridges.ensure`. (Config edits wake the poll through `serve-watch`.)
 pub const QUIET_POLL: Duration = Duration::from_secs(60);
 
 /// Called with each successful poll's running container names.
