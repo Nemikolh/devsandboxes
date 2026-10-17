@@ -17,6 +17,8 @@ remote name the CLI refuses `vscode` and `inbox` (`MachineUse::Refused` in
 `src/serve/machines/cli.rs`); the dashboard answers `o` on a remote row
 with a "not yet" line (`not_yet_code` in `src/tui/app/actions.rs`).
 
+Items 1 and 2 are being built: [machines-agent](machines-agent.md).
+
 ## 1. A noisy login shell doesn't break the link
 
 The remote command runs through the login shell (`ssh::remote_command`), so
