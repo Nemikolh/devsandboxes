@@ -16,6 +16,8 @@
 //! - `daemon`: the accept loop, lock, handoff and idle exit
 //! - `host`: the live host side: the one container poll (bridges, forwards,
 //!   watched roots' snapshots) and the autostart pass
+//! - `events`: the runtime's container event stream (`docker events`) as
+//!   wake-ups, on its own thread
 //! - `snapshots`: the watched roots' snapshot cache and the poll's cadence
 //! - `forwards`: the port forwards (ad-hoc and configured), on their own thread
 //! - `forward_store`: `forwards.toml`, the ad-hoc forwards a successor restores
@@ -35,6 +37,7 @@ pub mod api;
 pub mod client;
 pub mod daemon;
 pub mod endpoint;
+mod events;
 pub mod forward_store;
 pub mod forwards;
 mod host;

@@ -94,7 +94,10 @@ Start with `docs/README.md` (reading order and map) and
   `forwardPorts` against `host.rs`'s running poll, with host ports saved in
   `state.toml`; `forwards.*` talk to it over a request/reply channel),
   `forward_store.rs` (`forwards.toml`: the ad-hoc forwards, with their bound
-  host ports, that a starting registry restores; locked atomic writes).
+  host ports, that a starting registry restores; locked atomic writes),
+  `events.rs` (`EventWatcher`: the `serve-events` thread following
+  `Backend::events_argv`, a wake per relevant event, respawned after
+  `EVENTS_RETRY`; program injectable, tests run `sh`).
   `daemon.rs` also owns `subscribe`: a `serve-watch` thread flags changes on
   each connection's `Outbox`, a per-connection notifier writes them; and
   `instances.watch`/`unwatch` (per-connection watched roots in `Pending`,
@@ -142,7 +145,9 @@ Start with `docs/README.md` (reading order and map) and
   snapshot (`instances.watch {machines: true}`).
 - `src/runtime/` — backend abstraction over docker/podman/Apple container.
   `procs.rs` parses a container's `ps` listing and its helper's `devsbd run
-  ls` (pure; what `instances.procs` answers).
+  ls` (pure; what `instances.procs` answers). `events.rs` parses one
+  `docker`/`podman events` line and whitelists the actions worth a re-list
+  (never exec events: the bridges' own execs would loop).
 - `devsbd/` — static in-container helper (workspace member), built by
   `scripts/build-devsbd.sh` and embedded by `build.rs`; `src/devsbd.rs` holds
   the embedded blobs + install, `src/devsbd/proto.rs` the frame protocol

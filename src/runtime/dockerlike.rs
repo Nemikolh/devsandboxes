@@ -66,6 +66,14 @@ impl Backend for Dockerlike {
         self.output_quiet(&["inspect", container])
     }
 
+    /// No `event=` filter: docker says `die` where podman says `died`, so
+    /// [`super::events::relevant`] whitelists instead.
+    fn events_argv(&self) -> Option<Vec<&'static str>> {
+        // Podman's `--format` takes `json`, not a Go template of it.
+        let format = if self.name == "podman" { "json" } else { "{{json .}}" };
+        Some(vec!["events", "--filter", "type=container", "--format", format])
+    }
+
     fn list(&self, all: bool, name_prefix: &str) -> Result<Vec<ContainerRow>> {
         let mut args = vec!["ps"];
         if all {

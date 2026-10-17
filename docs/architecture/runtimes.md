@@ -6,7 +6,7 @@ touching any runtime call or adding a runtime capability.
 Code: `src/runtime/mod.rs` (`Backend`, `backend()`, `default_backend_name`,
 `backend_named`, `NAME_PREFIX`, `fixed_path`), `src/runtime/dockerlike.rs`
 (`Dockerlike::DOCKER`/`PODMAN`), `src/runtime/apple.rs` (`AppleContainer`),
-`src/runtime/bounded.rs`, `src/runtime/procs.rs`.
+`src/runtime/bounded.rs`, `src/runtime/procs.rs`, `src/runtime/events.rs`.
 
 ## Backend
 
@@ -21,7 +21,8 @@ process-wide backend, resolved once by `backend()`.
 - **Queries** (per runtime): `is_running`, `label`, `network_exists`,
   `inspect_json`, `list` (rows as `ContainerRow`: name, image, status,
   normalized `state`, labels, host ports), `stats`, `server_version`,
-  `logs_tail`, `proc_list`, `image_entrypoint`.
+  `logs_tail`, `proc_list`, `image_entrypoint`, `events_argv` (see
+  [events](#events)).
 - **Mutations that differ in shape**: `remove_force`, `network_run_args` +
   `connect_networks`, `service_alias_args` + `wire_service_dns`,
   `set_restart_policy`, `remove_volume`, `signal_proc` (`exec kill -<n>`, same
@@ -125,6 +126,22 @@ a container controls: dispatcher run ops, `devsbd run ls`, the dispatch
 from: `parse_top` (the `ps -eo pid,ppid,args` listing), `parse_runs` and
 `run_ls` (the helper's `devsbd run ls`, bounded to 64 KiB / 5 s; any failure
 means "no runs"). The dashboard's process forest lives in `tui::procs`.
+
+## events
+
+`Backend::events_argv` is the argv of a long-lived child printing one JSON
+line per container event, so the daemon can be told of changes instead of
+only listing on a timer (`serve::events::EventWatcher`). docker runs
+`events --filter type=container --format {{json .}}`, podman the same with
+`--format json`; Apple `container` has no event stream (`None`: poll only).
+`runtime::events::parse` reads both shapes (docker's `Action` +
+`Actor.Attributes.name`, podman's `Status` + `Name`) and
+`runtime::events::relevant` keeps a whitelist: `devsandbox-` containers being
+created, started, restarted, stopped, killed, dying, removed, renamed,
+paused or unpaused (docker's `die`/`destroy` and podman's `died`/`remove`
+both). Everything else is dropped, exec events above all: the daemon's
+bridges `exec` into containers, so a wake on `exec_start: …` would make each
+listing trigger the next.
 
 ## Adding a runtime
 

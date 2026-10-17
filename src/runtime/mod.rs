@@ -9,6 +9,9 @@
 mod apple;
 pub mod bounded;
 mod dockerlike;
+// Only the daemon follows events (unix-only).
+#[cfg(unix)]
+pub mod events;
 // Only the daemon and the dashboard list processes (both unix-only).
 #[cfg(unix)]
 pub mod procs;
@@ -238,6 +241,14 @@ pub trait Backend: Send + Sync {
     /// Containers whose name starts with `name_prefix` (empty = all). stderr is
     /// captured so this is safe from the TUI.
     fn list(&self, all: bool, name_prefix: &str) -> Result<Vec<ContainerRow>>;
+
+    /// Args (after [`Self::bin`]) of a long-lived child printing one JSON line
+    /// per container event ([`events::parse`]), so the daemon can be told of
+    /// changes instead of re-running [`Self::list`] on a timer. `None`: the
+    /// runtime has no such stream and the daemon only polls.
+    fn events_argv(&self) -> Option<Vec<&'static str>> {
+        None
+    }
 
     /// Resource usage of running containers.
     fn stats(&self) -> Result<Vec<StatsRow>>;
