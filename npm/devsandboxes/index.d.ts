@@ -1118,10 +1118,16 @@ export interface ApiMethods {
    * With `paths`: exactly those, in order (`~` expanded here, canonicalized; a bad one has its `error`).
    */
   'roots.list': { params: { paths?: string[] }; result: RootCandidate[] };
-  /** Dial a target over ssh and list its candidate roots; `failed` when ssh or the hello fails. */
-  'machines.probe': { params: { target: string }; result: MachineProbe };
-  /** Check `roots` on the machine (a quoted `~` is its home) and register it; `invalid` for a taken name or a bad root. */
-  'machines.add': { params: { target: string; name?: string; roots: string[]; agent?: boolean }; result: MachineAdded };
+  /**
+   * Dial a target over ssh and list its candidate roots; `failed` when ssh or the hello fails. `command`: the
+   * machine's devsandbox as shell text (default `devsandbox`); `invalid` when empty.
+   */
+  'machines.probe': { params: { target: string; command?: string }; result: MachineProbe };
+  /**
+   * Check `roots` on the machine (a quoted `~` is its home) and register it; `invalid` for a taken name, a bad
+   * root or an empty `command`. `command` as `machines.probe`'s, saved as the machine's.
+   */
+  'machines.add': { params: { target: string; name?: string; roots: string[]; agent?: boolean; command?: string }; result: MachineAdded };
   'machines.list': { params: {}; result: MachineRow[] };
   /** Change a registered machine's settings; `not-found` for an unknown name. */
   'machines.set': { params: { name: string; agent: boolean }; result: OkResult };

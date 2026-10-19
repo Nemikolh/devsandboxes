@@ -99,12 +99,15 @@ pub struct MachineRow {
 #[derive(Deserialize)]
 struct ProbeParams {
     target: String,
+    #[serde(default)]
+    command: Option<String>,
 }
 
 fn probe(p: ProbeParams, ctx: &Ctx) -> Answer {
     ssh::parse_target(&p.target).map_err(|e| ApiError::invalid(format!("{e:#}")))?;
+    check_command(p.command.as_deref())?;
     // No name yet: errors say the target.
-    let entry = Entry { name: p.target.clone(), target: p.target, roots: Vec::new(), command: None, agent: false };
+    let entry = Entry { name: p.target.clone(), target: p.target, roots: Vec::new(), command: p.command, agent: false };
     let mut link = connect(&entry, ctx)?;
     let roots: Vec<RootCandidate> = remote_call(&mut link, &entry.name, "roots.list", json!({}))?;
     let remote = link.remote();
@@ -119,6 +122,8 @@ struct AddParams {
     roots: Vec<String>,
     #[serde(default)]
     agent: bool,
+    #[serde(default)]
+    command: Option<String>,
 }
 
 fn add(p: AddParams, ctx: &Ctx) -> Answer {
@@ -129,6 +134,7 @@ fn add(p: AddParams, ctx: &Ctx) -> Answer {
         None => default_name(&p.target).map_err(invalid)?,
     };
     check_name(&name).map_err(invalid)?;
+    check_command(p.command.as_deref())?;
     if p.roots.is_empty() {
         return Err(ApiError::invalid("no roots: pass --config <path on the machine>"));
     }
@@ -137,7 +143,7 @@ fn add(p: AddParams, ctx: &Ctx) -> Answer {
         return Err(taken(&name));
     }
 
-    let mut entry = Entry { name, target: p.target, roots: Vec::new(), command: None, agent: p.agent };
+    let mut entry = Entry { name, target: p.target, roots: Vec::new(), command: p.command, agent: p.agent };
     let mut link = connect(&entry, ctx)?;
     let checked: Vec<RootCandidate> = remote_call(&mut link, &entry.name, "roots.list", json!({ "paths": p.roots }))?;
     // A daemon that ignores `paths` answers its candidates instead.
@@ -310,6 +316,15 @@ fn registered(ctx: &Ctx) -> Result<Vec<Entry>, ApiError> {
     super::load(&ctx.registry).map_err(ApiError::internal)
 }
 
+/// `command` is shell text the machine runs, like the registry's hand-set
+/// field, so the only check is that there's something to run.
+fn check_command(command: Option<&str>) -> Result<(), ApiError> {
+    match command {
+        Some(c) if c.trim().is_empty() => Err(ApiError::invalid("empty `command`: omit it for `devsandbox`")),
+        _ => Ok(()),
+    }
+}
+
 fn taken(name: &str) -> ApiError {
     ApiError::invalid(format!("a machine named `{name}` exists; pass --name"))
 }
@@ -410,6 +425,11 @@ mod tests {
 
     impl Pair {
         fn new(tag: &str, remote_semver: &str) -> Self {
+            Self::with(tag, remote_semver, |_| {})
+        }
+
+        /// As [`Pair::new`], `local` adjusting this host's daemon's options.
+        fn with(tag: &str, remote_semver: &str, local: impl FnOnce(&mut Options)) -> Self {
             let base = scratch(tag);
             let home = base.join("remote-home");
             std::fs::create_dir_all(home.join(".devsandboxes")).unwrap();
@@ -418,10 +438,10 @@ mod tests {
             std::fs::write(home.join(".devsandboxes").join(cfg), "[sandbox.web]\nimage = \"a\"\n[sandbox.api]\nimage = \"a\"\n").unwrap();
             std::fs::write(home.join("broken").join(cfg), "[sandbox.web\n").unwrap();
             let remote = base.join("remote");
-            let daemons = vec![
-                spawn_daemon(&remote, remote_opts(&base, remote_semver)),
-                spawn_daemon(&base.join("local"), local_opts(&base, Some(remote))),
-            ];
+            let mut local_o = local_opts(&base, Some(remote.clone()));
+            local(&mut local_o);
+            let daemons =
+                vec![spawn_daemon(&remote, remote_opts(&base, remote_semver)), spawn_daemon(&base.join("local"), local_o)];
             // The dial connects straight away: the machine must be up.
             drop(client_at(&base.join("remote")));
             let local = client_at(&base.join("local"));
@@ -448,6 +468,10 @@ mod tests {
         );
         assert_eq!(err(&mut pair.local, "machines.probe", json!({"target": "-oProxyCommand=x"})).0, "invalid");
         assert_eq!(err(&mut pair.local, "machines.probe", json!({})).0, "invalid");
+        for empty in ["", "  "] {
+            let (code, message) = err(&mut pair.local, "machines.probe", json!({"target": "me@box", "command": empty}));
+            assert!(code == "invalid" && message.contains("`command`"), "{code}: {message}");
+        }
         pair.finish();
     }
 
@@ -478,6 +502,9 @@ mod tests {
         let (code, message) = err(&mut pair.local, "machines.add", json!({"target": "me@box", "roots": ["~/broken"]}));
         assert!(code == "invalid" && message.contains("devsandboxes.toml"), "{code}: {message}");
         assert_eq!(err(&mut pair.local, "machines.add", json!({"target": "me@box", "roots": []})).0, "invalid");
+        let (code, message) =
+            err(&mut pair.local, "machines.add", json!({"target": "me@box", "roots": ["~"], "command": " "}));
+        assert!(code == "invalid" && message.contains("`command`"), "{code}: {message}");
         assert!(!registry.exists(), "nothing saved");
 
         // The default name is the host; roots are the machine's canonical
@@ -497,9 +524,17 @@ mod tests {
         assert_eq!(code, "invalid");
         let (code, message) = err(&mut pair.local, "machines.add", json!({"target": "me@[::1]", "roots": ["~"]}));
         assert!(code == "invalid" && message.ends_with("pass --name"), "{message}");
-        let r = ok(&mut pair.local, "machines.add", json!({"target": "ssh://box:2200", "name": "box2", "roots": ["~/.devsandboxes"], "agent": true}));
+        let cmd = "~/.local/bin/devsandbox";
+        let r = ok(
+            &mut pair.local,
+            "machines.add",
+            json!({"target": "ssh://box:2200", "name": "box2", "roots": ["~/.devsandboxes"], "agent": true, "command": cmd}),
+        );
         assert_eq!(r["name"], "box2");
-        assert!(crate::serve::machines::load(&registry).unwrap()[1].agent, "`agent` saved");
+        let box2 = &crate::serve::machines::load(&registry).unwrap()[1];
+        assert!(box2.agent, "`agent` saved");
+        assert_eq!(box2.command.as_deref(), Some(cmd), "`command` saved");
+        assert!(std::fs::read_to_string(&registry).unwrap().contains("command = \"~/.local/bin/devsandbox\""));
 
         // Listed sorted by name, idle (no link wanted); then removed.
         let rows = ok(&mut pair.local, "machines.list", Value::Null);
@@ -507,16 +542,35 @@ mod tests {
             rows,
             json!([
                 {"name": "box", "target": "me@box", "roots": [dot, std::fs::canonicalize(&pair.home).unwrap()], "command": null, "agent": false, "state": "idle", "error": null, "version": null},
-                {"name": "box2", "target": "ssh://box:2200", "roots": [dot], "command": null, "agent": true, "state": "idle", "error": null, "version": null},
+                {"name": "box2", "target": "ssh://box:2200", "roots": [dot], "command": cmd, "agent": true, "state": "idle", "error": null, "version": null},
             ])
         );
         let info = ok(&mut pair.local, "machines.get", json!({"name": "box2"}));
-        assert_eq!(info, json!({"name": "box2", "target": "ssh://box:2200", "command": null, "roots": [dot], "agent": true}));
+        assert_eq!(info, json!({"name": "box2", "target": "ssh://box:2200", "command": cmd, "roots": [dot], "agent": true}));
         assert_eq!(err(&mut pair.local, "machines.get", json!({"name": "nope"})).0, "not-found");
         assert_eq!(ok(&mut pair.local, "machines.rm", json!({"name": "box"})), json!({"ok": true}));
         let (code, _) = err(&mut pair.local, "machines.rm", json!({"name": "box"}));
         assert_eq!(code, "not-found");
         assert_eq!(ok(&mut pair.local, "machines.list", Value::Null).as_array().unwrap().len(), 1);
+        pair.finish();
+    }
+
+    #[test]
+    fn probe_and_add_dial_with_the_command() {
+        let dialed: Arc<std::sync::Mutex<Vec<Option<String>>>> = Arc::default();
+        let log = dialed.clone();
+        let mut pair = Pair::with("mach-cmd", "0.6.0", move |o| {
+            let inner = o.dial.take().unwrap();
+            o.dial = Some(Arc::new(move |e: &Entry| {
+                log.lock().unwrap().push(e.command.clone());
+                inner(e)
+            }));
+        });
+        let cmd = "~/.local/bin/devsandbox";
+        ok(&mut pair.local, "machines.probe", json!({"target": "me@box", "command": cmd}));
+        ok(&mut pair.local, "machines.probe", json!({"target": "me@box"}));
+        ok(&mut pair.local, "machines.add", json!({"target": "me@box", "roots": ["~/.devsandboxes"], "command": cmd}));
+        assert_eq!(*dialed.lock().unwrap(), [Some(cmd.to_string()), None, Some(cmd.to_string())]);
         pair.finish();
     }
 

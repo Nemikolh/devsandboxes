@@ -27,8 +27,9 @@ federated joins), `cli.rs` (`plan`, `Plan`, `machine_use`, `route`,
 `<data-dir>/devsandbox/machines.toml`, `[machine.<name>]` with `target`
 (`me@host`, an ssh-config alias, or `ssh://[user@]host[:port]`), `roots`
 (remote config roots, as the remote canonicalized them), an optional
-`command` (remote devsandbox as shell text, default `devsandbox`; set by
-hand, `machine add` has no flag for it) and `agent` (whether this host's
+`command` (remote devsandbox as shell text, default `devsandbox`; no
+`machine add` flag, `machines.add`'s `command` param sets it, else by hand;
+`machines.probe` dials with the same param) and `agent` (whether this host's
 ssh-agent is meant for the machine, see [Agent](#agent); off by default,
 written only when on). Only the daemon writes it
 (`machines.add`/`set`/`rm`): locked read-modify-write on `machines.lock`, temp
