@@ -9,13 +9,14 @@ touching anything that takes a `machine` param or a `m/name`.
 Code: `src/serve/machines/mod.rs` (`Entry`, `path`, `parse`, `update`,
 `check_name`, `Where`, `parse_name`, `default_name`), `ssh.rs`
 (`api_argv`, `tty_argv`, `tty_argv_with`, `cli_argv`, `agent_argv`,
-`parse_target`, `Dial`, `Duplex`, `ssh_dial`, `ssh_agent_dial`), `link.rs`
+`script_argv`, `parse_target`, `Dial`, `Duplex`, `ssh_dial`, `ssh_agent_dial`), `link.rs`
 (`LinkError`, `client_name`), `service.rs` (`Machines`, `Handle`, `Want`,
 `Timing`, `Hooks`), `agent.rs`
 (`serve`, `End`, `SENTINEL`), `api.rs`
 (`machines.*`, `Ctx`), `forward.rs` (`QUICK`, `FANOUT_WAIT`, `verb`, the
 federated joins), `cli.rs` (`plan`, `Plan`, `machine_use`, `route`,
-`localize`), `src/serve/snapshots.rs` (`Remotes`, `LinkState`, `merge`),
+`localize`), `install.rs` (`CHECK`, `INSTALL`, `check`, `install`,
+`parse_check`, `decide`, `platform_matches`), `src/serve/snapshots.rs` (`Remotes`, `LinkState`, `merge`),
 `src/serve/relay.rs` (`--session-env`), `src/commands/machine.rs`,
 `src/commands/agent_relay.rs` (`run`, `Socket`),
 `src/serve/endpoint.rs` (`agent_socket`, `agent_sockets`),
@@ -65,6 +66,10 @@ the machine's `agent` on.
   starting with `-` a value.
 - `agent_argv`: `ssh -T -o BatchMode=yes [-p N] -- <host> … agent-relay
   --client <c>`, a machine's agent relay ([Agent](#agent)).
+- `script_argv`: `ssh -T [-p N] -- <host> sh -c <script> sh <args…>`, a
+  POSIX script run for a person at the CLI ([Install](#install)); no
+  `BatchMode`. A script is one line: the login shell may be csh, which
+  refuses a newline inside quotes.
 
 `Tail` (a bounded ring of a stream's last bytes, `Tail::collect`) keeps
 ssh's stderr for `spawn`'s `Peer` and the remote forward opener alike.
@@ -78,6 +83,36 @@ in-process). `--session-env` makes the remote relay replace each verb
 request's `params.env` with its own login-shell env, `SSH_AUTH_SOCK`
 pointed at this host's agent relay socket there while it's up
 ([Agent](#agent)).
+
+## Install
+
+`src/serve/machines/install.rs` checks which devsandbox a machine runs and
+copies this binary there. The CLI runs it, not the daemon: the daemon's ssh
+is `BatchMode` with nobody to ask, and the bytes are the CLI's own binary.
+Both scripts go over `script_argv` and print their report after a marker
+line, past whatever the login shell printed first.
+
+- `CHECK` (`check`): `$1` is the program (empty: `devsandbox`), resolved
+  with `command -v`; it reports `uname -s`, `uname -m`, the path and the
+  output of its `--version`. `parse_check` makes it a `Remote`, whose
+  `version` is `None` when `--version` fails (a build from before it
+  existed).
+- `platform_matches`: `uname` against this binary's
+  `std::env::consts::{OS, ARCH}` (`Linux`↔`linux`, `Darwin`↔`macos`;
+  `x86_64`|`amd64`↔`x86_64`, `aarch64`|`arm64`↔`aarch64`); copying
+  itself can't work anywhere else.
+- `decide` (pure): the same semver is `Plan::Nothing`; a devsandbox found
+  with another or no version is updated in place (`Dest::Found`); a
+  missing one goes to `$HOME/.local/bin/devsandbox` (`Dest::Default`).
+- `INSTALL` (`install`): `$1` is the destination (empty: the default).
+  ssh's stdin, the binary, goes into a `mktemp` file next to it,
+  `chmod 755`, then its `--version` must run (a binary linked against a
+  libc the machine lacks fails here), then `mv -f` over the destination:
+  atomic, no "text file busy" over a running binary. Any failure removes
+  the temp file and leaves the destination as it was. It prints the
+  installed path, expanded.
+
+A failed ssh or script is an error carrying the tail of its stderr.
 
 ## Link handshake
 

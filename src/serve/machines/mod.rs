@@ -14,6 +14,8 @@
 //!   ssh re-run of commands that don't go through the daemon
 //! - `agent`: this end of a machine's agent relay, serving its streams from
 //!   the local ssh-agent (`commands::agent_relay` is the far end)
+//! - `install`: the CLI's check of a machine's devsandbox and the copy of
+//!   this binary there
 //!
 //! Only the daemon writes the registry (`machines.add` / `set` / `rm`);
 //! the CLI reads it later to know whether any machine exists. Two
@@ -33,6 +35,7 @@ pub mod agent;
 pub mod api;
 pub mod cli;
 pub mod forward;
+pub mod install;
 pub mod link;
 pub mod service;
 pub mod ssh;

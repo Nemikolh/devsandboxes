@@ -32,7 +32,7 @@ use crate::serve::endpoint::Stream;
 
 /// How much of ssh's stderr is kept: enough for its last lines
 /// (`Permission denied (publickey).`, `sh: 1: devsandbox: not found`).
-const STDERR_TAIL: usize = 4096;
+pub(super) const STDERR_TAIL: usize = 4096;
 
 /// A parsed `target`: what ssh takes as its destination, plus a port from
 /// an `ssh://` URL.
@@ -190,6 +190,21 @@ pub fn tunnel_argv(
 /// relay's own streams.
 pub fn agent_argv(entry: &Entry, client: &str) -> Result<Vec<OsString>> {
     argv(entry, &["-T", "-o", "BatchMode=yes"], &["agent-relay", "--client", client])
+}
+
+/// The argv of a POSIX sh `script` run on `entry` by a person at the CLI
+/// (`install::check` / `install::install`, docs/architecture/daemon/machines.md,
+/// *Install*): `ssh -T [-p N] -- <host> <sh -c <script> sh <args…>>`, through
+/// the login shell like every remote command, so `PATH` is the user's.
+/// `-T`: stdin carries bytes (the binary being installed). No `BatchMode`:
+/// a person is there to answer ssh's prompts. No `-A`: a script needs no
+/// agent. `script` is one line: the login shell may be csh, which refuses a
+/// newline inside quotes.
+#[allow(dead_code)] // Until `machine add` calls `install`.
+pub fn script_argv(entry: &Entry, script: &str, args: &[impl AsRef<str>]) -> Result<Vec<OsString>> {
+    let mut remote_args = vec!["-c", script, "sh"];
+    remote_args.extend(args.iter().map(AsRef::as_ref));
+    argv_with(entry, &["-T"], "sh", &remote_args)
 }
 
 fn argv(entry: &Entry, opts: &[&str], remote_args: &[impl AsRef<str>]) -> Result<Vec<OsString>> {
@@ -538,8 +553,12 @@ mod tests {
         let with = tty_argv_with(&e, "docker", &["exec", "-it", "db", "sh"]).unwrap();
         let remote = remote_command("docker", &["exec", "-it", "db", "sh"]);
         assert_eq!(strs(&with), ["ssh", "-t", "--", "box", remote.as_str()]);
+        let script = script_argv(&entry("ssh://box:2200", Some("~/bin/devsandbox")), "echo \"$1\"", &["it's"]).unwrap();
+        let remote = remote_command("sh", &["-c", "echo \"$1\"", "sh", "it's"]);
+        assert_eq!(strs(&script), ["ssh", "-T", "-p", "2200", "--", "box", remote.as_str()]);
+        assert!(!strs(&script).contains(&"BatchMode=yes"), "a person is there");
         // No ssh agent forwarding anywhere: the agent relay carries it.
-        for argv in [&api, &tty, &piped, &with] {
+        for argv in [&api, &tty, &piped, &with, &script] {
             assert!(!strs(argv).contains(&"-A"), "{argv:?}");
         }
         assert!(api_argv(&entry("-oProxyCommand=x", None), "c").is_err());
@@ -603,6 +622,31 @@ mod tests {
         let want: String = args.iter().map(|a| format!("[{a}]\n")).collect();
         assert_eq!(String::from_utf8_lossy(&out.stdout), want);
         let _ = std::fs::remove_dir_all(home.parent().unwrap());
+    }
+
+    /// A script's remote string through both shells: the script text and
+    /// its positional args arrive intact.
+    #[test]
+    fn scripts_survive_both_shells() {
+        let home = std::env::temp_dir().join(format!("dsv-ssh-script-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let script = r#"printf '<%s>' "$0"; for a in "$@"; do printf '[%s]' "$a"; done"#;
+        let args = ["plain", "two words", "it's", "$HOME", "`id`", "", "-l"];
+        let argv = script_argv(&entry("box", None), script, &args).unwrap();
+        let out = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(argv.last().unwrap())
+            .env_clear()
+            .env("SHELL", "/bin/sh")
+            .env("HOME", &home)
+            .env("PATH", "/usr/bin:/bin")
+            .current_dir(&home)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let want: String = std::iter::once("<sh>".to_string()).chain(args.iter().map(|a| format!("[{a}]"))).collect();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), want);
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

@@ -26,7 +26,7 @@ use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "devsandbox", about = "Manage devcontainer-based sandboxes")]
+#[command(name = "devsandbox", version, about = "Manage devcontainer-based sandboxes")]
 struct Cli {
     /// Directory containing devsandboxes.toml (defaults to the current directory).
     #[arg(short = 'C', long, global = true, default_value = ".")]

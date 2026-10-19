@@ -12,7 +12,8 @@ limitation means editing this file in the same commit.
 
 ## In progress
 
-(none)
+- **machines**: `machine add` checks the machine's devsandbox and offers to
+  copy this one there. → [plan](plans/active/machine-install.md)
 
 ## Planned
 
