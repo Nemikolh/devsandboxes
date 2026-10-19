@@ -6,6 +6,10 @@
 //! lets the user pick (a TTY) or takes the only usable one (no TTY). The
 //! picked or typed roots go to `machines.add`, which checks them on the
 //! machine itself.
+//!
+//! Before probing, `add` checks the machine's devsandbox (`install`) and,
+//! when it's missing or another version, copies this binary there: asked on
+//! a TTY, without asking under `--auto-install`, refused otherwise.
 
 use std::io::{IsTerminal, Write};
 
@@ -17,14 +21,17 @@ use crate::render::table;
 use crate::serve::api::RootCandidate;
 use crate::serve::client::{self, Conn};
 use crate::serve::endpoint;
+use crate::serve::machines::Entry;
 use crate::serve::machines::api::{Added, MachineRow, Probed};
+use crate::serve::machines::install::{self, Dest, Plan, Remote};
 
 const HEADERS: [&str; 6] = ["NAME", "TARGET", "ROOTS", "AGENT", "STATE", "VERSION"];
 
-pub fn add(target: &str, name: Option<&str>, configs: &[String], agent: bool) -> Result<()> {
+pub fn add(target: &str, name: Option<&str>, configs: &[String], agent: bool, auto_install: bool) -> Result<()> {
+    let command = ensure_devsandbox(target, auto_install)?;
     let mut conn = connect()?;
     let roots = if configs.is_empty() {
-        let probed: Probed = call(&mut conn, "machines.probe", json!({ "target": target }))?;
+        let probed: Probed = call(&mut conn, "machines.probe", json!({ "target": target, "command": command }))?;
         if std::io::stdin().is_terminal() {
             pick_roots(target, &probed.roots)?
         } else {
@@ -33,13 +40,160 @@ pub fn add(target: &str, name: Option<&str>, configs: &[String], agent: bool) ->
     } else {
         configs.to_vec()
     };
-    let added: Added = call(&mut conn, "machines.add", json!({ "target": target, "name": name, "roots": roots, "agent": agent }))?;
+    let added: Added = call(&mut conn, "machines.add", json!({ "target": target, "name": name, "roots": roots, "agent": agent, "command": command }))?;
     let roots: Vec<String> = added.roots.iter().map(|r| r.display().to_string()).collect();
     println!("added {} ({target}): {}", added.name, roots.join(", "));
     if let Some(warning) = added.warning {
         eprintln!("warning: {warning}");
     }
     Ok(())
+}
+
+/// [`install::DEFAULT_DEST`] as the registry's `command`: shell text, the
+/// remote login shell expands the `~`.
+const LOCAL_COMMAND: &str = "~/.local/bin/devsandbox";
+
+/// Check `target`'s devsandbox and copy this one there when it's missing or
+/// another version (docs/architecture/daemon/machines.md, *Install*). The
+/// machine's `command`: `None` is `devsandbox` on its login `PATH`.
+fn ensure_devsandbox(target: &str, auto_install: bool) -> Result<Option<String>> {
+    let ours = env!("CARGO_PKG_VERSION");
+    let entry = Entry { name: target.into(), target: target.into(), roots: vec![], command: None, agent: false };
+    let remote = install::check(&entry, None)?;
+    let Plan::Install { dest, from } = install::decide(&remote, ours) else {
+        return Ok(None);
+    };
+    let found = match &dest {
+        Dest::Found(path) => Some(path.as_str()),
+        Dest::Default => None,
+    };
+    if !install::platform_matches(&remote.os, &remote.arch) {
+        let why = platform_mismatch(target, &remote);
+        if found.is_none() {
+            bail!("{why}: install devsandbox there yourself");
+        }
+        // Today's behaviour: the daemon warns about the other version.
+        eprintln!("note: {why}: leaving its devsandbox as it is");
+        return Ok(None);
+    }
+    match consent(std::io::stdin().is_terminal(), auto_install) {
+        Consent::Install => {}
+        Consent::Refuse => bail!("{}", refusal(target, found, from.as_deref(), ours)),
+        Consent::Ask => {
+            if !is_yes(&prompt(&question(target, found, from.as_deref(), ours))?) {
+                if found.is_none() {
+                    bail!("no devsandbox on {target}, so it isn't added");
+                }
+                return Ok(None);
+            }
+        }
+    }
+    let shown = found.unwrap_or(LOCAL_COMMAND);
+    eprintln!("copying devsandbox {ours} to {target}:{shown}…");
+    let installed = install::install(&entry, dest.path(), &crate::exe::devsandbox()?)?;
+    let after = install::check(&entry, None)?;
+    let command = match rechecked(&after, &dest, ours, target, &installed)? {
+        Rechecked::OnPath => None,
+        Rechecked::OffPath => {
+            let direct = install::check(&entry, Some(&installed))?;
+            if direct.version.as_deref() != Some(ours) {
+                bail!("{installed} on {target} doesn't run as devsandbox {ours} after the copy");
+            }
+            Some(LOCAL_COMMAND.to_string())
+        }
+    };
+    eprintln!("installed devsandbox {ours} at {installed}");
+    if command.is_some() {
+        eprintln!("note: `devsandbox` on {target}'s login PATH isn't that one, so the machine is registered with command = \"{LOCAL_COMMAND}\"");
+    }
+    Ok(command)
+}
+
+/// Whether to install without asking, ask, or refuse.
+#[derive(Debug, PartialEq, Eq)]
+enum Consent {
+    Install,
+    Ask,
+    Refuse,
+}
+
+fn consent(tty: bool, auto_install: bool) -> Consent {
+    match (auto_install, tty) {
+        (true, _) => Consent::Install,
+        (false, true) => Consent::Ask,
+        (false, false) => Consent::Refuse,
+    }
+}
+
+/// `from` as a sentence's object: `0.7.0`, or that it's unknown.
+fn version_text(from: Option<&str>) -> &str {
+    from.unwrap_or("of an unknown (older) version")
+}
+
+/// The error off a TTY without `--auto-install`. `found`: the machine's
+/// devsandbox, `None` when missing.
+fn refusal(target: &str, found: Option<&str>, from: Option<&str>, ours: &str) -> String {
+    match found {
+        None => format!("{target} has no devsandbox: pass --auto-install to copy this one ({ours}) there"),
+        Some(path) => format!(
+            "{target} runs devsandbox {} at {path}, this is {ours}: pass --auto-install to replace it",
+            version_text(from)
+        ),
+    }
+}
+
+/// The `[y/N]` question on a TTY.
+fn question(target: &str, found: Option<&str>, from: Option<&str>, ours: &str) -> String {
+    match found {
+        None => format!("devsandbox isn't on {target}'s PATH. Copy this one ({ours}) to {LOCAL_COMMAND} there? [y/N] "),
+        Some(path) => format!(
+            "{target} runs devsandbox {} at {path}. Replace it with this one ({ours})? [y/N] ",
+            from.unwrap_or("(unknown version)")
+        ),
+    }
+}
+
+fn is_yes(answer: &str) -> bool {
+    answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes")
+}
+
+fn platform_mismatch(target: &str, remote: &Remote) -> String {
+    format!(
+        "{target} is {} {}; this devsandbox is built for {} {}, so it can't be copied there",
+        remote.os,
+        remote.arch,
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    )
+}
+
+/// What the check after the copy says about the login `PATH`.
+#[derive(Debug, PartialEq, Eq)]
+enum Rechecked {
+    /// `devsandbox` there is ours now.
+    OnPath,
+    /// Installed to [`LOCAL_COMMAND`], which the login `PATH` doesn't reach
+    /// first: the machine's `command` is that path.
+    OffPath,
+}
+
+/// `after`: the login shell's devsandbox after copying ours to `dest`,
+/// `installed` there. An update in place that `PATH` still doesn't resolve
+/// to is an error: no `command` can fix that.
+fn rechecked(after: &Remote, dest: &Dest, ours: &str, target: &str, installed: &str) -> Result<Rechecked> {
+    if after.version.as_deref() == Some(ours) {
+        return Ok(Rechecked::OnPath);
+    }
+    if *dest == Dest::Default {
+        return Ok(Rechecked::OffPath);
+    }
+    match &after.path {
+        None => bail!("updated {installed}, but {target}'s login PATH no longer finds a devsandbox"),
+        Some(path) => bail!(
+            "updated {installed}, but `devsandbox` on {target}'s login PATH is {path} (devsandbox {})",
+            version_text(after.version.as_deref())
+        ),
+    }
 }
 
 pub fn ls(json: bool) -> Result<()> {
@@ -266,6 +420,81 @@ mod tests {
         let two = [cand("/a", &["web"], None), cand("/c", &[], None)];
         let err = only_root("box", &two).unwrap_err().to_string();
         assert!(err.contains("several") && err.contains("\n  /a  (web)\n  /c  (no sandboxes)\n") && err.contains("--config"), "{err}");
+    }
+
+    fn remote(path: Option<&str>, version: Option<&str>) -> Remote {
+        Remote { os: "Linux".into(), arch: "x86_64".into(), path: path.map(Into::into), version: version.map(Into::into) }
+    }
+
+    #[test]
+    fn install_asks_on_a_tty_and_needs_the_flag_off_one() {
+        assert_eq!(consent(true, false), Consent::Ask);
+        assert_eq!(consent(false, false), Consent::Refuse);
+        assert_eq!(consent(true, true), Consent::Install);
+        assert_eq!(consent(false, true), Consent::Install);
+        for yes in ["y", "Y", "yes", "YES"] {
+            assert!(is_yes(yes), "{yes}");
+        }
+        for no in ["", "n", "no", "yep", "y es"] {
+            assert!(!is_yes(no), "{no}");
+        }
+    }
+
+    #[test]
+    fn install_messages_name_what_is_there() {
+        assert_eq!(
+            refusal("box", None, None, "1.0.0"),
+            "box has no devsandbox: pass --auto-install to copy this one (1.0.0) there"
+        );
+        assert_eq!(
+            refusal("box", Some("/b/devsandbox"), Some("0.9.0"), "1.0.0"),
+            "box runs devsandbox 0.9.0 at /b/devsandbox, this is 1.0.0: pass --auto-install to replace it"
+        );
+        assert_eq!(
+            refusal("box", Some("/b/devsandbox"), None, "1.0.0"),
+            "box runs devsandbox of an unknown (older) version at /b/devsandbox, this is 1.0.0: pass --auto-install to replace it"
+        );
+        assert_eq!(
+            question("box", None, None, "1.0.0"),
+            "devsandbox isn't on box's PATH. Copy this one (1.0.0) to ~/.local/bin/devsandbox there? [y/N] "
+        );
+        assert_eq!(
+            question("box", Some("/b/devsandbox"), Some("0.9.0"), "1.0.0"),
+            "box runs devsandbox 0.9.0 at /b/devsandbox. Replace it with this one (1.0.0)? [y/N] "
+        );
+        assert_eq!(
+            question("box", Some("/b/devsandbox"), None, "1.0.0"),
+            "box runs devsandbox (unknown version) at /b/devsandbox. Replace it with this one (1.0.0)? [y/N] "
+        );
+        let mismatch = Remote { os: "FreeBSD".into(), arch: "riscv64".into(), path: None, version: None };
+        let why = platform_mismatch("box", &mismatch);
+        assert!(why.starts_with("box is FreeBSD riscv64; this devsandbox is built for "), "{why}");
+        assert!(!install::platform_matches(&mismatch.os, &mismatch.arch));
+    }
+
+    #[test]
+    fn local_command_is_the_default_dest() {
+        assert_eq!(LOCAL_COMMAND.strip_prefix('~'), install::DEFAULT_DEST.strip_prefix("$HOME"));
+    }
+
+    #[test]
+    fn the_recheck_decides_the_command() {
+        let found = Dest::Found("/b/devsandbox".into());
+        let local = "/home/me/.local/bin/devsandbox";
+        let check = |after: &Remote, dest: &Dest, installed: &str| rechecked(after, dest, "1.0.0", "box", installed);
+        // On the login PATH now, wherever it went.
+        assert_eq!(check(&remote(Some(local), Some("1.0.0")), &Dest::Default, local).unwrap(), Rechecked::OnPath);
+        assert_eq!(check(&remote(Some("/b/devsandbox"), Some("1.0.0")), &found, "/b/devsandbox").unwrap(), Rechecked::OnPath);
+        // `~/.local/bin` off the login PATH, or behind another devsandbox.
+        assert_eq!(check(&remote(None, None), &Dest::Default, local).unwrap(), Rechecked::OffPath);
+        assert_eq!(check(&remote(Some("/opt/devsandbox"), Some("0.1.0")), &Dest::Default, local).unwrap(), Rechecked::OffPath);
+        // Updated in place, yet PATH resolves elsewhere.
+        let err = check(&remote(Some("/opt/devsandbox"), Some("0.1.0")), &found, "/b/devsandbox").unwrap_err().to_string();
+        assert_eq!(err, "updated /b/devsandbox, but `devsandbox` on box's login PATH is /opt/devsandbox (devsandbox 0.1.0)");
+        let err = check(&remote(Some("/opt/devsandbox"), None), &found, "/b/devsandbox").unwrap_err().to_string();
+        assert!(err.ends_with("(devsandbox of an unknown (older) version)"), "{err}");
+        let err = check(&remote(None, None), &found, "/b/devsandbox").unwrap_err().to_string();
+        assert!(err.contains("no longer finds a devsandbox"), "{err}");
     }
 
     #[test]

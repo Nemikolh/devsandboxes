@@ -200,7 +200,6 @@ pub fn agent_argv(entry: &Entry, client: &str) -> Result<Vec<OsString>> {
 /// a person is there to answer ssh's prompts. No `-A`: a script needs no
 /// agent. `script` is one line: the login shell may be csh, which refuses a
 /// newline inside quotes.
-#[allow(dead_code)] // Until `machine add` calls `install`.
 pub fn script_argv(entry: &Entry, script: &str, args: &[impl AsRef<str>]) -> Result<Vec<OsString>> {
     let mut remote_args = vec!["-c", script, "sh"];
     remote_args.extend(args.iter().map(AsRef::as_ref));

@@ -9,9 +9,6 @@
 //! their report follows a marker line, since the login shell may print a
 //! motd first (as [`ssh::skip_lines`] skips for the link).
 
-// Until `machine add` calls it.
-#![allow(dead_code)]
-
 use std::ffi::OsString;
 use std::fs::File;
 use std::path::Path;
@@ -27,6 +24,8 @@ const CHECK_MARKER: &str = "@devsandbox-check@";
 const INSTALL_MARKER: &str = "@devsandbox-installed@";
 
 /// Where a missing devsandbox goes, as shell text (expanded remote-side).
+/// [`INSTALL`] spells it out; `machine add`'s tests pin its `command` to it.
+#[cfg_attr(not(test), allow(dead_code))]
 pub const DEFAULT_DEST: &str = "$HOME/.local/bin/devsandbox";
 
 /// POSIX sh (Linux and macOS), one line ([`ssh::script_argv`]). `$1`: the

@@ -28,8 +28,11 @@ federated joins), `cli.rs` (`plan`, `Plan`, `machine_use`, `route`,
 (`me@host`, an ssh-config alias, or `ssh://[user@]host[:port]`), `roots`
 (remote config roots, as the remote canonicalized them), an optional
 `command` (remote devsandbox as shell text, default `devsandbox`; no
-`machine add` flag, `machines.add`'s `command` param sets it, else by hand;
-`machines.probe` dials with the same param) and `agent` (whether this host's
+`machine add` flag: `machine add` sets it to `~/.local/bin/devsandbox`
+when it installs there off the login `PATH` (see
+[`machine add`](#devsandbox-machine-addlssetrm)) through `machines.add`'s
+`command` param, any other location is set by hand; `machines.probe`
+dials with the same param) and `agent` (whether this host's
 ssh-agent is meant for the machine, see [Agent](#agent); off by default,
 written only when on). Only the daemon writes it
 (`machines.add`/`set`/`rm`): locked read-modify-write on `machines.lock`, temp
@@ -88,7 +91,9 @@ pointed at this host's agent relay socket there while it's up
 ## Install
 
 `src/serve/machines/install.rs` checks which devsandbox a machine runs and
-copies this binary there. The CLI runs it, not the daemon: the daemon's ssh
+copies this binary there, for `machine add`
+([`devsandbox machine add|ls|set|rm`](#devsandbox-machine-addlssetrm)). The
+CLI runs it, not the daemon: the daemon's ssh
 is `BatchMode` with nobody to ask, and the bytes are the CLI's own binary.
 Both scripts go over `script_argv` and print their report after a marker
 line, past whatever the login shell printed first.
@@ -338,6 +343,26 @@ env's own `SSH_AUTH_SOCK` (the machine's agent, if any) stays.
 ## `devsandbox machine add|ls|set|rm`
 
 A client of `machines.*` only, never in-process (`src/commands/machine.rs`).
+
+`add` first checks the machine's devsandbox (`ensure_devsandbox`, over
+[Install](#install)): `install::check` through the login `PATH`, then
+`install::decide` against this binary's version. The same version goes on
+to the probe. Otherwise, a machine whose `uname` fails
+`install::platform_matches` is refused when it has no devsandbox and left
+as it is when it has another version (the daemon's version warning still
+applies). Then `consent`: `--auto-install` installs, a TTY asks `[y/N]` on
+stderr, no TTY is an error pointing at `--auto-install` (`refusal`).
+Declined, a missing devsandbox is an error and nothing is added; another
+version carries on as it is. `install::install` copies `exe::devsandbox()`
+there and a second `install::check` decides (`rechecked`): `devsandbox` on
+the login `PATH` is now this version, done; installed to
+`~/.local/bin` but the login `PATH` doesn't reach it first (macOS by
+default, another devsandbox earlier on it), the installed path is checked
+directly and the machine's `command` becomes `LOCAL_COMMAND`
+(`~/.local/bin/devsandbox`); updated in place but still not what the
+login `PATH` resolves, an error naming what it resolves to. That
+`command` goes to both `machines.probe` and `machines.add`.
+
 `add` without `--config` calls `machines.probe` (the remote's
 `roots.list`: every `config_dir` in its `state.toml` plus
 `~/.devsandboxes`) and lets the user multi-select on a TTY; off a TTY it

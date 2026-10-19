@@ -179,8 +179,14 @@ limitation means editing this file in the same commit.
 - Several hosts linking one machine with `agent` on each run a relay;
   processes there use the newest live socket (mtime), not their caller's.
   → [machines](architecture/daemon/machines.md#agent); `endpoint::agent_sockets`
-- `machine add` has no `--command`; a remote devsandbox off `PATH` is set by
-  hand in `machines.toml`. → [machines](architecture/daemon/machines.md)
+- `machine add` has no `--command`: it sets `command` only when it installs
+  devsandbox to `~/.local/bin` off the login `PATH`; a remote devsandbox
+  anywhere else off `PATH` is set by hand in `machines.toml`.
+  → [machines](architecture/daemon/machines.md#registry-machinestoml)
+- `machine add`'s install copies this binary, so only to a machine of the
+  same OS and arch (`install::platform_matches`); updating a devsandbox
+  that's a symlink replaces the link with a file (`install::INSTALL`'s
+  `mv -f`). → [machines](architecture/daemon/machines.md#install)
 - Remote rows live in memory: a fresh daemon shows a machine without rows
   until its link connects. → [machines](architecture/daemon/machines.md); `snapshots::Remotes`
 - `vscode` and `inbox` are refused for a machine's instances on the CLI;

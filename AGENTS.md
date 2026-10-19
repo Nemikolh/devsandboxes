@@ -29,8 +29,9 @@ Start with `docs/README.md` (reading order and map) and
   end of its agent relay (socket + frame mux over stdio; machines.md
   *Agent*). `machine.rs` is `devsandbox machine add|ls|set|rm`
   (docs/architecture/daemon/machines.md): a client of `machines.*` only (never in-process);
-  `add`'s TTY multi-select of probed roots and the off-TTY one-candidate
-  rule.
+  `add`'s install check first (ask on a TTY, `--auto-install`, else
+  refuse; `machines/install.rs`), its TTY multi-select of probed roots and
+  the off-TTY one-candidate rule.
   `run/` is split by concern: `mod.rs` (`run`/`materialize`, naming,
   `run_container`), `worktree.rs`, `git.rs` (`host_git`: the only way the
   host runs git — hooks/fsmonitor off, repo config allowlist-checked),
@@ -142,7 +143,9 @@ Start with `docs/README.md` (reading order and map) and
   / `sandboxes.list` joins as pure fns), `cli.rs` (the CLI side: `plan` where
   a command's name points, `--machine` uses, the ssh re-exec argv; pure, with
   `route` doing the I/O), `agent.rs` (this end of a machine's agent relay:
-  `serve` answers its `Open`s from the local agent while `allowed`).
+  `serve` answers its `Open`s from the local agent while `allowed`),
+  `install.rs` (the CLI's check of a machine's devsandbox and the copy of
+  this binary there, for `machine add`; `check`/`decide`/`install`).
   `snapshots.rs`'s `merge` builds the federated
   snapshot (`instances.watch {machines: true}`).
 - `src/runtime/` — backend abstraction over docker/podman/Apple container.

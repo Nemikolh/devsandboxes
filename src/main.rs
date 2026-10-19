@@ -388,6 +388,10 @@ enum MachineCommand {
     /// the machine: quote a `~` (`--config '~/sandboxes'`), or your local
     /// shell expands it to your local home.
     ///
+    /// When the machine has no devsandbox or another version, add offers to
+    /// copy this one there (to ~/.local/bin/devsandbox when missing, in
+    /// place when updating); off a TTY it fails unless --auto-install.
+    ///
     ///     devsandbox machine add me@my-server
     ///
     ///     devsandbox machine add ssh://me@box:2200 --name box --config '~/sandboxes'
@@ -403,6 +407,9 @@ enum MachineCommand {
         /// Relay this host's ssh-agent to the machine (off by default; see `machine set`)
         #[arg(long)]
         agent: bool,
+        /// Install or update devsandbox on the machine without asking (copies this binary)
+        #[arg(long)]
+        auto_install: bool,
     },
     /// List the registered machines
     Ls {
@@ -720,8 +727,8 @@ fn main() -> Result<()> {
         Command::AgentRelay { client } => commands::agent_relay::agent_relay(&client),
         #[cfg(unix)]
         Command::Machine { cmd } => match cmd {
-            MachineCommand::Add { target, name, configs, agent } => {
-                commands::machine::add(&target, name.as_deref(), &configs, agent)
+            MachineCommand::Add { target, name, configs, agent, auto_install } => {
+                commands::machine::add(&target, name.as_deref(), &configs, agent, auto_install)
             }
             MachineCommand::Ls { json } => commands::machine::ls(json),
             MachineCommand::Set { name, agent } => commands::machine::set(&name, agent),
