@@ -1,3 +1,6 @@
+> Archived 2026-10-19. Historical, may be wrong; do not use as a reference.
+> Current: [architecture/daemon/machines.md](../../architecture/daemon/machines.md)
+
 # `machine add` installs devsandbox on the machine
 
 ## Goal
