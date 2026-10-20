@@ -227,6 +227,7 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
             let mut out = io::stdout();
             out.write_all(&clipboard::osc52(sent, std::env::var_os("TMUX").is_some()))?;
             out.flush()?;
+            copy_on_host(sent.as_bytes());
             let n = sent.chars().count();
             app.status = Some(if sent.len() < text.len() {
                 format!("copied {n} chars (cut at 1 MiB)")
@@ -245,6 +246,9 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
             let mut out = io::stdout();
             out.write_all(&clipboard::osc52_base64(&b64, std::env::var_os("TMUX").is_some()))?;
             out.flush()?;
+            if let Some(text) = clipboard::decode_base64(&b64) {
+                copy_on_host(&text);
+            }
             app.status = Some(format!("copied from {title}"));
         }
 
@@ -879,6 +883,28 @@ fn open_link(link: &str) -> std::result::Result<(), String> {
         let _ = child.wait();
     });
     Ok(())
+}
+
+/// Also put `text` on the host clipboard ([`clipboard::host_helper`]) beside
+/// the OSC 52 copy, which the outer terminal may ignore. Best effort, as
+/// OSC 52 is: no helper, a failed spawn or write says nothing. Fed and
+/// reaped on its own thread so a 1 MiB copy never stalls the loop.
+fn copy_on_host(text: &[u8]) {
+    use std::process::{Command, Stdio};
+    let Some((cmd, args)) = clipboard::host_helper(std::env::consts::OS, |k| std::env::var(k).ok()) else {
+        return;
+    };
+    let Ok(mut child) = Command::new(cmd).args(args).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()
+    else {
+        return;
+    };
+    let text = text.to_vec();
+    std::thread::spawn(move || {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(&text);
+        }
+        let _ = child.wait();
+    });
 }
 
 /// Result of a background VS Code launch, drained by the event loop.

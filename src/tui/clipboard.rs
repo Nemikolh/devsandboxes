@@ -1,7 +1,9 @@
 //! Copy to the system clipboard through the outer terminal: OSC 52
 //! (docs/architecture/dashboard/selection.md, *OSC 52*). It needs no host clipboard, so it
-//! reaches the user's machine over SSH and from inside a container. Pure: the
-//! event loop writes the bytes, since `App` stays I/O-free.
+//! reaches the user's machine over SSH and from inside a container. A local
+//! dashboard also pipes each copy to the host's clipboard command
+//! ([`host_helper`]), since terminals may ignore OSC 52. Pure: the event loop
+//! writes the bytes and spawns the command, since `App` stays I/O-free.
 
 /// Most text one copy sends. Terminals cap the payload (xterm-likes ~100 KB),
 /// and a runaway selection shouldn't stall the tty; the caller says when a
@@ -50,6 +52,49 @@ pub fn osc52_base64(b64: &[u8], tmux: bool) -> Vec<u8> {
     }
     out.extend_from_slice(b"\x1b\\");
     out
+}
+
+/// The host clipboard command a local dashboard also pipes each copy to, so
+/// a copy lands even when the outer terminal ignores OSC 52 (iTerm2 does by
+/// default). `None` over ssh, where the host clipboard is the remote's and
+/// OSC 52 is the only way to the user. `env`: a variable's value, if set.
+pub fn host_helper(os: &str, env: impl Fn(&str) -> Option<String>) -> Option<(&'static str, &'static [&'static str])> {
+    let set = |k: &str| env(k).is_some_and(|v| !v.is_empty());
+    if ["SSH_CONNECTION", "SSH_TTY", "SSH_CLIENT"].into_iter().any(set) {
+        return None;
+    }
+    match os {
+        "macos" => Some(("pbcopy", &[])),
+        _ if set("WAYLAND_DISPLAY") => Some(("wl-copy", &[])),
+        _ if set("DISPLAY") => Some(("xclip", &["-selection", "clipboard"])),
+        _ => None,
+    }
+}
+
+/// Decode standard base64 (padding optional), as an app's OSC 52 payload
+/// arrives; `None` on anything else.
+pub fn decode_base64(b64: &[u8]) -> Option<Vec<u8>> {
+    let value = |c: u8| match c {
+        b'A'..=b'Z' => Some(c - b'A'),
+        b'a'..=b'z' => Some(c - b'a' + 26),
+        b'0'..=b'9' => Some(c - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    };
+    let data = b64.strip_suffix(b"==").or_else(|| b64.strip_suffix(b"=")).unwrap_or(b64);
+    if data.len() % 4 == 1 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(data.len() / 4 * 3 + 2);
+    for chunk in data.chunks(4) {
+        let mut n = 0u32;
+        for (i, &c) in chunk.iter().enumerate() {
+            n |= (value(c)? as u32) << (18 - 6 * i);
+        }
+        out.extend_from_slice(&n.to_be_bytes()[1..chunk.len()]);
+    }
+    Some(out)
 }
 
 /// Standard (RFC 4648 §4) base64 with `=` padding. Inline: one call site
@@ -103,6 +148,36 @@ mod tests {
         assert_eq!(osc52_base64(b"aGk=", false), b"\x1b]52;c;aGk=\x07");
         assert_eq!(osc52_base64(b"aGk=", true), b"\x1bPtmux;\x1b\x1b]52;c;aGk=\x07\x1b\\");
         assert_eq!(MAX_COPY_BASE64, base64(&vec![0; MAX_COPY]).len());
+    }
+
+    #[test]
+    fn base64_decodes_what_it_encodes() {
+        for input in ["", "f", "fo", "foo", "foob", "fooba", "foobar", "日本 ✓"] {
+            let b64 = base64(input.as_bytes());
+            assert_eq!(decode_base64(b64.as_bytes()).as_deref(), Some(input.as_bytes()), "{input:?}");
+            let bare = b64.trim_end_matches('=');
+            assert_eq!(decode_base64(bare.as_bytes()).as_deref(), Some(input.as_bytes()), "{bare:?}");
+        }
+        for bad in [&b"Z"[..], b"Zm9v!", b"Zm 9v", b"Zm9vY"] {
+            assert_eq!(decode_base64(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn host_helper_by_platform_and_never_over_ssh() {
+        fn env<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+            move |k| vars.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string())
+        }
+        assert_eq!(host_helper("macos", env(&[])), Some(("pbcopy", &[][..])));
+        assert_eq!(host_helper("linux", env(&[("WAYLAND_DISPLAY", "wayland-0"), ("DISPLAY", ":0")])), Some(("wl-copy", &[][..])));
+        assert_eq!(host_helper("linux", env(&[("DISPLAY", ":0")])), Some(("xclip", &["-selection", "clipboard"][..])));
+        assert_eq!(host_helper("linux", env(&[("DISPLAY", "")])), None);
+        assert_eq!(host_helper("linux", env(&[])), None);
+        for ssh in ["SSH_CONNECTION", "SSH_TTY", "SSH_CLIENT"] {
+            let vars = [(ssh, "x"), ("DISPLAY", ":0")];
+            assert_eq!(host_helper("macos", env(&vars)), None, "{ssh}");
+            assert_eq!(host_helper("linux", env(&vars)), None, "{ssh}");
+        }
     }
 
     #[test]

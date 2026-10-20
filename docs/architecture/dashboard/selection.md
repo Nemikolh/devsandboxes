@@ -74,12 +74,20 @@ An all-blank selection copies nothing.
 The event loop writes the text to the outer terminal as OSC 52
 (`clipboard::osc52`), cut to 1 MiB on a char boundary (`cap`), wrapped in
 tmux's DCS passthrough when `TMUX` is set. OSC 52 has no reply, so the
-status line says `copied N chars`. There is no other clipboard backend.
+status line says `copied N chars`. A local dashboard also pipes the text to
+the host clipboard command (`clipboard::host_helper`: `pbcopy` on macOS,
+else `wl-copy` under `WAYLAND_DISPLAY`, `xclip -selection clipboard` under
+`DISPLAY`; none when `SSH_CONNECTION`/`SSH_TTY`/`SSH_CLIENT` is set, the
+host there being the remote), spawned by `copy_on_host` in `tui/mod.rs`, so a
+copy lands even when the outer terminal ignores OSC 52 (iTerm2's default).
 
 Apps inside the integrated terminal copy with OSC 52 to the vt100
 emulator; `KittyState` queues it (reads and payloads over
 `MAX_COPY_BASE64` dropped) and the event loop relays the last copy per
-frame (`take_terminal_clipboard`) when `terminal_clipboard` is on.
+frame (`take_terminal_clipboard`) when `terminal_clipboard` is on: as OSC
+52, and decoded (`decode_base64`) to the same host clipboard command. Remote
+tabs (ssh to a machine, then `docker exec`) carry the sequence unchanged, so
+an app in a machine's sandbox copies to this host the same way.
 
 ## Settings
 

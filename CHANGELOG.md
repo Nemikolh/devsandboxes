@@ -78,6 +78,8 @@ devsandbox logs --build web-4 --follow
 
 ### Fixed
 
+- **Copying in the dashboard works in terminals that ignore OSC 52**, such as iTerm2 by default. That covers the dashboard's own selections and copies from apps in its terminal tabs, including tabs on a machine. A dashboard running on your machine now also puts the text on the clipboard itself (`pbcopy`, `wl-copy` or `xclip`).
+
 - **Upgrading devsandbox under a running dashboard or daemon no longer breaks it.** Once the binary was replaced, new terminal tabs, builds and other spawned commands failed until a restart; they now run the new one.
 
 - **A run killed outright shows as failed.** A `run` or `rebuild` killed by SIGKILL, the OOM killer or a reboot used to leave its instance looking half-made or not at all; it now shows as `failed` with `interrupted`, ready to `rebuild` or `rm`.
