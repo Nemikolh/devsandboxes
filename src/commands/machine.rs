@@ -60,8 +60,12 @@ fn ensure_devsandbox(target: &str, auto_install: bool) -> Result<Option<String>>
     let ours = env!("CARGO_PKG_VERSION");
     let entry = Entry { name: target.into(), target: target.into(), roots: vec![], command: None, agent: false };
     let remote = install::check(&entry, None)?;
+    let found_command = remote.off_path.then(|| LOCAL_COMMAND.to_string());
+    if found_command.is_some() {
+        eprintln!("note: `devsandbox` isn't on {target}'s login PATH, using {LOCAL_COMMAND}");
+    }
     let Plan::Install { dest, from } = install::decide(&remote, ours) else {
-        return Ok(None);
+        return Ok(found_command);
     };
     let found = match &dest {
         Dest::Found(path) => Some(path.as_str()),
@@ -70,11 +74,12 @@ fn ensure_devsandbox(target: &str, auto_install: bool) -> Result<Option<String>>
     if !install::platform_matches(&remote.os, &remote.arch) {
         let why = platform_mismatch(target, &remote);
         if found.is_none() {
-            bail!("{why}: install devsandbox there yourself");
+            eprintln!("warning: found no devsandbox on {target}, and {why}: install it there yourself");
+            return Ok(None);
         }
         // Today's behaviour: the daemon warns about the other version.
         eprintln!("note: {why}: leaving its devsandbox as it is");
-        return Ok(None);
+        return Ok(found_command);
     }
     match consent(std::io::stdin().is_terminal(), auto_install) {
         Consent::Install => {}
@@ -84,7 +89,7 @@ fn ensure_devsandbox(target: &str, auto_install: bool) -> Result<Option<String>>
                 if found.is_none() {
                     bail!("no devsandbox on {target}, so it isn't added");
                 }
-                return Ok(None);
+                return Ok(found_command);
             }
         }
     }
@@ -93,7 +98,7 @@ fn ensure_devsandbox(target: &str, auto_install: bool) -> Result<Option<String>>
     let installed = install::install(&entry, dest.path(), &crate::exe::devsandbox()?)?;
     let after = install::check(&entry, None)?;
     let command = match rechecked(&after, &dest, ours, target, &installed)? {
-        Rechecked::OnPath => None,
+        Rechecked::OnPath => after.off_path.then(|| LOCAL_COMMAND.to_string()),
         Rechecked::OffPath => {
             let direct = install::check(&entry, Some(&installed))?;
             if direct.version.as_deref() != Some(ours) {
@@ -423,7 +428,7 @@ mod tests {
     }
 
     fn remote(path: Option<&str>, version: Option<&str>) -> Remote {
-        Remote { os: "Linux".into(), arch: "x86_64".into(), path: path.map(Into::into), version: version.map(Into::into) }
+        Remote { os: "Linux".into(), arch: "x86_64".into(), path: path.map(Into::into), off_path: false, version: version.map(Into::into) }
     }
 
     #[test]
@@ -466,7 +471,7 @@ mod tests {
             question("box", Some("/b/devsandbox"), None, "1.0.0"),
             "box runs devsandbox (unknown version) at /b/devsandbox. Replace it with this one (1.0.0)? [y/N] "
         );
-        let mismatch = Remote { os: "FreeBSD".into(), arch: "riscv64".into(), path: None, version: None };
+        let mismatch = Remote { os: "FreeBSD".into(), arch: "riscv64".into(), path: None, off_path: false, version: None };
         let why = platform_mismatch("box", &mismatch);
         assert!(why.starts_with("box is FreeBSD riscv64; this devsandbox is built for "), "{why}");
         assert!(!install::platform_matches(&mismatch.os, &mismatch.arch));

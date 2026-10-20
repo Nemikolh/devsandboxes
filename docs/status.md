@@ -178,8 +178,8 @@ limitation means editing this file in the same commit.
 - Several hosts linking one machine with `agent` on each run a relay;
   processes there use the newest live socket (mtime), not their caller's.
   → [machines](architecture/daemon/machines.md#agent); `endpoint::agent_sockets`
-- `machine add` has no `--command`: it sets `command` only when it installs
-  devsandbox to `~/.local/bin` off the login `PATH`; a remote devsandbox
+- `machine add` has no `--command`: it sets `command` only when it finds or
+  installs devsandbox in `~/.local/bin` off the login `PATH`; a remote devsandbox
   anywhere else off `PATH` is set by hand in `machines.toml`.
   → [machines](architecture/daemon/machines.md#registry-machinestoml)
 - `machine add`'s install copies this binary, so only to a machine of the

@@ -99,8 +99,10 @@ Both scripts go over `script_argv` and print their report after a marker
 line, past whatever the login shell printed first.
 
 - `CHECK` (`check`): `$1` is the program (empty: `devsandbox`), resolved
-  with `command -v`; it reports `uname -s`, `uname -m`, the path and the
-  output of its `--version`. `parse_check` makes it a `Remote`, whose
+  with `command -v`; empty and not on the login `PATH`, it falls back to
+  `$HOME/.local/bin/devsandbox` (`Remote::off_path`), since a login shell
+  often misses that dir (added in `.bashrc`). It reports `uname -s`,
+  `uname -m`, the path and the output of its `--version`. `parse_check` makes it a `Remote`, whose
   `version` is `None` when `--version` fails (a build from before it
   existed).
 - `platform_matches`: `uname` against this binary's
@@ -348,9 +350,11 @@ A client of `machines.*` only, never in-process (`src/commands/machine.rs`).
 [Install](#install)): `install::check` through the login `PATH`, then
 `install::decide` against this binary's version. The same version goes on
 to the probe. Otherwise, a machine whose `uname` fails
-`install::platform_matches` is refused when it has no devsandbox and left
-as it is when it has another version (the daemon's version warning still
-applies). Then `consent`: `--auto-install` installs, a TTY asks `[y/N]` on
+`install::platform_matches` gets a warning and goes on to the probe when
+it has no devsandbox, and is left as it is when it has another version
+(the daemon's version warning still applies). A devsandbox found only
+through the `~/.local/bin` fallback (`off_path`) makes the machine's
+`command` `LOCAL_COMMAND`, installed over or not. Then `consent`: `--auto-install` installs, a TTY asks `[y/N]` on
 stderr, no TTY is an error pointing at `--auto-install` (`refusal`).
 Declined, a missing devsandbox is an error and nothing is added; another
 version carries on as it is. `install::install` copies `exe::devsandbox()`

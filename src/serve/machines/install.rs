@@ -30,15 +30,20 @@ pub const DEFAULT_DEST: &str = "$HOME/.local/bin/devsandbox";
 
 /// POSIX sh (Linux and macOS), one line ([`ssh::script_argv`]). `$1`: the
 /// program to check, a path or a name looked up on `PATH`; empty is
-/// `devsandbox`. Prints [`CHECK_MARKER`], then `os <uname -s>`, `arch
-/// <uname -m>`, and when the program is found `path <path>` and, when its
-/// `--version` runs, `version <its output>`.
+/// `devsandbox`, then [`DEFAULT_DEST`] when the login `PATH` has none (it
+/// often misses `~/.local/bin`: added in `.bashrc`, which a login shell
+/// skips). Prints [`CHECK_MARKER`], then `os <uname -s>`, `arch <uname
+/// -m>`, and when the program is found `path <path>`, `offpath yes` when
+/// that's the fallback and, when its `--version` runs, `version <its
+/// output>`.
 pub const CHECK: &str = "p=$(command -v \"${1:-devsandbox}\" 2>/dev/null) || p=; \
+    o=; if [ -z \"$p\" ] && [ -z \"$1\" ]; then p=$HOME/.local/bin/devsandbox; o=1; fi; \
     echo @devsandbox-check@; \
     printf 'os %s\\n' \"$(uname -s)\"; \
     printf 'arch %s\\n' \"$(uname -m)\"; \
     if [ -n \"$p\" ] && [ -f \"$p\" ] && [ -x \"$p\" ]; then \
     printf 'path %s\\n' \"$p\"; \
+    if [ -n \"$o\" ]; then echo 'offpath yes'; fi; \
     v=$(\"$p\" --version </dev/null 2>/dev/null) && printf 'version %s\\n' \"$v\"; \
     fi; \
     exit 0";
@@ -76,6 +81,9 @@ pub struct Remote {
     pub arch: String,
     /// Where the program resolved; `None`: not found.
     pub path: Option<String>,
+    /// `path` is [`DEFAULT_DEST`], found there since the login `PATH` has
+    /// no devsandbox: the machine's `command` must name it.
+    pub off_path: bool,
     /// Its semver; `None` when `--version` failed (a build from before it
     /// existed) or said something else.
     pub version: Option<String>,
@@ -86,7 +94,7 @@ pub struct Remote {
 pub fn parse_check(stdout: &str) -> Result<Remote> {
     let report = after_marker(stdout, CHECK_MARKER)
         .with_context(|| format!("unexpected output from the check: {}", first_line(stdout)))?;
-    let (mut os, mut arch, mut path, mut version) = (None, None, None, None);
+    let (mut os, mut arch, mut path, mut version, mut off_path) = (None, None, None, None, None);
     for line in report {
         let Some((key, value)) = line.split_once(' ') else { continue };
         let slot = match key {
@@ -94,6 +102,7 @@ pub fn parse_check(stdout: &str) -> Result<Remote> {
             "arch" => &mut arch,
             "path" => &mut path,
             "version" => &mut version,
+            "offpath" => &mut off_path,
             _ => continue,
         };
         slot.get_or_insert_with(|| value.trim().to_string());
@@ -105,7 +114,9 @@ pub fn parse_check(stdout: &str) -> Result<Remote> {
         let semver = v.strip_prefix("devsandbox ")?.trim();
         (!semver.is_empty()).then(|| semver.to_string())
     });
-    Ok(Remote { os, arch, path: path.filter(|p| !p.is_empty()), version })
+    let path = path.filter(|p| !p.is_empty());
+    let off_path = path.is_some() && off_path.is_some();
+    Ok(Remote { os, arch, path, off_path, version })
 }
 
 /// [`INSTALL`]'s stdout: the installed path.
@@ -241,7 +252,7 @@ mod tests {
     use super::*;
 
     fn remote(path: Option<&str>, version: Option<&str>) -> Remote {
-        Remote { os: "Linux".into(), arch: "x86_64".into(), path: path.map(Into::into), version: version.map(Into::into) }
+        Remote { os: "Linux".into(), arch: "x86_64".into(), path: path.map(Into::into), off_path: false, version: version.map(Into::into) }
     }
 
     #[test]
@@ -254,7 +265,9 @@ mod tests {
         let odd = parse_check("@devsandbox-check@\nos Linux\narch x86_64\npath /x\nversion error: unexpected\n").unwrap();
         assert_eq!(odd.version, None);
         let missing = parse_check("@devsandbox-check@\nos Darwin\narch arm64\n").unwrap();
-        assert_eq!(missing, Remote { os: "Darwin".into(), arch: "arm64".into(), path: None, version: None });
+        assert_eq!(missing, Remote { os: "Darwin".into(), arch: "arm64".into(), path: None, off_path: false, version: None });
+        let fallback = parse_check("@devsandbox-check@\nos Linux\narch x86_64\npath /h/.local/bin/devsandbox\noffpath yes\n").unwrap();
+        assert_eq!(fallback, Remote { off_path: true, ..remote(Some("/h/.local/bin/devsandbox"), None) });
         // A motd before the marker; a multi-line `--version` after.
         let noisy = parse_check(
             "Welcome!\npath /evil\nos Plan9\n@devsandbox-check@\nos Linux\narch x86_64\npath /p\nversion devsandbox 1.0.0\npath /other\n",
@@ -392,7 +405,20 @@ mod tests {
 
         let after = b.check("");
         assert_eq!((after.path.as_deref(), after.version.as_deref()), (Some(installed.as_str()), Some("9.9.9")));
+        assert!(!after.off_path);
         assert_eq!(decide(&after, "9.9.9"), Plan::Nothing);
+    }
+
+    #[test]
+    fn local_bin_off_the_login_path_is_found() {
+        let b = Machine::new("offpath");
+        std::fs::write(b.home.join(".profile"), "PATH=/usr/bin:/bin; export PATH\n").unwrap();
+        let installed = b.install("", &b.binary()).unwrap();
+        let found = b.check("");
+        assert_eq!((found.path.as_deref(), found.off_path), (Some(installed.as_str()), true));
+        assert_eq!(found.version.as_deref(), Some("9.9.9"));
+        // An explicit program doesn't fall back.
+        assert_eq!(b.check("devsandbox").path, None);
     }
 
     #[test]
