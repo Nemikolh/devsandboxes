@@ -73,9 +73,10 @@ archives and the npm package carry the helper.
 /bin/sh -c INSTALL_SCRIPT` stdin (no `docker cp`, no file binds: works on
 every runtime, Apple `container` included), to a temp file renamed to
 `BIN` = `/run/devsandbox/bin/devsbd` so a concurrent `version` never sees half
-a binary. The script also creates `/var/lib/devsandbox/outbox` and
-`/var/lib/devsandbox/runs` (mode 1777: the sandbox user writes them) and
-symlinks `/usr/local/bin/devsbd`; those three are best-effort.
+a binary. The script also creates `/var/lib/devsandbox/outbox`,
+`/var/lib/devsandbox/runs` and `/var/lib/devsandbox/sessions` (mode 1777: the
+sandbox user writes them) and symlinks `/usr/local/bin/devsbd`; those four
+are best-effort.
 
 - Skip: the installed helper's `version` hash already equals an embedded one.
 - Arch order (`candidates`): the arch recorded on the instance

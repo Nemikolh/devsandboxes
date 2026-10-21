@@ -143,9 +143,11 @@ fn decompress(zst: &[u8]) -> Option<Vec<u8>> {
 pub const BIN: &str = "/run/devsandbox/bin/devsbd";
 
 /// Write stdin to a temp file and rename, so a concurrent `devsbd version`
-/// never sees a half-written binary. The notify outbox (`notify::OUTBOX`) and
-/// the runs dir (`devsbd/src/runs.rs`) are made world-writable + sticky
-/// because `devsbd notify` / `devsbd run start` run as the sandbox user; the `/usr/local/bin` symlink puts `devsbd` on `PATH` for scripts.
+/// never sees a half-written binary. The notify outbox (`notify::OUTBOX`), the
+/// runs dir (`devsbd/src/runs.rs`) and the sessions dir
+/// (`devsbd/src/sessions.rs`) are made world-writable + sticky because
+/// `devsbd notify` / `devsbd run start` / `devsbd session new` run as the
+/// sandbox user; the `/usr/local/bin` symlink puts `devsbd` on `PATH` for scripts.
 /// Both best-effort (read-only or missing dirs), each wrapped in `{ …; }` so
 /// it can't turn a good install into a failure.
 const INSTALL_SCRIPT: &str = "mkdir -p /run/devsandbox/bin \
@@ -154,6 +156,7 @@ const INSTALL_SCRIPT: &str = "mkdir -p /run/devsandbox/bin \
     && mv /run/devsandbox/bin/devsbd.tmp /run/devsandbox/bin/devsbd \
     && { { mkdir -p /var/lib/devsandbox/outbox && chmod 1777 /var/lib/devsandbox/outbox; } 2>/dev/null || true; } \
     && { { mkdir -p /var/lib/devsandbox/runs && chmod 1777 /var/lib/devsandbox/runs; } 2>/dev/null || true; } \
+    && { { mkdir -p /var/lib/devsandbox/sessions && chmod 1777 /var/lib/devsandbox/sessions; } 2>/dev/null || true; } \
     && { ln -sf /run/devsandbox/bin/devsbd /usr/local/bin/devsbd 2>/dev/null || true; }";
 
 /// Boot file write, atomic for the same reason as `INSTALL_SCRIPT`: a hook

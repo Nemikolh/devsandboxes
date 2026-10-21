@@ -209,6 +209,13 @@ Prune ended/`lost` session dirs; surface detached sessions (dashboard
 rows, maybe an Inbox note); a policy for sessions nobody re-attaches to
 (idle timeout or explicit).
 
+Found in step 1's review (orchestrator): a displaced client whose exec pty
+nobody reads anymore (ssh gone, docker kept the exec) can stay blocked
+writing to its stdout and never read its `detached`; the supervisor drops
+it, but the client process lingers. Check on Linux whether docker/podman
+close that pty; if not, the client needs a bounded write (or the
+supervisor a way to signal it).
+
 ## Open questions
 
 - **Detach key**: a key (dtach's `Ctrl-\`) that leaves the session running

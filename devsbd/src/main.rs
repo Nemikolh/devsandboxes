@@ -9,6 +9,7 @@ mod json;
 mod listeners;
 mod outbox;
 mod runs;
+mod sessions;
 mod vscode;
 
 // Shared with the host so the two sides can't drift; they live in the root
@@ -49,7 +50,7 @@ fn build_hash() -> String {
 /// which reads as "none of these". Append-only; separate from `version`,
 /// whose one-line output is the host's install check, and from the frame
 /// protocol's `caps`, which describe the host link, not the CLI.
-const FEATURES: &[&str] = &["thread-send", "thread-withdraw", "thread-ls-feed", "events-follow"];
+const FEATURES: &[&str] = &["thread-send", "thread-withdraw", "thread-ls-feed", "events-follow", "session"];
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -86,9 +87,10 @@ fn main() {
             let code = if runs::is_local(&args) { runs::run(&args) } else { ctl::run_remote(&args) };
             std::process::exit(code)
         }
+        Some("session") => std::process::exit(sessions::run(&args.collect::<Vec<_>>())),
         _ => {
             eprintln!(
-                "usage: devsbd version|features|daemon|bridge|boot|notify|thread|events|ensure|ls|branches|stop|rm|done|exec|run|vscode-goto"
+                "usage: devsbd version|features|daemon|bridge|boot|notify|thread|events|ensure|ls|branches|stop|rm|done|exec|run|session|vscode-goto"
             );
             std::process::exit(2);
         }

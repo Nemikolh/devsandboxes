@@ -1,4 +1,4 @@
-# Inside the container: daemon, boot, outbox, control, runs
+# Inside the container: daemon, boot, outbox, control, runs, sessions
 
 What `devsbd` does once installed: the long-lived `devsbd daemon`, the boot
 hook, and the verbs scripts and dispatchers call. Read when changing
@@ -7,7 +7,7 @@ helper-side behavior or debugging a sandbox from the inside.
 Code: `devsbd/src/daemon.rs` (`run`, `take_over`, `Bridges::route`,
 `flush`, `control_exchange`, `control_follow`), `devsbd/src/bridge.rs`,
 `devsbd/src/boot.rs`, `devsbd/src/outbox.rs`, `devsbd/src/ctl.rs`,
-`devsbd/src/runs.rs`, `devsbd/src/vscode.rs`, `devsbd/src/json.rs`;
+`devsbd/src/runs.rs`, `devsbd/src/sessions.rs`, `devsbd/src/vscode.rs`, `devsbd/src/json.rs`;
 `src/commands/run/mod.rs` (`container_command`, `BOOT_HOOK_LABEL`).
 
 ## Files and sockets
@@ -22,9 +22,11 @@ Code: `devsbd/src/daemon.rs` (`run`, `take_over`, `Bridges::route`,
 | `/run/devsandbox/boot`, `boot.log` | boot file (host-written) and its commands' output |
 | `/var/lib/devsandbox/outbox/` (1777) | queued notify/thread records |
 | `/var/lib/devsandbox/runs/` (1777) | tracked runs |
+| `/var/lib/devsandbox/sessions/` (1777) | interactive sessions; `<id>/sock` (0600) is a session's socket |
 
 `/run` content is lost when an image mounts a tmpfs there; `/var/lib` sits in
-the writable layer, so outbox and runs survive a restart, not a rebuild.
+the writable layer, so outbox, runs and sessions' records survive a restart, not a rebuild (a
+session's processes don't: it reads `lost`).
 
 ## `devsbd daemon`
 
@@ -125,6 +127,48 @@ without an end, e.g. container restart). Runs stay until `rm`/`prune`.
 execs the same `devsbd run …` inside the child as its remote user
 (`dispatch` `exec`/`run-*` ops); without one it acts on this container.
 
+## Sessions: `devsbd session new|attach|ls|rm`
+
+Interactive commands that outlive their client, dtach's shape
+(`devsbd/src/sessions.rs`). One dir per session under
+`/var/lib/devsandbox/sessions/<id>/`: `argv` and `meta` in the runs format
+(the bookkeeping is `runs.rs`'s, over this root), `sock` (0600) while the
+command runs, `client` while a client is attached. The id is the caller's
+(`control::valid_run_id` rules).
+
+- `new --id <id> [--cwd DIR] -- <cmd>...` (`create_with`) creates the dir
+  and spawns a detached `devsbd session supervise <id>` (its own session,
+  null stdio, in `DIR` with the caller's env), then attaches; an id that
+  already exists attaches instead. `attach <id>` only attaches.
+- The supervisor (`supervise`) binds `sock`, opens a pty (`open_pty`,
+  libc through `extern "C"`, per-OS ioctl numbers in `sessions::sys`) and
+  runs the command on it as a session leader with the pty as its
+  controlling terminal, so its pid is its pgid. One `poll` loop over
+  non-blocking fds (`Supervisor::relay`): the pty is always read, its
+  output queued for the client up to `OUT_CAP` and dropped past it or with
+  no client, so neither the program nor the supervisor ever waits on a
+  client. One client at a time: an accepted connection takes over and the
+  previous client gets `detached`. A client's first size is applied one row
+  off, then as is, so the program gets `SIGWINCH` and redraws (there is no
+  output log). When the command exits: `sock` removed, `ended` + `exit` /
+  `signal` appended to `meta`, `exit` sent to the client, supervisor gone.
+- The client (`terminal`, `relay`) puts its stdin terminal raw (restored on
+  return and by a panic hook), sends its size at once and whenever a
+  `SIZE_POLL` check sees it change, relays bytes both ways, and exits with
+  the command's code (`128 + n` for signal `n`). Without a terminal on
+  stdin it relays plain bytes and sends no size. An ended session's attach
+  exits at once with its recorded code; an unknown or `lost` one, or a
+  connection that ends without a record, exits `NO_SESSION_EXIT` (250);
+  one taken over exits `DETACHED_EXIT` (251); both with a note on stderr.
+- Socket records (`Record`): `u8 tag | u32 len | payload`; `size`
+  (`u16 cols, u16 rows`) and `data` from the client, `data`, `exit`
+  (`i32`) and `detached` from the supervisor. Only the helper speaks it.
+- `ls`: `<id> <state> <attached|detached|-> <started, UTC> <argv…>`, the
+  newest `runs::MAX_LS_RUNS`, states as in `run ls`. `rm <id>`: a running
+  session's command group gets SIGHUP, then SIGKILL after `HUP_WAIT`
+  (verified with `runs::kill_target`), the supervisor records the end, the
+  dir is deleted.
+
 ## `devsbd vscode-goto <abs>[:line[:col]] [--wait SECS]`
 
 Opens a file in the VS Code window attached to this container by running
@@ -137,7 +181,7 @@ vscode` (`src/commands/vscode.rs`).
 ## `devsbd features`
 
 Prints the append-only list of CLI capabilities (`thread-send`,
-`thread-withdraw`, `thread-ls-feed`, `events-follow`) a dispatcher may probe
+`thread-withdraw`, `thread-ls-feed`, `events-follow`, `session`) a dispatcher may probe
 before relying on them.
 
 Limitations: [status.md](../../status.md#helper)

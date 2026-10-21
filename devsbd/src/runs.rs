@@ -46,7 +46,7 @@ pub const MAX_CHUNK: u64 = 256 * 1024;
 
 /// `ls` lists only this many runs, the newest: the runs dir is world-writable,
 /// so anyone in the container can fill it, and the host reads `ls` often.
-const MAX_LS_RUNS: usize = 50;
+pub(crate) const MAX_LS_RUNS: usize = 50;
 
 /// Characters of rendered (escaped) argv per `ls` line; longer is cut, `…`
 /// appended.
@@ -59,16 +59,16 @@ const MAX_META_BYTES: u64 = 4 * 1024;
 
 /// `wait`'s default timeout, seconds.
 const DEFAULT_WAIT: u64 = 60;
-const POLL: Duration = Duration::from_millis(100);
+pub(crate) const POLL: Duration = Duration::from_millis(100);
 
 /// A run with neither `supervisor` nor `ended` is still starting for this
 /// long (`start` records the supervisor right after spawning it); after that,
 /// `start` died in between and the run is `lost`.
-const STARTING_GRACE: u64 = 10;
+pub(crate) const STARTING_GRACE: u64 = 10;
 
 /// How long `rm --force` waits for a young run's supervisor to record the
 /// command's group, then for the killed run to be recorded as ended.
-const KILL_WAIT: Duration = Duration::from_secs(5);
+pub(crate) const KILL_WAIT: Duration = Duration::from_secs(5);
 
 const USAGE: &str = "usage: devsbd run start [--cwd DIR] -- <cmd>...\n\
        devsbd run ls\n\
@@ -225,7 +225,7 @@ fn once<T>(slot: &mut Option<T>, value: T, flag: &str) -> Result<(), String> {
     }
 }
 
-fn now() -> u64 {
+pub(crate) fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
@@ -238,14 +238,14 @@ fn run_dir(root: &Path, id: &str) -> io::Result<PathBuf> {
 }
 
 /// A directory itself, not a symlink to one (`ls` and `run_dir` skip those).
-fn is_real_dir(path: &Path) -> bool {
+pub(crate) fn is_real_dir(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
 }
 
 /// `path` as text, when it's a regular file (not a symlink, dir, FIFO, …) of
 /// at most `cap` bytes; anything else is an error, so a planted file can't
 /// make a reader block or buffer without bound.
-fn read_capped(path: &Path, cap: u64) -> io::Result<String> {
+pub(crate) fn read_capped(path: &Path, cap: u64) -> io::Result<String> {
     if !fs::symlink_metadata(path)?.is_file() {
         return Err(io::Error::new(io::ErrorKind::InvalidData, format!("{} is not a regular file", path.display())));
     }
@@ -257,7 +257,7 @@ fn read_capped(path: &Path, cap: u64) -> io::Result<String> {
     String::from_utf8(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
-fn append(dir: &Path, text: &str) -> io::Result<()> {
+pub(crate) fn append(dir: &Path, text: &str) -> io::Result<()> {
     // One `write` per call on an O_APPEND file: lines from `start` and the
     // supervisor never interleave mid-line.
     OpenOptions::new().create(true).append(true).open(dir.join("meta"))?.write_all(text.as_bytes())
@@ -278,17 +278,23 @@ fn create(root: &Path, argv: &[String], now: u64) -> io::Result<String> {
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
         }
-        let mut text = String::new();
-        for arg in argv {
-            text.push_str("arg ");
-            escape(arg, &mut text);
-            text.push('\n');
-        }
-        fs::write(dir.join("argv"), text)?;
-        append(&dir, &format!("started {now}\n"))?;
+        init(&dir, argv, now)?;
         return Ok(id);
     }
     Err(io::Error::other("no free run id"))
+}
+
+/// Fill a fresh run (or session, `sessions.rs`) dir: `argv` and the
+/// `started` line.
+pub(crate) fn init(dir: &Path, argv: &[String], now: u64) -> io::Result<()> {
+    let mut text = String::new();
+    for arg in argv {
+        text.push_str("arg ");
+        escape(arg, &mut text);
+        text.push('\n');
+    }
+    fs::write(dir.join("argv"), text)?;
+    append(dir, &format!("started {now}\n"))
 }
 
 /// `run start`: create the run, spawn its supervisor detached (in `cwd`, so
@@ -333,7 +339,7 @@ fn start_with(
     }
 }
 
-fn read_argv(dir: &Path) -> io::Result<Vec<String>> {
+pub(crate) fn read_argv(dir: &Path) -> io::Result<Vec<String>> {
     let text = read_capped(&dir.join("argv"), MAX_ARGV_BYTES)?;
     text.lines()
         .map(|l| {
@@ -379,7 +385,7 @@ fn supervise(root: &Path, id: &str) -> io::Result<()> {
     append(&dir, &format!("ended {}\n{end}\n", now()))
 }
 
-fn exit_line(status: ExitStatus) -> String {
+pub(crate) fn exit_line(status: ExitStatus) -> String {
     match (status.code(), status.signal()) {
         (Some(code), _) => format!("exit {code}"),
         (None, Some(sig)) => format!("signal {sig}"),
@@ -388,20 +394,20 @@ fn exit_line(status: ExitStatus) -> String {
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
-struct Meta {
-    started: Option<u64>,
-    supervisor: Option<u32>,
-    pid: Option<u32>,
+pub(crate) struct Meta {
+    pub(crate) started: Option<u64>,
+    pub(crate) supervisor: Option<u32>,
+    pub(crate) pid: Option<u32>,
     /// The command's process group (absent: not spawned yet, or a supervisor
     /// from before `rm`, whose command shares the supervisor's group).
-    pgid: Option<u32>,
-    ended: Option<u64>,
-    exit: Option<State>,
+    pub(crate) pgid: Option<u32>,
+    pub(crate) ended: Option<u64>,
+    pub(crate) exit: Option<State>,
 }
 
 /// Complete lines of a `meta` file; unknown keys are skipped (a newer helper
 /// may add some), as is a torn last line.
-fn parse_meta(text: &str) -> Meta {
+pub(crate) fn parse_meta(text: &str) -> Meta {
     let mut meta = Meta::default();
     let complete = &text[..text.rfind('\n').map_or(0, |i| i + 1)];
     for line in complete.lines() {
@@ -421,7 +427,7 @@ fn parse_meta(text: &str) -> Meta {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum State {
+pub(crate) enum State {
     Running,
     Exited(i32),
     Killed(i32),
@@ -430,7 +436,7 @@ enum State {
 
 impl State {
     /// As printed by `ls` and `wait` (and parsed by `ctl.rs`).
-    fn label(self) -> String {
+    pub(crate) fn label(self) -> String {
         match self {
             State::Running => "running".into(),
             State::Exited(code) => format!("exited {code}"),
@@ -443,7 +449,7 @@ impl State {
 /// A run's state from its `meta`: ended → how; else running while the
 /// supervisor lives (`alive`), `lost` once it's gone. No supervisor recorded
 /// yet: starting (running) within `STARTING_GRACE` of `started`.
-fn state_of(meta: &Meta, now: u64, alive: impl Fn(u32) -> bool) -> State {
+pub(crate) fn state_of(meta: &Meta, now: u64, alive: impl Fn(u32) -> bool) -> State {
     if meta.ended.is_some() {
         return meta.exit.unwrap_or(State::Lost);
     }
@@ -457,12 +463,12 @@ fn state_of(meta: &Meta, now: u64, alive: impl Fn(u32) -> bool) -> State {
 
 /// Whether `pid` is run `id`'s supervisor: alive, and its cmdline names the
 /// id (a zombie's cmdline is empty, so a finished unreaped one doesn't count).
-fn is_supervisor(pid: u32, id: &str) -> bool {
+pub(crate) fn is_supervisor(pid: u32, id: &str) -> bool {
     let cmdline = fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
     cmdline.split(|&b| b == 0).any(|w| w == id.as_bytes())
 }
 
-fn load_state(dir: &Path, id: &str) -> io::Result<(Meta, State)> {
+pub(crate) fn load_state(dir: &Path, id: &str) -> io::Result<(Meta, State)> {
     let read = || read_capped(&dir.join("meta"), MAX_META_BYTES).map(|t| parse_meta(&t));
     let meta = read()?;
     let state = state_of(&meta, now(), |pid| is_supervisor(pid, id));
@@ -511,7 +517,7 @@ fn ls(root: &Path) -> io::Result<String> {
 /// Every run id under `root` that is a real dir, sorted (start order; runs
 /// started in the same second tie-break on the id's random part). A missing
 /// root has none.
-fn run_ids(root: &Path) -> io::Result<Vec<String>> {
+pub(crate) fn run_ids(root: &Path) -> io::Result<Vec<String>> {
     let mut ids: Vec<String> = match fs::read_dir(root) {
         Ok(entries) => entries
             .filter_map(|e| e.ok()?.file_name().into_string().ok())
@@ -525,7 +531,7 @@ fn run_ids(root: &Path) -> io::Result<Vec<String>> {
 }
 
 /// ` <word> <word>…`, escaped, cut to [`MAX_LS_ARGV_CHARS`] chars plus `…`.
-fn render_argv(argv: &[String]) -> String {
+pub(crate) fn render_argv(argv: &[String]) -> String {
     let mut text = String::new();
     for arg in argv {
         text.push(' ');
@@ -629,7 +635,7 @@ fn parse_stat(text: &str) -> Option<(u32, u32)> {
     Some((fields.next()?.parse().ok()?, fields.next()?.parse().ok()?))
 }
 
-fn proc_stat(pid: u32) -> Option<(u32, u32)> {
+pub(crate) fn proc_stat(pid: u32) -> Option<(u32, u32)> {
     parse_stat(&fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
 }
 
@@ -641,7 +647,7 @@ fn proc_stat(pid: u32) -> Option<(u32, u32)> {
 /// one: the command shares the supervisor's group) or one that never got to
 /// spawn, the supervisor's own group (it leads one: `start`). `None`: nothing
 /// verifiably the run's (e.g. the command just ended).
-fn kill_target(meta: &Meta, stat: impl Fn(u32) -> Option<(u32, u32)>) -> Option<u32> {
+pub(crate) fn kill_target(meta: &Meta, stat: impl Fn(u32) -> Option<(u32, u32)>) -> Option<u32> {
     let sup = meta.supervisor?;
     let target = match meta.pgid {
         Some(pgid) => (stat(pgid) == Some((sup, pgid))).then_some(pgid),
@@ -656,14 +662,21 @@ fn kill_target(meta: &Meta, stat: impl Fn(u32) -> Option<(u32, u32)>) -> Option<
 /// and whose group syntax differs between procps, util-linux and busybox. A
 /// group that's already gone is fine.
 fn kill_group(pgid: u32) -> io::Result<()> {
+    signal_group(pgid, SIGKILL)
+}
+
+pub(crate) const SIGHUP: i32 = 1;
+pub(crate) const SIGKILL: i32 = 9;
+
+/// Send `sig` to process group `pgid` (> 1), as [`kill_group`] does.
+pub(crate) fn signal_group(pgid: u32, sig: i32) -> io::Result<()> {
     unsafe extern "C" {
         fn kill(pid: i32, sig: i32) -> i32;
     }
-    const SIGKILL: i32 = 9;
     const ESRCH: i32 = 3;
     let pgid = i32::try_from(pgid).map_err(|_| other(format!("bad process group {pgid}")))?;
     // SAFETY: a plain syscall wrapper; no memory is shared.
-    if unsafe { kill(-pgid, SIGKILL) } != 0 {
+    if unsafe { kill(-pgid, sig) } != 0 {
         let e = io::Error::last_os_error();
         if e.raw_os_error() != Some(ESRCH) {
             return Err(e);
