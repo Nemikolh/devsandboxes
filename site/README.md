@@ -60,9 +60,7 @@ Pages → Run workflow, pick the branch or tag to deploy).
 
 Hand-written docs pages are MDX in the `docs` content collection
 (`src/content/docs/<slug>.mdx` → `/docs/<slug>`, frontmatter `title`,
-`description`, `eyebrow`, `order`; schema in `src/content.config.ts`). The
-landing page links to `/docs/quick-start#the-dashboard`, so keep that heading's
-text. Two pages are generated at build time
+`description`, `eyebrow`, `order`; schema in `src/content.config.ts`). Two pages are generated at build time
 from files elsewhere in the repo, so edit those, not the site:
 
 - `/docs/config` — rendered from `../skills/config-toml-spec/SKILL.md`.

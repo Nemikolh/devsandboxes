@@ -1,140 +1,48 @@
 ---
-import {
-  ArrowDown,
-  ArrowRight,
-  ArrowUpRight,
-  Boxes,
-  Braces,
-  Check,
-  Database,
-  FileCode,
-  FolderGit2,
-  GitBranch,
-  GitFork,
-  HardDrive,
-  LayoutDashboard,
-  Terminal,
-  Workflow,
-} from '@lucide/astro';
-import { codeToHtml } from 'shiki';
-import CodeBlock from '../components/CodeBlock.astro';
+import { ArrowRight, ArrowUpRight, Boxes, Check, Copy, KeyRound, Layers, Puzzle } from '@lucide/astro';
 import HowItWorks from '../components/HowItWorks.astro';
-import StacksDiagram from '../components/StacksDiagram.astro';
 import Base from '../layouts/Base.astro';
-import { psTable } from '../lib/home';
-import { VERSION } from '../lib/nav';
 import { searchSection } from '../lib/search';
-import { devsandboxesTheme } from '../lib/shiki-theme';
 import '../styles/home.css';
 import '../styles/how-it-works.css';
 
-// Hero config. Validated with `devsandbox -C <dir> ls` (config dir next to a
-// `web/` folder); keep it valid when editing.
-const heroConfig = `[template.agent]
-caches = ["pnpm"]
-persist-shell-history = true
-
-[services.postgres]
-image = "postgres:16"
-scope = "global"
-env = { POSTGRES_PASSWORD = "dev" }
-
-[sandbox.web]
-extends = "agent"
-folder = "../web"
-image = "node:22"
-services = ["postgres"]`;
-
-const heroConfigHtml = await codeToHtml(heroConfig, { lang: 'toml', theme: devsandboxesTheme });
-
-// What `devsandbox run` (prints the instance name) and `devsandbox ps` (the
-// runtime's NAME / IMAGE / STATUS, sorted by name) print for the config above.
-// The global service's container is `devsandbox-svc-<project hash>-<name>`.
-const runs = [
-  { name: 'web', note: '../web · your checkout' },
-  { name: 'web-2', note: '.worktrees/web-2 · sandbox/web-2' },
-  { name: 'web-3', note: '.worktrees/web-3 · sandbox/web-3' },
-];
-const ps = psTable(
-  ['NAME', 'IMAGE', 'STATUS'],
-  [
-    ['devsandbox-svc-3f9c21ab-postgres', 'postgres:16', 'Up 3 minutes'],
-    ['devsandbox-web', 'node:22', 'Up 3 minutes'],
-    ['devsandbox-web-2', 'node:22', 'Up 2 minutes'],
-    ['devsandbox-web-3', 'node:22', 'Up 41 seconds'],
-  ],
-);
-
-const features = [
+// High level to low level: what one sandbox is, then many, then what stays
+// on your side, then what it builds on. Few words; the docs say the rest.
+const benefits = [
   {
-    icon: GitFork,
-    title: 'A worktree per instance',
-    text: 'Run a sandbox again and the new instance gets its own git worktree on `sandbox/${instance}`. Agents never share a working tree.',
+    icon: Layers,
+    title: 'A sandbox per agent',
+    text: 'Every container your app needs, database included, on a network of its own.',
+    href: '/docs/quick-start',
+    link: 'Quick start',
+  },
+  {
+    icon: Copy,
+    title: 'Same stack, many times',
+    text: 'Run it again for the next agent. Each copy is provisioned for you.',
     href: '/examples/parallel-agents',
     link: 'Run agents in parallel',
   },
   {
-    icon: Database,
-    title: 'Shared or isolated services',
-    text: 'Declare postgres once. `scope = "global"` shares one container per config root; the default gives every instance its own.',
-    href: '/examples/shared-postgres',
-    link: 'Share a database',
+    icon: KeyRound,
+    title: 'Secrets stay home',
+    text: 'Your keys sign from the host and ports open when you ask. It feels like working on your machine.',
+    href: '/examples/ssh-and-git-push',
+    link: 'ssh-agent and git push',
   },
   {
-    icon: HardDrive,
-    title: 'Warm caches',
-    text: '`caches = ["pnpm", "cargo"]` mounts one store from `shared-volumes/` into every sandbox and points the tool at it.',
-    href: '/examples/caches',
-    link: 'Share package caches',
-  },
-  {
-    icon: LayoutDashboard,
-    title: 'A dashboard for all of it',
-    text: 'Run `devsandbox` with no arguments: every instance and service, an integrated terminal, port forwards and an inbox.',
-    href: '/docs/quick-start#the-dashboard',
-    link: 'Open the dashboard',
-  },
-  {
-    icon: Workflow,
-    title: 'Automations',
-    text: 'Sandboxes that come back after a boot, notify you, and dispatch child instances to work on a PR, driven by your script.',
-    href: '/examples/babysit-pr',
-    link: 'Babysit pull requests',
-  },
-  {
-    icon: Braces,
-    title: 'Typed Node API',
-    text: '`npm i devsandboxes` and script it: `run`, `exec`, `status`, `rm`… as promises, with TypeScript types for every result.',
-    href: '/docs/node-api',
-    link: 'Read the API',
+    icon: Puzzle,
+    title: 'Built on standards',
+    text: 'devcontainer images and Features: reuse what the community already wrote.',
+    href: '/examples/port-a-devcontainer',
+    link: 'Port a devcontainer.json',
   },
 ];
-
-const toolingSteps = [
-  {
-    title: 'Clone the repos',
-    text: 'Your agent clones what the task needs side by side on your machine, like `~/code/api` and `~/code/web`.',
-  },
-  {
-    title: 'Describe the stack',
-    text: 'One `devsandboxes.toml` per stack: a sandbox per repo, the services they share, caches. Unknown keys are errors, so a typo fails fast.',
-  },
-  {
-    title: 'Run, exec, report back',
-    text: '`devsandbox run --json` returns the new instance and `exec` runs in it. From inside, `devsbd notify` reaches you when a human is needed.',
-  },
-];
-
-/** `a `code` b` → text and <code> parts (odd indices are code). */
-const ticks = (s: string) => s.split('`');
-
-const firstCommand = `npm i -g devsandboxes
-devsandbox run web`;
 ---
 
 <Base
   title="devsandboxes"
-  description="Devcontainers for AI agents: every coding agent gets its own container sandbox and git worktree of your repo, and one terminal dashboard shows them all. On docker, podman and Apple container."
+  description="Run many coding agents at once, on your own machines, each fully isolated in its own sandbox. You stay in control. On docker, podman and Apple container."
   fullTitle
   ogType="website"
 >
@@ -151,14 +59,13 @@ devsandbox run web`;
       <div class="hero-inner">
         <div class="hero-copy">
           <div class="hero-kicker reveal" style="--d: 0s">
-            <span class="kicker-symbol" aria-hidden="true">//</span> DEVCONTAINERS FOR AI AGENTS
+            <span class="kicker-symbol" aria-hidden="true">//</span> SANDBOXES FOR CODING AGENTS
             <span class="kicker-line" aria-hidden="true"></span>
           </div>
           <h1 class="reveal" style="--d: 0.08s" data-pagefind-meta="title:devsandboxes">Let agents loose.<br /><em>Safely<span class="title-period">.</span></em></h1>
-          <p class="reveal" style="--d: 0.16s">
-            Every coding agent gets its own container and git worktree of your repo, away from your host and the other
-            agents. Watch them all from one dashboard and jump in with VS&nbsp;Code, on docker, podman or
-            Apple&nbsp;container.
+          <p class="hero-hook reveal" style="--d: 0.16s">Scared of getting pwned because your agent has the same privileges as you?</p>
+          <p class="reveal" style="--d: 0.2s">
+            Run many coding agents at once, on your own machines, each fully isolated. You stay in control.
           </p>
           <div class="hero-cta reveal" style="--d: 0.24s">
             <a class="button-primary" href="/docs/quick-start">Get started <ArrowRight size={18} aria-hidden="true" /></a>
@@ -166,174 +73,43 @@ devsandbox run web`;
           </div>
           <ul class="hero-trust reveal" style="--d: 0.32s" aria-label="At a glance">
             <li><Check size={14} class="trust-icon" aria-hidden="true" /> MIT</li>
-            <li><Check size={14} class="trust-icon" aria-hidden="true" /> No daemon</li>
             <li><Check size={14} class="trust-icon" aria-hidden="true" /> docker · podman · Apple container</li>
+            <li><Check size={14} class="trust-icon" aria-hidden="true" /> Linux · macOS</li>
           </ul>
         </div>
-
-        <div class="hero-workspace" data-pagefind-ignore role="img" aria-label="A terminal running devsandbox run web three times, creating instances web, web-2 and web-3, the last two on their own git worktrees, then devsandbox ps listing them next to a shared postgres service; beside it the devsandboxes.toml that defines them.">
-          <div class="workspace-glow"></div>
-          <div class="terminal-window">
-            <div class="window-bar">
-              <div class="window-dots"><i></i><i></i><i></i></div>
-              <div class="window-title"><Terminal size={13} /> terminal — ~/sandboxes</div>
-              <div class="window-bar-right">zsh <span>↗</span></div>
-            </div>
-            <div class="terminal-content">
-              {
-                runs.map((r, i) => (
-                  <>
-                    <div class="term-line" style={`--i: ${i * 2}`}>
-                      <span class="term-prompt">➜</span>
-                      <span class="term-path">~/sandboxes</span>
-                      <span class="term-command">devsandbox run web</span>
-                    </div>
-                    <div class="term-output term-run" style={`--i: ${i * 2 + 1}`}>
-                      <span class="term-instance">{r.name}</span>
-                      <span class={`term-note${i > 0 ? ' is-worktree' : ''}`}>
-                        {i > 0 ? <GitBranch size={11} /> : <FolderGit2 size={11} />}
-                        {r.note}
-                      </span>
-                    </div>
-                  </>
-                ))
-              }
-              <div class="term-line" style="--i: 6">
-                <span class="term-prompt">➜</span>
-                <span class="term-path">~/sandboxes</span>
-                <span class="term-command">devsandbox ps</span>
-              </div>
-              <pre class="term-table" style="--i: 7">{
-                ps.map((row, i) => <span class={i === 0 ? 'term-table-head' : undefined}>{row}{'\n'}</span>)
-              }</pre>
-              <div class="term-line" style="--i: 8">
-                <span class="term-prompt">➜</span>
-                <span class="term-path">~/sandboxes</span>
-                <span class="typing-cursor"></span>
-              </div>
-            </div>
-            <div class="terminal-status">
-              <span><span class="status-indicator"></span> ILLUSTRATIVE OUTPUT</span>
-              <span>DEVSANDBOX v{VERSION}</span>
-            </div>
-          </div>
-          <div class="config-window">
-            <div class="config-bar">
-              <FileCode size={14} />
-              <span>devsandboxes.toml</span>
-              <span class="config-close" aria-hidden="true">×</span>
-            </div>
-            <div class="config-code" set:html={heroConfigHtml} />
-          </div>
-          <div class="floating-tag"><span class="status-indicator"></span> 3 SANDBOXES · READY FOR AGENTS</div>
-        </div>
       </div>
-      <div class="hero-bottom" data-pagefind-ignore>
-        <span>BUILT FOR CODING AGENTS</span>
-        <a href="#how-it-works">SCROLL TO EXPLORE <ArrowDown size={14} aria-hidden="true" /></a>
+      <div class="hero-picture reveal" style="--d: 0.36s" id="how-it-works">
+        <HowItWorks />
       </div>
     </section>
 
-    <section class="overview-section" id="how-it-works" aria-labelledby="how-it-works-title">
+    <section class="overview-section" id="features" aria-labelledby="features-title">
       <div class="section-intro">
         <div>
-          <div class="small-label"><span>01 / HOW IT WORKS</span></div>
-          <h2 id="how-it-works-title">One sandbox each.<br />One place to watch<span class="title-period">.</span></h2>
+          <div class="small-label"><span>WHAT YOU GET</span></div>
+          <h2 id="features-title">Everything an agent needs.<br />Nothing it shouldn't have<span class="title-period">.</span></h2>
         </div>
-        <p>
-          Describe your sandboxes once, then start one per agent: each runs in its own container, on its own worktree and
-          branch. The dashboard lists them all, and opens any of them in VS Code with one key.
-        </p>
       </div>
-      <HowItWorks />
-    </section>
-
-    <section class="overview-section overview-features" id="features" aria-labelledby="features-title">
-      <div class="section-intro">
-        <div>
-          <div class="small-label"><span>02 / THE TOOLKIT</span></div>
-          <h2 id="features-title">Cheap to start.<br />Safe to throw away<span class="title-period">.</span></h2>
-        </div>
-        <p>
-          Instances are isolated, discoverable and disposable. Everything around them, from databases to caches to the
-          dashboard, is shared from the same config.
-        </p>
-      </div>
-      <div class="feature-grid">
+      <div class="feature-grid benefit-grid">
         {
-          features.map((f, i) => (
-            <a class="feature-card" href={f.href}>
-              <div class="feature-top">
-                <span class="feature-icon">
-                  <f.icon size={21} aria-hidden="true" />
-                </span>
-                <span class="feature-number">
-                  {String(i + 1).padStart(2, '0')} / {String(features.length).padStart(2, '0')}
-                </span>
-              </div>
-              <h3>{f.title}</h3>
-              <p>{ticks(f.text).map((t, j) => (j % 2 ? <code>{t}</code> : t))}</p>
+          benefits.map((b) => (
+            <a class="feature-card" href={b.href}>
+              <span class="feature-icon">
+                <b.icon size={21} aria-hidden="true" />
+              </span>
+              <h3>{b.title}</h3>
+              <p>{b.text}</p>
               <span class="feature-link">
-                {f.link}
+                {b.link}
                 <ArrowUpRight size={16} aria-hidden="true" />
               </span>
             </a>
           ))
         }
       </div>
-      <a class="section-link" href="/examples">
-        <Boxes size={16} aria-hidden="true" /> All examples <ArrowRight size={16} aria-hidden="true" />
-      </a>
-    </section>
-
-    <section class="command-section" aria-labelledby="command-title">
-      <div class="command-inner">
-        <div>
-          <div class="small-label"><span>03 / THE FIRST COMMAND</span></div>
-          <h2 id="command-title">Two lines to a sandbox<span class="title-period">.</span></h2>
-          <p>
-            Have docker, podman or Apple container running? Install the CLI from npm and start an instance. No config
-            yet: on a terminal, <code>devsandbox run</code> offers to write an example one.
-          </p>
-          <a href="/docs/quick-start">Follow the quick start <ArrowRight size={16} aria-hidden="true" /></a>
-        </div>
-        <div class="command-code">
-          <CodeBlock code={firstCommand} lang="bash" title="YOUR TERMINAL" />
-          <span class="command-caption">Also on the GitHub releases (Linux, macOS, Windows) and crates.io.</span>
-        </div>
-      </div>
-    </section>
-
-    <section class="overview-section" id="tooling" aria-labelledby="tooling-title">
-      <div class="section-intro">
-        <div>
-          <div class="small-label"><span>04 / LOW-LEVEL TOOLING</span></div>
-          <h2 id="tooling-title">Docker's verbs.<br />Local defaults<span class="title-period">.</span></h2>
-        </div>
-        <p>
-          Under the dashboard is a plain CLI with docker's verbs: run, exec, ps, logs, rm. The compose file becomes one
-          devsandboxes.toml per stack, with defaults made for your laptop: worktrees, shared services and caches, your
-          ssh-agent, ports tunneled on demand. Hand it to your agent and it sets up the whole stack.
-        </p>
-      </div>
-      <StacksDiagram />
-      <ol class="hiw-steps">
-        {
-          toolingSteps.map((s, i) => (
-            <li>
-              <span class="hiw-step-no">{String(i + 1).padStart(2, '0')}</span>
-              <h3>{s.title}</h3>
-              <p>{ticks(s.text).map((t, j) => (j % 2 ? <code>{t}</code> : t))}</p>
-            </li>
-          ))
-        }
-      </ol>
       <div class="section-links">
-        <a class="section-link" href="https://github.com/Nemikolh/devsandboxes/blob/main/skills/devsandbox-cli/SKILL.md">
-          <Terminal size={16} aria-hidden="true" /> The devsandbox-cli skill <ArrowUpRight size={16} aria-hidden="true" />
-        </a>
-        <a class="section-link" href="/docs/node-api">
-          <Braces size={16} aria-hidden="true" /> Script it from Node <ArrowRight size={16} aria-hidden="true" />
+        <a class="section-link" href="/examples">
+          <Boxes size={16} aria-hidden="true" /> All examples <ArrowRight size={16} aria-hidden="true" />
         </a>
       </div>
     </section>

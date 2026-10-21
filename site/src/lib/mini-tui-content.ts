@@ -2,8 +2,8 @@
  * Canned bodies for the mini dashboard's text views: container logs (`l`),
  * build logs (`b`),
  * the config explorer's TOML (`enter`) and its `docker inspect` pane. The
- * config is the landing page's hero config (`pages/index.astro`), serialized
- * the way the real explorer does it (`toml::to_string_pretty`: keys sorted,
+ * config is a `web` sandbox extending an `agent` template, with a global
+ * `postgres` service, serialized the way the real explorer does it (`toml::to_string_pretty`: keys sorted,
  * `extends` kept in the original and dropped when resolved), with the config
  * hash `short_hash` gives the resolved table. Inspect JSON is key-sorted too,
  * as `serde_json` prints it.
