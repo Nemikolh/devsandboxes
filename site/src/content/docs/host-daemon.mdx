@@ -22,7 +22,7 @@ What it keeps across restarts:
 
 ## Other machines
 
-The daemon can also manage sandboxes on other hosts you reach over ssh, where devsandbox is installed too. Register one, and its sandboxes and instances show in your dashboard next to yours, and the CLI finds its names:
+The daemon can also manage sandboxes on other hosts you reach over ssh. `machine add` checks the machine's devsandbox first: when it's missing or another version, it offers to copy this one there (to `~/.local/bin/devsandbox`, or over the old one; `--auto-install` skips the question and is needed off a terminal). Register one, and its sandboxes and instances show in your dashboard next to yours, and the CLI finds its names:
 
 ```bash
 devsandbox machine add me@my-server   # pick its config roots; or --config '~/sandboxes'

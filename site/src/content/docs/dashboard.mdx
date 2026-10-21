@@ -131,7 +131,7 @@ With [machines](/docs/host-daemon#other-machines) registered, the dashboard show
 
 ## Every key
 
-The real dashboard's keys, also in its `?` screen. The Preview column says what the preview on this page fakes. Clicking a tab title switches to it, like `1`–`5`. Dragging selects text and releasing copies it (*copy on select*, on by default; turn it off in `?` to copy only with `ctrl-shift-c`, or `ctrl-c` in terminals that keep `ctrl-shift-c` for themselves, as the dashboard tells you); an app in the integrated terminal that uses the mouse (vim, tmux) gets the drag and hover instead, and what it copies reaches your clipboard (*terminal clipboard* in `?` turns that off).
+The real dashboard's keys, also in its `?` screen. The Preview column says what the preview on this page fakes. Clicking a tab title switches to it, like `1`–`5`. Dragging selects text and releasing copies it (*copy on select*, on by default; turn it off in `?` to copy only with `ctrl-shift-c`, or `ctrl-c` in terminals that keep `ctrl-shift-c` for themselves, as the dashboard tells you); an app in the integrated terminal that uses the mouse (vim, tmux) gets the drag and hover instead, and what it copies reaches your clipboard (*terminal clipboard* in `?` turns that off). Copies go out as OSC 52, and a dashboard running on your own machine also hands them to `pbcopy`, `wl-copy` or `xclip`, so they land in terminals that ignore OSC 52, like iTerm2 by default.
 
 ### Everywhere
 
@@ -143,7 +143,7 @@ The real dashboard's keys, also in its `?` screen. The Preview column says what 
 | `?`                 | Settings & help: `space` / `enter` / click toggles a setting, `tab` moves between them | help only |
 | `q`, `ctrl-c`       | Quit                 | no                               |
 | drag                | Select text in one pane; release copies it while *copy on select* is on (the default) | no |
-| `ctrl-shift-c`, `cmd-c` | Copy the selection to your clipboard (OSC 52); `ctrl-c` too over a dashboard selection, for terminals that send it plain or keep `ctrl-shift-c` (Alacritty, GNOME Terminal, kitty, …) | no |
+| `ctrl-shift-c`, `cmd-c` | Copy the selection to your clipboard; `ctrl-c` too over a dashboard selection, for terminals that send it plain or keep `ctrl-shift-c` (Alacritty, GNOME Terminal, kitty, …) | no |
 | `shift`-drag        | Your terminal's own selection (whole rows, across panes) | no |
 
 ### Instances and Services
