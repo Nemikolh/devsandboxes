@@ -239,6 +239,15 @@ enum Command {
         json: bool,
     },
     /// Run a command in a sandbox instance (a login shell when none is given)
+    ///
+    /// With a TTY, on an instance with the devsbd helper, the command runs in
+    /// a session that outlives this client: if the connection or terminal
+    /// goes, it keeps running and `--attach` gets back to it.
+    ///
+    ///     devsandbox exec web
+    ///     devsandbox exec web --sessions
+    ///     devsandbox exec web --attach
+    ///     devsandbox exec web --attach=1790000000-a1b2
     Exec {
         /// Keep stdin open
         #[arg(short)]
@@ -246,6 +255,19 @@ enum Command {
         /// Allocate a pseudo-TTY
         #[arg(short)]
         tty: bool,
+        /// Attach to session ID; without ID, to the instance's one detached
+        /// session (several: a pick list on a TTY). Give ID as `--attach=ID`
+        /// before the name, or after it
+        #[arg(long, value_name = "ID", num_args = 0..=1, conflicts_with_all = ["command", "sessions", "session", "interactive", "tty"])]
+        attach: Option<Option<String>>,
+        /// List the instance's sessions: id, state, attached or detached,
+        /// started (UTC), command
+        #[arg(long, conflicts_with_all = ["command", "session", "interactive", "tty"])]
+        sessions: bool,
+        /// Run in session ID, attaching if it is live (even without a TTY);
+        /// without the helper, a plain exec
+        #[arg(long, value_name = "ID")]
+        session: Option<String>,
         #[arg(help = NAME_HELP)]
         name: String,
         /// Command and arguments to run; omitted: a login shell (zsh, bash,
@@ -697,8 +719,14 @@ fn main() -> Result<()> {
         Command::Undone { name } => commands::done::done(&name, false),
         Command::Stats { json } => commands::stats::stats(json),
         Command::Status { json: _ } => commands::status::status(&cli.dir),
-        Command::Exec { interactive, tty, name, command } => {
-            commands::exec::exec(&name, interactive, tty, &command)
+        Command::Exec { interactive, tty, attach, sessions, session, name, command } => {
+            use commands::exec::Exec;
+            let what = match (&attach, sessions) {
+                (Some(id), _) => Exec::Attach(id.as_deref()),
+                (None, true) => Exec::Sessions,
+                (None, false) => Exec::Run { interactive, tty, command: &command, session: session.as_deref() },
+            };
+            commands::exec::exec(&name, what)
         }
         Command::Port { name, service, address, ports } => {
             #[cfg(unix)]
@@ -781,5 +809,48 @@ mod tests {
         assert_eq!(rm_flag(&["--keep-branch"]).unwrap(), Some(false));
         let err = rm_flag(&["--delete-branch", "--keep-branch"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    /// `exec`'s (attach, sessions, session, name, command).
+    type ExecArgs = (Option<Option<String>>, bool, Option<String>, String, Vec<String>);
+
+    fn exec_args(args: &[&str]) -> Result<ExecArgs, clap::Error> {
+        let cli = Cli::try_parse_from(["devsandbox", "exec"].iter().chain(args))?;
+        match cli.command {
+            Some(Command::Exec { attach, sessions, session, name, command, .. }) => {
+                Ok((attach, sessions, session, name, command))
+            }
+            _ => panic!("not exec"),
+        }
+    }
+
+    #[test]
+    fn exec_session_flags_parse() {
+        let s = |v: &str| v.to_string();
+        let id = "1790000000-a1b2";
+        assert_eq!(exec_args(&["web", "--attach"]).unwrap(), (Some(None), false, None, s("web"), vec![]));
+        assert_eq!(exec_args(&["web", "--attach", id]).unwrap(), (Some(Some(s(id))), false, None, s("web"), vec![]));
+        assert_eq!(exec_args(&["--attach=1790000000-a1b2", "web"]).unwrap().0, Some(Some(s(id))));
+        assert_eq!(exec_args(&["web", "--sessions"]).unwrap(), (None, true, None, s("web"), vec![]));
+        assert_eq!(exec_args(&["--sessions", "web"]).unwrap().1, true);
+        assert_eq!(
+            exec_args(&["--session", id, "web", "--", "zidane"]).unwrap(),
+            (None, false, Some(s(id)), s("web"), vec![s("zidane")])
+        );
+        assert_eq!(exec_args(&["web", "--session", id]).unwrap().2, Some(s(id)));
+        // After the command starts, the flags are the command's.
+        assert_eq!(exec_args(&["web", "--", "cmd", "--attach"]).unwrap(), (None, false, None, s("web"), vec![s("cmd"), s("--attach")]));
+        assert_eq!(exec_args(&["web", "ls", "--sessions"]).unwrap().4, vec![s("ls"), s("--sessions")]);
+        for conflict in [
+            &["web", "--attach", "--", "ls"][..],
+            &["web", "--sessions", "--", "ls"],
+            &["web", "--attach", "--sessions"],
+            &["--session", id, "web", "--attach"],
+            &["--session", id, "web", "--sessions"],
+            &["-t", "web", "--attach"],
+        ] {
+            let err = exec_args(conflict).unwrap_err();
+            assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict, "{conflict:?}");
+        }
     }
 }

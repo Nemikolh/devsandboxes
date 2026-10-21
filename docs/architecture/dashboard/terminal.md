@@ -24,7 +24,8 @@ into a shared `vt100::Parser<KittyState>` (5000 lines of scrollback) and
 writes back the replies the callbacks queued. EOF sets `exited`: the tab
 shows `(exited)`, keeps its screen, swallows keys, and `x` closes it.
 Dropping a session kills and waits the child, so quitting the dashboard
-leaks no `exec` client.
+leaks no `exec` client. An instance tab's shell lives on in its helper
+session (see *What a tab runs*), there for `devsandbox exec --attach`.
 
 `TermTabs` is the pure tab strip (open, `find`, next/prev, close; the
 active index). One strip serves every dashboard tab. `t` focuses a live
@@ -45,7 +46,10 @@ arrives on reader threads and only shows on the next draw.
   (`exe::devsandbox`) so tabs opened after an upgrade run the new binary.
   The CLI owns the runtime argv, the in-flight guard and the ssh-agent
   relay; with no command it runs `SHELL_FALLBACK_CMD` (zsh, then bash, then
-  `sh`, as login shells). Its errors print in the tab.
+  `sh`, as login shells), in a new helper session when the instance has
+  the helper (`devsbd session new`, `commands::exec::session_for`; see
+  [../helper/in-container.md](../helper/in-container.md)). Its errors
+  print in the tab.
 - A service (Services tab, first running container): `<runtime> exec -i
   -t <container>` + `SHELL_FALLBACK_CMD`, the binary named by the
   snapshot's `runtime_name`. The one place the dashboard runs the runtime

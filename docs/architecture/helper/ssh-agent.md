@@ -51,6 +51,11 @@ and lifecycle execs:
 `devsandbox exec`) get it; so do `run`'s lifecycle chain, `start`'s
 `postStartCommand`, and the boot hook's commands (`boot_spec` records it).
 A container's own processes not started through these execs don't.
+A tty exec's command runs in a helper session (`devsbd session new`,
+[in-container.md](in-container.md)), whose supervisor takes its env from
+the exec that created it: the command keeps that exec's `SSH_AUTH_SOCK`
+(or its absence) for good, and a later `exec --attach` changes neither.
+Both hold an `AgentRelay` while they run, as any `exec` does.
 
 ## The relay
 

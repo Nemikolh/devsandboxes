@@ -1,8 +1,9 @@
 use std::io::IsTerminal;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 
 use super::resolve_instance;
+use crate::devsbd::control::valid_run_id;
 use crate::runtime::backend;
 use crate::state::{Instance, State};
 
@@ -18,42 +19,98 @@ pub const SHELL_FALLBACK_CMD: [&str; 3] = [
     "command -v zsh >/dev/null 2>&1 && exec zsh -l; command -v bash >/dev/null 2>&1 && exec bash -l; exec sh -l",
 ];
 
-/// CLI entry point: run the command, then exit the process with its status.
-pub fn exec(name: &str, interactive: bool, tty: bool, command: &[String]) -> Result<()> {
-    std::process::exit(exec_status(name, interactive, tty, command)?);
+/// What one `devsandbox exec` does in its instance.
+pub enum Exec<'a> {
+    /// Run `command` (empty: the login shell), through a session when
+    /// [`session_for`] says so; `session` is the caller's id (`--session`).
+    Run { interactive: bool, tty: bool, command: &'a [String], session: Option<&'a str> },
+    /// `--attach [ID]`: attach to session `ID`, or to the one detached
+    /// session ([`choose_detached`]).
+    Attach(Option<&'a str>),
+    /// `--sessions`: the helper's `session ls`.
+    Sessions,
 }
 
-/// Run the command inside the matching instance and return its exit code.
-/// Split out of [`exec`] so callers that must not terminate the process (the
-/// dashboard prompt) can reuse it. An empty `command` opens the login shell
-/// ([`SHELL_FALLBACK_CMD`]) with [`shell_flags`] defaults.
-pub fn exec_status(name: &str, interactive: bool, tty: bool, command: &[String]) -> Result<i32> {
+/// CLI entry point: run the command, then exit the process with its status.
+pub fn exec(name: &str, what: Exec) -> Result<()> {
+    std::process::exit(exec_status(name, what)?);
+}
+
+/// Run `what` inside the matching instance and return its exit code. An
+/// empty command opens the login shell ([`SHELL_FALLBACK_CMD`]) with
+/// [`shell_flags`] defaults.
+pub fn exec_status(name: &str, what: Exec) -> Result<i32> {
     let state = State::load()?;
     let key = resolve_instance(&state, name)?;
     let instance = state.instances.get(&key).expect("key came from state");
     if let Some(why) = super::no_container_yet(&key, instance.phase_view().as_ref()) {
-        anyhow::bail!("{why}");
+        bail!("{why}");
     }
+    let stdin_tty = std::io::stdin().is_terminal();
+    let helper = instance.devsbd_arch.is_some();
 
-    let shell: Vec<String>;
-    let (command, interactive, tty) = if command.is_empty() {
-        shell = SHELL_FALLBACK_CMD.iter().map(|s| s.to_string()).collect();
-        let (i, t) = shell_flags(interactive, tty, std::io::stdin().is_terminal());
-        (shell.as_slice(), i, t)
-    } else {
-        (command, interactive, tty)
-    };
+    match what {
+        Exec::Sessions => {
+            if !helper {
+                bail!("`{key}` has no devsbd helper, so no sessions");
+            }
+            let listing = backend().output(&refs(&session_ls_argv(instance)))?;
+            if listing.is_empty() {
+                eprintln!("no sessions in `{key}`");
+            } else {
+                print!("{listing}");
+            }
+            Ok(0)
+        }
+        Exec::Attach(id) => {
+            if !helper {
+                bail!("`{key}` has no devsbd helper, so no sessions to attach to");
+            }
+            let id = match id {
+                Some(id) => checked_session_id(id)?.to_string(),
+                None => {
+                    let listing = backend().output(&refs(&session_ls_argv(instance)))?;
+                    choose_detached(&key, &listing, stdin_tty, &mut |prompt, options| super::pick(prompt, options))?
+                }
+            };
+            let (interactive, tty) = shell_flags(false, false, stdin_tty);
+            run_in(&key, instance, interactive, tty, &session_attach_command(&id))
+        }
+        Exec::Run { interactive, tty, command, session } => {
+            if let Some(id) = session {
+                checked_session_id(id)?;
+            }
+            let shell: Vec<String>;
+            let (command, interactive, tty) = if command.is_empty() {
+                shell = SHELL_FALLBACK_CMD.iter().map(|s| s.to_string()).collect();
+                let (i, t) = shell_flags(interactive, tty, stdin_tty);
+                (shell.as_slice(), i, t)
+            } else {
+                (command, interactive, tty)
+            };
+            let wrapped = session_for(helper, tty, session, || mint_session_id(Instance::now()))
+                .map(|id| session_new_command(&id, command));
+            run_in(&key, instance, interactive, tty, wrapped.as_deref().unwrap_or(command))
+        }
+    }
+}
 
+fn refs(args: &[String]) -> Vec<&str> {
+    args.iter().map(String::as_str).collect()
+}
+
+/// Run `command` in `instance` (instance `key`) with stdio inherited, under
+/// the ssh-agent relay when it applies; the runtime's exit code.
+fn run_in(key: &str, instance: &Instance, interactive: bool, tty: bool, command: &[String]) -> Result<i32> {
     // Same gate as the `SSH_AUTH_SOCK` injection: relay mode with a host agent.
     let host_agent = crate::devsbd::relay_mode(instance) && has_host_agent();
     // The daemon's bridge for the command's lifetime, asked for alongside it:
     // the in-container daemon holds an agent client until the bridge attaches
     // (docs/architecture/helper/in-container.md).
     #[cfg(unix)]
-    let relay = host_agent.then(|| AgentRelay::start(&key));
+    let relay = host_agent.then(|| AgentRelay::start(key));
     let args = exec_argv_with(instance, interactive, tty, command, host_agent);
-    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let code = backend().run_inherit(&arg_refs)?;
+    let code = backend().run_inherit(&refs(&args))?;
     #[cfg(unix)]
     if let Some(relay) = relay {
         relay.finish(&instance.container);
@@ -167,6 +224,100 @@ fn shell_flags(interactive: bool, tty: bool, stdin_tty: bool) -> (bool, bool) {
         (interactive, tty)
     } else {
         (true, stdin_tty)
+    }
+}
+
+/// The session a `Run` exec goes through, if any: none without the helper
+/// (`helper`: `Instance::devsbd_arch` is `Some`); else the caller's id
+/// (`requested`, `--session`, whether or not there is a tty); else a fresh
+/// id from `mint` when the exec gets a tty: every interactive exec is
+/// resumable, every command-less one a new shell. Piped execs stay plain
+/// (nothing to re-attach to).
+fn session_for(helper: bool, tty: bool, requested: Option<&str>, mint: impl FnOnce() -> String) -> Option<String> {
+    match requested {
+        _ if !helper => None,
+        Some(id) => Some(id.to_string()),
+        None => tty.then(mint),
+    }
+}
+
+/// The in-container command that creates session `id` running `command` and
+/// attaches to it (an `id` already live attaches instead). No `--cwd`: the
+/// supervisor starts in the client's cwd and env, which the runtime exec's
+/// `-w`/`-u`/`-e` set as for a plain exec.
+fn session_new_command(id: &str, command: &[String]) -> Vec<String> {
+    let head = [crate::devsbd::BIN, "session", "new", "--id", id, "--"];
+    head.iter().map(|s| s.to_string()).chain(command.iter().cloned()).collect()
+}
+
+/// The in-container command attaching to session `id`.
+fn session_attach_command(id: &str) -> Vec<String> {
+    [crate::devsbd::BIN, "session", "attach", id].iter().map(|s| s.to_string()).collect()
+}
+
+/// The runtime argv listing `instance`'s sessions (as its user: a session's
+/// socket is its user's).
+fn session_ls_argv(instance: &Instance) -> Vec<String> {
+    let ls: Vec<String> = [crate::devsbd::BIN, "session", "ls"].iter().map(|s| s.to_string()).collect();
+    exec_argv_with(instance, false, false, &ls, false)
+}
+
+/// A fresh session id at `now` (unix secs), in `control::valid_run_id`'s
+/// shape so a name sort is start order. The hex comes from std's
+/// per-process random hash keys (as `inbox`'s event ids): no dependency. A
+/// collision would attach to that other session, so the odds matter: 1 in
+/// 65536 among sessions of one instance started in the same second.
+fn mint_session_id(now: u64) -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u64(now);
+    h.write_u32(std::process::id());
+    format!("{now:010}-{:04x}", h.finish() as u16)
+}
+
+/// `id` when it is a session id the helper accepts (checked here too, so a
+/// typo fails before any runtime call).
+fn checked_session_id(id: &str) -> Result<&str> {
+    if !valid_run_id(id) {
+        bail!("bad session id `{id}` (expected <unix secs:010>-<4 hex>, see --sessions)");
+    }
+    Ok(id)
+}
+
+/// The running, detached sessions in a `devsbd session ls` listing (lines
+/// `<id> <state> <attached|detached|-> <started> <argv…>`): `(id, line)`.
+fn detached_sessions(listing: &str) -> Vec<(&str, &str)> {
+    listing
+        .lines()
+        .filter_map(|line| {
+            let mut words = line.split(' ');
+            let id = words.next()?;
+            (words.next() == Some("running") && words.next() == Some("detached")).then_some((id, line))
+        })
+        .collect()
+}
+
+/// `--attach` without an id: the one detached session in `listing`; several
+/// → `pick` on a TTY (`tty`), else an error naming them; none → an error.
+fn choose_detached(
+    key: &str,
+    listing: &str,
+    tty: bool,
+    pick: &mut dyn FnMut(&str, &[&str]) -> Result<usize>,
+) -> Result<String> {
+    let found = detached_sessions(listing);
+    match found.as_slice() {
+        [] => bail!("no detached session in `{key}` (devsandbox exec {key} --sessions)"),
+        [(id, _)] => Ok(id.to_string()),
+        _ if tty => {
+            let lines: Vec<&str> = found.iter().map(|(_, line)| *line).collect();
+            let i = pick(&format!("`{key}` has several detached sessions"), &lines)?;
+            Ok(found[i].0.to_string())
+        }
+        _ => {
+            let ids: Vec<&str> = found.iter().map(|(id, _)| *id).collect();
+            bail!("`{key}` has several detached sessions, pick one with --attach <id>: {}", ids.join(", "))
+        }
     }
 }
 
@@ -421,6 +572,101 @@ mod tests {
         let outdated = Readiness { ready: false, error: Some("helper in c is outdated".into()) };
         assert_eq!(relay_note(Some(outdated)).as_deref(), Some("helper in c is outdated"));
         assert_eq!(relay_note(Some(Readiness { ready: false, error: None })).as_deref(), Some("the bridge isn't ready"));
+    }
+
+    const ID: &str = "1790000000-a1b2";
+
+    #[test]
+    fn session_only_with_the_helper_and_a_tty_or_an_explicit_id() {
+        let mint = || ID.to_string();
+        let never = || -> String { panic!("minted") };
+        // No helper: plain exec, even with an explicit id (no session to make).
+        assert_eq!(session_for(false, true, None, never), None);
+        assert_eq!(session_for(false, true, Some("1790000000-0000"), never), None);
+        // Helper, no tty: a piped exec stays plain.
+        assert_eq!(session_for(true, false, None, never), None);
+        // Helper and a tty (explicit `-t`, or the login-shell default on a
+        // terminal, both decided before): a fresh session.
+        assert_eq!(session_for(true, true, None, mint).as_deref(), Some(ID));
+        // `--session`: the caller's id, tty or not.
+        assert_eq!(session_for(true, false, Some("1790000000-0000"), never).as_deref(), Some("1790000000-0000"));
+        assert_eq!(session_for(true, true, Some("1790000000-0000"), never).as_deref(), Some("1790000000-0000"));
+    }
+
+    /// The command-less shell on a terminal: `shell_flags` gives `-t`, so a
+    /// session wraps the login shell, with the same `-w`/`-u`/`-e` flags.
+    #[test]
+    fn session_argv_wraps_the_command_after_the_plain_flags() {
+        let mut inst = instance();
+        inst.remote_user = Some("vscode".into());
+        inst.remote_env.insert("FOO".into(), "bar".into());
+        let (i, t) = shell_flags(false, false, true);
+        let shell: Vec<String> = SHELL_FALLBACK_CMD.iter().map(|s| s.to_string()).collect();
+        let id = session_for(true, t, None, || ID.to_string()).unwrap();
+        let argv = exec_argv_with(&inst, i, t, &session_new_command(&id, &shell), false);
+        let mut want: Vec<String> = [
+            "exec", "-i", "-t", "-w", "/workspaces/repository-1", "-u", "vscode", "-e", "FOO=bar",
+            "devsandbox-repo-abc1", crate::devsbd::BIN, "session", "new", "--id", ID, "--",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        want.extend(shell);
+        assert_eq!(argv, want);
+        assert_eq!(session_attach_command(ID), [crate::devsbd::BIN, "session", "attach", ID]);
+        assert_eq!(
+            session_ls_argv(&inst),
+            ["exec", "-w", "/workspaces/repository-1", "-u", "vscode", "-e", "FOO=bar", "devsandbox-repo-abc1", crate::devsbd::BIN, "session", "ls"]
+        );
+    }
+
+    #[test]
+    fn minted_ids_are_valid_run_ids() {
+        for now in [0, 1_790_000_000, 9_999_999_999] {
+            let id = mint_session_id(now);
+            assert!(valid_run_id(&id), "{id}");
+            assert!(id.starts_with(&format!("{now:010}-")), "{id}");
+        }
+        assert!(checked_session_id(ID).is_ok());
+        for bad in ["", "abc", "1790000000-A1B2", "../../etc", "1790000000-a1b2 "] {
+            assert!(checked_session_id(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    const LISTING: &str = "\
+1790000000-0001 exited 0 - 2026-09-21T10:00:00Z sh -lc x
+1790000000-0002 running attached 2026-09-21T10:00:01Z zidane
+1790000000-0003 running detached 2026-09-21T10:00:02Z claude
+1790000000-0004 lost - 2026-09-21T10:00:03Z sh
+1790000000-0005 killed 9 - 2026-09-21T10:00:04Z sh
+";
+
+    #[test]
+    fn detached_sessions_are_the_running_unattached_ones() {
+        assert_eq!(
+            detached_sessions(LISTING),
+            vec![("1790000000-0003", "1790000000-0003 running detached 2026-09-21T10:00:02Z claude")]
+        );
+        assert_eq!(detached_sessions(""), vec![]);
+    }
+
+    #[test]
+    fn attach_without_an_id_picks_the_detached_one() {
+        let mut never = |_: &str, _: &[&str]| -> Result<usize> { panic!("picked") };
+        assert_eq!(choose_detached("web", LISTING, false, &mut never).unwrap(), "1790000000-0003");
+        let e = choose_detached("web", "1790000000-0002 running attached 2026-09-21T10:00:01Z sh\n", true, &mut never);
+        assert!(e.unwrap_err().to_string().starts_with("no detached session in `web`"));
+
+        let two = "1790000000-0003 running detached 2026-09-21T10:00:02Z claude\n\
+                   1790000000-0006 running detached 2026-09-21T10:00:05Z zsh -l\n";
+        let e = choose_detached("web", two, false, &mut never).unwrap_err().to_string();
+        assert_eq!(e, "`web` has several detached sessions, pick one with --attach <id>: 1790000000-0003, 1790000000-0006");
+        let mut second = |prompt: &str, options: &[&str]| {
+            assert_eq!(prompt, "`web` has several detached sessions");
+            assert_eq!(options, ["1790000000-0003 running detached 2026-09-21T10:00:02Z claude", "1790000000-0006 running detached 2026-09-21T10:00:05Z zsh -l"]);
+            Ok(1)
+        };
+        assert_eq!(choose_detached("web", two, true, &mut second).unwrap(), "1790000000-0006");
     }
 
     #[test]

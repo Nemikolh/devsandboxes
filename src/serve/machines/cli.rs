@@ -353,11 +353,18 @@ pub(crate) fn remote_args(command: &Command, name: &str, root: Option<&Path>) ->
         Command::Done { .. } => out.extend([s("done"), s("--"), s(name)]),
         Command::Undone { .. } => out.extend([s("undone"), s("--"), s(name)]),
         Command::Rename { new_name, .. } => out.extend([s("rename"), s("--"), s(name), new_name.clone()]),
-        Command::Exec { interactive, tty, command, .. } => {
+        Command::Exec { interactive, tty, attach, sessions, session, command, .. } => {
             out.push(s("exec"));
-            out.extend([flag(*interactive, "-i"), flag(*tty, "-t")].into_iter().flatten());
+            out.extend([flag(*interactive, "-i"), flag(*tty, "-t"), flag(*sessions, "--sessions")].into_iter().flatten());
+            out.extend(session.as_ref().map(|id| format!("--session={id}")));
             // The name before `--`: after it, it would be the command.
             out.push(s(name));
+            // After the name: `--attach`'s value is optional, so a bare one
+            // before it would take the name as its id.
+            out.extend(attach.as_ref().map(|id| match id {
+                Some(id) => format!("--attach={id}"),
+                None => s("--attach"),
+            }));
             if !command.is_empty() {
                 out.push(s("--"));
                 out.extend(command.iter().cloned());
@@ -837,6 +844,20 @@ mod tests {
         );
         assert_eq!(ra(&["exec", "web", "uname", "-a"], "web", None), ms(&["exec", "web", "--", "uname", "-a"]));
         assert_eq!(ra(&["exec", "-t", "web"], "web", None), ms(&["exec", "-t", "web"]));
+        // Session flags ride along; a bare `--attach` stays after the name.
+        assert_eq!(ra(&["exec", "box/web", "--attach"], "web", None), ms(&["exec", "web", "--attach"]));
+        assert_eq!(
+            ra(&["exec", "box/web", "--attach", "1790000000-a1b2"], "web", None),
+            ms(&["exec", "web", "--attach=1790000000-a1b2"])
+        );
+        assert_eq!(ra(&["exec", "--sessions", "box/web"], "web", None), ms(&["exec", "--sessions", "web"]));
+        assert_eq!(
+            ra(&["exec", "--session", "1790000000-a1b2", "box/web", "zidane"], "web", root),
+            ms(&["-C", "/srv/it's", "exec", "--session=1790000000-a1b2", "web", "--", "zidane"])
+        );
+        // What it emits parses back to the same flags.
+        let back = command(&ra(&["exec", "box/web", "--attach"], "web", None).iter().map(String::as_str).collect::<Vec<_>>());
+        assert!(matches!(back, Command::Exec { attach: Some(None), ref name, .. } if name == "web"));
         assert_eq!(remote_args(&command(&["stop", "web"]), "web", None), None);
         assert_eq!(remote_args(&command(&["vscode", "web"]), "web", None), None);
     }

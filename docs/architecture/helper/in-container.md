@@ -136,6 +136,14 @@ Interactive commands that outlive their client, dtach's shape
 command runs, `client` while a client is attached. The id is the caller's
 (`control::valid_run_id` rules).
 
+The host starts them: `devsandbox exec` on an instance with the helper runs
+every tty exec as `<runtime> exec -it … <container> /run/devsandbox/bin/devsbd
+session new --id <id> -- <cmd>...` (`commands::exec::session_for`,
+`session_new_command`), with a fresh id (`mint_session_id`) or
+`--session`'s; the runtime exec's `-w`/`-u`/`-e` give the supervisor the
+cwd and env the command gets, so `new` needs no `--cwd`. `exec --attach
+[<id>]` runs `session attach`, `exec --sessions` `session ls`.
+
 - `new --id <id> [--cwd DIR] -- <cmd>...` (`create_with`) creates the dir
   and spawns a detached `devsbd session supervise <id>` (its own session,
   null stdio, in `DIR` with the caller's env), then attaches; an id that
