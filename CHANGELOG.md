@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-No more half-built sandboxes: an instance is recorded from the moment `run` starts, a failure leaves it listed as `failed` with its error, and Ctrl-C undoes the whole run. Every `run`, `rebuild` and `start` keeps a build log, and the dashboard runs them in the background instead of handing them the screen. `run`, `rebuild`, `start`, `stop`, `rm` and `service rebuild` now run in the host daemon, so a build outlives the terminal that started it, and `-d` leaves it running. The dashboard gets everything it shows from the daemon too.
+Machines: sandboxes on your other hosts, over ssh, in the same CLI and dashboard, with your ssh-agent relayed only where you allow it. No more half-built sandboxes: an instance is recorded from the moment `run` starts, a failure leaves it listed as `failed` with its error, and Ctrl-C undoes the whole run. Every `run`, `rebuild` and `start` keeps a build log, and the dashboard runs them in the background instead of handing them the screen. `run`, `rebuild`, `start`, `stop`, `rm` and `service rebuild` now run in the host daemon, so a build outlives the terminal that started it, and `-d` leaves it running. The dashboard gets everything it shows from the daemon too.
 
 **Behaviour change: a failed `run` now leaves an instance to `rm`.** Before, only a failing lifecycle command (`postCreateCommand`, …) kept its container, and a run that failed earlier (worktree, image build, container create) left its worktree, branch and services behind with no instance pointing at them. Now every failure keeps a `failed` instance; `devsandbox rm <name>` removes all of it, or `devsandbox rebuild <name>` retries.
 
@@ -13,7 +13,11 @@ devsandbox rm web-4        # or remove everything it made
 
 ### Added
 
-- **`machine add` installs devsandbox on the machine.** When the machine has no devsandbox or another version, `machine add` offers to copy this one there (to `~/.local/bin/devsandbox`, or over the old one); `--auto-install` skips the question and is needed off a TTY. `devsandbox --version` prints the version.
+- **`machine add` installs devsandbox on the machine.** When the machine has no devsandbox or another version, `machine add` offers to copy this one there (to `~/.local/bin/devsandbox`, or over the old one); `--auto-install` skips the question and is needed off a TTY. A devsandbox in `~/.local/bin` is found even when the machine's login shell doesn't put it on `PATH`. `devsandbox --version` prints the version.
+
+```bash
+devsandbox machine add me@my-server --auto-install
+```
 - **Machines: sandboxes on other hosts, over ssh.** `devsandbox machine add <ssh target>` registers a host running devsandbox (its config roots are offered to pick from, or pass `--config '<path there>'`); `machine ls` shows each one's state, `machine rm` forgets it. Their sandboxes and instances then show in the dashboard next to yours, in a MACHINE column, and every key works on them, terminals included. On the CLI a name is looked up on every machine: one match is used wherever it is, `my-server/test` or `@/test` (this host) picks when it's ambiguous. Verbs run on the machine with its login shell's environment. Your ssh-agent reaches a machine only if you ask: `machine add --agent`, `machine set <name> --agent on|off`, or `a` on the dashboard's Machines tab (`5`, listed while a machine is registered: each machine's target, link state, agent and version) (off by default, takes effect at once), relayed by devsandbox rather than `ssh -A`. A login shell that prints a banner no longer makes the machine unreachable. `exec`, `logs`, `inspect`, `done` and `rename` run there over `ssh`. `--machine <name>` runs a command without a name there (`ps`, `ls`, `stop --all`, …). A machine that's down keeps its last rows, marked `unreachable`. Not yet on machines: VS Code, the Inbox. Adding a machine means trusting it. Details: `docs/machines.md`.
 
 ```bash
@@ -72,6 +76,8 @@ devsandbox logs --build web-4 --follow
 
 - **The dashboard runs `run`, `rebuild` and `start` in the background, through the host daemon.** It no longer steps aside for the build and waits for a key: the command keeps going even if you quit the dashboard, a status line says when it started, and the instance's row shows its step as it goes, `failed` included. When it can't reach the daemon, the status line says one is needed instead. `b` on an instance opens its build log, following it while it builds. `d` on a row still building asks to cancel it; on a failed row it removes the instance, and `s` rebuilds it.
 
+- **The host daemon follows container events.** Instead of listing containers every few seconds, it wakes on the runtime's events and on edits to your config, so the dashboard reflects a change sooner and an idle daemon (kept up by `serve install`) costs next to nothing.
+
 - **Ctrl-C rolls a `run` back.** Cancelling a `run` (Ctrl-C or SIGTERM) removes everything it had made: container, services and network, volumes, worktrees, the branch it created if it has no new commits, and the instance itself. A second Ctrl-C quits at once without cleaning up. A cancelled `rebuild` leaves the instance `failed`.
 
 - **Commands leave an instance alone while it's being made.** `start`, `stop`, `rename`, `rebuild` and `rm` (even with `--force`) refuse an instance whose `run` or `rebuild` is still going and say what it's doing; `start` also refuses a failed one and points at `rebuild` and `rm`. `rebuild --all` and autostart skip both. `exec` works once the container exists, so you can shell into one whose `postCreateCommand` failed. A dispatcher's `devsbd ensure` of such a child fails with a message naming its step instead of starting or recreating it.
@@ -88,6 +94,98 @@ devsandbox logs --build web-4 --follow
 
 <details><summary>Commits</summary>
 
+- be6fc4a docs(skills): tell agents to add sandboxes to the workspace's config
+- c286190 docs(site): frame a sandbox as the stack and one config per workspace
+- b14a8d5 docs(site): add a compared-to-docker page
+- 686da2d docs(site): cover machine add installing devsandbox and the host clipboard copy
+- e0a718b docs(site): make the landing page say what devsandbox is for
+- 7917bf1 fix(devsbd): mark a failed bridge done before reporting its outcome, so a caller seeing the failure also sees it dead
+- 6a8efb3 fix(tui): also copy through the host clipboard command, since iTerm2 ignores osc 52 by default and dashboard copies (own and relayed from terminal tabs) were lost
+- 9c286da fix(machine): find devsandbox in ~/.local/bin off the login path and only warn when it can't be copied, so add works on hosts whose login shell misses ~/.local/bin
+- 93d8d20 docs(machine): close the machine-install plan
+- 000c807 feat(machine): offer to install devsandbox on machine add
+- ad6ff05 feat(machine): let machines.probe and machines.add take a command
+- 8865a83 feat(machine): check a machine's devsandbox and copy this binary there
+- 649b827 feat(serve): wake the host poll on config edits
+- 04fa19d docs(serve): close the runtime-events plan
+- ca725cb feat(serve): let container events drive the host poll
+- ecf0181 feat(serve): follow the runtime's container event stream
+- 048f612 fix: ra hang bug
+- 38eb0a5 docs(tui): bring the changelog, selection regions and stale comments in line with the machines tab
+- 06af1a0 docs(tui): close the machines tab plan now that the tab and its agent toggle shipped
+- 70f0246 feat(tui): let a on the machines tab flip a machine's agent, so relaying keys no longer needs a trip to the cli
+- decbcf8 feat(tui): add a machines tab listing every registered machine's link and agent, so the dashboard can show what only machine ls did
+- f07511a docs(machines): close the agent plan, record the never-ssh-a decision and the relay's known costs
+- 042a430 feat(machines): keep a machine's agent relay up for cli re-runs and drop ssh -A everywhere, so keys reach a machine only when you said so
+- e23d074 refactor(config): group implemented devcontainer properties together
+- b742fa0 feat(serve): relay the agent to a machine only while it's wanted and its agent is on, and drop ssh -A from the daemon's links
+- 79f6766 feat(machine): add a per-machine agent setting, off by default, so forwarding your keys becomes a choice per host
+- b5075e4 feat(machines): add an agent relay over the helper's frame protocol, so a machine can get this host's agent without ssh -A
+- 7c75b99 fix(machines): skip what a remote login shell prints before the relay's sentinel, so a chatty profile no longer makes the machine unreachable
+- 3f9effb docs(plans): plan opt-in agent forwarding over our own relay and a sentinel for noisy login shells
+- b27bb92 docs(agents): treat everything as unreleased before 1.0 so plans stop carrying compat work
+- d2197ec docs(plans): drop compat and changelog notes from the machines plan, machines are unreleased
+- de38c42 docs(plans): plan surviving a noisy remote login shell and opt-in, live-switchable agent forwarding for machines
+- a6a0d0e docs(status): plan dropping the host lsof fallback once the helper covers every route
+- 18e1892 docs(forwards): record remote forwards as shipped, with their limits, and archive the plan
+- f38975b feat(tui): forward a machine's instances and services from the dashboard, with their forwards in the ports tab
+- a2ccf7e feat(serve): hold forwards into a machine's instances in the daemon, persisted and dropped with the machine
+- f27796e feat(port): forward a machine's instance or global service from the cli, tunnelled over ssh
+- d86800a feat(port): add the hidden tunnel command and a remote opener, so a forward's bridge can run over ssh to a machine
+- 6b0b55d refactor(forward): open a forward's bridge through a pluggable opener, so a remote one can come from ssh
+- d40e4b5 feat(devsbd): answer a forward's listening process from the helper, so it works without lsof and over a remote bridge
+- aebbf31 docs(plans): plan remote forwards as an ssh-carried bridge, helper-side process lookup first
+- 8e0edaa chore(skills): make orchestrated work keep the docs tree current and close its plan
+- 97502e1 refactor(serve): drop dead idle and quiet knobs left from the in-process dashboard
+- b2a5e39 docs(comments): drop plan-step tags and describe the daemon-era code as it is
+- f2a4a64 docs: point every code and site citation at the new docs tree, and test that they keep resolving
+- ac334c9 docs: one status file, an overview and a map; archive shipped plans, drop docs the code outgrew
+- 6afcdc5 docs(plans): trim unfinished work into current plans and triage every old doc
+- 1f265ea docs(decisions): keep only the decisions that still hold, standalone
+- a1f4371 docs(tui): describe the dashboard as a daemon client as built
+- ed04e91 docs(inbox): describe the inbox and automations as built, with a verified inbox cli reference
+- fc67220 docs(devsbd): describe the helper, its protocol, bridges and ssh-agent relay as built
+- 423ce69 docs(serve): describe the daemon as built and verify the api reference against the method table
+- 7172a5b docs(instances): describe config, runtimes and instances as they work today, verified against the code
+- 25e878d docs: split docs into living reference, decisions and plans so status stops drifting
+- 98749d6 docs(machines): document machines across the docs, site and cli skill
+- 5647d09 feat(tui): show and act on machines' sandboxes
+- dee2e5c feat(cli): resolve names across machines
+- 519bb23 feat(machines): forward calls and verbs to a machine
+- 2e7a08f feat(machines): held links and the federated snapshot
+- 78ba576 feat(machines): machines.toml registry and machine add|ls|rm
+- e897bf2 feat(machines): ssh transport, link hello, relay session env and roots.list
+- 348d39d docs(site): show stop, rm and build cancel as the dashboard does now
+- 4e25f3c docs(serve): describe the daemon-owned host side and the watched snapshot
+- e35209d fix(tui): size a build's pty to the build log modal, not the terminal
+- 667378a docs(changelog): note the shared poll, pty builds and upgrade fix
+- 747f751 feat(tui): watch the root instead of polling instances.list
+- 3098829 feat(serve): poll once for every dashboard and push the snapshot
+- 686a362 feat(tui): show build logs in colour, replayed as the terminal drew them
+- 62cf9ec feat(serve): run build verbs on a pty when the client has a terminal
+- 8d341bd fix(tui): scroll the logs, build log and help modals with the wheel
+- 5367fcd fix(tui): let stop, rm and service rebuild outlive a dashboard quit
+- 27b7209 fix(serve): spawn the binary now at our path, not the replaced one
+- 4d9a749 docs(serve): plan the work before machines
+- b925e66 docs(tui): describe the dashboard as a client of devsandbox serve
+- 7b0544c feat(tui): open instance terminals and :exec through devsandbox exec
+- 665323e feat(tui): send stop, rm, s and service rebuild to the daemon
+- 7c17dbe feat(tui): ask the daemon for logs, inspect, config, build logs and edits
+- 7e7f59c feat(tui): read the instance tree and procs from the daemon
+- 3b36501 feat(serve): rename, mark done, signal procs and rebuild services over the api
+- b43bcc9 feat(serve): serve procs, logs, inspect, build logs and config views
+- 5b3e7b7 feat(serve): serve the dashboard's snapshot over the api
+- 710b2df refactor(tui): build the dashboard on unix only
+- a3d7919 docs(tui): plan rollout step 4, the dashboard as a pure client
+- 4fa528b docs(serve): record the calls on step 3's known limitations
+- df0c28e docs(serve): describe the verbs running in the daemon, -d and the caller's env
+- 61a1151 feat(serve): adopt verbs a previous daemon left running
+- b4ea475 feat(tui): send run, rebuild and start to the daemon and cancel through it
+- 6b6fdd7 feat(cli): send run, rebuild, start, stop and rm to the daemon
+- 71c0f24 feat(serve): resolve names, cancel builds and ask rm's question over the api
+- 0fe841e feat(serve): run run, rebuild, start, stop and rm as daemon requests
+- 4360b83 docs(serve): plan rollout step 3, the verbs as daemon requests
+- 9762f34 docs(changelog): describe failed instances, build logs and background dashboard builds
 - 26ae476 feat(tui): run, rebuild and start in the background with a build-log view
 - 19a9d5a feat(tui): show a building or failed instance's phase as its status
 - b65237f fix(run): keep a run that fails before its container as failed
