@@ -2,7 +2,8 @@
 /**
  * The "docker's verbs" picture of `/docs/vs-docker`: you ask your agent, it
  * clones repos on your machine and drives devsandbox like docker to bring up
- * stacks (one config root each, the compose-project analogue), and the edges
+ * sandboxes (each one a stack, the compose-project analogue, all in one
+ * workspace's config), their instances and services, and the edges
  * between the sandboxes and the host: tunneled ports, the forwarded ssh-agent,
  * `devsbd notify`, and the planned on-demand credentials. Static, in the
  * landing diagram's visual language (`HowItWorks.astro`), laid out like
@@ -32,14 +33,19 @@ interface Box {
   scope?: string;
 }
 
+/** The workspace's one config; every sandbox below is a table in it. */
+const CONFIG = '~/work/devsandboxes.toml';
+
+// One group per sandbox: its instances (the first on the checkout, repeats on
+// worktrees) and its services, isolated, so one per instance.
 const stacks: { name: string; sandboxes: Box[]; services: Box[] }[] = [
   {
     name: 'shop',
     sandboxes: [
-      { name: 'api', tree: '~/code/api' },
-      { name: 'web', tree: '~/code/web' },
+      { name: 'shop', tree: '~/code/shop' },
+      { name: 'shop-2', tree: 'sandbox/shop-2', worktree: true },
     ],
-    services: [{ name: 'postgres', scope: 'global' }],
+    services: [{ name: 'postgres', scope: 'per instance' }],
   },
   {
     name: 'billing',
@@ -47,16 +53,16 @@ const stacks: { name: string; sandboxes: Box[]; services: Box[] }[] = [
       { name: 'billing', tree: '~/code/billing' },
       { name: 'billing-pr-42', tree: 'fix/invoice-rounding', worktree: true },
     ],
-    services: [{ name: 'redis', scope: 'isolated' }],
+    services: [{ name: 'redis', scope: 'per instance' }],
   },
 ];
 
-const repos = ['api', 'web', 'billing'];
+const repos = ['shop', 'billing'];
 
 // Bottom row: what crosses the sandbox boundary. `up` = from the host into
 // the sandboxes, else out of them.
 const edges = [
-  { id: 'ports', icon: Plug, label: 'devsandbox port', title: 'localhost:3000', sub: 'web:3000 · no -p' },
+  { id: 'ports', icon: Plug, label: 'devsandbox port', title: 'localhost:3000', sub: 'shop:3000 · no -p' },
   { id: 'ssh', icon: KeyRound, label: 'git push · pull', title: 'ssh-agent', sub: 'keys stay on the host', up: true },
   { id: 'notify', icon: Bell, label: 'devsbd notify', title: 'you', sub: 'Inbox · desktop' },
   {
@@ -73,11 +79,12 @@ const edges = [
 
 <figure class="sd" data-pagefind-ignore>
   <p class="visually-hidden">
-    Diagram: on your machine, you ask your agent to set up an environment. It git clones the api, web and billing repos
+    Diagram: on your machine, you ask your agent to set up an environment. It git clones the shop and billing repos
     into ~/code, then drives devsandbox with run --json and exec on your container runtime. There it brings up two
-    stacks, each one devsandboxes.toml: shop, with sandboxes api and web on their checkouts and a global postgres, and
-    billing, with sandbox billing, a child instance billing-pr-42 on its own worktree of the PR branch
-    fix/invoice-rounding, and an isolated redis. Across the
+    sandboxes, each a whole stack, both defined in one config for your work workspace, ~/work/devsandboxes.toml: shop,
+    with instance shop on its checkout and shop-2 on its own worktree, and a postgres per instance; and billing, with
+    instance billing and a child instance billing-pr-42 on its own worktree of the PR branch fix/invoice-rounding, and a
+    redis per instance. Across the
     sandbox boundary: ports tunneled to localhost with devsandbox port, your ssh-agent forwarded in so keys stay on the
     host, devsbd notify reaching you in the dashboard's Inbox and on the desktop, and, planned, credentials handed out on
     demand so tokens never live in a sandbox.
@@ -126,6 +133,7 @@ const edges = [
         <div class="sd-runtime-label">
           <span class="sd-runtime-title">RUNTIME</span>
           <span>docker</span><span>podman</span><span>Apple container</span>
+          <span class="sd-config">{CONFIG}</span>
         </div>
         <ul class="sd-stacks">
           {
@@ -134,7 +142,7 @@ const edges = [
                 <div class="sd-stack-head">
                   <Layers />
                   <strong>{s.name}</strong>
-                  <span>stacks/{s.name}/devsandboxes.toml</span>
+                  <span>[sandbox.{s.name}]</span>
                 </div>
                 <div class="sd-boxes">
                   {s.sandboxes.map((b) => (

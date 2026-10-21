@@ -1,6 +1,6 @@
 ---
 title: Compared to docker
-description: How devsandbox differs from docker compose and a devcontainer. Docker's verbs, one config per stack, and defaults made for running agents on your laptop.
+description: How devsandbox differs from docker compose and a devcontainer.
 eyebrow: GETTING STARTED
 order: 1.5
 ---
@@ -15,22 +15,25 @@ devsandbox combines tools you'd otherwise wire together yourself into a single i
 - **git worktrees**: every repeat instance of a repo gets its own worktree and branch.
 - **Multiple machines**: sandboxes on your other hosts, over ssh, in the same CLI and dashboard.
 
-It runs on docker, podman or Apple container, with docker's verbs: `run`, `exec`, `ps`, `logs`, `rm`. One `run` gives you not a container but a whole sandbox, ready for an agent to work in.
+It runs on docker, podman or Apple container, with docker's verbs: `run`, `exec`, `ps`, `logs`, `rm`.
+
+One `run` gives you not a container but a **whole sandbox**, ready for an agent to work in.
 
 ## Docker's verbs, local defaults
 
-A compose file and a `devcontainer.json` become one `devsandboxes.toml` per stack, with defaults made for your laptop: a git worktree per instance, shared services and caches, your ssh-agent, ports tunneled on demand. Hand it to your agent and it sets up the whole stack.
+A compose file and a `devcontainer.json` become one sandbox: the app's container and the services it needs, the whole stack. Every sandbox you work on lives in one `devsandboxes.toml`; a second config is for another workspace, like personal projects next to work. Defaults are made for your laptop: a git worktree per instance, shared services and caches, your ssh-agent, ports tunneled on demand. Hand the config to your agent and it sets up the stack.
 
 <StacksDiagram />
 
 1. **Clone the repos.** Your agent clones what the task needs side by side on your machine, like `~/code/api` and `~/code/web`.
-2. **Describe the stack.** One `devsandboxes.toml` per stack: a sandbox per repo, the services they share, caches. Unknown keys are errors, so a typo fails fast.
+2. **Describe the stack.** A `[sandbox.*]` per repo in your workspace's `devsandboxes.toml`, with the services it needs and caches. Unknown keys are errors, so a typo fails fast.
 3. **Run, exec, report back.** `devsandbox run --json` returns the new instance and `exec` runs in it. From inside, `devsbd notify` reaches you when a human is needed.
 
 ## What replaces what
 
 | With docker                                   | With devsandbox                                                                                               |
 | --------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| A compose project per app                     | A sandbox per app, every one in your workspace's `devsandboxes.toml`                                         |
 | `docker-compose.yml` services                 | `[services.*]`: one per instance on its own network, or `scope = "global"` for one shared by every sandbox |
 | `devcontainer.json` image, features, commands | `[sandbox.*]`: the same image, Features and lifecycle commands, in TOML                                        |
 | `docker compose up` a second time             | `devsandbox run web` again: a new instance, with its own containers and its own worktree and branch           |
