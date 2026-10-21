@@ -12,7 +12,9 @@ limitation means editing this file in the same commit.
 
 ## In progress
 
-(none)
+- **helper**: resumable interactive `exec` (helper-held pty sessions,
+  `--attach`, reconnect over ssh).
+  → [plan](plans/active/resumable-exec.md)
 
 ## Planned
 
