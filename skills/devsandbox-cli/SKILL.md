@@ -10,7 +10,9 @@ description: |
 `devsandbox` manages devcontainer-style sandboxes directly on a container runtime
 (docker / podman / Apple `container`) — no devcontainer CLI, no daemon to set
 up (its own host daemon starts on demand, see below). One
-`devsandboxes.toml` that lives outside of any project, unique per user.
+`devsandboxes.toml`, outside of any project, holds every sandbox of a
+workspace: add a sandbox to it rather than a new config per project (separate
+configs split workspaces, e.g. work vs personal).
 
 It defines templates, sandboxes, and shared services; the CLI derives containers, networks,
 mounts, caches, and VS Code wiring from it.

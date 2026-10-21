@@ -5,7 +5,7 @@ description: Reference for devsandbox's `devsandboxes.toml` format — `[templat
 
 # devsandbox `devsandboxes.toml` spec
 
-`devsandboxes.toml` is devsandbox's single source of truth: one file, outside any project, describing every sandbox. It replaces per-repo `devcontainer.json` (same property names, TOML syntax, plus devsandbox extras).
+`devsandboxes.toml` is devsandbox's single source of truth: one file, outside any project, describing every sandbox of a workspace (separate config dirs split workspaces, e.g. work vs personal, not projects). It replaces per-repo `devcontainer.json` (same property names, TOML syntax, plus devsandbox extras).
 
 ## File layout
 
