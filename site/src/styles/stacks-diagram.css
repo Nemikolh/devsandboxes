@@ -1,4 +1,4 @@
-/* ------------------------------------ Stacks diagram (landing, 04) */
+/* ------------------------------------ Stacks diagram (/docs/vs-docker) */
 
 /*
  * `StacksDiagram.astro`. Same colours as the landing diagram
@@ -6,9 +6,11 @@
  * lime you and your agent, purple devsandbox's own requests; yellow is
  * notify, dashed means planned. Desktop is a 4-column grid inside the host
  * box: links are CSS arrows in their own cells, so they always meet the
- * nodes; narrow screens stack it.
+ * nodes; narrow screens stack it. Breakpoints are container queries: the
+ * figure sits in a docs column, far narrower than the viewport.
  */
 .sd {
+  container-type: inline-size;
   /* Vertical links' x: centred on desktop, the icon rail when stacked. */
   --lx: 50%;
   --dash: #af87ff;
@@ -17,7 +19,7 @@
   --push: #8fcf6a;
   --muted-line: #56706f;
 
-  margin: 56px 0 0;
+  margin: 40px 0 0;
 }
 
 .sd-host {
@@ -576,21 +578,17 @@
 
 /* ------------------------------------------------------ Breakpoints */
 
-@media (max-width: 1180px) {
+@container (max-width: 1100px) {
   .sd .sd-stacks {
     grid-template-columns: minmax(0, 1fr);
   }
 }
 
-@media (max-width: 760px) {
-  /* One rail through the icons: card border + padding + half an icon. */
-  .sd {
+@container (max-width: 800px) {
+  .sd-host {
+    /* One rail through the icons: card border + padding + half an icon. */
     --lx: 24px;
 
-    margin-top: 36px;
-  }
-
-  .sd-host {
     padding: 40px 12px 12px;
   }
 

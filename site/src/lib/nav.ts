@@ -26,6 +26,7 @@ export function sidebarGroups(examples: NavLink[]): NavGroup[] {
       label: 'GETTING STARTED',
       links: [
         { href: '/docs/quick-start', label: 'Quick start' },
+        { href: '/docs/vs-docker', label: 'Compared to docker' },
         { href: '/docs/going-further', label: 'Going further' },
       ],
     },

@@ -1,0 +1,54 @@
+---
+title: Compared to docker
+description: How devsandbox differs from docker compose and a devcontainer. Docker's verbs, one config per stack, and defaults made for running agents on your laptop.
+eyebrow: GETTING STARTED
+order: 1.5
+---
+
+import ResourceLink from '../../components/ResourceLink.astro';
+import StacksDiagram from '../../components/StacksDiagram.astro';
+
+devsandbox combines tools you'd otherwise wire together yourself into a single interface:
+
+- **devcontainer**: images, Features and lifecycle commands, from the same standard VS Code uses.
+- **docker compose**: the services a stack needs, one set per instance or shared by all.
+- **git worktrees**: every repeat instance of a repo gets its own worktree and branch.
+- **Multiple machines**: sandboxes on your other hosts, over ssh, in the same CLI and dashboard.
+
+It runs on docker, podman or Apple container, with docker's verbs: `run`, `exec`, `ps`, `logs`, `rm`. One `run` gives you not a container but a whole sandbox, ready for an agent to work in.
+
+## Docker's verbs, local defaults
+
+A compose file and a `devcontainer.json` become one `devsandboxes.toml` per stack, with defaults made for your laptop: a git worktree per instance, shared services and caches, your ssh-agent, ports tunneled on demand. Hand it to your agent and it sets up the whole stack.
+
+<StacksDiagram />
+
+1. **Clone the repos.** Your agent clones what the task needs side by side on your machine, like `~/code/api` and `~/code/web`.
+2. **Describe the stack.** One `devsandboxes.toml` per stack: a sandbox per repo, the services they share, caches. Unknown keys are errors, so a typo fails fast.
+3. **Run, exec, report back.** `devsandbox run --json` returns the new instance and `exec` runs in it. From inside, `devsbd notify` reaches you when a human is needed.
+
+## What replaces what
+
+| With docker                                   | With devsandbox                                                                                               |
+| --------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `docker-compose.yml` services                 | `[services.*]`: one per instance on its own network, or `scope = "global"` for one shared by every sandbox |
+| `devcontainer.json` image, features, commands | `[sandbox.*]`: the same image, Features and lifecycle commands, in TOML                                        |
+| `docker compose up` a second time             | `devsandbox run web` again: a new instance, with its own containers and its own worktree and branch           |
+| `-p 3000:3000`, decided up front              | `devsandbox port web 3000`, opened on demand, nothing restarts                                                |
+| Keys mounted or copied into the container     | Your ssh-agent relayed: the container can sign, the keys stay on your host                                     |
+| Cache volumes you wire per project            | `caches = ["pnpm", "cargo"]`: one store shared by every sandbox                                               |
+| `docker ps` across everything                 | `devsandbox ps`, or the dashboard: every instance, service, port and notification                             |
+
+It builds on the devcontainer standard rather than replacing it: images, [Features](/examples/features) and lifecycle commands work as they do in VS Code, so the community's existing setups carry over.
+
+## Other machines, over ssh
+
+`devsandbox machine add me@my-server` registers a host you reach over ssh; its sandboxes then show next to yours and the CLI finds their names. Your keys don't need to be there: with the machine's `agent` on, your ssh-agent is relayed to it while you use it. See [Other machines](/docs/host-daemon#other-machines).
+
+## Next steps
+
+<div class="resource-grid">
+  <ResourceLink href="/examples/port-a-devcontainer" label="Port a devcontainer.json" description="Turn an existing devcontainer.json into a devsandbox config" />
+  <ResourceLink href="https://github.com/Nemikolh/devsandboxes/blob/main/skills/devsandbox-cli/SKILL.md" label="The devsandbox-cli skill" description="What your agent reads to drive the CLI" />
+  <ResourceLink href="/docs/node-api" label="Node API" description="Script it from TypeScript" />
+</div>
