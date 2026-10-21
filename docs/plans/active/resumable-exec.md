@@ -1,8 +1,11 @@
 # Resumable exec: interactive sessions that outlive their connection
 
-Status: in progress
-Nothing built yet: no `devsbd session`, `devsandbox exec` has no
-`--attach` / `--session`.
+Status: planned (step 4)
+Steps 1-3 shipped: helper sessions (`devsbd/src/sessions.rs`), `exec`
+through them with `--attach` / `--sessions` / `--session`
+(`src/commands/exec.rs`), reconnect over ssh and in remote dashboard tabs
+(`serve::machines::cli` `Reconnect`, `tui::app::terminal`); the living
+docs describe them. Left: step 4, cleanup.
 
 ## Problem
 

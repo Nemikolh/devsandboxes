@@ -12,11 +12,14 @@ limitation means editing this file in the same commit.
 
 ## In progress
 
-- **helper**: resumable interactive `exec` (helper-held pty sessions,
-  `--attach`, reconnect over ssh).
-  → [plan](plans/active/resumable-exec.md)
+(none)
 
 ## Planned
+
+- **helper**: cleanup of `exec` sessions: prune ended/`lost` session
+  dirs, show detached sessions in the dashboard, a policy for sessions
+  nobody reattaches to (`devsbd/src/sessions.rs`).
+  → [plan](plans/active/resumable-exec.md)
 
 - **helper**: host → in-container daemon requests (an `RPC` channel),
   daemon-owned runs with a restart policy, worktree stand-ins.
