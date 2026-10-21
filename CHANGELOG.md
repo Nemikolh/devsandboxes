@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.8.0
 
 Machines: sandboxes on your other hosts, over ssh, in the same CLI and dashboard, with your ssh-agent relayed only where you allow it. No more half-built sandboxes: an instance is recorded from the moment `run` starts, a failure leaves it listed as `failed` with its error, and Ctrl-C undoes the whole run. Every `run`, `rebuild` and `start` keeps a build log, and the dashboard runs them in the background instead of handing them the screen. `run`, `rebuild`, `start`, `stop`, `rm` and `service rebuild` now run in the host daemon, so a build outlives the terminal that started it, and `-d` leaves it running. The dashboard gets everything it shows from the daemon too.
 
