@@ -9,8 +9,9 @@ Code: `src/tui/term.rs` (`TermSession`, `TermTabs`, `TermParser`,
 `spawn_reader`, `process_output`, `encode_key`, `encode_mouse`,
 `encode_wheel`), `src/tui/kitty.rs` (`KittyState`, `encode_key`,
 `DISAMBIGUATE`), `src/tui/app/terminal.rs` (`ExecCli`, `on_key_terminal`,
-`terminal_mouse`, `open_terminal`, `term_argv`, `exec_argv`),
-`src/tui/remote.rs` (`exec_argv`, `service_argv`), `src/tui/ui.rs`
+`terminal_mouse`, `open_terminal`, `term_argv`, `exec_argv`, `Redial`,
+`redial_terminals`), `src/tui/remote.rs` (`exec_argv`,
+`session_exec_argv`, `attach_argv`, `service_argv`), `src/tui/ui.rs`
 (`open_bottom_split`, `terminal_panel_rect`, `term_pane_size`,
 `terminal_tab_hit`), `src/tui/mod.rs` (`setup`/`enter`/`restore`,
 `TERM_POLL_INTERVAL`), `src/commands/exec.rs` (`SHELL_FALLBACK_CMD`).
@@ -55,8 +56,29 @@ arrives on reader threads and only shows on the next draw.
   snapshot's `runtime_name`. The one place the dashboard runs the runtime
   itself.
 - A machine's row (`box/…` key): the same over `ssh -t` on that machine
-  (`remote::exec_argv` against the instance's root there,
+  (`remote::session_exec_argv` against the instance's root there,
   `remote::service_argv`), see [../daemon/machines.md](../daemon/machines.md).
+  An instance's adds `--reserve-255 --session=<id>`, the id minted by
+  the tab (`exec::mint_session_id`), so it can reconnect (below).
+
+## Remote tabs reconnect
+
+A remote instance tab carries a `Redial` (`TermSession::redial`; local
+and service tabs have none and just end). The event loop calls
+`App::redial_terminals` each pass: once the tab's ssh has ended
+(`TermSession::exit_code`, the PTY's EOF then a reaped child), `Redial`
+applies the CLI's rule (`serve::machines::cli::Reconnect`: a 255 after a
+dial that ran 5 s is a lost connection, `--reserve-255` keeping a
+program's own 255 out of it; any other code ends). A lost tab waits out
+the backoff (1, 2, 4, 8, then 10 s), labelled `(reconnecting…)` in the
+tab strip (`(reconnecting… N)` from its second try), then `TermSession::respawn` runs
+`remote::attach_argv` (`exec --reserve-255 --attach=<id>`) on a fresh PTY
+feeding the same parser: same tab, title, screen and scrollback; the
+program redraws over them. While it waits the tab is still `find`'s live
+tab for its container, swallows keys, and `x` closes it, which ends the
+loop. A tab whose session is gone, whose first dial never connected, or
+whose re-dial can't spawn (the reason written into its screen) shows
+`(exited)`.
 
 `:exec <instance> <cmd…>` is different: it suspends the dashboard and runs
 the same `devsandbox exec` with inherited stdio

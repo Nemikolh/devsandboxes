@@ -41,7 +41,7 @@ pub use forms::{form_lines, form_title, forms_offset, pinned_forms, FormSpot};
 pub use actions::{PendingDone, VerbEnd, not_yet_code};
 pub use procs::{PendingSignal, Signal};
 pub use selection::{copy_key_intercepted, Extract};
-pub use terminal::ExecCli;
+pub use terminal::{ExecCli, Redial};
 pub use view::{
     BuildLogModal, ConfigKind, ConfigView, ConfirmModal, Fetch, HelpModal, Modal, Pane, Side, TextModal, BUILD_LOG_LINES,
     LOG_LINES,

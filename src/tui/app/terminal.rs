@@ -3,6 +3,7 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
+use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
@@ -14,6 +15,7 @@ use crate::tui::kitty;
 use crate::tui::remote::{self, instance_key, qualify, service_key};
 use crate::commands::exec::SHELL_FALLBACK_CMD;
 use crate::tui::select;
+use crate::serve::machines::cli::{Next, Reconnect};
 use crate::tui::term::{encode_key, encode_mouse, encode_wheel, TermSession};
 
 use super::view::{point_in, Modal};
@@ -63,7 +65,107 @@ impl ExecCli {
     }
 }
 
+/// A remote instance tab's reconnect (docs/architecture/dashboard/terminal.md,
+/// *Remote tabs reconnect*): the tab's first dial runs its shell in helper
+/// session `id` (`remote::session_exec_argv`); each time its ssh exits,
+/// [`Reconnect`] (the CLI's rule) says whether to re-dial `attach`
+/// (`remote::attach_argv`) into the same tab after a backoff, or end. Pure
+/// over the exit codes and the `Instant`s it's given.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Redial {
+    attach: Vec<String>,
+    state: Reconnect,
+    /// When the current dial started (its run time decides a 255).
+    dialed: Instant,
+    phase: Phase,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Phase {
+    /// A dial is running (or just ended, its code not read yet).
+    Live,
+    /// Lost: re-dial at `until`.
+    Waiting { until: Instant, attempt: u32 },
+    /// No more dials: the tab is `(exited)`.
+    Ended,
+}
+
+impl Redial {
+    /// A tab whose first dial started at `now`, re-dialing with `attach`.
+    pub fn new(attach: Vec<String>, now: Instant) -> Self {
+        Self { attach, state: Reconnect::default(), dialed: now, phase: Phase::Live }
+    }
+
+    /// Whether the current dial's exit code is wanted ([`Self::step`]).
+    pub fn live(&self) -> bool {
+        self.phase == Phase::Live
+    }
+
+    pub fn ended(&self) -> bool {
+        self.phase == Phase::Ended
+    }
+
+    /// One look at the tab at `now`, `exit` the current dial's code once it
+    /// ended: the argv to re-dial now, if it's time (then [`Self::dialed`]
+    /// or [`Self::end`]).
+    pub fn step(&mut self, exit: Option<i32>, now: Instant) -> Option<&[String]> {
+        match self.phase {
+            Phase::Live => {
+                let code = exit?;
+                self.phase = match self.state.after(code, now.saturating_duration_since(self.dialed)) {
+                    Next::Retry { wait, attempt } => Phase::Waiting { until: now + wait, attempt },
+                    Next::Done { .. } => Phase::Ended,
+                };
+                None
+            }
+            Phase::Waiting { until, .. } if now >= until => Some(&self.attach),
+            Phase::Waiting { .. } | Phase::Ended => None,
+        }
+    }
+
+    /// The re-dial [`Self::step`] asked for started at `now`.
+    pub fn dialed(&mut self, now: Instant) {
+        self.dialed = now;
+        self.phase = Phase::Live;
+    }
+
+    /// No more dials (a re-dial that couldn't spawn).
+    pub fn end(&mut self) {
+        self.phase = Phase::Ended;
+    }
+
+    /// The re-dial a waiting tab is on (from 1), for its label.
+    pub fn attempt(&self) -> Option<u32> {
+        match self.phase {
+            Phase::Waiting { attempt, .. } => Some(attempt),
+            _ => None,
+        }
+    }
+}
+
 impl App {
+    /// Step every remote instance tab's [`Redial`] at `now` (the event loop,
+    /// each pass): read an ended dial's exit code, and respawn the attach
+    /// into the tab when its wait is over. A respawn that fails ends the tab,
+    /// the reason written into its screen. Like [`Self::open_terminal`]'s
+    /// spawn, the PTY work is `TermSession`'s.
+    pub fn redial_terminals(&mut self, now: Instant) {
+        for session in self.terms.sessions_mut() {
+            let Some(mut redial) = session.redial.take() else { continue };
+            let exit = if redial.live() { session.exit_code() } else { None };
+            if let Some(argv) = redial.step(exit, now).map(<[String]>::to_vec) {
+                match session.respawn(argv) {
+                    Ok(()) => redial.dialed(now),
+                    Err(e) => {
+                        redial.end();
+                        session.note(&format!("terminal: {e:#}"));
+                    }
+                }
+            }
+            session.redial = Some(redial);
+        }
+    }
+
     /// The OSC 52 copy (tab title, base64) the event loop should relay from
     /// the integrated terminals to the outer clipboard: the last of this
     /// frame's (it would overwrite the others there anyway), and only with
@@ -428,7 +530,8 @@ impl App {
             }
         }
 
-        let argv = match self.term_argv(&title, &container, is_instance) {
+        let id = crate::commands::exec::mint_session_id(crate::state::Instance::now());
+        let (argv, attach) = match self.term_argv(&title, &container, is_instance, &id) {
             Ok(argv) => argv,
             Err(msg) => {
                 self.status = Some(msg);
@@ -445,7 +548,8 @@ impl App {
             .map(|s| s.size())
             .unwrap_or((24, 80));
         match TermSession::spawn(title, container, argv, rows, cols, self.kitty) {
-            Ok(session) => {
+            Ok(mut session) => {
+                session.redial = attach.map(|attach| Redial::new(attach, Instant::now()));
                 self.terms.open(session);
                 self.focus = Focus::Terminal;
                 self.status = None;
@@ -463,18 +567,34 @@ impl App {
     ///
     /// On a machine (a `box/…` key) either goes over ssh: the machine's
     /// `devsandbox -C <its root> exec`, or its runtime's `exec`
-    /// (docs/architecture/daemon/machines.md, *Dashboard*).
-    fn term_argv(&self, title: &str, container: &str, is_instance: bool) -> Result<Vec<String>, String> {
+    /// (docs/architecture/daemon/machines.md, *Dashboard*). A remote
+    /// instance's shell runs in helper session `id`, and the second value is
+    /// the attach its tab re-dials after a lost connection ([`Redial`]);
+    /// `None` for every other tab.
+    fn term_argv(
+        &self,
+        title: &str,
+        container: &str,
+        is_instance: bool,
+        id: &str,
+    ) -> Result<(Vec<String>, Option<Vec<String>>), String> {
+        let terminal = |e: String| format!("terminal: {e}");
         if is_instance {
-            return self.exec_argv(title, &[]).map_err(|e| format!("terminal: {e}"));
+            if let (Some(machine), name) = remote::split(title) {
+                let (m, root) = self.remote_instance(title, machine).map_err(terminal)?;
+                let first = remote::session_exec_argv(m, &root, name, id).map_err(terminal)?;
+                let attach = remote::attach_argv(m, &root, name, id).map_err(terminal)?;
+                return Ok((first, Some(attach)));
+            }
+            return self.exec_argv(title, &[]).map(|argv| (argv, None)).map_err(terminal);
         }
         if let (Some(machine), container) = remote::split(container) {
-            return remote::service_argv(self.machine_entry(machine)?, container).map_err(|e| format!("terminal: {e}"));
+            return remote::service_argv(self.machine_entry(machine)?, container).map(|argv| (argv, None)).map_err(terminal);
         }
         let snapshot = self.snapshot.as_ref().ok_or_else(|| "terminal: no data yet".to_string())?;
         let mut argv = vec![snapshot.runtime_name.clone(), "exec".into(), "-i".into(), "-t".into(), container.into()];
         argv.extend(SHELL_FALLBACK_CMD.iter().map(|s| s.to_string()));
-        Ok(argv)
+        Ok((argv, None))
     }
 
     /// The `devsandbox exec` of instance `key` (a terminal tab, `:exec`):
@@ -485,10 +605,16 @@ impl App {
         let Some(machine) = machine else {
             return self.exec_cli.as_ref().map_err(String::clone)?.argv(name, command);
         };
+        let (entry, root) = self.remote_instance(key, machine)?;
+        remote::exec_argv(entry, &root, name, command)
+    }
+
+    /// Remote instance `key`'s machine entry and its root there.
+    fn remote_instance(&self, key: &str, machine: &str) -> Result<(&crate::serve::snapshots::SnapshotMachine, String), String> {
         let entry = self.machine_entry(machine)?;
         let snapshot = self.snapshot.as_ref().ok_or_else(|| "no data yet".to_string())?;
         let root = remote::instance_route(snapshot, key).root.ok_or_else(|| format!("`{key}`: no root known on `{machine}`"))?;
-        remote::exec_argv(entry, &root, name, command)
+        Ok((entry, root))
     }
 
     /// Machine `name`'s snapshot entry (for its ssh argv).
@@ -1042,12 +1168,18 @@ mod tests {
         app.selected[Tab::Instances.index()] = 5; // box/inst1
         let target = app.term_target();
         assert_eq!(target, Ok(("box/inst1".into(), "box/devsandbox-inst1".into(), true)));
-        let argv = app.term_argv("box/inst1", "box/devsandbox-inst1", true).unwrap();
+        let (argv, attach) = app.term_argv("box/inst1", "box/devsandbox-inst1", true, ID).unwrap();
         assert_eq!(argv[..4], ["ssh", "-t", "--", "me@box"]);
         assert!(argv[4].contains(r"'\''-C'\'' '\''/r/one'\'' '\''exec'\''"), "{}", argv[4]);
         assert!(argv[4].ends_with(r"'\''--'\'' '\''inst1'\'''"), "{}", argv[4]);
-        // A local instance of the same name: this host's devsandbox.
-        assert_eq!(app.term_argv("inst1", "devsandbox-inst1", true).unwrap()[..4], ["/opt/bin/devsandbox", "-C", "/home/u/cfg", "exec"]);
+        // In session ID, which the tab re-dials an attach to.
+        let machine = remote::machine(&app.machines, "box").unwrap();
+        assert_eq!(argv, remote::session_exec_argv(machine, "/r/one", "inst1", ID).unwrap());
+        assert_eq!(attach, Some(remote::attach_argv(machine, "/r/one", "inst1", ID).unwrap()));
+        // A local instance of the same name: this host's devsandbox, no re-dial.
+        let (argv, attach) = app.term_argv("inst1", "devsandbox-inst1", true, ID).unwrap();
+        assert_eq!(argv[..4], ["/opt/bin/devsandbox", "-C", "/home/u/cfg", "exec"]);
+        assert_eq!(attach, None);
         // `:exec` too.
         let exec = app.exec_argv("box/inst1", &["uname".into()]).unwrap();
         assert!(exec[4].ends_with(r"'\''inst1'\'' '\''uname'\'''"), "{}", exec[4]);
@@ -1062,9 +1194,102 @@ mod tests {
         let db = app.snapshot.as_ref().unwrap().services.iter().position(|s| s.name == "db").unwrap();
         app.selected[Tab::Services.index()] = db;
         assert_eq!(app.term_target(), Ok(("box/svc-db".into(), "box/devsandbox-svc-db".into(), false)));
-        let argv = app.term_argv("box/svc-db", "box/devsandbox-svc-db", false).unwrap();
+        let (argv, attach) = app.term_argv("box/svc-db", "box/devsandbox-svc-db", false, ID).unwrap();
+        assert_eq!(attach, None, "a service tab doesn't re-dial");
         assert_eq!(argv[..4], ["ssh", "-t", "--", "me@box"]);
         assert!(argv[4].starts_with(r#"exec "$SHELL" -lc 'exec docker '\''exec'\'' '\''-i'\'' '\''-t'\'' '\''devsandbox-svc-db'\''"#), "{}", argv[4]);
+    }
+
+    const ID: &str = "1790000000-a1b2";
+
+    fn attach() -> Vec<String> {
+        vec!["ssh".into(), "attach".into()]
+    }
+
+    /// A tab's dials: lost (255 after a connected run) waits out the
+    /// backoff, then re-dials the attach; the session's own code ends it.
+    #[test]
+    fn redial_waits_then_re_dials_until_the_session_answers() {
+        use std::time::Duration;
+        let t0 = Instant::now();
+        let s = Duration::from_secs;
+        let mut r = Redial::new(attach(), t0);
+        assert_eq!(r.step(None, t0 + s(60)), None, "running");
+        assert!(r.live() && !r.ended());
+        // Lost after a minute: re-dial in 1 s.
+        assert_eq!(r.step(Some(255), t0 + s(60)), None);
+        assert_eq!(r.attempt(), Some(1));
+        assert_eq!(r.step(None, t0 + s(60) + Duration::from_millis(500)), None, "still waiting");
+        assert_eq!(r.step(None, t0 + s(61)), Some(&attach()[..]));
+        r.dialed(t0 + s(61));
+        assert!(r.live() && r.attempt().is_none());
+        // The re-dial fails at once: the next wait is longer.
+        assert_eq!(r.step(Some(255), t0 + s(62)), None);
+        assert_eq!(r.attempt(), Some(2));
+        assert_eq!(r.step(None, t0 + s(63)), None);
+        assert_eq!(r.step(None, t0 + s(64)), Some(&attach()[..]));
+        r.dialed(t0 + s(64));
+        // The program exits: the tab ends.
+        assert_eq!(r.step(Some(0), t0 + s(90)), None);
+        assert!(r.ended());
+        assert_eq!(r.step(Some(255), t0 + s(200)), None, "ended stays ended");
+
+        // A first dial refused at once (ssh couldn't connect): no re-dial.
+        let mut r = Redial::new(attach(), t0);
+        assert_eq!(r.step(Some(255), t0 + Duration::from_millis(300)), None);
+        assert!(r.ended());
+        // A session gone: ends too.
+        let mut r = Redial::new(attach(), t0);
+        r.step(Some(255), t0 + s(60));
+        r.step(None, t0 + s(61));
+        r.dialed(t0 + s(61));
+        r.step(Some(250), t0 + s(62));
+        assert!(r.ended());
+    }
+
+    /// In the app: a remote tab whose ssh dropped shows as reconnecting
+    /// (still the dedup target, keys swallowed), until its wait is over;
+    /// `x` closes it, which stops the loop. A tab without a `Redial` just
+    /// exits.
+    #[test]
+    fn a_dropped_remote_tab_reconnects_in_place() {
+        use std::time::Duration;
+        let mut app = new_app();
+        let t0 = Instant::now();
+        let mut remote = TermSession::test_session("box/web", "box/devsandbox-web", 24, 80);
+        remote.redial = Some(Redial::new(attach(), t0));
+        app.terms.open(remote);
+        app.terms.open(TermSession::test_session("web", "devsandbox-web", 24, 80));
+        app.redial_terminals(t0 + Duration::from_secs(30));
+        assert!(!app.terms.sessions()[0].reconnecting(), "running");
+
+        app.terms.sessions_mut()[0].set_exited_with(255);
+        app.terms.sessions_mut()[1].set_exited_with(255);
+        app.redial_terminals(t0 + Duration::from_secs(30));
+        let tabs = app.terms.sessions();
+        assert!(tabs[0].reconnecting() && tabs[0].redial.as_ref().unwrap().attempt() == Some(1));
+        assert!(!tabs[1].reconnecting(), "a local tab just exits");
+        assert_eq!(app.terms.find("box/devsandbox-web"), Some(0), "`t` focuses the reconnecting tab");
+        assert_eq!(app.terms.find("devsandbox-web"), None);
+        assert_eq!(crate::tui::ui::terminal_tab_labels(&app), ["1:box/web (reconnecting…)", "2:web (exited)"]);
+        // A second try of the same outage counts in the label.
+        let mut second = Redial::new(attach(), t0);
+        second.step(Some(255), t0 + Duration::from_secs(30));
+        assert!(second.step(None, t0 + Duration::from_secs(31)).is_some());
+        second.dialed(t0 + Duration::from_secs(31));
+        second.step(Some(255), t0 + Duration::from_secs(32));
+        let saved = app.terms.sessions_mut()[0].redial.replace(second);
+        assert_eq!(crate::tui::ui::terminal_tab_labels(&app)[0], "1:box/web (reconnecting… 2)");
+        app.terms.sessions_mut()[0].redial = saved;
+
+        // Keys are swallowed while it waits; `x` closes it.
+        app.terms.set_active(0);
+        app.focus = Focus::Terminal;
+        app.on_key(key(KeyCode::Char('a')));
+        assert!(app.terms.sessions()[0].take_written().is_empty());
+        app.on_key(key(KeyCode::Char('x')));
+        assert_eq!(app.terms.sessions().len(), 1);
+        assert_eq!(app.terms.sessions()[0].title, "web");
     }
 
     fn cli() -> ExecCli {
@@ -1085,11 +1310,11 @@ mod tests {
         app.set_snapshot(snapshot_with_status(1, running()));
         // No executable yet: the tab doesn't open, the status says why.
         assert_eq!(
-            app.term_argv("inst0", "devsandbox-inst0", true),
+            app.term_argv("inst0", "devsandbox-inst0", true, ID),
             Err("terminal: the devsandbox executable isn't known yet".into())
         );
         app.exec_cli = Ok(cli());
-        assert_eq!(app.term_argv("inst0", "devsandbox-inst0", true), cli().argv("inst0", &[]));
+        assert_eq!(app.term_argv("inst0", "devsandbox-inst0", true, ID), Ok((cli().argv("inst0", &[]).unwrap(), None)));
     }
 
     #[test]
@@ -1098,7 +1323,8 @@ mod tests {
         let mut snap = service_snapshot(vec![("devsandbox-svc-api-2".into(), running())]);
         snap.runtime_name = "podman".into();
         app.set_snapshot(snap);
-        let argv = app.term_argv("svc-api-2", "devsandbox-svc-api-2", false).unwrap();
+        let (argv, attach) = app.term_argv("svc-api-2", "devsandbox-svc-api-2", false, ID).unwrap();
+        assert_eq!(attach, None);
         assert_eq!(argv[..5], ["podman", "exec", "-i", "-t", "devsandbox-svc-api-2"]);
         assert_eq!(argv[5..], SHELL_FALLBACK_CMD);
         // The exec CLI isn't needed for a service.

@@ -268,6 +268,11 @@ enum Command {
         /// without the helper, a plain exec
         #[arg(long, value_name = "ID")]
         session: Option<String>,
+        /// Report a command's exit code 255 as 254, so 255 only ever means
+        /// ssh's own failure: what the reconnect loops over ssh pass
+        /// (`commands::exec::reported_code`)
+        #[arg(long, hide = true)]
+        reserve_255: bool,
         #[arg(help = NAME_HELP)]
         name: String,
         /// Command and arguments to run; omitted: a login shell (zsh, bash,
@@ -719,14 +724,14 @@ fn main() -> Result<()> {
         Command::Undone { name } => commands::done::done(&name, false),
         Command::Stats { json } => commands::stats::stats(json),
         Command::Status { json: _ } => commands::status::status(&cli.dir),
-        Command::Exec { interactive, tty, attach, sessions, session, name, command } => {
+        Command::Exec { interactive, tty, attach, sessions, session, reserve_255, name, command } => {
             use commands::exec::Exec;
             let what = match (&attach, sessions) {
                 (Some(id), _) => Exec::Attach(id.as_deref()),
                 (None, true) => Exec::Sessions,
                 (None, false) => Exec::Run { interactive, tty, command: &command, session: session.as_deref() },
             };
-            commands::exec::exec(&name, what)
+            commands::exec::exec(&name, what, reserve_255)
         }
         Command::Port { name, service, address, ports } => {
             #[cfg(unix)]

@@ -14,11 +14,16 @@
 //! `agent` on, ssh is spawned and waited for instead of `exec`ed: this
 //! process keeps a daemon connection holding the machine (`machines.hold`),
 //! so its agent relay is up while ssh runs, and ssh has no `-A`.
+//!
+//! A tty `exec` on a machine is spawned too, in a loop: it runs in a helper
+//! session this process names ([`reconnect_session`]), and a lost connection
+//! (ssh's 255) re-dials an attach to it ([`Reconnect`], [`session_dials`]).
 
 use std::ffi::OsString;
 use std::io::IsTerminal;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
@@ -353,9 +358,10 @@ pub(crate) fn remote_args(command: &Command, name: &str, root: Option<&Path>) ->
         Command::Done { .. } => out.extend([s("done"), s("--"), s(name)]),
         Command::Undone { .. } => out.extend([s("undone"), s("--"), s(name)]),
         Command::Rename { new_name, .. } => out.extend([s("rename"), s("--"), s(name), new_name.clone()]),
-        Command::Exec { interactive, tty, attach, sessions, session, command, .. } => {
+        Command::Exec { interactive, tty, attach, sessions, session, reserve_255, command, .. } => {
             out.push(s("exec"));
-            out.extend([flag(*interactive, "-i"), flag(*tty, "-t"), flag(*sessions, "--sessions")].into_iter().flatten());
+            let flags = [flag(*interactive, "-i"), flag(*tty, "-t"), flag(*sessions, "--sessions"), flag(*reserve_255, "--reserve-255")];
+            out.extend(flags.into_iter().flatten());
             out.extend(session.as_ref().map(|id| format!("--session={id}")));
             // The name before `--`: after it, it would be the command.
             out.push(s(name));
@@ -373,6 +379,164 @@ pub(crate) fn remote_args(command: &Command, name: &str, root: Option<&Path>) ->
         _ => return None,
     }
     Some(out)
+}
+
+// ---- reconnecting a tty exec ------------------------------------------------
+
+/// ssh's exit code for its own failure (a lost or refused connection).
+pub(crate) const SSH_FAILED: i32 = 255;
+
+/// The helper's `NO_SESSION_EXIT` (`devsbd/src/sessions.rs`): an attach to
+/// a session that is unknown or `lost`.
+pub(crate) const NO_SESSION_EXIT: i32 = 250;
+
+/// How long a dial must have run to count as connected: a 255 sooner, on a
+/// first dial, is ssh failing to connect at all (bad host, auth), which no
+/// retry fixes; on a re-dial, one more failed attempt of the same outage.
+pub(crate) const CONNECTED_AFTER: Duration = Duration::from_secs(5);
+
+/// The longest wait between two re-dials.
+pub(crate) const BACKOFF_CAP: Duration = Duration::from_secs(10);
+
+/// What follows one dial's exit ([`Reconnect::after`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Next {
+    /// Re-dial with an attach after `wait`; `attempt` counts this outage's
+    /// re-dials from 1.
+    Retry { wait: Duration, attempt: u32 },
+    /// The loop ends with `code`; `gone`: the session isn't there to attach
+    /// to ([`NO_SESSION_EXIT`]).
+    Done { code: i32, gone: bool },
+}
+
+/// The reconnect decision of a session exec over ssh, shared by the CLI loop
+/// ([`route`]) and the dashboard's remote tabs (`tui::app::terminal::Redial`):
+/// pure over each dial's exit code and run time. A 255 is ssh's alone (the
+/// remote `exec --reserve-255` reports a program's 255 as 254), so it means
+/// the connection went: re-dial, with backoff, for as long as it takes. Any
+/// other code is the session's answer and ends the loop.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct Reconnect {
+    /// Some dial ran [`CONNECTED_AFTER`]: a later 255 is an outage.
+    connected: bool,
+    /// Re-dials since the last connected dial.
+    attempt: u32,
+}
+
+impl Reconnect {
+    /// After a dial exited with `code` having run `ran`.
+    pub(crate) fn after(&mut self, code: i32, ran: Duration) -> Next {
+        if code != SSH_FAILED {
+            return Next::Done { code, gone: code == NO_SESSION_EXIT };
+        }
+        if ran >= CONNECTED_AFTER {
+            self.connected = true;
+            self.attempt = 0;
+        }
+        if !self.connected {
+            // Never got through: ssh's own error (on stderr) is the answer.
+            return Next::Done { code, gone: false };
+        }
+        self.attempt += 1;
+        Next::Retry { wait: backoff(self.attempt), attempt: self.attempt }
+    }
+}
+
+/// The wait before re-dial `attempt` (from 1): 1, 2, 4, 8 s, then
+/// [`BACKOFF_CAP`].
+pub(crate) fn backoff(attempt: u32) -> Duration {
+    let secs = 1u64 << attempt.saturating_sub(1).min(8);
+    Duration::from_secs(secs).min(BACKOFF_CAP)
+}
+
+/// The CLI's line on stderr before re-dial `attempt`: the outage once, then
+/// a counter.
+pub(crate) fn retry_note(attempt: u32) -> String {
+    match attempt {
+        1 => "connection lost, reconnecting… (Ctrl-C to stop)".to_string(),
+        n => format!("reconnecting… (attempt {n})"),
+    }
+}
+
+/// The line after a loop that ended on [`Next::Done`] with `gone`.
+pub(crate) fn gone_note(id: &str) -> String {
+    format!("session `{id}` is gone (unknown or lost there, as after a container restart): nothing to reattach to")
+}
+
+/// The session id a machine `exec` reconnects with: `None` when it gets no
+/// tty (a piped exec, nothing to re-attach to) or is an `--attach` /
+/// `--sessions` already. The tty rule is the remote `exec`'s
+/// (`commands::exec::shell_flags`), `terminal` standing for the remote
+/// stdin: ssh gives it a tty ([`ssh::cli_argv`]) exactly when this process is
+/// on a terminal. A `--session` given is kept, else one is minted here.
+pub(crate) fn reconnect_session(command: &Command, terminal: bool, mint: impl FnOnce() -> String) -> Result<Option<String>> {
+    let Command::Exec { interactive, tty, attach: None, sessions: false, session, command, .. } = command else {
+        return Ok(None);
+    };
+    let tty = if command.is_empty() { crate::commands::exec::shell_flags(*interactive, *tty, terminal).1 } else { *tty };
+    if !tty {
+        return Ok(None);
+    }
+    Ok(Some(match session {
+        Some(id) => crate::commands::exec::checked_session_id(id)?.to_string(),
+        None => mint(),
+    }))
+}
+
+/// The two remote commands of a session exec (`command`, an `Exec`) in
+/// session `id`: the first dial, `exec --session=<id>` as typed
+/// (create-or-attach), and every re-dial, `exec --attach=<id>` (attach only:
+/// a reconnect never starts a second program). Both `--reserve-255`.
+pub(crate) fn session_dials(command: &Command, id: &str) -> Option<(Command, Command)> {
+    let Command::Exec { interactive, tty, name, command, .. } = command else { return None };
+    let first = Command::Exec {
+        interactive: *interactive,
+        tty: *tty,
+        attach: None,
+        sessions: false,
+        session: Some(id.to_string()),
+        reserve_255: true,
+        name: name.clone(),
+        command: command.clone(),
+    };
+    let again = Command::Exec {
+        interactive: false,
+        tty: false,
+        attach: Some(Some(id.to_string())),
+        sessions: false,
+        session: None,
+        reserve_255: true,
+        name: name.clone(),
+        command: Vec::new(),
+    };
+    Some((first, again))
+}
+
+/// Run `first` (ssh), then `again` after each lost connection, per
+/// [`Reconnect`], with `held` kept to the end. Each dial is spawned
+/// ([`spawn_ssh_owning_signals`]): this process outlives ssh. Between dials
+/// SIGINT is ours again, so Ctrl-C during a wait ends it.
+fn reconnect_loop(first: &[OsString], again: &[OsString], id: &str, held: Option<Conn>) -> Result<Routed> {
+    let mut state = Reconnect::default();
+    let mut argv = first;
+    loop {
+        let started = Instant::now();
+        let code = spawn_ssh_owning_signals(argv)?;
+        match state.after(code, started.elapsed()) {
+            Next::Retry { wait, attempt } => {
+                eprintln!("{}", retry_note(attempt));
+                std::thread::sleep(wait);
+                argv = again;
+            }
+            Next::Done { code, gone } => {
+                if gone {
+                    eprintln!("{}", gone_note(id));
+                }
+                drop(held);
+                return Ok(Routed::Exit(code));
+            }
+        }
+    }
 }
 
 /// `--machine m` on a root-bound command: one run per registered root,
@@ -483,7 +647,8 @@ fn run_ssh(argv: &[OsString], held: Option<Conn>) -> Result<Routed> {
 
 /// Where `command` runs (module doc): here (maybe with its name resolved),
 /// or on a machine over ssh, which replaces this process (or, `agent` on,
-/// runs as its child: [`hold`]). `machine` is
+/// runs as its child: [`hold`]; a tty `exec` always does, re-dialed after a
+/// lost connection: [`reconnect_loop`]). `machine` is
 /// `--machine`, `machines` the registered names ([`super::registered_names`]).
 pub(crate) fn route(machine: Option<&str>, in_process: bool, machines: &[String], command: Command) -> Result<Routed> {
     match plan(&command, machine, in_process, machines)? {
@@ -579,8 +744,15 @@ fn resolve_and_route(command: Command, wherever: Where, name: String) -> Result<
         return routed_port(command, entry, root, Some(chosen.name));
     }
     let root = chosen.root.as_deref().or(entry.roots.first().map(PathBuf::as_path));
+    let terminal = on_terminal();
+    if let Some(id) = reconnect_session(&command, terminal, || crate::commands::exec::mint_session_id(crate::state::Instance::now()))? {
+        let (first, again) = session_dials(&command, &id).context("not an exec")?;
+        let first = ssh::cli_argv(&entry, terminal, &remote_args(&first, &chosen.name, root).context("not an exec")?)?;
+        let again = ssh::cli_argv(&entry, terminal, &remote_args(&again, &chosen.name, root).context("not an exec")?)?;
+        return reconnect_loop(&first, &again, &id, hold(conn, &entry));
+    }
     let args = remote_args(&command, &chosen.name, root).context("this command doesn't run on a machine")?;
-    let argv = ssh::cli_argv(&entry, on_terminal(), &args)?;
+    let argv = ssh::cli_argv(&entry, terminal, &args)?;
     run_ssh(&argv, hold(conn, &entry))
 }
 
@@ -860,6 +1032,76 @@ mod tests {
         assert!(matches!(back, Command::Exec { attach: Some(None), ref name, .. } if name == "web"));
         assert_eq!(remote_args(&command(&["stop", "web"]), "web", None), None);
         assert_eq!(remote_args(&command(&["vscode", "web"]), "web", None), None);
+    }
+
+    const ID: &str = "1790000000-a1b2";
+
+    /// 255 after a connected dial retries with backoff until another code
+    /// comes; a dial that never connected ends on ssh's own 255.
+    #[test]
+    fn reconnect_retries_lost_connections_only() {
+        let long = CONNECTED_AFTER;
+        let short = Duration::from_millis(200);
+        // A first dial refused at once: no loop (bad host, auth).
+        assert_eq!(Reconnect::default().after(255, short), Next::Done { code: 255, gone: false });
+        // The program's code, whatever ran: done.
+        assert_eq!(Reconnect::default().after(0, short), Next::Done { code: 0, gone: false });
+        assert_eq!(Reconnect::default().after(254, long), Next::Done { code: 254, gone: false });
+        assert_eq!(Reconnect::default().after(1, long), Next::Done { code: 1, gone: false });
+
+        let mut r = Reconnect::default();
+        assert_eq!(r.after(255, long), Next::Retry { wait: Duration::from_secs(1), attempt: 1 });
+        // The re-dials of one outage fail fast: the counter and the wait grow.
+        let waits: Vec<Next> = (0..6).map(|_| r.after(255, short)).collect();
+        let secs = [2, 4, 8, 10, 10, 10];
+        for (i, (next, s)) in waits.into_iter().zip(secs).enumerate() {
+            assert_eq!(next, Next::Retry { wait: Duration::from_secs(s), attempt: i as u32 + 2 });
+        }
+        // Connected again, then lost: a new outage from attempt 1.
+        assert_eq!(r.after(255, long), Next::Retry { wait: Duration::from_secs(1), attempt: 1 });
+        // The session is gone, or the program ended: done.
+        assert_eq!(r.clone().after(NO_SESSION_EXIT, short), Next::Done { code: 250, gone: true });
+        assert_eq!(r.clone().after(1, short), Next::Done { code: 1, gone: false });
+        assert_eq!(backoff(1000), BACKOFF_CAP);
+        assert_eq!(retry_note(1), "connection lost, reconnecting… (Ctrl-C to stop)");
+        assert_eq!(retry_note(3), "reconnecting… (attempt 3)");
+    }
+
+    /// Only a machine exec with a tty reconnects, keeping a given id.
+    #[test]
+    fn tty_execs_get_a_session_to_reconnect_to() {
+        let mint = || ID.to_string();
+        let rs = |args: &[&str], terminal| reconnect_session(&command(args), terminal, mint).unwrap();
+        assert_eq!(rs(&["exec", "box/web"], true).as_deref(), Some(ID), "the shell on a terminal");
+        assert_eq!(rs(&["exec", "box/web"], false), None, "piped: no tty");
+        assert_eq!(rs(&["exec", "-i", "box/web"], true), None, "explicit flags as given");
+        assert_eq!(rs(&["exec", "-t", "box/web"], false).as_deref(), Some(ID));
+        assert_eq!(rs(&["exec", "box/web", "zidane"], true), None, "a command takes -t as given");
+        assert_eq!(rs(&["exec", "-it", "box/web", "zidane"], true).as_deref(), Some(ID));
+        assert_eq!(rs(&["exec", "--session", "1790000000-0000", "box/web"], true).as_deref(), Some("1790000000-0000"));
+        assert_eq!(rs(&["exec", "box/web", "--attach"], true), None);
+        assert_eq!(rs(&["exec", "box/web", "--sessions"], true), None);
+        assert_eq!(rs(&["logs", "box/web"], true), None);
+        assert!(reconnect_session(&command(&["exec", "--session", "nope", "box/web"]), true, mint).is_err());
+    }
+
+    /// The first dial creates (or attaches), every re-dial only attaches,
+    /// both with `--reserve-255`; each parses back on the machine.
+    #[test]
+    fn first_dial_and_re_dials() {
+        let root = Some(Path::new("/r"));
+        let (first, again) = session_dials(&command(&["exec", "-it", "box/web", "zidane", "-c"]), ID).unwrap();
+        let first = remote_args(&first, "web-2", root).unwrap();
+        let again = remote_args(&again, "web-2", root).unwrap();
+        assert_eq!(first, ms(&["-C", "/r", "exec", "-i", "-t", "--reserve-255", "--session=1790000000-a1b2", "web-2", "--", "zidane", "-c"]));
+        assert_eq!(again, ms(&["-C", "/r", "exec", "--reserve-255", "web-2", "--attach=1790000000-a1b2"]));
+        let parse = |args: &[String]| command(&args.iter().map(String::as_str).collect::<Vec<_>>());
+        assert!(matches!(parse(&first), Command::Exec { reserve_255: true, session: Some(ref s), ref command, .. } if s == ID && command == &ms(&["zidane", "-c"])));
+        assert!(matches!(parse(&again), Command::Exec { reserve_255: true, attach: Some(Some(ref a)), ref name, .. } if a == ID && name == "web-2"));
+        assert!(session_dials(&command(&["logs", "web"]), ID).is_none());
+        let entry = entry();
+        let argv = ssh::cli_argv(&entry, true, &again).unwrap();
+        assert_eq!(argv[..4], ["ssh", "-t", "--", "me@box"].map(OsString::from));
     }
 
     #[test]

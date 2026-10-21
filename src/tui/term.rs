@@ -19,6 +19,7 @@ use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
+use super::app::Redial;
 use super::kitty::KittyState;
 
 /// The session's parsed screen, with the kitty protocol state riding along as
@@ -62,6 +63,53 @@ pub struct TermSession {
     exited: Arc<AtomicBool>,
     /// Current `(rows, cols)`; `resize` is a no-op when unchanged.
     size: (u16, u16),
+    /// The child's exit code, once reaped ([`Self::exit_code`]).
+    exit_code: Option<i32>,
+    /// A remote instance tab's re-dial state (`None`: every other tab, which
+    /// just ends): the app steps it (`App::redial_terminals`) and
+    /// [`Self::respawn`]s the attach into this same tab.
+    pub redial: Option<Redial>,
+}
+
+/// A child on a fresh PTY: its master, the child, the PTY's read half and
+/// shared write half.
+type Spawned = (Box<dyn MasterPty + Send>, Box<dyn Child + Send + Sync>, Box<dyn Read + Send>, SharedWriter);
+
+/// Spawn `argv` on a fresh PTY sized `rows`×`cols`.
+fn spawn_on_pty(argv: Vec<String>, rows: u16, cols: u16) -> Result<Spawned> {
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .context("failed to open pty")?;
+
+    let mut cmd = CommandBuilder::from_argv(argv.into_iter().map(Into::into).collect());
+    // This TERM only reaches the host-side child (`devsandbox exec`, the
+    // runtime client): the runtime's `exec` doesn't forward the caller's
+    // environment, so the shell in the container gets the runtime's
+    // default (`xterm` on docker) or whatever the image / `remoteEnv` sets.
+    cmd.env("TERM", "xterm-256color");
+    let child = pair
+        .slave
+        .spawn_command(cmd)
+        .context("failed to spawn shell in pty")?;
+    // Drop the slave so only the child holds it; without this the PTY never
+    // reports EOF when the child exits and the reader thread hangs forever.
+    drop(pair.slave);
+
+    let reader = pair
+        .master
+        .try_clone_reader()
+        .context("failed to clone pty reader")?;
+    let writer: SharedWriter = Arc::new(Mutex::new(
+        pair.master
+            .take_writer()
+            .context("failed to take pty writer")?,
+    ));
+    Ok((pair.master, child, reader, writer))
 }
 
 impl TermSession {
@@ -78,39 +126,7 @@ impl TermSession {
         cols: u16,
         kitty: bool,
     ) -> Result<TermSession> {
-        let pair = native_pty_system()
-            .openpty(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .context("failed to open pty")?;
-
-        let mut cmd = CommandBuilder::from_argv(argv.into_iter().map(Into::into).collect());
-        // This TERM only reaches the host-side child (`devsandbox exec`, the
-        // runtime client): the runtime's `exec` doesn't forward the caller's
-        // environment, so the shell in the container gets the runtime's
-        // default (`xterm` on docker) or whatever the image / `remoteEnv` sets.
-        cmd.env("TERM", "xterm-256color");
-        let child = pair
-            .slave
-            .spawn_command(cmd)
-            .context("failed to spawn shell in pty")?;
-        // Drop the slave so only the child holds it; without this the PTY never
-        // reports EOF when the child exits and the reader thread hangs forever.
-        drop(pair.slave);
-
-        let reader = pair
-            .master
-            .try_clone_reader()
-            .context("failed to clone pty reader")?;
-        let writer: SharedWriter = Arc::new(Mutex::new(
-            pair.master
-                .take_writer()
-                .context("failed to take pty writer")?,
-        ));
-
+        let (master, child, reader, writer) = spawn_on_pty(argv, rows, cols)?;
         let parser = Arc::new(Mutex::new(new_parser(rows, cols, kitty)));
         let exited = Arc::new(AtomicBool::new(false));
 
@@ -120,14 +136,59 @@ impl TermSession {
             title,
             container,
             parser,
-            master: Some(pair.master),
+            master: Some(master),
             writer,
             #[cfg(test)]
             written: Arc::default(),
             child: Some(child),
             exited,
             size: (rows, cols),
+            exit_code: None,
+            redial: None,
         })
+    }
+
+    /// Run `argv` in this tab in place of its ended child: a fresh PTY at the
+    /// tab's size, read into the same parser (the screen and scrollback stay,
+    /// the reattached program redraws over them). The old child is reaped.
+    pub fn respawn(&mut self, argv: Vec<String>) -> Result<()> {
+        let (rows, cols) = self.size;
+        let (master, child, reader, writer) = spawn_on_pty(argv, rows, cols)?;
+        if let Some(mut old) = self.child.replace(child) {
+            let _ = old.kill();
+            let _ = old.wait();
+        }
+        self.master = Some(master);
+        self.writer = writer;
+        self.exited = Arc::new(AtomicBool::new(false));
+        self.exit_code = None;
+        spawn_reader(reader, self.parser.clone(), self.writer.clone(), self.exited.clone());
+        Ok(())
+    }
+
+    /// The child's exit code once it has exited and is reaped (a PTY EOF
+    /// comes first: `None` until the child is waited for). `None` without a
+    /// child.
+    pub fn exit_code(&mut self) -> Option<i32> {
+        if self.exit_code.is_none() && self.exited() {
+            let status = self.child.as_mut()?.try_wait().ok()??;
+            self.exit_code = Some(i32::try_from(status.exit_code()).unwrap_or(i32::MAX));
+        }
+        self.exit_code
+    }
+
+    /// Print `line` of our own into the tab's screen, on a line of its own.
+    pub fn note(&self, line: &str) {
+        if let Ok(mut parser) = self.parser.lock() {
+            parser.process(format!("\r\n{line}\r\n").as_bytes());
+        }
+    }
+
+    /// Whether this tab is between dials of a reconnect: its child has ended,
+    /// a re-dial is due (`Redial`). Shown as `(reconnecting…)`, and a live
+    /// tab for dedup.
+    pub fn reconnecting(&self) -> bool {
+        self.exited() && self.redial.as_ref().is_some_and(|r| !r.ended())
     }
 
     /// Shared screen, for the renderer.
@@ -194,7 +255,16 @@ impl TermSession {
             child: None,
             exited: Arc::new(AtomicBool::new(false)),
             size: (rows, cols),
+            exit_code: None,
+            redial: None,
         }
+    }
+
+    /// Test helper: the child exited with `code` (EOF seen, reaped).
+    #[cfg(test)]
+    pub(crate) fn set_exited_with(&mut self, code: i32) {
+        self.set_exited();
+        self.exit_code = Some(code);
     }
 
     /// Test helper: flip the exited flag, standing in for the reader thread's
@@ -308,6 +378,11 @@ impl TermTabs {
         self.sessions.get(self.active)
     }
 
+    /// Every session mutably (the reconnect steps).
+    pub fn sessions_mut(&mut self) -> &mut [TermSession] {
+        &mut self.sessions
+    }
+
     /// The active session mutably (for resize / key forwarding).
     pub fn active_session_mut(&mut self) -> Option<&mut TermSession> {
         self.sessions.get_mut(self.active)
@@ -319,13 +394,14 @@ impl TermTabs {
         self.active = self.sessions.len() - 1;
     }
 
-    /// Index of the first *live* (non-exited) session for `container`. Exited
-    /// tabs are skipped so `t`'s dedup opens a fresh terminal alongside a dead
-    /// one for the same target instead of re-focusing the corpse.
+    /// Index of the first *live* (non-exited, or reconnecting) session for
+    /// `container`. Exited tabs are skipped so `t`'s dedup opens a fresh
+    /// terminal alongside a dead one for the same target instead of
+    /// re-focusing the corpse.
     pub fn find(&self, container: &str) -> Option<usize> {
         self.sessions
             .iter()
-            .position(|s| s.container == container && !s.exited())
+            .position(|s| s.container == container && (!s.exited() || s.reconnecting()))
     }
 
     /// Focus tab `idx`, clamped into range. No-op when empty.

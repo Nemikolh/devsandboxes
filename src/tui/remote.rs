@@ -133,6 +133,25 @@ pub fn exec_argv(m: &SnapshotMachine, root: &str, name: &str, command: &[String]
     ssh::tty_argv(&entry(m), &args).map(lossy).map_err(|e| format!("{e:#}"))
 }
 
+/// A remote instance's terminal tab, first dial: [`exec_argv`]'s with
+/// `--reserve-255 --session=<id>`, so the shell runs in helper session `id`
+/// the tab re-dials ([`attach_argv`]) after a lost connection
+/// (`tui::app::terminal::Redial`).
+pub fn session_exec_argv(m: &SnapshotMachine, root: &str, name: &str, id: &str) -> Result<Vec<String>, String> {
+    let session = format!("--session={id}");
+    let args = ["-C", root, "exec", "-i", "-t", "--reserve-255", &session, "--", name];
+    ssh::tty_argv(&entry(m), &args).map(lossy).map_err(|e| format!("{e:#}"))
+}
+
+/// A remote instance tab's re-dial: `ssh -t … devsandbox -C <root> exec
+/// --reserve-255 --attach=<id> -- <name>`, attach only (the `=` form, as
+/// `--attach`'s value is optional and the name comes after `--`).
+pub fn attach_argv(m: &SnapshotMachine, root: &str, name: &str, id: &str) -> Result<Vec<String>, String> {
+    let attach = format!("--attach={id}");
+    let args = ["-C", root, "exec", "--reserve-255", &attach, "--", name];
+    ssh::tty_argv(&entry(m), &args).map(lossy).map_err(|e| format!("{e:#}"))
+}
+
 /// A remote service container's terminal: `ssh -t … <runtime> exec -i -t
 /// <container> <login shell>`, the runtime the machine's snapshot named
 /// (`docker` before one came).
@@ -342,6 +361,24 @@ pub(crate) mod tests {
                 r#"exec "$SHELL" -lc 'exec ~/bin/devsandbox '\''-C'\'' '\''/r/one'\'' '\''exec'\'' '\''-i'\'' '\''-t'\'' '\''--'\'' '\''web-2'\'''"#,
             ]
         );
+        let id = "1790000000-a1b2";
+        let first = session_exec_argv(&m, "/r/one", "web-2", id).unwrap();
+        let want = ssh::remote_command("~/bin/devsandbox", &["-C", "/r/one", "exec", "-i", "-t", "--reserve-255", "--session=1790000000-a1b2", "--", "web-2"]);
+        assert_eq!(first, ["ssh", "-t", "-p", "2222", "--", "me@box", want.as_str()]);
+        let again = attach_argv(&m, "/r/one", "web-2", id).unwrap();
+        let want = ssh::remote_command("~/bin/devsandbox", &["-C", "/r/one", "exec", "--reserve-255", "--attach=1790000000-a1b2", "--", "web-2"]);
+        assert_eq!(again, ["ssh", "-t", "-p", "2222", "--", "me@box", want.as_str()]);
+        // What each runs parses back on the machine as that exec.
+        use clap::Parser;
+        let parsed = |args: &[&str]| crate::Cli::try_parse_from(std::iter::once("devsandbox").chain(args.iter().copied())).unwrap().command.unwrap();
+        assert!(matches!(
+            parsed(&["-C", "/r", "exec", "--reserve-255", "--attach=1790000000-a1b2", "--", "web-2"]),
+            crate::Command::Exec { reserve_255: true, attach: Some(Some(ref a)), ref name, ref command, .. } if a == id && name == "web-2" && command.is_empty()
+        ));
+        assert!(matches!(
+            parsed(&["exec", "-i", "-t", "--reserve-255", "--session=1790000000-a1b2", "--", "web-2"]),
+            crate::Command::Exec { reserve_255: true, session: Some(ref s), ref name, .. } if s == id && name == "web-2"
+        ));
         m.runtime = Some("podman".into());
         let argv = service_argv(&m, "devsandbox-svc-db").unwrap();
         assert_eq!(argv[..6], ["ssh", "-t", "-p", "2222", "--", "me@box"]);

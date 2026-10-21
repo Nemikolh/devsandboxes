@@ -340,7 +340,30 @@ env's own `SSH_AUTH_SOCK` (the machine's agent, if any) stays.
   process group; ssh gets the dispositions back as they were before
   (a `pre_exec`, since an ignored signal survives `exec`). A hold that
   fails (a daemon without the method, any error) prints a `warning:` and
-  the command runs without the agent. With `agent` off ssh is `exec`ed.
+  the command runs without the agent. With `agent` off ssh is `exec`ed,
+  except for a tty `exec` (below).
+- **A tty `exec` reconnects** (`reconnect_session`: no `--attach` /
+  `--sessions`, and a tty by the remote `exec`'s rule, `shell_flags`, with
+  this process on a terminal standing for the remote stdin). The id is this
+  process's (`--session` as given, else `exec::mint_session_id`), and the
+  ssh is always spawned (`reconnect_loop`, through
+  `spawn_ssh_owning_signals`, a hold kept across every dial): the first
+  dial runs `exec --reserve-255 --session=<id> …` (create-or-attach),
+  each re-dial `exec --reserve-255 <name> --attach=<id>` (attach only: a
+  reconnect never starts a second program; `session_dials`). `Reconnect`
+  (pure) decides after each dial: 255 is ssh's own failure, since
+  `--reserve-255` (hidden) makes the remote `exec` report a program's 255
+  as 254 (`exec::reported_code`); after a dial that ran
+  `CONNECTED_AFTER` (5 s) it is an outage: `connection lost,
+  reconnecting… (Ctrl-C to stop)` on stderr, then `reconnecting… (attempt
+  N)` per further try, re-dialed after `backoff` (1, 2, 4, 8, then 10 s,
+  no limit on tries). A 255 before any dial got that far is ssh failing to
+  connect: the loop ends with it. Any other code ends the loop with it;
+  `NO_SESSION_EXIT` (250) also prints that the session is gone (`gone_note`).
+  Without the helper on the remote instance `--session` is a plain exec,
+  so a re-dial's `--attach` fails there (exit 1, its message on stderr)
+  and ends the loop. SIGINT is only ignored while ssh runs, so Ctrl-C
+  during a wait ends the process.
 
 ## `devsandbox machine add|ls|set|rm`
 
@@ -383,7 +406,11 @@ on|off`. `ls` shows it in an `AGENT` column. `rm` forgets the machine.
 `src/tui/remote.rs`: rows are keyed `machine/name` (bare for local),
 routed back to a request's `machine` + remote `root`; terminal tabs use
 `tty_argv` (no hold of their own: the dashboard's `machines: true` watch
-keeps the machine, and its agent relay, up); a machine without rows shows `box: connecting` or `box:
+keeps the machine, and its agent relay, up); a remote instance tab runs
+its shell in a helper session it names (`session_exec_argv`) and, when its
+ssh exits 255, re-dials an attach to it into the same tab (`attach_argv`,
+`tui::app::terminal::Redial`, the CLI's `Reconnect` rule;
+[terminal.md](../dashboard/terminal.md) *Remote tabs reconnect*); a machine without rows shows `box: connecting` or `box:
 unreachable: <why>` in the header (`pending_note`), the name as `box
 (agent)` when its `agent` is on. `p` / `:port` on a remote row sends
 `forwards.add` with `machine` and the row's root (the forward binds here,

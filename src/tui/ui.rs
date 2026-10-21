@@ -1594,7 +1594,9 @@ fn draw_text_box(
 }
 
 /// Pure tab labels for the terminal panel, one per open session: `{i+1}:{title}`
-/// with a ` (exited)` suffix on dead tabs. The single source of truth for both
+/// with a ` (reconnecting…)` suffix on a remote tab between dials
+/// (`TermSession::reconnecting`; ` (reconnecting… N)` from its second
+/// re-dial of an outage), ` (exited)` on dead tabs. The single source of truth for both
 /// the rendered strip ([`terminal_tab_specs`]) and the mouse hit-test
 /// ([`terminal_tab_hit`]), so a click can't land on a column the strip doesn't
 /// actually draw.
@@ -1604,7 +1606,12 @@ pub(crate) fn terminal_tab_labels(app: &App) -> Vec<String> {
         .iter()
         .enumerate()
         .map(|(i, s)| {
-            if s.exited() {
+            if s.reconnecting() {
+                match s.redial.as_ref().and_then(|r| r.attempt()).filter(|n| *n > 1) {
+                    Some(n) => format!("{}:{} (reconnecting… {n})", i + 1, s.title),
+                    None => format!("{}:{} (reconnecting…)", i + 1, s.title),
+                }
+            } else if s.exited() {
                 format!("{}:{} (exited)", i + 1, s.title)
             } else {
                 format!("{}:{}", i + 1, s.title)
@@ -2292,7 +2299,10 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
     // Terminal focus (no modal) has its own hints, independent of the tab.
     if app.focus == Focus::Terminal && matches!(app.modal, Modal::None) {
         let exited = app.terms.active_session().is_some_and(|s| s.exited());
-        let text = if exited {
+        let reconnecting = app.terms.active_session().is_some_and(|s| s.reconnecting());
+        let text = if reconnecting {
+            "connection lost, reconnecting — ctrl-]/F12 back · x closes"
+        } else if exited {
             "terminal exited — ctrl-]/F12 back · x closes"
         } else {
             "ctrl-] / F12 back to dashboard · all other keys go to the shell"

@@ -31,9 +31,21 @@ pub enum Exec<'a> {
     Sessions,
 }
 
-/// CLI entry point: run the command, then exit the process with its status.
-pub fn exec(name: &str, what: Exec) -> Result<()> {
-    std::process::exit(exec_status(name, what)?);
+/// CLI entry point: run the command, then exit the process with its status
+/// ([`reported_code`] under `reserve_255`).
+pub fn exec(name: &str, what: Exec, reserve_255: bool) -> Result<()> {
+    std::process::exit(reported_code(exec_status(name, what)?, reserve_255));
+}
+
+/// The exit code `exec` reports for the command's `code`. `reserve_255`
+/// (the hidden `--reserve-255`, passed by the reconnect loops over ssh,
+/// `serve::machines::cli::Reconnect`): ssh exits 255 when the connection
+/// fails, and a reconnect's attach to an ended session reports the program's
+/// recorded code, so a program that exited 255 would look like a lost
+/// connection forever. It reports 254 instead: lossy, but 255 then only ever
+/// means ssh.
+pub(crate) fn reported_code(code: i32, reserve_255: bool) -> i32 {
+    if reserve_255 && code == 255 { 254 } else { code }
 }
 
 /// Run `what` inside the matching instance and return its exit code. An
@@ -219,7 +231,7 @@ impl AgentRelay {
 /// gets a pseudo-TTY when stdin is a terminal (`-t`), which is what an
 /// interactive user or a pty-hosting consumer (node-pty, a GUI terminal) wants
 /// without having to know the flags.
-fn shell_flags(interactive: bool, tty: bool, stdin_tty: bool) -> (bool, bool) {
+pub(crate) fn shell_flags(interactive: bool, tty: bool, stdin_tty: bool) -> (bool, bool) {
     if interactive || tty {
         (interactive, tty)
     } else {
@@ -267,7 +279,7 @@ fn session_ls_argv(instance: &Instance) -> Vec<String> {
 /// per-process random hash keys (as `inbox`'s event ids): no dependency. A
 /// collision would attach to that other session, so the odds matter: 1 in
 /// 65536 among sessions of one instance started in the same second.
-fn mint_session_id(now: u64) -> String {
+pub(crate) fn mint_session_id(now: u64) -> String {
     use std::hash::{BuildHasher, Hasher};
     let mut h = std::collections::hash_map::RandomState::new().build_hasher();
     h.write_u64(now);
@@ -277,7 +289,7 @@ fn mint_session_id(now: u64) -> String {
 
 /// `id` when it is a session id the helper accepts (checked here too, so a
 /// typo fails before any runtime call).
-fn checked_session_id(id: &str) -> Result<&str> {
+pub(crate) fn checked_session_id(id: &str) -> Result<&str> {
     if !valid_run_id(id) {
         bail!("bad session id `{id}` (expected <unix secs:010>-<4 hex>, see --sessions)");
     }
@@ -667,6 +679,15 @@ mod tests {
             Ok(1)
         };
         assert_eq!(choose_detached("web", two, true, &mut second).unwrap(), "1790000000-0006");
+    }
+
+    #[test]
+    fn reserve_255_reports_a_programs_255_as_254() {
+        assert_eq!(reported_code(255, true), 254);
+        for code in [0, 1, 130, 250, 251, 254] {
+            assert_eq!(reported_code(code, true), code);
+        }
+        assert_eq!(reported_code(255, false), 255, "off: as is");
     }
 
     #[test]

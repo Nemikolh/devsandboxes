@@ -162,6 +162,9 @@ limitation means editing this file in the same commit.
 
 ### machines
 
+- A program run by a reconnecting `exec m/x` (or a remote dashboard tab)
+  that exits 255 reports 254: 255 is kept for ssh's own failure.
+  → [machines](architecture/daemon/machines.md#the-cli-clirs); `commands::exec::reported_code`
 - A local daemon exit (handoff, idle, shutdown) cancels a held non-`detach`
   remote verb (every CLI verb): there is no spool to adopt it by.
   → [machines](architecture/daemon/machines.md); `machines::forward::verb`

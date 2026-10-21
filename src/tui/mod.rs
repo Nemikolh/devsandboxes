@@ -213,6 +213,8 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
         // cheap no-op when unchanged; every tab (not just the active one) is
         // sized so a background tab is already correct when switched to.
         if !app.terms.is_empty() {
+            // A remote tab whose ssh dropped re-dials when its wait is over.
+            app.redial_terminals(std::time::Instant::now());
             if let Some((rows, cols)) = ui::term_pane_size(area, app.prompt.is_some()) {
                 app.terms.resize_all(rows, cols);
             }
