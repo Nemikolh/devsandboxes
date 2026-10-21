@@ -697,8 +697,10 @@ fn attach_with(
         bridged.store(ok, Ordering::Relaxed);
         if let Err(e) = &result {
             let why = e.clone();
-            let _ = tx.send(result);
+            // `done` before the result: a caller that sees the failed
+            // `outcome()` must also see `is_done()`.
             finished.store(true, Ordering::Relaxed);
+            let _ = tx.send(result);
             // After `done`: a reconcile that sees the failure also sees the
             // bridge dead, so an urgent one respawns it.
             observe(BridgeStatus::Failed(why));
