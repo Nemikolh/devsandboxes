@@ -1,7 +1,7 @@
 # Identity: one user model across runtimes
 
-Status: planned
-Nothing is built. Today `run_container` (`src/commands/run/mod.rs`) passes
+Status: in progress (steps 1–6)
+Nothing is built yet. Today `run_container` (`src/commands/run/mod.rs`) passes
 `containerUser` as `--user`, `generate_dockerfile`
 (`src/commands/run/image.rs`) bakes it as `USER`, `exec` runs as
 `remoteUser`, and `updateRemoteUserUID` parses but is ignored
@@ -97,14 +97,14 @@ two stats, plus a backend method running the canary.
 
 | Mode | Plan |
 |---|---|
-| rootful | create as root, then remap the adopted account to host uid/gid (step 4); exec as it |
+| rootful | create as root, then remap the adopted account to host uid/gid (section 4); exec as it |
 | rootless docker | exec as root, `HOME` = the adopted account's home, chowned to 0 (root is you) |
 | rootless podman | `--userns=keep-id:uid=1000,gid=1000` (the assumed adopted ids); no remap |
 | VM-backed (Tier 2) | no remap; exec as the adopted account |
 | `identity = "image"` | today's behavior |
 
 Plus modifiers on every plan: `:z` on binds when SELinux is detected, and
-the docker socket's gid added to the dev user (step 4) when the sandbox
+the docker socket's gid added to the dev user (section 4) when the sandbox
 mounts it.
 
 The plan is recorded on the instance (a label, like `config_hash`) so
@@ -149,15 +149,12 @@ the account to it, whatever its starting uid.
 ### No account to adopt
 
 An image with no non-root user (no `remoteUser`/`containerUser`, image
-`USER` root, no uid-1000 account) has nothing to remap. Two options,
-undecided (see *Open questions*):
-- add the `common-utils` feature implicitly (`username = "automatic"`,
-  which creates a non-root user and passwordless sudo);
-- run as root, then warn and recommend adding `common-utils` to the
-  config.
+`USER` root, no uid-1000 account) has nothing to remap. It runs as
+root, and `run` warns and recommends adding the `common-utils` feature
+to the config (decided; adding `common-utils` implicitly was rejected).
 
-Under rootless docker neither option changes the outcome: non-root
-inside is a subuid there, so root is still the plan.
+Under rootless docker root is the plan anyway (non-root inside is a
+subuid there), so there's no warning.
 
 ### Tool environment
 
@@ -505,42 +502,211 @@ asked.
 
 ## Steps
 
-1. Pure classifier + strategy table + tests (`src/runtime/`).
-2. Probe: fast path, then canary; cache in `state.toml`; `--reprobe`.
-3. `devsbd identity apply` in the helper, with unit tests on passwd/group
-   rewriting (pure over file contents).
-4. Wire into `run`: plan → create args (`--userns`, `:z`) → apply exec →
-   label; `exec`/TUI/lifecycle read the label.
-5. `identity` config field, `updateRemoteUserUID` as its hint, spec skill,
-   drift hash.
-5b. Tool environment: the userns probe in the canary, the docker seccomp
-   profile and the `userns` field (spec skill), the knobs as a fallback.
-   Then the browser wrapper and `DEVSANDBOX_CHROME`, as their own step,
-   with the agent note in `skills/devsandbox-cli/SKILL.md` (and the
-   plugin's skill, if it exists by then).
-6. Docs: `architecture/instances/` (a new `identity.md`), `runtimes.md`,
-   status line for anything left.
+The current run covers the core, steps 1–6. Step 7 (tool environment)
+and steps 8–14 (migration) stay planned for a later run.
 
-Migration (section 7, after step 4):
+**Testing limits for every step.** The orchestrating host is a Mac with
+no docker, podman or Apple `container` on `PATH`. `cargo test
+--workspace` runs, but every `#[test_utils::docker_test…]` /
+`helper_test` skips locally and only runs (and fails, if wrong) on CI.
+Rootless docker and podman can't be exercised at all. So:
+- put the logic in pure fns with table tests, and keep runtime calls thin;
+- a docker test written in a step is unverified until CI runs it; say so
+  in the step's report;
+- never claim a runtime behavior works because a skipped test "passed".
 
-7. `${containerEnv:NAME}` / `${containerEnv:HOME}`: `MountContext`,
+Repo rules apply (AGENTS.md): no clippy/rustfmt here, mimic the
+surrounding style, docs describe the code as it is (paths + symbols, no
+line numbers), pre-1.0 so no compat shims. Line numbers below are as of
+the plan commit; re-grep before editing.
+
+### Step 1: classifier and strategy table (pure)
+
+New module `src/runtime/identity.rs` (`pub mod identity;` in
+`src/runtime/mod.rs` next to `pub mod procs;`). No I/O, no `backend()`.
+- `Mode`: `Rootful`, `RootlessDocker`, `RootlessPodman`, `VmBacked`.
+  `Probe { mode, selinux: bool }`.
+- `classify(host: Ids, as_root: Ids, as_1000: Ids) -> Option<Mode>`: the
+  canary's two `stat` results (section 2): root file host-root + 1000
+  file host-1000 → `Rootful`; root file = host user → rootless (docker vs
+  podman is the backend's name, so take it as an argument); everything
+  host-user-owned → `VmBacked`; anything else → `None`.
+- `Identity`: `Host` (default), `Image`. Lowercase serde (`"host"`,
+  `"image"`), used by step 2's config field.
+- `plan(probe, identity, adopted: Option<&str>, host: Ids) -> Plan`:
+  the table in section 3, plus *No account to adopt* (decided: run as
+  root, with a warning recommending `common-utils`). `Plan` carries what
+  later steps need and nothing more: the create user (`--user`), the
+  `--userns` value, the remap (`user`, `uid`, `gid`) for `devsbd identity
+  apply`, the exec user, whether `HOME` is the adopted account's home
+  under root (rootless docker), the `relabel` flag (SELinux), and
+  warnings. `Identity::Image` reproduces today's behavior exactly
+  (create as `containerUser`, exec as `remoteUser`, no remap).
+- `Plan::summary()`: the one-line diagnostic of section 6
+  ("rootless docker: exec as root, root maps to you"), and a
+  `label()`/`parse_label()` round trip for the container label of step 5.
+- Table tests: every row of section 3's table, the no-account row in each
+  mode, `Image` in each mode, `classify`'s four outcomes and the unknown.
+
+Docs: none yet (no behavior change); the module's doc comment points at
+this plan's sections 2–3.
+
+### Step 2: `identity` config field
+
+- `SandboxProperties` (`src/config.rs`, near `remote_user` ~line 202):
+  `identity: Option<Identity>`. `updateRemoteUserUID` (`~line 214`) stops
+  being ignored: remove it from `SandboxProperties::ignored` (~line 350),
+  and add an accessor (e.g. `SandboxProperties::identity()`) where an
+  unset `identity` with `updateRemoteUserUID = false` gives `Image`, else
+  `Host`. An explicit `identity` wins over the hint.
+- Drift: `identity` changes how the container is created, so it must be
+  in `config_hash` (it is, through `sandbox_hash` over the merged table,
+  unless excluded; add a test like `config_hash_is_stable_and_sensitive`
+  proving a toggle changes the hash, and one that the hint does too).
+- Both config formats (TOML and the YAML/devcontainer.json path) parse it;
+  test both.
+- `skills/config-toml-spec/SKILL.md`: the field, its default, the hint.
+  `docs/architecture/config.md` if it lists sandbox fields.
+
+Nothing reads the field yet; step 5 does. Say so in the commit body, not
+in the docs.
+
+### Step 3: `devsbd identity apply` (helper)
+
+New `devsbd/src/identity.rs`, dispatched from `devsbd/src/main.rs`'s
+`match` (~line 57) as `devsbd identity apply <user> <uid> <gid>
+[--socket-gid N] [--volume PATH]… [--expect UID:GID] [--root-home]`.
+The helper crate has **no dependencies** (`devsbd/Cargo.toml`); std only
+(`std::os::unix::fs::{chown, lchown}`, `MetadataExt`).
+- Pure fns over file contents, unit-tested: rewrite `/etc/passwd` and
+  `/etc/group` to move the account to `uid:gid` (moving a clashing
+  account aside to a free id), add a group with the socket's gid and the
+  user to it (reuse an existing group with that gid). No `usermod`.
+- Home chown: only entries owned by the account's old uid, `lchown`
+  (never follow symlinks), never crossing into another device (bind
+  mounts and volumes under `$HOME` keep their owner). Not a blind
+  `chown -R`.
+- `--volume PATH`: chown a mount point when it's root-owned and empty
+  (section 5).
+- `--expect UID:GID`: no remap (keep-id plans); warn on stderr when the
+  account's real ids differ, naming the account, its ids and what will
+  be wrong (*Assumed ids*).
+- `--root-home`: rootless docker's plan: chown the account's home to 0.
+- Idempotent: a second run is a no-op. Prints one machine-readable stdout
+  line with the account's home (the host records it for `HOME`).
+- Missing account: error with a clear message; the host decides.
+
+Docs: `docs/architecture/helper/in-container.md` (or `overview.md`,
+whichever lists subcommands) describes the subcommand.
+
+### Step 4: probe
+
+- Fast path, pure parsers in `src/runtime/identity.rs` over the runtime's
+  own output: `docker info` security options containing `name=rootless`;
+  `podman info` `.Host.Security.Rootless`; VM-backed docker (Docker
+  Desktop, OrbStack, colima: `docker info`'s `OperatingSystem` /
+  context endpoint) and podman machine (remote connection); Apple
+  `container` is always `VmBacked`. Tests over captured outputs.
+- Canary (when the fast path is ambiguous, or on `--reprobe`): a new
+  `Backend` method (`src/runtime/mod.rs` trait ~line 101, implemented in
+  `dockerlike.rs`; `apple.rs` returns `VmBacked` without running
+  anything). The orchestrator's suggestion: run it from the sandbox's own
+  image (already built, no pull) with `--entrypoint sh`, `--user 0` then
+  `--user 1000`, a temp host dir bound in; `stat` on the host feeds
+  `classify`. SELinux: an EACCES that `:z` clears. Host ids from
+  `libc::getuid/getgid` (`libc` is a root dependency).
+- Cache: `State.identity_probes` (`src/state.rs`, next to
+  `autostart_boot` ~line 344), keyed by backend + context (`DOCKER_HOST` /
+  `DOCKER_CONTEXT` / current docker context, `CONTAINER_HOST` / podman
+  connection), written through `State::update`. Omitted when empty
+  (mirror `empty_autostart_boot_is_omitted`).
+- `--reprobe` on `run` and `rebuild` (`src/main.rs` clap, and the verb
+  argv in `src/serve/verbs.rs`, whose pure argv fns have tests; check
+  `npm/devsandboxes/index.d.ts` / `serve/dts.rs` if the params are typed
+  there, and `docs/reference/api.md`).
+
+Docs: `docs/architecture/runtimes.md` (mode detection, the cache);
+`docs/reference/` CLI pages for `--reprobe` if they list flags.
+
+### Step 5: wire into `run`, `exec` and lifecycle
+
+In `materialize` (`src/commands/run/mod.rs` ~line 479):
+- after `image_for` (~line 701): the adopted account (`remoteUser`, else
+  `containerUser`, else the image's `Config.User`), the cached probe, and
+  `identity::plan`. Print `Plan::summary()` once, and its warnings.
+- `run_container` (~line 981): `--user` from the plan (replacing the
+  `props.container_user` push ~line 1032), `--userns`, the relabel
+  modifier on binds (docker's `--mount` has no relabel option: `-v …:z`
+  on docker, `relabel=shared` on podman's `--mount`; mind
+  `backend().supports_file_binds()`), and a `devsandbox.identity` label
+  with `Plan::label()`.
+- after `devsbd::ensure_or_reason` (~line 725), before shell-rc and the
+  lifecycle chain: a root exec of `devsbd identity apply` (see
+  `devsbd::root_script_argv` in `src/devsbd.rs` for the root-exec
+  pattern), with `--socket-gid` when a mount's source is the docker
+  socket (host `stat` gid), `--volume` for named-volume and feature mount
+  targets. No helper (a `cargo install` build): fall back to the `Image`
+  plan with a note.
+- record the outcome on `state::Instance` (`src/state.rs`, next to
+  `remote_user` ~line 82): the exec user and, for root plans, `HOME`.
+  `exec_argv_with` (`src/commands/exec.rs` ~line 388, `-u` ~line 403),
+  `exec_lifecycle` callers (`run/mod.rs` ~lines 806, 835, 855),
+  `boot_spec_for`, `start.rs` (~lines 98, 131), `vscode.rs` (~line 198)
+  and `write_vscode_name_config` read it instead of `props.remote_user`.
+  An instance without the record (created before this) keeps its
+  recorded `remote_user` until rebuilt.
+- `devsandbox inspect` shows the plan (the label already appears in the
+  raw JSON; add a readable line if `inspect.rs` has a summary).
+- `generate_dockerfile` / `builtin_env` (`src/commands/run/image.rs`)
+  keep baking `USER containerUser`: create-time `--user` overrides it.
+- Services guard (section *Services*): a test in
+  `src/commands/services.rs`'s tests that `service_run_args` emits no
+  `--user`/`--userns`.
+- Docker test: one `#[test_utils::docker_test(helper)]` asserting a file
+  written in the workspace as the exec user is host-uid-owned (rootful;
+  on Docker Desktop it holds too). Unverified locally; say so.
+
+Docs: new `docs/architecture/instances/identity.md` (the model, the
+table, the remap, what's recorded where), linked from
+`docs/architecture/instances/lifecycle.md` / `mounts-and-state.md` and
+`docs/README.md`'s map; `docs/architecture/runtimes.md`.
+
+### Step 6: close the core
+
+- Verify `docs/architecture/instances/identity.md` and `runtimes.md`
+  against the code.
+- `docs/status.md`: the identity line moves from *In progress* back to
+  *Planned* for step 7 and the migration (8–14); known limitations, one
+  verified line each (rootless modes untested, `/root` mounts break
+  under `identity = "host"` until the migration ships, no account to
+  adopt runs as root).
+- This plan: steps 1–6 marked shipped, the plan stays active for the
+  rest (precedent: `1e52c67`, resumable exec).
+
+### Step 7 (later): tool environment
+
+The userns probe in the canary, the docker seccomp profile and the
+`userns` field (spec skill), the knobs as a fallback. Then the browser
+wrapper and `DEVSANDBOX_CHROME`, as their own step, with the agent note in
+`skills/devsandbox-cli/SKILL.md` (and the plugin's skill, if it exists by
+then).
+
+### Migration (later, section 7)
+
+8. `${containerEnv:NAME}` / `${containerEnv:HOME}`: `MountContext`,
    `resolve_var`, env substitution, the image passwd and `Config.Env` read
    cached by image id (replacing the 1000 guess), spec skill.
-8. `identity_findings` with origins and ids; table tests (templates,
+9. `identity_findings` with origins and ids; table tests (templates,
    `extends` chains, scalar overrides).
-9. `rewrite` on `toml_edit`: round-trip tests, YAML refusal, the atomic
-   write with a transient `.bak`, the `conflict` guard, and `RootUser`'s
-   `identity = "image"` write.
-10. `identity_acks` in `state.toml`; `config.findings`/`migrate`/`ack`
+10. `rewrite` on `toml_edit`: round-trip tests, YAML refusal, the atomic
+    write with a transient `.bak`, the `conflict` guard, and `RootUser`'s
+    `identity = "image"` write.
+11. `identity_acks` in `state.toml`; `config.findings`/`migrate`/`ack`
     (`QUICK`, d.ts, api.md).
-11. `SandboxRow.identity`, the header line, the Detail lines.
-12. The CLI prompt in `verbs_client::prepare`, the in-process fallback,
+12. `SandboxRow.identity`, the header line, the Detail lines.
+13. The CLI prompt in `verbs_client::prepare`, the in-process fallback,
     the off-TTY warning.
-13. The TUI verb modal and the TUI-open offer; docs and a status line.
-
-Docker tests: one `#[test_utils::docker_test(helper)]` per Tier 1 mode
-the CI host can run (rootful at least), asserting a file written in the
-workspace is host-uid-owned.
+14. The TUI verb modal and the TUI-open offer; docs and a status line.
 
 ## Decisions
 
@@ -557,6 +723,14 @@ workspace is host-uid-owned.
 - The `.bak` exists only during the write. It's deleted on success.
 - Machines' configs are rewritten remotely, by their own daemon.
 - Autostart may run before the TUI-open offer is answered. Accepted.
+- No account to adopt: run as root, warn, recommend `common-utils`.
+- Rootless docker's root-only frictions (Homebrew, pip, bundler) are not
+  documented, and users aren't pointed at rootless podman.
+- The `identity` field (step 2) lands before the wiring (step 5), so the
+  escape hatch exists the moment the behavior changes.
+- `identity` defaults to `"host"` from step 5, even though the migration
+  comes later: configs mounting into `/root` break until then, listed as
+  a limitation in `docs/status.md`.
 
 ## Experiment (separate, after the above)
 
@@ -569,12 +743,6 @@ own plan if the identity work leaves gaps.
 
 ## Open questions
 
-- No account to adopt: implicit `common-utils`, or warn and recommend it?
 - Rootless docker and podman: the wrapper and the profile are tested on
   rootful docker only. Retest under both rootless runtimes (one more
   userns level) before calling them "on".
-- Rootless docker runs everything as root. That's rarely a problem in
-  devcontainer base images. The known frictions are tools that refuse or
-  degrade as root: Homebrew refuses it; Chromium/Puppeteer/Playwright need
-  `--no-sandbox`; pip and bundler only warn. Document it, and point users
-  who hit it to rootless podman?

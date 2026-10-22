@@ -12,7 +12,10 @@ limitation means editing this file in the same commit.
 
 ## In progress
 
-(none)
+- **runtimes**: one user model across rootful/rootless docker, podman and
+  VM-backed runtimes, core steps 1–6 (probe, strategy table, helper-side
+  uid remap, `identity` config field); tool environment and the `/root`
+  config migration after. → [plan](plans/active/identity.md)
 
 ## Planned
 
@@ -36,9 +39,6 @@ limitation means editing this file in the same commit.
   → [forwards](architecture/daemon/forwards.md#routes)
 - **helper**: run the ssh-agent relay once on Apple `container` on a Mac
   (built, never tested there).
-- **runtimes**: one user model across rootful/rootless docker, podman and
-  VM-backed runtimes (probe, strategy table, helper-side uid remap,
-  `identity` config field). → [plan](plans/active/identity.md)
 
 ## Parked
 
