@@ -12,6 +12,9 @@ mod dockerlike;
 // Only the daemon follows events (unix-only).
 #[cfg(unix)]
 pub mod events;
+// Nothing calls it until `run` wires the plan in.
+#[allow(dead_code)]
+pub mod identity;
 // Only the daemon and the dashboard list processes (both unix-only).
 #[cfg(unix)]
 pub mod procs;
