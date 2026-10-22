@@ -7,7 +7,8 @@ helper-side behavior or debugging a sandbox from the inside.
 Code: `devsbd/src/daemon.rs` (`run`, `take_over`, `Bridges::route`,
 `flush`, `control_exchange`, `control_follow`), `devsbd/src/bridge.rs`,
 `devsbd/src/boot.rs`, `devsbd/src/outbox.rs`, `devsbd/src/ctl.rs`,
-`devsbd/src/runs.rs`, `devsbd/src/sessions.rs`, `devsbd/src/vscode.rs`, `devsbd/src/json.rs`;
+`devsbd/src/runs.rs`, `devsbd/src/sessions.rs`, `devsbd/src/vscode.rs`, `devsbd/src/json.rs`,
+`devsbd/src/identity.rs`;
 `src/commands/run/mod.rs` (`container_command`, `BOOT_HOOK_LABEL`).
 
 ## Files and sockets
@@ -176,6 +177,44 @@ cwd and env the command gets, so `new` needs no `--cwd`. `exec --attach
   session's command group gets SIGHUP, then SIGKILL after `HUP_WAIT`
   (verified with `runs::kill_target`), the supervisor records the end, the
   dir is deleted.
+
+## `devsbd identity apply`
+
+`devsbd identity apply <user> [--remap UID:GID | --expect UID:GID |
+--root-home] [--socket-gid GID] [--volume PATH]...` (`identity::run`) fits
+the adopted account to the identity plan, as root, once per container; the
+edits live in the container layer and a repeat run changes nothing. `<user>`
+is an account name, else a uid. At most one mode:
+
+- none: ids kept;
+- `--remap UID:GID`: the account moves to those ids (`remap_passwd`,
+  `remap_group`). `/etc/passwd` and `/etc/group` are rewritten directly, no
+  `usermod`. Another account holding the uid moves to the lowest free uid
+  from 1000 (not the account's old one); its files keep their numeric owner.
+  A group that already has the gid becomes the account's primary group as
+  is, else the account's own group is renumbered, else one is added. uid 0,
+  or an account that is uid 0, is refused. `/etc/shadow` and
+  `/etc/gshadow` are name-keyed and nothing is renamed, so they're left alone;
+- `--expect UID:GID`: ids kept, a warning on stderr when the account's real
+  ids differ (keep-id: workspace files would be owned by a subuid);
+- `--root-home`: ids kept, the home goes to `0:0` (rootless docker: root is
+  the host user).
+
+The home (from `/etc/passwd`) is walked (`chown_tree`, per entry `step`):
+only entries owned by the account's old uid change owner, their group too
+when it's the old gid; symlinks are `lchown`ed, never followed; an entry on
+another device than the home (a bind mount or volume) is skipped and not
+entered. The walk runs before the `/etc` writes, so a run cut short is
+finished by the next. `--socket-gid` puts the account in the group with that
+gid, adding `docker` (or `docker-<gid>` when the name is taken) if none has
+it (`add_member`). `--volume PATH` hands a root-owned, empty mount point to
+the account (`claim_volume`); a missing one is a warning. `/etc` files are
+replaced by a temp file renamed over them, keeping mode and owner
+(`write_replacing`), and only when their content changes.
+
+Stdout is one line, `home=<path>`, the account's home. Exit 0 on success
+(warnings on stderr), 1 with `devsbd: identity: <why>` on stderr when it
+fails (no such account, a refused remap, an I/O error), 2 on a usage error.
 
 ## `devsbd vscode-goto <abs>[:line[:col]] [--wait SECS]`
 

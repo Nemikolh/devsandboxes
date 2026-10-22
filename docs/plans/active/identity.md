@@ -574,8 +574,9 @@ in the docs.
 ### Step 3: `devsbd identity apply` (helper)
 
 New `devsbd/src/identity.rs`, dispatched from `devsbd/src/main.rs`'s
-`match` (~line 57) as `devsbd identity apply <user> <uid> <gid>
-[--socket-gid N] [--volume PATH]… [--expect UID:GID] [--root-home]`.
+`match` (~line 57) as `devsbd identity apply <user> [--remap UID:GID |
+--expect UID:GID | --root-home] [--socket-gid N] [--volume PATH]…`
+(shipped grammar; the contract is in `docs/architecture/helper/in-container.md`).
 The helper crate has **no dependencies** (`devsbd/Cargo.toml`); std only
 (`std::os::unix::fs::{chown, lchown}`, `MetadataExt`).
 - Pure fns over file contents, unit-tested: rewrite `/etc/passwd` and

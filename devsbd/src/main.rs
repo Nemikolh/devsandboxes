@@ -5,6 +5,7 @@ mod boot;
 mod bridge;
 mod ctl;
 mod daemon;
+mod identity;
 mod json;
 mod listeners;
 mod outbox;
@@ -88,9 +89,10 @@ fn main() {
             std::process::exit(code)
         }
         Some("session") => std::process::exit(sessions::run(&args.collect::<Vec<_>>())),
+        Some("identity") => std::process::exit(identity::run(&args.collect::<Vec<_>>())),
         _ => {
             eprintln!(
-                "usage: devsbd version|features|daemon|bridge|boot|notify|thread|events|ensure|ls|branches|stop|rm|done|exec|run|session|vscode-goto"
+                "usage: devsbd version|features|daemon|bridge|boot|notify|thread|events|ensure|ls|branches|stop|rm|done|exec|run|session|identity|vscode-goto"
             );
             std::process::exit(2);
         }
