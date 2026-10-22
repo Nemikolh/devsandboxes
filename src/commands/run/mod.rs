@@ -14,6 +14,9 @@ pub(crate) mod cancel;
 mod editor;
 mod folders;
 mod git;
+// Nothing calls the probe until `materialize` wires the plan in.
+#[allow(dead_code)]
+mod identity;
 mod image;
 mod lifecycle;
 mod mounts;
@@ -44,10 +47,15 @@ pub(crate) use worktree::{instance_at, lock_instance_worktrees, parse_worktree_l
 pub const DEFAULT_WORKTREE_BRANCH: &str = "sandbox/${instance}";
 
 /// Per-instance additions from the hidden `run` flags, which a dispatcher's
-/// control requests use (`commands::dispatch`). Not part of the config, so
-/// not hashed.
+/// control requests use (`commands::dispatch`), plus `--reprobe`. Not part
+/// of the config, so not hashed.
 #[derive(Debug, Clone, Default)]
 pub struct RunExtras {
+    /// `run`/`rebuild --reprobe`: probe the runtime's identity mode afresh
+    /// (`identity::probe`) instead of trusting the cache. Not recorded.
+    // Read once `materialize` calls the probe.
+    #[allow(dead_code)]
+    pub reprobe: bool,
     /// Extra `-e K=V` for this instance only, after `containerEnv` (so they
     /// win on a duplicate key). Recorded in state (`Instance::extra_env`) so a
     /// `rebuild`, which passes none, keeps them.
@@ -1297,6 +1305,7 @@ mod tests {
             let extras = RunExtras {
                 env: vec![("OK".into(), "1".into()), (name.into(), "/tmp/p".into())],
                 dispatcher: Some("d".into()),
+                ..Default::default()
             };
             let err = run(dir, Some("web".into()), None, None, None, extras).unwrap_err().to_string();
             assert_eq!(err, format!("--env `{name}` may not be set by a dispatcher"));

@@ -6,9 +6,10 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
+use super::identity::{self, Canary, FastPath, Ids};
 use super::{
     split_kv, without_self_ps, Backend, ContainerRow, ProcList, ServiceEndpoint, StatsRow,
     PROC_PS_ARGS,
@@ -192,6 +193,80 @@ impl Backend for Dockerlike {
             Err(e) => Err(e),
         }
     }
+
+    fn identity_fast_path(&self) -> Result<FastPath> {
+        let linux = cfg!(target_os = "linux");
+        let var = |key| std::env::var(key).ok().filter(|v| !v.is_empty());
+        if self.name == "podman" {
+            // Podman's `--format` takes `json`, not a Go template of it.
+            let out = self.output_quiet(&["info", "--format", "json"])?;
+            identity::podman_fast_path(&out, var("CONTAINER_HOST").as_deref(), linux)
+        } else {
+            let out = self.output_quiet(&["info", "--format", "{{json .}}"])?;
+            identity::docker_fast_path(&out, var("DOCKER_HOST").as_deref(), linux)
+        }
+    }
+
+    fn identity_canary(&self, image: &str, dir: &std::path::Path, relabel: bool) -> Result<Canary> {
+        let host_dir = dir.to_str().context("identity canary dir is not UTF-8")?;
+        // `-v`'s separators; `--mount` would take them but has no relabel.
+        if host_dir.contains([':', ',']) {
+            bail!("identity canary dir `{host_dir}` has a `:` or `,`");
+        }
+        let root = Ids { uid: 0, gid: 0 };
+        for user in [root, identity::ASSUMED] {
+            let args = canary_argv(image, host_dir, user, relabel);
+            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            self.output_quiet(&refs)
+                .with_context(|| format!("identity canary as uid {} from `{image}` (it needs {})", user.uid, super::SH))?;
+        }
+        Ok(Canary { as_root: owner(&dir.join("0"))?, as_1000: owner(&dir.join(identity::ASSUMED.uid.to_string()))? })
+    }
+}
+
+/// Where the canary's host dir is bound inside.
+const CANARY_TARGET: &str = "/devsandbox-probe";
+
+/// One canary run: a throwaway container from the local `image` (never
+/// pulled, no network, entrypoint replaced) creating `<uid>` in the bound
+/// `host_dir` as `user`. `:z` relabels the bind for SELinux.
+fn canary_argv(image: &str, host_dir: &str, user: Ids, relabel: bool) -> Vec<String> {
+    let relabel = if relabel { ":z" } else { "" };
+    vec![
+        "run".into(),
+        "--rm".into(),
+        "--pull=never".into(),
+        "--network=none".into(),
+        "--user".into(),
+        format!("{}:{}", user.uid, user.gid),
+        "--entrypoint".into(),
+        super::SH.into(),
+        "-v".into(),
+        format!("{host_dir}:{CANARY_TARGET}{relabel}"),
+        image.into(),
+        "-c".into(),
+        // A builtin and a redirect: no tool needed from the image.
+        format!(": > {CANARY_TARGET}/{}", user.uid),
+    ]
+}
+
+/// A canary file's owner, as the host sees it.
+#[cfg(unix)]
+fn owner(path: &std::path::Path) -> Result<Ids> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::symlink_metadata(path).with_context(|| {
+        format!(
+            "identity canary file {} isn't on this host: the engine sees another filesystem \
+             (a remote engine, or a VM share not covering it)",
+            path.display()
+        )
+    })?;
+    Ok(Ids { uid: meta.uid(), gid: meta.gid() })
+}
+
+#[cfg(not(unix))]
+fn owner(_path: &std::path::Path) -> Result<Ids> {
+    bail!("the identity canary needs a unix host")
 }
 
 /// `{{json .Config.Entrypoint}}`: `null` (unset) or a string array.
@@ -414,6 +489,46 @@ mod tests {
         Dockerlike::DOCKER.run_checked(&["volume", "create", &name]).map_err(|_| "volume create failed")?;
         assert!(Dockerlike::DOCKER.remove_volume(&name).unwrap());
         assert!(!Dockerlike::DOCKER.remove_volume(&name).unwrap());
+        Ok(())
+    }
+
+    #[test]
+    fn canary_argv_per_user() {
+        let root = canary_argv("devsandbox-web:abc", "/home/u/.local/share/devsandbox/identity-probe-7", Ids { uid: 0, gid: 0 }, false);
+        assert_eq!(
+            root,
+            [
+                "run", "--rm", "--pull=never", "--network=none", "--user", "0:0", "--entrypoint", "/bin/sh", "-v",
+                "/home/u/.local/share/devsandbox/identity-probe-7:/devsandbox-probe", "devsandbox-web:abc", "-c",
+                ": > /devsandbox-probe/0",
+            ]
+        );
+        let user = canary_argv("img", "/d", identity::ASSUMED, true);
+        assert_eq!(user[5], "1000:1000");
+        assert_eq!(user[9], "/d:/devsandbox-probe:z");
+        assert_eq!(user[12], ": > /devsandbox-probe/1000");
+    }
+
+    /// Docker-gated: CI's docker is rootful, so the canary must classify it
+    /// so. Unverified on a dev Mac (no docker there).
+    #[cfg(unix)]
+    #[test_utils::docker_test]
+    fn canary_classifies_rootful_docker() -> Result<(), &'static str> {
+        use std::os::unix::fs::PermissionsExt;
+        let image = "alpine:3.20";
+        Dockerlike::DOCKER.output_quiet(&["pull", "-q", image]).map_err(|_| "cannot pull alpine:3.20")?;
+        let dir = std::env::temp_dir().join(format!("devsandbox-canary-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let canary = crate::test_support::with_cleanup(
+            || drop(std::fs::remove_dir_all(&dir)),
+            || Dockerlike::DOCKER.identity_canary(image, &dir, false),
+        )
+        .unwrap();
+        let host = Ids { uid: unsafe { libc::getuid() }, gid: unsafe { libc::getgid() } };
+        let mode = identity::classify(host, canary.as_root, canary.as_1000, identity::Engine::Docker);
+        assert_eq!(mode, Some(identity::Mode::Rootful), "{canary:?}");
         Ok(())
     }
 

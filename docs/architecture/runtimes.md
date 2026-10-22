@@ -6,7 +6,8 @@ touching any runtime call or adding a runtime capability.
 Code: `src/runtime/mod.rs` (`Backend`, `backend()`, `default_backend_name`,
 `backend_named`, `NAME_PREFIX`, `fixed_path`), `src/runtime/dockerlike.rs`
 (`Dockerlike::DOCKER`/`PODMAN`), `src/runtime/apple.rs` (`AppleContainer`),
-`src/runtime/bounded.rs`, `src/runtime/procs.rs`, `src/runtime/events.rs`.
+`src/runtime/bounded.rs`, `src/runtime/procs.rs`, `src/runtime/events.rs`,
+`src/runtime/identity.rs`, `src/commands/run/identity.rs`.
 
 ## Backend
 
@@ -22,7 +23,8 @@ process-wide backend, resolved once by `backend()`.
   `inspect_json`, `list` (rows as `ContainerRow`: name, image, status,
   normalized `state`, labels, host ports), `stats`, `server_version`,
   `logs_tail`, `proc_list`, `image_entrypoint`, `events_argv` (see
-  [events](#events)).
+  [events](#events)), `identity_fast_path` and `identity_canary` (see
+  [mode detection](#mode-detection)).
 - **Mutations that differ in shape**: `remove_force`, `network_run_args` +
   `connect_networks`, `service_alias_args` + `wire_service_dns`,
   `set_restart_policy`, `remove_volume`, `signal_proc` (`exec kill -<n>`, same
@@ -142,6 +144,75 @@ paused or unpaused (docker's `die`/`destroy` and podman's `died`/`remove`
 both). Everything else is dropped, exec events above all: the daemon's
 bridges `exec` into containers, so a wake on `exec_start: …` would make each
 listing trigger the next.
+
+## Mode detection
+
+The same devcontainer user fields mean opposite things on rootful docker,
+rootless docker, rootless podman and VM-backed runtimes, so the runtime's
+user-namespace mode (`runtime::identity::Mode`) is probed, with whether
+binds need SELinux relabeling, into a `runtime::identity::Probe`.
+`commands::run::identity::probe(image, reprobe)` decides it (`decide`, I/O
+injected) in this order:
+
+1. **Cache**: `State.identity_probes` in `state.toml`, keyed by
+   `runtime::identity::context_key`, unless `reprobe`.
+2. **Fast path**: `Backend::identity_fast_path`, the runtime's own metadata.
+3. **Canary**: `Backend::identity_canary`, when the fast path is ambiguous
+   or on `reprobe`.
+
+A fresh result is written through `State::update`. Apple `container`
+answers `VmBacked` before any of this: every container is its own VM, and
+no command runs.
+
+**Fast path.** docker reads `docker info --format '{{json .}}'`
+(`runtime::identity::docker_fast_path`), with `DOCKER_HOST`:
+- a `tcp://` or `ssh://` endpoint: ambiguous (binds name the remote host's
+  paths);
+- a non-Linux host, or a VM marker (`OperatingSystem` Docker Desktop /
+  OrbStack / Rancher Desktop, a colima/lima/orbstack/desktop hostname
+  `Name` or `ClientInfo.Context`, a VM's socket dir in `DOCKER_HOST`):
+  `VmBacked`;
+- `name=rootless` in `SecurityOptions`: `RootlessDocker`;
+- `name=userns` (a `userns-remap` daemon): ambiguous;
+- otherwise `Rootful`.
+
+SELinux is `name=selinux` (docker labels containers only with
+`selinux-enabled`). podman reads `podman info --format json`
+(`runtime::identity::podman_fast_path`), with `CONTAINER_HOST`: a non-Linux
+host, or `host.serviceIsRemote` without a local `unix://` endpoint (a podman
+machine), is `VmBacked`; else `host.security.rootless` picks
+`RootlessPodman` or `Rootful`. SELinux is `host.security.selinuxEnabled`.
+podman's metadata is never ambiguous.
+
+**Canary.** A throwaway container from the sandbox's own image (`run --rm
+--pull=never --network=none --entrypoint /bin/sh`, so nothing is pulled),
+with an empty mode-0777 host dir bound in (`:z` when the fast path saw
+SELinux), creates one file as `--user 0:0` and one as `1000:1000`
+(`dockerlike::canary_argv`). The host `stat`s both, and
+`runtime::identity::classify` maps the owners (and the backend's engine)
+to a mode; an unknown outcome is an error. The dir sits next to
+`state.toml` (`identity-probe-<pid>`), under `$HOME`, which VM file shares
+cover by default, and is removed after. An image without `/bin/sh`, or an
+engine whose binds don't reach this host's filesystem, fails the canary
+with an error. The canary never tests SELinux: that flag always comes from
+the fast path.
+
+**Cache key.** The runtime context as the runtime's CLI resolves it, never
+the machine that asked (a machine probes for itself, with its own
+`state.toml`): `docker:host=<DOCKER_HOST>`, else
+`docker:context=<DOCKER_CONTEXT>`, else the docker CLI config's
+`currentContext` (`$DOCKER_CONFIG/config.json`, else
+`~/.docker/config.json`), else `docker:context=default`;
+`podman:host=<CONTAINER_HOST>`, else
+`podman:connection=<CONTAINER_CONNECTION>`, else `podman:default`. A
+changed key is a fresh probe. A change behind the same key (a reinstalled
+engine, podman's default connection switched) needs `--reprobe`.
+
+**`--reprobe`** on `run` and `rebuild` (`RunParams::reprobe` /
+`RebuildParams::reprobe` over the API, `--reprobe` in the verb argv) skips
+the cache and runs the canary even when the metadata is clear. It reaches
+`materialize` as `RunExtras::reprobe` and isn't recorded on the instance.
+`rebuild --reprobe` alone doesn't count as drift.
 
 ## Adding a runtime
 

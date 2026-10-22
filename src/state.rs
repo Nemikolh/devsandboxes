@@ -347,6 +347,10 @@ pub struct State {
     /// instances declare it, so its port can't live on any one instance.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub global_forwarded_ports: BTreeMap<String, BTreeMap<String, u16>>,
+    /// Runtime context key (`runtime::identity::context_key`) -> its probed
+    /// user-namespace mode, so a context is probed once (until `--reprobe`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub identity_probes: BTreeMap<String, crate::runtime::identity::Probe>,
 }
 
 impl State {
@@ -467,8 +471,11 @@ mod tests {
             },
         );
         state.autostart_boot.insert("abc12345".into(), "3f2c-boot".into());
+        let probe = crate::runtime::identity::Probe { mode: crate::runtime::identity::Mode::RootlessPodman, selinux: true };
+        state.identity_probes.insert("podman:host=unix:///run/user/1000/podman/podman.sock".into(), probe);
         let text = toml::to_string_pretty(&state).unwrap();
         let back: State = toml::from_str(&text).unwrap();
+        assert_eq!(back.identity_probes["podman:host=unix:///run/user/1000/podman/podman.sock"], probe);
         assert_eq!(back.instances["repo-abc1"].sandbox, "repository-1");
         assert_eq!(back.instances["repo-abc1"].instance_id, "repo-abc1");
         assert_eq!(back.autostart_boot["abc12345"], "3f2c-boot");
@@ -488,6 +495,14 @@ mod tests {
         assert!(!text.contains("autostart_boot"), "{text}");
         let back: State = toml::from_str(&text).unwrap();
         assert!(back.autostart_boot.is_empty());
+    }
+
+    #[test]
+    fn empty_identity_probes_is_omitted() {
+        let text = toml::to_string_pretty(&State::default()).unwrap();
+        assert!(!text.contains("identity_probes"), "{text}");
+        let back: State = toml::from_str(&text).unwrap();
+        assert!(back.identity_probes.is_empty());
     }
 
     #[test]

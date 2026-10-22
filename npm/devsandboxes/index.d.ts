@@ -921,6 +921,8 @@ export interface RunParams extends VerbParams {
   base?: string | null;
   /** The run record arrives on `stdout` (and in a detached answer's `record`). */
   json?: boolean;
+  /** Probe the runtime's user-namespace mode again instead of using the cached result (`--reprobe`). */
+  reprobe?: boolean;
   /** Answer once the instance is registered. */
   detach?: boolean;
   /**
@@ -937,6 +939,8 @@ export interface RebuildParams extends VerbParams {
   instance?: string | null;
   all?: boolean;
   force?: boolean;
+  /** As {@link RunParams.reprobe}. */
+  reprobe?: boolean;
   detach?: boolean;
   /** As {@link RunParams.tty}. */
   tty?: TtySize | null;

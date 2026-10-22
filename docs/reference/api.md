@@ -634,12 +634,16 @@ and `HOME` are the caller's, never the daemon's.
 
 | method | params (besides `root`, `env`) |
 |---|---|
-| `run` | `sandbox`, `name?`, `branch?`, `base?`, `json?`, `detach?`, `tty?` |
-| `rebuild` | `instance` \| `all: true`, `force?`, `detach?`, `tty?` |
+| `run` | `sandbox`, `name?`, `branch?`, `base?`, `json?`, `reprobe?`, `detach?`, `tty?` |
+| `rebuild` | `instance` \| `all: true`, `force?`, `reprobe?`, `detach?`, `tty?` |
 | `start` | `instance` \| `all: true`, `detach?`, `tty?` |
 | `stop` | `instance` \| `all: true`, `detach?` |
 | `rm` | `instance`, `deleteBranch?` (`true` deletes, `false` keeps, absent: merged or gone branches go, local work stays), `force?`, `ask?`, `detach?` |
 | `services.rebuild` | `name` (a service of the config root), `detach?` |
+
+`reprobe` is the CLI's `--reprobe`: the runtime's identity mode is probed
+again on the daemon's host instead of read from its cache
+([runtimes](../architecture/runtimes.md#mode-detection)).
 
 `services.rebuild` runs `devsandbox service rebuild <name>`: no instance
 verb, so its answer's (and `failed`'s) `instance` is always `null`, no

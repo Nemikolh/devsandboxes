@@ -671,11 +671,31 @@ fn verb_call(
     let (method, params) = match action.clone() {
         PromptAction::Run { sandbox, name, branch, base } => (
             "run",
-            serde_json::to_value(RunParams { root, env, sandbox, name, branch, base, json: false, detach: true, tty }),
+            serde_json::to_value(RunParams {
+                root,
+                env,
+                sandbox,
+                name,
+                branch,
+                base,
+                json: false,
+                reprobe: false,
+                detach: true,
+                tty,
+            }),
         ),
         PromptAction::Rebuild { instance, force } => (
             "rebuild",
-            serde_json::to_value(RebuildParams { root, env, instance: Some(instance), all: false, force, detach: true, tty }),
+            serde_json::to_value(RebuildParams {
+                root,
+                env,
+                instance: Some(instance),
+                all: false,
+                force,
+                reprobe: false,
+                detach: true,
+                tty,
+            }),
         ),
         PromptAction::Start { instance } => (
             "start",
@@ -1009,12 +1029,13 @@ mod tests {
                 name: Some("w2".into()),
                 branch: Some("feat/x".into()),
                 base: Some("-odd".into()),
-                json: false
+                json: false,
+                reprobe: false
             }
         );
         assert_eq!(
             parse(&PromptAction::Rebuild { instance: "web-2".into(), force: true }, true),
-            Verb::Rebuild { target: Target::One("web-2".into()), force: true }
+            Verb::Rebuild { target: Target::One("web-2".into()), force: true, reprobe: false }
         );
         assert_eq!(parse(&PromptAction::Start { instance: "web-2".into() }, true), Verb::Start { target: Target::One("web-2".into()) });
         assert_eq!(parse(&PromptAction::Stop { instance: "web-2".into() }, true), Verb::Stop { target: Target::One("web-2".into()) });

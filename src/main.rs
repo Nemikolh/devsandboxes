@@ -95,6 +95,8 @@ enum Command {
         /// (builds, hooks) goes to stderr so stdout stays parseable
         #[arg(long)]
         json: bool,
+        #[arg(long, help = REPROBE_HELP)]
+        reprobe: bool,
         #[arg(short, long, help = DETACH_HELP)]
         detach: bool,
     },
@@ -111,6 +113,8 @@ enum Command {
         /// behavior changes the drift hashes cannot see)
         #[arg(long)]
         force: bool,
+        #[arg(long, help = REPROBE_HELP)]
+        reprobe: bool,
         #[arg(short, long, help = DETACH_HELP)]
         detach: bool,
     },
@@ -391,6 +395,9 @@ const CONTAINER_NAME_HELP: &str = "Instance name, sandbox config name, repositor
 const DETACH_HELP: &str = "Return once the instance is registered (its name is printed); the build \
      goes on in devsandbox serve. `devsandbox logs --build <name> --follow` follows it";
 
+const REPROBE_HELP: &str = "Probe the runtime's user-namespace mode again (rootful, rootless, VM-backed) \
+     with a throwaway container, instead of the cached result";
+
 #[cfg(unix)]
 #[derive(Subcommand)]
 enum ServeCommand {
@@ -619,7 +626,7 @@ fn main() -> Result<()> {
     match command {
         Command::Ls { json } => commands::ls::ls(&cli.dir, json),
         Command::Ps { all, json } => commands::ps::ps(all, json),
-        Command::Run { sandbox, name, branch, base, env, dispatcher, json, detach } => {
+        Command::Run { sandbox, name, branch, base, env, dispatcher, json, reprobe, detach } => {
             if detach {
                 return Err(detach_refused());
             }
@@ -629,7 +636,7 @@ fn main() -> Result<()> {
             // A CLI process: the build log may tee fds 1/2 (on top of
             // `--json`'s redirect). Autostart's runs below get their own.
             build_log::enable();
-            let extras = commands::run::RunExtras { env, dispatcher };
+            let extras = commands::run::RunExtras { reprobe, env, dispatcher };
             let result = commands::run::run(&cli.dir, sandbox, name, branch, base, extras);
             if let (None, Ok(Some(key))) = (&json_out, &result) {
                 println!("{key}");
@@ -649,12 +656,12 @@ fn main() -> Result<()> {
                 (_, None) => Ok(()),
             }
         }
-        Command::Rebuild { name, all, force, detach } => {
+        Command::Rebuild { name, all, force, reprobe, detach } => {
             if detach {
                 return Err(detach_refused());
             }
             build_log::enable();
-            let result = commands::rebuild::rebuild(&cli.dir, name, all, force);
+            let result = commands::rebuild::rebuild(&cli.dir, name, all, force, reprobe);
             // Like `start`: the rebuilt container is up, and a dispatcher /
             // inbox instance needs a host even with no dashboard open.
             commands::autostart::autostart(&cli.dir);

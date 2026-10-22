@@ -24,7 +24,10 @@ use crate::state::{Instance, Phase, PhaseView, State};
 /// A `failed` instance (docs/architecture/instances/lifecycle.md) is always
 /// rebuilt when named: that's how it's retried. One still being materialized
 /// is refused, and `--all` skips both.
-pub fn rebuild(dir: &Path, name: Option<String>, all: bool, force: bool) -> Result<()> {
+///
+/// `reprobe` re-runs the identity probe (`RunExtras::reprobe`); it doesn't
+/// count as drift.
+pub fn rebuild(dir: &Path, name: Option<String>, all: bool, force: bool, reprobe: bool) -> Result<()> {
     // Ctrl-C/SIGTERM mid-rebuild leaves the instance `failed` ("cancelled").
     let _cancel = run::cancel::catch();
     let mut state = State::load()?;
@@ -53,7 +56,7 @@ pub fn rebuild(dir: &Path, name: Option<String>, all: bool, force: bool) -> Resu
             if !force && !needs_rebuild(dir, &info.container, &sandbox)? {
                 continue;
             }
-            rebuild_instance(dir, &config, &sandbox, &key, &mut state)?;
+            rebuild_instance(dir, &config, &sandbox, &key, reprobe, &mut state)?;
             rebuilt += 1;
         }
         if rebuilt == 0 {
@@ -81,7 +84,7 @@ pub fn rebuild(dir: &Path, name: Option<String>, all: bool, force: bool) -> Resu
         println!("no config drift for `{key}`; nothing to do (--force overrides)");
         return Ok(());
     }
-    rebuild_instance(dir, &config, &sandbox, &key, &mut state)
+    rebuild_instance(dir, &config, &sandbox, &key, reprobe, &mut state)
 }
 
 /// Drift check against the container's recorded config *and* build hashes.
@@ -108,11 +111,12 @@ fn rebuild_instance(
     config: &Config,
     sandbox: &ResolvedSandbox,
     key: &str,
+    reprobe: bool,
     state: &mut State,
 ) -> Result<()> {
     let instance_id = state.instances.get(key).expect("key came from state").instance_id.clone();
     let log = crate::build_log::open(&instance_id);
-    log.outcome(recreate(dir, config, sandbox, key, state))
+    log.outcome(recreate(dir, config, sandbox, key, reprobe, state))
 }
 
 /// [`rebuild_instance`]'s work, inside the build log.
@@ -121,6 +125,7 @@ fn recreate(
     config: &Config,
     sandbox: &ResolvedSandbox,
     key: &str,
+    reprobe: bool,
     state: &mut State,
 ) -> Result<()> {
     // Clone everything materialize needs out of the entry before borrowing
@@ -161,9 +166,9 @@ fn recreate(
         worktree,
         branch,
         branch_created,
-        // No extras: `materialize` keeps the recorded dispatcher and the
-        // recorded `--env`s (`Instance::extra_env`, `effective_extra_env`).
-        &run::RunExtras::default(),
+        // No env or dispatcher: `materialize` keeps the recorded ones
+        // (`Instance::extra_env`, `effective_extra_env`).
+        &run::RunExtras { reprobe, ..Default::default() },
         state,
         &mut tracker,
     );

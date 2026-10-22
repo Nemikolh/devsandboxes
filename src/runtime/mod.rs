@@ -330,6 +330,18 @@ pub trait Backend: Send + Sync {
     /// Delete a named volume. `Ok(false)` when it doesn't exist (already
     /// gone), an error when the runtime refuses (e.g. still in use).
     fn remove_volume(&self, name: &str) -> Result<bool>;
+
+    /// The identity probe's fast path: what the runtime's own metadata says
+    /// about its user-namespace mode (docs/architecture/runtimes.md, *Mode
+    /// detection*). stderr is captured.
+    fn identity_fast_path(&self) -> Result<identity::FastPath>;
+
+    /// The identity probe's canary: from `image` (local, never pulled), with
+    /// host dir `dir` (empty, writable by any uid) bound in, write one file
+    /// as uid 0 and one as uid [`identity::ASSUMED`], then `stat` both on the
+    /// host. `relabel` binds `dir` with `:z` (SELinux). An image without `sh`
+    /// fails it. stderr is captured.
+    fn identity_canary(&self, image: &str, dir: &std::path::Path, relabel: bool) -> Result<identity::Canary>;
 }
 
 /// Whether a runtime's error text means "no such volume" (docker/podman say

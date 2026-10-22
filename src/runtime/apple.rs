@@ -10,7 +10,7 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
 use super::{
-    human_bytes, without_self_ps, Backend, ContainerRow, ProcList, ServiceEndpoint, StatsRow,
+    human_bytes, identity, without_self_ps, Backend, ContainerRow, ProcList, ServiceEndpoint, StatsRow,
     PROC_PS_ARGS,
 };
 
@@ -308,6 +308,15 @@ impl Backend for AppleContainer {
             Err(e) if super::is_missing_volume(&e.to_string()) => Ok(false),
             Err(e) => Err(e),
         }
+    }
+
+    /// Every container is its own VM: nothing to ask.
+    fn identity_fast_path(&self) -> Result<identity::FastPath> {
+        Ok(identity::FastPath { mode: Ok(identity::Mode::VmBacked), selinux: false })
+    }
+
+    fn identity_canary(&self, _image: &str, _dir: &std::path::Path, _relabel: bool) -> Result<identity::Canary> {
+        bail!("no identity canary on Apple `container`: it is always VM-backed")
     }
 }
 

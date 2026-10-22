@@ -4,13 +4,18 @@
 //! the user model is decided here from the probed mode instead of taken
 //! literally: [`classify`] turns the canary's two host-side `stat`s into a
 //! [`Mode`], and [`plan`] maps (mode, [`Identity`], adopted account) to a
-//! [`Plan`]. Pure: no I/O and no `backend()`, so every row is table-tested;
-//! running the canary and applying the plan belong to the callers.
+//! [`Plan`]. The probe's fast path reads the runtime's own metadata
+//! ([`docker_fast_path`], [`podman_fast_path`]) and its cache is keyed by
+//! [`context_key`]. Pure: no I/O and no `backend()`, so every row is
+//! table-tested; running the commands and the canary, and applying the plan,
+//! belong to the callers (docs/architecture/runtimes.md, *Mode detection*).
 
 use serde::{Deserialize, Serialize};
 
 /// The user-namespace situation of a runtime context, as the probe found it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Serialized as [`Mode::as_str`] (the probe cache in `state.toml`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Mode {
     /// uid 0 inside is host root, uid 1000 inside is host 1000.
     Rootful,
@@ -21,6 +26,7 @@ pub enum Mode {
     RootlessPodman,
     /// A VM's file share translates ownership (Docker Desktop, OrbStack,
     /// colima, podman machine, Apple `container`).
+    #[serde(rename = "vm")]
     VmBacked,
 }
 
@@ -51,8 +57,8 @@ impl Mode {
     }
 }
 
-/// A probe's result for one runtime context.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A probe's result for one runtime context (cached in `state.toml`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Probe {
     pub mode: Mode,
     /// SELinux is enforcing: binds need relabeling or every access is EACCES.
@@ -127,6 +133,203 @@ pub fn classify(host: Ids, as_root: Ids, as_1000: Ids, engine: Engine) -> Option
     } else {
         None
     }
+}
+
+/// The canary's two host-side `stat`s: the owners of the files written inside
+/// as uid 0 and as uid [`ASSUMED`] (fed to [`classify`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Canary {
+    pub as_root: Ids,
+    pub as_1000: Ids,
+}
+
+/// What the runtime's own metadata says (the probe's fast path).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FastPath {
+    /// The mode, or why the metadata can't tell (the canary decides).
+    pub mode: Result<Mode, &'static str>,
+    /// The engine labels containers for SELinux: binds need relabeling. The
+    /// canary doesn't test this, so it holds even when `mode` is ambiguous.
+    pub selinux: bool,
+}
+
+/// The fields of `docker info --format '{{json .}}'` the fast path reads.
+#[derive(Debug, Deserialize)]
+struct DockerInfo {
+    #[serde(rename = "SecurityOptions", default)]
+    security_options: Option<Vec<String>>,
+    #[serde(rename = "OperatingSystem", default)]
+    operating_system: String,
+    /// The engine host's hostname: `colima`, `lima-rancher-desktop`, …
+    #[serde(rename = "Name", default)]
+    name: String,
+    /// Only in newer CLIs' output.
+    #[serde(rename = "ClientInfo", default)]
+    client_info: Option<DockerClientInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DockerClientInfo {
+    #[serde(rename = "Context", default)]
+    context: String,
+}
+
+/// `OperatingSystem` values of VM-backed engines.
+const VM_OPERATING_SYSTEMS: [&str; 3] = ["Docker Desktop", "OrbStack", "Rancher Desktop"];
+/// Engine hostnames (`Name`) and context names of VM-backed engines, exact or
+/// as a `<marker>-` prefix (`colima-work`, `lima-rancher-desktop`).
+const VM_NAMES: [&str; 6] = ["colima", "lima", "orbstack", "docker-desktop", "desktop-linux", "rancher-desktop"];
+/// Socket paths of VM-backed engines, as found in `DOCKER_HOST`.
+const VM_SOCKET_DIRS: [&str; 6] = ["/.colima/", "/.lima/", "/.rd/", "/.orbstack/", "/.docker/desktop/", "/.docker/run/"];
+
+fn vm_name(name: &str) -> bool {
+    VM_NAMES.iter().any(|m| name == *m || name.strip_prefix(m).is_some_and(|rest| rest.starts_with('-')))
+}
+
+/// An endpoint on another host: binds name that host's paths, so neither the
+/// metadata nor this host's view of a bind says anything. Left to the canary,
+/// which then fails (its files never show up here).
+fn remote_endpoint(endpoint: Option<&str>) -> bool {
+    endpoint.is_some_and(|e| e.starts_with("tcp://") || e.starts_with("ssh://"))
+}
+
+/// The fast path over `docker info --format '{{json .}}'`. `endpoint` is
+/// `DOCKER_HOST` when set; `linux_host` whether devsandbox runs on Linux
+/// (anywhere else a local engine is in a VM). In order:
+/// - a remote endpoint (`tcp://`, `ssh://`): ambiguous;
+/// - not Linux, or a VM marker (`OperatingSystem` Docker Desktop / OrbStack /
+///   Rancher Desktop, a colima/lima/… hostname or context, a VM's socket
+///   path): `VmBacked`;
+/// - `name=rootless` in `SecurityOptions`: `RootlessDocker`;
+/// - `name=userns` (a `userns-remap` daemon: root is a subuid, uid 1000
+///   another): ambiguous;
+/// - otherwise `Rootful`: a local daemon with no user namespace.
+///
+/// `selinux` is `name=selinux` (the daemon's `selinux-enabled`; without it
+/// docker doesn't label containers and binds need no relabel).
+pub fn docker_fast_path(info: &str, endpoint: Option<&str>, linux_host: bool) -> anyhow::Result<FastPath> {
+    let info: DockerInfo = serde_json::from_str(info.trim())
+        .map_err(|e| anyhow::anyhow!("unexpected `docker info` output: {e}"))?;
+    let options: Vec<&str> = info
+        .security_options
+        .iter()
+        .flatten()
+        .filter_map(|o| o.split(',').find_map(|kv| kv.strip_prefix("name=")))
+        .collect();
+    let has = |name: &str| options.contains(&name);
+    let context = info.client_info.as_ref().map_or("", |c| c.context.as_str());
+    let vm = !linux_host
+        || VM_OPERATING_SYSTEMS.iter().any(|os| info.operating_system.contains(os))
+        || vm_name(&info.name)
+        || vm_name(context)
+        || endpoint.is_some_and(|e| VM_SOCKET_DIRS.iter().any(|d| e.contains(d)));
+    let mode = if remote_endpoint(endpoint) {
+        Err("DOCKER_HOST is a remote engine")
+    } else if vm {
+        Ok(Mode::VmBacked)
+    } else if has("rootless") {
+        Ok(Mode::RootlessDocker)
+    } else if has("userns") {
+        Err("the docker daemon remaps users (userns-remap)")
+    } else {
+        Ok(Mode::Rootful)
+    };
+    Ok(FastPath { mode, selinux: has("selinux") })
+}
+
+/// The fields of `podman info --format json` the fast path reads (podman's
+/// own lowerCamel keys under `host`).
+#[derive(Debug, Deserialize)]
+struct PodmanInfo {
+    host: PodmanHost,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PodmanHost {
+    #[serde(default)]
+    security: PodmanSecurity,
+    /// The client talks to a podman service elsewhere (podman machine, a
+    /// connection, `--remote`).
+    #[serde(default)]
+    service_is_remote: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PodmanSecurity {
+    #[serde(default)]
+    rootless: bool,
+    #[serde(default)]
+    selinux_enabled: bool,
+}
+
+/// The fast path over `podman info --format json`. `endpoint` is
+/// `CONTAINER_HOST` when set. Podman's metadata is never ambiguous:
+/// - not Linux, or a remote service not on a local `unix://` socket (a
+///   podman machine's `ssh://` connection, by name or by URL): `VmBacked`;
+/// - `host.security.rootless`: `RootlessPodman`;
+/// - otherwise `Rootful`.
+///
+/// `selinux` is `host.security.selinuxEnabled`: podman labels containers
+/// whenever the engine host has SELinux on.
+pub fn podman_fast_path(info: &str, endpoint: Option<&str>, linux_host: bool) -> anyhow::Result<FastPath> {
+    let info: PodmanInfo = serde_json::from_str(info.trim())
+        .map_err(|e| anyhow::anyhow!("unexpected `podman info` output: {e}"))?;
+    let host = info.host;
+    let local_socket = endpoint.is_some_and(|e| e.starts_with("unix://"));
+    let mode = if !linux_host || (host.service_is_remote && !local_socket) {
+        Mode::VmBacked
+    } else if host.security.rootless {
+        Mode::RootlessPodman
+    } else {
+        Mode::Rootful
+    };
+    Ok(FastPath { mode: Ok(mode), selinux: host.security.selinux_enabled })
+}
+
+/// The probe cache's key: the backend plus the runtime context it talks to,
+/// as the runtime's own CLI resolves it, so pointing the CLI elsewhere is a
+/// fresh probe. Never the machine that asked (a machine probes for itself).
+/// - docker: `docker:host=<DOCKER_HOST>`, else
+///   `docker:context=<DOCKER_CONTEXT>`, else the CLI config's
+///   `currentContext` (`current_context`, read lazily), else
+///   `docker:context=default` (docker's own order: `DOCKER_HOST` wins);
+/// - podman: `podman:host=<CONTAINER_HOST>`, else
+///   `podman:connection=<CONTAINER_CONNECTION>`, else `podman:default`;
+/// - anything else: the backend name.
+///
+/// `env` returns non-empty values only.
+pub fn context_key(
+    backend: &str,
+    env: impl Fn(&str) -> Option<String>,
+    current_context: impl FnOnce() -> Option<String>,
+) -> String {
+    match backend {
+        "docker" => match (env("DOCKER_HOST"), env("DOCKER_CONTEXT")) {
+            (Some(host), _) => format!("docker:host={host}"),
+            (None, Some(context)) => format!("docker:context={context}"),
+            (None, None) => format!("docker:context={}", current_context().unwrap_or_else(|| "default".into())),
+        },
+        "podman" => match (env("CONTAINER_HOST"), env("CONTAINER_CONNECTION")) {
+            (Some(host), _) => format!("podman:host={host}"),
+            (None, Some(connection)) => format!("podman:connection={connection}"),
+            (None, None) => "podman:default".into(),
+        },
+        other => other.into(),
+    }
+}
+
+/// `currentContext` of the docker CLI's `config.json`; `None` when unset,
+/// empty or unreadable.
+pub fn docker_current_context(config_json: &str) -> Option<String> {
+    #[derive(Deserialize)]
+    struct DockerConfig {
+        #[serde(rename = "currentContext", default)]
+        current_context: Option<String>,
+    }
+    let config: DockerConfig = serde_json::from_str(config_json).ok()?;
+    config.current_context.filter(|c| !c.is_empty())
 }
 
 /// The devcontainer user fields a plan starts from. The image's `USER` is the
@@ -545,6 +748,120 @@ mod tests {
         }
         assert_eq!(Plan::parse_label("mode=rootful;identity=host;exec=a%zz"), None);
         assert_eq!(Plan::parse_label("mode=rootful;identity=host;remap=u:x:1"), None);
+    }
+
+    // `docker info --format '{{json .}}'` captures, trimmed to the fields
+    // around the ones read (the real output carries ~60 more).
+    const DOCKER_ROOTFUL: &str = r#"{"ID":"0c5d6d2e-7b1f-4f0e-9a43-2c1b8e1d9f10","Containers":3,"ContainersRunning":1,"Images":12,"Driver":"overlay2","CgroupDriver":"systemd","CgroupVersion":"2","KernelVersion":"6.8.0-45-generic","OperatingSystem":"Ubuntu 24.04.1 LTS","OSVersion":"24.04","OSType":"linux","Architecture":"x86_64","NCPU":8,"MemTotal":33363566592,"DockerRootDir":"/var/lib/docker","Name":"build-01","ServerVersion":"27.3.1","SecurityOptions":["name=apparmor","name=seccomp,profile=builtin","name=cgroupns"],"Warnings":null,"ClientInfo":{"Debug":false,"Version":"27.3.1","GitCommit":"ce12230","GoVersion":"go1.22.7","Os":"linux","Arch":"amd64","BuildTime":"Fri Sep 20 11:41:00 2024","Context":"default","Plugins":[],"Warnings":null}}"#;
+    const DOCKER_ROOTLESS: &str = r#"{"ID":"8f1e2a3b-1c4d-4e5f-8a9b-0c1d2e3f4a5b","Containers":0,"Driver":"overlay2","CgroupDriver":"systemd","CgroupVersion":"2","OperatingSystem":"Ubuntu 24.04.1 LTS","OSType":"linux","Architecture":"x86_64","DockerRootDir":"/home/dev/.local/share/docker","Name":"build-01","ServerVersion":"27.3.1","SecurityOptions":["name=seccomp,profile=builtin","name=rootless","name=cgroupns"],"Warnings":["WARNING: No cpu cfs quota support"],"ClientInfo":{"Debug":false,"Version":"27.3.1","Os":"linux","Arch":"amd64","Context":"rootless","Plugins":[],"Warnings":null}}"#;
+    const DOCKER_USERNS_REMAP: &str = r#"{"ID":"5a6b7c8d-9e0f-4a1b-8c2d-3e4f5a6b7c8d","Driver":"overlay2","OperatingSystem":"Debian GNU/Linux 12 (bookworm)","OSType":"linux","DockerRootDir":"/var/lib/docker/231072.231072","Name":"ci-runner","ServerVersion":"26.1.4","SecurityOptions":["name=apparmor","name=seccomp,profile=builtin","name=userns","name=cgroupns"],"ClientInfo":{"Context":"default"}}"#;
+    const DOCKER_SELINUX: &str = r#"{"ID":"1b2c3d4e-5f6a-4b7c-8d9e-0f1a2b3c4d5e","Driver":"overlay2","OperatingSystem":"Fedora Linux 40 (Workstation Edition)","OSType":"linux","DockerRootDir":"/var/lib/docker","Name":"fedora","ServerVersion":"27.1.1","SecurityOptions":["name=seccomp,profile=builtin","name=selinux","name=cgroupns"],"ClientInfo":{"Context":"default"}}"#;
+    const DOCKER_DESKTOP: &str = r#"{"ID":"c0ffee00-1111-4222-8333-444455556666","Driver":"overlayfs","KernelVersion":"6.10.14-linuxkit","OperatingSystem":"Docker Desktop","OSType":"linux","Architecture":"aarch64","DockerRootDir":"/var/lib/docker","Name":"docker-desktop","ServerVersion":"27.3.1","SecurityOptions":["name=seccomp,profile=unconfined","name=cgroupns"],"ClientInfo":{"Version":"27.3.1","Os":"darwin","Arch":"arm64","Context":"desktop-linux"}}"#;
+    const DOCKER_ORBSTACK: &str = r#"{"ID":"2d3e4f5a-6b7c-4d8e-9f0a-1b2c3d4e5f6a","Driver":"overlay2","KernelVersion":"6.11.9-orbstack-00279-g5a4d8b3c5d1b","OperatingSystem":"OrbStack","OSType":"linux","Architecture":"aarch64","DockerRootDir":"/var/lib/docker","Name":"orbstack","ServerVersion":"27.3.1","SecurityOptions":["name=seccomp,profile=builtin","name=cgroupns"],"ClientInfo":{"Os":"darwin","Context":"orbstack"}}"#;
+    const DOCKER_COLIMA: &str = r#"{"ID":"3e4f5a6b-7c8d-4e9f-8a0b-1c2d3e4f5a6b","Driver":"overlay2","OperatingSystem":"Ubuntu 24.04 LTS","OSType":"linux","DockerRootDir":"/var/lib/docker","Name":"colima","ServerVersion":"27.4.0","SecurityOptions":["name=apparmor","name=seccomp,profile=builtin","name=cgroupns"],"ClientInfo":{"Os":"linux","Context":"colima"}}"#;
+    /// An older CLI: no `ClientInfo`, `SecurityOptions` null.
+    const DOCKER_OLD: &str = r#"{"ID":"ABCD:EFGH","Driver":"overlay2","OperatingSystem":"CentOS Linux 7 (Core)","OSType":"linux","Name":"legacy","ServerVersion":"20.10.24","SecurityOptions":null}"#;
+
+    // `podman info --format json` captures, trimmed the same way.
+    const PODMAN_ROOTLESS: &str = r#"{"host":{"arch":"amd64","buildahVersion":"1.33.7","cgroupManager":"systemd","cgroupVersion":"v2","distribution":{"distribution":"ubuntu","version":"24.04","codename":"noble"},"hostname":"build-01","idMappings":{"gidmap":[{"container_id":0,"host_id":1000,"size":1},{"container_id":1,"host_id":100000,"size":65536}],"uidmap":[{"container_id":0,"host_id":1000,"size":1},{"container_id":1,"host_id":100000,"size":65536}]},"kernel":"6.8.0-45-generic","os":"linux","remoteSocket":{"exists":false,"path":"/run/user/1000/podman/podman.sock"},"security":{"apparmorEnabled":false,"capabilities":"CAP_CHOWN,CAP_DAC_OVERRIDE,CAP_FOWNER,CAP_FSETID,CAP_KILL,CAP_NET_BIND_SERVICE,CAP_SETFCAP,CAP_SETGID,CAP_SETPCAP,CAP_SETUID,CAP_SYS_CHROOT","rootless":true,"seccompEnabled":true,"seccompProfilePath":"/usr/share/containers/seccomp.json","selinuxEnabled":false},"serviceIsRemote":false},"store":{"graphDriverName":"overlay","graphRoot":"/home/dev/.local/share/containers/storage"},"registries":{},"plugins":{"log":["k8s-file","none","passthrough","journald"]},"version":{"APIVersion":"4.9.3","Version":"4.9.3","GoVersion":"go1.22.2","GitCommit":"","BuiltTime":"Thu Jan  1 00:00:00 1970","Built":0,"OsArch":"linux/amd64","Os":"linux"}}"#;
+    const PODMAN_ROOTFUL_SELINUX: &str = r#"{"host":{"arch":"amd64","cgroupVersion":"v2","distribution":{"distribution":"fedora","variant":"workstation","version":"40"},"hostname":"fedora","idMappings":{"gidmap":null,"uidmap":null},"os":"linux","remoteSocket":{"exists":true,"path":"/run/podman/podman.sock"},"security":{"apparmorEnabled":false,"rootless":false,"seccompEnabled":true,"seccompProfilePath":"/usr/share/containers/seccomp.json","selinuxEnabled":true},"serviceIsRemote":false},"store":{"graphRoot":"/var/lib/containers/storage"},"version":{"APIVersion":"5.2.3","Version":"5.2.3","OsArch":"linux/amd64","Os":"linux"}}"#;
+    /// macOS client talking to a podman machine (Fedora CoreOS in the VM).
+    const PODMAN_MACHINE: &str = r#"{"host":{"arch":"arm64","cgroupVersion":"v2","distribution":{"distribution":"fedora","variant":"coreos","version":"40"},"hostname":"localhost.localdomain","os":"linux","remoteSocket":{"exists":true,"path":"/run/user/501/podman/podman.sock"},"security":{"apparmorEnabled":false,"rootless":true,"seccompEnabled":true,"selinuxEnabled":true},"serviceIsRemote":true},"store":{"graphRoot":"/var/home/core/.local/share/containers/storage"},"version":{"APIVersion":"5.2.3","Version":"5.2.3","OsArch":"linux/arm64","Os":"linux"}}"#;
+
+    fn known(mode: Mode, selinux: bool) -> FastPath {
+        FastPath { mode: Ok(mode), selinux }
+    }
+
+    #[test]
+    fn docker_fast_path_per_host() {
+        let fp = |info, endpoint, linux| docker_fast_path(info, endpoint, linux).unwrap();
+        assert_eq!(fp(DOCKER_ROOTFUL, None, true), known(Mode::Rootful, false));
+        assert_eq!(fp(DOCKER_OLD, None, true), known(Mode::Rootful, false));
+        assert_eq!(fp(DOCKER_ROOTLESS, Some("unix:///run/user/1000/docker.sock"), true), known(Mode::RootlessDocker, false));
+        assert_eq!(fp(DOCKER_SELINUX, None, true), known(Mode::Rootful, true));
+        let remap = fp(DOCKER_USERNS_REMAP, None, true);
+        assert!(remap.mode.is_err(), "{remap:?}");
+        // VM markers, on a Linux host (Docker Desktop for Linux) or not.
+        for info in [DOCKER_DESKTOP, DOCKER_ORBSTACK, DOCKER_COLIMA] {
+            assert_eq!(fp(info, None, true), known(Mode::VmBacked, false), "{info}");
+            assert_eq!(fp(info, None, false), known(Mode::VmBacked, false), "{info}");
+        }
+        // Off Linux any local engine is in a VM, rootless or remapped included.
+        assert_eq!(fp(DOCKER_ROOTFUL, None, false), known(Mode::VmBacked, false));
+        assert_eq!(fp(DOCKER_USERNS_REMAP, None, false), known(Mode::VmBacked, false));
+        // A VM's socket in DOCKER_HOST, whatever the engine reports.
+        let colima_sock = Some("unix:///home/dev/.colima/default/docker.sock");
+        assert_eq!(fp(DOCKER_ROOTFUL, colima_sock, true), known(Mode::VmBacked, false));
+        // A remote engine: ambiguous, even off Linux.
+        for host in ["tcp://10.0.0.5:2376", "ssh://me@box"] {
+            assert!(fp(DOCKER_ROOTFUL, Some(host), true).mode.is_err(), "{host}");
+            assert!(fp(DOCKER_DESKTOP, Some(host), false).mode.is_err(), "{host}");
+        }
+        assert!(docker_fast_path("Cannot connect to the Docker daemon", None, true).is_err());
+    }
+
+    #[test]
+    fn vm_names_match_whole_or_dash_prefixed() {
+        for name in ["colima", "colima-work", "lima-rancher-desktop", "orbstack", "desktop-linux"] {
+            assert!(vm_name(name), "{name}");
+        }
+        for name in ["", "default", "colimax", "limado", "build-01", "rootless"] {
+            assert!(!vm_name(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn podman_fast_path_per_host() {
+        let fp = |info, endpoint, linux| podman_fast_path(info, endpoint, linux).unwrap();
+        assert_eq!(fp(PODMAN_ROOTLESS, None, true), known(Mode::RootlessPodman, false));
+        assert_eq!(fp(PODMAN_ROOTFUL_SELINUX, None, true), known(Mode::Rootful, true));
+        assert_eq!(fp(PODMAN_MACHINE, None, false), known(Mode::VmBacked, true));
+        // A remote service on Linux: a machine's ssh connection is a VM, a
+        // local socket is the engine's own mode.
+        assert_eq!(fp(PODMAN_MACHINE, Some("ssh://core@127.0.0.1:50123/run/user/501/podman/podman.sock"), true), known(Mode::VmBacked, true));
+        assert_eq!(fp(PODMAN_MACHINE, None, true), known(Mode::VmBacked, true));
+        assert_eq!(fp(PODMAN_MACHINE, Some("unix:///run/user/1000/podman/podman.sock"), true), known(Mode::RootlessPodman, true));
+        assert_eq!(fp(PODMAN_ROOTLESS, None, false), known(Mode::VmBacked, false));
+        assert!(podman_fast_path("{}", None, true).is_err());
+    }
+
+    #[test]
+    fn context_keys() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| pairs.iter().find(|(key, _)| *key == k).map(|(_, v)| v.to_string())
+        };
+        let never = || -> Option<String> { panic!("config read with the env set") };
+        let host = &[("DOCKER_HOST", "unix:///run/user/1000/docker.sock"), ("DOCKER_CONTEXT", "x")];
+        assert_eq!(context_key("docker", env(host), never), "docker:host=unix:///run/user/1000/docker.sock");
+        assert_eq!(context_key("docker", env(&[("DOCKER_CONTEXT", "colima")]), never), "docker:context=colima");
+        assert_eq!(context_key("docker", env(&[]), || Some("orbstack".into())), "docker:context=orbstack");
+        assert_eq!(context_key("docker", env(&[]), || None), "docker:context=default");
+        let podman = &[("CONTAINER_HOST", "ssh://core@127.0.0.1:50123/run/podman.sock"), ("CONTAINER_CONNECTION", "m")];
+        assert_eq!(context_key("podman", env(podman), never), "podman:host=ssh://core@127.0.0.1:50123/run/podman.sock");
+        assert_eq!(context_key("podman", env(&[("CONTAINER_CONNECTION", "podman-machine-default")]), never), "podman:connection=podman-machine-default");
+        // Docker's variables mean nothing to podman, and the reverse.
+        assert_eq!(context_key("podman", env(&[("DOCKER_HOST", "tcp://x")]), never), "podman:default");
+        assert_eq!(context_key("docker", env(&[("CONTAINER_HOST", "unix:///x")]), || None), "docker:context=default");
+        assert_eq!(context_key("container", env(host), never), "container");
+    }
+
+    #[test]
+    fn docker_current_context_from_config() {
+        let config = r#"{"auths":{"ghcr.io":{}},"credsStore":"osxkeychain","currentContext":"orbstack"}"#;
+        assert_eq!(docker_current_context(config).as_deref(), Some("orbstack"));
+        assert_eq!(docker_current_context(r#"{"auths":{}}"#), None);
+        assert_eq!(docker_current_context(r#"{"currentContext":""}"#), None);
+        assert_eq!(docker_current_context("not json"), None);
+    }
+
+    #[test]
+    fn probe_serde_round_trips() {
+        for mode in MODES {
+            let p = Probe { mode, selinux: true };
+            let text = toml::to_string(&p).unwrap();
+            assert!(text.contains(&format!("mode = \"{}\"", mode.as_str())), "{text}");
+            assert_eq!(toml::from_str::<Probe>(&text).unwrap(), p);
+        }
     }
 
     #[test]

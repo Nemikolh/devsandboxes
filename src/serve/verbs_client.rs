@@ -49,8 +49,16 @@ const SETTLE_POLL: Duration = Duration::from_millis(500);
 /// A verb the CLI was given, before its prompts. A `None` target is `--all`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CliVerb {
-    Run { sandbox: Option<String>, name: Option<String>, branch: Option<String>, base: Option<String>, json: bool, detach: bool },
-    Rebuild { target: Option<String>, force: bool, detach: bool },
+    Run {
+        sandbox: Option<String>,
+        name: Option<String>,
+        branch: Option<String>,
+        base: Option<String>,
+        json: bool,
+        reprobe: bool,
+        detach: bool,
+    },
+    Rebuild { target: Option<String>, force: bool, reprobe: bool, detach: bool },
     Start { target: Option<String>, detach: bool },
     Stop { target: Option<String> },
     Rm { name: String, delete_branch: Option<bool>, force: bool },
@@ -92,16 +100,17 @@ impl CliVerb {
 pub(crate) fn from_command(command: &Command) -> Option<CliVerb> {
     Some(match command {
         Command::Run { env, dispatcher, .. } if !env.is_empty() || dispatcher.is_some() => return None,
-        Command::Run { sandbox, name, branch, base, json, detach, .. } => CliVerb::Run {
+        Command::Run { sandbox, name, branch, base, json, reprobe, detach, .. } => CliVerb::Run {
             sandbox: sandbox.clone(),
             name: name.clone(),
             branch: branch.clone(),
             base: base.clone(),
             json: *json,
+            reprobe: *reprobe,
             detach: *detach,
         },
-        Command::Rebuild { name, force, detach, .. } => {
-            CliVerb::Rebuild { target: name.clone(), force: *force, detach: *detach }
+        Command::Rebuild { name, force, reprobe, detach, .. } => {
+            CliVerb::Rebuild { target: name.clone(), force: *force, reprobe: *reprobe, detach: *detach }
         }
         Command::Start { name, detach, .. } => CliVerb::Start { target: name.clone(), detach: *detach },
         Command::Stop { name, .. } => CliVerb::Stop { target: name.clone() },
@@ -361,7 +370,7 @@ fn prepare(
         banner: None,
     };
     let prepared = match verb.clone() {
-        CliVerb::Run { sandbox, name, branch, base, json, detach } => {
+        CliVerb::Run { sandbox, name, branch, base, json, reprobe, detach } => {
             let Some(target) = run_target(sandbox, &root, fed, call, ui, json)? else {
                 return Ok(Prep::Exit(0));
             };
@@ -370,26 +379,47 @@ fn prepare(
                 Err(old) => return Ok(Prep::Old(old)),
             };
             let tty = if json { None } else { ui.term };
-            let p = RunParams { root: target.root.clone(), env, sandbox: target.name.clone(), name, branch, base, json, detach, tty };
+            let p = RunParams {
+                root: target.root.clone(),
+                env,
+                sandbox: target.name.clone(),
+                name,
+                branch,
+                base,
+                json,
+                reprobe,
+                detach,
+                tty,
+            };
             // `run` names no instance before it runs: `progress` does.
             Prepared { instance: None, ..one("run", serde_json::to_value(p)?, Some(&target)) }
         }
-        CliVerb::Rebuild { target, force, detach } => match target {
+        CliVerb::Rebuild { target, force, reprobe, detach } => match target {
             Some(name) => {
                 let t = resolved!(&name);
-                let p = RebuildParams { root: t.root.clone(), env, instance: Some(t.name.clone()), all: false, force, detach, tty: ui.term };
+                let p = RebuildParams {
+                    root: t.root.clone(),
+                    env,
+                    instance: Some(t.name.clone()),
+                    all: false,
+                    force,
+                    reprobe,
+                    detach,
+                    tty: ui.term,
+                };
                 one("rebuild", serde_json::to_value(p)?, Some(&t))
             }
             None => match machine_roots(call)? {
                 None => {
-                    let p = RebuildParams { root, env, instance: None, all: true, force, detach, tty: ui.term };
+                    let p = RebuildParams { root, env, instance: None, all: true, force, reprobe, detach, tty: ui.term };
                     one("rebuild", serde_json::to_value(p)?, None)
                 }
                 Some((m, roots)) => {
                     let mut each = Vec::new();
                     for root in roots {
                         let banner = super::machines::cli::banner(&m, &root);
-                        let p = RebuildParams { root, env: env.clone(), instance: None, all: true, force, detach, tty: ui.term };
+                        let p =
+                            RebuildParams { root, env: env.clone(), instance: None, all: true, force, reprobe, detach, tty: ui.term };
                         each.push(on_machine("rebuild", serde_json::to_value(p)?, &m, banner));
                     }
                     return Ok(Prep::Each(each));
@@ -1010,22 +1040,24 @@ mod tests {
     #[test]
     fn verbs_from_the_parsed_cli() {
         assert_eq!(
-            verb(&["run", "web", "--name", "w2", "--branch", "b", "--base", "origin/x", "--json", "-d"]),
+            verb(&["run", "web", "--name", "w2", "--branch", "b", "--base", "origin/x", "--json", "--reprobe", "-d"]),
             Some(CliVerb::Run {
                 sandbox: Some("web".into()),
                 name: Some("w2".into()),
                 branch: Some("b".into()),
                 base: Some("origin/x".into()),
                 json: true,
+                reprobe: true,
                 detach: true,
             })
         );
         assert_eq!(
             verb(&["run"]),
-            Some(CliVerb::Run { sandbox: None, name: None, branch: None, base: None, json: false, detach: false })
+            Some(CliVerb::Run { sandbox: None, name: None, branch: None, base: None, json: false, reprobe: false, detach: false })
         );
-        assert_eq!(verb(&["rebuild", "w", "--force"]), Some(CliVerb::Rebuild { target: Some("w".into()), force: true, detach: false }));
-        assert_eq!(verb(&["recreate", "--all", "--detach"]), Some(CliVerb::Rebuild { target: None, force: false, detach: true }));
+        assert_eq!(verb(&["rebuild", "w", "--force"]), Some(CliVerb::Rebuild { target: Some("w".into()), force: true, reprobe: false, detach: false }));
+        assert_eq!(verb(&["recreate", "--all", "--detach"]), Some(CliVerb::Rebuild { target: None, force: false, reprobe: false, detach: true }));
+        assert_eq!(verb(&["rebuild", "w", "--reprobe"]), Some(CliVerb::Rebuild { target: Some("w".into()), force: false, reprobe: true, detach: false }));
         assert_eq!(verb(&["start", "-d", "w"]), Some(CliVerb::Start { target: Some("w".into()), detach: true }));
         assert_eq!(verb(&["stop", "--all"]), Some(CliVerb::Stop { target: None }));
         assert_eq!(verb(&["rm", "w"]), Some(CliVerb::Rm { name: "w".into(), delete_branch: None, force: false }));
@@ -1215,7 +1247,7 @@ mod tests {
         assert!(matches!(prep(&stop, true, &old, 0).0.unwrap(), Prep::Old(_)));
 
         // `--all` resolves nothing.
-        let (p, calls, _) = prep(&CliVerb::Rebuild { target: None, force: true, detach: true }, true, &[], 0);
+        let (p, calls, _) = prep(&CliVerb::Rebuild { target: None, force: true, reprobe: false, detach: true }, true, &[], 0);
         assert!(calls.is_empty());
         let p = sent(p);
         assert_eq!(p.instance, None);
@@ -1251,6 +1283,7 @@ mod tests {
             branch: None,
             base: None,
             json,
+            reprobe: false,
             detach: false,
         };
         let two = [("sandboxes.list", ok(json!([{"name": "api"}, {"name": "web"}])))];
@@ -1276,8 +1309,8 @@ mod tests {
     /// (its stdout is the record) and not off a terminal.
     #[test]
     fn build_verbs_send_the_terminal_size() {
-        let run = |json| CliVerb::Run { sandbox: Some("web".into()), name: None, branch: None, base: None, json, detach: false };
-        let rebuild = CliVerb::Rebuild { target: None, force: false, detach: false };
+        let run = |json| CliVerb::Run { sandbox: Some("web".into()), name: None, branch: None, base: None, json, reprobe: false, detach: false };
+        let rebuild = CliVerb::Rebuild { target: None, force: false, reprobe: false, detach: false };
         let start = CliVerb::Start { target: None, detach: true };
         let list = [("sandboxes.list", ok(json!([{"name": "web"}])))];
         let size = json!({"cols": 100, "rows": 30});
@@ -1337,7 +1370,7 @@ mod tests {
     }
 
     fn run_of(sandbox: Option<&str>) -> CliVerb {
-        CliVerb::Run { sandbox: sandbox.map(str::to_string), name: None, branch: None, base: None, json: false, detach: false }
+        CliVerb::Run { sandbox: sandbox.map(str::to_string), name: None, branch: None, base: None, json: false, reprobe: false, detach: false }
     }
 
     fn row(name: &str, machine: Option<&str>, root: &str) -> SandboxEntry {
@@ -1449,7 +1482,7 @@ mod tests {
             assert_eq!((p.machine.as_deref(), p.banner), (Some("a"), None));
         }
         // `rebuild --all` resolves against the root's config: each root.
-        let Prep::Each(each) = prep_fed(&CliVerb::Rebuild { target: None, force: false, detach: false }, &on("a"), false, None, &get, 0).0.unwrap()
+        let Prep::Each(each) = prep_fed(&CliVerb::Rebuild { target: None, force: false, reprobe: false, detach: false }, &on("a"), false, None, &get, 0).0.unwrap()
         else {
             panic!()
         };

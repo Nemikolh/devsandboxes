@@ -75,6 +75,9 @@ pub struct RunParams {
     pub base: Option<String>,
     #[serde(default)]
     pub json: bool,
+    /// Probe the runtime's identity mode afresh (`--reprobe`).
+    #[serde(default)]
+    pub reprobe: bool,
     #[serde(default)]
     pub detach: bool,
     /// Run its commands on a pty of this size (the build log's tee, as
@@ -95,6 +98,9 @@ pub struct RebuildParams {
     pub all: bool,
     #[serde(default)]
     pub force: bool,
+    /// As [`RunParams::reprobe`].
+    #[serde(default)]
+    pub reprobe: bool,
     #[serde(default)]
     pub detach: bool,
     /// As [`RunParams::tty`].
@@ -181,8 +187,8 @@ pub enum Target {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verb {
-    Run { sandbox: String, name: Option<String>, branch: Option<String>, base: Option<String>, json: bool },
-    Rebuild { target: Target, force: bool },
+    Run { sandbox: String, name: Option<String>, branch: Option<String>, base: Option<String>, json: bool, reprobe: bool },
+    Rebuild { target: Target, force: bool, reprobe: bool },
     Start { target: Target },
     Stop { target: Target },
     Rm { instance: String, delete_branch: Option<bool>, force: bool, ask: bool },
@@ -244,12 +250,14 @@ pub fn parse(method: &str, params: Value) -> Result<VerbRequest, ApiError> {
     let (root, env, verb, detach, tty) = match method {
         "run" => {
             let p: RunParams = api::parse(params)?;
-            let verb = Verb::Run { sandbox: p.sandbox, name: p.name, branch: p.branch, base: p.base, json: p.json };
+            let verb =
+                Verb::Run { sandbox: p.sandbox, name: p.name, branch: p.branch, base: p.base, json: p.json, reprobe: p.reprobe };
             (p.root, p.env, verb, p.detach, p.tty)
         }
         "rebuild" => {
             let p: RebuildParams = api::parse(params)?;
-            (p.root, p.env, Verb::Rebuild { target: target(p.instance, p.all)?, force: p.force }, p.detach, p.tty)
+            let verb = Verb::Rebuild { target: target(p.instance, p.all)?, force: p.force, reprobe: p.reprobe };
+            (p.root, p.env, verb, p.detach, p.tty)
         }
         "start" => {
             let p: StartParams = api::parse(params)?;
@@ -310,18 +318,24 @@ pub fn argv(req: &VerbRequest) -> Vec<String> {
         }
     };
     let target = match &req.verb {
-        Verb::Run { sandbox, name, branch, base, json } => {
+        Verb::Run { sandbox, name, branch, base, json, reprobe } => {
             flag(&mut args, "name", name);
             flag(&mut args, "branch", branch);
             flag(&mut args, "base", base);
             if *json {
                 args.push("--json".into());
             }
+            if *reprobe {
+                args.push("--reprobe".into());
+            }
             Some(sandbox)
         }
-        Verb::Rebuild { target, force } => {
+        Verb::Rebuild { target, force, reprobe } => {
             if *force {
                 args.push("--force".into());
+            }
+            if *reprobe {
+                args.push("--reprobe".into());
             }
             one_or_all(&mut args, target)
         }
@@ -1028,7 +1042,7 @@ pub(crate) mod tests {
         let s = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let lead = ["--in-process", "-C", "/cfg"];
         let with = |rest: &[&str]| s(&[&lead[..], rest].concat());
-        let run = Verb::Run { sandbox: "web".into(), name: None, branch: None, base: None, json: false };
+        let run = Verb::Run { sandbox: "web".into(), name: None, branch: None, base: None, json: false, reprobe: false };
         assert_eq!(argv(&req(run, false)), with(&["run", "--", "web"]));
         let run = Verb::Run {
             sandbox: "-web".into(),
@@ -1036,13 +1050,18 @@ pub(crate) mod tests {
             branch: Some("feat/x".into()),
             base: Some("-odd".into()),
             json: true,
+            reprobe: true,
         };
         assert_eq!(
             argv(&req(run, true)),
-            with(&["run", "--name=w2", "--branch=feat/x", "--base=-odd", "--json", "--", "-web"])
+            with(&["run", "--name=w2", "--branch=feat/x", "--base=-odd", "--json", "--reprobe", "--", "-web"])
         );
-        assert_eq!(argv(&req(Verb::Rebuild { target: one("w"), force: true }, false)), with(&["rebuild", "--force", "--", "w"]));
-        assert_eq!(argv(&req(Verb::Rebuild { target: Target::All, force: false }, false)), with(&["rebuild", "--all"]));
+        assert_eq!(argv(&req(Verb::Rebuild { target: one("w"), force: true, reprobe: false }, false)), with(&["rebuild", "--force", "--", "w"]));
+        assert_eq!(
+            argv(&req(Verb::Rebuild { target: one("w"), force: false, reprobe: true }, false)),
+            with(&["rebuild", "--reprobe", "--", "w"])
+        );
+        assert_eq!(argv(&req(Verb::Rebuild { target: Target::All, force: false, reprobe: false }, false)), with(&["rebuild", "--all"]));
         assert_eq!(argv(&req(Verb::Start { target: Target::All }, false)), with(&["start", "--all"]));
         assert_eq!(argv(&req(Verb::Stop { target: one("w") }, false)), with(&["stop", "--", "w"]));
         let rm = |delete_branch, force, ask| Verb::Rm { instance: "w".into(), delete_branch, force, ask };
@@ -1073,25 +1092,29 @@ pub(crate) mod tests {
             branch: Some("-b".into()),
             base: Some("origin/main".into()),
             json: true,
+            reprobe: true,
         };
         match parse(run) {
-            Command::Run { sandbox, name, branch, base, env, dispatcher, json, detach } => {
+            Command::Run { sandbox, name, branch, base, env, dispatcher, json, reprobe, detach } => {
                 assert_eq!(sandbox.as_deref(), Some("-web"));
                 assert_eq!((name.as_deref(), branch.as_deref(), base.as_deref()), (Some("w2"), Some("-b"), Some("origin/main")));
                 // The daemon detaches by itself: the subprocess never gets `-d`.
-                assert!(json && env.is_empty() && dispatcher.is_none() && !detach);
+                assert!(json && reprobe && env.is_empty() && dispatcher.is_none() && !detach);
             }
             _ => panic!("not run"),
         }
-        let run = Verb::Run { sandbox: "web".into(), name: None, branch: None, base: None, json: false };
-        assert!(matches!(parse(run), Command::Run { name: None, branch: None, base: None, json: false, .. }));
-        match parse(Verb::Rebuild { target: one("-x"), force: true }) {
-            Command::Rebuild { name, all, force, detach: false } => {
-                assert_eq!((name.as_deref(), all, force), (Some("-x"), false, true))
+        let run = Verb::Run { sandbox: "web".into(), name: None, branch: None, base: None, json: false, reprobe: false };
+        assert!(matches!(parse(run), Command::Run { name: None, branch: None, base: None, json: false, reprobe: false, .. }));
+        match parse(Verb::Rebuild { target: one("-x"), force: true, reprobe: true }) {
+            Command::Rebuild { name, all, force, reprobe, detach: false } => {
+                assert_eq!((name.as_deref(), all, force, reprobe), (Some("-x"), false, true, true))
             }
             _ => panic!("not rebuild"),
         }
-        assert!(matches!(parse(Verb::Rebuild { target: Target::All, force: false }), Command::Rebuild { name: None, all: true, force: false, detach: false }));
+        assert!(matches!(
+            parse(Verb::Rebuild { target: Target::All, force: false, reprobe: false }),
+            Command::Rebuild { name: None, all: true, force: false, reprobe: false, detach: false }
+        ));
         assert!(matches!(parse(Verb::Start { target: one("w") }), Command::Start { name: Some(n), all: false, detach: false } if n == "w"));
         assert!(matches!(parse(Verb::Start { target: Target::All }), Command::Start { name: None, all: true, detach: false }));
         assert!(matches!(parse(Verb::Stop { target: one("w") }), Command::Stop { name: Some(n), all: false } if n == "w"));
@@ -1168,11 +1191,11 @@ pub(crate) mod tests {
 
     #[test]
     fn detach_answers_at_registration_or_spawn() {
-        let run = Verb::Run { sandbox: "web".into(), name: None, branch: None, base: None, json: false };
+        let run = Verb::Run { sandbox: "web".into(), name: None, branch: None, base: None, json: false, reprobe: false };
         assert_eq!(detach_at(&req(run.clone(), false)), DetachAt::Never);
         assert_eq!(detach_at(&req(run, true)), DetachAt::Registered);
-        assert_eq!(detach_at(&req(Verb::Rebuild { target: one("w"), force: false }, true)), DetachAt::Registered);
-        assert_eq!(detach_at(&req(Verb::Rebuild { target: Target::All, force: false }, true)), DetachAt::Spawn);
+        assert_eq!(detach_at(&req(Verb::Rebuild { target: one("w"), force: false, reprobe: false }, true)), DetachAt::Registered);
+        assert_eq!(detach_at(&req(Verb::Rebuild { target: Target::All, force: false, reprobe: false }, true)), DetachAt::Spawn);
         assert_eq!(detach_at(&req(Verb::Start { target: one("w") }, true)), DetachAt::Spawn);
         // Held verbs: `detach` only spares them a hang-up's cancel.
         assert_eq!(detach_at(&req(Verb::ServicesRebuild { name: "db".into() }, true)), DetachAt::Never);
@@ -1363,7 +1386,7 @@ pub(crate) mod tests {
     fn a_tty_request_runs_its_verb_with_the_size_in_the_env() {
         let (runner, dir) = script_runner("tty", r#"echo "tty=${DEVSANDBOX_TTY-unset}""#);
         let table = Arc::new(InFlight::default());
-        let rebuild = Verb::Rebuild { target: one("web"), force: false };
+        let rebuild = Verb::Rebuild { target: one("web"), force: false, reprobe: false };
         let mut sized = req(rebuild.clone(), false);
         sized.tty = Some(TtySize { cols: 100, rows: 30 });
         let mut plain = req(rebuild, false);
@@ -1461,7 +1484,7 @@ pub(crate) mod tests {
     #[test]
     fn progress_follows_the_childs_instance() {
         let (runner, dir) = script_runner("progress", &phase_script(&["preparing", "building", "ready"]));
-        let run = Verb::Run { sandbox: "web".into(), name: None, branch: None, base: None, json: false };
+        let run = Verb::Run { sandbox: "web".into(), name: None, branch: None, base: None, json: false, reprobe: false };
         let peer = FakePeer::default();
         let out = serve(&req(run, false), Some(3), &runner, &Arc::default(), &peer, "test", |_| {});
         assert_eq!(out.answer().unwrap(), json!({"instance": "web-2", "exit": 0}));
@@ -1476,7 +1499,7 @@ pub(crate) mod tests {
     fn detach_answers_once_registered_and_the_verb_runs_on() {
         let script = format!("{} touch \"$DIR/finished\"", phase_script(&["building", "building", "building", "ready"]));
         let (runner, dir) = script_runner("detach", &script);
-        let run = Verb::Run { sandbox: "web".into(), name: None, branch: None, base: None, json: true };
+        let run = Verb::Run { sandbox: "web".into(), name: None, branch: None, base: None, json: true, reprobe: false };
         let table = Arc::new(InFlight::default());
         let peer = FakePeer::default();
         let started = Instant::now();
@@ -1553,7 +1576,7 @@ pub(crate) mod tests {
         let peer = FakePeer::default();
         *peer.hang_up_at.lock().unwrap() = Some(Instant::now() + Duration::from_millis(300));
         // `rebuild <one>` detaches only once registered, which the script never does.
-        let out = serve(&req(Verb::Rebuild { target: one("w"), force: false }, true), None, &runner, &table, &peer, "test", |_| {});
+        let out = serve(&req(Verb::Rebuild { target: one("w"), force: false, reprobe: false }, true), None, &runner, &table, &peer, "test", |_| {});
         assert!(matches!(out, Outcome::Gone));
         wait_for("the verb", || dir.join("done").exists());
         assert!(!dir.join("int").exists());
@@ -1583,6 +1606,7 @@ pub(crate) mod tests {
             branch: None,
             base: None,
             json: true,
+            reprobe: true,
             detach: true,
             tty: Some(TtySize { cols: 100, rows: 30 }),
         };
@@ -1592,6 +1616,7 @@ pub(crate) mod tests {
             instance: None,
             all: true,
             force: false,
+            reprobe: false,
             detach: false,
             tty: None,
         };
