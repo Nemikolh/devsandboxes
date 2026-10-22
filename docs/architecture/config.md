@@ -46,7 +46,9 @@ records its `config_dir`).
   are hard errors). `SandboxProperties` is the devcontainer.json schema plus
   devsandbox extras. Valid devcontainer properties devsandbox doesn't act on
   still parse; `ignored()` lists them and `run` warns before creating the
-  container. `forwardPorts` entries are deduplicated after merge and each
+  container. `SandboxProperties::identity` folds devcontainer's
+  `updateRemoteUserUID` into the `identity` field (`false` means `image`
+  when `identity` is unset). `forwardPorts` entries are deduplicated after merge and each
   named service must be in the sandbox's `services`.
 - **Templates** are never validated on their own, only through the
   sandboxes that extend them.

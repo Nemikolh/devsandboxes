@@ -98,8 +98,8 @@ The `devcontainer.json` can stay in the repo; devsandbox never reads it.
 
 `ls` errors on unknown keys; `run` warns about ignored ones.
 
-- **Implemented:** `image`, `build`, `features`, `workspaceFolder`, `mounts`, `containerEnv`, `remoteEnv`, `containerUser`, `remoteUser`, `init`, `privileged`, the six lifecycle commands, `customizations.vscode.extensions`, `forwardPorts` ([details](/docs/config#implemented-devcontainer-properties)).
-- **Ignored:** `name`, `appPort`, `portsAttributes`, `otherPortsAttributes`, `runArgs`, `workspaceMount`, `overrideFeatureInstallOrder`, `updateRemoteUserUID`, `userEnvProbe`, `overrideCommand`, `shutdownAction`, `capAdd`, `securityOpt`, `hostRequirements`, `waitFor`, `secrets`, other `customizations.*` ([details](/docs/config#accepted-but-ignored-warned-at-run)).
+- **Implemented:** `image`, `build`, `features`, `workspaceFolder`, `mounts`, `containerEnv`, `remoteEnv`, `containerUser`, `remoteUser`, `updateRemoteUserUID` (`false` means `identity = "image"`), `init`, `privileged`, the six lifecycle commands, `customizations.vscode.extensions`, `forwardPorts` ([details](/docs/config#implemented-devcontainer-properties)).
+- **Ignored:** `name`, `appPort`, `portsAttributes`, `otherPortsAttributes`, `runArgs`, `workspaceMount`, `overrideFeatureInstallOrder`, `userEnvProbe`, `overrideCommand`, `shutdownAction`, `capAdd`, `securityOpt`, `hostRequirements`, `waitFor`, `secrets`, other `customizations.*` ([details](/docs/config#accepted-but-ignored-warned-at-run)).
 - **Rejected:** `dockerComposeFile`, `service`, `runServices`, and any unknown key.
 - **Variables:** as in devcontainers, plus `${configDir}`, `${sharedVolumes}`, `${instance}`; substituted only in some keys ([variables](/docs/config#variables)).
 

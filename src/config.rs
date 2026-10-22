@@ -5,6 +5,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 use toml::{Table, Value};
 
+use crate::runtime::identity::Identity;
+
 /// Default config file name, written by `run`'s example-config offer.
 pub const CONFIG_FILE: &str = "devsandboxes.toml";
 /// Every accepted config file name; more than one present is an error rather
@@ -200,6 +202,14 @@ pub struct SandboxProperties {
     pub mounts: Option<Vec<Mount>>,
     pub container_user: Option<String>,
     pub remote_user: Option<String>,
+    /// Who you are inside: `host` adopts the image's user at the host
+    /// uid/gid, `image` takes users literally. Read through [`Self::identity`]; changes how the container
+    /// is created, so it stays in `config_hash`.
+    pub identity: Option<Identity>,
+    /// devcontainer's knob, read as a hint for [`Self::identity`]: `false`
+    /// means `identity = "image"`. Hashed like `identity`.
+    #[serde(rename = "updateRemoteUserUID")]
+    pub update_remote_user_uid: Option<bool>,
     pub init: Option<bool>,
 
     // --- devcontainer properties not implemented yet ([`Self::ignored`]) ---
@@ -210,8 +220,6 @@ pub struct SandboxProperties {
     pub run_args: Option<Value>,
     pub workspace_mount: Option<Value>,
     pub override_feature_install_order: Option<Value>,
-    #[serde(rename = "updateRemoteUserUID")]
-    pub update_remote_user_uid: Option<Value>,
     pub user_env_probe: Option<Value>,
     pub override_command: Option<Value>,
     pub shutdown_action: Option<Value>,
@@ -345,6 +353,19 @@ impl<'de> Deserialize<'de> for Autostart {
 }
 
 impl SandboxProperties {
+    /// The effective `identity`: an explicit one wins, else
+    /// `updateRemoteUserUID = false` means [`Identity::Image`], else
+    /// [`Identity::Host`].
+    // Read once `run` builds an identity plan (identity.md, step 5).
+    #[allow(dead_code)]
+    pub fn identity(&self) -> Identity {
+        match (self.identity, self.update_remote_user_uid) {
+            (Some(identity), _) => identity,
+            (None, Some(false)) => Identity::Image,
+            (None, _) => Identity::Host,
+        }
+    }
+
     /// Names of valid devcontainer properties that are set but not
     /// implemented yet.
     pub fn ignored(&self) -> Vec<String> {
@@ -362,7 +383,6 @@ impl SandboxProperties {
             run_args => "runArgs",
             workspace_mount => "workspaceMount",
             override_feature_install_order => "overrideFeatureInstallOrder",
-            update_remote_user_uid => "updateRemoteUserUID",
             user_env_probe => "userEnvProbe",
             override_command => "overrideCommand",
             shutdown_action => "shutdownAction",
@@ -1367,6 +1387,67 @@ folders = { "/workspaces/docs" = "../docs", "/workspaces/lib" = { path = "../lib
         assert_eq!(a, b, "same config must hash identically");
         let c = config.resolve_sandbox("repository-2").unwrap().config_hash;
         assert_ne!(a, c, "different configs must hash differently");
+    }
+
+    fn identity_props(body: &str) -> Result<SandboxProperties> {
+        let config = Config::parse(&format!("[sandbox.app]\nfolder = \"../app\"\n{body}"))?;
+        Ok(config.resolve_sandbox("app")?.properties)
+    }
+
+    #[test]
+    fn identity_parses_and_hint_applies() {
+        let cases = [
+            ("", Identity::Host),
+            ("identity = \"host\"\n", Identity::Host),
+            ("identity = \"image\"\n", Identity::Image),
+            ("updateRemoteUserUID = true\n", Identity::Host),
+            ("updateRemoteUserUID = false\n", Identity::Image),
+            // An explicit `identity` wins over the hint.
+            ("identity = \"host\"\nupdateRemoteUserUID = false\n", Identity::Host),
+            ("identity = \"image\"\nupdateRemoteUserUID = true\n", Identity::Image),
+        ];
+        for (body, want) in cases {
+            let props = identity_props(body).unwrap();
+            assert_eq!(props.identity(), want, "{body:?}");
+            assert!(props.ignored().is_empty(), "{body:?}: {:?}", props.ignored());
+        }
+    }
+
+    #[test]
+    fn identity_rejects_other_values() {
+        let err = format!("{:#}", identity_props("identity = \"root\"\n").unwrap_err());
+        assert!(err.contains("host") && err.contains("image"), "{err}");
+        assert!(identity_props("updateRemoteUserUID = \"false\"\n").is_err());
+    }
+
+    #[test]
+    fn identity_parses_from_yaml() {
+        let props = |yaml: &str| {
+            Config::parse_yaml(yaml).unwrap().resolve_sandbox("app").unwrap().properties.identity()
+        };
+        assert_eq!(props("sandbox:\n  app:\n    identity: image\n"), Identity::Image);
+        assert_eq!(props("sandbox:\n  app:\n    updateRemoteUserUID: false\n"), Identity::Image);
+        assert_eq!(props("sandbox:\n  app:\n    identity: host\n"), Identity::Host);
+        let toml = Config::parse("[sandbox.app]\nidentity = \"image\"\n").unwrap();
+        let yaml = Config::parse_yaml("sandbox:\n  app:\n    identity: image\n").unwrap();
+        assert_eq!(toml.resolved_table("app").unwrap(), yaml.resolved_table("app").unwrap());
+    }
+
+    #[test]
+    fn identity_and_hint_change_config_hash() {
+        let hash = |body: &str| {
+            Config::parse(&format!("[sandbox.app]\nfolder = \"../app\"\n{body}"))
+                .unwrap()
+                .resolve_sandbox("app")
+                .unwrap()
+                .config_hash
+        };
+        let plain = hash("");
+        assert_eq!(plain, hash(""));
+        assert_ne!(plain, hash("identity = \"image\"\n"));
+        assert_ne!(hash("identity = \"host\"\n"), hash("identity = \"image\"\n"));
+        assert_ne!(plain, hash("updateRemoteUserUID = false\n"));
+        assert_ne!(hash("updateRemoteUserUID = true\n"), hash("updateRemoteUserUID = false\n"));
     }
 
     fn autostart_of(value: &str) -> Result<Option<Autostart>> {

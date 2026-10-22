@@ -120,7 +120,7 @@ limitation means editing this file in the same commit.
   `run` (`runArgs`, `appPort`, `portsAttributes`, `workspaceMount`,
   `capAdd`, `securityOpt`, `overrideCommand`, `shutdownAction`,
   `hostRequirements`, `waitFor`, `secrets`, `userEnvProbe`,
-  `updateRemoteUserUID`, `overrideFeatureInstallOrder`, `name`,
+  `overrideFeatureInstallOrder`, `name`,
   `customizations.vscode.settings`). → [config](architecture/config.md);
   `SandboxProperties::ignored`
 - `extends` can't remove an inherited array entry; a diamond duplicates
