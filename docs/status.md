@@ -12,10 +12,7 @@ limitation means editing this file in the same commit.
 
 ## In progress
 
-- **runtimes**: one user model across rootful/rootless docker, podman and
-  VM-backed runtimes, core steps 1–6 (probe, strategy table, helper-side
-  uid remap, `identity` config field); tool environment and the `/root`
-  config migration after. → [plan](plans/active/identity.md)
+(none)
 
 ## Planned
 
@@ -39,6 +36,10 @@ limitation means editing this file in the same commit.
   → [forwards](architecture/daemon/forwards.md#routes)
 - **helper**: run the ssh-agent relay once on Apple `container` on a Mac
   (built, never tested there).
+- **runtimes**: identity's tool environment (the browser sandbox under
+  docker's seccomp, the root-plan browser wrapper, the knobs) and the
+  migration of configs that mount into `/root`.
+  → [plan](plans/active/identity.md)
 
 ## Parked
 
@@ -136,6 +137,25 @@ limitation means editing this file in the same commit.
 - Podman: `autostart = "runtime"` restarts at boot only with
   `podman-restart.service`, which devsandbox never installs.
   → [runtimes](architecture/runtimes.md); `autostart::restart_decision`
+- Identity: only rootful docker and VM-backed runtimes are exercised (CI's
+  docker test); rootless docker, rootless podman, SELinux relabeling and
+  `--socket-gid` have never run. → [identity](architecture/instances/identity.md)
+- Identity: under `identity = "host"` (the default) a mount, `workspaceFolder`
+  or env value under `/root` lands in a dir the adopted account can't
+  reach; set `identity = "image"` until the migration ships.
+  → [plan](plans/active/identity.md)
+- Identity under SELinux on docker: `--mount` binds aren't relabeled (only
+  podman has `relabel=shared`), just warned about. `identity::create_args`
+- Identity probe: a failed probe isn't cached, so a remote `DOCKER_HOST`
+  (always ambiguous, the canary can't see its files) re-runs the canary and
+  falls back to `identity = "image"` on every `run`. `run::identity::probe`
+- Identity: rootless podman assumes the adopted account is 1000:1000
+  (`--userns keep-id:uid=1000,gid=1000`); another uid only gets a warning
+  from `devsbd identity apply --expect`. `identity::ASSUMED`
+- Identity on rootless docker: VS Code attaches as root without the plan's
+  `HOME` (`Instance::home` reaches execs only). `vscode::launch`
+- `rebuild --reprobe` without config drift does nothing unless `--force`
+  is given too. `rebuild::rebuild`
 
 ### daemon
 

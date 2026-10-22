@@ -1,12 +1,14 @@
 # Identity: one user model across runtimes
 
-Status: in progress (steps 1–6)
-Nothing is built yet. Today `run_container` (`src/commands/run/mod.rs`) passes
-`containerUser` as `--user`, `generate_dockerfile`
-(`src/commands/run/image.rs`) bakes it as `USER`, `exec` runs as
-`remoteUser`, and `updateRemoteUserUID` parses but is ignored
-(`SandboxProperties::ignored`). No code reasons about user namespaces,
-SELinux labels or the docker socket's gid.
+Status: planned (step 7, steps 8–14)
+Steps 1–6 shipped: the strategy table (`src/runtime/identity.rs`), the
+`identity` field (`SandboxProperties::identity`), `devsbd identity apply`
+(`devsbd/src/identity.rs`), the probe (`src/commands/run/identity.rs`
+`probe`, cached in `State::identity_probes`, `--reprobe`), and the wiring
+in `materialize`; the living docs describe them
+([identity](../../architecture/instances/identity.md),
+[runtimes](../../architecture/runtimes.md#mode-detection)). Left: the
+tool environment (step 7) and the `/root` config migration (8–14).
 
 ## Problem
 
