@@ -424,10 +424,21 @@ pub(super) fn feature_mount_decision(
     }
 }
 
+/// Whether a feature mount's missing bind source may be created: only inside
+/// `shared_volumes` (no `..` hop out of it), so a feature can't make devsandbox
+/// create arbitrary host paths.
+pub(super) fn creatable_feature_source(kind: &str, source: &str, shared_volumes: &str) -> bool {
+    let source = Path::new(source);
+    kind == "bind"
+        && !source.components().any(|c| c == std::path::Component::ParentDir)
+        && source.starts_with(shared_volumes)
+        && source != Path::new(shared_volumes)
+}
+
 /// Create a missing bind-mount source. A final path component containing a dot
 /// (other than a leading one) is treated as a file (touched); anything else as a
 /// directory — so `credentials.json` becomes a file and `pnpm-store` a dir.
-fn ensure_bind_source(path: &Path) -> Result<()> {
+pub(super) fn ensure_bind_source(path: &Path) -> Result<()> {
     if path.exists() {
         return Ok(());
     }
@@ -727,6 +738,20 @@ mod tests {
             MountDecision::Skip(reason) => assert!(reason.contains("cannot bind file"), "{reason}"),
             other => panic!("expected Skip, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn creatable_feature_source_only_inside_shared_volumes() {
+        let sv = "/cfg/shared-volumes";
+        assert!(creatable_feature_source("bind", "/cfg/shared-volumes/zidane/web", sv));
+        assert!(creatable_feature_source("bind", "/cfg/shared-volumes/zidane-state", sv));
+        // The root itself, siblings sharing the prefix, `..` hops, elsewhere.
+        assert!(!creatable_feature_source("bind", sv, sv));
+        assert!(!creatable_feature_source("bind", "/cfg/shared-volumes-x/a", sv));
+        assert!(!creatable_feature_source("bind", "/cfg/shared-volumes/../etc", sv));
+        assert!(!creatable_feature_source("bind", "/var/run/docker.sock", sv));
+        // Volumes are named, not host paths.
+        assert!(!creatable_feature_source("volume", "/cfg/shared-volumes/a", sv));
     }
 
     #[test]

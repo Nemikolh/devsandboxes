@@ -95,9 +95,11 @@ Order (install order) and the lack of arguments are the same.
 
 - `mounts`: `${…}` substituted (`${devcontainerId}` = instance id, so a
   volume named with it is per-instance and `rm` deletes it). A sandbox mount
-  on the same target wins. Skipped with a warning: unknown variable, missing
-  bind source (never auto-created), a file bind on a runtime without file
-  binds.
+  on the same target wins. A missing bind source under `${sharedVolumes}` is
+  created like a config mount's (`creatable_feature_source`: devsandbox's own
+  state, e.g. a feature's per-instance dirs). Skipped with a warning: unknown
+  variable, any other missing bind source, a file bind on a runtime without
+  file binds.
 - `privileged`: OR-ed with the sandbox's `privileged` (`false` can't veto a
   feature). Skipped with a warning where the runtime has no `--privileged`.
 

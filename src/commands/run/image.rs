@@ -14,7 +14,9 @@ use crate::config::{
 use crate::features::{self, FeatureMetadata};
 use crate::runtime::{backend, NAME_PREFIX};
 
-use super::mounts::{feature_mount_decision, MountDecision};
+use super::mounts::{
+    creatable_feature_source, ensure_bind_source, feature_mount_decision, MountDecision,
+};
 
 /// What the sandbox's enabled features ask of the container itself (the image
 /// side lives in [`build_features_image`]).
@@ -56,6 +58,9 @@ pub(super) fn privileged_decision(sandbox: bool, features: &[String], supported:
 /// backend cannot apply, or whose bind source is missing on the host, are
 /// skipped with a warning — auto-creating the source (the config-mount
 /// behavior) would hand the container an empty stub instead of a clear signal.
+/// The exception is a source under `${sharedVolumes}`: that is devsandbox's own
+/// persistent state, so it is created like a config mount's (a devsandbox
+/// feature's per-instance dirs don't exist before the first run).
 pub(super) fn feature_container_opts(
     props: &SandboxProperties,
     ctx: &MountContext,
@@ -90,6 +95,11 @@ pub(super) fn feature_container_opts(
         }
         for mount in &feature.metadata.mounts {
             let resolved = mount.resolve(ctx)?;
+            if let Some(source) = resolved.source.as_deref() {
+                if creatable_feature_source(&resolved.kind, source, ctx.shared_volumes) {
+                    ensure_bind_source(Path::new(source))?;
+                }
+            }
             let probe = |source: &str| std::fs::metadata(source).ok().map(|m| !m.is_dir());
             match feature_mount_decision(
                 &resolved,
