@@ -1443,6 +1443,7 @@ folder = "."
             workspace_file: None,
             remote_env: BTreeMap::new(),
             remote_user: None,
+            home: None,
             ssh_auth_sock: None,
             devsbd_arch: None,
             volumes: Vec::new(),

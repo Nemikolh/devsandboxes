@@ -26,8 +26,9 @@ pub(super) fn run_host_commands(dir: &Path, cmd: &LifecycleCommand) -> Result<()
 }
 
 /// Run a lifecycle command inside the container via `exec`. `env` is the
-/// instance's `Instance::exec_env` (remoteEnv, then the saved `--env`), the
-/// same set `devsandbox exec` passes.
+/// instance's `Instance::exec_env` (the plan's `HOME`, remoteEnv, then the
+/// saved `--env`) and `remote_user` its `Instance::remote_user` (the plan's
+/// exec user), the same as `devsandbox exec` passes.
 pub(crate) fn exec_lifecycle(
     container: &str,
     workspace: &str,

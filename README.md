@@ -32,11 +32,11 @@ devsandbox              # the dashboard
 | ------------------------------------------ | ------------------------------------------------------------------------- |
 | `devsandbox`                               | TUI dashboard on a TTY; help otherwise                                    |
 | `ls` / `ps [-a]`                           | Sandbox configs / instances                                               |
-| `run [sandbox] [--name] [--branch] [-d]`   | Create a fresh instance (picker without args)                             |
+| `run [sandbox] [--name] [--branch] [--reprobe] [-d]` | Create a fresh instance (picker without args); `--reprobe` re-detects the runtime's user-namespace mode |
 | `start [-d]` / `stop <name>\|--all`        | Start / Stop an instance                                                  |
-| `rebuild <name>\|--all [--force] [-d]`     | Recreate from current config when drifted; worktree and state kept        |
+| `rebuild <name>\|--all [--force] [--reprobe] [-d]` | Recreate from current config when drifted; worktree and state kept (`--reprobe` alone isn't drift: add `--force`) |
 | `rm <name>`                                | Remove sandbox: container, worktree, and state entry are removed          |
-| `exec [-i] [-t] <name> [cmd…]`             | Exec honoring `remoteEnv` / `remoteUser`; no `cmd`: login shell           |
+| `exec [-i] [-t] <name> [cmd…]`             | Exec as the instance's user with `remoteEnv`; no `cmd`: login shell       |
 | `vscode <name> [--goto PATH[:LINE[:COL]]]` | Open VS Code attached to the instance, optionally at a file and line      |
 | `done` / `undone <name>`                   | Mark an instance done (kept as is, shown dimmed) / clear the mark         |
 | `port <name> [--service s] <port…>`        | Forward a container/service port to the host until exited                 |

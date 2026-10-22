@@ -183,11 +183,12 @@ pub fn vscode(dir: &Path, name: &str, goto: Option<&Goto>) -> Result<()> {
 /// to [`GOTO_TIMEOUT`] then. Returns a one-line status. Shared with the TUI's
 /// `o` so both open identically.
 pub fn launch(dir: &Path, instance: &str, info: &Instance, goto: Option<&Goto>) -> Result<String> {
-    // Extensions and remoteUser come from the resolved sandbox, read from the
-    // instance's own config root: state is global, so `dir` (the cwd by
-    // default) may be another root or none. Failure to resolve is non-fatal —
-    // keep the extensions `run` registered and fall back to the remote user
-    // recorded in state so the attach still opens with write access.
+    // Extensions come from the resolved sandbox, read from the instance's own
+    // config root: state is global, so `dir` (the cwd by default) may be
+    // another root or none. Failure to resolve is non-fatal: keep the
+    // extensions `run` registered. The user is the one every exec runs as,
+    // recorded at create (the identity plan's, not the config's
+    // `remoteUser`), so the attach opens as the user that owns the files.
     let config_dir = info.config_dir.as_deref().unwrap_or(dir);
     let resolved = Config::load(config_dir)
         .and_then(|cfg| cfg.resolve_sandbox(&info.sandbox))
@@ -195,14 +196,10 @@ pub fn launch(dir: &Path, instance: &str, info: &Instance, goto: Option<&Goto>) 
     let extensions: Option<Vec<String>> = resolved.as_ref().map(|sb| {
         sb.properties.vscode_extensions().map(<[String]>::to_vec).unwrap_or_default()
     });
-    let remote_user = resolved
-        .as_ref()
-        .and_then(|sb| sb.properties.remote_user.clone())
-        .or_else(|| info.remote_user.clone());
     let _ = super::run::write_vscode_name_config(
         &info.container,
         extensions.as_deref(),
-        remote_user.as_deref(),
+        info.remote_user.as_deref(),
     );
 
     // Prefer the generated `.code-workspace` (window named after the instance,

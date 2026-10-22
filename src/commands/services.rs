@@ -949,6 +949,28 @@ ports = ["5432:5432"]
         assert_eq!(args.last().unwrap(), "postgres:16");
     }
 
+    /// Services get no identity treatment (docs/architecture/instances/identity.md,
+    /// *Services*): no user, user namespace or mount may leak in through a
+    /// shared args builder.
+    #[test]
+    fn service_run_args_have_no_identity_flags() {
+        let svc = service("[services.db]\nimage = \"postgres:16\"\nenv = { A = \"1\" }\nports = [\"5432:5432\"]");
+        let docker = crate::runtime::Dockerlike::DOCKER;
+        let podman = crate::runtime::Dockerlike::PODMAN;
+        let apple = crate::runtime::AppleContainer;
+        for rt in [&docker as &dyn Backend, &podman, &apple] {
+            let args = service_run_args(rt, "devsandbox-svc-p-db", "devsandbox-net-p", "postgres:16", &svc, &svc.spec.ports, &[]);
+            for flag in ["--user", "-u", "--userns", "-v", "--mount"] {
+                assert!(
+                    !args.iter().any(|a| a == flag || a.starts_with(&format!("{flag}="))),
+                    "{}: {flag} in {args:?}",
+                    rt.name()
+                );
+            }
+            assert!(!args.iter().any(|a| a.contains("devsandbox.identity")), "{args:?}");
+        }
+    }
+
     #[test]
     fn service_run_args_apple_has_no_alias() {
         let svc = service("[services.db]\nimage = \"postgres:16\"");
@@ -1055,6 +1077,7 @@ ports = ["5432:5432"]
             workspace_file: None,
             remote_env: Default::default(),
             remote_user: None,
+            home: None,
             ssh_auth_sock: None,
             devsbd_arch: None,
             volumes: Vec::new(),

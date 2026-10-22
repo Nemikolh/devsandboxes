@@ -53,8 +53,8 @@ Sites:
 
 ## rebuild
 
-`devsandbox rebuild <name>` (alias `recreate`; `--all`, `--force`)
-recreates an instance's container from the current config while keeping its
+`devsandbox rebuild <name>` (alias `recreate`; `--all`, `--force`,
+`--reprobe`) recreates an instance's container from the current config while keeping its
 identity and working tree:
 
 1. Refuse an instance still in flight. A `failed` one is always rebuilt
@@ -66,7 +66,9 @@ identity and working tree:
 3. `needs_rebuild`: the shared rule, plus one rebuild-only case: no
    `config_hash` label (container gone or removed by hand) means rebuild.
    It's the only worktree-preserving way back. No drift and no `--force`:
-   no-op with a message.
+   no-op with a message. `--reprobe` (probe the runtime's identity mode
+   afresh, [identity](identity.md)) is not drift: without drift it needs
+   `--force` to recreate anything.
 4. `recreate`: `remove_force` the container, then `run::materialize` with
    the recorded folder, base folder, worktree, branch and `branch_created`,
    under a `Tracker` in phase `building`, output into the instance's build
@@ -75,8 +77,9 @@ identity and working tree:
 Kept: instance name and `instance_id`, worktree and branch, recorded
 `volumes` (per-instance volumes are only deleted by `rm`), shell history,
 `${instance}`-anchored host paths, the recorded dispatcher and `extra_env`.
-Refreshed from config: workspace, `remoteEnv`, `remoteUser`, the
-`.code-workspace` file, mounts, services, lifecycle commands.
+Refreshed from config: workspace, `remoteEnv`, the identity plan (exec
+user and `HOME`, [identity](identity.md)), the `.code-workspace` file,
+mounts, services, lifecycle commands.
 
 A failure is never rolled back: the instance stays `failed` with its
 worktree for another `rebuild` or an `rm`. Ctrl-C marks it failed

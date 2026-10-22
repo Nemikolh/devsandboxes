@@ -12,8 +12,6 @@ mod dockerlike;
 // Only the daemon follows events (unix-only).
 #[cfg(unix)]
 pub mod events;
-// Nothing calls it until `run` wires the plan in.
-#[allow(dead_code)]
 pub mod identity;
 // Only the daemon and the dashboard list processes (both unix-only).
 #[cfg(unix)]
@@ -326,6 +324,10 @@ pub trait Backend: Send + Sync {
     /// chain it behind feature entrypoints, since a Dockerfile cannot reference
     /// its parent's.
     fn image_entrypoint(&self, image: &str) -> Result<Vec<String>>;
+
+    /// The local image's `USER` (`None` when unset or empty): the account
+    /// `identity = "host"` adopts when the config names none.
+    fn image_user(&self, image: &str) -> Result<Option<String>>;
 
     /// Delete a named volume. `Ok(false)` when it doesn't exist (already
     /// gone), an error when the runtime refuses (e.g. still in use).

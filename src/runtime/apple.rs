@@ -302,6 +302,11 @@ impl Backend for AppleContainer {
         parse_image_entrypoint(&out, oci_arch(std::env::consts::ARCH))
     }
 
+    fn image_user(&self, image: &str) -> Result<Option<String>> {
+        let out = self.output_quiet(&["image", "inspect", image])?;
+        parse_image_user(&out, oci_arch(std::env::consts::ARCH))
+    }
+
     fn remove_volume(&self, name: &str) -> Result<bool> {
         match self.output_quiet(&["volume", "delete", name]) {
             Ok(_) => Ok(true),
@@ -348,6 +353,8 @@ struct OciImage {
 struct OciImageConfig {
     #[serde(rename = "Entrypoint", default)]
     entrypoint: Option<Vec<String>>,
+    #[serde(rename = "User", default)]
+    user: Option<String>,
 }
 
 /// Rust's `std::env::consts::ARCH` in OCI platform terms.
@@ -362,6 +369,17 @@ fn oci_arch(arch: &str) -> &str {
 /// The entrypoint of the `linux/<arch>` variant (what `run` would start),
 /// falling back to the first variant.
 fn parse_image_entrypoint(json: &str, arch: &str) -> Result<Vec<String>> {
+    Ok(image_config(json, arch)?.and_then(|c| c.entrypoint).unwrap_or_default())
+}
+
+/// The `USER` of the variant [`parse_image_entrypoint`] picks; `None` when
+/// unset or empty.
+fn parse_image_user(json: &str, arch: &str) -> Result<Option<String>> {
+    Ok(image_config(json, arch)?.and_then(|c| c.user).filter(|u| !u.is_empty()))
+}
+
+/// The `linux/<arch>` variant's config, else the first variant's.
+fn image_config(json: &str, arch: &str) -> Result<Option<OciImageConfig>> {
     let images: Vec<ImageInspect> =
         serde_json::from_str(json).context("unexpected `container image inspect` JSON")?;
     let variants = images.into_iter().next().map(|i| i.variants).unwrap_or_default();
@@ -369,12 +387,7 @@ fn parse_image_entrypoint(json: &str, arch: &str) -> Result<Vec<String>> {
         .iter()
         .position(|v| v.config.os == "linux" && v.config.architecture == arch)
         .unwrap_or(0);
-    Ok(variants
-        .into_iter()
-        .nth(pick)
-        .and_then(|v| v.config.config)
-        .and_then(|c| c.entrypoint)
-        .unwrap_or_default())
+    Ok(variants.into_iter().nth(pick).and_then(|v| v.config.config))
 }
 
 #[cfg(test)]
@@ -393,6 +406,19 @@ mod tests {
         assert_eq!(parse_image_entrypoint(json, "amd64").unwrap(), ["/amd"]);
         // No matching variant: first one.
         assert_eq!(parse_image_entrypoint(json, "riscv64").unwrap(), ["/amd"]);
+    }
+
+    #[test]
+    fn image_user_picks_host_variant() {
+        let json = r#"[{"variants": [
+          {"config": {"architecture": "amd64", "os": "linux", "config": {"User": "amd"}}},
+          {"config": {"architecture": "arm64", "os": "linux", "config": {"User": "node"}}}
+        ]}]"#;
+        assert_eq!(parse_image_user(json, "arm64").unwrap().as_deref(), Some("node"));
+        let json = r#"[{"variants": [{"config": {"architecture": "arm64", "os": "linux", "config": {"User": ""}}}]}]"#;
+        assert_eq!(parse_image_user(json, "arm64").unwrap(), None);
+        let json = r#"[{"variants": [{"config": {"architecture": "arm64", "os": "linux"}}]}]"#;
+        assert_eq!(parse_image_user(json, "arm64").unwrap(), None);
     }
 
     #[test]

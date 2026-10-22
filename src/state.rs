@@ -68,9 +68,18 @@ pub struct Instance {
     /// devcontainer `remoteEnv`, applied to every exec in the container.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub remote_env: BTreeMap<String, String>,
-    /// devcontainer `remoteUser`: the user every exec runs as, when set.
+    /// The user every exec runs as (`-u`), when set: the identity plan's exec
+    /// user (`identity::Plan::exec_user`; docs/architecture/instances/identity.md),
+    /// decided at create. Instances from before identity carry the config's
+    /// `remoteUser` until rebuilt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_user: Option<String>,
+    /// `HOME` for every exec: the adopted account's home on plans that exec
+    /// as root with that home (`identity::Plan::root_home`, rootless docker),
+    /// as `devsbd identity apply` reported it. Unset elsewhere: the exec
+    /// user's own home applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home: Option<String>,
     /// Container path of the forwarded ssh-agent socket, set when `run`
     /// mounted the host agent (see docs/architecture/helper/ssh-agent.md); `exec_argv` uses it
     /// to inject `SSH_AUTH_SOCK` per exec.
@@ -313,13 +322,17 @@ impl Instance {
     }
 
     /// The env every devsandbox exec into this instance sets (CLI/TUI exec,
-    /// dispatcher run ops, lifecycle commands, the boot file): `remoteEnv`
-    /// overlaid by `extra_env`. The instance-specific value wins, as at
-    /// `docker run` where `--env` comes after `containerEnv`; and the saved
-    /// `extra_env` may be newer than the container's own env (an `ensure`
-    /// replaced it), so it must override whatever the image or config set.
+    /// dispatcher run ops, lifecycle commands, the boot file): the recorded
+    /// `home` as `HOME`, overlaid by `remoteEnv`, overlaid by `extra_env`. A
+    /// `HOME` the user sets wins over the plan's. The instance-specific value
+    /// wins, as at `docker run` where `--env` comes after `containerEnv`; and
+    /// the saved `extra_env` may be newer than the container's own env (an
+    /// `ensure` replaced it), so it must override whatever the image or
+    /// config set.
     pub fn exec_env(&self) -> BTreeMap<String, String> {
-        let mut env = self.remote_env.clone();
+        let mut env: BTreeMap<String, String> =
+            self.home.iter().map(|h| ("HOME".to_string(), h.clone())).collect();
+        env.extend(self.remote_env.iter().map(|(k, v)| (k.clone(), v.clone())));
         env.extend(self.extra_env.iter().map(|(k, v)| (k.clone(), v.clone())));
         env
     }
@@ -458,6 +471,7 @@ mod tests {
                 workspace_file: None,
                 remote_env: BTreeMap::new(),
                 remote_user: None,
+                home: Some("/home/vscode".into()),
                 ssh_auth_sock: None,
                 devsbd_arch: None,
                 volumes: Vec::new(),
@@ -487,6 +501,7 @@ mod tests {
         assert_eq!(back.instances["repo-abc1"].extra_env["PR_NUMBER"], "42");
         assert_eq!(back.instances["repo-abc1"].forwarded_ports["8080:3000"], 8081);
         assert_eq!(back.instances["repo-abc1"].done, Some(1_790_900_000));
+        assert_eq!(back.instances["repo-abc1"].home.as_deref(), Some("/home/vscode"));
     }
 
     #[test]
@@ -533,6 +548,8 @@ mod tests {
         assert!(!text.contains("branch_created"), "{text}");
         assert!(!text.contains("extra_env"), "{text}");
         assert!(!text.contains("done"), "{text}");
+        assert_eq!(state.instances["repo"].home, None);
+        assert!(!text.contains("home ="), "{text}");
     }
 
     #[test]
@@ -553,6 +570,13 @@ mod tests {
                 ("C".into(), "c".into()),
             ])
         );
+        // The plan's HOME comes first: remoteEnv and `--env` override it.
+        inst.home = Some("/home/vscode".into());
+        assert_eq!(inst.exec_env()["HOME"], "/home/vscode");
+        inst.remote_env.insert("HOME".into(), "/srv/me".into());
+        assert_eq!(inst.exec_env()["HOME"], "/srv/me");
+        inst.extra_env.insert("HOME".into(), "/tmp/x".into());
+        assert_eq!(inst.exec_env()["HOME"], "/tmp/x");
     }
 
     /// The orphaned-child bug: two writers holding snapshots from before each

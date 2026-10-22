@@ -14,8 +14,6 @@ pub(crate) mod cancel;
 mod editor;
 mod folders;
 mod git;
-// Nothing calls the probe until `materialize` wires the plan in.
-#[allow(dead_code)]
 mod identity;
 mod image;
 mod lifecycle;
@@ -53,8 +51,6 @@ pub const DEFAULT_WORKTREE_BRANCH: &str = "sandbox/${instance}";
 pub struct RunExtras {
     /// `run`/`rebuild --reprobe`: probe the runtime's identity mode afresh
     /// (`identity::probe`) instead of trusting the cache. Not recorded.
-    // Read once `materialize` calls the probe.
-    #[allow(dead_code)]
     pub reprobe: bool,
     /// Extra `-e K=V` for this instance only, after `containerEnv` (so they
     /// win on a duplicate key). Recorded in state (`Instance::extra_env`) so a
@@ -212,6 +208,7 @@ pub fn run(
         workspace_file: None,
         remote_env: Default::default(),
         remote_user: None,
+        home: None,
         ssh_auth_sock: None,
         devsbd_arch: None,
         volumes: Vec::new(),
@@ -707,6 +704,8 @@ pub(crate) fn materialize(
     }
     tracker.enter(Phase::Building)?;
     let image = image_for(dir, sandbox)?;
+    // Who the container runs as (docs/architecture/instances/identity.md).
+    let plan = identity::plan_for(&image, props, extras.reprobe);
     tracker.enter(Phase::Creating)?;
     run_container(
         dir,
@@ -723,6 +722,7 @@ pub(crate) fn materialize(
         privileged,
         restart,
         dispatcher.as_deref(),
+        &plan,
     )?;
     let container = container_name.clone();
     backend().connect_networks(&container, &networks)?;
@@ -741,6 +741,24 @@ pub(crate) fn materialize(
             None
         }
     };
+    // Fit the adopted account to the plan, before anything runs as it. No
+    // helper means no remap: the container runs on, unfitted.
+    let mut home = None;
+    let volume_targets = identity::volume_targets(&mounts);
+    let socket_gid = identity::socket_gid(plan.mode, &mounts);
+    if let Some(argv) = identity::apply_argv(&container, &plan, socket_gid, &volume_targets) {
+        if devsbd_arch.is_some() {
+            let account_home = identity::apply(&argv)?;
+            if plan.root_home {
+                home = Some(account_home);
+            }
+        } else {
+            eprintln!(
+                "warning: the devsbd helper isn't installed in `{container}`, so `{}` couldn't be fitted to the identity plan",
+                plan.account.as_deref().unwrap_or_default()
+            );
+        }
+    }
     let workspace_file = write_workspace_file(
         &container,
         instance,
@@ -765,7 +783,8 @@ pub(crate) fn materialize(
         workspace: workspace.clone(),
         workspace_file,
         remote_env: props.remote_env.clone().unwrap_or_default(),
-        remote_user: props.remote_user.clone(),
+        remote_user: plan.exec_user.clone(),
+        home,
         ssh_auth_sock,
         devsbd_arch,
         volumes,
@@ -786,9 +805,11 @@ pub(crate) fn materialize(
     })?;
     state.instances.insert(instance.to_string(), record);
 
+    // Every exec below runs as the plan's user, recorded on the instance.
+    let exec_user = plan.exec_user.as_deref();
     let extensions = props.vscode_extensions().unwrap_or(&[]);
-    if !extensions.is_empty() || props.remote_user.is_some() {
-        write_vscode_name_config(&container, Some(extensions), props.remote_user.as_deref())?;
+    if !extensions.is_empty() || exec_user.is_some() {
+        write_vscode_name_config(&container, Some(extensions), exec_user)?;
     }
 
     // ssh-agent for the lifecycle chain. The instance was just saved, so read
@@ -811,7 +832,7 @@ pub(crate) fn materialize(
         props.post_start_command.as_ref(),
         &workspace,
         Some(&exec_env),
-        props.remote_user.as_deref(),
+        exec_user,
         ssh_auth_sock,
     );
     crate::devsbd::sync_boot(&container, boot.as_ref(), false);
@@ -840,7 +861,7 @@ pub(crate) fn materialize(
             &container,
             &workspace,
             Some(&exec_env),
-            props.remote_user.as_deref(),
+            exec_user,
             ssh_auth_sock,
             &shell_rc_wiring(&paths, persist_history),
         )
@@ -860,7 +881,7 @@ pub(crate) fn materialize(
                 &container,
                 &workspace,
                 Some(&exec_env),
-                props.remote_user.as_deref(),
+                exec_user,
                 ssh_auth_sock,
                 cmd,
             )
@@ -985,7 +1006,9 @@ pub(crate) fn warn_on_drift(dir: &Path, container: &str, sandbox: &ResolvedSandb
 /// `docker run` the instance container from `image` (built by the caller, so
 /// the phase can tell building from creating). Network attachment beyond the
 /// first and service DNS are the caller's too: they run once the container
-/// exists, when a failure keeps it.
+/// exists, when a failure keeps it. `plan` decides the user, the user
+/// namespace and the binds' SELinux labels (`identity::create_args`).
+#[allow(clippy::too_many_arguments)]
 fn run_container(
     dir: &Path,
     sandbox: &ResolvedSandbox,
@@ -1001,6 +1024,7 @@ fn run_container(
     privileged: bool,
     restart: Option<&str>,
     dispatcher: Option<&str>,
+    plan: &crate::runtime::identity::Plan,
 ) -> Result<()> {
     let props = &sandbox.properties;
     let mount = format!("{}:{workspace}", source.display());
@@ -1019,7 +1043,7 @@ fn run_container(
         "--label", &sandbox_label, "--label", &instance_label,
         "--label", &hash_label, "--label", &build_hash_label, "--label", &base_label,
         "--label", &boot_hook_label,
-        "-v", &mount, "-w", workspace,
+        "-w", workspace,
     ]
     .map(str::to_string)
     .into();
@@ -1037,18 +1061,12 @@ fn run_container(
         args.push("--label".into());
         args.push(format!("{DISPATCHER_LABEL}={id}"));
     }
-    if let Some(user) = &props.container_user {
-        args.push("--user".into());
-        args.push(user.clone());
+    let volumes: Vec<String> = std::iter::once(mount).chain(extra_mounts.iter().cloned()).collect();
+    let (identity_args, warning) = identity::create_args(plan, backend().name() == "podman", &volumes, mounts);
+    if let Some(warning) = warning {
+        eprintln!("warning: {warning}");
     }
-    for mount in extra_mounts {
-        args.push("-v".into());
-        args.push(mount.clone());
-    }
-    for mount in mounts {
-        args.push("--mount".into());
-        args.push(mount.clone());
-    }
+    args.extend(identity_args);
     // Runtimes differ in how many networks a container can start on; the
     // backend attaches the rest after creation.
     args.extend(backend().network_run_args(networks));
@@ -1106,6 +1124,10 @@ fn gc_keeps_worktrees_env<'a>(
 /// ([`container_command`]); older ones run a bare `sleep infinity`, so `start`
 /// must keep running their `postStartCommand` from the host.
 pub(crate) const BOOT_HOOK_LABEL: &str = "devsandbox.boot_hook";
+
+/// Label recording the identity plan a container was created with
+/// (`identity::Plan::label`; docs/architecture/instances/identity.md).
+pub(crate) const IDENTITY_LABEL: &str = "devsandbox.identity";
 
 /// Label carrying the owning dispatcher's `instance_id` on a child container.
 pub(crate) const DISPATCHER_LABEL: &str = "devsandbox.dispatcher";
@@ -1179,6 +1201,7 @@ mod tests {
             workspace_file: None,
             remote_env: Default::default(),
             remote_user: None,
+            home: None,
             ssh_auth_sock: None,
             devsbd_arch: None,
             volumes: Vec::new(),
@@ -1619,6 +1642,55 @@ mod tests {
             assert_eq!(progress.pid, std::process::id());
             assert_eq!(info.workspace, "/workspaces/repo");
             assert!(backend().is_running(&container).unwrap().is_some(), "container kept");
+        });
+    }
+
+    /// `run` under the default `identity = "host"` fits the image's account
+    /// to the host (docs/architecture/instances/identity.md), so a file the
+    /// exec user writes into the workspace is the host user's: remapped on
+    /// rootful docker, root-is-you on rootless, the share on a VM.
+    #[cfg(unix)]
+    #[test_utils::docker_test(helper)]
+    fn workspace_files_are_host_owned_with_docker() -> Result<(), String> {
+        isolated("identity_child")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_child() {
+        let Some(root) = isolated_root("identity_child") else { return };
+        let (repo, cfg) = (root.join("repo"), root.join("cfg"));
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&cfg).unwrap();
+        // Unique per run: container and image names are global to the runtime.
+        let name = format!("ident-{}", std::process::id());
+        std::fs::write(cfg.join("Dockerfile"), "FROM alpine:3.20\nRUN adduser -D -u 1000 dev\n").unwrap();
+        std::fs::write(
+            cfg.join(CONFIG_FILE),
+            format!("[sandbox.{name}]\nfolder = \"../repo\"\nbuild.dockerfile = \"Dockerfile\"\nremoteUser = \"dev\"\n"),
+        )
+        .unwrap();
+        let project = services::project_id(&cfg).unwrap();
+        let container = format!("{NAME_PREFIX}{name}");
+        let image = format!("{NAME_PREFIX}img-{name}");
+        let cleanup = || {
+            crate::commands::rm::remove_container(&container, &project, &name);
+            let _ = backend().output_quiet(&["rmi", "-f", &image]);
+        };
+        crate::test_support::with_cleanup(cleanup, || {
+            run(&cfg, Some(name.clone()), Some(name.clone()), None, None, RunExtras::default()).unwrap();
+            let state = State::load().unwrap();
+            let info = state.instances.get(&name).expect("instance recorded");
+            let label = backend().label(&container, IDENTITY_LABEL).unwrap().expect("identity label");
+            let plan = crate::runtime::identity::Plan::parse_label(&label).expect("parsable label");
+            assert_eq!(info.remote_user, plan.exec_user, "{label}");
+            let touch = ["sh".to_string(), "-c".into(), "touch owned-by-me".into()];
+            let argv = crate::commands::exec::exec_argv_with(info, false, false, &touch, false);
+            backend().run_checked(&argv.iter().map(String::as_str).collect::<Vec<_>>()).unwrap();
+            use std::os::unix::fs::MetadataExt;
+            let owner = std::fs::metadata(repo.join("owned-by-me")).unwrap().uid();
+            // SAFETY: getuid has no preconditions and can't fail.
+            assert_eq!(owner, unsafe { libc::getuid() }, "{label}");
         });
     }
 

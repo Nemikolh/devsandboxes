@@ -40,8 +40,9 @@ recorded meanwhile.
 `Instance` holds: `sandbox`, `instance_id`, `project` (config-root id),
 `config_dir`, `container`, `folder` (mounted tree) / `base_folder` /
 `worktree` / `branch` / `branch_created`, `folders` (extra roots as
-mounted), `workspace`, `workspace_file`, `remote_env`, `remote_user`,
-`extra_env` (`run --env`, kept across rebuild), `volumes` (per-instance
+mounted), `workspace`, `workspace_file`, `remote_env`, `remote_user` and
+`home` (the exec user and its `HOME`, from the identity plan:
+[identity](identity.md)), `extra_env` (`run --env`, kept across rebuild), `volumes` (per-instance
 volumes `rm` deletes), `shell_history`, `ssh_auth_sock`, `devsbd_arch`,
 `dispatcher` (owning dispatcher's id), `forwarded_ports`, `done`,
 `progress`, `created_unix`. `State` also holds `autostart_boot` and
@@ -78,19 +79,24 @@ had (dispatcher, `config_dir`, `extra_env`, `forwarded_ports`, `done`,
 4. Mounts, caches, shell history, `shell-rc`, feature options, privileged and
    restart decisions ([mounts and state](mounts-and-state.md),
    [images and features](images-and-features.md)).
-5. Phase `building`: `image_for`. Phase `creating`: `run_container`
-   (`run -d`, labels, `--mount`s, env, first network; command
+5. Phase `building`: `image_for`, then the identity plan
+   (`identity::plan_for`: probe, plan, its summary and warnings on
+   stderr; [identity](identity.md)). Phase `creating`: `run_container`
+   (`run -d`, labels, the plan's `--user`/`--userns` and relabeled binds,
+   `--mount`s, env, first network; command
    `sh -c '[ -x /run/devsandbox/bin/devsbd ] && /run/devsandbox/bin/devsbd boot & exec sleep infinity'`,
    `container_command`), then
    `connect_networks`, `wire_service_dns`, install the `devsbd` helper,
-   write the `.code-workspace` file.
+   `devsbd identity apply` as root (a failure fails the create), write the
+   `.code-workspace` file.
 6. Save the record (still in flight), write the VS Code name config, sync the
    helper's boot file.
 7. Lifecycle (phase = step name): `shell-rc` wiring if any, then
    `onCreateCommand`, `updateContentCommand`, `postCreateCommand`,
    `postStartCommand`, `postAttachCommand`, each via `exec` with the
-   workspace as workdir, `remoteUser`, `exec_env` (`remoteEnv` + `extra_env`)
-   and the ssh-agent socket. Then `progress` is cleared.
+   workspace as workdir, the recorded exec user (`remote_user`),
+   `exec_env` (the plan's `HOME`, `remoteEnv`, `extra_env`) and the
+   ssh-agent socket. Then `progress` is cleared.
 
 ## Phases and failure
 

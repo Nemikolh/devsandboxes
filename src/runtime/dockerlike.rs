@@ -186,6 +186,11 @@ impl Backend for Dockerlike {
         parse_entrypoint(&out)
     }
 
+    fn image_user(&self, image: &str) -> Result<Option<String>> {
+        let out = self.output_quiet(&["image", "inspect", "--format", "{{json .Config.User}}", image])?;
+        parse_image_user(&out)
+    }
+
     fn remove_volume(&self, name: &str) -> Result<bool> {
         match self.output_quiet(&["volume", "rm", name]) {
             Ok(_) => Ok(true),
@@ -274,6 +279,13 @@ fn parse_entrypoint(out: &str) -> Result<Vec<String>> {
     let value: Option<Vec<String>> = serde_json::from_str(out.trim())
         .with_context(|| format!("unexpected image entrypoint `{}`", out.trim()))?;
     Ok(value.unwrap_or_default())
+}
+
+/// `{{json .Config.User}}`: a JSON string, empty (or `null`) when unset.
+fn parse_image_user(out: &str) -> Result<Option<String>> {
+    let value: Option<String> = serde_json::from_str(out.trim())
+        .with_context(|| format!("unexpected image user `{}`", out.trim()))?;
+    Ok(value.filter(|u| !u.is_empty()))
 }
 
 /// A string, or a list of strings (podman emits `Names` as an array).
@@ -473,6 +485,15 @@ mod tests {
             ["/usr/bin/tini", "--"]
         );
         assert!(parse_entrypoint("garbage").is_err());
+    }
+
+    #[test]
+    fn parse_image_user_empty_is_none() {
+        assert_eq!(parse_image_user("\"vscode\"\n").unwrap().as_deref(), Some("vscode"));
+        assert_eq!(parse_image_user("\"1000:1000\"").unwrap().as_deref(), Some("1000:1000"));
+        assert_eq!(parse_image_user("\"\"").unwrap(), None);
+        assert_eq!(parse_image_user("null").unwrap(), None);
+        assert!(parse_image_user("garbage").is_err());
     }
 
     /// Docker-gated: a removed volume reports `true`, a second removal hits the

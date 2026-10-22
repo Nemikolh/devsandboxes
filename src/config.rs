@@ -356,8 +356,6 @@ impl SandboxProperties {
     /// The effective `identity`: an explicit one wins, else
     /// `updateRemoteUserUID = false` means [`Identity::Image`], else
     /// [`Identity::Host`].
-    // Read once `run` builds an identity plan (identity.md, step 5).
-    #[allow(dead_code)]
     pub fn identity(&self) -> Identity {
         match (self.identity, self.update_remote_user_uid) {
             (Some(identity), _) => identity,

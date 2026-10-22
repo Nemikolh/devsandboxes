@@ -152,8 +152,9 @@ fn recreate(
     tracker.start()?;
 
     // materialize replaces the state entry (insert overwrites) and refreshes
-    // config-derived fields (workspace, remote_env, remote_user, workspace_file)
-    // — intended: the point of rebuild is to re-apply the current config.
+    // config-derived fields (workspace, remote_env, workspace_file) and the
+    // identity plan's (remote_user, home) — intended: the point of rebuild is
+    // to re-apply the current config.
     let result = run::materialize(
         dir,
         config,
@@ -245,6 +246,7 @@ mod tests {
             workspace_file: None,
             remote_env: BTreeMap::new(),
             remote_user: None,
+            home: None,
             ssh_auth_sock: None,
             devsbd_arch: None,
             volumes: Vec::new(),

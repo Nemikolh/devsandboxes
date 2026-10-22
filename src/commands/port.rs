@@ -769,6 +769,7 @@ image = "node"
             workspace_file: None,
             remote_env: Default::default(),
             remote_user: None,
+            home: None,
             ssh_auth_sock: None,
             devsbd_arch: None,
             volumes: Vec::new(),

@@ -214,6 +214,11 @@ the cache and runs the canary even when the metadata is clear. It reaches
 `materialize` as `RunExtras::reprobe` and isn't recorded on the instance.
 `rebuild --reprobe` alone doesn't count as drift.
 
+What the mode then decides (who the container is created and exec'd as,
+the user namespace, relabeled binds, the helper's remap) is in
+[instances/identity.md](instances/identity.md). `Backend::image_user` reads
+an image's `USER` for it.
+
 ## Adding a runtime
 
 A docker-CLI-compatible one is another `Dockerlike` constant plus its name in

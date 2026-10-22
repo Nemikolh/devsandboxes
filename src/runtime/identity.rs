@@ -28,6 +28,9 @@ pub enum Mode {
     /// colima, podman machine, Apple `container`).
     #[serde(rename = "vm")]
     VmBacked,
+    /// The probe failed: never cached, only recorded on a fallback plan
+    /// (`identity = "image"` semantics, nothing relabeled).
+    Unknown,
 }
 
 impl Mode {
@@ -37,11 +40,13 @@ impl Mode {
             Mode::RootlessDocker => "rootless-docker",
             Mode::RootlessPodman => "rootless-podman",
             Mode::VmBacked => "vm",
+            Mode::Unknown => "unknown",
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))] // for `Plan::parse_label`
     fn parse(s: &str) -> Option<Mode> {
-        [Mode::Rootful, Mode::RootlessDocker, Mode::RootlessPodman, Mode::VmBacked]
+        [Mode::Rootful, Mode::RootlessDocker, Mode::RootlessPodman, Mode::VmBacked, Mode::Unknown]
             .into_iter()
             .find(|m| m.as_str() == s)
     }
@@ -53,6 +58,7 @@ impl Mode {
             Mode::RootlessDocker => "rootless docker",
             Mode::RootlessPodman => "rootless podman",
             Mode::VmBacked => "VM-backed",
+            Mode::Unknown => "unknown mode",
         }
     }
 }
@@ -85,6 +91,7 @@ impl Identity {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))] // for `Plan::parse_label`
     fn parse(s: &str) -> Option<Identity> {
         match s {
             "host" => Some(Identity::Host),
@@ -396,8 +403,10 @@ pub const NO_ACCOUNT_WARNING: &str = "no non-root account to adopt (remoteUser, 
 /// The strategy table (section 3) plus *No account to adopt*.
 /// `Identity::Image` is the pre-identity behavior: create as
 /// `containerUser`, exec as `remoteUser` (else `containerUser`), nothing
-/// remapped. Relabeling applies to every plan.
+/// remapped. An unknown mode can only be taken literally, so it plans
+/// `Image` whatever was asked. Relabeling applies to every plan.
 pub fn plan(probe: Probe, identity: Identity, accounts: Accounts, host: Ids) -> Plan {
+    let identity = if probe.mode == Mode::Unknown { Identity::Image } else { identity };
     let mut p = Plan {
         mode: probe.mode,
         identity,
@@ -446,6 +455,7 @@ pub fn plan(probe: Probe, identity: Identity, accounts: Accounts, host: Ids) -> 
             p.create_user = accounts.container_user.map(str::to_string);
             p.exec_user = Some(account.into());
         }
+        Mode::Unknown => unreachable!("an unknown mode plans `Image`"),
     }
     p
 }
@@ -473,6 +483,7 @@ impl Plan {
             (Identity::Host, Mode::VmBacked, Some(a)) => {
                 format!("{mode}: exec as {a}, the file share maps ownership")
             }
+            (Identity::Host, Mode::Unknown, Some(a)) => format!("{mode}: exec as {a}"),
         };
         if self.relabel {
             s.push_str(", binds relabeled (SELinux)");
@@ -507,6 +518,8 @@ impl Plan {
     }
 
     /// The inverse of [`Plan::label`]; `None` on anything it wouldn't write.
+    // Nothing reads a container's label back yet (`inspect` shows it raw).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn parse_label(s: &str) -> Option<Plan> {
         let (mut mode, mut identity) = (None, None);
         let mut p = Plan {
@@ -557,6 +570,7 @@ fn escape(v: &str) -> String {
     v.replace('%', "%25").replace(';', "%3B")
 }
 
+#[cfg_attr(not(test), allow(dead_code))] // for `Plan::parse_label`
 fn unescape(v: &str) -> Option<String> {
     let mut out = String::with_capacity(v.len());
     let mut rest = v;
@@ -695,6 +709,19 @@ mod tests {
             assert_eq!((p.create_user, p.exec_user), (None, None), "{mode:?}");
             assert!(p.warnings.is_empty());
         }
+    }
+
+    #[test]
+    fn unknown_mode_plans_image() {
+        let accounts = Accounts { container_user: Some("app"), remote_user: Some("dev"), image_user: None };
+        let p = plan(probe(Mode::Unknown), Identity::Host, accounts, HOST);
+        let mut want = plan(probe(Mode::Unknown), Identity::Image, accounts, HOST);
+        assert_eq!(p, want);
+        assert_eq!(p.identity, Identity::Image);
+        assert_eq!((p.create_user.as_deref(), p.exec_user.as_deref()), (Some("app"), Some("dev")));
+        assert_eq!(p.summary(), "unknown mode: identity = \"image\", exec as dev, no remap");
+        want.warnings.clear();
+        assert_eq!(Plan::parse_label(&p.label()), Some(want));
     }
 
     #[test]

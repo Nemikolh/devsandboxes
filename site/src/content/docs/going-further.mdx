@@ -29,7 +29,7 @@ devsandbox rebuild -d --force web   # prints: web, the build goes on
 devsandbox logs --build web --follow
 ```
 
-`exec` runs in the workspace directory as the configured `remoteUser`, exits with the command's own status, and takes `-i` / `-t` only for interactive shells. Any command that takes a name accepts an instance name, a sandbox name or the repo folder's basename.
+`exec` runs in the workspace directory as the instance's user (the `remoteUser` adopted under [`identity`](/docs/config)), exits with the command's own status, and takes `-i` / `-t` only for interactive shells. Any command that takes a name accepts an instance name, a sandbox name or the repo folder's basename.
 
 <Callout variant="note" title="When a lifecycle command fails">
   A failing `postCreateCommand` aborts `run` but keeps the container, so `devsandbox logs --build web`, `devsandbox logs web` and `devsandbox exec web …` can show you why.

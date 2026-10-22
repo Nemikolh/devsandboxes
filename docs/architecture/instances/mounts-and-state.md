@@ -63,6 +63,12 @@ In `materialize` / `run_container`:
 `sort_parents_first` orders all `--mount`s by target depth so nested mounts
 stay visible on every runtime, not just docker.
 
+Who owns what lands in these binds is the identity plan's
+([identity](identity.md)): it relabels binds under SELinux, and
+`devsbd identity apply` hands empty root-owned named-volume mount points
+(feature volumes included) to the adopted account and adds it to the
+docker socket's group when a bind brings the socket in.
+
 ## ssh-agent
 
 Relay first: with an embedded `devsbd` helper (unix), nothing is mounted;
@@ -96,8 +102,9 @@ globally unique `instance_id` (containers); see [services](services.md).
   `terminal.integrated.cwd` pinned to the primary root.
 - `write_vscode_name_config`: the Remote-Containers `nameConfigs/<container>.json`
   for each installed product (`Code`, `Cursor`, `VSCodium`) with
-  `customizations.vscode.extensions` and `remoteUser`; written by `run` when
-  either is set and by every `vscode` launch.
+  `customizations.vscode.extensions` and `remoteUser` (the instance's
+  recorded exec user, `Instance::remote_user`: [identity](identity.md));
+  written by `run` when either is set and by every `vscode` launch.
 - `vscode::launch`: `code --file-uri` (or `--folder-uri` without a workspace
   file) on `vscode-remote://attached-container+<hex(name)>/…`; on Apple
   `container`, `apple-container+<hex({id, image})>`, which needs VS Code's
