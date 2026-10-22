@@ -44,10 +44,12 @@ In `materialize` / `run_container`:
   `${devcontainerId}` is per-instance: recorded in `Instance.volumes`
   (accumulated across rebuilds) and deleted by `rm`.
 - **`folders`**: each entry (or its detached worktree) at its container path.
-- **`caches`**: `<config dir>/shared-volumes/<dir>` bind-mounted at a fixed
-  `/root/…` target plus the tool's env var(s) (`known_cache`: pnpm →
-  `pnpm-store`, cargo, npm, yarn, go → `go-mod`, pip), shared by every
-  instance of the config root.
+- **`caches`**: `<config dir>/shared-volumes/<dir>` bind-mounted at
+  `/var/cache/devsandbox/<dir>` plus the tool's env var(s) pointing there
+  (`known_cache`: pnpm → `pnpm-store`, cargo, npm, yarn, go → `go-mod`,
+  pip), shared by every instance of the config root. No home directory is
+  involved, so the same target serves any `remoteUser`/`containerUser`; the
+  host-created source is as writable in the container as the workspace.
 - **`persist-shell-history`**: `shared-volumes/history/<instance_id>/` at
   `/commandhistory`, `HISTFILE` set in env and pinned in `~/.zshrc` /
   `~/.bashrc` (VS Code's shell integration resets the env value). A

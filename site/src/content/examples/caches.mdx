@@ -44,7 +44,7 @@ From the config dir:
 devsandbox run web                     # npm install fills shared-volumes/npm
 devsandbox run web --name fix-login    # same install, served from the cache
 devsandbox run api                     # the api shares it too
-devsandbox exec web sh -c 'echo $npm_config_cache'   # /root/.npm
+devsandbox exec web sh -c 'echo $npm_config_cache'   # /var/cache/devsandbox/npm
 ```
 
 - `--name`: the instance name.
@@ -54,7 +54,7 @@ devsandbox exec web sh -c 'echo $npm_config_cache'   # /root/.npm
 - Valid names are `pnpm`, `cargo`, `npm`, `yarn`, `go` and `pip`; each sets the tool's env vars to its mount ([`caches`](/docs/config#devsandbox-extras)).
 - Arrays concatenate under `extends`: a sandbox can add its own, e.g. `caches = ["cargo"]` ([templates](/docs/config#templates-and-extends)).
 - `rm` and `gc` leave caches alone; delete a directory in `shared-volumes/` to start that cache over.
-- Mounts target `/root/…`, so the sandbox must run as root (`node:22` does).
+- Mounts target `/var/cache/devsandbox/…`, outside any home dir, so they work whatever user the sandbox runs as.
 
 ## Agent instructions
 
@@ -62,7 +62,6 @@ devsandbox exec web sh -c 'echo $npm_config_cache'   # /root/.npm
   goal="Share package caches across my devsandbox sandboxes so new instances stop re-downloading dependencies."
   steps={[
     'Find which package managers my sandboxes use and add them to `caches` (valid: pnpm, cargo, npm, yarn, go, pip), in a template every sandbox `extends` if there is one.',
-    'The caches mount under /root, so check each sandbox runs as root. Tell me about any that does not rather than changing its user.',
   ]}
   verify={[
     'Existing instances now drift: list them with `devsandbox -C <config dir> ps -a` and ask me before running `devsandbox -C <config dir> rebuild <instance>` on each.',

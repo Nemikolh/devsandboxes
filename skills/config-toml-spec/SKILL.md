@@ -57,7 +57,7 @@ Keys are devcontainer camelCase, except devsandbox extras noted in kebab-case. *
 |---|---|---|
 | `folder` | string | Host project dir (relative to config dir, must exist). Required by `run`. A second instance of the same folder gets a git worktree, as does an instance whose folder another instance already mounts as a direct `folders` entry. |
 | `services` | [string] | Names from `[services.*]` to start and attach. |
-| `caches` | [string] | Shared package caches: `pnpm`, `cargo`, `npm`, `yarn`, `go`, `pip`. Each = bind mount under `shared-volumes/<sub>` + env vars pointing the tool at it (targets are `/root/...`). Unknown name errors. |
+| `caches` | [string] | Shared package caches: `pnpm`, `cargo`, `npm`, `yarn`, `go`, `pip`. Each = bind mount under `shared-volumes/<sub>` + env vars pointing the tool at it (targets are `/var/cache/devsandbox/<sub>`, outside any home, so they work for any `remoteUser`/`containerUser`; `cargo` sets `CARGO_HOME`, so `cargo install` lands in the shared cache's `bin/`, not on the image's `PATH`). Unknown name errors. |
 | `persist-shell-history` | bool | Per-instance `shared-volumes/history/<id>/.zsh_history`, dir mounted at `/commandhistory`, `HISTFILE` set (env + rc line). Kept on `rm`. |
 | `worktree-branch` | string | Branch pattern for worktree instances, `${…}` vars allowed. Default `sandbox/${instance}`. `run --branch` overrides. An existing local branch is checked out as is (`worktree-base` ignored); one only on `origin` becomes a local branch tracking it; else a new branch is created. A branch checked out in another worktree is an error. |
 | `worktree-base` | string | Commit-ish start point (e.g. `origin/develop`). Default: remote's default branch. `run --base` overrides. |

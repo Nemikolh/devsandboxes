@@ -518,6 +518,41 @@ mod tests {
         assert_eq!(resolved[0].mode, FolderWorktree::Never);
     }
 
+    // --- caches ---
+
+    #[test]
+    fn caches_mount_outside_home_and_point_env_at_target() {
+        let dir = std::env::temp_dir().join(format!("devsandbox-caches-{}", std::process::id()));
+        let props = SandboxProperties {
+            caches: Some(vec!["pnpm".into(), "cargo".into()]),
+            remote_user: Some("node".into()),
+            ..Default::default()
+        };
+        let (mounts, env) = resolve_caches(&dir, &props).unwrap();
+        let src = |sub: &str| dir.join("shared-volumes").join(sub);
+        assert!(src("pnpm-store").is_dir() && src("cargo").is_dir());
+        assert_eq!(
+            mounts,
+            vec![
+                format!(
+                    "type=bind,source={},target=/var/cache/devsandbox/pnpm-store",
+                    src("pnpm-store").display()
+                ),
+                format!("type=bind,source={},target=/var/cache/devsandbox/cargo", src("cargo").display()),
+            ]
+        );
+        let pair = |k: &str, v: &str| (k.to_string(), v.to_string());
+        assert_eq!(
+            env,
+            vec![
+                pair("npm_config_store_dir", "/var/cache/devsandbox/pnpm-store"),
+                pair("pnpm_config_store_dir", "/var/cache/devsandbox/pnpm-store"),
+                pair("CARGO_HOME", "/var/cache/devsandbox/cargo"),
+            ]
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     // --- shell-rc ---
 
     #[test]

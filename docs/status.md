@@ -97,8 +97,10 @@ limitation means editing this file in the same commit.
   `features::install_order`
 - Feature entrypoints race lifecycle commands (nothing waits for e.g.
   dockerd after `run_container`). → [images](architecture/instances/images-and-features.md); `materialize`
-- `caches` mount at fixed `/root/…` targets whatever `remoteUser` is.
-  → [mounts](architecture/instances/mounts-and-state.md); `config::known_cache`
+- The `cargo` cache replaces the image's `CARGO_HOME`: its `config.toml`
+  is not read and `cargo install` binaries land off `PATH` (in the shared
+  cache's `bin/`). → [mounts](architecture/instances/mounts-and-state.md);
+  `config::known_cache`
 - `worktree-include`/`worktree-link` apply to the primary repo only, not to
   `folders` worktrees; a `folders` entry that is a repo subdirectory is
   always bind-mounted; extra `folders` worktrees don't show in `--json` or

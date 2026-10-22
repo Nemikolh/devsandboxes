@@ -623,18 +623,24 @@ pub const SUPPORTED_CACHES: &[&str] = &["pnpm", "cargo", "npm", "yarn", "go", "p
 /// Resolve a cache name to `(source subdirectory under shared-volumes, mount
 /// target in the container, env vars that must point at the target)`. Returns
 /// `None` for an unknown name.
+///
+/// Targets sit under `/var/cache/devsandbox/`, not a home directory: the env
+/// vars are what point each tool at its cache, so no user's home is needed,
+/// and a non-root `remoteUser`/`containerUser` can't reach `/root` (0700).
+/// The bind source is created on the host, so it is as writable in the
+/// container as the workspace mount is.
 pub fn known_cache(name: &str) -> Option<(&'static str, &'static str, &'static [&'static str])> {
     Some(match name {
         "pnpm" => (
             "pnpm-store",
-            "/root/.pnpm-store",
+            "/var/cache/devsandbox/pnpm-store",
             &["npm_config_store_dir", "pnpm_config_store_dir"],
         ),
-        "cargo" => ("cargo", "/root/.cargo", &["CARGO_HOME"]),
-        "npm" => ("npm", "/root/.npm", &["npm_config_cache"]),
-        "yarn" => ("yarn", "/root/.yarn-cache", &["YARN_CACHE_FOLDER"]),
-        "go" => ("go-mod", "/root/go/pkg/mod", &["GOMODCACHE"]),
-        "pip" => ("pip", "/root/.cache/pip", &["PIP_CACHE_DIR"]),
+        "cargo" => ("cargo", "/var/cache/devsandbox/cargo", &["CARGO_HOME"]),
+        "npm" => ("npm", "/var/cache/devsandbox/npm", &["npm_config_cache"]),
+        "yarn" => ("yarn", "/var/cache/devsandbox/yarn", &["YARN_CACHE_FOLDER"]),
+        "go" => ("go-mod", "/var/cache/devsandbox/go-mod", &["GOMODCACHE"]),
+        "pip" => ("pip", "/var/cache/devsandbox/pip", &["PIP_CACHE_DIR"]),
         _ => return None,
     })
 }
@@ -2140,9 +2146,19 @@ extends = "a"
     fn caches_expand_to_known_specs() {
         let (source, target, env) = known_cache("cargo").unwrap();
         assert_eq!(source, "cargo");
-        assert_eq!(target, "/root/.cargo");
+        assert_eq!(target, "/var/cache/devsandbox/cargo");
         assert_eq!(env, &["CARGO_HOME"]);
         assert!(known_cache("nope").is_none());
+    }
+
+    #[test]
+    fn cache_targets_avoid_home_dirs() {
+        // A non-root user can't traverse `/root`; every target must be
+        // reachable whatever user the sandbox runs as.
+        for name in SUPPORTED_CACHES {
+            let (_, target, _) = known_cache(name).unwrap();
+            assert!(target.starts_with("/var/cache/devsandbox/"), "{name}: {target}");
+        }
     }
 
     #[test]
