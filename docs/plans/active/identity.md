@@ -343,6 +343,138 @@ exec as root, root maps to you"), and `inspect` shows the recorded
 plan. Ignored or overridden devcontainer user fields are warned about
 once, the same way as other ignored properties.
 
+### 7. Migrating existing configs
+
+Configs written for root-in-container break under `identity = "host"`:
+`target=/root/...` mounts land in a 0700 dir the dev user can't reach.
+The user asked for a migration (an exception to the pre-1.0
+no-migrations rule): offered when the TUI opens, and asked before a verb
+acts on an affected sandbox. The per-verb prompt is the preferred surface.
+A design pass (a subagent reading the code) found it's one mechanism:
+findings, a rewrite and an ack.
+
+**`${containerEnv:HOME}`** (devcontainer's variable; `config::resolve_var`
+knows only `localEnv:` today). The general form `${containerEnv:NAME}`
+reads the sandbox's `containerEnv`, then the image's `Config.Env`. `HOME`
+is rarely in either, so it falls back to the adopted account's home.
+That home comes from the image's `/etc/passwd`, read once per image id.
+The same read gives the real uid/gid, so it replaces the 1000 guess in
+*Assumed ids*. The fallback is `/home/<user>`, or `/root` for root.
+
+It's resolved at create time through a new field on
+`config::MountContext`. The devcontainer spec doesn't allow
+`containerEnv:` in `mounts`; devsandbox does, and the spec skill says so.
+It's also substituted in `containerEnv`/`remoteEnv`, which the spec says
+aren't substituted today, so the spec changes. A self-reference
+(`containerEnv.HOME = "${containerEnv:HOME}"`) is an error. With no
+runtime (`snapshot::validate_sandbox`, `ls`), it stays verbatim and isn't
+an error. On the rootless-docker root plan `HOME` is still the adopted
+home, so a rewritten config doesn't depend on the host's plan.
+
+**Findings**: a pure `identity_findings(&Config)` in a sibling module
+(`src/config_identity.rs`). It scans each template's and sandbox's *own*
+table, so every finding names the table that defines it, and walks
+`extends` (as `Config::resolve_extends` does) for the sandboxes it
+reaches. There's one config file per dir (`config::find`), so the origin
+is a table, not a file. Kinds:
+- `RootTarget`: a `mounts` target equal to or under `/root`, in both
+  forms (`config::parse_shorthand` `target=`/`dst=`/`destination=`, and
+  `MountObject::target`). Rewritten to `${containerEnv:HOME}/...`;
+- `RootEnv`: `containerEnv`/`remoteEnv` values under `/root` (e.g. the
+  site examples' `CLAUDE_CONFIG_DIR`). Rewritten the same way;
+- `RootPath`: `workspaceFolder`/`folders` targets under `/root`. Fixed by
+  hand;
+- `RootUser`: `remoteUser`/`containerUser = "root"`, counted only where
+  it wins the merge (`Config::resolved_table`). "Update" removes the key
+  (the image's account gets adopted). "Continue as is" isn't an ack: it
+  writes `identity = "image"` into that table, so keeping root is
+  explicit and the finding is gone for good.
+
+Not findings: caches (already under `/var/cache/devsandbox/`,
+`config::known_cache`), shell history (`/commandhistory`), feature mounts
+(not the user's file), `updateRemoteUserUID` (a hint, not a migration).
+
+A finding's id is `short_hash(table | key | current value)`, without the
+array index (indices shift), so a new or edited `/root` mount warns again.
+
+**Rewrite**: add `toml_edit`. It shares `toml`'s `toml_parser`/`toml_writer`/
+`winnow`, so it's about one new crate, and it keeps comments and layout.
+The rewrite is a pure `rewrite(text, &[Finding])` that reparses its output
+and checks the findings are gone. YAML configs (`Config::parse_yaml`) are
+refused, with the edits printed instead. Writing:
+- `devsandboxes.toml.bak` is copied before the write and deleted once the
+  new file is in place and reparses with the findings gone. It only
+  guards the write itself, and is left behind (and reported) only when
+  something fails;
+- tmp + rename, keeping the mode, through a symlink to its target;
+- `conflict` when the file's hash changed since the findings were read.
+
+The rewrite changes `config_hash`, so affected instances show drift.
+That's the right outcome (pre-identity containers need recreating), and
+it's reported with the next step: `updated devsandboxes.toml (5 edits);
+now drifted: web, web-2 → devsandbox rebuild <name>`. The verb that asked
+then continues on the new config. An instance created before identity
+has no plan label: it keeps its recorded `remote_user` (`state::Instance`)
+until it's rebuilt.
+
+**Ack ("continue as is")**: `identity_acks` in `state.toml`, project id
+to finding ids, next to `autostart_boot`, written through `State::update`
+and pruned of stale ids on every write. Not `dashboard.toml` (the CLI
+wouldn't see it), and not the config (noise, and it would change the
+hash). An acked finding leaves the header and the prompts, and stays dimmed
+in Detail.
+
+**Surfaces**:
+- **verb prompt** (CLI): a pre-send quick call in
+  `serve::verbs_client::prepare`, like `sandboxes.list`, once the target
+  sandbox is known: `[u]pdate / [c]ontinue as is (don't ask again) /
+  [s]kip this time`. It covers `run`/`start`/`rebuild`, with one combined
+  prompt for `--all`. `exec` creates nothing and doesn't prompt. It is not
+  modelled on rm's confirm round, which is an error coming back from an
+  already-spawned subprocess;
+- **verb prompt** (TUI): before `spawn_verb` sends run/start/rebuild, a
+  three-choice modal (on `Modal::Confirm`, `tui/app/actions.rs`). The `:`
+  prompt goes through the same path;
+- **header**: a yellow line under the red `Snapshot.error` line
+  (`tui/ui.rs`), e.g. `2 sandboxes use /root (U to update)`, for
+  un-acked findings only;
+- **Detail**: `SandboxRow.identity`, filled in `snapshot::sandbox_rows`
+  (shared with `ls`), rendered in `tui/ui.rs::sandbox_detail` next to the
+  red `issues`, yellow (dim when acked);
+- **TUI open**: on the first `instances.snapshot`
+  (`tui/daemon.rs::snapshot_update`), a modal listing every un-acked
+  finding's edit: `update / continue as is / later`. Ack and migrate go
+  out as daemon-worker `Cmd`s, like `Rename`.
+
+**API**: `config.findings {root, sandbox?}` → `{file, format, fileHash,
+findings}`, `config.migrate {root, ids?, fileHash}` → `{edits, drifted}`
+(errors `conflict`, `unsupported`, `invalid`), `config.ack {root, ids}`.
+All three are in `machines/forward.rs`'s `QUICK`, so a machine's config is
+checked, rewritten and acked by that machine's daemon. Machines' configs
+are rewritten in place, the same way as local ones. This makes the
+daemon write a user file, against the rule in `run::offer_example_config`,
+because the TUI and machines have no other way to write. The doc says so.
+Update `npm/devsandboxes/index.d.ts` (`serve/dts.rs`) and
+`docs/reference/api.md`.
+
+**Edge cases**:
+- off a TTY, and under `--json`: one `warning:` line on stderr, never
+  blocking, with stdout left alone (`json_stdout`);
+- the dispatcher's `--in-process` subprocesses and autostart: no
+  prompt, the warning only, printed by `run` the way `ignored()` is;
+- no daemon: the same prompt, with the pure fns called locally;
+- a template shared through `extends`: edited once, fixed for every
+  sandbox using it. An unused template's finding shows up in the
+  TUI-open offer only;
+- **autostart**: "before anything boots" can't fully hold. The first
+  connect starts the daemon, and `serve::host::Host::new`'s autostart
+  pass runs straight away. It mostly starts existing containers, which
+  keep their old model until rebuilt anyway. Accepted (user's call); the
+  architecture doc says so.
+
+Also update the spec skill's example, the site examples and
+`site/src/lib/agents.test.ts`'s matcher (`${containerEnv:HOME}/.claude`).
+
 ## Services
 
 No plan. `[services.*]` has no mount, user or userns knobs (`config::Service`,
@@ -389,6 +521,23 @@ asked.
 6. Docs: `architecture/instances/` (a new `identity.md`), `runtimes.md`,
    status line for anything left.
 
+Migration (section 7, after step 4):
+
+7. `${containerEnv:NAME}` / `${containerEnv:HOME}`: `MountContext`,
+   `resolve_var`, env substitution, the image passwd and `Config.Env` read
+   cached by image id (replacing the 1000 guess), spec skill.
+8. `identity_findings` with origins and ids; table tests (templates,
+   `extends` chains, scalar overrides).
+9. `rewrite` on `toml_edit`: round-trip tests, YAML refusal, the atomic
+   write with a transient `.bak`, the `conflict` guard, and `RootUser`'s
+   `identity = "image"` write.
+10. `identity_acks` in `state.toml`; `config.findings`/`migrate`/`ack`
+    (`QUICK`, d.ts, api.md).
+11. `SandboxRow.identity`, the header line, the Detail lines.
+12. The CLI prompt in `verbs_client::prepare`, the in-process fallback,
+    the off-TTY warning.
+13. The TUI verb modal and the TUI-open offer; docs and a status line.
+
 Docker tests: one `#[test_utils::docker_test(helper)]` per Tier 1 mode
 the CI host can run (rootful at least), asserting a file written in the
 workspace is host-uid-owned.
@@ -399,6 +548,15 @@ workspace is host-uid-owned.
 - Docker and podman are Tier 1; Apple `container` is Tier 2.
 - Services get no identity treatment.
 - The probe runs per runtime host (a machine probes for itself).
+- Existing configs get a migration (user's request, despite pre-1.0):
+  asked per verb (preferred), offered when the TUI opens, flagged in the
+  header and Detail. "Continue as is" is remembered per finding,
+  except for root users, where it writes `identity = "image"`.
+- `${containerEnv:HOME}` is the home variable, allowed in mounts
+  (beyond the devcontainer spec).
+- The `.bak` exists only during the write. It's deleted on success.
+- Machines' configs are rewritten remotely, by their own daemon.
+- Autostart may run before the TUI-open offer is answered. Accepted.
 
 ## Experiment (separate, after the above)
 
