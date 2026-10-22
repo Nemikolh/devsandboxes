@@ -27,6 +27,10 @@ limitation means editing this file in the same commit.
 - **machines**: VS Code on remote rows (spike),
   remote Inbox threads, nameless commands across every machine.
   → [plan](plans/active/machines-next.md)
+- **machines**: a fleet: workers dial an always-on hub and lend a
+  restricted API (no ssh into them), soft-cap placement, devsandbox-owned code transfer between hosts, dispatcher
+  children on any machine, checkpoints and re-placement.
+  → [plan](plans/active/fleet.md)
 - **daemon**: Windows as a remote-only client of a machine.
   → [plan](plans/active/windows-support.md)
 - **helper**: drop the host-side `lsof` fallback for a forward's listening
