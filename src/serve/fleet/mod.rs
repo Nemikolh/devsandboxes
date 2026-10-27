@@ -21,12 +21,16 @@
 //!   way) and each end's receivers by kind.
 //! - `update`: the build each end says in its `Hello`, and how a worker
 //!   follows its hub's (download, install, forced handoff).
+//! - `place`: the pure placement of new work over candidates filled from
+//!   the daemon's snapshots (soft caps, locality, pins).
 
 pub mod lend;
 pub mod lender;
 pub mod lent;
 pub mod link;
 pub mod offer;
+#[allow(dead_code)] // first caller: the placed run (fleet step 3c)
+pub mod place;
 pub mod transfer;
 pub mod update;
 pub mod worker;

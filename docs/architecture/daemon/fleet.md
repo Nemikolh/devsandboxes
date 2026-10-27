@@ -9,7 +9,8 @@ dial, and [hub mode](#hub-mode); on the worker `lend.toml`, the lending thread, 
 worker policy and `lend.*` with its CLI, `devsandbox lend` and
 `devsandbox fleet join|leave`
 ([ADR 0041](../../decisions/0041-fleet-workers-dial-their-hub.md)); and
-every daemon's [capacity report](#capacity), carried by its snapshots;
+every daemon's [capacity report](#capacity), carried by its snapshots,
+and the pure [placement](#placement) that scores it;
 and the link's [`TRANSFER`](#transfer) streams, both ways; and
 [versions](#versions): a worker follows its hub's build, a published one
 downloaded, a dev one received over `TRANSFER`
@@ -47,6 +48,9 @@ Code: `src/serve/fleet/mod.rs` (`LINK`), `src/serve/fleet/link.rs`
 (`poll`, `running_instances`), `src/serve/snapshots.rs`
 (`Snapshots::set_capacity`, `Machine::capacity`,
 `SnapshotMachine::capacity`), `src/serve/fleet/lend.rs` (`SoftCaps`);
+placement: `src/serve/fleet/place.rs` (`place`, `score`, `Spec`,
+`Candidate`, `MachineRef`, `Placement`, `NoPlace`, `has_image`,
+`reachable`);
 versions: `src/serve/fleet/update.rs` (`HELLO`, `PLATFORM`,
 `platform_of`, `Build`, `decide`, `Decision`, `hub_pushes`, `push`,
 `install_received`, `release_target`, `asset_url`, `curl_argv`, `update`,
@@ -300,7 +304,7 @@ keeps it running) makes the daemon a hub:
 
 Every daemon reports its host's capacity in its snapshots (fleet plan
 decision 8; wire: [Capacity](../../reference/api.md#capacity)), what
-placement (plan step 3b) will score against. The host poll
+[placement](#placement) scores against. The host poll
 (`host.rs` `poll`) builds one `capacity::Capacity` per tick while a root
 is watched (`Capacity::build`, pure) and hands it to the snapshot cache
 (`Snapshots::set_capacity`), which puts it top-level in every root's
@@ -352,6 +356,53 @@ and `devsandbox machine ls` show it as LEND (`capacity::lend_label`:
 `on`, `drain`, `off`, `-`) and CAPACITY (`capacity::summary`: `8 cpu ·
 12/32G · 120G free · 3 run`, memory in use / total, then the over-cap
 note).
+
+## Placement
+
+Where new work goes (fleet plan decision 11: placement runs in the
+daemon). `place::place` is pure over a `Spec` (the sandbox, its
+`config_hash` / `build_hash`, the repo, the requester, an optional pin)
+and the `Candidate`s, each a `MachineRef` (this host or a machine name)
+with `reachable`, `lending`, its `Capacity` (or none yet), `has_image`
+and `has_repo`. It answers a `Placement` (the machine, `warnings`, the
+`score` and its `reasons` as text) or a `NoPlace`.
+
+- **A pin wins** (`Spec::pinned`: `--machine m` or a qualified name).
+  It is refused only when the machine isn't a candidate
+  (`NoPlace::UnknownPin`) or is unreachable (`NoPlace::PinUnreachable`);
+  over a cap, draining or not lending, it is used with a warning.
+- **New work never goes** to an unreachable machine or one lending `off`
+  or `drain`. None left: `NoPlace::NoCandidate`, each skipped one with
+  why.
+- **Soft caps never refuse.** Among the rest, the highest `place::score`
+  wins; ties go to the lowest `MachineRef` (this host first, then
+  machines by name). Every exceeded cap (`capacity::over_caps`)
+  subtracts `OVER` (2000), more than an in-cap machine can score, so a
+  machine over a cap ranks below every one that isn't; when all are
+  over, the best is still used and its `warnings` carry
+  `<machine>: over cap: mem 18G/16G` (`capacity::over_note`).
+- **Score**: headroom, each item `0..=100` points and an unknown one
+  `NEUTRAL` (50), so a machine with no report is neither best nor worst:
+  memory ×3 (`mem_available / mem_total`, or the room left under the
+  `mem` cap when smaller), disk ×2 (`disk_free / disk_total`, or under
+  `disk`), slots ×2 (room left under `instances`; unknown without the
+  cap), cpu ×1 (`running` per cpu, the `cpus` cap lowering the count;
+  `0` at one instance per cpu). Then locality: `IMAGE` (300) when
+  `has_image`, `REPO` (150) when `has_repo`; and `REQUESTER` (50) when
+  the candidate is the requester's own host.
+
+Candidates come from what the daemon already keeps:
+`Candidate::local` (this host: always reachable and lending `on`) and
+`Candidate::from_machine` over a `snapshots::Machine` (its
+`Machine::capacity`; `lending` from that report, `off` without one, so a
+machine that never ran `devsandbox lend` takes only pinned work;
+`place::reachable`: an ssh machine unless its link state is
+`unreachable`, an offered one only while `connected`).
+`place::has_image` reads roots' `instances.snapshot` params: a sandbox
+row of the spec's name at its `config_hash` (and `build_hash`, when the
+spec has one) with a ready, non-drifted instance of that sandbox from
+the same root, since image tags are per config root. No snapshot says
+which repos a host has, so `has_repo` is the caller's to fill.
 
 ## Worker side
 

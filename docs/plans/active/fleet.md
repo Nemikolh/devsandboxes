@@ -30,7 +30,10 @@ installs and hands off; 3a (image namespacing) shipped: image tags and
 feature build contexts carry the root's `services::project_id`
 (`run::image::sandbox_image`, `features_image`,
 `services::service_image_tag`, `features::build_context_name`;
-[images](../../architecture/instances/images-and-features.md))
+[images](../../architecture/instances/images-and-features.md)); 3b
+(`place`) shipped: `serve::fleet::place` (`place`, `score`, `Candidate::local`
+/ `from_machine`, `has_image`), pure, not yet called
+([fleet](../../architecture/daemon/fleet.md#placement))
 ([fleet](../../architecture/daemon/fleet.md), ADRs
 [0041](../../decisions/0041-fleet-workers-dial-their-hub.md),
 [0042](../../decisions/0042-fleet-workers-follow-their-hubs-version.md)); the rest
