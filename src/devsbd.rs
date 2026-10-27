@@ -357,8 +357,7 @@ pub fn ensure_recorded(key: &str, info: &Instance, quiet: bool) -> Option<Arch> 
 /// uid, env and argv under `/tmp/rec/`. Returns the server's `bin/<commit>` dir.
 #[cfg(test)]
 pub(crate) fn fake_vscode_window(container: &str) -> &'static str {
-    use std::process::Command;
-    let exec = |args: &[&str]| Command::new("docker").arg("exec").args(args).output().unwrap();
+    let exec = |args: &[&str]| crate::test_support::runtime_cmd().arg("exec").args(args).output().unwrap();
     let sh = |script: &str| {
         let out = exec(&[container, "sh", "-c", script]);
         assert!(out.status.success(), "{script}: {}", String::from_utf8_lossy(&out.stderr));
@@ -455,24 +454,23 @@ mod tests {
     /// wrong-arch-first retry.
     #[test_utils::docker_test(helper)]
     fn installs_into_container_with_docker() -> Result<(), &'static str> {
-        use std::process::Command;
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let name = format!("devsandbox-devsbd-test-{stamp}");
-        let up = Command::new("docker")
+        let up = crate::test_support::runtime_cmd()
             .args(["run", "-d", "--rm", "--name", &name, "alpine:3.20", "sleep", "300"])
             .output()
             .unwrap();
         assert!(up.status.success(), "{}", String::from_utf8_lossy(&up.stderr));
         let inode = || {
-            let out = Command::new("docker").args(["exec", &name, "stat", "-c", "%i", BIN]).output().unwrap();
+            let out = crate::test_support::runtime_cmd().args(["exec", &name, "stat", "-c", "%i", BIN]).output().unwrap();
             String::from_utf8_lossy(&out.stdout).trim().to_string()
         };
 
         let cleanup = || {
-            let _ = Command::new("docker").args(["rm", "-f", &name]).output();
+            let _ = crate::test_support::runtime_cmd().args(["rm", "-f", &name]).output();
         };
         crate::test_support::with_cleanup(cleanup, || {
             let arch = install(&name, None).unwrap();
@@ -483,7 +481,7 @@ mod tests {
             assert_eq!(inode(), before);
             // Missing helper, wrong arch recorded: blind retry lands on one that
             // runs (the other arch too, where qemu binfmt is registered).
-            Command::new("docker").args(["exec", &name, "rm", BIN]).output().unwrap();
+            crate::test_support::runtime_cmd().args(["exec", &name, "rm", BIN]).output().unwrap();
             let retried = install(&name, Some(Arch::host().other())).unwrap();
             assert_eq!(installed_hash(&name).as_deref(), hash(retried));
         });
@@ -495,29 +493,28 @@ mod tests {
     /// run by the host's root execs (install, boot file write and removal).
     #[test_utils::docker_test(helper)]
     fn root_execs_ignore_the_containers_path_with_docker() -> Result<(), &'static str> {
-        use std::process::Command;
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let name = format!("devsandbox-devsbd-path-test-{stamp}");
-        let up = Command::new("docker")
+        let up = crate::test_support::runtime_cmd()
             .args(["run", "-d", "--rm", "--name", &name, "-e", "PATH=/tmp/p:/usr/sbin:/usr/bin:/sbin:/bin"])
             .args(["alpine:3.20", "/bin/sleep", "300"])
             .output()
             .unwrap();
         assert!(up.status.success(), "{}", String::from_utf8_lossy(&up.stderr));
         let cleanup = || {
-            let _ = Command::new("docker").args(["rm", "-f", &name]).output();
+            let _ = crate::test_support::runtime_cmd().args(["rm", "-f", &name]).output();
         };
         crate::test_support::with_cleanup(cleanup, || {
             let plant = "mkdir -p /tmp/p && for t in sh mkdir cat chmod mv ln rm; do \
                 printf '#!/bin/sh\\ntouch /tmp/pwned\\nexec /bin/%s \"$@\"\\n' $t > /tmp/p/$t; \
                 chmod 755 /tmp/p/$t; done";
-            let ok = Command::new("docker").args(["exec", &name, "/bin/sh", "-c", plant]).status().unwrap();
+            let ok = crate::test_support::runtime_cmd().args(["exec", &name, "/bin/sh", "-c", plant]).status().unwrap();
             assert!(ok.success());
             let pwned = || {
-                Command::new("docker")
+                crate::test_support::runtime_cmd()
                     .args(["exec", &name, "/bin/ls", "/tmp/pwned"])
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
@@ -531,7 +528,7 @@ mod tests {
             sync_boot(&name, Some(&spec), false);
             sync_boot(&name, None, false);
             assert!(!pwned(), "a root exec ran a planted binary");
-            let ok = Command::new("docker").args(["exec", &name, "sh", "-c", "true"]).status().unwrap();
+            let ok = crate::test_support::runtime_cmd().args(["exec", &name, "sh", "-c", "true"]).status().unwrap();
             assert!(ok.success() && pwned(), "the fakes are live (sanity)");
         });
         Ok(())
@@ -546,25 +543,24 @@ mod tests {
     /// can't listen on a unix socket.
     #[test_utils::docker_test(helper)]
     fn vscode_goto_runs_the_window_cli_as_its_owner_with_docker() -> Result<(), &'static str> {
-        use std::process::Command;
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let name = format!("devsandbox-devsbd-vscode-test-{stamp}");
-        let up = Command::new("docker")
+        let up = crate::test_support::runtime_cmd()
             .args(["run", "-d", "--rm", "--name", &name, "python:3.13-alpine", "sleep", "300"])
             .output()
             .unwrap();
         assert!(up.status.success(), "{}", String::from_utf8_lossy(&up.stderr));
-        let exec = |args: &[&str]| Command::new("docker").arg("exec").args(args).output().unwrap();
+        let exec = |args: &[&str]| crate::test_support::runtime_cmd().arg("exec").args(args).output().unwrap();
         let sh = |script: &str| {
             let out = exec(&[&name, "sh", "-c", script]);
             assert!(out.status.success(), "{script}: {}", String::from_utf8_lossy(&out.stderr));
             String::from_utf8_lossy(&out.stdout).into_owned()
         };
         let cleanup = || {
-            let _ = Command::new("docker").args(["rm", "-f", &name]).output();
+            let _ = crate::test_support::runtime_cmd().args(["rm", "-f", &name]).output();
         };
         crate::test_support::with_cleanup(cleanup, || {
             install(&name, None).unwrap();
@@ -602,9 +598,8 @@ mod tests {
     /// and under ours (`runtime::seccomp`), as uid 1000 and with `--as-root`
     /// as root. Root has no `CAP_SYS_ADMIN` in docker's default cap set, so
     /// the default profile blocks both, rootful or rootless.
-    #[test_utils::docker_test(helper)]
+    #[test_utils::docker_test(helper, docker_only)]
     fn userns_check_follows_the_seccomp_profile_with_docker() -> Result<(), &'static str> {
-        use std::process::Command;
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -615,13 +610,13 @@ mod tests {
         let cleanup = || {
             let _ = std::fs::remove_dir_all(&dir);
             for name in &names {
-                let _ = Command::new("docker").args(["rm", "-f", name]).output();
+                let _ = crate::test_support::runtime_cmd().args(["rm", "-f", name]).output();
             }
         };
         crate::test_support::with_cleanup(cleanup, || {
             let seccomp = format!("seccomp={}", profile.display());
             for (name, opts) in [(&names[0], vec![]), (&names[1], vec!["--security-opt", seccomp.as_str()])] {
-                let up = Command::new("docker")
+                let up = crate::test_support::runtime_cmd()
                     .args(["run", "-d", "--rm", "--name", name])
                     .args(opts)
                     .args(["alpine:3.20", "sleep", "300"])
@@ -631,7 +626,7 @@ mod tests {
                 install(name, None).unwrap();
             }
             let check = |name: &str, user: &str, extra: &[&str]| {
-                let out = Command::new("docker")
+                let out = crate::test_support::runtime_cmd()
                     .args(["exec", "-u", user, name, BIN, "userns", "check"])
                     .args(extra)
                     .output()
@@ -654,10 +649,10 @@ mod tests {
     /// back to the wrapper doesn't count) is exit 127. Root has no
     /// `CAP_SYS_ADMIN` in docker's default cap set, so this holds rootful or
     /// rootless.
-    #[test_utils::docker_test(helper)]
+    #[test_utils::docker_test(helper, docker_only)]
     fn browser_wrapper_drops_root_with_docker() -> Result<(), &'static str> {
         use std::io::Write;
-        use std::process::{Command, Stdio};
+        use std::process::Stdio;
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -668,14 +663,14 @@ mod tests {
         let cleanup = || {
             let _ = std::fs::remove_dir_all(&dir);
             for name in &names {
-                let _ = Command::new("docker").args(["rm", "-f", name]).output();
+                let _ = crate::test_support::runtime_cmd().args(["rm", "-f", name]).output();
             }
         };
         let fake = "#!/bin/sh\necho \"uid=$(id -u)\"\n[ -e /proc/self/fd/3 ] && echo fd3=open || echo fd3=closed\necho \"args=$*\"\n";
         crate::test_support::with_cleanup(cleanup, || {
             let seccomp = format!("seccomp={}", profile.display());
             for (name, opts) in [(&names[0], vec!["--security-opt", seccomp.as_str()]), (&names[1], vec![])] {
-                let up = Command::new("docker")
+                let up = crate::test_support::runtime_cmd()
                     .args(["run", "-d", "--rm", "--name", name])
                     .args(opts)
                     .args(["alpine:3.20", "sleep", "300"])
@@ -685,12 +680,12 @@ mod tests {
                 install(name, None).unwrap();
             }
             let sh = |name: &str, script: &str| {
-                let out = Command::new("docker").args(["exec", "-u", "root", name, "sh", "-c", script]).output().unwrap();
+                let out = crate::test_support::runtime_cmd().args(["exec", "-u", "root", name, "sh", "-c", script]).output().unwrap();
                 let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
                 (out.status.code(), text(&out.stdout), text(&out.stderr))
             };
             let put_fake = |name: &str| {
-                let mut child = Command::new("docker")
+                let mut child = crate::test_support::runtime_cmd()
                     .args(["exec", "-i", "-u", "root", name, "sh", "-c"])
                     .arg("cat > /usr/local/bin/chrome && chmod 755 /usr/local/bin/chrome")
                     .stdin(Stdio::piped())

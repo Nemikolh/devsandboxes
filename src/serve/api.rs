@@ -2174,14 +2174,13 @@ mod tests {
     /// its processes through the production fetch (no helper: no runs).
     #[test_utils::docker_test]
     fn containers_and_procs_against_docker() -> Result<(), &'static str> {
-        use std::process::Command;
         let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let name = format!("devsandbox-api-test-{stamp}");
         let cleanup = || {
-            let _ = Command::new("docker").args(["rm", "-f", &name]).output();
+            let _ = crate::test_support::runtime_cmd().args(["rm", "-f", &name]).output();
         };
         crate::test_support::with_cleanup(cleanup, || {
-            let up = Command::new("docker")
+            let up = crate::test_support::runtime_cmd()
                 .args(["run", "-d", "--name", &name, "alpine:3.20", "sh", "-c", "echo hello-api; exec sleep 300"])
                 .output();
             if !matches!(up, Ok(o) if o.status.success()) {
@@ -2214,7 +2213,7 @@ mod tests {
                 backend.inspect_json(c).map_err(ApiError::internal)
             });
             assert_eq!(code(missing), "internal");
-            Command::new("docker").args(["stop", "-t", "0", &name]).output().map_err(|_| "docker stop failed")?;
+            crate::test_support::runtime_cmd().args(["stop", "-t", "0", &name]).output().map_err(|_| "docker stop failed")?;
             assert_eq!(fetch_procs(&name).unwrap_err(), "not running");
             Ok(())
         })

@@ -1493,7 +1493,6 @@ mod tests {
     /// user, with its env) and brings the daemon back on a runtime restart.
     #[test_utils::docker_test(helper)]
     fn boot_hook_reruns_post_start_on_restart_with_docker() -> Result<(), &'static str> {
-        use std::process::Command;
         use std::time::{Duration, Instant};
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1502,10 +1501,10 @@ mod tests {
         let name = format!("devsandbox-boot-test-{stamp}");
         let mut args = vec!["run".to_string(), "-d".into(), "--name".into(), name.clone(), "alpine:3.20".into()];
         args.extend(container_command());
-        let up = Command::new("docker").args(&args).output().unwrap();
+        let up = crate::test_support::runtime_cmd().args(&args).output().unwrap();
         assert!(up.status.success(), "{}", String::from_utf8_lossy(&up.stderr));
         let in_container = |script: &str| {
-            let out = Command::new("docker").args(["exec", &name, "sh", "-c", script]).output().unwrap();
+            let out = crate::test_support::runtime_cmd().args(["exec", &name, "sh", "-c", script]).output().unwrap();
             out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
         };
         let poll = |script: &str| {
@@ -1522,7 +1521,7 @@ mod tests {
         };
 
         let cleanup = || {
-            let _ = Command::new("docker").args(["rm", "-f", &name]).output();
+            let _ = crate::test_support::runtime_cmd().args(["rm", "-f", &name]).output();
         };
         crate::test_support::with_cleanup(cleanup, || {
             crate::devsbd::install(&name, None).unwrap();
@@ -1536,7 +1535,7 @@ mod tests {
             // First start had no helper: the hook was a no-op.
             assert_eq!(in_container("cat /tmp/marker-ok"), None);
 
-            let restart = Command::new("docker").args(["restart", "-t", "0", &name]).output().unwrap();
+            let restart = crate::test_support::runtime_cmd().args(["restart", "-t", "0", &name]).output().unwrap();
             assert!(restart.status.success(), "{}", String::from_utf8_lossy(&restart.stderr));
             assert_eq!(poll("cat /tmp/marker-ok").as_deref(), Some("65534"), "postStartCommand not rerun");
             assert!(

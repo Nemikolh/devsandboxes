@@ -289,12 +289,11 @@ mod tests {
         assert_eq!(wakes.load(Ordering::SeqCst), 0);
     }
 
-    /// Against the real `docker events`: a devsandbox container starting
+    /// Against the real `<runtime> events`: a devsandbox container starting
     /// wakes the watcher.
     #[test_utils::docker_test]
-    fn docker_events_wake_on_a_container_start() -> Result<(), &'static str> {
-        use crate::runtime::{Backend, Dockerlike};
-        let rt = Dockerlike::DOCKER;
+    fn runtime_events_wake_on_a_container_start() -> Result<(), &'static str> {
+        let rt = crate::runtime::backend();
         let argv = rt.events_argv().map(|a| a.into_iter().map(String::from).collect());
         let (tx, rx) = mpsc::channel::<()>();
         let tx = Mutex::new(tx);
@@ -310,10 +309,10 @@ mod tests {
         let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let name = format!("devsandbox-evtest-{stamp}");
         let cleanup = || {
-            let _ = Command::new("docker").args(["rm", "-f", &name]).output();
+            let _ = crate::test_support::runtime_cmd().args(["rm", "-f", &name]).output();
         };
         crate::test_support::with_cleanup(cleanup, || {
-            let up = Command::new("docker").args(["run", "-d", "--name", &name, "alpine:3.20", "sleep", "30"]).output();
+            let up = crate::test_support::runtime_cmd().args(["run", "-d", "--name", &name, "alpine:3.20", "sleep", "30"]).output();
             if !matches!(up, Ok(o) if o.status.success()) {
                 return Err("docker run alpine:3.20 failed");
             }

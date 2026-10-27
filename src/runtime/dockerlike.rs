@@ -571,9 +571,9 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         );
-        Dockerlike::DOCKER.run_checked(&["volume", "create", &name]).map_err(|_| "volume create failed")?;
-        assert!(Dockerlike::DOCKER.remove_volume(&name).unwrap());
-        assert!(!Dockerlike::DOCKER.remove_volume(&name).unwrap());
+        crate::runtime::backend().run_checked(&["volume", "create", &name]).map_err(|_| "volume create failed")?;
+        assert!(crate::runtime::backend().remove_volume(&name).unwrap());
+        assert!(!crate::runtime::backend().remove_volume(&name).unwrap());
         Ok(())
     }
 
@@ -614,35 +614,38 @@ mod tests {
     #[test_utils::docker_test]
     fn image_passwd_and_id_from_alpine() -> Result<(), &'static str> {
         let image = "alpine:3.20";
-        Dockerlike::DOCKER.output_quiet(&["pull", "-q", image]).map_err(|_| "cannot pull alpine:3.20")?;
-        let passwd = Dockerlike::DOCKER.image_passwd(image).unwrap().expect("alpine has sh");
+        crate::runtime::backend().output_quiet(&["pull", "-q", image]).map_err(|_| "cannot pull alpine:3.20")?;
+        let passwd = crate::runtime::backend().image_passwd(image).unwrap().expect("alpine has sh");
         assert_eq!(identity::account(&passwd, "root").map(|a| (a.uid, a.home)), Some((0, "/root".into())));
-        let id = Dockerlike::DOCKER.image_id(image).unwrap().expect("an id");
+        let id = crate::runtime::backend().image_id(image).unwrap().expect("an id");
         assert!(id.starts_with("sha256:"), "{id}");
-        assert!(Dockerlike::DOCKER.image_id("devsandbox-no-such-image:never").is_err());
+        assert!(crate::runtime::backend().image_id("devsandbox-no-such-image:never").is_err());
         Ok(())
     }
 
-    /// Docker-gated: CI's docker is rootful, so the canary must classify it
-    /// so. Unverified on a dev Mac (no docker there).
+    /// Runtime-gated: the canary agrees with the fast path (CI: rootful
+    /// docker, rootless podman). Unverified on a dev Mac (no docker there).
     #[cfg(unix)]
     #[test_utils::docker_test]
-    fn canary_classifies_rootful_docker() -> Result<(), &'static str> {
+    fn canary_agrees_with_the_fast_path() -> Result<(), &'static str> {
         use std::os::unix::fs::PermissionsExt;
+        let rt = crate::runtime::backend();
+        let expected = rt.identity_fast_path().map_err(|_| "no fast path")?.mode.map_err(|_| "fast path ambiguous")?;
         let image = "alpine:3.20";
-        Dockerlike::DOCKER.output_quiet(&["pull", "-q", image]).map_err(|_| "cannot pull alpine:3.20")?;
+        crate::runtime::backend().output_quiet(&["pull", "-q", image]).map_err(|_| "cannot pull alpine:3.20")?;
         let dir = std::env::temp_dir().join(format!("devsandbox-canary-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
         let canary = crate::test_support::with_cleanup(
             || drop(std::fs::remove_dir_all(&dir)),
-            || Dockerlike::DOCKER.identity_canary(image, &dir, false),
+            || crate::runtime::backend().identity_canary(image, &dir, false),
         )
         .unwrap();
         let host = Ids { uid: unsafe { libc::getuid() }, gid: unsafe { libc::getgid() } };
-        let mode = identity::classify(host, canary.as_root, canary.as_1000, identity::Engine::Docker);
-        assert_eq!(mode, Some(identity::Mode::Rootful), "{canary:?}");
+        let engine = if rt.name() == "podman" { identity::Engine::Podman } else { identity::Engine::Docker };
+        let mode = identity::classify(host, canary.as_root, canary.as_1000, engine);
+        assert_eq!(mode, Some(expected), "{canary:?}");
         Ok(())
     }
 

@@ -810,7 +810,6 @@ chmod +x ./devcontainer-features-install.sh && \
     /// build on CI (where it fails instead of skipping).
     #[test_utils::docker_test]
     fn derived_image_builds_with_docker() -> Result<(), &'static str> {
-        use std::process::Command;
 
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -822,7 +821,7 @@ chmod +x ./devcontainer-features-install.sh && \
 
         let cleanup = |ctx: &Path, tag: &str| {
             let _ = std::fs::remove_dir_all(ctx);
-            let _ = Command::new("docker").args(["rmi", "-f", tag]).output();
+            let _ = crate::test_support::runtime_cmd().args(["rmi", "-f", tag]).output();
         };
 
         // Synthetic feature: one option `myopt` (default "fallback"), a
@@ -864,7 +863,7 @@ chmod +x ./devcontainer-features-install.sh && \
         let dockerfile_path = ctx.join("Dockerfile.devsandbox-features");
         std::fs::write(&dockerfile_path, dockerfile).unwrap();
 
-        let build = Command::new("docker")
+        let build = crate::test_support::runtime_cmd()
             .args([
                 "build",
                 "-t",
@@ -881,7 +880,7 @@ chmod +x ./devcontainer-features-install.sh && \
             panic!("docker build failed: {stderr}");
         }
 
-        let run = Command::new("docker")
+        let run = crate::test_support::runtime_cmd()
             .args(["run", "--rm", &tag, "cat", "/opt/marker"])
             .output()
             .unwrap();
@@ -899,7 +898,6 @@ chmod +x ./devcontainer-features-install.sh && \
     /// option override and metadata default both land.
     #[test_utils::docker_test]
     fn derived_image_builds_with_local_feature() -> Result<(), &'static str> {
-        use std::process::Command;
 
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -944,11 +942,11 @@ chmod +x ./devcontainer-features-install.sh && \
         let result = build_features_image(&config_dir, &sandbox, "alpine:3.20", &features)
             .map_err(|e| format!("{e:#}"))
             .and_then(|tag| {
-                let run = Command::new("docker")
+                let run = crate::test_support::runtime_cmd()
                     .args(["run", "--rm", &tag, "cat", "/opt/marker"])
                     .output()
                     .unwrap();
-                let _ = Command::new("docker").args(["rmi", "-f", &tag]).output();
+                let _ = crate::test_support::runtime_cmd().args(["rmi", "-f", &tag]).output();
                 if !run.status.success() {
                     return Err(String::from_utf8_lossy(&run.stderr).into_owned());
                 }
@@ -968,7 +966,6 @@ chmod +x ./devcontainer-features-install.sh && \
     /// executes feature entrypoint, then image entrypoint, then the command.
     #[test_utils::docker_test]
     fn entrypoint_chain_builds_with_docker() -> Result<(), &'static str> {
-        use std::process::Command;
 
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -980,14 +977,14 @@ chmod +x ./devcontainer-features-install.sh && \
         let build = |dockerfile: &str| {
             let path = ctx.join("Dockerfile");
             std::fs::write(&path, dockerfile).unwrap();
-            Command::new("docker")
+            crate::test_support::runtime_cmd()
                 .args(["build", "-q", "-t", &tag, "-f", &path.to_string_lossy(), &ctx.to_string_lossy()])
                 .output()
                 .unwrap()
         };
         let cleanup = || {
             let _ = std::fs::remove_dir_all(&ctx);
-            let _ = Command::new("docker").args(["rmi", "-f", &tag]).output();
+            let _ = crate::test_support::runtime_cmd().args(["rmi", "-f", &tag]).output();
         };
 
         // Stand-in for the features build: a feature entrypoint baked in, and
@@ -1017,7 +1014,7 @@ ENTRYPOINT [\"/bin/sh\", \"-c\", \"echo image >> /tmp/log; exec \\\"$@\\\"\", \"
             if !chained.status.success() {
                 return Err(String::from_utf8_lossy(&chained.stderr).into_owned());
             }
-            let run = Command::new("docker")
+            let run = crate::test_support::runtime_cmd()
                 .args(["run", "--rm", &tag, "sh", "-c", "echo cmd >> /tmp/log; cat /tmp/log"])
                 .output()
                 .unwrap();

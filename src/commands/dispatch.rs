@@ -2011,19 +2011,18 @@ folder = "."
     /// `handle_with` (argv from `exec_argv`, the helper's `run` commands).
     #[test_utils::docker_test(helper)]
     fn runs_in_a_child_container_with_docker() -> Result<(), &'static str> {
-        use std::process::Command;
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let name = format!("devsandbox-dispatch-runs-test-{stamp}");
-        let up = Command::new("docker")
+        let up = crate::test_support::runtime_cmd()
             .args(["run", "-d", "--rm", "--name", &name, "alpine:3.20", "sleep", "300"])
             .output()
             .unwrap();
         assert!(up.status.success(), "{}", String::from_utf8_lossy(&up.stderr));
         let cleanup = || {
-            let _ = Command::new("docker").args(["rm", "-f", &name]).output();
+            let _ = crate::test_support::runtime_cmd().args(["rm", "-f", &name]).output();
         };
         crate::test_support::with_cleanup(cleanup, || {
             let arch = crate::devsbd::install(&name, None).unwrap();

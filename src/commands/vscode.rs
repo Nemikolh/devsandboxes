@@ -339,20 +339,20 @@ mod tests {
             .unwrap()
             .as_nanos();
         let name = format!("devsandbox-vscode-goto-test-{stamp}");
-        let up = Command::new("docker")
+        let up = crate::test_support::runtime_cmd()
             .args(["run", "-d", "--rm", "--name", &name, "python:3.13-alpine", "sleep", "300"])
             .output()
             .unwrap();
         assert!(up.status.success(), "{}", String::from_utf8_lossy(&up.stderr));
         let cleanup = || {
-            let _ = Command::new("docker").args(["rm", "-f", &name]).output();
+            let _ = crate::test_support::runtime_cmd().args(["rm", "-f", &name]).output();
         };
         crate::test_support::with_cleanup(cleanup, || {
             crate::devsbd::install(&name, None).unwrap();
             crate::devsbd::fake_vscode_window(&name);
             let outcome = goto_in(&name, "/workspaces/repo/", &goto("src/a.rs", Some(4), Some(2)));
             assert_eq!(outcome, GotoOutcome::Opened);
-            let argv = Command::new("docker").args(["exec", &name, "cat", "/tmp/rec/argv"]).output().unwrap();
+            let argv = crate::test_support::runtime_cmd().args(["exec", &name, "cat", "/tmp/rec/argv"]).output().unwrap();
             assert_eq!(String::from_utf8_lossy(&argv.stdout), "-g\n/workspaces/repo/src/a.rs:4:2\n");
         });
         Ok(())

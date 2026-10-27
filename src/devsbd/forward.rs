@@ -916,10 +916,10 @@ mod tests {
         // daemon dials). `-lk` keeps serving across connects.
         let serve = "busybox nc -lk -s 127.0.0.1 -p 8080 -e cat";
         let cleanup = || {
-            let _ = Command::new("docker").args(["rm", "-f", &name]).output();
+            let _ = crate::test_support::runtime_cmd().args(["rm", "-f", &name]).output();
         };
         crate::test_support::with_cleanup(cleanup, || {
-            assert!(ok(Command::new("docker").args(["run", "-d", "--name", &name, "alpine:3.20", "sh", "-c", serve])));
+            assert!(ok(crate::test_support::runtime_cmd().args(["run", "-d", "--name", &name, "alpine:3.20", "sh", "-c", serve])));
             let arch = install(&name, None).unwrap();
 
             let forward = Forward::start(ForwardSpec {
@@ -1017,10 +1017,10 @@ mod tests {
         let name = format!("devsandbox-fwd-procs-{stamp}");
         let serve = "busybox nc -lk -s 127.0.0.1 -p 8080 -e cat";
         let cleanup = || {
-            let _ = Command::new("docker").args(["rm", "-f", &name]).output();
+            let _ = crate::test_support::runtime_cmd().args(["rm", "-f", &name]).output();
         };
         crate::test_support::with_cleanup(cleanup, || {
-            assert!(ok(Command::new("docker").args(["run", "-d", "--name", &name, "alpine:3.20", "sh", "-c", serve])));
+            assert!(ok(crate::test_support::runtime_cmd().args(["run", "-d", "--name", &name, "alpine:3.20", "sh", "-c", serve])));
             let arch = install(&name, None).unwrap();
             let fallback = || -> Box<dyn Fn(&str, u16) -> Option<String> + Send + Sync> {
                 Box::new(|container, _| Some(format!("fallback in {container}")))
@@ -1087,10 +1087,10 @@ mod tests {
         let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let name = format!("devsandbox-fwd-closed-{stamp}");
         let cleanup = || {
-            let _ = Command::new("docker").args(["rm", "-f", &name]).output();
+            let _ = crate::test_support::runtime_cmd().args(["rm", "-f", &name]).output();
         };
         crate::test_support::with_cleanup(cleanup, || {
-            assert!(ok(Command::new("docker").args(["run", "-d", "--name", &name, "alpine:3.20", "sleep", "300"])));
+            assert!(ok(crate::test_support::runtime_cmd().args(["run", "-d", "--name", &name, "alpine:3.20", "sleep", "300"])));
             let arch = install(&name, None).unwrap();
             // Port 9: nothing listening → the daemon's dial is refused.
             let forward = Forward::start(ForwardSpec {
@@ -1133,7 +1133,7 @@ mod tests {
         let name = format!("devsandbox-fwd-heal-{stamp}");
         let serve = "busybox nc -lk -s 127.0.0.1 -p 8080 -e cat";
         let cleanup = || {
-            let _ = Command::new("docker").args(["rm", "-f", &name]).output();
+            let _ = crate::test_support::runtime_cmd().args(["rm", "-f", &name]).output();
         };
         let echo_ok = |addr: SocketAddr| -> bool {
             for _ in 0..40 {
@@ -1151,7 +1151,7 @@ mod tests {
             false
         };
         crate::test_support::with_cleanup(cleanup, || {
-            assert!(ok(Command::new("docker").args(["run", "-d", "--name", &name, "alpine:3.20", "sh", "-c", serve])));
+            assert!(ok(crate::test_support::runtime_cmd().args(["run", "-d", "--name", &name, "alpine:3.20", "sh", "-c", serve])));
             let arch = install(&name, None).unwrap();
             let forward = Forward::start(ForwardSpec {
                 bind: LOOPBACK,
@@ -1165,7 +1165,7 @@ mod tests {
             assert!(echo_ok(addr), "echo before restart");
 
             // Restart the container: the bridge's exec dies, the daemon is gone.
-            assert!(ok(Command::new("docker").args(["restart", "-t", "1", &name])));
+            assert!(ok(crate::test_support::runtime_cmd().args(["restart", "-t", "1", &name])));
             // The supervisor notices, waits the retry gap, re-resolves and
             // respawns; the helper survives the restart so the bridge revives.
             assert!(echo_ok(addr), "echo after restart (healed)");

@@ -114,11 +114,10 @@ mod tests {
 
     /// The point of the profile: an unprivileged user can create a user
     /// namespace under it, and not under docker's default.
-    #[test_utils::docker_test]
+    #[test_utils::docker_test(docker_only)]
     fn allows_unprivileged_userns_with_docker() -> Result<(), &'static str> {
-        use std::process::Command;
         let image = "alpine:3.20";
-        let pulled = Command::new("docker").args(["pull", "-q", image]).output().map_err(|_| "cannot run docker")?;
+        let pulled = crate::test_support::runtime_cmd().args(["pull", "-q", image]).output().map_err(|_| "cannot run docker")?;
         if !pulled.status.success() {
             return Err("cannot pull alpine:3.20");
         }
@@ -129,7 +128,7 @@ mod tests {
             || {
                 let path = ensure_file_in(&dir).map_err(|_| "cannot write the profile")?;
                 let unshare = |opts: &[String]| {
-                    let out = Command::new("docker")
+                    let out = crate::test_support::runtime_cmd()
                         .args(["run", "--rm", "--user", "1000:1000"])
                         .args(opts)
                         .args([image, "unshare", "-Ur", "true"])

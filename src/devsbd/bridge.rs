@@ -1710,7 +1710,7 @@ mod tests {
         let mut agent = Command::new("ssh-agent").arg("-D").arg("-a").arg(&sock).stdout(Stdio::null()).spawn().unwrap();
         let cleanup = || {
             let _ = agent.kill();
-            let _ = Command::new("docker").args(["rm", "-f", &name]).output();
+            let _ = crate::test_support::runtime_cmd().args(["rm", "-f", &name]).output();
             let _ = std::fs::remove_dir_all(&tmp);
         };
         crate::test_support::with_cleanup(cleanup, || {
@@ -1725,8 +1725,8 @@ mod tests {
                 .arg(&key)));
             assert!(ok(Command::new("ssh-add").arg(&key).env("SSH_AUTH_SOCK", &sock)));
 
-            assert!(ok(Command::new("docker").args(["run", "-d", "--name", &name, "alpine:3.20", "sleep", "300"])));
-            if !ok(Command::new("docker").args(["exec", &name, "apk", "add", "--no-cache", "-q", "openssh-client-default"])) {
+            assert!(ok(crate::test_support::runtime_cmd().args(["run", "-d", "--name", &name, "alpine:3.20", "sleep", "300"])));
+            if !ok(crate::test_support::runtime_cmd().args(["exec", &name, "apk", "add", "--no-cache", "-q", "openssh-client-default"])) {
                 return Err("apk add failed (no network?)");
             }
             let arch = install(&name, None).unwrap();
@@ -1735,7 +1735,7 @@ mod tests {
                 spawn_with(&name, hash(arch).unwrap(), Some(move || Some(agent_path.clone())), None).unwrap()
             };
             let ssh_add = || {
-                Command::new("docker")
+                crate::test_support::runtime_cmd()
                     .args(["exec", "-e", "SSH_AUTH_SOCK=/run/devsandbox/ssh-agent.sock", &name, "ssh-add", "-l"])
                     .stdout(Stdio::piped())
                     .spawn()
@@ -1743,7 +1743,7 @@ mod tests {
             };
             let list = || String::from_utf8_lossy(&ssh_add().wait_with_output().unwrap().stdout).into_owned();
             let pidfile = || {
-                let out = Command::new("docker").args(["exec", &name, "cat", "/run/devsandbox/devsbd.pid"]).output().unwrap();
+                let out = crate::test_support::runtime_cmd().args(["exec", &name, "cat", "/run/devsandbox/devsbd.pid"]).output().unwrap();
                 String::from_utf8_lossy(&out.stdout).trim().to_string()
             };
 
@@ -1789,7 +1789,7 @@ mod tests {
             let old = pidfile();
             let old_pid = old.split_whitespace().next().unwrap().to_string();
             let fake = format!("printf '{old_pid} outdated\\n' > /run/devsandbox/devsbd.pid");
-            assert!(ok(Command::new("docker").args(["exec", &name, "sh", "-c", &fake])));
+            assert!(ok(crate::test_support::runtime_cmd().args(["exec", &name, "sh", "-c", &fake])));
             start_daemon(&name);
             let mut replaced = false;
             for _ in 0..50 {
@@ -1822,7 +1822,7 @@ mod tests {
             // start_daemon: the next bridge revives it and the key lists.
             drop(fresh);
             let killed = "kill $(cut -d' ' -f1 /run/devsandbox/devsbd.pid)";
-            assert!(ok(Command::new("docker").args(["exec", &name, "sh", "-c", killed])));
+            assert!(ok(crate::test_support::runtime_cmd().args(["exec", &name, "sh", "-c", killed])));
             let revived = bridge();
             assert_eq!(revived.outcome(Duration::from_secs(10)), Some(Ok(())), "revived daemon");
             assert!(list().contains("devsbd-relay-test"), "via revived daemon");
@@ -1849,7 +1849,7 @@ mod tests {
         let mut agent = Command::new("ssh-agent").arg("-D").arg("-a").arg(&sock).stdout(Stdio::null()).spawn().unwrap();
         let cleanup = || {
             let _ = agent.kill();
-            let _ = Command::new("docker").args(["rm", "-f", &name]).output();
+            let _ = crate::test_support::runtime_cmd().args(["rm", "-f", &name]).output();
             let _ = std::fs::remove_dir_all(&tmp);
         };
         crate::test_support::with_cleanup(cleanup, || {
@@ -1863,14 +1863,14 @@ mod tests {
                 .args(["-q", "-t", "ed25519", "-N", "", "-C", "devsbd-agentroute", "-f"])
                 .arg(&key)));
             assert!(ok(Command::new("ssh-add").arg(&key).env("SSH_AUTH_SOCK", &sock)));
-            assert!(ok(Command::new("docker").args(["run", "-d", "--name", &name, "alpine:3.20", "sleep", "300"])));
-            if !ok(Command::new("docker").args(["exec", &name, "apk", "add", "--no-cache", "-q", "openssh-client-default"])) {
+            assert!(ok(crate::test_support::runtime_cmd().args(["run", "-d", "--name", &name, "alpine:3.20", "sleep", "300"])));
+            if !ok(crate::test_support::runtime_cmd().args(["exec", &name, "apk", "add", "--no-cache", "-q", "openssh-client-default"])) {
                 return Err("apk add failed (no network?)");
             }
             let arch = install(&name, None).unwrap();
             start_daemon(&name);
             let list = || {
-                let out = Command::new("docker")
+                let out = crate::test_support::runtime_cmd()
                     .args(["exec", "-e", "SSH_AUTH_SOCK=/run/devsandbox/ssh-agent.sock", &name, "ssh-add", "-l"])
                     .output()
                     .unwrap();
@@ -1926,17 +1926,17 @@ mod tests {
         let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let name = format!("devsandbox-notify-test-{stamp}");
         let cleanup = || {
-            let _ = Command::new("docker").args(["rm", "-f", &name]).output();
+            let _ = crate::test_support::runtime_cmd().args(["rm", "-f", &name]).output();
         };
         crate::test_support::with_cleanup(cleanup, || {
-            assert!(ok(Command::new("docker").args(["run", "-d", "--name", &name, "alpine:3.20", "sleep", "300"])));
+            assert!(ok(crate::test_support::runtime_cmd().args(["run", "-d", "--name", &name, "alpine:3.20", "sleep", "300"])));
             let arch = install(&name, None).unwrap();
             start_daemon(&name);
             let (to, rx) = services("notify-test", no_control());
             let none: Option<fn() -> Option<PathBuf>> = None;
             let bridge = spawn_with(&name, hash(arch).unwrap(), none, Some(to)).unwrap();
             assert_eq!(bridge.outcome(Duration::from_secs(10)), Some(Ok(())), "bridge handshake");
-            assert!(ok(Command::new("docker").args(["exec", &name, BIN, "notify", "--key", "k", "hello"])));
+            assert!(ok(crate::test_support::runtime_cmd().args(["exec", &name, BIN, "notify", "--key", "k", "hello"])));
             let got = rx.recv_timeout(Duration::from_secs(15)).expect("notification delivered");
             assert_eq!(got.instance, "notify-test");
             assert_eq!(
@@ -1954,7 +1954,7 @@ mod tests {
             let list = format!("ls -A {}", notify::OUTBOX);
             let mut empty = false;
             for _ in 0..50 {
-                let out = Command::new("docker").args(["exec", &name, "sh", "-c", &list]).output().unwrap();
+                let out = crate::test_support::runtime_cmd().args(["exec", &name, "sh", "-c", &list]).output().unwrap();
                 if out.status.success() && out.stdout.is_empty() {
                     empty = true;
                     break;
@@ -1976,23 +1976,23 @@ mod tests {
         let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let name = format!("devsandbox-thread-test-{stamp}");
         let cleanup = || {
-            let _ = Command::new("docker").args(["rm", "-f", &name]).output();
+            let _ = crate::test_support::runtime_cmd().args(["rm", "-f", &name]).output();
         };
         crate::test_support::with_cleanup(cleanup, || {
-            assert!(ok(Command::new("docker").args(["run", "-d", "--name", &name, "alpine:3.20", "sleep", "300"])));
+            assert!(ok(crate::test_support::runtime_cmd().args(["run", "-d", "--name", &name, "alpine:3.20", "sleep", "300"])));
             let arch = install(&name, None).unwrap();
             start_daemon(&name);
 
             // No bridge yet, so nothing can drain: both puts sit in the outbox.
             let put = |title: &str| {
                 let json = format!(r#"{{"key":"pr-1","title":"{title}","state":"active"}}"#);
-                ok(Command::new("docker").args(["exec", &name, BIN, "thread", "put", "--json", &json]))
+                ok(crate::test_support::runtime_cmd().args(["exec", &name, BIN, "thread", "put", "--json", &json]))
             };
             assert!(put("first"));
             assert!(put("second"));
-            assert!(ok(Command::new("docker").args(["exec", &name, BIN, "notify", "--key", "pr-1", "hello"])));
+            assert!(ok(crate::test_support::runtime_cmd().args(["exec", &name, BIN, "notify", "--key", "pr-1", "hello"])));
             let count = format!("ls -A {} | wc -l", notify::OUTBOX);
-            let out = Command::new("docker").args(["exec", &name, "sh", "-c", &count]).output().unwrap();
+            let out = crate::test_support::runtime_cmd().args(["exec", &name, "sh", "-c", &count]).output().unwrap();
             assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "2", "the first put was replaced");
 
             let (to, rx) = services("thread-test", no_control());
@@ -2024,13 +2024,13 @@ mod tests {
         let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let name = format!("devsandbox-send-test-{stamp}");
         let cleanup = || {
-            let _ = Command::new("docker").args(["rm", "-f", &name]).output();
+            let _ = crate::test_support::runtime_cmd().args(["rm", "-f", &name]).output();
         };
         crate::test_support::with_cleanup(cleanup, || {
-            assert!(ok(Command::new("docker").args(["run", "-d", "--name", &name, "alpine:3.20", "sleep", "300"])));
+            assert!(ok(crate::test_support::runtime_cmd().args(["run", "-d", "--name", &name, "alpine:3.20", "sleep", "300"])));
             let arch = install(&name, None).unwrap();
             start_daemon(&name);
-            let devsbd = |args: &[&str]| Command::new("docker").args(["exec", &name, BIN]).args(args).output().unwrap();
+            let devsbd = |args: &[&str]| crate::test_support::runtime_cmd().args(["exec", &name, BIN]).args(args).output().unwrap();
 
             let features = devsbd(&["features"]);
             assert!(String::from_utf8_lossy(&features.stdout).lines().any(|l| l == "thread-send"), "{features:?}");
@@ -2049,7 +2049,7 @@ mod tests {
             assert_eq!(bad.status.code(), Some(2), "{bad:?}");
             assert!(String::from_utf8_lossy(&bad.stderr).contains("bad id `Bad`"), "{bad:?}");
             let count = format!("ls -A {} | wc -l", notify::OUTBOX);
-            let out = Command::new("docker").args(["exec", &name, "sh", "-c", &count]).output().unwrap();
+            let out = crate::test_support::runtime_cmd().args(["exec", &name, "sh", "-c", &count]).output().unwrap();
             assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "3", "put, send a, withdraw b");
 
             let (to, rx) = services("send-test", no_control());
@@ -2079,13 +2079,13 @@ mod tests {
         let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let name = format!("devsandbox-control-test-{stamp}");
         let cleanup = || {
-            let _ = Command::new("docker").args(["rm", "-f", &name]).output();
+            let _ = crate::test_support::runtime_cmd().args(["rm", "-f", &name]).output();
         };
         crate::test_support::with_cleanup(cleanup, || {
-            assert!(ok(Command::new("docker").args(["run", "-d", "--name", &name, "alpine:3.20", "sleep", "300"])));
+            assert!(ok(crate::test_support::runtime_cmd().args(["run", "-d", "--name", &name, "alpine:3.20", "sleep", "300"])));
             let arch = install(&name, None).unwrap();
             start_daemon(&name);
-            let ensure = || Command::new("docker").args(["exec", &name, BIN, "ensure", "web", "--key", "pr-1"]).output().unwrap();
+            let ensure = || crate::test_support::runtime_cmd().args(["exec", &name, BIN, "ensure", "web", "--key", "pr-1"]).output().unwrap();
 
             // Daemon up, no bridge: fail fast with the no-host code.
             let out = ensure();
@@ -2118,7 +2118,7 @@ mod tests {
             assert_eq!((req.op, req.sandbox.as_deref(), req.key.as_deref()), (control::Op::Ensure, Some("web"), Some("pr-1")));
 
             // A usage error never reaches the host.
-            let out = Command::new("docker").args(["exec", &name, BIN, "ensure", "web"]).output().unwrap();
+            let out = crate::test_support::runtime_cmd().args(["exec", &name, BIN, "ensure", "web"]).output().unwrap();
             assert_eq!(out.status.code(), Some(control::EXIT_USAGE), "{out:?}");
             assert!(calls.recv_timeout(Duration::from_millis(200)).is_err());
 
@@ -2185,7 +2185,7 @@ mod tests {
     /// lines arrive on the receiver; the child is returned for its exit code.
     fn follower(name: &str) -> (std::process::Child, mpsc::Receiver<String>) {
         use std::io::BufRead;
-        let mut child = Command::new("docker")
+        let mut child = crate::test_support::runtime_cmd()
             .args(["exec", name, BIN, "events", "--follow"])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -2237,11 +2237,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("devsandbox-follow-docker-{stamp}"));
         let path = dir.join("inbox.json");
         let cleanup = || {
-            let _ = Command::new("docker").args(["rm", "-f", &name]).output();
+            let _ = crate::test_support::runtime_cmd().args(["rm", "-f", &name]).output();
             let _ = std::fs::remove_dir_all(&dir);
         };
         crate::test_support::with_cleanup(cleanup, || {
-            assert!(ok(Command::new("docker").args(["run", "-d", "--name", &name, "alpine:3.20", "sleep", "300"])));
+            assert!(ok(crate::test_support::runtime_cmd().args(["run", "-d", "--name", &name, "alpine:3.20", "sleep", "300"])));
             let arch = install(&name, None).unwrap();
             start_daemon(&name);
             host_reply(&path, OWNER, "before");
@@ -2262,7 +2262,7 @@ mod tests {
                 assert_eq!(bridge.outcome(Duration::from_secs(10)), Some(Ok(())), "bridge handshake");
                 // The host's `Caps` lands just after the handshake: wait for a
                 // routable control op before following.
-                let ls = || Command::new("docker").args(["exec", &name, BIN, "ls"]).output().unwrap().status.code();
+                let ls = || crate::test_support::runtime_cmd().args(["exec", &name, BIN, "ls"]).output().unwrap().status.code();
                 let mut code = ls();
                 for _ in 0..50 {
                     if code == Some(0) {
@@ -2301,7 +2301,7 @@ mod tests {
             let (mut third, third_rx) = follower(&name);
             assert_eq!(next_event(&third_rx).map(|l| text(&l)).as_deref(), Some("before"));
             let kill = "kill $(cut -d' ' -f1 /run/devsandbox/devsbd.pid)";
-            assert!(ok(Command::new("docker").args(["exec", &name, "sh", "-c", kill])));
+            assert!(ok(crate::test_support::runtime_cmd().args(["exec", &name, "sh", "-c", kill])));
             assert_eq!(exit_within(&mut third, 20), Some(control::EXIT_NO_HOST), "daemon killed");
             Ok(())
         })
@@ -2325,10 +2325,10 @@ mod tests {
         // dials. `-lk` keeps it serving across connects.
         let serve = "busybox nc -lk -s 127.0.0.1 -p 8080 -e cat";
         let cleanup = || {
-            let _ = Command::new("docker").args(["rm", "-f", &name]).output();
+            let _ = crate::test_support::runtime_cmd().args(["rm", "-f", &name]).output();
         };
         crate::test_support::with_cleanup(cleanup, || {
-            assert!(ok(Command::new("docker").args(["run", "-d", "--name", &name, "alpine:3.20", "sh", "-c", serve])));
+            assert!(ok(crate::test_support::runtime_cmd().args(["run", "-d", "--name", &name, "alpine:3.20", "sh", "-c", serve])));
             let arch = install(&name, None).unwrap();
             start_daemon(&name);
             let none: Option<fn() -> Option<PathBuf>> = None;

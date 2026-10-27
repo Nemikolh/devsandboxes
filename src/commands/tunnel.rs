@@ -453,10 +453,10 @@ mod tests {
         let name = format!("devsandbox-fwd-tunnel-{stamp}");
         let serve = "busybox nc -lk -s 127.0.0.1 -p 8080 -e cat";
         let cleanup = || {
-            let _ = Command::new("docker").args(["rm", "-f", &name]).output();
+            let _ = crate::test_support::runtime_cmd().args(["rm", "-f", &name]).output();
         };
         crate::test_support::with_cleanup(cleanup, || {
-            assert!(ok(Command::new("docker").args(["run", "-d", "--name", &name, "alpine:3.20", "sh", "-c", serve])));
+            assert!(ok(crate::test_support::runtime_cmd().args(["run", "-d", "--name", &name, "alpine:3.20", "sh", "-c", serve])));
             let arch = crate::devsbd::install(&name, None).unwrap();
             let header = Header::Route {
                 label: "web:8080".into(),

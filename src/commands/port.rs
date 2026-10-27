@@ -1154,7 +1154,6 @@ image = "node"
 
     // ---- docker-gated: listening_procs ----
 
-    use std::process::Command;
 
     /// Docker-gated: a container with `lsof` running a loopback listener yields
     /// the listening process; a container without `lsof` yields `None`. Skips
@@ -1173,10 +1172,10 @@ image = "node"
         let without = format!("devsandbox-lsof-no-{stamp}");
         let cleanup = || {
             for n in [&with, &without] {
-                let _ = Command::new("docker").args(["rm", "-f", n]).output();
+                let _ = crate::test_support::runtime_cmd().args(["rm", "-f", n]).output();
             }
         };
-        let run_ok = |args: &[&str]| matches!(Command::new("docker").args(args).output(), Ok(o) if o.status.success());
+        let run_ok = |args: &[&str]| matches!(crate::test_support::runtime_cmd().args(args).output(), Ok(o) if o.status.success());
 
         crate::test_support::with_cleanup(cleanup, || {
             // Listener: keep the container up on a trivial command, then add
