@@ -17,12 +17,15 @@
 //!   its ssh to the hub.
 //! - `lent`: what a hub may do over that link (the daemon's `Worker`
 //!   connection table).
+//! - `transfer`: one bulk transfer on the link's `TRANSFER` streams (either
+//!   way) and each end's receivers by kind.
 
 pub mod lend;
 pub mod lender;
 pub mod lent;
 pub mod link;
 pub mod offer;
+pub mod transfer;
 pub mod worker;
 
 use crate::devsbd::proto::{caps, channel};
@@ -31,7 +34,9 @@ use crate::devsbd::proto::{caps, channel};
 /// connection to the opener's socket. Its sentinel is `devsandbox-fleet 1`.
 /// Each `API` stream starts with the API relay's own sentinel line
 /// (`relay::write_sentinel`), written by the worker's answer, so a stream
-/// reads as an ssh relay does to `machines::link::handshake`.
+/// reads as an ssh relay does to `machines::link::handshake`. Both ends
+/// also carry `TRANSFER` streams ([`transfer`], `link::opener_with` /
+/// `link::answerer_with`).
 pub const LINK: link::Spec = link::Spec {
     name: "fleet link",
     serves: "API",

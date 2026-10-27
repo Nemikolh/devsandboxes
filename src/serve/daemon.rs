@@ -430,13 +430,16 @@ fn start_lending(opts: &Options, shared: &Arc<Shared>) {
     let env = opts.lend_env.clone().unwrap_or_else(|| super::verbs_client::caller_env(std::env::vars_os()));
     let transport = opts.lend_transport.clone().unwrap_or_else(fleet::worker::ssh_transport);
     let timing = opts.machine_timing;
+    // What the hub may send this worker: no kind yet (fleet step 2c adds
+    // the hub's binary).
+    let receivers = Arc::new(fleet::transfer::Receivers::new(log));
     // Weak: the lender lives in `shared`.
     let weak = Arc::downgrade(shared);
     let spawn: fleet::lender::Spawn = Box::new(move |start: fleet::lender::Start| {
         let scope = Arc::new(lent::Scope { hub: start.hub.clone(), root: start.root.clone(), env: env.clone() });
         let weak = weak.clone();
         let open: fleet::worker::Open = Arc::new(move || weak.upgrade()?.open_lent(&scope));
-        fleet::worker::Lending::spawn(start.hub, start.name, start.root, start.draining, transport.clone(), open, timing, log)
+        fleet::worker::Lending::spawn(start.hub, start.name, start.root, start.draining, transport.clone(), open, receivers.clone(), timing, log)
     });
     let lender = shared.lender.get_or_init(|| fleet::lender::Lender::new(path, link::hostname(), spawn, log));
     lender.start();

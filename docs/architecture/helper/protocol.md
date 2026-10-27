@@ -72,12 +72,17 @@ host, only toward a daemon advertising `caps::RPC`. `API` = 6: never on a
 container's link; between two hosts' `serve::fleet::link` ends
 ([fleet](../daemon/fleet.md)), opened by the end with the socket toward a
 peer advertising `caps::API`, each stream one connection to a host
-daemon's API.
+daemon's API. `TRANSFER` = 7: never on a container's link either; one bulk
+transfer between two hosts' link ends (a header line, the body, a one-line
+answer: [fleet](../daemon/fleet.md#transfer)), opened by either end toward
+a peer advertising `caps::TRANSFER`: the end with the socket with ids below
+2^31, the other end with high-bit ids, which the first admits through
+`Mux::on_host_open`.
 
 Whether a channel's streams are legacy or flow-controlled (see
 [Mux](#mux)) is a property of the channel, `proto::channel::flows`, so both
-ends agree without a flag on the wire: `RPC` and `API` flow, the rest are
-legacy.
+ends agree without a flag on the wire: `RPC`, `API` and `TRANSFER` flow,
+the rest are legacy.
 
 ### Caps
 
@@ -86,7 +91,8 @@ Bitset, unknown bits ignored: `TCP_FORWARD` (daemon serves `Connect`),
 `Open(RPC)`; sent by every daemon, `DAEMON_CAPS` in
 `devsbd/src/daemon.rs`), `SSH_AGENT`, `NOTIFY`, `CONTROL` (host serves
 those channels), `API` (a fleet link's answerer serves `channel::API`;
-host-to-host only). The host sends
+host-to-host only), `TRANSFER` (the peer receives `channel::TRANSFER`;
+both ends of a fleet link, host-to-host only). The host sends
 `Caps` after the handshake (`SSH_AGENT` only when it has a live agent;
 `NOTIFY | CONTROL` only on the serve daemon's bridges). Until a bridge's
 `Caps` arrives the daemon treats it as capable of nothing, except a bridge
@@ -162,7 +168,7 @@ Two stream kinds share a connection:
   local socket, which is how request/response streams work: the daemon sends
   the request then `Eof`, the host replies and closes.
 - **Flow-controlled** (`Connect`: forwarded TCP; `Open` on a flowing
-  channel: `RPC`). Both ends register the stream as flowing: the opener in
+  channel: `RPC`, `API`, `TRANSFER`). Both ends register the stream as flowing: the opener in
   `Mux::connect` / `Mux::open_host` (the host's `Open`, handing the caller
   one end of a socket pair), the acceptor when it admits the `Open`. Per-direction credit
   starting at `INITIAL_WINDOW` (256 KiB), `Window` granted once half is

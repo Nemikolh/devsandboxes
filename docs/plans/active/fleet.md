@@ -14,7 +14,10 @@ shipped: keep-alive, offered links always held, `remotes.json`
 `serve::capacity`, the report in every root's snapshot and on
 `SnapshotMachine`, `[caps]` in `lend.toml`, offered entries' fleet root
 (`fleet-link --root`), LEND / CAPACITY in the Machines tab and `machine
-ls`
+ls`; 2a (`TRANSFER`) shipped: `channel::TRANSFER` both ways on the fleet
+link (`fleet-<name>.transfer.sock` hub → worker, the answerer's `Outlet`
+worker → hub), `serve::fleet::transfer` (header line, `ready`, body, `ok` /
+`error`), receivers by kind with none registered yet
 ([fleet](../../architecture/daemon/fleet.md), ADR
 [0041](../../decisions/0041-fleet-workers-dial-their-hub.md)); the rest
 is design. Builds on [machines](../../architecture/daemon/machines.md)

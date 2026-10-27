@@ -93,6 +93,14 @@ pub fn fleet_socket(dir: &Path, worker: &str) -> PathBuf {
     dir.join(format!("fleet-{}.sock", agent_socket_name(worker)))
 }
 
+/// An offered fleet worker's transfer socket in `dir` (docs/architecture/daemon/fleet.md,
+/// *Transfer*): `fleet-<worker>.transfer.sock`, bound by its `fleet-link`
+/// next to [`fleet_socket`]; each connection there is one `TRANSFER`
+/// stream to the worker.
+pub fn fleet_transfer_socket(dir: &Path, worker: &str) -> PathBuf {
+    dir.join(format!("fleet-{}.transfer.sock", agent_socket_name(worker)))
+}
+
 fn agent_socket_name(client: &str) -> String {
     let safe: String = client
         .chars()
@@ -179,22 +187,27 @@ impl Listener {
 /// [`Listener::accept_timeout`] on any non-blocking `listener` (an agent
 /// relay's too): wait up to `timeout`, `Ok(None)` when no connection came.
 pub fn accept_timeout(listener: &UnixListener, timeout: Duration) -> io::Result<Option<Stream>> {
-    let mut fd = libc::pollfd { fd: listener.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+    Ok(accept_any(&[listener], timeout)?.map(|(_, stream)| stream))
+}
+
+/// [`accept_timeout`] over several non-blocking listeners at once: a
+/// connection on the first ready one, with its index in `listeners`.
+pub fn accept_any(listeners: &[&UnixListener], timeout: Duration) -> io::Result<Option<(usize, Stream)>> {
+    let mut fds: Vec<libc::pollfd> =
+        listeners.iter().map(|l| libc::pollfd { fd: l.as_raw_fd(), events: libc::POLLIN, revents: 0 }).collect();
     let ms = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
-    // SAFETY: one valid pollfd for the duration of the call.
-    let n = unsafe { libc::poll(&mut fd, 1, ms) };
+    // SAFETY: `fds` is valid for its length for the duration of the call.
+    let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, ms) };
     if n < 0 {
         let e = io::Error::last_os_error();
         return if e.kind() == io::ErrorKind::Interrupted { Ok(None) } else { Err(e) };
     }
-    if n == 0 {
-        return Ok(None);
-    }
-    match listener.accept() {
-        Ok((stream, _)) => {
+    let Some(i) = fds.iter().position(|fd| fd.revents != 0) else { return Ok(None) };
+    match listeners[i].accept().map(|(stream, _)| (i, stream)) {
+        Ok((i, stream)) => {
             // macOS hands out accepted sockets with the listener's O_NONBLOCK.
             stream.set_nonblocking(false)?;
-            Ok(Some(stream))
+            Ok(Some((i, stream)))
         }
         Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
         Err(e) => Err(e),
@@ -283,6 +296,7 @@ mod tests {
     fn fleet_sockets_are_named_after_the_worker() {
         let dir = Path::new("/run/user/1000/devsandbox");
         assert_eq!(fleet_socket(dir, "lap.top"), dir.join("fleet-lap.top.sock"));
+        assert_eq!(fleet_transfer_socket(dir, "lap.top"), dir.join("fleet-lap.top.transfer.sock"));
         let long = fleet_socket(dir, &"w".repeat(80));
         assert_eq!(long.file_name().unwrap().len(), "fleet-".len() + AGENT_CLIENT_MAX + ".sock".len());
     }

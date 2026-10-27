@@ -65,13 +65,18 @@ pub mod channel {
     /// answerer connects it to a daemon. Only opened toward a peer that
     /// advertised `caps::API`; never used with a container.
     pub const API: u8 = 6;
+    /// One bulk transfer between two hosts' `serve::fleet::link` ends (a
+    /// header line, the body, a one-line answer: `serve::fleet::transfer`),
+    /// opened by either end toward a peer that advertised `caps::TRANSFER`;
+    /// never used with a container.
+    pub const TRANSFER: u8 = 7;
 
     /// Whether `Open` on `channel` makes a flow-controlled stream (window
     /// credit, `Eof` half-close, its own writer thread, like `Connect`) rather
     /// than a legacy one. A property of the channel, so both ends agree
     /// without a flag on the wire.
     pub const fn flows(channel: u8) -> bool {
-        matches!(channel, RPC | API)
+        matches!(channel, RPC | API | TRANSFER)
     }
 }
 
@@ -110,6 +115,10 @@ pub mod caps {
     /// The peer answers `channel::API` streams (a fleet link's answerer).
     #[allow(dead_code)] // host-only: devsbd never sends it
     pub const API: u32 = 1 << 6;
+    /// The peer receives `channel::TRANSFER` streams (both ends of a fleet
+    /// link).
+    #[allow(dead_code)] // host-only: devsbd never sends it
+    pub const TRANSFER: u32 = 1 << 7;
 }
 
 /// Upper bound on the processes one `PortInfo` lists; the helper stops

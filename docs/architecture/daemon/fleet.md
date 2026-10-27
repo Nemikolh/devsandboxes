@@ -9,13 +9,20 @@ dial, and [hub mode](#hub-mode); on the worker `lend.toml`, the lending thread, 
 worker policy and `lend.*` with its CLI, `devsandbox lend` and
 `devsandbox fleet join|leave`
 ([ADR 0041](../../decisions/0041-fleet-workers-dial-their-hub.md)); and
-every daemon's [capacity report](#capacity), carried by its snapshots.
+every daemon's [capacity report](#capacity), carried by its snapshots;
+and the link's [`TRANSFER`](#transfer) streams, both ways, with no
+kind received yet.
 
 Code: `src/serve/fleet/mod.rs` (`LINK`), `src/serve/fleet/link.rs`
-(`Spec`, `opener`, `answerer`, `End`, `write_sentinel`,
-`match_sentinel`), `src/serve/fleet/offer.rs` (`call`, `Ctx`, `accept`,
+(`Spec`, `opener`, `opener_with`, `answerer`, `answerer_with`,
+`OpenerTransfer`, `AnswererTransfer`, `Outlet`, `End`, `write_sentinel`,
+`match_sentinel`), `src/serve/fleet/transfer.rs` (`Header`, `Received`,
+`send`, `receive`, `Receivers`, `parse_header`, `check_header`,
+`check_size`, `encode_reply`, `parse_reply`, `digest`),
+`src/serve/fleet/offer.rs` (`call`, `Ctx`, `accept`,
 `dial`), `src/commands/fleet_link.rs` (`fleet_link`, `run`),
-`src/serve/endpoint.rs` (`fleet_socket`), `src/daemon_config.rs`
+`src/serve/endpoint.rs` (`fleet_socket`, `fleet_transfer_socket`,
+`accept_any`), `src/daemon_config.rs`
 (`ServeConfig::hub`), `src/serve/machines/service.rs` (`Hub`,
 `save_loop`, `log_failure`), `src/serve/machines/saved.rs` (`Saved`,
 `of`, `machines`, `load`, `save`, `save_wait`), `src/serve/snapshots.rs`
@@ -59,7 +66,7 @@ says the far end serves it, and the `Hello` hash (informational).
   the opener with it. Each accepted connection becomes one `Open { channel }` stream
   (`Mux::attach`, ids below 2^31); on a flowing channel
   (`channel::flows`) the stream is flow-controlled. `Open`s from the peer
-  are refused. It returns `Ok` when the reader ends or the writer fails,
+  are refused, but for [`TRANSFER`](#transfer). It returns `Ok` when the reader ends or the writer fails,
   an error when the keepalive (`mux::KEEPALIVE_INTERVAL` /
   `KEEPALIVE_TIMEOUT`) hears nothing or the listener fails. Exiting
   unlinks the socket only while it is still its own (same device and
@@ -93,6 +100,61 @@ answerer's `open` hands back a daemon connection that writes that line
 before the daemon's bytes. So a stream reads exactly like an ssh machine's
 relay, and `machines::link::handshake` (which skips to that line, then
 says its hello) works on it unchanged.
+
+## Transfer
+
+A link may also carry bulk transfers on flowing `TRANSFER` streams, in
+both directions; `fleet::LINK`'s two ends do (`link::opener_with` with an
+`OpenerTransfer`, `link::answerer_with` with an `AnswererTransfer`), the
+agent relay's don't. Both ends then advertise `caps::TRANSFER` in their
+`Hello`s; the opener requires it of the peer, the answerer opens toward
+the opener only when the opener advertised it.
+
+**One transfer per stream** (`serve::fleet::transfer`):
+
+1. The sender writes a header line, JSON (`Header`, `encode_header`):
+   `{"kind":"root-tar","name":"cfg.tar","size":3,"sha256":"ba78…"}`.
+   `kind` (`[a-z0-9-]`, at most 32 bytes: `binary`, `root-tar`, `bundle`)
+   picks the receiver; `name` is a file name (no `/`, not `.`/`..`, at most
+   255 bytes); `size` the body's length; `sha256` its lowercase hex hash
+   (`check_header`). At most `HEADER_MAX` (4 KiB) with its newline.
+2. The receiver (`receive`) checks the header and `size` against its
+   limit (`check_size`), asks its `decide` where the body goes, creates a
+   temp file next to there (`.<file>.<pid>-<n>.part`, 0600, its dir
+   created) and answers `ready` (`READY`); any refusal answers
+   `error <why>` instead and the sender sends no body.
+3. The sender writes exactly `size` raw bytes, then half-closes (`Eof`).
+4. The receiver writes the body into the temp file and requires it to
+   end at `size` (fewer bytes before the `Eof`, or any byte after, is an
+   error) with the header's sha256; then renames it into place.
+5. The receiver answers one line, `ok` or `error <why>` (`encode_reply`),
+   and both close. On any error the temp file is removed; a bad body is
+   first read to its end and dropped (at most `size` plus `DRAIN_EXTRA`,
+   64 KiB): a receiver that closes while the sender is still writing
+   loses its answer on the mux, the sender seeing only a broken pipe.
+   `send` returns the receiver's why as `transfer refused: <why>`.
+
+**Receivers.** Each end hands the `TRANSFER` streams the peer opens to
+its `Receivers`: one entry per kind (`Receivers::with`: a size limit,
+`decide`, and a `done` run with each `Received` after its `ok`). The
+link's callback answers the `Open` with one end of a socket pair
+(`Receivers::accept`) and receives on a `fleet-transfer` thread of its
+own; a kind with no entry is refused ("nothing here receives
+\`<kind>\` transfers"). No end registers a kind yet: the worker daemon's
+`start_lending` and `commands::fleet_link::run` pass empty receivers.
+
+**Hub → worker.** `fleet-link` binds a second socket next to the link's,
+`endpoint::fleet_transfer_socket` (`fleet-<name>.transfer.sock`, bound and
+unlinked like `fleet-<name>.sock`, one accept loop over both:
+`endpoint::accept_any`); each connection there is one `Open { TRANSFER }`
+(an id below 2^31) to the worker, so a hub process connects and calls
+`transfer::send` on it. The worker's answerer hands it to its receivers.
+
+**Worker → hub.** The answerer opens with high-bit ids
+(`Mux::open_host`, through its `Outlet`, set from the `Hello`s until the
+link ends; `Lending::open_transfer` on the worker), and the opener admits
+them through `Mux::on_host_open` (`TRANSFER` only) into its receivers. So
+the two directions never share an id space.
 
 ## Hub side
 

@@ -16,15 +16,22 @@
 //! canonical fleet root, a path on the worker), and holds that connection for the link's
 //! life, so a linked worker keeps the hub's daemon from idling out. A refused
 //! offer (not a hub, a name an ssh machine has) ends the link with why.
+//!
+//! It also binds `endpoint::fleet_transfer_socket`
+//! (`fleet-<name>.transfer.sock`): each connection there is one `TRANSFER`
+//! stream to the worker (`fleet::transfer::send` on it). `TRANSFER` streams
+//! the worker opens are refused for now: this end receives no kind yet.
 
 use std::io::{self, Read, Write};
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use serde_json::json;
 
 use crate::serve::client::{self, Conn};
 use crate::serve::endpoint;
+use crate::serve::fleet::transfer::Receivers;
 use crate::serve::fleet::{self, link};
 use crate::serve::machines::check_name;
 
@@ -60,7 +67,11 @@ pub fn run(
         bail!("--root {} isn't an absolute path", root.display());
     }
     let mut held: Option<Conn> = None;
-    let end = link::opener(&fleet::LINK, reader, writer, &endpoint::fleet_socket(dir, worker), |peer| {
+    let transfer = link::OpenerTransfer {
+        socket: endpoint::fleet_transfer_socket(dir, worker),
+        receivers: Arc::new(Receivers::new(|m| eprintln!("{m}"))),
+    };
+    let end = link::opener_with(&fleet::LINK, reader, writer, &endpoint::fleet_socket(dir, worker), Some(transfer), |peer| {
         let mut conn = daemon()?;
         offer(&mut conn, worker, &peer.hash, root, draining)?;
         held = Some(conn);
@@ -135,7 +146,8 @@ mod tests {
                 let duplex = ssh::test_support::relayed(endpoint::connect(&daemon).ok()?).ok()?;
                 Some(duplex.stream.into())
             };
-            link::answerer(&fleet::LINK, r, w, open, || {}, || {})
+            let transfer = link::AnswererTransfer { receivers: Arc::new(Receivers::new(|_| {})), outlet: Default::default() };
+            link::answerer_with(&fleet::LINK, r, w, open, Some(&transfer), || {}, || {})
         })
     }
 
@@ -195,6 +207,7 @@ mod tests {
         let lap = Entry { roots: vec![WORKER_ROOT.into()], ..Entry::offered("lap") };
         wait_for(|| machines::load(&registry).is_ok_and(|e| e == [lap.clone()]), "the offer registers `lap` and its root");
         assert!(endpoint::fleet_socket(&hub_dir, "lap").exists());
+        assert!(endpoint::fleet_transfer_socket(&hub_dir, "lap").exists());
 
         let mut c = conn_at(&hub_dir);
         // A quick call: the worker's answer, over the link.
@@ -232,6 +245,7 @@ mod tests {
         hub_io.shutdown(Shutdown::Both).unwrap();
         hub_end.join().unwrap().unwrap();
         assert!(!endpoint::fleet_socket(&hub_dir, "lap").exists());
+        assert!(!endpoint::fleet_transfer_socket(&hub_dir, "lap").exists());
         assert!(matches!(worker_end.join().unwrap(), link::End::Closed));
         assert!(conn_at(&worker_dir).call("shutdown", json!({})).unwrap().error.is_none());
         let [worker, hub] = daemons;
@@ -259,6 +273,7 @@ mod tests {
         let err = hub_link(hub_io, hub_dir.clone()).join().unwrap().unwrap_err();
         assert!(format!("{err:#}").contains("offer refused: this devsandbox isn't a fleet hub"), "{err:#}");
         assert!(!endpoint::fleet_socket(&hub_dir, "lap").exists());
+        assert!(!endpoint::fleet_transfer_socket(&hub_dir, "lap").exists());
         assert!(!registry.exists());
         assert!(matches!(worker_end.join().unwrap(), link::End::Closed));
         assert_eq!(daemon.join().unwrap().unwrap(), Exit::Idle);

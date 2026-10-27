@@ -9,6 +9,8 @@
 //! (`service::backoff`), reset once a link came up. [`Lending::status`] is
 //! the link's state for `lend.get`; [`Lending::set_draining`] changes what
 //! the next link offers (`--drain`) without dropping the current one.
+//! `TRANSFER` streams the hub opens go to the daemon's `Receivers`;
+//! [`Lending::open_transfer`] opens one toward the hub while a link is up.
 //!
 //! The transport is injectable ([`Transport`]): production spawns ssh
 //! (`ssh::spawn`), tests hand back one end of a socket pair whose other end
@@ -24,6 +26,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
+use super::transfer::Receivers;
 use super::{LINK, link};
 use crate::devsbd::mux::Conn;
 use crate::serve::endpoint::Stream;
@@ -89,11 +92,15 @@ struct Ctl {
     /// What the next link offers: `--drain`.
     draining: AtomicBool,
     status: Mutex<Option<Status>>,
+    /// The links' `TRANSFER` side: the daemon's receivers, the live link's
+    /// outlet.
+    transfer: Option<link::AnswererTransfer>,
 }
 
 impl Lending {
     /// Start lending to `hub` as `name`, offering fleet root `root`
-    /// (`draining`: offering `--drain`).
+    /// (`draining`: offering `--drain`); the hub's `TRANSFER` streams go to
+    /// `receivers`.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         hub: String,
@@ -102,11 +109,13 @@ impl Lending {
         draining: bool,
         transport: Transport,
         open: Open,
+        receivers: Arc<Receivers>,
         timing: Timing,
         log: fn(&str),
     ) -> Result<Lending> {
         link_argv(&hub, &name, &root, draining)?;
-        let ctl = Arc::new(Ctl::default());
+        let transfer = Some(link::AnswererTransfer { receivers, outlet: Default::default() });
+        let ctl = Arc::new(Ctl { transfer, ..Ctl::default() });
         ctl.draining.store(draining, Ordering::SeqCst);
         let thread = {
             let ctl = Arc::clone(&ctl);
@@ -126,6 +135,13 @@ impl Lending {
     /// it when the link is next made).
     pub fn set_draining(&self, draining: bool) {
         self.ctl.draining.store(draining, Ordering::SeqCst);
+    }
+
+    /// A new `TRANSFER` stream to the hub (for `transfer::send`); an error
+    /// while no link is up.
+    #[allow(dead_code)] // first caller: fetch-back (fleet step 5)
+    pub fn open_transfer(&self) -> Result<Conn> {
+        self.ctl.transfer.as_ref().context("no transfers")?.outlet.open()
     }
 }
 
@@ -203,11 +219,12 @@ fn run_link(hub: &str, name: &str, mut duplex: Duplex, open: &Open, ctl: &Ctl, l
         *current = duplex.stream.try_clone().ok();
     }
     let up = AtomicBool::new(false);
-    let end = link::answerer(
+    let end = link::answerer_with(
         &LINK,
         reader,
         writer,
         || open(),
+        ctl.transfer.as_ref(),
         || {
             up.store(true, Ordering::Relaxed);
             ctl.set_status(Status::Connected);
@@ -524,7 +541,7 @@ mod tests {
         });
         let timing = Timing { backoff: Duration::from_millis(5), backoff_cap: Duration::from_millis(10), ..Timing::default() };
         let lending =
-            Lending::spawn("hub".into(), "lap".into(), "/fleet/hub".into(), false, transport, Arc::new(|| None), timing, |_| {}).unwrap();
+            Lending::spawn("hub".into(), "lap".into(), "/fleet/hub".into(), false, transport, Arc::new(|| None), Arc::new(Receivers::new(|_| {})), timing, |_| {}).unwrap();
         let start = std::time::Instant::now();
         while tries.load(Ordering::SeqCst) < 3 {
             assert!(start.elapsed() < Duration::from_secs(5), "retried");
