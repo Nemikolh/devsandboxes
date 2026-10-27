@@ -67,6 +67,7 @@ use serde_json::{Value, json};
 
 use super::api::{self, Topic};
 use super::endpoint::{self, Listener, Stream};
+use super::fleet::{self, lent};
 use super::forwards::{self, Registry};
 use super::host::{Host, Observers, Waker};
 use super::idle::{self, Decision, Holders};
@@ -136,6 +137,16 @@ pub struct Options {
     /// How `helper.call` reaches containers; `None` is the host side's
     /// bridges (none without one). Tests pass a client over fake links.
     pub helper: Option<helper::HelperClient>,
+    /// `lend.toml`, read once at start (lending `on`/`drain` starts the
+    /// lending thread, `fleet::worker`); its dir holds the fleet roots.
+    /// `None` is the default ([`fleet::lend::path`]). Tests point it at
+    /// their own file.
+    pub lend: Option<PathBuf>,
+    /// How the lending thread reaches its hub; `None` is ssh. Tests link an
+    /// in-process hub.
+    pub lend_transport: Option<fleet::worker::Transport>,
+    /// The env a hub's verbs run with; `None` is this process's.
+    pub lend_env: Option<BTreeMap<String, String>>,
 }
 
 impl Options {
@@ -156,6 +167,9 @@ impl Options {
             agent_dial: None,
             machine_timing: service::Timing::default(),
             helper: None,
+            lend: None,
+            lend_transport: None,
+            lend_env: None,
         }
     }
 }
@@ -319,7 +333,9 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
         let _ = shared.helper.set(client);
     }
     let watcher = Watcher::spawn(&shared, host.as_ref().map(Host::changes));
-    let mut next_conn = 0u64;
+    let lending = start_lending(opts, &shared);
+    // A lending daemon holds its link to the hub: it never idles out.
+    let keep_alive = opts.keep_alive || lending.is_some();
     let exit = loop {
         if let Some(exit) = *shared.stop.lock().unwrap() {
             break exit;
@@ -333,14 +349,11 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
             *shared.idle_since.lock().unwrap() = now;
         }
         let idle_since = *shared.idle_since.lock().unwrap();
-        if idle::decide(&holders, idle_since, now, opts.keep_alive, opts.idle_timeout) == Decision::Exit {
+        if idle::decide(&holders, idle_since, now, keep_alive, opts.idle_timeout) == Decision::Exit {
             break Exit::Idle;
         }
         match listener.accept_timeout(TICK) {
-            Ok(Some(stream)) => {
-                next_conn += 1;
-                shared.spawn_conn(next_conn, stream);
-            }
+            Ok(Some(stream)) => shared.spawn_conn(shared.next_conn_id(), stream),
             Ok(None) => {}
             Err(e) => {
                 // EMFILE and friends: don't spin, the next tick retries.
@@ -362,6 +375,8 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
         _ => "idle",
     });
     shared.drain(DRAIN_TIMEOUT);
+    // After the drain: the hub's connections answer over the link.
+    drop(lending);
     drop(watcher);
     // The machine links close (their ssh killed) after the connections whose
     // forwarded calls they may still answer.
@@ -374,6 +389,43 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
     // closed too; the next daemon restores them from `forwards.toml`.
     drop(registry);
     Ok(exit)
+}
+
+/// The lending thread (`fleet::worker`) when `lend.toml` says `on` or
+/// `drain`: its fleet root created, each `API` stream from the hub a
+/// `Worker` connection ([`Shared::open_lent`]). A bad file (or hostname,
+/// without `name`) is logged and nothing lends.
+fn start_lending(opts: &Options, shared: &Arc<Shared>) -> Option<fleet::worker::Lending> {
+    let attempt = || -> Result<Option<fleet::worker::Lending>> {
+        let path = match &opts.lend {
+            Some(path) => path.clone(),
+            None => fleet::lend::path()?,
+        };
+        let Some(lend) = fleet::lend::load(&path)?.filter(fleet::lend::Lend::lends) else {
+            return Ok(None);
+        };
+        let data = path.parent().context("lend.toml has no dir")?;
+        let root = fleet::lend::fleet_root(data, &lend.hub)?;
+        std::fs::create_dir_all(&root).with_context(|| format!("cannot create {}", root.display()))?;
+        let root = std::fs::canonicalize(&root).with_context(|| format!("cannot resolve {}", root.display()))?;
+        let name = match lend.name.as_str() {
+            "" => fleet::lend::default_name(&link::hostname())?,
+            name => name.to_string(),
+        };
+        let env = opts.lend_env.clone().unwrap_or_else(|| super::verbs_client::caller_env(std::env::vars_os()));
+        log(&format!("fleet: lending to {} as {name} ({:?}, fleet root {})", lend.hub, lend.state, root.display()));
+        let scope = Arc::new(lent::Scope { hub: lend.hub.clone(), root, env });
+        let open: fleet::worker::Open = {
+            let shared = Arc::clone(shared);
+            Arc::new(move || shared.open_lent(&scope))
+        };
+        let transport = opts.lend_transport.clone().unwrap_or_else(fleet::worker::ssh_transport);
+        fleet::worker::Lending::spawn(lend.hub, name, transport, open, opts.machine_timing, log).map(Some)
+    };
+    attempt().unwrap_or_else(|e| {
+        log(&format!("warning: not lending: {e:#}"));
+        None
+    })
 }
 
 /// Take the start lock, or `None` when a live daemon (one answering on the
@@ -417,6 +469,9 @@ struct Shared {
     state: PathBuf,
     /// Live connections. Its size is the `clients` holder count.
     conns: Mutex<HashMap<u64, ConnEntry>>,
+    /// The last connection id handed out: the listener's and the lending
+    /// link's connections share it.
+    next_conn: AtomicU64,
     /// Inbox changes this daemon has seen: the `generation` of
     /// `inbox.changed`.
     inbox_generation: AtomicU64,
@@ -469,6 +524,7 @@ impl Shared {
             inbox,
             state,
             conns: Mutex::new(HashMap::new()),
+            next_conn: AtomicU64::new(0),
             inbox_generation: AtomicU64::new(0),
             idle_since: Mutex::new(Instant::now()),
             stop: Mutex::new(None),
@@ -514,19 +570,50 @@ impl Shared {
         }
     }
 
+    fn next_conn_id(&self) -> u64 {
+        self.next_conn.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// A local client's connection: the whole API.
+    fn spawn_conn(self: &Arc<Self>, id: u64, stream: Stream) {
+        self.spawn_conn_as(id, stream, Table::Full);
+    }
+
+    /// One `API` stream of the lending link: a socket pair whose one end
+    /// goes to the hub, the other served with `scope`'s `Worker` table. The
+    /// API relay's sentinel line goes out on ours first, so the hub reads it
+    /// before any answer (`machines::link::handshake` reads the stream as an
+    /// ssh relay's). `None` once the daemon is stopping.
+    fn open_lent(self: &Arc<Self>, scope: &Arc<lent::Scope>) -> Option<crate::devsbd::mux::Conn> {
+        if *self.closed.0.lock().unwrap() {
+            return None;
+        }
+        let (hub, ours) = Stream::pair().ok()?;
+        super::relay::write_sentinel(&mut &ours, true).ok()?;
+        self.spawn_conn_as(self.next_conn_id(), ours, Table::Worker(Arc::clone(scope)));
+        Some(hub.into())
+    }
+
     /// Register before the thread starts, so the next holder snapshot counts
     /// it even if the client is gone by then.
-    fn spawn_conn(self: &Arc<Self>, id: u64, stream: Stream) {
+    fn spawn_conn_as(self: &Arc<Self>, id: u64, stream: Stream, table: Table) {
         let (Ok(clone), Ok(writer), Ok(ctl)) = (stream.try_clone(), stream.try_clone(), stream.try_clone()) else {
             return;
         };
         // A socket option: covers every clone, responses and notifications.
         let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
         let out = Arc::new(Outbox::new(writer, ctl));
+        if let Table::Worker(scope) = &table {
+            let root = scope.root.clone();
+            out.post(|p| {
+                p.confine = Some(root);
+                false
+            });
+        }
         self.conns.lock().unwrap().insert(id, ConnEntry { stream: clone, out: Arc::clone(&out) });
         let shared = Arc::clone(self);
         let spawned = std::thread::Builder::new().name(format!("serve-conn-{id}")).spawn(move || {
-            serve_conn(id, stream, &shared, out);
+            serve_conn(id, stream, &shared, out, table);
             shared.conns.lock().unwrap().remove(&id);
             *shared.idle_since.lock().unwrap() = Instant::now();
         });
@@ -721,6 +808,9 @@ struct Pending {
     forwards_status: Option<String>,
     /// `closing` with this reason; written last.
     closing: Option<&'static str>,
+    /// A `Worker` connection's fleet root: its snapshots are cut to it
+    /// (`lent::filter_snapshot`).
+    confine: Option<PathBuf>,
     /// The connection ended: the notifier writes what's left and exits.
     closed: bool,
 }
@@ -748,7 +838,11 @@ impl Pending {
             out.push(Notification { method: "instances.changed".into(), params: json!({}) });
         }
         for params in std::mem::take(&mut self.snapshots).into_values() {
-            out.push(Notification { method: "instances.snapshot".into(), params: Arc::unwrap_or_clone(params) });
+            let mut params = Arc::unwrap_or_clone(params);
+            if let Some(root) = &self.confine {
+                lent::filter_snapshot(&mut params, root);
+            }
+            out.push(Notification { method: "instances.snapshot".into(), params });
         }
         if std::mem::take(&mut self.forwards) {
             out.push(Notification { method: "forwards.changed".into(), params: json!({}) });
@@ -911,9 +1005,18 @@ fn config_stamps<'a>(roots: impl Iterator<Item = &'a PathBuf>) -> ConfigStamps {
 
 type ConfigStamps = BTreeMap<PathBuf, Vec<Option<(std::time::SystemTime, u64)>>>;
 
+/// What a connection may call.
+enum Table {
+    /// A local client: the whole API.
+    Full,
+    /// A fleet hub over the lending link: the lent API only (`fleet::lent`).
+    Worker(Arc<lent::Scope>),
+}
+
 /// A connection's own state, on its thread.
 struct ConnState {
     id: u64,
+    table: Table,
     /// The hello's `client` (`tui`, `cli`, `api:<name>`), for the log.
     client: String,
     /// What the store records as the client of this connection's user ops
@@ -936,9 +1039,16 @@ impl ConnState {
 }
 
 /// One connection: a request per line, a response per request, until EOF.
-fn serve_conn(id: u64, stream: Stream, shared: &Shared, out: Arc<Outbox>) {
-    let mut conn =
-        ConnState { id, client: String::new(), audit: api::audit_client(""), out, notifier: None, holds: BTreeMap::new() };
+fn serve_conn(id: u64, stream: Stream, shared: &Shared, out: Arc<Outbox>, table: Table) {
+    let mut conn = ConnState {
+        id,
+        table,
+        client: String::new(),
+        audit: api::audit_client(""),
+        out,
+        notifier: None,
+        holds: BTreeMap::new(),
+    };
     let mut reader = BufReader::new(stream);
     loop {
         let mut line = Vec::new();
@@ -972,10 +1082,23 @@ fn serve_conn(id: u64, stream: Stream, shared: &Shared, out: Arc<Outbox>) {
 }
 
 fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response> {
-    let req: Request = match serde_json::from_slice(line) {
+    let mut req: Request = match serde_json::from_slice(line) {
         Ok(req) => req,
         Err(e) => return Some(Response::err(None, "invalid", format!("not a request: {e}"))),
     };
+    // A fleet hub: the lent API only, its params confined, before anything
+    // else looks at the request.
+    if let Table::Worker(scope) = &conn.table {
+        match lent::admit(&req.method, std::mem::take(&mut req.params), scope, &shared.state) {
+            Ok(params) => req.params = params,
+            Err(e) => {
+                if e.code == "denied" {
+                    log(&format!("{}: refused {} from fleet hub {}: {}", conn.label(), req.method, scope.hub, e.message));
+                }
+                return Some(Response::err(req.id, e.code, e.message));
+            }
+        }
+    }
     match req.method.as_str() {
         "hello" => return Some(hello(req.id, req.params, shared, conn)),
         method if verbs::is_verb(method) => return verb(req.id, method, req.params, shared, conn),
@@ -1025,6 +1148,10 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
             machines::api::call(method, req.params, ctx).unwrap_or_else(|| Err(api::ApiError::unknown_method(method)))
         }
         method => local_call(method, req.params, shared, conn),
+    };
+    let answer = match &conn.table {
+        Table::Worker(scope) => answer.and_then(|v| lent::filter_answer(&req.method, v, &scope.root)),
+        Table::Full => answer,
     };
     Some(match answer {
         Ok(result) => Response::ok(req.id, result),
@@ -1319,7 +1446,9 @@ fn hello(id: Option<u64>, params: Value, shared: &Shared, conn: &mut ConnState) 
     conn.client.clone_from(&params.client);
     conn.audit = api::audit_client(&params.client);
     let client = Version { semver: params.version, build: params.build };
-    let handoff = client.is_newer_than(&shared.version);
+    // A fleet hub's hello never hands this daemon off: only a local client's
+    // newer binary replaces it.
+    let handoff = matches!(conn.table, Table::Full) && client.is_newer_than(&shared.version);
     if handoff {
         log(&format!(
             "client `{}` has version {} build {}: handing off",
@@ -1410,6 +1539,11 @@ pub(crate) mod tests {
                 tick: Duration::from_millis(20),
             },
             helper: None,
+            // Never the user's: absent, so nothing lends unless a test
+            // writes its own.
+            lend: Some(std::env::temp_dir().join(format!("dsv-lend-{}", std::process::id())).join("lend.toml")),
+            lend_transport: None,
+            lend_env: None,
         }
     }
 

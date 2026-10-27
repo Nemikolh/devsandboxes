@@ -1,6 +1,6 @@
 //! Fleet: machines as one pool of capacity (docs/architecture/daemon/fleet.md,
-//! plan docs/plans/active/fleet.md). So far its link primitive and the hub
-//! side of a worker's link:
+//! plan docs/plans/active/fleet.md). So far its link primitive and both
+//! sides of a worker's link:
 //!
 //! - `link`: the two ends of a host-to-host frame-mux link carrying one
 //!   channel, generic over its sentinel line and channel ([`link::Spec`]);
@@ -9,9 +9,18 @@
 //! - `offer`: `fleet.offer`, which registers an offered worker in
 //!   `machines.toml`, and the [`offer::dial`] that reaches one through its
 //!   `fleet-link` socket (`commands::fleet_link` is that opener).
+//! - `lend`: `lend.toml` (whether and to which hub this host lends) and the
+//!   fleet root a hub reaches.
+//! - `worker`: the worker's lending thread, the answerer of [`LINK`] over
+//!   its ssh to the hub.
+//! - `lent`: what a hub may do over that link (the daemon's `Worker`
+//!   connection table).
 
+pub mod lend;
+pub mod lent;
 pub mod link;
 pub mod offer;
+pub mod worker;
 
 use crate::devsbd::proto::{caps, channel};
 

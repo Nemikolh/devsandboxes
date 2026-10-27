@@ -505,7 +505,7 @@ fn spawn_link(entry: Entry, inner: Arc<Inner>) -> LinkThread {
 
 /// The delay before the next attempt after `failures` failures in a row: 1,
 /// 2, 4 … units, capped; counts this one.
-fn backoff(t: &Timing, failures: &mut u32) -> Duration {
+pub(crate) fn backoff(t: &Timing, failures: &mut u32) -> Duration {
     let delay = t.backoff.saturating_mul(1u32 << (*failures).min(16)).min(t.backoff_cap);
     *failures = failures.saturating_add(1);
     delay

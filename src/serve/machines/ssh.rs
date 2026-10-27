@@ -213,7 +213,14 @@ fn argv(entry: &Entry, opts: &[&str], remote_args: &[impl AsRef<str>]) -> Result
 /// Every argv above comes through here, so an offered machine (no ssh to
 /// it) is refused for all of them alike.
 fn argv_with(entry: &Entry, opts: &[&str], program: &str, remote_args: &[impl AsRef<str>]) -> Result<Vec<OsString>> {
-    let target = parse_target(entry.ssh_target()?)?;
+    target_argv(entry.ssh_target()?, opts, program, remote_args)
+}
+
+/// `ssh <opts> [-p N] -- <host> <remote_command>` to a bare target: what
+/// [`argv_with`] builds for an entry, and a fleet worker's link to its hub
+/// (`fleet::worker::link_argv`), which has no entry.
+pub(crate) fn target_argv(target: &str, opts: &[&str], program: &str, remote_args: &[impl AsRef<str>]) -> Result<Vec<OsString>> {
+    let target = parse_target(target)?;
     let mut argv: Vec<OsString> = ["ssh"].iter().chain(opts).map(OsString::from).collect();
     if let Some(port) = target.port {
         argv.extend(["-p".into(), port.to_string().into()]);

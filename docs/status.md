@@ -277,11 +277,26 @@ limitation means editing this file in the same commit.
 - An offered fleet worker (fleet step 1b) answers quick calls and verbs
   only: `exec`, terminal tabs, forwards, the agent relay and every CLI
   re-run over ssh (`logs`/`inspect` on the CLI included; the dashboard's
-  work) refuse with "need fleet step 4". Nothing dials a hub yet (the
-  worker side is step 1c), its entry has no roots (so `--machine` per-root
-  commands and `--all` verbs on it fail), and its link is held only while
-  wanted, like an ssh machine's (step 1f keeps it up).
+  work) refuse with "need fleet step 4". Its entry has no roots (so
+  `--machine` per-root commands and `--all` verbs on it fail), and its link
+  is held only while wanted, like an ssh machine's (step 1f keeps it up).
   → [fleet](architecture/daemon/fleet.md#hub-side); `machines::offered_refusal`
+- `lend.toml` has no writer yet (`devsandbox lend`, `fleet join`: step 1d):
+  it's written by hand, and read only when the daemon starts, so a change
+  needs a daemon restart. → [fleet](architecture/daemon/fleet.md#worker-side); `daemon::start_lending`
+- A placed config isn't checked against a worker policy yet (step 1e): a
+  config under the fleet root may bind-mount any host path, run
+  privileged or mount the runtime socket.
+  → [fleet](architecture/daemon/fleet.md#the-worker-table); `fleet::lent::admit`
+- On a `Worker` connection, `containers.*` reach only instances'
+  containers (not a fleet root's service containers), and an isolated
+  service row's `containers` aren't cut to lent instances.
+  → [fleet](architecture/daemon/fleet.md#the-worker-table); `fleet::lent::filter_snapshot`
+- A hub's verb on a worker runs with the worker daemon's own process env
+  (a systemd unit's or LaunchAgent's, not a login shell's as over ssh's
+  `relay::SessionEnv`), so `PATH` additions from shell profiles are
+  missing; fix: capture a login env once when lending starts.
+  → [fleet](architecture/daemon/fleet.md#the-worker-table); `fleet::lent::admit`
 
 ### helper
 

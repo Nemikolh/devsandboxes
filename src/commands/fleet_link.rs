@@ -1,7 +1,7 @@
 //! `devsandbox fleet-link --worker <name>` (hidden): the hub's end of a fleet
 //! worker's link (docs/architecture/daemon/fleet.md, *Hub side*). A worker's
 //! daemon runs it on its hub over its own ssh (`ssh -T -o BatchMode=yes <hub>
-//! devsandbox fleet-link --worker <name>`, fleet plan step 1c) and answers the
+//! devsandbox fleet-link --worker <name>`, `serve::fleet::worker`) and answers the
 //! streams it opens with connections to its own daemon.
 //!
 //! It is the opener of a `fleet::link` of `fleet::LINK`, as
@@ -118,8 +118,8 @@ mod tests {
 
     /// The worker's end, faked: the answerer of `fleet::LINK` over `io`,
     /// each `API` stream a connection to the daemon in `daemon` that starts
-    /// with the API relay's sentinel line, as the worker's (fleet plan 1c)
-    /// will.
+    /// with the API relay's sentinel line, as the worker's
+    /// (`daemon::Shared::open_lent`) does.
     fn fake_worker(io: UnixStream, daemon: PathBuf) -> std::thread::JoinHandle<link::End> {
         let (r, w) = (io.try_clone().unwrap(), io);
         std::thread::spawn(move || {

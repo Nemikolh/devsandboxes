@@ -151,7 +151,7 @@ pub fn client_name() -> String {
     format!("machine:{}", hostname())
 }
 
-fn hostname() -> String {
+pub(crate) fn hostname() -> String {
     let mut buf = [0u8; 256];
     // SAFETY: the buffer is valid for its length; gethostname NUL-terminates
     // within it or truncates (we cut at the first NUL either way).

@@ -3,8 +3,10 @@
 Machines as one pool of capacity (the plan:
 [fleet](../../plans/active/fleet.md)). What exists so far is the link
 primitive the fleet's links are built on (the machines'
-[agent relay](machines.md#agent) runs on it too) and the hub's side of a
-worker's link: the offer, the offered registry entry and its dial.
+[agent relay](machines.md#agent) runs on it too) and both sides of a
+worker's link: on the hub the offer, the offered registry entry and its
+dial; on the worker `lend.toml`, the lending thread and the lent API
+([ADR 0041](../../decisions/0041-fleet-workers-dial-their-hub.md)).
 
 Code: `src/serve/fleet/mod.rs` (`LINK`), `src/serve/fleet/link.rs`
 (`Spec`, `opener`, `answerer`, `End`, `write_sentinel`,
@@ -12,7 +14,12 @@ Code: `src/serve/fleet/mod.rs` (`LINK`), `src/serve/fleet/link.rs`
 `dial`), `src/commands/fleet_link.rs` (`fleet_link`, `run`),
 `src/serve/endpoint.rs` (`fleet_socket`), `src/daemon_config.rs`
 (`ServeConfig::hub`), `src/devsbd/proto.rs` (`channel::API`, `caps::API`,
-`channel::flows`).
+`channel::flows`); the worker side: `src/serve/fleet/lend.rs` (`Lend`,
+`load`, `fleet_root`, `fleet_dir_name`, `default_name`),
+`src/serve/fleet/worker.rs` (`Lending`, `link_argv`, `Transport`),
+`src/serve/fleet/lent.rs` (`Scope`, `decide`, `admit`, `confine_path`,
+`filter_answer`, `filter_snapshot`), `src/serve/daemon.rs`
+(`start_lending`, `Table`, `Shared::open_lent`).
 
 ## Link
 
@@ -55,7 +62,7 @@ Two specs exist:
 | spec | sentinel | channel | cap | opener / answerer |
 |---|---|---|---|---|
 | `machines::agent::SPEC` | `devsandbox-agent 1` | `SSH_AGENT` (legacy) | `caps::SSH_AGENT` | `commands::agent_relay::run` / `machines::agent::serve` |
-| `fleet::LINK` | `devsandbox-fleet 1` | `API` (flowing) | `caps::API` | `commands::fleet_link::run` (on the hub) / the worker's lending thread (plan step 1c) |
+| `fleet::LINK` | `devsandbox-fleet 1` | `API` (flowing) | `caps::API` | `commands::fleet_link::run` (on the hub) / the worker's lending thread (`fleet::worker`) |
 
 On `fleet::LINK` each connection to the opener's socket is one connection
 to whatever daemon socket the answerer's `open` connects, so a
@@ -72,8 +79,9 @@ says its hello) works on it unchanged.
 ## Hub side
 
 A worker dials its hub: its daemon holds `ssh -T -o BatchMode=yes <hub>
-devsandbox fleet-link --worker <name>` (plan step 1c). The hub never dials
-the worker; everything it does there goes over that link's `API` streams.
+devsandbox fleet-link --worker <name>` ([Worker side](#worker-side)). The
+hub never dials the worker; everything it does there goes over that
+link's `API` streams.
 
 - **`devsandbox fleet-link --worker <name>`** (hidden,
   `commands::fleet_link`) is the opener of `fleet::LINK` on the hub. The
@@ -116,3 +124,88 @@ the worker; everything it does there goes over that link's `API` streams.
   message; `machines.set` refuses `agent` on for one (`invalid`). The
   dashboard's logs and inspect views go through the `containers.*` quick
   calls and work.
+
+## Worker side
+
+A worker lends itself to one hub, through `lend.toml`; the hub reaches
+it only through the link the worker holds, and there only through the
+lent API ([ADR 0041](../../decisions/0041-fleet-workers-dial-their-hub.md)).
+
+- **`lend.toml`** (`<data>/devsandbox/lend.toml`, next to `state.toml`,
+  `fleet::lend::path`) is the worker's own; the hub never writes it. Keys:
+  `state` (`on` | `off` | `drain`; absent is `off`), `hub` (the hub's ssh
+  target, as `machine add` takes one), `name` (what this host offers itself
+  as; absent is the hostname's first label, `lend::default_name`, which
+  must pass `machines::check_name`) and an `[allow]` table, the worker
+  policy's allowances (none yet). Unknown keys are ignored. `lend::load`
+  reads it (missing is not lending); lending (`on`/`drain`) requires a
+  valid `hub`. The daemon reads it once, at start (`daemon::start_lending`,
+  `Options::lend` in tests); a bad file is logged and nothing lends.
+- **The fleet root** for a hub is `<data>/devsandbox/fleet/<hub>/`
+  (`lend::fleet_root`), `<hub>` the target made one plain path component
+  (`lend::fleet_dir_name`: the host, `user@host`, plus `_<port>` for a URL's
+  port; bytes other than ASCII alphanumerics, `.`, `-`, `_` and `@` become
+  `_`, and so does a leading `.`). The daemon creates it when lending starts
+  and holds its canonical path. All the hub reaches is under it.
+- **The lending thread** (`fleet::worker::Lending`, `serve-lend`) runs
+  while the file says `on` or `drain`. It spawns `link_argv`'s `ssh -T -o
+  BatchMode=yes [-p N] -- <hub> <devsandbox fleet-link --worker <name>>`
+  (through the hub's login shell, `ssh::target_argv`, the builder every
+  machine argv uses, here without a registry entry) and runs
+  `link::answerer` of `fleet::LINK` on its stdio. A link that ends (the
+  handshake failed, the keepalive heard nothing, ssh exited) is logged
+  with ssh's stderr tail and retried after the machine links' backoff
+  (`service::backoff`: 1 s doubling to 30 s), reset once a link came up.
+  Dropping the thread (the daemon exiting, after its drain) shuts the
+  link's socket and kills the ssh. The transport is
+  `fleet::worker::Transport` (`ssh::spawn` in production;
+  `Options::lend_transport` in tests). A lending daemon never idles out:
+  it is what holds the link.
+- **Each `API` stream** the hub opens is answered by `Shared::open_lent`: a
+  socket pair whose daemon end writes the API relay's sentinel line first
+  ([the sentinel rule](#link)) and is then served like any connection
+  (`spawn_conn_as`), with the `Worker` table. Its connection id comes from
+  the same counter as the listener's.
+
+### The Worker table
+
+Every connection has a table (`daemon::Table`): `Full` for local clients,
+`Worker(Scope)` for the hub's streams. A `Scope` (`fleet::lent::Scope`) is
+the hub, the canonical fleet root and the env its verbs get. On a `Worker`
+connection each request goes through `lent::admit` at the top of
+`handle`, before any dispatch:
+
+- **`decide`** (pure, over method and params) lets through `hello`,
+  `subscribe` / `unsubscribe` with only the `instances` topic,
+  `instances.watch` / `unwatch`, the quick calls
+  (`machines::forward::QUICK`) and the verbs (`verbs::is_verb`). It refuses
+  (`denied`) any request with a `machine` param or `machines: true`
+  (nothing federates past the worker), a verb with `all` (`--all` is every
+  instance in `state.toml`, not the root's), and every other method:
+  `machines.*`, `fleet.*`, `shutdown`, `helper.call`, `forwards.*`,
+  `bridges.ensure`, `roots.list`, the Inbox. Refusals are logged.
+- **Paths**: a `root` or `dir` param must be absolute, have no `..`, and
+  canonicalize (symlinks resolved) under the fleet root
+  (`lent::confine_path`); it is rewritten to the canonical path. A path that
+  doesn't exist is `not-found`, except an unwatch's, checked as written.
+  `instances.list`, the watches, `sandboxes.*`, `services.get`, `config.*`
+  and the verbs must carry theirs.
+- **Instances**: an `instance` (exact name or id), `instances.procs`'
+  `instances` and the `containers.*` `container` must be an instance whose
+  `config_dir` is under the fleet root (`lent::lent_instances`, from
+  `state.toml`), else `not-found`. A verb's `instance` is resolved as the
+  CLI resolves it (`commands::instance_matches`), and every match must be
+  lent; `rebuild` / `start` / `stop` / `rm` must name one.
+- **Env**: a verb's `env` is replaced by the scope's, the daemon's own
+  process env (`verbs_client::caller_env`, `Options::lend_env` in tests),
+  never what the hub sent: the worker-side counterpart of
+  `relay::SessionEnv` on an ssh machine.
+- **Answers and pushes**: a snapshot lists every instance in `state.toml`,
+  whatever its `dir`, so `instances.list` answers and every
+  `instances.snapshot` pushed to the connection (`Pending::confine`) are
+  cut by `lent::filter_snapshot`: instance rows whose `root` is under the
+  fleet root, their names alone in services' `used_by` and in
+  `thread_children`. `instances.resolve`'s matches are cut the same way
+  (`lent::filter_answer`); none left is `not-found`.
+- **Hello** on a `Worker` connection never hands the daemon off, whatever
+  version it says: only a local client's newer binary replaces it.

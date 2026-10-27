@@ -3,7 +3,10 @@
 Status: in progress
 Commit 1a (link primitive) shipped: `serve::fleet::link`, `channel::API`;
 1b (hub side) shipped: `fleet-link`, `fleet.offer`, the `offered` registry
-kind and its dial ([fleet](../../architecture/daemon/fleet.md)); the rest
+kind and its dial; 1c (worker side) shipped: `lend.toml` read at start,
+the lending thread, the fleet root and the `Worker` table
+([fleet](../../architecture/daemon/fleet.md), ADR
+[0041](../../decisions/0041-fleet-workers-dial-their-hub.md)); the rest
 is design. Builds on [machines](../../architecture/daemon/machines.md)
 and supersedes nothing yet; [machines-next](machines-next.md) items 2 and 3
 fold into step 8 here, its parked auto-update and PTY attach into steps
