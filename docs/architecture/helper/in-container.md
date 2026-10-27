@@ -129,7 +129,7 @@ without an end, e.g. container restart). Runs stay until `rm`/`prune`.
 execs the same `devsbd run …` inside the child as its remote user
 (`dispatch` `exec`/`run-*` ops); without one it acts on this container.
 
-## Sessions: `devsbd session new|attach|ls|rm`
+## Sessions: `devsbd session new|attach|ls|rm|prune`
 
 Interactive commands that outlive their client, dtach's shape
 (`devsbd/src/sessions.rs`). One dir per session under
@@ -149,7 +149,15 @@ cwd and env the command gets, so `new` needs no `--cwd`. `exec --attach
 - `new --id <id> [--cwd DIR] -- <cmd>...` (`create_with`) creates the dir
   and spawns a detached `devsbd session supervise <id>` (its own session,
   null stdio, in `DIR` with the caller's env), then attaches; an id that
-  already exists attaches instead. `attach <id>` only attaches.
+  already exists attaches instead. `attach <id>` only attaches. Before it
+  creates the dir, `new` quietly prunes (`prune_settled`, over
+  `runs::prune_ended_before`; errors ignored, as the caller's user, so
+  other users' dirs stay): every `lost` session, and every ended one
+  whose `ended` is more than `ENDED_GRACE` (5 min) old. Recently ended
+  ones stay so an attach still gets their code: the ssh reconnect loop
+  (`serve::machines::cli` `Reconnect`) re-dials after an outage and reads
+  the end of a program that exited meanwhile. Nothing else prunes on its
+  own (not the daemon, `boot` or `ls`).
 - The supervisor (`supervise`) binds `sock`, opens a pty (`open_pty`,
   libc through `extern "C"`, per-OS ioctl numbers in `sessions::sys`) and
   runs the command on it as a session leader with the pty as its
@@ -177,7 +185,9 @@ cwd and env the command gets, so `new` needs no `--cwd`. `exec --attach
   newest `runs::MAX_LS_RUNS`, states as in `run ls`. `rm <id>`: a running
   session's command group gets SIGHUP, then SIGKILL after `HUP_WAIT`
   (verified with `runs::kill_target`), the supervisor records the end, the
-  dir is deleted.
+  dir is deleted. `prune [--keep N]` (`runs::prune`, as `run prune`):
+  deletes every ended or `lost` session but the newest `N` (default 0),
+  never a running one, and prints `removed <n>`.
 
 ## `devsbd identity apply`
 

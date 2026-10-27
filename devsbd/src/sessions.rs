@@ -1,4 +1,4 @@
-//! `devsbd session new|attach|supervise|ls|rm`: interactive sessions that
+//! `devsbd session new|attach|supervise|ls|rm|prune`: interactive sessions that
 //! outlive their client (docs/architecture/helper/in-container.md), dtach's
 //! shape: one supervisor process owns a pty and the command on it, and
 //! listens on a unix socket; a client relays its own terminal to it, and a
@@ -90,10 +90,19 @@ const FAILED_WAIT: Duration = Duration::from_secs(2);
 /// `rm`: after SIGHUP, how long the command gets before SIGKILL.
 const HUP_WAIT: Duration = Duration::from_secs(2);
 
+/// How long an ended session's dir outlives its end before `new`'s automatic
+/// prune deletes it. An attach to an ended session exits with its recorded
+/// code, and the ssh reconnect loop (`serve::machines::cli` `Reconnect`,
+/// backoff up to 10 s) relies on that when the program exits during an
+/// outage: its re-dial must still find the end. Minutes, well past any
+/// backoff, so a slow re-dial still gets the code.
+const ENDED_GRACE: u64 = 5 * 60;
+
 const USAGE: &str = "usage: devsbd session new --id <id> [--cwd DIR] -- <cmd>...\n\
        devsbd session attach <id>\n\
        devsbd session ls\n\
-       devsbd session rm <id>";
+       devsbd session rm <id>\n\
+       devsbd session prune [--keep N]";
 
 /// `devsbd session …`; returns the exit code.
 pub fn run(args: &[String]) -> i32 {
@@ -125,6 +134,7 @@ pub fn run(args: &[String]) -> i32 {
         Cmd::Supervise { id } => supervise(root, &id),
         Cmd::Ls => ls(root).and_then(|text| io::stdout().write_all(text.as_bytes())),
         Cmd::Rm { id } => rm(root, &id),
+        Cmd::Prune { keep } => runs::prune(root, keep).map(|n| println!("removed {n}")),
     };
     match result {
         Ok(()) => control::EXIT_OK,
@@ -144,11 +154,12 @@ enum Cmd {
     Supervise { id: String },
     Ls,
     Rm { id: String },
+    Prune { keep: usize },
 }
 
 fn parse(args: &[String]) -> Result<Cmd, String> {
     let (sub, rest) = args.split_first().ok_or("missing subcommand")?;
-    let (mut id, mut cwd, mut argv) = (None, None, None);
+    let (mut id, mut cwd, mut argv, mut keep) = (None, None, None, None);
     let mut words: Vec<String> = Vec::new();
     let mut it = rest.iter();
     while let Some(arg) = it.next() {
@@ -167,6 +178,10 @@ fn parse(args: &[String]) -> Result<Cmd, String> {
             }
             ("new", "--id") => once(&mut id, value()?, flag)?,
             ("new", "--cwd") => once(&mut cwd, value()?, flag)?,
+            ("prune", "--keep") => {
+                let v = value()?;
+                once(&mut keep, v.parse::<u64>().map_err(|_| format!("{flag}: bad number `{v}`"))?, flag)?
+            }
             (_, f) if f.starts_with('-') && f.len() > 1 => return Err(format!("unknown option `{f}`")),
             _ => words.push(arg.clone()),
         }
@@ -192,6 +207,10 @@ fn parse(args: &[String]) -> Result<Cmd, String> {
         "ls" if words.is_empty() => Ok(Cmd::Ls),
         "ls" => Err("takes no arguments".into()),
         "rm" => Ok(Cmd::Rm { id: one_id(&mut words)? }),
+        "prune" if words.is_empty() => {
+            Ok(Cmd::Prune { keep: usize::try_from(keep.unwrap_or(0)).unwrap_or(usize::MAX) })
+        }
+        "prune" => Err("takes no arguments".into()),
         other => Err(format!("unknown subcommand `{other}`")),
     }
 }
@@ -994,7 +1013,8 @@ fn join(
 /// `session new`'s first half: create session `id` and spawn its supervisor
 /// (from `supervisor`; tests run it from the test binary) detached in `cwd`:
 /// its own session, null stdio. `Ok(None)`: the id is taken, attach to it
-/// instead. A bad `cwd` fails here, before anything runs.
+/// instead. A bad `cwd` fails here, before anything runs. First, quietly,
+/// [`prune_settled`].
 fn create_with(
     root: &Path,
     id: &str,
@@ -1003,6 +1023,7 @@ fn create_with(
     supervisor: impl FnOnce(&str) -> Command,
 ) -> io::Result<Option<Child>> {
     outbox::ensure_dir(root)?;
+    prune_settled(root, runs::now());
     let dir = root.join(id);
     match fs::create_dir(&dir) {
         Ok(()) => {}
@@ -1034,7 +1055,16 @@ fn create_with(
     }
 }
 
-// ---- ls / rm -------------------------------------------------------------
+// ---- ls / rm / prune -----------------------------------------------------
+
+/// `new`'s automatic prune: every `lost` session and every one ended more
+/// than [`ENDED_GRACE`] before `now`, so finished dirs don't pile up and push
+/// live sessions out of `ls`'s newest `runs::MAX_LS_RUNS`. As the caller's
+/// user, so other users' dirs (sticky dir) just stay; errors are ignored, a
+/// failed prune never stops a new session.
+fn prune_settled(root: &Path, now: u64) {
+    let _ = runs::prune_ended_before(root, now.saturating_sub(ENDED_GRACE));
+}
 
 /// `session ls`: one line per session, oldest first, only the newest
 /// `runs::MAX_LS_RUNS`: `<id> <state> <attached|detached|-> <started, UTC>
@@ -1129,6 +1159,13 @@ mod tests {
         assert_eq!(p(&["supervise", id]), Ok(Cmd::Supervise { id: id.into() }));
         assert_eq!(p(&["ls"]), Ok(Cmd::Ls));
         assert_eq!(p(&["rm", id]), Ok(Cmd::Rm { id: id.into() }));
+        assert_eq!(p(&["prune"]), Ok(Cmd::Prune { keep: 0 }));
+        assert_eq!(p(&["prune", "--keep", "5"]), Ok(Cmd::Prune { keep: 5 }));
+        assert_eq!(p(&["prune", "--keep=0"]), Ok(Cmd::Prune { keep: 0 }));
+        assert!(p(&["prune", "x"]).unwrap_err().contains("no arguments"));
+        assert!(p(&["prune", "--keep", "-1"]).unwrap_err().contains("bad number"));
+        assert!(p(&["prune", "--keep", "1", "--keep", "2"]).unwrap_err().contains("twice"));
+        assert!(p(&["ls", "--keep", "1"]).unwrap_err().contains("unknown option"));
         assert!(p(&["new", "--", "sh"]).unwrap_err().contains("missing --id"));
         assert!(p(&["new", "--id", "x", "--", "sh"]).unwrap_err().contains("bad session id"));
         assert!(p(&["new", "--id", id]).unwrap_err().contains("missing `--"));
@@ -1401,6 +1438,86 @@ mod tests {
         #[cfg(target_os = "linux")]
         wait_for("lost in ls", || ls(&root).unwrap().starts_with(&format!("{id} lost - ")));
         let _ = runs::signal_group(m.pgid.unwrap(), runs::SIGKILL);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A session dir made by hand: `argv` and `meta` as given.
+    fn fake_session(root: &Path, id: &str, meta: &str) {
+        let dir = root.join(id);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("argv"), "arg sh\n").unwrap();
+        fs::write(dir.join("meta"), meta).unwrap();
+    }
+
+    /// `new`'s prune: `lost` and long-ended sessions go; recently ended ones
+    /// (an attach still returns their code), running and unreadable ones
+    /// stay. `prune` without `--keep` then takes the recent ones too.
+    #[test]
+    fn new_prunes_lost_and_long_ended_sessions() {
+        let root = temp_root("prune");
+        prune_settled(&root, runs::now()); // no root yet: nothing, no panic
+        let now = runs::now();
+        let ended = |ago: u64| format!("started 1790000000\nended {}\nexit 3\n", now - ago);
+        fake_session(&root, "1790000000-0000", &ended(ENDED_GRACE + 1));
+        fake_session(&root, "1790000001-0000", &ended(ENDED_GRACE - 60));
+        fake_session(&root, "1790000002-0000", "started 1790000002\nsupervisor 4294967\n");
+        fake_session(&root, "1790000003-0000", "started 1790000003\n");
+        let mut sup = Command::new("sh").args(["-c", "sleep 30; :", "1790000003-0000"]).spawn().unwrap();
+        runs::append(&root.join("1790000003-0000"), &format!("supervisor {}\n", sup.id())).unwrap();
+        #[cfg(target_os = "linux")]
+        wait_for("the fake supervisor", || runs::is_supervisor(sup.id(), "1790000003-0000"));
+        fs::create_dir_all(root.join("1790000004-0000/meta")).unwrap();
+        let left = || runs::run_ids(&root).unwrap();
+
+        // Through `new`: the prune runs before the new dir exists.
+        let id = "1790000005-0000";
+        assert_eq!(client(&root, id, Some(start(&root, id, "exit 0")), None).wait().code, 0);
+        // `is_supervisor` reads /proc: off Linux the running one reads as lost.
+        #[cfg(target_os = "linux")]
+        assert_eq!(left(), ["1790000001-0000", "1790000003-0000", "1790000004-0000", id]);
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(left(), ["1790000001-0000", "1790000004-0000", id]);
+        // Still within the grace: its code.
+        assert_eq!(client(&root, "1790000001-0000", None, None).wait().code, 3);
+        prune_settled(&root, runs::now());
+        assert_eq!(left().len(), if cfg!(target_os = "linux") { 4 } else { 3 }, "nothing more to prune");
+        // Past the grace, the recently ended ones go too.
+        prune_settled(&root, runs::now() + ENDED_GRACE + 1);
+        #[cfg(target_os = "linux")]
+        assert_eq!(left(), ["1790000003-0000", "1790000004-0000"]);
+
+        // `session prune`: every finished one but the newest `keep`.
+        fake_session(&root, "1790000006-0000", &ended(0));
+        fake_session(&root, "1790000007-0000", &ended(0));
+        assert_eq!(runs::prune(&root, 1).unwrap(), 1);
+        assert!(left().contains(&"1790000007-0000".to_string()));
+        assert_eq!(runs::prune(&root, 0).unwrap(), 1);
+        #[cfg(target_os = "linux")]
+        assert_eq!(left(), ["1790000003-0000", "1790000004-0000"]);
+        let _ = sup.kill();
+        let _ = sup.wait();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Ended sessions piling up no longer hide an older live one from `ls`:
+    /// `new` prunes the long-ended ones. Linux only (`is_supervisor`).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ls_keeps_an_old_live_session_past_many_ended_ones() {
+        let root = temp_root("ls-live");
+        let live = "1790000000-0001";
+        let _child = start(&root, live, "sleep 300");
+        wait_for("the command", || meta(&root, live).pgid.is_some());
+        let done = format!("started 1790000001\nended {}\nexit 0\n", runs::now() - ENDED_GRACE - 1);
+        for n in 0..runs::MAX_LS_RUNS + 10 {
+            fake_session(&root, &format!("{:010}-0000", 1790000001 + n), &done);
+        }
+        assert!(!ls(&root).unwrap().contains(live), "hidden before the prune");
+        let id = "1800000000-0001";
+        assert_eq!(client(&root, id, Some(start(&root, id, "exit 0")), None).wait().code, 0);
+        assert_eq!(runs::run_ids(&root).unwrap(), [live, id]);
+        assert!(ls(&root).unwrap().starts_with(&format!("{live} running detached ")));
+        rm(&root, live).unwrap();
         let _ = fs::remove_dir_all(&root);
     }
 

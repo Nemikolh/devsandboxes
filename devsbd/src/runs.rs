@@ -690,10 +690,23 @@ pub(crate) fn signal_group(pgid: u32, sig: i32) -> io::Result<()> {
 /// `meta` can't be read are left alone. Returns how many were deleted. One
 /// that can't be (another user's, in the sticky dir) doesn't stop the rest,
 /// but makes the result an error naming it.
-fn prune(root: &Path, keep: usize) -> io::Result<usize> {
+pub(crate) fn prune(root: &Path, keep: usize) -> io::Result<usize> {
+    prune_where(root, keep, |_| true)
+}
+
+/// [`prune`] with no `keep`, for dirs that may still be asked how they
+/// ended: deletes `lost` ones (no `ended` recorded) and ended ones whose
+/// `ended` is before `cutoff` (unix seconds); running ones and unreadable
+/// ones stay, as in [`prune`].
+pub(crate) fn prune_ended_before(root: &Path, cutoff: u64) -> io::Result<usize> {
+    prune_where(root, 0, |meta| meta.ended.is_none_or(|ended| ended < cutoff))
+}
+
+/// [`prune`] over the finished dirs `pick` accepts (it sees their `meta`).
+fn prune_where(root: &Path, keep: usize, pick: impl Fn(&Meta) -> bool) -> io::Result<usize> {
     let ended: Vec<String> = run_ids(root)?
         .into_iter()
-        .filter(|id| matches!(load_state(&root.join(id), id), Ok((_, s)) if s != State::Running))
+        .filter(|id| matches!(load_state(&root.join(id), id), Ok((m, s)) if s != State::Running && pick(&m)))
         .collect();
     let (mut removed, mut failed) = (0, None);
     for id in &ended[..ended.len().saturating_sub(keep)] {
