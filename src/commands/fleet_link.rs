@@ -10,7 +10,7 @@
 //! dir; the newest link for a worker wins), and each connection there (the
 //! hub's link to the offered machine, its forwarded verbs: `fleet::offer::dial`)
 //! becomes one `API` stream to the worker's daemon. Once the `Hello`s are
-//! through it sends `fleet.offer {worker, version}` to this host's daemon
+//! through it sends `fleet.offer {worker, version, draining}` to this host's daemon
 //! (started like any client's, if it isn't running), which registers the
 //! worker as an offered machine, and holds that connection for the link's
 //! life, so a linked worker keeps the hub's daemon from idling out. A refused
@@ -29,12 +29,13 @@ use crate::serve::machines::check_name;
 
 /// The CLI entry: the socket dir (created 0700 if missing), then [`run`] on
 /// stdin/stdout, offering through this host's daemon (lazy start).
-pub fn fleet_link(worker: &str) -> Result<()> {
+/// `draining`: the worker's `lend` is `drain` (`--drain`).
+pub fn fleet_link(worker: &str, draining: bool) -> Result<()> {
     check_name(worker)?;
     let dir = endpoint::socket_dir()?;
     endpoint::ensure_private_dir(&dir)?;
     let daemon = dir.clone();
-    run(io::stdin(), io::stdout(), &dir, worker, move || {
+    run(io::stdin(), io::stdout(), &dir, worker, draining, move || {
         client::connect(&daemon, "fleet-link").context("cannot reach this host's devsandbox serve")
     })
 }
@@ -48,13 +49,14 @@ pub fn run(
     writer: impl Write + Send + 'static,
     dir: &Path,
     worker: &str,
+    draining: bool,
     daemon: impl FnOnce() -> Result<Conn>,
 ) -> Result<()> {
     check_name(worker)?;
     let mut held: Option<Conn> = None;
     let end = link::opener(&fleet::LINK, reader, writer, &endpoint::fleet_socket(dir, worker), |peer| {
         let mut conn = daemon()?;
-        offer(&mut conn, worker, &peer.hash)?;
+        offer(&mut conn, worker, &peer.hash, draining)?;
         held = Some(conn);
         Ok(())
     });
@@ -63,8 +65,8 @@ pub fn run(
 }
 
 /// `fleet.offer` on `conn`; a refusal is an error with the daemon's reason.
-fn offer(conn: &mut Conn, worker: &str, version: &str) -> Result<()> {
-    let r = conn.call("fleet.offer", json!({ "worker": worker, "version": version }))?;
+fn offer(conn: &mut Conn, worker: &str, version: &str, draining: bool) -> Result<()> {
+    let r = conn.call("fleet.offer", json!({ "worker": worker, "version": version, "draining": draining }))?;
     if let Some(e) = r.error {
         bail!("offer refused: {}", e.message);
     }
@@ -135,7 +137,7 @@ mod tests {
     /// daemon in `hub`.
     fn hub_link(io: UnixStream, hub: PathBuf) -> std::thread::JoinHandle<Result<()>> {
         let (r, w) = (io.try_clone().unwrap(), io);
-        std::thread::spawn(move || run(r, w, &hub.clone(), "lap", move || Ok(conn_at(&hub))))
+        std::thread::spawn(move || run(r, w, &hub.clone(), "lap", false, move || Ok(conn_at(&hub))))
     }
 
     /// A worker linked to its hub: the hub's daemon registers it on offer,
@@ -253,7 +255,7 @@ mod tests {
     fn a_bad_worker_name_is_refused_before_binding() {
         let (a, b) = UnixStream::pair().unwrap();
         let dir = std::env::temp_dir();
-        let err = run(a, b, &dir, "a/b", || unreachable!()).unwrap_err();
+        let err = run(a, b, &dir, "a/b", false, || unreachable!()).unwrap_err();
         assert!(format!("{err:#}").contains("machine name"), "{err:#}");
     }
 }

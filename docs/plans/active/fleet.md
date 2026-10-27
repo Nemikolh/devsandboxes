@@ -4,7 +4,9 @@ Status: in progress
 Commit 1a (link primitive) shipped: `serve::fleet::link`, `channel::API`;
 1b (hub side) shipped: `fleet-link`, `fleet.offer`, the `offered` registry
 kind and its dial; 1c (worker side) shipped: `lend.toml` read at start,
-the lending thread, the fleet root and the `Worker` table
+the lending thread, the fleet root and the `Worker` table; 1d (CLI)
+shipped: `serve::locked_file`, `lend.get|set` applied live, `devsandbox
+lend`, `fleet join|leave`
 ([fleet](../../architecture/daemon/fleet.md), ADR
 [0041](../../decisions/0041-fleet-workers-dial-their-hub.md)); the rest
 is design. Builds on [machines](../../architecture/daemon/machines.md)

@@ -383,6 +383,9 @@ enum Command {
         /// The worker's machine name: names the socket and its offered entry
         #[arg(long)]
         worker: String,
+        /// The worker's lending is `drain`: it takes no new work
+        #[arg(long)]
+        drain: bool,
     },
     /// Register remote hosts (over ssh) whose sandboxes this one manages
     /// (docs/architecture/daemon/machines.md)
@@ -390,6 +393,20 @@ enum Command {
     Machine {
         #[command(subcommand)]
         cmd: MachineCommand,
+    },
+    /// Show or change whether this host lends itself to a fleet hub
+    /// (docs/architecture/daemon/fleet.md); `fleet join` picks the hub
+    #[cfg(unix)]
+    Lend {
+        #[command(subcommand)]
+        cmd: Option<LendCommand>,
+    },
+    /// Join or leave a fleet: lend this host to a hub as a worker
+    /// (docs/architecture/daemon/fleet.md)
+    #[cfg(unix)]
+    Fleet {
+        #[command(subcommand)]
+        cmd: FleetCommand,
     },
 }
 
@@ -473,6 +490,39 @@ enum MachineCommand {
     },
     /// Unregister a machine (nothing on it changes)
     Rm { name: String },
+}
+
+#[cfg(unix)]
+#[derive(Subcommand, Debug, PartialEq, Eq)]
+enum LendCommand {
+    /// The lending state, the hub, the name offered and the link (the default)
+    Show,
+    /// Lend to the hub `fleet join` set: offer this host and take new work
+    On,
+    /// Stop lending: the link to the hub goes down
+    Off,
+    /// Keep the link (what's placed here stays reachable), take no new work
+    Drain,
+}
+
+#[cfg(unix)]
+#[derive(Subcommand, Debug, PartialEq, Eq)]
+enum FleetCommand {
+    /// Lend this host to a hub: its daemon dials `ssh <hub> devsandbox fleet-link`
+    ///
+    ///     devsandbox fleet join me@hub
+    ///
+    ///     devsandbox fleet join ssh://me@hub:2200 --name lap
+    Join {
+        /// What ssh takes (`me@host`, an ssh-config alias) or `ssh://[user@]host[:port]`
+        hub: String,
+        /// The name this host offers itself under (default: the hostname's first label)
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Drain, wait until no instance the hub placed here runs, then stop lending
+    /// (Ctrl-C stops the wait and leaves it draining)
+    Leave,
 }
 
 /// `<thread>`: `<owner>/<key>` (owner: instance name or id) or the id `inbox ls` shows.
@@ -777,7 +827,7 @@ fn main() -> Result<()> {
         #[cfg(unix)]
         Command::AgentRelay { client } => commands::agent_relay::agent_relay(&client),
         #[cfg(unix)]
-        Command::FleetLink { worker } => commands::fleet_link::fleet_link(&worker),
+        Command::FleetLink { worker, drain } => commands::fleet_link::fleet_link(&worker, drain),
         #[cfg(unix)]
         Command::Machine { cmd } => match cmd {
             MachineCommand::Add { target, name, configs, agent, auto_install } => {
@@ -786,6 +836,21 @@ fn main() -> Result<()> {
             MachineCommand::Ls { json } => commands::machine::ls(json),
             MachineCommand::Set { name, agent } => commands::machine::set(&name, agent),
             MachineCommand::Rm { name } => commands::machine::rm(&name),
+        },
+        #[cfg(unix)]
+        Command::Lend { cmd } => {
+            use serve::fleet::lend::State;
+            match cmd.unwrap_or(LendCommand::Show) {
+                LendCommand::Show => commands::lend::show(),
+                LendCommand::On => commands::lend::set_state(State::On),
+                LendCommand::Off => commands::lend::set_state(State::Off),
+                LendCommand::Drain => commands::lend::set_state(State::Drain),
+            }
+        }
+        #[cfg(unix)]
+        Command::Fleet { cmd } => match cmd {
+            FleetCommand::Join { hub, name } => commands::lend::join(&hub, name.as_deref()),
+            FleetCommand::Leave => commands::lend::leave(),
         },
     }
 }
@@ -816,6 +881,8 @@ mod tests {
     use clap::Parser;
 
     use super::{rm_branch_flag, Cli, Command};
+    #[cfg(unix)]
+    use super::{FleetCommand, LendCommand};
 
     fn rm_flag(args: &[&str]) -> Result<Option<bool>, clap::Error> {
         let cli = Cli::try_parse_from(["devsandbox", "rm", "web"].iter().chain(args))?;
@@ -834,6 +901,38 @@ mod tests {
         assert_eq!(rm_flag(&["--keep-branch"]).unwrap(), Some(false));
         let err = rm_flag(&["--delete-branch", "--keep-branch"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lend_and_fleet_parse() {
+        let parse = |args: &[&str]| Cli::try_parse_from(std::iter::once("devsandbox").chain(args.iter().copied()));
+        let lend = |args: &[&str]| match parse(args).unwrap().command {
+            Some(Command::Lend { cmd }) => cmd,
+            _ => panic!("not lend"),
+        };
+        assert_eq!(lend(&["lend"]), None, "show by default");
+        assert_eq!(lend(&["lend", "show"]), Some(LendCommand::Show));
+        assert_eq!(lend(&["lend", "on"]), Some(LendCommand::On));
+        assert_eq!(lend(&["lend", "off"]), Some(LendCommand::Off));
+        assert_eq!(lend(&["lend", "drain"]), Some(LendCommand::Drain));
+        assert!(parse(&["lend", "maybe"]).is_err());
+        let fleet = |args: &[&str]| match parse(args).unwrap().command {
+            Some(Command::Fleet { cmd }) => cmd,
+            _ => panic!("not fleet"),
+        };
+        assert_eq!(fleet(&["fleet", "join", "me@hub"]), FleetCommand::Join { hub: "me@hub".into(), name: None });
+        assert_eq!(
+            fleet(&["fleet", "join", "ssh://me@hub:2200", "--name", "lap"]),
+            FleetCommand::Join { hub: "ssh://me@hub:2200".into(), name: Some("lap".into()) }
+        );
+        assert_eq!(fleet(&["fleet", "leave"]), FleetCommand::Leave);
+        assert!(parse(&["fleet", "join"]).is_err(), "a hub is required");
+        assert!(parse(&["fleet"]).is_err());
+        match parse(&["fleet-link", "--worker", "lap", "--drain"]).unwrap().command {
+            Some(Command::FleetLink { worker, drain }) => assert!(worker == "lap" && drain),
+            _ => panic!("not fleet-link"),
+        }
     }
 
     /// `exec`'s (attach, sessions, session, name, command).

@@ -250,8 +250,8 @@ fn connect() -> Result<Conn> {
 }
 
 /// One call; an error answer is the command's error, with the daemon's
-/// message.
-fn call<T: DeserializeOwned>(conn: &mut Conn, method: &str, params: Value) -> Result<T> {
+/// message. `lend` / `fleet` call the same way.
+pub(crate) fn call<T: DeserializeOwned>(conn: &mut Conn, method: &str, params: Value) -> Result<T> {
     let r = conn.call(method, params)?;
     if let Some(e) = r.error {
         bail!("{}", e.message);

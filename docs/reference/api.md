@@ -13,6 +13,7 @@ method), `src/inbox/wire.rs` (Inbox views, `ApiError`, `decide_*`),
 `src/serve/forwards.rs` (`forwards.*`),
 `src/serve/machines/api.rs` (`machines.*`), `src/serve/machines/forward.rs`
 (`QUICK`, federation), `src/serve/fleet/offer.rs` (`fleet.offer`),
+`src/serve/fleet/lender.rs` (`lend.*`),
 `src/serve/relay.rs` (`api --stdio`),
 `npm/devsandboxes/index.js` + `index.d.ts` (Node client; `src/serve/dts.rs`
 checks the typings against the wire structs).
@@ -29,7 +30,7 @@ checks the typings against the wire structs).
 | | `roots.list` | no |
 | bridges, forwards | `bridges.ensure`, `helper.call`, `forwards.list\|add\|rm` | no |
 | verbs | `run`, `rebuild`, `start`, `stop`, `rm`, `services.rebuild` | yes (own ssh) |
-| machines | `machines.probe\|add\|list\|get\|rm`, `fleet.offer` (internal) | no |
+| machines | `machines.probe\|add\|list\|get\|rm`, `fleet.offer` (internal), `lend.get\|set` | no |
 
 Notifications: `inbox.changed`, `inbox.shown`, `instances.changed`,
 `instances.snapshot`, `forwards.changed`, `forwards.status`, `closing`
@@ -941,12 +942,45 @@ there.
 Internal (`devsandbox fleet-link`'s; not in the npm typings): a fleet
 worker's link to this host is up
 ([fleet.md](../architecture/daemon/fleet.md#hub-side)). Params:
-`{"worker": "<machine name>", "version": "<its semver>"}`. Result: `{"ok":
+`{"worker": "<machine name>", "version": "<its semver>", "draining"?:
+<bool>}` (`draining`: the worker's lending was `drain` when it dialed;
+logged). Result: `{"ok":
 true}`; a new name is saved as an offered machine (its link starts, dialed
 at the worker's `fleet-<worker>.sock`), an offered one is kept. Errors:
 `invalid` (a bad name, a missing param), `denied` (this daemon isn't a
 hub: `[serve] hub = true` in `daemon.config.toml`; or the name is an ssh
 machine's), `internal` (`machines.toml` doesn't read or write).
+
+### `lend.*`
+
+This host as a fleet worker: `lend.toml` and the link to its hub
+([fleet.md](../architecture/daemon/fleet.md#lending-lend)). The daemon is
+`lend.toml`'s only writer, and a change applies at once. Both are denied
+on a fleet hub's connection.
+
+| method | params | result | errors |
+|---|---|---|---|
+| `lend.get` | `{}` | `{"state", "hub", "name", "fleet_root", "link", "error"}` | `internal` (`lend.toml` doesn't parse), `failed` (no data dir) |
+| `lend.set` | `{"state"?, "hub"?, "name"?}`: each one given is changed | as `lend.get`, after the change | `invalid` (an unknown param or `state`, an empty or bad `hub`, a bad `name`, lending without a `hub`, or no `name` and a hostname that isn't a valid one), `failed` (the daemon is exiting, no data dir), `internal` (`lend.toml` doesn't read or write, the fleet root can't be created) |
+
+- `state`: `on` (offer this host, take new work), `off` (no link) or
+  `drain` (keep the link, so what's placed here stays reachable; take no
+  new work: offered as `draining`, nothing places work yet).
+- `hub`: the hub's ssh target, as `machines.add` takes one; `null` when
+  none was set. Kept when lending goes `off`.
+- `name`: the name this host offers itself under: the one set, else the
+  hostname's first label; `null` when neither is a valid machine name.
+  `lend.set {name: ""}` clears it.
+- `fleet_root`: `<data>/devsandbox/fleet/<hub>/`, all the hub reaches
+  (canonical while lending); `null` without a `hub`.
+- `link`: `off`, `connecting` (the first attempt hasn't ended),
+  `connected`, or `retrying` (`error` says why; the next attempt follows
+  the backoff). `error` is also set while `off` when the file says lend
+  but lending couldn't start.
+
+`lend.set` restarts the link only for a new `hub` or `name` (the old ssh
+killed first); `on` ↔ `drain` keeps it, and the next dial offers the new
+state.
 
 ### The `machine` param
 

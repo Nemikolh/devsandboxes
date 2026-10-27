@@ -281,9 +281,10 @@ limitation means editing this file in the same commit.
   `--machine` per-root commands and `--all` verbs on it fail), and its link
   is held only while wanted, like an ssh machine's (step 1f keeps it up).
   → [fleet](architecture/daemon/fleet.md#hub-side); `machines::offered_refusal`
-- `lend.toml` has no writer yet (`devsandbox lend`, `fleet join`: step 1d):
-  it's written by hand, and read only when the daemon starts, so a change
-  needs a daemon restart. → [fleet](architecture/daemon/fleet.md#worker-side); `daemon::start_lending`
+- A worker's `drain` reaches its hub only in the offer of its next link
+  (`lend on` ↔ `drain` keeps the current one), and nothing on the hub acts
+  on it until placement (step 3b; live lending state in the snapshot is
+  step 1g). → [fleet](architecture/daemon/fleet.md#lending-lend); `fleet::lender::transition`
 - A placed config isn't checked against a worker policy yet (step 1e): a
   config under the fleet root may bind-mount any host path, run
   privileged or mount the runtime socket.

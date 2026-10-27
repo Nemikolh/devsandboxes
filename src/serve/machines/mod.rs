@@ -23,11 +23,10 @@
 //! the CLI reads it later to know whether any machine exists. Two
 //! daemons can briefly overlap during a handoff, so every write is a
 //! read-modify-write under an exclusive lock on the sibling `machines.lock`,
-//! written to a temp file and renamed, as `forward_store` does.
+//! written to a temp file and renamed (`serve::locked_file`).
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -246,37 +245,7 @@ pub fn load(path: &Path) -> Result<Vec<Entry>> {
 /// the entries. A file that doesn't parse fails the update rather than being
 /// overwritten.
 pub fn update<T>(path: &Path, f: impl FnOnce(&mut Vec<Entry>) -> T) -> Result<T> {
-    let dir = path.parent().context("machines path has no parent")?;
-    std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
-    let _lock = lock(path)?;
-    let mut entries = load(path)?;
-    let before = entries.clone();
-    let out = f(&mut entries);
-    if entries != before {
-        write_atomic(path, &serialize(&entries)?)?;
-    }
-    Ok(out)
-}
-
-/// Separate from `machines.toml`, which the atomic write replaces.
-fn lock(path: &Path) -> Result<File> {
-    let lock_path = path.with_file_name("machines.lock");
-    let file = File::options()
-        .create(true)
-        .read(true)
-        .write(true)
-        .open(&lock_path)
-        .with_context(|| format!("cannot open {}", lock_path.display()))?;
-    file.lock().with_context(|| format!("cannot lock {}", lock_path.display()))?;
-    Ok(file)
-}
-
-/// Temp file + rename; the pid in the temp name keeps a killed writer's stale
-/// temp from being reused by the other daemon.
-fn write_atomic(path: &Path, text: &str) -> Result<()> {
-    let tmp = path.with_file_name(format!(".machines.toml.{}.tmp", std::process::id()));
-    std::fs::write(&tmp, text).with_context(|| format!("cannot write {}", tmp.display()))?;
-    std::fs::rename(&tmp, path).with_context(|| format!("cannot write {}", path.display()))
+    super::locked_file::update(path, load, |e| serialize(e), f)
 }
 
 /// A machine name is `[A-Za-z0-9._-]+`, not starting with `.` or `-`. Never

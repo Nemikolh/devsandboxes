@@ -6,7 +6,9 @@
 //! by the daemon's `open` (a socket pair: the API relay's sentinel on the
 //! hub's end, the other end served as a `Worker` connection, `fleet::lent`).
 //! A link that ends is retried with the machine links' backoff
-//! (`service::backoff`), reset once a link came up.
+//! (`service::backoff`), reset once a link came up. [`Lending::status`] is
+//! the link's state for `lend.get`; [`Lending::set_draining`] changes what
+//! the next link offers (`--drain`) without dropping the current one.
 //!
 //! The transport is injectable ([`Transport`]): production spawns ssh
 //! (`ssh::spawn`), tests hand back one end of a socket pair whose other end
@@ -44,9 +46,26 @@ pub type Open = Arc<dyn Fn() -> Option<Conn> + Send + Sync>;
 /// `ssh -T -o BatchMode=yes [-p N] -- <hub> <devsandbox fleet-link --worker
 /// <name>>` through the hub's login shell, as every machine argv is
 /// (`ssh::remote_command`). `BatchMode`: the daemon has no TTY.
-pub fn link_argv(hub: &str, name: &str) -> Result<Vec<OsString>> {
+/// `draining` adds `--drain`: the offer says this worker takes no new work.
+pub fn link_argv(hub: &str, name: &str, draining: bool) -> Result<Vec<OsString>> {
     check_name(name)?;
-    ssh::target_argv(hub, &["-T", "-o", "BatchMode=yes"], "devsandbox", &["fleet-link", "--worker", name])
+    let mut args = vec!["fleet-link", "--worker", name];
+    if draining {
+        args.push("--drain");
+    }
+    ssh::target_argv(hub, &["-T", "-o", "BatchMode=yes"], "devsandbox", &args)
+}
+
+/// The link's state, for `lend.get`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Status {
+    /// The first attempt hasn't come up (or failed) yet.
+    Connecting,
+    /// The `Hello`s are through.
+    Connected,
+    /// The last attempt failed or the link ended: why. The next one is
+    /// after the backoff.
+    Retrying(String),
 }
 
 /// The lending thread. Dropping it stops it: the link's stream is shut
@@ -63,21 +82,43 @@ struct Ctl {
     wake: Condvar,
     /// The live link's stream, to shut on stop.
     current: Mutex<Option<Stream>>,
+    /// What the next link offers: `--drain`.
+    draining: AtomicBool,
+    status: Mutex<Option<Status>>,
 }
 
 impl Lending {
-    /// Start lending to `hub` as `name`.
-    pub fn spawn(hub: String, name: String, transport: Transport, open: Open, timing: Timing, log: fn(&str)) -> Result<Lending> {
-        let argv = link_argv(&hub, &name)?;
+    /// Start lending to `hub` as `name` (`draining`: offering `--drain`).
+    pub fn spawn(
+        hub: String,
+        name: String,
+        draining: bool,
+        transport: Transport,
+        open: Open,
+        timing: Timing,
+        log: fn(&str),
+    ) -> Result<Lending> {
+        link_argv(&hub, &name, draining)?;
         let ctl = Arc::new(Ctl::default());
+        ctl.draining.store(draining, Ordering::SeqCst);
         let thread = {
             let ctl = Arc::clone(&ctl);
             std::thread::Builder::new()
                 .name("serve-lend".into())
-                .spawn(move || lend_loop(&hub, &name, &argv, &transport, &open, &timing, &ctl, log))
+                .spawn(move || lend_loop(&hub, &name, &transport, &open, &timing, &ctl, log))
                 .context("cannot start the lending thread")?
         };
         Ok(Lending { ctl, thread: Some(thread) })
+    }
+
+    pub fn status(&self) -> Status {
+        self.ctl.status.lock().unwrap().clone().unwrap_or(Status::Connecting)
+    }
+
+    /// What the next link offers; the current one stays up (the hub learns
+    /// it when the link is next made).
+    pub fn set_draining(&self, draining: bool) {
+        self.ctl.draining.store(draining, Ordering::SeqCst);
     }
 }
 
@@ -99,6 +140,10 @@ impl Ctl {
         *self.stopped.lock().unwrap()
     }
 
+    fn set_status(&self, status: Status) {
+        *self.status.lock().unwrap() = Some(status);
+    }
+
     /// Sleep `d` unless stopped first; `false` once stopped.
     fn wait(&self, d: Duration) -> bool {
         let guard = self.stopped.lock().unwrap();
@@ -107,21 +152,22 @@ impl Ctl {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn lend_loop(
-    hub: &str,
-    name: &str,
-    argv: &[OsString],
-    transport: &Transport,
-    open: &Open,
-    timing: &Timing,
-    ctl: &Ctl,
-    log: fn(&str),
-) {
+fn lend_loop(hub: &str, name: &str, transport: &Transport, open: &Open, timing: &Timing, ctl: &Ctl, log: fn(&str)) {
     let mut failures = 0;
     while !ctl.stopped() {
-        match transport(argv) {
-            Err(e) => log(&format!("fleet: cannot reach hub {hub}: {e:#}")),
+        let argv = match link_argv(hub, name, ctl.draining.load(Ordering::SeqCst)) {
+            Ok(argv) => argv,
+            Err(e) => {
+                // Checked by `spawn`: unreachable short of a bug.
+                log(&format!("fleet: {e:#}"));
+                return;
+            }
+        };
+        match transport(&argv) {
+            Err(e) => {
+                log(&format!("fleet: cannot reach hub {hub}: {e:#}"));
+                ctl.set_status(Status::Retrying(format!("{e:#}")));
+            }
             Ok(duplex) => {
                 if run_link(hub, name, duplex, open, ctl, log) {
                     failures = 0;
@@ -156,6 +202,7 @@ fn run_link(hub: &str, name: &str, mut duplex: Duplex, open: &Open, ctl: &Ctl, l
         || open(),
         || {
             up.store(true, Ordering::Relaxed);
+            ctl.set_status(Status::Connected);
             log(&format!("fleet: lending to {hub} as {name}"));
         },
         move || {
@@ -170,10 +217,9 @@ fn run_link(hub: &str, name: &str, mut duplex: Duplex, open: &Open, ctl: &Ctl, l
             link::End::Closed => "link closed".into(),
         };
         let tail = duplex.peer.stderr_tail(Duration::from_millis(500));
-        log(&format!(
-            "fleet: link to {hub} ended: {why}{}",
-            if tail.is_empty() { String::new() } else { format!(" (ssh: {tail})") }
-        ));
+        let why = format!("{why}{}", if tail.is_empty() { String::new() } else { format!(" (ssh: {tail})") });
+        log(&format!("fleet: link to {hub} ended: {why}"));
+        ctl.set_status(Status::Retrying(why));
     }
     duplex.peer.close();
     up.load(Ordering::Relaxed)
@@ -185,7 +231,7 @@ mod tests {
 
     #[test]
     fn the_link_argv() {
-        let argv = link_argv("ssh://me@hub:2200", "lap").unwrap();
+        let argv = link_argv("ssh://me@hub:2200", "lap", false).unwrap();
         let want = [
             "ssh",
             "-T",
@@ -198,9 +244,11 @@ mod tests {
             r#"exec "$SHELL" -lc 'exec devsandbox '\''fleet-link'\'' '\''--worker'\'' '\''lap'\'''"#,
         ];
         assert_eq!(argv, want.map(OsString::from));
-        assert_eq!(link_argv("hub", "lap").unwrap()[4..6], [OsString::from("--"), "hub".into()]);
-        assert!(link_argv("-oProxyCommand=x", "lap").is_err());
-        assert!(link_argv("hub", "a/b").is_err());
+        assert_eq!(link_argv("hub", "lap", false).unwrap()[4..6], [OsString::from("--"), "hub".into()]);
+        let drain = link_argv("hub", "lap", true).unwrap();
+        assert!(drain[6].to_string_lossy().ends_with(r#"'\''--drain'\'''"#), "{drain:?}");
+        assert!(link_argv("-oProxyCommand=x", "lap", false).is_err());
+        assert!(link_argv("hub", "a/b", false).is_err());
     }
 
     mod e2e {
@@ -262,7 +310,7 @@ mod tests {
                 let hub = hub.clone();
                 std::thread::spawn(move || {
                     let (r, w) = (hub_io.try_clone().unwrap(), hub_io);
-                    crate::commands::fleet_link::run(r, w, &hub.clone(), "lap", move || Ok(conn_at(&hub)))
+                    crate::commands::fleet_link::run(r, w, &hub.clone(), "lap", false, move || Ok(conn_at(&hub)))
                 });
                 Ok(Duplex::socket(worker))
             })
@@ -324,7 +372,7 @@ mod tests {
             worker.state = Some(worker_state);
             worker.home = Some(base.join("worker-home"));
             worker.machines = Some(base.join("worker-machines.toml"));
-            worker.lend = Some(lend_path);
+            worker.lend = Some(lend_path.clone());
             worker.lend_transport = Some(in_process_hub(hub_dir.clone()));
             worker.lend_env = Some(BTreeMap::from([("PATH".into(), "/worker/bin".into())]));
             let registry = base.join("machines.toml");
@@ -401,6 +449,24 @@ mod tests {
             drop(raw);
             assert!(!worker_daemon.is_finished());
 
+            // `lend.*` on a local connection: the link's state, and a change
+            // applied at once (off drops the link, on brings it back).
+            let mut local = conn_at(&worker_dir);
+            let info = local.call("lend.get", Value::Null).unwrap().result.unwrap();
+            assert_eq!((&info["state"], &info["link"], &info["name"]), (&json!("on"), &json!("connected"), &json!("lap")));
+            assert_eq!(info["fleet_root"], json!(std::fs::canonicalize(&fleet_root).unwrap()));
+            let off = local.call("lend.set", json!({"state": "off"})).unwrap().result.unwrap();
+            assert_eq!(off["link"], "off");
+            wait_for(|| !endpoint::fleet_socket(&hub_dir, "lap").exists(), "off: the hub's socket gone");
+            assert_eq!(lend::load(&lend_path).unwrap().unwrap().state, lend::State::Off, "written");
+            local.call("lend.set", json!({"state": "drain"})).unwrap().result.unwrap();
+            wait_for(|| endpoint::fleet_socket(&hub_dir, "lap").exists(), "drain: linked again");
+            wait_for(
+                || local.call("lend.get", Value::Null).unwrap().result.unwrap()["link"] == "connected",
+                "drain: connected",
+            );
+            drop(local);
+
             // A local client stops the worker; its link goes with it, which
             // ends the hub's end and unlinks its socket.
             assert!(conn_at(&worker_dir).call("shutdown", json!({})).unwrap().error.is_none());
@@ -421,12 +487,13 @@ mod tests {
             anyhow::bail!("no route")
         });
         let timing = Timing { backoff: Duration::from_millis(5), backoff_cap: Duration::from_millis(10), ..Timing::default() };
-        let lending = Lending::spawn("hub".into(), "lap".into(), transport, Arc::new(|| None), timing, |_| {}).unwrap();
+        let lending = Lending::spawn("hub".into(), "lap".into(), false, transport, Arc::new(|| None), timing, |_| {}).unwrap();
         let start = std::time::Instant::now();
         while tries.load(Ordering::SeqCst) < 3 {
             assert!(start.elapsed() < Duration::from_secs(5), "retried");
             std::thread::sleep(Duration::from_millis(5));
         }
+        assert_eq!(lending.status(), Status::Retrying("no route".into()));
         drop(lending);
         let n = tries.load(Ordering::SeqCst);
         std::thread::sleep(Duration::from_millis(50));

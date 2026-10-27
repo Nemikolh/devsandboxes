@@ -826,6 +826,26 @@ export interface MachineRow {
   version: string | null;
 }
 
+/** Whether this host lends itself to a fleet hub: `drain` keeps the link but takes no new work. */
+export type LendState = 'on' | 'off' | 'drain';
+
+/** The lending link to the hub: `retrying` after a failure (see `error`). */
+export type LendLinkState = 'off' | 'connecting' | 'connected' | 'retrying';
+
+/** `lend.get`'s answer (and `lend.set`'s, after the change): this host as a fleet worker. */
+export interface LendInfo {
+  state: LendState;
+  /** The hub's ssh target; `null` when none was ever set. */
+  hub: string | null;
+  /** The name offered: `lend.toml`'s, else the hostname's first label; `null` when neither is a valid name. */
+  name: string | null;
+  /** `<data>/devsandbox/fleet/<hub>/`, all the hub reaches here (canonical while lending). */
+  fleet_root: string | null;
+  link: LendLinkState;
+  /** Why the link is `retrying`, or why it's `off` while `state` says lend. */
+  error: string | null;
+}
+
 /** One process of an instance, as `ps` printed it. */
 export interface ProcessRow {
   pid: string;
@@ -1215,6 +1235,13 @@ export interface ApiMethods {
    * caller's absolute `SSH_AUTH_SOCK`. Waits up to 5 s for the relay; `not-found` for an unknown name.
    */
   'machines.hold': { params: { name: string; agent?: string }; result: MachineHeld };
+  /** This host's lending to a fleet hub (`lend.toml`) and its link. */
+  'lend.get': { params: {}; result: LendInfo };
+  /**
+   * Change what's given and apply it at once: start, stop or retarget the link (`on` ↔ `drain` keeps it).
+   * `invalid` for an empty or bad `hub`, a bad `name` (`''` clears it), or lending without a hub.
+   */
+  'lend.set': { params: { state?: LendState; hub?: string; name?: string }; result: LendInfo };
   /** `not-found` for an unknown sandbox; one that doesn't merge answers why in `resolved`. */
   'sandboxes.get': { params: { root: string; name: string; machine?: string }; result: SandboxConfig };
   'services.get': { params: { root: string; name: string; machine?: string }; result: ServiceConfig };

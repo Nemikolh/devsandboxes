@@ -41,7 +41,7 @@ dials with the same param) and `agent` (whether this host's
 ssh-agent is meant for the machine, see [Agent](#agent); off by default,
 written only when on). Only the daemon writes it
 (`machines.add`/`set`/`rm`, `fleet.offer`): locked read-modify-write on `machines.lock`, temp
-file + rename, since two daemons overlap during a handoff. A file that
+file + rename (`serve::locked_file::update`), since two daemons overlap during a handoff. A file that
 doesn't parse is logged and changes nothing. The CLI reads it only to know
 whether any machine exists, so with none every command resolves exactly as
 without machines and never starts a daemon it didn't need.

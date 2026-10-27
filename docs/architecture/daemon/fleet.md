@@ -5,7 +5,8 @@ Machines as one pool of capacity (the plan:
 primitive the fleet's links are built on (the machines'
 [agent relay](machines.md#agent) runs on it too) and both sides of a
 worker's link: on the hub the offer, the offered registry entry and its
-dial; on the worker `lend.toml`, the lending thread and the lent API
+dial; on the worker `lend.toml`, the lending thread, the lent API and
+`lend.*` with its CLI, `devsandbox lend` and `devsandbox fleet join|leave`
 ([ADR 0041](../../decisions/0041-fleet-workers-dial-their-hub.md)).
 
 Code: `src/serve/fleet/mod.rs` (`LINK`), `src/serve/fleet/link.rs`
@@ -15,8 +16,11 @@ Code: `src/serve/fleet/mod.rs` (`LINK`), `src/serve/fleet/link.rs`
 `src/serve/endpoint.rs` (`fleet_socket`), `src/daemon_config.rs`
 (`ServeConfig::hub`), `src/devsbd/proto.rs` (`channel::API`, `caps::API`,
 `channel::flows`); the worker side: `src/serve/fleet/lend.rs` (`Lend`,
-`load`, `fleet_root`, `fleet_dir_name`, `default_name`),
-`src/serve/fleet/worker.rs` (`Lending`, `link_argv`, `Transport`),
+`load`, `check`, `update`, `fleet_root`, `fleet_dir_name`, `default_name`),
+`src/serve/fleet/worker.rs` (`Lending`, `Status`, `link_argv`, `Transport`),
+`src/serve/fleet/lender.rs` (`Lender`, `call`, `merge`, `transition`,
+`LendInfo`), `src/serve/locked_file.rs` (`update`),
+`src/commands/lend.rs` (`show`, `set_state`, `join`, `leave`, `busy`),
 `src/serve/fleet/lent.rs` (`Scope`, `decide`, `admit`, `confine_path`,
 `filter_answer`, `filter_snapshot`), `src/serve/daemon.rs`
 (`start_lending`, `Table`, `Shared::open_lent`).
@@ -90,8 +94,9 @@ link's `API` streams.
   0700 socket dir, the name cut as an agent relay socket's client is), so
   the newest link for a worker wins. Its `on_ready` connects to this host's
   daemon (`client::connect`, which starts one like any client does when
-  none runs) and sends `fleet.offer {worker, version}`, `version` the
-  worker's `Hello`. A refused offer ends the link with `offer refused:
+  none runs) and sends `fleet.offer {worker, version, draining}`, `version`
+  the worker's `Hello`, `draining` its `--drain` (the worker's `lend` was
+  `drain` when it dialed). A refused offer ends the link with `offer refused:
   <why>` (on its stderr, which the worker's ssh keeps). It holds that
   daemon connection for the link's life, so a linked worker is a `clients`
   holder of the hub's daemon. `serve::machines::cli::machine_use` refuses
@@ -103,7 +108,8 @@ link's `API` streams.
   adds an offered entry for a new name, keeps an existing offered one, and
   refuses (`denied`) a name an ssh machine has. A new entry reloads the
   machine links (`service::Handle::reload`), which start a link thread for
-  it; the offer is logged with the worker's version.
+  it; the offer is logged with the worker's version and whether it's
+  draining (nothing on the hub acts on that yet).
 - **An offered entry** is `[machine.<name>]` with `offered = true` and no
   `target` in `machines.toml` (`machines::Kind::Offered`,
   [Registry](machines.md#registry-machinestoml)). Its roots are empty.
@@ -138,9 +144,14 @@ lent API ([ADR 0041](../../decisions/0041-fleet-workers-dial-their-hub.md)).
   as; absent is the hostname's first label, `lend::default_name`, which
   must pass `machines::check_name`) and an `[allow]` table, the worker
   policy's allowances (none yet). Unknown keys are ignored. `lend::load`
-  reads it (missing is not lending); lending (`on`/`drain`) requires a
-  valid `hub`. The daemon reads it once, at start (`daemon::start_lending`,
-  `Options::lend` in tests); a bad file is logged and nothing lends.
+  reads it (missing is not lending); `lend::check`: lending (`on`/`drain`)
+  requires a `hub`, and a `hub` or `name` that's set must be valid. The
+  daemon reads it at start (`daemon::start_lending`, `Lender::start`;
+  `Options::lend` in tests; a bad file is logged and nothing lends) and is
+  its only writer ([Lending: `lend.*`](#lending-lend)): `lend::update`, a
+  read-modify-write under the sibling `lend.lock`, written to a temp file
+  and renamed (`locked_file::update`, which `machines.toml` and
+  `forwards.toml` are written with too).
 - **The fleet root** for a hub is `<data>/devsandbox/fleet/<hub>/`
   (`lend::fleet_root`), `<hub>` the target made one plain path component
   (`lend::fleet_dir_name`: the host, `user@host`, plus `_<port>` for a URL's
@@ -149,23 +160,72 @@ lent API ([ADR 0041](../../decisions/0041-fleet-workers-dial-their-hub.md)).
   and holds its canonical path. All the hub reaches is under it.
 - **The lending thread** (`fleet::worker::Lending`, `serve-lend`) runs
   while the file says `on` or `drain`. It spawns `link_argv`'s `ssh -T -o
-  BatchMode=yes [-p N] -- <hub> <devsandbox fleet-link --worker <name>>`
+  BatchMode=yes [-p N] -- <hub> <devsandbox fleet-link --worker <name>
+  [--drain]>` (`--drain` while `drain`, read at each dial)
   (through the hub's login shell, `ssh::target_argv`, the builder every
   machine argv uses, here without a registry entry) and runs
   `link::answerer` of `fleet::LINK` on its stdio. A link that ends (the
   handshake failed, the keepalive heard nothing, ssh exited) is logged
   with ssh's stderr tail and retried after the machine links' backoff
   (`service::backoff`: 1 s doubling to 30 s), reset once a link came up.
-  Dropping the thread (the daemon exiting, after its drain) shuts the
-  link's socket and kills the ssh. The transport is
+  Its `Status` is `Connecting` until the first attempt ends, `Connected`
+  once the `Hello`s are through, `Retrying(why)` after a failure (why with
+  ssh's stderr tail). Dropping the thread (`lend.set` off or to another
+  hub or name, the daemon exiting after its drain: `Lender::stop`) shuts
+  the link's socket and kills the ssh. The transport is
   `fleet::worker::Transport` (`ssh::spawn` in production;
-  `Options::lend_transport` in tests). A lending daemon never idles out:
-  it is what holds the link.
+  `Options::lend_transport` in tests). A lending daemon never idles out
+  (`Lender::lends`, checked each tick): it is what holds the link.
 - **Each `API` stream** the hub opens is answered by `Shared::open_lent`: a
   socket pair whose daemon end writes the API relay's sentinel line first
   ([the sentinel rule](#link)) and is then served like any connection
   (`spawn_conn_as`), with the `Worker` table. Its connection id comes from
   the same counter as the listener's.
+
+### Lending: `lend.*`
+
+`lend.toml` is the daemon's (the `machines.toml` rule): `lend.get` and
+`lend.set` (`fleet::lender::call`, over the daemon's `Lender`) are the
+only way to read its live state or change it, and every change is applied
+at once, without watching the file. Never on a `Worker` connection
+(`lent::decide` denies them). Wire: [`lend.*`](../../reference/api.md#lend).
+
+- **`lend.get`** answers `LendInfo`: the file's `state` and `hub`, the
+  `name` offered (the file's, else `lend::default_name` of the hostname;
+  `null` when neither is valid), the `fleet_root` (canonical while
+  lending), and the link: `off`, `connecting`, `connected` or `retrying`,
+  with `error` the `Retrying` reason, or why lending didn't start while
+  the file says lend.
+- **`lend.set {state?, hub?, name?}`** merges what's given into the file
+  (`lender::merge`, pure: `hub` non-empty and a valid target; `name` a
+  `machines::check_name`, `""` clears it; lending needs a `hub`) and, when
+  it lends, checks the name it would offer, all before writing; then
+  applies it under the `Lender`'s lock (`lender::transition`, pure, over
+  the running thread's and the wanted `(hub, name)`): nothing running and
+  lending starts one (its fleet root created); off stops it; another hub
+  or name stops the old one (its ssh killed) and starts a new one; the same
+  pair keeps the thread and its link and sets what the next dial offers,
+  so `on` ↔ `drain` never drops what's placed here. It answers the
+  `LendInfo` after the change. A daemon that's exiting answers `failed`.
+- **`drain`** is recorded, shown by `lend.get` and offered (`--drain`);
+  nothing places work yet (fleet plan step 3), so it changes nothing else.
+
+The CLI (`commands::lend`) is a client of these two, through the daemon
+(started like any client does), never in-process; `--machine` refuses
+both commands (`serve::machines::cli::machine_use`):
+
+- `devsandbox lend` / `lend show`: `lend.get` as a one-row table (`STATE`,
+  `HUB`, `NAME`, `LINK`, `FLEET ROOT`), then the error if any.
+  `lend on|off|drain`: `lend.set {state}`.
+- `devsandbox fleet join <hub> [--name N]`: `lend.set {hub, name?, state:
+  on}`.
+- `devsandbox fleet leave`: `lend.set {state: drain}`, then
+  `instances.list {dir: <fleet root>, depth: listing}` every 2 s until
+  `commands::lend::busy` (pure, over its rows) finds no instance whose
+  config root is under the fleet root running or being built (a note on
+  stderr names them when that set changes), then `lend.set {state: off}`.
+  Ctrl-C ends the wait and leaves lending at `drain`. Not lending: it says
+  so and changes nothing.
 
 ### The Worker table
 
@@ -182,7 +242,7 @@ connection each request goes through `lent::admit` at the top of
   (`denied`) any request with a `machine` param or `machines: true`
   (nothing federates past the worker), a verb with `all` (`--all` is every
   instance in `state.toml`, not the root's), and every other method:
-  `machines.*`, `fleet.*`, `shutdown`, `helper.call`, `forwards.*`,
+  `machines.*`, `fleet.*`, `lend.*`, `shutdown`, `helper.call`, `forwards.*`,
   `bridges.ensure`, `roots.list`, the Inbox. Refusals are logged.
 - **Paths**: a `root` or `dir` param must be absolute, have no `..`, and
   canonicalize (symlinks resolved) under the fleet root

@@ -11,12 +11,15 @@
 //!   `fleet-link` socket (`commands::fleet_link` is that opener).
 //! - `lend`: `lend.toml` (whether and to which hub this host lends) and the
 //!   fleet root a hub reaches.
+//! - `lender`: `lend.get` / `lend.set`, the daemon's one writer of
+//!   `lend.toml`, applied live to the lending thread.
 //! - `worker`: the worker's lending thread, the answerer of [`LINK`] over
 //!   its ssh to the hub.
 //! - `lent`: what a hub may do over that link (the daemon's `Worker`
 //!   connection table).
 
 pub mod lend;
+pub mod lender;
 pub mod lent;
 pub mod link;
 pub mod offer;

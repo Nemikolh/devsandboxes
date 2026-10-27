@@ -9,7 +9,7 @@
 //!   `unsubscribe` to `instances` only, `instances.watch` / `unwatch`, the
 //!   quick calls (`machines::forward::QUICK`) and the verbs; never a
 //!   `machine` param or a federated (`machines: true`) request, never a
-//!   verb's `all`; everything else (`machines.*`, `fleet.*`, `shutdown`,
+//!   verb's `all`; everything else (`machines.*`, `fleet.*`, `lend.*`, `shutdown`,
 //!   `helper.call`, `forwards.*`, the Inbox, `roots.list`, …) is `denied`.
 //! - [`admit`] then confines the params: every `root` / `dir` canonicalized
 //!   and under the fleet root (rewritten to its canonical form), every
@@ -330,6 +330,8 @@ mod tests {
             ("machines.list", p.clone(), Err("denied")),
             ("machines.hold", json!({"name": "m"}), Err("denied")),
             ("fleet.offer", p.clone(), Err("denied")),
+            ("lend.get", p.clone(), Err("denied")),
+            ("lend.set", json!({"state": "off"}), Err("denied")),
             ("shutdown", p.clone(), Err("denied")),
             ("helper.call", p.clone(), Err("denied")),
             ("forwards.add", p.clone(), Err("denied")),

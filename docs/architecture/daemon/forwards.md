@@ -158,8 +158,8 @@ start the registry restores each entry first thing: on its saved port
 `Prefer` from it, saving the new port. Entries whose instance is gone from
 `state.toml` are dropped; a stopped instance's forward comes back and heals
 when it runs. Writes are read-modify-writes under an exclusive lock on
-`forwards.lock`, temp file + rename, since two daemons overlap during a
-handoff.
+`forwards.lock`, temp file + rename (`serve::locked_file::update`), since
+two daemons overlap during a handoff.
 
 `forwards.add` with `machine` (`Daemon::add_remote`) checks the machine is
 in `machines.toml` (the path `Registry::spawn` gets), then binds a

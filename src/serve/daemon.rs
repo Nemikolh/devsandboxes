@@ -137,10 +137,10 @@ pub struct Options {
     /// How `helper.call` reaches containers; `None` is the host side's
     /// bridges (none without one). Tests pass a client over fake links.
     pub helper: Option<helper::HelperClient>,
-    /// `lend.toml`, read once at start (lending `on`/`drain` starts the
-    /// lending thread, `fleet::worker`); its dir holds the fleet roots.
-    /// `None` is the default ([`fleet::lend::path`]). Tests point it at
-    /// their own file.
+    /// `lend.toml`, read at start (lending `on`/`drain` starts the lending
+    /// thread, `fleet::worker`) and written by `lend.set`
+    /// (`fleet::lender`); its dir holds the fleet roots. `None` is the
+    /// default ([`fleet::lend::path`]). Tests point it at their own file.
     pub lend: Option<PathBuf>,
     /// How the lending thread reaches its hub; `None` is ssh. Tests link an
     /// in-process hub.
@@ -333,9 +333,7 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
         let _ = shared.helper.set(client);
     }
     let watcher = Watcher::spawn(&shared, host.as_ref().map(Host::changes));
-    let lending = start_lending(opts, &shared);
-    // A lending daemon holds its link to the hub: it never idles out.
-    let keep_alive = opts.keep_alive || lending.is_some();
+    start_lending(opts, &shared);
     let exit = loop {
         if let Some(exit) = *shared.stop.lock().unwrap() {
             break exit;
@@ -349,6 +347,8 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
             *shared.idle_since.lock().unwrap() = now;
         }
         let idle_since = *shared.idle_since.lock().unwrap();
+        // A lending daemon holds its link to the hub: it never idles out.
+        let keep_alive = opts.keep_alive || shared.lender.get().is_some_and(|l| l.lends());
         if idle::decide(&holders, idle_since, now, keep_alive, opts.idle_timeout) == Decision::Exit {
             break Exit::Idle;
         }
@@ -376,7 +376,9 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
     });
     shared.drain(DRAIN_TIMEOUT);
     // After the drain: the hub's connections answer over the link.
-    drop(lending);
+    if let Some(lender) = shared.lender.get() {
+        lender.stop();
+    }
     drop(watcher);
     // The machine links close (their ssh killed) after the connections whose
     // forwarded calls they may still answer.
@@ -391,41 +393,35 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
     Ok(exit)
 }
 
-/// The lending thread (`fleet::worker`) when `lend.toml` says `on` or
-/// `drain`: its fleet root created, each `API` stream from the hub a
-/// `Worker` connection ([`Shared::open_lent`]). A bad file (or hostname,
-/// without `name`) is logged and nothing lends.
-fn start_lending(opts: &Options, shared: &Arc<Shared>) -> Option<fleet::worker::Lending> {
-    let attempt = || -> Result<Option<fleet::worker::Lending>> {
-        let path = match &opts.lend {
-            Some(path) => path.clone(),
-            None => fleet::lend::path()?,
-        };
-        let Some(lend) = fleet::lend::load(&path)?.filter(fleet::lend::Lend::lends) else {
-            return Ok(None);
-        };
-        let data = path.parent().context("lend.toml has no dir")?;
-        let root = fleet::lend::fleet_root(data, &lend.hub)?;
-        std::fs::create_dir_all(&root).with_context(|| format!("cannot create {}", root.display()))?;
-        let root = std::fs::canonicalize(&root).with_context(|| format!("cannot resolve {}", root.display()))?;
-        let name = match lend.name.as_str() {
-            "" => fleet::lend::default_name(&link::hostname())?,
-            name => name.to_string(),
-        };
-        let env = opts.lend_env.clone().unwrap_or_else(|| super::verbs_client::caller_env(std::env::vars_os()));
-        log(&format!("fleet: lending to {} as {name} ({:?}, fleet root {})", lend.hub, lend.state, root.display()));
-        let scope = Arc::new(lent::Scope { hub: lend.hub.clone(), root, env });
-        let open: fleet::worker::Open = {
-            let shared = Arc::clone(shared);
-            Arc::new(move || shared.open_lent(&scope))
-        };
-        let transport = opts.lend_transport.clone().unwrap_or_else(fleet::worker::ssh_transport);
-        fleet::worker::Lending::spawn(lend.hub, name, transport, open, opts.machine_timing, log).map(Some)
+/// The daemon's lending (`fleet::lender`): lend as `lend.toml` says now,
+/// and follow each `lend.set`. A lending thread's fleet root is created,
+/// and each `API` stream from the hub is a `Worker` connection
+/// ([`Shared::open_lent`]). Without a `lend.toml` path (no data dir) it's
+/// logged and `lend.*` fail.
+fn start_lending(opts: &Options, shared: &Arc<Shared>) {
+    let path = match &opts.lend {
+        Some(path) => path.clone(),
+        None => match fleet::lend::path() {
+            Ok(path) => path,
+            Err(e) => {
+                log(&format!("warning: not lending: {e:#}"));
+                return;
+            }
+        },
     };
-    attempt().unwrap_or_else(|e| {
-        log(&format!("warning: not lending: {e:#}"));
-        None
-    })
+    let env = opts.lend_env.clone().unwrap_or_else(|| super::verbs_client::caller_env(std::env::vars_os()));
+    let transport = opts.lend_transport.clone().unwrap_or_else(fleet::worker::ssh_transport);
+    let timing = opts.machine_timing;
+    // Weak: the lender lives in `shared`.
+    let weak = Arc::downgrade(shared);
+    let spawn: fleet::lender::Spawn = Box::new(move |start: fleet::lender::Start| {
+        let scope = Arc::new(lent::Scope { hub: start.hub.clone(), root: start.root, env: env.clone() });
+        let weak = weak.clone();
+        let open: fleet::worker::Open = Arc::new(move || weak.upgrade()?.open_lent(&scope));
+        fleet::worker::Lending::spawn(start.hub, start.name, start.draining, transport.clone(), open, timing, log)
+    });
+    let lender = shared.lender.get_or_init(|| fleet::lender::Lender::new(path, link::hostname(), spawn, log));
+    lender.start();
 }
 
 /// Take the start lock, or `None` when a live daemon (one answering on the
@@ -515,6 +511,9 @@ struct Shared {
     /// Each watched root's last local `instances.snapshot` params (the poll's,
     /// or a new watch's disk one): what a machine's push is merged with.
     locals: Mutex<BTreeMap<PathBuf, Arc<Value>>>,
+    /// `lend.toml` and the lending thread, for `lend.*`; unset without a
+    /// data dir and in tests that build a bare `Shared`.
+    lender: OnceLock<fleet::lender::Lender>,
 }
 
 impl Shared {
@@ -542,6 +541,7 @@ impl Shared {
             hub: false,
             machines: None,
             locals: Mutex::default(),
+            lender: OnceLock::new(),
         }
     }
 
@@ -1138,6 +1138,11 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
             Ok(json!({ "ok": true }))
         }
         "machines.hold" => hold_machine(req.params, shared, conn),
+        method if method.starts_with("lend.") => match shared.lender.get() {
+            Some(lender) => fleet::lender::call(method, req.params, lender)
+                .unwrap_or_else(|| Err(api::ApiError::unknown_method(method))),
+            None => Err(api::ApiError::failed("this daemon has no lend.toml (no data dir)")),
+        },
         method if method.starts_with("fleet.") && shared.machines.is_some() => {
             let m = shared.machines.as_ref().expect("checked");
             let ctx = super::fleet::offer::Ctx { registry: &m.registry, hub: shared.hub, links: m.links.as_ref(), log };

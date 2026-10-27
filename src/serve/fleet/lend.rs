@@ -2,9 +2,10 @@
 //! (docs/architecture/daemon/fleet.md, *Worker side*), and the fleet root
 //! that lending reaches (`<data>/devsandbox/fleet/<hub>/`).
 //!
-//! The worker owns it: the hub never writes it. The daemon reads it once at
-//! start ([`load`]); writing it (`lend.*`, `devsandbox lend`) is fleet plan
-//! commit 1d.
+//! The worker owns it: the hub never writes it. Only the daemon does, through
+//! `lend.set` (`fleet::lender`; `devsandbox lend` / `fleet` are its
+//! clients), with [`update`]: under the sibling `lend.lock`, a temp file and
+//! a rename (`serve::locked_file`).
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -23,8 +24,19 @@ pub enum State {
     /// No link.
     #[default]
     Off,
-    /// Offer to the hub, take no new work (placement, fleet plan step 3).
+    /// Offer to the hub, take no new work (recorded and offered; placement,
+    /// fleet plan step 3, will honor it).
     Drain,
+}
+
+impl State {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            State::On => "on",
+            State::Off => "off",
+            State::Drain => "drain",
+        }
+    }
 }
 
 /// What the worker policy allows beyond its defaults (fleet plan commit
@@ -39,6 +51,7 @@ pub struct Allowances {}
 pub struct Lend {
     pub state: State,
     /// The hub's ssh target (`me@hub`, `ssh://me@hub:2200`, an alias).
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub hub: String,
     /// The name this host offers itself under; empty is [`default_name`]
     /// of the hostname.
@@ -64,18 +77,38 @@ pub fn path_from(xdg_data_home: Option<OsString>, home: Option<OsString>) -> Res
     Ok(crate::daemon_config::data_dir_from(xdg_data_home, home)?.join("lend.toml"))
 }
 
-/// `text` as a [`Lend`]; lending (`on`/`drain`) needs a valid `hub` target
-/// and, when set, a valid `name`.
+/// `text` as a [`Lend`], [`check`]ed.
 pub fn parse(text: &str) -> Result<Lend> {
     let lend: Lend = toml::from_str(text)?;
-    if lend.lends() {
+    check(&lend)?;
+    Ok(lend)
+}
+
+/// Lending (`on`/`drain`) needs a valid `hub` target; a `hub` that's set
+/// must be one anyway, and a `name` that's set a valid machine name.
+pub fn check(lend: &Lend) -> Result<()> {
+    if lend.lends() && lend.hub.is_empty() {
+        bail!("`hub`: no hub to lend to");
+    }
+    if !lend.hub.is_empty() {
         ssh::parse_target(&lend.hub).context("`hub`")?;
         fleet_dir_name(&lend.hub)?;
     }
     if !lend.name.is_empty() {
         check_name(&lend.name).context("`name`")?;
     }
-    Ok(lend)
+    Ok(())
+}
+
+pub fn serialize(lend: &Lend) -> Result<String> {
+    toml::to_string_pretty(lend).context("cannot serialize lend.toml")
+}
+
+/// Read-modify-write of the file at `path` under its lock (a missing file is
+/// the default, `off`); saved only when `f` changed it. A file that doesn't
+/// parse fails the update rather than being overwritten.
+pub fn update<T>(path: &Path, f: impl FnOnce(&mut Lend) -> T) -> Result<T> {
+    crate::serve::locked_file::update(path, |p| Ok(load(p)?.unwrap_or_default()), serialize, f)
 }
 
 /// The file at `path`; a missing file is `None` (not lending).
@@ -126,11 +159,10 @@ pub fn fleet_root(data: &Path, hub: &str) -> Result<PathBuf> {
     Ok(data.join("fleet").join(fleet_dir_name(hub)?))
 }
 
-/// Write `lend` at `path` (tests; the daemon's writer is commit 1d).
+/// Write `lend` at `path` (tests: what an earlier `lend.set` left).
 #[cfg(test)]
 pub fn write_for_test(path: &Path, lend: &Lend) {
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    std::fs::write(path, toml::to_string(lend).unwrap()).unwrap();
+    update(path, |l| *l = lend.clone()).unwrap();
 }
 
 #[cfg(test)]
@@ -161,6 +193,9 @@ mod tests {
         assert!(parse("state = \"on\"\nhub = \"-oProxyCommand=x\"\n").is_err());
         assert!(parse("state = \"on\"\nhub = \"h\"\nname = \"a/b\"\n").is_err());
         assert!(parse("state = \"maybe\"\n").is_err());
+        // A hub kept while off must still be a target.
+        assert!(parse("state = \"off\"\nhub = \"hub\"\n").is_ok());
+        assert!(parse("state = \"off\"\nhub = \"-oProxyCommand=x\"\n").is_err());
     }
 
     #[test]
@@ -172,8 +207,17 @@ mod tests {
         let lend = Lend { state: State::Drain, hub: "ssh://me@hub:2200".into(), ..Default::default() };
         write_for_test(&path, &lend);
         assert_eq!(load(&path).unwrap(), Some(lend));
+        assert!(dir.join("lend.lock").exists(), "written through locked_file");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("name"), "an unset name is left out: {text}");
+        // A no-op doesn't write.
+        let off = dir.join("sub/lend.toml");
+        update(&off, |l| l.state = State::Off).unwrap();
+        assert!(!off.exists());
         std::fs::write(&path, "state = 1\n").unwrap();
         assert!(format!("{:#}", load(&path).unwrap_err()).contains("invalid"));
+        assert!(update(&path, |l| l.state = State::Off).is_err(), "a bad file isn't overwritten");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "state = 1\n");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

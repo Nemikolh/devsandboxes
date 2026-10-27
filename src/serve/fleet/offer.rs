@@ -1,5 +1,5 @@
 //! The hub side of an offer (docs/architecture/daemon/fleet.md, *Hub
-//! side*): `fleet.offer {worker, version}`, sent by a worker's `fleet-link`
+//! side*): `fleet.offer {worker, version, draining?}`, sent by a worker's `fleet-link`
 //! once its link's `Hello`s are through, writes (or keeps) the worker's
 //! offered entry in `machines.toml`; and [`dial`], how this host reaches an
 //! offered machine: its `fleet-<worker>.sock`.
@@ -47,6 +47,10 @@ struct OfferParams {
     worker: String,
     /// The worker's devsandbox semver (its link `Hello`), for the log.
     version: String,
+    /// The worker's `lend` was `drain` when it linked: it takes no new work
+    /// (logged; placement, fleet plan step 3, will honor it).
+    #[serde(default)]
+    draining: bool,
 }
 
 /// What an offer does to the registry.
@@ -85,10 +89,16 @@ fn offer(p: OfferParams, ctx: &Ctx) -> Answer {
         ));
     }
     let offered = machines::update(ctx.registry, |entries| accept(entries, &p.worker)).map_err(ApiError::internal)??;
-    (ctx.log)(&format!("fleet: worker {} offered (devsandbox {}){}", p.worker, p.version, match offered {
-        Offered::Added => ", added",
-        Offered::Kept => "",
-    }));
+    (ctx.log)(&format!(
+        "fleet: worker {} offered (devsandbox {}{}){}",
+        p.worker,
+        p.version,
+        if p.draining { ", draining" } else { "" },
+        match offered {
+            Offered::Added => ", added",
+            Offered::Kept => "",
+        }
+    ));
     if offered == Offered::Added
         && let Some(links) = ctx.links
     {
@@ -149,8 +159,9 @@ mod tests {
         assert_eq!(call("fleet.offer", params("lap"), &hub).unwrap().unwrap(), json!({"ok": true}));
         assert_eq!(machines::load(&registry).unwrap(), vec![Entry::offered("lap")]);
         assert!(std::fs::read_to_string(&registry).unwrap().contains("offered = true"));
-        // Again: kept, not duplicated.
-        call("fleet.offer", params("lap"), &hub).unwrap().unwrap();
+        // Again (draining this time): kept, not duplicated.
+        let draining = json!({"worker": "lap", "version": "0.6.0", "draining": true});
+        call("fleet.offer", draining, &hub).unwrap().unwrap();
         assert_eq!(machines::load(&registry).unwrap(), vec![Entry::offered("lap")]);
 
         machines::update(&registry, |e| e.push(Entry::ssh("srv", "me@srv"))).unwrap();

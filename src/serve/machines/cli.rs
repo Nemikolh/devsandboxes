@@ -101,6 +101,9 @@ pub(crate) fn machine_use(command: Option<&Command>) -> MachineUse {
         Command::AgentRelay { .. } => MachineUse::Refused("agent-relay"),
         Command::FleetLink { .. } => MachineUse::Refused("fleet-link"),
         Command::Machine { .. } => MachineUse::Refused("machine"),
+        // This host's own lending: `lend.toml` and its link are local.
+        Command::Lend { .. } => MachineUse::Refused("lend"),
+        Command::Fleet { .. } => MachineUse::Refused("fleet"),
     }
 }
 
@@ -949,6 +952,11 @@ mod tests {
         assert_eq!(once(&["port", "--service", "redis"]), MachineUse::Port);
         assert_eq!(once(&["port", "web", "3000"]), MachineUse::Named);
         assert_eq!(once(&["port", "web", "--service", "db", "5432"]), MachineUse::Named);
+        // This host's own lending.
+        assert_eq!(once(&["lend"]), MachineUse::Refused("lend"));
+        assert_eq!(once(&["lend", "drain"]), MachineUse::Refused("lend"));
+        assert_eq!(once(&["fleet", "join", "me@hub"]), MachineUse::Refused("fleet"));
+        assert_eq!(once(&["fleet", "leave"]), MachineUse::Refused("fleet"));
     }
 
     fn entry() -> Entry {
