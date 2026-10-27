@@ -466,8 +466,9 @@ mod tests {
                 helper: true,
             };
             let script = format!(
-                "echo motd; printf '%s' '{}'; exec docker exec -i -u root {name} {} bridge",
+                "echo motd; printf '%s' '{}'; exec {} exec -i -u root {name} {} bridge",
                 header.line(),
+                crate::runtime::backend().bin(),
                 crate::devsbd::BIN
             );
             let forward = Forward::start(ForwardSpec {

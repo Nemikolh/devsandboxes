@@ -618,7 +618,9 @@ mod tests {
         let passwd = crate::runtime::backend().image_passwd(image).unwrap().expect("alpine has sh");
         assert_eq!(identity::account(&passwd, "root").map(|a| (a.uid, a.home)), Some((0, "/root".into())));
         let id = crate::runtime::backend().image_id(image).unwrap().expect("an id");
-        assert!(id.starts_with("sha256:"), "{id}");
+        // docker says `sha256:<hex>`, podman the bare hex.
+        let hex = id.strip_prefix("sha256:").unwrap_or(&id);
+        assert!(hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit()), "{id}");
         assert!(crate::runtime::backend().image_id("devsandbox-no-such-image:never").is_err());
         Ok(())
     }

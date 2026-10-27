@@ -1568,6 +1568,8 @@ mod tests {
             .as_nanos();
         let root = std::env::temp_dir().join(format!("devsandbox-phase-{child}-{stamp}"));
         std::fs::create_dir_all(&root).unwrap();
+        #[cfg(unix)]
+        crate::test_support::share_runtime_dirs(&root.join("data"), &root.join("runtime"));
         // libtest names drop the crate segment of `module_path!`.
         let module = module_path!().split_once("::").map_or(module_path!(), |(_, rest)| rest);
         let out = std::process::Command::new(std::env::current_exe().unwrap())

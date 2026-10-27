@@ -2204,7 +2204,8 @@ mod tests {
                 backend.inspect_json(c).map_err(ApiError::internal)
             })
             .unwrap();
-            assert_eq!(inspected[0]["Name"], format!("/{name}"));
+            // docker prefixes the name with `/`, podman doesn't.
+            assert_eq!(inspected[0]["Name"].as_str().map(|n| n.trim_start_matches('/')), Some(name.as_str()));
             let listing = fetch_procs(&name).unwrap();
             assert!(listing.signalable);
             assert!(listing.processes.iter().any(|p| p.args == "sleep 300"), "{listing:?}");

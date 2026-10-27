@@ -810,7 +810,6 @@ chmod +x ./devcontainer-features-install.sh && \
     /// build on CI (where it fails instead of skipping).
     #[test_utils::docker_test]
     fn derived_image_builds_with_docker() -> Result<(), &'static str> {
-
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -898,7 +897,6 @@ chmod +x ./devcontainer-features-install.sh && \
     /// option override and metadata default both land.
     #[test_utils::docker_test]
     fn derived_image_builds_with_local_feature() -> Result<(), &'static str> {
-
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -966,7 +964,6 @@ chmod +x ./devcontainer-features-install.sh && \
     /// executes feature entrypoint, then image entrypoint, then the command.
     #[test_utils::docker_test]
     fn entrypoint_chain_builds_with_docker() -> Result<(), &'static str> {
-
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -1001,8 +998,7 @@ ENTRYPOINT [\"/bin/sh\", \"-c\", \"echo image >> /tmp/log; exec \\\"$@\\\"\", \"
         }
 
         let result = (|| -> Result<String, String> {
-            use crate::runtime::Backend;
-            let image_entrypoint = crate::runtime::Dockerlike::DOCKER
+            let image_entrypoint = crate::runtime::backend()
                 .image_entrypoint(&tag)
                 .map_err(|e| format!("{e:#}"))?;
             std::fs::write(

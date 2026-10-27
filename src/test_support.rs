@@ -63,6 +63,35 @@ pub fn runtime_cmd() -> Command {
     Command::new(crate::runtime::backend().bin())
 }
 
+/// Give a test child that runs with its own `XDG_DATA_HOME` (`data`) and
+/// `XDG_RUNTIME_DIR` (`runtime`) the runtime's own state back. Rootless
+/// podman keeps its storage and its pause process under those dirs, so a
+/// fresh pair would mean an empty store owned by subuids (that the test's
+/// cleanup can't delete) and a second user namespace. Under podman this
+/// links `data/containers` and `runtime/{containers,libpod}` to the
+/// parent's; docker needs nothing. Removing the child's dirs removes only
+/// the links.
+#[cfg(unix)]
+pub fn share_runtime_dirs(data: &std::path::Path, runtime: &std::path::Path) {
+    use std::os::unix::fs::{DirBuilderExt, symlink};
+    std::fs::create_dir_all(data).unwrap();
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(runtime).unwrap();
+    if crate::runtime::backend().name() != "podman" {
+        return;
+    }
+    let out = runtime_cmd().args(["info", "--format", "{{.Store.GraphRoot}}\n{{.Store.RunRoot}}"]).output().unwrap();
+    assert!(out.status.success(), "podman info: {}", String::from_utf8_lossy(&out.stderr));
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let mut lines = text.lines().map(std::path::Path::new);
+    let (Some(graph), Some(run)) = (lines.next(), lines.next()) else { panic!("podman info: {text}") };
+    // `<data>/containers/storage` and `<run dir>/containers` by default.
+    let (Some(store), Some(run_dir)) = (graph.parent(), run.parent()) else { panic!("podman info: {text}") };
+    symlink(store, data.join("containers")).unwrap();
+    for name in ["containers", "libpod"] {
+        symlink(run_dir.join(name), runtime.join(name)).unwrap();
+    }
+}
+
 /// Run `body`, then `cleanup` even if `body` panicked, then re-raise the panic
 /// or return `body`'s value. Container tests use it to always remove what they
 /// started. `body` comes last so it reads as a trailing block.
