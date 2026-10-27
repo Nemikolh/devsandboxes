@@ -5,7 +5,7 @@ Machines as one pool of capacity (the plan:
 primitive the fleet's links are built on (the machines'
 [agent relay](machines.md#agent) runs on it too) and both sides of a
 worker's link: on the hub the offer, the offered registry entry and its
-dial; on the worker `lend.toml`, the lending thread, the lent API, the
+dial, and [hub mode](#hub-mode); on the worker `lend.toml`, the lending thread, the lent API, the
 worker policy and `lend.*` with its CLI, `devsandbox lend` and
 `devsandbox fleet join|leave`
 ([ADR 0041](../../decisions/0041-fleet-workers-dial-their-hub.md)).
@@ -15,7 +15,10 @@ Code: `src/serve/fleet/mod.rs` (`LINK`), `src/serve/fleet/link.rs`
 `match_sentinel`), `src/serve/fleet/offer.rs` (`call`, `Ctx`, `accept`,
 `dial`), `src/commands/fleet_link.rs` (`fleet_link`, `run`),
 `src/serve/endpoint.rs` (`fleet_socket`), `src/daemon_config.rs`
-(`ServeConfig::hub`), `src/devsbd/proto.rs` (`channel::API`, `caps::API`,
+(`ServeConfig::hub`), `src/serve/machines/service.rs` (`Hub`,
+`save_loop`, `log_failure`), `src/serve/machines/saved.rs` (`Saved`,
+`of`, `machines`, `load`, `save`, `save_wait`), `src/serve/snapshots.rs`
+(`Machine::set_link`, `Remotes::restore`), `src/devsbd/proto.rs` (`channel::API`, `caps::API`,
 `channel::flows`); the worker side: `src/serve/fleet/lend.rs` (`Lend`,
 `load`, `check`, `update`, `fleet_root`, `fleet_dir_name`, `default_name`),
 `src/serve/fleet/worker.rs` (`Lending`, `Status`, `link_argv`, `Transport`),
@@ -133,6 +136,64 @@ link's `API` streams.
   message; `machines.set` refuses `agent` on for one (`invalid`). The
   dashboard's logs and inspect views go through the `containers.*` quick
   calls and work.
+
+### Hub mode
+
+`[serve] hub = true` in `daemon.config.toml` (`ServeConfig::hub`, read
+once at start into `daemon::Options::hub`; `serve install` on the server
+keeps it running) makes the daemon a hub:
+
+- **It never idles out**: `hub` implies `keep-alive` (`daemon::run`
+  passes `keep_alive` to `idle::decide` for a hub).
+- **It accepts offers** (`fleet.offer`, above); any other daemon refuses
+  them.
+- **It holds every offered link** (fleet plan decision 7): the daemon
+  passes `service::Hub` to `Machines::spawn`, and `Inner::wanted` is true
+  for an offered entry whatever holds, watchers or linger say. Its link
+  thread dials at once and, while the worker's `fleet-link` socket is
+  absent, retries with the usual backoff (1 s doubling to 30 s), its
+  `state` `unreachable`. An offered link's failure is logged only when it
+  differs from the last one logged since the link was up
+  (`service::log_failure`), so an absent worker is one line in
+  `serve.log`, not one per retry. Ssh machines are held only while
+  wanted, as anywhere.
+- **It saves the machines' rows**, `remotes.json` next to `state.toml`
+  (`machines::saved::path`; `Options::remotes` in tests), so a restarted
+  hub shows the fleet before its machines reconnect. The
+  `serve-remotes` thread (`service::save_loop`) saves when the rows
+  change (a pushed snapshot, a hello's version, a registry reload), at
+  most every `saved::SAVE_EVERY` (5 s, `saved::save_wait`), and once more
+  after the links stop; through `locked_file::update` (under
+  `remotes.lock`, temp file + rename, unchanged content not rewritten).
+  The file:
+
+  ```json
+  {
+    "version": 1,
+    "machines": {
+      "lap": {
+        "at": 1761566400,
+        "version": "0.6.0",
+        "rows": { "/remote/root": { "dir": "/remote/root", "instances": [] } }
+      }
+    }
+  }
+  ```
+
+  `at` is when the rows were pushed (unix seconds), `version` the
+  machine's devsandbox from its last hello, `rows` each remote root's last
+  `instances.snapshot` params, as `Remotes` holds them; a machine with
+  neither rows nor a version isn't saved. Kind, target, roots and the rest
+  come from `machines.toml`. A file of another `version` or one that
+  doesn't parse is ignored and overwritten by the next save.
+- **At start** `Machines::spawn` loads the file (`saved::load`,
+  `saved::machines`) into `Remotes` (`Remotes::restore`) before the first
+  registry sync, which drops the machines and roots no longer registered
+  (and the next save drops them from the file). Restored machines are
+  `restored`: `Machine::set_link` shows them `unreachable`, `error` saying
+  why with the rows' time (`not reconnected since this daemon started
+  (rows from Oct 27 12:00 UTC)`, or the link's failure with the same
+  suffix), and ignores `connecting` meanwhile, until their link connects.
 
 ## Worker side
 

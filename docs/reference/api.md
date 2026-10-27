@@ -879,8 +879,9 @@ ours, a different semver is allowed.
 **Links.** One `serve-machine-<name>` thread per registered machine holds a
 connection to it only while wanted: while some connection watches with
 `machines: true`, a forwarded quick call is queued, a forwarded verb
-runs or a connection holds it (`machines.hold`), and 60 s after.
-Connected, it subscribes to `instances` and, while a watcher wants
+runs or a connection holds it (`machines.hold`), and 60 s after; on a
+fleet hub, an offered machine always
+([fleet](../architecture/daemon/fleet.md#hub-mode)). Connected, it subscribes to `instances` and, while a watcher wants
 machines, watches each of the machine's roots. A failed connect or a lost
 link is retried 1 s, 2 s, … 30 s apart while wanted (a forwarded call
 arriving meanwhile retries at once); the rows stay. A link's `state`:
@@ -890,7 +891,7 @@ arriving meanwhile retries at once); the rows stay. A link's `state`:
 | `idle` | not wanted, so not connected |
 | `connecting` | dialing ssh and saying hello |
 | `connected` | up; `error` may still name a registered root the machine refused |
-| `unreachable` | the last attempt failed or the link was lost; `error` says why (ssh's last stderr, a protocol mismatch, `its devsandbox serve is exiting`) |
+| `unreachable` | the last attempt failed or the link was lost; `error` says why (ssh's last stderr, a protocol mismatch, `its devsandbox serve is exiting`); on a fleet hub also rows restored from `remotes.json` until the link connects, `error` ending `(rows from <time> UTC)` |
 
 ### `roots.list`
 

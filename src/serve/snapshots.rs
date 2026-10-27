@@ -195,8 +195,46 @@ pub struct Machine {
     /// Its devsandbox semver, from the last hello.
     pub version: Option<String>,
     /// Remote root → the last `instances.snapshot` params it pushed. Kept
-    /// while the link is down: last known, in memory only.
+    /// while the link is down: last known (a hub also saves them,
+    /// `machines::saved`).
     pub rows: BTreeMap<PathBuf, Arc<Value>>,
+    /// Unix seconds of the last push stored in `rows`.
+    pub seen: Option<u64>,
+    /// `rows` were restored from a hub's `remotes.json` and the link hasn't
+    /// connected since: shown `unreachable` ([`Machine::set_link`]).
+    pub restored: bool,
+}
+
+impl Machine {
+    /// Record the link's `state` and `error`; whether what's shown changed.
+    /// A [`restored`](Self::restored) machine shows `unreachable` with the
+    /// rows' time until the link connects; meanwhile `connecting` changes
+    /// nothing, so a retrying link doesn't flap.
+    pub fn set_link(&mut self, state: LinkState, error: Option<String>) -> bool {
+        let (state, error) = match (self.restored, state) {
+            (false, _) => (state, error),
+            (true, LinkState::Connected) => {
+                self.restored = false;
+                (state, error)
+            }
+            (true, LinkState::Connecting) => return false,
+            (true, _) => (LinkState::Unreachable, Some(restored_error(error.as_deref(), self.seen))),
+        };
+        let moved = self.state != state || self.error != error;
+        self.state = state;
+        self.error = error;
+        moved
+    }
+}
+
+/// A restored machine's `error`: why its link is down (or that it hasn't
+/// reconnected), and when its rows are from.
+pub fn restored_error(why: Option<&str>, seen: Option<u64>) -> String {
+    let why = why.unwrap_or("not reconnected since this daemon started");
+    match seen {
+        Some(at) => format!("{why} (rows from {} UTC)", crate::inbox::clock::stamp(at, 0)),
+        None => why.to_string(),
+    }
 }
 
 /// Every registered machine's [`Machine`], by name. The machine links write
@@ -219,6 +257,16 @@ impl Remotes {
             m.agent = e.agent;
             m.roots.clone_from(&e.roots);
             m.rows.retain(|root, _| e.roots.contains(root));
+        }
+    }
+
+    /// Put machines restored from a hub's `remotes.json` in (before the
+    /// first [`sync`](Self::sync), which drops the ones no longer
+    /// registered); a machine already here is left alone.
+    pub fn restore(&self, machines: Vec<Machine>) {
+        let mut inner = self.lock();
+        for m in machines {
+            inner.entry(m.name.clone()).or_insert(m);
         }
     }
 

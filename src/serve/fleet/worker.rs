@@ -378,6 +378,7 @@ mod tests {
             let registry = base.join("machines.toml");
             let mut hub = opts(1, 300);
             hub.hub = true;
+            hub.remotes = Some(base.join("hub-data/remotes.json"));
             hub.machines = Some(registry.clone());
             hub.state = Some(base.join("hub-data/state.toml"));
             let hub_daemon = spawn_daemon(&hub_dir, hub);
@@ -472,7 +473,9 @@ mod tests {
             assert!(conn_at(&worker_dir).call("shutdown", json!({})).unwrap().error.is_none());
             assert_eq!(worker_daemon.join().unwrap().unwrap(), Exit::Shutdown);
             wait_for(|| !endpoint::fleet_socket(&hub_dir, "lap").exists(), "the hub's socket gone");
-            assert_eq!(hub_daemon.join().unwrap().unwrap(), Exit::Idle);
+            // A hub never idles out: stopped by hand.
+            assert!(conn_at(&hub_dir).call("shutdown", json!({})).unwrap().error.is_none());
+            assert_eq!(hub_daemon.join().unwrap().unwrap(), Exit::Shutdown);
             let _ = std::fs::remove_dir_all(&base);
             let _ = std::fs::remove_dir_all(&verb_dir);
         }

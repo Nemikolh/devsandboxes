@@ -278,9 +278,12 @@ limitation means editing this file in the same commit.
   only: `exec`, terminal tabs, forwards, the agent relay and every CLI
   re-run over ssh (`logs`/`inspect` on the CLI included; the dashboard's
   work) refuse with "need fleet step 4". Its entry has no roots (so
-  `--machine` per-root commands and `--all` verbs on it fail), and its link
-  is held only while wanted, like an ssh machine's (step 1f keeps it up).
+  `--machine` per-root commands and `--all` verbs on it fail).
   → [fleet](architecture/daemon/fleet.md#hub-side); `machines::offered_refusal`
+- A hub notices a worker that's back (its `fleet-link` socket bound again)
+  only at its offered link's next retry, up to 30 s later: a re-offer of a
+  known worker doesn't wake the link.
+  → [fleet](architecture/daemon/fleet.md#hub-mode); `fleet::offer::offer`
 - A worker's `drain` reaches its hub only in the offer of its next link
   (`lend on` ↔ `drain` keeps the current one), and nothing on the hub acts
   on it until placement (step 3b; live lending state in the snapshot is

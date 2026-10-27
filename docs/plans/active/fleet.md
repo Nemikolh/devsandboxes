@@ -8,7 +8,9 @@ the lending thread, the fleet root and the `Worker` table; 1d (CLI)
 shipped: `serve::locked_file`, `lend.get|set` applied live, `devsandbox
 lend`, `fleet join|leave`; 1e (worker policy) shipped: `worker_policy`,
 detected by path (no flag), checked on the final `run` / `build` argv and
-the config, allowances in `lend.toml`'s `[allow]`
+the config, allowances in `lend.toml`'s `[allow]`; 1f (hub mode)
+shipped: keep-alive, offered links always held, `remotes.json`
+(`machines::saved`) restored as `unreachable`
 ([fleet](../../architecture/daemon/fleet.md), ADR
 [0041](../../decisions/0041-fleet-workers-dial-their-hub.md)); the rest
 is design. Builds on [machines](../../architecture/daemon/machines.md)

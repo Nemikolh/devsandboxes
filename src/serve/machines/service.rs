@@ -6,12 +6,20 @@
 //! A link connects only while wanted: while some local connection
 //! watches with `machines: true` ([`Hooks::watching`]), a forwarded call
 //! is queued, or a [`Want`] holds the machine (a forwarded verb), and for
-//! [`Timing::linger`] after. Connected, it subscribes to
+//! [`Timing::linger`] after. On a fleet hub ([`Hub`]) an offered machine is
+//! always wanted (fleet plan decision 7). Connected, it subscribes to
 //! `instances`, watches each of the machine's roots while a local watcher
 //! wants machines, and stores every pushed `instances.snapshot` in the
 //! shared [`Remotes`] ([`Hooks::changed`] then re-publishes). A failed
 //! connect or a lost link is `unreachable` with the reason, rows kept, and
-//! retried with a doubling backoff while wanted.
+//! retried with a doubling backoff while wanted. A hub's offered link that
+//! keeps failing the same way (its worker's `fleet-link` socket absent) logs
+//! that once, not per retry.
+//!
+//! A hub also saves `Remotes` to `remotes.json` (`machines::saved`) from a
+//! `serve-remotes` thread, at most every `saved::SAVE_EVERY` while rows
+//! change and once more at the stop, and restores it at the start: those
+//! rows show `unreachable` until their machine's link connects.
 //!
 //! Forwarded calls reach the thread over its channel, one in flight
 //! per machine, each with [`Timing::call`] to answer. A timed-out call drops
@@ -37,12 +45,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
 use super::Entry;
 use super::agent;
+use super::saved;
 use super::link::{self, Link};
 use super::ssh::{Dial, Duplex, Peer};
 use crate::serve::api::ApiError;
@@ -90,10 +99,35 @@ pub struct Hooks {
     pub changed: Box<dyn Fn() + Send + Sync>,
 }
 
+/// This daemon is a fleet hub (`[serve] hub = true`): offered links are
+/// always wanted, and `Remotes` lives on in `remotes`.
+pub struct Hub {
+    /// `remotes.json` (`saved::path`; a scratch file in tests).
+    pub remotes: PathBuf,
+}
+
 /// The service, owned by the daemon's `run`. Dropping it stops and joins
-/// every link (closing its connection, killing its ssh).
+/// every link (closing its connection, killing its ssh), then a hub's
+/// last save.
 pub struct Machines {
     inner: Arc<Inner>,
+    saver: Option<JoinHandle<()>>,
+}
+
+/// A hub's save of `Remotes`: the file and the `serve-remotes` thread's
+/// wake-ups.
+struct HubSave {
+    path: PathBuf,
+    state: Mutex<SaveState>,
+    cv: Condvar,
+}
+
+#[derive(Default)]
+struct SaveState {
+    /// The rows changed since the last save.
+    dirty: bool,
+    /// The links are stopped: save what's dirty, then end.
+    stop: bool,
 }
 
 /// A cheap clone for the API: forwarded calls, registry reloads, link
@@ -118,6 +152,8 @@ struct Inner {
     /// link restarted by a registry change.
     holds: Mutex<BTreeMap<String, usize>>,
     stopped: AtomicBool,
+    /// `Some` on a fleet hub.
+    hub: Option<HubSave>,
 }
 
 /// One machine's threads, as the service holds them.
@@ -263,9 +299,19 @@ struct Call {
 
 impl Machines {
     /// Start the service: one link per entry of `registry` (none connects
-    /// until wanted). `dial` opens a machine's transport (ssh, or a test
-    /// daemon's socket), `agent_dial` its agent relay's.
-    pub fn spawn(registry: PathBuf, dial: Dial, agent_dial: Dial, timing: Timing, hooks: Hooks, log: fn(&str)) -> Machines {
+    /// until wanted, but a hub's offered ones). `dial` opens a machine's
+    /// transport (ssh, or a test daemon's socket), `agent_dial` its agent
+    /// relay's. A `hub`'s saved rows are restored before the links start.
+    pub fn spawn(
+        registry: PathBuf,
+        dial: Dial,
+        agent_dial: Dial,
+        timing: Timing,
+        hooks: Hooks,
+        hub: Option<Hub>,
+        log: fn(&str),
+    ) -> Machines {
+        let hub = hub.map(|h| HubSave { path: h.remotes, state: Mutex::default(), cv: Condvar::new() });
         let inner = Arc::new(Inner {
             registry,
             dial,
@@ -277,8 +323,21 @@ impl Machines {
             links: Mutex::new(BTreeMap::new()),
             holds: Mutex::new(BTreeMap::new()),
             stopped: AtomicBool::new(false),
+            hub,
         });
-        let machines = Machines { inner };
+        let saver = inner.hub.as_ref().and_then(|h| {
+            match saved::load(&h.path) {
+                Ok(s) => inner.remotes.restore(saved::machines(s)),
+                Err(e) => log(&format!("machines: {e:#}")),
+            }
+            let inner = Arc::clone(&inner);
+            std::thread::Builder::new()
+                .name("serve-remotes".into())
+                .spawn(move || save_loop(&inner))
+                .map_err(|e| log(&format!("cannot start saving remotes.json: {e}")))
+                .ok()
+        });
+        let machines = Machines { inner, saver };
         machines.handle().reload();
         machines
     }
@@ -293,6 +352,47 @@ impl Drop for Machines {
         self.inner.stopped.store(true, Ordering::SeqCst);
         let links = std::mem::take(&mut *self.inner.lock_links());
         stop_all(links.into_values().collect());
+        if let Some(hub) = &self.inner.hub {
+            lock(&hub.state).stop = true;
+            hub.cv.notify_all();
+        }
+        if let Some(saver) = self.saver.take() {
+            let _ = saver.join();
+        }
+    }
+}
+
+/// Unix seconds now.
+fn now_unix() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+/// A hub's `serve-remotes` thread: each change of the rows saves them,
+/// at most every `saved::SAVE_EVERY` ([`saved::save_wait`]); the stop saves
+/// what's left at once. A failed save is logged; the next change retries.
+fn save_loop(inner: &Inner) {
+    let Some(hub) = &inner.hub else { return };
+    let mut last: Option<Instant> = None;
+    loop {
+        {
+            let mut s = lock(&hub.state);
+            while !s.dirty && !s.stop {
+                s = hub.cv.wait(s).unwrap_or_else(|e| e.into_inner());
+            }
+            if !s.dirty {
+                return;
+            }
+            let wait = saved::save_wait(last, Instant::now());
+            if !wait.is_zero() && !s.stop {
+                drop(hub.cv.wait_timeout(s, wait));
+                continue;
+            }
+            s.dirty = false;
+        }
+        if let Err(e) = saved::save(&hub.path, &saved::of(&inner.remotes.all(), now_unix())) {
+            (inner.log)(&format!("machines: cannot save remotes: {e:#}"));
+        }
+        last = Some(Instant::now());
     }
 }
 
@@ -314,18 +414,30 @@ impl Inner {
         lock(&self.links)
     }
 
-    /// Whether machine `name` is wanted now (`busy`: the link has calls
-    /// queued; a machines watcher; a [`Want`]) or was within the linger.
-    /// Stamps `ctl`'s last want, which the link and agent threads share.
-    fn wanted(&self, name: &str, ctl: &Ctl, busy: bool) -> bool {
+    /// Whether machine `entry` is wanted now (`busy`: the link has calls
+    /// queued; a machines watcher; a [`Want`]) or was within the linger;
+    /// always for an offered machine on a hub. Stamps `ctl`'s last want,
+    /// which the link and agent threads share.
+    fn wanted(&self, entry: &Entry, ctl: &Ctl, busy: bool) -> bool {
+        if self.hub.is_some() && entry.is_offered() {
+            return true;
+        }
         let now = Instant::now();
-        let held = lock(&self.holds).get(name).is_some_and(|n| *n > 0);
+        let held = lock(&self.holds).get(&entry.name).is_some_and(|n| *n > 0);
         let fresh = busy || held || (self.hooks.watching)();
         let mut last = lock(&ctl.last_want);
         if fresh {
             *last = Some(now);
         }
         last.is_some_and(|t| now < t + self.timing.linger)
+    }
+
+    /// The rows changed: a hub saves them soon.
+    fn rows_changed(&self) {
+        if let Some(hub) = &self.hub {
+            lock(&hub.state).dirty = true;
+            hub.cv.notify_all();
+        }
     }
 }
 
@@ -379,6 +491,7 @@ impl Handle {
         }
         // Before the new threads run: they record their state there.
         inner.remotes.sync(&entries);
+        inner.rows_changed();
         for e in &entries {
             if !links.contains_key(&e.name) {
                 let link = spawn_link(e.clone(), Arc::clone(inner));
@@ -520,7 +633,7 @@ fn agent_loop(entry: &Entry, inner: &Inner, ctl: &Arc<Ctl>) {
     let mut failures = 0;
     let mut retry_at: Option<Instant> = None;
     while !ctl.stopped() {
-        let up = ctl.agent_on() && inner.wanted(&entry.name, ctl, false);
+        let up = ctl.agent_on() && inner.wanted(entry, ctl, false);
         if !up || retry_at.is_some_and(|t| Instant::now() < t) {
             ctl.wait_agent(tick);
             continue;
@@ -553,7 +666,7 @@ fn run_relay(entry: &Entry, inner: &Inner, ctl: &Arc<Ctl>) -> (bool, Option<Stri
         r.ready = false;
         r.kill = Some((stream, peer));
     }
-    let unwanted = || ctl.stopped() || !ctl.agent_on() || !inner.wanted(&entry.name, ctl, false);
+    let unwanted = || ctl.stopped() || !ctl.agent_on() || !inner.wanted(entry, ctl, false);
     let handshaken = AtomicBool::new(false);
     let ended = std::thread::scope(|s| {
         let served = std::thread::Builder::new().name(format!("serve-machine-{}-relay", entry.name)).spawn_scoped(s, || {
@@ -629,11 +742,13 @@ struct LinkLoop<'a> {
     /// Forwarded calls not answered yet, oldest first.
     pending: VecDeque<Call>,
     failures: u32,
+    /// The last failure logged since the link was last up.
+    logged: Option<String>,
 }
 
 impl<'a> LinkLoop<'a> {
     fn new(entry: Entry, inner: &'a Inner, ctl: &'a Ctl) -> Self {
-        Self { entry, inner, ctl, pending: VecDeque::new(), failures: 0 }
+        Self { entry, inner, ctl, pending: VecDeque::new(), failures: 0, logged: None }
     }
 
     fn run(&mut self, rx: &Receiver<Cmd>) {
@@ -650,11 +765,13 @@ impl<'a> LinkLoop<'a> {
             let failed = match self.connect() {
                 Ok(mut link) => {
                     self.failures = 0;
+                    self.logged = None;
                     if let Some(noise) = &link.noise {
                         (self.inner.log)(&format!("machine {}: login shell printed: {noise}", self.entry.name));
                     }
                     let remote = link.remote().version.clone();
                     self.inner.remotes.update(&self.entry.name, |m| m.version = Some(remote));
+                    self.inner.rows_changed();
                     self.set(LinkState::Connected, None);
                     let end = self.serve(&mut link, rx);
                     self.ctl.hold(None);
@@ -670,7 +787,9 @@ impl<'a> LinkLoop<'a> {
             if self.ctl.stopped() {
                 break;
             }
-            (self.inner.log)(&format!("machine {}: {failed}", self.entry.name));
+            if log_failure(&self.entry, &mut self.logged, &failed) {
+                (self.inner.log)(&format!("machine {}: {failed}", self.entry.name));
+            }
             self.set(LinkState::Unreachable, Some(failed.clone()));
             // A queued call doesn't wait out the backoff for an answer.
             for call in self.pending.drain(..) {
@@ -709,16 +828,12 @@ impl<'a> LinkLoop<'a> {
     /// Wanted now (a machines watcher, a queued call, a [`Want`]), or within
     /// the linger.
     fn wanted(&self) -> bool {
-        self.inner.wanted(&self.entry.name, self.ctl, !self.pending.is_empty())
+        self.inner.wanted(&self.entry, self.ctl, !self.pending.is_empty())
     }
 
     fn set(&self, state: LinkState, error: Option<String>) {
         let mut moved = false;
-        self.inner.remotes.update(&self.entry.name, |m| {
-            moved = m.state != state || m.error != error;
-            m.state = state;
-            m.error = error;
-        });
+        self.inner.remotes.update(&self.entry.name, |m| moved = m.set_link(state, error));
         if moved {
             (self.inner.hooks.changed)();
         }
@@ -845,9 +960,26 @@ impl<'a> LinkLoop<'a> {
                 snapshots::carry_remote_status(prev, &mut params);
             }
             m.rows.insert(dir, Arc::new(params));
+            m.seen = Some(now_unix());
         });
+        self.inner.rows_changed();
         (self.inner.hooks.changed)();
     }
+}
+
+/// Whether a link's `failed` goes to the log (`logged`: the last one that
+/// did since the link was up). An ssh machine's every failure does; an
+/// offered machine's only when it differs from the last, since a hub
+/// retries one whose worker is away for as long as it's away.
+fn log_failure(entry: &Entry, logged: &mut Option<String>, failed: &str) -> bool {
+    if !entry.is_offered() {
+        return true;
+    }
+    if logged.as_deref() == Some(failed) {
+        return false;
+    }
+    *logged = Some(failed.to_string());
+    true
 }
 
 #[cfg(test)]
@@ -864,7 +996,7 @@ mod tests {
     use crate::serve::endpoint;
     use crate::serve::machines::ssh::{self, Duplex};
     use crate::serve::proto::{Notification, Version};
-    use crate::serve::snapshots::Join;
+    use crate::serve::snapshots::{Join, Machine};
 
     fn connect(dir: &Path) -> Conn {
         let v = Version { semver: "0.6.0".into(), build: 1 };
@@ -1057,7 +1189,7 @@ mod tests {
         let timing = Timing { call: Duration::from_millis(200), ..opts(1, 0).machine_timing };
         let hooks = Hooks { watching: Box::new(|| false), changed: Box::new(|| {}) };
         let no_agent: Dial = Arc::new(|_| anyhow::bail!("no agent relay here"));
-        let machines = Machines::spawn(registry, dial, no_agent, timing, hooks, |_| {});
+        let machines = Machines::spawn(registry, dial, no_agent, timing, hooks, None, |_| {});
         let h = machines.handle();
         for round in 1..=2 {
             let r = h.forward("m", "instances.list", json!({"dir": "/x"})).unwrap();
@@ -1089,7 +1221,7 @@ mod tests {
         };
         let no_dial: Dial = Arc::new(|_| anyhow::bail!("no link here"));
         let no_agent: Dial = Arc::new(|_| anyhow::bail!("no agent relay here"));
-        let machines = Machines::spawn(registry.clone(), no_dial, no_agent, opts(1, 0).machine_timing, hooks, |_| {});
+        let machines = Machines::spawn(registry.clone(), no_dial, no_agent, opts(1, 0).machine_timing, hooks, None, |_| {});
         let h = machines.handle();
         let before = changed.load(Ordering::SeqCst);
         assert!(!h.remotes().get("m").unwrap().agent);
@@ -1182,7 +1314,7 @@ mod tests {
             Hooks { watching: Box::new(move || w.load(Ordering::SeqCst)), changed: Box::new(|| {}) }
         };
         let timing = opts(1, 0).machine_timing;
-        let machines = Machines::spawn(registry.clone(), dial, agent_dial, timing, hooks, |_| {});
+        let machines = Machines::spawn(registry.clone(), dial, agent_dial, timing, hooks, None, |_| {});
         let socket = endpoint::agent_socket(&base, CLIENT);
         Agented { base, registry, machines, watching, dials, spawns, socket, timing }
     }
@@ -1314,7 +1446,7 @@ mod tests {
         let dial: Dial = Arc::new(|_| Ok(mute_peer()));
         let hooks = Hooks { watching: Box::new(|| true), changed: Box::new(|| {}) };
         let timing = opts(1, 0).machine_timing;
-        let machines = Machines::spawn(registry, dial, agent_dial, timing, hooks, |line| LOGGED.lock().unwrap().push(line.into()));
+        let machines = Machines::spawn(registry, dial, agent_dial, timing, hooks, None, |line| LOGGED.lock().unwrap().push(line.into()));
         std::thread::sleep(Duration::from_millis(600));
         drop(machines);
         // 50, 100, 200, 200 … ms apart: a handful in 600 ms, not hundreds.
@@ -1324,6 +1456,121 @@ mod tests {
         let ours: Vec<_> = logged.iter().filter(|l| l.starts_with("machine fails: agent relay: ")).collect();
         assert_eq!(ours.len(), n, "{logged:?}");
         assert!(ours[0].ends_with("Could not resolve hostname x"), "{}", ours[0]);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ---- a fleet hub -----------------------------------------------------------
+
+    static HUB_LOGGED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    /// Offered worker `w` and ssh machine `s`, nobody watching; `w`'s
+    /// fleet-link socket is "up" while the flag says so (a [`mute_peer`]),
+    /// else its dial fails as `fleet::offer::dial`'s does. Dials by name.
+    fn offered_and_ssh(
+        base: &Path,
+        hub: Option<Hub>,
+        log: fn(&str),
+    ) -> (Machines, Arc<AtomicBool>, Arc<Mutex<Vec<String>>>) {
+        let registry = base.join("machines.toml");
+        crate::serve::machines::update(&registry, |e| {
+            e.push(Entry::offered("w"));
+            e.push(Entry::ssh("s", "me@s"));
+        })
+        .unwrap();
+        let up = Arc::new(AtomicBool::new(false));
+        let dials = Arc::new(Mutex::new(Vec::new()));
+        let dial: Dial = {
+            let (up, dials) = (Arc::clone(&up), Arc::clone(&dials));
+            Arc::new(move |e: &Entry| {
+                dials.lock().unwrap().push(e.name.clone());
+                if e.is_offered() && up.load(Ordering::SeqCst) {
+                    return Ok(mute_peer());
+                }
+                anyhow::bail!("its fleet link isn't up (fleet-{}.sock: No such file or directory)", e.name)
+            })
+        };
+        let no_agent: Dial = Arc::new(|_| anyhow::bail!("no agent relay here"));
+        let hooks = Hooks { watching: Box::new(|| false), changed: Box::new(|| {}) };
+        let machines = Machines::spawn(registry, dial, no_agent, opts(1, 0).machine_timing, hooks, hub, log);
+        (machines, up, dials)
+    }
+
+    fn dialed(dials: &Mutex<Vec<String>>, name: &str) -> usize {
+        dials.lock().unwrap().iter().filter(|n| *n == name).count()
+    }
+
+    /// On a hub an offered link is wanted with no watcher, hold or linger:
+    /// it retries an absent worker (logging that once) and connects when it
+    /// comes; an ssh machine still waits to be wanted.
+    #[test]
+    fn a_hub_always_wants_its_offered_links() {
+        let base = short_scratch("hub-want");
+        let hub = Hub { remotes: base.join("remotes.json") };
+        let (machines, up, dials) = offered_and_ssh(&base, Some(hub), |l| HUB_LOGGED.lock().unwrap().push(l.into()));
+        let h = machines.handle();
+        wait_for("the offered link retrying", Duration::from_secs(5), || dialed(&dials, "w") >= 3);
+        assert_eq!(h.remotes().get("w").unwrap().state, LinkState::Unreachable);
+        let logged: Vec<_> = HUB_LOGGED.lock().unwrap().iter().filter(|l| l.starts_with("machine w: ")).cloned().collect();
+        assert_eq!(logged.len(), 1, "one line for one way of failing: {logged:?}");
+        assert!(logged[0].contains("its fleet link isn't up"), "{}", logged[0]);
+
+        up.store(true, Ordering::SeqCst);
+        wait_for("the offered link up", Duration::from_secs(5), || h.remotes().get("w").unwrap().state == LinkState::Connected);
+        // Well past the linger, nobody wanting it: still up.
+        std::thread::sleep(opts(1, 0).machine_timing.linger * 2);
+        assert_eq!(h.remotes().get("w").unwrap().state, LinkState::Connected);
+        assert_eq!(dialed(&dials, "s"), 0, "an ssh machine waits to be wanted");
+        assert_eq!(h.remotes().get("s").unwrap().state, LinkState::Idle);
+        drop(machines);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Not a hub: an offered link is held only while wanted, like an ssh one.
+    #[test]
+    fn elsewhere_an_offered_link_waits_to_be_wanted() {
+        let base = short_scratch("nohub-want");
+        let (machines, up, dials) = offered_and_ssh(&base, None, |_| {});
+        up.store(true, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(dials.lock().unwrap().len(), 0, "nothing dialed");
+        assert_eq!(machines.handle().remotes().get("w").unwrap().state, LinkState::Idle);
+        assert!(!base.join("remotes.json").exists(), "only a hub saves");
+        drop(machines);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A hub restores `remotes.json` (unreachable until the link connects,
+    /// machines no longer registered dropped) and saves it back at the stop.
+    #[test]
+    fn a_hub_restores_and_saves_remotes() {
+        let base = short_scratch("hub-save");
+        let path = base.join("remotes.json");
+        let rows = json!({"dir": "/r", "instances": [{"name": "web-1"}]});
+        let row = |name: &str| Machine {
+            name: name.into(),
+            rows: [(PathBuf::from("/r"), Arc::new(rows.clone()))].into(),
+            seen: Some(1_761_566_400),
+            ..Machine::default()
+        };
+        saved::save(&path, &saved::of(&[row("s"), row("gone")], 0)).unwrap();
+        let hub = Hub { remotes: path.clone() };
+        let (machines, up, _) = offered_and_ssh(&base, Some(hub), |_| {});
+        let h = machines.handle();
+        assert!(h.remotes().get("gone").is_none(), "not registered: dropped");
+        let s = h.remotes().get("s").unwrap();
+        // `s` has no `/r` registered: its rows go with the sync, the machine stays.
+        assert!(s.rows.is_empty() && s.restored);
+        std::thread::sleep(Duration::from_millis(200));
+        let s = h.remotes().get("s").unwrap();
+        assert_eq!(s.state, LinkState::Unreachable, "idle, but restored: unreachable");
+        assert!(s.error.as_deref().unwrap().ends_with("(rows from Oct 27 12:00 UTC)"), "{:?}", s.error);
+
+        up.store(true, Ordering::SeqCst);
+        wait_for("w connected", Duration::from_secs(5), || h.remotes().get("w").unwrap().state == LinkState::Connected);
+        drop(machines);
+        let saved = saved::load(&path).unwrap();
+        assert_eq!(saved.machines.keys().collect::<Vec<_>>(), ["w"], "gone dropped; s has nothing left to save");
+        assert_eq!(saved.machines["w"].version.as_deref(), Some("0.6.0"), "w's hello");
         let _ = std::fs::remove_dir_all(&base);
     }
 }

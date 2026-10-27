@@ -100,8 +100,13 @@ pub struct Options {
     /// ([`crate::daemon_config`]), resolved once by [`serve`].
     pub keep_alive: bool,
     /// A fleet hub: `[serve] hub = true` ([`crate::daemon_config`]), resolved
-    /// once by [`serve`]. Only a hub accepts `fleet.offer`.
+    /// once by [`serve`]. Only a hub accepts `fleet.offer`; a hub never idles
+    /// out (keep-alive), always holds its offered links and saves the
+    /// machines' rows in `remotes` (`service::Hub`).
     pub hub: bool,
+    /// A hub's `remotes.json`; `None` is the default
+    /// ([`machines::saved::path`]). Tests point it at their own file.
+    pub remotes: Option<PathBuf>,
     /// [`idle::IDLE_TIMEOUT`] outside tests.
     pub idle_timeout: Duration,
     /// Run the live host side ([`Host`]: bridges, popups, autostart). Off in
@@ -155,6 +160,7 @@ impl Options {
             version: Version::current(),
             keep_alive,
             hub: false,
+            remotes: None,
             idle_timeout: idle::IDLE_TIMEOUT,
             host: true,
             inbox: None,
@@ -238,7 +244,11 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
         std::process::id(),
         opts.version.semver,
         opts.version.build,
-        if opts.keep_alive { ", keep-alive" } else { "" },
+        match (opts.hub, opts.keep_alive) {
+            (true, _) => ", fleet hub (keep-alive)",
+            (false, true) => ", keep-alive",
+            (false, false) => "",
+        },
     ));
 
     let join = opts.join.clone().unwrap_or_else(|| default_join(state.clone()));
@@ -271,7 +281,12 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
             }),
         }
     };
-    let links = service::Machines::spawn(registry_path.clone(), dial.clone(), agent_dial, opts.machine_timing, hooks, log);
+    let hub = match (opts.hub, &opts.remotes) {
+        (false, _) => None,
+        (true, Some(path)) => Some(service::Hub { remotes: path.clone() }),
+        (true, None) => Some(service::Hub { remotes: machines::saved::path()? }),
+    };
+    let links = service::Machines::spawn(registry_path.clone(), dial.clone(), agent_dial, opts.machine_timing, hooks, hub, log);
     let forwards_machines = registry_path.clone();
     shared.hub = opts.hub;
     shared.machines = Some(machines::api::Ctx {
@@ -347,8 +362,9 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
             *shared.idle_since.lock().unwrap() = now;
         }
         let idle_since = *shared.idle_since.lock().unwrap();
-        // A lending daemon holds its link to the hub: it never idles out.
-        let keep_alive = opts.keep_alive || shared.lender.get().is_some_and(|l| l.lends());
+        // A hub holds its workers' links, a lending daemon its link to the
+        // hub: neither idles out.
+        let keep_alive = opts.keep_alive || opts.hub || shared.lender.get().is_some_and(|l| l.lends());
         if idle::decide(&holders, idle_since, now, keep_alive, opts.idle_timeout) == Decision::Exit {
             break Exit::Idle;
         }
@@ -1512,6 +1528,8 @@ pub(crate) mod tests {
             version: Version { semver: "0.6.0".into(), build },
             keep_alive: false,
             hub: false,
+            // Never the user's: a test hub that checks it sets its own.
+            remotes: Some(std::env::temp_dir().join(format!("dsv-remotes-{}", std::process::id())).join("remotes.json")),
             idle_timeout: Duration::from_millis(idle_ms),
             host: false,
             inbox: Some(std::env::temp_dir().join(format!("dsv-inbox-{}", std::process::id())).join("inbox.json")),
@@ -2405,6 +2423,20 @@ pub(crate) mod tests {
         let (_c, h) = hello_at(&dir, &v(2));
         assert!(matches!(h, Hello::Handoff));
         assert_eq!(daemon.join().unwrap().unwrap(), Exit::Handoff);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `hub = true` implies keep-alive.
+    #[test]
+    fn a_hub_never_idles() {
+        let dir = scratch("hub-idle");
+        let hub = Options { hub: true, remotes: Some(dir.join("data/remotes.json")), ..opts(1, 50) };
+        let daemon = spawn_daemon(&dir, hub);
+        let _ = hello_at(&dir, &v(1));
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(!daemon.is_finished(), "a hub idled out");
+        assert!(connect(&dir).call("shutdown", json!({})).unwrap().error.is_none());
+        assert_eq!(daemon.join().unwrap().unwrap(), Exit::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

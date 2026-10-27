@@ -123,7 +123,8 @@ The daemon exits `IDLE_TIMEOUT` (10 min) after its last holder left
 `followers` exists in the struct but nothing sets it. A machine link is
 not a holder. `--keep-alive` or `[serve] keep-alive = true` in
 `daemon.config.toml` (read once at start; a bad file is logged, defaults
-used) disables the idle exit.
+used) disables the idle exit, as do `[serve] hub = true` (a
+[fleet hub](fleet.md#hub-mode)) and lending to a hub.
 
 ## Drain
 

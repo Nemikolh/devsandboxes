@@ -12,7 +12,7 @@ Code: `src/serve/machines/mod.rs` (`Entry`, `Kind`, `MachineKind`,
 (`api_argv`, `tty_argv`, `tty_argv_with`, `cli_argv`, `agent_argv`,
 `script_argv`, `parse_target`, `Dial`, `Duplex`, `ssh_dial`, `ssh_agent_dial`), `link.rs`
 (`LinkError`, `client_name`), `service.rs` (`Machines`, `Handle`, `Want`,
-`Timing`, `Hooks`), `agent.rs`
+`Timing`, `Hooks`, `Hub`), `saved.rs` (`remotes.json`), `agent.rs`
 (`serve`, `End`, `SPEC`), `api.rs`
 (`machines.*`, `Ctx`), `forward.rs` (`QUICK`, `FANOUT_WAIT`, `verb`, the
 federated joins), `cli.rs` (`plan`, `Plan`, `machine_use`, `route`,
@@ -167,11 +167,13 @@ per holder (a forwarded verb for its run, a connection's
 `machines.hold` for the connection's life), counted per machine name so a
 hold outlives a restarted link; `Want::agent_ready` waits, bounded, for
 the agent relay's handshake (`false` at once with `agent` off). The link
-connects only while the machine is wanted. Connected, it
+connects only while the machine is wanted; on a fleet hub
+(`service::Hub`) an offered machine is always wanted
+([fleet](fleet.md#hub-mode)). Connected, it
 subscribes to `instances`, watches each of the machine's roots while a
 local watcher wants machines (not for a link lingering on calls), and
-stores pushed snapshots in `Remotes` (memory only, kept while the link is
-down).
+stores pushed snapshots in `Remotes` (kept while the link is down; in
+memory only, but on a hub, which also saves them to `remotes.json`).
 `LinkState`: `idle`, `connecting`, `connected`, `unreachable` (with the
 reason); retries back off from 1 s doubling to 30 s while wanted.
 Handshake timeout 20 s. A link isn't an idle holder of the local daemon;

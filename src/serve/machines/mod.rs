@@ -18,6 +18,7 @@
 //!   the local ssh-agent (`commands::agent_relay` is the far end)
 //! - `install`: the CLI's check of a machine's devsandbox and the copy of
 //!   this binary there
+//! - `saved`: a hub's `remotes.json`, the machines' last known rows
 //!
 //! Only the daemon writes the registry (`machines.add` / `set` / `rm`);
 //! the CLI reads it later to know whether any machine exists. Two
@@ -38,6 +39,7 @@ pub mod cli;
 pub mod forward;
 pub mod install;
 pub mod link;
+pub mod saved;
 pub mod service;
 pub mod ssh;
 

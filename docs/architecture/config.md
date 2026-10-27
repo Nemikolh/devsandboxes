@@ -172,7 +172,8 @@ among the root's findings on every write. The ops (`findings`, `migrate`,
 ## daemon.config.toml
 
 `<data-dir>/devsandbox/daemon.config.toml` is per user, not per root: settings
-for `devsandbox serve` (`[serve] keep-alive`). Unknown keys are ignored so a
+for `devsandbox serve` (`[serve] keep-alive`; `[serve] hub`, a
+[fleet hub](daemon/fleet.md#hub-mode), which implies keep-alive). Unknown keys are ignored so a
 newer binary's file still loads. See [daemon](daemon/).
 
 Limitations: [status.md](../status.md#config)

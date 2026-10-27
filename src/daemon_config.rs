@@ -24,8 +24,10 @@ pub struct DaemonConfig {
 pub struct ServeConfig {
     /// No idle exit, as `serve --keep-alive`.
     pub keep_alive: bool,
-    /// This daemon is a fleet hub (docs/architecture/daemon/fleet.md): it
-    /// accepts workers' `fleet.offer`.
+    /// This daemon is a fleet hub (docs/architecture/daemon/fleet.md, *Hub
+    /// mode*): it accepts workers' `fleet.offer`, always holds their
+    /// links and saves the machines' rows in `remotes.json`. Implies
+    /// `keep_alive`: a hub never idles out.
     pub hub: bool,
 }
 
