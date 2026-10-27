@@ -17,6 +17,7 @@ export const EXAMPLE_ICONS = [
   'package',
   'git-pull-request',
   'file-code',
+  'globe-lock',
 ] as const;
 
 export type ExampleIconName = (typeof EXAMPLE_ICONS)[number];

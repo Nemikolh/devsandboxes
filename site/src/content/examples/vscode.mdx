@@ -11,7 +11,7 @@ related: [parallel-agents, port-a-devcontainer, features]
 
 An agent works in instance `fix-login` and you want to read its diff, step through a test or poke at the running app in your editor. With several instances of one repo open, the windows all look alike, and an editor that attaches as the wrong user hits permission errors on the first save.
 
-`devsandbox vscode` (or `o` in the dashboard) opens a window attached to the instance's container, as the sandbox's `remoteUser`, with the sandbox's extensions, titled after the instance.
+`devsandbox vscode` (or `o` in the dashboard) opens a window attached to the instance's container, as the user every `exec` runs as, with the sandbox's extensions, titled after the instance.
 
 ## Try it
 
@@ -26,7 +26,7 @@ In the dashboard, select an instance and press `o`, or type `:code add-search`.
 
 ## How it works
 
-- VS Code attaches to the container devsandbox already made, as [`remoteUser`](/docs/config#implemented-devcontainer-properties) if set.
+- VS Code attaches to the container devsandbox already made, as the user `run` picked for it: the adopted [`remoteUser`](/docs/going-further#who-you-are-inside) with your host ids, or root on rootless docker, where root is you.
 - Extensions in the sandbox's `customizations.vscode.extensions` are installed on attach.
 - The window opens `/workspaces/<instance>.code-workspace`, which is what names it.
 - `customizations.vscode.settings` is ignored ([accepted but ignored](/docs/config#accepted-but-ignored-warned-at-run)): keep settings in the repo's `.vscode/settings.json`.

@@ -1,0 +1,65 @@
+---
+title: Browsers with their sandbox
+description: Run Playwright, Puppeteer or Electron in a sandbox without turning the browser's own sandbox off.
+order: 11
+icon: globe-lock
+tags: [browsers, testing]
+related: [parallel-agents, port-forwarding, features]
+---
+
+import AgentPrompt from '../../components/AgentPrompt.astro';
+import AgentPromptLink from '../../components/AgentPromptLink.astro';
+
+## The problem
+
+An agent runs end-to-end tests in a sandbox and Chromium won't start. Its own sandbox needs to create user namespaces, which docker's default seccomp profile blocks, and it refuses to run as root. The usual fix is `--no-sandbox` everywhere, and then every page the browser opens runs unsandboxed, even in containers where the sandbox would have worked.
+
+devsandbox makes the sandbox work where it can, checks in each new container whether it does, and tells the tools which one it is.
+
+<AgentPromptLink />
+
+## Try it
+
+No config needed. `run` prints what the check found, after the identity line:
+
+```text title="OUTPUT"
+browser sandbox: on
+```
+
+Where it can't work, it says why, for example `browser sandbox: off (no user namespaces: AppArmor restriction on the host); sandbox-off knobs set`. `devsandbox inspect web` prints the same line.
+
+Playwright turns Chromium's sandbox off by default, so launch it like this:
+
+```js title="playwright"
+const browser = await chromium.launch({
+  chromiumSandbox: !!process.env.DEVSANDBOX_BROWSER_SANDBOX,
+  executablePath: process.env.DEVSANDBOX_CHROME,
+});
+```
+
+## How it works
+
+- **The profile.** Docker sandboxes are created with devsandbox's seccomp profile: docker's default plus user namespaces for unprivileged processes. Podman's default already allows them; nothing changes on Apple `container`.
+- **The env.** Where the check passes, every `exec` gets `DEVSANDBOX_BROWSER_SANDBOX=1`. Where it fails, the tools' own sandbox-off knobs instead (`PUPPETEER_DANGEROUS_NO_SANDBOX`, `ELECTRON_DISABLE_SANDBOX`, `QTWEBENGINE_DISABLE_SANDBOX`, `PLAYWRIGHT_MCP_SANDBOX=false`, `CHROMIUM_FLAGS=--no-sandbox`), so they turn it off only there. A key you set in `containerEnv` or `remoteEnv` wins.
+- **Root execs.** Where execs run as root ([rootless docker, or an image with no user](/docs/going-further#who-you-are-inside)), `chrome`, `chromium` and `google-chrome` go through a wrapper in `/run/devsandbox/bin` that starts the real browser at a non-root uid. `DEVSANDBOX_CHROME` (and `CHROME_PATH`, `CHROME_BIN`, `PUPPETEER_EXECUTABLE_PATH`) point at it; Playwright uses it only through `executablePath`.
+- **The cost.** Unprivileged user namespaces open kernel surface docker's default closes, the same trade podman's default makes. [`userns = false`](/docs/config#devsandbox-extras) keeps docker's default profile, and the browser sandbox off:
+
+```toml
+[sandbox.web]
+userns = false
+```
+
+Never add `--no-sandbox` by hand: without `DEVSANDBOX_BROWSER_SANDBOX`, the knobs above already turn the sandbox off.
+
+## Agent instructions
+
+<AgentPrompt
+  goal="Make the browser tests of my repo at <repo path> keep Chromium's sandbox wherever my devsandbox sandbox <sandbox name> supports it."
+  steps={[
+    'Find where the repo launches a browser (Playwright config or `chromium.launch`, Puppeteer, Electron). For Playwright, pass `chromiumSandbox: !!process.env.DEVSANDBOX_BROWSER_SANDBOX` and `executablePath: process.env.DEVSANDBOX_CHROME`.',
+    'Remove any hand-added `--no-sandbox` flag; the env devsandbox sets turns the sandbox off where it cannot work. Do not change the sandbox\'s `userns`.',
+  ]}
+  verify={[
+    'Run `devsandbox -C <config dir> run <sandbox name>`, report its `browser sandbox:` line, then run the browser tests with `devsandbox -C <config dir> exec <instance> <the repo\'s test command>` and report what happened.',
+  ]}
+/>

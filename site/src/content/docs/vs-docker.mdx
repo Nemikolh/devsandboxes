@@ -39,6 +39,7 @@ A compose file and a `devcontainer.json` become one sandbox: the app's container
 | `docker compose up` a second time             | `devsandbox run web` again: a new instance, with its own containers and its own worktree and branch           |
 | `-p 3000:3000`, decided up front              | `devsandbox port web 3000`, opened on demand, nothing restarts                                                |
 | Keys mounted or copied into the container     | Your ssh-agent relayed: the container can sign, the keys stay on your host                                     |
+| Root-owned files, or a uid that only matches on some hosts | Your host uid/gid inside, on every runtime, so workspace files stay yours                   |
 | Cache volumes you wire per project            | `caches = ["pnpm", "cargo"]`: one store shared by every sandbox                                               |
 | `docker ps` across everything                 | `devsandbox ps`, or the dashboard: every instance, service, port and notification                             |
 

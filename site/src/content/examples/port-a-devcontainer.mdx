@@ -79,8 +79,9 @@ The `devcontainer.json` can stay in the repo; devsandbox never reads it.
 | `name` | the table key | `name` is ignored |
 | `image`, `features` | same | Features: OCI references only |
 | `build.*` | `build = { dockerfile, context, … }` | paths relative to the config dir |
-| `containerEnv`, `remoteEnv` | same | `containerEnv` not `${…}`-substituted |
-| `containerUser`, `remoteUser` | same | |
+| `containerEnv`, `remoteEnv` | same | both `${…}`-substituted at create, `${containerEnv:…}` included |
+| `containerUser`, `remoteUser` | same | the account you [run as, with your host ids](/docs/going-further#who-you-are-inside) |
+| `updateRemoteUserUID` | same | `false` means `identity = "image"` |
 | `mounts` | same | missing bind sources are created |
 | `workspaceFolder` | same | default `/workspaces/<folder basename>` |
 | `workspaceMount` | `folder` | ignored |
@@ -101,7 +102,7 @@ The `devcontainer.json` can stay in the repo; devsandbox never reads it.
 - **Implemented:** `image`, `build`, `features`, `workspaceFolder`, `mounts`, `containerEnv`, `remoteEnv`, `containerUser`, `remoteUser`, `updateRemoteUserUID` (`false` means `identity = "image"`), `init`, `privileged`, the six lifecycle commands, `customizations.vscode.extensions`, `forwardPorts` ([details](/docs/config#implemented-devcontainer-properties)).
 - **Ignored:** `name`, `appPort`, `portsAttributes`, `otherPortsAttributes`, `runArgs`, `workspaceMount`, `overrideFeatureInstallOrder`, `userEnvProbe`, `overrideCommand`, `shutdownAction`, `capAdd`, `securityOpt`, `hostRequirements`, `waitFor`, `secrets`, other `customizations.*` ([details](/docs/config#accepted-but-ignored-warned-at-run)).
 - **Rejected:** `dockerComposeFile`, `service`, `runServices`, and any unknown key.
-- **Variables:** as in devcontainers, plus `${configDir}`, `${sharedVolumes}`, `${instance}`; substituted only in some keys ([variables](/docs/config#variables)).
+- **Variables:** as in devcontainers, plus `${configDir}`, `${sharedVolumes}`, `${instance}`, and `${containerEnv:…}` in `mounts` too (`target=${containerEnv:HOME}/.config/gh`); substituted only in some keys ([variables](/docs/config#variables)).
 
 ### Coming from docker compose
 

@@ -5,6 +5,7 @@ import {
   FileCode,
   GitBranch,
   GitPullRequest,
+  GlobeLock,
   HardDrive,
   KeyRound,
   Network,
@@ -31,6 +32,7 @@ const ICONS: Record<ExampleIconName, typeof Database> = {
   package: Package,
   'git-pull-request': GitPullRequest,
   'file-code': FileCode,
+  'globe-lock': GlobeLock,
 };
 
 const { name, size = 20 } = Astro.props;

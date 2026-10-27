@@ -49,6 +49,8 @@ Tab `2` lists the service containers your sandboxes use: shared by every instanc
 
 `r` on a sandbox row prefills `:run web`: Enter starts a new instance, on its own worktree. `run`, `rebuild` and `start` run in the background, in the [host daemon](/docs/host-daemon), and keep going if you quit the dashboard: the new row's status shows the step it's at (`building`, `postCreateCommand`, …), and `b` opens its build log, following along. `d` on a row still building offers to cancel it (a cancelled `run` is undone). `s` stops the selected instance, or starts it again the way `devsandbox start` does, `postStartCommand` included. `stop` and `rm` run in the daemon too; the status line says when they're done. On an instance row, `r` renames it.
 
+A sandbox whose config [assumes root in the container](/docs/going-further#configs-written-for-root) (a mount into `/root`, a root user) is flagged in the header, `N sandboxes use /root (U to update)`, and its Detail lists the entries. The dashboard offers to update them when it opens and on `U` (`u` update, `c` continue as is, `l` later), and asks the CLI's question before `run`, `start` or `rebuild` on such a sandbox.
+
 <Try>`enter` to run `web-4` and watch its row go from `building` to `running`, then `↓` to it and `b` for its build log, or `s` on any instance.</Try>
 
 </TourStep>
@@ -67,7 +69,7 @@ Tab `2` lists the service containers your sandboxes use: shared by every instanc
 
 ## Terminal
 
-`t` opens a shell in the selected instance, inside the dashboard: the bottom half splits into Detail and the terminal, one tab per shell. While the terminal has focus, every key goes to the shell. `ctrl-]` (or `F12`) goes back and forth.
+`t` opens a shell in the selected instance, inside the dashboard: the bottom half splits into Detail and the terminal, one tab per shell. While the terminal has focus, every key goes to the shell. `ctrl-]` (or `F12`) goes back and forth. The shell runs in a [session](/docs/going-further#get-a-shell-back), so one still open when you quit is there for `devsandbox exec --attach`.
 
 <Try>type `ls` and `enter`, `esc` back to the dashboard (`ctrl-]` in the real one), `↓` `t` for a second shell, `esc` again, then `[` `]` to switch and `x` to close.</Try>
 
@@ -127,7 +129,7 @@ A script or an agent in a sandbox reaches you with `devsbd notify "tests pass"`.
 
 ## Other machines
 
-With [machines](/docs/host-daemon#other-machines) registered, the dashboard shows their sandboxes and instances too, with a MACHINE column (blank for this host's). Every key works on their rows, terminals included (over `ssh -t`), and `:` commands take `my-server/web-2`. A machine that's down keeps its last rows, shown `unreachable`; one not reached yet is a note in the header. `p` forwards a port from a machine's row to this host, listed in the Ports tab with its MACHINE. `o` (VS Code) doesn't work on a machine's rows yet. A Machines tab (`5`) lists every registered machine: its ssh target, whether it's connected (and why not), whether your ssh agent reaches it, and its devsandbox version; `a` turns that agent relay on or off for the selected one, no prompt.
+With [machines](/docs/host-daemon#other-machines) registered, the dashboard shows their sandboxes and instances too, with a MACHINE column (blank for this host's). Every key works on their rows, terminals included (over `ssh -t`, reconnecting to the same shell when ssh drops), and `:` commands take `my-server/web-2`. A machine that's down keeps its last rows, shown `unreachable`; one not reached yet is a note in the header. `p` forwards a port from a machine's row to this host, listed in the Ports tab with its MACHINE. `o` (VS Code) doesn't work on a machine's rows yet. A Machines tab (`5`) lists every registered machine: its ssh target, whether it's connected (and why not), whether your ssh agent reaches it, and its devsandbox version; `a` turns that agent relay on or off for the selected one, no prompt.
 
 ## Every key
 
@@ -161,6 +163,7 @@ The real dashboard's keys, also in its `?` screen. The Preview column says what 
 | `p`               | Forward a port (instance or service)             | yes                      |
 | `o`               | Open in VS Code (Instances)                      | yes                      |
 | `d`               | Remove the instance now, no prompt; cancel it, after a `y`/`n`, while it's building (Instances) | no |
+| `U`               | Update the configs that use `/root`              | no                       |
 | `t` / `K`         | SIGTERM / SIGKILL (process row)                  | no                       |
 
 ### Ports, Machines and Inbox list

@@ -29,11 +29,52 @@ devsandbox rebuild -d --force web   # prints: web, the build goes on
 devsandbox logs --build web --follow
 ```
 
-`exec` runs in the workspace directory as the instance's user (the `remoteUser` adopted under [`identity`](/docs/config)), exits with the command's own status, and takes `-i` / `-t` only for interactive shells. Any command that takes a name accepts an instance name, a sandbox name or the repo folder's basename.
+`exec` runs in the workspace directory as the instance's user ([below](#who-you-are-inside)), exits with the command's own status, and takes `-i` / `-t` only for interactive shells. Any command that takes a name accepts an instance name, a sandbox name or the repo folder's basename.
 
 <Callout variant="note" title="When a lifecycle command fails">
   A failing `postCreateCommand` aborts `run` but keeps the container, so `devsandbox logs --build web`, `devsandbox logs web` and `devsandbox exec web …` can show you why.
 </Callout>
+
+### Get a shell back
+
+An interactive `exec` (one with a terminal) runs in a session inside the instance: if your terminal closes or the connection drops, the program keeps running, and you can attach to it again:
+
+```bash
+devsandbox exec web --sessions                # id, state, attached or detached, started, command
+devsandbox exec web --attach                  # the one detached session; a pick list if several
+devsandbox exec web --attach=1790000000-a1b2  # a given one
+devsandbox exec web --session dev pnpm dev    # run in session `dev`, or attach if it's live
+```
+
+The dashboard's terminals run in sessions too, so a shell still open when you quit the dashboard is there for `--attach`.
+
+## Who you are inside
+
+Inside a sandbox you are a user with your host uid/gid, so what it writes in the workspace is yours on the host, on rootful docker, rootless docker, rootless podman and VM-backed runtimes such as Apple `container` alike. The account is the config's `remoteUser` (else `containerUser`, else the image's `USER`), keeping its name, home and shell; only its ids change. How that's done depends on the runtime, which `run` probes once and states in one line:
+
+```text title="OUTPUT"
+identity: rootful: exec as vscode, remapped to 1000:1000, user namespaces allowed (seccomp)
+```
+
+On rootless docker, where root in the container already is you, execs run as root with `HOME` set to the account's home. An image with no user to adopt runs as root, with a warning recommending the `common-utils` Feature. `--reprobe` on `run` or `rebuild` probes the runtime again, after you change its setup. An instance keeps the user it was created with until it's rebuilt.
+
+To mount something into the user's home, whoever that is, target `${containerEnv:HOME}` ([variables](/docs/config#variables)):
+
+```toml
+mounts = ["source=${localEnv:HOME}/.claude,target=${containerEnv:HOME}/.claude,type=bind"]
+```
+
+To take the image's users as written instead, with nothing remapped, set [`identity = "image"`](/docs/config#devsandbox-extras) on the sandbox; a ported `updateRemoteUserUID = false` means the same.
+
+### Configs written for root
+
+A config that mounts into `/root` or sets a root `remoteUser` or `containerUser` breaks under this. Before `run`, `start` and `rebuild`, on a terminal, devsandbox lists those entries per config file, with the edit it would make, and asks:
+
+```text
+[u]pdate / [c]ontinue as is (don't ask again) / [s]kip this time
+```
+
+`u` rewrites `devsandboxes.toml` in place, comments and layout kept: `/root` becomes `${containerEnv:HOME}`, a root user is removed, and it names the instances to `rebuild`. `c` keeps the config (a root user stays, as `identity = "image"`) and won't ask about those entries again; `s`, or Enter, goes ahead this once. A YAML config gets the edits to make by hand. Off a terminal, under `run --json` and on autostart, `run` prints one `warning:` line instead. The [dashboard](/docs/dashboard#run-stop-start) asks the same.
 
 ## A second instance
 
@@ -72,7 +113,7 @@ devsandbox exec api pnpm test         # over ssh, in the instance there
 devsandbox stop my-server/web         # qualified, when `web` exists here too
 ```
 
-See [Other machines](/docs/host-daemon#other-machines) for what runs where.
+An interactive `exec` there reconnects by itself when ssh drops (`connection lost, reconnecting… (Ctrl-C to stop)`), back into the same session. See [Other machines](/docs/host-daemon#other-machines) for what runs where.
 
 ## Clean up
 
