@@ -25,6 +25,7 @@ use super::service::{Handle, Want};
 use super::ssh::{self, Dial};
 use super::{Entry, MachineKind, check_name, default_name};
 use crate::serve::api::{ApiError, RootCandidate, parse};
+use crate::serve::capacity::Capacity;
 use crate::serve::snapshots::LinkState;
 
 /// The hello's wait: ssh's connect and auth, the remote login shell, and a
@@ -96,6 +97,10 @@ pub struct MachineRow {
     pub state: LinkState,
     pub error: Option<String>,
     pub version: Option<String>,
+    /// Its host's capacity, from its last pushed snapshot
+    /// (`snapshots::Machine::capacity`).
+    #[serde(default)]
+    pub capacity: Option<Capacity>,
 }
 
 #[derive(Deserialize)]
@@ -197,6 +202,7 @@ fn list(ctx: &Ctx) -> Answer {
                 roots: e.roots,
                 command: e.command,
                 agent: e.agent,
+                capacity: live.capacity(),
                 state: live.state,
                 error: live.error,
                 version: live.version,
@@ -554,8 +560,8 @@ mod tests {
         assert_eq!(
             rows,
             json!([
-                {"name": "box", "kind": "ssh", "target": "me@box", "roots": [dot, std::fs::canonicalize(&pair.home).unwrap()], "command": null, "agent": false, "state": "idle", "error": null, "version": null},
-                {"name": "box2", "kind": "ssh", "target": "ssh://box:2200", "roots": [dot], "command": cmd, "agent": true, "state": "idle", "error": null, "version": null},
+                {"name": "box", "kind": "ssh", "target": "me@box", "roots": [dot, std::fs::canonicalize(&pair.home).unwrap()], "command": null, "agent": false, "state": "idle", "error": null, "version": null, "capacity": null},
+                {"name": "box2", "kind": "ssh", "target": "ssh://box:2200", "roots": [dot], "command": cmd, "agent": true, "state": "idle", "error": null, "version": null, "capacity": null},
             ])
         );
         let info = ok(&mut pair.local, "machines.get", json!({"name": "box2"}));
@@ -648,8 +654,11 @@ mod tests {
             state: LinkState::Idle,
             error: None,
             version: None,
+            capacity: Some(Capacity::default()),
         };
-        assert_matches("MachineRow", &to_value(row).unwrap());
+        let row = to_value(row).unwrap();
+        assert_matches("MachineRow", &row);
+        assert_matches("Capacity", &row["capacity"]);
         let info = MachineInfo { name: "m".into(), kind: MachineKind::Ssh, target: Some("m".into()), command: None, roots: vec![], agent: false };
         assert_matches("MachineInfo", &to_value(info).unwrap());
         assert_eq!(union_members("MachineKind"), ["'ssh'", "'offered'"]);

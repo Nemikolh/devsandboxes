@@ -201,6 +201,13 @@ impl Lender {
         drop(live);
     }
 
+    /// `lend.toml` as it is now, for the capacity report: `None` when it's
+    /// missing or doesn't parse. Read each time, so a hand edit of `[caps]`
+    /// shows on the next poll.
+    pub fn file(&self) -> Option<Lend> {
+        lend::load(&self.path).ok().flatten()
+    }
+
     pub fn get(&self) -> Result<LendInfo, ApiError> {
         let lend = lend::load(&self.path).map_err(ApiError::internal)?.unwrap_or_default();
         let slot = self.slot.lock().unwrap();
@@ -376,7 +383,7 @@ mod tests {
         let transport = dials.transport();
         let timing = Timing { backoff: Duration::from_millis(5), backoff_cap: Duration::from_millis(10), ..Timing::default() };
         let spawn: Spawn = Box::new(move |s: Start| {
-            Lending::spawn(s.hub, s.name, s.draining, transport.clone(), Arc::new(|| None), timing, |_| {})
+            Lending::spawn(s.hub, s.name, s.root, s.draining, transport.clone(), Arc::new(|| None), timing, |_| {})
         });
         Lender::new(path, "lap.local".into(), spawn, |_| {})
     }
@@ -438,7 +445,8 @@ mod tests {
         wait_for(|| dials.count() >= 1, "a dial");
         let argv = dials.last().unwrap();
         assert_eq!(argv[5], "me@hub");
-        assert!(argv[6].contains("'\\''lap'\\'''"), "the hostname's label: {argv:?}");
+        assert!(argv[6].contains("'\\''--worker'\\'' '\\''lap'\\''"), "the hostname's label: {argv:?}");
+        assert!(argv[6].contains(&format!("'\\''--root'\\'' '\\''{}'\\''", root.display())), "the fleet root: {argv:?}");
         wait_for(|| l.get().unwrap().link == LinkState::Retrying, "retrying");
         assert_eq!(l.get().unwrap().error.as_deref(), Some("no route"));
 

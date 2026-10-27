@@ -1,7 +1,7 @@
-//! `devsandbox fleet-link --worker <name>` (hidden): the hub's end of a fleet
+//! `devsandbox fleet-link --worker <name> --root <path>` (hidden): the hub's end of a fleet
 //! worker's link (docs/architecture/daemon/fleet.md, *Hub side*). A worker's
 //! daemon runs it on its hub over its own ssh (`ssh -T -o BatchMode=yes <hub>
-//! devsandbox fleet-link --worker <name>`, `serve::fleet::worker`) and answers the
+//! devsandbox fleet-link --worker <name> --root <fleet root>`, `serve::fleet::worker`) and answers the
 //! streams it opens with connections to its own daemon.
 //!
 //! It is the opener of a `fleet::link` of `fleet::LINK`, as
@@ -10,9 +10,10 @@
 //! dir; the newest link for a worker wins), and each connection there (the
 //! hub's link to the offered machine, its forwarded verbs: `fleet::offer::dial`)
 //! becomes one `API` stream to the worker's daemon. Once the `Hello`s are
-//! through it sends `fleet.offer {worker, version, draining}` to this host's daemon
+//! through it sends `fleet.offer {worker, version, root, draining}` to this host's daemon
 //! (started like any client's, if it isn't running), which registers the
-//! worker as an offered machine, and holds that connection for the link's
+//! worker as an offered machine whose one root is `root` (the worker's
+//! canonical fleet root, a path on the worker), and holds that connection for the link's
 //! life, so a linked worker keeps the hub's daemon from idling out. A refused
 //! offer (not a hub, a name an ssh machine has) ends the link with why.
 
@@ -29,13 +30,14 @@ use crate::serve::machines::check_name;
 
 /// The CLI entry: the socket dir (created 0700 if missing), then [`run`] on
 /// stdin/stdout, offering through this host's daemon (lazy start).
-/// `draining`: the worker's `lend` is `drain` (`--drain`).
-pub fn fleet_link(worker: &str, draining: bool) -> Result<()> {
+/// `root`: the worker's fleet root (`--root`); `draining`: the worker's
+/// `lend` is `drain` (`--drain`).
+pub fn fleet_link(worker: &str, root: &Path, draining: bool) -> Result<()> {
     check_name(worker)?;
     let dir = endpoint::socket_dir()?;
     endpoint::ensure_private_dir(&dir)?;
     let daemon = dir.clone();
-    run(io::stdin(), io::stdout(), &dir, worker, draining, move || {
+    run(io::stdin(), io::stdout(), &dir, worker, root, draining, move || {
         client::connect(&daemon, "fleet-link").context("cannot reach this host's devsandbox serve")
     })
 }
@@ -49,14 +51,18 @@ pub fn run(
     writer: impl Write + Send + 'static,
     dir: &Path,
     worker: &str,
+    root: &Path,
     draining: bool,
     daemon: impl FnOnce() -> Result<Conn>,
 ) -> Result<()> {
     check_name(worker)?;
+    if !root.is_absolute() {
+        bail!("--root {} isn't an absolute path", root.display());
+    }
     let mut held: Option<Conn> = None;
     let end = link::opener(&fleet::LINK, reader, writer, &endpoint::fleet_socket(dir, worker), |peer| {
         let mut conn = daemon()?;
-        offer(&mut conn, worker, &peer.hash, draining)?;
+        offer(&mut conn, worker, &peer.hash, root, draining)?;
         held = Some(conn);
         Ok(())
     });
@@ -65,8 +71,8 @@ pub fn run(
 }
 
 /// `fleet.offer` on `conn`; a refusal is an error with the daemon's reason.
-fn offer(conn: &mut Conn, worker: &str, version: &str, draining: bool) -> Result<()> {
-    let r = conn.call("fleet.offer", json!({ "worker": worker, "version": version, "draining": draining }))?;
+fn offer(conn: &mut Conn, worker: &str, version: &str, root: &Path, draining: bool) -> Result<()> {
+    let r = conn.call("fleet.offer", json!({ "worker": worker, "version": version, "root": root, "draining": draining }))?;
     if let Some(e) = r.error {
         bail!("offer refused: {}", e.message);
     }
@@ -133,11 +139,15 @@ mod tests {
         })
     }
 
+    /// The fleet root `lap` offers in these tests (a path on the worker;
+    /// the hub never reads it).
+    const WORKER_ROOT: &str = "/worker/fleet/hub";
+
     /// The hub's `fleet-link` for worker `lap` over `io`, its socket and
     /// daemon in `hub`.
     fn hub_link(io: UnixStream, hub: PathBuf) -> std::thread::JoinHandle<Result<()>> {
         let (r, w) = (io.try_clone().unwrap(), io);
-        std::thread::spawn(move || run(r, w, &hub.clone(), "lap", false, move || Ok(conn_at(&hub))))
+        std::thread::spawn(move || run(r, w, &hub.clone(), "lap", Path::new(WORKER_ROOT), false, move || Ok(conn_at(&hub))))
     }
 
     /// A worker linked to its hub: the hub's daemon registers it on offer,
@@ -182,7 +192,8 @@ mod tests {
         let (worker_io, hub_io) = UnixStream::pair().unwrap();
         let worker_end = fake_worker(worker_io, worker_dir.clone());
         let hub_end = hub_link(hub_io.try_clone().unwrap(), hub_dir.clone());
-        wait_for(|| machines::load(&registry).is_ok_and(|e| e == [Entry::offered("lap")]), "the offer registers `lap`");
+        let lap = Entry { roots: vec![WORKER_ROOT.into()], ..Entry::offered("lap") };
+        wait_for(|| machines::load(&registry).is_ok_and(|e| e == [lap.clone()]), "the offer registers `lap` and its root");
         assert!(endpoint::fleet_socket(&hub_dir, "lap").exists());
 
         let mut c = conn_at(&hub_dir);
@@ -258,7 +269,10 @@ mod tests {
     fn a_bad_worker_name_is_refused_before_binding() {
         let (a, b) = UnixStream::pair().unwrap();
         let dir = std::env::temp_dir();
-        let err = run(a, b, &dir, "a/b", false, || unreachable!()).unwrap_err();
+        let err = run(a, b, &dir, "a/b", Path::new("/r"), false, || unreachable!()).unwrap_err();
         assert!(format!("{err:#}").contains("machine name"), "{err:#}");
+        let (a, b) = UnixStream::pair().unwrap();
+        let err = run(a, b, &dir, "lap", Path::new("rel"), false, || unreachable!()).unwrap_err();
+        assert!(format!("{err:#}").contains("absolute"), "{err:#}");
     }
 }

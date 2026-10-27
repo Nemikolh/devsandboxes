@@ -53,7 +53,13 @@ for Instances when the last machine goes. Each keeps its own selected row.
 - **Machines**: one row per registered machine, in the snapshot's
   `machines` order (`SnapshotMachine`, `ui.rs` `draw_machines`): NAME,
   TARGET, STATE (`LinkState::as_str`, with `: <error>` when set), AGENT
-  (`on`/`off`), VERSION (`-` before a link). `a` flips the selected
+  (`on`/`off`), VERSION (`-` before a link), LEND (`on`/`drain`/`off`,
+  `-` without a report or a `lend.toml`: `capacity::lend_label`) and
+  CAPACITY (`ui.rs` `capacity_text`: `capacity::summary`, e.g. `8 cpu ·
+  12/32G · 120G free · 3 run`, then `over cap: mem 18G/16G` in yellow
+  when `capacity::over_caps` finds a soft cap exceeded), from the
+  machine's last snapshot's capacity report
+  ([../daemon/fleet.md](../daemon/fleet.md#capacity)). `a` flips the selected
   machine's `agent`: `App::toggle_selected_agent` queues it
   (`take_pending_machine_set`), the event loop hands it to the daemon
   worker (`Cmd::MachineSet`, `machines.set {name, agent}`), and the

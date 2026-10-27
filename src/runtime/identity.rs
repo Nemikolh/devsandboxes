@@ -10,6 +10,8 @@
 //! table-tested; running the commands and the canary, and applying the plan,
 //! belong to the callers (docs/architecture/runtimes.md, *Mode detection*).
 
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
 /// The user-namespace situation of a runtime context, as the probe found it.
@@ -174,6 +176,14 @@ struct DockerInfo {
     /// Only in newer CLIs' output.
     #[serde(rename = "ClientInfo", default)]
     client_info: Option<DockerClientInfo>,
+    /// The engine host's cpus and memory (a VM's, for a VM-backed engine).
+    #[serde(rename = "NCPU", default)]
+    ncpu: Option<u64>,
+    #[serde(rename = "MemTotal", default)]
+    mem_total: Option<u64>,
+    /// Where the engine keeps images and containers, on the engine host.
+    #[serde(rename = "DockerRootDir", default)]
+    root_dir: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -216,8 +226,7 @@ fn remote_endpoint(endpoint: Option<&str>) -> bool {
 /// `selinux` is `name=selinux` (the daemon's `selinux-enabled`; without it
 /// docker doesn't label containers and binds need no relabel).
 pub fn docker_fast_path(info: &str, endpoint: Option<&str>, linux_host: bool) -> anyhow::Result<FastPath> {
-    let info: DockerInfo = serde_json::from_str(info.trim())
-        .map_err(|e| anyhow::anyhow!("unexpected `docker info` output: {e}"))?;
+    let info = parse_docker_info(info)?;
     let options: Vec<&str> = info
         .security_options
         .iter()
@@ -225,15 +234,9 @@ pub fn docker_fast_path(info: &str, endpoint: Option<&str>, linux_host: bool) ->
         .filter_map(|o| o.split(',').find_map(|kv| kv.strip_prefix("name=")))
         .collect();
     let has = |name: &str| options.contains(&name);
-    let context = info.client_info.as_ref().map_or("", |c| c.context.as_str());
-    let vm = !linux_host
-        || VM_OPERATING_SYSTEMS.iter().any(|os| info.operating_system.contains(os))
-        || vm_name(&info.name)
-        || vm_name(context)
-        || endpoint.is_some_and(|e| VM_SOCKET_DIRS.iter().any(|d| e.contains(d)));
     let mode = if remote_endpoint(endpoint) {
         Err("DOCKER_HOST is a remote engine")
-    } else if vm {
+    } else if docker_vm(&info, endpoint, linux_host) {
         Ok(Mode::VmBacked)
     } else if has("rootless") {
         Ok(Mode::RootlessDocker)
@@ -245,11 +248,65 @@ pub fn docker_fast_path(info: &str, endpoint: Option<&str>, linux_host: bool) ->
     Ok(FastPath { mode, selinux: has("selinux") })
 }
 
+fn parse_docker_info(info: &str) -> anyhow::Result<DockerInfo> {
+    serde_json::from_str(info.trim()).map_err(|e| anyhow::anyhow!("unexpected `docker info` output: {e}"))
+}
+
+/// The engine runs in a VM: not Linux, or a VM marker ([`docker_fast_path`]).
+fn docker_vm(info: &DockerInfo, endpoint: Option<&str>, linux_host: bool) -> bool {
+    let context = info.client_info.as_ref().map_or("", |c| c.context.as_str());
+    !linux_host
+        || VM_OPERATING_SYSTEMS.iter().any(|os| info.operating_system.contains(os))
+        || vm_name(&info.name)
+        || vm_name(context)
+        || endpoint.is_some_and(|e| VM_SOCKET_DIRS.iter().any(|d| e.contains(d)))
+}
+
+/// What the runtime's metadata says about the engine host, for the daemon's
+/// capacity report (docs/architecture/daemon/fleet.md, *Capacity*).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EngineInfo {
+    pub cpus: Option<u64>,
+    /// Bytes.
+    pub mem_total: Option<u64>,
+    /// Where the engine keeps its images and containers, as the engine host
+    /// names it.
+    pub root_dir: Option<PathBuf>,
+    /// The engine runs on this host's own Linux kernel: local, no VM
+    /// marker, the same rule as the fast path's `VmBacked` and remote
+    /// checks. Only then are this host's free memory and `root_dir`'s disk
+    /// the engine's.
+    pub native: bool,
+}
+
+/// [`EngineInfo`] from `docker info --format '{{json .}}'` (`NCPU`,
+/// `MemTotal`, `DockerRootDir`); `endpoint` and `linux_host` as for
+/// [`docker_fast_path`]. Native: not remote and not a VM.
+pub fn docker_engine_info(info: &str, endpoint: Option<&str>, linux_host: bool) -> anyhow::Result<EngineInfo> {
+    let info = parse_docker_info(info)?;
+    let native = !remote_endpoint(endpoint) && !docker_vm(&info, endpoint, linux_host);
+    Ok(EngineInfo {
+        cpus: info.ncpu.filter(|n| *n > 0),
+        mem_total: info.mem_total.filter(|n| *n > 0),
+        root_dir: info.root_dir.filter(|d| !d.is_empty()).map(PathBuf::from),
+        native,
+    })
+}
+
 /// The fields of `podman info --format json` the fast path reads (podman's
 /// own lowerCamel keys under `host`).
 #[derive(Debug, Deserialize)]
 struct PodmanInfo {
     host: PodmanHost,
+    #[serde(default)]
+    store: PodmanStore,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PodmanStore {
+    #[serde(default)]
+    graph_root: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -261,6 +318,11 @@ struct PodmanHost {
     /// connection, `--remote`).
     #[serde(default)]
     service_is_remote: bool,
+    #[serde(default)]
+    cpus: Option<u64>,
+    /// Bytes.
+    #[serde(default)]
+    mem_total: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -282,11 +344,9 @@ struct PodmanSecurity {
 /// `selinux` is `host.security.selinuxEnabled`: podman labels containers
 /// whenever the engine host has SELinux on.
 pub fn podman_fast_path(info: &str, endpoint: Option<&str>, linux_host: bool) -> anyhow::Result<FastPath> {
-    let info: PodmanInfo = serde_json::from_str(info.trim())
-        .map_err(|e| anyhow::anyhow!("unexpected `podman info` output: {e}"))?;
+    let info = parse_podman_info(info)?;
     let host = info.host;
-    let local_socket = endpoint.is_some_and(|e| e.starts_with("unix://"));
-    let mode = if !linux_host || (host.service_is_remote && !local_socket) {
+    let mode = if podman_vm(&host, endpoint, linux_host) {
         Mode::VmBacked
     } else if host.security.rootless {
         Mode::RootlessPodman
@@ -294,6 +354,29 @@ pub fn podman_fast_path(info: &str, endpoint: Option<&str>, linux_host: bool) ->
         Mode::Rootful
     };
     Ok(FastPath { mode: Ok(mode), selinux: host.security.selinux_enabled })
+}
+
+fn parse_podman_info(info: &str) -> anyhow::Result<PodmanInfo> {
+    serde_json::from_str(info.trim()).map_err(|e| anyhow::anyhow!("unexpected `podman info` output: {e}"))
+}
+
+/// Not Linux, or a remote service not on a local `unix://` socket.
+fn podman_vm(host: &PodmanHost, endpoint: Option<&str>, linux_host: bool) -> bool {
+    let local_socket = endpoint.is_some_and(|e| e.starts_with("unix://"));
+    !linux_host || (host.service_is_remote && !local_socket)
+}
+
+/// [`EngineInfo`] from `podman info --format json` (`host.cpus`,
+/// `host.memTotal`, `store.graphRoot`). Native: what [`podman_fast_path`]
+/// doesn't call `VmBacked`.
+pub fn podman_engine_info(info: &str, endpoint: Option<&str>, linux_host: bool) -> anyhow::Result<EngineInfo> {
+    let info = parse_podman_info(info)?;
+    Ok(EngineInfo {
+        cpus: info.host.cpus.filter(|n| *n > 0),
+        mem_total: info.host.mem_total.filter(|n| *n > 0),
+        root_dir: info.store.graph_root.filter(|d| !d.is_empty()).map(PathBuf::from),
+        native: !podman_vm(&info.host, endpoint, linux_host),
+    })
 }
 
 /// The probe cache's key: the backend plus the runtime context it talks to,
@@ -955,6 +1038,50 @@ mod tests {
             assert!(fp(DOCKER_DESKTOP, Some(host), false).mode.is_err(), "{host}");
         }
         assert!(docker_fast_path("Cannot connect to the Docker daemon", None, true).is_err());
+    }
+
+    #[test]
+    fn docker_engine_info_reads_cpus_memory_and_root() {
+        let info = |text, endpoint, linux| docker_engine_info(text, endpoint, linux).unwrap();
+        assert_eq!(
+            info(DOCKER_ROOTFUL, None, true),
+            EngineInfo { cpus: Some(8), mem_total: Some(33363566592), root_dir: Some("/var/lib/docker".into()), native: true }
+        );
+        // Missing fields are unknown; native follows the fast path's VM and
+        // remote rules (a remapped daemon is still this host's kernel).
+        let rootless = info(DOCKER_ROOTLESS, Some("unix:///run/user/1000/docker.sock"), true);
+        assert_eq!((rootless.cpus, rootless.mem_total, rootless.native), (None, None, true));
+        assert_eq!(rootless.root_dir, Some("/home/dev/.local/share/docker".into()));
+        assert!(info(DOCKER_USERNS_REMAP, None, true).native);
+        assert_eq!(info(DOCKER_OLD, None, true).root_dir, None);
+        for vm in [DOCKER_DESKTOP, DOCKER_ORBSTACK, DOCKER_COLIMA] {
+            assert!(!info(vm, None, true).native, "{vm}");
+        }
+        assert!(!info(DOCKER_ROOTFUL, None, false).native, "off Linux");
+        assert!(!info(DOCKER_ROOTFUL, Some("tcp://10.0.0.5:2376"), true).native, "remote");
+        assert!(!info(DOCKER_ROOTFUL, Some("unix:///home/dev/.colima/default/docker.sock"), true).native);
+        let zero = DOCKER_ROOTFUL.replace("\"NCPU\":8", "\"NCPU\":0");
+        assert_eq!(info(&zero, None, true).cpus, None, "0 is unknown");
+        assert!(docker_engine_info("Cannot connect to the Docker daemon", None, true).is_err());
+    }
+
+    #[test]
+    fn podman_engine_info_reads_cpus_memory_and_graph_root() {
+        let with = PODMAN_ROOTLESS.replace("\"serviceIsRemote\":false", "\"serviceIsRemote\":false,\"cpus\":4,\"memTotal\":16471560192");
+        let info = podman_engine_info(&with, None, true).unwrap();
+        assert_eq!(
+            info,
+            EngineInfo {
+                cpus: Some(4),
+                mem_total: Some(16471560192),
+                root_dir: Some("/home/dev/.local/share/containers/storage".into()),
+                native: true
+            }
+        );
+        assert!(!podman_engine_info(PODMAN_MACHINE, None, true).unwrap().native);
+        assert!(podman_engine_info(PODMAN_MACHINE, Some("unix:///run/user/1000/podman/podman.sock"), true).unwrap().native);
+        assert!(!podman_engine_info(PODMAN_ROOTLESS, None, false).unwrap().native);
+        assert_eq!(podman_engine_info(r#"{"host":{}}"#, None, true).unwrap().root_dir, None);
     }
 
     #[test]

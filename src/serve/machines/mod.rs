@@ -114,7 +114,8 @@ impl Entry {
         Entry { name: name.into(), kind: Kind::Ssh { target: target.into() }, roots: Vec::new(), command: None, agent: false }
     }
 
-    /// An offered fleet worker as its first `fleet.offer` writes it.
+    /// An offered fleet worker with no roots (`fleet.offer` adds its fleet
+    /// root: `fleet::offer::accept`).
     pub fn offered(name: impl Into<String>) -> Entry {
         Entry { name: name.into(), kind: Kind::Offered, roots: Vec::new(), command: None, agent: false }
     }

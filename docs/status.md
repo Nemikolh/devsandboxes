@@ -277,8 +277,7 @@ limitation means editing this file in the same commit.
 - An offered fleet worker (fleet step 1b) answers quick calls and verbs
   only: `exec`, terminal tabs, forwards, the agent relay and every CLI
   re-run over ssh (`logs`/`inspect` on the CLI included; the dashboard's
-  work) refuse with "need fleet step 4". Its entry has no roots (so
-  `--machine` per-root commands and `--all` verbs on it fail).
+  work) refuse with "need fleet step 4".
   → [fleet](architecture/daemon/fleet.md#hub-side); `machines::offered_refusal`
 - A hub notices a worker that's back (its `fleet-link` socket bound again)
   only at its offered link's next retry, up to 30 s later: a re-offer of a
@@ -286,8 +285,14 @@ limitation means editing this file in the same commit.
   → [fleet](architecture/daemon/fleet.md#hub-mode); `fleet::offer::offer`
 - A worker's `drain` reaches its hub only in the offer of its next link
   (`lend on` ↔ `drain` keeps the current one), and nothing on the hub acts
-  on it until placement (step 3b; live lending state in the snapshot is
-  step 1g). → [fleet](architecture/daemon/fleet.md#lending-lend); `fleet::lender::transition`
+  on it until placement (step 3b); the capacity report's `lending` is
+  live, but nothing acts on it either. → [fleet](architecture/daemon/fleet.md#lending-lend); `fleet::lender::transition`
+- The capacity report's soft caps (`lend.toml` `[caps]`) are edited by
+  hand (no `lend` flag), and measured against the whole host's memory and
+  disk use, not what placed work takes; `cpus` caps nothing measured. The
+  report is built only while a root is watched, and an Apple `container`
+  host reports no cpus or memory.
+  → [fleet](architecture/daemon/fleet.md#capacity); `capacity::over_caps`
 - Under the worker policy a placed instance's plain `devsbd notify`
   messages (not threads, which need `inbox`) still reach the worker's
   Inbox and desktop.

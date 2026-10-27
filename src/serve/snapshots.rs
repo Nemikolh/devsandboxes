@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use super::api::InstancesList;
+use super::capacity::Capacity;
 use super::machines::{Entry, MachineKind};
 use crate::snapshot::{ContainerStatus, Depth, RuntimeView, Snapshot};
 
@@ -57,6 +58,8 @@ struct Inner {
     roots: BTreeMap<PathBuf, Root>,
     /// The last pass that asked for stats.
     last_stats: Option<Instant>,
+    /// This host's capacity, set by the poll before each collection.
+    capacity: Option<Value>,
 }
 
 /// One root's entry. Its rows are this host's; a machine's join here later,
@@ -98,8 +101,16 @@ impl Snapshots {
         watched.iter().filter(|d| !inner.roots.contains_key(*d)).cloned().collect()
     }
 
+    /// This host's capacity: every params [`collect`](Self::collect)
+    /// returns from now on carries it as `capacity` (one host-wide value,
+    /// the same in every root's snapshot).
+    pub fn set_capacity(&self, capacity: &Capacity) {
+        self.lock().capacity = serde_json::to_value(capacity).ok();
+    }
+
     /// Join each of `roots` against `view`, carry cpu/mem over a
-    /// listing-only pass, cache, and return each root's params to push.
+    /// listing-only pass, cache, and return each root's params to push
+    /// (with the [`set_capacity`](Self::set_capacity) value, if any).
     /// Every collection is returned, changed or not, so a watcher can judge
     /// staleness by arrival.
     pub fn collect(
@@ -120,7 +131,8 @@ impl Snapshots {
             carry_over(&mut list.snapshot, &prev);
             let usage = usage(&list.snapshot);
             let stats = list.snapshot.stats;
-            let Some(pushed) = params(dir, &list) else { continue };
+            let capacity = self.lock().capacity.clone();
+            let Some(pushed) = params_with(dir, &list, capacity) else { continue };
             let mut inner = self.lock();
             let had = inner.roots.get(dir).is_some_and(|r| r.stats);
             inner.roots.insert(dir.clone(), Root { pushed: Arc::clone(&pushed), usage, stats: had || stats });
@@ -137,8 +149,17 @@ impl Snapshots {
 /// `instances.snapshot`'s params: `{"dir", …InstancesList}`. `None` only if
 /// it won't serialize (it always does).
 pub fn params(dir: &Path, list: &InstancesList) -> Option<Arc<Value>> {
+    params_with(dir, list, None)
+}
+
+/// [`params`] plus `capacity` when there's one.
+fn params_with(dir: &Path, list: &InstancesList, capacity: Option<Value>) -> Option<Arc<Value>> {
     let mut value = serde_json::to_value(list).ok()?;
-    value.as_object_mut()?.insert("dir".into(), Value::String(dir.to_string_lossy().into_owned()));
+    let obj = value.as_object_mut()?;
+    obj.insert("dir".into(), Value::String(dir.to_string_lossy().into_owned()));
+    if let Some(capacity) = capacity {
+        obj.insert("capacity".into(), capacity);
+    }
     Some(Arc::new(value))
 }
 
@@ -206,6 +227,13 @@ pub struct Machine {
 }
 
 impl Machine {
+    /// Its host's capacity, from the first of its roots' pushed snapshots
+    /// that carries one (every root's is the same host's, pushed on the same
+    /// poll).
+    pub fn capacity(&self) -> Option<Capacity> {
+        self.roots.iter().find_map(|r| serde_json::from_value(self.rows.get(r)?.get("capacity")?.clone()).ok())
+    }
+
     /// Record the link's `state` and `error`; whether what's shown changed.
     /// A [`restored`](Self::restored) machine shows `unreachable` with the
     /// rows' time until the link connects; meanwhile `connecting` changes
@@ -308,6 +336,10 @@ pub struct SnapshotMachine {
     pub command: Option<String>,
     /// The registry's `agent`: this host's ssh-agent is relayed there.
     pub agent: bool,
+    /// Its host's capacity, from its last pushed snapshot (last known while
+    /// the link is down); `None` before one carried it.
+    #[serde(default)]
+    pub capacity: Option<Capacity>,
 }
 
 /// A `machines: true` watcher's `instances.snapshot`: `local` (a local
@@ -361,6 +393,7 @@ fn snapshot_machine(m: &Machine) -> SnapshotMachine {
         .iter()
         .find_map(|r| m.rows.get(r)?.get("runtime_name")?.as_str().map(str::to_string));
     SnapshotMachine {
+        capacity: m.capacity(),
         name: m.name.clone(),
         kind: m.kind,
         target: m.target.clone(),
@@ -542,10 +575,17 @@ pub(crate) mod tests {
         });
         let mut a = machine("a", &["/r/one", "/r/two"], LinkState::Connected);
         a.version = Some("0.6.1".into());
-        // Every root's snapshot lists all of the machine's instances.
+        // Every root's snapshot lists all of the machine's instances, and
+        // carries its host's capacity.
         let all = [("in-one", Some("/r/one")), ("in-two", Some("/r/two")), ("orphan", Some("/r/gone")), ("old", None)];
-        a.rows.insert("/r/one".into(), remote("/r/one", &all));
-        a.rows.insert("/r/two".into(), remote("/r/two", &all));
+        let capacity = Capacity { cpus: Some(8), running: 2, lending: Some(crate::serve::fleet::lend::State::On), ..Capacity::default() };
+        let with_capacity = |dir: &str| {
+            let mut p = (*remote(dir, &all)).clone();
+            p["capacity"] = serde_json::to_value(&capacity).unwrap();
+            Arc::new(p)
+        };
+        a.rows.insert("/r/one".into(), with_capacity("/r/one"));
+        a.rows.insert("/r/two".into(), with_capacity("/r/two"));
         // Down: its last rows stay, with its state.
         let mut b = machine("b", &["/b"], LinkState::Unreachable);
         b.error = Some("b: Connection refused".into());
@@ -572,15 +612,18 @@ pub(crate) mod tests {
         // The local rest as is: no remote thread_children.
         assert_eq!((&merged["dir"], &merged["runtime_name"]), (&serde_json::json!("/here"), &serde_json::json!("docker")));
         assert_eq!(merged["thread_children"], serde_json::json!({"local": {}}));
+        let cap = serde_json::to_value(&capacity).unwrap();
         assert_eq!(
             merged["machines"],
             serde_json::json!([
-                {"name": "a", "kind": "ssh", "target": "me@a", "state": "connected", "error": null, "version": "0.6.1", "runtime": "podman", "command": null, "agent": false},
-                {"name": "b", "kind": "ssh", "target": "me@b", "state": "unreachable", "error": "b: Connection refused", "version": null, "runtime": "podman", "command": null, "agent": false},
-                {"name": "c", "kind": "ssh", "target": "me@c", "state": "unreachable", "error": "c: Permission denied", "version": null, "runtime": null, "command": "~/bin/devsandbox", "agent": false},
-                {"name": "w", "kind": "offered", "target": null, "state": "idle", "error": null, "version": null, "runtime": null, "command": null, "agent": false},
+                {"name": "a", "kind": "ssh", "target": "me@a", "state": "connected", "error": null, "version": "0.6.1", "runtime": "podman", "command": null, "agent": false, "capacity": cap},
+                {"name": "b", "kind": "ssh", "target": "me@b", "state": "unreachable", "error": "b: Connection refused", "version": null, "runtime": "podman", "command": null, "agent": false, "capacity": null},
+                {"name": "c", "kind": "ssh", "target": "me@c", "state": "unreachable", "error": "c: Permission denied", "version": null, "runtime": null, "command": "~/bin/devsandbox", "agent": false, "capacity": null},
+                {"name": "w", "kind": "offered", "target": null, "state": "idle", "error": null, "version": null, "runtime": null, "command": null, "agent": false, "capacity": null},
             ])
         );
+        crate::serve::dts::assert_matches("SnapshotMachine", &merged["machines"][0]);
+        crate::serve::dts::assert_matches("Capacity", &merged["machines"][0]["capacity"]);
         // No machines: the local params plus an empty `machines`.
         let alone = merge(&local, &[]);
         let mut want = local.clone();
@@ -673,11 +716,21 @@ pub(crate) mod tests {
         assert_eq!(pushed[0].1["instances"][0]["cpu"], "5%");
         assert!(!cache.stats_due(&both, first.at + Duration::from_secs(2)));
 
-        // A listing-only tick still pushes, cpu carried.
+        assert!(pushed[0].1.get("capacity").is_none(), "no capacity set yet");
+
+        // A listing-only tick still pushes, cpu carried; with this host's
+        // capacity in every root's params.
+        let capacity = Capacity { cpus: Some(4), running: 1, ..Capacity::default() };
+        cache.set_capacity(&capacity);
         let pushed = cache.collect(&view(Depth::Listing), &both, &join);
         assert_eq!(pushed.len(), 2);
         assert_eq!(pushed[1].1["instances"][0]["cpu"], "5%");
         assert_eq!(cache.cached(&b).unwrap()["instances"][0]["cpu"], "5%");
+        for (_, p) in &pushed {
+            assert_eq!(p["capacity"], serde_json::to_value(&capacity).unwrap());
+        }
+        assert_eq!(cache.cached(&a).unwrap()["capacity"]["cpus"], 4);
+        crate::serve::dts::assert_matches("Capacity", &pushed[0].1["capacity"]);
 
         // A new root has never had stats: due at once.
         let c = PathBuf::from("/cfg/c");

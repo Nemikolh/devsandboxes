@@ -282,6 +282,7 @@ pub(crate) mod tests {
             runtime: None,
             command: None,
             agent: false,
+            capacity: None,
         }
     }
 

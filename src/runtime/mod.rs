@@ -363,6 +363,12 @@ pub trait Backend: Send + Sync {
     /// detection*). stderr is captured.
     fn identity_fast_path(&self) -> Result<identity::FastPath>;
 
+    /// The engine host's cpus, memory and data root, and whether it is this
+    /// host's own kernel (the daemon's capacity report,
+    /// docs/architecture/daemon/fleet.md, *Capacity*): the same `info` the
+    /// fast path reads. stderr is captured.
+    fn engine_info(&self) -> Result<identity::EngineInfo>;
+
     /// The identity probe's canary: from `image` (local, never pulled), with
     /// host dir `dir` (empty, writable by any uid) bound in, write one file
     /// as uid 0 and one as uid [`identity::ASSUMED`], then `stat` both on the

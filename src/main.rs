@@ -384,6 +384,9 @@ enum Command {
         /// The worker's machine name: names the socket and its offered entry
         #[arg(long)]
         worker: String,
+        /// The worker's canonical fleet root: its offered entry's one root
+        #[arg(long)]
+        root: PathBuf,
         /// The worker's lending is `drain`: it takes no new work
         #[arg(long)]
         drain: bool,
@@ -828,7 +831,7 @@ fn main() -> Result<()> {
         #[cfg(unix)]
         Command::AgentRelay { client } => commands::agent_relay::agent_relay(&client),
         #[cfg(unix)]
-        Command::FleetLink { worker, drain } => commands::fleet_link::fleet_link(&worker, drain),
+        Command::FleetLink { worker, root, drain } => commands::fleet_link::fleet_link(&worker, &root, drain),
         #[cfg(unix)]
         Command::Machine { cmd } => match cmd {
             MachineCommand::Add { target, name, configs, agent, auto_install } => {
@@ -884,6 +887,8 @@ mod tests {
     use super::{rm_branch_flag, Cli, Command};
     #[cfg(unix)]
     use super::{FleetCommand, LendCommand};
+    #[cfg(unix)]
+    use std::path::Path;
 
     fn rm_flag(args: &[&str]) -> Result<Option<bool>, clap::Error> {
         let cli = Cli::try_parse_from(["devsandbox", "rm", "web"].iter().chain(args))?;
@@ -930,10 +935,11 @@ mod tests {
         assert_eq!(fleet(&["fleet", "leave"]), FleetCommand::Leave);
         assert!(parse(&["fleet", "join"]).is_err(), "a hub is required");
         assert!(parse(&["fleet"]).is_err());
-        match parse(&["fleet-link", "--worker", "lap", "--drain"]).unwrap().command {
-            Some(Command::FleetLink { worker, drain }) => assert!(worker == "lap" && drain),
+        match parse(&["fleet-link", "--worker", "lap", "--root", "/d/fleet/hub", "--drain"]).unwrap().command {
+            Some(Command::FleetLink { worker, root, drain }) => assert!(worker == "lap" && root == Path::new("/d/fleet/hub") && drain),
             _ => panic!("not fleet-link"),
         }
+        assert!(parse(&["fleet-link", "--worker", "lap"]).is_err(), "a root is required");
     }
 
     /// `exec`'s (attach, sessions, session, name, command).

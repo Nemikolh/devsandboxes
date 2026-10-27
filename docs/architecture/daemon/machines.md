@@ -31,7 +31,8 @@ an ssh-config alias, or `ssh://[user@]host[:port]`) for a machine this host
 sshes to (`Kind::Ssh`), or `offered = true` and no `target` for a fleet
 worker that dialed this host (`Kind::Offered`, written by `fleet.offer`:
 [fleet](fleet.md#hub-side)); exactly one of the two. Then `roots`
-(remote config roots, as the remote canonicalized them), an optional
+(remote config roots, as the remote canonicalized them; an offered
+machine's one root is the fleet root its offer names), an optional
 `command` (remote devsandbox as shell text, default `devsandbox`; no
 `machine add` flag: `machine add` sets it to `~/.local/bin/devsandbox`
 when it installs there off the login `PATH` (see
@@ -231,7 +232,8 @@ gets every push merged with each machine's rows (`snapshots::merge`): rows
 gain `machine` and keep their remote `root`, and a top-level `machines`
 array carries each machine's `name`, `kind` (`ssh` | `offered`), `target`
 (`null` for an offered one), `state`, `error`, `version`, `command`,
-`runtime`, `agent`. A machine's push or state change re-publishes those
+`runtime`, `agent`, `capacity` (its host's
+[capacity report](fleet.md#capacity), from its last push). A machine's push or state change re-publishes those
 watchers' roots from the last local params. Details:
 [host-poll.md](host-poll.md#snapshots).
 
@@ -416,8 +418,10 @@ expanded with the remote home, canonicalized, config loaded). `add
 refused. `set <name> --agent on|off` (`machines.set`; `--agent` is
 required) changes it on a registered machine and prints `<name>: agent
 on|off`; on is refused for an offered machine. `ls` shows it in an `AGENT`
-column, and `offered` as an offered machine's `TARGET`. `rm` forgets the
-machine.
+column, and `offered` as an offered machine's `TARGET`; `LEND` and
+`CAPACITY` are the machine's last [capacity report](fleet.md#capacity)
+(`machines.list`'s `capacity`, `-` before one came), the over-cap note in
+parentheses. `rm` forgets the machine.
 
 ## Dashboard
 
@@ -437,7 +441,8 @@ VS Code on a remote row answers "isn't supported yet". The Machines tab,
 listed while a machine is registered, shows every registered machine from
 the snapshot's `machines` with its target (dimmed `offered` for an offered
 fleet worker, whose terminal tabs and forwards say why they can't open),
-link state (and error) and `agent`;
+link state (and error), `agent`, and its LEND and CAPACITY
+([capacity](fleet.md#capacity));
 `a` flips the selected one's `agent` with `machines.set` (no prompt; a
 down machine's too, it's a registry write), and the row follows with the
 next push, which the reload triggers

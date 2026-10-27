@@ -8,7 +8,8 @@ worker's link: on the hub the offer, the offered registry entry and its
 dial, and [hub mode](#hub-mode); on the worker `lend.toml`, the lending thread, the lent API, the
 worker policy and `lend.*` with its CLI, `devsandbox lend` and
 `devsandbox fleet join|leave`
-([ADR 0041](../../decisions/0041-fleet-workers-dial-their-hub.md)).
+([ADR 0041](../../decisions/0041-fleet-workers-dial-their-hub.md)); and
+every daemon's [capacity report](#capacity), carried by its snapshots.
 
 Code: `src/serve/fleet/mod.rs` (`LINK`), `src/serve/fleet/link.rs`
 (`Spec`, `opener`, `answerer`, `End`, `write_sentinel`,
@@ -29,7 +30,14 @@ Code: `src/serve/fleet/mod.rs` (`LINK`), `src/serve/fleet/link.rs`
 `filter_answer`, `filter_snapshot`), `src/serve/daemon.rs`
 (`start_lending`, `Table`, `Shared::open_lent`), `src/worker_policy.rs`
 (`Allow`, `Policy`, `fleet_root_of`, `load_allow`, `enforce`,
-`enforce_argv`, `Refusal`).
+`enforce_argv`, `Refusal`); capacity: `src/serve/capacity.rs`
+(`Capacity`, `Caps`, `HostFacts`, `EngineCache`, `parse_meminfo`,
+`parse_size`, `over_caps`, `over_note`, `summary`, `lend_label`),
+`src/runtime/identity.rs` (`EngineInfo`, `docker_engine_info`,
+`podman_engine_info`), `Backend::engine_info`, `src/serve/host.rs`
+(`poll`, `running_instances`), `src/serve/snapshots.rs`
+(`Snapshots::set_capacity`, `Machine::capacity`,
+`SnapshotMachine::capacity`), `src/serve/fleet/lend.rs` (`SoftCaps`).
 
 ## Link
 
@@ -89,20 +97,21 @@ says its hello) works on it unchanged.
 ## Hub side
 
 A worker dials its hub: its daemon holds `ssh -T -o BatchMode=yes <hub>
-devsandbox fleet-link --worker <name>` ([Worker side](#worker-side)). The
+devsandbox fleet-link --worker <name> --root <fleet root>` ([Worker side](#worker-side)). The
 hub never dials the worker; everything it does there goes over that
 link's `API` streams.
 
-- **`devsandbox fleet-link --worker <name>`** (hidden,
+- **`devsandbox fleet-link --worker <name> --root <path>`** (hidden,
   `commands::fleet_link`) is the opener of `fleet::LINK` on the hub. The
-  name must pass `machines::check_name`. It binds
+  name must pass `machines::check_name`, the root (the worker's canonical
+  fleet root, a path on the worker) must be absolute. It binds
   `endpoint::fleet_socket`: `<socket dir>/fleet-<name>.sock` (0600 in the
   0700 socket dir, the name cut as an agent relay socket's client is), so
   the newest link for a worker wins. Its `on_ready` connects to this host's
   daemon (`client::connect`, which starts one like any client does when
-  none runs) and sends `fleet.offer {worker, version, draining}`, `version`
-  the worker's `Hello`, `draining` its `--drain` (the worker's `lend` was
-  `drain` when it dialed). A refused offer ends the link with `offer refused:
+  none runs) and sends `fleet.offer {worker, version, root, draining}`,
+  `version` the worker's `Hello`, `root` its `--root`, `draining` its
+  `--drain` (the worker's `lend` was `drain` when it dialed). A refused offer ends the link with `offer refused:
   <why>` (on its stderr, which the worker's ssh keeps). It holds that
   daemon connection for the link's life, so a linked worker is a `clients`
   holder of the hub's daemon. `serve::machines::cli::machine_use` refuses
@@ -111,14 +120,21 @@ link's `API` streams.
   typings) is accepted only by a hub: `[serve] hub = true` in
   `daemon.config.toml` (`ServeConfig::hub`, read once at start into
   `daemon::Options::hub`); anything else is `denied`. `accept` (pure)
-  adds an offered entry for a new name, keeps an existing offered one, and
-  refuses (`denied`) a name an ssh machine has. A new entry reloads the
-  machine links (`service::Handle::reload`), which start a link thread for
-  it; the offer is logged with the worker's version and whether it's
+  adds an offered entry for a new name with the offer's `root` as its one
+  root, keeps an existing offered one (its root replaced when the offer
+  names another: `Offered::Updated`), and refuses (`denied`) a name an ssh
+  machine has. A new or changed entry reloads the machine links
+  (`service::Handle::reload`), which start (or restart) its link thread;
+  the offer is logged with the worker's version, root and whether it's
   draining (nothing on the hub acts on that yet).
-- **An offered entry** is `[machine.<name>]` with `offered = true` and no
-  `target` in `machines.toml` (`machines::Kind::Offered`,
-  [Registry](machines.md#registry-machinestoml)). Its roots are empty.
+- **An offered entry** is `[machine.<name>]` with `offered = true`, no
+  `target`, and `roots` the worker's fleet root in `machines.toml`
+  (`machines::Kind::Offered`,
+  [Registry](machines.md#registry-machinestoml)). Its link watches that
+  root while a federated watch wants it, as an ssh machine's watches its
+  roots (`service.rs` `LinkLoop::watch`), and its rows merge into
+  federated snapshots the same way (`snapshots::merge`); the
+  [Worker table](#the-worker-table) confines the watch to the fleet root.
 - **The dial** (`fleet::offer::dial`, wrapped around whatever reaches ssh
   machines when `daemon::run` builds its `Dial`): for an offered entry, a
   connection to its `fleet-<name>.sock` in the daemon's socket dir as a
@@ -195,6 +211,63 @@ keeps it running) makes the daemon a hub:
   (rows from Oct 27 12:00 UTC)`, or the link's failure with the same
   suffix), and ignores `connecting` meanwhile, until their link connects.
 
+## Capacity
+
+Every daemon reports its host's capacity in its snapshots (fleet plan
+decision 8; wire: [Capacity](../../reference/api.md#capacity)), what
+placement (plan step 3b) will score against. The host poll
+(`host.rs` `poll`) builds one `capacity::Capacity` per tick while a root
+is watched (`Capacity::build`, pure) and hands it to the snapshot cache
+(`Snapshots::set_capacity`), which puts it top-level in every root's
+`instances.snapshot` params it collects next. Nothing is built while
+nothing is watched; a new watch's first, disk-depth push has none.
+
+- **`cpus`, `mem_total`**: the runtime's `info`
+  (`Backend::engine_info`: `docker info`'s `NCPU` / `MemTotal`,
+  `identity::docker_engine_info`; podman's `host.cpus` / `host.memTotal`,
+  `identity::podman_engine_info`; unknown on Apple `container`), the same
+  output the identity probe's fast path reads. Asked at most every
+  `capacity::ENGINE_TTL` (60 s, `EngineCache::get`, pure over `Instant`s;
+  a failed call keeps the last answer and waits out the same interval). A
+  VM-backed engine reports its VM.
+- **Native Linux** (`EngineInfo::native`): the engine runs on this host's
+  own kernel, by the fast path's own rules: Linux, no remote endpoint
+  (`tcp://`, `ssh://`), no VM marker (Docker Desktop, OrbStack, Rancher
+  Desktop, colima/lima names or contexts, a VM's socket path; for podman,
+  no remote service off a local `unix://` socket). Only then does
+  `HostFacts::read` add `mem_available` (`/proc/meminfo` `MemAvailable`,
+  `capacity::parse_meminfo`) and `disk_free` / `disk_total` (`statvfs` of
+  the runtime's data root, `DockerRootDir` / podman's `store.graphRoot`,
+  when it exists here); otherwise they are unknown.
+- **`running`**: the instances in `state.toml` whose container the
+  poll's listing has running (`host.rs` `running_instances`; services
+  and strays don't count), every instance on the host, the fleet root's
+  or not.
+- **`lending` and `caps`**: `lend.toml`'s `state` (none without a
+  `lend.toml`) and its `[caps]` in bytes (`Caps::of`; none when no cap is
+  set), read through the daemon's `Lender::file` on each tick, so a hand
+  edit shows on the next poll.
+
+**Soft caps never refuse.** `capacity::over_caps` (pure) lists what
+exceeds one: memory in use (`mem_total - mem_available`) over `mem`,
+disk in use (`disk_total - disk_free`) over `disk`, `running` over
+`instances`; `cpus` caps no use (none is reported), and an item whose use
+is unknown is never over. `over_note` makes the text, `over cap: mem
+18G/16G`.
+
+**A machine's capacity** is the one its own snapshots carry: the link
+stores each pushed root's params (`service.rs` `LinkLoop::store`), and
+`Machine::capacity` takes the first of its roots' that has one, into
+`SnapshotMachine::capacity` (federated snapshots) and `machines.list`'s
+`capacity`; last known while the link is down, and restored with a hub's
+`remotes.json` rows. A worker's comes through its offered root
+([Hub side](#hub-side)); the Worker table's snapshot filter
+(`lent::filter_snapshot`) leaves it as is. The dashboard's Machines tab
+and `devsandbox machine ls` show it as LEND (`capacity::lend_label`:
+`on`, `drain`, `off`, `-`) and CAPACITY (`capacity::summary`: `8 cpu ·
+12/32G · 120G free · 3 run`, memory in use / total, then the over-cap
+note).
+
 ## Worker side
 
 A worker lends itself to one hub, through `lend.toml`; the hub reaches
@@ -206,8 +279,13 @@ lent API ([ADR 0041](../../decisions/0041-fleet-workers-dial-their-hub.md)).
   `state` (`on` | `off` | `drain`; absent is `off`), `hub` (the hub's ssh
   target, as `machine add` takes one), `name` (what this host offers itself
   as; absent is the hostname's first label, `lend::default_name`, which
-  must pass `machines::check_name`) and an `[allow]` table, the
-  [worker policy](#worker-policy)'s allowances. Unknown keys are ignored. `lend::load`
+  must pass `machines::check_name`), an `[allow]` table, the
+  [worker policy](#worker-policy)'s allowances, and a `[caps]` table, the
+  soft caps of the [capacity report](#capacity) (`lend::SoftCaps`:
+  `cpus`, `mem`, `disk`, `instances`, each optional; `mem` and `disk`
+  sizes like `16G`, checked by `capacity::parse_size`). Unknown keys are
+  ignored. `[allow]` and `[caps]` are edited by hand: `lend.set` changes
+  neither. `lend::load`
   reads it (missing is not lending); `lend::check`: lending (`on`/`drain`)
   requires a `hub`, and a `hub` or `name` that's set must be valid. The
   daemon reads it at start (`daemon::start_lending`, `Lender::start`;
@@ -225,7 +303,8 @@ lent API ([ADR 0041](../../decisions/0041-fleet-workers-dial-their-hub.md)).
 - **The lending thread** (`fleet::worker::Lending`, `serve-lend`) runs
   while the file says `on` or `drain`. It spawns `link_argv`'s `ssh -T -o
   BatchMode=yes [-p N] -- <hub> <devsandbox fleet-link --worker <name>
-  [--drain]>` (`--drain` while `drain`, read at each dial)
+  --root <fleet root> [--drain]>` (the canonical fleet root; `--drain`
+  while `drain`, read at each dial)
   (through the hub's login shell, `ssh::target_argv`, the builder every
   machine argv uses, here without a registry entry) and runs
   `link::answerer` of `fleet::LINK` on its stdio. A link that ends (the
@@ -271,8 +350,8 @@ at once, without watching the file. Never on a `Worker` connection
   pair keeps the thread and its link and sets what the next dial offers,
   so `on` ↔ `drain` never drops what's placed here. It answers the
   `LendInfo` after the change. A daemon that's exiting answers `failed`.
-- **`drain`** is recorded, shown by `lend.get` and offered (`--drain`);
-  nothing places work yet (fleet plan step 3), so it changes nothing else.
+- **`drain`** is recorded, shown by `lend.get`, offered (`--drain`) and
+  reported as the [capacity](#capacity)'s `lending`; nothing places work yet (fleet plan step 3), so it changes nothing else.
 
 The CLI (`commands::lend`) is a client of these two, through the daemon
 (started like any client does), never in-process; `--machine` refuses

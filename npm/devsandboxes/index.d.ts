@@ -142,6 +142,8 @@ export interface InstancesList extends Snapshot {
 export interface InstancesSnapshot extends InstancesList {
   /** The config root, as `instances.watch` named it. */
   dir: string;
+  /** This host's capacity, the same in every root's snapshot; absent from a new watch's first (disk-only) push. */
+  capacity?: Capacity;
   /**
    * With `instances.watch`'s `machines`: every registered machine, sorted by
    * name. The rows then include each machine's (tagged `machine`), last known
@@ -176,6 +178,38 @@ export interface SnapshotMachine {
   command: string | null;
   /** This host's ssh-agent is relayed to it (`machines.set`). */
   agent: boolean;
+  /** Its host's capacity, from its last snapshot (last known while not `connected`); `null` before one carried it. */
+  capacity: Capacity | null;
+}
+
+/**
+ * A host's capacity report (fleet). Sizes in bytes; `null` is unknown. Free memory and disk are
+ * reported for a native Linux engine only (a VM-backed engine's are the VM's, not known here).
+ */
+export interface Capacity {
+  /** The engine host's cpus (a VM's, for a VM-backed engine). */
+  cpus: number | null;
+  mem_total: number | null;
+  /** `MemAvailable` of `/proc/meminfo`. */
+  mem_available: number | null;
+  /** Free on the filesystem of the runtime's data root. */
+  disk_free: number | null;
+  /** That filesystem's size. */
+  disk_total: number | null;
+  /** Instances whose container runs. */
+  running: number;
+  /** `lend.toml`'s `state`; `null` without a `lend.toml`. */
+  lending: LendState | null;
+  /** `lend.toml`'s soft caps; `null` when none is set. */
+  caps: Caps | null;
+}
+
+/** Soft caps from `lend.toml`'s `[caps]` (sizes in bytes): never enforced; over one is a note. */
+export interface Caps {
+  cpus: number | null;
+  mem: number | null;
+  disk: number | null;
+  instances: number | null;
 }
 
 /**
@@ -824,6 +858,8 @@ export interface MachineRow {
   error: string | null;
   /** The machine's devsandbox semver, once reached. */
   version: string | null;
+  /** Its host's capacity, from its last snapshot; `null` before one carried it. */
+  capacity: Capacity | null;
 }
 
 /** Whether this host lends itself to a fleet hub: `drain` keeps the link but takes no new work. */

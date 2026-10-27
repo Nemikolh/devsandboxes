@@ -119,6 +119,9 @@ A client that shows a config root continuously sends `instances.watch
 {dir, machines?}` (after `subscribe` to `instances`). While at least one
 connection watches anything, each pass:
 
+- builds this host's capacity report (`Snapshots::set_capacity`;
+  the runtime's `info` at most once a minute,
+  [fleet.md](fleet.md#capacity)), carried by every root's push;
 - asks for stats (`<runtime> stats --no-stream`, the expensive call) when
   `stats_due`: at most every `STATS_INTERVAL` (7 s), at once for a root
   that never had them. A newly watched root is pushed first without stats

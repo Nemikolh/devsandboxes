@@ -1097,7 +1097,7 @@ mod tests {
         assert_eq!(s["dir"], local_root.to_str().unwrap());
         assert_eq!(
             s["machines"],
-            json!([{"name": "box", "kind": "ssh", "target": "me@box", "state": "connected", "error": null, "version": "0.6.0", "runtime": "Disk", "command": null, "agent": false}])
+            json!([{"name": "box", "kind": "ssh", "target": "me@box", "state": "connected", "error": null, "version": "0.6.0", "runtime": "Disk", "command": null, "agent": false, "capacity": null}])
         );
         crate::serve::dts::assert_matches("InstancesSnapshot", &s);
         crate::serve::dts::assert_matches("SnapshotMachine", &s["machines"][0]);

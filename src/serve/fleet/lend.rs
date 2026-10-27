@@ -56,6 +56,41 @@ pub struct Lend {
     /// The worker policy's allowances (`worker_policy`, which reads them
     /// itself from this file).
     pub allow: Allow,
+    /// Soft caps, reported in this host's capacity
+    /// (`serve::capacity::Capacity::caps`); never enforced.
+    #[serde(skip_serializing_if = "SoftCaps::is_empty")]
+    pub caps: SoftCaps,
+}
+
+/// `[caps]`: what this host means to lend (fleet plan, *Placement*). All
+/// optional; sizes as `16G`, `512M`, `1.5T` (binary units) or bytes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SoftCaps {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpus: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mem: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instances: Option<u64>,
+}
+
+impl SoftCaps {
+    pub fn is_empty(&self) -> bool {
+        *self == SoftCaps::default()
+    }
+
+    /// `mem` and `disk` must be sizes.
+    pub fn check(&self) -> Result<()> {
+        for (key, size) in [("mem", &self.mem), ("disk", &self.disk)] {
+            if let Some(size) = size {
+                crate::serve::capacity::parse_size(size).with_context(|| format!("`caps.{key}`"))?;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Lend {
@@ -95,6 +130,7 @@ pub fn check(lend: &Lend) -> Result<()> {
     if !lend.name.is_empty() {
         check_name(&lend.name).context("`name`")?;
     }
+    lend.caps.check()?;
     lend.allow.check()
 }
 
@@ -179,7 +215,7 @@ mod tests {
     #[test]
     fn parses() {
         let l = parse("state = \"on\"\nhub = \"me@hub\"\nname = \"lap\"\n[allow]\n").unwrap();
-        assert_eq!(l, Lend { state: State::On, hub: "me@hub".into(), name: "lap".into(), allow: Allow::default() });
+        assert_eq!(l, Lend { state: State::On, hub: "me@hub".into(), name: "lap".into(), ..Default::default() });
         let a = parse("[allow]\nprivileged = true\nbinds = [\"/srv/x\"]\nlater = true\n").unwrap().allow;
         assert_eq!(a, Allow { privileged: true, binds: vec!["/srv/x".into()], ..Default::default() });
         assert!(parse("[allow]\nbinds = [\"x\"]\n").is_err(), "binds are absolute");
@@ -196,6 +232,14 @@ mod tests {
         assert!(parse("state = \"on\"\nhub = \"-oProxyCommand=x\"\n").is_err());
         assert!(parse("state = \"on\"\nhub = \"h\"\nname = \"a/b\"\n").is_err());
         assert!(parse("state = \"maybe\"\n").is_err());
+        // Soft caps: sizes checked, unset ones left out of the file.
+        let caps = parse("[caps]\ncpus = 4\nmem = \"16G\"\ninstances = 3\n").unwrap().caps;
+        assert_eq!(caps, SoftCaps { cpus: Some(4), mem: Some("16G".into()), disk: None, instances: Some(3) });
+        assert_eq!(serialize(&Lend { caps, ..Default::default() }).unwrap(), "state = \"off\"\n\n[allow]\n\n[caps]\ncpus = 4\nmem = \"16G\"\ninstances = 3\n");
+        assert!(!serialize(&Lend::default()).unwrap().contains("caps"));
+        let bad = parse("[caps]\ndisk = \"lots\"\n").unwrap_err();
+        assert!(format!("{bad:#}").contains("caps.disk"), "{bad:#}");
+        assert!(parse("[caps]\ncpus = -1\n").is_err());
         // A hub kept while off must still be a target.
         assert!(parse("state = \"off\"\nhub = \"hub\"\n").is_ok());
         assert!(parse("state = \"off\"\nhub = \"-oProxyCommand=x\"\n").is_err());

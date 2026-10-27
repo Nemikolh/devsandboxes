@@ -13,7 +13,10 @@
 //! `forwardPorts` follow it). Then, while a dashboard watches a config root
 //! ([`Observers`], `instances.watch`), it asks for stats when due and joins
 //! every watched root against that one listing (`snapshots.rs`), each
-//! snapshot handed to the daemon to push. The poll also owns the runtime's
+//! snapshot handed to the daemon to push, with this host's capacity report
+//! (`capacity.rs`: the runtime's `info` at most every
+//! `capacity::ENGINE_TTL`, free memory and disk, the running instances,
+//! `lend.toml`). The poll also owns the runtime's
 //! event stream ([`EventWatcher`], `events.rs`): each relevant container
 //! event wakes it at once. The sleep is [`tick`]:
 //! [`snapshots::LISTING_INTERVAL`] while anything is watched, else
@@ -37,7 +40,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+use super::capacity::{Capacity, EngineCache, HostFacts};
 use super::events::{EVENTS_RETRY, EventWatcher};
+use super::fleet::lend::Lend;
 use super::snapshots::{self, Join, Snapshots};
 use crate::devsbd::bridge::{self, BridgeBoard, Bridges, OnShown, Readiness};
 use crate::runtime::{ContainerRow, NAME_PREFIX};
@@ -67,6 +72,9 @@ pub struct Observers {
     /// Each watched root's snapshot (`instances.snapshot` params), every
     /// tick; it must not block.
     pub on_snapshot: Box<dyn Fn(&Path, Arc<Value>) + Send>,
+    /// `lend.toml` now (`None`: none), for the capacity report's lending
+    /// state and soft caps.
+    pub lend: Box<dyn Fn() -> Option<Lend> + Send>,
 }
 
 /// What the poll thread sleeps on: stop, containers a client asked a
@@ -262,6 +270,9 @@ fn poll(
     let mut down = false;
     let mut last: Vec<String> = Vec::new();
     let mut urgent: Vec<(String, u64)> = Vec::new();
+    let mut engine = EngineCache::default();
+    // Instances running as of the last listing that loaded with its state.
+    let mut running_count = 0;
     loop {
         // Quiet: the backend captures stderr.
         let listing = rt.list(true, NAME_PREFIX);
@@ -280,6 +291,7 @@ fn poll(
                 // runtime being down.
                 if let Ok(state) = State::load() {
                     live.store(live_instances(&running, &state, expects_host), Ordering::Release);
+                    running_count = running_instances(&running, &state);
                 }
                 on_running(&running);
                 worker.send(running, std::mem::take(&mut urgent));
@@ -300,6 +312,11 @@ fn poll(
                     (observers.on_snapshot)(&dir, params);
                 }
             };
+            // The capacity report rides every root's snapshot: only built
+            // while someone watches.
+            let info = engine.get(Instant::now(), || rt.engine_info());
+            let lend = (observers.lend)();
+            observers.cache.set_capacity(&Capacity::build(info, HostFacts::read(info), running_count, lend.as_ref()));
             let due = listing.is_ok() && observers.cache.stats_due(&watched, Instant::now());
             let mut view = RuntimeView::from_parts(rt, Some(listing), None);
             if due {
@@ -371,6 +388,12 @@ fn live_instances(running: &[String], state: &State, expects: impl Fn(&str) -> b
         .iter()
         .filter(|(key, info)| running.contains(&info.container) && expects(key))
         .count()
+}
+
+/// The capacity report's `running`: instances in `state` whose container is
+/// in `running` (services and strays aren't instances).
+fn running_instances(running: &[String], state: &State) -> usize {
+    live_instances(running, state, |_| true)
 }
 
 /// Every distinct config root recorded in `state`, sorted. Instances from
@@ -463,6 +486,9 @@ mod tests {
         assert_eq!(live_instances(&running(&["devsandbox-disp-pr-1", "devsandbox-old"]), &s, dispatchers), 0);
         // A running container no state entry knows: not a holder.
         assert_eq!(live_instances(&running(&["devsandbox-stray"]), &s, |_| true), 0);
+        // The capacity report counts every running instance.
+        let all = running(&["devsandbox-disp", "devsandbox-disp-pr-1", "devsandbox-old", "devsandbox-svc-pg"]);
+        assert_eq!(running_instances(&all, &s), 3);
     }
 
     #[test]

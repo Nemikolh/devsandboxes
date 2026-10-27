@@ -312,6 +312,29 @@ every registered machine's rows, plus a top-level `machines`, and the
 machine links stay up while such a watch lasts (*Machines*, *Federated
 snapshots*). Re-watching with another `machines` switches the variant.
 
+Every push from the poll carries this host's `capacity` at the top level
+(the same in every root's; the first `disk`-depth push of a new watch has
+none), and each `machines` entry its machine's, from that machine's last
+push (`null` before one carried it):
+
+#### Capacity
+
+```json
+{"cpus": 8, "mem_total": 34359738368, "mem_available": 21474836480,
+ "disk_free": 128849018880, "disk_total": 536870912000, "running": 3,
+ "lending": "on", "caps": {"cpus": null, "mem": 17179869184, "disk": null, "instances": 4}}
+```
+
+Sizes in bytes; `null` is unknown. `cpus` and `mem_total` are the
+runtime's (`docker info` `NCPU` / `MemTotal`, podman's `host.cpus` /
+`host.memTotal`; a VM-backed engine's VM), asked at most once a minute.
+`mem_available` (`/proc/meminfo` `MemAvailable`) and `disk_free` /
+`disk_total` (the filesystem of the runtime's data root) only for a
+native Linux engine, else `null`. `running`: instances whose container
+runs. `lending`: `lend.toml`'s `state` (`null` without one); `caps` its
+`[caps]` soft caps (`null` when none is set): never enforced, over one is
+a note ([fleet.md](../architecture/daemon/fleet.md#capacity)).
+
 Errors: `invalid` (missing or relative `dir`; watch without the
 `instances` subscription), `not-found` (watch of a missing directory;
 unwatch only needs `dir` absolute).
@@ -912,7 +935,7 @@ and `sandboxes: []`; the call itself fails only as `internal`, when
 |---|---|---|---|
 | `machines.probe` | `{"target", "command"?}` (`command`: the machine's devsandbox as shell text, default `devsandbox`) | `{"version", "protocol", "roots": […]}`: the machine's devsandbox and its `roots.list` | `invalid` (bad target, empty `command`), `failed` (ssh, the hello or the protocol) |
 | `machines.add` | `{"target", "name"?, "roots": […], "agent"?, "command"?}` (`agent` default `false`; `command` as `probe`'s, saved as the machine's) | `{"name", "roots", "version", "warning"}`: `roots` as saved (the machine's canonical paths, deduplicated), `warning` set when its semver differs from ours | `invalid` (bad target or name, a name taken, no `roots`, empty `command`, a root the machine refuses: each one's reason), `failed` (as `probe`, or a remote too old to check roots), `internal` (`machines.toml` doesn't read or write) |
-| `machines.list` | `{}` | `[{"name", "kind", "target", "roots", "command", "agent", "state", "error", "version"}]`, by name; `kind` `ssh` \| `offered`, `target` `null` for an offered one; `version` from the last hello | `internal` (`machines.toml` doesn't parse) |
+| `machines.list` | `{}` | `[{"name", "kind", "target", "roots", "command", "agent", "state", "error", "version", "capacity"}]`, by name; `kind` `ssh` \| `offered`, `target` `null` for an offered one; `version` from the last hello; `capacity` the machine's [capacity](#capacity) from its last pushed snapshot (`null` before one carried it) | `internal` (`machines.toml` doesn't parse) |
 | `machines.get` | `{"name"}` | `{"name", "kind", "target", "command", "roots", "agent"}`: what an ssh command to it needs (no argv on the wire: build it from `target` and `command`; an offered one has none) | `not-found`, `internal` (as `list`) |
 | `machines.set` | `{"name", "agent"}` | `{"ok": true}`; saves the machine's `agent`, its link restarts if it changed | `not-found`, `invalid` (no `agent`; `agent: true` on an offered machine), `internal` (`machines.toml` doesn't read or write) |
 | `machines.rm` | `{"name"}` | `{"ok": true}`; its link stops and its rows go. Nothing on the machine changes | `not-found`, `internal` (`machines.toml` doesn't read or write) |
@@ -943,12 +966,15 @@ there.
 Internal (`devsandbox fleet-link`'s; not in the npm typings): a fleet
 worker's link to this host is up
 ([fleet.md](../architecture/daemon/fleet.md#hub-side)). Params:
-`{"worker": "<machine name>", "version": "<its semver>", "draining"?:
-<bool>}` (`draining`: the worker's lending was `drain` when it dialed;
-logged). Result: `{"ok":
-true}`; a new name is saved as an offered machine (its link starts, dialed
-at the worker's `fleet-<worker>.sock`), an offered one is kept. Errors:
-`invalid` (a bad name, a missing param), `denied` (this daemon isn't a
+`{"worker": "<machine name>", "version": "<its semver>", "root":
+"<its fleet root>", "draining"?: <bool>}` (`root`: the worker's canonical
+fleet root, a path on the worker; `draining`: the worker's lending was
+`drain` when it dialed; logged). Result: `{"ok": true}`; a new name is
+saved as an offered machine whose one root is `root` (its link starts,
+dialed at the worker's `fleet-<worker>.sock`, and watches that root like
+an ssh machine's), an offered one is kept, its root replaced (and its link
+restarted) when it differs. Errors: `invalid` (a bad name, a missing
+param, a `root` that isn't absolute), `denied` (this daemon isn't a
 hub: `[serve] hub = true` in `daemon.config.toml`; or the name is an ssh
 machine's), `internal` (`machines.toml` doesn't read or write).
 
@@ -1043,7 +1069,7 @@ remote `thread_children` aren't merged. Plus, top-level:
 
 | field | |
 |---|---|
-| `machines` | every registered machine, by name: `{"name", "kind", "target", "command", "state", "error", "version", "runtime", "agent"}`; `kind` and `target` as `machines.list`'s, `command` the remote devsandbox (`null`: `devsandbox`), `runtime` its `runtime_name` once a snapshot came, `agent` the registry's |
+| `machines` | every registered machine, by name: `{"name", "kind", "target", "command", "state", "error", "version", "runtime", "agent", "capacity"}`; `kind` and `target` as `machines.list`'s, `command` the remote devsandbox (`null`: `devsandbox`), `runtime` its `runtime_name` once a snapshot came, `agent` the registry's, `capacity` its [capacity](#capacity) from its last push (`null` before one carried it) |
 
 A machine's rows are last known: they stay while its link is down (in
 memory only, so a fresh daemon has none until it connects), and a client
@@ -1093,7 +1119,7 @@ between.
 | `inbox.changed` | `inbox` | `{"generation": n}` | the store changed: through the daemon at once, through other processes (the dashboard, `devsandbox rm`) within 0.5 s. `n` grows per change the daemon saw; compare within one connection only |
 | `inbox.shown` | `inbox` | `{"instance": "<name>", "line": "<name>: <text>"}` | a container message the daemon stored is worth a status line (a `devsbd notify`, a thread put that changed something); `line` is the dashboard's status-line text. Latest only: lines that arrive faster than the client reads are dropped |
 | `instances.changed` | `instances` | `{}` | the running containers changed (the daemon re-lists on each container event, else every 2 s while a root is watched, 60 s while the runtime's event stream is up, 5 s without one or while a bridge is pending or failed), or `state.toml` did (checked every 0.5 s): a phase moved (a `run`/`rebuild` step, a failure), an instance was created, removed or renamed, marked done or undone |
-| `instances.snapshot` | `instances` | `{"dir": "<abs>", …}`: `instances.list`'s result plus the root | a root this connection watches (`instances.watch`) was collected: every poll pass (about every 2 s), changed or not, so its arrival says how fresh it is. Latest only per root |
+| `instances.snapshot` | `instances` | `{"dir": "<abs>", "capacity"?, …}`: `instances.list`'s result plus the root and this host's [capacity](#capacity) | a root this connection watches (`instances.watch`) was collected: every poll pass (about every 2 s), changed or not, so its arrival says how fresh it is. Latest only per root |
 | `forwards.changed` | `forwards` | `{}` | any forward's row changed (added, stopped, state, process, connections; checked every 0.5 s), in any config root |
 | `forwards.status` | `forwards` | `{"line": "…"}` | a one-line status: a configured forward started (`forwarding 127.0.0.1:3000 -> api:3000`) or failed, a connection note (`3000: connection refused`). Latest only, like `inbox.shown` |
 | `closing` | any | `{"reason": "handoff" \| "idle" \| "shutdown"}` | the daemon is exiting; reconnect (which starts a new one) |

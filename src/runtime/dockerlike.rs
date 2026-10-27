@@ -234,6 +234,18 @@ impl Backend for Dockerlike {
         }
     }
 
+    fn engine_info(&self) -> Result<identity::EngineInfo> {
+        let linux = cfg!(target_os = "linux");
+        let var = |key| std::env::var(key).ok().filter(|v| !v.is_empty());
+        if self.name == "podman" {
+            let out = self.output_quiet(&["info", "--format", "json"])?;
+            identity::podman_engine_info(&out, var("CONTAINER_HOST").as_deref(), linux)
+        } else {
+            let out = self.output_quiet(&["info", "--format", "{{json .}}"])?;
+            identity::docker_engine_info(&out, var("DOCKER_HOST").as_deref(), linux)
+        }
+    }
+
     fn identity_canary(&self, image: &str, dir: &std::path::Path, relabel: bool) -> Result<Canary> {
         let host_dir = dir.to_str().context("identity canary dir is not UTF-8")?;
         // `-v`'s separators; `--mount` would take them but has no relabel.

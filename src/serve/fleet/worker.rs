@@ -1,7 +1,7 @@
 //! The worker side of a fleet link (docs/architecture/daemon/fleet.md,
 //! *Worker side*): while `lend.toml` says `on` or `drain`, the daemon's
 //! `serve-lend` thread holds `ssh -T -o BatchMode=yes <hub> devsandbox
-//! fleet-link --worker <name>` ([`link_argv`]) and runs the answerer of
+//! fleet-link --worker <name> --root <fleet root>` ([`link_argv`]) and runs the answerer of
 //! `fleet::LINK` on its stdio. Each `API` stream the hub opens is answered
 //! by the daemon's `open` (a socket pair: the API relay's sentinel on the
 //! hub's end, the other end served as a `Worker` connection, `fleet::lent`).
@@ -16,6 +16,7 @@
 
 use std::ffi::OsString;
 use std::net::Shutdown;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -44,12 +45,15 @@ pub fn ssh_transport() -> Transport {
 pub type Open = Arc<dyn Fn() -> Option<Conn> + Send + Sync>;
 
 /// `ssh -T -o BatchMode=yes [-p N] -- <hub> <devsandbox fleet-link --worker
-/// <name>>` through the hub's login shell, as every machine argv is
-/// (`ssh::remote_command`). `BatchMode`: the daemon has no TTY.
-/// `draining` adds `--drain`: the offer says this worker takes no new work.
-pub fn link_argv(hub: &str, name: &str, draining: bool) -> Result<Vec<OsString>> {
+/// <name> --root <root>>` through the hub's login shell, as every machine
+/// argv is (`ssh::remote_command`). `BatchMode`: the daemon has no TTY.
+/// `root` is the canonical fleet root: the offer registers it as the
+/// offered entry's one root, which the hub watches. `draining` adds
+/// `--drain`: the offer says this worker takes no new work.
+pub fn link_argv(hub: &str, name: &str, root: &Path, draining: bool) -> Result<Vec<OsString>> {
     check_name(name)?;
-    let mut args = vec!["fleet-link", "--worker", name];
+    let root = root.to_str().with_context(|| format!("fleet root {} is not UTF-8", root.display()))?;
+    let mut args = vec!["fleet-link", "--worker", name, "--root", root];
     if draining {
         args.push("--drain");
     }
@@ -88,24 +92,27 @@ struct Ctl {
 }
 
 impl Lending {
-    /// Start lending to `hub` as `name` (`draining`: offering `--drain`).
+    /// Start lending to `hub` as `name`, offering fleet root `root`
+    /// (`draining`: offering `--drain`).
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         hub: String,
         name: String,
+        root: PathBuf,
         draining: bool,
         transport: Transport,
         open: Open,
         timing: Timing,
         log: fn(&str),
     ) -> Result<Lending> {
-        link_argv(&hub, &name, draining)?;
+        link_argv(&hub, &name, &root, draining)?;
         let ctl = Arc::new(Ctl::default());
         ctl.draining.store(draining, Ordering::SeqCst);
         let thread = {
             let ctl = Arc::clone(&ctl);
             std::thread::Builder::new()
                 .name("serve-lend".into())
-                .spawn(move || lend_loop(&hub, &name, &transport, &open, &timing, &ctl, log))
+                .spawn(move || lend_loop(&hub, &name, &root, &transport, &open, &timing, &ctl, log))
                 .context("cannot start the lending thread")?
         };
         Ok(Lending { ctl, thread: Some(thread) })
@@ -152,10 +159,11 @@ impl Ctl {
     }
 }
 
-fn lend_loop(hub: &str, name: &str, transport: &Transport, open: &Open, timing: &Timing, ctl: &Ctl, log: fn(&str)) {
+#[allow(clippy::too_many_arguments)]
+fn lend_loop(hub: &str, name: &str, root: &Path, transport: &Transport, open: &Open, timing: &Timing, ctl: &Ctl, log: fn(&str)) {
     let mut failures = 0;
     while !ctl.stopped() {
-        let argv = match link_argv(hub, name, ctl.draining.load(Ordering::SeqCst)) {
+        let argv = match link_argv(hub, name, root, ctl.draining.load(Ordering::SeqCst)) {
             Ok(argv) => argv,
             Err(e) => {
                 // Checked by `spawn`: unreachable short of a bug.
@@ -231,7 +239,8 @@ mod tests {
 
     #[test]
     fn the_link_argv() {
-        let argv = link_argv("ssh://me@hub:2200", "lap", false).unwrap();
+        let root = Path::new("/d/fleet/me@hub");
+        let argv = link_argv("ssh://me@hub:2200", "lap", root, false).unwrap();
         let want = [
             "ssh",
             "-T",
@@ -241,14 +250,14 @@ mod tests {
             "2200",
             "--",
             "me@hub",
-            r#"exec "$SHELL" -lc 'exec devsandbox '\''fleet-link'\'' '\''--worker'\'' '\''lap'\'''"#,
+            r#"exec "$SHELL" -lc 'exec devsandbox '\''fleet-link'\'' '\''--worker'\'' '\''lap'\'' '\''--root'\'' '\''/d/fleet/me@hub'\'''"#,
         ];
         assert_eq!(argv, want.map(OsString::from));
-        assert_eq!(link_argv("hub", "lap", false).unwrap()[4..6], [OsString::from("--"), "hub".into()]);
-        let drain = link_argv("hub", "lap", true).unwrap();
+        assert_eq!(link_argv("hub", "lap", root, false).unwrap()[4..6], [OsString::from("--"), "hub".into()]);
+        let drain = link_argv("hub", "lap", root, true).unwrap();
         assert!(drain[6].to_string_lossy().ends_with(r#"'\''--drain'\'''"#), "{drain:?}");
-        assert!(link_argv("-oProxyCommand=x", "lap", false).is_err());
-        assert!(link_argv("hub", "a/b", false).is_err());
+        assert!(link_argv("-oProxyCommand=x", "lap", root, false).is_err());
+        assert!(link_argv("hub", "a/b", root, false).is_err());
     }
 
     mod e2e {
@@ -299,18 +308,19 @@ mod tests {
         }
 
         /// A transport whose every link is the hub's `fleet-link` for `lap`
-        /// in-process, its socket and daemon in `hub`.
-        fn in_process_hub(hub: PathBuf) -> Transport {
+        /// offering `root` in-process, its socket and daemon in `hub`.
+        fn in_process_hub(hub: PathBuf, root: PathBuf) -> Transport {
             Arc::new(move |argv: &[OsString]| {
                 let words: Vec<_> = argv.iter().map(|a| a.to_string_lossy().into_owned()).collect();
                 assert_eq!(&words[..5], ["ssh", "-T", "-o", "BatchMode=yes", "--"]);
                 assert_eq!(words[5], "me@hub");
                 assert!(words[6].contains("fleet-link") && words[6].contains("lap"), "{}", words[6]);
+                assert!(words[6].contains(&format!("'\\''--root'\\'' '\\''{}'\\''", root.display())), "{}", words[6]);
                 let (worker, hub_io) = UnixStream::pair()?;
-                let hub = hub.clone();
+                let (hub, root) = (hub.clone(), root.clone());
                 std::thread::spawn(move || {
                     let (r, w) = (hub_io.try_clone().unwrap(), hub_io);
-                    crate::commands::fleet_link::run(r, w, &hub.clone(), "lap", false, move || Ok(conn_at(&hub)))
+                    crate::commands::fleet_link::run(r, w, &hub.clone(), "lap", &root, false, move || Ok(conn_at(&hub)))
                 });
                 Ok(Duplex::socket(worker))
             })
@@ -373,7 +383,9 @@ mod tests {
             worker.home = Some(base.join("worker-home"));
             worker.machines = Some(base.join("worker-machines.toml"));
             worker.lend = Some(lend_path.clone());
-            worker.lend_transport = Some(in_process_hub(hub_dir.clone()));
+            std::fs::create_dir_all(&fleet_root).unwrap();
+            let canonical_root = std::fs::canonicalize(&fleet_root).unwrap();
+            worker.lend_transport = Some(in_process_hub(hub_dir.clone(), canonical_root.clone()));
             worker.lend_env = Some(BTreeMap::from([("PATH".into(), "/worker/bin".into())]));
             let registry = base.join("machines.toml");
             let mut hub = opts(1, 300);
@@ -385,7 +397,8 @@ mod tests {
             drop(conn_at(&hub_dir));
             let worker_daemon = spawn_daemon(&worker_dir, worker);
 
-            wait_for(|| machines::load(&registry).is_ok_and(|e| e == [Entry::offered("lap")]), "the offer registers `lap`");
+            let lap = Entry { roots: vec![canonical_root.clone()], ..Entry::offered("lap") };
+            wait_for(|| machines::load(&registry).is_ok_and(|e| e == [lap.clone()]), "the offer registers `lap` with its fleet root");
             wait_for(|| endpoint::fleet_socket(&hub_dir, "lap").exists(), "the hub's fleet socket");
             // Lending keeps the worker up past its 300 ms idle timeout.
             std::thread::sleep(Duration::from_millis(600));
@@ -418,6 +431,26 @@ mod tests {
             assert_eq!(r.result.unwrap()["found"], json!([{"name": "web-w", "machine": null, "root": cfg, "sandbox": "web"}]));
             let r = c.call("sandboxes.list", json!({"root": mine, "machine": "lap"})).unwrap();
             assert_eq!(r.error.unwrap().code, "denied");
+
+            // A federated watch on the hub watches the offered root on the
+            // worker: its snapshot arrives as an ssh machine's does.
+            c.call("subscribe", json!({"topics": ["instances"]})).unwrap();
+            let here = base.join("hub-root");
+            std::fs::create_dir_all(&here).unwrap();
+            assert!(c.call("instances.watch", json!({"dir": here, "machines": true})).unwrap().error.is_none());
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let n = c.next_notification(Duration::from_millis(200)).unwrap();
+                if let Some(n) = n.filter(|n| n.method == "instances.snapshot") {
+                    let m = &n.params["machines"][0];
+                    if m["state"] == "connected" && m["runtime"] == "Disk" {
+                        assert_eq!(m["name"], "lap");
+                        break;
+                    }
+                }
+                assert!(Instant::now() < deadline, "the worker's fleet root never pushed");
+            }
+            c.call("instances.unwatch", json!({"dir": here})).unwrap();
 
             // A verb: the worker's env, not the hub's.
             let stream = stream_at(&hub_dir);
@@ -490,7 +523,8 @@ mod tests {
             anyhow::bail!("no route")
         });
         let timing = Timing { backoff: Duration::from_millis(5), backoff_cap: Duration::from_millis(10), ..Timing::default() };
-        let lending = Lending::spawn("hub".into(), "lap".into(), false, transport, Arc::new(|| None), timing, |_| {}).unwrap();
+        let lending =
+            Lending::spawn("hub".into(), "lap".into(), "/fleet/hub".into(), false, transport, Arc::new(|| None), timing, |_| {}).unwrap();
         let start = std::time::Instant::now();
         while tries.load(Ordering::SeqCst) < 3 {
             assert!(start.elapsed() < Duration::from_secs(5), "retried");

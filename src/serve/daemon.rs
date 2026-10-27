@@ -321,12 +321,14 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
         // Configured `forwardPorts` follow the running containers.
         let sync = registry.as_ref().map(Registry::handle);
         let observers = {
-            let (watching, publishing) = (Arc::clone(&shared), Arc::clone(&shared));
+            let (watching, publishing, lending) = (Arc::clone(&shared), Arc::clone(&shared), Arc::clone(&shared));
             Observers {
                 watched: Box::new(move || watching.watched_roots()),
                 cache: Arc::clone(&shared.snapshots),
                 join: Arc::clone(&shared.join),
                 on_snapshot: Box::new(move |dir, params| publishing.publish_snapshot(dir, params)),
+                // The lender exists once lending started, just after the host.
+                lend: Box::new(move || lending.lender.get().and_then(|l| l.file())),
             }
         };
         Host::start(
@@ -431,10 +433,10 @@ fn start_lending(opts: &Options, shared: &Arc<Shared>) {
     // Weak: the lender lives in `shared`.
     let weak = Arc::downgrade(shared);
     let spawn: fleet::lender::Spawn = Box::new(move |start: fleet::lender::Start| {
-        let scope = Arc::new(lent::Scope { hub: start.hub.clone(), root: start.root, env: env.clone() });
+        let scope = Arc::new(lent::Scope { hub: start.hub.clone(), root: start.root.clone(), env: env.clone() });
         let weak = weak.clone();
         let open: fleet::worker::Open = Arc::new(move || weak.upgrade()?.open_lent(&scope));
-        fleet::worker::Lending::spawn(start.hub, start.name, start.draining, transport.clone(), open, timing, log)
+        fleet::worker::Lending::spawn(start.hub, start.name, start.root, start.draining, transport.clone(), open, timing, log)
     });
     let lender = shared.lender.get_or_init(|| fleet::lender::Lender::new(path, link::hostname(), spawn, log));
     lender.start();

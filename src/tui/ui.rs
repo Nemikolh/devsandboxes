@@ -709,14 +709,23 @@ fn draw_machines(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_machines_table(frame: &mut Frame, app: &App, area: Rect, term_focused: bool) {
     let name_width = app.machines.iter().map(|m| m.name.chars().count()).max().unwrap_or(0).max("NAME".len());
+    let room_width = app
+        .machines
+        .iter()
+        .map(|m| capacity_text(m.capacity.as_ref()).chars().count())
+        .max()
+        .unwrap_or(0)
+        .max("CAPACITY".len());
     let widths = [
         Constraint::Length(name_width as u16),
         Constraint::Length(24),
         Constraint::Min(14),
         Constraint::Length(5),
         Constraint::Length(12),
+        Constraint::Length(5),
+        Constraint::Length(room_width as u16),
     ];
-    let header = Row::new(["NAME", "TARGET", "STATE", "AGENT", "VERSION"].map(Cell::from))
+    let header = Row::new(["NAME", "TARGET", "STATE", "AGENT", "VERSION", "LEND", "CAPACITY"].map(Cell::from))
         .style(Style::default().add_modifier(Modifier::DIM));
     let rows: Vec<Row> = app.machines.iter().map(machine_row).collect();
     let block = Block::default()
@@ -732,8 +741,21 @@ fn draw_machines_table(frame: &mut Frame, app: &App, area: Rect, term_focused: b
     frame.render_stateful_widget(table, area, &mut state);
 }
 
+/// The CAPACITY cell's text: `8 cpu · 12/32G · 120G free · 3 run`, then
+/// `  over cap: mem 18G/16G` when a soft cap is exceeded; `-` without a
+/// report (`serve::capacity`).
+fn capacity_text(c: Option<&crate::serve::capacity::Capacity>) -> String {
+    use crate::serve::capacity;
+    let summary = capacity::summary(c);
+    match c.and_then(capacity::over_note) {
+        Some(note) => format!("{summary}  {note}"),
+        None => summary,
+    }
+}
+
 /// One machine's cells: STATE is the link state, with `: <error>` when the
-/// last attempt said why.
+/// last attempt said why; LEND and CAPACITY from its last snapshot's
+/// capacity report (last known while it isn't connected).
 fn machine_row(m: &crate::serve::snapshots::SnapshotMachine) -> Row<'_> {
     use crate::serve::snapshots::LinkState;
     let state = match &m.error {
@@ -756,6 +778,12 @@ fn machine_row(m: &crate::serve::snapshots::SnapshotMachine) -> Row<'_> {
         Cell::from(Span::styled(state, style)),
         Cell::from(if m.agent { "on" } else { "off" }),
         Cell::from(m.version.clone().unwrap_or_else(|| "-".to_string())),
+        Cell::from(crate::serve::capacity::lend_label(m.capacity.as_ref())),
+        {
+            let over = m.capacity.as_ref().is_some_and(|c| !crate::serve::capacity::over_caps(c).is_empty());
+            let style = if over { Style::default().fg(Color::Yellow) } else { Style::default() };
+            Cell::from(Span::styled(capacity_text(m.capacity.as_ref()), style))
+        },
     ])
 }
 
@@ -3283,17 +3311,32 @@ mod tests {
         let mut up = sm("box", LinkState::Connected);
         up.agent = true;
         up.version = Some("0.9.1".into());
+        let g = 1u64 << 30;
+        up.capacity = Some(crate::serve::capacity::Capacity {
+            cpus: Some(8),
+            mem_total: Some(32 * g),
+            mem_available: Some(14 * g),
+            disk_free: Some(120 * g),
+            disk_total: Some(500 * g),
+            running: 3,
+            lending: Some(crate::serve::fleet::lend::State::Drain),
+            caps: Some(crate::serve::capacity::Caps { mem: Some(16 * g), ..Default::default() }),
+        });
         app.set_machines(vec![up, down]);
         app.on_key(KeyEvent::from(KeyCode::Char('5')));
-        let screen = render(&app, 140, 30);
+        let screen = render(&app, 180, 30);
         let header = screen.lines().find(|l| l.contains("NAME")).unwrap();
-        for col in ["TARGET", "STATE", "AGENT", "VERSION"] {
+        for col in ["TARGET", "STATE", "AGENT", "VERSION", "LEND", "CAPACITY"] {
             assert!(header.contains(col), "{screen}");
         }
         let line = |name: &str| screen.lines().find(|l| l.contains(&format!("│{name} "))).unwrap().to_string();
         let (up, down) = (line("box"), line("down"));
         assert!(up.contains("me@box") && up.contains(" connected ") && up.contains(" on ") && up.contains("0.9.1"), "{screen}");
+        assert!(up.contains(" drain "), "{screen}");
+        assert!(up.contains("8 cpu · 18/32G · 120G free · 3 run  over cap: mem 18G/16G"), "{screen}");
         assert!(down.contains(" unreachable: Connection refused ") && down.contains(" off ") && down.contains(" - "), "{screen}");
+        // No report yet: LEND and CAPACITY `-`.
+        assert!(down.trim_end_matches('│').trim_end().ends_with("-     -"), "{down}");
         assert!(screen.find("│box ").unwrap() < screen.find("│down ").unwrap(), "{screen}");
         assert!(screen.contains("Machines"), "{screen}");
     }

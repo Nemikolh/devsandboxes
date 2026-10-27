@@ -336,6 +336,12 @@ impl Backend for AppleContainer {
         Ok(identity::FastPath { mode: Ok(identity::Mode::VmBacked), selinux: false })
     }
 
+    /// Every container is its own VM, sized per container: no engine host
+    /// to report.
+    fn engine_info(&self) -> Result<identity::EngineInfo> {
+        Ok(identity::EngineInfo::default())
+    }
+
     fn identity_canary(&self, _image: &str, _dir: &std::path::Path, _relabel: bool) -> Result<identity::Canary> {
         bail!("no identity canary on Apple `container`: it is always VM-backed")
     }
