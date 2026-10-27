@@ -1883,8 +1883,9 @@ mod tests {
         };
         // Another hello: ours back, then closed.
         let mut s = dial();
+        // Only the hello: anything still unread when the supervisor closes
+        // makes Linux reset our read (ECONNRESET), or fails the write.
         s.write_all(&encode(&Record::Hello(WIRE_VERSION + 1))).unwrap();
-        s.write_all(&encode(&Record::Size { cols: 80, rows: 24 })).unwrap();
         assert_eq!(answer(s), encode(&Record::Hello(WIRE_VERSION)));
         // A bad first record, or nothing until the deadline: closed.
         let mut s = dial();
