@@ -1061,6 +1061,24 @@ impl Config {
     /// recursively), then the table's own body on top. `stack` tracks the active
     /// resolution path for cycle detection.
     fn resolve_extends(&self, table: &Table, stack: &mut Vec<String>) -> Result<Table> {
+        self.merge_extends(table, stack, &mut Vec::new())
+    }
+
+    /// The templates `table`'s `extends` reaches, in merge order (each after
+    /// the templates it extends itself; one reached twice is listed twice):
+    /// the table that sets a scalar last wins it, `table` itself coming after
+    /// all of them. Fails as [`Self::resolve_sandbox`] would (unknown
+    /// template, cycle, bad `extends`).
+    #[cfg_attr(not(test), allow(dead_code))] // config_identity's, wired by identity steps 13–14
+    pub fn extends_chain(&self, table: &Table) -> Result<Vec<String>> {
+        let mut chain = Vec::new();
+        self.merge_extends(table, &mut Vec::new(), &mut chain)?;
+        Ok(chain)
+    }
+
+    /// [`Self::resolve_extends`], also pushing each template it merges onto
+    /// `chain` ([`Self::extends_chain`]).
+    fn merge_extends(&self, table: &Table, stack: &mut Vec<String>, chain: &mut Vec<String>) -> Result<Table> {
         let names = match table.get("extends") {
             None => Vec::new(),
             Some(Value::String(name)) => vec![name.clone()],
@@ -1087,9 +1105,10 @@ impl Config {
                 .templates
                 .get(&name)
                 .with_context(|| format!("extends unknown template `{name}`"))?;
-            stack.push(name);
-            let resolved = self.resolve_extends(template, stack)?;
+            stack.push(name.clone());
+            let resolved = self.merge_extends(template, stack, chain)?;
             stack.pop();
+            chain.push(name);
             merged = deep_merge(merged, resolved);
         }
 
@@ -1798,6 +1817,19 @@ forwardPorts = [true]
     fn resolved_table_unknown_sandbox_errors() {
         let config = Config::parse(EXAMPLE).unwrap();
         assert!(config.resolved_table("nope").is_err());
+    }
+
+    #[test]
+    fn extends_chain_is_merge_order() {
+        let config = Config::parse(
+            "[template.a]\n[template.b]\nextends = \"a\"\n[template.c]\nextends = [\"b\", \"a\"]\n\
+             [template.x]\nextends = \"y\"\n[template.y]\nextends = \"x\"\n",
+        )
+        .unwrap();
+        let chain = |name: &str| config.extends_chain(&config.templates[name]);
+        assert_eq!(chain("a").unwrap(), Vec::<String>::new());
+        assert_eq!(chain("c").unwrap(), ["a", "b", "a"]);
+        assert!(format!("{:#}", chain("x").unwrap_err()).contains("cyclic"));
     }
 
     #[test]

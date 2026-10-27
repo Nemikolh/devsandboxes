@@ -1,6 +1,7 @@
 mod build_log;
 mod commands;
 mod config;
+mod config_identity;
 mod daemon_config;
 mod devsbd;
 mod exe;
