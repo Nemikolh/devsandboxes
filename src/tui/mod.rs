@@ -292,7 +292,11 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
                 | PromptAction::Stop { .. }
                 | PromptAction::Rm { .. }
                 | PromptAction::ServiceRebuild { .. }) => {
-                    app.status = Some(verb_pending(&action));
+                    // An identity answer that released it leads its line.
+                    app.status = Some(match app.take_identity_note() {
+                        Some(note) => format!("{note} · {}", verb_pending(&action)),
+                        None => verb_pending(&action),
+                    });
                     let route = app.snapshot.as_ref().map(|s| verb_route(s, &action)).unwrap_or_default();
                     verbs.push((action.clone(), spawn_verb(&dir, action, verb_tty(size.width, size.height), route)));
                     procs_after_snapshot = true;
@@ -325,6 +329,11 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
         // requests on the daemon worker's connection, answered below.
         if let Some(sig) = app.take_pending_signal() {
             daemon.signal(sig);
+        }
+        // The identity offer's read, or an identity modal's answer (the
+        // verb it holds comes back with the answer).
+        if let Some(req) = app.take_pending_identity() {
+            daemon.identity(req);
         }
         for req in app.take_pending_done() {
             daemon.set_done(req);
@@ -408,6 +417,9 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
                     }
                     procs_after_snapshot = true;
                 }
+                daemon::DaemonUpdate::IdentityOffer { groups, asked } => app.identity_offer(groups, asked),
+                // A released verb is taken on the next pass.
+                daemon::DaemonUpdate::Identity { outcome, then } => app.identity_answered(outcome, then),
             }
         }
         // The Inbox lives in one shared file (`crate::inbox::store`), so any

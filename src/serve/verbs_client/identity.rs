@@ -8,6 +8,11 @@
 //! prompt covers every root of an `--all`. Nothing here blocks a verb: a
 //! root that can't be read is left out (the verb reports its own errors),
 //! and a failed update is a warning, but for a file changed meanwhile.
+//!
+//! The dashboard asks the same through its modals
+//! (docs/architecture/dashboard/tabs-and-actions.md, *Identity modals*):
+//! its daemon worker runs [`gather`] and [`answer`] over its own
+//! connection, and the modal lists [`listing`]'s lines.
 
 use std::path::{Path, PathBuf};
 
@@ -25,21 +30,26 @@ pub(super) const QUESTION: &str = "[u]pdate / [c]ontinue as is (don't ask again)
 
 /// One config root to ask about.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct Ask {
+pub(crate) struct Ask {
     pub root: PathBuf,
     /// Where `root` is (`None`: here); the calls go there.
     pub machine: Option<String>,
     pub scope: Scope,
 }
 
-/// Which of a root's findings count.
+/// Which of a root's findings count (un-acked ones only, always).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum Scope {
+pub(crate) enum Scope {
     /// Those applying to one of these sandboxes.
     Sandboxes(Vec<String>),
     /// Those applying to any sandbox (`--all`; an unused template's aren't
     /// a verb's business).
     Used,
+    /// Every one, an unused template's included: the dashboard's offer.
+    All,
+    /// These ids: what the dashboard's verb modal showed (a sandbox row's
+    /// notes), so an answer never touches a finding it didn't list.
+    Ids(Vec<String>),
 }
 
 /// `config.findings`' answer, as far as the prompt reads it.
@@ -52,7 +62,7 @@ struct Findings {
     findings: Vec<Finding>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 struct Finding {
     id: String,
     table: String,
@@ -78,13 +88,16 @@ impl Finding {
             && match scope {
                 Scope::Sandboxes(names) => self.sandboxes.iter().any(|s| names.contains(s)),
                 Scope::Used => !self.sandboxes.is_empty(),
+                Scope::All => true,
+                Scope::Ids(ids) => ids.contains(&self.id),
             }
     }
 }
 
-/// One root's findings to ask about.
-#[derive(Debug)]
-struct Group {
+/// One root's findings to ask about: plain data, so the dashboard's modal
+/// can hold it until answered.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Group {
     root: PathBuf,
     machine: Option<String>,
     file: PathBuf,
@@ -102,6 +115,27 @@ impl Group {
         }
     }
 
+    /// A TOML group here, `(id, edit line)` per finding: the dashboard's
+    /// tests.
+    #[cfg(test)]
+    pub(crate) fn sample(root: &str, findings: &[(&str, &str)]) -> Group {
+        let findings = findings
+            .iter()
+            .map(|(id, edit)| Finding {
+                id: id.to_string(),
+                table: "sandbox.web".into(),
+                kind: "root-target".into(),
+                key: "mounts".into(),
+                value: "/root/x".into(),
+                edit: Some(edit.to_string()),
+                sandboxes: vec!["web".into()],
+                acked: false,
+            })
+            .collect();
+        let root = PathBuf::from(root);
+        Group { file: root.join("devsandboxes.toml"), root, machine: None, yaml: false, file_hash: "h".into(), findings }
+    }
+
     fn params(&self, params: Value) -> Value {
         let mut params = params;
         params["root"] = json!(self.root);
@@ -110,7 +144,7 @@ impl Group {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Choice {
+pub(crate) enum Choice {
     Update,
     Keep,
     Skip,
@@ -137,17 +171,24 @@ pub(super) fn prompt(asks: Vec<Ask>, call: &mut Call, ui: &mut Ui) -> Result<()>
     if groups.is_empty() {
         return Ok(());
     }
-    (ui.say)(&listing(&groups));
+    (ui.say)(&listing(&groups).join("\n"));
     let choice = loop {
         if let Some(c) = choice(&(ui.ask)(QUESTION)?) {
             break c;
         }
     };
-    for group in &groups {
+    answer(&groups, choice, call, &mut *ui.say)
+}
+
+/// Do what was answered for each group, saying what came of it. `Err` only
+/// for a file changed since its findings were read (`conflict`): nothing
+/// more is written and the verb that asked isn't sent.
+pub(crate) fn answer(groups: &[Group], choice: Choice, call: &mut Call, say: &mut dyn FnMut(&str)) -> Result<()> {
+    for group in groups {
         match choice {
             Choice::Skip => {}
-            Choice::Update => update(group, call, ui)?,
-            Choice::Keep => keep(group, call, ui)?,
+            Choice::Update => update(group, call, say)?,
+            Choice::Keep => keep(group, call, say)?,
         }
     }
     Ok(())
@@ -155,7 +196,7 @@ pub(super) fn prompt(asks: Vec<Ask>, call: &mut Call, ui: &mut Ui) -> Result<()>
 
 /// Each root's un-acked findings in scope; a root whose findings can't be
 /// had (an older daemon, a bad config, an unreachable machine) is left out.
-fn gather(asks: Vec<Ask>, call: &mut Call) -> Vec<Group> {
+pub(crate) fn gather(asks: Vec<Ask>, call: &mut Call) -> Vec<Group> {
     let mut groups = Vec::new();
     for ask in asks {
         let params = routed(json!({ "root": ask.root }), ask.machine.as_deref());
@@ -177,35 +218,33 @@ fn gather(asks: Vec<Ask>, call: &mut Call) -> Vec<Group> {
     groups
 }
 
-/// What the prompt shows above [`QUESTION`].
-fn listing(groups: &[Group]) -> String {
-    let mut out = String::new();
+/// What the prompt shows above [`QUESTION`], a line each: per group, the
+/// file, then its findings indented.
+pub(crate) fn listing(groups: &[Group]) -> Vec<String> {
+    let mut out = Vec::new();
     for g in groups {
-        out.push_str(&format!(
-            "{} assumes root in the container, which breaks under identity = \"host\":\n",
-            g.label()
-        ));
+        out.push(format!("{} assumes root in the container, which breaks under identity = \"host\":", g.label()));
         for f in &g.findings {
-            out.push_str(&format!("  {}\n", f.line()));
+            out.push(format!("  {}", f.line()));
         }
     }
-    out.trim_end().to_string()
+    out
 }
 
 /// `u`: every finding with an edit, rewritten.
-fn update(g: &Group, call: &mut Call, ui: &mut Ui) -> Result<()> {
+fn update(g: &Group, call: &mut Call, say: &mut dyn FnMut(&str)) -> Result<()> {
     let ids: Vec<&str> = g.findings.iter().filter(|f| f.edit.is_some()).map(|f| f.id.as_str()).collect();
     if ids.is_empty() {
-        (ui.say)(&format!("{}: nothing to update automatically; fix the entries above by hand", g.label()));
+        say(&format!("{}: nothing to update automatically; fix the entries above by hand", g.label()));
         return Ok(());
     }
-    migrate(g, json!({ "ids": ids, "fileHash": g.file_hash }), call, ui)
+    migrate(g, json!({ "ids": ids, "fileHash": g.file_hash }), call, say)
 }
 
 /// `c`: acked, but a root user in TOML, which is kept in the file
 /// (`identity = "image"`, the finding gone for good). YAML isn't rewritten:
 /// its root user is acked too.
-fn keep(g: &Group, call: &mut Call, ui: &mut Ui) -> Result<()> {
+fn keep(g: &Group, call: &mut Call, say: &mut dyn FnMut(&str)) -> Result<()> {
     let (users, others): (Vec<&Finding>, Vec<&Finding>) =
         g.findings.iter().partition(|f| f.kind == "root-user" && !g.yaml);
     if !others.is_empty() {
@@ -214,38 +253,38 @@ fn keep(g: &Group, call: &mut Call, ui: &mut Ui) -> Result<()> {
             Ok(Reply::Ok(_)) => {
                 let n = ids.len();
                 let entries = if n == 1 { "1 entry".to_string() } else { format!("{n} entries") };
-                (ui.say)(&format!("{}: {entries} kept as is, not asked about again", g.label()));
+                say(&format!("{}: {entries} kept as is, not asked about again", g.label()));
             }
-            Ok(Reply::Err(e)) => (ui.say)(&format!("warning: could not record that for {}: {}", g.label(), e.message)),
-            Ok(Reply::Old(why)) => (ui.say)(&format!("warning: could not record that for {}: {why}", g.label())),
-            Err(e) => (ui.say)(&format!("warning: could not record that for {}: {e:#}", g.label())),
+            Ok(Reply::Err(e)) => say(&format!("warning: could not record that for {}: {}", g.label(), e.message)),
+            Ok(Reply::Old(why)) => say(&format!("warning: could not record that for {}: {why}", g.label())),
+            Err(e) => say(&format!("warning: could not record that for {}: {e:#}", g.label())),
         }
     }
     if !users.is_empty() {
         let keep: Vec<&str> = users.iter().map(|f| f.id.as_str()).collect();
-        migrate(g, json!({ "ids": [], "keep": keep, "fileHash": g.file_hash }), call, ui)?;
+        migrate(g, json!({ "ids": [], "keep": keep, "fileHash": g.file_hash }), call, say)?;
     }
     Ok(())
 }
 
 /// `config.migrate` and its report.
-fn migrate(g: &Group, params: Value, call: &mut Call, ui: &mut Ui) -> Result<()> {
+fn migrate(g: &Group, params: Value, call: &mut Call, say: &mut dyn FnMut(&str)) -> Result<()> {
     let warn = |why: &str| format!("warning: could not update {}: {why}", g.label());
     match call("config.migrate", g.params(params)).map(reply) {
         Ok(Reply::Ok(v)) => {
             let edits = v["edits"].as_u64().unwrap_or(0);
             let drifted: Vec<String> =
                 v["drifted"].as_array().into_iter().flatten().filter_map(|n| n.as_str().map(str::to_string)).collect();
-            (ui.say)(&updated(&g.file, edits, &drifted, g.machine.as_deref()));
+            say(&updated(&g.file, edits, &drifted, g.machine.as_deref()));
         }
         Ok(Reply::Err(e)) if e.code == "conflict" => {
             bail!("{} changed while you were asked; nothing written, run the command again", g.label())
         }
         // YAML: the message is the edits to make by hand.
-        Ok(Reply::Err(e)) if e.code == "unsupported" => (ui.say)(&format!("{}: {}", g.label(), e.message)),
-        Ok(Reply::Err(e)) => (ui.say)(&warn(&e.message)),
-        Ok(Reply::Old(why)) => (ui.say)(&warn(&why)),
-        Err(e) => (ui.say)(&warn(&format!("{e:#}"))),
+        Ok(Reply::Err(e)) if e.code == "unsupported" => say(&format!("{}: {}", g.label(), e.message)),
+        Ok(Reply::Err(e)) => say(&warn(&e.message)),
+        Ok(Reply::Old(why)) => say(&warn(&why)),
+        Err(e) => say(&warn(&format!("{e:#}"))),
     }
     Ok(())
 }

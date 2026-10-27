@@ -267,16 +267,17 @@ pub fn totals_line(snapshot: &Snapshot, age: std::time::Duration, error: Option<
     line
 }
 
-/// The header's yellow identity line, e.g. `2 sandboxes use /root`: the
-/// sandboxes (every row, a machine's included) with at least one un-acked
-/// identity note. `None` when there's none.
+/// The header's yellow identity line, e.g. `2 sandboxes use /root (U to
+/// update)`: the sandboxes (every row, a machine's included) with at least
+/// one un-acked identity note, and the key opening the offer. `None` when
+/// there's none.
 pub fn identity_line(snapshot: &Snapshot) -> Option<String> {
     let n = snapshot
         .sandboxes
         .iter()
         .filter(|s| s.identity.iter().any(|note| !note.acked))
         .count();
-    (n > 0).then(|| format!("{n} {} /root", plural(n, "sandbox uses", "sandboxes use")))
+    (n > 0).then(|| format!("{n} {} /root (U to update)", plural(n, "sandbox uses", "sandboxes use")))
 }
 
 /// `n singular` / `n plural` word choice (the count itself is rendered by the
@@ -472,9 +473,9 @@ mod tests {
         let mut one = sb("one");
         one.identity = vec![note(true), note(false)];
         s.sandboxes.push(one.clone());
-        assert_eq!(identity_line(&s).as_deref(), Some("1 sandbox uses /root"));
+        assert_eq!(identity_line(&s).as_deref(), Some("1 sandbox uses /root (U to update)"));
         s.sandboxes.push(one);
-        assert_eq!(identity_line(&s).as_deref(), Some("2 sandboxes use /root"));
+        assert_eq!(identity_line(&s).as_deref(), Some("2 sandboxes use /root (U to update)"));
     }
 
     #[test]

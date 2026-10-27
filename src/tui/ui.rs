@@ -2567,8 +2567,14 @@ fn draw_build_log_modal(frame: &mut Frame, app: &App, view: &BuildLogModal) {
 /// A small centered yes/no box over the dashboard.
 fn draw_confirm_modal(frame: &mut Frame, view: &ConfirmModal) {
     let full = frame.area();
-    let width = (view.question.chars().count() as u16 + 6).max(24).min(full.width);
-    let height = 4.min(full.height);
+    let widest = std::iter::once(&view.question)
+        .chain(&view.body)
+        .map(|l| l.chars().count())
+        .chain([view.choices().chars().count()])
+        .max()
+        .unwrap_or(0);
+    let width = (widest.min(u16::MAX as usize) as u16).saturating_add(6).max(24).min(full.width);
+    let height = (view.body.len().min(u16::MAX as usize) as u16).saturating_add(4).min(full.height);
     let area = Rect {
         x: full.x + (full.width - width) / 2,
         y: full.y + (full.height - height) / 2,
@@ -2576,12 +2582,18 @@ fn draw_confirm_modal(frame: &mut Frame, view: &ConfirmModal) {
         height,
     };
     let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(ACCENT));
-    let lines = vec![
-        Line::from(view.question.clone()),
-        Line::from("[y] yes  [n] no").style(Style::default().add_modifier(Modifier::DIM)),
-    ];
+    let choices = Line::from(view.choices()).style(Style::default().add_modifier(Modifier::DIM));
     frame.render_widget(ratatui::widgets::Clear, area);
-    frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center).block(block), area);
+    if view.body.is_empty() {
+        let lines = vec![Line::from(view.question.clone()), choices];
+        frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center).block(block), area);
+        return;
+    }
+    // The identity modals: a listing, left-aligned under the question.
+    let mut lines = vec![Line::from(view.question.clone())];
+    lines.extend(view.body.iter().map(|l| Line::from(l.clone()).style(Style::default().fg(Color::Yellow))));
+    lines.push(choices);
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 /// The `?` modal's `(settings, help body)` areas inside its border over the
@@ -3113,8 +3125,18 @@ mod tests {
         ];
         app.set_snapshot(s.clone());
         let screen = render(&app, 140, 30);
-        assert!(screen.contains("1 sandbox uses /root"), "{screen}");
-        assert!(!screen.contains("U to update"), "{screen}");
+        assert!(screen.contains("1 sandbox uses /root (U to update)"), "{screen}");
+        // A start of it asks first: the un-acked notes, then the choices.
+        let mut asked = phase_app(vec![("web", running(), None)]);
+        asked.set_snapshot(s.clone());
+        asked.pending_action = Some(crate::tui::prompt::PromptAction::Start { instance: "web".into() });
+        assert_eq!(asked.take_pending_action(), None);
+        let modal = render(&asked, 140, 30);
+        assert!(modal.contains("sandbox s assumes root in the container"), "{modal}");
+        assert!(modal.contains("  sandbox.s: mounts entry \"x\" -> \"y\""), "{modal}");
+        assert!(!modal.contains("│  sandbox.s: remove remoteUser"), "acked: not listed: {modal}");
+        assert!(modal.contains("[u] update  [c] continue as is (don't ask again)  [s] skip this time"), "{modal}");
+        assert!(modal.contains("u update · c continue as is · s/esc skip"), "help bar: {modal}");
         assert!(screen.contains("⚠ sandbox.s: remove remoteUser = \"root\""), "{screen}");
 
         // Detail's fixed height clips the rest on screen; the lines are all there.

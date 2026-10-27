@@ -33,8 +33,8 @@ caches = ["npm"]           # one npm cache for every instance
 worktree-link = [".env"]   # one .env, shared by every instance
 
 # Your Claude Code login and settings, from the host.
-mounts = ["source=${localEnv:HOME}/.claude,target=/root/.claude,type=bind"]
-containerEnv = { CLAUDE_CONFIG_DIR = "/root/.claude" }
+mounts = ["source=${localEnv:HOME}/.claude,target=${containerEnv:HOME}/.claude,type=bind"]
+containerEnv = { CLAUDE_CONFIG_DIR = "${containerEnv:HOME}/.claude" }
 
 [sandbox.app.postCreateCommand]  # once, when an instance is created
 deps = "npm install"
@@ -49,7 +49,7 @@ caches = ["npm"]           # one npm cache for every instance
 worktree-link = [".env"]   # one .env, shared by every instance
 
 # Your Codex login and settings, from the host.
-mounts = ["source=${localEnv:HOME}/.codex,target=/root/.codex,type=bind"]
+mounts = ["source=${localEnv:HOME}/.codex,target=${containerEnv:HOME}/.codex,type=bind"]
 
 [sandbox.app.postCreateCommand]  # once, when an instance is created
 deps = "npm install"

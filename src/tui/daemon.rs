@@ -52,6 +52,12 @@
 //! [`DaemonUpdate`] naming its target; disconnected, that answer says the
 //! dashboard needs devsandbox serve ([`needs_serve`]), as `cancel`'s does.
 //!
+//! Identity (docs/architecture/dashboard/tabs-and-actions.md, *Identity
+//! modals*): the offer's `config.findings` and a modal's
+//! `config.migrate`/`config.ack` share it too ([`Cmd::Identity`]), run by
+//! the CLI prompt's own fns; the answer carries back the verb it held,
+//! which the event loop then sends.
+//!
 //! A command channel plus a short-joining `Drop`; nothing is ever written to
 //! stderr, failures are [`DaemonUpdate::Status`] lines.
 
@@ -65,7 +71,9 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use serde_json::{Value, json};
 
-use super::app::{ConfigKind, Fetch, PendingDone, PendingSignal, PortRequest, PortRow};
+use super::app::{ConfigKind, Fetch, IdentityOn, IdentityReq, PendingDone, PendingSignal, PortRequest, PortRow};
+use super::prompt::PromptAction;
+use crate::serve::verbs_client::identity::{self, Ask, Group, Scope};
 use crate::build_log::Tail;
 use crate::config::SandboxText;
 use crate::inbox::{self, Op};
@@ -121,6 +129,13 @@ pub enum DaemonUpdate {
     /// A done-flag write's status line, `failed` or not, and the request's
     /// `report` (`PendingDone`).
     Done { status: String, failed: bool, report: bool },
+    /// [`IdentityReq::Offer`]'s findings, per root (none: nothing to offer,
+    /// or nothing could be read), and whether `U` asked.
+    IdentityOffer { groups: Vec<Group>, asked: bool },
+    /// [`IdentityReq::Answer`]'s outcome for `App::identity_answered`: what
+    /// it did (one line), `Err` for a file changed meanwhile; and the verb
+    /// it held.
+    Identity { outcome: Result<String, String>, then: Option<PromptAction> },
 }
 
 /// From the event loop to the worker.
@@ -146,6 +161,8 @@ enum Cmd {
     Rename { instance: String, new_name: String },
     /// `instances.done`.
     Done(PendingDone),
+    /// `config.findings` for the offer, or an identity modal's answer.
+    Identity(IdentityReq),
 }
 
 /// Handle to the daemon worker. Never blocks the UI thread; dropping it
@@ -234,6 +251,13 @@ impl DaemonWorker {
     /// [`DaemonUpdate::Done`].
     pub fn set_done(&self, req: PendingDone) {
         self.send(Cmd::Done(req));
+    }
+
+    /// Read the identity offer, or carry out a modal's answer. Never
+    /// blocks; answered by [`DaemonUpdate::IdentityOffer`] /
+    /// [`DaemonUpdate::Identity`].
+    pub fn identity(&self, req: IdentityReq) {
+        self.send(Cmd::Identity(req));
     }
 
     fn send(&self, cmd: Cmd) {
@@ -513,6 +537,24 @@ fn done_status(req: &PendingDone, answer: Answer) -> (String, bool) {
     }
 }
 
+/// The identity prompt's ask for the root at `route` (the default one: the
+/// dashboard's, `dir`); `None` for a machine whose root isn't known.
+fn identity_ask(dir: &Path, route: &Route, scope: Scope) -> Option<Ask> {
+    let root = match (&route.machine, &route.root) {
+        (None, _) => dir.to_path_buf(),
+        (Some(_), Some(root)) => PathBuf::from(root),
+        (Some(_), None) => return None,
+    };
+    Some(Ask { root, machine: route.machine.clone(), scope })
+}
+
+/// An identity answer's report as one status line: what the prompt's fns
+/// said (a YAML config's hand edits too), `; `-joined; `Err` the conflict.
+fn identity_outcome(done: Result<()>, said: Vec<String>) -> Result<String, String> {
+    done.map_err(|e| format!("{e:#}"))?;
+    Ok(said.iter().flat_map(|s| s.lines()).map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join("; "))
+}
+
 /// The API call for `forwards.list` of config root `dir`, plus every
 /// forward into a machine (they bind here whatever root they reach).
 fn list_call(dir: &Path) -> (&'static str, Value) {
@@ -700,6 +742,7 @@ fn run(dir: &Path, connector: &Connector, rx: Receiver<Cmd>, utx: Sender<DaemonU
             Ok(Cmd::Signal(sig)) => w.signal(sig),
             Ok(Cmd::Rename { instance, new_name }) => w.rename(&instance, &new_name),
             Ok(Cmd::Done(req)) => w.set_done(req),
+            Ok(Cmd::Identity(req)) => w.identity(req),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return,
         }
@@ -916,6 +959,46 @@ impl Worker<'_> {
         let answer = self.one_shot(what, done_call(&req));
         let (status, failed) = done_status(&req, answer);
         self.send(DaemonUpdate::Done { status, failed, report: req.report });
+    }
+
+    /// The identity calls (`config.findings`, `.migrate`, `.ack`) on this
+    /// connection, through the CLI prompt's own fns (`verbs_client::
+    /// identity`): a machine's root goes there (`machine`, in `QUICK`).
+    /// Disconnected, each call fails with [`needs_serve`]'s line, which the
+    /// fns turn into a left-out root or a warning.
+    fn identity(&mut self, req: IdentityReq) {
+        let dir = self.dir.to_path_buf();
+        let down = self.down.clone();
+        let mut broke = false;
+        let conn = &mut self.conn;
+        let mut call = |method: &str, params: Value| -> Result<Response> {
+            let Some(c) = conn.as_mut() else { anyhow::bail!("{}", needs_serve("config", down.as_deref())) };
+            c.call(method, params).inspect_err(|_| {
+                *conn = None;
+                broke = true;
+            })
+        };
+        let update = match req {
+            IdentityReq::Offer { routes, asked } => {
+                let asks = routes.iter().filter_map(|r| identity_ask(&dir, r, Scope::All)).collect();
+                DaemonUpdate::IdentityOffer { groups: identity::gather(asks, &mut call), asked }
+            }
+            IdentityReq::Answer { choice, on, then } => {
+                let groups = match on {
+                    IdentityOn::Groups(groups) => groups,
+                    IdentityOn::Notes { route, ids } => {
+                        identity::gather(identity_ask(&dir, &route, Scope::Ids(ids)).into_iter().collect(), &mut call)
+                    }
+                };
+                let mut said = Vec::new();
+                let done = identity::answer(&groups, choice, &mut call, &mut |line: &str| said.push(line.to_string()));
+                DaemonUpdate::Identity { outcome: identity_outcome(done, said), then }
+            }
+        };
+        if broke {
+            self.lost(false);
+        }
+        self.send(update);
     }
 
     /// One batch of ops, in order: through the daemon while connected, the
@@ -1259,6 +1342,32 @@ mod tests {
         assert_eq!(rx.try_recv().unwrap(), Cmd::Signal(sig("42")));
         assert_eq!(rx.try_recv().unwrap(), Cmd::Rename { instance: "a".into(), new_name: "b".into() });
         assert_eq!(rx.try_recv().unwrap(), Cmd::Done(done));
+    }
+
+    /// The identity request queues as its command; a route becomes the
+    /// prompt's ask (the dashboard's root here, a machine's root there,
+    /// none for a machine without one); the answer's lines join into one.
+    #[test]
+    fn identity_requests_queue_ask_and_report() {
+        let (tx, rx) = mpsc::channel();
+        let (_utx, updates) = mpsc::channel();
+        let worker = DaemonWorker { tx: Some(tx), updates, connected: Arc::default(), handle: None };
+        let offer = IdentityReq::Offer { routes: vec![Route::default()], asked: true };
+        worker.identity(offer.clone());
+        assert_eq!(rx.try_recv().unwrap(), Cmd::Identity(offer));
+
+        let dir = Path::new("/cfg");
+        let here = identity_ask(dir, &Route::default(), Scope::All).unwrap();
+        assert_eq!((here.root.as_path(), here.machine, here.scope), (dir, None, Scope::All));
+        let remote = Route { machine: Some("box".into()), root: Some("/r/one".into()) };
+        let there = identity_ask(dir, &remote, Scope::Ids(vec!["a".into()])).unwrap();
+        assert_eq!((there.root.as_path(), there.machine.as_deref()), (Path::new("/r/one"), Some("box")));
+        assert_eq!(identity_ask(dir, &Route { machine: Some("box".into()), root: None }, Scope::All), None);
+
+        let said = vec!["updated devsandboxes.toml (1 edit)".to_string(), "x.yaml: make these edits:\n  a\n  b".to_string()];
+        assert_eq!(identity_outcome(Ok(()), said), Ok("updated devsandboxes.toml (1 edit); x.yaml: make these edits:; a; b".into()));
+        assert_eq!(identity_outcome(Ok(()), Vec::new()), Ok(String::new()));
+        assert_eq!(identity_outcome(Err(anyhow::anyhow!("x changed")), Vec::new()), Err("x changed".into()));
     }
 
     #[test]

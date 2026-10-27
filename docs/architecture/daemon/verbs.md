@@ -125,7 +125,9 @@ config file and asks `[u]pdate / [c]ontinue as is (don't ask again) /
 - `s`: nothing.
 
 The verb is then sent, on the config as it now is. Nothing here blocks a
-verb otherwise: a root whose findings can't be read is left out.
+verb otherwise: a root whose findings can't be read is left out. The
+dashboard asks the same through modals, over the same fns
+([../dashboard/tabs-and-actions.md](../dashboard/tabs-and-actions.md#identity-modals)).
 
 With no daemon the same prompt runs before the in-process verb, its calls
 answered in this process by the API's own table (`identity::local_call`:

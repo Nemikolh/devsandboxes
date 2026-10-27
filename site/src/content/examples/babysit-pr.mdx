@@ -32,7 +32,7 @@ A **dispatcher** sandbox runs a shell loop you own. For each PR that is conflict
 [template.base]
 image = "node:22"
 # One gh login for every sandbox: `gh auth login` once, in any of them.
-mounts = ["source=${sharedVolumes}/gh,target=/root/.config/gh,type=bind"]
+mounts = ["source=${sharedVolumes}/gh,target=${containerEnv:HOME}/.config/gh,type=bind"]
 [template.base.features]
 "ghcr.io/devcontainers/features/github-cli:1" = true
 
@@ -47,8 +47,8 @@ postStartCommand = "nohup ./babysit-loop.sh >babysit.log 2>&1 &"
 extends = "base"
 folder = "../web"                  # your repo
 # Your Claude Code login and settings, from the host.
-mounts = ["source=${localEnv:HOME}/.claude,target=/root/.claude,type=bind"]
-containerEnv = { CLAUDE_CONFIG_DIR = "/root/.claude" }
+mounts = ["source=${localEnv:HOME}/.claude,target=${containerEnv:HOME}/.claude,type=bind"]
+containerEnv = { CLAUDE_CONFIG_DIR = "${containerEnv:HOME}/.claude" }
 [sandbox.web.postCreateCommand]
 git-auth = "gh auth setup-git"     # git fetch/push over https as your gh user
 git-identity = "git config --global user.name 'PR babysitter' && git config --global user.email you@example.com"
@@ -59,7 +59,7 @@ agent = "npm install -g @anthropic-ai/claude-code"
 [template.base]
 image = "node:22"
 # One gh login for every sandbox: `gh auth login` once, in any of them.
-mounts = ["source=${sharedVolumes}/gh,target=/root/.config/gh,type=bind"]
+mounts = ["source=${sharedVolumes}/gh,target=${containerEnv:HOME}/.config/gh,type=bind"]
 [template.base.features]
 "ghcr.io/devcontainers/features/github-cli:1" = true
 
@@ -74,7 +74,7 @@ postStartCommand = "nohup ./babysit-loop.sh >babysit.log 2>&1 &"
 extends = "base"
 folder = "../web"                  # your repo
 # Your Codex login and settings, from the host.
-mounts = ["source=${localEnv:HOME}/.codex,target=/root/.codex,type=bind"]
+mounts = ["source=${localEnv:HOME}/.codex,target=${containerEnv:HOME}/.codex,type=bind"]
 [sandbox.web.postCreateCommand]
 git-auth = "gh auth setup-git"     # git fetch/push over https as your gh user
 git-identity = "git config --global user.name 'PR babysitter' && git config --global user.email you@example.com"

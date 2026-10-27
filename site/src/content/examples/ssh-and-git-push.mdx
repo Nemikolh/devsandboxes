@@ -30,8 +30,8 @@ devsandbox forwards your host's **ssh-agent** instead: ssh inside the sandbox as
 folder = "../app"          # your repo, next to this config dir
 image = "node:22"
 # Your Claude Code login and settings, from the host.
-mounts = ["source=${localEnv:HOME}/.claude,target=/root/.claude,type=bind"]
-containerEnv = { CLAUDE_CONFIG_DIR = "/root/.claude" }
+mounts = ["source=${localEnv:HOME}/.claude,target=${containerEnv:HOME}/.claude,type=bind"]
+containerEnv = { CLAUDE_CONFIG_DIR = "${containerEnv:HOME}/.claude" }
 
 [sandbox.app.postCreateCommand]  # once, when an instance is created
 git-identity = "git config --global user.name 'Your Name' && git config --global user.email you@example.com"
@@ -44,7 +44,7 @@ agent = "npm install -g @anthropic-ai/claude-code"
 folder = "../app"          # your repo, next to this config dir
 image = "node:22"
 # Your Codex login and settings, from the host.
-mounts = ["source=${localEnv:HOME}/.codex,target=/root/.codex,type=bind"]
+mounts = ["source=${localEnv:HOME}/.codex,target=${containerEnv:HOME}/.codex,type=bind"]
 
 [sandbox.app.postCreateCommand]  # once, when an instance is created
 git-identity = "git config --global user.name 'Your Name' && git config --global user.email you@example.com"

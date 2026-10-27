@@ -143,10 +143,15 @@ limitation means editing this file in the same commit.
 - Identity: only rootful docker and VM-backed runtimes are exercised (CI's
   docker test); rootless docker, rootless podman, SELinux relabeling and
   `--socket-gid` have never run. → [identity](architecture/instances/identity.md)
-- Identity: under `identity = "host"` (the default) a mount, `workspaceFolder`
-  or env value under `/root` lands in a dir the adopted account can't
-  reach; set `identity = "image"` until the migration ships.
-  → [plan](plans/active/identity.md)
+- Identity: a `workspaceFolder` or `folders` target under `/root` isn't
+  rewritten by the migration (`config_identity::Kind::RootPath`, no edit);
+  under `identity = "host"` it stays unreachable for the adopted account
+  until fixed by hand. → [identity](architecture/instances/identity.md)
+- Identity modals (dashboard): the listing doesn't scroll, so one longer
+  than the screen is cut (`ui.rs` `draw_confirm_modal`); the offer reads a
+  machine's root only when its rows carry un-acked notes, so a machine's
+  unused templates show up only in that machine's own dashboard
+  (`identity::offer_routes`).
 - Identity prompt (CLI): with no daemon, `run` without a sandbox name
   doesn't prompt (the in-process pick comes after it; `run`'s warning
   still shows), and off unix nothing prompts (no verb client).

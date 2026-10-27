@@ -146,11 +146,10 @@ Each container is labelled with `config_hash` (hash of the merged sandbox table,
 ```toml
 [template.base]
 init = true
-remoteUser = "root"
 worktree-branch = "me/${instance}"
 caches = ["pnpm", "cargo"]
 persist-shell-history = true
-mounts = ["source=${sharedVolumes}/gh,target=/root/.config/gh,type=bind"]
+mounts = ["source=${sharedVolumes}/gh,target=${containerEnv:HOME}/.config/gh,type=bind"]
 
 [services.postgres]
 image = "postgres:16"

@@ -14,7 +14,8 @@ Code: `src/tui/app/mod.rs` (`Tab`, `App`, `dispatch_key`, `PortRow`,
 `remove_instance`, `attach_code`, `verb_answered`, `VerbEnd`,
 `PendingDone`), `src/tui/app/view.rs` (`Modal`, `Fetch`, `ConfigView`,
 `BuildLogModal`, `ConfirmModal`, `open_config`, `open_build_log`,
-`refresh_build_log`), `src/tui/ansi.rs`, `src/tui/mod.rs` (`run`,
+`refresh_build_log`), `src/tui/app/identity.rs` (`identity_gate`,
+`IdentityReq`, `IdentityOn`), `src/tui/ansi.rs`, `src/tui/mod.rs` (`run`,
 `spawn_verb`, `verb_call`, `verb_status`), `src/tui/daemon.rs` (`Cmd`,
 `DaemonUpdate`), `src/tui/ui.rs`.
 
@@ -64,8 +65,9 @@ connection is down, or after `STALE_AFTER_SECS` without a push.
 
 Above the Instances and Services tables (`ui.rs` `draw_status_lines`),
 each one row and only while set: `Snapshot.error` in red, then
-`identity_line` in yellow, `N sandboxes use /root`, counting the rows
-(a machine's included) with an un-acked identity note.
+`identity_line` in yellow, `N sandboxes use /root (U to update)`,
+counting the rows (a machine's included) with an un-acked identity note.
+`U` opens the offer ([Identity modals](#identity-modals)).
 
 ## Process layer
 
@@ -98,7 +100,9 @@ fills the modal if it is still the one open:
   `ansi::parse_line` (SGR only, other escapes dropped). While the instance
   is in flight, each snapshot triggers a re-read (one outstanding); it
   follows the bottom unless scrolled away.
-- `Confirm`: rm's branch question and "cancel the build?".
+- `Confirm`: rm's branch question, "cancel the build?", and the identity
+  modals (`Confirmed::Identity`/`IdentityOffer`, a listing under the
+  question: [Identity modals](#identity-modals)).
 - `?` → `Help`: settings toggles, then every key by context.
 
 ## One-key actions and the pending queue
@@ -143,5 +147,47 @@ its own process.
 thread actions), signals, cancel and the modal reads share the daemon
 worker's connection. Rows change with the next snapshot push, after which
 the processes are refetched.
+
+## Identity modals
+
+The dashboard's side of the identity migration
+([../config.md](../config.md#identity-findings)), the CLI prompt's
+counterpart ([../daemon/verbs.md](../daemon/verbs.md#the-identity-prompt)). Both go through
+the same fns, `serve::verbs_client::identity` (`gather`, `listing`,
+`answer`), which the daemon worker runs over its connection
+(`Cmd::Identity`, `Worker::identity`), a machine's root through that
+machine (`machine`, `config.*` being forwarded quick calls).
+
+- **Verb modal.** `take_pending_action` passes every queued action
+  through `identity_gate`, so a key and the `:` prompt alike get it: a
+  `run` (its sandbox) or `rebuild`/`start` (its instance's group,
+  `group_of`) whose sandbox row has un-acked notes isn't returned; a
+  `Confirm` modal holds it instead, listing those notes, `[u] update /
+  [c] continue as is (don't ask again) / [s] skip this time` (`esc`/`q`
+  skip too). Decided from the snapshot alone. `s` releases the verb
+  (`cleared_action`, returned next without asking again). `u`/`c` queue
+  an `IdentityReq::Answer` holding it, on the notes' ids
+  (`IdentityOn::Notes`, `Scope::Ids`: only what the modal listed is
+  touched): the worker reads the root's findings and does what the CLI's
+  `u`/`c` do (`config.migrate`; `config.ack`, a TOML root user kept by
+  `migrate {keep}`). Its `DaemonUpdate::Identity` carries the verb back:
+  `App::identity_answered` releases it, the update's line (a YAML
+  config's hand edits included) leading the verb's status line; a
+  `conflict` drops it, clearing its guards as a failed verb's
+  (`verb_answered`).
+- **Offer.** On the first snapshot (`identity_offered`, once per
+  dashboard) and on `U` (Instances and Services tabs), an
+  `IdentityReq::Offer` reads every un-acked finding, an unused template's
+  included (`Scope::All`), of the dashboard's root plus each machine root
+  whose rows carry un-acked notes (`offer_routes`). The answer
+  (`DaemonUpdate::IdentityOffer`, `App::identity_offer`) opens a modal
+  listing them per file, `[u] update / [c] continue as is / [l] later`;
+  `u`/`c` send `IdentityOn::Groups`, whose file hashes guard the write
+  (`conflict` when the file changed since). Nothing to list: `U` says
+  "no config uses /root", the first one says nothing; the first one
+  doesn't cover a modal already up.
+
+A rewrite changes `config_hash`, so the next push shows the affected
+instances drifted and their notes gone.
 
 Limitations: [status.md](../../status.md#dashboard)

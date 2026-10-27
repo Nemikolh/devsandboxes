@@ -13,8 +13,10 @@ use crate::snapshot::PhaseRow;
 use crate::tui::data::{ContainerStatus, InstanceRow, Node};
 use crate::tui::settings::{SETTINGS, Settings};
 use crate::tui::prompt::PromptAction;
-use crate::tui::remote::{instance_key, qualify, sandbox_key, service_key};
+use crate::serve::verbs_client::identity::{Choice, Group};
+use crate::tui::remote::{Route, instance_key, qualify, sandbox_key, service_key};
 
+use super::identity::IdentityOn;
 use super::{App, Tab};
 
 /// Keybinding reference shown by the `?` overlay, grouped by context;
@@ -45,8 +47,12 @@ Tables (Instances / Services)
   d           remove the instance now, no prompt (Instances; like :rm,
               so a dirty worktree still refuses); on an instance still
               building: cancel it, after a y/n (a cancelled run is undone)
+  U           update configs that assume root in the container (the
+              header's \"uses /root\" line): update / continue as is / later
   run, rebuild and start (s, :run, :rebuild, :start) run in the background
-  and outlive the dashboard: the row shows their phase, b their output
+  and outlive the dashboard: the row shows their phase, b their output;
+  on a sandbox that uses /root they ask first: update / continue as is /
+  skip this time
 
 Ports tab
   ↑/k ↓/j     move selection
@@ -299,32 +305,62 @@ fn build_log_title(instance: &str, phase: Option<&PhaseRow>) -> String {
     }
 }
 
-/// A yes/no question over the dashboard (`d` on an in-flight row, rm's
-/// branch question): `y` or `enter` goes ahead, `n`/`esc`/`q` doesn't. For
-/// rm, `n` is an answer too (keep the branch) and only `esc`/`q` abort.
+/// A question over the dashboard (`d` on an in-flight row, rm's branch
+/// question, the identity modals): `y` or `enter` goes ahead, `n`/`esc`/`q`
+/// doesn't. For rm, `n` is an answer too (keep the branch) and only
+/// `esc`/`q` abort. The identity ones (`identity.rs`) list `body` under the
+/// question and take `u`/`c`/`s` (the offer: `u`/`c`/`l`), `esc`/`q` being
+/// a skip.
 pub struct ConfirmModal {
     pub question: String,
+    /// Lines listed under the question (the identity findings).
+    pub body: Vec<String>,
     action: Confirmed,
 }
 
 impl ConfirmModal {
+    pub(super) fn new(question: String, body: Vec<String>, action: Confirmed) -> ConfirmModal {
+        ConfirmModal { question, body, action }
+    }
+
     /// The help bar's keys for this question.
     pub fn keys_hint(&self) -> &'static str {
         match self.action {
             Confirmed::CancelBuild(_) => "y/enter yes · n/esc no",
             Confirmed::RmBranch { .. } => "y/enter yes · n no · esc cancel",
+            Confirmed::Identity { .. } => "u update · c continue as is · s/esc skip",
+            Confirmed::IdentityOffer(_) => "u update · c continue as is · l/esc later",
         }
+    }
+
+    /// The choices line the modal shows under the question.
+    pub fn choices(&self) -> &'static str {
+        match self.action {
+            Confirmed::CancelBuild(_) | Confirmed::RmBranch { .. } => "[y] yes  [n] no",
+            Confirmed::Identity { .. } => "[u] update  [c] continue as is (don't ask again)  [s] skip this time",
+            Confirmed::IdentityOffer(_) => "[u] update  [c] continue as is  [l] later",
+        }
+    }
+
+    /// One of the identity modals.
+    pub fn is_identity(&self) -> bool {
+        matches!(self.action, Confirmed::Identity { .. } | Confirmed::IdentityOffer(_))
     }
 }
 
 /// What a [`ConfirmModal`]'s answer does.
 #[derive(Clone)]
-enum Confirmed {
+pub(super) enum Confirmed {
     /// Cancel the instance's `run`/`rebuild`/`start` (`App::pending_cancel`).
     CancelBuild(String),
     /// Resend rm with the answer as `deleteBranch` (the CLI's
     /// `verbs_client::with_confirm`), same `force`, no `ask`.
     RmBranch { instance: String, force: bool },
+    /// The verb `action`, held for its sandbox's un-acked identity notes
+    /// `ids` (config at `route`).
+    Identity { route: Route, ids: Vec<String>, action: PromptAction },
+    /// The offer's findings.
+    IdentityOffer(Vec<Group>),
 }
 
 /// How many lines dropped off the top of a log's window between two reads,
@@ -585,6 +621,26 @@ impl App {
                     view.on_scroll_key(key);
                 }
             }
+            Modal::Confirm(view) if view.is_identity() => {
+                let offer = matches!(view.action, Confirmed::IdentityOffer(_));
+                let choice = match key.code {
+                    KeyCode::Char('u') => Choice::Update,
+                    KeyCode::Char('c') => Choice::Keep,
+                    KeyCode::Char('s') if !offer => Choice::Skip,
+                    KeyCode::Char('l') if offer => Choice::Skip,
+                    KeyCode::Esc | KeyCode::Char('q') => Choice::Skip,
+                    _ => return,
+                };
+                let action = view.action.clone();
+                self.modal = Modal::None;
+                match action {
+                    Confirmed::Identity { route, ids, action } => {
+                        self.identity_chosen(choice, IdentityOn::Notes { route, ids }, Some(action));
+                    }
+                    Confirmed::IdentityOffer(groups) => self.identity_chosen(choice, IdentityOn::Groups(groups), None),
+                    _ => {}
+                }
+            }
             Modal::Confirm(view) => {
                 let yes = match key.code {
                     KeyCode::Char('y') | KeyCode::Enter => Some(true),
@@ -606,6 +662,7 @@ impl App {
                     (Confirmed::RmBranch { instance, .. }, None) => {
                         self.status = Some(format!("rm {instance}: cancelled"));
                     }
+                    (Confirmed::Identity { .. } | Confirmed::IdentityOffer(_), _) => {}
                 }
             }
         }
@@ -614,15 +671,16 @@ impl App {
     /// rm's branch `question` for `instance` (its `confirm` answer), shown
     /// as rm words it.
     pub(super) fn confirm_rm_branch(&mut self, instance: String, force: bool, question: String) {
-        self.modal = Modal::Confirm(ConfirmModal { question, action: Confirmed::RmBranch { instance, force } });
+        self.modal = Modal::Confirm(ConfirmModal::new(question, Vec::new(), Confirmed::RmBranch { instance, force }));
     }
 
     /// Ask before cancelling `instance`'s build (`d` on an in-flight row).
     pub(super) fn confirm_cancel_build(&mut self, instance: String) {
-        self.modal = Modal::Confirm(ConfirmModal {
-            question: format!("cancel {instance}'s build?"),
-            action: Confirmed::CancelBuild(instance),
-        });
+        self.modal = Modal::Confirm(ConfirmModal::new(
+            format!("cancel {instance}'s build?"),
+            Vec::new(),
+            Confirmed::CancelBuild(instance),
+        ));
     }
 
     /// Take the instance whose build the event loop should cancel.
@@ -1225,8 +1283,8 @@ mod tests {
         assert!(matches!(app.modal, Modal::None));
         // Nor into another modal.
         app.open_help();
-        app.set_logs("devsandbox-b", "late".into());
-        assert!(!help(&app).text.body.contains("late"));
+        app.set_logs("devsandbox-b", "a late answer".into());
+        assert!(!help(&app).text.body.contains("a late answer"));
     }
 
     #[test]

@@ -25,7 +25,8 @@ describe('agents', () => {
 describe('splitTerms', () => {
   it('prefers the longest term', () => {
     expect(matches('npm install -g @anthropic-ai/claude-code')).toEqual(['@anthropic-ai/claude-code']);
-    expect(matches('target=/root/.claude,type=bind')).toEqual(['.claude']);
+    expect(matches('target=${containerEnv:HOME}/.claude,type=bind')).toEqual(['.claude']);
+    expect(matches('CLAUDE_CONFIG_DIR = "${containerEnv:HOME}/.claude"')).toEqual(['CLAUDE_CONFIG_DIR', '.claude']);
   });
 
   it('skips terms glued to a longer word', () => {

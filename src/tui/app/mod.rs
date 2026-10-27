@@ -22,6 +22,7 @@ use super::term::{TermParser, TermTabs};
 mod actions;
 mod command_line;
 mod forms;
+mod identity;
 mod inbox;
 mod procs;
 mod selection;
@@ -39,6 +40,7 @@ pub use inbox::{
 };
 pub use forms::{form_lines, form_title, forms_offset, pinned_forms, FormSpot};
 pub use actions::{PendingDone, VerbEnd, not_yet_code};
+pub use identity::{IdentityOn, IdentityReq};
 pub use procs::{PendingSignal, Signal};
 pub use selection::{copy_key_intercepted, Extract};
 pub use terminal::{ExecCli, Redial};
@@ -161,6 +163,16 @@ pub struct App {
     /// Action awaiting execution by the event loop (it sends the verb
     /// request, or suspends for `exec`, keeping [`App`] I/O-free).
     pub pending_action: Option<PromptAction>,
+    /// A verb the identity modal let go (`identity.rs`): returned by
+    /// [`Self::take_pending_action`] ahead of `pending_action`, unasked.
+    cleared_action: Option<PromptAction>,
+    /// The identity request (the offer's read, a modal's answer) for the
+    /// event loop to hand the daemon worker.
+    pending_identity: Option<IdentityReq>,
+    /// The first snapshot asked for the identity offer.
+    identity_offered: bool,
+    /// What an identity answer did, for the released verb's status line.
+    identity_note: Option<String>,
     /// Appended to the status line the event loop writes after launching a
     /// [`PromptAction::Code`]: an Inbox `vscode` action's caveats (a goto it
     /// couldn't honor, the event and child done queued), which would
@@ -308,6 +320,10 @@ impl App {
             modal: Modal::None,
             prompt: None,
             pending_action: None,
+            cleared_action: None,
+            pending_identity: None,
+            identity_offered: false,
+            identity_note: None,
             code_note: None,
             stopping: BTreeSet::new(),
             starting: BTreeSet::new(),
@@ -360,6 +376,7 @@ impl App {
         self.clamp_selection();
         self.refresh_build_log();
         self.run_after_start();
+        self.offer_identity_once();
     }
 
     /// Install the daemon's latest forward rows and re-clamp the Ports
@@ -600,6 +617,9 @@ impl App {
             KeyCode::Char('d') if self.tab == Tab::Ports => self.stop_selected_forward(),
             KeyCode::Char('a') if self.tab == Tab::Machines => self.toggle_selected_agent(),
             KeyCode::Char('D') if self.tab == Tab::Inbox => self.clear_notifications(),
+            KeyCode::Char('U') if matches!(self.tab, Tab::Instances | Tab::Services) => {
+                self.request_identity_offer()
+            }
             KeyCode::Char('?') => self.open_help(),
             _ => {}
         }

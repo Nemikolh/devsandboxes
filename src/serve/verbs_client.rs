@@ -40,7 +40,7 @@ use crate::Command;
 use crate::commands::run::cancel;
 use crate::state::PhaseView;
 
-mod identity;
+pub(crate) mod identity;
 
 use identity::{Ask, Scope};
 

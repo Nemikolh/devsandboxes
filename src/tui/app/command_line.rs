@@ -455,9 +455,16 @@ impl App {
         self.snapshot.as_ref().map(|s| remote::candidates(s, remote::Kind::Service)).unwrap_or_default()
     }
 
-    /// Take the pending action for the event loop to execute, if any.
+    /// Take the pending action for the event loop to execute, if any: one
+    /// the identity modal released first, else the queued one, unless that
+    /// opens the identity modal (`identity.rs`), which then holds it.
     pub fn take_pending_action(&mut self) -> Option<PromptAction> {
-        self.pending_action.take()
+        if let Some(action) = self.cleared_action.take() {
+            return Some(action);
+        }
+        // A build verb on a sandbox using /root asks first (`identity.rs`).
+        let action = self.pending_action.take()?;
+        self.identity_gate(action)
     }
 }
 
