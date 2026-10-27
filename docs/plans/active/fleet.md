@@ -1,8 +1,10 @@
 # Fleet: machines as one pool of capacity
 
 Status: in progress
-Commit 1a (link primitive) shipped: `serve::fleet::link`, `channel::API`
-([fleet](../../architecture/daemon/fleet.md)); the rest is design. Builds on [machines](../../architecture/daemon/machines.md)
+Commit 1a (link primitive) shipped: `serve::fleet::link`, `channel::API`;
+1b (hub side) shipped: `fleet-link`, `fleet.offer`, the `offered` registry
+kind and its dial ([fleet](../../architecture/daemon/fleet.md)); the rest
+is design. Builds on [machines](../../architecture/daemon/machines.md)
 and supersedes nothing yet; [machines-next](machines-next.md) items 2 and 3
 fold into step 8 here, its parked auto-update and PTY attach into steps
 2 and 4.

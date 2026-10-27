@@ -58,7 +58,7 @@ const LOCAL_COMMAND: &str = "~/.local/bin/devsandbox";
 /// machine's `command`: `None` is `devsandbox` on its login `PATH`.
 fn ensure_devsandbox(target: &str, auto_install: bool) -> Result<Option<String>> {
     let ours = env!("CARGO_PKG_VERSION");
-    let entry = Entry { name: target.into(), target: target.into(), roots: vec![], command: None, agent: false };
+    let entry = Entry::ssh(target, target);
     let remote = install::check(&entry, None)?;
     let found_command = remote.off_path.then(|| LOCAL_COMMAND.to_string());
     if found_command.is_some() {
@@ -259,14 +259,16 @@ fn call<T: DeserializeOwned>(conn: &mut Conn, method: &str, params: Value) -> Re
     serde_json::from_value(r.result.unwrap_or(Value::Null)).with_context(|| format!("unexpected {method} answer"))
 }
 
-/// `ls`'s cells: the first root and how many more.
+/// `ls`'s cells: the first root and how many more; an offered fleet
+/// worker's TARGET is `offered` (it has none).
 fn cells(r: MachineRow) -> [String; 6] {
     let roots = match r.roots.split_first() {
         None => "-".to_string(),
         Some((first, [])) => first.display().to_string(),
         Some((first, rest)) => format!("{} +{}", first.display(), rest.len()),
     };
-    [r.name, r.target, roots, on_off(r.agent).into(), r.state.as_str().into(), r.version.unwrap_or_else(|| "-".into())]
+    let target = r.target.unwrap_or_else(|| "offered".into());
+    [r.name, target, roots, on_off(r.agent).into(), r.state.as_str().into(), r.version.unwrap_or_else(|| "-".into())]
 }
 
 /// A candidate as the picker shows it: `/home/me/.devsandboxes  (api, web)`.
@@ -515,7 +517,8 @@ mod tests {
     fn ls_cells_show_the_first_root() {
         let row = |roots: &[&str], version: Option<&str>| MachineRow {
             name: "m".into(),
-            target: "me@m".into(),
+            kind: crate::serve::machines::MachineKind::Ssh,
+            target: Some("me@m".into()),
             roots: roots.iter().map(Into::into).collect(),
             command: None,
             agent: false,
@@ -527,5 +530,7 @@ mod tests {
         assert_eq!(cells(row(&["/a", "/b", "/c"], Some("0.7.0")))[2..], ["/a +2", "off", "idle", "0.7.0"].map(String::from));
         assert_eq!(cells(MachineRow { agent: true, ..row(&[], None) })[3], "on");
         assert_eq!(cells(row(&[], None))[2], "-");
+        let offered = MachineRow { kind: crate::serve::machines::MachineKind::Offered, target: None, ..row(&[], None) };
+        assert_eq!(cells(offered)[1], "offered");
     }
 }

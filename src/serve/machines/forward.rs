@@ -520,8 +520,8 @@ mod tests {
             std::fs::write(&local_state, instance("web-l", "web", &local_root)).unwrap();
 
             let registry = base.join("machines.toml");
-            let boxed = Entry { name: "box".into(), target: "me@box".into(), roots: vec![remote_root.clone()], command: None, agent: false };
-            let down = Entry { name: "down".into(), target: "me@down".into(), roots: vec!["/nonexistent".into()], command: None, agent: false };
+            let boxed = Entry { roots: vec![remote_root.clone()], ..Entry::ssh("box", "me@box") };
+            let down = Entry { roots: vec!["/nonexistent".into()], ..Entry::ssh("down", "me@down") };
             crate::serve::machines::update(&registry, |e| e.extend([boxed, down])).unwrap();
 
             let remote_dir = base.join("remote");

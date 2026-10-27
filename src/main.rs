@@ -374,6 +374,16 @@ enum Command {
         #[arg(long)]
         client: String,
     },
+    /// The hub's end of a fleet worker's link (docs/architecture/daemon/fleet.md,
+    /// *Hub side*): offer the worker to this host's daemon and carry its API
+    /// over stdin/stdout
+    #[cfg(unix)]
+    #[command(hide = true)]
+    FleetLink {
+        /// The worker's machine name: names the socket and its offered entry
+        #[arg(long)]
+        worker: String,
+    },
     /// Register remote hosts (over ssh) whose sandboxes this one manages
     /// (docs/architecture/daemon/machines.md)
     #[cfg(unix)]
@@ -766,6 +776,8 @@ fn main() -> Result<()> {
         Command::Tunnel { instance, service, port } => commands::tunnel::tunnel(cli.dir, instance, service, port),
         #[cfg(unix)]
         Command::AgentRelay { client } => commands::agent_relay::agent_relay(&client),
+        #[cfg(unix)]
+        Command::FleetLink { worker } => commands::fleet_link::fleet_link(&worker),
         #[cfg(unix)]
         Command::Machine { cmd } => match cmd {
             MachineCommand::Add { target, name, configs, agent, auto_install } => {

@@ -84,6 +84,15 @@ pub fn agent_socket(dir: &Path, client: &str) -> PathBuf {
     dir.join(format!("agent-{}.sock", agent_socket_name(client)))
 }
 
+/// An offered fleet worker's socket in `dir` (docs/architecture/daemon/fleet.md,
+/// *Hub side*): `fleet-<worker>.sock`, bound by its `fleet-link` and dialed
+/// by this host's link to the worker. The name is cut like
+/// [`agent_socket`]'s client (a valid machine name needs only the length
+/// cut).
+pub fn fleet_socket(dir: &Path, worker: &str) -> PathBuf {
+    dir.join(format!("fleet-{}.sock", agent_socket_name(worker)))
+}
+
 fn agent_socket_name(client: &str) -> String {
     let safe: String = client
         .chars()
@@ -268,6 +277,14 @@ mod tests {
         let name = a.file_name().unwrap().to_str().unwrap();
         assert_eq!(name.len(), "agent-".len() + AGENT_CLIENT_MAX + ".sock".len());
         assert!(name.starts_with("agent-machine_hhh"), "{name}");
+    }
+
+    #[test]
+    fn fleet_sockets_are_named_after_the_worker() {
+        let dir = Path::new("/run/user/1000/devsandbox");
+        assert_eq!(fleet_socket(dir, "lap.top"), dir.join("fleet-lap.top.sock"));
+        let long = fleet_socket(dir, &"w".repeat(80));
+        assert_eq!(long.file_name().unwrap().len(), "fleet-".len() + AGENT_CLIENT_MAX + ".sock".len());
     }
 
     #[test]

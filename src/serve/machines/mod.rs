@@ -1,6 +1,8 @@
 //! Machines: remote hosts whose daemons this one talks to over
 //! `ssh <target> devsandbox api --stdio`
-//! (docs/architecture/daemon/machines.md).
+//! (docs/architecture/daemon/machines.md), or, for an offered fleet worker,
+//! over the `API` streams of the link it holds to this host
+//! (docs/architecture/daemon/fleet.md, `fleet::offer::dial`).
 //!
 //! - this module: the registry, `machines.toml` next to `state.toml`
 //! - `ssh`: the ssh argv and quoting, and the injectable [`ssh::Dial`] that
@@ -42,32 +44,157 @@ pub mod ssh;
 
 /// One registered machine, as `machines.toml` holds it under
 /// `[machine.<name>]` (docs/architecture/daemon/machines.md, *Registry:
-/// `machines.toml`*).
+/// `machines.toml`*). In the file the kind is `target = "…"` (ssh) or
+/// `offered = true`, exactly one of them ([`RawEntry`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RawEntry", into = "RawEntry")]
 pub struct Entry {
     /// The table key, so not a field of its own in the file.
-    #[serde(skip)]
     pub name: String,
-    /// What ssh takes (`me@host`, `host`, an ssh-config alias) or an
-    /// `ssh://` URL ([`ssh::parse_target`]).
-    pub target: String,
+    /// How this host reaches the machine.
+    pub kind: Kind,
     /// Config roots on the machine, as the remote canonicalized them.
-    #[serde(default)]
     pub roots: Vec<PathBuf>,
     /// The remote devsandbox as shell text (`~/bin/devsandbox`); `None` is
     /// `devsandbox` on the login shell's `PATH`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
     /// This host's ssh-agent is relayed to the machine while its link is
     /// wanted (docs/architecture/daemon/machines.md, *Agent*); off by
     /// default, and only written when on.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub agent: bool,
 }
 
+/// How a machine is reached.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Kind {
+    /// This host sshes to it: `target` is what ssh takes (`me@host`, `host`,
+    /// an ssh-config alias) or an `ssh://` URL ([`ssh::parse_target`]).
+    Ssh { target: String },
+    /// A fleet worker that dialed this host (docs/architecture/daemon/fleet.md,
+    /// *Hub side*): reached only over the `API` channel of its held fleet
+    /// link, through `fleet-<name>.sock`; nothing here can ssh to it.
+    Offered,
+}
+
+/// [`Kind`] on the wire (`kind` of `machines.list` / `get` and the
+/// federated snapshot's `machines`, next to a `target` that is `null` for an
+/// offered machine).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MachineKind {
+    #[default]
+    Ssh,
+    Offered,
+}
+
+impl Kind {
+    /// The wire's `kind` and `target`.
+    pub fn wire(&self) -> (MachineKind, Option<String>) {
+        match self {
+            Kind::Ssh { target } => (MachineKind::Ssh, Some(target.clone())),
+            Kind::Offered => (MachineKind::Offered, None),
+        }
+    }
+
+    /// Back from the wire's `kind` and `target`: an ssh machine needs its
+    /// target.
+    pub fn from_wire(kind: MachineKind, target: Option<String>) -> Result<Kind> {
+        match (kind, target) {
+            (MachineKind::Ssh, Some(target)) => Ok(Kind::Ssh { target }),
+            (MachineKind::Ssh, None) => bail!("an ssh machine without a target"),
+            (MachineKind::Offered, _) => Ok(Kind::Offered),
+        }
+    }
+}
+
 impl Entry {
+    /// An ssh machine with no roots yet, `command` and `agent` unset.
+    pub fn ssh(name: impl Into<String>, target: impl Into<String>) -> Entry {
+        Entry { name: name.into(), kind: Kind::Ssh { target: target.into() }, roots: Vec::new(), command: None, agent: false }
+    }
+
+    /// An offered fleet worker as its first `fleet.offer` writes it.
+    pub fn offered(name: impl Into<String>) -> Entry {
+        Entry { name: name.into(), kind: Kind::Offered, roots: Vec::new(), command: None, agent: false }
+    }
+
     pub fn command(&self) -> &str {
         self.command.as_deref().unwrap_or("devsandbox")
+    }
+
+    /// The ssh target; `None` for an offered machine.
+    pub fn target(&self) -> Option<&str> {
+        match &self.kind {
+            Kind::Ssh { target } => Some(target),
+            Kind::Offered => None,
+        }
+    }
+
+    pub fn is_offered(&self) -> bool {
+        self.kind == Kind::Offered
+    }
+
+    /// What messages and listings call where it is: the target, or
+    /// `offered`.
+    pub fn label(&self) -> &str {
+        self.target().unwrap_or("offered")
+    }
+
+    /// The ssh target, for the argv builders ([`ssh`]): an offered machine
+    /// has none, so whatever needs an ssh to it is refused
+    /// ([`offered_refusal`]).
+    pub fn ssh_target(&self) -> Result<&str> {
+        self.target().ok_or_else(|| offered_refusal(&self.name))
+    }
+}
+
+/// Why an ssh path (exec, terminal tabs, forwards, CLI re-runs, the agent
+/// relay) can't reach an offered machine: until fleet step 4 its link
+/// carries only the API.
+pub fn offered_refusal(name: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "machine `{name}` is an offered fleet worker, reached only through its fleet link's API: \
+         this needs ssh to it (exec, terminals, forwards and CLI re-runs there need fleet step 4)"
+    )
+}
+
+/// [`Entry`] as the file holds it.
+#[derive(Serialize, Deserialize)]
+struct RawEntry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    offered: bool,
+    #[serde(default)]
+    roots: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    command: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    agent: bool,
+}
+
+impl TryFrom<RawEntry> for Entry {
+    type Error = String;
+
+    /// The name is the table key: [`parse`] fills it in.
+    fn try_from(raw: RawEntry) -> Result<Entry, String> {
+        let kind = match (raw.target, raw.offered) {
+            (Some(target), false) => Kind::Ssh { target },
+            (None, true) => Kind::Offered,
+            (Some(_), true) => return Err("`target` and `offered = true` both set".into()),
+            (None, false) => return Err("no `target` (or `offered = true`)".into()),
+        };
+        Ok(Entry { name: String::new(), kind, roots: raw.roots, command: raw.command, agent: raw.agent })
+    }
+}
+
+impl From<Entry> for RawEntry {
+    fn from(e: Entry) -> RawEntry {
+        let (target, offered) = match e.kind {
+            Kind::Ssh { target } => (Some(target), false),
+            Kind::Offered => (None, true),
+        };
+        RawEntry { target, offered, roots: e.roots, command: e.command, agent: e.agent }
     }
 }
 
@@ -228,7 +355,7 @@ mod tests {
     use super::*;
 
     fn entry(name: &str, target: &str) -> Entry {
-        Entry { name: name.into(), target: target.into(), roots: vec!["/srv/a".into()], command: None, agent: false }
+        Entry { roots: vec!["/srv/a".into()], ..Entry::ssh(name, target) }
     }
 
     #[test]
@@ -258,9 +385,32 @@ mod tests {
         assert_eq!(parse(&text).unwrap(), want);
         assert_eq!(parse("").unwrap(), vec![]);
         let minimal = parse("[machine.m]\ntarget = \"m\"\n").unwrap();
-        assert_eq!(minimal, vec![Entry { name: "m".into(), target: "m".into(), roots: vec![], command: None, agent: false }]);
+        assert_eq!(minimal, vec![Entry::ssh("m", "m")]);
         assert!(parse("[machine.\"a/b\"]\ntarget = \"m\"\n").is_err(), "a bad name fails the file");
         assert!(parse("[machine.m]\n").is_err(), "no target");
+    }
+
+    #[test]
+    fn offered_entries_round_trip_as_offered_true() {
+        let entries = vec![Entry::offered("lap"), entry("srv", "me@srv")];
+        let text = serialize(&entries).unwrap();
+        assert_eq!(text.matches("offered = true").count(), 1, "{text}");
+        assert_eq!(text.matches("target").count(), 1, "{text}");
+        assert!(!text.contains("offered = false"), "{text}");
+        assert_eq!(parse(&text).unwrap(), entries);
+        assert_eq!(parse("[machine.lap]\noffered = true\n").unwrap(), vec![Entry::offered("lap")]);
+        let both = parse("[machine.m]\ntarget = \"m\"\noffered = true\n").unwrap_err();
+        assert!(format!("{both:#}").contains("both set"), "{both:#}");
+        assert!(parse("[machine.m]\noffered = false\n").is_err(), "neither");
+
+        let lap = Entry::offered("lap");
+        assert_eq!((lap.target(), lap.label(), lap.is_offered()), (None, "offered", true));
+        assert!(format!("{:#}", lap.ssh_target().unwrap_err()).contains("fleet step 4"));
+        assert_eq!(entry("srv", "me@srv").ssh_target().unwrap(), "me@srv");
+        assert_eq!(Kind::Offered.wire(), (MachineKind::Offered, None));
+        assert_eq!(Kind::from_wire(MachineKind::Ssh, Some("t".into())).unwrap(), Kind::Ssh { target: "t".into() });
+        assert_eq!(Kind::from_wire(MachineKind::Offered, None).unwrap(), Kind::Offered);
+        assert!(Kind::from_wire(MachineKind::Ssh, None).is_err());
     }
 
     #[test]

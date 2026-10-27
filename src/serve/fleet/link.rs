@@ -107,13 +107,17 @@ enum OpenerEnd {
 /// The opener over `reader`/`writer` with its socket at `socket` (temp name
 /// in the same dir): bind, sentinel and `Hello`s (the peer must advertise
 /// `spec.cap`), then accept and relay until it ends (see the module doc).
-/// `Ok` when the peer went away (the reader ended or the writer broke,
-/// whichever was seen first).
+/// `on_ready` runs once the `Hello`s are through, with the peer's (its
+/// `hash` is what the far end's spec says, e.g. its semver), before the
+/// first accept; its error ends the opener (the socket unlinked) with that
+/// error. `Ok` when the peer went away (the reader ended or the writer
+/// broke, whichever was seen first).
 pub fn opener(
     spec: &Spec,
     mut reader: impl Read + Send + 'static,
     writer: impl Write + Send + 'static,
     socket: &Path,
+    on_ready: impl FnOnce(&proto::Peer) -> Result<()>,
 ) -> Result<()> {
     // Bound before the `Hello`s, so once this end has answered, the socket
     // is there.
@@ -126,6 +130,7 @@ pub fn opener(
     if peer.caps & spec.cap == 0 {
         bail!("the peer serves no {}", spec.serves);
     }
+    on_ready(&peer)?;
     let mux = Mux::new(writer);
     let dead = tx.clone();
     mux.keepalive(mux::KEEPALIVE_INTERVAL, mux::KEEPALIVE_TIMEOUT, move || {
@@ -332,7 +337,7 @@ mod tests {
         let (a_r, o_w) = std::io::pipe().unwrap();
         let (o_r, a_w) = std::io::pipe().unwrap();
         let path = socket.to_path_buf();
-        std::thread::spawn(move || opener(&LINK, o_r, o_w, &path));
+        std::thread::spawn(move || opener(&LINK, o_r, o_w, &path, |_| Ok(())));
         std::thread::spawn(move || answerer(&LINK, a_r, a_w, open, || {}, || {}));
         wait_for(|| UnixStream::connect(socket).is_ok(), "the opener's socket accepts");
     }

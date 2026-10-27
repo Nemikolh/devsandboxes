@@ -116,9 +116,13 @@ pub fn service_route(s: &Snapshot, key: &str) -> Route {
 }
 
 /// An ssh [`Entry`] from a snapshot's machine entry (its roots aren't
-/// needed for an argv).
+/// needed for an argv). An offered machine's makes every argv builder
+/// refuse with why; an ssh one without a target (a malformed snapshot), with
+/// "empty ssh target".
 fn entry(m: &SnapshotMachine) -> Entry {
-    Entry { name: m.name.clone(), target: m.target.clone(), roots: Vec::new(), command: m.command.clone(), agent: m.agent }
+    use crate::serve::machines::Kind as Via;
+    let kind = Via::from_wire(m.kind, m.target.clone()).unwrap_or(Via::Ssh { target: String::new() });
+    Entry { name: m.name.clone(), kind, roots: Vec::new(), command: m.command.clone(), agent: m.agent }
 }
 
 fn lossy(argv: Vec<std::ffi::OsString>) -> Vec<String> {
@@ -270,7 +274,8 @@ pub(crate) mod tests {
     pub(crate) fn sm(name: &str, state: LinkState) -> SnapshotMachine {
         SnapshotMachine {
             name: name.into(),
-            target: format!("me@{name}"),
+            kind: Default::default(),
+            target: Some(format!("me@{name}")),
             state,
             error: None,
             version: None,
@@ -352,7 +357,7 @@ pub(crate) mod tests {
     #[test]
     fn terminal_argvs_go_over_ssh() {
         let mut m = sm("box", LinkState::Connected);
-        m.target = "ssh://me@box:2222".into();
+        m.target = Some("ssh://me@box:2222".into());
         m.command = Some("~/bin/devsandbox".into());
         assert_eq!(
             exec_argv(&m, "/r/one", "web-2", &[]).unwrap(),
@@ -385,6 +390,12 @@ pub(crate) mod tests {
         assert!(argv[6].starts_with(r#"exec "$SHELL" -lc 'exec podman '\''exec'\'' '\''-i'\'' '\''-t'\'' '\''devsandbox-svc-db'\''"#), "{}", argv[6]);
         m.runtime = None;
         assert!(service_argv(&m, "c").unwrap()[6].contains("exec docker "));
+
+        // An offered worker has no ssh: its tabs say why.
+        let lap = SnapshotMachine { kind: crate::serve::machines::MachineKind::Offered, target: None, ..sm("lap", LinkState::Connected) };
+        for argv in [exec_argv(&lap, "/r", "w", &[]), service_argv(&lap, "c")] {
+            assert!(argv.unwrap_err().contains("offered fleet worker"));
+        }
     }
 
     #[test]

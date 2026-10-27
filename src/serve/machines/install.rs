@@ -201,14 +201,14 @@ pub fn decide(remote: &Remote, ours: &str) -> Plan {
 /// login `PATH`).
 pub fn check(entry: &Entry, program: Option<&str>) -> Result<Remote> {
     let argv = ssh::script_argv(entry, CHECK, &[program.unwrap_or("")])?;
-    check_with(&argv).with_context(|| format!("cannot check devsandbox on {}", entry.target))
+    check_with(&argv).with_context(|| format!("cannot check devsandbox on {}", entry.label()))
 }
 
 /// Copy `binary` to `dest` on `entry` (`None`: [`DEFAULT_DEST`]) with
 /// [`INSTALL`]; the installed path, expanded.
 pub fn install(entry: &Entry, dest: Option<&str>, binary: &Path) -> Result<String> {
     let argv = ssh::script_argv(entry, INSTALL, &[dest.unwrap_or("")])?;
-    install_with(&argv, binary).with_context(|| format!("cannot install devsandbox on {}", entry.target))
+    install_with(&argv, binary).with_context(|| format!("cannot install devsandbox on {}", entry.label()))
 }
 
 fn check_with(argv: &[OsString]) -> Result<Remote> {

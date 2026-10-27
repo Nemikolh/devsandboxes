@@ -1550,7 +1550,7 @@ mod tests {
         // machine's first.
         let there = [
             ("instances.resolve", ok(json!({"matches": ["w"], "found": [{"name": "w", "machine": null, "root": null}]}))),
-            ("machines.get", ok(json!({"name": "a", "target": "me@a", "command": null, "roots": ["/r1", "/r2"], "agent": false}))),
+            ("machines.get", ok(json!({"name": "a", "kind": "ssh", "target": "me@a", "command": null, "roots": ["/r1", "/r2"], "agent": false}))),
         ];
         let (p, calls, _, _) = prep_fed(&CliVerb::Rm { name: "a/w".into(), delete_branch: None, force: true }, &FED, false, None, &there, 0);
         assert_eq!(calls, [r#"instances.resolve {"machine":"a","name":"w"}"#, r#"machines.get {"name":"a"}"#]);
@@ -1565,7 +1565,7 @@ mod tests {
 
     #[test]
     fn all_verbs_with_a_machine_go_by_its_roots() {
-        let machine = || ("machines.get", ok(json!({"name": "a", "target": "a", "command": null, "roots": ["/r1", "/r2"], "agent": false})));
+        let machine = || ("machines.get", ok(json!({"name": "a", "kind": "ssh", "target": "a", "command": null, "roots": ["/r1", "/r2"], "agent": false})));
         let get = [machine()];
         // Every instance in the machine's state: once, at the first root.
         for verb in [CliVerb::Stop { target: None }, CliVerb::Start { target: None, detach: false }] {
@@ -1756,7 +1756,7 @@ mod tests {
         assert_eq!(sent(out.prep).instance.as_deref(), Some("web-2"));
         assert!(out.said[0].contains("remove remoteUser"), "{:?}", out.said);
         // `--all` on a machine: one prompt for its roots, each asked there.
-        let machine = ("machines.get", ok(json!({"name": "a", "target": "a", "command": null, "roots": ["/r1", "/r2"], "agent": false})));
+        let machine = ("machines.get", ok(json!({"name": "a", "kind": "ssh", "target": "a", "command": null, "roots": ["/r1", "/r2"], "agent": false})));
         let answers = [
             machine,
             ("config.findings /r1", findings_answer("toml")),

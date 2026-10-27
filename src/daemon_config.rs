@@ -24,6 +24,9 @@ pub struct DaemonConfig {
 pub struct ServeConfig {
     /// No idle exit, as `serve --keep-alive`.
     pub keep_alive: bool,
+    /// This daemon is a fleet hub (docs/architecture/daemon/fleet.md): it
+    /// accepts workers' `fleet.offer`.
+    pub hub: bool,
 }
 
 /// [`path_from`] over the process env.
@@ -89,6 +92,13 @@ mod tests {
     fn keep_alive_parses() {
         let c = parse("[serve]\nkeep-alive = true\n").unwrap();
         assert!(c.serve.keep_alive);
+        assert!(!c.serve.hub);
+    }
+
+    #[test]
+    fn hub_parses() {
+        let c = parse("[serve]\nhub = true\n").unwrap();
+        assert!(c.serve.hub && !c.serve.keep_alive);
     }
 
     #[test]

@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 use super::link::{self, Link};
 use super::service::{Handle, Want};
 use super::ssh::{self, Dial};
-use super::{Entry, check_name, default_name};
+use super::{Entry, MachineKind, check_name, default_name};
 use crate::serve::api::{ApiError, RootCandidate, parse};
 use crate::serve::snapshots::LinkState;
 
@@ -87,7 +87,9 @@ pub struct Added {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MachineRow {
     pub name: String,
-    pub target: String,
+    pub kind: MachineKind,
+    /// `None` for an offered machine.
+    pub target: Option<String>,
     pub roots: Vec<PathBuf>,
     pub command: Option<String>,
     pub agent: bool,
@@ -107,7 +109,7 @@ fn probe(p: ProbeParams, ctx: &Ctx) -> Answer {
     ssh::parse_target(&p.target).map_err(|e| ApiError::invalid(format!("{e:#}")))?;
     check_command(p.command.as_deref())?;
     // No name yet: errors say the target.
-    let entry = Entry { name: p.target.clone(), target: p.target, roots: Vec::new(), command: p.command, agent: false };
+    let entry = Entry { command: p.command, ..Entry::ssh(p.target.clone(), p.target) };
     let mut link = connect(&entry, ctx)?;
     let roots: Vec<RootCandidate> = remote_call(&mut link, &entry.name, "roots.list", json!({}))?;
     let remote = link.remote();
@@ -143,7 +145,7 @@ fn add(p: AddParams, ctx: &Ctx) -> Answer {
         return Err(taken(&name));
     }
 
-    let mut entry = Entry { name, target: p.target, roots: Vec::new(), command: p.command, agent: p.agent };
+    let mut entry = Entry { command: p.command, agent: p.agent, ..Entry::ssh(name, p.target) };
     let mut link = connect(&entry, ctx)?;
     let checked: Vec<RootCandidate> = remote_call(&mut link, &entry.name, "roots.list", json!({ "paths": p.roots }))?;
     // A daemon that ignores `paths` answers its candidates instead.
@@ -187,9 +189,11 @@ fn list(ctx: &Ctx) -> Answer {
         .into_iter()
         .map(|e| {
             let live = ctx.links.as_ref().and_then(|l| l.remotes().get(&e.name)).unwrap_or_default();
+            let (kind, target) = e.kind.wire();
             MachineRow {
                 name: e.name,
-                target: e.target,
+                kind,
+                target,
                 roots: e.roots,
                 command: e.command,
                 agent: e.agent,
@@ -204,11 +208,13 @@ fn list(ctx: &Ctx) -> Answer {
 
 /// `machines.get`'s answer: what an ssh command to the machine needs. No
 /// argv on the wire: Rust callers build it (`ssh::tty_argv`), other clients
-/// from `target` and `command`.
+/// from `target` and `command`. An offered machine has no `target`: no
+/// ssh to it.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MachineInfo {
     pub name: String,
-    pub target: String,
+    pub kind: MachineKind,
+    pub target: Option<String>,
     pub command: Option<String>,
     pub roots: Vec<PathBuf>,
     pub agent: bool,
@@ -219,9 +225,11 @@ fn get(p: NameParams, ctx: &Ctx) -> Answer {
         .into_iter()
         .find(|e| e.name == p.name)
         .ok_or_else(|| ApiError::not_found(format!("no machine named `{}`", p.name)))?;
+    let (kind, target) = entry.kind.wire();
     to_value(MachineInfo {
         name: entry.name,
-        target: entry.target,
+        kind,
+        target,
         command: entry.command,
         roots: entry.roots,
         agent: entry.agent,
@@ -235,17 +243,22 @@ struct SetParams {
 }
 
 /// Change a registered machine's settings (today only `agent`). The links
-/// reload only when something changed.
+/// reload only when something changed. `agent` on an offered machine is
+/// refused: its relay is an ssh to it.
 fn set(p: SetParams, ctx: &Ctx) -> Answer {
     let changed = super::update(&ctx.registry, |entries| {
         let entry = entries.iter_mut().find(|e| e.name == p.name)?;
+        if p.agent && entry.is_offered() {
+            return Some(Err(ApiError::invalid(format!("{:#}", super::offered_refusal(&entry.name)))));
+        }
         let changed = entry.agent != p.agent;
         entry.agent = p.agent;
-        Some(changed)
+        Some(Ok(changed))
     });
     let Some(changed) = changed.map_err(ApiError::internal)? else {
         return Err(ApiError::not_found(format!("no machine named `{}`", p.name)));
     };
+    let changed = changed?;
     if changed && let Some(links) = &ctx.links {
         links.reload();
     }
@@ -398,7 +411,7 @@ mod tests {
         o.machines = Some(base.join("machines.toml"));
         o.dial = Some(match remote {
             Some(remote) => Arc::new(move |_: &Entry| ssh::test_support::relayed(endpoint::connect(&remote)?)),
-            None => Arc::new(|e: &Entry| anyhow::bail!("ssh: Could not resolve hostname {}", e.target)),
+            None => Arc::new(|e: &Entry| anyhow::bail!("ssh: Could not resolve hostname {}", e.label())),
         });
         o
     }
@@ -515,7 +528,7 @@ mod tests {
         let r = ok(&mut pair.local, "machines.add", json!({"target": "me@box", "roots": ["~/.devsandboxes", "~", via]}));
         assert_eq!(r, json!({"name": "box", "roots": [dot, home], "version": "0.6.0", "warning": null}));
         let saved = crate::serve::machines::load(&registry).unwrap();
-        assert_eq!(saved, vec![Entry { name: "box".into(), target: "me@box".into(), roots: vec![dot.clone(), home], command: None, agent: false }]);
+        assert_eq!(saved, vec![Entry { roots: vec![dot.clone(), home], ..Entry::ssh("box", "me@box") }]);
 
         // Taken: by default name or by `name`; `--name` gets around it.
         let (code, message) = err(&mut pair.local, "machines.add", json!({"target": "ssh://box:2200", "roots": ["~"]}));
@@ -541,12 +554,12 @@ mod tests {
         assert_eq!(
             rows,
             json!([
-                {"name": "box", "target": "me@box", "roots": [dot, std::fs::canonicalize(&pair.home).unwrap()], "command": null, "agent": false, "state": "idle", "error": null, "version": null},
-                {"name": "box2", "target": "ssh://box:2200", "roots": [dot], "command": cmd, "agent": true, "state": "idle", "error": null, "version": null},
+                {"name": "box", "kind": "ssh", "target": "me@box", "roots": [dot, std::fs::canonicalize(&pair.home).unwrap()], "command": null, "agent": false, "state": "idle", "error": null, "version": null},
+                {"name": "box2", "kind": "ssh", "target": "ssh://box:2200", "roots": [dot], "command": cmd, "agent": true, "state": "idle", "error": null, "version": null},
             ])
         );
         let info = ok(&mut pair.local, "machines.get", json!({"name": "box2"}));
-        assert_eq!(info, json!({"name": "box2", "target": "ssh://box:2200", "command": cmd, "roots": [dot], "agent": true}));
+        assert_eq!(info, json!({"name": "box2", "kind": "ssh", "target": "ssh://box:2200", "command": cmd, "roots": [dot], "agent": true}));
         assert_eq!(err(&mut pair.local, "machines.get", json!({"name": "nope"})).0, "not-found");
         assert_eq!(ok(&mut pair.local, "machines.rm", json!({"name": "box"})), json!({"ok": true}));
         let (code, _) = err(&mut pair.local, "machines.rm", json!({"name": "box"}));
@@ -578,7 +591,7 @@ mod tests {
     fn set_flips_agent_and_saves_it() {
         let base = scratch("mach-set");
         let registry = base.join("machines.toml");
-        let entry = Entry { name: "box".into(), target: "me@box".into(), roots: vec!["/r".into()], command: None, agent: false };
+        let entry = Entry { roots: vec!["/r".into()], ..Entry::ssh("box", "me@box") };
         crate::serve::machines::update(&registry, |e| e.push(entry.clone())).unwrap();
         let daemon = spawn_daemon(&base.join("local"), local_opts(&base, None));
         let mut local = client_at(&base.join("local"));
@@ -595,7 +608,16 @@ mod tests {
         let (code, message) = err(&mut local, "machines.set", json!({"name": "nope", "agent": true}));
         assert_eq!((code.as_str(), message.as_str()), ("not-found", "no machine named `nope`"));
         assert_eq!(err(&mut local, "machines.set", json!({"name": "box"})).0, "invalid");
-        assert_eq!(crate::serve::machines::load(&registry).unwrap(), vec![entry]);
+        assert_eq!(crate::serve::machines::load(&registry).unwrap(), vec![entry.clone()]);
+        // An offered machine has no ssh for a relay: `agent` on is refused,
+        // off is a no-op; `get` says its kind, no target.
+        crate::serve::machines::update(&registry, |e| e.push(Entry::offered("lap"))).unwrap();
+        let (code, message) = err(&mut local, "machines.set", json!({"name": "lap", "agent": true}));
+        assert!(code == "invalid" && message.contains("offered fleet worker"), "{code}: {message}");
+        assert_eq!(ok(&mut local, "machines.set", json!({"name": "lap", "agent": false})), json!({"ok": true}));
+        assert_eq!(crate::serve::machines::load(&registry).unwrap(), vec![entry, Entry::offered("lap")]);
+        let info = ok(&mut local, "machines.get", json!({"name": "lap"}));
+        assert_eq!(info, json!({"name": "lap", "kind": "offered", "target": null, "command": null, "roots": [], "agent": false}));
         drop(local);
         assert_eq!(daemon.join().unwrap().unwrap(), Exit::Idle);
         let _ = std::fs::remove_dir_all(&base);
@@ -618,7 +640,8 @@ mod tests {
         assert_matches("MachineAdded", &to_value(added).unwrap());
         let row = MachineRow {
             name: "m".into(),
-            target: "m".into(),
+            kind: MachineKind::Offered,
+            target: None,
             roots: vec![],
             command: None,
             agent: false,
@@ -627,8 +650,9 @@ mod tests {
             version: None,
         };
         assert_matches("MachineRow", &to_value(row).unwrap());
-        let info = MachineInfo { name: "m".into(), target: "m".into(), command: None, roots: vec![], agent: false };
+        let info = MachineInfo { name: "m".into(), kind: MachineKind::Ssh, target: Some("m".into()), command: None, roots: vec![], agent: false };
         assert_matches("MachineInfo", &to_value(info).unwrap());
+        assert_eq!(union_members("MachineKind"), ["'ssh'", "'offered'"]);
         assert_matches("MachineHeld", &to_value(Held { ok: true, agent: false }).unwrap());
         assert_eq!(union_members("LinkState"), ["'idle'", "'connecting'", "'connected'", "'unreachable'"]);
         for (method, result) in [

@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use super::api::InstancesList;
-use super::machines::Entry;
+use super::machines::{Entry, MachineKind};
 use crate::snapshot::{ContainerStatus, Depth, RuntimeView, Snapshot};
 
 /// The poll's tick while anything is watched: the dashboard's listing
@@ -179,7 +179,10 @@ impl LinkState {
 #[derive(Debug, Clone, Default)]
 pub struct Machine {
     pub name: String,
-    pub target: String,
+    /// The registry's kind: ssh, or an offered fleet worker.
+    pub kind: MachineKind,
+    /// The ssh target; `None` for an offered machine.
+    pub target: Option<String>,
     /// The registry's `command` (the remote devsandbox), for an ssh argv.
     pub command: Option<String>,
     /// The registry's `agent`, for the dashboard to show.
@@ -211,7 +214,7 @@ impl Remotes {
         inner.retain(|name, _| entries.iter().any(|e| e.name == *name));
         for e in entries {
             let m = inner.entry(e.name.clone()).or_insert_with(|| Machine { name: e.name.clone(), ..Machine::default() });
-            m.target.clone_from(&e.target);
+            (m.kind, m.target) = e.kind.wire();
             m.command.clone_from(&e.command);
             m.agent = e.agent;
             m.roots.clone_from(&e.roots);
@@ -244,7 +247,9 @@ impl Remotes {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotMachine {
     pub name: String,
-    pub target: String,
+    pub kind: MachineKind,
+    /// `None` for an offered machine (no ssh to it).
+    pub target: Option<String>,
     pub state: LinkState,
     pub error: Option<String>,
     pub version: Option<String>,
@@ -309,6 +314,7 @@ fn snapshot_machine(m: &Machine) -> SnapshotMachine {
         .find_map(|r| m.rows.get(r)?.get("runtime_name")?.as_str().map(str::to_string));
     SnapshotMachine {
         name: m.name.clone(),
+        kind: m.kind,
         target: m.target.clone(),
         state: m.state,
         error: m.error.clone(),
@@ -469,7 +475,7 @@ pub(crate) mod tests {
     fn machine(name: &str, roots: &[&str], state: LinkState) -> Machine {
         Machine {
             name: name.into(),
-            target: format!("me@{name}"),
+            target: Some(format!("me@{name}")),
             roots: roots.iter().map(PathBuf::from).collect(),
             state,
             ..Machine::default()
@@ -500,8 +506,10 @@ pub(crate) mod tests {
         let mut c = machine("c", &["/c"], LinkState::Unreachable);
         c.error = Some("c: Permission denied".into());
         c.command = Some("~/bin/devsandbox".into());
+        // An offered worker: no target.
+        let w = Machine { kind: MachineKind::Offered, target: None, ..machine("w", &[], LinkState::Idle) };
 
-        let merged = merge(&local, &[a, b, c]);
+        let merged = merge(&local, &[a, b, c, w]);
         // From its own root's snapshot when registered, else the first's.
         assert_eq!(names(&merged, "instances"), ["mine@-", "in-one@a", "orphan@a", "old@a", "in-two@a", "bee@b"]);
         assert_eq!(names(&merged, "sandboxes"), ["s@-", "sb-one@a", "sb-two@a", "sb-b@b"]);
@@ -519,9 +527,10 @@ pub(crate) mod tests {
         assert_eq!(
             merged["machines"],
             serde_json::json!([
-                {"name": "a", "target": "me@a", "state": "connected", "error": null, "version": "0.6.1", "runtime": "podman", "command": null, "agent": false},
-                {"name": "b", "target": "me@b", "state": "unreachable", "error": "b: Connection refused", "version": null, "runtime": "podman", "command": null, "agent": false},
-                {"name": "c", "target": "me@c", "state": "unreachable", "error": "c: Permission denied", "version": null, "runtime": null, "command": "~/bin/devsandbox", "agent": false},
+                {"name": "a", "kind": "ssh", "target": "me@a", "state": "connected", "error": null, "version": "0.6.1", "runtime": "podman", "command": null, "agent": false},
+                {"name": "b", "kind": "ssh", "target": "me@b", "state": "unreachable", "error": "b: Connection refused", "version": null, "runtime": "podman", "command": null, "agent": false},
+                {"name": "c", "kind": "ssh", "target": "me@c", "state": "unreachable", "error": "c: Permission denied", "version": null, "runtime": null, "command": "~/bin/devsandbox", "agent": false},
+                {"name": "w", "kind": "offered", "target": null, "state": "idle", "error": null, "version": null, "runtime": null, "command": null, "agent": false},
             ])
         );
         // No machines: the local params plus an empty `machines`.
@@ -544,14 +553,11 @@ pub(crate) mod tests {
     #[test]
     fn remotes_follow_the_registry() {
         let remotes = Remotes::default();
-        let entry = |name: &str, roots: &[&str]| Entry {
-            name: name.into(),
-            target: name.into(),
-            roots: roots.iter().map(PathBuf::from).collect(),
-            command: None,
-            agent: false,
-        };
-        remotes.sync(&[entry("a", &["/1", "/2"]), entry("b", &["/b"])]);
+        let entry = |name: &str, roots: &[&str]| Entry { roots: roots.iter().map(PathBuf::from).collect(), ..Entry::ssh(name, name) };
+        remotes.sync(&[entry("a", &["/1", "/2"]), entry("b", &["/b"]), Entry::offered("w")]);
+        let w = remotes.get("w").unwrap();
+        assert_eq!((w.kind, w.target), (MachineKind::Offered, None));
+        assert_eq!(remotes.get("a").unwrap().target.as_deref(), Some("a"));
         remotes.update("a", |m| {
             m.state = LinkState::Connected;
             m.rows.insert("/1".into(), Arc::new(Value::Null));

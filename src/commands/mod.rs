@@ -3,6 +3,8 @@ pub mod agent_relay;
 pub mod autostart;
 pub mod dispatch;
 pub mod done;
+#[cfg(unix)]
+pub mod fleet_link;
 pub mod exec;
 pub mod inbox;
 pub mod inspect;

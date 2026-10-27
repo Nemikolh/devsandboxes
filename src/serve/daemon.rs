@@ -98,6 +98,9 @@ pub struct Options {
     /// it) or `[serve] keep-alive = true` in the per-user global config
     /// ([`crate::daemon_config`]), resolved once by [`serve`].
     pub keep_alive: bool,
+    /// A fleet hub: `[serve] hub = true` ([`crate::daemon_config`]), resolved
+    /// once by [`serve`]. Only a hub accepts `fleet.offer`.
+    pub hub: bool,
     /// [`idle::IDLE_TIMEOUT`] outside tests.
     pub idle_timeout: Duration,
     /// Run the live host side ([`Host`]: bridges, popups, autostart). Off in
@@ -140,6 +143,7 @@ impl Options {
         Self {
             version: Version::current(),
             keep_alive,
+            hub: false,
             idle_timeout: idle::IDLE_TIMEOUT,
             host: true,
             inbox: None,
@@ -188,7 +192,7 @@ pub fn serve(socket_dir: Option<PathBuf>, keep_alive: bool) -> Result<()> {
         log(&format!("warning: {e:#}; using defaults"));
         Default::default()
     });
-    let opts = Options::new(keep_alive || config.serve.keep_alive);
+    let opts = Options { hub: config.serve.hub, ..Options::new(keep_alive || config.serve.keep_alive) };
     match run(&dir, &opts)? {
         Exit::AlreadyRunning => {}
         Exit::Idle => log("idle, exiting"),
@@ -230,7 +234,12 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
         Some(path) => path.clone(),
         None => machines::path()?,
     };
-    let dial = opts.dial.clone().unwrap_or_else(|| ssh::ssh_dial(link::client_name()));
+    // An offered machine is dialed at its `fleet-link` socket here, whatever
+    // reaches the ssh ones (tests inject that part).
+    let dial = super::fleet::offer::dial(
+        dir.to_path_buf(),
+        opts.dial.clone().unwrap_or_else(|| ssh::ssh_dial(link::client_name())),
+    );
     let agent_dial = opts.agent_dial.clone().unwrap_or_else(|| ssh::ssh_agent_dial(link::client_name()));
     // Whenever the daemon runs, host side or not: a link dials only when
     // wanted, so with no machine watcher (every test but the links') it's
@@ -250,6 +259,7 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
     };
     let links = service::Machines::spawn(registry_path.clone(), dial.clone(), agent_dial, opts.machine_timing, hooks, log);
     let forwards_machines = registry_path.clone();
+    shared.hub = opts.hub;
     shared.machines = Some(machines::api::Ctx {
         registry: registry_path,
         dial,
@@ -441,6 +451,8 @@ struct Shared {
     join: Join,
     /// What `roots.list` reads `~` as.
     home: Option<PathBuf>,
+    /// [`Options::hub`]: `fleet.offer` is accepted.
+    hub: bool,
     /// The `machines.*` methods' registry and dial, and the machine links;
     /// unset only in tests that build a bare `Shared` (the methods are then
     /// unknown, and no machine exists).
@@ -471,6 +483,7 @@ impl Shared {
             snapshots: Arc::default(),
             join,
             home: None,
+            hub: false,
             machines: None,
             locals: Mutex::default(),
         }
@@ -1002,6 +1015,11 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
             Ok(json!({ "ok": true }))
         }
         "machines.hold" => hold_machine(req.params, shared, conn),
+        method if method.starts_with("fleet.") && shared.machines.is_some() => {
+            let m = shared.machines.as_ref().expect("checked");
+            let ctx = super::fleet::offer::Ctx { registry: &m.registry, hub: shared.hub, links: m.links.as_ref(), log };
+            super::fleet::offer::call(method, req.params, &ctx).unwrap_or_else(|| Err(api::ApiError::unknown_method(method)))
+        }
         method if method.starts_with("machines.") && shared.machines.is_some() => {
             let ctx = shared.machines.as_ref().expect("checked");
             machines::api::call(method, req.params, ctx).unwrap_or_else(|| Err(api::ApiError::unknown_method(method)))
@@ -1359,6 +1377,7 @@ pub(crate) mod tests {
         Options {
             version: Version { semver: "0.6.0".into(), build },
             keep_alive: false,
+            hub: false,
             idle_timeout: Duration::from_millis(idle_ms),
             host: false,
             inbox: Some(std::env::temp_dir().join(format!("dsv-inbox-{}", std::process::id())).join("inbox.json")),
@@ -1980,7 +1999,7 @@ pub(crate) mod tests {
             }
         }
         // A `machines: true` watcher's variant.
-        let machine = snapshots::Machine { name: "m".into(), target: "me@m".into(), ..Default::default() };
+        let machine = snapshots::Machine { name: "m".into(), target: Some("me@m".into()), ..Default::default() };
         let merged = snapshots::merge(&snapshots::params(&dir, &list).unwrap(), &[machine]);
         dts::assert_matches(&dts::prop_type("ApiEvents", "instances.snapshot").unwrap(), &merged);
         dts::assert_matches("SnapshotMachine", &merged["machines"][0]);

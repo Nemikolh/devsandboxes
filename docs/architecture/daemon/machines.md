@@ -6,7 +6,8 @@ machine add`. The local daemon links to each machine's daemon over
 snapshots, and forwards requests for its instances. Read this before
 touching anything that takes a `machine` param or a `m/name`.
 
-Code: `src/serve/machines/mod.rs` (`Entry`, `path`, `parse`, `update`,
+Code: `src/serve/machines/mod.rs` (`Entry`, `Kind`, `MachineKind`,
+`RawEntry`, `offered_refusal`, `path`, `parse`, `update`,
 `check_name`, `Where`, `parse_name`, `default_name`), `ssh.rs`
 (`api_argv`, `tty_argv`, `tty_argv_with`, `cli_argv`, `agent_argv`,
 `script_argv`, `parse_target`, `Dial`, `Duplex`, `ssh_dial`, `ssh_agent_dial`), `link.rs`
@@ -24,8 +25,12 @@ federated joins), `cli.rs` (`plan`, `Plan`, `machine_use`, `route`,
 
 ## Registry: `machines.toml`
 
-`<data-dir>/devsandbox/machines.toml`, `[machine.<name>]` with `target`
-(`me@host`, an ssh-config alias, or `ssh://[user@]host[:port]`), `roots`
+`<data-dir>/devsandbox/machines.toml`, `[machine.<name>]` with its kind
+(`Entry::kind`, read and written through `RawEntry`): `target` (`me@host`,
+an ssh-config alias, or `ssh://[user@]host[:port]`) for a machine this host
+sshes to (`Kind::Ssh`), or `offered = true` and no `target` for a fleet
+worker that dialed this host (`Kind::Offered`, written by `fleet.offer`:
+[fleet](fleet.md#hub-side)); exactly one of the two. Then `roots`
 (remote config roots, as the remote canonicalized them), an optional
 `command` (remote devsandbox as shell text, default `devsandbox`; no
 `machine add` flag: `machine add` sets it to `~/.local/bin/devsandbox`
@@ -35,7 +40,7 @@ when it installs there off the login `PATH` (see
 dials with the same param) and `agent` (whether this host's
 ssh-agent is meant for the machine, see [Agent](#agent); off by default,
 written only when on). Only the daemon writes it
-(`machines.add`/`set`/`rm`): locked read-modify-write on `machines.lock`, temp
+(`machines.add`/`set`/`rm`, `fleet.offer`): locked read-modify-write on `machines.lock`, temp
 file + rename, since two daemons overlap during a handoff. A file that
 doesn't parse is logged and changes nothing. The CLI reads it only to know
 whether any machine exists, so with none every command resolves exactly as
@@ -49,7 +54,9 @@ collides with an instance name.
 
 ## ssh
 
-One argv builder for the daemon, the CLI and the dashboard. Plain ssh, no
+One argv builder for the daemon, the CLI and the dashboard; every argv
+goes through `argv_with`, which takes `Entry::ssh_target`, so an offered
+machine is refused alike by all of them (`offered_refusal`). Plain ssh, no
 ControlMaster of its own: `~/.ssh/config` decides. The remote command runs
 through the login shell (`exec "$SHELL" -lc '…'`, each arg quoted for it),
 so the remote `PATH` is the user's. No argv passes `-A`: this host's
@@ -80,7 +87,8 @@ ssh's stderr for `spawn`'s `Peer` and the remote forward opener alike.
 
 `Dial` (`Fn(&Entry) -> Duplex`) is injectable: `ssh_dial` spawns
 `api_argv`, `ssh_agent_dial` `agent_argv`, both with `link::client_name`
-as the client. A `Duplex` is always a unix socket pumped to the ssh
+as the client. The daemon wraps its API dial in `fleet::offer::dial`,
+which dials an offered machine at its fleet link's socket instead. A `Duplex` is always a unix socket pumped to the ssh
 child's pipes, so `client::Conn` works on it unchanged and tests dial a
 second test daemon's socket (or run the agent relay's far end
 in-process). `--session-env` makes the remote relay replace each verb
@@ -219,8 +227,9 @@ and goes to that machine, but for the ones served here:
 `instances.watch {dir, machines: true}` (the dashboard always sends it)
 gets every push merged with each machine's rows (`snapshots::merge`): rows
 gain `machine` and keep their remote `root`, and a top-level `machines`
-array carries each machine's `name`, `target`, `state`, `error`, `version`,
-`command`, `runtime`, `agent`. A machine's push or state change re-publishes those
+array carries each machine's `name`, `kind` (`ssh` | `offered`), `target`
+(`null` for an offered one), `state`, `error`, `version`, `command`,
+`runtime`, `agent`. A machine's push or state change re-publishes those
 watchers' roots from the last local params. Details:
 [host-poll.md](host-poll.md#snapshots).
 
@@ -404,7 +413,9 @@ expanded with the remote home, canonicalized, config loaded). `add
 --agent` saves the machine with `agent` on; adding a name that exists is
 refused. `set <name> --agent on|off` (`machines.set`; `--agent` is
 required) changes it on a registered machine and prints `<name>: agent
-on|off`. `ls` shows it in an `AGENT` column. `rm` forgets the machine.
+on|off`; on is refused for an offered machine. `ls` shows it in an `AGENT`
+column, and `offered` as an offered machine's `TARGET`. `rm` forgets the
+machine.
 
 ## Dashboard
 
@@ -422,7 +433,9 @@ unreachable: <why>` in the header (`pending_note`), the name as `box
 listed with the rest on the Ports tab: `forwards.list {machines: true}`);
 VS Code on a remote row answers "isn't supported yet". The Machines tab,
 listed while a machine is registered, shows every registered machine from
-the snapshot's `machines` with its link state (and error) and `agent`;
+the snapshot's `machines` with its target (dimmed `offered` for an offered
+fleet worker, whose terminal tabs and forwards say why they can't open),
+link state (and error) and `agent`;
 `a` flips the selected one's `agent` with `machines.set` (no prompt; a
 down machine's too, it's a registry write), and the row follows with the
 next push, which the reload triggers

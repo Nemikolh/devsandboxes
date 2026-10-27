@@ -1619,7 +1619,7 @@ mod tests {
         let federated = json!({
             "dir": "/cfg", "instances": [], "sandboxes": [], "services": [], "sandbox_count": 0,
             "runtime_name": "docker", "runtime_version": null, "error": null,
-            "machines": [{"name": "box", "target": "me@box", "state": "unreachable", "error": "refused",
+            "machines": [{"name": "box", "kind": "ssh", "target": "me@box", "state": "unreachable", "error": "refused",
                 "version": null, "runtime": null, "command": null, "agent": false}],
         });
         let DaemonUpdate::Snapshot(_, machines) = snapshot_update(federated) else { panic!("not parsed") };

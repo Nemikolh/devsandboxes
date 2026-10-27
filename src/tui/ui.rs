@@ -748,7 +748,11 @@ fn machine_row(m: &crate::serve::snapshots::SnapshotMachine) -> Row<'_> {
     };
     Row::new([
         Cell::from(Span::styled(m.name.clone(), Style::default().fg(ACCENT))),
-        Cell::from(m.target.clone()),
+        // An offered fleet worker has no ssh target: its kind instead.
+        match &m.target {
+            Some(target) => Cell::from(target.clone()),
+            None => Cell::from(Span::styled("offered", Style::default().add_modifier(Modifier::DIM))),
+        },
         Cell::from(Span::styled(state, style)),
         Cell::from(if m.agent { "on" } else { "off" }),
         Cell::from(m.version.clone().unwrap_or_else(|| "-".to_string())),

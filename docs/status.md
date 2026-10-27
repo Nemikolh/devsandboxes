@@ -274,6 +274,14 @@ limitation means editing this file in the same commit.
 - The npm client's `forwards.list(dir)` can't pass `machines` (the typed
   `call('forwards.list', {machines: true})` can).
   → [api](reference/api.md#forwards); `npm/devsandboxes/index.js`
+- An offered fleet worker (fleet step 1b) answers quick calls and verbs
+  only: `exec`, terminal tabs, forwards, the agent relay and every CLI
+  re-run over ssh (`logs`/`inspect` on the CLI included; the dashboard's
+  work) refuse with "need fleet step 4". Nothing dials a hub yet (the
+  worker side is step 1c), its entry has no roots (so `--machine` per-root
+  commands and `--all` verbs on it fail), and its link is held only while
+  wanted, like an ssh machine's (step 1f keeps it up).
+  → [fleet](architecture/daemon/fleet.md#hub-side); `machines::offered_refusal`
 
 ### helper
 

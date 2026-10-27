@@ -210,8 +210,10 @@ fn argv(entry: &Entry, opts: &[&str], remote_args: &[impl AsRef<str>]) -> Result
     argv_with(entry, opts, entry.command(), remote_args)
 }
 
+/// Every argv above comes through here, so an offered machine (no ssh to
+/// it) is refused for all of them alike.
 fn argv_with(entry: &Entry, opts: &[&str], program: &str, remote_args: &[impl AsRef<str>]) -> Result<Vec<OsString>> {
-    let target = parse_target(&entry.target)?;
+    let target = parse_target(entry.ssh_target()?)?;
     let mut argv: Vec<OsString> = ["ssh"].iter().chain(opts).map(OsString::from).collect();
     if let Some(port) = target.port {
         argv.extend(["-p".into(), port.to_string().into()]);
@@ -249,8 +251,8 @@ pub struct Duplex {
 }
 
 impl Duplex {
-    /// A plain socket to a daemon (tests).
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// A plain socket to a daemon: an offered machine's fleet socket
+    /// (`fleet::dial`), a test daemon's.
     pub fn socket(stream: Stream) -> Self {
         Self { stream, peer: Peer::default() }
     }
@@ -498,7 +500,26 @@ mod tests {
     use super::*;
 
     fn entry(target: &str, command: Option<&str>) -> Entry {
-        Entry { name: "m".into(), target: target.into(), roots: vec![], command: command.map(Into::into), agent: false }
+        Entry { command: command.map(Into::into), ..Entry::ssh("m", target) }
+    }
+
+    #[test]
+    fn every_argv_refuses_an_offered_machine() {
+        let e = Entry::offered("lap");
+        let root = Path::new("/r");
+        let refusals = [
+            api_argv(&e, "c"),
+            tty_argv(&e, &["exec", "w"]),
+            cli_argv(&e, false, &["ps"]),
+            tty_argv_with(&e, "docker", &["exec"]),
+            tunnel_argv(&e, true, root, Some("w"), None, 1),
+            agent_argv(&e, "c"),
+            script_argv(&e, "true", &[] as &[&str]),
+        ];
+        for r in refusals {
+            let err = format!("{:#}", r.unwrap_err());
+            assert!(err.contains("machine `lap` is an offered fleet worker") && err.contains("fleet step 4"), "{err}");
+        }
     }
 
     fn strs(argv: &[OsString]) -> Vec<&str> {

@@ -38,7 +38,7 @@ pub fn agent_relay(client: &str) -> Result<()> {
 /// relay until it ends (see the module doc). `Ok` when the peer went away
 /// (stdin ended or stdout broke, whichever was seen first).
 pub fn run(reader: impl Read + Send + 'static, writer: impl Write + Send + 'static, dir: &Path, client: &str) -> Result<()> {
-    link::opener(&agent::SPEC, reader, writer, &endpoint::agent_socket(dir, client))
+    link::opener(&agent::SPEC, reader, writer, &endpoint::agent_socket(dir, client), |_| Ok(()))
 }
 
 #[cfg(test)]

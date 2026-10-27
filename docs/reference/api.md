@@ -12,7 +12,8 @@ method), `src/inbox/wire.rs` (Inbox views, `ApiError`, `decide_*`),
 `src/serve/verbs.rs` (verbs), `src/serve/helper.rs` (`helper.call`),
 `src/serve/forwards.rs` (`forwards.*`),
 `src/serve/machines/api.rs` (`machines.*`), `src/serve/machines/forward.rs`
-(`QUICK`, federation), `src/serve/relay.rs` (`api --stdio`),
+(`QUICK`, federation), `src/serve/fleet/offer.rs` (`fleet.offer`),
+`src/serve/relay.rs` (`api --stdio`),
 `npm/devsandboxes/index.js` + `index.d.ts` (Node client; `src/serve/dts.rs`
 checks the typings against the wire structs).
 
@@ -28,7 +29,7 @@ checks the typings against the wire structs).
 | | `roots.list` | no |
 | bridges, forwards | `bridges.ensure`, `helper.call`, `forwards.list\|add\|rm` | no |
 | verbs | `run`, `rebuild`, `start`, `stop`, `rm`, `services.rebuild` | yes (own ssh) |
-| machines | `machines.probe\|add\|list\|get\|rm` | no |
+| machines | `machines.probe\|add\|list\|get\|rm`, `fleet.offer` (internal) | no |
 
 Notifications: `inbox.changed`, `inbox.shown`, `instances.changed`,
 `instances.snapshot`, `forwards.changed`, `forwards.status`, `closing`
@@ -840,7 +841,7 @@ Remote hosts whose daemons this one talks to over ssh
 ([machines.md](../architecture/daemon/machines.md)).
 The registry is `<data-dir>/devsandbox/machines.toml`, next to
 `state.toml`, written only by `machines.add` / `machines.set` /
-`machines.rm`:
+`machines.rm` and `fleet.offer`:
 
 ```toml
 [machine.my-server]
@@ -848,7 +849,15 @@ target = "me@my-server"            # what ssh takes, or ssh://[user@]host[:port]
 roots = ["/home/me/.devsandboxes"] # config roots there, canonical
 command = "~/bin/devsandbox"       # optional: the remote devsandbox, shell text
 agent = true                       # optional, default false: this host's ssh-agent is meant for it
+
+[machine.laptop]
+offered = true                     # a fleet worker that dialed this host: no target, no ssh to it
 ```
+
+A machine's `kind` is `ssh` (it has a `target`) or `offered` (a fleet
+worker reached over its own link, `fleet.offer`; nothing here sshes to
+it, so terminals, forwards, the agent relay and the CLI's ssh re-runs are
+refused for it, while quick calls and verbs work).
 
 A machine name is `[A-Za-z0-9._-]+`, not starting with `.` or `-` (never
 `/` or `@`, so the CLI's `my-server/web-2` and `@/web-2` are unambiguous).
@@ -901,9 +910,9 @@ and `sandboxes: []`; the call itself fails only as `internal`, when
 |---|---|---|---|
 | `machines.probe` | `{"target", "command"?}` (`command`: the machine's devsandbox as shell text, default `devsandbox`) | `{"version", "protocol", "roots": […]}`: the machine's devsandbox and its `roots.list` | `invalid` (bad target, empty `command`), `failed` (ssh, the hello or the protocol) |
 | `machines.add` | `{"target", "name"?, "roots": […], "agent"?, "command"?}` (`agent` default `false`; `command` as `probe`'s, saved as the machine's) | `{"name", "roots", "version", "warning"}`: `roots` as saved (the machine's canonical paths, deduplicated), `warning` set when its semver differs from ours | `invalid` (bad target or name, a name taken, no `roots`, empty `command`, a root the machine refuses: each one's reason), `failed` (as `probe`, or a remote too old to check roots), `internal` (`machines.toml` doesn't read or write) |
-| `machines.list` | `{}` | `[{"name", "target", "roots", "command", "agent", "state", "error", "version"}]`, by name; `version` from the last hello | `internal` (`machines.toml` doesn't parse) |
-| `machines.get` | `{"name"}` | `{"name", "target", "command", "roots", "agent"}`: what an ssh command to it needs (no argv on the wire: build it from `target` and `command`) | `not-found`, `internal` (as `list`) |
-| `machines.set` | `{"name", "agent"}` | `{"ok": true}`; saves the machine's `agent`, its link restarts if it changed | `not-found`, `invalid` (no `agent`), `internal` (`machines.toml` doesn't read or write) |
+| `machines.list` | `{}` | `[{"name", "kind", "target", "roots", "command", "agent", "state", "error", "version"}]`, by name; `kind` `ssh` \| `offered`, `target` `null` for an offered one; `version` from the last hello | `internal` (`machines.toml` doesn't parse) |
+| `machines.get` | `{"name"}` | `{"name", "kind", "target", "command", "roots", "agent"}`: what an ssh command to it needs (no argv on the wire: build it from `target` and `command`; an offered one has none) | `not-found`, `internal` (as `list`) |
+| `machines.set` | `{"name", "agent"}` | `{"ok": true}`; saves the machine's `agent`, its link restarts if it changed | `not-found`, `invalid` (no `agent`; `agent: true` on an offered machine), `internal` (`machines.toml` doesn't read or write) |
 | `machines.rm` | `{"name"}` | `{"ok": true}`; its link stops and its rows go. Nothing on the machine changes | `not-found`, `internal` (`machines.toml` doesn't read or write) |
 | `machines.hold` | `{"name", "agent"?}` (`agent`: the caller's `SSH_AUTH_SOCK`) | `{"ok": true, "agent"}`: the machine is wanted (link and, with `agent` on, agent relay up) until this connection closes; `agent` says whether the relay is up | `not-found`, `invalid` (`agent` not absolute) |
 
@@ -926,6 +935,18 @@ false`. Holding the same machine again on one connection is allowed and
 still one hold. Closing the connection releases it (then the 60 s). Adding a machine means trusting it: its socket is as
 powerful as `docker.sock`, and with `agent` on your agent is reachable
 there.
+
+### `fleet.offer`
+
+Internal (`devsandbox fleet-link`'s; not in the npm typings): a fleet
+worker's link to this host is up
+([fleet.md](../architecture/daemon/fleet.md#hub-side)). Params:
+`{"worker": "<machine name>", "version": "<its semver>"}`. Result: `{"ok":
+true}`; a new name is saved as an offered machine (its link starts, dialed
+at the worker's `fleet-<worker>.sock`), an offered one is kept. Errors:
+`invalid` (a bad name, a missing param), `denied` (this daemon isn't a
+hub: `[serve] hub = true` in `daemon.config.toml`; or the name is an ssh
+machine's), `internal` (`machines.toml` doesn't read or write).
 
 ### The `machine` param
 
@@ -987,7 +1008,7 @@ remote `thread_children` aren't merged. Plus, top-level:
 
 | field | |
 |---|---|
-| `machines` | every registered machine, by name: `{"name", "target", "command", "state", "error", "version", "runtime", "agent"}`; `command` the remote devsandbox (`null`: `devsandbox`), `runtime` its `runtime_name` once a snapshot came, `agent` the registry's |
+| `machines` | every registered machine, by name: `{"name", "kind", "target", "command", "state", "error", "version", "runtime", "agent"}`; `kind` and `target` as `machines.list`'s, `command` the remote devsandbox (`null`: `devsandbox`), `runtime` its `runtime_name` once a snapshot came, `agent` the registry's |
 
 A machine's rows are last known: they stay while its link is down (in
 memory only, so a fresh daemon has none until it connects), and a client

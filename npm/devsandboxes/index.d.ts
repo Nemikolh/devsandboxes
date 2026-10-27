@@ -153,11 +153,18 @@ export interface InstancesSnapshot extends InstancesList {
 /** Where a machine's link stands. `idle`: not wanted, so not connected. */
 export type LinkState = 'idle' | 'connecting' | 'connected' | 'unreachable';
 
+/**
+ * How a machine is reached: `ssh` (this host sshes to its `target`) or `offered` (a fleet worker that dialed
+ * this host; no `target`, nothing sshes to it).
+ */
+export type MachineKind = 'ssh' | 'offered';
+
 /** One machine of a federated {@link InstancesSnapshot}. */
 export interface SnapshotMachine {
   name: string;
-  /** What ssh takes, or an `ssh://` URL. */
-  target: string;
+  kind: MachineKind;
+  /** What ssh takes, or an `ssh://` URL; `null` for an `offered` machine. */
+  target: string | null;
   state: LinkState;
   /** Why it's `unreachable` (or a root it refused). */
   error: string | null;
@@ -782,8 +789,9 @@ export interface MachineAdded {
 /** `machines.get`'s answer: what an ssh command to the machine needs. */
 export interface MachineInfo {
   name: string;
-  /** What ssh takes, or an `ssh://` URL. */
-  target: string;
+  kind: MachineKind;
+  /** What ssh takes, or an `ssh://` URL; `null` for an `offered` machine. */
+  target: string | null;
   /** The remote devsandbox as shell text; `null` is `devsandbox` on its `PATH`. */
   command: string | null;
   /** Config roots on the machine. */
@@ -802,8 +810,9 @@ export interface MachineHeld {
 /** One registered machine (`machines.list`). */
 export interface MachineRow {
   name: string;
-  /** What ssh takes, or an `ssh://` URL. */
-  target: string;
+  kind: MachineKind;
+  /** What ssh takes, or an `ssh://` URL; `null` for an `offered` machine. */
+  target: string | null;
   /** Config roots on the machine. */
   roots: string[];
   /** The remote devsandbox as shell text; `null` is `devsandbox` on its `PATH`. */

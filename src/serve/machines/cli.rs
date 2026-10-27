@@ -99,6 +99,7 @@ pub(crate) fn machine_use(command: Option<&Command>) -> MachineUse {
         Command::Api { .. } => MachineUse::Refused("api"),
         Command::Tunnel { .. } => MachineUse::Refused("tunnel"),
         Command::AgentRelay { .. } => MachineUse::Refused("agent-relay"),
+        Command::FleetLink { .. } => MachineUse::Refused("fleet-link"),
         Command::Machine { .. } => MachineUse::Refused("machine"),
     }
 }
@@ -329,7 +330,8 @@ pub(crate) fn machine_info(call: &mut dyn FnMut(&str, Value) -> Result<crate::se
     }
     let info: MachineInfo =
         serde_json::from_value(r.result.unwrap_or(Value::Null)).context("bad machines.get result from devsandbox serve")?;
-    Ok(Entry { name: info.name, target: info.target, roots: info.roots, command: info.command, agent: info.agent })
+    let kind = super::Kind::from_wire(info.kind, info.target).with_context(|| format!("machine `{m}`"))?;
+    Ok(Entry { name: info.name, kind, roots: info.roots, command: info.command, agent: info.agent })
 }
 
 // ---- the ssh re-run -----------------------------------------------------------
@@ -950,7 +952,7 @@ mod tests {
     }
 
     fn entry() -> Entry {
-        Entry { name: "box".into(), target: "me@box".into(), roots: vec![PathBuf::from("/r")], command: None, agent: false }
+        Entry { roots: vec![PathBuf::from("/r")], ..Entry::ssh("box", "me@box") }
     }
 
     /// A re-run holds its machine only with `agent` on, passing this
