@@ -8,7 +8,8 @@ Code: `devsbd/src/daemon.rs` (`run`, `take_over`, `Bridges::route`,
 `flush`, `control_exchange`, `control_follow`), `devsbd/src/bridge.rs`,
 `devsbd/src/boot.rs`, `devsbd/src/outbox.rs`, `devsbd/src/ctl.rs`,
 `devsbd/src/runs.rs`, `devsbd/src/sessions.rs`, `devsbd/src/vscode.rs`, `devsbd/src/json.rs`,
-`devsbd/src/identity.rs`, `devsbd/src/userns.rs`, `devsbd/src/browser.rs`;
+`devsbd/src/identity.rs`, `devsbd/src/userns.rs`, `devsbd/src/browser.rs`,
+`devsbd/src/rpc_server.rs`;
 `src/commands/run/mod.rs` (`container_command`, `BOOT_HOOK_LABEL`).
 
 ## Files and sockets
@@ -52,6 +53,16 @@ streams and everything else as usual.
   (`HOLD`) for one to appear; none → the connection closes (ssh sees a
   refusing agent).
 - **`Connect`**: dials `host:port` inside the container for port forwards.
+- **RPC**: each host-opened `Open(RPC)` stream gets a thread of its own
+  (`rpc_server::accept`, the mux's `on_host_open` hook; every other
+  host-opened channel is refused): it reads the `call`, runs the method
+  from `rpc_server::METHODS` and writes the reply record
+  ([protocol.md](protocol.md#rpc)). `rpc.methods` lists what this daemon
+  offers as `name@version`. Methods flagged `needs_root` (acting as another
+  user) are offered only when the daemon's euid is 0, since `devsbd boot`
+  starts it as the container command's user; one not offered answers
+  `unknown-method`. The daemon always advertises `caps::RPC`
+  (`DAEMON_CAPS`).
 - **Outbox flusher**: sends queued records oldest first, one `Open(NOTIFY)`
   each, deleting a file only after the host's `ok` and stopping at the first
   failure so order holds. Woken by a poke on `api.sock`, a bridge attaching

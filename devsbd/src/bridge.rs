@@ -10,11 +10,11 @@ use std::process::{Command, Stdio};
 use crate::daemon::CTL;
 use crate::proto::{self, caps};
 
-/// What this bridge itself can serve. The daemon dials `Connect` streams and
-/// answers `PortQuery` (the bridge just relays bytes), so the bridge
-/// advertises `TCP_FORWARD | PORT_INFO` to the host — gated below by what the
-/// daemon also supports.
-const OWN_CAPS: u32 = caps::TCP_FORWARD | caps::PORT_INFO;
+/// What this bridge itself can carry. The daemon dials `Connect` streams,
+/// answers `PortQuery` and serves host-opened `RPC` streams (the bridge just
+/// relays bytes), so the bridge advertises `TCP_FORWARD | PORT_INFO | RPC` to
+/// the host — gated below by what the daemon also supports.
+const OWN_CAPS: u32 = caps::TCP_FORWARD | caps::PORT_INFO | caps::RPC;
 
 pub fn run(hash: &str) -> io::Result<()> {
     // Daemon first, so a missing or mismatched daemon surfaces to the host as
@@ -127,4 +127,17 @@ fn spawn_daemon() -> io::Result<()> {
         .stderr(Stdio::null())
         .spawn()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The host sees `OWN_CAPS & daemon caps`: everything the daemon serves
+    /// must survive the mask, `RPC` included.
+    #[test]
+    fn the_bridge_passes_every_daemon_cap() {
+        assert_eq!(OWN_CAPS & crate::daemon::DAEMON_CAPS, crate::daemon::DAEMON_CAPS);
+        assert_ne!(OWN_CAPS & caps::RPC, 0);
+    }
 }

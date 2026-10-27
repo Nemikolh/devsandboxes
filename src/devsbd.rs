@@ -37,6 +37,10 @@ pub(crate) mod mux;
 // Partly helper-only (e.g. `Frame::encode` callers on the daemon side).
 #[allow(dead_code)]
 pub mod proto;
+// Shared with the helper (its `rpc_server`); the host caller comes with the
+// helper client (docs/plans/active/helper-rpc.md).
+#[allow(dead_code)]
+pub mod rpc;
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;

@@ -15,10 +15,14 @@
 //!   `shutdown(Write)`s the local socket, so a sender that writes its request
 //!   with `Mux::send` and then `Eof` (the daemon's notify flush) still gets the
 //!   reply. Never sent on agent streams, so their behavior is unchanged.
-//! - **Flow-controlled** (`Connect`, forwarded TCP): per-direction credit
+//! - **Flow-controlled** (`Connect`, forwarded TCP, and `Open` on a channel
+//!   where `proto::channel::flows` holds, e.g. `RPC`): per-direction credit
 //!   (`Window`), a per-stream write queue drained by its own thread so the
 //!   reader never blocks, and half-close (`Eof`). One slow local reader can't
 //!   stall the other streams or starve the keepalive.
+//!
+//! `Open`s come from the daemon (low ids) toward the host, and from the host
+//! (high ids, `HOST_ID_BIT`) toward a daemon that registered `on_host_open`.
 //!
 //! Besides streams, one request/answer on stream 0: the host's `PortQuery`
 //! (who listens on a port), answered with `PortInfo` by a daemon that
@@ -72,8 +76,9 @@ const MAX_STREAMS: usize = 64;
 const MAX_HOST_STREAMS: usize = 256;
 
 /// Stream-id spaces: the daemon allocates ids with the high bit clear
-/// (1..2^31), the host with it set (`Mux::connect`). The host refuses a peer
-/// `Open` whose id has this bit set, the daemon a `Connect` whose id doesn't
+/// (1..2^31), the host with it set (`Mux::connect`, host-opened `Open`s). The
+/// host refuses a peer `Open` whose id has this bit set (it registers no
+/// `on_host_open`), the daemon a `Connect` whose id doesn't
 /// (docs/architecture/helper/protocol.md, _Frames_).
 const HOST_ID_BIT: u32 = 1 << 31;
 
@@ -85,6 +90,11 @@ const MAX_PORT_LOOKUPS: usize = 4;
 /// The daemon's answer to a `PortQuery`: the `(pid, comm)` listening on a TCP
 /// port (see `Mux::on_port_query`).
 pub type PortLookup = Arc<dyn Fn(u16) -> Vec<(u32, String)> + Send + Sync>;
+
+/// The daemon's answer to a host-opened `Open` `(stream, channel)`: a local
+/// end for the stream, `None` to refuse it (see `Mux::on_host_open`). Runs on
+/// the frame reader: quick (hand the other end to a thread).
+pub type HostOpen = Arc<dyn Fn(u32, u8) -> Option<Conn> + Send + Sync>;
 
 /// Reason sent with the `Close` for a peer that overran its credit.
 const FLOW_VIOLATION: &str = "flow control violation";
@@ -118,8 +128,9 @@ fn teardown_ready(eof_sent: bool, eof_received: bool, drained: bool) -> bool {
     eof_sent && eof_received && drained
 }
 
-/// Pure id policy for an inbound `Connect`: host id space (high bit set), not
-/// already live, and under the host-stream cap.
+/// Pure id policy for an inbound `Connect` or host-opened `Open`: host id
+/// space (high bit set), not already live, and under the host-stream cap.
+/// Both kinds share `MAX_HOST_STREAMS`.
 fn connect_allowed(stream: u32, live: bool, live_host_streams: usize) -> bool {
     stream & HOST_ID_BIT != 0 && !live && live_host_streams < MAX_HOST_STREAMS
 }
@@ -244,9 +255,11 @@ pub type OnClose = Box<dyn FnOnce(String) + Send>;
 
 /// A registered stream.
 enum Entry {
-    /// `Open` stream (ssh-agent): the original unbuffered path.
+    /// `Open` stream on a legacy channel (ssh-agent, notify, control): the
+    /// original unbuffered path.
     Legacy(Arc<Conn>),
-    /// `Connect` stream: credit, write queue, half-close.
+    /// `Connect` stream or `Open` on a flowing channel: credit, write queue,
+    /// half-close.
     Flow(Arc<Flow>),
 }
 
@@ -395,6 +408,8 @@ pub struct Mux {
     /// Answers inbound `PortQuery`s (the daemon's); `None` leaves them
     /// unanswered.
     port_lookup: Mutex<Option<PortLookup>>,
+    /// Accepts host-opened `Open`s (the daemon's); `None` refuses them all.
+    host_open: Mutex<Option<HostOpen>>,
     /// Lookups running now, capped at `MAX_PORT_LOOKUPS`.
     port_lookups: AtomicUsize,
     /// Our outstanding `PortQuery`s by id, each waiting in `port_query` for
@@ -416,6 +431,7 @@ impl Mux {
             peer_caps: Mutex::new(None),
             on_caps: Mutex::new(None),
             port_lookup: Mutex::new(None),
+            host_open: Mutex::new(None),
             port_lookups: AtomicUsize::new(0),
             queries: Mutex::new(HashMap::new()),
             next_query: AtomicU32::new(1),
@@ -428,6 +444,14 @@ impl Mux {
     #[allow(dead_code)] // used by the daemon (devsbd crate) only
     pub fn on_port_query(&self, lookup: PortLookup) {
         *self.port_lookup.lock().unwrap() = Some(lookup);
+    }
+
+    /// Register how this side answers `Open`s with host-allocated ids (the
+    /// daemon's `RPC` server). Admitted under the same id policy as `Connect`
+    /// (`connect_allowed`); without a handler every one is refused.
+    #[allow(dead_code)] // used by the daemon (devsbd crate) only
+    pub fn on_host_open(&self, accept: HostOpen) {
+        *self.host_open.lock().unwrap() = Some(accept);
     }
 
     /// Ask the peer (a daemon advertising `caps::PORT_INFO`) who listens on TCP
@@ -584,9 +608,13 @@ impl Mux {
     /// Register `conn` as `stream` and pump its reads into `Data` frames on a
     /// new thread, sending `Close` when it ends (unless the peer closed it
     /// first). With `open`, announces the stream with `Open { channel }` before
-    /// any data can flow.
+    /// any data can flow; on a flowing channel (`channel::flows`) the stream
+    /// is flow-controlled, as the peer's end will be.
     pub fn attach(self: &Arc<Self>, stream: u32, conn: impl Into<Conn>, open: Option<u8>) -> io::Result<()> {
         let conn = conn.into();
+        if open.is_some_and(proto::channel::flows) {
+            return self.attach_flow(stream, conn, open);
+        }
         let reader = conn.try_clone()?;
         self.streams.lock().unwrap().insert(stream, Entry::Legacy(Arc::new(conn)));
         if let Some(channel) = open {
@@ -598,6 +626,33 @@ impl Mux {
         let mux = Arc::clone(self);
         spawn_stream_thread(move || mux.pump(stream, reader));
         Ok(())
+    }
+
+    /// `attach` for a flowing channel: registered as a flow stream before
+    /// `Open` goes out (so the peer's answer always finds it), threads started
+    /// after (so no `Data` precedes the `Open`), like `connect`.
+    fn attach_flow(self: &Arc<Self>, stream: u32, conn: Conn, open: Option<u8>) -> io::Result<()> {
+        let reader = conn.try_clone()?;
+        let flow = Flow::new(None, None);
+        self.streams.lock().unwrap().insert(stream, Entry::Flow(Arc::clone(&flow)));
+        if let Some(channel) = open {
+            if let Err(e) = self.send(&Frame::Open { stream, channel }) {
+                self.unregister(stream, &flow);
+                return Err(e);
+            }
+        }
+        self.start_flow(stream, &flow, conn, reader);
+        Ok(())
+    }
+
+    /// Register an accepted peer `Open`'s local end: flow-controlled on a
+    /// flowing channel, legacy otherwise. Sends nothing.
+    fn accept_open(self: &Arc<Self>, stream: u32, channel: u8, conn: Conn) -> bool {
+        if proto::channel::flows(channel) {
+            self.attach_flow(stream, conn, None).is_ok()
+        } else {
+            self.attach(stream, conn, None).is_ok()
+        }
     }
 
     fn pump(&self, stream: u32, mut conn: Conn) {
@@ -862,7 +917,8 @@ impl Mux {
 
     /// Route frames from `reader` until it ends: `Data` to its stream,
     /// `Close` shuts it, `Ping` gets a `Pong`, and `Open` asks `on_open` for a
-    /// local connection (`None` refuses the stream with `Close`). `Connect`
+    /// local connection (`None` refuses the stream with `Close`), or the
+    /// `on_host_open` handler for a host-allocated id. `Connect`
     /// registers a pending flow stream (so `Data` racing the dial is queued,
     /// bounded by credit) and hands a [`ConnectReply`] to `on_connect`, which
     /// must return at once and dial elsewhere. This thread never blocks on a
@@ -941,19 +997,28 @@ impl Mux {
                     // misbehaving peer drop its *existing* stream with that
                     // id — acceptable, since only a broken or hostile peer
                     // reuses a live id. The daemon side passes
-                    // `on_open = |_,_| None` and never reaches the accept path.
+                    // `on_open = |_,_| None` and never reaches that path.
+                    //
+                    // A high-bit id is a host-opened stream: admitted only
+                    // with an `on_host_open` handler (the daemon's), under
+                    // `Connect`'s policy and cap.
+                    let host_open = self.host_open.lock().unwrap().clone();
                     let attached = {
                         let live = self.streams.lock().unwrap();
-                        let peer_streams = live.keys().filter(|&&id| id & HOST_ID_BIT == 0).count();
-                        let allowed = stream & HOST_ID_BIT == 0
-                            && !live.contains_key(&stream)
-                            && peer_streams < MAX_STREAMS;
+                        let allowed = if stream & HOST_ID_BIT == 0 {
+                            let peer_streams = live.keys().filter(|&&id| id & HOST_ID_BIT == 0).count();
+                            !live.contains_key(&stream) && peer_streams < MAX_STREAMS
+                        } else {
+                            let host_streams = live.keys().filter(|&&id| id & HOST_ID_BIT != 0).count();
+                            host_open.is_some() && connect_allowed(stream, live.contains_key(&stream), host_streams)
+                        };
                         drop(live);
-                        allowed
-                            && match on_open(stream, channel) {
-                                Some(conn) => self.attach(stream, conn, None).is_ok(),
-                                None => false,
-                            }
+                        let conn = match &host_open {
+                            _ if !allowed => None,
+                            Some(accept) if stream & HOST_ID_BIT != 0 => accept(stream, channel),
+                            _ => on_open(stream, channel),
+                        };
+                        conn.is_some_and(|conn| self.accept_open(stream, channel, conn))
                     };
                     if !attached {
                         self.send_ctl(Frame::Close { stream, reason: String::new() });
@@ -1818,6 +1883,177 @@ mod tests {
         // Up to MAX_HOST_STREAMS accepted (well past MAX_STREAMS), then refused.
         let ids: Vec<u32> = (1..=MAX_HOST_STREAMS as u32 + 2).map(h).collect();
         assert_eq!(refused_connects(&ids), [h(MAX_HOST_STREAMS as u32 + 1), h(MAX_HOST_STREAMS as u32 + 2)]);
+    }
+
+    // ---- flow-controlled `Open` (flowing channels) and host-opened `Open` ----
+
+    /// A daemon-side hook accepting host `Open`s on `RPC` only, handing out
+    /// one end of a socket pair; the other end goes to `peers`.
+    fn rpc_only(peers: mpsc::Sender<UnixStream>) -> HostOpen {
+        let peers = Mutex::new(peers);
+        Arc::new(move |_, ch| {
+            (ch == channel::RPC).then(|| {
+                let (ours, theirs) = UnixStream::pair().unwrap();
+                peers.lock().unwrap().send(theirs).unwrap();
+                ours.into()
+            })
+        })
+    }
+
+    /// Feed `wire` to a daemon-side `serve_with` whose `on_host_open` is
+    /// `rpc_only` (peer ends retained, so no stream ends on its own) and
+    /// return the frames it sent.
+    fn host_open_frames(wire: Vec<u8>) -> Vec<Frame> {
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let mux = Mux::new(Sink(Arc::clone(&out)));
+        let (tx, _peers) = mpsc::channel();
+        mux.on_host_open(rpc_only(tx));
+        mux.serve_with(io::Cursor::new(wire), |_, _| None, |_, _, _, reply: ConnectReply| reply.finish(Err("no".into())));
+        wait_ctl_drained(&mux);
+        let mut r = io::Cursor::new(std::mem::take(&mut *out.lock().unwrap()));
+        let mut frames = Vec::new();
+        while let Ok(Some(frame)) = proto::read_frame(&mut r) {
+            frames.push(frame);
+        }
+        frames
+    }
+
+    fn refused_host_opens(opens: &[(u32, u8)]) -> Vec<u32> {
+        let mut wire = Vec::new();
+        for &(stream, channel) in opens {
+            proto::write_frame(&mut wire, &Frame::Open { stream, channel }).unwrap();
+        }
+        closes(&host_open_frames(wire)).into_iter().map(|(s, _)| s).collect()
+    }
+
+    #[test]
+    fn flowing_channels() {
+        assert!(channel::flows(channel::RPC));
+        for ch in [channel::SSH_AGENT, channel::HTTP_PROXY, channel::NOTIFY, channel::CONTROL] {
+            assert!(!channel::flows(ch), "{ch} stays legacy");
+        }
+    }
+
+    /// The daemon-side counterpart of `open_with_high_bit_is_refused`: with
+    /// an `on_host_open` handler, a high-bit `Open` is admitted per channel
+    /// (the handler's call) and per id (`Connect`'s policy); the daemon's own
+    /// id space stays refused (`on_open` = none).
+    #[test]
+    fn host_open_id_and_channel_policy() {
+        let h = |n: u32| HOST_ID_BIT | n;
+        let opens = [(h(1), channel::RPC), (h(2), channel::SSH_AGENT), (h(1), channel::RPC), (3, channel::RPC)];
+        assert_eq!(refused_host_opens(&opens), [h(2), h(1), 3]);
+        // Up to MAX_HOST_STREAMS accepted, then refused.
+        let opens: Vec<(u32, u8)> = (1..=MAX_HOST_STREAMS as u32 + 2).map(|n| (h(n), channel::RPC)).collect();
+        assert_eq!(refused_host_opens(&opens), [h(MAX_HOST_STREAMS as u32 + 1), h(MAX_HOST_STREAMS as u32 + 2)]);
+    }
+
+    /// Without a handler (the host side, or a daemon that serves no RPC),
+    /// a high-bit `Open` on a flowing channel is refused like any other.
+    #[test]
+    fn host_open_without_a_handler_is_refused() {
+        let mut wire = Vec::new();
+        proto::write_frame(&mut wire, &Frame::Open { stream: HOST_ID_BIT | 1, channel: channel::RPC }).unwrap();
+        let frames = daemon_frames(wire, false);
+        assert_eq!(closes(&frames), [(HOST_ID_BIT | 1, String::new())]);
+    }
+
+    /// `Connect`s and host `Open`s share one `MAX_HOST_STREAMS` budget.
+    #[test]
+    fn host_opens_count_against_the_connect_cap() {
+        let h = |n: u32| HOST_ID_BIT | n;
+        let mut wire = Vec::new();
+        for n in 1..=MAX_HOST_STREAMS as u32 {
+            proto::write_frame(&mut wire, &Frame::Open { stream: h(n), channel: channel::RPC }).unwrap();
+        }
+        let over = h(MAX_HOST_STREAMS as u32 + 1);
+        proto::write_frame(&mut wire, &Frame::Connect { stream: over, host: "svc".into(), port: 80 }).unwrap();
+        assert_eq!(closes(&host_open_frames(wire)), [(over, "stream refused".to_string())]);
+    }
+
+    /// `credit_overrun_closes_only_that_stream` for a flowing `Open`.
+    #[test]
+    fn credit_overrun_on_a_flowing_open_closes_only_that_stream() {
+        let (a, b) = (HOST_ID_BIT | 1, HOST_ID_BIT | 2);
+        let mut wire = Vec::new();
+        for frame in [
+            Frame::Open { stream: a, channel: channel::RPC },
+            Frame::Open { stream: b, channel: channel::RPC },
+            Frame::Data { stream: a, bytes: vec![0; INITIAL_WINDOW as usize + 1] },
+            Frame::Data { stream: b, bytes: vec![0; 10] },
+            Frame::Ping(b"alive".to_vec()),
+        ] {
+            proto::write_frame(&mut wire, &frame).unwrap();
+        }
+        let frames = host_open_frames(wire);
+        assert_eq!(closes(&frames), [(a, FLOW_VIOLATION.to_string())]);
+        assert!(frames.contains(&Frame::Pong(b"alive".to_vec())), "connection stays up");
+    }
+
+    fn is_flow(mux: &Mux, stream: u32) -> Option<bool> {
+        mux.streams.lock().unwrap().get(&stream).map(|e| matches!(e, Entry::Flow(_)))
+    }
+
+    /// `flow_pair_with` for `Open`: a host-opened `RPC` stream is a flow
+    /// stream on both ends and moves more than a window each way with a
+    /// clean both-`Eof` teardown; a daemon-opened `CONTROL` stream on the
+    /// same connection stays legacy on both ends.
+    #[test]
+    fn flowing_open_is_flow_controlled_on_both_ends_and_legacy_stays_legacy() {
+        const N: usize = 1 << 20;
+        let (d_r, h_w) = std::io::pipe().unwrap();
+        let (h_r, d_w) = std::io::pipe().unwrap();
+        let daemon = Mux::new(d_w);
+        let host = Mux::new(h_w);
+        let (tx, servers) = mpsc::channel();
+        daemon.on_host_open(rpc_only(tx));
+        let d = Arc::clone(&daemon);
+        std::thread::spawn(move || d.serve(d_r, |_, _| None));
+        let h = Arc::clone(&host);
+        std::thread::spawn(move || {
+            h.serve(h_r, |_, ch| {
+                (ch == channel::CONTROL).then(|| {
+                    let (ours, agent) = UnixStream::pair().unwrap();
+                    echo_agent(agent);
+                    ours.into()
+                })
+            })
+        });
+
+        let id = HOST_ID_BIT | 1;
+        let (caller, theirs) = UnixStream::pair().unwrap();
+        host.attach(id, theirs, Some(channel::RPC)).unwrap();
+        assert_eq!(is_flow(&host, id), Some(true), "opener's end");
+        let server = servers.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(is_flow(&daemon, id), Some(true), "accepting end");
+        for s in [&caller, &server] {
+            s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        }
+        let (cw, sw) = (caller.try_clone().unwrap(), server.try_clone().unwrap());
+        let up = std::thread::spawn(move || {
+            write_pattern(&cw, N).unwrap();
+            cw.shutdown(Shutdown::Write).unwrap();
+        });
+        let down = std::thread::spawn(move || {
+            write_pattern(&sw, N).unwrap();
+            sw.shutdown(Shutdown::Write).unwrap();
+        });
+        let received_up = std::thread::spawn(move || read_check(&server));
+        assert_eq!(read_check(&caller), N);
+        assert_eq!(received_up.join().unwrap(), N);
+        up.join().unwrap();
+        down.join().unwrap();
+        wait_until("both sides to unregister", || {
+            host.streams.lock().unwrap().is_empty() && daemon.streams.lock().unwrap().is_empty()
+        });
+
+        let mut c = client(&daemon, 1, channel::CONTROL);
+        writeln!(c.get_mut(), "ping").unwrap();
+        let mut line = String::new();
+        c.read_line(&mut line).unwrap();
+        assert_eq!(line, "re:ping\n");
+        assert_eq!(is_flow(&daemon, 1), Some(false), "legacy on the opener");
+        assert_eq!(is_flow(&host, 1), Some(false), "legacy on the acceptor");
     }
 
     /// A host and a daemon mux over pipes; the daemon answers `PortQuery`s

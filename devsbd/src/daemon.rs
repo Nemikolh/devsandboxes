@@ -340,6 +340,12 @@ fn accept_bridges(ctl: UnixListener, bridges: Arc<Bridges>, hash: &str) {
 /// build taking over: exit) or a bridge's `Hello`, answered with ours even on
 /// a version mismatch so the bridge can report it. A matching bridge then
 /// becomes the newest route until it disconnects.
+/// What the daemon serves, in its `Hello` to each bridge: `Connect` streams,
+/// `PortQuery` answers and host-opened `RPC` streams (always: which methods
+/// a daemon offers is `rpc.methods`' answer, see `rpc_server`). The bridge
+/// passes the host `own & these`.
+pub(crate) const DAEMON_CAPS: u32 = caps::TCP_FORWARD | caps::PORT_INFO | caps::RPC;
+
 fn serve_bridge(mut conn: UnixStream, bridges: Arc<Bridges>, hash: &str) {
     // The bridge binary's own `Hello` caps: nonzero means its host will send
     // `Caps`, so until then the bridge isn't capable of anything
@@ -347,14 +353,10 @@ fn serve_bridge(mut conn: UnixStream, bridges: Arc<Bridges>, hash: &str) {
     let hello_caps = match proto::read_frame(&mut conn) {
         Ok(Some(Frame::Quit)) => std::process::exit(0),
         Ok(Some(Frame::Hello { version, caps: bridge_caps, .. })) => {
-            // Advertise that we serve `Connect` streams and answer `PortQuery`,
-            // so the bridge can pass the host `own & daemon` caps and a forward
-            // only uses what this daemon can serve.
-            let ours = Frame::Hello {
-                version: proto::VERSION,
-                hash: hash.to_string(),
-                caps: caps::TCP_FORWARD | caps::PORT_INFO,
-            };
+            // Advertise what we serve, so the bridge can pass the host
+            // `own & daemon` caps and the host only uses what this daemon
+            // can serve.
+            let ours = Frame::Hello { version: proto::VERSION, hash: hash.to_string(), caps: DAEMON_CAPS };
             if proto::write_frame(&mut conn, &ours).is_err() || version != proto::VERSION {
                 return;
             }
@@ -365,6 +367,7 @@ fn serve_bridge(mut conn: UnixStream, bridges: Arc<Bridges>, hash: &str) {
     let Ok(out) = conn.try_clone() else { return };
     let mux = Mux::new(out);
     mux.on_port_query(Arc::new(crate::listeners::lookup));
+    mux.on_host_open(Arc::new(|_, channel| crate::rpc_server::accept(channel)));
     Bridges::attach(&bridges, &mux, hello_caps);
     // Keepalive: a wedged bridge (stopped reading, so it also stops sending)
     // is caught by inbound silence; `on_dead` shuts the control connection,
@@ -376,8 +379,9 @@ fn serve_bridge(mut conn: UnixStream, bridges: Arc<Bridges>, hash: &str) {
             let _ = dead.shutdown(std::net::Shutdown::Both);
         });
     }
-    // The daemon never accepts `Open`; it dials each `Connect` on its own
-    // thread so the frame reader never blocks on a slow TCP handshake.
+    // The daemon accepts only host-opened `Open`s (`RPC`, above); it dials
+    // each `Connect` on its own thread so the frame reader never blocks on a
+    // slow TCP handshake.
     mux.serve_with(conn, |_, _| None, |_, host, port, reply| {
         std::thread::spawn(move || reply.finish(dial(&host, port)));
     });
@@ -721,6 +725,11 @@ fn next_stream_id(next: &AtomicU32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn daemon_advertises_forwarding_port_info_and_rpc() {
+        assert_eq!(DAEMON_CAPS, caps::TCP_FORWARD | caps::PORT_INFO | caps::RPC);
+    }
 
     #[test]
     fn stream_ids_stay_in_lower_half_and_wrap() {

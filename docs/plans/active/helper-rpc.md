@@ -1,8 +1,10 @@
 # Helper RPC: host → in-container daemon requests
 
-Status: planned
-Design written, nothing built: no `RPC` channel or caps bit in
-`src/devsbd/proto.rs`, no `rpc.rs`, no `HelperClient`.
+Status: in progress (steps 2-3, 8 next)
+Step 1 shipped: `channel::RPC` / `caps::RPC`, flowing `Open`
+(`proto::channel::flows`, `Mux::on_host_open`), `src/devsbd/rpc.rs`,
+`devsbd/src/rpc_server.rs` with `rpc.methods`. Not yet: `HelperClient`,
+`Mux::open_host` with cancel-by-`Close`, streaming handlers.
 
 Today the one persistent link (the serve daemon's bridge,
 [bridges](../../architecture/helper/bridges.md)) carries the container's

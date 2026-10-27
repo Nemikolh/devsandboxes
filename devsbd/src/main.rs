@@ -10,6 +10,7 @@ mod identity;
 mod json;
 mod listeners;
 mod outbox;
+mod rpc_server;
 mod runs;
 mod sessions;
 mod userns;
@@ -32,6 +33,9 @@ mod notify;
 #[path = "../../src/devsbd/proto.rs"]
 #[allow(dead_code)] // host-only helpers (e.g. Frame::Ping senders)
 mod proto;
+#[path = "../../src/devsbd/rpc.rs"]
+#[allow(dead_code)] // caller-side records and accessors the daemon doesn't use yet
+mod rpc;
 
 /// Build hash slot. The helper can't know its own sha256 at compile time, so
 /// devsandbox's build.rs finds this marker in the binary and overwrites the 64

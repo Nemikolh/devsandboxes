@@ -1446,6 +1446,10 @@ mod tests {
         assert_eq!(own_caps(true, false), caps::SSH_AGENT);
         assert_eq!(own_caps(false, true), SERVED);
         assert_eq!(own_caps(true, true), caps::SSH_AGENT | SERVED);
+        // `RPC` is a daemon cap: the host opens those streams, never serves them.
+        for (agent, sink) in [(false, false), (true, false), (false, true), (true, true)] {
+            assert_eq!(own_caps(agent, sink) & caps::RPC, 0);
+        }
     }
 
     /// `Services` for instance `instance` (owner id `<instance>-id`) whose
@@ -2336,8 +2340,8 @@ mod tests {
             assert_eq!(bridge.outcome(Duration::from_secs(10)), Some(Ok(())), "bridge handshake");
             assert_eq!(
                 bridge.peer_caps(),
-                Some(caps::TCP_FORWARD | caps::PORT_INFO),
-                "daemon advertises TCP_FORWARD and PORT_INFO"
+                Some(caps::TCP_FORWARD | caps::PORT_INFO | caps::RPC),
+                "daemon advertises TCP_FORWARD, PORT_INFO and RPC"
             );
 
             // Round-trip through the loopback echo server. Retry the connect a

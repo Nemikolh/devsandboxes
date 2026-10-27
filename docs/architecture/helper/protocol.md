@@ -8,7 +8,8 @@ changing either side of the link; both sides compile the same source files.
 Code: `src/devsbd/proto.rs` (`Frame`, `VERSION`, `caps`, `channel`,
 `handshake`), `src/devsbd/mux.rs` (`Mux`, `Conn`), `devsbd/src/bridge.rs`,
 `devsbd/src/daemon.rs` (`serve_bridge`, `Bridges::route`),
-`devsbd/src/listeners.rs` (`lookup`),
+`devsbd/src/listeners.rs` (`lookup`), `src/devsbd/rpc.rs`,
+`devsbd/src/rpc_server.rs`,
 `src/devsbd/{bootfile,notify,control,escape}.rs`, `devsbd/src/json.rs`.
 All shared files are included by the helper via `#[path]`; they are std-only
 because `devsbd` has no dependencies.
@@ -28,8 +29,9 @@ host owner ──exec -i -u root <c> /run/devsandbox/bin/devsbd bridge──▶ 
   restarted outside devsandbox), does `Hello` with the daemon, then with the
   host, then copies bytes verbatim both ways. The daemon parses the frames;
   the bridge never does after the handshake.
-- The bridge advertises to the host `(TCP_FORWARD | PORT_INFO) & <daemon's
-  caps>`, so the host sees what the whole path can serve.
+- The bridge advertises to the host `(TCP_FORWARD | PORT_INFO | RPC) &
+  <daemon's caps>` (`OWN_CAPS`), so the host sees what the whole path can
+  serve.
 - The daemon routes each new stream to the **newest** attached bridge whose
   host serves that channel; older bridges stay as fallbacks.
 
@@ -44,7 +46,7 @@ error, not a huge allocation). Stream 0 carries control frames.
 | kind | frame | payload / use |
 |---|---|---|
 | 0 | `Hello` | `u32 version \| u8 hash_len \| hash \| u32 caps`; first frame each way; trailing bytes ignored |
-| 1 | `Open` | one channel byte; daemon opens a stream toward the host |
+| 1 | `Open` | one channel byte; daemon opens a stream toward the host, or the host one toward the daemon (`RPC`) |
 | 2 | `Data` | stream bytes |
 | 3 | `Close` | optional UTF-8 reason (e.g. `connection refused (127.0.0.1:3000)`); empty = no payload |
 | 4/5 | `Ping`/`Pong` | keepalive, payload echoed |
@@ -64,14 +66,21 @@ must match.
 ### Channels (`Open`)
 
 `SSH_AGENT` = 1, `HTTP_PROXY` = 2 (reserved, unused), `NOTIFY` = 3,
-`CONTROL` = 4. The daemon opens `NOTIFY`/`CONTROL` only toward a host that
-advertised the matching cap.
+`CONTROL` = 4: opened by the daemon. The daemon opens `NOTIFY`/`CONTROL` only
+toward a host that advertised the matching cap. `RPC` = 5: opened by the
+host, only toward a daemon advertising `caps::RPC`.
+
+Whether a channel's streams are legacy or flow-controlled (see
+[Mux](#mux)) is a property of the channel, `proto::channel::flows`, so both
+ends agree without a flag on the wire: `RPC` flows, the rest are legacy.
 
 ### Caps
 
 Bitset, unknown bits ignored: `TCP_FORWARD` (daemon serves `Connect`),
-`PORT_INFO` (daemon answers `PortQuery`), `SSH_AGENT`, `NOTIFY`, `CONTROL`
-(host serves those channels). The host sends
+`PORT_INFO` (daemon answers `PortQuery`), `RPC` (daemon accepts host
+`Open(RPC)`; sent by every daemon, `DAEMON_CAPS` in
+`devsbd/src/daemon.rs`), `SSH_AGENT`, `NOTIFY`, `CONTROL` (host serves
+those channels). The host sends
 `Caps` after the handshake (`SSH_AGENT` only when it has a live agent;
 `NOTIFY | CONTROL` only on the serve daemon's bridges). Until a bridge's
 `Caps` arrives the daemon treats it as capable of nothing, except a bridge
@@ -132,17 +141,23 @@ the same code, so close semantics match: whoever sees its local end close
 first sends `Close`; receiving `Close` shuts the local socket without echoing.
 
 Stream ids: the daemon allocates `1..2^31` (high bit clear), the host
-allocates with the high bit set (`Connect`), monotonically, never reusing a
-just-closed id at once. Each side refuses ids from the wrong space. Caps:
-64 live `Open` streams, 256 live host `Connect` streams per bridge.
+allocates with the high bit set (`Connect`, `Open(RPC)`), monotonically,
+never reusing a just-closed id at once. Each side refuses ids from the wrong
+space: the host every high-bit `Open`; the daemon a low-bit `Connect`, and a
+high-bit `Open` unless it registered `Mux::on_host_open` (it does, and that
+hook accepts `RPC` only). Caps: 64 live daemon-opened streams, 256 live
+host-opened streams (`Connect` and `Open` together, `connect_allowed`) per
+bridge.
 
 Two stream kinds share a connection:
 
-- **Legacy** (`Open`: ssh-agent, notify, control). `Data` is written into the
+- **Legacy** (`Open` on ssh-agent, notify, control). `Data` is written into the
   local socket on the frame-reader thread. A peer `Eof` `shutdown(Write)`s the
   local socket, which is how request/response streams work: the daemon sends
   the request then `Eof`, the host replies and closes.
-- **Flow-controlled** (`Connect`: forwarded TCP). Per-direction credit
+- **Flow-controlled** (`Connect`: forwarded TCP; `Open` on a flowing
+  channel: `RPC`). Both ends register the stream as flowing: the opener in
+  `Mux::attach`, the acceptor when it admits the `Open`. Per-direction credit
   starting at `INITIAL_WINDOW` (256 KiB), `Window` granted once half is
   consumed, a per-stream write queue drained by its own thread (a slow reader
   never blocks the frame reader or the keepalive), half-close via `Eof` on
@@ -150,6 +165,45 @@ Two stream kinds share a connection:
   the stream with a reason. The daemon dials each `Connect` on its own thread
   (5 s per address, loopback falls back to the other IP family). The engine on
   top: [../daemon/forwards.md](../daemon/forwards.md).
+
+## RPC
+
+One host → daemon request per `Open(RPC)` stream (the daemon's side:
+[in-container.md](in-container.md#devsbd-daemon)): concurrent requests don't
+block each other, and cancelling one is closing its stream. Inside the
+stream's bytes (`Data` boundaries mean nothing) ride length-prefixed records
+`u8 tag | u32 len | payload`, little endian, payload ≤ `MAX_RECORD` (1 MiB),
+`src/devsbd/rpc.rs` (`Record`, `write_record`, `read_record`):
+
+| tag | record | dir | payload |
+|---|---|---|---|
+| 1 | `call` | → | first record: JSON `{ "method", "params", "meta" }` (`params`/`meta` objects, optional) |
+| 2 | `stdin` | → | raw bytes |
+| 3 | `stdin-eof` | → | empty |
+| 4 | `resize` | → | `u16 cols \| u16 rows` |
+| 5 | `signal` | → | `u8 signo` |
+| 6 / 7 | `stdout` / `stderr` | ← | raw bytes |
+| 8 | `event` | ← | JSON object |
+| 9 | `result` | ← | JSON object, last record on success |
+| 10 | `error` | ← | JSON `{ "code", "message" }`, last record on failure |
+| 11 | `exit` | ← | `u8 kind (0 code, 1 signal) \| i32 value`, last record of a process |
+
+An unknown tag or a malformed payload is an error (both ends ship together).
+Error codes every method can answer: `unknown-method` (no such method, or
+not offered by this daemon) and `bad-request` (the stream didn't start with
+a well-formed `call`). The daemon half-closes after its last record and
+reads the caller's input until its `Eof`, so a caller sends `Eof` once it
+has nothing more to send and the stream ends with both `Eof`s.
+
+JSON payloads use a subset with its own encoder and decoder in `rpc.rs`
+(`Json`, `Obj`, `encode_json`, `decode_json`), since the helper has no
+serde: objects (keys unique, nested at most `MAX_DEPTH` = 4), strings,
+`i64` integers, bools, `null`, and arrays of strings only. String maps
+(`env`) are objects of strings (`Obj::map`). No floats, no arrays of
+anything else; bigger data travels as byte records.
+
+Discovery: `rpc.methods` answers `{"methods": ["rpc.methods@1", …]}`, the
+methods this daemon offers with their versions.
 
 ## Line codecs
 

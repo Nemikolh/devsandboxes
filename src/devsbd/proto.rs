@@ -55,6 +55,18 @@ pub mod channel {
     /// encoded request then `Eof`; the host replies with the encoded response
     /// and closes. Only opened toward a host that advertised `caps::CONTROL`.
     pub const CONTROL: u8 = 4;
+    /// One host → daemon request (`rpc.rs`): opened by the host (high-bit
+    /// id) toward a daemon that advertised `caps::RPC`; records both ways,
+    /// the caller half-closes with `Eof` when it has no more input.
+    pub const RPC: u8 = 5;
+
+    /// Whether `Open` on `channel` makes a flow-controlled stream (window
+    /// credit, `Eof` half-close, its own writer thread, like `Connect`) rather
+    /// than a legacy one. A property of the channel, so both ends agree
+    /// without a flag on the wire.
+    pub const fn flows(channel: u8) -> bool {
+        matches!(channel, RPC)
+    }
 }
 
 const KIND_HELLO: u8 = 0;
@@ -87,6 +99,8 @@ pub mod caps {
     pub const CONTROL: u32 = 1 << 3;
     /// Daemon answers `PortQuery` with `PortInfo` (who listens on a port).
     pub const PORT_INFO: u32 = 1 << 4;
+    /// Daemon accepts host-opened `channel::RPC` streams.
+    pub const RPC: u32 = 1 << 5;
 }
 
 /// Upper bound on the processes one `PortInfo` lists; the helper stops
