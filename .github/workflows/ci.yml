@@ -32,14 +32,22 @@ jobs:
   # The same suite under rootless podman (the runner user), the runtime mode
   # the docker job can't reach. Gated tests follow DEVSANDBOX_RUNTIME
   # (src/test_support.rs); docker-only ones pass as not applicable. Pinned:
-  # ubuntu-latest moves to 26.04 and a newer podman. The systemd user manager
-  # and service-manager e2e stay in `test`.
+  # ubuntu-latest moves to 26.04 and a newer podman. The service-manager e2e
+  # stays in `test`.
   test-podman:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
       - run: rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
       - run: scripts/build-devsbd.sh
+      # Rootless podman's systemd cgroup manager needs a user session, as on
+      # a desktop; without one it half falls back to cgroupfs.
+      - name: Start a systemd user manager
+        run: |
+          sudo loginctl enable-linger "$USER"
+          dir="/run/user/$(id -u)"
+          for _ in $(seq 100); do [ -S "$dir/bus" ] && break; sleep 0.1; done
+          echo "XDG_RUNTIME_DIR=$dir" >> "$GITHUB_ENV"
       - name: Podman
         run: |
           podman version

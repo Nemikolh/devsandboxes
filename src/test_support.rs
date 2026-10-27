@@ -69,8 +69,9 @@ pub fn runtime_cmd() -> Command {
 /// fresh pair would mean an empty store owned by subuids (that the test's
 /// cleanup can't delete) and a second user namespace. Under podman this
 /// links `data/containers` and `runtime/{containers,libpod}` to the
-/// parent's; docker needs nothing. Removing the child's dirs removes only
-/// the links.
+/// parent's, plus the user bus (`$XDG_RUNTIME_DIR/bus`) when there is one:
+/// podman's systemd cgroup manager talks to it. Docker needs nothing.
+/// Removing the child's dirs removes only the links.
 #[cfg(unix)]
 pub fn share_runtime_dirs(data: &std::path::Path, runtime: &std::path::Path) {
     use std::os::unix::fs::{DirBuilderExt, symlink};
@@ -89,6 +90,9 @@ pub fn share_runtime_dirs(data: &std::path::Path, runtime: &std::path::Path) {
     symlink(store, data.join("containers")).unwrap();
     for name in ["containers", "libpod"] {
         symlink(run_dir.join(name), runtime.join(name)).unwrap();
+    }
+    if let Some(bus) = std::env::var_os("XDG_RUNTIME_DIR").map(|d| std::path::PathBuf::from(d).join("bus")).filter(|b| b.exists()) {
+        symlink(bus, runtime.join("bus")).unwrap();
     }
 }
 
