@@ -9,7 +9,8 @@ Code: `src/serve/proto.rs` (envelope, `PROTOCOL`, `MAX_LINE`),
 `src/serve/daemon.rs` (`handle`, `hello`, `subscribe`, `watch_root`,
 `shutdown`, `machine` routing), `src/serve/api.rs` (`call`: every other
 method), `src/inbox/wire.rs` (Inbox views, `ApiError`, `decide_*`),
-`src/serve/verbs.rs` (verbs), `src/serve/forwards.rs` (`forwards.*`),
+`src/serve/verbs.rs` (verbs), `src/serve/helper.rs` (`helper.call`),
+`src/serve/forwards.rs` (`forwards.*`),
 `src/serve/machines/api.rs` (`machines.*`), `src/serve/machines/forward.rs`
 (`QUICK`, federation), `src/serve/relay.rs` (`api --stdio`),
 `npm/devsandboxes/index.js` + `index.d.ts` (Node client; `src/serve/dts.rs`
@@ -25,13 +26,14 @@ checks the typings against the wire structs).
 | | `instances.watch\|unwatch` | no (`machines: true` federates) |
 | containers, config | `containers.logs\|inspect`, `sandboxes.list\|get`, `services.get`, `config.findings\|migrate\|ack` | yes |
 | | `roots.list` | no |
-| bridges, forwards | `bridges.ensure`, `forwards.list\|add\|rm` | no |
+| bridges, forwards | `bridges.ensure`, `helper.call`, `forwards.list\|add\|rm` | no |
 | verbs | `run`, `rebuild`, `start`, `stop`, `rm`, `services.rebuild` | yes (own ssh) |
 | machines | `machines.probe\|add\|list\|get\|rm` | no |
 
 Notifications: `inbox.changed`, `inbox.shown`, `instances.changed`,
 `instances.snapshot`, `forwards.changed`, `forwards.status`, `closing`
-(*Notifications*); `output`, `progress` (a verb's, *Verbs*).
+(*Notifications*); `output`, `progress` (a verb's, *Verbs*);
+`helper.record` (a `helper.call`'s).
 
 ## Transport
 
@@ -599,6 +601,45 @@ Errors: `not-found` (no such instance; nothing is recorded), `invalid`
 (missing `instance`, relative or empty `agent`, negative or non-numeric
 `wait`), `internal` (`state.toml` doesn't read, or a daemon without a
 host side).
+
+### `helper.call`
+
+Internal (devsandbox's own clients; not in the npm typings): one RPC call
+into an instance's in-container daemon over its bridge
+([helper/bridges.md](../architecture/helper/bridges.md#host--container-requests),
+[helper/protocol.md](../architecture/helper/protocol.md#rpc)).
+
+Params: `{"instance": "<name>", "method": "<rpc method>", "params": {…}}`.
+`instance` is the instance name (its `state.toml` key); `params` is
+optional and must fit the RPC JSON subset: integers only, arrays of
+strings only, objects nested at most 3 deep. `meta.caller` is the
+connection's client (`cli`, `tui`, `api:<name>`).
+
+The request holds its connection like a verb: nothing else is read from it
+meanwhile, and a hang-up (queued or mid-call) cancels the call. The call
+waits its turn behind the instance's other calls (16 at a time). Meanwhile,
+on that connection only:
+
+| notification | params | when |
+|---|---|---|
+| `helper.record` | `{"request": id, "record": "stdout" \| "stderr" \| "event", "data": …}` | the daemon sent output (`data` a string, UTF-8 lossy) or an event (`data` its object) |
+
+Result: the call's last record, one key:
+
+```
+← {"id":6,"result":{"result":{"methods":["rpc.methods@1"]}}}
+← {"id":7,"result":{"error":{"code":"unknown-method","message":"no method `x`"}}}
+← {"id":8,"result":{"exit":0}}          or {"signal": 9}
+```
+
+An RPC `error` record is a result, not an API error: the call went
+through. Errors: `invalid` (missing or empty `instance` or `method`,
+`params` outside the subset, a `machine`), `not-found` (no such instance,
+or no live bridge to it: not running, no helper, handshake not done),
+`unsupported` (its helper has no RPC: restart the instance), `failed` (the
+stream couldn't open, or ended without a last record: the message says
+why), `internal` (`state.toml` doesn't read, or a daemon without a host
+side).
 
 ## Forwards
 

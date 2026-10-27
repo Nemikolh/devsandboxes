@@ -32,6 +32,8 @@
 //!   its client
 //! - `verbs_client`: the CLI's side of those six: prompts, streaming,
 //!   Ctrl-C, exit codes, the in-process fallback
+//! - `helper`: host → container RPC calls (`HelperClient`) over the
+//!   bridges' links, and the internal `helper.call` method
 
 pub mod api;
 pub mod client;
@@ -40,6 +42,7 @@ pub mod endpoint;
 mod events;
 pub mod forward_store;
 pub mod forwards;
+pub mod helper;
 mod host;
 pub mod idle;
 pub mod install;

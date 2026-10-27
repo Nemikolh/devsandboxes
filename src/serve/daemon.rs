@@ -72,6 +72,7 @@ use super::host::{Host, Observers, Waker};
 use super::idle::{self, Decision, Holders};
 use super::machines::{self, forward as fwd, link, service, ssh::{self, Dial}};
 use super::proto::{self, HelloParams, HelloResult, Notification, Request, Response, Version};
+use super::helper;
 use super::snapshots::{self, Join, Snapshots};
 use super::verbs;
 use crate::inbox::ops;
@@ -129,6 +130,9 @@ pub struct Options {
     pub agent_dial: Option<Dial>,
     /// The machine links' linger, backoff and timeouts; short in tests.
     pub machine_timing: service::Timing,
+    /// How `helper.call` reaches containers; `None` is the host side's
+    /// bridges (none without one). Tests pass a client over fake links.
+    pub helper: Option<helper::HelperClient>,
 }
 
 impl Options {
@@ -147,6 +151,7 @@ impl Options {
             dial: None,
             agent_dial: None,
             machine_timing: service::Timing::default(),
+            helper: None,
         }
     }
 }
@@ -299,6 +304,9 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
     if let Some(host) = &host {
         let _ = shared.bridges.set(host.waker());
     }
+    if let Some(client) = opts.helper.clone().or_else(|| host.as_ref().map(|h| helper::HelperClient::new(h.board(), log))) {
+        let _ = shared.helper.set(client);
+    }
     let watcher = Watcher::spawn(&shared, host.as_ref().map(Host::changes));
     let mut next_conn = 0u64;
     let exit = loop {
@@ -412,6 +420,8 @@ struct Shared {
     bridges: OnceLock<Waker>,
     /// The forward registry, for `forwards.*`; unset without a host side.
     forwards: OnceLock<forwards::Handle>,
+    /// Host → container calls, for `helper.call`; unset without a host side.
+    helper: OnceLock<helper::HelperClient>,
     /// How verbs run; unset only in tests that build a bare `Shared`.
     runner: OnceLock<verbs::Runner>,
     /// The verbs not reaped yet, a predecessor's adopted ones included: the
@@ -452,6 +462,7 @@ impl Shared {
             closed: (Mutex::new(false), Condvar::new()),
             bridges: OnceLock::new(),
             forwards: OnceLock::new(),
+            helper: OnceLock::new(),
             runner: OnceLock::new(),
             verbs: Arc::default(),
             remote_verbs: AtomicUsize::new(0),
@@ -954,6 +965,7 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
     match req.method.as_str() {
         "hello" => return Some(hello(req.id, req.params, shared, conn)),
         method if verbs::is_verb(method) => return verb(req.id, method, req.params, shared, conn),
+        "helper.call" => return helper_call(req.id, req.params, shared, conn),
         _ => {}
     }
     // On a machine: the remote's answer as is
@@ -1054,6 +1066,40 @@ fn verb(id: Option<u64>, method: &str, params: Value, shared: &Shared, conn: &Co
             }
             Some(Response::err_with(id, f.code, f.message, f.data))
         }
+        verbs::Outcome::Gone => None,
+    }
+}
+
+/// `helper.call` (`serve::helper`): held on this connection like a verb,
+/// the call's records relayed until its last one, which is the answer.
+/// `None`: the client hung up (the call is cancelled); nothing is answered.
+fn helper_call(id: Option<u64>, params: Value, shared: &Shared, conn: &ConnState) -> Option<Response> {
+    match fwd::machine_of(&params) {
+        Err(e) => return Some(Response::err(id, e.code, e.message)),
+        Ok(Some(_)) => return Some(Response::err(id, "invalid", "`helper.call` can't take a machine")),
+        Ok(None) => {}
+    }
+    let Some(client) = shared.helper.get() else {
+        return Some(Response::err(id, "internal", "this daemon runs no bridges"));
+    };
+    let p = match helper::parse(params) {
+        Ok(p) => p,
+        Err(e) => return Some(Response::err(id, e.code, e.message)),
+    };
+    let container = match crate::state::State::load_at(&shared.state) {
+        Ok(state) => state.instances.get(&p.instance).map(|i| i.container.clone()),
+        Err(e) => {
+            log(&format!("{}: helper.call: {e:#}", conn.label()));
+            return Some(Response::err(id, "internal", format!("{e:#}")));
+        }
+    };
+    let Some(container) = container else {
+        return Some(Response::err(id, "not-found", format!("no instance `{}`", p.instance)));
+    };
+    let peer = ConnPeer { out: &conn.out, shared };
+    match helper::serve(client, &container, p, id, &conn.audit, &peer) {
+        verbs::Outcome::Answer(Ok(result)) => Some(Response::ok(id, result)),
+        verbs::Outcome::Answer(Err(f)) => Some(Response::err_with(id, f.code, f.message, f.data)),
         verbs::Outcome::Gone => None,
     }
 }
@@ -1343,6 +1389,7 @@ pub(crate) mod tests {
                 handshake: Duration::from_secs(5),
                 tick: Duration::from_millis(20),
             },
+            helper: None,
         }
     }
 
@@ -2016,6 +2063,67 @@ pub(crate) mod tests {
         assert_eq!(daemon.join().unwrap().unwrap(), Exit::Idle);
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `helper.call` over the socket: records as `helper.record`, the last
+    /// one the answer, request errors before any stream, and a hang-up
+    /// mid-call cancels it.
+    #[test]
+    fn helper_call_streams_records_and_a_hang_up_cancels() {
+        use crate::devsbd::proto::caps;
+        use crate::serve::helper::tests::{Fake, logged, respond};
+        let dir = scratch("helper-call");
+        let state_dir = scratch("helper-call-state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let state = state_dir.join("state.toml");
+        std::fs::write(
+            &state,
+            "[instance.web]\nsandbox = \"web\"\ncontainer = \"devsandbox-hc-web\"\nfolder = \"/w\"\nworkspace = \"/w\"\ncreated_unix = 1\n",
+        )
+        .unwrap();
+        let fake = Fake::default();
+        fake.add("devsandbox-hc-web", caps::RPC, 1, respond);
+        let client = helper::HelperClient::new(fake, crate::serve::helper::tests::log);
+        let daemon = spawn_daemon(&dir, Options { helper: Some(client), state: Some(state), ..opts(1, 200) });
+        let (stream, _) = hello_at(&dir, &v(1));
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut writer = stream;
+        let line = |id: u64, params: Value| format!("{}\n", json!({"id": id, "method": "helper.call", "params": params}));
+        let lines = line(1, json!({"instance": "web", "method": "chatty"}))
+            + &line(2, json!({"instance": "nope", "method": "chatty"}))
+            + &line(3, json!({"instance": "web", "method": "x", "machine": "box"}));
+        writer.write_all(lines.as_bytes()).unwrap();
+        let mut next = || {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            serde_json::from_str::<Value>(&line).unwrap()
+        };
+        let mut notes = Vec::new();
+        let answer = loop {
+            let msg = next();
+            if msg.get("id").is_some() {
+                break msg;
+            }
+            notes.push(msg);
+        };
+        assert_eq!(answer, json!({"id": 1, "result": {"exit": 3}}));
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert_eq!(notes[0], json!({"method": "helper.record", "params": {"request": 1, "record": "stdout", "data": "hi\n"}}));
+        assert_eq!(next()["error"]["code"], "not-found");
+        assert_eq!(next()["error"]["code"], "invalid");
+        assert!(logged("helper devsandbox-hc-web: chatty from api:test: exit 3"), "caller is the connection's client");
+
+        writer.write_all(line(4, json!({"instance": "web", "method": "hang"})).as_bytes()).unwrap();
+        assert_eq!(next()["params"]["data"], "working");
+        drop((reader, writer));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !logged("helper devsandbox-hc-web: hang from api:test: cancelled") {
+            assert!(Instant::now() < deadline, "not cancelled");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(daemon.join().unwrap().unwrap(), Exit::Idle);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&state_dir);
     }
 
     /// The dashboard's held verbs (`stop`, `rm`, `services.rebuild`) carry

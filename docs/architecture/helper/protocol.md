@@ -157,7 +157,8 @@ Two stream kinds share a connection:
   the request then `Eof`, the host replies and closes.
 - **Flow-controlled** (`Connect`: forwarded TCP; `Open` on a flowing
   channel: `RPC`). Both ends register the stream as flowing: the opener in
-  `Mux::attach`, the acceptor when it admits the `Open`. Per-direction credit
+  `Mux::connect` / `Mux::open_host` (the host's `Open`, handing the caller
+  one end of a socket pair), the acceptor when it admits the `Open`. Per-direction credit
   starting at `INITIAL_WINDOW` (256 KiB), `Window` granted once half is
   consumed, a per-stream write queue drained by its own thread (a slow reader
   never blocks the frame reader or the keepalive), half-close via `Eof` on
@@ -169,8 +170,11 @@ Two stream kinds share a connection:
 ## RPC
 
 One host → daemon request per `Open(RPC)` stream (the daemon's side:
-[in-container.md](in-container.md#devsbd-daemon)): concurrent requests don't
-block each other, and cancelling one is closing its stream. Inside the
+[in-container.md](in-container.md#devsbd-daemon); the host's:
+[bridges.md](bridges.md#host--container-requests)): concurrent requests
+don't block each other, and cancelling one is closing its stream
+(`Mux::close_stream`: `Close` with a reason, the local end shut, the
+stream's `on_close` run). Inside the
 stream's bytes (`Data` boundaries mean nothing) ride length-prefixed records
 `u8 tag | u32 len | payload`, little endian, payload ≤ `MAX_RECORD` (1 MiB),
 `src/devsbd/rpc.rs` (`Record`, `write_record`, `read_record`):

@@ -3,14 +3,16 @@
 A bridge is one `exec -i -u root <container> /run/devsandbox/bin/devsbd bridge`
 child whose stdio carries the frame protocol. The `devsandbox serve` daemon
 keeps one per running helper instance and serves what the container asks
-for over it: ssh-agent streams, notifications, control requests. Read this
-when touching who spawns bridges, their lifecycle, or what a container
-request turns into on the host.
+for over it: ssh-agent streams, notifications, control requests; and it
+calls the container's daemon over it (`RPC`). Read this when touching who
+spawns bridges, their lifecycle, what a container request turns into on the
+host, or how the host calls into a container.
 
 Code: `src/devsbd/bridge.rs` (`Bridge`, `Bridges`, `BridgeWorker`,
-`BridgeBoard`, `spawn_observed`, `spawn_for`, `attach`, `open_stream`,
+`BridgeBoard`, `Link`, `spawn_observed`, `spawn_for`, `attach`, `open_stream`,
 `handle_notify`, `handle_control`, `dispatch_control`, `apply_message`,
-`AgentCandidates`), `src/serve/host.rs` (`poll`, `Waker`), `src/serve/api.rs`
+`AgentCandidates`), `src/serve/helper.rs` (`HelperClient`, `Call`, `serve`),
+`src/serve/host.rs` (`poll`, `Waker`), `src/serve/api.rs`
 (`bridges_ensure`), `src/serve/client.rs` (`ensure_bridge`,
 `ensure_bridge_running`), `src/commands/exec.rs` (`AgentRelay`),
 `src/devsbd/desktop.rs`, `src/commands/dispatch.rs`.
@@ -84,10 +86,12 @@ daemon holder. `ensure_bridge` lazy-starts the daemon unless `--in-process`.
    devsandbox is older"), the bridge exiting `MISMATCH_EXIT`, or the bridge's
    stderr (e.g. `daemon not running`).
 3. On success: send `Caps` (`own_caps`: `SSH_AGENT` with a live agent,
-   `NOTIFY | CONTROL` only with a sink), publish the mux for forwards, report
-   `Ready` on the board, start the keepalive (dead peer → kill the child),
-   then `Mux::serve` until the stream ends; the board then shows `Failed("the
-   bridge ended …")` and the next reconcile retries.
+   `NOTIFY | CONTROL` only with a sink), publish the mux for forwards and,
+   for a daemon bridge, its `Link` on the board (*Host → container
+   requests*), report `Ready` on the board, start the keepalive (dead peer
+   → kill the child), then `Mux::serve` until the stream ends; the board
+   then shows `Failed("the bridge ended …")`, drops the link, and the next
+   reconcile retries.
 
 Wire details: [protocol.md](protocol.md).
 
@@ -143,6 +147,53 @@ the lock. Every daemon bridge advertises `CONTROL`; non-dispatchers get
 Bounds: at most 8 notify/control handler threads per bridge (`MAX_HANDLERS`).
 In-flight control requests (waits and followers included) count as daemon
 holders (`control_in_flight`), so the daemon doesn't idle out under them.
+
+## Host → container requests
+
+The serve daemon calls into a container's `devsbd daemon` over the same
+bridge, one `RPC` stream per call ([protocol.md](protocol.md#rpc)).
+
+**The registry.** Each daemon bridge's handshake thread publishes a `Link`
+(its mux, the daemon's caps, an `attach` id unique to that bridge) on the
+`BridgeBoard` right before it reports `Ready`; `BridgeBoard::link` hands it
+out. It goes when the bridge turns `Failed` (handshake failed, or it ended),
+when a new bridge for the container spawns, and when a reconcile drops the
+container. Links and statuses share the board's lock and spawn ids, so a
+replaced bridge's late link never shadows its successor. The forward
+engine's own bridges publish nothing.
+
+**`HelperClient`** (`src/serve/helper.rs`, one per daemon over the board)
+is the one way in:
+
+- `call(container, method, params, meta, caller, abandoned)`: no link →
+  `NoBridge`; a daemon without `caps::RPC` → `Unsupported` (the caller
+  falls back to `exec`). Then the call waits its turn: at most `MAX_CALLS`
+  (16) per container in flight, the rest queued in arrival order, each
+  checking `abandoned` while it waits. Each host-opened stream counts
+  against the bridge's 256 host streams (`MAX_HOST_STREAMS`, shared with
+  port forwards' `Connect`s), so RPC keeps well clear of them. Then
+  `Link::open_rpc` (`Mux::open_host` on `RPC`), the `call` record with
+  `meta.caller` stamped over whatever `meta` had (who asked; for
+  `helper.call` the connection's client, `cli`, `tui` or `api:<name>`), and
+  `Eof`: calls send no input.
+- `Call::next` reads the reply records up to the last (`result`, `error`,
+  `exit`); a stream that ends without one is an error with the reason
+  (cancelled, the peer's `Close` reason, the bridge gone).
+- Cancel (`Call::canceller`, or dropping an unfinished `Call`) is
+  `Mux::close_stream("cancelled")`: `Close` to the daemon, which drops the
+  stream; the reader sees the end at once.
+- One `serve.log` line per call, started or not: `helper <container>:
+  <method> from <caller>: <outcome> (<ms> ms)`, the outcome `ok`, `error
+  <code>: …`, `exit <n>`, `signal <n>`, `cancelled`, `ended: …` or why it
+  didn't start.
+- `offers(container, method)`: whether the daemon lists `method` in
+  `rpc.methods` (a bare name matches any version), asked once per bridge
+  attach and cached; `false` for a helper without `RPC`.
+
+The API reaches it through the internal `helper.call`
+([../../reference/api.md](../../reference/api.md#helpercall)): held on its
+connection like a verb, records relayed as notifications, and a hang-up
+cancels the call.
 
 ## Boot hook (host role)
 

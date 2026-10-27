@@ -191,6 +191,11 @@ impl Host {
         Waker(Arc::clone(&self.stop), self.board.clone())
     }
 
+    /// The bridges' board: their links, for `serve::helper`.
+    pub fn board(&self) -> BridgeBoard {
+        self.board.clone()
+    }
+
     /// Bumped each time a poll finds the running containers changed; the
     /// daemon's notification watcher compares it.
     pub fn changes(&self) -> Arc<AtomicU64> {

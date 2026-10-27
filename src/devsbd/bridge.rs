@@ -542,10 +542,48 @@ fn spawn_with(
     spawn_observed(container, hash, agent, notify, None)
 }
 
-/// Gets a bridge's status changes from its handshake thread: `Ready` or
-/// `Failed` once the handshake is decided (after `peer_caps` is published),
-/// then `Failed` again when a healthy bridge ends. Must return at once.
-type Observer = Box<dyn Fn(BridgeStatus) + Send>;
+/// Gets a bridge's news from its handshake thread: its mux and the daemon's
+/// caps once the handshake succeeded (`on_link`, just before `Ready`), and its
+/// status changes: `Ready` or `Failed` once the handshake is decided (after
+/// `peer_caps` is published), then `Failed` again when a healthy bridge ends.
+/// Both must return at once.
+struct Observer {
+    on_status: Box<dyn Fn(BridgeStatus) + Send>,
+    on_link: Box<dyn Fn(&Arc<Mux>, u32) + Send>,
+}
+
+impl Observer {
+    fn status(&self, status: BridgeStatus) {
+        (self.on_status)(status)
+    }
+
+    fn link(&self, mux: &Arc<Mux>, caps: u32) {
+        (self.on_link)(mux, caps)
+    }
+}
+
+/// A managed bridge's live connection, as [`BridgeBoard::link`] hands it to
+/// host → container callers (`serve::helper`): the mux to open streams on,
+/// the daemon's caps, and which attach it is (a new bridge for the same
+/// container gets a new one, so per-attach caches know to refresh).
+#[derive(Clone)]
+pub struct Link {
+    pub mux: Arc<Mux>,
+    pub caps: u32,
+    pub attach: u64,
+}
+
+impl Link {
+    /// Open an `RPC` stream (`Mux::open_host`): `Unsupported` when the
+    /// daemon doesn't advertise `caps::RPC` (an older helper: the caller
+    /// falls back to `exec`).
+    pub fn open_rpc(&self, on_close: impl FnOnce(String) + Send + 'static) -> std::io::Result<(u32, Conn)> {
+        if self.caps & caps::RPC == 0 {
+            return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "helper has no RPC: restart the instance"));
+        }
+        self.mux.open_host(proto::channel::RPC, on_close)
+    }
+}
 
 /// [`spawn_with`], plus an [`Observer`] (the daemon's [`BridgeBoard`]):
 /// spawns `<runtime> exec -i -u root <container> devsbd bridge` and
@@ -615,11 +653,7 @@ fn attach_with(
     notify: Option<Services>,
     observe: Option<Observer>,
 ) -> Bridge {
-    let observe = move |s: BridgeStatus| {
-        if let Some(o) = &observe {
-            o(s)
-        }
-    };
+    let observe = observe.unwrap_or_else(|| Observer { on_status: Box::new(|_| {}), on_link: Box::new(|_, _| {}) });
     let child = Arc::new(Mutex::new(child));
     let done = Arc::new(AtomicBool::new(false));
     let mismatch = Arc::new(AtomicBool::new(false));
@@ -703,7 +737,7 @@ fn attach_with(
             let _ = tx.send(result);
             // After `done`: a reconcile that sees the failure also sees the
             // bridge dead, so an urgent one respawns it.
-            observe(BridgeStatus::Failed(why));
+            observe.status(BridgeStatus::Failed(why));
             return;
         }
         {
@@ -720,7 +754,10 @@ fn attach_with(
             // result, so a caller that sees `outcome() == Ok` can rely on
             // `peer_caps()` / `connect()` being ready (no publish race).
             let _ = hs_forward.set(Forward { mux: Arc::clone(&mux), peer_caps: daemon_caps });
-            observe(BridgeStatus::Ready);
+            // Likewise the board's link: a `bridges.ensure` waiter that sees
+            // `Ready` finds it.
+            observe.link(&mux, daemon_caps);
+            observe.status(BridgeStatus::Ready);
             let _ = tx.send(result);
             // Keepalive: a wedged daemon (stopped reading) is caught by inbound
             // silence; `on_dead` kills the child, ending the `serve` read below
@@ -732,7 +769,7 @@ fn attach_with(
             mux.serve(stdout, move |_, channel| open_stream(channel, agent.as_ref(), notify.as_ref()));
         }
         finished.store(true, Ordering::Relaxed);
-        observe(BridgeStatus::Failed("the bridge ended (container stopped or helper gone)".into()));
+        observe.status(BridgeStatus::Failed("the bridge ended (container stopped or helper gone)".into()));
     });
     Bridge { child, done, mismatch, handshake, forward, label: bridge_label }
 }
@@ -845,18 +882,23 @@ impl Readiness {
 
 /// The board's data: each daemon bridge's status by container (tagged with a
 /// spawn id so a replaced bridge's late news can't overwrite its
-/// successor's), and the newest `bridges.ensure` ticket the worker has
-/// reconciled for.
-#[derive(Debug, Default)]
+/// successor's), the live ones' [`Link`]s (`attach` = that spawn id), and
+/// the newest `bridges.ensure` ticket the worker has reconciled for. One
+/// lock for both maps: a link is published only while its spawn id is
+/// current, so a dropped bridge's late link can't outlive its successor's
+/// arrival.
+#[derive(Default)]
 struct Board {
     handled: u64,
     next_id: u64,
     bridges: HashMap<String, (u64, BridgeStatus)>,
+    links: HashMap<String, Link>,
 }
 
-/// The daemon bridges' statuses, shared by the worker (spawns, removals,
-/// handled tickets), each bridge's handshake thread (its outcome and end) and
-/// the API's `bridges.ensure` (waits on it). Every writer only takes the lock
+/// The daemon bridges' statuses and links, shared by the worker (spawns,
+/// removals, handled tickets), each bridge's handshake thread (its outcome,
+/// link and end), the API's `bridges.ensure` (waits on it) and the helper
+/// client (`serve::helper`, takes links). Every writer only takes the lock
 /// briefly, so a waiting handler never holds up the worker. Cloneable.
 #[derive(Clone, Default)]
 pub struct BridgeBoard {
@@ -896,26 +938,48 @@ impl BridgeBoard {
 
     /// `container` gets a fresh bridge: `Pending`, and the [`Observer`] its
     /// handshake thread reports through.
+    /// The previous bridge's link goes (it was just dropped); this one's is
+    /// published by `on_link` and removed when it turns `Failed`.
     fn spawning(&self, container: &str) -> Observer {
         let mut id = 0;
         self.update(|b| {
             b.next_id += 1;
             id = b.next_id;
             b.bridges.insert(container.to_string(), (id, BridgeStatus::Pending));
+            b.links.remove(container);
         });
-        let (board, container) = (self.clone(), container.to_string());
-        Box::new(move |status| {
+        let (board, name) = (self.clone(), container.to_string());
+        let on_status = Box::new(move |status: BridgeStatus| {
             let failed = matches!(status, BridgeStatus::Failed(_));
             let mut applied = false;
             board.update(|b| {
-                if let Some(entry) = b.bridges.get_mut(&container).filter(|(at, _)| *at == id) {
+                if let Some(entry) = b.bridges.get_mut(&name).filter(|(at, _)| *at == id) {
                     entry.1 = status;
                     applied = true;
+                    if failed {
+                        b.links.remove(&name);
+                    }
                 }
             });
             // A replaced bridge's late news changes nothing: no wake.
             board.notify(failed && applied);
-        })
+        });
+        let (board, name) = (self.clone(), container.to_string());
+        let on_link = Box::new(move |mux: &Arc<Mux>, caps: u32| {
+            board.update(|b| {
+                if b.bridges.get(&name).is_some_and(|(at, _)| *at == id) {
+                    b.links.insert(name.clone(), Link { mux: Arc::clone(mux), caps, attach: id });
+                }
+            });
+        });
+        Observer { on_status, on_link }
+    }
+
+    /// `container`'s live link: its bridge finished the handshake and hasn't
+    /// ended. `None` while pending, after it failed or ended, or when the
+    /// daemon keeps no bridge for it.
+    pub fn link(&self, container: &str) -> Option<Link> {
+        self.inner.0.lock().unwrap_or_else(|e| e.into_inner()).links.get(container).cloned()
     }
 
     /// No [`BridgeBoard::on_failed`] wake: `reconcile` calls this itself when
@@ -926,12 +990,16 @@ impl BridgeBoard {
             b.next_id += 1;
             let id = b.next_id;
             b.bridges.insert(container.to_string(), (id, status));
+            b.links.remove(container);
         });
     }
 
     /// Forget every container but `keep` (their bridges were dropped).
     fn retain(&self, keep: &[String]) {
-        self.update(|b| b.bridges.retain(|c, _| keep.contains(c)));
+        self.update(|b| {
+            b.bridges.retain(|c, _| keep.contains(c));
+            b.links.retain(|c, _| keep.contains(c));
+        });
     }
 
     /// The worker reconciled with every ticket up to `ticket`.
@@ -1283,13 +1351,13 @@ mod tests {
         let observe = board.spawning("c");
         board.handled(t);
         assert_eq!(at(&board), None, "pending");
-        observe(BridgeStatus::Failed("helper in c is outdated".into()));
+        observe.status(BridgeStatus::Failed("helper in c is outdated".into()));
         assert_eq!(at(&board), Some(Readiness::not("helper in c is outdated")));
         // A replacement: the old bridge's late news can't overwrite it.
         let fresh = board.spawning("c");
-        observe(BridgeStatus::Ready);
+        observe.status(BridgeStatus::Ready);
         assert_eq!(at(&board), None, "stale observer ignored");
-        fresh(BridgeStatus::Ready);
+        fresh.status(BridgeStatus::Ready);
         assert_eq!(at(&board), Some(Readiness::ready()));
         // Dropped by a reconcile: no bridge.
         board.retain(&[]);
@@ -1308,10 +1376,10 @@ mod tests {
         assert!(board.settled(), "no bridges");
         let a = board.spawning("a");
         assert!(!board.settled(), "pending");
-        a(BridgeStatus::Ready);
+        a.status(BridgeStatus::Ready);
         assert!(board.settled());
         let b = board.spawning("b");
-        b(BridgeStatus::Failed("the bridge ended".into()));
+        b.status(BridgeStatus::Failed("the bridge ended".into()));
         assert!(!board.settled(), "failed");
         board.retain(&["a".into()]);
         assert!(board.settled(), "the failed one dropped");
@@ -1328,9 +1396,9 @@ mod tests {
         let n = || fired.load(Ordering::SeqCst);
         let a = board.spawning("a");
         assert_eq!(n(), 0, "pending");
-        a(BridgeStatus::Ready);
+        a.status(BridgeStatus::Ready);
         assert_eq!(n(), 0, "ready");
-        a(BridgeStatus::Failed("the bridge ended".into()));
+        a.status(BridgeStatus::Failed("the bridge ended".into()));
         assert_eq!(n(), 1, "failed via the observer");
         // `reconcile`'s own `set` (the exec couldn't start): no wake, or the
         // woken pass would retry at once, in a loop.
@@ -1338,7 +1406,7 @@ mod tests {
         assert_eq!(n(), 1, "no wake via set");
         // A replaced bridge's late failure: no wake.
         let _fresh = board.spawning("a");
-        a(BridgeStatus::Failed("late".into()));
+        a.status(BridgeStatus::Failed("late".into()));
         assert_eq!(n(), 1);
         // The hook runs outside the lock: it may read the board.
         let other = BridgeBoard::default();
@@ -1346,8 +1414,52 @@ mod tests {
         let out = Arc::clone(&seen);
         let inner = other.clone();
         other.on_failed(Box::new(move || *out.lock().unwrap() = Some(inner.settled())));
-        other.spawning("c")(BridgeStatus::Failed("x".into()));
+        other.spawning("c").status(BridgeStatus::Failed("x".into()));
         assert_eq!(*seen.lock().unwrap(), Some(false));
+    }
+
+    /// The registry: a bridge's link is there from its handshake until it
+    /// ends, is replaced, or a reconcile drops it; a replaced bridge's late
+    /// link or failure doesn't touch its successor's.
+    #[test]
+    fn board_publishes_a_link_from_handshake_to_end() {
+        let board = BridgeBoard::default();
+        let mux = Mux::new(std::io::sink());
+        let a = board.spawning("c");
+        assert!(board.link("c").is_none(), "pending");
+        a.link(&mux, caps::RPC);
+        a.status(BridgeStatus::Ready);
+        let link = board.link("c").unwrap();
+        assert!(Arc::ptr_eq(&link.mux, &mux));
+        assert_eq!(link.caps, caps::RPC);
+        a.status(BridgeStatus::Failed("the bridge ended".into()));
+        assert!(board.link("c").is_none(), "ended");
+
+        let b = board.spawning("c");
+        b.link(&mux, caps::RPC);
+        let first = board.link("c").unwrap().attach;
+        let fresh = board.spawning("c");
+        assert!(board.link("c").is_none(), "the replaced bridge's link went with it");
+        b.link(&mux, caps::RPC);
+        assert!(board.link("c").is_none(), "a late link from the replaced bridge");
+        fresh.link(&mux, caps::RPC);
+        assert_ne!(board.link("c").unwrap().attach, first, "a new attach");
+        b.status(BridgeStatus::Failed("late".into()));
+        assert!(board.link("c").is_some(), "a late failure from the replaced bridge");
+
+        let other = board.spawning("d");
+        other.link(&mux, 0);
+        board.set("d", BridgeStatus::Failed("cannot run exec".into()));
+        assert!(board.link("d").is_none());
+        board.retain(&[]);
+        assert!(board.link("c").is_none(), "dropped by a reconcile");
+    }
+
+    #[test]
+    fn a_link_without_the_rpc_cap_is_unsupported() {
+        let link = Link { mux: Mux::new(std::io::sink()), caps: caps::TCP_FORWARD, attach: 1 };
+        let err = link.open_rpc(|_| {}).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
     }
 
     #[test]
@@ -1365,7 +1477,7 @@ mod tests {
             std::thread::spawn(move || board.wait("c", t, Duration::from_secs(10)))
         };
         std::thread::sleep(Duration::from_millis(50));
-        observe(BridgeStatus::Ready);
+        observe.status(BridgeStatus::Ready);
         assert_eq!(waiter.join().unwrap(), Readiness::ready());
         assert!(started.elapsed() < Duration::from_secs(5), "woken, not timed out");
     }
@@ -2389,6 +2501,54 @@ mod tests {
             .unwrap();
             let reason = closed.recv_timeout(Duration::from_secs(10)).unwrap();
             assert!(reason.contains("refused"), "closed port reason: {reason:?}");
+            Ok(())
+        })
+    }
+
+    /// Docker-gated: a managed bridge publishes its link on the board once
+    /// the handshake is done, an `RPC` call (`rpc.methods`) round-trips over
+    /// it to the real daemon, and the link goes when the bridge does.
+    #[test_utils::docker_test(helper)]
+    fn a_managed_bridge_publishes_its_link_with_docker() -> Result<(), &'static str> {
+        use super::super::rpc::{self, Call, Record};
+
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let name = format!("devsandbox-rpc-link-test-{stamp}");
+        let cleanup = || {
+            let _ = crate::test_support::runtime_cmd().args(["rm", "-f", &name]).output();
+        };
+        crate::test_support::with_cleanup(cleanup, || {
+            assert!(ok(crate::test_support::runtime_cmd().args(["run", "-d", "--name", &name, "alpine:3.20", "sleep", "300"])));
+            let arch = install(&name, None).unwrap();
+            start_daemon(&name);
+            let board = BridgeBoard::default();
+            let none: Option<fn() -> Option<PathBuf>> = None;
+            let bridge = spawn_observed(&name, hash(arch).unwrap(), none, None, Some(board.spawning(&name))).unwrap();
+            assert_eq!(bridge.outcome(Duration::from_secs(10)), Some(Ok(())), "bridge handshake");
+            let link = board.link(&name).expect("published by the handshake");
+            assert_ne!(link.caps & caps::RPC, 0);
+
+            let (tx, closed) = mpsc::channel();
+            let (_, mut conn) = link
+                .open_rpc(move |r| {
+                    let _ = tx.send(r);
+                })
+                .unwrap();
+            let Conn::Unix(s) = &conn else { unreachable!() };
+            s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            rpc::write_record(&mut conn, &Record::Call(Call { method: "rpc.methods".into(), ..Call::default() })).unwrap();
+            conn.shutdown(std::net::Shutdown::Write).unwrap();
+            let Ok(Some(Record::Result(o))) = rpc::read_record(&mut conn) else { panic!("no result") };
+            assert!(o.strs("methods").unwrap().contains(&"rpc.methods@1".to_string()), "{o:?}");
+            assert_eq!(rpc::read_record(&mut conn).unwrap(), None);
+            assert_eq!(closed.recv_timeout(Duration::from_secs(10)).unwrap(), "", "clean both-Eof end");
+
+            drop(bridge);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while board.link(&name).is_some() {
+                assert!(Instant::now() < deadline, "the link outlived its bridge");
+                std::thread::sleep(Duration::from_millis(20));
+            }
             Ok(())
         })
     }

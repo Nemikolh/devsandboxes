@@ -720,6 +720,71 @@ impl Mux {
         Ok(stream)
     }
 
+    /// Open a flow-controlled stream on flowing `channel` toward the peer (a
+    /// daemon that registered `on_host_open`; the host's `RPC` calls), the
+    /// sibling of [`connect`](Self::connect): a high-bit id, registered before
+    /// the `Open` goes out. Returns the id and the caller's end of a socket
+    /// pair whose other end the mux relays: write to send, read until EOF to
+    /// receive, `shutdown(Write)` to send `Eof`. `on_close` runs once when the
+    /// stream ends (both `Eof`s: empty reason; else the peer's `Close`
+    /// reason, ours from [`close_stream`](Self::close_stream), or `"bridge
+    /// closed"`); it isn't called when this returns `Err`, which it does for a
+    /// legacy channel or a connection already gone.
+    #[allow(dead_code)] // host side (`serve::helper`)
+    pub fn open_host(
+        self: &Arc<Self>,
+        channel: u8,
+        on_close: impl FnOnce(String) + Send + 'static,
+    ) -> io::Result<(u32, Conn)> {
+        if !proto::channel::flows(channel) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("channel {channel} is not a flowing channel")));
+        }
+        let gone = || io::Error::new(io::ErrorKind::BrokenPipe, "bridge closed");
+        if self.ended.load(Ordering::Relaxed) {
+            return Err(gone());
+        }
+        let (ours, theirs) = UnixStream::pair()?;
+        let conn = Conn::from(ours);
+        let reader = conn.try_clone()?;
+        let flow = Flow::new(None, Some(Box::new(on_close)));
+        let stream = {
+            let mut live = self.streams.lock().unwrap();
+            let mut next = self.next_host.load(Ordering::Relaxed);
+            let id = next_host_id(&mut next, |id| live.contains_key(&id));
+            self.next_host.store(next, Ordering::Relaxed);
+            live.insert(id, Entry::Flow(Arc::clone(&flow)));
+            id
+        };
+        // `serve` sets `ended` before `close_all`: past the insert, either we
+        // see it here or `close_all` drains (and reports) our entry.
+        if self.ended.load(Ordering::Relaxed) && self.unregister(stream, &flow) {
+            return Err(gone());
+        }
+        if let Err(e) = self.send(&Frame::Open { stream, channel }) {
+            if self.unregister(stream, &flow) {
+                return Err(e);
+            }
+        }
+        self.start_flow(stream, &flow, conn, reader);
+        Ok((stream, Conn::from(theirs)))
+    }
+
+    /// End flow-controlled `stream` from this side: unregister it, shut its
+    /// local socket (the caller's end then reads EOF), run its `on_close`
+    /// with `reason`, and send the peer `Close { reason }`. How a host
+    /// cancels an `RPC` call. `false` when the stream is already gone (or is
+    /// legacy).
+    #[allow(dead_code)] // host side (`serve::helper`)
+    pub fn close_stream(self: &Arc<Self>, stream: u32, reason: &str) -> bool {
+        let Some(flow) = self.flow(stream) else { return false };
+        let live = self.unregister(stream, &flow);
+        if live {
+            flow.end(reason.to_string());
+            self.send_ctl(Frame::Close { stream, reason: reason.to_string() });
+        }
+        live
+    }
+
     /// Settle a pending inbound `Connect`. A stream that was closed (or whose
     /// id was replaced) while the dial ran is no longer registered: the late
     /// socket is dropped silently, the peer already knows the stream is gone.
@@ -2025,7 +2090,8 @@ mod tests {
         host.attach(id, theirs, Some(channel::RPC)).unwrap();
         assert_eq!(is_flow(&host, id), Some(true), "opener's end");
         let server = servers.recv_timeout(Duration::from_secs(10)).unwrap();
-        assert_eq!(is_flow(&daemon, id), Some(true), "accepting end");
+        // The hook hands `server` out before `accept_open` registers it.
+        wait_until("the accepting end's flow", || is_flow(&daemon, id) == Some(true));
         for s in [&caller, &server] {
             s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
         }
@@ -2054,6 +2120,113 @@ mod tests {
         assert_eq!(line, "re:ping\n");
         assert_eq!(is_flow(&daemon, 1), Some(false), "legacy on the opener");
         assert_eq!(is_flow(&host, 1), Some(false), "legacy on the acceptor");
+    }
+
+    /// A host and a daemon mux over pipes, the daemon serving host `Open`s on
+    /// `RPC` with `respond` (on a thread per stream, like `rpc_server`).
+    fn rpc_pair(respond: fn(UnixStream)) -> (Arc<Mux>, Arc<Mux>) {
+        let (d_r, h_w) = std::io::pipe().unwrap();
+        let (h_r, d_w) = std::io::pipe().unwrap();
+        let daemon = Mux::new(d_w);
+        let host = Mux::new(h_w);
+        daemon.on_host_open(Arc::new(move |_, ch| {
+            (ch == channel::RPC).then(|| {
+                let (ours, theirs) = UnixStream::pair().unwrap();
+                std::thread::spawn(move || respond(theirs));
+                ours.into()
+            })
+        }));
+        let d = Arc::clone(&daemon);
+        std::thread::spawn(move || d.serve(d_r, |_, _| None));
+        let h = Arc::clone(&host);
+        std::thread::spawn(move || h.serve(h_r, |_, _| None));
+        (host, daemon)
+    }
+
+    /// A test responder over the shared codec, shaped like `rpc_server`'s
+    /// `serve`: read the `call`, answer `result {method}` (or, for `hang`,
+    /// a `stdout` and nothing more until the stream goes), half-close,
+    /// drain the caller's input.
+    fn responder(s: UnixStream) {
+        use super::super::rpc::{self, Obj, Record};
+        let mut r = &s;
+        let Ok(Some(Record::Call(call))) = rpc::read_record(&mut r) else { return };
+        let mut w = &s;
+        if call.method == "hang" {
+            let _ = rpc::write_record(&mut w, &Record::Stdout(b"working".to_vec()));
+            let _ = io::copy(&mut r, &mut io::sink());
+            return;
+        }
+        let _ = rpc::write_record(&mut w, &Record::Result(Obj::new().with("method", call.method.as_str())));
+        let _ = s.shutdown(Shutdown::Write);
+        let _ = io::copy(&mut r, &mut io::sink());
+    }
+
+    fn rpc_call(host: &Arc<Mux>, method: &str) -> (u32, Conn, mpsc::Receiver<String>) {
+        use super::super::rpc::{self, Call, Record};
+        let (tx, closed) = mpsc::channel();
+        let (id, mut conn) = host
+            .open_host(channel::RPC, move |reason| {
+                let _ = tx.send(reason);
+            })
+            .unwrap();
+        let Conn::Unix(s) = &conn else { unreachable!() };
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        rpc::write_record(&mut conn, &Record::Call(Call { method: method.into(), ..Call::default() })).unwrap();
+        (id, conn, closed)
+    }
+
+    /// `open_host`: a high-bit flow stream on both ends; a call and its
+    /// answer round-trip, and once both sides half-close it tears down
+    /// cleanly (`on_close` with no reason). Ids stay monotonic.
+    #[test]
+    fn open_host_round_trips_a_call_and_tears_down_on_both_eofs() {
+        use super::super::rpc::{self, Obj, Record};
+        let (host, daemon) = rpc_pair(responder);
+        let (id, mut conn, closed) = rpc_call(&host, "rpc.methods");
+        assert_ne!(id & HOST_ID_BIT, 0);
+        assert_eq!(is_flow(&host, id), Some(true));
+        conn.shutdown(Shutdown::Write).unwrap();
+        let rec = rpc::read_record(&mut conn).unwrap();
+        assert_eq!(rec, Some(Record::Result(Obj::new().with("method", "rpc.methods"))));
+        assert_eq!(rpc::read_record(&mut conn).unwrap(), None, "the daemon's Eof");
+        assert_eq!(closed.recv_timeout(Duration::from_secs(10)).unwrap(), "");
+        wait_until("both sides to unregister", || {
+            host.streams.lock().unwrap().is_empty() && daemon.streams.lock().unwrap().is_empty()
+        });
+        let (next, _conn, _closed) = rpc_call(&host, "x");
+        assert!(next > id, "monotonic: {next:#x} after {id:#x}");
+    }
+
+    /// `close_stream` cancels a call in flight: the caller's end reads EOF,
+    /// `on_close` gets the reason, the daemon's end is shut, both sides
+    /// unregister; other streams and a closed id are unaffected.
+    #[test]
+    fn close_stream_cancels_one_call() {
+        use super::super::rpc::{self, Record};
+        let (host, daemon) = rpc_pair(responder);
+        let (id, mut conn, closed) = rpc_call(&host, "hang");
+        assert_eq!(rpc::read_record(&mut conn).unwrap(), Some(Record::Stdout(b"working".to_vec())));
+        let (other, mut other_conn, _other_closed) = rpc_call(&host, "hang");
+        assert!(host.close_stream(id, "cancelled"));
+        assert_eq!(closed.recv_timeout(Duration::from_secs(10)).unwrap(), "cancelled");
+        assert_eq!(rpc::read_record(&mut conn).unwrap(), None);
+        wait_until("the daemon to drop it", || !daemon.streams.lock().unwrap().contains_key(&id));
+        assert!(!host.close_stream(id, "again"), "already gone");
+        assert_eq!(rpc::read_record(&mut other_conn).unwrap(), Some(Record::Stdout(b"working".to_vec())));
+        assert!(host.streams.lock().unwrap().contains_key(&other));
+    }
+
+    /// `open_host` refuses a legacy channel and a connection that ended.
+    #[test]
+    fn open_host_refuses_legacy_channels_and_ended_connections() {
+        let mux = Mux::new(io::sink());
+        let err = mux.open_host(channel::CONTROL, |_| {}).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        mux.serve(io::empty(), |_, _| None);
+        let err = mux.open_host(channel::RPC, |_| panic!("not reported")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+        assert!(mux.streams.lock().unwrap().is_empty());
     }
 
     /// A host and a daemon mux over pipes; the daemon answers `PortQuery`s

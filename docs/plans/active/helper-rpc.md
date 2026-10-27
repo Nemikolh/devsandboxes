@@ -1,10 +1,13 @@
 # Helper RPC: host → in-container daemon requests
 
-Status: in progress (steps 2-3, 8 next)
+Status: in progress (steps 3, 8 next)
 Step 1 shipped: `channel::RPC` / `caps::RPC`, flowing `Open`
 (`proto::channel::flows`, `Mux::on_host_open`), `src/devsbd/rpc.rs`,
-`devsbd/src/rpc_server.rs` with `rpc.methods`. Not yet: `HelperClient`,
-`Mux::open_host` with cancel-by-`Close`, streaming handlers.
+`devsbd/src/rpc_server.rs` with `rpc.methods`.
+Step 2 shipped: `Link`s on the `BridgeBoard`, `Mux::open_host` /
+`Mux::close_stream`, `HelperClient` (`src/serve/helper.rs`: queue, log,
+`offers`), the internal `helper.call`. Not yet: streaming handlers, a
+caller in `dispatch.rs`.
 
 Today the one persistent link (the serve daemon's bridge,
 [bridges](../../architecture/helper/bridges.md)) carries the container's

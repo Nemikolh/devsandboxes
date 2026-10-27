@@ -37,8 +37,8 @@ pub(crate) mod mux;
 // Partly helper-only (e.g. `Frame::encode` callers on the daemon side).
 #[allow(dead_code)]
 pub mod proto;
-// Shared with the helper (its `rpc_server`); the host caller comes with the
-// helper client (docs/plans/active/helper-rpc.md).
+// Shared with the helper (its `rpc_server`); the host's caller is
+// `serve::helper`. Partly one-sided (caller vs. daemon records).
 #[allow(dead_code)]
 pub mod rpc;
 
