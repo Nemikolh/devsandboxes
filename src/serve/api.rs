@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::forwards::{AddRequest, Added, ForwardRow, Removed};
+use crate::config_identity::ops as identity_ops;
 use crate::inbox::wire::{self, Addr, resolve};
 use crate::inbox::{Inbox, Kind, Op, View, ops};
 // The wire views and errors live in `inbox::wire` (the CLI shares them off
@@ -150,6 +151,18 @@ pub fn call(method: &str, params: Value, ctx: &Ctx) -> Answer {
         }
         "sandboxes.get" => sandboxes_get(parse(params)?),
         "services.get" => services_get(parse(params)?),
+        "config.findings" => {
+            let p: FindingsParams = parse(params)?;
+            to_value(identity_ops::findings(&p.root, &host_state(ctx)?, p.sandbox.as_deref())?)
+        }
+        "config.migrate" => {
+            let p: MigrateParams = parse(params)?;
+            to_value(identity_ops::migrate(&p.root, &host_state(ctx)?, p.ids.as_deref(), &p.keep, &p.file_hash)?)
+        }
+        "config.ack" => {
+            let p: AckParams = parse(params)?;
+            to_value(identity_ops::ack(&p.root, &host_state(ctx)?, &p.ids)?)
+        }
         "bridges.ensure" => bridges_ensure(parse(params)?, ctx),
         "forwards.list" => forwards_list(parse(params)?, ctx),
         "forwards.add" => forwards_add(parse(params)?, ctx),
@@ -803,6 +816,35 @@ fn sandboxes_get(p: ConfigEntryParams) -> Answer {
         return Err(ApiError::not_found(format!("no sandbox `{}` in {}", p.name, p.root.display())));
     }
     serde_json::to_value(config.sandbox_text(&p.name)).map_err(|e| ApiError::internal(e.into()))
+}
+
+#[derive(Deserialize)]
+struct FindingsParams {
+    root: PathBuf,
+    #[serde(default)]
+    sandbox: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MigrateParams {
+    root: PathBuf,
+    /// Absent: every finding with an edit (but `keep`'s).
+    #[serde(default)]
+    ids: Option<Vec<String>>,
+    #[serde(default)]
+    keep: Vec<String>,
+    file_hash: String,
+}
+
+#[derive(Deserialize)]
+struct AckParams {
+    root: PathBuf,
+    ids: Vec<String>,
+}
+
+fn to_value(x: impl Serialize) -> Answer {
+    serde_json::to_value(x).map_err(|e| ApiError::internal(e.into()))
 }
 
 /// `services.get`'s answer. Services don't `extends`: as written is resolved.
@@ -2038,6 +2080,89 @@ mod tests {
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 
+    #[test]
+    fn config_findings_migrate_and_ack() {
+        let state = state_file("identity", "");
+        let root = state.with_file_name("cfg");
+        std::fs::create_dir_all(&root).unwrap();
+        let host = HostPaths { state: &state, home: None };
+        let run = |method: &str, params: Value| {
+            call(method, params, &Ctx { inbox: &state.with_file_name("inbox.json"), client: "api:test", bridges: None, forwards: None, host: Some(host) })
+        };
+        let file = root.join(crate::config::CONFIG_FILE);
+        assert_eq!(code(run("config.findings", json!({"root": root}))), "not-found", "no config file");
+        assert_eq!(code(run("config.findings", json!({"root": "rel"}))), "invalid");
+        let toml = "[template.base]\nmounts = [\"source=/a,target=/root/.a\"]\n\
+                    [sandbox.web]\nextends = \"base\"\nimage = \"img\"\n\
+                    [sandbox.api]\nimage = \"img\"\nremoteUser = \"root\"\n[sandbox.ok]\nimage = \"img\"\n";
+        std::fs::write(&file, toml).unwrap();
+        let project = crate::commands::services::project_id(&root).unwrap();
+        std::fs::write(
+            &state,
+            [instance("web", "web", ""), instance("web-2", "web", ""), instance("api", "api", ""), instance("ok", "ok", "")]
+                .concat()
+                .replace("created_unix = 1\n", &format!("created_unix = 1\nproject = \"{project}\"\n")),
+        )
+        .unwrap();
+
+        let all = run("config.findings", json!({"root": root})).unwrap();
+        assert_eq!(all["file"], json!(file));
+        assert_eq!(all["format"], "toml");
+        assert_eq!(all["fileHash"], crate::config_identity::file_hash(toml));
+        let found = all["findings"].as_array().unwrap();
+        assert_eq!(found.len(), 2);
+        let (mount, user) = (&found[0], &found[1]);
+        assert_eq!(mount["table"], "template.base");
+        assert_eq!(mount["kind"], "root-target");
+        assert_eq!(mount["sandboxes"], json!(["web"]));
+        assert_eq!(mount["edit"], "template.base: mounts entry \"source=/a,target=/root/.a\" -> \"source=/a,target=${containerEnv:HOME}/.a\"");
+        assert_eq!(user["kind"], "root-user");
+        assert_eq!(user["acked"], false);
+        // The sandbox filter; an unknown sandbox is not-found.
+        let api = run("config.findings", json!({"root": root, "sandbox": "api"})).unwrap();
+        assert_eq!(api["findings"].as_array().unwrap().len(), 1);
+        assert_eq!(api["findings"][0]["id"], user["id"]);
+        assert_eq!(run("config.findings", json!({"root": root, "sandbox": "ok"})).unwrap()["findings"], json!([]));
+        assert_eq!(code(run("config.findings", json!({"root": root, "sandbox": "nope"}))), "not-found");
+
+        // Ack: shown as acked; an unknown id is invalid.
+        assert_eq!(run("config.ack", json!({"root": root, "ids": [user["id"]]})).unwrap(), json!({"acked": [user["id"]]}));
+        let again = run("config.findings", json!({"root": root})).unwrap();
+        assert_eq!(again["findings"][1]["acked"], true);
+        assert_eq!(again["findings"][0]["acked"], false);
+        assert_eq!(code(run("config.ack", json!({"root": root, "ids": ["nope"]}))), "invalid");
+
+        // Migrate: a stale hash conflicts, unknown ids are invalid, then the mount only.
+        let hash = all["fileHash"].clone();
+        assert_eq!(code(run("config.migrate", json!({"root": root, "fileHash": "stale"}))), "conflict");
+        assert_eq!(code(run("config.migrate", json!({"root": root, "ids": ["nope"], "fileHash": hash}))), "invalid");
+        assert_eq!(code(run("config.migrate", json!({"root": root}))), "invalid", "fileHash is required");
+        let got = run("config.migrate", json!({"root": root, "ids": [mount["id"]], "fileHash": hash})).unwrap();
+        assert_eq!(got, json!({"edits": 1, "drifted": ["web", "web-2"]}));
+        assert!(std::fs::read_to_string(&file).unwrap().contains("target=${containerEnv:HOME}/.a"));
+        // The acked user is kept; the next ack prunes nothing still found.
+        assert_eq!(run("config.ack", json!({"root": root, "ids": []})).unwrap(), json!({"acked": [user["id"]]}));
+        // Keeping the root user fixes it for good, and the next ack prunes it.
+        let hash = run("config.findings", json!({"root": root})).unwrap()["fileHash"].clone();
+        let got = run("config.migrate", json!({"root": root, "ids": [], "keep": [user["id"]], "fileHash": hash})).unwrap();
+        assert_eq!(got, json!({"edits": 1, "drifted": ["api"]}));
+        assert_eq!(run("config.findings", json!({"root": root})).unwrap()["findings"], json!([]));
+        assert_eq!(run("config.ack", json!({"root": root, "ids": []})).unwrap(), json!({"acked": []}));
+        assert!(crate::state::State::load_at(&state).unwrap().identity_acks.is_empty());
+
+        // YAML: findings read, the rewrite refused with the edits.
+        std::fs::remove_file(&file).unwrap();
+        let yaml = "sandbox:\n  web:\n    image: img\n    remoteUser: root\n";
+        std::fs::write(root.join("devsandboxes.yaml"), yaml).unwrap();
+        let y = run("config.findings", json!({"root": root})).unwrap();
+        assert_eq!(y["format"], "yaml");
+        let err = run("config.migrate", json!({"root": root, "fileHash": y["fileHash"]})).unwrap_err();
+        assert_eq!(err.code, "unsupported");
+        assert!(err.message.contains("sandbox.web: remove remoteUser = \"root\""), "{}", err.message);
+        assert_eq!(std::fs::read_to_string(root.join("devsandboxes.yaml")).unwrap(), yaml);
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
     /// Against a real throwaway container: its logs, its inspect JSON, and
     /// its processes through the production fetch (no helper: no runs).
     #[test_utils::docker_test]
@@ -2124,7 +2249,28 @@ mod tests {
         assert_matches("ServiceConfig", &v(&ServiceConfig { original: "t".into() }));
         assert_matches("InstanceRenamed", &v(&Renamed { instance: "w".into() }));
         assert_matches("InstanceDone", &v(&DoneSet { instance: "w".into(), done: true }));
+        {
+            use crate::config_identity::ops::{ConfigAcked, ConfigFindings, ConfigMigrated, IdentityFinding};
+            let finding = IdentityFinding {
+                id: "i".into(),
+                table: "sandbox.web".into(),
+                kind: "root-user",
+                key: "remoteUser".into(),
+                value: "root".into(),
+                edit: None,
+                sandboxes: vec!["web".into()],
+                acked: false,
+            };
+            assert_matches("IdentityFinding", &v(&finding));
+            let findings = ConfigFindings { file: "/f".into(), format: "toml", file_hash: "h".into(), findings: vec![finding] };
+            assert_matches("ConfigFindings", &v(&findings));
+            assert_matches("ConfigMigrated", &v(&ConfigMigrated { edits: 1, drifted: vec!["web".into()] }));
+            assert_matches("ConfigAcked", &v(&ConfigAcked { acked: vec!["i".into()] }));
+        }
         for (method, result) in [
+            ("config.findings", "ConfigFindings"),
+            ("config.migrate", "ConfigMigrated"),
+            ("config.ack", "ConfigAcked"),
             ("instances.list", "InstancesList"),
             ("instances.watch", "OkResult"),
             ("instances.unwatch", "OkResult"),

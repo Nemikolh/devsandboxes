@@ -134,6 +134,32 @@ config ([rebuild and drift](instances/rebuild-and-drift.md)):
 `sandbox_text` / `resolved_table` give the dashboard's config view and the
 daemon's `sandboxes.get` the original table, the merged one and its hash.
 
+## Identity findings
+
+`config_identity::identity_findings` lists what in a config breaks under
+`identity = "host"`: `/root` mount targets (`RootTarget`), env values
+(`RootEnv`) and workspace paths (`RootPath`), and a winning
+`remoteUser`/`containerUser = "root"` (`RootUser`). Each `Finding` names
+the template or sandbox table that defines it and the sandboxes it
+reaches; its id is `short_hash` of table, key and current value, so an
+edited value is a new finding.
+
+`config_identity::rewrite` / `keep_root` edit the file's text on a
+`toml_edit` document (comments and layout kept): `/root` becomes
+`${containerEnv:HOME}`, a root user is removed, or kept with
+`identity = "image"`. `migrate_file` applies them to the config file
+(`.bak`, tmp + rename, refused for YAML and for a file changed since its
+`file_hash`). The rewrite changes the sandboxes' `sandbox_hash`, so their
+instances drift; `config_identity::ops::drifted` names them from the hash
+before and after, without the runtime.
+
+"Continue as is" is an ack: `State::identity_acks`, project id
+(`services::project_id`) to finding ids, kept out of the config so it
+doesn't change the hash. `config_identity::ops::ack` prunes ids no longer
+among the root's findings on every write. The ops (`findings`, `migrate`,
+`ack`) are the API's `config.*` methods ([api.md](../reference/api.md),
+*Config*), and what the CLI calls with no daemon.
+
 ## daemon.config.toml
 
 `<data-dir>/devsandbox/daemon.config.toml` is per user, not per root: settings

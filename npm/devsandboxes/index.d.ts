@@ -865,6 +865,46 @@ export interface ServiceConfig {
   original: string;
 }
 
+/** `config.findings`' answer: what in a config root's file breaks under `identity = "host"`. */
+export interface ConfigFindings {
+  file: string;
+  /** A `yaml` file isn't rewritten: `config.migrate` answers `unsupported`. */
+  format: 'toml' | 'yaml';
+  /** What `config.migrate` takes back, to refuse a file changed meanwhile (`conflict`). */
+  fileHash: string;
+  findings: IdentityFinding[];
+}
+
+/** One identity finding of a config. */
+export interface IdentityFinding {
+  /** Stable while its table, key and value are unchanged. */
+  id: string;
+  /** Where it's written: `template.<name>` | `sandbox.<name>`. */
+  table: string;
+  kind: 'root-target' | 'root-env' | 'root-path' | 'root-user';
+  key: string;
+  value: string;
+  /** The update as a line for a person; `null`: fixed by hand. */
+  edit: string | null;
+  /** The sandboxes it applies to; empty for a template no sandbox uses. */
+  sandboxes: string[];
+  /** The user chose to continue as is (`config.ack`). */
+  acked: boolean;
+}
+
+/** `config.migrate`'s answer. */
+export interface ConfigMigrated {
+  /** Findings fixed; 0 wrote nothing. */
+  edits: number;
+  /** This root's instances whose config hash the rewrite changed (they need a rebuild). */
+  drifted: string[];
+}
+
+/** `config.ack`'s answer: every acked finding id of the root, sorted. */
+export interface ConfigAcked {
+  acked: string[];
+}
+
 /** What `forwards.rm()` stopped. */
 export interface ForwardRemoved {
   ok: true;
@@ -1146,6 +1186,16 @@ export interface ApiMethods {
   /** `not-found` for an unknown sandbox; one that doesn't merge answers why in `resolved`. */
   'sandboxes.get': { params: { root: string; name: string; machine?: string }; result: SandboxConfig };
   'services.get': { params: { root: string; name: string; machine?: string }; result: ServiceConfig };
+  /** `not-found` for no config file or an unknown `sandbox`; with `sandbox`, only the findings applying to it. */
+  'config.findings': { params: { root: string; sandbox?: string; machine?: string }; result: ConfigFindings };
+  /**
+   * Rewrite the config file: `ids` (absent: every finding with an edit), and "continue as is" for the
+   * `root-user` findings in `keep`. `conflict` when the file's hash isn't `fileHash`; `unsupported` for YAML
+   * (the message lists the edits).
+   */
+  'config.migrate': { params: { root: string; ids?: string[]; keep?: string[]; fileHash: string; machine?: string }; result: ConfigMigrated };
+  /** Continue as is: ack `ids`, dropping acked ids no longer among the root's findings. */
+  'config.ack': { params: { root: string; ids: string[]; machine?: string }; result: ConfigAcked };
   'forwards.list': { params: { dir?: string; machines?: boolean }; result: ForwardRow[] };
   'forwards.add': { params: ForwardAddParams; result: ForwardAdded };
   'forwards.rm': { params: { id: number }; result: ForwardRemoved };
@@ -1238,7 +1288,7 @@ export declare function connect(opts?: ConnectOptions): Promise<Api>;
 
 /**
  * Rejection of an API call. `code` is the daemon's (`not-found`, `invalid`,
- * `denied`, `closed-form`, `bind-failed`, `failed`, `unknown-method`, `internal`, …) or the client's
+ * `denied`, `closed-form`, `conflict`, `unsupported`, `bind-failed`, `failed`, `unknown-method`, `internal`, …) or the client's
  * own: `closed` (the connection ended), `protocol`, `unsupported`.
  */
 export declare class DevsandboxApiError extends Error {

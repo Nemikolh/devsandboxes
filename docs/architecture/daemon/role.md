@@ -39,6 +39,15 @@ command still works without a daemon: verbs fall back to running in the
 CLI's process, Inbox mutations run locally, and a new daemon picks up
 where the last one left off.
 
+The user's own files are the client's to write: the example config
+(`run::offer_example_config`) is offered and written by the CLI, never the
+daemon. One exception: `config.migrate` (`config_identity::ops::migrate`)
+rewrites a config root's config file in the daemon, because the dashboard
+and machines have no other way to write it (a machine's config is
+rewritten by that machine's daemon). It writes through `migrate_file`'s
+`.bak` + tmp + rename, and only for a request naming the file's current
+hash.
+
 ## Socket, lock, log
 
 | file | where |

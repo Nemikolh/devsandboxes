@@ -45,8 +45,15 @@
 //! are gone. [`migrate_file`] applies it to a config file: YAML is refused
 //! with the edits as text, a file whose [`file_hash`] changed is a
 //! conflict, and the write goes through a `.bak` copy and tmp + rename.
+//!
+//! [`ops`] is all of it as the API's `config.*` methods, with the acks in
+//! `state.toml`.
 
-#![cfg_attr(not(test), allow(dead_code))] // wired by identity step 14
+// Only the daemon (unix) calls it so far; the CLI's no-daemon path comes in
+// identity step 16.
+#![cfg_attr(not(unix), allow(dead_code))]
+
+pub mod ops;
 
 use std::path::{Path, PathBuf};
 

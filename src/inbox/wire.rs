@@ -59,6 +59,18 @@ impl ApiError {
         Self::new("failed", message)
     }
 
+    /// What the request was based on changed meanwhile (a config file
+    /// edited since its findings were read).
+    pub fn conflict(message: impl Into<String>) -> Self {
+        Self::new("conflict", message)
+    }
+
+    /// Valid, but not something this target can do (a YAML config isn't
+    /// rewritten); the message says what to do instead.
+    pub fn unsupported(message: impl Into<String>) -> Self {
+        Self::new("unsupported", message)
+    }
+
     #[cfg_attr(not(unix), allow(dead_code))] // only the daemon (unix) uses it
     pub fn internal(e: anyhow::Error) -> Self {
         Self::new("internal", format!("{e:#}"))

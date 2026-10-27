@@ -367,6 +367,12 @@ pub struct State {
     /// autostart pass for that config root, so autostart runs once per boot.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub autostart_boot: BTreeMap<String, String>,
+    /// Project id (`services::project_id`) -> the identity findings
+    /// (`config_identity::Finding::id`) the user chose to "continue as is"
+    /// on: they leave the prompts and the header. Pruned of ids no longer
+    /// among that root's findings on every write (`config_identity::ops::ack`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub identity_acks: BTreeMap<String, std::collections::BTreeSet<String>>,
     /// Project id -> `forwardPorts` entry key -> host port, for entries that
     /// forward a `global` service: one forward per config root however many
     /// instances declare it, so its port can't live on any one instance.
@@ -566,6 +572,16 @@ mod tests {
         assert!(!text.contains("autostart_boot"), "{text}");
         let back: State = toml::from_str(&text).unwrap();
         assert!(back.autostart_boot.is_empty());
+    }
+
+    #[test]
+    fn identity_acks_roundtrip_and_empty_is_omitted() {
+        let text = toml::to_string_pretty(&State::default()).unwrap();
+        assert!(!text.contains("identity_acks"), "{text}");
+        let mut state = State::default();
+        state.identity_acks.insert("abc12345".into(), ["f1".to_string(), "f2".to_string()].into());
+        let back: State = toml::from_str(&toml::to_string_pretty(&state).unwrap()).unwrap();
+        assert_eq!(back.identity_acks, state.identity_acks);
     }
 
     #[test]

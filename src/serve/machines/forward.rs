@@ -48,6 +48,9 @@ pub const QUICK: &[&str] = &[
     "sandboxes.list",
     "sandboxes.get",
     "services.get",
+    "config.findings",
+    "config.migrate",
+    "config.ack",
 ];
 
 pub fn is_quick(method: &str) -> bool {

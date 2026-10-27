@@ -23,7 +23,7 @@ checks the typings against the wire structs).
 | Inbox | `inbox.threads.list`, `inbox.thread.get\|markRead\|act\|reply\|done\|reopen`, `inbox.form.saveDraft\|submit`, `inbox.notify.dismiss\|markRead` | no |
 | instances | `instances.list\|resolve\|cancel\|procs\|buildLog\|signal\|rename\|done` | yes |
 | | `instances.watch\|unwatch` | no (`machines: true` federates) |
-| containers, config | `containers.logs\|inspect`, `sandboxes.list\|get`, `services.get` | yes |
+| containers, config | `containers.logs\|inspect`, `sandboxes.list\|get`, `services.get`, `config.findings\|migrate\|ack` | yes |
 | | `roots.list` | no |
 | bridges, forwards | `bridges.ensure`, `forwards.list\|add\|rm` | no |
 | verbs | `run`, `rebuild`, `start`, `stop`, `rm`, `services.rebuild` | yes (own ssh) |
@@ -106,7 +106,8 @@ absent otherwise (`confirm` included).
 | `unknown-method` | no such method on this daemon |
 | `denied` | the target refuses it (an archived thread is read-only; a thread that takes no replies) |
 | `closed-form` | the form was already submitted, or withdrawn by its owner |
-| `conflict` | reserved: no method sends it |
+| `conflict` | what the request was based on changed meanwhile: a config file edited since its findings were read (`config.migrate`) |
+| `unsupported` | valid, but this target can't do it: a YAML config isn't rewritten (`config.migrate`); the message says what to do instead |
 | `bind-failed` | a forward's host port couldn't be bound (in use, privileged, an address not on this host) |
 | `failed` | a verb exited non-zero; `data`: `{"exit": n, "instance": name \| null}` (*Verbs*). Also a machine that couldn't be reached: ssh failed, the hello failed or the protocols differ, the link is `unreachable` (*Machines*) |
 | `confirm` | an `rm` sent with `ask: true` needs an answer; `message` is the question, nothing was removed (*Verbs*) |
@@ -491,6 +492,64 @@ Params: `{"root": "/abs/path/to/config-root", "name": "db"}`. Result:
 `extends`, so it's also what runs).
 
 Errors: as `sandboxes.get`, `not-found` for no such service.
+
+## Config
+
+A config's identity findings: what breaks under `identity = "host"`
+(`/root` mount targets, env values and paths, a root user), the rewrite
+that fixes them, and the acks that silence them
+([config.md](../architecture/config.md), *Identity findings*). Code:
+`src/config_identity/ops.rs`. The daemon writes the user's config file
+here ([role.md](../architecture/daemon/role.md), *Files are the truth*).
+
+### `config.findings`
+
+Params: `{"root": "/abs/path/to/config-root", "sandbox"?: "web"}`.
+Result:
+
+```json
+{"file": "/abs/…/devsandboxes.toml", "format": "toml", "fileHash": "…",
+ "findings": [{"id": "…", "table": "sandbox.web", "kind": "root-target",
+   "key": "mounts", "value": "source=/a,target=/root/.a",
+   "edit": "sandbox.web: mounts entry \"…\" -> \"…\"", "sandboxes": ["web"], "acked": false}]}
+```
+
+`format` is `toml` or `yaml`; `fileHash` is what `config.migrate` takes
+back. Each finding: `table` (`template.<name>` | `sandbox.<name>`) is
+where it's written, `kind` one of `root-target`, `root-env`, `root-path`,
+`root-user`, `edit` the update as a line for a person (`null`: fixed by
+hand), `sandboxes` those it applies to (empty: a template no sandbox
+uses), `acked` whether the user chose to continue as is. With `sandbox`,
+only the findings applying to it.
+
+Errors: `invalid` (as `sandboxes.list`), `not-found` (no such directory,
+no config file, no such `sandbox`).
+
+### `config.migrate`
+
+Params: `{"root": "/abs/…", "ids"?: ["…"], "keep"?: ["…"], "fileHash": "…"}`.
+Rewrites the config file in place, comments and layout kept: the findings
+`ids` (absent: every one with an edit, but `keep`'s), and for the
+`root-user` findings in `keep`, "continue as is" (`identity = "image"` in
+their table). Result: `{"edits": 2, "drifted": ["web", "web-2"]}`, the
+findings fixed (0 wrote nothing) and this root's instances whose config
+hash the rewrite changed (they drift: `devsandbox rebuild <name>`).
+
+Errors: `conflict` (the file's hash isn't `fileHash`), `unsupported` (a
+YAML config; the message lists the edits to make by hand), `invalid` (as
+`config.findings`, an id that isn't a current finding, a `keep` that
+isn't a `root-user`, an id in both), `not-found` (as `config.findings`),
+`internal` (the write failed; the message names a `.bak` left behind).
+
+### `config.ack`
+
+Params: `{"root": "/abs/…", "ids": ["…"]}`. Records "continue as is" for
+those findings in `state.toml` (`identity_acks`, by the root's project
+id), and drops acked ids no longer among the root's findings. Result:
+`{"acked": ["…"]}`, every acked id of the root, sorted.
+
+Errors: `invalid` (as `config.findings`, or an id that isn't a current
+finding), `not-found` (as `config.findings`).
 
 ## Bridges
 
