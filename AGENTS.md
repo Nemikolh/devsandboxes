@@ -37,7 +37,10 @@ Start with `docs/README.md` (reading order and map) and
   host runs git — hooks/fsmonitor off, repo config allowlist-checked),
   `ssh_agent.rs`, `mounts.rs`, `image.rs`
   (feature image + Dockerfile/entrypoint generation), `lifecycle.rs`,
-  `editor.rs` (VS Code name config); `mod.rs` re-exports what other commands use.
+  `editor.rs` (VS Code name config), `identity.rs` (mode probe, the plan's
+  create args, `devsbd identity apply`), `tool_env.rs` (userns check
+  verdict → exec env), `facts.rs` (image ENV/USER/passwd, cached per image
+  id); `mod.rs` re-exports what other commands use.
 - `src/config.rs` — TOML schema: `[template.*]`, `[sandbox.*]`, `[services.*]`.
   `extends` deep-merges (tables recurse, **arrays concatenate** — that's how
   `template.base` services reach every sandbox). Config drift is detected by
@@ -47,6 +50,8 @@ Start with `docs/README.md` (reading order and map) and
   `skills/config-toml-spec/SKILL.md` skill: update it whenever a config field,
   merge rule, or `${…}` variable changes (the docs site renders it verbatim as
   `/docs/config`).
+- `src/config_identity.rs` (+ `ops.rs`) — findings under `/root` (and root
+  users), the `toml_edit` rewrite, acks, the `config.*` ops.
 - `src/commands/services.rs` — service/network lifecycle. `scope = "isolated"`
   (default): one container per instance on a per-instance network. `scope =
 "global"`: one shared container per config root. `gc` reaps unreferenced ones;
@@ -122,7 +127,8 @@ Start with `docs/README.md` (reading order and map) and
   `verbs_client.rs` is the CLI side: prompts first (`sandboxes.list`,
   `instances.resolve`, rm's `confirm` round), then streams the request;
   Ctrl-C = `instances.cancel` on a second connection; no daemon → the
-  in-process fallback.
+  in-process fallback. `verbs_client/identity.rs` is the identity prompt
+  (shared with the dashboard).
   `--in-process` (hidden, global) never lazy-starts a daemon
   (`client::set_in_process`) and never fans out to machines; the
   dispatcher's subprocesses pass it too.
@@ -152,7 +158,9 @@ Start with `docs/README.md` (reading order and map) and
   `procs.rs` parses a container's `ps` listing and its helper's `devsbd run
   ls` (pure; what `instances.procs` answers). `events.rs` parses one
   `docker`/`podman events` line and whitelists the actions worth a re-list
-  (never exec events: the bridges' own execs would loop).
+  (never exec events: the bridges' own execs would loop). `identity.rs`
+  (strategy table, probe parsers), `seccomp.rs` (vendored moby profile +
+  userns rules).
 - `devsbd/` — static in-container helper (workspace member), built by
   `scripts/build-devsbd.sh` and embedded by `build.rs`; `src/devsbd.rs` holds
   the embedded blobs + install, `src/devsbd/proto.rs` the frame protocol
@@ -169,14 +177,16 @@ Start with `docs/README.md` (reading order and map) and
   start), `outbox.rs` (`devsbd notify` queue, flushed by the daemon),
   `ctl.rs` (`devsbd ensure|ls|stop|rm|exec|run … <key>` clients over
   `api.sock`), `runs.rs` (`devsbd run start|ls|logs|wait`: tracked runs in a
-  container).
+  container), `identity.rs` (`devsbd identity apply`), `userns.rs` (`devsbd
+  userns check`), `browser.rs` (the multicall browser wrapper).
 - `src/tui/` — ratatui dashboard. `app/` is a deliberately I/O-free state
   machine (unit-tested): `App` + key/mouse dispatch in `app/mod.rs`, with
   `impl App` blocks split into `tree.rs` (selection/navigation), `view.rs`
   (modals, config/inspect view), `command_line.rs` (`:` prompt handling and
   completion), `terminal.rs`, `actions.rs` (one-key actions + pending queue),
   `procs.rs`, `inbox.rs` (Inbox tab: `devsbd notify` history, key dedupe,
-  unread badges), `forms.rs` (pinned open forms: rendering, form zone keys); shared test fixtures in `test_support.rs`. `tui/mod.rs` owns the terminal + event loop and runs
+  unread badges), `forms.rs` (pinned open forms: rendering, form zone keys),
+  `identity.rs` (identity gate and offer modals); shared test fixtures in `test_support.rs`. `tui/mod.rs` owns the terminal + event loop and runs
   daemon requests on background threads (the dashboard reads no config
   and calls no runtime; still local: the Inbox store, `dashboard.toml`,
   prompt history, VS Code's `state.toml` read); `procs.rs` builds the

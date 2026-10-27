@@ -1,6 +1,6 @@
 //! What in a config breaks under `identity = "host"`: the *findings* a
-//! migration offers to fix (docs/plans/active/identity.md, section 7
-//! *Migrating existing configs*). Pure over [`Config`]; no I/O.
+//! migration offers to fix (docs/architecture/config.md, *Identity
+//! findings*). Pure over [`Config`]; no I/O.
 //!
 //! Each template's and sandbox's *own* table is scanned, so a finding names
 //! the table that defines it ([`Origin`]) and one edit there fixes every

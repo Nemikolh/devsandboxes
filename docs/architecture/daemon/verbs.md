@@ -119,7 +119,9 @@ config file and asks `[u]pdate / [c]ontinue as is (don't ask again) /
   an edit, then `updated devsandboxes.toml (N edits); now drifted: a, b →
   devsandbox rebuild <name>`. A `conflict` (the file changed meanwhile)
   stops the verb, to be re-run; `unsupported` (YAML) prints the edits to
-  make by hand; any other error is a `warning:`;
+  make by hand; any other error is a `warning:`. A file none of whose
+  findings has an edit gets `<file>: nothing to update automatically;
+  fix the entries above by hand` instead, and no `config.migrate`;
 - `c`: `config.ack`, but a root user in a TOML config, which
   `config.migrate {keep}` keeps in the file as `identity = "image"`;
 - `s`: nothing.

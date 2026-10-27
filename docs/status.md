@@ -12,10 +12,7 @@ limitation means editing this file in the same commit.
 
 ## In progress
 
-- **runtimes**: identity's tool environment (the browser sandbox under
-  docker's seccomp, the root-plan browser wrapper, the knobs) and the
-  migration of configs that mount into `/root`.
-  → [plan](plans/active/identity.md)
+(none)
 
 ## Planned
 
@@ -46,6 +43,9 @@ limitation means editing this file in the same commit.
 
 ## Parked
 
+- **instances**: repeat-instance worktrees in a container volume instead
+  of a host bind (ownership stops mattering, faster I/O on VM-backed
+  runtimes; the host reaches them through `host_git` and the helper).
 - **services**: credential-isolated `gh`/`sentry-cli` through a `tools`
   service, or HTTP proxying over the helper. → [plan](plans/active/cli-proxy.md)
 - **instances**: auto-mount a shared `.agents/skills` folder read-only into
@@ -166,6 +166,10 @@ limitation means editing this file in the same commit.
   can't be read (no `sh` in the image) or lacks the account; another uid
   then only gets a warning from `devsbd identity apply --expect`.
   `identity::ASSUMED`
+- Apple `container` never reads the image's `/etc/passwd` (no throwaway
+  container), so `${containerEnv:HOME}` falls back to `/home/<user>` (or
+  `/root`) whatever home the image gives the account.
+  `AppleContainer::image_passwd`
 - `${containerEnv:…}` in `workspaceFolder` and `folders` stays verbatim:
   they resolve before the image is built. `run::materialize`
 - Identity on rootless docker: VS Code attaches as root without the plan's

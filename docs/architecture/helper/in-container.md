@@ -237,7 +237,11 @@ Exit 0 with no output when every step passes; 1 with one stderr line
 `unshare(CLONE_NEWUSER)`, `setgroups`, `uid_map`, `gid_map` or
 `clone(CLONE_NEWPID)` (or `fork`/`waitpid` for the check's own plumbing)
 and `<errno>` is `EPERM`, `EACCES`, `EINVAL`, `ENOSPC`, `ENOSYS` or the
-number; 2 on a usage error. Off Linux it always exits 1. Without
+number. A grandchild that doesn't exit 0 (a non-zero code or a signal)
+reports `devsbd: userns: clone(CLONE_NEWPID): 0`; the check's own child
+killed by a signal reports `devsbd: userns: check killed by signal <N>`,
+also exit 1. 2 on a usage error. Off Linux it always exits 1 with
+`devsbd: userns: Linux only`. Without
 `--as-root` at euid 0 it fails up front with `devsbd: userns: euid: root`
 (`ROOT_LINE`): Chromium refuses its sandbox there, whatever namespaces
 could be made.

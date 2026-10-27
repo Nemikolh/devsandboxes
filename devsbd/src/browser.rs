@@ -1,7 +1,8 @@
 //! The browser wrapper: `devsbd` invoked as `chrome`, `chromium`, … (the
 //! symlinks the host's install makes in `/run/devsandbox/bin`). Chromium
 //! refuses its sandbox at euid 0, and on a root plan every exec runs as
-//! container root (docs/architecture/instances/identity.md, *Browser
+//! container root (docs/architecture/instances/identity.md, *The
+//! browser wrapper*; docs/architecture/helper/in-container.md, *Browser
 //! wrapper*). So at euid 0 the wrapper steps into a single-uid user
 //! namespace where it is [`userns::WRAPPED_ID`], with container root
 //! underneath (files still come out root's), and execs the real browser

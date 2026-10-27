@@ -15,7 +15,8 @@ Code: `src/tui/app/mod.rs` (`Tab`, `App`, `dispatch_key`, `PortRow`,
 `PendingDone`), `src/tui/app/view.rs` (`Modal`, `Fetch`, `ConfigView`,
 `BuildLogModal`, `ConfirmModal`, `open_config`, `open_build_log`,
 `refresh_build_log`), `src/tui/app/identity.rs` (`identity_gate`,
-`IdentityReq`, `IdentityOn`), `src/tui/ansi.rs`, `src/tui/mod.rs` (`run`,
+`IdentityReq`, `IdentityOn`, `offer_routes`, `App::identity_offer`,
+`App::identity_answered`), `src/tui/ansi.rs`, `src/tui/mod.rs` (`run`,
 `spawn_verb`, `verb_call`, `verb_status`), `src/tui/daemon.rs` (`Cmd`,
 `DaemonUpdate`), `src/tui/ui.rs`.
 
@@ -110,7 +111,7 @@ fills the modal if it is still the one open:
 `App` never sends anything. A key sets a pending field (`pending_action`,
 `pending_signal`, `pending_done`, `pending_fetch`, `pending_cancel`,
 `pending_port`/`pending_unport`, `pending_machine_set`, `pending_inbox`,
-`pending_open`), and the
+`pending_open`, `pending_identity`), and the
 event loop takes each once per pass and hands it to a thread.
 
 - `s`: stop a running instance, start an exited one; an exited drifted

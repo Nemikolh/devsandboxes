@@ -235,8 +235,10 @@ like the canary (`dockerlike.rs` `passwd_argv`: `--pull=never`,
 They're cached in `state.toml` (`State::image_facts`) by image id
 (`Backend::image_id`, `image inspect {{.Id}}`): content-addressed, so never
 stale. At most `IMAGE_FACTS_CAP` (32) entries; `State::remember_image_facts`
-drops the oldest by `at`. A fact that failed to read isn't cached, and
-without an id (Apple `container`) they're read on every `run`.
+drops the oldest by `at`. Caching is all or nothing (`facts::decide`):
+when any of the three reads fails, nothing is cached and the next `run`
+reads them all again; the fact that failed reads as unset. Without an id
+(Apple `container`) they're read on every `run`.
 
 ## Adding a runtime
 

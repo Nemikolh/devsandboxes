@@ -13,9 +13,15 @@ Code: `src/runtime/identity.rs` (`Identity`, `Accounts`, `plan`, `Plan`,
 (`plan_for`, `decide_plan`, `create_args`, `apply_argv`, `apply`,
 `apply_outcome`, `socket_gid`, `volume_targets`), `src/commands/run/mod.rs`
 (`materialize`, `run_container`, `IDENTITY_LABEL`), `src/state.rs`
-(`Instance::remote_user`, `Instance::home`, `Instance::exec_env`),
+(`Instance::remote_user`, `Instance::home`, `Instance::exec_env`,
+`Instance::browser_sandbox`, `Instance::tool_env`),
 `src/config.rs` (`SandboxProperties::identity`, `SandboxProperties::userns`),
-`src/runtime/seccomp.rs` (`profile`, `ensure_file`), `devsbd/src/identity.rs`.
+`src/runtime/seccomp.rs` (`profile`, `ensure_file`),
+`src/commands/run/tool_env.rs` (`check_argv`, `root_plan`,
+`browser_sandbox`, `tool_env`, `summary`), `src/commands/run/facts.rs`
+(`image_facts`, `accounts`, `home`), `src/devsbd.rs` (`BROWSER_WRAPPER`),
+`src/commands/inspect.rs` (`browser_line`), `devsbd/src/identity.rs`,
+`devsbd/src/userns.rs`, `devsbd/src/browser.rs`.
 
 ## The model
 
@@ -156,7 +162,9 @@ knobs (`SANDBOX_OFF_KNOBS`) are `PUPPETEER_DANGEROUS_NO_SANDBOX=1`,
 sandbox sets itself in `containerEnv` or `remoteEnv` are left out, `PATH`
 included. `run` says one line (`tool_env::summary`): `browser sandbox:
 on`, `browser sandbox: on (through /run/devsandbox/bin/chrome)` on a root
-plan, or `browser sandbox: off (<why>); sandbox-off knobs set`.
+plan, `browser sandbox: off (<why>); sandbox-off knobs set`, or, when
+the verdict is unknown, `browser sandbox: off (unknown: the userns check
+didn't run); sandbox-off knobs set`.
 
 ### The browser wrapper
 
@@ -227,7 +235,8 @@ container.
 An instance created before identity has no label and keeps the
 `remote_user` its `run` recorded (the config's `remoteUser`) until
 rebuilt. One created before the check has no verdict and no tool env:
-`inspect` says it isn't recorded.
+`inspect` (`browser_line`) says ``browser sandbox: not recorded (created
+before the userns check; `devsandbox rebuild` checks it)``.
 
 ## Fallbacks
 

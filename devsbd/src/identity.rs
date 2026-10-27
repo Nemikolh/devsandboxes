@@ -1,6 +1,7 @@
 //! `devsbd identity apply`: fit the adopted account to the identity plan
-//! (docs/plans/active/identity.md, section 4), run once per container by a
-//! root exec from the host after create. The edits live in the container
+//! (docs/architecture/helper/in-container.md, *`devsbd identity apply`*;
+//! docs/architecture/instances/identity.md, *Applying it*), run once per
+//! container by a root exec from the host after create. The edits live in the container
 //! layer, so a restart keeps them; a repeat run is a no-op.
 //!
 //! `/etc/passwd` and `/etc/group` are rewritten here rather than with

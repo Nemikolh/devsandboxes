@@ -1,6 +1,12 @@
+> Archived 2026-10-27. Historical, may be wrong; do not use as a reference.
+> Current: [architecture/instances/identity.md](../../architecture/instances/identity.md),
+> decisions [0038](../../decisions/0038-sandboxes-run-as-the-host-user-planned-per-runtime-mode.md),
+> [0039](../../decisions/0039-browser-sandbox-kept-where-it-can-work.md),
+> [0040](../../decisions/0040-root-configs-migrate-in-place-asked-per-verb.md)
+
 # Identity: one user model across runtimes
 
-Status: in progress (steps 7–17)
+Status: shipped (steps 1–17)
 Steps 1–6 shipped: the strategy table (`src/runtime/identity.rs`), the
 `identity` field (`SandboxProperties::identity`), `devsbd identity apply`
 (`devsbd/src/identity.rs`), the probe (`src/commands/run/identity.rs`
@@ -306,9 +312,9 @@ its sandbox at euid 0, so a wrapper starts it at a non-root euid:
   - **said where agents read it:** a short note in
     `skills/devsandbox-cli/SKILL.md` (host agents exec'ing into
     instances), the Claude Code plugin's skill
-    ([claude-code-plugin](claude-code-plugin.md)), and for agents running
+    ([claude-code-plugin](../active/claude-code-plugin.md)), and for agents running
     inside an instance, the auto-mounted skills
-    ([agents-skills](agents-skills.md), parked). The note: with
+    ([agents-skills](../active/agents-skills.md), parked). The note: with
     `DEVSANDBOX_BROWSER_SANDBOX=1`, launch Playwright with
     `chromiumSandbox: true`, plus `executablePath: $DEVSANDBOX_CHROME`
     when that's set; never add `--no-sandbox` by hand. Written

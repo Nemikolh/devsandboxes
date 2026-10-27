@@ -1,5 +1,5 @@
-//! Who a sandbox runs as, per runtime mode (docs/plans/active/identity.md,
-//! sections 2–3). The same devcontainer user fields mean opposite things on
+//! Who a sandbox runs as, per runtime mode (docs/architecture/instances/identity.md,
+//! *The model*, *The plan*). The same devcontainer user fields mean opposite things on
 //! rootful docker, rootless docker, rootless podman and VM-backed runtimes, so
 //! the user model is decided here from the probed mode instead of taken
 //! literally: [`classify`] turns the canary's two host-side `stat`s into a
@@ -444,11 +444,11 @@ pub struct Plan {
 
 const ROOT: &str = "root";
 
-/// The warning for an image with nothing to adopt (*No account to adopt*).
+/// The warning for an image with nothing to adopt (*The model*).
 pub const NO_ACCOUNT_WARNING: &str = "no non-root account to adopt (remoteUser, containerUser and the image's USER are unset or root): running as root; \
      add the `ghcr.io/devcontainers/features/common-utils` feature to the config for one";
 
-/// The strategy table (section 3) plus *No account to adopt*.
+/// The strategy table (*The plan*) plus the no-account case (*The model*).
 /// `Identity::Image` is the pre-identity behavior: create as
 /// `containerUser`, exec as `remoteUser` (else `containerUser`), nothing
 /// remapped. An unknown mode can only be taken literally, so it plans
@@ -526,7 +526,7 @@ impl Plan {
         Some(Ids { uid: uid?, gid: gid? })
     }
 
-    /// One line for `run` and `inspect` (section 6).
+    /// The one line `run` prints (*The plan*).
     pub fn summary(&self) -> String {
         let mode = self.mode.describe();
         let mut s = match (self.identity, self.mode, self.account.as_deref()) {

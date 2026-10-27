@@ -9,8 +9,10 @@ field, merge rule or variable change. This doc does not repeat it.
 Code: `src/config.rs` (`find`, `migrate_legacy`, `Config::load`,
 `Config::resolve_sandbox`, `resolve_extends`, `deep_merge`,
 `SandboxProperties`, `SandboxProperties::ignored`, `Service`,
-`resolve_service`, `substitute`, `MountContext`, `sandbox_hash`,
-`config_hash`, `build_hash`, `sandbox_build_hash`, `short_hash`),
+`resolve_service`, `substitute`, `MountContext`, `ContainerEnv`,
+`ContainerEnv::resolve`, `sandbox_hash`, `config_hash`, `build_hash`,
+`sandbox_build_hash`, `short_hash`), `src/config_identity.rs`,
+`src/config_identity/ops.rs`, `src/commands/run/facts.rs`,
 `src/commands/services.rs` (`project_id`), `src/daemon_config.rs`.
 
 ## Config root
@@ -103,8 +105,9 @@ resolves `ContainerEnv::resolve` before the mounts, so `mounts`,
 `shell-rc`, feature mounts, `containerEnv` and `remoteEnv` see it;
 `workspaceFolder` and `folders` resolve earlier and leave it verbatim. A
 name resolves to the sandbox's `containerEnv` (substituted), else the
-image's `ENV`, else for `HOME` the adopted account's home
-([identity](instances/identity.md#containerenvhome)). Inside `containerEnv`
+image's `ENV`, else for `HOME` the home of the account the container runs
+as (`run::facts::home`, `identity::container_home`;
+[identity](instances/identity.md#containerenvhome)). Inside `containerEnv`
 values it reads only the image's `ENV` and that home
 (`ContainerEnv::resolve`), as devcontainer's does: `PATH =
 "${containerEnv:PATH}:…"` extends the image's `PATH`, and no order between
@@ -144,12 +147,18 @@ the template or sandbox table that defines it and the sandboxes it
 reaches; its id is `short_hash` of table, key and current value, so an
 edited value is a new finding.
 
+`config_identity::warning` is `run`'s one-line warning for a sandbox: its
+findings not acked, counted, pointing at the prompt `run`, `start` and
+`rebuild` offer on a terminal
+([verbs](daemon/verbs.md#the-identity-prompt)).
+
 `config_identity::rewrite` / `keep_root` edit the file's text on a
 `toml_edit` document (comments and layout kept): `/root` becomes
 `${containerEnv:HOME}`, a root user is removed, or kept with
 `identity = "image"`. `migrate_file` applies them to the config file
-(`.bak`, tmp + rename, refused for YAML and for a file changed since its
-`file_hash`). The rewrite changes the sandboxes' `sandbox_hash`, so their
+(a `.bak` copy, tmp + rename, reread and checked; the `.bak` is removed
+once the check passes and left only when something fails; refused for
+YAML and for a file changed since its `file_hash`). The rewrite changes the sandboxes' `sandbox_hash`, so their
 instances drift; `config_identity::ops::drifted` names them from the hash
 before and after, without the runtime.
 

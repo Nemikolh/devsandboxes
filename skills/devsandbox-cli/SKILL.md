@@ -278,11 +278,13 @@ process.env.DEVSANDBOX_CHROME` when that's set (instances whose execs run as
 root: `/run/devsandbox/bin/chrome` starts the browser at a non-root uid):
 
 ```js
-chromium.launch({ chromiumSandbox: true, executablePath: process.env.DEVSANDBOX_CHROME })
+chromium.launch({ chromiumSandbox: !!process.env.DEVSANDBOX_BROWSER_SANDBOX, executablePath: process.env.DEVSANDBOX_CHROME })
 ```
 
 Never add `--no-sandbox` by hand. Without `DEVSANDBOX_BROWSER_SANDBOX`,
-keep the tool's defaults: devsandbox has set its sandbox-off knobs.
+keep the tool's defaults; `devsandbox inspect <instance>` prints a
+`browser sandbox:` line saying why it's off and whether devsandbox set its
+sandbox-off knobs.
 
 ## Debugging a sandbox
 

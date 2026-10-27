@@ -268,7 +268,7 @@ bumps it with the crate and npm pins. Component paths can't escape the
 plugin root, so `skills/devsandbox-cli` can't be referenced from there.
 Besides how to work under the plugin, the skill carries instance facts
 an agent would otherwise rediscover the hard way, e.g. the browser note
-from [identity](identity.md) (*Browser wrapper*): with
+from [identity](../../architecture/instances/identity.md#the-browser-wrapper): with
 `DEVSANDBOX_BROWSER_SANDBOX=1`, launch Playwright with
 `chromiumSandbox: true`, plus `executablePath: $DEVSANDBOX_CHROME` when
 that's set.

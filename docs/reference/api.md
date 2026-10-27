@@ -541,6 +541,8 @@ YAML config; the message lists the edits to make by hand), `invalid` (as
 `config.findings`, an id that isn't a current finding, a `keep` that
 isn't a `root-user`, an id in both), `not-found` (as `config.findings`),
 `internal` (the write failed; the message names a `.bak` left behind).
+The hash is checked first, so a YAML config changed since `fileHash` is
+`conflict`, not `unsupported`.
 
 ### `config.ack`
 
