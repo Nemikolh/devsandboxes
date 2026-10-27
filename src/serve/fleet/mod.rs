@@ -26,16 +26,17 @@
 //!   cache), and the worker's receivers for them.
 //! - `place`: the pure placement of new work over candidates filled from
 //!   the daemon's snapshots (soft caps, locality, pins).
+//! - `placed`: the daemon's `run` verb placed: candidates, the decision,
+//!   the request forwarded to the worker.
 
-#[allow(dead_code)] // the hub side's first caller: the placed run (fleet step 3c2)
 pub mod code;
 pub mod lend;
 pub mod lender;
 pub mod lent;
 pub mod link;
 pub mod offer;
-#[allow(dead_code)] // first caller: the placed run (fleet step 3c)
 pub mod place;
+pub mod placed;
 pub mod transfer;
 pub mod update;
 pub mod worker;

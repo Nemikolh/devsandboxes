@@ -158,4 +158,17 @@ request's life, ids rewritten, with no spool here; it's a `verbs` holder
 while it runs, and a drain cuts it like a hang-up (cancelled there unless
 `detach`). → [machines.md](machines.md)
 
+## A placed `run`
+
+A `run` request without `machine` or `here` is placed first
+(`daemon.rs` `placed_run`, `fleet::placed`): when an offered fleet worker
+takes work and scores above this host, the sandbox's code moves there and
+the request goes on as a machine verb would (`remote_verb`, `root`
+rewritten to the worker's copy, `here` set), its `progress` and answer
+tagged with the worker (`placed::Tagged`, `placed::tag_answer`) so the
+CLI prints the name qualified and sends its Ctrl-C there. Otherwise it is
+the local verb above, maybe after a `note:` line. Only a hub has offered
+workers, so elsewhere this is one check of the machines' state and
+nothing more. → [fleet.md](fleet.md#placement)
+
 Limitations: [status.md](../../status.md#daemon)

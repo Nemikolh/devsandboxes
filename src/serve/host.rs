@@ -40,7 +40,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use super::capacity::{Capacity, EngineCache, HostFacts};
+use super::capacity::HostCapacity;
 use super::events::{EVENTS_RETRY, EventWatcher};
 use super::fleet::lend::Lend;
 use super::snapshots::{self, Join, Snapshots};
@@ -75,6 +75,9 @@ pub struct Observers {
     /// `lend.toml` now (`None`: none), for the capacity report's lending
     /// state and soft caps.
     pub lend: Box<dyn Fn() -> Option<Lend> + Send>,
+    /// This host's capacity: the poll keeps its running count, and asks it
+    /// for the report while a root is watched (the daemon asks it too).
+    pub capacity: Arc<HostCapacity>,
 }
 
 /// What the poll thread sleeps on: stop, containers a client asked a
@@ -270,9 +273,6 @@ fn poll(
     let mut down = false;
     let mut last: Vec<String> = Vec::new();
     let mut urgent: Vec<(String, u64)> = Vec::new();
-    let mut engine = EngineCache::default();
-    // Instances running as of the last listing that loaded with its state.
-    let mut running_count = 0;
     loop {
         // Quiet: the backend captures stderr.
         let listing = rt.list(true, NAME_PREFIX);
@@ -291,7 +291,8 @@ fn poll(
                 // runtime being down.
                 if let Ok(state) = State::load() {
                     live.store(live_instances(&running, &state, expects_host), Ordering::Release);
-                    running_count = running_instances(&running, &state);
+                    // Instances running as of the last listing that loaded with its state.
+                    observers.capacity.set_running(running_instances(&running, &state));
                 }
                 on_running(&running);
                 worker.send(running, std::mem::take(&mut urgent));
@@ -314,9 +315,8 @@ fn poll(
             };
             // The capacity report rides every root's snapshot: only built
             // while someone watches.
-            let info = engine.get(Instant::now(), || rt.engine_info());
             let lend = (observers.lend)();
-            observers.cache.set_capacity(&Capacity::build(info, HostFacts::read(info), running_count, lend.as_ref()));
+            observers.cache.set_capacity(&observers.capacity.report(lend.as_ref()));
             let due = listing.is_ok() && observers.cache.stats_due(&watched, Instant::now());
             let mut view = RuntimeView::from_parts(rt, Some(listing), None);
             if due {

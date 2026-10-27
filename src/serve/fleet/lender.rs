@@ -191,6 +191,12 @@ impl Lender {
         self.slot.lock().unwrap().live.is_some()
     }
 
+    /// Whether the running lending thread is draining (`lend drain`), as
+    /// applied now, not as the file says: a hub's `run` is refused then.
+    pub fn draining(&self) -> bool {
+        self.slot.lock().unwrap().live.as_ref().is_some_and(|l| l.lending.draining())
+    }
+
     /// Stop lending for good (the daemon exiting, after its drain).
     pub fn stop(&self) {
         let live = {

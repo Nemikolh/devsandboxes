@@ -25,8 +25,8 @@ pub enum State {
     /// No link.
     #[default]
     Off,
-    /// Offer to the hub, take no new work (recorded and offered; placement,
-    /// fleet plan step 3, will honor it).
+    /// Offer to the hub, take no new work (recorded and offered; the hub's
+    /// placement reads it from the capacity report).
     Drain,
 }
 

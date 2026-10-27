@@ -60,7 +60,8 @@ pub struct Spec {
 pub struct Candidate {
     pub machine: MachineRef,
     pub reachable: bool,
-    /// This host's is always `On`; a machine without a `lend.toml` is `Off`.
+    /// This host's is always `On`; an ssh machine without a `lend.toml`
+    /// is `Off`.
     pub lending: State,
     /// `None` before a report came: every headroom item counts as neutral.
     pub capacity: Option<Capacity>,
@@ -87,15 +88,21 @@ impl Candidate {
     }
 
     /// A registered machine, from what the daemon keeps of it: its link
-    /// state ([`reachable`]), its capacity report's lending state (none
-    /// is `Off`: a machine that never ran `lend` isn't lending), its
-    /// pushed rows for [`has_image`]. `has_repo` is the caller's.
+    /// state ([`reachable`]), its capacity report's lending state, its
+    /// pushed rows for [`has_image`]. Without a report's lending state an
+    /// ssh machine is `Off` (one that never ran `lend` isn't lending) and
+    /// an offered one `On` (it links only while lending; its `drain` shows
+    /// once a report comes). `has_repo` is the caller's.
     pub fn from_machine(spec: &Spec, m: &Machine) -> Candidate {
         let capacity = m.capacity();
+        let unreported = match m.kind {
+            MachineKind::Ssh => State::Off,
+            MachineKind::Offered => State::On,
+        };
         Candidate {
             machine: MachineRef::Machine(m.name.clone()),
             reachable: reachable(m.kind, m.state),
-            lending: capacity.as_ref().and_then(|c| c.lending).unwrap_or(State::Off),
+            lending: capacity.as_ref().and_then(|c| c.lending).unwrap_or(unreported),
             capacity,
             has_image: has_image(spec, m.rows.values().map(|v| v.as_ref())),
             has_repo: false,
@@ -623,6 +630,10 @@ mod tests {
         let bare = Machine { name: "s".into(), state: LinkState::Idle, ..Machine::default() };
         let c = Candidate::from_machine(&spec(), &bare);
         assert_eq!((c.reachable, c.lending, c.capacity, c.has_image), (true, State::Off, None, false));
+        // An offered one without a report: lending (it linked), neutral.
+        let fresh = Machine { name: "f".into(), kind: MachineKind::Offered, state: LinkState::Connected, ..Machine::default() };
+        let c = Candidate::from_machine(&spec(), &fresh);
+        assert_eq!((c.reachable, c.lending, c.capacity), (true, State::On, None));
         let down = Machine { state: LinkState::Idle, ..w };
         assert!(!Candidate::from_machine(&spec(), &down).reachable);
     }

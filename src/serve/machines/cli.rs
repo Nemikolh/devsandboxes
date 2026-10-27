@@ -188,6 +188,9 @@ pub(crate) fn plan(command: &Command, machine: Option<&str>, in_process: bool, m
     }
     if let Some(m) = machine {
         check_name(m)?;
+        if matches!(command, Command::Run { here: true, .. }) {
+            bail!("--here runs on this host; it doesn't go with --machine {m}");
+        }
         let named = name_of(command).is_some();
         let usage = machine_use(Some(command));
         match &usage {
@@ -914,6 +917,10 @@ mod tests {
         assert!(e.ends_with("qualify the name instead: box/<name>"), "{e}");
         let e = plan_of(&["stop", "web"], Some("box"), m).unwrap_err().to_string();
         assert!(e.ends_with("qualify the name instead: box/<name>"), "{e}");
+        for args in [&["run", "web", "--here"][..], &["run", "--here"]] {
+            let e = plan_of(args, Some("box"), m).unwrap_err().to_string();
+            assert_eq!(e, "--here runs on this host; it doesn't go with --machine box", "{args:?}");
+        }
         for (args, what) in [(&["inbox", "ls"][..], "inbox"), (&["machine", "ls"], "machine"), (&["serve"], "serve"), (&["api", "--stdio"], "api"),
             (&["tunnel", "--service", "db", "--port", "5432"], "tunnel")]
         {

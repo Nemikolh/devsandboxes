@@ -32,14 +32,21 @@ feature build contexts carry the root's `services::project_id`
 `services::service_image_tag`, `features::build_context_name`;
 [images](../../architecture/instances/images-and-features.md)); 3b
 (`place`) shipped: `serve::fleet::place` (`place`, `score`, `Candidate::local`
-/ `from_machine`, `has_image`), pure, not yet called
+/ `from_machine`, `has_image`), pure
 ([fleet](../../architecture/daemon/fleet.md#placement)); 3c1 (moving
 code) shipped: `serve::fleet::code` (`offer`, `send`, `prepare`,
 `Transfer`, `LinkTransfer`, the worker's `root-tar` / `bundle`
 receivers), the root as an in-process ustar, the hub's repo cache
 (`repos/<url hash>.git`), `Header::to`, `transfer::receive_then`,
-`host_git_bare` / `host_git_new`; not yet called
-([fleet](../../architecture/daemon/fleet.md#moving-code))
+`host_git_bare` / `host_git_new`
+([fleet](../../architecture/daemon/fleet.md#moving-code)); 3c2 (placed
+`run`) shipped: the daemon's `run` verb places (`daemon.rs`
+`placed_run`, `serve::fleet::placed`), moves the code and forwards the
+run to the worker; `run --here`; `capacity.get` (on demand, lent) asked
+of each worker before placing; a draining worker refuses a hub's `run`;
+a new branch starts at the bundled tip (`--base`)
+([fleet](../../architecture/daemon/fleet.md#in-the-run-verb)). Steps
+1-3 are done
 ([fleet](../../architecture/daemon/fleet.md), ADRs
 [0041](../../decisions/0041-fleet-workers-dial-their-hub.md),
 [0042](../../decisions/0042-fleet-workers-follow-their-hubs-version.md)); the rest

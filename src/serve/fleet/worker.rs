@@ -265,6 +265,12 @@ impl Lending {
         self.ctl.draining.store(draining, Ordering::SeqCst);
     }
 
+    /// Whether it's draining now (its last [`set_draining`](Self::set_draining),
+    /// or how it started).
+    pub fn draining(&self) -> bool {
+        self.ctl.draining.load(Ordering::SeqCst)
+    }
+
     /// A new `TRANSFER` stream to the hub (for `transfer::send`); an error
     /// while no link is up.
     #[allow(dead_code)] // first caller: fetch-back (fleet step 5)
@@ -1003,6 +1009,181 @@ mod tests {
             assert_eq!(hub_daemon.join().unwrap().unwrap(), Exit::Shutdown);
             let _ = std::fs::remove_dir_all(&base);
             let _ = std::fs::remove_dir_all(&verb_dir);
+        }
+
+        /// A verb request on `dir`'s daemon: its answer, its stdout and
+        /// stderr as streamed.
+        fn verb(dir: &Path, method: &str, params: Value) -> (Value, String, String) {
+            let stream = stream_at(dir);
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            writeln!(&stream, "{}", json!({"id": 1, "method": method, "params": params})).unwrap();
+            let (mut out, mut err) = (String::new(), String::new());
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).unwrap() > 0, "closed before the answer");
+                let msg: Value = serde_json::from_str(&line).unwrap();
+                if msg.get("id").is_some() {
+                    return (msg, out, err);
+                }
+                if msg["method"] == "output" {
+                    let data = msg["params"]["data"].as_str().unwrap();
+                    if msg["params"]["stream"] == "stdout" { out.push_str(data) } else { err.push_str(data) }
+                }
+            }
+        }
+
+        /// A hub with an offered worker `lap` (in-process, as above) and a
+        /// config root whose sandbox's folder is a checkout of a local
+        /// origin: a `run` that pins nothing is placed on `lap` (its fresh
+        /// `capacity.get` beats this host's neutral report), the root's tar
+        /// and the branch's bundle land in the worker's fleet root, and the
+        /// request is forwarded there in that copy; `here`, and a sandbox
+        /// that can't move, run here; a draining `lap` gets no `run`.
+        #[test]
+        fn a_run_is_placed_on_a_worker_with_its_code() {
+            use crate::serve::capacity::Capacity;
+            use crate::serve::fleet::code::repo::tests::{git, origin_and_checkout};
+
+            let base = scratch("fleet-place");
+            let (worker_dir, hub_dir) = (base.join("w"), base.join("hub"));
+            let src = base.join("src");
+            std::fs::create_dir_all(&src).unwrap();
+            origin_and_checkout(&src, "web");
+            std::fs::create_dir_all(src.join("plain")).unwrap();
+            git(&src.join("plain"), &["init", "-q"]);
+            let cfg = src.join("cfg");
+            std::fs::create_dir_all(cfg.join("dockerfiles")).unwrap();
+            std::fs::write(
+                cfg.join(crate::config::CONFIG_FILE),
+                "[sandbox.web]\nfolder = \"../web\"\nimage = \"img\"\n\n[sandbox.plain]\nfolder = \"../plain\"\nimage = \"img\"\n",
+            )
+            .unwrap();
+            std::fs::write(cfg.join("dockerfiles/web.Dockerfile"), "FROM x\n").unwrap();
+            let cfg = std::fs::canonicalize(&cfg).unwrap();
+
+            let data = base.join("worker-data");
+            let fleet_root = lend::fleet_root(&data, "me@hub").unwrap();
+            std::fs::create_dir_all(&fleet_root).unwrap();
+            let fleet_root = std::fs::canonicalize(&fleet_root).unwrap();
+            let lend_path = data.join("lend.toml");
+            lend::write_for_test(&lend_path, &Lend { state: lend::State::On, hub: "me@hub".into(), name: "lap".into(), ..Default::default() });
+            let path = std::env::var("PATH").unwrap_or_default();
+            // `$3` is the `-C` root: show what's there, as the verb would see it.
+            let (w_runner, w_verbs) = crate::serve::verbs::tests::script_runner(
+                "fleet-place-w",
+                r#"echo "worker $*"; cat "$3/dockerfiles/web.Dockerfile" "$3/../web/F""#,
+            );
+            let mut worker = opts(1, 300);
+            worker.verbs = Some(w_runner);
+            worker.state = Some(data.join("state.toml"));
+            worker.home = Some(base.join("worker-home"));
+            worker.machines = Some(base.join("worker-machines.toml"));
+            worker.lend = Some(lend_path.clone());
+            worker.lend_transport = Some(in_process_hub(hub_dir.clone(), fleet_root.clone()));
+            worker.lend_env = Some(BTreeMap::from([("PATH".into(), path.clone())]));
+            // Its `capacity.get`: plenty of room (the hub's own is the test
+            // default, an empty report: neutral).
+            const G: u64 = 1 << 30;
+            let roomy = Capacity {
+                cpus: Some(8),
+                mem_total: Some(32 * G),
+                mem_available: Some(28 * G),
+                disk_free: Some(400 * G),
+                disk_total: Some(500 * G),
+                ..Capacity::default()
+            };
+            worker.local_capacity = Some(Arc::new(move || roomy.clone()));
+
+            let (h_runner, h_verbs) = crate::serve::verbs::tests::script_runner("fleet-place-h", r#"echo "local $*""#);
+            let registry = base.join("machines.toml");
+            let mut hub = opts(1, 300);
+            hub.hub = true;
+            hub.verbs = Some(h_runner);
+            hub.remotes = Some(base.join("hub-data/remotes.json"));
+            hub.machines = Some(registry.clone());
+            hub.state = Some(base.join("hub-data/state.toml"));
+            hub.repos = Some(base.join("hub-data/repos"));
+            let hub_daemon = spawn_daemon(&hub_dir, hub);
+            drop(conn_at(&hub_dir));
+            let worker_daemon = spawn_daemon(&worker_dir, worker);
+            wait_for(|| endpoint::fleet_transfer_socket(&hub_dir, "lap").exists(), "the worker's link");
+            let mut c = conn_at(&hub_dir);
+            wait_for(
+                || {
+                    let rows = c.call("machines.list", Value::Null).unwrap().result.unwrap();
+                    rows.as_array().unwrap().iter().any(|r| r["name"] == "lap" && r["state"] == "connected")
+                },
+                "the hub's link to lap",
+            );
+            // Nothing watched: the hub has no report of lap's, and its own
+            // is neutral; only lap's fresh `capacity.get` tips it.
+            let rows = c.call("machines.list", Value::Null).unwrap().result.unwrap();
+            assert!(rows[0]["capacity"].is_null(), "{rows}");
+            // Through the Worker table, as the hub asks it.
+            let dial = crate::serve::fleet::offer::dial(hub_dir.clone(), Arc::new(|_: &Entry| unreachable!()));
+            let mut link = mlink::handshake("lap", dial(&Entry::offered("lap")).unwrap(), Duration::from_secs(5)).unwrap();
+            let r = link.conn.call("capacity.get", json!({})).unwrap().result.unwrap();
+            assert_eq!((&r["cpus"], &r["lending"]), (&json!(8), &json!("on")), "{r}");
+            crate::serve::dts::assert_matches("Capacity", &r);
+            assert!(crate::serve::dts::prop_type("ApiMethods", "capacity.get").is_some_and(|t| t.contains("result: Capacity")));
+            drop((link, c));
+            let params = |sandbox: &str, extra: Value| {
+                let mut p = json!({"root": cfg, "env": {"PATH": path}, "sandbox": sandbox});
+                p.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+                p
+            };
+
+            // Placed: the code there first, then the run in its copy.
+            let (answer, out, err) = verb(&hub_dir, "run", params("web", json!({"branch": "feature"})));
+            assert!(answer["error"].is_null(), "{answer}");
+            assert_eq!(answer["result"]["machine"], "lap", "{answer}");
+            assert!(err.starts_with("placed on lap ("), "{err}");
+            let roots: Vec<_> = std::fs::read_dir(fleet_root.join("roots")).unwrap().flatten().map(|e| e.file_name()).filter(|n| n != ".in").collect();
+            assert_eq!(roots.len(), 1, "{roots:?}");
+            let remote = fleet_root.join("roots").join(&roots[0]).join("cfg");
+            assert_eq!(out, format!("worker --in-process -C {} run --branch=feature -- web\nFROM x\nfeature\n", remote.display()));
+            assert_eq!(git(&remote.join("../web"), &["symbolic-ref", "--short", "HEAD"]), "feature");
+
+            // A branch origin lacks: the worker starts it at the bundled tip.
+            let (answer, out, _) = verb(&hub_dir, "run", params("web", json!({"branch": "new-one"})));
+            assert!(answer["error"].is_null(), "{answer}");
+            assert!(out.starts_with(&format!("worker --in-process -C {} run --branch=new-one --base=main -- web\n", remote.display())), "{out}");
+
+            // `here`: this host, nothing placed.
+            let (answer, out, err) = verb(&hub_dir, "run", params("web", json!({"here": true})));
+            assert!(answer["error"].is_null() && answer["result"].get("machine").is_none(), "{answer}");
+            assert_eq!(out, format!("local --in-process -C {} run -- web\n", cfg.display()));
+            assert_eq!(err, "");
+
+            // A folder without `origin` can't move: here, with the note.
+            let (answer, out, err) = verb(&hub_dir, "run", params("plain", json!({})));
+            assert!(answer["error"].is_null(), "{answer}");
+            assert_eq!(out, format!("local --in-process -C {} run -- plain\n", cfg.display()));
+            assert!(err.starts_with("note: not placed on lap: ") && err.ends_with("; running here\n"), "{err}");
+            assert!(err.contains("has no `origin`"), "{err}");
+
+            // `drain` on the worker: its fresh report says so, so the hub
+            // runs here; pinned there, `run` is refused, other verbs aren't.
+            let mut local = conn_at(&worker_dir);
+            assert!(local.call("lend.set", json!({"state": "drain"})).unwrap().error.is_none());
+            drop(local);
+            let (answer, out, err) = verb(&hub_dir, "run", params("web", json!({})));
+            assert!(answer["error"].is_null() && answer["result"].get("machine").is_none(), "{answer}");
+            assert_eq!(out, format!("local --in-process -C {} run -- web\n", cfg.display()));
+            assert_eq!(err, "");
+            let (answer, ..) = verb(&hub_dir, "run", params("web", json!({"root": remote, "machine": "lap"})));
+            assert_eq!(answer["error"]["code"], "denied", "{answer}");
+            assert_eq!(answer["error"]["message"], crate::serve::fleet::lent::DRAINING);
+            let (answer, ..) = verb(&hub_dir, "stop", json!({"root": remote, "env": {}, "instance": "nope", "machine": "lap"}));
+            assert!(answer["error"].is_null(), "stop isn't refused (the verb ran there): {answer}");
+
+            assert!(conn_at(&worker_dir).call("shutdown", json!({})).unwrap().error.is_none());
+            assert_eq!(worker_daemon.join().unwrap().unwrap(), Exit::Shutdown);
+            assert!(conn_at(&hub_dir).call("shutdown", json!({})).unwrap().error.is_none());
+            assert_eq!(hub_daemon.join().unwrap().unwrap(), Exit::Shutdown);
+            let _ = std::fs::remove_dir_all(&base);
+            let _ = std::fs::remove_dir_all(&w_verbs);
+            let _ = std::fs::remove_dir_all(&h_verbs);
         }
     }
 

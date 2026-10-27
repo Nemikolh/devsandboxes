@@ -7,7 +7,7 @@
 //!
 //! - [`decide`] (pure, over the method and params): hello, `subscribe` /
 //!   `unsubscribe` to `instances` only, `instances.watch` / `unwatch`, the
-//!   quick calls (`machines::forward::QUICK`) and the verbs; never a
+//!   quick calls (`machines::forward::QUICK`), `capacity.get` and the verbs; never a
 //!   `machine` param or a federated (`machines: true`) request, never a
 //!   verb's `all`; everything else (`machines.*`, `fleet.*`, `lend.*`, `shutdown`,
 //!   `helper.call`, `forwards.*`, the Inbox, `roots.list`, …) is `denied`.
@@ -15,6 +15,8 @@
 //!   and under the fleet root (rewritten to its canonical form), every
 //!   instance or container named an instance whose `config_dir` is under
 //!   the fleet root, and a verb's `env` replaced by this host's.
+//! - [`refuse_new_work`]: while lending `drain`, a `run` is `denied`
+//!   ([`DRAINING`]); verbs on instances already here go on.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
@@ -46,7 +48,22 @@ pub enum Gate {
     Watch,
     Unwatch,
     Quick,
+    /// `capacity.get`: this host's report, for the hub's placement.
+    Capacity,
     Verb,
+}
+
+/// The refusal of a hub's `run` while this host drains.
+pub const DRAINING: &str = "this worker is draining: no new work";
+
+/// `drain` is the one hard no for new work (pure): a `run` while
+/// `draining` is `denied` with [`DRAINING`]; everything else (`start`,
+/// `stop`, `rm`, `rebuild` of what's placed here) is left to [`admit`].
+pub fn refuse_new_work(method: &str, draining: bool) -> Result<(), ApiError> {
+    if draining && method == "run" {
+        return Err(ApiError::denied(DRAINING));
+    }
+    Ok(())
 }
 
 /// Whether a hub may send `method` with `params` at all (pure).
@@ -69,6 +86,7 @@ pub fn decide(method: &str, params: &Value) -> Result<Gate, ApiError> {
         "instances.watch" => Gate::Watch,
         "instances.unwatch" => Gate::Unwatch,
         m if fwd::is_quick(m) => Gate::Quick,
+        "capacity.get" => Gate::Capacity,
         m if verbs::is_verb(m) => {
             // `--all` is every instance in `state.toml`, not the root's.
             if params.get("all").and_then(Value::as_bool) == Some(true) {
@@ -320,6 +338,8 @@ mod tests {
             ("containers.logs", json!({"container": "c"}), Ok(Quick)),
             ("sandboxes.list", json!({"root": "/x"}), Ok(Quick)),
             ("config.migrate", json!({"root": "/x"}), Ok(Quick)),
+            ("capacity.get", p.clone(), Ok(Capacity)),
+            ("capacity.get", json!({"machine": "m"}), Err("denied")),
             ("run", json!({"root": "/x"}), Ok(Verb)),
             ("rm", json!({"root": "/x"}), Ok(Verb)),
             ("services.rebuild", json!({"root": "/x"}), Ok(Verb)),
@@ -349,6 +369,16 @@ mod tests {
         for m in fwd::QUICK {
             assert_eq!(decide(m, &p).unwrap(), Quick, "{m}");
         }
+    }
+
+    #[test]
+    fn draining_refuses_new_work_only() {
+        let e = refuse_new_work("run", true).unwrap_err();
+        assert_eq!((e.code, e.message.as_str()), ("denied", DRAINING));
+        for m in ["start", "stop", "rm", "rebuild", "services.rebuild", "capacity.get", "instances.list"] {
+            assert!(refuse_new_work(m, true).is_ok(), "{m}");
+        }
+        assert!(refuse_new_work("run", false).is_ok());
     }
 
     #[test]

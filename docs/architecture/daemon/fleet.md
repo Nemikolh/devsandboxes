@@ -10,10 +10,11 @@ worker policy and `lend.*` with its CLI, `devsandbox lend` and
 `devsandbox fleet join|leave`
 ([ADR 0041](../../decisions/0041-fleet-workers-dial-their-hub.md)); and
 every daemon's [capacity report](#capacity), carried by its snapshots,
-and the pure [placement](#placement) that scores it;
+and [placement](#placement), which scores it and which the hub's `run`
+verb follows;
 and the link's [`TRANSFER`](#transfer) streams, both ways, with
 [moving code](#moving-code) on them (a config root and its repos onto a
-worker; nothing calls the hub's side yet); and
+worker, for a placed `run`); and
 [versions](#versions): a worker follows its hub's build, a published one
 downloaded, a dev one received over `TRANSFER`
 ([ADR 0042](../../decisions/0042-fleet-workers-follow-their-hubs-version.md)).
@@ -58,7 +59,17 @@ Code: `src/serve/fleet/mod.rs` (`LINK`), `src/serve/fleet/link.rs`
 `SnapshotMachine::capacity`), `src/serve/fleet/lend.rs` (`SoftCaps`);
 placement: `src/serve/fleet/place.rs` (`place`, `score`, `Spec`,
 `Candidate`, `MachineRef`, `Placement`, `NoPlace`, `has_image`,
-`reachable`);
+`reachable`), `src/serve/fleet/placed.rs` (`worth_placing`, `workers`,
+`reachable_workers`, `CAPACITY_WAIT`, `with_fresh`, `spec`,
+`candidates`, `Ask`, `decide`, `Placed`, `start_point`, `lines`,
+`forwarded`, `after_forward`, `Forwarded`, `tag_answer`, `Tagged`),
+`src/serve/daemon.rs` (`placed_run`, `fresh_capacities`,
+`remote_verb`, `Shared::capacity`, `Options::local_capacity`,
+`Options::repos`), `src/serve/capacity.rs` (`HostCapacity`,
+`Capacity::with_lend`), `src/serve/fleet/lent.rs` (`refuse_new_work`,
+`DRAINING`), `src/serve/fleet/lender.rs` (`Lender::draining`),
+`src/serve/verbs.rs` (`RunParams::here`), `src/serve/verbs_client.rs`
+(`run_target`, `Streaming`), `src/serve/machines/cli.rs` (`plan`);
 versions: `src/serve/fleet/update.rs` (`HELLO`, `PLATFORM`,
 `platform_of`, `Build`, `decide`, `Decision`, `hub_pushes`, `push`,
 `install_received`, `release_target`, `asset_url`, `curl_argv`, `update`,
@@ -211,8 +222,8 @@ one `TRANSFER` through the worker's link (a connection to
 root, config root, sandbox, branch)` is `offer` then `send`, answering
 `Prepared` (the config root on the worker, `remote_root`, and each moved
 folder with its branch) or `Unprepared`: `NotMovable(why)` (it runs
-where it is, the why for the user) or `Failed`. Nothing calls it yet
-(the placed `run`, fleet step 3c2).
+where it is, the why for the user) or `Failed`. The placed `run` calls
+it ([In the `run` verb](#in-the-run-verb)).
 
 **Offer** (`offer`, on the hub). The sandbox resolves from the config
 root (canonical) as `run` resolves it. Its `folder` and every `folders`
@@ -314,7 +325,8 @@ link's `API` streams.
   machine has. A new or changed entry reloads the machine links
   (`service::Handle::reload`), which start (or restart) its link thread;
   the offer is logged with the worker's version, root and whether it's
-  draining (nothing on the hub acts on that yet).
+  draining (only logged: placement reads `drain` from the worker's
+  capacity report).
 - **An offered entry** is `[machine.<name>]` with `offered = true`, no
   `target`, and `roots` the worker's fleet root in `machines.toml`
   (`machines::Kind::Offered`,
@@ -405,10 +417,17 @@ Every daemon reports its host's capacity in its snapshots (fleet plan
 decision 8; wire: [Capacity](../../reference/api.md#capacity)), what
 [placement](#placement) scores against. The host poll
 (`host.rs` `poll`) builds one `capacity::Capacity` per tick while a root
-is watched (`Capacity::build`, pure) and hands it to the snapshot cache
-(`Snapshots::set_capacity`), which puts it top-level in every root's
-`instances.snapshot` params it collects next. Nothing is built while
-nothing is watched; a new watch's first, disk-depth push has none.
+is watched (`HostCapacity::report`, over `Capacity::build`, pure) and
+hands it to the snapshot cache (`Snapshots::set_capacity`), which puts
+it top-level in every root's `instances.snapshot` params it collects
+next; a new watch's first, disk-depth push has none. On demand,
+`capacity.get` answers the same report watched or not
+([api](../../reference/api.md#capacityget)): `capacity::HostCapacity`
+holds the one `EngineCache` and the running count the poll sets from
+every listing (watched or not), and the daemon adds `lend.toml`'s state
+and caps (`Shared::capacity`, `Capacity::with_lend`); tests replace the
+rest with `Options::local_capacity`. It is lent on the Worker table, so
+a hub asks its workers before it places.
 
 - **`cpus`, `mem_total`**: the runtime's `info`
   (`Backend::engine_info`: `docker info`'s `NCPU` / `MemTotal`,
@@ -428,13 +447,13 @@ nothing is watched; a new watch's first, disk-depth push has none.
   the runtime's data root, `DockerRootDir` / podman's `store.graphRoot`,
   when it exists here); otherwise they are unknown.
 - **`running`**: the instances in `state.toml` whose container the
-  poll's listing has running (`host.rs` `running_instances`; services
+  poll's last listing has running (`host.rs` `running_instances`; services
   and strays don't count), every instance on the host, the fleet root's
   or not.
 - **`lending` and `caps`**: `lend.toml`'s `state` (none without a
   `lend.toml`) and its `[caps]` in bytes (`Caps::of`; none when no cap is
-  set), read through the daemon's `Lender::file` on each tick, so a hand
-  edit shows on the next poll.
+  set), read through the daemon's `Lender::file` each time, so a hand
+  edit shows on the next report.
 
 **Soft caps never refuse.** `capacity::over_caps` (pure) lists what
 exceeds one: memory in use (`mem_total - mem_available`) over `mem`,
@@ -493,8 +512,10 @@ and `has_repo`. It answers a `Placement` (the machine, `warnings`, the
 Candidates come from what the daemon already keeps:
 `Candidate::local` (this host: always reachable and lending `on`) and
 `Candidate::from_machine` over a `snapshots::Machine` (its
-`Machine::capacity`; `lending` from that report, `off` without one, so a
-machine that never ran `devsandbox lend` takes only pinned work;
+`Machine::capacity`; `lending` from that report; without one an ssh
+machine is `off`, so one that never ran `devsandbox lend` takes only
+pinned work, and an offered one `on`, since it links only while lending
+(a draining one refuses the `run` itself, below);
 `place::reachable`: an ssh machine unless its link state is
 `unreachable`, an offered one only while `connected`).
 `place::has_image` reads roots' `instances.snapshot` params: a sandbox
@@ -502,6 +523,76 @@ row of the spec's name at its `config_hash` (and `build_hash`, when the
 spec has one) with a ready, non-drifted instance of that sandbox from
 the same root, since image tags are per config root. No snapshot says
 which repos a host has, so `has_repo` is the caller's to fill.
+
+### In the `run` verb
+
+The daemon's `run` verb places a request that names no `machine` and
+isn't `here` (`daemon.rs` `placed_run`, the decisions pure in
+`fleet::placed`). Placement runs on a hub in practice: the candidates are
+this host and its offered workers (`placed::workers`; code moves only
+over a worker's link, so an ssh machine is never placed on, only pinned
+with `--machine` or a qualified name, which are forwarded as before), and
+only a hub has offered workers.
+
+- **Worth it?** `placed::worth_placing`: some worker reachable (an
+  offered link `connected`). If none, the run is local with nothing else
+  read or asked.
+- **Fresh reports** (`daemon.rs` `fresh_capacities`): each reachable
+  worker is asked `capacity.get`, in parallel, each on a fresh `API`
+  stream over its offered dial (`machines::link::handshake`, then the
+  call), each bounded by `placed::CAPACITY_WAIT` (2 s) for the dial and
+  hello and again for the answer. An answer replaces the worker's saved
+  report and lending state (`placed::with_fresh`, pure); a timeout or an
+  error leaves the saved one (its last push, or `remotes.json`'s).
+- **Candidates** (`placed::candidates`): `Candidate::local` with this
+  host's capacity built now (`Shared::capacity`, as `capacity.get`
+  answers it) and every watched root's snapshot, and `from_machine` for
+  each worker with its fresh report. The `Spec` (`placed::spec`) takes the sandbox's
+  `config_hash` / `build_hash` from the request root's snapshot when it
+  is watched, and the requester is this host.
+- **Decide** (`placed::decide`): this host wins (the `REQUESTER` bias
+  breaks a tie) → the local verb, unchanged. A worker wins →
+  `code::prepare` for it: the worker's fleet root is its registry entry's
+  one root, the transfer its link's `LinkTransfer`, the repo cache
+  `Options::repos` (default `code::repos_dir`), the config root the
+  request's, the branch its `branch`. `NotMovable(why)` runs it here with
+  `note: not placed on <worker>: <why>; running here` first in the
+  output; `Failed` is the verb's `failed` error (`cannot place on
+  <worker>: …`), nothing runs elsewhere.
+- **Forward**: the request as a `machine` one (`placed::forwarded`:
+  `machine` the worker, `root` its `Prepared::remote_root`, `here` so the
+  worker never places again), through `remote_verb` as any machine verb
+  ([machines](machines.md#forwarded-requests)). Its output starts with
+  `placed on <worker> (<reasons>)` and a `warning: <worker>: over cap: …`
+  line per warning (`placed::lines`); its `progress`, result and detached
+  answer carry `machine` (`placed::Tagged`, `placed::tag_answer`), so the
+  CLI prints `<worker>/<instance>`, cancels there on Ctrl-C, and the
+  dashboard's status line names it so.
+- **`drain` is a hard no at the worker**: on a Worker connection a `run`
+  is refused `denied` with `lent::DRAINING` (`this worker is draining: no
+  new work`) while the lending thread drains (`Lender::draining`, the
+  live state, not the file; `lent::refuse_new_work`); `start`, `stop`,
+  `rm` and `rebuild` of what's placed there go on. A fresh report already
+  keeps a draining worker out of the candidates; if the hub picked it
+  anyway (no report in time, a drain since), the code has moved but the
+  refusal runs the run here, `note: not placed on <worker>: draining;
+  running here` first (`placed::after_forward` → `Forwarded::Here`).
+- **A new branch** (`placed::start_point`): a `--branch` origin doesn't
+  have was bundled as the hub checkout's own branch (`code::offer`), and
+  the moved checkout has no `origin` for `run` to start a branch from
+  (`worktree_start_point` falls back to `HEAD`, whichever branch first
+  landed there). So without the user's `--base` the worker gets
+  `--base <the bundled branch>`: the new branch starts at the hub
+  checkout's branch tip, where on the hub it would start at
+  `origin/HEAD`.
+
+The moving runs on the request's connection thread before the forward
+(a fetch of each origin, the transfers), so a hang-up meanwhile is only
+seen once the forward starts. `run --here` (`RunParams::here`) skips all
+of it; the CLI then resolves the sandbox among this host's only
+(`verbs_client::run_target`) and refuses a qualified one, and `--here`
+with `--machine` is refused (`machines::cli::plan`). The dashboard's `run`
+is the same verb request, so it is placed too.
 
 ## Worker side
 
@@ -690,7 +781,9 @@ at once, without watching the file. Never on a `Worker` connection
   so `on` ↔ `drain` never drops what's placed here. It answers the
   `LendInfo` after the change. A daemon that's exiting answers `failed`.
 - **`drain`** is recorded, shown by `lend.get`, offered (`--drain`) and
-  reported as the [capacity](#capacity)'s `lending`; nothing places work yet (fleet plan step 3), so it changes nothing else.
+  reported as the [capacity](#capacity)'s `lending`, which the hub's
+  [placement](#in-the-run-verb) reads, and a hub's `run` is refused
+  while the lending thread drains (`lent::refuse_new_work`).
 
 The CLI (`commands::lend`) is a client of these two, through the daemon
 (started like any client does), never in-process; `--machine` refuses
@@ -714,13 +807,15 @@ both commands (`serve::machines::cli::machine_use`):
 Every connection has a table (`daemon::Table`): `Full` for local clients,
 `Worker(Scope)` for the hub's streams. A `Scope` (`fleet::lent::Scope`) is
 the hub, the canonical fleet root and the env its verbs get. On a `Worker`
-connection each request goes through `lent::admit` at the top of
-`handle`, before any dispatch:
+connection each request goes through `lent::refuse_new_work` (a `run`
+while the lending thread drains is `denied`, `lent::DRAINING`) and
+`lent::admit` at the top of `handle`, before any dispatch:
 
 - **`decide`** (pure, over method and params) lets through `hello`,
   `subscribe` / `unsubscribe` with only the `instances` topic,
   `instances.watch` / `unwatch`, the quick calls
-  (`machines::forward::QUICK`) and the verbs (`verbs::is_verb`). It refuses
+  (`machines::forward::QUICK`), `capacity.get` and the verbs
+  (`verbs::is_verb`). It refuses
   (`denied`) any request with a `machine` param or `machines: true`
   (nothing federates past the worker), a verb with `all` (`--all` is every
   instance in `state.toml`, not the root's), and every other method:

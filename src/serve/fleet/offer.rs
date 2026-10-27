@@ -53,7 +53,7 @@ struct OfferParams {
     /// root, which this hub's link watches.
     root: PathBuf,
     /// The worker's `lend` was `drain` when it linked: it takes no new work
-    /// (logged; placement, fleet plan step 3, will honor it).
+    /// (logged only: placement reads `drain` from the capacity report).
     #[serde(default)]
     draining: bool,
 }

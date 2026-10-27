@@ -85,6 +85,11 @@ pub struct RunParams {
     /// TTY progress, as on the caller's terminal. Absent: pipes.
     #[serde(default)]
     pub tty: Option<TtySize>,
+    /// Run on this host, never placed on a fleet worker (`run --here`;
+    /// docs/architecture/daemon/fleet.md, *Placement*). Only the daemon
+    /// reads it: the subprocess runs here either way.
+    #[serde(default)]
+    pub here: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -400,7 +405,7 @@ fn detach_at(req: &VerbRequest) -> DetachAt {
 
 // ---- wire values ----------------------------------------------------------
 
-fn output_params(request: Option<u64>, stream: &str, data: &str) -> Value {
+pub(crate) fn output_params(request: Option<u64>, stream: &str, data: &str) -> Value {
     json!({ "request": request, "stream": stream, "data": data })
 }
 
@@ -1095,11 +1100,12 @@ pub(crate) mod tests {
             reprobe: true,
         };
         match parse(run) {
-            Command::Run { sandbox, name, branch, base, env, dispatcher, json, reprobe, detach } => {
+            Command::Run { sandbox, name, branch, base, env, dispatcher, json, reprobe, detach, here } => {
                 assert_eq!(sandbox.as_deref(), Some("-web"));
                 assert_eq!((name.as_deref(), branch.as_deref(), base.as_deref()), (Some("w2"), Some("-b"), Some("origin/main")));
                 // The daemon detaches by itself: the subprocess never gets `-d`.
-                assert!(json && reprobe && env.is_empty() && dispatcher.is_none() && !detach);
+                // Nor `--here`: placement is the daemon's, the subprocess runs here.
+                assert!(json && reprobe && env.is_empty() && dispatcher.is_none() && !detach && !here);
             }
             _ => panic!("not run"),
         }
@@ -1609,6 +1615,7 @@ pub(crate) mod tests {
             reprobe: true,
             detach: true,
             tty: Some(TtySize { cols: 100, rows: 30 }),
+            here: true,
         };
         let rebuild = RebuildParams {
             root: root.clone(),

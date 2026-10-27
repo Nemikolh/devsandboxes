@@ -101,6 +101,10 @@ enum Command {
         reprobe: bool,
         #[arg(short, long, help = DETACH_HELP)]
         detach: bool,
+        /// Run on this host: never placed on a fleet worker (not with
+        /// `--machine` or a `<machine>/<sandbox>`)
+        #[arg(long)]
+        here: bool,
     },
     /// Recreate an instance's container from the current config (keeps the
     /// worktree, branch, and per-instance state); no-op when there is no drift
@@ -697,7 +701,8 @@ fn main() -> Result<()> {
     match command {
         Command::Ls { json } => commands::ls::ls(&cli.dir, json),
         Command::Ps { all, json } => commands::ps::ps(all, json),
-        Command::Run { sandbox, name, branch, base, env, dispatcher, json, reprobe, detach } => {
+        // `--here` only matters to the daemon's placement: in-process is here.
+        Command::Run { sandbox, name, branch, base, env, dispatcher, json, reprobe, detach, here: _ } => {
             if detach {
                 return Err(detach_refused());
             }

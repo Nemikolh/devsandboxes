@@ -156,7 +156,18 @@ pub struct Options {
     pub lend_update: Option<Arc<dyn fleet::update::Steps>>,
     /// The env a hub's verbs run with; `None` is this process's.
     pub lend_env: Option<BTreeMap<String, String>>,
+    /// This host's capacity before its lend state and caps (which come
+    /// from `lend.toml` either way), as `capacity.get` and a placed `run`
+    /// read it; `None` is `capacity::HostCapacity` (the runtime's cached
+    /// `info`, `HostFacts`, the poll's running count). Tests inject one.
+    pub local_capacity: Option<LocalCapacity>,
+    /// The hub's repo caches a placed `run` fetches into; `None` is
+    /// `fleet::code::repos_dir`. Tests point it at a scratch dir.
+    pub repos: Option<PathBuf>,
 }
+
+/// [`Options::local_capacity`].
+pub type LocalCapacity = Arc<dyn Fn() -> super::capacity::Capacity + Send + Sync>;
 
 impl Options {
     pub fn new(keep_alive: bool) -> Self {
@@ -181,6 +192,8 @@ impl Options {
             lend_transport: None,
             lend_update: None,
             lend_env: None,
+            local_capacity: None,
+            repos: None,
         }
     }
 }
@@ -259,6 +272,9 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
     let join = opts.join.clone().unwrap_or_else(|| default_join(state.clone()));
     let mut shared = Shared::new(opts.version.clone(), inbox, state, join);
     shared.home = opts.home.clone().or_else(|| std::env::var_os("HOME").map(PathBuf::from));
+    shared.socket_dir = dir.to_path_buf();
+    shared.local_capacity = opts.local_capacity.clone();
+    shared.repos = opts.repos.clone();
     let registry_path = match &opts.machines {
         Some(path) => path.clone(),
         None => machines::path()?,
@@ -334,6 +350,7 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
                 on_snapshot: Box::new(move |dir, params| publishing.publish_snapshot(dir, params)),
                 // The lender exists once lending started, just after the host.
                 lend: Box::new(move || lending.lender.get().and_then(|l| l.file())),
+                capacity: Arc::clone(&shared.host_capacity),
             }
         };
         Host::start(
@@ -550,6 +567,15 @@ struct Shared {
     /// `lend.toml` and the lending thread, for `lend.*`; unset without a
     /// data dir and in tests that build a bare `Shared`.
     lender: OnceLock<fleet::lender::Lender>,
+    /// The socket dir: a worker's `fleet-<name>.transfer.sock` is here.
+    socket_dir: PathBuf,
+    /// [`Options::local_capacity`].
+    local_capacity: Option<LocalCapacity>,
+    /// This host's capacity on demand; the host poll keeps its running
+    /// count.
+    host_capacity: Arc<super::capacity::HostCapacity>,
+    /// [`Options::repos`].
+    repos: Option<PathBuf>,
 }
 
 impl Shared {
@@ -578,7 +604,25 @@ impl Shared {
             machines: None,
             locals: Mutex::default(),
             lender: OnceLock::new(),
+            socket_dir: PathBuf::new(),
+            local_capacity: None,
+            host_capacity: Arc::new(super::capacity::HostCapacity::new(Arc::new(|| crate::runtime::backend().engine_info()))),
+            repos: None,
         }
+    }
+
+    /// This host's capacity now (`capacity.get`, a placed `run`'s own
+    /// candidate): [`Options::local_capacity`] or the [`HostCapacity`]
+    /// report, with `lend.toml`'s state and caps.
+    ///
+    /// [`HostCapacity`]: super::capacity::HostCapacity
+    fn capacity(&self) -> super::capacity::Capacity {
+        let lend = self.lender.get().and_then(|l| l.file());
+        let base = match &self.local_capacity {
+            Some(f) => f(),
+            None => self.host_capacity.report(None),
+        };
+        base.with_lend(lend.as_ref())
     }
 
     fn links(&self) -> Option<&service::Handle> {
@@ -1129,7 +1173,11 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
     // A fleet hub: the lent API only, its params confined, before anything
     // else looks at the request.
     if let Table::Worker(scope) = &conn.table {
-        match lent::admit(&req.method, std::mem::take(&mut req.params), scope, &shared.state) {
+        // `drain` is the one hard no: read live from the lending thread.
+        let draining = shared.lender.get().is_some_and(|l| l.draining());
+        let admitted = lent::refuse_new_work(&req.method, draining)
+            .and_then(|()| lent::admit(&req.method, std::mem::take(&mut req.params), scope, &shared.state));
+        match admitted {
             Ok(params) => req.params = params,
             Err(e) => {
                 if e.code == "denied" {
@@ -1178,6 +1226,7 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
             Ok(json!({ "ok": true }))
         }
         "machines.hold" => hold_machine(req.params, shared, conn),
+        "capacity.get" => serde_json::to_value(shared.capacity()).map_err(|e| api::ApiError::internal(e.into())),
         method if method.starts_with("lend.") => match shared.lender.get() {
             Some(lender) => fleet::lender::call(method, req.params, lender)
                 .unwrap_or_else(|| Err(api::ApiError::unknown_method(method))),
@@ -1238,8 +1287,16 @@ fn forward(id: Option<u64>, method: &str, params: Value, machine: &str, shared: 
 fn verb(id: Option<u64>, method: &str, params: Value, shared: &Shared, conn: &ConnState) -> Option<Response> {
     match fwd::machine_of(&params) {
         Err(e) => return Some(Response::err(id, e.code, e.message)),
-        Ok(Some(machine)) => return remote_verb(id, method, params, &machine, shared, conn),
+        Ok(Some(machine)) => {
+            let peer = ConnPeer { out: &conn.out, shared };
+            return remote_verb(id, method, params, &machine, shared, conn, &peer);
+        }
         Ok(None) => {}
+    }
+    if method == "run"
+        && let Some(answer) = placed_run(id, &params, shared, conn)
+    {
+        return answer;
     }
     let Some(runner) = shared.runner.get() else {
         return Some(Response::err(id, "internal", "this daemon runs no verbs"));
@@ -1296,15 +1353,133 @@ fn helper_call(id: Option<u64>, params: Value, shared: &Shared, conn: &ConnState
 }
 
 /// A verb with `machine`: run there over a connection of its own
-/// (`machines::forward::verb`, which says how a hang-up and a drain end it).
-fn remote_verb(id: Option<u64>, method: &str, params: Value, machine: &str, shared: &Shared, conn: &ConnState) -> Option<Response> {
+/// (`machines::forward::verb`, which says how a hang-up and a drain end it),
+/// its notifications to `peer`.
+fn remote_verb(
+    id: Option<u64>,
+    method: &str,
+    params: Value,
+    machine: &str,
+    shared: &Shared,
+    conn: &ConnState,
+    peer: &dyn verbs::Peer,
+) -> Option<Response> {
     let (Some(ctx), Some(links)) = (shared.machines.as_ref(), shared.links()) else {
         return Some(Response::err(id, "not-found", format!("no machine named `{machine}`")));
     };
     let label = conn.label();
     let vctx = fwd::VerbCtx { entries: links.entries(), dial: &ctx.dial, links, held: &shared.remote_verbs, who: &label, log };
+    fwd::verb(id, method, params, machine, &vctx, peer)
+}
+
+/// `run` without `machine`, placed (docs/architecture/daemon/fleet.md,
+/// *Placement*; `fleet::placed`): `None` when it runs here (a note, if
+/// any, already in its output), else the answer of the run forwarded to
+/// the worker it was placed on, in the worker's copy of the config root,
+/// or the failure to move the code there. Placement only looks further
+/// than this host when some offered worker takes work
+/// (`placed::worth_placing`), so in practice only on a hub. Moving the
+/// code (a fetch of each folder's origin, the transfers) runs on this
+/// connection's thread before anything is forwarded; a hang-up meanwhile
+/// is seen once the forward starts.
+fn placed_run(id: Option<u64>, params: &Value, shared: &Shared, conn: &ConnState) -> Option<Option<Response>> {
+    use fleet::placed::{self, Placed};
+    let str_of = |k: &str| params.get(k).and_then(Value::as_str);
+    if params.get("here").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
+    let sandbox = str_of("sandbox")?;
+    let machines = shared.remotes();
+    if !placed::worth_placing(&machines) {
+        return None;
+    }
+    // A bad `root` is the local parse's to refuse.
+    let root = PathBuf::from(str_of("root")?);
+    if !root.is_absolute() {
+        return None;
+    }
+    let locals: Vec<(PathBuf, Arc<Value>)> = shared.locals.lock().unwrap().iter().map(|(d, v)| (d.clone(), Arc::clone(v))).collect();
+    let spec = placed::spec(sandbox, locals.iter().find(|(d, _)| *d == root).map(|(_, v)| v.as_ref()));
+    let local_roots: Vec<Arc<Value>> = locals.into_iter().map(|(_, v)| v).collect();
+    let entries = shared.links().map(|l| l.entries()).unwrap_or_default();
+    let fresh = fresh_capacities(shared, &entries, &placed::reachable_workers(&machines));
+    let candidates = placed::candidates(&spec, Some(shared.capacity()), &local_roots, &machines, &fresh);
+    let ask = placed::Ask { here: false, branch: str_of("branch"), base: str_of("base") };
+    let decided = placed::decide(&ask, &spec, &candidates, |worker| {
+        use fleet::code::{self, LinkTransfer, Unprepared};
+        let Some(worker_root) = entries.iter().find(|e| e.name == worker).and_then(|e| e.roots.first()) else {
+            return Err(Unprepared::NotMovable("its fleet root isn't known (it offered none)".into()));
+        };
+        let repos = match &shared.repos {
+            Some(repos) => repos.clone(),
+            None => code::repos_dir()?,
+        };
+        let t = LinkTransfer::for_worker(&shared.socket_dir, worker);
+        code::prepare(&t, &repos, worker_root, &root, sandbox, ask.branch)
+    });
     let peer = ConnPeer { out: &conn.out, shared };
-    fwd::verb(id, method, params, machine, &vctx, &peer)
+    let say = |line: &str| {
+        let _ = verbs::Peer::notify(&peer, "output", verbs::output_params(id, "stderr", &format!("{line}\n")));
+    };
+    match decided {
+        Placed::Local => None,
+        Placed::LocalWithNote(note) => {
+            log(&format!("{}: run: {note}", conn.label()));
+            say(&note);
+            None
+        }
+        Placed::Failed(why) => {
+            log(&format!("{}: run: {why}", conn.label()));
+            Some(Some(Response::err_with(id, "failed", why, Some(json!({ "exit": null, "instance": null })))))
+        }
+        Placed::Worker { name, root, base, lines } => {
+            log(&format!("{}: run placed on {name} ({})", conn.label(), root.display()));
+            for line in &lines {
+                say(line);
+            }
+            let params = placed::forwarded(params.clone(), &name, &root, base.as_deref());
+            let tagged = placed::Tagged { inner: &peer, machine: &name };
+            match remote_verb(id, "run", params, &name, shared, conn, &tagged).map(|r| placed::after_forward(r, &name)) {
+                None => Some(None),
+                Some(placed::Forwarded::Answer(r)) => Some(Some(r)),
+                Some(placed::Forwarded::Here(note)) => {
+                    log(&format!("{}: run: {note}", conn.label()));
+                    say(&note);
+                    None
+                }
+            }
+        }
+    }
+}
+
+/// Each of `workers`' `capacity.get`, asked in parallel over its offered
+/// dial (a fresh `API` stream: hello, then the call), each bounded by
+/// `placed::CAPACITY_WAIT` for its dial-and-hello and again for its
+/// answer. A worker that doesn't answer in time, or fails, is left out:
+/// its saved report stands.
+fn fresh_capacities(
+    shared: &Shared,
+    entries: &[machines::Entry],
+    workers: &[String],
+) -> BTreeMap<String, super::capacity::Capacity> {
+    use fleet::placed::CAPACITY_WAIT;
+    let Some(ctx) = shared.machines.as_ref() else { return BTreeMap::new() };
+    std::thread::scope(|s| {
+        let asks: Vec<_> = workers
+            .iter()
+            .filter_map(|w| entries.iter().find(|e| &e.name == w))
+            .map(|entry| {
+                s.spawn(move || {
+                    let duplex = (ctx.dial)(entry).ok()?;
+                    let mut link = link::handshake(&entry.name, duplex, CAPACITY_WAIT).ok()?;
+                    let r = link.conn.call_within("capacity.get", json!({}), CAPACITY_WAIT).ok()??;
+                    let capacity = serde_json::from_value(r.result?).ok()?;
+                    Some((entry.name.clone(), capacity))
+                })
+            })
+            .collect();
+        asks.into_iter().filter_map(|a| a.join().ok().flatten()).collect()
+    })
 }
 
 /// A verb's view of its connection.
@@ -1603,6 +1778,10 @@ pub(crate) mod tests {
             // Never a download or a handoff of this test binary.
             lend_update: Some(Arc::new(crate::serve::fleet::update::tests::Fake::default())),
             lend_env: None,
+            // Never the runtime's `info`: an empty report (lend state aside).
+            local_capacity: Some(Arc::new(crate::serve::capacity::Capacity::default)),
+            // Never the user's repo caches.
+            repos: Some(std::env::temp_dir().join(format!("dsv-repos-{}", std::process::id()))),
         }
     }
 

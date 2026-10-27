@@ -30,7 +30,7 @@ checks the typings against the wire structs).
 | | `roots.list` | no |
 | bridges, forwards | `bridges.ensure`, `helper.call`, `forwards.list\|add\|rm` | no |
 | verbs | `run`, `rebuild`, `start`, `stop`, `rm`, `services.rebuild` | yes (own ssh) |
-| machines | `machines.probe\|add\|list\|get\|rm`, `fleet.offer` (internal), `lend.get\|set` | no |
+| machines | `machines.probe\|add\|list\|get\|rm`, `fleet.offer` (internal), `lend.get\|set`, `capacity.get` | no |
 
 Notifications: `inbox.changed`, `inbox.shown`, `instances.changed`,
 `instances.snapshot`, `forwards.changed`, `forwards.status`, `closing`
@@ -768,7 +768,7 @@ and `HOME` are the caller's, never the daemon's.
 
 | method | params (besides `root`, `env`) |
 |---|---|
-| `run` | `sandbox`, `name?`, `branch?`, `base?`, `json?`, `reprobe?`, `detach?`, `tty?` |
+| `run` | `sandbox`, `name?`, `branch?`, `base?`, `json?`, `reprobe?`, `detach?`, `tty?`, `here?` |
 | `rebuild` | `instance` \| `all: true`, `force?`, `reprobe?`, `detach?`, `tty?` |
 | `start` | `instance` \| `all: true`, `detach?`, `tty?` |
 | `stop` | `instance` \| `all: true`, `detach?` |
@@ -778,6 +778,20 @@ and `HOME` are the caller's, never the daemon's.
 `reprobe` is the CLI's `--reprobe`: the runtime's identity mode is probed
 again on the daemon's host instead of read from its cache
 ([runtimes](../architecture/runtimes.md#mode-detection)).
+
+**Placement** (`run` without `machine`): on a fleet hub with a worker
+taking work, `run` goes where placement scores best, this host or a worker
+([fleet](../architecture/daemon/fleet.md#placement)). Placed on a worker,
+the sandbox's config root and folders move there first, then the request
+is forwarded as with `machine`, in the worker's copy of the root; its
+output starts with a `stderr` line `placed on <worker> (<reasons>)` (and
+`warning: <worker>: over cap: …` lines), and its `progress`, its result
+and its detached answer carry `"machine": "<worker>"`. A sandbox that
+can't move runs here, its output starting `note: not placed on <worker>:
+<why>; running here` (`<why>` is `draining` when the worker refused the
+run); a move that fails is the error `failed` (`data.exit`
+`null`), nothing runs. `"here": true` (the CLI's `--here`) always runs
+here.
 
 `services.rebuild` runs `devsandbox service rebuild <name>`: no instance
 verb, so its answer's (and `failed`'s) `instance` is always `null`, no
@@ -993,7 +1007,9 @@ on a fleet hub's connection.
 
 - `state`: `on` (offer this host, take new work), `off` (no link) or
   `drain` (keep the link, so what's placed here stays reachable; take no
-  new work: offered as `draining`, nothing places work yet).
+  new work: the hub's `run` is refused `denied`, `this worker is
+  draining: no new work`, while `start`, `stop`, `rm` and `rebuild` of
+  what's here go on).
 - `hub`: the hub's ssh target, as `machines.add` takes one; `null` when
   none was set. Kept when lending goes `off`.
 - `name`: the name this host offers itself under: the one set, else the
@@ -1009,6 +1025,14 @@ on a fleet hub's connection.
 `lend.set` restarts the link only for a new `hub` or `name` (the old ssh
 killed first); `on` ↔ `drain` keeps it, and the next dial offers the new
 state.
+
+### `capacity.get`
+
+This host's capacity report now, as its snapshots carry it (`Capacity`:
+`cpus`, `mem_total`, `mem_available`, `disk_free`, `disk_total`,
+`running`, `lending`, `caps`; [fleet.md](../architecture/daemon/fleet.md#capacity)),
+built on demand: no watched root needed. Params `{}`. Lent on a fleet
+hub's connection: a hub asks each worker before it places a `run`.
 
 ### The `machine` param
 

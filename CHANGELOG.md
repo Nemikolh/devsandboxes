@@ -50,6 +50,13 @@ devsandbox exec web --attach=1790000000-a1b2
 
 - **Machine terminals reconnect.** A tty `exec` on a machine's instance, and a dashboard terminal tab on one, reattach to their session when ssh drops (`connection lost, reconnecting… (Ctrl-C to stop)`, backing off up to 10 s between tries), instead of ending the program's terminal. To keep ssh's own failure apart, a program there that exits 255 reports 254.
 
+- **Fleet: machines lend capacity to an always-on hub.** A hub (`hub = true` under `[serve]` in `daemon.config.toml`) takes workers that dial it (`devsandbox fleet join <hub>` on the worker; `devsandbox lend on|off|drain` after), with no ssh into them. On the hub, `run` places a new instance on the hub or a worker by headroom against soft caps (`over cap: …` warns, never refuses) and says where (`placed on <worker> (…)`); placed on a worker, the config root and the folder's branch move there first (committed, pushed work only; anything else runs on the hub with a note). `run --here` stays on the hub. `exec` and terminals into a placed instance come later.
+
+```bash
+devsandbox run web --branch fix-login   # placed on lap (mem 71% free, …)
+devsandbox run web --here
+```
+
 - **API: `config.findings`, `config.migrate` and `config.ack`.** The `/root` findings of a config root, the in-place update (guarded by the file's hash: `conflict` when it changed since) and "continue as is", also on a machine (`machine`). Details: `docs/reference/api.md`, *Config*.
 
 ### Fixed

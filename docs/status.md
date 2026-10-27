@@ -12,8 +12,8 @@ limitation means editing this file in the same commit.
 
 ## In progress
 
-- **helper / machines**: helper-rpc step 8, fleet steps 1-3, in the
-  order of
+- **helper / machines**: helper-rpc step 8, then fleet step 4 (fleet
+  steps 1-3 shipped), in the order of
   [helper-rpc](plans/active/helper-rpc.md#order-across-plans).
 
 ## Planned
@@ -278,15 +278,16 @@ limitation means editing this file in the same commit.
   only at its offered link's next retry, up to 30 s later: a re-offer of a
   known worker doesn't wake the link.
   → [fleet](architecture/daemon/fleet.md#hub-mode); `fleet::offer::offer`
-- A worker's `drain` reaches its hub only in the offer of its next link
-  (`lend on` ↔ `drain` keeps the current one), and nothing on the hub acts
-  on it until placement (step 3b); the capacity report's `lending` is
-  live, but nothing acts on it either. → [fleet](architecture/daemon/fleet.md#lending-lend); `fleet::lender::transition`
+- A worker's `drain` in its offer (sent at the next link only: `lend on`
+  ↔ `drain` keeps the current one) is only logged; the hub learns it from
+  the worker's `capacity.get` and the worker refuses a `run` itself.
+  → [fleet](architecture/daemon/fleet.md#lending-lend); `fleet::lender::transition`
 - The capacity report's soft caps (`lend.toml` `[caps]`) are edited by
   hand (no `lend` flag), and measured against the whole host's memory and
   disk use, not what placed work takes; `cpus` caps nothing measured. The
-  report is built only while a root is watched, and an Apple `container`
-  host reports no cpus or memory.
+  report rides the snapshots only while a root is watched (`capacity.get`
+  builds it any time), and an Apple `container` host reports no cpus or
+  memory.
   → [fleet](architecture/daemon/fleet.md#capacity); `capacity::over_caps`
 - Under the worker policy a placed instance's plain `devsbd notify`
   messages (not threads, which need `inbox`) still reach the worker's
@@ -318,8 +319,25 @@ limitation means editing this file in the same commit.
   the hub only as an offered machine whose link is gone (`unreachable`);
   the reason is on the worker (`lend.get`, `serve.log`).
   → [fleet](architecture/daemon/fleet.md#versions); `fleet::worker` `run_link`
-- Moving a sandbox to a worker (`fleet::code::prepare`) has no caller
-  yet (the placed `run`, fleet step 3c2). It moves committed, pushed work
+- Placement's `has_image` reads only watched roots' snapshots (this
+  host's while watched, a worker's last pushed), and `has_repo` is never
+  filled (no repo locality yet).
+  → [fleet](architecture/daemon/fleet.md#in-the-run-verb); `fleet::placed::candidates`
+- A placed `run` is placed only by the daemon's `run` verb: a CLI `run`
+  with no daemon to reach, the dispatcher's children and `--in-process`
+  runs stay here (fleet step 6 for children), and only offered workers
+  are candidates (an ssh machine needs `--machine` or a qualified name).
+  The hub's `state.toml` doesn't record a placed instance (it's the
+  worker's, seen as `<worker>/<name>` in federated views; fleet step 6),
+  and `exec`, terminals and forwards to it need fleet step 4. Moving the
+  code runs before the forward and isn't cancelled by a hang-up or Ctrl-C
+  meanwhile (the run, once forwarded, is); a worker that refuses the run
+  (draining) keeps the code it was sent. A new `--branch` starts at the
+  hub checkout's branch tip, not `origin/HEAD` as on the hub; a `--base`
+  or `worktree-base` naming an `origin/…` ref fails on the worker (its
+  checkout has no `origin`).
+  → [fleet](architecture/daemon/fleet.md#in-the-run-verb); `fleet::placed::start_point`
+- A placed `run` moves committed, pushed work
   only: one branch of each folder's `origin`, fetched by the hub; a
   folder with no `origin`, an unreachable one, a branch origin lacks, a
   `folder` inside the config root (a root that's a repo), a `folders`

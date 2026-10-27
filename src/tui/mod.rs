@@ -694,6 +694,7 @@ fn verb_call(
                 reprobe: false,
                 detach: true,
                 tty,
+                here: false,
             }),
         ),
         PromptAction::Rebuild { instance, force } => (
@@ -859,8 +860,10 @@ fn verb_status(action: &PromptAction, sent: Result<crate::serve::client::Streame
                 };
                 return (done, false);
             }
-            let status = match result["instance"].as_str() {
-                Some(instance) if Some(instance) != named => format!("{label}: {instance} started"),
+            let status = match (result["instance"].as_str(), result["machine"].as_str()) {
+                // Placed on a fleet worker: named where it is.
+                (Some(instance), Some(m)) => format!("{label}: {m}/{instance} started"),
+                (Some(instance), None) if Some(instance) != named => format!("{label}: {instance} started"),
                 _ => format!("{label}: started"),
             };
             (format!("{status} (b opens its build log)"), false)
@@ -1091,6 +1094,11 @@ mod tests {
         assert_eq!(
             status(&run_action(Some("w2"), None, None), ok(json!({"instance": "w2", "detached": true}))),
             "run web --name w2: started (b opens its build log)"
+        );
+        // Placed on a fleet worker: named there.
+        assert_eq!(
+            status(&run_action(Some("w2"), None, None), ok(json!({"instance": "w2", "detached": true, "machine": "lap"}))),
+            "run web --name w2: lap/w2 started (b opens its build log)"
         );
         assert_eq!(
             status(&rebuild, ok(json!({"instance": "web-2", "detached": true}))),

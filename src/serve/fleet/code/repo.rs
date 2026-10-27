@@ -155,7 +155,7 @@ fn optional(cmd: &mut Command) -> Result<Option<String>> {
 }
 
 #[cfg(test)]
-pub(super) mod tests {
+pub(crate) mod tests {
     use super::*;
 
     pub fn scratch(tag: &str) -> PathBuf {

@@ -62,6 +62,8 @@ pub(crate) enum CliVerb {
         json: bool,
         reprobe: bool,
         detach: bool,
+        /// `--here`: this host's sandbox, never placed on a fleet worker.
+        here: bool,
     },
     Rebuild { target: Option<String>, force: bool, reprobe: bool, detach: bool },
     Start { target: Option<String>, detach: bool },
@@ -105,7 +107,7 @@ impl CliVerb {
 pub(crate) fn from_command(command: &Command) -> Option<CliVerb> {
     Some(match command {
         Command::Run { env, dispatcher, .. } if !env.is_empty() || dispatcher.is_some() => return None,
-        Command::Run { sandbox, name, branch, base, json, reprobe, detach, .. } => CliVerb::Run {
+        Command::Run { sandbox, name, branch, base, json, reprobe, detach, here, .. } => CliVerb::Run {
             sandbox: sandbox.clone(),
             name: name.clone(),
             branch: branch.clone(),
@@ -113,6 +115,7 @@ pub(crate) fn from_command(command: &Command) -> Option<CliVerb> {
             json: *json,
             reprobe: *reprobe,
             detach: *detach,
+            here: *here,
         },
         Command::Rebuild { name, force, reprobe, detach, .. } => {
             CliVerb::Rebuild { target: name.clone(), force: *force, reprobe: *reprobe, detach: *detach }
@@ -246,6 +249,12 @@ fn send(conn: &mut Conn, verb: &CliVerb, prepared: Prepared) -> Result<(Done, bo
     {
         last.instance = v["instance"].as_str().map(str::to_string);
     }
+    // A placed run's answer names its worker too (`fleet::placed`).
+    let placed = match &answer {
+        Answer::Ok(v) => v["machine"].as_str().map(str::to_string),
+        _ => None,
+    };
+    let machine = machine.or(last.placed.clone()).or(placed);
     last.finish_stdout();
 
     let ending = ending(answer, last.cancelled);
@@ -396,8 +405,8 @@ fn prepare(
         banner: None,
     };
     let prepared = match verb.clone() {
-        CliVerb::Run { sandbox, name, branch, base, json, reprobe, detach } => {
-            let Some(target) = run_target(sandbox, &root, fed, call, ui, json)? else {
+        CliVerb::Run { sandbox, name, branch, base, json, reprobe, detach, here } => {
+            let Some(target) = run_target(sandbox, here, &root, fed, call, ui, json)? else {
                 return Ok(Prep::Exit(0));
             };
             let target = match target {
@@ -420,6 +429,7 @@ fn prepare(
                 reprobe,
                 detach,
                 tty,
+                here,
             };
             // `run` names no instance before it runs: `progress` does.
             Prepared { instance: None, ..one("run", serde_json::to_value(p)?, Some(&target)) }
@@ -609,8 +619,10 @@ fn target_of(name: &str, root: &Path, fed: &Fed, call: &mut Call, ui: &mut Ui) -
 
 /// `run`'s sandbox: where it's defined, after the pick. `None`: nothing to
 /// send (the example config was offered); `Err(why)` from an older daemon.
+/// `here` (`--here`): this host's only, a machine's name refused.
 fn run_target(
     sandbox: Option<String>,
+    here: bool,
     root: &Path,
     fed: &Fed,
     call: &mut Call,
@@ -630,14 +642,21 @@ fn run_target(
         Some(s) => Some((Where::Any, s)),
         None => None,
     };
-    let here = |name: String| Target { sandbox: Some(name.clone()), name, machine: None, root: root.to_path_buf() };
+    let wanted = match (wanted, here) {
+        (Some((Where::Machine(m), name)), true) => bail!("--here runs on this host; `{m}/{name}` is on machine `{m}`"),
+        (Some((_, name)), true) => Some((Where::Local, name)),
+        (wanted, _) => wanted,
+    };
+    // `--here` without a name picks among this host's sandboxes only.
+    let rows = if here { rows.into_iter().filter(|r| r.machine.is_none()).collect() } else { rows };
+    let local = |name: String| Target { sandbox: Some(name.clone()), name, machine: None, root: root.to_path_buf() };
     let there = |row: SandboxEntry| -> Result<Target> {
         let root = row.root.context("bad sandboxes.list entry from devsandbox serve: no root")?;
         Ok(Target { sandbox: Some(row.name.clone()), name: row.name, machine: row.machine, root })
     };
     let target = match choose_sandbox(rows, wanted) {
         SandboxChoice::Example { unmatched } => {
-            if let Some(name) = unmatched.filter(|_| fed.machines) {
+            if let Some(name) = unmatched.filter(|_| fed.machines && !here) {
                 note_unreachable(&name, call);
             }
             (ui.offer_example)()?;
@@ -648,10 +667,10 @@ fn run_target(
             return Ok(None);
         }
         SandboxChoice::Here { sandbox, matched } => {
-            if !matched && fed.machines {
+            if !matched && fed.machines && !here {
                 note_unreachable(&sandbox, call);
             }
-            here(sandbox)
+            local(sandbox)
         }
         SandboxChoice::There(row) => there(row)?,
         SandboxChoice::Missing { machine, sandbox } => {
@@ -667,7 +686,7 @@ fn run_target(
                 bail!("selection out of range");
             }
             match options.swap_remove(at).1 {
-                row if row.machine.is_none() => here(row.name),
+                row if row.machine.is_none() => local(row.name),
                 row => there(row)?,
             }
         }
@@ -862,11 +881,26 @@ struct Streaming {
     /// That stdout's line in progress, and the last whole line, unprinted.
     partial: String,
     pending: Option<String>,
+    /// The fleet worker the daemon placed this `run` on, from its
+    /// `progress` (`machine`): where a Ctrl-C cancels and the name points.
+    placed: Option<String>,
+    /// A placed run's name prints qualified (not `run --json`'s record).
+    qualify_placed: bool,
 }
 
 impl Streaming {
     fn new(instance: Option<String>, track_progress: bool, held: Option<Vec<(bool, String)>>) -> Self {
-        Self { instance, cancelled: false, track_progress, held, qualify: None, partial: String::new(), pending: None }
+        Self {
+            instance,
+            cancelled: false,
+            track_progress,
+            held,
+            qualify: None,
+            partial: String::new(),
+            pending: None,
+            placed: None,
+            qualify_placed: false,
+        }
     }
 }
 
@@ -886,7 +920,8 @@ fn stream(
     let held = (verb.detach() || params["ask"] == true).then(Vec::new);
     let mut s = Streaming::new(instance, track_progress, held);
     // `run --json`'s stdout is the record, unchanged.
-    s.qualify = machine.clone().filter(|_| matches!(verb, CliVerb::Run { json: false, .. }));
+    s.qualify_placed = matches!(verb, CliVerb::Run { json: false, .. });
+    s.qualify = machine.clone().filter(|_| s.qualify_placed);
     let _guard = cancel::catch();
     let streamed = conn.call_streaming(method, params, TICK, &mut |note| {
         if let Some(note) = note {
@@ -895,7 +930,7 @@ fn stream(
         if cancel::requested() && !s.cancelled {
             s.cancelled = true;
             return match &s.instance {
-                Some(instance) => cancel_by_name(instance, machine.as_deref()),
+                Some(instance) => cancel_by_name(instance, machine.as_deref().or(s.placed.as_deref())),
                 None => false,
             };
         }
@@ -919,6 +954,12 @@ impl Streaming {
             }
             "progress" if self.track_progress && self.instance.is_none() => {
                 self.instance = note.params["instance"].as_str().map(str::to_string);
+                if let Some(m) = note.params["machine"].as_str() {
+                    self.placed = Some(m.to_string());
+                    if self.qualify_placed && self.qualify.is_none() {
+                        self.qualify = Some(m.to_string());
+                    }
+                }
             }
             _ => {}
         }
@@ -1107,12 +1148,15 @@ mod tests {
                 json: true,
                 reprobe: true,
                 detach: true,
+                here: false,
             })
         );
         assert_eq!(
             verb(&["run"]),
-            Some(CliVerb::Run { sandbox: None, name: None, branch: None, base: None, json: false, reprobe: false, detach: false })
+            Some(CliVerb::Run { sandbox: None, name: None, branch: None, base: None, json: false, reprobe: false, detach: false, here: false })
         );
+        // (`--here` with `--machine`: `machines::cli::plan` refuses it.)
+        assert!(matches!(verb(&["run", "web", "--here"]), Some(CliVerb::Run { here: true, .. })));
         assert_eq!(verb(&["rebuild", "w", "--force"]), Some(CliVerb::Rebuild { target: Some("w".into()), force: true, reprobe: false, detach: false }));
         assert_eq!(verb(&["recreate", "--all", "--detach"]), Some(CliVerb::Rebuild { target: None, force: false, reprobe: false, detach: true }));
         assert_eq!(verb(&["rebuild", "w", "--reprobe"]), Some(CliVerb::Rebuild { target: Some("w".into()), force: false, reprobe: true, detach: false }));
@@ -1377,6 +1421,7 @@ mod tests {
             json,
             reprobe: false,
             detach: false,
+            here: false,
         };
         let two = [("sandboxes.list", ok(json!([{"name": "api"}, {"name": "web"}])))];
         let p = sent(prep(&run(None, false), true, &two, 1).0);
@@ -1401,7 +1446,7 @@ mod tests {
     /// (its stdout is the record) and not off a terminal.
     #[test]
     fn build_verbs_send_the_terminal_size() {
-        let run = |json| CliVerb::Run { sandbox: Some("web".into()), name: None, branch: None, base: None, json, reprobe: false, detach: false };
+        let run = |json| CliVerb::Run { sandbox: Some("web".into()), name: None, branch: None, base: None, json, reprobe: false, detach: false, here: false };
         let rebuild = CliVerb::Rebuild { target: None, force: false, reprobe: false, detach: false };
         let start = CliVerb::Start { target: None, detach: true };
         let list = [("sandboxes.list", ok(json!([{"name": "web"}])))];
@@ -1462,7 +1507,7 @@ mod tests {
     }
 
     fn run_of(sandbox: Option<&str>) -> CliVerb {
-        CliVerb::Run { sandbox: sandbox.map(str::to_string), name: None, branch: None, base: None, json: false, reprobe: false, detach: false }
+        CliVerb::Run { sandbox: sandbox.map(str::to_string), name: None, branch: None, base: None, json: false, reprobe: false, detach: false, here: false }
     }
 
     fn row(name: &str, machine: Option<&str>, root: &str) -> SandboxEntry {
@@ -1524,6 +1569,53 @@ mod tests {
         // Without machines: the request of before, byte for byte.
         let (_, calls, _, _) = prep_fed(&run_of(Some("loc")), &Fed::default(), false, None, &list, 0);
         assert_eq!(calls, [r#"sandboxes.list {"root":"/cfg"}"#]);
+    }
+
+    #[test]
+    fn run_here_stays_on_this_host() {
+        let here = |sandbox: Option<&str>| CliVerb::Run {
+            sandbox: sandbox.map(str::to_string),
+            name: None,
+            branch: None,
+            base: None,
+            json: false,
+            reprobe: false,
+            detach: false,
+            here: true,
+        };
+        let list = [("sandboxes.list", ok(json!([{"name": "web", "root": "/cfg"}, {"name": "web", "machine": "a", "root": "/r"}, {"name": "db", "machine": "a", "root": "/r"}])))];
+        // A name both define: this host's, no pick, `here` sent.
+        let p = sent(prep_fed(&here(Some("web")), &FED, false, None, &list, 0).0);
+        assert_eq!((p.params.get("machine"), &p.params["root"], &p.params["here"], p.machine), (None, &json!("/cfg"), &json!(true), None));
+        // Only a machine's: not looked for there (the local `run` says it's missing).
+        let p = sent(prep_fed(&here(Some("db")), &FED, false, None, &list, 0).0);
+        assert_eq!((p.params.get("machine"), &p.params["sandbox"]), (None, &json!("db")));
+        // The pick lists this host's only.
+        let two = [("sandboxes.list", ok(json!([{"name": "api", "root": "/cfg"}, {"name": "web", "root": "/cfg"}, {"name": "db", "machine": "a", "root": "/r"}])))];
+        let (p, _, _, picks) = prep_fed(&here(None), &FED, true, None, &two, 1);
+        assert_eq!(picks, [vec!["api".to_string(), "web".to_string()]]);
+        assert_eq!(sent(p).params["sandbox"], "web");
+        // A machine's name is refused.
+        let e = prep_fed(&here(Some("a/web")), &FED, false, None, &list, 0).0.unwrap_err();
+        assert_eq!(e.to_string(), "--here runs on this host; `a/web` is on machine `a`");
+        // Without it: `here: false` on the wire.
+        assert_eq!(sent(prep_fed(&run_of(Some("@/web")), &FED, false, None, &list, 0).0).params["here"], false);
+    }
+
+    /// A run the daemon placed on a worker says so in its `progress`: the
+    /// name prints qualified, a Ctrl-C goes there.
+    #[test]
+    fn a_placed_runs_progress_names_its_worker() {
+        let note = json!({"request": 1, "instance": "web-2", "phase": "building", "machine": "lap"});
+        let mut s = Streaming::new(None, true, None);
+        s.qualify_placed = true;
+        s.observe(&Notification { method: "progress".into(), params: note.clone() });
+        assert_eq!((s.instance.as_deref(), s.placed.as_deref(), s.qualify.as_deref()), (Some("web-2"), Some("lap"), Some("lap")));
+        assert_eq!(s.qualified("web-2\n".into()), "lap/web-2\n");
+        // `run --json`: its record unchanged.
+        let mut s = Streaming::new(None, true, None);
+        s.observe(&Notification { method: "progress".into(), params: note });
+        assert_eq!((s.placed.as_deref(), s.qualify), (Some("lap"), None));
     }
 
     #[test]
@@ -1645,7 +1737,7 @@ mod tests {
     }
 
     fn run_web(json: bool) -> CliVerb {
-        CliVerb::Run { sandbox: Some("web".into()), name: None, branch: None, base: None, json, reprobe: false, detach: false }
+        CliVerb::Run { sandbox: Some("web".into()), name: None, branch: None, base: None, json, reprobe: false, detach: false, here: false }
     }
 
     fn list() -> (&'static str, Response) {

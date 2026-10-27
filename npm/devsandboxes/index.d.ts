@@ -1060,6 +1060,12 @@ export interface RunParams extends VerbParams {
    * terminal escapes. The build log records the size. Absent: pipes, plain output.
    */
   tty?: TtySize | null;
+  /**
+   * Run on this host. Without it (and without `machine`) a fleet hub places
+   * the run on itself or one of its workers; placed on a worker, the code
+   * moves there first and the answer and `progress` carry `machine`.
+   */
+  here?: boolean;
 }
 
 /** `rebuild` params: `instance` or `all: true`. */
@@ -1115,12 +1121,16 @@ export interface VerbResult {
   /** The instance it acted on; `null` for `all` or when unknown. */
   instance: string | null;
   exit: 0;
+  /** A `run` placed on a fleet worker: that machine (the instance is `<machine>/<instance>`). */
+  machine?: string;
 }
 
 /** A `detach` verb's early answer; the verb runs on. */
 export interface VerbDetached {
   instance: string | null;
   detached: true;
+  /** As {@link VerbResult.machine}. */
+  machine?: string;
   /** `run` with `json`: the in-flight instance's record. */
   record?: RunRecord;
 }
@@ -1146,6 +1156,8 @@ export interface VerbProgress {
   instance: string;
   /** `preparing`, `building`, `creating`, a lifecycle step, or `failed`. */
   phase: string;
+  /** As {@link VerbResult.machine}. */
+  machine?: string;
 }
 
 /** `closing` params: the daemon is exiting; connect again (which starts a new one). */
@@ -1271,6 +1283,11 @@ export interface ApiMethods {
    * caller's absolute `SSH_AUTH_SOCK`. Waits up to 5 s for the relay; `not-found` for an unknown name.
    */
   'machines.hold': { params: { name: string; agent?: string }; result: MachineHeld };
+  /**
+   * This host's capacity report now (the one its snapshots carry), built on demand: no
+   * watched root needed. A fleet hub asks its workers before placing a `run`.
+   */
+  'capacity.get': { params: {}; result: Capacity };
   /** This host's lending to a fleet hub (`lend.toml`) and its link. */
   'lend.get': { params: {}; result: LendInfo };
   /**
