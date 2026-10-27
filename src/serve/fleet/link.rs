@@ -618,7 +618,7 @@ mod tests {
         // Hub → worker: bigger than a window, so credit has to flow.
         let body: Vec<u8> = (0..600_000u32).map(|i| i as u8).collect();
         let (size, sha256) = transfer::digest(&body[..]).unwrap();
-        let header = Header { kind: "root-tar".into(), name: "cfg.tar".into(), size, sha256 };
+        let header = Header { kind: "root-tar".into(), name: "cfg.tar".into(), size, sha256, to: None };
         transfer::send(UnixStream::connect(&xfer).unwrap(), &header, &body[..]).unwrap();
         let got = worker_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(got.path, worker_dir.join("cfg.tar"));

@@ -11,7 +11,9 @@ worker policy and `lend.*` with its CLI, `devsandbox lend` and
 ([ADR 0041](../../decisions/0041-fleet-workers-dial-their-hub.md)); and
 every daemon's [capacity report](#capacity), carried by its snapshots,
 and the pure [placement](#placement) that scores it;
-and the link's [`TRANSFER`](#transfer) streams, both ways; and
+and the link's [`TRANSFER`](#transfer) streams, both ways, with
+[moving code](#moving-code) on them (a config root and its repos onto a
+worker; nothing calls the hub's side yet); and
 [versions](#versions): a worker follows its hub's build, a published one
 downloaded, a dev one received over `TRANSFER`
 ([ADR 0042](../../decisions/0042-fleet-workers-follow-their-hubs-version.md)).
@@ -21,7 +23,13 @@ Code: `src/serve/fleet/mod.rs` (`LINK`), `src/serve/fleet/link.rs`
 `OpenerTransfer`, `AnswererTransfer`, `Outlet`, `End`, `write_sentinel`,
 `match_sentinel`), `src/serve/fleet/transfer.rs` (`Header`, `Received`,
 `send`, `receive`, `Receivers`, `parse_header`, `check_header`,
-`check_size`, `encode_reply`, `parse_reply`, `digest`),
+`receive_then`, `check_size`, `encode_reply`, `parse_reply`, `digest`),
+`src/serve/fleet/code/mod.rs` (`Transfer`, `LinkTransfer`, `Haves`,
+`offer`, `Offer`, `send`, `prepare`, `Prepared`, `Unprepared`, `layout`,
+`pack_root`, `receivers`, `repos_dir`), `src/serve/fleet/code/tar.rs`
+(`Writer`, `read`, `extract`, `check_path`, `check_link`),
+`src/serve/fleet/code/repo.rs` (`probe`, `cache_dir`, `fetch`,
+`has_branch`, `bundle`, `land`, `check_branch`),
 `src/serve/fleet/offer.rs` (`call`, `Ctx`, `accept`,
 `dial`), `src/commands/fleet_link.rs` (`fleet_link`, `run`),
 `src/serve/endpoint.rs` (`fleet_socket`, `fleet_transfer_socket`,
@@ -137,8 +145,11 @@ the opener only when the opener advertised it.
    `{"kind":"root-tar","name":"cfg.tar","size":3,"sha256":"ba78…"}`.
    `kind` (`[a-z0-9-]`, at most 32 bytes: `binary`, `root-tar`, `bundle`)
    picks the receiver; `name` is a file name (no `/`, not `.`/`..`, at most
-   255 bytes); `size` the body's length; `sha256` its lowercase hex hash
-   (`check_header`). At most `HEADER_MAX` (4 KiB) with its newline.
+   255 bytes); `size` the body's length; `sha256` its lowercase hex hash;
+   an optional `to`, where below the receiver's tree the body belongs (a
+   relative path of plain components, at most 1024 bytes; left out when
+   unset), for a kind that places more than its file (`check_header`).
+   At most `HEADER_MAX` (4 KiB) with its newline.
 2. The receiver (`receive`) checks the header and `size` against its
    limit (`check_size`), asks its `decide` where the body goes, creates a
    temp file next to there (`.<file>.<pid>-<n>.part`, 0600, its dir
@@ -148,7 +159,10 @@ the opener only when the opener advertised it.
 4. The receiver writes the body into the temp file and requires it to
    end at `size` (fewer bytes before the `Eof`, or any byte after, is an
    error) with the header's sha256; then renames it into place.
-5. The receiver answers one line, `ok` or `error <why>` (`encode_reply`),
+5. A kind that unpacks its body does so now, on the placed file
+   (`receive_then`, `Receivers::then`): its error is the answer and the
+   file is removed, so the sender hears an unpacking that failed.
+6. The receiver answers one line, `ok` or `error <why>` (`encode_reply`),
    and both close. On any error the temp file is removed; a bad body is
    first read to its end and dropped (at most `size` plus `DRAIN_EXTRA`,
    64 KiB): a receiver that closes while the sender is still writing
@@ -162,12 +176,13 @@ link's callback answers the `Open` with one end of a socket pair
 (`Receivers::accept`) and receives on a `fleet-transfer` thread of its
 own; a kind with no entry is refused ("nothing here receives
 \`<kind>\` transfers"). `Receivers::on_failure` adds a kind's hook for a
-transfer that failed after its `decide` took it. The one kind received so
-far is the worker's `binary` (`update::BINARY_KIND`, at most
+transfer that failed after its `decide` took it. The kinds received so
+far are the worker's: `binary` (`update::BINARY_KIND`, at most
 `BINARY_LIMIT`, 256 MiB: the hub's dev build, [Versions](#versions)),
-which the lending thread registers itself (`Incoming::receiver`); the
-receivers `start_lending` passes and `commands::fleet_link::run`'s are
-empty otherwise.
+which the lending thread registers itself (`Incoming::receiver`), and
+`root-tar` / `bundle` ([Moving code](#moving-code)), which
+`start_lending` registers (`code::receivers` over the lending's fleet
+root); `commands::fleet_link::run`'s receivers are empty.
 
 **Hub → worker.** `fleet-link` binds a second socket next to the link's,
 `endpoint::fleet_transfer_socket` (`fleet-<name>.transfer.sock`, bound and
@@ -181,6 +196,90 @@ unlinked like `fleet-<name>.sock`, one accept loop over both:
 link ends; `Lending::open_transfer` on the worker), and the opener admits
 them through `Mux::on_host_open` (`TRANSFER` only) into its receivers. So
 the two directions never share an id space.
+
+## Moving code
+
+A sandbox goes to a worker as its config root and its folders' repos, so
+the worker runs the config as the hub has it (dockerfiles, local
+features) on a checkout of the branch (fleet plan decision 12: the hub
+reaches `origin` with its own credentials; a worker never needs any). It
+sits behind one seam, `serve::fleet::code`'s `Transfer` (`haves`, `send`;
+`offer` builds what goes, `receivers` takes it), so a sync layer can
+replace the git + tar implementation; `LinkTransfer` sends each body as
+one `TRANSFER` through the worker's link (a connection to
+`endpoint::fleet_transfer_socket`). `prepare(transfer, repos, worker
+root, config root, sandbox, branch)` is `offer` then `send`, answering
+`Prepared` (the config root on the worker, `remote_root`, and each moved
+folder with its branch) or `Unprepared`: `NotMovable(why)` (it runs
+where it is, the why for the user) or `Failed`. Nothing calls it yet
+(the placed `run`, fleet step 3c2).
+
+**Offer** (`offer`, on the hub). The sandbox resolves from the config
+root (canonical) as `run` resolves it. Its `folder` and every `folders`
+entry outside the root must each be a checkout's root (`repo::probe`: a
+`.git` there) with an `origin`; a `folders` entry inside the root
+travels in its tar instead (its `.git` doesn't), one with a `${…}`
+variable doesn't move, nor does a `folder` in the root. Each origin is
+fetched (`repo::fetch`: every branch, `+refs/heads/*:refs/heads/*`,
+pruned, no tags, `protocol.ext.allow=never`) into the hub's repo cache,
+`<data>/devsandbox/repos/<sha256(url) prefix>.git` (bare, made by `git
+init --bare`; `repo::cache_dir`, `repos_dir`). The branch is the
+requested one (`run --branch`, for `folder` only) when origin has it,
+else the checkout's current branch when origin has it; neither is
+`NotMovable` (push it first), as is an origin the fetch can't reach.
+
+**Layout** (`layout`, pure). Paths stay as the config says: each folder
+relative to the root climbs `n` times (`..`) then goes down, and the
+root's members sit under its last `max(n, 1)` path components on the hub,
+so every folder lands at its own relative offset with the hub's names:
+root `/w/.devsandboxes` with `folder = "../web"` is `.devsandboxes/` and
+`web/` in the tree. A root too shallow, a folder holding the root, and
+two folders where one holds the other are `NotMovable`.
+
+**The root's tar** (`pack_root`, `code::tar`). Written in-process, never
+by a `tar` program: ustar with pax `path` / `linkpath` records past 100
+bytes, members sorted, mtime 0, owner 0, modes 0644 / 0755 by the owner's
+exec bit, so the same content (and layout) is the same bytes on every
+hub. Left out: `.worktrees`, `shared-volumes` and `shared-files` at the
+top (`ROOT_SKIPS`), `.git` at any depth, and anything but dirs, regular
+files and symlinks; ignore files aren't read. Symlinks are stored, never
+followed; one whose target isn't relative with its `..`s first and no
+more of them than it has parents in the root (`tar::check_link`), a
+non-UTF-8 name, or a tar over `ROOT_TAR_LIMIT` (256 MiB) refuses the
+root. Its name is `root-<hash>.tar`, `<hash>` the sha256's first 16 hex.
+
+**Send** (`send`). The tar, unless `haves` lists its hash (nothing asks
+yet: `Transfer::haves` is empty), then per repo `git bundle create` of
+`refs/heads/<branch>` from the cache (a temp file next to it), sent as
+`bundle` with `to` = `<hash>/<folder's offset>`. A refusal is the
+receiver's why (`Failed`).
+
+**Receive** (`receivers`, on the worker, into its fleet root). Bodies
+wait in `roots/.in/`.
+
+- `root-tar`: the name must be `root-<its sha256's first 16 hex>.tar`.
+  `tar::read` refuses an absolute path, a `.` / `..` / empty component, a
+  symlink outside `check_link`'s shape, any other member type (hard
+  links, devices, global pax headers), a pax key other than `path` /
+  `linkpath`, a bad checksum and more than `MEMBERS_MAX` members.
+  `tar::extract` writes into a fresh temp dir, every parent a real
+  directory it made (never through a symlink), never over a member,
+  then renames it to `roots/<hash>/`; a hash already there is kept.
+- `bundle`: `to` must be `<hash>/<path>` with `roots/<hash>/` there (the
+  tar goes first) and no symlink on the way. `repo::land` makes the
+  checkout if missing (`git init`, HEAD to the bundle's one
+  `refs/heads/<branch>`, fetch, `reset --hard`) with no remote; an
+  existing checkout gets the branch fast-forwarded when it's the one
+  checked out, else moved to the bundle's. A dir that exists, isn't
+  empty and has no `.git` is refused.
+
+All of it is host git through `run::git`'s family
+([ADR 0003](../../decisions/0003-host-git-never-runs-repo-controlled-code.md)):
+`host_git` on checkouts, `host_git_bare` on the cache, `host_git_new`
+for `git init`; hooks and fsmonitor off, repo config checked. Branch
+names are `repo::check_branch`'s (plain characters, no `..`, no
+component starting `.` or `-`). Under the fleet root the moved root and
+checkouts fall under the [worker policy](#worker-policy) like any other.
 
 ## Hub side
 

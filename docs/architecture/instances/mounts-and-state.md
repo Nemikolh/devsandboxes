@@ -9,7 +9,7 @@ Code: `src/commands/run/mounts.rs` (`resolve_mounts`, `last_wins_by_target`,
 `sort_parents_first`, `resolve_folders`, `resolve_caches`,
 `provision_shell_history`, `resolve_shell_rc`, `shell_rc_wiring`,
 `write_workspace_file`, `feature_mount_decision`, `merge_volumes`),
-`src/commands/run/git.rs` (`host_git`, `check_repo`),
+`src/commands/run/git.rs` (`host_git`, `host_git_bare`, `host_git_new`, `check_repo`),
 `src/commands/run/editor.rs` (`write_vscode_name_config`),
 `src/commands/vscode.rs` (`launch`), `src/commands/run/ssh_agent.rs`,
 `src/commands/run/mod.rs` (`materialize`, `run_container`), `src/config.rs`
@@ -131,5 +131,12 @@ git call on a sandbox's repo goes through `run::git::host_git`:
 
 `rm` runs `check_repo` before tearing anything down so it never stops
 half-way.
+
+Two siblings cover the git the fleet's code moving runs
+([fleet](../daemon/fleet.md#moving-code)), with the same flags and env:
+`host_git_bare` for a bare repo devsandbox keeps (the hub's repo cache: the
+dir is the git dir, its `config` and alternates checked as `check_repo`
+checks a checkout's) and `host_git_new` for a dir with no `.git` yet (`git
+init`; refused once one is there).
 
 Limitations: [status.md](../../status.md#instances)

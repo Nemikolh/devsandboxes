@@ -23,13 +23,42 @@ pub(crate) fn host_git(repo: &Path) -> Result<Command> {
     Ok(git_command(repo))
 }
 
+/// A `git` command for the bare repo `dir` (a repo devsandbox keeps for
+/// itself, as the fleet's repo cache): `dir` is the git dir, its `config`
+/// and alternates checked as [`check_repo`] checks a checkout's, hooks and
+/// fsmonitor off as [`host_git`]'s.
+pub(crate) fn host_git_bare(dir: &Path) -> Result<Command> {
+    check_dirs(dir, dir, dir)?;
+    let mut cmd = Command::new("git");
+    cmd.args(SAFE_ARGS).arg("--git-dir").arg(dir);
+    Ok(safe_env(cmd))
+}
+
+/// A `git` command in `dir`, which holds no repo yet (for `git init`): with
+/// no `.git` there is no repo config to check. Refused when `dir` has a
+/// `.git` (use [`host_git`]) or isn't a dir.
+pub(crate) fn host_git_new(dir: &Path) -> Result<Command> {
+    if !dir.is_dir() {
+        bail!("refusing to run git in {}: not a directory", dir.display());
+    }
+    if dir.join(".git").symlink_metadata().is_ok() {
+        bail!("refusing to run git in {}: it holds a .git already", dir.display());
+    }
+    Ok(git_command(dir))
+}
+
+/// What every host git gets on its command line: hooks and fsmonitor off.
+const SAFE_ARGS: [&str; 4] = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"];
+
 fn git_command(repo: &Path) -> Command {
     let mut cmd = Command::new("git");
-    cmd.args(["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"])
-        .arg("-C")
-        .arg(repo)
-        .stdin(Stdio::null())
-        .env("GIT_TERMINAL_PROMPT", "0");
+    cmd.args(SAFE_ARGS).arg("-C").arg(repo);
+    safe_env(cmd)
+}
+
+/// No stdin, no credential prompts, no env pointing git at another repo.
+fn safe_env(mut cmd: Command) -> Command {
+    cmd.stdin(Stdio::null()).env("GIT_TERMINAL_PROMPT", "0");
     // These would make git use another repo than the one `check_repo` read.
     for var in ["GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE"] {
         cmd.env_remove(var);
@@ -40,11 +69,17 @@ fn git_command(repo: &Path) -> Command {
 /// Refuse `repo` when its local config (or an alternates file) could make
 /// host git run commands or read objects from elsewhere.
 pub(crate) fn check_repo(repo: &Path) -> Result<()> {
+    let (gitdir, common) = git_dirs(repo)?;
+    check_dirs(repo, &gitdir, &common)
+}
+
+/// [`check_repo`] over a known git dir and common dir (`repo` names them in
+/// messages).
+fn check_dirs(repo: &Path, gitdir: &Path, common: &Path) -> Result<()> {
     let refuse = |what: String| -> anyhow::Error {
         anyhow::anyhow!("refusing to run git on {}: {what}", repo.display())
     };
     let shown = |p: &Path| p.strip_prefix(repo).unwrap_or(p).display().to_string();
-    let (gitdir, common) = git_dirs(repo)?;
     let alternates = common.join("objects/info/alternates");
     if alternates.symlink_metadata().is_ok() {
         return Err(refuse(format!(
@@ -53,7 +88,7 @@ pub(crate) fn check_repo(repo: &Path) -> Result<()> {
             shown(&alternates)
         )));
     }
-    for file in config_files(&gitdir, &common).map_err(|e| refuse(format!("{e:#}")))? {
+    for file in config_files(gitdir, common).map_err(|e| refuse(format!("{e:#}")))? {
         let bytes = match std::fs::read(&file) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,

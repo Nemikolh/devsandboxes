@@ -33,7 +33,13 @@ feature build contexts carry the root's `services::project_id`
 [images](../../architecture/instances/images-and-features.md)); 3b
 (`place`) shipped: `serve::fleet::place` (`place`, `score`, `Candidate::local`
 / `from_machine`, `has_image`), pure, not yet called
-([fleet](../../architecture/daemon/fleet.md#placement))
+([fleet](../../architecture/daemon/fleet.md#placement)); 3c1 (moving
+code) shipped: `serve::fleet::code` (`offer`, `send`, `prepare`,
+`Transfer`, `LinkTransfer`, the worker's `root-tar` / `bundle`
+receivers), the root as an in-process ustar, the hub's repo cache
+(`repos/<url hash>.git`), `Header::to`, `transfer::receive_then`,
+`host_git_bare` / `host_git_new`; not yet called
+([fleet](../../architecture/daemon/fleet.md#moving-code))
 ([fleet](../../architecture/daemon/fleet.md), ADRs
 [0041](../../decisions/0041-fleet-workers-dial-their-hub.md),
 [0042](../../decisions/0042-fleet-workers-follow-their-hubs-version.md)); the rest
@@ -435,7 +441,9 @@ Commits (landmarks from recon; line numbers drift, trust the symbol):
   check rebuild / gc / image facts.
 - **3b `place`.** Pure `place(spec, &[Candidate]) -> Placement`,
   soft-cap score + warnings, from 1g's capacity; `drain` the only hard no.
-- **3c placed run.** In the daemon's `run` verb: `place` when the user
+- **3c placed run** (two commits, split by the orchestrator: **3c1** the
+  transfer of a config root and its repo onto a worker, **3c2** `place`
+  in the `run` verb). In the daemon's `run` verb: `place` when the user
   didn't pin a machine (`--here` forces local); config root as a tar over
   `TRANSFER` into `fleet/<hub>/roots/<hash>/`; the hub clones `origin`
   into its repo cache and sends a bundle of the branch; the worker cuts

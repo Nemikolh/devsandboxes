@@ -450,9 +450,10 @@ fn start_lending(dir: &Path, opts: &Options, shared: &Arc<Shared>) {
         let scope = Arc::new(lent::Scope { hub: start.hub.clone(), root: start.root.clone(), env: env.clone() });
         let weak = weak.clone();
         let open: fleet::worker::Open = Arc::new(move || weak.upgrade()?.open_lent(&scope));
-        // What the hub may send this worker: beyond the hub's binary, which
-        // the lending thread takes itself, no kind yet.
-        let receivers = fleet::transfer::Receivers::new(log);
+        // What the hub may send this worker: config roots and their repos,
+        // into the fleet root (`fleet::code`); the hub's binary the lending
+        // thread takes itself.
+        let receivers = fleet::code::receivers(&start.root, fleet::transfer::Receivers::new(log));
         fleet::worker::Lending::spawn(start.hub, start.name, start.root, start.draining, transport.clone(), open, receivers, follow.clone(), timing, log)
     });
     let lender = shared.lender.get_or_init(|| fleet::lender::Lender::new(path, link::hostname(), spawn, log));

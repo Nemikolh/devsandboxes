@@ -21,9 +21,14 @@
 //!   way) and each end's receivers by kind.
 //! - `update`: the build each end says in its `Hello`, and how a worker
 //!   follows its hub's (download, install, forced handoff).
+//! - `code`: a config root and its repos moved onto a worker (the root as
+//!   a tar, each folder's branch as a git bundle from the hub's repo
+//!   cache), and the worker's receivers for them.
 //! - `place`: the pure placement of new work over candidates filled from
 //!   the daemon's snapshots (soft caps, locality, pins).
 
+#[allow(dead_code)] // the hub side's first caller: the placed run (fleet step 3c2)
+pub mod code;
 pub mod lend;
 pub mod lender;
 pub mod lent;

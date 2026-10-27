@@ -141,7 +141,7 @@ pub fn hub_pushes(hub: &str, worker: &str) -> bool {
 pub fn push(socket: &Path, binary: &Path) -> Result<()> {
     let open = || std::fs::File::open(binary).with_context(|| format!("cannot read {}", binary.display()));
     let (size, sha256) = transfer::digest(open()?).with_context(|| format!("cannot read {}", binary.display()))?;
-    let header = transfer::Header { kind: BINARY_KIND.into(), name: "devsandbox".into(), size, sha256 };
+    let header = transfer::Header { kind: BINARY_KIND.into(), name: "devsandbox".into(), size, sha256, to: None };
     let stream = UnixStream::connect(socket).with_context(|| format!("cannot connect to {}", socket.display()))?;
     transfer::send(stream, &header, open()?)
 }

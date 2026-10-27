@@ -9,7 +9,9 @@
 //! is still coming loses its answer on the mux: the sender would only see a
 //! broken pipe. A body longer or shorter than
 //! `size`, a hash mismatch, a `size` over the receiver's limit or a kind
-//! nobody receives is an `error`, the temp file removed.
+//! nobody receives is an `error`, the temp file removed. A kind may check
+//! or unpack the placed body before the answer ([`receive_then`],
+//! [`Receivers::then`]): its error is the answer too.
 //!
 //! [`send`] and [`receive`] are the two ends over any byte stream;
 //! [`Receivers`] is an end's registry of what it accepts, by kind, which the
@@ -58,6 +60,12 @@ pub struct Header {
     pub size: u64,
     /// The body's sha256, lowercase hex.
     pub sha256: String,
+    /// Where below the receiver's tree the body belongs, for a kind that
+    /// places more than its file (a `bundle`'s checkout): a relative
+    /// `/`-separated path of plain components. Left out of the line when
+    /// unset; each receiver checks what it means.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
 }
 
 /// A transfer the receiver took: its header and where the body now is.
@@ -92,6 +100,12 @@ pub fn check_header(h: &Header) -> Result<()> {
     }
     if h.sha256.len() != 64 || !h.sha256.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
         bail!("bad transfer sha256 `{}`", h.sha256);
+    }
+    if let Some(to) = &h.to {
+        let plain = |c: &str| !c.is_empty() && c != "." && c != ".." && !c.contains(['\0', '\n', '\\']);
+        if to.len() > 1024 || !to.split('/').all(plain) {
+            bail!("bad transfer path {to:?}");
+        }
     }
     Ok(())
 }
@@ -219,9 +233,28 @@ fn read_reply(stream: &mut impl Read, line: &mut Vec<u8>) -> io::Result<()> {
 /// a bad body once the rest of it is read and dropped (at most what the
 /// header said plus [`DRAIN_EXTRA`]), so the answer isn't lost to a
 /// sender still writing.
+#[cfg_attr(not(test), allow(dead_code))] // every kind goes through `Receivers`
 pub fn receive(stream: impl Read + Write, limit: u64, decide: impl FnOnce(&Header) -> Result<PathBuf>) -> Result<Received> {
+    receive_then(stream, limit, decide, |_| Ok(()))
+}
+
+/// [`receive`], with `then` run on what was received (in place, checked)
+/// before the answer: its error is the answer (`error <why>`), the file
+/// removed. So a receiver that unpacks the body reports the unpacking.
+pub fn receive_then(
+    stream: impl Read + Write,
+    limit: u64,
+    decide: impl FnOnce(&Header) -> Result<PathBuf>,
+    then: impl FnOnce(&Received) -> Result<()>,
+) -> Result<Received> {
     let mut stream = BufReader::new(stream);
-    let result = receive_body(&mut stream, limit, decide);
+    let result = receive_body(&mut stream, limit, decide).and_then(|received| match then(&received) {
+        Ok(()) => Ok(received),
+        Err(e) => {
+            let _ = std::fs::remove_file(&received.path);
+            Err(e)
+        }
+    });
     let reply = encode_reply(&result.as_ref().map(|_| ()).map_err(|e| format!("{e:#}")));
     let out = stream.get_mut();
     let answered = out.write_all(reply.as_bytes()).and_then(|()| out.flush());
@@ -332,10 +365,12 @@ impl Drop for Temp {
 type Decide = Box<dyn Fn(&Header) -> Result<PathBuf> + Send + Sync>;
 type Done = Box<dyn Fn(Received) + Send + Sync>;
 type Failed = Box<dyn Fn(&str) + Send + Sync>;
+type Then = Box<dyn Fn(&Received) -> Result<()> + Send + Sync>;
 
 struct Kind {
     limit: u64,
     decide: Decide,
+    then: Option<Then>,
     done: Done,
     failed: Option<Failed>,
 }
@@ -364,7 +399,17 @@ impl Receivers {
         decide: impl Fn(&Header) -> Result<PathBuf> + Send + Sync + 'static,
         done: impl Fn(Received) + Send + Sync + 'static,
     ) -> Receivers {
-        self.kinds.insert(kind.to_string(), Kind { limit, decide: Box::new(decide), done: Box::new(done), failed: None });
+        self.kinds.insert(kind.to_string(), Kind { limit, decide: Box::new(decide), then: None, done: Box::new(done), failed: None });
+        self
+    }
+
+    /// For `kind` (registered by [`Receivers::with`]): `then` runs with each
+    /// one received before its answer goes out ([`receive_then`]): its error
+    /// is the answer, and the kind's `failed`.
+    pub fn then(mut self, kind: &str, then: impl Fn(&Received) -> Result<()> + Send + Sync + 'static) -> Receivers {
+        if let Some(k) = self.kinds.get_mut(kind) {
+            k.then = Some(Box::new(then));
+        }
         self
     }
 
@@ -378,17 +423,25 @@ impl Receivers {
         self
     }
 
-    /// [`receive`] on `stream` by its header's kind, then that kind's `done`
-    /// (or, failed once its `decide` took it, its `failed`).
+    /// [`receive_then`] on `stream` by its header's kind, then that kind's
+    /// `done` (or, failed once its `decide` took it, its `failed`).
     pub fn receive(&self, stream: impl Read + Write) -> Result<Received> {
         let mut kind = None;
-        let received = receive(stream, u64::MAX, |h| {
-            let k = self.kinds.get(&h.kind).with_context(|| format!("nothing here receives `{}` transfers", h.kind))?;
-            check_size(h.size, k.limit)?;
-            let dest = (k.decide)(h)?;
-            kind = Some(k);
-            Ok(dest)
-        });
+        let received = receive_then(
+            stream,
+            u64::MAX,
+            |h| {
+                let k = self.kinds.get(&h.kind).with_context(|| format!("nothing here receives `{}` transfers", h.kind))?;
+                check_size(h.size, k.limit)?;
+                let dest = (k.decide)(h)?;
+                kind = Some(k);
+                Ok(dest)
+            },
+            |r| match self.kinds.get(&r.header.kind).and_then(|k| k.then.as_ref()) {
+                Some(then) => then(r),
+                None => Ok(()),
+            },
+        );
         match (received, kind) {
             (Ok(received), Some(k)) => {
                 (k.done)(received.clone());
@@ -436,7 +489,7 @@ mod tests {
 
     fn header_for(kind: &str, name: &str, body: &[u8]) -> Header {
         let (size, sha256) = digest(body).unwrap();
-        Header { kind: kind.into(), name: name.into(), size, sha256 }
+        Header { kind: kind.into(), name: name.into(), size, sha256, to: None }
     }
 
     fn files(dir: &Path) -> Vec<String> {
@@ -478,6 +531,15 @@ mod tests {
         assert!(bad(|h| h.name = String::new()).contains("name"));
         assert!(bad(|h| h.sha256 = "AB".repeat(32)).contains("sha256"));
         assert!(bad(|h| h.sha256 = "ab".into()).contains("sha256"));
+        for to in ["", "/a", "a/", "a//b", "a/../b", "./a", ".."] {
+            let h = Header { to: Some(to.into()), ..h.clone() };
+            let err = format!("{:#}", parse_header(encode_header(&h).as_bytes()).unwrap_err());
+            assert!(err.contains("path"), "{to:?}: {err}");
+        }
+        let to = Header { to: Some("0123/repos/web".into()), ..h.clone() };
+        let line = encode_header(&to);
+        assert!(line.contains("\"to\":\"0123/repos/web\""), "{line}");
+        assert_eq!(parse_header(line.as_bytes()).unwrap(), to);
         assert!(parse_header(b"{\"kind\":\"x\"}").is_err());
         assert!(parse_header(b"not json").is_err());
         assert!(check_size(10, 10).is_ok());
@@ -606,6 +668,30 @@ mod tests {
         assert!(theirs.join().unwrap().is_err());
         assert!(rx.try_recv().is_err(), "`done` only for the one received");
         assert_eq!(files(&dir), ["repo.bundle"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_kinds_then_answers_for_the_received_body() {
+        let dir = scratch("then");
+        let failures = Arc::new(Mutex::new(Vec::<String>::new()));
+        let heard = Arc::clone(&failures);
+        let to = dir.clone();
+        let receivers = Receivers::new(|_| {})
+            .with("root-tar", 100, move |h| Ok(to.join(&h.name)), |_| {})
+            .then("root-tar", |r| if std::fs::read(&r.path)? == b"bad" { bail!("cannot unpack") } else { Ok(()) })
+            .on_failure("root-tar", move |why| heard.lock().unwrap().push(why.to_string()));
+        let receivers = Arc::new(receivers);
+        send(receivers.accept().unwrap(), &header_for("root-tar", "good", b"good"), &b"good"[..]).unwrap();
+        let err = format!("{:#}", send(receivers.accept().unwrap(), &header_for("root-tar", "bad", b"bad"), &b"bad"[..]).unwrap_err());
+        assert_eq!(err, "transfer refused: cannot unpack");
+        assert_eq!(files(&dir), ["good"], "the refused body is removed");
+        let start = std::time::Instant::now();
+        while failures.lock().unwrap().is_empty() {
+            assert!(start.elapsed() < std::time::Duration::from_secs(5), "the hook ran");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(*failures.lock().unwrap(), ["cannot unpack"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

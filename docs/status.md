@@ -318,6 +318,22 @@ limitation means editing this file in the same commit.
   the hub only as an offered machine whose link is gone (`unreachable`);
   the reason is on the worker (`lend.get`, `serve.log`).
   → [fleet](architecture/daemon/fleet.md#versions); `fleet::worker` `run_link`
+- Moving a sandbox to a worker (`fleet::code::prepare`) has no caller
+  yet (the placed `run`, fleet step 3c2). It moves committed, pushed work
+  only: one branch of each folder's `origin`, fetched by the hub; a
+  folder with no `origin`, an unreachable one, a branch origin lacks, a
+  `folder` inside the config root (a root that's a repo), a `folders`
+  entry with a `${…}` variable or outside the root but not a checkout
+  doesn't move. `folders` entries inside the root travel in its tar
+  without their `.git`. The root's tar skips `.git`, `.worktrees`,
+  `shared-volumes` and `shared-files` but not git-ignored files, and a
+  symlink pointing out of the root refuses it. Everything is sent every
+  time (`Transfer::haves` asks nothing; the worker keeps a root it has),
+  the repo cache is keyed by origin URL (not by root commits) and never
+  pruned, a worker's moved checkout keeps the branch it first checked out
+  (later bundles update other branches' refs), and `roots/<hash>/` trees
+  are never removed.
+  → [fleet](architecture/daemon/fleet.md#moving-code); `fleet::code::offer`, `fleet::code::repo::land`
 - After a worker's downgrade, a dashboard or other long-lived client still
   running the replaced, newer binary hands the new daemon off again at its
   next hello (its version is newer), restarting the older binary each

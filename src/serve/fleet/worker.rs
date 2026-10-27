@@ -694,7 +694,7 @@ mod tests {
         let incoming = Arc::new(Incoming::default());
         let receivers = Arc::new(incoming.receiver(Receivers::new(|_| {})));
         let (size, sha256) = transfer::digest(&b"bin"[..]).unwrap();
-        let header = Header { kind: BINARY_KIND.into(), name: "devsandbox".into(), size, sha256 };
+        let header = Header { kind: BINARY_KIND.into(), name: "devsandbox".into(), size, sha256, to: None };
         let err = transfer::send(receivers.accept().unwrap(), &header, &b"bin"[..]).unwrap_err();
         assert_eq!(format!("{err:#}"), "transfer refused: this worker isn't waiting for a binary");
 
