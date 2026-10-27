@@ -717,9 +717,9 @@ approves them with the plan:
   the wrapper also looks under `~/.cache/puppeteer` (Puppeteer's own
   download).
 - **`${containerEnv:X}` inside `containerEnv` values** reads only the
-  image env and the home fallback. A reference to any key the sandbox's
-  `containerEnv` defines is an error, which covers self-reference and
-  avoids ordering rules.
+  image env and the home fallback, so no order between keys matters and
+  `PATH = "${containerEnv:PATH}:…"` extends the image's `PATH` (it was an
+  error at first; dropped in step 11's review for that idiom).
 - **`instances.resolve` gains `sandbox`** (`machines/cli.rs` `Found`):
   the CLI prompt for `rebuild`/`start <instance>` needs the sandbox, and
   the client only knows the instance name today.
@@ -910,8 +910,9 @@ Line numbers below are from recon at the start of this run; re-grep.
   and isn't an issue.
 - Substitute `containerEnv` and `remoteEnv` values (`run/mod.rs` ~:1073
   `-e`, ~:785 `Instance.remote_env`). In `containerEnv` values,
-  `containerEnv:` reads only the image env and the home fallback. A
-  reference to a key the sandbox's `containerEnv` defines is an error.
+  `containerEnv:` reads only the image env and the home fallback (review
+  of step 11: not an error, so devcontainer's `PATH =
+  "${containerEnv:PATH}:…"` idiom works).
 - Check the ordering in `materialize`: mounts must resolve after the image
   exists. If they resolve before it today, move the resolution after
   `image_for` with the smallest change, and say so in the report.

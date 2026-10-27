@@ -196,6 +196,23 @@ impl Backend for Dockerlike {
         parse_image_env(&out)
     }
 
+    fn image_id(&self, image: &str) -> Result<Option<String>> {
+        let out = self.output_quiet(&["image", "inspect", "--format", "{{.Id}}", image])?;
+        Ok(Some(out).filter(|id| !id.is_empty()))
+    }
+
+    fn image_passwd(&self, image: &str) -> Result<Option<String>> {
+        let args = passwd_argv(image);
+        let out = std::process::Command::new(self.bin)
+            .args(&args)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .with_context(|| format!("failed to run {} (is it installed?)", self.bin))?;
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        passwd_outcome(out.status.code(), &String::from_utf8_lossy(&out.stdout), &stderr)
+            .with_context(|| format!("cannot read /etc/passwd from `{image}`"))
+    }
+
     fn remove_volume(&self, name: &str) -> Result<bool> {
         match self.output_quiet(&["volume", "rm", name]) {
             Ok(_) => Ok(true),
@@ -258,6 +275,26 @@ fn canary_argv(image: &str, host_dir: &str, user: Ids, relabel: bool) -> Vec<Str
         // A builtin and a redirect: no tool needed from the image.
         format!(": > {CANARY_TARGET}/{}", user.uid),
     ]
+}
+
+/// `Backend::image_passwd`'s run: like the canary (local image only, no
+/// network, `sh` for the entrypoint), as root so any image's file is
+/// readable.
+fn passwd_argv(image: &str) -> Vec<String> {
+    ["run", "--rm", "--pull=never", "--network=none", "--user", "0:0", "--entrypoint", super::SH, image, "-c", "cat /etc/passwd"]
+        .map(String::from)
+        .into()
+}
+
+/// The passwd run's outcome: stdout on success; `None` on 126/127 (no `sh`
+/// to start, or no `cat` in it: the runtime and `sh` both say so that way);
+/// any other failure is an error with stderr's first line.
+fn passwd_outcome(code: Option<i32>, stdout: &str, stderr: &str) -> Result<Option<String>> {
+    match code {
+        Some(0) => Ok(Some(stdout.to_string())),
+        Some(126 | 127) => Ok(None),
+        _ => bail!("{}", stderr.lines().next().unwrap_or("non-zero exit").trim()),
+    }
 }
 
 /// A canary file's owner, as the host sees it.
@@ -555,6 +592,35 @@ mod tests {
         assert_eq!(user[5], "1000:1000");
         assert_eq!(user[9], "/d:/devsandbox-probe:z");
         assert_eq!(user[12], ": > /devsandbox-probe/1000");
+    }
+
+    #[test]
+    fn passwd_run_and_outcome() {
+        assert_eq!(
+            passwd_argv("img"),
+            ["run", "--rm", "--pull=never", "--network=none", "--user", "0:0", "--entrypoint", "/bin/sh", "img", "-c", "cat /etc/passwd"]
+        );
+        assert_eq!(passwd_outcome(Some(0), "root:x:0:0::/root:/bin/sh\n", "").unwrap().as_deref(), Some("root:x:0:0::/root:/bin/sh\n"));
+        // No `sh` (the runtime's 127/126) or no `cat` (sh's 127): nothing to read.
+        assert_eq!(passwd_outcome(Some(127), "", "exec: \"/bin/sh\": stat /bin/sh: no such file").unwrap(), None);
+        assert_eq!(passwd_outcome(Some(126), "", "").unwrap(), None);
+        let err = passwd_outcome(Some(125), "", "Error: No such image: img\nmore").unwrap_err();
+        assert_eq!(err.to_string(), "Error: No such image: img");
+        assert!(passwd_outcome(None, "", "").is_err());
+    }
+
+    /// Docker-gated: alpine's passwd through a throwaway container, and an id
+    /// to key it by. Runs under rootless docker too (no bind involved).
+    #[test_utils::docker_test]
+    fn image_passwd_and_id_from_alpine() -> Result<(), &'static str> {
+        let image = "alpine:3.20";
+        Dockerlike::DOCKER.output_quiet(&["pull", "-q", image]).map_err(|_| "cannot pull alpine:3.20")?;
+        let passwd = Dockerlike::DOCKER.image_passwd(image).unwrap().expect("alpine has sh");
+        assert_eq!(identity::account(&passwd, "root").map(|a| (a.uid, a.home)), Some((0, "/root".into())));
+        let id = Dockerlike::DOCKER.image_id(image).unwrap().expect("an id");
+        assert!(id.starts_with("sha256:"), "{id}");
+        assert!(Dockerlike::DOCKER.image_id("devsandbox-no-such-image:never").is_err());
+        Ok(())
     }
 
     /// Docker-gated: CI's docker is rootful, so the canary must classify it

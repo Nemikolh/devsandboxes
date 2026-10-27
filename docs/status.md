@@ -153,8 +153,12 @@ limitation means editing this file in the same commit.
   (always ambiguous, the canary can't see its files) re-runs the canary and
   falls back to `identity = "image"` on every `run`. `run::identity::probe`
 - Identity: rootless podman assumes the adopted account is 1000:1000
-  (`--userns keep-id:uid=1000,gid=1000`); another uid only gets a warning
-  from `devsbd identity apply --expect`. `identity::ASSUMED`
+  (`--userns keep-id:uid=1000,gid=1000`) when the image's `/etc/passwd`
+  can't be read (no `sh` in the image) or lacks the account; another uid
+  then only gets a warning from `devsbd identity apply --expect`.
+  `identity::ASSUMED`
+- `${containerEnv:…}` in `workspaceFolder` and `folders` stays verbatim:
+  they resolve before the image is built. `run::materialize`
 - Identity on rootless docker: VS Code attaches as root without the plan's
   `HOME` (`Instance::home` reaches execs only). `vscode::launch`
 - Tool env: `PLAYWRIGHT_MCP_SANDBOX=false` and `CHROMIUM_FLAGS=--no-sandbox`

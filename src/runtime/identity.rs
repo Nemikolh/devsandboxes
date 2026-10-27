@@ -108,9 +108,10 @@ pub struct Ids {
     pub gid: u32,
 }
 
-/// The ids the adopted account is assumed to have (*Assumed ids*): what
-/// devcontainer base images and common-utils' `automatic` user use. The
-/// canary writes its non-root file as this uid too.
+/// The ids the adopted account is assumed to have when the image's
+/// `/etc/passwd` can't be read (*Assumed ids*): what devcontainer base images
+/// and common-utils' `automatic` user use. The canary writes its non-root
+/// file as this uid too.
 pub const ASSUMED: Ids = Ids { uid: 1000, gid: 1000 };
 
 /// Which rootless runtime ran the canary: the stats alone can't tell rootless
@@ -347,6 +348,9 @@ pub struct Accounts<'a> {
     pub container_user: Option<&'a str>,
     pub remote_user: Option<&'a str>,
     pub image_user: Option<&'a str>,
+    /// The adopted account's real ids, from the image's `/etc/passwd`
+    /// ([`account`]); `None` when unknown ([`ASSUMED`] stands in).
+    pub ids: Option<Ids>,
 }
 
 impl<'a> Accounts<'a> {
@@ -358,6 +362,46 @@ impl<'a> Accounts<'a> {
         let spec = self.remote_user.or(self.container_user).or(self.image_user)?;
         let user = spec.split(':').next().unwrap_or_default().trim();
         (!user.is_empty() && user != "root" && user != "0").then_some(user)
+    }
+}
+
+/// One account of an image's `/etc/passwd`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Account {
+    pub uid: u32,
+    pub gid: u32,
+    pub home: String,
+}
+
+/// The account `name_or_uid` names in `passwd` (`/etc/passwd` text): by
+/// name, else (all digits) by uid. Malformed lines are skipped.
+pub fn account(passwd: &str, name_or_uid: &str) -> Option<Account> {
+    let by_uid = name_or_uid.parse::<u32>().ok();
+    fn parse(line: &str) -> Option<(&str, Account)> {
+        let f: Vec<&str> = line.split(':').collect();
+        if f.len() < 7 {
+            return None;
+        }
+        Some((f[0], Account { uid: f[2].parse().ok()?, gid: f[3].parse().ok()?, home: f[5].to_string() }))
+    }
+    let accounts: Vec<(&str, Account)> = passwd.lines().filter_map(parse).collect();
+    let named = accounts.iter().find(|(name, _)| *name == name_or_uid);
+    named.or_else(|| accounts.iter().find(|(_, a)| Some(a.uid) == by_uid)).map(|(_, a)| a.clone())
+}
+
+/// The home `${containerEnv:HOME}` falls back to: the account `user` names
+/// (remoteUser, else containerUser, else the image's `USER`; whatever the
+/// plan) as `passwd` has it, else `/home/<user>`; `/root` when `user` is
+/// root or unset. A rootless-docker root plan gets the account's home too
+/// (its `HOME` is that home), so a config doesn't depend on the plan.
+pub fn container_home(accounts: &Accounts, passwd: Option<&str>) -> String {
+    let Some(user) = accounts.adopted() else {
+        return "/root".into();
+    };
+    match passwd.and_then(|p| account(p, user)) {
+        Some(a) if !a.home.is_empty() => a.home,
+        Some(a) if a.uid == 0 => "/root".into(),
+        _ => format!("/home/{user}"),
     }
 }
 
@@ -453,7 +497,8 @@ pub fn plan(probe: Probe, identity: Identity, accounts: Accounts, host: Ids) -> 
         Mode::RootlessPodman => {
             // keep-id runs the container as the mapped uid unless `--user`
             // says otherwise.
-            p.userns = Some(format!("keep-id:uid={},gid={}", ASSUMED.uid, ASSUMED.gid));
+            let ids = accounts.ids.unwrap_or(ASSUMED);
+            p.userns = Some(format!("keep-id:uid={},gid={}", ids.uid, ids.gid));
             p.exec_user = Some(account.into());
         }
         Mode::VmBacked => {
@@ -466,6 +511,21 @@ pub fn plan(probe: Probe, identity: Identity, accounts: Accounts, host: Ids) -> 
 }
 
 impl Plan {
+    /// The ids keep-id maps the account at (`--userns keep-id:uid=…,gid=…`),
+    /// which `devsbd identity apply --expect` checks.
+    pub fn keep_id(&self) -> Option<Ids> {
+        let ids = self.userns.as_deref()?.strip_prefix("keep-id:")?;
+        let (mut uid, mut gid) = (None, None);
+        for kv in ids.split(',') {
+            match kv.split_once('=') {
+                Some(("uid", v)) => uid = v.parse().ok(),
+                Some(("gid", v)) => gid = v.parse().ok(),
+                _ => {}
+            }
+        }
+        Some(Ids { uid: uid?, gid: gid? })
+    }
+
     /// One line for `run` and `inspect` (section 6).
     pub fn summary(&self) -> String {
         let mode = self.mode.describe();
@@ -616,7 +676,7 @@ mod tests {
     }
 
     fn vscode() -> Accounts<'static> {
-        Accounts { container_user: Some("vscode"), remote_user: Some("vscode"), image_user: None }
+        Accounts { container_user: Some("vscode"), remote_user: Some("vscode"), image_user: None, ids: None }
     }
 
     #[test]
@@ -639,9 +699,59 @@ mod tests {
         assert_eq!(classify(HOST, HOST, ids(0, 0), Engine::Docker), None);
     }
 
+    const PASSWD: &str = "root:x:0:0:root:/root:/bin/bash\n\
+        # a comment\n\
+        broken:x:notanumber:1:::\n\
+        short:x:5\n\
+        node:x:1000:1000::/home/node:/bin/bash\n\
+        vscode:x:1001:1002:VS Code:/home/vscode:/bin/zsh\n\
+        svc:x:999:999::/srv/svc:/usr/sbin/nologin\n";
+
+    #[test]
+    fn account_by_name_or_uid() {
+        let acc = |uid, gid, home: &str| Some(Account { uid, gid, home: home.into() });
+        assert_eq!(account(PASSWD, "vscode"), acc(1001, 1002, "/home/vscode"));
+        assert_eq!(account(PASSWD, "1000"), acc(1000, 1000, "/home/node"));
+        assert_eq!(account(PASSWD, "root"), acc(0, 0, "/root"));
+        assert_eq!(account(PASSWD, "nobody"), None);
+        assert_eq!(account(PASSWD, "4242"), None);
+        // Malformed lines are skipped, never matched.
+        assert_eq!(account(PASSWD, "broken"), None);
+        assert_eq!(account(PASSWD, "short"), None);
+        assert_eq!(account("", "node"), None);
+    }
+
+    #[test]
+    fn container_home_fallbacks() {
+        let a = |r| Accounts { remote_user: r, ..Default::default() };
+        assert_eq!(container_home(&a(Some("svc")), Some(PASSWD)), "/srv/svc");
+        assert_eq!(container_home(&a(Some("1001")), Some(PASSWD)), "/home/vscode");
+        // Not in passwd, or no passwd: the conventional home.
+        assert_eq!(container_home(&a(Some("dev")), Some(PASSWD)), "/home/dev");
+        assert_eq!(container_home(&a(Some("svc")), None), "/home/svc");
+        // Root or nobody named.
+        assert_eq!(container_home(&a(Some("root")), Some(PASSWD)), "/root");
+        assert_eq!(container_home(&a(None), None), "/root");
+        let image = Accounts { image_user: Some("node:node"), ..Default::default() };
+        assert_eq!(container_home(&image, Some(PASSWD)), "/home/node");
+    }
+
+    #[test]
+    fn keep_id_uses_the_real_ids_when_known() {
+        let accounts = Accounts { ids: Some(ids(1001, 1002)), ..vscode() };
+        let p = plan(probe(Mode::RootlessPodman), Identity::Host, accounts, HOST);
+        assert_eq!(p.userns.as_deref(), Some("keep-id:uid=1001,gid=1002"));
+        assert_eq!(p.keep_id(), Some(ids(1001, 1002)));
+        // Unknown: the assumed ids.
+        let p = plan(probe(Mode::RootlessPodman), Identity::Host, vscode(), HOST);
+        assert_eq!(p.keep_id(), Some(ASSUMED));
+        // Other modes have no keep-id.
+        assert_eq!(plan(probe(Mode::Rootful), Identity::Host, accounts, HOST).keep_id(), None);
+    }
+
     #[test]
     fn adopted_account_precedence() {
-        let a = |c, r, i| Accounts { container_user: c, remote_user: r, image_user: i };
+        let a = |c, r, i| Accounts { container_user: c, remote_user: r, image_user: i, ids: None };
         assert_eq!(a(Some("c"), Some("r"), Some("i")).adopted(), Some("r"));
         assert_eq!(a(Some("c"), None, Some("i")).adopted(), Some("c"));
         assert_eq!(a(None, None, Some("node:node")).adopted(), Some("node"));
@@ -706,7 +816,7 @@ mod tests {
 
     #[test]
     fn image_identity_is_todays_behavior_in_every_mode() {
-        let accounts = Accounts { container_user: Some("app:app"), remote_user: Some("dev"), image_user: Some("x") };
+        let accounts = Accounts { container_user: Some("app:app"), remote_user: Some("dev"), image_user: Some("x"), ids: None };
         let only_container = Accounts { container_user: Some("app"), ..Default::default() };
         for mode in MODES {
             let p = plan(probe(mode), Identity::Image, accounts, HOST);
@@ -726,7 +836,7 @@ mod tests {
 
     #[test]
     fn unknown_mode_plans_image() {
-        let accounts = Accounts { container_user: Some("app"), remote_user: Some("dev"), image_user: None };
+        let accounts = Accounts { container_user: Some("app"), remote_user: Some("dev"), image_user: None, ids: None };
         let p = plan(probe(Mode::Unknown), Identity::Host, accounts, HOST);
         let mut want = plan(probe(Mode::Unknown), Identity::Image, accounts, HOST);
         assert_eq!(p, want);
@@ -766,7 +876,7 @@ mod tests {
 
     #[test]
     fn label_round_trips() {
-        let odd = Accounts { container_user: Some("a;b%c:grp"), remote_user: None, image_user: None };
+        let odd = Accounts { container_user: Some("a;b%c:grp"), remote_user: None, image_user: None, ids: None };
         for mode in MODES {
             for selinux in [false, true] {
                 for identity in [Identity::Host, Identity::Image] {

@@ -85,14 +85,31 @@ last entry per target (`run::mounts::last_wins_by_target`).
 `configDir`, `localWorkspaceFolder`, `localWorkspaceFolderBasename`,
 `sharedVolumes` (`<configDir>/shared-volumes`), `instance` and its alias
 `devcontainerId` (the instance id: the name at creation, stable across
-rebuild and `rename`), and `localEnv:VAR` (unset → empty). Unknown
-expressions are left verbatim (feature mounts using one are skipped with a
-warning).
+rebuild and `rename`), `localEnv:VAR` (unset → empty), and
+`containerEnv:NAME` through `MountContext::container_env` (unset → empty).
+Unknown expressions are left verbatim (feature mounts using one are skipped
+with a warning), and so is `containerEnv:` when the context has no
+`ContainerEnv` (`snapshot::validate_sandbox`, `ls`: no image, not an issue).
 
 Expanded at `run`, not at load, in: `mounts` source/target, `folders` keys
-and paths, `shell-rc` paths, `workspaceFolder`, and the `worktree-branch`
+and paths, `shell-rc` paths, `workspaceFolder`, the `worktree-branch`
 pattern (a dispatcher's `--branch` is taken literally, never expanded, so it
-can't read host env). Other fields are not substituted.
+can't read host env), and `containerEnv` / `remoteEnv` values. Other fields
+are not substituted.
+
+`ContainerEnv` exists once the image is built: `materialize` builds the
+image (`image_for`), reads its facts (`run::facts::image_facts`), then
+resolves `ContainerEnv::resolve` before the mounts, so `mounts`,
+`shell-rc`, feature mounts, `containerEnv` and `remoteEnv` see it;
+`workspaceFolder` and `folders` resolve earlier and leave it verbatim. A
+name resolves to the sandbox's `containerEnv` (substituted), else the
+image's `ENV`, else for `HOME` the adopted account's home
+([identity](instances/identity.md#containerenvhome)). Inside `containerEnv`
+values it reads only the image's `ENV` and that home
+(`ContainerEnv::resolve`), as devcontainer's does: `PATH =
+"${containerEnv:PATH}:…"` extends the image's `PATH`, and no order between
+keys matters. `Instance::remote_env`
+holds the substituted `remoteEnv`.
 
 A volume mount whose source uses `${instance}` / `${devcontainerId}` is
 `per_instance`: recorded in state and deleted by `rm`.

@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
-use crate::config::{sandbox_build_hash, short_hash, substitute, Config, MountContext, ResolvedSandbox, CONFIG_FILE};
+use crate::config::{
+    sandbox_build_hash, short_hash, substitute, Config, ContainerEnv, MountContext, ResolvedSandbox, CONFIG_FILE,
+};
 use crate::runtime::{backend, NAME_PREFIX};
 use crate::state::{Instance, Phase, State};
 
@@ -12,6 +14,7 @@ use super::{container_drifted, pick, services};
 
 pub(crate) mod cancel;
 mod editor;
+mod facts;
 mod folders;
 mod git;
 mod identity;
@@ -176,6 +179,7 @@ pub fn run(
         workspace_folder_basename: &basename,
         shared_volumes: &shared_volumes,
         instance: &instance_id,
+        container_env: None,
     };
 
     // A dispatcher's child always gets a worktree, even as the folder's first
@@ -538,6 +542,7 @@ pub(crate) fn materialize(
         workspace_folder_basename: &basename,
         shared_volumes: &shared_volumes,
         instance: instance_id,
+        container_env: None,
     };
     let workspace = substitute(
         &props
@@ -649,8 +654,16 @@ pub(crate) fn materialize(
             None => None,
         }
     };
+    // The image before the mounts: `${containerEnv:…}` (mounts, containerEnv,
+    // remoteEnv) reads the built image's env and passwd.
+    tracker.enter(Phase::Building)?;
+    let image = image_for(dir, sandbox)?;
+    let facts = facts::image_facts(&image);
+    let container_env =
+        ContainerEnv::resolve(props.container_env.as_ref(), facts.env.clone(), facts::home(props, &facts), &var_ctx);
+    let var_ctx = MountContext { container_env: Some(&container_env), ..var_ctx };
     let ResolvedMounts { args: mut mounts, volumes: mut instance_volumes } =
-        resolve_mounts(dir, folder, &basename, instance_id, sandbox)?;
+        resolve_mounts(dir, folder, &basename, instance_id, sandbox, Some(&container_env))?;
     for fm in &folder_mounts {
         mounts.push(format!(
             "type=bind,source={},target={}",
@@ -706,14 +719,9 @@ pub(crate) fn materialize(
     for warning in warnings {
         eprintln!("warning: {warning}");
     }
-    tracker.enter(Phase::Building)?;
-    let image = image_for(dir, sandbox)?;
     // Who the container runs as (docs/architecture/instances/identity.md).
-    let (plan, seccomp) = identity::plan_for(&image, props, extras.reprobe, privileged);
+    let (plan, seccomp) = identity::plan_for(&image, facts::accounts(props, &facts), props, extras.reprobe, privileged);
     let root_plan = tool_env::root_plan(plan.exec_user.as_deref());
-    // A root plan's tool env puts the browser wrapper's dir before the
-    // image's PATH (`exec -e PATH` replaces it); unreadable reads as unset.
-    let image_env = if root_plan { backend().image_env(&image).unwrap_or_default() } else { Vec::new() };
     tracker.enter(Phase::Creating)?;
     run_container(
         dir,
@@ -725,6 +733,7 @@ pub(crate) fn materialize(
         &workspace,
         &extra_mounts,
         &mounts,
+        &container_env.sandbox,
         &extra_env,
         &networks,
         privileged,
@@ -780,8 +789,10 @@ pub(crate) fn materialize(
         .chain(props.remote_env.iter())
         .flat_map(|env| env.keys().map(String::as_str))
         .collect();
+    // A root plan's tool env puts the browser wrapper's dir before the
+    // image's PATH (`exec -e PATH` replaces it); unreadable reads as unset.
     let tool_env =
-        tool_env::tool_env(root_plan, browser_sandbox.as_ref(), tool_env::image_path(&image_env), &user_keys);
+        tool_env::tool_env(root_plan, browser_sandbox.as_ref(), tool_env::image_path(&facts.env), &user_keys);
     eprintln!("{}", tool_env::summary(root_plan, browser_sandbox.as_ref()));
     let workspace_file = write_workspace_file(
         &container,
@@ -806,7 +817,7 @@ pub(crate) fn materialize(
         shell_history,
         workspace: workspace.clone(),
         workspace_file,
-        remote_env: props.remote_env.clone().unwrap_or_default(),
+        remote_env: props.remote_env.iter().flatten().map(|(k, v)| (k.clone(), substitute(v, &var_ctx))).collect(),
         remote_user: plan.exec_user.clone(),
         home,
         browser_sandbox,
@@ -1034,7 +1045,8 @@ pub(crate) fn warn_on_drift(dir: &Path, container: &str, sandbox: &ResolvedSandb
 /// first and service DNS are the caller's too: they run once the container
 /// exists, when a failure keeps it. `plan` decides the user, the user
 /// namespace, the seccomp profile (`seccomp`, its path) and the binds'
-/// SELinux labels (`identity::create_args`).
+/// SELinux labels (`identity::create_args`). `container_env` is the
+/// sandbox's `containerEnv`, substituted (`ContainerEnv::resolve`).
 #[allow(clippy::too_many_arguments)]
 fn run_container(
     dir: &Path,
@@ -1046,6 +1058,7 @@ fn run_container(
     workspace: &str,
     extra_mounts: &[String],
     mounts: &[String],
+    container_env: &BTreeMap<String, String>,
     extra_env: &[(String, String)],
     networks: &[String],
     privileged: bool,
@@ -1098,17 +1111,15 @@ fn run_container(
     // Runtimes differ in how many networks a container can start on; the
     // backend attaches the rest after creation.
     args.extend(backend().network_run_args(networks));
-    if let Some(env) = &props.container_env {
-        for (key, value) in env {
-            args.push("-e".into());
-            args.push(format!("{key}={value}"));
-        }
+    for (key, value) in container_env {
+        args.push("-e".into());
+        args.push(format!("{key}={value}"));
     }
     for (key, value) in extra_env {
         args.push("-e".into());
         args.push(format!("{key}={value}"));
     }
-    let set = props.container_env.iter().flatten().chain(extra_env.iter().map(|(k, v)| (k, v)));
+    let set = container_env.iter().chain(extra_env.iter().map(|(k, v)| (k, v)));
     for (key, value) in gc_keeps_worktrees_env(set) {
         args.push("-e".into());
         args.push(format!("{key}={value}"));
@@ -1324,6 +1335,7 @@ mod tests {
             workspace_folder_basename: "repo",
             shared_volumes: "/cfg/shared-volumes",
             instance: "web-1",
+            container_env: None,
         };
         let own = |s: &str| Some(s.to_string());
         // Config pattern and the default: substituted.
@@ -1793,6 +1805,60 @@ mod tests {
                 let out = backend().output_quiet(&argv.iter().map(String::as_str).collect::<Vec<_>>()).unwrap();
                 assert_eq!(out.trim(), "/run/devsandbox/bin/chromium");
             }
+        });
+    }
+
+    /// `${containerEnv:HOME}` resolves to the adopted account's home as the
+    /// built image's passwd has it, in a mount target and in containerEnv /
+    /// remoteEnv values, and the facts get cached by image id. The account's
+    /// home and uid are off the conventions, so no fallback could pass.
+    #[test_utils::docker_test]
+    fn container_env_home_reaches_mounts_and_env_with_docker() -> Result<(), String> {
+        isolated("container_env_child")
+    }
+
+    #[test]
+    fn container_env_child() {
+        let Some(root) = isolated_root("container_env_child") else { return };
+        let (repo, cfg) = (root.join("repo"), root.join("cfg"));
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&cfg).unwrap();
+        // Unique per run: container, image and volume names are global to the runtime.
+        let name = format!("cenv-{}", std::process::id());
+        std::fs::write(cfg.join("Dockerfile"), "FROM alpine:3.20\nRUN adduser -D -u 1234 -h /srv/dev dev\n").unwrap();
+        std::fs::write(
+            cfg.join(CONFIG_FILE),
+            format!(
+                "[sandbox.{name}]\nfolder = \"../repo\"\nbuild.dockerfile = \"Dockerfile\"\nremoteUser = \"dev\"\n\
+                 mounts = [\"type=volume,source=cenv-${{instance}},target=${{containerEnv:HOME}}/.cfg\"]\n\
+                 containerEnv = {{ CFG = \"${{containerEnv:HOME}}/.cfg\" }}\n\
+                 remoteEnv = {{ WHERE = \"${{containerEnv:CFG}}\" }}\n"
+            ),
+        )
+        .unwrap();
+        let project = services::project_id(&cfg).unwrap();
+        let container = format!("{NAME_PREFIX}{name}");
+        let image = format!("{NAME_PREFIX}img-{name}");
+        let volume = format!("cenv-{name}");
+        let cleanup = || {
+            crate::commands::rm::remove_container(&container, &project, &name);
+            let _ = backend().remove_volume(&volume);
+            let _ = backend().output_quiet(&["rmi", "-f", &image]);
+        };
+        crate::test_support::with_cleanup(cleanup, || {
+            run(&cfg, Some(name.clone()), Some(name.clone()), None, None, RunExtras::default()).unwrap();
+            let state = State::load().unwrap();
+            let info = state.instances.get(&name).expect("instance recorded");
+            assert_eq!(info.remote_env.get("WHERE").map(String::as_str), Some("/srv/dev/.cfg"));
+            let probe = ["sh".to_string(), "-c".into(), "echo \"$CFG|$WHERE\"; grep -c ' /srv/dev/.cfg ' /proc/mounts".into()];
+            let argv = crate::commands::exec::exec_argv_with(info, false, false, &probe, false);
+            let out = backend().output_quiet(&argv.iter().map(String::as_str).collect::<Vec<_>>()).unwrap();
+            assert_eq!(out.lines().collect::<Vec<_>>(), ["/srv/dev/.cfg|/srv/dev/.cfg", "1"], "{out}");
+            let id = backend().image_id(&image).unwrap().expect("image id");
+            let facts = &state.image_facts[&id];
+            let passwd = facts.passwd.as_deref().expect("passwd cached");
+            let dev = crate::runtime::identity::account(passwd, "dev").expect("dev in passwd");
+            assert_eq!((dev.uid, dev.home.as_str()), (1234, "/srv/dev"));
         });
     }
 

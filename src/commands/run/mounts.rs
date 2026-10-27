@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 
 use crate::config::{
-    parse_shorthand, substitute, FolderWorktree, LifecycleCommand, MountContext, ResolvedMount,
+    parse_shorthand, substitute, ContainerEnv, FolderWorktree, LifecycleCommand, MountContext, ResolvedMount,
     ResolvedSandbox, SandboxProperties, SimpleCommand,
 };
 use crate::runtime::backend;
@@ -16,13 +16,15 @@ use crate::runtime::backend;
 /// `${…}` variables and creating any missing bind sources so a first run doesn't
 /// fail on a non-existent host path. Entries sharing a target collapse to the
 /// last one (see [`last_wins_by_target`]) before any source is created, so an
-/// overridden template mount leaves no stub behind.
+/// overridden template mount leaves no stub behind. `container_env` is what
+/// `${containerEnv:…}` reads (the built image's, see `ContainerEnv`).
 pub(super) fn resolve_mounts(
     dir: &Path,
     folder: &Path,
     basename: &str,
     instance_id: &str,
     sandbox: &ResolvedSandbox,
+    container_env: Option<&ContainerEnv>,
 ) -> Result<ResolvedMounts> {
     let Some(mounts) = &sandbox.properties.mounts else {
         return Ok(ResolvedMounts::default());
@@ -36,6 +38,7 @@ pub(super) fn resolve_mounts(
         workspace_folder_basename: basename,
         shared_volumes: &shared_volumes.to_string_lossy(),
         instance: instance_id,
+        container_env,
     };
     let resolved = mounts
         .iter()
@@ -475,6 +478,7 @@ mod tests {
             workspace_folder_basename: "app",
             shared_volumes: "/cfg/shared-volumes",
             instance: "app",
+            container_env: None,
         }
     }
 

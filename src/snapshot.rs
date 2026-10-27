@@ -533,6 +533,7 @@ fn validate_sandbox(dir: &Path, sb: &ResolvedSandbox) -> Vec<String> {
             // The sandbox name doubles as the default first-instance name; a
             // real instance name only exists at run time.
             instance: &sb.name,
+            container_env: None,
         };
         for mount in mounts {
             match mount.resolve(&ctx) {

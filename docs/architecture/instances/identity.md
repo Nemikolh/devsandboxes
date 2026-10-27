@@ -23,8 +23,8 @@ The sandbox's `identity` (`SandboxProperties::identity`):
 
 - `"host"` (default): inside you are a user with the host's uid/gid. The
   **adopted account** (`Accounts::adopted`) is `remoteUser`, else
-  `containerUser`, else the image's `USER` (`Backend::image_user`, read
-  only when neither field is set), as a name (a `user:group` spec loses its
+  `containerUser`, else the image's `USER` (from the image's facts,
+  `run::facts::accounts`, counted only when neither field is set), as a name (a `user:group` spec loses its
   group). It keeps its name, home and shell. root, `0` or nothing means
   there's no account to adopt: the plan runs as root and warns,
   recommending the `common-utils` feature (not under rootless docker,
@@ -41,14 +41,13 @@ the create-time `--user` overrides it.
 `runtime::identity::plan(probe, identity, accounts, host_ids)` is pure and
 table-tested. The probe is the runtime context's mode and SELinux flag
 ([runtimes](../runtimes.md#mode-detection)). Per mode, with
-`identity = "host"` and an account `A` (ids assumed 1000:1000,
-`identity::ASSUMED`):
+`identity = "host"` and an account `A` with ids `U:G`:
 
 | Mode | Create (`run`) | `devsbd identity apply A` | Exec as | `HOME` |
 |---|---|---|---|---|
 | rootful | `--user root` | `--remap <host uid>:<host gid>` | `A` | `A`'s own |
 | rootless docker | `--user root` | `--root-home` (home chowned to 0) | root | `A`'s home |
-| rootless podman | `--userns keep-id:uid=1000,gid=1000` | `--expect 1000:1000` (warns when `A` isn't) | `A` | `A`'s own |
+| rootless podman | `--userns keep-id:uid=U,gid=G` | `--expect U:G` (`Plan::keep_id`; warns when `A` isn't) | `A` | `A`'s own |
 | VM-backed | `--user containerUser` when set | no mode flag | `A` | `A`'s own |
 | any, `identity = "image"` | `--user containerUser` when set | not run | `remoteUser`, else `containerUser` | the image's |
 
@@ -57,6 +56,27 @@ On every plan, SELinux enforcing (`Plan::relabel`) relabels binds
 store, an ssh-agent bind) gets `z`; a `--mount` bind gets `relabel=shared`
 on podman. docker's `--mount` has no relabel option, so docker binds given
 as `--mount` are named in one warning instead.
+
+### Assumed ids
+
+`U:G` are `A`'s real ids (`Accounts::ids`), found in the built image's
+`/etc/passwd` (`identity::account`, by name or numeric uid; the image's
+facts, read once per image id: [runtimes](../runtimes.md#image-facts)).
+When the passwd can't be read (no `sh` in the image, Apple `container`)
+or lacks `A`, they're `identity::ASSUMED` (1000:1000), and `devsbd
+identity apply --expect` warns on a mismatch. Only keep-id reads them:
+rootful remaps to the host's ids whatever `A` starts at.
+
+### `${containerEnv:HOME}`
+
+The same facts give `${containerEnv:HOME}` its fallback
+(`identity::container_home`, via `run::facts::home`): the home of the
+account the container runs as (`remoteUser`, else `containerUser`, else the
+image's `USER`, whatever the identity), from the passwd, else
+`/home/<user>`, else `/root`. It doesn't follow the plan: on rootless
+docker, where execs run as root, it is still `A`'s home, which is the
+plan's `HOME` there. Resolution order and where it applies:
+[config](../config.md).
 
 `run` prints `Plan::summary` once (`identity: rootful: exec as vscode,
 remapped to 1000:1000`), then the plan's warnings and any fallback.
@@ -149,7 +169,7 @@ the helper's wrapper ([in-container](../helper/in-container.md#browser-wrapper))
 real browser at uid 1001 in a single-uid user namespace, container root
 underneath. That's the sequence `devsbd userns check --as-root` verified,
 so `On` means it works. The image's `PATH` comes from its `ENV`
-(`Backend::image_env`, read in `materialize`; `tool_env::image_path`),
+(the image's facts, `ImageFacts::env`; `tool_env::image_path`),
 since `exec -e PATH` replaces the container's; with none, Debian's default
 (`DEFAULT_PATH`).
 

@@ -80,8 +80,8 @@ Keys are devcontainer camelCase, except devsandbox extras noted in kebab-case. *
 | `features` | `{ "<ref>" = { opts } \| "version" \| true \| false }` (`false` skips it, handy to disable an inherited feature). `<ref>` is an OCI ref (`ghcr.io/devcontainers/features/node:1`) or a local folder starting with `./`, `../` or `/`, resolved against the config dir, holding `devcontainer-feature.json` + `install.sh` (e.g. `[template.base.features."./features/toolkit"]`); a missing folder or metadata file is flagged by `ls`. No https/tarball refs. Ordered by `installsAfter`, baked into `devsandbox-img-<sandbox>-feat`. Feature-declared `mounts` are applied, but a sandbox `mounts` entry on the same target replaces them, and one the host or runtime can't satisfy (missing bind source, except one under `${sharedVolumes}`, which is created; single-file bind on Apple `container`) is skipped with a warning, as is one still holding an unsupported `${…}` variable. A feature declaring `privileged: true` runs the container `--privileged` (skipped with a warning on Apple `container`, which has no such flag). Feature `entrypoint`s run at every container start, in install order, before the image's own `ENTRYPOINT` (a failing one warns in the logs and the rest continue; see `docs/architecture/instances/images-and-features.md`). Feature `capAdd` is ignored. |
 | `workspaceFolder` | Container path of the working tree. Default `/workspaces/<folder basename>`. `${…}` vars allowed. |
 | `mounts` | Docker shorthand `"source=…,target=…,type=bind[,readonly]"` or `{ type = "bind", source, target, readonly }`. Default type `bind` (needs `source`). One mount per target: the last entry wins (see merge rules). Missing bind sources are auto-created: a basename with a dot after any leading dots (`creds.json`) → file, otherwise → dir (`.zshrc` becomes a *dir*). A `volume` whose source uses `${instance}` / `${devcontainerId}` is per-instance: `rm` deletes it (`rebuild` keeps it); other named volumes are shared and never deleted. |
-| `containerEnv` | `docker run -e`. Not `${…}`-substituted. |
-| `remoteEnv` | Applied on every `exec` and lifecycle command. |
+| `containerEnv` | `docker run -e`. Values `${…}`-substituted at create (beyond the devcontainer spec, which doesn't); there `${containerEnv:X}` reads only the image's env and `HOME`, never this `containerEnv`'s other keys, so `PATH = "${containerEnv:PATH}:/opt/bin"` extends the image's `PATH`. |
+| `remoteEnv` | Applied on every `exec` and lifecycle command. Values `${…}`-substituted at create, `${containerEnv:X}` included. |
 | `containerUser` | Under `identity = "image"`: `docker run --user`. Under `"host"`: the account adopted when `remoteUser` is unset; the create user follows the runtime's mode (root on rootful and rootless docker, keep-id's user on rootless podman, `containerUser` on VM-backed runtimes). |
 | `remoteUser` | Under `identity = "image"`: `exec -u` for `exec`, lifecycle commands, VS Code attach. Under `"host"`: the account adopted (its uid/gid fitted to the host's); every exec runs as it, except on rootless docker, where execs run as root (root is the host user) with `HOME` set to its home. `remoteEnv.HOME` overrides that `HOME`. |
 | `updateRemoteUserUID` | bool; a hint for `identity` when that's unset: `false` means `identity = "image"`, `true` changes nothing. A non-bool errors. Hashed for drift. |
@@ -102,7 +102,7 @@ Not accepted at all (hard error): compose keys (`dockerComposeFile`, `service`, 
 
 ## `${…}` variables
 
-Substituted in `mounts` (source/target), `workspaceFolder`, `worktree-branch`, `shell-rc`, and `folders` (keys and values). Unknown expressions are left verbatim.
+Substituted in `mounts` (source/target), `workspaceFolder`, `worktree-branch`, `shell-rc`, `folders` (keys and values), `containerEnv` and `remoteEnv` (values). Unknown expressions are left verbatim. `${containerEnv:NAME}` only resolves at create, once the image is built: in `mounts` (a devsandbox extension; the devcontainer spec doesn't allow it there), `shell-rc`, feature mounts, `containerEnv` and `remoteEnv`; anywhere else, and in `ls`, it stays verbatim.
 
 | var | value |
 |---|---|
@@ -113,6 +113,7 @@ Substituted in `mounts` (source/target), `workspaceFolder`, `worktree-branch`, `
 | `${instance}` | persistent instance id (name at creation; stable across renames) |
 | `${devcontainerId}` | same as `${instance}` (devcontainer's stable per-container id; features name volumes with it) |
 | `${localEnv:VAR}` | host env var, empty if unset |
+| `${containerEnv:NAME}` | the container's env: the sandbox's `containerEnv`, else the image's `ENV`, else for `HOME` the adopted account's home (`remoteUser`, else `containerUser`, else the image's `USER`, as the image's `/etc/passwd` has it; else `/home/<user>`; `/root` for root or no user), the same under every runtime's plan; empty if unset. `target=${containerEnv:HOME}/.claude` lands in the user's home whoever that is |
 
 ## Services (`[services.<name>]`)
 

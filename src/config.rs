@@ -535,6 +535,7 @@ pub struct MountObject {
 
 /// Values for the devcontainer `${…}` variables devsandbox substitutes in mount
 /// sources. `localEnv:*` is read from the process environment separately.
+#[derive(Clone, Copy)]
 pub struct MountContext<'a> {
     /// Directory holding `devsandboxes.toml` (`${configDir}`).
     pub config_dir: &'a str,
@@ -550,6 +551,65 @@ pub struct MountContext<'a> {
     /// `Instance::instance_id` (the name at creation, unique forever), not the
     /// current display name, so renames never move `${instance}`-anchored paths.
     pub instance: &'a str,
+    /// What `${containerEnv:NAME}` reads, known once the image is built
+    /// (`run` only). `None` (`ls`, the snapshot) leaves it verbatim.
+    pub container_env: Option<&'a ContainerEnv>,
+}
+
+/// The env `${containerEnv:NAME}` reads at create time, in order: the
+/// sandbox's `containerEnv` (substituted), the image's `ENV`, then for
+/// `HOME` the adopted account's home (`runtime::identity::container_home`).
+/// A name none of them sets reads as empty, like an unset `localEnv:`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContainerEnv {
+    /// The sandbox's `containerEnv`, its values substituted.
+    pub sandbox: BTreeMap<String, String>,
+    /// The image's `ENV`, in order (a later entry wins).
+    pub image: Vec<(String, String)>,
+    /// `HOME` when neither sets it.
+    pub home: String,
+}
+
+impl ContainerEnv {
+    /// `name`'s value, in [`ContainerEnv`]'s order.
+    pub fn get(&self, name: &str) -> String {
+        match self.sandbox.get(name) {
+            Some(v) => v.clone(),
+            None => self.from_image(name),
+        }
+    }
+
+    /// `name` from the image's env, else the home fallback.
+    fn from_image(&self, name: &str) -> String {
+        match self.image.iter().rev().find(|(k, _)| k == name) {
+            Some((_, v)) => v.clone(),
+            None if name == "HOME" => self.home.clone(),
+            None => String::new(),
+        }
+    }
+
+    /// Build it from the image's env, the home fallback and the sandbox's
+    /// raw `containerEnv`, whose values get the other `${…}` variables of
+    /// `ctx` substituted. In those values `${containerEnv:X}` reads only the
+    /// image env and the home, as devcontainer's does: `PATH =
+    /// "${containerEnv:PATH}:…"` extends the image's `PATH`, and no order
+    /// between keys matters.
+    pub fn resolve(
+        sandbox_env: Option<&BTreeMap<String, String>>,
+        image: Vec<(String, String)>,
+        home: String,
+        ctx: &MountContext,
+    ) -> ContainerEnv {
+        let mut env = ContainerEnv { sandbox: BTreeMap::new(), image, home };
+        let image_only = MountContext { container_env: Some(&env), ..*ctx };
+        let resolved = sandbox_env
+            .into_iter()
+            .flatten()
+            .map(|(key, value)| (key.clone(), substitute(value, &image_only)))
+            .collect();
+        env.sandbox = resolved;
+        env
+    }
 }
 
 /// A mount with variables substituted and defaults applied, ready to hand to
@@ -704,6 +764,9 @@ fn resolve_var(expr: &str, ctx: &MountContext) -> Option<String> {
     if let Some(var) = expr.strip_prefix("localEnv:") {
         // devcontainer semantics: an unset host variable expands to empty.
         return Some(std::env::var(var).unwrap_or_default());
+    }
+    if let Some(var) = expr.strip_prefix("containerEnv:") {
+        return ctx.container_env.map(|env| env.get(var));
     }
     match expr {
         "configDir" => Some(ctx.config_dir.to_string()),
@@ -1937,7 +2000,71 @@ onCreateCommand = { b = "make", a = ["cargo", "build"] }
             workspace_folder_basename: "repo",
             shared_volumes: "/cfg/shared-volumes",
             instance: "repo-2",
+            container_env: None,
         }
+    }
+
+    fn image_env() -> Vec<(String, String)> {
+        vec![("PATH".into(), "/usr/bin:/bin".into()), ("LANG".into(), "C".into()), ("LANG".into(), "C.UTF-8".into())]
+    }
+
+    #[test]
+    fn container_env_order_and_home_fallback() {
+        let sandbox = BTreeMap::from([("LANG".into(), "en_US.UTF-8".into())]);
+        let env = ContainerEnv { sandbox, image: image_env(), home: "/home/node".into() };
+        assert_eq!(env.get("LANG"), "en_US.UTF-8");
+        assert_eq!(env.get("PATH"), "/usr/bin:/bin");
+        assert_eq!(env.get("HOME"), "/home/node");
+        assert_eq!(env.get("UNSET"), "");
+        // The image's HOME beats the fallback; a later image entry wins.
+        let mut image = image_env();
+        image.push(("HOME".into(), "/srv".into()));
+        let env = ContainerEnv { image, ..env };
+        assert_eq!(env.get("HOME"), "/srv");
+        assert_eq!(ContainerEnv { sandbox: BTreeMap::new(), ..env }.get("LANG"), "C.UTF-8");
+    }
+
+    #[test]
+    fn container_env_in_mounts_only_with_a_context() {
+        let m = Mount::Shorthand("type=volume,source=claude-${instance},target=${containerEnv:HOME}/.claude".into());
+        // `ls`, the snapshot: verbatim, not an error.
+        assert_eq!(m.resolve(&ctx()).unwrap().target, "${containerEnv:HOME}/.claude");
+        let env = ContainerEnv { home: "/home/vscode".into(), ..Default::default() };
+        let with = MountContext { container_env: Some(&env), ..ctx() };
+        assert_eq!(m.resolve(&with).unwrap().target, "/home/vscode/.claude");
+    }
+
+    #[test]
+    fn container_env_values_resolve_against_the_image_only() {
+        let raw = BTreeMap::from([
+            ("CLAUDE_CONFIG_DIR".into(), "${containerEnv:HOME}/.claude".into()),
+            ("TOOLS_PATH".into(), "${containerEnv:PATH}:/opt/bin".into()),
+            ("WHERE".into(), "${instance}@${configDir}".into()),
+        ]);
+        let env = ContainerEnv::resolve(Some(&raw), image_env(), "/home/node".into(), &ctx());
+        assert_eq!(env.sandbox["CLAUDE_CONFIG_DIR"], "/home/node/.claude");
+        assert_eq!(env.sandbox["TOOLS_PATH"], "/usr/bin:/bin:/opt/bin");
+        assert_eq!(env.sandbox["WHERE"], "repo-2@/cfg");
+        // Later lookups (mounts, remoteEnv) see the substituted values.
+        assert_eq!(env.get("TOOLS_PATH"), "/usr/bin:/bin:/opt/bin");
+        let none = ContainerEnv::resolve(None, Vec::new(), "/root".into(), &ctx());
+        assert!(none.sandbox.is_empty());
+    }
+
+    #[test]
+    fn container_env_values_read_the_image_not_each_other() {
+        // Its own key: the image's value (devcontainer's PATH idiom), the home.
+        let path = BTreeMap::from([
+            ("PATH".into(), "${containerEnv:PATH}:/opt/bin".into()),
+            ("HOME".into(), "${containerEnv:HOME}".into()),
+        ]);
+        let env = ContainerEnv::resolve(Some(&path), image_env(), "/root".into(), &ctx());
+        assert_eq!(env.sandbox["PATH"], "/usr/bin:/bin:/opt/bin");
+        assert_eq!(env.sandbox["HOME"], "/root");
+        // Another containerEnv key isn't seen: no order between keys.
+        let other = BTreeMap::from([("A".into(), "x".into()), ("B".into(), "pre-${containerEnv:A}".into())]);
+        let env = ContainerEnv::resolve(Some(&other), Vec::new(), "/root".into(), &ctx());
+        assert_eq!(env.sandbox["B"], "pre-");
     }
 
     #[test]

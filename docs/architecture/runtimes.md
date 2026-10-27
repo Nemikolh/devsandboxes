@@ -216,9 +216,27 @@ the cache and runs the canary even when the metadata is clear. It reaches
 
 What the mode then decides (who the container is created and exec'd as,
 the user namespace, relabeled binds, the helper's remap) is in
-[instances/identity.md](instances/identity.md). `Backend::image_user` reads
-an image's `USER` for it, `Backend::image_env` its `ENV` (a root plan's
-tool env extends the image's `PATH`).
+[instances/identity.md](instances/identity.md). It reads the image's
+facts.
+
+## Image facts
+
+What `run` reads from the built image (`state::ImageFacts`,
+`run::facts::image_facts`): `Backend::image_env` (its `ENV`: a root plan's
+tool env extends its `PATH`, `${containerEnv:…}` reads it),
+`Backend::image_user` (its `USER`, the adopted account when the config
+names none) and `Backend::image_passwd` (its `/etc/passwd`: the adopted
+account's real ids and home). The passwd comes from a throwaway container,
+like the canary (`dockerlike.rs` `passwd_argv`: `--pull=never`,
+`--network=none`, `--user 0:0`, `sh` as the entrypoint, `cat
+/etc/passwd`); exit 126/127 (no `sh`, no `cat`) reads as no passwd. Apple
+`container` has none (a VM per run).
+
+They're cached in `state.toml` (`State::image_facts`) by image id
+(`Backend::image_id`, `image inspect {{.Id}}`): content-addressed, so never
+stale. At most `IMAGE_FACTS_CAP` (32) entries; `State::remember_image_facts`
+drops the oldest by `at`. A fact that failed to read isn't cached, and
+without an id (Apple `container`) they're read on every `run`.
 
 ## Adding a runtime
 

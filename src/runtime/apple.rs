@@ -312,6 +312,17 @@ impl Backend for AppleContainer {
         parse_image_env(&out, oci_arch(std::env::consts::ARCH))
     }
 
+    /// Facts are read fresh each time: env is one inspect, and there's no
+    /// passwd to cache ([`Self::image_passwd`]).
+    fn image_id(&self, _image: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// A VM per run is too slow for one file: the fallbacks stand in.
+    fn image_passwd(&self, _image: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
+
     fn remove_volume(&self, name: &str) -> Result<bool> {
         match self.output_quiet(&["volume", "delete", name]) {
             Ok(_) => Ok(true),

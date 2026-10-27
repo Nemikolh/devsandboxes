@@ -27,20 +27,19 @@ use super::IDENTITY_LABEL;
 /// The plan for a container from `image`, said once on stderr: its summary,
 /// then its warnings and any fallback. Never fails: whatever goes wrong
 /// (probe, no helper) falls back to `identity = "image"` ([`decide_plan`]).
-/// The image's `USER` is read only when it could be the adopted account.
+/// `accounts` come from the image's facts (`facts::accounts`: its `USER`
+/// and the adopted account's real ids).
 /// Also the seccomp profile's path when [`wants_seccomp`] (`plan.seccomp`
 /// says it's there); a profile that can't be written is a warning and no
 /// profile.
-pub(super) fn plan_for(image: &str, props: &SandboxProperties, reprobe: bool, privileged: bool) -> (Plan, Option<PathBuf>) {
+pub(super) fn plan_for(
+    image: &str,
+    accounts: Accounts,
+    props: &SandboxProperties,
+    reprobe: bool,
+    privileged: bool,
+) -> (Plan, Option<PathBuf>) {
     let identity = props.identity();
-    let image_user = (identity == Identity::Host && props.container_user.is_none() && props.remote_user.is_none())
-        .then(|| backend().image_user(image).ok().flatten())
-        .flatten();
-    let accounts = Accounts {
-        container_user: props.container_user.as_deref(),
-        remote_user: props.remote_user.as_deref(),
-        image_user: image_user.as_deref(),
-    };
     let probe = probe(image, reprobe);
     let (mut plan, mut lines) = decide_plan(identity, probe, crate::devsbd::embedded(), accounts, host_ids());
     let mut seccomp = None;
@@ -222,7 +221,7 @@ pub(super) fn socket_gid(mode: Mode, mounts: &[String]) -> Option<u32> {
 /// The root exec of `devsbd identity apply` that fits the adopted account to
 /// `plan` in `container`; `None` when there's nothing to fit (`identity =
 /// "image"`, or no account to adopt). The mode flag: `--remap` to the host
-/// ids (rootful), `--expect` the assumed ids (keep-id), `--root-home`
+/// ids (rootful), `--expect` keep-id's ids (`Plan::keep_id`), `--root-home`
 /// (rootless docker), none (VM-backed: only the home, socket and volumes).
 pub(super) fn apply_argv(container: &str, plan: &Plan, socket_gid: Option<u32>, volumes: &[String]) -> Option<Vec<String>> {
     let account = plan.account.as_deref().filter(|_| plan.identity == Identity::Host)?;
@@ -230,8 +229,8 @@ pub(super) fn apply_argv(container: &str, plan: &Plan, socket_gid: Option<u32>, 
         ["exec", "-u", "root", container, crate::devsbd::BIN, "identity", "apply", account].map(String::from).into();
     if let Some(remap) = &plan.remap {
         args.extend(["--remap".into(), format!("{}:{}", remap.uid, remap.gid)]);
-    } else if plan.userns.is_some() {
-        args.extend(["--expect".into(), format!("{}:{}", identity::ASSUMED.uid, identity::ASSUMED.gid)]);
+    } else if let Some(ids) = plan.keep_id() {
+        args.extend(["--expect".into(), format!("{}:{}", ids.uid, ids.gid)]);
     } else if plan.root_home {
         args.push("--root-home".into());
     }
@@ -452,7 +451,7 @@ mod tests {
     const HOST: Ids = Ids { uid: 501, gid: 20 };
 
     fn vscode() -> Accounts<'static> {
-        Accounts { container_user: None, remote_user: Some("vscode"), image_user: None }
+        Accounts { container_user: None, remote_user: Some("vscode"), image_user: None, ids: None }
     }
 
     fn probe_of(mode: Mode) -> Result<Probe> {
@@ -585,6 +584,10 @@ mod tests {
         assert_eq!(argv(&host_plan(Mode::Rootful, false), None, &[])[8..], ["--remap", "501:20"]);
         assert_eq!(argv(&host_plan(Mode::Rootful, false), None, &[])[..8], base);
         assert_eq!(argv(&host_plan(Mode::RootlessPodman, false), None, &[])[8..], ["--expect", "1000:1000"]);
+        // The image's real ids, when its passwd had them.
+        let real = Accounts { ids: Some(Ids { uid: 1001, gid: 1002 }), ..vscode() };
+        let keep_id = identity::plan(Probe { mode: Mode::RootlessPodman, selinux: false }, Identity::Host, real, HOST);
+        assert_eq!(argv(&keep_id, None, &[])[8..], ["--expect", "1001:1002"]);
         assert_eq!(argv(&host_plan(Mode::RootlessDocker, false), None, &[])[8..], ["--root-home"]);
         assert!(argv(&host_plan(Mode::VmBacked, false), None, &[])[8..].is_empty());
         let vols = ["/v".to_string(), "/w".to_string()];

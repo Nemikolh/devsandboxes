@@ -376,9 +376,51 @@ pub struct State {
     /// user-namespace mode, so a context is probed once (until `--reprobe`).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub identity_probes: BTreeMap<String, crate::runtime::identity::Probe>,
+    /// Image id (`Backend::image_id`) -> what `run` reads from that image,
+    /// so an image is read once: at most [`IMAGE_FACTS_CAP`] entries, the
+    /// oldest dropped ([`State::remember_image_facts`]).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub image_facts: BTreeMap<String, ImageFacts>,
+}
+
+/// How many images' facts `state.toml` keeps.
+pub const IMAGE_FACTS_CAP: usize = 32;
+
+/// What `run` reads from a built image (docs/architecture/runtimes.md,
+/// *Image facts*): the account fallbacks and `${containerEnv:…}` come from
+/// it. An image id is content-addressed, so the facts never go stale.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageFacts {
+    /// `Config.Env`, in order (`Backend::image_env`).
+    #[serde(default)]
+    pub env: Vec<(String, String)>,
+    /// `Config.User` (`Backend::image_user`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// `/etc/passwd` (`Backend::image_passwd`); `None` when unreadable (no
+    /// `sh`, or Apple `container`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passwd: Option<String>,
+    /// When it was read (unix seconds, [`Instance::now`]): the cap drops the
+    /// oldest.
+    #[serde(default)]
+    pub at: u64,
 }
 
 impl State {
+    /// Cache `facts` under image `id`, then drop the oldest (by `at`)
+    /// beyond [`IMAGE_FACTS_CAP`].
+    pub fn remember_image_facts(&mut self, id: String, facts: ImageFacts) {
+        self.image_facts.insert(id, facts);
+        while self.image_facts.len() > IMAGE_FACTS_CAP {
+            let oldest = self.image_facts.iter().min_by_key(|(_, f)| f.at).map(|(id, _)| id.clone());
+            match oldest {
+                Some(id) => self.image_facts.remove(&id),
+                None => break,
+            };
+        }
+    }
+
     pub fn path() -> Result<PathBuf> {
         let base = std::env::var_os("XDG_DATA_HOME")
             .map(PathBuf::from)
@@ -524,6 +566,39 @@ mod tests {
         assert!(!text.contains("autostart_boot"), "{text}");
         let back: State = toml::from_str(&text).unwrap();
         assert!(back.autostart_boot.is_empty());
+    }
+
+    #[test]
+    fn image_facts_roundtrip_and_empty_is_omitted() {
+        let text = toml::to_string_pretty(&State::default()).unwrap();
+        assert!(!text.contains("image_facts"), "{text}");
+        let mut state = State::default();
+        let facts = ImageFacts {
+            env: vec![("PATH".into(), "/usr/bin:/bin".into()), ("OPTS".into(), "a=b".into())],
+            user: Some("node".into()),
+            passwd: Some("root:x:0:0:root:/root:/bin/sh\nnode:x:1000:1000::/home/node:/bin/sh\n".into()),
+            at: 7,
+        };
+        state.remember_image_facts("sha256:abc".into(), facts.clone());
+        state.remember_image_facts("sha256:none".into(), ImageFacts::default());
+        let back: State = toml::from_str(&toml::to_string_pretty(&state).unwrap()).unwrap();
+        assert_eq!(back.image_facts["sha256:abc"], facts);
+        assert_eq!(back.image_facts["sha256:none"], ImageFacts::default());
+    }
+
+    #[test]
+    fn image_facts_cap_drops_the_oldest() {
+        let mut state = State::default();
+        for i in 0..IMAGE_FACTS_CAP as u64 {
+            // Inserted newest first: the oldest isn't the first key.
+            state.remember_image_facts(format!("sha256:{i:02}"), ImageFacts { at: 1000 - i, ..Default::default() });
+        }
+        assert_eq!(state.image_facts.len(), IMAGE_FACTS_CAP);
+        state.remember_image_facts("sha256:new".into(), ImageFacts { at: 2000, ..Default::default() });
+        assert_eq!(state.image_facts.len(), IMAGE_FACTS_CAP);
+        let oldest = format!("sha256:{:02}", IMAGE_FACTS_CAP - 1);
+        assert!(!state.image_facts.contains_key(&oldest));
+        assert!(state.image_facts.contains_key("sha256:new") && state.image_facts.contains_key("sha256:00"));
     }
 
     #[test]

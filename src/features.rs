@@ -1180,6 +1180,7 @@ mod tests {
             workspace_folder_basename: "w",
             shared_volumes: "/cfg/shared-volumes",
             instance: "i",
+            container_env: None,
         };
         let resolved = md.mounts[0].resolve(&ctx).unwrap();
         assert_eq!(resolved.kind, "bind");

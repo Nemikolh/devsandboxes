@@ -344,6 +344,16 @@ pub trait Backend: Send + Sync {
     /// `containerEnv`, e.g. the `PATH` a root plan's tool env extends.
     fn image_env(&self, image: &str) -> Result<Vec<(String, String)>>;
 
+    /// The local image's id (content-addressed), what its cached facts are
+    /// keyed by; `None` on a runtime with nothing cheap to key by.
+    fn image_id(&self, image: &str) -> Result<Option<String>>;
+
+    /// The local image's `/etc/passwd`, read from a throwaway container
+    /// (never pulled, no network, entrypoint replaced by `sh`). `None` when
+    /// the image has no `sh` (or `cat`), or the runtime can't run one
+    /// cheaply (Apple `container`: a VM per run).
+    fn image_passwd(&self, image: &str) -> Result<Option<String>>;
+
     /// Delete a named volume. `Ok(false)` when it doesn't exist (already
     /// gone), an error when the runtime refuses (e.g. still in use).
     fn remove_volume(&self, name: &str) -> Result<bool>;
