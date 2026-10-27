@@ -78,6 +78,12 @@ pub struct HelloParams {
     /// Who's calling (`tui`, `cli`, `api:<name>`); recorded for audit later.
     #[serde(default)]
     pub client: String,
+    /// Hand off to this client's binary whatever its version, an older one
+    /// included: a fleet worker that installed its hub's version
+    /// (`fleet::update`, ADR 0042). Honored only on a local connection from
+    /// this daemon's own uid (`daemon::hello`), never on a `Worker` one.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub force: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -172,7 +178,12 @@ mod tests {
         let req: Request = serde_json::from_str(r#"{"method":"hello","params":{"version":"0.6.0","build":2,"client":"cli"}}"#).unwrap();
         assert_eq!((req.id, req.method.as_str()), (None, "hello"));
         let hello: HelloParams = serde_json::from_value(req.params).unwrap();
-        assert_eq!((hello.version.as_str(), hello.build, hello.client.as_str()), ("0.6.0", 2, "cli"));
+        assert_eq!((hello.version.as_str(), hello.build, hello.client.as_str(), hello.force), ("0.6.0", 2, "cli", false));
+        let forced = HelloParams { force: true, ..hello };
+        assert_eq!(
+            serde_json::to_value(&forced).unwrap(),
+            serde_json::json!({"version":"0.6.0","build":2,"client":"cli","force":true})
+        );
 
         let quiet = HelloResult { version: "0.6.0".into(), build: 1, protocol: PROTOCOL, handoff: false };
         let ok = Response::ok(Some(1), serde_json::to_value(&quiet).unwrap());

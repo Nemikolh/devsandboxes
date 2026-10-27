@@ -102,7 +102,13 @@ compared as `(major, minor, patch, build)`: a rebuilt dev binary counts as
 newer. When a `hello` is newer than the daemon, the daemon stops accepting
 and removes `serve.sock`, answers `handoff: true`, drains, and exits. The
 client then starts its own, which waits for the lock. Equal or older
-clients proceed.
+clients proceed, but for a **forced** hello (`HelloParams::force`), which
+hands off whatever its version: honored only on a local (`Full`)
+connection whose peer runs as the daemon's uid
+(`endpoint::peer_is_own_user`), never on a fleet hub's `Worker` one. A
+fleet worker sends it after installing its hub's version, older or newer
+([fleet](fleet.md#versions),
+[ADR 0042](../../decisions/0042-fleet-workers-follow-their-hubs-version.md)).
 
 ## Holders and idle exit
 

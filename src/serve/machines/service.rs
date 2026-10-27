@@ -712,6 +712,7 @@ fn run_relay(entry: &Entry, inner: &Inner, ctl: &Arc<Ctl>) -> (bool, Option<Stri
     }
     let why = match ended {
         Ok(agent::End::Handshake(why)) => format!("handshake failed: {why}"),
+        Ok(agent::End::Refused(why)) => format!("refused: {why}"),
         Ok(agent::End::Dead) => format!("silent for {}s", crate::devsbd::mux::KEEPALIVE_TIMEOUT.as_secs()),
         Ok(agent::End::Closed) => "closed".to_string(),
         Err(why) => why,

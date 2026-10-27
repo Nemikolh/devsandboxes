@@ -220,12 +220,53 @@ pub fn connect(dir: &Path) -> io::Result<Stream> {
     Stream::connect(socket_path(dir))
 }
 
+/// Whether the process at the other end of `stream` runs as this process's
+/// uid (`SO_PEERCRED` on Linux, `getpeereid` elsewhere); `false` when it
+/// can't be told.
+pub fn peer_is_own_user(stream: &Stream) -> bool {
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let ours = unsafe { libc::getuid() };
+    peer_uid(stream) == Some(ours)
+}
+
+#[cfg(target_os = "linux")]
+fn peer_uid(stream: &Stream) -> Option<u32> {
+    let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: `cred` and `len` are valid for writes of the sizes given; the
+    // fd is open for `stream`'s life.
+    let r = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut cred as *mut libc::ucred).cast(),
+            &mut len,
+        )
+    };
+    (r == 0).then_some(cred.uid)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn peer_uid(stream: &Stream) -> Option<u32> {
+    let (mut uid, mut gid) = (0, 0);
+    // SAFETY: both out-params are valid; the fd is open for `stream`'s life.
+    let r = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) };
+    (r == 0).then_some(uid)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn os(s: &str) -> Option<&OsStr> {
         Some(OsStr::new(s))
+    }
+
+    #[test]
+    fn a_pair_in_this_process_is_its_own_user() {
+        let (a, b) = Stream::pair().unwrap();
+        assert!(peer_is_own_user(&a) && peer_is_own_user(&b));
     }
 
     #[test]

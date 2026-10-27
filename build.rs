@@ -9,11 +9,19 @@
 //! The helper can't know its own hash, so the sha256 of the unpatched binary
 //! is written into its `BUILD_HASH` slot (devsbd/src/main.rs) before
 //! compression; `devsbd version` then reports exactly `devsbd::hash(arch)`.
+//!
+//! Also stamps this build for the fleet link's `Hello`
+//! (`serve::fleet::update::HELLO`): `DEVSANDBOX_BUILD_GIT`, the short git
+//! hash of `HEAD` (`unknown` without git or a repo: never a build failure),
+//! and `DEVSANDBOX_BUILD_KIND`, `published` when `DEVSANDBOX_PUBLISHED=1`
+//! (the release workflow's build of a tagged version) else `dev`.
 
 use sha2::{Digest, Sha256};
+use std::process::Command;
 use std::{env, fs, path::Path, path::PathBuf};
 
 fn main() {
+    stamp_build();
     println!("cargo:rerun-if-env-changed=DEVSANDBOX_DEVSBD_DIR");
     println!("cargo:rerun-if-env-changed=DEVSANDBOX_DEVSBD_REQUIRED");
     let required = env::var_os("DEVSANDBOX_DEVSBD_REQUIRED").is_some_and(|v| v == "1");
@@ -65,6 +73,41 @@ fn main() {
         // recompile the crate every build.
         write_if_changed(&out.join(format!("devsbd-{arch}.zst")), &zst);
         write_if_changed(&out.join(format!("devsbd-{arch}.sha256")), hash.as_bytes());
+    }
+}
+
+/// The fleet link's build stamp (module doc). The git hash is watched through
+/// `HEAD` and the ref it names (worktree-aware: `git rev-parse --git-path`),
+/// plus `packed-refs`, so a commit or checkout reruns this script; a path
+/// that doesn't exist isn't watched (it would be always stale).
+fn stamp_build() {
+    println!("cargo:rerun-if-env-changed=DEVSANDBOX_PUBLISHED");
+    let published = env::var_os("DEVSANDBOX_PUBLISHED").is_some_and(|v| v == "1");
+    println!("cargo:rustc-env=DEVSANDBOX_BUILD_KIND={}", if published { "published" } else { "dev" });
+    let git = |args: &[&str]| -> Option<String> {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(env::var_os("CARGO_MANIFEST_DIR")?)
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        let text = String::from_utf8(out.stdout).ok()?;
+        out.status.success().then(|| text.trim().to_string()).filter(|t| !t.is_empty())
+    };
+    let hash = git(&["rev-parse", "--short=12", "HEAD"])
+        .filter(|h| h.bytes().all(|b| b.is_ascii_hexdigit()))
+        .unwrap_or_else(|| "unknown".into());
+    println!("cargo:rustc-env=DEVSANDBOX_BUILD_GIT={hash}");
+    let mut watched = vec![git(&["rev-parse", "--git-path", "HEAD"]), git(&["rev-parse", "--git-path", "packed-refs"])];
+    if let Some(head_ref) = git(&["symbolic-ref", "-q", "HEAD"]) {
+        watched.push(git(&["rev-parse", "--git-path", &head_ref]));
+    }
+    let root = env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from).unwrap_or_default();
+    for path in watched.into_iter().flatten() {
+        let path = root.join(path);
+        if path.exists() {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
     }
 }
 

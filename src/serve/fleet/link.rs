@@ -64,8 +64,9 @@ pub struct Spec {
     pub channel: u8,
     /// The cap the answerer advertises and the opener requires.
     pub cap: u32,
-    /// What both ends say in their `Hello` (informational: the frame
-    /// protocol's `VERSION` is what has to match).
+    /// What both ends say in their `Hello` (the frame protocol's `VERSION`
+    /// is what has to match; a fleet worker follows the build its hub says
+    /// here, `fleet::update`).
     pub hello: &'static str,
 }
 
@@ -256,6 +257,9 @@ pub fn opener_with(
 pub enum End {
     /// The link never came up: no sentinel, or the `Hello`s failed.
     Handshake(String),
+    /// `answerer_with`'s `on_ready` turned the peer down, with why: nothing
+    /// was served.
+    Refused(String),
     /// No frame for `mux::KEEPALIVE_TIMEOUT`: `on_dead` ran.
     Dead,
     /// The stream ended (the far end exited, the transport closed).
@@ -279,20 +283,34 @@ pub fn answerer(
     on_ready: impl FnOnce(),
     on_dead: impl FnOnce() + Send + 'static,
 ) -> End {
-    answerer_with(spec, reader, writer, open, None, on_ready, on_dead)
+    answerer_with(
+        spec,
+        reader,
+        writer,
+        open,
+        None,
+        |_| {
+            on_ready();
+            Ok(())
+        },
+        on_dead,
+    )
 }
 
 /// [`answerer`], with `transfer`: `caps::TRANSFER` advertised, the opener's
 /// `Open { TRANSFER }`s handed to its receivers, and its outlet set to this
 /// link from the `Hello`s until it ends (when the opener advertised
-/// `caps::TRANSFER`).
+/// `caps::TRANSFER`). `on_ready` gets the opener's `Hello` (its `hash` is
+/// the far end's `spec.hello`); an `Err` ends the link at once, before
+/// anything is served, as [`End::Refused`] (a fleet worker that must first
+/// follow its hub's version, `fleet::worker`).
 pub fn answerer_with(
     spec: &Spec,
     mut reader: impl Read,
     mut writer: impl Write + Send + 'static,
     open: impl Fn() -> Option<Conn>,
     transfer: Option<&AnswererTransfer>,
-    on_ready: impl FnOnce(),
+    on_ready: impl FnOnce(&proto::Peer) -> Result<(), String>,
     on_dead: impl FnOnce() + Send + 'static,
 ) -> End {
     let mut noise = None;
@@ -313,7 +331,9 @@ pub fn answerer_with(
         Ok(peer) => peer,
         Err(e) => return End::Handshake(e.to_string()),
     };
-    on_ready();
+    if let Err(why) = on_ready(&peer) {
+        return End::Refused(why);
+    }
     let mux = Mux::new(writer);
     let outlet = transfer.filter(|_| peer.caps & caps::TRANSFER != 0).map(|t| &t.outlet);
     if let Some(outlet) = outlet {
@@ -592,7 +612,7 @@ mod tests {
         let path = socket.clone();
         std::thread::spawn(move || opener_with(&LINK, o_r, o_w, &path, Some(ours), |_| Ok(())));
         let answering = Arc::clone(&theirs);
-        std::thread::spawn(move || answerer_with(&LINK, a_r, a_w, || None, Some(&answering), || {}, || {}));
+        std::thread::spawn(move || answerer_with(&LINK, a_r, a_w, || None, Some(&answering), |_| Ok(()), || {}));
         wait_for(|| UnixStream::connect(&xfer).is_ok(), "the transfer socket accepts");
 
         // Hub → worker: bigger than a window, so credit has to flow.
@@ -623,6 +643,26 @@ mod tests {
         let got = hub_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(got.path, hub_dir.join("in/cfg.tar"));
         assert_eq!(std::fs::read(&got.path).unwrap(), body);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The answerer's `on_ready` sees the opener's `Hello` and may turn the
+    /// link down before anything is served.
+    #[test]
+    fn the_answerer_may_refuse_the_opener_it_hears() {
+        let dir = scratch("fleet-refuse");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a_r, o_w) = std::io::pipe().unwrap();
+        let (o_r, a_w) = std::io::pipe().unwrap();
+        let socket = dir.join("fleet-w.sock");
+        let opener = std::thread::spawn(move || opener(&LINK, o_r, o_w, &socket, |_| Ok(())));
+        let end = answerer_with(&LINK, a_r, a_w, || None, None, |peer| Err(format!("not {}", peer.hash)), || {});
+        match end {
+            End::Refused(why) => assert_eq!(why, format!("not {}", LINK.hello)),
+            other => panic!("{other:?}"),
+        }
+        // The answerer's ends are dropped: the opener sees the link close.
+        opener.join().unwrap().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

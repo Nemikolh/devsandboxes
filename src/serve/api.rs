@@ -2502,7 +2502,7 @@ mod tests {
         };
         let added = Added { id: 1, local: "127.0.0.1:3000".into(), target: "web:3000".into() };
         let removed = ForwardRemoved { ok: true, local: "127.0.0.1:3000".into(), configured: false };
-        let hello = HelloParams { version: "0.6.0".into(), build: 1, client: "api:x".into() };
+        let hello = HelloParams { version: "0.6.0".into(), build: 1, client: "api:x".into(), force: false };
         let hello_result = HelloResult { version: "0.6.0".into(), build: 1, protocol: 1, handoff: true };
         let error = ErrorBody { code: "failed".into(), message: "m".into(), data: Some(json!({"exit": 1})) };
 

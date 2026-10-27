@@ -17,9 +17,15 @@ shipped: keep-alive, offered links always held, `remotes.json`
 ls`; 2a (`TRANSFER`) shipped: `channel::TRANSFER` both ways on the fleet
 link (`fleet-<name>.transfer.sock` hub → worker, the answerer's `Outlet`
 worker → hub), `serve::fleet::transfer` (header line, `ready`, body, `ok` /
-`error`), receivers by kind with none registered yet
-([fleet](../../architecture/daemon/fleet.md), ADR
-[0041](../../decisions/0041-fleet-workers-dial-their-hub.md)); the rest
+`error`), receivers by kind with none registered yet; 2b (self-update)
+shipped: the link `Hello` says `<semver> <git> <published|dev>`
+(`fleet::update::HELLO`, `build.rs`), the worker follows a published hub
+build (download, `INSTALL` run locally, forced handoff:
+`HelloParams::force`), inert until `release.yml` sets
+`DEVSANDBOX_PUBLISHED=1`
+([fleet](../../architecture/daemon/fleet.md), ADRs
+[0041](../../decisions/0041-fleet-workers-dial-their-hub.md),
+[0042](../../decisions/0042-fleet-workers-follow-their-hubs-version.md)); the rest
 is design. Builds on [machines](../../architecture/daemon/machines.md)
 and supersedes nothing yet; [machines-next](machines-next.md) items 2 and 3
 fold into step 8 here, its parked auto-update and PTY attach into steps

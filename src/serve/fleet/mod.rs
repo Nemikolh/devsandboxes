@@ -19,6 +19,8 @@
 //!   connection table).
 //! - `transfer`: one bulk transfer on the link's `TRANSFER` streams (either
 //!   way) and each end's receivers by kind.
+//! - `update`: the build each end says in its `Hello`, and how a worker
+//!   follows its hub's (download, install, forced handoff).
 
 pub mod lend;
 pub mod lender;
@@ -26,6 +28,7 @@ pub mod lent;
 pub mod link;
 pub mod offer;
 pub mod transfer;
+pub mod update;
 pub mod worker;
 
 use crate::devsbd::proto::{caps, channel};
@@ -36,7 +39,8 @@ use crate::devsbd::proto::{caps, channel};
 /// (`relay::write_sentinel`), written by the worker's answer, so a stream
 /// reads as an ssh relay does to `machines::link::handshake`. Both ends
 /// also carry `TRANSFER` streams ([`transfer`], `link::opener_with` /
-/// `link::answerer_with`).
+/// `link::answerer_with`). Its `Hello` hash is this build
+/// ([`update::HELLO`]), which a worker follows (`worker`).
 pub const LINK: link::Spec = link::Spec {
     name: "fleet link",
     serves: "API",
@@ -44,5 +48,5 @@ pub const LINK: link::Spec = link::Spec {
     sentinel_version: 1,
     channel: channel::API,
     cap: caps::API,
-    hello: env!("CARGO_PKG_VERSION"),
+    hello: update::HELLO,
 };

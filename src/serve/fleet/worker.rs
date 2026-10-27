@@ -12,6 +12,13 @@
 //! `TRANSFER` streams the hub opens go to the daemon's `Receivers`;
 //! [`Lending::open_transfer`] opens one toward the hub while a link is up.
 //!
+//! Before it serves anything, each link compares the hub's build (its
+//! `Hello`) with this one's (`update::decide`): another published build is
+//! downloaded, installed and handed off to (`update::update`), the link
+//! dropped meanwhile; another dev build drops the link, saying why. Either
+//! way the next attempt is after the backoff, so a failed update is retried
+//! at the backoff's pace, never in a loop.
+//!
 //! The transport is injectable ([`Transport`]): production spawns ssh
 //! (`ssh::spawn`), tests hand back one end of a socket pair whose other end
 //! is the hub's `fleet-link` in-process.
@@ -27,6 +34,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 
 use super::transfer::Receivers;
+use super::update::{self, Build, Decision, Steps};
 use super::{LINK, link};
 use crate::devsbd::mux::Conn;
 use crate::serve::endpoint::Stream;
@@ -95,12 +103,14 @@ struct Ctl {
     /// The links' `TRANSFER` side: the daemon's receivers, the live link's
     /// outlet.
     transfer: Option<link::AnswererTransfer>,
+    /// How this worker follows its hub's version.
+    update: Option<Arc<dyn Steps>>,
 }
 
 impl Lending {
     /// Start lending to `hub` as `name`, offering fleet root `root`
     /// (`draining`: offering `--drain`); the hub's `TRANSFER` streams go to
-    /// `receivers`.
+    /// `receivers`; a hub on another build is followed through `update`.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         hub: String,
@@ -110,12 +120,13 @@ impl Lending {
         transport: Transport,
         open: Open,
         receivers: Arc<Receivers>,
+        update: Arc<dyn Steps>,
         timing: Timing,
         log: fn(&str),
     ) -> Result<Lending> {
         link_argv(&hub, &name, &root, draining)?;
         let transfer = Some(link::AnswererTransfer { receivers, outlet: Default::default() });
-        let ctl = Arc::new(Ctl { transfer, ..Ctl::default() });
+        let ctl = Arc::new(Ctl { transfer, update: Some(update), ..Ctl::default() });
         ctl.draining.store(draining, Ordering::SeqCst);
         let thread = {
             let ctl = Arc::clone(&ctl);
@@ -219,25 +230,43 @@ fn run_link(hub: &str, name: &str, mut duplex: Duplex, open: &Open, ctl: &Ctl, l
         *current = duplex.stream.try_clone().ok();
     }
     let up = AtomicBool::new(false);
+    let wanted: Mutex<Option<String>> = Mutex::new(None);
     let end = link::answerer_with(
         &LINK,
         reader,
         writer,
         || open(),
         ctl.transfer.as_ref(),
-        || {
+        |peer| {
+            let theirs = Build::parse(&peer.hash);
+            match update::decide(&Build::current(), &theirs) {
+                Decision::Same => {}
+                Decision::Download { version } => {
+                    *wanted.lock().unwrap() = Some(version);
+                    return Err(format!("the hub runs {}: updating", theirs.label()));
+                }
+                Decision::DevBuild => return Err(update::dev_build_reason(&theirs)),
+            }
             up.store(true, Ordering::Relaxed);
             ctl.set_status(Status::Connected);
             log(&format!("fleet: lending to {hub} as {name}"));
+            Ok(())
         },
         move || {
             let _ = killer.shutdown(Shutdown::Both);
         },
     );
     ctl.current.lock().unwrap().take();
+    let wanted = wanted.into_inner().unwrap();
+    if let (Some(version), false) = (wanted, ctl.stopped()) {
+        // The ssh goes first: nothing is served while this binary changes.
+        duplex.peer.close();
+        follow(hub, &version, ctl, log);
+        return false;
+    }
     if !ctl.stopped() {
         let why = match end {
-            link::End::Handshake(why) => why,
+            link::End::Handshake(why) | link::End::Refused(why) => why,
             link::End::Dead => "no frame from the hub: link dead".into(),
             link::End::Closed => "link closed".into(),
         };
@@ -250,9 +279,129 @@ fn run_link(hub: &str, name: &str, mut duplex: Duplex, open: &Open, ctl: &Ctl, l
     up.load(Ordering::Relaxed)
 }
 
+/// Install the hub's published `version` and hand off to it
+/// (`update::update`); the outcome is the status `lend.get` shows until the
+/// daemon hands off or the next attempt.
+fn follow(hub: &str, version: &str, ctl: &Ctl, log: fn(&str)) {
+    let Some(steps) = &ctl.update else { return };
+    log(&format!("fleet: hub {hub} runs devsandbox {version}: updating this one"));
+    ctl.set_status(Status::Retrying(format!("updating to {version}")));
+    let consts = (std::env::consts::OS, std::env::consts::ARCH);
+    let why = match update::update(steps.as_ref(), version, consts.0, consts.1, &std::env::temp_dir()) {
+        Ok(()) => format!("updated to {version}: handing off"),
+        Err(e) => format!("update to {version} failed: {e:#}"),
+    };
+    log(&format!("fleet: {why}"));
+    ctl.set_status(Status::Retrying(why));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::serve::fleet::update::tests::Fake;
+
+    /// A transport whose every link is a hub `fleet-link` saying `hello` in
+    /// its `Hello` (its opener in-process, its socket under `dir`); the
+    /// worker's answer is never served.
+    fn hub_saying(hello: &'static str, dir: PathBuf) -> Transport {
+        Arc::new(move |_: &[OsString]| {
+            let (worker, hub) = std::os::unix::net::UnixStream::pair()?;
+            let socket = dir.join("fleet-lap.sock");
+            std::thread::spawn(move || {
+                let spec = link::Spec { hello, ..LINK };
+                let (r, w) = (hub.try_clone().unwrap(), hub);
+                link::opener(&spec, r, w, &socket, |_| Ok(()))
+            });
+            Ok(Duplex::socket(worker))
+        })
+    }
+
+    fn lend_to(hello: &'static str, tag: &str, steps: Arc<Fake>) -> (Lending, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("dsv-worker-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let timing = Timing { backoff: Duration::from_millis(5), backoff_cap: Duration::from_millis(10), ..Timing::default() };
+        let lending = Lending::spawn(
+            "hub".into(),
+            "lap".into(),
+            "/fleet/hub".into(),
+            false,
+            hub_saying(hello, dir.clone()),
+            Arc::new(|| -> Option<Conn> { panic!("nothing is served to a hub on another build") }),
+            Arc::new(Receivers::new(|_| {})),
+            steps,
+            timing,
+            |_| {},
+        )
+        .unwrap();
+        (lending, dir)
+    }
+
+    fn wait_status(lending: &Lending, pred: impl Fn(&str) -> bool) -> String {
+        let start = std::time::Instant::now();
+        loop {
+            if let Status::Retrying(why) = lending.status()
+                && pred(&why)
+            {
+                return why;
+            }
+            assert!(start.elapsed() < Duration::from_secs(10), "status: {:?}", lending.status());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn has_release() -> bool {
+        update::release_target(std::env::consts::OS, std::env::consts::ARCH).is_some()
+    }
+
+    /// A hub on another published build: the worker installs it and asks
+    /// for the handoff, a downgrade included; nothing is served meanwhile.
+    #[test]
+    fn a_published_hub_build_is_installed_and_handed_off_to() {
+        let steps = Arc::new(Fake::reporting("0.0.1"));
+        let (lending, dir) = lend_to("0.0.1 0123abcd published", "follow", Arc::clone(&steps));
+        if has_release() {
+            assert_eq!(wait_status(&lending, |w| w.starts_with("updated")), "updated to 0.0.1: handing off");
+            assert!(steps.calls().iter().any(|c| c == "handoff "), "{:?}", steps.calls());
+            assert!(steps.calls()[0].contains("/releases/download/v0.0.1/devsandbox-0.0.1-"));
+        } else {
+            wait_status(&lending, |w| w.contains("no devsandbox release is built for"));
+        }
+        drop(lending);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A failed download stops offering with why, and is retried at the
+    /// backoff's pace on the next link.
+    #[test]
+    fn a_failed_update_stops_offering_and_is_retried() {
+        let steps = Arc::new(Fake { fail: Some("fetch"), ..Fake::reporting("0.0.1") });
+        let (lending, dir) = lend_to("0.0.1 0123abcd published", "fail", Arc::clone(&steps));
+        let why = wait_status(&lending, |w| w.starts_with("update to 0.0.1 failed: "));
+        if has_release() {
+            assert!(why.ends_with("fetch broke"), "{why}");
+            let start = std::time::Instant::now();
+            while steps.calls().len() < 2 {
+                assert!(start.elapsed() < Duration::from_secs(10), "retried");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        assert!(!steps.calls().iter().any(|c| c.starts_with("install") || c.starts_with("handoff")));
+        drop(lending);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A hub on another dev build: no update, the reason shown.
+    #[test]
+    fn a_dev_hub_build_stops_offering() {
+        let steps = Arc::new(Fake::reporting("0.0.1"));
+        let (lending, dir) = lend_to("0.0.1 0123abcd dev", "dev", Arc::clone(&steps));
+        let why = wait_status(&lending, |w| w.starts_with("dev build"));
+        assert!(why.starts_with("dev build: needs fleet step 2c (the hub runs 0.0.1 (dev, 0123abcd)"), "{why}");
+        assert!(steps.calls().is_empty());
+        drop(lending);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn the_link_argv() {
@@ -498,6 +647,13 @@ mod tests {
                 other => panic!("{other:?}"),
             }
             drop(raw);
+            // Nor a forced one: that's for this user's local clients only.
+            let mut raw = offered_stream(&hub_dir);
+            match client::hello_with(&mut raw, &newer, "hub", true).unwrap() {
+                Hello::Ready(r) => assert!(!r.handoff),
+                other => panic!("{other:?}"),
+            }
+            drop(raw);
             assert!(!worker_daemon.is_finished());
 
             // `lend.*` on a local connection: the link's state, and a change
@@ -541,7 +697,7 @@ mod tests {
         });
         let timing = Timing { backoff: Duration::from_millis(5), backoff_cap: Duration::from_millis(10), ..Timing::default() };
         let lending =
-            Lending::spawn("hub".into(), "lap".into(), "/fleet/hub".into(), false, transport, Arc::new(|| None), Arc::new(Receivers::new(|_| {})), timing, |_| {}).unwrap();
+            Lending::spawn("hub".into(), "lap".into(), "/fleet/hub".into(), false, transport, Arc::new(|| None), Arc::new(Receivers::new(|_| {})), Arc::new(Fake::default()), timing, |_| {}).unwrap();
         let start = std::time::Instant::now();
         while tries.load(Ordering::SeqCst) < 3 {
             assert!(start.elapsed() < Duration::from_secs(5), "retried");

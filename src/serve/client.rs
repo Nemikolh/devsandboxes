@@ -389,7 +389,13 @@ pub(crate) fn connect_with(
 /// [`Hello::Closed`]; an error response is an error. Reads byte by byte so
 /// nothing past the reply's newline is consumed before [`Conn`] buffers.
 pub(crate) fn hello(stream: &mut Stream, version: &Version, client: &str) -> Result<Hello> {
-    let params = HelloParams { version: version.semver.clone(), build: version.build, client: client.into() };
+    hello_with(stream, version, client, false)
+}
+
+/// [`hello`], with `force` (`HelloParams::force`): ask the daemon to hand
+/// off to this binary whatever its version.
+pub(crate) fn hello_with(stream: &mut Stream, version: &Version, client: &str, force: bool) -> Result<Hello> {
+    let params = HelloParams { version: version.semver.clone(), build: version.build, client: client.into(), force };
     let request = Request { id: Some(0), method: "hello".into(), params: serde_json::to_value(params)? };
     let mut line = serde_json::to_vec(&request)?;
     line.push(b'\n');

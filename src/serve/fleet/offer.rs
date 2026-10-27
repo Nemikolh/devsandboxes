@@ -46,7 +46,8 @@ pub fn call(method: &str, params: Value, ctx: &Ctx) -> Option<Answer> {
 #[derive(Deserialize)]
 struct OfferParams {
     worker: String,
-    /// The worker's devsandbox semver (its link `Hello`), for the log.
+    /// The worker's build, its link `Hello` (`<semver> <git>
+    /// <published|dev>`, `fleet::update::HELLO`), for the log.
     version: String,
     /// The worker's canonical fleet root (a path there): the entry's one
     /// root, which this hub's link watches.

@@ -150,6 +150,10 @@ pub struct Options {
     /// How the lending thread reaches its hub; `None` is ssh. Tests link an
     /// in-process hub.
     pub lend_transport: Option<fleet::worker::Transport>,
+    /// How the lending thread follows its hub's version; `None` is the
+    /// release download and a forced handoff on this daemon's socket
+    /// (`fleet::update::Release`). Tests fake it.
+    pub lend_update: Option<Arc<dyn fleet::update::Steps>>,
     /// The env a hub's verbs run with; `None` is this process's.
     pub lend_env: Option<BTreeMap<String, String>>,
 }
@@ -175,6 +179,7 @@ impl Options {
             helper: None,
             lend: None,
             lend_transport: None,
+            lend_update: None,
             lend_env: None,
         }
     }
@@ -192,7 +197,7 @@ pub enum Exit {
     /// Another daemon holds the lock and answers: nothing to do.
     AlreadyRunning,
     Idle,
-    /// A newer client asked; it starts the successor.
+    /// A newer client asked, or a forced hello; it starts the successor.
     Handoff,
     /// A client sent `shutdown` (`serve install`, before the service manager
     /// starts its own daemon).
@@ -216,7 +221,7 @@ pub fn serve(socket_dir: Option<PathBuf>, keep_alive: bool) -> Result<()> {
     match run(&dir, &opts)? {
         Exit::AlreadyRunning => {}
         Exit::Idle => log("idle, exiting"),
-        Exit::Handoff => log("handed off to a newer version, exiting"),
+        Exit::Handoff => log("handed off to a newer (or forced) binary, exiting"),
         Exit::Shutdown => log("shutdown requested, exiting"),
     }
     Ok(())
@@ -350,7 +355,7 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
         let _ = shared.helper.set(client);
     }
     let watcher = Watcher::spawn(&shared, host.as_ref().map(Host::changes));
-    start_lending(opts, &shared);
+    start_lending(dir, opts, &shared);
     let exit = loop {
         if let Some(exit) = *shared.stop.lock().unwrap() {
             break exit;
@@ -416,7 +421,7 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
 /// and each `API` stream from the hub is a `Worker` connection
 /// ([`Shared::open_lent`]). Without a `lend.toml` path (no data dir) it's
 /// logged and `lend.*` fail.
-fn start_lending(opts: &Options, shared: &Arc<Shared>) {
+fn start_lending(dir: &Path, opts: &Options, shared: &Arc<Shared>) {
     let path = match &opts.lend {
         Some(path) => path.clone(),
         None => match fleet::lend::path() {
@@ -429,6 +434,10 @@ fn start_lending(opts: &Options, shared: &Arc<Shared>) {
     };
     let env = opts.lend_env.clone().unwrap_or_else(|| super::verbs_client::caller_env(std::env::vars_os()));
     let transport = opts.lend_transport.clone().unwrap_or_else(fleet::worker::ssh_transport);
+    let update = opts
+        .lend_update
+        .clone()
+        .unwrap_or_else(|| Arc::new(fleet::update::Release { socket_dir: dir.to_path_buf() }));
     let timing = opts.machine_timing;
     // What the hub may send this worker: no kind yet (fleet step 2c adds
     // the hub's binary).
@@ -439,7 +448,7 @@ fn start_lending(opts: &Options, shared: &Arc<Shared>) {
         let scope = Arc::new(lent::Scope { hub: start.hub.clone(), root: start.root.clone(), env: env.clone() });
         let weak = weak.clone();
         let open: fleet::worker::Open = Arc::new(move || weak.upgrade()?.open_lent(&scope));
-        fleet::worker::Lending::spawn(start.hub, start.name, start.root, start.draining, transport.clone(), open, receivers.clone(), timing, log)
+        fleet::worker::Lending::spawn(start.hub, start.name, start.root, start.draining, transport.clone(), open, receivers.clone(), update.clone(), timing, log)
     });
     let lender = shared.lender.get_or_init(|| fleet::lender::Lender::new(path, link::hostname(), spawn, log));
     lender.start();
@@ -1038,6 +1047,9 @@ enum Table {
 struct ConnState {
     id: u64,
     table: Table,
+    /// The peer runs as this daemon's uid (`endpoint::peer_is_own_user`):
+    /// what a forced hello needs, besides the `Full` table.
+    own_user: bool,
     /// The hello's `client` (`tui`, `cli`, `api:<name>`), for the log.
     client: String,
     /// What the store records as the client of this connection's user ops
@@ -1063,6 +1075,7 @@ impl ConnState {
 fn serve_conn(id: u64, stream: Stream, shared: &Shared, out: Arc<Outbox>, table: Table) {
     let mut conn = ConnState {
         id,
+        own_user: endpoint::peer_is_own_user(&stream),
         table,
         client: String::new(),
         audit: api::audit_client(""),
@@ -1473,12 +1486,22 @@ fn hello(id: Option<u64>, params: Value, shared: &Shared, conn: &mut ConnState) 
     conn.audit = api::audit_client(&params.client);
     let client = Version { semver: params.version, build: params.build };
     // A fleet hub's hello never hands this daemon off: only a local client's
-    // newer binary replaces it.
-    let handoff = matches!(conn.table, Table::Full) && client.is_newer_than(&shared.version);
+    // newer binary replaces it, or any binary of this user's that forces it
+    // (a fleet worker following its hub's version, a downgrade included:
+    // ADR 0042).
+    let local = matches!(conn.table, Table::Full);
+    let forced = params.force && local && conn.own_user;
+    if params.force && !forced {
+        log(&format!("{}: refused a forced handoff (not a local client of this user)", conn.label()));
+    }
+    let handoff = local && (forced || client.is_newer_than(&shared.version));
     if handoff {
         log(&format!(
-            "client `{}` has version {} build {}: handing off",
-            params.client, client.semver, client.build
+            "client `{}` has version {} build {}: handing off{}",
+            params.client,
+            client.semver,
+            client.build,
+            if forced { " (forced)" } else { "" }
         ));
         shared.begin_stop(Exit::Handoff);
     }
@@ -1571,6 +1594,8 @@ pub(crate) mod tests {
             // writes its own.
             lend: Some(std::env::temp_dir().join(format!("dsv-lend-{}", std::process::id())).join("lend.toml")),
             lend_transport: None,
+            // Never a download or a handoff of this test binary.
+            lend_update: Some(Arc::new(crate::serve::fleet::update::tests::Fake::default())),
             lend_env: None,
         }
     }
@@ -1656,6 +1681,21 @@ pub(crate) mod tests {
         assert!(started.elapsed() < DRAIN_TIMEOUT);
         let mut buf = [0u8; 1];
         assert_eq!(idle_client.read(&mut buf).unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A forced hello from this user's local client hands off even when the
+    /// client is older (a fleet worker's downgrade).
+    #[test]
+    fn a_forced_hello_hands_off_to_an_older_binary() {
+        let dir = scratch("forced");
+        let daemon = spawn_daemon(&dir, opts(5, 60_000));
+        drop(hello_at(&dir, &v(5)));
+        let mut stream = endpoint::connect(&dir).unwrap();
+        let older = Version { semver: "0.5.0".into(), build: 1 };
+        let answer = client::hello_with(&mut stream, &older, "fleet-update", true).unwrap();
+        assert!(matches!(answer, Hello::Handoff), "{answer:?}");
+        assert_eq!(daemon.join().unwrap().unwrap(), Exit::Handoff);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

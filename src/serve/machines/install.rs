@@ -110,13 +110,17 @@ pub fn parse_check(stdout: &str) -> Result<Remote> {
     let (Some(os), Some(arch)) = (os, arch) else {
         bail!("the check reported no `uname`");
     };
-    let version = version.and_then(|v| {
-        let semver = v.strip_prefix("devsandbox ")?.trim();
-        (!semver.is_empty()).then(|| semver.to_string())
-    });
+    let version = version.and_then(|v| version_of(&v));
     let path = path.filter(|p| !p.is_empty());
     let off_path = path.is_some() && off_path.is_some();
     Ok(Remote { os, arch, path, off_path, version })
+}
+
+/// The semver in a `devsandbox --version` line (`devsandbox 0.7.0`); `None`
+/// for anything else.
+pub fn version_of(line: &str) -> Option<String> {
+    let semver = line.trim().strip_prefix("devsandbox ")?.trim();
+    (!semver.is_empty()).then(|| semver.to_string())
 }
 
 /// [`INSTALL`]'s stdout: the installed path.
@@ -209,6 +213,17 @@ pub fn check(entry: &Entry, program: Option<&str>) -> Result<Remote> {
 pub fn install(entry: &Entry, dest: Option<&str>, binary: &Path) -> Result<String> {
     let argv = ssh::script_argv(entry, INSTALL, &[dest.unwrap_or("")])?;
     install_with(&argv, binary).with_context(|| format!("cannot install devsandbox on {}", entry.label()))
+}
+
+/// [`INSTALL`] run on this host (`sh -c INSTALL sh <dest>`), `binary` on its
+/// stdin: the same temp file, `--version` check and rename over `dest`.
+/// For a fleet worker following its hub (`fleet::update`).
+pub fn install_local(dest: &Path, binary: &Path) -> Result<String> {
+    install_with(&local_install_argv(dest), binary).with_context(|| format!("cannot install devsandbox at {}", dest.display()))
+}
+
+fn local_install_argv(dest: &Path) -> Vec<OsString> {
+    vec!["sh".into(), "-c".into(), INSTALL.into(), "sh".into(), dest.into()]
 }
 
 fn check_with(argv: &[OsString]) -> Result<Remote> {
@@ -454,5 +469,26 @@ mod tests {
         // Nor over a directory.
         let err = b.install(b.odd.to_str().unwrap(), &b.binary()).unwrap_err();
         assert!(format!("{err:#}").contains("is a directory"), "{err:#}");
+    }
+
+    /// The same script run on this host, over a scratch file (never this
+    /// test binary).
+    #[test]
+    fn install_local_replaces_the_dest_in_place() {
+        let b = Machine::new("local");
+        let dest = b.odd.join("devsandbox");
+        std::fs::write(&dest, "old").unwrap();
+        assert_eq!(install_local(&dest, &b.binary()).unwrap(), dest.to_str().unwrap());
+        let out = Command::new(&dest).arg("--version").output().unwrap();
+        assert_eq!(version_of(&String::from_utf8_lossy(&out.stdout)).as_deref(), Some("9.9.9"));
+        assert!(temp_files(&b.odd).is_empty());
+        assert_eq!(local_install_argv(&dest)[..4], ["sh", "-c", INSTALL, "sh"].map(OsString::from));
+    }
+
+    #[test]
+    fn versions_parse() {
+        assert_eq!(version_of("devsandbox 0.7.0\n").as_deref(), Some("0.7.0"));
+        assert_eq!(version_of("devsandbox \n"), None);
+        assert_eq!(version_of("error: unexpected"), None);
     }
 }

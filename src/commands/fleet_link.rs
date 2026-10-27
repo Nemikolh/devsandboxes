@@ -147,7 +147,7 @@ mod tests {
                 Some(duplex.stream.into())
             };
             let transfer = link::AnswererTransfer { receivers: Arc::new(Receivers::new(|_| {})), outlet: Default::default() };
-            link::answerer_with(&fleet::LINK, r, w, open, Some(&transfer), || {}, || {})
+            link::answerer_with(&fleet::LINK, r, w, open, Some(&transfer), |_| Ok(()), || {})
         })
     }
 

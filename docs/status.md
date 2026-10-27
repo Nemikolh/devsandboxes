@@ -306,6 +306,22 @@ limitation means editing this file in the same commit.
   `relay::SessionEnv`), so `PATH` additions from shell profiles are
   missing; fix: capture a login env once when lending starts.
   → [fleet](architecture/daemon/fleet.md#the-worker-table); `fleet::lent::admit`
+- No build is marked published yet: the release workflow doesn't set
+  `DEVSANDBOX_PUBLISHED=1`, so every hub says `dev` and a worker's
+  download path never runs; a worker on another build than its hub stops
+  offering with "dev build: needs fleet step 2c". Dev builds from the same
+  commit with different local changes count as the same build (the git
+  hash has no dirty marker).
+  → [fleet](architecture/daemon/fleet.md#versions); `build.rs` `stamp_build`, `fleet::update::decide`
+- A worker that won't follow its hub (dev build, failed update) is seen by
+  the hub only as an offered machine whose link is gone (`unreachable`);
+  the reason is on the worker (`lend.get`, `serve.log`).
+  → [fleet](architecture/daemon/fleet.md#versions); `fleet::worker` `run_link`
+- After a worker's downgrade, a dashboard or other long-lived client still
+  running the replaced, newer binary hands the new daemon off again at its
+  next hello (its version is newer), restarting the older binary each
+  time until that client is restarted.
+  → [role](architecture/daemon/role.md#version-handoff); `daemon::hello`
 
 ### helper
 

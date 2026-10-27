@@ -11,7 +11,9 @@ worker policy and `lend.*` with its CLI, `devsandbox lend` and
 ([ADR 0041](../../decisions/0041-fleet-workers-dial-their-hub.md)); and
 every daemon's [capacity report](#capacity), carried by its snapshots;
 and the link's [`TRANSFER`](#transfer) streams, both ways, with no
-kind received yet.
+kind received yet; and [versions](#versions): a worker follows its hub's
+published build
+([ADR 0042](../../decisions/0042-fleet-workers-follow-their-hubs-version.md)).
 
 Code: `src/serve/fleet/mod.rs` (`LINK`), `src/serve/fleet/link.rs`
 (`Spec`, `opener`, `opener_with`, `answerer`, `answerer_with`,
@@ -44,7 +46,14 @@ Code: `src/serve/fleet/mod.rs` (`LINK`), `src/serve/fleet/link.rs`
 `podman_engine_info`), `Backend::engine_info`, `src/serve/host.rs`
 (`poll`, `running_instances`), `src/serve/snapshots.rs`
 (`Snapshots::set_capacity`, `Machine::capacity`,
-`SnapshotMachine::capacity`), `src/serve/fleet/lend.rs` (`SoftCaps`).
+`SnapshotMachine::capacity`), `src/serve/fleet/lend.rs` (`SoftCaps`);
+versions: `src/serve/fleet/update.rs` (`HELLO`, `Build`, `decide`,
+`Decision`, `release_target`, `asset_url`, `curl_argv`, `update`,
+`Steps`, `Release`), `build.rs` (`stamp_build`),
+`src/serve/machines/install.rs` (`install_local`, `version_of`),
+`src/serve/proto.rs` (`HelloParams::force`), `src/serve/client.rs`
+(`hello_with`), `src/serve/endpoint.rs` (`peer_is_own_user`),
+`src/serve/daemon.rs` (`hello`).
 
 ## Link
 
@@ -54,7 +63,9 @@ with the roles of a container's link moved onto the two hosts. A connection
 to a socket on one host becomes a stream on the mux, answered on the other
 host by a connection made there. A `Spec` says what a link carries: its
 sentinel line (`\n<sentinel> <version>\n`), its one channel, the cap that
-says the far end serves it, and the `Hello` hash (informational).
+says the far end serves it, and the `Hello` hash (the agent relay's is
+informational; on the fleet link it is the build a worker
+[follows](#versions)).
 
 - **The opener** (`link::opener`, the in-container daemon's role) gets a
   reader, a writer and a socket path. It binds a temp name next to the path
@@ -62,7 +73,7 @@ says the far end serves it, and the `Hello` hash (informational).
   wins; then it writes the sentinel, exchanges `Hello`s (advertising
   nothing) and requires the peer's `Hello` caps to include the spec's
   cap. Its `on_ready` callback runs next, with the peer's `Hello` (its
-  `hash` is the far end's spec `hello`, a semver); an error there ends
+  `hash` is the far end's spec `hello`); an error there ends
   the opener with it. Each accepted connection becomes one `Open { channel }` stream
   (`Mux::attach`, ids below 2^31); on a flowing channel
   (`channel::flows`) the stream is flow-controlled. `Open`s from the peer
@@ -77,8 +88,11 @@ says the far end serves it, and the `Hello` hash (informational).
   bytes; another sentinel version is a handshake failure saying which side
   to update), exchanges `Hello`s advertising the cap, and answers each
   `Open` on the spec's channel with `open()`'s connection (`None` refuses
-  it with `Close`, as is every other channel). It returns an `End`: the
-  handshake failed (with the first line of noise), the keepalive ran
+  it with `Close`, as is every other channel). `answerer_with`'s
+  `on_ready` gets the opener's `Hello`; its `Err` ends the link before
+  anything is served. It returns an `End`: the
+  handshake failed (with the first line of noise), `on_ready` refused
+  (`Refused`, with why), the keepalive ran
   `on_dead` (which must end the reader, e.g. kill the ssh), or the stream
   closed.
 
@@ -172,7 +186,8 @@ link's `API` streams.
   the newest link for a worker wins. Its `on_ready` connects to this host's
   daemon (`client::connect`, which starts one like any client does when
   none runs) and sends `fleet.offer {worker, version, root, draining}`,
-  `version` the worker's `Hello`, `root` its `--root`, `draining` its
+  `version` the worker's `Hello` hash (`<semver> <git> <published|dev>`),
+  `root` its `--root`, `draining` its
   `--drain` (the worker's `lend` was `drain` when it dialed). A refused offer ends the link with `offer refused:
   <why>` (on its stderr, which the worker's ssh keeps). It holds that
   daemon connection for the link's life, so a linked worker is a `clients`
@@ -369,7 +384,8 @@ lent API ([ADR 0041](../../decisions/0041-fleet-workers-dial-their-hub.md)).
   while `drain`, read at each dial)
   (through the hub's login shell, `ssh::target_argv`, the builder every
   machine argv uses, here without a registry entry) and runs
-  `link::answerer` of `fleet::LINK` on its stdio. A link that ends (the
+  `link::answerer_with` of `fleet::LINK` on its stdio, serving nothing
+  until its hub's build checks out ([Versions](#versions)). A link that ends (the
   handshake failed, the keepalive heard nothing, ssh exited) is logged
   with ssh's stderr tail and retried after the machine links' backoff
   (`service::backoff`: 1 s doubling to 30 s), reset once a link came up.
@@ -386,6 +402,64 @@ lent API ([ADR 0041](../../decisions/0041-fleet-workers-dial-their-hub.md)).
   ([the sentinel rule](#link)) and is then served like any connection
   (`spawn_conn_as`), with the `Worker` table. Its connection id comes from
   the same counter as the listener's.
+
+### Versions
+
+A worker follows its hub's exact build, an older one included
+([ADR 0042](../../decisions/0042-fleet-workers-follow-their-hubs-version.md)):
+
+- **The build in the `Hello`.** `fleet::LINK`'s `hello` is
+  `fleet::update::HELLO`, `<semver> <git> <published|dev>` (`0.8.0
+  1a2b3c4d5e6f dev`), from `build.rs`'s `stamp_build`: `DEVSANDBOX_BUILD_GIT`
+  is `git rev-parse --short=12 HEAD` of the source tree (`unknown` when git
+  or the repo is missing; the build never fails for it), watched through
+  `HEAD`, the ref it names and `packed-refs`; `DEVSANDBOX_BUILD_KIND` is
+  `published` when the build ran with `DEVSANDBOX_PUBLISHED=1` (meant for
+  the release workflow), else `dev`. `Build::parse` reads one back (a
+  missing word is `unknown` / dev).
+- **The decision** (`update::decide`, pure, over this build and the hub's
+  from the answerer's `on_ready`): the same semver, git and kind is
+  `Same`, and the link serves; another build that is published is
+  `Download { version }`; another dev build is `DevBuild`. Only `Same`
+  serves: the others refuse the link (`End::Refused`) before the first
+  stream, so the hub's offer registers the worker but its link finds it
+  gone.
+- **`DevBuild`** stops offering: `lend.get`'s error is `dev build: needs
+  fleet step 2c (the hub runs <hub build>, this worker <ours>)`
+  (`update::dev_build_reason`), retried at the next attempt.
+- **`Download`**: the ssh is killed, then `update::update` over the
+  worker's `Steps` (`Release` in production; `Options::lend_update` in
+  tests): the asset `devsandbox-<v>-<target>.tar.gz` of release `v<v>`
+  (`asset_url`: `https://github.com/Nemikolh/devsandboxes/releases/download/…`,
+  `<v>` limited to a semver's characters; `<target>` by `release_target`
+  from `std::env::consts`: `x86_64-unknown-linux-musl`,
+  `aarch64-unknown-linux-musl`, `aarch64-apple-darwin`, none elsewhere) is
+  fetched into a private scratch dir under the temp dir with curl
+  (`curl_argv`: `--fail --location --proto =https --proto-redir =https
+  --tlsv1.2`, a stall of 30 s gives up) and unpacked with `tar`. Its
+  `--version` must report `<v>` (`install::version_of`); it is installed
+  over `exe::devsandbox()` (refused while that path is gone) by
+  `install::install_local`, `machines::install::INSTALL` run locally as
+  `sh -c INSTALL sh <dest>` (temp file next to it, its own `--version`
+  check, rename); the installed binary must report `<v>` too. The scratch
+  dir is removed either way. Then the handoff, below.
+- **Any failure** stops offering: `lend.get`'s `retrying` error says
+  `update to <v> failed: <why>`, and the next link attempt, after the
+  usual backoff (`service::backoff`, doubling to 30 s), decides again.
+  While it runs the error is `updating to <v>`; after it, `updated to <v>:
+  handing off`.
+- **The forced handoff** (`Release::handoff`): a hello on the daemon's own
+  socket with `force` (`client::hello_with`, `HelloParams::force`) as
+  client `fleet-update`. `daemon::hello` hands off on a forced hello only
+  from a `Full` connection whose peer runs as the daemon's uid
+  (`endpoint::peer_is_own_user`: `SO_PEERCRED` on Linux, `getpeereid`
+  elsewhere); a `Worker` connection never hands off, forced or not, and a
+  refused force is logged. Then the successor is started as a newer
+  client's handoff starts it (`install::lazy_start` with
+  `StartReason::Handoff`: the service manager's unit, rewritten to this
+  path, when installed; else detached), and waits for the lock while the
+  old daemon drains ([role](role.md#version-handoff)). The new daemon
+  lends as `lend.toml` says, and its hello matches the hub's.
 
 ### Lending: `lend.*`
 
@@ -473,7 +547,8 @@ connection each request goes through `lent::admit` at the top of
   `thread_children`. `instances.resolve`'s matches are cut the same way
   (`lent::filter_answer`); none left is `not-found`.
 - **Hello** on a `Worker` connection never hands the daemon off, whatever
-  version it says: only a local client's newer binary replaces it.
+  version it says and even with `force`: only a local client's newer
+  binary (or this user's forced hello, [Versions](#versions)) replaces it.
 
 ### Worker policy
 

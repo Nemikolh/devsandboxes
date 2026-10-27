@@ -81,6 +81,7 @@ Send it first:
 | `version` | the client's devsandbox semver; external clients send the version they were built against |
 | `build` | optional; the devsandbox binary's mtime (unix secs), for dev builds |
 | `client` | who's calling: `tui`, `cli`, `api:<name>`. Logged, and recorded in the store on the user's feed items (`tui` and `cli` as is, any other name as `api:<name>`) for the user's audit; never shown to owners |
+| `force` | optional, internal (not in the npm typings): `true` hands off whatever the client's version, honored only from a local client of the daemon's own uid; a fleet worker's after installing its hub's version ([fleet](../architecture/daemon/fleet.md#versions)) |
 
 Result: the daemon's `version` and `build`, the API `protocol` number, and
 `"handoff": true` when the client's version is newer than the daemon's: the
