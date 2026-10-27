@@ -87,7 +87,9 @@ had (dispatcher, `config_dir`, `extra_env`, `forwarded_ports`, `done`,
    `sh -c '[ -x /run/devsandbox/bin/devsbd ] && /run/devsandbox/bin/devsbd boot & exec sleep infinity'`,
    `container_command`), then
    `connect_networks`, `wire_service_dns`, install the `devsbd` helper,
-   `devsbd identity apply` as root (a failure fails the create), write the
+   `devsbd identity apply` as root (a failure fails the create), `devsbd
+   userns check` as the exec user (the tool env,
+   [identity](identity.md#the-check-and-the-env)), write the
    `.code-workspace` file.
 6. Save the record (still in flight), write the VS Code name config, sync the
    helper's boot file.
@@ -95,7 +97,7 @@ had (dispatcher, `config_dir`, `extra_env`, `forwarded_ports`, `done`,
    `onCreateCommand`, `updateContentCommand`, `postCreateCommand`,
    `postStartCommand`, `postAttachCommand`, each via `exec` with the
    workspace as workdir, the recorded exec user (`remote_user`),
-   `exec_env` (the plan's `HOME`, `remoteEnv`, `extra_env`) and the
+   `exec_env` (the tool env and the plan's `HOME`, `remoteEnv`, `extra_env`) and the
    ssh-agent socket. Then `progress` is cleared.
 
 ## Phases and failure

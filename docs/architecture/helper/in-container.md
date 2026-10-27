@@ -236,7 +236,10 @@ Exit 0 with no output when every step passes; 1 with one stderr line
 `unshare(CLONE_NEWUSER)`, `setgroups`, `uid_map`, `gid_map` or
 `clone(CLONE_NEWPID)` (or `fork`/`waitpid` for the check's own plumbing)
 and `<errno>` is `EPERM`, `EACCES`, `EINVAL`, `ENOSPC`, `ENOSYS` or the
-number; 2 on a usage error. Off Linux it always exits 1.
+number; 2 on a usage error. Off Linux it always exits 1. Without
+`--as-root` at euid 0 it fails up front with `devsbd: userns: euid: root`
+(`ROOT_LINE`): Chromium refuses its sandbox there, whatever namespaces
+could be made.
 
 ## `devsbd vscode-goto <abs>[:line[:col]] [--wait SECS]`
 

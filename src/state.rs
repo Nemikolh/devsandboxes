@@ -80,6 +80,18 @@ pub struct Instance {
     /// user's own home applies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub home: Option<String>,
+    /// What `devsbd userns check` found after create: whether Chromium's
+    /// sandbox can work here (docs/architecture/instances/identity.md, *Tool
+    /// environment*). `None` = unknown: no helper, a helper too old for the
+    /// check, or an instance from before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_sandbox: Option<crate::commands::run::BrowserSandbox>,
+    /// The env every exec gets from the plan and `browser_sandbox`
+    /// (`commands::run::tool_env`): the sandbox-off knobs, or the opt-in
+    /// `DEVSANDBOX_BROWSER_SANDBOX`, and root silencers. Below everything
+    /// else in [`Instance::exec_env`]. Empty for instances from before it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tool_env: BTreeMap<String, String>,
     /// Container path of the forwarded ssh-agent socket, set when `run`
     /// mounted the host agent (see docs/architecture/helper/ssh-agent.md); `exec_argv` uses it
     /// to inject `SSH_AUTH_SOCK` per exec.
@@ -323,15 +335,15 @@ impl Instance {
 
     /// The env every devsandbox exec into this instance sets (CLI/TUI exec,
     /// dispatcher run ops, lifecycle commands, the boot file): the recorded
-    /// `home` as `HOME`, overlaid by `remoteEnv`, overlaid by `extra_env`. A
-    /// `HOME` the user sets wins over the plan's. The instance-specific value
+    /// `tool_env` and `home` as `HOME`, overlaid by `remoteEnv`, overlaid by
+    /// `extra_env`. A `HOME` or knob the user sets wins over the plan's. The instance-specific value
     /// wins, as at `docker run` where `--env` comes after `containerEnv`; and
     /// the saved `extra_env` may be newer than the container's own env (an
     /// `ensure` replaced it), so it must override whatever the image or
     /// config set.
     pub fn exec_env(&self) -> BTreeMap<String, String> {
-        let mut env: BTreeMap<String, String> =
-            self.home.iter().map(|h| ("HOME".to_string(), h.clone())).collect();
+        let mut env = self.tool_env.clone();
+        env.extend(self.home.iter().map(|h| ("HOME".to_string(), h.clone())));
         env.extend(self.remote_env.iter().map(|(k, v)| (k.clone(), v.clone())));
         env.extend(self.extra_env.iter().map(|(k, v)| (k.clone(), v.clone())));
         env
@@ -472,6 +484,8 @@ mod tests {
                 remote_env: BTreeMap::new(),
                 remote_user: None,
                 home: Some("/home/vscode".into()),
+                browser_sandbox: None,
+                tool_env: Default::default(),
                 ssh_auth_sock: None,
                 devsbd_arch: None,
                 volumes: Vec::new(),
@@ -550,6 +564,32 @@ mod tests {
         assert!(!text.contains("done"), "{text}");
         assert_eq!(state.instances["repo"].home, None);
         assert!(!text.contains("home ="), "{text}");
+        // Before the userns check: no verdict, no tool env.
+        assert_eq!(state.instances["repo"].browser_sandbox, None);
+        assert!(state.instances["repo"].tool_env.is_empty());
+        assert!(!text.contains("browser_sandbox") && !text.contains("tool_env"), "{text}");
+    }
+
+    #[test]
+    fn browser_sandbox_and_tool_env_roundtrip() {
+        use crate::commands::run::BrowserSandbox;
+        let mut state: State = toml::from_str(
+            "[instance.a]\nsandbox = \"web\"\ncontainer = \"c\"\nfolder = \"/f\"\nworkspace = \"/w\"\ncreated_unix = 0\n",
+        )
+        .unwrap();
+        let inst = state.instances.get_mut("a").unwrap();
+        inst.browser_sandbox = Some(BrowserSandbox::On);
+        inst.tool_env = BTreeMap::from([("DEVSANDBOX_BROWSER_SANDBOX".into(), "1".into())]);
+        let text = toml::to_string_pretty(&state).unwrap();
+        assert!(text.contains("browser_sandbox = \"on\""), "{text}");
+        let back: State = toml::from_str(&text).unwrap();
+        assert_eq!(back.instances["a"].browser_sandbox, Some(BrowserSandbox::On));
+        assert_eq!(back.instances["a"].tool_env["DEVSANDBOX_BROWSER_SANDBOX"], "1");
+        let why = "no user namespaces: seccomp";
+        state.instances.get_mut("a").unwrap().browser_sandbox = Some(BrowserSandbox::Off(why.into()));
+        let text = toml::to_string_pretty(&state).unwrap();
+        let back: State = toml::from_str(&text).unwrap();
+        assert_eq!(back.instances["a"].browser_sandbox, Some(BrowserSandbox::Off(why.into())), "{text}");
     }
 
     #[test]
@@ -577,6 +617,9 @@ mod tests {
         assert_eq!(inst.exec_env()["HOME"], "/srv/me");
         inst.extra_env.insert("HOME".into(), "/tmp/x".into());
         assert_eq!(inst.exec_env()["HOME"], "/tmp/x");
+        // The tool env comes first too.
+        inst.tool_env = BTreeMap::from([("B".into(), "tool".into()), ("T".into(), "t".into())]);
+        assert_eq!((inst.exec_env()["B"].as_str(), inst.exec_env()["T"].as_str()), ("b", "t"));
     }
 
     /// The orphaned-child bug: two writers holding snapshots from before each

@@ -20,6 +20,7 @@ mod lifecycle;
 mod mounts;
 mod progress;
 mod ssh_agent;
+pub(crate) mod tool_env;
 mod worktree;
 
 pub(crate) use editor::write_vscode_name_config;
@@ -35,6 +36,7 @@ use mounts::{
     resolve_shell_rc, shell_rc_wiring, sort_parents_first, write_workspace_file, ResolvedMounts,
 };
 pub(crate) use progress::{OnFailure, Tracker};
+pub(crate) use tool_env::BrowserSandbox;
 use ssh_agent::ssh_agent_forward;
 use worktree::{copy_worktree_includes, create_worktree, git_companion_mount, link_shared_files, lock_worktree};
 pub(crate) use worktree::{instance_at, lock_instance_worktrees, parse_worktree_list, unlock_worktree};
@@ -209,6 +211,8 @@ pub fn run(
         remote_env: Default::default(),
         remote_user: None,
         home: None,
+        browser_sandbox: None,
+        tool_env: Default::default(),
         ssh_auth_sock: None,
         devsbd_arch: None,
         volumes: Vec::new(),
@@ -760,6 +764,21 @@ pub(crate) fn materialize(
             );
         }
     }
+    // Whether the browser sandbox can work here, checked as the exec user in
+    // the real container (its seccomp, user, AppArmor); the knobs follow.
+    let root_plan = tool_env::root_plan(plan.exec_user.as_deref());
+    let browser_sandbox = devsbd_arch
+        .is_some()
+        .then(|| tool_env::check(&tool_env::check_argv(&container, plan.exec_user.as_deref())))
+        .flatten();
+    let user_keys = props
+        .container_env
+        .iter()
+        .chain(props.remote_env.iter())
+        .flat_map(|env| env.keys().map(String::as_str))
+        .collect();
+    let tool_env = tool_env::tool_env(root_plan, browser_sandbox.as_ref(), &user_keys);
+    eprintln!("{}", tool_env::summary(root_plan, browser_sandbox.as_ref()));
     let workspace_file = write_workspace_file(
         &container,
         instance,
@@ -786,6 +805,8 @@ pub(crate) fn materialize(
         remote_env: props.remote_env.clone().unwrap_or_default(),
         remote_user: plan.exec_user.clone(),
         home,
+        browser_sandbox,
+        tool_env,
         ssh_auth_sock,
         devsbd_arch,
         volumes,
@@ -1205,6 +1226,8 @@ mod tests {
             remote_env: Default::default(),
             remote_user: None,
             home: None,
+            browser_sandbox: None,
+            tool_env: Default::default(),
             ssh_auth_sock: None,
             devsbd_arch: None,
             volumes: Vec::new(),
@@ -1694,6 +1717,63 @@ mod tests {
             let owner = std::fs::metadata(repo.join("owned-by-me")).unwrap().uid();
             // SAFETY: getuid has no preconditions and can't fail.
             assert_eq!(owner, unsafe { libc::getuid() }, "{label}");
+        });
+    }
+
+    /// `run` checks user namespaces in the new container, records the verdict
+    /// and the tool env, and every exec gets that env under the sandbox's own
+    /// keys (docs/architecture/instances/identity.md, *Tool environment*).
+    #[test_utils::docker_test(helper)]
+    fn tool_env_reaches_exec_with_docker() -> Result<(), String> {
+        isolated("tool_env_child")
+    }
+
+    #[test]
+    fn tool_env_child() {
+        let Some(root) = isolated_root("tool_env_child") else { return };
+        let (repo, cfg) = (root.join("repo"), root.join("cfg"));
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&cfg).unwrap();
+        // Unique per run: container and image names are global to the runtime.
+        let name = format!("toolenv-{}", std::process::id());
+        std::fs::write(cfg.join("Dockerfile"), "FROM alpine:3.20\nRUN adduser -D -u 1000 dev\n").unwrap();
+        std::fs::write(
+            cfg.join(CONFIG_FILE),
+            format!(
+                "[sandbox.{name}]\nfolder = \"../repo\"\nbuild.dockerfile = \"Dockerfile\"\nremoteUser = \"dev\"\n\
+                 containerEnv = {{ CHROMIUM_FLAGS = \"--mine\" }}\nremoteEnv = {{ PIP_ROOT_USER_ACTION = \"warn\" }}\n"
+            ),
+        )
+        .unwrap();
+        let project = services::project_id(&cfg).unwrap();
+        let container = format!("{NAME_PREFIX}{name}");
+        let image = format!("{NAME_PREFIX}img-{name}");
+        let cleanup = || {
+            crate::commands::rm::remove_container(&container, &project, &name);
+            let _ = backend().output_quiet(&["rmi", "-f", &image]);
+        };
+        crate::test_support::with_cleanup(cleanup, || {
+            run(&cfg, Some(name.clone()), Some(name.clone()), None, None, RunExtras::default()).unwrap();
+            let state = State::load().unwrap();
+            let info = state.instances.get(&name).expect("instance recorded");
+            assert!(info.browser_sandbox.is_some(), "the helper ran the check");
+            let env_cmd = ["env".to_string()];
+            let argv = crate::commands::exec::exec_argv_with(info, false, false, &env_cmd, false);
+            let out = backend().output_quiet(&argv.iter().map(String::as_str).collect::<Vec<_>>()).unwrap();
+            let env: BTreeMap<&str, &str> = out.lines().filter_map(|l| l.split_once('=')).collect();
+            // The sandbox's own keys: containerEnv's untouched, remoteEnv's on top.
+            assert_eq!(env.get("CHROMIUM_FLAGS"), Some(&"--mine"), "{out}");
+            assert!(!info.tool_env.contains_key("CHROMIUM_FLAGS"), "{:?}", info.tool_env);
+            let root = tool_env::root_plan(info.remote_user.as_deref());
+            let knobs = root || info.browser_sandbox != Some(BrowserSandbox::On);
+            assert_eq!(env.get("PUPPETEER_DANGEROUS_NO_SANDBOX") == Some(&"1"), knobs, "{out}");
+            assert_eq!(env.get("ELECTRON_DISABLE_SANDBOX") == Some(&"1"), knobs, "{out}");
+            assert_eq!(env.get("DEVSANDBOX_BROWSER_SANDBOX") == Some(&"1"), !knobs, "{out}");
+            if root {
+                // Rootless docker (this host's case): the silencers too.
+                assert_eq!(env.get("BUNDLE_SILENCE_ROOT_WARNING"), Some(&"1"), "{out}");
+                assert_eq!(env.get("PIP_ROOT_USER_ACTION"), Some(&"warn"), "{out}");
+            }
         });
     }
 

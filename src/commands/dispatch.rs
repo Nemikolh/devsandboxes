@@ -1444,6 +1444,8 @@ folder = "."
             remote_env: BTreeMap::new(),
             remote_user: None,
             home: None,
+            browser_sandbox: None,
+            tool_env: Default::default(),
             ssh_auth_sock: None,
             devsbd_arch: None,
             volumes: Vec::new(),

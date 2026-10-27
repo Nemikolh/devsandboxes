@@ -100,6 +100,42 @@ docker's default closes, the same trade podman's default makes. `userns =
 false` keeps docker's default profile. The field changes create args, so
 it's hashed for drift.
 
+### The check and the env
+
+Whether the sandbox can work is checked in the real container, with its
+real profile, user and AppArmor: in `materialize`, right after `devsbd
+identity apply`, an exec of `devsbd userns check` as the plan's exec user
+(`run::tool_env::check_argv`, contract in
+[in-container](../helper/in-container.md#devsbd-userns-check---as-root)),
+with `--as-root` on a root plan (`tool_env::root_plan`: the exec user is
+`root`). It runs on every backend the helper runs on. `browser_sandbox`
+reads the outcome as a `BrowserSandbox`: exit 0 is `On`; exit 1 is
+`Off(why)`, where EPERM at `unshare(CLONE_NEWUSER)` or
+`clone(CLONE_NEWPID)` reads `no user namespaces: seccomp`, EPERM at
+`uid_map`, `gid_map` or `setgroups` reads `no user namespaces: AppArmor
+restriction on the host`, a plain check at euid 0 (`euid: root`, an
+image running as root with no exec user) reads `execs run as root`, and
+anything else is the helper's line as is.
+No helper in the container, a helper too old to know `userns` (exit 2), or
+an exec that can't run leaves it unknown (`None`).
+
+`tool_env` then decides the env every exec gets:
+
+| Plan | Verdict | Env |
+|---|---|---|
+| non-root | `On` | `DEVSANDBOX_BROWSER_SANDBOX=1` |
+| non-root | `Off`, unknown | the sandbox-off knobs |
+| root | any | the sandbox-off knobs, plus `PIP_ROOT_USER_ACTION=ignore`, `BUNDLE_SILENCE_ROOT_WARNING=1` |
+
+The sandbox-off knobs (`SANDBOX_OFF_KNOBS`) are
+`PUPPETEER_DANGEROUS_NO_SANDBOX=1`, `ELECTRON_DISABLE_SANDBOX=1`,
+`QTWEBENGINE_DISABLE_SANDBOX=1`, `PLAYWRIGHT_MCP_SANDBOX=false` and
+`CHROMIUM_FLAGS=--no-sandbox`. A root plan gets them whatever the check
+says: Chromium refuses its sandbox at euid 0. Keys the sandbox sets itself
+in `containerEnv` or `remoteEnv` are left out. `run` says one line
+(`tool_env::summary`): `browser sandbox: on`, or `browser sandbox: off
+(<why>); sandbox-off knobs set`.
+
 ## Applying it
 
 In `materialize`, after the helper is installed and before shell-rc and the
@@ -136,10 +172,18 @@ container.
 - `Instance::home`: the home `apply` reported, on root-home plans only.
   `Instance::exec_env` puts it first as `HOME`, so `remoteEnv` and
   `run --env` override it.
+- `Instance::browser_sandbox` and `Instance::tool_env`: the check's
+  verdict (`browser_sandbox = "on"` or `{ off = "<why>" }` in
+  `state.toml`) and the env decided from it. `exec_env` puts `tool_env`
+  first, with `HOME`, so `remoteEnv` and `run --env` override it. The
+  checks run once per container: `start` keeps the record, `rebuild` makes
+  a new one. `inspect` prints the browser sandbox line on stderr before the
+  JSON, from the record.
 
 An instance created before identity has no label and keeps the
 `remote_user` its `run` recorded (the config's `remoteUser`) until
-rebuilt.
+rebuilt. One created before the check has no verdict and no tool env:
+`inspect` says it isn't recorded.
 
 ## Fallbacks
 

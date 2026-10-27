@@ -157,6 +157,9 @@ limitation means editing this file in the same commit.
   from `devsbd identity apply --expect`. `identity::ASSUMED`
 - Identity on rootless docker: VS Code attaches as root without the plan's
   `HOME` (`Instance::home` reaches execs only). `vscode::launch`
+- Tool env: `PLAYWRIGHT_MCP_SANDBOX=false` and `CHROMIUM_FLAGS=--no-sandbox`
+  are unverified knobs (no Playwright MCP or Debian `chromium` wrapper
+  was tested). `run::tool_env::tool_env`
 - `rebuild --reprobe` without config drift does nothing unless `--force`
   is given too. `rebuild::rebuild`
 

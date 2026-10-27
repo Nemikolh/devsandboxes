@@ -18,6 +18,10 @@ const USAGE: &str = "usage: devsbd userns check [--as-root]";
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const WRAPPED_ID: u32 = 1001;
 
+/// A plain check's outcome at euid 0.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const ROOT_LINE: &str = "devsbd: userns: euid: root";
+
 /// The step that failed, named as in the outcome line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
@@ -134,8 +138,15 @@ mod imp {
         write("/proc/self/gid_map", format!("{inner_gid} {gid} 1\n"), Step::GidMap)
     }
 
-    /// Fork, run the sequence in the child, exit with its outcome.
+    /// Fork, run the sequence in the child, exit with its outcome. At euid 0
+    /// without `--as-root` it fails up front: Chromium refuses its sandbox
+    /// there whatever namespaces could be made.
     pub fn check(as_root: bool) -> i32 {
+        // SAFETY: plain syscall wrapper.
+        if !as_root && unsafe { sys::geteuid() } == 0 {
+            eprintln!("{}", super::ROOT_LINE);
+            return 1;
+        }
         // SAFETY: the helper is single-threaded here; the child only makes
         // syscalls, writes stderr and exits.
         let pid = unsafe { sys::fork() };

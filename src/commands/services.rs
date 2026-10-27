@@ -1078,6 +1078,8 @@ ports = ["5432:5432"]
             remote_env: Default::default(),
             remote_user: None,
             home: None,
+            browser_sandbox: None,
+            tool_env: Default::default(),
             ssh_auth_sock: None,
             devsbd_arch: None,
             volumes: Vec::new(),

@@ -3,15 +3,19 @@ use anyhow::Result;
 use super::resolve_container;
 use crate::render::{classify_json_line, dim, green, JsonLine};
 use crate::runtime::backend;
-use crate::state::State;
+use crate::state::{Instance, State};
 
 /// Pretty-print the runtime's `inspect` JSON for an instance or service
 /// container, with the same light key highlighting as the TUI inspect pane
-/// (color only on a TTY; see `render::paint`).
+/// (color only on a TTY; see `render::paint`). For an instance, its browser
+/// sandbox line goes first, on stderr, from the record ([`browser_line`]).
 pub fn inspect(name: &str, json: bool) -> Result<()> {
     let state = State::load()?;
     let container = resolve_container(&state, name)?;
     let raw = backend().inspect_json(&container)?;
+    if let Some(info) = state.instances.values().find(|i| i.container == container) {
+        eprintln!("{}", browser_line(info));
+    }
     // JSON mode prints the runtime's own inspect document verbatim (no color, no
     // envelope): the payload is the backend's schema, not ours.
     if json {
@@ -22,6 +26,16 @@ pub fn inspect(name: &str, json: bool) -> Result<()> {
         println!("{}", paint_json_line(line));
     }
     Ok(())
+}
+
+/// `run`'s browser sandbox line for a recorded instance
+/// (`run::tool_env::summary`); an instance from before the check says so.
+fn browser_line(info: &Instance) -> String {
+    if info.browser_sandbox.is_none() && info.tool_env.is_empty() {
+        return "browser sandbox: not recorded (created before the userns check; `devsandbox rebuild` checks it)".into();
+    }
+    use crate::commands::run::tool_env;
+    tool_env::summary(tool_env::root_plan(info.remote_user.as_deref()), info.browser_sandbox.as_ref())
 }
 
 /// Pretty-print raw `inspect` output. On JSON parse failure the raw output is
