@@ -124,16 +124,29 @@ pub(super) fn feature_container_opts(
     Ok(opts)
 }
 
+/// Tag of a `build.dockerfile` sandbox's image: `project` is the config
+/// root's [`services::project_id`], so same-named sandboxes of two roots
+/// never share (or clobber) a tag.
+pub(super) fn sandbox_image(project: &str, sandbox: &str) -> String {
+    format!("{NAME_PREFIX}img-{project}-{sandbox}")
+}
+
+/// Tag of a sandbox's derived features image (scoped like [`sandbox_image`]).
+pub(super) fn features_image(project: &str, sandbox: &str) -> String {
+    format!("{}-feat", sandbox_image(project, sandbox))
+}
+
 /// Image to run: the `image` property as-is, or a local build for
-/// `build.dockerfile` sandboxes. When the sandbox declares `features`, the base
-/// (image or build) is extended into a derived image tagged
-/// `devsandbox-img-<sandbox>-feat`.
-pub(super) fn image_for(dir: &Path, sandbox: &ResolvedSandbox) -> Result<String> {
-    let base = base_image_for(dir, sandbox)?;
+/// `build.dockerfile` sandboxes ([`sandbox_image`]). When the sandbox declares
+/// `features`, the base (image or build) is extended into a derived image
+/// tagged [`features_image`]. `project` is the config root's
+/// [`services::project_id`].
+pub(super) fn image_for(dir: &Path, project: &str, sandbox: &ResolvedSandbox) -> Result<String> {
+    let base = base_image_for(dir, project, sandbox)?;
     let props = &sandbox.properties;
     match &props.features {
         Some(features) if !features.is_empty() => {
-            build_features_image(dir, sandbox, &base, features)
+            build_features_image(dir, project, sandbox, &base, features)
         }
         _ => Ok(base),
     }
@@ -141,7 +154,7 @@ pub(super) fn image_for(dir: &Path, sandbox: &ResolvedSandbox) -> Result<String>
 
 /// The base image: the `image` property as-is, or a local build for
 /// `build.dockerfile` sandboxes.
-fn base_image_for(dir: &Path, sandbox: &ResolvedSandbox) -> Result<String> {
+fn base_image_for(dir: &Path, project: &str, sandbox: &ResolvedSandbox) -> Result<String> {
     let props = &sandbox.properties;
     if let Some(image) = &props.image {
         return Ok(image.clone());
@@ -154,7 +167,7 @@ fn base_image_for(dir: &Path, sandbox: &ResolvedSandbox) -> Result<String> {
         .dockerfile
         .as_deref()
         .with_context(|| format!("sandbox `{}`: `build.dockerfile` is required", sandbox.name))?;
-    let tag = format!("{NAME_PREFIX}img-{}", sandbox.name);
+    let tag = sandbox_image(project, &sandbox.name);
     let args = services::build_args(
         backend(),
         dir,
@@ -193,6 +206,7 @@ struct FeatureBuild {
 /// config dir local feature folders resolve against.
 fn build_features_image(
     dir: &Path,
+    project: &str,
     sandbox: &ResolvedSandbox,
     base: &str,
     features: &BTreeMap<String, FeatureOptions>,
@@ -225,7 +239,7 @@ fn build_features_image(
     let remote_user = props.remote_user.as_deref().unwrap_or(container_user);
 
     // Fresh build context.
-    let context = features::build_context_dir(&sandbox.name)?;
+    let context = features::build_context_dir(project, &sandbox.name)?;
     std::fs::write(
         context.join("devcontainer-features.builtin.env"),
         builtin_env(container_user, remote_user),
@@ -264,7 +278,7 @@ fn build_features_image(
     std::fs::write(&dockerfile_path, dockerfile)
         .with_context(|| format!("cannot write {}", dockerfile_path.display()))?;
 
-    let tag = format!("{NAME_PREFIX}img-{}-feat", sandbox.name);
+    let tag = features_image(project, &sandbox.name);
     backend().run_checked(&[
         "build",
         "-t",
@@ -556,6 +570,20 @@ fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use crate::features::FeatureOption;
+
+    #[test]
+    fn image_tags_are_scoped_by_project() {
+        assert_eq!(sandbox_image("ab12cd34", "web"), "devsandbox-img-ab12cd34-web");
+        assert_eq!(features_image("ab12cd34", "web"), "devsandbox-img-ab12cd34-web-feat");
+        // Two roots, one sandbox name: nothing shared.
+        assert_ne!(sandbox_image("ab12cd34", "web"), sandbox_image("00ff00ff", "web"));
+        assert_ne!(features_image("ab12cd34", "web"), features_image("00ff00ff", "web"));
+        assert_ne!(
+            features::build_context_name("ab12cd34", "web"),
+            features::build_context_name("00ff00ff", "web")
+        );
+        assert_eq!(features::build_context_name("ab12cd34", "web"), "build-ab12cd34-web");
+    }
 
     #[test]
     fn privileged_decision_ors_sandbox_and_features() {
@@ -938,7 +966,8 @@ chmod +x ./devcontainer-features-install.sh && \
             )])),
         )]);
 
-        let result = build_features_image(&config_dir, &sandbox, "alpine:3.20", &features)
+        let project = services::project_id(&config_dir).unwrap();
+        let result = build_features_image(&config_dir, &project, &sandbox, "alpine:3.20", &features)
             .map_err(|e| format!("{e:#}"))
             .and_then(|tag| {
                 let run = crate::test_support::runtime_cmd()
@@ -952,7 +981,7 @@ chmod +x ./devcontainer-features-install.sh && \
                 Ok(String::from_utf8_lossy(&run.stdout).trim().to_string())
             });
         let _ = std::fs::remove_dir_all(&config_dir);
-        if let Ok(context) = features::build_context_dir(&name) {
+        if let Ok(context) = features::build_context_dir(&project, &name) {
             let _ = std::fs::remove_dir_all(context);
         }
         let marker = result.unwrap_or_else(|e| panic!("{e}"));

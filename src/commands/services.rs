@@ -10,8 +10,10 @@ use crate::render::{bold_cyan, dim, green, magenta, yellow};
 use crate::runtime::{backend, Backend, ServiceEndpoint, NAME_PREFIX};
 use crate::state::{PhaseView, State};
 
-/// Short, stable id for a config root, scoping its networks and services so two
-/// projects never collide.
+/// Short, stable id for a config root, scoping its networks, services and
+/// image tags so two projects never collide: 8 hex chars (32 bits) of the
+/// canonical path's hash. A collision needs two roots on one runtime landing
+/// on the same 32-bit value (about 1 in 4 billion per pair), accepted.
 pub fn project_id(dir: &Path) -> Result<String> {
     let canonical = dir
         .canonicalize()
@@ -37,6 +39,12 @@ pub fn service_container(project: &str, name: &str) -> String {
 /// Container name for an `isolated` service (one per sandbox instance).
 pub fn isolated_service_container(project: &str, instance: &str, name: &str) -> String {
     format!("{NAME_PREFIX}svc-{project}-{instance}-{name}")
+}
+
+/// Image tag of a service's local `build` (shared by its global or isolated
+/// containers within one config root).
+pub fn service_image_tag(project: &str, name: &str) -> String {
+    format!("{NAME_PREFIX}img-svc-{project}-{name}")
 }
 
 /// Create the given network if it does not already exist.
@@ -89,7 +97,7 @@ pub fn ensure_services(
                         build_hash(dir, service.spec.build.as_ref())
                     ),
                 ];
-                ensure_service(dir, &container, &global_net, &service, &labels)?;
+                ensure_service(dir, project, &container, &global_net, &service, &labels)?;
                 endpoints.push(ServiceEndpoint { alias: name.clone(), container });
             }
             ServiceScope::Isolated => {
@@ -109,7 +117,7 @@ pub fn ensure_services(
                         build_hash(dir, service.spec.build.as_ref())
                     ),
                 ];
-                ensure_service(dir, &container, &instance_net, &service, &labels)?;
+                ensure_service(dir, project, &container, &instance_net, &service, &labels)?;
                 endpoints.push(ServiceEndpoint { alias: name.clone(), container });
             }
         }
@@ -129,6 +137,7 @@ pub fn ensure_services(
 /// stopped, warn on config drift, and no-op if already running.
 fn ensure_service(
     dir: &Path,
+    project: &str,
     container: &str,
     network: &str,
     service: &ResolvedService,
@@ -163,7 +172,7 @@ fn ensure_service(
             };
             let ports = prefer_same_host_ports(container, &ports)?;
             check_port_conflicts(container, &ports)?;
-            let image = service_image(dir, service)?;
+            let image = service_image(dir, project, service)?;
             let args = service_run_args(backend(), container, network, &image, service, &ports, labels);
             if let Some(policy) = &policy {
                 policy.check_run(&args)?;
@@ -176,8 +185,8 @@ fn ensure_service(
 }
 
 /// Resolve a service to a runnable image: its `image` as-is, or a local build
-/// of its `build.dockerfile` (built once, tagged by service name).
-fn service_image(dir: &Path, service: &ResolvedService) -> Result<String> {
+/// of its `build.dockerfile` (tagged [`service_image_tag`]).
+fn service_image(dir: &Path, project: &str, service: &ResolvedService) -> Result<String> {
     if let Some(image) = &service.spec.image {
         return Ok(image.clone());
     }
@@ -190,7 +199,7 @@ fn service_image(dir: &Path, service: &ResolvedService) -> Result<String> {
         .dockerfile
         .as_deref()
         .with_context(|| format!("service `{}`: `build.dockerfile` is required", service.name))?;
-    let tag = format!("{NAME_PREFIX}img-svc-{}", service.name);
+    let tag = service_image_tag(project, &service.name);
 
     let args = build_args(backend(), dir, &tag, dockerfile, build, &format!("service `{}`", service.name));
     crate::worker_policy::enforce_argv(dir, &args)?;
@@ -624,7 +633,7 @@ pub fn rebuild(dir: &Path, name: &str) -> Result<()> {
             format!("devsandbox.config_hash={}", service.config_hash),
             format!("devsandbox.build_hash={}", build_hash(dir, service.spec.build.as_ref())),
         ];
-        ensure_service(dir, &container, &global_net, &service, &labels)?;
+        ensure_service(dir, &project, &container, &global_net, &service, &labels)?;
         println!("recreated {container}");
         recreated += 1;
     }
@@ -903,6 +912,27 @@ mod tests {
 
     fn service(toml: &str) -> ResolvedService {
         Config::parse(toml).unwrap().resolve_service("db").unwrap()
+    }
+
+    #[test]
+    fn project_id_is_stable_per_root_and_differs_across_roots() {
+        let base = std::env::temp_dir().join(format!("devsandbox-project-id-{}", std::process::id()));
+        let (a, b) = (base.join("a"), base.join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let id = project_id(&a).unwrap();
+        assert_eq!(id.len(), 8);
+        assert!(id.bytes().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()), "{id}");
+        // The same root through a non-canonical path gives the same key.
+        assert_eq!(project_id(&base.join("b/../a")).unwrap(), id);
+        assert_ne!(project_id(&b).unwrap(), id);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn service_image_tag_is_scoped_by_project() {
+        assert_eq!(service_image_tag("ab12cd34", "db"), "devsandbox-img-svc-ab12cd34-db");
+        assert_ne!(service_image_tag("ab12cd34", "db"), service_image_tag("00ff00ff", "db"));
     }
 
     #[test]

@@ -273,16 +273,23 @@ fn cache_root() -> Result<PathBuf> {
 }
 
 /// A fresh build-context dir for a sandbox's derived image build, under the
-/// features cache root: `<cache_root>/build-<sandbox>`. Recreated each call
-/// (any prior contents are removed) so a rebuild starts clean.
-pub fn build_context_dir(sandbox: &str) -> Result<PathBuf> {
-    let dir = cache_root()?.join(format!("build-{sandbox}"));
+/// features cache root: `<cache_root>/`[`build_context_name`]. Recreated each
+/// call (any prior contents are removed) so a rebuild starts clean.
+pub fn build_context_dir(project: &str, sandbox: &str) -> Result<PathBuf> {
+    let dir = cache_root()?.join(build_context_name(project, sandbox));
     if dir.exists() {
         std::fs::remove_dir_all(&dir)
             .with_context(|| format!("cannot clear {}", dir.display()))?;
     }
     std::fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
     Ok(dir)
+}
+
+/// `build-<project>-<sandbox>`: `project` (the config root's
+/// `services::project_id`) keeps two roots' same-named sandboxes from
+/// clearing each other's build context mid-build.
+pub fn build_context_name(project: &str, sandbox: &str) -> String {
+    format!("build-{project}-{sandbox}")
 }
 
 /// A feature's `devcontainer-feature.json`. Tolerant of unknown fields and

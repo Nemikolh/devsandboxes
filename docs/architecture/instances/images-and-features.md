@@ -6,13 +6,14 @@ features ask of the container. Read before touching image builds or
 devcontainer `features` support.
 
 Code: `src/commands/run/image.rs` (`image_for`, `base_image_for`,
+`sandbox_image`, `features_image`,
 `build_features_image`, `generate_dockerfile`, `install_wrapper`,
 `feature_env_file`, `builtin_env`, `entrypoint_wrapper`,
 `entrypoint_dockerfile`, `feature_container_opts`, `privileged_decision`),
 `src/features.rs` (`FeatureSource`, `resolve`, `fetch_into`,
 `install_order`, `feature_issues`, `local_features_fingerprint`,
-`build_context_dir`, `FeatureMetadata`), `src/commands/services.rs`
-(`build_args`), `src/commands/run/mod.rs` (`container_command`),
+`build_context_dir`, `build_context_name`, `FeatureMetadata`),
+`src/commands/services.rs` (`build_args`, `project_id`), `src/commands/run/mod.rs` (`container_command`),
 `src/build_log.rs`.
 
 ## Base image
@@ -22,13 +23,20 @@ built with `services::build_args` (the same argv builder services use:
 `-f`, `--build-arg`, `--target`, `--cache-from` where the runtime supports
 it, `build.options` verbatim, context default `.` relative to the config
 dir) and tagged
-`devsandbox-img-<sandbox>`. The build runs on every `run`/`rebuild`; the
-runtime's layer cache makes it cheap.
+`devsandbox-img-<project>-<sandbox>` (`sandbox_image`). The build runs on
+every `run`/`rebuild`; the runtime's layer cache makes it cheap.
+
+`<project>` is the config root's `services::project_id` (8 hex chars of
+the canonical root path's hash, the same key that scopes networks and
+service containers), so two roots with a same-named sandbox (two
+checkouts of one config, a hub's config next to a local one) build into
+tags and build contexts of their own.
 
 ## Feature image
 
 When the sandbox has enabled `features`, `image_for` builds a derived image
-`devsandbox-img-<sandbox>-feat` on top of the base. Layout mirrors the
+`devsandbox-img-<project>-<sandbox>-feat` (`features_image`) on top of the
+base. Layout mirrors the
 official devcontainers CLI.
 
 1. Each entry: options from the config value (`true`, a version string, or a
@@ -37,7 +45,8 @@ official devcontainers CLI.
    without tag, else bare id; absent deps ignored; cycles error),
    alphabetical tie-break.
 3. A fresh build context at
-   `<cache>/devsandbox/features/build-<sandbox>/`: the builtin env
+   `<cache>/devsandbox/features/build-<project>-<sandbox>/`
+   (`build_context_name`): the builtin env
    (`_CONTAINER_USER`, `_REMOTE_USER`; `_*_HOME` appended in the image), and
    per feature `<idx>-<id>/` with its files, `devcontainer-features.env`
    (metadata defaults overridden by config values, names via `safe_id`) and

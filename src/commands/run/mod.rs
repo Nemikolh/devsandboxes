@@ -678,7 +678,7 @@ pub(crate) fn materialize(
     // The image before the mounts: `${containerEnv:…}` (mounts, containerEnv,
     // remoteEnv) reads the built image's env and passwd.
     tracker.enter(Phase::Building)?;
-    let image = image_for(dir, sandbox)?;
+    let image = image_for(dir, &project, sandbox)?;
     let facts = facts::image_facts(&image);
     let container_env =
         ContainerEnv::resolve(props.container_env.as_ref(), facts.env.clone(), facts::home(props, &facts), &var_ctx);
@@ -1817,7 +1817,7 @@ mod tests {
         .unwrap();
         let project = services::project_id(&cfg).unwrap();
         let container = format!("{NAME_PREFIX}{name}");
-        let image = format!("{NAME_PREFIX}img-{name}");
+        let image = image::sandbox_image(&project, &name);
         let cleanup = || {
             crate::commands::rm::remove_container(&container, &project, &name);
             let _ = backend().output_quiet(&["rmi", "-f", &image]);
@@ -1866,7 +1866,7 @@ mod tests {
         .unwrap();
         let project = services::project_id(&cfg).unwrap();
         let container = format!("{NAME_PREFIX}{name}");
-        let image = format!("{NAME_PREFIX}img-{name}");
+        let image = image::sandbox_image(&project, &name);
         let cleanup = || {
             crate::commands::rm::remove_container(&container, &project, &name);
             let _ = backend().output_quiet(&["rmi", "-f", &image]);
@@ -1941,7 +1941,7 @@ mod tests {
         .unwrap();
         let project = services::project_id(&cfg).unwrap();
         let container = format!("{NAME_PREFIX}{name}");
-        let image = format!("{NAME_PREFIX}img-{name}");
+        let image = image::sandbox_image(&project, &name);
         let volume = format!("cenv-{name}");
         let cleanup = || {
             crate::commands::rm::remove_container(&container, &project, &name);

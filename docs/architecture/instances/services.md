@@ -42,7 +42,8 @@ Called by `materialize` (before the instance container is created), by
 2. Create the scope's network if missing.
 3. `ensure_service`: exists → warn on drift, `start` if stopped; absent →
    create. Creating builds a `build` service into
-   `devsandbox-img-svc-<name>` (`build_args`, shared with sandbox builds),
+   `devsandbox-img-svc-<project>-<name>` (`service_image_tag`; `build_args`,
+   shared with sandbox builds),
    prefers the same host port for bare `-p` specs when it's free
    (`prefer_same_host_ports`), fails early if another running container
    publishes a requested host port (`check_port_conflicts`), then `run -d`

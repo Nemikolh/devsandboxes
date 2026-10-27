@@ -92,11 +92,6 @@ limitation means editing this file in the same commit.
 - Drift misses the build context and OCI feature contents; those need
   `rebuild --force`. → [drift](architecture/instances/rebuild-and-drift.md);
   `config::build_hash`, `sandbox_build_hash`
-- Image tags and feature build contexts aren't namespaced by config root
-  (`devsandbox-img-<sandbox>`, `-feat`, `devsandbox-img-svc-<name>`,
-  `features/build-<sandbox>/`): two roots with the same names clobber each
-  other. → [images](architecture/instances/images-and-features.md);
-  `run::image::base_image_for`, `services::service_image`
 - Feature cache entries never refresh: a mutable tag (`:1`) stays at its
   first pull. → [images](architecture/instances/images-and-features.md); `features::fetch_into`
 - Features: `installsAfter` only (no `dependsOn`,
