@@ -2,9 +2,96 @@
 
 ## Unreleased
 
+One user model on every runtime: inside a sandbox you are a user with your host uid/gid, so workspace files come out owned by you on rootful docker, rootless docker, rootless podman and VM-backed runtimes alike. Browsers keep their own sandbox wherever it can work, and tools are told when it can't. Interactive `exec` sessions survive a dropped connection: `--attach` gets the program back, and a machine's terminal reconnects by itself after a network blip.
+
+**Behaviour change: sandboxes run as the host user by default (`identity = "host"`).** The config's `remoteUser` (else `containerUser`, else the image's `USER`) is adopted with your host uid/gid, keeping its name, home and shell. A config that assumes root in the container (mounts or paths under `/root`, a root `remoteUser`/`containerUser`) can break under it, so `run`, `start` and `rebuild` now offer to update it first (the dashboard asks too), and `identity = "image"` keeps the old behaviour. Existing instances keep the user they were created with until rebuilt (`devsandbox rebuild --force <name>`).
+
+```toml
+[sandbox.legacy]
+identity = "image"   # users as written, no remapping
+```
+
+### Added
+
+- **Sandboxes run as the host user, planned per runtime mode.** `run` probes the runtime's user-namespace mode (rootful, rootless docker, rootless podman, VM-backed) once per runtime context and picks how to create and exec the container so the adopted account ends up with your ids; it prints the plan in one line (`identity: rootful: exec as vscode, remapped to 1000:1000`) plus any warning. On rootless docker, where root is the host user, execs run as root with `HOME` set to the account's home. With no account to adopt (root or no user), the sandbox runs as root with a warning recommending the `common-utils` feature. `--reprobe` on `run` and `rebuild` probes the mode again instead of using the cached result. A docker socket mount gets the right group, and SELinux-enforcing hosts get their binds relabelled.
+
+```bash
+devsandbox run web --reprobe
+```
+
+- **`identity` config field, with `updateRemoteUserUID` as its hint.** `identity = "host"` (default) or `"image"` (users taken literally, as before). When `identity` is unset, `updateRemoteUserUID = false` means `"image"`, so devcontainer configs that opt out of uid remapping keep doing so.
+
+- **Updating configs that mount into `/root`.** Before `run`, `start` and `rebuild`, on a terminal, devsandbox lists the config entries that break under host identity and asks `[u]pdate / [c]ontinue as is (don't ask again) / [s]kip this time`. Update rewrites the config file in place, comments and layout kept: `/root` becomes `${containerEnv:HOME}`, a root user is removed (or kept with `identity = "image"`), and it names the instances that now need a rebuild. A YAML config gets the edits to make by hand. Off a terminal, under `run --json` and from autostart, `run` prints one warning line instead. The dashboard flags these sandboxes in its header (`N sandboxes use /root (U to update)`) and Detail panel, offers the update when it opens and on `U`, and asks the same question before `run`, `start` and `rebuild`. Machines' configs are checked on the machine.
+
+- **`${containerEnv:NAME}`.** Resolves at create, once the image is built, from the sandbox's `containerEnv`, else the image's `ENV`, else for `HOME` the home of the account the container runs as. It works in `mounts`, `shell-rc`, feature mounts, `containerEnv` and `remoteEnv`, so a mount can land in the user's home whoever that is, and `PATH = "${containerEnv:PATH}:/opt/bin"` extends the image's `PATH`.
+
+```toml
+mounts = ["source=${sharedVolumes}/gh,target=${containerEnv:HOME}/.config/gh,type=bind"]
+```
+
+- **Browsers keep their sandbox on docker.** Docker sandboxes are created with devsandbox's seccomp profile: docker's default plus user namespaces for unprivileged processes, which Chromium's and Electron's own sandbox needs (podman already allows it). That opens kernel surface docker's default closes; `userns = false` keeps docker's default profile.
+
+```toml
+[sandbox.web]
+userns = false
+```
+
+- **Browser sandbox check and tool env.** Each new container checks whether a browser sandbox can start there, and `run` says so (`browser sandbox: on`, or `off (<why>); sandbox-off knobs set`). Where it works, every exec gets `DEVSANDBOX_BROWSER_SANDBOX=1`; where it doesn't, the tools' sandbox-off knobs (`PUPPETEER_DANGEROUS_NO_SANDBOX`, `ELECTRON_DISABLE_SANDBOX`, `QTWEBENGINE_DISABLE_SANDBOX`, `PLAYWRIGHT_MCP_SANDBOX=false`, `CHROMIUM_FLAGS=--no-sandbox`), so tools turn their sandbox off only where it can't work. Keys you set in `containerEnv` or `remoteEnv` win. `inspect` prints the recorded verdict. Instances created before this say `not recorded` until rebuilt.
+
+- **Browsers where execs run as root.** On plans where execs run as root (rootless docker, root images), `chrome`, `chromium` and `google-chrome` go through a wrapper in `/run/devsandbox/bin` that starts the real browser at a non-root uid, so Chromium keeps its sandbox. `DEVSANDBOX_CHROME` (and `CHROME_PATH`, `CHROME_BIN`, `PUPPETEER_EXECUTABLE_PATH`) point at it; a Playwright script passes `executablePath: process.env.DEVSANDBOX_CHROME` and `chromiumSandbox: true`. Root plans also silence pip's and bundler's root warnings.
+
+- **Resumable `exec` sessions.** On an instance with the helper, a tty `exec` runs in a session that outlives the client: if the terminal or connection goes, the program keeps running, and `exec --attach` gets back to it (the instance's one detached session, a pick list when there are several, or `--attach=<id>`). `--sessions` lists them, `--session <id>` runs in a named one, attaching if it's live. The dashboard's instance terminals run in sessions too, so a shell closed with the dashboard can be reattached from the CLI. Detached sessions aren't cleaned up yet.
+
+```bash
+devsandbox exec web --sessions
+devsandbox exec web --attach
+devsandbox exec web --attach=1790000000-a1b2
+```
+
+- **Machine terminals reconnect.** A tty `exec` on a machine's instance, and a dashboard terminal tab on one, reattach to their session when ssh drops (`connection lost, reconnecting… (Ctrl-C to stop)`, backing off up to 10 s between tries), instead of ending the program's terminal. To keep ssh's own failure apart, a program there that exits 255 reports 254.
+
+- **API: `config.findings`, `config.migrate` and `config.ack`.** The `/root` findings of a config root, the in-place update (guarded by the file's hash: `conflict` when it changed since) and "continue as is", also on a machine (`machine`). Details: `docs/reference/api.md`, *Config*.
+
 ### Fixed
 
 - **Feature mounts under `${sharedVolumes}` work on a first run.** A feature's bind mount whose source is under `${sharedVolumes}` is now created when missing, like a config mount, instead of skipped with a warning. Other missing feature sources are still skipped.
+- **`caches` work for a non-root user.** Cache mounts now go to `/var/cache/devsandbox/<name>` instead of `/root/…`, which a non-root `remoteUser` couldn't reach. The tools find them through their env vars as before.
+
+<details><summary>Commits</summary>
+
+- b2c4d7c docs(identity): close the identity plan, with ADRs for the user model, the browser sandbox and the /root migration, and the living docs checked against the code
+- d37a8f3 feat(tui): offer the /root migration when the dashboard opens and before run, start and rebuild, so dashboard users get the same choice as the cli
+- 6ce79cc feat(run): ask before run, start and rebuild whether to update a config that mounts into /root, so the switch to host identity doesn't break sandboxes silently
+- 7d6cee8 feat(tui): flag sandboxes that use /root in the header and Detail, so a config the identity change broke is visible before anything fails
+- f6749d4 feat(serve): serve /root findings, their migration and acks over the API, so the CLI, the dashboard and machines check and fix a config the same way
+- 384d751 feat(config): rewrite /root findings in place with toml_edit, keeping comments and layout, guarded by a file hash and a transient backup
+- cca9216 feat(config): find the config entries that point into /root, each tied to the table that defines it, so a migration can rewrite them at their origin
+- 0374df0 feat(config): resolve ${containerEnv:NAME} from the image at create, so configs can name the adopted home instead of /root
+- f971a8c feat(devsbd): start browsers through a wrapper at a non-root uid on root plans, so Chromium keeps its sandbox where execs run as root
+- 4f84442 feat(run): check the browser sandbox in each new container and give execs the env that matches, so tools turn their sandbox off only where it can't work
+- 5b8cd40 feat(devsbd): add userns check so the host can tell from inside a container whether a browser sandbox can start, and which step blocks it
+- 34f6c51 feat(run): create docker sandboxes with a seccomp profile that allows user namespaces, so a browser's own sandbox can start
+- 300a457 docs(identity): split the tool environment and /root migration into steps 7-17 with landmarks, so implementers can run them
+- 4317d51 docs(status): mark fleet as active
+- 283dc54 docs(identity): mark the identity core shipped, leaving the tool environment and /root migration planned with known limitations listed
+- d4442a2 feat(run): create and exec sandboxes by the identity plan so workspace files come out host-owned on every runtime mode
+- 50c237c feat(runtime): probe each runtime context's user-namespace mode, cached per context, so the identity plan matches the host it runs on
+- 31f22f7 feat(devsbd): add identity apply so the helper can move the adopted account to the host ids without usermod in the image
+- d99932b docs(machines): plan a fleet of workers lending capacity to an always-on hub without exposing ssh
+- 3ff5371 feat(config): add the identity field and read updateRemoteUserUID as its hint so a sandbox can opt out of host identity
+- 0d33dde feat(runtime): add the identity classifier and strategy table so each runtime mode gets one tested user plan
+- 80fb208 docs(identity): split the core into commit-sized steps with landmarks so implementers can run it, decisions recorded
+- 0066a12 docs(identity): plan migrating /root configs so existing sandboxes survive the switch to host identity
+- f5857af docs(identity): plan one user model across runtimes so devcontainer configs stop breaking between rootful, rootless docker and podman
+- d03e16d fix(run): create missing feature bind sources under shared volumes
+- 9e9b4fd fix(config): mount caches outside /root so a non-root remoteUser can reach them
+- 1e52c67 docs(exec): mark resumable exec steps 1-3 shipped, leaving session cleanup planned
+- b219a6a feat(machines): reattach a machine exec's session after ssh drops, so a network blip doesn't end the program's terminal
+- f8bb5ef feat(exec): run tty execs in helper sessions with --attach/--sessions, so a dropped client can get its process back
+- e94c930 feat(devsbd): add pty sessions a client can reattach to, so an interactive exec can outlive its connection
+- 2818015 docs(exec): plan resumable interactive sessions so a dropped connection no longer leaks the process
+
+</details>
 
 ## 0.8.0
 
