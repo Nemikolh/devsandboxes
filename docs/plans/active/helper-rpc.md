@@ -52,8 +52,11 @@ messages. Helper binary size is best effort, not a hard limit.
    arbitrary streamed I/O and caller identity on the same wire shapes.
 
 Non-goals: replacing bootstrap (install, daemon start, the bridge) and the
-interactive `exec -it` paths; non-unix hosts (`serve` is unix-only, they
-keep exec).
+local interactive `exec -it` paths (the CLI's and the dashboard's own
+`exec`, and anything without `serve`, keep them); non-unix hosts (`serve`
+is unix-only, they keep exec). Attaching to an existing helper session
+(`session.attach`, below) is in scope: [fleet](fleet.md) step 4's `PTY`
+needs a daemon-side attach, since a fleet worker runs no CLI for the hub.
 
 ## Design
 
@@ -109,6 +112,8 @@ boundaries mean nothing).
 | `run.logs` | `stdout` from `offset`; with `follow`, until the run ends | polling |
 | `run.wait` | `event`s on state changes, then `result` | polling |
 | `run.attach` | live run I/O (`stdin`/`stdout`/`resize`/`signal`) | — (interactive runs) |
+| `session.attach` | params: session id, `create` (+ argv, cwd, env, user) or attach only; live session I/O (`stdin`/`stdout`/`resize`), then `exit`, or `error` `no-session` / `detached` | `exec -it … devsbd session new\|attach` for daemon-side callers ([resumable-exec](resumable-exec.md)) |
+| `session.ls` / `session.rm` | result | `devsbd session ls\|rm` |
 | `proc.spawn` | untracked process, I/O + `exit`, optional PTY | lifecycle / `vscode-goto` exec (optional) |
 | `fs.write` | path, mode, owner, atomic; body in `stdin` | boot file, workspace file (optional) |
 | `worktrees.sync` | result: created/removed stand-ins | — (see below) |
@@ -191,13 +196,28 @@ Each ships alone; 1-3 already fix "runs depend on a host exec".
 6. **`worktrees.sync`**.
 7. **Container → host `RPC`**, only if [cli-proxy](cli-proxy.md) picks the
    through-the-host transport or `CONTROL` migrates.
+8. **Sessions over RPC**: `session.attach` / `session.ls` / `session.rm`,
+   the daemon connecting to the session's `sock` as a client (the
+   supervisor's one-client takeover applies to it like to any other).
+   Done before [fleet](fleet.md) step 4, after steps 1-3 here.
+
+## Order across plans
+
+1. [resumable-exec](resumable-exec.md) step 4, "now" part.
+2. [fleet](fleet.md) steps 1-3, alongside steps 1-3 here.
+3. Step 8 here (`session.attach`).
+4. Fleet step 4 (`PTY` over the RPC stream).
+5. Steps 4-5 here (daemon-owned runs, restart policy), before fleet step
+   6 so dispatcher children on workers don't poll across machines.
+6. Fleet steps 5-9.
 
 ## Open questions
 
-- **PTY without libc**: `openpty`/`setsid`/`TIOCSCTTY` are syscalls the
-  helper doesn't make. Raw syscalls, or accept a `libc` dependency now
-  that size is best effort? Only `run.attach` TTY mode and `proc.spawn`
-  with a PTY need it.
+- **PTY for `proc.spawn` / `run.attach`**: the helper already opens ptys
+  through `extern "C"` libc calls without a dependency
+  (`devsbd/src/sessions.rs`); `run.attach` in TTY mode and `proc.spawn`
+  with a PTY reuse that. `session.attach` needs no pty of its own (the
+  supervisor holds it).
 - **Event delivery with no host attached**: reuse the notify outbox
   (persisted, acked) or a separate run-events queue?
 - **Scheduler policy source**: per-call `queue` key only, or sandbox

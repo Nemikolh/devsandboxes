@@ -208,9 +208,26 @@ Build `devsbd/src/sessions.rs` per *Sessions in the helper*.
 
 ## Step 4: cleanup (later, not started with steps 1-3)
 
-Prune ended/`lost` session dirs; surface detached sessions (dashboard
-rows, maybe an Inbox note); a policy for sessions nobody re-attaches to
-(idle timeout or explicit).
+Order with the other plans: [helper-rpc](helper-rpc.md#order-across-plans).
+
+Now, before [fleet](fleet.md) step 2:
+
+- Prune ended/`lost` session dirs.
+- The displaced client (below).
+- A version byte in the session wire, refused with a clear message on
+  mismatch: a supervisor keeps its old binary while `ensure_recorded`
+  installs a new helper, so a new client can meet an old supervisor.
+  Fleet's worker self-update makes that routine and unattended.
+- A session count on the instance row (`session ls`).
+
+After fleet step 1 (fleet root, `lend.toml`):
+
+- Surface detached sessions (dashboard rows, maybe an Inbox note). The
+  Inbox is per host until fleet step 8, so a note for a hub-placed
+  instance would land in the worker's own Inbox.
+- A policy for sessions nobody re-attaches to (idle timeout or
+  explicit); on a worker they hold lent capacity, so it may belong in
+  `lend.toml` or the capacity report.
 
 Found in step 1's review (orchestrator): a displaced client whose exec pty
 nobody reads anymore (ssh gone, docker kept the exec) can stay blocked
@@ -231,4 +248,5 @@ supervisor a way to signal it).
 - **Relation to [helper-rpc](helper-rpc.md)**'s `run.attach`: sessions
   stay on `exec -it` (that plan keeps interactive exec out of scope); if
   `RPC` lands, `run.attach` could attach to a session's socket from the
-  daemon side.
+  daemon side. Decided together with [fleet](fleet.md) step 4's `PTY`,
+  which needs the same daemon-side attach.

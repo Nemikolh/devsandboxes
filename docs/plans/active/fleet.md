@@ -218,7 +218,10 @@ agent never reaches the hub.
 
 ## Rollout
 
-Each step is usable on its own.
+Each step is usable on its own. Order with the other plans is in
+[helper-rpc](helper-rpc.md#order-across-plans): steps 1-3 run alongside
+helper-rpc's 1-3; step 4 waits for helper-rpc's `session.attach`; step 6
+for its daemon-owned runs.
 
 1. **Fleet link and hub mode** (L). `fleet-link`, the frame-mux link with
    `API` channels, the `offered` registry kind and its channel `Dial`,
@@ -239,6 +242,16 @@ Each step is usable on its own.
 4. **Interactive over the link** (M). `PTY` (exec, terminal tabs, the
    reconnecting `exec`), `CONNECT` forwards, `SSH_AGENT` from the hub.
    Placed instances become as usable as local ones.
+   `PTY` is a session attach ([resumable-exec](resumable-exec.md)): the
+   channel opens with `{instance, session id, create|attach}` and ends
+   with a structured record (`exit <code>` | `gone` | `detached` |
+   `lost`); a link drop is `lost`, never an exit. The 255 /
+   `--reserve-255` convention (`serve::machines::cli::Reconnect`) stays
+   ssh-machine-only. `fleet::WORKER` gains session `ls`/`rm` for
+   fleet-root instances. Decide first whether the worker daemon attaches
+   to the session's `sock` directly (proposed: drops the in-container
+   client and the `exec -it` hop, settles helper-rpc's `run.attach`) or
+   goes through `<runtime> exec -it` as the ssh path does.
 5. **Transfer v1** (L). Repo identity, WIP snapshot commits, bundles
    routed through the hub, repo caches, the hub mirror, fetch-back.
    Repos without a remote and unpushed work can be placed.
@@ -259,13 +272,17 @@ Each step is usable on its own.
    worker, when back, is told the instance moved: stop it, keep its WIP
    ref, no auto-delete). Process state is lost, committed and
    checkpointed work isn't. `devsandbox move <instance> [--to m]` is the
-   manual form.
+   manual form. Fencing a copy ends its sessions: live or detached
+   sessions extend the grace period (or at least warn), and an attach to
+   a moved instance says `moved to <machine>`, not `no session`.
 8. **Laptop as a client of the hub** (M). A laptop links the hub as an
    ordinary ssh machine (laptop → hub, fine) or, when it's also a worker,
    over its offered link's `API` channel in the other direction. Federated
    snapshots through the hub (a link's watch asks for `machines: true`;
    rows of the asking machine never re-exported: no cycles), `PTY` and
-   `CONNECT` to another worker's instances relayed by the hub, the Inbox behind the daemon on
+   `CONNECT` to another worker's instances relayed by the hub (`PTY` end
+   records relayed unchanged: a worker hop dropping reaches the client
+   as `lost`), the Inbox behind the daemon on
    both ends (machines-next §2), nameless commands across the fleet
    (machines-next §3).
 9. **Sync layer** (L, later). A second `Transfer` for state git doesn't
@@ -278,7 +295,8 @@ Each step is usable on its own.
 - Fencing in step 7: is "the worker stops the stale copy when it
   reconnects" enough, or must a placed instance hold a lease it renews
   with the hub and stop itself when the lease lapses (laptop offline but
-  awake, e.g. off the tailnet)?
+  awake, e.g. off the tailnet)? Either way it ends that copy's sessions,
+  which a user may still mean to reattach to (step 7).
 - Checkpoint cadence and size: big untracked files in WIP commits; a size
   cap with a warning, or `.devsandboxignore`?
 - Hub mirror retention: when are WIP refs and repo caches of removed
