@@ -269,6 +269,21 @@ devsandbox machine rm box                      # unregister only
 - Networks/containers are namespaced by a short hash of the config-root path, so
   two projects never collide.
 
+## Browsers in a sandbox
+
+When `DEVSANDBOX_BROWSER_SANDBOX=1` is set in an instance (`devsandbox exec
+<instance> env`), Chromium's sandbox works there. Playwright turns it off by
+default, so launch with `chromiumSandbox: true`, plus `executablePath:
+process.env.DEVSANDBOX_CHROME` when that's set (instances whose execs run as
+root: `/run/devsandbox/bin/chrome` starts the browser at a non-root uid):
+
+```js
+chromium.launch({ chromiumSandbox: true, executablePath: process.env.DEVSANDBOX_CHROME })
+```
+
+Never add `--no-sandbox` by hand. Without `DEVSANDBOX_BROWSER_SANDBOX`,
+keep the tool's defaults: devsandbox has set its sandbox-off knobs.
+
 ## Debugging a sandbox
 
 Container name for an instance is `devsandbox-<instance>`; service containers are

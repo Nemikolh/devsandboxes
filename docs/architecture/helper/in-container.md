@@ -8,7 +8,7 @@ Code: `devsbd/src/daemon.rs` (`run`, `take_over`, `Bridges::route`,
 `flush`, `control_exchange`, `control_follow`), `devsbd/src/bridge.rs`,
 `devsbd/src/boot.rs`, `devsbd/src/outbox.rs`, `devsbd/src/ctl.rs`,
 `devsbd/src/runs.rs`, `devsbd/src/sessions.rs`, `devsbd/src/vscode.rs`, `devsbd/src/json.rs`,
-`devsbd/src/identity.rs`, `devsbd/src/userns.rs`;
+`devsbd/src/identity.rs`, `devsbd/src/userns.rs`, `devsbd/src/browser.rs`;
 `src/commands/run/mod.rs` (`container_command`, `BOOT_HOOK_LABEL`).
 
 ## Files and sockets
@@ -16,6 +16,7 @@ Code: `devsbd/src/daemon.rs` (`run`, `take_over`, `Bridges::route`,
 | path | what |
 |---|---|
 | `/run/devsandbox/bin/devsbd` | the binary (symlinked as `/usr/local/bin/devsbd`) |
+| `/run/devsandbox/bin/chrome`, `chromium`, `chromium-browser`, `google-chrome`, `google-chrome-stable` | symlinks to `devsbd`: the browser wrapper |
 | `/run/devsandbox/devsbd.ctl` (0600) | bridges attach here (root only) |
 | `/run/devsandbox/ssh-agent.sock` (0666) | agent socket for container processes |
 | `/run/devsandbox/api.sock` (0666) | in-container clients: first byte `n` = outbox poke, `c` = control request |
@@ -240,6 +241,36 @@ number; 2 on a usage error. Off Linux it always exits 1. Without
 `--as-root` at euid 0 it fails up front with `devsbd: userns: euid: root`
 (`ROOT_LINE`): Chromium refuses its sandbox there, whatever namespaces
 could be made.
+
+## Browser wrapper
+
+`devsbd` is multicall: when `argv[0]`'s basename is one of
+`browser::NAMES` (`chrome`, `chromium`, `chromium-browser`,
+`google-chrome`, `google-chrome-stable`), `main` runs `browser::run`
+whatever the args. The host's install links those names to `devsbd` in
+`/run/devsandbox/bin`, and a root plan's tool env puts that dir first on
+`PATH` (see [identity](../instances/identity.md#the-browser-wrapper)).
+
+The real browser is the first of `browser::candidates` that is an
+executable file and doesn't resolve to the running binary (a link back to
+the wrapper is skipped, not looped): the invoked name, then the other
+names, in each absolute `PATH` dir except `/run/devsandbox/bin`; then the
+newest `chromium-*/chrome-linux*/chrome` under `$PLAYWRIGHT_BROWSERS_PATH`
+(when set and not `0`) or `~/.cache/ms-playwright`; then the newest
+`chrome/*/chrome-linux64/chrome` under `$PUPPETEER_CACHE_DIR` or
+`~/.cache/puppeteer`. None: exit 127 with one stderr line, `devsbd:
+<name>: no browser found (…)`.
+
+At euid 0 the wrapper calls `userns::enter_userns(1001, 1001)` in place
+(the `--as-root` check's first step), so the browser runs at uid 1001
+over container root: it can write what root can, its files come out
+root's, and Chrome nests its own namespaces for the renderers. At another
+euid nothing changes. Then `execv` with the real path as `argv[0]` and the
+caller's args; fds stay as they are, so Playwright's
+`--remote-debugging-pipe` (fds 3 and 4) gets through. If `enter_userns`
+fails, the wrapper says so on stderr (`devsbd: <name>: no user namespace
+for the browser (<step>: <errno>); starting <path> with --no-sandbox`) and
+execs with `--no-sandbox` appended. A failed exec is exit 126.
 
 ## `devsbd vscode-goto <abs>[:line[:col]] [--wait SECS]`
 

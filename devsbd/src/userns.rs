@@ -9,14 +9,16 @@
 //! and nests the same sequence there.
 //!
 //! The work happens in a forked child, so the caller's namespaces are
-//! untouched. [`enter_userns`] is the reusable core.
+//! untouched. [`enter_userns`] is the reusable core (the browser wrapper,
+//! `browser.rs`, enters one in place before its exec).
 
 const USAGE: &str = "usage: devsbd userns check [--as-root]";
 
 /// The inner id `--as-root` maps the container's root to: non-root, so
 /// Chrome keeps its sandbox; any fixed id works, nothing is looked up.
+/// The browser wrapper uses the same id.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-const WRAPPED_ID: u32 = 1001;
+pub const WRAPPED_ID: u32 = 1001;
 
 /// A plain check's outcome at euid 0.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -66,9 +68,17 @@ pub fn run(args: &[String]) -> i32 {
     imp::check(as_root)
 }
 
+#[cfg(target_os = "linux")]
+pub use imp::enter_userns;
+
 /// The one stderr line of a failed check.
 pub fn outcome_line(step: Step, errno: i32) -> String {
-    format!("devsbd: userns: {}: {}", step.name(), errno_name(errno))
+    format!("devsbd: userns: {}", describe(step, errno))
+}
+
+/// `<step>: <errno name>`, the tail of [`outcome_line`].
+pub fn describe(step: Step, errno: i32) -> String {
+    format!("{}: {}", step.name(), errno_name(errno))
 }
 
 /// The errnos namespace creation is known to fail with, by name; others as

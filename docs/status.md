@@ -160,6 +160,12 @@ limitation means editing this file in the same commit.
 - Tool env: `PLAYWRIGHT_MCP_SANDBOX=false` and `CHROMIUM_FLAGS=--no-sandbox`
   are unverified knobs (no Playwright MCP or Debian `chromium` wrapper
   was tested). `run::tool_env::tool_env`
+- Tool env: the Playwright library keeps its sandbox off (it adds
+  `--no-sandbox`) and skips the root plan's browser wrapper unless a script
+  launches with `chromiumSandbox: true` and `executablePath:
+  $DEVSANDBOX_CHROME`; no env var does it. `run::tool_env::tool_env`
+- Browser wrapper: never run under rootless podman (one more userns level);
+  its test runs a fake browser under docker. `devsbd/src/browser.rs` `run`
 - `rebuild --reprobe` without config drift does nothing unless `--force`
   is given too. `rebuild::rebuild`
 

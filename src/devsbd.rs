@@ -142,18 +142,27 @@ fn decompress(zst: &[u8]) -> Option<Vec<u8>> {
 /// images that mount a tmpfs at `/run`.
 pub const BIN: &str = "/run/devsandbox/bin/devsbd";
 
+/// The browser wrapper (`devsbd` as `chrome`, linked by `INSTALL_SCRIPT`).
+pub const BROWSER_WRAPPER: &str = "/run/devsandbox/bin/chrome";
+
+/// The dir of [`BIN`] and the wrapper's links, first on a root plan's `PATH`.
+pub const BIN_DIR: &str = "/run/devsandbox/bin";
+
 /// Write stdin to a temp file and rename, so a concurrent `devsbd version`
 /// never sees a half-written binary. The notify outbox (`notify::OUTBOX`), the
 /// runs dir (`devsbd/src/runs.rs`) and the sessions dir
 /// (`devsbd/src/sessions.rs`) are made world-writable + sticky because
 /// `devsbd notify` / `devsbd run start` / `devsbd session new` run as the
 /// sandbox user; the `/usr/local/bin` symlink puts `devsbd` on `PATH` for scripts.
-/// Both best-effort (read-only or missing dirs), each wrapped in `{ …; }` so
+/// The browser names next to it are the helper's browser wrapper
+/// (`devsbd/src/browser.rs` `NAMES`; [`BROWSER_WRAPPER`] is the one the tool env
+/// points at). The dirs and the `/usr/local/bin` link are best-effort (read-only or missing dirs), each wrapped in `{ …; }` so
 /// it can't turn a good install into a failure.
 const INSTALL_SCRIPT: &str = "mkdir -p /run/devsandbox/bin \
     && cat > /run/devsandbox/bin/devsbd.tmp \
     && chmod 755 /run/devsandbox/bin/devsbd.tmp \
     && mv /run/devsandbox/bin/devsbd.tmp /run/devsandbox/bin/devsbd \
+    && for n in chrome chromium chromium-browser google-chrome google-chrome-stable; do ln -sf devsbd /run/devsandbox/bin/$n || exit; done \
     && { { mkdir -p /var/lib/devsandbox/outbox && chmod 1777 /var/lib/devsandbox/outbox; } 2>/dev/null || true; } \
     && { { mkdir -p /var/lib/devsandbox/runs && chmod 1777 /var/lib/devsandbox/runs; } 2>/dev/null || true; } \
     && { { mkdir -p /var/lib/devsandbox/sessions && chmod 1777 /var/lib/devsandbox/sessions; } 2>/dev/null || true; } \
@@ -638,6 +647,84 @@ mod tests {
         Ok(())
     }
 
+    /// The browser wrapper (`devsbd/src/browser.rs`) as root, in alpine with
+    /// a fake `chrome` on `PATH`: under our profile it starts the browser at
+    /// uid 1001 in its own user namespace, fd 3 still open; under docker's
+    /// default it falls back to `--no-sandbox` at uid 0. No browser (a link
+    /// back to the wrapper doesn't count) is exit 127. Root has no
+    /// `CAP_SYS_ADMIN` in docker's default cap set, so this holds rootful or
+    /// rootless.
+    #[test_utils::docker_test(helper)]
+    fn browser_wrapper_drops_root_with_docker() -> Result<(), &'static str> {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("devsandbox-browser-test-{stamp}"));
+        let profile = crate::runtime::seccomp::ensure_file_in(&dir).map_err(|_| "cannot write the profile")?;
+        let names = [format!("devsandbox-devsbd-browser-ours-{stamp}"), format!("devsandbox-devsbd-browser-default-{stamp}")];
+        let cleanup = || {
+            let _ = std::fs::remove_dir_all(&dir);
+            for name in &names {
+                let _ = Command::new("docker").args(["rm", "-f", name]).output();
+            }
+        };
+        let fake = "#!/bin/sh\necho \"uid=$(id -u)\"\n[ -e /proc/self/fd/3 ] && echo fd3=open || echo fd3=closed\necho \"args=$*\"\n";
+        crate::test_support::with_cleanup(cleanup, || {
+            let seccomp = format!("seccomp={}", profile.display());
+            for (name, opts) in [(&names[0], vec!["--security-opt", seccomp.as_str()]), (&names[1], vec![])] {
+                let up = Command::new("docker")
+                    .args(["run", "-d", "--rm", "--name", name])
+                    .args(opts)
+                    .args(["alpine:3.20", "sleep", "300"])
+                    .output()
+                    .unwrap();
+                assert!(up.status.success(), "{}", String::from_utf8_lossy(&up.stderr));
+                install(name, None).unwrap();
+            }
+            let sh = |name: &str, script: &str| {
+                let out = Command::new("docker").args(["exec", "-u", "root", name, "sh", "-c", script]).output().unwrap();
+                let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+                (out.status.code(), text(&out.stdout), text(&out.stderr))
+            };
+            let put_fake = |name: &str| {
+                let mut child = Command::new("docker")
+                    .args(["exec", "-i", "-u", "root", name, "sh", "-c"])
+                    .arg("cat > /usr/local/bin/chrome && chmod 755 /usr/local/bin/chrome")
+                    .stdin(Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                child.stdin.take().unwrap().write_all(fake.as_bytes()).unwrap();
+                assert!(child.wait().unwrap().success());
+            };
+            // Nothing to find; a link back to the wrapper is skipped, not looped.
+            let (code, out, err) = sh(&names[0], "ln -s /run/devsandbox/bin/devsbd /usr/bin/google-chrome && /run/devsandbox/bin/chrome");
+            assert_eq!(code, Some(127), "{out}{err}");
+            assert_eq!(err.lines().count(), 1, "{err}");
+            assert!(err.starts_with("devsbd: chrome: no browser found"), "{err}");
+
+            put_fake(&names[0]);
+            // Invoked as `chromium` (none on PATH), it falls back to `chrome`.
+            for link in ["chrome", "chromium"] {
+                let (code, out, err) = sh(&names[0], &format!("/run/devsandbox/bin/{link} --headless 3</etc/hostname"));
+                assert_eq!((code, out.as_str(), err.as_str()), (Some(0), "uid=1001\nfd3=open\nargs=--headless\n", ""));
+            }
+            let (_, out, _) = sh(&names[0], "/run/devsandbox/bin/chrome");
+            assert_eq!(out, "uid=1001\nfd3=closed\nargs=\n", "the fd check can fail");
+
+            put_fake(&names[1]);
+            let (code, out, err) = sh(&names[1], "/run/devsandbox/bin/chrome --headless 3</etc/hostname");
+            assert_eq!((code, out.as_str()), (Some(0), "uid=0\nfd3=open\nargs=--headless --no-sandbox\n"), "{err}");
+            assert_eq!(
+                err,
+                "devsbd: chrome: no user namespace for the browser (unshare(CLONE_NEWUSER): EPERM); starting /usr/local/bin/chrome with --no-sandbox\n"
+            );
+        });
+        Ok(())
+    }
+
     #[test]
     fn boot_spec_mirrors_the_lifecycle_exec() {
         #[derive(Deserialize)]
@@ -693,6 +780,18 @@ mod tests {
     fn install_links_devsbd_onto_path_best_effort() {
         assert!(INSTALL_SCRIPT.ends_with(
             "&& { ln -sf /run/devsandbox/bin/devsbd /usr/local/bin/devsbd 2>/dev/null || true; }"
+        ));
+    }
+
+    #[test]
+    fn install_links_the_browser_wrapper_names() {
+        assert_eq!(BROWSER_WRAPPER, format!("{BIN_DIR}/chrome"));
+        assert_eq!(BIN, format!("{BIN_DIR}/devsbd"));
+        // The helper's `browser::NAMES`, linked relative to `devsbd` and
+        // required (the tool env points at them).
+        assert!(INSTALL_SCRIPT.contains(
+            "&& for n in chrome chromium chromium-browser google-chrome google-chrome-stable; \
+             do ln -sf devsbd /run/devsandbox/bin/$n || exit; done &&"
         ));
     }
 

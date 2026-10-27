@@ -48,6 +48,15 @@ pub fn fixed_path(script: &str) -> String {
     format!("PATH={FIXED_PATH}; export PATH; {script}")
 }
 
+/// An image config's `Env` entries as pairs, split at the first `=`; an
+/// entry without one is dropped (it sets nothing).
+fn split_env(entries: Vec<String>) -> Vec<(String, String)> {
+    entries
+        .into_iter()
+        .filter_map(|e| e.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
+        .collect()
+}
+
 /// Env var that overrides runtime selection: `docker`, `podman` or `container`.
 pub const RUNTIME_ENV: &str = "DEVSANDBOX_RUNTIME";
 
@@ -329,6 +338,11 @@ pub trait Backend: Send + Sync {
     /// The local image's `USER` (`None` when unset or empty): the account
     /// `identity = "host"` adopts when the config names none.
     fn image_user(&self, image: &str) -> Result<Option<String>>;
+
+    /// The local image's `ENV`, in order (`KEY=VALUE` split at the first
+    /// `=`; empty when unset): what a container starts with before
+    /// `containerEnv`, e.g. the `PATH` a root plan's tool env extends.
+    fn image_env(&self, image: &str) -> Result<Vec<(String, String)>>;
 
     /// Delete a named volume. `Ok(false)` when it doesn't exist (already
     /// gone), an error when the runtime refuses (e.g. still in use).

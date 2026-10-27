@@ -191,6 +191,11 @@ impl Backend for Dockerlike {
         parse_image_user(&out)
     }
 
+    fn image_env(&self, image: &str) -> Result<Vec<(String, String)>> {
+        let out = self.output_quiet(&["image", "inspect", "--format", "{{json .Config.Env}}", image])?;
+        parse_image_env(&out)
+    }
+
     fn remove_volume(&self, name: &str) -> Result<bool> {
         match self.output_quiet(&["volume", "rm", name]) {
             Ok(_) => Ok(true),
@@ -286,6 +291,13 @@ fn parse_image_user(out: &str) -> Result<Option<String>> {
     let value: Option<String> = serde_json::from_str(out.trim())
         .with_context(|| format!("unexpected image user `{}`", out.trim()))?;
     Ok(value.filter(|u| !u.is_empty()))
+}
+
+/// `{{json .Config.Env}}`: a JSON list of `KEY=VALUE`, `null` when unset.
+fn parse_image_env(out: &str) -> Result<Vec<(String, String)>> {
+    let value: Option<Vec<String>> = serde_json::from_str(out.trim())
+        .with_context(|| format!("unexpected image env `{}`", out.trim()))?;
+    Ok(super::split_env(value.unwrap_or_default()))
 }
 
 /// A string, or a list of strings (podman emits `Names` as an array).
@@ -485,6 +497,21 @@ mod tests {
             ["/usr/bin/tini", "--"]
         );
         assert!(parse_entrypoint("garbage").is_err());
+    }
+
+    #[test]
+    fn parse_image_env_splits_at_the_first_equals() {
+        // Captured from `docker image inspect --format '{{json .Config.Env}}' alpine:3.20`, plus one.
+        let out = "[\"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\",\"OPTS=a=b\"]\n";
+        assert_eq!(
+            parse_image_env(out).unwrap(),
+            [
+                ("PATH".to_string(), "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string()),
+                ("OPTS".into(), "a=b".into())
+            ]
+        );
+        assert!(parse_image_env("null").unwrap().is_empty());
+        assert!(parse_image_env("garbage").is_err());
     }
 
     #[test]

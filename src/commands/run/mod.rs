@@ -710,6 +710,10 @@ pub(crate) fn materialize(
     let image = image_for(dir, sandbox)?;
     // Who the container runs as (docs/architecture/instances/identity.md).
     let (plan, seccomp) = identity::plan_for(&image, props, extras.reprobe, privileged);
+    let root_plan = tool_env::root_plan(plan.exec_user.as_deref());
+    // A root plan's tool env puts the browser wrapper's dir before the
+    // image's PATH (`exec -e PATH` replaces it); unreadable reads as unset.
+    let image_env = if root_plan { backend().image_env(&image).unwrap_or_default() } else { Vec::new() };
     tracker.enter(Phase::Creating)?;
     run_container(
         dir,
@@ -766,7 +770,6 @@ pub(crate) fn materialize(
     }
     // Whether the browser sandbox can work here, checked as the exec user in
     // the real container (its seccomp, user, AppArmor); the knobs follow.
-    let root_plan = tool_env::root_plan(plan.exec_user.as_deref());
     let browser_sandbox = devsbd_arch
         .is_some()
         .then(|| tool_env::check(&tool_env::check_argv(&container, plan.exec_user.as_deref())))
@@ -777,7 +780,8 @@ pub(crate) fn materialize(
         .chain(props.remote_env.iter())
         .flat_map(|env| env.keys().map(String::as_str))
         .collect();
-    let tool_env = tool_env::tool_env(root_plan, browser_sandbox.as_ref(), &user_keys);
+    let tool_env =
+        tool_env::tool_env(root_plan, browser_sandbox.as_ref(), tool_env::image_path(&image_env), &user_keys);
     eprintln!("{}", tool_env::summary(root_plan, browser_sandbox.as_ref()));
     let workspace_file = write_workspace_file(
         &container,
@@ -1765,7 +1769,7 @@ mod tests {
             assert_eq!(env.get("CHROMIUM_FLAGS"), Some(&"--mine"), "{out}");
             assert!(!info.tool_env.contains_key("CHROMIUM_FLAGS"), "{:?}", info.tool_env);
             let root = tool_env::root_plan(info.remote_user.as_deref());
-            let knobs = root || info.browser_sandbox != Some(BrowserSandbox::On);
+            let knobs = info.browser_sandbox != Some(BrowserSandbox::On);
             assert_eq!(env.get("PUPPETEER_DANGEROUS_NO_SANDBOX") == Some(&"1"), knobs, "{out}");
             assert_eq!(env.get("ELECTRON_DISABLE_SANDBOX") == Some(&"1"), knobs, "{out}");
             assert_eq!(env.get("DEVSANDBOX_BROWSER_SANDBOX") == Some(&"1"), !knobs, "{out}");
@@ -1773,6 +1777,21 @@ mod tests {
                 // Rootless docker (this host's case): the silencers too.
                 assert_eq!(env.get("BUNDLE_SILENCE_ROOT_WARNING"), Some(&"1"), "{out}");
                 assert_eq!(env.get("PIP_ROOT_USER_ACTION"), Some(&"warn"), "{out}");
+            }
+            if root && !knobs {
+                // Through the wrapper, ahead of alpine's own PATH.
+                let wrapper = crate::devsbd::BROWSER_WRAPPER;
+                assert_eq!(env.get("CHROME_PATH"), Some(&wrapper), "{out}");
+                assert_eq!(env.get("DEVSANDBOX_CHROME"), Some(&wrapper), "{out}");
+                assert_eq!(
+                    env.get("PATH"),
+                    Some(&"/run/devsandbox/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"),
+                    "{out}"
+                );
+                let which = ["sh".to_string(), "-c".into(), "command -v chromium".into()];
+                let argv = crate::commands::exec::exec_argv_with(info, false, false, &which, false);
+                let out = backend().output_quiet(&argv.iter().map(String::as_str).collect::<Vec<_>>()).unwrap();
+                assert_eq!(out.trim(), "/run/devsandbox/bin/chromium");
             }
         });
     }

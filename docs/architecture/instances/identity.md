@@ -125,16 +125,40 @@ an exec that can't run leaves it unknown (`None`).
 |---|---|---|
 | non-root | `On` | `DEVSANDBOX_BROWSER_SANDBOX=1` |
 | non-root | `Off`, unknown | the sandbox-off knobs |
-| root | any | the sandbox-off knobs, plus `PIP_ROOT_USER_ACTION=ignore`, `BUNDLE_SILENCE_ROOT_WARNING=1` |
+| root | `On` | `DEVSANDBOX_BROWSER_SANDBOX=1`; `DEVSANDBOX_CHROME`, `CHROME_PATH`, `CHROME_BIN`, `PUPPETEER_EXECUTABLE_PATH` = `/run/devsandbox/bin/chrome`; `PATH=/run/devsandbox/bin:<image PATH>` |
+| root | `Off`, unknown | the sandbox-off knobs |
 
-The sandbox-off knobs (`SANDBOX_OFF_KNOBS`) are
-`PUPPETEER_DANGEROUS_NO_SANDBOX=1`, `ELECTRON_DISABLE_SANDBOX=1`,
-`QTWEBENGINE_DISABLE_SANDBOX=1`, `PLAYWRIGHT_MCP_SANDBOX=false` and
-`CHROMIUM_FLAGS=--no-sandbox`. A root plan gets them whatever the check
-says: Chromium refuses its sandbox at euid 0. Keys the sandbox sets itself
-in `containerEnv` or `remoteEnv` are left out. `run` says one line
-(`tool_env::summary`): `browser sandbox: on`, or `browser sandbox: off
-(<why>); sandbox-off knobs set`.
+A root plan also gets `PIP_ROOT_USER_ACTION=ignore` and
+`BUNDLE_SILENCE_ROOT_WARNING=1`, whatever the verdict. The sandbox-off
+knobs (`SANDBOX_OFF_KNOBS`) are `PUPPETEER_DANGEROUS_NO_SANDBOX=1`,
+`ELECTRON_DISABLE_SANDBOX=1`, `QTWEBENGINE_DISABLE_SANDBOX=1`,
+`PLAYWRIGHT_MCP_SANDBOX=false` and `CHROMIUM_FLAGS=--no-sandbox`. Keys the
+sandbox sets itself in `containerEnv` or `remoteEnv` are left out, `PATH`
+included. `run` says one line (`tool_env::summary`): `browser sandbox:
+on`, `browser sandbox: on (through /run/devsandbox/bin/chrome)` on a root
+plan, or `browser sandbox: off (<why>); sandbox-off knobs set`.
+
+### The browser wrapper
+
+Chromium refuses its sandbox at euid 0, and a root plan's execs all run
+as container root. So on a root plan with `On`, the browser goes through
+the helper's wrapper ([in-container](../helper/in-container.md#browser-wrapper)):
+`devsbd` linked as `chrome`, `chromium`, `chromium-browser`,
+`google-chrome` and `google-chrome-stable` in `/run/devsandbox/bin`
+(`devsbd::BROWSER_WRAPPER`, the links made by the install), which execs the
+real browser at uid 1001 in a single-uid user namespace, container root
+underneath. That's the sequence `devsbd userns check --as-root` verified,
+so `On` means it works. The image's `PATH` comes from its `ENV`
+(`Backend::image_env`, read in `materialize`; `tool_env::image_path`),
+since `exec -e PATH` replaces the container's; with none, Debian's default
+(`DEFAULT_PATH`).
+
+The Playwright library doesn't go through the wrapper on its own, and
+adds `--no-sandbox` unless launched with `chromiumSandbox: true`: no env
+var changes either. So a script opts in with `chromiumSandbox: true` when
+`DEVSANDBOX_BROWSER_SANDBOX` is set, and `executablePath:
+process.env.DEVSANDBOX_CHROME` when that is. The `devsandbox-cli` skill
+(`skills/devsandbox-cli/SKILL.md`, *Browsers in a sandbox*) tells agents.
 
 ## Applying it
 

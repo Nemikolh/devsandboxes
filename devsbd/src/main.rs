@@ -3,6 +3,7 @@
 
 mod boot;
 mod bridge;
+mod browser;
 mod ctl;
 mod daemon;
 mod identity;
@@ -55,6 +56,12 @@ fn build_hash() -> String {
 const FEATURES: &[&str] = &["thread-send", "thread-withdraw", "thread-ls-feed", "events-follow", "session", "userns"];
 
 fn main() {
+    // Multicall: under a browser's name (the links in /run/devsandbox/bin)
+    // this is the browser wrapper, whatever the args.
+    let mut argv = std::env::args_os();
+    if let Some(name) = argv.next().as_deref().and_then(browser::invoked_as) {
+        std::process::exit(browser::run(name, argv.collect()));
+    }
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("version") => println!("devsbd {} {}", proto::VERSION, build_hash()),

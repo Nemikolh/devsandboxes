@@ -307,6 +307,11 @@ impl Backend for AppleContainer {
         parse_image_user(&out, oci_arch(std::env::consts::ARCH))
     }
 
+    fn image_env(&self, image: &str) -> Result<Vec<(String, String)>> {
+        let out = self.output_quiet(&["image", "inspect", image])?;
+        parse_image_env(&out, oci_arch(std::env::consts::ARCH))
+    }
+
     fn remove_volume(&self, name: &str) -> Result<bool> {
         match self.output_quiet(&["volume", "delete", name]) {
             Ok(_) => Ok(true),
@@ -355,6 +360,8 @@ struct OciImageConfig {
     entrypoint: Option<Vec<String>>,
     #[serde(rename = "User", default)]
     user: Option<String>,
+    #[serde(rename = "Env", default)]
+    env: Option<Vec<String>>,
 }
 
 /// Rust's `std::env::consts::ARCH` in OCI platform terms.
@@ -376,6 +383,11 @@ fn parse_image_entrypoint(json: &str, arch: &str) -> Result<Vec<String>> {
 /// unset or empty.
 fn parse_image_user(json: &str, arch: &str) -> Result<Option<String>> {
     Ok(image_config(json, arch)?.and_then(|c| c.user).filter(|u| !u.is_empty()))
+}
+
+/// The `Env` of the variant [`parse_image_entrypoint`] picks.
+fn parse_image_env(json: &str, arch: &str) -> Result<Vec<(String, String)>> {
+    Ok(super::split_env(image_config(json, arch)?.and_then(|c| c.env).unwrap_or_default()))
 }
 
 /// The `linux/<arch>` variant's config, else the first variant's.
@@ -419,6 +431,18 @@ mod tests {
         assert_eq!(parse_image_user(json, "arm64").unwrap(), None);
         let json = r#"[{"variants": [{"config": {"architecture": "arm64", "os": "linux"}}]}]"#;
         assert_eq!(parse_image_user(json, "arm64").unwrap(), None);
+    }
+
+    #[test]
+    fn image_env_picks_host_variant() {
+        let json = r#"[{"variants": [
+          {"config": {"architecture": "amd64", "os": "linux", "config": {"Env": ["PATH=/amd"]}}},
+          {"config": {"architecture": "arm64", "os": "linux", "config": {"Env": ["PATH=/usr/bin:/bin", "A=b=c"]}}}
+        ]}]"#;
+        let want = [("PATH".to_string(), "/usr/bin:/bin".to_string()), ("A".into(), "b=c".into())];
+        assert_eq!(parse_image_env(json, "arm64").unwrap(), want);
+        let json = r#"[{"variants": [{"config": {"architecture": "arm64", "os": "linux"}}]}]"#;
+        assert!(parse_image_env(json, "arm64").unwrap().is_empty());
     }
 
     #[test]

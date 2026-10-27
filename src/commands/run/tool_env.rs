@@ -3,6 +3,8 @@
 //! `devsbd userns check` finds it after create ([`check_argv`], [`check`],
 //! [`browser_sandbox`]), and the env every exec then gets from it
 //! ([`tool_env`]), recorded on the instance (`state::Instance::tool_env`).
+//! On a root plan the browser goes through the helper's wrapper
+//! (`devsbd/src/browser.rs`), which starts it at a non-root euid.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::process::{Command, Stdio};
@@ -39,6 +41,19 @@ const ROOT_SILENCERS: [(&str, &str); 2] = [("PIP_ROOT_USER_ACTION", "ignore"), (
 /// Set when the browser sandbox works for the exec user, so a script can
 /// opt in where its tool defaults to off (Playwright's `chromiumSandbox`).
 const SANDBOX_ON: (&str, &str) = ("DEVSANDBOX_BROWSER_SANDBOX", "1");
+
+/// What points tools at the browser wrapper on a root plan:
+/// `DEVSANDBOX_CHROME` for scripts that opt in (Playwright's
+/// `executablePath`), the rest read by the tools themselves.
+const WRAPPER_VARS: [&str; 4] = ["DEVSANDBOX_CHROME", "CHROME_PATH", "CHROME_BIN", "PUPPETEER_EXECUTABLE_PATH"];
+
+/// `PATH` when the image sets none: Debian's default, what docker uses too.
+const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+/// The image's `PATH`, from its `ENV` (`Backend::image_env`).
+pub(super) fn image_path(env: &[(String, String)]) -> Option<&str> {
+    env.iter().rev().find(|(k, _)| k == "PATH").map(|(_, v)| v.as_str())
+}
 
 /// The exec of `devsbd userns check` in `container` as the plan's exec user
 /// (`exec_user`; the container's own user when `None`), `--as-root` on a
@@ -94,36 +109,45 @@ pub(super) fn browser_sandbox(code: Option<i32>, stderr: &str) -> Option<Browser
 }
 
 /// The env every exec gets from the check (`sandbox`, `None` = unknown) and
-/// the plan: `DEVSANDBOX_BROWSER_SANDBOX=1` when the sandbox works for a
-/// non-root exec user, else the sandbox-off knobs (a root plan's browser
-/// runs at euid 0, where Chromium refuses its sandbox); the root silencers on
-/// root plans. Keys the sandbox sets itself (`user_keys`: its
-/// `containerEnv`/`remoteEnv`) are left out.
+/// the plan: when the sandbox works, `DEVSANDBOX_BROWSER_SANDBOX=1`, and on
+/// a root plan (whose browser would run at euid 0, where Chromium refuses
+/// its sandbox) the browser vars and `PATH` pointed at the wrapper, its dir
+/// before the image's `PATH` (`image_path`; Debian's default when the image
+/// sets none). Otherwise the sandbox-off knobs. The root silencers on root
+/// plans. Keys the sandbox sets itself (`user_keys`: its
+/// `containerEnv`/`remoteEnv`, `PATH` included) are left out.
 pub(super) fn tool_env(
     root_plan: bool,
     sandbox: Option<&BrowserSandbox>,
+    image_path: Option<&str>,
     user_keys: &BTreeSet<&str>,
 ) -> BTreeMap<String, String> {
-    let mut env: Vec<(&str, &str)> = match (root_plan, sandbox) {
-        (false, Some(BrowserSandbox::On)) => vec![SANDBOX_ON],
-        _ => SANDBOX_OFF_KNOBS.to_vec(),
+    let mut env: Vec<(&str, String)> = match (root_plan, sandbox) {
+        (false, Some(BrowserSandbox::On)) => vec![(SANDBOX_ON.0, SANDBOX_ON.1.into())],
+        (true, Some(BrowserSandbox::On)) => {
+            let mut env = vec![(SANDBOX_ON.0, SANDBOX_ON.1.into())];
+            env.extend(WRAPPER_VARS.map(|k| (k, crate::devsbd::BROWSER_WRAPPER.to_string())));
+            env.push(("PATH", format!("{}:{}", crate::devsbd::BIN_DIR, image_path.unwrap_or(DEFAULT_PATH))));
+            env
+        }
+        _ => SANDBOX_OFF_KNOBS.map(|(k, v)| (k, v.to_string())).to_vec(),
     };
     if root_plan {
-        env.extend(ROOT_SILENCERS);
+        env.extend(ROOT_SILENCERS.map(|(k, v)| (k, v.to_string())));
     }
-    env.into_iter()
-        .filter(|(k, _)| !user_keys.contains(k))
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect()
+    env.into_iter().filter(|(k, _)| !user_keys.contains(k)).map(|(k, v)| (k.to_string(), v)).collect()
 }
 
-/// The line `run` and `inspect` say about the browser sandbox: on, or off
-/// with why and that the knobs are set ([`tool_env`]'s rule).
+/// The line `run` and `inspect` say about the browser sandbox: on (through
+/// the wrapper on a root plan), or off with why and that the knobs are set
+/// ([`tool_env`]'s rule).
 pub(crate) fn summary(root_plan: bool, sandbox: Option<&BrowserSandbox>) -> String {
     let why = match (root_plan, sandbox) {
         (false, Some(BrowserSandbox::On)) => return "browser sandbox: on".into(),
+        (true, Some(BrowserSandbox::On)) => {
+            return format!("browser sandbox: on (through {})", crate::devsbd::BROWSER_WRAPPER);
+        }
         (_, Some(BrowserSandbox::Off(why))) => why.as_str(),
-        (true, Some(BrowserSandbox::On)) => "execs run as root",
         (_, None) => "unknown: the userns check didn't run",
     };
     format!("browser sandbox: off ({why}); sandbox-off knobs set")
@@ -194,28 +218,61 @@ mod tests {
         let on = Some(BrowserSandbox::On);
         let seccomp = off("no user namespaces: seccomp");
         // Non-root, on: the opt-in only.
-        let env = tool_env(false, on.as_ref(), &none);
+        let env = tool_env(false, on.as_ref(), Some("/usr/bin"), &none);
         assert_eq!(env, BTreeMap::from([("DEVSANDBOX_BROWSER_SANDBOX".into(), "1".into())]));
         // Non-root, off or unknown: the knobs.
         for sandbox in [seccomp.as_ref(), None] {
-            let env = tool_env(false, sandbox, &none);
+            let env = tool_env(false, sandbox, Some("/usr/bin"), &none);
             assert_eq!(keys(&env), KNOBS, "{sandbox:?}");
             assert_eq!((env["PLAYWRIGHT_MCP_SANDBOX"].as_str(), env["CHROMIUM_FLAGS"].as_str()), ("false", "--no-sandbox"));
         }
-        // Root, whatever the verdict: the knobs and the silencers.
+        // Root, off or unknown: the knobs and the silencers.
         let mut root = KNOBS.to_vec();
         root.extend(["PIP_ROOT_USER_ACTION", "BUNDLE_SILENCE_ROOT_WARNING"]);
         root.sort();
-        for sandbox in [on.as_ref(), seccomp.as_ref(), None] {
-            let env = tool_env(true, sandbox, &none);
+        for sandbox in [seccomp.as_ref(), None] {
+            let env = tool_env(true, sandbox, Some("/usr/bin"), &none);
             assert_eq!(keys(&env), root, "{sandbox:?}");
             assert_eq!(env["PIP_ROOT_USER_ACTION"], "ignore");
         }
-        // The sandbox's own keys win by absence.
-        let user = BTreeSet::from(["CHROMIUM_FLAGS", "PIP_ROOT_USER_ACTION", "DEVSANDBOX_BROWSER_SANDBOX"]);
-        let env = tool_env(true, None, &user);
+        // Root, on: through the wrapper, no knobs; the silencers stay.
+        let env = tool_env(true, on.as_ref(), Some("/opt/x/bin:/usr/bin"), &none);
+        let wrapper = "/run/devsandbox/bin/chrome";
+        assert_eq!(
+            env,
+            BTreeMap::from(
+                [
+                    ("DEVSANDBOX_BROWSER_SANDBOX", "1"),
+                    ("DEVSANDBOX_CHROME", wrapper),
+                    ("CHROME_PATH", wrapper),
+                    ("CHROME_BIN", wrapper),
+                    ("PUPPETEER_EXECUTABLE_PATH", wrapper),
+                    ("PATH", "/run/devsandbox/bin:/opt/x/bin:/usr/bin"),
+                    ("PIP_ROOT_USER_ACTION", "ignore"),
+                    ("BUNDLE_SILENCE_ROOT_WARNING", "1"),
+                ]
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+            )
+        );
+        // No image PATH: Debian's default behind the wrapper's dir.
+        let env = tool_env(true, on.as_ref(), None, &none);
+        assert_eq!(env["PATH"], "/run/devsandbox/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+        // The sandbox's own keys win by absence, PATH too.
+        let user = BTreeSet::from(["CHROMIUM_FLAGS", "PIP_ROOT_USER_ACTION", "DEVSANDBOX_BROWSER_SANDBOX", "PATH", "CHROME_BIN"]);
+        let env = tool_env(true, None, None, &user);
         assert!(!env.contains_key("CHROMIUM_FLAGS") && !env.contains_key("PIP_ROOT_USER_ACTION"), "{env:?}");
-        assert!(tool_env(false, on.as_ref(), &user).is_empty());
+        assert!(tool_env(false, on.as_ref(), None, &user).is_empty());
+        let env = tool_env(true, on.as_ref(), Some("/usr/bin"), &user);
+        assert_eq!(keys(&env), ["BUNDLE_SILENCE_ROOT_WARNING", "CHROME_PATH", "DEVSANDBOX_CHROME", "PUPPETEER_EXECUTABLE_PATH"]);
+    }
+
+    #[test]
+    fn image_path_is_the_last_path_entry() {
+        let env = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        };
+        assert_eq!(image_path(&env(&[("A", "1"), ("PATH", "/a"), ("PATH", "/b")])), Some("/b"));
+        assert_eq!(image_path(&env(&[("A", "1")])), None);
     }
 
     #[test]
@@ -225,9 +282,10 @@ mod tests {
             summary(false, off("no user namespaces: seccomp").as_ref()),
             "browser sandbox: off (no user namespaces: seccomp); sandbox-off knobs set"
         );
+        assert_eq!(summary(true, Some(&BrowserSandbox::On)), "browser sandbox: on (through /run/devsandbox/bin/chrome)");
         assert_eq!(
-            summary(true, Some(&BrowserSandbox::On)),
-            "browser sandbox: off (execs run as root); sandbox-off knobs set"
+            summary(true, off("no user namespaces: seccomp").as_ref()),
+            "browser sandbox: off (no user namespaces: seccomp); sandbox-off knobs set"
         );
         assert_eq!(
             summary(false, None),

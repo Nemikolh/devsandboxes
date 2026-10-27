@@ -217,7 +217,8 @@ the cache and runs the canary even when the metadata is clear. It reaches
 What the mode then decides (who the container is created and exec'd as,
 the user namespace, relabeled binds, the helper's remap) is in
 [instances/identity.md](instances/identity.md). `Backend::image_user` reads
-an image's `USER` for it.
+an image's `USER` for it, `Backend::image_env` its `ENV` (a root plan's
+tool env extends the image's `PATH`).
 
 ## Adding a runtime
 
