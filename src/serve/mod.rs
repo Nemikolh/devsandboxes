@@ -25,6 +25,8 @@
 //! - `machines`: remote hosts over ssh (docs/architecture/daemon/machines.md):
 //!   the registry (`machines.toml`), the ssh argv and dial, the link
 //!   handshake, the `machines.*` methods
+//! - `fleet`: machines as one pool (docs/architecture/daemon/fleet.md); so
+//!   far the link primitive both host-to-host frame-mux links run on
 //! - `relay`: `devsandbox api --stdio`, stdin/stdout ↔ the socket
 //! - `install`: `serve install|uninstall`, the systemd user unit / LaunchAgent
 //! - `verbs`: `run`/`rebuild`/`start`/`stop`/`rm`/`services.rebuild` as
@@ -40,6 +42,7 @@ pub mod client;
 pub mod daemon;
 pub mod endpoint;
 mod events;
+pub mod fleet;
 pub mod forward_store;
 pub mod forwards;
 pub mod helper;

@@ -4,37 +4,26 @@
 //! the streams it opens from the laptop's agent
 //! (`serve::machines::agent::serve`).
 //!
-//! It plays the in-container daemon's part of the helper's frame protocol
-//! (`devsbd/src/daemon.rs` `accept_agent_clients`): it listens on
-//! `endpoint::agent_socket` (0600, in the 0700 socket dir), and each
-//! connection there becomes one `Open { channel: SSH_AGENT }` stream on the
-//! mux over stdout. Processes on this host find the socket through
-//! `bridge::host_agent`, which tries the socket dir's `agent-*.sock`.
+//! It is the opener of a `fleet::link` of `machines::agent::SPEC`
+//! (docs/architecture/daemon/fleet.md), playing the in-container daemon's
+//! part of the helper's frame protocol (`devsbd/src/daemon.rs`
+//! `accept_agent_clients`): it listens on `endpoint::agent_socket` (0600, in
+//! the 0700 socket dir), and each connection there becomes one
+//! `Open { channel: SSH_AGENT }` stream on the mux over stdout. Processes on
+//! this host find the socket through `bridge::host_agent`, which tries the
+//! socket dir's `agent-*.sock`.
 //!
-//! The newest relay for a client wins: it binds a temp name and renames it
-//! over the socket. It exits, unlinking the socket if it is still its own,
-//! when stdin ends, stdout fails, or the keepalive hears nothing for
-//! `mux::KEEPALIVE_TIMEOUT`, so a partitioned link can't leave a socket that
-//! accepts and hangs.
+//! The newest relay for a client wins; it exits when stdin ends, stdout
+//! fails, or the keepalive hears nothing (`link::opener`).
 
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::os::unix::net::UnixListener;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::mpsc;
-use std::time::Duration;
+use std::path::Path;
 
-use anyhow::{bail, Context, Result};
+use anyhow::Result;
 
-use crate::devsbd::mux::{self, Mux};
-use crate::devsbd::proto::{self, caps, channel};
 use crate::serve::endpoint;
-use crate::serve::machines::agent::{write_sentinel, HELLO_HASH};
-
-/// How often the accept loop looks up from the listener to see whether the
-/// relay has ended.
-const POLL: Duration = Duration::from_millis(200);
+use crate::serve::fleet::link;
+use crate::serve::machines::agent;
 
 /// The CLI entry: the socket dir (created 0700 if missing), then [`run`] on
 /// stdin/stdout.
@@ -44,165 +33,27 @@ pub fn agent_relay(client: &str) -> Result<()> {
     run(io::stdin(), io::stdout(), &dir, client)
 }
 
-/// Why the relay ended.
-enum End {
-    /// The peer's stream ended (or carried a bad frame).
-    Closed,
-    /// The keepalive heard nothing.
-    Dead,
-    /// Writing to the peer failed: it's gone too, seen from the other side.
-    Write,
-    /// The listener failed.
-    Accept(io::Error),
-}
-
 /// The relay over `reader`/`writer` with its socket in `dir`: bind, sentinel
 /// and `Hello`s (the peer must advertise `caps::SSH_AGENT`), then accept and
 /// relay until it ends (see the module doc). `Ok` when the peer went away
 /// (stdin ended or stdout broke, whichever was seen first).
-pub fn run(
-    mut reader: impl Read + Send + 'static,
-    writer: impl Write + Send + 'static,
-    dir: &Path,
-    client: &str,
-) -> Result<()> {
-    // Bound before the `Hello`s, so once this end has answered, the socket
-    // is there.
-    let socket = Socket::bind(dir, client)?;
-    let (tx, ended) = mpsc::channel();
-    let mut writer = Reporting { inner: writer, failed: tx.clone() };
-    write_sentinel(&mut writer).context("cannot write to stdout")?;
-    let peer = proto::handshake(&mut reader, &mut writer, HELLO_HASH, 0).context("agent relay handshake failed")?;
-    if peer.caps & caps::SSH_AGENT == 0 {
-        bail!("the peer serves no ssh-agent");
-    }
-    let mux = Mux::new(writer);
-    let dead = tx.clone();
-    mux.keepalive(mux::KEEPALIVE_INTERVAL, mux::KEEPALIVE_TIMEOUT, move || {
-        let _ = dead.send(End::Dead);
-    });
-    {
-        let mux = std::sync::Arc::clone(&mux);
-        std::thread::spawn(move || {
-            // Opens from the peer are refused; `serve` refuses `Connect`.
-            mux.serve(reader, |_, _| None);
-            let _ = tx.send(End::Closed);
-        });
-    }
-    let mut next = 1;
-    let end = loop {
-        if let Ok(end) = ended.try_recv() {
-            break end;
-        }
-        match endpoint::accept_timeout(&socket.listener, POLL) {
-            // A failed `Open` is a write error, which `Reporting` reports.
-            Ok(Some(conn)) => {
-                let _ = mux.attach(next_stream_id(&mut next), conn, Some(channel::SSH_AGENT));
-            }
-            Ok(None) => {}
-            Err(e) => break End::Accept(e),
-        }
-    };
-    drop(socket);
-    mux.close_all();
-    match end {
-        End::Closed | End::Write => Ok(()),
-        End::Dead => bail!("no frame from the peer for {}s", mux::KEEPALIVE_TIMEOUT.as_secs()),
-        End::Accept(e) => Err(e).context("agent relay socket"),
-    }
-}
-
-/// The next stream id this end allocates: 1..2^31, wrapping back to 1, the
-/// in-container daemon's id space (the high bit is the peer's).
-fn next_stream_id(next: &mut u32) -> u32 {
-    let id = *next;
-    *next = if id >= (1 << 31) - 1 { 1 } else { id + 1 };
-    id
-}
-
-/// The writer to the peer, telling the relay when a write fails (the peer is
-/// gone).
-struct Reporting<W> {
-    inner: W,
-    failed: mpsc::Sender<End>,
-}
-
-impl<W> Reporting<W> {
-    fn check<T>(&self, r: io::Result<T>) -> io::Result<T> {
-        if r.is_err() {
-            let _ = self.failed.send(End::Write);
-        }
-        r
-    }
-}
-
-impl<W: Write> Write for Reporting<W> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let r = self.inner.write(buf);
-        self.check(r)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        let r = self.inner.flush();
-        self.check(r)
-    }
-}
-
-/// The relay's listening socket. Dropping it unlinks the socket file unless a
-/// newer relay has replaced it since (another inode there).
-struct Socket {
-    listener: UnixListener,
-    path: PathBuf,
-    id: (u64, u64),
-}
-
-impl Socket {
-    /// Bind a temp name in `dir` (0600), then rename it over the client's
-    /// socket: a live one is another relay for this client, and the newest
-    /// wins; a dead one is a leftover.
-    fn bind(dir: &Path, client: &str) -> Result<Socket> {
-        static SEQ: AtomicU32 = AtomicU32::new(0);
-        let path = endpoint::agent_socket(dir, client);
-        let tmp = dir.join(format!(".agent-{}-{}.tmp", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
-        let _ = std::fs::remove_file(&tmp);
-        let listener = UnixListener::bind(&tmp).with_context(|| format!("cannot bind {}", tmp.display()))?;
-        let placed = (|| {
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-            let meta = std::fs::symlink_metadata(&tmp)?;
-            listener.set_nonblocking(true)?;
-            std::fs::rename(&tmp, &path)?;
-            Ok::<_, io::Error>((meta.dev(), meta.ino()))
-        })();
-        match placed {
-            Ok(id) => Ok(Socket { listener, path, id }),
-            Err(e) => {
-                let _ = std::fs::remove_file(&tmp);
-                Err(e).with_context(|| format!("cannot set up {}", path.display()))
-            }
-        }
-    }
-}
-
-impl Drop for Socket {
-    fn drop(&mut self) {
-        let ours = std::fs::symlink_metadata(&self.path).is_ok_and(|m| (m.dev(), m.ino()) == self.id);
-        if ours {
-            let _ = std::fs::remove_file(&self.path);
-        }
-    }
+pub fn run(reader: impl Read + Send + 'static, writer: impl Write + Send + 'static, dir: &Path, client: &str) -> Result<()> {
+    link::opener(&agent::SPEC, reader, writer, &endpoint::agent_socket(dir, client))
 }
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Read, Write};
     use std::net::Shutdown;
-    use std::os::unix::net::UnixStream;
-    use std::sync::atomic::AtomicBool;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     use super::*;
-    use crate::serve::machines::agent::{self, End as LocalEnd};
+    use crate::devsbd::proto;
+    use crate::serve::machines::agent::End as LocalEnd;
     use crate::serve::machines::ssh;
 
     /// A short scratch dir (socket paths stay well under 104 bytes).
@@ -367,15 +218,5 @@ mod tests {
         assert!(format!("{err:#}").contains("no ssh-agent"), "{err:#}");
         assert!(!endpoint::agent_socket(&dir, "machine:x").exists());
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn stream_ids_stay_in_the_daemon_space() {
-        let mut next = 1;
-        assert_eq!(next_stream_id(&mut next), 1);
-        assert_eq!(next_stream_id(&mut next), 2);
-        let mut top = (1 << 31) - 1;
-        assert_eq!(next_stream_id(&mut top), (1 << 31) - 1);
-        assert_eq!(next_stream_id(&mut top), 1);
     }
 }

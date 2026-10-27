@@ -12,7 +12,7 @@ Code: `src/serve/machines/mod.rs` (`Entry`, `path`, `parse`, `update`,
 `script_argv`, `parse_target`, `Dial`, `Duplex`, `ssh_dial`, `ssh_agent_dial`), `link.rs`
 (`LinkError`, `client_name`), `service.rs` (`Machines`, `Handle`, `Want`,
 `Timing`, `Hooks`), `agent.rs`
-(`serve`, `End`, `SENTINEL`), `api.rs`
+(`serve`, `End`, `SPEC`), `api.rs`
 (`machines.*`, `Ctx`), `forward.rs` (`QUICK`, `FANOUT_WAIT`, `verb`, the
 federated joins), `cli.rs` (`plan`, `Plan`, `machine_use`, `route`,
 `localize`), `install.rs` (`CHECK`, `INSTALL`, `check`, `install`,
@@ -229,7 +229,9 @@ watchers' roots from the last local params. Details:
 A machine's agent relay carries this host's ssh-agent to the machine over
 its own ssh (`ssh::agent_argv`, no `-A`), on the helper's frame protocol
 ([protocol.md](../helper/protocol.md)) with the roles of a container's
-relay ([ssh-agent.md](../helper/ssh-agent.md)) swapped onto the two hosts:
+relay ([ssh-agent.md](../helper/ssh-agent.md)) swapped onto the two hosts.
+It is a [fleet link](fleet.md#link) of `agent::SPEC`: `fleet::link::opener` and
+`fleet::link::answerer` hold the mechanics below.
 
 - **The machine's end**, the hidden `devsandbox agent-relay --client <c>`
   (`commands::agent_relay`), plays the in-container daemon. It binds
@@ -238,7 +240,7 @@ relay ([ssh-agent.md](../helper/ssh-agent.md)) swapped onto the two hosts:
   longer one ends in a hash of the whole name) so the path stays under
   macOS's 104 bytes. It binds a temp name and renames it over that path,
   so the newest relay for a client wins. Then it writes the sentinel line
-  `\n` + `devsandbox-agent 1\n` (`agent::write_sentinel`), exchanges
+  `\n` + `devsandbox-agent 1\n` (`fleet::link::write_sentinel`), exchanges
   `Hello`s on its stdin/stdout and requires the peer to advertise
   `caps::SSH_AGENT`. Each connection to its socket becomes one
   `Open { channel: SSH_AGENT }` stream on the mux over stdout (ids in the

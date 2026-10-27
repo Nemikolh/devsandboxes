@@ -59,13 +59,19 @@ pub mod channel {
     /// id) toward a daemon that advertised `caps::RPC`; records both ways,
     /// the caller half-closes with `Eof` when it has no more input.
     pub const RPC: u8 = 5;
+    /// A connection to a host daemon's API (JSON lines,
+    /// docs/reference/api.md), between two hosts' `serve::fleet::link` ends:
+    /// the opener sends one `Open` per connection to its socket, the
+    /// answerer connects it to a daemon. Only opened toward a peer that
+    /// advertised `caps::API`; never used with a container.
+    pub const API: u8 = 6;
 
     /// Whether `Open` on `channel` makes a flow-controlled stream (window
     /// credit, `Eof` half-close, its own writer thread, like `Connect`) rather
     /// than a legacy one. A property of the channel, so both ends agree
     /// without a flag on the wire.
     pub const fn flows(channel: u8) -> bool {
-        matches!(channel, RPC)
+        matches!(channel, RPC | API)
     }
 }
 
@@ -101,6 +107,9 @@ pub mod caps {
     pub const PORT_INFO: u32 = 1 << 4;
     /// Daemon accepts host-opened `channel::RPC` streams.
     pub const RPC: u32 = 1 << 5;
+    /// The peer answers `channel::API` streams (a fleet link's answerer).
+    #[allow(dead_code)] // host-only: devsbd never sends it
+    pub const API: u32 = 1 << 6;
 }
 
 /// Upper bound on the processes one `PortInfo` lists; the helper stops

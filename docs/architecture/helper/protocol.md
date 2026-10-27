@@ -68,11 +68,16 @@ must match.
 `SSH_AGENT` = 1, `HTTP_PROXY` = 2 (reserved, unused), `NOTIFY` = 3,
 `CONTROL` = 4: opened by the daemon. The daemon opens `NOTIFY`/`CONTROL` only
 toward a host that advertised the matching cap. `RPC` = 5: opened by the
-host, only toward a daemon advertising `caps::RPC`.
+host, only toward a daemon advertising `caps::RPC`. `API` = 6: never on a
+container's link; between two hosts' `serve::fleet::link` ends
+([fleet](../daemon/fleet.md)), opened by the end with the socket toward a
+peer advertising `caps::API`, each stream one connection to a host
+daemon's API.
 
 Whether a channel's streams are legacy or flow-controlled (see
 [Mux](#mux)) is a property of the channel, `proto::channel::flows`, so both
-ends agree without a flag on the wire: `RPC` flows, the rest are legacy.
+ends agree without a flag on the wire: `RPC` and `API` flow, the rest are
+legacy.
 
 ### Caps
 
@@ -80,7 +85,8 @@ Bitset, unknown bits ignored: `TCP_FORWARD` (daemon serves `Connect`),
 `PORT_INFO` (daemon answers `PortQuery`), `RPC` (daemon accepts host
 `Open(RPC)`; sent by every daemon, `DAEMON_CAPS` in
 `devsbd/src/daemon.rs`), `SSH_AGENT`, `NOTIFY`, `CONTROL` (host serves
-those channels). The host sends
+those channels), `API` (a fleet link's answerer serves `channel::API`;
+host-to-host only). The host sends
 `Caps` after the handshake (`SSH_AGENT` only when it has a live agent;
 `NOTIFY | CONTROL` only on the serve daemon's bridges). Until a bridge's
 `Caps` arrives the daemon treats it as capable of nothing, except a bridge
