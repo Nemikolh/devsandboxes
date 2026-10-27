@@ -140,9 +140,10 @@ limitation means editing this file in the same commit.
 - Podman: `autostart = "runtime"` restarts at boot only with
   `podman-restart.service`, which devsandbox never installs.
   → [runtimes](architecture/runtimes.md); `autostart::restart_decision`
-- Identity: only rootful docker and VM-backed runtimes are exercised (CI's
-  docker test); rootless docker, rootless podman, SELinux relabeling and
-  `--socket-gid` have never run. → [identity](architecture/instances/identity.md)
+- Identity: only rootful docker (CI's `test` job), rootless podman (CI's
+  `test-podman` job) and VM-backed runtimes are exercised; rootless docker,
+  rootful podman, SELinux relabeling and `--socket-gid` have never run.
+  → [identity](architecture/instances/identity.md)
 - Identity: a `workspaceFolder` or `folders` target under `/root` isn't
   rewritten by the migration (`config_identity::Kind::RootPath`, no edit);
   under `identity = "host"` it stays unreachable for the adopted account

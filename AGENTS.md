@@ -247,12 +247,18 @@ Start with `docs/README.md` (reading order and map) and
 - Doc comments explain _why_; keep them current when moving logic.
 - Tests live in `#[cfg(test)]` modules per file; most logic is factored to be
   testable without a container runtime.
-- Tests that need docker or the embedded helper use
+- Tests that need a container runtime or the embedded helper use
   `#[test_utils::docker_test]` / `#[test_utils::docker_test(helper)]` /
   `#[test_utils::helper_test]` (proc macros in `test-utils/`, a path-only,
   never-published dev-dependency) and return `Result<(), E>`. A missing
   requirement or `Err(why)` skips locally but **fails on CI** (`CI` env var);
   runtime side in `src/test_support.rs` (`gated`, `with_cleanup`).
+  "Docker" tests run against the runtime `DEVSANDBOX_RUNTIME` selects (CI's
+  `test-podman` job runs them under rootless podman): drive it with
+  `test_support::runtime_cmd()` / `runtime::backend()`, never a literal
+  `docker`, and mark a docker-only mechanism `docker_test(docker_only)`
+  (not applicable elsewhere, so it passes there). A test child with its
+  own `XDG_*` dirs calls `test_support::share_runtime_dirs`.
 - Checks: `cargo test --workspace` (covers the `devsbd/` helper crate too;
   plain `cargo test` only runs the root package). clippy/rustfmt are not
   installed in the default toolchain here.
