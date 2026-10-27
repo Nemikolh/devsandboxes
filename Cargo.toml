@@ -23,6 +23,7 @@ tui-term = "0.3.4"
 vt100 = "0.16"
 ruzstd = "0.8"
 serde-saphyr = { version = "1.3.0", default-features = false, features = ["deserialize"] }
+toml_edit = { version = "0.25.15", default-features = false, features = ["parse", "display"] }
 
 [build-dependencies]
 sha2 = "0.10"
