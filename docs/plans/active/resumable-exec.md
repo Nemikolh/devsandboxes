@@ -229,13 +229,6 @@ After fleet step 1 (fleet root, `lend.toml`):
   explicit); on a worker they hold lent capacity, so it may belong in
   `lend.toml` or the capacity report.
 
-Found in step 1's review (orchestrator): a displaced client whose exec pty
-nobody reads anymore (ssh gone, docker kept the exec) can stay blocked
-writing to its stdout and never read its `detached`; the supervisor drops
-it, but the client process lingers. Check on Linux whether docker/podman
-close that pty; if not, the client needs a bounded write (or the
-supervisor a way to signal it).
-
 The "now" part ships as four commits (4a-4d). Landmarks are from recon
 (line numbers drift; trust the symbol).
 

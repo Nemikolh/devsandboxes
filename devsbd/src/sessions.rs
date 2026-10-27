@@ -35,6 +35,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -82,6 +83,17 @@ const SIZE_POLL: Duration = Duration::from_millis(200);
 
 /// How long the supervisor tries to hand a client its final records.
 const FINAL_WRITE: Duration = Duration::from_secs(2);
+
+/// Output records a client queues for its terminal before dropping more:
+/// the supervisor's [`OUT_CAP`] in its 16 KiB reads. A terminal nobody
+/// reads (ssh gone, the exec's pty kept) then costs output, never the
+/// socket reader, so `detached` and `exit` always arrive.
+const OUT_QUEUE: usize = OUT_CAP / (16 * 1024);
+
+/// How long a finished client waits for its queued output to reach the
+/// terminal, and then for its note to reach stderr (the same possibly
+/// unread pty).
+const TERMINAL_WAIT: Duration = Duration::from_secs(1);
 
 /// How long a supervisor whose command couldn't be spawned waits for the
 /// client to collect the error.
@@ -657,7 +669,14 @@ impl Supervisor {
             if let Some(mut old) = self.client.take() {
                 old.out.clear_unstarted();
                 old.out.push_always(encode(&Record::Detached));
-                let _ = old.out.flush(&mut old.sock);
+                // Blocking, bounded, off this thread: the supervisor never
+                // waits on a client, but a non-blocking write into a full
+                // socket buffer would lose `detached`.
+                std::thread::spawn(move || {
+                    let _ = old.sock.set_nonblocking(false);
+                    let _ = old.sock.set_write_timeout(Some(FINAL_WRITE));
+                    let _ = old.out.flush(&mut old.sock);
+                });
             }
             let _ = File::create(self.dir.join("client"));
             self.client = Some(Client { sock, inbuf: Vec::new(), out: Out::default(), sized: false });
@@ -839,16 +858,23 @@ impl Drop for RawMode {
 
 /// Run a client on this process's stdio: raw mode and size tracking when
 /// stdin is a terminal (else plain bytes, no size), the terminal restored
-/// before the note is printed. Returns the exit code.
-fn terminal(client: impl FnOnce(io::Stdin, &mut dyn Write, Option<SizeFn>) -> Done) -> i32 {
+/// before the note is printed, for at most [`TERMINAL_WAIT`]. Returns the
+/// exit code, which `main` passes straight to `std::process::exit`: that
+/// also ends a thread still stuck writing to a terminal nobody reads.
+fn terminal(client: impl FnOnce(io::Stdin, Box<dyn Write + Send>, Option<SizeFn>) -> Done) -> i32 {
     // SAFETY: isatty only inspects the fd.
     let tty = unsafe { sys::isatty(0) } == 1;
     let raw = if tty { RawMode::enter(0).ok() } else { None };
     let size: Option<SizeFn> = if tty { Some(Box::new(|| get_size(0))) } else { None };
-    let done = client(io::stdin(), &mut io::stdout().lock(), size);
+    let done = client(io::stdin(), Box::new(io::stdout()), size);
     drop(raw);
     if let Some(note) = done.note {
-        eprintln!("devsbd session: {note}");
+        let (wrote, waited) = mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let _ = writeln!(io::stderr(), "devsbd session: {note}");
+            drop(wrote);
+        });
+        let _ = waited.recv_timeout(TERMINAL_WAIT);
     }
     done.code
 }
@@ -857,11 +883,21 @@ fn terminal(client: impl FnOnce(io::Stdin, &mut dyn Write, Option<SizeFn>) -> Do
 /// size (from `size`, when given) at once and on every change, the session's
 /// `data` to `out`, until `exit`, `detached` or the connection ends.
 ///
+/// `out` is written on a thread of its own, fed through an [`OUT_QUEUE`]
+/// bound that drops output when full, so a stalled terminal never keeps the
+/// socket from being read. Owned, not borrowed: that thread may never
+/// return. At the end, queued output gets [`TERMINAL_WAIT`] to drain.
+///
 /// Size changes are polled every [`SIZE_POLL`] on a thread rather than taken
 /// from `SIGWINCH`: a handler needs `sigaction` (whose struct layout differs
 /// per libc) plus a self-pipe to wake anything, while polling is one ioctl and
 /// costs at most [`SIZE_POLL`] of latency on a resize.
-fn relay(sock: UnixStream, input: impl Read + Send + 'static, out: &mut dyn Write, size: Option<SizeFn>) -> Outcome {
+fn relay(
+    sock: UnixStream,
+    input: impl Read + Send + 'static,
+    out: Box<dyn Write + Send>,
+    size: Option<SizeFn>,
+) -> Outcome {
     let Ok(writer) = sock.try_clone() else { return Outcome::Lost };
     let writer = Arc::new(Mutex::new(writer));
     let done = Arc::new(AtomicBool::new(false));
@@ -900,13 +936,27 @@ fn relay(sock: UnixStream, input: impl Read + Send + 'static, out: &mut dyn Writ
             }
         }
     });
-    let outcome = read_records(&sock, out);
+    let (queue, queued) = mpsc::sync_channel::<Vec<u8>>(OUT_QUEUE);
+    let (drained, drain) = mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        let (mut out, _drained) = (out, drained);
+        for bytes in queued {
+            // The terminal going away isn't a reason to stop: the
+            // session's `exit` still decides the code.
+            let _ = out.write_all(&bytes).and_then(|()| out.flush());
+        }
+    });
+    let outcome = read_records(&sock, &queue);
     done.store(true, Ordering::Relaxed);
     let _ = sock.shutdown(Shutdown::Both);
+    drop(queue);
+    let _ = drain.recv_timeout(TERMINAL_WAIT);
     outcome
 }
 
-fn read_records(mut sock: &UnixStream, out: &mut dyn Write) -> Outcome {
+/// Read records until the outcome, `data` handed to `out` (dropped when its
+/// queue is full).
+fn read_records(mut sock: &UnixStream, out: &SyncSender<Vec<u8>>) -> Outcome {
     let (mut inbuf, mut buf) = (Vec::new(), vec![0u8; 16 * 1024]);
     loop {
         match sock.read(&mut buf) {
@@ -919,9 +969,7 @@ fn read_records(mut sock: &UnixStream, out: &mut dyn Write) -> Outcome {
             match decode(&mut inbuf) {
                 Ok(None) => break,
                 Ok(Some(Record::Data(bytes))) => {
-                    // The terminal going away isn't a reason to stop: the
-                    // session's `exit` still decides the code.
-                    let _ = out.write_all(&bytes).and_then(|()| out.flush());
+                    let _ = out.try_send(bytes);
                 }
                 Ok(Some(Record::Exit(code))) => return Outcome::Exit(code),
                 Ok(Some(Record::Detached)) => return Outcome::Detached,
@@ -986,7 +1034,13 @@ fn connect(dir: &Path, mut child: Option<Child>) -> Option<UnixStream> {
 
 /// `session attach`: attach only. An ended session's recorded code at once;
 /// unknown or `lost`: [`NO_SESSION_EXIT`].
-fn attach(root: &Path, id: &str, input: impl Read + Send + 'static, out: &mut dyn Write, size: Option<SizeFn>) -> Done {
+fn attach(
+    root: &Path,
+    id: &str,
+    input: impl Read + Send + 'static,
+    out: Box<dyn Write + Send>,
+    size: Option<SizeFn>,
+) -> Done {
     join(root, id, None, input, out, size)
 }
 
@@ -997,7 +1051,7 @@ fn join(
     id: &str,
     child: Option<Child>,
     input: impl Read + Send + 'static,
-    out: &mut dyn Write,
+    out: Box<dyn Write + Send>,
     size: Option<SizeFn>,
 ) -> Done {
     let Ok(dir) = session_dir(root, id) else { return no_session(id, "no session") };
@@ -1315,14 +1369,41 @@ mod tests {
 
     /// A client on a thread: `child` as `new` passes it (`None`: `attach`).
     fn client(root: &Path, id: &str, child: Option<Child>, size: Option<SizeFn>) -> TestClient {
-        let (input, theirs) = UnixStream::pair().unwrap();
         let output = Sink::default();
+        client_to(root, id, child, size, output.clone(), Box::new(output))
+    }
+
+    /// [`client`] writing to `out` (`output` then sees whatever `out` shares).
+    fn client_to(
+        root: &Path,
+        id: &str,
+        child: Option<Child>,
+        size: Option<SizeFn>,
+        output: Sink,
+        out: Box<dyn Write + Send>,
+    ) -> TestClient {
+        let (input, theirs) = UnixStream::pair().unwrap();
         let (tx, done) = mpsc::channel();
-        let (root, id, mut out) = (root.to_path_buf(), id.to_string(), output.clone());
+        let (root, id) = (root.to_path_buf(), id.to_string());
         std::thread::spawn(move || {
-            let _ = tx.send(join(&root, &id, child, theirs, &mut out, size));
+            let _ = tx.send(join(&root, &id, child, theirs, out, size));
         });
         TestClient { input, output, done }
+    }
+
+    /// A terminal nobody reads: the first write blocks forever (its thread
+    /// is leaked, never joined).
+    struct Stalled(Arc<AtomicBool>);
+    impl Write for Stalled {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            self.0.store(true, Ordering::Relaxed);
+            loop {
+                std::thread::park();
+            }
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 
     fn wait_for(what: &str, cond: impl Fn() -> bool) {
@@ -1413,6 +1494,30 @@ mod tests {
         assert_eq!(b.wait().code, 5);
         assert!(b.output.text().contains("got:x"), "{:?}", b.output.text());
         assert!(!a.output.text().contains("got:x"));
+
+        // A first client stuck writing to its terminal still reads its
+        // `detached` and finishes, past a full queue and socket buffer.
+        let id = "1790000000-0002";
+        let stuck = Arc::new(AtomicBool::new(false));
+        let script = "read l; head -c 2000000 /dev/zero | tr '\\0' x; read l; exit 6";
+        let mut a = client_to(
+            &root,
+            id,
+            Some(start(&root, id, script)),
+            None,
+            Sink::default(),
+            Box::new(Stalled(stuck.clone())),
+        );
+        wait_for("the first attach", || root.join(id).join("client").exists());
+        a.send("\n");
+        wait_for("the stalled write", || stuck.load(Ordering::Relaxed));
+        let mut b = client(&root, id, None, None);
+        let t = Instant::now();
+        let done = a.wait();
+        assert_eq!(done.code, DETACHED_EXIT, "{done:?}");
+        assert!(t.elapsed() < Duration::from_secs(10), "took {:?}", t.elapsed());
+        b.send("\n");
+        assert_eq!(b.wait().code, 6);
         let _ = fs::remove_dir_all(&root);
     }
 

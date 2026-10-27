@@ -178,6 +178,13 @@ cwd and env the command gets, so `new` needs no `--cwd`. `exec --attach
   exits at once with its recorded code; an unknown or `lost` one, or a
   connection that ends without a record, exits `NO_SESSION_EXIT` (250);
   one taken over exits `DETACHED_EXIT` (251); both with a note on stderr.
+  A terminal nobody reads (ssh gone, the runtime keeping the exec's pty)
+  never stops the client: `relay` writes output on a thread of its own,
+  fed through a queue of `OUT_QUEUE` records that drops output when full,
+  so the socket reader (`read_records`) still gets `detached` or `exit`.
+  At the end, queued output and then the note each get `TERMINAL_WAIT`,
+  and `main` exits with the code (`std::process::exit`), ending a writer
+  still stuck on that terminal.
 - Socket records (`Record`): `u8 tag | u32 len | payload`; `size`
   (`u16 cols, u16 rows`) and `data` from the client, `data`, `exit`
   (`i32`) and `detached` from the supervisor. Only the helper speaks it.
