@@ -1,6 +1,6 @@
 # Identity: one user model across runtimes
 
-Status: planned (step 7, steps 8–14)
+Status: in progress (steps 7–17)
 Steps 1–6 shipped: the strategy table (`src/runtime/identity.rs`), the
 `identity` field (`SandboxProperties::identity`), `devsbd identity apply`
 (`devsbd/src/identity.rs`), the probe (`src/commands/run/identity.rs`
@@ -8,7 +8,7 @@ Steps 1–6 shipped: the strategy table (`src/runtime/identity.rs`), the
 in `materialize`; the living docs describe them
 ([identity](../../architecture/instances/identity.md),
 [runtimes](../../architecture/runtimes.md#mode-detection)). Left: the
-tool environment (step 7) and the `/root` config migration (8–14).
+tool environment (steps 7–10) and the `/root` config migration (11–17).
 
 ## Problem
 
@@ -504,17 +504,18 @@ asked.
 
 ## Steps
 
-The current run covers the core, steps 1–6. Step 7 (tool environment)
-and steps 8–14 (migration) stay planned for a later run.
+Steps 1–6 (the core) shipped in an earlier run. This run covers the tool
+environment (7–10) and the migration (11–17).
 
-**Testing limits for every step.** The orchestrating host is a Mac with
-no docker, podman or Apple `container` on `PATH`. `cargo test
---workspace` runs, but every `#[test_utils::docker_test…]` /
-`helper_test` skips locally and only runs (and fails, if wrong) on CI.
-Rootless docker and podman can't be exercised at all. So:
+**Testing limits for every step.** Steps 1–6 were built on a Mac with no
+runtime. Steps 7–17 run on a Linux host with **rootless docker 28.5.1**
+(`SecurityOptions` has `name=rootless`, Ubuntu 24.04.5), so
+`#[test_utils::docker_test…]` / `helper_test` tests actually run here,
+under rootless docker (the root plan). Rootful docker and podman still
+only run on CI. So:
 - put the logic in pure fns with table tests, and keep runtime calls thin;
-- a docker test written in a step is unverified until CI runs it; say so
-  in the step's report;
+- say in the step's report which docker tests ran here and which are
+  rootful-only (unverified until CI);
 - never claim a runtime behavior works because a skipped test "passed".
 
 Repo rules apply (AGENTS.md): no clippy/rustfmt here, mimic the
@@ -686,30 +687,376 @@ table, the remap, what's recorded where), linked from
 - This plan: steps 1–6 marked shipped, the plan stays active for the
   rest (precedent: `1e52c67`, resumable exec).
 
-### Step 7 (later): tool environment
+### Orchestrator's deviations from the design above (steps 7–17)
 
-The userns probe in the canary, the docker seccomp profile and the
-`userns` field (spec skill), the knobs as a fallback. Then the browser
-wrapper and `DEVSANDBOX_CHROME`, as their own step, with the agent note in
-`skills/devsandbox-cli/SKILL.md` (and the plugin's skill, if it exists by
-then).
+Found during recon for this run. They change the design, so the user
+approves them with the plan:
+- **The userns check runs in the real container, after create**, by the
+  helper (`devsbd userns check`, step 8), not in the canary. The canary
+  runs only when the fast path is ambiguous or on `--reprobe`, and it
+  uses the image's `sh` (`dockerlike.rs` `canary_argv`): it has no
+  `unshare` to rely on and runs without the planned profile. The real
+  container has the real seccomp profile, user and AppArmor. The knobs
+  are exec-time env anyway, so deciding them after create costs nothing.
+  The result is recorded on the instance, not in the context cache.
+- **The tool env is stored on the instance** (`state::Instance`), not
+  "next to `builtin_env`". `builtin_env` (`run/image.rs`) is the
+  features' build-context file, not container env.
+- **The wrapper (step 10) needs the image's `PATH`** to put
+  `/run/devsandbox/bin` first (`exec -e PATH=…` replaces it). So step 10
+  adds `Backend::image_env` (`.Config.Env`), and step 11 reuses it.
+- **`PUPPETEER_EXECUTABLE_PATH` points at the wrapper on root plans**, so
+  the wrapper also looks under `~/.cache/puppeteer` (Puppeteer's own
+  download).
+- **`${containerEnv:X}` inside `containerEnv` values** reads only the
+  image env and the home fallback. A reference to any key the sandbox's
+  `containerEnv` defines is an error, which covers self-reference and
+  avoids ordering rules.
+- **`instances.resolve` gains `sandbox`** (`machines/cli.rs` `Found`):
+  the CLI prompt for `rebuild`/`start <instance>` needs the sandbox, and
+  the client only knows the instance name today.
+- **Autostart runs in the daemon** (`serve/host.rs` `serve-autostart`
+  thread → `autostart::autostart` → `run::run`), not as an `--in-process`
+  subprocess. The "warning only" path is therefore `run`'s own warning
+  line, printed whenever un-acked findings apply. It shows up for
+  interactive runs too, after the prompt was skipped.
 
-### Migration (later, section 7)
+Line numbers below are from recon at the start of this run; re-grep.
 
-8. `${containerEnv:NAME}` / `${containerEnv:HOME}`: `MountContext`,
-   `resolve_var`, env substitution, the image passwd and `Config.Env` read
-   cached by image id (replacing the 1000 guess), spec skill.
-9. `identity_findings` with origins and ids; table tests (templates,
-   `extends` chains, scalar overrides).
-10. `rewrite` on `toml_edit`: round-trip tests, YAML refusal, the atomic
-    write with a transient `.bak`, the `conflict` guard, and `RootUser`'s
-    `identity = "image"` write.
-11. `identity_acks` in `state.toml`; `config.findings`/`migrate`/`ack`
-    (`QUICK`, d.ts, api.md).
-12. `SandboxRow.identity`, the header line, the Detail lines.
-13. The CLI prompt in `verbs_client::prepare`, the in-process fallback,
-    the off-TTY warning.
-14. The TUI verb modal and the TUI-open offer; docs and a status line.
+### Step 7: docker seccomp profile and the `userns` field
+
+- Vendor moby's profile verbatim:
+  `src/runtime/seccomp/moby-default-v0.2.4.json`, from
+  `https://raw.githubusercontent.com/moby/profiles/seccomp/v0.2.4/seccomp/default.json`
+  (14122 bytes). Add a header comment nowhere: JSON has no comments, so
+  the pin is the file name plus the module doc.
+- New `src/runtime/seccomp.rs`: `profile() -> String`, pure: the vendored
+  JSON (`include_str!`) parsed with `serde_json`, the two rules of
+  *Keeping the browser sandbox where it can work* appended to `syscalls`,
+  serialized. Then `ensure_file() -> Result<PathBuf>`: writes
+  `seccomp-<short_hash(profile)>.json` next to `state.toml`
+  (`State::path()?.with_file_name`, tmp + rename like `state.rs`'s atomic
+  write), only when missing. Tests: the two rules are present with the
+  exact args/excludes, and every vendored rule is kept.
+- `SandboxProperties::userns: Option<bool>` (`src/config.rs`, next to
+  `identity` ~:208), accessor `userns()` defaulting to `true`. It's hashed
+  already (`sandbox_hash` ~:1116 excludes only listed keys). Add a test
+  that toggling it changes the hash.
+- `run`: on docker only (`backend().name() == "docker"`: not podman,
+  whose default already allows it, and not Apple), with `userns()` on and
+  the sandbox not `--privileged` (which drops seccomp anyway), pass
+  `--security-opt seccomp=<ensure_file()>`. Put it in
+  `commands/run/identity.rs` `create_args` (~:100, after `--userns`),
+  behind a new `Plan.seccomp: bool` set by `plan_for` (not by the pure
+  `identity::plan`). Add `seccomp` as a bare flag in `Plan::label` /
+  `parse_label` (`runtime/identity.rs` ~:497/:523), and to `summary()`
+  (", user namespaces allowed (seccomp)"). If `ensure_file` fails: a
+  `warning:` and no flag.
+- Docker test (`#[test_utils::docker_test]`, runs here under rootless
+  docker): `unshare -Ur true` as `--user 1000:1000` in an image that has
+  util-linux (`ubuntu:24.04`, or whatever image the existing docker tests
+  pull) fails under the default profile and succeeds with ours.
+- Docs: `skills/config-toml-spec/SKILL.md` (a `userns` row next to
+  `identity` ~:71); `docs/architecture/instances/identity.md`, a new
+  *Tool environment* section (the profile, why, the cost, `userns =
+  false`); `docs/architecture/runtimes.md` if it lists create args.
+
+### Step 8: `devsbd userns check` (helper)
+
+- New `devsbd/src/userns.rs`, dispatched from `devsbd/src/main.rs`'s match
+  (~:56-100, usage string ~:95). Add `"userns"` to `FEATURES` (~:54).
+  Std only: syscalls go through hand-declared `unsafe extern "C"` as in
+  `devsbd/src/sessions.rs` `mod sys` (~:287-359) and `runs.rs` (~:673).
+  Needed: `unshare`, `fork`, `waitpid`, `_exit`, `geteuid`/`getegid`,
+  `execvp` (step 10), and `syscall` for a raw `clone`.
+- Reusable core `enter_userns(inner_uid, inner_gid) -> Result<(), Fail>`:
+  `unshare(CLONE_NEWUSER)`, then `setgroups` deny, then one-line
+  `uid_map`/`gid_map` mapping the inner id to the current euid/egid.
+  Step 10's wrapper reuses it.
+- `devsbd userns check [--as-root]`, in a forked child so the caller's
+  namespaces are untouched, mirroring Chrome's zygote:
+  - non-root: `enter_userns(euid, egid)`, then a raw
+    `clone(CLONE_NEWPID|SIGCHLD)` (not `unshare(CLONE_NEWPID)`: docker's
+    profile rule is on `clone`, which is what Chrome calls; the null-stack
+    `clone` is fork-like on x86_64 and aarch64, so the arg order doesn't
+    matter), and the grandchild exits 0;
+  - `--as-root` (root plans, the wrapper's sequence): first
+    `enter_userns(1001, 1001)` (non-root euid inside), then the non-root
+    sequence nested.
+  - Outcome: exit 0 with no output, or exit 1 with one stderr line
+    `devsbd: userns: <step>: <errno name>` where `<step>` is one of
+    `unshare(CLONE_NEWUSER)`, `uid_map`, `gid_map`, `setgroups`,
+    `clone(CLONE_NEWPID)`. A pure `outcome_line(step, errno)` gets a unit
+    test.
+- `helper_test`: under the default profile on this host it fails at
+  `unshare(CLONE_NEWUSER)`, and with step 7's profile it passes, both as
+  `--user 1000` and with `--as-root` as root. State which assertions are
+  rootful-only.
+- Docs: `docs/architecture/helper/in-container.md` (the subcommand, its
+  contract).
+
+### Step 9: run the check, record it, set the tool env
+
+- In `materialize` (`src/commands/run/mod.rs`), after `devsbd identity
+  apply` (find the `identity::apply` call): exec `devsbd userns check`
+  as the plan's exec user, with `--as-root` when that's root ("root
+  plan" = `plan.exec_user == Some("root")`). It runs on every backend
+  the helper runs on. No helper means the result is `unknown`.
+- Host-side pure fn (in `commands/run/identity.rs`, or a sibling
+  `tool_env.rs`): `browser_sandbox(success, stderr) -> BrowserSandbox`
+  `{ On, Off(why) }`. The why is a readable phrase: `no user namespaces:
+  seccomp` for `unshare(CLONE_NEWUSER)`/`clone(CLONE_NEWPID)` EPERM,
+  `no user namespaces: AppArmor restriction on the host` for
+  `uid_map`/`gid_map`/`setgroups` EPERM, else the raw line.
+- Pure `tool_env(root_plan, &BrowserSandbox, user_keys) -> BTreeMap`:
+  - non-root and `On`: `DEVSANDBOX_BROWSER_SANDBOX=1`;
+  - `Off`, `unknown`, or a root plan (until step 10): the knobs
+    `PUPPETEER_DANGEROUS_NO_SANDBOX=1`, `ELECTRON_DISABLE_SANDBOX=1`,
+    `QTWEBENGINE_DISABLE_SANDBOX=1`, `PLAYWRIGHT_MCP_SANDBOX=false`,
+    `CHROMIUM_FLAGS=--no-sandbox`;
+  - root plans also get `PIP_ROOT_USER_ACTION=ignore`,
+    `BUNDLE_SILENCE_ROOT_WARNING=1`;
+  - keys the sandbox sets itself (`containerEnv`/`remoteEnv`) are left
+    out.
+  Table test over every row.
+- Record on `state::Instance` (`src/state.rs` ~:71-82, next to
+  `remote_user`/`home`): `browser_sandbox: Option<BrowserSandbox>` and
+  `tool_env: BTreeMap<String, String>`, both `#[serde(default)]`, empty
+  omitted. `Instance::exec_env` (~:332) puts `tool_env` *first*, so
+  `remote_env`/`extra_env` override it. `Instance` is built literally in
+  many places (`commands/mod.rs`, `rebuild.rs`, `port.rs`, `services.rs`,
+  `rename.rs`, `exec.rs`, `dispatch.rs`, `run/mod.rs`): update each.
+  Instances from before this step have neither field and get no tool env.
+- `run` prints one line: `browser sandbox: on`, or `browser sandbox: off
+  (<why>); sandbox-off knobs set`. `devsandbox inspect`
+  (`src/commands/inspect.rs`, which prints the runtime JSON only) prints
+  that line on stderr before the JSON, read from the instance record.
+- Docker test, here (rootless docker = root plan): after `run`, `exec
+  env` shows the knobs and the silencers.
+- Docs: identity.md *Tool environment* (the check, the env table, which
+  plan gets what), `docs/status.md` known limitation: `PLAYWRIGHT_MCP_SANDBOX`
+  and `CHROMIUM_FLAGS` unverified (symbol: `tool_env`).
+
+### Step 10: the browser wrapper (root plans)
+
+- `devsbd` as a multicall binary: when `argv[0]`'s basename is `chrome`,
+  `chromium`, `chromium-browser`, `google-chrome` or
+  `google-chrome-stable`, it runs the wrapper (check this before the
+  subcommand match in `devsbd/src/main.rs`). New `devsbd/src/browser.rs`:
+  - find the real binary: those names on `PATH` minus `/run/devsandbox/bin`,
+    else the newest `~/.cache/ms-playwright/chromium-*/chrome-linux*/chrome`,
+    else `~/.cache/puppeteer/chrome/*/chrome-linux64/chrome`. None found:
+    exit 127 with a one-line why. The search is a pure fn over a listing,
+    unit-tested;
+  - at euid 0: `enter_userns(1001, 1001)` (step 8), then `execv` with the
+    argv as given, inheriting fds (no `CLOEXEC` changes: Playwright's
+    `--remote-debugging-pipe` is fds 3/4). At non-root euid: a plain exec.
+    A failed `enter_userns` execs anyway with `--no-sandbox` appended and
+    says so on stderr.
+- `src/devsbd.rs` `INSTALL_SCRIPT` (~:153) also creates those names as
+  symlinks to `devsbd` in `/run/devsandbox/bin`.
+- `Backend::image_env(image) -> Result<Vec<(String, String)>>`
+  (`.Config.Env`; `dockerlike.rs` next to `image_user` ~:189, Apple
+  ~:305 from its inspect JSON). Pure parse, tested on captured output.
+- `tool_env` (step 9) on root plans with `On`: no knobs. Instead
+  `DEVSANDBOX_BROWSER_SANDBOX=1`,
+  `DEVSANDBOX_CHROME`/`CHROME_PATH`/`CHROME_BIN`/`PUPPETEER_EXECUTABLE_PATH`
+  = `/run/devsandbox/bin/chrome`, and `PATH=/run/devsandbox/bin:<image
+  PATH>` (unless the sandbox sets `PATH`; with no image `PATH`, Debian's
+  default). Root plans with `Off` keep step 9's knobs.
+- `skills/devsandbox-cli/SKILL.md`: the agent note from *Browser wrapper*
+  (*said where agents read it*), as a short section before *Debugging a
+  sandbox*. No plugin skill exists (`claude-code-plugin.md` is unbuilt),
+  so there's nothing else to update.
+- `helper_test`, here: a fake `chrome` script on `PATH` that prints `id
+  -u` and checks fd 3 is open, run through `/run/devsandbox/bin/chrome 3<…`
+  as root: it reports uid 1001 and sees fd 3.
+- Docs: identity.md (the wrapper, the gap that Playwright needs
+  `executablePath` + `chromiumSandbox: true`), in-container.md (multicall
+  names); status.md: the Playwright-library gap as a known limitation,
+  and the rootless-podman retest from *Open questions*.
+
+### Step 11: image facts and `${containerEnv:NAME}`
+
+- `Backend::image_passwd(image) -> Result<Option<String>>`:
+  `run --rm --pull=never --network=none --entrypoint /bin/sh <image> -c
+  'cat /etc/passwd'` (as the canary does, `dockerlike.rs` `canary_argv`
+  ~:238). No `sh` gives `None`. Apple: `None` (Tier 2, a VM per run).
+- Cache `State.image_facts: BTreeMap<image id, ImageFacts {env, passwd}>`
+  (`src/state.rs` `State` ~:350, empty omitted, like `identity_probes`),
+  keyed by image id (`image inspect .Id`), capped at 32 entries (oldest
+  dropped, by an `at` stamp).
+- Pure `account(passwd, name_or_uid) -> Option<{uid, gid, home}>` in
+  `runtime/identity.rs`. `Accounts` carries the adopted account's real
+  ids when known. They replace `ASSUMED` in keep-id (`plan` ~:451) and
+  `--expect` (`run/identity.rs` `apply_argv` ~:204). `ASSUMED` stays as
+  the fallback when there's no passwd.
+- `config::MountContext` (`src/config.rs` ~:526, built literally at
+  `run/mod.rs` ~:171/:531, `mounts.rs` ~:33, `snapshot.rs` ~:528, and in
+  tests) gains `container_env: Option<&ContainerEnv>`. `resolve_var`
+  (~:693) resolves `containerEnv:NAME` through it, in this order: the
+  sandbox's (substituted) `containerEnv`, then the image env, then for
+  `HOME` the adopted account's home (passwd, else `/home/<user>`, else
+  `/root`). On the rootless-docker root plan `HOME` is still the adopted
+  home. With `None` (snapshot, `ls`), `${containerEnv:…}` stays verbatim
+  and isn't an issue.
+- Substitute `containerEnv` and `remoteEnv` values (`run/mod.rs` ~:1073
+  `-e`, ~:785 `Instance.remote_env`). In `containerEnv` values,
+  `containerEnv:` reads only the image env and the home fallback. A
+  reference to a key the sandbox's `containerEnv` defines is an error.
+- Check the ordering in `materialize`: mounts must resolve after the image
+  exists. If they resolve before it today, move the resolution after
+  `image_for` with the smallest change, and say so in the report.
+- Docs: spec skill (`## ${…} variables` ~:102, `containerEnv`/`remoteEnv`
+  rows ~:82-83 "Not substituted" → substituted; `containerEnv:` allowed in
+  mounts, beyond the devcontainer spec), `docs/architecture/config.md`,
+  identity.md *Assumed ids* → real ids from the image.
+
+### Step 12: `identity_findings`
+
+- New `src/config_identity.rs` (`mod` in `main.rs`/`lib.rs` wherever
+  `config` is declared). Pure `identity_findings(&Config) -> Vec<Finding>`.
+  A `Finding` has `{id, origin: Origin::{Template|Sandbox}(name), kind,
+  key, value, edit: Option<String>, sandboxes: Vec<String>}`. The kinds
+  are `RootTarget`, `RootEnv`, `RootPath` and `RootUser`, with the exact
+  scope of section 7 *Findings*.
+- It scans each template's and sandbox's own table (`Config.templates` /
+  `sandboxes`, raw `toml::Table`s, `config.rs` ~:76). `sandboxes` holds
+  every sandbox whose `extends` chain reaches the table. Walk it like
+  `Config::resolve_extends` (~:990, private: expose a chain helper rather
+  than duplicate the cycle check). `RootUser` counts only where it wins
+  the merge (`resolved_table` ~:954).
+- Mounts in both forms: `parse_shorthand` (~:614) keys and `MountObject`
+  (~:516). The edit for `RootTarget`/`RootEnv` is `/root` →
+  `${containerEnv:HOME}`.
+- `id = short_hash(table | key | current value)` (`short_hash` ~:1059),
+  without an array index.
+- Table tests: a sandbox, a template shared by two sandboxes, an unused
+  template, an `extends` chain, a scalar override where the root user
+  loses, `/root` exactly vs `/rootfs`, caches and `/commandhistory` not
+  flagged.
+- Docs: none yet (nothing calls it); the module doc points at section 7.
+
+### Step 13: the rewrite
+
+- Add `toml_edit` to `Cargo.toml`, with the version that shares
+  `toml_parser`/`toml_writer`/`winnow` with `toml 1.1.5` (check
+  `Cargo.lock` after: no second copy of those three).
+- In `src/config_identity.rs`: pure `rewrite(text, &[Finding]) ->
+  Result<(String, usize edits)>`, on `toml_edit::DocumentMut`. It keeps
+  comments and layout, edits shorthand strings in place and object
+  `target`s by key, removes `RootUser` keys on update, and writes
+  `identity = "image"` into a table for `RootUser` "continue as is"
+  (a separate entry point, `keep_root(text, &Finding)`). It reparses the
+  output with `Config::parse` and checks the findings are gone.
+- `migrate_file(path, ids, expected_hash) -> Result<Migrated, MigrateError>`:
+  - YAML (`parse_yaml` path) → `Unsupported` with the edits as text;
+  - a hash mismatch → `Conflict`;
+  - `.bak` copy, then tmp + rename keeping the mode, through a symlink to
+    its target. On success the `.bak` is removed after the reparse; on
+    failure it's left and named.
+- Tests: round trips with comments, both mount forms, a template edit
+  fixing two sandboxes, YAML refusal, conflict, symlinked file, `.bak`
+  gone on success.
+
+### Step 14: acks and the API
+
+- `State.identity_acks: BTreeMap<project id, BTreeSet<finding id>>`
+  (next to `autostart_boot`, empty omitted, with a test). The project id
+  is whatever key `autostart_boot` uses. Pruned of ids no longer among
+  the findings on every write.
+- `serve/api.rs` method table (~:99-159), modeled on `sandboxes.get`
+  (~:800, `config_at` ~:776):
+  - `config.findings {root, sandbox?}` → `{file, format, fileHash,
+    findings}`, each finding with `acked`;
+  - `config.migrate {root, ids?, keep?, fileHash}` → `{edits, drifted}`,
+    where `drifted` is the instance names whose `config_hash` now differs
+    (`commands::drift_decision`), and `keep` the `RootUser` ids to
+    "continue as is";
+  - `config.ack {root, ids}`.
+  New `ApiError` constructors `conflict`/`unsupported` (`inbox/wire.rs`
+  ~:22-71). The ops are plain fns over `(root, state path)` so the CLI's
+  no-daemon path (step 16) calls them directly.
+- Add all three to `QUICK` (`serve/machines/forward.rs` ~:37).
+- `npm/devsandboxes/index.d.ts` (`ApiMethods` ~:1062, new interfaces),
+  with the `serve/dts.rs` checks in `api.rs`'s test (~:2121). In
+  `docs/reference/api.md`: the index row, a `## Config` section, and
+  `conflict` no longer "reserved" (~:109) plus a new `unsupported` row.
+  `docs/architecture/daemon/`: the daemon writes a user file here, against
+  `run::offer_example_config`'s rule, because the TUI and machines have
+  no other way to write. Say so.
+
+### Step 15: `SandboxRow.identity`, the header, Detail
+
+- `snapshot::SandboxRow` (`src/snapshot.rs` ~:142) gains `identity:
+  Vec<IdentityNote {id, text, acked}>`, filled in `sandbox_rows` (~:577)
+  from step 12 plus the acks in `state.toml`. It's shared with `ls`
+  (check `ls --json` and the d.ts `SandboxEntry` ~:732).
+- `tui/ui.rs`: a yellow line under the red `Snapshot.error` line in
+  `draw_instances` (~:1714) and `draw_services` (~:334), with the same
+  height logic: `N sandboxes use /root (U to update)`, un-acked only.
+  `sandbox_detail` (~:2172) shows each note under the red issues, yellow,
+  dim when acked. `U` opens step 17's offer. Until then, make it a no-op
+  hint left out of the header text, or ship `U` in step 17: pick one and
+  say so.
+- Docs: `docs/architecture/dashboard/` (header, Detail).
+
+### Step 16: the CLI prompt
+
+- `instances.resolve`'s `Found` (`machines/cli.rs` ~:271) gains
+  `sandbox`. Update d.ts and api.md.
+- `serve::verbs_client::prepare` (~:336): for `run` (after `run_target`
+  ~:554), `rebuild`/`start` (after `target_of` ~:524), call
+  `config.findings {root, sandbox}`. On un-acked findings and a TTY
+  (`ui.tty`, not `--json`), prompt `[u]pdate / [c]ontinue as is (don't
+  ask again) / [s]kip this time`, with one combined prompt for `--all`.
+  `u` → `config.migrate`, printing `updated devsandboxes.toml (N edits);
+  now drifted: a, b → devsandbox rebuild <name>`, and the verb then goes
+  on; `c` → `config.ack` for the non-root kinds plus `migrate` with
+  `keep` for `RootUser`. Read the answer the way `offer_example_config`
+  does (`run/mod.rs` ~:1147). Keep the prompt logic over an injected
+  call (`Call`) so it's unit-tested, like the existing `prepare` tests.
+- No daemon (`in_process()` ~:247): the same prompt over the step 14 fns
+  called locally.
+- `run` itself (`materialize`, next to the `ignored()` warning ~:105):
+  one `warning:` line on stderr when un-acked findings apply to the
+  sandbox. That covers off-TTY, `--json` (stdout untouched), the
+  dispatcher's `--in-process` subprocesses and autostart (in the daemon).
+- Docs: `docs/architecture/daemon/verbs.md` (the pre-send call), the CLI
+  reference if it describes prompts.
+
+### Step 17: the TUI modal, the TUI-open offer, examples
+
+- Before `spawn_verb` (`tui/mod.rs` ~:284-299, ~:871) sends
+  run/rebuild/start, for keys and the `:` prompt alike (both land in
+  `pending_action`): if the target sandbox's row has un-acked notes, open
+  a three-choice modal. Extend `Modal::Confirm` / `ConfirmModal`
+  (`tui/app/view.rs` ~:305-328, ~:513-610), which is yes/no today, with a
+  `Confirmed` variant carrying the held action and `u`/`c`/`s` keys. The
+  app stays I/O-free: the answer becomes a pending `Cmd`.
+- `tui/daemon.rs` `Cmd` (~:128) gains `Migrate`/`Ack`, modeled on
+  `Rename` (~:146, `Worker::rename` ~:909, `on_machine`), each answered by
+  a `DaemonUpdate`. After `Migrate`, the held verb is sent.
+- TUI open: on the first `instances.snapshot` (`snapshot_update` ~:643;
+  add a first-snapshot flag), un-acked findings across the root (unused
+  templates included, via `config.findings {root}`) open a modal listing
+  each edit: `update / continue as is / later`. `U` from step 15 opens
+  it too.
+- Examples: the spec skill's example (`skills/config-toml-spec/SKILL.md`
+  ~:142-165: `remoteUser = "root"`, `target=/root/.config/gh`), the site
+  examples (`site/src/content/examples/{isolated-services,ssh-and-git-push,babysit-pr,parallel-agents}.mdx`)
+  → `${containerEnv:HOME}/…` and no root user, and
+  `site/src/lib/agents.test.ts` (~:28) matching
+  `${containerEnv:HOME}/.claude`. Check with `cd site && pnpm check &&
+  pnpm build` (and the site's test command).
+- Docs: dashboard docs (modal, offer); status.md: drop the "`/root`
+  mounts break" limitation.
+
+### Close
+
+The orchestrator's final commit: verify the living docs against the code,
+write ADRs for the decisions that hold, update `docs/status.md`, and
+archive this plan.
 
 ## Decisions
 

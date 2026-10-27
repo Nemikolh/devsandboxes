@@ -12,7 +12,10 @@ limitation means editing this file in the same commit.
 
 ## In progress
 
-(none)
+- **runtimes**: identity's tool environment (the browser sandbox under
+  docker's seccomp, the root-plan browser wrapper, the knobs) and the
+  migration of configs that mount into `/root`.
+  → [plan](plans/active/identity.md)
 
 ## Planned
 
@@ -40,10 +43,6 @@ limitation means editing this file in the same commit.
   → [forwards](architecture/daemon/forwards.md#routes)
 - **helper**: run the ssh-agent relay once on Apple `container` on a Mac
   (built, never tested there).
-- **runtimes**: identity's tool environment (the browser sandbox under
-  docker's seccomp, the root-plan browser wrapper, the knobs) and the
-  migration of configs that mount into `/root`.
-  → [plan](plans/active/identity.md)
 
 ## Parked
 
