@@ -58,6 +58,14 @@ pub mod code {
     pub const BAD_REQUEST: &str = "bad-request";
     /// The method ran and failed; `message` says why (e.g. `no run `x``).
     pub const FAILED: &str = "failed";
+    /// `session.attach`: nothing to attach to (unknown id, `lost`, or the
+    /// session went away without an end).
+    pub const NO_SESSION: &str = "no-session";
+    /// `session.attach`: another client took the session over; it runs on.
+    pub const DETACHED: &str = "detached";
+    /// `session.attach`: the session was started by a helper speaking
+    /// another session wire version; nothing was attached, it runs on.
+    pub const VERSION: &str = "version";
 }
 
 /// A `call` record.

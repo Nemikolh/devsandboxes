@@ -12,6 +12,7 @@ mod listeners;
 mod outbox;
 mod rpc_runs;
 mod rpc_server;
+mod rpc_sessions;
 mod runs;
 mod sessions;
 mod userns;

@@ -95,7 +95,7 @@ const INPUT_CAP: usize = 64 * 1024;
 const TICK: c_int = 100;
 
 /// How often a client checks its terminal's size (see [`relay`]).
-const SIZE_POLL: Duration = Duration::from_millis(200);
+pub(crate) const SIZE_POLL: Duration = Duration::from_millis(200);
 
 /// How long the supervisor tries to hand a client its final records.
 const FINAL_WRITE: Duration = Duration::from_secs(2);
@@ -154,13 +154,9 @@ pub fn run(args: &[String]) -> i32 {
                 Ok(exe) => exe,
                 Err(e) => return failed(e),
             };
-            let started = create_with(root, &id, &argv, cwd.as_deref(), |id| {
-                let mut cmd = Command::new(&exe);
-                cmd.args(["session", "supervise", id]);
-                cmd
-            });
+            let started = create_with(root, &id, &argv, cwd.as_deref(), |id| Ok(supervisor_cmd(&exe, id)));
             return match started {
-                Ok(child) => terminal(|input, out, size| join(root, &id, child, input, out, size)),
+                Ok(mut child) => terminal(|input, out, size| join(root, &id, child.as_mut(), input, out, size)),
                 Err(e) => failed(e),
             };
         }
@@ -174,6 +170,13 @@ pub fn run(args: &[String]) -> i32 {
         Ok(()) => control::EXIT_OK,
         Err(e) => failed(e),
     }
+}
+
+/// `exe`'s `session supervise <id>`.
+pub(crate) fn supervisor_cmd(exe: &Path, id: &str) -> Command {
+    let mut cmd = Command::new(exe);
+    cmd.args(["session", "supervise", id]);
+    cmd
 }
 
 fn failed(e: io::Error) -> i32 {
@@ -926,9 +929,45 @@ fn exit_code(state: State) -> i32 {
 /// What a client ends with: its exit code and a note for stderr (printed
 /// after the terminal is restored).
 #[derive(Debug, PartialEq, Eq)]
-struct Done {
-    code: i32,
-    note: Option<String>,
+pub(crate) struct Done {
+    pub(crate) code: i32,
+    pub(crate) note: Option<String>,
+}
+
+/// How an attach ended, before it becomes a CLI client's [`Done`] or an RPC
+/// caller's last record (`rpc_sessions`): kept apart from exit codes, so a
+/// program exiting with [`NO_SESSION_EXIT`] is still its own exit.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum End {
+    /// The session's command ended with this code (`128 + n` for signal `n`).
+    Exit(i32),
+    /// Nothing to attach to (unknown, `lost`, the connection gone without an
+    /// end); the reason, said before the id.
+    NoSession(&'static str),
+    /// Another client took the session over.
+    Detached,
+    /// The session speaks another [`WIRE_VERSION`] (`None`: unrecorded).
+    Version(Option<u8>),
+}
+
+impl End {
+    /// The CLI client's exit code and note for session `id`.
+    pub(crate) fn done(self, id: &str) -> Done {
+        match self {
+            End::Exit(code) => Done { code, note: None },
+            End::NoSession(why) => Done { code: NO_SESSION_EXIT, note: Some(format!("{why} `{id}`")) },
+            End::Detached => Done { code: DETACHED_EXIT, note: Some(format!("session `{id}` was attached elsewhere")) },
+            End::Version(theirs) => {
+                let theirs = theirs.map_or("none".to_string(), |v| v.to_string());
+                Done {
+                    code: VERSION_EXIT,
+                    note: Some(format!(
+                        "session `{id}` was started by another devsbd (proto {theirs}, this is {WIRE_VERSION}); end it with session rm"
+                    )),
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -941,7 +980,7 @@ enum Outcome {
     Lost,
 }
 
-type SizeFn = Box<dyn FnMut() -> Option<(u16, u16)> + Send>;
+pub(crate) type SizeFn = Box<dyn FnMut() -> Option<(u16, u16)> + Send>;
 
 /// Saved terminal state for the panic hook (the helper's profile aborts on
 /// panic, so `Drop` wouldn't run).
@@ -1119,32 +1158,16 @@ fn ended(dir: &Path) -> Option<State> {
     meta.ended.map(|_| meta.exit.unwrap_or(State::Lost))
 }
 
-fn no_session(id: &str, why: &str) -> Done {
-    Done { code: NO_SESSION_EXIT, note: Some(format!("{why} `{id}`")) }
-}
-
-/// Session `id` speaks wire version `theirs` (`None`: from before versions
-/// were recorded), not ours.
-fn other_version(id: &str, theirs: Option<u8>) -> Done {
-    let theirs = theirs.map_or("none".to_string(), |v| v.to_string());
-    Done {
-        code: VERSION_EXIT,
-        note: Some(format!(
-            "session `{id}` was started by another devsbd (proto {theirs}, this is {WIRE_VERSION}); end it with session rm"
-        )),
-    }
-}
-
-/// A finished relay (or a connect that failed) as the client's result: the
-/// recorded end wins over a lost connection.
-fn conclude(dir: &Path, id: &str, outcome: Outcome) -> Done {
+/// A finished relay as the attach's end: the recorded end wins over a lost
+/// connection.
+fn conclude(dir: &Path, outcome: Outcome) -> End {
     match outcome {
-        Outcome::Exit(code) => Done { code, note: None },
-        Outcome::Detached => Done { code: DETACHED_EXIT, note: Some(format!("session `{id}` was attached elsewhere")) },
-        Outcome::Version(v) => other_version(id, Some(v)),
+        Outcome::Exit(code) => End::Exit(code),
+        Outcome::Detached => End::Detached,
+        Outcome::Version(v) => End::Version(Some(v)),
         Outcome::Lost => match ended(dir) {
-            Some(state) => Done { code: exit_code(state), note: None },
-            None => no_session(id, "lost the connection to session"),
+            Some(state) => End::Exit(exit_code(state)),
+            None => End::NoSession("lost the connection to session"),
         },
     }
 }
@@ -1153,7 +1176,7 @@ fn conclude(dir: &Path, id: &str, outcome: Outcome) -> Done {
 /// while `child` (the supervisor `new` just spawned) lives, else while the
 /// session is young and its command not recorded yet. `None`: nothing to
 /// attach to.
-fn connect(dir: &Path, mut child: Option<Child>) -> Option<UnixStream> {
+fn connect(dir: &Path, mut child: Option<&mut Child>) -> Option<UnixStream> {
     let deadline = Instant::now() + Duration::from_secs(runs::STARTING_GRACE);
     loop {
         if let Ok(sock) = UnixStream::connect(dir.join("sock")) {
@@ -1191,35 +1214,54 @@ fn attach(
     join(root, id, None, input, out, size)
 }
 
-/// Attach to session `id`, `child` its supervisor when this process just
-/// started it (`new`). Before dialing, `meta`: an ended session's recorded
-/// code at once (whoever ran it); one whose `proto` isn't [`WIRE_VERSION`]
-/// (or has none) is refused with [`VERSION_EXIT`], never connected to, so
-/// its attached client stays attached.
+/// [`join_end`] as a CLI client's result.
 fn join(
     root: &Path,
     id: &str,
-    child: Option<Child>,
+    child: Option<&mut Child>,
     input: impl Read + Send + 'static,
     out: Box<dyn Write + Send>,
     size: Option<SizeFn>,
 ) -> Done {
-    let Ok(dir) = session_dir(root, id) else { return no_session(id, "no session") };
+    join_end(root, id, child, input, out, size, |_| {}).done(id)
+}
+
+/// Attach to session `id`, `child` its supervisor when this process just
+/// started it (`new`, `session.attach` with `create`). Before dialing,
+/// `meta`: an ended session's recorded code at once (whoever ran it); one
+/// whose `proto` isn't [`WIRE_VERSION`] (or has none) is refused, never
+/// connected to, so its attached client stays attached. `on_connect` sees
+/// the socket before the relay starts: shutting it down later (the RPC
+/// caller hung up) ends the relay as a lost connection, which detaches
+/// without ending the session.
+pub(crate) fn join_end(
+    root: &Path,
+    id: &str,
+    child: Option<&mut Child>,
+    input: impl Read + Send + 'static,
+    out: Box<dyn Write + Send>,
+    size: Option<SizeFn>,
+    on_connect: impl FnOnce(&UnixStream),
+) -> End {
+    let Ok(dir) = session_dir(root, id) else { return End::NoSession("no session") };
     // No `meta` yet: another `new` is mid-create; `connect` waits for it as
     // for any starting session.
     if let Ok(meta) = runs::read_capped(&dir.join("meta"), 4 * 1024).map(|t| runs::parse_meta(&t)) {
         if meta.ended.is_some() {
-            return Done { code: exit_code(meta.exit.unwrap_or(State::Lost)), note: None };
+            return End::Exit(exit_code(meta.exit.unwrap_or(State::Lost)));
         }
         if meta.proto != Some(WIRE_VERSION) {
-            return other_version(id, meta.proto);
+            return End::Version(meta.proto);
         }
     }
     match connect(&dir, child) {
-        Some(sock) => conclude(&dir, id, relay(sock, input, out, size)),
+        Some(sock) => {
+            on_connect(&sock);
+            conclude(&dir, relay(sock, input, out, size))
+        }
         None => match ended(&dir) {
-            Some(state) => Done { code: exit_code(state), note: None },
-            None => no_session(id, "no live session"),
+            Some(state) => End::Exit(exit_code(state)),
+            None => End::NoSession("no live session"),
         },
     }
 }
@@ -1229,13 +1271,14 @@ fn join(
 /// its own session, null stdio. `Ok(None)`: the id is taken, attach to it
 /// instead. A bad `cwd` fails here, before anything runs. `meta` records the
 /// [`WIRE_VERSION`] (`proto`) that `join` checks. First, quietly,
-/// [`prune_settled`].
-fn create_with(
+/// [`prune_settled`]. `supervisor` may fail (`rpc_sessions` hands the dir to
+/// the session's user there); the dir is removed then.
+pub(crate) fn create_with(
     root: &Path,
     id: &str,
     argv: &[String],
     cwd: Option<&str>,
-    supervisor: impl FnOnce(&str) -> Command,
+    supervisor: impl FnOnce(&str) -> io::Result<Command>,
 ) -> io::Result<Option<Child>> {
     outbox::ensure_dir(root)?;
     prune_settled(root, runs::now());
@@ -1248,7 +1291,7 @@ fn create_with(
     // `proto` before anything else, so no attach ever reads a `meta` without it.
     let spawned = runs::append(&dir, &format!("proto {WIRE_VERSION}\n")).and_then(|()| runs::init(&dir, argv, runs::now()));
     let spawned = spawned.and_then(|()| {
-        let mut cmd = supervisor(id);
+        let mut cmd = supervisor(id)?;
         cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
         // SAFETY: only setsid between fork and exec. Its own session: no
         // terminal's hangup or job control reaches the supervisor.
@@ -1287,7 +1330,7 @@ fn prune_settled(root: &Path, now: u64) {
 /// `runs::MAX_LS_RUNS`: `<id> <state> <attached|detached|-> <started, UTC>
 /// <argv…>` (state as in `run ls`; the attachment is `-` unless running),
 /// argv rendered and cut as `run ls` does. Unreadable sessions are skipped.
-fn ls(root: &Path) -> io::Result<String> {
+pub(crate) fn ls(root: &Path) -> io::Result<String> {
     let ids = runs::run_ids(root)?;
     let mut out = String::new();
     for id in &ids[ids.len().saturating_sub(runs::MAX_LS_RUNS)..] {
@@ -1331,7 +1374,7 @@ fn wait_stopped(dir: &Path, id: &str, timeout: Duration) -> io::Result<bool> {
 /// wait for its supervisor to record the end, delete the dir. The group is
 /// verified against the process table (`runs::kill_target`), as `run rm
 /// --force` does.
-fn rm(root: &Path, id: &str) -> io::Result<()> {
+pub(crate) fn rm(root: &Path, id: &str) -> io::Result<()> {
     let dir = session_dir(root, id)?;
     if let Ok((meta, State::Running)) = runs::load_state(&dir, id)
         && let Some(pgid) = runs::kill_target(&meta, runs::proc_stat)
@@ -1348,7 +1391,7 @@ fn rm(root: &Path, id: &str) -> io::Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::mpsc;
 
@@ -1358,7 +1401,7 @@ mod tests {
 
     /// Under `/tmp`, not `temp_dir()`: macOS's is long enough to push
     /// `<root>/<id>/sock` past `sun_path` (104 bytes).
-    fn temp_root(tag: &str) -> PathBuf {
+    pub(crate) fn temp_root(tag: &str) -> PathBuf {
         let root = PathBuf::from(format!("/tmp/devsbd-ses-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         root
@@ -1498,17 +1541,20 @@ mod tests {
         supervise(Path::new(&root), &id).unwrap();
     }
 
+    /// This test binary as session `id`'s supervisor under `root`
+    /// ([`supervisor_process`]).
+    pub(crate) fn test_supervisor(root: &Path, id: &str) -> Command {
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        // The id as a second filter: the cmdline names it (`is_supervisor`).
+        cmd.args(["--exact", "--ignored", "sessions::tests::supervisor_process", id])
+            .env("DEVSBD_TEST_SESSIONS_ROOT", root)
+            .env("DEVSBD_TEST_SESSION_ID", id);
+        cmd
+    }
+
     /// `create_with` with this test binary as the supervisor.
     fn create_test(root: &Path, id: &str, argv: &[String], cwd: Option<&str>) -> io::Result<Option<Child>> {
-        let exe = std::env::current_exe().unwrap();
-        create_with(root, id, argv, cwd, |id| {
-            let mut cmd = Command::new(&exe);
-            // The id as a second filter: the cmdline names it (`is_supervisor`).
-            cmd.args(["--exact", "--ignored", "sessions::tests::supervisor_process", id])
-                .env("DEVSBD_TEST_SESSIONS_ROOT", root)
-                .env("DEVSBD_TEST_SESSION_ID", id);
-            cmd
-        })
+        create_with(root, id, argv, cwd, |id| Ok(test_supervisor(root, id)))
     }
 
     fn start(root: &Path, id: &str, script: &str) -> Child {
@@ -1574,7 +1620,8 @@ mod tests {
         let (tx, done) = mpsc::channel();
         let (root, id) = (root.to_path_buf(), id.to_string());
         std::thread::spawn(move || {
-            let _ = tx.send(join(&root, &id, child, theirs, out, size));
+            let mut child = child;
+            let _ = tx.send(join(&root, &id, child.as_mut(), theirs, out, size));
         });
         TestClient { input, output, done }
     }
@@ -1594,7 +1641,7 @@ mod tests {
         }
     }
 
-    fn wait_for(what: &str, cond: impl Fn() -> bool) {
+    pub(crate) fn wait_for(what: &str, cond: impl Fn() -> bool) {
         let t = Instant::now();
         while !cond() {
             assert!(t.elapsed() < Duration::from_secs(20), "timed out waiting for {what}");
@@ -1602,7 +1649,7 @@ mod tests {
         }
     }
 
-    fn meta(root: &Path, id: &str) -> runs::Meta {
+    pub(crate) fn meta(root: &Path, id: &str) -> runs::Meta {
         runs::parse_meta(&fs::read_to_string(root.join(id).join("meta")).unwrap())
     }
 

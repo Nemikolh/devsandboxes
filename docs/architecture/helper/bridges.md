@@ -176,6 +176,11 @@ is the one way in:
   `meta.caller` stamped over whatever `meta` had (who asked; for
   `helper.call` the connection's client, `cli`, `tui` or `api:<name>`), and
   `Eof`: calls send no input.
+- `call_with_input(…)` is the same call with the stream left open: it
+  returns the `Call` and an `Input`, the stream's write side, which sends
+  `stdin` (chunked at `MAX_RECORD`), `resize` and `stdin-eof` records from
+  any thread while `Call::next` reads the reply (`session.attach`'s
+  terminal I/O). Dropping the `Input` is the stream's `Eof`, not a cancel.
 - `Call::next` reads the reply records up to the last (`result`, `error`,
   `exit`); a stream that ends without one is an error with the reason
   (cancelled, the peer's `Close` reason, the bridge gone).

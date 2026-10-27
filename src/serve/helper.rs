@@ -5,8 +5,10 @@
 //! queues the call behind that container's [`MAX_CALLS`], opens one `RPC`
 //! stream per call (`Mux::open_host`), stamps `meta.caller`, and logs one line
 //! per call. [`Call`] reads the reply records; cancelling is closing the
-//! stream. What a container's daemon offers (`rpc.methods`) is cached per
-//! bridge attach ([`HelperClient::offers`]).
+//! stream. A call that carries input ([`HelperClient::call_with_input`], e.g.
+//! `session.attach`) also gets an [`Input`] writing `stdin` / `resize` /
+//! `stdin-eof` records into the same stream. What a container's daemon offers
+//! (`rpc.methods`) is cached per bridge attach ([`HelperClient::offers`]).
 //!
 //! Also the internal `helper.call` API method ([`parse`], [`serve`]): a held
 //! request like a verb, the call's records relayed as `helper.record`
@@ -181,6 +183,41 @@ impl HelperClient {
         caller: &str,
         abandoned: &dyn Fn() -> bool,
     ) -> Result<Call, CallError> {
+        self.open(container, method, params, meta, caller, abandoned, false).map(|(call, _)| call)
+    }
+
+    /// [`HelperClient::call`] for a method that takes input after the `call`
+    /// (`session.attach`): the stream stays open, [`Input`] writes into it
+    /// from any thread while [`Call::next`] reads the reply. Dropping the
+    /// `Input` ends the input (`Eof`), not the call.
+    // First caller: fleet step 4's `PTY` (docs/plans/active/fleet.md).
+    #[allow(dead_code)]
+    pub fn call_with_input(
+        &self,
+        container: &str,
+        method: &str,
+        params: Obj,
+        meta: Obj,
+        caller: &str,
+        abandoned: &dyn Fn() -> bool,
+    ) -> Result<(Call, Input), CallError> {
+        let (call, input) = self.open(container, method, params, meta, caller, abandoned, true)?;
+        Ok((call, input.expect("asked for input")))
+    }
+
+    /// Queue, open the stream, send the `call`; then half-close it, or (with
+    /// `input`) hand back its write side.
+    #[allow(clippy::too_many_arguments)]
+    fn open(
+        &self,
+        container: &str,
+        method: &str,
+        params: Obj,
+        meta: Obj,
+        caller: &str,
+        abandoned: &dyn Fn() -> bool,
+        input: bool,
+    ) -> Result<(Call, Option<Input>), CallError> {
         let started = Instant::now();
         let logged = |e: CallError| {
             log_call(self.inner.log, container, method, caller, &e.to_string(), started);
@@ -198,11 +235,18 @@ impl HelperClient {
             .map_err(|e| logged(CallError::Io(e)))?;
         let cancel = Cancel { mux: Arc::clone(&link.mux), stream, cancelled: Arc::default() };
         let record = Record::Call(rpc::Call { method: method.to_string(), params, meta: meta.with("caller", caller) });
-        if let Err(e) = rpc::write_record(&mut conn, &record).and_then(|()| conn.shutdown(Shutdown::Write)) {
-            link.mux.close_stream(stream, "call not sent");
-            return Err(logged(CallError::Io(e)));
-        }
-        Ok(Call {
+        let sent = rpc::write_record(&mut conn, &record).and_then(|()| match input {
+            true => conn.try_clone().map(|conn| Some(Input { conn })),
+            false => conn.shutdown(Shutdown::Write).map(|()| None),
+        });
+        let input = match sent {
+            Ok(input) => input,
+            Err(e) => {
+                link.mux.close_stream(stream, "call not sent");
+                return Err(logged(CallError::Io(e)));
+            }
+        };
+        let call = Call {
             conn,
             cancel,
             closed,
@@ -215,7 +259,8 @@ impl HelperClient {
             caller: caller.to_string(),
             log: self.inner.log,
             _slot: slot,
-        })
+        };
+        Ok((call, input))
     }
 
     /// Whether `container`'s daemon offers `method`: a bare name matches any
@@ -342,6 +387,41 @@ impl Cancel {
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
         self.mux.close_stream(self.stream, "cancelled");
+    }
+}
+
+/// A call's input: records after the `call`, on its stream (`rpc.rs`). Each
+/// write fails once the stream is gone (the call ended or was cancelled).
+/// Dropped: `Eof`, the end of input; the call goes on.
+pub struct Input {
+    conn: Conn,
+}
+
+// First caller: fleet step 4's `PTY` (docs/plans/active/fleet.md).
+#[allow(dead_code)]
+impl Input {
+    /// Bytes for the callee's stdin, in records of at most `MAX_RECORD`.
+    pub fn stdin(&mut self, bytes: &[u8]) -> io::Result<()> {
+        for chunk in bytes.chunks(rpc::MAX_RECORD as usize) {
+            rpc::write_record(&mut self.conn, &Record::Stdin(chunk.to_vec()))?;
+        }
+        Ok(())
+    }
+
+    /// The caller's terminal size (a session's pty follows it).
+    pub fn resize(&mut self, cols: u16, rows: u16) -> io::Result<()> {
+        rpc::write_record(&mut self.conn, &Record::Resize { cols, rows })
+    }
+
+    /// No more stdin. The stream stays open: dropping the `Input` closes it.
+    pub fn stdin_eof(&mut self) -> io::Result<()> {
+        rpc::write_record(&mut self.conn, &Record::StdinEof)
+    }
+}
+
+impl Drop for Input {
+    fn drop(&mut self) {
+        let _ = self.conn.shutdown(Shutdown::Write);
     }
 }
 
@@ -636,7 +716,9 @@ pub(crate) mod tests {
 
     /// Like `rpc_server`'s `serve`: `rpc.methods`, `echo` (params and meta
     /// back), `chatty` (stdout, an event, exit 3), `hang` (a stdout, then
-    /// nothing until the stream goes), anything else `unknown-method`.
+    /// nothing until the stream goes), `cat` (input back: `stdin` as
+    /// `stdout`, a `resize` as an event, `exit 0` at `stdin-eof`, `exit 1`
+    /// at the stream's `Eof`), anything else `unknown-method`.
     pub(crate) fn respond(s: UnixStream) {
         let mut r = &s;
         let Ok(Some(Record::Call(call))) = rpc::read_record(&mut r) else { return };
@@ -655,6 +737,21 @@ pub(crate) mod tests {
                 let _ = send(Record::Event(Obj::new().with("state", "running")));
                 let _ = send(Record::Exit(Exit::Code(3)));
             }
+            "cat" => loop {
+                let rec = match rpc::read_record(&mut r) {
+                    Ok(Some(Record::Stdin(b))) => Record::Stdout(b),
+                    Ok(Some(Record::Resize { cols, rows })) => {
+                        Record::Event(Obj::new().with("cols", i64::from(cols)).with("rows", i64::from(rows)))
+                    }
+                    Ok(Some(Record::StdinEof)) => Record::Exit(Exit::Code(0)),
+                    _ => Record::Exit(Exit::Code(1)),
+                };
+                let last = matches!(rec, Record::Exit(_));
+                let _ = send(rec);
+                if last {
+                    break;
+                }
+            },
             "hang" => {
                 // A long-running method: the caller's `Eof` doesn't end it,
                 // only the stream going (its socket shut by a `Close`).
@@ -714,6 +811,42 @@ pub(crate) mod tests {
         assert_eq!(recs[2], Record::Exit(Exit::Code(3)));
         drop(call);
         assert!(logged("helper c1: chatty from cli: exit 3 ("));
+    }
+
+    /// Input travels on the call's own stream, from another thread, while
+    /// the reply is read; dropping the `Input` is the stream's `Eof`.
+    #[test]
+    fn a_call_with_input_sends_stdin_resize_and_eof() {
+        let (c, fake) = client(4);
+        fake.add("c5", caps::RPC, 1, respond);
+        let (mut call, mut input) = c.call_with_input("c5", "cat", no(), no(), "hub", &|| false).unwrap();
+        let big = vec![b'x'; rpc::MAX_RECORD as usize + 10];
+        let writer = std::thread::spawn(move || {
+            input.stdin(b"hi").unwrap();
+            input.resize(120, 40).unwrap();
+            input.stdin(&big).unwrap();
+            input.stdin_eof().unwrap();
+            input
+        });
+        let mut recs = Vec::new();
+        while let Some(rec) = call.next().unwrap() {
+            recs.push(rec);
+        }
+        let input = writer.join().unwrap();
+        assert_eq!(recs[0], Record::Stdout(b"hi".to_vec()));
+        assert_eq!(recs[1], Record::Event(Obj::new().with("cols", 120i64).with("rows", 40i64)));
+        let sizes: Vec<usize> = recs[2..4].iter().map(|r| if let Record::Stdout(b) = r { b.len() } else { 0 }).collect();
+        assert_eq!(sizes, [rpc::MAX_RECORD as usize, 10], "chunked at MAX_RECORD");
+        assert_eq!(recs[4..], [Record::Exit(Exit::Code(0))]);
+        drop((input, call));
+        assert!(logged("helper c5: cat from hub: exit 0 ("));
+
+        let (mut call, input) = c.call_with_input("c5", "cat", no(), no(), "hub", &|| false).unwrap();
+        drop(input);
+        assert_eq!(call.next().unwrap(), Some(Record::Exit(Exit::Code(1))), "dropped: Eof");
+        // Plain calls still send none: `cat` sees the Eof at once.
+        let mut call = c.call("c5", "cat", no(), no(), "hub", &|| false).unwrap();
+        assert_eq!(call.next().unwrap(), Some(Record::Exit(Exit::Code(1))));
     }
 
     #[test]

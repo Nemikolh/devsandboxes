@@ -5,7 +5,9 @@
 //! reply records (`rpc.rs`). A handler writes its intermediate records
 //! (`stdout`, `event`) through [`Out`] as it goes and returns the last one, so
 //! a streaming method (`run.logs` with `follow`, `run.wait`) is one held
-//! stream; [`Out::gone`] tells it the caller closed the stream.
+//! stream; [`Out::gone`] tells it the caller closed the stream. A method that
+//! takes the caller's input records (`session.attach`) reads them from
+//! [`Out::take_input`].
 //!
 //! What a daemon offers depends on who it runs as: methods that must act as
 //! another user (`needs_root`) are listed and served only when the euid is 0,
@@ -22,7 +24,9 @@ use crate::mux::Conn;
 use crate::proto::channel;
 use crate::rpc::{self, code, Call, Obj, Record};
 use crate::rpc_runs;
+use crate::rpc_sessions;
 use crate::runs;
+use crate::sessions;
 
 /// One RPC method. `version` bumps when its params or reply change shape;
 /// the host picks per container from `rpc.methods` (`name@version`).
@@ -48,17 +52,38 @@ pub struct Ctx {
     /// The supervisor command for run `id` under `runs`
     /// (`runs::supervisor_cmd` of this binary; the test binary in tests).
     pub supervisor: fn(&Path, &str) -> Command,
+    /// The sessions dir (`sessions::DIR`; a temp dir in tests).
+    pub sessions: PathBuf,
+    /// The supervisor command for session `id` under `sessions`
+    /// (`sessions::supervisor_cmd` of this binary; the test binary in tests).
+    pub session_supervisor: fn(&Path, &str) -> Command,
 }
 
 /// A call's reply stream, before its last record.
 pub struct Out<'a> {
     w: &'a mut dyn Write,
     gone: &'a dyn Fn() -> bool,
+    input: Option<UnixStream>,
 }
 
 impl<'a> Out<'a> {
     pub fn new(w: &'a mut dyn Write, gone: &'a dyn Fn() -> bool) -> Out<'a> {
-        Out { w, gone }
+        Out { w, gone, input: None }
+    }
+
+    /// Over a stream whose caller's records after the `call` a handler may
+    /// read ([`Out::take_input`]).
+    fn with_input(self, input: Option<UnixStream>) -> Out<'a> {
+        Out { input, ..self }
+    }
+
+    /// The stream itself, once: the caller's records after the `call` are
+    /// read from it, and the handler may write intermediate records to it
+    /// from other threads, as long as none still writes when it returns (the
+    /// last record follows). `None` in-process (tests) or after the first
+    /// take. Whatever input the handler leaves is drained after its reply.
+    pub fn take_input(&mut self) -> Option<UnixStream> {
+        self.input.take()
     }
 
     /// Write one intermediate record; an error means the caller is gone.
@@ -77,7 +102,9 @@ impl<'a> Out<'a> {
 /// run's user; `run.rm`/`run.prune` delete dirs (and kill groups) that
 /// belong to that user in the sticky runs dir, which only root (or that
 /// user, whom a non-root daemon may not be) can: all three root only, the
-/// host execs them as the user otherwise. The reads work as any user.
+/// host execs them as the user otherwise. The reads work as any user. The
+/// `session.*` methods start a session's supervisor as its user and attach to
+/// or delete sessions of any user: root only too.
 pub const METHODS: &[Method] = &[
     Method { name: "rpc.methods", version: 1, needs_root: false, handler: list_methods },
     Method { name: "run.start", version: 1, needs_root: true, handler: rpc_runs::start },
@@ -86,6 +113,9 @@ pub const METHODS: &[Method] = &[
     Method { name: "run.wait", version: 1, needs_root: false, handler: rpc_runs::wait },
     Method { name: "run.rm", version: 1, needs_root: true, handler: rpc_runs::rm },
     Method { name: "run.prune", version: 1, needs_root: true, handler: rpc_runs::prune },
+    Method { name: "session.attach", version: 1, needs_root: true, handler: rpc_sessions::attach },
+    Method { name: "session.ls", version: 1, needs_root: true, handler: rpc_sessions::ls },
+    Method { name: "session.rm", version: 1, needs_root: true, handler: rpc_sessions::rm },
 ];
 
 /// Stack for a stream's thread: it holds one record at a time on the heap.
@@ -94,13 +124,29 @@ const STACK: usize = 128 * 1024;
 /// The mux's `on_host_open` hook: an `RPC` stream gets a socket pair, one end
 /// served on its own thread; any other channel is refused.
 pub fn accept(channel: u8) -> Option<Conn> {
-    accept_with(channel, Ctx { root: is_root(), table: METHODS, runs: runs::DIR.into(), supervisor })
+    let ctx = Ctx {
+        root: is_root(),
+        table: METHODS,
+        runs: runs::DIR.into(),
+        supervisor,
+        sessions: sessions::DIR.into(),
+        session_supervisor,
+    };
+    accept_with(channel, ctx)
+}
+
+fn own_exe() -> PathBuf {
+    std::env::current_exe().unwrap_or_else(|_| "/proc/self/exe".into())
 }
 
 /// This binary's `run supervise <id>`.
 fn supervisor(_: &Path, id: &str) -> Command {
-    let exe = std::env::current_exe().unwrap_or_else(|_| "/proc/self/exe".into());
-    runs::supervisor_cmd(&exe, id)
+    runs::supervisor_cmd(&own_exe(), id)
+}
+
+/// This binary's `session supervise <id>`.
+fn session_supervisor(_: &Path, id: &str) -> Command {
+    sessions::supervisor_cmd(&own_exe(), id)
 }
 
 fn accept_with(channel: u8, ctx: Ctx) -> Option<Conn> {
@@ -125,7 +171,9 @@ fn serve(stream: UnixStream, ctx: &Ctx) {
     let mut w = &stream;
     let gone = || hung_up(&stream);
     let reply = match rpc::read_record(&mut r) {
-        Ok(Some(Record::Call(call))) => dispatch(ctx, &call, &mut Out::new(&mut w, &gone)),
+        Ok(Some(Record::Call(call))) => {
+            dispatch(ctx, &call, &mut Out::new(&mut w, &gone).with_input(stream.try_clone().ok()))
+        }
         Ok(Some(_)) => Record::error(code::BAD_REQUEST, "the first record must be a call"),
         Ok(None) => return,
         Err(e) => Record::error(code::BAD_REQUEST, e.to_string()),
@@ -158,7 +206,7 @@ fn list_methods(ctx: &Ctx, _: &Call, _: &mut Out) -> Record {
 /// Whether the mux shut our stream's peer end down both ways: a `Close`
 /// (cancel) or a dead bridge. The caller's `Eof` only shuts its write side,
 /// which reads as end of input, not as a hang-up. `poll` with no wait.
-fn hung_up(s: &UnixStream) -> bool {
+pub(crate) fn hung_up(s: &UnixStream) -> bool {
     use std::os::fd::AsRawFd;
     #[repr(C)]
     struct PollFd {
@@ -206,7 +254,14 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn ctx(root: bool, table: &'static [Method]) -> Ctx {
-        Ctx { root, table, runs: "/nonexistent/runs".into(), supervisor: no_supervisor }
+        Ctx {
+            root,
+            table,
+            runs: "/nonexistent/runs".into(),
+            supervisor: no_supervisor,
+            sessions: "/nonexistent/sessions".into(),
+            session_supervisor: no_supervisor,
+        }
     }
 
     /// `dispatch` with intermediate records dropped.
@@ -242,9 +297,21 @@ pub(crate) mod tests {
 
     #[test]
     fn the_real_table_lists_rpc_methods() {
-        let all = ["rpc.methods@1", "run.start@1", "run.ls@1", "run.logs@1", "run.wait@1", "run.rm@1", "run.prune@1"];
+        let all = [
+            "rpc.methods@1",
+            "run.start@1",
+            "run.ls@1",
+            "run.logs@1",
+            "run.wait@1",
+            "run.rm@1",
+            "run.prune@1",
+            "session.attach@1",
+            "session.ls@1",
+            "session.rm@1",
+        ];
         assert_eq!(listed(dispatch(&ctx(true, METHODS), &call("rpc.methods"))), all);
-        // A non-root daemon can't act as the run's user: the host execs those.
+        // A non-root daemon can't act as the run's (or session's) user: the
+        // host execs those.
         let user = ["rpc.methods@1", "run.ls@1", "run.logs@1", "run.wait@1"];
         assert_eq!(listed(dispatch(&ctx(false, METHODS), &call("rpc.methods"))), user);
         assert!(accept(channel::CONTROL).is_none(), "only RPC streams are served");

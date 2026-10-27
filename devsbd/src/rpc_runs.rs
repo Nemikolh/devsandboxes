@@ -116,7 +116,7 @@ pub fn start(ctx: &Ctx, call: &Call, _: &mut Out) -> Record {
 
 /// `user` (`name|uid[:group|gid]`) against this container's passwd/group,
 /// with the groups `docker exec -u` would give it ([`supplementary_groups`]).
-fn lookup(user: &str) -> Option<(Account, Vec<u32>)> {
+pub(crate) fn lookup(user: &str) -> Option<(Account, Vec<u32>)> {
     let passwd = std::fs::read_to_string("/etc/passwd").unwrap_or_default();
     let group = std::fs::read_to_string("/etc/group").unwrap_or_default();
     let a = resolve_user(&passwd, &group, user)?;
@@ -133,7 +133,7 @@ fn lookup(user: &str) -> Option<(Account, Vec<u32>)> {
 /// in that order (each needs the privileges the next one drops), each
 /// checked. Between fork and exec only async-signal-safe calls: `groups` is
 /// allocated here, before the fork, and the hook only reads it.
-fn switch_user(cmd: &mut std::process::Command, uid: u32, gid: u32, groups: Vec<u32>) {
+pub(crate) fn switch_user(cmd: &mut std::process::Command, uid: u32, gid: u32, groups: Vec<u32>) {
     #[cfg(target_os = "linux")]
     type Count = usize;
     #[cfg(not(target_os = "linux"))]
@@ -162,8 +162,9 @@ fn switch_user(cmd: &mut std::process::Command, uid: u32, gid: u32, groups: Vec<
 
 /// Chown a fresh run dir and the files `create` wrote to `a`, so its
 /// supervisor (running as `a`) can append to it and `a` can `rm` it, as if
-/// `a` had run `devsbd run start`. `lchown`: never through a link.
-fn hand_over(dir: &Path, a: &Account) -> std::io::Result<()> {
+/// `a` had run `devsbd run start` (a session's dir holds the same files).
+/// `lchown`: never through a link.
+pub(crate) fn hand_over(dir: &Path, a: &Account) -> std::io::Result<()> {
     use std::os::unix::fs::lchown;
     for path in [dir.to_path_buf(), dir.join("argv"), dir.join("meta")] {
         lchown(&path, Some(a.uid), Some(a.gid))?;
@@ -173,7 +174,7 @@ fn hand_over(dir: &Path, a: &Account) -> std::io::Result<()> {
 
 /// Wait for a supervisor this daemon spawned, so it doesn't stay a zombie
 /// (its cmdline empty: `runs::is_supervisor` already reads that as gone).
-fn reap(mut child: Child) {
+pub(crate) fn reap(mut child: Child) {
     let _ = std::thread::Builder::new().name("run-reap".into()).stack_size(32 * 1024).spawn(move || {
         let _ = child.wait();
     });
@@ -306,7 +307,11 @@ mod tests {
     }
 
     fn ctx(root: &Path) -> Ctx {
-        Ctx { root: true, table: METHODS, runs: root.to_path_buf(), supervisor }
+        Ctx { root: true, table: METHODS, runs: root.to_path_buf(), supervisor, ..no_sessions() }
+    }
+
+    fn no_sessions() -> Ctx {
+        crate::rpc_server::tests::ctx(true, METHODS)
     }
 
     fn call(method: &str, params: Obj) -> Call {
@@ -478,7 +483,7 @@ mod tests {
         let ctx = ctx(&root);
         let id = start(&ctx, &["sh", "-c", "echo one; sleep 0.3; echo two"], Vec::new());
         let r = root.clone();
-        let host = pair_with(move || Ctx { root: false, table: METHODS, runs: r.clone(), supervisor });
+        let host = pair_with(move || Ctx { root: false, table: METHODS, runs: r.clone(), supervisor, ..no_sessions() });
         let follow = Record::Call(call("run.logs", Obj::new().with("id", id.as_str()).with("follow", true)));
         let recs = round_trip(&host, 1, &[follow]);
         assert_eq!(stdout(&recs), b"one\ntwo\n");

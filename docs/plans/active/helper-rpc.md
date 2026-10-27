@@ -1,6 +1,6 @@
 # Helper RPC: host → in-container daemon requests
 
-Status: in progress (step 8 next)
+Status: steps 1-3 and 8 shipped; steps 4-7 planned (after fleet step 4)
 Step 1 shipped: `channel::RPC` / `caps::RPC`, flowing `Open`
 (`proto::channel::flows`, `Mux::on_host_open`), `src/devsbd/rpc.rs`,
 `devsbd/src/rpc_server.rs` with `rpc.methods`.
@@ -12,6 +12,10 @@ methods (`devsbd/src/rpc_runs.rs`; `run.start`/`rm`/`prune` root only),
 `dispatch.rs`' `run_op` calling them (`rpc_request`, `rpc_answer`,
 `Executor::helper_call`) with exec as the per-method fallback. The
 dispatcher → host leg still polls (`docs/status.md`).
+Step 8 shipped: `session.attach` / `session.ls` / `session.rm`
+(`devsbd/src/rpc_sessions.rs`, root only; `sessions::join_end` / `End`),
+the `no-session` / `detached` / `version` error codes, the host's
+`HelperClient::call_with_input` / `Input`.
 
 Today the one persistent link (the serve daemon's bridge,
 [bridges](../../architecture/helper/bridges.md)) carries the container's

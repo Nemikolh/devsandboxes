@@ -12,9 +12,7 @@ limitation means editing this file in the same commit.
 
 ## In progress
 
-- **helper / machines**: helper-rpc step 8, then fleet step 4 (fleet
-  steps 1-3 shipped), in the order of
-  [helper-rpc](plans/active/helper-rpc.md#order-across-plans).
+(none)
 
 ## Planned
 
@@ -23,15 +21,19 @@ limitation means editing this file in the same commit.
   for sessions nobody reattaches to (`devsbd/src/sessions.rs`).
   → [plan](plans/active/resumable-exec.md)
 
-- **helper**: host → in-container daemon requests (an `RPC` channel),
-  daemon-owned runs with a restart policy, worktree stand-ins.
+- **helper**: daemon-owned runs (registry, run-state events, a `queued`
+  state) with a restart policy, worktree stand-ins, container → host
+  `RPC` (helper-rpc steps 4-7; the `RPC` channel and runs and sessions
+  over it shipped), in the order of
+  [helper-rpc](plans/active/helper-rpc.md#order-across-plans).
   → [plan](plans/active/helper-rpc.md)
 - **machines**: VS Code on remote rows (spike),
   remote Inbox threads, nameless commands across every machine.
   → [plan](plans/active/machines-next.md)
 - **machines**: a fleet: workers dial an always-on hub and lend a
   restricted API (no ssh into them), soft-cap placement, devsandbox-owned code transfer between hosts, dispatcher
-  children on any machine, checkpoints and re-placement.
+  children on any machine, checkpoints and re-placement: from fleet
+  step 4 (`PTY` over `session.attach`) on, steps 1-3 shipped.
   → [plan](plans/active/fleet.md)
 - **daemon**: Windows as a remote-only client of a machine.
   → [plan](plans/active/windows-support.md)

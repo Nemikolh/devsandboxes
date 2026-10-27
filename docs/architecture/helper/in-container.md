@@ -61,7 +61,9 @@ streams and everything else as usual.
   writes its intermediate records (`stdout`, `event`) through
   `rpc_server::Out` as it goes and returns the last one, so a streaming
   method holds its one stream; `Out::gone` (the stream's peer shut both
-  ways: a `Close`, or the bridge gone) stops a waiting one early. `rpc.methods` lists what this daemon
+  ways: a `Close`, or the bridge gone) stops a waiting one early; one that
+  takes the caller's input records (`session.attach`) reads them from the
+  stream `Out::take_input` hands it. `rpc.methods` lists what this daemon
   offers as `name@version`. Methods flagged `needs_root` (acting as another
   user) are offered only when the daemon's euid is 0, since `devsbd boot`
   starts it as the container command's user; one not offered answers
@@ -196,7 +198,10 @@ session new --id <id> -- <cmd>...` (`commands::exec::session_for`,
 `session_new_command`), with a fresh id (`mint_session_id`) or
 `--session`'s; the runtime exec's `-w`/`-u`/`-e` give the supervisor the
 cwd and env the command gets, so `new` needs no `--cwd`. `exec --attach
-[<id>]` runs `session attach`, `exec --sessions` `session ls`.
+[<id>]` runs `session attach`, `exec --sessions` `session ls`. A caller
+that runs no CLI in the container (the serve daemon, for a fleet hub)
+attaches over RPC instead ([Sessions over RPC](#sessions-over-rpc)), the
+daemon then being the session's client.
 
 - `new --id <id> [--cwd DIR] -- <cmd>...` (`create_with`) creates the dir
   and spawns a detached `devsbd session supervise <id>` (its own session,
@@ -261,6 +266,45 @@ cwd and env the command gets, so `new` needs no `--cwd`. `exec --attach
   dir is deleted. `prune [--keep N]` (`runs::prune`, as `run prune`):
   deletes every ended or `lost` session but the newest `N` (default 0),
   never a running one, and prints `removed <n>`.
+
+### Sessions over RPC
+
+The daemon serves sessions as RPC methods (`rpc_sessions.rs`, over
+`sessions.rs`' `create_with`, `join_end`, `ls`, `rm`):
+
+| method | params | records |
+|---|---|---|
+| `session.attach` | `id`, `create?` `{argv, cwd?, env?, user?}` | → `stdin`, `stdin-eof`, `resize`; ← `stdout`…, then `exit` or `error` |
+| `session.ls` | — | `result {sessions: [line…]}`, `session ls`' lines |
+| `session.rm` | `id` | `result {}` |
+
+`session.attach` with `create` is `session new --id <id>`: the dir is
+created (after the same quiet prune) and `lchown`ed to `user`
+(`rpc_runs::hand_over`), and the supervisor started as them exactly as
+`run.start`'s (`rpc_runs::switch_user`, `HOME`/`USER`, the daemon's env plus
+`env`, `cwd`), so the session, its dir and its `sock` are the user's; the
+daemon reaps the supervisor. An id that is already a session attaches to
+it. Without `create`, attach only. The daemon is then a client like any
+other (`sessions::join_end`, without `terminal`'s raw mode): `meta`'s
+`proto` and the `hello` are checked, and a later attach (CLI or RPC) takes
+over. The stream's `stdin` records go through a pipe into the relay's
+input, `stdin-eof` closes it, `resize` sets what the relay's size fn
+answers (sent on the next `SIZE_POLL` check), the session's output comes
+back as `stdout` records (`rpc_sessions::Stdout`, closed before the last
+record). `signal` is ignored (a session's program gets signals from its
+terminal, as input bytes).
+
+The end (`sessions::End`, kept apart from exit codes so a program's own
+250 stays an exit): `exit <code>` (`128 + n` for signal `n`; an ended
+session's at once), else `error` `no-session` (unknown, `lost`, or the
+connection gone without an end), `detached` (taken over) or `version`
+(another session wire), the CLI's note as `message`. A caller that hangs up
+(`Close`, or the bridge gone; its `Eof` alone is not one, watched every
+`HANGUP_POLL` once its input ended) has the daemon shut the session socket:
+the supervisor drops its client and the session runs on for a later
+attach. All three methods are `needs_root` (they act as, or on, another
+user's session); a daemon started as the container user doesn't offer
+them.
 
 ## `devsbd identity apply`
 

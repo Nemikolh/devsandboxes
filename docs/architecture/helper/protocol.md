@@ -208,7 +208,10 @@ An unknown tag or a malformed payload is an error (both ends ship together).
 Error codes every method can answer: `unknown-method` (no such method, or
 not offered by this daemon), `bad-request` (the stream didn't start with
 a well-formed `call`, or its params are wrong for the method) and `failed`
-(the method ran and failed; `message` says why). The daemon half-closes after its last record and
+(the method ran and failed; `message` says why). `session.attach` adds
+`no-session` (nothing to attach to), `detached` (another client took the
+session over) and `version` (the session speaks another session wire);
+`rpc::code` names them all. The daemon half-closes after its last record and
 reads the caller's input until its `Eof`, so a caller sends `Eof` once it
 has nothing more to send and the stream ends with both `Eof`s.
 
@@ -221,7 +224,8 @@ anything else; bigger data travels as byte records.
 
 Discovery: `rpc.methods` answers `{"methods": ["rpc.methods@1", …]}`, the
 methods this daemon offers with their versions. The `run.*` methods and
-their records: [in-container.md](in-container.md#runs-over-rpc).
+their records: [in-container.md](in-container.md#runs-over-rpc); the
+`session.*` ones: [in-container.md](in-container.md#sessions-over-rpc).
 
 ## Line codecs
 
