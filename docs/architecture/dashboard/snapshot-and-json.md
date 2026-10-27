@@ -28,7 +28,12 @@ state and `Snapshot.error` says why.
   ready), `root`, `machine`.
 - `SandboxRow`: every configured sandbox, resolved or not (source `?`):
   source, folder, services, `extends`, config/build hashes, `issues`,
-  `dispatcher`, `worktree_branch`, `root`, `machine`.
+  `identity`, `dispatcher`, `worktree_branch`, `root`, `machine`.
+  `identity` is the `IdentityNote`s (`id`, `text`, `acked`) of the
+  identity findings reaching the sandbox (`identity_notes` over
+  `config_identity::identity_findings`); `sandbox_rows` takes the root's
+  acked ids (`State::identity_acks` under its project id) from its
+  caller: the join's loaded state, `ls --json`'s own `State::load`.
 - `ServiceRow`: scope, source, ports, backing `containers` with status,
   `used_by`, `drift`, `root`, `machine`.
 - Header data: `sandbox_count`, `runtime_name`, `runtime_version`.

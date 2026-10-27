@@ -6,7 +6,7 @@ this before adding a tab, a modal, or a one-key action.
 
 Code: `src/tui/app/mod.rs` (`Tab`, `App`, `dispatch_key`, `PortRow`,
 `PortRequest`), `src/tui/data.rs` (`Node`, `visible_nodes`, `group_of`,
-`ORPHANS_NAME`, `totals_line`, `STALE_AFTER_SECS`), `src/tui/app/tree.rs`,
+`ORPHANS_NAME`, `totals_line`, `STALE_AFTER_SECS`, `identity_line`), `src/tui/app/tree.rs`,
 `src/tui/procs.rs` (`ProcState`, `ProcRow`, `build_forest`, `run_rows`,
 `proc_state`, `is_agent`, `AGENT_NAMES`), `src/tui/app/procs.rs`
 (`Signal`, `PendingSignal`, `proc_fetch_targets`, `agent_count`),
@@ -32,7 +32,10 @@ for Instances when the last machine goes. Each keeps its own selected row.
   group for instances whose sandbox is gone) and `Proc`. With machines,
   groups are per (machine, sandbox) (`group_of`). Collapse state and
   expanded process layers survive snapshot refreshes. The Detail pane
-  shows the selected row. Done instances render dimmed.
+  shows the selected row. Done instances render dimmed. A sandbox's
+  Detail (`ui.rs` `sandbox_detail`) lists its validation `issues` in red,
+  then its identity notes (`SandboxRow.identity`: what uses `/root` and
+  breaks under `identity = "host"`) in yellow, dimmed once acked.
 - **Services**: one row per `ServiceRow` with its backing containers.
 - **Ports**: the daemon's forwards for this config root plus every
   forward into a machine (`PortRow`, `configured` for a sandbox's
@@ -58,6 +61,11 @@ for Instances when the last machine goes. Each keeps its own selected row.
 
 The header's totals line marks the snapshot stale with why when the daemon
 connection is down, or after `STALE_AFTER_SECS` without a push.
+
+Above the Instances and Services tables (`ui.rs` `draw_status_lines`),
+each one row and only while set: `Snapshot.error` in red, then
+`identity_line` in yellow, `N sandboxes use /root`, counting the rows
+(a machine's included) with an un-acked identity note.
 
 ## Process layer
 

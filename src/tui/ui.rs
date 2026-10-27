@@ -16,7 +16,7 @@ use super::app::{
 };
 use super::settings::SETTINGS;
 use super::data::{
-    humanize_secs, sandbox_stats, totals_line, ContainerStatus, InstanceRow, Node, SandboxRow,
+    humanize_secs, identity_line, sandbox_stats, totals_line, ContainerStatus, InstanceRow, Node, SandboxRow,
     ServiceRow, Snapshot,
 };
 use super::procs::{is_agent, ProcState, MESSAGE_ROW};
@@ -318,6 +318,29 @@ pub(crate) fn terminal_tab_hit(
     None
 }
 
+/// The lines above a view's table, each one row and only while it has
+/// something to say: the red `Snapshot.error`, then the yellow
+/// [`identity_line`]. Returns what's left of `top` for the table.
+fn draw_status_lines(frame: &mut Frame, snapshot: Option<&Snapshot>, top: Rect) -> Rect {
+    let error = snapshot.and_then(|s| s.error.as_deref());
+    let identity = snapshot.and_then(identity_line);
+    let [err_area, identity_area, rest] = Layout::vertical([
+        Constraint::Length(if error.is_some() { 1 } else { 0 }),
+        Constraint::Length(if identity.is_some() { 1 } else { 0 }),
+        Constraint::Min(0),
+    ])
+    .areas(top);
+    if let Some(err) = error {
+        let line = Line::from(Span::styled(err.to_string(), Style::default().fg(Color::Red)));
+        frame.render_widget(Paragraph::new(line), err_area);
+    }
+    if let Some(text) = identity {
+        let line = Line::from(Span::styled(text, Style::default().fg(Color::Yellow)));
+        frame.render_widget(Paragraph::new(line), identity_area);
+    }
+    rest
+}
+
 /// Display width of the `▶ ` focus mark prepended to the tab strip when the
 /// terminal is focused (`▶` is one column plus a trailing space).
 const FOCUS_MARK_WIDTH: u16 = 2;
@@ -329,19 +352,9 @@ fn draw_services(frame: &mut Frame, app: &App, area: Rect) {
     let rows: &[ServiceRow] = snapshot.map_or(&[], |s| s.services.as_slice());
 
     let (top, detail_area, terms_area) = content_areas(app, area);
-    // Carve the error line out of the top part (never the bottom), so the
+    // Carve the status lines out of the top part (never the bottom), so the
     // terminal panel's geometry stays independent of snapshot state.
-    let error = snapshot.and_then(|s| s.error.as_deref());
-    let [err_area, table_area] = Layout::vertical([
-        Constraint::Length(if error.is_some() { 1 } else { 0 }),
-        Constraint::Min(0),
-    ])
-    .areas(top);
-
-    if let Some(err) = error {
-        let line = Line::from(Span::styled(err.to_string(), Style::default().fg(Color::Red)));
-        frame.render_widget(Paragraph::new(line), err_area);
-    }
+    let table_area = draw_status_lines(frame, snapshot, top);
 
     // Terminal focused ⇒ the terminal panel is the accented one; dim the rest.
     let panel_focused = app.focus == Focus::Terminal;
@@ -1709,22 +1722,9 @@ fn draw_instances(frame: &mut Frame, app: &App, area: Rect) {
     let nodes = app.visible_nodes();
 
     let (top, detail_area, terms_area) = content_areas(app, area);
-    // Optional error line reserved above the table, carved out of the top part
+    // Optional status lines reserved above the table, carved out of the top part
     // (never the bottom) so the terminal panel geometry is snapshot-independent.
-    let error = snapshot.and_then(|s| s.error.as_deref());
-    let [err_area, table_area] = Layout::vertical([
-        Constraint::Length(if error.is_some() { 1 } else { 0 }),
-        Constraint::Min(0),
-    ])
-    .areas(top);
-
-    if let Some(err) = error {
-        let line = Line::from(Span::styled(
-            err.to_string(),
-            Style::default().fg(Color::Red),
-        ));
-        frame.render_widget(Paragraph::new(line), err_area);
-    }
+    let table_area = draw_status_lines(frame, snapshot, top);
 
     // Terminal focused ⇒ the terminal panel is the accented one; dim the rest.
     let panel_focused = app.focus == Focus::Terminal;
@@ -2196,6 +2196,14 @@ fn sandbox_detail<'a>(snapshot: &Snapshot, si: usize, sb: &'a SandboxRow) -> Vec
             format!("⚠ {issue}"),
             Style::default().fg(Color::Red),
         )));
+    }
+    // Identity notes: yellow, dimmed once acked ("continue as is").
+    for note in &sb.identity {
+        let mut style = Style::default().fg(Color::Yellow);
+        if note.acked {
+            style = style.add_modifier(Modifier::DIM);
+        }
+        lines.push(Line::from(Span::styled(format!("⚠ {}", note.text), style)));
     }
     lines
 }
@@ -3046,6 +3054,7 @@ mod tests {
             config_hash: "hash".into(),
             build_hash: String::new(),
             issues: Vec::new(),
+            identity: Vec::new(),
             dispatcher: false,
             worktree_branch: None,
             root: None,
@@ -3089,6 +3098,40 @@ mod tests {
         assert_eq!(style(0), Style::default().fg(Color::Red).add_modifier(Modifier::BOLD));
         assert_eq!(style(1), Style::default().fg(Color::Yellow));
         assert_eq!(style(2), Style::default().fg(Color::Green));
+    }
+
+    /// Un-acked identity notes put a yellow line above the table, in both
+    /// views; Detail lists every note, yellow, the acked ones dimmed.
+    #[test]
+    fn identity_notes_show_in_the_header_and_detail() {
+        use crate::snapshot::IdentityNote;
+        let mut app = phase_app(vec![("web", running(), None)]);
+        let mut s = app.snapshot.clone().unwrap();
+        s.sandboxes[0].identity = vec![
+            IdentityNote { id: "a".into(), text: "sandbox.s: remove remoteUser = \"root\"".into(), acked: true },
+            IdentityNote { id: "b".into(), text: "sandbox.s: mounts entry \"x\" -> \"y\"".into(), acked: false },
+        ];
+        app.set_snapshot(s.clone());
+        let screen = render(&app, 140, 30);
+        assert!(screen.contains("1 sandbox uses /root"), "{screen}");
+        assert!(!screen.contains("U to update"), "{screen}");
+        assert!(screen.contains("⚠ sandbox.s: remove remoteUser = \"root\""), "{screen}");
+
+        // Detail's fixed height clips the rest on screen; the lines are all there.
+        let lines = sandbox_detail(&s, 0, &s.sandboxes[0]);
+        assert_eq!(text(lines.last().unwrap()), "⚠ sandbox.s: mounts entry \"x\" -> \"y\"");
+        let style = |needle: &str| lines.iter().find(|l| text(l).contains(needle)).unwrap().spans[0].style;
+        assert_eq!(style("remoteUser"), Style::default().fg(Color::Yellow).add_modifier(Modifier::DIM));
+        assert_eq!(style("mounts entry"), Style::default().fg(Color::Yellow));
+
+        app.on_key(KeyEvent::from(KeyCode::Char('2')));
+        let services = render(&app, 140, 30);
+        assert!(services.contains("1 sandbox uses /root"), "services view too: {services}");
+
+        // Everything acked: no line.
+        s.sandboxes[0].identity[1].acked = true;
+        app.set_snapshot(s);
+        assert!(!render(&app, 140, 30).contains("uses /root"));
     }
 
     /// The MACHINE column only with a machine registered; a machine that

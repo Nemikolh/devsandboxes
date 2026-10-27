@@ -3,7 +3,7 @@
 //! verbatim. Plain blocking I/O (the daemon's poll, `status`); parsing lives in
 //! free functions to stay unit-testable without docker.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::Instant;
@@ -159,6 +159,12 @@ pub struct SandboxRow {
     /// shown in the Detail panel. Empty when the sandbox validates or failed to
     /// resolve at all (the resolve error is reported separately).
     pub issues: Vec<String>,
+    /// The identity findings applying to this sandbox
+    /// (`config_identity::identity_findings`): what breaks under
+    /// `identity = "host"` because it uses `/root`. Shown in Detail; the
+    /// un-acked ones count in the dashboard's header.
+    #[serde(default)]
+    pub identity: Vec<IdentityNote>,
     /// Whether the sandbox has a `dispatcher` table (the TUI's TYPE column).
     pub dispatcher: bool,
     /// The resolved `worktree-branch`, for `run --branch` completion; `None`
@@ -171,6 +177,18 @@ pub struct SandboxRow {
     /// As [`InstanceRow::machine`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub machine: Option<String>,
+}
+
+/// One identity finding as a sandbox row carries it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdentityNote {
+    /// The finding's id (`config.findings`' `id`, what `config.ack` takes).
+    pub id: String,
+    /// One line for a person: the update (`config_identity::edit_line`), or
+    /// the path to fix by hand.
+    pub text: String,
+    /// In `state.toml`'s `identity_acks` for the row's root.
+    pub acked: bool,
 }
 
 /// One service row, everything the Services view needs pre-joined.
@@ -573,13 +591,17 @@ fn mount_source_uses_instance(mount: &Mount) -> bool {
 /// [`validate_sandbox`] issues; one that fails to resolve gets a placeholder row
 /// (source `?`, empty everything) and its resolve error is returned alongside so
 /// the caller can surface it (`collect` folds these into `Snapshot.error`; `ls
-/// --json` ignores them, the `?` row is the signal). Pure config work — no
+/// --json` ignores them, the `?` row is the signal). Every row gets its
+/// identity notes ([`identity_notes`]), `acked` being the root's acked
+/// finding ids (`State::identity_acks`, read by the caller). Pure config work — no
 /// docker — shared verbatim by [`collect`] and `commands::ls`.
-pub fn sandbox_rows(dir: &Path, config: &Config) -> (Vec<SandboxRow>, Vec<String>) {
+pub fn sandbox_rows(dir: &Path, config: &Config, acked: &BTreeSet<String>) -> (Vec<SandboxRow>, Vec<String>) {
     let mut rows = Vec::with_capacity(config.sandboxes.len());
     let mut errors = Vec::new();
     let root = root_label(dir);
+    let findings = crate::config_identity::identity_findings(config);
     for name in config.sandboxes.keys() {
+        let identity = identity_notes(&findings, name, acked);
         let extends = config
             .sandboxes
             .get(name)
@@ -600,6 +622,7 @@ pub fn sandbox_rows(dir: &Path, config: &Config) -> (Vec<SandboxRow>, Vec<String
                     config_hash: rs.config_hash,
                     build_hash,
                     issues,
+                    identity,
                     dispatcher: rs.properties.dispatcher.is_some(),
                     worktree_branch: rs.properties.worktree_branch.clone(),
                     root: Some(root.clone()),
@@ -617,6 +640,7 @@ pub fn sandbox_rows(dir: &Path, config: &Config) -> (Vec<SandboxRow>, Vec<String
                     config_hash: String::new(),
                     build_hash: String::new(),
                     issues: Vec::new(),
+                    identity,
                     dispatcher: false,
                     worktree_branch: None,
                     root: Some(root.clone()),
@@ -626,6 +650,27 @@ pub fn sandbox_rows(dir: &Path, config: &Config) -> (Vec<SandboxRow>, Vec<String
         }
     }
     (rows, errors)
+}
+
+/// The notes of `findings` applying to sandbox `name`, in findings order.
+/// A finding fixed by hand (no automatic edit) reads `<table>: <key> =
+/// "<value>" is under /root (fix by hand)`.
+pub fn identity_notes(
+    findings: &[crate::config_identity::Finding],
+    name: &str,
+    acked: &BTreeSet<String>,
+) -> Vec<IdentityNote> {
+    findings
+        .iter()
+        .filter(|f| f.sandboxes.iter().any(|s| s == name))
+        .map(|f| IdentityNote {
+            id: f.id.clone(),
+            text: crate::config_identity::edit_line(f, false).unwrap_or_else(|| {
+                format!("{}: {} = \"{}\" is under /root (fix by hand)", f.origin.table(), f.key, f.value)
+            }),
+            acked: acked.contains(&f.id),
+        })
+        .collect()
 }
 
 /// Collect a fresh [`Snapshot`]. Blocking; run off the UI thread.
@@ -789,7 +834,11 @@ fn join(dir: &Path, state: anyhow::Result<State>, view: &RuntimeView) -> Snapsho
     let mut sandboxes: Vec<SandboxRow> = Vec::new();
     match &config {
         Ok(cfg) => {
-            let (rows, mut resolve_errors) = sandbox_rows(dir, cfg);
+            let acked = project_id(dir)
+                .ok()
+                .and_then(|p| state.identity_acks.get(&p).cloned())
+                .unwrap_or_default();
+            let (rows, mut resolve_errors) = sandbox_rows(dir, cfg, &acked);
             errors.append(&mut resolve_errors);
             // The instance join needs each sandbox's services + hash; take them
             // from the rows so nothing is resolved twice. Placeholder rows (empty
@@ -934,7 +983,7 @@ mod tests {
     #[test]
     fn sandbox_rows_empty_config_is_empty() {
         let cfg = Config::parse("").unwrap();
-        let (rows, errors) = sandbox_rows(std::env::temp_dir().as_path(), &cfg);
+        let (rows, errors) = sandbox_rows(std::env::temp_dir().as_path(), &cfg, &BTreeSet::new());
         assert!(rows.is_empty());
         assert!(errors.is_empty());
     }
@@ -953,7 +1002,7 @@ extends = "does-not-exist"
 "#,
         )
         .unwrap();
-        let (rows, errors) = sandbox_rows(std::env::temp_dir().as_path(), &cfg);
+        let (rows, errors) = sandbox_rows(std::env::temp_dir().as_path(), &cfg, &BTreeSet::new());
 
         assert_eq!(rows.len(), 2);
         let web = rows.iter().find(|r| r.name == "web").unwrap();
@@ -968,6 +1017,45 @@ extends = "does-not-exist"
 
         assert_eq!(errors.len(), 1, "got: {errors:?}");
         assert!(errors[0].contains("sandbox `broken`"), "got: {errors:?}");
+    }
+
+    /// Each row carries the identity findings reaching it, `acked` from the
+    /// set passed in; an older snapshot without the field reads as none.
+    #[test]
+    fn sandbox_rows_carry_identity_notes() {
+        let cfg = Config::parse(
+            "[template.base]\nremoteUser = \"root\"\n\
+             [sandbox.web]\nextends = \"base\"\nimage = \"img\"\nmounts = [\"source=/a,target=/root/.a\"]\n\
+             [sandbox.api]\nimage = \"img\"\nworkspaceFolder = \"/root/app\"\n\
+             [sandbox.ok]\nimage = \"img\"\n",
+        )
+        .unwrap();
+        let findings = crate::config_identity::identity_findings(&cfg);
+        let user = findings.iter().find(|f| f.key == "remoteUser").unwrap().id.clone();
+        let acked = BTreeSet::from([user.clone()]);
+        let (rows, _) = sandbox_rows(std::env::temp_dir().as_path(), &cfg, &acked);
+        let row = |name: &str| rows.iter().find(|r| r.name == name).unwrap();
+
+        let web: Vec<(&str, bool)> = row("web").identity.iter().map(|n| (n.text.as_str(), n.acked)).collect();
+        assert_eq!(
+            web,
+            vec![
+                ("template.base: remove remoteUser = \"root\"", true),
+                ("sandbox.web: mounts entry \"source=/a,target=/root/.a\" -> \"source=/a,target=${containerEnv:HOME}/.a\"", false),
+            ]
+        );
+        assert_eq!(row("web").identity[0].id, user);
+        assert_eq!(
+            row("api").identity.iter().map(|n| n.text.as_str()).collect::<Vec<_>>(),
+            vec!["sandbox.api: workspaceFolder = \"/root/app\" is under /root (fix by hand)"]
+        );
+        assert!(row("ok").identity.is_empty());
+
+        let mut json = serde_json::to_value(row("web")).unwrap();
+        let back: SandboxRow = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(back.identity, row("web").identity);
+        json.as_object_mut().unwrap().remove("identity");
+        assert!(serde_json::from_value::<SandboxRow>(json).unwrap().identity.is_empty());
     }
 
     #[test]
@@ -1040,7 +1128,7 @@ extends = "does-not-exist"
             "[sandbox.web]\nimage = \"node:22\"\nworktree-branch = \"agent/${instance}\"\n[sandbox.broken]\nextends = \"nope\"\n",
         )
         .unwrap();
-        let (sandboxes, _) = sandbox_rows(std::env::temp_dir().as_path(), &cfg);
+        let (sandboxes, _) = sandbox_rows(std::env::temp_dir().as_path(), &cfg, &BTreeSet::new());
         let mut services = build_service_rows(
             "proj",
             &[ServiceInput { name: "db".into(), resolved: Some(resolved_input()) }, ServiceInput { name: "x".into(), resolved: None }],

@@ -880,7 +880,7 @@ mod tests {
             row.root = Some(dir.display().to_string());
             list.snapshot.instances.push(row);
             let cfg = crate::config::Config::parse("[sandbox.web]\nimage = \"alpine\"\n").unwrap();
-            list.snapshot.sandboxes = crate::snapshot::sandbox_rows(dir, &cfg).0;
+            list.snapshot.sandboxes = crate::snapshot::sandbox_rows(dir, &cfg, &Default::default()).0;
             list
         })
     }

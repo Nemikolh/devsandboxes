@@ -267,6 +267,18 @@ pub fn totals_line(snapshot: &Snapshot, age: std::time::Duration, error: Option<
     line
 }
 
+/// The header's yellow identity line, e.g. `2 sandboxes use /root`: the
+/// sandboxes (every row, a machine's included) with at least one un-acked
+/// identity note. `None` when there's none.
+pub fn identity_line(snapshot: &Snapshot) -> Option<String> {
+    let n = snapshot
+        .sandboxes
+        .iter()
+        .filter(|s| s.identity.iter().any(|note| !note.acked))
+        .count();
+    (n > 0).then(|| format!("{n} {} /root", plural(n, "sandbox uses", "sandboxes use")))
+}
+
 /// `n singular` / `n plural` word choice (the count itself is rendered by the
 /// caller; this only returns the noun).
 fn plural<'a>(n: usize, singular: &'a str, plural: &'a str) -> &'a str {
@@ -438,11 +450,31 @@ mod tests {
             config_hash: "hash".into(),
             build_hash: String::new(),
             issues: Vec::new(),
+            identity: Vec::new(),
             dispatcher: false,
             worktree_branch: None,
             root: None,
             machine: None,
         }
+    }
+
+    #[test]
+    fn identity_line_counts_sandboxes_with_unacked_notes() {
+        use crate::snapshot::IdentityNote;
+        let note = |acked| IdentityNote { id: "i".into(), text: "t".into(), acked };
+        let mut s = snap(Vec::new(), Vec::new(), 0, None);
+        s.sandboxes = vec![sb("clean")];
+        assert_eq!(identity_line(&s), None);
+        let mut acked = sb("acked");
+        acked.identity = vec![note(true)];
+        s.sandboxes.push(acked);
+        assert_eq!(identity_line(&s), None, "acked notes don't count");
+        let mut one = sb("one");
+        one.identity = vec![note(true), note(false)];
+        s.sandboxes.push(one.clone());
+        assert_eq!(identity_line(&s).as_deref(), Some("1 sandbox uses /root"));
+        s.sandboxes.push(one);
+        assert_eq!(identity_line(&s).as_deref(), Some("2 sandboxes use /root"));
     }
 
     #[test]

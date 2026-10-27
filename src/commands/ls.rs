@@ -16,8 +16,14 @@ pub fn ls(dir: &Path, json: bool) -> Result<()> {
     // config_hash, issues) so a UI gets the same data the TUI does. No docker,
     // like the table path; resolve failures become `?` rows rather than an error,
     // and an empty config emits `data: []`, not the human "no sandboxes" prose.
+    // The identity notes' acks come from state; a state that won't load (or a
+    // root without a project id) reads as none acked, not an error.
     if json {
-        let (rows, _errors) = crate::snapshot::sandbox_rows(dir, &config);
+        let acked = crate::commands::services::project_id(dir)
+            .ok()
+            .and_then(|p| crate::state::State::load().ok()?.identity_acks.remove(&p))
+            .unwrap_or_default();
+        let (rows, _errors) = crate::snapshot::sandbox_rows(dir, &config, &acked);
         let out = serde_json::to_string_pretty(&Envelope::new(rows))
             .context("serialize sandboxes")?;
         println!("{out}");

@@ -68,6 +68,7 @@ pub(super) fn snapshot_with(n: usize) -> Snapshot {
         config_hash: "hash".into(),
         build_hash: String::new(),
         issues: Vec::new(),
+        identity: Vec::new(),
         dispatcher: false,
         worktree_branch: None,
         root: None,

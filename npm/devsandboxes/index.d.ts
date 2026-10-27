@@ -71,6 +71,8 @@ export interface SandboxRow {
   build_hash: string;
   /** Config-validation problems (folder / mount resolution). */
   issues: string[];
+  /** What in its config uses `/root` and breaks under `identity = "host"` (`config.findings`, this sandbox's). */
+  identity: IdentityNote[];
   /** Has a `dispatcher` table (docs/architecture/automations/dispatchers.md). */
   dispatcher: boolean;
   /** The resolved `worktree-branch`; `null` when unset or unresolved. */
@@ -79,6 +81,16 @@ export interface SandboxRow {
   root: string | null;
   /** As {@link InstanceRow.machine}. */
   machine?: string;
+}
+
+/** One identity finding on a {@link SandboxRow}. */
+export interface IdentityNote {
+  /** The finding's id (as `config.findings`' `id`, what `config.ack` takes). */
+  id: string;
+  /** The update as one line, or the path to fix by hand. */
+  text: string;
+  /** Acked ("continue as is") for this config root. */
+  acked: boolean;
 }
 
 /** One `[services.*]` from devsandboxes.toml (`service.ls()`, `status().services`). */

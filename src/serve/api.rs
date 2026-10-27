@@ -2234,9 +2234,10 @@ mod tests {
         assert_matches("SandboxEntry", &v(&listed));
         let list = InstancesList { snapshot: empty_snapshot(), thread_children: Default::default() };
         assert_matches("InstancesList", &v(&list));
-        let cfg = crate::config::Config::parse("[sandbox.web]\nimage = \"alpine\"\n").unwrap();
-        let (rows, _) = crate::snapshot::sandbox_rows(&std::env::temp_dir(), &cfg);
+        let cfg = crate::config::Config::parse("[sandbox.web]\nimage = \"alpine\"\nremoteUser = \"root\"\n").unwrap();
+        let (rows, _) = crate::snapshot::sandbox_rows(&std::env::temp_dir(), &cfg, &Default::default());
         assert_matches("SandboxRow", &v(&rows[0]));
+        assert_matches("IdentityNote", &v(&rows[0].identity[0]));
         let listed = listing("1");
         assert_matches("ProcsListing", &v(&listed));
         assert_matches("ProcessRow", &v(&listed.processes[0]));

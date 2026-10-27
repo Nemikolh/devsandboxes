@@ -932,6 +932,7 @@ mod tests {
             config_hash: "h".into(),
             build_hash: String::new(),
             issues: Vec::new(),
+            identity: Vec::new(),
             dispatcher: false,
             worktree_branch: worktree_branch.map(String::from),
             root: None,
