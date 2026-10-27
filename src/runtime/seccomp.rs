@@ -46,7 +46,7 @@ pub fn ensure_file() -> Result<PathBuf> {
 /// [`ensure_file`] in `dir`. Named by the profile's hash, so a changed
 /// profile is a new file and an existing one is always current. Written to
 /// a pid-named temp file and renamed, so a reader never sees half of one.
-fn ensure_file_in(dir: &Path) -> Result<PathBuf> {
+pub(crate) fn ensure_file_in(dir: &Path) -> Result<PathBuf> {
     let profile = profile();
     let path = dir.join(format!("seccomp-{}.json", short_hash(&profile)));
     if path.exists() {

@@ -8,7 +8,7 @@ Code: `devsbd/src/daemon.rs` (`run`, `take_over`, `Bridges::route`,
 `flush`, `control_exchange`, `control_follow`), `devsbd/src/bridge.rs`,
 `devsbd/src/boot.rs`, `devsbd/src/outbox.rs`, `devsbd/src/ctl.rs`,
 `devsbd/src/runs.rs`, `devsbd/src/sessions.rs`, `devsbd/src/vscode.rs`, `devsbd/src/json.rs`,
-`devsbd/src/identity.rs`;
+`devsbd/src/identity.rs`, `devsbd/src/userns.rs`;
 `src/commands/run/mod.rs` (`container_command`, `BOOT_HOOK_LABEL`).
 
 ## Files and sockets
@@ -216,6 +216,28 @@ Stdout is one line, `home=<path>`, the account's home. Exit 0 on success
 (warnings on stderr), 1 with `devsbd: identity: <why>` on stderr when it
 fails (no such account, a refused remap, an I/O error), 2 on a usage error.
 
+## `devsbd userns check [--as-root]`
+
+`devsbd userns check` (`userns::run`) tells whether a process here can
+create the namespaces Chromium's sandbox needs, under the container's real
+seccomp profile, user and AppArmor. It runs in a forked child, so the
+caller's namespaces stay as they are, and follows Chrome's zygote:
+`enter_userns` (`unshare(CLONE_NEWUSER)`, `deny` to `/proc/self/setgroups`,
+one-line `uid_map`/`gid_map` mapping the current euid/egid to themselves),
+then a raw `clone(CLONE_NEWPID|SIGCHLD)` whose child exits 0. The `clone`
+is the syscall itself, not `unshare(CLONE_NEWPID)`: docker's seccomp rule
+is on `clone`, which is what Chrome calls. `--as-root` first enters a
+single-uid namespace as uid/gid 1001 (`WRAPPED_ID`), the browser
+wrapper's non-root euid over container root, then runs the same sequence
+nested.
+
+Exit 0 with no output when every step passes; 1 with one stderr line
+`devsbd: userns: <step>: <errno>` (`outcome_line`) where `<step>` is
+`unshare(CLONE_NEWUSER)`, `setgroups`, `uid_map`, `gid_map` or
+`clone(CLONE_NEWPID)` (or `fork`/`waitpid` for the check's own plumbing)
+and `<errno>` is `EPERM`, `EACCES`, `EINVAL`, `ENOSPC`, `ENOSYS` or the
+number; 2 on a usage error. Off Linux it always exits 1.
+
 ## `devsbd vscode-goto <abs>[:line[:col]] [--wait SECS]`
 
 Opens a file in the VS Code window attached to this container by running
@@ -228,7 +250,7 @@ vscode` (`src/commands/vscode.rs`).
 ## `devsbd features`
 
 Prints the append-only list of CLI capabilities (`thread-send`,
-`thread-withdraw`, `thread-ls-feed`, `events-follow`, `session`) a dispatcher may probe
+`thread-withdraw`, `thread-ls-feed`, `events-follow`, `session`, `userns`) a dispatcher may probe
 before relying on them.
 
 Limitations: [status.md](../../status.md#helper)

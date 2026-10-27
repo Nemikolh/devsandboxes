@@ -589,6 +589,55 @@ mod tests {
         Ok(())
     }
 
+    /// `devsbd userns check` in alpine under docker's default seccomp profile
+    /// and under ours (`runtime::seccomp`), as uid 1000 and with `--as-root`
+    /// as root. Root has no `CAP_SYS_ADMIN` in docker's default cap set, so
+    /// the default profile blocks both, rootful or rootless.
+    #[test_utils::docker_test(helper)]
+    fn userns_check_follows_the_seccomp_profile_with_docker() -> Result<(), &'static str> {
+        use std::process::Command;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("devsandbox-userns-test-{stamp}"));
+        let profile = crate::runtime::seccomp::ensure_file_in(&dir).map_err(|_| "cannot write the profile")?;
+        let names = [format!("devsandbox-devsbd-userns-default-{stamp}"), format!("devsandbox-devsbd-userns-ours-{stamp}")];
+        let cleanup = || {
+            let _ = std::fs::remove_dir_all(&dir);
+            for name in &names {
+                let _ = Command::new("docker").args(["rm", "-f", name]).output();
+            }
+        };
+        crate::test_support::with_cleanup(cleanup, || {
+            let seccomp = format!("seccomp={}", profile.display());
+            for (name, opts) in [(&names[0], vec![]), (&names[1], vec!["--security-opt", seccomp.as_str()])] {
+                let up = Command::new("docker")
+                    .args(["run", "-d", "--rm", "--name", name])
+                    .args(opts)
+                    .args(["alpine:3.20", "sleep", "300"])
+                    .output()
+                    .unwrap();
+                assert!(up.status.success(), "{}", String::from_utf8_lossy(&up.stderr));
+                install(name, None).unwrap();
+            }
+            let check = |name: &str, user: &str, extra: &[&str]| {
+                let out = Command::new("docker")
+                    .args(["exec", "-u", user, name, BIN, "userns", "check"])
+                    .args(extra)
+                    .output()
+                    .unwrap();
+                (out.status.code(), String::from_utf8_lossy(&out.stderr).into_owned())
+            };
+            let blocked = (Some(1), "devsbd: userns: unshare(CLONE_NEWUSER): EPERM\n".to_string());
+            assert_eq!(check(&names[0], "1000:1000", &[]), blocked);
+            assert_eq!(check(&names[0], "root", &["--as-root"]), blocked);
+            assert_eq!(check(&names[1], "1000:1000", &[]), (Some(0), String::new()));
+            assert_eq!(check(&names[1], "root", &["--as-root"]), (Some(0), String::new()));
+        });
+        Ok(())
+    }
+
     #[test]
     fn boot_spec_mirrors_the_lifecycle_exec() {
         #[derive(Deserialize)]
