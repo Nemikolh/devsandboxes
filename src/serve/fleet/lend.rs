@@ -53,6 +53,11 @@ pub struct Lend {
     /// of the hostname.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub name: String,
+    /// `dev-builds`: take the hub's own binary when it runs an unpublished
+    /// build (`fleet::update::Decision::Receive`): code the hub chooses,
+    /// run outside a container. Edited by hand, as `[allow]` is.
+    #[serde(rename = "dev-builds", skip_serializing_if = "std::ops::Not::not")]
+    pub dev_builds: bool,
     /// The worker policy's allowances (`worker_policy`, which reads them
     /// itself from this file).
     pub allow: Allow,
@@ -243,6 +248,12 @@ mod tests {
         // A hub kept while off must still be a target.
         assert!(parse("state = \"off\"\nhub = \"hub\"\n").is_ok());
         assert!(parse("state = \"off\"\nhub = \"-oProxyCommand=x\"\n").is_err());
+        // `dev-builds`: off unless set, and left out of the file while off.
+        assert!(!parse("").unwrap().dev_builds);
+        let dev = parse("dev-builds = true\n").unwrap();
+        assert!(dev.dev_builds);
+        assert_eq!(serialize(&dev).unwrap(), "state = \"off\"\ndev-builds = true\n\n[allow]\n");
+        assert!(!serialize(&Lend::default()).unwrap().contains("dev-builds"));
     }
 
     #[test]

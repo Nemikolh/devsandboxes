@@ -13,8 +13,10 @@
 //! Also stamps this build for the fleet link's `Hello`
 //! (`serve::fleet::update::HELLO`): `DEVSANDBOX_BUILD_GIT`, the short git
 //! hash of `HEAD` (`unknown` without git or a repo: never a build failure),
-//! and `DEVSANDBOX_BUILD_KIND`, `published` when `DEVSANDBOX_PUBLISHED=1`
-//! (the release workflow's build of a tagged version) else `dev`.
+//! `DEVSANDBOX_BUILD_KIND`, `published` when `DEVSANDBOX_PUBLISHED=1`
+//! (the release workflow's build of a tagged version) else `dev`, and
+//! `DEVSANDBOX_BUILD_PLATFORM`, the target's `<os>/<arch>` as
+//! `std::env::consts` names them (`linux/x86_64`).
 
 use sha2::{Digest, Sha256};
 use std::process::Command;
@@ -84,6 +86,8 @@ fn stamp_build() {
     println!("cargo:rerun-if-env-changed=DEVSANDBOX_PUBLISHED");
     let published = env::var_os("DEVSANDBOX_PUBLISHED").is_some_and(|v| v == "1");
     println!("cargo:rustc-env=DEVSANDBOX_BUILD_KIND={}", if published { "published" } else { "dev" });
+    let cfg = |key: &str| env::var(key).unwrap_or_else(|_| "unknown".into());
+    println!("cargo:rustc-env=DEVSANDBOX_BUILD_PLATFORM={}/{}", cfg("CARGO_CFG_TARGET_OS"), cfg("CARGO_CFG_TARGET_ARCH"));
     let git = |args: &[&str]| -> Option<String> {
         let out = Command::new("git")
             .args(args)

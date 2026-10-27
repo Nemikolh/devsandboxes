@@ -308,11 +308,17 @@ limitation means editing this file in the same commit.
   → [fleet](architecture/daemon/fleet.md#the-worker-table); `fleet::lent::admit`
 - No build is marked published yet: the release workflow doesn't set
   `DEVSANDBOX_PUBLISHED=1`, so every hub says `dev` and a worker's
-  download path never runs; a worker on another build than its hub stops
-  offering with "dev build: needs fleet step 2c". Dev builds from the same
-  commit with different local changes count as the same build (the git
-  hash has no dirty marker).
+  download path never runs; a worker on another build than its hub takes
+  the hub's binary over the link only with `dev-builds = true` in
+  `lend.toml` and the same OS/arch, else stops offering. Dev builds from
+  the same commit with different local changes count as the same build
+  (the git hash has no dirty marker). A mixed-platform dev fleet is built
+  per platform by hand.
   → [fleet](architecture/daemon/fleet.md#versions); `build.rs` `stamp_build`, `fleet::update::decide`
+- A worker waiting for its hub's binary gives up only when the transfer
+  hasn't started within 60 s (`PUSH_WAIT`) or fails; one that started and
+  stalls while the link stays up waits until the link ends.
+  → [fleet](architecture/daemon/fleet.md#versions); `fleet::worker` `Incoming::watch`
 - A worker that won't follow its hub (dev build, failed update) is seen by
   the hub only as an offered machine whose link is gone (`unreachable`);
   the reason is on the worker (`lend.get`, `serve.log`).

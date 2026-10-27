@@ -100,6 +100,7 @@ pub(crate) fn machine_use(command: Option<&Command>) -> MachineUse {
         Command::Tunnel { .. } => MachineUse::Refused("tunnel"),
         Command::AgentRelay { .. } => MachineUse::Refused("agent-relay"),
         Command::FleetLink { .. } => MachineUse::Refused("fleet-link"),
+        Command::FleetHello => MachineUse::Refused("fleet-hello"),
         Command::Machine { .. } => MachineUse::Refused("machine"),
         // This host's own lending: `lend.toml` and its link are local.
         Command::Lend { .. } => MachineUse::Refused("lend"),

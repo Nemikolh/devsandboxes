@@ -22,7 +22,11 @@ shipped: the link `Hello` says `<semver> <git> <published|dev>`
 (`fleet::update::HELLO`, `build.rs`), the worker follows a published hub
 build (download, `INSTALL` run locally, forced handoff:
 `HelloParams::force`), inert until `release.yml` sets
-`DEVSANDBOX_PUBLISHED=1`
+`DEVSANDBOX_PUBLISHED=1`; 2c (dev builds) shipped: the `Hello` gains
+`<os>/<arch>`, `lend.toml` `dev-builds` (hand-edited, default off), the
+hub's `fleet-link` pushes its own binary as a `binary` transfer, the
+worker serves no `API` stream until it's in, checks its `fleet-hello`,
+installs and hands off
 ([fleet](../../architecture/daemon/fleet.md), ADRs
 [0041](../../decisions/0041-fleet-workers-dial-their-hub.md),
 [0042](../../decisions/0042-fleet-workers-follow-their-hubs-version.md)); the rest

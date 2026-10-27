@@ -129,7 +129,6 @@ pub fn parse_reply(line: &[u8]) -> Result<(), String> {
 
 /// The size and sha256 (lowercase hex) of everything `body` reads: what a
 /// sender puts in its [`Header`].
-#[allow(dead_code)] // first caller: fleet step 2c (the hub's binary)
 pub fn digest(mut body: impl Read) -> io::Result<(u64, String)> {
     let mut hash = Sha256::new();
     let mut buf = vec![0u8; 64 * 1024];
@@ -170,7 +169,6 @@ impl HalfClose for Conn {
 /// error otherwise (`transfer refused: <why>`; a refused header sends no
 /// body). `body` is sent as is: one that doesn't match `header` is the
 /// receiver's to refuse.
-#[allow(dead_code)] // first caller: fleet step 2c (the hub's binary)
 pub fn send(mut stream: impl Read + Write + HalfClose, header: &Header, body: impl Read) -> Result<()> {
     stream.write_all(encode_header(header).as_bytes()).and_then(|()| stream.flush()).context("cannot send the transfer")?;
     let mut line = Vec::new();
@@ -333,11 +331,13 @@ impl Drop for Temp {
 /// Where one kind's transfers go and what happens once one is in.
 type Decide = Box<dyn Fn(&Header) -> Result<PathBuf> + Send + Sync>;
 type Done = Box<dyn Fn(Received) + Send + Sync>;
+type Failed = Box<dyn Fn(&str) + Send + Sync>;
 
 struct Kind {
     limit: u64,
     decide: Decide,
     done: Done,
+    failed: Option<Failed>,
 }
 
 /// An end's receivers by kind: each `TRANSFER` stream the peer opens goes
@@ -357,7 +357,6 @@ impl Receivers {
     /// Receive `kind`, at most `limit` bytes, into where `decide` says;
     /// `done` runs with each one received (after its `ok` went out, on the
     /// transfer's thread).
-    #[allow(dead_code)] // first caller: fleet step 2c (the hub's binary)
     pub fn with(
         mut self,
         kind: &str,
@@ -365,23 +364,42 @@ impl Receivers {
         decide: impl Fn(&Header) -> Result<PathBuf> + Send + Sync + 'static,
         done: impl Fn(Received) + Send + Sync + 'static,
     ) -> Receivers {
-        self.kinds.insert(kind.to_string(), Kind { limit, decide: Box::new(decide), done: Box::new(done) });
+        self.kinds.insert(kind.to_string(), Kind { limit, decide: Box::new(decide), done: Box::new(done), failed: None });
         self
     }
 
-    /// [`receive`] on `stream` by its header's kind, then that kind's `done`.
+    /// For `kind` (registered by [`Receivers::with`]): `failed` runs with
+    /// why when one of its transfers failed after its `decide` took it (a
+    /// bad or cut body), on the transfer's thread.
+    pub fn on_failure(mut self, kind: &str, failed: impl Fn(&str) + Send + Sync + 'static) -> Receivers {
+        if let Some(k) = self.kinds.get_mut(kind) {
+            k.failed = Some(Box::new(failed));
+        }
+        self
+    }
+
+    /// [`receive`] on `stream` by its header's kind, then that kind's `done`
+    /// (or, failed once its `decide` took it, its `failed`).
     pub fn receive(&self, stream: impl Read + Write) -> Result<Received> {
         let mut kind = None;
         let received = receive(stream, u64::MAX, |h| {
             let k = self.kinds.get(&h.kind).with_context(|| format!("nothing here receives `{}` transfers", h.kind))?;
             check_size(h.size, k.limit)?;
+            let dest = (k.decide)(h)?;
             kind = Some(k);
-            (k.decide)(h)
-        })?;
-        if let Some(k) = kind {
-            (k.done)(received.clone());
+            Ok(dest)
+        });
+        match (received, kind) {
+            (Ok(received), Some(k)) => {
+                (k.done)(received.clone());
+                Ok(received)
+            }
+            (Err(e), Some(Kind { failed: Some(failed), .. })) => {
+                failed(&format!("{e:#}"));
+                Err(e)
+            }
+            (received, _) => received,
         }
-        Ok(received)
     }
 
     /// The link's end of one `TRANSFER` stream the peer opened: a socket
@@ -588,6 +606,31 @@ mod tests {
         assert!(theirs.join().unwrap().is_err());
         assert!(rx.try_recv().is_err(), "`done` only for the one received");
         assert_eq!(files(&dir), ["repo.bundle"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_kinds_failure_hook_hears_a_taken_transfer_fail() {
+        let dir = scratch("failed");
+        let failures = Arc::new(Mutex::new(Vec::<String>::new()));
+        let heard = Arc::clone(&failures);
+        let to = dir.clone();
+        let receivers = Arc::new(
+            Receivers::new(|_| {})
+                .with("binary", 100, move |h| if h.name == "no" { bail!("not now") } else { Ok(to.join(&h.name)) }, |_| {})
+                .on_failure("binary", move |why| heard.lock().unwrap().push(why.to_string())),
+        );
+        // Refused by `decide`: not taken, not a failure.
+        assert!(send(receivers.accept().unwrap(), &header_for("binary", "no", b"x"), &b"x"[..]).is_err());
+        // Taken, then a bad body.
+        let h = header_for("binary", "b", b"xyz");
+        assert!(send(receivers.accept().unwrap(), &h, &b"xy"[..]).is_err());
+        let start = std::time::Instant::now();
+        while failures.lock().unwrap().is_empty() {
+            assert!(start.elapsed() < std::time::Duration::from_secs(5), "the hook ran");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(*failures.lock().unwrap(), ["the body ended after 2 of 3 bytes"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

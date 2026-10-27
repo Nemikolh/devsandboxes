@@ -47,7 +47,7 @@ pub fn call(method: &str, params: Value, ctx: &Ctx) -> Option<Answer> {
 struct OfferParams {
     worker: String,
     /// The worker's build, its link `Hello` (`<semver> <git>
-    /// <published|dev>`, `fleet::update::HELLO`), for the log.
+    /// <published|dev> <os>/<arch>`, `fleet::update::HELLO`), for the log.
     version: String,
     /// The worker's canonical fleet root (a path there): the entry's one
     /// root, which this hub's link watches.

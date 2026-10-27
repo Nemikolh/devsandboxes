@@ -15,9 +15,13 @@
 //! Before it serves anything, each link compares the hub's build (its
 //! `Hello`) with this one's (`update::decide`): another published build is
 //! downloaded, installed and handed off to (`update::update`), the link
-//! dropped meanwhile; another dev build drops the link, saying why. Either
-//! way the next attempt is after the backoff, so a failed update is retried
-//! at the backoff's pace, never in a loop.
+//! dropped meanwhile. Another dev build for this platform, with
+//! `lend.toml`'s `dev-builds` on, keeps the link up serving no `API`
+//! stream, only the `binary` transfer the hub pushes (`update::push`); once
+//! it is in, the link is dropped and the binary installed and handed off to
+//! (`update::install_received`). Any other dev build drops the link, saying
+//! why. Either way the next attempt is after the backoff, so a failed
+//! update is retried at the backoff's pace, never in a loop.
 //!
 //! The transport is injectable ([`Transport`]): production spawns ssh
 //! (`ssh::spawn`), tests hand back one end of a socket pair whose other end
@@ -34,7 +38,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 
 use super::transfer::Receivers;
-use super::update::{self, Build, Decision, Steps};
+use super::update::{self, BINARY_KIND, BINARY_LIMIT, Build, Decision, Steps};
 use super::{LINK, link};
 use crate::devsbd::mux::Conn;
 use crate::serve::endpoint::Stream;
@@ -54,6 +58,20 @@ pub fn ssh_transport() -> Transport {
 /// How the daemon answers one `API` stream: the hub's end of a new
 /// connection, `None` to refuse it.
 pub type Open = Arc<dyn Fn() -> Option<Conn> + Send + Sync>;
+
+/// How this worker follows its hub's build.
+#[derive(Clone)]
+pub struct Follow {
+    /// The update's steps (`update::Release` in production).
+    pub steps: Arc<dyn Steps>,
+    /// `lend.toml`'s `dev-builds`, read at each link's `Hello`s (a hand
+    /// edit counts from the next attempt).
+    pub dev_builds: Arc<dyn Fn() -> bool + Send + Sync>,
+}
+
+/// How long a link waiting for the hub's binary waits for its transfer to
+/// start; then it ends, retried after the backoff.
+const PUSH_WAIT: Duration = Duration::from_secs(60);
 
 /// `ssh -T -o BatchMode=yes [-p N] -- <hub> <devsandbox fleet-link --worker
 /// <name> --root <root>>` through the hub's login shell, as every machine
@@ -100,17 +118,114 @@ struct Ctl {
     /// What the next link offers: `--drain`.
     draining: AtomicBool,
     status: Mutex<Option<Status>>,
-    /// The links' `TRANSFER` side: the daemon's receivers, the live link's
-    /// outlet.
+    /// The links' `TRANSFER` side: the daemon's receivers (and the `binary`
+    /// one, [`Incoming`]), the live link's outlet.
     transfer: Option<link::AnswererTransfer>,
     /// How this worker follows its hub's version.
-    update: Option<Arc<dyn Steps>>,
+    follow: Option<Follow>,
+    incoming: Arc<Incoming>,
+}
+
+/// The hub's binary on its way (`Decision::Receive`): what the `binary`
+/// receiver takes, for the one link waiting for it.
+#[derive(Default)]
+struct Incoming {
+    want: Mutex<Option<Want>>,
+    wake: Condvar,
+    seq: std::sync::atomic::AtomicU64,
+}
+
+struct Want {
+    seq: u64,
+    /// The hub's `Hello` hash: what the binary must report.
+    hello: String,
+    /// The private scratch dir it lands in.
+    dir: PathBuf,
+    /// The link's stream, shut once the wait is over (received or not).
+    link: Option<Stream>,
+    /// Its transfer's header was taken: no other is.
+    started: bool,
+    received: Option<PathBuf>,
+    /// Why it didn't come.
+    why: Option<String>,
+}
+
+impl Want {
+    fn waiting(&self) -> bool {
+        !self.started && self.received.is_none() && self.why.is_none()
+    }
+}
+
+impl Incoming {
+    /// Wait for the hub's binary on the link `link`; the wait's `seq`.
+    fn expect(&self, hello: String, dir: PathBuf, link: Option<Stream>) -> u64 {
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+        *self.want.lock().unwrap() = Some(Want { seq, hello, dir, link, started: false, received: None, why: None });
+        seq
+    }
+
+    /// End the current wait with `f`: its link shut (which ends the link).
+    fn finish(&self, f: impl FnOnce(&mut Want)) {
+        if let Some(w) = self.want.lock().unwrap().as_mut() {
+            f(w);
+            if let Some(link) = &w.link {
+                let _ = link.shutdown(Shutdown::Both);
+            }
+        }
+        self.wake.notify_all();
+    }
+
+    /// The wait, over (its link ended).
+    fn take(&self) -> Option<Want> {
+        let want = self.want.lock().unwrap().take();
+        self.wake.notify_all();
+        want
+    }
+
+    /// After `wait` without the transfer starting, wait `seq` ends with why.
+    fn watch(self: &Arc<Self>, seq: u64, wait: Duration) {
+        let me = Arc::clone(self);
+        let _ = std::thread::Builder::new().name("serve-lend-push".into()).spawn(move || {
+            let current = |w: &Option<Want>| w.as_ref().is_some_and(|w| w.seq == seq && w.waiting());
+            let guard = me.want.lock().unwrap();
+            let (guard, _) = me.wake.wait_timeout_while(guard, wait, |w| current(w)).unwrap();
+            if current(&guard) {
+                drop(guard);
+                me.finish(|w| w.why = Some(format!("the hub sent no binary within {wait:?}")));
+            }
+        });
+    }
+
+    /// `receivers` taking the hub's binary ([`BINARY_KIND`]) into the
+    /// current wait's dir, once; with no wait, refused at the header.
+    fn receiver(self: &Arc<Self>, receivers: Receivers) -> Receivers {
+        let (take, done, failed) = (Arc::clone(self), Arc::clone(self), Arc::clone(self));
+        receivers
+            .with(
+                BINARY_KIND,
+                BINARY_LIMIT,
+                move |_| {
+                    let mut want = take.want.lock().unwrap();
+                    match want.as_mut() {
+                        Some(w) if w.waiting() => {
+                            w.started = true;
+                            take.wake.notify_all();
+                            Ok(w.dir.join("devsandbox"))
+                        }
+                        _ => anyhow::bail!("this worker isn't waiting for a binary"),
+                    }
+                },
+                move |r| done.finish(|w| w.received = Some(r.path)),
+            )
+            .on_failure(BINARY_KIND, move |why| failed.finish(|w| w.why = Some(format!("the hub's binary didn't arrive: {why}"))))
+    }
 }
 
 impl Lending {
     /// Start lending to `hub` as `name`, offering fleet root `root`
     /// (`draining`: offering `--drain`); the hub's `TRANSFER` streams go to
-    /// `receivers`; a hub on another build is followed through `update`.
+    /// `receivers`, plus the hub's binary; a hub on another build is
+    /// followed through `follow`.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         hub: String,
@@ -119,14 +234,16 @@ impl Lending {
         draining: bool,
         transport: Transport,
         open: Open,
-        receivers: Arc<Receivers>,
-        update: Arc<dyn Steps>,
+        receivers: Receivers,
+        follow: Follow,
         timing: Timing,
         log: fn(&str),
     ) -> Result<Lending> {
         link_argv(&hub, &name, &root, draining)?;
+        let incoming = Arc::new(Incoming::default());
+        let receivers = Arc::new(incoming.receiver(receivers));
         let transfer = Some(link::AnswererTransfer { receivers, outlet: Default::default() });
-        let ctl = Arc::new(Ctl { transfer, update: Some(update), ..Ctl::default() });
+        let ctl = Arc::new(Ctl { transfer, follow: Some(follow), incoming, ..Ctl::default() });
         ctl.draining.store(draining, Ordering::SeqCst);
         let thread = {
             let ctl = Arc::clone(&ctl);
@@ -231,21 +348,36 @@ fn run_link(hub: &str, name: &str, mut duplex: Duplex, open: &Open, ctl: &Ctl, l
     }
     let up = AtomicBool::new(false);
     let wanted: Mutex<Option<String>> = Mutex::new(None);
+    // While the hub's binary is on its way the link serves no `API` stream:
+    // nothing reaches the `Worker` table until the update is done.
+    let receiving = AtomicBool::new(false);
+    let mut link_stream = duplex.stream.try_clone().ok();
     let end = link::answerer_with(
         &LINK,
         reader,
         writer,
-        || open(),
+        || if receiving.load(Ordering::Relaxed) { None } else { open() },
         ctl.transfer.as_ref(),
         |peer| {
             let theirs = Build::parse(&peer.hash);
-            match update::decide(&Build::current(), &theirs) {
+            let dev_builds = ctl.follow.as_ref().is_some_and(|f| (f.dev_builds)());
+            let platform = update::platform_of(&peer.hash);
+            match update::decide(&Build::current(), &theirs, update::PLATFORM, platform, dev_builds) {
                 Decision::Same => {}
                 Decision::Download { version } => {
                     *wanted.lock().unwrap() = Some(version);
                     return Err(format!("the hub runs {}: updating", theirs.label()));
                 }
-                Decision::DevBuild => return Err(update::dev_build_reason(&theirs)),
+                Decision::Stop(why) => return Err(why),
+                Decision::Receive => {
+                    let dir = update::scratch_dir(&std::env::temp_dir()).map_err(|e| format!("cannot take the hub's build: {e:#}"))?;
+                    receiving.store(true, Ordering::Relaxed);
+                    let seq = ctl.incoming.expect(peer.hash.clone(), dir, link_stream.take());
+                    ctl.incoming.watch(seq, PUSH_WAIT);
+                    log(&format!("fleet: hub {hub} runs devsandbox {}: receiving its binary", theirs.label()));
+                    ctl.set_status(Status::Retrying(format!("receiving the hub's build {}", theirs.label())));
+                    return Ok(());
+                }
             }
             up.store(true, Ordering::Relaxed);
             ctl.set_status(Status::Connected);
@@ -257,6 +389,26 @@ fn run_link(hub: &str, name: &str, mut duplex: Duplex, open: &Open, ctl: &Ctl, l
         },
     );
     ctl.current.lock().unwrap().take();
+    if let Some(want) = ctl.incoming.take() {
+        let label = Build::parse(&want.hello).label();
+        match (&want.received, ctl.stopped()) {
+            (_, true) => {}
+            // The ssh goes first: nothing is served while this binary changes.
+            (Some(binary), false) => {
+                duplex.peer.close();
+                follow_dev(&label, &want.hello, binary, ctl, log);
+            }
+            (None, false) => {
+                let why = want.why.clone().unwrap_or_else(|| format!("{} before the hub's binary arrived", end_why(end, &mut duplex)));
+                let why = format!("update to {label} failed: {why}");
+                log(&format!("fleet: {why}"));
+                ctl.set_status(Status::Retrying(why));
+            }
+        }
+        let _ = std::fs::remove_dir_all(&want.dir);
+        duplex.peer.close();
+        return false;
+    }
     let wanted = wanted.into_inner().unwrap();
     if let (Some(version), false) = (wanted, ctl.stopped()) {
         // The ssh goes first: nothing is served while this binary changes.
@@ -265,13 +417,7 @@ fn run_link(hub: &str, name: &str, mut duplex: Duplex, open: &Open, ctl: &Ctl, l
         return false;
     }
     if !ctl.stopped() {
-        let why = match end {
-            link::End::Handshake(why) | link::End::Refused(why) => why,
-            link::End::Dead => "no frame from the hub: link dead".into(),
-            link::End::Closed => "link closed".into(),
-        };
-        let tail = duplex.peer.stderr_tail(Duration::from_millis(500));
-        let why = format!("{why}{}", if tail.is_empty() { String::new() } else { format!(" (ssh: {tail})") });
+        let why = end_why(end, &mut duplex);
         log(&format!("fleet: link to {hub} ended: {why}"));
         ctl.set_status(Status::Retrying(why));
     }
@@ -279,11 +425,37 @@ fn run_link(hub: &str, name: &str, mut duplex: Duplex, open: &Open, ctl: &Ctl, l
     up.load(Ordering::Relaxed)
 }
 
+/// Why the link ended, with ssh's stderr tail.
+fn end_why(end: link::End, duplex: &mut Duplex) -> String {
+    let why = match end {
+        link::End::Handshake(why) | link::End::Refused(why) => why,
+        link::End::Dead => "no frame from the hub: link dead".into(),
+        link::End::Closed => "link closed".into(),
+    };
+    let tail = duplex.peer.stderr_tail(Duration::from_millis(500));
+    format!("{why}{}", if tail.is_empty() { String::new() } else { format!(" (ssh: {tail})") })
+}
+
+/// Install the hub's dev build `hello` (`label` for messages), received at
+/// `binary`, and hand off to it (`update::install_received`); the outcome
+/// is the status `lend.get` shows until the daemon hands off or the next
+/// attempt.
+fn follow_dev(label: &str, hello: &str, binary: &Path, ctl: &Ctl, log: fn(&str)) {
+    let Some(follow) = &ctl.follow else { return };
+    ctl.set_status(Status::Retrying(format!("updating to {label}")));
+    let why = match update::install_received(follow.steps.as_ref(), binary, hello) {
+        Ok(()) => format!("updated to {label}: handing off"),
+        Err(e) => format!("update to {label} failed: {e:#}"),
+    };
+    log(&format!("fleet: {why}"));
+    ctl.set_status(Status::Retrying(why));
+}
+
 /// Install the hub's published `version` and hand off to it
 /// (`update::update`); the outcome is the status `lend.get` shows until the
 /// daemon hands off or the next attempt.
 fn follow(hub: &str, version: &str, ctl: &Ctl, log: fn(&str)) {
-    let Some(steps) = &ctl.update else { return };
+    let Some(Follow { steps, .. }) = &ctl.follow else { return };
     log(&format!("fleet: hub {hub} runs devsandbox {version}: updating this one"));
     ctl.set_status(Status::Retrying(format!("updating to {version}")));
     let consts = (std::env::consts::OS, std::env::consts::ARCH);
@@ -300,41 +472,73 @@ mod tests {
     use super::*;
     use crate::serve::fleet::update::tests::Fake;
 
+    /// What a test hub pushes: `None` never gets a binary.
+    type Binary = Arc<dyn Fn() -> std::io::Result<PathBuf> + Send + Sync>;
+
+    fn no_binary() -> Binary {
+        Arc::new(|| Err(std::io::Error::other("no binary here")))
+    }
+
     /// A transport whose every link is a hub `fleet-link` saying `hello` in
-    /// its `Hello` (its opener in-process, its socket under `dir`); the
-    /// worker's answer is never served.
-    fn hub_saying(hello: &'static str, dir: PathBuf) -> Transport {
+    /// its `Hello` (its opener in-process, its sockets under `dir`), pushing
+    /// `binary()`'s file to the worker as `fleet_link::run` does
+    /// (`fleet_link::push_build`, when `update::hub_pushes`).
+    fn hub_pushing(hello: &'static str, dir: PathBuf, binary: Binary) -> Transport {
         Arc::new(move |_: &[OsString]| {
             let (worker, hub) = std::os::unix::net::UnixStream::pair()?;
-            let socket = dir.join("fleet-lap.sock");
+            let (socket, xfer) = (dir.join("fleet-lap.sock"), dir.join("fleet-lap.transfer.sock"));
+            let binary = Arc::clone(&binary);
             std::thread::spawn(move || {
                 let spec = link::Spec { hello, ..LINK };
+                let transfer = link::OpenerTransfer { socket: xfer.clone(), receivers: Arc::new(Receivers::new(|_| {})) };
                 let (r, w) = (hub.try_clone().unwrap(), hub);
-                link::opener(&spec, r, w, &socket, |_| Ok(()))
+                link::opener_with(&spec, r, w, &socket, Some(transfer), |peer| {
+                    crate::commands::fleet_link::push_build(hello, &peer.hash, xfer, move || binary());
+                    Ok(())
+                })
             });
             Ok(Duplex::socket(worker))
         })
     }
 
-    fn lend_to(hello: &'static str, tag: &str, steps: Arc<Fake>) -> (Lending, PathBuf) {
+    /// A lending thread to an in-process hub (`hub_pushing`) in a fresh
+    /// `dir`; every `API` stream the worker answers is counted (`opens`).
+    struct Lent {
+        lending: Lending,
+        dir: PathBuf,
+        opens: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Drop for Lent {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn lend_to(hello: &'static str, tag: &str, steps: Arc<Fake>, dev_builds: bool, binary: Binary) -> Lent {
         let dir = std::env::temp_dir().join(format!("dsv-worker-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let timing = Timing { backoff: Duration::from_millis(5), backoff_cap: Duration::from_millis(10), ..Timing::default() };
+        let opens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&opens);
         let lending = Lending::spawn(
             "hub".into(),
             "lap".into(),
             "/fleet/hub".into(),
             false,
-            hub_saying(hello, dir.clone()),
-            Arc::new(|| -> Option<Conn> { panic!("nothing is served to a hub on another build") }),
-            Arc::new(Receivers::new(|_| {})),
-            steps,
+            hub_pushing(hello, dir.clone(), binary),
+            Arc::new(move || -> Option<Conn> {
+                counted.fetch_add(1, Ordering::SeqCst);
+                None
+            }),
+            Receivers::new(|_| {}),
+            Follow { steps, dev_builds: Arc::new(move || dev_builds) },
             timing,
             |_| {},
         )
         .unwrap();
-        (lending, dir)
+        Lent { lending, dir, opens }
     }
 
     fn wait_status(lending: &Lending, pred: impl Fn(&str) -> bool) -> String {
@@ -359,16 +563,15 @@ mod tests {
     #[test]
     fn a_published_hub_build_is_installed_and_handed_off_to() {
         let steps = Arc::new(Fake::reporting("0.0.1"));
-        let (lending, dir) = lend_to("0.0.1 0123abcd published", "follow", Arc::clone(&steps));
+        let lent = lend_to("0.0.1 0123abcd published", "follow", Arc::clone(&steps), false, no_binary());
         if has_release() {
-            assert_eq!(wait_status(&lending, |w| w.starts_with("updated")), "updated to 0.0.1: handing off");
+            assert_eq!(wait_status(&lent.lending, |w| w.starts_with("updated")), "updated to 0.0.1: handing off");
             assert!(steps.calls().iter().any(|c| c == "handoff "), "{:?}", steps.calls());
             assert!(steps.calls()[0].contains("/releases/download/v0.0.1/devsandbox-0.0.1-"));
         } else {
-            wait_status(&lending, |w| w.contains("no devsandbox release is built for"));
+            wait_status(&lent.lending, |w| w.contains("no devsandbox release is built for"));
         }
-        drop(lending);
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(lent.opens.load(Ordering::SeqCst), 0);
     }
 
     /// A failed download stops offering with why, and is retried at the
@@ -376,8 +579,8 @@ mod tests {
     #[test]
     fn a_failed_update_stops_offering_and_is_retried() {
         let steps = Arc::new(Fake { fail: Some("fetch"), ..Fake::reporting("0.0.1") });
-        let (lending, dir) = lend_to("0.0.1 0123abcd published", "fail", Arc::clone(&steps));
-        let why = wait_status(&lending, |w| w.starts_with("update to 0.0.1 failed: "));
+        let lent = lend_to("0.0.1 0123abcd published", "fail", Arc::clone(&steps), false, no_binary());
+        let why = wait_status(&lent.lending, |w| w.starts_with("update to 0.0.1 failed: "));
         if has_release() {
             assert!(why.ends_with("fetch broke"), "{why}");
             let start = std::time::Instant::now();
@@ -387,19 +590,135 @@ mod tests {
             }
         }
         assert!(!steps.calls().iter().any(|c| c.starts_with("install") || c.starts_with("handoff")));
-        drop(lending);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A hub on another dev build: no update, the reason shown.
+    /// A hub's dev build for this platform: `hub` is its `Hello` hash.
+    fn dev_hub() -> &'static str {
+        Box::leak(format!("0.0.1 0123abcd dev {}", update::PLATFORM).into_boxed_str())
+    }
+
+    /// A hub binary under `dir`, written when `binary()` is called.
+    fn hub_binary(dir: PathBuf, gate: Option<std::sync::mpsc::Receiver<()>>) -> Binary {
+        let gate = Mutex::new(gate);
+        Arc::new(move || {
+            if let Some(gate) = gate.lock().unwrap().as_ref() {
+                let _ = gate.recv();
+            }
+            let path = dir.join("hub-exe");
+            std::fs::write(&path, b"the hub's build")?;
+            Ok(path)
+        })
+    }
+
+    /// A hub on another dev build for this platform, `dev-builds` on: the
+    /// link serves no `API` stream while the hub's binary comes over
+    /// `TRANSFER`; then it is checked, installed and handed off to.
     #[test]
-    fn a_dev_hub_build_stops_offering() {
-        let steps = Arc::new(Fake::reporting("0.0.1"));
-        let (lending, dir) = lend_to("0.0.1 0123abcd dev", "dev", Arc::clone(&steps));
-        let why = wait_status(&lending, |w| w.starts_with("dev build"));
-        assert!(why.starts_with("dev build: needs fleet step 2c (the hub runs 0.0.1 (dev, 0123abcd)"), "{why}");
+    fn a_dev_hub_build_is_received_installed_and_handed_off_to() {
+        let hub = dev_hub();
+        let steps = Arc::new(Fake::building(hub));
+        let (go, gate) = std::sync::mpsc::channel();
+        let base = std::env::temp_dir().join(format!("dsv-worker-devbin-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let lent = lend_to(hub, "dev-ok", Arc::clone(&steps), true, hub_binary(base.clone(), Some(gate)));
+        wait_status(&lent.lending, |w| w == "receiving the hub's build 0.0.1 (dev, 0123abcd)");
+
+        // The Worker table is out of reach: an `API` stream is refused.
+        let mut probe = std::os::unix::net::UnixStream::connect(lent.dir.join("fleet-lap.sock")).unwrap();
+        probe.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        assert_eq!(std::io::Read::read(&mut probe, &mut [0u8; 16]).unwrap(), 0, "closed: refused");
+        assert_eq!(lent.opens.load(Ordering::SeqCst), 0);
+        assert!(steps.calls().is_empty(), "nothing before the binary");
+
+        go.send(()).unwrap();
+        assert_eq!(wait_status(&lent.lending, |w| w.starts_with("updated")), "updated to 0.0.1 (dev, 0123abcd): handing off");
+        assert_eq!(steps.calls(), ["build received", "install /dest/devsandbox", "build dest", "handoff "]);
+        assert_eq!(lent.opens.load(Ordering::SeqCst), 0);
+        drop(lent);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The hub's binary reporting another build: never installed; the next
+    /// link receives it again (after the backoff).
+    #[test]
+    fn a_received_build_that_isnt_the_hubs_is_refused_and_retried() {
+        let hub = dev_hub();
+        let steps = Arc::new(Fake { received_build: "0.0.1 ffff dev x/y".into(), ..Fake::building(hub) });
+        let base = std::env::temp_dir().join(format!("dsv-worker-devbad-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let lent = lend_to(hub, "dev-bad", Arc::clone(&steps), true, hub_binary(base.clone(), None));
+        let why = wait_status(&lent.lending, |w| w.starts_with("update to 0.0.1 (dev, 0123abcd) failed: "));
+        assert!(why.contains("the hub's binary (") && why.contains("reports \"0.0.1 ffff dev x/y\""), "{why}");
+        let start = std::time::Instant::now();
+        while steps.calls().len() < 2 {
+            assert!(start.elapsed() < Duration::from_secs(10), "retried");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(steps.calls().iter().all(|c| c == "build received"), "{:?}", steps.calls());
+        assert_eq!(lent.opens.load(Ordering::SeqCst), 0);
+        drop(lent);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A hub on another dev build, `dev-builds` off: no update, the reason
+    /// shown.
+    #[test]
+    fn a_dev_hub_build_without_dev_builds_stops_offering() {
+        let steps = Arc::new(Fake::building(dev_hub()));
+        let lent = lend_to(dev_hub(), "dev-off", Arc::clone(&steps), false, no_binary());
+        let why = wait_status(&lent.lending, |w| w.starts_with("dev build"));
+        assert_eq!(why, "dev build: dev-builds is off in lend.toml (the hub runs 0.0.1 (dev, 0123abcd))");
         assert!(steps.calls().is_empty());
-        drop(lending);
+    }
+
+    /// A hub's dev build for another platform: no update, whatever
+    /// `dev-builds` says.
+    #[test]
+    fn a_dev_hub_build_for_another_platform_stops_offering() {
+        let steps = Arc::new(Fake::building("x"));
+        let lent = lend_to("0.0.1 0123abcd dev plan9/mips", "dev-plat", Arc::clone(&steps), true, no_binary());
+        let why = wait_status(&lent.lending, |w| w.starts_with("dev build"));
+        assert_eq!(why, format!("dev build: can't run on {} (the hub runs 0.0.1 (dev, 0123abcd) for plan9/mips)", update::PLATFORM));
+        assert!(steps.calls().is_empty());
+    }
+
+    /// The `binary` receiver takes one transfer, only while a link waits
+    /// for it; a wait whose transfer never starts ends with why, its link
+    /// shut.
+    #[test]
+    fn the_binary_receiver_takes_one_while_waited_for() {
+        use crate::serve::fleet::transfer::{self, Header};
+        let dir = std::env::temp_dir().join(format!("dsv-worker-incoming-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let incoming = Arc::new(Incoming::default());
+        let receivers = Arc::new(incoming.receiver(Receivers::new(|_| {})));
+        let (size, sha256) = transfer::digest(&b"bin"[..]).unwrap();
+        let header = Header { kind: BINARY_KIND.into(), name: "devsandbox".into(), size, sha256 };
+        let err = transfer::send(receivers.accept().unwrap(), &header, &b"bin"[..]).unwrap_err();
+        assert_eq!(format!("{err:#}"), "transfer refused: this worker isn't waiting for a binary");
+
+        let (link, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        incoming.expect("h".into(), dir.clone(), Some(link.into()));
+        transfer::send(receivers.accept().unwrap(), &header, &b"bin"[..]).unwrap();
+        let err = transfer::send(receivers.accept().unwrap(), &header, &b"bin"[..]).unwrap_err();
+        assert_eq!(format!("{err:#}"), "transfer refused: this worker isn't waiting for a binary", "once");
+        let start = std::time::Instant::now();
+        while incoming.want.lock().unwrap().as_ref().unwrap().received.is_none() {
+            assert!(start.elapsed() < Duration::from_secs(5), "received");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(std::io::Read::read(&mut &peer, &mut [0u8; 1]).unwrap(), 0, "the link is shut");
+        let want = incoming.take().unwrap();
+        assert_eq!(want.received, Some(dir.join("devsandbox")));
+        assert_eq!(std::fs::read(dir.join("devsandbox")).unwrap(), b"bin");
+
+        let (link, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let seq = incoming.expect("h".into(), dir.clone(), Some(link.into()));
+        incoming.watch(seq, Duration::from_millis(20));
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        assert_eq!(std::io::Read::read(&mut &peer, &mut [0u8; 1]).unwrap(), 0, "shut by the watch");
+        assert_eq!(incoming.take().unwrap().why.as_deref(), Some("the hub sent no binary within 20ms"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -697,7 +1016,7 @@ mod tests {
         });
         let timing = Timing { backoff: Duration::from_millis(5), backoff_cap: Duration::from_millis(10), ..Timing::default() };
         let lending =
-            Lending::spawn("hub".into(), "lap".into(), "/fleet/hub".into(), false, transport, Arc::new(|| None), Arc::new(Receivers::new(|_| {})), Arc::new(Fake::default()), timing, |_| {}).unwrap();
+            Lending::spawn("hub".into(), "lap".into(), "/fleet/hub".into(), false, transport, Arc::new(|| None), Receivers::new(|_| {}), Follow { steps: Arc::new(Fake::default()), dev_builds: Arc::new(|| false) }, timing, |_| {}).unwrap();
         let start = std::time::Instant::now();
         while tries.load(Ordering::SeqCst) < 3 {
             assert!(start.elapsed() < Duration::from_secs(5), "retried");

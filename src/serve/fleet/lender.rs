@@ -383,7 +383,11 @@ mod tests {
         let transport = dials.transport();
         let timing = Timing { backoff: Duration::from_millis(5), backoff_cap: Duration::from_millis(10), ..Timing::default() };
         let spawn: Spawn = Box::new(move |s: Start| {
-            Lending::spawn(s.hub, s.name, s.root, s.draining, transport.clone(), Arc::new(|| None), Arc::new(crate::serve::fleet::transfer::Receivers::new(|_| {})), Arc::new(crate::serve::fleet::update::tests::Fake::default()), timing, |_| {})
+            let follow = crate::serve::fleet::worker::Follow {
+                steps: Arc::new(crate::serve::fleet::update::tests::Fake::default()),
+                dev_builds: Arc::new(|| false),
+            };
+            Lending::spawn(s.hub, s.name, s.root, s.draining, transport.clone(), Arc::new(|| None), crate::serve::fleet::transfer::Receivers::new(|_| {}), follow, timing, |_| {})
         });
         Lender::new(path, "lap.local".into(), spawn, |_| {})
     }

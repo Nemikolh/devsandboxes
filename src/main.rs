@@ -391,6 +391,12 @@ enum Command {
         #[arg(long)]
         drain: bool,
     },
+    /// Print the build this binary says in a fleet link's `Hello`
+    /// (docs/architecture/daemon/fleet.md, *Versions*): what a worker
+    /// checks the hub's binary by
+    #[cfg(unix)]
+    #[command(hide = true)]
+    FleetHello,
     /// Register remote hosts (over ssh) whose sandboxes this one manages
     /// (docs/architecture/daemon/machines.md)
     #[cfg(unix)]
@@ -833,6 +839,11 @@ fn main() -> Result<()> {
         #[cfg(unix)]
         Command::FleetLink { worker, root, drain } => commands::fleet_link::fleet_link(&worker, &root, drain),
         #[cfg(unix)]
+        Command::FleetHello => {
+            println!("{}", serve::fleet::update::HELLO);
+            Ok(())
+        }
+        #[cfg(unix)]
         Command::Machine { cmd } => match cmd {
             MachineCommand::Add { target, name, configs, agent, auto_install } => {
                 commands::machine::add(&target, name.as_deref(), &configs, agent, auto_install)
@@ -940,6 +951,7 @@ mod tests {
             _ => panic!("not fleet-link"),
         }
         assert!(parse(&["fleet-link", "--worker", "lap"]).is_err(), "a root is required");
+        assert!(matches!(parse(&["fleet-hello"]).unwrap().command, Some(Command::FleetHello)));
     }
 
     /// `exec`'s (attach, sessions, session, name, command).

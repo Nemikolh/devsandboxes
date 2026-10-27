@@ -21,6 +21,13 @@
 //! (`fleet-<name>.transfer.sock`): each connection there is one `TRANSFER`
 //! stream to the worker (`fleet::transfer::send` on it). `TRANSFER` streams
 //! the worker opens are refused for now: this end receives no kind yet.
+//!
+//! When this is a dev build the worker isn't on, for the worker's platform
+//! (`update::hub_pushes`, over both `Hello`s), it pushes its own binary
+//! through that socket once the offer is made ([`push_build`]): the one
+//! that said this link's `Hello`, so the build the worker decided on.
+//! The worker takes it only while it waits for it (`dev-builds` on),
+//! refusing at the header otherwise.
 
 use std::io::{self, Read, Write};
 use std::path::Path;
@@ -32,7 +39,7 @@ use serde_json::json;
 use crate::serve::client::{self, Conn};
 use crate::serve::endpoint;
 use crate::serve::fleet::transfer::Receivers;
-use crate::serve::fleet::{self, link};
+use crate::serve::fleet::{self, link, update};
 use crate::serve::machines::check_name;
 
 /// The CLI entry: the socket dir (created 0700 if missing), then [`run`] on
@@ -67,18 +74,52 @@ pub fn run(
         bail!("--root {} isn't an absolute path", root.display());
     }
     let mut held: Option<Conn> = None;
-    let transfer = link::OpenerTransfer {
-        socket: endpoint::fleet_transfer_socket(dir, worker),
-        receivers: Arc::new(Receivers::new(|m| eprintln!("{m}"))),
-    };
+    let socket = endpoint::fleet_transfer_socket(dir, worker);
+    let transfer = link::OpenerTransfer { socket: socket.clone(), receivers: Arc::new(Receivers::new(|m| eprintln!("{m}"))) };
     let end = link::opener_with(&fleet::LINK, reader, writer, &endpoint::fleet_socket(dir, worker), Some(transfer), |peer| {
         let mut conn = daemon()?;
         offer(&mut conn, worker, &peer.hash, root, draining)?;
         held = Some(conn);
+        push_build(fleet::LINK.hello, &peer.hash, socket, own_binary);
         Ok(())
     });
     drop(held);
     end
+}
+
+/// This process's own binary: on Linux `/proc/self/exe`, the inode it runs
+/// even when the path was replaced since; elsewhere `current_exe()`. The
+/// worker checks what it got reports this link's `Hello` anyway.
+fn own_binary() -> io::Result<std::path::PathBuf> {
+    #[cfg(target_os = "linux")]
+    return Ok("/proc/self/exe".into());
+    #[cfg(not(target_os = "linux"))]
+    std::env::current_exe()
+}
+
+/// When a hub saying `ours` pushes to a worker saying `theirs`
+/// (`update::hub_pushes`), `binary()`'s file to it on a thread of its own
+/// through the link's transfer socket `socket` (`update::push`; its
+/// connection waits in the backlog until the opener's accept loop runs).
+/// A failure is on stderr (which the worker sees as ssh's); the worker's
+/// wait ends on its own.
+pub fn push_build(
+    ours: &str,
+    theirs: &str,
+    socket: std::path::PathBuf,
+    binary: impl FnOnce() -> io::Result<std::path::PathBuf> + Send + 'static,
+) -> Option<std::thread::JoinHandle<Result<()>>> {
+    if !update::hub_pushes(ours, theirs) {
+        return None;
+    }
+    let pushed = std::thread::Builder::new().name("fleet-push".into()).spawn(move || {
+        let pushed = binary().context("cannot locate this binary").and_then(|b| update::push(&socket, &b));
+        if let Err(e) = &pushed {
+            eprintln!("fleet-link: cannot send this build to the worker: {e:#}");
+        }
+        pushed
+    });
+    pushed.ok()
 }
 
 /// `fleet.offer` on `conn`; a refusal is an error with the daemon's reason.

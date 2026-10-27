@@ -33,9 +33,10 @@ hand.
   off, forced or not. The successor starts as any handoff's does.
 - On any failure the worker stops offering (no link), `lend.get` says why,
   and the next link attempt, after the usual backoff, tries again.
-- A hub on an unpublished build the worker isn't on is not followed yet
-  (fleet step 2c: the hub's binary over `TRANSFER`); the worker stops
-  offering, saying so.
+- A hub on an unpublished build the worker isn't on is followed only
+  with the hub's own binary over `TRANSFER`, when the worker's
+  `lend.toml` accepts dev builds and the platforms match; otherwise the
+  worker stops offering, saying why.
 
 0015 stays for everything else: a forced hello is the one exception to
 "the newest binary wins", and only a worker following its hub sends one.

@@ -10,9 +10,9 @@ worker policy and `lend.*` with its CLI, `devsandbox lend` and
 `devsandbox fleet join|leave`
 ([ADR 0041](../../decisions/0041-fleet-workers-dial-their-hub.md)); and
 every daemon's [capacity report](#capacity), carried by its snapshots;
-and the link's [`TRANSFER`](#transfer) streams, both ways, with no
-kind received yet; and [versions](#versions): a worker follows its hub's
-published build
+and the link's [`TRANSFER`](#transfer) streams, both ways; and
+[versions](#versions): a worker follows its hub's build, a published one
+downloaded, a dev one received over `TRANSFER`
 ([ADR 0042](../../decisions/0042-fleet-workers-follow-their-hubs-version.md)).
 
 Code: `src/serve/fleet/mod.rs` (`LINK`), `src/serve/fleet/link.rs`
@@ -47,9 +47,12 @@ Code: `src/serve/fleet/mod.rs` (`LINK`), `src/serve/fleet/link.rs`
 (`poll`, `running_instances`), `src/serve/snapshots.rs`
 (`Snapshots::set_capacity`, `Machine::capacity`,
 `SnapshotMachine::capacity`), `src/serve/fleet/lend.rs` (`SoftCaps`);
-versions: `src/serve/fleet/update.rs` (`HELLO`, `Build`, `decide`,
-`Decision`, `release_target`, `asset_url`, `curl_argv`, `update`,
-`Steps`, `Release`), `build.rs` (`stamp_build`),
+versions: `src/serve/fleet/update.rs` (`HELLO`, `PLATFORM`,
+`platform_of`, `Build`, `decide`, `Decision`, `hub_pushes`, `push`,
+`install_received`, `release_target`, `asset_url`, `curl_argv`, `update`,
+`Steps`, `Release`), `src/serve/fleet/worker.rs` (`Follow`, `Incoming`),
+`src/commands/fleet_link.rs` (`push_build`), `src/main.rs`
+(`Command::FleetHello`), `build.rs` (`stamp_build`),
 `src/serve/machines/install.rs` (`install_local`, `version_of`),
 `src/serve/proto.rs` (`HelloParams::force`), `src/serve/client.rs`
 (`hello_with`), `src/serve/endpoint.rs` (`peer_is_own_user`),
@@ -154,8 +157,13 @@ its `Receivers`: one entry per kind (`Receivers::with`: a size limit,
 link's callback answers the `Open` with one end of a socket pair
 (`Receivers::accept`) and receives on a `fleet-transfer` thread of its
 own; a kind with no entry is refused ("nothing here receives
-\`<kind>\` transfers"). No end registers a kind yet: the worker daemon's
-`start_lending` and `commands::fleet_link::run` pass empty receivers.
+\`<kind>\` transfers"). `Receivers::on_failure` adds a kind's hook for a
+transfer that failed after its `decide` took it. The one kind received so
+far is the worker's `binary` (`update::BINARY_KIND`, at most
+`BINARY_LIMIT`, 256 MiB: the hub's dev build, [Versions](#versions)),
+which the lending thread registers itself (`Incoming::receiver`); the
+receivers `start_lending` passes and `commands::fleet_link::run`'s are
+empty otherwise.
 
 **Hub → worker.** `fleet-link` binds a second socket next to the link's,
 `endpoint::fleet_transfer_socket` (`fleet-<name>.transfer.sock`, bound and
@@ -186,7 +194,7 @@ link's `API` streams.
   the newest link for a worker wins. Its `on_ready` connects to this host's
   daemon (`client::connect`, which starts one like any client does when
   none runs) and sends `fleet.offer {worker, version, root, draining}`,
-  `version` the worker's `Hello` hash (`<semver> <git> <published|dev>`),
+  `version` the worker's `Hello` hash (`<semver> <git> <published|dev> <os>/<arch>`),
   `root` its `--root`, `draining` its
   `--drain` (the worker's `lend` was `drain` when it dialed). A refused offer ends the link with `offer refused:
   <why>` (on its stderr, which the worker's ssh keeps). It holds that
@@ -356,13 +364,15 @@ lent API ([ADR 0041](../../decisions/0041-fleet-workers-dial-their-hub.md)).
   `state` (`on` | `off` | `drain`; absent is `off`), `hub` (the hub's ssh
   target, as `machine add` takes one), `name` (what this host offers itself
   as; absent is the hostname's first label, `lend::default_name`, which
-  must pass `machines::check_name`), an `[allow]` table, the
+  must pass `machines::check_name`), `dev-builds` (take the hub's own
+  binary when it runs a dev build, [Versions](#versions); absent is
+  `false`, left out of the file while `false`), an `[allow]` table, the
   [worker policy](#worker-policy)'s allowances, and a `[caps]` table, the
   soft caps of the [capacity report](#capacity) (`lend::SoftCaps`:
   `cpus`, `mem`, `disk`, `instances`, each optional; `mem` and `disk`
   sizes like `16G`, checked by `capacity::parse_size`). Unknown keys are
-  ignored. `[allow]` and `[caps]` are edited by hand: `lend.set` changes
-  neither. `lend::load`
+  ignored. `dev-builds`, `[allow]` and `[caps]` are edited by hand:
+  `lend.set` changes none of them. `lend::load`
   reads it (missing is not lending); `lend::check`: lending (`on`/`drain`)
   requires a `hub`, and a `hub` or `name` that's set must be valid. The
   daemon reads it at start (`daemon::start_lending`, `Lender::start`;
@@ -409,24 +419,67 @@ A worker follows its hub's exact build, an older one included
 ([ADR 0042](../../decisions/0042-fleet-workers-follow-their-hubs-version.md)):
 
 - **The build in the `Hello`.** `fleet::LINK`'s `hello` is
-  `fleet::update::HELLO`, `<semver> <git> <published|dev>` (`0.8.0
-  1a2b3c4d5e6f dev`), from `build.rs`'s `stamp_build`: `DEVSANDBOX_BUILD_GIT`
+  `fleet::update::HELLO`, `<semver> <git> <published|dev> <os>/<arch>`
+  (`0.8.0 1a2b3c4d5e6f dev linux/x86_64`), from `build.rs`'s
+  `stamp_build`: `DEVSANDBOX_BUILD_PLATFORM` is the target's
+  `CARGO_CFG_TARGET_OS` / `CARGO_CFG_TARGET_ARCH` (what `std::env::consts`
+  says, `update::PLATFORM`); `DEVSANDBOX_BUILD_GIT`
   is `git rev-parse --short=12 HEAD` of the source tree (`unknown` when git
   or the repo is missing; the build never fails for it), watched through
   `HEAD`, the ref it names and `packed-refs`; `DEVSANDBOX_BUILD_KIND` is
   `published` when the build ran with `DEVSANDBOX_PUBLISHED=1` (meant for
-  the release workflow), else `dev`. `Build::parse` reads one back (a
-  missing word is `unknown` / dev).
-- **The decision** (`update::decide`, pure, over this build and the hub's
-  from the answerer's `on_ready`): the same semver, git and kind is
-  `Same`, and the link serves; another build that is published is
-  `Download { version }`; another dev build is `DevBuild`. Only `Same`
-  serves: the others refuse the link (`End::Refused`) before the first
-  stream, so the hub's offer registers the worker but its link finds it
-  gone.
-- **`DevBuild`** stops offering: `lend.get`'s error is `dev build: needs
-  fleet step 2c (the hub runs <hub build>, this worker <ours>)`
-  (`update::dev_build_reason`), retried at the next attempt.
+  the release workflow), else `dev`. `Build::parse` reads the first three
+  words back (a missing one is `unknown` / dev), `update::platform_of` the
+  fourth (`unknown` without one): the platform isn't part of the build,
+  one release being built for several. `devsandbox fleet-hello` (hidden)
+  prints `HELLO`.
+- **The decision** (`update::decide`, pure, over this build and platform,
+  the hub's from the answerer's `on_ready`, and `lend.toml`'s `dev-builds`,
+  read at each link's `Hello`s through `worker::Follow::dev_builds`): the
+  same semver, git and kind is `Same`, and the link serves; another build
+  that is published is `Download { version }`; another dev build is
+  `Receive` when the platforms are equal and `dev-builds` is on, else
+  `Stop(why)`. `Download` and `Stop` refuse the link (`End::Refused`)
+  before the first stream, so the hub's offer registers the worker but
+  its link finds it gone; `Receive` keeps the link up serving only the
+  hub's binary.
+- **`Stop`** stops offering, retried at the next attempt. `lend.get`'s
+  error is `dev build: can't run on <our os>/<arch> (the hub runs <hub
+  build> for <its os>/<arch>)`, checked first since `dev-builds` can't
+  help there, else `dev build: dev-builds is off in lend.toml (the hub
+  runs <hub build>)`.
+- **`Receive`**, the hub's side: `fleet-link`, once its offer is made,
+  pushes its own binary when `update::hub_pushes` (over both `Hello`s:
+  the worker, taking dev builds, would `Receive`), from a thread of its
+  own (`commands::fleet_link::push_build`): `update::push`, one `binary`
+  transfer named `devsandbox` through its own transfer socket. The
+  binary is the `fleet-link` process's (`/proc/self/exe` on Linux, the
+  inode it runs even if the path was replaced since; `current_exe()`
+  elsewhere), not the hub daemon's: it is the one that said the link's
+  `Hello`, so the build the worker decided on. The hub pushes rather
+  than waiting to be asked: the worker's decision stands either way,
+  since it refuses the header (no body sent) unless it waits for a
+  binary, and a worker with `dev-builds` off has refused the link before
+  the push opens; no request kind or round trip is needed. A failed push
+  is on `fleet-link`'s stderr.
+- **`Receive`**, the worker's side: the link's `API` streams are refused
+  (the `Worker` table is out of reach until the update is done) and a
+  wait is set up (`worker::Incoming`: a private scratch dir under the temp
+  dir, `update::scratch_dir`); `lend.get`'s error is `receiving the hub's
+  build <hub build>`. The `binary` receiver takes one transfer while a
+  wait is on (else `this worker isn't waiting for a binary`) into
+  `<scratch>/devsandbox` (0600, as every transfer lands), then shuts the
+  link. No transfer started within `PUSH_WAIT` (60 s: `Incoming::watch`)
+  or one that failed shuts it too, with why. With the link down (its ssh
+  killed) `update::install_received` over the worker's `Steps`: the file
+  made 0755, its `fleet-hello` (`Steps::build`) must report the hub's
+  `Hello` word for word (semver, git, kind, platform), installed by
+  `install::install_local` as a download is, the installed binary's
+  `fleet-hello` checked again, then the forced handoff, below. The
+  scratch dir is removed either way. The status follows `Download`'s:
+  `updating to <hub build>`, `updated to <hub build>: handing off`, or
+  `update to <hub build> failed: <why>`, retried after the backoff (a
+  `Receive` link never counts as up, so the backoff isn't reset).
 - **`Download`**: the ssh is killed, then `update::update` over the
   worker's `Steps` (`Release` in production; `Options::lend_update` in
   tests): the asset `devsandbox-<v>-<target>.tar.gz` of release `v<v>`
