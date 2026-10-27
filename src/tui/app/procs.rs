@@ -60,7 +60,7 @@ impl App {
             return None;
         }
         let inst = snapshot.instances.get(instance)?;
-        let ProcState::Rows { rows, signalable } = self.procs.get(&instance_key(inst))? else {
+        let ProcState::Rows { rows, signalable, .. } = self.procs.get(&instance_key(inst))? else {
             return None;
         };
         // A `top` fallback listing has host-namespace pids that `exec kill` can't
@@ -123,6 +123,16 @@ impl App {
         }
     }
 
+    /// The helper's session count for a cached instance (`instances.procs`'
+    /// `sessions`). `None` when nothing is cached, the cache is a message, or
+    /// the helper didn't answer one (missing or predating sessions).
+    pub fn session_count(&self, instance: &str) -> Option<crate::runtime::procs::SessionCount> {
+        match self.procs.get(instance) {
+            Some(ProcState::Rows { sessions, .. }) => *sessions,
+            _ => None,
+        }
+    }
+
     /// The selected instance's name as a fetch target, but only when its
     /// container is running. Drives the on-demand proc fetch that backs the
     /// Detail agent count for instances that aren't expanded. `None` on non-
@@ -148,7 +158,7 @@ impl App {
     /// selected running instance is appended (deduped) so the Detail agent count
     /// has a fresh forest even when its process layer isn't expanded. Empty off
     /// the Instances tab: nothing there shows processes, and each target costs
-    /// two `docker exec`s.
+    /// three `docker exec`s (`ps`, `devsbd run ls`, `devsbd session ls`).
     pub fn proc_fetch_targets(&mut self) -> Vec<String> {
         if self.tab != Tab::Instances {
             return Vec::new();
@@ -348,6 +358,7 @@ mod tests {
             ProcState::Rows {
                 rows: vec![ProcRow { pid: "660011".into(), depth: 0, args: "x".into() }],
                 signalable: false,
+                sessions: None,
             },
         );
         app.on_key(key(KeyCode::Down)); // inst0
@@ -455,12 +466,28 @@ mod tests {
                 args: "1790000000-a1b2 running claude -p x".into(),
             },
         ];
-        app.procs.insert("x".into(), ProcState::Rows { rows, signalable: true });
+        app.procs.insert("x".into(), ProcState::Rows { rows, signalable: true, sessions: None });
         assert_eq!(app.agent_count("x"), Some(2));
 
         // A message state (not running / error) has no countable forest.
         app.procs.insert("y".into(), ProcState::Message("(not running)".into()));
         assert_eq!(app.agent_count("y"), None);
+    }
+
+    #[test]
+    fn session_count_reads_the_cached_listing() {
+        use crate::runtime::procs::SessionCount;
+        use crate::tui::procs::ProcState;
+        let mut app = new_app();
+        assert_eq!(app.session_count("x"), None);
+        let count = SessionCount { running: 3, detached: 1 };
+        app.procs.insert("x".into(), ProcState::Rows { rows: Vec::new(), signalable: true, sessions: Some(count) });
+        assert_eq!(app.session_count("x"), Some(count));
+        // An old helper (no `session ls`) and a message state: unknown.
+        app.procs.insert("old".into(), ProcState::Rows { rows: Vec::new(), signalable: true, sessions: None });
+        assert_eq!(app.session_count("old"), None);
+        app.procs.insert("y".into(), ProcState::Message("(not running)".into()));
+        assert_eq!(app.session_count("y"), None);
     }
 
     #[test]

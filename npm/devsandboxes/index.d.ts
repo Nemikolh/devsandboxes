@@ -842,6 +842,15 @@ export interface ProcsListing {
   signalable: boolean;
   /** Oldest first; `[]` without a helper that tracks runs. */
   runs: RunRow[];
+  /** The helper's sessions; absent without a helper that has them. */
+  sessions?: SessionCount;
+}
+
+/** An instance's helper sessions (`devsandbox exec`'s resumable shells and commands). */
+export interface SessionCount {
+  running: number;
+  /** Running with no client attached. */
+  detached: number;
 }
 
 /** Why an instance has no listing: no such instance, not running, or the listing failed. */

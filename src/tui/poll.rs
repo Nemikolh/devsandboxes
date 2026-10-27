@@ -287,7 +287,7 @@ mod tests {
             "gone": {"error": "no instance `gone`"},
         });
         let Answer::Ok(states) = procs_answer(wire) else { panic!("not parsed") };
-        assert!(matches!(&states["up"], ProcState::Rows { rows, signalable: true } if rows.len() == 1));
+        assert!(matches!(&states["up"], ProcState::Rows { rows, signalable: true, sessions: None } if rows.len() == 1));
         assert_eq!(states["gone"], ProcState::Message("(processes unavailable: no instance `gone`)".into()));
     }
 

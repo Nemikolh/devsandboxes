@@ -1,7 +1,8 @@
 //! An instance's processes and runs as the daemon's `instances.procs`
 //! answers them (docs/reference/api.md): the parse of a container's `ps -eo
-//! pid,ppid,args` listing and of its helper's `devsbd run ls`, pure so they
-//! unit-test without docker, plus the bounded `devsbd run ls` probe itself.
+//! pid,ppid,args` listing and of its helper's `devsbd run ls` / `devsbd
+//! session ls`, pure so they unit-test without docker, plus the bounded
+//! probes themselves.
 //! The dashboard's forest and row formatting stay in `tui::procs`.
 
 use std::time::Duration;
@@ -81,10 +82,39 @@ fn parse_run(line: &str) -> Run {
     }
 }
 
-/// Stdout kept from a child's `devsbd run ls` before it's given up on.
+/// How many of a container's helper sessions are running, and how many of
+/// those have no client attached (docs/architecture/helper/in-container.md,
+/// *Sessions*).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCount {
+    pub running: usize,
+    pub detached: usize,
+}
+
+/// The count in `devsbd session ls` output: lines `<id> <state>
+/// <attached|detached|-> …`, a running session's state being the one word
+/// `running`. Anything else (ended, lost, malformed) isn't counted.
+pub fn count_sessions(ls: &str) -> SessionCount {
+    let mut count = SessionCount::default();
+    for line in ls.lines() {
+        let mut words = line.split(' ').skip(1);
+        if words.next() != Some("running") {
+            continue;
+        }
+        count.running += 1;
+        if words.next() == Some("detached") {
+            count.detached += 1;
+        }
+    }
+    count
+}
+
+/// Stdout kept from a child's `devsbd run ls` / `session ls` before it's
+/// given up on.
 const RUN_LS_CAP: usize = 64 * 1024;
 
-/// How long a child's `devsbd run ls` may take before it's killed.
+/// How long a child's `devsbd run ls` / `session ls` may take before it's
+/// killed.
 const RUN_LS_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// `devsbd run ls` in `container`, bounded in size and time (its output is
@@ -92,9 +122,22 @@ const RUN_LS_TIMEOUT: Duration = Duration::from_secs(5);
 /// runs, a timeout, or output past [`RUN_LS_CAP`] (dropped whole rather than
 /// parsed cut off): the instance then just shows no runs.
 pub fn run_ls(container: &str) -> Option<String> {
+    helper_ls(container, "run")
+}
+
+/// `devsbd session ls` in `container`, bounded and `None` on failure as
+/// [`run_ls`] is (a helper predating sessions included): the instance then
+/// shows no session count.
+pub fn session_ls(container: &str) -> Option<String> {
+    helper_ls(container, "session")
+}
+
+/// `devsbd <noun> ls` in `container`, bounded by [`RUN_LS_CAP`] and
+/// [`RUN_LS_TIMEOUT`].
+fn helper_ls(container: &str, noun: &str) -> Option<String> {
     let backend = super::backend();
     let mut cmd = std::process::Command::new(backend.bin());
-    cmd.args(["exec", container, crate::devsbd::BIN, "run", "ls"]).stdin(std::process::Stdio::null());
+    cmd.args(["exec", container, crate::devsbd::BIN, noun, "ls"]).stdin(std::process::Stdio::null());
     let out = super::bounded::run(&mut cmd, RUN_LS_CAP, RUN_LS_TIMEOUT).ok()?;
     (out.status.success() && !out.truncated).then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
@@ -153,5 +196,19 @@ mod tests {
         assert_eq!(parse_runs("x exited"), [run("x", "exited", "", "")]);
         assert_eq!(parse_runs("x lost 2026"), [run("x", "lost", "2026", "")]);
         assert_eq!(parse_runs("x"), [run("x", "", "", "")]);
+    }
+
+    #[test]
+    fn count_sessions_counts_running_and_detached() {
+        let ls = "1790000000-a1b2 exited 0 - 2026-09-21T14:13:20Z bash\n\
+1790000001-0000 running attached 2026-09-21T14:13:21Z zidane\n\
+\n\
+1790000002-ffff running detached 2026-09-21T14:13:22Z claude\n\
+1790000003-eeee lost - 2026-09-21T14:13:23Z sh\n\
+1790000004-dddd running detached 2026-09-21T14:13:24Z\n\
+1790000005-cccc running\n";
+        assert_eq!(count_sessions(ls), SessionCount { running: 4, detached: 2 });
+        assert_eq!(count_sessions(""), SessionCount::default());
+        assert_eq!(count_sessions("running detached"), SessionCount::default(), "state is the 2nd word");
     }
 }

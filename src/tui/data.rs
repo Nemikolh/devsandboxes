@@ -601,7 +601,7 @@ mod tests {
         let mut procs = BTreeMap::new();
         procs.insert(
             "a1".to_string(),
-            ProcState::Rows { rows: vec![proc_row("1"), proc_row("2")], signalable: true },
+            ProcState::Rows { rows: vec![proc_row("1"), proc_row("2")], signalable: true, sessions: None },
         );
         let nodes = visible_nodes(&sandboxes, &instances, &BTreeSet::new(), &expanded, &procs);
         assert_eq!(
@@ -648,7 +648,7 @@ mod tests {
         let mut procs = BTreeMap::new();
         procs.insert(
             "a1".to_string(),
-            ProcState::Rows { rows: vec![proc_row("1")], signalable: true },
+            ProcState::Rows { rows: vec![proc_row("1")], signalable: true, sessions: None },
         );
         // Sandbox collapsed → its instance and procs are hidden entirely.
         let nodes = visible_nodes(&sandboxes, &instances, &collapsed(&["a"]), &expanded, &procs);

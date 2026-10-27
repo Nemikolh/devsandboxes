@@ -889,7 +889,7 @@ pub struct Process {
     pub args: String,
 }
 
-/// A running instance's processes and its helper's runs.
+/// A running instance's processes and its helper's runs and sessions.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProcsListing {
     pub processes: Vec<Process>,
@@ -898,6 +898,9 @@ pub struct ProcsListing {
     pub signalable: bool,
     /// Oldest first; none when the helper is missing or predates runs.
     pub runs: Vec<crate::runtime::procs::Run>,
+    /// The helper's sessions; absent when it's missing or predates them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sessions: Option<crate::runtime::procs::SessionCount>,
 }
 
 /// One instance's entry in `instances.procs`: its listing, or why there's
@@ -938,10 +941,10 @@ fn instances_procs(
 }
 
 /// `container`'s listing from the runtime: `ps` in it (or `top` outside),
-/// then its helper's runs. A stopped container says so rather than
+/// then its helper's runs and session count. A stopped container says so rather than
 /// quoting the runtime's exec error.
 fn fetch_procs(container: &str) -> Result<ProcsListing, String> {
-    use crate::runtime::procs::{parse_runs, parse_top, run_ls};
+    use crate::runtime::procs::{count_sessions, parse_runs, parse_top, run_ls, session_ls};
     let backend = crate::runtime::backend();
     if let Ok(Some(false)) = backend.is_running(container) {
         return Err("not running".to_string());
@@ -950,7 +953,8 @@ fn fetch_procs(container: &str) -> Result<ProcsListing, String> {
     let processes =
         parse_top(&list.text).into_iter().map(|(pid, ppid, args)| Process { pid, ppid, args }).collect();
     let runs = run_ls(container).map(|text| parse_runs(&text)).unwrap_or_default();
-    Ok(ProcsListing { processes, signalable: list.container_pids, runs })
+    let sessions = session_ls(container).map(|text| count_sessions(&text));
+    Ok(ProcsListing { processes, signalable: list.container_pids, runs, sessions })
 }
 
 #[derive(Deserialize)]
@@ -1956,6 +1960,7 @@ mod tests {
                 started: "2026-09-21T14:13:20Z".into(),
                 argv: "sh -c x".into(),
             }],
+            sessions: Some(crate::runtime::procs::SessionCount { running: 2, detached: 1 }),
         }
     }
 
@@ -1975,6 +1980,7 @@ mod tests {
                     "processes": [{"pid": "1", "ppid": "0", "args": "sleep 9"}],
                     "signalable": true,
                     "runs": [{"id": "1790000000-a1b2", "state": "exited 4", "started": "2026-09-21T14:13:20Z", "argv": "sh -c x"}],
+                    "sessions": {"running": 2, "detached": 1},
                 },
                 "off": {"error": "not running"},
                 "nope": {"error": "no instance `nope`"},
@@ -2250,6 +2256,8 @@ mod tests {
         assert_matches("ProcsListing", &v(&listed));
         assert_matches("ProcessRow", &v(&listed.processes[0]));
         assert_matches("RunRow", &v(&listed.runs[0]));
+        assert_matches("SessionCount", &v(&listed.sessions.unwrap()));
+        assert_matches("ProcsListing", &v(&ProcsListing { sessions: None, ..listing("1") }));
         assert_matches("ProcsError", &v(&InstanceProcs::Failed { error: "not running".into() }));
         assert_eq!(union_members("InstanceProcs"), ["ProcsListing", "ProcsError"]);
         assert_matches("BuildLogTail", &v(&crate::build_log::Tail { text: "t".into(), cut: false }));

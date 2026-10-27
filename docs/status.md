@@ -18,9 +18,9 @@ limitation means editing this file in the same commit.
 
 ## Planned
 
-- **helper**: cleanup of `exec` sessions: prune ended/`lost` session
-  dirs, show detached sessions in the dashboard, a policy for sessions
-  nobody reattaches to (`devsbd/src/sessions.rs`).
+- **helper**: `exec` sessions after fleet step 1: surfacing detached
+  sessions beyond the procs-fetched rows (maybe an Inbox note), a policy
+  for sessions nobody reattaches to (`devsbd/src/sessions.rs`).
   → [plan](plans/active/resumable-exec.md)
 
 - **helper**: host → in-container daemon requests (an `RPC` channel),

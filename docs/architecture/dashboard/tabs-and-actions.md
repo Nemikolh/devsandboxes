@@ -79,7 +79,14 @@ every 5 s (`PROC_TICK`), one request at a time and only on the Instances
 tab. `proc_state` turns each answer into a `ps --forest`-style
 `ProcState::Rows` (then up to 5 tracked `devsbd run` rows, `run` in the
 pid column) or a placeholder `Message`. `is_agent` counts coding-agent
-processes by argv basename (`AGENT_NAMES`) for Detail.
+processes by argv basename (`AGENT_NAMES`) for Detail. The answer's
+helper session count rides on `ProcState::Rows` (`sessions`,
+`App::session_count`): Detail shows `sessions: N (M detached)`
+(`ui.rs` `sessions_line`, the detached part only when some are), and the
+instance's tree row a `▣N` badge of the running ones (`SESSION_BADGE`,
+yellow while some are detached) when the count is above zero. Only
+fetched instances (expanded or selected, running) have a count; the
+others show none, as with a helper predating sessions.
 
 On a process row only navigation and signals apply: `t` SIGTERM, `K`
 SIGKILL, sent as `instances.signal`, and only when the rows are

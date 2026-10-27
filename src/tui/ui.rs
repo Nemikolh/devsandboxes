@@ -1738,7 +1738,7 @@ fn draw_instances(frame: &mut Frame, app: &App, area: Rect) {
             (None, None) => "loading…".to_string(),
         };
         draw_empty(frame, table_area, panel_focused, &message);
-        draw_detail(frame, snapshot, None, None, &app.machines, detail_area, panel_focused);
+        draw_detail(frame, snapshot, None, None, None, &app.machines, detail_area, panel_focused);
         selectable(app, RegionId::InstancesTree, table_area);
         selectable(app, RegionId::Detail, detail_area);
     } else {
@@ -1753,11 +1753,18 @@ fn draw_instances(frame: &mut Frame, app: &App, area: Rect) {
             }
             _ => None,
         };
+        let sessions = match selected {
+            Some(Node::Instance(i)) | Some(Node::Proc { instance: i, .. }) => {
+                snapshot.instances.get(i).and_then(|r| app.session_count(&super::remote::instance_key(r)))
+            }
+            _ => None,
+        };
         draw_detail(
             frame,
             Some(snapshot),
             selected,
             agent_count,
+            sessions,
             &app.machines,
             detail_area,
             panel_focused,
@@ -1901,6 +1908,7 @@ fn tree_cells<'a>(app: &App, snapshot: &'a Snapshot, node: Node, show_type: bool
                 inst,
                 instance_status_label(app, inst),
                 app.inbox.needs_you_for(&inst.instance_id),
+                app.session_count(&super::remote::instance_key(inst)),
                 super::data::dispatcher_label(inst, &snapshot.instances),
                 show_type.then(|| {
                     let group = super::data::group_of(&snapshot.sandboxes, inst);
@@ -1994,7 +2002,10 @@ fn source_folder_cell(sb: &SandboxRow) -> Line<'static> {
 }
 
 /// `unread`: the instance's Inbox threads waiting on the user (needs-you
-/// threads + unread notify records), shown as a yellow `✉N` after the name. `owner`: a dispatcher child's dim
+/// threads + unread notify records), shown as a yellow `✉N` after the name.
+/// `sessions`: the cached helper session count ([`App::session_count`]), a
+/// [`SESSION_BADGE`]`N` of the running ones when any, yellow while some are
+/// detached, else dim. `owner`: a dispatcher child's dim
 /// `⇠ <dispatcher>` suffix (`data::dispatcher_label`). `kind`: the TYPE cell,
 /// `None` when that column is hidden. `status`: the STATUS text
 /// ([`instance_status_label`]).
@@ -2002,6 +2013,7 @@ fn instance_tree_row(
     r: &InstanceRow,
     status: &str,
     unread: usize,
+    sessions: Option<crate::runtime::procs::SessionCount>,
     owner: Option<String>,
     kind: Option<&'static str>,
 ) -> (Vec<Cell<'static>>, Style) {
@@ -2020,6 +2032,10 @@ fn instance_tree_row(
     let mut name = vec![Span::raw(format!("  {}", r.name))];
     if unread > 0 {
         name.push(Span::styled(format!(" ✉{unread}"), Style::default().fg(Color::Yellow)));
+    }
+    if let Some(s) = sessions.filter(|s| s.running > 0) {
+        let style = if s.detached > 0 { Style::default().fg(Color::Yellow) } else { Style::default().add_modifier(Modifier::DIM) };
+        name.push(Span::styled(format!(" {SESSION_BADGE}{}", s.running), style));
     }
     if let Some(owner) = owner {
         name.push(Span::styled(format!(" {owner}"), Style::default().add_modifier(Modifier::DIM)));
@@ -2042,6 +2058,9 @@ fn instance_tree_row(
     let style = if r.done { Style::default().add_modifier(Modifier::DIM) } else { Style::default() };
     (cells, style)
 }
+
+/// The tree-row badge before an instance's running session count.
+const SESSION_BADGE: &str = "▣";
 
 /// The STATUS of a row whose machine isn't connected (docs/architecture/daemon/machines.md):
 /// its last known row, styled like `missing`.
@@ -2132,6 +2151,7 @@ fn draw_detail(
     snapshot: Option<&Snapshot>,
     node: Option<Node>,
     agent_count: Option<usize>,
+    sessions: Option<crate::runtime::procs::SessionCount>,
     machines: &[crate::serve::snapshots::SnapshotMachine],
     area: Rect,
     term_focused: bool,
@@ -2152,7 +2172,7 @@ fn draw_detail(
         | (Some(s), Some(Node::Proc { instance: i, .. })) => match s.instances.get(i) {
             Some(r) => {
                 let mut lines = machine_detail(machines, r.machine.as_deref());
-                lines.extend(instance_detail(r, agent_count));
+                lines.extend(instance_detail(r, agent_count, sessions));
                 lines
             }
             None => Vec::new(),
@@ -2220,7 +2240,11 @@ fn machine_detail(machines: &[crate::serve::snapshots::SnapshotMachine], machine
     vec![Line::from(Span::styled(text, Style::default().fg(Color::Red)))]
 }
 
-fn instance_detail(r: &InstanceRow, agent_count: Option<usize>) -> Vec<Line<'_>> {
+fn instance_detail(
+    r: &InstanceRow,
+    agent_count: Option<usize>,
+    sessions: Option<crate::runtime::procs::SessionCount>,
+) -> Vec<Line<'_>> {
     let mut lines: Vec<Line> = Vec::new();
     // First, so the panel's few rows never clip it: what failed and why.
     if let Some(PhaseRow::Failed { step, error }) = &r.phase {
@@ -2237,6 +2261,7 @@ fn instance_detail(r: &InstanceRow, agent_count: Option<usize>) -> Vec<Line<'_>>
         kv("remoteEnv", &r.remote_env_len.to_string()),
         agents_line(r, agent_count),
     ]);
+    lines.extend(sessions_line(r, sessions));
     if r.worktree {
         lines.push(kv2("base", &r.base_folder, "worktree", &r.folder));
     } else {
@@ -2272,6 +2297,23 @@ fn agents_line(r: &InstanceRow, agent_count: Option<usize>) -> Line<'static> {
         Span::styled("agents: ", Style::default().add_modifier(Modifier::DIM)),
         Span::styled(text, style),
     ])
+}
+
+/// The `sessions: N (M detached)` Detail line for a running instance whose
+/// helper answered a count; none otherwise (stopped, not fetched yet, or a
+/// helper predating sessions). The detached part is yellow and only there
+/// when some are.
+fn sessions_line(r: &InstanceRow, sessions: Option<crate::runtime::procs::SessionCount>) -> Option<Line<'static>> {
+    let s = sessions.filter(|_| matches!(r.status, ContainerStatus::Running(_)))?;
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let mut spans = vec![
+        Span::styled("sessions: ", dim),
+        Span::styled(s.running.to_string(), if s.running == 0 { dim } else { Style::default() }),
+    ];
+    if s.detached > 0 {
+        spans.push(Span::styled(format!(" ({} detached)", s.detached), Style::default().fg(Color::Yellow)));
+    }
+    Some(Line::from(spans))
 }
 
 /// `key: value` with a dim key.
@@ -3110,6 +3152,33 @@ mod tests {
         assert_eq!(style(0), Style::default().fg(Color::Red).add_modifier(Modifier::BOLD));
         assert_eq!(style(1), Style::default().fg(Color::Yellow));
         assert_eq!(style(2), Style::default().fg(Color::Green));
+    }
+
+    /// A cached session count puts a badge on the tree row (none at zero or
+    /// unknown) and a `sessions:` line in the selected instance's Detail.
+    #[test]
+    fn session_counts_show_in_the_tree_and_detail() {
+        use crate::runtime::procs::SessionCount;
+        let mut app = phase_app(vec![("web", running(), None), ("idle", running(), None), ("old", running(), None)]);
+        let rows = |sessions| ProcState::Rows { rows: Vec::new(), signalable: true, sessions };
+        app.procs.insert("web".into(), rows(Some(SessionCount { running: 2, detached: 1 })));
+        app.procs.insert("idle".into(), rows(Some(SessionCount::default())));
+        app.procs.insert("old".into(), rows(None));
+        app.on_key(KeyEvent::from(KeyCode::Down)); // onto `web`
+        let screen = render(&app, 140, 30);
+        let line = |name: &str| screen.lines().find(|l| l.contains(&format!("  {name} "))).unwrap().to_string();
+        assert!(line("web").contains(&format!("  web {SESSION_BADGE}2 ")), "{screen}");
+        assert!(!line("idle").contains(SESSION_BADGE), "{screen}");
+        assert!(!line("old").contains(SESSION_BADGE), "{screen}");
+        assert!(screen.contains("sessions: 2 (1 detached)"), "{screen}");
+
+        let r = &app.snapshot.as_ref().unwrap().instances[0];
+        let text = |l: Line| l.spans.iter().map(|s| s.content.to_string()).collect::<String>();
+        assert_eq!(sessions_line(r, Some(SessionCount { running: 1, detached: 0 })).map(text).as_deref(), Some("sessions: 1"));
+        assert!(sessions_line(r, None).is_none(), "an old helper: no line");
+        let mut stopped = r.clone();
+        stopped.status = ContainerStatus::Missing;
+        assert!(sessions_line(&stopped, Some(SessionCount::default())).is_none());
     }
 
     /// Un-acked identity notes put a yellow line above the table, in both

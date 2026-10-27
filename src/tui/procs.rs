@@ -18,10 +18,11 @@ pub struct ProcRow {
 /// (not fetched yet, container not running, or a fetch error). `signalable` is
 /// true when the rows' pids are container-namespace (from `exec ps`), so the
 /// SIGTERM/SIGKILL shortcuts can target them; false for a host-side `top`
-/// fallback (see [`ProcList`](super::super::runtime::ProcList)).
+/// fallback (see [`ProcList`](super::super::runtime::ProcList)). `sessions`:
+/// the helper's session count, `None` when it didn't answer one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProcState {
-    Rows { rows: Vec<ProcRow>, signalable: bool },
+    Rows { rows: Vec<ProcRow>, signalable: bool, sessions: Option<crate::runtime::procs::SessionCount> },
     Message(String),
 }
 
@@ -157,7 +158,7 @@ pub fn proc_state(entry: crate::serve::api::InstanceProcs) -> ProcState {
             let triples = listing.processes.into_iter().map(|p| (p.pid, p.ppid, p.args)).collect();
             let mut rows = build_forest(triples);
             rows.extend(run_rows(&listing.runs));
-            ProcState::Rows { rows, signalable: listing.signalable }
+            ProcState::Rows { rows, signalable: listing.signalable, sessions: listing.sessions }
         }
         InstanceProcs::Failed { error } => ProcState::Message(format!("(processes unavailable: {error})")),
     }
@@ -214,6 +215,7 @@ mod tests {
             processes: vec![p("1", "0", "init"), p("7", "1", "claude")],
             signalable: true,
             runs: runs("1790000000-a1b2 running 2026-09-21T14:13:20Z sleep 9"),
+            sessions: Some(crate::runtime::procs::SessionCount { running: 1, detached: 1 }),
         };
         assert_eq!(
             proc_state(InstanceProcs::Listed(listing)),
@@ -224,10 +226,11 @@ mod tests {
                     ProcRow { pid: RUN_PID.into(), depth: 0, args: "1790000000-a1b2 running sleep 9".into() },
                 ],
                 signalable: true,
+                sessions: Some(crate::runtime::procs::SessionCount { running: 1, detached: 1 }),
             }
         );
-        let top = ProcsListing { processes: vec![p("660011", "1", "x")], signalable: false, runs: Vec::new() };
-        assert!(matches!(proc_state(InstanceProcs::Listed(top)), ProcState::Rows { signalable: false, .. }));
+        let top = ProcsListing { processes: vec![p("660011", "1", "x")], signalable: false, runs: Vec::new(), sessions: None };
+        assert!(matches!(proc_state(InstanceProcs::Listed(top)), ProcState::Rows { signalable: false, sessions: None, .. }));
         assert_eq!(
             proc_state(InstanceProcs::Failed { error: "not running".into() }),
             ProcState::Message("(processes unavailable: not running)".into())

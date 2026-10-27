@@ -119,7 +119,7 @@ root, so scripts run with `SH` (`/bin/sh` by absolute path) and
 `runtime::bounded::run`: a child with stdout capped (past the cap it is
 killed, `truncated` set), stderr capped, and a wall-clock timeout (killed and
 reaped, whole process group on unix). For host calls whose output or duration
-a container controls: dispatcher run ops, `devsbd run ls`, the dispatch
+a container controls: dispatcher run ops, `devsbd run ls` / `session ls`, the dispatch
 `devsandbox` subprocess. Silent, so safe under the TUI.
 
 ## procs
@@ -127,7 +127,10 @@ a container controls: dispatcher run ops, `devsbd run ls`, the dispatch
 `runtime::procs` (unix-only) is what the daemon's `instances.procs` answers
 from: `parse_top` (the `ps -eo pid,ppid,args` listing), `parse_runs` and
 `run_ls` (the helper's `devsbd run ls`, bounded to 64 KiB / 5 s; any failure
-means "no runs"). The dashboard's process forest lives in `tui::procs`.
+means "no runs"), `count_sessions` and `session_ls` (the helper's `devsbd
+session ls` under the same bounds, counted as running and detached
+`SessionCount`; any failure means no count). The dashboard's process forest
+lives in `tui::procs`.
 
 ## events
 

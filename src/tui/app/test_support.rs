@@ -231,7 +231,7 @@ pub(super) fn expand_with_rows(app: &mut App, instance: &str, pids: &[&str]) {
         .collect();
     app.expanded_procs.insert(instance.to_string());
     app.procs
-        .insert(instance.to_string(), ProcState::Rows { rows, signalable: true });
+        .insert(instance.to_string(), ProcState::Rows { rows, signalable: true, sessions: None });
 }
 
 /// Select the single process row of `inst0`, returning the app ready to act.
