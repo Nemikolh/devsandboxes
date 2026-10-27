@@ -285,10 +285,10 @@ limitation means editing this file in the same commit.
   (`lend on` ↔ `drain` keeps the current one), and nothing on the hub acts
   on it until placement (step 3b; live lending state in the snapshot is
   step 1g). → [fleet](architecture/daemon/fleet.md#lending-lend); `fleet::lender::transition`
-- A placed config isn't checked against a worker policy yet (step 1e): a
-  config under the fleet root may bind-mount any host path, run
-  privileged or mount the runtime socket.
-  → [fleet](architecture/daemon/fleet.md#the-worker-table); `fleet::lent::admit`
+- Under the worker policy a placed instance's plain `devsbd notify`
+  messages (not threads, which need `inbox`) still reach the worker's
+  Inbox and desktop.
+  → [fleet](architecture/daemon/fleet.md#worker-policy); `inbox::decide`
 - On a `Worker` connection, `containers.*` reach only instances'
   containers (not a fleet root's service containers), and an isolated
   service row's `containers` aren't cut to lent instances.

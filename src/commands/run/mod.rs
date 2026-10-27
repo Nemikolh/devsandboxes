@@ -106,6 +106,9 @@ pub fn run(
     };
     let sandbox = config.resolve_sandbox(&sandbox_name)?;
     let props = &sandbox.properties;
+    // Under a fleet root: refused before anything is done, on the host or
+    // the runtime (`materialize` checks again for `rebuild`).
+    crate::worker_policy::enforce(dir, |p| p.check_config(dir, &config, &sandbox))?;
 
     let ignored = props.ignored();
     if !ignored.is_empty() {
@@ -119,6 +122,8 @@ pub fn run(
         .join(folder)
         .canonicalize()
         .with_context(|| format!("sandbox folder `{folder}` does not exist"))?;
+    // Before its worktree: host git writes into the base repo.
+    crate::worker_policy::enforce(dir, |p| p.check_path(&folder, "`folder`"))?;
     let basename = folder
         .file_name()
         .context("sandbox folder has no basename")?
@@ -506,6 +511,12 @@ pub(crate) fn materialize(
     tracker: &mut Tracker,
 ) -> Result<()> {
     let props = &sandbox.properties;
+    // The worker policy's config checks (`run` made them too; `rebuild`
+    // comes straight here), then `folder`, before anything touches it.
+    crate::worker_policy::enforce(dir, |p| {
+        p.check_config(dir, config, sandbox)?;
+        p.check_path(folder, "`folder`")
+    })?;
     // Not the prompt (that's the verb client's, on a terminal): this line is
     // what every other path gets (off a TTY, `--json`, the dispatcher's
     // subprocesses, autostart), and a skipped prompt too. stderr only.
@@ -561,6 +572,9 @@ pub(crate) fn materialize(
     // Extra workspace roots (`folders`): bind-mounted at their container path
     // and listed in the generated `.code-workspace` after the primary folder.
     let extra_folders = resolve_folders(dir, &var_ctx, &workspace, props)?;
+    crate::worker_policy::enforce(dir, |p| {
+        extra_folders.iter().try_for_each(|f| p.check_path(&f.host, &format!("`folders` entry `{}`", f.target)))
+    })?;
 
     // initializeCommand runs on the host, before anything is created.
     if let Some(cmd) = &props.initialize_command {
@@ -1134,6 +1148,9 @@ fn run_container(
     args.push(image);
     args.extend(container_command());
 
+    // The worker policy's authority: this argv is everything the runtime
+    // gets (features' mounts and `privileged`, identity, caches).
+    crate::worker_policy::enforce_argv(dir, &args)?;
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     backend().run_checked(&arg_refs)?;
     Ok(())
@@ -1562,6 +1579,11 @@ mod tests {
     /// `run` reads and writes `state.toml` and may reach the serve daemon,
     /// and neither may be the user's. Env is process-wide, hence the child.
     fn isolated(child: &str) -> Result<(), String> {
+        isolated_with(child, &[])
+    }
+
+    /// [`isolated`] with `env` set on the child too.
+    fn isolated_with(child: &str, env: &[(&str, &str)]) -> Result<(), String> {
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -1579,6 +1601,7 @@ mod tests {
             .env("XDG_DATA_HOME", root.join("data"))
             .env("XDG_RUNTIME_DIR", root.join("runtime"))
             .env_remove("SSH_AUTH_SOCK")
+            .envs(env.iter().copied())
             .output()
             .unwrap();
         let _ = std::fs::remove_dir_all(&root);
@@ -1586,6 +1609,78 @@ mod tests {
         assert!(out.status.success(), "child `{child}` failed:\n{text}");
         assert!(text.contains("1 passed"), "child `{child}` did not run:\n{text}");
         Ok(())
+    }
+
+    /// A config under a fleet root (`<data>/devsandbox/fleet/<hub>/`, here or
+    /// through a symlink) asking for `privileged` is refused by `run` before
+    /// any runtime call: the child has no runtime on its `PATH`, so a call
+    /// would fail with another error, and nothing is recorded. Allowed in
+    /// `lend.toml`, `run` gets past the policy (to the missing runtime).
+    #[cfg(unix)]
+    #[test]
+    fn run_under_a_fleet_root_is_refused_before_the_runtime() {
+        isolated_with("fleet_policy_child", &[("PATH", "/nonexistent"), ("DOCKER_HOST", "unix:///nonexistent")])
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fleet_policy_child() {
+        let Some(root) = isolated_root("fleet_policy_child") else { return };
+        let data = root.join("data/devsandbox");
+        let cfg = data.join("fleet/me@hub/cfg");
+        std::fs::create_dir_all(cfg.join("repo")).unwrap();
+        std::fs::write(
+            cfg.join(CONFIG_FILE),
+            "[sandbox.t]\nfolder = \"repo\"\nimage = \"alpine:3.20\"\nprivileged = true\n",
+        )
+        .unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&cfg, &link).unwrap();
+        let want = "refused by this machine's lending policy: privileged \
+                    (allow with privileged = true under [allow] in lend.toml)";
+        for dir in [&cfg, &link] {
+            let err = run(dir, Some("t".into()), None, None, None, RunExtras::default()).unwrap_err();
+            assert_eq!(format!("{err:#}"), want, "{}", dir.display());
+        }
+        assert!(State::load().unwrap().instances.is_empty(), "nothing recorded");
+
+        // `${localEnv:…}`: refused by `run`, and never expanded for a config
+        // under the root unless its name is allowed.
+        let env_cfg = data.join("fleet/me@hub/env");
+        std::fs::create_dir_all(env_cfg.join("repo")).unwrap();
+        std::fs::write(
+            env_cfg.join(CONFIG_FILE),
+            "[sandbox.t]\nfolder = \"repo\"\nimage = \"alpine:3.20\"\ncontainerEnv = { T = \"${localEnv:HOME}\" }\n",
+        )
+        .unwrap();
+        let err = run(&env_cfg, Some("t".into()), None, None, None, RunExtras::default()).unwrap_err();
+        assert!(format!("{err:#}").contains("`${localEnv:HOME}`"), "{err:#}");
+        assert!(format!("{err:#}").contains("local-env = [\"HOME\"]"), "{err:#}");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let expand = |dir: &Path| {
+            let dir = dir.to_string_lossy().into_owned();
+            let ctx = MountContext {
+                config_dir: &dir,
+                workspace_folder: "/w",
+                workspace_folder_basename: "w",
+                shared_volumes: "/sv",
+                instance: "i",
+                container_env: None,
+            };
+            substitute("${localEnv:HOME}|${localEnv:USER}", &ctx)
+        };
+        let home = std::env::var("HOME").unwrap_or_default();
+        let user = std::env::var("USER").unwrap_or_default();
+        assert_eq!(expand(&env_cfg), "${localEnv:HOME}|${localEnv:USER}");
+        assert_eq!(expand(&outside), format!("{home}|{user}"));
+        std::fs::write(data.join("lend.toml"), "[allow]\nlocal-env = [\"HOME\"]\n").unwrap();
+        assert_eq!(expand(&env_cfg), format!("{home}|${{localEnv:USER}}"));
+
+        std::fs::write(data.join("lend.toml"), "[allow]\nprivileged = true\n").unwrap();
+        let err = run(&cfg, Some("t".into()), None, None, None, RunExtras::default()).unwrap_err();
+        assert!(!format!("{err:#}").contains("lending policy"), "{err:#}");
     }
 
     /// The child's root when this process is [`isolated`]'s child for `test`.

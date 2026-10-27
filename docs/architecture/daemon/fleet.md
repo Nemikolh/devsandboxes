@@ -5,8 +5,9 @@ Machines as one pool of capacity (the plan:
 primitive the fleet's links are built on (the machines'
 [agent relay](machines.md#agent) runs on it too) and both sides of a
 worker's link: on the hub the offer, the offered registry entry and its
-dial; on the worker `lend.toml`, the lending thread, the lent API and
-`lend.*` with its CLI, `devsandbox lend` and `devsandbox fleet join|leave`
+dial; on the worker `lend.toml`, the lending thread, the lent API, the
+worker policy and `lend.*` with its CLI, `devsandbox lend` and
+`devsandbox fleet join|leave`
 ([ADR 0041](../../decisions/0041-fleet-workers-dial-their-hub.md)).
 
 Code: `src/serve/fleet/mod.rs` (`LINK`), `src/serve/fleet/link.rs`
@@ -23,7 +24,9 @@ Code: `src/serve/fleet/mod.rs` (`LINK`), `src/serve/fleet/link.rs`
 `src/commands/lend.rs` (`show`, `set_state`, `join`, `leave`, `busy`),
 `src/serve/fleet/lent.rs` (`Scope`, `decide`, `admit`, `confine_path`,
 `filter_answer`, `filter_snapshot`), `src/serve/daemon.rs`
-(`start_lending`, `Table`, `Shared::open_lent`).
+(`start_lending`, `Table`, `Shared::open_lent`), `src/worker_policy.rs`
+(`Allow`, `Policy`, `fleet_root_of`, `load_allow`, `enforce`,
+`enforce_argv`, `Refusal`).
 
 ## Link
 
@@ -142,8 +145,8 @@ lent API ([ADR 0041](../../decisions/0041-fleet-workers-dial-their-hub.md)).
   `state` (`on` | `off` | `drain`; absent is `off`), `hub` (the hub's ssh
   target, as `machine add` takes one), `name` (what this host offers itself
   as; absent is the hostname's first label, `lend::default_name`, which
-  must pass `machines::check_name`) and an `[allow]` table, the worker
-  policy's allowances (none yet). Unknown keys are ignored. `lend::load`
+  must pass `machines::check_name`) and an `[allow]` table, the
+  [worker policy](#worker-policy)'s allowances. Unknown keys are ignored. `lend::load`
   reads it (missing is not lending); `lend::check`: lending (`on`/`drain`)
   requires a `hub`, and a `hub` or `name` that's set must be valid. The
   daemon reads it at start (`daemon::start_lending`, `Lender::start`;
@@ -269,3 +272,104 @@ connection each request goes through `lent::admit` at the top of
   (`lent::filter_answer`); none left is `not-found`.
 - **Hello** on a `Worker` connection never hands the daemon off, whatever
   version it says: only a local client's newer binary replaces it.
+
+### Worker policy
+
+What a config under a fleet root may ask of the host beyond containers
+that see only what was lent (`src/worker_policy.rs`). Denied by default;
+every item has an allowance in `lend.toml`'s `[allow]`.
+
+- **Under the policy by path.** A config dir whose canonical path is
+  under `<data>/devsandbox/fleet/` (`fleet_root_of`: symlinks count where
+  they point) is under the policy of its fleet root, the first component
+  below `fleet/`, whatever process runs it: a lending daemon's verb
+  subprocess or a local CLI pointed at the dir. No flag carries it: each
+  check point calls `Policy::for_dir` (the data dir from `$XDG_DATA_HOME` /
+  `$HOME`, as `state.toml`'s) itself, and reads `[allow]` off `lend.toml`
+  next to `state.toml` (`load_allow`: that table only, so it is read
+  without `serve`; one that doesn't parse fails the verb).
+- **The final argv is the authority.** `Policy::check_run` checks the
+  `run` argv of every container right before it reaches the runtime: the
+  sandbox's in `commands::run::run_container` (after features, identity,
+  caches and mounts are merged in) and every service's in
+  `commands::services::ensure_service`, which `run`, `rebuild`, `start` and
+  `services rebuild` all create service containers through. Only the flags
+  devsandbox writes pass (`-d`, `--name`, `--label`, `-w`, `--init`,
+  `--restart`, `-e`, `--user`, `-p`, `--network-alias`, `-v`, `--mount`,
+  `--network`, `--userns`, `--security-opt`, `--privileged`), so anything
+  else (`--cap-add`, `--device`, `--pid`, `--ipc`, `--volumes-from`, a
+  combined `-it`) is refused with no allowance, as are a `-p` whose host
+  side isn't bound to loopback (`127.0.0.1:` / `[::1]:`; `publish`
+  permits it), `--userns` other than `keep-id…`, `--security-opt` other than devsandbox's own seccomp
+  profile (`seccomp-*.json` in the data dir) and networks other than
+  devsandbox's (`devsandbox-net-…`; `host` needs `host-network`). The
+  first positional is the image; what follows is its command.
+  `Policy::check_build` checks a sandbox's or service's `build` argv
+  (`commands::run::image::base_image_for`, `services::service_image`):
+  the dockerfile and the context resolve under the fleet root, `--network
+  host` needs `host-network`, and flags `build.options` could add beyond
+  `--pull`, `--no-cache`, `-q`, `--platform`, `--progress` (`--secret`,
+  `--ssh`, `--build-context`, …) are refused.
+- **Binds** (`check_bind`, `-v` with a path source and `--mount
+  type=bind`): the source is resolved as the host would (its deepest
+  existing ancestor canonicalized, a `..` in the rest refused) and must be
+  under the fleet root or a `binds` entry. A runtime socket (named
+  `docker.sock`, `podman.sock`, `containerd.sock`, one of
+  `runtime_sockets`' paths, `DOCKER_HOST`'s and `CONTAINER_HOST`'s
+  included, or a dir holding one) needs `runtime-socket`. Under the fleet
+  root, a path through `shared-volumes/` needs `shared-volumes` (or
+  `caches` for a cache's dir), one through `shared-files/` `worktree-link`.
+  Named and anonymous volumes and `tmpfs` pass; `--mount` keys beyond the
+  ones devsandbox writes (`volume-opt`, which can bind a host path) and
+  other mount types are refused.
+- **Before anything is done**: `Policy::check_config`, from `run` (right
+  after the sandbox resolves, before the runtime is called or the
+  instance recorded) and again at the top of `materialize` (so `rebuild`
+  too), refuses `initializeCommand` (it runs on the host), `dispatcher`,
+  `inbox`, `caches`, `persist-shell-history` (`shared-volumes`),
+  `worktree-link`, `privileged`, `global` services, and local features
+  whose folder, or any file in it, resolves outside the fleet root (they
+  are copied into the image's build context). `folder` and `folders`
+  hosts are checked (`check_path`) before their worktrees are made, and
+  `resolve_mounts` checks the config's `mounts` before it creates any
+  bind source. Any `${localEnv:NAME}` (or `${localEnv:NAME:default}`) in
+  the merged sandbox table (`Config::resolved_table`: templates, keys
+  included) or its services' tables is refused unless `local-env` lists
+  that exact name.
+- **`${localEnv:…}` never expands unchecked.** `config::resolve_var`, the
+  one place `${…}` variables are expanded, asks `local_env_allowed` over
+  the context's `configDir`: under a fleet root a name `local-env` doesn't
+  list (or a policy that can't be read) stays verbatim, so what no config
+  check saw (a hub's `run --branch`) gets nothing of this host's env.
+- **Services' `ports` publish on loopback.** Under the policy
+  `services::ensure_service` writes a spec without a host address
+  (`5432`, `8080:80`) as `127.0.0.1::5432` / `127.0.0.1:8080:80`
+  (`loopback_publish`) before choosing host ports, so a placed service
+  with ports works by default; one the config binds elsewhere
+  (`0.0.0.0:…`) needs `publish`. `dispatcher` and `inbox` are checked on every control
+  request too (`commands::dispatch::policy_gate`), since a config may gain
+  them after its instance exists.
+- **The refusal** (`Refusal`) names the item and its allowance:
+  `refused by this machine's lending policy: privileged (allow with
+  privileged = true under [allow] in lend.toml)`; an item no allowance
+  covers ends `(no lend.toml allowance permits it)`.
+
+| `[allow]` key | permits |
+|---|---|
+| `privileged` | `--privileged` (the sandbox's or a feature's) |
+| `runtime-socket` | a bind of a runtime socket or a dir holding one |
+| `host-network` | `--network host` on `run` or `build` |
+| `caches` | `caches` and their dirs' binds |
+| `shared-volumes` | binds under `shared-volumes/`, `persist-shell-history` |
+| `worktree-link` | `worktree-link` and its store's bind |
+| `global-services` | `scope = "global"` services |
+| `dispatcher` | `dispatcher` and its control ops |
+| `inbox` | `inbox = true` and its control ops |
+| `initialize-command` | `initializeCommand` |
+| `publish` | a published port (`-p`) beyond loopback |
+| `local-env = ["NAME", …]` | `${localEnv:NAME}` for exactly these names |
+| `binds = ["/abs", …]` | host paths outside the fleet root (and under them) for binds, build files and contexts, `folder`s and local features |
+
+The booleans default to `false`, the lists to empty; an unset allowance is
+left out of the file `lend::update` writes. `binds` entries must be
+absolute (`Allow::check`, part of `lend::check`).

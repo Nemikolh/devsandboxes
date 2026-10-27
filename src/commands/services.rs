@@ -134,6 +134,12 @@ fn ensure_service(
     service: &ResolvedService,
     labels: &[String],
 ) -> Result<()> {
+    // Every service container is created (or started) here: the worker
+    // policy's scope check, then its argv checks below.
+    let policy = crate::worker_policy::Policy::for_dir(dir)?;
+    if let Some(policy) = &policy {
+        policy.check_service(service)?;
+    }
     match backend().is_running(container)? {
         Some(running) => {
             let build = build_hash(dir, service.spec.build.as_ref());
@@ -149,10 +155,19 @@ fn ensure_service(
             }
         }
         None => {
-            let ports = prefer_same_host_ports(container, &service.spec.ports)?;
+            // Under the policy, `ports` without a host address publish on
+            // loopback only (`worker_policy::loopback_publish`).
+            let ports: Vec<String> = match &policy {
+                Some(_) => service.spec.ports.iter().map(|p| crate::worker_policy::loopback_publish(p)).collect(),
+                None => service.spec.ports.clone(),
+            };
+            let ports = prefer_same_host_ports(container, &ports)?;
             check_port_conflicts(container, &ports)?;
             let image = service_image(dir, service)?;
             let args = service_run_args(backend(), container, network, &image, service, &ports, labels);
+            if let Some(policy) = &policy {
+                policy.check_run(&args)?;
+            }
             let refs: Vec<&str> = args.iter().map(String::as_str).collect();
             backend().run_checked(&refs)?;
         }
@@ -178,6 +193,7 @@ fn service_image(dir: &Path, service: &ResolvedService) -> Result<String> {
     let tag = format!("{NAME_PREFIX}img-svc-{}", service.name);
 
     let args = build_args(backend(), dir, &tag, dockerfile, build, &format!("service `{}`", service.name));
+    crate::worker_policy::enforce_argv(dir, &args)?;
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     backend().run_checked(&refs)?;
     Ok(tag)

@@ -46,6 +46,9 @@ pub(super) fn resolve_mounts(
         .collect::<Result<Vec<_>>>()
         .with_context(|| format!("sandbox `{}`: invalid mount", sandbox.name))?;
     let resolved = last_wins_by_target(resolved);
+    // Before any source is created on the host (the argv check comes too
+    // late for that).
+    crate::worker_policy::enforce(dir, |p| resolved.iter().try_for_each(|m| p.check_mount(&m.to_arg())))?;
     let mut out = ResolvedMounts::default();
     for resolved in resolved {
         if resolved.kind == "bind" {

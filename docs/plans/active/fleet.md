@@ -6,7 +6,9 @@ Commit 1a (link primitive) shipped: `serve::fleet::link`, `channel::API`;
 kind and its dial; 1c (worker side) shipped: `lend.toml` read at start,
 the lending thread, the fleet root and the `Worker` table; 1d (CLI)
 shipped: `serve::locked_file`, `lend.get|set` applied live, `devsandbox
-lend`, `fleet join|leave`
+lend`, `fleet join|leave`; 1e (worker policy) shipped: `worker_policy`,
+detected by path (no flag), checked on the final `run` / `build` argv and
+the config, allowances in `lend.toml`'s `[allow]`
 ([fleet](../../architecture/daemon/fleet.md), ADR
 [0041](../../decisions/0041-fleet-workers-dial-their-hub.md)); the rest
 is design. Builds on [machines](../../architecture/daemon/machines.md)

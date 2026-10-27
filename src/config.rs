@@ -762,6 +762,13 @@ pub fn substitute(input: &str, ctx: &MountContext) -> String {
 
 fn resolve_var(expr: &str, ctx: &MountContext) -> Option<String> {
     if let Some(var) = expr.strip_prefix("localEnv:") {
+        // Under a fleet root the config is the hub's: the worker's env only
+        // for names `lend.toml` allows, else left verbatim (`run` refuses
+        // such a config before this, `worker_policy::Policy::check_config`;
+        // this is for what no check saw, e.g. a hub's `run --branch`).
+        if !crate::worker_policy::local_env_allowed(Path::new(ctx.config_dir), var) {
+            return None;
+        }
         // devcontainer semantics: an unset host variable expands to empty.
         return Some(std::env::var(var).unwrap_or_default());
     }

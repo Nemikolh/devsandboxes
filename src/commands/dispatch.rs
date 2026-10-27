@@ -171,7 +171,7 @@ pub trait Executor {
 /// (`devsbd::bridge`), which is unix-only.
 #[cfg_attr(not(unix), allow(dead_code))]
 pub fn handle(dispatcher_key: &str, req: &Request) -> Response {
-    match load(dispatcher_key) {
+    match load(dispatcher_key, req.op) {
         Ok((state, config)) => {
             handle_with(&state, &config, dispatcher_key, req, &mut Subprocess::new(dispatcher_key))
         }
@@ -180,8 +180,9 @@ pub fn handle(dispatcher_key: &str, req: &Request) -> Response {
 }
 
 /// State, and the config root recorded on instance `key`, as [`handle`] and
-/// [`follow`] need them.
-fn load(key: &str) -> Result<(State, Config), Response> {
+/// [`follow`] need them; under a fleet root, `op` must have the worker
+/// policy's allowance ([`policy_gate`]).
+fn load(key: &str, op: Op) -> Result<(State, Config), Response> {
     let state = State::load().map_err(|e| failed(format!("{e:#}")))?;
     let config_dir = match state.instances.get(key) {
         None => return Err(denied(format!("`{key}` is not an instance"))),
@@ -190,8 +191,27 @@ fn load(key: &str) -> Result<(State, Config), Response> {
             None => return Err(no_config_dir(key)),
         },
     };
+    policy_gate(&config_dir, op)?;
     let config = Config::load(&config_dir).map_err(|e| failed(format!("{e:#}")))?;
     Ok((state, config))
+}
+
+/// The worker policy on every request, not just at create: a config under a
+/// fleet root may gain `dispatcher` / `inbox` after its instance exists.
+/// Inbox ops need `inbox`, child ops `dispatcher`, in `lend.toml`'s
+/// `[allow]` (`worker_policy`).
+fn policy_gate(config_dir: &Path, op: Op) -> Result<(), Response> {
+    let policy = crate::worker_policy::Policy::for_dir(config_dir).map_err(|e| failed(format!("{e:#}")))?;
+    let Some(policy) = policy else { return Ok(()) };
+    let (allowed, what, key) = if is_inbox_op(op) {
+        (policy.allow.inbox, "`inbox`", "inbox")
+    } else {
+        (policy.allow.dispatcher, "`dispatcher`", "dispatcher")
+    };
+    if allowed {
+        return Ok(());
+    }
+    Err(denied(crate::worker_policy::Refusal::new(what, format!("{key} = true")).to_string()))
 }
 
 /// Serve an `events-follow` request from instance `key` on `out` (the
@@ -203,7 +223,7 @@ fn load(key: &str) -> Result<(State, Config), Response> {
 #[cfg_attr(not(unix), allow(dead_code))]
 pub fn follow(key: &str, req: &Request, out: &mut dyn Write) {
     static FOLLOWERS: Followers = Followers::new();
-    let resp = match load(key) {
+    let resp = match load(key, req.op) {
         Ok((state, config)) => {
             let exec = Subprocess::new(key);
             match follow_with(&state, &config, key, req, &exec, out, &FOLLOWERS, control::FOLLOW_PING) {

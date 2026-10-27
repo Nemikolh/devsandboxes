@@ -163,6 +163,7 @@ fn base_image_for(dir: &Path, sandbox: &ResolvedSandbox) -> Result<String> {
         build,
         &format!("sandbox `{}`", sandbox.name),
     );
+    crate::worker_policy::enforce_argv(dir, &args)?;
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     backend().run_checked(&arg_refs)?;
     Ok(tag)

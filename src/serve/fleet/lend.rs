@@ -14,6 +14,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::serve::machines::{check_name, ssh};
+use crate::worker_policy::Allow;
 
 /// Whether this host lends.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,11 +40,6 @@ impl State {
     }
 }
 
-/// What the worker policy allows beyond its defaults (fleet plan commit
-/// 1e); nothing yet.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Allowances {}
-
 /// The file. Unknown keys are ignored, as in `daemon.config.toml`: an
 /// allowance a newer binary knows is one an older one doesn't grant.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,7 +53,9 @@ pub struct Lend {
     /// of the hostname.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub name: String,
-    pub allow: Allowances,
+    /// The worker policy's allowances (`worker_policy`, which reads them
+    /// itself from this file).
+    pub allow: Allow,
 }
 
 impl Lend {
@@ -97,7 +95,7 @@ pub fn check(lend: &Lend) -> Result<()> {
     if !lend.name.is_empty() {
         check_name(&lend.name).context("`name`")?;
     }
-    Ok(())
+    lend.allow.check()
 }
 
 pub fn serialize(lend: &Lend) -> Result<String> {
@@ -181,7 +179,12 @@ mod tests {
     #[test]
     fn parses() {
         let l = parse("state = \"on\"\nhub = \"me@hub\"\nname = \"lap\"\n[allow]\n").unwrap();
-        assert_eq!(l, Lend { state: State::On, hub: "me@hub".into(), name: "lap".into(), allow: Allowances {} });
+        assert_eq!(l, Lend { state: State::On, hub: "me@hub".into(), name: "lap".into(), allow: Allow::default() });
+        let a = parse("[allow]\nprivileged = true\nbinds = [\"/srv/x\"]\nlater = true\n").unwrap().allow;
+        assert_eq!(a, Allow { privileged: true, binds: vec!["/srv/x".into()], ..Default::default() });
+        assert!(parse("[allow]\nbinds = [\"x\"]\n").is_err(), "binds are absolute");
+        // Unset allowances stay out of the file.
+        assert_eq!(serialize(&Lend { allow: a, ..Default::default() }).unwrap(), "state = \"off\"\n\n[allow]\nprivileged = true\nbinds = [\"/srv/x\"]\n");
         assert!(l.lends());
         let drain = parse("state = \"drain\"\nhub = \"hub\"\n").unwrap();
         assert!(drain.lends() && drain.name.is_empty());
