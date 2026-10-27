@@ -9,8 +9,11 @@ use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::quote;
 use syn::{Ident, ItemFn, ReturnType, parse_macro_input, punctuated::Punctuated, Token};
 
-/// A test that needs a working `docker`. `#[docker_test(helper)]` also needs
-/// the embedded devsbd helper for the host arch.
+/// A test that needs a working container runtime (the one
+/// `DEVSANDBOX_RUNTIME` selects, docker by default). `#[docker_test(helper)]`
+/// also needs the embedded devsbd helper for the host arch;
+/// `#[docker_test(docker_only)]` is out of scope (passes with a note) under
+/// any other runtime.
 ///
 /// The function takes no arguments and returns `Result<(), E: Display>`.
 /// `Err(why)` means "environment can't run this" (no network, missing host
@@ -19,12 +22,13 @@ use syn::{Ident, ItemFn, ReturnType, parse_macro_input, punctuated::Punctuated, 
 #[proc_macro_attribute]
 pub fn docker_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let flags = parse_macro_input!(attr with Punctuated::<Ident, Token![,]>::parse_terminated);
-    let mut needs = vec![quote!(Docker)];
+    let mut needs = vec![quote!(Runtime)];
     for flag in &flags {
         match flag.to_string().as_str() {
             "helper" => needs.push(quote!(Helper)),
+            "docker_only" => needs.push(quote!(DockerOnly)),
             other => {
-                let msg = format!("unknown docker_test flag `{other}` (expected `helper`)");
+                let msg = format!("unknown docker_test flag `{other}` (expected `helper` or `docker_only`)");
                 return syn::Error::new(flag.span(), msg).to_compile_error().into();
             }
         }
@@ -32,8 +36,8 @@ pub fn docker_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     gated(needs, parse_macro_input!(item as ItemFn)).into()
 }
 
-/// A test that needs the embedded devsbd helper for the host arch but not
-/// docker. Same contract as [`docker_test`].
+/// A test that needs the embedded devsbd helper for the host arch but no
+/// container runtime. Same contract as [`docker_test`].
 #[proc_macro_attribute]
 pub fn helper_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     if !attr.is_empty() {
