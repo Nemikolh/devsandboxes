@@ -387,7 +387,10 @@ pub(crate) fn remote_args(command: &Command, name: &str, root: Option<&Path>) ->
 pub(crate) const SSH_FAILED: i32 = 255;
 
 /// The helper's `NO_SESSION_EXIT` (`devsbd/src/sessions.rs`): an attach to
-/// a session that is unknown or `lost`.
+/// a session that is unknown or `lost`. Its siblings need no mirror: like
+/// every code but 255 they end [`Reconnect`]'s loop as the session's answer,
+/// with the helper's own note on stderr (`DETACHED_EXIT` 251: attached
+/// elsewhere; `VERSION_EXIT` 252: started by another devsbd, still there).
 pub(crate) const NO_SESSION_EXIT: i32 = 250;
 
 /// How long a dial must have run to count as connected: a 255 sooner, on a
@@ -1062,6 +1065,8 @@ mod tests {
         // The session is gone, or the program ended: done.
         assert_eq!(r.clone().after(NO_SESSION_EXIT, short), Next::Done { code: 250, gone: true });
         assert_eq!(r.clone().after(1, short), Next::Done { code: 1, gone: false });
+        // Another devsbd's session: there, not gone.
+        assert_eq!(r.clone().after(252, short), Next::Done { code: 252, gone: false });
         assert_eq!(backoff(1000), BACKOFF_CAP);
         assert_eq!(retry_note(1), "connection lost, reconnecting… (Ctrl-C to stop)");
         assert_eq!(retry_note(3), "reconnecting… (attempt 3)");

@@ -157,7 +157,8 @@ cwd and env the command gets, so `new` needs no `--cwd`. `exec --attach
   ones stay so an attach still gets their code: the ssh reconnect loop
   (`serve::machines::cli` `Reconnect`) re-dials after an outage and reads
   the end of a program that exited meanwhile. Nothing else prunes on its
-  own (not the daemon, `boot` or `ls`).
+  own (not the daemon, `boot` or `ls`). `meta`'s first line is `proto
+  <N>`, the session wire's `WIRE_VERSION`.
 - The supervisor (`supervise`) binds `sock`, opens a pty (`open_pty`,
   libc through `extern "C"`, per-OS ioctl numbers in `sessions::sys`) and
   runs the command on it as a session leader with the pty as its
@@ -165,8 +166,14 @@ cwd and env the command gets, so `new` needs no `--cwd`. `exec --attach
   non-blocking fds (`Supervisor::relay`): the pty is always read, its
   output queued for the client up to `OUT_CAP` and dropped past it or with
   no client, so neither the program nor the supervisor ever waits on a
-  client. One client at a time: an accepted connection takes over and the
-  previous client gets `detached`. A client's first size is applied one row
+  client. One client at a time: an accepted connection waits as `Pending`
+  (polled, non-blocking) for its first record, a `hello`; a matching one
+  takes over (`Supervisor::take_over`: the previous client gets
+  `detached`, the new one the supervisor's `hello`). A `hello` of another
+  version gets the supervisor's `hello` back and is closed, any other
+  first record is closed, and so is a connection with no `hello` after
+  `HELLO_WAIT` (2 s); none of them displaces the attached client
+  (`hello_verdict`, `Supervisor::serve_pending`). A client's first size is applied one row
   off, then as is, so the program gets `SIGWINCH` and redraws (there is no
   output log). When the command exits: `sock` removed, `ended` + `exit` /
   `signal` appended to `meta`, `exit` sent to the client, supervisor gone.
@@ -177,7 +184,12 @@ cwd and env the command gets, so `new` needs no `--cwd`. `exec --attach
   stdin it relays plain bytes and sends no size. An ended session's attach
   exits at once with its recorded code; an unknown or `lost` one, or a
   connection that ends without a record, exits `NO_SESSION_EXIT` (250);
-  one taken over exits `DETACHED_EXIT` (251); both with a note on stderr.
+  one taken over exits `DETACHED_EXIT` (251). A session started by another
+  devsbd (a supervisor keeps its binary while a newer helper is
+  installed) exits `VERSION_EXIT` (252) without displacing anyone: `join`
+  reads `meta` before dialing and refuses a `proto` other than its own, or
+  none, and a supervisor `hello` of another version ends the relay the
+  same way. Each with a note on stderr.
   A terminal nobody reads (ssh gone, the runtime keeping the exec's pty)
   never stops the client: `relay` writes output on a thread of its own,
   fed through a queue of `OUT_QUEUE` records that drops output when full,
@@ -185,9 +197,11 @@ cwd and env the command gets, so `new` needs no `--cwd`. `exec --attach
   At the end, queued output and then the note each get `TERMINAL_WAIT`,
   and `main` exits with the code (`std::process::exit`), ending a writer
   still stuck on that terminal.
-- Socket records (`Record`): `u8 tag | u32 len | payload`; `size`
-  (`u16 cols, u16 rows`) and `data` from the client, `data`, `exit`
-  (`i32`) and `detached` from the supervisor. Only the helper speaks it.
+- Socket records (`Record`): `u8 tag | u32 len | payload`; `hello` (`u8`
+  `WIRE_VERSION`, each end's first record, its encoding fixed across
+  versions), `size` (`u16 cols, u16 rows`) and `data` from the client,
+  `data`, `exit` (`i32`) and `detached` from the supervisor. Only the
+  helper speaks it.
 - `ls`: `<id> <state> <attached|detached|-> <started, UTC> <argv…>`, the
   newest `runs::MAX_LS_RUNS`, states as in `run ls`. `rm <id>`: a running
   session's command group gets SIGHUP, then SIGKILL after `HUP_WAIT`

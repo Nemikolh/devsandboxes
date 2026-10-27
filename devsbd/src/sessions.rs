@@ -20,7 +20,10 @@
 //! an attach causes.
 //!
 //! Socket wire (helper-only, both ends are this binary): records
-//! `u8 tag | u32 len (BE) | payload`, see [`Record`].
+//! `u8 tag | u32 len (BE) | payload`, see [`Record`]. Versioned
+//! ([`WIRE_VERSION`]) twice: in `meta`, checked before a client dials, and
+//! in the hello each end sends first; a new connection displaces the
+//! attached client only once its hello matches.
 
 use std::collections::VecDeque;
 use std::ffi::{CStr, OsStr, c_int};
@@ -60,6 +63,19 @@ pub const NO_SESSION_EXIT: i32 = 250;
 /// program runs on, attached elsewhere. Same family as [`NO_SESSION_EXIT`].
 pub const DETACHED_EXIT: i32 = 251;
 
+/// A client's exit code when the session was started by a devsbd speaking
+/// another [`WIRE_VERSION`] (a supervisor keeps its binary while a newer
+/// helper is installed): nothing was attached, the program runs on. Same
+/// family as [`NO_SESSION_EXIT`], and not it: the host reports 250 as the
+/// session being gone, and this one is still there.
+pub const VERSION_EXIT: i32 = 252;
+
+/// The session wire's version: in `meta` (`proto <N>`, written by
+/// [`create_with`]) and in each end's [`Record::Hello`]. Bump it on any
+/// change to the records; keep `Hello`'s own encoding as is, so any two
+/// versions can still tell they differ.
+const WIRE_VERSION: u8 = 1;
+
 /// Largest record payload either end accepts; a bigger length is a protocol
 /// error (the stream is dropped), so a bad peer can't make a reader buffer
 /// without bound.
@@ -83,6 +99,12 @@ const SIZE_POLL: Duration = Duration::from_millis(200);
 
 /// How long the supervisor tries to hand a client its final records.
 const FINAL_WRITE: Duration = Duration::from_secs(2);
+
+/// How long a new connection has to send its [`Record::Hello`] before the
+/// supervisor drops it. A client sends it first thing, so this only reaps
+/// connections that never will; the attached client stays attached
+/// meanwhile.
+const HELLO_WAIT: Duration = Duration::from_secs(2);
 
 /// Output records a client queues for its terminal before dropping more:
 /// the supervisor's [`OUT_CAP`] in its 16 KiB reads. A terminal nobody
@@ -248,13 +270,16 @@ const TAG_SIZE: u8 = 1;
 const TAG_DATA: u8 = 2;
 const TAG_EXIT: u8 = 3;
 const TAG_DETACHED: u8 = 4;
+const TAG_HELLO: u8 = 5;
 
-/// One socket record. `Size` (client → supervisor: `u16 cols, u16 rows`,
-/// BE), `Data` (both ways: terminal bytes), `Exit` (supervisor → client: the
-/// code to exit with, `i32` BE), `Detached` (supervisor → client: another
-/// client took over; empty).
+/// One socket record. `Hello` (both ways, each end's first: its
+/// [`WIRE_VERSION`], `u8`), `Size` (client → supervisor: `u16 cols, u16
+/// rows`, BE), `Data` (both ways: terminal bytes), `Exit` (supervisor →
+/// client: the code to exit with, `i32` BE), `Detached` (supervisor →
+/// client: another client took over; empty).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Record {
+    Hello(u8),
     Size { cols: u16, rows: u16 },
     Data(Vec<u8>),
     Exit(i32),
@@ -271,6 +296,7 @@ fn frame(tag: u8, payload: &[u8]) -> Vec<u8> {
 
 fn encode(record: &Record) -> Vec<u8> {
     match record {
+        Record::Hello(version) => frame(TAG_HELLO, &[*version]),
         Record::Size { cols, rows } => {
             let mut p = cols.to_be_bytes().to_vec();
             p.extend_from_slice(&rows.to_be_bytes());
@@ -298,6 +324,7 @@ fn decode(buf: &mut Vec<u8>) -> Result<Option<Record>, String> {
     }
     let p = &buf[5..5 + len];
     let record = match (buf[0], len) {
+        (TAG_HELLO, 1) => Record::Hello(p[0]),
         (TAG_SIZE, 4) => Record::Size { cols: u16::from_be_bytes([p[0], p[1]]), rows: u16::from_be_bytes([p[2], p[3]]) },
         (TAG_DATA, _) => Record::Data(p.to_vec()),
         (TAG_EXIT, 4) => Record::Exit(i32::from_be_bytes([p[0], p[1], p[2], p[3]])),
@@ -526,6 +553,37 @@ struct Client {
     sized: bool,
 }
 
+/// A new connection that hasn't said hello yet: not a client, so it
+/// displaces no one until [`hello_verdict`] says it speaks this wire.
+struct Pending {
+    sock: UnixStream,
+    inbuf: Vec<u8>,
+    /// Dropped past this ([`HELLO_WAIT`]).
+    deadline: Instant,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Verdict {
+    /// No complete first record yet.
+    Waiting,
+    /// Hello with this [`WIRE_VERSION`]: it takes over.
+    Matched,
+    /// Hello with another version: told ours, closed.
+    Mismatched,
+    /// Anything else first: closed.
+    Bad,
+}
+
+/// What a new connection's first record (off the front of `inbuf`) makes it.
+fn hello_verdict(inbuf: &mut Vec<u8>) -> Verdict {
+    match decode(inbuf) {
+        Ok(None) => Verdict::Waiting,
+        Ok(Some(Record::Hello(WIRE_VERSION))) => Verdict::Matched,
+        Ok(Some(Record::Hello(_))) => Verdict::Mismatched,
+        Ok(Some(_)) | Err(_) => Verdict::Bad,
+    }
+}
+
 struct Supervisor {
     dir: PathBuf,
     listener: UnixListener,
@@ -535,6 +593,8 @@ struct Supervisor {
     /// Client input not yet written to the pty.
     input: Vec<u8>,
     client: Option<Client>,
+    /// Connections waiting for their hello, oldest first.
+    pending: Vec<Pending>,
 }
 
 /// `session supervise`: bind `sock`, open a pty, run the command on it (cwd
@@ -556,7 +616,7 @@ fn supervise(root: &Path, id: &str) -> io::Result<()> {
     set_nonblocking(master.as_raw_fd())?;
     let spawned = spawn_on(&slave, program, rest);
     drop(slave);
-    let mut sup = Supervisor { dir: dir.clone(), listener, master, master_open: true, input: Vec::new(), client: None };
+    let mut sup = Supervisor { dir: dir.clone(), listener, master, master_open: true, input: Vec::new(), client: None, pending: Vec::new() };
     let end = match spawned {
         Ok(mut child) => {
             let pid = child.id();
@@ -634,6 +694,7 @@ impl Supervisor {
                 fds.push(pollfd(c.sock.as_raw_fd(), read | write));
                 fds.len() - 1
             });
+            let pending_at = self.push_pending(&mut fds);
             poll(&mut fds, TICK)?;
             if fds[0].revents & sys::POLLIN != 0 {
                 self.accept();
@@ -647,7 +708,7 @@ impl Supervisor {
                     self.write_master();
                 }
             }
-            // A client accepted this pass isn't in `fds`; its turn is next.
+            // Its pty read may have dropped it (a failed flush).
             if let Some(i) = client_at.filter(|_| self.client.is_some()) {
                 let ev = fds[i].revents;
                 if ev & (sys::POLLIN | sys::POLLHUP | sys::POLLERR | sys::POLLNVAL) != 0 {
@@ -657,30 +718,87 @@ impl Supervisor {
                     self.flush_client();
                 }
             }
+            // After the client's turn: one promoted now isn't in `fds` either.
+            self.serve_pending(&fds[pending_at..], &mut buf);
         }
     }
 
-    /// Accept every pending connection; each new one takes over.
+    /// Add the pending connections to `fds` (in [`Supervisor::pending`]'s
+    /// order); returns where they start.
+    fn push_pending(&self, fds: &mut Vec<sys::PollFd>) -> usize {
+        let at = fds.len();
+        fds.extend(self.pending.iter().map(|p| pollfd(p.sock.as_raw_fd(), sys::POLLIN)));
+        at
+    }
+
+    /// Accept every waiting connection as [`Pending`]: none takes over before
+    /// its hello ([`Supervisor::serve_pending`]).
     fn accept(&mut self) {
         while let Ok((sock, _)) = self.listener.accept() {
             if sock.set_nonblocking(true).is_err() {
                 continue;
             }
-            if let Some(mut old) = self.client.take() {
-                old.out.clear_unstarted();
-                old.out.push_always(encode(&Record::Detached));
-                // Blocking, bounded, off this thread: the supervisor never
-                // waits on a client, but a non-blocking write into a full
-                // socket buffer would lose `detached`.
-                std::thread::spawn(move || {
-                    let _ = old.sock.set_nonblocking(false);
-                    let _ = old.sock.set_write_timeout(Some(FINAL_WRITE));
-                    let _ = old.out.flush(&mut old.sock);
-                });
-            }
-            let _ = File::create(self.dir.join("client"));
-            self.client = Some(Client { sock, inbuf: Vec::new(), out: Out::default(), sized: false });
+            self.pending.push(Pending { sock, inbuf: Vec::new(), deadline: Instant::now() + HELLO_WAIT });
         }
+    }
+
+    /// One read from each pending connection `polled` reports ready (the
+    /// first `polled.len()` of them; later ones were accepted since), then
+    /// its verdict: a match takes over, a mismatch gets our hello and is
+    /// closed, anything bad or past its deadline is closed. Never blocks.
+    fn serve_pending(&mut self, polled: &[sys::PollFd], buf: &mut [u8]) {
+        let now = Instant::now();
+        for (i, mut p) in std::mem::take(&mut self.pending).into_iter().enumerate() {
+            let ready = polled.get(i).is_some_and(|f| f.revents != 0);
+            let verdict = if !ready {
+                Verdict::Waiting
+            } else {
+                match p.sock.read(buf) {
+                    Ok(0) => Verdict::Bad,
+                    Ok(n) => {
+                        p.inbuf.extend_from_slice(&buf[..n]);
+                        hello_verdict(&mut p.inbuf)
+                    }
+                    Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted) => {
+                        Verdict::Waiting
+                    }
+                    Err(_) => Verdict::Bad,
+                }
+            };
+            match verdict {
+                Verdict::Waiting if now < p.deadline => self.pending.push(p),
+                Verdict::Waiting | Verdict::Bad => {}
+                Verdict::Matched => self.take_over(p),
+                Verdict::Mismatched => {
+                    // A fresh socket's buffer takes 6 bytes without blocking.
+                    let _ = p.sock.write(&encode(&Record::Hello(WIRE_VERSION)));
+                    let _ = p.sock.shutdown(Shutdown::Write);
+                }
+            }
+        }
+    }
+
+    /// A connection that said hello becomes the client: the previous one gets
+    /// `detached`, the new one our hello, then whatever it sent after its own.
+    fn take_over(&mut self, p: Pending) {
+        if let Some(mut old) = self.client.take() {
+            old.out.clear_unstarted();
+            old.out.push_always(encode(&Record::Detached));
+            // Blocking, bounded, off this thread: the supervisor never
+            // waits on a client, but a non-blocking write into a full
+            // socket buffer would lose `detached`.
+            std::thread::spawn(move || {
+                let _ = old.sock.set_nonblocking(false);
+                let _ = old.sock.set_write_timeout(Some(FINAL_WRITE));
+                let _ = old.out.flush(&mut old.sock);
+            });
+        }
+        let _ = File::create(self.dir.join("client"));
+        let mut out = Out::default();
+        out.push_always(encode(&Record::Hello(WIRE_VERSION)));
+        self.client = Some(Client { sock: p.sock, inbuf: p.inbuf, out, sized: false });
+        self.client_records();
+        self.flush_client();
     }
 
     fn drop_client(&mut self) {
@@ -747,6 +865,12 @@ impl Supervisor {
             Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted) => return,
             Err(_) => return self.drop_client(),
         }
+        self.client_records();
+    }
+
+    /// Handle the client's complete records in its `inbuf`.
+    fn client_records(&mut self) {
+        let Some(c) = &mut self.client else { return };
         loop {
             match decode(&mut c.inbuf) {
                 Ok(None) => break,
@@ -771,12 +895,15 @@ impl Supervisor {
     /// the error as output (the caller then sends its `exit`).
     fn show_failure(&mut self, message: Vec<u8>) {
         let deadline = Instant::now() + FAILED_WAIT;
+        let mut buf = vec![0u8; 16 * 1024];
         while self.client.is_none() && Instant::now() < deadline {
-            let mut fds = [pollfd(self.listener.as_raw_fd(), sys::POLLIN)];
+            let mut fds = vec![pollfd(self.listener.as_raw_fd(), sys::POLLIN)];
+            let pending_at = self.push_pending(&mut fds);
             if poll(&mut fds, TICK).is_err() {
                 break;
             }
             self.accept();
+            self.serve_pending(&fds[pending_at..], &mut buf);
         }
         if let Some(c) = &mut self.client {
             c.out.push_always(frame(TAG_DATA, &message));
@@ -808,6 +935,8 @@ struct Done {
 enum Outcome {
     Exit(i32),
     Detached,
+    /// The supervisor's hello names another wire version.
+    Version(u8),
     /// The connection ended without an `exit` or `detached`.
     Lost,
 }
@@ -902,6 +1031,9 @@ fn relay(
     let writer = Arc::new(Mutex::new(writer));
     let done = Arc::new(AtomicBool::new(false));
     let send = |w: &Mutex<UnixStream>, record: &[u8]| w.lock().is_ok_and(|mut s| s.write_all(record).is_ok());
+    // First, before anything the supervisor would act on: it takes nothing
+    // from a connection, nor displaces anyone for it, before this.
+    send(&writer, &encode(&Record::Hello(WIRE_VERSION)));
     if let Some(mut size) = size {
         let mut last = size();
         if let Some((cols, rows)) = last {
@@ -973,6 +1105,8 @@ fn read_records(mut sock: &UnixStream, out: &SyncSender<Vec<u8>>) -> Outcome {
                 }
                 Ok(Some(Record::Exit(code))) => return Outcome::Exit(code),
                 Ok(Some(Record::Detached)) => return Outcome::Detached,
+                Ok(Some(Record::Hello(WIRE_VERSION))) => {}
+                Ok(Some(Record::Hello(v))) => return Outcome::Version(v),
                 Ok(Some(Record::Size { .. })) | Err(_) => return Outcome::Lost,
             }
         }
@@ -989,12 +1123,25 @@ fn no_session(id: &str, why: &str) -> Done {
     Done { code: NO_SESSION_EXIT, note: Some(format!("{why} `{id}`")) }
 }
 
+/// Session `id` speaks wire version `theirs` (`None`: from before versions
+/// were recorded), not ours.
+fn other_version(id: &str, theirs: Option<u8>) -> Done {
+    let theirs = theirs.map_or("none".to_string(), |v| v.to_string());
+    Done {
+        code: VERSION_EXIT,
+        note: Some(format!(
+            "session `{id}` was started by another devsbd (proto {theirs}, this is {WIRE_VERSION}); end it with session rm"
+        )),
+    }
+}
+
 /// A finished relay (or a connect that failed) as the client's result: the
 /// recorded end wins over a lost connection.
 fn conclude(dir: &Path, id: &str, outcome: Outcome) -> Done {
     match outcome {
         Outcome::Exit(code) => Done { code, note: None },
         Outcome::Detached => Done { code: DETACHED_EXIT, note: Some(format!("session `{id}` was attached elsewhere")) },
+        Outcome::Version(v) => other_version(id, Some(v)),
         Outcome::Lost => match ended(dir) {
             Some(state) => Done { code: exit_code(state), note: None },
             None => no_session(id, "lost the connection to session"),
@@ -1045,7 +1192,10 @@ fn attach(
 }
 
 /// Attach to session `id`, `child` its supervisor when this process just
-/// started it (`new`).
+/// started it (`new`). Before dialing, `meta`: an ended session's recorded
+/// code at once (whoever ran it); one whose `proto` isn't [`WIRE_VERSION`]
+/// (or has none) is refused with [`VERSION_EXIT`], never connected to, so
+/// its attached client stays attached.
 fn join(
     root: &Path,
     id: &str,
@@ -1055,6 +1205,16 @@ fn join(
     size: Option<SizeFn>,
 ) -> Done {
     let Ok(dir) = session_dir(root, id) else { return no_session(id, "no session") };
+    // No `meta` yet: another `new` is mid-create; `connect` waits for it as
+    // for any starting session.
+    if let Ok(meta) = runs::read_capped(&dir.join("meta"), 4 * 1024).map(|t| runs::parse_meta(&t)) {
+        if meta.ended.is_some() {
+            return Done { code: exit_code(meta.exit.unwrap_or(State::Lost)), note: None };
+        }
+        if meta.proto != Some(WIRE_VERSION) {
+            return other_version(id, meta.proto);
+        }
+    }
     match connect(&dir, child) {
         Some(sock) => conclude(&dir, id, relay(sock, input, out, size)),
         None => match ended(&dir) {
@@ -1067,7 +1227,8 @@ fn join(
 /// `session new`'s first half: create session `id` and spawn its supervisor
 /// (from `supervisor`; tests run it from the test binary) detached in `cwd`:
 /// its own session, null stdio. `Ok(None)`: the id is taken, attach to it
-/// instead. A bad `cwd` fails here, before anything runs. First, quietly,
+/// instead. A bad `cwd` fails here, before anything runs. `meta` records the
+/// [`WIRE_VERSION`] (`proto`) that `join` checks. First, quietly,
 /// [`prune_settled`].
 fn create_with(
     root: &Path,
@@ -1084,7 +1245,9 @@ fn create_with(
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Ok(None),
         Err(e) => return Err(e),
     }
-    let spawned = runs::init(&dir, argv, runs::now()).and_then(|()| {
+    // `proto` before anything else, so no attach ever reads a `meta` without it.
+    let spawned = runs::append(&dir, &format!("proto {WIRE_VERSION}\n")).and_then(|()| runs::init(&dir, argv, runs::now()));
+    let spawned = spawned.and_then(|()| {
         let mut cmd = supervisor(id);
         cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
         // SAFETY: only setsid between fork and exec. Its own session: no
@@ -1235,6 +1398,8 @@ mod tests {
     #[test]
     fn codec_round_trips_and_rejects() {
         let records = [
+            Record::Hello(WIRE_VERSION),
+            Record::Hello(255),
             Record::Size { cols: 300, rows: 2 },
             Record::Data(b"hi\x00\xff".to_vec()),
             Record::Data(Vec::new()),
@@ -1255,13 +1420,36 @@ mod tests {
         assert_eq!(got, records);
         assert!(buf.is_empty());
         assert_eq!(encode(&Record::Size { cols: 0x0102, rows: 0x0304 }), [1, 0, 0, 0, 4, 1, 2, 3, 4]);
+        // Fixed for good: every version must read another's hello.
+        assert_eq!(encode(&Record::Hello(7)), [5, 0, 0, 0, 1, 7]);
 
         let mut big = vec![TAG_DATA];
         big.extend_from_slice(&(MAX_PAYLOAD as u32 + 1).to_be_bytes());
         assert!(decode(&mut big).is_err());
         assert!(decode(&mut frame(TAG_SIZE, &[1, 2, 3])).is_err());
         assert!(decode(&mut frame(TAG_DETACHED, &[1])).is_err());
+        assert!(decode(&mut frame(TAG_HELLO, &[])).is_err());
+        assert!(decode(&mut frame(TAG_HELLO, &[1, 2])).is_err());
         assert!(decode(&mut frame(9, &[])).is_err());
+    }
+
+    #[test]
+    fn hello_verdicts() {
+        let v = |bytes: Vec<u8>| {
+            let mut buf = bytes;
+            hello_verdict(&mut buf)
+        };
+        let hello = encode(&Record::Hello(WIRE_VERSION));
+        assert_eq!(v(hello[..3].to_vec()), Verdict::Waiting);
+        assert_eq!(v(Vec::new()), Verdict::Waiting);
+        assert_eq!(v(hello.clone()), Verdict::Matched);
+        assert_eq!(v(encode(&Record::Hello(WIRE_VERSION + 1))), Verdict::Mismatched);
+        assert_eq!(v(encode(&Record::Size { cols: 80, rows: 24 })), Verdict::Bad);
+        assert_eq!(v(frame(9, &[])), Verdict::Bad);
+        // What follows the hello stays for the client.
+        let mut buf = [hello, encode(&Record::Data(b"x".to_vec()))].concat();
+        assert_eq!(hello_verdict(&mut buf), Verdict::Matched);
+        assert_eq!(decode(&mut buf), Ok(Some(Record::Data(b"x".to_vec()))));
     }
 
     #[test]
@@ -1642,6 +1830,7 @@ mod tests {
         wait_for("output with no client", || work.join("m1").exists());
         // A client that sends but never reads.
         let mut stalled = UnixStream::connect(dir.join("sock")).unwrap();
+        stalled.write_all(&encode(&Record::Hello(WIRE_VERSION))).unwrap();
         stalled.write_all(&encode(&Record::Size { cols: 80, rows: 24 })).unwrap();
         stalled.write_all(&encode(&Record::Data(b"\n".to_vec()))).unwrap();
         wait_for("output to a stalled client", || work.join("m2").exists());
@@ -1652,6 +1841,68 @@ mod tests {
         drop((stalled, child));
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&work);
+    }
+
+    /// A session of another wire version: refused from `meta` before any
+    /// dial, and a hand-made connection with another hello (or none, or a
+    /// bad first record) is answered or dropped, the attached client never
+    /// displaced. An ended session's code doesn't depend on its version.
+    #[test]
+    fn another_wire_version_never_displaces_the_attached_client() {
+        let root = temp_root("version");
+        let id = "1790000000-0001";
+        let script = "read l; echo got:$l; read l; echo got:$l; exit 8";
+        let mut a = client(&root, id, Some(start(&root, id, script)), None);
+        let dir = root.join(id);
+        wait_for("the attach", || dir.join("client").exists());
+        wait_for("the command", || meta(&root, id).pgid.is_some());
+        assert_eq!(meta(&root, id).proto, Some(WIRE_VERSION));
+
+        let real = fs::read_to_string(dir.join("meta")).unwrap();
+        let ours = format!("proto {WIRE_VERSION}\n");
+        for (text, theirs) in [(real.replace(&ours, "proto 200\n"), "proto 200"), (real.replace(&ours, ""), "proto none")] {
+            fs::write(dir.join("meta"), text).unwrap();
+            let done = client(&root, id, None, None).wait();
+            assert_eq!(done.code, VERSION_EXIT);
+            let note = done.note.unwrap();
+            assert!(note.contains(&format!("({theirs}, this is {WIRE_VERSION}); end it with session rm")), "{note}");
+        }
+        fs::write(dir.join("meta"), &real).unwrap();
+        a.send("x\n");
+        a.wait_output("got:x");
+
+        let dial = || {
+            let s = UnixStream::connect(dir.join("sock")).unwrap();
+            s.set_read_timeout(Some(HELLO_WAIT + Duration::from_secs(5))).unwrap();
+            s
+        };
+        let answer = |mut s: UnixStream| {
+            let mut got = Vec::new();
+            s.read_to_end(&mut got).expect("closed by the supervisor");
+            got
+        };
+        // Another hello: ours back, then closed.
+        let mut s = dial();
+        s.write_all(&encode(&Record::Hello(WIRE_VERSION + 1))).unwrap();
+        s.write_all(&encode(&Record::Size { cols: 80, rows: 24 })).unwrap();
+        assert_eq!(answer(s), encode(&Record::Hello(WIRE_VERSION)));
+        // A bad first record, or nothing until the deadline: closed.
+        let mut s = dial();
+        s.write_all(&encode(&Record::Data(b"y\n".to_vec()))).unwrap();
+        assert_eq!(answer(s), b"");
+        let t = Instant::now();
+        assert_eq!(answer(dial()), b"");
+        assert!(t.elapsed() >= HELLO_WAIT - Duration::from_millis(200), "{:?}", t.elapsed());
+        assert!(dir.join("client").exists(), "still attached");
+
+        a.send("z\n");
+        assert_eq!(a.wait().code, 8);
+        assert!(a.output.text().contains("got:z"), "{:?}", a.output.text());
+
+        // Ended: its code, whatever wrote it.
+        fake_session(&root, "1790000000-0002", "started 1790000000\nended 1790000001\nexit 3\n");
+        assert_eq!(client(&root, "1790000000-0002", None, None).wait(), Done { code: 3, note: None });
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// `rm` on a running session: SIGHUP ends a shell's `sleep`, the end is

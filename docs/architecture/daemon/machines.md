@@ -359,7 +359,10 @@ env's own `SSH_AUTH_SOCK` (the machine's agent, if any) stays.
   N)` per further try, re-dialed after `backoff` (1, 2, 4, 8, then 10 s,
   no limit on tries). A 255 before any dial got that far is ssh failing to
   connect: the loop ends with it. Any other code ends the loop with it;
-  `NO_SESSION_EXIT` (250) also prints that the session is gone (`gone_note`).
+  `NO_SESSION_EXIT` (250) also prints that the session is gone (`gone_note`);
+  the helper's 251 (attached elsewhere) and 252 (`VERSION_EXIT`: started
+  by another devsbd, still running) end it too, the helper's own note on
+  stderr.
   Without the helper on the remote instance `--session` is a plain exec,
   so a re-dial's `--attach` fails there (exit 1, its message on stderr)
   and ends the loop. SIGINT is only ignored while ssh runs, so Ctrl-C

@@ -403,6 +403,9 @@ pub(crate) struct Meta {
     pub(crate) pgid: Option<u32>,
     pub(crate) ended: Option<u64>,
     pub(crate) exit: Option<State>,
+    /// The session wire version its supervisor speaks (`sessions.rs`
+    /// `WIRE_VERSION`); runs never write it.
+    pub(crate) proto: Option<u8>,
 }
 
 /// Complete lines of a `meta` file; unknown keys are skipped (a newer helper
@@ -420,6 +423,7 @@ pub(crate) fn parse_meta(text: &str) -> Meta {
             "ended" => meta.ended = value.parse().ok(),
             "exit" => meta.exit = value.parse().ok().map(State::Exited),
             "signal" => meta.exit = value.parse().ok().map(State::Killed),
+            "proto" => meta.proto = value.parse().ok(),
             _ => {}
         }
     }
@@ -808,7 +812,7 @@ mod tests {
 
     #[test]
     fn meta_parsing_and_state() {
-        let m = parse_meta("started 100\nsupervisor 7\npid 8\npgid 8\nended 105\nexit 3\n");
+        let m = parse_meta("proto 1\nstarted 100\nsupervisor 7\npid 8\npgid 8\nended 105\nexit 3\n");
         assert_eq!(
             m,
             Meta {
@@ -818,6 +822,7 @@ mod tests {
                 pgid: Some(8),
                 ended: Some(105),
                 exit: Some(State::Exited(3)),
+                proto: Some(1),
             }
         );
         assert_eq!(state_of(&m, 200, |_| false), State::Exited(3));

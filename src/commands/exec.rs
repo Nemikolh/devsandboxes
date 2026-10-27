@@ -687,7 +687,7 @@ mod tests {
     #[test]
     fn reserve_255_reports_a_programs_255_as_254() {
         assert_eq!(reported_code(255, true), 254);
-        for code in [0, 1, 130, 250, 251, 254] {
+        for code in [0, 1, 130, 250, 251, 252, 254] {
             assert_eq!(reported_code(code, true), code);
         }
         assert_eq!(reported_code(255, false), 255, "off: as is");
