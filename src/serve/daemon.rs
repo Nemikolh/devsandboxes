@@ -305,6 +305,7 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
         let _ = shared.bridges.set(host.waker());
     }
     if let Some(client) = opts.helper.clone().or_else(|| host.as_ref().map(|h| helper::HelperClient::new(h.board(), log))) {
+        helper::install(client.clone());
         let _ = shared.helper.set(client);
     }
     let watcher = Watcher::spawn(&shared, host.as_ref().map(Host::changes));

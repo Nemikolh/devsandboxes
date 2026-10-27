@@ -190,6 +190,12 @@ is the one way in:
   `rpc.methods` (a bare name matches any version), asked once per bridge
   attach and cached; `false` for a helper without `RPC`.
 
+The daemon also publishes its client process-wide (`helper::install`,
+`helper::shared`) for callers running inside it without a handle: the
+dispatcher's run ops, on the bridges' control handler threads, call the
+child's `run.*` methods through it
+([dispatchers](../automations/dispatchers.md#ops)).
+
 The API reaches it through the internal `helper.call`
 ([../../reference/api.md](../../reference/api.md#helpercall)): held on its
 connection like a verb, records relayed as notifications, and a hang-up

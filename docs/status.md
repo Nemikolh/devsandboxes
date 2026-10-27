@@ -12,8 +12,8 @@ limitation means editing this file in the same commit.
 
 ## In progress
 
-- **helper / machines**: resumable-exec step 4 (now part), helper-rpc
-  steps 1-3 and 8, fleet steps 1-3, in the order of
+- **helper / machines**: helper-rpc step 8, fleet steps 1-3, in the
+  order of
   [helper-rpc](plans/active/helper-rpc.md#order-across-plans).
 
 ## Planned
@@ -299,6 +299,10 @@ limitation means editing this file in the same commit.
   never carries agent streams. → [protocol](architecture/helper/protocol.md); `known_host_caps`
 - A record the host can't decode (helper newer than the daemon) stalls the
   outbox at that record. → [bridges](architecture/helper/bridges.md); `handle_notify`
+- `devsbd boot`'s commands run without the user's supplementary groups
+  (`cmd.uid/gid` clears them), unlike `docker exec -u`; fix: switch in
+  `pre_exec` with `supplementary_groups`, as `rpc_runs::switch_user` does.
+  → [in-container](architecture/helper/in-container.md); `boot::run_spec`
 - The helper's arch is found by a blind second try, no probe.
   → [helper](architecture/helper/overview.md); `devsbd::candidates`
 
@@ -331,6 +335,11 @@ limitation means editing this file in the same commit.
 - Dispatcher lifecycle ops are serialized host-wide: one long `ensure` (up
   to 30 min) blocks every other dispatcher's `ensure`/`stop`/`rm`/`done`.
   → [dispatchers](architecture/automations/dispatchers.md); `dispatch_control` `LOCK`
+- A dispatcher's `run logs --follow` and `run wait` still poll the host with
+  short control requests (`devsbd/src/ctl.rs` `wait_once`, `follow`), though
+  the host → child leg is one held `run.wait`/`run.logs` stream; fix: a
+  streaming control op (like `events-follow`) relaying `run.logs follow`.
+  → [dispatchers](architecture/automations/dispatchers.md); `wait_once`
 
 ### dashboard
 

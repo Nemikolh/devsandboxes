@@ -56,6 +56,8 @@ pub mod code {
     /// The stream didn't start with a well-formed `call`, or its params are
     /// wrong for the method.
     pub const BAD_REQUEST: &str = "bad-request";
+    /// The method ran and failed; `message` says why (e.g. `no run `x``).
+    pub const FAILED: &str = "failed";
 }
 
 /// A `call` record.

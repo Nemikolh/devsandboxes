@@ -1,8 +1,9 @@
 //! `devsbd run start|supervise|ls|logs|wait|rm|prune`: tracked runs inside one
 //! container (docs/architecture/helper/in-container.md). A dispatcher reaches a child's
 //! runs through the host (`devsbd exec` / `devsbd run … <key>`, `ctl.rs`),
-//! which execs these commands in the child; they work by hand in the child
-//! too.
+//! which calls the child daemon's `run.*` methods (`rpc_runs.rs`, over the
+//! functions here) or execs these commands in the child; they work by hand
+//! in the child too.
 //!
 //! Each run is a directory `DIR/<id>/` (id: `control::valid_run_id`):
 //!
@@ -58,7 +59,7 @@ const MAX_ARGV_BYTES: u64 = 64 * 1024;
 const MAX_META_BYTES: u64 = 4 * 1024;
 
 /// `wait`'s default timeout, seconds.
-const DEFAULT_WAIT: u64 = 60;
+pub(crate) const DEFAULT_WAIT: u64 = 60;
 pub(crate) const POLL: Duration = Duration::from_millis(100);
 
 /// A run with neither `supervisor` nor `ended` is still starting for this
@@ -229,7 +230,7 @@ pub(crate) fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-fn run_dir(root: &Path, id: &str) -> io::Result<PathBuf> {
+pub(crate) fn run_dir(root: &Path, id: &str) -> io::Result<PathBuf> {
     let dir = root.join(id);
     if !valid_run_id(id) || !is_real_dir(&dir) {
         return Err(io::Error::new(io::ErrorKind::NotFound, format!("no run `{id}`")));
@@ -302,24 +303,37 @@ pub(crate) fn init(dir: &Path, argv: &[String], now: u64) -> io::Result<()> {
 /// record the supervisor's pid.
 fn start(root: &Path, argv: &[String], cwd: Option<&str>) -> io::Result<String> {
     let exe = std::env::current_exe()?;
-    start_with(root, argv, cwd, |id| {
-        let mut cmd = Command::new(&exe);
-        cmd.args(["run", "supervise", id]);
-        cmd
-    })
+    // This process exits right after, so the supervisor needs no reaping.
+    start_with(root, argv, cwd, |id| Ok(supervisor_cmd(&exe, id))).map(|(id, _)| id)
+}
+
+/// `<exe> run supervise <id>`: the supervisor of run `id`.
+pub(crate) fn supervisor_cmd(exe: &Path, id: &str) -> Command {
+    let mut cmd = Command::new(exe);
+    cmd.args(["run", "supervise", id]);
+    cmd
 }
 
 /// [`start`] with the supervisor command for run `id` from `supervisor`
-/// (tests run it from the test binary, over their own root).
-fn start_with(
+/// (tests run it from the test binary, over their own root; the daemon's
+/// `run.start` hands the run's dir to its user and sets user and env on it;
+/// its error deletes the run). Returns the id and the spawned supervisor,
+/// which a long-lived caller must reap.
+pub(crate) fn start_with(
     root: &Path,
     argv: &[String],
     cwd: Option<&str>,
-    supervisor: impl FnOnce(&str) -> Command,
-) -> io::Result<String> {
+    supervisor: impl FnOnce(&str) -> io::Result<Command>,
+) -> io::Result<(String, std::process::Child)> {
     let id = create(root, argv, now())?;
     let dir = root.join(&id);
-    let mut cmd = supervisor(&id);
+    let mut cmd = match supervisor(&id) {
+        Ok(cmd) => cmd,
+        Err(e) => {
+            let _ = fs::remove_dir_all(&dir);
+            return Err(e);
+        }
+    };
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -330,7 +344,7 @@ fn start_with(
     match cmd.spawn() {
         Ok(child) => {
             append(&dir, &format!("supervisor {}\n", child.id()))?;
-            Ok(id)
+            Ok((id, child))
         }
         Err(e) => {
             let _ = fs::remove_dir_all(&dir);
@@ -499,7 +513,7 @@ pub(crate) fn load_state(dir: &Path, id: &str) -> io::Result<(Meta, State)> {
 /// `meta`/`argv` can't be read are skipped. The newest are picked by name
 /// (ids start with the start time) before anything is read, so a flood of
 /// dirs costs one `lstat` each.
-fn ls(root: &Path) -> io::Result<String> {
+pub(crate) fn ls(root: &Path) -> io::Result<String> {
     let ids = run_ids(root)?;
     let mut out = String::new();
     for id in &ids[ids.len().saturating_sub(MAX_LS_RUNS)..] {
@@ -553,7 +567,7 @@ pub(crate) fn render_argv(argv: &[String]) -> String {
 
 /// `run logs`: up to `cap` bytes of the log from `offset` (none past the end,
 /// or before the command wrote anything).
-fn read_chunk(root: &Path, id: &str, offset: u64, cap: u64) -> io::Result<Vec<u8>> {
+pub(crate) fn read_chunk(root: &Path, id: &str, offset: u64, cap: u64) -> io::Result<Vec<u8>> {
     let dir = run_dir(root, id)?;
     let mut f = match File::open(dir.join("out.log")) {
         Ok(f) => f,
@@ -589,7 +603,7 @@ fn other(msg: String) -> io::Error {
 /// (its state is unknown), which `force` deletes as is. The dir is checked to
 /// be a real one (`run_dir`), and `remove_dir_all` never follows symlinks,
 /// not even a dir swapped for one in between.
-fn rm(root: &Path, id: &str, force: bool) -> io::Result<()> {
+pub(crate) fn rm(root: &Path, id: &str, force: bool) -> io::Result<()> {
     let dir = run_dir(root, id)?;
     match load_state(&dir, id) {
         Ok((_, State::Running)) if !force => {
@@ -728,7 +742,7 @@ fn prune_where(root: &Path, keep: usize, pick: impl Fn(&Meta) -> bool) -> io::Re
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn strings(v: &[&str]) -> Vec<String> {
@@ -1123,6 +1137,16 @@ mod tests {
         supervise(Path::new(&root), &id).unwrap();
     }
 
+    /// The command running [`supervisor_process`] for run `id` under `root`
+    /// from the test binary `exe` (also `rpc_runs`' tests).
+    pub(crate) fn test_supervisor(exe: &Path, root: &Path, id: &str) -> Command {
+        let mut cmd = Command::new(exe);
+        cmd.args(["--exact", "--ignored", "runs::tests::supervisor_process", id])
+            .env("DEVSBD_TEST_RUNS_ROOT", root)
+            .env("DEVSBD_TEST_RUN_ID", id);
+        cmd
+    }
+
     /// Whether `pid` is a live process (a zombie isn't: an orphan's may sit
     /// unreaped under a non-reaping PID 1).
     fn alive(pid: u32) -> bool {
@@ -1148,14 +1172,7 @@ mod tests {
         let root = temp_root("rm-kill");
         let exe = std::env::current_exe().unwrap();
         let argv = strings(&["sh", "-c", "sleep 300 & sleep 300; :"]);
-        let id = start_with(&root, &argv, None, |id| {
-            let mut cmd = Command::new(&exe);
-            cmd.args(["--exact", "--ignored", "runs::tests::supervisor_process", id])
-                .env("DEVSBD_TEST_RUNS_ROOT", &root)
-                .env("DEVSBD_TEST_RUN_ID", id);
-            cmd
-        })
-        .unwrap();
+        let (id, _) = start_with(&root, &argv, None, |id| Ok(test_supervisor(&exe, &root, id))).unwrap();
         let dir = root.join(&id);
         let t = Instant::now();
         let pgid = loop {

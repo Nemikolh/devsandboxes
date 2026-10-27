@@ -194,8 +194,9 @@ stream's bytes (`Data` boundaries mean nothing) ride length-prefixed records
 
 An unknown tag or a malformed payload is an error (both ends ship together).
 Error codes every method can answer: `unknown-method` (no such method, or
-not offered by this daemon) and `bad-request` (the stream didn't start with
-a well-formed `call`). The daemon half-closes after its last record and
+not offered by this daemon), `bad-request` (the stream didn't start with
+a well-formed `call`, or its params are wrong for the method) and `failed`
+(the method ran and failed; `message` says why). The daemon half-closes after its last record and
 reads the caller's input until its `Eof`, so a caller sends `Eof` once it
 has nothing more to send and the stream ends with both `Eof`s.
 
@@ -207,7 +208,8 @@ serde: objects (keys unique, nested at most `MAX_DEPTH` = 4), strings,
 anything else; bigger data travels as byte records.
 
 Discovery: `rpc.methods` answers `{"methods": ["rpc.methods@1", …]}`, the
-methods this daemon offers with their versions.
+methods this daemon offers with their versions. The `run.*` methods and
+their records: [in-container.md](in-container.md#runs-over-rpc).
 
 ## Line codecs
 

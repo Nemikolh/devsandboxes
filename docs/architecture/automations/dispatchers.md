@@ -11,7 +11,8 @@ Code: `src/commands/dispatch.rs` (`handle`, `handle_with`, `authorize`,
 `check_fields`, `ensure_action`, `Ensure`, `ensure_args`, `replaced_env`,
 `find_child`, `child_name`, `child_key`, `children`, `thread_children`,
 `ls`, `branches`, `holder_rows`, `Holder`, `run_op`, `helper_argv`,
-`exec_timeout`, `Executor`, `Subprocess`, `log_path`), `src/config.rs`
+`rpc_request`, `rpc_answer`, `exec_timeout`, `Executor`, `Subprocess`,
+`log_path`), `src/serve/helper.rs` (`shared`), `src/config.rs`
 (`Dispatcher`), `src/devsbd/control.rs` (`Op`, `Status`, `EXIT_*`,
 `valid_key`, `denied_env`), `src/devsbd/bridge.rs` (`dispatch_control`,
 `writes_state`), `src/commands/run/mod.rs` (`RunExtras`, `orphan_check`,
@@ -104,8 +105,8 @@ for the child's ssh-agent relay when execs there would use it. Answer:
 | `stop`, `rm` | `devsandbox stop\|rm <name>` | `{name, key, state:"stopped"}` / `{name, key, removed:true}` |
 | `done` | set `Instance.done` (idempotent, keeps the original time) | `{name, key, done:true}` |
 | `branches` | branch holders of a spawn sandbox's repo, below | JSON array |
-| `exec` | `devsbd run start -- <argv>` in the child | the helper's output (run id) |
-| `run-ls`, `run-logs`, `run-wait`, `run-rm`, `run-prune` | `devsbd run ls\|logs\|wait\|rm\|prune` in the child | the helper's output |
+| `exec` | `run.start`, or `devsbd run start -- <argv>` in the child | the run id |
+| `run-ls`, `run-logs`, `run-wait`, `run-rm`, `run-prune` | `run.ls\|logs\|wait\|rm\|prune`, or `devsbd run …` in the child | what `devsbd run …` prints |
 | `events`, `events-ack`, `events-follow`, `thread-ls` | Inbox ops, gated on `inbox = true` | [threads-and-feed](../inbox/threads-and-feed.md#events) |
 
 Lifecycle ops run as `devsandbox --in-process -C <root> <args>` subprocesses
@@ -116,15 +117,32 @@ killed after 30 min, output to `<data>/devsandbox/logs/dispatch-<unix>-<op>.log`
 those commands print and stream docker/git output to inherited stdio, and
 `--in-process` keeps them from lazy-starting a daemon.
 
-Run ops need a running child with a helper; they exec the child's own
-`devsbd` like `devsandbox exec` would (remote user, workspace, `remoteEnv`
-+ saved env), output captured and capped at `MAX_RESPONSE`, timeout 5 min
-(`run wait`: `MAX_WAIT` + 30 s). A usage error from an older helper is
-reported as "restart the child". Runs themselves:
-[in-container](../helper/in-container.md).
+Run ops need a running child with a helper, and reach it one of two ways,
+chosen per op in `run_op`:
 
-`Executor` abstracts every side effect (liveness, subprocess, exec, bridge
-wait, state writes, git, store path), so `handle_with` is tested without a
+- **RPC**, when the child's daemon lists the op's method
+  (`Executor::offers`: `HelperClient::offers`, through the running
+  daemon's client, `serve::helper::shared`, as the dispatcher's key):
+  `rpc_request` builds the params, `Executor::helper_call` collects the
+  reply records, `rpc_answer` turns them into the body the exec path
+  prints, and a helper's `error` into `in <child>: devsbd run: <message>`
+  as the exec path quotes its stderr. `run.start` carries what the exec
+  argv sets (workspace, remote user, `Instance::exec_env` +
+  `SSH_AUTH_SOCK`), so `exec` goes this way only for a child with a
+  recorded remote user; without one the runtime picks the image's `USER`,
+  which the daemon doesn't know. Same caps and timeouts as exec (a timed
+  out call is cancelled).
+- **Exec** otherwise (an older helper without `RPC`, a non-root daemon for
+  `run.start`/`rm`/`prune`, no bridge yet, no daemon): the child's own
+  `devsbd run …` (`helper_argv`) like `devsandbox exec` would (remote user,
+  workspace, `remoteEnv` + saved env), output captured and capped at
+  `MAX_RESPONSE`, timeout 5 min (`run wait`: `MAX_WAIT` + 30 s). A usage
+  error from an older helper is reported as "restart the child".
+
+Runs themselves: [in-container](../helper/in-container.md).
+
+`Executor` abstracts every side effect (liveness, subprocess, exec, RPC
+calls, the host agent probe, bridge wait, state writes, git, store path), so `handle_with` is tested without a
 runtime.
 
 ## Serialization

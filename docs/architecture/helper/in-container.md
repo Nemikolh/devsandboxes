@@ -9,7 +9,7 @@ Code: `devsbd/src/daemon.rs` (`run`, `take_over`, `Bridges::route`,
 `devsbd/src/boot.rs`, `devsbd/src/outbox.rs`, `devsbd/src/ctl.rs`,
 `devsbd/src/runs.rs`, `devsbd/src/sessions.rs`, `devsbd/src/vscode.rs`, `devsbd/src/json.rs`,
 `devsbd/src/identity.rs`, `devsbd/src/userns.rs`, `devsbd/src/browser.rs`,
-`devsbd/src/rpc_server.rs`;
+`devsbd/src/rpc_server.rs`, `devsbd/src/rpc_runs.rs`;
 `src/commands/run/mod.rs` (`container_command`, `BOOT_HOOK_LABEL`).
 
 ## Files and sockets
@@ -56,8 +56,12 @@ streams and everything else as usual.
 - **RPC**: each host-opened `Open(RPC)` stream gets a thread of its own
   (`rpc_server::accept`, the mux's `on_host_open` hook; every other
   host-opened channel is refused): it reads the `call`, runs the method
-  from `rpc_server::METHODS` and writes the reply record
-  ([protocol.md](protocol.md#rpc)). `rpc.methods` lists what this daemon
+  from `rpc_server::METHODS` and writes the reply records
+  ([protocol.md](protocol.md#rpc)). A handler (`rpc_server::Handler`)
+  writes its intermediate records (`stdout`, `event`) through
+  `rpc_server::Out` as it goes and returns the last one, so a streaming
+  method holds its one stream; `Out::gone` (the stream's peer shut both
+  ways: a `Close`, or the bridge gone) stops a waiting one early. `rpc.methods` lists what this daemon
   offers as `name@version`. Methods flagged `needs_root` (acting as another
   user) are offered only when the daemon's euid is 0, since `devsbd boot`
   starts it as the container command's user; one not offered answers
@@ -137,8 +141,45 @@ without an end, e.g. container restart). Runs stay until `rm`/`prune`.
 
 `runs::is_local` routes: with a child `<key>` positional (`run ls <key>`,
 `run logs <key> <id>`, …) the verb is a control request to the host, which
-execs the same `devsbd run …` inside the child as its remote user
-(`dispatch` `exec`/`run-*` ops); without one it acts on this container.
+calls the child's daemon's `run.*` method, or execs the same `devsbd run …`
+inside the child as its remote user where that daemon doesn't offer it
+(`dispatch` `exec`/`run-*` ops,
+[dispatchers](../automations/dispatchers.md#ops)); without one it acts on
+this container.
+
+### Runs over RPC
+
+The daemon serves the same operations as RPC methods (`rpc_runs.rs`, over
+the `runs.rs` functions), answering what the CLI prints as JSON:
+
+| method | params | records |
+|---|---|---|
+| `run.start` | `argv`, `cwd?`, `env?`, `user?` | `result {id}` |
+| `run.ls` | — | `result {runs: [line…]}`, `run ls`' lines |
+| `run.logs` | `id`, `offset?`, `follow?` | `stdout`…, `result {offset[, state]}` |
+| `run.wait` | `id`, `timeout?` (s, default 60) | `event {state}` while running, `result {state}` |
+| `run.rm` | `id`, `force?` | `result {}` |
+| `run.prune` | `keep?` | `result {removed}` |
+
+A failure is `error failed` with the CLI's message, bad params
+`bad-request`. `run.logs` without `follow` is one chunk (`MAX_CHUNK`) from
+`offset`; with it, one held stream of chunks until the run ended and its
+log is drained, then its end state. `run.wait` holds its stream until the
+run isn't running or the timeout passes (`running` then). Both poll the
+runs dir inside the container, never across the host.
+
+Who they act as: `run.start` runs the command as `user` (what `exec -u`
+gives the exec path): the fresh run dir and its files are `lchown`ed to
+that user (`rpc_runs::hand_over`), then the supervisor is spawned with its
+uid/gid, its supplementary groups from `/etc/group`
+(`boot::supplementary_groups`, set in a `pre_exec` hook:
+`rpc_runs::switch_user`) and `HOME` (+ `USER`) from passwd, over the
+daemon's env plus `env`; the daemon reaps it (`rpc_runs::reap`). `run.rm`
+and `run.prune` delete the user's dirs in the sticky runs dir (and kill its
+groups), which a daemon running as someone else can't. Those three are
+`needs_root`: a daemon `devsbd boot` started as the container user doesn't
+offer them, and the host execs them as the user instead. `run.ls`,
+`run.logs` and `run.wait` only read, and are offered by every daemon.
 
 ## Sessions: `devsbd session new|attach|ls|rm|prune`
 

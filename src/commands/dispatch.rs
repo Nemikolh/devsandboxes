@@ -20,11 +20,17 @@
 //! children"); an `ensure` that reuses a done child clears the flag, since
 //! the dispatcher is putting it back to work.
 //!
-//! Runs (`exec`, `run-ls|logs|wait`) live in the child: the host execs the
-//! child's own helper (`devsbd run start|ls|logs|wait`, `devsbd/src/runs.rs`)
-//! there, as the child's remote user in its workspace with its `remoteEnv` and
-//! saved env (the `devsandbox exec` argv), output captured, and answers with what it
-//! printed. Only owned, running children with a helper are reachable.
+//! Runs (`exec`, `run-ls|logs|wait|rm|prune`) live in the child, in its own
+//! helper (`devsbd/src/runs.rs`). When the child's daemon lists the op's
+//! `run.*` method ([`Executor::offers`]), the host calls it over the bridge
+//! ([`Executor::helper_call`], `serve::helper`); else it execs `devsbd run
+//! start|ls|logs|wait|rm|prune` there, as the child's remote user in its
+//! workspace with its `remoteEnv` and saved env (the `devsandbox exec` argv),
+//! output captured. Both paths answer the same body ([`rpc_answer`] mirrors
+//! what the CLI prints). `exec` goes over RPC only for a child with a
+//! recorded remote user: without one, the runtime picks the image's `USER`,
+//! which the daemon doesn't know. Only owned, running children with a helper
+//! are reachable.
 //!
 //! `branches` (read-only, a sandbox in `spawn`) lists the branches checked out
 //! in that sandbox's base repo, live from host `git worktree list`, each with
@@ -58,6 +64,7 @@ use serde::Serialize;
 use crate::commands::run::{instance_at, parse_worktree_list};
 use crate::config::{Config, Dispatcher, SandboxProperties};
 use crate::devsbd::control::{self, Op, Request, Response, Status};
+use crate::devsbd::rpc::{self, Obj, Record};
 use crate::inbox::{ops as inbox_ops, store, Event};
 use crate::runtime::{backend, bounded};
 use crate::state::{Instance, PhaseView, State};
@@ -124,6 +131,18 @@ pub trait Executor {
     /// workspace, `Instance::exec_env`), stdin null, output captured; `Err` only when it
     /// couldn't run at all.
     fn exec_in(&mut self, child: &Instance, command: &[String]) -> Result<ExecOutput, String>;
+    /// Whether `child`'s helper serves RPC `method` (`HelperClient::offers`).
+    /// `false` (an older or non-root daemon, no bridge yet, no host daemon)
+    /// sends the op through [`Executor::exec_in`].
+    fn offers(&mut self, child: &Instance, method: &str) -> bool;
+    /// Call RPC `method` in `child`'s helper with `params`: every reply
+    /// record, the last one included. `Err` when the call couldn't be made,
+    /// broke off, or outlived `timeout`.
+    fn helper_call(&mut self, child: &Instance, method: &str, params: Obj, timeout: Duration)
+    -> Result<Vec<Record>, String>;
+    /// Whether the host has a live ssh-agent (`exec::has_host_agent`), for
+    /// `run.start`'s `SSH_AUTH_SOCK` as `exec_in` would inject it.
+    fn host_agent(&self) -> bool;
     /// After `ensure` created or (re)started child `name`: wait (bounded) for
     /// its ssh-agent bridge when an exec there gets `SSH_AUTH_SOCK` (relay
     /// mode with a host agent), so the dispatcher's next `exec` can use ssh.
@@ -153,7 +172,9 @@ pub trait Executor {
 #[cfg_attr(not(unix), allow(dead_code))]
 pub fn handle(dispatcher_key: &str, req: &Request) -> Response {
     match load(dispatcher_key) {
-        Ok((state, config)) => handle_with(&state, &config, dispatcher_key, req, &mut Subprocess),
+        Ok((state, config)) => {
+            handle_with(&state, &config, dispatcher_key, req, &mut Subprocess::new(dispatcher_key))
+        }
         Err(resp) => resp,
     }
 }
@@ -184,7 +205,8 @@ pub fn follow(key: &str, req: &Request, out: &mut dyn Write) {
     static FOLLOWERS: Followers = Followers::new();
     let resp = match load(key) {
         Ok((state, config)) => {
-            match follow_with(&state, &config, key, req, &Subprocess, out, &FOLLOWERS, control::FOLLOW_PING) {
+            let exec = Subprocess::new(key);
+            match follow_with(&state, &config, key, req, &exec, out, &FOLLOWERS, control::FOLLOW_PING) {
                 Ok(()) => return,
                 Err(resp) => resp,
             }
@@ -799,6 +821,13 @@ fn run_op(name: &str, child: &Instance, req: &Request, exec: &mut dyn Executor) 
     if child.devsbd_arch.is_none() {
         return failed(format!("child {name} has no devsbd helper (installed on `start`)"));
     }
+    let host_agent = req.op == Op::Exec && exec.host_agent();
+    if let Some((method, params)) = rpc_request(child, req, host_agent) {
+        if exec.offers(child, method) {
+            let reply = exec.helper_call(child, method, params, exec_timeout(&helper_argv(req)));
+            return rpc_answer(name, req, reply);
+        }
+    }
     let out = match exec.exec_in(child, &helper_argv(req)) {
         Ok(out) => out,
         Err(e) => return failed(e),
@@ -821,6 +850,92 @@ fn run_op(name: &str, child: &Instance, req: &Request, exec: &mut dyn Executor) 
         _ => String::from_utf8_lossy(&out.stdout).trim_end().to_string(),
     };
     Response::new(Status::Ok, body)
+}
+
+/// The `run.*` method and params carrying run op `req` in `child` (after
+/// [`check_fields`]), as [`helper_argv`] does for exec; `None` = exec only:
+/// an `exec` in a child without a recorded remote user. `run.start` gets
+/// what the exec argv sets: the workspace, the remote user, and
+/// `Instance::exec_env` plus `SSH_AUTH_SOCK` (`host_agent`: the host has an
+/// agent, `exec::ssh_auth_sock_env`).
+fn rpc_request(child: &Instance, req: &Request, host_agent: bool) -> Option<(&'static str, Obj)> {
+    let id = || req.id.clone().expect("checked by check_fields");
+    let int = |n: u64| i64::try_from(n).unwrap_or(i64::MAX);
+    Some(match req.op {
+        Op::Exec => {
+            let user = child.remote_user.as_deref()?;
+            let mut env = child.exec_env();
+            if let Some(sock) = crate::commands::exec::ssh_auth_sock_env(child, host_agent) {
+                env.insert("SSH_AUTH_SOCK".into(), sock.to_string());
+            }
+            let params = Obj::new()
+                .with("argv", req.argv.clone())
+                .with("cwd", child.workspace.as_str())
+                .with("user", user)
+                .with("env", env.into_iter().collect::<Vec<_>>());
+            ("run.start", params)
+        }
+        Op::RunLs => ("run.ls", Obj::new()),
+        Op::RunLogs => ("run.logs", Obj::new().with("id", id()).with("offset", int(req.offset.unwrap_or(0)))),
+        Op::RunWait => {
+            let mut params = Obj::new().with("id", id());
+            if let Some(t) = req.timeout {
+                params = params.with("timeout", int(t.min(MAX_WAIT)));
+            }
+            ("run.wait", params)
+        }
+        Op::RunRm => ("run.rm", Obj::new().with("id", id()).with("force", req.force)),
+        Op::RunPrune => {
+            let mut params = Obj::new();
+            if let Some(keep) = req.keep {
+                params = params.with("keep", int(keep));
+            }
+            ("run.prune", params)
+        }
+        Op::Ensure | Op::Ls | Op::Stop | Op::Rm | Op::Done | Op::Branches | Op::Events | Op::EventsAck
+        | Op::Subscribe | Op::ThreadLs => unreachable!("not a run op"),
+    })
+}
+
+/// The response to run op `req` from its `run.*` call's `reply`: the body
+/// the exec path prints (`run start`'s id, `run ls`' lines, a
+/// [`control::logs_body`], `run wait`'s state, `removed N`), and a helper's
+/// error as the exec path quotes its stderr (`in <child>: devsbd run: …`).
+fn rpc_answer(name: &str, req: &Request, reply: Result<Vec<Record>, String>) -> Response {
+    let records = match reply {
+        Ok(records) => records,
+        Err(e) => return failed(e),
+    };
+    let mut out = Vec::new();
+    let mut last = None;
+    for rec in records {
+        match rec {
+            Record::Stdout(b) => out.extend_from_slice(&b),
+            Record::Event(_) | Record::Stderr(_) => {}
+            rec => last = Some(rec),
+        }
+    }
+    let o = match last {
+        Some(Record::Result(o)) => o,
+        Some(Record::Error { message, .. }) => return failed(format!("in {name}: devsbd run: {message}")),
+        other => return failed(format!("in {name}: devsbd answered no result ({other:?})")),
+    };
+    let body = match req.op {
+        Op::Exec => o.str("id").map(str::to_string),
+        Op::RunLs => o.strs("runs").map(|lines| lines.join("\n").trim_end().to_string()),
+        Op::RunLogs => Some(control::logs_body(req.offset.unwrap_or(0), &out)),
+        Op::RunWait => o.str("state").map(str::to_string),
+        Op::RunRm => Some(String::new()),
+        Op::RunPrune => o.int("removed").map(|n| format!("removed {n}")),
+        _ => None,
+    };
+    match body {
+        Some(body) => Response::new(Status::Ok, body),
+        None => failed(format!(
+            "in {name}: unexpected devsbd reply {}",
+            rpc::encode_json(&rpc::Json::Obj(o))
+        )),
+    }
 }
 
 pub fn child_name(sandbox: &str, key: &str) -> String {
@@ -1220,9 +1335,18 @@ fn branches(state: &State, owner_id: &str, base: &Path, ahead: bool, exec: &mut 
     }
 }
 
-/// The real executor: the runtime for liveness, a quiet `devsandbox`
-/// subprocess for everything else.
-struct Subprocess;
+/// The real executor: the runtime for liveness, the daemon's
+/// `HelperClient` for RPC calls (as `caller`, the dispatcher's state key), a
+/// quiet `devsandbox` subprocess for everything else.
+struct Subprocess {
+    caller: String,
+}
+
+impl Subprocess {
+    fn new(caller: &str) -> Subprocess {
+        Subprocess { caller: caller.to_string() }
+    }
+}
 
 /// Lines of the log quoted back in a failure response.
 const TAIL_LINES: usize = 5;
@@ -1312,6 +1436,81 @@ impl Executor for Subprocess {
             stdout: out.stdout,
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         })
+    }
+
+    fn offers(&mut self, child: &Instance, method: &str) -> bool {
+        #[cfg(unix)]
+        {
+            // An error (no bridge yet, `rpc.methods` failed) is the exec
+            // path's to report; the call is logged either way.
+            crate::serve::helper::shared()
+                .is_some_and(|c| c.offers(&child.container, method, &self.caller).unwrap_or(false))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (child, method);
+            false
+        }
+    }
+
+    fn helper_call(
+        &mut self,
+        child: &Instance,
+        method: &str,
+        params: Obj,
+        timeout: Duration,
+    ) -> Result<Vec<Record>, String> {
+        #[cfg(unix)]
+        {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            use std::sync::{mpsc, Arc};
+            let client = crate::serve::helper::shared().ok_or("no host daemon to call the child's helper")?;
+            let mut call = client
+                .call(&child.container, method, params, Obj::new(), &self.caller, &|| false)
+                .map_err(|e| format!("`{method}` in the child: {e}"))?;
+            // Bounded like `exec_in`: the child's helper picks how long it
+            // holds the stream. Dropping `done` (any return) disarms it.
+            let (done, disarmed) = mpsc::channel::<()>();
+            let timed_out = Arc::new(AtomicBool::new(false));
+            let (cancel, flag) = (call.canceller(), Arc::clone(&timed_out));
+            std::thread::spawn(move || {
+                if disarmed.recv_timeout(timeout) == Err(mpsc::RecvTimeoutError::Timeout) {
+                    flag.store(true, Ordering::SeqCst);
+                    cancel.cancel();
+                }
+            });
+            let cap = control::MAX_RESPONSE;
+            let (mut records, mut bytes) = (Vec::new(), 0);
+            loop {
+                match call.next() {
+                    Ok(Some(rec)) => {
+                        if let Record::Stdout(b) | Record::Stderr(b) = &rec {
+                            bytes += b.len();
+                            if bytes > cap {
+                                return Err(format!("`{method}` output in the child is longer than {cap} bytes"));
+                            }
+                        }
+                        records.push(rec);
+                    }
+                    Ok(None) => break,
+                    Err(_) if timed_out.load(Ordering::SeqCst) => {
+                        return Err(format!("`{method}` in the child timed out after {}", bounded::human(timeout)));
+                    }
+                    Err(e) => return Err(format!("`{method}` in the child: {e}")),
+                }
+            }
+            drop(done);
+            Ok(records)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (child, params, timeout);
+            Err(format!("`{method}` needs the host daemon"))
+        }
+    }
+
+    fn host_agent(&self) -> bool {
+        crate::commands::exec::has_host_agent()
     }
 
     fn wait_bridge(&mut self, name: &str) -> Option<String> {
@@ -1500,6 +1699,14 @@ folder = "."
         bridge_waits: Vec<String>,
         /// What `wait_bridge` answers.
         bridge_note: Option<String>,
+        /// RPC methods the children's helpers offer (none: the exec path).
+        rpc: BTreeSet<String>,
+        /// What `helper_call` answers (`fail`: an error).
+        rpc_reply: Vec<Record>,
+        /// `helper_call` calls, `(container, method, params)`.
+        rpc_calls: Vec<(String, String, Obj)>,
+        /// What `host_agent` answers.
+        agent: bool,
     }
 
     impl Fake {
@@ -1523,6 +1730,16 @@ folder = "."
         fn exec_in(&mut self, child: &Instance, command: &[String]) -> Result<ExecOutput, String> {
             self.execs.push((child.container.clone(), command.to_vec()));
             if self.fail { Err("no docker".into()) } else { Ok(self.helper.clone()) }
+        }
+        fn offers(&mut self, _: &Instance, method: &str) -> bool {
+            self.rpc.contains(method)
+        }
+        fn helper_call(&mut self, child: &Instance, method: &str, params: Obj, _: Duration) -> Result<Vec<Record>, String> {
+            self.rpc_calls.push((child.container.clone(), method.to_string(), params));
+            if self.fail { Err("`run.ls` in the child: ended: bridge gone".into()) } else { Ok(self.rpc_reply.clone()) }
+        }
+        fn host_agent(&self) -> bool {
+            self.agent
         }
         fn wait_bridge(&mut self, name: &str) -> Option<String> {
             self.bridge_waits.push(name.to_string());
@@ -1974,6 +2191,121 @@ folder = "."
         assert_eq!(call(&s, "d", &r, &mut fake), Response::new(Status::Failed, "no docker"));
     }
 
+    /// A Fake whose children's helpers offer every `run.*` method.
+    fn rpc_fake(reply: Vec<Record>) -> Fake {
+        let rpc = ["run.start", "run.ls", "run.logs", "run.wait", "run.rm", "run.prune"];
+        Fake { rpc: rpc.iter().map(|m| m.to_string()).collect(), rpc_reply: reply, ..Fake::new() }
+    }
+
+    fn ok(o: Obj) -> Record {
+        Record::Result(o)
+    }
+
+    /// The same ops as [`run_ops_exec_the_childs_helper`], over RPC: the
+    /// method and params each maps to, and the same bodies from the
+    /// records the helper's `run.*` methods answer. Nothing is exec'd.
+    #[test]
+    fn run_ops_call_the_childs_helper_when_it_offers_them() {
+        let mut s = helper_state();
+        let one = s.instances.get_mut("web-one").unwrap();
+        one.remote_user = Some("vscode".into());
+        one.remote_env = BTreeMap::from([("A".into(), "1".into())]);
+        one.ssh_auth_sock = Some("/ssh-agent".into());
+        let id = Obj::new().with("id", RUN_ID);
+        let stdout = |b: &str| Record::Stdout(b.as_bytes().to_vec());
+        let running = Record::Event(Obj::new().with("state", "running"));
+        let start = Obj::new()
+            .with("argv", argv(&["sh", "-c", "echo hi"]))
+            .with("cwd", "/workspaces/w")
+            .with("user", "vscode")
+            .with("env", vec![("A".to_string(), "1".to_string()), ("SSH_AUTH_SOCK".into(), "/ssh-agent".into())]);
+        let lines = vec!["a".to_string(), "b".into()];
+        let cases: Vec<(Request, &str, Obj, Vec<Record>, &str)> = vec![
+            (run_req(Op::Exec, "one"), "run.start", start, vec![ok(Obj::new().with("id", RUN_ID))], RUN_ID),
+            (run_req(Op::RunLs, "one"), "run.ls", Obj::new(), vec![ok(Obj::new().with("runs", lines))], "a\nb"),
+            (run_req(Op::RunLs, "one"), "run.ls", Obj::new(), vec![ok(Obj::new().with("runs", Vec::<String>::new()))], ""),
+            (run_req(Op::RunLogs, "one"), "run.logs", id.clone().with("offset", 0i64),
+             vec![stdout("ou"), stdout("t\n"), ok(Obj::new().with("offset", 4i64))], "4\nout\n"),
+            (Request { offset: Some(10), ..run_req(Op::RunLogs, "one") }, "run.logs", id.clone().with("offset", 10i64),
+             vec![stdout("x"), ok(Obj::new().with("offset", 11i64))], "11\nx"),
+            (run_req(Op::RunLogs, "one"), "run.logs", id.clone().with("offset", 0i64),
+             vec![ok(Obj::new().with("offset", 0i64))], "0\n"),
+            (run_req(Op::RunWait, "one"), "run.wait", id.clone(),
+             vec![running.clone(), ok(Obj::new().with("state", "exited 4"))], "exited 4"),
+            (Request { timeout: Some(99_999), ..run_req(Op::RunWait, "one") }, "run.wait", id.clone().with("timeout", 300i64),
+             vec![running, ok(Obj::new().with("state", "running"))], "running"),
+            (run_req(Op::RunRm, "one"), "run.rm", id.clone().with("force", false), vec![ok(Obj::new())], ""),
+            (Request { force: true, ..run_req(Op::RunRm, "one") }, "run.rm", id.clone().with("force", true), vec![ok(Obj::new())], ""),
+            (run_req(Op::RunPrune, "one"), "run.prune", Obj::new(), vec![ok(Obj::new().with("removed", 3i64))], "removed 3"),
+            (Request { keep: Some(5), ..run_req(Op::RunPrune, "one") }, "run.prune", Obj::new().with("keep", 5i64),
+             vec![ok(Obj::new().with("removed", 0i64))], "removed 0"),
+        ];
+        for (r, method, params, reply, body) in cases {
+            let mut fake = rpc_fake(reply);
+            let resp = call(&s, "d", &r, &mut fake);
+            assert_eq!(resp, Response::new(Status::Ok, body), "{r:?}");
+            assert_eq!(fake.rpc_calls, vec![("devsandbox-web-one".to_string(), method.to_string(), params)], "{r:?}");
+            assert!(fake.execs.is_empty() && fake.calls.is_empty(), "{r:?}");
+        }
+    }
+
+    /// Which path an op takes: RPC only for methods the helper lists, and
+    /// `exec` only for a child with a recorded remote user; relay mode's
+    /// `SSH_AUTH_SOCK` only with a host agent, as `exec_argv` injects it.
+    #[test]
+    fn run_ops_fall_back_to_exec_per_method() {
+        let mut s = helper_state();
+        let exec = run_req(Op::Exec, "one");
+        // No remote user (the image's `USER`): exec, though offered.
+        let mut fake = Fake { helper: helper(0, "x\n", ""), ..rpc_fake(Vec::new()) };
+        assert_eq!(call(&s, "d", &exec, &mut fake), Response::new(Status::Ok, "x"));
+        assert_eq!(fake.execs.len(), 1);
+        assert!(fake.rpc_calls.is_empty());
+        // Only `run.ls` offered: `run-prune` (an older or non-root daemon) execs.
+        let mut fake = Fake { helper: helper(0, "removed 1\n", ""), ..rpc_fake(vec![ok(Obj::new().with("runs", vec!["l".to_string()]))]) };
+        fake.rpc.retain(|m| m == "run.ls");
+        assert_eq!(call(&s, "d", &run_req(Op::RunLs, "one"), &mut fake), Response::new(Status::Ok, "l"));
+        assert_eq!(call(&s, "d", &run_req(Op::RunPrune, "one"), &mut fake), Response::new(Status::Ok, "removed 1"));
+        assert_eq!((fake.rpc_calls.len(), fake.execs.len()), (1, 1));
+
+        s.instances.get_mut("web-one").unwrap().remote_user = Some("vscode".into());
+        for agent in [false, true] {
+            let mut fake = Fake { agent, ..rpc_fake(vec![ok(Obj::new().with("id", RUN_ID))]) };
+            call(&s, "d", &exec, &mut fake);
+            let env = fake.rpc_calls[0].2.map("env").unwrap();
+            let sock = env.iter().find(|(k, _)| k == "SSH_AUTH_SOCK").map(|(_, v)| v.as_str());
+            assert_eq!(sock, agent.then_some(crate::commands::run::SSH_AGENT_TARGET), "agent {agent}");
+        }
+    }
+
+    /// [`run_op_failures`] over RPC: a helper's error reads as the exec
+    /// path quotes its stderr; a broken call or reply is a failure.
+    #[test]
+    fn rpc_run_op_failures() {
+        let s = helper_state();
+        let r = run_req(Op::RunLogs, "one");
+        let err = Record::error(rpc::code::FAILED, "no run `1790000000-a1b2`");
+        let resp = call(&s, "d", &r, &mut rpc_fake(vec![err]));
+        assert_eq!(resp, Response::new(Status::Failed, "in web-one: devsbd run: no run `1790000000-a1b2`"));
+        let busy = Record::error(rpc::code::FAILED, "run `1790000000-a1b2` is running; `--force` kills it first");
+        let resp = call(&s, "d", &run_req(Op::RunRm, "one"), &mut rpc_fake(vec![busy]));
+        assert_eq!(resp.status, Status::Failed);
+        assert!(resp.body.contains("is running; `--force`"), "{resp:?}");
+        let resp = call(&s, "d", &run_req(Op::RunLs, "one"), &mut Fake { fail: true, ..rpc_fake(Vec::new()) });
+        assert_eq!(resp, Response::new(Status::Failed, "`run.ls` in the child: ended: bridge gone"));
+        let resp = call(&s, "d", &run_req(Op::RunWait, "one"), &mut rpc_fake(Vec::new()));
+        assert!(resp.body.starts_with("in web-one: devsbd answered no result"), "{resp:?}");
+        let resp = call(&s, "d", &run_req(Op::RunWait, "one"), &mut rpc_fake(vec![ok(Obj::new())]));
+        assert_eq!(resp, Response::new(Status::Failed, "in web-one: unexpected devsbd reply {}"));
+        // The gates come first, as for exec.
+        let mut fake = rpc_fake(Vec::new());
+        let resp = call(&s, "d", &run_req(Op::RunLs, "two"), &mut fake);
+        assert!(resp.body.contains("is stopped"), "{resp:?}");
+        let resp = call(&state(), "d", &run_req(Op::RunLs, "one"), &mut fake);
+        assert!(resp.body.contains("no devsbd helper"), "{resp:?}");
+        assert!(fake.rpc_calls.is_empty());
+    }
+
     #[test]
     fn run_op_fields() {
         let s = helper_state();
@@ -1997,12 +2329,14 @@ folder = "."
             (Request { keep: Some(1), ..req(Op::Rm, None, Some("one")) }, "`rm` takes no `keep`"),
             (Request { id: Some("../x".into()), ..run_req(Op::RunRm, "one") }, "bad run id `../x`"),
         ];
+        // Checked before either path: nothing exec'd, nothing called.
         for (r, needle) in cases {
-            let mut fake = Fake::new();
-            let resp = call(&s, "d", r, &mut fake);
-            assert_eq!(resp.status, Status::Usage, "{r:?}: {resp:?}");
-            assert!(resp.body.contains(needle), "{r:?}: {resp:?}");
-            assert!(fake.execs.is_empty());
+            for mut fake in [Fake::new(), rpc_fake(Vec::new())] {
+                let resp = call(&s, "d", r, &mut fake);
+                assert_eq!(resp.status, Status::Usage, "{r:?}: {resp:?}");
+                assert!(resp.body.contains(needle), "{r:?}: {resp:?}");
+                assert!(fake.execs.is_empty() && fake.rpc_calls.is_empty());
+            }
         }
     }
 
@@ -2032,7 +2366,7 @@ folder = "."
             child.workspace = "/tmp".into();
             child.devsbd_arch = Some(arch);
             let config = Config::parse(CONFIG).unwrap();
-            let call = |r: Request| handle_with(&s, &config, "d", &r, &mut Subprocess);
+            let call = |r: Request| handle_with(&s, &config, "d", &r, &mut Subprocess::new("d"));
 
             let exec = Request {
                 argv: argv(&["sh", "-c", "echo out; pwd; exit 4"]),

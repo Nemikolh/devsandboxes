@@ -10,6 +10,7 @@ mod identity;
 mod json;
 mod listeners;
 mod outbox;
+mod rpc_runs;
 mod rpc_server;
 mod runs;
 mod sessions;

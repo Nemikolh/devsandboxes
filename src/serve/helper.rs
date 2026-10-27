@@ -47,6 +47,22 @@ const TICK: Duration = Duration::from_millis(50);
 /// close reason (the mux reports it right after the local end reads EOF).
 const REASON_WAIT: Duration = Duration::from_secs(1);
 
+/// The running daemon's client, for the callers that run inside it without a
+/// handle of their own: the dispatcher's run ops (`commands::dispatch`, on
+/// the bridges' control handler threads). Set at daemon start ([`install`]).
+static SHARED: Mutex<Option<HelperClient>> = Mutex::new(None);
+
+/// Make `client` the one [`shared`] hands out (a later daemon in the same
+/// process, as in tests, replaces it).
+pub fn install(client: HelperClient) {
+    *SHARED.lock().unwrap() = Some(client);
+}
+
+/// The running daemon's client; `None` outside a daemon.
+pub fn shared() -> Option<HelperClient> {
+    SHARED.lock().unwrap().clone()
+}
+
 /// Where calls find a container's live bridge link: the daemon's
 /// [`BridgeBoard`], or a fake in tests.
 pub trait Links: Send + Sync {
@@ -118,7 +134,6 @@ struct Inner {
     cv: Condvar,
     next_waiter: AtomicU64,
     /// Container → (the bridge attach it was asked on, `rpc.methods`' list).
-    #[allow(dead_code)] // `offers`' cache
     methods: Mutex<HashMap<String, (u64, Arc<Vec<String>>)>>,
     log: fn(&str),
 }
@@ -208,7 +223,6 @@ impl HelperClient {
     /// once per bridge attach (a call like any other, logged, by `caller`),
     /// then cached. `Ok(false)` from a helper without `RPC`: the caller
     /// falls back to `exec` as for a method it doesn't offer.
-    #[allow(dead_code)] // the dispatcher's run ops next (docs/plans/active/helper-rpc.md)
     pub fn offers(&self, container: &str, method: &str, caller: &str) -> Result<bool, CallError> {
         let link = match self.usable(container) {
             Ok(link) => link,
@@ -229,7 +243,6 @@ impl HelperClient {
     }
 
     /// `rpc.methods`, asked now: the attach it went over and the list.
-    #[allow(dead_code)] // `offers`
     fn methods_now(&self, container: &str, caller: &str) -> Result<(u64, Vec<String>), CallError> {
         let mut call = self.call(container, "rpc.methods", Obj::new(), Obj::new(), caller, &|| false)?;
         let attach = call.attach;
@@ -288,7 +301,6 @@ impl HelperClient {
 
 /// `list` (`name@version` entries) offers `method` (a bare name, or one
 /// with its version).
-#[allow(dead_code)] // `offers`
 fn offered(list: &[String], method: &str) -> bool {
     if method.contains('@') {
         list.iter().any(|m| m == method)
@@ -340,7 +352,6 @@ pub struct Call {
     cancel: Cancel,
     closed: mpsc::Receiver<String>,
     /// The bridge attach it went over (`offers`' cache key).
-    #[allow(dead_code)]
     attach: u64,
     /// The log line's outcome, once known.
     outcome: Option<String>,

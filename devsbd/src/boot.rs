@@ -112,9 +112,9 @@ impl Log {
 /// Who to run as: what `docker exec -u` would pick for the same spec.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Account {
-    name: Option<String>,
-    uid: u32,
-    gid: u32,
+    pub(crate) name: Option<String>,
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
     pub(crate) home: String,
 }
 
@@ -152,6 +152,27 @@ pub(crate) fn resolve_user(passwd: &str, group: &str, spec: &str) -> Option<Acco
         };
     }
     Some(account)
+}
+
+/// The groups `docker exec -u` gives `name` (`None`: a uid passwd doesn't
+/// know, which gets only its primary group): `primary` first, then every
+/// `/etc/group` entry (`group` contents) listing `name` as a member, each
+/// once.
+pub(crate) fn supplementary_groups(group: &str, name: Option<&str>, primary: u32) -> Vec<u32> {
+    let mut gids = vec![primary];
+    let Some(name) = name else { return gids };
+    for line in group.lines() {
+        let f: Vec<&str> = line.split(':').collect();
+        if f.len() < 4 || !f[3].split(',').any(|m| m.trim() == name) {
+            continue;
+        }
+        if let Ok(gid) = f[2].parse() {
+            if !gids.contains(&gid) {
+                gids.push(gid);
+            }
+        }
+    }
+    gids
 }
 
 /// `YYYY-MM-DDTHH:MM:SSZ` for the log header, without a date dependency.
@@ -219,6 +240,17 @@ broken:x:notanumber:1:::\n";
         assert_eq!(resolve_user(PASSWD, GROUP, "4242"), Some(account(None, 4242, 0, "/")));
         // A malformed entry doesn't match by name.
         assert_eq!(resolve_user(PASSWD, GROUP, "broken"), None);
+    }
+
+    #[test]
+    fn supplementary_groups_from_member_lists() {
+        let group = "root:x:0:\nvscode:x:1000:\ndocker:x:999:vscode,other\nwheel:x:10:other, vscode\n\
+                     dup:x:1000:vscode\nbad:x:nope:vscode\nshort:x:5\nnot:x:20:vscodex\n";
+        assert_eq!(supplementary_groups(group, Some("vscode"), 1000), [1000, 999, 10]);
+        assert_eq!(supplementary_groups(group, Some("other"), 1001), [1001, 999, 10]);
+        assert_eq!(supplementary_groups(group, Some("nobody"), 65534), [65534]);
+        assert_eq!(supplementary_groups(group, None, 0), [0], "a bare uid: its primary group only");
+        assert_eq!(supplementary_groups("", Some("vscode"), 7), [7]);
     }
 
     #[test]
