@@ -100,8 +100,8 @@ above. `devsandbox fleet join <hub>` writes it and starts offering;
 snapshot. A sleeping laptop is a dropped link (`unreachable`): placement
 skips it, re-placement (step 7) may move its children.
 
-Hub mode is a daemon setting (`hub = true` in a `serve.toml` next to
-`dashboard.toml`): the daemon never idles out, accepts offers, and
+Hub mode is a daemon setting (`hub = true` under `[serve]` in the existing
+`daemon.config.toml`, `src/daemon_config.rs`; implies `keep-alive`): the daemon never idles out, accepts offers, and
 persists remote rows (`remotes.json`) so a restarted hub shows the fleet
 before workers reconnect. `serve install` on the server keeps it up.
 
@@ -290,6 +290,122 @@ for its daemon-owned runs.
    sharing (a registry on the hub, `--cache-from`) and services that span
    machines (P10) can be revisited.
 
+## Steps 1-3 in detail
+
+Decided with the user before building (2026-10-27):
+
+1. `hub = true` in `daemon.config.toml` `[serve]`, no `serve.toml`.
+2. An offer is accepted only by a hub; ssh login to the hub is the
+   authentication (the user's own account). A worker name colliding with
+   an ssh machine is refused.
+3. `lend.toml` is written by the daemon only, through `lend.*` API calls
+   (the `machines.toml` rule); `devsandbox lend` / `fleet` are clients.
+4. A worker's fleet root is one pseudo-root on the hub; `fleet::WORKER`
+   lists the config roots under it.
+5. Step 1's acceptance test: a config copied by hand under
+   `<worker data>/devsandbox/fleet/<hub>/`, `run --machine <worker>`.
+6. Until step 4, paths that need ssh to the machine (`exec`, terminal
+   tabs, forwards, CLI re-runs) refuse on an offered machine with
+   `needs fleet step 4` wording; `logs` / `inspect` use the
+   `containers.*` quick calls.
+7. The hub always holds offered links (no `Want` / linger for them).
+8. Capacity: cpus / memory total from `docker info` (`NCPU`,
+   `MemTotal`, cached 60 s); free memory and free disk only for a native
+   Linux runtime (`/proc/meminfo`, `statvfs` of the runtime's root), else
+   unknown. VM-backed engines report the VM.
+9. Worker policy denies by default: binds outside the fleet root,
+   `privileged`, runtime socket mounts, host network, `caches`,
+   `shared-volumes`, `worktree-link`, `global` services, inbox /
+   dispatcher sockets. Allowances per worker in `lend.toml`.
+10. Self-update: the hello carries git hash + `published`; the worker
+    follows the hub's exact version (a downgrade is a forced handoff);
+    installs in place at `exe::devsandbox()`. Verified by TLS + running
+    `--version`; no checksum asset (a `release.yml` change not approved).
+11. Placement runs in the daemon.
+12. Step 3's code: the hub clones `origin` with its own credentials and
+    sends a bundle over `TRANSFER`; a worker never needs credentials.
+    Pulls a slice of step 5 forward (bundle of committed refs only).
+
+Commits (landmarks from recon; line numbers drift, trust the symbol):
+
+- **1a link primitive.** `channel::API` / `caps::API`
+  (`src/devsbd/proto.rs`) on helper-rpc step 1's flow-controlled `Open`.
+  One `serve::fleet::link` module generalizing the opener of
+  `src/commands/agent_relay.rs` `run` (bind a socket, temp name +
+  rename, each accepted connection → `Mux::attach(.., Some(channel))`)
+  and the answerer of `src/serve/machines/agent.rs` `serve` (each `Open`
+  → a local socket), sentinel and channel as parameters. Test: a
+  `client::Conn` through the mux reaches a test daemon.
+- **1b hub side.** Hidden `fleet-link --worker <name>` (`src/main.rs`,
+  like `AgentRelay`; `serve::machines::cli` `machine_use` refuses it):
+  binds `fleet-<name>.sock` in the socket dir, mux on stdio, sends
+  `fleet.offer {worker, version}` to its daemon. `machines::Entry` gets
+  a kind (`Ssh { target }` | `Offered`); every ssh argv builder refuses
+  `Offered`; the offered `Dial` is `UnixStream::connect(fleet sock)` +
+  `Duplex::socket`, so `link::handshake` (the API channel writes the
+  `devsandbox-api 1` sentinel, `relay::write_sentinel`), `forward::verb`
+  and the quick calls work unchanged. `machine ls`, the Machines tab and
+  `snapshots::SnapshotMachine` show the kind.
+- **1c worker side.** A lending thread in the worker daemon holding `ssh
+  -T -o BatchMode=yes <hub> devsandbox fleet-link --worker <name>` with
+  `service.rs`'s backoff while lending is on. `Open{API}` → socketpair →
+  `Shared::spawn_conn` (`src/serve/daemon.rs`) with a per-connection
+  table `Full | Worker { hub, root }` checked at the top of `handle`:
+  hello, subscribe, `instances.watch`/`unwatch`, the `QUICK` set
+  (`machines/forward.rs`) and verbs only; no `machine` param; every
+  `root` / `dir` under the fleet root; instance rows filtered by
+  `config_dir`; verbs' `env` replaced by the worker's own login env (as
+  `relay::SessionEnv` does for ssh). ADR 0041: workers dial the hub; a
+  hub reaches a worker only through the lent API and its policy.
+- **1d CLI.** `lend.toml` model + store (third locked atomic writer after
+  `machines::update` and `forward_store`: extract a shared helper);
+  `lend.get|set` API; `devsandbox lend on|off|drain|show`, `fleet join
+  <hub>` / `fleet leave` (drain, then off); the daemon reacts to `lend.set`
+  directly (no file watching).
+- **1e worker policy.** The verb subprocess learns its root is a fleet
+  root (hidden flag from `verbs::argv`); a pure checker over the resolved
+  config, called at `run`'s privileged decision (`commands/run/mod.rs`
+  `privileged_decision`) and before `identity::create_args`'s binds;
+  allowances from `lend.toml`; refusal names the field and the
+  allowance.
+- **1f hub mode.** `hub = true` (`daemon_config.rs`, read in
+  `daemon.rs`): never idles (`idle::decide` keep-alive), accepts offers
+  (else `fleet.offer` errors), keeps offered links wanted, saves / loads
+  `remotes.json` around `snapshots::Remotes` (rows shown `unreachable`
+  until the worker reconnects).
+- **1g capacity.** `docker info` parse gains `NCPU` / `MemTotal`
+  (`runtime/identity.rs` parser, fixture there), cached; native-Linux
+  free memory / disk; running count (`host.rs` `live_instances`) and
+  lending state into each root's snapshot and `SnapshotMachine`;
+  Machines tab columns, `over cap` note; `docs/reference/api.md`,
+  `index.d.ts`.
+- **2a `TRANSFER`.** A flow-controlled channel carrying a header line
+  (kind, name, size, sha256 of the body) then raw bytes; receiver writes
+  to a temp file and checks size + hash before rename.
+- **2b self-update.** Hello gains `git` + `published`
+  (`src/serve/proto.rs`); on a mismatch the worker fetches
+  `https://github.com/<repo>/releases/download/v<v>/devsandbox-<v>-<target>.tar.gz`
+  (curl / tar shell-out like `commands/features.rs`), installs with
+  `machines::install::INSTALL`'s steps run locally, runs `--version`,
+  then hellos its own daemon to trigger the handoff (forced, also for a
+  downgrade), and re-offers.
+- **2c dev builds.** Unpublished hub version: the hub's binary over
+  `TRANSFER` when `install::platform_matches` and `lend.toml`
+  `dev-builds = true`; else stop offering with `dev build: can't run on
+  <os>/<arch>`.
+- **3a image namespacing (P9).** `run::image::base_image_for`
+  (`devsandbox-img-<sandbox>`), the `-feat` tag, `features::build_context_dir`,
+  services' `img-svc-<service>` gain a short hash of the config root;
+  check rebuild / gc / image facts.
+- **3b `place`.** Pure `place(spec, &[Candidate]) -> Placement`,
+  soft-cap score + warnings, from 1g's capacity; `drain` the only hard no.
+- **3c placed run.** In the daemon's `run` verb: `place` when the user
+  didn't pin a machine (`--here` forces local); config root as a tar over
+  `TRANSFER` into `fleet/<hub>/roots/<hash>/`; the hub clones `origin`
+  into its repo cache and sends a bundle of the branch; the worker cuts
+  the worktree at the folder's offset relative to the config root; no
+  reachable `origin` → runs where it is, with a note.
+
 ## Open questions
 
 - Fencing in step 7: is "the worker stops the stale copy when it
@@ -305,9 +421,8 @@ for its daemon-owned runs.
   `--anywhere` until placement has earned trust?
 - Services: does a placed child's `global` service move with it, or must
   `global` services pin their dependents to one machine?
-- Worker policy defaults: is "no privileged, binds only in the fleet
-  root" too strict for the sandboxes you'd actually lend (docker-in-docker
-  features need `privileged`)? Per-sandbox allowances in `lend.toml`, or
-  per-worker only?
+- Worker policy defaults: per-worker allowances for now (decision 9);
+  per-sandbox allowances if docker-in-docker features make that too
+  coarse.
 - One hub per worker, or may a laptop lend to several hubs (one fleet
   root each)?

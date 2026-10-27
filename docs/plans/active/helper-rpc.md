@@ -201,10 +201,125 @@ Each ships alone; 1-3 already fix "runs depend on a host exec".
    supervisor's one-client takeover applies to it like to any other).
    Done before [fleet](fleet.md) step 4, after steps 1-3 here.
 
+## Step details (1-3, 8)
+
+From recon; line numbers drift, trust the symbol. Corrections to the
+design above, found in the code:
+
+- **`Open` streams have no flow control.** Only `Connect` gets
+  `Entry::Flow` (window credit, `Eof`); an `Open` is `Entry::Legacy`,
+  its `Data` written inline on the frame reader (`src/devsbd/mux.rs`
+  `serve_with`). One slow consumer stalls the link, keepalive included.
+- **The daemon isn't always root**: the host starts it `exec -u root`
+  (`src/devsbd.rs`), the bridge's self-heal spawn too, but `devsbd boot`
+  starts it as the container command's user (`devsbd/src/boot.rs`).
+- **Run ops already run in `serve`**: `dispatch::handle` is called on
+  serve's bridge threads (`dispatch_control`, `src/devsbd/bridge.rs`);
+  `Subprocess::exec_in` runs `<runtime> exec` from serve. Only
+  `Executor::devsandbox` (ensure/stop/rm) is a subprocess.
+- **No shared handle to a container's mux**: managed `Bridges` belong to
+  the worker thread (`spawn_worker`); the mux sits in the private
+  `Bridge.forward` `OnceLock`.
+- **The helper has no JSON encoder** and `devsbd/src/json.rs` only
+  extracts top-level strings.
+
+### Step 1: transport
+
+- `src/devsbd/proto.rs`: `channel::RPC = 5`, `caps::RPC = 1 << 5`; also
+  into the helper bridge's `OWN_CAPS` (`devsbd/src/bridge.rs`), else the
+  host never sees the bit; the daemon's `Hello` caps in `serve_bridge`
+  (`devsbd/src/daemon.rs`).
+- **Flow-controlled `Open`**: an `Open` on a channel registered as
+  flowing creates `Entry::Flow` (same window/`Eof` path as `Connect`:
+  `start_flow`, `flow_pump`, `flow_writer`), on both sides. Legacy
+  channels (`SSH_AGENT`, `HTTP_PROXY`, `NOTIFY`, `CONTROL`) unchanged.
+  Bump `proto::VERSION` if the frame semantics change (pre-1.0, both ends
+  same version). [fleet](fleet.md) step 1a reuses this for `API` and
+  `TRANSFER`.
+- Host-opened `Open` (high-bit ids): `serve_with` today accepts only
+  container ids on `Open`; add an `on_host_open(channel, stream)` hook
+  admitting high-bit ids under `connect_allowed` / `MAX_HOST_STREAMS`.
+  The daemon passes a handler for `RPC` only.
+- `src/devsbd/rpc.rs` (shared via `#[path]`, `devsbd/src/main.rs` and
+  `src/devsbd.rs`, `#[allow(dead_code)]` for one-sided items): record
+  codec per the envelope table, plus a small flat JSON object
+  encoder/decoder (strings, ints, bools, string arrays, string maps:
+  enough for `run.start`'s argv/env), std only, fixture tests compiled in
+  both crates (model: `bootfile.rs` `FIXTURE`).
+- Helper handler `devsbd/src/rpc_server.rs`: one thread per stream,
+  `rpc.methods` (model: `FEATURES`, `devsbd/src/main.rs`), unknown method
+  → `error`.
+- The daemon advertises `caps::RPC` always; methods that need to act as
+  another user (`run.start`, `session.*`) are listed by `rpc.methods` only
+  when the daemon's euid is 0. The host falls back per method.
+- Tests: mux (`open_with_high_bit_is_refused` gets a per-channel
+  counterpart, `connect_id_policy`, `flow_pair_with`,
+  `credit_overrun_closes_only_that_stream` for `Open`), daemon caps,
+  `own_caps` in `src/devsbd/bridge.rs`, the codec fixture.
+- Docs: `docs/architecture/helper/protocol.md` (channels, caps, stream
+  kinds), `docs/architecture/helper/in-container.md`.
+
+### Step 2: `HelperClient` in `serve`
+
+- A registry container → (`Arc<Mux>`, peer caps) shared from the bridge
+  worker: on `BridgeBoard` (already shared with the API's `Waker`,
+  `src/serve/host.rs`), published where `attach_with` sets
+  `hs_forward`, removed on detach.
+- `Mux::open_host(channel)` (model: `Mux::connect`: high-bit id,
+  `Entry::Flow`, frame, `start_flow`), wrapped like `Bridge::connect`
+  (caps check → `Unsupported`).
+- `HelperClient` (new `src/serve/helper.rs`): `call(container, method,
+  params) -> Stream`, cancel = `Close`, per-container concurrency limit
+  under `MAX_HOST_STREAMS`, one log line per call (method, caller,
+  outcome), `meta.caller` stamped.
+- `helper.call`: connection-level like verbs (`src/serve/daemon.rs`
+  `handle` → `verb`), internal: not in `npm/devsandboxes/index.d.ts`
+  (like `bridges.ensure`), documented in `docs/reference/api.md`.
+- Tests: `src/devsbd/bridge.rs` (`service_pair`), `src/serve/api.rs`
+  fakes.
+- Docs: `docs/architecture/helper/bridges.md` (host → container),
+  `docs/reference/api.md`.
+
+### Step 3: runs over RPC
+
+- Helper methods `run.start/ls/rm/prune/logs/wait` on `runs.rs`
+  (`start_with`, `ls`, `read_chunk`, `wait`, `rm`, `prune`); `run.logs`
+  with `follow` and `run.wait` are one held stream each (events, then
+  `result`). `run.start` params carry what `exec_argv_with` passes today
+  (user, cwd, env incl. `SSH_AUTH_SOCK`); the root daemon drops to that
+  user (`CommandExt::uid/gid`, `HOME`/`USER`, like `boot.rs`).
+- `src/commands/dispatch.rs`: `Executor::helper_call` beside `exec_in`;
+  `run_op` uses it when the child's helper lists the method, else
+  `helper_argv` + `exec_in` as today (incl. `run rm|prune`). The `Fake`
+  executor keeps the decision tests.
+- The dispatcher → host leg (`devsbd/src/ctl.rs` `wait_once`, `follow`)
+  stays per-poll CONTROL for now; noted in `docs/status.md`.
+- Tests: `dispatch.rs` (`run_ops_exec_the_childs_helper`,
+  `run_op_failures`, `run_op_fields`), `runs.rs`, `rpc_server.rs`.
+- Docs: `docs/architecture/automations/dispatchers.md`, `in-container.md`,
+  `bridges.md`.
+
+### Step 8: sessions over RPC
+
+- `session.attach {id, create?: {argv, cwd, env, user}}`: the daemon is a
+  session client (`devsbd/src/sessions.rs` `join` → `connect` →
+  `relay`, which takes `impl Read` / `&mut dyn Write` / a size fn: feed
+  RPC `stdin` and `resize` in, `stdout` out; skip `terminal`'s raw-mode
+  wrapper). End records: `exit` (code, `128+n` for signals as today),
+  `error` `no-session` | `detached` | `version`.
+- `create` from a root daemon must start the supervisor as `user` (else
+  the session and its `sock` are root's). Root only (step 1's rule).
+- `session.ls` / `session.rm` on `sessions::ls` / `rm`.
+- Tests: `sessions.rs` (`echo_round_trip_and_exit_codes`,
+  `a_new_attach_takes_over` with an RPC client), `rpc_server.rs`.
+- Docs: `in-container.md` (*Sessions*: who attaches),
+  `protocol.md`.
+
 ## Order across plans
 
 1. [resumable-exec](resumable-exec.md) step 4, "now" part.
-2. [fleet](fleet.md) steps 1-3, alongside steps 1-3 here.
+2. Step 1 here first (fleet's link needs its flow-controlled `Open`),
+   then steps 2-3 here and [fleet](fleet.md) steps 1-3.
 3. Step 8 here (`session.attach`).
 4. Fleet step 4 (`PTY` over the RPC stream).
 5. Steps 4-5 here (daemon-owned runs, restart policy), before fleet step

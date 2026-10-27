@@ -236,6 +236,96 @@ it, but the client process lingers. Check on Linux whether docker/podman
 close that pty; if not, the client needs a bounded write (or the
 supervisor a way to signal it).
 
+The "now" part ships as four commits (4a-4d). Landmarks are from recon
+(line numbers drift; trust the symbol).
+
+### Step 4a: `session prune`
+
+- `devsbd session prune [--keep N]` (`devsbd/src/sessions.rs` `parse` /
+  `Cmd` / `USAGE`) on `runs::prune(root, keep)` (`devsbd/src/runs.rs`,
+  make it `pub(crate)`; already root-parameterized, skips running dirs,
+  goes on past another user's dir in the sticky 1777 dir).
+- Automatic, quiet prune in `create_with` (before `create_dir`, errors
+  ignored), as the session's own user: every `lost` dir, and ended dirs
+  whose `ended` is older than a few minutes (a constant with a doc
+  comment). The age guard matters: `join` returns an ended session's
+  recorded code, which the ssh reconnect loop (backoff up to 10 s,
+  `serve::machines::cli`) relies on when the program ends during an
+  outage. Needs an age-aware variant next to `runs::prune`; runs'
+  behavior and tests stay unchanged.
+- Fixes: `ls` lists only the newest `runs::MAX_LS_RUNS`, so ended dirs
+  piling up hide an old live session from `ls` and from `exec --attach`'s
+  pick list (`src/commands/exec.rs` `detached_sessions`).
+- Not in the daemon, `boot` or `ls` (the daemon may run as root; `ls`
+  stays read-only).
+- Tests in `sessions.rs` `mod tests` (model: `runs.rs`
+  `prune_keeps_the_newest_ended_runs_and_never_running_ones`,
+  `fake_run`), `parses_forms`.
+- Docs: `docs/architecture/helper/in-container.md` *Sessions*.
+
+### Step 4b: a displaced client never blocks
+
+- Today `read_records` (`sessions.rs`) writes pty output with a blocking
+  `write_all` on the same thread that reads the socket, so a stalled
+  stdout means `detached`/`exit` are never read; the supervisor's
+  `Supervisor::accept` sends `Detached` once, non-blocking, then drops the
+  old socket, so a full socket buffer loses it (the client then reports
+  `NO_SESSION_EXIT`, not `DETACHED_EXIT`).
+- Fix in the client: the socket reader hands output to a writer thread
+  through a bounded queue and drops when full (the supervisor already
+  drops past `OUT_CAP`), so records always arrive. On the outcome:
+  restore the terminal, write the note with a bounded wait (thread + ~1 s
+  or skip), `std::process::exit(code)` (ends a stuck writer). No signals,
+  no new libc calls.
+- Test: extend `a_new_attach_takes_over` with a first client whose `out`
+  blocks forever (like `Sink`, stalled): it still exits `DETACHED_EXIT`.
+- Docs: `in-container.md` (client bullet); drop the review note above.
+
+### Step 4c: session wire version
+
+- Today a new client meeting an old supervisor is bad twice:
+  `Supervisor::accept` displaces the attached client before reading
+  anything, then the unknown record drops the new one (`Lost`, 250).
+- `create_with` writes `proto <N>` into `meta` (`runs::Meta` gets the
+  field; `parse_meta` already skips unknown keys). `join`/`connect` check
+  it before dialing; missing or different → refuse without connecting:
+  `session <id> was started by another devsbd (proto X, this is Y); end it
+  with session rm`.
+- `TAG_HELLO` (`u8` version) as the client's first record; the supervisor
+  checks it before `accept` displaces anyone, answers or closes. Guards
+  future versions inside the wire.
+- `VERSION_EXIT = 252`, same family as `NO_SESSION_EXIT` (250) /
+  `DETACHED_EXIT` (251). Not 250: the host prints "gone" for 250.
+  `serve::machines::cli::Reconnect` already ends on it; a comment by its
+  `NO_SESSION_EXIT` mirror. `src/commands/exec.rs`'s code-list test.
+- Tests: codec (new tag), refusal without displacing an attached
+  `TestClient`.
+- Docs: `in-container.md` (records, exit codes),
+  `docs/architecture/daemon/machines.md` where it lists 250/251.
+
+### Step 4d: session count in `instances.procs`
+
+- Not in the snapshot (`snapshot::InstanceRow` is built without
+  per-instance execs; a count there costs an exec per running instance
+  per poll).
+- `src/runtime/procs.rs`: `session_ls` next to `run_ls` (same bound and
+  `None` on failure, e.g. an old helper), a pure parser/count of `session
+  ls` lines (state is the 2nd word). `ProcsListing` (`src/serve/api.rs`)
+  gains `sessions` (running, detached), `#[serde(default)]`;
+  `fetch_procs` fills it. `npm/devsandboxes/index.d.ts` `ProcsListing`
+  (checked by `src/serve/dts.rs` via the api test).
+- Dashboard: carried with the procs rows (`src/tui/procs.rs`
+  `ProcState::Rows` or beside it), a `sessions: N (M detached)` Detail
+  line (model: `App::agent_count` → `ui.rs` `agents_line`) and a tree-row
+  badge in `instance_tree_row` when cached. Only expanded / selected
+  running instances are fetched (`app/procs.rs` `proc_fetch_targets`), so
+  others show none: accepted.
+- Tests: the parser, the dts conformance, `app/procs.rs` (model:
+  `agent_count_counts_agent_rows_in_cache`), ui.
+- Docs: `docs/reference/api.md` (`instances.procs`),
+  `docs/architecture/dashboard/tabs-and-actions.md`,
+  `docs/architecture/runtimes.md` where it describes the procs listing.
+
 ## Open questions
 
 - **Detach key**: a key (dtach's `Ctrl-\`) that leaves the session running

@@ -12,7 +12,9 @@ limitation means editing this file in the same commit.
 
 ## In progress
 
-(none)
+- **helper / machines**: resumable-exec step 4 (now part), helper-rpc
+  steps 1-3 and 8, fleet steps 1-3, in the order of
+  [helper-rpc](plans/active/helper-rpc.md#order-across-plans).
 
 ## Planned
 
