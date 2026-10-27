@@ -14,7 +14,8 @@ Code: `src/runtime/identity.rs` (`Identity`, `Accounts`, `plan`, `Plan`,
 `apply_outcome`, `socket_gid`, `volume_targets`), `src/commands/run/mod.rs`
 (`materialize`, `run_container`, `IDENTITY_LABEL`), `src/state.rs`
 (`Instance::remote_user`, `Instance::home`, `Instance::exec_env`),
-`src/config.rs` (`SandboxProperties::identity`), `devsbd/src/identity.rs`.
+`src/config.rs` (`SandboxProperties::identity`, `SandboxProperties::userns`),
+`src/runtime/seccomp.rs` (`profile`, `ensure_file`), `devsbd/src/identity.rs`.
 
 ## The model
 
@@ -59,6 +60,45 @@ as `--mount` are named in one warning instead.
 
 `run` prints `Plan::summary` once (`identity: rootful: exec as vscode,
 remapped to 1000:1000`), then the plan's warnings and any fallback.
+
+## Tool environment
+
+Chromium's sandbox (and Electron's) needs a non-root euid and the right
+to create a user namespace. Docker's default seccomp profile blocks
+`clone`/`unshare` with `CLONE_NEWUSER` unless `CAP_SYS_ADMIN` is held, and
+Chrome's zygote also calls `clone(CLONE_NEWPID)` from inside its new
+userns, which the profile blocks too. Podman's default profile allows
+both.
+
+So on docker `run` creates the container with devsandbox's own profile
+(`runtime::seccomp::profile`): moby's default, vendored verbatim and
+pinned by file name (`src/runtime/seccomp/moby-default-v0.2.4.json`,
+`moby/profiles` `seccomp/v0.2.4`), plus two rules (`RULES`) shaped like
+moby's own `clone` rule: `clone`/`unshare` with `CLONE_NEWUSER`, and
+`clone` with `CLONE_NEWPID`, both excluded when `CAP_SYS_ADMIN` is held
+(moby's rule allows everything then) and on s390. The kernel still wants
+`CAP_SYS_ADMIN` in the owning userns for a new pid namespace, so the second
+rule only takes effect inside a new userns. `clone3` stays ENOSYS (glibc
+falls back to `clone`). Docker's default AppArmor profile is kept: with
+AppArmor off, Ubuntu's `kernel.apparmor_restrict_unprivileged_userns`
+strips the new userns of its capabilities.
+
+`seccomp::ensure_file` writes the profile next to `state.toml` as
+`seccomp-<short_hash of the profile>.json` when missing (temp file +
+rename), and `create_args` passes `--security-opt seccomp=<path>` after
+`--userns`. The docker CLI reads the file itself, so a remote daemon needs
+nothing. `plan_for` decides it (`wants_seccomp`): docker only, the
+sandbox's `userns` on (`SandboxProperties::userns`, default `true`), and
+not `--privileged`, which drops seccomp anyway. The decision is
+`Plan::seccomp`, recorded as the bare `seccomp` field of the label and
+said in the summary (`, user namespaces allowed (seccomp)`). A profile
+that can't be written is a warning, and the container gets docker's
+default.
+
+The cost: unprivileged user namespaces open kernel attack surface that
+docker's default closes, the same trade podman's default makes. `userns =
+false` keeps docker's default profile. The field changes create args, so
+it's hashed for drift.
 
 ## Applying it
 

@@ -210,6 +210,11 @@ pub struct SandboxProperties {
     /// means `identity = "image"`. Hashed like `identity`.
     #[serde(rename = "updateRemoteUserUID")]
     pub update_remote_user_uid: Option<bool>,
+    /// Let unprivileged processes create user namespaces (what a browser's
+    /// sandbox needs): on docker, `run` passes devsandbox's seccomp profile
+    /// (`runtime::seccomp`). Read through [`Self::userns`]; changes create
+    /// args, so it stays in `config_hash`.
+    pub userns: Option<bool>,
     pub init: Option<bool>,
 
     // --- devcontainer properties not implemented yet ([`Self::ignored`]) ---
@@ -362,6 +367,11 @@ impl SandboxProperties {
             (None, Some(false)) => Identity::Image,
             (None, _) => Identity::Host,
         }
+    }
+
+    /// The effective `userns`: on unless set to `false`.
+    pub fn userns(&self) -> bool {
+        self.userns != Some(false)
     }
 
     /// Names of valid devcontainer properties that are set but not
@@ -1446,6 +1456,23 @@ folders = { "/workspaces/docs" = "../docs", "/workspaces/lib" = { path = "../lib
         assert_ne!(hash("identity = \"host\"\n"), hash("identity = \"image\"\n"));
         assert_ne!(plain, hash("updateRemoteUserUID = false\n"));
         assert_ne!(hash("updateRemoteUserUID = true\n"), hash("updateRemoteUserUID = false\n"));
+    }
+
+    #[test]
+    fn userns_defaults_on_and_changes_config_hash() {
+        assert!(identity_props("").unwrap().userns());
+        assert!(identity_props("userns = true\n").unwrap().userns());
+        assert!(!identity_props("userns = false\n").unwrap().userns());
+        assert!(identity_props("userns = \"no\"\n").is_err());
+        let hash = |body: &str| {
+            Config::parse(&format!("[sandbox.app]\nfolder = \"../app\"\n{body}"))
+                .unwrap()
+                .resolve_sandbox("app")
+                .unwrap()
+                .config_hash
+        };
+        assert_ne!(hash(""), hash("userns = false\n"));
+        assert_ne!(hash("userns = true\n"), hash("userns = false\n"));
     }
 
     fn autostart_of(value: &str) -> Result<Option<Autostart>> {

@@ -512,7 +512,15 @@ runtime. Steps 7–17 run on a Linux host with **rootless docker 28.5.1**
 (`SecurityOptions` has `name=rootless`, Ubuntu 24.04.5), so
 `#[test_utils::docker_test…]` / `helper_test` tests actually run here,
 under rootless docker (the root plan). Rootful docker and podman still
-only run on CI. So:
+only run on CI. The docker daemon is the *host's* (docker-outside-of-docker:
+`/var/run/docker.sock` → `docker-host.sock`), so a bind of a path in this
+container mounts the host's path of that name: anything read back through
+a bind (`commands::run` `workspace_files_are_host_owned_with_docker`,
+`dockerlike` `canary_classifies_rootful_docker`) fails here. Write docker
+tests that check through `exec`, not through host files, where the step
+allows. The embedded helper is rebuilt with `scripts/build-devsbd.sh` (musl
+targets are installed); rerun it after any `devsbd/` change before testing.
+So:
 - put the logic in pure fns with table tests, and keep runtime calls thin;
 - say in the step's report which docker tests ran here and which are
   rootful-only (unverified until CI);

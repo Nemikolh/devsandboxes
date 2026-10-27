@@ -705,7 +705,7 @@ pub(crate) fn materialize(
     tracker.enter(Phase::Building)?;
     let image = image_for(dir, sandbox)?;
     // Who the container runs as (docs/architecture/instances/identity.md).
-    let plan = identity::plan_for(&image, props, extras.reprobe);
+    let (plan, seccomp) = identity::plan_for(&image, props, extras.reprobe, privileged);
     tracker.enter(Phase::Creating)?;
     run_container(
         dir,
@@ -723,6 +723,7 @@ pub(crate) fn materialize(
         restart,
         dispatcher.as_deref(),
         &plan,
+        seccomp.as_deref(),
     )?;
     let container = container_name.clone();
     backend().connect_networks(&container, &networks)?;
@@ -1007,7 +1008,8 @@ pub(crate) fn warn_on_drift(dir: &Path, container: &str, sandbox: &ResolvedSandb
 /// the phase can tell building from creating). Network attachment beyond the
 /// first and service DNS are the caller's too: they run once the container
 /// exists, when a failure keeps it. `plan` decides the user, the user
-/// namespace and the binds' SELinux labels (`identity::create_args`).
+/// namespace, the seccomp profile (`seccomp`, its path) and the binds'
+/// SELinux labels (`identity::create_args`).
 #[allow(clippy::too_many_arguments)]
 fn run_container(
     dir: &Path,
@@ -1025,6 +1027,7 @@ fn run_container(
     restart: Option<&str>,
     dispatcher: Option<&str>,
     plan: &crate::runtime::identity::Plan,
+    seccomp: Option<&Path>,
 ) -> Result<()> {
     let props = &sandbox.properties;
     let mount = format!("{}:{workspace}", source.display());
@@ -1062,7 +1065,7 @@ fn run_container(
         args.push(format!("{DISPATCHER_LABEL}={id}"));
     }
     let volumes: Vec<String> = std::iter::once(mount).chain(extra_mounts.iter().cloned()).collect();
-    let (identity_args, warning) = identity::create_args(plan, backend().name() == "podman", &volumes, mounts);
+    let (identity_args, warning) = identity::create_args(plan, backend().name() == "podman", seccomp, &volumes, mounts);
     if let Some(warning) = warning {
         eprintln!("warning: {warning}");
     }

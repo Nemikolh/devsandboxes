@@ -7,11 +7,12 @@
 //! itself.
 //!
 //! Also `run`'s side of the plan (docs/architecture/instances/identity.md):
-//! [`plan_for`] decides it, [`create_args`] turns it into `run` args, and
+//! [`plan_for`] decides it (and whether docker gets devsandbox's seccomp
+//! profile, [`wants_seccomp`]), [`create_args`] turns it into `run` args, and
 //! [`apply_argv`] / [`apply`] run `devsbd identity apply` in the new
 //! container.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{bail, Context, Result};
@@ -27,7 +28,10 @@ use super::IDENTITY_LABEL;
 /// then its warnings and any fallback. Never fails: whatever goes wrong
 /// (probe, no helper) falls back to `identity = "image"` ([`decide_plan`]).
 /// The image's `USER` is read only when it could be the adopted account.
-pub(super) fn plan_for(image: &str, props: &SandboxProperties, reprobe: bool) -> Plan {
+/// Also the seccomp profile's path when [`wants_seccomp`] (`plan.seccomp`
+/// says it's there); a profile that can't be written is a warning and no
+/// profile.
+pub(super) fn plan_for(image: &str, props: &SandboxProperties, reprobe: bool, privileged: bool) -> (Plan, Option<PathBuf>) {
     let identity = props.identity();
     let image_user = (identity == Identity::Host && props.container_user.is_none() && props.remote_user.is_none())
         .then(|| backend().image_user(image).ok().flatten())
@@ -38,12 +42,28 @@ pub(super) fn plan_for(image: &str, props: &SandboxProperties, reprobe: bool) ->
         image_user: image_user.as_deref(),
     };
     let probe = probe(image, reprobe);
-    let (plan, lines) = decide_plan(identity, probe, crate::devsbd::embedded(), accounts, host_ids());
+    let (mut plan, mut lines) = decide_plan(identity, probe, crate::devsbd::embedded(), accounts, host_ids());
+    let mut seccomp = None;
+    if wants_seccomp(backend().name(), props.userns(), privileged) {
+        match crate::runtime::seccomp::ensure_file() {
+            Ok(path) => seccomp = Some(path),
+            Err(e) => lines.push(format!("warning: cannot write the seccomp profile ({e:#}): user namespaces stay blocked")),
+        }
+    }
+    plan.seccomp = seccomp.is_some();
     eprintln!("identity: {}", plan.summary());
     for line in lines {
         eprintln!("{line}");
     }
-    plan
+    (plan, seccomp)
+}
+
+/// Whether to create with devsandbox's seccomp profile: on docker only
+/// (podman's default already allows user namespaces; Apple's `container`
+/// runs a VM), when the sandbox's `userns` is on and it isn't `--privileged`
+/// (which drops seccomp anyway).
+fn wants_seccomp(runtime: &str, userns: bool, privileged: bool) -> bool {
+    runtime == "docker" && userns && !privileged
 }
 
 /// [`identity::plan`] with `run`'s fallbacks, plus the lines to print after
@@ -93,17 +113,27 @@ fn decide_plan(
 }
 
 /// The plan's part of `run`'s args: the [`IDENTITY_LABEL`] label, `--user`,
-/// `--userns`, then `volumes` as `-v` and `mounts` as `--mount`, relabeled
-/// when SELinux asks for it (`plan.relabel`): `-v` binds get `z`; a `--mount`
+/// `--userns`, `--security-opt seccomp=` with `seccomp` (`plan_for`'s
+/// profile path, there when `plan.seccomp`), then `volumes` as `-v` and
+/// `mounts` as `--mount`, relabeled when SELinux asks for it (`plan.relabel`): `-v` binds get `z`; a `--mount`
 /// bind gets `relabel=shared` on podman, while docker's `--mount` has no
 /// relabel option, so its binds are named in the returned warning instead.
-pub(super) fn create_args(plan: &Plan, podman: bool, volumes: &[String], mounts: &[String]) -> (Vec<String>, Option<String>) {
+pub(super) fn create_args(
+    plan: &Plan,
+    podman: bool,
+    seccomp: Option<&Path>,
+    volumes: &[String],
+    mounts: &[String],
+) -> (Vec<String>, Option<String>) {
     let mut args = vec!["--label".to_string(), format!("{IDENTITY_LABEL}={}", plan.label())];
     if let Some(user) = &plan.create_user {
         args.extend(["--user".into(), user.clone()]);
     }
     if let Some(userns) = &plan.userns {
         args.extend(["--userns".into(), userns.clone()]);
+    }
+    if let Some(profile) = seccomp.filter(|_| plan.seccomp) {
+        args.extend(["--security-opt".into(), format!("seccomp={}", profile.display())]);
     }
     for volume in volumes {
         let value = if plan.relabel { relabel_volume(volume) } else { volume.clone() };
@@ -475,20 +505,42 @@ mod tests {
     fn create_args_per_mode() {
         let label = |p: &Plan| format!("{IDENTITY_LABEL}={}", p.label());
         let p = host_plan(Mode::Rootful, false);
-        let (args, warning) = create_args(&p, false, &[], &[]);
+        let (args, warning) = create_args(&p, false, None, &[], &[]);
         assert_eq!(args, ["--label".into(), label(&p), "--user".into(), "root".into()]);
         assert_eq!(warning, None);
         let p = host_plan(Mode::RootlessPodman, false);
-        let (args, _) = create_args(&p, true, &[], &[]);
+        let (args, _) = create_args(&p, true, None, &[], &[]);
         assert_eq!(args, ["--label".into(), label(&p), "--userns".into(), "keep-id:uid=1000,gid=1000".into()]);
         let p = host_plan(Mode::VmBacked, false);
-        let (args, _) = create_args(&p, false, &[], &[]);
+        let (args, _) = create_args(&p, false, None, &[], &[]);
         assert_eq!(args, ["--label".to_string(), label(&p)]);
         // Image identity: `containerUser` as is.
         let accounts = Accounts { container_user: Some("app"), ..Default::default() };
         let p = identity::plan(Probe { mode: Mode::Rootful, selinux: false }, Identity::Image, accounts, HOST);
-        let (args, _) = create_args(&p, false, &[], &[]);
+        let (args, _) = create_args(&p, false, None, &[], &[]);
         assert_eq!(args[2..], ["--user", "app"]);
+    }
+
+    #[test]
+    fn create_args_seccomp_after_userns() {
+        let profile = Path::new("/data/devsandbox/seccomp-0123.json");
+        let p = Plan { seccomp: true, ..host_plan(Mode::Rootful, false) };
+        let (args, _) = create_args(&p, false, Some(profile), &["/s:/w".into()], &[]);
+        assert_eq!(args[2..], ["--user", "root", "--security-opt", "seccomp=/data/devsandbox/seccomp-0123.json", "-v", "/s:/w"]);
+        // The flag follows the plan: no path, or a plan without it, adds nothing.
+        let (args, _) = create_args(&p, false, None, &[], &[]);
+        assert_eq!(args[2..], ["--user", "root"]);
+        let (args, _) = create_args(&host_plan(Mode::Rootful, false), false, Some(profile), &[], &[]);
+        assert_eq!(args[2..], ["--user", "root"]);
+    }
+
+    #[test]
+    fn seccomp_only_on_docker_with_userns_unprivileged() {
+        assert!(wants_seccomp("docker", true, false));
+        assert!(!wants_seccomp("docker", false, false));
+        assert!(!wants_seccomp("docker", true, true));
+        assert!(!wants_seccomp("podman", true, false));
+        assert!(!wants_seccomp("container", true, false));
     }
 
     #[test]
@@ -501,7 +553,7 @@ mod tests {
         ];
         let tail = |args: Vec<String>| args[4..].to_vec();
         // Podman: every bind relabeled, volumes left alone.
-        let (args, warning) = create_args(&host_plan(Mode::Rootful, true), true, &volumes, &mounts);
+        let (args, warning) = create_args(&host_plan(Mode::Rootful, true), true, None, &volumes, &mounts);
         assert_eq!(
             tail(args),
             [
@@ -513,14 +565,14 @@ mod tests {
         );
         assert_eq!(warning, None);
         // Docker: `-v` relabeled, `--mount` binds named in one warning.
-        let (args, warning) = create_args(&host_plan(Mode::Rootful, true), false, &volumes, &mounts);
+        let (args, warning) = create_args(&host_plan(Mode::Rootful, true), false, None, &volumes, &mounts);
         let args = tail(args);
         assert_eq!(args[1], "/src:/workspaces/x:z");
         assert_eq!(args[4..], mounts.iter().flat_map(|m| ["--mount".to_string(), m.clone()]).collect::<Vec<_>>()[..]);
         let warning = warning.unwrap();
         assert!(warning.contains("/var/cache/devsandbox/cargo, /d") && !warning.contains("/v,"), "{warning}");
         // No SELinux: untouched.
-        let (args, warning) = create_args(&host_plan(Mode::Rootful, false), true, &volumes, &mounts);
+        let (args, warning) = create_args(&host_plan(Mode::Rootful, false), true, None, &volumes, &mounts);
         assert_eq!(args[5], "/src:/workspaces/x");
         assert_eq!(args[9], mounts[0]);
         assert_eq!(warning, None);

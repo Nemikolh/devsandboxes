@@ -390,6 +390,10 @@ pub struct Plan {
     pub root_home: bool,
     /// Relabel binds (SELinux enforcing).
     pub relabel: bool,
+    /// Create with devsandbox's seccomp profile (`runtime::seccomp`), which
+    /// allows unprivileged user namespaces. Set by `run`, not by [`plan`]:
+    /// it depends on the runtime, the sandbox's `userns` and `--privileged`.
+    pub seccomp: bool,
     /// Said once by `run`, never recorded.
     pub warnings: Vec<String>,
 }
@@ -417,6 +421,7 @@ pub fn plan(probe: Probe, identity: Identity, accounts: Accounts, host: Ids) -> 
         exec_user: None,
         root_home: false,
         relabel: probe.selinux,
+        seccomp: false,
         warnings: Vec::new(),
     };
     if identity == Identity::Image {
@@ -488,6 +493,9 @@ impl Plan {
         if self.relabel {
             s.push_str(", binds relabeled (SELinux)");
         }
+        if self.seccomp {
+            s.push_str(", user namespaces allowed (seccomp)");
+        }
         s
     }
 
@@ -514,6 +522,9 @@ impl Plan {
         if self.relabel {
             fields.push("relabel".into());
         }
+        if self.seccomp {
+            fields.push("seccomp".into());
+        }
         fields.join(";")
     }
 
@@ -532,6 +543,7 @@ impl Plan {
             exec_user: None,
             root_home: false,
             relabel: false,
+            seccomp: false,
             warnings: Vec::new(),
         };
         for field in s.split(';') {
@@ -539,6 +551,7 @@ impl Plan {
                 None => match field {
                     "root_home" => p.root_home = true,
                     "relabel" => p.relabel = true,
+                    "seccomp" => p.seccomp = true,
                     _ => return None,
                 },
                 Some((key, v)) => match key {
@@ -747,6 +760,8 @@ mod tests {
         assert_eq!(s(Mode::Rootful, Identity::Image, vscode()), "rootful: identity = \"image\", exec as vscode, no remap");
         let p = plan(Probe { mode: Mode::Rootful, selinux: true }, Identity::Host, vscode(), HOST);
         assert!(p.summary().ends_with(", binds relabeled (SELinux)"));
+        let p = Plan { seccomp: true, ..p };
+        assert!(p.summary().ends_with(", binds relabeled (SELinux), user namespaces allowed (seccomp)"));
     }
 
     #[test]
@@ -756,16 +771,21 @@ mod tests {
             for selinux in [false, true] {
                 for identity in [Identity::Host, Identity::Image] {
                     for accounts in [vscode(), Accounts::default(), odd] {
-                        let mut p = plan(Probe { mode, selinux }, identity, accounts, HOST);
-                        let label = p.label();
-                        p.warnings.clear();
-                        assert_eq!(Plan::parse_label(&label), Some(p), "{label}");
+                        for seccomp in [false, true] {
+                            let mut p = plan(Probe { mode, selinux }, identity, accounts, HOST);
+                            p.seccomp = seccomp;
+                            let label = p.label();
+                            p.warnings.clear();
+                            assert_eq!(Plan::parse_label(&label), Some(p), "{label}");
+                        }
                     }
                 }
             }
         }
         let label = plan(probe(Mode::RootlessPodman), Identity::Host, vscode(), HOST).label();
         assert_eq!(label, "mode=rootless-podman;identity=host;account=vscode;userns=keep-id:uid=1000,gid=1000;exec=vscode");
+        let p = Plan { seccomp: true, ..plan(probe(Mode::Rootful), Identity::Host, vscode(), HOST) };
+        assert!(p.label().ends_with(";seccomp"), "{}", p.label());
     }
 
     #[test]

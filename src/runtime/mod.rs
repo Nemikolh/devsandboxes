@@ -16,6 +16,7 @@ pub mod identity;
 // Only the daemon and the dashboard list processes (both unix-only).
 #[cfg(unix)]
 pub mod procs;
+pub mod seccomp;
 
 #[cfg(test)]
 pub use apple::AppleContainer;
