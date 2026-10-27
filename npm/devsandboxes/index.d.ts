@@ -721,6 +721,8 @@ export interface ResolvedInstance {
   machine: string | null;
   /** Its config root on its host; `null` when not recorded. */
   root: string | null;
+  /** Its sandbox; `null` from an older machine. */
+  sandbox: string | null;
 }
 
 /** `instances.cancel`'s answer: the in-flight verb's pid was SIGINTed. */

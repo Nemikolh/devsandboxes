@@ -6,8 +6,9 @@
 //!
 //! Every prompt happens here, on the user's TTY, before the verb is sent
 //! (the daemon's subprocess has no stdin): the sandbox pick and the example
-//! config (`sandboxes.list`), the instance pick (`instances.resolve`), rm's
-//! branch question (`ask` → `confirm` → resend). Then the request streams:
+//! config (`sandboxes.list`), the instance pick (`instances.resolve`), the
+//! identity prompt ([`identity`], `config.findings`; with no daemon too),
+//! rm's branch question (`ask` → `confirm` → resend). Then the request streams:
 //! `output` goes to our stdout/stderr as it comes, and the answer decides the
 //! exit code. Ctrl-C cancels through a second connection
 //! (`instances.cancel`) so the rollback still streams; when there's nothing
@@ -38,6 +39,10 @@ use super::verbs::{RebuildParams, RmParams, RunParams, ServicesRebuildParams, St
 use crate::Command;
 use crate::commands::run::cancel;
 use crate::state::PhaseView;
+
+mod identity;
+
+use identity::{Ask, Scope};
 
 /// How often the streaming loop wakes without a line to check for Ctrl-C.
 const TICK: Duration = Duration::from_millis(100);
@@ -166,10 +171,6 @@ pub(crate) enum Done {
 pub(crate) fn run(dir: &Path, verb: CliVerb, fed: &Fed) -> Result<Done> {
     let root = dir.canonicalize().with_context(|| format!("no directory {}", dir.display()))?;
     let env = caller_env(std::env::vars_os());
-    let mut conn = match endpoint::socket_dir().and_then(|socket| client::connect(&socket, "cli")) {
-        Ok(conn) => conn,
-        Err(e) => return in_process(&verb, fed, format!("{e:#}")),
-    };
     let tty = std::io::stdin().is_terminal();
     // As the in-process tee decides (`build_log`): stderr too, or the pty
     // would merge the errors into stdout.
@@ -182,6 +183,26 @@ pub(crate) fn run(dir: &Path, verb: CliVerb, fed: &Fed) -> Result<Done> {
             crate::commands::pick(prompt, &refs)
         },
         offer_example: &mut || crate::commands::run::offer_example_config(&root),
+        ask: &mut |question| {
+            eprint!("{question}");
+            std::io::stderr().flush()?;
+            let mut answer = String::new();
+            std::io::stdin().read_line(&mut answer)?;
+            Ok(answer)
+        },
+        say: &mut |text| eprintln!("{text}"),
+    };
+    let mut conn = match endpoint::socket_dir().and_then(|socket| client::connect(&socket, "cli")) {
+        Ok(conn) => conn,
+        Err(e) => {
+            let done = in_process(&verb, fed, format!("{e:#}"))?;
+            // No daemon: the same prompt, the calls answered here.
+            if ui.tty {
+                let asks = identity::local_asks(&verb, &root, fed, &mut identity::local_call)?;
+                identity::prompt(asks, &mut identity::local_call, &mut ui)?;
+            }
+            return Ok(done);
+        }
     };
     let list = match prepare(&verb, &root, env, fed, &mut |method, params| conn.call(method, params), &mut ui)? {
         Prep::Send(prepared) => vec![prepared],
@@ -283,6 +304,11 @@ struct Ui<'a> {
     pick: &'a mut dyn FnMut(&str, &[String]) -> Result<usize>,
     /// `run` on a config without sandboxes (`offer_example_config`).
     offer_example: &'a mut dyn FnMut() -> Result<()>,
+    /// The identity prompt's question: shown, then a line read (empty at
+    /// stdin's end).
+    ask: &'a mut dyn FnMut(&str) -> Result<String>,
+    /// A line for the user (stderr).
+    say: &'a mut dyn FnMut(&str),
 }
 
 /// What [`prepare`] decided.
@@ -378,6 +404,10 @@ fn prepare(
                 Ok(target) => target,
                 Err(old) => return Ok(Prep::Old(old)),
             };
+            // `--json`: no prompt, `run`'s warning only (stderr).
+            if !json {
+                identity::prompt(target.ask().into_iter().collect(), call, ui)?;
+            }
             let tty = if json { None } else { ui.term };
             let p = RunParams {
                 root: target.root.clone(),
@@ -397,6 +427,7 @@ fn prepare(
         CliVerb::Rebuild { target, force, reprobe, detach } => match target {
             Some(name) => {
                 let t = resolved!(&name);
+                identity::prompt(t.ask().into_iter().collect(), call, ui)?;
                 let p = RebuildParams {
                     root: t.root.clone(),
                     env,
@@ -411,10 +442,13 @@ fn prepare(
             }
             None => match machine_roots(call)? {
                 None => {
+                    identity::prompt(vec![every(&root, None)], call, ui)?;
                     let p = RebuildParams { root, env, instance: None, all: true, force, reprobe, detach, tty: ui.term };
                     one("rebuild", serde_json::to_value(p)?, None)
                 }
                 Some((m, roots)) => {
+                    // One prompt for all of the machine's roots.
+                    identity::prompt(roots.iter().map(|r| every(r, Some(&m))).collect(), call, ui)?;
                     let mut each = Vec::new();
                     for root in roots {
                         let banner = super::machines::cli::banner(&m, &root);
@@ -429,13 +463,22 @@ fn prepare(
         CliVerb::Start { target, detach } => match target {
             Some(name) => {
                 let t = resolved!(&name);
+                identity::prompt(t.ask().into_iter().collect(), call, ui)?;
                 let p = StartParams { root: t.root.clone(), env, instance: Some(t.name.clone()), all: false, detach, tty: ui.term };
                 one("start", serde_json::to_value(p)?, Some(&t))
             }
             None => {
+                // `start --all` starts the instances of every root (the
+                // machine's state.toml): every root is asked about.
                 let (root, m) = match machine_roots(call)? {
-                    None => (root, None),
-                    Some((m, roots)) => (roots[0].clone(), Some(m)),
+                    None => {
+                        identity::prompt(vec![every(&root, None)], call, ui)?;
+                        (root, None)
+                    }
+                    Some((m, roots)) => {
+                        identity::prompt(roots.iter().map(|r| every(r, Some(&m))).collect(), call, ui)?;
+                        (roots[0].clone(), Some(m))
+                    }
                 };
                 let p = StartParams { root, env, instance: None, all: true, detach, tty: ui.term };
                 Prepared { machine: m.clone(), ..one("start", routed(serde_json::to_value(p)?, m.as_deref()), None) }
@@ -502,6 +545,11 @@ fn routed(mut params: Value, machine: Option<&str>) -> Value {
     params
 }
 
+/// The identity prompt's ask for every sandbox of `root` (`--all`).
+fn every(root: &Path, machine: Option<&str>) -> Ask {
+    Ask { root: root.to_path_buf(), machine: machine.map(str::to_string), scope: Scope::Used }
+}
+
 /// One of a machine's per-root requests.
 fn on_machine(method: &'static str, params: Value, m: &str, banner: String) -> Prepared {
     Prepared { method, params: routed(params, Some(m)), instance: None, machine: Some(m.to_string()), banner: Some(banner) }
@@ -515,6 +563,16 @@ struct Target {
     name: String,
     machine: Option<String>,
     root: PathBuf,
+    /// Its sandbox (`run`'s is `name`); `None` from an older daemon.
+    sandbox: Option<String>,
+}
+
+impl Target {
+    /// The identity prompt's ask: this sandbox's findings, at its root.
+    fn ask(&self) -> Option<Ask> {
+        let sandbox = self.sandbox.clone()?;
+        Some(Ask { root: self.root.clone(), machine: self.machine.clone(), scope: Scope::Sandboxes(vec![sandbox]) })
+    }
 }
 
 /// `name` as one instance (`instances.resolve`), picking on a TTY among
@@ -536,7 +594,7 @@ fn target_of(name: &str, root: &Path, fed: &Fed, call: &mut Call, ui: &mut Ui) -
         bail!("{}", crate::commands::no_instance_matches(&name));
     };
     let Some(m) = found.machine else {
-        return Ok(Ok(Target { name: found.name, machine: None, root: root.to_path_buf() }));
+        return Ok(Ok(Target { name: found.name, machine: None, root: root.to_path_buf(), sandbox: found.sandbox }));
     };
     let root = match found.root {
         Some(root) => root,
@@ -546,7 +604,7 @@ fn target_of(name: &str, root: &Path, fed: &Fed, call: &mut Call, ui: &mut Ui) -
             .next()
             .with_context(|| format!("machine `{m}` has no config roots (devsandbox machine ls)"))?,
     };
-    Ok(Ok(Target { name: found.name, machine: Some(m), root }))
+    Ok(Ok(Target { name: found.name, machine: Some(m), root, sandbox: found.sandbox }))
 }
 
 /// `run`'s sandbox: where it's defined, after the pick. `None`: nothing to
@@ -572,10 +630,10 @@ fn run_target(
         Some(s) => Some((Where::Any, s)),
         None => None,
     };
-    let here = |name: String| Target { name, machine: None, root: root.to_path_buf() };
+    let here = |name: String| Target { sandbox: Some(name.clone()), name, machine: None, root: root.to_path_buf() };
     let there = |row: SandboxEntry| -> Result<Target> {
         let root = row.root.context("bad sandboxes.list entry from devsandbox serve: no root")?;
-        Ok(Target { name: row.name, machine: row.machine, root })
+        Ok(Target { sandbox: Some(row.name.clone()), name: row.name, machine: row.machine, root })
     };
     let target = match choose_sandbox(rows, wanted) {
         SandboxChoice::Example { unmatched } => {
@@ -1186,9 +1244,38 @@ mod tests {
         answers: &[(&str, Response)],
         pick: usize,
     ) -> (Result<Prep>, Vec<String>, bool, Vec<Vec<String>>) {
+        let out = prep_all(verb, fed, tty, term, answers, pick, None);
+        (out.prep, out.calls, out.offered, out.picks)
+    }
+
+    struct Out {
+        prep: Result<Prep>,
+        calls: Vec<String>,
+        offered: bool,
+        picks: Vec<Vec<String>>,
+        /// What the identity prompt said, then `? <question>` per ask.
+        said: Vec<String>,
+    }
+
+    /// [`prep_fed`] answering the identity prompt with `reply` (`None`:
+    /// asking is a failure). An unanswered `config.findings` finds nothing
+    /// and isn't logged, so the other tests read as before the prompt.
+    fn prep_all(
+        verb: &CliVerb,
+        fed: &Fed,
+        tty: bool,
+        term: Option<TtySize>,
+        answers: &[(&str, Response)],
+        pick: usize,
+        reply: Option<&str>,
+    ) -> Out {
         let calls = RefCell::new(Vec::new());
         let picks = RefCell::new(Vec::new());
+        let said = RefCell::new(Vec::new());
         let mut call = |method: &str, params: Value| {
+            if method == "config.findings" && !answers.iter().any(|(m, _)| m.split(' ').next() == Some(method)) {
+                return Ok(ok(json!({"file": "/cfg/devsandboxes.toml", "format": "toml", "fileHash": "h", "findings": []})));
+            }
             calls.borrow_mut().push(format!("{method} {params}"));
             // `"method"`, or `"method <text>"` for a call whose params hold `<text>`.
             let fits = |key: &str| match key.split_once(' ') {
@@ -1211,10 +1298,15 @@ mod tests {
                 *offered.borrow_mut() = true;
                 Ok(())
             },
+            ask: &mut |question| {
+                said.borrow_mut().push(format!("? {question}"));
+                Ok(reply.unwrap_or_else(|| panic!("asked: {question}")).to_string())
+            },
+            say: &mut |text| said.borrow_mut().push(text.to_string()),
         };
         let env = BTreeMap::from([("A".to_string(), "1".to_string())]);
-        let out = prepare(verb, Path::new("/cfg"), env, fed, &mut call, &mut ui);
-        (out, calls.into_inner(), offered.into_inner(), picks.into_inner())
+        let prep = prepare(verb, Path::new("/cfg"), env, fed, &mut call, &mut ui);
+        Out { prep, calls: calls.into_inner(), offered: offered.into_inner(), picks: picks.into_inner(), said: said.into_inner() }
     }
 
     fn sent(p: Result<Prep>) -> Prepared {
@@ -1532,5 +1624,189 @@ mod tests {
         assert_eq!(s.qualified("other\n".into()), "other\n");
         s.qualify = None;
         assert_eq!(s.qualified("web-2\n".into()), "web-2\n");
+    }
+
+    // ---- the identity prompt --------------------------------------------------
+
+    fn finding(id: &str, kind: &str, edit: Option<&str>, sandboxes: &[&str], acked: bool) -> Value {
+        json!({"id": id, "table": "sandbox.web", "kind": kind, "key": "workspaceFolder", "value": "/root/app",
+               "edit": edit, "sandboxes": sandboxes, "acked": acked})
+    }
+
+    /// web's: a mount, a root user, one fixed by hand, one acked; api's.
+    fn findings_answer(format: &str) -> Response {
+        ok(json!({"file": "/cfg/devsandboxes.toml", "format": format, "fileHash": "h1", "findings": [
+            finding("m1", "root-target", Some("sandbox.web: mounts entry \"a\" -> \"b\""), &["web"], false),
+            finding("u1", "root-user", Some("sandbox.web: remove remoteUser = \"root\""), &["web"], false),
+            finding("p1", "root-path", None, &["web"], false),
+            finding("old", "root-target", Some("acked"), &["web"], true),
+            finding("a1", "root-env", Some("api's"), &["api"], false),
+        ]}))
+    }
+
+    fn run_web(json: bool) -> CliVerb {
+        CliVerb::Run { sandbox: Some("web".into()), name: None, branch: None, base: None, json, reprobe: false, detach: false }
+    }
+
+    fn list() -> (&'static str, Response) {
+        ("sandboxes.list", ok(json!([{"name": "web"}, {"name": "api"}])))
+    }
+
+    #[test]
+    fn identity_prompt_lists_un_acked_findings_and_updates() {
+        let answers = [
+            list(),
+            ("config.findings", findings_answer("toml")),
+            ("config.migrate", ok(json!({"edits": 2, "drifted": ["web-1", "web-2"]}))),
+        ];
+        let out = prep_all(&run_web(false), &Fed::default(), true, None, &answers, 0, Some("u\n"));
+        assert_eq!(sent(out.prep).params["sandbox"], "web", "the verb goes on");
+        assert_eq!(
+            out.calls[1..],
+            [
+                r#"config.findings {"root":"/cfg"}"#.to_string(),
+                r#"config.migrate {"fileHash":"h1","ids":["m1","u1"],"root":"/cfg"}"#.to_string(),
+            ]
+        );
+        assert_eq!(
+            out.said,
+            [
+                "/cfg/devsandboxes.toml assumes root in the container, which breaks under identity = \"host\":\n  \
+                 sandbox.web: mounts entry \"a\" -> \"b\"\n  sandbox.web: remove remoteUser = \"root\"\n  \
+                 sandbox.web: workspaceFolder = \"/root/app\" is under /root (fix by hand)"
+                    .to_string(),
+                format!("? {}", identity::QUESTION),
+                "updated devsandboxes.toml (2 edits); now drifted: web-1, web-2 → devsandbox rebuild <name>".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn identity_prompt_continue_acks_and_keeps_the_root_user() {
+        let answers = [
+            list(),
+            ("config.findings", findings_answer("toml")),
+            ("config.ack", ok(json!({"acked": ["m1", "old", "p1"]}))),
+            ("config.migrate", ok(json!({"edits": 1, "drifted": []}))),
+        ];
+        let out = prep_all(&run_web(false), &Fed::default(), true, None, &answers, 0, Some("C"));
+        assert!(matches!(out.prep.unwrap(), Prep::Send(_)));
+        assert_eq!(
+            out.calls[2..],
+            [
+                r#"config.ack {"ids":["m1","p1"],"root":"/cfg"}"#.to_string(),
+                r#"config.migrate {"fileHash":"h1","ids":[],"keep":["u1"],"root":"/cfg"}"#.to_string(),
+            ]
+        );
+        assert_eq!(out.said[2..], ["/cfg/devsandboxes.toml: 2 entries kept as is, not asked about again", "updated devsandboxes.toml (1 edit)"]);
+
+        // YAML: the root user is acked too, nothing rewritten.
+        let yaml = [list(), ("config.findings", findings_answer("yaml")), ("config.ack", ok(json!({"acked": []})))];
+        let out = prep_all(&run_web(false), &Fed::default(), true, None, &yaml, 0, Some("c"));
+        assert_eq!(out.calls[2..], [r#"config.ack {"ids":["m1","u1","p1"],"root":"/cfg"}"#.to_string()]);
+    }
+
+    #[test]
+    fn identity_prompt_skips_and_stays_quiet_off_a_tty() {
+        let answers = [list(), ("config.findings", findings_answer("toml"))];
+        let out = prep_all(&run_web(false), &Fed::default(), true, None, &answers, 0, Some(""));
+        assert!(matches!(out.prep.unwrap(), Prep::Send(_)));
+        assert_eq!(out.calls.len(), 2, "findings read, nothing written: {:?}", out.calls);
+        // Off a TTY and under `--json`: not even read (`run` warns instead).
+        for (verb, tty) in [(run_web(false), false), (run_web(true), true)] {
+            let out = prep_all(&verb, &Fed::default(), tty, None, &answers, 0, None);
+            assert!(matches!(out.prep.unwrap(), Prep::Send(_)));
+            assert_eq!(out.calls.len(), 1, "{verb:?}: {:?}", out.calls);
+        }
+        // Nothing un-acked for the sandbox: no prompt.
+        let api_only = [list(), ("config.findings", ok(json!({"file": "/cfg/x.toml", "format": "toml", "fileHash": "h",
+            "findings": [finding("a1", "root-env", Some("e"), &["api"], false), finding("w", "root-env", Some("e"), &["web"], true)]})))];
+        let out = prep_all(&run_web(false), &Fed::default(), true, None, &api_only, 0, None);
+        assert!(out.said.is_empty());
+        // An older daemon, a bad config: the verb goes on, unasked.
+        let old = [list(), ("config.findings", err("unknown-method", "no", None))];
+        assert!(matches!(prep_all(&run_web(false), &Fed::default(), true, None, &old, 0, None).prep.unwrap(), Prep::Send(_)));
+    }
+
+    #[test]
+    fn identity_prompt_errors_conflict_stops_others_warn() {
+        let with = |migrate: Response| {
+            let answers = [list(), ("config.findings", findings_answer("toml")), ("config.migrate", migrate)];
+            prep_all(&run_web(false), &Fed::default(), true, None, &answers, 0, Some("u"))
+        };
+        let e = with(err("conflict", "changed", None)).prep.unwrap_err();
+        assert_eq!(e.to_string(), "/cfg/devsandboxes.toml changed while you were asked; nothing written, run the command again");
+        let out = with(err("unsupported", "YAML configs aren't rewritten; make these edits by hand:\nx", None));
+        assert!(matches!(out.prep.unwrap(), Prep::Send(_)));
+        assert_eq!(out.said.last().unwrap(), "/cfg/devsandboxes.toml: YAML configs aren't rewritten; make these edits by hand:\nx");
+        let out = with(err("internal", "disk full; left devsandboxes.toml.bak", None));
+        assert!(matches!(out.prep.unwrap(), Prep::Send(_)));
+        assert_eq!(out.said.last().unwrap(), "warning: could not update /cfg/devsandboxes.toml: disk full; left devsandboxes.toml.bak");
+    }
+
+    #[test]
+    fn identity_prompt_for_instances_and_all() {
+        // `rebuild <instance>`: its sandbox, from `instances.resolve`.
+        let answers = [
+            ("instances.resolve", ok(json!({"matches": ["web-2"], "found": [{"name": "web-2", "machine": null, "root": "/cfg", "sandbox": "web"}]}))),
+            ("config.findings", findings_answer("toml")),
+        ];
+        let rebuild = CliVerb::Rebuild { target: Some("web-2".into()), force: false, reprobe: false, detach: false };
+        let out = prep_all(&rebuild, &Fed::default(), true, None, &answers, 0, Some("s"));
+        assert_eq!(sent(out.prep).instance.as_deref(), Some("web-2"));
+        assert!(out.said[0].contains("remove remoteUser"), "{:?}", out.said);
+        // `--all` on a machine: one prompt for its roots, each asked there.
+        let machine = ("machines.get", ok(json!({"name": "a", "target": "a", "command": null, "roots": ["/r1", "/r2"], "agent": false})));
+        let answers = [
+            machine,
+            ("config.findings /r1", findings_answer("toml")),
+            ("config.findings /r2", ok(json!({"file": "/r2/devsandboxes.toml", "format": "toml", "fileHash": "h2",
+                "findings": [finding("x", "root-env", Some("r2's"), &["db"], false), finding("t", "root-env", Some("unused"), &[], false)]}))),
+            ("config.migrate /r1", ok(json!({"edits": 3, "drifted": ["web-1"]}))),
+            ("config.migrate /r2", ok(json!({"edits": 1, "drifted": []}))),
+        ];
+        let all = CliVerb::Rebuild { target: None, force: false, reprobe: false, detach: false };
+        let out = prep_all(&all, &on("a"), true, None, &answers, 0, Some("u"));
+        assert!(matches!(out.prep.unwrap(), Prep::Each(_)));
+        let asked: Vec<&String> = out.said.iter().filter(|s| s.starts_with("? ")).collect();
+        assert_eq!(asked.len(), 1, "one prompt");
+        assert!(out.said[0].starts_with("a:/cfg/devsandboxes.toml assumes root"), "{}", out.said[0]);
+        assert!(out.said[0].contains("a:/r2/devsandboxes.toml assumes root"), "{}", out.said[0]);
+        assert!(!out.said[0].contains("unused"), "an unused template isn't the verb's: {}", out.said[0]);
+        assert!(out.calls.contains(&r#"config.migrate {"fileHash":"h1","ids":["m1","u1","a1"],"machine":"a","root":"/r1"}"#.to_string()), "{:?}", out.calls);
+        assert!(out.calls.contains(&r#"config.migrate {"fileHash":"h2","ids":["x"],"machine":"a","root":"/r2"}"#.to_string()), "{:?}", out.calls);
+        assert!(out.said.contains(&"updated devsandboxes.toml (3 edits); now drifted: a/web-1 → devsandbox rebuild <name>".to_string()));
+    }
+
+    #[test]
+    fn with_no_daemon_the_asks_come_from_what_is_known() {
+        let mut call = |method: &str, params: Value| {
+            assert_eq!(method, "instances.resolve");
+            Ok(match params["name"].as_str() {
+                Some("w") => ok(json!({"matches": ["w-1", "w-2", "x"], "found": [
+                    {"name": "w-1", "machine": null, "root": null, "sandbox": "web"},
+                    {"name": "w-2", "machine": null, "root": null, "sandbox": "web"},
+                    {"name": "x", "machine": null, "root": null, "sandbox": "api"}]})),
+                _ => err("not-found", "no", None),
+            })
+        };
+        let asks = |verb: CliVerb, call: &mut Call| identity::local_asks(&verb, Path::new("/cfg"), &FED, call).unwrap();
+        let ask = |scope| vec![Ask { root: "/cfg".into(), machine: None, scope }];
+        let names = |n: &[&str]| Scope::Sandboxes(n.iter().map(|s| s.to_string()).collect());
+        assert_eq!(asks(run_of(Some("@/web")), &mut call), ask(names(&["web"])));
+        assert_eq!(asks(run_web(true), &mut call), Vec::<Ask>::new(), "--json");
+        assert_eq!(asks(run_of(None), &mut call), Vec::<Ask>::new(), "the pick comes later");
+        assert_eq!(asks(CliVerb::Start { target: Some("w".into()), detach: false }, &mut call), ask(names(&["api", "web"])));
+        assert_eq!(asks(CliVerb::Rebuild { target: Some("zz".into()), force: false, reprobe: false, detach: false }, &mut call), Vec::<Ask>::new());
+        assert_eq!(asks(CliVerb::Rebuild { target: None, force: false, reprobe: false, detach: false }, &mut call), ask(Scope::Used));
+        assert_eq!(asks(CliVerb::Stop { target: Some("w".into()) }, &mut call), Vec::<Ask>::new());
+    }
+
+    /// The no-daemon calls go through the API's table; nothing else does.
+    #[test]
+    fn the_local_call_answers_only_the_prompts_methods() {
+        assert!(identity::local_call("inbox.threads.list", json!({})).is_err());
+        let r = identity::local_call("config.findings", json!({"root": "rel"})).unwrap();
+        assert_eq!(r.error.unwrap().code, "invalid");
     }
 }

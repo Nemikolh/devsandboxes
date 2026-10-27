@@ -506,6 +506,13 @@ pub(crate) fn materialize(
     tracker: &mut Tracker,
 ) -> Result<()> {
     let props = &sandbox.properties;
+    // Not the prompt (that's the verb client's, on a terminal): this line is
+    // what every other path gets (off a TTY, `--json`, the dispatcher's
+    // subprocesses, autostart), and a skipped prompt too. stderr only.
+    let acks = services::project_id(dir).ok().and_then(|p| state.identity_acks.get(&p));
+    if let Some(line) = crate::config_identity::warning(&crate::config_identity::identity_findings(config), sandbox_name, acks) {
+        eprintln!("warning: {line}");
+    }
     let prior = state.instances.get(instance);
     let dispatcher = extras
         .dispatcher

@@ -147,6 +147,10 @@ limitation means editing this file in the same commit.
   or env value under `/root` lands in a dir the adopted account can't
   reach; set `identity = "image"` until the migration ships.
   → [plan](plans/active/identity.md)
+- Identity prompt (CLI): with no daemon, `run` without a sandbox name
+  doesn't prompt (the in-process pick comes after it; `run`'s warning
+  still shows), and off unix nothing prompts (no verb client).
+  → [verbs](architecture/daemon/verbs.md)
 - Identity under SELinux on docker: `--mount` binds aren't relabeled (only
   podman has `relabel=shared`), just warned about. `identity::create_args`
 - Identity probe: a failed probe isn't cached, so a remote `DOCKER_HOST`

@@ -92,14 +92,55 @@ cancelled by `instances.cancel`, but nobody streams their output.
 (`run` with the dispatcher's hidden `--env`/`--dispatcher` and `rm
 --fail-on-ask` stay local). Every prompt happens on the user's TTY before
 the send, since the child has no stdin: sandbox pick and example config
-(`sandboxes.list`), instance pick (`instances.resolve`), rm's branch
-question (`ask` → `confirm` → resend). The request env is the CLI's whole
-env (`caller_env`, non-UTF-8 vars dropped).
+(`sandboxes.list`), instance pick (`instances.resolve`), the identity
+prompt (below), rm's branch question (`ask` → `confirm` → resend). The
+request env is the CLI's whole env (`caller_env`, non-UTF-8 vars dropped).
 
 No daemon reachable, or one too old for verbs: one `warning:` line and the
 verb runs in the CLI's process as `--in-process` (`Done::InProcess`); `-d`
 refuses instead (`detach_needs_daemon` in `main.rs`). A verb aimed at a
 machine has no fallback.
+
+### The identity prompt
+
+A config written for root in the container breaks under `identity =
+"host"` (`config_identity`, the findings). Once `prepare` knows the
+target of `run`/`start`/`rebuild` (the sandbox from `run_target`, an
+instance's from `instances.resolve`'s `sandbox`, every sandbox of the root
+for `--all`, every root of the machine for `--all --machine`), it calls
+`config.findings {root}` where the target lives (with `machine` for a
+machine's) and keeps the un-acked findings of those sandboxes
+(`verbs_client::identity::prompt`). If any, on a TTY and not under `run
+--json`, one prompt lists each one's edit line (or "fix by hand") per
+config file and asks `[u]pdate / [c]ontinue as is (don't ask again) /
+[s]kip this time` (Enter skips):
+
+- `u`: `config.migrate {root, ids, fileHash}` with the findings that have
+  an edit, then `updated devsandboxes.toml (N edits); now drifted: a, b →
+  devsandbox rebuild <name>`. A `conflict` (the file changed meanwhile)
+  stops the verb, to be re-run; `unsupported` (YAML) prints the edits to
+  make by hand; any other error is a `warning:`;
+- `c`: `config.ack`, but a root user in a TOML config, which
+  `config.migrate {keep}` keeps in the file as `identity = "image"`;
+- `s`: nothing.
+
+The verb is then sent, on the config as it now is. Nothing here blocks a
+verb otherwise: a root whose findings can't be read is left out.
+
+With no daemon the same prompt runs before the in-process verb, its calls
+answered in this process by the API's own table (`identity::local_call`:
+`serve::api::call`, `state.toml` at `State::path`). What it asks about is
+what's known before the verb's own prompts (`identity::local_asks`): `run`
+with a sandbox named, the sandboxes an instance name can mean, the root
+for `--all`.
+
+Everywhere else `run` and `rebuild` print one `warning:` line on stderr
+from `run::materialize` when un-acked findings apply to the sandbox
+(`config_identity::warning`): off a TTY, `run --json` (stdout untouched),
+the dispatcher's `--in-process` subprocesses, autostart, and after a
+skipped prompt too. Autostart runs in the daemon when it starts (`serve::host`),
+before any prompt could be shown: it mostly starts existing containers,
+which keep the model they were created with until rebuilt.
 
 ## Other `--in-process` callers
 

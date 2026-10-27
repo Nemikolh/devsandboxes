@@ -47,10 +47,10 @@
 //! conflict, and the write goes through a `.bak` copy and tmp + rename.
 //!
 //! [`ops`] is all of it as the API's `config.*` methods, with the acks in
-//! `state.toml`.
+//! `state.toml`. [`warning`] is `run`'s line for the un-acked ones.
 
-// Only the daemon (unix) calls it so far; the CLI's no-daemon path comes in
-// identity step 16.
+// The rewrite and [`ops`] are called by the daemon and the CLI's verb client
+// (`serve`, unix-only); elsewhere only the findings and `run`'s warning are.
 #![cfg_attr(not(unix), allow(dead_code))]
 
 pub mod ops;
@@ -491,6 +491,29 @@ pub fn edit_line(finding: &Finding, keep: bool) -> Option<String> {
     }
 }
 
+/// The `warning:` line `run` prints for sandbox `sandbox` (without the
+/// prefix): its findings not among `acked` (the root's
+/// `State::identity_acks`), counted, with the way to fix them. `None`: none.
+/// It's printed in every mode (a daemon's subprocess, `--in-process`,
+/// autostart), so it points at the prompt on a terminal, the one fix path
+/// they all have.
+pub fn warning(findings: &[Finding], sandbox: &str, acked: Option<&std::collections::BTreeSet<String>>) -> Option<String> {
+    let n = findings
+        .iter()
+        .filter(|f| f.sandboxes.iter().any(|s| s == sandbox))
+        .filter(|f| acked.is_none_or(|a| !a.contains(&f.id)))
+        .count();
+    let (entries, verbs) = match n {
+        0 => return None,
+        1 => ("1 config entry assumes".to_string(), "breaks"),
+        n => (format!("{n} config entries assume"), "break"),
+    };
+    Some(format!(
+        "sandbox `{sandbox}`: {entries} root in the container (under /root, or a root user) and {verbs} under \
+         identity = \"host\"; `devsandbox run`, `start` or `rebuild` on a terminal offers to update the config"
+    ))
+}
+
 /// What [`migrate_file`] did.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Migrated {
@@ -691,6 +714,24 @@ remoteUser = "root"
             .map(|(k, key, value, edit)| (k, key.to_string(), value.to_string(), edit, web.clone()))
             .collect();
         assert_eq!(got, want);
+    }
+
+    #[test]
+    fn run_warns_of_the_un_acked_findings_of_its_sandbox() {
+        let all = findings(
+            "[template.base]\nmounts = [\"source=/a,target=/root/.a\"]\n\
+             [sandbox.web]\nextends = \"base\"\nremoteUser = \"root\"\n[sandbox.ok]\nimage = \"img\"\n",
+        );
+        let web = warning(&all, "web", None).unwrap();
+        assert!(web.starts_with("sandbox `web`: 2 config entries assume root"), "{web}");
+        assert!(web.contains("break under identity = \"host\""), "{web}");
+        let acked: std::collections::BTreeSet<String> = [all[0].id.clone()].into();
+        let one = warning(&all, "web", Some(&acked)).unwrap();
+        assert!(one.starts_with("sandbox `web`: 1 config entry assumes root"), "{one}");
+        assert!(one.contains(" breaks under"), "{one}");
+        let both: std::collections::BTreeSet<String> = all.iter().map(|f| f.id.clone()).collect();
+        assert_eq!(warning(&all, "web", Some(&both)), None);
+        assert_eq!(warning(&all, "ok", None), None);
     }
 
     #[test]

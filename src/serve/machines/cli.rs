@@ -273,7 +273,7 @@ pub(crate) fn found_of(answer: Value, wherever: &Where) -> Result<Vec<Found>> {
     let found = if r.found.len() == r.matches.len() {
         r.found
     } else {
-        r.matches.into_iter().map(|name| Found { name, machine: None, root: None }).collect()
+        r.matches.into_iter().map(|name| Found { name, machine: None, root: None, sandbox: None }).collect()
     };
     Ok(match wherever {
         Where::Machine(m) => found.into_iter().map(|f| Found { machine: Some(m.clone()), ..f }).collect(),
@@ -725,7 +725,7 @@ fn resolve_and_route(command: Command, wherever: Where, name: String) -> Result<
     })? {
         Some(found) => found,
         // A machine's container: as typed, at its first root.
-        None if qualified && containers => Found { name: name.clone(), machine: None, root: None },
+        None if qualified && containers => Found { name: name.clone(), machine: None, root: None, sandbox: None },
         None if !qualified => return Ok(Routed::Here(command)),
         None => bail!("{}", crate::commands::no_instance_matches(name_of(&command).unwrap_or_default())),
     };
@@ -1117,7 +1117,7 @@ mod tests {
     }
 
     fn found(name: &str, machine: Option<&str>, root: Option<&str>) -> Found {
-        Found { name: name.into(), machine: machine.map(Into::into), root: root.map(PathBuf::from) }
+        Found { name: name.into(), machine: machine.map(Into::into), root: root.map(PathBuf::from), sandbox: None }
     }
 
     #[test]

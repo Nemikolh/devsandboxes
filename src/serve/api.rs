@@ -285,8 +285,9 @@ pub struct Resolved {
 }
 
 /// One `instances.resolve` match: its name on its own host (unqualified),
-/// the machine (`None`: this host) and its config root (`None`: an
-/// instance that predates `config_dir`, or an older machine).
+/// the machine (`None`: this host), its config root (`None`: an
+/// instance that predates `config_dir`, or an older machine) and its
+/// sandbox (what the CLI's identity prompt checks; `None` when unknown).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Found {
     pub name: String,
@@ -294,6 +295,8 @@ pub struct Found {
     pub machine: Option<String>,
     #[serde(default)]
     pub root: Option<PathBuf>,
+    #[serde(default)]
+    pub sandbox: Option<String>,
 }
 
 /// `instances.cancel`'s answer.
@@ -570,10 +573,14 @@ fn instances_resolve(p: NameParams, state: &Path) -> Answer {
     }
     let found = matches
         .iter()
-        .map(|name| Found {
-            name: name.clone(),
-            machine: None,
-            root: state.instances.get(name).and_then(|i| i.config_dir.clone()),
+        .map(|name| {
+            let instance = state.instances.get(name);
+            Found {
+                name: name.clone(),
+                machine: None,
+                root: instance.and_then(|i| i.config_dir.clone()),
+                sandbox: instance.map(|i| i.sandbox.clone()),
+            }
         })
         .collect();
     serde_json::to_value(Resolved { matches, found }).map_err(|e| ApiError::internal(e.into()))
@@ -1712,7 +1719,7 @@ mod tests {
         let rooted = format!("{}config_dir = \"/cfg\"\n", instance("web", "web", ""));
         let state = state_file("resolve", &[rooted, instance("web-2", "web", ""), instance("x", "web", "")].concat());
         let resolve = |params: Value| instances_resolve(parse(params)?, &state);
-        let found = |name: &str, root: Option<&str>| json!({"name": name, "machine": null, "root": root});
+        let found = |name: &str, root: Option<&str>| json!({"name": name, "machine": null, "root": root, "sandbox": "web"});
         assert_eq!(
             resolve(json!({"name": "web"})).unwrap(),
             json!({"matches": ["web"], "found": [found("web", Some("/cfg"))]}),
@@ -2224,6 +2231,7 @@ mod tests {
             name: "web".into(),
             machine: machine.map(Into::into),
             root: root.map(Into::into),
+            sandbox: Some("web".into()),
         };
         let resolved = Resolved { matches: vec!["web".into(), "m/web".into()], found: vec![found(None, None), found(Some("m"), Some("/cfg"))] };
         assert_matches("InstancesResolved", &v(&resolved));

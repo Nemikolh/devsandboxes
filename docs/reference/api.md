@@ -316,13 +316,14 @@ unwatch only needs `dir` absolute).
 
 Params: `{"name": "<name>"}`, as the CLI's `<name>` takes it. Result:
 `{"matches": ["web", "web-2"], "found": [{"name": "web", "machine":
-null, "root": "/home/me/.devsandboxes"}, …]}`, sorted: an exact instance
+null, "root": "/home/me/.devsandboxes", "sandbox": "web"}, …]}`, sorted: an exact instance
 name or id if any matches, else every instance of that sandbox or folder
 basename. Two or more is the caller's to pick from (the CLI prompts on its
 TTY), not an error; then it sends the chosen name to a verb. `found` is
 `matches` again, in order, with where each lives: the unqualified name,
-its machine (`null`: this host) and its config root there (`null` for
-instances older than that record).
+its machine (`null`: this host), its config root there (`null` for
+instances older than that record) and its sandbox (what the CLI's
+identity prompt asks `config.findings` about).
 
 `"machines": true` asks this host and every registered machine (*Machines*,
 *Federated calls*).

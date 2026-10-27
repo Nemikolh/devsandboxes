@@ -211,15 +211,20 @@ fn join_resolve(
 }
 
 /// A resolve answer with `found` filled for every match: an older daemon's
-/// has none, so its matches get no root.
+/// has none, so its matches get no root or sandbox.
 fn resolved(v: Value) -> Resolved {
     let mut r: Resolved = serde_json::from_value(v).unwrap_or(Resolved { matches: Vec::new(), found: Vec::new() });
     r.found = r
         .matches
         .iter()
         .map(|m| {
-            let root = r.found.iter().find(|f| f.name == *m).and_then(|f| f.root.clone());
-            Found { name: m.clone(), machine: None, root }
+            let f = r.found.iter().find(|f| f.name == *m);
+            Found {
+                name: m.clone(),
+                machine: None,
+                root: f.and_then(|f| f.root.clone()),
+                sandbox: f.and_then(|f| f.sandbox.clone()),
+            }
         })
         .collect();
     r
@@ -425,9 +430,9 @@ mod tests {
 
     #[test]
     fn resolve_joins_qualify_and_sort() {
-        let local = Ok(json!({"matches": ["web-1"], "found": [{"name": "web-1", "machine": null, "root": "/here"}]}));
+        let local = Ok(json!({"matches": ["web-1"], "found": [{"name": "web-1", "machine": null, "root": "/here", "sandbox": "web"}]}));
         let remotes = vec![
-            ("b".to_string(), ok(json!({"matches": ["web-2"], "found": [{"name": "web-2", "machine": null, "root": "/there"}]}))),
+            ("b".to_string(), ok(json!({"matches": ["web-2"], "found": [{"name": "web-2", "machine": null, "root": "/there", "sandbox": "web"}]}))),
             // An older daemon: no `found`, so no root.
             ("a".to_string(), ok(json!({"matches": ["web-3"]}))),
             ("c".to_string(), err("not-found", "no sandbox instance matches `web`")),
@@ -438,9 +443,9 @@ mod tests {
         assert_eq!(
             r["found"],
             json!([
-                {"name": "web-3", "machine": "a", "root": null},
-                {"name": "web-2", "machine": "b", "root": "/there"},
-                {"name": "web-1", "machine": null, "root": "/here"},
+                {"name": "web-3", "machine": "a", "root": null, "sandbox": null},
+                {"name": "web-2", "machine": "b", "root": "/there", "sandbox": "web"},
+                {"name": "web-1", "machine": null, "root": "/here", "sandbox": "web"},
             ])
         );
 
@@ -594,7 +599,7 @@ mod tests {
         assert_eq!(code_message(&r), ("not-found", "no instance `nope`"));
         // A forwarded resolve is the machine's answer as is.
         let r = c.call("instances.resolve", json!({"name": "web-r", "machine": "box"})).unwrap();
-        assert_eq!(r.result.unwrap(), json!({"matches": ["web-r"], "found": [{"name": "web-r", "machine": null, "root": pair.remote_root}]}));
+        assert_eq!(r.result.unwrap(), json!({"matches": ["web-r"], "found": [{"name": "web-r", "machine": null, "root": pair.remote_root, "sandbox": "web"}]}));
         let r = c.call("sandboxes.list", json!({"root": pair.remote_root, "machine": "box", "machines": true})).unwrap();
         assert_eq!(r.result.unwrap(), json!([{"name": "web", "root": pair.remote_root}]), "no fan-out there");
         let r = c.call("instances.buildLog", json!({"instance": "x", "machine": "nope"})).unwrap();
@@ -618,8 +623,8 @@ mod tests {
         assert_eq!(
             r["found"],
             json!([
-                {"name": "web-r", "machine": "box", "root": pair.remote_root},
-                {"name": "web-l", "machine": null, "root": pair.local_root},
+                {"name": "web-r", "machine": "box", "root": pair.remote_root, "sandbox": "web"},
+                {"name": "web-l", "machine": null, "root": pair.local_root, "sandbox": "web"},
             ])
         );
         crate::serve::dts::assert_matches("InstancesResolved", &r);
