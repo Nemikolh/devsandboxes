@@ -32,8 +32,7 @@ jobs:
   # The same suite under rootless podman (the runner user), the runtime mode
   # the docker job can't reach. Gated tests follow DEVSANDBOX_RUNTIME
   # (src/test_support.rs); docker-only ones pass as not applicable. Pinned:
-  # ubuntu-latest moves to 26.04 and a newer podman. The service-manager e2e
-  # stays in `test`.
+  # ubuntu-latest moves to 26.04 and a newer podman.
   test-podman:
     runs-on: ubuntu-24.04
     steps:
@@ -56,6 +55,7 @@ jobs:
         env:
           DEVSANDBOX_RUNTIME: podman
           DEVSANDBOX_DEVSBD_REQUIRED: "1"
+          DEVSANDBOX_SERVICE_MANAGER_E2E: "1"
 
   # `serve install` under a real launchd (the Linux job covers systemd).
   service-manager-macos:
