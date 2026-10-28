@@ -200,11 +200,11 @@ export interface Capacity {
   running: number;
   /** `lend.toml`'s `state`; `null` without a `lend.toml`. */
   lending: LendState | null;
-  /** `lend.toml`'s soft caps; `null` when none is set. */
+  /** `member.toml`'s soft caps; `null` when none is set. */
   caps: Caps | null;
 }
 
-/** Soft caps from `lend.toml`'s `[caps]` (sizes in bytes): never enforced; over one is a note. */
+/** Soft caps from `member.toml`'s `[caps]` (sizes in bytes): never enforced; over one is a note. */
 export interface Caps {
   cpus: number | null;
   mem: number | null;
@@ -873,13 +873,27 @@ export interface LendInfo {
   state: LendState;
   /** The hub's ssh target; `null` when none was ever set. */
   hub: string | null;
-  /** The name offered: `lend.toml`'s, else the hostname's first label; `null` when neither is a valid name. */
+  /** The name offered: `member.toml`'s, else the hostname's first label; `null` when neither is a valid name. */
   name: string | null;
   /** `<data>/devsandbox/fleet/<hub>/`, all the hub reaches here (canonical while lending). */
   fleet_root: string | null;
   link: LendLinkState;
   /** Why the link is `retrying`, or why it's `off` while `state` says lend. */
   error: string | null;
+}
+
+/** What a remote caller reaches on this member: `worker` (its own roots and the fleet root, placed work under the worker policy) or `full` (the whole API). */
+export type MemberTrust = 'worker' | 'full';
+
+/** `member.get`'s answer (and `member.set`'s, after the change): this host as a fleet member (`member.toml`). */
+export interface MemberInfo {
+  /** `member.toml`'s `name`, else the hostname's first label; `null` when neither is a valid name. */
+  name: string | null;
+  trust: MemberTrust;
+  /** `dev-builds` as the file says (`full` takes the hub's dev builds either way). */
+  dev_builds: boolean;
+  /** Config roots shown to the fleet besides those with instances (absolute). */
+  roots: string[];
 }
 
 /** One process of an instance, as `ps` printed it. */
@@ -1331,9 +1345,16 @@ export interface ApiMethods {
   'lend.get': { params: {}; result: LendInfo };
   /**
    * Change what's given and apply it at once: start, stop or retarget the link (`on` ↔ `drain` keeps it).
-   * `invalid` for an empty or bad `hub`, a bad `name` (`''` clears it), or lending without a hub.
+   * `invalid` for an empty or bad `hub`, or lending without a hub (or without a name: `member.set`'s).
    */
-  'lend.set': { params: { state?: LendState; hub?: string; name?: string }; result: LendInfo };
+  'lend.set': { params: { state?: LendState; hub?: string }; result: LendInfo };
+  /** This host as a fleet member (`member.toml`). Local only: never over a fleet link. */
+  'member.get': { params: {}; result: MemberInfo };
+  /**
+   * Change what's given: `name` (`''` clears it; a lending link restarts under the new one), `trust`, and
+   * `roots_add` / `roots_rm` (absolute paths). `invalid` for a bad name or a relative root.
+   */
+  'member.set': { params: { name?: string; trust?: MemberTrust; roots_add?: string[]; roots_rm?: string[] }; result: MemberInfo };
   /** `not-found` for an unknown sandbox; one that doesn't merge answers why in `resolved`. */
   'sandboxes.get': { params: { root: string; name: string; machine?: string }; result: SandboxConfig };
   'services.get': { params: { root: string; name: string; machine?: string }; result: ServiceConfig };

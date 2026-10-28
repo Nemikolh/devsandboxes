@@ -1615,7 +1615,7 @@ mod tests {
     /// through a symlink) asking for `privileged` is refused by `run` before
     /// any runtime call: the child has no runtime on its `PATH`, so a call
     /// would fail with another error, and nothing is recorded. Allowed in
-    /// `lend.toml`, `run` gets past the policy (to the missing runtime).
+    /// `member.toml`, `run` gets past the policy (to the missing runtime).
     #[cfg(unix)]
     #[test]
     fn run_under_a_fleet_root_is_refused_before_the_runtime() {
@@ -1638,7 +1638,7 @@ mod tests {
         let link = root.join("link");
         std::os::unix::fs::symlink(&cfg, &link).unwrap();
         let want = "refused by this machine's lending policy: privileged \
-                    (allow with privileged = true under [allow] in lend.toml)";
+                    (allow with privileged = true under [allow] in member.toml)";
         for dir in [&cfg, &link] {
             let err = run(dir, Some("t".into()), None, None, None, RunExtras::default()).unwrap_err();
             assert_eq!(format!("{err:#}"), want, "{}", dir.display());
@@ -1675,10 +1675,10 @@ mod tests {
         let user = std::env::var("USER").unwrap_or_default();
         assert_eq!(expand(&env_cfg), "${localEnv:HOME}|${localEnv:USER}");
         assert_eq!(expand(&outside), format!("{home}|{user}"));
-        std::fs::write(data.join("lend.toml"), "[allow]\nlocal-env = [\"HOME\"]\n").unwrap();
+        std::fs::write(data.join("member.toml"), "[allow]\nlocal-env = [\"HOME\"]\n").unwrap();
         assert_eq!(expand(&env_cfg), format!("{home}|${{localEnv:USER}}"));
 
-        std::fs::write(data.join("lend.toml"), "[allow]\nprivileged = true\n").unwrap();
+        std::fs::write(data.join("member.toml"), "[allow]\nprivileged = true\n").unwrap();
         let err = run(&cfg, Some("t".into()), None, None, None, RunExtras::default()).unwrap_err();
         assert!(!format!("{err:#}").contains("lending policy"), "{err:#}");
     }

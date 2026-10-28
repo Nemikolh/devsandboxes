@@ -3,8 +3,10 @@
 //! is written by the daemon only (decision 3 of the fleet plan), and every
 //! `lend.set` is applied at once, without watching the file: the lending
 //! thread (`fleet::worker::Lending`) starts, stops, or is replaced by one to
-//! the new hub or name. `on` ↔ `drain` keeps the link up (what's placed here
-//! stays reachable); the next link offers the new state.
+//! the new hub. The name it offers is `member.toml`'s (`fleet::member`): a
+//! `member.set` that renames this host re-applies ([`Lender::reapply`]),
+//! replacing the thread the same way. `on` ↔ `drain` keeps the link up
+//! (what's placed here stays reachable); the next link offers the new state.
 //!
 //! How a lending thread is started is the daemon's ([`Spawn`]: the fleet
 //! root's `Worker` connections, the transport), so tests drive a `Lender`
@@ -18,9 +20,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::lend::{self, Lend, State};
+use super::member::{self, Member, SoftCaps};
 use super::worker::{Lending, Status};
 use crate::serve::api::{ApiError, parse};
-use crate::serve::machines::check_name;
+use crate::serve::capacity::Own;
 
 type Answer = Result<Value, ApiError>;
 
@@ -66,7 +69,7 @@ pub struct LendInfo {
     pub state: State,
     /// The hub's ssh target; `None` when none was ever set.
     pub hub: Option<String>,
-    /// The name this host offers itself under: `lend.toml`'s, else the
+    /// The name this host offers itself under: `member.toml`'s, else the
     /// hostname's first label; `None` when neither is a valid name.
     pub name: Option<String>,
     /// `<data>/devsandbox/fleet/<hub>/`: canonical while lending.
@@ -85,9 +88,6 @@ pub struct SetParams {
     /// An ssh target, as `machine add` takes one.
     #[serde(default)]
     pub hub: Option<String>,
-    /// A machine name; `""` clears it (the hostname's first label).
-    #[serde(default)]
-    pub name: Option<String>,
 }
 
 /// `lend` with `p` applied, checked (pure).
@@ -97,12 +97,6 @@ pub fn merge(mut lend: Lend, p: &SetParams) -> Result<Lend, ApiError> {
             return Err(ApiError::invalid("`hub` is empty"));
         }
         lend.hub = hub.clone();
-    }
-    if let Some(name) = &p.name {
-        if !name.is_empty() {
-            check_name(name).map_err(|e| ApiError::invalid(format!("`name`: {e:#}")))?;
-        }
-        lend.name = name.clone();
     }
     if let Some(state) = p.state {
         lend.state = state;
@@ -154,9 +148,11 @@ struct Slot {
     closed: bool,
 }
 
-/// The daemon's lending: `lend.toml` and the thread that follows it.
+/// The daemon's lending: `lend.toml` and the thread that follows it (and
+/// `member.toml`'s name).
 pub struct Lender {
     path: PathBuf,
+    member: PathBuf,
     hostname: String,
     spawn: Spawn,
     slot: Mutex<Slot>,
@@ -164,10 +160,21 @@ pub struct Lender {
 }
 
 impl Lender {
-    /// `path` is `lend.toml` (its dir holds the fleet roots); `hostname`
-    /// names this worker when the file doesn't.
-    pub fn new(path: PathBuf, hostname: String, spawn: Spawn, log: fn(&str)) -> Lender {
-        Lender { path, hostname, spawn, slot: Mutex::default(), log }
+    /// `path` is `lend.toml` (its dir holds the fleet roots), `member`
+    /// `member.toml`; `hostname` names this worker when `member.toml`
+    /// doesn't.
+    pub fn new(path: PathBuf, member: PathBuf, hostname: String, spawn: Spawn, log: fn(&str)) -> Lender {
+        Lender { path, member, hostname, spawn, slot: Mutex::default(), log }
+    }
+
+    /// `member.toml`, for `member.*` (`fleet::member::call`).
+    pub fn member_path(&self) -> &Path {
+        &self.member
+    }
+
+    /// What names this host when `member.toml` doesn't.
+    pub fn hostname(&self) -> &str {
+        &self.hostname
     }
 
     /// At daemon start: lend as the file says. A bad file (or hostname,
@@ -207,11 +214,37 @@ impl Lender {
         drop(live);
     }
 
-    /// `lend.toml` as it is now, for the capacity report: `None` when it's
-    /// missing or doesn't parse. Read each time, so a hand edit of `[caps]`
-    /// shows on the next poll.
-    pub fn file(&self) -> Option<Lend> {
-        lend::load(&self.path).ok().flatten()
+    /// What the capacity report carries of this host's own files: the
+    /// lending state (`None` while `lend.toml` is missing or doesn't parse)
+    /// and `member.toml`'s `[caps]` (none while it is). Read each time, so a
+    /// hand edit of `[caps]` shows on the next poll.
+    pub fn own(&self) -> Own {
+        Own {
+            lending: lend::load(&self.path).ok().flatten().map(|l| l.state),
+            caps: self.member_file().map(|m| m.caps).unwrap_or_else(SoftCaps::default),
+        }
+    }
+
+    /// `member.toml` as it is now: `None` when it's missing or doesn't
+    /// parse.
+    pub fn member_file(&self) -> Option<Member> {
+        member::load(&self.member).ok().flatten()
+    }
+
+    /// Follow the files again after `member.set` renamed this host: a
+    /// running lending thread is replaced by one under the new name.
+    pub fn reapply(&self) {
+        let lend = match lend::load(&self.path) {
+            Ok(lend) => lend.unwrap_or_default(),
+            Err(e) => {
+                (self.log)(&format!("warning: not lending: {e:#}"));
+                return;
+            }
+        };
+        let mut slot = self.slot.lock().unwrap();
+        if let Err(e) = self.apply(&mut slot, &lend) {
+            (self.log)(&format!("warning: not lending: {e:#}"));
+        }
     }
 
     pub fn get(&self) -> Result<LendInfo, ApiError> {
@@ -229,7 +262,7 @@ impl Lender {
         let next = lend::update(&self.path, |cur| -> Result<Lend, ApiError> {
             let next = merge(cur.clone(), &p)?;
             if next.lends() {
-                self.name_of(&next).map_err(|e| ApiError::invalid(format!("{e:#}")))?;
+                self.name_of().map_err(|e| ApiError::invalid(format!("{e:#}")))?;
             }
             *cur = next.clone();
             Ok(next)
@@ -239,11 +272,9 @@ impl Lender {
         Ok(self.info(&next, &slot))
     }
 
-    fn name_of(&self, lend: &Lend) -> Result<String> {
-        match lend.name.as_str() {
-            "" => lend::default_name(&self.hostname),
-            name => Ok(name.to_string()),
-        }
+    /// The name this host offers itself under (`member.toml`'s, read now).
+    fn name_of(&self) -> Result<String> {
+        member::load(&self.member)?.unwrap_or_default().name_or(&self.hostname)
     }
 
     fn info(&self, lend: &Lend, slot: &Slot) -> LendInfo {
@@ -263,7 +294,7 @@ impl Lender {
         LendInfo {
             state: lend.state,
             hub: (!lend.hub.is_empty()).then(|| lend.hub.clone()),
-            name: self.name_of(lend).ok(),
+            name: self.name_of().ok(),
             fleet_root,
             link,
             error,
@@ -273,7 +304,7 @@ impl Lender {
     /// Make the thread follow `lend`.
     fn apply(&self, slot: &mut Slot, lend: &Lend) -> Result<()> {
         slot.error = None;
-        let want = if lend.lends() && !slot.closed { Some((lend.hub.clone(), self.name_of(lend)?)) } else { None };
+        let want = if lend.lends() && !slot.closed { Some((lend.hub.clone(), self.name_of()?)) } else { None };
         let running = slot.live.as_ref().map(|l| (l.hub.as_str(), l.name.as_str()));
         let draining = lend.state == State::Drain;
         match transition(running, want.as_ref().map(|(h, n)| (h.as_str(), n.as_str()))) {
@@ -395,7 +426,8 @@ mod tests {
             };
             Lending::spawn(s.hub, s.name, s.root, s.draining, transport.clone(), Vec::new(), crate::serve::fleet::transfer::Receivers::new(|_| {}), None, follow, timing, |_| {})
         });
-        Lender::new(path, "lap.local".into(), spawn, |_| {})
+        let member = path.with_file_name("member.toml");
+        Lender::new(path, member, "lap.local".into(), spawn, |_| {})
     }
 
     fn set(l: &Lender, params: Value) -> Result<LendInfo, ApiError> {
@@ -406,18 +438,17 @@ mod tests {
     fn merge_checks_what_it_changes() {
         let p = |v: Value| -> SetParams { serde_json::from_value(v).unwrap() };
         let on = merge(Lend::default(), &p(json!({"hub": "me@hub", "state": "on"}))).unwrap();
-        assert_eq!((on.state, on.hub.as_str(), on.name.as_str()), (State::On, "me@hub", ""));
-        let named = merge(on.clone(), &p(json!({"name": "lap"}))).unwrap();
-        assert_eq!((named.state, named.name.as_str()), (State::On, "lap"), "the rest kept");
-        assert_eq!(merge(named, &p(json!({"name": ""}))).unwrap().name, "", "cleared");
+        assert_eq!((on.state, on.hub.as_str()), (State::On, "me@hub"));
+        let drain = merge(on.clone(), &p(json!({"state": "drain"}))).unwrap();
+        assert_eq!((drain.state, drain.hub.as_str()), (State::Drain, "me@hub"), "the rest kept");
         let code = |lend: &Lend, v: Value| merge(lend.clone(), &p(v)).unwrap_err().code;
         assert_eq!(code(&Lend::default(), json!({"state": "on"})), "invalid", "no hub");
         assert_eq!(code(&on, json!({"hub": " "})), "invalid");
         assert_eq!(code(&on, json!({"hub": "-oProxyCommand=x"})), "invalid");
-        assert_eq!(code(&on, json!({"name": "a/b"})), "invalid");
         assert_eq!(merge(on.clone(), &p(json!({"state": "off"}))).unwrap().hub, "me@hub", "off keeps the hub");
         assert!(serde_json::from_value::<SetParams>(json!({"state": "maybe"})).is_err());
         assert!(serde_json::from_value::<SetParams>(json!({"hubb": "x"})).is_err());
+        assert!(serde_json::from_value::<SetParams>(json!({"name": "lap"})).is_err(), "the name is member.set's");
     }
 
     #[test]
@@ -433,8 +464,8 @@ mod tests {
     }
 
     /// off → on dials, on → drain keeps the link (the next dial offers
-    /// `--drain`), a new hub restarts it, off stops it; `lend.get` says the
-    /// link's state all along.
+    /// `--drain`), a `member.set` rename and a new hub restart it, off stops
+    /// it; `lend.get` says the link's state all along.
     #[test]
     fn set_applies_live() {
         let dir = scratch("live");
@@ -464,7 +495,13 @@ mod tests {
         assert_eq!((drain.state, drain.link), (State::Drain, LinkState::Retrying), "the same thread");
         wait_for(|| dials.last().unwrap()[6].contains("--drain"), "the next dial offers --drain");
 
-        set(&l, json!({"hub": "me@hub2", "name": "box"})).unwrap();
+        let rename = |name: &str| {
+            member::call("member.set", json!({ "name": name }), l.member_path(), l.hostname(), || l.reapply()).unwrap().unwrap()
+        };
+        assert_eq!(rename("box")["name"], "box");
+        wait_for(|| dials.last().unwrap()[6].contains("'\\''box'\\''"), "a dial under the new name");
+        assert_eq!(l.get().unwrap().name.as_deref(), Some("box"));
+        set(&l, json!({"hub": "me@hub2"})).unwrap();
         wait_for(|| dials.last().unwrap()[5] == "me@hub2", "a dial to the new hub");
         let argv = dials.last().unwrap();
         assert!(argv[6].contains("box") && argv[6].contains("--drain"), "{argv:?}");
@@ -478,8 +515,8 @@ mod tests {
         assert_eq!(dials.count(), n, "stopped dialing");
 
         // A refused set changes nothing.
-        assert_eq!(set(&l, json!({"name": "a/b"})).unwrap_err().code, "invalid");
-        assert_eq!(lend::load(&path).unwrap().unwrap().name, "box");
+        assert_eq!(set(&l, json!({"hub": "-oProxyCommand=x"})).unwrap_err().code, "invalid");
+        assert_eq!(lend::load(&path).unwrap().unwrap().hub, "me@hub2");
 
         // A new daemon lends as the file says.
         set(&l, json!({"state": "on"})).unwrap();
@@ -503,7 +540,8 @@ mod tests {
         let e = set(&l, json!({"hub": "hub", "state": "on"})).unwrap_err();
         assert!(e.code == "invalid" && e.message.contains("set `name`"), "{e:?}");
         assert!(!dir.join("lend.toml").exists(), "nothing written");
-        assert!(set(&l, json!({"hub": "hub", "state": "on", "name": "lap"})).is_ok());
+        member::write_for_test(l.member_path(), &Member { name: "lap".into(), ..Member::default() });
+        assert!(set(&l, json!({"hub": "hub", "state": "on"})).is_ok());
         l.stop();
         let _ = std::fs::remove_dir_all(&dir);
     }

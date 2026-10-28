@@ -16,7 +16,7 @@
 //! snapshot handed to the daemon to push, with this host's capacity report
 //! (`capacity.rs`: the runtime's `info` at most every
 //! `capacity::ENGINE_TTL`, free memory and disk, the running instances,
-//! `lend.toml`). The poll also owns the runtime's
+//! `lend.toml`'s state, `member.toml`'s caps). The poll also owns the runtime's
 //! event stream ([`EventWatcher`], `events.rs`): each relevant container
 //! event wakes it at once. The sleep is [`tick`]:
 //! [`snapshots::LISTING_INTERVAL`] while anything is watched, else
@@ -42,7 +42,7 @@ use serde_json::Value;
 
 use super::capacity::HostCapacity;
 use super::events::{EVENTS_RETRY, EventWatcher};
-use super::fleet::lend::Lend;
+use super::capacity::Own;
 use super::snapshots::{self, Join, Snapshots};
 use crate::devsbd::bridge::{self, BridgeBoard, Bridges, OnShown, Readiness};
 use crate::runtime::{ContainerRow, NAME_PREFIX};
@@ -72,9 +72,9 @@ pub struct Observers {
     /// Each watched root's snapshot (`instances.snapshot` params), every
     /// tick; it must not block.
     pub on_snapshot: Box<dyn Fn(&Path, Arc<Value>) + Send>,
-    /// `lend.toml` now (`None`: none), for the capacity report's lending
-    /// state and soft caps.
-    pub lend: Box<dyn Fn() -> Option<Lend> + Send>,
+    /// `lend.toml`'s state and `member.toml`'s caps now, for the capacity
+    /// report.
+    pub own: Box<dyn Fn() -> Own + Send>,
     /// This host's capacity: the poll keeps its running count, and asks it
     /// for the report while a root is watched (the daemon asks it too).
     pub capacity: Arc<HostCapacity>,
@@ -315,8 +315,8 @@ fn poll(
             };
             // The capacity report rides every root's snapshot: only built
             // while someone watches.
-            let lend = (observers.lend)();
-            observers.cache.set_capacity(&observers.capacity.report(lend.as_ref()));
+            let own = (observers.own)();
+            observers.cache.set_capacity(&observers.capacity.report(&own));
             let due = listing.is_ok() && observers.cache.stats_due(&watched, Instant::now());
             let mut view = RuntimeView::from_parts(rt, Some(listing), None);
             if due {

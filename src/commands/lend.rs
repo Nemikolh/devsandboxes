@@ -41,13 +41,14 @@ pub fn set_state(state: State) -> Result<()> {
     Ok(())
 }
 
-/// `fleet join <hub> [--name N]`: lend to `hub`, `on`.
+/// `fleet join <hub> [--name N]`: name this host (`member.set`), then lend
+/// to `hub`, `on`.
 pub fn join(hub: &str, name: Option<&str>) -> Result<()> {
-    let mut params = json!({ "hub": hub, "state": State::On });
+    let mut conn = connect()?;
     if let Some(name) = name {
-        params["name"] = json!(name);
+        let _: Value = call(&mut conn, "member.set", json!({ "name": name }))?;
     }
-    let info: LendInfo = call(&mut connect()?, "lend.set", params)?;
+    let info: LendInfo = call(&mut conn, "lend.set", json!({ "hub": hub, "state": State::On }))?;
     println!("{}", summary(&info));
     Ok(())
 }

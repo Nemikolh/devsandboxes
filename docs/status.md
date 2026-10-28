@@ -308,8 +308,8 @@ limitation means editing this file in the same commit.
   ↔ `drain` keeps the current one) is only logged; the hub learns it from
   the worker's `capacity.get` and the worker refuses a `run` itself.
   → [fleet](architecture/daemon/fleet.md#lending-lend); `fleet::lender::transition`
-- The capacity report's soft caps (`lend.toml` `[caps]`) are edited by
-  hand (no `lend` flag), and measured against the whole host's memory and
+- The capacity report's soft caps (`member.toml` `[caps]`) are edited by
+  hand (no `member.set` param), and measured against the whole host's memory and
   disk use, not what placed work takes; `cpus` caps nothing measured. The
   report rides the snapshots only while a root is watched (`capacity.get`
   builds it any time), and an Apple `container` host reports no cpus or
@@ -332,7 +332,7 @@ limitation means editing this file in the same commit.
   `DEVSANDBOX_PUBLISHED=1`, so every hub says `dev` and a worker's
   download path never runs; a worker on another build than its hub takes
   the hub's binary over the link only with `dev-builds = true` in
-  `lend.toml` and the same OS/arch, else stops offering. Dev builds from
+  `member.toml` (or trust `full`) and the same OS/arch, else stops offering. Dev builds from
   the same commit with different local changes count as the same build
   (the git hash has no dirty marker). A mixed-platform dev fleet is built
   per platform by hand.

@@ -198,7 +198,7 @@ fn load(key: &str, op: Op) -> Result<(State, Config), Response> {
 
 /// The worker policy on every request, not just at create: a config under a
 /// fleet root may gain `dispatcher` / `inbox` after its instance exists.
-/// Inbox ops need `inbox`, child ops `dispatcher`, in `lend.toml`'s
+/// Inbox ops need `inbox`, child ops `dispatcher`, in `member.toml`'s
 /// `[allow]` (`worker_policy`).
 fn policy_gate(config_dir: &Path, op: Op) -> Result<(), Response> {
     let policy = crate::worker_policy::Policy::for_dir(config_dir).map_err(|e| failed(format!("{e:#}")))?;

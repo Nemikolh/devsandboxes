@@ -224,6 +224,7 @@ devsandbox machine add me@my-server --agent    # with `agent` on
 devsandbox machine ls [--json]                 # NAME TARGET ROOTS AGENT STATE VERSION
 devsandbox machine set box --agent on|off      # change a machine's `agent`
 devsandbox machine rm box                      # unregister only
+devsandbox machine trust [worker|full]         # this host's fleet trust (show / set)
 ```
 
 - `add` without `--config` offers the machine's known config roots (a

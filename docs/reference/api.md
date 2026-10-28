@@ -13,7 +13,7 @@ method), `src/inbox/wire.rs` (Inbox views, `ApiError`, `decide_*`),
 `src/serve/forwards.rs` (`forwards.*`),
 `src/serve/machines/api.rs` (`machines.*`), `src/serve/machines/forward.rs`
 (`QUICK`, federation), `src/serve/fleet/offer.rs` (`fleet.offer`, `fleet.agent`),
-`src/serve/fleet/lender.rs` (`lend.*`),
+`src/serve/fleet/lender.rs` (`lend.*`), `src/serve/fleet/member.rs` (`member.*`),
 `src/serve/relay.rs` (`api --stdio`),
 `npm/devsandboxes/index.js` + `index.d.ts` (Node client; `src/serve/dts.rs`
 checks the typings against the wire structs).
@@ -31,7 +31,7 @@ checks the typings against the wire structs).
 | | `roots.list` | no |
 | bridges, forwards | `bridges.ensure`, `helper.call`, `forwards.list\|add\|rm` | no |
 | verbs | `run`, `rebuild`, `start`, `stop`, `rm`, `services.rebuild` | yes (own ssh) |
-| machines | `machines.probe\|add\|list\|get\|rm`, `fleet.offer\|agent` (internal), `lend.get\|set`, `capacity.get` | no |
+| machines | `machines.probe\|add\|list\|get\|rm`, `fleet.offer\|agent` (internal), `lend.get\|set`, `member.get\|set`, `capacity.get` | no |
 
 Notifications: `inbox.changed`, `inbox.shown`, `instances.changed`,
 `instances.snapshot`, `forwards.changed`, `forwards.status`, `closing`
@@ -333,8 +333,8 @@ runtime's (`docker info` `NCPU` / `MemTotal`, podman's `host.cpus` /
 `mem_available` (`/proc/meminfo` `MemAvailable`) and `disk_free` /
 `disk_total` (the filesystem of the runtime's data root) only for a
 native Linux engine, else `null`. `running`: instances whose container
-runs. `lending`: `lend.toml`'s `state` (`null` without one); `caps` its
-`[caps]` soft caps (`null` when none is set): never enforced, over one is
+runs. `lending`: `lend.toml`'s `state` (`null` without one); `caps`
+`member.toml`'s `[caps]` soft caps (`null` when none is set): never enforced, over one is
 a note ([fleet.md](../architecture/daemon/fleet.md#capacity)).
 
 Errors: `invalid` (missing or relative `dir`; watch without the
@@ -1087,7 +1087,7 @@ on a fleet hub's connection.
 | method | params | result | errors |
 |---|---|---|---|
 | `lend.get` | `{}` | `{"state", "hub", "name", "fleet_root", "link", "error"}` | `internal` (`lend.toml` doesn't parse), `failed` (no data dir) |
-| `lend.set` | `{"state"?, "hub"?, "name"?}`: each one given is changed | as `lend.get`, after the change | `invalid` (an unknown param or `state`, an empty or bad `hub`, a bad `name`, lending without a `hub`, or no `name` and a hostname that isn't a valid one), `failed` (the daemon is exiting, no data dir), `internal` (`lend.toml` doesn't read or write, the fleet root can't be created) |
+| `lend.set` | `{"state"?, "hub"?}`: each one given is changed | as `lend.get`, after the change | `invalid` (an unknown param or `state`, an empty or bad `hub`, lending without a `hub`, or no `name` in `member.toml` and a hostname that isn't a valid one), `failed` (the daemon is exiting, no data dir), `internal` (`lend.toml` doesn't read or write, the fleet root can't be created) |
 
 - `state`: `on` (offer this host, take new work), `off` (no link) or
   `drain` (keep the link, so what's placed here stays reachable; take no
@@ -1096,9 +1096,9 @@ on a fleet hub's connection.
   what's here go on).
 - `hub`: the hub's ssh target, as `machines.add` takes one; `null` when
   none was set. Kept when lending goes `off`.
-- `name`: the name this host offers itself under: the one set, else the
-  hostname's first label; `null` when neither is a valid machine name.
-  `lend.set {name: ""}` clears it.
+- `name`: the name this host offers itself under: `member.toml`'s
+  ([`member.*`](#member)), else the hostname's first label; `null` when
+  neither is a valid machine name.
 - `fleet_root`: `<data>/devsandbox/fleet/<hub>/`, all the hub reaches
   (canonical while lending); `null` without a `hub`.
 - `link`: `off`, `connecting` (the first attempt hasn't ended),
@@ -1106,9 +1106,35 @@ on a fleet hub's connection.
   the backoff). `error` is also set while `off` when the file says lend
   but lending couldn't start.
 
-`lend.set` restarts the link only for a new `hub` or `name` (the old ssh
-killed first); `on` ↔ `drain` keeps it, and the next dial offers the new
-state.
+`lend.set` restarts the link only for a new `hub` (the old ssh killed
+first), `member.set` for a new `name`; `on` ↔ `drain` keeps it, and the
+next dial offers the new state.
+
+### `member.*`
+
+This host as a fleet member: `member.toml`
+([fleet.md](../architecture/daemon/fleet.md#member-member)). The daemon is
+its only writer; `[allow]`, `[caps]` and `dev-builds` are edited by hand
+and have no param. Local only: both are denied on a fleet hub's
+connection.
+
+| method | params | result | errors |
+|---|---|---|---|
+| `member.get` | `{}` | `{"name", "trust", "dev_builds", "roots"}` | `internal` (`member.toml` doesn't parse), `failed` (no data dir) |
+| `member.set` | `{"name"?, "trust"?, "roots_add"?, "roots_rm"?}`: each one given is changed | as `member.get`, after the change | `invalid` (an unknown param or `trust`, a bad `name`, a relative root), `failed` (no data dir), `internal` (`member.toml` doesn't read or write) |
+
+- `name`: the name this host goes by in the fleet: the one set, else the
+  hostname's first label; `null` when neither is a valid machine name.
+  `member.set {name: ""}` clears it. A change restarts a lending link
+  under the new name.
+- `trust`: `worker` (the default: a remote caller reaches this host's
+  roots and its fleet root, placed work under the worker policy) or
+  `full` (the whole API, no worker policy, the hub's dev builds taken)
+  ([fleet.md](../architecture/daemon/fleet.md#trust)).
+- `dev_builds`: `member.toml`'s `dev-builds`, as the file says.
+- `roots`: config roots shown to the fleet besides those with instances
+  here (absolute paths). `roots_add` adds each one not there yet,
+  `roots_rm` drops each one named.
 
 ### `capacity.get`
 

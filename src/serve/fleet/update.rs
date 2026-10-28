@@ -110,9 +110,9 @@ pub enum Decision {
 
 /// The worker follows the hub's exact build (pure): semver, git hash and
 /// `published` all equal is the same build. Another dev build is taken
-/// only for this worker's platform and with `dev_builds` (`lend.toml`'s
-/// `dev-builds`); the platform is checked first, since `dev-builds` can't
-/// help there.
+/// only for this worker's platform and with `dev_builds` (`member.toml`'s
+/// `dev-builds`, or trust `full`: `fleet::member::Member::takes_dev_builds`);
+/// the platform is checked first, since `dev-builds` can't help there.
 pub fn decide(ours: &Build, hub: &Build, our_platform: &str, hub_platform: &str, dev_builds: bool) -> Decision {
     if ours == hub {
         Decision::Same
@@ -121,7 +121,10 @@ pub fn decide(ours: &Build, hub: &Build, our_platform: &str, hub_platform: &str,
     } else if hub_platform != our_platform {
         Decision::Stop(format!("dev build: can't run on {our_platform} (the hub runs {} for {hub_platform})", hub.label()))
     } else if !dev_builds {
-        Decision::Stop(format!("dev build: dev-builds is off in lend.toml (the hub runs {})", hub.label()))
+        Decision::Stop(format!(
+            "dev build: not taken (`dev-builds = true` in member.toml or `devsandbox machine trust full` takes it; the hub runs {})",
+            hub.label()
+        ))
     } else {
         Decision::Receive
     }
@@ -408,7 +411,10 @@ pub(crate) mod tests {
         assert_eq!(decide(&build("0.8.0", "eeee", false), &dev, lx, lx, true), Decision::Receive, "another dev build");
         assert_eq!(
             decide(&ours, &dev, lx, lx, false),
-            Decision::Stop("dev build: dev-builds is off in lend.toml (the hub runs 0.8.0 (dev, dddd))".into())
+            Decision::Stop(
+                "dev build: not taken (`dev-builds = true` in member.toml or `devsandbox machine trust full` takes it; the hub runs 0.8.0 (dev, dddd))"
+                    .into()
+            )
         );
         let mismatch = Decision::Stop("dev build: can't run on linux/x86_64 (the hub runs 0.8.0 (dev, dddd) for macos/aarch64)".into());
         assert_eq!(decide(&ours, &dev, lx, mac, true), mismatch);

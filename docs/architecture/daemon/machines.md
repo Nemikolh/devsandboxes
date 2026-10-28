@@ -511,6 +511,10 @@ column, and `offered` as an offered machine's `TARGET`; `LEND` and
 (`machines.list`'s `capacity`, `-` before one came), the over-cap note in
 parentheses. `rm` forgets the machine.
 
+`trust [worker|full]` is about this host, not a registered machine: a
+client of `member.*` (this host's `member.toml`;
+[fleet.md](fleet.md#trust)).
+
 ## Dashboard
 
 `src/tui/remote.rs`: rows are keyed `machine/name` (bare for local),

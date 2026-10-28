@@ -1134,7 +1134,7 @@ mod tests {
             let e = plan_of(args, Some("box"), m).unwrap_err().to_string();
             assert_eq!(e, "--here runs on this host; it doesn't go with --machine box", "{args:?}");
         }
-        for (args, what) in [(&["inbox", "ls"][..], "inbox"), (&["machine", "ls"], "machine"), (&["serve"], "serve"), (&["api", "--stdio"], "api"),
+        for (args, what) in [(&["inbox", "ls"][..], "inbox"), (&["machine", "ls"], "machine"), (&["machine", "trust", "full"], "machine"), (&["serve"], "serve"), (&["api", "--stdio"], "api"),
             (&["tunnel", "--service", "db", "--port", "5432"], "tunnel")]
         {
             let e = plan_of(args, Some("box"), m).unwrap_err().to_string();

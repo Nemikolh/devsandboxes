@@ -418,6 +418,8 @@ mod tests {
             ("fleet.agent", json!({"worker": "w"}), Err("denied")),
             ("lend.get", p.clone(), Err("denied")),
             ("lend.set", json!({"state": "off"}), Err("denied")),
+            ("member.get", p.clone(), Err("denied")),
+            ("member.set", json!({"trust": "full"}), Err("denied")),
             ("shutdown", p.clone(), Err("denied")),
             ("helper.call", p.clone(), Err("denied")),
             ("forwards.add", p.clone(), Err("denied")),

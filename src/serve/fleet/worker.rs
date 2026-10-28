@@ -20,7 +20,7 @@
 //! `Hello`) with this one's (`update::decide`): another published build is
 //! downloaded, installed and handed off to (`update::update`), the link
 //! dropped meanwhile. Another dev build for this platform, with
-//! `lend.toml`'s `dev-builds` on, keeps the link up serving no `API`
+//! `member.toml`'s `dev-builds` on (or trust `full`), keeps the link up serving no `API`
 //! stream, only the `binary` transfer the hub pushes (`update::push`); once
 //! it is in, the link is dropped and the binary installed and handed off to
 //! (`update::install_received`). Any other dev build drops the link, saying
@@ -75,8 +75,9 @@ pub type Opens = Vec<(u8, Open)>;
 pub struct Follow {
     /// The update's steps (`update::Release` in production).
     pub steps: Arc<dyn Steps>,
-    /// `lend.toml`'s `dev-builds`, read at each link's `Hello`s (a hand
-    /// edit counts from the next attempt).
+    /// `member.toml`'s `dev-builds` or trust `full`
+    /// (`fleet::member::Member::takes_dev_builds`), read at each link's
+    /// `Hello`s (a hand edit counts from the next attempt).
     pub dev_builds: Arc<dyn Fn() -> bool + Send + Sync>,
 }
 
@@ -767,7 +768,10 @@ mod tests {
         let steps = Arc::new(Fake::building(dev_hub()));
         let lent = lend_to(dev_hub(), "dev-off", Arc::clone(&steps), false, no_binary());
         let why = wait_status(&lent.lending, |w| w.starts_with("dev build"));
-        assert_eq!(why, "dev build: dev-builds is off in lend.toml (the hub runs 0.0.1 (dev, 0123abcd))");
+        assert_eq!(
+            why,
+            "dev build: not taken (`dev-builds = true` in member.toml or `devsandbox machine trust full` takes it; the hub runs 0.0.1 (dev, 0123abcd))"
+        );
         assert!(steps.calls().is_empty());
     }
 
@@ -860,6 +864,7 @@ mod tests {
         use crate::serve::daemon::tests::{opts, scratch, spawn_daemon};
         use crate::serve::endpoint;
         use crate::serve::fleet::lend::{self, Lend};
+        use crate::serve::fleet::member;
         use crate::serve::machines::{self, Entry, link as mlink};
         use crate::serve::proto::{HelloResult, Version};
 
@@ -984,12 +989,8 @@ mod tests {
             let worker_state = data.join("state.toml");
             std::fs::write(&worker_state, inst("web-w", &cfg) + &inst("own", &mine)).unwrap();
             let lend_path = data.join("lend.toml");
-            lend::write_for_test(&lend_path, &Lend {
-                state: lend::State::On,
-                hub: "me@hub".into(),
-                name: "lap".into(),
-                ..Default::default()
-            });
+            lend::write_for_test(&lend_path, &Lend { state: lend::State::On, hub: "me@hub".into() });
+            member::write_for_test(&data.join("member.toml"), &member::Member { name: "lap".into(), ..Default::default() });
 
             let (runner, verb_dir) =
                 crate::serve::verbs::tests::script_runner("fleet-lend", r#"for a; do n=$a; done; echo "hi $n path=$PATH""#);
@@ -1213,7 +1214,8 @@ mod tests {
             std::fs::create_dir_all(&fleet_root).unwrap();
             let fleet_root = std::fs::canonicalize(&fleet_root).unwrap();
             let lend_path = data.join("lend.toml");
-            lend::write_for_test(&lend_path, &Lend { state: lend::State::On, hub: "me@hub".into(), name: "lap".into(), ..Default::default() });
+            lend::write_for_test(&lend_path, &Lend { state: lend::State::On, hub: "me@hub".into() });
+            member::write_for_test(&data.join("member.toml"), &member::Member { name: "lap".into(), ..Default::default() });
             let path = std::env::var("PATH").unwrap_or_default();
             // `$3` is the `-C` root: show what's there, as the verb would see it.
             let (w_runner, w_verbs) = crate::serve::verbs::tests::script_runner(

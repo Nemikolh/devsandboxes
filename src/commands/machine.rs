@@ -1,6 +1,8 @@
 //! `devsandbox machine add|ls|set|rm` (docs/architecture/daemon/machines.md,
 //! *`devsandbox machine add|ls|set|rm`*): a client of the daemon's `machines.*`,
 //! never in-process, since the registry and the links are the daemon's.
+//! `machine trust` is likewise a client of `member.*` (this host's
+//! `member.toml`, docs/architecture/daemon/fleet.md, *Trust*).
 //!
 //! `add` without `--config` probes the machine for its candidate roots and
 //! lets the user pick (a TTY) or takes the only usable one (no TTY). The
@@ -22,6 +24,7 @@ use crate::serve::api::RootCandidate;
 use crate::serve::capacity;
 use crate::serve::client::{self, Conn};
 use crate::serve::endpoint;
+use crate::serve::fleet::member::{MemberInfo, Trust};
 use crate::serve::machines::Entry;
 use crate::serve::machines::api::{Added, MachineRow, Probed};
 use crate::serve::machines::install::{self, Dest, Plan, Remote};
@@ -224,6 +227,34 @@ pub fn set(name: &str, agent: bool) -> Result<()> {
     let _: Value = call(&mut conn, "machines.set", json!({ "name": name, "agent": agent }))?;
     println!("{name}: agent {}", on_off(agent));
     Ok(())
+}
+
+/// `machine trust [worker|full]`: set this host's trust (`member.set`), or
+/// show it (`member.get`).
+pub fn trust(to: Option<Trust>) -> Result<()> {
+    let mut conn = connect()?;
+    let info: MemberInfo = match to {
+        Some(trust) => call(&mut conn, "member.set", json!({ "trust": trust }))?,
+        None => call(&mut conn, "member.get", Value::Null)?,
+    };
+    println!("{}", trust_line(info.trust));
+    Ok(())
+}
+
+fn trust_line(trust: Trust) -> String {
+    match trust {
+        Trust::Worker => "trust: worker".into(),
+        Trust::Full => "trust: full (remote callers get this host's whole API: any root, any path, no worker policy)".into(),
+    }
+}
+
+/// `machine trust`'s value: `worker` or `full`.
+pub fn parse_trust(s: &str) -> Result<Trust, String> {
+    match s {
+        "worker" => Ok(Trust::Worker),
+        "full" => Ok(Trust::Full),
+        _ => Err(format!("`{s}` isn't `worker` or `full`")),
+    }
 }
 
 /// `--agent`'s value: `on` or `off`.
@@ -526,6 +557,17 @@ mod tests {
         for bad in ["", "yes", "true", "ON"] {
             assert!(parse_on_off(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn trust_takes_worker_or_full_and_full_says_what_it_gives() {
+        assert_eq!(parse_trust("worker"), Ok(Trust::Worker));
+        assert_eq!(parse_trust("full"), Ok(Trust::Full));
+        for bad in ["", "Full", "all"] {
+            assert!(parse_trust(bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(trust_line(Trust::Worker), "trust: worker");
+        assert!(trust_line(Trust::Full).contains("whole API"));
     }
 
     #[test]

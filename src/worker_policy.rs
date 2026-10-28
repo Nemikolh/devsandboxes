@@ -2,7 +2,8 @@
 //! what a config under a fleet root (`<data>/devsandbox/fleet/<hub>/`, the
 //! root a hub reaches on a lending host) may ask of this host, beyond
 //! containers that see only what was lent. Denied by default; each item has
-//! an allowance in `lend.toml`'s `[allow]` table ([`Allow`]).
+//! an allowance in `member.toml`'s `[allow]` table ([`Allow`]); none of it
+//! applies under `trust = "full"` ([`Trust`]).
 //!
 //! A config is under the policy by its path, whatever process runs it (a
 //! lending daemon's verb subprocess, a local CLI pointed at the dir): every
@@ -17,8 +18,8 @@
 //! `${localEnv:…}`, which `config::resolve_var` also never expands for a
 //! name [`local_env_allowed`] refuses).
 //!
-//! Cross-platform (no `serve`): `lend.toml` is read here for its `[allow]`
-//! table only.
+//! Cross-platform (no `serve`): `member.toml` is read here for its `trust`
+//! and `[allow]` only (the rest is `serve::fleet::member`'s).
 
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
@@ -29,7 +30,21 @@ use serde::{Deserialize, Serialize};
 use crate::config::{Config, ResolvedSandbox, ResolvedService, ServiceScope};
 use crate::runtime::NAME_PREFIX;
 
-/// `lend.toml`'s `[allow]`: what the worker policy permits beyond its
+/// `member.toml`'s `trust`: what a remote caller of this member's daemon
+/// reaches (docs/architecture/daemon/fleet.md, *Trust*). Here, not in
+/// `serve::fleet::member`, because the policy reads it on every platform.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Trust {
+    /// The member's own roots and the fleet root, placed work under the
+    /// worker policy.
+    #[default]
+    Worker,
+    /// The whole API, as a local client has it: no worker policy.
+    Full,
+}
+
+/// `member.toml`'s `[allow]`: what the worker policy permits beyond its
 /// defaults. Every allowance is off (empty) unless set. Unknown keys are
 /// ignored: an allowance a newer binary knows is one an older one doesn't
 /// grant.
@@ -118,8 +133,8 @@ impl fmt::Display for Refusal {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "refused by this machine's lending policy: {}", self.what)?;
         match &self.allow {
-            Some(allow) => write!(f, " (allow with {allow} under [allow] in lend.toml)"),
-            None => write!(f, " (no lend.toml allowance permits it)"),
+            Some(allow) => write!(f, " (allow with {allow} under [allow] in member.toml)"),
+            None => write!(f, " (no member.toml allowance permits it)"),
         }
     }
 }
@@ -201,13 +216,16 @@ pub fn fleet_root_of(data: &Path, dir: &Path) -> Result<Option<PathBuf>> {
     }))
 }
 
-/// `[allow]` of the `lend.toml` at `path`; missing is the defaults. Only that
-/// table is read (the rest is `serve::fleet::lend`'s), so a file that's
-/// otherwise invalid still yields its allowances; one whose `[allow]` doesn't
-/// parse is an error, never the defaults' silent stand-in.
-pub fn load_allow(path: &Path) -> Result<Allow> {
+/// `trust` and `[allow]` of the `member.toml` at `path`; missing is the
+/// defaults (`worker`, nothing allowed). Only those are read (the rest is
+/// `serve::fleet::member`'s), so a file that's otherwise invalid still
+/// yields them; one whose `trust` or `[allow]` doesn't parse is an error,
+/// never the defaults' silent stand-in.
+pub fn load_member(path: &Path) -> Result<(Trust, Allow)> {
     #[derive(Deserialize)]
     struct File {
+        #[serde(default)]
+        trust: Trust,
         #[serde(default)]
         allow: Allow,
     }
@@ -215,9 +233,9 @@ pub fn load_allow(path: &Path) -> Result<Allow> {
         Ok(text) => {
             let file: File = toml::from_str(&text).with_context(|| format!("invalid {}", path.display()))?;
             file.allow.check().with_context(|| format!("invalid {}", path.display()))?;
-            Ok(file.allow)
+            Ok((file.trust, file.allow))
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Allow::default()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((Trust::default(), Allow::default())),
         Err(e) => Err(e).with_context(|| format!("cannot read {}", path.display())),
     }
 }
@@ -240,12 +258,17 @@ impl Policy {
     }
 
     /// [`Self::for_dir`] over a given `<data>/devsandbox` and socket list.
+    /// `None` too under `trust = "full"`: no worker policy then (fleet
+    /// plan decision 9).
     pub fn detect(data: &Path, dir: &Path, sockets: Vec<PathBuf>) -> Result<Option<Policy>> {
         let data = data.canonicalize().unwrap_or_else(|_| data.to_path_buf());
         let Some(root) = fleet_root_of(&data, dir)? else {
             return Ok(None);
         };
-        let allow = load_allow(&data.join("lend.toml"))?;
+        let (trust, allow) = load_member(&data.join("member.toml"))?;
+        if trust == Trust::Full {
+            return Ok(None);
+        }
         Ok(Some(Policy { root, data, allow, sockets }))
     }
 
@@ -744,14 +767,22 @@ mod tests {
         let (data2, _, outside2) = fixture("detect-none");
         std::fs::remove_dir_all(data2.join("fleet")).unwrap();
         assert_eq!(fleet_root_of(&data2, &outside2).unwrap(), None);
-        // `detect` reads `[allow]` off lend.toml next to it.
-        std::fs::write(data.join("lend.toml"), "state = \"on\"\nhub = \"me@hub\"\n[allow]\nprivileged = true\n").unwrap();
+        // `detect` reads `[allow]` off member.toml next to it, not lend.toml.
+        std::fs::write(data.join("lend.toml"), "[allow]\nhost-network = true\n").unwrap();
+        std::fs::write(data.join("member.toml"), "name = \"lap\"\n[allow]\nprivileged = true\n").unwrap();
         let p = Policy::detect(&data, &cfg, Vec::new()).unwrap().unwrap();
         assert!(p.allow.privileged && !p.allow.host_network);
         assert!(Policy::detect(&data, &outside, Vec::new()).unwrap().is_none());
-        std::fs::write(data.join("lend.toml"), "[allow]\nprivileged = 1\n").unwrap();
+        std::fs::write(data.join("member.toml"), "trust = \"worker\"\n").unwrap();
+        assert_eq!(Policy::detect(&data, &cfg, Vec::new()).unwrap().unwrap().allow, Allow::default());
+        // Under `full`, no policy at all.
+        std::fs::write(data.join("member.toml"), "trust = \"full\"\n").unwrap();
+        assert!(Policy::detect(&data, &cfg, Vec::new()).unwrap().is_none());
+        std::fs::write(data.join("member.toml"), "trust = \"most\"\n").unwrap();
+        assert!(Policy::detect(&data, &cfg, Vec::new()).is_err(), "a bad trust fails, not the defaults");
+        std::fs::write(data.join("member.toml"), "[allow]\nprivileged = 1\n").unwrap();
         assert!(Policy::detect(&data, &cfg, Vec::new()).is_err(), "a bad [allow] fails, not the defaults");
-        std::fs::write(data.join("lend.toml"), "[allow]\nbinds = [\"rel\"]\n").unwrap();
+        std::fs::write(data.join("member.toml"), "[allow]\nbinds = [\"rel\"]\n").unwrap();
         assert!(Policy::detect(&data, &cfg, Vec::new()).is_err());
     }
 
@@ -779,9 +810,9 @@ mod tests {
         let r = Refusal::new("privileged", "privileged = true");
         assert_eq!(
             r.to_string(),
-            "refused by this machine's lending policy: privileged (allow with privileged = true under [allow] in lend.toml)"
+            "refused by this machine's lending policy: privileged (allow with privileged = true under [allow] in member.toml)"
         );
-        assert!(Refusal::always("runtime flag `--cap-add`").to_string().ends_with("(no lend.toml allowance permits it)"));
+        assert!(Refusal::always("runtime flag `--cap-add`").to_string().ends_with("(no member.toml allowance permits it)"));
     }
 
     #[test]

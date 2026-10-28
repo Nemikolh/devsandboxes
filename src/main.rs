@@ -510,6 +510,18 @@ enum MachineCommand {
     },
     /// Unregister a machine (nothing on it changes)
     Rm { name: String },
+    /// Show or set what other machines reach on this host (its fleet trust)
+    ///
+    /// `worker` (the default): this host's own roots and its fleet root,
+    /// placed work under the worker policy. `full`: its whole API, as a
+    /// local client has it (any root, any path, no worker policy, the hub's
+    /// dev builds taken). Only ever set here, on this host.
+    ///
+    ///     devsandbox machine trust full
+    Trust {
+        #[arg(value_name = "worker|full", value_parser = commands::machine::parse_trust)]
+        trust: Option<serve::fleet::member::Trust>,
+    },
 }
 
 #[cfg(unix)]
@@ -863,6 +875,7 @@ fn main() -> Result<()> {
             MachineCommand::Ls { json } => commands::machine::ls(json),
             MachineCommand::Set { name, agent } => commands::machine::set(&name, agent),
             MachineCommand::Rm { name } => commands::machine::rm(&name),
+            MachineCommand::Trust { trust } => commands::machine::trust(trust),
         },
         #[cfg(unix)]
         Command::Lend { cmd } => {

@@ -5,9 +5,10 @@ Machines as one pool of capacity (the plan:
 primitive the fleet's links are built on (the machines'
 [agent relay](machines.md#agent) runs on it too) and both sides of a
 worker's link: on the hub the offer, the offered registry entry and its
-dial, and [hub mode](#hub-mode); on the worker `lend.toml`, the lending thread, the lent API, the
-worker policy and `lend.*` with its CLI, `devsandbox lend` and
-`devsandbox fleet join|leave`
+dial, and [hub mode](#hub-mode); on the worker `lend.toml`,
+`member.toml`, the lending thread, the lent API, the worker policy,
+`lend.*` and `member.*` with their CLI, `devsandbox lend`,
+`devsandbox fleet join|leave` and `devsandbox machine trust`
 ([ADR 0041](../../decisions/0041-fleet-workers-dial-their-hub.md)); and
 every daemon's [capacity report](#capacity), carried by its snapshots,
 and [placement](#placement), which scores it and which the hub's `run`
@@ -44,11 +45,14 @@ Code: `src/serve/fleet/mod.rs` (`LINK`), `src/serve/fleet/link.rs`
 `of`, `machines`, `load`, `save`, `save_wait`), `src/serve/snapshots.rs`
 (`Machine::set_link`, `Remotes::restore`), `src/devsbd/proto.rs` (`channel::API`, `channel::PTY`,
 `channel::TUNNEL`, `channel::AGENT` and their `caps`, `channel::flows`); the worker side: `src/serve/fleet/lend.rs` (`Lend`,
-`load`, `check`, `update`, `fleet_root`, `fleet_dir_name`, `default_name`),
+`load`, `check`, `update`, `fleet_root`, `fleet_dir_name`),
+`src/serve/fleet/member.rs` (`Member`, `SoftCaps`, `load`, `check`,
+`update`, `default_name`, `merge`, `call`, `MemberInfo`),
 `src/serve/fleet/worker.rs` (`Lending`, `Status`, `link_argv`, `Transport`),
-`src/serve/fleet/lender.rs` (`Lender`, `call`, `merge`, `transition`,
-`LendInfo`), `src/serve/locked_file.rs` (`update`),
+`src/serve/fleet/lender.rs` (`Lender`, `Lender::reapply`, `call`, `merge`,
+`transition`, `LendInfo`), `src/serve/locked_file.rs` (`update`),
 `src/commands/lend.rs` (`show`, `set_state`, `join`, `leave`, `busy`),
+`src/commands/machine.rs` (`trust`),
 `src/serve/fleet/lent.rs` (`Scope`, `decide`, `admit`, `confine_path`,
 `filter_answer`, `filter_snapshot`), `src/serve/daemon.rs`
 (`start_lending`, `Table`, `Shared::open_lent`, `Shared::open_lent_pty`,
@@ -70,7 +74,7 @@ Code: `src/serve/fleet/mod.rs` (`LINK`), `src/serve/fleet/link.rs`
 `exec_context`), `src/serve/helper.rs` (`HelperClient::call_with_input`,
 `Input`), `src/serve/api.rs` (`sessions_list`, `sessions_rm`,
 `session_container`, `helper_rpc`, `SessionsList`), `src/worker_policy.rs`
-(`Allow`, `Policy`, `fleet_root_of`, `load_allow`, `enforce`,
+(`Trust`, `Allow`, `Policy`, `fleet_root_of`, `load_member`, `enforce`,
 `enforce_argv`, `Refusal`); capacity: `src/serve/capacity.rs`
 (`Capacity`, `Caps`, `HostFacts`, `EngineCache`, `parse_meminfo`,
 `parse_size`, `over_caps`, `over_note`, `summary`, `lend_label`),
@@ -88,7 +92,7 @@ placement: `src/serve/fleet/place.rs` (`place`, `score`, `Spec`,
 `src/serve/daemon.rs` (`placed_run`, `fresh_capacities`,
 `remote_verb`, `Shared::capacity`, `Options::local_capacity`,
 `Options::repos`), `src/serve/capacity.rs` (`HostCapacity`,
-`Capacity::with_lend`), `src/serve/fleet/lent.rs` (`refuse_new_work`,
+`Capacity::with_own`), `src/serve/fleet/lent.rs` (`refuse_new_work`,
 `DRAINING`), `src/serve/fleet/lender.rs` (`Lender::draining`),
 `src/serve/verbs.rs` (`RunParams::here`), `src/serve/verbs_client.rs`
 (`run_target`, `Streaming`), `src/serve/machines/cli.rs` (`plan`);
@@ -505,7 +509,7 @@ next; a new watch's first, disk-depth push has none. On demand,
 ([api](../../reference/api.md#capacityget)): `capacity::HostCapacity`
 holds the one `EngineCache` and the running count the poll sets from
 every listing (watched or not), and the daemon adds `lend.toml`'s state
-and caps (`Shared::capacity`, `Capacity::with_lend`); tests replace the
+and `member.toml`'s caps (`Shared::capacity`, `Capacity::with_own`); tests replace the
 rest with `Options::local_capacity`. It is lent on the Worker table, so
 a hub asks its workers before it places.
 
@@ -531,9 +535,9 @@ a hub asks its workers before it places.
   and strays don't count), every instance on the host, the fleet root's
   or not.
 - **`lending` and `caps`**: `lend.toml`'s `state` (none without a
-  `lend.toml`) and its `[caps]` in bytes (`Caps::of`; none when no cap is
-  set), read through the daemon's `Lender::file` each time, so a hand
-  edit shows on the next report.
+  `lend.toml`) and `member.toml`'s `[caps]` in bytes (`Caps::of`; none
+  when no cap is set), read through the daemon's `Lender::own`
+  (`capacity::Own`) each time, so a hand edit shows on the next report.
 
 **Soft caps never refuse.** `capacity::over_caps` (pure) lists what
 exceeds one: memory in use (`mem_total - mem_available`) over `mem`,
@@ -679,29 +683,41 @@ is the same verb request, so it is placed too.
 A worker lends itself to one hub, through `lend.toml`; the hub reaches
 it only through the link the worker holds, and there only through the
 lent API ([ADR 0041](../../decisions/0041-fleet-workers-dial-their-hub.md)).
+What the worker is as a fleet member (its name, trust and the rest) is
+`member.toml`'s.
 
 - **`lend.toml`** (`<data>/devsandbox/lend.toml`, next to `state.toml`,
   `fleet::lend::path`) is the worker's own; the hub never writes it. Keys:
-  `state` (`on` | `off` | `drain`; absent is `off`), `hub` (the hub's ssh
-  target, as `machine add` takes one), `name` (what this host offers itself
-  as; absent is the hostname's first label, `lend::default_name`, which
-  must pass `machines::check_name`), `dev-builds` (take the hub's own
-  binary when it runs a dev build, [Versions](#versions); absent is
-  `false`, left out of the file while `false`), an `[allow]` table, the
-  [worker policy](#worker-policy)'s allowances, and a `[caps]` table, the
-  soft caps of the [capacity report](#capacity) (`lend::SoftCaps`:
-  `cpus`, `mem`, `disk`, `instances`, each optional; `mem` and `disk`
-  sizes like `16G`, checked by `capacity::parse_size`). Unknown keys are
-  ignored. `dev-builds`, `[allow]` and `[caps]` are edited by hand:
-  `lend.set` changes none of them. `lend::load`
-  reads it (missing is not lending); `lend::check`: lending (`on`/`drain`)
-  requires a `hub`, and a `hub` or `name` that's set must be valid. The
+  `state` (`on` | `off` | `drain`; absent is `off`) and `hub` (the hub's
+  ssh target, as `machine add` takes one). Unknown keys are ignored.
+  `lend::load` reads it (missing is not lending); `lend::check`: lending
+  (`on`/`drain`) requires a `hub`, and a `hub` that's set must be valid. The
   daemon reads it at start (`daemon::start_lending`, `Lender::start`;
   `Options::lend` in tests; a bad file is logged and nothing lends) and is
   its only writer ([Lending: `lend.*`](#lending-lend)): `lend::update`, a
   read-modify-write under the sibling `lend.lock`, written to a temp file
-  and renamed (`locked_file::update`, which `machines.toml` and
-  `forwards.toml` are written with too).
+  and renamed (`locked_file::update`, which `machines.toml`,
+  `forwards.toml` and `member.toml` are written with too).
+- **`member.toml`** (`<data>/devsandbox/member.toml`, next to
+  `state.toml`, `fleet::member::path`; beside `Options::lend` in tests) is
+  this host as a member. Keys: `name` (what this host offers itself as;
+  absent is the hostname's first label, `member::default_name`, which
+  must pass `machines::check_name`), `trust` (`worker` | `full`, absent is
+  `worker`: [Trust](#trust)), `dev-builds` (take the hub's own binary
+  when it runs a dev build, [Versions](#versions); absent is `false`, left
+  out of the file while `false`), `roots` (config roots this host shows
+  the fleet besides those its `state.toml` has instances in, absolute),
+  an `[allow]` table, the [worker policy](#worker-policy)'s allowances,
+  and a `[caps]` table, the soft caps of the
+  [capacity report](#capacity) (`member::SoftCaps`: `cpus`, `mem`,
+  `disk`, `instances`, each optional; `mem` and `disk` sizes like `16G`,
+  checked by `capacity::parse_size`). Unknown keys are ignored.
+  `member::check`: a `name` that's set is valid, `roots` are absolute,
+  `[caps]` and `[allow]` well-formed. The daemon is its only writer
+  ([Member: `member.*`](#member-member)), with `member::update` (the
+  `lend.toml` discipline, under `member.lock`); `dev-builds`, `[allow]`
+  and `[caps]` are edited by hand (no call changes them) and read at each
+  use.
 - **The fleet root** for a hub is `<data>/devsandbox/fleet/<hub>/`
   (`lend::fleet_root`), `<hub>` the target made one plain path component
   (`lend::fleet_dir_name`: the host, `user@host`, plus `_<port>` for a URL's
@@ -723,7 +739,7 @@ lent API ([ADR 0041](../../decisions/0041-fleet-workers-dial-their-hub.md)).
   Its `Status` is `Connecting` until the first attempt ends, `Connected`
   once the `Hello`s are through, `Retrying(why)` after a failure (why with
   ssh's stderr tail). Dropping the thread (`lend.set` off or to another
-  hub or name, the daemon exiting after its drain: `Lender::stop`) shuts
+  hub, `member.set` to another name, the daemon exiting after its drain: `Lender::stop`) shuts
   the link's socket and kills the ssh. The transport is
   `fleet::worker::Transport` (`ssh::spawn` in production;
   `Options::lend_transport` in tests). A lending daemon never idles out
@@ -768,11 +784,13 @@ A worker follows its hub's exact build, an older one included
   one release being built for several. `devsandbox fleet-hello` (hidden)
   prints `HELLO`.
 - **The decision** (`update::decide`, pure, over this build and platform,
-  the hub's from the answerer's `on_ready`, and `lend.toml`'s `dev-builds`,
-  read at each link's `Hello`s through `worker::Follow::dev_builds`): the
+  the hub's from the answerer's `on_ready`, and whether this host takes
+  dev builds: `member.toml`'s `dev-builds`, or trust `full`
+  (`member::Member::takes_dev_builds`), read at each link's `Hello`s
+  through `worker::Follow::dev_builds`): the
   same semver, git and kind is `Same`, and the link serves; another build
   that is published is `Download { version }`; another dev build is
-  `Receive` when the platforms are equal and `dev-builds` is on, else
+  `Receive` when the platforms are equal and dev builds are taken, else
   `Stop(why)`. `Download` and `Stop` refuse the link (`End::Refused`)
   before the first stream, so the hub's offer registers the worker but
   its link finds it gone; `Receive` keeps the link up serving only the
@@ -780,8 +798,9 @@ A worker follows its hub's exact build, an older one included
 - **`Stop`** stops offering, retried at the next attempt. `lend.get`'s
   error is `dev build: can't run on <our os>/<arch> (the hub runs <hub
   build> for <its os>/<arch>)`, checked first since `dev-builds` can't
-  help there, else `dev build: dev-builds is off in lend.toml (the hub
-  runs <hub build>)`.
+  help there, else `` dev build: not taken (`dev-builds = true` in
+  member.toml or `devsandbox machine trust full` takes it; the hub runs
+  <hub build>) ``.
 - **`Receive`**, the hub's side: `fleet-link`, once its offer is made,
   pushes its own binary when `update::hub_pushes` (over both `Hello`s:
   the worker, taking dev builds, would `Receive`), from a thread of its
@@ -793,7 +812,7 @@ A worker follows its hub's exact build, an older one included
   `Hello`, so the build the worker decided on. The hub pushes rather
   than waiting to be asked: the worker's decision stands either way,
   since it refuses the header (no body sent) unless it waits for a
-  binary, and a worker with `dev-builds` off has refused the link before
+  binary, and a worker taking no dev builds has refused the link before
   the push opens; no request kind or round trip is needed. A failed push
   is on `fleet-link`'s stderr.
 - **`Receive`**, the worker's side: the link's `API` streams are refused
@@ -857,15 +876,15 @@ at once, without watching the file. Never on a `Worker` connection
 (`lent::decide` denies them). Wire: [`lend.*`](../../reference/api.md#lend).
 
 - **`lend.get`** answers `LendInfo`: the file's `state` and `hub`, the
-  `name` offered (the file's, else `lend::default_name` of the hostname;
-  `null` when neither is valid), the `fleet_root` (canonical while
+  `name` offered (`member.toml`'s, else `member::default_name` of the
+  hostname; `null` when neither is valid), the `fleet_root` (canonical while
   lending), and the link: `off`, `connecting`, `connected` or `retrying`,
   with `error` the `Retrying` reason, or why lending didn't start while
   the file says lend.
-- **`lend.set {state?, hub?, name?}`** merges what's given into the file
-  (`lender::merge`, pure: `hub` non-empty and a valid target; `name` a
-  `machines::check_name`, `""` clears it; lending needs a `hub`) and, when
-  it lends, checks the name it would offer, all before writing; then
+- **`lend.set {state?, hub?}`** merges what's given into the file
+  (`lender::merge`, pure: `hub` non-empty and a valid target; lending
+  needs a `hub`) and, when it lends, checks the name it would offer
+  (`member.toml`'s), all before writing; then
   applies it under the `Lender`'s lock (`lender::transition`, pure, over
   the running thread's and the wanted `(hub, name)`): nothing running and
   lending starts one (its fleet root created); off stops it; another hub
@@ -885,8 +904,8 @@ both commands (`serve::machines::cli::machine_use`):
 - `devsandbox lend` / `lend show`: `lend.get` as a one-row table (`STATE`,
   `HUB`, `NAME`, `LINK`, `FLEET ROOT`), then the error if any.
   `lend on|off|drain`: `lend.set {state}`.
-- `devsandbox fleet join <hub> [--name N]`: `lend.set {hub, name?, state:
-  on}`.
+- `devsandbox fleet join <hub> [--name N]`: `member.set {name}` when
+  `--name` is given, then `lend.set {hub, state: on}`.
 - `devsandbox fleet leave`: `lend.set {state: drain}`, then
   `instances.list {dir: <fleet root>, depth: listing}` every 2 s until
   `commands::lend::busy` (pure, over its rows) finds no instance whose
@@ -894,6 +913,39 @@ both commands (`serve::machines::cli::machine_use`):
   stderr names them when that set changes), then `lend.set {state: off}`.
   Ctrl-C ends the wait and leaves lending at `drain`. Not lending: it says
   so and changes nothing.
+
+### Member: `member.*`
+
+`member.toml` is the daemon's too (decision 3 of the fleet plan):
+`member.get` and `member.set` (`fleet::member::call`, over the
+`Lender`'s `member.toml` path and hostname) are the only way to change
+it. Local only: never on a `Worker` connection (`lent::decide` denies
+them). Wire: [`member.*`](../../reference/api.md#member).
+
+- **`member.get`** answers `MemberInfo`: the `name` this host goes by
+  (`Member::name_or`: the file's, else the hostname's first label; `null`
+  when neither is valid), `trust`, `dev_builds` as the file says, and
+  `roots`.
+- **`member.set {name?, trust?, roots_add?, roots_rm?}`** merges what's
+  given into the file (`member::merge`, pure: `name` a
+  `machines::check_name`, `""` clears it; `roots_add` absolute, one
+  already there kept once; `roots_rm` drops what it names), checks it and
+  writes it; a change of the resolved name re-applies lending at once
+  (`Lender::reapply`), so a lending thread restarts under the new name as
+  a new hub restarts it. It answers the `MemberInfo` after the change.
+
+### Trust
+
+`member.toml`'s `trust` is this member's own setting, changed only on it:
+`devsandbox machine trust [worker|full]` (`commands::machine::trust`) is
+`member.set {trust}`, or `member.get` without an argument, printing the
+trust (under `full`, with a note that remote callers get this host's
+whole API); `--machine` refuses it with the rest of `machine`
+(`serve::machines::cli::machine_use`). `worker` is the default: a hub
+reaches this host through the [Worker table](#the-worker-table), placed
+work under the [worker policy](#worker-policy). `full` lifts the worker
+policy (`worker_policy::Policy::detect` answers none) and takes the hub's
+dev builds ([Versions](#versions)).
 
 ### The Worker table
 
@@ -912,7 +964,7 @@ while the lending thread drains is `denied`, `lent::DRAINING`) and
   (`denied`) any request with a `machine` param or `machines: true`
   (nothing federates past the worker), a verb with `all` (`--all` is every
   instance in `state.toml`, not the root's), and every other method:
-  `machines.*`, `fleet.*`, `lend.*`, `shutdown`, `helper.call`, `forwards.*`,
+  `machines.*`, `fleet.*`, `lend.*`, `member.*`, `shutdown`, `helper.call`, `forwards.*`,
   `bridges.ensure`, `roots.list`, the Inbox. Refusals are logged.
 - **Paths**: a `root` or `dir` param must be absolute, have no `..`, and
   canonicalize (symlinks resolved) under the fleet root
@@ -1244,7 +1296,8 @@ run of failures is on `fleet-link`'s stderr.
 
 What a config under a fleet root may ask of the host beyond containers
 that see only what was lent (`src/worker_policy.rs`). Denied by default;
-every item has an allowance in `lend.toml`'s `[allow]`.
+every item has an allowance in `member.toml`'s `[allow]`, and none of it
+applies under `trust = "full"` ([Trust](#trust)).
 
 - **Under the policy by path.** A config dir whose canonical path is
   under `<data>/devsandbox/fleet/` (`fleet_root_of`: symlinks count where
@@ -1252,9 +1305,10 @@ every item has an allowance in `lend.toml`'s `[allow]`.
   below `fleet/`, whatever process runs it: a lending daemon's verb
   subprocess or a local CLI pointed at the dir. No flag carries it: each
   check point calls `Policy::for_dir` (the data dir from `$XDG_DATA_HOME` /
-  `$HOME`, as `state.toml`'s) itself, and reads `[allow]` off `lend.toml`
-  next to `state.toml` (`load_allow`: that table only, so it is read
-  without `serve`; one that doesn't parse fails the verb).
+  `$HOME`, as `state.toml`'s) itself, and reads `trust` and `[allow]` off
+  `member.toml` next to `state.toml` (`load_member`: those only, so it is
+  read without `serve`; one that doesn't parse fails the verb). Under
+  `full`, `Policy::detect` answers no policy.
 - **The final argv is the authority.** `Policy::check_run` checks the
   `run` argv of every container right before it reaches the runtime: the
   sandbox's in `commands::run::run_container` (after features, identity,
@@ -1318,8 +1372,8 @@ every item has an allowance in `lend.toml`'s `[allow]`.
   them after its instance exists.
 - **The refusal** (`Refusal`) names the item and its allowance:
   `refused by this machine's lending policy: privileged (allow with
-  privileged = true under [allow] in lend.toml)`; an item no allowance
-  covers ends `(no lend.toml allowance permits it)`.
+  privileged = true under [allow] in member.toml)`; an item no allowance
+  covers ends `(no member.toml allowance permits it)`.
 
 | `[allow]` key | permits |
 |---|---|
