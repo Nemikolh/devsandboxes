@@ -57,8 +57,9 @@ limitation means editing this file in the same commit.
   service, or HTTP proxying over the helper. → [plan](plans/active/cli-proxy.md)
 - **instances**: auto-mount a shared `.agents/skills` folder read-only into
   every instance. → [plan](plans/active/agents-skills.md)
-- **daemon**: `rename`, `done`/`undone`, `gc`, `service ls` as daemon verbs
-  (they run in the CLI process; the API has `instances.rename`/`instances.done`).
+- **daemon**: `rename`, `done`/`undone`, a local `gc`, `service ls` as daemon verbs
+  (they run in the CLI process; the API has `instances.rename`/`instances.done`,
+  and `gc` is a verb for an offered worker's `--machine m gc`).
 - **npm**: typed verb helpers (`api.run(…)`); `ApiInstances` has only `list`.
 - **config**: `runArgs` pass-through, `envFile`, secrets; `devsandbox init`
   scaffolding.
@@ -274,9 +275,6 @@ limitation means editing this file in the same commit.
 - The npm client's `forwards.list(dir)` can't pass `machines` (the typed
   `call('forwards.list', {machines: true})` can).
   → [api](reference/api.md#forwards); `npm/devsandboxes/index.js`
-- `--machine <offered worker> gc` is refused: host maintenance on the
-  worker is outside a fleet worker's trust.
-  → [machines](architecture/daemon/machines.md#the-cli-clirs); `machines::cli::offered::refusal`
 - `logs --build --follow` on an offered worker's instance reads the
   worker's `build.log` by path, page by page: a new build rotating it
   mid-follow isn't followed into `build.1.log` as a local follow (which

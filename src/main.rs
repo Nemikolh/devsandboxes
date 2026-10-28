@@ -700,7 +700,8 @@ fn main() -> Result<()> {
         std::process::exit(2);
     };
 
-    // The five verbs and `service rebuild` go to the daemon
+    // The five verbs and `service rebuild` (and `--machine m gc` on an
+    // offered fleet worker) go to the daemon
     // (docs/architecture/daemon/verbs.md, docs/reference/api.md *Verbs*); it runs
     // them as `--in-process` subprocesses, which take the arms below. With
     // no daemon to reach, `fallback` says why and they run here instead.
@@ -727,7 +728,7 @@ fn main() -> Result<()> {
     #[cfg(unix)]
     let fed = serve::verbs_client::Fed { machines: !machines.is_empty(), machine: cli.machine.clone() };
     #[cfg(unix)]
-    let (command, fallback) = match serve::verbs_client::from_command(&command).filter(|_| !cli.in_process) {
+    let (command, fallback) = match serve::verbs_client::from_command(&command, cli.machine.as_deref()).filter(|_| !cli.in_process) {
         Some(verb) => match serve::verbs_client::run(&cli.dir, verb, &fed)? {
             serve::verbs_client::Done::Exit(code) => std::process::exit(code),
             serve::verbs_client::Done::InProcess(why) => {

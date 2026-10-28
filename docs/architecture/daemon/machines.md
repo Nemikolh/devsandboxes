@@ -485,11 +485,13 @@ env's own `SSH_AUTH_SOCK` (the machine's agent, if any) stays.
   `containers.list`, `stats [--json]` one `containers.stats`
   (`offered::listing`): the worker answers its whole runtime's rows cut to
   what its trust reaches (those instances' containers and their config
-  roots' services, [fleet](fleet.md#the-trust-table)). Refused, naming the
-  command (`offered::refusal`): `vscode` (not over a fleet link yet), a
-  session `exec` without a tty (a session over the link needs a
-  terminal), and `gc` (host maintenance on the worker, outside a
-  worker's trust).
+  roots' services, [fleet](fleet.md#the-trust-table)). `--machine m gc
+  [--force]` (`offered::Use::Gc`) is handed on to `verbs_client`: the `gc`
+  verb per config root (`config_roots`, as `ls`), each after its banner;
+  the worker runs it under `full` trust only, its `worker` refusal is the
+  error. Refused, naming the command (`offered::refusal`): `vscode` (not
+  over a fleet link yet), and a session `exec` without a tty (a session
+  over the link needs a terminal).
 
 ## `devsandbox machine add|ls|set|rm|trust|roots`
 

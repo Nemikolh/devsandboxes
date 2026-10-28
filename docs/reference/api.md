@@ -30,7 +30,7 @@ checks the typings against the wire structs).
 | containers, config | `containers.logs\|inspect\|list\|stats`, `sandboxes.list\|get`, `services.get`, `config.findings\|migrate\|ack` | yes |
 | | `roots.list` | no |
 | bridges, forwards | `bridges.ensure`, `helper.call`, `forwards.list\|add\|rm` | no |
-| verbs | `run`, `rebuild`, `start`, `stop`, `rm`, `services.rebuild` | yes (own ssh) |
+| verbs | `run`, `rebuild`, `start`, `stop`, `rm`, `services.rebuild`, `gc` | yes (own ssh) |
 | machines | `machines.probe\|add\|list\|get\|rm`, `fleet.offer\|agent` (internal), `lend.get\|set`, `member.get\|set`, `capacity.get` | no |
 
 Notifications: `inbox.changed`, `inbox.shown`, `instances.changed`,
@@ -130,8 +130,8 @@ either trust, as is a hello's handoff. Under `trust = "worker"` (the
 default) the caller may call `hello`, `subscribe` / `unsubscribe`
 (`instances` only), `instances.watch` / `unwatch`, the quick calls (the
 `machine`-taking methods in the index but the verbs), `capacity.get`,
-`roots.list` and the verbs (`all` only while every instance here is in
-reach), never with `machine` or `machines: true`; every `root` / `dir`
+`roots.list` and the verbs but `gc` (`all` only while every instance here
+is in reach; `gc` is host maintenance, `full` only), never with `machine` or `machines: true`; every `root` / `dir`
 must be under this member's fleet root (a hub's) or exactly one of its
 own roots (`roots.list`'s plus `member.toml`'s `roots`), every named
 instance or container one of theirs; `config.migrate` / `config.ack`
@@ -878,6 +878,7 @@ and `HOME` are the caller's, never the daemon's.
 | `stop` | `instance` \| `all: true`, `detach?` |
 | `rm` | `instance`, `deleteBranch?` (`true` deletes, `false` keeps, absent: merged or gone branches go, local work stays), `force?`, `ask?`, `detach?` |
 | `services.rebuild` | `name` (a service of the config root), `detach?` |
+| `gc` | `force?`, `detach?` |
 
 `reprobe` is the CLI's `--reprobe`: the runtime's identity mode is probed
 again on the daemon's host instead of read from its cache
@@ -900,6 +901,13 @@ here.
 `services.rebuild` runs `devsandbox service rebuild <name>`: no instance
 verb, so its answer's (and `failed`'s) `instance` is always `null`, no
 `progress` comes, and `ask` doesn't apply.
+
+`gc` runs `devsandbox gc [--force]` at the root: the root's unused
+services and networks, orphaned shell history and the host's dangling
+agent links. No instance verb either (`instance` always `null`). Nothing
+can answer its per-file shell-history prompt, so without `force` those
+files are kept. A remote caller needs the member's `full` trust
+(*Remote callers*).
 
 `root` is the absolute config root (`-C`); `env` an object of strings,
 required. `instance` is resolved as the CLI's `<name>` is, but an
@@ -941,7 +949,7 @@ its envelope, for `run` with `json`), for `start` and `all` right after
 the spawn. A verb that exits first answers as usual. No notifications follow
 the answer; the client may hang up or send more requests.
 
-The held verbs (`stop`, `rm`, `services.rebuild`) take `detach` too, but
+The held verbs (`stop`, `rm`, `services.rebuild`, `gc`) take `detach` too, but
 never answer early: the answer (`confirm` included) still comes at the
 exit. For them `"detach": true` only means a hang-up before the answer
 leaves the verb running instead of cancelling it. The dashboard sends it

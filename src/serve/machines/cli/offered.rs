@@ -2,8 +2,8 @@
 //! *The CLI*; fleet plan decision 15): API calls through this host's daemon
 //! with `machine` set (the quick calls, `machines::forward::QUICK`), never
 //! a `devsandbox …` run there, printed by the local commands' own render
-//! fns so the output reads as theirs. What has no such call yet is refused
-//! ([`refusal`]).
+//! fns so the output reads as theirs; `gc` as the `gc` verb ([`Use::Gc`]).
+//! What has no such call yet is refused ([`refusal`]).
 //!
 //! [`use_of`] is the pure choice; [`named`], [`per_root`] and [`listing`] make the calls
 //! through an injected [`Call`] and write to injected streams, so the tests
@@ -50,6 +50,10 @@ pub(crate) enum Use {
     Ps { all: bool, json: bool },
     /// `--machine m stats`: `containers.stats`.
     Stats { json: bool },
+    /// `--machine m gc`: the `gc` verb per config root, sent by
+    /// `verbs_client` (`CliVerb::Gc`). The worker answers it under `full`
+    /// trust only; under `worker` its refusal is the error.
+    Gc,
     /// As on any machine: what goes over the fleet link already (a tty
     /// `exec`, its sessions, `port`) and the verbs.
     Link,
@@ -59,7 +63,6 @@ pub(crate) enum Use {
 /// What an offered machine refuses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Refused {
-    Gc,
     /// A session `exec` that gets no tty (`--attach` without a terminal,
     /// `--session` without `-t`): a session over the link needs one.
     SessionNoTty,
@@ -82,7 +85,7 @@ pub(crate) fn use_of(command: &Command) -> Use {
         Command::Status { .. } => Use::Status,
         Command::Ps { all, json } => Use::Ps { all: *all, json: *json },
         Command::Stats { json } => Use::Stats { json: *json },
-        Command::Gc { .. } => Use::Refused(Refused::Gc),
+        Command::Gc { .. } => Use::Gc,
         Command::Service { cmd: ServiceCommand::Ls { json } } => Use::ServiceLs { json: *json },
         Command::Vscode { .. } => Use::Refused(Refused::Vscode),
         _ => Use::Link,
@@ -92,11 +95,6 @@ pub(crate) fn use_of(command: &Command) -> Use {
 /// Why offered machine `m` refuses `what`.
 pub(crate) fn refusal(m: &str, what: Refused) -> anyhow::Error {
     let what = match what {
-        Refused::Gc => {
-            return anyhow::anyhow!(
-                "machine `{m}` is an offered fleet worker: `gc` there is host maintenance, outside a fleet worker's trust"
-            );
-        }
         Refused::SessionNoTty => {
             return anyhow::anyhow!(
                 "machine `{m}` is an offered fleet worker: a session `exec` there (`--attach`, `--session`) needs a terminal"
@@ -187,7 +185,14 @@ pub(crate) fn named(call: &mut Call, u: &Use, m: &str, name: &str, root: &Path, 
             let r: Renamed = call_on(call, m, "instances.rename", json!({ "instance": name, "newName": new_name }))?;
             writeln!(out, "{}", crate::commands::rename::renamed_line(name, &r.instance))?;
         }
-        Use::Ls { .. } | Use::Status | Use::ServiceLs { .. } | Use::Ps { .. } | Use::Stats { .. } | Use::Link | Use::Refused(_) => {
+        Use::Ls { .. }
+        | Use::Status
+        | Use::ServiceLs { .. }
+        | Use::Ps { .. }
+        | Use::Stats { .. }
+        | Use::Gc
+        | Use::Link
+        | Use::Refused(_) => {
             bail!("not a named re-run")
         }
     }
@@ -378,7 +383,8 @@ mod tests {
         assert_eq!(u(&["ps", "--json"]), Use::Ps { all: false, json: true });
         assert_eq!(u(&["stats"]), Use::Stats { json: false });
         assert_eq!(u(&["stats", "--json"]), Use::Stats { json: true });
-        assert_eq!(u(&["gc", "--force"]), Use::Refused(Refused::Gc));
+        assert_eq!(u(&["gc", "--force"]), Use::Gc);
+        assert_eq!(u(&["gc"]), Use::Gc);
         assert_eq!(u(&["service", "ls"]), Use::ServiceLs { json: false });
         assert_eq!(u(&["service", "ls", "--json"]), Use::ServiceLs { json: true });
         assert_eq!(u(&["vscode", "lap/web"]), Use::Refused(Refused::Vscode));
@@ -395,7 +401,6 @@ mod tests {
             r(Refused::SessionNoTty),
             "machine `lap` is an offered fleet worker: a session `exec` there (`--attach`, `--session`) needs a terminal"
         );
-        assert_eq!(r(Refused::Gc), "machine `lap` is an offered fleet worker: `gc` there is host maintenance, outside a fleet worker's trust");
     }
 
     fn row(name: &str, container: &str, root: &str, done: bool) -> Value {

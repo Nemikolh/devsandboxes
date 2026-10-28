@@ -35,7 +35,7 @@ use super::endpoint;
 use super::machines::cli::{choose, found_of, machine_info, resolve_params};
 use super::machines::{Where, parse_name};
 use super::proto::{Notification, Response, Version};
-use super::verbs::{RebuildParams, RmParams, RunParams, ServicesRebuildParams, StartParams, StopParams, TtySize};
+use super::verbs::{GcParams, RebuildParams, RmParams, RunParams, ServicesRebuildParams, StartParams, StopParams, TtySize};
 use crate::Command;
 use crate::commands::run::cancel;
 use crate::state::PhaseView;
@@ -72,6 +72,11 @@ pub(crate) enum CliVerb {
     /// `service rebuild <name>`: names a service, so no prompt, no cancel by
     /// name (the first Ctrl-C hangs up, as `stop --all`'s).
     ServicesRebuild { name: String },
+    /// `--machine m gc` on an offered fleet worker (`machines::cli::route`
+    /// leaves only that one to us): one request per config root there. A
+    /// local `gc` stays in this process, as does an ssh machine's (`ssh …
+    /// devsandbox gc`).
+    Gc { force: bool },
 }
 
 impl CliVerb {
@@ -84,6 +89,7 @@ impl CliVerb {
             CliVerb::Stop { .. } => "stop",
             CliVerb::Rm { .. } => "rm",
             CliVerb::ServicesRebuild { .. } => "service rebuild",
+            CliVerb::Gc { .. } => "gc",
         }
     }
 
@@ -103,9 +109,11 @@ impl CliVerb {
 /// The verb `command` sends to the daemon, or `None`: it runs in-process.
 /// `run`'s hidden `--env`/`--dispatcher` aren't on the wire (only the
 /// dispatcher passes them, from inside the daemon already), nor is `rm
-/// --fail-on-ask` (the daemon's own flag).
-pub(crate) fn from_command(command: &Command) -> Option<CliVerb> {
+/// --fail-on-ask` (the daemon's own flag). `gc` is a verb only with
+/// `--machine` (`machine`): [`CliVerb::Gc`].
+pub(crate) fn from_command(command: &Command, machine: Option<&str>) -> Option<CliVerb> {
     Some(match command {
+        Command::Gc { force } if machine.is_some() => CliVerb::Gc { force: *force },
         Command::Run { env, dispatcher, .. } if !env.is_empty() || dispatcher.is_some() => return None,
         Command::Run { sandbox, name, branch, base, json, reprobe, detach, here, .. } => CliVerb::Run {
             sandbox: sandbox.clone(),
@@ -140,7 +148,7 @@ pub(crate) struct Fed {
     /// Some machine is registered: names resolve across machines. Without
     /// one every request stays on this host.
     pub machines: bool,
-    /// `--machine`: an `--all` verb or `service rebuild` sent there.
+    /// `--machine`: an `--all` verb, `service rebuild` or `gc` sent there.
     pub machine: Option<String>,
 }
 
@@ -153,7 +161,7 @@ impl CliVerb {
             | CliVerb::Start { target: name, .. }
             | CliVerb::Stop { target: name } => name.as_deref(),
             CliVerb::Rm { name, .. } => Some(name),
-            CliVerb::ServicesRebuild { .. } => None,
+            CliVerb::ServicesRebuild { .. } | CliVerb::Gc { .. } => None,
         }
     }
 }
@@ -325,7 +333,7 @@ struct Ui<'a> {
 enum Prep {
     Send(Prepared),
     /// One request per config root of a machine (`rebuild --all`, `service
-    /// rebuild` with `--machine`), each with its banner.
+    /// rebuild`, `gc` with `--machine`), each with its banner.
     Each(Vec<Prepared>),
     /// Nothing to send (the example config was written instead).
     Exit(i32),
@@ -539,6 +547,31 @@ fn prepare(
                 if each.is_empty() {
                     let list: Vec<String> = roots.iter().map(|r| r.display().to_string()).collect();
                     bail!("no service `{name}` on machine `{m}` (roots: {})", list.join(", "));
+                }
+                return Ok(Prep::Each(each));
+            }
+        },
+        CliVerb::Gc { force } => match machine_roots(call)? {
+            None => one("gc", serde_json::to_value(GcParams { root, env, force, detach: false })?, None),
+            // An offered worker's root is its fleet root: the config roots
+            // its rows name, as its `ls` lists them (`cli::config_roots`).
+            Some((m, roots)) => {
+                let mut config = Vec::new();
+                for at in &roots {
+                    let list = match reply(call("instances.list", json!({ "dir": at, "depth": "disk", "machine": m }))?) {
+                        Reply::Ok(v) => serde_json::from_value(v).context("bad instances.list result from devsandbox serve")?,
+                        Reply::Old(why) => return Ok(Prep::Old(why)),
+                        Reply::Err(e) => bail!("{}", e.message),
+                    };
+                    config.extend(super::machines::cli::config_roots(at, &list));
+                }
+                config.sort();
+                config.dedup();
+                let mut each = Vec::new();
+                for root in config {
+                    let banner = super::machines::cli::banner(&m, &root);
+                    let p = GcParams { root, env: env.clone(), force, detach: false };
+                    each.push(on_machine("gc", serde_json::to_value(p)?, &m, banner));
                 }
                 return Ok(Prep::Each(each));
             }
@@ -1133,7 +1166,7 @@ mod tests {
     fn verb(args: &[&str]) -> Option<CliVerb> {
         let cli = Cli::try_parse_from(std::iter::once("devsandbox").chain(args.iter().copied()))
             .unwrap_or_else(|e| panic!("{e}"));
-        from_command(&cli.command.unwrap())
+        from_command(&cli.command.unwrap(), None)
     }
 
     #[test]
@@ -1186,6 +1219,9 @@ mod tests {
         assert_eq!(verb(&["logs", "w"]), None);
         assert_eq!(verb(&["service", "ls"]), None);
         assert_eq!(verb(&["gc"]), None);
+        // With `--machine` (an offered worker's, `cli::route` decides): a verb.
+        let gc = Cli::try_parse_from(["devsandbox", "--machine", "lap", "gc", "--force"]).unwrap();
+        assert_eq!(from_command(&gc.command.unwrap(), gc.machine.as_deref()), Some(CliVerb::Gc { force: true }));
         let cli = Cli::try_parse_from(["devsandbox", "--in-process", "stop", "w"]).unwrap();
         assert!(cli.in_process);
     }
@@ -1688,6 +1724,32 @@ mod tests {
         let none = [machine(), ("services.get", err("not-found", "no service", None))];
         let e = prep_fed(&CliVerb::ServicesRebuild { name: "db".into() }, &on("a"), false, None, &none, 0).0.unwrap_err();
         assert_eq!(e.to_string(), "no service `db` on machine `a` (roots: /r1, /r2)");
+        // `gc` (an offered worker's): each config root its rows name, else the root itself.
+        let row = |name: &str, root: &str| {
+            json!({"name": name, "sandbox": "web", "container": "c", "status": {"state": "running", "text": "Up"}, "uptime_secs": 0,
+                "cpu": null, "mem": null, "folder": "", "worktree": false, "services": [], "workspace": "",
+                "remote_user": null, "remote_env_len": 0, "base_folder": "", "drift": false, "instance_id": "id",
+                "done": false, "root": root})
+        };
+        let listing = |rows: Vec<Value>| {
+            ok(json!({"instances": rows, "sandboxes": [], "services": [], "sandbox_count": 0, "runtime_name": "docker",
+                "runtime_version": null, "error": null}))
+        };
+        let gc = [
+            machine(),
+            ("instances.list /r1", listing(vec![row("x", "/r1/b"), row("y", "/r1/a"), row("z", "/r1/a")])),
+            ("instances.list /r2", listing(vec![])),
+        ];
+        let out = prep_fed(&CliVerb::Gc { force: true }, &on("a"), false, None, &gc, 0);
+        let Prep::Each(each) = out.0.unwrap() else { panic!() };
+        let roots: Vec<_> = each.iter().map(|p| (p.params["root"].clone(), p.banner.clone().unwrap())).collect();
+        assert_eq!(
+            roots,
+            [(json!("/r1/a"), "==> a:/r1/a".to_string()), (json!("/r1/b"), "==> a:/r1/b".to_string()), (json!("/r2"), "==> a:/r2".to_string())]
+        );
+        assert_eq!(each[0].params, json!({"root": "/r1/a", "env": {"A": "1"}, "force": true, "detach": false, "machine": "a"}));
+        assert!(each.iter().all(|p| p.method == "gc" && p.instance.is_none() && p.machine.as_deref() == Some("a")));
+        assert!(out.1[1].contains(r#""depth":"disk""#) && out.1[1].contains(r#""machine":"a""#), "{:?}", out.1);
         let missing = [("machines.get", err("not-found", "no machine named `z`", None))];
         let e = prep_fed(&CliVerb::Stop { target: None }, &on("z"), false, None, &missing, 0).0.unwrap_err();
         assert_eq!(e.to_string(), "no machine named `z` (devsandbox machine ls)");

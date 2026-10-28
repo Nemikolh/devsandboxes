@@ -1,8 +1,9 @@
 # Verbs as requests
 
-`run`, `rebuild`, `start`, `stop`, `rm` and `service rebuild` are API
-methods: the CLI and the dashboard send them to the daemon, which runs each
-as a subprocess and streams it back. Read this before changing how a verb
+`run`, `rebuild`, `start`, `stop`, `rm`, `service rebuild` and `gc` are
+API methods: the CLI and the dashboard send them to the daemon, which runs
+each as a subprocess and streams it back (`gc` only from the CLI, for an
+offered fleet worker: below). Read this before changing how a verb
 is launched, cancelled or survives a daemon exit.
 
 Code: `src/serve/verbs.rs` (`is_verb`, `*Params`, `parse`, `argv`,
@@ -53,7 +54,7 @@ branch question, having removed nothing.
   early (`{instance, detached: true, record?}`): `run` and a one-instance
   `rebuild` once an instance's `progress.pid` is the child's, `start` and
   `rebuild --all` right after the spawn (`DetachAt`). The verb runs on.
-- **Held verbs** (`stop`, `rm`, `services.rebuild`) always answer at the
+- **Held verbs** (`stop`, `rm`, `services.rebuild`, `gc`) always answer at the
   exit; `detach` only means a hang-up doesn't cancel them.
 - **Hang-up** before the answer SIGINTs the group (the verb rolls back),
   unless `detach`, or the client merely stopped reading for the write
@@ -90,7 +91,13 @@ cancelled by `instances.cancel`, but nobody streams their output.
 
 `verbs_client::from_command` picks the verbs that go to the daemon
 (`run` with the dispatcher's hidden `--env`/`--dispatcher` and `rm
---fail-on-ask` stay local). Every prompt happens on the user's TTY before
+--fail-on-ask` stay local). `gc` is one only with `--machine` on an
+offered fleet worker (`CliVerb::Gc`: `machines::cli::route` hands only
+that one on; an ssh machine's runs `devsandbox gc` there over ssh): one
+request per config root its rows name there (`machines::cli::config_roots`,
+as its `ls`), each after its `==> m:<root>` line. A local `gc` runs in
+the CLI's process. Sent as a verb, `gc` has no TTY: without `force` its
+shell-history prompt answers no, so those files stay. Every prompt happens on the user's TTY before
 the send, since the child has no stdin: sandbox pick and example config
 (`sandboxes.list`), instance pick (`instances.resolve`), the identity
 prompt (below), rm's branch question (`ask` → `confirm` → resend). The

@@ -1,7 +1,7 @@
 //! Verbs as requests (docs/reference/api.md, *Verbs*;
 //! docs/architecture/daemon/verbs.md): `run`, `rebuild`, `start`, `stop` and
-//! `rm` as API methods, and `services.rebuild` (no instance verb: `service
-//! rebuild <name>`). The daemon runs each as a `devsandbox --in-process -C
+//! `rm` as API methods, and `services.rebuild` and `gc` (no instance verbs:
+//! `service rebuild <name>`, `gc [--force]`). The daemon runs each as a `devsandbox --in-process -C
 //! <root> <verb> …` subprocess built from the request's typed params
 //! ([`argv`]), so a verb that panics or hangs takes down one request, not the
 //! daemon, and a handoff doesn't wait for a build
@@ -53,7 +53,7 @@ const CHUNK: usize = 64 * 1024;
 const ERR_TAIL: usize = 16 * 1024;
 
 pub fn is_verb(method: &str) -> bool {
-    matches!(method, "run" | "rebuild" | "start" | "stop" | "rm" | "services.rebuild")
+    matches!(method, "run" | "rebuild" | "start" | "stop" | "rm" | "services.rebuild" | "gc")
 }
 
 // ---- params ---------------------------------------------------------------
@@ -183,6 +183,22 @@ pub struct ServicesRebuildParams {
     pub detach: bool,
 }
 
+/// `gc` params: the config root whose unused services and networks go
+/// (`commands::services::gc`; its agent-link sweep is host-wide). Without
+/// `force` the orphaned shell-history files are kept: their confirm prompt
+/// has no TTY in the subprocess, so it answers no. `detach` as on
+/// [`ServicesRebuildParams`].
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GcParams {
+    pub root: PathBuf,
+    pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub force: bool,
+    #[serde(default)]
+    pub detach: bool,
+}
+
 /// What a verb acts on: an instance as the CLI's `<name>` takes it, or `--all`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Target {
@@ -199,6 +215,8 @@ pub enum Verb {
     Rm { instance: String, delete_branch: Option<bool>, force: bool, ask: bool },
     /// A service, not an instance: answers `instance: null`.
     ServicesRebuild { name: String },
+    /// Host maintenance of the root, no instance: answers `instance: null`.
+    Gc { force: bool },
 }
 
 impl Verb {
@@ -212,13 +230,14 @@ impl Verb {
             Verb::Stop { .. } => "stop",
             Verb::Rm { .. } => "rm",
             Verb::ServicesRebuild { .. } => "service rebuild",
+            Verb::Gc { .. } => "gc",
         }
     }
 
     fn target(&self) -> Option<&Target> {
         match self {
             Verb::Rebuild { target, .. } | Verb::Start { target } | Verb::Stop { target } => Some(target),
-            Verb::Run { .. } | Verb::Rm { .. } | Verb::ServicesRebuild { .. } => None,
+            Verb::Run { .. } | Verb::Rm { .. } | Verb::ServicesRebuild { .. } | Verb::Gc { .. } => None,
         }
     }
 
@@ -280,6 +299,10 @@ pub fn parse(method: &str, params: Value) -> Result<VerbRequest, ApiError> {
         "services.rebuild" => {
             let p: ServicesRebuildParams = api::parse(params)?;
             (p.root, p.env, Verb::ServicesRebuild { name: p.name }, p.detach, None)
+        }
+        "gc" => {
+            let p: GcParams = api::parse(params)?;
+            (p.root, p.env, Verb::Gc { force: p.force }, p.detach, None)
         }
         other => return Err(ApiError::unknown_method(other)),
     };
@@ -360,6 +383,12 @@ pub fn argv(req: &VerbRequest) -> Vec<String> {
             Some(instance)
         }
         Verb::ServicesRebuild { name } => Some(name),
+        Verb::Gc { force } => {
+            if *force {
+                args.push("--force".into());
+            }
+            None
+        }
     };
     if let Some(target) = target {
         args.push("--".into());
@@ -379,7 +408,7 @@ fn one_or_all<'a>(args: &mut Vec<String>, target: &'a Target) -> Option<&'a Stri
 }
 
 /// When a `detach` request is answered (docs/reference/api.md, *Verbs*).
-/// Held verbs (`stop`, `rm`, `services.rebuild`) answer at the exit, detached
+/// Held verbs (`stop`, `rm`, `services.rebuild`, `gc`) answer at the exit, detached
 /// or not: for them `detach` only means a hang-up leaves them running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DetachAt {
@@ -399,7 +428,7 @@ fn detach_at(req: &VerbRequest) -> DetachAt {
     match &req.verb {
         Verb::Run { .. } | Verb::Rebuild { target: Target::One(_), .. } => DetachAt::Registered,
         Verb::Rebuild { .. } | Verb::Start { .. } => DetachAt::Spawn,
-        Verb::Stop { .. } | Verb::Rm { .. } | Verb::ServicesRebuild { .. } => DetachAt::Never,
+        Verb::Stop { .. } | Verb::Rm { .. } | Verb::ServicesRebuild { .. } | Verb::Gc { .. } => DetachAt::Never,
     }
 }
 
@@ -1076,6 +1105,8 @@ pub(crate) mod tests {
         assert_eq!(argv(&req(rm(None, false, true), false)), with(&["rm", "--fail-on-ask", "--", "w"]));
         let svc = Verb::ServicesRebuild { name: "-db".into() };
         assert_eq!(argv(&req(svc, false)), with(&["service", "rebuild", "--", "-db"]));
+        assert_eq!(argv(&req(Verb::Gc { force: false }, false)), with(&["gc"]));
+        assert_eq!(argv(&req(Verb::Gc { force: true }, false)), with(&["gc", "--force"]));
     }
 
     /// The argv parses as the CLI's own verb with the request's values, so a
@@ -1140,6 +1171,9 @@ pub(crate) mod tests {
             Command::Service { cmd: crate::ServiceCommand::Rebuild { name } } => assert_eq!(name, "-db"),
             _ => panic!("not service rebuild"),
         }
+        for force in [false, true] {
+            assert!(matches!(parse(Verb::Gc { force }), Command::Gc { force: f } if f == force));
+        }
     }
 
     #[test]
@@ -1177,6 +1211,12 @@ pub(crate) mod tests {
         assert!(p.detach && matches!(p.verb, Verb::Rm { ask: true, .. }));
         assert_eq!(code("services.rebuild", json!({"root": r, "env": {}})), Err("invalid"));
         assert_eq!(code("services.rebuild", json!({"root": r, "name": "db"})), Err("invalid"));
+        assert!(is_verb("gc"));
+        let p = parse("gc", json!({"root": r, "env": {}, "force": true})).unwrap();
+        assert_eq!((p.verb, p.detach), (Verb::Gc { force: true }, false));
+        assert_eq!(parse("gc", json!({"root": r, "env": {}})).unwrap().verb, Verb::Gc { force: false });
+        assert_eq!(code("gc", json!({"root": r})), Err("invalid"));
+        assert_eq!(code("gc", json!({"env": {}})), Err("invalid"));
         // `tty`: the build verbs', checked.
         let size = TtySize { cols: 100, rows: 30 };
         let tty = |method: &str, extra: Value| {
@@ -1205,6 +1245,7 @@ pub(crate) mod tests {
         assert_eq!(detach_at(&req(Verb::Start { target: one("w") }, true)), DetachAt::Spawn);
         // Held verbs: `detach` only spares them a hang-up's cancel.
         assert_eq!(detach_at(&req(Verb::ServicesRebuild { name: "db".into() }, true)), DetachAt::Never);
+        assert_eq!(detach_at(&req(Verb::Gc { force: false }, true)), DetachAt::Never);
         assert_eq!(detach_at(&req(Verb::Stop { target: one("w") }, true)), DetachAt::Never);
         assert_eq!(detach_at(&req(Verb::Stop { target: Target::All }, true)), DetachAt::Never);
         let rm = Verb::Rm { instance: "w".into(), delete_branch: None, force: false, ask: true };
@@ -1638,7 +1679,8 @@ pub(crate) mod tests {
             ask: true,
             detach: true,
         };
-        let services_rebuild = ServicesRebuildParams { root, env: e, name: "db".into(), detach: true };
+        let services_rebuild = ServicesRebuildParams { root: root.clone(), env: e.clone(), name: "db".into(), detach: true };
+        let gc = GcParams { root, env: e, force: true, detach: true };
         for (iface, value) in [
             ("RunParams", v(&run)),
             ("RebuildParams", v(&rebuild)),
@@ -1646,6 +1688,7 @@ pub(crate) mod tests {
             ("StopParams", v(&stop)),
             ("RmParams", v(&rm)),
             ("ServicesRebuildParams", v(&services_rebuild)),
+            ("GcParams", v(&gc)),
             ("TtySize", v(&TtySize { cols: 100, rows: 30 })),
             ("VerbResult", done_result(Some("w"))),
             ("VerbDetached", detached_result(Some("w"), Some(json!({})))),
@@ -1660,6 +1703,7 @@ pub(crate) mod tests {
             assert_eq!(prop_type(iface, "tty").as_deref(), Some("TtySize | null"), "{iface}");
         }
         assert!(prop_type("ApiMethods", "services.rebuild").is_some_and(|t| t.contains("result: VerbResult ")));
+        assert!(prop_type("ApiMethods", "gc").is_some_and(|t| t.contains("params: GcParams") && t.contains("result: VerbResult ")));
         for method in ["run", "rebuild", "start", "stop", "rm"] {
             assert!(prop_type("ApiMethods", method).is_some(), "ApiMethods lacks `{method}`");
         }

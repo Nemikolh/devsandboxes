@@ -432,12 +432,15 @@ link's `API` streams.
   m ls` / `status --json` (`instances.list` per config root under the
   fleet root; `service ls` too, its service rows), `--machine m ps` (`containers.list`) and `stats`
   (`containers.stats`), printed as the local commands print them
-  ([machines](machines.md#the-cli-clirs), `machines::cli::offered`). The
+  ([machines](machines.md#the-cli-clirs), `machines::cli::offered`).
+  `--machine m gc [--force]` is the `gc` verb per config root
+  (`verbs_client`'s `CliVerb::Gc`), which the worker runs under `full`
+  trust only: under `worker` its refusal is the error. The
   dashboard's logs and inspect views go through the same quick calls.
 - **What has no link form yet** is refused, each in its own words:
   `vscode` (`cli::offered::refusal`), a session `exec` without a tty
   (`--attach` off a terminal, `--session` without `-t`: a session over
-  the link needs one), `gc` (host maintenance, outside a worker's trust), and the dashboard's service tabs
+  the link needs one), and the dashboard's service tabs
   (`tui::remote::service_argv`: service terminals aren't supported over
   the fleet link). No ssh argv is built for an offered entry:
   `machines::ssh`'s `argv_with` takes `Entry::ssh_target`, an error for one
@@ -1010,9 +1013,11 @@ never hands the daemon off (below). Under **`worker`**:
   `instances.watch` / `unwatch`, the quick calls
   (`machines::forward::QUICK`), `capacity.get`, `roots.list` (with or
   without `paths`: read-only; `machines.add` checks typed roots through
-  it) and the verbs (`verbs::is_verb`). It refuses
+  it) and the verbs (`verbs::is_verb`) but `gc`. It refuses
   (`denied`) any request with a `machine` param or `machines: true`
-  (nothing federates past the member), and every other method:
+  (nothing federates past the member), `gc` (host maintenance: it reaps
+  services and the host's agent links, not one root's instances), and
+  every other method:
   `machines.*`, `fleet.*`, `lend.*`, `shutdown`, `helper.call`, `forwards.*`,
   `bridges.ensure`, the Inbox, each refusal naming `devsandbox machine
   trust full` as what opens it. Refusals are logged.

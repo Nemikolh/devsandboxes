@@ -1158,6 +1158,14 @@ export interface ServicesRebuildParams extends VerbParams {
   detach?: boolean;
 }
 
+/** `gc` params: the config root's unused services and networks, orphaned shell history (with `force` only: no prompt can answer) and the host's dangling agent links. */
+export interface GcParams extends VerbParams {
+  /** Delete orphaned shell-history files; without it they are kept. */
+  force?: boolean;
+  /** A hang-up before the answer leaves it running instead of cancelling it; the answer still comes at the exit. */
+  detach?: boolean;
+}
+
 /** A verb's answer once it exited 0. */
 export interface VerbResult {
   /** The instance it acted on; `null` for `all` or when unknown. */
@@ -1379,6 +1387,8 @@ export interface ApiMethods {
   rm: { params: RmParams; result: VerbResult };
   /** No instance verb: `instance` is always `null`; `detach` only keeps it running past a hang-up, the answer comes at its exit. */
   'services.rebuild': { params: ServicesRebuildParams; result: VerbResult };
+  /** Host maintenance, no instance verb: `instance` is always `null`. A remote caller needs the member's `full` trust. */
+  gc: { params: GcParams; result: VerbResult };
   subscribe: { params: { topics: ApiTopic[] }; result: OkResult };
   unsubscribe: { params: { topics: ApiTopic[] }; result: OkResult };
   /** Stop the daemon (it drains, then exits); `devsandbox serve install` sends it. */

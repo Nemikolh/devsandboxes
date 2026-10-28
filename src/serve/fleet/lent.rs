@@ -16,7 +16,7 @@
 //! - [`decide`] (pure, over the method and params): hello, `subscribe` /
 //!   `unsubscribe` to `instances` only, `instances.watch` / `unwatch`, the
 //!   quick calls (`machines::forward::QUICK`), `capacity.get`, `roots.list`
-//!   and the verbs; never a `machine` param or a federated (`machines:
+//!   and the verbs but `gc` (host maintenance); never a `machine` param or a federated (`machines:
 //!   true`) request; everything else (`machines.*`,
 //!   `fleet.*`, `lend.*`, `shutdown`, `helper.call`, `forwards.*`, the
 //!   Inbox, …) is `denied`.
@@ -225,6 +225,9 @@ pub fn decide(method: &str, params: &Value) -> Result<Gate, ApiError> {
         m if fwd::is_quick(m) => Gate::Quick,
         "capacity.get" => Gate::Capacity,
         "roots.list" => Gate::Roots,
+        "gc" => return Err(ApiError::denied(format!(
+            "`gc` is host maintenance: not open to remote callers under this member's `worker` trust ({FULL_HINT})"
+        ))),
         m if verbs::is_verb(m) => Gate::Verb,
         m => return Err(ApiError::denied(format!("`{m}` isn't open to remote callers under this member's `worker` trust ({FULL_HINT})"))),
     };
@@ -596,6 +599,8 @@ mod tests {
             ("run", json!({"root": "/x"}), Ok(Verb)),
             ("rm", json!({"root": "/x"}), Ok(Verb)),
             ("services.rebuild", json!({"root": "/x"}), Ok(Verb)),
+            ("gc", json!({"root": "/x"}), Err("denied")),
+            ("gc", json!({"root": "/x", "force": true}), Err("denied")),
             ("stop", json!({"root": "/x", "all": true}), Ok(Verb)),
             ("stop", json!({"root": "/x", "machine": "m"}), Err("denied")),
             ("instances.list", json!({"dir": "/x", "machine": "m"}), Err("denied")),
@@ -629,9 +634,18 @@ mod tests {
             e.message,
             "`machines.list` isn't open to remote callers under this member's `worker` trust (`devsandbox machine trust full` there opens it)"
         );
-        // Every quick call and verb is lent (with confined params).
+        let e = decide("gc", &json!({"root": "/x"})).unwrap_err();
+        assert_eq!(
+            e.message,
+            "`gc` is host maintenance: not open to remote callers under this member's `worker` trust (`devsandbox machine trust full` there opens it)"
+        );
+        // Every quick call and verb but `gc` is lent (with confined params).
         for m in fwd::QUICK {
             assert_eq!(decide(m, &p).unwrap(), Quick, "{m}");
+        }
+        for m in ["run", "rebuild", "start", "stop", "rm", "services.rebuild"] {
+            assert!(verbs::is_verb(m));
+            assert_eq!(decide(m, &p).unwrap(), Verb, "{m}");
         }
     }
 
@@ -856,10 +870,17 @@ mod tests {
             ("instances.done", json!({"instance": "nobody"})),
             ("stop", json!({"all": true})),
             ("instances.list", json!({"machine": "m"})),
+            ("gc", json!({"root": "/anywhere", "force": true})),
         ] {
             let as_sent = Peer { env: None, ..s.clone() };
             assert_eq!(admit(m, p.clone(), &as_sent, &r, &state).unwrap(), p, "{m}: as sent");
         }
+        // `gc`: a verb, so the peer's env; under `worker` refused whatever the root.
+        let gc = json!({"root": root, "env": {"PATH": "/hub/bin"}});
+        assert_eq!(admit("gc", gc.clone(), &s, &r, &state).unwrap()["env"], json!({"PATH": "/worker/bin"}));
+        let e = admit("gc", gc, &s, &fleet(&root), &state).unwrap_err();
+        assert_eq!(e.code, "denied");
+        assert!(e.message.contains("host maintenance"), "{}", e.message);
         for m in ["member.get", "member.set", "link.attach", "link.anything"] {
             for reach in [&r, &fleet(&root)] {
                 assert_eq!(admit(m, json!({}), &s, reach, &state).unwrap_err().code, "denied", "{m}");

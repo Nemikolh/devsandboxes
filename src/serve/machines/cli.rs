@@ -27,6 +27,8 @@
 
 mod offered;
 
+pub(crate) use offered::config_roots;
+
 use std::ffi::OsString;
 use std::io::IsTerminal;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
@@ -771,8 +773,11 @@ pub(crate) fn route(machine: Option<&str>, in_process: bool, machines: &[String]
             let entry = machine_info(&mut |method, params| conn.call(method, params), &m)?;
             if entry.is_offered() && usage != MachineUse::Port {
                 let u = offered::use_of(&command);
-                if let offered::Use::Refused(what) = u {
-                    return Err(offered::refusal(&m, what));
+                match u {
+                    offered::Use::Refused(what) => return Err(offered::refusal(&m, what)),
+                    // The `gc` verb: `verbs_client` sends it (`CliVerb::Gc`).
+                    offered::Use::Gc => return Ok(Routed::Here(command)),
+                    _ => {}
                 }
                 let (mut out, mut err) = (std::io::stdout().lock(), std::io::stderr());
                 let call = &mut |method: &str, params| conn.call(method, params);
@@ -1192,7 +1197,7 @@ mod tests {
         assert_eq!(nameless(&["status", "--json"]), (MachineUse::PerRoot { args: ms(&["status", "--json"]), json: true }, Use::Status));
         assert_eq!(nameless(&["ps"]), (MachineUse::Once(ms(&["ps"])), Use::Ps { all: false, json: false }));
         assert_eq!(nameless(&["stats"]), (MachineUse::Once(ms(&["stats"])), Use::Stats { json: false }));
-        assert_eq!(nameless(&["gc"]), (MachineUse::PerRoot { args: ms(&["gc"]), json: false }, Use::Refused(Refused::Gc)));
+        assert_eq!(nameless(&["gc"]), (MachineUse::PerRoot { args: ms(&["gc"]), json: false }, Use::Gc));
         assert_eq!(
             nameless(&["service", "ls"]),
             (MachineUse::PerRoot { args: ms(&["service", "ls"]), json: false }, Use::ServiceLs { json: false })
