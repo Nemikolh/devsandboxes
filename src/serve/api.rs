@@ -817,17 +817,13 @@ fn sandboxes_list(p: SandboxesParams) -> Answer {
 }
 
 /// This host's candidate config roots (docs/architecture/daemon/machines.md,
-/// *`devsandbox machine add|ls|set|rm`*; what `machine add` offers): every
-/// distinct `config_dir` in `state` plus `~/.devsandboxes` when `home` has
-/// one, canonicalized (a root that's gone stays as recorded), sorted. Known
+/// *`devsandbox machine add|ls|set|rm`*; what `machine add` offers):
+/// `fleet::lent::own_roots` (every distinct `config_dir` in `state` plus
+/// `~/.devsandboxes` when `home` has one, canonicalized), sorted. Known
 /// roots only, no disk scan. A root that no longer exists or whose config
 /// doesn't load answers with its `error`.
 fn roots_list(state: &Path, home: Option<&Path>) -> Answer {
-    let state = load_state(state)?;
-    let recorded = state.instances.into_values().filter_map(|i| i.config_dir);
-    let home = home.map(|h| h.join(".devsandboxes")).filter(|d| d.is_dir());
-    let roots: std::collections::BTreeSet<PathBuf> =
-        recorded.chain(home).map(|r| std::fs::canonicalize(&r).unwrap_or(r)).collect();
+    let roots = crate::serve::fleet::lent::own_roots(&load_state(state)?, home);
     let rows: Vec<RootCandidate> = roots
         .into_iter()
         .map(|root| match config_at(&root) {

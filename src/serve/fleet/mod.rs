@@ -18,8 +18,8 @@
 //!   `lend.toml`, applied live to the lending thread.
 //! - `worker`: the worker's lending thread, the answerer of [`LINK`] over
 //!   its ssh to the hub.
-//! - `lent`: what a hub may do over that link (the daemon's `Worker`
-//!   connection table).
+//! - `lent`: the trust table, what a hub may do over that link (the
+//!   daemon's `Peer` connection table, by `member.toml`'s `trust`).
 //! - `pty`: the worker's end of a `PTY` stream: a session attach in a
 //!   lent instance, through its helper's `session.attach`.
 //! - `pty_client`: the hub's end of one: a tty `exec` on an offered

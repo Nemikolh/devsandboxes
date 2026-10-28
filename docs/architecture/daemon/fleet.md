@@ -53,10 +53,11 @@ Code: `src/serve/fleet/mod.rs` (`LINK`), `src/serve/fleet/link.rs`
 `transition`, `LendInfo`), `src/serve/locked_file.rs` (`update`),
 `src/commands/lend.rs` (`show`, `set_state`, `join`, `leave`, `busy`),
 `src/commands/machine.rs` (`trust`),
-`src/serve/fleet/lent.rs` (`Scope`, `decide`, `admit`, `confine_path`,
-`filter_answer`, `filter_snapshot`), `src/serve/daemon.rs`
-(`start_lending`, `Table`, `Shared::open_lent`, `Shared::open_lent_pty`,
-`Shared::open_lent_tunnel`),
+`src/serve/fleet/lent.rs` (`Peer`, `Files`, `Reach`, `own_roots`,
+`decide`, `admit`, `confine_path`, `lent_instances`, `filter_answer`,
+`filter_snapshot`), `src/serve/daemon.rs`
+(`start_lending`, `Table`, `Shared::reach_files`, `Shared::open_lent`,
+`Shared::open_lent_pty`, `Shared::open_lent_tunnel`),
 `src/serve/fleet/worker.rs` (`Open`, `Opens`), `src/serve/fleet/agent.rs`
 (`SERVING`, `NOT_SERVING`, `Status`, `status_of`, `Action`, `decide`,
 `socket`, `serve`, `PROBE`, `Cached`, `Gate`, `answer`, `refresh`,
@@ -395,7 +396,12 @@ link's `API` streams.
   root while a federated watch wants it, as an ssh machine's watches its
   roots (`service.rs` `LinkLoop::watch`), and its rows merge into
   federated snapshots the same way (`snapshots::merge`); the
-  [Worker table](#the-worker-table) confines the watch to the fleet root.
+  [trust table](#the-trust-table) confines the watch to the fleet root
+  (or an own root of the worker's), and its pushes carry the instances of
+  every root the worker's trust reaches: under `worker`, its own roots'
+  rows as well as the placed ones, which `snapshots::merge` takes from
+  the fleet root's snapshot as it takes an ssh machine's unregistered
+  roots' rows from its first root's.
 - **The dial** (`fleet::offer::dial`, wrapped around whatever reaches ssh
   machines when `daemon::run` builds its `Dial`): for an offered entry, a
   connection to its `fleet-<name>.sock` in the daemon's socket dir as a
@@ -510,7 +516,7 @@ next; a new watch's first, disk-depth push has none. On demand,
 holds the one `EngineCache` and the running count the poll sets from
 every listing (watched or not), and the daemon adds `lend.toml`'s state
 and `member.toml`'s caps (`Shared::capacity`, `Capacity::with_own`); tests replace the
-rest with `Options::local_capacity`. It is lent on the Worker table, so
+rest with `Options::local_capacity`. It is on the trust table under either trust, so
 a hub asks its workers before it places.
 
 - **`cpus`, `mem_total`**: the runtime's `info`
@@ -552,7 +558,7 @@ stores each pushed root's params (`service.rs` `LinkLoop::store`), and
 `SnapshotMachine::capacity` (federated snapshots) and `machines.list`'s
 `capacity`; last known while the link is down, and restored with a hub's
 `remotes.json` rows. A worker's comes through its offered root
-([Hub side](#hub-side)); the Worker table's snapshot filter
+([Hub side](#hub-side)); the trust table's snapshot filter
 (`lent::filter_snapshot`) leaves it as is. The dashboard's Machines tab
 and `devsandbox machine ls` show it as LEND (`capacity::lend_label`:
 `on`, `drain`, `off`, `-`) and CAPACITY (`capacity::summary`: `8 cpu ·
@@ -859,7 +865,7 @@ A worker follows its hub's exact build, an older one included
   client `fleet-update`. `daemon::hello` hands off on a forced hello only
   from a `Full` connection whose peer runs as the daemon's uid
   (`endpoint::peer_is_own_user`: `SO_PEERCRED` on Linux, `getpeereid`
-  elsewhere); a `Worker` connection never hands off, forced or not, and a
+  elsewhere); a `Peer` connection never hands off, forced or not, and a
   refused force is logged. Then the successor is started as a newer
   client's handoff starts it (`install::lazy_start` with
   `StartReason::Handoff`: the service manager's unit, rewritten to this
@@ -872,8 +878,8 @@ A worker follows its hub's exact build, an older one included
 `lend.toml` is the daemon's (the `machines.toml` rule): `lend.get` and
 `lend.set` (`fleet::lender::call`, over the daemon's `Lender`) are the
 only way to read its live state or change it, and every change is applied
-at once, without watching the file. Never on a `Worker` connection
-(`lent::decide` denies them). Wire: [`lend.*`](../../reference/api.md#lend).
+at once, without watching the file. Never on a `Peer` connection under
+`worker` (`lent::decide` denies them). Wire: [`lend.*`](../../reference/api.md#lend).
 
 - **`lend.get`** answers `LendInfo`: the file's `state` and `hub`, the
   `name` offered (`member.toml`'s, else `member::default_name` of the
@@ -919,8 +925,8 @@ both commands (`serve::machines::cli::machine_use`):
 `member.toml` is the daemon's too (decision 3 of the fleet plan):
 `member.get` and `member.set` (`fleet::member::call`, over the
 `Lender`'s `member.toml` path and hostname) are the only way to change
-it. Local only: never on a `Worker` connection (`lent::decide` denies
-them). Wire: [`member.*`](../../reference/api.md#member).
+it. Local only: never on a `Peer` connection (`lent::admit` refuses
+them under either trust). Wire: [`member.*`](../../reference/api.md#member).
 
 - **`member.get`** answers `MemberInfo`: the `name` this host goes by
   (`Member::name_or`: the file's, else the hostname's first label; `null`
@@ -941,52 +947,87 @@ them). Wire: [`member.*`](../../reference/api.md#member).
 `member.set {trust}`, or `member.get` without an argument, printing the
 trust (under `full`, with a note that remote callers get this host's
 whole API); `--machine` refuses it with the rest of `machine`
-(`serve::machines::cli::machine_use`). `worker` is the default: a hub
-reaches this host through the [Worker table](#the-worker-table), placed
-work under the [worker policy](#worker-policy). `full` lifts the worker
-policy (`worker_policy::Policy::detect` answers none) and takes the hub's
-dev builds ([Versions](#versions)).
+(`serve::machines::cli::machine_use`). It is read for every request a
+remote caller sends (`lent::Reach::load`), so a change applies to the
+next one. `worker` is the default: a hub reaches this host's own roots
+and its fleet root through the [trust table](#the-trust-table), placed
+work under the [worker policy](#worker-policy). `full` gives it the API a
+local client has (but `member.*` and `link.*`), lifts the worker policy
+(`worker_policy::Policy::detect` answers none) and takes the hub's dev
+builds ([Versions](#versions)).
 
-### The Worker table
+### The trust table
 
 Every connection has a table (`daemon::Table`): `Full` for local clients,
-`Worker(Scope)` for the hub's streams. A `Scope` (`fleet::lent::Scope`) is
-the hub, the canonical fleet root and the env its verbs get. On a `Worker`
-connection each request goes through `lent::refuse_new_work` (a `run`
-while the lending thread drains is `denied`, `lent::DRAINING`) and
-`lent::admit` at the top of `handle`, before any dispatch:
+`Peer(Peer)` for a remote caller's: the hub's `API` streams over the
+lending link. A `Peer` (`fleet::lent::Peer`) is who it is (for the log),
+its fleet root (canonical; `Some` on the lending link) and the env its
+verbs get (`Some` on the lending link: this host's own; `None` keeps a
+verb's as sent). For each request on a `Peer` connection the daemon reads
+a `lent::Reach` from this host's files (`Reach::load` over
+`Shared::reach_files`: `member.toml` and `state.toml`, the home):
+
+- **`trust`**, `member.toml`'s; no file (or no data dir) is `worker`. A
+  `member.toml` that doesn't load fails closed: `worker`, no picked roots,
+  the error logged.
+- **Own roots** (`Reach::own`): `lent::own_roots` (every `config_dir` in
+  `state.toml` plus `~/.devsandboxes`, what `roots.list` answers) and
+  `member.toml`'s `roots`, canonicalized where they exist (decision 17 of
+  the [plan](../../plans/active/fleet.md#decisions)). Placed instances'
+  config roots are in `state.toml` too.
+- **The fleet root**, the `Peer`'s.
+
+`Reach::admits` takes a canonical path that is under the fleet root or
+exactly one of the own roots (a dir nested in an own root isn't one);
+`Reach::admits_recorded` the same for a recorded `config_dir` (canonical
+when it exists, never with a `..`). Every gate below uses it.
+
+Each request goes through `lent::refuse_new_work` (a `run` while the
+lending thread drains is `denied`, `lent::DRAINING`, under either trust)
+and `lent::admit` at the top of `handle`, before any dispatch. Under
+either trust `member.*` and `link.*` are `denied`: this member's own
+settings and links are its local clients' only.
+
+Under **`full`** that's all: the request runs as a local client's would,
+any root, any instance, no filter on its answer or its pushes, except
+that a verb's `env` is still replaced when the `Peer` has one, and a hello
+never hands the daemon off (below). Under **`worker`**:
 
 - **`decide`** (pure, over method and params) lets through `hello`,
   `subscribe` / `unsubscribe` with only the `instances` topic,
   `instances.watch` / `unwatch`, the quick calls
-  (`machines::forward::QUICK`), `capacity.get` and the verbs
-  (`verbs::is_verb`). It refuses
+  (`machines::forward::QUICK`), `capacity.get`, `roots.list` (with or
+  without `paths`: read-only; `machines.add` checks typed roots through
+  it) and the verbs (`verbs::is_verb`). It refuses
   (`denied`) any request with a `machine` param or `machines: true`
-  (nothing federates past the worker), a verb with `all` (`--all` is every
+  (nothing federates past the member), a verb with `all` (`--all` is every
   instance in `state.toml`, not the root's), and every other method:
-  `machines.*`, `fleet.*`, `lend.*`, `member.*`, `shutdown`, `helper.call`, `forwards.*`,
-  `bridges.ensure`, `roots.list`, the Inbox. Refusals are logged.
+  `machines.*`, `fleet.*`, `lend.*`, `shutdown`, `helper.call`, `forwards.*`,
+  `bridges.ensure`, the Inbox. Refusals are logged.
 - **Paths**: a `root` or `dir` param must be absolute, have no `..`, and
-  canonicalize (symlinks resolved) under the fleet root
+  canonicalize (symlinks resolved) to a path the reach admits
   (`lent::confine_path`); it is rewritten to the canonical path. A path that
   doesn't exist is `not-found`, except an unwatch's, checked as written.
   `instances.list`, the watches, `sandboxes.*`, `services.get`, `config.*`,
-  `sessions.*` and the verbs must carry theirs.
+  `sessions.*` and the verbs must carry theirs. `config.migrate` and
+  `config.ack` edit a config, so their `root` must be under the fleet
+  root: an own root's is `denied`, naming `machine trust full`.
 - **Instances**: an `instance` (exact name or id, `sessions.*`' included), `instances.procs`'
   `instances` and the `containers.*` `container` must be an instance whose
-  `config_dir` is under the fleet root (`lent::lent_instances`, from
+  `config_dir` the reach admits (`lent::lent_instances`, from
   `state.toml`), else `not-found`. A verb's `instance` is resolved as the
   CLI resolves it (`commands::instance_matches`), and every match must be
   lent; `rebuild` / `start` / `stop` / `rm` must name one.
-- **Env**: a verb's `env` is replaced by the scope's, the daemon's own
-  process env (`verbs_client::caller_env`, `Options::lend_env` in tests),
-  never what the hub sent: the worker-side counterpart of
-  `relay::SessionEnv` on an ssh machine.
+- **Env**: a verb's `env` is replaced by the `Peer`'s when it has one: on
+  the lending link the daemon's own process env (`verbs_client::caller_env`,
+  `Options::lend_env` in tests), never what the hub sent: the worker-side
+  counterpart of `relay::SessionEnv` on an ssh machine.
 - **Answers and pushes**: a snapshot lists every instance in `state.toml`,
   whatever its `dir`, so `instances.list` answers and every
-  `instances.snapshot` pushed to the connection (`Pending::confine`) are
-  cut by `lent::filter_snapshot`: instance rows whose `root` is under the
-  fleet root, their names alone in services' `used_by` and in
+  `instances.snapshot` pushed to the connection (`Pending::reach`: the
+  notifier reads the reach per push, outside the pending lock) are
+  cut by `lent::filter_snapshot`: instance rows whose `root` the reach
+  admits, their names alone in services' `used_by` and in
   `thread_children`, their ids alone in `isolated` services' `containers`
   (whose names carry the instance id). `instances.resolve`'s matches are cut the same way
   (`lent::filter_answer`); none left is `not-found`. `containers.list` /
@@ -996,9 +1037,14 @@ while the lending thread drains is `denied`, `lent::DRAINING`) and
   `devsandbox.project` label being one of those roots'
   `services::project_id` (no label: dropped), a stats row, which has no
   labels, by its `devsandbox-svc-<project>-` name.
-- **Hello** on a `Worker` connection never hands the daemon off, whatever
-  version it says and even with `force`: only a local client's newer
-  binary (or this user's forced hello, [Versions](#versions)) replaces it.
+
+**Hello** on a `Peer` connection never hands the daemon off, whatever
+version it says and even with `force`, under either trust: only a local
+client's newer binary (or this user's forced hello, [Versions](#versions))
+replaces it.
+
+An ssh machine's `api --stdio` connection (the relay) is a local
+client's: the `Full` table, not this one.
 
 ### PTY
 
@@ -1022,10 +1068,11 @@ in the container. The stream carries `rpc` records
   running `argv`, or the login shell (`exec::SHELL_FALLBACK_CMD`) when
   `argv` is absent or empty.
 - **The gate** (`pty::gate`, pure but for canonicalizing `root`):
-  `root` confined as an `API` request's is (`lent::confine_path`: under
-  the fleet root); the instance found by exact name, else by id, among
-  the lent ones (`lent::lent_instances`) whose config root is under
-  `root`. Then `pty::decide` (pure) picks the terminal from whether the
+  `root` confined as an `API` request's is (`lent::confine_path` over
+  the link's `lent::Reach`, read per stream: under the fleet root or an
+  own root under `worker`, any root under `full`); the instance found by
+  exact name, else by id, among the lent ones (`lent::lent_instances`)
+  whose config root is under `root`. Then `pty::decide` (pure) picks the terminal from whether the
   instance has the helper (`Instance::devsbd_arch`) and whether it offers
   `session.attach` (`HelperClient::offers`): offered, the attach below; no
   bridge up, `not-running`; no helper, or a helper whose daemon isn't root
@@ -1200,9 +1247,11 @@ tunnel` is at the far end of a forward's ssh
   `resolve_instance` takes a name (exact name or id, then sandbox or
   folder basename; ambiguous refuses).
 - **The gate**: `root` confined as an `API` request's is
-  (`tunnel::confine`, `lent::confine_path`: under the fleet root, and it
-  must exist). The route is resolved over `tunnel::scoped` state only:
-  the lent instances whose config root is under `root`, so neither the
+  (`tunnel::confine`, `lent::confine_path` over the link's `lent::Reach`,
+  read per stream: under the fleet root or an own root under `worker`, any
+  root under `full`; it must exist). The route is resolved over
+  `tunnel::scoped` state only: the lent instances whose config root is
+  under `root`, so neither the
   instance name nor a service's via-instance pick (`port::plan`) can land
   on any other instance. A service must be one such an instance uses, the
   named one when there is one (`tunnel::check_service`,

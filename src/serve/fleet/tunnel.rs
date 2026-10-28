@@ -11,9 +11,10 @@
 //! follow the header as over ssh. The bridge is killed and reaped once the
 //! hub closes the stream.
 //!
-//! The gate: the root confined to the fleet root (`lent::confine_path`);
-//! routes resolved (`commands::tunnel::resolve`) over [`scoped`] state only,
-//! the lent instances whose config root is under it, so neither an instance
+//! The gate: the root confined to the peer's reach (`lent::confine_path`:
+//! the fleet root or an own root under `worker`, any under `full`); routes
+//! resolved (`commands::tunnel::resolve`) over [`scoped`] state only, the
+//! lent instances whose config root is under it, so neither an instance
 //! name nor a service's via-instance pick can reach another; a service must
 //! be one such an instance (the named one, when given) uses
 //! ([`check_service`]), so an injection is only into a service container of
@@ -29,7 +30,7 @@ use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::lent::{self, Scope};
+use super::lent::{self, Files, Peer, Reach};
 use crate::commands::port::{self, LoadState};
 use crate::commands::tunnel::{self as far, Header, Request};
 use crate::config::Config;
@@ -68,17 +69,17 @@ pub fn read_request(r: &mut impl Read) -> Result<Request, String> {
 }
 
 /// `state` with only the instances a `TUNNEL` into `root` may reach: lent
-/// ones (`lent::lent_instances`' rule) whose config root is under `root`
-/// (canonical, already confined to the fleet root).
-pub fn scoped(mut state: State, root: &Path) -> State {
-    state.instances.retain(|_, i| i.config_dir.as_deref().is_some_and(|d| lent::root_under(d, root)));
+/// ones (`lent::lent_instances`' rule, over `reach`) whose config root is
+/// under `root` (canonical, already [`confine`]d).
+pub fn scoped(mut state: State, root: &Path, reach: &Reach) -> State {
+    state.instances.retain(|_, i| i.config_dir.as_deref().is_some_and(|d| reach.admits_recorded(d) && lent::root_under(d, root)));
     state
 }
 
-/// The request's root, canonical and confined to `fleet_root` as
+/// The request's root, canonical and confined to `reach` as
 /// `lent::confine_path` does (it must exist).
-pub fn confine(req: &Request, fleet_root: &Path) -> Result<PathBuf, ApiError> {
-    lent::confine_path(fleet_root, &req.root, true)
+pub fn confine(req: &Request, reach: &Reach) -> Result<PathBuf, ApiError> {
+    lent::confine_path(reach, &req.root, true)
 }
 
 /// A service forward's own gate, over [`scoped`] `state` and the config at
@@ -99,13 +100,14 @@ pub fn check_service(config: &Config, state: &State, instance: Option<&str>, ser
 }
 
 /// Serve one `TUNNEL` stream, `link` the worker's end, to its end (see the
-/// module doc). `state` is this host's `state.toml`, `scope` the link's.
-/// Refusals with `denied` and bridges that can't start are logged.
-pub fn serve(link: Stream, state: &Path, scope: &Scope, log: fn(&str)) {
+/// module doc). `files` are this host's (its `state.toml`, and what the
+/// peer's [`Reach`] is read from), `peer` the link's. Refusals with
+/// `denied` and bridges that can't start are logged.
+pub fn serve(link: Stream, files: &Files, peer: &Peer, log: fn(&str)) {
     let _ = link.set_read_timeout(Some(REQUEST_WAIT));
     let request = read_request(&mut &link);
     let _ = link.set_read_timeout(None);
-    let route = request.and_then(|req| route(req, state, scope, log));
+    let route = request.and_then(|req| route(req, files, peer, log));
     let header = Header::of(&route);
     if (&link).write_all(header.line().as_bytes()).is_err() {
         return;
@@ -113,23 +115,27 @@ pub fn serve(link: Stream, state: &Path, scope: &Scope, log: fn(&str)) {
     if let Ok(route) = route {
         match spawn_bridge(&link, &route, log) {
             Ok(child) => watch(&link, child),
-            Err(e) => log(&format!("fleet: cannot start a TUNNEL bridge into {} for hub {}: {e}", route.container, scope.hub)),
+            Err(e) => log(&format!("fleet: cannot start a TUNNEL bridge into {} for hub {}: {e}", route.container, peer.name)),
         }
     }
     let _ = link.shutdown(Shutdown::Both);
 }
 
 /// The gate, then the route (see the module doc).
-fn route(req: Request, state: &Path, scope: &Scope, log: fn(&str)) -> Result<Route, String> {
-    let root = confine(&req, &scope.root).map_err(|e| {
+fn route(req: Request, files: &Files, peer: &Peer, log: fn(&str)) -> Result<Route, String> {
+    let (reach, warning) = Reach::load(files, peer.fleet_root.as_deref());
+    if let Some(w) = warning {
+        log(&format!("fleet: a TUNNEL stream from hub {}: {w}", peer.name));
+    }
+    let root = confine(&req, &reach).map_err(|e| {
         if e.code == "denied" {
-            log(&format!("fleet: refused a TUNNEL stream from hub {}: {}", scope.hub, e.message));
+            log(&format!("fleet: refused a TUNNEL stream from hub {}: {}", peer.name, e.message));
         }
         e.message
     })?;
     let load: LoadState = {
-        let (path, root) = (state.to_path_buf(), root.clone());
-        Arc::new(move || State::load_at(&path).map(|s| scoped(s, &root)).map_err(|e| format!("{e:#}")))
+        let (path, root) = (files.state.clone(), root.clone());
+        Arc::new(move || State::load_at(&path).map(|s| scoped(s, &root, &reach)).map_err(|e| format!("{e:#}")))
     };
     if let Some(service) = &req.service {
         let config = Config::load(&root).map_err(|e| format!("{e:#}"))?;
@@ -176,7 +182,6 @@ fn watch(link: &Stream, mut child: Child) {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
     use std::os::unix::net::UnixStream;
 
     use super::*;
@@ -246,18 +251,24 @@ services = ["cache"]
         for d in ["cfg", "elsewhere"] {
             std::fs::create_dir_all(root.join(d)).unwrap();
         }
-        std::fs::create_dir_all(b.join("mine")).unwrap();
+        std::fs::create_dir_all(b.join("mine/nested")).unwrap();
         let req = |root: &Path| Request { root: root.to_path_buf(), instance: None, service: Some("db".into()), port: 5432 };
-        assert_eq!(confine(&req(&root.join("cfg")), &root).unwrap(), root.join("cfg"));
-        assert_eq!(confine(&req(&b.join("mine")), &root).unwrap_err().code, "denied");
-        assert_eq!(confine(&req(&root.join("cfg/../../../mine")), &root).unwrap_err().code, "denied");
-        assert_eq!(confine(&req(&root.join("gone")), &root).unwrap_err().code, "not-found");
-        assert_eq!(confine(&req(Path::new("rel")), &root).unwrap_err().code, "invalid");
+        let r = fleet(&root, &[]);
+        assert_eq!(confine(&req(&root.join("cfg")), &r).unwrap(), root.join("cfg"));
+        assert_eq!(confine(&req(&b.join("mine")), &r).unwrap_err().code, "denied");
+        assert_eq!(confine(&req(&root.join("cfg/../../../mine")), &r).unwrap_err().code, "denied");
+        assert_eq!(confine(&req(&root.join("gone")), &r).unwrap_err().code, "not-found");
+        assert_eq!(confine(&req(Path::new("rel")), &r).unwrap_err().code, "invalid");
+        // An own root, exactly.
+        let with_own = fleet(&root, &[&b.join("mine")]);
+        assert_eq!(confine(&req(&b.join("mine")), &with_own).unwrap(), b.join("mine"));
+        assert_eq!(confine(&req(&b.join("mine/nested")), &with_own).unwrap_err().code, "denied");
 
         let names = |s: &State| s.instances.keys().cloned().collect::<Vec<_>>();
-        assert_eq!(names(&scoped(state_with(&b, &root), &root.join("cfg"))), ["app-1", "other-1"]);
-        assert_eq!(names(&scoped(state_with(&b, &root), &root)), ["app-1", "far", "other-1"], "the fleet root holds them all");
-        assert_eq!(names(&scoped(state_with(&b, &root), &b.join("mine"))), ["own"], "scoping alone doesn't confine: `confine` does");
+        assert_eq!(names(&scoped(state_with(&b, &root), &root.join("cfg"), &r)), ["app-1", "other-1"]);
+        assert_eq!(names(&scoped(state_with(&b, &root), &root, &r)), ["app-1", "far", "other-1"], "the fleet root holds them all");
+        assert!(names(&scoped(state_with(&b, &root), &b.join("mine"), &r)).is_empty(), "not reached: not scoped in");
+        assert_eq!(names(&scoped(state_with(&b, &root), &b.join("mine"), &with_own)), ["own"], "an own root's");
         let _ = std::fs::remove_dir_all(&b);
     }
 
@@ -267,7 +278,7 @@ services = ["cache"]
         let root = b.join("fleet/hub");
         std::fs::create_dir_all(root.join("cfg")).unwrap();
         let config = Config::parse(CONFIG).unwrap();
-        let state = scoped(state_with(&b, &root), &root.join("cfg"));
+        let state = scoped(state_with(&b, &root), &root.join("cfg"), &fleet(&root, &[]));
         assert_eq!(check_service(&config, &state, None, "db"), Ok(()));
         assert_eq!(check_service(&config, &state, Some("app-1"), "db"), Ok(()));
         assert_eq!(check_service(&config, &state, Some("id-app-1"), "db"), Ok(()), "by id");
@@ -275,17 +286,26 @@ services = ["cache"]
         assert_eq!(check_service(&config, &state, Some("app-1"), "cache").unwrap_err(), "instance `app-1` doesn't use service `cache`");
         assert!(check_service(&config, &state, Some("own"), "db").is_err(), "not lent: out of scope");
         assert!(check_service(&config, &state, Some("far"), "db").is_err(), "another root's");
-        let none = scoped(state, &b.join("nothing"));
+        let none = scoped(state, &b.join("nothing"), &fleet(&root, &[]));
         assert_eq!(check_service(&config, &none, None, "db").unwrap_err(), "no instance here uses service `db`");
         let _ = std::fs::remove_dir_all(&b);
     }
 
+    /// A `worker` reach of fleet root `root` and own roots `own`.
+    fn fleet(root: &Path, own: &[&Path]) -> Reach {
+        Reach {
+            trust: crate::worker_policy::Trust::Worker,
+            fleet_root: Some(root.to_path_buf()),
+            own: own.iter().map(|p| p.to_path_buf()).collect(),
+        }
+    }
+
     /// The hub's end of a stream served on a thread, its request sent;
     /// what it reads back to the end.
-    fn served(scope: &Scope, state: &Path, request: &str) -> String {
+    fn served(peer: &Peer, state: &Path, request: &str) -> String {
         let (hub, ours) = UnixStream::pair().unwrap();
-        let (scope, state) = (Scope { env: BTreeMap::new(), ..scope.clone() }, state.to_path_buf());
-        let t = std::thread::spawn(move || serve(ours, &state, &scope, crate::serve::helper::tests::log));
+        let (peer, files) = (peer.clone(), Files { state: state.to_path_buf(), member: None, home: None });
+        let t = std::thread::spawn(move || serve(ours, &files, &peer, crate::serve::helper::tests::log));
         (&hub).write_all(request.as_bytes()).unwrap();
         hub.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
         let mut out = String::new();
@@ -305,7 +325,7 @@ services = ["cache"]
         std::fs::write(root.join("cfg").join(crate::config::CONFIG_FILE), CONFIG).unwrap();
         state_with(&b, &root);
         let state = b.join("state.toml");
-        let scope = Scope { hub: "me@hub".into(), root: root.clone(), env: BTreeMap::new() };
+        let scope = Peer { name: "me@hub".into(), fleet_root: Some(root.clone()), env: None };
         let error = |out: &str| match crate::commands::tunnel::read_header(&mut out.as_bytes()) {
             Ok(Header::Error { error }) => {
                 assert!(out.ends_with("}\n"), "nothing after the header: {out:?}");
@@ -317,8 +337,13 @@ services = ["cache"]
         let line = |instance: Option<&str>, service: Option<&str>, root: &Path| {
             Request { root: root.to_path_buf(), instance: instance.map(Into::into), service: service.map(Into::into), port: 5432 }.line()
         };
-        let e = error(&served(&scope, &state, &line(Some("own"), None, &b.join("mine"))));
-        assert!(e.contains("outside this worker's fleet root"), "{e}");
+        std::fs::create_dir_all(b.join("other")).unwrap();
+        let e = error(&served(&scope, &state, &line(Some("own"), None, &b.join("other"))));
+        assert!(e.contains("neither under this member's fleet root nor one of its own roots"), "{e}");
+        // An own root (`own`'s, from `state.toml`) is reached: here a
+        // service no instance of it uses is the refusal.
+        std::fs::write(b.join("mine").join(crate::config::CONFIG_FILE), CONFIG).unwrap();
+        assert_eq!(error(&served(&scope, &state, &line(Some("own"), Some("cache"), &b.join("mine")))), "instance `own` doesn't use service `cache`");
         assert!(crate::serve::helper::tests::logged("fleet: refused a TUNNEL stream from hub me@hub"));
         assert!(error(&served(&scope, &state, &line(Some("own"), None, &cfg))).contains("own"), "not lent: no such instance");
         assert!(error(&served(&scope, &state, &line(Some("far"), None, &cfg))).contains("far"), "another root's");

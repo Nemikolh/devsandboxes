@@ -299,7 +299,7 @@ limitation means editing this file in the same commit.
 - Verbs on an offered worker run with the worker's own env: host git
   there gets no `SSH_AUTH_SOCK` of the hub's agent, unlike an ssh
   machine's (`--session-env`).
-  → [fleet](architecture/daemon/fleet.md#the-worker-table); `fleet::lent::admit`
+  → [fleet](architecture/daemon/fleet.md#the-trust-table); `fleet::lent::admit`
 - A hub notices a worker that's back (its `fleet-link` socket bound again)
   only at its offered link's next retry, up to 30 s later: a re-offer of a
   known worker doesn't wake the link.
@@ -319,15 +319,15 @@ limitation means editing this file in the same commit.
   messages (not threads, which need `inbox`) still reach the worker's
   Inbox and desktop.
   → [fleet](architecture/daemon/fleet.md#worker-policy); `inbox::decide`
-- On a `Worker` connection, `containers.*` reach only instances'
-  containers (not a fleet root's service containers), and an isolated
-  service row's `containers` aren't cut to lent instances.
-  → [fleet](architecture/daemon/fleet.md#the-worker-table); `fleet::lent::filter_snapshot`
+- The trust table applies to offered workers' lending links only: an
+  ssh machine's `api --stdio` connection is still a local client's, the
+  whole API, whatever the machine's `trust` (fleet step 6).
+  → [fleet](architecture/daemon/fleet.md#the-trust-table); `serve::relay`
 - A hub's verb on a worker runs with the worker daemon's own process env
   (a systemd unit's or LaunchAgent's, not a login shell's as over ssh's
   `relay::SessionEnv`), so `PATH` additions from shell profiles are
   missing; fix: capture a login env once when lending starts.
-  → [fleet](architecture/daemon/fleet.md#the-worker-table); `fleet::lent::admit`
+  → [fleet](architecture/daemon/fleet.md#the-trust-table); `fleet::lent::admit`
 - No build is marked published yet: the release workflow doesn't set
   `DEVSANDBOX_PUBLISHED=1`, so every hub says `dev` and a worker's
   download path never runs; a worker on another build than its hub takes

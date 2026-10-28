@@ -4,7 +4,7 @@
 //! fleet-link --worker <name> --root <fleet root>` ([`link_argv`]) and runs the answerer of
 //! `fleet::LINK` on its stdio. Each `API` stream the hub opens is answered
 //! by the daemon's `open` (a socket pair: the API relay's sentinel on the
-//! hub's end, the other end served as a `Worker` connection, `fleet::lent`).
+//! hub's end, the other end served as a `Peer` connection, `fleet::lent`).
 //! A link that ends is retried with the machine links' backoff
 //! (`service::backoff`), reset once a link came up. [`Lending::status`] is
 //! the link's state for `lend.get`; [`Lending::set_draining`] changes what
@@ -720,7 +720,7 @@ mod tests {
         let lent = lend_to(hub, "dev-ok", Arc::clone(&steps), true, hub_binary(base.clone(), Some(gate)));
         wait_status(&lent.lending, |w| w == "receiving the hub's build 0.0.1 (dev, 0123abcd)");
 
-        // The Worker table is out of reach: an `API` stream is refused, and
+        // The trust table is out of reach: an `API` stream is refused, and
         // so is a `PTY` one.
         for sock in ["fleet-lap.sock", "fleet-lap.pty.sock"] {
             let mut probe = std::os::unix::net::UnixStream::connect(lent.dir.join(sock)).unwrap();
@@ -964,10 +964,11 @@ mod tests {
         }
 
         /// A worker lending to an in-process hub: its offer registers it,
-        /// and through the hub's offered dial the lent API answers inside
-        /// the fleet root and nowhere else.
+        /// and through the hub's offered dial the trust table (`worker`)
+        /// answers in the fleet root and the worker's own roots, nowhere
+        /// else.
         #[test]
-        fn a_lending_worker_serves_its_hub_the_lent_api_only() {
+        fn a_lending_worker_serves_its_hub_the_trust_table() {
             let base = scratch("fleet-lend");
             let (worker_dir, hub_dir) = (base.join("w"), base.join("hub"));
             let data = base.join("worker-data");
@@ -979,6 +980,8 @@ mod tests {
             std::fs::create_dir_all(&mine).unwrap();
             std::fs::write(mine.join(crate::config::CONFIG_FILE), "[sandbox.web]\nimage = \"a\"\n").unwrap();
             let (cfg, mine) = (std::fs::canonicalize(&cfg).unwrap(), std::fs::canonicalize(&mine).unwrap());
+            let nested = mine.join("nested");
+            std::fs::create_dir_all(&nested).unwrap();
             let inst = |name: &str, dir: &Path| {
                 format!(
                     "[instance.{name}]\nsandbox = \"web\"\ncontainer = \"devsandbox-{name}\"\nfolder = \"/w\"\n\
@@ -1033,23 +1036,30 @@ mod tests {
             let r = call(&mut link, "sandboxes.list", json!({"root": cfg}));
             assert_eq!(r.result.unwrap()[0]["name"], "web", "inside the fleet root");
             let r = call(&mut link, "sandboxes.list", json!({"root": mine}));
-            assert_eq!(r.error.unwrap().code, "denied", "outside it");
+            assert_eq!(r.result.unwrap()[0]["name"], "web", "an own root of the worker's");
+            let r = call(&mut link, "sandboxes.list", json!({"root": nested}));
+            assert_eq!(r.error.unwrap().code, "denied", "not what's nested in one");
             let r = call(&mut link, "sandboxes.list", json!({"root": cfg.join("../../../../mine")}));
             assert_eq!(r.error.unwrap().code, "denied", "`..`");
-            for (m, p) in [("machines.list", json!({})), ("shutdown", json!({})), ("roots.list", json!({}))] {
+            let r = call(&mut link, "config.migrate", json!({"root": mine}));
+            assert_eq!(r.error.unwrap().code, "denied", "no edit of the worker's own config");
+            for (m, p) in [("machines.list", json!({})), ("shutdown", json!({})), ("member.get", json!({}))] {
                 assert_eq!(call(&mut link, m, p).error.unwrap().code, "denied", "{m}");
             }
-            // `web` matches both instances; the hub sees its own only.
+            let roots = call(&mut link, "roots.list", json!({})).result.unwrap();
+            let roots: Vec<&str> = roots.as_array().unwrap().iter().map(|r| r["root"].as_str().unwrap()).collect();
+            assert_eq!(roots, [mine.to_str().unwrap(), cfg.to_str().unwrap()], "read-only");
+            // `web` matches both instances: the fleet root's and the own root's.
             let r = call(&mut link, "instances.resolve", json!({"name": "web"}));
-            assert_eq!(r.result.unwrap()["matches"], json!(["web-w"]));
-            assert_eq!(call(&mut link, "instances.done", json!({"instance": "own", "done": true})).error.unwrap().code, "not-found");
+            assert_eq!(r.result.unwrap()["matches"], json!(["own", "web-w"]));
+            assert!(call(&mut link, "instances.done", json!({"instance": "own", "done": true})).error.is_none());
             drop(link);
 
             // Through the hub as any client would: a quick call forwarded.
             let mut c = conn_at(&hub_dir);
-            let r = c.call("instances.resolve", json!({"name": "web", "machine": "lap"})).unwrap();
+            let r = c.call("instances.resolve", json!({"name": "web-w", "machine": "lap"})).unwrap();
             assert_eq!(r.result.unwrap()["found"], json!([{"name": "web-w", "machine": null, "root": cfg, "sandbox": "web"}]));
-            let r = c.call("sandboxes.list", json!({"root": mine, "machine": "lap"})).unwrap();
+            let r = c.call("sandboxes.list", json!({"root": nested, "machine": "lap"})).unwrap();
             assert_eq!(r.error.unwrap().code, "denied");
 
             // A federated watch on the hub watches the offered root on the
@@ -1268,7 +1278,7 @@ mod tests {
             // is neutral; only lap's fresh `capacity.get` tips it.
             let rows = c.call("machines.list", Value::Null).unwrap().result.unwrap();
             assert!(rows[0]["capacity"].is_null(), "{rows}");
-            // Through the Worker table, as the hub asks it.
+            // Through the trust table, as the hub asks it.
             let dial = crate::serve::fleet::offer::dial(hub_dir.clone(), Arc::new(|_: &Entry| unreachable!()));
             let mut link = mlink::handshake("lap", dial(&Entry::offered("lap")).unwrap(), Duration::from_secs(5)).unwrap();
             let r = link.conn.call("capacity.get", json!({})).unwrap().result.unwrap();

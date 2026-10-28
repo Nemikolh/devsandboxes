@@ -9,7 +9,7 @@
 //! (what's placed here stays reachable); the next link offers the new state.
 //!
 //! How a lending thread is started is the daemon's ([`Spawn`]: the fleet
-//! root's `Worker` connections, the transport), so tests drive a `Lender`
+//! root's `Peer` connections, the transport), so tests drive a `Lender`
 //! with an injected transport and no daemon.
 
 use std::path::{Path, PathBuf};

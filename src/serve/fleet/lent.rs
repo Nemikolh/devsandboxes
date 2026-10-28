@@ -1,22 +1,37 @@
-//! The lent API (docs/architecture/daemon/fleet.md, *The Worker table*):
-//! what a fleet hub may do on this worker over its link's `API` streams.
-//! Each such connection is served with a [`Scope`] (the daemon's
-//! `Table::Worker`); every request on it goes through [`admit`] first and
-//! its answer through [`filter_answer`], every `instances.snapshot` pushed
-//! to it through [`filter_snapshot`].
+//! The trust table (docs/architecture/daemon/fleet.md, *The trust table*):
+//! what a remote caller (a [`Peer`]: a fleet hub over its link's `API`
+//! streams) may do on this member. Each such connection is served with a
+//! [`Peer`] (the daemon's `Table::Peer`); every request on it goes through
+//! [`admit`] first and its answer through [`filter_answer`], every
+//! `instances.snapshot` pushed to it through [`filter_snapshot`], each
+//! against the [`Reach`] read from this host's files for that request
+//! ([`Reach::load`]: `member.toml`'s `trust` and `roots`, `state.toml`).
+//!
+//! Under `trust = "worker"` (the default) a peer reaches this member's own
+//! roots ([`own_roots`] plus `member.toml`'s `roots`: each exactly, not
+//! what's nested in one) and its fleet root (all under it):
 //!
 //! - [`decide`] (pure, over the method and params): hello, `subscribe` /
 //!   `unsubscribe` to `instances` only, `instances.watch` / `unwatch`, the
-//!   quick calls (`machines::forward::QUICK`), `capacity.get` and the verbs; never a
-//!   `machine` param or a federated (`machines: true`) request, never a
-//!   verb's `all`; everything else (`machines.*`, `fleet.*`, `lend.*`, `shutdown`,
-//!   `helper.call`, `forwards.*`, the Inbox, `roots.list`, …) is `denied`.
+//!   quick calls (`machines::forward::QUICK`), `capacity.get`, `roots.list`
+//!   and the verbs; never a `machine` param or a federated (`machines:
+//!   true`) request, never a verb's `all`; everything else (`machines.*`,
+//!   `fleet.*`, `lend.*`, `shutdown`, `helper.call`, `forwards.*`, the
+//!   Inbox, …) is `denied`.
 //! - [`admit`] then confines the params: every `root` / `dir` canonicalized
-//!   and under the fleet root (rewritten to its canonical form), every
-//!   instance or container named an instance whose `config_dir` is under
-//!   the fleet root, and a verb's `env` replaced by this host's.
+//!   and admitted by the [`Reach`] (rewritten to its canonical form), every
+//!   instance or container named one whose `config_dir` the reach admits,
+//!   `config.migrate` / `config.ack` (edits of a config) only under the
+//!   fleet root, and a verb's `env` replaced by the peer's when it has one.
+//!
+//! Under `trust = "full"` none of that: the peer has the API a local client
+//! has, except `member.*` and `link.*` (this member's own settings, and its
+//! links), refused under both; a verb's `env` is still the peer's when it
+//! has one.
+//!
 //! - [`refuse_new_work`]: while lending `drain`, a `run` is `denied`
-//!   ([`DRAINING`]); verbs on instances already here go on.
+//!   ([`DRAINING`]), under either trust; verbs on instances already here go
+//!   on.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
@@ -24,20 +39,109 @@ use std::path::{Component, Path, PathBuf};
 use serde_json::Value;
 
 use crate::serve::api::ApiError;
+use crate::serve::fleet::member::{self, Member};
 use crate::serve::machines::forward as fwd;
 use crate::serve::verbs;
 use crate::state::State;
+use crate::worker_policy::Trust;
 
-/// A hub's view of this host: one per lending link.
+/// A remote caller of this member: one per lending link.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Scope {
-    /// The hub's ssh target, for the log.
-    pub hub: String,
-    /// The fleet root, canonical: all the hub reaches.
-    pub root: PathBuf,
-    /// The env a hub's verbs run with: this host's own (the daemon's), never
-    /// what the hub sent.
-    pub env: BTreeMap<String, String>,
+pub struct Peer {
+    /// Who it is (the hub's ssh target), for the log.
+    pub name: String,
+    /// This member's fleet root for it, canonical; `Some` on the lending
+    /// link.
+    pub fleet_root: Option<PathBuf>,
+    /// `Some`: the env its verbs run with, whatever it sent (the lending
+    /// link's: this host's own, the daemon's). `None`: a verb's env as sent.
+    pub env: Option<BTreeMap<String, String>>,
+}
+
+/// Where a [`Reach`] is read from: this host's files.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Files {
+    pub state: PathBuf,
+    /// `member.toml`; `None` without a data dir (then: `worker`, no picked
+    /// roots).
+    pub member: Option<PathBuf>,
+    /// The home `~/.devsandboxes` is found in ([`own_roots`]).
+    pub home: Option<PathBuf>,
+}
+
+/// What a [`Peer`] reaches here, for one request (see the module doc).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reach {
+    pub trust: Trust,
+    /// Canonical; everything under it is reached.
+    pub fleet_root: Option<PathBuf>,
+    /// This member's own roots (canonical where they exist): each is
+    /// reached exactly, not what's nested in it.
+    pub own: BTreeSet<PathBuf>,
+}
+
+/// This host's own config roots: every distinct `config_dir` in `state`,
+/// plus `~/.devsandboxes` when `home` has one, canonicalized (a root that's
+/// gone stays as recorded). What `roots.list` answers, and the base of a
+/// [`Reach`]'s `own`.
+pub fn own_roots(state: &State, home: Option<&Path>) -> BTreeSet<PathBuf> {
+    let recorded = state.instances.values().filter_map(|i| i.config_dir.clone());
+    let home = home.map(|h| h.join(".devsandboxes")).filter(|d| d.is_dir());
+    recorded.chain(home).map(|r| std::fs::canonicalize(&r).unwrap_or(r)).collect()
+}
+
+impl Reach {
+    /// Over what's read (pure but for canonicalizing): `member`'s `trust`
+    /// (none: `worker`), [`own_roots`] of `state` plus `member`'s `roots`.
+    pub fn of(member: Option<&Member>, state: &State, home: Option<&Path>, fleet_root: Option<&Path>) -> Reach {
+        let mut own = own_roots(state, home);
+        if let Some(m) = member {
+            own.extend(m.roots.iter().map(|r| std::fs::canonicalize(r).unwrap_or_else(|_| r.clone())));
+        }
+        let trust = member.map(|m| m.trust).unwrap_or_default();
+        Reach { trust, fleet_root: fleet_root.map(Path::to_path_buf), own }
+    }
+
+    /// [`Reach::of`] this host's `files`. Fails closed: a `member.toml` that
+    /// doesn't load is `worker` with no picked roots, a `state.toml` that
+    /// doesn't load is no instances' roots; either comes back as the error
+    /// to log.
+    pub fn load(files: &Files, fleet_root: Option<&Path>) -> (Reach, Option<String>) {
+        let mut warning = None;
+        let member = match files.member.as_deref().map(member::load) {
+            None | Some(Ok(None)) => None,
+            Some(Ok(Some(m))) => Some(m),
+            Some(Err(e)) => {
+                warning = Some(format!("{e:#}; taken as `trust = \"worker\"`, no `roots`"));
+                None
+            }
+        };
+        let state = State::load_at(&files.state).unwrap_or_else(|e| {
+            warning = Some(format!("{e:#}; taken as no instances"));
+            State::default()
+        });
+        (Reach::of(member.as_ref(), &state, files.home.as_deref(), fleet_root), warning)
+    }
+
+    /// Whether the peer reaches canonical path `real`: anything under
+    /// `full`; else under the fleet root, or exactly an own root.
+    pub fn admits(&self, real: &Path) -> bool {
+        self.trust == Trust::Full || self.in_fleet_root(real) || self.own.contains(real)
+    }
+
+    /// Whether canonical path `real` is under the fleet root.
+    pub fn in_fleet_root(&self, real: &Path) -> bool {
+        self.fleet_root.as_deref().is_some_and(|r| real.starts_with(r))
+    }
+
+    /// Whether recorded config root `dir` is admitted: canonicalized when it
+    /// still exists, else as recorded; never with a `..`.
+    pub fn admits_recorded(&self, dir: &Path) -> bool {
+        if dir.components().any(|c| c == Component::ParentDir) {
+            return false;
+        }
+        self.admits(&std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()))
+    }
 }
 
 /// What kind of request [`decide`] let through.
@@ -50,6 +154,9 @@ pub enum Gate {
     Quick,
     /// `capacity.get`: this host's report, for the hub's placement.
     Capacity,
+    /// `roots.list`, with or without `paths`: read-only (`machines.add`
+    /// checks typed roots through it).
+    Roots,
     Verb,
 }
 
@@ -66,7 +173,8 @@ pub fn refuse_new_work(method: &str, draining: bool) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// Whether a hub may send `method` with `params` at all (pure).
+/// Whether a `worker` member's peer may send `method` with `params` at all
+/// (pure).
 pub fn decide(method: &str, params: &Value) -> Result<Gate, ApiError> {
     if fwd::machine_of(params)?.is_some() {
         return Err(ApiError::denied("a fleet hub can't reach past this worker (`machine`)"));
@@ -87,6 +195,7 @@ pub fn decide(method: &str, params: &Value) -> Result<Gate, ApiError> {
         "instances.unwatch" => Gate::Unwatch,
         m if fwd::is_quick(m) => Gate::Quick,
         "capacity.get" => Gate::Capacity,
+        "roots.list" => Gate::Roots,
         m if verbs::is_verb(m) => {
             // `--all` is every instance in `state.toml`, not the root's.
             if params.get("all").and_then(Value::as_bool) == Some(true) {
@@ -115,11 +224,11 @@ fn needs_instance(method: &str) -> bool {
     matches!(method, "rebuild" | "start" | "stop" | "rm")
 }
 
-/// `path` checked against fleet root `root` (canonical): absolute, no `..`,
-/// and canonicalized (symlinks resolved) under `root`. A path that doesn't
-/// exist is `not-found`, unless `!exists` (an unwatch of a removed root),
-/// where it is checked as written.
-pub fn confine_path(root: &Path, path: &Path, exists: bool) -> Result<PathBuf, ApiError> {
+/// `path` checked against `reach`: absolute, no `..`, and canonicalized
+/// (symlinks resolved) to one the reach admits ([`Reach::admits`]). A path
+/// that doesn't exist is `not-found`, unless `!exists` (an unwatch of a
+/// removed root), where it is checked as written.
+pub fn confine_path(reach: &Reach, path: &Path, exists: bool) -> Result<PathBuf, ApiError> {
     if !path.is_absolute() {
         return Err(ApiError::invalid(format!("`{}` must be absolute", path.display())));
     }
@@ -131,8 +240,11 @@ pub fn confine_path(root: &Path, path: &Path, exists: bool) -> Result<PathBuf, A
         Err(_) if !exists => path.to_path_buf(),
         Err(_) => return Err(ApiError::not_found(format!("no directory {}", path.display()))),
     };
-    if !real.starts_with(root) {
-        return Err(ApiError::denied(format!("`{}` is outside this worker's fleet root", path.display())));
+    if !reach.admits(&real) {
+        return Err(ApiError::denied(format!(
+            "`{}` is neither under this member's fleet root nor one of its own roots",
+            path.display()
+        )));
     }
     Ok(real)
 }
@@ -146,12 +258,12 @@ pub(crate) fn root_under(dir: &Path, root: &Path) -> bool {
     std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()).starts_with(root)
 }
 
-/// The instances of `state` the hub may name: names and ids of those whose
-/// `config_dir` is under `root`.
-pub fn lent_instances(state: &State, root: &Path) -> Lent {
+/// The instances of `state` the peer may name: names and ids of those whose
+/// `config_dir` `reach` admits ([`Reach::admits_recorded`]).
+pub fn lent_instances(state: &State, reach: &Reach) -> Lent {
     let mut lent = Lent::default();
     for (name, i) in &state.instances {
-        if i.config_dir.as_deref().is_some_and(|d| root_under(d, root)) {
+        if i.config_dir.as_deref().is_some_and(|d| reach.admits_recorded(d)) {
             lent.names.insert(name.clone());
             lent.ids.insert(i.instance_id.clone());
             lent.containers.insert(i.container.clone());
@@ -182,10 +294,21 @@ impl Lent {
     }
 }
 
-/// Gate, then confine, a hub's request (see the module doc): the params
+/// Gate, then confine, a peer's request (see the module doc): the params
 /// to run it with. `state` is this host's `state.toml`, read only when the
-/// request names an instance or a container.
-pub fn admit(method: &str, mut params: Value, scope: &Scope, state: &Path) -> Result<Value, ApiError> {
+/// request names an instance or a container under `worker`.
+pub fn admit(method: &str, mut params: Value, peer: &Peer, reach: &Reach, state: &Path) -> Result<Value, ApiError> {
+    if method.starts_with("member.") || method.starts_with("link.") {
+        return Err(ApiError::denied(format!("`{method}` is this member's own: local clients only")));
+    }
+    if reach.trust == Trust::Full {
+        if verbs::is_verb(method)
+            && let Some(obj) = params.as_object_mut()
+        {
+            peer_env(obj, peer)?;
+        }
+        return Ok(params);
+    }
     let gate = decide(method, &params)?;
     let Some(obj) = params.as_object_mut() else {
         return Ok(params);
@@ -195,7 +318,13 @@ pub fn admit(method: &str, mut params: Value, scope: &Scope, state: &Path) -> Re
         let Some(path) = v.as_str() else {
             return Err(ApiError::invalid(format!("`{key}` must be a path")));
         };
-        let real = confine_path(&scope.root, Path::new(path), gate != Gate::Unwatch)?;
+        let real = confine_path(reach, Path::new(path), gate != Gate::Unwatch)?;
+        if matches!(method, "config.migrate" | "config.ack") && !reach.in_fleet_root(&real) {
+            return Err(ApiError::denied(format!(
+                "`{method}` edits this member's own config at {}: that needs `devsandbox machine trust full` on it",
+                real.display()
+            )));
+        }
         obj.insert(key.into(), Value::String(real.to_string_lossy().into_owned()));
     }
     // The methods whose path is how they find what they act on: without
@@ -224,7 +353,7 @@ pub fn admit(method: &str, mut params: Value, scope: &Scope, state: &Path) -> Re
     let named_container = matches!(method, "containers.logs" | "containers.inspect");
     if !keys.is_empty() || method == "instances.procs" || named_container {
         let state = State::load_at(state).map_err(ApiError::internal)?;
-        let lent = lent_instances(&state, &scope.root);
+        let lent = lent_instances(&state, reach);
         let unknown = |what: &str| ApiError::not_found(format!("no instance `{what}`"));
         for key in keys {
             let Some(name) = obj.get(*key).and_then(Value::as_str) else {
@@ -259,31 +388,42 @@ pub fn admit(method: &str, mut params: Value, scope: &Scope, state: &Path) -> Re
         }
     }
     if gate == Gate::Verb {
-        obj.insert("env".into(), serde_json::to_value(&scope.env).map_err(|e| ApiError::internal(e.into()))?);
+        peer_env(obj, peer)?;
     }
     Ok(params)
 }
 
-/// A local answer to a hub's request, cut to the fleet root: an
-/// `instances.list` like a snapshot ([`filter_snapshot`]); an
+/// A verb's `env` replaced by the peer's, when it has one.
+fn peer_env(obj: &mut serde_json::Map<String, Value>, peer: &Peer) -> Result<(), ApiError> {
+    if let Some(env) = &peer.env {
+        obj.insert("env".into(), serde_json::to_value(env).map_err(|e| ApiError::internal(e.into()))?);
+    }
+    Ok(())
+}
+
+/// A local answer to a peer's request, cut to `reach` (nothing cut under
+/// `full`): an `instances.list` like a snapshot ([`filter_snapshot`]); an
 /// `instances.resolve`'s matches to lent instances (none left is
 /// `not-found`); `containers.list` / `containers.stats` rows to the lent
 /// instances' containers and their config roots' services
 /// ([`cut_containers`]; `state` is this host's `state.toml`, read for
 /// those two only). Others pass as they are: their params were confined.
-pub fn filter_answer(method: &str, mut answer: Value, root: &Path, state: &Path) -> Result<Value, ApiError> {
+pub fn filter_answer(method: &str, mut answer: Value, reach: &Reach, state: &Path) -> Result<Value, ApiError> {
+    if reach.trust == Trust::Full {
+        return Ok(answer);
+    }
     match method {
-        "instances.list" => filter_snapshot(&mut answer, root),
+        "instances.list" => filter_snapshot(&mut answer, reach),
         "containers.list" | "containers.stats" => {
             let state = State::load_at(state).map_err(ApiError::internal)?;
-            let lent = lent_instances(&state, root);
+            let lent = lent_instances(&state, reach);
             cut_containers(method, &mut answer, &lent.containers, &lent.projects());
         }
         "instances.resolve" => {
             let found: Vec<Value> = answer
                 .get("found")
                 .and_then(Value::as_array)
-                .map(|f| f.iter().filter(|f| row_lent(f, root)).cloned().collect())
+                .map(|f| f.iter().filter(|f| row_lent(f, reach)).cloned().collect())
                 .unwrap_or_default();
             if found.is_empty() {
                 return Err(ApiError::not_found("no instance matches"));
@@ -319,22 +459,26 @@ pub fn cut_containers(method: &str, answer: &mut Value, containers: &BTreeSet<St
     });
 }
 
-/// Whether a row (`InstanceRow`, a resolve's `found`) has its `root` under
-/// `root`; a row without one isn't lent.
-fn row_lent(row: &Value, root: &Path) -> bool {
-    row.get("root").and_then(Value::as_str).is_some_and(|r| root_under(Path::new(r), root))
+/// Whether a row (`InstanceRow`, a resolve's `found`) has a `root` `reach`
+/// admits; a row without one isn't lent.
+fn row_lent(row: &Value, reach: &Reach) -> bool {
+    row.get("root").and_then(Value::as_str).is_some_and(|r| reach.admits_recorded(Path::new(r)))
 }
 
 /// An `instances.list` answer / `instances.snapshot` params cut to the
-/// instances under `root` (by their rows' `root`), in place: other rows
+/// instances `reach` admits (by their rows' `root`), in place: other rows
 /// gone, and their names from services' `used_by` and from
 /// `thread_children`. The snapshot lists every instance in `state.toml`,
-/// whatever `dir`, so this is what keeps this host's own out.
-pub fn filter_snapshot(snapshot: &mut Value, root: &Path) {
+/// whatever `dir`, so this is what keeps what isn't reached out. Nothing
+/// is cut under `full`.
+pub fn filter_snapshot(snapshot: &mut Value, reach: &Reach) {
+    if reach.trust == Trust::Full {
+        return;
+    }
     let mut kept = BTreeSet::new();
     let mut ids = BTreeSet::new();
     if let Some(rows) = snapshot.get_mut("instances").and_then(Value::as_array_mut) {
-        rows.retain(|r| row_lent(r, root));
+        rows.retain(|r| row_lent(r, reach));
         kept.extend(rows.iter().filter_map(|r| r.get("name").and_then(Value::as_str).map(String::from)));
         ids.extend(rows.iter().filter_map(|r| r.get("instance_id").and_then(Value::as_str).map(String::from)));
     }
@@ -381,6 +525,16 @@ mod tests {
         std::fs::canonicalize(&dir).unwrap()
     }
 
+    /// A `worker` reach of fleet root `root` and own roots `own`.
+    fn worker(root: &Path, own: &[&Path]) -> Reach {
+        Reach { trust: Trust::Worker, fleet_root: Some(root.to_path_buf()), own: own.iter().map(|p| p.to_path_buf()).collect() }
+    }
+
+    /// The fleet root only.
+    fn fleet(root: &Path) -> Reach {
+        worker(root, &[])
+    }
+
     #[test]
     fn the_allow_list() {
         use Gate::*;
@@ -424,7 +578,9 @@ mod tests {
             ("helper.call", p.clone(), Err("denied")),
             ("forwards.add", p.clone(), Err("denied")),
             ("forwards.list", p.clone(), Err("denied")),
-            ("roots.list", p.clone(), Err("denied")),
+            ("roots.list", p.clone(), Ok(Roots)),
+            ("roots.list", json!({"paths": ["~/x"]}), Ok(Roots)),
+            ("roots.list", json!({"machine": "m"}), Err("denied")),
             ("bridges.ensure", p.clone(), Err("denied")),
             ("inbox.threads.list", p.clone(), Err("denied")),
             ("nope", p.clone(), Err("denied")),
@@ -458,18 +614,19 @@ mod tests {
         std::os::unix::fs::symlink(base.join("mine"), root.join("escape")).unwrap();
         std::os::unix::fs::symlink(root.join("cfg"), base.join("into")).unwrap();
 
-        assert_eq!(confine_path(&root, &root.join("cfg"), true).unwrap(), root.join("cfg"));
-        assert_eq!(confine_path(&root, &root, true).unwrap(), root, "the root itself");
+        let reach = fleet(&root);
+        assert_eq!(confine_path(&reach, &root.join("cfg"), true).unwrap(), root.join("cfg"));
+        assert_eq!(confine_path(&reach, &root, true).unwrap(), root, "the root itself");
         // A symlink from outside into the root resolves inside: fine.
-        assert_eq!(confine_path(&root, &base.join("into/sub"), true).unwrap(), root.join("cfg/sub"));
-        let code = |p: &Path, exists| confine_path(&root, p, exists).unwrap_err().code;
+        assert_eq!(confine_path(&reach, &base.join("into/sub"), true).unwrap(), root.join("cfg/sub"));
+        let code = |p: &Path, exists| confine_path(&reach, p, exists).unwrap_err().code;
         assert_eq!(code(&base.join("mine"), true), "denied", "outside");
         assert_eq!(code(&root.join("escape"), true), "denied", "a symlink out");
         assert_eq!(code(&root.join("cfg/../../../mine"), true), "denied", "`..`");
         assert_eq!(code(&root.join("cfg/.."), true), "denied", "`..` even when it stays inside");
         assert_eq!(code(Path::new("rel"), true), "invalid");
         assert_eq!(code(&root.join("gone"), true), "not-found");
-        assert_eq!(confine_path(&root, &root.join("gone"), false).unwrap(), root.join("gone"), "an unwatch");
+        assert_eq!(confine_path(&reach, &root.join("gone"), false).unwrap(), root.join("gone"), "an unwatch");
         assert_eq!(code(&base.join("gone"), false), "denied");
         // A sibling whose name extends the root's isn't under it.
         std::fs::create_dir_all(base.join("fleet/hub2")).unwrap();
@@ -491,8 +648,13 @@ mod tests {
         state
     }
 
-    fn scope(root: &Path) -> Scope {
-        Scope { hub: "me@hub".into(), root: root.to_path_buf(), env: BTreeMap::from([("PATH".into(), "/worker/bin".into())]) }
+    /// The lending link's peer: this host's env.
+    fn peer(root: &Path) -> Peer {
+        Peer {
+            name: "me@hub".into(),
+            fleet_root: Some(root.to_path_buf()),
+            env: Some(BTreeMap::from([("PATH".into(), "/worker/bin".into())])),
+        }
     }
 
     #[test]
@@ -502,9 +664,10 @@ mod tests {
         std::fs::create_dir_all(root.join("cfg")).unwrap();
         std::fs::create_dir_all(base.join("mine")).unwrap();
         let state = state_with(&base, &root);
-        let s = scope(&root);
-        let ok = |m: &str, p: Value| admit(m, p, &s, &state).unwrap();
-        let code = |m: &str, p: Value| admit(m, p, &s, &state).unwrap_err().code;
+        let (s, r) = (peer(&root), fleet(&root));
+        let ok = |m: &str, p: Value| admit(m, p, &s, &r, &state).unwrap();
+        let code = |m: &str, p: Value| admit(m, p, &s, &r, &state).unwrap_err().code;
+        let admit = |m: &str, p: Value, s: &Peer, state: &Path| admit(m, p, s, &r, state);
 
         let cfg = root.join("cfg");
         assert_eq!(ok("instances.list", json!({"dir": cfg})), json!({"dir": cfg}));
@@ -548,14 +711,116 @@ mod tests {
         std::fs::create_dir_all(root.join("cfg")).unwrap();
         let state = state_with(&base, &root);
         let p = json!({"root": root.join("cfg"), "instance": "in", "env": {"PATH": "/hub/bin", "SSH_AUTH_SOCK": "/hub/agent"}});
-        let got = admit("stop", p, &scope(&root), &state).unwrap();
+        let r = fleet(&root);
+        let got = admit("stop", p.clone(), &peer(&root), &r, &state).unwrap();
         assert_eq!(got["env"], json!({"PATH": "/worker/bin"}));
         // Missing too: the verb gets it all the same.
-        let got = admit("run", json!({"root": root.join("cfg"), "sandbox": "web"}), &scope(&root), &state).unwrap();
+        let got = admit("run", json!({"root": root.join("cfg"), "sandbox": "web"}), &peer(&root), &r, &state).unwrap();
         assert_eq!(got["env"], json!({"PATH": "/worker/bin"}));
         // Not a verb: params untouched.
-        let got = admit("sandboxes.list", json!({"root": root.join("cfg"), "env": {"A": "b"}}), &scope(&root), &state).unwrap();
+        let got = admit("sandboxes.list", json!({"root": root.join("cfg"), "env": {"A": "b"}}), &peer(&root), &r, &state).unwrap();
         assert_eq!(got["env"], json!({"A": "b"}));
+        // A peer without one: the verb's as sent, under either trust.
+        let as_sent = Peer { env: None, ..peer(&root) };
+        assert_eq!(admit("stop", p.clone(), &as_sent, &r, &state).unwrap()["env"], p["env"]);
+        let full = Reach { trust: Trust::Full, ..r.clone() };
+        assert_eq!(admit("stop", p.clone(), &as_sent, &full, &state).unwrap()["env"], p["env"]);
+        // `full` still takes the peer's.
+        assert_eq!(admit("stop", p, &peer(&root), &full, &state).unwrap()["env"], json!({"PATH": "/worker/bin"}));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Own roots are reached exactly, beside the fleet root.
+    #[test]
+    fn worker_admits_own_roots_exactly() {
+        let base = scratch("own");
+        let root = base.join("fleet/hub");
+        std::fs::create_dir_all(root.join("cfg")).unwrap();
+        std::fs::create_dir_all(base.join("mine/nested")).unwrap();
+        std::fs::create_dir_all(base.join("other")).unwrap();
+        let state = state_with(&base, &root);
+        let (s, r) = (peer(&root), worker(&root, &[&base.join("mine")]));
+        let ok = |m: &str, p: Value| admit(m, p, &s, &r, &state).unwrap();
+        let code = |m: &str, p: Value| admit(m, p, &s, &r, &state).unwrap_err().code;
+        let mine = base.join("mine");
+        assert_eq!(ok("sandboxes.list", json!({"root": mine})), json!({"root": mine}), "an own root");
+        assert_eq!(code("sandboxes.list", json!({"root": mine.join("nested")})), "denied", "not what's nested in one");
+        assert_eq!(code("sandboxes.list", json!({"root": base.join("other")})), "denied", "nor another path");
+        assert_eq!(code("sandboxes.list", json!({"root": mine.join("nested/..")})), "denied", "`..`");
+        // Its instances are named, verbs reach them.
+        assert!(admit("instances.done", json!({"instance": "own", "done": true}), &s, &r, &state).is_ok());
+        assert!(admit("stop", json!({"root": mine, "instance": "web"}), &s, &r, &state).is_ok(), "both matches reached");
+        // Edits of a config: under the fleet root only.
+        for m in ["config.migrate", "config.ack"] {
+            let e = admit(m, json!({"root": mine}), &s, &r, &state).unwrap_err();
+            assert_eq!(e.code, "denied", "{m}");
+            assert!(e.message.contains("machine trust full"), "{}", e.message);
+            assert!(admit(m, json!({"root": root.join("cfg")}), &s, &r, &state).is_ok(), "{m} under the fleet root");
+        }
+        assert!(admit("config.findings", json!({"root": mine}), &s, &r, &state).is_ok(), "reading is fine");
+        assert_eq!(ok("roots.list", json!({"paths": ["/anywhere"]})), json!({"paths": ["/anywhere"]}));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// `full`: nothing confined, but `member.*` and `link.*` stay local.
+    #[test]
+    fn full_skips_the_table_but_not_member_or_link() {
+        let base = scratch("full");
+        let root = base.join("fleet/hub");
+        std::fs::create_dir_all(&root).unwrap();
+        let state = base.join("absent.toml");
+        let (s, r) = (peer(&root), Reach { trust: Trust::Full, ..fleet(&root) });
+        for (m, p) in [
+            ("sandboxes.list", json!({"root": "/anywhere/at/all"})),
+            ("config.migrate", json!({"root": "/etc"})),
+            ("machines.list", json!({})),
+            ("shutdown", json!({})),
+            ("instances.done", json!({"instance": "nobody"})),
+            ("stop", json!({"all": true})),
+            ("instances.list", json!({"machine": "m"})),
+        ] {
+            let as_sent = Peer { env: None, ..s.clone() };
+            assert_eq!(admit(m, p.clone(), &as_sent, &r, &state).unwrap(), p, "{m}: as sent");
+        }
+        for m in ["member.get", "member.set", "link.attach", "link.anything"] {
+            for reach in [&r, &fleet(&root)] {
+                assert_eq!(admit(m, json!({}), &s, reach, &state).unwrap_err().code, "denied", "{m}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn the_reach_comes_from_member_toml_and_state_toml() {
+        let base = scratch("load");
+        let root = base.join("fleet/hub");
+        std::fs::create_dir_all(root.join("cfg")).unwrap();
+        std::fs::create_dir_all(base.join("mine")).unwrap();
+        std::fs::create_dir_all(base.join("picked")).unwrap();
+        std::fs::create_dir_all(base.join("home/.devsandboxes")).unwrap();
+        let state = state_with(&base, &root);
+        let files = Files { state, member: Some(base.join("member.toml")), home: Some(base.join("home")) };
+        let (r, warn) = Reach::load(&files, Some(&root));
+        assert_eq!(warn, None);
+        assert_eq!(r.trust, Trust::Worker, "no member.toml");
+        let own = |p: &[&str]| p.iter().map(|p| base.join(p)).collect::<BTreeSet<_>>();
+        assert_eq!(r.own, [root.join("cfg")].into_iter().chain(own(&["mine", "home/.devsandboxes"])).collect());
+        member::write_for_test(
+            files.member.as_ref().unwrap(),
+            &Member { trust: Trust::Full, roots: vec![base.join("picked"), base.join("gone")], ..Default::default() },
+        );
+        let (r, warn) = Reach::load(&files, Some(&root));
+        assert_eq!((r.trust, warn), (Trust::Full, None));
+        assert!(r.own.is_superset(&own(&["picked", "gone"])), "picked ones, a missing one as written");
+        // A member.toml that doesn't load: `worker`, no picked roots, said.
+        std::fs::write(files.member.as_ref().unwrap(), "trust = 1\n").unwrap();
+        let (r, warn) = Reach::load(&files, Some(&root));
+        assert_eq!(r.trust, Trust::Worker);
+        assert!(!r.own.contains(&base.join("picked")));
+        assert!(warn.unwrap().contains("trust = \"worker\""));
+        // No data dir: `worker`.
+        let (r, _) = Reach::load(&Files { member: None, ..files }, None);
+        assert_eq!((r.trust, r.fleet_root), (Trust::Worker, None));
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -578,6 +843,16 @@ mod tests {
             "sandboxes": [{"name": "web"}],
             "thread_children": {"id-own": {"k": "own"}, "id-in": {"k": "in", "j": "own"}},
         });
+        let full = Reach { trust: Trust::Full, ..fleet(root) };
+        let mut whole = snap.clone();
+        filter_snapshot(&mut whole, &full);
+        assert_eq!(whole, snap, "nothing cut under `full`");
+        let mut own = snap.clone();
+        filter_snapshot(&mut own, &worker(root, &[Path::new("/nonexistent/mine")]));
+        let names: Vec<&str> = own["instances"].as_array().unwrap().iter().map(|r| r["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["in", "own"], "an own root's rows kept, the others dropped");
+        assert_eq!(own["thread_children"], json!({"id-own": {"k": "own"}, "id-in": {"k": "in", "j": "own"}}));
+        let root = &fleet(root);
         filter_snapshot(&mut snap, root);
         assert_eq!(snap["instances"], json!([{"name": "in", "root": "/nonexistent/fleet/hub/cfg", "instance_id": "i1"}]));
         assert_eq!(snap["services"][0]["used_by"], json!(["in"]));
@@ -633,12 +908,16 @@ mod tests {
         let mine = crate::commands::services::project_id(&base.join("mine")).unwrap();
         let svc = |p: &str| json!({"name": format!("devsandbox-svc-{p}-db"), "labels": {"devsandbox.project": p}});
         let answer = json!({"rows": [{"name": "devsandbox-in", "labels": {}}, {"name": "devsandbox-own", "labels": {}}, svc(&lent), svc(&mine)]});
-        let got = filter_answer("containers.list", answer, &root, &state).unwrap();
+        let with_own = filter_answer("containers.list", answer.clone(), &worker(&root, &[&base.join("mine")]), &state).unwrap();
+        assert_eq!(with_own, answer, "an own root's instance and services kept");
+        let reach = fleet(&root);
+        let root = &reach;
+        let got = filter_answer("containers.list", answer, root, &state).unwrap();
         assert_eq!(got, json!({"rows": [{"name": "devsandbox-in", "labels": {}}, svc(&lent)]}));
         let stats = json!({"rows": [{"name": "devsandbox-own"}, {"name": format!("devsandbox-svc-{lent}-db")}]});
-        let got = filter_answer("containers.stats", stats, &root, &state).unwrap();
+        let got = filter_answer("containers.stats", stats, root, &state).unwrap();
         assert_eq!(got, json!({"rows": [{"name": format!("devsandbox-svc-{lent}-db")}]}));
-        assert_eq!(filter_answer("containers.list", json!({"rows": []}), &root, &base.join("bad")).unwrap(), json!({"rows": []}), "no state: none lent");
+        assert_eq!(filter_answer("containers.list", json!({"rows": []}), root, &base.join("bad")).unwrap(), json!({"rows": []}), "no state: none lent");
         let _ = std::fs::remove_dir_all(&base);
     }
 }

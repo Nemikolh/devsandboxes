@@ -448,7 +448,7 @@ pub fn run(dir: &Path, opts: &Options) -> Result<Exit> {
 
 /// The daemon's lending (`fleet::lender`): lend as `lend.toml` says now,
 /// and follow each `lend.set`. A lending thread's fleet root is created,
-/// each `API` stream from the hub is a `Worker` connection
+/// each `API` stream from the hub is a `Peer` connection
 /// ([`Shared::open_lent`]), each `PTY` stream a session attach
 /// ([`Shared::open_lent_pty`]) and each `TUNNEL` stream a forward's bridge
 /// ([`Shared::open_lent_tunnel`]). Without a `lend.toml` path (no data dir) it's
@@ -482,7 +482,7 @@ fn start_lending(dir: &Path, opts: &Options, shared: &Arc<Shared>) {
     // Where each link's agent socket goes (`fleet::agent::socket`).
     let socket_dir = dir.to_path_buf();
     let spawn: fleet::lender::Spawn = Box::new(move |start: fleet::lender::Start| {
-        let scope = Arc::new(lent::Scope { hub: start.hub.clone(), root: start.root.clone(), env: env.clone() });
+        let scope = Arc::new(lent::Peer { name: start.hub.clone(), fleet_root: Some(start.root.clone()), env: Some(env.clone()) });
         let (api, pty, tunnel) = (weak.clone(), weak.clone(), weak.clone());
         let (api_scope, pty_scope) = (Arc::clone(&scope), Arc::clone(&scope));
         let api: fleet::worker::Open = Arc::new(move || api.upgrade()?.open_lent(&api_scope));
@@ -687,18 +687,27 @@ impl Shared {
         self.spawn_conn_as(id, stream, Table::Full);
     }
 
+    /// [`lent::Files`] here: what a peer's [`lent::Reach`] is read from.
+    fn reach_files(&self) -> lent::Files {
+        lent::Files {
+            state: self.state.clone(),
+            member: self.lender.get().map(|l| l.member_path().to_path_buf()),
+            home: self.home.clone(),
+        }
+    }
+
     /// One `API` stream of the lending link: a socket pair whose one end
-    /// goes to the hub, the other served with `scope`'s `Worker` table. The
+    /// goes to the hub, the other served with `scope`'s trust table. The
     /// API relay's sentinel line goes out on ours first, so the hub reads it
     /// before any answer (`machines::link::handshake` reads the stream as an
     /// ssh relay's). `None` once the daemon is stopping.
-    fn open_lent(self: &Arc<Self>, scope: &Arc<lent::Scope>) -> Option<crate::devsbd::mux::Conn> {
+    fn open_lent(self: &Arc<Self>, scope: &Arc<lent::Peer>) -> Option<crate::devsbd::mux::Conn> {
         if *self.closed.0.lock().unwrap() {
             return None;
         }
         let (hub, ours) = Stream::pair().ok()?;
         super::relay::write_sentinel(&mut &ours, true).ok()?;
-        self.spawn_conn_as(self.next_conn_id(), ours, Table::Worker(Arc::clone(scope)));
+        self.spawn_conn_as(self.next_conn_id(), ours, Table::Peer(Arc::clone(scope)));
         Some(hub.into())
     }
 
@@ -708,17 +717,17 @@ impl Shared {
     /// instances). `None`
     /// once the daemon is stopping, or without a host side (no helper
     /// client).
-    fn open_lent_pty(self: &Arc<Self>, scope: &Arc<lent::Scope>) -> Option<crate::devsbd::mux::Conn> {
+    fn open_lent_pty(self: &Arc<Self>, scope: &Arc<lent::Peer>) -> Option<crate::devsbd::mux::Conn> {
         if *self.closed.0.lock().unwrap() {
             return None;
         }
         let helper = self.helper.get()?.clone();
         let (hub, ours) = Stream::pair().ok()?;
-        let (state, scope) = (self.state.clone(), Arc::clone(scope));
+        let (files, scope) = (self.reach_files(), Arc::clone(scope));
         std::thread::Builder::new()
             .name("serve-pty".into())
             .spawn(move || {
-                fleet::pty::serve(ours, &helper, &state, &scope, crate::commands::exec::has_host_agent, fleet::pty::runtime_exec, log)
+                fleet::pty::serve(ours, &helper, &files, &scope, crate::commands::exec::has_host_agent, fleet::pty::runtime_exec, log)
             })
             .ok()?;
         Some(hub.into())
@@ -728,15 +737,15 @@ impl Shared {
     /// goes to the hub, the other served by `fleet::tunnel::serve` on a
     /// thread of its own (a forward's bridge into one of `scope`'s
     /// instances). `None` once the daemon is stopping.
-    fn open_lent_tunnel(self: &Arc<Self>, scope: &Arc<lent::Scope>) -> Option<crate::devsbd::mux::Conn> {
+    fn open_lent_tunnel(self: &Arc<Self>, scope: &Arc<lent::Peer>) -> Option<crate::devsbd::mux::Conn> {
         if *self.closed.0.lock().unwrap() {
             return None;
         }
         let (hub, ours) = Stream::pair().ok()?;
-        let (state, scope) = (self.state.clone(), Arc::clone(scope));
+        let (files, scope) = (self.reach_files(), Arc::clone(scope));
         std::thread::Builder::new()
             .name("serve-tunnel".into())
-            .spawn(move || fleet::tunnel::serve(ours, &state, &scope, log))
+            .spawn(move || fleet::tunnel::serve(ours, &files, &scope, log))
             .ok()?;
         Some(hub.into())
     }
@@ -750,10 +759,10 @@ impl Shared {
         // A socket option: covers every clone, responses and notifications.
         let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
         let out = Arc::new(Outbox::new(writer, ctl));
-        if let Table::Worker(scope) = &table {
-            let root = scope.root.clone();
+        if let Table::Peer(peer) = &table {
+            let reach = (Arc::clone(peer), self.reach_files());
             out.post(|p| {
-                p.confine = Some(root);
+                p.reach = Some(reach);
                 false
             });
         }
@@ -955,9 +964,10 @@ struct Pending {
     forwards_status: Option<String>,
     /// `closing` with this reason; written last.
     closing: Option<&'static str>,
-    /// A `Worker` connection's fleet root: its snapshots are cut to it
-    /// (`lent::filter_snapshot`).
-    confine: Option<PathBuf>,
+    /// A `Peer` connection's peer, and where its reach is read from: its
+    /// snapshots are cut to that reach, read per push
+    /// (`lent::filter_snapshot`), by the notifier.
+    reach: Option<(Arc<lent::Peer>, lent::Files)>,
     /// The connection ended: the notifier writes what's left and exits.
     closed: bool,
 }
@@ -985,11 +995,7 @@ impl Pending {
             out.push(Notification { method: "instances.changed".into(), params: json!({}) });
         }
         for params in std::mem::take(&mut self.snapshots).into_values() {
-            let mut params = Arc::unwrap_or_clone(params);
-            if let Some(root) = &self.confine {
-                lent::filter_snapshot(&mut params, root);
-            }
-            out.push(Notification { method: "instances.snapshot".into(), params });
+            out.push(Notification { method: "instances.snapshot".into(), params: Arc::unwrap_or_clone(params) });
         }
         if std::mem::take(&mut self.forwards) {
             out.push(Notification { method: "forwards.changed".into(), params: json!({}) });
@@ -1033,13 +1039,22 @@ impl Outbox {
 /// ends its reader too.
 fn notifier(out: &Outbox) {
     loop {
-        let (notes, closed) = {
+        let (mut notes, closed, reach) = {
             let mut p = out.pending.lock().unwrap_or_else(|e| e.into_inner());
             while !p.any() && !p.closed {
                 p = out.wake.wait(p).unwrap_or_else(|e| e.into_inner());
             }
-            (p.take(), p.closed)
+            (p.take(), p.closed, p.reach.clone())
         };
+        // A peer's snapshots are cut outside the lock: the reach reads files.
+        if let Some((peer, files)) = reach
+            && notes.iter().any(|n| n.method == "instances.snapshot")
+        {
+            let (reach, _) = lent::Reach::load(&files, peer.fleet_root.as_deref());
+            for n in notes.iter_mut().filter(|n| n.method == "instances.snapshot") {
+                lent::filter_snapshot(&mut n.params, &reach);
+            }
+        }
         for note in &notes {
             if out.send(note).is_err() {
                 let _ = out.ctl.shutdown(Shutdown::Both);
@@ -1156,8 +1171,9 @@ type ConfigStamps = BTreeMap<PathBuf, Vec<Option<(std::time::SystemTime, u64)>>>
 enum Table {
     /// A local client: the whole API.
     Full,
-    /// A fleet hub over the lending link: the lent API only (`fleet::lent`).
-    Worker(Arc<lent::Scope>),
+    /// A remote caller (a fleet hub over the lending link): the trust table
+    /// (`fleet::lent`).
+    Peer(Arc<lent::Peer>),
 }
 
 /// A connection's own state, on its thread.
@@ -1237,23 +1253,31 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
         Ok(req) => req,
         Err(e) => return Some(Response::err(None, "invalid", format!("not a request: {e}"))),
     };
-    // A fleet hub: the lent API only, its params confined, before anything
+    // A remote caller: the trust table, its params confined, before anything
     // else looks at the request.
-    if let Table::Worker(scope) = &conn.table {
-        // `drain` is the one hard no: read live from the lending thread.
-        let draining = shared.lender.get().is_some_and(|l| l.draining());
-        let admitted = lent::refuse_new_work(&req.method, draining)
-            .and_then(|()| lent::admit(&req.method, std::mem::take(&mut req.params), scope, &shared.state));
-        match admitted {
-            Ok(params) => req.params = params,
-            Err(e) => {
-                if e.code == "denied" {
-                    log(&format!("{}: refused {} from fleet hub {}: {}", conn.label(), req.method, scope.hub, e.message));
-                }
-                return Some(Response::err(req.id, e.code, e.message));
+    let reach = match &conn.table {
+        Table::Peer(peer) => {
+            let (reach, warning) = lent::Reach::load(&shared.reach_files(), peer.fleet_root.as_deref());
+            if let Some(w) = warning {
+                log(&format!("{}: {w}", conn.label()));
             }
+            // `drain` is the one hard no: read live from the lending thread.
+            let draining = shared.lender.get().is_some_and(|l| l.draining());
+            let admitted = lent::refuse_new_work(&req.method, draining)
+                .and_then(|()| lent::admit(&req.method, std::mem::take(&mut req.params), peer, &reach, &shared.state));
+            match admitted {
+                Ok(params) => req.params = params,
+                Err(e) => {
+                    if e.code == "denied" {
+                        log(&format!("{}: refused {} from {}: {}", conn.label(), req.method, peer.name, e.message));
+                    }
+                    return Some(Response::err(req.id, e.code, e.message));
+                }
+            }
+            Some(reach)
         }
-    }
+        Table::Full => None,
+    };
     match req.method.as_str() {
         "hello" => return Some(hello(req.id, req.params, shared, conn)),
         method if verbs::is_verb(method) => return verb(req.id, method, req.params, shared, conn),
@@ -1319,9 +1343,9 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
         }
         method => local_call(method, req.params, shared, conn),
     };
-    let answer = match &conn.table {
-        Table::Worker(scope) => answer.and_then(|v| lent::filter_answer(&req.method, v, &scope.root, &shared.state)),
-        Table::Full => answer,
+    let answer = match &reach {
+        Some(reach) => answer.and_then(|v| lent::filter_answer(&req.method, v, reach, &shared.state)),
+        None => answer,
     };
     Some(match answer {
         Ok(result) => Response::ok(req.id, result),

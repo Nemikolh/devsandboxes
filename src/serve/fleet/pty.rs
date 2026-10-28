@@ -39,13 +39,13 @@
 
 use std::io::{Read, Write};
 use std::net::Shutdown;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, ExitStatus, Stdio};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use super::lent::{self, Scope};
+use super::lent::{self, Files, Peer, Reach};
 use crate::commands::exec::{SHELL_FALLBACK_CMD, exec_argv_with, exec_context};
 use crate::devsbd::control::valid_run_id;
 use crate::devsbd::rpc::{self, Exit, Json, Obj, Record};
@@ -198,17 +198,18 @@ pub fn parse_header(rec: Record) -> Result<Header, Record> {
 }
 
 /// The instance the header names, and its `state.toml` key: `root`
-/// confined to the fleet root `fleet_root` as `lent::confine_path` does;
-/// the instance by exact name, else by id, among those lent
-/// (`lent::lent_instances`) whose config root is under `root`. Neither the
-/// helper nor running is checked here: a session's helper is asked
-/// ([`decide`]); a runtime exec (a pipe, a tty) says so itself.
-pub fn gate<'a>(h: &Header, state: &'a State, fleet_root: &Path) -> Result<(&'a str, &'a Instance), Record> {
-    let root = lent::confine_path(fleet_root, &h.root, true).map_err(|e| match e.code {
+/// confined to `reach` as `lent::confine_path` does (the fleet root or an
+/// own root under `worker`, any under `full`); the instance by exact name,
+/// else by id, among those lent (`lent::lent_instances`) whose config root
+/// is under `root`. Neither the helper nor running is checked here: a
+/// session's helper is asked ([`decide`]); a runtime exec (a pipe, a tty)
+/// says so itself.
+pub fn gate<'a>(h: &Header, state: &'a State, reach: &Reach) -> Result<(&'a str, &'a Instance), Record> {
+    let root = lent::confine_path(reach, &h.root, true).map_err(|e| match e.code {
         "invalid" => bad(e.message),
         code => Record::error(code, e.message),
     })?;
-    let lent = lent::lent_instances(state, fleet_root);
+    let lent = lent::lent_instances(state, reach);
     let by_name = state.instances.get_key_value(&h.instance);
     let found = by_name
         .or_else(|| state.instances.iter().find(|(_, i)| i.instance_id == h.instance))
@@ -427,25 +428,26 @@ enum Started {
 }
 
 /// Serve one `PTY` stream, `link` the worker's end, to its end (see the
-/// module doc). `state` is this host's `state.toml`, `scope` the link's;
+/// module doc). `files` are this host's (its `state.toml`, and what the
+/// peer's [`Reach`] is read from), `peer` the link's;
 /// `host_agent` probes for a host ssh-agent (`exec::has_host_agent`);
 /// `exec` builds a piped or tty exec's argv ([`runtime_exec`]). Refusals
 /// with `denied` are logged.
 pub fn serve(
     link: Stream,
     helper: &HelperClient,
-    state: &Path,
-    scope: &Scope,
+    files: &Files,
+    peer: &Peer,
     host_agent: fn() -> bool,
     exec: ExecCommand,
     log: fn(&str),
 ) {
-    let caller = format!("fleet hub {}", scope.hub);
+    let caller = format!("fleet hub {}", peer.name);
     let _ = link.set_read_timeout(Some(HEADER_WAIT));
     let first = rpc::read_record(&mut &link);
     let _ = link.set_read_timeout(None);
     let started = match first {
-        Ok(Some(rec)) => start(rec, &link, helper, state, scope, host_agent, exec, &caller),
+        Ok(Some(rec)) => start(rec, &link, helper, files, peer, host_agent, exec, &caller, log),
         Ok(None) => return,
         Err(e) => Err(bad(format!("no PTY header: {e}"))),
     };
@@ -457,7 +459,7 @@ pub fn serve(
             if let Record::Error { code: c, message } = &rec
                 && c == code::DENIED
             {
-                log(&format!("fleet: refused a PTY stream from hub {}: {message}", scope.hub));
+                log(&format!("fleet: refused a PTY stream from hub {}: {message}", peer.name));
             }
             let _ = rpc::write_record(&mut &link, &rec);
         }
@@ -472,15 +474,20 @@ fn start(
     first: Record,
     link: &Stream,
     helper: &HelperClient,
-    state: &Path,
-    scope: &Scope,
+    files: &Files,
+    peer: &Peer,
     host_agent: fn() -> bool,
     exec: ExecCommand,
     caller: &str,
+    log: fn(&str),
 ) -> Result<Started, Record> {
     let h = parse_header(first)?;
-    let state = State::load_at(state).map_err(|e| Record::error(code::FAILED, format!("{e:#}")))?;
-    let (name, instance) = gate(&h, &state, &scope.root)?;
+    let state = State::load_at(&files.state).map_err(|e| Record::error(code::FAILED, format!("{e:#}")))?;
+    let (reach, warning) = Reach::load(files, peer.fleet_root.as_deref());
+    if let Some(w) = warning {
+        log(&format!("fleet: a PTY stream from hub {}: {w}", peer.name));
+    }
+    let (name, instance) = gate(&h, &state, &reach)?;
     let tty = |argv: Vec<String>, note: Option<String>| {
         spawn_tty(argv)
             .map(|t| Started::Tty(t, note))
@@ -787,6 +794,7 @@ fn feed(mut reader: Stream, mut input: Input, done: &AtomicBool, gone: &AtomicBo
 mod tests {
     use std::collections::BTreeMap;
     use std::os::unix::net::UnixStream;
+    use std::path::Path;
 
     use super::*;
     use crate::devsbd::proto::caps;
@@ -936,20 +944,32 @@ mod tests {
         let state = state_with(&b, &root);
         let cfg = root.join("cfg");
         let h = |root: &Path, instance: &str| Header { root: root.to_path_buf(), instance: instance.into(), mode: session(None) };
-        let (name, i) = gate(&h(&cfg, "web-1"), &state, &root).unwrap();
+        let reach = |own: &[PathBuf]| Reach { trust: crate::worker_policy::Trust::Worker, fleet_root: Some(root.clone()), own: own.iter().cloned().collect() };
+        // An own root reaches its instances, exactly.
+        let mine = b.join("mine");
+        std::fs::create_dir_all(mine.join("nested")).unwrap();
+        let with_own = reach(&[mine.clone()]);
+        assert_eq!(gate(&h(&mine, "own"), &state, &with_own).unwrap().0, "own", "an own root's");
+        assert_eq!(gate(&h(&mine, "id-own"), &state, &with_own).unwrap().0, "own", "by id");
+        assert_eq!(code_of(gate(&h(&mine.join("nested"), "own"), &state, &with_own)), code::DENIED, "not what's nested in it");
+        assert_eq!(code_of(gate(&h(&cfg, "own"), &state, &with_own)), code::NOT_FOUND, "not another root's");
+        let full = Reach { trust: crate::worker_policy::Trust::Full, ..reach(&[]) };
+        assert_eq!(gate(&h(&mine, "own"), &state, &full).unwrap().0, "own", "`full`: any root");
+        let r = reach(&[]);
+        let (name, i) = gate(&h(&cfg, "web-1"), &state, &r).unwrap();
         assert_eq!((name, i.container.as_str()), ("web-1", "devsandbox-web-1"));
-        assert_eq!(gate(&h(&cfg, "id-web-1"), &state, &root).unwrap().0, "web-1", "by id");
-        assert_eq!(gate(&h(&root, "web-1"), &state, &root).unwrap().0, "web-1", "the fleet root holds it too");
-        assert_eq!(code_of(gate(&h(&cfg, "web"), &state, &root)), code::NOT_FOUND, "exact names only");
-        assert_eq!(code_of(gate(&h(&cfg, "own"), &state, &root)), code::NOT_FOUND, "not lent");
-        assert_eq!(code_of(gate(&h(&root.join("other"), "web-1"), &state, &root)), code::NOT_FOUND, "another root's");
-        assert_eq!(code_of(gate(&h(&b.join("mine"), "own"), &state, &root)), code::DENIED, "outside the fleet root");
-        assert_eq!(code_of(gate(&h(&root.join("gone"), "web-1"), &state, &root)), code::NOT_FOUND);
-        assert_eq!(code_of(gate(&h(Path::new("rel"), "web-1"), &state, &root)), code::BAD_REQUEST);
-        assert_eq!(gate(&h(&cfg, "bare"), &state, &root).unwrap().0, "bare", "no helper: `decide`'s to say");
+        assert_eq!(gate(&h(&cfg, "id-web-1"), &state, &r).unwrap().0, "web-1", "by id");
+        assert_eq!(gate(&h(&root, "web-1"), &state, &r).unwrap().0, "web-1", "the fleet root holds it too");
+        assert_eq!(code_of(gate(&h(&cfg, "web"), &state, &r)), code::NOT_FOUND, "exact names only");
+        assert_eq!(code_of(gate(&h(&cfg, "own"), &state, &r)), code::NOT_FOUND, "not lent");
+        assert_eq!(code_of(gate(&h(&root.join("other"), "web-1"), &state, &r)), code::NOT_FOUND, "another root's");
+        assert_eq!(code_of(gate(&h(&b.join("mine"), "own"), &state, &r)), code::DENIED, "outside the fleet root");
+        assert_eq!(code_of(gate(&h(&root.join("gone"), "web-1"), &state, &r)), code::NOT_FOUND);
+        assert_eq!(code_of(gate(&h(Path::new("rel"), "web-1"), &state, &r)), code::BAD_REQUEST);
+        assert_eq!(gate(&h(&cfg, "bare"), &state, &r).unwrap().0, "bare", "no helper: `decide`'s to say");
         let pipe = |instance: &str| Header { mode: Mode::Pipe { argv: vec!["ls".into()], interactive: false }, ..h(&cfg, instance) };
-        assert_eq!(gate(&pipe("bare"), &state, &root).unwrap().0, "bare", "a pipe needs no helper");
-        assert_eq!(code_of(gate(&pipe("own"), &state, &root)), code::NOT_FOUND, "but the same lending");
+        assert_eq!(gate(&pipe("bare"), &state, &r).unwrap().0, "bare", "a pipe needs no helper");
+        assert_eq!(code_of(gate(&pipe("own"), &state, &r)), code::NOT_FOUND, "but the same lending");
         let _ = std::fs::remove_dir_all(&b);
     }
 
@@ -1117,9 +1137,9 @@ mod tests {
     /// The hub's end of a stream served on a thread, its header sent.
     fn open(w: &World, header: Record, helper: HelperClient) -> (UnixStream, std::thread::JoinHandle<()>) {
         let (hub, ours) = UnixStream::pair().unwrap();
-        let scope = Scope { hub: "me@hub".into(), root: w.root.clone(), env: BTreeMap::new() };
-        let state = w.state.clone();
-        let t = std::thread::spawn(move || serve(ours, &helper, &state, &scope, || false, sh, log));
+        let peer = Peer { name: "me@hub".into(), fleet_root: Some(w.root.clone()), env: None };
+        let files = Files { state: w.state.clone(), member: None, home: None };
+        let t = std::thread::spawn(move || serve(ours, &helper, &files, &peer, || false, sh, log));
         rpc::write_record(&mut &hub, &header).unwrap();
         hub.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
         (hub, t)
@@ -1266,10 +1286,14 @@ mod tests {
         let cfg = cfg.to_str().unwrap();
         assert_eq!(refusal(Record::StdinEof, w.helper.clone()), code::BAD_REQUEST);
         assert_eq!(refusal(header(base(cfg).with("instance", "own")), w.helper.clone()), code::NOT_FOUND);
+        let other = w.base.join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        assert_eq!(refusal(header(base(other.to_str().unwrap()).with("instance", "own")), w.helper.clone()), code::DENIED);
+        assert!(logged("fleet: refused a PTY stream from hub me@hub"));
+        // An own root's instance is reached (its helper isn't running here).
         let mine = w.base.join("mine");
         std::fs::create_dir_all(&mine).unwrap();
-        assert_eq!(refusal(header(base(mine.to_str().unwrap()).with("instance", "own")), w.helper.clone()), code::DENIED);
-        assert!(logged("fleet: refused a PTY stream from hub me@hub"));
+        assert_eq!(refusal(header(base(mine.to_str().unwrap()).with("instance", "own")), w.helper.clone()), code::NOT_RUNNING);
         // Attach only, without a helper that attaches: nothing to resume.
         assert_eq!(refusal(header(base(cfg).with("instance", "bare")), w.helper.clone()), rpc::code::NO_SESSION);
 

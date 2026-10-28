@@ -451,9 +451,10 @@ env's own `SSH_AUTH_SOCK` (the machine's agent, if any) stays.
   that comes from this host's record); `done` / `undone` are
   `instances.done`, worded from the row's `done` before; `rename` is
   `instances.rename`. `--machine m ls [--json]` and `status --json` list
-  each config root under the machine's one root (its fleet root): the
-  roots its instance rows name (`offered::config_roots`; none: the fleet
-  root itself), each an `instances.list` after its `==> m:<root>` line,
+  each config root its listing of the machine's one root (its fleet root)
+  names: the roots its instance rows name (`offered::config_roots`: the
+  placed configs', and under `worker` trust the worker's own roots'
+  instances too; none: the fleet root itself), each an `instances.list` after its `==> m:<root>` line,
   `per_root`'s rules (`--json` with several roots is an error); `ls`
   renders the snapshot's sandbox rows (a config that doesn't load is the
   error, as locally). `--machine m service ls [--json]` takes the same
@@ -464,8 +465,8 @@ env's own `SSH_AUTH_SOCK` (the machine's agent, if any) stays.
   line names `<root>/devsandboxes.toml`. `--machine m ps [--all] [--json]` is one
   `containers.list`, `stats [--json]` one `containers.stats`
   (`offered::listing`): the worker answers its whole runtime's rows cut to
-  what it lends (its lent instances' containers and their config roots'
-  services, [fleet](fleet.md#the-worker-table)). Refused, naming the
+  what its trust reaches (those instances' containers and their config
+  roots' services, [fleet](fleet.md#the-trust-table)). Refused, naming the
   command (`offered::refusal`): `vscode` (not over a fleet link yet), a
   session `exec` without a tty (a session over the link needs a
   terminal), and `gc` (host maintenance on the worker, outside a

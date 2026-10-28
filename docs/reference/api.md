@@ -110,7 +110,7 @@ absent otherwise (`confirm` included).
 | `not-found` | the thread, action, directory, instance, sandbox, service, forward or machine named doesn't exist |
 | `invalid` | bad params (missing, wrong type, unknown value), an op that makes no sense for its target, a `machine` on a method that doesn't take one, or a `machine` that isn't a non-empty string |
 | `unknown-method` | no such method on this daemon |
-| `denied` | the target refuses it (an archived thread is read-only; a thread that takes no replies) |
+| `denied` | the target refuses it (an archived thread is read-only; a thread that takes no replies), or a remote caller's trust doesn't reach it (*Remote callers*) |
 | `closed-form` | the form was already submitted, or withdrawn by its owner |
 | `conflict` | what the request was based on changed meanwhile: a config file edited since its findings were read (`config.migrate`) |
 | `unsupported` | valid, but this target can't do it: a YAML config isn't rewritten (`config.migrate`); the message says what to do instead |
@@ -118,6 +118,25 @@ absent otherwise (`confirm` included).
 | `failed` | a verb exited non-zero; `data`: `{"exit": n, "instance": name \| null}` (*Verbs*). Also a machine that couldn't be reached: ssh failed, the hello failed or the protocols differ, the link is `unreachable` (*Machines*) |
 | `confirm` | an `rm` sent with `ask: true` needs an answer; `message` is the question, nothing was removed (*Verbs*) |
 | `internal` | the daemon failed (store unreadable, …); logged in `serve.log` |
+
+### Remote callers
+
+A fleet hub's connection over the lending link is served with this
+member's trust table
+([fleet.md](../architecture/daemon/fleet.md#the-trust-table)), read from
+its `member.toml` per request. `member.*` and `link.*` are `denied` under
+either trust, as is a hello's handoff. Under `trust = "worker"` (the
+default) the hub may call `hello`, `subscribe` / `unsubscribe`
+(`instances` only), `instances.watch` / `unwatch`, the quick calls (the
+`machine`-taking methods in the index but the verbs), `capacity.get`,
+`roots.list` and the verbs (never with `all`), never with `machine` or
+`machines: true`; every `root` / `dir` must be under this member's fleet
+root or exactly one of its own roots (`roots.list`'s plus `member.toml`'s
+`roots`), every named instance one of theirs; `config.migrate` /
+`config.ack` only under the fleet root; answers and pushed snapshots are
+cut to those roots' instances. Anything else is `denied`. Under `full`
+the hub has the API a local client has. An ssh machine's `api --stdio`
+connection is a local client's.
 
 ## Inbox threads
 
@@ -540,9 +559,9 @@ the runtime's `name`, `image`, `status`, `state`, `labels`, `host_ports`,
 plus `done` (its instance is marked done; `false` for a service) and
 `phase` while its instance is being created or failed (absent once
 ready). `state.toml` is read best-effort: unreadable, no row is done.
-On a fleet hub's connection (the Worker table) the rows are cut to what
-this worker lends: its lent instances' containers and their config roots'
-services ([fleet.md](../architecture/daemon/fleet.md#the-worker-table)).
+On a fleet hub's connection under `worker` (*Remote callers*) the rows are
+cut to what it reaches: those instances' containers and their config
+roots' services ([fleet.md](../architecture/daemon/fleet.md#the-trust-table)).
 
 Errors: `invalid` (`all` not a boolean), `internal` (the runtime failed).
 
@@ -1075,14 +1094,15 @@ picks one) while `worker` is an offered machine with `agent` on;
 `{"agent": null}` otherwise (no such machine, an ssh machine's name,
 `agent` off, no live agent here). Errors: `invalid` (a bad name, no
 `worker`), `internal` (`machines.toml` doesn't read). A fleet worker's
-connection (the Worker table) is `denied` it, as every `fleet.*`.
+connection under `worker` (*Remote callers*) is `denied` it, as every
+`fleet.*`.
 
 ### `lend.*`
 
 This host as a fleet worker: `lend.toml` and the link to its hub
 ([fleet.md](../architecture/daemon/fleet.md#lending-lend)). The daemon is
 `lend.toml`'s only writer, and a change applies at once. Both are denied
-on a fleet hub's connection.
+on a fleet hub's connection under `worker` (*Remote callers*).
 
 | method | params | result | errors |
 |---|---|---|---|
@@ -1116,7 +1136,7 @@ This host as a fleet member: `member.toml`
 ([fleet.md](../architecture/daemon/fleet.md#member-member)). The daemon is
 its only writer; `[allow]`, `[caps]` and `dev-builds` are edited by hand
 and have no param. Local only: both are denied on a fleet hub's
-connection.
+connection under either trust (*Remote callers*).
 
 | method | params | result | errors |
 |---|---|---|---|
@@ -1128,8 +1148,9 @@ connection.
   `member.set {name: ""}` clears it. A change restarts a lending link
   under the new name.
 - `trust`: `worker` (the default: a remote caller reaches this host's
-  roots and its fleet root, placed work under the worker policy) or
-  `full` (the whole API, no worker policy, the hub's dev builds taken)
+  own roots and its fleet root, placed work under the worker policy) or
+  `full` (the whole API but `member.*` and `link.*`, no worker policy,
+  the hub's dev builds taken)
   ([fleet.md](../architecture/daemon/fleet.md#trust)).
 - `dev_builds`: `member.toml`'s `dev-builds`, as the file says.
 - `roots`: config roots shown to the fleet besides those with instances
