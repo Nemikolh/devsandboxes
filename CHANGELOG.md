@@ -63,7 +63,7 @@ devsandbox run web --here
 
 - **Feature mounts under `${sharedVolumes}` work on a first run.** A feature's bind mount whose source is under `${sharedVolumes}` is now created when missing, like a config mount, instead of skipped with a warning. Other missing feature sources are still skipped.
 - **`caches` work for a non-root user.** Cache mounts now go to `/var/cache/devsandbox/<name>` instead of `/root/…`, which a non-root `remoteUser` couldn't reach. The tools find them through their env vars as before.
-- **Same-named sandboxes in two config roots no longer clobber each other's images.** Built images are tagged per config root (`devsandbox-img-<root>-<sandbox>`, `devsandbox-img-svc-<root>-<service>`), so the first `run` or `rebuild` after upgrading builds them again; images under the old tags are left for `docker image prune`.
+- **Same-named sandboxes in two config roots no longer clobber each other's images, nor does sandbox `foo-feat` clobber sandbox `foo`'s features image.** Built images are tagged per config root, one prefix per kind (`devsandbox-img-<root>-<sandbox>`, `devsandbox-feat-<root>-<sandbox>`, `devsandbox-img-svc-<root>-<service>`), so the first `run` or `rebuild` after upgrading builds them again; images under the old tags are left for `docker image prune`.
 - **`${localEnv:NAME:default}` uses its default.** An unset `NAME` now expands to `default` (everything after the `:`) instead of empty; a set one, even to empty, to its value. `${containerEnv:NAME:default}` works the same.
 
 <details><summary>Commits</summary>

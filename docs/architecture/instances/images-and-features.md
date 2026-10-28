@@ -35,8 +35,11 @@ tags and build contexts of their own.
 ## Feature image
 
 When the sandbox has enabled `features`, `image_for` builds a derived image
-`devsandbox-img-<project>-<sandbox>-feat` (`features_image`) on top of the
-base. Layout mirrors the
+`devsandbox-feat-<project>-<sandbox>` (`features_image`) on top of the
+base. Its own `feat-` head keeps it apart from every sandbox's
+`img-<project>-` build tag and every service's `img-svc-` one
+(`sandbox_image` has the argument), where a `-feat` suffix would give
+sandbox `foo-feat`'s build and sandbox `foo`'s feature image one tag. Layout mirrors the
 official devcontainers CLI.
 
 1. Each entry: options from the config value (`true`, a version string, or a

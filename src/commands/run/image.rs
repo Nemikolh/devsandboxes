@@ -127,13 +127,23 @@ pub(super) fn feature_container_opts(
 /// Tag of a `build.dockerfile` sandbox's image: `project` is the config
 /// root's [`services::project_id`], so same-named sandboxes of two roots
 /// never share (or clobber) a tag.
+///
+/// No two of devsandbox's image tags collide: after `devsandbox-` each
+/// kind has its own head (`img-<project>-` here, `feat-` for
+/// [`features_image`], `img-svc-` for [`services::service_image_tag`]; a
+/// project id is 8 lowercase hex chars, and `s` isn't hex), and within a
+/// kind the fixed-length, `-`-free project id ends at a known offset, so
+/// the rest is the sandbox (or service) name exactly. A suffix scheme
+/// (`…-<sandbox>-feat`) wasn't: sandbox `web-feat`'s image was sandbox
+/// `web`'s features image.
 pub(super) fn sandbox_image(project: &str, sandbox: &str) -> String {
     format!("{NAME_PREFIX}img-{project}-{sandbox}")
 }
 
-/// Tag of a sandbox's derived features image (scoped like [`sandbox_image`]).
+/// Tag of a sandbox's derived features image (scoped like [`sandbox_image`],
+/// whose doc has why no tag collides with it).
 pub(super) fn features_image(project: &str, sandbox: &str) -> String {
-    format!("{}-feat", sandbox_image(project, sandbox))
+    format!("{NAME_PREFIX}feat-{project}-{sandbox}")
 }
 
 /// Image to run: the `image` property as-is, or a local build for
@@ -574,7 +584,11 @@ mod tests {
     #[test]
     fn image_tags_are_scoped_by_project() {
         assert_eq!(sandbox_image("ab12cd34", "web"), "devsandbox-img-ab12cd34-web");
-        assert_eq!(features_image("ab12cd34", "web"), "devsandbox-img-ab12cd34-web-feat");
+        assert_eq!(features_image("ab12cd34", "web"), "devsandbox-feat-ab12cd34-web");
+        // Sandbox `web-feat`'s build used to be sandbox `web`'s features image.
+        assert_ne!(sandbox_image("ab12cd34", "web-feat"), features_image("ab12cd34", "web"));
+        // Nor does a sandbox image meet a service's (`svc` isn't hex).
+        assert_ne!(sandbox_image("ab12cd34", "db"), services::service_image_tag("ab12cd34", "db"));
         // Two roots, one sandbox name: nothing shared.
         assert_ne!(sandbox_image("ab12cd34", "web"), sandbox_image("00ff00ff", "web"));
         assert_ne!(features_image("ab12cd34", "web"), features_image("00ff00ff", "web"));
@@ -714,10 +728,10 @@ mod tests {
 
     #[test]
     fn entrypoint_dockerfile_chains_image_entrypoint() {
-        let df = entrypoint_dockerfile("devsandbox-img-s-feat", &["/usr/bin/tini".into(), "--".into()]);
+        let df = entrypoint_dockerfile("devsandbox-feat-s", &["/usr/bin/tini".into(), "--".into()]);
         assert_eq!(
             df,
-            "FROM devsandbox-img-s-feat\n\
+            "FROM devsandbox-feat-s\n\
 COPY devsandbox-entrypoint.sh /usr/local/share/devsandbox-entrypoint.sh\n\
 ENTRYPOINT [\"/bin/sh\",\"/usr/local/share/devsandbox-entrypoint.sh\",\"/usr/bin/tini\",\"--\"]\n"
         );

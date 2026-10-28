@@ -60,7 +60,7 @@ devsandbox rebuild fix-login           # drifted: recreated with node 20
 
 ## How it works
 
-- Features are baked into an image derived from `image` or `build`, `devsandbox-img-<root>-<sandbox>-feat` (`<root>` a short hash of the config dir); OCI references only ([`features`](/docs/config#implemented-devcontainer-properties)).
+- Features are baked into an image derived from `image` or `build`, `devsandbox-feat-<root>-<sandbox>` (`<root>` a short hash of the config dir); OCI references only ([`features`](/docs/config#implemented-devcontainer-properties)).
 - `features` tables merge key by key under `extends`: `web` gets gh and node ([templates](/docs/config#templates-and-extends)).
 - `= false` skips a Feature, e.g. one inherited from a template.
 - Adding, removing or changing a Feature makes existing instances drift; `devsandbox rebuild` applies it ([drift](/docs/config#drift)).
