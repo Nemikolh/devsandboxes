@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use anyhow::{Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::commands::status::Envelope;
 use crate::render::table;
@@ -14,29 +14,41 @@ const HEADERS: [&str; 3] = ["NAME", "IMAGE", "STATUS"];
 /// One `ps --json` row: the runtime's listing plus the state facts `ps`
 /// shows: whether the container's instance is done, and its phase while it
 /// is being materialized or failed (`snapshot::PhaseRow`, absent when ready).
-#[derive(Debug, Serialize)]
-struct PsRow {
+/// Also the API's `containers.list` rows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PsRow {
     #[serde(flatten)]
-    row: ContainerRow,
-    done: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    phase: Option<PhaseRow>,
+    pub row: ContainerRow,
+    pub done: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<PhaseRow>,
 }
 
 pub fn ps(all: bool, json: bool) -> Result<()> {
-    let mut rows = backend().list(all, NAME_PREFIX)?;
-    rows.sort_by(|a, b| a.name.cmp(&b.name));
     // Best-effort: `ps` is a runtime listing, so an unreadable state file
     // only loses the done marks.
-    let rows = join_state(rows, &State::load().unwrap_or_default(), Instance::phase_view);
+    let rows = rows(backend().list(all, NAME_PREFIX)?, &State::load().unwrap_or_default());
+    print!("{}", render(rows, json)?);
+    Ok(())
+}
+
+/// `ps`'s rows from the runtime's `listed` containers: sorted by name,
+/// joined with `state` ([`join_state`]). Shared with `containers.list`.
+pub(crate) fn rows(mut listed: Vec<ContainerRow>, state: &State) -> Vec<PsRow> {
+    listed.sort_by(|a, b| a.name.cmp(&b.name));
+    join_state(listed, state, Instance::phase_view)
+}
+
+/// What `ps` prints for `rows`: the `--json` envelope (one line ending), or
+/// the table. Shared with the run on an offered machine
+/// (`machines::cli::offered`).
+pub(crate) fn render(rows: Vec<PsRow>, json: bool) -> Result<String> {
     if json {
         let out = serde_json::to_string_pretty(&Envelope::new(rows)).context("serialize ps")?;
-        println!("{out}");
-        return Ok(());
+        return Ok(format!("{out}\n"));
     }
     let cells: Vec<[String; 3]> = rows.into_iter().map(cells).collect();
-    print!("{}", table(&HEADERS, &cells));
-    Ok(())
+    Ok(table(&HEADERS, &cells))
 }
 
 /// Join the rows with their instance by container name: done marks and the

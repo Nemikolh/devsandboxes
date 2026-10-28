@@ -274,9 +274,6 @@ limitation means editing this file in the same commit.
 - The npm client's `forwards.list(dir)` can't pass `machines` (the typed
   `call('forwards.list', {machines: true})` can).
   → [api](reference/api.md#forwards); `npm/devsandboxes/index.js`
-- `--machine <offered worker> ps` and `stats` are refused: no API call
-  answers them over a fleet link yet.
-  → [machines](architecture/daemon/machines.md#the-cli-clirs); `machines::cli::offered::refusal`
 - `--machine <offered worker> gc` is refused: host maintenance on the
   worker is outside a fleet worker's trust.
   → [machines](architecture/daemon/machines.md#the-cli-clirs); `machines::cli::offered::refusal`

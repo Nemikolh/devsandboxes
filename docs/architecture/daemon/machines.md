@@ -416,9 +416,10 @@ env's own `SSH_AUTH_SOCK` (the machine's agent, if any) stays.
   worker's trust, never a `devsandbox …` run there), printed by the local
   command's own render fns (`commands::logs::render_logs`,
   `inspect::render`, `ls::table` / `ls::render_json`, `status::render`,
-  `done::status_line`, `rename::renamed_line`), so the output reads the
-  same; `cli::offered::use_of` (pure) picks the call, `offered::named` /
-  `offered::per_root` make them over an injected call. `logs [-n N]` is
+  `done::status_line`, `rename::renamed_line`, `ps::render`,
+  `stats::render`), so the output reads the same; `cli::offered::use_of`
+  (pure) picks the call, `offered::named` / `offered::per_root` /
+  `offered::listing` make them over an injected call. `logs [-n N]` is
   `containers.logs` of the instance's container (its row's, from an
   `instances.list` at `depth: disk`: a rename keeps the container; a name
   that is no instance is taken as a container name); `logs --build` is
@@ -433,8 +434,12 @@ env's own `SSH_AUTH_SOCK` (the machine's agent, if any) stays.
   root itself), each an `instances.list` after its `==> m:<root>` line,
   `per_root`'s rules (`--json` with several roots is an error); `ls`
   renders the snapshot's sandbox rows (a config that doesn't load is the
-  error, as locally). Refused, naming the command (`offered::refusal`):
-  `ps`, `stats`, `service ls`, `logs --follow`, an `exec` without a tty
+  error, as locally). `--machine m ps [--all] [--json]` is one
+  `containers.list`, `stats [--json]` one `containers.stats`
+  (`offered::listing`): the worker answers its whole runtime's rows cut to
+  what it lends (its lent instances' containers and their config roots'
+  services, [fleet](fleet.md#the-worker-table)). Refused, naming the
+  command (`offered::refusal`): `service ls`, `logs --follow`, an `exec` without a tty
   and `vscode` (not over a fleet link yet), and `gc` (host maintenance on
   the worker, outside a worker's trust).
 

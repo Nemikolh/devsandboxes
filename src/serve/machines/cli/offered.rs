@@ -5,7 +5,7 @@
 //! fns so the output reads as theirs. What has no such call yet is refused
 //! ([`refusal`]).
 //!
-//! [`use_of`] is the pure choice; [`named`] and [`per_root`] make the calls
+//! [`use_of`] is the pure choice; [`named`], [`per_root`] and [`listing`] make the calls
 //! through an injected [`Call`] and write to injected streams, so the tests
 //! feed them fixture answers.
 
@@ -16,7 +16,7 @@ use anyhow::{Context, Result, bail};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
-use crate::serve::api::{ContainerLogs, InstancesList, MAX_LINES, Renamed};
+use crate::serve::api::{ContainerLogs, ContainersList, ContainersStats, InstancesList, MAX_LINES, Renamed};
 use crate::serve::proto::Response;
 use crate::snapshot::InstanceRow;
 use crate::{Command, ServiceCommand};
@@ -41,6 +41,10 @@ pub(crate) enum Use {
     Ls { json: bool },
     /// `--machine m status --json`: `instances.list` per config root.
     Status,
+    /// `--machine m ps`: `containers.list`.
+    Ps { all: bool, json: bool },
+    /// `--machine m stats`: `containers.stats`.
+    Stats { json: bool },
     /// As on any machine: what goes over the fleet link already (a tty
     /// `exec`, its sessions, `port`) and the verbs.
     Link,
@@ -50,8 +54,6 @@ pub(crate) enum Use {
 /// What an offered machine refuses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Refused {
-    Ps,
-    Stats,
     Gc,
     ServiceLs,
     LogsFollow,
@@ -75,8 +77,8 @@ pub(crate) fn use_of(command: &Command) -> Use {
         Command::Rename { new_name, .. } => Use::Rename(new_name.clone()),
         Command::Ls { json } => Use::Ls { json: *json },
         Command::Status { .. } => Use::Status,
-        Command::Ps { .. } => Use::Refused(Refused::Ps),
-        Command::Stats { .. } => Use::Refused(Refused::Stats),
+        Command::Ps { all, json } => Use::Ps { all: *all, json: *json },
+        Command::Stats { json } => Use::Stats { json: *json },
         Command::Gc { .. } => Use::Refused(Refused::Gc),
         Command::Service { cmd: ServiceCommand::Ls { .. } } => Use::Refused(Refused::ServiceLs),
         Command::Vscode { .. } => Use::Refused(Refused::Vscode),
@@ -92,8 +94,6 @@ pub(crate) fn refusal(m: &str, what: Refused) -> anyhow::Error {
                 "machine `{m}` is an offered fleet worker: `gc` there is host maintenance, outside a fleet worker's trust"
             );
         }
-        Refused::Ps => "`ps`",
-        Refused::Stats => "`stats`",
         Refused::ServiceLs => "`service ls`",
         Refused::LogsFollow => "`logs --follow`",
         Refused::ExecNoTty => "an `exec` without a tty",
@@ -177,7 +177,25 @@ pub(crate) fn named(call: &mut Call, u: &Use, m: &str, name: &str, root: &Path, 
             let r: Renamed = call_on(call, m, "instances.rename", json!({ "instance": name, "newName": new_name }))?;
             writeln!(out, "{}", crate::commands::rename::renamed_line(name, &r.instance))?;
         }
-        Use::Ls { .. } | Use::Status | Use::Link | Use::Refused(_) => bail!("not a named re-run"),
+        Use::Ls { .. } | Use::Status | Use::Ps { .. } | Use::Stats { .. } | Use::Link | Use::Refused(_) => bail!("not a named re-run"),
+    }
+    Ok(0)
+}
+
+/// `--machine m ps|stats` (`u`) on offered machine `m`: one
+/// `containers.list` / `containers.stats` (the worker cuts the rows to what
+/// it lends), printed by the local command's render. The exit code.
+pub(crate) fn listing(call: &mut Call, u: &Use, m: &str, out: &mut dyn Write) -> Result<i32> {
+    match u {
+        Use::Ps { all, json } => {
+            let list: ContainersList = call_on(call, m, "containers.list", json!({ "all": all }))?;
+            write!(out, "{}", crate::commands::ps::render(list.rows, *json)?)?;
+        }
+        Use::Stats { json } => {
+            let stats: ContainersStats = call_on(call, m, "containers.stats", json!({}))?;
+            write!(out, "{}", crate::commands::stats::render(stats.rows, *json)?)?;
+        }
+        _ => bail!("not a listing re-run"),
     }
     Ok(0)
 }
@@ -261,8 +279,10 @@ mod tests {
         assert_eq!(u(&["ls"]), Use::Ls { json: false });
         assert_eq!(u(&["ls", "--json"]), Use::Ls { json: true });
         assert_eq!(u(&["status", "--json"]), Use::Status);
-        assert_eq!(u(&["ps", "-a"]), Use::Refused(Refused::Ps));
-        assert_eq!(u(&["stats"]), Use::Refused(Refused::Stats));
+        assert_eq!(u(&["ps", "-a"]), Use::Ps { all: true, json: false });
+        assert_eq!(u(&["ps", "--json"]), Use::Ps { all: false, json: true });
+        assert_eq!(u(&["stats"]), Use::Stats { json: false });
+        assert_eq!(u(&["stats", "--json"]), Use::Stats { json: true });
         assert_eq!(u(&["gc", "--force"]), Use::Refused(Refused::Gc));
         assert_eq!(u(&["service", "ls"]), Use::Refused(Refused::ServiceLs));
         assert_eq!(u(&["vscode", "lap/web"]), Use::Refused(Refused::Vscode));
@@ -275,8 +295,6 @@ mod tests {
     fn refusals_name_the_command_and_why() {
         let r = |what| refusal("lap", what).to_string();
         for (what, label) in [
-            (Refused::Ps, "`ps`"),
-            (Refused::Stats, "`stats`"),
             (Refused::ServiceLs, "`service ls`"),
             (Refused::LogsFollow, "`logs --follow`"),
             (Refused::ExecNoTty, "an `exec` without a tty"),
@@ -444,6 +462,47 @@ mod tests {
         let (_, out, _) = run_per_root(Use::Status, answer);
         let snapshot = list_of(listing(vec![row("w", "c", "/f/cfg", false)], sandboxes(), None)).snapshot;
         assert_eq!(out, format!("{}\n", crate::commands::status::render(&snapshot).unwrap()));
+    }
+
+    /// `ps` and `stats` print what the local commands print for the same rows.
+    #[test]
+    fn ps_and_stats_print_as_the_local_commands() {
+        use crate::commands::ps::PsRow;
+        use crate::runtime::{ContainerRow, StatsRow};
+        let ps_rows = vec![
+            PsRow { row: ContainerRow { name: "devsandbox-a".into(), image: "img".into(), status: "Up 1 hour".into(), ..Default::default() }, done: true, phase: None },
+            PsRow {
+                row: ContainerRow { name: "devsandbox-b".into(), image: "img".into(), status: "Up".into(), ..Default::default() },
+                done: false,
+                phase: Some(crate::snapshot::PhaseRow::Failed { step: "postStartCommand".into(), error: "exit 1".into() }),
+            },
+        ];
+        let stats_rows = vec![StatsRow { name: "devsandbox-a".into(), cpu: "1.5%".into(), mem: "20MiB / 1GiB".into() }];
+        let run = |u: Use| {
+            let mut f = fake(|m: &str, _: &Value| {
+                Ok(match m {
+                    "containers.list" => json!({ "rows": ps_rows }),
+                    _ => json!({ "rows": stats_rows }),
+                })
+            });
+            let mut out = Vec::new();
+            let r = super::listing(&mut |m, p| f.call(m, p), &u, "lap", &mut out);
+            (r.unwrap(), String::from_utf8(out).unwrap(), f.calls)
+        };
+        for json in [false, true] {
+            let (code, out, calls) = run(Use::Ps { all: true, json });
+            assert_eq!((code, out), (0, crate::commands::ps::render(ps_rows.clone(), json).unwrap()));
+            assert_eq!(calls, [("containers.list".into(), json!({"all": true, "machine": "lap"}))]);
+            let (_, out, calls) = run(Use::Stats { json });
+            assert_eq!(out, crate::commands::stats::render(stats_rows.clone(), json).unwrap());
+            assert_eq!(calls, [("containers.stats".into(), json!({"machine": "lap"}))]);
+        }
+        let (_, out, _) = run(Use::Ps { all: false, json: false });
+        assert!(out.contains("Up 1 hour (done)") && out.contains("failed (postStartCommand)"), "{out}");
+
+        let mut f = fake(|_: &str, _: &Value| Err(("denied", "`containers.list` isn't lent to a fleet hub".into())));
+        let r = super::listing(&mut |m, p| f.call(m, p), &Use::Ps { all: false, json: false }, "lap", &mut Vec::new());
+        assert_eq!(r.unwrap_err().to_string(), "`containers.list` isn't lent to a fleet hub");
     }
 
     #[test]

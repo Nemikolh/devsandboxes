@@ -155,6 +155,9 @@ pub fn lent_instances(state: &State, root: &Path) -> Lent {
             lent.names.insert(name.clone());
             lent.ids.insert(i.instance_id.clone());
             lent.containers.insert(i.container.clone());
+            if let Some(dir) = &i.config_dir {
+                lent.roots.insert(dir.clone());
+            }
         }
     }
     lent
@@ -166,6 +169,17 @@ pub struct Lent {
     pub names: BTreeSet<String>,
     pub ids: BTreeSet<String>,
     pub containers: BTreeSet<String>,
+    /// Their config roots, as recorded.
+    pub roots: BTreeSet<PathBuf>,
+}
+
+impl Lent {
+    /// The `project_id`s of [`Lent::roots`] (`commands::services`): what
+    /// their service containers are labelled and named by. A root that no
+    /// longer resolves has none.
+    fn projects(&self) -> BTreeSet<String> {
+        self.roots.iter().filter_map(|d| crate::commands::services::project_id(d).ok()).collect()
+    }
 }
 
 /// Gate, then confine, a hub's request (see the module doc): the params
@@ -253,10 +267,18 @@ pub fn admit(method: &str, mut params: Value, scope: &Scope, state: &Path) -> Re
 /// A local answer to a hub's request, cut to the fleet root: an
 /// `instances.list` like a snapshot ([`filter_snapshot`]); an
 /// `instances.resolve`'s matches to lent instances (none left is
-/// `not-found`). Others pass as they are: their params were confined.
-pub fn filter_answer(method: &str, mut answer: Value, root: &Path) -> Result<Value, ApiError> {
+/// `not-found`); `containers.list` / `containers.stats` rows to the lent
+/// instances' containers and their config roots' services
+/// ([`cut_containers`]; `state` is this host's `state.toml`, read for
+/// those two only). Others pass as they are: their params were confined.
+pub fn filter_answer(method: &str, mut answer: Value, root: &Path, state: &Path) -> Result<Value, ApiError> {
     match method {
         "instances.list" => filter_snapshot(&mut answer, root),
+        "containers.list" | "containers.stats" => {
+            let state = State::load_at(state).map_err(ApiError::internal)?;
+            let lent = lent_instances(&state, root);
+            cut_containers(method, &mut answer, &lent.containers, &lent.projects());
+        }
         "instances.resolve" => {
             let found: Vec<Value> = answer
                 .get("found")
@@ -273,6 +295,28 @@ pub fn filter_answer(method: &str, mut answer: Value, root: &Path) -> Result<Val
         _ => {}
     }
     Ok(answer)
+}
+
+/// A `containers.list` / `containers.stats` answer's `rows` cut, in place,
+/// to `containers` (the lent instances') and the service containers of
+/// `projects` (the lent instances' config roots' `project_id`s): a
+/// listing row by its `devsandbox.project` label (none: dropped), a stats
+/// row, which has no labels, by its name (`services::service_container`'s
+/// `devsandbox-svc-<project>-` prefix, isolated ones' too).
+pub fn cut_containers(method: &str, answer: &mut Value, containers: &BTreeSet<String>, projects: &BTreeSet<String>) {
+    let Some(rows) = answer.get_mut("rows").and_then(Value::as_array_mut) else { return };
+    let prefixes: Vec<String> = projects.iter().map(|p| crate::commands::services::service_container(p, "")).collect();
+    rows.retain(|r| {
+        let Some(name) = r.get("name").and_then(Value::as_str) else { return false };
+        if containers.contains(name) {
+            return true;
+        }
+        if method == "containers.stats" {
+            return prefixes.iter().any(|p| name.starts_with(p.as_str()));
+        }
+        let project = r.get("labels").and_then(|l| l.get("devsandbox.project")).and_then(Value::as_str);
+        project.is_some_and(|p| projects.contains(p))
+    });
 }
 
 /// Whether a row (`InstanceRow`, a resolve's `found`) has its `root` under
@@ -340,6 +384,9 @@ mod tests {
             ("instances.resolve", json!({"name": "a"}), Ok(Quick)),
             ("instances.resolve", json!({"name": "a", "machines": true}), Err("denied")),
             ("containers.logs", json!({"container": "c"}), Ok(Quick)),
+            ("containers.list", json!({"all": true}), Ok(Quick)),
+            ("containers.stats", p.clone(), Ok(Quick)),
+            ("containers.list", json!({"machine": "m"}), Err("denied")),
             ("sandboxes.list", json!({"root": "/x"}), Ok(Quick)),
             ("config.migrate", json!({"root": "/x"}), Ok(Quick)),
             ("capacity.get", p.clone(), Ok(Capacity)),
@@ -518,10 +565,57 @@ mod tests {
 
         let resolved = json!({"matches": ["in", "own"], "found": [
             {"name": "in", "root": "/nonexistent/fleet/hub/cfg"}, {"name": "own", "root": "/nonexistent/mine"}]});
-        let got = filter_answer("instances.resolve", resolved, root).unwrap();
+        let got = filter_answer("instances.resolve", resolved, root, Path::new("/nonexistent/state.toml")).unwrap();
         assert_eq!(got, json!({"matches": ["in"], "found": [{"name": "in", "root": "/nonexistent/fleet/hub/cfg"}]}));
         let own = json!({"matches": ["own"], "found": [{"name": "own", "root": "/nonexistent/mine"}]});
-        assert_eq!(filter_answer("instances.resolve", own, root).unwrap_err().code, "not-found");
-        assert_eq!(filter_answer("sandboxes.list", json!({"a": 1}), root).unwrap(), json!({"a": 1}));
+        assert_eq!(filter_answer("instances.resolve", own, root, Path::new("/nonexistent/state.toml")).unwrap_err().code, "not-found");
+        assert_eq!(filter_answer("sandboxes.list", json!({"a": 1}), root, Path::new("/nonexistent/state.toml")).unwrap(), json!({"a": 1}));
+    }
+
+    #[test]
+    fn container_rows_are_cut_to_lent_instances_and_their_services() {
+        let containers = BTreeSet::from(["devsandbox-in".to_string()]);
+        let projects = BTreeSet::from(["aaaa1111".to_string()]);
+        let svc = |name: &str, project: &str| json!({"name": name, "labels": {"devsandbox.project": project}});
+        let mut list = json!({"rows": [
+            {"name": "devsandbox-in", "labels": {}},
+            {"name": "devsandbox-own", "labels": {}},
+            svc("devsandbox-svc-aaaa1111-db", "aaaa1111"),
+            svc("devsandbox-svc-bbbb2222-db", "bbbb2222"),
+            // Named like a lent service, labelled otherwise: the label decides.
+            svc("devsandbox-svc-aaaa1111-x", "bbbb2222"),
+            {"name": "devsandbox-svc-aaaa1111-nolabels"},
+            {"labels": {"devsandbox.project": "aaaa1111"}},
+        ]});
+        cut_containers("containers.list", &mut list, &containers, &projects);
+        let names: Vec<&str> = list["rows"].as_array().unwrap().iter().map(|r| r["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["devsandbox-in", "devsandbox-svc-aaaa1111-db"]);
+
+        let row = |name: &str| json!({"name": name, "cpu": "1%", "mem": "2MiB"});
+        let mut stats = json!({"rows": [row("devsandbox-in"), row("devsandbox-own"), row("devsandbox-svc-aaaa1111-in-db"),
+            row("devsandbox-svc-bbbb2222-db"), row("devsandbox-svc-aaaa11112-db")]});
+        cut_containers("containers.stats", &mut stats, &containers, &projects);
+        assert_eq!(stats["rows"], json!([row("devsandbox-in"), row("devsandbox-svc-aaaa1111-in-db")]));
+    }
+
+    /// The projects come from the lent instances' config roots in `state.toml`.
+    #[test]
+    fn container_answers_are_cut_by_the_state() {
+        let base = scratch("containers");
+        let root = base.join("fleet/hub");
+        std::fs::create_dir_all(root.join("cfg")).unwrap();
+        std::fs::create_dir_all(base.join("mine")).unwrap();
+        let state = state_with(&base, &root);
+        let lent = crate::commands::services::project_id(&root.join("cfg")).unwrap();
+        let mine = crate::commands::services::project_id(&base.join("mine")).unwrap();
+        let svc = |p: &str| json!({"name": format!("devsandbox-svc-{p}-db"), "labels": {"devsandbox.project": p}});
+        let answer = json!({"rows": [{"name": "devsandbox-in", "labels": {}}, {"name": "devsandbox-own", "labels": {}}, svc(&lent), svc(&mine)]});
+        let got = filter_answer("containers.list", answer, &root, &state).unwrap();
+        assert_eq!(got, json!({"rows": [{"name": "devsandbox-in", "labels": {}}, svc(&lent)]}));
+        let stats = json!({"rows": [{"name": "devsandbox-own"}, {"name": format!("devsandbox-svc-{lent}-db")}]});
+        let got = filter_answer("containers.stats", stats, &root, &state).unwrap();
+        assert_eq!(got, json!({"rows": [{"name": format!("devsandbox-svc-{lent}-db")}]}));
+        assert_eq!(filter_answer("containers.list", json!({"rows": []}), &root, &base.join("bad")).unwrap(), json!({"rows": []}), "no state: none lent");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

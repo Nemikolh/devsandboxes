@@ -419,11 +419,11 @@ link's `API` streams.
   (`instances.buildLog`), `inspect` (`containers.inspect`), `done` /
   `undone` (`instances.done`), `rename` (`instances.rename`), `--machine
   m ls` / `status --json` (`instances.list` per config root under the
-  fleet root), printed as the local commands print them
+  fleet root), `--machine m ps` (`containers.list`) and `stats`
+  (`containers.stats`), printed as the local commands print them
   ([machines](machines.md#the-cli-clirs), `machines::cli::offered`). The
   dashboard's logs and inspect views go through the same quick calls.
-- **What has no link form yet** is refused, each in its own words: `ps`,
-  `stats`, `service ls`, `logs --follow`, an `exec` without a tty and
+- **What has no link form yet** is refused, each in its own words: `service ls`, `logs --follow`, an `exec` without a tty and
   `vscode` (`cli::offered::refusal`), `gc` (host maintenance, outside a
   worker's trust), and the dashboard's service tabs
   (`tui::remote::service_argv`: service terminals aren't supported over
@@ -934,7 +934,13 @@ while the lending thread drains is `denied`, `lent::DRAINING`) and
   cut by `lent::filter_snapshot`: instance rows whose `root` is under the
   fleet root, their names alone in services' `used_by` and in
   `thread_children`. `instances.resolve`'s matches are cut the same way
-  (`lent::filter_answer`); none left is `not-found`.
+  (`lent::filter_answer`); none left is `not-found`. `containers.list` /
+  `containers.stats` list the whole host's runtime, so their `rows` are
+  cut (`lent::cut_containers`) to the lent instances' containers and the
+  service containers of their config roots: a listing row by its
+  `devsandbox.project` label being one of those roots'
+  `services::project_id` (no label: dropped), a stats row, which has no
+  labels, by its `devsandbox-svc-<project>-` name.
 - **Hello** on a `Worker` connection never hands the daemon off, whatever
   version it says and even with `force`: only a local client's newer
   binary (or this user's forced hello, [Versions](#versions)) replaces it.

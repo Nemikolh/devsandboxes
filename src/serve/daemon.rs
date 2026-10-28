@@ -1306,7 +1306,7 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
         method => local_call(method, req.params, shared, conn),
     };
     let answer = match &conn.table {
-        Table::Worker(scope) => answer.and_then(|v| lent::filter_answer(&req.method, v, &scope.root)),
+        Table::Worker(scope) => answer.and_then(|v| lent::filter_answer(&req.method, v, &scope.root, &shared.state)),
         Table::Full => answer,
     };
     Some(match answer {

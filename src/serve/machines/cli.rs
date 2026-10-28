@@ -732,7 +732,11 @@ pub(crate) fn route(machine: Option<&str>, in_process: bool, machines: &[String]
                     return Err(offered::refusal(&m, what));
                 }
                 let (mut out, mut err) = (std::io::stdout().lock(), std::io::stderr());
-                let code = offered::per_root(&mut |method, params| conn.call(method, params), &u, &m, &entry.roots, &mut out, &mut err)?;
+                let call = &mut |method: &str, params| conn.call(method, params);
+                let code = match u {
+                    offered::Use::Ps { .. } | offered::Use::Stats { .. } => offered::listing(call, &u, &m, &mut out)?,
+                    _ => offered::per_root(call, &u, &m, &entry.roots, &mut out, &mut err)?,
+                };
                 return Ok(Routed::Exit(code));
             }
             let held = match usage {
@@ -1115,8 +1119,8 @@ mod tests {
         let nameless = |args: &[&str]| (machine_use(Some(&command(args))), offered::use_of(&command(args)));
         assert_eq!(nameless(&["ls"]), (MachineUse::PerRoot { args: ms(&["ls"]), json: false }, Use::Ls { json: false }));
         assert_eq!(nameless(&["status", "--json"]), (MachineUse::PerRoot { args: ms(&["status", "--json"]), json: true }, Use::Status));
-        assert_eq!(nameless(&["ps"]), (MachineUse::Once(ms(&["ps"])), Use::Refused(Refused::Ps)));
-        assert_eq!(nameless(&["stats"]), (MachineUse::Once(ms(&["stats"])), Use::Refused(Refused::Stats)));
+        assert_eq!(nameless(&["ps"]), (MachineUse::Once(ms(&["ps"])), Use::Ps { all: false, json: false }));
+        assert_eq!(nameless(&["stats"]), (MachineUse::Once(ms(&["stats"])), Use::Stats { json: false }));
         assert_eq!(nameless(&["gc"]), (MachineUse::PerRoot { args: ms(&["gc"]), json: false }, Use::Refused(Refused::Gc)));
         assert_eq!(nameless(&["service", "ls"]).1, Use::Refused(Refused::ServiceLs));
         // `port` goes over the link (`TUNNEL`) on both.

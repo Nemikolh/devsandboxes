@@ -27,7 +27,7 @@ checks the typings against the wire structs).
 | instances | `instances.list\|resolve\|cancel\|procs\|buildLog\|signal\|rename\|done` | yes |
 | | `instances.watch\|unwatch` | no (`machines: true` federates) |
 | sessions | `sessions.list\|rm` | yes |
-| containers, config | `containers.logs\|inspect`, `sandboxes.list\|get`, `services.get`, `config.findings\|migrate\|ack` | yes |
+| containers, config | `containers.logs\|inspect\|list\|stats`, `sandboxes.list\|get`, `services.get`, `config.findings\|migrate\|ack` | yes |
 | | `roots.list` | no |
 | bridges, forwards | `bridges.ensure`, `helper.call`, `forwards.list\|add\|rm` | no |
 | verbs | `run`, `rebuild`, `start`, `stop`, `rm`, `services.rebuild` | yes (own ssh) |
@@ -518,6 +518,31 @@ JSON, parsed (docker and podman: an array of one object; Apple's
 
 Errors: `invalid` (as `containers.logs`), `internal` (the runtime failed,
 or its output isn't JSON).
+
+### `containers.list`
+
+Params: `{"all": false}`, `all` optional (`false`: running ones only).
+Result: `{"rows": […]}`, every `devsandbox-` container, instances and
+services, sorted by name: `ps --json`'s rows (`commands::ps::rows`), each
+the runtime's `name`, `image`, `status`, `state`, `labels`, `host_ports`,
+plus `done` (its instance is marked done; `false` for a service) and
+`phase` while its instance is being created or failed (absent once
+ready). `state.toml` is read best-effort: unreadable, no row is done.
+On a fleet hub's connection (the Worker table) the rows are cut to what
+this worker lends: its lent instances' containers and their config roots'
+services ([fleet.md](../architecture/daemon/fleet.md#the-worker-table)).
+
+Errors: `invalid` (`all` not a boolean), `internal` (the runtime failed).
+
+### `containers.stats`
+
+Params: `{}`. Result: `{"rows": [{"name": "devsandbox-web", "cpu":
+"1.50%", "mem": "20MiB / 1GiB"}, …]}`, the running `devsandbox-`
+containers' usage as the runtime renders it, sorted by name: `stats
+--json`'s rows (`commands::stats::rows`). Cut on a fleet hub's
+connection as `containers.list`'s.
+
+Errors: `internal` (the runtime failed).
 
 ## Sandboxes
 
@@ -1094,7 +1119,7 @@ machine, each with 15 s to answer:
 `instances.procs`, `instances.signal`, `instances.rename`,
 `instances.done`, `instances.buildLog`, `sessions.list`, `sessions.rm`,
 `containers.logs`,
-`containers.inspect`, `sandboxes.list`, `sandboxes.get`, `services.get`,
+`containers.inspect`, `containers.list`, `containers.stats`, `sandboxes.list`, `sandboxes.get`, `services.get`,
 and every verb (*Verbs on a machine*).
 
 `forwards.add` with `machine` isn't forwarded: the daemon serves it, binding

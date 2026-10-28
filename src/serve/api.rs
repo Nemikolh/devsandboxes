@@ -140,6 +140,10 @@ pub fn call(method: &str, params: Value, ctx: &Ctx) -> Answer {
         "containers.inspect" => {
             containers_inspect(parse(params)?, |c| crate::runtime::backend().inspect_json(c).map_err(ApiError::internal))
         }
+        "containers.list" => containers_list(parse(params)?, &host_state(ctx)?, |all| {
+            crate::runtime::backend().list(all, crate::runtime::NAME_PREFIX).map_err(ApiError::internal)
+        }),
+        "containers.stats" => containers_stats(|| crate::runtime::backend().stats().map_err(ApiError::internal)),
         "sandboxes.list" => sandboxes_list(parse(params)?),
         "roots.list" => {
             let p: RootsParams = parse(params)?;
@@ -1124,6 +1128,42 @@ fn containers_inspect(p: ContainerParams, inspect: impl FnOnce(&str) -> Result<S
     let raw = inspect(&p.container)?;
     serde_json::from_str(&raw)
         .map_err(|e| ApiError::internal(anyhow::anyhow!("`{}`'s inspect output isn't JSON: {e}", p.container)))
+}
+
+#[derive(Deserialize)]
+struct ContainersListParams {
+    #[serde(default)]
+    all: bool,
+}
+
+/// `containers.list`'s answer: `ps --json`'s rows.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ContainersList {
+    pub rows: Vec<crate::commands::ps::PsRow>,
+}
+
+/// `containers.stats`' answer: `stats --json`'s rows.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ContainersStats {
+    pub rows: Vec<crate::runtime::StatsRow>,
+}
+
+/// Every devsandbox container (running only unless `all`), as `ps` lists
+/// them (`commands::ps::rows`): `list` is the runtime (injected for the
+/// tests), `state` read best-effort as `ps` reads it.
+fn containers_list(
+    p: ContainersListParams,
+    state: &Path,
+    list: impl FnOnce(bool) -> Result<Vec<crate::runtime::ContainerRow>, ApiError>,
+) -> Answer {
+    let state = crate::state::State::load_at(state).unwrap_or_default();
+    to_value(ContainersList { rows: crate::commands::ps::rows(list(p.all)?, &state) })
+}
+
+/// The running devsandbox containers' usage, as `stats` shows it
+/// (`commands::stats::rows`); `stats` is the runtime (injected for the tests).
+fn containers_stats(stats: impl FnOnce() -> Result<Vec<crate::runtime::StatsRow>, ApiError>) -> Answer {
+    to_value(ContainersStats { rows: crate::commands::stats::rows(stats()?) })
 }
 
 #[derive(Deserialize)]
@@ -2198,6 +2238,40 @@ mod tests {
         assert_eq!(code(inspect("web", "[]")), "invalid");
     }
 
+    /// `containers.list` / `containers.stats` answer what `ps --json` /
+    /// `stats --json` print as their envelope's `data`.
+    #[test]
+    fn containers_list_and_stats_answer_the_local_commands_rows() {
+        let state = state_file("containers-list", &format!("{}done = 1\n", instance("web", "web", "")));
+        let row = |name: &str| crate::runtime::ContainerRow { name: name.into(), image: "img".into(), status: "Up".into(), ..Default::default() };
+        let listed = vec![row("devsandbox-web"), row("devsandbox-svc-abc-db")];
+        let asked = std::cell::Cell::new(None);
+        let list = |params: Value| {
+            containers_list(parse(params)?, &state, |all| {
+                asked.set(Some(all));
+                Ok(listed.clone())
+            })
+        };
+        let got = list(json!({})).unwrap();
+        assert_eq!(asked.get(), Some(false));
+        let local = crate::commands::ps::rows(listed.clone(), &crate::state::State::load_at(&state).unwrap());
+        assert_eq!(got, json!({"rows": local}));
+        assert_eq!(got["rows"][0]["name"], "devsandbox-svc-abc-db", "sorted");
+        assert_eq!(got["rows"][1]["done"], true);
+        list(json!({"all": true})).unwrap();
+        assert_eq!(asked.get(), Some(true));
+        assert_eq!(code(list(json!({"all": "yes"}))), "invalid");
+        // An unreadable state only loses the marks, as for `ps`.
+        let gone = state.with_file_name("missing.toml");
+        let got = containers_list(parse(json!({})).unwrap(), &gone, |_| Ok(listed.clone())).unwrap();
+        assert_eq!(got["rows"][1]["done"], false);
+        assert_eq!(code(containers_list(parse(json!({})).unwrap(), &state, |_| Err(ApiError::internal(anyhow::anyhow!("down"))))), "internal");
+
+        let s = |name: &str| crate::runtime::StatsRow { name: name.into(), cpu: "1%".into(), mem: "2MiB".into() };
+        let got = containers_stats(|| Ok(vec![s("devsandbox-b"), s("postgres"), s("devsandbox-a")])).unwrap();
+        assert_eq!(got, json!({"rows": [s("devsandbox-a"), s("devsandbox-b")]}));
+    }
+
     #[test]
     fn sandboxes_get_and_services_get_answer_the_config_text() {
         let root = store_path("config-get").with_file_name("cfg");
@@ -2403,6 +2477,16 @@ mod tests {
         assert_eq!(union_members("InstanceProcs"), ["ProcsListing", "ProcsError"]);
         assert_matches("BuildLogTail", &v(&crate::build_log::Tail { text: "t".into(), cut: false }));
         assert_matches("ContainerLogs", &v(&ContainerLogs { text: "t".into() }));
+        let ps_row = crate::commands::ps::PsRow {
+            row: crate::runtime::ContainerRow { name: "devsandbox-w".into(), ..Default::default() },
+            done: false,
+            phase: Some(crate::snapshot::PhaseRow::InFlight { step: "building".into() }),
+        };
+        assert_matches("ContainerRow", &v(&ps_row));
+        assert_matches("ContainersList", &v(&ContainersList { rows: vec![ps_row] }));
+        let stats_row = crate::runtime::StatsRow { name: "devsandbox-w".into(), cpu: "1%".into(), mem: "2MiB".into() };
+        assert_matches("StatsRow", &v(&stats_row));
+        assert_matches("ContainersStats", &v(&ContainersStats { rows: vec![stats_row] }));
         assert_matches("SandboxConfig", &v(&cfg.sandbox_text("web")));
         assert_matches("ServiceConfig", &v(&ServiceConfig { original: "t".into() }));
         assert_matches("InstanceRenamed", &v(&Renamed { instance: "w".into() }));
@@ -2444,6 +2528,8 @@ mod tests {
             ("instances.done", "InstanceDone"),
             ("containers.logs", "ContainerLogs"),
             ("containers.inspect", "unknown"),
+            ("containers.list", "ContainersList"),
+            ("containers.stats", "ContainersStats"),
             ("sandboxes.list", "SandboxEntry[]"),
             ("roots.list", "RootCandidate[]"),
             ("sandboxes.get", "SandboxConfig"),

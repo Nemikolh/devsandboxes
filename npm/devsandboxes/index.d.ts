@@ -944,6 +944,16 @@ export interface ContainerLogs {
   text: string;
 }
 
+/** `containers.list`'s answer: `ps --json`'s rows, sorted by name. */
+export interface ContainersList {
+  rows: ContainerRow[];
+}
+
+/** `containers.stats`' answer: `stats --json`'s rows, sorted by name. */
+export interface ContainersStats {
+  rows: StatsRow[];
+}
+
 /** `sandboxes.get`'s answer: the sandbox's config as TOML text. */
 export interface SandboxConfig {
   /** The table as written, `extends` included. */
@@ -1265,6 +1275,10 @@ export interface ApiMethods {
   'containers.logs': { params: { container: string; lines?: number; machine?: string }; result: ContainerLogs };
   /** `devsandbox-…` containers only: the runtime's inspect JSON (docker's: an array of one object). */
   'containers.inspect': { params: { container: string; machine?: string }; result: unknown };
+  /** Every `devsandbox-…` container, instances and services (running only unless `all`), as `ps` lists them. */
+  'containers.list': { params: { all?: boolean; machine?: string }; result: ContainersList };
+  /** The running `devsandbox-…` containers' CPU/memory, as `stats` shows them. */
+  'containers.stats': { params: { machine?: string }; result: ContainersStats };
   /**
    * The config root's sandboxes, sorted; `[]` without a config file. `machines`: then every
    * machine's registered roots' (5 s; one that doesn't answer adds nothing, see `machines.list`).

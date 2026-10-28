@@ -61,7 +61,7 @@ fn split_env(entries: Vec<String>) -> Vec<(String, String)> {
 pub const RUNTIME_ENV: &str = "DEVSANDBOX_RUNTIME";
 
 /// One container as reported by the runtime's listing.
-#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct ContainerRow {
     pub name: String,
     pub image: String,
@@ -86,7 +86,7 @@ impl ContainerRow {
 }
 
 /// Resource usage of one running container, pre-rendered for display.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StatsRow {
     pub name: String,
     pub cpu: String,
