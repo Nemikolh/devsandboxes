@@ -277,10 +277,10 @@ limitation means editing this file in the same commit.
 - `--machine <offered worker> gc` is refused: host maintenance on the
   worker is outside a fleet worker's trust.
   → [machines](architecture/daemon/machines.md#the-cli-clirs); `machines::cli::offered::refusal`
-- `--machine <offered worker> service ls` is refused (not over a fleet
-  link yet). → [machines](architecture/daemon/machines.md#the-cli-clirs); `machines::cli::offered::refusal`
-- `logs --build --follow` on an offered worker's instance is refused
-  (`logs --build` without it works). → [machines](architecture/daemon/machines.md#the-cli-clirs); `machines::cli::offered::refusal`
+- `logs --build --follow` on an offered worker's instance reads the
+  worker's `build.log` by path, page by page: a new build rotating it
+  mid-follow isn't followed into `build.1.log` as a local follow (which
+  keeps the file open) would. → [api](reference/api.md#instancesbuildlog); `build_log::page_in`
 - An `exec` without a tty (piped, or `exec m/x -- cmd` without `-t`) on
   an offered worker's instance is refused: only session execs (`PTY`) go
   over the link. → [fleet](architecture/daemon/fleet.md#pty); `machines::cli::offered::Refused::ExecNoTty`

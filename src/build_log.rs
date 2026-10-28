@@ -252,6 +252,75 @@ fn replay_tail(bytes: &[u8], size: TtySize, header: usize, partial: bool, n: usi
     Tail { text: Vec::from(kept).join("\n"), cut }
 }
 
+/// Most log bytes one [`Page`] carries. A JSON string can take up to six
+/// bytes per log byte (`\u001b`), and a reply is one `serve::proto` line of
+/// at most `MAX_LINE` (1 MiB).
+pub const PAGE_BYTES: usize = 128 * 1024;
+
+/// A build log's bytes from an offset (`instances.buildLog` with `offset`):
+/// what `logs --build --follow` on an offered machine prints as it goes.
+#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Page {
+    /// The bytes as UTF-8, invalid sequences as U+FFFD ([`page_text`]).
+    pub text: String,
+    /// The offset after them: the next page's.
+    pub next: u64,
+    /// A pty log (`# tty` header, [`tty_header`]).
+    pub tty: bool,
+    /// Nothing comes after: `next` is the log's end and the instance
+    /// wasn't in flight before the read (`commands::logs::in_flight`).
+    pub complete: bool,
+}
+
+/// [`Page`] of `instance_id`'s build log under data dir `data` from byte
+/// `offset` (at most [`PAGE_BYTES`]); `None` when it has none. `in_flight`
+/// is the instance's, taken before the read: a log read while it isn't is
+/// whole, so a page that reaches its end is [`Page::complete`].
+#[cfg_attr(not(unix), allow(dead_code))] // only the daemon (unix) uses it
+pub fn page_in(data: &Path, instance_id: &str, offset: u64, in_flight: bool) -> Result<Option<Page>> {
+    let path = dir_in(data, instance_id).join(FILE);
+    let mut file = match File::open(&path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("cannot open {}", path.display())),
+    };
+    let read = |file: &mut File| -> std::io::Result<(bool, Vec<u8>)> {
+        let tty = tty_header(&read_head(file)?).is_some();
+        file.seek(SeekFrom::Start(offset))?;
+        let mut bytes = Vec::new();
+        Read::by_ref(file).take(PAGE_BYTES as u64).read_to_end(&mut bytes)?;
+        Ok((tty, bytes))
+    };
+    let (tty, bytes) = read(&mut file).with_context(|| format!("cannot read {}", path.display()))?;
+    let complete = !in_flight && bytes.len() < PAGE_BYTES;
+    let (text, used) = page_text(&bytes, complete);
+    Ok(Some(Page { text, next: offset + used as u64, tty, complete }))
+}
+
+/// `bytes` as text and how many of them it took: all, unless `whole` is
+/// false and they end inside a UTF-8 sequence, which is left for the next
+/// page (so a character cut by the page or by a write still in progress
+/// isn't garbled). Invalid sequences read as U+FFFD.
+pub fn page_text(bytes: &[u8], whole: bool) -> (String, usize) {
+    let mut used = bytes.len();
+    if !whole {
+        // The last character's lead byte, at most three continuation bytes back.
+        let tail = bytes.len().saturating_sub(4);
+        if let Some(lead) = (tail..bytes.len()).rev().find(|&i| bytes[i] & 0xC0 != 0x80) {
+            let want = match bytes[lead] {
+                b if b >= 0xF0 => 4,
+                b if b >= 0xE0 => 3,
+                b if b >= 0xC0 => 2,
+                _ => 1,
+            };
+            if lead + want > bytes.len() {
+                used = lead;
+            }
+        }
+    }
+    (String::from_utf8_lossy(&bytes[..used]).into_owned(), used)
+}
+
 /// Bytes [`Replay`] hands vt100 at a time; after each, the rows that
 /// scrolled off the screen go out. Small enough that a chunk's rows (one
 /// per `\r\n` at most, short of explicit scrolls) stay cheap to hold.
@@ -1062,6 +1131,54 @@ mod tests {
         assert_eq!(tail_at(&path, 10, true).unwrap().unwrap(), want);
         assert_eq!(tail_at(&dir.join("none"), 10, true).unwrap(), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn page_text_leaves_a_cut_character_for_the_next_page() {
+        let e = "é".as_bytes(); // two bytes
+        let euro = "€".as_bytes(); // three
+        assert_eq!(page_text(b"ab", false), ("ab".into(), 2));
+        assert_eq!(page_text(&[b'a', e[0]], false), ("a".into(), 1));
+        assert_eq!(page_text(&[b'a', e[0], e[1]], false), ("aé".into(), 3));
+        assert_eq!(page_text(&[b'a', euro[0], euro[1]], false), ("a".into(), 1));
+        assert_eq!(page_text(&[euro[0]], false), (String::new(), 0));
+        // The whole log: what's there, cut or not.
+        assert_eq!(page_text(&[b'a', e[0]], true), ("a\u{FFFD}".into(), 2));
+        // Invalid bytes don't hold anything back.
+        assert_eq!(page_text(&[0xFF, b'a'], false), ("\u{FFFD}a".into(), 2));
+        assert_eq!(page_text(&[], false), (String::new(), 0));
+    }
+
+    #[test]
+    fn pages_go_from_an_offset_a_page_at_a_time() {
+        let data = temp_dir("page");
+        assert_eq!(page_in(&data, "web", 0, true).unwrap(), None);
+        let path = tty_log(&data.join("logs").join("web"), b"\x1b[31mred\x1b[0m\r\n");
+        let all = std::fs::read(&path).unwrap();
+        let page = page_in(&data, "web", 0, false).unwrap().unwrap();
+        assert_eq!(page, Page { text: String::from_utf8(all.clone()).unwrap(), next: all.len() as u64, tty: true, complete: true });
+        let page = page_in(&data, "web", 5, true).unwrap().unwrap();
+        assert_eq!((page.text.as_bytes(), page.next, page.complete), (&all[5..], all.len() as u64, false));
+        // Past the end: nothing, the offset kept.
+        let page = page_in(&data, "web", 1 << 30, false).unwrap().unwrap();
+        assert_eq!((page.text.as_str(), page.next), ("", 1 << 30));
+
+        // More than a page: capped, the rest from `next`.
+        let big = vec![b'x'; PAGE_BYTES + 10];
+        std::fs::write(&path, &big).unwrap();
+        let page = page_in(&data, "web", 0, false).unwrap().unwrap();
+        assert_eq!((page.text.len(), page.next, page.tty, page.complete), (PAGE_BYTES, PAGE_BYTES as u64, false, false));
+        let page = page_in(&data, "web", page.next, false).unwrap().unwrap();
+        assert_eq!((page.text.len(), page.next, page.complete), (10, big.len() as u64, true));
+        // A character cut by the page is the next one's, even once the build ended.
+        let mut cut = vec![b'x'; PAGE_BYTES - 1];
+        cut.extend_from_slice("é".as_bytes());
+        std::fs::write(&path, &cut).unwrap();
+        let page = page_in(&data, "web", 0, false).unwrap().unwrap();
+        assert_eq!((page.next, page.complete), (PAGE_BYTES as u64 - 1, false));
+        let page = page_in(&data, "web", page.next, false).unwrap().unwrap();
+        assert_eq!((page.text.as_str(), page.complete), ("é", true));
+        let _ = std::fs::remove_dir_all(&data);
     }
 
     #[test]

@@ -7,8 +7,9 @@ use super::{resolve_container, resolve_instance};
 use crate::runtime::backend;
 use crate::state::{PhaseView, State};
 
-/// How often `--follow` checks for new output and whether the build ended.
-const FOLLOW_POLL: Duration = Duration::from_millis(500);
+/// How often `--follow` checks for new output and whether the build ended
+/// (the offered-machine follow too: `machines::cli::offered`).
+pub(crate) const FOLLOW_POLL: Duration = Duration::from_millis(500);
 
 /// Print the last `lines` lines of a container's stdout+stderr. Mirrors the
 /// TUI logs modal: empty output is flagged rather than silent. Logs are shown
@@ -100,8 +101,9 @@ pub fn build_log(name: &str, follow: bool) -> Result<()> {
 }
 
 /// Whether `--follow` waits on: the record exists (`Some`) and its phase is in
-/// flight. Done (`Some(None)`), failed and gone (`None`) all end it.
-fn in_flight(view: Option<&Option<PhaseView>>) -> bool {
+/// flight. Done (`Some(None)`), failed and gone (`None`) all end it. The
+/// daemon's `instances.buildLog` pages say the same (`serve::api`).
+pub(crate) fn in_flight(view: Option<&Option<PhaseView>>) -> bool {
     matches!(view, Some(Some(PhaseView::InFlight(_))))
 }
 

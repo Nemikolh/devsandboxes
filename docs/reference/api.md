@@ -424,8 +424,20 @@ lines are plain text, or with `ansi` carry SGR escapes (`ESC[…m`: colours,
 bold, …) and no other escapes. A log written through pipes is its lines as
 they are (a `\r` redraw keeps its last state), whatever `ansi` says.
 
+With `"offset": <n>` (bytes; `lines` and `ansi` then don't apply) the
+result is the log's bytes from there instead, what `logs --build
+--follow` on an offered worker prints as they come:
+`{"text": "…", "next": <n>, "tty": false, "complete": false}`, at most
+128 KiB (`build_log::PAGE_BYTES`) of them as UTF-8 text (invalid bytes as
+U+FFFD; a character the page or a write in progress cuts is left for the
+next page, `build_log::page_text`), `next` the offset after them, `tty`
+for a pty log, `complete` once nothing comes after: `next` is the log's
+end and the instance wasn't in flight before the read. A follow asks
+from `0`, then from each `next` until a page is `complete`; `null` as
+above. An offset past the end is an empty page.
+
 Errors: `not-found` (no such instance), `invalid` (no `instance`, a
-negative `lines`, a non-boolean `ansi`), `internal` (the log or
+negative `lines` or `offset`, a non-boolean `ansi`), `internal` (the log or
 `state.toml` doesn't read).
 
 ### `instances.signal`

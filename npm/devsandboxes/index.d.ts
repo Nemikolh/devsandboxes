@@ -933,6 +933,18 @@ export interface BuildLogTail {
   cut: boolean;
 }
 
+/** `instances.buildLog`'s answer with `offset`: the log's bytes from there. */
+export interface BuildLogPage {
+  /** At most 128 KiB of the log as UTF-8 (invalid bytes as U+FFFD). */
+  text: string;
+  /** The offset after them: the next page's. */
+  next: number;
+  /** A pty log (its header's `# tty` line). */
+  tty: boolean;
+  /** Nothing comes after: `next` is the log's end and the instance wasn't in flight. */
+  complete: boolean;
+}
+
 /** `sessions.list`'s answer: the helper's `session ls` lines, oldest first. */
 export interface SessionsList {
   /** `<id> <state> <attached|detached|-> <started> <argv…>`. */
@@ -1257,7 +1269,7 @@ export interface ApiMethods {
    * `instance`: exact name or instance id; `lines` default 500, at most 10000. `null`: no build log yet.
    * A pty log is replayed: plain lines, or with `ansi` lines carrying SGR escapes only.
    */
-  'instances.buildLog': { params: { instance: string; lines?: number; ansi?: boolean; machine?: string }; result: BuildLogTail | null };
+  'instances.buildLog': { params: { instance: string; lines?: number; ansi?: boolean; offset?: number; machine?: string }; result: BuildLogTail | BuildLogPage | null };
   /** Signal a process in the instance's container (exact name; `pid` from `instances.procs`, digits). */
   'instances.signal': { params: { instance: string; pid: string; signal: 'TERM' | 'KILL'; machine?: string }; result: OkResult };
   /** Exact name; `invalid` for a bad or taken name, or an instance mid-build. */

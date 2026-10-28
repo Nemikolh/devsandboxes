@@ -1122,14 +1122,17 @@ mod tests {
         assert_eq!(nameless(&["ps"]), (MachineUse::Once(ms(&["ps"])), Use::Ps { all: false, json: false }));
         assert_eq!(nameless(&["stats"]), (MachineUse::Once(ms(&["stats"])), Use::Stats { json: false }));
         assert_eq!(nameless(&["gc"]), (MachineUse::PerRoot { args: ms(&["gc"]), json: false }, Use::Refused(Refused::Gc)));
-        assert_eq!(nameless(&["service", "ls"]).1, Use::Refused(Refused::ServiceLs));
+        assert_eq!(
+            nameless(&["service", "ls"]),
+            (MachineUse::PerRoot { args: ms(&["service", "ls"]), json: false }, Use::ServiceLs { json: false })
+        );
         // `port` goes over the link (`TUNNEL`) on both.
         assert_eq!(nameless(&["port", "--service", "redis", "6379"]), (MachineUse::Port, Use::Link));
 
         let named = |args: &[&str]| (remote_args(&command(args), "web", None).is_some(), offered::use_of(&command(args)));
         assert_eq!(named(&["logs", "box/web"]), (true, Use::Logs { lines: 50 }));
-        assert_eq!(named(&["logs", "--build", "box/web"]), (true, Use::BuildLog));
-        assert_eq!(named(&["logs", "--build", "-f", "box/web"]), (true, Use::Refused(Refused::LogsFollow)));
+        assert_eq!(named(&["logs", "--build", "box/web"]), (true, Use::BuildLog { follow: false }));
+        assert_eq!(named(&["logs", "--build", "-f", "box/web"]), (true, Use::BuildLog { follow: true }));
         assert_eq!(named(&["inspect", "box/web"]), (true, Use::Inspect { json: false }));
         assert_eq!(named(&["done", "box/web"]), (true, Use::Done(true)));
         assert_eq!(named(&["undone", "box/web"]), (true, Use::Done(false)));

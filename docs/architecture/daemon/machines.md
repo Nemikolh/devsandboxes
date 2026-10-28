@@ -417,14 +417,21 @@ env's own `SSH_AUTH_SOCK` (the machine's agent, if any) stays.
   command's own render fns (`commands::logs::render_logs`,
   `inspect::render`, `ls::table` / `ls::render_json`, `status::render`,
   `done::status_line`, `rename::renamed_line`, `ps::render`,
-  `stats::render`), so the output reads the same; `cli::offered::use_of`
+  `stats::render`, `services::ls_render`), so the output reads the same; `cli::offered::use_of`
   (pure) picks the call, `offered::named` / `offered::per_root` /
   `offered::listing` make them over an injected call. `logs [-n N]` is
   `containers.logs` of the instance's container (its row's, from an
   `instances.list` at `depth: disk`: a rename keeps the container; a name
   that is no instance is taken as a container name); `logs --build` is
   `instances.buildLog` (up to `api::MAX_LINES` lines, a note on stderr
-  when cut; `ansi` when stdout is a terminal); `inspect [--json]` is
+  when cut; `ansi` when stdout is a terminal); `logs --build --follow` is
+  `instances.buildLog` pages with `offset` (`offered::follow_build_log`,
+  by the row's `instance_id`, so a rename doesn't lose it): from the
+  log's start, the next page at once while pages bring something, after
+  `logs::FOLLOW_POLL` when one doesn't (`offered::follow_next`), until
+  one is `complete`; printed as the local follow prints (as they are on a
+  terminal, a pty log through `build_log::Strip` elsewhere), and the
+  record gone meanwhile ends it, as locally; `inspect [--json]` is
   `containers.inspect` (without the local one's browser sandbox line:
   that comes from this host's record); `done` / `undone` are
   `instances.done`, worded from the row's `done` before; `rename` is
@@ -434,12 +441,17 @@ env's own `SSH_AUTH_SOCK` (the machine's agent, if any) stays.
   root itself), each an `instances.list` after its `==> m:<root>` line,
   `per_root`'s rules (`--json` with several roots is an error); `ls`
   renders the snapshot's sandbox rows (a config that doesn't load is the
-  error, as locally). `--machine m ps [--all] [--json]` is one
+  error, as locally). `--machine m service ls [--json]` takes the same
+  roots and rules, each an `instances.list` at `depth: listing` (container
+  statuses), and renders its service rows (`used_by` cut to the lent
+  instances); the snapshot's `error` (the runtime's, resolve failures)
+  goes to stderr, a config that doesn't load is the error. The empty
+  line names `<root>/devsandboxes.toml`. `--machine m ps [--all] [--json]` is one
   `containers.list`, `stats [--json]` one `containers.stats`
   (`offered::listing`): the worker answers its whole runtime's rows cut to
   what it lends (its lent instances' containers and their config roots'
   services, [fleet](fleet.md#the-worker-table)). Refused, naming the
-  command (`offered::refusal`): `service ls`, `logs --follow`, an `exec` without a tty
+  command (`offered::refusal`): an `exec` without a tty
   and `vscode` (not over a fleet link yet), and `gc` (host maintenance on
   the worker, outside a worker's trust).
 

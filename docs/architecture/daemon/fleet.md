@@ -416,14 +416,14 @@ link's `API` streams.
   none.
 - **The CLI's other re-runs** are API calls with `machine` (fleet plan
   decision 15): `logs` (`containers.logs`), `logs --build`
-  (`instances.buildLog`), `inspect` (`containers.inspect`), `done` /
+  (`instances.buildLog`; `--follow`, its pages by `offset`), `inspect` (`containers.inspect`), `done` /
   `undone` (`instances.done`), `rename` (`instances.rename`), `--machine
   m ls` / `status --json` (`instances.list` per config root under the
-  fleet root), `--machine m ps` (`containers.list`) and `stats`
+  fleet root; `service ls` too, its service rows), `--machine m ps` (`containers.list`) and `stats`
   (`containers.stats`), printed as the local commands print them
   ([machines](machines.md#the-cli-clirs), `machines::cli::offered`). The
   dashboard's logs and inspect views go through the same quick calls.
-- **What has no link form yet** is refused, each in its own words: `service ls`, `logs --follow`, an `exec` without a tty and
+- **What has no link form yet** is refused, each in its own words: an `exec` without a tty and
   `vscode` (`cli::offered::refusal`), `gc` (host maintenance, outside a
   worker's trust), and the dashboard's service tabs
   (`tui::remote::service_argv`: service terminals aren't supported over
@@ -933,7 +933,8 @@ while the lending thread drains is `denied`, `lent::DRAINING`) and
   `instances.snapshot` pushed to the connection (`Pending::confine`) are
   cut by `lent::filter_snapshot`: instance rows whose `root` is under the
   fleet root, their names alone in services' `used_by` and in
-  `thread_children`. `instances.resolve`'s matches are cut the same way
+  `thread_children`, their ids alone in `isolated` services' `containers`
+  (whose names carry the instance id). `instances.resolve`'s matches are cut the same way
   (`lent::filter_answer`); none left is `not-found`. `containers.list` /
   `containers.stats` list the whole host's runtime, so their `rows` are
   cut (`lent::cut_containers`) to the lent instances' containers and the

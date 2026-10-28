@@ -332,15 +332,29 @@ fn row_lent(row: &Value, root: &Path) -> bool {
 /// whatever `dir`, so this is what keeps this host's own out.
 pub fn filter_snapshot(snapshot: &mut Value, root: &Path) {
     let mut kept = BTreeSet::new();
+    let mut ids = BTreeSet::new();
     if let Some(rows) = snapshot.get_mut("instances").and_then(Value::as_array_mut) {
         rows.retain(|r| row_lent(r, root));
         kept.extend(rows.iter().filter_map(|r| r.get("name").and_then(Value::as_str).map(String::from)));
+        ids.extend(rows.iter().filter_map(|r| r.get("instance_id").and_then(Value::as_str).map(String::from)));
     }
     let keep = |v: &Value| v.as_str().is_some_and(|n| kept.contains(n));
+    // An isolated service's container is per instance
+    // (`services::isolated_service_container`: `…svc-<project>-<instance id>-<name>`),
+    // so another root's instance of a same-named sandbox would show by name.
+    let lent_container = |c: &Value| {
+        let name = c.get(0).and_then(Value::as_str).unwrap_or_default();
+        ids.iter().any(|id| name.contains(&format!("-{id}-")))
+    };
     if let Some(services) = snapshot.get_mut("services").and_then(Value::as_array_mut) {
         for s in services {
             if let Some(used) = s.get_mut("used_by").and_then(Value::as_array_mut) {
                 used.retain(keep);
+            }
+            if s.get("scope").and_then(Value::as_str) == Some("isolated")
+                && let Some(containers) = s.get_mut("containers").and_then(Value::as_array_mut)
+            {
+                containers.retain(lent_container);
             }
         }
     }
@@ -548,18 +562,25 @@ mod tests {
         let root = Path::new("/nonexistent/fleet/hub");
         let mut snap = json!({
             "instances": [
-                {"name": "in", "root": "/nonexistent/fleet/hub/cfg"},
-                {"name": "own", "root": "/nonexistent/mine"},
+                {"name": "in", "root": "/nonexistent/fleet/hub/cfg", "instance_id": "i1"},
+                {"name": "own", "root": "/nonexistent/mine", "instance_id": "o1"},
                 {"name": "sneaky", "root": "/nonexistent/fleet/hub/../../mine"},
                 {"name": "old", "root": null},
             ],
-            "services": [{"name": "db", "used_by": ["in", "own"]}],
+            "services": [
+                {"name": "db", "used_by": ["in", "own"]},
+                {"name": "cache", "scope": "isolated", "used_by": ["in", "own"], "containers": [
+                    ["devsandbox-svc-p-i1-cache", {"Running": "Up"}], ["devsandbox-svc-p-o1-cache", {"Running": "Up"}]]},
+                {"name": "pg", "scope": "global", "used_by": ["in"], "containers": [["devsandbox-svc-p-pg", {"Running": "Up"}]]},
+            ],
             "sandboxes": [{"name": "web"}],
             "thread_children": {"id-own": {"k": "own"}, "id-in": {"k": "in", "j": "own"}},
         });
         filter_snapshot(&mut snap, root);
-        assert_eq!(snap["instances"], json!([{"name": "in", "root": "/nonexistent/fleet/hub/cfg"}]));
+        assert_eq!(snap["instances"], json!([{"name": "in", "root": "/nonexistent/fleet/hub/cfg", "instance_id": "i1"}]));
         assert_eq!(snap["services"][0]["used_by"], json!(["in"]));
+        assert_eq!(snap["services"][1]["containers"], json!([["devsandbox-svc-p-i1-cache", {"Running": "Up"}]]), "another root's isolated copy cut");
+        assert_eq!(snap["services"][2]["containers"].as_array().unwrap().len(), 1, "a global one kept");
         assert_eq!(snap["thread_children"], json!({"id-in": {"k": "in"}}));
         assert_eq!(snap["sandboxes"], json!([{"name": "web"}]), "the root's own config, as is");
 

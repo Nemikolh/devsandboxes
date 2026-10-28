@@ -1061,25 +1061,37 @@ struct BuildLogParams {
     /// A pty log's lines with SGR escapes (colours, bold…), else plain.
     #[serde(default)]
     ansi: bool,
+    /// The log's bytes from here instead (`build_log::Page`), for a
+    /// follow; `lines` and `ansi` don't apply.
+    #[serde(default)]
+    offset: Option<u64>,
 }
 
 /// The end of an instance's build log (`build_log::tail_in`): `{text, cut}`,
 /// or `null` when it has none yet. `instance` is an exact name or
 /// instance id in `state` (injected for the tests; the logs live next to
 /// it); a cancelled `run` drops its record, and its log is `not-found` then.
+/// With `offset`, a `build_log::Page` from there instead, complete once the
+/// instance isn't in flight as `logs --build --follow` reads it
+/// (`commands::logs::in_flight`) and the page reaches the log's end.
 fn instances_build_log(p: BuildLogParams, state: &Path) -> Answer {
     let s = load_state(state)?;
-    let id = match s.instances.get(&p.instance) {
-        Some(instance) => &instance.instance_id,
+    let instance = match s.instances.get(&p.instance) {
+        Some(instance) => instance,
         None => s
             .instances
             .values()
-            .map(|i| &i.instance_id)
-            .find(|id| **id == p.instance)
+            .find(|i| i.instance_id == p.instance)
             .ok_or_else(|| ApiError::not_found(format!("no instance `{}`", p.instance)))?,
     };
-    let lines = p.lines.unwrap_or(DEFAULT_BUILD_LOG_LINES).min(MAX_LINES);
+    let id = &instance.instance_id;
     let data = state.parent().unwrap_or(Path::new("."));
+    if let Some(offset) = p.offset {
+        let in_flight = crate::commands::logs::in_flight(Some(&instance.phase_view()));
+        let page = crate::build_log::page_in(data, id, offset, in_flight).map_err(ApiError::internal)?;
+        return serde_json::to_value(page).map_err(|e| ApiError::internal(e.into()));
+    }
+    let lines = p.lines.unwrap_or(DEFAULT_BUILD_LOG_LINES).min(MAX_LINES);
     let tail = crate::build_log::tail_in(data, id, lines, p.ansi).map_err(ApiError::internal)?;
     serde_json::to_value(tail).map_err(|e| ApiError::internal(e.into()))
 }
@@ -2203,6 +2215,26 @@ mod tests {
         let ask = |ansi: bool| read(json!({"instance": "web", "lines": 1, "ansi": ansi})).unwrap();
         assert_eq!(ask(false), json!({"text": "ok", "cut": true}));
         assert_eq!(ask(true), json!({"text": "\u{1b}[0;32mok\u{1b}[0m", "cut": true}));
+        // With `offset`: the bytes from there, as they are.
+        let page = read(json!({"instance": "web", "offset": 52, "lines": 1, "ansi": true})).unwrap();
+        assert_eq!(page, json!({"text": "\x1b[32mok\x1b[0m\r\n", "next": pty.len(), "tty": true, "complete": true}));
+        assert_eq!(read(json!({"instance": "new", "offset": 0})).unwrap(), Value::Null, "no log yet");
+        assert_eq!(code(read(json!({"instance": "web", "offset": -1}))), "invalid");
+    }
+
+    /// A page read while the instance is in flight isn't complete.
+    #[test]
+    fn build_log_pages_say_whether_the_build_goes_on() {
+        let me = std::process::id();
+        let state = state_file(
+            "buildlog-page",
+            &instance("web", "web", &format!("instance_id = \"web-id\"\n[instance.web.progress]\nphase = \"building\"\npid = {me}\n")),
+        );
+        let log = state.with_file_name("logs").join("web-id");
+        std::fs::create_dir_all(&log).unwrap();
+        std::fs::write(log.join(crate::build_log::FILE), "$ devsandbox run\n# x\nstep 1\n").unwrap();
+        let page = instances_build_log(parse(json!({"instance": "web-id", "offset": 21})).unwrap(), &state).unwrap();
+        assert_eq!(page, json!({"text": "step 1\n", "next": 28, "tty": false, "complete": false}));
     }
 
     #[test]
@@ -2476,6 +2508,7 @@ mod tests {
         assert_matches("ProcsError", &v(&InstanceProcs::Failed { error: "not running".into() }));
         assert_eq!(union_members("InstanceProcs"), ["ProcsListing", "ProcsError"]);
         assert_matches("BuildLogTail", &v(&crate::build_log::Tail { text: "t".into(), cut: false }));
+        assert_matches("BuildLogPage", &v(&crate::build_log::Page { text: "t".into(), next: 1, tty: false, complete: false }));
         assert_matches("ContainerLogs", &v(&ContainerLogs { text: "t".into() }));
         let ps_row = crate::commands::ps::PsRow {
             row: crate::runtime::ContainerRow { name: "devsandbox-w".into(), ..Default::default() },
@@ -2520,7 +2553,7 @@ mod tests {
             ("instances.resolve", "InstancesResolved"),
             ("instances.cancel", "InstanceCancelled"),
             ("instances.procs", "Record<string, InstanceProcs>"),
-            ("instances.buildLog", "BuildLogTail | null"),
+            ("instances.buildLog", "BuildLogTail | BuildLogPage | null"),
             ("instances.signal", "OkResult"),
             ("sessions.list", "SessionsList"),
             ("sessions.rm", "OkResult"),

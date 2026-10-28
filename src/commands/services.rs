@@ -688,25 +688,29 @@ pub fn ls(dir: &Path, json: bool) -> Result<()> {
     let (rows, errors) =
         crate::snapshot::service_rows(dir, &project, &config, &instance_services, &ps);
 
-    // JSON path mirrors `ls --json`: emit the same `ServiceRow`s the TUI has, an
-    // empty config yields `data: []`, and resolve failures are ignored (the `?`
-    // source row is the signal), not surfaced as errors.
-    if json {
-        let out = serde_json::to_string_pretty(&Envelope::new(rows))
-            .context("serialize services")?;
-        println!("{out}");
-        return Ok(());
-    }
-
     // Table path surfaces resolve failures on stderr (like the snapshot folds
-    // them into `error`), but still prints the rows.
-    for err in &errors {
-        eprintln!("{err}");
+    // them into `error`), but still prints the rows. The JSON path ignores
+    // them: the `?` source row is the signal.
+    if !json {
+        for err in &errors {
+            eprintln!("{err}");
+        }
     }
+    print!("{}", ls_render(&rows, json, &crate::config::display_path(dir))?);
+    Ok(())
+}
 
+/// What `service ls` prints of `rows` (one `print!`), shared with the re-run
+/// on an offered machine (`machines::cli::offered`): `--json` mirrors `ls
+/// --json` (the `ServiceRow`s the TUI has, `data: []` when none), else the
+/// table, or a line naming `config_file` when there are no services.
+pub(crate) fn ls_render(rows: &[crate::snapshot::ServiceRow], json: bool, config_file: &Path) -> Result<String> {
+    if json {
+        let out = serde_json::to_string_pretty(&Envelope::new(rows)).context("serialize services")?;
+        return Ok(format!("{out}\n"));
+    }
     if rows.is_empty() {
-        println!("no services defined in {}", crate::config::display_path(dir).display());
-        return Ok(());
+        return Ok(format!("no services defined in {}\n", config_file.display()));
     }
 
     // Plain cells (width math) and colored cells (display) kept in lockstep so
@@ -714,7 +718,7 @@ pub fn ls(dir: &Path, json: bool) -> Result<()> {
     let mut plain: Vec<[String; 6]> = Vec::with_capacity(rows.len());
     let mut colored: Vec<[String; 6]> = Vec::with_capacity(rows.len());
 
-    for row in &rows {
+    for row in rows {
         let ports = if row.ports.is_empty() { None } else { Some(row.ports.join(", ")) };
         let used_by = if row.used_by.is_empty() { None } else { Some(row.used_by.join(", ")) };
         let status = ls_status_cell(&row.containers);
@@ -744,11 +748,11 @@ pub fn ls(dir: &Path, json: bool) -> Result<()> {
     }
 
     let widths = ls_column_widths(&LS_HEADERS, &plain);
-    print!("{}", ls_format_row(&LS_HEADERS.map(|h| dim(h)), &LS_HEADERS.map(str::to_string), &widths));
+    let mut out = ls_format_row(&LS_HEADERS.map(|h| dim(h)), &LS_HEADERS.map(str::to_string), &widths);
     for (colored_row, plain_row) in colored.iter().zip(&plain) {
-        print!("{}", ls_format_row(colored_row, plain_row, &widths));
+        out.push_str(&ls_format_row(colored_row, plain_row, &widths));
     }
-    Ok(())
+    Ok(out)
 }
 
 /// STATUS cell from a service's backing containers: `-` when it has none,
